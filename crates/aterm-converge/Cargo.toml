@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-converge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm — the converge engine (docs/DESIGN-init-system-2026-10-20.md §3): items that probe, apply and explain themselves, run in the order their `after` edges give, with every change journaled before it is made. Every provisioning surface runs it: `aterm init`, `aterm machines`, and the doctors and repair as they move onto it."
+
+# No platform code: an item owns its ports (an `Arc<dyn System>`, a store layout), so this
+# crate only orders, runs, reports and journals.
+[dependencies]
+# The report rows travel as JSON (the machines agent's report, `--json` surfaces).
+serde = { workspace = true, features = ["derive"] }
+# The journal's lines.
+aterm-json = { workspace = true }
+# A journal line reaches stable media before the change it records is made.
+aterm-durable = { workspace = true }
+
+[dev-dependencies]
+# Scratch directories for the journal's tests.
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

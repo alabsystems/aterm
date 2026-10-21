@@ -60,12 +60,14 @@ dev-seams = ["aterm-update-core/dev-seams", "aterm-types/dev-seams"]
 # transcription on 1 GiB. `ring::digest` needs no feature.
 ring = { workspace = true, features = ["alloc"] }
 # Decode the base64 root + release Ed25519 public keys (32 raw bytes each).
-# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# Standard padded Base64 — first-party; its one dependency is astream-wire
+# (dependency-free, vendor/astream). `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
 # The workspace's one FNV-1a/64, for `root_key_fingerprint`'s operator-facing
-# digest (never a security primitive). First-party, dependency-free.
+# digest (never a security primitive). First-party; its one dependency is
+# astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
 aterm-hash = { workspace = true }
 # getuid() for the 0600, owned-by-uid durable high-water floor file (mirrors
 # aterm-update-core's privatedir hardening). Already a workspace dependency.
@@ -79,6 +81,11 @@ aterm-types = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin). Already in
 # the graph via aterm-types.
 aterm-time = { workspace = true }
+# First-party bounded regex engine for abrew's `search /regex/` form. It
+# refuses constructs it cannot evaluate (look-around, backreferences,
+# \p{…}) instead of reinterpreting them, which is what lets admission
+# keep delegating those spellings to real Homebrew.
+aterm-regex = { workspace = true }
 # THE toolchain's discovery, rustup's home, the build-cache rule, the gone-checkout rule
 # and the lease core, std only; `toolchain`, `build_cache` and `lease` re-export them.
 aterm-toolchain = { workspace = true }
@@ -142,13 +149,24 @@ aterm-containment = { workspace = true }
 
 # Private per-operation download and extraction staging, removed on drop.
 aterm-tempfile = { workspace = true }
+# The converge engine's model (docs/DESIGN-init-system-2026-10-20.md §3): `machine`'s
+# tri-state `defaults` read is its `Read<T>`, one rule with the machines families. serde,
+# aterm-json and aterm-durable, which it adds, atpkg links already.
+aterm-converge = { workspace = true }
+
+# On Windows, the one reader of another process's environment block
+# (`aterm_sysprobe::peb::parameters`), which `caller_shell::process_args`
+# splits, and the case fold a variable's name is looked up by
+# (`aterm_sysprobe::paths::fold_case`, `RtlUpcaseUnicodeChar`'s), for
+# `caller_shell::ProcArgs::env_var`. Already in atpkg's Windows graph through
+# aterm-toolchain and aterm-uds; pure Rust and kernel32/ntdll FFI there.
+[target.'cfg(windows)'.dependencies]
+aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]
-# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
-# build too.
-aterm-durable = { workspace = true, features = ["test-support"] }
 # Tier-1 conformance drives the real index-probe stamp/lock against the derived
-# bounded model; this edge exists only while compiling tests, never in atpkg.
+# bounded model, and `aterm_spec::host::test_shell` finds the real shells the hook
+# tests run; this edge exists only while compiling tests, never in atpkg.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-atpkg = { workspace = true }

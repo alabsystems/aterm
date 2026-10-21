@@ -2,254 +2,385 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Cached full-content search index.
+//! The terminal's full-history search index: one slot per terminal, and the protocol every
+//! host builds and queries it through.
 //!
-//! The index over all retained scrollback plus visible rows depends only on which grid is
-//! active and its content, so one index serves every query until the content changes.
-//! [`Terminal::indexed_search`] caches it keyed by `(alternate_screen, content_seq())` plus
-//! the renumber epoch and the ambiguous-width policy. The key cannot go stale: line text,
-//! membership and `oldest_absolute_row()` change only by writes, scrolls, erases, reflows
-//! and resizes, all of which bump the active grid's `content_gen`. A pure viewport scroll
-//! reuses the cache.
+//! The index over the retained scrollback plus visible rows depends only on which grid is
+//! active, its content and its coordinate frame, so one index serves every query whose
+//! [`SearchKey`] is of the generation it was built under. The slot keeps it with that key,
+//! the layout it indexes soft wraps in ([`SearchLayout`]), and the narrowing frames a find
+//! bar read off it ([`NarrowStack`]), which die with it. The slot lives in the `Terminal`,
+//! so the index dies with the terminal, and checkpoint restore and history carry release it.
 //!
-//! A miss refreshes in O(churn) rather than rebuilding in O(total):
+//! A search runs in three steps, so the O(window) work never runs under the lock a GUI host
+//! keeps its terminal behind (shared with the PTY reader and the renderer):
+//!
+//! 1. [`Terminal::search_plan`], one hold: capture the key, carry the anchor into its
+//!    soft-wrap frame, and either answer from the slot or plan a build (the window from
+//!    nothing, or a refresh of the slot's index).
+//! 2. [`Terminal::read_search_chunk`], one bounded hold per call, copies the build's rows and
+//!    notes whether a hold saw another generation or frame than the key's; a refresh's first
+//!    chunk names its rows first, the ones that may have changed. [`SearchPlan::build`]
+//!    indexes them with no lock held.
+//! 3. [`Terminal::finish_search`], one hold: the endpoint check, and the slot's upkeep
+//!    (keep a whole build, take the narrowing frames back).
+//!
+//! No hold frees an index: that is O(window) too (every indexed line, its cells and the
+//! trigram posting lists), and so is freeing the narrowing frames read off one. What a plan's
+//! hold takes out of the slot rides in the plan and is freed by [`SearchPlan::build`]; what
+//! [`Terminal::finish_search`] and [`Terminal::take_search_index`] let go of comes back as a
+//! [`SearchDiscard`], which the host drops once its lock is released.
+//!
+//! Finding the row a soft-wrapped line starts on walks its run one row at a time, a
+//! per-row history read each. The plan's hold walks at most one run (the anchor's); the
+//! refresh's walks over the runs at its two boundaries run in the first chunk's hold.
+//!
+//! [`Terminal::indexed_search`] runs the three in one `&mut` borrow, for a host that owns
+//! its terminal (the web host, `search_summary`).
+//!
+//! The window is the newest `max_lines` rows ([`SearchKey::window`]), indexed into an index
+//! that retains exactly that many, so the index itself never evicts; rows the depth cap
+//! leaves unread mark the results incomplete from the window's first row. A refresh costs
+//! O(churn) rather than O(window):
 //!
 //! - Append: rows at or above the previous `indexed_end` are new; feed them.
 //! - Replace: rows at or above the previous visible base may have been edited in place;
 //!   re-feed them (unchanged rows are cheap).
-//! - EvictBelow: `drop_history_below` removes evicted rows with fresh-build semantics.
-//! - Reflow, alt-screen switch, protected-footer splice (`absolute_row_revision`) or Kitty
-//!   unscroll (`history_renumber_epoch`): full rebuild.
+//! - EvictBelow: `drop_history_below` removes the rows that left the window, with
+//!   fresh-build semantics.
+//! - Reflow, alt-screen switch, protected-footer splice (`absolute_row_revision`), Kitty
+//!   unscroll (`history_renumber_epoch`), a new depth or layout: full rebuild.
 //!
-//! The refresh runs only when it provably equals the full rebuild (guards in
-//! `try_refresh_search_index`); the tests compare it with `legacy_results`, a from-scratch
-//! oracle.
+//! The refresh runs only when it provably equals the full build over the current window
+//! ([`SearchKey::refreshable_from`] and [`Terminal::try_refresh_search_index`]); the tests
+//! compare it with `legacy_results`, a from-scratch oracle.
 
-use aterm_types::text_shaping::AmbiguousWidth;
+use std::ops::Range;
+use std::sync::Arc;
 
-use super::Terminal;
-use super::search_rows::history_row_for_search;
+use super::search_budgeted::BudgetedSearchState;
+use super::search_plan::{BuiltSearch, Made, PlanKind, RowCopy};
+use super::{
+    NarrowStack, SearchKey, SearchLayout, SearchPlan, SearchRequest, SearchRows, SearchVerdict,
+    Terminal, WrapFrame, join_wrapped_rows,
+};
 use crate::search::{DEFAULT_MAX_CACHED_LINES, TerminalSearch};
 
-/// A cached search index and the key it was built for, stamped at (re)build time.
-pub(crate) struct CachedSearchIndex {
-    /// The alternate screen was active: the grids keep independent `content_gen` counters,
-    /// so a swap landing on the same value must still invalidate.
-    alt_screen: bool,
-    /// The active grid's `content_seq()`, bumped by every content mutation.
-    content_gen: u64,
-    /// Protected-footer splice revision: a splice renumbers rows piecewise (full rebuild).
-    absolute_row_revision: u64,
-    /// `Grid::history_renumber_epoch()`: a Kitty CSI +T unscroll shifts older rows' keys
-    /// without moving the other stamps. Part of the hit key.
-    history_renumber_epoch: u64,
-    /// Grid width. A width change rewraps history (full rebuild); height-only changes move
-    /// rows between history and visible without moving keys.
-    cols: u16,
-    /// The `ambiguous_width` policy the index measures under; a live switch moves no
-    /// `content_gen`, so it is part of the hit key.
-    ambiguous_width: AmbiguousWidth,
-    /// Absolute row of the oldest retained line; a decrease means renumbering.
-    hist_base: usize,
-    /// Absolute row of the top visible row. Rows at or above it were fed as visible text
-    /// and may be edited in place; rows below are immutable history.
-    visible_base: usize,
-    /// Exclusive end of the indexed absolute-row range; a shrink forces the full rebuild.
-    indexed_end: usize,
-    /// The index over scrollback and visible rows, reused verbatim while the key matches.
-    index: TerminalSearch,
+/// What [`Terminal::indexed_search`] asks for: the default depth, one line per row. The
+/// budgeted search verifies the same window ([`Terminal::search_budgeted`]).
+pub(crate) const ONE_SHOT_SEARCH: SearchRequest = SearchRequest {
+    depth_cap: DEFAULT_MAX_CACHED_LINES,
+    layout: SearchLayout::Physical,
+    anchor: None,
+};
+
+/// A terminal's search index and what it was built for.
+pub(crate) struct SearchSlot {
+    /// The key the index was built under: the hit test ([`SearchKey::same_generation`]),
+    /// the refresh guard ([`SearchKey::refreshable_from`]), and through its window the
+    /// visible base a refresh re-reads from.
+    key: SearchKey,
+    /// How the index lays out soft wraps; a request for the other layout misses.
+    layout: SearchLayout,
+    /// Shared with the queries reading it off the lock; never changed while shared.
+    index: Arc<TerminalSearch>,
+    /// The narrowing frames read off `index`, lent to one hit at a time.
+    narrow: Option<NarrowStack>,
+}
+
+/// Search state a hold took out of the terminal and left its caller to free
+/// ([`Terminal::finish_search`], [`Terminal::take_search_index`]); a building plan carries
+/// its own ([`SearchPlan::build`]). Freeing an index is O(window), about 100k allocations at
+/// the default depth, so no hold does it: a host that keeps its terminal behind a lock drops
+/// this after releasing the lock.
+#[must_use = "dropping it frees what it holds: drop it once the terminal's lock is released"]
+#[derive(Default)]
+pub struct SearchDiscard {
+    /// A slot the terminal no longer holds: displaced by a plan or a kept build, or taken.
+    slot: Option<SearchSlot>,
+    /// A search's index the slot does not hold: a build it did not keep, or a hit's share of
+    /// an index (the last one when a refresh displaced that index meanwhile).
+    index: Option<Arc<TerminalSearch>>,
+    /// Narrowing frames that lost their place: a refreshed index's, a build's the slot did
+    /// not keep, or a hit's that the slot no longer wants.
+    narrow: Option<NarrowStack>,
+    /// A budgeted search taken with the slot.
+    #[expect(dead_code, reason = "held only to be freed when the discard drops")]
+    budgeted: Option<BudgetedSearchState>,
 }
 
 impl Terminal {
+    /// Plan one search, in one hold: capture its key ([`SearchKey::capture`]), carry the
+    /// request's anchor into the key's soft-wrap frame, and decide how the index is had.
+    ///
+    /// - The slot's index is of the key's generation and layout: a hit, which shares the
+    ///   index and borrows its narrowing frames.
+    /// - It is of an earlier generation the key may be refreshed from: the plan takes it
+    ///   out of the slot ([`Self::try_refresh_search_index`]), and its first chunk names
+    ///   the rows that may differ ([`Self::read_search_chunk`]).
+    /// - Otherwise the slot is emptied now, so the terminal never holds two indexes of its
+    ///   window, and the plan names the whole window.
+    ///
+    /// The only soft-wrap run this hold walks is the anchor's, and it frees nothing: what it
+    /// takes out of the slot and does not build on (an index the plan does not refresh, a
+    /// refreshed index's narrowing frames) rides in the plan to [`SearchPlan::build`].
+    #[must_use]
+    pub fn search_plan(&mut self, request: &SearchRequest) -> SearchPlan {
+        let key = SearchKey::capture(self, request.depth_cap);
+        let wrap = match request.layout {
+            SearchLayout::Physical => WrapFrame::unjoined(&key),
+            SearchLayout::Logical => WrapFrame::under_key(self, &key, request.anchor),
+        };
+        let hit = self
+            .search_slot
+            .as_mut()
+            .filter(|slot| slot.layout == request.layout && slot.key.same_generation(&key))
+            .map(|slot| PlanKind::Hit {
+                index: Arc::clone(&slot.index),
+                narrow: slot.narrow.take(),
+            });
+        let kind = hit.unwrap_or_else(|| {
+            PlanKind::Build(Box::new(
+                match self.try_refresh_search_index(&key, request.layout) {
+                    Some(SearchSlot {
+                        key: previous,
+                        index,
+                        narrow,
+                        ..
+                    }) => RowCopy::refresh(
+                        index,
+                        previous,
+                        SearchDiscard {
+                            narrow,
+                            ..SearchDiscard::default()
+                        },
+                    ),
+                    None => RowCopy::window(
+                        &key.window(),
+                        SearchDiscard {
+                            slot: self.search_slot.take(),
+                            ..SearchDiscard::default()
+                        },
+                    ),
+                },
+            ))
+        });
+        SearchPlan {
+            request: *request,
+            key,
+            wrap,
+            kind,
+        }
+    }
+
+    /// The refresh decision: the slot, taken out of the terminal, when bringing its index up
+    /// to `key` provably equals building the window afresh. `None` leaves the slot alone.
+    /// Given the guards:
+    ///
+    /// - The same layout, frame and depth ([`SearchKey::refreshable_from`]): no splice,
+    ///   rewrap or renumbering moved a row's key, every line is measured as it was, and
+    ///   the window only advanced. Rows below the previous visible base are immutable
+    ///   history, and retention and the depth cap only drop the oldest rows.
+    /// - `drop_history_below` removes the rows that left the window with fresh-build
+    ///   semantics, and the copy ([`Self::search_copy_spans`]) re-reads every row whose
+    ///   indexed line may differ, as the build reads it.
+    /// - The index retains exactly the window's rows, so no cap eviction fires on either
+    ///   path.
+    ///
+    /// A query still reading the index (an earlier hit) does not stop the refresh: the
+    /// build copies a shared index instead of taking it over. The bloom filter keeps stale
+    /// bits from replaced rows (false-positive candidates only; saturation self-heals via
+    /// `rebuild_bloom`).
+    fn try_refresh_search_index(
+        &mut self,
+        key: &SearchKey,
+        layout: SearchLayout,
+    ) -> Option<SearchSlot> {
+        self.search_slot
+            .take_if(|slot| slot.layout == layout && key.refreshable_from(&slot.key))
+    }
+
+    /// The absolute rows a refresh under `key` from `previous` copies, ascending, each span
+    /// starting a logical line: the rows whose indexed line may differ from what
+    /// `previous`'s index holds. Named in the hold of the plan's first chunk
+    /// ([`Self::name_search_copy`]), which also checks that hold's key against the plan's.
+    ///
+    /// A refresh re-reads from the older of the two visible bases (a row edited while
+    /// visible and scrolled into history since must not keep stale text; a rows-grow that
+    /// reveals history hands rows back to the screen, editable again), clipped at the
+    /// window's floor. Joining soft wraps adds two boundaries where a line can straddle
+    /// the rows a refresh keeps and the rows it re-reads, each found by a walk over one
+    /// run, a row at a time and as far as [`Self::logical_origin`] walks:
+    ///
+    /// - The re-read starts at the head of the run the row above the boundary belongs to:
+    ///   that row is immutable history, and the boundary row itself may have been rewritten
+    ///   out of the run since, so the run's head must be re-joined either way. A run too
+    ///   deep to walk back over starts the re-read at the floor.
+    /// - The run the floor now lands in lost its head with the rows below the floor; a
+    ///   fresh build starts a line at the floor with that run's remaining rows, so they
+    ///   are re-read as their own span.
+    fn search_copy_spans(
+        &self,
+        key: &SearchKey,
+        layout: SearchLayout,
+        previous: &SearchKey,
+    ) -> Vec<Range<usize>> {
+        let (orphans, start) = self.search_copy_start(key, layout, previous);
+        let end = key.window().indexed_end;
+        orphans
+            .into_iter()
+            .chain(std::iter::once(start..end))
+            .collect()
+    }
+
+    /// [`Self::search_copy_spans`]' decision: the rows of a run the floor orphaned, when
+    /// they are re-read as a span of their own, and the row the re-read of the rest of the
+    /// window starts at.
+    fn search_copy_start(
+        &self,
+        key: &SearchKey,
+        layout: SearchLayout,
+        previous: &SearchKey,
+    ) -> (Option<Range<usize>>, usize) {
+        let window = key.window();
+        let floor = window.retained_base;
+        let was = previous.window();
+        let start = was.visible_base.min(window.visible_base).max(floor);
+        if layout == SearchLayout::Physical || start <= floor {
+            return (None, start);
+        }
+        let row = |abs: usize| u64::try_from(abs).unwrap_or(u64::MAX);
+        let at = |abs: u64| usize::try_from(abs).unwrap_or(usize::MAX);
+        let start = self
+            .logical_origin(row(start).saturating_sub(1), row(floor))
+            .map_or(floor, at);
+        if start <= floor || was.retained_base >= floor || !self.abs_row_wrap_flag(row(floor)) {
+            return (None, start);
+        }
+        let orphans_end = at(self.logical_run_end(row(floor), row(start)));
+        if orphans_end >= start {
+            (None, floor)
+        } else {
+            (Some(floor..orphans_end), start)
+        }
+    }
+
+    /// Copy the plan's next rows, at most `max_rows` of them (at least one), in this one
+    /// hold, through [`Self::read_search_rows`]; nothing on a hit. A refresh's first chunk
+    /// names its rows before it copies one ([`Self::search_copy_spans`]: two walks of a
+    /// soft-wrap run at most). The hold's key is compared with the plan's, so a copy that
+    /// read two generations or frames, or rows named in a hold of another generation, says
+    /// so at [`Self::finish_search`].
+    pub fn read_search_chunk(&self, plan: &mut SearchPlan, max_rows: usize) {
+        self.name_search_copy(plan);
+        let PlanKind::Build(copy) = &mut plan.kind else {
+            return;
+        };
+        let now = SearchKey::capture(self, plan.request.depth_cap);
+        copy.torn |= !plan.key.same_generation(&now);
+        copy.frame_moved |= !plan.key.same_frame(&now);
+        let mut skip = copy.rows.text.len();
+        let mut budget = max_rows.max(1);
+        for span in &copy.spans {
+            let len = span.len();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            let take = (len - skip).min(budget);
+            let first = u64::try_from(span.start.saturating_add(skip)).unwrap_or(u64::MAX);
+            self.read_search_rows(first, take, &mut copy.rows);
+            budget -= take;
+            skip = 0;
+            if budget == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Name a refresh's rows ([`Self::search_copy_spans`]) from the key its base was built
+    /// under, once, before any row is copied. In the first chunk's hold rather than the
+    /// plan's: a terminal that moves in between makes that hold's key check fail, so rows
+    /// named from another generation are never kept.
+    fn name_search_copy(&self, plan: &mut SearchPlan) {
+        if let PlanKind::Build(copy) = &mut plan.kind
+            && let Some(previous) = copy.pending.take()
+        {
+            copy.name_spans(self.search_copy_spans(&plan.key, plan.request.layout, &previous));
+        }
+    }
+
+    /// End a search in one hold: compare the terminal with the key the search began under,
+    /// keep what the slot can use, and hand back what it let go of, unfreed.
+    ///
+    /// A hit hands its narrowing frames back while the slot still holds the index they
+    /// were read off. A build is counted ([`Self::search_index_rebuilds`]), and kept when
+    /// its copy is whole: then it is the index of its key's generation whether or not the
+    /// terminal has moved on since. Current, it answers the next search; stale, it is the
+    /// base the next search refreshes from, so it fills an empty slot but never displaces
+    /// a current one. A torn copy may mix two contents and is answered from once, never
+    /// kept.
+    ///
+    /// The [`SearchDiscard`] holds the build the slot did not keep, the slot a kept build
+    /// displaced, or the hit's share of its index with the frames the slot did not take
+    /// back: when a refresh displaced the hit's index meanwhile, that share is the last.
+    pub fn finish_search(&mut self, built: BuiltSearch) -> (SearchVerdict, SearchDiscard) {
+        let now = SearchKey::capture(self, built.request.depth_cap);
+        let verdict = SearchVerdict {
+            consistent: !built.torn && built.key.same_generation(&now),
+            frame_stable: !built.frame_moved && built.key.same_frame(&now),
+        };
+        let mut discard = SearchDiscard::default();
+        match built.made {
+            Made::Served => {
+                discard.narrow = match self
+                    .search_slot
+                    .as_mut()
+                    .filter(|slot| Arc::ptr_eq(&slot.index, &built.index))
+                {
+                    Some(slot) => std::mem::replace(&mut slot.narrow, built.narrow),
+                    None => built.narrow,
+                };
+                discard.index = Some(built.index);
+            }
+            Made::Refreshed | Made::Rebuilt => {
+                self.search_index_rebuilds = self.search_index_rebuilds.wrapping_add(1);
+                if built.made == Made::Refreshed {
+                    self.search_index_refreshes = self.search_index_refreshes.wrapping_add(1);
+                }
+                if !built.torn && (verdict.consistent || self.search_slot.is_none()) {
+                    discard.slot = self.search_slot.replace(SearchSlot {
+                        key: built.key,
+                        layout: built.request.layout,
+                        index: built.index,
+                        narrow: built.narrow,
+                    });
+                } else {
+                    discard.index = Some(built.index);
+                    discard.narrow = built.narrow;
+                }
+            }
+        }
+        (verdict, discard)
+    }
+
     /// A full-content search index, reused while the active grid's content is unchanged. It
-    /// covers every retained line keyed by absolute row (history at `oldest + i`, visible
-    /// rows at `oldest + scrollback + r`), so each
-    /// [`SearchMatch::line`](crate::search::SearchMatch) is an absolute row. Query with
+    /// covers the newest [`DEFAULT_MAX_CACHED_LINES`] retained lines, one per row, keyed by
+    /// absolute row (history at `oldest + i`, visible rows at `oldest + scrollback + r`), so
+    /// each [`SearchMatch::line`](crate::search::SearchMatch) is an absolute row. Query with
     /// `indexed_search(...).search_results_opts(pat, case, regex)`. A miss refreshes or
     /// rebuilds; the result is immutable so callers cannot alter cached coordinates.
     pub fn indexed_search(&mut self) -> &TerminalSearch {
-        let key_alt = self.modes.alternate_screen;
-        let key_gen = self.content_seq();
-        // A Kitty unscroll shifts older rows' keys without necessarily moving
-        // `content_seq`, so the renumber epoch is part of the hit key.
-        let key_epoch = self.grid.history_renumber_epoch();
-        let key_ambiguous = self.ambiguous_width();
-
-        let hit = match &self.search_index {
-            Some(cached) => {
-                cached.alt_screen == key_alt
-                    && cached.content_gen == key_gen
-                    && cached.history_renumber_epoch == key_epoch
-                    && cached.ambiguous_width == key_ambiguous
-            }
-            None => false,
-        };
-
-        if !hit {
-            // Retained-window geometry for the guards, the refresh and the stamps; mirrors
-            // `build_search_index`.
-            let oldest = self.grid.oldest_absolute_row();
-            let scrollback = self.grid.scrollback_lines();
-            let rows = self.rows();
-            let cols = self.cols();
-            let revision = self.absolute_row_revision;
-            let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
-            let visible_base = hist_base.saturating_add(scrollback);
-            let indexed_end = visible_base.saturating_add(usize::from(rows));
-
-            let index = match self.try_refresh_search_index(
-                key_alt,
-                revision,
-                key_epoch,
-                cols,
-                hist_base,
-                visible_base,
-                indexed_end,
-            ) {
-                Some(index) => {
-                    self.search_index_refreshes = self.search_index_refreshes.wrapping_add(1);
-                    index
-                }
-                // The full build is the fallback and the definition the refresh must equal.
-                None => self.build_search_index(),
-            };
-            self.search_index = Some(CachedSearchIndex {
-                alt_screen: key_alt,
-                content_gen: key_gen,
-                absolute_row_revision: revision,
-                history_renumber_epoch: key_epoch,
-                cols,
-                ambiguous_width: key_ambiguous,
-                hist_base,
-                visible_base,
-                indexed_end,
-                index,
-            });
-            self.search_index_rebuilds = self.search_index_rebuilds.wrapping_add(1);
-        }
-
+        let mut plan = self.search_plan(&ONE_SHOT_SEARCH);
+        self.read_search_chunk(&mut plan, usize::MAX);
+        // Nothing moves inside this borrow, so the build is whole and current and stays; the
+        // borrow is no lock, so what it displaced is freed here.
+        let _ = self.finish_search(plan.build());
         &self
-            .search_index
+            .search_slot
             .as_ref()
-            .expect("search_index populated above")
+            .expect("a finished search under &mut leaves its index in the slot")
             .index
-    }
-
-    /// Serve a cache miss by refreshing the cached index; `None` unless the refresh provably
-    /// equals `build_search_index` over the current window. Given the guards:
-    ///
-    /// - Rows below the previous visible base are immutable history: splices, rewraps and
-    ///   renumberings are fenced to the rebuild, and retention only drops the oldest rows.
-    ///   The refresh re-feeds from `min(previous, current visible base)`, so a reclassified
-    ///   row is read as the build reads it (`written_line_cells` visible,
-    ///   `history_row_for_search` history).
-    /// - `drop_history_below` removes the evicted prefix with fresh-build semantics.
-    /// - No cap eviction fires on either path: the guards require an eviction-free cached
-    ///   index and a window under `DEFAULT_MAX_CACHED_LINES` (`TerminalSearch::new`'s cap).
-    ///
-    /// Cost: O(appended rows + visible rows). The bloom filter keeps stale bits from
-    /// replaced rows (false-positive candidates only; saturation self-heals via
-    /// `rebuild_bloom`).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "geometry tuple computed once by the caller and shared with the cache stamps"
-    )]
-    fn try_refresh_search_index(
-        &mut self,
-        key_alt: bool,
-        revision: u64,
-        renumber_epoch: u64,
-        cols: u16,
-        hist_base: usize,
-        visible_base: usize,
-        indexed_end: usize,
-    ) -> Option<TerminalSearch> {
-        {
-            let cached = self.search_index.as_ref()?;
-            let reusable = cached.alt_screen == key_alt
-                && cached.absolute_row_revision == revision
-                && cached.history_renumber_epoch == renumber_epoch
-                && cached.cols == cols
-                // Every row is re-measured under a new ambiguous-width policy.
-                && cached.ambiguous_width == self.ambiguous_width()
-                // Retention only advances; a retreat means renumbering (a re-attached
-                // offloaded reflow can grow scrollback back).
-                && cached.hist_base <= hist_base
-                // The index cannot truncate above; a shrinking end falls back.
-                && cached.indexed_end <= indexed_end
-                // Both windows eviction-free, for the fresh-equality argument.
-                && indexed_end.saturating_sub(hist_base) <= DEFAULT_MAX_CACHED_LINES
-                && !cached.index.results_may_be_incomplete();
-            if !reusable {
-                return None;
-            }
-        }
-        let cached = self.search_index.take()?;
-        let mut index = cached.index;
-
-        index.drop_history_below(hist_base);
-
-        // Replace + Append: re-feed from the older visible base (unchanged rows are cheap).
-        let refresh_start = cached.visible_base.min(visible_base).max(hist_base);
-        if refresh_start < visible_base {
-            let start_hist = refresh_start.saturating_sub(hist_base);
-            let count = visible_base.saturating_sub(refresh_start);
-            // The dense walk keeps absolute-row keys (`None` is empty text); the repeat
-            // pads should it be shorter than `count`.
-            let lines = self
-                .grid
-                .history_lines_from(start_hist)
-                .chain(std::iter::repeat_with(|| None))
-                .take(count);
-            index.index_numbered_cells_owned(lines.enumerate().map(|(j, line)| {
-                let (text, cells) = history_row_for_search(&self.grid, line);
-                (refresh_start.saturating_add(j), text, cells)
-            }));
-        }
-        let rows = self.rows();
-        index.index_numbered_cells_owned((0..rows).map(|r| {
-            let (text, cells) = self.written_line_cells(i32::from(r)).unwrap_or_default();
-            (visible_base.saturating_add(usize::from(r)), text, cells)
-        }));
-        Some(index)
-    }
-
-    /// A fresh full-content index over the active grid. Its line set, order and absolute-row
-    /// keys define search results.
-    fn build_search_index(&self) -> TerminalSearch {
-        let grid = &self.grid;
-        let oldest = grid.oldest_absolute_row();
-        let scrollback = grid.scrollback_lines();
-        let rows = self.rows();
-
-        let mut search = TerminalSearch::new().with_ambiguous_width(self.ambiguous_width());
-
-        // History at absolute oldest + i via the dense walk (`Grid::history_lines_from`,
-        // item `i` == `get_history_line(i)`, an unreadable line an empty placeholder so
-        // later lines keep their rows), decoding each warm block / cold page once. Text is
-        // bounded by MAX_SCROLLBACK_LINE_SCAN_BYTES: a crafted checkpoint can inject a
-        // multi-MiB `Line`. Streamed, so the scrollback text is never resident twice. Each
-        // row carries the cells its text was read from, so a match is reported where drawn.
-        let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
-        let history = grid
-            .history_lines_from(0)
-            .chain(std::iter::repeat_with(|| None))
-            .take(scrollback);
-        search.index_numbered_cells_owned(history.enumerate().map(|(i, line)| {
-            let (text, cells) = history_row_for_search(grid, line);
-            (hist_base.saturating_add(i), text, cells)
-        }));
-
-        // Visible rows at oldest + scrollback + r, combining-aware, read as written with
-        // trailing blanks kept as each history line stores its row: a row's matches must
-        // not change when it scrolls off (`foo$`, a query ending in spaces).
-        let vis_base = hist_base.saturating_add(scrollback);
-        search.index_numbered_cells_owned((0..rows).map(|r| {
-            let (text, cells) = self.written_line_cells(i32::from(r)).unwrap_or_default();
-            (vis_base.saturating_add(usize::from(r)), text, cells)
-        }));
-
-        search
     }
 
     /// Search-index cache misses so far (rebuilds and refreshes), never a reuse.
@@ -268,14 +399,80 @@ impl Terminal {
         self.search_index_refreshes
     }
 
-    /// Release the search index's heap: the cached index and any budgeted search (in flight
-    /// or retained for `search_summary`). The whole `CachedSearchIndex` goes: an in-place
+    /// Take the search index's heap out of the terminal, unfreed: the slot and any budgeted
+    /// search (in flight or retained for `search_summary`). The whole slot goes: an in-place
     /// [`SearchIndex::release`](aterm_search::SearchIndex::release) would leave the key
     /// matching an emptied index, a false empty hit.
-    pub fn release_search_index(&mut self) {
-        self.search_index = None;
-        self.budgeted_search = None;
+    pub fn take_search_index(&mut self) -> SearchDiscard {
+        SearchDiscard {
+            slot: self.search_slot.take(),
+            budgeted: self.budgeted_search.take(),
+            ..SearchDiscard::default()
+        }
     }
+
+    /// [`Self::take_search_index`], freed in this call.
+    pub fn release_search_index(&mut self) {
+        drop(self.take_search_index());
+    }
+}
+
+/// The windowed builder: index a plan's copied rows, with no lock held. Its line set,
+/// order and absolute-row keys define search results.
+///
+/// From nothing, an index that retains exactly the window's rows; on a refresh, the base
+/// with the rows below the window dropped, taken over when no query still reads it and
+/// copied otherwise. Each span's rows are joined per `layout` (the span's first row starts
+/// a line: the index has nothing older to join it to) and indexed at their absolute rows,
+/// a re-read row replacing the line it had. The completeness verdict is restated from the
+/// window every time: `Some(floor)` while the depth cap leaves older retained history
+/// unread, else `None`, so an index outliving the condition that made it partial (a
+/// `clear`, a scrollback eviction, a raised cap) does not go on calling an exact count
+/// incomplete.
+pub(super) fn build_search_index(
+    key: &SearchKey,
+    layout: SearchLayout,
+    copy: RowCopy,
+) -> TerminalSearch {
+    let window = key.window();
+    let mut index = match copy.base {
+        Some(base) => {
+            let mut index = Arc::unwrap_or_clone(base);
+            index.drop_history_below(window.retained_base);
+            index
+        }
+        None => TerminalSearch::with_capacity_and_max(window.retained_total, key.max_lines)
+            .with_ambiguous_width(key.ambiguous),
+    };
+    let SearchRows {
+        text: mut lines,
+        mut cells,
+        mut wrapped,
+    } = copy.rows;
+    if layout == SearchLayout::Logical {
+        let mut at = 0usize;
+        for span in &copy.spans {
+            let next = at.saturating_add(span.len()).min(lines.len());
+            if let (Some(lines), Some(cells), Some(wrapped)) = (
+                lines.get_mut(at..next),
+                cells.get_mut(at..next),
+                wrapped.get_mut(at..next),
+            ) {
+                if let Some(first) = wrapped.first_mut() {
+                    *first = false;
+                }
+                join_wrapped_rows(lines, cells, wrapped, usize::from(key.cols));
+            }
+            at = next;
+        }
+    }
+    let rows = copy.spans.into_iter().flatten();
+    index.index_numbered_cells_owned(
+        rows.zip(lines.into_iter().zip(cells))
+            .map(|(row, (text, cells))| (row, text, cells)),
+    );
+    index.set_history_prefix_eviction((window.skipped_prefix > 0).then_some(window.retained_base));
+    index
 }
 
 #[cfg(test)]
@@ -370,6 +567,64 @@ pub(crate) mod tests {
         // The corrupt block's placeholder rows sit between the needles.
         assert_eq!(got[0].0, oldest + 2);
         assert_eq!(got[1].0, oldest + 38 + corrupt);
+    }
+
+    /// A history line longer than the read bound (a crafted checkpoint can store one) is
+    /// indexed up to the bound and counted as a line not searched to its end, by the
+    /// full build, the refresh and the budgeted search alike, until it leaves the
+    /// history.
+    #[test]
+    fn a_history_line_past_the_read_bound_is_counted_cut_short() {
+        use crate::grid::Grid;
+        use crate::scrollback::{Line, Scrollback};
+        use crate::terminal::selection::MAX_SCROLLBACK_LINE_SCAN_BYTES;
+        let terminal = |len: usize| {
+            let mut line = b"NEEDLE ".to_vec();
+            line.resize(len, b'A');
+            let mut scrollback = Scrollback::with_defaults();
+            scrollback.push_line(Line::from_bytes(&line));
+            Terminal::with_grid(Grid::with_tiered_scrollback(4, 80, 1000, scrollback))
+        };
+        let summary = |results: &crate::search::SearchResults| {
+            (
+                results.matches.len(),
+                results.cut_short_lines,
+                results.incomplete,
+            )
+        };
+        let search = |t: &mut Terminal, regex: bool| {
+            let got = t
+                .indexed_search()
+                .search_results_opts("needle", false, regex)
+                .expect("searched");
+            summary(&got)
+        };
+        // NEGATIVE CONTROL: a line exactly at the bound is read whole.
+        let mut whole = terminal(MAX_SCROLLBACK_LINE_SCAN_BYTES);
+        assert_eq!(search(&mut whole, false), (1, 0, false));
+
+        let mut t = terminal(MAX_SCROLLBACK_LINE_SCAN_BYTES + 1);
+        for regex in [false, true] {
+            assert_eq!(search(&mut t, regex), (1, 1, true), "regex {regex}");
+            let step = t
+                .search_budgeted("needle", false, regex, None, 100)
+                .expect("budgeted search");
+            assert!(step.complete, "one step covers the fixture");
+            assert_eq!(
+                summary(&step.results),
+                (1, 1, true),
+                "budgeted, regex {regex}"
+            );
+        }
+        let refreshes = t.search_index_refreshes();
+        t.process(b"more output\r\n");
+        assert_eq!(search(&mut t, false), (1, 1, true), "the refreshed index");
+        assert!(
+            t.search_index_refreshes() > refreshes,
+            "precondition: a refresh served it"
+        );
+        t.process(b"\x1b[3J");
+        assert_eq!(search(&mut t, false), (0, 0, false), "the line was erased");
     }
 
     /// Absolute rows only grow and survive live upgrades, so a long-lived tab passes row
@@ -1228,7 +1483,8 @@ pub(crate) mod tests {
     }
 
     /// A width change (history rewrapped) and a Kitty CSI +T unscroll (history renumbered)
-    /// both fall back to the full rebuild and advance the renumber epoch.
+    /// both fall back to the full rebuild and advance the renumber epoch. NEGATIVE CONTROL:
+    /// a height change at the same width takes the refresh arm.
     #[test]
     fn width_change_and_unscroll_rebuild_instead_of_refreshing() {
         let mut t = Terminal::new(6, 40);
@@ -1237,8 +1493,18 @@ pub(crate) mod tests {
         }
         let _ = cached_results(&mut t, "needle");
         let refreshes = t.search_index_refreshes();
+        t.resize(8, 40);
+        let got = cached_results(&mut t, "needle");
+        assert_eq!(
+            t.search_index_refreshes(),
+            refreshes + 1,
+            "a height change at the same width refreshes"
+        );
+        assert_eq!(got, legacy_results(&t, "needle"));
+        let _ = cached_results(&mut t, "needle");
+        let refreshes = t.search_index_refreshes();
         let epoch = t.grid().history_renumber_epoch();
-        t.resize(6, 33);
+        t.resize(8, 33);
         // The `cols` fence alone would pass the refresh assertion below; without the
         // width-reflow epoch bump a later width change restoring `cols` would refresh over
         // renumbered keys.
@@ -1280,5 +1546,517 @@ pub(crate) mod tests {
             "a history renumbering must force a full rebuild"
         );
         assert_eq!(got, legacy_results(&t, "needle"));
+    }
+
+    /// A request for the logical layout (soft-wrap runs joined) at `depth_cap`.
+    fn logical(depth_cap: usize) -> crate::terminal::SearchRequest {
+        crate::terminal::SearchRequest {
+            depth_cap,
+            layout: crate::terminal::SearchLayout::Logical,
+            anchor: None,
+        }
+    }
+
+    /// Copy the rest of a plan's rows, a few per hold, as a GUI host copies them.
+    fn copy_rows(t: &Terminal, plan: &mut crate::terminal::SearchPlan) {
+        while plan.rows_to_read() > 0 {
+            t.read_search_chunk(plan, 3);
+        }
+    }
+
+    /// One case-insensitive forward query over a built index, as `(row, col, len)` hits.
+    fn hits_of(built: &mut crate::terminal::BuiltSearch, pat: &str) -> Vec<(usize, usize, usize)> {
+        let (results, _) = built
+            .query(
+                pat,
+                false,
+                false,
+                crate::search::SearchDirection::Forward,
+                false,
+            )
+            .expect("a literal query");
+        results
+            .matches
+            .iter()
+            .map(|m| (m.line, m.start_col, m.len()))
+            .collect()
+    }
+
+    /// One logical-layout search through the whole protocol: plan, chunked copy, build,
+    /// query, finish.
+    fn logical_search(
+        t: &mut Terminal,
+        depth_cap: usize,
+        pat: &str,
+    ) -> (Vec<(usize, usize, usize)>, crate::terminal::SearchVerdict) {
+        let mut plan = t.search_plan(&logical(depth_cap));
+        copy_rows(t, &mut plan);
+        let mut built = plan.build();
+        let hits = hits_of(&mut built, pat);
+        (hits, t.finish_search(built).0)
+    }
+
+    /// The same search over an index built afresh (the slot released first).
+    fn fresh_logical(t: &mut Terminal, depth_cap: usize, pat: &str) -> Vec<(usize, usize, usize)> {
+        t.release_search_index();
+        logical_search(t, depth_cap, pat).0
+    }
+
+    /// The spans a build plan copies, named as its first chunk names them, no row copied.
+    fn spans_of(
+        t: &Terminal,
+        plan: &mut crate::terminal::SearchPlan,
+    ) -> Vec<std::ops::Range<usize>> {
+        t.name_search_copy(plan);
+        match &plan.kind {
+            super::PlanKind::Build(copy) => copy.spans.clone(),
+            super::PlanKind::Hit { .. } => Vec::new(),
+        }
+    }
+
+    fn needles(t: &mut Terminal, n: usize) {
+        for i in 0..n {
+            t.process(format!("needle {i}\r\n").as_bytes());
+        }
+    }
+
+    /// Output between the plan and the copy tears the copy, a cold build's or a refresh's
+    /// (whose first chunk then names its rows off the moved terminal): the search is still
+    /// answered from the rows it read, the verdict says it is not the terminal's, and the
+    /// index is not kept, so the next plan builds again. NEGATIVE CONTROL: the same search
+    /// with no output is consistent and leaves the slot answering the next plan.
+    #[test]
+    fn a_build_torn_by_output_is_answered_but_not_installed() {
+        for (refresh, torn) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut t = Terminal::new(4, 20);
+            needles(&mut t, 10);
+            if refresh {
+                let _ = logical_search(&mut t, 1_000, "needle");
+                t.process(b"needle 10\r\n");
+            }
+            let refreshes = t.search_index_refreshes();
+            let mut plan = t.search_plan(&logical(1_000));
+            assert!(
+                !plan.is_hit(),
+                "refresh={refresh} torn={torn}: precondition"
+            );
+            if torn {
+                t.process(b"needle late\r\n");
+            }
+            copy_rows(&t, &mut plan);
+            let mut built = plan.build();
+            assert!(
+                hits_of(&mut built, "needle").len() >= 10,
+                "refresh={refresh} torn={torn}"
+            );
+            assert_eq!(
+                t.finish_search(built).0,
+                crate::terminal::SearchVerdict {
+                    consistent: !torn,
+                    frame_stable: true,
+                },
+                "refresh={refresh} torn={torn}: output moves the generation, not the frame"
+            );
+            assert_eq!(
+                t.search_index_refreshes() - refreshes,
+                u64::from(refresh),
+                "refresh={refresh} torn={torn}: precondition"
+            );
+            assert_eq!(
+                t.search_plan(&logical(1_000)).is_hit(),
+                !torn,
+                "refresh={refresh} torn={torn}"
+            );
+        }
+    }
+
+    /// A hit's query runs off the lock; a mutation between the query and the finish is
+    /// reported, never hidden: output makes it inconsistent with the frame standing; a
+    /// screen switch, a width or ambiguous-width change and a history renumbering move
+    /// the frame too. The ambiguous-width switch and the Kitty `CSI +T` unscroll move no
+    /// `content_seq`, so only the key's other fields see them. NEGATIVE CONTROL: no
+    /// mutation is consistent.
+    #[test]
+    fn a_hit_query_raced_by_output_reports_inconsistent() {
+        let verdict = |consistent, frame_stable| crate::terminal::SearchVerdict {
+            consistent,
+            frame_stable,
+        };
+        let races: [(
+            &str,
+            Option<fn(&mut Terminal)>,
+            crate::terminal::SearchVerdict,
+        ); 6] = [
+            ("none", None, verdict(true, true)),
+            (
+                "output",
+                Some(|t| {
+                    t.process(b"more\r\n");
+                }),
+                verdict(false, true),
+            ),
+            (
+                "alt switch",
+                Some(|t| {
+                    t.process(b"\x1b[?1049h");
+                }),
+                verdict(false, false),
+            ),
+            (
+                "ambiguous width",
+                Some(|t| {
+                    t.apply_config(&crate::config::TerminalConfig {
+                        ambiguous_width_double: true,
+                        ..Default::default()
+                    });
+                }),
+                verdict(false, false),
+            ),
+            ("width", Some(|t| t.resize(4, 30)), verdict(false, false)),
+            (
+                "unscroll",
+                Some(|t| {
+                    t.process(b"\x1b[2+T");
+                }),
+                verdict(false, false),
+            ),
+        ];
+        for (label, race, want) in races {
+            // A tiered store under the ring: a ring-only grid routes an unscroll to a
+            // plain region scroll.
+            let mut t = Terminal::with_scrollback(
+                4,
+                40,
+                8,
+                aterm_scrollback::Scrollback::new(64, 512, 8_000_000),
+            );
+            needles(&mut t, 40);
+            let _ = logical_search(&mut t, 1_000, "needle");
+            let plan = t.search_plan(&logical(1_000));
+            assert!(plan.is_hit(), "{label}: precondition");
+            let mut built = plan.build();
+            assert_eq!(hits_of(&mut built, "needle").len(), 40, "{label}");
+            if let Some(race) = race {
+                race(&mut t);
+            }
+            assert_eq!(t.finish_search(built).0, want, "{label}");
+        }
+    }
+
+    /// A soft-wrap run is indexed as one line keyed at the row it starts on, so a refresh
+    /// whose boundary lands inside a run re-reads from the run's head: the head is
+    /// re-joined with what the boundary row holds now. NEGATIVE CONTROL: the same refresh
+    /// copied from the boundary row leaves the head holding the rows it lost.
+    #[test]
+    fn refresh_rejoins_the_run_its_boundary_lands_in() {
+        let setup = || {
+            let mut t = Terminal::new(4, 10);
+            // "0123456789" scrolls into history, "ABCDEFGHIJ" stays the top visible row,
+            // a continuation of it.
+            t.process(b"0123456789ABCDEFGHIJ\r\naa\r\nbb\r\n");
+            assert_eq!(
+                logical_search(&mut t, 1_000, "9A").0.len(),
+                1,
+                "the run is whole"
+            );
+            // Rewrite the top visible row out of the run, then scroll it into history.
+            t.process(b"\x1b[H\x1b[2Kzz\x1b[4;1H\r\n");
+            t
+        };
+        let mut t = setup();
+        let refreshes = t.search_index_refreshes();
+        let mut plan = t.search_plan(&logical(1_000));
+        assert_eq!(
+            spans_of(&t, &mut plan).first().map(|span| span.start),
+            Some(0),
+            "from the head"
+        );
+        copy_rows(&t, &mut plan);
+        let mut built = plan.build();
+        assert!(
+            hits_of(&mut built, "9A").is_empty(),
+            "the head is re-joined"
+        );
+        assert_eq!(
+            hits_of(&mut built, "0123456789").len(),
+            1,
+            "with its own row's text"
+        );
+        let _ = t.finish_search(built);
+        assert_eq!(
+            t.search_index_refreshes(),
+            refreshes + 1,
+            "precondition: a refresh"
+        );
+
+        let mut t = setup();
+        let mut plan = t.search_plan(&logical(1_000));
+        let _ = spans_of(&t, &mut plan);
+        if let super::PlanKind::Build(copy) = &mut plan.kind {
+            copy.spans[0].start = 1;
+        }
+        copy_rows(&t, &mut plan);
+        assert_eq!(hits_of(&mut plan.build(), "9A").len(), 1, "a stale head");
+    }
+
+    /// When the window's floor advances into a soft-wrap run, the run's head leaves the
+    /// window with the rows below the floor; a fresh build starts a line at the floor with
+    /// the run's remaining rows, and so does the refresh. NEGATIVE CONTROL: the refresh
+    /// without that span leaves those rows as empty continuations of a head it dropped.
+    #[test]
+    fn a_refresh_rereads_the_run_its_window_floor_lands_in() {
+        // A soft-wrap run on rows 1 to 3 of a 4x10 screen, short lines after it.
+        let output = || {
+            let mut t = Terminal::new(4, 10);
+            t.process(b"s0\r\n0123456789ABCDEFGHIJKLMNOPQRST\r\n");
+            for i in 0..5 {
+                t.process(format!("t{i}\r\n").as_bytes());
+            }
+            t
+        };
+        // A depth window whose floor is the run's second row, then one line more, so the
+        // floor advances to its third.
+        let depth = {
+            let t = output();
+            t.grid().scrollback_lines() + usize::from(t.rows()) - 2
+        };
+        let setup = || {
+            let mut t = output();
+            // The window's line at row 2 holds rows 2 and 3: a hit straddles them.
+            assert_eq!(
+                logical_search(&mut t, depth, "JK").0,
+                vec![(2, 9, 2)],
+                "floor at row 2"
+            );
+            t.process(b"t5\r\n");
+            t
+        };
+        let mut t = setup();
+        assert_eq!(
+            t.grid().oldest_absolute_row(),
+            0,
+            "precondition: nothing evicted"
+        );
+        let refreshes = t.search_index_refreshes();
+        let mut plan = t.search_plan(&logical(depth));
+        assert_eq!(
+            plan.key().window().retained_base,
+            3,
+            "the floor is inside the run"
+        );
+        let spans = spans_of(&t, &mut plan);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert!(
+            spans[0].start == 3 && spans[0].end < spans[1].start,
+            "{spans:?}"
+        );
+        copy_rows(&t, &mut plan);
+        let mut built = plan.build();
+        let refreshed = hits_of(&mut built, "KLMNO");
+        assert!(
+            hits_of(&mut built, "JK").is_empty(),
+            "row 2 left the window"
+        );
+        let _ = t.finish_search(built);
+        assert_eq!(
+            t.search_index_refreshes(),
+            refreshes + 1,
+            "precondition: a refresh"
+        );
+        assert_eq!(refreshed, vec![(3, 0, 5)]);
+        assert_eq!(refreshed, fresh_logical(&mut t, depth, "KLMNO"));
+
+        let mut t = setup();
+        let mut plan = t.search_plan(&logical(depth));
+        let _ = spans_of(&t, &mut plan);
+        if let super::PlanKind::Build(copy) = &mut plan.kind {
+            copy.spans.remove(0);
+        }
+        copy_rows(&t, &mut plan);
+        assert!(
+            hits_of(&mut plan.build(), "KLMNO").is_empty(),
+            "the orphaned rows"
+        );
+    }
+
+    /// The narrowing frames read off an index are kept beside it and die with it: a hit on
+    /// a new generation's index starts with none. NEGATIVE CONTROL: on an unchanged key the
+    /// next keystroke narrows off the frame the last one left.
+    #[test]
+    fn narrow_stack_dies_with_the_index() {
+        let mut t = Terminal::new(4, 40);
+        for i in 0..30 {
+            t.process(format!("find {i}\r\n").as_bytes());
+        }
+        let served_off_a_frame = |t: &mut Terminal, pat: &str| {
+            let _ = crate::terminal::take_narrowed_query_steps();
+            let (hits, verdict) = logical_search(t, 1_000, pat);
+            assert!(verdict.consistent && !hits.is_empty(), "{pat}");
+            crate::terminal::take_narrowed_query_steps() == 1
+        };
+        assert!(
+            !served_off_a_frame(&mut t, "fi"),
+            "the build seeds the first frame"
+        );
+        assert!(
+            served_off_a_frame(&mut t, "fin"),
+            "an unchanged key keeps it"
+        );
+        t.process(b"find more\r\n");
+        assert!(
+            !served_off_a_frame(&mut t, "find"),
+            "the refreshed index has no frames"
+        );
+        assert!(
+            served_off_a_frame(&mut t, "find "),
+            "and keeps the ones its query left"
+        );
+    }
+
+    /// A query still reading the slot's index does not turn the next refresh into a
+    /// rebuild of the window: the refresh copies the index it shares and brings the copy
+    /// up to date, leaving the reader's index as it was. NEGATIVE CONTROL: a cold plan over
+    /// the same terminal reads the whole window.
+    #[test]
+    fn a_refresh_racing_a_query_on_the_old_index_copies_it_and_leaves_it_whole() {
+        let mut t = Terminal::new(4, 40);
+        needles(&mut t, 30);
+        let _ = logical_search(&mut t, 1_000, "needle");
+        let reader = t.search_plan(&logical(1_000));
+        assert!(reader.is_hit(), "precondition");
+        let mut reader = reader.build();
+        t.process(b"needle late\r\n");
+
+        let mut refresh = t.search_plan(&logical(1_000));
+        assert!(!refresh.is_hit());
+        assert_eq!(
+            refresh.rows_to_read(),
+            refresh.key().window().retained_total,
+            "the plan's hold names no refresh rows: the window bounds them"
+        );
+        let named: usize = spans_of(&t, &mut refresh)
+            .iter()
+            .map(ExactSizeIterator::len)
+            .sum();
+        assert!(named <= 4 + 2, "a refresh, not the window: {named}");
+        assert_eq!(refresh.rows_to_read(), named);
+        copy_rows(&t, &mut refresh);
+        let mut built = refresh.build();
+        let refreshed = hits_of(&mut built, "needle");
+        assert!(t.finish_search(built).0.consistent);
+        assert_eq!(refreshed.len(), 31);
+
+        assert_eq!(
+            hits_of(&mut reader, "needle").len(),
+            30,
+            "the reader's index is unchanged"
+        );
+        assert!(!t.finish_search(reader).0.consistent);
+
+        assert_eq!(refreshed, fresh_logical(&mut t, 1_000, "needle"));
+        t.release_search_index();
+        let cold = t.search_plan(&logical(1_000));
+        let window = cold.key().window().retained_total;
+        assert_eq!(
+            cold.rows_to_read(),
+            window,
+            "a cold plan reads all {window} rows"
+        );
+    }
+
+    /// No hold frees an index, since freeing one is O(window): a plan's hold leaves what it
+    /// displaced in the plan, which `build` frees, and `finish_search` and
+    /// `take_search_index` hand what they let go of back in a discard. The cases: a plan over
+    /// another frame, a torn build the slot does not keep, a kept build displacing the
+    /// slot's, a hit whose index a refresh displaced meanwhile, and a release. NEGATIVE
+    /// CONTROL: the index dies when the build runs or the discard drops, so each held the
+    /// last reference.
+    #[test]
+    fn no_hold_frees_an_index() {
+        use std::sync::{Arc, Weak};
+
+        use crate::search::TerminalSearch;
+        let slot_index = |t: &Terminal| -> Weak<TerminalSearch> {
+            Arc::downgrade(&t.search_slot.as_ref().expect("a kept index").index)
+        };
+        let warm = || {
+            let mut t = Terminal::new(4, 40);
+            needles(&mut t, 30);
+            let _ = logical_search(&mut t, 1_000, "needle");
+            t
+        };
+
+        let mut t = warm();
+        let displaced = slot_index(&t);
+        t.resize(4, 30);
+        let mut plan = t.search_plan(&logical(1_000));
+        assert!(
+            t.search_slot.is_none(),
+            "another frame: the slot is emptied"
+        );
+        assert!(displaced.upgrade().is_some(), "the plan's hold freed it");
+        copy_rows(&t, &mut plan);
+        let built = plan.build();
+        assert!(displaced.upgrade().is_none(), "the build frees it");
+        let _ = t.finish_search(built);
+
+        let mut t = Terminal::new(4, 40);
+        needles(&mut t, 30);
+        let mut plan = t.search_plan(&logical(1_000));
+        t.process(b"needle late\r\n");
+        copy_rows(&t, &mut plan);
+        let built = plan.build();
+        let torn = Arc::downgrade(&built.index);
+        let (verdict, discard) = t.finish_search(built);
+        assert!(
+            !verdict.consistent && t.search_slot.is_none(),
+            "precondition"
+        );
+        assert!(torn.upgrade().is_some(), "the finish freed a torn build");
+        drop(discard);
+        assert!(torn.upgrade().is_none());
+
+        let mut t = Terminal::new(4, 40);
+        needles(&mut t, 30);
+        let mut first = t.search_plan(&logical(1_000));
+        let mut second = t.search_plan(&logical(1_000));
+        copy_rows(&t, &mut first);
+        copy_rows(&t, &mut second);
+        let (first, second) = (first.build(), second.build());
+        let kept = Arc::downgrade(&first.index);
+        let _ = t.finish_search(first);
+        let (verdict, discard) = t.finish_search(second);
+        assert!(verdict.consistent, "precondition");
+        assert!(
+            kept.upgrade().is_some(),
+            "the finish freed the slot it displaced"
+        );
+        drop(discard);
+        assert!(kept.upgrade().is_none());
+
+        let mut t = warm();
+        let reader = t.search_plan(&logical(1_000));
+        assert!(reader.is_hit(), "precondition");
+        let reader = reader.build();
+        t.process(b"needle late\r\n");
+        let mut refresh = t.search_plan(&logical(1_000));
+        copy_rows(&t, &mut refresh);
+        let _ = t.finish_search(refresh.build());
+        let shared = Arc::downgrade(&reader.index);
+        let (_, discard) = t.finish_search(reader);
+        assert!(
+            shared.upgrade().is_some(),
+            "the finish freed a hit's index a refresh displaced"
+        );
+        drop(discard);
+        assert!(shared.upgrade().is_none());
+
+        let mut t = warm();
+        let resident = slot_index(&t);
+        let discard = t.take_search_index();
+        assert!(t.search_slot.is_none(), "taken");
+        assert!(resident.upgrade().is_some(), "the take freed it");
+        drop(discard);
+        assert!(resident.upgrade().is_none());
     }
 }

@@ -13,7 +13,8 @@
 //! loop from it ([`Session::from_setup`]) without asking this process for
 //! anything the recorded run was told — not its pid (the holder is resolved
 //! here, once), not `$HOME` or `$TMPDIR`, not the live upgrade's dev-seam
-//! settle ([`background_settle`]). Both codecs name every field
+//! settle — neither the break's ([`background_settle`]) nor the step of the
+//! loop's waits it bounds ([`next_wait_step`]). Both codecs name every field
 //! ([`SessionSetup::write`] destructures, [`SessionSetup::read`] builds a
 //! whole literal), so a field added here and not to the header does not
 //! build.
@@ -158,6 +159,20 @@ pub struct SessionSetup {
     /// [`background_settle`] ([`Session::set_background_settle`]): read
     /// from the live upgrade's settle once, here.
     pub(super) background_settle: Duration,
+    /// The step of the waits a host's request is read between
+    /// ([`next_wait_step`]: [`WAIT_STEP`], never longer than the live
+    /// upgrade's settle as this process runs it): read once, here, as
+    /// [`Self::background_settle`] is.
+    ///
+    /// WHY THE SETUP HOLDS IT: each step is the `timeout` of an `await` the
+    /// loop asks (`await gone … timeout 20000`), a request the tape records
+    /// and a strict replay must ask again word for word. Read live at each
+    /// wait, as it once was, the step came from whichever process ran the
+    /// loop — a recording under a development build whose settle seam is
+    /// shortened (the live suite's 2 s: `timeout 2000`) replayed in a process
+    /// without the seam asked `timeout 20000` and diverged at its first wait,
+    /// though the header claimed to carry everything the run was given.
+    pub(super) wait_step: Duration,
     /// How long apart the agent's transcript is read again for a box's call
     /// ([`crate::supervise::policy::box_call::LAG_STEP`];
     /// [`Session::set_box_call_step`], a test shortens it).
@@ -216,6 +231,7 @@ impl SessionSetup {
             box_settle: BOX_SETTLE,
             autocompact_settle: AUTOCOMPACT_SETTLE,
             background_settle: background_settle(),
+            wait_step: next_wait_step(),
             box_call_step: crate::supervise::policy::box_call::LAG_STEP,
             stuck_after: wall_memory::STUCK_AFTER,
             person_hold_wait: None,
@@ -262,7 +278,10 @@ impl SessionSetup {
 
     /// The setup as a header's `[setup]` and `[env]` sections, every path the
     /// loop opens under `roots`. The home and `$TMPDIR` the approval policy
-    /// compares with the screen's text are values, written as they are; the
+    /// reads the screen with are values, written as they are and never
+    /// remapped: the policy compares them with the paths the screen draws,
+    /// and looks at the disk under them only through its probe, which a
+    /// replay answers from the tape (`tape::header`'s module docs); the
     /// worker's environment is written as its kind only — a stand-in's
     /// (a test's) with the DIGEST the tape names it by (seeded with `seed`,
     /// the tape's own: `WorkerEnv::digest`) and its pid, never a variable.
@@ -301,6 +320,7 @@ impl SessionSetup {
             box_settle,
             autocompact_settle,
             background_settle,
+            wait_step,
             box_call_step,
             stuck_after,
             person_hold_wait,
@@ -326,6 +346,7 @@ impl SessionSetup {
         w.duration("box_settle", *box_settle);
         w.duration("autocompact_settle", *autocompact_settle);
         w.duration("background_settle", *background_settle);
+        w.duration("wait_step", *wait_step);
         w.duration("box_call_step", *box_call_step);
         w.duration("stuck_after", *stuck_after);
         let ProbeWaits {
@@ -453,6 +474,9 @@ impl SessionSetup {
         let pause_max = r.duration("pause_max")?;
         let claim_renew = r.duration("claim_renew")?;
         let claim_ttl_ms = r.parsed("claim_ttl_ms")?;
+        // Required: it arrived after the format but before the recorder
+        // (`--tape`, 8533e1164c), whose first build already wrote it, so no
+        // recorded tape lacks it.
         let redecide_after_skip = r.duration("redecide_after_skip")?;
         let press_badge_after = r.duration("press_badge_after")?;
         let survey_retry: [Duration; SURVEY_TRIES] =
@@ -464,6 +488,17 @@ impl SessionSetup {
         let box_settle = r.duration("box_settle")?;
         let autocompact_settle = r.duration("autocompact_settle")?;
         let background_settle = r.duration("background_settle")?;
+        // Arrived after the format did. A tape from before read the step
+        // live, from the same settle `background_settle` was read from once
+        // (the live upgrade's, `upgrade::quiet_s`): this build's rule for the
+        // step ([`next_wait_step`]) applied to the settle the TAPE recorded,
+        // never this process's, gives back the step that run waited in —
+        // every run but a test's that shortened the break's settle alone.
+        let wait_step = r.or_shipped(
+            "wait_step",
+            WAIT_STEP.min(background_settle),
+            Reader::duration,
+        )?;
         // Arrived after the format did: a tape from before it ran with the
         // shipped step.
         let box_call_step = r.or_shipped(
@@ -556,6 +591,7 @@ impl SessionSetup {
             box_settle,
             autocompact_settle,
             background_settle,
+            wait_step,
             box_call_step,
             stuck_after,
             person_hold_wait,

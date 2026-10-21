@@ -137,6 +137,7 @@ impl CursorGlow {
         self.bs_baseline = None;
         self.quench_hint = None;
         self.translate_scroll_state(rows, self.last_ch);
+        self.scroll_rows = self.scroll_rows.saturating_add(rows);
     }
 
     /// A held park ([`HeldPark`]) rides a scroll or band move with its row, as
@@ -179,7 +180,9 @@ impl CursorGlow {
     /// map; the echo-anchor row memory is dropped ([`Self::forget_anchor_rows`]);
     /// the insert's members follow [`Self::translate_insert_rows`]; the hand's
     /// row ([`Self::hand_row`]) rides the map and keeps the caret's screen row
-    /// beside it when the hand typed at the caret ([`HandRow::carried`]).
+    /// beside it when the hand typed at the caret ([`HandRow::carried`]). The
+    /// classic engine's sparks, ring and last cell ride the same map
+    /// ([`crate::classic_wake::ClassicWake::translate_rows`]).
     pub(super) fn translate_row_addressed(&mut self, map: &impl Fn(u16) -> Option<u16>) {
         // Read before `last` moves: whether the hand was typing at the caret
         // the last frame drew.
@@ -217,6 +220,7 @@ impl CursorGlow {
             }
             None => false,
         });
+        self.classic.translate_rows(map);
     }
 
     /// Move every live, position-bearing member with a PTY scroll. `cell_h`

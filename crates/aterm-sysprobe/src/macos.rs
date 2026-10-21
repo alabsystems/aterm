@@ -8,7 +8,8 @@
 //!   group) and `proc_listpids(PROC_PGRP_ONLY)` with
 //!   `proc_pid_rusage(RUSAGE_INFO_V4)` per member (the group's
 //!   `ri_phys_footprint`), and the same listing for whether a group's leader
-//!   is alone in it.
+//!   is alone in it and for which members read the leader's own input device
+//!   (`proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` on descriptor 0).
 //! * **Memory** — `kern.memorystatus_vm_pressure_level`;
 //!   `host_statistics64(HOST_VM_INFO64)` for memory available and in use
 //!   ([`available_mib_of`](crate::available_mib_of),
@@ -19,16 +20,22 @@
 //!   `hw.perflevelN.*` and the IORegistry's `IODeviceTree:/cpus` for the
 //!   clusters; the same `HOST_VM_INFO64` read by page class with
 //!   `vm.swapusage`; the first `IOAccelerator`'s `PerformanceStatistics`;
-//!   `statfs` of a path.
+//!   `statfs` of a path; the routing socket's `NET_RT_IFLIST2` list (decoded
+//!   by [`crate::iflist`]) with each interface's `SIOCGIFFUNCTIONALTYPE`;
+//!   `kern.maxproc`, `kern.maxprocperuid` and `RLIMIT_NPROC`.
 
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::OnceLock;
 
+use crate::iflist::{self, IfReqFunctional};
 use crate::iokit::{
     self, CFTypeRef, MAIN_PORT_DEFAULT, io_object_t, io_registry_entry_t, io_service_t,
 };
 use crate::machine::{DtCpu, Level, VmPages};
-use crate::{CoreTicks, CpuLayout, GpuReading, MemoryDetail, PATH_CAP, VolumeReading, pressure_of};
+use crate::{
+    CoreTicks, CpuLayout, GpuReading, LinkReading, MemoryDetail, PATH_CAP, ProcessLimits,
+    VolumeReading, pressure_of,
+};
 
 /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`). Declared here rather than in
 /// the first-party `libc` because the reference `libc` 0.2.186 does not export
@@ -305,6 +312,59 @@ pub(crate) fn complete_lone_group(pid: c_int, bytes: c_int, pids: &[c_int]) -> b
     }
     let mut members = pids[..bytes / width].iter().copied().filter(|p| *p != 0);
     members.next() == Some(pid) && members.next().is_none()
+}
+
+/// `pid`'s descriptor 0 when it is a device (a terminal, `/dev/null`): its
+/// `vst_dev` and `vst_ino`, from `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`
+/// decoded by [`crate::jobs::darwin::vnode`] (whose offsets
+/// `tests/proc_info_sdk.rs` holds to the SDK). `None` for a pipe, a socket, a
+/// file, no descriptor 0, or a process gone or not ours.
+fn stdin_device(pid: c_int) -> Option<(u32, u64)> {
+    use crate::jobs::darwin;
+    let mut buf = [0u8; darwin::VNODE_PATH_SIZE];
+    let size = c_int::try_from(buf.len()).ok()?;
+    // SAFETY: `buf` is `size` writable bytes, the size passed.
+    let n = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            0,
+            darwin::PROC_PIDFDVNODEPATHINFO,
+            buf.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if usize::try_from(n).ok() != Some(darwin::VNODE_PATH_SIZE) {
+        return None;
+    }
+    darwin::vnode(&buf)
+        .filter(darwin::VnodeFd::char_device)
+        .map(|v| (v.dev, v.ino))
+}
+
+/// [`crate::stdin_sharers`] on macOS: `leader` leads its group (its short
+/// info's `pbsi_pgid` is its own pid) and reads a device on descriptor 0;
+/// then every other member `proc_listpids(PROC_PGRP_ONLY)` names whose
+/// descriptor 0 is that device.
+pub(crate) fn stdin_sharers(leader: u32) -> Option<Vec<u32>> {
+    let pid = i32::try_from(leader).ok().filter(|p| *p > 0)?;
+    if short_info(pid)?.pbsi_pgid != leader {
+        return None;
+    }
+    let device = stdin_device(pid)?;
+    let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
+    let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call
+    // returns how many bytes it wrote.
+    let n = unsafe { proc_listpids(PROC_PGRP_ONLY, leader, pids.as_mut_ptr().cast(), bytes) };
+    let n = usize::try_from(n).ok().filter(|n| *n > 0)? / std::mem::size_of::<c_int>();
+    Some(
+        pids.iter()
+            .take(n.min(crate::MAX_GROUP_PIDS))
+            .copied()
+            .filter(|m| *m > 0 && *m != pid && stdin_device(*m) == Some(device))
+            .map(c_int::unsigned_abs)
+            .collect(),
+    )
 }
 
 fn hw_memsize() -> Option<u64> {
@@ -790,6 +850,8 @@ struct GpuKeys {
     renderer: CFTypeRef,
     tiler: CFTypeRef,
     in_use: CFTypeRef,
+    alloc: CFTypeRef,
+    recoveries: CFTypeRef,
 }
 
 /// The first `IOAccelerator`, matched once per process, with what never
@@ -840,6 +902,8 @@ fn accel() -> Option<&'static Accel> {
                 renderer: kept_string(c"Renderer Utilization %")?,
                 tiler: kept_string(c"Tiler Utilization %")?,
                 in_use: kept_string(c"In use system memory")?,
+                alloc: kept_string(c"Alloc system memory")?,
+                recoveries: kept_string(c"recoveryCount")?,
             };
             let name = Cf::string(c"model")
                 .and_then(|k| Cf::property(service, k.0))
@@ -891,6 +955,11 @@ pub(crate) fn gpu() -> Option<GpuReading> {
         reading.renderer_pct = value(a.keys.renderer).and_then(crate::machine::percent_of);
         reading.tiler_pct = value(a.keys.tiler).and_then(crate::machine::percent_of);
         reading.in_use_bytes = value(a.keys.in_use).and_then(|v| u64::try_from(v).ok());
+        reading.alloc_bytes = value(a.keys.alloc).and_then(|v| u64::try_from(v).ok());
+        reading.recoveries = value(a.keys.recoveries).and_then(|v| u64::try_from(v).ok());
+    }
+    if reading.device_pct.is_none() {
+        reading.unread = Some(crate::Why::Unsupported);
     }
     Some(reading)
 }
@@ -920,6 +989,174 @@ pub(crate) fn volume(path: &std::path::Path) -> Option<VolumeReading> {
         std::path::PathBuf::from(c_text(&st.f_mntonname)),
         c_text(&st.f_fstypename),
     ))
+}
+
+/// The first buffer [`net_links`] offers the interface list: room for
+/// about 140 interfaces with their addresses (24 took 10.9 KB on the M5
+/// Max). Made per call and freed before [`net_links`] returns.
+const IFLIST_FIRST: usize = 64 * 1024;
+/// The most it grows to.
+const IFLIST_CAP: usize = 4 * 1024 * 1024;
+
+/// The routing socket's `NET_RT_IFLIST2` answer: into [`IFLIST_FIRST`]
+/// bytes, and where the kernel says that is too small (`ENOMEM`), grown as
+/// [`iflist::read_growing`] says, never past [`IFLIST_CAP`].
+fn iflist_bytes() -> Option<Vec<u8>> {
+    iflist::read_growing(IFLIST_FIRST, IFLIST_CAP, iflist_sysctl)
+}
+
+/// One `sysctl` of the interface list into `buf`, or, with no buffer, of
+/// the size it needs now.
+fn iflist_sysctl(buf: Option<&mut [u8]>) -> iflist::Asked {
+    let mut mib = [
+        iflist::CTL_NET,
+        iflist::PF_ROUTE,
+        0,
+        0,
+        iflist::NET_RT_IFLIST2,
+        0,
+    ];
+    let (ptr, mut len) = match buf {
+        Some(b) => (b.as_mut_ptr().cast::<c_void>(), b.len()),
+        None => (std::ptr::null_mut(), 0),
+    };
+    // SAFETY: `mib` names its length in integers; `ptr` is writable for
+    // `len` bytes and the kernel writes at most that, reporting how many,
+    // or it is null, which asks only for the size, written to `len`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            ptr,
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        iflist::Asked::Bytes(len)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+        iflist::Asked::TooSmall
+    } else {
+        iflist::Asked::Failed
+    }
+}
+
+/// A descriptor this module opened, closed on drop.
+struct Fd(c_int);
+
+impl Drop for Fd {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor this owner opened, closed once.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// A datagram socket to ask interface ioctls on, close-on-exec; `None`
+/// where it cannot be opened (a sandbox that denies sockets).
+fn ioctl_socket() -> Option<Fd> {
+    // SAFETY: plain integers; the descriptor is owned by the `Fd` below.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let fd = Fd(fd);
+    // SAFETY: `fd` is a descriptor this process holds; Darwin's `socket`
+    // takes no `SOCK_CLOEXEC`, so the flag is set before anything else.
+    unsafe { libc::fcntl(fd.0, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Some(fd)
+}
+
+/// `name`'s functional type (`SIOCGIFFUNCTIONALTYPE`); `None` where the
+/// ask fails or the name does not fit `ifr_name` with its terminator.
+fn functional_type(sock: &Fd, name: &str) -> Option<u32> {
+    // SAFETY: integers and bytes; all-zero is a value.
+    let mut req: IfReqFunctional = unsafe { std::mem::zeroed() };
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() >= req.ifr_name.len() || bytes.contains(&0) {
+        return None;
+    }
+    req.ifr_name[..bytes.len()].copy_from_slice(bytes);
+    // SAFETY: `req` is a writable 32-byte `struct ifreq`, the size the
+    // request encodes, with a NUL-terminated name.
+    let rc = unsafe { libc::ioctl(sock.0, iflist::SIOCGIFFUNCTIONALTYPE, &raw mut req) };
+    (rc == 0).then_some(req.ifru_functional_type)
+}
+
+/// `index`'s name by `if_indextoname`, for an interface whose message
+/// carried none.
+fn index_name(index: u32) -> Option<String> {
+    let mut buf = [0 as libc::c_char; libc::IFNAMSIZ];
+    // SAFETY: `buf` is `IFNAMSIZ` writable bytes, which the call fills
+    // NUL-terminated, or it returns NULL.
+    let named = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+    let name = (!named.is_null()).then(|| c_text(&buf))?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// [`crate::net_links`] on macOS: the interface list decoded, a missing
+/// name asked of `if_indextoname`, and each interface's kind by
+/// [`iflist::link_kind`]: other for a name the machine filter refuses,
+/// else its functional type asked on one socket (the name's kind where
+/// that fails).
+pub(crate) fn net_links() -> Option<Vec<LinkReading>> {
+    let mut links = iflist::links_of(&iflist_bytes()?);
+    let sock = ioctl_socket();
+    for link in &mut links {
+        if link.name.is_empty()
+            && let Some(name) = index_name(link.index)
+        {
+            link.name = name;
+        }
+        link.kind = iflist::link_kind(&link.name, || {
+            sock.as_ref().and_then(|s| functional_type(s, &link.name))
+        });
+    }
+    Some(links)
+}
+
+/// [`crate::process_limits`] on macOS: `kern.maxproc`, and the smaller of
+/// `kern.maxprocperuid` and the soft `RLIMIT_NPROC`.
+pub(crate) fn process_limits() -> ProcessLimits {
+    let int = |name: &CStr| {
+        sysctl_int(name)
+            .and_then(|v| u64::try_from(v).ok())
+            .filter(|v| *v > 0)
+    };
+    ProcessLimits {
+        system: int(c"kern.maxproc"),
+        per_user: crate::machine::smaller(
+            int(c"kern.maxprocperuid"),
+            crate::machine::nproc_rlimit(),
+        ),
+    }
+}
+
+/// [`crate::caps`] on macOS: the public baseline of design §5.2 as this
+/// build reads it. Other users' processes answer no CPU time or footprint
+/// unprivileged (`proc_pid_rusage` is same-uid); the thermal notify level,
+/// `kern.sched_recommended_cores` and the per-process GPU lane are not read
+/// by this build.
+pub(crate) fn caps() -> crate::Caps {
+    use crate::{Cap, Why};
+    crate::Caps {
+        os: "macos",
+        per_core: Cap::Yes,
+        core_kinds: Cap::Yes,
+        cores_withdrawn: Cap::No(Why::NotRead),
+        memory_classes: Cap::Yes,
+        pressure: Cap::Yes,
+        commit: Cap::No(Why::Unsupported),
+        compressor: Cap::Yes,
+        swap: Cap::Yes,
+        gpu_device: crate::caps::gpu_cap(gpu().as_ref()),
+        gpu_per_proc: Cap::No(Why::NotRead),
+        proc_cpu_others: Cap::No(Why::NeedsPrivilege("root")),
+        proc_memory_others: Cap::No(Why::NeedsPrivilege("root")),
+        throttle: Cap::No(Why::NotRead),
+        volume: Cap::Yes,
+        capacity: crate::CapSource::Host,
+    }
 }
 
 #[cfg(test)]

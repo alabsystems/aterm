@@ -10,12 +10,14 @@
 //!   run= turn= step= need= need_since_ms=`, from the reader's view (a fenced
 //!   log shows its fence).
 //! - [`SessionLog::take_log_wake`]: THE WAKE. A producer appends under the
-//!   timeline's lock and releases it; whoever holds the `Subscribers` handle
-//!   then wakes the session's watchers (`await log`, `subscribe … log`) when
-//!   this says the reader's head moved. Every producer site does so (the
-//!   status sweep, the settle tick, a person's burst, the restore lineage, a
-//!   failure seen, a fence lifted, control input, a `ctl turn`, a `mark`);
-//!   the session's close wakes through `Wake::Exit`.
+//!   timeline's lock and takes the owed wake, which rings the session's
+//!   watchers (`await log`, `subscribe … log`) when this says the reader's
+//!   head moved: `SessionTimeline::slog_take_wake` rings them in that same
+//!   hold, and a `mark` ([`SessionLog::mark_claim`]) once its hold ends.
+//!   Every producer site does so (the status sweep, the settle tick, a
+//!   person's burst, the restore lineage, a failure seen, a fence lifted,
+//!   control input, a `ctl turn`, a `mark`); the session's close wakes
+//!   through `Wake::Exit`.
 //! - [`SessionLog::ctl_input`]: control input, by its author, its burst's
 //!   `mark - input`; [`validate_cause`] what a `cause=` may name.
 
@@ -154,7 +156,9 @@ const fn reserved_burst(by: &Actor) -> Option<usize> {
 
 /// THE CONSUMER HALF's state in a session's log (one `SessionLog` field):
 /// the mark limiter, the watchers' wake and the control-input bursts. Under
-/// 2 KiB a session; not counted by `Log::footprint`.
+/// 2 KiB a session, and under 4 KiB while the limiter's owed-only table is
+/// full (32 entries of 56 bytes on the heap, ruling U18); not counted by
+/// `Log::footprint`.
 #[derive(Debug)]
 pub(crate) struct Consumers {
     /// `mark`'s per-author limiter ([`aterm_slog::MarkLimiter`]): one claim a
@@ -230,12 +234,14 @@ impl SessionLog {
     /// THE OWED WAKE (phase 3A, design §2.2): whether what a reader is shown
     /// moved since the watchers were last woken — the reader's head
     /// ([`aterm_slog::Log::reader_last_seq`]) or its epoch — and so whether
-    /// the caller, once it has released the timeline's lock, must wake this
-    /// session's subscribers. One comparison of two numbers, so no append path
-    /// (this phase's, an earlier one's, or a later one's) can be forgotten:
-    /// every append moves the head, a fence lifting moves it past the overlap,
-    /// an adoption moves the epoch. Nothing here locks the subscriber
-    /// registry: the timeline's lock stays a strict leaf.
+    /// this session's watchers are owed a wake. `SessionTimeline::slog_take_wake`
+    /// takes it and rings them in the same timeline hold, as
+    /// `SessionTimeline::record` does: the watchers' `slots` lock is the leaf
+    /// under the timeline's lock. [`Self::mark_claim`] hands it to the `mark`
+    /// arm, which rings them once that hold ends. One comparison of two
+    /// numbers, so no append path (this phase's, an earlier one's, or a later
+    /// one's) can be forgotten: every append moves the head, a fence lifting
+    /// moves it past the overlap, an adoption moves the epoch.
     pub(crate) fn take_log_wake(&mut self) -> bool {
         let head = (self.log.ep(), self.log.reader_last_seq());
         let owed = head != self.consumers.notified;
@@ -333,19 +339,20 @@ impl SessionLog {
     /// `ctl turn`'s first byte, [`SessionLog::ctl_turn`]): written at the first
     /// input of a burst from `by`.
     /// An acted input (ruling T1) is marked whatever the burst, `mark -
-    /// input verb=<v> act=<w> [re=<step>] [dropped=<n>] by=<it>`, `re=` the
+    /// input verb=<v> act=<w> [re=<step>] [dropped=<n> [pool=shared]]
+    /// by=<it>`, `re=` the
     /// step a late one was admitted under (it closed before the bytes were
     /// written), within its author's mark tokens: one past its burst's first
     /// spends one ([`aterm_slog::MarkLimiter`], as a claim does: twenty, then
     /// one a second), and one its bucket is short of is counted, not marked,
-    /// the next acted mark from the same bucket saying how many (`dropped=`):
-    /// the author's own when it is a trusted actor or a session holding its
-    /// named slot, the overflow's for the authors that share it
+    /// the author's next acted mark saying how many (`dropped=`): its own
+    /// count, a trusted actor's, a named slot's holder's, or an overflowed
+    /// author's owed-only entry's (Phase 6 step 6C-6, ruling U18); past
+    /// that table, the shared pool's, said as the pool's (`dropped=<n>
+    /// pool=shared`) by an overflowed author with none of its own
     /// ([`aterm_slog::MarkLimiter::owed`]). So no author's acted keys push
-    /// the session's other records out of its ring, and no trusted actor's
-    /// count, nor a session's while it holds a named slot, rides another
-    /// author's mark; the overflow's authors (the sessions past the table,
-    /// `-`, `aterm`, a vendor) share one count, which any of them says.
+    /// the session's other records out of its ring, and no author's count
+    /// rides another author's mark as that author's.
     pub(crate) fn ctl_input_mark(
         &mut self,
         by: Actor,
@@ -378,14 +385,19 @@ impl SessionLog {
             Some(n) => f.clone().id(Key::Re, &n.to_string()).unwrap_or(f),
             None => f,
         };
-        let dropped = if acted.act.is_some() {
+        let owed = if acted.act.is_some() {
             self.consumers.limiter.owed(&by, at.mono_ms)
         } else {
-            0
+            aterm_slog::Owed::Own(0)
         };
+        let dropped = owed.count();
         let mut f = f;
         if dropped > 0 {
             let _ = f.set(Key::Dropped, aterm_slog::Val::U(dropped));
+            // The shared pool's count is said as the pool's (ruling U18).
+            if owed.is_shared() {
+                f = f.clone().word(Key::Pool, "shared").unwrap_or(f);
+            }
         }
         let wrote = self
             .log

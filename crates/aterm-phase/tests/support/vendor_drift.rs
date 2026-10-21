@@ -59,151 +59,185 @@ pub(crate) fn contains(bytes: &[u8], needle: &str) -> bool {
     contains_bytes(bytes, needle.as_bytes())
 }
 
-/// One of the limit reset's templates, whole, as the bundle spells it
-/// ([`reset_templates`]): the row it stands for, and the builds that
-/// spell it so — from `since` through `last`, as an anchor's are
-/// ([`Anchor::drawn_by`]).
-pub(crate) struct Template {
-    pub(crate) id: &'static str,
-    pub(crate) since: &'static str,
-    pub(crate) last: Option<&'static str>,
-    pub(crate) text: String,
-}
-
-impl Template {
-    pub(crate) fn spelled_by(&self, version: Option<&str>) -> bool {
-        Anchor {
-            last: self.last,
-            id: self.id,
-            text: "",
-            since: self.since,
-            kind: AnchorKind::Literal,
-        }
-        .drawn_by(version)
-    }
-}
-
-/// THE LIMIT RESET'S TEMPLATES, WHOLE, as the bundle spells them — a `·`
-/// as its `\xB7` escape, a value as its `{placeholder}` — each built
-/// from the rows the readers match by (`crate::reset`) and named by the
-/// row it stands for: the grant row, the confirmation's body and its
-/// detail, and the opening of each answer a reader tells apart; and from
-/// 2.1.304 on, which names the kind of reset, the confirmation's title,
-/// its yes and its early lines' tail too, each with its `{kind}`.
+/// THE LIMIT RESET'S TEMPLATES, WHOLE, as the 2.1.304 bundle spells them
+/// — a `·` as its `\xB7` escape, a value as its `{placeholder}` — each
+/// built from the rows the readers match by (`crate::reset`) and named
+/// by what it is: the grant row, the confirmation's title, yes, body
+/// and detail, the early lines' tail, the answers a reader tells apart
+/// (the spent line, the still-walled one, the kept line's head, the
+/// lifted and login lines), the three switches of the bundle's that say
+/// which kind each word is — `X()`'s `{kind}`, `ce()`'s count noun for
+/// the five-hour kind, `Mt()`'s `{done}` (`crate::reset::ResetKind`
+/// reads each word as that kind) — the two rules the readers read the
+/// kinds' words back by: `ce()`'s count grammar (`no …s`, `1 …`, `n …s`)
+/// and `Kg`'s `{Kind}` (the first letter upper-cased); and `Yn`'s
+/// `{limits}`, the confirmation's body, which `reset_limit_name` and
+/// `limits_of` read back: its limit names, the model limits' names it
+/// strips ` limit` from (`jie`), and its `X limit` / `a, b and c limits`
+/// join.
 ///
-/// The literal-anchor matcher looks for each side of a `·` on its own, and the sides of
-/// the confirmation's two joins are `now`, `left` and `use by`: words a
-/// build that rewords the confirmation still carries elsewhere. A
-/// template is ONE literal of the vendor's table, so a reworded one is
-/// missing — and what a rewording costs is every confirmation read
-/// inexact and Escaped, the wall's one attempt with it.
-pub(crate) fn reset_templates() -> Vec<Template> {
+/// [`missing`] looks for each side of a `·` on its own, and the kinds'
+/// names, the confirmation's two joins (`now`, `left`, `use by`) and the
+/// heads `Use a`, `Yes, use my` and `kept` are words a build that
+/// rewords the reset still carries elsewhere. A template is ONE literal
+/// of the vendor's table (a switch, one function's body), so a reworded
+/// one is missing — and what a rewording costs is every row, every
+/// confirmation or every answer of the reset read as none of its own:
+/// refused, the wall's one attempt with it, or a spent reset recorded as
+/// failed.
+pub(crate) fn reset_templates() -> Vec<(&'static str, String)> {
+    use crate::reset::ResetKind;
     let escaped = |id: &str| anchor(id).replace('·', "\\xB7");
-    let led = |id: &str| format!("{} \\xB7 ", anchor(id));
-    let stays = anchor("reset.confirm.stays");
-    let (now, week) = stays.split_once(" · ").expect("the week's join");
-    let use_by = escaped("reset.confirm.use_by");
-    let old = |id, text| Template {
-        id,
-        since: "2.1.287",
-        last: Some("2.1.303"),
-        text,
+    let limit_name = |limit_type: &str| {
+        crate::reset::reset_limit_name(limit_type).expect("a window the confirmation names")
     };
-    let any = |id, text| Template {
-        id,
-        since: "2.1.287",
-        last: None,
-        text,
-    };
-    let kinds = |id, text| Template {
-        id,
-        since: "2.1.304",
-        last: None,
-        text,
+    let (now, stays) = anchor("reset.confirm.stays")
+        .split_once(" · ")
+        .expect("the week's join has two sides");
+    let left = anchor("reset.confirm.use_by")
+        .split(" · ")
+        .next()
+        .expect("the detail's join opens with its word");
+    // A switch over the kinds' ids in the bundle's own order, each
+    // returning `word(kind)`.
+    let switch = |word: &dyn Fn(ResetKind) -> String| {
+        let cases: String = [
+            ResetKind::Session,
+            ResetKind::Fable,
+            ResetKind::Full,
+            ResetKind::Weekly,
+        ]
+        .into_iter()
+        .map(|kind| format!("case\"{}\":return\"{}\"", kind.word(), word(kind)))
+        .collect::<Vec<_>>()
+        .join(";");
+        format!("{cases}}}")
     };
     vec![
-        old(
-            "reset.row.until",
+        (
+            "grant row",
             format!(
-                "{} ({{left}} {} {{date}})",
+                "{} {{kind}} ({{left}} {} {{date}})",
                 anchor("reset.row"),
                 anchor("reset.row.until")
             ),
         ),
-        old(
-            "reset.confirm.stays",
+        (
+            "confirmation title",
+            format!("{} {{kind}}?", anchor("reset.row")),
+        ),
+        (
+            "confirmation yes",
+            format!("{} {{kind}}", anchor("reset.yes")),
+        ),
+        (
+            "confirmation body",
             format!(
-                "{} {{limits}} {} {{week}}",
-                anchor("reset.confirm.refills"),
-                escaped("reset.confirm.stays")
+                "{} {{limits}} {now} \\xB7 {{returns}} \\xB7 {stays} {{week}}",
+                anchor("reset.confirm.refills")
             ),
         ),
-        old(
-            "reset.confirm.use_by",
-            format!("{{resets}} {use_by} {{deadline}}"),
-        ),
-        old("reset.done", led("reset.done")),
-        old("reset.kept", led("reset.kept")),
-        any("reset.lifted", escaped("reset.lifted")),
-        any("reset.login", led("reset.login")),
-        kinds(
-            "reset.kind.row",
+        (
+            "confirmation detail",
             format!(
-                "{} {{kind}} ({{left}} {} {{date}})",
-                anchor("reset.kind.row"),
-                anchor("reset.row.until")
+                "{{kindResets}} {} {{deadline}}",
+                escaped("reset.confirm.use_by")
             ),
         ),
-        kinds(
-            "reset.kind.title",
-            format!("{} {{kind}}?", anchor("reset.kind.row")),
-        ),
-        kinds(
-            "reset.kind.yes",
-            format!("{} {{kind}}", anchor("reset.kind.yes")),
-        ),
-        // The body: 2.1.304 put a `{returns}` segment between the two,
-        // which only a Fable reset fills (`Ot()`); a segment with no
-        // value is dropped, so every other kind's body is drawn as
-        // before.
-        kinds(
-            "reset.confirm.stays",
-            format!(
-                "{} {{limits}} {now} \\xB7 {{returns}} \\xB7 {week} {{week}}",
-                anchor("reset.confirm.refills"),
-            ),
-        ),
-        kinds(
-            "reset.confirm.use_by",
-            format!("{{kindResets}} {use_by} {{deadline}}"),
-        ),
-        kinds(
-            "reset.kind.early",
+        (
+            "early line",
             format!(
                 "{} {{kind}} {}",
-                anchor("reset.kind.early"),
-                anchor("reset.kind.anyway")
+                anchor("reset.early"),
+                anchor("reset.early.anyway")
             ),
         ),
-        kinds(
-            "reset.done",
-            format!("{{done}} \\xB7 {week} {{week}} \\xB7 {{kindResets}} left"),
+        ("kind names", switch(&|kind| kind.name().to_string())),
+        (
+            "five-hour count noun",
+            format!("\"session\"?\"{}\":", anchor("reset.kind.session_count")),
         ),
-        kinds(
-            "reset.kind.kept",
-            format!("{{Kind}} {} \\xB7 ", anchor("reset.kind.kept")),
+        // `ce()`'s grammar of `{kindResets}`, which `ResetKind::resets_of`
+        // reads back (`no <noun>s`, `1 <noun>`, `<n> <noun>s`), and `Kg`'s
+        // `{Kind}`, the kind's first letter upper-cased, which the kept
+        // and still-walled lines are read by (`ResetKind::capital`):
+        // byte for byte, the bundle's minified names and all, so a build
+        // that rewords either, or only renames them, is named.
+        (
+            "kind count grammar",
+            "return s===0?`no ${d}s`:s===1?`1 ${d}`:`${s} ${d}s`}".to_string(),
         ),
-        kinds("reset.kept.choice", led("reset.kept.choice")),
+        (
+            "capitalised kind",
+            "\"{Kind}\":n.kind===void 0?void 0:n.kind.charAt(0).toUpperCase()+n.kind.slice(1),"
+                .to_string(),
+        ),
+        (
+            "spent heads",
+            switch(&|kind| kind.done().replace('·', "\\xB7")),
+        ),
+        (
+            "spent line",
+            format!("{{done}} \\xB7 {stays} {{week}} \\xB7 {{kindResets}} {left}"),
+        ),
+        (
+            "still-walled line",
+            format!(
+                "{{Kind}} {} {{limit}} until {{date}} \\xB7 {{kindResets}} {left}",
+                escaped("reset.walled")
+            ),
+        ),
+        (
+            "kept line",
+            format!("{{Kind}} {} \\xB7 run /", anchor("reset.kept")),
+        ),
+        ("lifted line", escaped("reset.lifted")),
+        ("login line", format!("{} \\xB7 ", anchor("reset.login"))),
+        // `Yn`'s `{limits}`: each window's name as `reset_limit_name`
+        // reads it back (a Fable give-back's own `Fable` aside), the
+        // model limits' names (`jie`'s, less ` limit`), and the join
+        // `limits_of` splits.
+        (
+            "limit names",
+            format!(
+                "case\"five_hour\":s.add(\"{}\");break;case\"seven_day\":s.add(\"{}\");break;\
+                 case\"seven_day_overage_included\":s.add(a.givesBackWeekly?\"Fable\":\"{}\");\
+                 break;",
+                limit_name("five_hour"),
+                limit_name("seven_day"),
+                limit_name("seven_day_overage_included")
+            ),
+        ),
+        (
+            "model limit names",
+            format!(
+                "seven_day_opus:\"{} limit\",seven_day_sonnet:\"{} limit\"",
+                limit_name("seven_day_opus"),
+                limit_name("seven_day_sonnet")
+            ),
+        ),
+        (
+            "model limit names' strip",
+            ".replace(/ limit$/,\"\"));break;case\"seven_day_sonnet\":".to_string(),
+        ),
+        (
+            "limits join",
+            "if(m===void 0)return\"limits\";return d.length===0?`${m} limit`:`${d.join(\", \")} \
+             and ${m} limits`}"
+                .to_string(),
+        ),
     ]
 }
 
-/// The rows whose template a build of `version` spells and `bytes` do
-/// not hold whole.
-pub(crate) fn missing_templates(bytes: &[u8], version: Option<&str>) -> Vec<&'static str> {
-    reset_templates()
+/// The names of the `templates` that `bytes` do not hold whole.
+pub(crate) fn missing_templates(
+    bytes: &[u8],
+    templates: &[(&'static str, String)],
+) -> Vec<&'static str> {
+    templates
         .iter()
-        .filter(|t| t.spelled_by(version) && !contains(bytes, &t.text))
-        .map(|t| t.id)
+        .filter(|(_, template)| !contains(bytes, template))
+        .map(|(name, _)| *name)
         .collect()
 }
 
@@ -213,6 +247,5 @@ pub(crate) const PLANTED_ROLLOUT_KEY: &[Anchor] = &[Anchor {
     id: "rollout.planted",
     text: "turn_context_planted_by_no_build",
     since: "0.163.0",
-    last: None,
     kind: AnchorKind::Literal,
 }];

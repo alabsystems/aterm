@@ -316,9 +316,7 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
              meaningful until it is restored."
         );
     } else {
-        for cell in cells {
-            let mut cell_log = String::new();
-            let resolved = resolve::graph_and_paths(cargo, root, cell, &mut cell_log);
+        for (cell, (cell_log, resolved)) in cells.iter().zip(resolve_cells(cargo, root, cells)) {
             if !cell_log.is_empty() {
                 notes += 1;
                 log.push_str(&cell_log);
@@ -1065,6 +1063,39 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
     Ok(out)
 }
 
+/// Every cell's graph ([`resolve::graph_and_paths`]) with the notes its resolution wrote, in
+/// `cells` order. Each cell is a read-only `targo tree` bound by cargo's rustc probes: the
+/// host's facts, which every cell needs, and its own triple's. The first cell runs alone, so
+/// the host's facts are in the target dir's rustc cache when the rest start, and the rest run
+/// at once: the verb waits for two cells, not eight, and probes the host once, as one cell
+/// after another did.
+fn resolve_cells(
+    cargo: &Cargo,
+    root: &Path,
+    cells: &[Cell],
+) -> Vec<(String, Result<Resolved, String>)> {
+    let resolve_one = |cell: &Cell| {
+        let mut cell_log = String::new();
+        let resolved = resolve::graph_and_paths(cargo, root, cell, &mut cell_log);
+        (cell_log, resolved)
+    };
+    let Some((first, rest)) = cells.split_first() else {
+        return Vec::new();
+    };
+    let mut resolved = vec![resolve_one(first)];
+    std::thread::scope(|scope| {
+        let running: Vec<_> = rest
+            .iter()
+            .map(|cell| scope.spawn(move || resolve_one(cell)))
+            .collect();
+        resolved.extend(running.into_iter().map(|cell| {
+            cell.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }));
+    });
+    resolved
+}
+
 /// The `--edges normal,build` closure of one cell, used only to tell a fork that is a build-time
 /// dependency from a dead patch. No `--no-dedupe`: only package identity is needed.
 fn build_closure(cargo: &Cargo, root: &Path, cell: &Cell) -> Result<Resolved, String> {
@@ -1503,7 +1534,10 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
     /// registry `foo`; under `bare` and `nobuild` nowhere. `broken` does not
     /// resolve, and `nobuild`'s build closure does not. Each cell's name is not
     /// its package, as in the real cells. Each row is a selection of cells and
-    /// its verdict as `(green, could not run)`; the first two are green.
+    /// its verdict as `(green, could not run)`; the first two are green. The
+    /// cells after the first resolve at once ([`resolve_cells`]): each comes
+    /// back as its own cell's graph, in cells order, the one that cannot
+    /// resolve included, so no finding is booked to another cell.
     #[cfg(unix)]
     #[test]
     fn patch_liveness_is_judged_in_every_cell_at_its_own_root() {
@@ -1580,5 +1614,18 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
             assert_eq!((v.ok, v.could_not_run.is_some()), want, "{}", v.log);
             assert!(v.ok || v.log.contains("FAIL [OB-12]"), "{}", v.log);
         }
+        let cells: Vec<Cell> = [&native, &web, &broken, &tool, &bare, &mixed]
+            .into_iter()
+            .cloned()
+            .collect();
+        let roots: Vec<Option<String>> = resolve_cells(&cargo, root, &cells)
+            .into_iter()
+            .map(|(_, resolved)| resolved.ok().map(|(graph, _)| graph.root.name))
+            .collect();
+        let own: Vec<Option<String>> = cells
+            .iter()
+            .map(|c| (c.package != "broken").then(|| c.package.clone()))
+            .collect();
+        assert_eq!(roots, own, "each cell's own graph, in cells order");
     }
 }

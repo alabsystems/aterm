@@ -1,0 +1,544 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+// Author: Andrew Yates
+
+//! [`Terminal::replay_fork`] against the straight fold. On each fixture, a fork
+//! taken at every event boundary and fed the rest of the events must end where
+//! the engine fed all of them ends: the same rows, cursor, images and full
+//! checkpoint. The negative controls show each fixture holds state a fork must
+//! carry or refuse: the restore a fork replaces ends elsewhere, and so does a
+//! fork without any one piece of the transient state it carries.
+
+use super::{Terminal, TerminalCheckpoint};
+use crate::grid::ResizePolicy;
+use crate::terminal::ClockReading;
+use std::time::Duration;
+
+/// One recorded event: a PTY read, or a resize to `(rows, cols)`.
+enum Ev {
+    Out(Vec<u8>),
+    Resize(u16, u16),
+}
+
+fn out(bytes: impl Into<Vec<u8>>) -> Ev {
+    Ev::Out(bytes.into())
+}
+
+struct Fixture {
+    name: &'static str,
+    rows: u16,
+    cols: u16,
+    policy: ResizePolicy,
+    /// The engine's history cap, when not the default.
+    ring: Option<usize>,
+    events: Vec<Ev>,
+}
+
+/// What a fold ends with, everything a replay or a checkpoint can read.
+#[derive(Debug, PartialEq)]
+struct Seen {
+    rows: Vec<String>,
+    cursor: (u16, u16),
+    images: Vec<Vec<(usize, aterm_grid::ImageRef)>>,
+    checkpoint: Option<TerminalCheckpoint>,
+}
+
+fn seen(t: &Terminal) -> Seen {
+    let rows = usize::from(t.rows());
+    let c = t.cursor();
+    Seen {
+        rows: (0..rows)
+            .map(|r| t.row_text(r).unwrap_or_default())
+            .collect(),
+        cursor: (c.row, c.col),
+        images: (0..rows).map(|r| t.images_row(r)).collect(),
+        checkpoint: t.checkpoint_continuing(),
+    }
+}
+
+/// Where the fixture clock starts: an hour ahead of the real clock, which a
+/// copy reads until its first event. A synchronized-update window armed at the
+/// copy's own clock (re-armed, not carried) has run out by that event; the
+/// source's, armed on the fixture clock an event earlier, has not.
+fn fixture_epoch() -> aterm_time::Instant {
+    ClockReading::now()
+        .monotonic
+        .checked_add(Duration::from_secs(3600))
+        .expect("clock")
+}
+
+/// Event `i`'s clock: fixed, so marks and the synchronized-update timer read
+/// the same instant in every fold.
+fn clock(epoch: aterm_time::Instant, i: usize) -> ClockReading {
+    let ms = u64::try_from(i).expect("small");
+    ClockReading {
+        monotonic: epoch.checked_add(Duration::from_millis(ms)).expect("clock"),
+        wall_ms: Some(1_700_000_000_000 + ms),
+    }
+}
+
+impl Fixture {
+    /// A replay's setup (`aterm_control`'s `ReplayEngine`): the archive off
+    /// and the policy's console-host posture.
+    fn configure(&self, t: &mut Terminal) {
+        t.set_alt_archive_enabled(false);
+        t.set_console_host_posture(self.policy);
+    }
+
+    fn engine(&self) -> Terminal {
+        let mut t = Terminal::new(self.rows, self.cols);
+        self.configure(&mut t);
+        if self.ring.is_some() {
+            t.set_scrollback_line_limit(self.ring);
+        }
+        t
+    }
+
+    fn apply(&self, t: &mut Terminal, epoch: aterm_time::Instant, from: usize) {
+        for (i, ev) in self.events.iter().enumerate().skip(from) {
+            match ev {
+                Ev::Out(bytes) => t.process_at(bytes, clock(epoch, i)),
+                Ev::Resize(rows, cols) => t.resize_with_policy(*rows, *cols, self.policy),
+            }
+        }
+    }
+
+    /// For every boundary `k` (after `k` events): `copy` of the engine there,
+    /// fed the rest, and what it ends with (`None` when `copy` refused).
+    fn at_every_boundary(
+        &self,
+        copy: impl Fn(&Terminal) -> Option<Terminal>,
+    ) -> (Seen, Vec<Option<Seen>>) {
+        let epoch = fixture_epoch();
+        let mut straight = self.engine();
+        self.apply(&mut straight, epoch, 0);
+        let end = seen(&straight);
+        let mut src = self.engine();
+        let mut ends = Vec::new();
+        for (k, ev) in self.events.iter().enumerate() {
+            match ev {
+                Ev::Out(bytes) => src.process_at(bytes, clock(epoch, k)),
+                Ev::Resize(rows, cols) => src.resize_with_policy(*rows, *cols, self.policy),
+            }
+            ends.push(copy(&src).map(|mut copy| {
+                self.configure(&mut copy);
+                self.apply(&mut copy, epoch, k + 1);
+                seen(&copy)
+            }));
+        }
+        (end, ends)
+    }
+}
+
+/// The DECSC slot, a sync window, an open link, REP and XTPUSHSGR left across
+/// a boundary, links, wide and combining text, a ZWJ sequence and wrapped
+/// lines in a history capped at 20 lines, tab stops, a scroll region, an
+/// alternate-screen flap with output between its halves and a quiet one, a
+/// Native grow that reveals history, a reflow, and more output than the cap.
+fn session() -> Fixture {
+    let mut events = Vec::new();
+    for i in 0..30 {
+        events.push(out(match i % 5 {
+            0 => format!("\x1b]8;;https://example.test/{i}\x1b\\link {i}\x1b]8;;\x1b\\\r\n"),
+            1 => format!("\x1b[31mred {i}\x1b[m \u{754c}\r\n"),
+            2 => format!("e\u{301} combining {i}\r\n"),
+            3 => format!("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} {i}\r\n"),
+            _ => format!("wrap {i} {}\r\n", "x".repeat(40)),
+        }));
+    }
+    events.extend([
+        out("\x1b]8;;https://example.test/open\x1b\\open "),
+        out("link\x1b]8;;\x1b\\\r\n"),
+        out("rep X"),
+        out("\x1b[3b\r\n"),
+        out("\x1b[#{\x1b[1;32mpushed "),
+        out("\x1b[#}popped\r\n"),
+        out("\x1b[3g\x1b[1;7H\x1bH\r"),
+        out("\ttab\r\n"),
+        out("\x1b[2;6r\x1b[6;1H"),
+        out("in region 1\nin region 2\nin region 3\n"),
+        out("\x1b[r\x1b[4;10H\x1b7\x1b[8;1H"),
+        out("\x1b[?2026h\x1b[?1049h\x1b[H\x1b[2J"),
+    ]);
+    let mut frame = String::new();
+    for r in 0..8 {
+        frame.push_str(&format!("\x1b[{};1HF{r}", r + 1));
+    }
+    frame.push_str("\x1b[6;3H\x1b[?2026l");
+    events.extend([
+        out(frame),
+        Ev::Resize(7, 30),
+        out("\x1b[?1000h"),
+        Ev::Resize(8, 30),
+        Ev::Resize(7, 30),
+        Ev::Resize(8, 30),
+        out("\x1b[3;1H\x1b[Kdiff\x1b[6;3H"),
+        out("\x1b[?1049l"),
+        Ev::Resize(11, 30),
+        Ev::Resize(11, 24),
+    ]);
+    for i in 0..25 {
+        events.push(out(format!("after {i}\r\n")));
+    }
+    events.push(out("\x1b8tail"));
+    Fixture {
+        name: "session",
+        rows: 8,
+        cols: 30,
+        policy: ResizePolicy::Native,
+        ring: Some(20),
+        events,
+    }
+}
+
+/// A pager entered by `?1047h` (no cursor save) dies, and the shell's prompt
+/// (`133;A`) leaves its screen keeping the pager's cursor, not the DECSC slot
+/// an earlier program left.
+fn pager_without_cursor_save() -> Fixture {
+    let mut pager = String::from("\x1b[?1047h\x1b[H\x1b[2J");
+    for r in 0..6 {
+        pager.push_str(&format!("page {r}\r\n"));
+    }
+    Fixture {
+        name: "pager_without_cursor_save",
+        rows: 8,
+        cols: 30,
+        policy: ResizePolicy::Native,
+        ring: None,
+        events: vec![
+            out("$ ls\r\nfile\r\n\x1b[2;4H\x1b7\x1b[3;1H$ pager\r\n"),
+            out(pager),
+            out("\x1b[7;9H"),
+            out("more"),
+            out("\x1b]133;A\x07$ "),
+            out("ls\r\nfile\r\n"),
+        ],
+    }
+}
+
+/// The fixture's reads, one per non-comment line, escapes decoded (the format
+/// of `conpty_dead_alt_screen_replay_tests`).
+fn reads(fixture: &str) -> Vec<Ev> {
+    fixture
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let mut bytes = Vec::with_capacity(line.len());
+            let mut it = line.bytes();
+            while let Some(b) = it.next() {
+                if b != b'\\' {
+                    bytes.push(b);
+                    continue;
+                }
+                bytes.push(match it.next() {
+                    Some(b'e') => 0x1b,
+                    Some(b'a') => 0x07,
+                    Some(b'b') => 0x08,
+                    Some(b'r') => b'\r',
+                    Some(b'n') => b'\n',
+                    Some(b'\\') => b'\\',
+                    other => panic!("unknown escape {other:?} in {line:?}"),
+                });
+            }
+            Ev::Out(bytes)
+        })
+        .collect()
+}
+
+/// Recorded ConPTY sessions: a killed pager's screen left at the prompt, then
+/// conhost's own buffer switching over it.
+fn conpty(name: &'static str, fixture: &str) -> Fixture {
+    Fixture {
+        name,
+        rows: 24,
+        cols: 80,
+        policy: ResizePolicy::ConPty,
+        ring: None,
+        events: reads(fixture),
+    }
+}
+
+fn conpty_fixtures() -> [Fixture; 2] {
+    [
+        conpty(
+            "conpty_killed_pager_then_second_pager",
+            include_str!("testdata/conpty_killed_pager_then_second_pager.reads"),
+        ),
+        conpty(
+            "conpty_killed_pager_console_resync",
+            include_str!("testdata/conpty_killed_pager_console_resync.reads"),
+        ),
+    ]
+}
+
+/// A Kitty image sent under a number (`I=`, the terminal picks its id) shown
+/// and placed again by that number, every image deleted, then a new one under
+/// the same number: the store refuses forks while it holds an image, and once
+/// it is empty the placement serials and the last id assigned carry (the new
+/// image takes the next id).
+fn kitty() -> Fixture {
+    let show = |row: u16| {
+        let raw = [255u8, 0, 0, 255].repeat(4);
+        let mut seq =
+            format!("\x1b[{};1H\x1b_Ga=T,f=32,s=2,v=2,I=7,c=2,r=1,q=2;", row + 1).into_bytes();
+        seq.extend_from_slice(
+            aterm_codec::base64::encode(&raw)
+                .expect("encode")
+                .as_bytes(),
+        );
+        seq.extend_from_slice(b"\x1b\\");
+        Ev::Out(seq)
+    };
+    Fixture {
+        name: "kitty",
+        rows: 10,
+        cols: 30,
+        policy: ResizePolicy::Native,
+        ring: None,
+        events: vec![
+            out("text before\r\n"),
+            show(1),
+            out(" after the image\r\n"),
+            out("\x1b[4;6H\x1b_Ga=p,I=7,q=2\x1b\\"),
+            out(" placed again\r\n"),
+            out("\x1b_Ga=d,d=A,q=2\x1b\\"),
+            out("\r\nmore text\r\n"),
+            show(7),
+            out(" done"),
+        ],
+    }
+}
+
+/// A synchronized update the recording ends inside, opened an event before
+/// the end: the source's window has not timed out there.
+fn sync_left_open() -> Fixture {
+    Fixture {
+        name: "sync_left_open",
+        rows: 8,
+        cols: 30,
+        policy: ResizePolicy::Native,
+        ring: None,
+        events: vec![
+            out("$ app\r\n"),
+            out("\x1b[?2026h\x1b[H\x1b[2Jframe"),
+            out("\r\nstill in the frame"),
+        ],
+    }
+}
+
+/// Kitty images sent without an id (the store keeps none, so each is charged
+/// to the screen) showing on more than half the live-image budget, more
+/// stamped and erased until the screen's charge reaches the budget, then one
+/// pixel more: the count that charge sets off finds more than half the budget
+/// showing and takes the oldest images off.
+fn live_images() -> Fixture {
+    use crate::terminal::handler_osc_1337::MAX_LIVE_IMAGE_BYTES;
+    let side = 1024;
+    let raster = side * side * 4;
+    let picture = aterm_codec::base64::encode(&crate::terminal::kitty_graphics::zlib_zeros(raster))
+        .expect("encode");
+    let stamp = |row: usize, col: usize| {
+        format!(
+            "\x1b[{row};{col}H\x1b_Ga=T,f=32,s={side},v={side},o=z,c=1,r=1,C=1,q=2;{picture}\x1b\\"
+        )
+    };
+    let shown = MAX_LIVE_IMAGE_BYTES / 2 / raster + 1;
+    let erased = MAX_LIVE_IMAGE_BYTES / raster - shown;
+    let pixel = aterm_codec::base64::encode(&[0u8, 0, 255, 255]).expect("encode");
+    Fixture {
+        name: "live_images",
+        rows: 8,
+        cols: 30,
+        policy: ResizePolicy::Native,
+        ring: None,
+        events: vec![
+            out((1..=shown).map(|col| stamp(1, col)).collect::<String>()),
+            out((0..erased)
+                .map(|_| stamp(2, 1) + "\x1b[2K")
+                .collect::<String>()),
+            out(format!(
+                "\x1b[3;1H\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1,q=2;{pixel}\x1b\\"
+            )),
+        ],
+    }
+}
+
+fn fixtures() -> Vec<Fixture> {
+    let mut fixtures = vec![
+        session(),
+        pager_without_cursor_save(),
+        kitty(),
+        sync_left_open(),
+        live_images(),
+    ];
+    fixtures.extend(conpty_fixtures());
+    fixtures
+}
+
+/// Every fork, at every boundary of every fixture, ends where the straight
+/// fold ends; it refuses only where it must (an open resize undo or a standing
+/// resize hand-back, a stored Kitty image) and forks everywhere else on these
+/// fixtures.
+#[test]
+fn a_fork_folds_the_rest_as_the_straight_fold_does() {
+    for fx in &fixtures() {
+        let (end, ends) = fx.at_every_boundary(Terminal::replay_fork);
+        let mut refused = Vec::new();
+        for (k, fork_end) in ends.iter().enumerate() {
+            match fork_end {
+                Some(fork_end) => {
+                    assert_eq!(fork_end, &end, "{}: forked after {} events", fx.name, k + 1)
+                }
+                None => refused.push(k + 1),
+            }
+        }
+        let n = fx.events.len();
+        match fx.name {
+            // Only from the first resize on: its undo or its hand-back (the
+            // rows a later grow reveals) stands, which a copy cannot hold.
+            "session" => {
+                let first_resize = fx
+                    .events
+                    .iter()
+                    .position(|e| matches!(e, Ev::Resize(..)))
+                    .map(|i| i + 1);
+                assert_eq!(
+                    refused.first().copied(),
+                    first_resize,
+                    "{}: {refused:?}",
+                    fx.name
+                );
+            }
+            // While the store holds an image: from the first until the
+            // delete freed it, and from the second on.
+            "kitty" => assert_eq!(refused, [2, 3, 4, 5, 8, 9], "{}", fx.name),
+            "sync_left_open" | "live_images" => {
+                assert!(refused.is_empty(), "{}: {refused:?}", fx.name);
+            }
+            _ => assert!(refused.len() < n / 4, "{}: {refused:?} of {n}", fx.name),
+        }
+    }
+}
+
+/// Negative control: the restore a fork replaces (`from_checkpoint` of the
+/// projection: an unlimited tiered history, no orphaned-screen notes, no Kitty
+/// serials), taken where a fork would be, ends elsewhere from some boundary of
+/// each fixture.
+#[test]
+fn a_restore_in_place_of_a_fork_folds_another_end() {
+    let restore = |t: &Terminal| {
+        t.replay_fork()?;
+        t.checkpoint_continuing()
+            .map(|c| Terminal::from_checkpoint(&c))
+    };
+    for fx in &fixtures() {
+        let (end, ends) = fx.at_every_boundary(restore);
+        assert!(
+            ends.iter().flatten().any(|restored| restored != &end),
+            "{}: every restore ended as the straight fold",
+            fx.name
+        );
+    }
+}
+
+/// Negative control: a fork without one piece of the transient state it
+/// carries, left as a restore leaves it, ends elsewhere from some boundary of
+/// each fixture that reads that piece.
+#[test]
+fn a_fork_without_a_carried_piece_folds_another_end() {
+    type Strip = fn(&mut Terminal);
+    let orphaned_screens = || {
+        let mut fixtures = vec![pager_without_cursor_save()];
+        fixtures.extend(conpty_fixtures());
+        fixtures
+    };
+    let pieces: [(&str, Strip, Vec<Fixture>); 6] = [
+        (
+            "the orphaned-screen leave's notes",
+            |fork| {
+                fork.transient.alt_entered_without_cursor_save = false;
+                fork.transient.conhost_alt_screen_left_up = false;
+            },
+            orphaned_screens(),
+        ),
+        (
+            "the synchronized-update timer",
+            Terminal::arm_carried_sync_window,
+            vec![sync_left_open()],
+        ),
+        (
+            "the last Kitty id assigned",
+            |fork| fork.transient.kitty_last_assigned_id = 0,
+            vec![kitty()],
+        ),
+        (
+            "the Kitty serials",
+            |fork| fork.transient.kitty_serial = 0,
+            vec![kitty()],
+        ),
+        (
+            "the live-image charge",
+            |fork| fork.transient.live_image_charge = [0; 2],
+            vec![live_images()],
+        ),
+        (
+            "its source's restore lineage",
+            |fork| fork.holder_carried_at = Some(fork.transient.screen_mutations),
+            vec![session()],
+        ),
+    ];
+    for (piece, strip, fixtures) in pieces {
+        let without = |t: &Terminal| {
+            t.replay_fork().map(|mut fork| {
+                strip(&mut fork);
+                fork
+            })
+        };
+        for fx in &fixtures {
+            let (end, ends) = fx.at_every_boundary(without);
+            assert!(
+                ends.iter().flatten().any(|forked| forked != &end),
+                "{}: a fork without {piece} ends as the straight fold",
+                fx.name
+            );
+        }
+    }
+}
+
+/// A fork continues its source's restore lineage. A restore's grids refuse a
+/// fork (their tiered store), so the lineage is set as a restore leaves it.
+/// Forked before any output and adopted, both carries are untouched; forked
+/// after output, neither is, adopted or fed more first. A fork that dropped the
+/// lineage fails the first, one that started its own (as `from_checkpoint`
+/// does) the second.
+#[test]
+fn a_fork_continues_its_sources_restore_lineage() {
+    // (output before the fork, output after it, adopted after that)
+    for (before, after, adopt) in [
+        (false, false, true),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        let label = format!("output before the fork: {before}, after: {after}, adopted: {adopt}");
+        let mut src = Terminal::new(6, 30);
+        src.process(b"\x1b[1mbefore\x1b[m the restore\r\n");
+        src.holder_carried_at = Some(src.transient.screen_mutations);
+        if before {
+            src.process(b"replayed\r\n");
+        }
+        let mut fork = src.replay_fork().expect("a fork");
+        let end = |t: &mut Terminal| {
+            if after {
+                t.process(b"more\r\n");
+            }
+            let adoption = adopt.then(|| t.adopt_holder_after_restore(0, false));
+            (adoption, t.checkpoint_continuing().expect("ground"))
+        };
+        let (src_end, fork_end) = (end(&mut src), end(&mut fork));
+        assert_eq!(
+            src_end.1.holder.seed_untrusted, before,
+            "{label}: premise, the restore is untouched until output"
+        );
+        assert_eq!(fork_end, src_end, "{label}");
+    }
+}

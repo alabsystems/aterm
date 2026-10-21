@@ -2525,6 +2525,10 @@ impl Meteors {
     }
 }
 
+/// The share of the white heat a flight off its row keeps over the row it
+/// launched from ([`build_stations`]): that line is printed text now.
+const WHITE_PRINTED_SHARE: f32 = 0.25;
+
 // ===========================================================================
 // The per-frame flight solution (§6.2, §6.3, §6.8, §6.11)
 // ===========================================================================
@@ -2924,7 +2928,16 @@ fn build_stations(
                 // 3). Both lengths are the white layer's own, closing into the
                 // landing after arrival (`WHITE_CLOSE_MS`).
                 let tail = (s - f.white_shoulder).max(0.0);
-                let c = f.head_cov * (-tail / f.white_fall).exp();
+                // A flight off its row (a Return) launches from the line it
+                // just printed: over that line the white heat keeps only the
+                // printed line's share, so the line's last word is not
+                // whited out under the glare.
+                let printed = if (m.y1 - m.y0).abs() >= 0.5 * ch && (py - m.y0).abs() < 0.5 * ch {
+                    WHITE_PRINTED_SHARE
+                } else {
+                    1.0
+                };
+                let c = f.head_cov * (-tail / f.white_fall).exp() * printed;
                 let blend = smoothstep01((s - f.white_shoulder) / f.white_shoulder.max(1.0));
                 let share =
                     SHOULDER_WIDTH_SHARE + (WHITE_WIDTH_SHARE - SHOULDER_WIDTH_SHARE) * blend;
@@ -3033,12 +3046,17 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
             }
         }
         if core_on {
+            // The nucleus in the head's own stop, deepened to a mark's ink:
+            // in the text's grey it read on paper as a dark dash under the
+            // letters the head crossed.
+            let cw = (geom.cw as f32).max(1.0);
+            let stop = spectrum(walk_pace(m.arc(f.to_go / cw)));
             push_halo_veil(
                 frame.halos,
                 geom,
                 (cx, cy),
                 (nx, ny),
-                ctx.cfg.theme_fg & 0x00FF_FFFF,
+                paper_mark_ink(stop, ctx.cfg.theme_bg),
                 (core_cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8,
             );
         }
@@ -4614,6 +4632,45 @@ mod tests {
         assert!(
             m.landings.iter().any(|l| l.burst.is_some()),
             "a recall's landing minted no ring"
+        );
+    }
+
+    /// A FLIGHT OFF ITS ROW SPARES THE LINE IT LEFT: an Enter-like leap from
+    /// the end of row 5 down to row 8's home throws its white heat, on the
+    /// frame it lands, over the launch row at most two fifths of what the
+    /// same leap laid along that row does ([`WHITE_PRINTED_SHARE`]; the launch line is
+    /// printed text now; at full heat its last word was whited out under the
+    /// glare). Negative control: the leap along the row keeps its whole heat
+    /// there.
+    #[test]
+    fn a_flight_off_its_row_spares_the_line_it_left() {
+        let cfg = config();
+        let t0 = Instant::now();
+        // The brightest white quad laid on `row` over the launch's last
+        // cells, on frame zero.
+        let white_on = |from: (u16, u16), to: (u16, u16), row: u16| -> f32 {
+            let mut m = Meteors::new();
+            let ctx = ctx_at(t0, &cfg, to, 0.25);
+            m.on_event(&mv(from, to), t0, &ctx)
+                .expect("a long leap flies");
+            let mut sc = Scratch::default();
+            sc.emit(&mut m, &ctx);
+            let near = (f32::from(from.1) - 6.0) * ctx.geom.cw as f32;
+            sc.out
+                .iter()
+                .filter(|q| q.row == row && f32::from(q.x) >= near)
+                .map(|q| lum(q.color))
+                .fold(0.0f32, f32::max)
+        };
+        let off = white_on((5, 60), (8, 2), 5);
+        let along = white_on((5, 60), (5, 2), 5);
+        assert!(
+            along > 0.0,
+            "control: the leap along the row lays its white heat there"
+        );
+        assert!(
+            off * 5.0 <= along * 2.0,
+            "the white heat over the line it left: {off:.1} against {along:.1} along it"
         );
     }
 

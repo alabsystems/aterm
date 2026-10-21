@@ -296,28 +296,28 @@ pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits
 /// enumerated so a split, a merge or a move cannot take a machine out of reach.
 fn derive_model_sources(root: &Path) -> Vec<std::path::PathBuf> {
     let rs_files = |dir: std::path::PathBuf| -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(dir)
+        crate::tree::read_dir(&dir)
             .map(|entries| {
                 entries
+                    .into_iter()
                     .filter_map(Result::ok)
-                    .map(|entry| entry.path())
                     .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
                     .collect()
             })
             .unwrap_or_default()
     };
     let mut paths = vec![root.join("crates/aterm-spec/src/derive.rs")];
-    let mut models: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("crates"))
+    let mut models: Vec<std::path::PathBuf> = crate::tree::read_dir(&root.join("crates"))
         .map(|entries| {
             entries
+                .into_iter()
                 .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
                         .is_some_and(|name| name.starts_with("aterm-models-"))
                 })
-                .flat_map(|entry| rs_files(entry.path().join("src")))
+                .flat_map(|path| rs_files(path.join("src")))
                 .collect()
         })
         .unwrap_or_default();
@@ -599,7 +599,7 @@ fn check_liveness(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
                 ));
             }
             let resolved = derive_model_sources(root).iter().any(|path| {
-                std::fs::read_to_string(path)
+                crate::tree::read_to_string(path)
                     .map(|s| mask_comments(&s).contains(&format!("{machine} {{")))
                     .unwrap_or(false)
             });
@@ -649,7 +649,7 @@ fn check_liveness(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
 
 /// OB-13: the pinned declaration occurs exactly once in its declared owner.
 fn check_link(root: &Path, claim: &ScopeClaim, link: &Link, v: &mut Vec<String>) {
-    let Ok(source) = std::fs::read_to_string(root.join(link.file)) else {
+    let Ok(source) = crate::tree::read_to_string(&root.join(link.file)) else {
         v.push(format!(
             "  ✗ FAIL [OB-16] claim `{}`: {} is unreadable — a claimed file that moved \
              leaves the cardinality unguarded.",
@@ -695,7 +695,7 @@ fn check_closure(root: &Path, claims: &[ScopeClaim], v: &mut Vec<String>) {
     let ctors = closed_token_ctors(&files, claims);
     let no_ctors = BTreeSet::new();
     for path in files {
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = crate::tree::read_to_string(&path) else {
             continue;
         };
         let file = rel(root, &path);
@@ -790,7 +790,7 @@ fn closed_token_ctors(
         .collect();
     let mut out: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     for path in files {
-        let Ok(raw) = std::fs::read_to_string(path) else {
+        let Ok(raw) = crate::tree::read_to_string(path) else {
             continue;
         };
         if !raw.contains("impl") || !tokens.iter().any(|t| raw.contains(t)) {
@@ -1020,7 +1020,7 @@ fn check_aggregation(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
         ));
         return;
     }
-    let Ok(source) = std::fs::read_to_string(root.join(agg.file)) else {
+    let Ok(source) = crate::tree::read_to_string(&root.join(agg.file)) else {
         v.push(format!(
             "  ✗ FAIL [OB-16] claim `{}`: aggregator file {} is unreadable.",
             claim.id, agg.file
@@ -1057,8 +1057,7 @@ mod tests {
     use super::*;
     // The real checkout: the main tests mutate copies of the real claim files
     // rather than synthetic lookalikes.
-    use crate::scan_set::test_fixtures::{repo_root, synth_tree};
-    use std::path::PathBuf;
+    use crate::scan_set::test_fixtures::{Tree, repo_root, synth_tree};
 
     fn claim_by_id(id: &str) -> &'static ScopeClaim {
         SCOPE_CLAIMS
@@ -1084,42 +1083,37 @@ mod tests {
         files
     }
 
-    /// Copy `files` out of the live checkout into a fresh temp root, preserving
-    /// repo-relative paths. The caller mutates and removes it.
-    fn copy_root(name: &str, files: &[String]) -> PathBuf {
+    /// Copy `files` out of the live checkout into a tree held in memory,
+    /// preserving repo-relative paths. The caller mutates it.
+    fn copy_root(name: &str, files: &[String]) -> Tree {
         let src = repo_root();
-        let root =
-            std::env::temp_dir().join(format!("aterm-scope-census-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for rel in files {
-            let from = src.join(rel);
-            let to = root.join(rel);
-            std::fs::create_dir_all(to.parent().expect("rel has a parent")).expect("mkdir");
-            let text = std::fs::read_to_string(&from)
-                .unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
-            std::fs::write(&to, text).expect("write copy");
-        }
-        root
+        let copied: Vec<(String, String)> = files
+            .iter()
+            .map(|rel| {
+                let from = src.join(rel);
+                let text = std::fs::read_to_string(&from)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
+                (rel.clone(), text)
+            })
+            .collect();
+        synth_tree("aterm-scope-census", name, &copied)
     }
 
-    fn write_file(root: &Path, rel: &str, contents: &str) {
-        let path = root.join(rel);
-        std::fs::create_dir_all(path.parent().expect("rel has a parent")).expect("mkdir");
-        std::fs::write(path, contents).expect("write file");
+    fn write_file(root: &Tree, rel: &str, contents: &str) {
+        root.write(rel, contents);
     }
 
     /// Apply a mutation to a copied file, asserting it applied (a stale `from`
     /// would make the test vacuous).
-    fn mutate(root: &Path, rel: &str, from: &str, to: &str) {
-        let path = root.join(rel);
-        let before = std::fs::read_to_string(&path).expect("read for mutation");
+    fn mutate(root: &Tree, rel: &str, from: &str, to: &str) {
+        let before = crate::tree::read_to_string(&root.join(rel)).expect("read for mutation");
         let after = before.replace(from, to);
         assert_ne!(
             before, after,
             "the mutation no longer applies to {rel} (looking for `{from}`) — the pinned \
              text is stale, so this demonstration proves nothing"
         );
-        std::fs::write(&path, after).expect("write mutation");
+        root.write(rel, &after);
     }
 
     fn run_one(root: &Path, claim: &'static ScopeClaim) -> CensusOutcome {
@@ -1173,7 +1167,6 @@ mod tests {
             "the diagnostic must carry the safety argument, not just a diff:\n{}",
             after.log
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// With the chain untouched, a new per-pane owner of the engine or of a
@@ -1204,7 +1197,6 @@ mod tests {
             "OB-14 must name the unaccounted owner:\n{}",
             out.log
         );
-        let _ = std::fs::remove_dir_all(&root);
 
         let root = copy_root("per-pane-pipeline", &claim_files(claim));
         write_file(
@@ -1220,7 +1212,6 @@ mod tests {
             "a per-pane pipeline is a second limiter and must open the closure:\n{}",
             out.log
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// No field at all: a per-pane engine built inside a loop. OB-13 and the
@@ -1255,7 +1246,6 @@ mod tests {
             "OB-14 must name the constructing fn:\n{}",
             out.log
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Every associated fn returning the closed token by value is a
@@ -1283,7 +1273,6 @@ mod tests {
             &[(rel.to_string(), src.to_string())],
         );
         let ctors = closed_token_ctors(&[root.join(rel)], SCOPE_CLAIMS);
-        let _ = std::fs::remove_dir_all(&root);
         let fx: Vec<&str> = ctors["EffectsPipeline"]
             .iter()
             .map(String::as_str)
@@ -1306,7 +1295,7 @@ mod tests {
         let mut files = claim_files(claim);
         files.push("crates/aterm-effects/src/pipeline_native.rs".to_string());
         let root = copy_root("per-pane-named-ctor", &files);
-        let native = std::fs::read_to_string(root.join(&files[files.len() - 1]))
+        let native = crate::tree::read_to_string(&root.join(&files[files.len() - 1]))
             .expect("read pipeline_native.rs");
         assert!(
             native.contains("pub fn for_window() -> Self {"),
@@ -1335,7 +1324,6 @@ mod tests {
              naming the fn:\n{}",
             out.log
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Anti-vacuity: a claim that stops matching the tree goes red.
@@ -1357,7 +1345,6 @@ mod tests {
             "the diagnostic must say the pinned declaration vanished:\n{}",
             out.log
         );
-        let _ = std::fs::remove_dir_all(&root);
 
         let root = copy_root("renamed-owner", &claim_files(claim));
         mutate(
@@ -1373,7 +1360,6 @@ mod tests {
             "the diagnostic must say the claim went stale:\n{}",
             out.log
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1409,7 +1395,6 @@ mod tests {
              impl WordDecorations {\n    fn len(&self) -> usize {\n        0\n    }\n}\n",
         );
         let out = run_one(&root, claim);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             out.ok,
             "variants, qualified variants, impl blocks and fn parameters must NOT count as \
@@ -1447,6 +1432,5 @@ mod tests {
             "the failure must name the missing shard read:\n{}",
             out.log
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

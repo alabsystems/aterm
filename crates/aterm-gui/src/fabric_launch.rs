@@ -53,15 +53,17 @@
 //! `ATERM_LINK_CAP_FILE`, `ATERM_LINK_FLEET` and `ATERM_FABRIC_COMMAND`, the four
 //! names `ENV_DENY_VARS` lists — do not reach it. Those four NAMES, and NOT the
 //! whole-prefix glob this header used to claim: `ENV_DENY_PREFIXES` carries no
-//! `ATERM_LINK_` rule, and the three other variables under that prefix are
+//! `ATERM_LINK_` rule, and the four other variables under that prefix are
 //! inherited ON PURPOSE — `ATERM_LINK_FAULT` and `ATERM_LINK_NOTIFY_FAULT` are
-//! the e2e harness's crash switches and `ATERM_LINK_WAIT_TALLY` the fabric
-//! bench's count of the bridge's waits on the broker (development seams: only a
-//! debug build's bridge reads them), which
+//! the e2e harness's crash switches, `ATERM_LINK_ACK_DEADLINE_MS` the
+//! `link_state` stub world's short ack deadline, and `ATERM_LINK_WAIT_TALLY` the
+//! fabric bench's count of the bridge's waits on the broker (development seams:
+//! only a debug build's bridge reads them), of which
 //! `the_bridge_child_inherits_no_identity_no_socket_and_no_edge_secret` REQUIRES
-//! to survive the filter. A future variable under that prefix that is a
-//! CREDENTIAL rather than a development seam needs its own deny-list entry of its
-//! own name; the glob would have said it was already covered. Everything else —
+//! the first and the last to survive the filter. A future variable under that
+//! prefix that is a CREDENTIAL rather than a development seam needs its own
+//! deny-list entry of its own name; the glob would have said it was already
+//! covered. Everything else —
 //! `PATH`, `HOME`, `XDG_STATE_HOME` (which `aterm-link` needs for its state dir),
 //! locale — is inherited, and that is stated rather than promised away: the
 //! header used to say the child got "none of aterm's own environment beyond what
@@ -493,15 +495,10 @@ fn is_executable(md: &std::fs::Metadata) -> bool {
 /// ([`crate::subscribe::await_roster_written`]) before the quit closes their
 /// connections. Answers whether a bridge took it; `false` at once when none is
 /// attached, or when `wait` is zero (said, not waited for).
-pub(crate) fn bye(
-    store: &crate::session_store::Store,
-    subscribers: &crate::subscribe::Subscribers,
-    word: Bye,
-    wait: Duration,
-) -> bool {
+pub(crate) fn bye(store: &crate::session_store::Store, word: Bye, wait: Duration) -> bool {
     let bridged = crate::fabric::bridge_attached_now();
     let before = crate::fabric::byes_taken();
-    let said = say(store, subscribers, word, true);
+    let said = say(store, word, true);
     let taken = bridged && !wait.is_zero() && crate::fabric::await_bye_taken(before, wait);
     if let Some(seq) = said
         && !wait.is_zero()
@@ -520,13 +517,8 @@ pub(crate) fn bye(
 /// Journal `bye <word>` for the push lane and wake it ([`bye`]): the roster
 /// seq it was said at, `None` when it was not. With `block` false a store
 /// whose lock is held skips the word rather than wait for it.
-fn say(
-    store: &crate::session_store::Store,
-    subscribers: &crate::subscribe::Subscribers,
-    word: Bye,
-    block: bool,
-) -> Option<u64> {
-    let (seq, locals): (u64, Vec<u64>) = {
+fn say(store: &crate::session_store::Store, word: Bye, block: bool) -> Option<u64> {
+    let seq = {
         let mut g = if block {
             store.write().unwrap_or_else(|p| p.into_inner())
         } else {
@@ -536,21 +528,11 @@ fn say(
                 Err(std::sync::TryLockError::WouldBlock) => return None,
             }
         };
+        // The journal row rings the instance's watchers (`sessions`, `@*`):
+        // the bridge's push loop drains it on that wake.
         g.say_bye(word);
-        (
-            g.roster_seq(),
-            g.snapshot().iter().map(|h| h.local_id).collect(),
-        )
+        g.roster_seq()
     };
-    // THE BRIDGE WATCHES EVERY SESSION (`subscribe @*`), so waking any of
-    // their subscribers wakes its push loop, which drains the journal row
-    // above on that wake. With no session at all the loop's own tick does.
-    if subscribers.any() {
-        let set = subscribers.lock().unwrap_or_else(|p| p.into_inner());
-        for local in locals {
-            set.notify(local);
-        }
-    }
     Some(seq)
 }
 
@@ -561,17 +543,13 @@ fn say(
 /// attempt says it. A skipped word costs nothing, because no word at all reads
 /// the same as a handoff (nothing is withdrawn); the bridge only misses the
 /// `ev`.
-pub(crate) fn bye_at_handoff(
-    store: &crate::session_store::Store,
-    subscribers: &crate::subscribe::Subscribers,
-    attempt: u64,
-) {
+pub(crate) fn bye_at_handoff(store: &crate::session_store::Store, attempt: u64) {
     if HANDOFF_BYE_ATTEMPT.load(Ordering::SeqCst) == attempt
         || !crate::fabric::bridge_attached_now()
     {
         return;
     }
-    if say(store, subscribers, Bye::Handoff, false).is_some() {
+    if say(store, Bye::Handoff, false).is_some() {
         HANDOFF_BYE_ATTEMPT.store(attempt, Ordering::SeqCst);
     }
 }
@@ -584,14 +562,11 @@ pub(crate) fn bye_at_handoff(
 /// the sessions only if it reads the word before the lanes close, and
 /// otherwise leaves them to read `away` with the node — said here, so the log
 /// has it.
-pub(crate) fn bye_at_quit(
-    store: &crate::session_store::Store,
-    subscribers: &crate::subscribe::Subscribers,
-) {
+pub(crate) fn bye_at_quit(store: &crate::session_store::Store) {
     RETIRED.store(true, Ordering::SeqCst);
     let word = quit_bye(aterm_types::dev_seam!(QUIT_BYE_SEAM).as_deref());
     let bridged = crate::fabric::bridge_attached_now();
-    if !bye(store, subscribers, word, BYE_WAIT) && bridged {
+    if !bye(store, word, BYE_WAIT) && bridged {
         aterm_log::warn!(
             "fabric: the bridge did not take `bye {}` within {:.1}s; this instance's \
              sessions are withdrawn only if it reads the word before the lanes close, \
@@ -1555,21 +1530,15 @@ mod tests {
     fn a_quit_says_bye_to_every_watcher_and_waits_only_for_a_bridge_to_take_it() {
         crate::fabric::with_link_reset(|| {
             let store = crate::session_store::new_store();
-            let subscribers = crate::subscribe::new_registry();
             let seq = |store: &crate::session_store::Store| {
                 store.read().unwrap_or_else(|p| p.into_inner()).roster_seq()
             };
-            assert!(!bye(
-                &store,
-                &subscribers,
-                Bye::Quit,
-                aterm_spec::wait::MUST_HAPPEN
-            ));
+            assert!(!bye(&store, Bye::Quit, aterm_spec::wait::MUST_HAPPEN));
             assert_eq!(seq(&store), 1, "no bridge, and said all the same");
 
             let generation = crate::fabric::next_bridge_generation();
             crate::fabric::bridge_attached(generation);
-            assert!(!bye(&store, &subscribers, Bye::Handoff, Duration::ZERO));
+            assert!(!bye(&store, Bye::Handoff, Duration::ZERO));
             assert_eq!(seq(&store), 2, "said, and not waited for");
 
             let bridge = {
@@ -1583,12 +1552,7 @@ mod tests {
                     crate::fabric::cmd_link(&store, "bye quit", Some(generation))
                 })
             };
-            assert!(bye(
-                &store,
-                &subscribers,
-                Bye::Quit,
-                aterm_spec::wait::MUST_HAPPEN
-            ));
+            assert!(bye(&store, Bye::Quit, aterm_spec::wait::MUST_HAPPEN));
             assert_eq!(bridge.join().expect("the bridge's answer"), "OK\n");
         });
     }

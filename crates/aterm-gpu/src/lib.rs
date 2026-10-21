@@ -17,7 +17,7 @@
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 /// `eprintln!` that cannot panic, for every stderr line this crate writes at
 /// runtime. `eprintln!` panics when stderr fails (a closed pipe or pty), and
@@ -77,6 +77,11 @@ mod metal;
 // browser's (`cfg(gl_arm)`, build.rs). See `gl/mod.rs`.
 #[cfg(gl_arm)]
 mod gl;
+// The GLSL twins' binding check reads them as text against the pipeline
+// table, so it runs on a host with no GL arm too (`gl/shaders.rs`).
+#[cfg(all(test, target_os = "macos", not(gl_arm)))]
+#[path = "gl/shaders.rs"]
+mod gl_shaders;
 /// The launch's first-frame Metal warm (see `metal/warm.rs`).
 #[cfg(target_os = "macos")]
 pub use metal::warm::{FirstFrameKnobs, FirstFrameWarm};
@@ -119,6 +124,10 @@ mod wgpu_timer;
 // Metal arm's `upload_stream`) uses,
 // re-exported for the Tier-1 conformance test.
 pub use renderer::should_slice;
+/// The armed tray card ring's GPU-free bookkeeping: which slot a change
+/// writes and which in-flight presents it outlasts (public for the Tier-1
+/// conformance test, `tests/conformance_tray_card_ring.rs`).
+pub mod tray_card_ring;
 
 // The DirectComposition visual swapchain opt-in (Windows).
 //
@@ -342,11 +351,12 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
     }
 }
 
-/// One [`GpuContext::new`] at a time in a process: its instance, adapter and
-/// device. Vulkan's loader and NVIDIA's ICD do not survive two instances made
-/// at once (two threads in `vk_icdNegotiateLoaderICDInterfaceVersion`, one
-/// jumps to address 0: measured on driver 580.159, libvulkan 1.4.328). The
-/// window makes one context per process; parallel tests make many.
+/// One context made at a time in a process ([`GpuContext::one_at_a_time`]):
+/// its instance, adapter and device. Vulkan's loader and NVIDIA's ICD do not
+/// survive two instances made at once (two threads in
+/// `vk_icdNegotiateLoaderICDInterfaceVersion`, one jumps to address 0:
+/// measured on driver 580.159, libvulkan 1.4.328). The window makes one
+/// context per process; parallel tests make many.
 #[cfg(wgpu_arm)]
 static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -356,6 +366,28 @@ static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(wgpu_arm)]
 fn fresh_instance(desc: wgpu::InstanceDescriptor) -> wgpu::Instance {
     wgpu::Instance::new(desc)
+}
+
+/// The instance aterm asks wgpu for over `backends`: no display handle, and
+/// wgpu's flags less what [`terminal_instance_flags`] and, on the Vulkan cell,
+/// [`vulkan_instance_flags`] drop. [`GpuContext::new`]'s, over
+/// [`default_backends`], and a test oracle's over the backends it names.
+#[cfg(wgpu_arm)]
+pub(crate) fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDescriptor {
+    let desc = wgpu::InstanceDescriptor {
+        backends,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    };
+    let desc = wgpu::InstanceDescriptor {
+        flags: terminal_instance_flags(desc.flags, desc.backends),
+        ..desc
+    };
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    let desc = wgpu::InstanceDescriptor {
+        flags: vulkan_instance_flags(desc.flags),
+        ..desc
+    };
+    desc
 }
 
 /// The Vulkan cell's instance flags: the build's, less `DEBUG`. `DEBUG` labels
@@ -528,7 +560,8 @@ fn terminal_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
 
 /// The instance flags aterm asks for over `backends`: `flags`, less
 /// indirect-call validation on a DX12 instance, which is the Windows build's
-/// ([`default_backends`]) and no other's.
+/// ([`default_backends`]) and no other's, and on a GL one, which no build
+/// asks for but the GL arm's wgpu oracle (`gl_replay_tests`).
 ///
 /// `VALIDATION_INDIRECT_CALL` (in wgpu's defaults for every build) makes
 /// wgpu-core build two compute pipelines, their layouts and their shader at
@@ -539,12 +572,18 @@ fn terminal_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
 /// device, three paired runs), 78.5 to 74.0 MB working set in every pair and
 /// device creation 167/242/147 to 125/178/121 ms; Metal and Vulkan were not
 /// measured and keep wgpu's flags.
+///
+/// On GL it costs the device: NVIDIA's EGL (driver 580.159, a GB10) hands
+/// wgpu's GL backend a desktop OpenGL 3.3 context, and with the flag
+/// `request_device` there answers "Parent device is lost"; without it the
+/// device comes up, and its frames match the GL arm's byte for byte
+/// (measured 2026-10-20).
 #[cfg(wgpu_arm)]
 fn terminal_instance_flags(
     flags: wgpu::InstanceFlags,
     backends: wgpu::Backends,
 ) -> wgpu::InstanceFlags {
-    if backends == wgpu::Backends::DX12 {
+    if backends == wgpu::Backends::DX12 || backends == wgpu::Backends::GL {
         flags - wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL
     } else {
         flags
@@ -632,19 +671,7 @@ impl GpuContext {
         // from it later. It is surface-capable without a display handle except
         // on GLES/Wayland, so the adapter request can use
         // `compatible_surface: None`.
-        let desc = wgpu::InstanceDescriptor {
-            backends: default_backends(),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        };
-        let desc = wgpu::InstanceDescriptor {
-            flags: terminal_instance_flags(desc.flags, desc.backends),
-            ..desc
-        };
-        #[cfg(all(unix, not(target_vendor = "apple")))]
-        let desc = wgpu::InstanceDescriptor {
-            flags: vulkan_instance_flags(desc.flags),
-            ..desc
-        };
+        let desc = instance_descriptor(default_backends());
         // Honour the visual-swapchain latch via the explicit descriptor field.
         // Ignored by non-DX12 backends; `visual_swapchain` below records the
         // outcome.
@@ -657,15 +684,7 @@ impl GpuContext {
             }
             desc
         };
-        let ctx = {
-            let _one_at_a_time = GPU_INIT
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // The first timed cold-build leg: backend enumeration and driver load.
-            let instance =
-                startup_probe::timed(startup_probe::Leg::GpuInstance, || fresh_instance(desc));
-            crate::block_on::block_on(Self::from_instance(instance))?
-        };
+        let ctx = Self::one_at_a_time(desc)?;
         // The visual path is active only if DX12 won adapter selection.
         // Recorded on the context and the process global.
         #[cfg(windows)]
@@ -686,6 +705,20 @@ impl GpuContext {
             debug_assert!(wired, "a fresh context's loss-latch cell is empty");
         }
         Ok(ctx)
+    }
+
+    /// The instance `desc` names, and an adapter and a device on it, one
+    /// context at a time in the process ([`GPU_INIT`]): [`Self::new`]'s, and a
+    /// test oracle's, whose instances meet in one process.
+    #[cfg(wgpu_arm)]
+    pub(crate) fn one_at_a_time(desc: wgpu::InstanceDescriptor) -> Result<Self, String> {
+        let _one_at_a_time = GPU_INIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The first timed cold-build leg: backend enumeration and driver load.
+        let instance =
+            startup_probe::timed(startup_probe::Leg::GpuInstance, || fresh_instance(desc));
+        crate::block_on::block_on(Self::from_instance(instance))
     }
 
     /// Async adapter and device acquisition on an existing `wgpu::Instance`,
@@ -971,10 +1004,21 @@ impl GpuContext {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit([enc.finish()]);
+        // With the host-read barrier: without it the bytes the map exposes
+        // can still be in flight (`device_layer::submit_host_readable`).
+        crate::device_layer::submit_host_readable(
+            &self.device,
+            &self.queue,
+            enc.finish(),
+            std::slice::from_ref(&buffer),
+        );
 
         let slice = buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the copy was submitted by device_layer::submit_host_readable"
+        )]
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
@@ -1053,25 +1097,30 @@ mod device_request_tests {
         }
     }
 
-    /// Indirect-call validation is dropped from a DX12 instance and nothing
-    /// else moves; every other instance keeps the flags it was given. The
-    /// DX12-only instance is the Windows build's and no other build's, so off
-    /// Windows the shipped flags are wgpu's, untouched.
+    /// Indirect-call validation is dropped from a DX12 instance and a GL one,
+    /// and nothing else moves; every other instance keeps the flags it was
+    /// given. The DX12-only instance is the Windows build's and no other
+    /// build's, and no build asks for a GL-only one (the GL oracle does), so
+    /// off Windows the shipped flags are wgpu's, untouched.
     #[test]
-    fn indirect_call_validation_is_dropped_on_a_dx12_instance_only() {
+    fn indirect_call_validation_is_dropped_on_dx12_and_gl_instances_only() {
         let indirect = wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL;
         let defaults = wgpu::InstanceFlags::default();
         assert!(
             defaults.contains(indirect),
             "wgpu's defaults carry it, or there is nothing to drop"
         );
-        let dx12 = terminal_instance_flags(defaults, wgpu::Backends::DX12);
-        assert!(!dx12.contains(indirect), "a DX12 instance drops it");
-        assert_eq!(dx12 | indirect, defaults, "and nothing else");
+        for backends in [wgpu::Backends::DX12, wgpu::Backends::GL] {
+            let dropped = terminal_instance_flags(defaults, backends);
+            assert!(
+                !dropped.contains(indirect),
+                "a {backends:?} instance drops it"
+            );
+            assert_eq!(dropped | indirect, defaults, "and nothing else");
+        }
         for backends in [
             wgpu::Backends::METAL,
             wgpu::Backends::VULKAN,
-            wgpu::Backends::GL,
             wgpu::Backends::PRIMARY,
             wgpu::Backends::all(),
         ] {

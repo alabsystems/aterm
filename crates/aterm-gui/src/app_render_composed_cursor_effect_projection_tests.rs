@@ -120,6 +120,7 @@ fn every_composed_cursor_channel_is_hard_clipped_and_clean_is_a_real_negative_co
             trail: &trail,
             trail_color: 0x00DE_ADBE,
             active_cursor_fill: Some(0x0050_FA7B),
+            fx_layers: &[],
         },
         Some(ComposedCursorEffectClip {
             row0: 2,
@@ -130,6 +131,11 @@ fn every_composed_cursor_channel_is_hard_clipped_and_clean_is_a_real_negative_co
             y0: 30,
             x1: 20,
             y1: 40,
+            fx: PaneFxPlacement {
+                window_origin: (10, 30),
+                grid_origin: (5, 20),
+                window_box: aterm_core::render::PxRect::new(10, 30, 20, 40),
+            },
         }),
         Some(CursorStyle::HollowBlock),
         Some(CursorStyle::Bolt),
@@ -225,6 +231,11 @@ fn composed_status_owner_follows_the_fill_that_survives_host_projection() {
         y0: 0,
         x1: 8,
         y1: 16,
+        fx: PaneFxPlacement {
+            window_origin: (0, 0),
+            grid_origin: (0, 0),
+            window_box: aterm_core::render::PxRect::new(0, 0, 8, 16),
+        },
     });
     let project = |input: &mut RenderInput, cursor_override| {
         project_focused_composed_cursor_effects(
@@ -239,6 +250,7 @@ fn composed_status_owner_follows_the_fill_that_survives_host_projection() {
                 trail: &[],
                 trail_color: 0,
                 active_cursor_fill: Some(owned.fill),
+                fx_layers: &[],
             },
             clip,
             cursor_override,

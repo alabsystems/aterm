@@ -9,10 +9,9 @@
 //! learn their keys went stale.
 //!
 //! The epoch is the oracle here because no consumer witnesses the bump through
-//! a width change: `try_refresh_search_index` also compares `cols`, and
-//! `indexed_search`'s key `(alternate_screen, content_seq,
-//! history_renumber_epoch)` currently misses on `content_seq`, which a width
-//! reflow happens to bump. Should reflow stop touching `content_seq`, only
+//! a width change: the search slot's key (`SearchKey`) also compares `cols`,
+//! and currently misses on `content_seq` too, which a width reflow happens to
+//! bump. Should reflow stop touching `content_seq`, only
 //! these tests would catch stale keys.
 
 use aterm_grid::Grid;

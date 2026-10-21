@@ -50,8 +50,8 @@ fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
 /// on `pub publish`, whose engine passes it through to the hook.
 pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
 
-/// A child the release waits on, made unable to block on a terminal: git's own prompt
-/// off, and — on Unix — the child the leader of a NEW SESSION (`setsid`), which also
+/// A child the release waits on, made unable to block on a terminal: git asks no
+/// person ([`crate::credential_wait::ask_no_one`]: no prompt, no askpass), and — on Unix — the child the leader of a NEW SESSION (`setsid`), which also
 /// makes it the leader of its own process group, the group the interrupt forwards to.
 ///
 /// WHY A SESSION, NOT THE TERMINAL'S FOREGROUND. A child in a background process group
@@ -69,7 +69,7 @@ pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
 /// the same in every one of those. stdin is the caller's to set (`/dev/null` for
 /// every step), and a hangup reaches the child only through the release.
 fn detach(cmd: &mut Command) {
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    crate::credential_wait::ask_no_one(cmd);
     #[cfg(unix)]
     cmd.setsid(true);
 }
@@ -112,7 +112,7 @@ impl crate::site::Launch for StepChildren {
             ));
         }
         // [`detach`]'s session, as this spawn path spells it (no pre_exec)
-        cmd.env("GIT_TERMINAL_PROMPT", "0").setsid(true);
+        crate::credential_wait::ask_no_one(cmd).setsid(true);
         let child = cmd.spawn()?;
         let running = interrupt::Running::enter(child.id());
         let note = self
@@ -2100,24 +2100,24 @@ impl EngineCause {
             .map_or(Self::Tree, |(_, cause)| *cause)
     }
 
-    fn remedy(self) -> &'static str {
+    fn remedy(self) -> String {
         match self {
-            Self::Tree => "fix the source the refusal names (never the export)",
-            Self::NoGitleaks => "brew install gitleaks",
+            Self::Tree => "fix the source the refusal names (never the export)".into(),
+            // The engine's own dependency (docs/DESIGN-init-system-2026-10-20.md §6.1 row 19).
+            Self::NoGitleaks => aterm_uds::host::tool("gitleaks").remedy(),
             Self::GitleaksBroke => {
-                "run `gitleaks version` to see why it cannot scan, then run it again"
+                "run `gitleaks version` to see why it cannot scan, then run it again".into()
             }
-            Self::Network => {
-                "check the network and access to the remote it names (ssh for a git@ remote), \
-                 then run it again"
-            }
+            Self::Network => "check the network and access to the remote it names (ssh for a \
+                              git@ remote), then run it again"
+                .into(),
             Self::Engine => {
                 "fix the publication engine's checkout or records it names, then run it again"
+                    .into()
             }
-            Self::Source => {
-                "push the commit to origin/main (the engine stages only mainline commits), or \
-                 fix the source clone it names, then run it again"
-            }
+            Self::Source => "push the commit to origin/main (the engine stages only mainline \
+                             commits), or fix the source clone it names, then run it again"
+                .into(),
         }
     }
 }
@@ -3380,7 +3380,7 @@ impl Backend for Real {
         if !gitleaks {
             blocks.push(Refusal::new(
                 "gitleaks is not installed — every stage dies at the guard",
-                "brew install gitleaks",
+                aterm_uds::host::tool("gitleaks").remedy(),
             ));
         }
         // the stage comes before the long steps, so for hours publish/.out holds a
@@ -4041,13 +4041,16 @@ mod tests {
         let fd = unsafe { fcntl(file.as_raw_fd(), 0, 200) };
         assert!(fd >= 200);
         let _held = unsafe { OwnedFd::from_raw_fd(fd) };
-        let probe = format!("test ! -e /dev/fd/{fd}");
+        // Exits 3 when the shell holds `fd`, read from its own table: a
+        // `test -e /dev/fd/N` read the held number as absent on Darwin while anything
+        // else looked it up.
+        let probe = aterm_spec::host::held_probe(fd);
         // CONTROL: an intentional pass-through does hand on this same descriptor.
         let control = aterm_uds::spawnfd::transparent("/bin/sh")
             .args(["-c", &probe])
             .status()
             .unwrap();
-        assert_eq!(control.code(), Some(1));
+        assert_eq!(control.code(), Some(3));
 
         let repo = std::env::current_dir().unwrap();
         let real = Real::new(&repo, None, true, false).unwrap();
@@ -4087,17 +4090,18 @@ mod tests {
         let mut sh = aterm_uds::spawnfd::command("/bin/sh");
         sh.args([
             "-c",
-            "echo \"$$ $(ps -o pgid= -p $$ | tr -d ' ') ${GIT_TERMINAL_PROMPT-unset}\"",
+            "echo \"$$ $(ps -o pgid= -p $$ | tr -d ' ') ${GIT_TERMINAL_PROMPT-unset} [${GIT_ASKPASS-unset}]\"",
         ]);
         let out = crate::site::output(&children, &mut sh).unwrap();
         let said = String::from_utf8_lossy(&out.stdout);
         let fields: Vec<&str> = said.split_whitespace().collect();
-        assert_eq!(fields.len(), 3, "{said}");
+        assert_eq!(fields.len(), 4, "{said}");
         assert_eq!(
             fields[0], fields[1],
             "the child leads its own group: {said}"
         );
         assert_eq!(fields[2], "0", "git's prompt is off: {said}");
+        assert_eq!(fields[3], "[]", "and so is its askpass: {said}");
         assert!(
             crate::release::child_notes(dir.path()).is_empty(),
             "the note goes with the child"

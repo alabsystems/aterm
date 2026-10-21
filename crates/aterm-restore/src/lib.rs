@@ -3,7 +3,7 @@
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! aterm's crash restore, headless: exact screens and scrollback after an unplanned window
 //! death.
@@ -24,10 +24,11 @@
 //! - [`layout`]: the v1 offsets (an 8 MiB region of 16 KiB pages, a 4 KiB header
 //!   of little-endian `u64` words, two keyframe slots, the tail ring, the control
 //!   slot and the history ring).
-//! - [`records`]: the three record kinds and their strict decoders. A TAIL record
+//! - [`records`]: the four record kinds and their strict decoders. A TAIL record
 //!   is raw engine input (bytes, a resize, a count of resizes lost); a KEYFRAME
-//!   (KFR v1) and a HISTORY CHUNK (HCR v1) are astream step records
-//!   (`astream_wire::steps`: dense, versioned, CRC-framed) around an LZ4 body.
+//!   (KFR v1), a HISTORY CHUNK (HCR v1) and a CONTROL record (CTR v1, the window's
+//!   control carry) are astream step records (`astream_wire::steps`: dense, versioned,
+//!   CRC-framed) around an LZ4 body.
 //! - [`store`]: the [`store::RegionStore`] a writer and a reader go through, with an
 //!   in-memory [`store::VecStore`] and, for tests, a [`store::CountdownStore`] that
 //!   drops every store after the k-th: a death at instruction granularity. A window's
@@ -75,16 +76,17 @@ mod conformance_region;
 pub use layout::{Geometry, LayoutError, REGION_LEN};
 pub use policy::{Decision, KeyframePolicy, Reason};
 pub use records::{
-    HistoryChunk, HistoryIdentity, Keyframe, KeyframeFault, KeyframeHead, TailFault, TailRecord,
+    ControlFault, HistoryChunk, HistoryIdentity, Keyframe, KeyframeFault, KeyframeHead, TailFault,
+    TailRecord,
 };
 pub use recover::{
-    HeadLost, HeaderFacts, JoinFacts, Losses, MetaWhy, RecoverPolicy, Recovery, Restored,
-    RingExport, RingRun, read_header, recover,
+    ControlVerdict, HeadLost, HeaderFacts, JoinFacts, Losses, MetaWhy, RecoverPolicy, Recovery,
+    Restored, RingExport, RingRun, read_control, read_erased_turn_count, read_header, recover,
 };
 #[cfg(any(test, debug_assertions))]
 pub use store::CountdownStore;
 pub use store::{RegionStore, RegionView, Shared, StoreError, Touched, VecStore};
 pub use writer::{
-    HistoryWriter, JournalWriter, KeyframeError, KeyframeInput, WriteError, WriterIdentity,
-    adaptive_hist_cap,
+    ControlWriter, HistoryWriter, JournalWriter, KeyframeError, KeyframeInput, WriteError,
+    WriterIdentity, adaptive_hist_cap, erase_region,
 };

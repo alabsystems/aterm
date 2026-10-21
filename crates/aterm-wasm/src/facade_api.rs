@@ -834,10 +834,17 @@ macro_rules! bind {
                 selection_range_for(&self.term, self.rows, self.cols)
             }
 
-            /// Detect a link under display `row`/`col`. Prefers an OSC-8 hyperlink, then
-            /// falls back to smart-selection rules (url/file_path). Returns `None` for
-            /// plain words. `kind`: 0=osc8, 1=url, 2=file_path, 3=other.
+            /// Detect a link under display `row`/`col`, the cell the canvas painted
+            /// there. Prefers an OSC-8 hyperlink, then falls back to smart-selection
+            /// rules (url/file_path). Returns `None` for plain words. `kind`: 0=osc8,
+            /// 1=url, 2=file_path, 3=other. The link is the one painted under the cell:
+            /// a DEC double-width line paints grid column `c` at cells `2c` and `2c + 1`,
+            /// and a BiDi row in visual order, so `col` is mapped to the logical column
+            /// first (`Terminal::painted_cell_logical`, as the desktop pointer maps
+            /// it). The hit's `start_col`/`end_col` are LOGICAL grid columns: on a
+            /// doubled line or a BiDi-reordered row they are not the painted cells.
             pub fn link_at(&self, row: u16, col: u16) -> Option<LinkHit> {
+                let (col, _) = self.term.painted_cell_logical(row, col);
                 // OSC-8 lookups are NOT display_offset-aware (only valid at the live
                 // bottom), so only consult hyperlink_at when the viewport isn't scrolled.
                 if self.term.grid().display_offset() == 0 {

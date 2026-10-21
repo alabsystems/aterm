@@ -83,8 +83,9 @@ impl Timeline for crate::session_timeline::SessionTimeline {
 
     /// THE ONE FABRIC HOOK (session log phase 3B, addendum A14): the timeline
     /// row and the session log's typed mark in this one hold, then whether
-    /// the log's readers are owed a wake, which the fabric gives once its
-    /// lock is released.
+    /// the log's readers were owed a wake, which
+    /// [`crate::session_timeline::SessionTimeline::slog_take_wake`] has rung
+    /// on the session's watchers in this hold.
     fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
         crate::session_timeline::SessionTimeline::record(self, kind, payload);
         let at = self.slog().now();

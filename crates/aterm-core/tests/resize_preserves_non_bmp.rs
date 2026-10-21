@@ -182,3 +182,51 @@ fn column_reflow_preserves_ring_rgb_with_structured_extras() {
         assert_eq!(after.combining[0], before.combining[0]);
     }
 }
+
+/// A width change lays a line whose head is in history out from its head
+/// (`Grid::prepare_rewrap` brings the head onto the screen first, moving the
+/// screen's rows down past the dense rings' last row). The tail left on the
+/// screen keeps its ring-held non-BMP bases and true colours.
+#[test]
+fn a_width_change_that_brings_a_line_head_back_preserves_non_bmp_cells() {
+    for (line, tail) in [
+        ("abcdefghijklmnopq\u{1F600}", "pq\u{1F600}"),
+        ("abcdefghijklmnop\u{1D504}z", "p\u{1D504}z"),
+        (
+            "abcdefghijklmnop\u{1F468}\u{200d}\u{1F469}",
+            "p\u{1F468}\u{200d}\u{1F469}",
+        ),
+    ] {
+        let mut t = Terminal::new(10, 8);
+        // The line wraps over three rows at eight columns; eight more lines
+        // leave only its last row on the screen, its head in history.
+        t.process(format!("\x1b[48;2;1;2;3m{line}\x1b[0m\r\n").as_bytes());
+        t.process(&b"x\r\n".repeat(8));
+        assert!(
+            t.grid().row(0).is_some_and(|row| row.is_wrapped()),
+            "precondition: the top row continues a history line"
+        );
+        t.resize(10, 15);
+        let row = (0..10u16).find(|&r| {
+            t.row_text(usize::from(r))
+                .is_some_and(|text| text.trim_end() == tail)
+        });
+        assert!(
+            row.is_some(),
+            "{line:?}: the tail {tail:?} must survive, not become U+FFFD: {:?}",
+            (0..10).filter_map(|r| t.row_text(r)).collect::<Vec<_>>()
+        );
+        let row = row.unwrap_or(0);
+        let col = u16::try_from(
+            tail.chars()
+                .position(|c| u32::from(c) > 0xFFFF)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        assert_eq!(
+            t.grid().extras().bg_rgb_for(row, col),
+            Some([1, 2, 3]),
+            "{line:?}: its true colour survives too"
+        );
+    }
+}

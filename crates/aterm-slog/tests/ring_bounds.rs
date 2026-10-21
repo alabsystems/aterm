@@ -6,7 +6,8 @@
 //! a reader is told exactly what it lost.
 
 use aterm_slog::{
-    Conf, Cursor, Fields, GapWhy, Key, Kind, Limits, Log, MAX_BYTES, MAX_RECORDS, Mark, Src,
+    Conf, Cursor, Fields, Gap, GapWhy, Key, Kind, Limits, Log, MAX_BYTES, MAX_RECORDS, Mark, Read,
+    SharedRead, Src,
 };
 use aterm_spec::rng::XorShift;
 
@@ -122,6 +123,62 @@ fn a_handoff_resets_old_cursors() {
         new.read(Cursor::new(5, 99), 1).gap.map(|g| g.why),
         Some(GapWhy::Reset)
     );
+}
+
+/// What a read answered: its gap, its records' seqs, its next cursor.
+fn answer(gap: Option<Gap>, seqs: impl Iterator<Item = u64>, next: Cursor) -> String {
+    format!("{gap:?} {:?} {next:?}", seqs.collect::<Vec<u64>>())
+}
+
+fn borrowed(r: &Read<'_>) -> String {
+    answer(r.gap, r.recs.iter().map(|r| r.seq), r.next)
+}
+
+fn shared(r: &SharedRead<'_>) -> String {
+    answer(r.gap, r.recs.iter().map(|r| r.seq), r.next)
+}
+
+/// `read_shared` IS `read` HANDING OUT THE RING'S OWN RECORDS: on an empty
+/// ring and on one that evicted, for cursors at the start, behind the ring,
+/// on its oldest record, inside it, at its head, ahead of it and of another
+/// epoch, at page sizes 0, 1, 3 and unbounded, both reads answer the same
+/// gap, records and next cursor, and each shared record is the very record
+/// the borrowed read points at. NEGATIVE CONTROL: an evicting append
+/// between the two reads makes them differ, so each reads the live ring.
+#[test]
+fn read_shared_equals_read() {
+    let empty = Log::with_limits(2, Limits::new(8, 1 << 20).expect("limits"));
+    let mut log = Log::with_limits(2, Limits::new(8, 1 << 20).expect("limits"));
+    for i in 0..20 {
+        log.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(i))
+            .expect("fits");
+    }
+    assert_eq!((log.oldest_seq(), log.last_seq()), (13, 20));
+    for ring in [&empty, &log] {
+        for seq in [0, 5, 11, 12, 13, 16, 19, 20, 21, 99] {
+            for ep in [2, 3] {
+                for max in [0, 1, 3, usize::MAX] {
+                    let cursor = Cursor::new(ep, seq);
+                    let (a, b) = (ring.read(cursor, max), ring.read_shared(cursor, max));
+                    assert_eq!(borrowed(&a), shared(&b), "{cursor:?} max {max}");
+                    assert!(
+                        a.recs
+                            .iter()
+                            .zip(&b.recs)
+                            .all(|(x, y)| std::ptr::eq(*x, &***y)),
+                        "{cursor:?} max {max}: the ring's own records"
+                    );
+                }
+            }
+        }
+    }
+
+    // NEGATIVE CONTROL.
+    let cursor = Cursor::new(2, 12);
+    let before = borrowed(&log.read(cursor, usize::MAX));
+    log.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(20))
+        .expect("fits");
+    assert_ne!(before, shared(&log.read_shared(cursor, usize::MAX)));
 }
 
 /// An update that carries no records but carries the seq count (design

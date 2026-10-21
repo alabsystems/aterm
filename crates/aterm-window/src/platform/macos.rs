@@ -59,6 +59,21 @@ pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
     crate::platform_impl::set_quit_confirm_hook(handler);
 }
 
+/// The printable ASCII character the Option chord on `key` types on the selected keyboard
+/// layout (with Shift when `shift`) when the layout has no key that types it without Option:
+/// German Option+L's `@`, Option+5's `[`, Option+7's `|` and Option+N's `~` (a dead key counts by
+/// the accent it puts down), French Option+('s `{`, British Option+3's `#`. `None` for every
+/// other chord, and for every chord on the U.S. layout, whose Option characters are not ASCII
+/// or are typed by a key of their own as well (Option+`'s accent is the ` key's). A terminal
+/// that sends Option chords as Meta (`WindowExtMacOS::set_option_as_alt`) types these instead:
+/// on such a layout Option is the only way to them.
+///
+/// LOCAL PATCH (aterm), 2026-10-20 (ATERM-KI-1015-9). Reads the layout with `UCKeyTranslate`
+/// (up to 257 lookups, only for an Option chord whose character is ASCII); on the main thread.
+pub fn option_only_character(key: crate::keyboard::PhysicalKey, shift: bool) -> Option<char> {
+    crate::platform_impl::option_only_character(key, shift)
+}
+
 /// Additional methods on [`Window`] that are specific to MacOS.
 ///
 /// LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5): the

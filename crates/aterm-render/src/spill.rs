@@ -23,12 +23,23 @@
 //! frame's band z-order (glow_under → fire Add → fire Over → cursor_glow_add → halo Add
 //! → halo Over), so spill and frame cannot drift.
 //!
+//! The fx layers (`docs/DESIGN-card-engine-2026-10-19.md` §4.4) replay too: every
+//! layer whose extent reaches the band, in either space, is drawn by the frame's own
+//! fx rasterizer onto each strip ([`fx_raster::draw_layers_on`]: the same slicing,
+//! occluder subtraction and pixel law F, cut to the strip), at its slot's place in
+//! that order: Linear Under → glow_under → Exact Under → fire → cursor_glow_add →
+//! Glow → halo → Exact Over → Linear Over. A card's border in the padding is then
+//! part of the spill, and the occluders cut it there exactly as in the frame.
+//!
 //! With 0/0 chrome there is no band: the buffer is empty and the revision never
 //! advances. Frames whose band inputs are unchanged (typing under a grid-interior glow,
 //! idle re-renders) keep the revision and report no dirty rects, so a host can skip its
 //! blit.
 
+use aterm_core::render::{FxBlend, FxInk, FxLayer, FxSlot, FxSpace, PxRect};
+
 use crate::fire_field;
+use crate::fx_raster::{self, FxCanvas, FxFrame, FxScratch, FxSlice};
 use crate::{
     FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput, Renderer, add_sat, halo_row_ny,
     halo_weight, over_rgb, premul_rgb,
@@ -104,6 +115,32 @@ impl SpillGeom {
                 h: grid_h,
             },
         ]
+    }
+
+    /// A window-pixel rect clipped to the frame, as a [`Rect`]; `None` when
+    /// nothing of it lies in the frame. Unbounded edges clip like any other.
+    fn frame_rect(&self, r: PxRect) -> Option<Rect> {
+        let clamp = |v: i32, hi: usize| usize::try_from(v.max(0)).map_or(hi, |v| v.min(hi));
+        let (x0, x1) = (clamp(r.x0, self.frame_w), clamp(r.x1, self.frame_w));
+        let (y0, y1) = (clamp(r.y0, self.frame_h), clamp(r.y1, self.frame_h));
+        (x0 < x1 && y0 < y1).then_some((x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// The window pixels `layer` may write ([`FxLayer::extent`] at its space's
+    /// origin), clipped to the frame.
+    fn layer_rect(&self, layer: &FxLayer) -> Option<Rect> {
+        let e = layer.extent();
+        if e.is_empty() {
+            return None;
+        }
+        let e = match layer.space {
+            FxSpace::Window => e,
+            FxSpace::Grid => e.translate(
+                i32::try_from(self.pad).unwrap_or(i32::MAX),
+                i32::try_from(self.grid_top()).unwrap_or(i32::MAX),
+            ),
+        };
+        self.frame_rect(e)
     }
 
     /// Total band pixels across the four strips.
@@ -221,6 +258,9 @@ pub struct SpillBand {
     prev: BandStreams,
     // Scratch for the current frame's clip (swapped into `prev` on a raster).
     cur: BandStreams,
+    /// The fx rasterizer's resident scratch (occluder pieces, sprite column
+    /// tables), so a replay allocates nothing once warm.
+    fx_scratch: FxScratch,
 }
 
 /// One frame's band-clipped emissions, per window-absolute stream.
@@ -230,6 +270,13 @@ struct BandStreams {
     fire: Vec<FirePatch>,
     glow: Vec<GlowQuad>,
     halo: Vec<RainHalo>,
+    /// The fx layers whose extent reaches the band, in frame order. Compared
+    /// by identity (the content `Arc`), and held, so a settled card costs a
+    /// pointer compare and a freed content can never alias a new one.
+    fx: Vec<FxLayer>,
+    /// The occluders reaching the band, kept only while `fx` is not empty
+    /// (an occluder only cuts layers).
+    fx_occluders: Vec<PxRect>,
 }
 
 impl BandStreams {
@@ -238,6 +285,7 @@ impl BandStreams {
             && self.fire.is_empty()
             && self.glow.is_empty()
             && self.halo.is_empty()
+            && self.fx.is_empty()
     }
 }
 
@@ -361,6 +409,32 @@ impl SpillBand {
         clip_stream(&mut cur.halo, &input.glow_halo, rows, geom, |q| {
             include_veils || q.mode == HaloMode::Add
         });
+        // The fx layers reaching the band (Arc clones: no payload is copied),
+        // and the occluders that can cut them there.
+        cur.fx.clear();
+        cur.fx.extend(
+            input
+                .fx_layers
+                .iter()
+                .filter(|l| {
+                    geom.layer_rect(l)
+                        .is_some_and(|r| geom.rect_touches_band(r))
+                })
+                .cloned(),
+        );
+        cur.fx_occluders.clear();
+        if !cur.fx.is_empty() {
+            cur.fx_occluders.extend(
+                input
+                    .fx_occluders
+                    .iter()
+                    .filter(|o| {
+                        geom.frame_rect(**o)
+                            .is_some_and(|r| geom.rect_touches_band(r))
+                    })
+                    .copied(),
+            );
+        }
 
         let geom_changed = geom != self.geom;
         let bg_changed = base_bg != self.base_bg;
@@ -390,7 +464,7 @@ impl SpillBand {
             self.rects.clear();
         } else {
             self.emit_dirty_rects(geom_changed || bg_changed);
-            self.rasterize();
+            self.rasterize(renderer.cell_size().1, rows);
             self.rev = self.rev.wrapping_add(1);
         }
         // Swap the just-clipped streams into the fingerprint (allocation-reusing).
@@ -444,6 +518,13 @@ impl SpillBand {
         for q in self.prev.halo.iter().chain(&self.cur.halo) {
             grow(q.rect());
         }
+        // A layer's pixels lie in its extent, and an occluder change moves
+        // pixels only inside some layer's, so the layers' rects bound both.
+        for l in self.prev.fx.iter().chain(&self.cur.fx) {
+            if let Some(r) = geom.layer_rect(l) {
+                grow(r);
+            }
+        }
         let Some((bx, by, bxe, bye)) = bb else {
             return;
         };
@@ -460,23 +541,59 @@ impl SpillBand {
 
     /// Replay the band's ops over `base_bg` per strip in the frame's z-order, then solve
     /// every pixel to the exported straight-alpha pair, in place (stable pointer).
-    fn rasterize(&mut self) {
+    /// `cell_h` and `rows` place the fx layers' band slicing as the frame's.
+    fn rasterize(&mut self, cell_h: usize, rows: usize) {
         let base = self.base_bg;
         self.color.fill(base);
         self.cover.fill(0);
-        let pad = self.geom.pad;
+        let geom = self.geom;
+        let pad = geom.pad;
+        let frame = FxFrame {
+            w: geom.frame_w,
+            h: geom.frame_h,
+            pad,
+            grid_top: geom.grid_top(),
+            cell_h,
+            rows,
+        };
+        let Self {
+            color,
+            cover,
+            cur,
+            fx_scratch,
+            ..
+        } = self;
         let mut off = 0usize;
-        for s in self.geom.strips() {
+        for s in geom.strips() {
             let n = s.w * s.h;
             if n == 0 {
                 continue;
             }
-            let color = &mut self.color[off..off + n];
-            let cover = &mut self.cover[off..off + n];
-            replay_flat_add(color, cover, s, &self.cur.glow_under);
-            replay_fire(color, cover, s, pad, &self.cur.fire);
-            replay_flat_add(color, cover, s, &self.cur.glow);
-            replay_halo(color, cover, s, &self.cur.halo);
+            let color = &mut color[off..off + n];
+            let cover = &mut cover[off..off + n];
+            let mut fx = |color: &mut [u32], cover: &mut [u8], slot, blend| {
+                if !cur.fx.is_empty() {
+                    fx_raster::draw_layers_on(
+                        &mut StripCanvas { s, color, cover },
+                        &frame,
+                        &cur.fx,
+                        &cur.fx_occluders,
+                        slot,
+                        blend,
+                        None,
+                        fx_scratch,
+                    );
+                }
+            };
+            fx(color, cover, FxSlot::Under, FxBlend::Linear);
+            replay_flat_add(color, cover, s, &cur.glow_under);
+            fx(color, cover, FxSlot::Under, FxBlend::Exact);
+            replay_fire(color, cover, s, pad, &cur.fire);
+            replay_flat_add(color, cover, s, &cur.glow);
+            fx(color, cover, FxSlot::Glow, FxBlend::Exact);
+            replay_halo(color, cover, s, &cur.halo);
+            fx(color, cover, FxSlot::Over, FxBlend::Exact);
+            fx(color, cover, FxSlot::Over, FxBlend::Linear);
             off += n;
         }
         for ((c, a), out) in self
@@ -486,6 +603,65 @@ impl SpillBand {
             .zip(self.rgba.as_chunks_mut::<4>().0)
         {
             out.copy_from_slice(&solve_spill_px(base, *c, *a));
+        }
+    }
+}
+
+/// One strip's replay planes as an fx stamp target: the frame's kernels on
+/// the colour plane, and each paint's coverage folded into the cover plane as
+/// the glow quads fold theirs (an Exact paint covers by `max(a, max channel)`,
+/// so additive light counts by its brightness; a Linear one by its opacity).
+struct StripCanvas<'a> {
+    s: StripRect,
+    color: &'a mut [u32],
+    cover: &'a mut [u8],
+}
+
+impl StripCanvas<'_> {
+    /// The plane index range of window row `y`, columns `[x0, x1)`.
+    #[inline]
+    fn span(&self, y: usize, x0: usize, x1: usize) -> std::ops::Range<usize> {
+        let row = (y - self.s.y) * self.s.w;
+        row + (x0 - self.s.x)..row + (x1 - self.s.x)
+    }
+}
+
+impl FxCanvas for StripCanvas<'_> {
+    fn bounds(&self) -> FxSlice {
+        FxSlice {
+            x0: self.s.x,
+            x1: self.s.x + self.s.w,
+            y0: self.s.y,
+            y1: self.s.y + self.s.h,
+        }
+    }
+
+    fn flat(&mut self, y: usize, x0: usize, x1: usize, c: u32, a: u8) {
+        let k = self.span(y, x0, x1);
+        fx_raster::fill_flat(&mut self.color[k.clone()], c, a);
+        let ap = a.max(max_channel(c));
+        for v in &mut self.cover[k] {
+            *v = cover_union(*v, ap);
+        }
+    }
+
+    fn ramp(&mut self, y: usize, x0: usize, x1: usize, i0: u32, qw: u32, c0: FxInk, c1: FxInk) {
+        let k = self.span(y, x0, x1);
+        fx_raster::fill_glow_span(&mut self.color[k.clone()], i0, qw, c0, c1);
+        let (a0, a1) = (u32::from(c0.alpha), u32::from(c1.alpha));
+        for (j, v) in self.cover[k].iter_mut().enumerate() {
+            let i = i0 + j as u32;
+            let a = crate::glow_lerp(a0, a1, i, qw) as u8;
+            let c = crate::glow_lerp_rgb(c0.color, c1.color, i, qw);
+            *v = cover_union(*v, a.max(max_channel(c)));
+        }
+    }
+
+    fn linear(&mut self, y: usize, x0: usize, x1: usize, c: u32, a: u8) {
+        let k = self.span(y, x0, x1);
+        for (p, v) in self.color[k.clone()].iter_mut().zip(&mut self.cover[k]) {
+            *p = crate::blend(*p, c, a);
+            *v = cover_union(*v, a);
         }
     }
 }
@@ -634,8 +810,11 @@ fn replay_fire(color: &mut [u32], cover: &mut [u8], s: StripRect, pad: usize, qu
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{Theme, WindowCpu};
+    use aterm_core::render::{FxArt, FxContent, FxItem, FxRamps, FxRect, FxSprite, FxTexels};
     use aterm_core::terminal::Terminal;
 
     /// The solver alone: over a (bg byte, target byte) lattice and several natural
@@ -691,6 +870,21 @@ mod tests {
         spill: &SpillBand,
         base: u32,
     ) -> [usize; 4] {
+        let (lit, seams) = band_parity(r, input, spill, base, true);
+        assert_eq!(seams, 0);
+        lit
+    }
+
+    /// The parity walk of [`assert_band_parity`]: the per-strip lit counts and
+    /// the number of band pixels where spill ∘ bg and the frame differ (the
+    /// seams), panicking at the first one when `strict`.
+    fn band_parity(
+        r: &mut Renderer,
+        input: &RenderInput,
+        spill: &SpillBand,
+        base: u32,
+        strict: bool,
+    ) -> ([usize; 4], usize) {
         let mut win = WindowCpu::new();
         let view = r.render_input_cached(&mut win, input);
         let (w, h) = (view.width(), view.height());
@@ -705,6 +899,7 @@ mod tests {
         let buf = spill.rgba();
         assert_eq!(buf.len(), geom.band_px() * 4, "buffer sized to the band");
         let mut lit = [0usize; 4];
+        let mut seams = 0usize;
         let mut off = 0usize;
         for (si, s) in geom.strips().iter().enumerate() {
             for yy in 0..s.h {
@@ -722,15 +917,409 @@ mod tests {
                             px[3],
                         )
                     };
-                    assert_eq!(
-                        composed, frame,
-                        "spill ∘ bg must equal the frame band at ({x},{y}) in strip {si}"
-                    );
+                    if strict {
+                        assert_eq!(
+                            composed, frame,
+                            "spill ∘ bg must equal the frame band at ({x},{y}) in strip {si}"
+                        );
+                    }
+                    seams += usize::from(composed != frame);
                 }
             }
             off += s.w * s.h;
         }
-        lit
+        (lit, seams)
+    }
+
+    /// An fx layer of one item.
+    fn fx_layer(
+        id: u64,
+        item: FxItem,
+        palette: Vec<FxInk>,
+        slot: FxSlot,
+        space: FxSpace,
+        blend: FxBlend,
+    ) -> FxLayer {
+        FxLayer::new(
+            id,
+            Arc::new(FxContent::new(vec![item], palette)),
+            slot,
+            space,
+            blend,
+        )
+    }
+
+    fn fx_rect(x: i32, y: i32, w: usize, h: usize) -> FxItem {
+        FxItem::Rect(FxRect {
+            x,
+            y,
+            w: u16::try_from(w).expect("small"),
+            h: u16::try_from(h).expect("small"),
+            ink: 0,
+        })
+    }
+
+    fn fx_sprite(x: i32, y: i32, dw: u16, dh: u16, art: Arc<FxArt>) -> FxItem {
+        FxItem::Sprite(FxSprite {
+            x,
+            y,
+            dw,
+            dh,
+            flip_x: false,
+            art,
+            ink: 0,
+            clip: PxRect::EVERYWHERE,
+        })
+    }
+
+    /// A straight-alpha art with clear, opaque and translucent texels.
+    fn straight_art(w: u16, h: u16) -> Arc<FxArt> {
+        let mut data = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let a = [0u8, 255, 140, 60][usize::from((x + y) % 4)];
+                data.extend_from_slice(&[(x * 41 + 20) as u8, (y * 23 + 90) as u8, 180, a]);
+            }
+        }
+        Arc::new(FxArt::new(w, h, FxTexels::Rgba8Straight, data).expect("sized"))
+    }
+
+    /// Layers of every slot and blend, in both spaces, reaching all four
+    /// strips of a `fw × fh` frame (pad 10, grid_top 27): a card border in
+    /// the padding (Window, Under, Exact), a Grid-space Over rect and ramps
+    /// that reach up and left out of the grid, a Glow Index8 sprite on the
+    /// right strip, Linear Straight sprites Under (right strip) and Over
+    /// (bottom strip, from the grid), and a Premul sprite in the head band.
+    fn band_layers(fw: usize, fh: usize, ch: usize) -> Vec<FxLayer> {
+        let (fwi, fhi) = (fw as i32, fh as i32);
+        let border = FxLayer::new(
+            1,
+            Arc::new(FxContent::new(
+                vec![
+                    fx_rect(2, 6, fw - 4, 3),
+                    fx_rect(2, 6, 3, fh - 12),
+                    fx_rect(fwi - 5, 6, 3, fh - 12),
+                    fx_rect(2, fhi - 6, fw - 4, 3),
+                ],
+                vec![
+                    FxInk::over(0x0030_2010, 0x60),
+                    FxInk::over(0x0010_2030, 0x30),
+                ],
+            )),
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Exact,
+        );
+        let grid_over = FxLayer::new(
+            2,
+            Arc::new(FxContent::new(
+                vec![
+                    fx_rect(-8, -10, 60, 14),
+                    FxItem::Ramps(FxRamps {
+                        x: -6,
+                        y: 2 * ch as i32,
+                        w: 9,
+                        h: 3,
+                        ink: 0,
+                    }),
+                ],
+                vec![
+                    FxInk::add(0x0028_1810),
+                    FxInk::add(0x0008_1828),
+                    FxInk::over(0x0040_2000, 0x80),
+                    FxInk::over(0x0000_2040, 0x20),
+                    FxInk::add(0x0030_3030),
+                    FxInk::add(0x0003_0303),
+                ],
+            )),
+            FxSlot::Over,
+            FxSpace::Grid,
+            FxBlend::Exact,
+        );
+        let glow = fx_layer(
+            3,
+            fx_sprite(
+                fwi - 9,
+                38,
+                8,
+                20,
+                Arc::new(
+                    FxArt::new(3, 2, FxTexels::Index8, vec![1, 0, 2, 2, 1, 0]).expect("sized"),
+                ),
+            ),
+            vec![FxInk::add(0x0040_3020), FxInk::over(0x0020_3040, 0xa0)],
+            FxSlot::Glow,
+            FxSpace::Window,
+            FxBlend::Exact,
+        );
+        let linear_under = fx_layer(
+            4,
+            fx_sprite(fwi - 12, 30, 12, 30, straight_art(4, 5)),
+            vec![FxInk::over(0x00ff_e0c0, 200)],
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Linear,
+        );
+        let linear_over = fx_layer(
+            5,
+            fx_sprite(30, 6 * ch as i32 - 4, 20, 14, straight_art(5, 3)),
+            vec![FxInk::over(0x00c0_e0ff, 230)],
+            FxSlot::Over,
+            FxSpace::Grid,
+            FxBlend::Linear,
+        );
+        let mut premul = Vec::new();
+        for k in 0..12u8 {
+            let a = [0u8, 255, 120, 0][usize::from(k % 4)];
+            let c = if a == 0 { 0x18 } else { a / 2 };
+            premul.extend_from_slice(&[c, c / 2, c / 3, a]);
+        }
+        let head = fx_layer(
+            6,
+            fx_sprite(
+                10,
+                2,
+                40,
+                16,
+                Arc::new(FxArt::new(4, 3, FxTexels::Rgba8Premul, premul).expect("sized")),
+            ),
+            vec![],
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Exact,
+        );
+        vec![border, grid_over, glow, linear_under, linear_over, head]
+    }
+
+    /// THE FX LAYERS SPILL (design §4.4): with layers of every slot and blend,
+    /// in both spaces, reaching all four strips (a card border in the padding
+    /// among them) and two occluders cutting them there, the spill over the
+    /// theme bg equals the composed frame's band byte for byte, alone and
+    /// interleaved with the glow_under, fire, aurora and halo streams on the
+    /// same pixels, on a dark and a light theme.
+    ///
+    /// CONTROLS (in the test): the same frame's spill without its fx layers,
+    /// and its spill without its occluders, each leave a seam.
+    #[test]
+    fn fx_layers_spill_byte_identical_over_the_frame_band() {
+        let dark = Theme::default();
+        let light = Theme {
+            fg: 0x001A_1A1A,
+            bg: 0x00F5_F5F0,
+            cursor: 0x0033_3333,
+            selection: 0x00B0_C4DE,
+        };
+        for theme in [dark, light] {
+            let mut r = Renderer::from_system(16.0, theme).expect(crate::NO_FONT);
+            r.set_pad(10);
+            r.set_pad_top(3);
+            r.set_head(24);
+            let base = theme.bg & 0x00FF_FFFF;
+            let ch = r.cell_size().1;
+            let mut term = Terminal::new(6, 20);
+            let (fw, fh) = r.frame_size(6, 20);
+            let mut input = term.cell_frame(6, 20);
+            input.fx_layers = band_layers(fw, fh, ch);
+            input.fx_occluders = vec![
+                PxRect::new(0, 8, 50, 14),
+                PxRect::new(fw as i32 - 6, 44, fw as i32, 52),
+            ];
+            let spill_of = |r: &Renderer, i: &RenderInput| {
+                let mut s = SpillBand::new();
+                s.update(r, i);
+                s
+            };
+            // Alone: every strip is lit by the layers.
+            let spill = spill_of(&r, &input);
+            let lit = assert_band_parity(&mut r, &input, &spill, base);
+            for (i, n) in lit.iter().enumerate() {
+                assert!(*n > 0, "strip {i} carries fx light (non-vacuous)");
+            }
+            // Interleaved with the streams on the same pixels.
+            // Each stream overlaps a layer it must not commute with: the
+            // order of every fx slot against its neighbours shows in a byte.
+            input.glow_under = vec![
+                GlowQuad::gradient(0, 2, 4, 60, 14, 0x0030_0810, 0x30, 0x0008_1030, 0x50),
+                GlowQuad::gradient(
+                    1,
+                    (fw - 12) as u16,
+                    32,
+                    12,
+                    20,
+                    0x0020_3010,
+                    0x40,
+                    0x0010_2030,
+                    0x60,
+                ),
+            ];
+            input.fire_patch = vec![FirePatch {
+                row: 0,
+                x: 0,
+                y: 2,
+                w: 70,
+                h: 26,
+                base_y: 40,
+                peak_h: 44,
+                phase: 977_331,
+                temp: 210,
+                strength: 230,
+                lean: 6,
+                cov_cap: 210,
+                cell_h: 18,
+                mode: FireMode::Add,
+            }];
+            input.cursor_glow_add = vec![GlowQuad {
+                row: 0,
+                x: (fw - 10) as u16,
+                y: 36,
+                w: 10,
+                h: 20,
+                color: 0x0018_3040,
+                alpha: 0x40,
+                color2: 0x0018_3040,
+                alpha2: 0x40,
+            }];
+            let veil = |row, x: usize, y: usize, w: usize, h: usize| RainHalo {
+                row,
+                x: x as u16,
+                y: y as u16,
+                w: w as u16,
+                h: h as u16,
+                color: 0x0040_3830,
+                cx: (x + w / 2) as u16,
+                cy: (y + h / 2) as u16,
+                rx: (w / 2 + 2) as u16,
+                ry: (h / 2 + 2) as u16,
+                mode: HaloMode::Over,
+            };
+            input.glow_halo = vec![
+                veil(5, 20, fh - 12, 50, 12),
+                veil(1, fw - 12, 34, 12, 26),
+                veil(0, 0, 10, 40, 20),
+            ];
+            let spill = spill_of(&r, &input);
+            assert_band_parity(&mut r, &input, &spill, base);
+
+            // CONTROL: the spill of the frame without its layers has a seam.
+            let mut bare = input.clone();
+            bare.fx_layers.clear();
+            let partial = spill_of(&r, &bare);
+            let (_, seams) = band_parity(&mut r, &input, &partial, base, false);
+            assert!(seams > 0, "CONTROL: a spill without the fx shows a seam");
+            // CONTROL: so does its spill without the occluders.
+            let mut uncut = input.clone();
+            uncut.fx_occluders.clear();
+            let partial = spill_of(&r, &uncut);
+            let (_, seams) = band_parity(&mut r, &input, &partial, base, false);
+            assert!(
+                seams > 0,
+                "CONTROL: a spill that ignores the occluders shows a seam"
+            );
+        }
+    }
+
+    /// The fx layers move the revision as the other streams do: a layer wholly
+    /// inside the grid and settled layers (the same `Arc`s) keep it still with
+    /// no rects; a moved band layer ticks it once with rects covering its old
+    /// and new place in the band; an occluder change over a band layer ticks
+    /// it; the layer vanishing ticks it and leaves the band transparent.
+    #[test]
+    fn fx_layers_tick_the_revision_only_when_the_band_changes() {
+        let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
+        r.set_pad(8);
+        r.set_head(20);
+        let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        let (fw, fh) = r.frame_size(6, 20);
+        let (cw, ch) = r.cell_size();
+        let mut spill = SpillBand::new();
+        spill.update(&r, &input);
+        assert_eq!(spill.rev(), 0);
+
+        // Inside the grid: invisible to the band, even as it changes.
+        let inner = fx_layer(
+            1,
+            fx_rect(2 * cw as i32, ch as i32, 4 * cw, ch),
+            vec![FxInk::add(0x0020_2020); 2],
+            FxSlot::Under,
+            FxSpace::Grid,
+            FxBlend::Exact,
+        );
+        input.fx_layers = vec![inner.clone()];
+        spill.update(&r, &input);
+        let mut moved_inner = inner.clone();
+        moved_inner.offset = (cw as i32, ch as i32);
+        input.fx_layers = vec![moved_inner];
+        spill.update(&r, &input);
+        assert_eq!(spill.rev(), 0, "grid-interior layers never tick");
+        assert!(spill.rects().is_empty());
+
+        // A border in the head band: one tick.
+        let border = fx_layer(
+            2,
+            fx_rect(4, 4, 40, 6),
+            vec![FxInk::add(0x0030_2010); 2],
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Exact,
+        );
+        input.fx_layers = vec![inner.clone(), border.clone()];
+        spill.update(&r, &input);
+        assert_eq!(spill.rev(), 1);
+        assert!(!spill.rgba().iter().all(|&b| b == 0), "the border is lit");
+
+        // Settled: the same Arcs keep the revision and report nothing.
+        input.fx_layers = vec![inner.clone(), border.clone()];
+        spill.update(&r, &input);
+        assert_eq!(spill.rev(), 1, "settled layers never tick");
+        assert!(spill.rects().is_empty());
+
+        // Moved 30 px right: one tick, rects covering old and new place.
+        let mut moved = border.clone();
+        moved.offset.0 = 30;
+        input.fx_layers = vec![inner.clone(), moved.clone()];
+        spill.update(&r, &input);
+        assert_eq!(spill.rev(), 2);
+        let rects = spill.rects().to_vec();
+        let covers = |x: i32, y: i32| {
+            rects
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|q| (q[0]..q[0] + q[2]).contains(&x) && (q[1]..q[1] + q[3]).contains(&y))
+        };
+        assert!(
+            covers(4, 4) && covers(73, 9),
+            "prev ∪ cur extents: {rects:?}"
+        );
+        for q in rects.as_chunks::<4>().0 {
+            assert!(q[0] >= 0 && q[1] >= 0 && q[0] + q[2] <= fw as i32 && q[1] + q[3] <= fh as i32);
+        }
+
+        // An occluder over the band layer: one tick.
+        input.fx_occluders = vec![PxRect::new(0, 0, 50, 8)];
+        spill.update(&r, &input);
+        assert_eq!(spill.rev(), 3, "an occluder cutting band light ticks");
+        // An occluder change inside the grid only: still.
+        input.fx_occluders.push(PxRect::new(
+            3 * cw as i32 + 8,
+            30 + ch as i32,
+            5 * cw as i32 + 8,
+            30 + 2 * ch as i32,
+        ));
+        spill.update(&r, &input);
+        assert_eq!(
+            spill.rev(),
+            3,
+            "an occluder off the band is not band content"
+        );
+
+        // Vanished: one tick, transparent again.
+        input.fx_layers = vec![inner];
+        spill.update(&r, &input);
+        assert_eq!(spill.rev(), 4);
+        assert!(!spill.rects().is_empty());
+        assert!(spill.rgba().iter().all(|&b| b == 0));
     }
 
     /// The byte-parity property: spill over the theme bg equals the composed frame's

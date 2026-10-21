@@ -66,6 +66,11 @@ LOOK
     ls [--json]               the inventory
     tabs [<host>…] [--json]   every accessible Mac's live aterm instances, tabs, stats and
                               AI CLI status
+    monitor [<host>…] [--open | --once | --watch] [--interval <s>] [--json]
+                              live continuous system monitoring (CPU, GPU, RAM, disk, load,
+                              network RTT, aterm sessions & AI CLIs); opens the native
+                              Fleet Monitor tab in aterm or streams in the terminal
+                              (aliases: top, watch)
     status [<host>…] [--by-item] [--json]
                               each host's newest report, read from state/ alone
     outstanding               failures, refusals, person steps, deferred items, what an
@@ -168,6 +173,7 @@ const VERBS: &[&str] = &[
     "rename",
     "ls",
     "tabs",
+    "monitor",
     "status",
     "outstanding",
     "plan",
@@ -345,7 +351,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             retire_lan_agent();
             here(&sys, &args[1..])
         }
-        verb if VERBS.contains(&verb) || verb == "name" => {
+        verb if VERBS.contains(&verb) || matches!(verb, "name" | "top" | "watch") => {
             #[cfg(not(test))]
             retire_lan_agent();
             let Some(paths) = root.or_else(Paths::default_root) else {
@@ -366,6 +372,10 @@ struct Opts {
     all: bool,
     now: bool,
     json: bool,
+    open: bool,
+    once: bool,
+    watch: bool,
+    interval: Option<u64>,
     by_item: bool,
     here: bool,
     unreachable: bool,
@@ -384,6 +394,14 @@ fn flags_of(verb: &str) -> &'static [&'static str] {
         // `outstanding` is a to-do list for a person: `status --json` has the reports.
         "ls" | "attach" => &["--json"],
         "tabs" => &["--all", "--json"],
+        "monitor" | "top" | "watch" => &[
+            "--all",
+            "--open",
+            "--once",
+            "--watch",
+            "--interval",
+            "--json",
+        ],
         "status" => &["--all", "--by-item", "--json"],
         "plan" | "apply" => &["--all", "--now", "--parallel", "--only", "--json"],
         "run" => &["--all", "--user", "--parallel", "--"],
@@ -421,6 +439,18 @@ fn parse(verb: &str, args: &[String]) -> Result<Opts, String> {
             "--all" => o.all = true,
             "--now" => o.now = true,
             "--json" => o.json = true,
+            "--open" => o.open = true,
+            "--once" => o.once = true,
+            "--watch" => o.watch = true,
+            "--interval" => {
+                let v = value()?;
+                o.interval = Some(
+                    v.parse::<u64>()
+                        .ok()
+                        .filter(|n| (1..=3600).contains(n))
+                        .ok_or_else(|| format!("--interval takes 1 to 3600 seconds, not {v:?}"))?,
+                );
+            }
             "--by-item" => o.by_item = true,
             "--here" => o.here = true,
             "--unreachable" => o.unreachable = true,
@@ -507,6 +537,15 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
         "rename" | "name" => commands::rename(&env, &o.words[0], &o.words[1]),
         "ls" => commands::ls(&env),
         "tabs" => commands::tabs(&env, &o.words, o.all),
+        "monitor" | "top" | "watch" => commands::monitor(
+            &env,
+            &o.words,
+            o.all,
+            o.open,
+            o.once,
+            o.watch || matches!(verb, "top" | "watch"),
+            o.interval.unwrap_or(2),
+        ),
         "status" => commands::status(&env, &o.words, o.all, o.by_item),
         "outstanding" => commands::outstanding(&env),
         "plan" => commands::plan_or_apply_only(&env, &o.words, o.all, Mode::Plan, o.now, &o.only),

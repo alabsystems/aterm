@@ -84,8 +84,23 @@ pub(crate) struct AiCli {
     pub(crate) mark: Mark,
     /// What is known, one line.
     pub(crate) fact: String,
+    /// THE PATH `fact` NAMES, as it says it ([`named_path`]): a copy on
+    /// `PATH` aterm does not manage. Only the look knows where it starts and
+    /// ends — a macOS path holds spaces ("Application Support") — so a row
+    /// that cuts its detail around the path is told it, never guesses it.
+    pub(crate) path: Option<String>,
     /// The installed version.
     pub(crate) version: Option<String>,
+}
+
+/// The words of `foreign` as `fact` says them, where `fact` names that path:
+/// the path a row's detail must keep its end of ([`AiCli::path`]); `None`
+/// where there is no such copy, or the fact (cut at [`FACT_MAX`]) does not
+/// say all of it.
+fn named_path(fact: &str, foreign: Option<&Path>) -> Option<String> {
+    foreign
+        .map(|path| one_line(&path.display().to_string()))
+        .filter(|path| !path.is_empty() && fact.contains(path.as_str()))
 }
 
 impl AiCli {
@@ -134,15 +149,24 @@ impl AiReading {
     pub(crate) fn of(look: &aterm_agent::ai::cli::Look, now: i64, offset_s: Option<i64>) -> Self {
         let clis = connector::connections()
             .filter_map(|c| look.rows.iter().find(|row| row.connector.id == c.id))
-            .map(|row| AiCli {
-                id: row.connector.id,
-                product: row.connector.product,
-                claude: row.connector.is_claude(),
-                wanted: row.wanted,
-                state: row.state,
-                mark: row.mark,
-                fact: one_line(&row.fact),
-                version: row.version.as_deref().map(one_line),
+            .map(|row| {
+                let fact = one_line(&row.fact);
+                let foreign = look
+                    .facts
+                    .iter()
+                    .find(|facts| facts.connector.id == row.connector.id)
+                    .and_then(|facts| facts.foreign.as_deref());
+                AiCli {
+                    id: row.connector.id,
+                    product: row.connector.product,
+                    claude: row.connector.is_claude(),
+                    wanted: row.wanted,
+                    state: row.state,
+                    mark: row.mark,
+                    path: named_path(&fact, foreign),
+                    fact,
+                    version: row.version.as_deref().map(one_line),
+                }
             })
             .collect();
         Self {
@@ -307,6 +331,9 @@ pub(crate) struct AiCliRow {
     pub(crate) title: String,
     /// Its state and what is known.
     pub(crate) detail: String,
+    /// The path `detail` names ([`AiCli::path`]), which a one-line row keeps
+    /// the end of.
+    pub(crate) path: Option<String>,
     /// Sign in or Install, where it needs a person.
     pub(crate) act: Option<AiAct>,
     /// Whether its `use` comes from the fleet document.
@@ -466,6 +493,7 @@ impl AiState {
                             None => format!("{}{tag}", c.product),
                         },
                         detail: detail_words(cli.state.word(), &cli.fact),
+                        path: cli.path.clone(),
                         act: self.actionable_cli(c.id).and_then(AiCli::act),
                         use_from_fleet,
                     },
@@ -480,6 +508,7 @@ impl AiState {
                         } else {
                             "not looked at yet".to_string()
                         },
+                        path: None,
                         act: None,
                         use_from_fleet,
                     },

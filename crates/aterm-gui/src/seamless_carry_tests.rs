@@ -123,6 +123,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 journal_key: None,
                 task: None,
                 status_seen: None,
+                autopilot_end: None,
             })
             .collect(),
         roster_seq: None,
@@ -224,7 +225,7 @@ fn old_session(app: &mut FakeApp, n: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<
         dur_ms: 2,
         submitted: true,
         status: "settled",
-        text: "an earlier turn".to_string(),
+        text: "an earlier turn".into(),
         screen_hash: 1,
         seq: 1,
         arch: ArchMark::of(&t),
@@ -242,7 +243,7 @@ fn old_session(app: &mut FakeApp, n: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<
         dur_ms: 2000,
         submitted: true,
         status: "settled",
-        text: TURN_TEXT.to_string(),
+        text: TURN_TEXT.into(),
         screen_hash: 2,
         seq: t.content_seq(),
         arch,
@@ -349,7 +350,11 @@ impl aterm_agent::supervise::run::Ctl for Host {
         let rest = args[1..].join(" ");
         let reply = match args[0] {
             "history" => crate::control::cmd_history(&self.ctx, &rest),
-            "offscreen" => crate::control::cmd_offscreen(&self.term, &rest),
+            "offscreen" => crate::control::cmd_offscreen(
+                &self.term,
+                &crate::frame_memo::FrameSlot::default(),
+                &rest,
+            ),
             other => return Err(format!("unscripted verb {other}")),
         };
         Ok(if reply.starts_with("OK") {
@@ -615,13 +620,15 @@ fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
     let (term, turns) = old_session(&mut app, 60);
     let mark = turns.lock().unwrap().records().last().unwrap().arch;
     let since = format!("since={}:{} max=5000", mark.origin, mark.last);
-    let before = crate::control::cmd_offscreen(&term, &since);
+    let before =
+        crate::control::cmd_offscreen(&term, &crate::frame_memo::FrameSlot::default(), &since);
     let carry = outgoing(&term, &turns, None);
     let staged = stage_carry_handoff("carry-roundtrip", &carry);
     let mut adopted = as_successor(&staged, |_| take_incoming().adopted);
     let (t, ledger, _) = adopt(&carry.screens[0], adopted[0].control.take());
     let h = host(t, ledger);
-    let after = crate::control::cmd_offscreen(&h.term, &since);
+    let after =
+        crate::control::cmd_offscreen(&h.term, &crate::frame_memo::FrameSlot::default(), &since);
     // The header's seq= is the engine's own content counter; everything else
     // — origin, indices, rows, gaps — is the same archive.
     let strip_seq = |s: &str| {
@@ -666,7 +673,8 @@ fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
     let h = host(t, ledger);
     let history = crate::control::cmd_history(&h.ctx, "since=40");
     assert!(history.starts_with("OK 1\nturn 41 "), "{history}");
-    let after = crate::control::cmd_offscreen(&h.term, &since);
+    let after =
+        crate::control::cmd_offscreen(&h.term, &crate::frame_memo::FrameSlot::default(), &since);
     assert!(after.contains(&format!("origin={ORIGIN}")), "{after}");
     assert!(ctl_files(&staged).is_empty(), "nothing left behind");
     staged.teardown();
@@ -688,7 +696,8 @@ fn a_receiver_degraded_screen_without_a_meta_keeps_its_archive_rows() {
     let (term, turns) = old_session(&mut app, 60);
     let mark = turns.lock().unwrap().records().last().unwrap().arch;
     let since = format!("since={}:{} max=5000", mark.origin, mark.last);
-    let before = crate::control::cmd_offscreen(&term, &since);
+    let before =
+        crate::control::cmd_offscreen(&term, &crate::frame_memo::FrameSlot::default(), &since);
     let carry = outgoing(&term, &turns, None);
     let mut staged = stage_carry_handoff("carry-nometa", &carry);
     restage_session(&mut staged, 0, &|_| "{".to_string(), &|grid| grid);
@@ -709,7 +718,8 @@ fn a_receiver_degraded_screen_without_a_meta_keeps_its_archive_rows() {
         0,
         &mut adopted[0].history,
     );
-    let after = crate::control::cmd_offscreen(&successor, &since);
+    let after =
+        crate::control::cmd_offscreen(&successor, &crate::frame_memo::FrameSlot::default(), &since);
     assert!(after.contains(&format!("origin={ORIGIN}")), "{after}");
     let carried_rows = |reply: &str| -> Vec<String> {
         reply
@@ -1015,6 +1025,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             journal_key: None,
             task: None,
             status_seen: None,
+            autopilot_end: None,
         }],
         roster_seq: None,
         fabric_attached: Vec::new(),
@@ -1511,7 +1522,7 @@ fn history_rec(id: u64, carried: bool) -> TurnRecord {
         dur_ms: 1,
         submitted: true,
         status: "settled",
-        text: "t".to_string(),
+        text: "t".into(),
         screen_hash: 1,
         seq: 1,
         arch: ArchMark::default(),
@@ -1594,6 +1605,7 @@ fn history_on_a_halved_ledger_says_its_floor() {
         turns: vec![history_rec(minted, true)],
         unheld_below: minted,
         shed_below: 0,
+        turn_ids: 0,
         archive: None,
         log: None,
         log_mirror: None,
@@ -1630,20 +1642,15 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
     let resume = |local: u64, ledger: TurnLedger| -> String {
         let store = crate::session_store::new_store();
         let h = crate::session_store::test_handle(local);
-        *h.ctx.turns.lock().unwrap() = ledger;
-        let target: crate::subscribe::ResolvedTarget = (
-            local,
-            h.term.clone(),
-            h.ctx.byte_fanout.clone(),
-            h.ctx.turns.clone(),
-            h.ctx.timeline.clone(),
-            h.ctx.fabric.clone(),
-        );
+        *h.ctx.turns.lock().unwrap() = ledger.watched_by(h.ctx.watchers.clone());
+        let target = crate::subscribe::ResolvedTarget {
+            local_id: local,
+            term: h.term.clone(),
+            src: crate::subscribe::WatchSource::of(&h.ctx),
+        };
         store.write().unwrap_or_else(|p| p.into_inner()).register(h);
-        let registry = crate::subscribe::new_registry();
         let mut sink: Vec<u8> = Vec::new();
         crate::subscribe::push_loop_with_peer_probe(
-            &registry,
             &store,
             &[target],
             crate::subscribe::PushScopes {
@@ -1669,6 +1676,7 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
         turns: vec![history_rec(minted, true)],
         unheld_below: minted,
         shed_below: 0,
+        turn_ids: 0,
         archive: None,
         log: None,
         log_mirror: None,
@@ -1743,7 +1751,7 @@ fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
         dur_ms: 2000,
         submitted: true,
         status: "settled",
-        text: TURN_TEXT.to_string(),
+        text: TURN_TEXT.into(),
         screen_hash: 2,
         seq: pre.content_seq(),
         arch: arch41,
@@ -1797,10 +1805,12 @@ fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
     };
     let o = strip(crate::control::cmd_offscreen(
         &Arc::new(Mutex::new(old)),
+        &crate::frame_memo::FrameSlot::default(),
         &since,
     ));
     let n = strip(crate::control::cmd_offscreen(
         &Arc::new(Mutex::new(t)),
+        &crate::frame_memo::FrameSlot::default(),
         &since,
     ));
     assert_eq!(

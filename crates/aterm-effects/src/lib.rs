@@ -84,6 +84,10 @@ pub mod cursor_trail;
 /// Crate-private shared render kit for the cursor emitters (the two per-cell-row
 /// quad pushers, colour ramps, and the one twinkle star).
 mod effect_util;
+/// WCAG 2.3.1's general-flash bound every flash rate here is held under,
+/// for the hosts that bound a flash of their own (the harness card's
+/// re-show bound).
+pub use effect_util::TWINKLE_FLASH_BOUND_HZ;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;
@@ -145,10 +149,11 @@ pub mod rainbow_kitty;
 /// is the host's.
 pub mod sound_policy;
 pub mod spec;
-/// The rainbow family's colour law (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2):
-/// a monotone C¹ hue curve through seven named stops at one relative luminance,
-/// baked to a 1 KB LUT. Colours resolve through [`spectrum::spectrum`]; point
-/// marks snap to a name through [`spectrum::spectrum_snap`].
+/// The rainbow family's colour law (`docs/design/RAINBOW-KITTY-V2.md` §2.3, C1):
+/// seven ROYGBIV stops joined by smooth per-channel interpolation, baked to a
+/// 511-entry (just under 2 KiB) LUT. Colours resolve through
+/// [`spectrum::spectrum`]; point marks snap to a name through
+/// [`spectrum::spectrum_snap`].
 pub mod spectrum;
 pub mod supernova;
 /// Tone of typing: a small hashed char-n-gram classifier that maps the line

@@ -368,7 +368,7 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
         "  Rainbow Kitty  ",
         // Geometry is not an animal: the underline spellings are the ribbon
         // drawn under the baseline and must draw the pet. All four, because
-        // `prefs::CURSOR_TRAIL_STYLE_ALIASES` canonicalises the other three
+        // `spellings::TRAIL_STYLE_ALIASES` canonicalises the other three
         // onto this one.
         "rainbow kitty underline",
         "rainbow underline",
@@ -431,8 +431,7 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
             "{s:?} claims both animals"
         );
     }
-    // The converse of `prefs`'s `every_tall_ribbon_spelling_stays_selectable`:
-    // choosing the geometry must not change the animal.
+    // Choosing the geometry must not change the animal.
     assert_eq!(
         GlowStyle::style_names_any_pet("rainbow kitty"),
         GlowStyle::style_names_any_pet("rainbow kitty underline"),

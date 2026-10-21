@@ -146,8 +146,9 @@ pub enum Op {
     /// Raw PTY input bytes were fed to the engine (`process`); payload in the
     /// blob store under this [`BlobId`].
     RawIn(BlobId),
-    /// The engine emitted reply bytes to the PTY peer (DSR/DA/…); payload in the
-    /// blob store. Recorded for fork-timeline fidelity; not re-emitted on replay.
+    /// The engine emitted reply bytes to the PTY peer (DSR/DA/…). Recorded for
+    /// fork-timeline fidelity; not re-emitted on replay, so a host may keep no
+    /// payload under the handle.
     Reply(BlobId),
     /// The terminal was resized to `rows`×`cols`. Reflow is path-dependent, so a
     /// resize is a recorded event and never reordered.
@@ -193,11 +194,12 @@ impl EventLog {
     /// Append a temporal op at a recorded tick. Returns the assigned `Seq` and,
     /// when the ring was full, the evicted oldest event.
     ///
-    /// The evicted event is the spill seam: the caller must tier it rather than
-    /// drop it (the `NoSilentLoss` obligation of `tier_residency_model`). This
-    /// crate does no fs; the host owns tiered persistence, which also keeps
-    /// `EventLog: Clone + Debug + Default`.
-    #[must_use = "the evicted event is the spill seam — tier it (B.8.2), do not drop it"]
+    /// The evicted event is the spill seam: the caller tiers it (the
+    /// `NoSilentLoss` obligation of `tier_residency_model`) or, keeping no
+    /// tier, counts it and releases what it referenced; it never drops it
+    /// silently. This crate does no fs; the host owns tiered persistence, which
+    /// also keeps `EventLog: Clone + Debug + Default`.
+    #[must_use = "the evicted event is the spill seam — tier or count it (B.8.2)"]
     pub fn append_at(&mut self, op: Op, ts: Ticks) -> (Seq, Option<Event>) {
         self.total = self.total.saturating_add(1);
         let seq = Seq(self.total);

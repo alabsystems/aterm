@@ -554,8 +554,11 @@ impl App {
     ///   (`Misspelled setting fixed`, ✓);
     /// * a row whose family's words CHANGED is superseded in place by the new
     ///   row: the problem became another, so its record keeps its title and
-    ///   its ⚠ and stays in Problems (design ruling 266). One that is now a
-    ///   record only comes down with the fix's words cleared first;
+    ///   its ⚠, never the fix's words (design ruling 266). Settings ▸ Messages
+    ///   lists it as part of the new row, which keeps the problem in Problems
+    ///   (one fact, one row; `aterm ctl messages` and messages.log keep the
+    ///   record itself). One that is now a record only comes down with the
+    ///   fix's words cleared first;
     /// * a family whose row already LEFT the glass — its hold ran out, it was
     ///   read, or it was recorded as a repeat before — and that comes back in
     ///   the words THIS process last recorded under its key is a RECORD
@@ -628,7 +631,8 @@ impl App {
             // SUPERSEDES it in place when posted below — the problem became
             // another, it was not fixed, so the record keeps its title and
             // its mark (ruling 266: `Misspelled setting fixed` was logged for
-            // a typo still there beside a second one).
+            // a typo still there beside a second one), and the page lists it
+            // as part of the new row.
         }
         self.post_config_set(resolved, msgs);
     }
@@ -1463,10 +1467,23 @@ impl App {
             // `End sessions` on the PTY keeper's recovery row: every shell
             // this launch reattached is hung up (`keeper_link`).
             Intent::EndRecovered => self.end_recovered_sessions() > 0,
-            // A row's navigation to a tab (rulings 247 and 440): the tab the
-            // title names, in the window it is in — the band is app-wide, so
-            // the press may come from another window's band — raised.
-            Intent::ShowTab { tab, window } => self.show_tab(WindowId(window), tab),
+            // Ordinal-only carried intents are readable, never rebound to
+            // whichever tab occupies that position now.
+            Intent::ShowTab { .. } => false,
+            Intent::ShowSession {
+                window, session, ..
+            } => {
+                // Drop the store read before focus takes any pane/terminal locks.
+                let local = {
+                    let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+                    store
+                        .by_sid(&aterm_session::SessionId::new(session))
+                        .map(|h| h.local_id)
+                };
+                local.is_some_and(|local| {
+                    self.focus_session_preferring(Some(WindowId(window)), local)
+                })
+            }
             // THE OWNER'S WORD on a tab's agent upgrade (gap #21): written
             // where `aterm harness upgrade <tab> --now|--defer|--skip` writes
             // it, for the build the row named, off this thread; the row says
@@ -1481,31 +1498,6 @@ impl App {
                     && self.send_upgrade_word(crate::upgrade_host::WordAsk::new(tab, to, word))
             }
         }
-    }
-
-    /// `Show tab N` (rulings 247 and 440): tab `tab` (1-based) of window
-    /// `wid` — the window the row named, whichever window's band the
-    /// press came from — selected and its window raised (the
-    /// [`Self::focus_session_window`] shape, de-miniaturize included).
-    /// `false` when that window or that tab is gone.
-    pub(crate) fn show_tab(&mut self, wid: WindowId, tab: u16) -> bool {
-        let index = usize::from(tab).saturating_sub(1);
-        let exists = self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| tab > 0 && ws.tab_set.tab_at(index).is_some());
-        if !exists {
-            return false;
-        }
-        self.switch_tab_in(wid, index);
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
-            if w.is_minimized().unwrap_or(false) {
-                self.pending_deminiaturize_focus = Some(wid);
-            }
-            w.set_minimized(false);
-            w.focus_window();
-        }
-        true
     }
 
     /// SETTINGS ▸ MESSAGES, AT AN ENTRY, IN THIS WINDOW (design §4.5, D5):

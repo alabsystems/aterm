@@ -61,6 +61,7 @@ impl EditorWorkspace {
         let (seq, deltas) = transact(store, view.document, view.anchor_seq, edits)?;
         view.observe_own(seq, &deltas);
         self.last_commit = Some((view.document, seq, deltas.clone()));
+        self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
         history.undo.push(HistoryFrame {
             expected_seq: seq,
@@ -98,6 +99,7 @@ impl EditorWorkspace {
         let (seq, deltas) = transact(store, view.document, current, frame.undo.clone())?;
         view.observe_own(seq, &deltas);
         self.last_commit = Some((view.document, seq, deltas.clone()));
+        self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
         // The undo is a new commit: the frame under it now applies to the
         // text at THIS sequence (its own edit's result, put back), so a
@@ -140,6 +142,7 @@ impl EditorWorkspace {
         let (seq, deltas) = transact(store, view.document, current, frame.redo.clone())?;
         view.observe_own(seq, &deltas);
         self.last_commit = Some((view.document, seq, deltas.clone()));
+        self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
         // As in [`Self::undo`]: the next Redo applies to the text at this
         // sequence.
@@ -186,7 +189,8 @@ fn inverse_edits(source: &str, edits: &[TextEdit]) -> Result<Vec<TextEdit>, Edit
             insert: source[edit.range.clone()].to_owned(),
         });
         let removed = edit.range.end.saturating_sub(edit.range.start);
-        growth = growth.saturating_add(edit.insert.len() as isize - removed as isize);
+        growth =
+            growth.saturating_add((edit.insert.len() as isize).saturating_sub(removed as isize));
     }
     Ok(inverse)
 }

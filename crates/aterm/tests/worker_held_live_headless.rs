@@ -10,9 +10,12 @@
 //! A worker started with `spawn agent=claude` runs a stand-in `claude` (a
 //! `#!/bin/sh` script run under the name `claude`, so the server reads it as
 //! Claude Code and the window harness supervises it) that draws a finished
-//! turn ending with ATERM-TASK-DONE — the harness publishes the done — then
-//! takes the manager's follow-up `turn` (echoed into its composer, so the
-//! submit is verified the Claude Code way) and answers it with that notice,
+//! turn; the worker is under Autopilot Land (a spawn's default), so the
+//! harness types its LAND instruction (echoed into the composer, so the
+//! submit is verified the Claude Code way), and the stand-in answers it with
+//! a clean defense, a few lines starting `Nothing left:` — Land's landing,
+//! which publishes the done. It then takes the manager's follow-up `turn`
+//! (echoed the same way) and answers it with that notice,
 //! no composer, nothing moving. The held deadline, shortened for the test
 //! through its development seam (`ATERM_TASK_HELD_MS`), marks the task
 //! `stalled why=held` with the attention naming the screen, and the
@@ -48,27 +51,63 @@ const STANDIN: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
     exec /bin/bash -c 'exec -a claude /bin/sh \"$HOME/fake.sh\" \"$HOME/screens\"'\n";
 
-/// The fake worker, in raw mode: draws `ready`; at `ready` it echoes what is
-/// typed into its composer row (`ready.row`) and, at the Enter, draws `box`;
-/// at `box` an Esc draws `back`. One byte a read; end of input ends it.
+/// The fake worker, in raw mode, drawing as Claude Code draws: a conversation
+/// (`ready.top`), then its framed composer (`rule`) holding what is typed,
+/// wrapped, the cursor after its last character. At `ready` the first Enter
+/// submits what was typed (the harness's LAND instruction) and draws the
+/// conversation with it and the worker's clean defense (`defense.top`), its
+/// composer empty again: `landed`. The submitted prompt is drawn as Claude
+/// Code draws one in the conversation — a `❯ ` row, wrapped at word
+/// boundaries onto rows indented two columns — and no busy frame comes
+/// between the Enter and the defense, so the harness knows its act was
+/// taken only by that row over the answer (`aterm_phase::answered_prompt`,
+/// the lab's measured `d1l` answer drawn faster than any read): a prompt
+/// split mid-word under a `> ` head reads as no answer, and the land act's
+/// defense would land nothing. There an Enter (the manager's follow-up)
+/// draws `box`; at `box` an Esc draws `back`. It reads what is there at once
+/// (raw mode returns what is pending), so a long instruction is drawn whole
+/// in one frame; end of input ends it.
 const FAKE: &str = r#"#!/bin/sh
 dir="$1"
 stty raw -echo
-cr=$(printf '\r'); esc=$(printf '\033')
+cr=$(printf '\r'); esc=$(printf '\033'); sc=$(printf '\0337'); rc=$(printf '\0338')
+rule=$(cat "$dir/rule")
+screen() {
+  printf '\033[H\033[2J'; cat "$1"; printf '%s\r\n' "$rule"
+  if [ -z "$2" ]; then printf '\342\235\257 %s' "$sc"
+  else printf '%s\n' "$2" | fold -w 96 | awk -v sc="$sc" 'NR>1{printf "\r\n  %s",$0;next}{printf "\342\235\257 %s",$0} END{printf "%s",sc}'
+  fi
+  printf '\r\n%s\r\n  ? for shortcuts%s' "$rule" "$rc"
+}
 draw() { printf '\033[H\033[2J'; cat "$dir/$1.scr"; }
-IFS= read -r row < "$dir/ready.row"
-draw ready
-at=ready; buf=""
+enter() {
+  if [ "$at" = ready ]; then
+    { cat "$dir/ready.top"
+      printf '%s\n' "$buf" | fold -s -w 96 | awk 'NR>1{printf "  %s\r\n",$0;next}{printf "\342\235\257 %s\r\n",$0}'
+      printf '\r\n'; cat "$dir/defense.top"; } > "$dir/landed.top"
+    at=landed; buf=""; screen "$dir/landed.top" ""
+  else at=box; buf=""; draw box; fi
+}
+feed() {
+  rest="$1"
+  while [ -n "$rest" ]; do
+    case "$at" in
+      ready|landed)
+        case "$rest" in
+          *"$cr"*) buf="$buf${rest%%"$cr"*}"; rest="${rest#*"$cr"}"; enter ;;
+          *) buf="$buf$rest"; rest=""; screen "$dir/$at.top" "$buf" ;;
+        esac ;;
+      box)
+        case "$rest" in *"$esc"*) at=back; draw back ;; esac; rest="" ;;
+      *) rest="" ;;
+    esac
+  done
+}
+at=ready; buf=""; screen "$dir/ready.top" ""
 while :; do
-  c=$(dd bs=1 count=1 2>/dev/null; printf .); c="${c%.}"
+  c=$(dd bs=4096 count=1 2>/dev/null; printf .); c="${c%.}"
   [ -z "$c" ] && exit 0
-  case "$at" in
-    ready)
-      if [ "$c" = "$cr" ]; then at=box; draw box
-      else buf="$buf$c"; printf '\033[%s;1H\033[2K\342\235\257 %s' "$row" "$buf"; fi ;;
-    box)
-      if [ "$c" = "$esc" ]; then at=back; draw back; fi ;;
-  esac
+  feed "$c"
 done
 "#;
 
@@ -100,13 +139,18 @@ fn render(rows: &[String], cursor: (usize, usize)) -> String {
     )
 }
 
-/// The task's turn as Claude Code ends it, the marker on its own line.
-const TASK_TURN: [&str; 6] = [
-    "> Fix the parser.",
+/// The task's turn as Claude Code ends it: its report, a done claim in
+/// ordinary words (no token), so its manager's wait skips the short turn's
+/// back-off and the LAND instruction goes at once.
+const TASK_TURN: [&str; 4] = [
+    "❯ Fix the parser.",
     "",
-    "⏺ Fixed the parser; the suite is green.",
+    "⏺ Fixed the parser; the suite is green. The task is complete.",
     "",
-    "  ATERM-TASK-DONE",
+];
+/// The worker's answer to the LAND instruction: a clean defense.
+const DEFENSE: [&str; 2] = [
+    "⏺ Nothing left: the parser fix is verified, committed and on the remote main branch.",
     "",
 ];
 /// The follow-up the manager types.
@@ -117,15 +161,18 @@ fn write_worker(home: &Path) {
     let dir = home.join("screens");
     std::fs::create_dir_all(&dir).expect("the screens' folder");
     std::fs::write(home.join("fake.sh"), FAKE).expect("the fake");
-    let (ready, caret) = composed(&TASK_TURN);
-    std::fs::write(dir.join("ready.scr"), render(&ready, (caret, 2))).expect("ready");
-    std::fs::write(dir.join("ready.row"), format!("{}\n", caret + 1)).expect("its row");
+    // The conversations the fake draws its composer under, in raw mode's
+    // line ends, and the composer's rule.
+    let top = |rows: &[&str]| rows.iter().map(|r| format!("{r}\r\n")).collect::<String>();
+    std::fs::write(dir.join("ready.top"), top(&TASK_TURN)).expect("ready");
+    std::fs::write(dir.join("defense.top"), top(&DEFENSE)).expect("the defense");
+    std::fs::write(dir.join("rule"), "─".repeat(COLUMNS)).expect("the rule");
     // The measured notice (2.1.301, the workers lab "On the way" 1), no
     // composer: a screen no harness rule knows.
     let mut held: Vec<String> = TASK_TURN.iter().map(|r| (*r).to_string()).collect();
     held.extend(
         [
-            &format!("> {FOLLOW_UP}"),
+            &format!("❯ {FOLLOW_UP}"),
             "",
             "We're changing auto mode to no longer charge for classifier requests in Claude Code.",
             "However, this session isn't eligible because your requests go through 127.0.0.1:4000,",
@@ -141,15 +188,8 @@ fn write_worker(home: &Path) {
     let at = held.len() - 1;
     std::fs::write(dir.join("box.scr"), render(&held, (at, 0))).expect("box");
     let mut back: Vec<&str> = TASK_TURN.to_vec();
-    let asked = format!("> {FOLLOW_UP}");
-    back.extend([
-        asked.as_str(),
-        "",
-        "⏺ Wrote the docs.",
-        "",
-        "  ATERM-TASK-DONE",
-        "",
-    ]);
+    let asked = format!("❯ {FOLLOW_UP}");
+    back.extend([asked.as_str(), "", "⏺ Wrote the docs.", ""]);
     let (back, caret) = composed(&back);
     std::fs::write(dir.join("back.scr"), render(&back, (caret, 2))).expect("back");
 }
@@ -202,13 +242,15 @@ fn spawn_worker(inst: &Instance, manager: &str, task: &str) -> String {
     cmd.env("ATERM_PARENT_SESSION_ID", manager)
         .current_dir(inst.tmp.join("work"))
         .stdin(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn aterm ctl");
-    let mut stdin = child.stdin.take().expect("its stdin");
-    stdin.write_all(task.as_bytes()).expect("write the task");
-    drop(stdin);
-    let out =
+    // Asked again while the instance has not yet accepted it, or answers it busy: nothing was sent.
+    let out = headless_boot::until_served(|| {
+        let mut child = cmd.spawn().expect("spawn aterm ctl");
+        let mut stdin = child.stdin.take().expect("its stdin");
+        stdin.write_all(task.as_bytes()).expect("write the task");
+        drop(stdin);
         child_output::wait_and_read(child, Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE)
-            .expect("aterm ctl exits");
+            .expect("aterm ctl exits")
+    });
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -278,7 +320,8 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
     let (_, manager) = boot_session(&inst);
     let worker = spawn_worker(&inst, &manager, "Fix the parser.");
 
-    // The task's own turn ends with the marker: the harness's done.
+    // The task's own turn, the LAND instruction typed, its clean defense:
+    // Land's landing, the harness's done.
     let done = await_task(&inst, &format!("@{worker}:0"), &worker);
     assert_eq!(field(&done, "state"), Some("done"), "{done}");
 

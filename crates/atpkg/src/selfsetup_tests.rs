@@ -243,6 +243,132 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
     );
 }
 
+#[test]
+fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_profile() {
+    // The one tool resolver (`$ATERM_TEST_FISH`, the pinned copy, the usual install
+    // paths, then `$PATH`), so a host that names its fish for one crate names it here;
+    // without one the test ends COULD NOT RUN naming fish's provider.
+    let fish = aterm_spec::host::need_tool("fish");
+    for shell in [
+        Path::new("/bin/zsh"),
+        Path::new("/bin/bash"),
+        fish.as_path(),
+    ] {
+        let is_fish = shell.file_name().is_some_and(|name| name == "fish");
+        let mut account = Account::new("selected-cli");
+        // Each shell must quote a real CLI path, including its metacharacters.
+        account.places.bin_dir = account.home().join("CLI $selected `app` 'links'");
+        let bin = &account.places.bin_dir;
+        let release = account.home().join("aterm.app/Contents/MacOS");
+        let dev = account.home().join("aterm (dev).app/Contents/MacOS");
+        exe(
+            &release.join("aterm"),
+            "#!/bin/sh\nprintf '%s\\n' release\n",
+        );
+        exe(&dev.join("aterm"), "#!/bin/sh\nprintf '%s\\n' selected\n");
+        std::fs::create_dir_all(bin).unwrap();
+        symlink(dev.join("aterm"), bin.join("aterm")).unwrap();
+        let package = account.home().join("package/bin");
+        let agents = account.home().join("package/agents");
+        let reroute = account.home().join("package/reroute");
+        for (name, body) in crate::hooks::hook_files(&package, &agents, &reroute) {
+            write(&account.home().join(".aterm/shell.d").join(name), body);
+        }
+        let inherited = format!(
+            "{}:/usr/bin::/bin:{}:{}",
+            release.display(),
+            bin.display(),
+            bin.display()
+        );
+        let env = ShellEnv {
+            shell: Some(shell.to_string_lossy().into_owned()),
+            path: Some(inherited.clone().into()),
+            manpath: None,
+        };
+        let rc = rc_target(&account.places, &env).unwrap();
+        let target = account.home().join("profiles/interactive");
+        let prefix = if is_fish {
+            "# user prefix\nset -gx UNCHANGED kept\n"
+        } else {
+            "# user prefix\nexport UNCHANGED=kept\n"
+        };
+        let suffix = "# user suffix\n";
+        write(
+            &target,
+            format!(
+                "{prefix}{PATH_BLOCK_START}\n# older append-only CLI block\n{PATH_BLOCK_END}\n{suffix}"
+            ),
+        );
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::create_dir_all(rc.parent().unwrap()).unwrap();
+        symlink(&target, &rc).unwrap();
+        let setup = Setup {
+            path: true,
+            ..Setup::default()
+        };
+        let (ok, out, err) = account.setup(&env, &dev.join("aterm"), &setup);
+        assert!(ok, "{out}{err}");
+        let updated = std::fs::read_to_string(&target).unwrap();
+        assert!(rc.is_symlink(), "the profile's link belongs to the user");
+        assert!(updated.starts_with(prefix) && updated.ends_with(suffix));
+        assert_eq!(target.metadata().unwrap().mode() & 0o777, 0o600);
+        assert!(account.setup(&env, &dev.join("aterm"), &setup).0);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), updated);
+
+        let mut command = aterm_uds::spawnfd::command(shell);
+        let args = if is_fish {
+            [
+                "--no-config",
+                "-c",
+                "aterm --version; source \"$PROFILE\"; source \"$PROFILE\"; aterm init --help; printf '%s\\n' (string join : $PATH) \"$UNCHANGED\"",
+            ]
+        } else {
+            [
+                "-f",
+                "-c",
+                "aterm --version; . \"$PROFILE\"; . \"$PROFILE\"; aterm init --help; printf '%s\\n' \"$PATH\" \"$UNCHANGED\"",
+            ]
+        };
+        // Nothing inherited (a live session's markers would re-order PATH), then the
+        // hermetic HOME and XDG dirs of every real shell a test runs: the scratch account's.
+        command.args(args).env_clear();
+        for (key, value) in aterm_spec::host::hermetic_env(account.home()) {
+            command.env(key, value);
+        }
+        command
+            .env("PATH", &inherited)
+            .env("PROFILE", &rc)
+            .env("ATERM_CHILD", "1");
+        let output = aterm_uds::deadline::output_until(
+            &mut command,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "release\nselected\n{}:{}:{}:{}:/usr/bin:{}:/bin:{}\nkept\n",
+                reroute.display(),
+                agents.display(),
+                bin.display(),
+                release.display(),
+                if is_fish { "." } else { "" },
+                package.display()
+            )
+        );
+        let incomplete = format!("{prefix}{PATH_BLOCK_START}\n# interrupted old setup\n");
+        write(&target, &incomplete);
+        let (ok, _, _) = account.setup(&env, &dev.join("aterm"), &setup);
+        assert!(!ok);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), incomplete);
+    }
+}
+
 /// THE PATH BLOCK ROUND TRIP: `shell-setup --path` appends one marker-fenced block (the
 /// hook, and the bin dir PATH lacks), once; the sweep removes exactly it and keeps the
 /// rest of the profile. With no hook and none coming nothing is written; an unknown shell
@@ -299,7 +425,7 @@ fn the_path_block_is_written_once_and_swept_exactly() {
     assert!(text.starts_with("export EDITOR=vi\n"), "{text}");
     assert_eq!(text.matches(PATH_BLOCK_START).count(), 1, "{text}");
     assert!(
-        text.contains(&format!("export PATH=\"$PATH:{bin}\"")),
+        text.contains(&format!("__aterm_cli_bin=\"{bin}\"")),
         "{text}"
     );
     let (ok, out, _) = a.setup(&env, exe, &coming);
@@ -888,8 +1014,10 @@ fn shell_setup_under_an_open_umask_shares_no_directory() {
 
 /// The Caffeine mug's leftovers are swept through the going bundle's own aterm — asked
 /// `help caffeine` first, then `caffeine startup off` and `caffeine quit` — and its files in
-/// the support dir go after a free lock is held (the rendezvous stays); a dry run runs no
-/// helper. Refused or unsupported helpers and busy/missing locks preserve the files.
+/// the support dir go after a free lock is held (the rendezvous stays, made when no mug ever
+/// made it); what `quit` itself removed or wrote is looked at afresh; a dry run runs no
+/// helper. Refused or unsupported helpers and a busy lock preserve the files, and a bundle
+/// whose step failed is kept for that step.
 #[test]
 fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     let a = Account::new("caffeine");
@@ -955,7 +1083,38 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     );
     assert!(!app.exists(), "the bundle went after its aterm was asked");
 
-    for kind in ["quit-fails", "unsupported", "busy", "missing"] {
+    // A real `quit` takes the ended mug's copy with it, and an older one may save Off where no
+    // state file was: both are seen after the steps, and no lock yet is made for the cleanup.
+    let a = Account::new("caffeine-quit-acts");
+    let home = a.home().to_path_buf();
+    let support = home.join("Library/Application Support/aterm");
+    let app = home.join("Applications/aterm.app");
+    bundle(&app, None);
+    exe(
+        &app.join("Contents/MacOS/aterm"),
+        &format!(
+            "#!/bin/sh\n[ \"$*\" = 'caffeine quit' ] || exit 0\nrm -rf '{code}'\n\
+             echo mode=off >'{state}'\n",
+            code = support.join("caffeine-code.noindex").display(),
+            state = support.join("caffeine.state").display()
+        ),
+    );
+    write(
+        &support.join("caffeine-code.noindex/l/aterm.app/Contents/Info.plist"),
+        "<plist/>",
+    );
+    write(&support.join("caffeine/l.plist"), "<plist/>");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    for name in ["caffeine-code.noindex", "caffeine", "caffeine.state"] {
+        assert!(!present(&support.join(name)), "{name}: {out}");
+    }
+    assert!(
+        support.join("caffeine.lock").is_file(),
+        "the rendezvous made for the cleanup stays: {out}"
+    );
+
+    for kind in ["quit-fails", "unsupported", "busy"] {
         let a = Account::new(kind);
         let support = a.home().join("Library/Application Support/aterm");
         let app = a.home().join("Applications/aterm.app");
@@ -972,9 +1131,7 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
         write(&support.join("caffeine.state"), "mode=off\n");
         write(&support.join("caffeine-code.noindex/keep"), "copy bytes");
         let lock = support.join("caffeine.lock");
-        if kind != "missing" {
-            write(&lock, "");
-        }
+        write(&lock, "");
         let held = (kind == "busy").then(|| {
             crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold")
         });
@@ -993,6 +1150,49 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
             std::fs::read_to_string(support.join("caffeine-code.noindex/keep")).expect("copy"),
             "copy bytes"
         );
+        assert_eq!(
+            app.exists(),
+            kind == "quit-fails",
+            "only a failed step keeps its bundle: {kind}: {out}"
+        );
         drop(held);
     }
+}
+
+/// A decline this run's sweep records, left because its aterm is kept for an unfinished
+/// Caffeine step, goes with that aterm on the run that removes it: it is tagged as the
+/// sweep's, never taken for the person's.
+#[test]
+fn a_decline_left_for_a_kept_bundle_goes_with_it() {
+    let a = Account::new("caffeine-decline");
+    let home = a.home().to_path_buf();
+    let support = home.join("Library/Application Support/aterm");
+    let app = home.join("Applications/aterm.app");
+    bundle(
+        &app,
+        Some(&sweeping_atpkg(&support, &a.dir.join("swept.log"))),
+    );
+    let aterm = app.join("Contents/MacOS/aterm");
+    exe(
+        &aterm,
+        "#!/bin/sh\n[ \"$*\" = 'caffeine quit' ] && exit 1\nexit 0\n",
+    );
+    write(&support.join("caffeine.state"), "mode=off\n");
+    write(&support.join("caffeine.lock"), "");
+    let decline = support.join("pkg/declined");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "{out}{err}");
+    assert!(app.exists(), "kept for its caffeine quit: {out}");
+    assert!(
+        decline.is_file(),
+        "the sweep's decline stays with its aterm"
+    );
+    exe(&aterm, "#!/bin/sh\nexit 0\n");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(!app.exists(), "{out}");
+    assert!(
+        !decline.exists(),
+        "the tagged decline went with the last aterm: {out}"
+    );
 }

@@ -174,14 +174,21 @@ impl Broker {
     /// `aterm link broker <sock> <log> <extra>…`, returned once it prints
     /// `listening`.
     fn serve(sock: &str, log: &str, extra: &[&str]) -> Self {
-        let mut child = aterm_uds::spawnfd::command(harness::aterm_to_launch())
-            .args(["link", "broker", sock, log])
+        Self::serve_env(sock, log, extra, &[])
+    }
+
+    /// [`Broker::serve`] with extra environment: a dev seam a test arms.
+    fn serve_env(sock: &str, log: &str, extra: &[&str], env: &[(&str, &str)]) -> Self {
+        let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
+        cmd.args(["link", "broker", sock, log])
             .args(extra)
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .expect("spawn the broker");
+            .stderr(aterm_uds::spawnfd::Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn the broker");
         let lines = line_reader(child.stdout.take().expect("stdout"));
         let first = lines
             .recv_timeout(DEADLINE)
@@ -294,25 +301,63 @@ fn the_secret_beside_the_socket_guards_it_and_the_report_measures_the_guard() {
 /// **THE TIER NAMED IS READ OFF THE BROKER'S PROCESS, THE TIER SERVED OFF ITS
 /// `Hello`.** A real `aterm link broker --durability relaxed`: the report's
 /// BROKER section and its JSON say `relaxed`, served `relaxed`, and doctor names
-/// it as a fact. `--durability ordered` is accepted and THIS build serves it
-/// strict: the JSON says `ordered`, served `strict`, and the `acks` row says
-/// "served strict" — read from the broker's own `Hello` (tag 0x01), never
-/// inferred from the argv. The same broker without the flag reads `strict`. No
-/// tier writes the legacy relaxed mark (`<log>.aterm-relaxed`): astream records
-/// how the run stood in its own sidecar. A tier the broker does not know is a
-/// usage error, exit 2, before any log is opened.
+/// it as a fact. `--durability ordered` is served ordered where astream can
+/// promise the order (macOS, the log on the boot volume, as `/tmp` is) and
+/// strict elsewhere: the JSON says `ordered`, served as the broker says, and
+/// only where it serves strict does the `acks` row say "served strict" — read
+/// from the broker's own `Hello` (tag 0x01), never inferred from the argv.
+/// The same guarded broker without the flag runs THE BUILD'S DEFAULT for a
+/// guarded broker — ordered, on every platform, served as astream serves it —
+/// and reads so.
+/// NEGATIVE CONTROL: a bare broker whose argv names no mint secret (guarded
+/// only by the `mint.secret` beside its socket) is judged unguarded by its
+/// argv, and runs and reads strict. No tier writes the legacy relaxed mark
+/// (`<log>.aterm-relaxed`): astream records how the run stood in its own
+/// sidecar. A tier the broker does not know is a usage error, exit 2, before
+/// any log is opened.
 #[test]
 fn the_report_reads_the_brokers_durability_off_its_process() {
+    // What astream serves `ordered` as for a log under `/tmp`: the barrier is
+    // Apple's, and `/tmp` is on the boot volume there. The build's default for
+    // a bare guarded argv is `ordered` everywhere, served the same.
+    const ORDERED_SERVED: &str = if cfg!(target_vendor = "apple") {
+        "ordered"
+    } else {
+        "strict"
+    };
     let s = Scratch::new("dur");
     let secret = s.path("mint.secret");
-    for (tier, served, extra) in [
-        ("relaxed", "relaxed", &["--durability", "relaxed"][..]),
-        ("ordered", "strict", &["--durability", "ordered"][..]),
-        ("strict", "strict", &[][..]),
+    for (name, tier, served, guarded, extra) in [
+        (
+            "relaxed",
+            "relaxed",
+            "relaxed",
+            true,
+            &["--durability", "relaxed"][..],
+        ),
+        (
+            "ordered",
+            "ordered",
+            ORDERED_SERVED,
+            true,
+            &["--durability", "ordered"][..],
+        ),
+        (
+            "strict",
+            "strict",
+            "strict",
+            true,
+            &["--durability", "strict"][..],
+        ),
+        ("bare", "ordered", ORDERED_SERVED, true, &[][..]),
+        ("unguarded", "strict", "strict", false, &[][..]),
     ] {
-        let sock = s.path(&format!("{tier}.sock"));
+        let sock = s.path(&format!("{name}.sock"));
         let log = format!("{sock}.log");
-        let mut args = vec!["--secret-file", secret.as_str()];
+        let mut args = Vec::new();
+        if guarded {
+            args.extend(["--secret-file", secret.as_str()]);
+        }
         args.extend_from_slice(extra);
         let _broker = Broker::serve(&sock, &log, &args);
         let cmd = s.command(&sock, true);
@@ -320,12 +365,12 @@ fn the_report_reads_the_brokers_durability_off_its_process() {
         assert_eq!(
             json(&out)["broker"]["durability"].as_str(),
             Some(tier),
-            "{out}\n{err}"
+            "{name}: {out}\n{err}"
         );
         assert_eq!(
             json(&out)["broker"]["served"].as_str(),
             Some(served),
-            "{tier}: the tier served, as the broker says it:\n{out}"
+            "{name}: the tier served, as the broker says it:\n{out}"
         );
         // The row's KEY and its TIER WORD, never the promise's prose.
         let row = |text: &str, key: &str| {
@@ -340,14 +385,14 @@ fn the_report_reads_the_brokers_durability_off_its_process() {
         assert_eq!(row(&text, "acks"), [tier], "{text}");
         assert_eq!(
             text.contains("served strict"),
-            tier == "ordered",
-            "{tier}: only ordered is served as another tier here:\n{text}"
+            tier == "ordered" && ORDERED_SERVED == "strict",
+            "{name}: only ordered off macOS is served as another tier here:\n{text}"
         );
         let (_, doctor, _) = fabric(&s, Some(&cmd), &["doctor"]);
         assert_eq!(row(&doctor, "durability:"), [tier], "{doctor}");
         assert!(
             !Path::new(&format!("{log}.aterm-relaxed")).exists(),
-            "{tier}: no legacy mark is written"
+            "{name}: no legacy mark is written"
         );
     }
     let log = s.path("never.log");
@@ -366,6 +411,224 @@ fn the_report_reads_the_brokers_durability_off_its_process() {
     assert!(!Path::new(&log).exists(), "a refused tier opens no log");
 }
 
+/// **THE REPORT AND ITS DOCTOR SAY WHAT THE BROKER SAYS OF ITS LOG**, end to
+/// end: a real `aterm link broker --durability relaxed`, guarded, whose
+/// `Hello` entry 0x04 the report's probe reads and whose astream
+/// `<log>.health` the report reads with astream's reader.
+///
+/// NEGATIVE CONTROL FIRST: healthy, the JSON's in-band entry names no poison
+/// and no failed flush, the snapshot is CURRENT (its writer serves, and is the
+/// broker's pid — its counts are as of its first write, before the listening
+/// line and so before the publish: astream rewrites it every 30 s, which this
+/// test does not wait out, so it asserts no count), no warning is the log's,
+/// and doctor prints `health: ok, not poisoned`. Then the broker's fault seam
+/// (a dev build's `sync`, with `escalate=` naming one subject and `stay`
+/// keeping it serving: the negative control of its own cure) poisons the log
+/// at an escalated record: the JSON and the text say POISONED with astream's
+/// reason, one failed flush and the served tier latched to strict; WARNINGS
+/// says so and the report exits 1; doctor prints the fact and the warning
+/// with the broker's-reopen fix. Restarted as its supervisor would, without
+/// `stay` (and `sync` spent), the next broker's word replaces it: not
+/// poisoned, its counts since its own open, its snapshot current under ITS
+/// pid.
+#[test]
+fn the_report_and_its_doctor_say_what_the_broker_says_of_its_log() {
+    let s = Scratch::new("health");
+    let sock = s.sock();
+    let log = s.path("b.log");
+    let secret = s.path("mint.secret");
+    let args = ["--secret-file", secret.as_str(), "--durability", "relaxed"];
+    let seam = aterm_link::broker_health::FAULT_SEAM;
+    let broker = Broker::serve_env(
+        &sock,
+        &log,
+        &args,
+        &[(seam, "sync escalate=/f/t1/x/> stay")],
+    );
+    let cmd = s.command(&sock, true);
+    let ours = |v: &aterm_json::Value| -> Vec<String> {
+        arr(v, "warnings")
+            .iter()
+            .filter_map(|w| w.as_str().map(str::to_string))
+            .filter(|w| w.contains("POISONED") || w.contains("flush of its log failed"))
+            .collect()
+    };
+    publish(
+        &sock,
+        &[("/f/t1/o/a".to_string(), "an ordinary record".to_string())],
+    );
+
+    // HEALTHY: the negative control.
+    let (_, out, err) = fabric(&s, Some(&cmd), &["--json"]);
+    let v = json(&out);
+    let health = &v["broker"]["health"];
+    assert!(health["in_band"]["poisoned"].is_null(), "{out}\n{err}");
+    assert_eq!(
+        health["in_band"]["flushes"]["failed"].as_u64(),
+        Some(0),
+        "{out}"
+    );
+    assert_eq!(health["log"].as_str(), Some(log.as_str()), "{out}");
+    assert_eq!(
+        health["snapshot"]["writer"].as_str(),
+        Some("serving"),
+        "{out}"
+    );
+    assert_eq!(health["snapshot"]["current"].as_bool(), Some(true), "{out}");
+    assert_eq!(
+        health["snapshot"]["pid"].as_u64(),
+        Some(u64::from(broker.pid())),
+        "{out}"
+    );
+    assert!(ours(&v).is_empty(), "{out}");
+    let (_, doctor, _) = fabric(&s, Some(&cmd), &["doctor"]);
+    assert!(
+        doctor.contains("\n  health: ok, not poisoned — flushes since it opened: "),
+        "{doctor}"
+    );
+    assert!(doctor.contains("\n  holds: "), "{doctor}");
+    assert!(!doctor.contains("POISONED"), "{doctor}");
+
+    // POISONED: astream's own verdict at an escalated record's failed flush.
+    let mut c = root_client(&sock);
+    c.publish(
+        0xfab,
+        SEQ.fetch_add(1, Ordering::Relaxed),
+        "/f/t1/x/a",
+        b"escalated",
+    )
+    .expect_err("its full flush failed");
+    let (code, out) = harness::until("the report to say the log is poisoned", || {
+        let (code, out, _) = fabric(&s, Some(&cmd), &["--json"]);
+        let v = json(&out);
+        let snapshot_says = v["broker"]["health"]["snapshot"]["poisoned"]
+            .as_str()
+            .is_some();
+        (v["broker"]["health"]["in_band"]["poisoned"]
+            .as_str()
+            .is_some()
+            && snapshot_says)
+            .then_some((code, out))
+    });
+    let v = json(&out);
+    let health = &v["broker"]["health"];
+    let why = health["in_band"]["poisoned"].as_str().unwrap_or_default();
+    assert!(why.contains("a flush failed"), "{out}");
+    assert_eq!(
+        health["in_band"]["flushes"]["failed"].as_u64(),
+        Some(1),
+        "{out}"
+    );
+    assert_eq!(
+        v["broker"]["served"].as_str(),
+        Some("strict"),
+        "latched: {out}"
+    );
+    assert_eq!(health["snapshot"]["current"].as_bool(), Some(true), "{out}");
+    let warned = ours(&v);
+    assert_eq!(warned.len(), 1, "the poison's warning alone: {out}");
+    assert!(
+        warned[0].contains("says its log is POISONED (a flush failed"),
+        "{out}"
+    );
+    assert_eq!(code, 1, "a warning: {out}");
+    let (_, text, _) = fabric(&s, Some(&cmd), &[]);
+    assert!(
+        text.lines()
+            .any(|l| l.trim_start().starts_with("health ") && l.contains("POISONED (a flush")),
+        "{text}"
+    );
+    let (_, doctor, _) = fabric(&s, Some(&cmd), &["doctor"]);
+    assert!(
+        doctor.contains("\n  health: POISONED (a flush failed"),
+        "{doctor}"
+    );
+    let fix = doctor
+        .lines()
+        .skip_while(|l| !l.contains("says its log is POISONED"))
+        .nth(1)
+        .unwrap_or_default();
+    assert!(
+        fix.trim_start()
+            .starts_with("fix: the broker's log is poisoned and refuses every write"),
+        "{doctor}"
+    );
+
+    // RESTARTED, AS ITS SUPERVISOR WOULD: the next broker's own word.
+    drop(c);
+    drop(broker);
+    let broker = Broker::serve_env(&sock, &log, &args, &[(seam, "sync escalate=/f/t1/x/>")]);
+    let (_, out, _) = fabric(&s, Some(&cmd), &["--json"]);
+    let v = json(&out);
+    let health = &v["broker"]["health"];
+    assert!(health["in_band"]["poisoned"].is_null(), "{out}");
+    assert_eq!(
+        health["in_band"]["flushes"]["failed"].as_u64(),
+        Some(0),
+        "{out}"
+    );
+    assert_eq!(health["snapshot"]["current"].as_bool(), Some(true), "{out}");
+    assert!(health["snapshot"]["poisoned"].is_null(), "{out}");
+    assert_eq!(
+        health["snapshot"]["pid"].as_u64(),
+        Some(u64::from(broker.pid())),
+        "{out}"
+    );
+    assert!(ours(&v).is_empty(), "{out}");
+}
+
+/// **THE BUILD'S DEFAULT OFF THE BOOT VOLUME IS SERVED STRICT, AND SAYS WHY.**
+/// A bare guarded broker runs the build's default — ordered — and astream
+/// serves ordered only for a log on the boot volume: a removable disk or a
+/// separate partition can lose power apart from the kernel, and its barrier
+/// honouring is unknown. With the log off it (the
+/// `ATERM_LINK_BROKER_VOLUME=other` dev seam: no test can unplug a disk) the
+/// report names the tier `ordered` and says it is "served strict", with
+/// astream's reason, and strict's promise — read from the broker's `Hello`,
+/// never from the argv. Off macOS astream serves it strict for any log, and
+/// the report gives that reason instead. The bare guarded row of
+/// `the_report_reads_the_brokers_durability_off_its_process`, the same broker
+/// on the boot volume, is this test's control: served ordered on macOS.
+#[test]
+fn the_default_off_the_boot_volume_is_served_strict_and_says_why() {
+    let s = Scratch::new("vol");
+    let secret = s.path("mint.secret");
+    let sock = s.path("vol.sock");
+    let _broker = Broker::serve_env(
+        &sock,
+        &format!("{sock}.log"),
+        &["--secret-file", &secret],
+        &[(aterm_link::durability::VOLUME_SEAM, "other")],
+    );
+    let cmd = s.command(&sock, true);
+    let (_, out, err) = fabric(&s, Some(&cmd), &["--json"]);
+    assert_eq!(
+        json(&out)["broker"]["durability"].as_str(),
+        Some("ordered"),
+        "{out}\n{err}"
+    );
+    assert_eq!(
+        json(&out)["broker"]["served"].as_str(),
+        Some("strict"),
+        "{out}"
+    );
+    let (_, text, _) = fabric(&s, Some(&cmd), &[]);
+    let acks = text
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("acks"))
+        .unwrap_or_else(|| panic!("no acks row:\n{text}"));
+    let why = if cfg!(target_vendor = "apple") {
+        "served strict (its log is not on the boot volume)"
+    } else {
+        "served strict (the ordering barrier exists only on Apple)"
+    };
+    assert!(acks.contains(why), "{acks}");
+    assert!(
+        acks.contains("an ack is on the disk: a power loss loses nothing acked"),
+        "strict's words, as served: {acks}"
+    );
+}
+
 /// **A RELAXED BROKER'S CLEAN STOP CLOSES ITS LOG, AND A REBOOT AFTER IT KEEPS
 /// THE IDENTITY.** A real `aterm link broker --durability relaxed`, one post
 /// acked, then SIGTERM — what launchd sends at logout and shutdown and `aterm
@@ -382,12 +645,19 @@ fn the_report_reads_the_brokers_durability_off_its_process() {
 /// the lineage step `(g + 1, 1)` — the one acked record is below the fork, so a
 /// reader resumes there instead of forgetting.
 ///
+/// AN ORDERED BROKER DOES THE SAME, where astream serves it ordered (macOS,
+/// the log on the boot volume): SIGTERM is a clean close that a reboot keeps
+/// the identity across; SIGKILL then a reboot moves the generation by one
+/// with lineage. Where astream serves it strict (off Apple) the SIGKILL arm's
+/// reboot moves nothing — a strict run's acks were on the disk — and the
+/// test says which it checked.
+///
 /// A strict broker keeps SIGTERM's default action, and dies of it as it always
 /// did. SIGINT (^C) and SIGHUP take the same path as SIGTERM, but are not sent
 /// here: one this test inherited as ignored (a background job's SIGINT,
 /// `nohup`'s SIGHUP) stays ignored in the broker, by design.
 #[test]
-fn a_relaxed_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity() {
+fn a_weak_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity() {
     use astream_broker::{Boot, BrokerLog, Durability, OpenOptions, Prepared};
     use std::os::unix::process::ExitStatusExt as _;
     let s = Scratch::new("stop");
@@ -404,16 +674,27 @@ fn a_relaxed_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity()
     };
     // No real kernel answers this id: the open it is passed to is in another boot.
     let another_boot = Boot::Known([0x5a; 16]);
-    for (what, sig) in [("SIGTERM", 15), ("SIGKILL", 9)] {
-        let sock = s.path(&format!("{}.sock", what.to_lowercase()));
+    for ((what, sig), tier) in [("SIGTERM", 15), ("SIGKILL", 9)]
+        .into_iter()
+        .flat_map(|stop| ["relaxed", "ordered"].map(|tier| (stop, tier)))
+    {
+        let sock = s.path(&format!("{}-{tier}.sock", what.to_lowercase()));
         let log = format!("{sock}.log");
         let mut broker = Broker::serve(
             &sock,
             &log,
-            &["--secret-file", &secret, "--durability", "relaxed"],
+            &["--secret-file", &secret, "--durability", tier],
         );
         let mut client = root_client(&sock);
         let before = client.seen_log_identity().expect("the Hello names the log");
+        // What the run SERVES decides what a reboot after its unclean stop costs.
+        let weak = client
+            .served_durability()
+            .is_some_and(|s| s.served != astream_broker::Tier::Strict);
+        let what = &format!(
+            "{what} ({tier}, served {})",
+            if weak { tier } else { "strict" }
+        );
         client
             .publish(1, 1, "/f/t1/pub/n-00000000000000aa/s-x/history", b"v=1")
             .expect("acked");
@@ -425,7 +706,7 @@ fn a_relaxed_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity()
         harness::kill(broker.pid() as i32, sig);
         let status = wait(&mut broker, what);
         if sig == 9 {
-            assert_eq!(status.signal(), Some(9), "{status:?}");
+            assert_eq!(status.signal(), Some(9), "{what}: {status:?}");
             // The same-boot reopen runs on a COPY of the log and its sidecar, so this
             // process opens each file once. A first full run of this file failed on the
             // second open of the original with `… is locked by another open BrokerLog`;
@@ -440,19 +721,26 @@ fn a_relaxed_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity()
             assert_eq!(
                 reopen(&copy, Boot::Detect).identity(),
                 before,
-                "a kill in the same boot moves nothing"
+                "{what}: a kill in the same boot moves nothing"
             );
             let rebooted = reopen(&log, another_boot);
             let after = rebooted.identity();
+            if !weak {
+                assert_eq!(
+                    after, before,
+                    "{what}: a strict run's acks were on the disk"
+                );
+                continue;
+            }
             assert_eq!(
                 (after.id, after.generation),
                 (before.id, before.generation + 1),
-                "SIGKILL, then a reboot: the generation moves by one"
+                "{what}: SIGKILL, then a reboot: the generation moves by one"
             );
             assert_eq!(
                 rebooted.lineage().steps().last(),
                 Some(&(after.generation, 1)),
-                "with the lineage step that continues the log below the acked record"
+                "{what}: with the lineage step that continues the log below the acked record"
             );
         } else {
             assert!(status.success(), "{what}: a clean stop exits 0: {status:?}");
@@ -465,7 +753,11 @@ fn a_relaxed_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity()
         }
     }
     let sock = s.path("strict.sock");
-    let mut broker = Broker::serve(&sock, &format!("{sock}.log"), &["--secret-file", &secret]);
+    let mut broker = Broker::serve(
+        &sock,
+        &format!("{sock}.log"),
+        &["--secret-file", &secret, "--durability", "strict"],
+    );
     harness::kill(broker.pid() as i32, 15);
     let status = wait(&mut broker, "SIGTERM");
     assert_eq!(status.signal(), Some(15), "strict: as before: {status:?}");
@@ -1061,6 +1353,42 @@ fn usage_errors_exit_2_and_help_exits_0() {
     assert_eq!(code, 0, "{out}");
     let (code, _, err) = fabric(&s, None, &["tail", "--json"]);
     assert_eq!(code, 2, "{err}");
+}
+
+/// A FILTER THE BROKER WOULD REFUSE NEVER REACHES IT. `tail --filter` passes
+/// the bus's own grammar at the parse (astream's `validate_filter_str`, the
+/// check the broker parses a subscription with), so with a broker up and the
+/// config pointing at it, a `>` that is not the last segment is a usage error
+/// naming the filter (exit 2), never the broker's refusal after a dial (exit
+/// 1, `aterm fabric tail: …`, which is what it was before the parse asked
+/// astream). The control: the same config with `>` last is followed, so the
+/// refusal is the filter's and not an unreachable broker's.
+#[test]
+fn a_filter_the_broker_would_refuse_is_a_usage_error_before_the_dial() {
+    let s = Scratch::new("filter");
+    let _broker = Broker::spawn(&s);
+    let (code, _, err) = fabric(
+        &s,
+        Some(&s.command(&s.sock(), false)),
+        &["tail", "--filter", "/f/t1/>/x"],
+    );
+    assert_eq!(code, 2, "a usage error, not a broker refusal: {err}");
+    assert!(
+        err.contains("--filter /f/t1/>/x is not a subject filter"),
+        "{err}"
+    );
+    // What a dialled tail says: its heading, or the broker's refusal. (The
+    // usage text names `aterm fabric tail [--bodies] …`, so match the forms.)
+    for dialled in ["aterm fabric tail —", "aterm fabric tail:"] {
+        assert!(!err.contains(dialled), "it dialled: {err}");
+    }
+
+    let whole = Tail::spawn(&s, &["tail", "--filter", "/f/t1/>"]);
+    let header = whole
+        .lines
+        .recv_timeout(DEADLINE)
+        .expect("a filter with `>` last is followed");
+    assert!(header.starts_with("OFFSET"), "{header}");
 }
 
 /// `aterm link broker <args>`, run to its exit: code, stdout, stderr.

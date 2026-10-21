@@ -243,7 +243,15 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
         }
     });
 
-    let w = World::boot_at("r13-stub", &[], &[], Some(&stub));
+    // The verdict is the deadline PASSING, so its length decides nothing here:
+    // a quarter second (`aterm-link`'s `ACK_DEADLINE_SEAM`), not the production
+    // five the wait below used to sit out.
+    let w = World::boot_at(
+        "r13-stub",
+        &[],
+        &[("ATERM_LINK_ACK_DEADLINE_MS", "250")],
+        Some(&stub),
+    );
     until("the bridge to attach", || {
         (kv(&fabric_status(&w), "state") == Some("stalled")).then_some(())
     });

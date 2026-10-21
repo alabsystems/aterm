@@ -178,6 +178,10 @@ fn serve(args: &Args, version: &str) -> ExitCode {
     // checkable; `run_from_own_copy` returns only when it could not.
     let code = crate::code::code_dir();
     let own_copy = code.as_deref().and_then(crate::code::own_copy);
+    // First thing from a copy: its exec is over, so a sweep may remove it once this keeper ends.
+    if let Some(copy) = &own_copy {
+        crate::code::mark_ran(copy);
+    }
     let exe = crate::code::origin_exe(own_copy.is_some());
     if let Some(dir) = code.as_deref() {
         crate::code::sweep(dir, crate::server::born);

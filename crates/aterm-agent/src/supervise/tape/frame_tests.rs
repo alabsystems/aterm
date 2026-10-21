@@ -17,7 +17,8 @@ use aterm_spec::rng::XorShift;
 use super::codec::{End, Item, Mark, Stamp, ctl_request};
 use super::doors;
 use super::frame::{
-    FRAME_RAW, FrameSink, HEAD, Hint, Kind, MAGIC, Stopped, TapeWriter, frame_bytes,
+    FRAME_RAW, Format, FrameSink, HEAD, Hint, Kind, MAGIC, PLACES, Stopped, TapeWriter, checksum,
+    frame_bytes, place_named, place_word,
 };
 use super::recover::{Recovered, Tail, Why, recover, salvage};
 
@@ -182,6 +183,44 @@ fn prefix(per_frame: &[Vec<Item>], whole: usize) -> Vec<Item> {
     per_frame[..whole].iter().flatten().cloned().collect()
 }
 
+/// A tape's magic, then its whole frames in `order` (the header is frame 0):
+/// frames repeated, dropped or moved at rest.
+pub(super) fn arranged(bytes: &[u8], order: &[usize]) -> Vec<u8> {
+    let frames = frames_of(bytes);
+    let mut out = bytes[..MAGIC.len()].to_vec();
+    for &i in order {
+        out.extend_from_slice(&bytes[frames[i].0..frames[i].1]);
+    }
+    out
+}
+
+/// A tape this build wrote, as the format-1 writer wrote the same frames: the
+/// magic's number 1, each frame's sum its xxh64 alone, naming no place.
+/// [`a_format_1_tape_reads_as_it_always_did`] holds it to bytes that writer
+/// wrote.
+pub(super) fn as_format_1(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out[..MAGIC.len()].copy_from_slice(&Format::One.magic());
+    for (start, end, kind, _) in frames_of(bytes) {
+        let kind = Kind::of(kind).expect("a frame's kind");
+        let sum = checksum(
+            kind,
+            &bytes[start + 1..start + 9],
+            &bytes[start + HEAD..end],
+        );
+        out[start + 9..start + HEAD].copy_from_slice(&sum.to_le_bytes());
+    }
+    out
+}
+
+/// A tape and the same frames as format 1 wrote them, each named.
+fn both_formats(bytes: &[u8]) -> [(&'static str, Vec<u8>); 2] {
+    [
+        ("format 2", bytes.to_vec()),
+        ("format 1", as_format_1(bytes)),
+    ]
+}
+
 /// A run's items, acts and waits between them, then its end, read back
 /// exactly: the header, every item, the end, a clean tail — with a frame that
 /// compressed and one that did not among them.
@@ -307,77 +346,362 @@ fn a_frame_closes_at_64_kib_of_raw_items() {
 }
 
 /// Every byte-offset cut of a tape reads back the whole frames before the
-/// cut — said clean only at a frame's end, torn anywhere else.
+/// cut — said clean only at a frame's end, torn anywhere else — in either
+/// frame format.
 #[test]
 fn every_cut_reads_back_a_prefix_of_whole_frames() {
     let mut rng = XorShift::new(11);
-    let (bytes, per_frame) = tape(4, &mut rng);
-    let ends: Vec<usize> = frames_of(&bytes).iter().map(|f| f.1).collect();
+    let (written, per_frame) = tape(4, &mut rng);
+    let ends: Vec<usize> = frames_of(&written).iter().map(|f| f.1).collect();
     assert_eq!(ends.len(), 5);
-    for cut in 0..=bytes.len() {
-        let read = recover(&bytes[..cut]);
-        let whole = ends.iter().filter(|e| **e <= cut).count();
-        assert_eq!(read.frames, whole, "cut {cut}");
-        let records = whole.saturating_sub(1);
-        assert_eq!(read.items, prefix(&per_frame, records), "cut {cut}");
-        let expected = if cut == 0 || ends.contains(&cut) {
-            Tail::Clean
-        } else if cut < MAGIC.len() {
-            Tail::Torn { at: 0 }
-        } else {
-            Tail::Torn {
-                at: ends[..whole].last().copied().unwrap_or(MAGIC.len()),
-            }
-        };
-        assert_eq!(read.tail, expected, "cut {cut}");
-        assert_eq!(
-            read.header.as_deref(),
-            (whole > 0).then_some(HEADER),
-            "cut {cut}"
-        );
+    for (format, bytes) in both_formats(&written) {
+        for cut in 0..=bytes.len() {
+            let read = recover(&bytes[..cut]);
+            let whole = ends.iter().filter(|e| **e <= cut).count();
+            assert_eq!(read.frames, whole, "{format}, cut {cut}");
+            let records = whole.saturating_sub(1);
+            assert_eq!(
+                read.items,
+                prefix(&per_frame, records),
+                "{format}, cut {cut}"
+            );
+            let expected = if cut == 0 || ends.contains(&cut) {
+                Tail::Clean
+            } else if cut < MAGIC.len() {
+                Tail::Torn { at: 0 }
+            } else {
+                Tail::Torn {
+                    at: ends[..whole].last().copied().unwrap_or(MAGIC.len()),
+                }
+            };
+            assert_eq!(read.tail, expected, "{format}, cut {cut}");
+            assert_eq!(
+                read.header.as_deref(),
+                (whole > 0).then_some(HEADER),
+                "{format}, cut {cut}"
+            );
+        }
     }
 }
 
 /// Every single-byte flip: one with a whole frame after it refuses the tape
 /// at the damaged frame (salvage keeps the frames before it); one in the last
-/// frame is the torn tail, and the frames before it come back.
+/// frame is the torn tail, and the frames before it come back — in either
+/// frame format.
 #[test]
 fn a_flip_before_a_whole_frame_is_refused_and_one_in_the_last_is_torn() {
     let mut rng = XorShift::new(5);
-    let (bytes, per_frame) = tape(3, &mut rng);
-    let frames = frames_of(&bytes);
+    let (written, per_frame) = tape(3, &mut rng);
+    let frames = frames_of(&written);
     let last = frames.last().expect("frames").0;
-    for at in 0..bytes.len() {
-        for mask in [0x01u8, 0x80, 0xff] {
-            let mut damaged = bytes.clone();
-            damaged[at] ^= mask;
-            let read = recover(&damaged);
-            if at >= last {
-                assert_eq!(read.tail, Tail::Torn { at: last }, "byte {at} ^ {mask:#x}");
-                assert_eq!(read.items, prefix(&per_frame, per_frame.len() - 1));
-                continue;
-            }
-            let start = frames
-                .iter()
-                .map(|f| f.0)
-                .filter(|s| *s <= at)
-                .max()
-                .unwrap_or(0);
-            match &read.tail {
-                Tail::Fault { at: fault, why } => {
-                    assert_eq!(*fault, start, "byte {at} ^ {mask:#x}: {why}");
+    for (format, bytes) in both_formats(&written) {
+        for at in 0..bytes.len() {
+            for mask in [0x01u8, 0x80, 0xff] {
+                let mut damaged = bytes.clone();
+                damaged[at] ^= mask;
+                let read = recover(&damaged);
+                let what = format!("{format}, byte {at} ^ {mask:#x}");
+                if at >= last {
+                    assert_eq!(read.tail, Tail::Torn { at: last }, "{what}");
+                    assert_eq!(
+                        read.items,
+                        prefix(&per_frame, per_frame.len() - 1),
+                        "{what}"
+                    );
+                    continue;
                 }
-                other => panic!("byte {at} ^ {mask:#x}: {other:?}"),
+                let start = frames
+                    .iter()
+                    .map(|f| f.0)
+                    .filter(|s| *s <= at)
+                    .max()
+                    .unwrap_or(0);
+                match &read.tail {
+                    Tail::Fault { at: fault, why } => {
+                        assert_eq!(*fault, start, "{what}: {why}");
+                    }
+                    other => panic!("{what}: {other:?}"),
+                }
+                assert_eq!(read.header, None, "a refused tape serves nothing");
+                assert!(read.items.is_empty() && read.frames == 0);
+                let kept = salvage(&damaged);
+                assert_eq!(kept.tail, read.tail);
+                let whole = frames.iter().filter(|f| f.1 <= start).count();
+                assert_eq!(kept.frames, whole, "{what}");
+                assert_eq!(kept.items, prefix(&per_frame, whole.saturating_sub(1)));
             }
-            assert_eq!(read.header, None, "a refused tape serves nothing");
-            assert!(read.items.is_empty() && read.frames == 0);
-            let kept = salvage(&damaged);
-            assert_eq!(kept.tail, read.tail);
-            let whole = frames.iter().filter(|f| f.1 <= start).count();
-            assert_eq!(kept.frames, whole, "byte {at}");
-            assert_eq!(kept.items, prefix(&per_frame, whole.saturating_sub(1)));
         }
     }
+}
+
+/// T3's review probe, asserted: of a tape of a header and four records
+/// frames, whole frames repeated, dropped or moved are refused where the
+/// first stands out of place, named by the place it was written at — the last
+/// frame repeated too: no crash writes a whole frame twice — and salvage keeps
+/// the frames before it, which are what was written. A tape that lost its
+/// last frame is a prefix of whole frames in place: clean, as a writer that
+/// died between the two leaves it, and only the run's missing end says so.
+#[test]
+fn whole_frames_out_of_place_are_refused_where_the_first_stands() {
+    let mut rng = XorShift::new(41);
+    let (bytes, per_frame) = tape(4, &mut rng);
+    for (what, order, place, found) in [
+        ("repeated", [0, 1, 2, 2, 3, 4].as_slice(), 3, 2),
+        ("dropped", &[0, 1, 3, 4], 2, 3),
+        ("moved", &[0, 1, 3, 2, 4], 2, 3),
+        ("the last repeated", &[0, 1, 2, 3, 4, 4], 5, 4),
+        ("the first dropped", &[0, 2, 3, 4], 1, 2),
+        ("the header moved", &[1, 0, 2, 3, 4], 0, 1),
+    ] {
+        let moved = arranged(&bytes, order);
+        let at = MAGIC.len()
+            + frames_of(&moved)[..place]
+                .iter()
+                .map(|f| f.1 - f.0)
+                .sum::<usize>();
+        let why = Why::OutOfPlace {
+            expected: place as u64,
+            found,
+        };
+        let read = recover(&moved);
+        assert_eq!(
+            read.tail,
+            Tail::Fault {
+                at,
+                why: why.clone()
+            },
+            "{what}: {order:?}"
+        );
+        assert_eq!(
+            (read.header, read.items.len(), read.frames),
+            (None, 0, 0),
+            "{what}: a refused tape serves nothing"
+        );
+        let kept = salvage(&moved);
+        assert_eq!(kept.tail, read.tail, "{what}");
+        assert_eq!(kept.frames, place, "{what}");
+        assert_eq!(
+            kept.items,
+            prefix(&per_frame, place.saturating_sub(1)),
+            "{what}: salvage keeps what was written"
+        );
+    }
+    let lost_last = recover(&arranged(&bytes, &[0, 1, 2, 3]));
+    assert_eq!(lost_last.tail, Tail::Clean);
+    assert_eq!(lost_last.items, prefix(&per_frame, 3));
+    // What says a run's last frames are missing is its end: the frame that
+    // held it lost, the items stop without one, as a killed run's do.
+    let (ended, items) = golden_run();
+    let unended = recover(&arranged(&ended, &[0, 1]));
+    assert_eq!(unended.tail, Tail::Clean);
+    assert_eq!(unended.items, items[..2]);
+    assert!(matches!(items.last(), Some(Item::End(_))));
+    assert_eq!(
+        Why::OutOfPlace {
+            expected: 2,
+            found: 3
+        }
+        .to_string(),
+        "frame 3 where frame 2 belongs: whole frames repeated, dropped or moved"
+    );
+}
+
+/// The negative control: the same frames sealed as format 1 — the frame's
+/// kind its sum's only seed — read the probe's arrangements back clean, with
+/// items that are not what was written, and not even the moved frames' own:
+/// each reply stored against the one before it under its key is decoded
+/// against the wrong one.
+#[test]
+fn format_1_reads_whole_frames_out_of_place_clean() {
+    let mut rng = XorShift::new(41);
+    let (bytes, per_frame) = tape(4, &mut rng);
+    let one = as_format_1(&bytes);
+    let written = prefix(&per_frame, 4);
+    for (what, order) in [
+        ("repeated", [0, 1, 2, 2, 3, 4].as_slice()),
+        ("dropped", &[0, 1, 3, 4]),
+        ("moved", &[0, 1, 3, 2, 4]),
+    ] {
+        let read = recover(&arranged(&one, order));
+        assert_eq!(read.tail, Tail::Clean, "{what}: format 1 cannot tell");
+        assert_eq!(read.frames, order.len(), "{what}");
+        assert_ne!(read.items, written, "{what}");
+        let theirs: Vec<Item> = order[1..]
+            .iter()
+            .flat_map(|i| per_frame[i - 1].clone())
+            .collect();
+        assert_ne!(
+            read.items, theirs,
+            "{what}: replies decoded on the wrong base"
+        );
+        // Format 2's sums tell, on the very same frames.
+        assert!(matches!(
+            recover(&arranged(&bytes, order)).tail,
+            Tail::Fault {
+                why: Why::OutOfPlace { .. },
+                ..
+            }
+        ));
+    }
+}
+
+/// The run [`GOLDEN_FORMAT_1`] holds: two records frames — the first LZ4,
+/// its reply long enough to be stored whole, the second's reply stored
+/// against it — the second ending with the run's end.
+fn golden_run() -> (Vec<u8>, Vec<Item>) {
+    let ask = |last: &str| {
+        let mut reply = "row of the worker's screen\n".repeat(20);
+        reply.push_str(last);
+        Item::effect(EffectRecord::Exchange {
+            door: doors::CTL.to_string(),
+            request: ctl_request(&["text"]),
+            reply: reply.into_bytes(),
+        })
+    };
+    let end = Item::End(End::Returned {
+        how: "EXIT stopped".to_string(),
+    });
+    let items = vec![mono(5), ask("0"), mono(9), ask("1"), end];
+    let (mut w, sink, _) = writer();
+    for (i, item) in items.iter().enumerate() {
+        w.append(item);
+        if i == 1 {
+            w.flush_hint(Hint::Act);
+        }
+    }
+    (sink.bytes(), items)
+}
+
+/// [`golden_run`]'s tape as the format-1 writer wrote it (the tree before
+/// format 2, 2d55535295: a test there printed these bytes).
+const GOLDEN_FORMAT_1: &str = concat!(
+    "415441504500010a002600000000000000b9e64bf2be72f2aa61746170652031",
+    "0a746170653d742d310a6275696c643d67300a656e7472793d77617463680a01",
+    "2f0200003a000000972739857c9e054dff1e050a06000363746c060104746578",
+    "74009d04726f77206f662074686520776f726b657227732073637265656e0a1b",
+    "00ffea607265656e0a30012000000000000000298cbeb4d6e96d5a0508060106",
+    "010474657874029c040001310b000c455849542073746f70706564",
+);
+
+/// A format-1 tape, as the format-1 writer wrote it, reads as it always did:
+/// its header, its items and a clean end. And this build's tape of the same
+/// run, sealed as format 1 ([`as_format_1`]), is those very bytes, so the
+/// tests that read both formats read what the format-1 writer wrote; its own
+/// bytes differ only in the magic's number and each frame's sum.
+#[test]
+fn a_format_1_tape_reads_as_it_always_did() {
+    let golden = aterm_codec::hex::decode_vec(GOLDEN_FORMAT_1.as_bytes()).expect("hex");
+    let (bytes, items) = golden_run();
+    assert_eq!(as_format_1(&bytes), golden);
+    for (format, tape) in [("format 1", &golden), ("format 2", &bytes)] {
+        let read = recover(tape);
+        assert_eq!(read.header.as_deref(), Some(HEADER), "{format}");
+        assert_eq!(read.items, items, "{format}");
+        assert_eq!((read.frames, read.tail), (3, Tail::Clean), "{format}");
+    }
+    let differ: Vec<usize> = (0..bytes.len())
+        .filter(|&i| bytes[i] != golden[i])
+        .collect();
+    let sums: Vec<usize> = frames_of(&bytes).iter().map(|f| f.0 + 9).collect();
+    assert!(differ.contains(&6), "the magic's number");
+    assert!(
+        differ
+            .iter()
+            .all(|&i| i == 6 || sums.iter().any(|&s| (s..s + 8).contains(&i))),
+        "only the magic's number and the sums: {differ:?}"
+    );
+}
+
+/// [`golden_run`]'s tape as the format-2 writer wrote it (the tree that
+/// introduced format 2, 0b8dc3dbfa: a test there printed these bytes).
+const GOLDEN_FORMAT_2: &str = concat!(
+    "415441504500020a002600000000000000e79143a3fda7acc061746170652031",
+    "0a746170653d742d310a6275696c643d67300a656e7472793d77617463680a01",
+    "2f0200003a000000a1d3d42cd9475f54ff1e050a06000363746c060104746578",
+    "74009d04726f77206f662074686520776f726b657227732073637265656e0a1b",
+    "00ffea607265656e0a30012000000000000000c1b686c74dad71900508060106",
+    "010474657874029c040001310b000c455849542073746f70706564",
+);
+
+/// A format-2 tape, as the format-2 writer wrote it, reads as it always did:
+/// its header, its items and a clean end, every frame in its place. The
+/// places its sums name are format 2's own, whatever format a later build
+/// writes: read first, so a build that changes how format 2 names a place
+/// fails here, not by reading every format-2 tape as a first write that tore.
+/// And this build still writes those very bytes.
+#[test]
+fn a_format_2_tape_reads_as_it_always_did() {
+    let golden = aterm_codec::hex::decode_vec(GOLDEN_FORMAT_2.as_bytes()).expect("hex");
+    let (bytes, items) = golden_run();
+    let read = recover(&golden);
+    assert_eq!(read.header.as_deref(), Some(HEADER));
+    assert_eq!(read.items, items);
+    assert_eq!((read.frames, read.tail), (3, Tail::Clean));
+    assert_eq!(Format::of_magic(&golden), Some(Format::Two));
+    for (place, (start, end, kind, _)) in frames_of(&golden).into_iter().enumerate() {
+        let kind = Kind::of(kind).expect("a frame's kind");
+        let hashed = checksum(
+            kind,
+            &golden[start + 1..start + 9],
+            &golden[start + HEAD..end],
+        );
+        let sum = u64::from_le_bytes(golden[start + 9..start + HEAD].try_into().expect("eight"));
+        assert_eq!(
+            place_named(sum, hashed),
+            Some(place as u64),
+            "frame {place}"
+        );
+    }
+    assert_eq!(bytes, golden, "this build writes format 2's bytes");
+}
+
+/// A magic whose format byte the damage turned into the other format's is
+/// refused at the magic, not read as a first write that tore: the header is
+/// whole only as the format the frames were written in.
+#[test]
+fn a_magic_naming_the_other_format_is_refused() {
+    let (bytes, _) = golden_run();
+    for (format, tape, named, frames) in [
+        ("format 2", bytes.clone(), 1u8, 2u8),
+        ("format 1", as_format_1(&bytes), 2, 1),
+    ] {
+        let mut damaged = tape;
+        damaged[6] = named;
+        assert_eq!(
+            recover(&damaged).tail,
+            Tail::Fault {
+                at: 0,
+                why: Why::MagicFormat { named, frames }
+            },
+            "{format}"
+        );
+    }
+}
+
+/// The place a format-2 sum names is read back for every place a test tape
+/// holds and the last a writer's can; a sum damaged in any one bit, or in any
+/// one byte under the bind's three masks, names no place at all (so a damaged
+/// last frame stays the torn tail); and the word a format-1 sum leaves names
+/// none either.
+#[test]
+fn a_place_reads_back_and_a_damaged_sum_names_none() {
+    let mut damages: Vec<u64> = (0..64).map(|bit| 1u64 << bit).collect();
+    for byte in 0..8 {
+        for mask in [0x01u64, 0x80, 0xff] {
+            damages.push(mask << (8 * byte));
+        }
+    }
+    for n in (0..4_096).chain([PLACES - 1]) {
+        let word = place_word(n);
+        assert_eq!(place_named(word, 0), Some(n));
+        let hashed = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(n + 1);
+        assert_eq!(place_named(word ^ hashed, hashed), Some(n));
+        for e in &damages {
+            assert_eq!(place_named(word ^ e, 0), None, "place {n}, damage {e:#x}");
+        }
+    }
+    assert_eq!(place_named(place_word(PLACES), 0), None);
+    assert_eq!(place_named(0, 0), None, "a format-1 sum names no place");
 }
 
 /// Bytes that are no tape, a tape of another frame format, a tape cut at its
@@ -402,29 +726,47 @@ fn what_is_not_a_tape_of_this_build_is_named() {
         (0, Why::NotATape)
     );
     let mut newer = MAGIC.to_vec();
-    newer[6] = 2;
-    assert_eq!(fault(recover(&newer)), (0, Why::Format(2)));
+    newer[6] = 3;
+    assert_eq!(fault(recover(&newer)), (0, Why::Format(3)));
     assert_eq!(recover(&MAGIC).tail, Tail::Torn { at: MAGIC.len() });
     assert_eq!(recover(&MAGIC[..5]).tail, Tail::Torn { at: 0 });
+    // A format-1 tape's first write, cut inside its magic or after it.
+    let one = Format::One.magic();
+    assert_eq!(recover(&one[..7]).tail, Tail::Torn { at: 0 });
+    assert_eq!(recover(&one).tail, Tail::Torn { at: MAGIC.len() });
     let records = |items: &[Item]| {
         let mut enc = super::codec::Encoder::default();
         let mut raw = Vec::new();
         for item in items {
             enc.item(item, &mut raw);
         }
-        frame_bytes(Kind::Records, &raw)
+        frame_bytes(Kind::Records, 0, &raw)
     };
-    let header = frame_bytes(Kind::Header, HEADER.as_bytes());
+    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes());
     let no_header = [MAGIC.as_slice(), &records(&[mono(1)])].concat();
     assert_eq!(fault(recover(&no_header)), (8, Why::NoHeader));
-    let two = [MAGIC.as_slice(), &header, &header].concat();
+    // A header frame at the second place: made by hand, as no writer makes
+    // one. A writer's header repeated is a frame out of place.
+    let second = frame_bytes(Kind::Header, 1, HEADER.as_bytes());
+    let two = [MAGIC.as_slice(), &header, &second].concat();
     assert_eq!(fault(recover(&two)), (8 + header.len(), Why::SecondHeader));
+    let again = [MAGIC.as_slice(), &header, &header].concat();
+    assert_eq!(
+        fault(recover(&again)),
+        (
+            8 + header.len(),
+            Why::OutOfPlace {
+                expected: 1,
+                found: 0
+            }
+        )
+    );
     // A whole last frame whose items this build does not read is a fault,
     // not a torn tail: no crash writes a whole frame of the wrong bytes.
     let wrong = [
         MAGIC.as_slice(),
         &header,
-        &frame_bytes(Kind::Records, &[0x7f]),
+        &frame_bytes(Kind::Records, 1, &[0x7f]),
     ]
     .concat();
     assert!(matches!(

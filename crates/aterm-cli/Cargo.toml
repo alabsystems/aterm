@@ -84,10 +84,25 @@ aterm-toml = { workspace = true }
 # binary links it already through the window).
 aterm-json = { workspace = true }
 
+# `aterm edit` and the `amacs` argv0 alias: the amacs program (its face
+# decision, and the client that hands a file to the window hosting the tab).
+# First-party; the one binary links aterm-ctl and amacs already.
+amacs-term = { workspace = true }
+
 # The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
 # the Windows driver is kernel32 console FFI with no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# `aterm doctor`'s `fabric:` row: whether the broker answers, the tier it says
+# it serves, and whether it says its log is poisoned, read by aterm-link's own
+# probe (`aterm_link::fabric::doctor_summary`) — the connect, `Hello` and
+# attach `aterm fabric` makes — so the two doctors read a broker the same way.
+# It reads the command the configuration names; the one place `aterm fabric`
+# looks beyond that, a running instance's bridge, `doctor_summary`'s doc says
+# why it skips and its `off` row names. Reached only by that print-and-exit
+# path; the one binary links aterm-link already on Unix, the only platform it
+# builds for (crates/aterm's Cargo.toml says why), so it adds no package.
+aterm-link = { path = "../aterm-link" }
 
 [lints]
 workspace = true

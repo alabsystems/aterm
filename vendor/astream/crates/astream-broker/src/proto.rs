@@ -59,9 +59,15 @@
 //!
 //! # What the wire says about durability
 //!
-//! Three things, all additive, none spending a request tag, a protocol version or an
+//! Four things, all additive, none spending a request tag, a protocol version or an
 //! error code:
 //!
+//! - **The health of the log**: tag 0x04 of the `Hello` answer's extension block
+//!   ([`NonceExt::health`], [`HelloHealth`]) — whether the log is POISONED (it refuses
+//!   every write until it is reopened) and why, and the flushes it has issued since it
+//!   opened (barriers, full, skipped, failed). Read by the broker without the log's
+//!   lock, so a status line on the host learns from the broker itself whether the log
+//!   it is about to call `connected` takes writes.
 //! - **The tier served**: tag 0x01 of the `Hello` answer's extension block
 //!   ([`NonceExt::durability`], [`ServedInfo`]) — the tier asked for, the tier in force
 //!   and why they differ, the Ordered horizon and the escalation table's size. A status
@@ -83,7 +89,11 @@
 //!   extra `Mark` when a full flush covers records it was delivered and not yet told are
 //!   durable — at most one per such flush. Not on Strict (the durable head is the
 //!   visible head after every batch, so a mark per delivery would say nothing) and not
-//!   on Relaxed (it does not move between opens).
+//!   on Relaxed (it does not move between opens). A log that LATCHES from Ordered to
+//!   Strict while serving keeps sending them for the rest of its open — then one per
+//!   delivered batch, every batch being flushed in full — because a subscriber that was
+//!   told Ordered may be holding back what it was delivered until a durable mark covers
+//!   it, and nothing on its stream says the tier changed.
 //!
 //! An escalated record (the broker's escalation table; see
 //! [`Escalation`](crate::Escalation)) never needs any of these to be safe: the broker
@@ -217,6 +227,31 @@ pub const ERR_PROTOCOL: u8 = 9;
 /// this code sends [`ERR_REFUSED`].
 pub const ERR_SUBJECT_BOUND: u8 = 10;
 
+/// A subject retirement was refused because the subject's index entry is charged to
+/// another producer ([`RETIRE_CHARGED_PREFIX`]), because a will that can still append
+/// targets the subject ([`RETIRE_WILL_PREFIX`]), or because the retirement's conditional
+/// log identity or offset does not match ([`RETIRE_LOG_PREFIX`]).
+///
+/// NOT permanent: `charged` lifts when the subject changes, `will` when the targeting
+/// will fires, is fenced, or is replaced, and `log` once the client re-reads `Last`.
+pub const ERR_RETIRE_REFUSED: u8 = 11;
+
+/// Fixed prefix for a [`ERR_RETIRE_REFUSED`] refusal when the subject is charged to
+/// another producer.
+pub const RETIRE_CHARGED_PREFIX: &str = "charged: ";
+
+/// Fixed prefix for a [`ERR_RETIRE_REFUSED`] refusal when a will that can still append
+/// targets the subject.
+pub const RETIRE_WILL_PREFIX: &str = "will: ";
+
+/// Fixed prefix for a [`ERR_RETIRE_REFUSED`] refusal when the conditional log identity
+/// or offset does not match.
+pub const RETIRE_LOG_PREFIX: &str = "log: ";
+
+/// Fixed prefix for a [`ERR_RECORD_REFUSED`] refusal when a retire is offered to a log
+/// that prefix retention has cut (`base > 0`).
+pub const RETIRE_CUT_PREFIX: &str = "cut: ";
+
 const TAG_PUBLISH: u8 = 0x01;
 const TAG_SUBSCRIBE: u8 = 0x02;
 const TAG_FORK_SUBSCRIBE: u8 = 0x03;
@@ -232,12 +267,25 @@ const TAG_HELLO: u8 = 0x0C;
 const TAG_KEEPALIVE: u8 = 0x0D;
 const TAG_IDLE_MARKS: u8 = 0x0E;
 const TAG_BUDGET: u8 = 0x0F;
+const TAG_RETIRE: u8 = 0x10;
 const TAG_ACK: u8 = 0x81;
 const TAG_DELIVERY: u8 = 0x82;
 const TAG_ERROR: u8 = 0x83;
 const TAG_MARK: u8 = 0x84;
 const TAG_NONCE: u8 = 0x85;
 const TAG_BUDGET_REPLY: u8 = 0x86;
+
+/// Bit 0 of [`NonceExt::requests`]: the broker accepts [`Request::Retire`] (`0x10`).
+pub const REQUEST_RETIRE: u64 = 1 << 0;
+
+/// Commit-tag byte in a [`Request::Replicate`] frame for a marked `/a/retire` record:
+/// an older follower only knows `0` (none) and `1` (group commit) and refuses `2` as
+/// malformed (`_ => return None`), stalling the replication link rather than diverging.
+const REPLICATE_COMMIT_RETIRE: u8 = 2;
+
+/// Internal sentinel group name used in [`Request::Replicate::commit`] to represent
+/// [`REPLICATE_COMMIT_RETIRE`] in memory without changing the `Request::Replicate` shape.
+pub(crate) const REPLICATE_RETIRE_GROUP: &str = "\0retire";
 
 // The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
 // `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
@@ -314,7 +362,9 @@ pub const fn windowed_send_advance(
 contract_fn! {
     /// Kernel-certified incarnation fence predicate `will_seq < high_water`, used by
     /// [`crate::store::BrokerLog`] when deciding whether a pending last will is fenced
-    /// by a later normal publish from the same producer (`TlaWillFencing`).
+    /// by a later normal publish from the same producer (`TlaWillFencing`). It fences a
+    /// dead incarnation's will only if the producer keeps the obligation
+    /// [`crate::will_seq`] states: a later incarnation's sequences sit above the old will.
     #[must_use]
     pub const fn will_is_fenced(high_water: u64, will_seq: u64) -> bool
     clauses [ensures result == (will_seq < high_water)]
@@ -478,6 +528,22 @@ pub enum Request {
     /// makes the will a no-op — and it is FENCED: it appends nothing if a record with
     /// a HIGHER `producer_seq` from the same producer has since landed, which is how
     /// a reconnected producer structurally suppresses its previous incarnation's will.
+    ///
+    /// THE PRODUCER'S OBLIGATION, which a reconnect needs to fence the old will and the
+    /// broker cannot check (a will is a hidden record, and incarnations are the
+    /// producer's own count): a new incarnation's sequences sit ABOVE every sequence of
+    /// any incarnation the producer ever presented to a broker, and the incarnation is
+    /// FLUSHED on the producer's side before its will is registered. A producer that
+    /// reuses an incarnation is not fenced. Its two wills share one key, so whichever
+    /// connection ends first fires its will and the other dedups away; when that is the
+    /// old one, its goodbye lands over the new incarnation's records.
+    /// [`crate::will_seq`] has the layout that meets the first half (aterm's,
+    /// `(inc << 32) | 0xFFFF_FFFF`, up to [`crate::INC_MAX`]) and the argument. In the
+    /// `TlaWillFencing` island, `WillFencingInv` (a fired will was not fenced) holds for
+    /// every producer; the obligation is the hypothesis of what it buys
+    /// (`newer_incarnation_publish_fences_the_will`, and over the spec
+    /// `obliged_spec_fences_the_will_once_landed`): from the newer incarnation's first
+    /// publish on, the will is fenced in every later state and cannot fire.
     Will {
         producer_id: u64,
         producer_seq: u64,
@@ -532,6 +598,27 @@ pub enum Request {
     /// predates the verb answers `Error 5 "malformed request"` and keeps the
     /// connection. A wire frame, never a log record.
     Budget { producer_id: u64 },
+    /// CONDITIONAL SUBJECT RETIREMENT (`DESIGN-aterm-fabric` §5.2): remove `subject` from
+    /// the last-value index (`Last`) and credit `producer_id`'s distinct-subject budget
+    /// by one if and only if `subject`'s current entry in `Last` is at `offset` on `log`.
+    ///
+    /// Answered with a [`Response::PublishAck`]:
+    /// - When `subject` is in `Last` at `offset` on `log`, charged to `producer_id`, and
+    ///   no live or durable will that can still append targets `subject`, the broker
+    ///   appends a marked `/a/retire` record and replies `PublishAck { offset: r, deduped: false }`.
+    /// - When `subject` is already absent from `Last` (and `offset` is below the log's
+    ///   head) or its current entry in `Last` is at a newer offset `o > offset`, the
+    ///   retirement is moot: nothing is appended and the broker replies
+    ///   `PublishAck { offset: o_or_head, deduped: true }`.
+    /// - Refused with [`ERR_RETIRE_REFUSED`] (`"charged: ..."`, `"will: ..."`, or
+    ///   `"log: ..."`), [`ERR_RECORD_REFUSED`] (`"cut: ..."` or reserved `/a/...`),
+    ///   [`ERR_BAD_SUBJECT`], [`ERR_UNAUTHORIZED`], or [`ERR_REFUSED`] (replica).
+    Retire {
+        producer_id: u64,
+        subject: String,
+        offset: u64,
+        log: LogIdentity,
+    },
 }
 
 /// A broker → client response.
@@ -573,8 +660,9 @@ pub enum Response {
     /// reads which from its `Hello` block where it sends one — on Strict "durable =
     /// visible", on Relaxed nothing acked since its open (see the module docs). A body that ends one to seven bytes after `resume` is a frame
     /// cut short (malformed); bytes after the eight are a later trailer, skipped. On a
-    /// broker that serves [`Tier::Ordered`], a subscriber that asked for idle marks also
-    /// gets a DURABLE mark when a full flush covers records it was delivered.
+    /// broker that serves [`Tier::Ordered`] (or served it at its open, and latched to
+    /// Strict since), a subscriber that asked for idle marks also gets a DURABLE mark
+    /// when a full flush covers records it was delivered.
     Mark {
         next: u64,
         head: u64,
@@ -593,10 +681,11 @@ pub enum Response {
     /// after the nonce).
     ///
     /// `ext` is the EXTENSION BLOCK after the identity: what the broker says about the
-    /// log beside its name — the tier it serves ([`NonceExt::durability`]) and where the
-    /// log's generations agree ([`NonceExt::lineage`]). Present only when `log` is, and
-    /// additive both ways: an older client never reads past the identity, and an older
-    /// broker sends none (both fields `None`). See [`NonceExt`] for the layout. The WIRE
+    /// log beside its name — the tier it serves ([`NonceExt::durability`]), where the
+    /// log's generations agree ([`NonceExt::lineage`]) and its health
+    /// ([`NonceExt::health`]). Present only when `log` is, and additive both ways: an
+    /// older client never reads past the identity, and an older broker sends none (every
+    /// field `None`). See [`NonceExt`] for the layout. The WIRE
     /// is additive; the variant is not: code that builds a `Response::Nonce` literal (a
     /// test's stand-in broker) names the field — `ext: NonceExt::default()` says
     /// nothing, as a broker before the block did.
@@ -711,7 +800,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    const fn code(self) -> u8 {
+    pub(crate) const fn code(self) -> u8 {
         match self {
             Tier::Strict => 0,
             Tier::Ordered => 1,
@@ -720,7 +809,7 @@ impl Tier {
         }
     }
 
-    const fn from_code(c: u8) -> Tier {
+    pub(crate) const fn from_code(c: u8) -> Tier {
         match c {
             0 => Tier::Strict,
             1 => Tier::Ordered,
@@ -752,7 +841,7 @@ pub enum ServedReason {
 }
 
 impl ServedReason {
-    const fn code(self) -> u8 {
+    pub(crate) const fn code(self) -> u8 {
         match self {
             ServedReason::None => 0,
             ServedReason::NotApple => 1,
@@ -764,7 +853,7 @@ impl ServedReason {
         }
     }
 
-    const fn from_code(c: u8) -> ServedReason {
+    pub(crate) const fn from_code(c: u8) -> ServedReason {
         match c {
             0 => ServedReason::None,
             1 => ServedReason::NotApple,
@@ -937,22 +1026,66 @@ const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
 /// |------|------------|-------|
 /// | 0x01 | durability | `requested u8, served u8, reason u8, horizon_ms u32 LE, rules u16 LE` ([`ServedInfo`]) |
 /// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
-/// | 0x03 | reserved   | the request set a broker announces (the subject-retire design) |
+/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`]) |
+/// | 0x04 | health     | `flags u8` (bit 0: poisoned), `barrier u64 LE, full u64 LE, skipped u64 LE, failed u64 LE`, `n u16 LE`, `n` bytes of the poison's reason (UTF-8); bytes after it are a later build's, skipped ([`HelloHealth`]) |
 ///
 /// No request tag, no protocol version and no error code are spent on it: a broker
 /// that predates the block sends a frame that ends at the identity, which reads here
-/// as both fields `None`.
+/// as every field `None`; one that predates an entry sends a block without it, which
+/// reads as that field `None`. A decoder skips every tag it does not know by its
+/// length, so a client built before an entry reads a block carrying it exactly as it
+/// read the block before (`the_health_entry_is_skipped_by_a_decoder_that_predates_it`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NonceExt {
     /// Tag 0x01: the tier the broker serves.
     pub durability: Option<ServedInfo>,
     /// Tag 0x02: where the log's generations agree.
     pub lineage: Option<Lineage>,
+    /// Tag 0x03: the request-set bitmask announced by the broker (bit 0 = [`REQUEST_RETIRE`]).
+    pub requests: Option<u64>,
+    /// Tag 0x04: whether the log is poisoned, and the flushes it has issued.
+    pub health: Option<HelloHealth>,
 }
+
+/// What a broker says about its log's health in the answer to every `Hello` — the
+/// extension block's tag 0x04: whether the log is POISONED, and why (it then refuses
+/// every write until it is reopened — [`Broker::poisoned`](crate::Broker::poisoned)),
+/// and the flushes it has issued since it opened
+/// ([`Broker::flush_counts`](crate::Broker::flush_counts)).
+///
+/// PUBLIC FACTS, like the tier served beside them (whose
+/// [`ServedReason::LatchedAfterFlushFailure`] already says, before authentication,
+/// that a full flush failed): the reason is the one every write the poisoned log
+/// refuses carries after [`LOG_POISONED_PREFIX`], to whichever producer sent it. So
+/// they ride the answer every client already asks for, and no request tag is spent:
+/// a status line on the host reads, from the broker itself, whether the log it is
+/// about to call `connected` takes writes. The broker reads both without the log's lock
+/// (`LogVitals`), so the answer never waits on the writer — not even on the rollback or
+/// identity I/O of the failure it reports.
+///
+/// The counts are since this OPEN: a reopen (the poison's cure) starts them at zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HelloHealth {
+    /// `Some(reason)` while the log is poisoned: the broker's own words, cut to
+    /// [`HELLO_REASON_MAX`] bytes at a character boundary.
+    pub poisoned: Option<String>,
+    /// The flushes the log has issued since it opened, by kind.
+    pub flushes: crate::store::FlushCounts,
+}
+
+/// The most bytes of a poison's reason the `Hello` health entry carries
+/// ([`HelloHealth::poisoned`]): astream's reasons run to about 200, and the entry's own
+/// length is a `u16`.
+pub const HELLO_REASON_MAX: usize = 1024;
+
+/// The fixed part of the health entry: flags, four counts, the reason's length.
+const HEALTH_FIXED_LEN: usize = 1 + 4 * 8 + 2;
 
 /// The extension-block tags ([`NonceExt`]).
 const EXT_DURABILITY: u8 = 0x01;
 const EXT_LINEAGE: u8 = 0x02;
+const EXT_REQUESTS: u8 = 0x03;
+const EXT_HEALTH: u8 = 0x04;
 
 fn put_ext_entry(p: &mut Vec<u8>, tag: u8, body: &[u8]) {
     p.push(tag);
@@ -960,7 +1093,73 @@ fn put_ext_entry(p: &mut Vec<u8>, tag: u8, body: &[u8]) {
     p.extend_from_slice(body);
 }
 
+/// `reason`'s longest prefix of at most `max` bytes that ends on a character boundary.
+fn reason_prefix(reason: &str, max: usize) -> &str {
+    if reason.len() <= max {
+        return reason;
+    }
+    let mut end = max;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    match reason.get(..end) {
+        Some(s) => s,
+        None => "",
+    }
+}
+
+impl HelloHealth {
+    fn put(&self, b: &mut Vec<u8>) {
+        let reason = match &self.poisoned {
+            Some(r) => reason_prefix(r, HELLO_REASON_MAX),
+            None => "",
+        };
+        b.push(u8::from(self.poisoned.is_some()));
+        b.extend_from_slice(&encode_u64_le_bytes(self.flushes.barrier));
+        b.extend_from_slice(&encode_u64_le_bytes(self.flushes.full));
+        b.extend_from_slice(&encode_u64_le_bytes(self.flushes.skipped));
+        b.extend_from_slice(&encode_u64_le_bytes(self.flushes.failed));
+        b.extend_from_slice(&encode_u16_le_bytes(reason.len() as u16));
+        b.extend_from_slice(reason.as_bytes());
+    }
+
+    /// The entry's body; `None` for one cut short or a reason that is not UTF-8. Flag
+    /// bits other than bit 0, and bytes after the reason, are a later build's: ignored.
+    fn from_wire(body: &[u8]) -> Option<HelloHealth> {
+        let mut r = Reader { b: body };
+        let flags = r.u8()?;
+        let flushes = crate::store::FlushCounts {
+            barrier: r.u64()?,
+            full: r.u64()?,
+            skipped: r.u64()?,
+            failed: r.u64()?,
+        };
+        let n = {
+            let raw = r.take(2)?;
+            let &[l0, l1] = raw.as_slice() else {
+                return None;
+            };
+            decode_u16_le_bytes(&[l0, l1]) as usize
+        };
+        let raw = r.take(n)?;
+        let Ok(reason) = String::from_utf8(raw) else {
+            return None;
+        };
+        let poisoned = if flags & 1 == 1 { Some(reason) } else { None };
+        Some(HelloHealth { poisoned, flushes })
+    }
+}
+
 impl NonceExt {
+    /// Whether this `Hello` extension block announces [`Request::Retire`] (`0x10`).
+    #[must_use]
+    pub const fn supports_retire(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_RETIRE) != 0,
+            None => false,
+        }
+    }
+
     fn put(&self, p: &mut Vec<u8>) {
         if let Some(d) = &self.durability {
             let b = encode_served_info_bytes(d);
@@ -970,6 +1169,14 @@ impl NonceExt {
             let mut b = Vec::new();
             l.put(&mut b);
             put_ext_entry(p, EXT_LINEAGE, &b);
+        }
+        if let Some(req) = self.requests {
+            put_ext_entry(p, EXT_REQUESTS, &encode_u64_le_bytes(req));
+        }
+        if let Some(h) = &self.health {
+            let mut b = Vec::with_capacity(HEALTH_FIXED_LEN);
+            h.put(&mut b);
+            put_ext_entry(p, EXT_HEALTH, &b);
         }
     }
 
@@ -984,7 +1191,14 @@ impl NonceExt {
             match tag {
                 EXT_DURABILITY => ext.durability = Some(decode_served_info(body)?),
                 EXT_LINEAGE => ext.lineage = Some(Lineage::from_wire(body)?),
-                // Unknown (0x03 included): skipped by its length.
+                EXT_REQUESTS => {
+                    let &[b0, b1, b2, b3, b4, b5, b6, b7] = body else {
+                        return None;
+                    };
+                    ext.requests = Some(decode_u64_le_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7]));
+                }
+                EXT_HEALTH => ext.health = Some(HelloHealth::from_wire(body)?),
+                // Unknown tags: skipped by their length.
                 _ => {}
             }
         }
@@ -1240,6 +1454,18 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             put_str(&mut p, filter);
             p.extend_from_slice(&encode_u32_le_bytes(*max));
         }
+        Request::Retire {
+            producer_id,
+            subject,
+            offset,
+            log,
+        } => {
+            p[1] = TAG_RETIRE;
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
+            put_str(&mut p, subject);
+            p.extend_from_slice(&encode_u64_le_bytes(*offset));
+            log.put(&mut p);
+        }
     }
     p
 }
@@ -1267,6 +1493,13 @@ pub fn encode_replicate(
     put_bytes(&mut p, body);
     match commit {
         None => p.push(0),
+        Some((group, 0))
+            if group == REPLICATE_RETIRE_GROUP
+                && subject == crate::store::RETIRE_SUBJECT
+                && producer_seq == crate::brecord::RETIRE_PRODUCER_SEQ =>
+        {
+            p.push(REPLICATE_COMMIT_RETIRE);
+        }
         Some((group, upto)) => {
             p.push(1);
             put_str(&mut p, group);
@@ -1339,8 +1572,30 @@ pub fn decode_request(p: &[u8]) -> Option<Request> {
             let subject = r.string()?;
             let body = r.bytes()?;
             let commit = match r.u8()? {
-                0 => None,
-                1 => Some((r.string()?, r.u64()?)),
+                0 => {
+                    if subject == crate::store::RETIRE_SUBJECT
+                        && producer_seq == crate::brecord::RETIRE_PRODUCER_SEQ
+                    {
+                        return None;
+                    }
+                    None
+                }
+                1 => {
+                    let group = r.string()?;
+                    let upto = r.u64()?;
+                    if group == REPLICATE_RETIRE_GROUP {
+                        return None;
+                    }
+                    Some((group, upto))
+                }
+                REPLICATE_COMMIT_RETIRE => {
+                    if subject != crate::store::RETIRE_SUBJECT
+                        || producer_seq != crate::brecord::RETIRE_PRODUCER_SEQ
+                    {
+                        return None;
+                    }
+                    Some((REPLICATE_RETIRE_GROUP.to_string(), 0))
+                }
                 _ => return None,
             };
             Some(Request::Replicate {
@@ -1363,6 +1618,19 @@ pub fn decode_request(p: &[u8]) -> Option<Request> {
             filter: r.string()?,
             max: r.u32()? as u32,
         }),
+        TAG_RETIRE => {
+            let producer_id = r.u64()?;
+            let subject = r.string()?;
+            let offset = r.u64()?;
+            let raw = r.take(LogIdentity::WIRE_LEN)?;
+            let log = LogIdentity::from_wire(&raw)?;
+            Some(Request::Retire {
+                producer_id,
+                subject,
+                offset,
+                log,
+            })
+        }
         _ => None,
     }
 }
@@ -1520,6 +1788,26 @@ pub(crate) fn append_publish_frame(
     out.extend_from_slice(&[0u8; HEADER_SIZE]);
     let payload_start = out.len();
     put_publish(out, producer_id, producer_seq, subject, body);
+    let _ = finish_framed(out, start, payload_start, None)?;
+    Ok(())
+}
+
+/// Append one framed `Retire` request to `out`, assembled in place.
+pub(crate) fn append_retire_frame(
+    out: &mut Vec<u8>,
+    producer_id: u64,
+    subject: &str,
+    offset: u64,
+    log: LogIdentity,
+) -> io::Result<()> {
+    let start = out.len();
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    let payload_start = out.len();
+    out.extend_from_slice(&[PROTO_VERSION, TAG_RETIRE]);
+    out.extend_from_slice(&encode_u64_le_bytes(producer_id));
+    put_str(out, subject);
+    out.extend_from_slice(&encode_u64_le_bytes(offset));
+    log.put(out);
     let _ = finish_framed(out, start, payload_start, None)?;
     Ok(())
 }
@@ -2034,7 +2322,7 @@ mod tests {
         );
 
         // Every tag's NUMBER, pinned against the variant that carries it.
-        let request_tags: [(u8, Request); 15] = [
+        let request_tags: [(u8, Request); 16] = [
             (
                 0x01,
                 Request::Publish {
@@ -2133,6 +2421,18 @@ mod tests {
             (0x0D, Request::Keepalive),
             (0x0E, Request::IdleMarks),
             (0x0F, Request::Budget { producer_id: 0 }),
+            (
+                0x10,
+                Request::Retire {
+                    producer_id: 0,
+                    subject: String::new(),
+                    offset: 0,
+                    log: LogIdentity {
+                        id: [0; 16],
+                        generation: 0,
+                    },
+                },
+            ),
         ];
         for (tag, req) in &request_tags {
             let bytes = encode_request(req);
@@ -2225,7 +2525,7 @@ mod tests {
         }
         assert_eq!(
             decodable_requests, declared_requests,
-            "exactly fifteen request tags decode, and no other byte does"
+            "exactly sixteen request tags decode, and no other byte does"
         );
         assert_eq!(
             decodable_responses, declared_responses,
@@ -2425,7 +2725,6 @@ mod tests {
         }
     }
 
-    /// THE REFUSAL A PEER OF ANY VERSION READS, pinned byte by byte:
     /// The `Nonce` extension block: the served tier (0x01) and the lineage (0x02) round
     /// trip; the frame without them is byte-identical to the identity-only frame, which
     /// is a prefix of the frame with them — exactly what an OLDER client reads, stopping
@@ -2447,6 +2746,8 @@ mod tests {
                 rules: 0,
             }),
             lineage: Some(Lineage::default().step(3, 41)),
+            requests: Some(REQUEST_RETIRE),
+            health: None,
         };
         let nonce = |log, ext| Response::Nonce {
             nonce: vec![2; 32],
@@ -2464,6 +2765,8 @@ mod tests {
             decode_response(&full),
             Some(nonce(Some(ident), ext.clone()))
         );
+        assert!(ext.supports_retire());
+        assert!(!NonceExt::default().supports_retire());
         // With no identity no block is sent, whatever the caller passed.
         assert_eq!(
             encode_response(&nonce(None, ext.clone())),
@@ -2484,17 +2787,152 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // The reserved tag 0x03 is skipped.
-        let mut reserved = full.clone();
-        reserved.extend_from_slice(&[0x03, 1, 0, 0xff]);
+        // Unknown tag 0x05 is skipped.
+        let mut unknown = full.clone();
+        unknown.extend_from_slice(&[0x05, 1, 0, 0xff]);
         assert_eq!(
-            decode_response(&reserved),
+            decode_response(&unknown),
             Some(nonce(Some(ident), ext.clone()))
         );
         // A durability entry one byte short is malformed.
         let mut short = plain.clone();
         short.extend_from_slice(&[0x01, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(decode_response(&short), None);
+        // A requests entry (tag 0x03) that is not 8 bytes is malformed.
+        let mut bad_req = plain.clone();
+        bad_req.extend_from_slice(&[0x03, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(decode_response(&bad_req), None);
+    }
+
+    /// The block's reader as it stood in the release before the health entry (0x04),
+    /// frozen here: it knows 0x01 and 0x02 and skips every other tag by its length —
+    /// what an OLDER client runs on the block this build's broker sends.
+    fn older_client_ext(mut b: &[u8]) -> Option<(Option<ServedInfo>, Option<Lineage>)> {
+        let (mut durability, mut lineage) = (None, None);
+        while !b.is_empty() {
+            let (tag, len, rest) = take_ext_entry_header(b)?;
+            let body = rest.get(..len)?;
+            b = rest.get(len..)?;
+            match tag {
+                0x01 => durability = Some(decode_served_info(body)?),
+                0x02 => lineage = Some(Lineage::from_wire(body)?),
+                _ => {}
+            }
+        }
+        Some((durability, lineage))
+    }
+
+    /// The `Nonce` answer's bytes after the identity: the extension block.
+    fn ext_block(frame: &[u8]) -> &[u8] {
+        let mut r = Reader { b: frame };
+        assert_eq!((r.u8(), r.u8()), (Some(PROTO_VERSION), Some(TAG_NONCE)));
+        r.bytes().expect("the nonce");
+        r.identity_trailer().expect("an identity");
+        r.b
+    }
+
+    /// THE HEALTH ENTRY (0x04) IS ADDITIVE: a client that predates it reads a block
+    /// carrying it exactly as it read the block before — the tier and the lineage, the
+    /// entry skipped by its length — whether the log is healthy or poisoned; this build
+    /// reads all three. NEGATIVE CONTROL: the same older reader REFUSES a health entry
+    /// cut short (its length runs past the frame), so it really walks the entry's header
+    /// rather than stopping before it.
+    #[test]
+    fn the_health_entry_is_skipped_by_a_decoder_that_predates_it() {
+        let ident = LogIdentity {
+            id: [0x5a; 16],
+            generation: 2,
+        };
+        let served = ServedInfo {
+            requested: Tier::Relaxed,
+            served: Tier::Strict,
+            reason: ServedReason::LatchedAfterFlushFailure,
+            horizon_ms: None,
+            rules: 1,
+        };
+        let lineage = Lineage::default().step(2, 9);
+        for poisoned in [None, Some("a flush failed (injected)".to_string())] {
+            let ext = NonceExt {
+                durability: Some(served),
+                lineage: Some(lineage.clone()),
+                requests: None,
+                health: Some(HelloHealth {
+                    poisoned: poisoned.clone(),
+                    flushes: crate::store::FlushCounts {
+                        barrier: 3,
+                        full: 2,
+                        skipped: 1,
+                        failed: 1,
+                    },
+                }),
+            };
+            let frame = encode_response(&Response::Nonce {
+                nonce: vec![7; 32],
+                log: Some(ident),
+                ext: ext.clone(),
+            });
+            assert_eq!(
+                older_client_ext(ext_block(&frame)),
+                Some((Some(served), Some(lineage.clone()))),
+                "an older client reads the tier and the lineage, the health skipped"
+            );
+            match decode_response(&frame) {
+                Some(Response::Nonce { ext: got, .. }) => assert_eq!(got, ext),
+                other => panic!("{other:?}"),
+            }
+            // The control: the entry's length now runs one byte past the frame.
+            let cut = &frame[..frame.len() - 1];
+            assert_eq!(older_client_ext(ext_block(cut)), None, "cut short: refused");
+            assert_eq!(decode_response(cut), None);
+        }
+    }
+
+    /// The health entry's own layout: it round-trips healthy and poisoned (an empty
+    /// reason included, which is still a poison); a reason past [`HELLO_REASON_MAX`] is
+    /// cut there at a character boundary, never inside one; flag bits other than bit 0
+    /// and bytes after the reason are a later build's, ignored; and a reason that is
+    /// not UTF-8, or a body cut inside its fixed part or its reason, is malformed.
+    #[test]
+    fn the_health_entry_round_trips_and_cuts_a_long_reason_at_a_char_boundary() {
+        let round = |h: &HelloHealth| {
+            let mut b = Vec::new();
+            h.put(&mut b);
+            (HelloHealth::from_wire(&b), b)
+        };
+        let healthy = HelloHealth::default();
+        assert_eq!(round(&healthy).0, Some(healthy.clone()));
+        let empty_reason = HelloHealth {
+            poisoned: Some(String::new()),
+            flushes: crate::store::FlushCounts::default(),
+        };
+        assert_eq!(round(&empty_reason).0, Some(empty_reason.clone()));
+
+        // 1023 ASCII bytes then a 3-byte character: the cut at 1024 would split it.
+        let long = format!("{}€tail", "x".repeat(HELLO_REASON_MAX - 1));
+        let (got, bytes) = round(&HelloHealth {
+            poisoned: Some(long),
+            flushes: crate::store::FlushCounts::default(),
+        });
+        let reason = got.unwrap().poisoned.unwrap();
+        assert_eq!(reason, "x".repeat(HELLO_REASON_MAX - 1), "cut before the €");
+        assert_eq!(bytes.len(), HEALTH_FIXED_LEN + HELLO_REASON_MAX - 1);
+
+        let (_, mut later) = round(&healthy);
+        later[0] |= 0b110;
+        later.extend_from_slice(&[0xEE; 9]);
+        assert_eq!(HelloHealth::from_wire(&later), Some(healthy.clone()));
+
+        let (_, poisoned) = round(&HelloHealth {
+            poisoned: Some("why".into()),
+            flushes: crate::store::FlushCounts::default(),
+        });
+        let mut not_utf8 = poisoned.clone();
+        let last = not_utf8.len() - 1;
+        not_utf8[last] = 0xFF;
+        assert_eq!(HelloHealth::from_wire(&not_utf8), None);
+        for cut in [1, HEALTH_FIXED_LEN - 1, poisoned.len() - 1] {
+            assert_eq!(HelloHealth::from_wire(&poisoned[..cut]), None, "cut {cut}");
+        }
     }
 
     /// THE HORIZON TELLS NO BOUND FROM A FLUSH AFTER EVERY BATCH. An Ordered broker with
@@ -2522,6 +2960,8 @@ mod tests {
                     rules: 1,
                 }),
                 lineage: None,
+                requests: None,
+                health: None,
             };
             let frame = encode_response(&Response::Nonce {
                 nonce: vec![2; 32],
@@ -2551,6 +2991,7 @@ mod tests {
         );
     }
 
+    /// THE REFUSAL A PEER OF ANY VERSION READS, pinned byte by byte:
     /// `[peer][0x83][ERR_PROTOCOL][len:u32 LE][msg][PROTO_VERSION]`. Under the peer's own
     /// version byte it is the refusal layout every version keeps, so the peer's decoder
     /// reads `Error { code: 9 }`; the byte after the message, which no decoder reads, is

@@ -1207,10 +1207,13 @@ fn a_ready_index_wins_before_a_ready_vendor_get() {
     );
     assert!(watch.pending_index_probe.is_some());
     assert!(model.fire("VendorReady", &mut state));
+    // The ready answer ends this park at its first look; its deadline is the
+    // one-minute hang detector, since a due deadline outranks the index (as
+    // `full_end` shows) and a loaded host can spend 20 ms before that look.
     let index_end = sleep_interval_watching_bump(
         Some(&layout),
-        &mut (SystemTime::now() + Duration::from_millis(20)),
-        Duration::from_millis(20),
+        &mut (SystemTime::now() + Duration::from_secs(60)),
+        Duration::from_secs(60),
         &mut watch,
         ParkProbes::INDEX,
         Some(&mut heads),
@@ -1502,14 +1505,14 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     .unwrap();
     std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
     // The stub's first exec can wait tens of seconds on macOS's assessment of a freshly
-    // written file; pay it here, unbounded, before Claude's stall starts its clock.
+    // written file; pay it here, under the first exec's own hang detector
+    // (`aterm_spec::wait::FIRST_EXEC`), before Claude's stall starts its clock.
     // Spawned the way the lane spawns it; the log keeps only the pass's argv.
-    crate::qos::atpkg_command(&atpkg)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .status()
-        .expect("the stub runs once, unbounded");
+    aterm_uds::deadline::output_until(
+        &mut crate::qos::atpkg_command(&atpkg),
+        std::time::Instant::now() + aterm_spec::wait::FIRST_EXEC,
+    )
+    .unwrap_or_else(|e| panic!("the stub's first exec within its hang detector: {e}"));
     std::fs::remove_file(&argv_log).expect("the warm run logged its argv");
 
     let release = Arc::new((Mutex::new(false), Condvar::new()));

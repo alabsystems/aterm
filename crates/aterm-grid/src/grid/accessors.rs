@@ -581,20 +581,21 @@ impl Grid {
     /// Returns the first codepoint of the complex character. For single-emoji
     /// cells (ring path), this is the full character. For multi-char strings
     /// in the HashMap (combining sequences, ZWJ families), this returns only
-    /// the base character. Use `complex_char_str_at` for the full string.
+    /// the base character. Use `push_complex_char_at` for the full string.
     #[inline]
     pub fn complex_char_at(&self, row: u16, col: u16) -> Option<char> {
         self.storage.extras().complex_codepoint_for(row, col)
     }
 
-    /// Look up a complex char as full string: ring buffer (char→String) or HashMap (Arc<str>).
+    /// Append a complex char's full text to `out`: the ring buffer's codepoint
+    /// or the HashMap's string. Returns whether either held one; `false`
+    /// appends nothing.
     ///
-    /// More expensive than `complex_char_at` — allocates a String for each call.
     /// Use for text extraction (row_text, content export). For rendering where
     /// only the base codepoint is needed, use `complex_char_at`.
     #[inline]
-    pub fn complex_char_str_at(&self, row: u16, col: u16) -> Option<String> {
-        self.storage.extras().complex_char_str_for(row, col)
+    pub fn push_complex_char_at(&self, row: u16, col: u16, out: &mut String) -> bool {
+        self.storage.extras().push_complex_char(row, col, out)
     }
 
     /// Look up fg RGB: ring buffer first (O(1)), then HashMap.

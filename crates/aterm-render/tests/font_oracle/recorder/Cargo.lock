@@ -7,6 +7,10 @@ name = "astream-sys"
 version = "0.2.0"
 
 [[package]]
+name = "astream-wire"
+version = "0.2.0"
+
+[[package]]
 name = "aterm-alloc"
 version = "0.107.0"
 
@@ -39,6 +43,9 @@ dependencies = [
 [[package]]
 name = "aterm-hash"
 version = "0.107.0"
+dependencies = [
+ "astream-wire",
+]
 
 [[package]]
 name = "aterm-log"

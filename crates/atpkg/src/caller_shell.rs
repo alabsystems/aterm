@@ -128,63 +128,92 @@ fn linux_comm_name(pid: u32) -> Option<String> {
     (!comm.is_empty()).then(|| comm.to_string())
 }
 
-/// `sysctl` `kern.procargs2` for `pid`: the executable's path is the first NUL-terminated
-/// string after the leading `argc`.
+/// `sysctl` `kern.procargs2` for `pid` ([`aterm_uds::procargs`]): the basename of the
+/// executable's path.
 #[cfg(target_os = "macos")]
 fn macos_exe_name(pid: u32) -> Option<String> {
-    exe_name_of_procargs2(&macos_procargs2(pid)?)
+    exe_name_of_procargs2(&aterm_uds::procargs::read(pid)?)
 }
 
-/// The basename of the exec path a `KERN_PROCARGS2` buffer leads with, read on its own
-/// ([`procargs2_exec_path`]), never through [`parse_procargs2`]: an argv the parser refuses
-/// must not cost the caller its shell.
+/// The basename of the exec path a `KERN_PROCARGS2` buffer leads with, read whether or not
+/// the buffer holds every argument word: an argv [`parse_procargs2`] refuses must not cost
+/// the caller its shell.
 #[cfg(any(target_os = "macos", test))]
 fn exe_name_of_procargs2(buf: &[u8]) -> Option<String> {
-    std::path::Path::new(procargs2_exec_path(buf)?)
+    let exec_path = aterm_uds::procargs::parse(buf)?.exec_path;
+    std::path::Path::new(std::str::from_utf8(exec_path).ok()?)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
 }
 
-/// The bytes of the native-endian `c_int` argc a `KERN_PROCARGS2` buffer leads with.
-#[cfg(any(target_os = "macos", test))]
-const PROCARGS2_ARGC_BYTES: usize = 4;
-
-/// The exec path a `KERN_PROCARGS2` buffer leads with: the first NUL-terminated string
-/// after the argc, which this does not read. `None` when there is no NUL or the path is
-/// not UTF-8.
-#[cfg(any(target_os = "macos", test))]
-fn procargs2_exec_path(buf: &[u8]) -> Option<&str> {
-    let rest = buf.get(PROCARGS2_ARGC_BYTES..)?;
-    let end = rest.iter().position(|&b| b == 0)?;
-    std::str::from_utf8(&rest[..end]).ok()
-}
-
 /// One process's exec path, argument vector and environment, as the kernel recorded them at
-/// `exec` (the initial environment: a later `export` is not in it).
+/// `exec` (the initial environment: a later `export` is not in it). On Windows, as its
+/// process environment block holds them now: the environment there is the CURRENT one, a
+/// `SetEnvironmentVariableW` since the start included.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProcArgs {
-    /// The path the process was exec'd from, as passed to `exec` (not canonical).
+    /// The path the process was exec'd from, as passed to `exec` (not canonical). On
+    /// Windows the image the kernel names (`QueryFullProcessImageNameW`, `C:\…\x.exe`).
     pub exec_path: String,
-    /// `argv`, `argv[0]` first.
+    /// `argv`, `argv[0]` first. On Windows the command line as the C runtime splits it
+    /// ([`split_command_line`]).
     pub argv: Vec<String>,
-    /// `KEY=value` entries, in the order the kernel holds them.
+    /// `KEY=value` entries, in the order the kernel holds them. On Windows the drive
+    /// letters' working directories are entries too (`=C:=C:\x`: a name that begins with
+    /// `=`).
     pub env: Vec<String>,
 }
 
 impl ProcArgs {
-    /// The value of one environment variable at exec, where set.
+    /// The value of one environment variable at exec, where set: the first entry whose
+    /// name is `key` — on Windows blind to case, as every lookup there is
+    /// ([`name_fold`]: `Path` is `PATH`).
     #[must_use]
     pub fn env_var(&self, key: &str) -> Option<&str> {
         self.env
             .iter()
-            .find_map(|kv| kv.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
+            .find_map(|kv| env_value(kv, key, name_fold()))
     }
+}
+
+/// How a variable's name is compared ([`ProcArgs::env_var`]): on Windows each character
+/// folded as the system folds it (`aterm_sysprobe::paths::fold_case`,
+/// `RtlUpcaseUnicodeChar`'s one-unit-to-one simple uppercase, which
+/// `GetEnvironmentVariableW` compares by); elsewhere exactly.
+fn name_fold() -> fn(char) -> char {
+    #[cfg(windows)]
+    {
+        aterm_sysprobe::paths::fold_case
+    }
+    #[cfg(not(windows))]
+    {
+        std::convert::identity
+    }
+}
+
+/// The value of `kv` (`KEY=value`) when its name is `key`, the two compared character by
+/// character through `fold`: `key` whole, then the `=` that ends the name. A name may begin
+/// with `=` (Windows' `=C:`), and a value may hold more `=`.
+fn env_value<'a>(kv: &'a str, key: &str, fold: fn(char) -> char) -> Option<&'a str> {
+    let mut chars = kv.char_indices();
+    for want in key.chars() {
+        let (_, got) = chars.next()?;
+        if fold(got) != fold(want) {
+            return None;
+        }
+    }
+    let (at, _) = chars.next().filter(|&(_, c)| c == '=')?;
+    kv.get(at + 1..)
 }
 
 /// `pid`'s exec path, argv and initial environment, when this process may read them (its
 /// own uid, or root). macOS: one `sysctl(KERN_PROCARGS2)`; Linux:
-/// `/proc/<pid>/{exe,cmdline,environ}`. `None` on any refusal, on another platform, or on a
-/// buffer this parser does not recognise, never a partial read passed off as whole.
+/// `/proc/<pid>/{exe,cmdline,environ}`; Windows: its process environment block
+/// (`aterm_sysprobe::peb::parameters`: its image, its command line split as the
+/// C runtime splits it, [`split_command_line`], and its environment block,
+/// [`split_environment`]), for a process of this account that grants `PROCESS_VM_READ`
+/// (not an elevated one). `None` on any refusal, on another platform, or on a buffer this
+/// parser does not recognise, never a partial read passed off as whole.
 ///
 /// aterm-agent's harness relaunches an agent session with the flags it was started with;
 /// `ps -o command=` joins argv with spaces and loses a quoted word.
@@ -192,15 +221,17 @@ impl ProcArgs {
 pub fn process_args(pid: u32) -> Option<ProcArgs> {
     #[cfg(target_os = "macos")]
     {
-        parse_procargs2(&macos_procargs2(pid)?)
+        parse_procargs2(&aterm_uds::procargs::read(pid)?)
     }
     #[cfg(target_os = "linux")]
     {
-        let exec_path = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()?
+        // Both through aterm-uds, which reads them as the program was given them, where
+        // the kernel names a translator, and leaks nothing under Rosetta
+        // (`aterm_uds::process::{read_exec_path, read_cmdline}`).
+        let exec_path = aterm_uds::process::read_exec_path(pid)?
             .to_string_lossy()
             .into_owned();
-        let argv = split_nul_list(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
+        let argv = split_nul_list(&aterm_uds::process::read_cmdline(pid)?);
         // An empty `environ` entry names no variable; only there is dropping one right.
         let mut env = split_nul_list(&std::fs::read(format!("/proc/{pid}/environ")).ok()?);
         env.retain(|kv| !kv.is_empty());
@@ -210,10 +241,136 @@ pub fn process_args(pid: u32) -> Option<ProcArgs> {
             env,
         })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let read = aterm_sysprobe::peb::parameters(pid)?;
+        let image: Vec<u16> = read.image.as_os_str().encode_wide().collect();
+        Some(ProcArgs {
+            exec_path: String::from_utf16_lossy(&image),
+            argv: split_command_line(&read.command_line, &image),
+            env: split_environment(&read.environment)?,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = pid;
         None
+    }
+}
+
+/// A Windows command line split into `argv` as the Microsoft C runtime splits it — the
+/// UCRT's `parse_command_line`, its post-2008 rules, which Rust's std and Zig's (Bun's: the
+/// native `claude.exe`) follow too. Measured 2026-10-20: `claude.exe` 2.1.304 reads
+/// `--x"y"" z` as one word, `--xy" z`, and `"--q r"""s t` as `--q r"s` and `t`, where
+/// shell32's `CommandLineToArgvW` (the pre-2008 rules) reads `--xy"`, `z` and `--q r"s t`.
+/// Pure, so the rules are tested on every platform.
+///
+/// * The line ends at its first NUL: the runtime reads a NUL-terminated string.
+/// * `argv[0]`, the program's name: every `"` turns quoting on or off and is dropped; a
+///   space or tab outside quotes ends it; a backslash is a plain character.
+/// * Then spaces and tabs between words are skipped, and each word reads: `2n` backslashes
+///   and a `"` are `n` backslashes, the `"` turning quoting on or off; `2n + 1` backslashes
+///   and a `"` are `n` backslashes and a literal `"`; backslashes before anything else are
+///   kept as they are; inside quotes `""` is a literal `"`, quoting staying on; outside
+///   quotes a space or tab ends the word. A quote never closed runs to the end, and `""`
+///   alone is an empty word, kept.
+/// * An empty line reads as the program's own path, `image`, split by the same rules (the
+///   UCRT parses `GetModuleFileNameW` there, so a path with a space splits at it); no
+///   Win32 launcher makes one (`CreateProcessW` puts the application name there when
+///   given no command line).
+#[cfg(any(windows, test))]
+fn split_command_line(line: &[u16], image: &[u16]) -> Vec<String> {
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    let blank = |u: u16| u == u16::from(b' ') || u == u16::from(b'\t');
+    let until_nul = |s: &[u16]| s.split(|&u| u == 0).next().unwrap_or_default().to_vec();
+    let mut line = until_nul(line);
+    if line.is_empty() {
+        line = until_nul(image);
+    }
+    let mut at = 0;
+    let mut argv = Vec::new();
+
+    // `argv[0]`: quotes toggle and go, nothing escapes.
+    let mut word = Vec::new();
+    let mut quoted = false;
+    while let Some(&u) = line.get(at) {
+        at += 1;
+        if u == QUOTE {
+            quoted = !quoted;
+        } else if !quoted && blank(u) {
+            break;
+        } else {
+            word.push(u);
+        }
+    }
+    argv.push(String::from_utf16_lossy(&word));
+
+    loop {
+        while line.get(at).copied().is_some_and(blank) {
+            at += 1;
+        }
+        if at >= line.len() {
+            break;
+        }
+        let mut word = Vec::new();
+        let mut quoted = false;
+        loop {
+            let mut slashes = 0;
+            while line.get(at) == Some(&BACKSLASH) {
+                slashes += 1;
+                at += 1;
+            }
+            // Whether the unit at `at` is a character of the word (a `"` that toggles
+            // quoting is not).
+            let mut kept = true;
+            if line.get(at) == Some(&QUOTE) {
+                // `& 1` is the odd test, side-stepping the toolchain's `% 2` lint.
+                if slashes & 1 == 0 {
+                    if quoted && line.get(at + 1) == Some(&QUOTE) {
+                        // `""` inside quotes: the second is a literal `"`.
+                        at += 1;
+                    } else {
+                        kept = false;
+                        quoted = !quoted;
+                    }
+                }
+                slashes /= 2;
+            }
+            word.extend(std::iter::repeat_n(BACKSLASH, slashes));
+            match line.get(at) {
+                None => break,
+                Some(&u) if !quoted && blank(u) => break,
+                Some(&u) => {
+                    if kept {
+                        word.push(u);
+                    }
+                    at += 1;
+                }
+            }
+        }
+        argv.push(String::from_utf16_lossy(&word));
+    }
+    argv
+}
+
+/// A Windows environment block (UTF-16) as its `KEY=value` strings: each ends in a NUL, and
+/// an empty one ends the block (a block whose first unit is a NUL holds none). `None` when
+/// the block ends before that empty string: a block cut short is never passed off as
+/// whole. Strings that name a drive letter's working directory (`=C:=C:\x`) are kept as
+/// they are. Pure, so it is tested on every platform.
+#[cfg(any(windows, test))]
+fn split_environment(block: &[u16]) -> Option<Vec<String>> {
+    let mut env = Vec::new();
+    let mut rest = block;
+    loop {
+        let end = rest.iter().position(|&u| u == 0)?;
+        if end == 0 {
+            return Some(env);
+        }
+        env.push(String::from_utf16_lossy(&rest[..end]));
+        rest = &rest[end + 1..];
     }
 }
 
@@ -233,98 +390,22 @@ fn split_nul_list(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Parse a `KERN_PROCARGS2` buffer: a native-endian `c_int` argc, the exec path and its
-/// NUL, NUL padding, then `argc` NUL-terminated argv strings, then the environment's
-/// NUL-terminated `KEY=value` strings until an empty string or the end. Pure, so the
-/// layout is tested on built buffers as well as on a live read.
+/// [`ProcArgs`] of one `KERN_PROCARGS2` answer, parsed by the workspace's one parser
+/// ([`aterm_uds::procargs::parse`]): every argument word, an empty one kept, and the
+/// environment up to its first empty string, each read lossily as UTF-8. `None` for a
+/// buffer cut inside its argument words, or whose exec path is no UTF-8: never a partial
+/// read passed off as whole. Pure, so the layout is tested on built buffers as well as on
+/// a live read.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
-    let argc = i32::from_ne_bytes(buf.get(..PROCARGS2_ARGC_BYTES)?.try_into().ok()?);
-    let exec_path = procargs2_exec_path(buf)?.to_string();
-    let rest = buf.get(PROCARGS2_ARGC_BYTES..)?;
-    // Every argv word takes at least one byte of `rest`, so a count past that is a buffer
-    // this parser does not recognise. No fixed cap: ARG_MAX admits more than 65 535 short
-    // words (a live `/bin/zsh` with 70 004 argv was measured).
-    let argc = usize::try_from(argc).ok().filter(|&n| n <= rest.len())?;
-    let mut at = exec_path.len();
-    while rest.get(at) == Some(&0) {
-        at += 1;
-    }
-    let mut next = || -> Option<String> {
-        let tail = rest.get(at..)?;
-        if tail.is_empty() {
-            return None;
-        }
-        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-        let s = String::from_utf8_lossy(&tail[..end]).into_owned();
-        at += end + 1;
-        Some(s)
-    };
-    // Grown, not reserved: `argc` is bounded only by the buffer, and a reservation sized by
-    // it would be the largest allocation here.
-    let mut argv = Vec::with_capacity(argc.min(1024));
-    for _ in 0..argc {
-        argv.push(next()?);
-    }
-    let mut env = Vec::new();
-    while let Some(kv) = next() {
-        if kv.is_empty() {
-            break;
-        }
-        env.push(kv);
-    }
+    let p = aterm_uds::procargs::parse(buf).filter(aterm_uds::procargs::ProcArgs2::whole)?;
+    let text = |w: &[u8]| String::from_utf8_lossy(w).into_owned();
     Some(ProcArgs {
-        exec_path,
-        argv,
-        env,
+        exec_path: std::str::from_utf8(p.exec_path).ok()?.to_string(),
+        argv: p.argv.iter().map(|w| text(w)).collect(),
+        env: p.env().map(text).collect(),
     })
-}
-
-/// The raw `KERN_PROCARGS2` buffer for `pid`, sized by `KERN_ARGMAX`.
-#[cfg(target_os = "macos")]
-fn macos_procargs2(pid: u32) -> Option<Vec<u8>> {
-    /// `KERN_PROCARGS2` (`sys/sysctl.h`): the process's `argc`, exec path, argv and env.
-    const KERN_PROCARGS2: libc::c_int = 49;
-    /// `KERN_ARGMAX`: the size that buffer must have.
-    const KERN_ARGMAX: libc::c_int = 8;
-    let pid = libc::pid_t::try_from(pid).ok()?;
-    let mut argmax: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::size_t;
-    let mut mib = [libc::CTL_KERN, KERN_ARGMAX];
-    // SAFETY: `mib` names a two-integer key; `argmax`/`len` are ours and outlive the
-    // call; no new value is written (`newp` null, `newlen` 0).
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&raw mut argmax).cast::<libc::c_void>(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    let argmax = usize::try_from(argmax).ok().filter(|&n| rc == 0 && n > 4)?;
-    let mut buf = vec![0u8; argmax];
-    let mut len = argmax as libc::size_t;
-    let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
-    // SAFETY: `buf` is `argmax` bytes and `len` says so; the kernel writes at most `len`
-    // and updates it; no new value is written.
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buf.as_mut_ptr().cast::<libc::c_void>(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    buf.truncate(len.min(argmax));
-    Some(buf)
 }
 
 #[cfg(test)]
@@ -424,27 +505,32 @@ mod tests {
 
     /// End to end through a real shell: `sh`/`zsh`/`bash`/`fish -c` each spawn this test
     /// binary to print what [`invoking_shell`] answers, with `$SHELL` pointed elsewhere; the
-    /// parent shell is what comes back.
+    /// parent shell is what comes back. Each shell is found where `aterm_spec::host::test_shell`
+    /// looks; one this host lacks ends the test COULD NOT RUN once the others ran.
+    ///
+    /// Every shell runs hermetically (`aterm_spec::host::shell_command`), in a scratch HOME
+    /// and XDG dirs: run with the real HOME, `fish -c` created the person's
+    /// `~/.config/fish/config.fish` (2026-10-20). fish's first-run state landing in the
+    /// scratch home is the proof it ran there.
     #[cfg(unix)]
     #[test]
     fn a_real_parent_shell_is_named_over_the_login_shell() {
         if std::env::var_os(PROBE_ENV).is_some() {
             return;
         }
+        let scratch = aterm_tempfile::tempdir().expect("a scratch home");
         let exe = std::env::current_exe().unwrap();
-        let mut seen = 0;
-        for (shell, expect) in [
-            // macOS's `/bin/sh` may re-exec the shell `/var/select/sh` names.
-            ("/bin/sh", "sh|bash|dash|zsh"),
-            ("/bin/zsh", "zsh"),
-            ("/bin/bash", "bash"),
-            ("/opt/homebrew/bin/fish", "fish"),
-            ("/usr/bin/fish", "fish"),
-            ("/usr/local/bin/fish", "fish"),
-        ] {
-            if !std::path::Path::new(shell).exists() {
-                continue;
+        // macOS's `/bin/sh` may re-exec the shell `/var/select/sh` names.
+        let mut lanes = vec![(std::path::PathBuf::from("/bin/sh"), "sh|bash|dash|zsh")];
+        let mut absent = Vec::new();
+        for shell in ["zsh", "bash", "fish"] {
+            match aterm_spec::host::test_shell(shell) {
+                Some(path) => lanes.push((path, shell)),
+                None => absent.push(shell),
             }
+        }
+        for (shell, expect) in &lanes {
+            let shell = shell.display();
             // `exec` keeps the shell as the parent only when the shell does not exec the
             // command itself (`sh -c 'cmd'` may); a `;` after the command stops that.
             let script = format!(
@@ -452,7 +538,7 @@ mod tests {
                 exe.display(),
                 "caller_shell::tests::probe_prints_the_invoking_shell_when_asked"
             );
-            let out = std::process::Command::new(shell)
+            let out = aterm_spec::host::shell_command(shell.to_string(), scratch.path())
                 .arg("-c")
                 .arg(&script)
                 .env(PROBE_ENV, "1")
@@ -468,12 +554,15 @@ mod tests {
                 expect.split('|').any(|e| e == line),
                 "{shell}: expected one of {expect}, got {line}: {stdout}"
             );
-            seen += 1;
         }
-        assert!(
-            seen >= 2,
-            "at least sh and one of zsh/bash exist on a test host"
-        );
+        if !absent.contains(&"fish") {
+            assert!(
+                scratch.path().join(".config/fish").is_dir(),
+                "fish wrote its first-run state somewhere other than the scratch home"
+            );
+        }
+        // A shell this host lacks did not run: the lanes it has ran first.
+        aterm_spec::host::could_not_run_without(&absent);
     }
 
     /// The probe half of the test above: the same test binary, run as the child.
@@ -538,26 +627,13 @@ mod tests {
     }
 
     /// The exe name needs only the exec path: a buffer the whole-layout parser refuses
-    /// still names its executable; only a buffer with no exec path names nothing.
+    /// (cut inside its argument words) still names its executable.
     #[test]
     fn the_exe_name_reads_the_exec_path_alone() {
         let mut short = 5i32.to_ne_bytes().to_vec();
         short.extend_from_slice(b"/opt/homebrew/bin/fish\0\0a\0b\0");
         assert_eq!(parse_procargs2(&short), None, "fewer argv than argc");
         assert_eq!(exe_name_of_procargs2(&short).as_deref(), Some("fish"));
-        let mut negative = (-1i32).to_ne_bytes().to_vec();
-        negative.extend_from_slice(b"/bin/bash\0");
-        assert_eq!(exe_name_of_procargs2(&negative).as_deref(), Some("bash"));
-        assert_eq!(
-            exe_name_of_procargs2(&[1, 0, 0, 0]),
-            None,
-            "nothing after argc"
-        );
-        assert_eq!(
-            exe_name_of_procargs2(&[1, 0, 0, 0, b'/', b'x']),
-            None,
-            "no NUL"
-        );
     }
 
     /// Linux's `/proc/<pid>/cmdline` keeps an empty argument, as the macOS parser does: only
@@ -644,5 +720,348 @@ mod tests {
             argv.ends_with(&tail.map(String::from)),
             "the empty argument must read back in place: {argv:?}"
         );
+    }
+
+    /// The UTF-16 of `s`.
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    /// A WINDOWS COMMAND LINE SPLITS AS THE C RUNTIME SPLITS IT (the UCRT's post-2008
+    /// rules): the table of Microsoft's "Parsing C command-line arguments", the three lines
+    /// `claude.exe` 2.1.304 was measured reading (2026-10-20), where `CommandLineToArgvW`
+    /// reads otherwise, the program name's own rule (quotes toggle, nothing escapes), empty
+    /// and unclosed words, blanks, backslashes before anything but a quote, the NUL that ends
+    /// the line, and an empty line, which reads as the program's own path. Pure: every
+    /// platform runs it.
+    #[test]
+    fn a_windows_command_line_splits_as_the_c_runtime_splits_it() {
+        let split = |line: &str| split_command_line(&wide(line), &wide(r"C:\x\prog.exe"));
+        for (line, want) in [
+            (r#"prog "abc" d e"#, &["prog", "abc", "d", "e"][..]),
+            (r#"prog a\\b d"e f"g h"#, &["prog", r"a\\b", "de fg", "h"]),
+            (r#"prog a\\\"b c d"#, &["prog", r#"a\"b"#, "c", "d"]),
+            (r#"prog a\\\\"b c" d e"#, &["prog", r"a\\b c", "d", "e"]),
+            (r#"prog a"b"" c d"#, &["prog", r#"ab" c d"#]),
+            (r#"claude --x"y"" z"#, &["claude", r#"--xy" z"#]),
+            (r#"claude "--q r"""s t"#, &["claude", r#"--q r"s"#, "t"]),
+            (r#"claude --w\\"v u""#, &["claude", r"--w\v u"]),
+            (
+                r#""C:\Program Files\x\claude.exe" --y"#,
+                &[r"C:\Program Files\x\claude.exe", "--y"],
+            ),
+            (r#"C:\a\"b c"\d.exe e"#, &[r"C:\a\b c\d.exe", "e"]),
+            (r#""a"b c"#, &["ab", "c"]),
+            ("\tprog", &["", "prog"]),
+            (r#"prog "" x """#, &["prog", "", "x", ""]),
+            (r#"prog "a b"#, &["prog", "a b"]),
+            (r#"prog ""#, &["prog", ""]),
+            ("prog\t a  \tb ", &["prog", "a", "b"]),
+            (r"prog \\srv\share\ x", &["prog", r"\\srv\share\", "x"]),
+            (r#"prog "C:\x\\" y"#, &["prog", r"C:\x\", "y"]),
+            ("prog a\0b c", &["prog", "a"]),
+        ] {
+            assert_eq!(split(line), want, "{line:?}");
+        }
+        assert_eq!(
+            split_command_line(&[], &wide(r"C:\x\prog.exe")),
+            [r"C:\x\prog.exe"]
+        );
+        assert_eq!(
+            split_command_line(&wide("\0junk"), &wide(r"C:\Program Files\p.exe")),
+            [r"C:\Program", r"Files\p.exe"],
+            "the C runtime splits its own path at a space"
+        );
+    }
+
+    /// A WINDOWS ENVIRONMENT BLOCK READS AS ITS STRINGS UP TO THE EMPTY ONE: the drive
+    /// letters' working directories (`=C:=C:\x`) are entries, found by their own names, and
+    /// a value may hold `=`; what follows the empty string is not read; a block that ends
+    /// before it is refused whole; a block that is only its end holds none. Pure.
+    #[test]
+    fn a_windows_environment_block_reads_whole_or_not_at_all() {
+        let block = wide("=C:=C:\\work\0=D:=D:\\\0Path=C:\\bin;C:\\x\0K=v=w\0\0junk\0");
+        let env = split_environment(&block).expect("a whole block");
+        assert_eq!(
+            env,
+            ["=C:=C:\\work", "=D:=D:\\", "Path=C:\\bin;C:\\x", "K=v=w"]
+        );
+        let args = ProcArgs {
+            env,
+            ..ProcArgs::default()
+        };
+        assert_eq!(args.env_var("=C:"), Some("C:\\work"));
+        assert_eq!(args.env_var("K"), Some("v=w"));
+        assert_eq!(args.env_var("C:"), None, "the name is `=C:`");
+        assert_eq!(split_environment(&wide("A=1\0B=2\0")), None, "cut short");
+        assert_eq!(split_environment(&wide("A=1\0B=2")), None, "cut mid-string");
+        assert_eq!(split_environment(&[]), None);
+        assert_eq!(split_environment(&wide("\0")), Some(Vec::new()));
+    }
+
+    /// A VARIABLE IS FOUND BY ITS WHOLE NAME, AND ON WINDOWS BLIND TO CASE as the system
+    /// folds a name, one character to one (`ı` is `I`), the first such entry winning: a
+    /// prefix or a longer name is not the name. Pure, through an injected fold; then through
+    /// this platform's own rule.
+    #[test]
+    fn a_variable_is_found_by_its_whole_name_and_on_windows_blind_to_case() {
+        let upper = |c: char| {
+            let mut up = c.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(u), None) => u,
+                _ => c,
+            }
+        };
+        let exact: fn(char) -> char = std::convert::identity;
+        assert_eq!(env_value("Path=C:\\bin", "PATH", upper), Some("C:\\bin"));
+        assert_eq!(env_value("Path=C:\\bin", "PATH", exact), None);
+        assert_eq!(env_value("Path=C:\\bin", "Path", exact), Some("C:\\bin"));
+        assert_eq!(env_value("PATHEXT=.COM", "PATH", upper), None, "longer");
+        assert_eq!(env_value("PAT=x", "PATH", upper), None, "shorter");
+        assert_eq!(env_value("PATH", "PATH", upper), None, "no `=`");
+        assert_eq!(env_value("ıd=x", "ID", upper), Some("x"));
+        assert_eq!(env_value("=C:=C:\\x", "=c:", upper), Some("C:\\x"));
+        let args = ProcArgs {
+            env: vec!["Path=C:\\bin".into(), "PATH=second".into()],
+            ..ProcArgs::default()
+        };
+        assert_eq!(args.env_var("Path"), Some("C:\\bin"));
+        assert_eq!(
+            args.env_var("PATH"),
+            Some(if cfg!(windows) { "C:\\bin" } else { "second" })
+        );
+    }
+
+    /// The probe half of [`process_args_reads_a_live_process_as_its_own_runtime_split_it`]:
+    /// this test binary, run as the child.
+    #[cfg(windows)]
+    const ARGS_PROBE_ENV: &str = "ATPKG_PROCESS_ARGS_PROBE";
+
+    /// `s` as the hex of its UTF-8, one line's worth whatever it holds.
+    #[cfg(windows)]
+    fn hex(s: &str) -> String {
+        s.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// [`hex`]'s inverse.
+    #[cfg(windows)]
+    fn unhex(s: &str) -> String {
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect();
+        String::from_utf8(bytes).expect("UTF-8")
+    }
+
+    /// Run as the child (with [`ARGS_PROBE_ENV`] set): print the argv this process's own
+    /// runtime split from its command line (Rust's std: the C runtime's post-2008 rules) and
+    /// its environment as std reads it (`GetEnvironmentStringsW`), then wait for stdin to
+    /// close, so the parent reads it alive.
+    #[cfg(windows)]
+    #[test]
+    fn probe_prints_its_own_argv_and_environment_when_asked() {
+        use std::io::Read as _;
+        if std::env::var_os(ARGS_PROBE_ENV).is_none() {
+            return;
+        }
+        for arg in std::env::args() {
+            println!("arg={}", hex(&arg));
+        }
+        for (k, v) in std::env::vars() {
+            println!("env={}", hex(&format!("{k}={v}")));
+        }
+        println!("probe=ready");
+        let _ = std::io::stdin().read_to_end(&mut Vec::new());
+    }
+
+    /// A LIVE PROCESS READS BACK AS ITS OWN RUNTIME SPLIT IT, ITS ENVIRONMENT WHOLE: this test
+    /// binary, run as a child with each raw command line below (the C runtime's hard cases,
+    /// the three `claude.exe` was measured on), prints the argv and the environment its own
+    /// std read, and `process_args` of it — its process environment block, read from here —
+    /// names the same words, the same `KEY=value` strings in the same order, its image as
+    /// its exec path, and a variable set for it, found by its name in another case.
+    #[cfg(windows)]
+    #[test]
+    fn process_args_reads_a_live_process_as_its_own_runtime_split_it() {
+        use std::io::BufRead as _;
+        use std::os::windows::process::CommandExt as _;
+        if std::env::var_os(ARGS_PROBE_ENV).is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        for raw in [
+            r#"--x"y"" z"#,
+            r#""--q r"""s t"#,
+            r#"--w\\"v u""#,
+            r#"a\\\\"b c" "" d"e f"g \\srv\x\ "C:\y\\""#,
+        ] {
+            let mut child = aterm_uds::spawnfd::command(&exe)
+                .args([
+                    "--exact",
+                    "--nocapture",
+                    "--quiet",
+                    "--test-threads=1",
+                    "caller_shell::tests::probe_prints_its_own_argv_and_environment_when_asked",
+                    "--",
+                ])
+                .raw_arg(raw)
+                .env(ARGS_PROBE_ENV, "1")
+                .env("ATPKG_Probe_Var", "a=b c")
+                .stdin(aterm_uds::spawnfd::Stdio::piped())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the probe");
+            let (mut argv, mut env, mut ready) = (Vec::new(), Vec::new(), false);
+            let out = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+            for line in out.lines() {
+                let line = line.expect("a line");
+                if line == "probe=ready" {
+                    ready = true;
+                    break;
+                }
+                if let Some(h) = line.strip_prefix("arg=") {
+                    argv.push(unhex(h));
+                } else if let Some(h) = line.strip_prefix("env=") {
+                    env.push(unhex(h));
+                }
+            }
+            let read = process_args(child.id());
+            drop(child.stdin.take());
+            let _ = child.wait();
+            assert!(ready, "{raw}: the probe never said it was ready: {argv:?}");
+            let read = read.unwrap_or_else(|| panic!("{raw}: the probe's block did not read"));
+            assert_eq!(read.argv, argv, "{raw}");
+            assert_eq!(read.env, env, "{raw}");
+            assert_eq!(read.env_var("ATPKG_PROBE_VAR"), Some("a=b c"), "{raw}");
+            assert_eq!(
+                std::fs::canonicalize(&read.exec_path).ok(),
+                std::fs::canonicalize(&exe).ok(),
+                "{raw}: {}",
+                read.exec_path
+            );
+        }
+    }
+
+    /// A 32-BIT PROCESS UNDER WOW64 IS READ THROUGH ITS OWN 32-BIT BLOCK, the one its
+    /// runtime writes: the system's 32-bit `cmd.exe` (`SysWOW64`), started with a quoted
+    /// word and a variable in a scratch folder, then `cd`ing into `sub` and `set`ting a
+    /// second variable itself, reads back its words, both variables, its image and `sub` as
+    /// its working directory. Its 64-bit block (WOW64's copy, which a reader of the native
+    /// layout alone reads) never learns the second variable or `sub`. No 32-bit process of
+    /// this account ran when this was written (106 native of 106, 2026-10-20), so the test
+    /// makes one.
+    #[cfg(windows)]
+    #[test]
+    fn a_wow64_process_is_read_through_its_32_bit_block() {
+        use std::os::windows::process::CommandExt as _;
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let cmd = std::path::Path::new(&root).join("SysWOW64").join("cmd.exe");
+        assert!(cmd.is_file(), "no 32-bit cmd.exe at {}", cmd.display());
+        let dir = aterm_tempfile::tempdir().expect("a scratch folder");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("sub");
+        let tail = r#"echo "a b" c & cd sub & set ATPKG_LATER=1"#;
+        let mut child = aterm_uds::spawnfd::command(&cmd)
+            .args(["/d", "/q", "/k"])
+            .raw_arg(tail)
+            .env("ATPKG_WOW64_PROBE", "x y=z")
+            .current_dir(dir.path())
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the 32-bit cmd.exe");
+        // Until it has set its own variable (a hang detector: it runs one line).
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let (read, cwd) = loop {
+            let read = process_args(child.id());
+            let later = read.as_ref().and_then(|r| r.env_var("ATPKG_LATER"));
+            if later.is_some() || std::time::Instant::now() >= deadline {
+                break (read, aterm_sysprobe::process_cwd(child.id()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        let read = read.expect("the 32-bit process's block read within a minute");
+        assert_eq!(
+            read.env_var("ATPKG_LATER"),
+            Some("1"),
+            "the variable it set itself was never read"
+        );
+        assert_eq!(read.env_var("ATPKG_WOW64_PROBE"), Some("x y=z"));
+        assert_eq!(
+            read.argv,
+            [
+                &cmd.display().to_string(),
+                "/d",
+                "/q",
+                "/k",
+                "echo",
+                "a b",
+                "c",
+                "&",
+                "cd",
+                "sub",
+                "&",
+                "set",
+                "ATPKG_LATER=1"
+            ]
+        );
+        assert!(
+            read.exec_path
+                .to_ascii_lowercase()
+                .ends_with(r"\syswow64\cmd.exe"),
+            "{}",
+            read.exec_path
+        );
+        let cwd = cwd.expect("its working directory");
+        assert_eq!(
+            std::fs::canonicalize(&cwd).ok(),
+            std::fs::canonicalize(&sub).ok(),
+            "{}",
+            cwd.display()
+        );
+    }
+
+    /// A MEASUREMENT, run by hand (`-- --ignored --nocapture
+    /// process_args_of_every_process_of_this_account`), never a gate: every process of this
+    /// account read as `process_args` reads it, how many read and how long it took; each
+    /// that did not read named by its image; how far each environment block runs past its
+    /// end (`EnvironmentSize` against the empty string).
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn process_args_of_every_process_of_this_account() {
+        let pids = aterm_uds::holders::uid_pids().expect("this account's processes");
+        let started = std::time::Instant::now();
+        let mut read = 0;
+        let mut refused = Vec::new();
+        for &pid in &pids {
+            match process_args(pid) {
+                Some(_) => read += 1,
+                None => refused.push(pid),
+            }
+        }
+        let took = started.elapsed();
+        eprintln!(
+            "{} processes: {read} read, {} not, in {took:?}",
+            pids.len(),
+            refused.len()
+        );
+        for pid in refused {
+            eprintln!("  not read: {pid} {:?}", aterm_uds::holders::exe_of(pid));
+        }
+        let mut tails = std::collections::BTreeMap::new();
+        for &pid in &pids {
+            if let Some(p) = aterm_sysprobe::peb::parameters(pid) {
+                let end = p.environment.windows(2).position(|w| w == [0, 0]);
+                let tail = end.map(|e| p.environment.len() - (e + 2));
+                *tails.entry(tail).or_insert(0) += 1;
+            }
+        }
+        eprintln!("units past the block's end (None: no end): {tails:?}");
     }
 }

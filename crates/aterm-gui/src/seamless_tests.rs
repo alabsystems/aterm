@@ -911,6 +911,7 @@ fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
         journal_key: None,
         task: None,
         status_seen: None,
+        autopilot_end: None,
     }
 }
 
@@ -1010,6 +1011,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                 root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                     sid: None,
                     lineage: None,
+                    log_ep: None,
                     cwd: None,
                     title: format!("session-{id}"),
                     profile: None,
@@ -1022,6 +1024,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     questions: None,
                     autopilot: None,
                     land_at: None,
+                    autopilot_by: None,
                     identity: None,
                     theme: None,
                     agent: None,
@@ -1317,7 +1320,14 @@ fn the_holder_fence_crosses_the_meta_wire_and_a_bad_one_costs_only_the_fence() {
         .insert("holder".to_string(), aterm_json::Value::from("garbage"));
     let parsed = parse_checkpoint_meta(&carry(aterm_json::to_string(&value).unwrap()))
         .expect("a bad holder never costs the screen");
-    assert!(parsed.holder.is_empty());
+    // It costs the fence, and is no seed authority either.
+    assert_eq!(
+        parsed.holder,
+        aterm_core::terminal::HolderRepr {
+            seed_untrusted: true,
+            ..aterm_core::terminal::HolderRepr::default()
+        }
+    );
     assert_eq!(parsed.rows, 6);
 
     let quiet = aterm_core::terminal::Terminal::new(6, 40);
@@ -1485,9 +1495,10 @@ fn decoded_cell_budget_accepts_exact_max_and_rejects_max_plus_one() {
     assert!(WireCaps::current().admit(&mut 0, 99, 338, 0, true).is_ok());
 }
 
-/// A ROLLBACK is the one hop whose consumer is older than its producer, so it
-/// is the one hop priced at the frozen caps; every other hop — an upgrade, or
-/// a same-build relaunch — gets this build's own (plan P0-4a).
+/// A ROLLBACK is the one hop whose consumer is older than its producer, so a
+/// rollback to a build before v0.93.0 is the one hop priced at the frozen
+/// caps; every other hop — an upgrade, or a same-build relaunch — gets this
+/// build's own (plan P0-4a).
 #[test]
 fn only_a_downgrade_target_gets_the_legacy_caps() {
     assert_eq!(WireCaps::for_hop(1_000, 999), WireCaps::legacy());
@@ -1498,6 +1509,83 @@ fn only_a_downgrade_target_gets_the_legacy_caps() {
         WireCaps::current(),
         "a same-image relaunch is not a downgrade"
     );
+}
+
+/// ROUND EIGHT'S LEAD U24: a rollback to v0.93.0 or later is priced at the
+/// consumer it reaches, not at v0.91.0's. Every consumer from v0.93.0 on
+/// admits this build's per-grid cap (`git show v0.93.0:crates/aterm-gui/src/
+/// seamless.rs`: `MAX_HANDOFF_GRID_CELLS = MAX_HANDOFF_AGGREGATE_GRID_CELLS /
+/// 2`, the aggregate 4 Mi cells) and bounds a line's attrs by its character
+/// count (`decode_line_strict` there is this build's, comments aside), and
+/// from v0.94.0 on imports the history sidecar (`handoff_history::incoming`;
+/// v0.101.0 the held panes', `incoming_held`). A hop to such a build was
+/// carried blank past 32 Ki cells and without its scrollback.
+///
+/// FAILS WITHOUT THE FIX: the 5K full-screen pane came back `Repaint` at
+/// 24x80, the styled cluster row `Repaint`, and no sidecar was exported.
+#[test]
+fn a_rollback_to_a_relaxed_consumer_carries_the_exact_screen_and_history() {
+    use aterm_core::terminal::Terminal;
+
+    use crate::handoff_history::{exports_for_target, exports_held_for_target};
+
+    // RELEASES.ledger.
+    let (v0_92, v0_93, v0_94, v0_98, v0_100, v0_101) = (
+        1_790_278_596,
+        1_790_305_290,
+        1_790_526_323,
+        1_790_607_299,
+        1_790_807_622,
+        1_791_501_389,
+    );
+    let running = crate::running_build_number().max(v0_101 + 1);
+
+    // A native full-screen window on a 5K display at the default font.
+    let mut full_screen = Terminal::new(99, 338);
+    full_screen.process(b"$ make\r\nbuilding...\r\n");
+    // A full-width styled row holding a combining mark.
+    let mut cluster = Terminal::new(55, 149);
+    cluster.process(format!("\x1b[1m{}e\u{301}\x1b[0m", "a".repeat(148)).as_bytes());
+    for target in [v0_93, v0_98, v0_101, running - 1] {
+        let caps = WireCaps::for_hop(running, target);
+        assert_eq!(caps.per_grid_cells(), WireCaps::current().per_grid_cells());
+        let (carried, rung, cause) = carry_for_wire(&full_screen, 0, 0, &mut 0, caps);
+        assert_eq!(rung, CarryRung::Full, "{target}: {cause:?}");
+        assert_eq!((carried.rows, carried.cols), (99, 338), "{target}");
+        let (_, rung, cause) = carry_for_wire(&cluster, 0, 0, &mut 0, caps);
+        assert_eq!(rung, CarryRung::Full, "{target}: {cause:?}");
+        // What it restores beyond the screen is not known from here (the
+        // parser and output-state carries are the unix handoff's).
+        #[cfg(unix)]
+        assert!(
+            !caps.carries_parser() && !caps.carries_output_state(),
+            "{target}"
+        );
+    }
+    for target in [v0_94, v0_98, v0_100, running - 1] {
+        assert!(exports_for_target(running, target), "{target}");
+    }
+    for target in [v0_101, running - 1] {
+        assert!(exports_held_for_target(running, target), "{target}");
+    }
+    // CONTROL: v0.92.0 and every build before it enforce the frozen caps, and
+    // nothing before v0.94.0 (v0.101.0 for a held pane) imports a sidecar.
+    for target in [0, v0_92, v0_93 - 1] {
+        assert_eq!(WireCaps::for_hop(running, target), WireCaps::legacy());
+        let (_, rung, _) = carry_for_wire(
+            &full_screen,
+            0,
+            0,
+            &mut 0,
+            WireCaps::for_hop(running, target),
+        );
+        assert_eq!(rung, CarryRung::Repaint, "{target}");
+    }
+    assert!(!exports_for_target(running, v0_94 - 1));
+    assert!(!exports_held_for_target(running, v0_100));
+    // A successor at least as new as this build is this build.
+    assert_eq!(WireCaps::for_hop(running, running), WireCaps::current());
+    assert!(exports_for_target(running, running) && exports_held_for_target(running, running));
 }
 
 /// v0.91.0's strict line decoder, transcribed (`git show
@@ -2026,9 +2114,20 @@ fn a_refused_grid_write_carries_its_io_error_kind_out() {
 /// review): the Commit audits each as dropped
 /// (`App::audit_connections_left_out`); a drop written with the manifest was
 /// false for every attempt that then stood down, and repeated at each retry.
+///
+/// IN A CHILD PROCESS ([`run_in_children`]), as
+/// `an_oversized_manifest_degrades_sessions_instead_of_being_written` is: the
+/// 50,000 rows' manifests are written and measured under [`ENV_LOCK`] (0.8 s
+/// alone, 5.2 s in the `-p aterm-gui --lib` binary), and every test of this
+/// module the runner started meanwhile parked on the lock.
 #[test]
 #[cfg(unix)]
 fn connections_give_way_before_held_panes_and_the_mailbox() {
+    const CHILD: &str = "ATERM_CONNECTIONS_GIVE_WAY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        run_in_children(CHILD, 1);
+        return;
+    }
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _scratch = ScratchEnv::home("conns-first");
     let sid = "s-00000000010000050505";
@@ -2175,9 +2274,18 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
 ///
 /// CONTROL, the same desk over by exactly the rows' measured bytes: the
 /// connections alone bring it under, so they go and the pane crosses.
+///
+/// IN A CHILD PROCESS ([`run_in_children`]), as
+/// `connections_give_way_before_held_panes_and_the_mailbox` is (0.6 s alone,
+/// under [`ENV_LOCK`] throughout).
 #[test]
 #[cfg(unix)]
 fn connections_that_cannot_cover_the_excess_measured_are_kept() {
+    const CHILD: &str = "ATERM_CONNECTIONS_MEASURED_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        run_in_children(CHILD, 1);
+        return;
+    }
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _scratch = ScratchEnv::home("conns-measured");
     // Session ids as `SessionId::generate` spells them: the rows' real shape.
@@ -2706,6 +2814,45 @@ fn parent_liveness_tracks_the_process_not_the_pid() {
         !attested.still_alive(),
         "the witness must go false when the attested process exits — this is \
          the fail-stop that stops a readerless candidate outliving its parent"
+    );
+}
+
+/// The handoff bind's wait for its predecessor (`exited_by`): a running
+/// process holds it to the deadline (the control), its exit ends it with the
+/// deadline a minute out (a hang detector, not a budget) and before anyone
+/// reaps it, and a pid whose birth no longer matches has exited already.
+#[test]
+#[cfg(target_os = "macos")]
+fn the_exit_wait_ends_at_the_attested_exit_and_not_before() {
+    use aterm_spec::wait::MUST_HAPPEN;
+    use std::time::{Duration, Instant};
+    let mut watched = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("600")
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("spawn the watched process");
+    let pid = libc::pid_t::try_from(watched.id()).expect("watched pid");
+    let birth = read_process_birth(pid).expect("a live process has a birth record");
+    let attested = AttestedParent {
+        pid,
+        witness: ParentWitness::Birth(birth),
+    };
+    assert!(
+        !attested.exited_by(Instant::now() + Duration::from_millis(30)),
+        "a running process has not exited at the deadline"
+    );
+    let waiter = std::thread::spawn(move || attested.exited_by(Instant::now() + MUST_HAPPEN));
+    watched.kill().expect("kill the watched process");
+    assert!(
+        waiter.join().expect("the wait returns"),
+        "the exit ends the wait"
+    );
+    watched.wait().expect("reap the watched process");
+    assert!(
+        AttestedParent::recycled_for_test(pid).exited_by(Instant::now() + MUST_HAPPEN),
+        "a birth that no longer matches is an exit already"
     );
 }
 
@@ -4732,6 +4879,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
             TerminalLeafRestore {
                 sid: None,
                 lineage: None,
+                log_ep: None,
                 cwd: None,
                 title: String::new(),
                 profile: None,
@@ -4744,6 +4892,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 questions: None,
                 autopilot: None,
                 land_at: None,
+                autopilot_by: None,
                 identity: None,
                 theme: None,
                 agent: None,

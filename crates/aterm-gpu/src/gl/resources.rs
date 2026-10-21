@@ -287,7 +287,7 @@ impl GlDevice {
     }
 
     /// Upload rows `[y0, y0 + rows)` at full width from `bytes`, tightly
-    /// packed at `bytes_per_row`.
+    /// packed at `bytes_per_row`: [`Self::upload_region`]'s full-width case.
     pub(crate) fn upload_rows(
         &self,
         tex: &GlTexture,
@@ -297,25 +297,42 @@ impl GlDevice {
         bytes_per_row: u32,
         width: u32,
     ) -> Result<(), String> {
-        if rows == 0 {
+        self.upload_region(tex, 0, y0, width, rows, bytes, bytes_per_row)
+    }
+
+    /// Upload the `w × h` region at `(x, y)` from `bytes`, rows
+    /// `bytes_per_row` apart, at unpack alignment 1 (an R8 region of odd
+    /// width is legal).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upload_region(
+        &self,
+        tex: &GlTexture,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        bytes: &[u8],
+        bytes_per_row: u32,
+    ) -> Result<(), String> {
+        if w == 0 || h == 0 {
             return Ok(());
         }
         let bpp = tex.format.bytes;
         if !bytes_per_row.is_multiple_of(bpp)
-            || bytes_per_row < width * bpp
-            || width > tex.width
-            || y0.checked_add(rows).is_none_or(|end| end > tex.height)
+            || bytes_per_row < w * bpp
+            || x.checked_add(w).is_none_or(|end| end > tex.width)
+            || y.checked_add(h).is_none_or(|end| end > tex.height)
         {
             return Err(format!(
-                "gl: upload of {width}x{rows} at row {y0} (stride {bytes_per_row}) does not \
+                "gl: upload of {w}x{h} at ({x}, {y}) (stride {bytes_per_row}) does not \
                  fit a {}x{} texture of {bpp}-byte texels",
                 tex.width, tex.height
             ));
         }
-        let need = bytes_per_row as usize * (rows as usize - 1) + (width * bpp) as usize;
+        let need = bytes_per_row as usize * (h as usize - 1) + (w * bpp) as usize;
         if bytes.len() < need {
             return Err(format!(
-                "gl: upload of {rows} rows needs {need} bytes, got {}",
+                "gl: upload of {h} rows needs {need} bytes, got {}",
                 bytes.len()
             ));
         }
@@ -331,10 +348,10 @@ impl GlDevice {
             (gl.tex_sub_image_2d)(
                 ffi::GL_TEXTURE_2D,
                 0,
-                0,
-                y0 as GLint,
-                width as GLint,
-                rows as GLint,
+                x as GLint,
+                y as GLint,
+                w as GLint,
+                h as GLint,
                 tex.format.format,
                 tex.format.ty,
                 bytes.as_ptr().cast(),

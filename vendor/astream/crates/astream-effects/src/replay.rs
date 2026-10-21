@@ -55,6 +55,18 @@ pub enum ReplayDivergence {
         /// `"Mono"`, `"Exchange"`, `"Emit"`).
         expected: &'static str,
     },
+    /// The program ended with records left on the tape: it did less than the
+    /// recorded run did — an output it no longer says, a read it no longer
+    /// makes, a flag it no longer polls up to the read that saw it rise. Only
+    /// [`ReplaySeam::finish`] refuses with it, because no door can see that
+    /// the program has stopped asking; only the program knows where it ends.
+    Unreached {
+        /// How many records the program consumed: the index of `found`
+        /// (`#N` counting from 0).
+        position: usize,
+        /// The first record the program never reached.
+        found: EffectRecord,
+    },
     /// The next recorded effect is of a different kind than the one asked for.
     KindMismatch {
         /// The effect kind the program asked for.
@@ -99,8 +111,8 @@ pub enum ReplayDivergence {
         emitted: Vec<u8>,
     },
     /// A [`KeyedView`](crate::KeyedView) holds no exchange through this door
-    /// with this request at or before the asked position. Never a reason to
-    /// ask the live world: the tape simply does not know.
+    /// with this request among the records it was asked to look in. Never a
+    /// reason to ask the live world: the tape simply does not know.
     Unrecorded {
         /// The door asked.
         door: String,
@@ -113,6 +125,16 @@ impl PartialEq for ReplayDivergence {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Exhausted { expected: a }, Self::Exhausted { expected: b }) => a == b,
+            (
+                Self::Unreached {
+                    position: pa,
+                    found: fa,
+                },
+                Self::Unreached {
+                    position: pb,
+                    found: fb,
+                },
+            ) => pa == pb && fa == fb,
             (
                 Self::KindMismatch {
                     expected: ea,
@@ -333,6 +355,11 @@ impl fmt::Debug for ReplayDivergence {
                 .debug_struct("Exhausted")
                 .field("expected", expected)
                 .finish(),
+            ReplayDivergence::Unreached { position, found } => f
+                .debug_struct("Unreached")
+                .field("position", position)
+                .field("found", &Brief(found))
+                .finish(),
             ReplayDivergence::KindMismatch { expected, found } => f
                 .debug_struct("KindMismatch")
                 .field("expected", expected)
@@ -390,6 +417,12 @@ impl fmt::Display for ReplayDivergence {
                 f,
                 "replay: effect tape exhausted — the program asked for a {expected} effect \
                  beyond what was recorded"
+            ),
+            ReplayDivergence::Unreached { position, found } => write!(
+                f,
+                "replay: the program ended with the tape unfinished — record {position}, {:?}, \
+                 and any after it were never reached",
+                Brief(found)
             ),
             ReplayDivergence::KindMismatch { expected, found } => {
                 write!(
@@ -472,7 +505,10 @@ fn mismatch(expected: &'static str, found: &EffectRecord) -> ReplayDivergence {
 ///
 /// A kind mismatch, a diverged path, door, request or output, or an exhausted
 /// tape is refused with a [`ReplayDivergence`], so the program stops rather
-/// than silently reading the real world.
+/// than silently reading the real world. A tape the program ends before
+/// reaching its end is refused too, but only where the program says it has
+/// ended: [`finish`](ReplaySeam::finish), which a replay of a whole run calls
+/// last — without it, a replay has checked a prefix of the tape, not the tape.
 ///
 /// A refusal **consumes nothing**: after one, [`position`](ReplaySeam::position)
 /// still names the record the program could not take and
@@ -517,6 +553,34 @@ impl<I: Iterator<Item = EffectRecord>> ReplaySeam<I> {
     /// How many records the program has consumed: the index of the next one.
     pub fn position(&self) -> usize {
         self.consumed
+    }
+
+    /// The program has ended: `Ok` when it consumed every record on the tape,
+    /// else [`ReplayDivergence::Unreached`] naming the first record it never
+    /// reached. Like every refusal it consumes nothing, so
+    /// [`position`](ReplaySeam::position) and [`peek`](ReplaySeam::peek) still
+    /// name that record afterwards, and asking twice gives the same answer.
+    ///
+    /// The doors catch a tape that is too SHORT where the program finds it
+    /// ended ([`Exhausted`](ReplayDivergence::Exhausted), an output past the
+    /// end included). A tape that is too LONG no door can see, because the
+    /// program simply stops asking: the records it never reached are what the
+    /// recorded run went on to do — a last output the replayed one no longer
+    /// says, a read it no longer makes, or a flag it stopped polling before
+    /// the read that saw it rise. That last is silent at every door by design:
+    /// [`raised`](EffectSeam::raised) answers false and leaves a `Raised`
+    /// record it has not yet reached, so a run that polls once where the
+    /// recorded run polled twice takes the not-stopped path and returns `Ok`.
+    /// Only the program knows where it ends, so the check is a call it makes
+    /// there.
+    pub fn finish(&mut self) -> Result<(), ReplayDivergence> {
+        match self.tape.peek() {
+            None => Ok(()),
+            Some(found) => Err(ReplayDivergence::Unreached {
+                position: self.consumed,
+                found: found.clone(),
+            }),
+        }
     }
 
     /// Consume the next record if it is of the `expected` kind and `read`
@@ -687,7 +751,10 @@ impl<I: Iterator<Item = EffectRecord>> EffectSeam for ReplaySeam<I> {
     /// has ended — is a read the recording saw answer false, so it answers
     /// false and leaves the record for whatever the program asks next. A
     /// `Raised` record the program never reaches is caught there instead, as
-    /// the kind mismatch of the next door it does use.
+    /// the kind mismatch of the next door it does use — or, when it uses no
+    /// door after it, by [`finish`](ReplaySeam::finish), as the record left
+    /// on the tape. A replay that returns without calling `finish` never
+    /// learns of it.
     fn raised(
         &mut self,
         door: &str,

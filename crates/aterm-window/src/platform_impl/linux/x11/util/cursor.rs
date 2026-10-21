@@ -144,11 +144,8 @@ impl CustomCursor {
             (*ximage).delay = 0;
 
             let dst = slice::from_raw_parts_mut((*ximage).pixels, cursor.0.rgba.len() / 4);
-            for (dst, chunk) in dst.iter_mut().zip(cursor.0.rgba.chunks_exact(4)) {
-                *dst = (chunk[0] as u32) << 16
-                    | (chunk[1] as u32) << 8
-                    | (chunk[2] as u32)
-                    | (chunk[3] as u32) << 24;
+            for (dst, &[r, g, b, a]) in dst.iter_mut().zip(cursor.0.rgba.as_chunks::<4>().0) {
+                *dst = (r as u32) << 16 | (g as u32) << 8 | (b as u32) | (a as u32) << 24;
             }
 
             let cursor =

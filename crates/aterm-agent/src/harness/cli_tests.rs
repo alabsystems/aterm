@@ -288,6 +288,64 @@ fn the_grammar_parses_what_the_help_text_advertises() {
     assert_eq!(over.sock.as_deref(), Some("/a.sock"));
 }
 
+/// The limit reset's lines of `accounts --help` are the code's own word, not
+/// a copy kept by hand (a hand-kept page named 2.1.287 alone after 2.1.304's
+/// texts were read, and none of 2.1.304's kinds): the page carries them,
+/// every build a `reset.` anchor was read in is named there, and each kind's
+/// verdict under the automatic-reset policy shows, flipping one kind's
+/// verdict changing the lines. Negative controls: a build only other anchors
+/// were read in is not named, and a `reset.` row of a build no anchor has is
+/// named once the table holds it.
+#[test]
+fn the_accounts_page_says_what_the_limit_reset_reads_and_takes() {
+    let anchors = aterm_phase::ANCHORS;
+    let lines = help_reset(ResetKind::takeable, anchors);
+    assert!(
+        help_page(HelpPage::Accounts).contains(&lines),
+        "the page carries the reset's lines"
+    );
+    let reset_builds: BTreeSet<&str> = anchors
+        .iter()
+        .filter(|a| a.id.starts_with("reset."))
+        .map(|a| a.since)
+        .collect();
+    assert!(
+        !reset_builds.is_empty(),
+        "the reset's texts were read somewhere"
+    );
+    for build in &reset_builds {
+        assert!(lines.contains(&format!("{build}'s")), "{build} is named");
+    }
+    let other = anchors
+        .iter()
+        .map(|a| a.since)
+        .find(|b| !reset_builds.contains(b))
+        .expect("a build only other anchors were read in");
+    assert!(
+        !lines.contains(&format!("{other}'s")),
+        "{other} read no reset text"
+    );
+    let later = Anchor {
+        id: "reset.test.later",
+        text: "a later build's text",
+        kind: aterm_phase::anchors::AnchorKind::Literal,
+        since: "9.9.9",
+    };
+    let widened: Vec<Anchor> = anchors.iter().copied().chain([later]).collect();
+    assert!(!lines.contains("9.9.9's"));
+    assert!(help_reset(ResetKind::takeable, &widened).contains("9.9.9's"));
+    for kind in ResetKind::ALL {
+        assert!(lines.contains(kind.name()), "{kind:?} is named");
+        let flipped = help_reset(|k| k.takeable() != (k == kind), anchors);
+        assert_ne!(flipped, lines, "{kind:?}'s verdict shows on the page");
+    }
+    assert_eq!(
+        help_reset(ResetKind::takeable, anchors),
+        lines,
+        "the same verdicts and table give the same lines"
+    );
+}
+
 /// What it does not know is refused, and the hook-era ring names are gone.
 #[test]
 fn the_grammar_refuses_what_it_does_not_know() {
@@ -1408,6 +1466,75 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
     assert_eq!(rows.lines().count(), 2, "{rows}");
 }
 
+/// THE VERB HOLDS THE SYSTEM'S ERROR BOXES OFF (wave 3's soundness review,
+/// its first finding): `aterm harness disk` canonicalizes its roots and the
+/// tabs' directories and walks build directories, and on Windows a query of
+/// an empty card reader or optical drive otherwise puts a box on the
+/// person's desktop and parks the command. Read inside the verb through its
+/// seam; the thread's own mode is back once it returns. NEGATIVE CONTROL:
+/// this test's thread, before and after, reads the boxes on (Windows;
+/// elsewhere no such box exists and the seam answers quiet everywhere).
+#[test]
+fn the_disk_verb_holds_the_error_boxes_off() {
+    let tmp = tmp_dir("disk-quiet");
+    let env = env_at(&tmp);
+    let cmd = Cmd::Disk {
+        targets: vec![tmp.path().join("no-such-target")],
+        apply: None,
+        json: false,
+    };
+    DISK_ERRORS_QUIET.set(None);
+    let unguarded = !cfg!(windows);
+    assert_eq!(aterm_sysprobe::errors_quiet(), unguarded, "no guard before");
+    let (ok, _, err) = go(&cmd, &env);
+    assert!(ok, "{err}");
+    assert_eq!(DISK_ERRORS_QUIET.get(), Some(true), "inside the verb");
+    assert_eq!(
+        aterm_sysprobe::errors_quiet(),
+        unguarded,
+        "the verb restored its caller's mode"
+    );
+}
+
+/// The store the disk scan reads and the `bin/` clause 5 reads are atpkg's
+/// own, on every platform: `<atpkg's default prefix>/store` and its sibling
+/// `bin/`. On Windows that is `%LOCALAPPDATA%\aterm\pkg`, never the
+/// `~\.local\share\aterm\pkg` that is not there.
+#[test]
+fn the_disk_scan_reads_atpkgs_own_store_and_bin() {
+    let tmp = tmp_dir("disk-store");
+    let home = tmp.path();
+    let prefix = atpkg::store::default_prefix(home);
+    assert_eq!(default_store_dir(home), prefix.join("store"));
+    assert!(
+        default_link_dirs(home).contains(&prefix.join("bin")),
+        "{:?}",
+        default_link_dirs(home)
+    );
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA").map_or_else(
+            || home.join("AppData").join("Local"),
+            std::path::PathBuf::from,
+        );
+        assert_eq!(
+            default_store_dir(home),
+            local.join("aterm").join("pkg").join("store")
+        );
+        assert!(!default_store_dir(home).starts_with(home.join(".local")));
+    }
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        default_store_dir(home),
+        home.join(".local/share/aterm/pkg/store")
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        default_store_dir(home),
+        home.join("Library/Application Support/aterm/pkg/store")
+    );
+}
+
 /// The disk journal is bounded: a journal past the bound is cut back to its
 /// newest rows before the run appends. Negative control: a journal under the
 /// bound is left byte-for-byte alone.
@@ -1512,11 +1639,15 @@ fn idle_now() -> i64 {
 /// The real remover the window's tick runs, at `now`, on any device.
 #[cfg(unix)]
 fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed> {
-    disk::remover(disk::Judge {
-        now,
-        threshold_days: disk::DEFAULT_TARGET_STALE_DAYS,
-        device: None,
-    })
+    disk::remover(
+        disk::Judge {
+            now,
+            threshold_days: disk::DEFAULT_TARGET_STALE_DAYS,
+            device: None,
+            volume: None,
+        },
+        disk::idle::Sessions::default,
+    )
 }
 
 /// The host's tick on a cargo-shaped build directory: at or above the
@@ -1550,6 +1681,7 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
         table: None,
         demand: None,
         session_cwds: &[],
+        session_cwd_unknown: None,
         link_dirs: &[],
     };
     let plenty = disk_tick(
@@ -1661,13 +1793,18 @@ fn tick_below_floor(
         table: None,
         demand: None,
         session_cwds: &[],
+        session_cwd_unknown: None,
         link_dirs: &[],
     };
-    let mut remover = disk::remover(disk::Judge {
-        now,
-        threshold_days: cfg.target_stale_days,
-        device: None,
-    });
+    let mut remover = disk::remover(
+        disk::Judge {
+            now,
+            threshold_days: cfg.target_stale_days,
+            device: None,
+            volume: None,
+        },
+        disk::idle::Sessions::default,
+    );
     let DiskTick::Reclaimed(done, _) = disk_tick(&look, cfg, &mut remover, measure) else {
         panic!("below the floor, the tick applies");
     };
@@ -1734,6 +1871,7 @@ fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
         table: None,
         demand: None,
         session_cwds: &[],
+        session_cwd_unknown: None,
         link_dirs: &[],
     };
     let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1758,6 +1896,116 @@ fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
     );
 }
 
+/// WINDOWS: ONE VOLUME, WHATEVER SPELLS IT, BY ITS SERIAL AND ITS GUID. A
+/// path's volume is its serial through the one identity export and its
+/// volume's GUID — the key its free-space reading carries — so a build
+/// directory spelled verbatim (`\\?\C:\…`, as discovery records it) or in
+/// capitals is on the volume a plain working directory measures (the drive
+/// prefix this replaced read `\\?\C:` and `C:` apart and surveyed nothing
+/// discovery found). A target whose serial agrees but whose GUID does not —
+/// a cloned volume — is left out. NEGATIVE CONTROLS: a path that cannot be
+/// read is on no volume, and neither is one whose GUID no table names.
+#[cfg(windows)]
+#[test]
+fn a_windows_volume_is_named_by_its_serial_and_guid_in_every_spelling() {
+    let tmp = tmp_dir("disk-volume-win");
+    let target = disk::tests::lay_target(&tmp.path().join("repo").join("target"));
+    let canonical = std::fs::canonicalize(&target).expect("canonical");
+    let shouted = PathBuf::from(target.to_string_lossy().to_uppercase());
+    let table = aterm_sysprobe::volumes::table();
+    let id = volume_id(tmp.path(), Some(&table)).expect("a volume");
+    assert_eq!(
+        Some(id.0),
+        aterm_sysprobe::volumes::file_id(tmp.path(), true).map(|i| i.dev)
+    );
+    let measured = disk::volume_of(tmp.path(), &table).expect("the volume read");
+    assert!(id.1.is_some(), "{id:?}");
+    assert_eq!(id.1, disk::target::VolumeGuid::of_key(&measured.key));
+    assert_eq!(volume_id(&canonical, Some(&table)), Some(id));
+    assert_eq!(volume_id(&shouted, Some(&table)), Some(id));
+    let missing = tmp.path().join("missing");
+    assert_eq!(volume_id(&missing, Some(&table)), None);
+    assert_eq!(volume_id(tmp.path(), None), None, "no table, no GUID");
+    let id_of = |path: &Path| volume_id(path, Some(&table));
+    let kept = on_volume(
+        tmp.path(),
+        &[canonical.clone(), shouted.clone(), missing],
+        &id_of,
+    );
+    assert_eq!(kept, [canonical.clone(), shouted.clone()]);
+    // The canonical spelling read as on a clone: its serial, another GUID.
+    let clone = disk::target::VolumeGuid::parse("{00000000-0000-0000-0000-00000000c10e}");
+    let cloned = |path: &Path| {
+        let (dev, guid) = id_of(path)?;
+        Some((dev, if path == canonical { clone } else { guid }))
+    };
+    let kept = on_volume(tmp.path(), &[canonical.clone(), shouted.clone()], &cloned);
+    assert_eq!(kept, [shouted]);
+}
+
+/// WINDOWS: THE TICK'S REMOVALS SEE CLOUD PLACEHOLDERS AS WHAT THEY ARE.
+/// Below the floor the tick hands an idle build directory's row (its
+/// `incremental/` to go) to its remover with this thread in
+/// `PHCM_EXPOSE_PLACEHOLDERS` (2) — so
+/// every `std` read a removal makes sees a placeholder as the reparse point
+/// it is — and the thread's own mode (0, the process's default) is back
+/// once the tick returns. NEGATIVE CONTROL: above the floor the tick
+/// switches nothing and removes nothing.
+#[cfg(windows)]
+#[test]
+fn the_disk_tick_removes_with_cloud_placeholders_exposed() {
+    use aterm_dirfd::seam::thread_placeholder_mode;
+    let tmp = tmp_dir("disk-tick-exposed");
+    let state = tmp.path().join("state");
+    let target = disk::tests::lay_target(&tmp.path().join("repo").join("target"));
+    let table = aterm_sysprobe::volumes::table();
+    let targets = [target.clone()];
+    let gib = 1024 * 1024 * 1024;
+    let cfg = disk::Config::default();
+    let look = |free: u64| DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free: Some(free),
+        targets: &targets,
+        discover: None,
+        transcripts: None,
+        now: idle_now(),
+        room: None,
+        table: Some(&table),
+        demand: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    };
+    assert_eq!(thread_placeholder_mode(), 0, "the process's default");
+    let plenty = disk_tick(
+        &look(cfg.warn_free_gib * gib),
+        cfg,
+        &mut |row| panic!("removed {} above the warning", row.path.display()),
+        &mut disk::tests::no_pressure,
+    );
+    assert_eq!(plenty, DiskTick::Plenty);
+    assert_eq!(thread_placeholder_mode(), 0);
+
+    let mut modes = Vec::new();
+    let DiskTick::Reclaimed(done, _) = disk_tick(
+        &look(gib),
+        cfg,
+        &mut |row| {
+            modes.push((row.path.clone(), thread_placeholder_mode()));
+            Err(io::Error::other("a test's remover removes nothing"))
+        },
+        &mut || Some(gib),
+    ) else {
+        panic!("below the floor, the tick applies");
+    };
+    assert_eq!(modes.len(), 1, "{modes:?} {done:?}");
+    let key = aterm_sysprobe::paths::windows_key;
+    assert_eq!(key(&modes[0].0), key(&target), "{modes:?}");
+    assert_eq!(modes[0].1, 2, "exposed while the tick removes: {modes:?}");
+    assert_eq!(thread_placeholder_mode(), 0, "the thread's own mode back");
+}
+
 /// The tick frees only the volume it measured: a build directory on another
 /// volume is not looked at when home runs short. The fixture measures `/dev`
 /// (its own volume on macOS and Linux) against an idle build directory in the
@@ -1771,8 +2019,8 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
     let now = idle_now();
     let elsewhere = Path::new("/dev");
     assert_ne!(
-        volume_id(elsewhere),
-        volume_id(tmp.path()),
+        volume_id(elsewhere, None),
+        volume_id(tmp.path(), None),
         "the fixture needs two volumes"
     );
     let targets = [target.clone()];
@@ -1788,6 +2036,7 @@ fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
         table: None,
         demand: None,
         session_cwds: &[],
+        session_cwd_unknown: None,
         link_dirs: &[],
     };
     let DiskTick::Reclaimed(done, _) = disk_tick(
@@ -1884,6 +2133,7 @@ fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
         table: None,
         demand: None,
         session_cwds: &[],
+        session_cwd_unknown: None,
         link_dirs: &[],
     };
     let DiskTick::Reclaimed(done, _) = disk_tick(
@@ -2792,19 +3042,21 @@ fn live_holder_in(
     });
     // The kernel's start time as Claude renders `procStart`: `ps` in the C
     // locale and UTC, whitespace squashed.
-    let start = aterm_uds::spawnfd::command("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
+    let start = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC"),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .ok()
+    .map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .unwrap_or_default();
     if !started || start.is_empty() {
         let _ = child.kill();
         let _ = child.wait();
@@ -4243,11 +4495,15 @@ fn isolated_terminal_signals(test: &str) -> bool {
     let ran =
         crate::harness::align::capture_bounded(cmd, std::time::Duration::from_secs(60), 256 * 1024)
             .expect("the exact signal test finishes and is reaped");
-    assert_eq!(
-        ran.code,
-        Some(0),
-        "isolated signal test:\n{}",
-        String::from_utf8_lossy(&ran.stdout)
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    assert_eq!(ran.code, Some(0), "isolated signal test:\n{stdout}");
+    // A filter that names no test (a renamed module or test) exits 0 too,
+    // having run nothing.
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed;")),
+        "isolated signal test: the child ran no test named {test}:\n{stdout}"
     );
     false
 }
@@ -4661,6 +4917,7 @@ fn reported_state(env: &Env) {
     assert!(accounts::note_offer(
         &mut state,
         "main",
+        Some(aterm_phase::ResetKind::Weekly),
         1,
         Some(now + 3 * 86_400),
         now - 3600,
@@ -4685,7 +4942,8 @@ fn reported_state(env: &Env) {
 /// THE REPORT, as JSON: one line, schema 1, kind `accounts`; every key of a
 /// row present whatever is known; an unknown is `null`, never `0`; an
 /// instant in Unix seconds with its UTC form beside it; `dir` absent for
-/// this machine's own login.
+/// this machine's own login; an offer's count with the kind it counts, in
+/// the text report too.
 #[test]
 fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     let tmp = tmp_dir("accounts-json");
@@ -4769,6 +5027,19 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     // The week was not read: null, in every one of its three keys.
     assert!(null(main, "week_pct") && null(main, "week_reset"));
     assert!(null(main, "week_reset_rfc3339"));
+    // The offer's count is its kind's, which it names.
+    let offer = main.get("offer").expect("the offer");
+    assert_eq!(text(offer, "kind").as_deref(), Some("weekly"));
+    assert_eq!(int(offer, "left"), Some(1));
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(
+        out.contains(&format!(
+            "offer: 1 weekly reset left, use by {}",
+            rfc3339_utc(now + 3 * 86_400)
+        )),
+        "{out}"
+    );
 
     assert_eq!(text(work_2, "dir"), Some(work));
     assert_eq!(text(work_2, "condition").as_deref(), Some("limited"));
@@ -5910,7 +6181,7 @@ mod renew;
 /// journalled; between, nothing is written. NEGATIVE CONTROL: a link to a
 /// victim in the reserve's place is refused at the emergency — journalled as
 /// `refused`, the victim byte for byte.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_back() {
     let tmp = tmp_dir("reserve");
@@ -5956,15 +6227,251 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
     assert!(!reserve.exists());
     assert_eq!(rows(), ["written", "released"]);
 
+    // The link: a symlink to a victim file on Unix; on Windows a junction to
+    // a victim folder (a file symlink needs a privilege a plain account lacks).
     let victim = tmp.path().join("victim");
-    std::fs::write(&victim, b"keep").expect("victim");
-    std::os::unix::fs::symlink(&victim, &reserve).expect("link");
+    #[cfg(unix)]
+    let kept = {
+        std::fs::write(&victim, b"keep").expect("victim");
+        std::os::unix::fs::symlink(&victim, &reserve).expect("link");
+        victim.clone()
+    };
+    #[cfg(windows)]
+    let kept = {
+        std::fs::create_dir_all(&victim).expect("victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("victim");
+        atpkg::platform::atomic_symlink(&victim, &reserve).expect("junction");
+        victim.join("keep")
+    };
     assert!(matches!(
         disk_reserve_look(&state, &reserve, disk::Level::Emergency, full, &t, 5),
         ReserveMove::Refused(_)
     ));
-    assert_eq!(std::fs::read(&victim).expect("victim"), b"keep");
+    assert_eq!(std::fs::read(&kept).expect("victim"), b"keep");
     assert_eq!(rows(), ["written", "released", "refused"]);
+}
+
+/// A COMPRESSED RESERVE FOLDER IS REFUSED, AND JOURNALLED ONCE (Windows): a
+/// reserve folder that compresses what is written into it (a drive compressed
+/// whole) would hold a reserve short of its blocks, so every look refuses it,
+/// and only the first writes its row ([`ReserveMove::StillRefused`] after). A
+/// write ends the run: refused again later, it is journalled again. NEGATIVE
+/// CONTROL: uncompressed, the same folder takes the reserve.
+#[cfg(windows)]
+#[test]
+fn a_compressed_reserve_folder_is_refused_and_journalled_once() {
+    let tmp = tmp_dir("reserve-refused-once");
+    let state = tmp.path().join("state");
+    let reserve = disk::reserve::path_for(&tmp.path().join("home"));
+    let folder = reserve.parent().expect("folder").to_path_buf();
+    std::fs::create_dir_all(&folder).expect("folder");
+    let compact = |flag: &str| {
+        let out = aterm_uds::spawnfd::command("compact")
+            .args([flag, "/q"])
+            .arg(&folder)
+            .output()
+            .expect("compact ran");
+        assert!(out.status.success(), "compact {flag}");
+    };
+    let rows = || -> Vec<String> {
+        std::fs::read_to_string(state.join(DISK_LEDGER))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                let v: Value = aterm_json::from_str(l).expect("a row");
+                v["action"].as_str().unwrap_or_default().to_owned()
+            })
+            .collect()
+    };
+    let t = disk::Config::default().thresholds(Some(460 << 30));
+    let plenty = Some(t.target + disk::reserve::RESERVE_BYTES);
+    let look = |now| disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, now);
+    compact("/c");
+    assert!(
+        matches!(look(1), ReserveMove::Refused(ref why) if why.contains("compresses")),
+        "the first look"
+    );
+    assert_eq!(look(2), ReserveMove::StillRefused);
+    assert_eq!(look(3), ReserveMove::StillRefused);
+    assert_eq!(rows(), ["refused"]);
+    compact("/u");
+    assert_eq!(look(4), ReserveMove::Written);
+    let full = Some(0);
+    assert_eq!(
+        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, 5),
+        ReserveMove::Released(disk::reserve::RESERVE_BYTES)
+    );
+    compact("/c");
+    assert!(matches!(look(6), ReserveMove::Refused(_)));
+    assert_eq!(look(7), ReserveMove::StillRefused);
+    assert_eq!(rows(), ["refused", "written", "released", "refused"]);
+}
+
+/// THE SWEEP'S LEDGER ROWS SAY WHY EACH BUILD CACHE WENT, with the figures
+/// it was taken on: a gone workspace's names its idle time and the sweep's
+/// window (a day while the volume is only low, not a fixed ten minutes); one
+/// taken for a month unwritten names that and never says its workspace was
+/// removed; an earlier sweep's half-removed stage says so. The intent row and
+/// the removal row carry the same words.
+#[test]
+fn the_sweep_rows_say_why_each_build_cache_went() {
+    use atpkg::build_cache::{RECLAIM_GONE, Unused};
+    let tmp = tmp_dir("sweep-why");
+    let state = tmp.path().join("state");
+    let path = Path::new("/c/ws/.cargo-build");
+    let cases = [
+        (
+            Unused::Gone {
+                idle: std::time::Duration::from_secs(26 * 3_600),
+                after: RECLAIM_GONE,
+            },
+            "its workspace is gone, and nothing wrote it for 26h (the sweep takes one unwritten 24h)",
+        ),
+        (
+            Unused::Idle {
+                idle: std::time::Duration::from_secs(31 * 86_400),
+            },
+            "nothing wrote it for 31d, a month or more, whatever its workspace's state",
+        ),
+        (
+            Unused::Unfinished,
+            "an earlier sweep renamed it aside and did not finish removing it",
+        ),
+    ];
+    for (why, _) in cases {
+        assert!(disk_sweep_journal(&state, path, 7, why, false, 1));
+        assert!(disk_sweep_journal(&state, path, 7, why, true, 2));
+    }
+    let rows: Vec<Value> = std::fs::read_to_string(state.join(DISK_LEDGER))
+        .expect("the ledger")
+        .lines()
+        .map(|l| aterm_json::from_str(l).expect("a row"))
+        .collect();
+    assert_eq!(rows.len(), 6);
+    for (pair, (_, words)) in rows.chunks(2).zip(cases) {
+        let actions: Vec<&str> = pair
+            .iter()
+            .map(|r| r["action"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(actions, ["removing", "removed"]);
+        for r in pair {
+            let text = r["text"].as_str().unwrap_or_default();
+            assert!(text.contains(words), "{text}");
+            assert!(!text.contains("ten minutes"), "{text}");
+        }
+    }
+    let idle = rows[2]["text"].as_str().unwrap_or_default();
+    assert!(
+        !idle.contains("gone") && !idle.contains("removed workspace"),
+        "{idle}"
+    );
+}
+
+/// A REFUSED RESERVE IS JOURNALLED ONCE PER REASON: a folder at the reserve's
+/// path refuses every look while the disk is healthy (the watch looks every
+/// minute), and three looks put one `refused` row in the ledger, the later two
+/// [`ReserveMove::StillRefused`] (nothing for the log either). Another reason
+/// (the reserve's folder a file) is journalled; once the fault clears and the
+/// reserve is written, the same refusal as before is news again.
+#[test]
+fn a_refused_reserve_is_journalled_once_per_reason() {
+    let tmp = tmp_dir("reserve-refused");
+    let state = tmp.path().join("state");
+    let reserve = disk::reserve::path_for(&tmp.path().join("home"));
+    let t = disk::Config::default().thresholds(Some(460 << 30));
+    let plenty = Some(t.target + disk::reserve::RESERVE_BYTES);
+    let level = t.level(plenty, None);
+    let rows = || -> Vec<(String, String)> {
+        std::fs::read_to_string(state.join(DISK_LEDGER))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                let v: Value = aterm_json::from_str(l).expect("a row");
+                (
+                    v["action"].as_str().unwrap_or_default().to_owned(),
+                    v["text"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let look = |now| disk_reserve_look(&state, &reserve, level, plenty, &t, now);
+    std::fs::create_dir_all(&reserve).expect("a folder in the reserve's place");
+    assert!(matches!(look(1), ReserveMove::Refused(_)));
+    assert_eq!(look(2), ReserveMove::StillRefused);
+    assert_eq!(look(3), ReserveMove::StillRefused);
+    assert_eq!(rows().len(), 1, "{:?}", rows());
+    assert!(reserve.is_dir(), "left alone");
+
+    // Another reason: the reserve's own folder is a file.
+    let folder = reserve.parent().expect("its folder").to_path_buf();
+    std::fs::remove_dir_all(&folder).expect("cleared");
+    std::fs::write(&folder, b"not a folder").expect("a file");
+    assert!(matches!(look(4), ReserveMove::Refused(_)));
+    assert_eq!(look(5), ReserveMove::StillRefused);
+
+    // Cleared and written: a refusal after it is news again.
+    std::fs::remove_file(&folder).expect("cleared");
+    assert_eq!(look(6), ReserveMove::Written);
+    std::fs::remove_file(&reserve).expect("taken away");
+    std::fs::create_dir_all(&reserve).expect("a folder again");
+    assert!(matches!(look(7), ReserveMove::Refused(_)));
+    let actions: Vec<String> = rows().into_iter().map(|(a, _)| a).collect();
+    assert_eq!(actions, ["refused", "refused", "written", "refused"]);
+    let texts = rows();
+    assert_ne!(texts[0].1, texts[1].1, "two reasons");
+    assert_eq!(texts[0].1, texts[3].1, "the first reason, news again");
+}
+
+/// A FAILED RESERVE WRITE IS NOT TRIED AT EVERY LOOK: a write that fails
+/// partway (a quota, a failing disk) wrote up to `RESERVE_BYTES` first, so no
+/// look within [`RESERVE_REWRITE_AFTER_SECS`] of it writes again, even once
+/// the fault has cleared, and the first look past it writes the reserve. The
+/// fault here is a folder that refuses new files (mode 0500), which fails the
+/// write as a quota would. NEGATIVE CONTROL: a refusal that writes nothing (a
+/// folder in the reserve's place) is judged again at the next look, which
+/// writes the reserve once the folder has gone.
+#[cfg(unix)]
+#[test]
+fn a_failed_reserve_write_waits_before_it_is_tried_again() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tmp_dir("reserve-unwritten");
+    let state = tmp.path().join("state");
+    let t = disk::Config::default().thresholds(Some(460 << 30));
+    let plenty = Some(t.target + disk::reserve::RESERVE_BYTES);
+    let level = t.level(plenty, None);
+    let look = |reserve: &Path, now| disk_reserve_look(&state, reserve, level, plenty, &t, now);
+    let mode = |p: &Path, m| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("its mode");
+    };
+
+    let reserve = disk::reserve::path_for(&tmp.path().join("home"));
+    let folder = reserve.parent().expect("its folder").to_path_buf();
+    std::fs::create_dir_all(&folder).expect("its folder");
+    mode(&folder, 0o500);
+    let ReserveMove::Refused(why) = look(&reserve, 100) else {
+        panic!("a folder that refuses new files refuses the write")
+    };
+    assert!(why.contains("could not be written"), "{why}");
+    mode(&folder, 0o700);
+    assert_eq!(look(&reserve, 160), ReserveMove::StillRefused);
+    assert_eq!(
+        look(&reserve, 100 + RESERVE_REWRITE_AFTER_SECS - 1),
+        ReserveMove::StillRefused
+    );
+    assert!(!reserve.exists(), "no write within the wait");
+    assert_eq!(
+        look(&reserve, 100 + RESERVE_REWRITE_AFTER_SECS),
+        ReserveMove::Written
+    );
+    std::fs::remove_file(&reserve).expect("taken away");
+
+    // NEGATIVE CONTROL: a refusal that wrote nothing is judged again at once.
+    let other = disk::reserve::path_for(&tmp.path().join("other"));
+    std::fs::create_dir_all(&other).expect("a folder in its place");
+    assert!(matches!(look(&other, 100), ReserveMove::Refused(_)));
+    std::fs::remove_dir(&other).expect("cleared");
+    assert_eq!(look(&other, 160), ReserveMove::Written);
+    std::fs::remove_file(&other).expect("taken away");
 }
 
 /// A state-preserving cut streams bounded main rows and reads predecessors

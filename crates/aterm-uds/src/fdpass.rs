@@ -26,13 +26,17 @@
 //!   close and refuse.
 //! * Every parsed descriptor becomes an [`OwnedDescriptor`] before the next fallible step,
 //!   so every error return closes what it parsed by dropping it.
+//! * Every send carries `MSG_NOSIGNAL`, so a hung-up peer is `EPIPE` even while SIGPIPE is
+//!   at its default. [`send_vectored`], the same `sendmsg` with no control message, is the
+//!   gather write std does not make signal-free (see its docs).
 //!
 //! Platforms: Darwin, and Linux on x86-64/aarch64 (the two ABIs mirrored
 //! below). Other targets, including Windows (afunix carries no ancillary
 //! data), get the same entry points returning [`io::ErrorKind::Unsupported`];
-//! only [`peer_pid`] is wired on Windows (`SIO_AF_UNIX_GETPEERPID`).
+//! only [`peer_pid`] and [`send_vectored`] are wired there.
 
 use std::io;
+use std::io::IoSlice;
 
 use crate::CtlStream;
 
@@ -100,14 +104,38 @@ pub struct Received {
 /// * `InvalidInput`: an empty payload (a zero-length stream `sendmsg` drops
 ///   the control message on Linux), or more than [`MAX_FDS`] descriptors.
 /// * `Unsupported`: this platform has no `SCM_RIGHTS` (see the module docs).
-/// * Anything `sendmsg(2)` reports (`EPIPE` if the peer is gone; std sockets
-///   use `SO_NOSIGPIPE`/`MSG_NOSIGNAL`, so this is an error, not a signal).
+/// * Anything `sendmsg(2)` reports (`EPIPE` if the peer is gone: the send
+///   carries `MSG_NOSIGNAL`, so this is an error, not a signal).
 pub fn send_with_fds(
     stream: &CtlStream,
     payload: &[u8],
     fds: &[BorrowedDescriptor<'_>],
 ) -> io::Result<usize> {
     scm::send_with_fds(stream, payload, fds)
+}
+
+/// Send `bufs` in order as one gather write on the connected `stream` and
+/// return the bytes the kernel accepted. A short return, as from
+/// `write_vectored`, leaves the rest to send again.
+///
+/// The `write_vectored` std gives a [`CtlStream`] is a bare `writev`: its
+/// `write` sends with `MSG_NOSIGNAL` on Linux, its gather does not. On Darwin
+/// std marks `SO_NOSIGPIPE` only on sockets it makes with `socket(2)`, not on
+/// a `socketpair(2)`'s ends. Either raises SIGPIPE at a hung-up peer
+/// whenever SIGPIPE is not ignored, and `Command::exec` sets it back to its
+/// default for the whole process before its `execve`. This is `sendmsg`
+/// with `MSG_NOSIGNAL` and no control message: the gather is kept, the
+/// signal is not.
+///
+/// One call takes at most the first 1024 slices (`IOV_MAX` on Darwin and
+/// Linux). On Windows it is the stream's own `WSASend` (no SIGPIPE there);
+/// on a Unix this file does not vouch for, std's `write` of the first
+/// non-empty slice.
+///
+/// # Errors
+/// Anything `sendmsg(2)` reports (`EPIPE` if the peer is gone).
+pub fn send_vectored(stream: &CtlStream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+    scm::send_vectored(stream, bufs)
 }
 
 /// Receive one message from `stream` into `buf`, accepting at most `max_fds` descriptors with
@@ -174,6 +202,7 @@ pub fn peer_pid_of_fd(fd: std::os::fd::RawFd) -> io::Result<u32> {
 ))]
 mod scm {
     use std::io;
+    use std::io::IoSlice;
     use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
     use super::{CONTROL_FDS, MAX_FDS, Received};
@@ -186,6 +215,20 @@ mod scm {
         iov_base: *mut core::ffi::c_void,
         iov_len: usize,
     }
+
+    // std guarantees an `IoSlice` is ABI-compatible with `struct iovec`, which
+    // is what lets [`send_vectored`] hand the caller's slices to the kernel.
+    const _: () = {
+        if size_of::<IoSlice<'static>>() != size_of::<IoVec>()
+            || align_of::<IoSlice<'static>>() != align_of::<IoVec>()
+        {
+            panic!("an IoSlice must be laid out as a struct iovec");
+        }
+    };
+
+    /// `IOV_MAX` on Darwin and Linux: a longer `msg_iov` is `EMSGSIZE`, so a
+    /// gather takes this many slices and returns short.
+    const MAX_IOV: usize = 1024;
 
     /// Darwin's `sys/socket.h`: `msg_iovlen`/`msg_flags` are `int` and
     /// `msg_namelen`/`msg_controllen` are `socklen_t` (`u32`), unlike Linux,
@@ -231,9 +274,12 @@ mod scm {
         pub const SOL_SOCKET: i32 = 0xffff;
         pub const SCM_RIGHTS: i32 = 0x01;
         pub const MSG_CTRUNC: i32 = 0x20;
-        /// Darwin has no `MSG_NOSIGNAL`; std sets `SO_NOSIGPIPE` on every
-        /// socket it creates instead, so a send to a dead peer is `EPIPE`.
-        pub const SEND_FLAGS: i32 = 0;
+        /// `MSG_NOSIGNAL` (`sys/socket.h`): a send to a hung-up peer is
+        /// `EPIPE`, not a `SIGPIPE`. std's `SO_NOSIGPIPE` does not cover a
+        /// `socketpair(2)`'s ends; with SIGPIPE at its default, a send to one
+        /// whose peer closed killed the sender, and this flag made it `EPIPE`
+        /// (measured on macOS 27).
+        pub const SEND_FLAGS: i32 = 0x80000;
 
         /// `sys/un.h`: level `SOL_LOCAL`, option `LOCAL_PEERPID`.
         const SOL_LOCAL: i32 = 0;
@@ -537,6 +583,28 @@ mod scm {
         // sendmsg only reads them) and `control_len` never exceeds
         // `control`'s length by construction (`fds.len() <= MAX_FDS`, and the
         // buffer is sized for `CONTROL_FDS >= MAX_FDS`).
+        let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, abi::SEND_FLAGS) };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sent as usize)
+    }
+
+    /// Send `bufs` as one message with no control data. See
+    /// [`super::send_vectored`].
+    // Skip: bottoms out at the `sendmsg(2)` FFI call (unverifiable C body).
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn send_vectored(stream: &CtlStream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let bufs = &bufs[..bufs.len().min(MAX_IOV)];
+        let msg = abi::msghdr(
+            bufs.as_ptr().cast::<IoVec>().cast_mut(),
+            bufs.len(),
+            core::ptr::null_mut(),
+            0,
+        );
+        // SAFETY: `msg` names `bufs.len()` iovecs at `bufs`, which is live for
+        // the whole call and laid out as `struct iovec` (asserted above);
+        // sendmsg only reads them. It names no control buffer.
         let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, abi::SEND_FLAGS) };
         if sent < 0 {
             return Err(io::Error::last_os_error());
@@ -944,6 +1012,71 @@ mod scm {
             assert_eq!(copies(), before, "a descriptor the peer sent stayed open");
         }
 
+        /// A receiver at its descriptor limit, where the kernel installs fewer descriptors than
+        /// were sent, refuses the message and keeps none that did arrive: Linux installs what
+        /// fits, names only those and flags `MSG_CTRUNC` (the flag alone tells it from a whole
+        /// message), and Darwin fails the `recvmsg` (`EMFILE`). Run in a fork whose soft
+        /// `RLIMIT_NOFILE` leaves room for one of the two sent; `alarm` is its hang detector.
+        #[test]
+        fn a_message_the_kernel_could_not_install_whole_is_refused() {
+            use std::os::fd::{AsFd as _, AsRawFd as _};
+            unsafe extern "C" {
+                fn alarm(seconds: u32) -> u32;
+            }
+            const REFUSED: i32 = 0;
+            const KEPT: i32 = 1;
+            const ACCEPTED: i32 = 2;
+            const NO_SETUP: i32 = 3;
+            let (a, b) = crate::CtlStream::pair().expect("pair");
+            super::send_with_fds(&a, b"x", &[a.as_fd(), a.as_fd()]).expect("sent");
+            crate::spawnfd::pass_libnotify_gate();
+            // SAFETY: the child runs the receive under test and plain syscalls, then `_exit`s;
+            // it never returns into the harness.
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                let receive = || {
+                    let fd = b.as_raw_fd();
+                    // SAFETY: plain syscalls on a descriptor this process holds and on a
+                    // fully initialized `rlimit`.
+                    unsafe {
+                        alarm(60);
+                        // The two lowest free numbers: a limit at the second leaves the first.
+                        let (first, second) = (libc::dup(fd), libc::dup(fd));
+                        let mut lim = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        };
+                        if first < 0
+                            || second < 0
+                            || libc::close(first) != 0
+                            || libc::close(second) != 0
+                            || libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0
+                        {
+                            return NO_SETUP;
+                        }
+                        lim.rlim_cur = second as libc::rlim_t;
+                        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                            return NO_SETUP;
+                        }
+                        let mut buf = [0u8; 4];
+                        match super::recv_with_fds(&b, &mut buf, super::MAX_FDS) {
+                            Ok(_) => ACCEPTED,
+                            Err(_) if libc::dup(fd) == first => REFUSED,
+                            Err(_) => KEPT,
+                        }
+                    }
+                };
+                // SAFETY: the forked child ends here.
+                unsafe { libc::_exit(receive()) }
+            }
+            assert!(child > 0, "fork: {}", std::io::Error::last_os_error());
+            let mut status = 0;
+            // SAFETY: our own child, reaped once.
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(libc::WIFEXITED(status), "the child died: {status:#x}");
+            assert_eq!(libc::WEXITSTATUS(status), REFUSED);
+        }
+
         /// A buffer too short to hold a header is no message, not a truncated one.
         #[test]
         fn an_empty_control_area_is_empty_not_truncated() {
@@ -955,11 +1088,96 @@ mod scm {
             }
         }
     }
+
+    /// A send to a hung-up peer with SIGPIPE at its default, in a helper
+    /// process: the test process's own SIGPIPE is not ours to change.
+    #[cfg(test)]
+    mod sigpipe_tests {
+        use std::io::{IoSlice, Write as _};
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::{Command, ExitStatus, Stdio};
+
+        use crate::CtlStream;
+
+        const HELPER_ENV: &str = "ATERM_UDS_SEND_VECTORED_HELPER";
+        /// The same numbers on Darwin and Linux.
+        const SIGPIPE: i32 = 13;
+        const SIG_DFL: usize = 0;
+        const EPIPE: i32 = 32;
+
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+
+        /// How the helper ended in `mode`, and what it printed.
+        fn helper(mode: &str) -> (ExitStatus, String) {
+            let out = Command::new(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "--exact",
+                    "fdpass::scm::sigpipe_tests::zz_helper_entry",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(HELPER_ENV, mode)
+                .stderr(Stdio::null())
+                .output()
+                .expect("the helper runs");
+            (
+                out.status,
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        }
+
+        /// A gather to a `socketpair` end whose peer closed, with SIGPIPE at
+        /// its default (as `Command::exec` leaves it before `execve`), is
+        /// `EPIPE` and the sender lives. NEGATIVE CONTROL: std's own
+        /// `write_vectored` on the same pair kills the helper with SIGPIPE.
+        #[test]
+        fn a_gather_to_a_hung_up_peer_is_epipe_not_sigpipe() {
+            let (status, text) = helper("send_vectored");
+            assert!(status.success(), "{status:?}: {text}");
+            assert!(
+                text.contains(&format!("send_vectored errno=Some({EPIPE})")),
+                "{text}"
+            );
+            let (status, text) = helper("write_vectored");
+            assert_eq!(
+                status.signal(),
+                Some(SIGPIPE),
+                "std's writev raises SIGPIPE: {status:?}: {text}"
+            );
+        }
+
+        /// The helper. Ordinary runs return at once.
+        #[test]
+        fn zz_helper_entry() {
+            let Some(mode) = std::env::var_os(HELPER_ENV) else {
+                return;
+            };
+            // SAFETY: the default disposition is a valid one for SIGPIPE.
+            unsafe { signal(SIGPIPE, SIG_DFL) };
+            let (near, far) = CtlStream::pair().expect("a socketpair");
+            drop(far);
+            let bufs = [IoSlice::new(b"ab"), IoSlice::new(b"cd")];
+            let sent = if mode == "write_vectored" {
+                (&near).write_vectored(&bufs)
+            } else {
+                super::send_vectored(&near, &bufs)
+            };
+            println!();
+            println!(
+                "{} errno={:?}",
+                mode.to_string_lossy(),
+                sent.err().and_then(|e| e.raw_os_error())
+            );
+        }
+    }
 }
 
-/// Every other target: the same entry points, returning `Unsupported`. Windows' afunix has no
-/// ancillary data, and on an unvouched Unix a wrong `msghdr` layout or option number would
-/// read the wrong memory instead of failing.
+/// Every other target: the same entry points, returning `Unsupported`, except
+/// [`send_vectored`] and Windows' [`peer_pid`]. Windows' afunix has no
+/// ancillary data, and on an unvouched Unix a wrong `msghdr` layout or option
+/// number would read the wrong memory instead of failing.
 #[cfg(not(any(
     target_vendor = "apple",
     all(
@@ -969,6 +1187,7 @@ mod scm {
 )))]
 mod scm {
     use std::io;
+    use std::io::IoSlice;
 
     use super::{BorrowedDescriptor, Received};
     use crate::CtlStream;
@@ -999,6 +1218,20 @@ mod scm {
     #[cfg(windows)]
     pub fn peer_pid(stream: &CtlStream) -> io::Result<u32> {
         stream.peer_pid()
+    }
+
+    /// The stream's own gather, `WSASend`: Windows raises no SIGPIPE.
+    #[cfg(windows)]
+    pub fn send_vectored(stream: &CtlStream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        io::Write::write_vectored(&mut &*stream, bufs)
+    }
+
+    /// No `msghdr` layout to trust, so no gather: the first non-empty slice
+    /// goes by std's `write`, the send std makes signal-free where it can.
+    #[cfg(not(windows))]
+    pub fn send_vectored(stream: &CtlStream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let first = bufs.iter().find(|buf| !buf.is_empty());
+        io::Write::write(&mut &*stream, first.map_or(&[][..], |buf| &buf[..]))
     }
 
     #[cfg(not(windows))]

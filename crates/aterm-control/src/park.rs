@@ -1,0 +1,281 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! ONE PARK FOR EVERY BLOCKING CONTROL VERB. `await`, `ready`, a `turn`'s
+//! phases, `wait`, `await inbox`, `post --wait` and a paste's kernel receipt
+//! each wait on their own wake (a session's watchers, a condvar, a sink's
+//! drain) until an instant their own state names. (`await consent` parks on
+//! the consent state's publications for at most `CONSENT_EXIT_POLL` at a
+//! time, the poll that sees its session exit, so each of its parks is already
+//! one slice: aterm-gui's `control_privacy::run_consent_wait`.) Here, below
+//! the window crate beside [`crate::hangup`], so the fabric endpoint's waits
+//! (`aterm-gui-fabric`) and the dispatcher's park the same way.
+//!
+//! None of those wakes hears the client hang up, and a killed client must get
+//! its lane back within [`crate::hangup::HANGUP_POLL`]. So while the thread
+//! serves a socket connection, [`park`] cuts the wait into slices of
+//! [`Lane::slice`]. A slice that ends with no wake asks only whether the caller
+//! hung up ([`Lane::hung_up`]) and whether a flag the verb watches moved, and
+//! parks again for the rest. The verb's own look (a store, terminal, timeline
+//! or inbox read) runs on a wake, at the instant it named, or once to answer a
+//! hang-up, never on a bare slice. Off a serving lane the park is one wait.
+
+use std::sync::{Condvar, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+/// The shortest park. A verb whose own instant has already passed still
+/// yields before it looks again, so a deadline that is named but does not
+/// fire cannot spin the lane.
+const MIN_PARK: Duration = Duration::from_millis(1);
+
+/// How a park asks after the caller of the connection its thread serves.
+#[derive(Clone, Copy)]
+pub struct Lane {
+    /// The longest one wait runs before the caller is asked after:
+    /// [`crate::hangup::hangup_park`], which is
+    /// [`crate::hangup::HANGUP_POLL`] while the thread serves a socket
+    /// connection and the whole park otherwise.
+    pub slice: fn(Duration) -> Duration,
+    /// Whether the caller hung up ([`crate::hangup::caller_hung_up`]).
+    pub hung_up: fn() -> bool,
+}
+
+impl Lane {
+    /// The connection this thread serves, if it serves one.
+    pub const SERVED: Lane = Lane {
+        slice: crate::hangup::hangup_park,
+        hung_up: crate::hangup::caller_hung_up,
+    };
+
+    /// This lane for a park that finishes whether or not its caller is still
+    /// there. It still slices, so a flag the park watches is read between
+    /// slices, but it never asks after the caller.
+    #[must_use]
+    pub const fn ignoring_hangup(self) -> Lane {
+        Lane {
+            slice: self.slice,
+            hung_up: never,
+        }
+    }
+}
+
+fn never() -> bool {
+    false
+}
+
+/// How a [`park`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Woke {
+    /// The wait was woken (a spurious wake counts), or the watched flag moved
+    /// between slices: look again.
+    Rang,
+    /// The instant the verb named came.
+    Due,
+    /// The caller hung up, asked between slices.
+    HungUp,
+}
+
+/// Park on `wait` until it wakes or `until` comes. `wait(bound)` parks for at
+/// most `bound` and answers `true` on a wake. A slice that ends with no wake
+/// short of `until` asks [`Lane::hung_up`], then `moved` (a flag the verb
+/// reads that rings no wake of its own), and nothing else, before it parks
+/// again for the rest.
+pub fn park(
+    mut wait: impl FnMut(Duration) -> bool,
+    until: Instant,
+    lane: Lane,
+    moved: &dyn Fn() -> bool,
+) -> Woke {
+    park_holding((), |(), bound| ((), wait(bound)), until, lane, moved).1
+}
+
+/// [`park`] on `changed`, the condvar that signals the state `guard` guards.
+/// Each slice hands the condvar the guard and takes it back, so the caller's
+/// look before and after the park runs under the guard as before, and a slice
+/// that ends with no notify takes the lock only to ask after the caller.
+pub fn park_guarded<'a, T>(
+    changed: &Condvar,
+    guard: MutexGuard<'a, T>,
+    until: Instant,
+    lane: Lane,
+) -> MutexGuard<'a, T> {
+    let wait = |guard, bound| {
+        let (guard, waited) = changed
+            .wait_timeout(guard, bound)
+            .unwrap_or_else(PoisonError::into_inner);
+        (guard, !waited.timed_out())
+    };
+    park_holding(guard, wait, until, lane, &|| false).0
+}
+
+/// The one slice loop: `held` is what each wait is handed and hands back (a
+/// condvar's guard, or nothing).
+fn park_holding<S>(
+    mut held: S,
+    mut wait: impl FnMut(S, Duration) -> (S, bool),
+    until: Instant,
+    lane: Lane,
+    moved: &dyn Fn() -> bool,
+) -> (S, Woke) {
+    let now = Instant::now();
+    let until = now
+        .checked_add(MIN_PARK)
+        .map_or(until, |floor| until.max(floor));
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return (held, Woke::Due);
+        }
+        let slice = (lane.slice)(left);
+        let (back, woke) = wait(held, slice);
+        held = back;
+        if woke {
+            return (held, Woke::Rang);
+        }
+        if slice >= left {
+            return (held, Woke::Due);
+        }
+        if (lane.hung_up)() {
+            return (held, Woke::HungUp);
+        }
+        if moved() {
+            return (held, Woke::Rang);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use aterm_spec::wait::MUST_HAPPEN;
+
+    use super::*;
+
+    /// A slice of a millisecond, for a park that must be cut many times.
+    fn short(left: Duration) -> Duration {
+        left.min(Duration::from_millis(1))
+    }
+
+    /// A slice that ends with no wake asks after the caller, then after the
+    /// flag, and parks again: the hang-up on its third ask ends the park after
+    /// exactly three waits, and a flag moved at its first ask ends it after
+    /// one. Both are counts, inside a window the hang detector bounds. A wake
+    /// asks neither.
+    #[test]
+    fn a_bare_slice_asks_only_after_the_caller_and_the_flag() {
+        static ASKS: AtomicUsize = AtomicUsize::new(0);
+        fn third_ask() -> bool {
+            ASKS.fetch_add(1, Ordering::SeqCst) + 1 >= 3
+        }
+        fn there() -> bool {
+            false
+        }
+        let until = Instant::now() + MUST_HAPPEN;
+        let sleep = |waits: &mut usize, bound: Duration| {
+            *waits += 1;
+            std::thread::sleep(bound);
+            false
+        };
+
+        let (mut waits, flag_reads) = (0, AtomicUsize::new(0));
+        let hang_up = Lane {
+            slice: short,
+            hung_up: third_ask,
+        };
+        let moved = || {
+            flag_reads.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let woke = park(|b| sleep(&mut waits, b), until, hang_up, &moved);
+        assert_eq!(woke, Woke::HungUp);
+        assert_eq!(waits, 3, "one wait per ask");
+        assert_eq!(
+            flag_reads.load(Ordering::SeqCst),
+            2,
+            "the flag is read after each ask that found the caller there"
+        );
+
+        let mut waits = 0;
+        let lane = Lane {
+            slice: short,
+            hung_up: there,
+        };
+        let woke = park(|b| sleep(&mut waits, b), until, lane, &|| true);
+        assert_eq!((woke, waits), (Woke::Rang, 1), "a moved flag is a wake");
+
+        // NEGATIVE CONTROL: a wake ends the park before anything is asked.
+        ASKS.store(0, Ordering::SeqCst);
+        let unread = || -> bool { panic!("a wake reads no flag") };
+        let woke = park(|_| true, until, hang_up, &unread);
+        assert_eq!((woke, ASKS.load(Ordering::SeqCst)), (Woke::Rang, 0));
+    }
+
+    /// Off a serving lane the park is one wait for the whole remainder, and
+    /// ends `Due`: nothing is asked.
+    #[test]
+    fn an_unserved_park_is_one_wait() {
+        let mut bounds = Vec::new();
+        let lane = Lane {
+            slice: |left: Duration| left,
+            hung_up: || -> bool { panic!("an unserved park asks after no caller") },
+        };
+        let woke = park(
+            |bound| {
+                bounds.push(bound);
+                std::thread::sleep(bound);
+                false
+            },
+            Instant::now() + Duration::from_millis(20),
+            lane,
+            &|| -> bool { panic!("and reads no flag") },
+        );
+        assert_eq!((woke, bounds.len()), (Woke::Due, 1), "{bounds:?}");
+    }
+
+    /// A guarded park hands the guard back: a notify ends it with the state
+    /// the notifier wrote readable under the guard. The negative control, no
+    /// notify, ends at its instant with the guard back too.
+    #[test]
+    fn a_guarded_park_hands_its_guard_back() {
+        let shared = Arc::new((Mutex::new(0u32), Condvar::new()));
+        let parked = Arc::new(AtomicBool::new(false));
+        let notifier = {
+            let (shared, parked) = (shared.clone(), parked.clone());
+            std::thread::spawn(move || {
+                aterm_spec::wait::until_within(MUST_HAPPEN, "the park to hold the condvar", || {
+                    parked.load(Ordering::SeqCst).then_some(())
+                });
+                // The lock is free only once the park waits on the condvar.
+                *shared.0.lock().unwrap() = 7;
+                shared.1.notify_all();
+            })
+        };
+        let lane = Lane {
+            slice: short,
+            hung_up: never,
+        };
+        let until = Instant::now() + MUST_HAPPEN;
+        let mut guard = shared.0.lock().unwrap();
+        parked.store(true, Ordering::SeqCst);
+        while *guard != 7 {
+            assert!(
+                Instant::now() < until,
+                "hang detector: the notify never came"
+            );
+            guard = park_guarded(&shared.1, guard, until, lane);
+        }
+        drop(guard);
+        notifier.join().unwrap();
+
+        let guard = shared.0.lock().unwrap();
+        let guard = park_guarded(
+            &shared.1,
+            guard,
+            Instant::now() + Duration::from_millis(5),
+            lane,
+        );
+        assert_eq!(*guard, 7, "the guard comes back at the instant");
+    }
+}

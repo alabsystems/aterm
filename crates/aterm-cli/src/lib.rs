@@ -56,6 +56,10 @@ mod driver;
 
 // The manual behind `aterm help [topic]`.
 mod manual;
+mod spotlight;
+
+// `aterm edit` and the `amacs` argv0 alias: the amacs program's one entry.
+pub mod amacs_launch;
 
 // How the print-and-exit verbs spell their text for its stream: as it is, except
 // into a pipe a Windows shell made under a legacy code page, which gets the
@@ -161,8 +165,9 @@ const HELP_HEAD: &str = concat!(
     "    show-config               Print this session's shell, TERM, size and\n",
     "                              containment default.\n",
     "    explain-config            Explain how aterm resolves its configuration.\n",
-    "    doctor                    Check shell, access (macOS), instances, crashes;\n",
-    "                              exit 1 only when the shell cannot start.\n",
+    "    doctor                    Check shell, access (macOS), instances, the\n",
+    "                              fabric's broker, crashes; exit 1 only when the\n",
+    "                              shell cannot start.\n",
     "    list-fonts                List available font families.\n",
     "    show-face <family>        Show a font family's file and cell metrics.\n",
     "    list-themes               List the built-in and custom themes (the same as\n",
@@ -210,12 +215,21 @@ pub enum Verb {
     /// `aterm pkg` — the toolchain package manager.
     Pkg,
     /// `aterm fleet` — this machine's membership in a fleet (`init`, `join`,
-    /// `peers`, `leave`): the machines `aterm ctl survey --fleet` reads.
+    /// `peers`, `allow`, `leave`): the machines `aterm ctl survey --fleet`
+    /// (or `--host <h>`, one of them) reads with no grant, and THE STEP-IN — a
+    /// machine whose person ran `aterm fleet allow drive --from <node>` is
+    /// driven from that node with `aterm ctl --host <h> spawn|await
+    /// task|result|turn|key|send|hold|close` (`crates/aterm-ctl/src/remote.rs`;
+    /// `aterm help workers`). `aterm ctl --host <h> survey` is that read, not a
+    /// drive.
     Fleet,
     /// `aterm drive` — the window harness's readers by hand (classify, phase,
     /// answer, ledger; tape and replay for a harness tape).
     Drive,
-    /// `aterm link` — the fabric bridge (`serve`, `ls`, `hook`, `notify`, …).
+    /// `aterm link` — the fabric bridge (`serve`, `ls`, `notify`, `broker`,
+    /// `mint`, `fabric`). The retired `hook` is no verb of it: a surviving
+    /// settings entry still runs it, so it answers exit 0 and does nothing
+    /// (`aterm_link::cli::RETIRED_HOOK_LINE`).
     Link,
     /// `aterm fabric` — the fabric's state on one screen, its traffic live, and
     /// `on|off|doctor`: the one command that turns it on and proves it.
@@ -234,6 +248,8 @@ pub enum Verb {
     /// Macs over SSH, no MDM and no Apple account (docs/DESIGN-machines-2026-10-16.md).
     /// macOS only: elsewhere the verb refuses by name.
     Machines,
+    /// `aterm init` — configure the current macOS login and optional GitHub bootstrap.
+    Init,
     /// `aterm harness` — the Claude Code harness's read views, the accounts
     /// roster (docs/DESIGN-claude-accounts-2026-10-01.md) and the live agent
     /// upgrade (docs/DESIGN-aterm-wrapper-2026-09-17.md §0.4). The window host
@@ -250,6 +266,11 @@ pub enum Verb {
     /// `aterm theme` — list, validate, create, export and import themes, and
     /// inspect the native theme schema.
     Theme,
+    /// `aterm edit` — amacs, aterm's editor (docs/DESIGN-amacs-2026-10-19.md):
+    /// in a window's tab, a file opens in a fresh Editor tab beside it and the
+    /// command waits until that tab is closed. Also the `amacs` argv0 alias,
+    /// the name `$EDITOR` holds.
+    Edit,
     /// `aterm new-tab` — a tab, routed by `windowing_behavior` (S12 / design §5).
     NewTab,
     /// `aterm new-window` — a window, unconditionally (the `attach` escape hatch).
@@ -273,10 +294,12 @@ impl Verb {
         Verb::Agents,
         Verb::Ai,
         Verb::Machines,
+        Verb::Init,
         Verb::Harness,
         Verb::Keeper,
         Verb::Caffeine,
         Verb::Theme,
+        Verb::Edit,
         Verb::NewTab,
         Verb::NewWindow,
         Verb::SplitPane,
@@ -297,10 +320,12 @@ impl Verb {
             Verb::Agents => "agents",
             Verb::Ai => "ai",
             Verb::Machines => "machines",
+            Verb::Init => "init",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
             Verb::Caffeine => "caffeine",
             Verb::Theme => "theme",
+            Verb::Edit => "edit",
             // Hyphenated, exactly like Windows Terminal's — the whole value of a
             // familiar grammar is that the words are the same words.
             Verb::NewTab => "new-tab",
@@ -326,12 +351,15 @@ impl Verb {
             // A report over what `aterm link` and `aterm ctl` reach; only a
             // front-door word (and `aterm-link fabric`).
             Verb::Fabric => None,
+            // `$EDITOR` names one executable, run with no room for a verb.
+            Verb::Edit => Some("amacs"),
             // Generic names like `new-tab` do not belong on a user's `$PATH`.
             Verb::Ship
             | Verb::Update
             | Verb::Agents
             | Verb::Ai
             | Verb::Machines
+            | Verb::Init
             | Verb::Harness
             | Verb::Keeper
             | Verb::Caffeine
@@ -365,10 +393,12 @@ impl Verb {
             | Verb::Agents
             | Verb::Ai
             | Verb::Machines
+            | Verb::Init
             | Verb::Harness
             | Verb::Keeper
             | Verb::Caffeine
-            | Verb::Theme => false,
+            | Verb::Theme
+            | Verb::Edit => false,
         }
     }
 
@@ -387,10 +417,12 @@ impl Verb {
             Verb::Agents => "aterm agents [<cmd>]",
             Verb::Ai => "aterm ai [<cmd>]",
             Verb::Machines => "aterm machines <cmd>",
+            Verb::Init => "aterm init [--plan|--check]",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
             Verb::Caffeine => "aterm caffeine [<cmd>]",
             Verb::Theme => "aterm theme <cmd>",
+            Verb::Edit => "aterm edit [+L[:C]] <file>",
             // `[-d dir]` rather than `[-d <dir>]`: the synopsis column is 26
             // wide and the blurb is pinned to column 30.
             Verb::NewTab => "aterm new-tab [-d dir]",
@@ -413,7 +445,9 @@ impl Verb {
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
             Verb::Fleet => &[
                 "This machine's membership in a fleet, the aterms of one LAN",
-                "that read each other (init | join | peers | leave).",
+                "that read each other (init | join | peers | allow | leave);",
+                "`allow drive --from <node>` lets that node drive this machine",
+                "with `aterm ctl --host <h> …` (`aterm help workers`).",
             ],
             Verb::Link => {
                 &["The fabric bridge: carry inbox/post between this instance and the bus."]
@@ -447,6 +481,10 @@ impl Verb {
                 "Configure and manage a lab of Macs over SSH from this one (init |",
                 "scan | enroll | status | plan | apply | person | screen). macOS.",
             ],
+            Verb::Init => &[
+                "Configure this Mac's keyboard, scrolling, widgets, Dock and accounts.",
+                "Optional init.toml GitHub authentication and clones. Current macOS user.",
+            ],
             Verb::Harness => &[
                 "Claude Code's spend, limits and accounts, the disk, the ledger",
                 "(usage | limits | accounts | disk | ledger); `upgrade` moves a",
@@ -464,6 +502,11 @@ impl Verb {
                 "List every theme (list); write and test your own (new, check,",
                 "export, schema); convert another terminal's theme (kitty, Ghostty,",
                 "Alacritty, iTerm2, Windows Terminal, base16) into it (import).",
+            ],
+            Verb::Edit => &[
+                "amacs, aterm's editor: open a file in a fresh Editor tab",
+                "beside this one and wait until it is closed (`amacs` is",
+                "the same command, for $EDITOR).",
             ],
             Verb::NewTab => &[
                 "Open a terminal tab. Where it opens is the",
@@ -562,7 +605,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "doctor",
-        "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances and past crashes, and fix what aterm can (stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; exits 1 only when the shell cannot start.",
+        "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances, the fabric's broker (does it answer, what tier it serves, is its log poisoned) and past crashes, and fix what aterm can (stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; exits 1 only when the shell cannot start.",
     ),
     ("list-fonts", "List available font families (one per line)."),
     ("show-face", "Show a font family's file and cell metrics."),
@@ -804,8 +847,9 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         writes when it shows a consent dialog: it decides when to ask,\n\
      \x20                         and any other dialog it can name is a record in Messages saying\n\
      \x20                         which tab asked (with notice on). false: off. true: the full\n\
-     \x20                         stream, the tab mark and a banner per dialog. Config only;\n\
-     \x20                         nothing in a session can set it.\n\
+     \x20                         stream, the tab mark and a banner per dialog. enabled = false\n\
+     \x20                         turns every mode off, true included. Config only; nothing in a\n\
+     \x20                         session can set it.\n\
      \x20                         false also stops the Developer Tools row's reads (tccd's log\n\
      \x20                         and the switch), the window's and both doctors' alike.\n\
      \x20 warmup                  \"automatic\" (default) | \"on-request\" | \"never\". The warm-up\n\
@@ -1597,7 +1641,8 @@ fn unix_shell(
 /// when it is unset; the shell a new WINDOW tab spawns on Windows), the macOS consent
 /// posture (Full Disk Access, debugger access, and whether macOS checks each
 /// new program aterm starts), the aterm instances no control socket reaches,
-/// the recovery ledger and open exceptions, plus the version. Reads env/fs +
+/// the fabric's broker (Unix: [`fabric_fact`]), the recovery ledger and open
+/// exceptions, plus the version. Reads env/fs +
 /// the consent tier, then delegates to the pure [`doctor_checks_with_origin`].
 /// Exit 1 only when the shell cannot start. Scriptable: `aterm doctor && aterm`.
 ///
@@ -1612,13 +1657,17 @@ fn doctor_report(fix: bool) -> (String, i32) {
         // The Developer Tools read (one `sqlite3` and one `log show`, up to 8 s)
         // runs beside the other facts, not after them.
         let devtools = scope.spawn(move || devtools_facts(fix));
+        let spotlight = scope.spawn(spotlight::facts);
         let privacy = privacy_facts();
         let debugger = debugger_facts();
         let instances = aterm_ctl::census::window_census();
         let recovery = recovery_facts();
         let exceptions = exceptions_facts();
-        let machine = machine_facts(fix);
+        let mut machine = machine_facts(fix);
         let devtools = devtools
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        machine.spotlight = spotlight
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         // Unix: the program this passthrough session spawns.
@@ -1660,14 +1709,19 @@ fn doctor_report(fix: bool) -> (String, i32) {
 }
 
 /// The stale copies of aterm as `doctor` reads them ([`atpkg::copies`]), with
-/// what this run did about them, and the console host a new window's tab runs
-/// in. Each is `None` where there is nothing to say (copies off macOS, the
-/// console host off Windows).
+/// what this run did about them, the console host a new window's tab runs
+/// in, and the fabric's broker. Each is `None` where there is nothing to say
+/// (copies off macOS, the console host off Windows, the fabric off Unix).
 struct MachineFacts {
     /// What the stale-copy prune found and did.
     copies: Option<atpkg::copies::Pruned>,
     /// Windows: the console host a new window's tab gets ([`console_host_fact`]).
     console_host: Option<aterm_pty::ConsoleHostReport>,
+    /// Unix: the fabric's broker in one row ([`fabric_fact`]).
+    fabric: Option<(Mark, String)>,
+    /// macOS: what Spotlight indexes of Rust build output and rustup's docs
+    /// ([`spotlight::facts`]).
+    spotlight: Option<Result<spotlight::Spotlit, String>>,
 }
 
 impl MachineFacts {
@@ -1676,6 +1730,8 @@ impl MachineFacts {
         Self {
             copies: None,
             console_host: None,
+            fabric: None,
+            spotlight: None,
         }
     }
 }
@@ -1685,16 +1741,70 @@ impl MachineFacts {
 /// would move — and the console host.
 fn machine_facts(fix: bool) -> MachineFacts {
     let console_host = console_host_fact();
+    let fabric = fabric_fact();
     if !cfg!(target_os = "macos") {
         return MachineFacts {
             console_host,
+            fabric,
             ..MachineFacts::absent()
         };
     }
     MachineFacts {
         copies: Some(atpkg::copies::prune(!fix)),
         console_host,
+        fabric,
+        spotlight: None,
     }
+}
+
+/// The fabric's broker in one row, read by aterm-link's own probe
+/// ([`aterm_link::fabric::doctor_summary`]: connect, `Hello`, the ring
+/// attached, the head query — `aterm fabric`'s, for the command the
+/// configuration names; a bridge an instance kept after `off` is `aterm
+/// fabric`'s alone to report, and the `off` row says so): whether
+/// it answers, the tier it SAYS it serves, and whether it says its log is
+/// poisoned. aterm-link's weights in this report's marks: a broker that does
+/// not answer, a bus that cannot be read and a poisoned log are a counted
+/// `warn` — mail does not move, and `aterm fabric doctor` names the fix — but
+/// never a failure, since no shell needs the fabric to start. `None` off Unix,
+/// where aterm has no fabric (crates/aterm's Cargo.toml says why).
+fn fabric_fact() -> Option<(Mark, String)> {
+    #[cfg(unix)]
+    {
+        let summary = aterm_link::fabric::doctor_summary();
+        Some((fabric_mark(summary.level), summary.text))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// aterm-link's weight for the fabric row in this report's marks: never
+/// [`Mark::Fail`].
+#[cfg(unix)]
+const fn fabric_mark(level: aterm_link::fabric::SummaryLevel) -> Mark {
+    use aterm_link::fabric::SummaryLevel;
+    match level {
+        SummaryLevel::Ok => Mark::Ok,
+        SummaryLevel::Note => Mark::Note,
+        SummaryLevel::Warn => Mark::Warn,
+    }
+}
+
+/// The `fabric:` row, pure over the facts ([`fabric_fact`]); none where there
+/// is no fabric.
+fn fabric_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    facts
+        .fabric
+        .as_ref()
+        .map(|(mark, fact)| DoctorRow {
+            label: "fabric:",
+            mark: *mark,
+            fact: fact.clone(),
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Windows: the console host a new window's tab runs in under aterm.toml's
@@ -2151,6 +2261,25 @@ fn console_host_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     }]
 }
 
+/// The `spotlight:` row, pure over the count ([`spotlight::row`]): `ok` when Spotlight
+/// indexes none of it, a `note` naming the folders and the remedy otherwise; none off
+/// macOS.
+fn spotlight_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    facts
+        .spotlight
+        .as_ref()
+        .map(|measured| {
+            let (clean, fact) = spotlight::row(measured);
+            DoctorRow {
+                label: "spotlight:",
+                mark: if clean { Mark::Ok } else { Mark::Note },
+                fact,
+            }
+        })
+        .into_iter()
+        .collect()
+}
+
 /// The `copies:` row, pure over the facts: atpkg's words and weights, never a
 /// failure (a `warn` moves no exit code: nothing in it stops a shell from
 /// starting).
@@ -2360,16 +2489,19 @@ fn doctor_checks_with_origin(
         });
     }
     checks.extend(copies_rows(machine));
+    checks.extend(spotlight_rows(machine));
     checks.extend(console_host_rows(machine));
     let (instances_mark, instances_fact) = instances_row(instances);
     let (recovery_mark, recovery_fact) = recovery_row(recovery);
     let (exceptions_mark, exceptions_fact) = exceptions_row(exceptions);
+    checks.push(DoctorRow {
+        label: "instances:",
+        mark: instances_mark,
+        fact: instances_fact,
+    });
+    // The fabric beside the instances that carry it.
+    checks.extend(fabric_rows(machine));
     checks.extend([
-        DoctorRow {
-            label: "instances:",
-            mark: instances_mark,
-            fact: instances_fact,
-        },
         DoctorRow {
             label: "recovery:",
             mark: recovery_mark,
@@ -3175,9 +3307,9 @@ pub fn session_main(quiet: bool) -> ! {
     // The session PATH, one `("PATH", value)` pair composed like the window's
     // `env_add` (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching
     // PATH"): the reroute dir (so a bare `cargo`/`rustc` is announced or
-    // signposted), the managed `agents/` (`managed_agents_dir`), aterm's own
-    // binary dir, then the inherited PATH, which the front door has already
-    // given the managed `bin/` at its end where the machine consents
+    // signposted), the managed `agents/` (`managed_agents_dir`), the selected CLI
+    // link directory, aterm's own binary dir, then the inherited PATH. The front
+    // door has already given it the managed `bin/` at its end where the machine consents
     // (`atpkg::session_bin_dir`). `--no-reroute` means no reroute prepend and
     // no export.
     //
@@ -3191,14 +3323,23 @@ pub fn session_main(quiet: bool) -> ! {
         reroute_dir.as_deref(),
         std::env::var(HOOK_AGENTS_ENV).ok().as_deref(),
     );
-    let mut env_add: Vec<(String, String)> = session_path_env(
+    let inherited = std::env::var("PATH").ok();
+    let path = session_path_env(
         reroute_dir.as_deref(),
         agents_dir.as_deref(),
         front_door_bin_dir().as_deref(),
-        std::env::var("PATH").ok().as_deref(),
+        inherited.as_deref(),
+    );
+    let path = aterm_types::cli_path::selected_path(
+        aterm_types::dirs::home_dir().as_deref(),
+        reroute_dir.as_deref(),
+        agents_dir.as_deref(),
+        path.as_ref()
+            .map(|(_, value)| value.as_str())
+            .or(inherited.as_deref()),
     )
-    .into_iter()
-    .collect();
+    .or(path);
+    let mut env_add: Vec<(String, String)> = path.into_iter().collect();
     if let Some(dir) = &reroute_dir {
         env_add.push((REROUTE_DIR_ENV.to_string(), dir.clone()));
     } else if std::env::var_os(REROUTE_DIR_ENV).is_some() {
@@ -3284,7 +3425,7 @@ mod tests {
     #[cfg(windows)]
     use super::show_config_report;
     #[cfg(unix)]
-    use super::unix_shell;
+    use super::{fabric_mark, machine_facts, unix_shell};
 
     fn decide(args: &[&str]) -> CliAction {
         decide_args(args.iter().map(|s| s.to_string()))
@@ -4950,6 +5091,7 @@ mod tests {
                 pressure: Pressure::Normal,
                 trial: 0,
             },
+            keeper: None,
             restores: None,
         };
         let path = std::path::PathBuf::from("/logs/recovery-ledger.log");
@@ -5061,6 +5203,129 @@ mod tests {
             row("copies:").contains("not checked"),
             "a test binary must never prune\n{r}"
         );
+        // Spotlight is not asked either.
+        assert!(
+            row("spotlight:").contains("not measured (a test binary)"),
+            "{r}"
+        );
+    }
+
+    /// **THE `spotlight:` ROW REPORTS, NEVER FAILS.** What Spotlight indexes of
+    /// build output and rustup's docs is a `note` (the health line stays OK and
+    /// names nothing) under `copies:`; none indexed is `ok`. NEGATIVE CONTROL:
+    /// with no count — off macOS — there is no row.
+    #[test]
+    fn the_spotlight_row_is_a_note_at_worst() {
+        let report = |spotlight| {
+            doctor_checks_with_origin(
+                "/bin/sh",
+                ShellCheck::Runs,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &DevtoolsFacts::absent(),
+                &no_census(),
+                &no_recovery(),
+                &no_exceptions(),
+                &MachineFacts {
+                    spotlight,
+                    ..MachineFacts::absent()
+                },
+            )
+        };
+        let lit = crate::spotlight::Spotlit {
+            builds: vec![("~/w/target".into(), 12)],
+            docs: None,
+        };
+        let (r, code) = report(Some(Ok(lit)));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "spotlight:"), "note", "{r}");
+        assert!(r.contains("~/w/target 12"), "{r}");
+        assert!(r.contains("health: OK\n"), "{r}");
+        let clean = crate::spotlight::Spotlit {
+            builds: vec![],
+            docs: None,
+        };
+        let (r, _) = report(Some(Ok(clean)));
+        assert_eq!(mark_of(&r, "spotlight:"), "ok", "{r}");
+        let (r, _) = report(None);
+        assert!(!r.contains("spotlight:"), "{r}");
+    }
+
+    /// **THE `fabric:` ROW IS ATERM-LINK'S VERDICT, A COUNTED WARNING AT
+    /// WORST.** It sits right after `instances:`, says aterm-link's words, and
+    /// a broker that does not answer (or a poisoned log) is a `warn` the
+    /// health line names while the exit stays 0: no shell needs the fabric to
+    /// start. One that answers is `ok`. NEGATIVE CONTROL: with no fabric fact
+    /// — off Unix — there is no row at all, and the health line names nothing.
+    #[test]
+    fn the_fabric_row_is_a_counted_warning_never_a_failure() {
+        let report = |fabric: Option<(Mark, String)>| {
+            doctor_checks_with_origin(
+                "/bin/sh",
+                ShellCheck::Runs,
+                None,
+                &unmeasured(),
+                &no_debugger(),
+                &no_devtools(),
+                &no_census(),
+                &no_recovery(),
+                &no_exceptions(),
+                &MachineFacts {
+                    fabric,
+                    ..MachineFacts::absent()
+                },
+            )
+        };
+        let (none, code) = report(None);
+        assert_eq!(code, 0);
+        assert!(!none.lines().any(|l| l.starts_with("fabric:")), "{none}");
+        assert!(!none.contains("fabric"), "{none}");
+
+        let down = "the broker at /r/bus.sock does not answer (connect: refused) — `aterm \
+                    fabric doctor` names the fix";
+        let (r, code) = report(Some((Mark::Warn, down.to_string())));
+        assert_eq!(code, 0, "a broker that does not answer fails no shell\n{r}");
+        let rows: Vec<&str> = r.lines().collect();
+        let at = rows
+            .iter()
+            .position(|l| l.starts_with("fabric:"))
+            .expect("the row");
+        assert!(rows[at - 1].starts_with("instances: "), "{r}");
+        assert_eq!(rows[at], format!("fabric:     warn  {down}"));
+        assert!(r.contains("health: OK — 1 warning (fabric)\n"), "{r}");
+
+        let (r, code) = report(Some((Mark::Ok, "the broker answers".to_string())));
+        assert_eq!(code, 0);
+        assert_eq!(mark_of(&r, "fabric:"), "ok", "{r}");
+        assert!(r.contains("health: OK\n"), "{r}");
+    }
+
+    /// aterm-link's three weights map onto the report's marks, none a failure.
+    #[cfg(unix)]
+    #[test]
+    fn the_fabric_weights_are_never_a_failure() {
+        use aterm_link::fabric::SummaryLevel;
+        assert_eq!(fabric_mark(SummaryLevel::Ok), Mark::Ok);
+        assert_eq!(fabric_mark(SummaryLevel::Note), Mark::Note);
+        assert_eq!(fabric_mark(SummaryLevel::Warn), Mark::Warn);
+        for level in [SummaryLevel::Ok, SummaryLevel::Note, SummaryLevel::Warn] {
+            assert!(!fabric_mark(level).is_fail());
+        }
+    }
+
+    /// **`aterm doctor` READS THE FABRIC'S ROW.** `machine_facts` is where the
+    /// row is read (aterm-link's `doctor_summary`), and every other test here
+    /// builds `MachineFacts` by hand — so a fact dropped there would pass them
+    /// all and leave `aterm doctor` with no `fabric:` row. Whatever this
+    /// process's fabric is (a test binary's own config root names none, so
+    /// usually `off`), the row is there, says something, and is no failure.
+    #[cfg(unix)]
+    #[test]
+    fn the_doctors_machine_facts_read_the_fabric_row() {
+        let (mark, fact) = machine_facts(false).fabric.expect("a fabric row on Unix");
+        assert!(!mark.is_fail(), "{fact}");
+        assert!(!fact.trim().is_empty());
     }
 
     /// The `devtools:` and `copies:` rows: aterm not on the Developer Tools list
@@ -5096,6 +5361,8 @@ mod tests {
                 kept: Vec::new(),
             }),
             console_host: None,
+            fabric: None,
+            spotlight: None,
         };
         let report = |d: &DevtoolsFacts| {
             doctor_checks_with_origin(
@@ -5679,7 +5946,7 @@ mod tests {
         // Either the sentinel, or a newline-terminated list of non-empty lines that
         // matches the enumeration exactly (deterministic, scriptable).
         if r == "(no fonts found)\n" {
-            return;
+            aterm_spec::host::could_not_run("no fonts found on this host to list");
         }
         assert!(r.ends_with('\n'), "must be newline-terminated");
         let lines: Vec<&str> = r.lines().collect();

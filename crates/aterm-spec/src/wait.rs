@@ -22,6 +22,13 @@ use std::time::{Duration, Instant};
 /// what is awaited, and a defect that never delivers still fails.
 pub const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
+/// How long a parked stand-in lives, in seconds (`sleep {PARKED_SECS}`): twice [`MUST_HAPPEN`].
+/// A stand-in whose end a test waits to see caused — by a kill, a group sweep, a signal remedy —
+/// must outlast the hang detector, or a run in which nothing ended it passes once it ended by
+/// itself (a `sleep 30` under a one-minute wait did, for a remedy that sent no signal). It still
+/// ends by itself, so a fixture an early panic orphans does not live on.
+pub const PARKED_SECS: u64 = 2 * MUST_HAPPEN.as_secs();
+
 /// The gap [`until_within`] leaves between observations. Not a synchronisation
 /// primitive: the observation is the assertion, and this only keeps the poll
 /// from spinning a core.

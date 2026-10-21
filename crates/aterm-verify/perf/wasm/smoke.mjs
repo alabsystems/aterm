@@ -133,4 +133,6 @@ panicSmoke('cpu', cpu, cpu.AtermTerminal)
 panicSmoke('gpu', gpu, gpu.AtermGpuTerminal)
 
 console.error(`wasm-smoke: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
-process.exit(failures === 0 ? 0 : 1)
+// Ended by itself, never `process.exit()`, which can hang once a module ran
+// (`replay.mjs`, where it was measured).
+process.exitCode = failures === 0 ? 0 : 1

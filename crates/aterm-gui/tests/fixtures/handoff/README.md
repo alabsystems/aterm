@@ -12,8 +12,9 @@ same build, so a consumer change that refuses an older producer's bytes passes
 the suite and fails in the field.
 
 Each `v<release>/` directory holds what that release's producer wrote: one
-directory per desk, and `rendezvous.toml`. When they were written, that
-release's own consumer adopted every desk exactly. v0.96.0 and v0.99.0 were
+directory per desk, `rendezvous.toml` and, from v0.107.0, `fields.toml` (what
+its desks cover, below). When they were written, that release's own consumer
+adopted every desk exactly. v0.96.0 and v0.99.0 were
 never cut and have no directory.
 
 **A red guard is never fixed by regenerating or editing a fixture.** Those
@@ -81,6 +82,73 @@ Beside it:
   unreadable, and the Settings tab moved to the other tab's position.
 - `every_release_since_the_floor_pins_the_required_desks` checks that every
   release pins each desk in `REQUIRED_DESKS` from that desk's floor on.
+
+## What the desks cover: `fields.toml`
+
+The guard checks only the shapes its desks carry, so a field the producer can
+write but no desk does is one the next consumer's parse is never held to.
+Each release's `fields.toml` records, record by record (`manifest`, `layout`,
+`meta`: every carried screen's engine state, and `control`: every `.ctl`
+sidecar), which fields its desks wrote with a value and which they left
+unwritten (skipped, `None`, an empty list or table), as `Struct.field`, and
+which variants of each enum they reach they took and which they did not, as
+`Enum::Variant`. The lists are read off the serde derives
+(`seamless_fixture_cover.rs`): a field added to a carried struct, or a variant
+to a carried enum, is in the next walk with no table to update. A variant is on
+no list a serializer sees, so the walk reads each desk's values back with a
+name no variant has in each place they wrote one, and the enum that refuses it
+names all its variants, whether it is externally or internally tagged, inside
+another's buffered content, or behind a lenient field that reads a refusal as
+its default.
+
+The generator writes the file beside the desks and holds them strictly. Every
+field of every struct a desk reaches, and every variant of every enum a desk
+reaches, must be written by some desk, with the value a real session carries,
+or be one no handoff writes (below); and every field and variant the newest
+release that recorded a file wrote must still be written here, whether or not
+a desk here still reaches it. Anything else stops `generate_handoff_fixtures`,
+in every ordinary `-p aterm-gui --lib` run and in the cut, naming each one:
+
+```text
+carried fields and variants no desk here writes (held since v0.107.0); ...
+  manifest CarriedMessage.fill_permille (no desk writes it)
+  meta CursorStyle::SteadyBar (no desk writes it)
+```
+
+Fix it in a desk, by giving the field the value a real session carries, or by
+taking the variant as a program or the host would. A field added to a carried
+struct, or a variant to a carried enum, is held from the run that adds it, so
+the change that adds it also gives it a value in a desk. A struct is reached
+through a field or a variant, so the only carried struct no desk reaches is one
+behind a field or variant no handoff writes.
+
+What the hold cannot see is what serde does not spell: a string is one field,
+whatever it says (the engine state is a JSON string, walked as its own record;
+a row's words are its own parser's), and a desk can stand for a state (a parser
+stopped mid-sequence, a policy's path) that writes no field of its own. So a
+release that adds such a state still adds a desk for it, and a
+`REQUIRED_DESKS` row with that release as the floor once its fixtures are
+checked in.
+
+A field or variant no handoff writes (one the update's producer never sets:
+written by another writer of its struct, as the crash carry's `Wire.turn_ids`,
+retired, or set by nothing in this build, as DECSCL's missing levels) goes in
+the generator's `NO_HANDOFF_WRITES` with why. The hold refuses a row there that
+a desk writes, and one that names nothing a desk reaches. v0.107.0's file was recorded after its cut, at its
+tag, by the same walk over these bytes.
+
+## The other direction
+
+The guard runs one way, an older producer's bytes into this consumer, because
+an update hands only to a newer build. No update authority names a build at or
+below the running one: a download staged there and an installed bundle there
+mint no stage and back no activation
+(`native_updater_service`'s
+`no_update_authority_names_a_build_at_or_below_the_running_one`, which fails
+when either comparison is made `>=`), and the one same-image hop (the QA seam,
+a launch-record renewal) runs this very build. An older bundle a person puts
+back starts cold; nothing hands it a session. So no shipped consumer reads this
+producer's bytes, and there is no reverse hop to check.
 
 ## What a desk directory holds
 
@@ -216,6 +284,69 @@ v0.100.0).
   a `.h<id>.hist` sidecar (11 and 12 lines, none left behind) and a `.h<id>.ctl`
   sidecar; `make`'s failure, in the tab in front, had been seen and vim's had
   not.
+
+- `carried-state` (v0.108.0): the state a session, its window and its desk
+  carry beside the screens, which no other desk writes. The last run's window
+  crashed and the desk was restored cold. Session 0 is a shell scrolled back
+  12 lines whose driver set its title, icon, attention, a keyed `wait`
+  escalation and Autopilot `cruise` with a deadline, set over `aterm ctl` (the
+  leaf's `autopilot_by`); it is under a fleet and a local hold (which the
+  status item saw), an external supervisor's lease, a working task, a spawn
+  identity, its own theme and the lineage of the restores it continues. Its
+  mailbox was driven through the bridge plane's verbs: a queued answer with
+  `re`, `dl`, `via` and `key`, a note left behind by id (`dl` past what TOML
+  writes), receipts owed on the current and an earlier bus log and one left
+  behind, a ring overflowed by broadcasts on its topic, and the bridge's
+  mirror took its log (`log_mirror`). Session 1, which session 0 spawned, is a
+  restored tab whose Codex relaunch is still owed (its leaf's `agent`, with
+  the `CODEX_HOME` its run set) and whose crash journal image was the crashed
+  window's (`journal_key`). Session 2 is a worker Claude Code adopted across
+  an earlier update (its ledger carried with a shed floor), in a shell an older
+  build spawned (`frozen_path`): the harness pressed `keep going` and the
+  person scrolled it back, so its sidecar carries `pressed`, `shed_below` and
+  the differ's `below`, and its leaf the agent the host supervises, under its
+  own Claude home and login. Sessions 3 to 6 are restored tabs whose Muse
+  Code, agy, Gemini CLI and Claude Code relaunches are owed, the last for the
+  explicit restart (`cause`, the tab it ran in). Session 7's agent cannot be
+  brought back (the leaf's `lost`). A second window co-views session 0. The
+  first window is zoomed two steps, and its band holds a wire notice posted
+  twice, a row restated a mark worse than it was posted, an unanswered
+  update-health warning, a metered build, the crash's record, the worker's
+  lost shell integration and its lost login waiting on the owner's sign-in (a
+  standing ask with its band's short title, `short_title`). The manifest names the bridge `fabric attach` armed
+  (`fabric_attached`), the fleet need the owner was told, a closed session's
+  mirrored tail and that the mirror is served.
+- `engine-state` (v0.108.0): seventeen sessions whose engines hold the state
+  a carried screen's meta writes and no other desk does: parsers stopped in
+  every carried state (a CSI parameter and intermediate, an OSC picture, a
+  split UTF-8 character, an APC and a DCS), the colours pushed with OSC 30001,
+  the charsets in G1 to G3, its title pushed with the icon name cleared, mouse
+  modes saved, the alternate screen's own saved cursor and kitty keyboard
+  stack, an open OSC 8 link, VT52 mode with an address in progress, a 1049
+  screen that owes rows after a resize, a shell resized back by the handback,
+  shells whose integration state was revoked, held, stale or cleared, and
+  Claude Code's two drawers with their cut holders.
+- `held-failed` and `held-withheld` (v0.108.0): a shell beside a `make` that
+  failed and was kept open, its build log in its scrollback. Under
+  `held-withheld`'s successor policy (`carry = "visible"`) the pane's lines are
+  left behind as the policy's choice (`history_withheld`); under
+  `held-failed`'s the person dragged the divider after the park captured the
+  pane, so its lines are left behind as a failure (`history_failed`). Either
+  way every line is counted.
+- `fold` (v0.108.0): a shell in front and a document in each of 64 windows
+  behind it (the config in the Editor with two selections, notes in Markdown,
+  one with a passage selected), one window past the layout's cap, so the
+  layout is folded (`fold`).
+- `variants` (v0.108.0): every variant of a carried enum no other desk takes.
+  A demo of DEC's national sets holds four in G0 to G3 of its screen, of the
+  main screen's DECSC slot and of the alternate screen's, with GL and GR
+  shifted and an SS2 waiting, on a VT100 in a light-mode window; a Latin-2
+  viewer holds DEC Supplemental and two 96-character sets with an SS3 waiting,
+  on a VT220 with BiDi off in the config; with them, the DECSCUSR shapes,
+  mouse modes and encodings, taskbar progress states, conformance levels and
+  paragraph directions no other desk takes, and explicit BiDi. The last tab
+  is a split focused in its second pane, beside the placeholder a pane no
+  session was carried for became on the update before.
 
 ## Producer shapes by release
 
@@ -359,6 +490,21 @@ the metas, and with them the manifests, digests and proof, moved:
 
 `parent.toml` records nothing new.
 
+### The fixtures v0.108.0 writes (this tree's generator)
+
+The generator now writes what the park does where earlier ones did not:
+
+- Every handed session's `.ctl` sidecar carries its session log (`log`): the
+  park has exported it to a newer successor since the session log's phase 2A
+  (`export_for_target`), but every generator through v0.107.0 called the
+  export without it, so no checked-in sidecar holds one.
+- Every terminal leaf names its session's `sid` and log epoch (`log_ep`) and
+  carries the operator's metadata in lockstep with the record
+  (`App::view_restore_descriptor_carrying`); each record carries its log's
+  `log_ids` and `log_seq`, drawn with the manifest.
+- Adds `carried-state`, `engine-state`, `held-failed`, `held-withheld`,
+  `fold` and `variants`, and `fields.toml` beside the desks, held strictly.
+
 ## The rendezvous transport
 
 On macOS the successor gets its PTY masters and the readiness and Commit pipes
@@ -419,11 +565,13 @@ policy reader, capture ladder, history carry, writer and consumer, so a
 producer change that breaks it fails to compile, and each release's tree
 carries the generator that matches its producer. Its two tests run in isolated
 child processes with private output in ordinary tests; the release cutter
-supplies an explicit output directory and its reserved identity: `generate_handoff_fixtures` writes every
-desk in `REQUIRED_DESKS`, and `generate_rendezvous_fixture` (macOS) writes
+supplies an explicit output directory and its reserved identity:
+`generate_handoff_fixtures` writes every desk (each one `REQUIRED_DESKS` asks
+among them) and `fields.toml`, and `generate_rendezvous_fixture` (macOS) writes
 `rendezvous.toml` with the guard's own capture (`capture_transport`). Each
 self-checks: the release's own consumer must adopt every desk exactly, held
-panes and history imports included.
+panes and history imports included, and the desks must cover every field the
+newest recorded release's did (`fields.toml`, above).
 
 Nothing in it is edited per release. Every release input is derived at run
 time:
@@ -476,9 +624,11 @@ The cut (`crates/aterm-release/src/fixtures.rs`):
 release adds rows to: the rendezvous guard pins the same releases.
 
 A release that changes its producer's shape changes the generator in the same
-commit, adds a desk for the shape to `REQUIRED_DESKS` with itself as the floor,
-`("vX.Y.0", "<desk>")`, and says what changed in a section of its own under
-"Producer shapes by release". Never move an existing row's floor, and never
+commit, gives every field it adds a value in a desk (the field record refuses
+it otherwise), and says what changed in a section of its own under "Producer
+shapes by release". A desk it adds may also get a `REQUIRED_DESKS` row with
+itself as the floor, `("vX.Y.0", "<desk>")`, once that release's fixtures are
+checked in (a floor names a release with fixtures). Never move an existing row's floor, and never
 give a new row an earlier floor than the release that first writes it: the
 fixtures of the releases before it are frozen and can never gain the desk.
 Build each layout the way `App::capture_manifest` does (`fx_window`), and give

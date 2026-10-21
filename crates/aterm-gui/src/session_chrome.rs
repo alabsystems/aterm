@@ -119,10 +119,11 @@ pub(crate) struct SessionChromeInput {
     /// its manager or its workers, gathered by the caller from the holds and
     /// the task records.
     pub agent: AgentMenu,
-    /// THE SESSION LOG'S CLAUSE (phase 3B, plan §5; addendum A12), only
-    /// under `[session_log] clause = true`: `now: <its head words>` after
-    /// `activity:`. `None` with the switch off (the default), and then
-    /// every line and row is today's, byte for byte.
+    /// THE SESSION LOG'S CLAUSE (phase 3B, plan §5; addendum A12; on by
+    /// default since D6): `now: <its head words>` after `activity:`, and a
+    /// shown label's author after them. `None` with `[session_log] clause =
+    /// false`, and then every line and row is as it was before the clause,
+    /// byte for byte.
     pub clause: Option<ClauseLine>,
 }
 
@@ -146,7 +147,8 @@ pub(crate) struct AgentMenu {
 /// The session log's clause as the chrome shows it ([`SessionChromeInput::clause`]):
 /// the tooltip's `now: <head>` line, no age and no minutes left (a clock-free
 /// cache cannot keep either true), and the menu's row aged as it pops
-/// ([`TabMenuEntry::Event`]: `now: running shell · 4m ago`).
+/// ([`TabMenuEntry::Event`]: `now: running shell · 4m ago`). A shown label
+/// says whose it is after its words (`now: restarting · by the harness`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClauseLine {
     /// The clause's words without their coarse age (`aterm_slog::Clause::head`).
@@ -156,6 +158,40 @@ pub(crate) struct ClauseLine {
     /// When a shown label leaves (its `until`, on the same clock), the clause
     /// being that label; `None` for every other row (ruling S10).
     pub until_ms: Option<u64>,
+    /// A shown label's author (`aterm_slog::Clause::by` on a label row, D6):
+    /// printed after the head, outside its 48 bytes. `None` for every other
+    /// row: a need, a step, a turn or a run says no author (ruling U22).
+    pub by: Option<ClauseAuthor>,
+}
+
+/// Who wrote a label the clause shows: only a proven author's label shows
+/// (`aterm_slog::shown_proven_label`), so it is the harness or the person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClauseAuthor {
+    /// The window's harness (`by=harness`).
+    Harness,
+    /// The person at the window (`by=human`).
+    You,
+}
+
+impl ClauseAuthor {
+    /// The author of a label written by `by`; `None` for an author whose
+    /// label never shows.
+    pub(crate) const fn of(by: &aterm_slog::Actor) -> Option<Self> {
+        match by {
+            aterm_slog::Actor::Harness => Some(Self::Harness),
+            aterm_slog::Actor::Human => Some(Self::You),
+            _ => None,
+        }
+    }
+
+    /// The words the line ends with.
+    pub(crate) const fn words(self) -> &'static str {
+        match self {
+            Self::Harness => "by the harness",
+            Self::You => "by you",
+        }
+    }
 }
 
 /// What the chrome cache keys the clause on (addendum A12): its row, its head
@@ -643,15 +679,19 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
     (identity, clause_at)
 }
 
-/// The clause's words as a line shows them (`now: <head>`), through the
-/// presentation sanitizer every header line takes (a bidi or C1 character
-/// in a label is stripped); `None` when nothing is left.
+/// The clause's words as a line shows them (`now: <head>`, and a shown
+/// label's ` · by the harness` or ` · by you` after them, outside the head's
+/// 48 bytes), through the presentation sanitizer every header line takes (a
+/// bidi or C1 character in a label is stripped); `None` when nothing is left.
 fn clause_words(clause: &ClauseLine) -> Option<String> {
     let head = crate::session_timeline::sanitize_presentation_line(
         &clause.head,
         crate::session_timeline::META_DESCRIPTION_MAX,
     );
-    (!head.is_empty()).then(|| format!("now: {head}"))
+    (!head.is_empty()).then(|| match clause.by {
+        Some(by) => format!("now: {head} \u{b7} {}", by.words()),
+        None => format!("now: {head}"),
+    })
 }
 
 /// The menu's newest-first timeline tail: each shown event
@@ -719,6 +759,13 @@ pub(crate) fn timeline_row_shown(kind: &str) -> bool {
             | "holder-named"
             | "holder-claim"
             | "card-seen"
+            | "card-decorated"
+            | "card-row"
+            | "card-armed"
+            | "card-bare"
+            | "holder-adopt"
+            // The footer resolver's dev row.
+            | crate::claude_footer::REGISTRY_READ
     )
 }
 
@@ -1767,7 +1814,56 @@ mod tests {
             head: head.to_string(),
             since_ms,
             until_ms,
+            by: None,
         }
+    }
+
+    /// D6 (session log Phase 6 step 6B-2, ruling U22): a shown label's line
+    /// names its author after its words, outside the head's 48 bytes, in the
+    /// tooltip and in the menu's aged row: `by the harness` or `by you`. A
+    /// row with no author (a need, a step, a turn, a run) names none.
+    ///
+    /// NEGATIVE CONTROL: the same label without its author is the bare line.
+    #[test]
+    fn a_shown_label_names_its_author_after_its_words() {
+        let mut input = full_input();
+        let mut label = clause("restarting", NOW - 240_000, Some(NOW + 60_000));
+        label.by = Some(ClauseAuthor::Harness);
+        input.clause = Some(label.clone());
+        assert!(
+            compose_tooltip(&input)
+                .expect("composes")
+                .contains("\nnow: restarting \u{b7} by the harness\ncwd:"),
+            "{:?}",
+            compose_tooltip(&input)
+        );
+        assert_eq!(
+            menu_shown_at(&compose_tab_menu(&input), NOW)[3],
+            TabMenuEntry::Header("now: restarting \u{b7} by the harness \u{b7} 4m ago".to_string())
+        );
+        label.by = Some(ClauseAuthor::You);
+        input.clause = Some(label.clone());
+        assert!(
+            compose_tooltip(&input)
+                .expect("composes")
+                .contains("\nnow: restarting \u{b7} by you\n")
+        );
+        // A head at the clause's full 48 bytes keeps every one of them; the
+        // author follows.
+        let head = "x".repeat(48);
+        label.head.clone_from(&head);
+        input.clause = Some(label.clone());
+        assert!(
+            compose_tooltip(&input)
+                .expect("composes")
+                .contains(&format!("\nnow: {head} \u{b7} by you\n"))
+        );
+        // Negative control.
+        label.by = None;
+        input.clause = Some(label);
+        let bare = compose_tooltip(&input).expect("composes");
+        assert!(bare.contains(&format!("\nnow: {head}\ncwd:")), "{bare:?}");
+        assert!(!bare.contains("\u{b7} by "), "{bare:?}");
     }
 
     /// THE CLAUSE'S LINE AND ROW (phase 3B; addendum A12 item 3): the

@@ -1557,7 +1557,10 @@ fn reset_dialog() -> Vec<String> {
     phase_fixtures::screen(aterm_phase::reset::fixtures::DIALOG_GRANT)
 }
 
-const GRANT: &str = "Use your reset now (2 left, until Oct 5)";
+const GRANT: &str = "Use a weekly reset (2 left, until Oct 5)";
+/// The grant row as Claude Code 2.1.287–2.1.303 drew it: no longer read as
+/// one, and still a spend.
+const OLD_GRANT: &str = "Use your reset now (2 left, until Oct 5)";
 const WEEKLY_RESET: &str = "Reset your session limit now";
 const WAIT_OCT_9: &str = "Wait here, then continue automatically at Oct 9 at 5am";
 
@@ -1576,9 +1579,10 @@ fn resetting(ctx: ApprovalCtx) -> ApprovalCtx {
 /// CONTROLS: with the key off (the default) the same screen is answered
 /// exactly as before the rule existed — the wait row, [`RULE_LIMIT_WAIT`] —
 /// and so it is, key on, with the weekly session reset's row in the grant
-/// row's slot, with a bare `Use your reset now`, with both rows, and with a
-/// grant that counts nought; no focus, a reading nobody vouches for and a
-/// Codex session press nothing.
+/// row's slot, with a bare `Use a weekly reset`, with both rows, with one
+/// kind's row drawn twice, with a grant that counts nought, and with the
+/// grant row in 2.1.287's words; no focus, a reading nobody vouches for and
+/// a Codex session press nothing.
 #[test]
 fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
     let rows = reset_dialog();
@@ -1653,10 +1657,11 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
         (vec![STOP, WEEKLY_RESET, GRANT, WAIT_OCT_9], 3),
         (vec![STOP, GRANT, GRANT, WAIT_OCT_9], 3),
         (
-            vec![STOP, "Use your reset now (0 left, until Oct 5)", WAIT_OCT_9],
+            vec![STOP, "Use a weekly reset (0 left, until Oct 5)", WAIT_OCT_9],
             2,
         ),
-        (vec![STOP, "Use your reset now (2 left)", WAIT_OCT_9], 2),
+        (vec![STOP, "Use a weekly reset (2 left)", WAIT_OCT_9], 2),
+        (vec![STOP, OLD_GRANT, WAIT_OCT_9], 2),
         (vec![STOP, WAIT_OCT_9, CREDITS], 1),
     ] {
         let screen = phase_fixtures::limit_options_panel(&labels, 0, true);
@@ -1690,100 +1695,102 @@ fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
     assert!(d.as_ref().is_none_or(|d| approved(d).is_none()), "{d:?}");
 }
 
-/// CLAUDE CODE 2.1.304'S ROW IS TAKEN ONLY WHERE IT IS THE ONE RESET ON
-/// OFFER, AND NEVER A FABLE RESET: the reader's composed dialog with one full
-/// reset is answered by [`RULE_LIMIT_RESET`] on that row, by its whole label,
-/// key on; so is a lone 5-hour or weekly reset. NEGATIVE CONTROLS: key off,
-/// the same screen is the wait row's; the composed dialog with three kinds on
-/// offer (which one to spend is the owner's choice), a lone Fable reset, a
-/// kind with nought left, a kind beside the weekly session reset's row and a
-/// kind this build does not name are the wait row's, key on.
+/// THE RESET'S RULE TAKES ONLY THE ONE RESET ON OFFER (the resets spec's
+/// R2): a row of a kind the step takes, alone among the options that spend
+/// a reset, wherever it stands; the focus is moved onto it by its whole
+/// label. Several on offer are the owner's to choose, so the composed dialog
+/// at a five-hour wall (5-hour, weekly and full resets) and the one at a
+/// Fable wall (a Fable reset, then a weekly one) get the WAIT ROW with the
+/// key on, exactly as with the key off; so does a Fable row alone, a lone
+/// row that does not read whole, and a row of a kind whose name only begins
+/// with a known one's beside a takeable one. NEGATIVE CONTROLS: each of
+/// those menus' takeable rows, alone, is the reset's; with the key off every
+/// menu is the wait row's; and the dialog MEASURED on 2.1.304 with no reset
+/// on offer is the wait row's, key on.
 #[test]
-fn claude_code_2_1_304s_lone_reset_is_taken_and_several_are_not() {
-    let composed = |name: &str| {
-        let (_, text) = aterm_phase::reset::fixtures::ALL
-            .iter()
-            .find(|(n, _)| *n == name)
-            .expect("the composed screen");
-        phase_fixtures::screen(text)
-    };
-    let full_row = "Use a full reset (2 left, until Oct 5)";
-    let rows = composed("dialog-kinds-full");
-    let guard = crate::supervise::policy::row_guard("   What do you want to do?");
-    let reset = |steps: i32, label: &str| Decision::Approve {
-        rule_id: RULE_LIMIT_RESET,
-        choice: Choice::Focus {
-            steps,
-            label: label.to_string(),
-        },
-        guard: guard.clone(),
-        subject: label.to_string(),
-        unproven: None,
-    };
-    let wait = |steps: i32| Decision::Approve {
-        rule_id: RULE_LIMIT_WAIT,
-        choice: Choice::Focus {
-            steps,
-            label: WAIT_OCT_9.to_string(),
-        },
-        guard: guard.clone(),
-        subject: WAIT_OCT_9.to_string(),
-        unproven: None,
-    };
-    for c in [ctx(), full(), none(full())] {
-        assert_eq!(on_screen(&rows, &c), wait(2), "{:?}", c.approve);
-        let on = resetting(c);
-        assert_eq!(
-            on_screen(&rows, &on),
-            reset(1, full_row),
-            "{:?}",
-            on.approve
-        );
-    }
+fn the_reset_rule_takes_only_the_one_reset_on_offer_and_never_a_fable_row() {
+    use aterm_phase::reset::fixtures as composed;
     let on = resetting(full());
-    for lone in [
-        "Use a 5-hour reset (1 left, until Oct 25)",
-        "Use a weekly reset (1 left, until Oct 7)",
-        full_row,
+    let taken = |rows: &[String], c: &ApprovalCtx| match on_screen(rows, c) {
+        Decision::Approve {
+            rule_id,
+            choice: Choice::Focus { steps, label },
+            ..
+        } => Some((rule_id, steps, label)),
+        _ => None,
+    };
+    const FABLE: &str = "Use a Fable reset (1 left, until Oct 5)";
+    const FULL: &str = "Use a full reset (1 left, until Oct 5)";
+    const SESSION: &str = "Use a 5-hour reset (2 left, until Oct 5)";
+    // The wait row of `labels`, as the rule takes it.
+    let wait_of = |labels: &[&str]| {
+        let wait = labels
+            .iter()
+            .position(|l| *l == WAIT_OCT_9)
+            .expect("the wait row");
+        Some((
+            RULE_LIMIT_WAIT,
+            i32::try_from(wait).expect("a small menu"),
+            WAIT_OCT_9.to_string(),
+        ))
+    };
+    // One reset on offer, of each kind the step takes, wherever it stands.
+    for (labels, steps, label) in [
+        (vec![STOP, FULL, WAIT_OCT_9], 1, FULL),
+        (vec![STOP, SESSION, WAIT_OCT_9], 1, SESSION),
+        (vec![STOP, WAIT_OCT_9, GRANT], 2, GRANT),
     ] {
-        let screen = phase_fixtures::limit_options_panel(&[STOP, lone, WAIT_OCT_9], 0, true);
-        assert_eq!(on_screen(&screen, &on), reset(1, lone), "{lone}");
-        assert_eq!(on_screen(&screen, &full()), wait(2), "{lone}, key off");
-    }
-    assert_eq!(on_screen(&composed("dialog-kinds-several"), &on), wait(4));
-    for labels in [
-        vec![
-            STOP,
-            "Use a Fable reset (1 left, until Oct 6) · frees up only what Fable used this week",
-            WAIT_OCT_9,
-        ],
-        vec![STOP, "Use a Fable reset (1 left, until Oct 6)", WAIT_OCT_9],
-        vec![STOP, "Use a full reset (0 left, until Oct 5)", WAIT_OCT_9],
-        vec![
-            STOP,
-            "Use a monthly reset (1 left, until Oct 5)",
-            WAIT_OCT_9,
-        ],
-        vec![
-            STOP,
-            "Use a full reset (2 left, until Oct 5)",
-            GRANT,
-            WAIT_OCT_9,
-        ],
-    ] {
-        let wait_at = labels.iter().position(|l| *l == WAIT_OCT_9).expect("wait");
         let screen = phase_fixtures::limit_options_panel(&labels, 0, true);
         assert_eq!(
-            on_screen(&screen, &on),
-            wait(i32::try_from(wait_at).expect("small")),
+            taken(&screen, &on),
+            Some((RULE_LIMIT_RESET, steps, label.to_string())),
             "{labels:?}"
         );
+        for c in [ctx(), full(), none(full())] {
+            assert_eq!(taken(&screen, &c), wait_of(&labels), "key off: {labels:?}");
+        }
     }
-    let beside =
-        phase_fixtures::limit_options_panel(&[STOP, WEEKLY_RESET, full_row, WAIT_OCT_9], 0, true);
-    assert_eq!(on_screen(&beside, &on), wait(3));
+    // Several on offer: the composed dialogs.
+    let kinds = phase_fixtures::screen(composed::DIALOG_KINDS);
+    let fable = phase_fixtures::screen(composed::DIALOG_FABLE);
+    for (name, rows) in [("kinds", &kinds), ("fable", &fable)] {
+        for c in [on.clone(), ctx(), full(), none(full())] {
+            assert_eq!(
+                taken(rows, &c).map(|(rule, _, _)| rule),
+                Some(RULE_LIMIT_WAIT),
+                "{name}: key {} {:?}",
+                c.limit_reset,
+                c.approve
+            );
+        }
+    }
+    for labels in [
+        vec![STOP, FULL, GRANT, WAIT_OCT_9],
+        vec![STOP, FABLE, FULL, WAIT_OCT_9],
+        vec![FABLE, STOP, WAIT_OCT_9, GRANT],
+        vec![STOP, SESSION, GRANT, FULL, WAIT_OCT_9],
+        vec![STOP, FABLE, WAIT_OCT_9],
+        vec![
+            STOP,
+            "Use a Fable reset (1 left, until Oct 5) · frees up only what Fable used this week",
+            WAIT_OCT_9,
+        ],
+        vec![STOP, "Use a 5-hour reset", WAIT_OCT_9],
+        vec![STOP, "Use a weekly reset (0 left, until Oct 5)", WAIT_OCT_9],
+        vec![STOP, "use a 5-hour reset (2 left, until Oct 5)", WAIT_OCT_9],
+        vec![
+            STOP,
+            SESSION,
+            "Use a full reset plus (1 left, until Oct 5)",
+            WAIT_OCT_9,
+        ],
+    ] {
+        let screen = phase_fixtures::limit_options_panel(&labels, 0, true);
+        assert_eq!(taken(&screen, &on), wait_of(&labels), "{labels:?}");
+    }
     // MEASURED on 2.1.304 (the lab): its dialog with no reset on offer is the
-    // wait row's, key on.
+    // wait row's, key on — the inline renderer's frame, the session's rows
+    // above it.
     let measured = phase_fixtures::screen(phase_fixtures::LIMIT_DIALOG_NO_RESET_ROWS_2_1_304);
     match on_screen(&measured, &on) {
         Decision::Approve {
@@ -1799,16 +1806,136 @@ fn claude_code_2_1_304s_lone_reset_is_taken_and_several_are_not() {
     }
 }
 
+/// UNDER THE OWNER'S ORDER (`[harness] limit_reset_kinds`,
+/// [`ApprovalCtx::reset_kinds`]; the resets spec's R2) the reset's rule
+/// takes the row of the first listed kind on offer, whatever else is: the
+/// composed dialog at a five-hour wall (5-hour, weekly and full resets) and
+/// the one at a Fable wall (a Fable reset, then a weekly one), which get the
+/// wait row with no list. NEGATIVE CONTROLS: a list naming no kind on offer
+/// is the wait row's; with the key off a list takes nothing.
+#[test]
+fn under_the_owners_order_the_reset_rule_takes_the_first_listed_kind_on_offer() {
+    use aterm_phase::ResetKind::{Full, Session, Weekly};
+    use aterm_phase::reset::fixtures as composed;
+    let listed = |on: bool, kinds: Vec<aterm_phase::ResetKind>| ApprovalCtx {
+        limit_reset: on,
+        reset_kinds: kinds,
+        ..full()
+    };
+    let taken = |rows: &[String], c: &ApprovalCtx| match on_screen(rows, c) {
+        Decision::Approve {
+            rule_id, subject, ..
+        } => Some((rule_id, subject)),
+        _ => None,
+    };
+    let kinds = phase_fixtures::screen(composed::DIALOG_KINDS);
+    let fable = phase_fixtures::screen(composed::DIALOG_FABLE);
+    for (rows, order, label) in [
+        (
+            &kinds,
+            vec![Full, Weekly],
+            "Use a full reset (1 left, until Oct 5)",
+        ),
+        (
+            &kinds,
+            vec![Weekly],
+            "Use a weekly reset (1 left, until Oct 9)",
+        ),
+        (
+            &kinds,
+            vec![Session, Full],
+            "Use a 5-hour reset (2 left, until Oct 5)",
+        ),
+        (
+            &fable,
+            vec![Full, Weekly],
+            "Use a weekly reset (1 left, until Oct 9)",
+        ),
+    ] {
+        assert_eq!(
+            taken(rows, &listed(true, order.clone())),
+            Some((RULE_LIMIT_RESET, label.to_string())),
+            "{order:?}"
+        );
+        assert_eq!(
+            taken(rows, &listed(false, order.clone())).map(|(rule, _)| rule),
+            Some(RULE_LIMIT_WAIT),
+            "key off: {order:?}"
+        );
+    }
+    for order in [vec![Full], vec![Session], vec![Full, Session]] {
+        assert_eq!(
+            taken(&fable, &listed(true, order.clone())).map(|(rule, _)| rule),
+            Some(RULE_LIMIT_WAIT),
+            "nothing listed on offer: {order:?}"
+        );
+    }
+}
+
+/// THE CHOOSER IS PRESSED BY NO RULE. `Which reset do you want to use?`
+/// (READ in the 2.1.304 bundle, `Fnt` @257468497; composed here, never
+/// captured) opens only on a typed `/limit-reset`, which the harness never
+/// types: each row is a kind's `Use a <kind> (…)` — every one a spend — or a
+/// disabled `<Kind> · <reason>`, and none keeps. At every level, with the
+/// reset's key on or off, nothing on it is approved: to full power it is a
+/// dialog of no kind with no consent, nothing that waits and no refusal (a
+/// person's), and its kinds' rows buy, so not even a consent pick could take
+/// one. NEGATIVE CONTROLS: the same box with plain rows in place of its
+/// kinds' (`Yes`, `No`) is a dialog of no kind the rules decline, so it is
+/// the rows that hold it; and (seen by mutation) a full power that reads
+/// every option as a consent presses the disabled row.
+#[test]
+fn the_chooser_is_pressed_by_no_rule() {
+    let base = phase_fixtures::screen(aterm_phase::reset::fixtures::CONFIRM);
+    let chooser = |rows: &[&str]| {
+        let mut out = base[..3].to_vec();
+        out.push("   Which reset do you want to use?".to_string());
+        out.push(String::new());
+        out.extend(rows.iter().map(|row| (*row).to_string()));
+        out.extend(base[10..].iter().cloned());
+        out
+    };
+    let rows = chooser(&[
+        "   ❯ Use a 5-hour reset (2 left, until Oct 5)",
+        "     Use a weekly reset (1 left, until Oct 9)",
+        "     Full reset · can't be used while you're at your session limit",
+    ]);
+    let reading = aterm_phase::read(Some("claude"), &rows, None);
+    let p = reading.prompt.as_ref().expect("the chooser is a box");
+    assert_eq!(p.options.len(), 3, "{:?}", p.options);
+    for key in [false, true] {
+        for c in [ctx(), full(), none(full())] {
+            let c = ApprovalCtx {
+                limit_reset: key,
+                ..c
+            };
+            let d = on_screen(&rows, &c);
+            assert_eq!(approved(&d), None, "key {key} {:?}: {d:?}", c.approve);
+        }
+    }
+    // The control.
+    let plain = chooser(&["   ❯ Yes", "     No"]);
+    assert_eq!(
+        approved(&on_screen(&plain, &full())),
+        Some(RULE_DECLINE),
+        "{:?}",
+        on_screen(&plain, &full())
+    );
+}
+
 /// Claude Code 2.1.304 offers several kinds of limit reset in one dialog and
 /// no longer says `your reset`: the wall's row and each row of the chooser
 /// read `Use a {kind} ({left} left, until {date})`, the confirmation's yes
 /// `Yes, use my {kind}` (READ in the 2.1.304 bundle; composed here). Each one
-/// still spends, so no rule but the reset's own may choose it — and so does
-/// any `use` whose head names a reset. NEGATIVE CONTROLS: options that say
-/// `use` with no reset in their head (the words before the first `(`, `·`,
-/// `?` or comma, or a later clause, `aterm_phase::spends_reset`) spend
-/// nothing; before this every 2.1.304
-/// spelling read as no spend.
+/// still spends, so no rule but the reset's own may choose it, and so does
+/// a kind no build has named yet, however many words its name takes. A head
+/// (the words before the first `(`, `·` or `?`, `aterm_phase::uses_a_reset`)
+/// that names a reset is a spend, unless that `reset` is another clause's
+/// verb (right after `and`, `or`, `then`, `but` or `to`): wide on purpose,
+/// since a label misread as a spend is an option no rule picks and the
+/// other way round a reset spent. NEGATIVE CONTROLS: options that say `use`
+/// with no reset in their head, or with one only as another clause's verb,
+/// spend nothing; before this every 2.1.304 spelling read as no spend.
 #[test]
 fn claude_code_2_1_304s_reset_kinds_still_spend() {
     use aterm_phase::prompt::{Opt, Role};
@@ -1830,6 +1957,9 @@ fn claude_code_2_1_304s_reset_kinds_still_spend() {
         "Yes, use my Fable reset",
         "Yes, use my full reset",
         "Use an hourly reset (1 left)",
+        "Use a scheduled full weekly reset (1 left, until Oct 7)",
+        "Use a 5-hour and weekly reset (1 left, until Oct 7)",
+        "Use an unlisted reset, 1 left",
     ] {
         assert!(spends(label), "{label}");
         assert!(buys(&opt(label)), "{label}");
@@ -1840,10 +1970,12 @@ fn claude_code_2_1_304s_reset_kinds_still_spend() {
         "Use an existing worktree",
         "Yes, use the reset branch for this commit",
         // `reset` past the head's end (aterm-phase reads the head up to its
-        // first `(`, `·`, `?` or comma, or a later clause's `and`/`or`/`then`/
-        // `but`/`to`, since 6ae0fc861c).
+        // first `(`, `·` or `?`), or another clause's verb in it (right after
+        // `and`, `or`, `then`, `but` or `to`).
         "Use a fresh session (reset nothing later)",
         "Use a fresh session and reset nothing later",
+        "Use a fresh session but reset nothing",
+        "Use my settings, then reset them",
         // The same 2.1.304 bundle's other `Yes, use my …` yeses (the Chrome
         // auto-enable dialog's, the cloud plugins offer's), a one-shot label
         // that merely says `use`, and a plain yes.
@@ -1940,9 +2072,11 @@ fn claude_code_2_1_304s_spend_limit_nudge_and_buy_screen_are_purchases() {
 }
 
 /// NO RULE EVER SPENDS A LIMIT RESET. Claude Code's usage-limit dialog can
-/// offer `Use your reset now (…)` or `Reset your session limit now`, and the
-/// first opens a confirmation whose yes is `Yes, use my reset` (READ in the
-/// 2.1.286 and 2.1.287 bundles; no such box has been captured on a screen).
+/// offer `Use a weekly reset (…)` (or another kind's) or `Reset your session
+/// limit now`, and the first opens a confirmation whose yes is `Yes, use my
+/// weekly reset` (READ in the 2.1.304 bundle; 2.1.286–2.1.303 drew `Use your
+/// reset now (…)` and `Yes, use my reset`, still spends; no such box has been
+/// captured on a screen).
 /// Each spends a reset ([`spends`]: the reader's own anchors and the wider
 /// words, one rule), so each is a purchase ([`buys`]) and [`allow_once`] — the
 /// pick full power makes for every kind with no rule of its own — never takes
@@ -1969,7 +2103,9 @@ fn no_rule_ever_spends_a_limit_reset() {
     };
     for label in [
         "Yes, use my reset",
+        "Yes, use my weekly reset",
         GRANT,
+        OLD_GRANT,
         "Use your reset now",
         WEEKLY_RESET,
         // Reworded by the server: the opening words still spend.
@@ -2005,7 +2141,13 @@ fn no_rule_ever_spends_a_limit_reset() {
         p.options = vec![opt(yes, role, true), opt("No, keep it", Role::Deny, false)];
         p
     };
-    for yes in ["Yes, use my reset", GRANT, WEEKLY_RESET] {
+    for yes in [
+        "Yes, use my weekly reset",
+        "Yes, use my reset",
+        GRANT,
+        OLD_GRANT,
+        WEEKLY_RESET,
+    ] {
         for role in [Role::Once, Role::Other] {
             let p = boxed(yes, role);
             let (rule, o) = allow_once(&p).expect("the box has an option that waits");
@@ -2078,6 +2220,7 @@ fn no_rule_ever_spends_a_limit_reset() {
         Choice::Digit(2),
         focus(GRANT),
         focus(WEEKLY_RESET),
+        focus("Yes, use my weekly reset"),
         focus("Yes, use my reset"),
         Choice::FocusKey {
             steps: 0,
@@ -2129,19 +2272,19 @@ fn no_rule_ever_spends_a_limit_reset() {
 fn no_reset_left(rows: &[String]) -> Vec<String> {
     let yes = rows
         .iter()
-        .position(|r| r.contains("Yes, use my reset"))
+        .position(|r| r.contains("Yes, use my weekly reset"))
         .expect("the yes row");
-    let title = rows.iter().position(|r| r.trim() == "Use your reset?");
+    let title = rows.iter().position(|r| r.trim() == "Use a weekly reset?");
     rows.iter()
         .enumerate()
         .map(|(k, row)| {
             let body = title.is_none_or(|t| k > t) && k < yes && !row.trim().is_empty();
             if title == Some(k) {
-                row.replace("Use your reset?", "Apply the change")
+                row.replace("Use a weekly reset?", "Apply the change")
             } else if body {
                 "   Nothing is lost by waiting".to_string()
             } else {
-                row.replace("Yes, use my reset", "Yes")
+                row.replace("Yes, use my weekly reset", "Yes")
                     .replace("No, keep it", "No")
             }
         })
@@ -2192,7 +2335,7 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
         let whole = phase_fixtures::screen(text);
         let title = whole
             .iter()
-            .position(|r| r.trim() == "Use your reset?")
+            .position(|r| r.trim() == "Use a weekly reset?")
             .expect("the title row");
         // The box with its title scrolled off the pane's top, and whole.
         for (head, rows) in [
@@ -2236,7 +2379,7 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
             for yes in ["Yes", "Yes, refill now"] {
                 let reworded: Vec<String> = rows
                     .iter()
-                    .map(|r| r.replace("Yes, use my reset", yes))
+                    .map(|r| r.replace("Yes, use my weekly reset", yes))
                     .collect();
                 let what = format!("{what}, `{yes}`");
                 let d = on_screen(&reworded, &full());
@@ -6305,13 +6448,15 @@ fn shell_word(dir: &Path) -> String {
 }
 
 fn scratch_git(dir: &Path, args: &[&str]) {
-    let out = aterm_uds::spawnfd::command("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .expect("git");
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
     assert!(out.status.success(), "git {args:?}");
 }
 
@@ -7225,6 +7370,20 @@ fn the_autocompact_offer_steps_the_size_before_any_enter() {
         choice(on_screen(&rows, &at(500))),
         Choice::Focus { steps: 0, label }
     );
+    // A size off the ladder (the server's list) is stepped toward the
+    // target like any other: `450k` down, `350k` and `399.9k` up.
+    for (words, key) in [("450k", "left"), ("350k", "right"), ("399.9k", "right")] {
+        let served: Vec<String> = rows.iter().map(|r| r.replace("500k", words)).collect();
+        assert_eq!(
+            choice(on_screen(&served, &full())),
+            Choice::FocusKey {
+                steps: 0,
+                label: format!("Autocompact at ‹ {words} › tokens"),
+                key
+            },
+            "{words}"
+        );
+    }
     // The focus on the keep row and another size: moved, then stepped.
     let keep_first = phase_fixtures::screen(phase_fixtures::AUTOCOMPACT_KEEP_FIRST);
     assert_eq!(

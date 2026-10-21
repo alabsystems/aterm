@@ -26,6 +26,7 @@
 //! turn the readers anchor on.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// How many turn records a session retains. Sized so a long agent conversation
 /// stays fully readable while the ring never grows unbounded; the screen-hash +
@@ -73,8 +74,10 @@ pub(crate) struct TurnRecord {
     /// [`STATUS_PRESSED`] for the harness's `send` and `key enter`, and for a
     /// `turn settle=submitted`, which await no settle.
     pub status: &'static str,
-    /// The submitted message, truncated to [`MAX_TEXT`] bytes on a char boundary.
-    pub text: String,
+    /// The submitted message, truncated to [`MAX_TEXT`] bytes on a char
+    /// boundary. Shared, so a reader copying records out of the ledger lock
+    /// bumps a refcount instead of copying the text.
+    pub text: Arc<str>,
     /// FNV-1a/64 of the settled screen text — deterministic across processes, so
     /// a replay/eval harness can diff a re-driven turn's screen against this.
     pub screen_hash: u64,
@@ -218,7 +221,7 @@ pub(crate) struct Typed {
     /// The control connection that typed it: only its Enter submits it.
     pub conn: u64,
     /// The text, clamped like a record's ([`clamp_text`]).
-    pub text: String,
+    pub text: Arc<str>,
     /// When it was written ([`now_ms`]).
     pub started_ms: u64,
     /// The archive's mark as the text was written.
@@ -255,10 +258,28 @@ pub(crate) struct TurnLedger {
     /// so this holds one id, or a few when `lease release force` preempted a
     /// wedged turn.
     open: Vec<u64>,
+    /// The session's watchers ([`crate::SessionCtx::watchers`]), rung by
+    /// [`TurnLedger::record`] so the `events` digest pushes a landed turn at
+    /// once. Never carried: a successor's ledger rings its own session's list
+    /// ([`crate::session_watch::Observed::new`]).
+    watchers: std::sync::Arc<crate::session_watch::Watchers>,
     /// The text the window harness typed and has not submitted yet
     /// ([`Typed`]): this process's alone, never carried.
     typed: Option<Typed>,
+    /// How many records the ledger has taken ([`TurnLedger::push`]): what a
+    /// carry of it last saw, so the crash journal's control slot is
+    /// rewritten only when it moved (`crash_restore`, increment 7).
+    #[cfg(any(unix, test))]
+    generation: u64,
+    /// Told after every record the ledger takes ([`TurnLedger::watch`]):
+    /// the session's crash journal, whose worker then carries the ledger
+    /// into the session's region. Called under the ledger's lock, so it
+    /// takes no lock a holder of another could be waiting on.
+    watch: Option<LedgerWatch>,
 }
+
+/// What a ledger tells after every record it takes ([`TurnLedger::watch`]).
+pub(crate) type LedgerWatch = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 impl TurnLedger {
     /// Append one record, evicting one past the cap: the oldest, or — while
@@ -290,6 +311,39 @@ impl TurnLedger {
             self.harness += 1;
         }
         self.records.push_back(rec);
+        #[cfg(any(unix, test))]
+        {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        if let Some(watch) = &self.watch {
+            watch();
+        }
+    }
+
+    /// Tell `watch` after every record this ledger takes from here on (the
+    /// session's crash journal: [`crate::crash_restore::SessionJournal::carry_ledger`]).
+    #[cfg(any(unix, test))]
+    pub(crate) fn watch(&mut self, watch: LedgerWatch) {
+        self.watch = Some(watch);
+    }
+
+    /// How many records the ledger has taken: it moves exactly when its
+    /// records change (a record lands, or one is evicted with it). A carry
+    /// also says the turns still open and the process's turn-id count
+    /// ([`Self::carry_floor`]), which move without it: the crash journal does
+    /// not carry them again for that, since the region's own count word holds
+    /// every id the process mints and the recovery raises every carried floor
+    /// past it (`crash_restore::note_turn_ids`, `continue_carried_turns`).
+    #[cfg(any(unix, test))]
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether a carry of this ledger says anything: a record, or a floor
+    /// below which it no longer vouches for the turn ids.
+    #[cfg(any(unix, test))]
+    pub(crate) fn carries_anything(&self) -> bool {
+        !self.records.is_empty() || self.unheld_below > 0 || self.shed_below > 0
     }
 
     /// A turn with id `id` began on this session: its record is owed
@@ -314,6 +368,8 @@ impl TurnLedger {
     /// by id, the `events` digest streams by id watermark, and a handoff
     /// carries only a rising run — a record landing under its old, lower id
     /// was one no subscriber was ever sent (round seven, finding 43).
+    ///
+    /// It wakes the session's watchers: the record is the scannable state.
     pub(crate) fn record(&mut self, mut rec: TurnRecord, mint: impl FnOnce() -> u64) -> u64 {
         self.abandon(rec.id);
         if self.high_id().is_some_and(|high| high >= rec.id) {
@@ -321,7 +377,17 @@ impl TurnLedger {
         }
         let id = rec.id;
         self.push(rec);
+        self.watchers.ring_watchers();
         id
+    }
+
+    /// This ledger, ringing `watchers` on every record.
+    #[must_use]
+    pub(crate) fn watched_by(
+        self,
+        watchers: std::sync::Arc<crate::session_watch::Watchers>,
+    ) -> Self {
+        TurnLedger { watchers, ..self }
     }
 
     /// The window harness typed `typed` and has not submitted it: kept, in
@@ -360,7 +426,11 @@ impl TurnLedger {
             shed_below: 0,
             unheld_below,
             open: Vec::new(),
+            watchers: std::sync::Arc::default(),
             typed: None,
+            #[cfg(any(unix, test))]
+            generation: 0,
+            watch: None,
         };
         for mut rec in records {
             rec.carried = true;
@@ -531,21 +601,40 @@ pub(crate) fn status_word(word: &str) -> Option<&'static str> {
 }
 
 /// Truncate `s` to at most [`MAX_TEXT`] bytes on a UTF-8 char boundary.
-pub(crate) fn clamp_text(s: &str) -> String {
-    if s.len() <= MAX_TEXT {
-        return s.to_string();
-    }
-    let mut end = MAX_TEXT;
+pub(crate) fn clamp_text(s: &str) -> Arc<str> {
+    let mut end = s.len().min(MAX_TEXT);
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    s[..end].to_string()
+    Arc::from(&s[..end])
 }
 
 /// Milliseconds since the process epoch (a lazily-pinned monotonic `Instant`).
 /// Monotonic and cheap; used for turn `started_ms`/`dur_ms`, not wall-clock.
 /// The one process clock, shared with the fabric's mail rows.
+#[cfg(not(test))]
 pub(crate) use aterm_gui_timing::now_ms;
+
+/// [`aterm_gui_timing::now_ms`], moved on by what this test thread
+/// [`advance_for_test`]ed: a test that needs an agent's 45 s of busy time
+/// on the A/B book (`harness_ab`, design §11.2.5) moves the clock on rather
+/// than waiting for it. Still monotonic: it only ever moves forward.
+#[cfg(test)]
+pub(crate) fn now_ms() -> u64 {
+    aterm_gui_timing::now_ms().saturating_add(ADVANCED.with(std::cell::Cell::get))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How far this test thread moved the ledger clock on.
+    static ADVANCED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Move this test thread's ledger clock on by `ms` ([`now_ms`]).
+#[cfg(test)]
+pub(crate) fn advance_for_test(ms: u64) {
+    ADVANCED.with(|advanced| advanced.set(advanced.get().saturating_add(ms)));
+}
 
 #[cfg(test)]
 mod tests {
@@ -561,7 +650,7 @@ mod tests {
             dur_ms: 1,
             submitted: true,
             status: "settled",
-            text: format!("msg{id}"),
+            text: format!("msg{id}").into(),
             screen_hash: id,
             seq: id,
             arch: ArchMark::default(),
@@ -590,6 +679,45 @@ mod tests {
             assert_eq!(TurnBy::from_wire(word), TurnBy::Unknown, "{word:?}");
         }
         assert_eq!(TurnBy::default(), TurnBy::Unknown);
+    }
+
+    /// THE CRASH JOURNAL'S WATCH (`crash_restore`'s increment 7): every
+    /// record the ledger takes moves its generation and tells the watch once,
+    /// an eviction past the cap included; nothing else does (a turn begun or
+    /// abandoned, a typed text). A carried ledger counts its records, and says
+    /// whether it carries anything: a record or a floor.
+    #[test]
+    fn every_record_moves_the_generation_and_tells_the_watch() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let told = Arc::new(AtomicU64::new(0));
+        let mut l = TurnLedger::default();
+        assert_eq!(l.generation(), 0);
+        assert!(!l.carries_anything());
+        l.push(rec(1));
+        assert_eq!(l.generation(), 1, "a record before any watch still counts");
+        let seen = Arc::clone(&told);
+        l.watch(Arc::new(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+        for id in 2..=(LEDGER_CAP as u64 + 3) {
+            l.push(rec(id));
+        }
+        assert_eq!(l.generation(), LEDGER_CAP as u64 + 3);
+        assert_eq!(told.load(Ordering::Relaxed), LEDGER_CAP as u64 + 2);
+        l.begin(9_000);
+        l.abandon(9_000);
+        assert_eq!(l.record(rec(9_001), || 9_002), 9_001);
+        assert_eq!(
+            (l.generation(), told.load(Ordering::Relaxed)),
+            (LEDGER_CAP as u64 + 4, LEDGER_CAP as u64 + 3),
+            "a turn's record counts once; its begin and abandon do not"
+        );
+        let carried = TurnLedger::carried(vec![rec(4), rec(5)], 0);
+        assert_eq!(carried.generation(), 2);
+        assert!(carried.carries_anything());
+        assert!(TurnLedger::carried(Vec::new(), 3).carries_anything());
+        assert!(!TurnLedger::carried(Vec::new(), 0).carries_anything());
     }
 
     /// The window's companion reacts to the newest turn the window harness
@@ -857,10 +985,14 @@ mod tests {
         // 801 bytes whose MAX_TEXT-th byte is inside an 'é': the clamp backs
         // off to the boundary before it, one byte short of the cap.
         let long = format!("a{}", "é".repeat(400));
-        assert_eq!(clamp_text(&long), format!("a{}", "é".repeat(255)));
+        assert_eq!(&*clamp_text(&long), format!("a{}", "é".repeat(255)));
         let on_boundary = "é".repeat(400);
-        assert_eq!(clamp_text(&on_boundary), "é".repeat(256), "cut at the cap");
+        assert_eq!(
+            &*clamp_text(&on_boundary),
+            "é".repeat(256),
+            "cut at the cap"
+        );
         let short = "é".repeat(256);
-        assert_eq!(clamp_text(&short), short, "at the cap it is kept whole");
+        assert_eq!(&*clamp_text(&short), short, "at the cap it is kept whole");
     }
 }

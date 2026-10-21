@@ -287,9 +287,16 @@ fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     prev.ink = settled.clone();
     cur.ink = settled;
     let mut dirty = Vec::new();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(!d.ink_changed, "equal ink must not set ink_changed");
@@ -305,9 +312,16 @@ fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
         col: 2,
         color: [1, 2, 3],
     }];
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(d.ink_changed, "changed ink must set ink_changed");

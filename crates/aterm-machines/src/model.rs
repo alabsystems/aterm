@@ -2,10 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The vocabulary every half shares: what a probe read, what the plan is, what happened,
-//! and the report one agent run returns.
+//! and the report one agent run returns. A read, a probe, an outcome and a report row are
+//! the converge engine's (`aterm_converge`), re-exported here so the families name them
+//! as before.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+pub use aterm_converge::{Effect, ItemReport, Mode, Outcome, Probe, Read};
 
 /// A preference value: the property-list types `defaults` stores.
 ///
@@ -104,165 +108,6 @@ impl fmt::Display for PValue {
             }
         }
     }
-}
-
-/// What one read of the host learned.
-///
-/// ABSENT AND UNUSABLE ARE NOT THE SAME ANSWER (the rule `atpkg::machine::KeyRead` keeps).
-/// `Absent` is a measurement: the tool said, in its documented way, that nothing is set,
-/// which is the OS default. `Unusable` is the absence of one: the tool did not run, ran
-/// out of time, or answered something this crate does not understand. Nothing may report
-/// an `Unusable` read as the default.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Read<T> {
-    /// The host holds this value.
-    Value(T),
-    /// Nothing is set: the documented "does not exist" answer.
-    Absent,
-    /// Nothing could be learned, and why.
-    Unusable(String),
-}
-
-/// What [`crate::items::Item::probe`] decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Probe {
-    /// Already as the baseline wants. `now` is the value, for the report.
-    Ok {
-        /// The current value, rendered.
-        now: String,
-    },
-    /// Differs: `apply` would change `from` to `to`.
-    Change {
-        /// The current value, rendered (`absent` when nothing is set).
-        from: String,
-        /// The wanted value, rendered.
-        to: String,
-    },
-    /// Only a person can make this change (design §6); `how` says where.
-    Person {
-        /// The step's id, as `aterm machines screen <host> <step>` takes it.
-        step: String,
-        /// One line: the System Settings path and what to switch.
-        how: String,
-    },
-    /// A precondition is missing, so nothing was or will be attempted.
-    Blocked {
-        /// Which precondition, in one line.
-        why: String,
-    },
-    /// Blocked on what another item, one of [`crate::items::Item::after`], puts in place
-    /// (git's settings before the Command Line Tools exist). A plan that changes that item
-    /// first reports this one planned; any other block is [`Probe::Blocked`].
-    Waits {
-        /// The id of the item whose change lifts the block.
-        on: String,
-        /// Which precondition, in one line.
-        why: String,
-    },
-    /// The setting does not exist on this host (an Intel Mac, a desktop, an older
-    /// macOS): nothing to do, and nothing wrong.
-    NotApplicable {
-        /// Why it does not apply, in one line.
-        why: String,
-    },
-    /// The change would disrupt someone using the Mac (relaunching their Dock, swapping
-    /// an app they have open); left for a run when the Mac is idle, or `--now`.
-    Deferred {
-        /// What it waits for, in one line.
-        why: String,
-    },
-    /// The current state could not be measured.
-    Unusable {
-        /// What went wrong, in one line.
-        why: String,
-    },
-}
-
-/// Whether a run only plans or also applies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Mode {
-    /// Probe and plan; change nothing.
-    Plan,
-    /// Probe, plan, apply each change, and read it back.
-    Apply,
-}
-
-/// What happened to one item in one run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Outcome {
-    /// Already as wanted.
-    Ok,
-    /// Differs; a plan run left it.
-    Planned,
-    /// Changed, and the read-back confirms it.
-    Changed,
-    /// Needs a person (design §6).
-    Person,
-    /// A precondition is missing.
-    Blocked,
-    /// Does not exist on this host.
-    NotApplicable,
-    /// Waits for the Mac to be idle (or `--now`).
-    Deferred,
-    /// Could not be measured.
-    Unknown,
-    /// The change was attempted and did not land.
-    Failed,
-}
-
-impl Outcome {
-    /// Whether this outcome makes the run's exit status nonzero (design §9).
-    #[must_use]
-    pub const fn is_failure(self) -> bool {
-        matches!(self, Self::Failed | Self::Unknown)
-    }
-}
-
-/// When a change is felt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Effect {
-    /// At once.
-    Now,
-    /// After the named process relaunches (the item relaunches it).
-    Relaunch,
-    /// At the user's next login.
-    Login,
-    /// After a restart.
-    Restart,
-}
-
-/// One item's row in a report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ItemReport {
-    /// Stable id, e.g. `keyboard.caps-lock.0-0-0@alice`.
-    pub id: String,
-    /// The family (`keyboard`, `power`, …).
-    pub family: String,
-    /// One human line.
-    pub title: String,
-    /// What happened.
-    pub outcome: Outcome,
-    /// The value before (rendered), when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-    /// The value wanted or now held (rendered).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    /// Why it failed, is blocked or unknown; for a person step, what to do. An `exec` row
-    /// carries its program's standard error here even when it succeeded (`exec_ran`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub why: Option<String>,
-    /// The command that undoes a change.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revert: Option<String>,
-    /// When the change is felt.
-    pub effect: Effect,
-    /// Family-specific output the controller acts on (a GitHub public key line).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
 }
 
 /// One keyboard the host sees.
@@ -449,17 +294,6 @@ mod tests {
         let c = PValue::Dict(vec![("A".into(), PValue::Int(1))]);
         assert!(!a.same(&c));
         assert!(!c.same(&a));
-    }
-
-    #[test]
-    fn a_failed_or_unmeasured_item_fails_the_run_and_a_person_step_does_not() {
-        assert!(Outcome::Failed.is_failure());
-        assert!(Outcome::Unknown.is_failure());
-        assert!(!Outcome::Person.is_failure());
-        assert!(!Outcome::Blocked.is_failure());
-        assert!(!Outcome::NotApplicable.is_failure());
-        assert!(!Outcome::Deferred.is_failure());
-        assert!(!Outcome::Planned.is_failure());
     }
 }
 

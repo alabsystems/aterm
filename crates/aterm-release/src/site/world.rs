@@ -332,11 +332,10 @@ impl World for Real {
         let mut probe = plain(Path::new("wasm-opt"));
         probe.arg("--version");
         if !output(launch, &mut probe).is_ok_and(|o| o.status.success()) {
-            return Err(
-                "wasm-opt not found — the engine never ships without its -O3 pass (brew install \
-                 binaryen)"
-                    .into(),
-            );
+            return Err(format!(
+                "wasm-opt not found — the engine never ships without its -O3 pass: {}",
+                aterm_uds::host::tool("wasm-opt").remedy()
+            ));
         }
         let rustup = aterm_verify::rustup::find_rustup().ok_or_else(|| {
             format!(

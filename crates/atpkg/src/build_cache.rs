@@ -3,15 +3,19 @@
 
 //! Rust build intermediates out of Spotlight (macOS).
 //!
-//! A command that builds gets `--config build.build-dir=<cache><workspace>/.cargo-build`
-//! when nothing else chose a target or build directory: binaries stay in `target/`, the
-//! rest goes under `~/Library/Caches/aterm/cargo-build.noindex`, which Spotlight skips.
-//! The rule itself is `aterm_toolchain::build_cache` ([`with_build_dir`], re-exported
+//! A command that builds gets a build directory Spotlight skips: `--config
+//! build.build-dir=<cache><workspace>/.cargo-build` when nothing else chose a target or
+//! build directory (binaries stay in `target/`, the rest goes under
+//! `~/Library/Caches/aterm/cargo-build.noindex`), else `<target>/build.noindex` under the
+//! target directory it builds into; only a caller's own build directory keeps cargo's
+//! layout. The rule itself is `aterm_toolchain::build_cache` ([`decide`], re-exported
 //! here with the rest of it); the `targo`/`targo-tippy` shims decide in `sh`
 //! ([`shim_block`]), `cargo` in an aterm tab through [`with_build_dir_here`], and
 //! `aterm-verify` for the children it starts; the tests hold the `sh` and Rust halves to
-//! one rule. Nothing is exported, so a nested cargo started by the build never inherits
-//! it. [`reclaim`] removes what nobody builds into any more.
+//! one rule. Only `targo trust`, whose cargo reads no `--config`, gets its folder through
+//! the environment (`CARGO_BUILD_BUILD_DIR`); every other command is handed a `--config`,
+//! which a nested cargo started by the build never inherits. [`reclaim`] removes what
+//! nobody builds into any more.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -38,7 +42,8 @@ const WRITE_DEPTH: usize = 3;
 pub const RECLAIM_GONE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Below the disk watch's floor, a build directory whose workspace is seen gone goes once
-/// unwritten this long ([`reclaim_under_pressure`]) instead of [`RECLAIM_GONE`]: nobody
+/// unwritten this long ([`reclaim_watched`]'s `gone_after` there) instead of
+/// [`RECLAIM_GONE`]: nobody
 /// builds into a removed workspace again, and a day of waiting is a day of a full disk. Ten
 /// minutes, the window the harness's disk watch keeps for a just-finished build.
 pub const RECLAIM_GONE_UNDER_PRESSURE: Duration = Duration::from_secs(10 * 60);
@@ -48,23 +53,43 @@ pub const RECLAIM_GONE_UNDER_PRESSURE: Duration = Duration::from_secs(10 * 60);
 pub const RECLAIM_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// The shim's half, rendered ahead of a `targo`/`targo-tippy` shim's `exec` on macOS:
-/// shell builtins only, and it only ever puts `--config …` in front of `"$@"`.
+/// shell builtins only. It puts `--config …` in front of `"$@"`, or for `targo trust`
+/// (whose cargo reads no `--config`) exports `CARGO_BUILD_BUILD_DIR` to that exec.
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
 __atb_t=
 __atb_c=${HOME-}/Library/Caches/aterm/cargo-build.noindex
-__atb=
+__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab=
 case ${HOME-} in /?*) case ${PWD-} in "$HOME"/*) __atb=1 ;; esac ;; esac
 case ${HOME-} in *[\'[:cntrl:]]*) __atb= ;; esac
 case ${HOME-}${PWD-} in *[{}]*) __atb= ;; esac
 case ${PWD-} in "$__atb_c" | "$__atb_c"/*) __atb= ;; esac
-[ -n "${CARGO_TARGET_DIR+1}${CARGO_BUILD_TARGET_DIR+1}${CARGO_BUILD_BUILD_DIR+1}" ] && __atb=
+[ -n "${CARGO_BUILD_BUILD_DIR+1}" ] && __atb=
 __atb_scan() {
   for __atb_f in "$1/config.toml" "$1/config"; do
     [ -f "$__atb_f" ] || continue
     [ -r "$__atb_f" ] || { __atb=; return; }
+    __atb_s=
     while IFS= read -r __atb_l || [ -n "$__atb_l" ]; do
-      case $__atb_l in *target-dir* | *build-dir*)
-        case ${__atb_l#"${__atb_l%%[![:blank:]]*}"} in [#]*) ;; *) __atb=; return ;; esac ;;
+      __atb_x=${__atb_l#"${__atb_l%%[![:blank:]]*}"}
+      case $__atb_x in [#]*) continue ;; esac
+      case $__atb_l in *build-dir*) __atb=; return ;; esac
+      case $__atb_l in *target-dir*) __atb_tn=1 ;; esac
+      case $__atb_x in
+        "["*) case $__atb_x in "[alias]"*) __atb_s=1 ;; *) __atb_s= ;; esac; continue ;;
+      esac
+      [ -n "$__atb_al" ] || continue
+      case $__atb_x in
+        alias."$__atb_v"[[:blank:]=]*) ;;
+        "$__atb_v"[[:blank:]=]*) [ -n "$__atb_s" ] || continue ;;
+        *) continue ;;
+      esac
+      case $__atb_x in *=*) ;; *) continue ;; esac
+      __atb_x=${__atb_x#*=}
+      while :; do
+        case $__atb_x in [[:blank:]]* | '['* | '"'* | "'"*) __atb_x=${__atb_x#?} ;; *) break ;; esac
+      done
+      case ${__atb_x%%[![:alnum:]_-]*} in
+        build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | clippy | tippy | fix | clean) __atb_ab=1 ;;
       esac
     done < "$__atb_f"
   done
@@ -73,13 +98,14 @@ __atb_ok() {
   case $1 in
     c) case $2 in *target-dir* | *build-dir*) __atb= ;; *=*) ;; *) __atb= ;; esac ;;
     m) case $2 in *..* | *[{}]* | "$__atb_c"/*) __atb= ;; "$HOME"/* | [!/]*) ;; *) __atb= ;; esac ;;
+    t) __atb_T=$2 __atb_tf=1 ;;
   esac
 }
 if [ -n "$__atb" ]; then
   __atb_v=$__atb_t __atb_u= __atb_n=
   for __atb_a in "$@"; do
     case $__atb_n in
-      c | m) __atb_ok "$__atb_n" "$__atb_a"; __atb_n=; continue ;;
+      c | m | t) __atb_ok "$__atb_n" "$__atb_a"; __atb_n=; continue ;;
       s) __atb_n=; continue ;;
     esac
     case $__atb_a in
@@ -89,7 +115,9 @@ if [ -n "$__atb" ]; then
       --config=*) __atb_ok c "${__atb_a#--config=}" ;;
       --manifest-path) __atb_n=m ;;
       --manifest-path=*) __atb_ok m "${__atb_a#--manifest-path=}" ;;
-      --target-dir | --target-dir=* | -C | -C?*) __atb= ;;
+      --target-dir) __atb_n=t ;;
+      --target-dir=*) __atb_ok t "${__atb_a#--target-dir=}" ;;
+      -C | -C?*) __atb= ;;
       -Z | --color | --explain) [ -n "$__atb_v" ] || __atb_n=s ;;
       -*) ;;
       *) [ -n "$__atb_v" ] || __atb_v=$__atb_a ;;
@@ -97,9 +125,11 @@ if [ -n "$__atb" ]; then
   done
   [ -z "$__atb_n" ] || __atb=
   case $__atb_v in
-    clean | tippy | clippy) ;;
-    build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | fix) [ -n "$__atb_u" ] || __atb= ;;
-    *) __atb= ;;
+    clean | tippy | clippy) __atb_k=1 ;;
+    trust) __atb_e=1 ;;
+    build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | fix) [ -n "$__atb_u" ] && __atb_k=1 || __atb= ;;
+    "") __atb= ;;
+    *) [ -n "$__atb_u" ] && __atb_k=1 __atb_al=1 || __atb= ;;
   esac
 fi
 if [ -n "$__atb" ]; then
@@ -112,13 +142,35 @@ if [ -n "$__atb" ]; then
   done
 fi
 [ -n "$__atb" ] && __atb_scan "${CARGO_HOME:-$HOME/.cargo}"
-if [ -n "$__atb" ]; then
-  if [ -d "$__atb_c" ]; then [ -w "$__atb_c" ] || __atb=
-  elif [ -d "${__atb_c%/*}" ]; then [ -w "${__atb_c%/*}" ] || __atb=
-  else [ -w "$HOME/Library/Caches" ] || __atb=
+[ -z "$__atb_al" ] || [ -n "$__atb_ab" ] || __atb=
+if [ -n "$__atb" ] && [ -z "$__atb_tf" ]; then
+  if [ -n "${CARGO_TARGET_DIR+1}" ]; then __atb_T=$CARGO_TARGET_DIR __atb_tf=1
+  elif [ -n "${CARGO_BUILD_TARGET_DIR+1}" ]; then __atb_T=$CARGO_BUILD_TARGET_DIR __atb_tf=1
   fi
 fi
-[ -n "$__atb" ] && set -- --config "build.build-dir='$__atb_c{workspace-root}/.cargo-build'" "$@"
+if [ -n "$__atb" ] && [ -n "$__atb_tf" ]; then
+  case $__atb_T in "") __atb= ;; /*) ;; *) __atb_T=$PWD/$__atb_T ;; esac
+  case $__atb_T/ in *.noindex/*) __atb= ;; esac
+  case $__atb_T in *[\'{}[:cntrl:]]*) __atb= ;; esac
+  __atb_D=$__atb_T/build.noindex
+elif [ -n "$__atb" ]; then
+  [ -z "$__atb_tn" ] || __atb=
+  if [ -n "$__atb_k" ]; then
+    if [ -d "$__atb_c" ]; then [ -w "$__atb_c" ] || __atb_k=
+    elif [ -d "${__atb_c%/*}" ]; then [ -w "${__atb_c%/*}" ] || __atb_k=
+    else [ -w "$HOME/Library/Caches" ] || __atb_k=
+    fi
+  fi
+  case $PWD/ in *.noindex/*) [ -n "$__atb_k" ] || __atb= ;; esac
+  [ -n "$__atb_k" ] || __atb_D='{workspace-root}/target/build.noindex'
+fi
+if [ -z "$__atb" ]; then __atb_D=
+elif [ -z "$__atb_D" ]; then set -- --config "build.build-dir='$__atb_c{workspace-root}/.cargo-build'" "$@"
+elif [ -z "$__atb_e" ]; then set -- --config "build.build-dir='$__atb_D'" "$@"
+else
+  CARGO_BUILD_BUILD_DIR=$__atb_D
+  export CARGO_BUILD_BUILD_DIR
+fi
 "#;
 
 /// The block a shim forwarding to the store file `name` carries: `targo`'s, or
@@ -132,7 +184,8 @@ pub fn shim_block(name: &str) -> Option<String> {
     }
 }
 
-/// [`with_build_dir`] on this process's machine; `None` off macOS.
+/// [`with_build_dir`] on this process's machine; `None` off macOS. It hands `--config`
+/// only: `targo trust`'s folder goes through the environment, which the shim sets.
 #[must_use]
 pub fn with_build_dir_here(args: &[String], tool: Tool) -> Option<Vec<String>> {
     if !cfg!(target_os = "macos") {
@@ -175,59 +228,57 @@ pub fn release_reads_build_dir(release: &str) -> bool {
     }
 }
 
+/// WHY A BUILD DIRECTORY GOES ([`reclaim`], [`reclaim_watched`]): what its intent row, its
+/// removal row and the watch's account of it say — each rule [`reclaim`] takes one by, with
+/// the figures it was taken on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unused {
+    /// Its workspace is seen gone ([`checkout::gone_placed`]) and nothing wrote it for
+    /// `idle`, at least the pass's window `after` ([`RECLAIM_GONE`], or
+    /// [`RECLAIM_GONE_UNDER_PRESSURE`] below the disk watch's floor).
+    Gone { idle: Duration, after: Duration },
+    /// Nothing wrote it for `idle`, [`RECLAIM_IDLE`] or more: it goes whatever its
+    /// workspace's state, which was not looked at — it may still be there.
+    Idle { idle: Duration },
+    /// What an earlier pass renamed aside and did not finish removing.
+    Unfinished,
+}
+
 /// Removes the build directories under the cache `root` that nobody builds into any more,
 /// and returns them: one unwritten for [`RECLAIM_GONE`] whose workspace is seen gone
 /// ([`checkout::gone`], `home` naming the folders it never looks into), and any unwritten
 /// for [`RECLAIM_IDLE`]. One whose build lock a build holds is kept; each other is renamed
-/// aside while its locks are held, then removed. Never follows a symlink and never leaves
-/// `root`. Mirror folders left empty go too.
+/// aside while its locks are held, then removed. A stage an earlier pass renamed aside and
+/// did not finish removing is finished, and returned too. Never follows a symlink and never
+/// leaves `root`. Mirror folders left empty go too.
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
-    reclaim_after(root, home, now, RECLAIM_GONE, None, &mut |_| true)
+    reclaim_watched(root, home, now, RECLAIM_GONE, None, &mut |_, _| true)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
 }
 
-/// [`reclaim`] when the volume is short of space (the window's disk watch, below its
-/// floor): a gone workspace's build directory goes once unwritten for
-/// [`RECLAIM_GONE_UNDER_PRESSURE`]; every other rule is [`reclaim`]'s.
+/// [`reclaim`] as the window's disk watch runs it, each directory returned with why it went
+/// ([`Unused`]): a gone workspace's build directory goes once unwritten for `gone_after`
+/// ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the
+/// floor); and with `placing` (the home volume's device and a complete mount table), a
+/// workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
 ///
-/// WRITE-AHEAD: `record` is asked for each build directory about to go, with its locks
-/// held and before anything of it is moved; one it answers `false` for (its intent could
-/// not be put on record — a full disk) is kept. The caller may size it there.
-pub fn reclaim_under_pressure(
-    root: &Path,
-    home: Option<&Path>,
-    now: SystemTime,
-    record: &mut dyn FnMut(&Path) -> bool,
-) -> Vec<PathBuf> {
-    reclaim_after(root, home, now, RECLAIM_GONE_UNDER_PRESSURE, None, record)
-}
-
-/// [`reclaim`] as the window's disk watch runs it: a gone workspace's build directory goes
-/// once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low,
-/// [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor), `record` asked first as in
-/// [`reclaim_under_pressure`]; and with `placing` (the home volume's device and a complete
-/// mount table), a workspace nested in a removed checkout is gone too
-/// ([`checkout::gone_placed`]).
+/// WRITE-AHEAD: `record` is asked for each build directory about to go, and why, with its
+/// locks held and before anything of it is moved — and for a stage an earlier pass left
+/// ([`Unused::Unfinished`]) before it is removed; one it answers `false` for (its intent
+/// could not be put on record — a full disk) is kept. The caller may size it there. What is
+/// returned was removed whole: a stage finished is returned as [`Unused::Unfinished`], so
+/// each intent asked has its outcome; a directory whose removal was cut short is returned by
+/// the pass that finishes its stage.
 pub fn reclaim_watched(
     root: &Path,
     home: Option<&Path>,
     now: SystemTime,
     gone_after: Duration,
     placing: Option<&checkout::Placing>,
-    record: &mut dyn FnMut(&Path) -> bool,
-) -> Vec<PathBuf> {
-    reclaim_after(root, home, now, gone_after, placing, record)
-}
-
-/// [`reclaim`], a gone workspace's build directory going once unwritten for `gone_after`
-/// and once `record` answers for it.
-fn reclaim_after(
-    root: &Path,
-    home: Option<&Path>,
-    now: SystemTime,
-    gone_after: Duration,
-    placing: Option<&checkout::Placing>,
-    record: &mut dyn FnMut(&Path) -> bool,
-) -> Vec<PathBuf> {
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
     let mut removed = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let mut sweep = Sweep {
@@ -254,8 +305,8 @@ struct Sweep<'a> {
     /// What places a workspace nested in a removed checkout ([`checkout::gone_placed`]).
     placing: Option<&'a checkout::Placing>,
     /// Asked before each removal, its locks held: `false` keeps it.
-    record: &'a mut dyn FnMut(&Path) -> bool,
-    removed: &'a mut Vec<PathBuf>,
+    record: &'a mut dyn FnMut(&Path, Unused) -> bool,
+    removed: &'a mut Vec<(PathBuf, Unused)>,
 }
 
 /// How deep [`reclaim`] walks the mirror of the filesystem.
@@ -265,13 +316,27 @@ const MAX_DEPTH: usize = 64;
 /// earlier pass left, walk its other children, then remove `dir` itself if it ended empty
 /// and is not brand new. Returns whether anything under `dir` was removed.
 impl Sweep<'_> {
-    /// A missing stage needs no intent; existing staged bytes do, even after a crash.
-    /// Unknown metadata and non-directory entries stay untouched.
-    fn stage_recorded(&mut self, path: &Path) -> bool {
+    /// Whether the stage at `path` may be cleared: `Some(false)` where there is none (a
+    /// missing stage needs no intent), `Some(true)` where one stands and its intent is on
+    /// record (existing staged bytes need one, even after a crash), `None` to keep it — its
+    /// intent refused, or unknown metadata, or no directory.
+    fn stage_recorded(&mut self, path: &Path) -> Option<bool> {
         match std::fs::symlink_metadata(path) {
-            Ok(meta) => meta.is_dir() && (self.record)(path),
-            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(meta) => (meta.is_dir() && (self.record)(path, Unused::Unfinished)).then_some(true),
+            Err(e) => (e.kind() == std::io::ErrorKind::NotFound).then_some(false),
         }
+    }
+
+    /// FINISH A STAGE an earlier pass left, its intent on record ([`Self::stage_recorded`]):
+    /// removed whole, it is returned as [`Unused::Unfinished`], so its outcome is on record
+    /// beside its intent and its bytes are counted; one a removal could not finish stays,
+    /// returned as nothing, for the next pass to record and finish.
+    fn finish_stage(&mut self, stage: &Path) -> bool {
+        let gone = std::fs::remove_dir_all(stage).is_ok();
+        if gone {
+            self.removed.push((stage.to_path_buf(), Unused::Unfinished));
+        }
+        gone
     }
 
     fn walk(&mut self, dir: &Path, depth: usize) -> bool {
@@ -289,32 +354,38 @@ impl Sweep<'_> {
         for child in children {
             let name = child.file_name().unwrap_or_default();
             if name == LEAF {
-                let Some(held) = workspace_of(root, dir)
+                let Some((held, why)) = workspace_of(root, dir)
                     .and_then(|ws| unused(&ws, &child, home, now, self.gone_after, self.placing))
                 else {
                     continue;
                 };
-                if !(self.record)(&child) {
+                if !(self.record)(&child, why) {
                     drop(held);
                     continue;
                 }
                 let doomed = dir.join(DOOMED);
-                if !self.stage_recorded(&doomed) {
+                let Some(staged) = self.stage_recorded(&doomed) else {
                     drop(held);
                     continue;
+                };
+                if staged {
+                    any |= self.finish_stage(&doomed);
                 }
-                let _ = std::fs::remove_dir_all(&doomed);
                 let moved = std::fs::rename(&child, &doomed).is_ok();
                 // A build that started meanwhile waited on these, and builds into a new folder.
                 drop(held);
+                // Returned only once removed whole: a removal cut short leaves its rest a
+                // stage, which the next pass records and finishes as [`Unused::Unfinished`]
+                // — counted there, and never twice.
                 if moved {
-                    let _ = std::fs::remove_dir_all(&doomed);
-                    self.removed.push(child);
                     any = true;
+                    if std::fs::remove_dir_all(&doomed).is_ok() {
+                        self.removed.push((child, why));
+                    }
                 }
             } else if name == DOOMED {
-                if self.stage_recorded(&child) {
-                    any |= std::fs::remove_dir_all(&child).is_ok();
+                if self.stage_recorded(&child) == Some(true) {
+                    any |= self.finish_stage(&child);
                 }
             } else if depth < MAX_DEPTH {
                 any |= self.walk(&child, depth + 1);
@@ -328,16 +399,21 @@ impl Sweep<'_> {
 }
 
 /// The workspace a mirror folder stands for: `dir` with `root` taken off, as an absolute
-/// path.
+/// path — the inverse of [`aterm_toolchain::build_cache::build_dir`]'s join on macOS, the
+/// one platform anything writes the cache on ([`with_build_dir_here`], the shim and
+/// `aterm-verify` add a build directory there alone; [`reclaim_home`] runs there alone).
+/// On Windows nothing writes it (`<root>C:\…` could not even be named: a `:` inside a
+/// component), and a folder found under it anyway reads as `\<rel>`, no absolute path,
+/// which `checkout::gone_placed` refuses: nothing under it is called gone.
 fn workspace_of(root: &Path, dir: &Path) -> Option<PathBuf> {
     let rel = dir.strip_prefix(root).ok()?;
     Some(Path::new("/").join(rel))
 }
 
-/// `leaf`'s build locks, held, when nobody builds into `leaf`, `workspace`'s build
-/// directory, any more: idle long enough, no build holding a lock, and nothing written
-/// since it was first looked at. The workspace is looked at only when the age alone does
-/// not decide.
+/// `leaf`'s build locks, held, and why it goes ([`Unused`]), when nobody builds into
+/// `leaf`, `workspace`'s build directory, any more: idle long enough, no build holding a
+/// lock, and nothing written since it was first looked at. The workspace is looked at only
+/// when the age alone does not decide.
 fn unused(
     workspace: &Path,
     leaf: &Path,
@@ -345,14 +421,22 @@ fn unused(
     now: SystemTime,
     gone_after: Duration,
     placing: Option<&checkout::Placing>,
-) -> Option<Vec<crate::lock::Flock>> {
+) -> Option<(Vec<crate::lock::Flock>, Unused)> {
     let seen = look(leaf)?;
     let idle = age(now, seen.newest);
-    if idle < gone_after
-        || (idle < RECLAIM_IDLE && checkout::gone_placed(workspace, home, placing).is_err())
-    {
+    if idle < gone_after {
         return None;
     }
+    let why = if idle >= RECLAIM_IDLE {
+        Unused::Idle { idle }
+    } else if checkout::gone_placed(workspace, home, placing).is_ok() {
+        Unused::Gone {
+            idle,
+            after: gone_after,
+        }
+    } else {
+        return None;
+    };
     let held = seen
         .locks
         .iter()
@@ -364,7 +448,7 @@ fn unused(
         })
         .collect::<Option<Vec<_>>>()?;
     let again = look(leaf)?;
-    (again.newest == seen.newest && again.locks == seen.locks).then_some(held)
+    (again.newest == seen.newest && again.locks == seen.locks).then_some((held, why))
 }
 
 /// What [`look`] finds in a build directory.
@@ -422,8 +506,8 @@ fn age(now: SystemTime, then: SystemTime) -> Duration {
 pub fn reclaim_home_watched(
     gone_after: Duration,
     placing: Option<&checkout::Placing>,
-    record: &mut dyn FnMut(&Path) -> bool,
-) -> Vec<PathBuf> {
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }

@@ -18,7 +18,9 @@
 //!
 //! GL is synchronous to the CPU for buffer and texture updates (the driver
 //! orders a write after every draw already issued that reads the object), so
-//! the arm needs none of the Metal arm's frame-slot rings.
+//! the arm needs none of the Metal arm's frame-slot rings for correctness.
+//! The fx palette keeps a ring of three textures all the same: a rewrite of a
+//! texture a draw in flight samples makes the driver copy or wait.
 
 use super::*;
 use crate::device_layer::{
@@ -87,6 +89,16 @@ pub(crate) struct GlArmLive {
     /// Glyph (mono, colour) and decoration coverage. Sprite textures live with
     /// their source (`SpriteTex::gl_atlas`).
     atlases: [Option<GlArmAtlas>; DRAW_ATLAS_COUNT],
+    /// The fx atlases (`fx_gpu::FxAtlasKind` order), synced from the
+    /// renderer's append-only `FxAtlas`.
+    fx_tex: [Option<fx_gpu::FxArmTex>; 2],
+    /// The fx palette ring: one RGBA8 texture (1024 entries a row) per slot,
+    /// written in turn. The driver orders a write after the draws that read
+    /// the old texels, but a write into a texture an in-flight draw samples
+    /// makes it copy or wait; a ring of three never writes the texture the
+    /// last two frames bound.
+    fx_palettes: [Option<GlTexture>; fx_gpu::FX_PALETTE_RING],
+    fx_palette_next: usize,
 }
 
 impl GlArmLive {
@@ -121,7 +133,50 @@ impl GlArmLive {
             uniform_key: None,
             streams: std::array::from_fn(|_| None),
             atlases: std::array::from_fn(|_| None),
+            fx_tex: std::array::from_fn(|_| None),
+            fx_palettes: std::array::from_fn(|_| None),
+            fx_palette_next: 0,
         })
+    }
+
+    /// Bring both fx atlases up to date with `atlas` (re-minted on a new
+    /// generation or another context, else the log's tail appended in place)
+    /// when the frame draws fx or prefetches. The texel bytes uploaded.
+    fn sync_fx(&mut self, atlas: &fx_gpu::FxAtlas, drawing: bool) -> Result<u64, String> {
+        let mut bytes = 0;
+        for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
+            let side = atlas.side(kind);
+            let slot = &mut self.fx_tex[kind as usize];
+            if !fx_gpu::fx_tex_due(slot, side, drawing) {
+                continue;
+            }
+            let dev = &self.dev;
+            bytes += fx_gpu::sync_fx_tex(
+                DeviceHandle::Gl(dev),
+                slot,
+                side,
+                |t| t.tex.gl().on(dev),
+                || {},
+            )?
+            .bytes;
+        }
+        Ok(bytes)
+    }
+
+    /// Drop the fx textures (the renderer's residency test seam).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn drop_fx_residency(&mut self) {
+        self.fx_tex = [None, None];
+        self.fx_palettes = std::array::from_fn(|_| None);
+    }
+
+    /// Write the frame's palette into the ring's next texture. The slot
+    /// written.
+    fn upload_fx_palette(&mut self, words: &[u32]) -> Result<usize, String> {
+        let slot = self.fx_palette_next;
+        self.fx_palette_next = (slot + 1) % fx_gpu::FX_PALETTE_RING;
+        write_fx_palette(&self.dev, &mut self.fx_palettes[slot], words)?;
+        Ok(slot)
     }
 
     /// The program for `row`, built on first use.
@@ -254,6 +309,30 @@ pub(crate) fn offscreen_format(dev: &GlDevice) -> (TexelFormat, Option<TexelForm
     }
 }
 
+/// Write `words` into `tex` (`FX_PALETTE_ROW` entries a row, entry `j` at
+/// `(j % row, j / row)`), re-minted at a power-of-two row count when it is
+/// absent, too short or on another context.
+pub(crate) fn write_fx_palette(
+    dev: &GlDevice,
+    tex: &mut Option<GlTexture>,
+    words: &[u32],
+) -> Result<(), String> {
+    let row = fx_gpu::FX_PALETTE_ROW;
+    let rows = u32::try_from(words.len().div_ceil(row as usize).max(1))
+        .map_err(|_| "gl arm: the fx palette outgrows a texture".to_owned())?;
+    if tex.as_ref().is_none_or(|t| t.height < rows || !t.on(dev)) {
+        *tex =
+            Some(dev.texture_2d(TexelFormat::Rgba8Unorm, row, rows.next_power_of_two(), None)?);
+    }
+    let tex = tex.as_ref().expect("minted above");
+    let bytes: &[u8] = aterm_bits::cast_slice(words);
+    let full = (words.len() / row as usize) as u32;
+    dev.upload_rows(tex, 0, full, bytes, row * 4, row)?;
+    let rem = (words.len() % row as usize) as u32;
+    let tail = &bytes[(full * row * 4) as usize..];
+    dev.upload_region(tex, 0, full, rem, 1, tail, rem * 4)
+}
+
 /// What the shared part of `encode_frame` hands the GL tail.
 pub(crate) struct GlTailIn<'a> {
     pub(crate) inst: &'a Instances,
@@ -272,6 +351,8 @@ pub(crate) struct GlTailIn<'a> {
     pub(crate) cursor_opaque: bool,
     /// The pass-economy ablation (`FramePlanCtx::ablation`).
     pub(crate) ablation: crate::renderer::UnormAblation,
+    /// The fx engine: its atlas and this frame's palette.
+    pub(crate) fx: &'a fx_gpu::FxGpu,
 }
 
 /// What the tail drew: the pass count, pass 0's load, the scissor and the
@@ -279,8 +360,15 @@ pub(crate) struct GlTailIn<'a> {
 pub(crate) struct GlTailOut {
     pub(crate) passes: usize,
     pub(crate) stage_ns: u64,
+    /// What the plan held on the Unorm view, under the ablation it took.
+    pub(crate) unorm: crate::renderer::PlanUnorm,
     pub(crate) load0: crate::device_layer::FrameLoad,
     pub(crate) scissor: Option<(u32, u32, u32, u32)>,
+    /// The fx atlas texel bytes uploaded this frame.
+    pub(crate) fx_atlas_bytes: u64,
+    /// Whether the fx streams were staged (the residency and the palette
+    /// went up; otherwise the frame's fx failed closed).
+    pub(crate) fx_staged: bool,
 }
 
 /// The GL encode tail: stage the instance streams, build the plan, resolve it
@@ -295,10 +383,32 @@ pub(crate) fn encode_tail(
     t: GlTailIn<'_>,
 ) -> Result<GlTailOut, String> {
     let (w, h) = t.dims;
-    // 1. Stage the streams: `Some` count iff the stream uploaded.
+    // 1. Stage the streams: `Some` count iff the stream uploaded. The fx
+    //    residency first: without both atlases and the palette no fx stream
+    //    is staged (fail closed, by name).
     let stage_started = aterm_time::Instant::now();
+    let drawing = t.inst.fx_instances() > 0;
+    let (fx_atlas_bytes, fx_palette) = match live.sync_fx(&t.fx.atlas, drawing).and_then(|b| {
+        Ok((
+            b,
+            if drawing {
+                Some(live.upload_fx_palette(&t.fx.palette)?)
+            } else {
+                None
+            },
+        ))
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            gl_arm_note(&format!("fx residency: {e}; fx draws nothing"));
+            (0, None)
+        }
+    };
     let mut counts: [Option<u32>; STREAM_COUNT] = [None; STREAM_COUNT];
     for id in StreamId::ALL {
+        if id.is_fx() && fx_palette.is_none() {
+            continue;
+        }
         let (bytes, count) = t.inst.stream_bytes(id);
         if live.upload_stream(id, bytes)? {
             counts[id as usize] = Some(count);
@@ -318,7 +428,7 @@ pub(crate) fn encode_tail(
              (built before arming?)",
         );
     }
-    build_frame_plan(
+    let unorm = build_frame_plan(
         plan,
         &counts,
         FramePlanCtx {
@@ -420,6 +530,8 @@ pub(crate) fn encode_tail(
                 sprites[a as usize] = Some(sprite.gl_atlas(&live.dev)?);
                 continue;
             }
+            // Synced with the palette in step 1.
+            DrawAtlas::Fx => continue,
             DrawAtlas::Image => {
                 let p = win
                     .image_plane
@@ -474,6 +586,12 @@ pub(crate) fn encode_tail(
             };
             tex.map(|tex| (tex, &live.nearest))
         }),
+        fx: fx_palette.map(|slot| GlFxBind {
+            r8: live.fx_tex[0].as_ref().expect("synced in step 1").tex.gl(),
+            rgba: live.fx_tex[1].as_ref().expect("synced in step 1").tex.gl(),
+            palette: live.fx_palettes[slot].as_ref().expect("written in step 1"),
+            sampler: &live.nearest,
+        }),
     };
     let mut enc = FrameEncoder::gl(&live.dev)?;
     let passes = run_frame_plan(&mut enc, &FrameRes::Gl(&rig), plan, load0, scissor)?;
@@ -485,8 +603,11 @@ pub(crate) fn encode_tail(
     Ok(GlTailOut {
         passes,
         stage_ns,
+        unorm,
         load0,
         scissor,
+        fx_atlas_bytes,
+        fx_staged: fx_palette.is_some(),
     })
 }
 
@@ -821,7 +942,7 @@ impl GpuRenderer {
             live,
             aterm_bits::bytes_of(&BloomUniform {
                 texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                strength: self.bloom_strength,
+                strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
                 radius: self.bloom_radius,
                 chroma_radius: bloom_chroma_radius(self.bloom_radius),
                 _pad: [0.0; 3],
@@ -1077,5 +1198,59 @@ impl GpuRenderer {
             pass.draw(4, 1)?;
         }
         frame.submit()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// The frame palette's texture is the layout `cell.glsl`'s `fx_ink` reads:
+    /// entry `j` at `(j % FX_PALETTE_ROW, j / FX_PALETTE_ROW)`, holding the
+    /// word's little-endian bytes, over whole rows and a partial last row. A
+    /// palette that fits reuses the texture; a longer one re-mints it at a
+    /// power-of-two row count.
+    #[test]
+    fn the_fx_palette_texture_holds_entry_j_at_its_texel() {
+        let dev = crate::gl::test_device();
+        let row = fx_gpu::FX_PALETTE_ROW;
+        let mut tex = None;
+        let mut heights = Vec::new();
+        for n in [3usize, 1024, 2500, 7] {
+            let words: Vec<u32> = (0..n as u32)
+                .map(|j| j.wrapping_mul(0x9e37_79b9) ^ (j << 7))
+                .collect();
+            write_fx_palette(&dev, &mut tex, &words).expect("written");
+            let t = tex.as_ref().expect("minted");
+            heights.push(t.height);
+            let rows = n.div_ceil(row as usize) as u32;
+            let bytes = dev
+                .read_rgba8(t, row, rows, row as usize * 4)
+                .expect("read back");
+            for (j, w) in words.iter().enumerate() {
+                assert_eq!(bytes[4 * j..4 * j + 4], w.to_le_bytes(), "entry {j} of {n}");
+            }
+        }
+        assert_eq!(heights, [1, 1, 4, 4], "reused while it fits");
+    }
+
+    /// The palette ring writes three distinct textures in turn, so no frame
+    /// rewrites a texture either of the two frames before it bound.
+    #[test]
+    fn the_fx_palette_ring_never_rewrites_the_last_two_frames_texture() {
+        let mut live = GlArmLive::on(crate::gl::test_device()).expect("the arm's resources");
+        let names: Vec<u32> = (0..7u32)
+            .map(|f| {
+                let slot = live.upload_fx_palette(&[f]).expect("written");
+                live.fx_palettes[slot].as_ref().expect("written").name
+            })
+            .collect();
+        for w in names.windows(3) {
+            assert!(
+                w[0] != w[1] && w[1] != w[2] && w[0] != w[2],
+                "three frames in a row wrote {w:?} ({names:?})"
+            );
+        }
+        assert_eq!(names[..4], [names[0], names[1], names[2], names[0]]);
     }
 }

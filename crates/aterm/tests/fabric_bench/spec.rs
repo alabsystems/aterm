@@ -56,25 +56,50 @@ pub struct Spec {
     pub rounds: usize,
     /// What the in-process broker's ack promises ([`Tier`]).
     pub durability: Tier,
+    /// The ordered broker's HORIZON, in milliseconds (`horizon_ms=`): how
+    /// long after the first ack no full flush covers its writer flushes in
+    /// full. `Some` exactly when `durability` is [`Tier::Ordered`]
+    /// ([`ORDERED_HORIZON_MS`] unless named).
+    pub horizon_ms: Option<u64>,
 }
 
-/// The durability tier the bench opens its in-process broker at — astream's
-/// `Durability`, named here in a std-only type because the lane mounts this
-/// file and has no astream dependency (`run.rs` maps it).
+/// aterm's ordered horizon (`aterm_link::durability::ORDERED_HORIZON`, 100 ms),
+/// the one aterm opens an ordered broker with, and so the ordered arm's unless
+/// it names another. Spelled here because this file is std-only (the lane
+/// mounts it); `run.rs` holds the two equal. (Every entry names its own,
+/// `horizon_ms=` in its words: those before aterm took 100 ms say 1000.)
+pub const ORDERED_HORIZON_MS: u64 = 100;
+
+/// The durability tier the bench opens its in-process broker at — aterm's
+/// `aterm_link::durability::Durability`, named here in a std-only type
+/// because the lane mounts this file and has no aterm-link dependency
+/// (`run.rs` maps it, and opens the broker with aterm's own options for it:
+/// the tier and, on a weak one, aterm's escalation table).
 ///
-/// STRICT IS THE MEASUREMENT; RELAXED IS THE CEILING. aterm opens its broker
-/// Strict (`Broker::open_guarded`: every ack after an fsync, `F_FULLFSYNC` on
-/// macOS), so the default is what a person's message costs. Relaxed acks after
-/// the batch's page-cache write instead, through the same guarded open
-/// (`Broker::open_guarded_with`, the same capability checks): it is what the
-/// stack costs with the broker's fsync taken out, the bound an ordered tier
-/// (`F_BARRIERFSYNC`, ordering without the drive-cache flush) could approach
-/// and never pass. The bridge's own state-file writes are not the broker's
-/// and stay as they are in both.
+/// ORDERED IS THE DEFAULT ARM, because it is what aterm opens its guarded
+/// broker at by default (`aterm_link::durability::default_for`, which
+/// `run.rs` holds this equal to): every ack after an ordering barrier
+/// (`F_BARRIERFSYNC`), and a full flush once the horizon
+/// ([`Spec::horizon_ms`]) has passed since the first ack no full flush
+/// covers — at most the horizon plus a batch and a flush after it — and
+/// before the ack of every record aterm's table escalates; served strict by
+/// astream off macOS and off the boot volume, which the entry's broker line
+/// then says. A bare `verify perf fabric` therefore measures the
+/// configuration aterm ships. STRICT is the baseline the default was gated
+/// against, and every entry's yardstick unit: every ack after a full flush
+/// (`F_FULLFSYNC` on macOS), what a person's message costs on a strict
+/// broker, and the default arm of every entry written before the 2026-10-20
+/// re-gate: compare a bare entry with one of those through
+/// `durability=strict`, never bare to bare. RELAXED is the ceiling: the
+/// batch's page-cache write and no flush at all, the bound a cheaper durable
+/// tier could approach and never pass. All three go through the same guarded
+/// open (the same capability checks); the bridge's own state-file writes are
+/// not the broker's and stay as they are in every arm.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Tier {
-    #[default]
     Strict,
+    #[default]
+    Ordered,
     Relaxed,
 }
 
@@ -84,11 +109,13 @@ impl Tier {
     pub fn word(self) -> &'static str {
         match self {
             Tier::Strict => "strict",
+            Tier::Ordered => "ordered",
             Tier::Relaxed => "relaxed",
         }
     }
 
-    /// `strict` or `relaxed`, and nothing else. Pure (unit-tested).
+    /// `strict`, `ordered` or `relaxed`, and nothing else. Pure
+    /// (unit-tested).
     ///
     /// # Errors
     ///
@@ -96,9 +123,10 @@ impl Tier {
     pub fn parse(word: &str) -> Result<Tier, String> {
         match word {
             "strict" => Ok(Tier::Strict),
+            "ordered" => Ok(Tier::Ordered),
             "relaxed" => Ok(Tier::Relaxed),
             _ => Err(format!(
-                "{ENV}: `durability=` is `strict` or `relaxed`, not `{word}`"
+                "{ENV}: `durability=` is `strict`, `ordered` or `relaxed`, not `{word}`"
             )),
         }
     }
@@ -119,11 +147,13 @@ impl Spec {
         self.burst.div_ceil(PER_SENDER)
     }
 
-    /// The spec as the words [`parse`] reads, for the report.
+    /// The spec as the words [`parse`] reads, for the report: an ordered
+    /// arm's with its horizon, so the entry says which arm it is and
+    /// reproduces it.
     #[must_use]
     pub fn words(&self) -> String {
         let attach: Vec<String> = self.attach.iter().map(usize::to_string).collect();
-        format!(
+        let mut words = format!(
             "samples={} warmup={} burst={} pingpong={} attach={} rounds={} durability={}",
             self.samples,
             self.warmup,
@@ -132,18 +162,23 @@ impl Spec {
             attach.join(","),
             self.rounds,
             self.durability.word()
-        )
+        );
+        if let Some(ms) = self.horizon_ms {
+            words.push_str(&format!(" horizon_ms={ms}"));
+        }
+        words
     }
 }
 
 /// Parse `out=<dir> [samples=<n>] [warmup=<n>] [burst=<n>] [pingpong=<n>]
-/// [attach=<n>,<n>,…] [rounds=<n>] [durability=strict|relaxed]`. Pure
-/// (unit-tested).
+/// [attach=<n>,<n>,…] [rounds=<n>] [durability=strict|ordered|relaxed]
+/// [horizon_ms=<n>]`. Pure (unit-tested).
 ///
 /// # Errors
 ///
 /// A word that is not one of those, a count that is not a positive integer
-/// (`warmup` may be 0), a durability that is not a [`Tier`], a burst past
+/// (`warmup` and `horizon_ms` may be 0), a durability that is not a
+/// [`Tier`], a horizon for a tier that is not ordered, a burst past
 /// [`BURST_MAX`], an attach list that does not rise or passes [`ATTACH_MAX`],
 /// or no `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
@@ -156,7 +191,8 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         pingpong: DEFAULT_PINGPONG,
         attach: DEFAULT_ATTACH.to_vec(),
         rounds: DEFAULT_ROUNDS,
-        durability: Tier::Strict,
+        durability: Tier::default(),
+        horizon_ms: None,
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -179,6 +215,11 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             "pingpong" => spec.pingpong = count(key, v, false)?,
             "rounds" => spec.rounds = count(key, v, false)?,
             "durability" => spec.durability = Tier::parse(v)?,
+            "horizon_ms" => {
+                spec.horizon_ms = Some(v.parse::<u64>().map_err(|_| {
+                    format!("{ENV}: `horizon_ms=` takes a non-negative integer, not `{v}`")
+                })?);
+            }
             "attach" => {
                 spec.attach = v
                     .split(',')
@@ -189,6 +230,16 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         }
     }
     spec.out = out.ok_or_else(|| format!("{ENV}: `out=<dir>` names where the report goes"))?;
+    match (spec.durability, spec.horizon_ms) {
+        (Tier::Ordered, None) => spec.horizon_ms = Some(ORDERED_HORIZON_MS),
+        (Tier::Ordered, Some(_)) | (_, None) => {}
+        (tier, Some(_)) => {
+            return Err(format!(
+                "{ENV}: horizon_ms= is the ordered tier's, and this run is {}",
+                tier.word()
+            ));
+        }
+    }
     if spec.burst > BURST_MAX {
         return Err(format!(
             "{ENV}: burst={} is past the {BURST_MAX} one instance's sender sessions carry",
@@ -231,9 +282,9 @@ mod tests {
         assert_eq!(spec.attach, DEFAULT_ATTACH.to_vec());
         assert_eq!(spec.burst_senders(), 5);
         assert_eq!(
-            spec.durability,
-            Tier::Strict,
-            "aterm opens its broker Strict"
+            (spec.durability, spec.horizon_ms),
+            (Tier::Ordered, Some(ORDERED_HORIZON_MS)),
+            "aterm opens its guarded broker ordered at its horizon (run.rs holds it to aterm's)"
         );
         // The words it reports are the words that reproduce it.
         let again = parse(&format!("out=/tmp/x {}", spec.words())).expect("round trip");
@@ -283,6 +334,7 @@ mod tests {
         for (word, tier) in [("strict", Tier::Strict), ("relaxed", Tier::Relaxed)] {
             let spec = parse(&format!("out=/o durability={word}")).expect(word);
             assert_eq!(spec.durability, tier, "{word}");
+            assert_eq!(spec.horizon_ms, None, "{word}: no horizon");
             assert_eq!(tier.word(), word);
             // The report's words carry the tier, so an entry says what its
             // acks promised and reproduces it.
@@ -290,12 +342,43 @@ mod tests {
             let again = parse(&format!("out=/o {}", spec.words())).expect("round trip");
             assert_eq!(again, spec);
         }
-        // Only the two words, spelled exactly: a near miss is refused rather
+        // Ordered carries its horizon: aterm's unless named, and the words say
+        // it, so the 1 s and the 100 ms arms read apart.
+        let ordered = parse("out=/o durability=ordered").expect("ordered");
+        assert_eq!(
+            (ordered.durability, ordered.horizon_ms),
+            (Tier::Ordered, Some(ORDERED_HORIZON_MS))
+        );
+        assert!(ordered.words().ends_with(&format!(
+            " durability=ordered horizon_ms={ORDERED_HORIZON_MS}"
+        )));
+        let fast = parse("out=/o durability=ordered horizon_ms=1000").expect("1 s");
+        assert_eq!(fast.horizon_ms, Some(1000));
+        assert_eq!(
+            parse(&format!("out=/o {}", fast.words())).expect("round trip"),
+            fast
+        );
+        // A horizon is the ordered tier's alone — the default arm's, unnamed.
+        for bad in [
+            "durability=strict horizon_ms=100",
+            "durability=relaxed horizon_ms=100",
+        ] {
+            let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+            assert!(err.contains("horizon_ms="), "{bad}: {err}");
+        }
+        assert_eq!(
+            parse("out=/o horizon_ms=1000")
+                .expect("the default arm's")
+                .horizon_ms,
+            Some(1000)
+        );
+        assert!(parse("out=/o durability=ordered horizon_ms=soon").is_err());
+        // Only the three words, spelled exactly: a near miss is refused rather
         // than measured at a tier nobody asked for.
         for bad in [
             "Strict",
             "RELAXED",
-            "ordered",
+            "Ordered",
             "replicated",
             "",
             "relaxed,strict",

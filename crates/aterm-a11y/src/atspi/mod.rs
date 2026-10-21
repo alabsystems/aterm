@@ -44,7 +44,7 @@ mod wire;
 
 pub use crate::model::{ActionHandler, ActivationHandler, DeactivationHandler};
 pub use adapter::Adapter;
-pub use publisher::{Buses, Publisher, SessionBuses};
+pub use publisher::{Buses, Publisher, SessionBuses, WRITE};
 
 #[cfg(test)]
 mod oracle;

@@ -353,13 +353,18 @@ fn every_value_reads_back_from_its_bytes() {
     assert_eq!(<()>::from_tape(&().to_tape()), Ok(()));
     assert!(<()>::from_tape(b"x").is_err());
     // The machine's count of its sleep, and its record of its last sleep.
-    use crate::supervise::policy::sleeps::SleepStamp;
+    use crate::supervise::policy::sleeps::{Boot, SleepStamp};
+    let boot = [
+        0x4F, 0x1C, 0x2A, 0x9E, 0x3E, 0x4F, 0x50, 0x61, 0x72, 0x83, 0x94, 0xA5, 0xB6, 0xC7, 0xD8,
+        0xE9,
+    ];
+    let counted = SleepStamp {
+        asleep: Duration::from_millis(1_800_003),
+        boot: Some(Boot::kernel(boot)),
+    };
     for v in [
         None,
-        Some(SleepStamp {
-            asleep: Duration::from_millis(1_800_003),
-            boot: Some("4F1C2A9E-boot".to_string()),
-        }),
+        Some(counted.clone()),
         Some(SleepStamp {
             asleep: Duration::ZERO,
             boot: None,
@@ -367,6 +372,33 @@ fn every_value_reads_back_from_its_bytes() {
     ] {
         assert_eq!(Option::<SleepStamp>::from_tape(&v.to_tape()), Ok(v));
     }
+    // The boot as the kernel spells it, and as it was read: a tape any build
+    // recorded on either kernel (macOS's upper-case text, Linux's lower-case)
+    // replays the same 16 bytes and is written back byte for byte, so the act
+    // rows a replay writes are the recorded ones. CONTROL: the all-zero id
+    // replays as a count on no named boot.
+    for recorded in [
+        &b"1800003 4F1C2A9E-3E4F-5061-7283-94A5B6C7D8E9"[..],
+        b"1800003 4f1c2a9e-3e4f-5061-7283-94a5b6c7d8e9",
+    ] {
+        let read = Option::<SleepStamp>::from_tape(recorded);
+        assert_eq!(read, Ok(Some(counted.clone())), "{recorded:?}");
+        assert_eq!(read.map(|v| v.to_tape()), Ok(recorded.to_vec()));
+    }
+    let kernel: &[u8] = if cfg!(any(target_os = "linux", target_os = "android")) {
+        b"1800003 4f1c2a9e-3e4f-5061-7283-94a5b6c7d8e9"
+    } else {
+        b"1800003 4F1C2A9E-3E4F-5061-7283-94A5B6C7D8E9"
+    };
+    assert_eq!(Some(counted.clone()).to_tape(), kernel.to_vec());
+    assert_eq!(
+        Option::<SleepStamp>::from_tape(b"1800003 00000000-0000-0000-0000-000000000000"),
+        Ok(Some(SleepStamp {
+            boot: None,
+            ..counted
+        })),
+        "CONTROL"
+    );
     for v in [None, Some((WALL_MS, WALL_MS + 1_800_000))] {
         assert_eq!(Option::<(i64, i64)>::from_tape(&v.to_tape()), Ok(v));
     }

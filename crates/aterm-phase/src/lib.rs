@@ -51,10 +51,12 @@
 //! * [`panel`] — Claude Code's Settings panel (`/usage`'s dialog): whether
 //!   it is what the screen shows, by which renderer, and what a row under
 //!   its header says of the Usage tab;
-//! * [`reset`] — Claude Code's limit reset: the grant row of the usage-limit
-//!   dialog by its exact label, the confirmation it opens read exactly or
-//!   refused, the name it draws each limit type by, the two pending lines,
-//!   and the line the vendor answers with;
+//! * [`reset`] — Claude Code's limit reset, in 2.1.304's wording: the kinds
+//!   of reset, the grant row of the usage-limit dialog the step may take (the
+//!   ONE reset on offer, of a kind it takes, or the first kind of the owner's
+//!   list on offer, by its exact label), the confirmation it opens
+//!   read exactly or refused, the name it draws each limit type by, the two
+//!   pending lines, and the line the vendor answers with;
 //! * [`credits`] — usage credits carrying the session, and the vendor's own
 //!   warning that a window is filling, read for the record;
 //! * [`anchors::ANCHORS`] — the literal strings other crates guard on.
@@ -101,7 +103,10 @@ mod vendor_files;
 
 pub use anchors::{ANCHORS, anchor, anchor_text};
 pub use autocompact::{Offer, OfferFocus};
-pub use login::{LoginMethod, LoginScreen, Picker as LoginPicker, login_interrupted, login_screen};
+pub use login::{
+    LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,
+    login_screen,
+};
 pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
@@ -123,14 +128,16 @@ pub use reader::{
     may_host_agent, program_of, read, read_at,
 };
 pub use reset::{
-    ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, is_confirm_title,
-    reset_confirm, reset_limit_name, reset_line, reset_pending, reset_row, spends_reset,
+    ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, reset_confirm,
+    reset_limit_name, reset_line, reset_pending, reset_row, reset_title, spends_reset,
+    uses_a_reset,
 };
 pub use survey::{SurveyBlock, SurveyKind, survey_block};
 pub use turn::{
-    CardPlace, LaunchCard, answered_prompt, continuation_suggestion, goal_active, idle_compacted,
-    interrupted, launch_card, launch_card_held, launch_card_place, launch_card_scan,
-    launch_card_unmoved, launch_card_version, launch_card_words, said_tail,
+    BannerBuild, CardPlace, LaunchCard, LaunchCardRead, answered_prompt, continuation_suggestion,
+    goal_active, idle_compacted, interrupted, launch_card, launch_card_held, launch_card_place,
+    launch_card_read, launch_card_scan, launch_card_unmoved, launch_card_version,
+    launch_card_words, said_tail, said_whole, turn_history_stop, turn_said_before, turn_whole,
 };
 pub use wall::{
     ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, WordsAbove, auto_continue_end,

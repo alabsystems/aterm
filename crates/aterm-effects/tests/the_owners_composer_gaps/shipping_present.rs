@@ -106,7 +106,8 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
                 default_bg: gl.cfg.theme_bg,
                 geom: gl.g,
                 focused: true,
-                amplitude: 1.0,
+                cursor_cell_bg: None,
+                trail_brightness: 1.0,
                 shed_envelope: 1.0,
                 body_allowed: false,
                 momentum_glow: false,
@@ -127,6 +128,7 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
             print_anchor: anchor,
             print_anchor_glyph: glyph,
             caret_drawn: visible,
+            frame_cells: None,
         },
         std::iter::empty(),
     );
@@ -837,10 +839,10 @@ fn probe_f2_midline_wrap_vacated_light() {
 /// retire is s3-long2-m's row in [`probe_live_families`].
 #[test]
 fn probe_f4a_synthetic_torn_catchup() {
-    let mut fails = Vec::new();
     let insert = "(versus system wide) is running and what disk space is being used and especially all the subtrees and such. so that every processtree of the system stays visible at a glance";
     // silent from key `k0` for `stall` ms, the catch-up then drawn as one
     // repaint; after it every key lags `lag` ms
+    let mut takes = Vec::new();
     for (k0, stall, lag) in [
         (45usize, 4000u64, 2u64),
         (45, 4000, 550),
@@ -852,90 +854,96 @@ fn probe_f4a_synthetic_torn_catchup() {
                 if tear.is_none() && tear_ms != 400 {
                     continue;
                 }
-                let mut s = Hosted::new(LABEL);
-                s.verbose = true;
-                let head = format!("{}{}{}", words_to(TW), words_to(TW), words_to(12));
-                s.preload(&format!("{head}{TAIL}"), head.chars().count());
-                let row0 = s.caret().0;
-                let top0 = top_rule(&s);
-                let keys = keys_of(insert, s.ms() + 100, 110);
-                let stall_end = keys[k0].0 + stall;
-                let renders = renders_for(&keys, |i| {
-                    if i < k0 {
-                        2
-                    } else if keys[i].0 < stall_end {
-                        stall_end - keys[i].0
-                    } else {
-                        lag
-                    }
-                });
-                // the catch-up is the render that lands at stall_end
-                let catch = renders
-                    .iter()
-                    .position(|&r| r >= stall_end)
-                    .expect("the catch-up");
-                let tear_spec = tear.map(|t| {
-                    let t = match t {
-                        TearAt::Row(_) => TearAt::Row(row0 - 1),
-                        p => p,
-                    };
-                    (catch, t, tear_ms)
-                });
-                let tear_used = tear_spec.map(|(_, t, _)| t);
-                let mut grew_at_catch: Option<u64> = None;
-                let mut max_dark_after: (u64, String) = (0, String::new());
-                let mut obs = |s: &Sim| {
-                    let t = s.ms();
-                    if t > stall_end + tear_ms + 1500 {
-                        // well after the catch-up the hand's row is lit from
-                        // where the band last began up to the caret
-                        let (cr, cc) = s.caret();
-                        let live = s.live(cr);
-                        let lo = live.first().copied().unwrap_or(cc);
-                        let dark = (lo..cc.saturating_sub(1))
-                            .filter(|c| !live.contains(c))
-                            .count();
-                        if dark as u64 > max_dark_after.0 {
-                            max_dark_after = (
-                                dark as u64,
-                                format!("t={t} row {cr} live {live:?} caret {cc}"),
-                            );
-                        }
-                    }
-                    if grew_at_catch.is_none() && top_rule(s) < top0 {
-                        grew_at_catch = Some(t);
-                    }
-                };
-                s.run(&keys, &renders, tear_spec, &mut obs);
-                let end = s.ms() + 600;
-                s.advance(end, &mut obs);
-                s.cov = Some((s.caret().0, 2));
-                let st = s.glow.v2_status();
-                let judged_after = s
-                    .glow
-                    .admission_log()
-                    .filter(|r| {
-                        r.at.duration_since(s.t0).as_millis() as u64 > stall_end + tear_ms + 200
-                    })
-                    .count();
-                let line = format!(
-                    "k0 {k0} stall {stall} lag {lag} tear {tear_used:?}/{tear_ms}: stall_end {stall_end} grew_at {grew_at_catch:?} caret {:?} {} retired {:?} followed {:?} judged_after_catchup {judged_after} max_dark_after {:?} holes {} | {}",
-                    s.caret(),
-                    s.dark(),
-                    st.map(|s| s.retired),
-                    st.map(|s| s.followed),
-                    max_dark_after,
-                    s.holes_seen.len(),
-                    declines(&s).join(" ; ")
-                );
-                eprintln!("{line}");
-                let hidden = declines(&s).iter().any(|l| l.contains("hidden-relocation"));
-                if st.is_some_and(|st| st.retired > 20) || hidden || s.dark() != "dark[0]=" {
-                    fails.push(line);
-                }
+                takes.push((k0, stall, lag, tear, tear_ms));
             }
         }
     }
+    // Each take is its own host and clock: they replay side by side.
+    let fails: Vec<String> = par_map(&takes, |&(k0, stall, lag, tear, tear_ms)| {
+        let mut s = Hosted::new(LABEL);
+        s.verbose = true;
+        let head = format!("{}{}{}", words_to(TW), words_to(TW), words_to(12));
+        s.preload(&format!("{head}{TAIL}"), head.chars().count());
+        let row0 = s.caret().0;
+        let top0 = top_rule(&s);
+        let keys = keys_of(insert, s.ms() + 100, 110);
+        let stall_end = keys[k0].0 + stall;
+        let renders = renders_for(&keys, |i| {
+            if i < k0 {
+                2
+            } else if keys[i].0 < stall_end {
+                stall_end - keys[i].0
+            } else {
+                lag
+            }
+        });
+        // the catch-up is the render that lands at stall_end
+        let catch = renders
+            .iter()
+            .position(|&r| r >= stall_end)
+            .expect("the catch-up");
+        let tear_spec = tear.map(|t| {
+            let t = match t {
+                TearAt::Row(_) => TearAt::Row(row0 - 1),
+                p => p,
+            };
+            (catch, t, tear_ms)
+        });
+        let tear_used = tear_spec.map(|(_, t, _)| t);
+        let mut grew_at_catch: Option<u64> = None;
+        let mut max_dark_after: (u64, String) = (0, String::new());
+        let mut obs = |s: &Sim| {
+            let t = s.ms();
+            if t > stall_end + tear_ms + 1500 {
+                // well after the catch-up the hand's row is lit from
+                // where the band last began up to the caret
+                let (cr, cc) = s.caret();
+                let live = s.live(cr);
+                let lo = live.first().copied().unwrap_or(cc);
+                let dark = (lo..cc.saturating_sub(1))
+                    .filter(|c| !live.contains(c))
+                    .count();
+                if dark as u64 > max_dark_after.0 {
+                    max_dark_after = (
+                        dark as u64,
+                        format!("t={t} row {cr} live {live:?} caret {cc}"),
+                    );
+                }
+            }
+            if grew_at_catch.is_none() && top_rule(s) < top0 {
+                grew_at_catch = Some(t);
+            }
+        };
+        s.run(&keys, &renders, tear_spec, &mut obs);
+        let end = s.ms() + 600;
+        s.advance(end, &mut obs);
+        s.cov = Some((s.caret().0, 2));
+        let st = s.glow.v2_status();
+        let judged_after = s
+            .glow
+            .admission_log()
+            .filter(|r| {
+                r.at.duration_since(s.t0).as_millis() as u64 > stall_end + tear_ms + 200
+            })
+            .count();
+        let line = format!(
+            "k0 {k0} stall {stall} lag {lag} tear {tear_used:?}/{tear_ms}: stall_end {stall_end} grew_at {grew_at_catch:?} caret {:?} {} retired {:?} followed {:?} judged_after_catchup {judged_after} max_dark_after {:?} holes {} | {}",
+            s.caret(),
+            s.dark(),
+            st.map(|s| s.retired),
+            st.map(|s| s.followed),
+            max_dark_after,
+            s.holes_seen.len(),
+            declines(&s).join(" ; ")
+        );
+        eprintln!("{line}");
+        let hidden = declines(&s).iter().any(|l| l.contains("hidden-relocation"));
+        (st.is_some_and(|st| st.retired > 20) || hidden || s.dark() != "dark[0]=")
+            .then_some(line)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     assert!(
         fails.is_empty(),
         "F4 reproduced in {} takes:\n{}",

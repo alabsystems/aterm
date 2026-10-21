@@ -18,6 +18,13 @@
 //! asb stats  <log>                                          inspect log offsets, retention, subjects, and bindings
 //! ```
 //!
+//! `stats` opens a log no broker serves and reads it. A log a running broker serves is
+//! locked to it, so `stats` reads that broker's health sidecar, `<log>.health`, instead
+//! — `serve` keeps one (every `--health-ms`, default 2 s, and at once when the log is
+//! poisoned) — and prints it only while the snapshot can be current: `writer=serving`
+//! when the broker that wrote it still holds it, `writer=unknown` where this host keeps
+//! no advisory locks. A snapshot a gone broker left is not printed (exit 1).
+//!
 //! `commit`'s printed `<offset>` is the COMMIT RECORD's own log offset, NOT
 //! `<upto>` and not the group's committed offset: the two live in different
 //! spaces, so never resume a consumer from it — resume with `sub --group G`.
@@ -247,7 +254,7 @@ mod capfile;
 
 const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME | --key-file PATH] [--handshake]
                   [--secret-env NAME | --secret-file PATH] [--revocation-file PATH] [--unix SOCKET] [--allow-remote]
-                  [--durability strict|ordered|relaxed] [--horizon-ms N]
+                  [--durability strict|ordered|relaxed] [--horizon-ms N] [--health-ms N]
        asb pub    <endpoint> <subject> [--id N] [--seq M | --seq-file PATH] <transport> <cap>
        asb sub    <endpoint> <filter> [--from N | --group G] <transport> <cap>
        asb last   <endpoint> <filter> [--after SUBJECT] [--max N] <transport> <cap>
@@ -269,8 +276,16 @@ const USAGE: &str = "usage: asb serve  <endpoint> [log] [--tcp] [--key-env NAME 
                                     because the bytes from there may be acked data) and report what was dropped;
                                     keyless, so a log sealed at rest is refused, never cut (repair it with its key)
   stats:                            print operational log counters (`base`, `head`, `records`, `bytes`, `subjects`,
-                                    `producers`, `wills`, `groups`, `replica`) for `<log>`
+                                    `producers`, `wills`, `groups`, `replica`) for `<log>`; for a log a running
+                                    broker serves, read them from its health sidecar `<log>.health` (which
+                                    `serve` keeps), with the broker's heads, connections, parked tails, served
+                                    tier, flush counts, `writer=` (serving, or unknown where this host cannot
+                                    tell), `pid=`, `at_ms=`, and `poisoned=` last (`no`, or `yes <reason>`);
+                                    exit 1 when no current snapshot exists
+  --health-ms N:                    serve: rewrite the health sidecar `<log>.health` every N ms (default 2000), and
+                                    at once when the log is poisoned
   --revocation-file PATH:           load revoked 64-hex Ed25519 keys or capability principals at `serve` startup
+                                    and on Apple targets reload on `SIGHUP` (fail-closed on malformed edits)
   --key-env NAME / --key-file PATH: 64 hex chars (32-byte PSK) for the XChaCha20-Poly1305-sealed TCP transport
                                     (needs asb built with --features aead); a bare --key HEX on argv is refused
   --cap-file PATH:                  present minted capabilities to a guarded broker, as a proof of possession
@@ -940,6 +955,9 @@ const VALUE_FLAGS: &[&str] = &[
     "--unix",
     "--durability",
     "--horizon-ms",
+    "--health-ms",
+    "--max-retained-records",
+    "--max-retained-bytes",
 ];
 
 /// Flags that take no value.
@@ -1805,6 +1823,12 @@ fn refuse_live_socket(_ep: &str) -> Result<(), u8> {
     Ok(())
 }
 
+/// How often `serve` rewrites its health sidecar, `<log>.health`, unless `--health-ms`
+/// says otherwise: `stats` on a live log reads facts at most this old (the poison is
+/// written at once, whatever the period). A few hundred bytes renamed into place, never
+/// flushed, every two seconds.
+const SERVE_HEALTH_EVERY: Duration = Duration::from_secs(2);
+
 /// `serve`'s tier: `--durability strict|ordered|relaxed` (strict when absent), and
 /// `--horizon-ms N` for ordered alone (the default horizon, one second, when absent).
 /// Strict like every other flag: an unknown tier, a horizon for another tier or a
@@ -1979,7 +2003,13 @@ fn cmd_stats(cli: &Cli) -> Result<(), AsbErr> {
     // first open after the next reboot move the log's generation for a run that
     // acked nothing. (The open's own fsync makes everything durable first, so a
     // Strict record here hides no loss.)
-    let opened = BrokerLog::open_with(&log, Durability::Strict)?;
+    let opened = match BrokerLog::open_with(&log, Durability::Strict) {
+        Ok(opened) => opened,
+        // A LIVE log: the broker serving it holds its lock, so this process cannot
+        // open it. Its health sidecar says what it holds instead.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return live_stats(&log),
+        Err(e) => return Err(AsbErr::Io(e)),
+    };
     let s = opened.stats();
     Ok(say(&format!(
         "base={} head={} records={} bytes={} subjects={} producers={} wills={} groups={} replica={}",
@@ -1993,6 +2023,121 @@ fn cmd_stats(cli: &Cli) -> Result<(), AsbErr> {
         s.group_commits,
         if s.is_replica { "yes" } else { "no" }
     ))?)
+}
+
+// `stats` on a log a running broker serves: the snapshot that broker keeps in
+// `<log>.health` (`asb serve` keeps one), in the offline line's words, then what only a
+// running broker has — its heads, connections, parked tails, flushes, its pid and when
+// it wrote, whether it is the broker serving now — and the poison LAST, so its reason
+// is the rest of the line. Printed only while the snapshot can be current: when its
+// writer still holds it (`writer=serving`), or when this host cannot tell
+// (`writer=unknown`, judged by `pid` and `at_ms`). A snapshot whose writer is gone is
+// a dead broker's last word about a log another process now holds: exit 1, naming it,
+// nothing on stdout.
+fn live_stats(log: &str) -> Result<(), AsbErr> {
+    let read = match astream_broker::read_health(log)? {
+        Some(read) => read,
+        None => {
+            return Err(AsbErr::Exit(fail_exit(
+                1,
+                &format!(
+                    "{log} is served by a running broker that keeps no health sidecar \
+                     ({log}{}); `asb serve` keeps one",
+                    astream_broker::HEALTH_SUFFIX
+                ),
+            )))
+        }
+    };
+    let writer = match read.writer {
+        astream_broker::HealthWriter::Serving => "serving",
+        astream_broker::HealthWriter::Unknown => "unknown",
+        astream_broker::HealthWriter::Gone => {
+            return Err(AsbErr::Exit(fail_exit(
+                1,
+                &format!(
+                    "{log} is served by a running broker, but its health sidecar is the \
+                     last word of pid {}, which no longer serves it: no current snapshot",
+                    read.health.pid
+                ),
+            )))
+        }
+    };
+    let h = read.health;
+    let poisoned = match &h.poisoned {
+        Some(why) => format!("yes {why}"),
+        None => "no".to_string(),
+    };
+    Ok(say(&format!(
+        "base={} head={} records={} bytes={} subjects={} producers={} wills={} groups={} \
+         replica={} visible={} durable={} connections={} parked_tails={} served={} \
+         flush_barrier={} flush_full={} flush_skipped={} flush_failed={} writer={writer} \
+         pid={} at_ms={} poisoned={poisoned}",
+        h.base,
+        h.head,
+        h.retained_records,
+        h.retained_bytes,
+        h.distinct_subjects,
+        h.bound_producers,
+        h.pending_wills,
+        h.group_commits,
+        if h.replica { "yes" } else { "no" },
+        h.visible_head,
+        h.durable_head,
+        h.active_conns,
+        h.parked_tails,
+        tier_word(h.served.served),
+        h.flushes.barrier,
+        h.flushes.full,
+        h.flushes.skipped,
+        h.flushes.failed,
+        h.pid,
+        h.written_at_ms,
+    ))?)
+}
+
+// State-carrying log compaction (`REQUIREMENTS` R4): compact `<log>` to `<min_offset>`,
+// preserving producer bindings, pending wills, producer sequence fences, consumer-group
+// commits, and the latest record of every quiet subject (`Last`) in `<log>.state`.
+fn cmd_compact(cli: &Cli) -> Result<(), AsbErr> {
+    let log = cli.at(1, "log")?;
+    let min_offset = cli.pos_num(2, "min_offset")?;
+    cli.no_more_than(3)?;
+    if cli.has("--tcp") {
+        return Err(AsbErr::Exit(usage_error(
+            "--tcp does not apply to compact (it operates on a local log file)",
+        )));
+    }
+    cli.only("compact", &[])?;
+    if !cfg!(feature = "retention") {
+        return Err(AsbErr::Exit(fail_exit(
+            2,
+            "compact requires asb built with `--features retention`",
+        )));
+    }
+    if !std::path::Path::new(&log).exists() {
+        return Err(AsbErr::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{log}: no such log file"),
+        )));
+    }
+    #[cfg(feature = "retention")]
+    {
+        let mut opened = BrokerLog::open_with(&log, Durability::Strict)?;
+        let dropped = opened.retain_before_carrying_state(astream_wire::Offset(min_offset))?;
+        let s = opened.stats();
+        Ok(say_durable(
+            &format!(
+                "{log}: compacted, dropped {dropped} record(s); base={} head={}",
+                s.base.0, s.head.0
+            ),
+            "the log WAS compacted",
+        )?)
+    }
+    #[cfg(not(feature = "retention"))]
+    {
+        let _ = min_offset;
+        Err(AsbErr::Exit(2))
+    }
 }
 
 // Mint a capability line. Offline: it touches no broker, only the secret.
@@ -2081,8 +2226,29 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
             "--allow-remote",
             "--durability",
             "--horizon-ms",
+            "--health-ms",
+            "--max-retained-records",
+            "--max-retained-bytes",
         ],
     )?;
+    let health_every = match cli.num("--health-ms")? {
+        None => SERVE_HEALTH_EVERY,
+        Some(0) => {
+            return Err(AsbErr::Exit(usage_error(
+                "--health-ms 0: the health sidecar's period is at least 1 ms",
+            )))
+        }
+        Some(ms) => Duration::from_millis(ms),
+    };
+    let max_retained_records = cli.num("--max-retained-records")?;
+    let max_retained_bytes = cli.num("--max-retained-bytes")?;
+    if (max_retained_records.is_some() || max_retained_bytes.is_some())
+        && !cfg!(feature = "retention")
+    {
+        return Err(AsbErr::Exit(usage_error(
+            "serve --max-retained-records/--max-retained-bytes requires asb built with `--features retention`",
+        )));
+    }
     // Every refusal below is decided BEFORE a secret is read or the log is
     // opened, so a usage error consumes no `--*-env` variable and leaves no
     // file behind.
@@ -2140,6 +2306,15 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
     }
     let created_here = !std::path::Path::new(&log).exists();
     let broker = open_log(&log, secret, durability)?;
+    #[cfg(feature = "retention")]
+    {
+        if let Some(max_rec) = max_retained_records {
+            broker.set_max_retained_records(usize::try_from(max_rec).unwrap_or(usize::MAX));
+        }
+        if let Some(max_bytes) = max_retained_bytes {
+            broker.set_max_retained_bytes(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+        }
+    }
     if let Some(rev_path) = cli.kv.get("--revocation-file") {
         if let Err(e) = broker.load_revocation_file(rev_path) {
             discard_created_log(&log, created_here, broker);
@@ -2184,6 +2359,17 @@ fn cmd_serve(cli: &Cli) -> Result<(), AsbErr> {
         }
     };
     let bound = handle.tcp_addr().map_or(ep, str::to_string);
+    // THE HEALTH SIDECAR, `<log>.health`, once every listener is bound (a refused bind
+    // leaves none behind): written now, every period, at the poison, and a last time
+    // at a clean stop — what `asb stats` reads while this broker holds the log. Not
+    // fatal: a log directory that refuses it still serves, and says so.
+    if let Err(e) = broker.keep_health(health_every) {
+        warn(&format!(
+            "asb: {log}{}: cannot write the health sidecar ({e}); `asb stats` cannot read \
+             this broker until it can",
+            astream_broker::HEALTH_SUFFIX
+        ));
+    }
     // The readiness line — callers sync on this, not a sleep — so a caller
     // that cannot read it will hang waiting for it. `say` flushes and reports
     // the write error instead of parking forever behind a dead reader. With
@@ -2512,6 +2698,7 @@ fn run() -> Result<(), AsbErr> {
     match cli.pos.first().map(String::as_str) {
         Some("repair") => cmd_repair(&cli),
         Some("stats") => cmd_stats(&cli),
+        Some("compact") => cmd_compact(&cli),
         Some("mint") => cmd_mint(&cli),
         Some("attenuate") => cmd_attenuate(&cli),
         Some("serve") => cmd_serve(&cli),

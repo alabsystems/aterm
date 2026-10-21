@@ -623,6 +623,71 @@ fn an_answered_box_ends_the_turn_on_the_reply() {
     assert_eq!(said_tail(&tool_row_last), None, "the control");
 }
 
+/// THE AGENT'S OWN SENTENCE THAT OPENS LIKE A TOOL ROW IS ITS WORDS
+/// (`docs/measured/forever-lab-2026-10-20.md` P2): a reply `Wrote the parser
+/// module and its unit tests in this turn.` (or `Edited the config …`) is the
+/// agent's last words, where a reader matching the heads alone left the turn
+/// none. NEGATIVE CONTROL: every `Ran `, `Wrote ` and `Edited ` row the
+/// captures measured — a path, a cut path, its `(+1)` or `— denied` tail,
+/// any command — is still Muse Code's own row, no word of the agent's.
+#[test]
+fn a_sentence_that_opens_like_a_tool_row_is_the_agents_words() {
+    let rows = screen(END_OF_TURN_1_4_10);
+    for said in [
+        "Wrote the parser module and its unit tests in this turn.",
+        "Edited the config so the tests find the stub.",
+    ] {
+        let reply = edited(&rows, "◆ Hi! I am the local lab stub", &format!("◆ {said}"));
+        assert_eq!(phase(&reply), (Phase::Idle, true), "{said}");
+        assert_eq!(said_tail(&reply).as_deref(), Some(said));
+    }
+    let mut measured = 0;
+    for (name, text) in captures() {
+        for row in screen(&text) {
+            let Some(head) = row.strip_prefix("◆ ") else {
+                continue;
+            };
+            if ["Ran ", "Wrote ", "Edited "]
+                .iter()
+                .any(|h| head.starts_with(h))
+            {
+                measured += 1;
+                assert!(tool_row(head), "{name}: {head}");
+                let tool_last = edited(&rows, "◆ Hi! I am the local lab stub", &row);
+                assert_eq!(said_tail(&tool_last), None, "{name}: {head}");
+            }
+        }
+    }
+    assert!(measured >= 20, "the captures' tool rows: {measured}");
+    // The turn's earlier replies are read by the same rows: the agent's
+    // sentence above a tool call is its words, the tool's row is not.
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("◆ Hi!"))
+        .expect("the reply");
+    for (before, words) in [
+        (
+            "◆ Wrote the parser; NEEDS YOU: the signing credential.",
+            Some("Wrote the parser; NEEDS YOU: the signing credential."),
+        ),
+        ("◆ Wrote .agents/probe-write.md (+1)", None),
+    ] {
+        let mut drawn = rows[..at].to_vec();
+        drawn.extend(
+            [
+                before,
+                "",
+                "◆ Ran command · Push the branch · ✓ · 2.3s · ctrl+o",
+                "",
+                "◆ Nothing left: all of it is merged.",
+            ]
+            .map(str::to_string),
+        );
+        drawn.extend(rows[at + 1..].iter().cloned());
+        assert_eq!(turn_said_before(&drawn).as_deref(), words, "{before}");
+    }
+}
+
 /// THE QUESTION (1.4.10) IS A PROMPT OVER AN OPEN COMPOSER, whatever glyph
 /// its head cycles: its question, the model's options — each label less its
 /// description, `Red (Recommended)` the recommended one by the model's own
@@ -2853,4 +2918,133 @@ fn a_resumed_session_reads_idle_under_its_abnormal_end_warning() {
     inside.remove(warned - 1);
     let tail = said_tail(&inside).expect("a reply");
     assert!(tail.ends_with("resumed\ncleanly."), "{tail}");
+}
+
+/// A REPLY TALLER THAN THE SCREEN IS NO WHOLE REPLY ([`said_whole`]): its
+/// `◆` head scrolled above the rows read ([`Turn::Tail`]), its last words
+/// are the rows in sight, and the need its head said is not in them — so a
+/// reader of a landing knows to read the rest (the recheck of d88a7bf289
+/// found only Claude Code's cut read, and a tall report here land on its
+/// last rows). NEGATIVE CONTROL: the same reply with its head on the rows is
+/// whole ([`Turn::Ended`]), the need in its words.
+#[test]
+fn a_reply_whose_head_scrolled_away_is_no_whole_reply() {
+    let rows = screen(END_OF_TURN_1_4_10);
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("◆ Hi!"))
+        .expect("the reply");
+    let mut drawn = rows[..at].to_vec();
+    drawn.push("◆ NEEDS YOU: the signing credential".to_string());
+    drawn.extend((0..40).map(|i| format!("  - merged item {i}")));
+    drawn.push("  Nothing left: all of it is merged.".to_string());
+    drawn.extend(rows[at + 1..].iter().cloned());
+    let cut = drawn[drawn.len() - 2 * rows.len()..].to_vec();
+    let tail = said_tail(&cut).expect("the rows in sight");
+    assert!(
+        tail.ends_with("Nothing left: all of it is merged.") && !tail.contains("NEEDS YOU"),
+        "{tail}"
+    );
+    assert!(!said_whole(&cut) && !MuseReader.said_whole(&cut));
+    // NEGATIVE CONTROL: the head on the rows.
+    assert!(said_whole(&drawn) && MuseReader.said_whole(&drawn));
+    assert!(said_tail(&drawn).is_some_and(|t| t.starts_with("NEEDS YOU: the signing")));
+}
+
+/// A NEED SAID BEFORE A TOOL CALL IS THE TURN'S ([`turn_said_before`]): the
+/// `◆` reply above a tool's row, under the person's `❯` message, is read
+/// with the turn its last reply ends — a `NEEDS YOU:` there stands however
+/// the last reply says nothing is left (the recheck of ea564676a3 found the
+/// turn's earlier words read on Claude Code alone). The tool's own row is
+/// no words of the agent. The turn is whole with its message on the rows
+/// ([`turn_whole`]); with it above them it is not, and the history read
+/// above stops at the message ([`turn_history_stop`]). NEGATIVE CONTROL: the
+/// same turn with no reply before the call holds no other words.
+#[test]
+fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
+    let rows = screen(END_OF_TURN_1_4_10);
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("◆ Hi!"))
+        .expect("the reply");
+    let turn = |before: &[&str]| {
+        let mut drawn = rows[..at].to_vec();
+        drawn.extend(before.iter().map(|r| (*r).to_string()));
+        drawn.extend(
+            [
+                "◆ Ran command · Push the branch · ✓ · 2.3s · ctrl+o",
+                "",
+                "◆ Nothing left: all of it is merged.",
+            ]
+            .map(str::to_string),
+        );
+        drawn.extend(rows[at + 1..].iter().cloned());
+        drawn
+    };
+    let drawn = turn(&[
+        "◆ NEEDS YOU: the signing credential, to sign the release.",
+        "  I will push the branch now.",
+        "",
+    ]);
+    let need =
+        "NEEDS YOU: the signing credential, to sign the release.\nI will push the branch now.";
+    assert_eq!(turn_said_before(&drawn).as_deref(), Some(need));
+    assert_eq!(MuseReader.turn_said_before(&drawn).as_deref(), Some(need));
+    assert_eq!(
+        said_tail(&drawn).as_deref(),
+        Some("Nothing left: all of it is merged.")
+    );
+    assert!(turn_whole(&drawn) && MuseReader.turn_whole(&drawn));
+    // The message above the rows: the turn is cut, and the read above stops
+    // at it.
+    let user = drawn
+        .iter()
+        .position(|r| r.starts_with("❯ carry on"))
+        .expect("the message");
+    let cut = drawn[user + 1..].to_vec();
+    assert!(said_whole(&cut) && !turn_whole(&cut) && !MuseReader.turn_whole(&cut));
+    assert!(turn_history_stop(&drawn[user]) && MuseReader.turn_history_stop(&drawn[user]));
+    for row in &drawn[user + 1..at + 3] {
+        assert!(!turn_history_stop(row), "{row}");
+    }
+    // NEGATIVE CONTROL: no reply before the call.
+    let plain = turn(&[]);
+    assert_eq!(turn_said_before(&plain), None);
+    assert!(turn_whole(&plain) && said_tail(&plain).is_some());
+}
+
+/// THE MESSAGE THAT OPENED THE TURN IS READ OFF ITS `❯` ROW
+/// ([`turn_opened_by`]): the row's text past its `❯`, and the rows it
+/// wrapped onto (indented, up to a blank row), joined — what tells a
+/// successor whether its land act opened the turn whose defense stands (the
+/// review of b8/residuals found a defense said under a person's earlier
+/// message landed on Muse Code, nothing reading the message). NEGATIVE
+/// CONTROLS: the message above the rows, and the composer's own `❯`, read
+/// none.
+#[test]
+fn the_message_that_opened_the_turn_is_read_off_its_row() {
+    let rows = screen(END_OF_TURN_1_4_10);
+    assert_eq!(
+        turn_opened_by(&rows).as_deref(),
+        Some("carry on with the task")
+    );
+    assert_eq!(
+        MuseReader.turn_opened_by(&rows).as_deref(),
+        Some("carry on with the task")
+    );
+    let user = rows
+        .iter()
+        .position(|r| r.starts_with("❯ carry on"))
+        .expect("the message");
+    let mut wrapped = rows.clone();
+    wrapped.insert(user + 1, "  and push it".to_string());
+    assert!(said_tail(&wrapped).is_some());
+    assert_eq!(
+        turn_opened_by(&wrapped).as_deref(),
+        Some("carry on with the task and push it")
+    );
+    // NEGATIVE CONTROLS.
+    let cut = rows[user + 1..].to_vec();
+    assert!(said_tail(&cut).is_some(), "{cut:#?}");
+    assert_eq!(turn_opened_by(&cut), None);
 }

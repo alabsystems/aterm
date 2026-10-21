@@ -113,7 +113,7 @@ fn a_leaky_capture_fails_at_each_record_and_its_scrubbed_twin_passes() {
 
 #[test]
 fn the_rule_reads_the_checkouts_rows_and_judges_every_capture_it_holds() {
-    use crate::scan_set::test_fixtures::synth_tree;
+    use crate::scan_set::test_fixtures::disk_tree;
     let files = [
         (EXTRA.to_string(), format!("# synthetic\n{WORD}\n")),
         ("crates/x/src/lib.rs".to_string(), "// x\n".to_string()),
@@ -127,7 +127,7 @@ fn the_rule_reads_the_checkouts_rows_and_judges_every_capture_it_holds() {
             format!("# comment {WORD}\n\\e[1mzeb\\e[0mrafish\\r\\n\nok\n"),
         ),
     ];
-    let root = synth_tree("aterm-census-guards", "capture-privacy", &files);
+    let root = disk_tree("aterm-census-guards", "capture-privacy", &files);
     let corpus = Corpus::read(&root).expect("the synth tree reads");
     let tree = Tree {
         root: &root,
@@ -217,7 +217,7 @@ fn the_exports_rows_compile_and_every_capture_row_does() {
 /// held to the capture rows, and the census notes what it judged without.
 #[test]
 fn without_the_exports_rows_the_capture_rows_still_hold() {
-    use crate::scan_set::test_fixtures::synth_tree;
+    use crate::scan_set::test_fixtures::disk_tree;
     let files = [
         ("crates/x/src/lib.rs".to_string(), "// x\n".to_string()),
         ("crates/x/tests/fixtures/leaky.ptylog".to_string(), leaky()),
@@ -226,7 +226,7 @@ fn without_the_exports_rows_the_capture_rows_still_hold() {
             scrubbed(),
         ),
     ];
-    let root = synth_tree("aterm-census-guards", "capture-privacy-public", &files);
+    let root = disk_tree("aterm-census-guards", "capture-privacy-public", &files);
     let corpus = Corpus::read(&root).expect("the synth tree reads");
     let tree = Tree {
         root: &root,
@@ -301,7 +301,7 @@ fn the_edited_view_reads_a_word_fixed_while_it_was_typed() {
 /// rows: a capture carrying only a baseline word fails at its record.
 #[test]
 fn the_engines_baseline_rows_are_held_when_the_host_has_them() {
-    use crate::scan_set::test_fixtures::synth_tree;
+    use crate::scan_set::test_fixtures::disk_tree;
     let files = [
         (EXTRA.to_string(), format!("# synthetic\n{WORD}\n")),
         ("crates/x/src/lib.rs".to_string(), "// x\n".to_string()),
@@ -310,7 +310,7 @@ fn the_engines_baseline_rows_are_held_when_the_host_has_them() {
             ptylog_text(&[("O", b"plain "), ("O", b"\x1b[1mquok\x1b[0mkaword\r\n")]),
         ),
     ];
-    let root = synth_tree("aterm-census-guards", "capture-privacy-baseline", &files);
+    let root = disk_tree("aterm-census-guards", "capture-privacy-baseline", &files);
     let corpus = Corpus::read(&root).expect("the synth tree reads");
     let tree = Tree {
         root: &root,

@@ -14,6 +14,11 @@ description = "First-party PNG decode/encode for aterm (replaces `png` and the f
 # Inflate comes from aterm-codec (already shipped); the compressor is
 # `src/deflate.rs`.
 aterm-codec = { workspace = true }
+# Every chunk's CRC-32 is astream-wire's `hash::crc32_ieee_update`
+# (compile-time slicing-by-8, bounds proved there): the CRC astream frames
+# records with and aterm-codec wraps for gzip, so aterm carries one. No
+# dependencies or platform code of its own; aterm-codec already brings it.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 
 [lints]
 workspace = true

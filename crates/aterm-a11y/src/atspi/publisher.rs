@@ -30,17 +30,26 @@
 //! dead tree's node never shadows the live one at the same path.
 //!
 //! One thread does everything, in order. While it waits on at-spi2-core's
-//! `org.a11y.Bus` (at most [`proxies::CALL`]), the AT's calls wait too;
-//! accesskit_unix answered them on another task meanwhile. A write to a bus
-//! has no deadline, so a dbus-daemon that stops reading stalls the thread,
-//! and the windows' channel grows, until it reads again or closes. A working
-//! at-spi2-core does neither.
+//! `org.a11y.Bus` (a call, at most [`proxies::CALL`] with its write), or on
+//! the accessibility bus's handshake (at most [`WRITE`]; aterm-dbus's
+//! `HANDSHAKE_TIMEOUT` for the session bus's), the AT's calls wait too;
+//! accesskit_unix answered them on another task meanwhile. Any other write to
+//! either bus (a reply, an error, a signal) waits at most [`WRITE`] for its
+//! daemon to read ([`Buses::write_timeout`]): a dbus-daemon that stops reading
+//! (frozen, wedged) would otherwise stall the thread, and grow the windows'
+//! channel, for as long as it stayed stopped.
+//! An accessibility bus that takes no write in that time is left as a lost one
+//! is; a join that fails is tried again, after one second and then twice as
+//! long each time up to a minute ([`REJOIN_FIRST`], [`REJOIN_MAX`]), as well as
+//! whenever at-spi2-core's status changes, so a bus that resumes is rejoined
+//! although nothing on the session bus says so.
 
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use aterm_dbus::{Connection, Error as BusError, Kind, Message, address};
 
@@ -51,6 +60,19 @@ use super::semantics::{
 use super::serve::{self, Objects};
 use super::{events, proxies};
 use crate::model::{ActionHandler, ActivationHandler, DeactivationHandler};
+
+/// How long a write to a bus may wait for its daemon to read it. A
+/// dbus-daemon reads each client as its messages come, so a write waits at
+/// all only once the socket's buffer holds what the daemon left unread; one
+/// that waits this long is a daemon that stopped.
+pub const WRITE: Duration = Duration::from_secs(5);
+
+/// The first wait before the publisher tries again to join an accessibility
+/// bus it could not join; each failure doubles it, up to [`REJOIN_MAX`].
+pub(crate) const REJOIN_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait between two attempts to join.
+pub(crate) const REJOIN_MAX: Duration = Duration::from_secs(60);
 
 /// What the windows send the publisher thread.
 pub(crate) enum Msg {
@@ -151,6 +173,13 @@ pub trait Buses: Send + 'static {
     fn address_override(&self) -> Option<String> {
         None
     }
+
+    /// How long a write to either bus may wait for its daemon to read
+    /// ([`WRITE`]). `None` waits for as long as the daemon does: a test's
+    /// negative control, never the desktop's.
+    fn write_timeout(&self) -> Option<Duration> {
+        Some(WRITE)
+    }
 }
 
 /// The desktop's buses: the session bus from `DBUS_SESSION_BUS_ADDRESS`, and
@@ -164,8 +193,11 @@ impl Buses for SessionBuses {
         Connection::session()
     }
 
+    /// The handshake within [`WRITE`]: a frozen daemon's listener still
+    /// takes the connection into its backlog, and would otherwise hold each
+    /// attempt to join for aterm-dbus's `HANDSHAKE_TIMEOUT`.
     fn open(&mut self, list: &str) -> aterm_dbus::Result<Connection> {
-        Connection::open(&address::parse(list)?)
+        Connection::open_within(&address::parse(list)?, WRITE)
     }
 
     fn address_override(&self) -> Option<String> {
@@ -317,6 +349,9 @@ struct Worker {
     /// Attachments so far; the current one's number while attached.
     epochs: u64,
     adapters: Vec<Entry>,
+    /// The next attempt to join, while assistive technologies want the tree
+    /// and the last attempt failed.
+    rejoin: Option<Rejoin>,
 }
 
 /// Whether a bus error means the connection is gone.
@@ -324,9 +359,34 @@ fn lost(e: &BusError) -> bool {
     matches!(e, BusError::Closed | BusError::Io(_))
 }
 
+/// Whether a failed write to the accessibility bus means leaving it: it is
+/// gone, or its daemon took nothing within [`Buses::write_timeout`].
+fn left(e: &BusError) -> bool {
+    lost(e) || matches!(e, BusError::Timeout)
+}
+
+/// When to try joining the accessibility bus again, and the wait that set it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Rejoin {
+    pub(super) at: Instant,
+    pub(super) after: Duration,
+}
+
+impl Rejoin {
+    /// The attempt after `last`'s: [`REJOIN_FIRST`] from now, or twice
+    /// `last`'s wait, at most [`REJOIN_MAX`].
+    pub(super) fn next(last: Option<Rejoin>, now: Instant) -> Option<Rejoin> {
+        let after = last.map_or(REJOIN_FIRST, |r| r.after.saturating_mul(2).min(REJOIN_MAX));
+        now.checked_add(after).map(|at| Rejoin { at, after })
+    }
+}
+
 fn run(mut buses: Box<dyn Buses>, link: Link, rx: Receiver<Msg>, wake: UnixStream) {
     let session = match buses.session() {
-        Ok(session) => session,
+        Ok(mut session) => {
+            session.set_send_timeout(buses.write_timeout());
+            session
+        }
         Err(e) => {
             aterm_log::warn!(
                 "accessibility: no session bus ({e}); screen readers cannot reach this process"
@@ -345,6 +405,7 @@ fn run(mut buses: Box<dyn Buses>, link: Link, rx: Receiver<Msg>, wake: UnixStrea
         bus: None,
         epochs: 0,
         adapters: Vec::new(),
+        rejoin: None,
     };
     for rule in [proxies::STATUS_RULE, proxies::OWNER_RULE] {
         if let Err(e) = worker.session.add_match(rule, proxies::CALL) {
@@ -368,7 +429,15 @@ impl Worker {
                 || self.bus.as_ref().is_some_and(|b| b.conn.has_buffered());
             let mut fds = vec![self.wake.as_raw_fd(), self.session.as_raw_fd()];
             fds.extend(self.bus.as_ref().map(|b| b.conn.as_raw_fd()));
-            let ready = match wait(&fds, !buffered) {
+            // Nothing buffered: wait for a socket, or for the next attempt
+            // to join when one is due.
+            let timeout = if buffered {
+                Some(Duration::ZERO)
+            } else {
+                self.rejoin
+                    .map(|r| r.at.saturating_duration_since(Instant::now()))
+            };
+            let ready = match wait(&fds, timeout) {
                 Ok(ready) => ready,
                 Err(e) => {
                     aterm_log::warn!("accessibility: poll failed ({e}); publishing stops");
@@ -389,6 +458,10 @@ impl Worker {
             {
                 self.pump_bus();
             }
+            if self.rejoin.is_some_and(|r| r.at <= Instant::now()) && self.refresh_status().is_err()
+            {
+                return;
+            }
         }
     }
 
@@ -405,6 +478,16 @@ impl Worker {
                 self.detach("the session bus closed");
                 return Err(());
             }
+            // An unanswered status says nothing of it. While the publisher
+            // waits to rejoin, the wait goes on, longer: clearing it would
+            // stop the attempts until at-spi2-core's next status signal.
+            Err(e) if self.rejoin.is_some() => {
+                aterm_log::debug!(
+                    "accessibility: org.a11y.Status.IsEnabled: {e}; trying again later"
+                );
+                self.rejoin = Rejoin::next(self.rejoin, Instant::now());
+                return Ok(());
+            }
             Err(e) => {
                 aterm_log::debug!("accessibility: org.a11y.Status.IsEnabled: {e}");
                 false
@@ -414,6 +497,9 @@ impl Worker {
             (true, false) => self.attach(),
             (false, true) => self.detach("assistive technologies were turned off"),
             _ => {}
+        }
+        if !enabled || self.bus.is_some() {
+            self.rejoin = None;
         }
         Ok(())
     }
@@ -425,18 +511,39 @@ impl Worker {
             Some(address) => Ok(address),
             None => proxies::bus_address(&mut self.session),
         };
+        let write_timeout = self.buses.write_timeout();
         let joined = address.and_then(|a| {
             let mut conn = self.buses.open(&a)?;
+            conn.set_send_timeout(write_timeout);
             proxies::embed(&mut conn)?;
             Ok(conn)
         });
         let conn = match joined {
             Ok(conn) => conn,
             Err(e) => {
-                aterm_log::warn!(
-                    "accessibility: cannot join the AT-SPI bus ({e}); trying again when \
-                     at-spi2-core's status changes"
+                let rejoin = Rejoin::next(self.rejoin, Instant::now());
+                let again = rejoin.map_or_else(
+                    || "when at-spi2-core's status changes".to_string(),
+                    |r| {
+                        format!(
+                            "in {} s and when at-spi2-core's status changes",
+                            r.after.as_secs()
+                        )
+                    },
                 );
+                // The first failure is a warning; the ones after it, which
+                // the backoff spaces out, are its detail.
+                if self.rejoin.is_none() {
+                    aterm_log::warn!(
+                        "accessibility: cannot join the AT-SPI bus ({e}); trying again {again}"
+                    );
+                } else {
+                    aterm_log::debug!(
+                        "accessibility: still cannot join the AT-SPI bus ({e}); trying again \
+                         {again}"
+                    );
+                }
+                self.rejoin = rejoin;
                 return;
             }
         };
@@ -469,16 +576,26 @@ impl Worker {
         }
     }
 
-    /// The accessibility bus failed: say so, drop the trees, and see whether
-    /// at-spi2-core has a bus to rejoin.
+    /// The accessibility bus failed, or took no write in time: say so, drop
+    /// the trees, and see whether at-spi2-core has a bus to rejoin.
     fn bus_lost(&mut self, e: &BusError) {
-        aterm_log::warn!(
-            "accessibility: the AT-SPI bus failed ({e}); screen readers lose this process \
-             until it rejoins"
-        );
-        self.detach("the AT-SPI bus failed");
+        let why = if matches!(e, BusError::Timeout) {
+            let waited = self.buses.write_timeout().unwrap_or(WRITE).as_secs_f64();
+            aterm_log::warn!(
+                "accessibility: the AT-SPI bus stopped reading (a write waited {waited} s); \
+                 screen readers lose this process until it rejoins"
+            );
+            "the AT-SPI bus stopped reading"
+        } else {
+            aterm_log::warn!(
+                "accessibility: the AT-SPI bus failed ({e}); screen readers lose this process \
+                 until it rejoins"
+            );
+            "the AT-SPI bus failed"
+        };
+        self.detach(why);
         // One attempt now (a restarted launcher answers at once); otherwise
-        // the next status signal brings it back.
+        // the next status signal, or the backoff, brings it back.
         let _ = self.refresh_status();
     }
 
@@ -540,7 +657,7 @@ impl Worker {
             && let Some(bus) = &mut self.bus
             && let Err(e) = bus.conn.send(signal)
         {
-            if lost(&e) {
+            if left(&e) {
                 self.bus_lost(&e);
             } else {
                 aterm_log::debug!("accessibility: an event was not sent: {e}");
@@ -597,7 +714,7 @@ impl Worker {
             };
             match result {
                 Ok(()) => {}
-                Err(e) if lost(&e) => {
+                Err(e) if left(&e) => {
                     self.bus_lost(&e);
                     return;
                 }
@@ -618,14 +735,14 @@ fn answer(conn: &mut Connection, call: &Message, served: serve::Served) -> aterm
     }
 }
 
-/// Waits until one of `fds` is readable or hung up (`block`), or only looks
-/// (`!block`); says which are.
+/// Waits until one of `fds` is readable or hung up, or `timeout` has passed
+/// (`None` waits for a descriptor; zero only looks); says which are.
 #[cfg_attr(trust_verify, trust::skip)]
 #[expect(
     unsafe_code,
     reason = "the crate's one FFI call: poll(2) over an array it owns"
 )]
-fn wait(fds: &[RawFd], block: bool) -> io::Result<Vec<bool>> {
+fn wait(fds: &[RawFd], timeout: Option<Duration>) -> io::Result<Vec<bool>> {
     let mut polls: Vec<libc::pollfd> = fds
         .iter()
         .map(|&fd| libc::pollfd {
@@ -635,10 +752,16 @@ fn wait(fds: &[RawFd], block: bool) -> io::Result<Vec<bool>> {
         })
         .collect();
     let count = libc::nfds_t::try_from(polls.len()).unwrap_or(libc::nfds_t::MAX);
+    // Whole milliseconds, rounded up so a wait never ends before it is due;
+    // a wait past `c_int`'s milliseconds is the longest poll takes.
+    let millis = timeout.map_or(-1, |t| {
+        let ms = t.as_micros().div_ceil(1000);
+        libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
+    });
     loop {
         // SAFETY: `polls` is an initialised array of `count` pollfd records,
         // alive and exclusively borrowed for the call.
-        let n = unsafe { libc::poll(polls.as_mut_ptr(), count, if block { -1 } else { 0 }) };
+        let n = unsafe { libc::poll(polls.as_mut_ptr(), count, millis) };
         if n >= 0 {
             return Ok(polls.iter().map(|p| p.revents != 0).collect());
         }

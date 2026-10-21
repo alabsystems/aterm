@@ -15,8 +15,8 @@
 //! * `runs/<tag>/clock/libaterm_lab_clock.dylib`: the library, which `up`
 //!   builds from this checkout (`targo --unverified build -p aterm-lab-clock
 //!   --lib`, by the `targo` that built this program, into
-//!   `target/lab-clock/`) and copies here, where no jailed process can
-//!   replace it while a launch reads it;
+//!   `target/lab-clock.noindex/`, which Spotlight skips) and copies here,
+//!   where no jailed process can replace it while a launch reads it;
 //! * `runs/<tag>/clock/offset`: the offset, whole seconds, `0` at `up`;
 //!   `sleep` steps it by a rename;
 //! * `runs/<tag>/clock/claude`: when the Claude Code under test has a
@@ -164,7 +164,7 @@ fn build_library(repo: &Path) -> Result<PathBuf, String> {
         ])
         .arg(repo.join("Cargo.toml"))
         .arg("--target-dir")
-        .arg(repo.join("target/lab-clock"))
+        .arg(repo.join("target/lab-clock.noindex"))
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_BUILD_DIR")

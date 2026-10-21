@@ -326,17 +326,43 @@ pub fn with_buggy(m: &Model, b: i64) -> Model {
 // bodies); spec-model machinery.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn bmc(m: &Model) -> Result<usize, (State, &'static str)> {
+    bmc_fired(m).0
+}
+
+/// A bmc verdict, beside the actions that fired in the space walked to reach it.
+pub type BmcFired = (Result<usize, (State, &'static str)>, BTreeSet<&'static str>);
+
+/// [`bmc`], and the actions that fired (had a successor) from the states it checked: from every
+/// reachable state when it returns `Ok`, so exactly [`fired_actions`]' answer then, and from
+/// the states checked before the first violation when it returns `Err`. A caller that needs
+/// both answers of one model walks it once.
+///
+/// # Panics
+///
+/// As [`bmc`].
+// Skip: the `bmc` driver class.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn bmc_fired(m: &Model) -> BmcFired {
     debug_assert!(
         names_are_unique(m),
         "{}: duplicate action/invariant name",
         m.name
     );
-    walk!(bmc_on(m))
+    let (verdict, fired) = walk!(bmc_on(m));
+    let fired = m
+        .actions
+        .iter()
+        .zip(fired)
+        .filter_map(|(a, f)| f.then_some(a.name))
+        .collect();
+    (verdict, fired)
 }
 
 // Skip: same BFS driver class as `bmc`, whose body this is.
 #[cfg_attr(trust_verify, trust::skip)]
-fn bmc_on<W: Walker>(m: &Model, w: &W) -> Result<usize, (State, &'static str)> {
+fn bmc_on<W: Walker>(m: &Model, w: &W) -> (Result<usize, (State, &'static str)>, Vec<bool>) {
+    // Per action: a successor from some state checked so far.
+    let mut fired = vec![false; m.actions.len()];
     let mut seen = Seen::default();
     let mut q: VecDeque<W::S> = VecDeque::new();
     let init = w.init();
@@ -355,18 +381,19 @@ fn bmc_on<W: Walker>(m: &Model, w: &W) -> Result<usize, (State, &'static str)> {
         let env = w.env(&st);
         for (i, inv) in m.invariants.iter().enumerate() {
             if !w.holds(&env, &st, i) {
-                return Err((w.state(&st), inv.name));
+                return (Err((w.state(&st), inv.name)), fired);
             }
         }
-        for a in 0..m.actions.len() {
+        for (a, fired) in fired.iter_mut().enumerate() {
             for ns in w.successors(&env, &st, a) {
+                *fired = true;
                 if w.first_sight(&mut seen, &ns) {
                     q.push_back(ns);
                 }
             }
         }
     }
-    Ok(n)
+    (Ok(n), fired)
 }
 
 /// The prove-and-catch protocol (the `Buggy` convention), interpreter tier: the invariants hold
@@ -568,41 +595,62 @@ fn fired_actions_on<W: Walker>(m: &Model, w: &W) -> BTreeSet<&'static str> {
     fired
 }
 
-/// Whether `action` is a VIOLATION STEP of `m`: it fires from some reachable
-/// state where every law holds, and every such firing lands in a state that
-/// breaks one; `None` when it never fires from a lawful state. Such an action
-/// is the defect itself (its own step, or the world's answer to one), so its
-/// being dead where no mutant is on is what the laws state rather than
+/// Whether each of `actions` is a VIOLATION STEP of `m`: it fires from some
+/// reachable state where every law holds, and every such firing lands in a
+/// state that breaks one (`Some(true)`); `Some(false)` when one such firing
+/// lands lawful, `None` when it never fires from a lawful state. Such an
+/// action is the defect itself (its own step, or the world's answer to one),
+/// so its being dead where no mutant is on is what the laws state rather than
 /// vacuity. A firing from a state some law already refused says nothing about
 /// the action, so it is not looked at; exploration does not stop at a
 /// violating state, like [`fired_actions`].
 ///
+/// One walk answers every action, in `actions`' order: the space explored is
+/// the same whichever action is watched, so asking one at a time would repeat
+/// the walk per action. It ends early once every action has a lawful landing,
+/// the only answer more of the space cannot change.
+///
 /// # Panics
 ///
-/// If `m` declares no action named `action`, or its reachable space exceeds
-/// [`MAX_STATES`], exactly like [`bmc`].
+/// If `m` declares no action named one of `actions`, or its reachable space
+/// exceeds [`MAX_STATES`], exactly like [`bmc`].
 #[must_use]
 // Skip: same BFS driver class as `fired_actions`.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn violation_step(m: &Model, action: &str) -> Option<bool> {
-    let a = m
-        .actions
+pub fn violation_steps(m: &Model, actions: &[&str]) -> Vec<Option<bool>> {
+    let watched: Vec<usize> = actions
         .iter()
-        .position(|act| act.name == action)
-        .unwrap_or_else(|| panic!("{} declares no action `{action}`", m.name));
-    walk!(violation_step_on(m, a))
+        .map(|action| {
+            m.actions
+                .iter()
+                .position(|act| act.name == *action)
+                .unwrap_or_else(|| panic!("{} declares no action `{action}`", m.name))
+        })
+        .collect();
+    walk!(violation_steps_on(m, &watched))
 }
 
-// Skip: same BFS driver class as `bmc`; the body of `violation_step`.
+// Skip: same BFS driver class as `bmc`; the body of `violation_steps`.
 #[cfg_attr(trust_verify, trust::skip)]
-fn violation_step_on<W: Walker>(m: &Model, w: &W, action: usize) -> Option<bool> {
+fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Option<bool>> {
     let lawful = |env: &W::Env, s: &W::S| (0..m.invariants.len()).all(|i| w.holds(env, s, i));
+    // Per watched action: fired from a lawful state; one such firing landed lawful.
+    let mut fired = vec![false; watched.len()];
+    let mut landed_lawful = vec![false; watched.len()];
+    let verdicts = |fired: &[bool], landed_lawful: &[bool]| -> Vec<Option<bool>> {
+        fired
+            .iter()
+            .zip(landed_lawful)
+            .map(|(&f, &l)| if l { Some(false) } else { f.then_some(true) })
+            .collect()
+    };
+    let mut open = watched.len();
     let mut seen = Seen::default();
     let mut q: VecDeque<W::S> = VecDeque::new();
     let init = w.init();
     w.first_sight(&mut seen, &init);
     q.push_back(init);
-    let (mut n, mut fired) = (0usize, false);
+    let mut n = 0usize;
     while let Some(st) = q.pop_front() {
         n += 1;
         assert!(
@@ -613,11 +661,22 @@ fn violation_step_on<W: Walker>(m: &Model, w: &W, action: usize) -> Option<bool>
         let env = w.env(&st);
         let from_lawful = lawful(&env, &st);
         for a in 0..m.actions.len() {
+            let watching = from_lawful && watched.contains(&a);
             for ns in w.successors(&env, &st, a) {
-                if a == action && from_lawful {
-                    fired = true;
-                    if lawful(&w.env(&ns), &ns) {
-                        return Some(false);
+                if watching {
+                    // Judged once per successor, and only while it can still decide something.
+                    let mut lands_lawful = None;
+                    for (k, _) in watched.iter().enumerate().filter(|&(_, &x)| x == a) {
+                        fired[k] = true;
+                        if !landed_lawful[k]
+                            && *lands_lawful.get_or_insert_with(|| lawful(&w.env(&ns), &ns))
+                        {
+                            landed_lawful[k] = true;
+                            open -= 1;
+                        }
+                    }
+                    if open == 0 {
+                        return verdicts(&fired, &landed_lawful);
                     }
                 }
                 if w.first_sight(&mut seen, &ns) {
@@ -626,7 +685,7 @@ fn violation_step_on<W: Walker>(m: &Model, w: &W, action: usize) -> Option<bool>
             }
         }
     }
-    fired.then_some(true)
+    verdicts(&fired, &landed_lawful)
 }
 
 /// Every state reachable in `m`'s bounded space, each once, in BFS order: the
@@ -820,9 +879,9 @@ impl std::fmt::Display for NonProgressCycle {
 }
 
 /// The whole reachable state graph, stutter steps dropped, numbered in BFS order
-/// (so a lower index is never farther from `Init`).
+/// (so a lower index is never farther from `Init`). It holds no state: the walk
+/// that built it keeps each one in its own form, by the same index ([`Walked`]).
 struct StateGraph {
-    states: Vec<State>,
     /// Per state, `(action index, successor index)` for every step that changes
     /// the state — the steps fairness can demand.
     steps: Vec<Vec<(usize, usize)>>,
@@ -952,86 +1011,12 @@ impl StateGraph {
         }
         walk.extend(rev.into_iter().rev());
     }
-
-    /// The lasso a fair run can follow in `component`: a stem to its first state, then a loop
-    /// that takes one step of every fair action with a step inside it and, for a weakly fair
-    /// action with none, visits a state where it is disabled — each what that action's
-    /// fairness demands of a run confined here, so the loop is a fair run by construction.
-    // Skip: witness assembly over the caller's graph (absent std bodies).
-    #[cfg_attr(trust_verify, trust::skip)]
-    fn witness(
-        &self,
-        m: &Model,
-        component: &[usize],
-        member: &BTreeSet<usize>,
-        inside: &BTreeSet<usize>,
-        weak: &[usize],
-        strong: &[usize],
-    ) -> NonProgressCycle {
-        let entry = component[0];
-        let mut stem: Vec<(&'static str, State)> = Vec::new();
-        let mut at = entry;
-        while let Some((a, prev)) = self.parent[at] {
-            stem.push((m.actions[a].name, self.states[at].clone()));
-            at = prev;
-        }
-        stem.push(("Init", self.states[at].clone()));
-        stem.reverse();
-
-        let mut fair: Vec<usize> = weak.iter().chain(strong).copied().collect();
-        fair.sort_unstable();
-        let mut cycle: Vec<(usize, usize)> = Vec::new();
-        let mut cur = entry;
-        // One step of every fair action that has a step inside the component…
-        for &a in &fair {
-            if !inside.contains(&a) {
-                continue;
-            }
-            let step = component.iter().find_map(|&s| {
-                self.steps[s]
-                    .iter()
-                    .find(|&&(b, t)| b == a && member.contains(&t))
-                    .map(|&(_, t)| (s, t))
-            });
-            if let Some((s, t)) = step {
-                self.walk_inside(m, member, cur, s, &mut cycle);
-                cycle.push((a, t));
-                cur = t;
-            }
-        }
-        self.walk_inside(m, member, cur, entry, &mut cycle);
-        // …and, for a weakly fair action with none, a visit to a state where it
-        // is off, unless the loop already passes one: a detour from the entry
-        // and back, so the loop stays closed.
-        for &a in &fair {
-            if inside.contains(&a) || !weak.contains(&a) {
-                continue;
-            }
-            let passes_off =
-                !self.enabled(entry, a) || cycle.iter().any(|&(_, s)| !self.enabled(s, a));
-            if passes_off {
-                continue;
-            }
-            if let Some(&s) = component.iter().find(|&&s| !self.enabled(s, a)) {
-                self.walk_inside(m, member, entry, s, &mut cycle);
-                self.walk_inside(m, member, s, entry, &mut cycle);
-            }
-        }
-        NonProgressCycle {
-            stem,
-            cycle: cycle
-                .into_iter()
-                .map(|(a, s)| (m.actions[a].name, self.states[s].clone()))
-                .collect(),
-            moves: inside.iter().map(|&a| m.actions[a].name).collect(),
-            component: component.len(),
-        }
-    }
 }
 
 /// Walk `m`'s whole reachable graph (stutter steps dropped, numbered in BFS
-/// order) over a [`Walker`]. The graph keeps each state as the public
-/// [`State`]; the walk's own form of each is returned beside it, by index.
+/// order) over a [`Walker`]. The walk's own form of each state is returned
+/// beside it, by index: a public [`State`] (a map) is built only for a state a
+/// caller asks to see.
 // Skip: keyed BFS over caller-built models (the `bmc` driver class) plus the deliberate
 // bounds-regression assert.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1040,7 +1025,6 @@ fn explore_on<W: Walker>(m: &Model, w: &W) -> (StateGraph, Vec<W::S>) {
     let mut ids = Seen::default();
     ids.add(w.key(&init));
     let mut graph = StateGraph {
-        states: vec![w.state(&init)],
         steps: vec![Vec::new()],
         parent: vec![None],
         fired: BTreeSet::new(),
@@ -1070,7 +1054,6 @@ fn explore_on<W: Walker>(m: &Model, w: &W) -> (StateGraph, Vec<W::S>) {
                         );
                         let numbered = ids.add(w.key(&ns));
                         debug_assert_eq!(numbered, id, "the graph numbers states as first seen");
-                        graph.states.push(w.state(&ns));
                         graph.steps.push(Vec::new());
                         graph.parent.push(Some((a, next)));
                         walked.push(ns);
@@ -1155,10 +1138,35 @@ pub fn find_nonprogress_cycle(
 pub struct Space {
     model: Model,
     graph: StateGraph,
-    /// The model resolved once, and each graph state in its form (by index),
-    /// when the model has one: a liveness goal is then evaluated without
-    /// building an environment map per state.
-    compiled: Option<(Compiled, Vec<Vec<i64>>)>,
+    walked: Walked,
+}
+
+/// Each graph state of a [`Space`], by index, in the form its walk held it.
+enum Walked {
+    /// The model resolved once and each state as its value slice: a liveness
+    /// goal is evaluated without building an environment map per state, and a
+    /// map is built only for a state a caller asks to see.
+    Compiled(Compiled, Vec<Vec<i64>>),
+    /// A model with no compiled form: each state as written.
+    ByName(Vec<State>),
+}
+
+impl Walked {
+    /// Graph state `i` as the public [`State`].
+    fn state(&self, i: usize) -> State {
+        match self {
+            Walked::Compiled(c, walked) => c.state(&walked[i]),
+            Walked::ByName(states) => states[i].clone(),
+        }
+    }
+
+    /// `f` of graph state `i`, borrowed where the walk holds it as a [`State`].
+    fn with_state<R>(&self, i: usize, f: impl FnOnce(&State) -> R) -> R {
+        match self {
+            Walked::Compiled(c, walked) => f(&c.state(&walked[i])),
+            Walked::ByName(states) => f(&states[i]),
+        }
+    }
 }
 
 impl Space {
@@ -1176,17 +1184,20 @@ impl Space {
             "{}: duplicate action/invariant name",
             m.name
         );
-        let (graph, compiled) = match Compiled::new(m) {
+        let (graph, walked) = match Compiled::new(m) {
             Some(c) => {
                 let (graph, walked) = explore_on(m, &c);
-                (graph, Some((c, walked)))
+                (graph, Walked::Compiled(c, walked))
             }
-            None => (explore_on(m, &ByName(m)).0, None),
+            None => {
+                let (graph, walked) = explore_on(m, &ByName(m));
+                (graph, Walked::ByName(walked))
+            }
         };
         Self {
             graph,
             model: m.clone(),
-            compiled,
+            walked,
         }
     }
 
@@ -1194,7 +1205,7 @@ impl Space {
     /// with no invariants.
     #[must_use]
     pub fn states(&self) -> usize {
-        self.graph.states.len()
+        self.graph.steps.len()
     }
 
     /// The actions that fire somewhere in the space: [`fired_actions`]' answer.
@@ -1210,10 +1221,10 @@ impl Space {
             weak: &live.weak,
             strong: &live.strong,
         };
-        match &self.compiled {
+        match &self.walked {
             // `Liveness::goal_holds`, over the compiled state: the same value,
             // and the same panic for an integer goal.
-            Some((c, walked)) => {
+            Walked::Compiled(c, walked) => {
                 let goal = c.expr(&self.model, &live.goal);
                 self.nonprogress_by_index(
                     |i| match goal.eval(&walked[i]) {
@@ -1226,7 +1237,7 @@ impl Space {
                     &fairness,
                 )
             }
-            None => {
+            Walked::ByName(_) => {
                 self.find_nonprogress_cycle(|state| live.goal_holds(&self.model, state), &fairness)
             }
         }
@@ -1242,7 +1253,7 @@ impl Space {
         is_goal: impl Fn(&State) -> bool,
         fairness: &Fairness<'_>,
     ) -> Option<NonProgressCycle> {
-        self.nonprogress_by_index(|s| is_goal(&self.graph.states[s]), fairness)
+        self.nonprogress_by_index(|s| self.walked.with_state(s, &is_goal), fairness)
     }
 
     /// [`Space::find_nonprogress_cycle`] with the goal asked of each state by
@@ -1263,7 +1274,7 @@ impl Space {
                 m.name, m.actions[both].name
             );
         }
-        let non_goal: Vec<usize> = (0..graph.states.len()).filter(|&s| !is_goal(s)).collect();
+        let non_goal: Vec<usize> = (0..graph.steps.len()).filter(|&s| !is_goal(s)).collect();
         // Keyed by each component's least (nearest-to-Init) state, distinct since components
         // are disjoint, so `pop_first` asks the nearest first.
         let mut queue: BTreeMap<usize, Vec<usize>> = graph
@@ -1304,9 +1315,84 @@ impl Space {
                 }
                 continue;
             }
-            return Some(graph.witness(m, &component, &member, &inside, &weak, &strong));
+            return Some(self.witness(&component, &member, &inside, &weak, &strong));
         }
         None
+    }
+
+    /// The lasso a fair run can follow in `component`: a stem to its first state, then a loop
+    /// that takes one step of every fair action with a step inside it and, for a weakly fair
+    /// action with none, visits a state where it is disabled — each what that action's
+    /// fairness demands of a run confined here, so the loop is a fair run by construction.
+    // Skip: witness assembly over the space's graph (absent std bodies).
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn witness(
+        &self,
+        component: &[usize],
+        member: &BTreeSet<usize>,
+        inside: &BTreeSet<usize>,
+        weak: &[usize],
+        strong: &[usize],
+    ) -> NonProgressCycle {
+        let (m, graph) = (&self.model, &self.graph);
+        let entry = component[0];
+        let mut stem: Vec<(&'static str, State)> = Vec::new();
+        let mut at = entry;
+        while let Some((a, prev)) = graph.parent[at] {
+            stem.push((m.actions[a].name, self.walked.state(at)));
+            at = prev;
+        }
+        stem.push(("Init", self.walked.state(at)));
+        stem.reverse();
+
+        let mut fair: Vec<usize> = weak.iter().chain(strong).copied().collect();
+        fair.sort_unstable();
+        let mut cycle: Vec<(usize, usize)> = Vec::new();
+        let mut cur = entry;
+        // One step of every fair action that has a step inside the component…
+        for &a in &fair {
+            if !inside.contains(&a) {
+                continue;
+            }
+            let step = component.iter().find_map(|&s| {
+                graph.steps[s]
+                    .iter()
+                    .find(|&&(b, t)| b == a && member.contains(&t))
+                    .map(|&(_, t)| (s, t))
+            });
+            if let Some((s, t)) = step {
+                graph.walk_inside(m, member, cur, s, &mut cycle);
+                cycle.push((a, t));
+                cur = t;
+            }
+        }
+        graph.walk_inside(m, member, cur, entry, &mut cycle);
+        // …and, for a weakly fair action with none, a visit to a state where it
+        // is off, unless the loop already passes one: a detour from the entry
+        // and back, so the loop stays closed.
+        for &a in &fair {
+            if inside.contains(&a) || !weak.contains(&a) {
+                continue;
+            }
+            let passes_off =
+                !graph.enabled(entry, a) || cycle.iter().any(|&(_, s)| !graph.enabled(s, a));
+            if passes_off {
+                continue;
+            }
+            if let Some(&s) = component.iter().find(|&&s| !graph.enabled(s, a)) {
+                graph.walk_inside(m, member, entry, s, &mut cycle);
+                graph.walk_inside(m, member, s, entry, &mut cycle);
+            }
+        }
+        NonProgressCycle {
+            stem,
+            cycle: cycle
+                .into_iter()
+                .map(|(a, s)| (m.actions[a].name, self.walked.state(s)))
+                .collect(),
+            moves: inside.iter().map(|&a| m.actions[a].name).collect(),
+            component: component.len(),
+        }
     }
 }
 
@@ -1637,7 +1723,6 @@ mod tests {
                 })
                 .collect();
             let graph = StateGraph {
-                states: vec![State::new(); n],
                 steps,
                 parent: vec![None; n],
                 fired: BTreeSet::new(),
@@ -1680,6 +1765,75 @@ mod tests {
                 }
             }
             assert_eq!(covered, member, "every asked-about state is in a component");
+        }
+    }
+
+    /// One walk answers each watched action as a walk of its own would: `Some(true)` for an
+    /// action every lawful firing of which breaks a law, `Some(false)` for one a lawful firing
+    /// of which lands lawful, `None` for one that fires only where a law is already broken or
+    /// never. Each answer is its action's wherever it is asked and however often, and the walk
+    /// that ends once every action has landed lawful answers the same. `Late` breaks a law where
+    /// it first fires and lands lawful only deeper, after `Spin` has landed lawful twice (from
+    /// `Init` and from `Tick`'s state): a walk that stopped at another action's lawful landing,
+    /// or counted one action's twice, would call it `None`.
+    #[test]
+    fn violation_steps_answer_each_action_as_its_own_walk_would() {
+        let m = crate::ty_model! {
+            ViolationSteps {
+                const Cap = 2;
+                var armed = 0;
+                var fired = 0;
+                var spun = 0;
+                var late = 0;
+                var tick = 0;
+                action Arm when (armed == 0) { armed = 1; }
+                action Tick when (tick == 0) { tick = 1; }
+                action Spin when (spun == 0) { spun = 1; }
+                action Fire when (armed == 1 && fired == 0) { fired = 1; }
+                action Stuck when (spun == Cap) { spun = 0; }
+                action Late when (late == 0) { late = if spun == 1 { 2 } else { 1 }; }
+                invariant NeverArmed: armed == 0;
+                invariant NeverHalfLate: 1 > late || late > 1;
+            }
+        };
+        let actions = ["Arm", "Spin", "Fire", "Stuck", "Late"];
+        let alone: Vec<Option<bool>> = actions
+            .iter()
+            .map(|a| violation_steps(&m, &[a])[0])
+            .collect();
+        assert_eq!(alone, [Some(true), Some(false), None, None, Some(false)]);
+        assert_eq!(violation_steps(&m, &actions), alone);
+        assert_eq!(
+            violation_steps(&m, &["Stuck", "Fire", "Spin", "Arm", "Spin"]),
+            [None, None, Some(false), Some(true), Some(false)]
+        );
+        assert_eq!(
+            violation_steps(&m, &["Spin", "Spin"]),
+            [Some(false), Some(false)]
+        );
+        assert_eq!(
+            violation_steps(&m, &["Spin", "Late"]),
+            [Some(false), Some(false)]
+        );
+    }
+
+    /// [`bmc_fired`] is [`bmc`]'s verdict, and where that verdict is `Ok` its fired set is
+    /// [`fired_actions`]' answer.
+    #[test]
+    fn bmc_fired_is_bmc_and_fired_actions_in_one_walk() {
+        for m in [
+            ring_model(),
+            subscribe_model(),
+            config_catalog_snapshot_model(),
+        ] {
+            for b in m.mutant_dials().into_iter().chain([0]) {
+                let m = with_buggy(&m, b);
+                let (verdict, fired) = bmc_fired(&m);
+                assert_eq!(verdict, bmc(&m), "{} Buggy={b}", m.name);
+                if verdict.is_ok() {
+                    assert_eq!(fired, fired_actions(&m), "{} Buggy={b}", m.name);
+                }
+            }
         }
     }
 
@@ -1789,14 +1943,15 @@ mod tests {
             "{}: deadlock (even states final)",
             m.name
         );
-        let ((gc, walked), (gb, _)) = (explore_on(m, &c), explore_on(m, &by));
-        assert_eq!(gc.states, gb.states, "{}: graph states", m.name);
+        let ((gc, walked), (gb, by_name)) = (explore_on(m, &c), explore_on(m, &by));
+        let graph_states: Vec<State> = walked.iter().map(|s| c.state(s)).collect();
+        assert_eq!(graph_states, by_name, "{}: graph states", m.name);
         assert_eq!(gc.steps, gb.steps, "{}: graph steps", m.name);
         assert_eq!(gc.parent, gb.parent, "{}: graph parents", m.name);
         assert_eq!(gc.fired, gb.fired, "{}: graph fired", m.name);
         let states = reachable_on(m, &c);
         assert_eq!(states, reachable_on(m, &by), "{}: reachable", m.name);
-        assert_eq!(states, gc.states, "{}: reachable is the graph's", m.name);
+        assert_eq!(states, graph_states, "{}: reachable is the graph's", m.name);
         // The public form names each variable by its place in a state's
         // values, which is `State`'s own iteration order.
         let r = Resolved::new(m).expect("compiles");
@@ -1858,9 +2013,9 @@ mod tests {
 
     /// The resolution corners no committed model happens to exercise: a state
     /// variable shadowing a constant, a constant declared twice, a `\A` index
-    /// shadowing a variable, nested `\A`s over one index name, an empty range,
-    /// a range and a plain update writing the same variable, and every
-    /// operator.
+    /// shadowing a variable, nested `\A`s over one index name, an inner `\A`
+    /// index read beside an outer one in one fused step, an empty range, a
+    /// range and a plain update writing the same variable, and every operator.
     #[test]
     fn compiled_walks_are_the_by_name_walks_on_the_resolution_corners() {
         use crate::derive::{
@@ -1877,9 +2032,32 @@ mod tests {
                 StateVar { name: "y", init: 0 },
                 StateVar { name: "x", init: 0 },
                 StateVar { name: "i", init: 1 },
+                StateVar { name: "n", init: 0 },
             ],
             fn_vars: vec![],
             actions: vec![
+                Action {
+                    name: "Nested",
+                    // `\A a \in 0..x : \A b \in a + 1..a + 1 : b > a /\ b - a = 1`:
+                    // each operation reads the inner index beside the outer one
+                    // as two atoms, so a fused step that read the wrong depth
+                    // would turn the guard false and the action dead.
+                    guard: Some(and_(
+                        eq(var("n"), int(0)),
+                        forall(
+                            "a",
+                            int(0),
+                            var("x"),
+                            forall(
+                                "b",
+                                add(var("a"), int(1)),
+                                add(var("a"), int(1)),
+                                and_(gt(var("b"), var("a")), eq(sub(var("b"), var("a")), int(1))),
+                            ),
+                        ),
+                    )),
+                    updates: vec![up("n", int(1))],
+                },
                 Action {
                     name: "Grow",
                     // `\A i \in 0..x : \A i \in i..2 : i <= K + x` — the inner
@@ -1949,7 +2127,7 @@ mod tests {
         // nondeterministic pick fans out, and an invariant is broken.
         assert_eq!(
             fired_actions(&m),
-            BTreeSet::from(["Grow", "Twice", "MaybeEmpty", "Ops"])
+            BTreeSet::from(["Nested", "Grow", "Twice", "MaybeEmpty", "Ops"])
         );
         assert!(reachable_states(&m).len() > 8);
         assert_eq!(
@@ -2004,7 +2182,7 @@ mod tests {
             invariants: vec![],
         };
         assert!(Compiled::new(&m).is_none());
-        assert_eq!(bmc(&m), bmc_on(&m, &ByName(&m)));
+        assert_eq!(bmc(&m), bmc_on(&m, &ByName(&m)).0);
         assert_eq!(reachable_states(&m), reachable_on(&m, &ByName(&m)));
     }
 

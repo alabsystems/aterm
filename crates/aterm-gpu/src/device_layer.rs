@@ -191,11 +191,8 @@ pub(crate) struct TexUsage {
 
 impl TexUsage {
     /// The upload-then-sample shape every atlas/sprite/overlay texture uses
-    /// (`TEXTURE_BINDING | COPY_DST`).
-    #[cfg_attr(
-        all(gl_arm, not(wgpu_arm)),
-        expect(dead_code, reason = "the wgpu and Metal arms' texture mints")
-    )]
+    /// (`TEXTURE_BINDING | COPY_DST`); the fx atlases mint through it on
+    /// every arm (`fx_gpu::sync_fx_tex`).
     pub(crate) const UPLOADED_SAMPLED: Self = Self {
         sampled: true,
         render: false,
@@ -378,12 +375,8 @@ impl DeviceHandle<'_> {
     }
 
     /// Row-ranged upload of rows `[y0, y0 + rows)` at full width, for the
-    /// atlas append. `bytes` holds exactly the band.
-    ///
-    /// The Metal arm's `replaceRegion:` is a CPU copy outside the command
-    /// queue's hazard tracking: a caller rewriting texels a submitted command
-    /// buffer may still sample settles those readers first
-    /// (`MetalArmLive::await_atlas_readers`).
+    /// atlas append: [`Self::upload_texture_region`]'s full-width case.
+    /// `bytes` holds exactly the band.
     pub(crate) fn upload_texture_rows(
         &self,
         tex: &LayerTexture,
@@ -393,7 +386,30 @@ impl DeviceHandle<'_> {
         bytes_per_row: u32,
         width: u32,
     ) {
-        if rows == 0 {
+        self.upload_texture_region(tex, 0, y0, width, rows, bytes, bytes_per_row);
+    }
+
+    /// Upload the `w × h` region at `(x, y)` of level 0 from `bytes`, rows
+    /// `bytes_per_row` apart (Metal `replaceRegion:`, wgpu `write_texture`
+    /// with an origin, GL `texSubImage2D` at unpack alignment 1). The fx atlas
+    /// writes each new art into its own fresh region this way.
+    ///
+    /// The Metal arm's `replaceRegion:` is a CPU copy outside the command
+    /// queue's hazard tracking: a caller writing a texture a submitted command
+    /// buffer may still sample settles those readers first
+    /// (`MetalArmLive::await_atlas_readers`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upload_texture_region(
+        &self,
+        tex: &LayerTexture,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        bytes: &[u8],
+        bytes_per_row: u32,
+    ) {
+        if w == 0 || h == 0 {
             return;
         }
         match (self, tex) {
@@ -403,18 +419,18 @@ impl DeviceHandle<'_> {
                     wgpu::TexelCopyTextureInfo {
                         texture,
                         mip_level: 0,
-                        origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
+                        origin: wgpu::Origin3d { x, y, z: 0 },
                         aspect: wgpu::TextureAspect::All,
                     },
                     bytes,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(bytes_per_row),
-                        rows_per_image: Some(rows),
+                        rows_per_image: Some(h),
                     },
                     wgpu::Extent3d {
-                        width,
-                        height: rows,
+                        width: w,
+                        height: h,
                         depth_or_array_layers: 1,
                     },
                 );
@@ -423,31 +439,38 @@ impl DeviceHandle<'_> {
             (Self::Metal(_), LayerTexture::Metal(texture)) => {
                 let region = mtl::MtlRegion {
                     origin: mtl::MtlOrigin {
-                        x: 0,
-                        y: y0 as usize,
+                        x: x as usize,
+                        y: y as usize,
                         z: 0,
                     },
                     size: mtl::MtlSize {
-                        width: width as usize,
-                        height: rows as usize,
+                        width: w as usize,
+                        height: h as usize,
                         depth: 1,
                     },
                 };
                 assert!(
-                    bytes.len() >= bytes_per_row as usize * rows as usize,
-                    "device layer: row-ranged upload of {rows} rows needs \
-                     {bytes_per_row}*{rows} bytes, got {}",
+                    bytes.len() >= bytes_per_row as usize * h as usize,
+                    "device layer: region upload of {w}x{h} rows needs \
+                     {bytes_per_row}*{h} bytes, got {}",
                     bytes.len()
+                );
+                assert!(
+                    (x + w) as usize <= texture.width() && (y + h) as usize <= texture.height(),
+                    "device layer: region upload of {w}x{h} at ({x}, {y}) leaves a {}x{} \
+                     texture",
+                    texture.width(),
+                    texture.height()
                 );
                 // SAFETY: a `LayerTexture::Metal` comes only from this layer's
                 // mint, which creates Managed 2-D textures, so `replaceRegion:`
-                // is legal; the band length is asserted above and the copy is
-                // synchronous.
+                // is legal; the region lies in the texture and the band length
+                // is asserted above, and the copy is synchronous.
                 unsafe { texture.upload(region, bytes, bytes_per_row as usize) };
             }
             #[cfg(gl_arm)]
             (Self::Gl(dev), LayerTexture::Gl(texture)) => {
-                if let Err(e) = dev.upload_rows(texture, y0, rows, bytes, bytes_per_row, width) {
+                if let Err(e) = dev.upload_region(texture, x, y, w, h, bytes, bytes_per_row) {
                     panic!("device layer: {e}");
                 }
             }
@@ -1044,6 +1067,28 @@ pub(crate) enum FrameAtlas<'a> {
         sampler: &'a GlSampler,
         unit: u32,
     },
+    /// The fx bind (`BindSpec::FX`): the Index8 and RGBA atlases at the row's
+    /// two fragment texture slots, read by integer address (no sampler), and
+    /// the frame slot's palette stream at its fragment buffer slot.
+    #[cfg(target_os = "macos")]
+    MetalFx {
+        r8: &'a mtl::Obj,
+        rgba: &'a mtl::Obj,
+        palette: &'a mtl::Obj,
+        tex_slots: [u32; 2],
+        palette_slot: u32,
+    },
+    /// The fx bind on GL: the two atlases and this frame's palette texture at
+    /// units `units` (`aterm_t0`, `aterm_t1`, `aterm_t2`), each with the
+    /// nearest sampler object (a texture is complete without mipmaps).
+    #[cfg(gl_arm)]
+    GlFx {
+        r8: &'a GlTexture,
+        rgba: &'a GlTexture,
+        palette: &'a GlTexture,
+        sampler: &'a GlSampler,
+        units: [u32; 3],
+    },
 }
 
 /// A bound instance stream: wgpu vertex slot 0, or the Metal stream at
@@ -1426,6 +1471,36 @@ impl FramePass<'_, '_> {
                 // Frame atlases are never sRGB-stored; `raw` is moot.
                 pass.bind_texture(tex, sampler, unit, false);
             }
+            #[cfg(target_os = "macos")]
+            (
+                Self::Metal(pass),
+                FrameAtlas::MetalFx {
+                    r8,
+                    rgba,
+                    palette,
+                    tex_slots,
+                    palette_slot,
+                },
+            ) => {
+                pass.set_fragment_texture(r8, tex_slots[0] as usize);
+                pass.set_fragment_texture(rgba, tex_slots[1] as usize);
+                pass.set_fragment_buffer(palette, palette_slot as usize);
+            }
+            #[cfg(gl_arm)]
+            (
+                Self::Gl(pass),
+                FrameAtlas::GlFx {
+                    r8,
+                    rgba,
+                    palette,
+                    sampler,
+                    units,
+                },
+            ) => {
+                pass.bind_texture(r8, sampler, units[0], false);
+                pass.bind_texture(rgba, sampler, units[1], false);
+                pass.bind_texture(palette, sampler, units[2], false);
+            }
             #[cfg(multi_arm)]
             _ => crossed("frame atlas", "an open pass"),
         }
@@ -1540,6 +1615,140 @@ pub(crate) fn metal_stage_readback(
         return Err(format!("metal readback failed: {outcome:?}"));
     }
     Ok((readback, padded))
+}
+
+/// Submit `commands`, whose copies fill each of `readbacks` (wgpu `MAP_READ`
+/// staging buffers), so that the host reads the copied bytes once a buffer's
+/// map completes. Every wgpu readback's copy is submitted here; `clippy.toml`
+/// bans a bare `map_async` so that no readback maps a buffer it did not
+/// submit this way.
+///
+/// wgpu-core records no barrier when a buffer is mapped (29.0.x
+/// `Buffer::map_async`: "TODO: we are ignoring the transition here"), so on
+/// Vulkan the copy's fence signals with no `TRANSFER_WRITE -> HOST_READ`
+/// dependency, the device-to-host domain operation Vulkan asks of a host read
+/// of a device write. On an NVIDIA GB10 (driver 580.159, wgpu 29.0.3, test
+/// binaries rendering in parallel) 16 of 8000 fresh devices' first readbacks
+/// then read zeros where the copy had written, in the buffer's first 28 KiB
+/// (from under 1 KiB to 28 KiB of it; once a texel with its colour but not
+/// yet its alpha), and the same mapping read the copied bytes 50 ms later;
+/// with the barrier, none of 8000 did.
+///
+/// The barrier is wgpu-hal's `COPY_DST -> MAP_READ` transition, recorded into
+/// a raw command buffer submitted after `commands` in the same
+/// `Queue::submit` (wgpu 29 refuses raw and wgpu commands in one encoder). One
+/// submission, so the map that waits for the copy waits for the barrier.
+#[cfg(wgpu_arm)]
+pub(crate) fn submit_host_readable(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    commands: wgpu::CommandBuffer,
+    readbacks: &[wgpu::Buffer],
+) -> wgpu::SubmissionIndex {
+    queue.submit(std::iter::once(commands).chain(host_read_barrier(device, readbacks)))
+}
+
+/// The raw command buffer [`submit_host_readable`] appends: a
+/// `TRANSFER_WRITE -> HOST_READ` buffer barrier per readback. `None` when there
+/// is nothing to read or the buffers are not Vulkan's (wgpu's GLES backend
+/// reads mapped buffers back through GL, which orders them itself).
+#[cfg(all(wgpu_arm, unix, not(target_vendor = "apple")))]
+fn host_read_barrier(
+    device: &wgpu::Device,
+    readbacks: &[wgpu::Buffer],
+) -> Option<wgpu::CommandBuffer> {
+    use wgpu::hal::CommandEncoder as _;
+    use wgpu::hal::api::Vulkan;
+    // SAFETY: the guard only asks which backend minted the buffer and is
+    // dropped at the end of the statement.
+    let vulkan = readbacks
+        .first()
+        .is_some_and(|b| unsafe { b.as_hal::<Vulkan>() }.is_some());
+    if !vulkan {
+        return None;
+    }
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("aterm-gpu host-read barrier"),
+    });
+    // SAFETY: the encoder is fresh and nothing else touches it while the
+    // callback records into it, and the callback does not end it (`finish`
+    // does). One buffer guard is held at a time (each holds the device's
+    // snatch lock, which wgpu refuses to take twice), for its one barrier,
+    // which orders only that buffer's memory. The buffers outlive the
+    // barriers: they ride the submission their copies do, which their maps
+    // wait for.
+    let recorded = unsafe {
+        enc.as_hal_mut::<Vulkan, _, _>(|hal| {
+            let Some(hal) = hal else {
+                return false;
+            };
+            for readback in readbacks {
+                let Some(raw) = readback.as_hal::<Vulkan>() else {
+                    return false;
+                };
+                hal.transition_buffers(std::iter::once(wgpu::hal::BufferBarrier {
+                    buffer: &*raw,
+                    usage: wgpu::hal::StateTransition {
+                        from: wgpu::wgt::BufferUses::COPY_DST,
+                        to: wgpu::wgt::BufferUses::MAP_READ,
+                    },
+                }));
+            }
+            true
+        })
+    };
+    recorded.then(|| enc.finish())
+}
+
+/// Off the Vulkan cells (Metal on macOS, DX12 on Windows) a completed command
+/// buffer's writes to a mapped readback buffer reach the host without one.
+#[cfg(all(wgpu_arm, not(all(unix, not(target_vendor = "apple")))))]
+fn host_read_barrier(
+    _device: &wgpu::Device,
+    _readbacks: &[wgpu::Buffer],
+) -> Option<wgpu::CommandBuffer> {
+    None
+}
+
+#[cfg(all(test, wgpu_arm, unix, not(target_vendor = "apple")))]
+mod host_read_tests {
+    /// A Vulkan readback's submit carries the host-read barrier: wgpu hands
+    /// the raw encoder over and the barrier is recorded, so the fix cannot
+    /// lapse into a silent no-op, and two readbacks in one submit (a
+    /// recording and a still of one present) get theirs too. A submit that
+    /// reads nothing back carries none.
+    #[test]
+    fn a_vulkan_readback_submit_carries_the_host_read_barrier() {
+        let ctx = crate::GpuContext::new()
+            .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU: {e}")));
+        if ctx.backend != "Vulkan" {
+            aterm_spec::host::could_not_run(format!("a {} device, not Vulkan", ctx.backend));
+        }
+        let layer = super::DeviceHandle::Wgpu {
+            device: &ctx.device,
+            queue: &ctx.queue,
+        };
+        let readbacks = [
+            layer
+                .create_readback_buffer("host-read barrier test", 256)
+                .into_wgpu(),
+            layer
+                .create_readback_buffer("host-read barrier test", 256)
+                .into_wgpu(),
+        ];
+        assert!(
+            super::host_read_barrier(&ctx.device, &readbacks[..1]).is_some(),
+            "a Vulkan readback must get its TRANSFER_WRITE -> HOST_READ barrier"
+        );
+        assert!(
+            super::host_read_barrier(&ctx.device, &readbacks).is_some(),
+            "two readbacks in one submit get theirs"
+        );
+        assert!(
+            super::host_read_barrier(&ctx.device, &[]).is_none(),
+            "nothing read back, no barrier"
+        );
+    }
 }
 
 /// GL arm of `try_read_back`: read `texture`'s `width` x `height` RGBA8
@@ -1732,7 +1941,7 @@ mod tests {
             .cloned()
             .or_else(|| err.downcast_ref::<&str>().map(|m| (*m).to_owned()))
             .unwrap_or_default();
-        assert!(msg.contains("row-ranged upload"), "got: {msg}");
+        assert!(msg.contains("region upload"), "got: {msg}");
 
         let buf = handle
             .try_create_instance_buffer("device-layer short-buffer probe", 4)

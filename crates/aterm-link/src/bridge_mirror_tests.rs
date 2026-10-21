@@ -566,7 +566,12 @@ fn log_mirror_conforms_across_a_bridge_crash_with_a_pin_outstanding() {
     // Its endpoint is the same instance: the logs move over.
     let logs = std::mem::take(&mut lane.mirror.lock().unwrap().logs);
     next_lane.mirror.lock().unwrap().logs = logs;
-    next.mirror = MirrorRun::new(crate::mirror::LogMode::Turns, &next.state);
+    next.mirror = MirrorRun::new(
+        crate::mirror::LogMode::Turns,
+        &next.state,
+        Instant::now(),
+        crate::mirror::mint_alias_key,
+    );
     next.mirror_hello_answered("OK lane=2 build=b log=turns");
     let (slots, outcomes) = next.mirror.as_deref().map(MirrorRun::batch).unwrap();
     assert_eq!(
@@ -742,7 +747,12 @@ fn a_bridge_with_the_mirror_off_sends_no_mirror_byte() {
     );
     // ON: the hello asks, and only an acknowledgment turns it on.
     let (lane, mut on) = FakeVerbLane::bridge(&[(1, SID)]);
-    on.mirror = MirrorRun::new(crate::mirror::LogMode::Turns, &on.state);
+    on.mirror = MirrorRun::new(
+        crate::mirror::LogMode::Turns,
+        &on.state,
+        Instant::now(),
+        crate::mirror::mint_alias_key,
+    );
     on.introduce();
     assert!(lane.hellos.lock().unwrap()[0].ends_with(" refill=in,say log=turns"));
     assert!(
@@ -948,7 +958,12 @@ fn a_republished_slots_dedup_is_read_back_and_a_foreign_one_is_a_collision() {
         .unwrap();
     let logs = std::mem::take(&mut lane.mirror.lock().unwrap().logs);
     next_lane.mirror.lock().unwrap().logs = logs;
-    next.mirror = MirrorRun::new(crate::mirror::LogMode::Turns, &next.state);
+    next.mirror = MirrorRun::new(
+        crate::mirror::LogMode::Turns,
+        &next.state,
+        Instant::now(),
+        crate::mirror::mint_alias_key,
+    );
     next.mirror_hello_answered("OK lane=2 build=b log=turns");
     next.mirror_send();
     next.settle_acks();
@@ -1308,10 +1323,22 @@ fn the_alias_key_survives_a_bridge_restart_and_a_cap_change() {
         Some(key.clone()),
         "the emptied pin keeps it"
     );
-    let next = MirrorRun::new(crate::mirror::LogMode::Turns, &w.bridge.state).expect("on");
+    let next = MirrorRun::new(
+        crate::mirror::LogMode::Turns,
+        &w.bridge.state,
+        Instant::now(),
+        crate::mirror::mint_alias_key,
+    )
+    .expect("on");
     assert_eq!(next.key(), key, "the next bridge's key is the pin's");
     let (_lane, other) = FakeVerbLane::bridge(&[]);
-    let elsewhere = MirrorRun::new(crate::mirror::LogMode::Turns, &other.state).expect("on");
+    let elsewhere = MirrorRun::new(
+        crate::mirror::LogMode::Turns,
+        &other.state,
+        Instant::now(),
+        crate::mirror::mint_alias_key,
+    )
+    .expect("on");
     assert_ne!(elsewhere.key(), key, "another node's is its own");
 }
 
@@ -1756,7 +1783,12 @@ fn successor(
     next.conn = Some(conn.into());
     let logs = std::mem::take(&mut lane.mirror.lock().unwrap().logs);
     next_lane.mirror.lock().unwrap().logs = logs;
-    next.mirror = MirrorRun::new(crate::mirror::LogMode::Turns, &next.state);
+    next.mirror = MirrorRun::new(
+        crate::mirror::LogMode::Turns,
+        &next.state,
+        Instant::now(),
+        crate::mirror::mint_alias_key,
+    );
     next.mirror_hello_answered("OK lane=2 build=b log=turns");
     (next_lane, next)
 }

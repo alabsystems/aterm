@@ -9,17 +9,16 @@
 
 use std::time::{Duration, Instant};
 
-use super::super::tests::{lines, lines_of, opened, stamp, with_claude};
+use super::super::tests::{blocks, finished, lines, lines_of, opened, running, stamp, with_claude};
 use super::*;
 use crate::{App, WindowId};
 
-/// A registration on `session`'s subscriber slot, any notify already
-/// pending drained.
-fn watching(
-    subscribers: &crate::subscribe::Subscribers,
-    session: u64,
-) -> crate::subscribe::Subscription {
-    let sub = crate::subscribe::SubscriberSet::register(subscribers, &[session]);
+/// A registration on `session`'s watcher list, any ring already pending
+/// drained.
+fn watching(app: &App, session: u64) -> crate::session_watch::Subscription {
+    let sub = crate::session_watch::Subscription::single(
+        &app.pool.get(session).expect("a live session").ctx.watchers,
+    );
     let _ = sub.wait(Duration::ZERO);
     sub
 }
@@ -53,7 +52,7 @@ fn the_sweep_marks_what_the_engine_says_once() {
         1,
         "{base:?}"
     );
-    let sub = watching(&app.subscribers, session);
+    let sub = watching(&app, session);
     let _ = timeline.lock().unwrap().slog_take_wake();
     crate::term_lock(&term).process(b"\x1b]9;SENTINEL-BODY\x07\x07\x1b]9;4;1;42\x07");
     app.observe_session_statuses(t0 + Duration::from_secs(1));
@@ -115,7 +114,7 @@ fn a_status_transition_is_one_typed_mark() {
         .unwrap()
         .since(None)
         .filter(|e| e.kind == crate::session_status::STATUS_CHANGE)
-        .map(|e| e.payload.clone())
+        .map(|e| e.payload.to_string())
         .collect();
     assert_eq!(
         marks.len(),
@@ -297,24 +296,6 @@ fn the_launch_card_amends_the_agent_run_once() {
     );
 }
 
-/// The render path's wake (ruling S29): the loop's `Wake::SessionLogMoved`
-/// with `notify` wakes the session's watchers (a one-minute hang detector).
-/// NEGATIVE CONTROL: without `notify` (the footer thread already woke them)
-/// it wakes nobody.
-#[test]
-fn the_render_paths_wake_reaches_the_watchers_after_the_frame() {
-    let mut app = App::headless_for_test();
-    let session = app
-        .front_terminal(WindowId(0))
-        .expect("a front terminal")
-        .session;
-    let sub = watching(&app.subscribers, session);
-    app.on_session_log_moved(session, false);
-    assert!(!sub.wait(Duration::ZERO), "no notify owed");
-    app.on_session_log_moved(session, true);
-    assert!(sub.wait(aterm_spec::wait::MUST_HAPPEN), "woken");
-}
-
 /// `mark - render state=…` (plan §3.2): each move of the verdict once; the
 /// ledger's transitions name their state. NEGATIVE CONTROL: the same state
 /// twice writes one mark.
@@ -431,7 +412,7 @@ fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
     let front = app.front_terminal(WindowId(0)).expect("a front terminal");
     let (session, term) = (front.session, std::sync::Arc::clone(&front.term));
     let timeline = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx.timeline);
-    let sub = watching(&app.subscribers, session);
+    let sub = watching(&app, session);
     let _ = timeline.lock().unwrap().slog_take_wake();
     crate::term_lock(&term)
         .process(b"\x1b]7;file://localhost/aterm-p3b/cwd\x07\x1b]2;SENTINEL-TITLE build\x07");
@@ -577,18 +558,17 @@ fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
     let h = crate::session_store::test_handle(12);
     let store = crate::session_store::new_store();
     store.write().unwrap().register(h.clone());
-    let subs = crate::subscribe::new_registry();
     let woke = std::cell::Cell::new(0u32);
     let wake = || {
         woke.set(woke.get() + 1);
-        subs.lock().unwrap().notify(12);
+        h.ctx.watchers.ring_watchers();
     };
     let (since, ep) = {
         let g = h.ctx.timeline.lock().unwrap();
         (g.slog().log().last_seq(), g.slog().log().ep())
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+    let (h2, store2) = (h.clone(), store.clone());
     std::thread::spawn(move || {
         let reply = crate::control::cmd_await(
             &h2.term,
@@ -596,7 +576,6 @@ fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
             h2.local_id,
             &h2.ctx,
             &format!("log kind=in-doubt since={since} ep={ep} timeout=600000"),
-            &subs2,
         );
         let _ = tx.send(reply);
     });
@@ -637,19 +616,18 @@ fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
 
 // ---- C10: the fabric's one typed hook ----------------------------------------
 
-/// A registered session, its store and a subscriber registry: what a
-/// control worker's fabric verb runs against.
+/// A registered session and its store: what a control worker's fabric verb
+/// runs against.
 fn fabric_rig(
     local: u64,
 ) -> (
     crate::session_store::SessionHandle,
     crate::session_store::Store,
-    crate::subscribe::Subscribers,
 ) {
     let h = crate::session_store::test_handle(local);
     let store = crate::session_store::new_store();
     store.write().unwrap().register(h.clone());
-    (h, store, crate::subscribe::new_registry())
+    (h, store)
 }
 
 /// An in-process `await log kind=<kind>` parked past `h`'s log as it stands:
@@ -658,7 +636,6 @@ fn fabric_rig(
 fn parked_log_await(
     h: &crate::session_store::SessionHandle,
     store: &crate::session_store::Store,
-    subs: &crate::subscribe::Subscribers,
     kind: &str,
 ) -> std::sync::mpsc::Receiver<String> {
     let (since, ep) = {
@@ -666,11 +643,10 @@ fn parked_log_await(
         (g.slog().log().last_seq(), g.slog().log().ep())
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+    let (h2, store2) = (h.clone(), store.clone());
     let line = format!("log kind={kind} since={since} ep={ep} timeout=600000");
     std::thread::spawn(move || {
-        let reply =
-            crate::control::cmd_await(&h2.term, &store2, h2.local_id, &h2.ctx, &line, &subs2);
+        let reply = crate::control::cmd_await(&h2.term, &store2, h2.local_id, &h2.ctx, &line);
         let _ = tx.send(reply);
     });
     rx
@@ -695,28 +671,27 @@ fn returned(rx: &std::sync::mpsc::Receiver<String>, site: &str) -> String {
 fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
     use crate::control::Scope;
     use crate::task_record::cmd_task;
-    let (h, store, subs) = fabric_rig(23);
+    let (h, store) = fabric_rig(23);
     let tasks = |h: &crate::session_store::SessionHandle| -> Vec<String> {
         lines_of(&h.ctx.timeline)
             .into_iter()
             .filter(|l| l.contains(" mark - task "))
             .collect()
     };
-    let rx = parked_log_await(&h, &store, &subs, "task");
-    let reply = cmd_task(&h.ctx, h.local_id, Scope::Owner, "mark working", &subs);
+    let rx = parked_log_await(&h, &store, "task");
+    let reply = cmd_task(&h.ctx, h.local_id, Scope::Owner, "mark working");
     assert!(reply.starts_with("OK task rev=1 state=working"), "{reply}");
     let got = returned(&rx, "task mark working");
     assert!(
         got.contains(" mark - task rev=1 state=working attention=0 src=aterm conf=exact "),
         "{got}"
     );
-    let rx = parked_log_await(&h, &store, &subs, "task");
+    let rx = parked_log_await(&h, &store, "task");
     let reply = cmd_task(
         &h.ctx,
         h.local_id,
         Scope::Owner,
         "mark exited why=exit exit=3 result_bytes=12",
-        &subs,
     );
     assert!(reply.contains(" changed=1"), "{reply}");
     let got = returned(&rx, "task mark exited");
@@ -727,7 +702,7 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
         "{got}"
     );
     // The supervisor's attention: one more rev of the same state.
-    let rx = parked_log_await(&h, &store, &subs, "task");
+    let rx = parked_log_await(&h, &store, "task");
     let changed = crate::session_timeline::write_attention_owned(
         &h.ctx,
         crate::harness_host::ATTENTION_OWNER,
@@ -736,7 +711,6 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
     )
     .expect("the supervisor's entry");
     assert!(changed);
-    crate::task_record::wake_task_waiters(&subs, h.local_id);
     let got = returned(&rx, "attention");
     assert!(
         got.contains(" mark - task rev=3 state=exited attention=1 why=exit code=3 "),
@@ -748,7 +722,6 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
         h.local_id,
         Scope::Owner,
         "mark exited why=exit exit=3 result_bytes=12",
-        &subs,
     );
     assert!(reply.contains(" changed=0"), "{reply}");
     let marks = tasks(&h);
@@ -781,11 +754,11 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
 /// and a repeated `inbox seen` write no second mark.
 #[test]
 fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
-    let (h, store, subs) = fabric_rig(21);
+    let (h, store) = fabric_rig(21);
     let sid = h.ctx.self_id.as_str().to_string();
-    let wake = |s: &aterm_session::SessionId| crate::control::wake_sid_watchers(&store, &subs, s);
+    let wake = |s: &aterm_session::SessionId| crate::control::wake_sid_watchers(&store, s);
     // Mail in.
-    let rx = parked_log_await(&h, &store, &subs, "mail");
+    let rx = parked_log_await(&h, &store, "mail");
     let line = format!("{sid} off=7 from=h-a kind=task trust=human text=SENTINEL%20BODY");
     assert_eq!(
         crate::fabric::cmd_deliver_waking(&store, &line, &wake),
@@ -802,14 +775,8 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     // NEGATIVE CONTROL: the same offset again is the same row.
     let _ = crate::fabric::cmd_deliver_waking(&store, &line, &wake);
     // A post, then its landing.
-    let session_wake = || wake(&h.ctx.self_id);
-    let rx = parked_log_await(&h, &store, &subs, "mail");
-    let post = crate::fabric::cmd_post_waking(
-        &h.ctx,
-        "to=@s-peer kind=ask --wait=0 SENTINEL-POST",
-        None,
-        &session_wake,
-    );
+    let rx = parked_log_await(&h, &store, "mail");
+    let post = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=ask --wait=0 SENTINEL-POST", None);
     // Queued whether or not a bridge is up (`ERR fabric absent id=1` here).
     assert!(
         post.starts_with("OK 1") || post.contains(" id=1 "),
@@ -817,7 +784,7 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     );
     let reply = returned(&rx, "post");
     assert!(reply.contains(" mark - mail dir=out kind=ask "), "{reply}");
-    let rx = parked_log_await(&h, &store, &subs, "mail-landed");
+    let rx = parked_log_await(&h, &store, "mail-landed");
     let landed = format!("{sid} landed=1 off=9");
     assert_eq!(
         crate::fabric::cmd_deliver_waking(&store, &landed, &wake),
@@ -829,18 +796,18 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
         "{reply}"
     );
     // Inbox seen.
-    let rx = parked_log_await(&h, &store, &subs, "mail-seen");
-    let seen = crate::fabric::cmd_inbox_seen_waking(&h.ctx, "1 handled", &session_wake);
+    let rx = parked_log_await(&h, &store, "mail-seen");
+    let seen = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
     assert!(seen.starts_with("OK seen=1"), "{seen}");
     let reply = returned(&rx, "inbox seen");
     assert!(
         reply.contains(" mark - mail-seen inbox=1 word=handled "),
         "{reply}"
     );
-    let _ = crate::fabric::cmd_inbox_seen_waking(&h.ctx, "1 handled", &session_wake);
+    let _ = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
     // The hold, on and off.
     for (state, word) in [("on reason=demo", "on"), ("off", "off")] {
-        let rx = parked_log_await(&h, &store, &subs, "hold");
+        let rx = parked_log_await(&h, &store, "hold");
         let reply = crate::fabric::cmd_hold_waking(
             &store,
             &format!("{sid} {state}"),
@@ -949,7 +916,7 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
         assert_eq!(store(&line), "OK 1\n", "the delivery");
     };
     // The real hook: the row and its mark.
-    let (h, store, _subs) = fabric_rig(24);
+    let (h, store) = fabric_rig(24);
     deliver(
         &|l| crate::fabric::cmd_deliver_waking(&store, l, &|_| {}),
         h.ctx.self_id.as_str(),
@@ -1009,13 +976,13 @@ fn meta_marks(ctx: &crate::SessionCtx) -> Vec<String> {
 /// CONTROL: the same value again moves nothing and writes no mark.
 #[test]
 fn the_meta_writers_mark_the_log_by_their_writer() {
-    let (h, store, subs) = fabric_rig(31);
-    let rx = parked_log_await(&h, &store, &subs, "meta");
+    let (h, store) = fabric_rig(31);
+    let rx = parked_log_await(&h, &store, "meta");
     let reply =
         crate::control::meta_line_for_test(&store, &h.term, h.local_id, &h.ctx, "set role builder");
     assert_eq!(reply, "OK\n");
     // The arm's own wake (`handle`'s `meta` closure notifies the session).
-    crate::control::wake_sid_watchers(&store, &subs, &h.ctx.self_id);
+    crate::control::wake_sid_watchers(&store, &h.ctx.self_id);
     let got = returned(&rx, "meta set");
     assert!(
         got.contains(" mark - meta field=role value=builder by=ctl src=meta conf=exact "),
@@ -1078,7 +1045,7 @@ fn the_meta_writers_mark_the_log_by_their_writer() {
 fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
     let owner = aterm_agent::supervise::run::ATTENTION_OWNER;
-    let (h, store, _subs) = fabric_rig(32);
+    let (h, store) = fabric_rig(32);
     let reply = crate::control::meta_line_for_test(
         &store,
         &h.term,
@@ -1177,7 +1144,7 @@ fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
 fn the_supervisors_attention_text_reaches_no_record() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
     let owner = aterm_agent::supervise::run::ATTENTION_OWNER;
-    let (h, store, _subs) = fabric_rig(34);
+    let (h, store) = fabric_rig(34);
     let text = "claude bash: grep -rn SENTINEL-ATTENTION ./notes (needs a person)";
     assert_eq!(
         write_attention_owned(
@@ -1313,7 +1280,7 @@ fn a_successor_restoring_the_same_meta_writes_no_mark() {
 fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
     use crate::session_timeline::{MetaEdit, claim_supervisor_as, release_proven_if_gone};
     let owner = aterm_agent::supervise::run::ATTENTION_OWNER;
-    let (h, _store, _subs) = fabric_rig(33);
+    let (h, _store) = fabric_rig(33);
     let _ = crate::session_timeline::write_attention_owned(
         &h.ctx,
         owner,
@@ -1392,7 +1359,7 @@ fn a_told_story_is_one_mark_by_its_teller_and_no_text() {
         .session;
     let ctx = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx);
     let _ = ctx.timeline.lock().unwrap().slog_take_wake();
-    let sub = watching(&app.subscribers, session);
+    let sub = watching(&app, session);
     let told = app.tell_story_by(
         session,
         aterm_messages::presence::StoryVerb::Chose,
@@ -1427,5 +1394,220 @@ fn a_meta_change_has_one_writer() {
     let _ = tl.record(
         crate::session_timeline::META_CHANGE,
         "field=role value=x".to_string(),
+    );
+}
+
+// ---- 6C-1: a harness relaunch lifts the failure it caused ----------------
+
+/// The session's failure needs, and its `mark - seen by=harness` lines.
+fn failures_and_harness_seen(
+    tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+) -> (usize, usize) {
+    let g = tl.lock().unwrap();
+    let failures = g
+        .slog()
+        .log()
+        .state()
+        .needs
+        .iter()
+        .flatten()
+        .filter(|n| n.word == "failure")
+        .count();
+    let seen = lines(g.slog().log())
+        .iter()
+        .filter(|l| l.contains(" mark - seen by=harness src=aterm conf=strong "))
+        .count();
+    (failures, seen)
+}
+
+/// The relaunch's act at `ms` into the test, as the hosted lanes' row
+/// writer writes it (`harness_host::log_act`) for a step that brought a new
+/// agent process up (`upgrade_drive::started`).
+fn relaunch_at(
+    tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    hand: &super::super::tests::Hand,
+    ms: u64,
+) {
+    hand.set(ms);
+    let mut g = tl.lock().unwrap();
+    let now = g.slog().now();
+    g.slog_mut().observe_relaunch_act("relaunch", true, now);
+}
+
+/// `claude` in front (group `pgid`) of the running block `blk` begun at
+/// `start`, at `ms`: the sweep its name wakes opens its `agent` run under
+/// that block's `cmd` run, as the resolver and the status sweep do.
+fn claude_in_front(
+    tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    hand: &super::super::tests::Hand,
+    ms: u64,
+    (blk, start, pgid): (u64, u64, i32),
+) {
+    hand.set(ms);
+    let mut g = tl.lock().unwrap();
+    assert!(g.note_foreground_group(pgid));
+    assert!(g.set_program(pgid, Some("claude".into())));
+    let _ = g.sweep_slog(&running(blk, start, "claude"), false, 100, pgid);
+    assert!(
+        lines(g.slog().log())
+            .iter()
+            .any(|l| l.contains(" agent par=") && l.contains(" prog=claude agent=claude ")),
+        "the agent's run opened: {:?}",
+        lines(g.slog().log())
+    );
+}
+
+/// (a) A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED (Phase 6 step 6C-1,
+/// ruling U3): the old `claude` command, an agent in front of it, ends 143
+/// (`need=failure` on its run), the relaunched `claude` opens a new `cmd`
+/// run, and the relaunch's act writes `mark - seen by=harness src=aterm
+/// conf=strong` after it, so no failure need is left and `brief` names none.
+#[test]
+fn a_relaunch_lifts_the_failure_it_caused() {
+    let (tl, hand) = opened();
+    blocks(&tl, &hand, 150, &running(0, 100, "claude"));
+    claude_in_front(&tl, &hand, 160, (0, 100, 300));
+    blocks(&tl, &hand, 400, &finished(0, Some(143), 100, 300, "claude"));
+    assert_eq!(failures_and_harness_seen(&tl), (1, 0), "PRECONDITION");
+    blocks(&tl, &hand, 600, &running(1, 500, "claude"));
+    claude_in_front(&tl, &hand, 650, (1, 500, 301));
+    relaunch_at(&tl, &hand, 700);
+    assert_eq!(
+        failures_and_harness_seen(&tl),
+        (0, 1),
+        "{:?}",
+        lines_of(&tl)
+    );
+    let got = lines_of(&tl);
+    let tail: Vec<&str> = got
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .map(|l| l.split_once(' ').map_or("", |(_, b)| b))
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            format!(
+                "mark - act word=relaunch rule=relaunch by=harness src=aterm conf=strong t={}",
+                super::super::tests::WALL0 + 700
+            ),
+            format!(
+                "mark - seen by=harness src=aterm conf=strong t={}",
+                super::super::tests::WALL0 + 700
+            ),
+        ],
+        "the act, then the seen: {got:?}"
+    );
+    let brief = crate::session_log::render_brief(
+        tl.lock().unwrap().slog().log(),
+        "s-x",
+        Node::SESSION,
+        None,
+        4000,
+        super::super::tests::WALL0 + 800,
+    );
+    assert!(!brief.contains("need=failure"), "{brief}");
+}
+
+/// (b) NEGATIVE CONTROLS: a relaunch's act written while no newer run of
+/// the failed kind is open writes no `seen`. Before the old run's end is
+/// read there is no failure to lift, and the 143 close that follows raises
+/// the need; with the need standing and still no newer run open, a second
+/// act lifts nothing either.
+#[test]
+fn a_relaunch_with_no_newer_run_open_lifts_nothing() {
+    let (tl, hand) = opened();
+    blocks(&tl, &hand, 150, &running(0, 100, "claude"));
+    claude_in_front(&tl, &hand, 160, (0, 100, 300));
+    relaunch_at(&tl, &hand, 200);
+    assert_eq!(failures_and_harness_seen(&tl), (0, 0), "nothing to lift");
+    blocks(&tl, &hand, 400, &finished(0, Some(143), 100, 300, "claude"));
+    assert_eq!(
+        failures_and_harness_seen(&tl),
+        (1, 0),
+        "the 143 close that follows raises the need"
+    );
+    relaunch_at(&tl, &hand, 500);
+    assert_eq!(
+        failures_and_harness_seen(&tl),
+        (1, 0),
+        "no newer run open: {:?}",
+        lines_of(&tl)
+    );
+}
+
+/// (d) TWO FAILURES: a `seen` lifts every failure need, so a relaunch beside
+/// a second failure writes none and both stand (the session did fail).
+/// Two `cmd` failures never stand together (the second's close lifts the
+/// first, `lifts_failure`), so the second is a program run's, written into
+/// the log as a producer of `prog` runs would. NEGATIVE CONTROL (the plan's,
+/// run by scratch revert): a guard that checks only N writes the `seen` and
+/// erases the program run's failure.
+#[test]
+fn a_relaunch_beside_a_second_failure_lifts_neither() {
+    use aterm_slog::{Close, Open, Out, RunOut};
+    let (tl, hand) = opened();
+    blocks(&tl, &hand, 150, &running(0, 100, "claude"));
+    claude_in_front(&tl, &hand, 160, (0, 100, 300));
+    blocks(&tl, &hand, 400, &finished(0, Some(143), 100, 300, "claude"));
+    {
+        let mut g = tl.lock().unwrap();
+        let log = g.slog_mut().log_mut_for_tests();
+        let prog = log
+            .open(
+                Open::new(Kind::Prog, Src::Status, Conf::Strong),
+                super::super::tests::at(410),
+            )
+            .expect("a program run");
+        log.close(
+            prog,
+            Close::new(Out::Run(RunOut::Fail), Src::Status, Conf::Exact),
+            super::super::tests::at(420),
+        )
+        .expect("it fails");
+    }
+    assert_eq!(failures_and_harness_seen(&tl), (2, 0), "PRECONDITION");
+    blocks(&tl, &hand, 600, &running(1, 500, "claude"));
+    relaunch_at(&tl, &hand, 700);
+    assert_eq!(
+        failures_and_harness_seen(&tl),
+        (2, 0),
+        "both failures stand: {:?}",
+        lines_of(&tl)
+    );
+}
+
+/// (f) A RESTART LIFTS NO FAILURE OF A COMMAND THAT RAN NO AGENT (the
+/// relaunch did not cause it): `make` ends 2 before the person starts
+/// `claude`, which is in front of its own command when the harness's
+/// restart step comes. The failure is the session's only one, its run is
+/// closed and a newer `cmd` run is open, but no agent ran under `make`, so
+/// the act is written and no `seen`: the need stands until a later command
+/// ends, as 3B's rule says. NEGATIVE CONTROL (by scratch revert): a guard
+/// that does not ask whether an agent ran under the failed run writes the
+/// `seen` and erases `make`'s failure.
+#[test]
+fn a_restart_lifts_no_failure_of_a_command_that_ran_no_agent() {
+    let (tl, hand) = opened();
+    blocks(&tl, &hand, 150, &running(0, 100, "make"));
+    blocks(&tl, &hand, 400, &finished(0, Some(2), 100, 300, "make"));
+    assert_eq!(failures_and_harness_seen(&tl), (1, 0), "PRECONDITION");
+    blocks(&tl, &hand, 600, &running(1, 500, "claude"));
+    claude_in_front(&tl, &hand, 650, (1, 500, 300));
+    relaunch_at(&tl, &hand, 700);
+    assert_eq!(
+        failures_and_harness_seen(&tl),
+        (1, 0),
+        "make's failure stands: {:?}",
+        lines_of(&tl)
+    );
+    assert!(
+        lines_of(&tl)
+            .iter()
+            .any(|l| l.contains(" mark - act word=relaunch rule=relaunch by=harness ")),
+        "the act is still written: {:?}",
+        lines_of(&tl)
     );
 }

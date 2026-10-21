@@ -202,6 +202,10 @@ aterm-gui-documents = { workspace = true }
 # forms the `edit` and `await edit` verbs serve, the edit request and ticket
 # replies and the file-URI codec (`amacs::protocol`).
 amacs = { workspace = true }
+# The document host and its pure persistence contracts (admission, atomic save,
+# the advisory-lock door), shared with amacs's terminal face and re-exported
+# under their old module names.
+amacs-files = { workspace = true }
 # The access card's decision and words, its marker files and the durability
 # flushes, extracted below this crate and re-exported under their old
 # module names.
@@ -260,7 +264,7 @@ aterm-gpu = { workspace = true }
 # Cmd-F find bar: back the find over the live screen + scrollback with the shared
 # trigram/Bloom search engine instead of a hand-rolled scan (app_search.rs).
 aterm-search = { workspace = true }
-# build_info: FxHash the running binary into a content signature (no crypto dep).
+# build_info: FxHash the running binary into a content signature off macOS (no crypto dep).
 aterm-hash = { workspace = true }
 # POL-1: install a default OSC policy. NO FEATURES — the winit→engine key map
 # this used to enable here (`features = ["winit-keymap"]`) is its own crate now,
@@ -351,7 +355,8 @@ aterm-tempfile = { workspace = true }
 # the host with its closure (ring under a second feature set, so a second C/asm
 # build-script run; aterm-types), 7.8 unit-s of a clean mac dev build, to read
 # one constant.
-# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# Standard padded Base64 — first-party; its one dependency is astream-wire
+# (dependency-free, vendor/astream). `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
@@ -370,14 +375,14 @@ aterm-winres = { workspace = true }
 # `verify perf throughput`'s corpus, for the `c_cut_cost` bench (a lib with no
 # dependencies of its own).
 aterm-bench = { path = "../aterm-bench" }
-# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
-# build too.
-aterm-durable = { workspace = true, features = ["test-support"] }
+# The engine's own parser, the oracle the byte arm's C-cut scan is held to
+# (`holder_image`'s tests: where it dispatches each OSC 133/633 C).
+aterm-parser = { workspace = true }
+aterm-provenance = { workspace = true }
 # Scratch home directories for the auto-prime pass test (spawn.rs): the pass
 # must be driven against a directory that is NOT the developer's real $HOME;
-# and the harness tests' stand-in programs (`stand_in`, in an optimized test
-# build too).
-aterm-tempfile = { workspace = true, features = ["test-support"] }
+# and the harness tests' stand-in programs (`stand_in`).
+aterm-tempfile = { workspace = true }
 
 # Tier-1 conformance: bind the real `App` window lifecycle to the ty-proven
 # `window_routing_model()`. Same model that is Tier-0 `ty check`ed in
@@ -459,8 +464,9 @@ aterm-keeper = { workspace = true }
 # each session's region layout, its single-writer protocols and keyframe policy,
 # and the panic-free recovery a restoring window runs over a dead window's
 # region. Headless (no file, thread, socket or clock); the window creates and
-# maps the region (aterm-uds) and runs its threads. Local only: the census
-# guard `restore-stays-local` keeps it out of every fabric or network crate.
+# maps the region (aterm-uds) and runs its threads. Local only: no control verb
+# reads a region, and the census guard `restore-stays-local` keeps it out of the
+# closure of every crate that carries bytes off the host.
 aterm-restore = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -540,6 +546,11 @@ aterm-a11y = { workspace = true }
 # as of W13 it carries every macOS site this crate has. Not optional and not
 # feature-gated: it is the shipping path.
 aterm-objc = { workspace = true }
+
+# The `window` capture's `CGImage` layout reads (`app_introspect.rs`'s AppKit
+# chrome copy, `lib.rs`'s `cg_capture`), which `aterm-cg` holds to the SDK.
+# CoreGraphics is linked here by AppKit already, so the crate adds no framework.
+aterm-cg = { workspace = true }
 
 # The macOS display-free event loop (`--headless`), driven on the MAIN thread —
 # which libtest never gives a test — so a `main` of its own. It checks the loop

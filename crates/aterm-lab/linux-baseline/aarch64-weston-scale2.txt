@@ -1,21 +1,22 @@
 # aterm Linux lane baseline (LW.4): aarch64 (native) under weston-scale2 (Wayland)
 # = behaviour, compared exactly by the replay; ~ measured, shown when it moves; @ the stack
 # replay: targo --unverified lab linux baseline --arch aarch64 --screen weston-scale2 (add --record to rewrite this file)
-# not-driven.resize.os no-resize-tool: no headless Wayland compositor here resizes a client from outside (no window manager tooling)
-# not-driven.clipboard no-seat: weston's headless backend advertises no wl_seat, and a Wayland selection is set with a seat's serial (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
-# not-driven.keyrepeat no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
-# not-driven.compose no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
-# not-driven.text-input-v3 v1-only: weston 13 offers zwp_text_input_manager_v1 only, which the winit fork does not bind
-# not-driven.header.gestures no-seat: the frame's move, resize and window menu take a press's serial from a seat, and weston's headless backend has none (header.maximize is driven: maximize takes no serial)
-# not-driven.dnd no-seat: weston's headless backend advertises no wl_seat, and a drag starts from a seat's pointer (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
+# not-driven.resize.os no-resize-tool: weston's headless backend has no seat, so no binding of its own reaches the window, and no tool here resizes a Wayland client from outside (Mutter's is driven, resize.os.tiled-left, and weston-x11's, resize.os.maximized from its seat)
+# not-driven.clipboard no-seat: weston's headless backend advertises no wl_seat, and a Wayland selection is set with a seat's serial (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.keyrepeat no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.compose no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.text-input-v3 v1-only: weston 13 offers zwp_text_input_manager_v1 only, which aterm-window does not bind
+# not-driven.header.gestures no-seat: the frame's move, resize and window menu take a press's serial from a seat, and weston's headless backend has none (header.maximize is driven: maximize takes no serial; the weston-x11 screen drives the gestures from its x11 backend's seat)
+# not-driven.dnd no-seat: weston's headless backend advertises no wl_seat, and a drag starts from a seat's pointer (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.touch no-seat: weston's headless backend advertises no wl_seat, so no touch reaches a client; Mutter's is driven, through a RemoteDesktop finger
 @ crate.aterm-dl 0.106.0 (path)
 @ crate.aterm-wayland 0.106.0 (path)
+@ crate.aterm-window 0.30.13 (path)
 @ crate.aterm-x11 0.106.0 (path)
 @ crate.aterm-xkb 0.106.0 (path)
 @ crate.softbuffer 0.4.8
 @ crate.wgpu 29.0.3
 @ crate.wgpu-hal 29.0.3
-@ crate.winit 0.30.13 (path)
 = start.dims 24x80 scale=2.00 cell_w=18 cell_h=40 font_px=30.00 window_rows=24 window_cols=80 grid_w=1440 grid_h=960 frame_w=1488 frame_h=1056 surface_w=1488 surface_h=1056 offset_x=0 offset_y=0 band_left=0 band_right=0 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=24 pad_top=4 pad_bottom=24 head=28 tab_rows=1
 = echo typed `echo LANE-$((6*7))`, LANE-42 appeared
 = atspi.walk.start apps 1
@@ -32,9 +33,9 @@
 = status render=ok resizes=4
 ~ status.flaps 0
 = resizes.1 1 ord=1 from=80x24 to=100x30 alt=0 sync=0 site=input win=100x30 chrome=1
-~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=6 restored=0 shift=+0 cut=0 site=input win=100x30 chrome=1
+~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=100x30 chrome=1
 = resizes.2 2 ord=2 from=100x30 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
-~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=6 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
+~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
 = resizes.3 3 ord=3 from=80x24 to=80x23 alt=0 sync=0 site=input win=80x23 chrome=1
 ~ resizes.3.rows 3 run=3 ord=3 from=80x24 to=80x23 alt=0 sync=0 trimmed=1 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x23 chrome=1
 = resizes.4 4 ord=4 from=80x23 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
@@ -61,6 +62,7 @@
 = not-driven.text-input-v3 v1-only
 = not-driven.header.gestures no-seat
 = not-driven.dnd no-seat
+= not-driven.touch no-seat
 = atspi.walk.end apps 1
 = atspi.walk.end.1 depth=0 role=application name="aterm-gui" description="" states=- interfaces=Accessible,Application attributes=ERR(org.freedesktop.DBus.Error.UnknownMethod:_Unknown_method_'GetAttributes') children=1 child_count=1
 ~ atspi.path.end.1 /org/a11y/atspi/accessible/root
@@ -71,7 +73,7 @@
 @ gpu llvmpipe (LLVM 20.1.2, 128 bits) (Gl)
 ~ present.software software rendering (llvmpipe (LLVM 20.1.2, 128 bits) (Gl)): n_present=8 present_p50/p95/p99_ms=13.63/335.54/335.54
 ~ input.software n_input=2 input_p50/p95/p99_ms=46.14/335.54/335.54
-~ present.slowest 304.93 ms, ending in echo +341 ms; gap 0.00 ms; max_frame_render_ms=301.75 max_redraw_total_ms=304.84 max_turn_ms=305.10 max_turn_owner=window_event
+~ present.slowest 308.12 ms, ending in echo +353 ms; gap 0.00 ms; max_frame_render_ms=304.94 max_redraw_total_ms=308.03 max_turn_ms=308.30 max_turn_owner=window_event
 = atspi.events.kinds Object.BoundsChanged@terminal Object.ChildrenChanged:add@application Object.TextChanged:delete@terminal Object.TextChanged:insert@terminal
 = atspi.events.text the text changes undo cleanly from the end walk's text; no caret event
 ~ atspi.events.count 16

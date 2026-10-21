@@ -294,3 +294,80 @@ fn the_escort_keeps_off_the_words_it_leads() {
         assert_eq!(m.brace, 0, "{ms} ms/key: typing braced the escort");
     }
 }
+
+/// A held backspace frightens the cat once, and then it follows the caret
+/// back. The bottle used to be held open by every delete: through a 1.6 s
+/// key repeat at 30 a second the cat stood startled in 96 % of the frames
+/// while the caret ran 55 cells away, and caught up in bounds (review of
+/// `fix/kitty-jitter`, 2026-10-20). A run of deletes bottles once, for the
+/// bottle's own hold: the cat is startled in under a third of the hold's
+/// frames, never falls more than 30 cells behind, and holding a key forward
+/// after it is walked or run, not leapt, most of the way.
+#[test]
+fn a_held_backspace_frightens_the_cat_once_and_it_follows() {
+    use aterm_effects::kitty_pet::PetAction;
+    let mut f = Fx::new();
+    let mut seen: Vec<(f32, u16, PetAction, &str)> = Vec::new();
+    let step = |f: &mut Fx, phase: &'static str, seen: &mut Vec<(f32, u16, PetAction, &str)>| {
+        let fr = f.tick(TICK_MS);
+        seen.push((fr.col, f.term.cursor().col, fr.action, phase));
+    };
+    for &ch in b"the quick brown fox jumps over the lazy dog and keeps on running far" {
+        f.key(ch);
+        for _ in 0..80 / TICK_MS {
+            step(&mut f, "type", &mut seen);
+        }
+    }
+    for _ in 0..60 {
+        step(&mut f, "rest", &mut seen);
+    }
+    // Key repeat: a delete every four 16 ms frames, fifty of them.
+    for _ in 0..50 {
+        f.brain.note_console_input(f.now, PetInputKind::Delete);
+        f.term.process(b"\x08\x1b[K");
+        for _ in 0..4 {
+            step(&mut f, "back", &mut seen);
+        }
+    }
+    for _ in 0..60 {
+        step(&mut f, "after", &mut seen);
+    }
+    for _ in 0..50 {
+        f.key(b'j');
+        for _ in 0..4 {
+            step(&mut f, "forward", &mut seen);
+        }
+    }
+    let phase = |name: &str| -> Vec<(f32, u16, PetAction)> {
+        seen.iter()
+            .filter(|s| s.3 == name)
+            .map(|s| (s.0, s.1, s.2))
+            .collect()
+    };
+    let back = phase("back");
+    let startled = back.iter().filter(|s| s.2 == PetAction::Startle).count();
+    assert!(startled > 0, "fixture: the held delete frightens the cat");
+    assert!(
+        startled * 3 < back.len(),
+        "the cat stood startled in {startled} of the hold's {} frames",
+        back.len()
+    );
+    let behind = back
+        .iter()
+        .map(|s| (s.0 - f32::from(s.1)).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        behind <= 30.0,
+        "the caret ran {behind:.1} cells from the cat"
+    );
+    let forward = phase("forward");
+    let airborne = forward
+        .iter()
+        .filter(|s| matches!(s.2, PetAction::Leap | PetAction::Land | PetAction::Crouch))
+        .count();
+    assert!(
+        airborne * 2 < forward.len(),
+        "holding a key forward after it, the cat leapt in {airborne} of {} frames",
+        forward.len()
+    );
+}

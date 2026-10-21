@@ -8,7 +8,8 @@
 
 //! The face the shaper reads: an [`crate::Face`] (with its variation
 //! instance already set), the `cmap` subtable upstream prefers, and the
-//! `GSUB` lookups, each parsed the first time a plan applies it.
+//! `GSUB` lookups, all parsed the first time a shape reaches one, within one
+//! budget for the face ([`LayoutWork`]).
 
 use std::cell::OnceCell;
 
@@ -16,6 +17,7 @@ use super::buffer::glyph_props;
 use super::digest::Digest;
 use crate::gsub::SubstitutionSubtable;
 use crate::opentype_layout::{Coverage, LayoutTable, LookupIndex};
+use crate::work::LayoutWork;
 use crate::{Face, GlyphId, PlatformId};
 
 const WINDOWS_SYMBOL_ENCODING: u16 = 0;
@@ -46,22 +48,25 @@ pub(crate) struct SubstLookup<'a> {
 }
 
 /// A face set up for shaping. Building one parses nothing but the `cmap`
-/// directory; lookups are parsed when a shape first reaches them.
+/// directory; the `GSUB` lookups are parsed together when a shape first
+/// reaches one.
 pub struct ShapeFace<'a> {
     pub(crate) face: Face<'a>,
     cmap_subtable: Option<u16>,
-    lookups: Vec<OnceCell<Option<SubstLookup<'a>>>>,
+    /// Every `GSUB` lookup (`None` for one that does not parse), or `None`
+    /// for the whole table once the parse runs past its budget
+    /// ([`LayoutWork`]): `GSUB` is then dropped for the face.
+    lookups: OnceCell<Option<Vec<Option<SubstLookup<'a>>>>>,
 }
 
 impl<'a> ShapeFace<'a> {
     /// Wraps `face`, at whatever variation instance it was given.
     pub fn new(face: Face<'a>) -> Self {
-        let count = face.tables().gsub.map_or(0, |gsub| gsub.lookups.len());
         let cmap_subtable = find_best_cmap_subtable(&face);
         ShapeFace {
             face,
             cmap_subtable,
-            lookups: (0..count).map(|_| OnceCell::new()).collect(),
+            lookups: OnceCell::new(),
         }
     }
 
@@ -79,13 +84,38 @@ impl<'a> ShapeFace<'a> {
         self.face.tables().gsub.as_ref()
     }
 
+    /// Lookup `index`; `None` when it does not parse, and for every lookup
+    /// when the face's `GSUB` is refused.
     pub(crate) fn gsub_lookup(&self, index: LookupIndex) -> Option<&SubstLookup<'a>> {
-        let cell = self.lookups.get(usize::from(index))?;
-        cell.get_or_init(|| {
-            let lookup = self.gsub()?.lookups.get(index)?;
-            Some(SubstLookup::parse(lookup))
-        })
-        .as_ref()
+        self.gsub_lookups()?.get(usize::from(index))?.as_ref()
+    }
+
+    /// Every `GSUB` lookup, parsed on the first call, the lookups no feature
+    /// names (reached only through a nested lookup) included. So the budget
+    /// refuses a table before any of it applies, and every shape of the face
+    /// reads the same lookups: parsing only what a plan names would leave a
+    /// nested lookup to run past the budget mid-shape, after the lookups
+    /// before it had applied. Each lookup is parsed once: one traversal.
+    fn gsub_lookups(&self) -> Option<&[Option<SubstLookup<'a>>]> {
+        self.lookups
+            .get_or_init(|| {
+                let gsub = self.gsub()?;
+                let len = self
+                    .face
+                    .raw_face()
+                    .table(crate::Tag::from_bytes(b"GSUB"))
+                    .map_or(0, <[u8]>::len);
+                let work = LayoutWork::for_table(len, 1);
+                let mut lookups = Vec::with_capacity(usize::from(gsub.lookups.len()));
+                for index in 0..gsub.lookups.len() {
+                    lookups.push(match gsub.lookups.get(index) {
+                        Some(lookup) => Some(SubstLookup::parse(lookup, &work)?),
+                        None => None,
+                    });
+                }
+                Some(lookups)
+            })
+            .as_deref()
     }
 
     pub(crate) fn has_glyph(&self, c: u32) -> bool {
@@ -173,27 +203,36 @@ impl<'a> ShapeFace<'a> {
 }
 
 impl<'a> SubstLookup<'a> {
-    fn parse(lookup: crate::opentype_layout::Lookup<'a>) -> Self {
-        let subtables: Vec<SubstitutionSubtable<'a>> = lookup
-            .subtables
-            .into_iter::<SubstitutionSubtable>()
-            .collect();
+    /// The lookup's subtables and their digest, each subtable and coverage
+    /// entry spending one unit of `work`; `None` when it runs out.
+    fn parse(lookup: crate::opentype_layout::Lookup<'a>, work: &LayoutWork) -> Option<Self> {
+        let mut subtables: Vec<SubstitutionSubtable<'a>> = Vec::new();
         let mut digest = Digest::new();
-        let mut reverse = !subtables.is_empty();
-        for subtable in &subtables {
-            collect_coverage(&subtable.coverage(), &mut digest);
-            reverse &= subtable.is_reverse();
+        for subtable in lookup.subtables.into_iter::<SubstitutionSubtable>() {
+            let coverage = subtable.coverage();
+            work.spend(1 + coverage_len(&coverage))?;
+            collect_coverage(&coverage, &mut digest);
+            subtables.push(subtable);
         }
+        let reverse = !subtables.is_empty() && subtables.iter().all(|s| s.is_reverse());
         let mut props = u32::from(lookup.flags.0);
         if let Some(set) = lookup.mark_filtering_set {
             props |= u32::from(set) << 16;
         }
-        SubstLookup {
+        Some(SubstLookup {
             subtables,
             digest,
             reverse,
             props,
-        }
+        })
+    }
+}
+
+/// How many entries (glyphs or ranges) `coverage` lists.
+fn coverage_len(coverage: &Coverage<'_>) -> u64 {
+    match *coverage {
+        Coverage::Format1 { glyphs } => u64::from(glyphs.len()),
+        Coverage::Format2 { records } => u64::from(records.len()),
     }
 }
 

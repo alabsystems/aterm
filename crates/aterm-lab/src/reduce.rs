@@ -22,10 +22,27 @@
 //!   row), and so do a question's words keying its answer and an MCP
 //!   result's own keys. A key that is an id is REMAPPED as that id (below);
 //! - row order, `null`, the booleans, and the numbers as written;
-//! - the closed words the readers read ([`CLAUDE_WORDS`], [`CODEX_WORDS`]:
-//!   `type`, `subtype`, `version`, `model`, `effort`, a notice's `error` and
-//!   `apiError`, …), each only while it is a word ([`is_word`]: no space, at
-//!   most [`WORD_MAX`] bytes).
+//! - THE CLOSED WORDS A READER READS (ruling U7). A candidate is a word
+//!   ([`is_word`]: no space, at most [`WORD_MAX`] bytes) under a key of
+//!   [`CLAUDE_WORDS`] or [`CODEX_WORDS`] (`type`, `subtype`, `version`,
+//!   `model`, `effort`, a notice's `error` and `apiError`, …), outside a free
+//!   subtree; those lists only filter candidates. The COMMITTED READERS
+//!   decide which are kept ([`Readings`]: the step folds, each notice as
+//!   the wall check reads it, the standing limit, the login wall,
+//!   [`FinishedScan`], the spend fold and the limits reader, and every row
+//!   as the harness's shapes read it, [`claude_reads`] and [`codex_reads`]):
+//!   a `(key, word)` pair is kept only when blanking it changes a reading
+//!   ([`Candidates::by_readings`]: the pairs needed alone, then each other
+//!   pair put back in the order the file first names them until the
+//!   readings are the source's, then each kept pair dropped again while
+//!   they stay so), and a file nothing restores is refused. So
+//!   `"mode":"normal"` on a row no reader opens goes, a `turn_duration`'s
+//!   `subtype` and a limit notice's `error` stay. What the verb writes reads
+//!   as its source ([`reads_as`]: the folds, each notice, the standing
+//!   limit, the login wall and the limits after every row, times one
+//!   shift, ids one to one), and each word it keeps, blanked alone, changes
+//!   its readings ([`unread_words`]), or nothing is written
+//!   ([`check_written`]).
 //!
 //! REBASED by whole days, so the first row is dated [`BASE_DAY`]: a row's
 //! `timestamp` (its time of day and zone as written, and only when the
@@ -78,14 +95,21 @@
 //!
 //! The reduction opens with one `#` line of its own, as the repository's
 //! fixtures do; a `#` line of the source (a fixture's header) is dropped.
-//! A line that is not one JSON value refuses the whole file.
+//! A source that is itself a reduction (its `#` line is one [`header`]
+//! wrote) is said so in the new line, whose day count is then the whole
+//! move from the first source (ruling U8), so a reduction reduced again is
+//! itself. A line that is not one JSON value refuses the whole file.
 //!
 //! Its proof is its tests (`reduce_tests.rs`): over every `supervise/fixtures`
 //! transcript the reduction folds as its source (the same steps, ids one to
 //! one, times one shift, the same walls and end), every notice classes as
-//! its source's, and no 8-byte run of any source string survives outside
-//! the kept vocabulary: no value, no key inside a free subtree, and no
-//! stamp's tail. Apart from [`opens_free`], the check finds a tool's
+//! its source's, the harness reads each reduction as its source (the login
+//! wall, the standing limit, the model, the last answer, the resumed build,
+//! the finish and the task after every row, and each notice as the wall
+//! check reads it), the committed 2.1.303 reduction reads its usage limit
+//! as the harness does, and no 8-byte run of any source string survives
+//! outside the kept vocabulary: no value, no key inside a free subtree, and
+//! no stamp's tail. Apart from [`opens_free`], the check finds a tool's
 //! arguments by their shape (a JSON schema's `properties`, a `…tool_use`
 //! part's `input`, what a map keyed by a call's id holds) wherever they
 //! sit: no argument name may be kept as written, and no word there. And it
@@ -97,16 +121,33 @@
 //! `progress` row nests, an MCP result's keys, a server tool's input, a
 //! tracked file's name, words after a stamp, a call's id keying a map) and
 //! a planted Codex rollout (a `parsed_cmd` read naming a file) keep none of
-//! their words. Negative controls: a reducer that keeps content, one that
-//! replaces `type`, one that blanks a notice's text, the earlier rules'
-//! reductions of the plant, the committed 2.1.303 reduction's tool list,
-//! and a reducer that keeps any Codex `name` as a tool's each fail.
+//! their words. A planted word no reader reads under a closed key
+//! (`"mode":"quokkaledger"`) is emptied, and every word a reduction keeps
+//! is read ([`unread_words`]). Negative controls: a reducer that keeps
+//! content, one that replaces `type`, one that blanks a notice's text, the
+//! earlier rules' reductions of the plant, a reducer that keeps any Codex
+//! `name` as a tool's, one that keeps every candidate word (the output-side
+//! check, which the verb refuses), one that blanks a word a reader reads
+//! (the fold check, which the verb refuses) and one that blanks a notice's
+//! `error`, `status` or `rateLimitType` (the harness's reading) each fail.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 
-use aterm_agent::harness::steps::{COMPACT, StepId, USER_MARKERS, tool_class};
+use aterm_agent::ai::codex_limits::{CodexLimits, rollout_rate_limits};
+use aterm_agent::harness::codex_rollout::{Row as SpendRow, TurnReader};
+use aterm_agent::harness::codex_steps::CodexStepFold;
+use aterm_agent::harness::steps::{
+    COMPACT, End, NoticeRead, StepEvent, StepFold, StepId, StepState, USER_MARKERS, notice_read,
+    tool_class,
+};
+use aterm_agent::harness::upgrade::{
+    CreditsWord, FinishedScan, LastTurn, LoginScan, StandingLimit, StandingScan, StandingWall,
+};
+use aterm_agent::harness::{claude_reads, codex_reads};
+use aterm_json::Value;
 use aterm_phase::WallKind;
 
 use crate::{Fail, LAB, Res};
@@ -145,10 +186,12 @@ pub const BASE_DAY: (i64, u32, u32) = (2000, 1, 1);
 /// The longest closed word kept.
 pub const WORD_MAX: usize = 64;
 
-/// The keys whose word a Claude Code reader reads: the row's and a part's
+/// The keys a Claude Code word MAY be kept under: the row's and a part's
 /// `type`, the build, the model and effort, a notice's typed fields
 /// (`error`, `apiError`, its quota's words), who asked (`origin.kind`,
-/// `turnOrigin`), a system row's `level`, and the usage figures' words.
+/// `turnOrigin`), a system row's `level`, and the usage figures' words. A
+/// CANDIDATE FILTER only (ruling U7): a word under one is kept when a
+/// reading reads it ([`Candidates::by_readings`]), and goes otherwise.
 pub const CLAUDE_WORDS: &[&str] = &[
     "type",
     "subtype",
@@ -178,14 +221,23 @@ pub const CLAUDE_WORDS: &[&str] = &[
     "mode",
 ];
 
-/// The keys whose word a Codex rollout carries as a closed word. The last
-/// five are as the lab's Codex 0.163.0 rollouts read them (session log 5G,
-/// 2026-10-19; ruling T9 names Codex's keys from a committed reduction,
-/// never a guess): a call's `namespace` (`functions`, `collaboration`: the
-/// step fold's class table reads it beside the `name`), a `turn_aborted`'s
-/// `reason` (`interrupted`), who began a thread or a turn (`thread_source`:
-/// `user`, `subagent`; `turn_trigger`) and the turn's
-/// `collaboration_mode_kind` (`default`).
+/// The keys a Codex rollout's word MAY be kept under, a candidate filter as
+/// [`CLAUDE_WORDS`] is (ruling U7). The five before the last are as the
+/// lab's Codex 0.163.0 rollouts read them (session log 5G, 2026-10-19;
+/// ruling T9 names Codex's keys from a committed reduction, never a guess):
+/// a call's `namespace` (`functions`, `collaboration`: the step fold's class
+/// table reads it beside the `name`), a `turn_aborted`'s `reason`
+/// (`interrupted`), who began a thread or a turn (`thread_source`: `user`,
+/// `subagent`; `turn_trigger`) and the turn's `collaboration_mode_kind`
+/// (`default`). Then a `turn_context`'s `service_tier`, a key that rollout
+/// shows and the spend fold reads (`TurnReader`'s tier, one of the
+/// [`readings`]), so a tier it names is kept; and last the words of a
+/// `token_count`'s `rate_limits` that the limits reader reads
+/// (`ai::codex_limits::rollout_rate_limits`: the family `limit_id` it
+/// needs to read the row at all, its `limit_name`, the credits' `balance`
+/// and an `individual_limit` it reads as a number written as text, and the
+/// `rate_limit_reached_type`), so a reduction's limits read as its
+/// source's.
 pub const CODEX_WORDS: &[&str] = &[
     "type",
     "role",
@@ -206,6 +258,12 @@ pub const CODEX_WORDS: &[&str] = &[
     "thread_source",
     "turn_trigger",
     "collaboration_mode_kind",
+    "service_tier",
+    "limit_id",
+    "limit_name",
+    "balance",
+    "individual_limit",
+    "rate_limit_reached_type",
 ];
 
 /// The keys a Claude Code transcript names an id by (besides any
@@ -605,6 +663,13 @@ pub fn is_ident(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
 }
 
+/// A name the reducer gives a key (`k<n>`), which holds nothing of the key.
+#[must_use]
+pub fn is_key_name(k: &str) -> bool {
+    k.strip_prefix('k')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
 /// A UUID's shape (`8-4-4-4-12` hex digits).
 #[must_use]
 pub fn is_uuid(s: &str) -> bool {
@@ -920,7 +985,8 @@ pub enum Treat {
         )
     )]
     Keep,
-    /// As written while it is a word ([`is_word`]), else replaced.
+    /// A CANDIDATE closed word: as written while it is a word ([`is_word`])
+    /// and a reader reads it ([`Rules::words`], ruling U7), else replaced.
     Word,
     /// Remapped, one to one.
     Id,
@@ -941,6 +1007,17 @@ pub enum Treat {
 pub trait Rules {
     /// What becomes of the string `s` at `at`.
     fn string(&self, at: &At<'_>, s: &str) -> Treat;
+
+    /// Which of the file's candidate closed words its reduction keeps: one
+    /// flag per pair of [`Candidates::pairs`]. The readers decide
+    /// ([`Candidates::by_readings`], ruling U7).
+    ///
+    /// # Errors
+    /// The file is refused: with every candidate kept, its reduction still
+    /// does not read as its source.
+    fn words(&self, c: &Candidates<'_>) -> Result<Vec<bool>, String> {
+        c.by_readings()
+    }
 }
 
 /// THE REDUCTION RULE (P11 as ruling T7 amends it; module docs).
@@ -963,10 +1040,15 @@ impl Rules for P11 {
         }
         match at.program {
             Program::Claude => {
+                // A message's text as its readers read it: its string
+                // content, or any content part's `text`, whatever the part's
+                // `type` says (`wall_confirm`'s `texts`, the step fold's
+                // lead), so a part whose `type` no reader reads, emptied, is
+                // still read and reduced as one (ruling U8: a reduction
+                // reduced again is itself).
                 let message_text = at.path.first().map(String::as_str) == Some("message")
                     && at.path.get(1).map(String::as_str) == Some("content")
-                    && (at.path.len() == 2
-                        || (at.path.len() == 3 && at.part == Some("text") && at.key == "text"));
+                    && (at.path.len() == 2 || (at.path.len() == 3 && at.key == "text"));
                 if at.notice && message_text {
                     return Treat::Notice;
                 }
@@ -1022,14 +1104,23 @@ pub struct Reduction {
     pub notices: usize,
     /// Days every time was moved by.
     pub shift_days: i64,
+    /// Days every time has moved from the first source, through the
+    /// reductions the source was itself made by ([`header`]'s count).
+    pub moved_days: i64,
+    /// The source was itself a reduction (ruling U8).
+    pub again: bool,
     /// The newest build a row named (`version`, Codex's `cli_version`).
     pub build: Option<String>,
+    /// Distinct `(key, word)` candidate pairs ([`Candidates::pairs`]), and
+    /// how many of them the reduction keeps (ruling U7).
+    pub words: (usize, usize),
 }
 
 /// Reduce `source` by [`P11`].
 ///
 /// # Errors
-/// A line is not one JSON value, or a notice reads as no canonical phrase.
+/// A line is not one JSON value, a notice reads as no canonical phrase, or
+/// the reduction cannot read as its source ([`Rules::words`]).
 pub fn reduce(source: &str, program: Program) -> Result<Reduction, String> {
     reduce_with(source, program, &P11)
 }
@@ -1039,8 +1130,58 @@ pub fn reduce(source: &str, program: Program) -> Result<Reduction, String> {
 /// # Errors
 /// As [`reduce`].
 pub fn reduce_with(source: &str, program: Program, rules: &dyn Rules) -> Result<Reduction, String> {
+    let w = walked(source, program, rules)?;
+    let moved = w.before.unwrap_or(0) + w.shift;
+    let rows = w.rows.len();
+    let c = Candidates::new(program, source, w.shift, w.rows, w.pairs, w.sites)?;
+    let keep = rules.words(&c)?;
+    if keep.len() != c.pairs.len() {
+        return Err(format!(
+            "the rule chose {} of {} candidate words",
+            keep.len(),
+            c.pairs.len()
+        ));
+    }
+    let mut text = header(program, w.build.as_deref(), moved, rows, w.before.is_some());
+    text.push('\n');
+    for r in c.lines(&keep) {
+        text.push_str(&r);
+        text.push('\n');
+    }
+    Ok(Reduction {
+        text,
+        rows,
+        comments: w.comments,
+        ids: w.ids,
+        notices: w.notices,
+        shift_days: w.shift,
+        moved_days: moved,
+        again: w.before.is_some(),
+        build: w.build,
+        words: (keep.len(), keep.iter().filter(|k| **k).count()),
+    })
+}
+
+/// A file walked by its rule: its reduction with EVERY candidate closed word
+/// kept ([`Candidates`]), the pairs and where each sits, and what the walk
+/// counted.
+struct Walked {
+    rows: Vec<Node>,
+    pairs: Vec<(String, String)>,
+    sites: Vec<Site>,
+    comments: usize,
+    ids: usize,
+    notices: usize,
+    shift: i64,
+    /// The day count the source's own reduction header names, when the
+    /// source is a reduction ([`moved_before`]).
+    before: Option<i64>,
+    build: Option<String>,
+}
+
+fn walked(source: &str, program: Program, rules: &dyn Rules) -> Result<Walked, String> {
     let mut rows = Vec::new();
-    let mut comments = 0;
+    let (mut comments, mut before, mut named) = (0, None, None);
     for (n, line) in source.lines().enumerate() {
         let t = line.trim();
         if t.is_empty() {
@@ -1048,6 +1189,12 @@ pub fn reduce_with(source: &str, program: Program, rules: &dyn Rules) -> Result<
         }
         if t.starts_with('#') {
             comments += 1;
+            if before.is_none()
+                && let Some(days) = moved_before(t, program)
+            {
+                before = Some(days);
+                named = build_named(t, program);
+            }
             continue;
         }
         rows.push(parse(t).map_err(|e| format!("line {}: not one JSON value ({e})", n + 1))?);
@@ -1065,6 +1212,7 @@ pub fn reduce_with(source: &str, program: Program, rules: &dyn Rules) -> Result<
             .map_err(|e| format!("row {}: {e}", n + 1))?;
     }
     let mut w = Walk::new(program, rules, false, learn.ids.into_keys().collect());
+    w.taken = learn.taken;
     // The first row's own stamp, else the first a row holds anywhere.
     let first = rows
         .iter()
@@ -1100,37 +1248,69 @@ pub fn reduce_with(source: &str, program: Program, rules: &dyn Rules) -> Result<
             .map_err(|e| format!("row {}: {e}", n + 1))?;
         notices += usize::from(state.left.is_some());
         let mut path = Vec::new();
+        w.row = n;
         let reduced = w
             .walk(row, "", &mut path, None, false, false, &mut state)
             .map_err(|e| format!("row {}: {e}", n + 1))?;
-        out_rows.push(reduced.dump());
+        out_rows.push(reduced);
     }
-    let mut text = header(program, build.as_deref(), shift, out_rows.len());
-    text.push('\n');
-    for r in &out_rows {
-        text.push_str(r);
-        text.push('\n');
-    }
-    Ok(Reduction {
-        text,
-        rows: out_rows.len(),
+    Ok(Walked {
+        rows: out_rows,
+        pairs: w.pairs,
+        sites: w.sites,
         comments,
         ids: w.ids.len(),
         notices,
-        shift_days: shift,
-        build,
+        shift,
+        before,
+        // A source reduction's rows may keep no build (no reader read it):
+        // its own line names it.
+        build: build.or(named),
     })
 }
 
 /// A reduction's own `#` line: the program, the build its rows named (a
-/// closed word), the shift and the row count, in fixed words.
+/// closed word), how many days its times have moved from the first source,
+/// the row count, and, for a source that was itself a reduction (`again`),
+/// that it was reduced again (ruling U8), in fixed words.
 #[must_use]
-pub fn header(program: Program, build: Option<&str>, shift: i64, rows: usize) -> String {
+pub fn header(
+    program: Program,
+    build: Option<&str>,
+    moved: i64,
+    rows: usize,
+    again: bool,
+) -> String {
     format!(
-        "# {} {} · lab reduce (session log 5H-1; P11 as ruling T7 amends it): keys, row order, closed words and numbers kept; times moved {shift:+} days; ids remapped; every other string replaced ({rows} rows)",
+        "# {} {} · lab reduce (session log 5H-1; P11 as ruling T7 amends it, a closed word kept only where a reader reads it as ruling U7 says): keys, row order, numbers and the closed words read kept; times moved {moved:+} days; ids remapped; every other string replaced ({rows} rows){}",
         program.name(),
         build.unwrap_or("-"),
+        if again {
+            "; reduced again from a reduction (ruling U8)"
+        } else {
+            ""
+        },
     )
+}
+
+/// The build a reduction's own `#` line for `program` names (`# <program>
+/// <build> · lab reduce (…`), a closed word; `None` for `-` and any other
+/// line.
+fn build_named(line: &str, program: Program) -> Option<String> {
+    let rest = line.strip_prefix(&format!("# {} ", program.name()))?;
+    let (build, _) = rest.split_once(" · lab reduce (")?;
+    (build != "-" && is_word(build)).then(|| build.to_string())
+}
+
+/// The day count of a reduction's own `#` line for `program` (this rule's
+/// [`header`], or an earlier rule's: `# <program> <build> · lab reduce (…`
+/// naming `times moved <n> days`); `None` for any other line.
+fn moved_before(line: &str, program: Program) -> Option<i64> {
+    let rest = line.strip_prefix(&format!("# {} ", program.name()))?;
+    let (_, tail) = rest.split_once(" · lab reduce (")?;
+    let n = tail.split("times moved ").nth(1)?.split(' ').next()?;
+    let days = tail.split("times moved ").nth(1)?.split(' ').nth(1)?;
+    (days.starts_with("day")).then(|| n.parse::<i64>().ok())?
 }
 
 /// Whether member `key` of the object that sits under `parent`, `key`
@@ -1279,8 +1459,22 @@ struct Walk<'r> {
     ids: HashMap<String, String>,
     names: HashMap<String, String>,
     keys: HashMap<String, String>,
+    /// The last `k<n>` named, and the names the file already holds as keys
+    /// (the first pass collects them).
+    next_key: usize,
+    taken: HashSet<String>,
     shift: i64,
     year: i64,
+    /// The row being walked, and the member and element indices from its
+    /// root down to where the walk is ([`Site::trail`]).
+    row: usize,
+    trail: Vec<usize>,
+    /// THE CANDIDATES (ruling U7): each `(key, word)` pair the rule keeps a
+    /// word of ([`Treat::Word`] while it is a word), in the order the file
+    /// first names it, and every place one sits.
+    pairs: Vec<(String, String)>,
+    pair_of: HashMap<(String, String), usize>,
+    sites: Vec<Site>,
 }
 
 impl<'r> Walk<'r> {
@@ -1293,9 +1487,31 @@ impl<'r> Walk<'r> {
             ids: HashMap::new(),
             names: HashMap::new(),
             keys: HashMap::new(),
+            next_key: 0,
+            taken: HashSet::new(),
             shift: 0,
             year: BASE_DAY.0,
+            row: 0,
+            trail: Vec::new(),
+            pairs: Vec::new(),
+            pair_of: HashMap::new(),
+            sites: Vec::new(),
         }
+    }
+
+    /// A candidate closed word, `word` under `key`, where the walk is.
+    fn candidate(&mut self, key: &str, word: &str) {
+        let pair = (key.to_string(), word.to_string());
+        let n = self.pairs.len();
+        let pair = *self.pair_of.entry(pair.clone()).or_insert_with(|| {
+            self.pairs.push(pair);
+            n
+        });
+        self.sites.push(Site {
+            row: self.row,
+            trail: self.trail.clone(),
+            pair,
+        });
     }
 }
 
@@ -1369,8 +1585,10 @@ impl Walk<'_> {
             Node::Str(s) => Node::Str(self.string(key, path, part, free, row, s)?),
             Node::Arr(items) => {
                 let mut out = Vec::with_capacity(items.len());
-                for x in items {
+                for (i, x) in items.iter().enumerate() {
+                    self.trail.push(i);
                     out.push(self.walk(x, key, path, part, free, key == "content", row)?);
+                    self.trail.pop();
                 }
                 Node::Arr(out)
             }
@@ -1384,8 +1602,12 @@ impl Walk<'_> {
                 // A JSON schema is free whole, wherever it sits.
                 let free = free || is_schema(v);
                 let mut out = Vec::with_capacity(members.len());
-                for (k, x) in members {
+                for (i, (k, x)) in members.iter().enumerate() {
+                    if self.learn && is_key_name(k) {
+                        self.taken.insert(k.clone());
+                    }
                     path.push(k.clone());
+                    self.trail.push(i);
                     let id_key = self.is_id(k);
                     let opens = opens_free(self.program, key, k, path.len(), part, id_key);
                     // Named before its value, so `k<n>` follows reading
@@ -1396,6 +1618,7 @@ impl Walk<'_> {
                         self.key(k, free)
                     };
                     let y = self.walk(x, k, path, part, free || opens, false, row)?;
+                    self.trail.pop();
                     path.pop();
                     out.push((name, y));
                 }
@@ -1433,7 +1656,10 @@ impl Walk<'_> {
         }
         Ok(match treat {
             Treat::Keep => s.to_string(),
-            Treat::Word if is_word(s) => s.to_string(),
+            Treat::Word if is_word(s) => {
+                self.candidate(key, s);
+                s.to_string()
+            }
             Treat::Word | Treat::Replace => String::new(),
             Treat::Id => self.id(s),
             Treat::Time => self.time(s),
@@ -1567,17 +1793,819 @@ impl Walk<'_> {
 
     /// A key: as written when it is an identifier outside a free subtree
     /// (`free`: [`opens_free`], where a key is whatever a tool, a person or
-    /// a schema's author named), else `k<n>`, one to one.
+    /// a schema's author named), else `k<n>`, one to one. A key that is
+    /// already such a name ([`is_key_name`]: a reduction's own) is that name
+    /// wherever it sits, and a new name is never one the file holds
+    /// ([`Walk::taken`]), so a reduction reduced again names its keys as it
+    /// did (ruling U8).
     fn key(&mut self, k: &str, free: bool) -> String {
-        if !free && is_ident(k) {
+        if (!free && is_ident(k)) || is_key_name(k) {
             return k.to_string();
         }
         if let Some(v) = self.keys.get(k) {
             return v.clone();
         }
-        let v = format!("k{}", self.keys.len() + 1);
+        let v = loop {
+            self.next_key += 1;
+            let v = format!("k{}", self.next_key);
+            if !self.taken.contains(&v) {
+                break v;
+            }
+        };
         self.keys.insert(k.to_string(), v.clone());
         v
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The readings (ruling U7)
+// ---------------------------------------------------------------------------
+
+/// The fingerprint and identity a reading binds its fold to: any, the same
+/// for every file read.
+const READ_FP: u64 = 0x5eed_0000_0000_0007;
+const READ_ID: Option<(u64, u64)> = Some((16_777_220, 7));
+
+/// One screen wall of each class, as the step fold's `confirms` is asked.
+const CLASSES: [WallKind; 5] = [
+    WallKind::UsageSession,
+    WallKind::Context,
+    WallKind::Auth,
+    WallKind::Overloaded,
+    WallKind::Memory,
+];
+
+/// Whether a line is a row (no `#` line, not blank).
+fn is_row(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && !t.starts_with('#')
+}
+
+/// One step a fold made of a file: the row its offset lies in (0-based,
+/// among the file's rows), its time, its state and what it is. Never its
+/// offset, which a word blanked moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepRead {
+    /// The row.
+    pub row: usize,
+    /// When (wall ms).
+    pub at_ms: u64,
+    /// Measured or not.
+    pub state: StepState,
+    /// What.
+    pub ev: StepEvent,
+}
+
+/// What [`FinishedScan`] says after a row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Finish {
+    /// [`FinishedScan::finished`].
+    pub finished: bool,
+    /// [`FinishedScan::settled`].
+    pub settled: bool,
+    /// [`FinishedScan::said_done`].
+    pub said_done: bool,
+    /// [`FinishedScan::said_irreversible`].
+    pub irreversible: bool,
+    /// [`FinishedScan::last_turn`].
+    pub last: LastTurn,
+}
+
+/// What the harness's standing-limit scan says after a row
+/// ([`StandingScan`]: the limit row a transcript stands at).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Standing {
+    /// `transcript_limit_until`.
+    pub until: Option<u64>,
+    /// `transcript_limit_reset`.
+    pub reset: Option<u64>,
+    /// `transcript_limit_spend`.
+    pub spend: bool,
+    /// `transcript_standing_wall`.
+    pub wall: Option<StandingWall>,
+    /// `transcript_standing_limit`, its words as their [`Reading`] (the
+    /// row's text emptied).
+    pub limit: Option<(Reading, StandingLimit)>,
+}
+
+impl Standing {
+    fn of(scan: &StandingScan) -> Standing {
+        Standing {
+            until: scan.until(),
+            reset: scan.reset(),
+            spend: scan.spend(),
+            wall: scan.wall(),
+            limit: scan.limit().map(|mut l| {
+                let r = Reading::of(&l.text);
+                l.text.clear();
+                (r, l)
+            }),
+        }
+    }
+}
+
+/// WHAT THE COMMITTED READERS READ OF A FILE (ruling U7), row by row, which
+/// decides the closed words a reduction keeps ([`Candidates::by_readings`]).
+/// Claude Code's: the step fold's steps (bound at the file's start, floor
+/// 0, every row pushed, then taken twice: a held prompt's release), its
+/// losses and the main chain's end after every row and at the last; each
+/// notice as the wall check reads it ([`notice_read`]: its words as their
+/// [`Reading`], its typed fields, its wall, the walls it confirms and the
+/// limit it names); after every row, [`FinishedScan`]'s reading, the
+/// standing limit's ([`StandingScan`]: the limit's reset, its spend, the
+/// quota wall and the limit row) and the login wall's ([`LoginScan`]). A
+/// Codex rollout's: the Codex step fold's steps and losses, the spend
+/// fold's row by row ([`TurnReader`], whose copy rule the step fold
+/// shares) and the limits reader's ([`rollout_rate_limits`]). And for
+/// either, EVERY ROW AS THE HARNESS'S SHAPES READ IT ([`claude_reads`],
+/// [`codex_reads`]: the metadata-only reads every one of its readers
+/// decides from), so a closed word any committed reader reads, the wall
+/// check's `served_since_notice` and the upgrade's `resumed_build_warned`
+/// among them, is a reading's.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Readings {
+    /// The step fold's steps, oldest first.
+    pub steps: Vec<StepRead>,
+    /// Rows past the seed the fold could not read.
+    pub lost: u64,
+    /// Steps dropped from a full queue.
+    pub overflow: u64,
+    /// The main chain's end at the last take.
+    pub end: End,
+    /// The main chain's end after each row (Claude Code).
+    pub ends: Vec<End>,
+    /// Each notice: its row, its words' reading, and the wall check's read
+    /// of it with its words emptied (Claude Code).
+    pub notices: Vec<(usize, Reading, NoticeRead)>,
+    /// [`FinishedScan`] after each row (Claude Code).
+    pub finished: Vec<Finish>,
+    /// The standing limit after each row (Claude Code).
+    pub standing: Vec<Standing>,
+    /// The login wall after each row: whether it stands, and when the last
+    /// one was lifted (Claude Code).
+    pub login: Vec<(bool, Option<u64>)>,
+    /// The spend fold's reading of each row (Codex).
+    pub spend: Vec<SpendRow>,
+    /// The limits reader's readings of each row (Codex).
+    pub limits: Vec<Vec<CodexLimits>>,
+    /// Each row as the harness's shapes read it.
+    pub reads: Vec<Vec<Option<Value>>>,
+}
+
+/// The [`Readings`] of a file's rows (its `#` lines and blank lines are
+/// none).
+#[must_use]
+pub fn readings(text: &str, program: Program) -> Readings {
+    let rows: Vec<&str> = text.lines().filter(|l| is_row(l)).collect();
+    readings_of(&rows, program)
+}
+
+fn readings_of(rows: &[&str], program: Program) -> Readings {
+    let mut r = Readings::default();
+    let mut ends_at = Vec::with_capacity(rows.len());
+    let mut end = 0u64;
+    let row_of = |off: u64, ends_at: &[u64]| ends_at.partition_point(|&e| e < off);
+    match program {
+        Program::Claude => {
+            let mut f = StepFold::new(0, None);
+            f.read_at(READ_FP, READ_ID, 0, false);
+            let mut scan = FinishedScan::default();
+            let (mut standing, mut login) = (StandingScan::default(), LoginScan::default());
+            for (n, line) in rows.iter().enumerate() {
+                end += line.len() as u64 + 1;
+                ends_at.push(end);
+                f.push(line.as_bytes(), end);
+                r.ends.push(f.end());
+                scan.line(line);
+                r.finished.push(Finish {
+                    finished: scan.finished(),
+                    settled: scan.settled(),
+                    said_done: scan.said_done(),
+                    irreversible: scan.said_irreversible(),
+                    last: scan.last_turn(),
+                });
+                standing.line(line);
+                r.standing.push(Standing::of(&standing));
+                login.line(line);
+                r.login.push((login.wall(), login.lifted_at()));
+                if let Some(mut notice) = notice_read(line) {
+                    let reading = Reading::of(&notice.text);
+                    notice.text.clear();
+                    r.notices.push((n, reading, notice));
+                }
+                r.reads.push(claude_reads(line));
+            }
+            let (a, b) = (f.take(), f.take());
+            (r.lost, r.overflow, r.end) = (a.lost + b.lost, a.overflow + b.overflow, b.end);
+            r.steps = a
+                .steps
+                .iter()
+                .chain(&b.steps)
+                .map(|s| StepRead {
+                    row: row_of(s.pos.off, &ends_at),
+                    at_ms: s.pos.at_ms,
+                    state: s.state,
+                    ev: s.ev,
+                })
+                .collect();
+        }
+        Program::Codex => {
+            let mut f = CodexStepFold::new(0);
+            f.bind(READ_FP, READ_ID, 0);
+            let mut spend = TurnReader::default();
+            for line in rows {
+                end += line.len() as u64 + 1;
+                ends_at.push(end);
+                f.push(line.as_bytes(), end);
+                r.spend.push(spend.line(line));
+                r.limits.push(rollout_rate_limits(line));
+                r.reads.push(codex_reads(line));
+            }
+            let b = f.take();
+            (r.lost, r.overflow, r.end) = (b.lost, b.overflow, b.end);
+            r.steps = b
+                .steps
+                .iter()
+                .map(|s| StepRead {
+                    row: row_of(s.pos.off, &ends_at),
+                    at_ms: s.pos.at_ms,
+                    state: s.state,
+                    ev: s.ev,
+                })
+                .collect();
+        }
+    }
+    r
+}
+
+/// One to one: `a` always maps to `b` and `b` from `a`.
+#[derive(Default)]
+struct OneToOne {
+    fwd: HashMap<String, String>,
+    back: HashMap<String, String>,
+}
+
+impl OneToOne {
+    fn same(&mut self, a: &StepId, b: &StepId) -> Result<(), String> {
+        self.pair(a.as_str(), b.as_str())
+    }
+
+    fn pair(&mut self, a: &str, b: &str) -> Result<(), String> {
+        let (a, b) = (a.to_string(), b.to_string());
+        let f = self.fwd.entry(a.clone()).or_insert_with(|| b.clone());
+        let g = self.back.entry(b.clone()).or_insert_with(|| a.clone());
+        if *f == b && *g == a {
+            Ok(())
+        } else {
+            Err(format!("ids {a} and {b} are not one to one"))
+        }
+    }
+}
+
+/// A step's kind, as a failure names it.
+fn kind(e: &StepEvent) -> &'static str {
+    match e {
+        StepEvent::Bind { .. } => "bind",
+        StepEvent::Prompt { .. } => "prompt",
+        StepEvent::Interrupt => "interrupt",
+        StepEvent::ToolUse { .. } => "tool",
+        StepEvent::ToolResult { .. } => "result",
+        StepEvent::TurnEnd { .. } => "end",
+        StepEvent::EndWall { .. } => "endwall",
+        StepEvent::Compact => "compact",
+        StepEvent::Model { .. } => "model",
+        StepEvent::Off { .. } => "off",
+    }
+}
+
+/// The step events of two folds agree: the same kinds and states, closed
+/// words and numbers, ids one to one.
+fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), String> {
+    use StepEvent as E;
+    match (a, b) {
+        (E::Bind { len: x }, E::Bind { len: y }) if x == y => Ok(()),
+        (E::Prompt { vref: x }, E::Prompt { vref: y }) => ids.same(x, y),
+        (E::Interrupt, E::Interrupt) | (E::Compact, E::Compact) => Ok(()),
+        (
+            E::ToolUse {
+                id: i,
+                tool: t,
+                cls: c,
+                subagent: s,
+            },
+            E::ToolUse {
+                id: j,
+                tool: u,
+                cls: d,
+                subagent: r,
+            },
+        ) => {
+            ids.same(i, j)?;
+            let named = !t.as_str().starts_with("mcp__") && tool_class(t.as_str()).0 != "other";
+            if c != d || s != r || (named && t.as_str() != u.as_str()) {
+                return Err(format!("tool {t:?} {c} became {u:?} {d}"));
+            }
+            Ok(())
+        }
+        (E::ToolResult { id: i, error: x }, E::ToolResult { id: j, error: y }) if x == y => {
+            ids.same(i, j)
+        }
+        (E::TurnEnd { .. }, E::TurnEnd { .. })
+        | (E::EndWall { .. }, E::EndWall { .. })
+        | (E::Model { .. }, E::Model { .. })
+        | (E::Off { .. }, E::Off { .. })
+            if a == b =>
+        {
+            Ok(())
+        }
+        _ => Err(format!("{a:?} became {b:?}")),
+    }
+}
+
+/// Two ends agree, the second's time `shift_ms` after the first's: the
+/// newest entry's class, the close, the wall and every class it confirms.
+fn same_end(a: &End, b: &End, shift_ms: i64) -> bool {
+    let ms = |t: u64| i64::try_from(t).unwrap_or(i64::MAX);
+    a.last == b.last
+        && a.closed == b.closed
+        && a.at_ms.map(|t| ms(t).saturating_add(shift_ms)) == b.at_ms.map(ms)
+        && a.wall() == b.wall()
+        && CLASSES.iter().all(|&k| a.confirms(k) == b.confirms(k))
+}
+
+/// Two spend rows agree, the second's turn stamped `shift_s` after the
+/// first's.
+fn same_spend(a: &SpendRow, b: &SpendRow, shift_s: i64) -> bool {
+    match (a, b) {
+        (SpendRow::Turn(x), SpendRow::Turn(y)) => {
+            x.at.saturating_add(shift_s) == y.at
+                && x.model == y.model
+                && x.tokens == y.tokens
+                && x.tier == y.tier
+                && x.key == y.key
+        }
+        _ => a == b,
+    }
+}
+
+/// Two standing limits agree, the second's times `shift_s` after the
+/// first's and its row's id the first's one to one.
+fn same_standing(a: &Standing, b: &Standing, shift_s: i64, ids: &mut OneToOne) -> bool {
+    let at = |t: Option<u64>| t.map(|t| i64::try_from(t).unwrap_or(i64::MAX));
+    let moved = |x: Option<u64>, y: Option<u64>| at(x).map(|t| t.saturating_add(shift_s)) == at(y);
+    let credits = |x: &Option<CreditsWord>, y: &Option<CreditsWord>| match (x, y) {
+        (
+            Some(CreditsWord::Off {
+                reason: r,
+                until: u,
+            }),
+            Some(CreditsWord::Off {
+                reason: q,
+                until: v,
+            }),
+        ) => r == q && moved(*u, *v),
+        _ => x == y,
+    };
+    let wall = match (&a.wall, &b.wall) {
+        (Some(x), Some(y)) => {
+            moved(Some(x.at), Some(y.at))
+                && moved(x.until, y.until)
+                && x.window == y.window
+                && credits(&x.credits, &y.credits)
+        }
+        (x, y) => x == y,
+    };
+    let limit = match (&a.limit, &b.limit) {
+        (Some((r, x)), Some((q, y))) => {
+            r == q
+                && moved(x.until, y.until)
+                && x.window == y.window
+                && moved(x.at, y.at)
+                && match (&x.row, &y.row) {
+                    (Some(i), Some(j)) => ids.pair(i, j).is_ok(),
+                    (i, j) => i == j,
+                }
+        }
+        (x, y) => x == y,
+    };
+    moved(a.until, b.until) && moved(a.reset, b.reset) && a.spend == b.spend && wall && limit
+}
+
+/// Two rows' Codex limits readings agree, the second's times `shift_s`
+/// after the first's.
+fn same_limits(a: &[CodexLimits], b: &[CodexLimits], shift_s: i64) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.at_unix.saturating_add(shift_s) == y.at_unix
+                && x.at_ms.saturating_add(shift_s.saturating_mul(1000)) == y.at_ms
+                && x.family == y.family
+                && x.name == y.name
+                && x.windows.len() == y.windows.len()
+                && x.windows.iter().zip(&y.windows).all(|(v, w)| {
+                    v.slot == w.slot
+                        && v.used_percent.to_bits() == w.used_percent.to_bits()
+                        && v.window_minutes == w.window_minutes
+                        && v.resets_at.map(|t| t.saturating_add(shift_s)) == w.resets_at
+                })
+                && x.credits == y.credits
+                && x.plan_type == y.plan_type
+                && x.individual_limit.map(f64::to_bits) == y.individual_limit.map(f64::to_bits)
+                && x.spend_control_reached == y.spend_control_reached
+                && x.reached_type == y.reached_type
+                && x.account == y.account
+        })
+}
+
+/// Whether `b`, a reduction's [`Readings`], READS AS `a`, its source's
+/// (ruling T7's fold check, which the reducer and its tests share): the same
+/// steps at the same rows in the same states, the same closed words and
+/// numbers, ids one to one, times `shift_days` apart (a bind's excepted);
+/// the same losses; the same end after every row and at the last (its wall
+/// and the classes it confirms); every notice read as its source's (its
+/// words' reading, its typed fields, its wall, what it confirms and the
+/// limit it names); the standing limit and the login wall after every row,
+/// their times the same days apart; and the spend fold's and the limits
+/// reader's rows, their stamps the same days apart. [`FinishedScan`]'s
+/// readings and the rows as the harness's shapes read them are not
+/// compared: they read the words a reduction empties or remaps (a prompt's,
+/// a reply's, an id), so a candidate is judged against the reduction with
+/// every candidate kept ([`Candidates::by_readings`]).
+///
+/// # Errors
+/// The first reading that differs, named.
+pub fn reads_as(a: &Readings, b: &Readings, shift_days: i64) -> Result<(), String> {
+    let shift = shift_days.saturating_mul(86_400_000);
+    let kinds =
+        |r: &Readings| -> Vec<&'static str> { r.steps.iter().map(|s| kind(&s.ev)).collect() };
+    if a.steps.len() != b.steps.len() {
+        return Err(format!(
+            "{} steps became {}: {:?} / {:?}",
+            a.steps.len(),
+            b.steps.len(),
+            kinds(a),
+            kinds(b)
+        ));
+    }
+    let mut ids = OneToOne::default();
+    for (sa, sb) in a.steps.iter().zip(&b.steps) {
+        let ms = |s: &StepRead| i64::try_from(s.at_ms).unwrap_or(i64::MAX);
+        // A bind is dated at the floor, and so is a step of a row with no
+        // readable stamp (a latch): neither moves with the file's times.
+        let timed = !matches!(sa.ev, StepEvent::Bind { .. }) && (sa.at_ms, sb.at_ms) != (0, 0);
+        if sa.row != sb.row || sa.state != sb.state || (timed && ms(sb) - ms(sa) != shift) {
+            return Err(format!(
+                "{:?} at row {} ({}) became {:?} at row {} ({})",
+                sa.ev, sa.row, sa.at_ms, sb.ev, sb.row, sb.at_ms
+            ));
+        }
+        same_event(&sa.ev, &sb.ev, &mut ids).map_err(|e| format!("row {}: {e}", sa.row))?;
+    }
+    if (a.lost, a.overflow) != (b.lost, b.overflow) {
+        return Err(format!(
+            "lost/overflow {:?} became {:?}",
+            (a.lost, a.overflow),
+            (b.lost, b.overflow)
+        ));
+    }
+    if !same_end(&a.end, &b.end, shift) {
+        return Err(format!("the end {:?} became {:?}", a.end, b.end));
+    }
+    if a.ends.len() != b.ends.len() {
+        return Err(format!("{} rows became {}", a.ends.len(), b.ends.len()));
+    }
+    if let Some(n) = (0..a.ends.len()).find(|&n| !same_end(&a.ends[n], &b.ends[n], shift)) {
+        return Err(format!(
+            "the end after row {n}, {:?}, became {:?}",
+            a.ends[n], b.ends[n]
+        ));
+    }
+    if a.notices.len() != b.notices.len() {
+        return Err(format!(
+            "{} notices became {}",
+            a.notices.len(),
+            b.notices.len()
+        ));
+    }
+    for ((ra, ta, na), (rb, tb, nb)) in a.notices.iter().zip(&b.notices) {
+        if ra != rb || ta != tb || na != nb {
+            return Err(format!(
+                "the notice at row {ra}, read {ta:?} {na:?}, became row {rb}'s {tb:?} {nb:?}"
+            ));
+        }
+    }
+    let shift_s = shift_days.saturating_mul(86_400);
+    if a.standing.len() != b.standing.len() || a.login.len() != b.login.len() {
+        return Err(format!(
+            "{} rows became {}",
+            a.standing.len(),
+            b.standing.len()
+        ));
+    }
+    if let Some(n) = (0..a.standing.len())
+        .find(|&n| !same_standing(&a.standing[n], &b.standing[n], shift_s, &mut ids))
+    {
+        return Err(format!(
+            "the standing limit after row {n}, {:?}, became {:?}",
+            a.standing[n], b.standing[n]
+        ));
+    }
+    let lifted = |x: Option<u64>| x.map(|t| i64::try_from(t).unwrap_or(i64::MAX));
+    if let Some(n) = (0..a.login.len()).find(|&n| {
+        let ((wa, la), (wb, lb)) = (a.login[n], b.login[n]);
+        wa != wb || lifted(la).map(|t| t.saturating_add(shift_s)) != lifted(lb)
+    }) {
+        return Err(format!(
+            "the login wall after row {n}, {:?}, became {:?}",
+            a.login[n], b.login[n]
+        ));
+    }
+    if a.spend.len() != b.spend.len() {
+        return Err(format!(
+            "{} spend rows became {}",
+            a.spend.len(),
+            b.spend.len()
+        ));
+    }
+    if let Some(n) = (0..a.spend.len()).find(|&n| !same_spend(&a.spend[n], &b.spend[n], shift_s)) {
+        return Err(format!(
+            "the spend fold's row {n}, {:?}, became {:?}",
+            a.spend[n], b.spend[n]
+        ));
+    }
+    if a.limits.len() != b.limits.len() {
+        return Err(format!(
+            "{} limits rows became {}",
+            a.limits.len(),
+            b.limits.len()
+        ));
+    }
+    if let Some(n) =
+        (0..a.limits.len()).find(|&n| !same_limits(&a.limits[n], &b.limits[n], shift_s))
+    {
+        return Err(format!(
+            "the limits reader's row {n}, {:?}, became {:?}",
+            a.limits[n], b.limits[n]
+        ));
+    }
+    Ok(())
+}
+
+/// Where a candidate closed word sits: its row (0-based, among the file's
+/// rows), the member and element indices from the row's root down to it,
+/// and its pair ([`Candidates::pairs`]).
+#[derive(Clone, Debug)]
+struct Site {
+    row: usize,
+    trail: Vec<usize>,
+    pair: usize,
+}
+
+/// The string `trail` leads to in `v`.
+fn str_at<'a>(v: &'a Node, trail: &[usize]) -> Option<&'a str> {
+    match (v, trail.split_first()) {
+        (Node::Str(s), None) => Some(s),
+        (Node::Arr(a), Some((i, rest))) => str_at(a.get(*i)?, rest),
+        (Node::Obj(m), Some((i, rest))) => str_at(&m.get(*i)?.1, rest),
+        _ => None,
+    }
+}
+
+/// Empty the string `trail` leads to in `v`.
+fn blank_at(v: &mut Node, trail: &[usize]) {
+    match (v, trail.split_first()) {
+        (Node::Str(s), None) => s.clear(),
+        (Node::Arr(a), Some((i, rest))) => {
+            if let Some(x) = a.get_mut(*i) {
+                blank_at(x, rest);
+            }
+        }
+        (Node::Obj(m), Some((i, rest))) => {
+            if let Some((_, x)) = m.get_mut(*i) {
+                blank_at(x, rest);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A file's CANDIDATE CLOSED WORDS (ruling U7): its reduction with every one
+/// kept, each `(key, word)` pair the rule keeps a word of, in the order the
+/// file first names it, and every place one sits; what [`Rules::words`]
+/// chooses from.
+pub struct Candidates<'a> {
+    program: Program,
+    /// The file reduced.
+    source: &'a str,
+    shift_days: i64,
+    rows: Vec<Node>,
+    dumped: Vec<String>,
+    pairs: Vec<(String, String)>,
+    sites: Vec<Site>,
+    /// Each row's sites.
+    by_row: Vec<Vec<usize>>,
+}
+
+impl<'a> Candidates<'a> {
+    fn new(
+        program: Program,
+        source: &'a str,
+        shift_days: i64,
+        rows: Vec<Node>,
+        pairs: Vec<(String, String)>,
+        sites: Vec<Site>,
+    ) -> Result<Self, String> {
+        let mut by_row = vec![Vec::new(); rows.len()];
+        for (i, s) in sites.iter().enumerate() {
+            let word = pairs.get(s.pair).map(|(_, w)| w.as_str());
+            if rows.get(s.row).and_then(|r| str_at(r, &s.trail)) != word {
+                return Err(format!(
+                    "row {}: a candidate word is not where the walk found it",
+                    s.row + 1
+                ));
+            }
+            by_row[s.row].push(i);
+        }
+        let dumped = rows.iter().map(Node::dump).collect();
+        Ok(Candidates {
+            program,
+            source,
+            shift_days,
+            rows,
+            dumped,
+            pairs,
+            sites,
+            by_row,
+        })
+    }
+
+    /// The candidate pairs, `(key, word)`, in the order the file first names
+    /// them.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only a negative control picks pairs by their words"
+        )
+    )]
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.pairs
+    }
+
+    /// Every candidate kept: the reduction as the string rule alone writes
+    /// it.
+    #[must_use]
+    pub fn every(&self) -> Vec<bool> {
+        vec![true; self.pairs.len()]
+    }
+
+    /// The reduction's rows with the pairs `keep` flags kept, and every
+    /// other pair's words emptied wherever they sit.
+    fn lines(&self, keep: &[bool]) -> Vec<Cow<'_, str>> {
+        let gone = |s: &&Site| !keep.get(s.pair).copied().unwrap_or(true);
+        self.rows
+            .iter()
+            .zip(&self.dumped)
+            .zip(&self.by_row)
+            .map(|((row, dumped), at)| {
+                let blank: Vec<&Site> = at.iter().map(|&i| &self.sites[i]).filter(gone).collect();
+                if blank.is_empty() {
+                    Cow::Borrowed(dumped.as_str())
+                } else {
+                    let mut r = row.clone();
+                    for s in blank {
+                        blank_at(&mut r, &s.trail);
+                    }
+                    Cow::Owned(r.dump())
+                }
+            })
+            .collect()
+    }
+
+    /// The [`Readings`] of the reduction `keep` makes.
+    #[must_use]
+    pub fn readings(&self, keep: &[bool]) -> Readings {
+        let lines = self.lines(keep);
+        let rows: Vec<&str> = lines.iter().map(AsRef::as_ref).collect();
+        readings_of(&rows, self.program)
+    }
+
+    /// THE READERS DECIDE (ruling U7). With every candidate kept the
+    /// reduction must read as its source ([`reads_as`]), else the file is
+    /// refused: nothing restores it. Then the pairs are chosen by the
+    /// reduction's [`Readings`] ([`choose`]): each is kept only when
+    /// blanking it alone, across the file, changes them.
+    ///
+    /// # Errors
+    /// With every candidate kept, the reduction does not read as its source.
+    pub fn by_readings(&self) -> Result<Vec<bool>, String> {
+        let all = self.every();
+        reads_as(
+            &readings(self.source, self.program),
+            &self.readings(&all),
+            self.shift_days,
+        )
+        .map_err(|e| {
+            format!("it does not read as its source with every closed word kept ({e}): refused")
+        })?;
+        Ok(choose(all.len(), |keep| self.readings(keep)))
+    }
+}
+
+/// THE CHOICE OF `n` CANDIDATE PAIRS BY A READING (ruling U7): `read` of the
+/// flags kept, which with every flag set is the reading to keep. Each pair
+/// is kept only when blanking it alone changes that reading. Blanked
+/// together, the rest may change it (two rows a reader reads either of):
+/// they are put back, in the order the file first names them, until it
+/// reads as it did. Last, a pair another kept pair made needless is blanked
+/// again, until each kept pair, blanked alone, changes the reading. So
+/// what is kept reads as every pair kept, and no pair kept is needless.
+fn choose<R: PartialEq>(n: usize, read: impl Fn(&[bool]) -> R) -> Vec<bool> {
+    let all = vec![true; n];
+    let base = read(&all);
+    let without = |keep: &[bool], i: usize| {
+        let mut k = keep.to_vec();
+        k[i] = false;
+        k
+    };
+    let mut keep: Vec<bool> = (0..n).map(|i| read(&without(&all, i)) != base).collect();
+    let mut next = 0;
+    while next < n && read(&keep) != base {
+        while next < n && keep[next] {
+            next += 1;
+        }
+        if let Some(k) = keep.get_mut(next) {
+            *k = true;
+        }
+    }
+    loop {
+        let mut moved = false;
+        for i in 0..n {
+            if keep[i] {
+                let fewer = without(&keep, i);
+                if read(&fewer) == base {
+                    keep = fewer;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            return keep;
+        }
+    }
+}
+
+/// THE OUTPUT-SIDE CHECK (ruling U7): the closed words the reduction `text`
+/// keeps that no reading reads — each candidate pair ([`Candidates::pairs`])
+/// whose words, blanked alone, leave its [`readings`] as they were. A
+/// reduction `lab reduce` writes keeps none.
+///
+/// # Errors
+/// `text` is no file `lab reduce` reads (a line that is no JSON value, a
+/// notice that reads as no canonical phrase).
+pub fn unread_words(text: &str, program: Program) -> Result<Vec<(String, String)>, String> {
+    let w = walked(text, program, &P11)?;
+    let own = text
+        .lines()
+        .filter(|l| is_row(l))
+        .map(|l| parse(l.trim()))
+        .collect::<Result<Vec<Node>, String>>()?;
+    let c = Candidates::new(program, text, 0, own, w.pairs, w.sites)?;
+    let all = c.every();
+    let base = c.readings(&all);
+    Ok((0..all.len())
+        .filter(|&i| {
+            let mut k = all.clone();
+            k[i] = false;
+            c.readings(&k) == base
+        })
+        .map(|i| c.pairs[i].clone())
+        .collect())
+}
+
+/// THE VERB'S CHECK OF WHAT IT WRITES: the reduction `r` of `source` reads
+/// as its source ([`reads_as`], ruling T7) and keeps no closed word no
+/// reader reads ([`unread_words`], ruling U7). `lab reduce` writes nothing
+/// that fails it.
+///
+/// # Errors
+/// The first that fails, named.
+pub fn check_written(source: &str, r: &Reduction, program: Program) -> Result<(), String> {
+    reads_as(
+        &readings(source, program),
+        &readings(&r.text, program),
+        r.shift_days,
+    )
+    .map_err(|e| format!("it does not read as its source ({e}): refused"))?;
+    let unread = unread_words(&r.text, program)?;
+    if unread.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "it keeps {} closed words no reader reads ({:?}): refused",
+            unread.len(),
+            unread
+        ))
     }
 }
 
@@ -1591,10 +2619,20 @@ impl Walk<'_> {
 /// ran the lab from (`paths::from_caller`), since the lab itself works
 /// from `/`.
 ///
+/// What it writes passes the output-side check ([`unread_words`]: every
+/// closed word kept is one a reader reads), or nothing is written.
+///
 /// # Errors
 /// Usage; the file cannot be read; a line is not JSON or a notice reads as
-/// no canonical phrase; FILE exists or cannot be written.
+/// no canonical phrase; the reduction cannot read as its source, or keeps a
+/// word no reader reads; FILE exists or cannot be written.
 pub fn cmd_reduce(args: &[String]) -> Res {
+    reduce_verb(args, reduce)
+}
+
+/// [`cmd_reduce`], reducing `by` ([`reduce`]): the verb's negative controls
+/// reduce by a rule that keeps what [`check_written`] refuses.
+fn reduce_verb(args: &[String], by: fn(&str, Program) -> Result<Reduction, String>) -> Res {
     let usage = || {
         Fail::usage(format!(
             "usage: {LAB} reduce <transcript|rollout> --program claude|codex [--out FILE]"
@@ -1622,7 +2660,11 @@ pub fn cmd_reduce(args: &[String]) -> Res {
     };
     let source =
         std::fs::read_to_string(&file).map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
-    let r = reduce(&source, program).map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
+    let r = by(&source, program).map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
+    // What is written reads as its source and keeps no word no reader
+    // reads, or nothing is written.
+    check_written(&source, &r, program)
+        .map_err(|e| Fail::die(format!("reduce: {file}: its reduction: {e}")))?;
     match &out {
         Some(path) => {
             // Never over an existing file: a reduction is written once.
@@ -1641,14 +2683,21 @@ pub fn cmd_reduce(args: &[String]) -> Res {
         None => print!("{}", r.text),
     }
     eprintln!(
-        "reduced {} rows of a {} file (build {}): {} ids remapped, {} notices as their canonical phrase, times moved {:+} days, {} comment lines dropped{}",
+        "reduced {} rows of a {} file (build {}): {} ids remapped, {} notices as their canonical phrase, {} of {} closed words kept where a reader reads them, times moved {:+} days, {} comment lines dropped{}{}",
         r.rows,
         program.name(),
         r.build.as_deref().unwrap_or("-"),
         r.ids,
         r.notices,
+        r.words.1,
+        r.words.0,
         r.shift_days,
         r.comments,
+        if r.again {
+            "; the source was a reduction"
+        } else {
+            ""
+        },
         out.map(|p| format!("; written to {p}")).unwrap_or_default()
     );
     Ok(0)

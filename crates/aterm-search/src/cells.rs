@@ -23,13 +23,20 @@ use crate::grapheme::ColumnMap;
 /// Stored as runs of cells of one shape (same bytes and width, consecutive columns),
 /// so a row of ASCII or of ideographs is one inline run and costs no allocation.
 ///
+/// A reader that stops at a byte bound before the line ends says so
+/// ([`mark_truncated`](Self::mark_truncated)): the index then counts the line as one
+/// it did not search to its end ([`SearchResults::cut_short_lines`]).
+///
 /// [`TerminalSearch::index_numbered_cells_owned`]: crate::TerminalSearch::index_numbered_cells_owned
+/// [`SearchResults::cut_short_lines`]: crate::SearchResults::cut_short_lines
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineCells {
     /// The first run.
     head: Option<CellRun>,
     /// The runs after it.
     tail: Vec<CellRun>,
+    /// The text these cells were read with stops short of the line's end.
+    truncated: bool,
 }
 
 /// `count` cells of one shape: cell `i` holds bytes
@@ -98,7 +105,23 @@ impl LineCells {
         Self {
             head: None,
             tail: Vec::new(),
+            truncated: false,
         }
+    }
+
+    /// Record that the text read with these cells stops short of the line's end:
+    /// its reader stopped at a byte bound (aterm-core reads the first MiB of a
+    /// stored history line), so the rest of the line is unread.
+    pub fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
+    /// Whether the text read with these cells stops short of the line's end
+    /// ([`mark_truncated`](Self::mark_truncated)). A joined line stops short when
+    /// any row joined into it does.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Record that the line's bytes `text` are drawn in the cell at column
@@ -143,8 +166,10 @@ impl LineCells {
     /// Append `other`'s cells, `bytes` further into the line and `cols`
     /// further along it: the cells of a row whose text was appended to a
     /// line `bytes` long, drawn from column `cols` on (a soft-wrapped row
-    /// joined to the rows before it).
+    /// joined to the rows before it). The line stops short of its end if
+    /// `other`'s row did.
     pub fn append_shifted(&mut self, other: &Self, bytes: usize, cols: usize) {
+        self.truncated |= other.truncated;
         for run in other.runs() {
             let shifted = CellRun {
                 byte: run.byte.saturating_add(bytes),
@@ -411,6 +436,27 @@ mod tests {
                 (5, 6, 11, 12),
             ]
         );
+    }
+
+    /// A joined line stops short of its end when any row joined into it does, its
+    /// head or a continuation, wherever the joins pad or shift its cells.
+    #[test]
+    fn a_joined_line_stops_short_when_a_row_does() {
+        let mut row = LineCells::new();
+        row.push(0..1, 0, 1);
+        let mut cut = row.clone();
+        cut.mark_truncated();
+        // NEGATIVE CONTROL: rows read whole join into a line read whole.
+        let mut whole = row.clone();
+        whole.append_wrapped_row(&mut "x".to_string(), "y", &row, 4);
+        assert!(!whole.is_truncated());
+        for (head, continuation) in [(&cut, &row), (&row, &cut)] {
+            let mut joined = head.clone();
+            let mut line = "x".to_string();
+            joined.append_wrapped_row(&mut line, "y", continuation, 4);
+            assert!(joined.is_truncated(), "{head:?} + {continuation:?}");
+            assert_eq!(line, "x   y", "the stride is unchanged");
+        }
     }
 
     /// A soft-wrapped row joins at its stride, whatever its text measures: after a

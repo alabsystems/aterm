@@ -331,6 +331,9 @@ impl SessionLog {
             at,
         };
         let (log, host, stats) = Log::from_carry(lines, a)?;
+        // A carried successor's epoch is its predecessor's plus one (ruling
+        // U1), held without being issued: every later issue is above it.
+        self.epochs.note(log.ep());
         self.replace_log(log);
         self.origin = Kind::Adopt;
         // The predecessor journaled the session up to the carried head
@@ -434,6 +437,7 @@ impl SessionLog {
                             by_screen,
                             tracker: TurnTracker::new(node),
                         });
+                        self.note_agent_cmd(node);
                     }
                 }
                 "tracker" => tracker_line = Some(line.as_str()),

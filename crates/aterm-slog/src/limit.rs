@@ -21,21 +21,27 @@
 //!
 //! THE MARKS A BUCKET WAS SHORT OF (phase 5, ruling T1): a host that counts
 //! a mark instead of making it, its author's bucket short
-//! ([`MarkLimiter::note_short`]), keeps the count IN THAT BUCKET, and the
-//! next mark made from the same bucket says it ([`MarkLimiter::owed`],
-//! [`MarkLimiter::said`]): a trusted actor's own, a session's while it
-//! holds its named slot, and the overflow's for every author that shares
-//! it. So a trusted actor's count, and a session's while it holds a named
-//! slot, never rides another author's mark; a session that takes a slot
-//! says nothing its last holder owed, and a named slot owing a count is
-//! given to another session only when no free slot or idle slot owing
-//! nothing is left, its count going with it, unsaid. The overflow's
-//! authors (the sessions past the table, and `-`, `aterm` and a vendor)
-//! share ONE count as they share one bucket: any of them may say what
-//! another was short of, its `dropped=` naming the bucket, not the author.
-//! A count per overflowed author is not kept: an Owner can mint any number
-//! of edges, so a table of them would be one more bounded table with an
-//! overflow of its own.
+//! ([`MarkLimiter::note_short`]), keeps the count, and the next mark the
+//! same author makes says it ([`MarkLimiter::owed`], [`MarkLimiter::said`]):
+//! a trusted actor's in its own bucket, a session's in its named slot while
+//! it holds one. A named slot owing a count is given to another session only
+//! when no free slot or idle slot owing nothing is left, and its count then
+//! goes with its last holder, not with the slot.
+//!
+//! THE OVERFLOWED AUTHORS' OWN COUNTS (Phase 6 step 6C-6, ruling U18): the
+//! authors past the named slots (the sessions past the table, and `-`,
+//! `aterm` and a vendor) share the overflow bucket's tokens, but not their
+//! counts: [`MARK_OWED_AUTHORS`] owed-only entries, one per such author,
+//! each a count and no tokens, keep what each was short of, so each one's
+//! next mark says its own `dropped=`. A session that takes a named slot
+//! takes its entry's count into it. The table is bounded (an Owner can mint
+//! any number of edges): past it, the entry noted least recently spills its
+//! count into the SHARED POOL (the overflow bucket's own count), which an
+//! overflowed author with no entry of its own says, marked as the pool's
+//! ([`Owed::Shared`], `pool=shared` on the host's mark), never as its own.
+//! So no author's count rides another author's mark as that author's.
+
+use std::collections::VecDeque;
 
 use crate::vocab::{Actor, ShortId};
 
@@ -45,6 +51,9 @@ pub const MARK_BURST: u32 = 20;
 pub const MARK_REFILL_MS: u64 = 1000;
 /// The named buckets sessions share before the overflow.
 pub const MARK_ACTORS: usize = 16;
+/// The overflowed authors whose short counts are kept apart (ruling U18):
+/// past them, the shared pool.
+pub const MARK_OWED_AUTHORS: usize = 32;
 
 /// A bucket's full level, in thousandths of a token.
 const FULL: u32 = MARK_BURST * 1000;
@@ -110,6 +119,34 @@ enum Slot {
     Overflow,
 }
 
+/// What an author's next mark says ([`MarkLimiter::owed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owed {
+    /// The author's own count (`0`: nothing to say): its trusted bucket's,
+    /// its named slot's, or its owed-only entry's.
+    Own(u64),
+    /// The shared pool's count, which an overflowed author with no count of
+    /// its own says for the authors the owed-only table spilled: never as
+    /// its own (`pool=shared`).
+    Shared(u64),
+}
+
+impl Owed {
+    /// How many marks it says.
+    #[must_use]
+    pub const fn count(self) -> u64 {
+        match self {
+            Owed::Own(n) | Owed::Shared(n) => n,
+        }
+    }
+
+    /// Whether it is the shared pool's.
+    #[must_use]
+    pub const fn is_shared(self) -> bool {
+        matches!(self, Owed::Shared(_))
+    }
+}
+
 /// One session's mark limiter (see the module doc).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkLimiter {
@@ -118,7 +155,11 @@ pub struct MarkLimiter {
     ctl: Bucket,
     human: Bucket,
     named: [Option<(ShortId, Bucket)>; MARK_ACTORS],
+    /// The overflowed authors' tokens, and in `short` the shared pool.
     overflow: Bucket,
+    /// The overflowed authors' own counts, least recently noted first, at
+    /// most [`MARK_OWED_AUTHORS`], none of them zero.
+    owed_only: VecDeque<(Actor, u64)>,
 }
 
 impl Default for MarkLimiter {
@@ -139,6 +180,7 @@ impl MarkLimiter {
             human: full,
             named: [None; MARK_ACTORS],
             overflow: full,
+            owed_only: VecDeque::new(),
         }
     }
 
@@ -178,12 +220,56 @@ impl MarkLimiter {
         match free {
             Some(i) => {
                 if take {
-                    self.named[i] = Some((id, Bucket::full(now)));
+                    // The new holder brings its entry's count, and leaves
+                    // the table first: its room is the last holder's, whose
+                    // count goes with it, to its own entry. Owed first, a
+                    // full table would spill the new holder's own count
+                    // into the pool when it was the least recently noted.
+                    let brought = self.take_entry(by).unwrap_or(0);
+                    if let Some((last, b)) = self.named[i]
+                        && b.short > 0
+                    {
+                        self.owe(Actor::Sid(last), b.short);
+                    }
+                    let mut b = Bucket::full(now);
+                    b.short = brought;
+                    self.named[i] = Some((id, b));
                 }
                 Slot::Named(i)
             }
             None => Slot::Overflow,
         }
+    }
+
+    /// `by`'s owed-only entry's count, if it has one.
+    fn entry(&self, by: &Actor) -> Option<u64> {
+        self.owed_only
+            .iter()
+            .find(|(a, _)| a == by)
+            .map(|&(_, n)| n)
+    }
+
+    /// Remove `by`'s owed-only entry, returning its count.
+    fn take_entry(&mut self, by: &Actor) -> Option<u64> {
+        let i = self.owed_only.iter().position(|(a, _)| a == by)?;
+        self.owed_only.remove(i).map(|(_, n)| n)
+    }
+
+    /// `n` more marks `by`, an author with no named slot, was short of: its
+    /// entry, now the most recently noted. A new entry past
+    /// [`MARK_OWED_AUTHORS`] spills the least recently noted one's count
+    /// into the shared pool.
+    fn owe(&mut self, by: Actor, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let count = self.take_entry(&by).unwrap_or(0).saturating_add(n);
+        if self.owed_only.len() >= MARK_OWED_AUTHORS
+            && let Some((_, spilled)) = self.owed_only.pop_front()
+        {
+            self.overflow.short = self.overflow.short.saturating_add(spilled);
+        }
+        self.owed_only.push_back((by, count));
     }
 
     /// The bucket of `slot`. A named slot is filled before it is spent
@@ -225,32 +311,49 @@ impl MarkLimiter {
     }
 
     /// `by` was short of a token at `now_mono_ms` and its mark was counted,
-    /// not made: one more in its bucket's count, which the next mark from
-    /// that bucket says ([`Self::owed`]). A session that holds no slot yet
-    /// takes one as [`Self::spend`] would, else counts in the overflow.
+    /// not made: one more in its own count, which its next mark says
+    /// ([`Self::owed`]). A session that holds no slot yet takes one as
+    /// [`Self::spend`] would; an author past the named slots counts in its
+    /// owed-only entry (the module doc).
     pub fn note_short(&mut self, by: &Actor, now_mono_ms: u64) {
-        let slot = self.slot(by, now_mono_ms, true);
-        let b = self.bucket(slot);
-        b.short = b.short.saturating_add(1);
-    }
-
-    /// How many marks `by`'s bucket was short of since one last said so
-    /// ([`Self::note_short`], [`Self::said`]): its own, the named slot it
-    /// holds, or the overflow it shares. `0` for a session that holds no
-    /// slot while one is there to take (free, or idle), whatever that slot's
-    /// last holder or the overflow owes.
-    pub fn owed(&mut self, by: &Actor, now_mono_ms: u64) -> u64 {
-        match self.slot(by, now_mono_ms, false) {
-            Slot::Named(i) if !self.holds(i, by) => 0,
-            slot => self.bucket(slot).short,
+        match self.slot(by, now_mono_ms, true) {
+            Slot::Overflow => self.owe(*by, 1),
+            slot => {
+                let b = self.bucket(slot);
+                b.short = b.short.saturating_add(1);
+            }
         }
     }
 
-    /// A mark from `by` said its bucket's count ([`Self::owed`]): that
-    /// bucket's alone starts again from zero.
+    /// What `by`'s next mark says ([`Self::note_short`], [`Self::said`]): its
+    /// own count (a trusted actor's bucket's, the named slot's it holds, or
+    /// its owed-only entry's), else, for an author past the named slots with
+    /// none, the shared pool's. A session that holds no slot while one is
+    /// there to take (free, or idle) says its entry's count or nothing,
+    /// never that slot's last holder's or the pool's.
+    pub fn owed(&mut self, by: &Actor, now_mono_ms: u64) -> Owed {
+        match self.slot(by, now_mono_ms, false) {
+            Slot::Named(i) if !self.holds(i, by) => Owed::Own(self.entry(by).unwrap_or(0)),
+            Slot::Overflow => match self.entry(by) {
+                Some(n) => Owed::Own(n),
+                None => Owed::Shared(self.overflow.short),
+            },
+            slot => Owed::Own(self.bucket(slot).short),
+        }
+    }
+
+    /// A mark from `by` said what [`Self::owed`] gave it: that count alone
+    /// starts again from zero.
     pub fn said(&mut self, by: &Actor, now_mono_ms: u64) {
         match self.slot(by, now_mono_ms, false) {
-            Slot::Named(i) if !self.holds(i, by) => {}
+            Slot::Named(i) if !self.holds(i, by) => {
+                let _ = self.take_entry(by);
+            }
+            Slot::Overflow => {
+                if self.take_entry(by).is_none() {
+                    self.overflow.short = 0;
+                }
+            }
             slot => self.bucket(slot).short = 0,
         }
     }

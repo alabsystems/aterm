@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The holder scan: which live processes of this uid hold a descriptor for one character
-//! device, named by its `st_rdev`.
+//! device, named by its `st_rdev` ([`scan_rdev_holders`]), or for one file, named by its
+//! device and inode ([`scan_file_holders`]).
 //!
 //! The PTY keeper offers a dead window's terminal to the next window only when no live process
 //! still holds that terminal's master (`docs/DESIGN-pty-keeper-2026-09-26.md`). A master's
@@ -28,6 +29,16 @@
 //!   would keep every gone owner's build directory from the disk watch;
 //! * an empty table: libproc answers 0 with `errno` clear, where a refusal sets it
 //!   (`list_fds`).
+//!
+//! A file's holders are the lanes' question of a lock or a conversation database before a
+//! relaunch resumes it (aterm-agent's `file_holders`), which ran `lsof -t <file>`: 0.21-0.26 s
+//! of wall and 0.17 s of CPU on a loaded Mac, where this walk takes 9-22 ms (measured
+//! 2026-10-20 at a load of 86-96, 803 processes of this uid). Its descriptors are read without
+//! their paths (`Lookup::BY_FILE`), as `lsof` reads one whose path the kernel refuses. `lsof`
+//! also lists a process whose working directory, root or a mapping is the file, which a
+//! holder of a lock or an open database never is without a descriptor; libproc's own
+//! `proc_listpidspath`, which reads those too, walks every mapping of every process and took
+//! 0.2-0.8 s.
 //!
 //! One walk serves a set of devices ([`scan_holders_of`]): it costs the same whichever devices
 //! it looks for, so a caller with many (the keeper, for every master a dead window registered
@@ -80,15 +91,59 @@ pub fn scan_rdev_holders(rdev: u64, skip: &[u32]) -> io::Result<HolderScan> {
 // Skip: bottoms out at the libproc FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scan_holders_of(rdevs: &[u64], skip: &[u32]) -> io::Result<Vec<HolderScan>> {
-    let mut scans = vec![HolderScan::default(); rdevs.len()];
-    if rdevs.is_empty() {
+    let wanted: Vec<u128> = rdevs.iter().map(|r| u128::from(*r)).collect();
+    scan(&wanted, Lookup::BY_RDEV, skip)
+}
+
+/// Scan every live process of this uid except `skip` for a descriptor on the file at `path`:
+/// one whose vnode has that file's device and inode (`path` followed through links, as
+/// `stat` follows it). A process whose table cannot be read is in
+/// [`HolderScan::unreadable`], as for a device.
+///
+/// # Errors
+/// `path` cannot be read (`stat`), or the process listing fails; `Unsupported` off macOS.
+#[cfg(target_vendor = "apple")]
+pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path)?;
+    // `st_dev` is a 32-bit `dev_t` on Darwin, which `MetadataExt` widens with its sign;
+    // `vst_dev` holds the same 32 bits.
+    let dev = u32::try_from(meta.dev() & u64::from(u32::MAX)).map_err(io::Error::other)?;
+    let file = Vnode {
+        dev,
+        ino: meta.ino(),
+        rdev: 0,
+    };
+    Ok(scan(&[file.file_key()], Lookup::BY_FILE, skip)?
+        .pop()
+        .unwrap_or_default())
+}
+
+/// See the macOS twin.
+///
+/// # Errors
+/// Always `Unsupported`.
+#[cfg(not(target_vendor = "apple"))]
+pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<HolderScan> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the holder scan reads libproc (macOS)",
+    ))
+}
+
+/// One walk of this uid's processes except `skip`: for each of `wanted`, in order, who holds a
+/// descriptor whose vnode answers it as `lookup` reads it.
+#[cfg(target_vendor = "apple")]
+fn scan(wanted: &[u128], lookup: Lookup, skip: &[u32]) -> io::Result<Vec<HolderScan>> {
+    let mut scans = vec![HolderScan::default(); wanted.len()];
+    if wanted.is_empty() {
         return Ok(scans);
     }
     for pid in uid_pids()? {
         if skip.contains(&pid) {
             continue;
         }
-        for (scan, read) in scans.iter_mut().zip(read_table(pid, rdevs)) {
+        for (scan, read) in scans.iter_mut().zip(read_table(pid, wanted, lookup)) {
             scan.scanned += 1;
             match read {
                 TableRead::Holds => scan.holders.push(pid),
@@ -112,13 +167,52 @@ pub fn scan_holders_of(_rdevs: &[u64], _skip: &[u32]) -> io::Result<Vec<HolderSc
     ))
 }
 
+/// Whether one of `pid`'s standard descriptors (0, 1, 2) is on a dead vnode
+/// (the module docs): `Some(true)`, `Some(false)` when each that is open reads
+/// as a live vnode or as no vnode (a pipe, a socket), `None` when the table or
+/// a descriptor could not be read, or the process has exited.
+///
+/// The exit of a terminal's controlling process (its session's leader)
+/// revokes that terminal for every holder, so a process still holding its
+/// stdio on a revoked terminal was born on a terminal whose session has
+/// ended: measured on Darwin 27, the child a terminal's session forks, which
+/// launchd adopts and which execs only after the leader's exit, holds 0, 1
+/// and 2 on vnodes this flavor reads as `ENOENT` (the descriptors stay
+/// `PROX_FDTYPE_VNODE`), and has lost `P_CONTROLT` with that exec. A
+/// force-unmounted volume's file reads the same.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn stdio_on_dead_vnode(pid: u32) -> Option<bool> {
+    let pid = i32::try_from(pid).ok()?;
+    for (fd, kind) in list_fds(pid).ok()? {
+        if !(0..=2).contains(&fd) || kind != ffi::PROX_FDTYPE_VNODE {
+            continue;
+        }
+        // The path flavor (`Lookup::BY_RDEV`): its path lookup is what reads a
+        // revoked terminal's vnode as dead (`ENOENT`).
+        match vnode_of(pid, fd, Lookup::BY_RDEV) {
+            Ok(_) | Err(Failed::Closed) => {}
+            Err(Failed::Dead) => return Some(true),
+            Err(Failed::Exited | Failed::Refused | Failed::Other) => return None,
+        }
+    }
+    Some(false)
+}
+
+/// See the macOS twin.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn stdio_on_dead_vnode(_pid: u32) -> Option<bool> {
+    None
+}
+
 /// Whether the one process `pid` holds a descriptor for `rdev`: `Some(true)`,
 /// `Some(false)` (also when it has exited: it holds nothing), or `None` when
 /// its table could not be read.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn process_holds_rdev(pid: u32, rdev: u64) -> Option<bool> {
-    match read_table(pid, &[rdev]).first() {
+    match read_table(pid, &[u128::from(rdev)], Lookup::BY_RDEV).first() {
         Some(TableRead::Holds) => Some(true),
         Some(TableRead::Clear | TableRead::Exited) => Some(false),
         Some(TableRead::Unreadable) | None => None,
@@ -155,13 +249,18 @@ enum Failed {
     /// Listing a process's table, it is no vnode's answer and is unknown like
     /// [`Failed::Other`].
     Dead,
-    /// Anything else (`EPERM`, or a failure that set no `errno`).
+    /// `EPERM`: the kernel will not tell this process. Reading one descriptor, it refuses
+    /// the vnode's metadata (a file in a protected folder, whose metadata only an entitled
+    /// reader such as `lsof` is given); otherwise unknown like [`Failed::Other`].
+    Refused,
+    /// Anything else (`EACCES`, or a failure that set no `errno`).
     Other,
 }
 
 #[cfg(target_vendor = "apple")]
 impl Failed {
     const ESRCH: i32 = 3;
+    const EPERM: i32 = 1;
     const EBADF: i32 = 9;
     /// A descriptor's or a working directory's read's answer for a dead
     /// vnode, and `proc_pidpath`'s for a process whose executable has been
@@ -173,6 +272,7 @@ impl Failed {
             Self::ESRCH => Self::Exited,
             Self::EBADF => Self::Closed,
             Self::ENOENT => Self::Dead,
+            Self::EPERM => Self::Refused,
             _ => Self::Other,
         }
     }
@@ -187,40 +287,110 @@ impl Failed {
     }
 }
 
-/// What `pid`'s descriptor table says of each device in `rdevs`, in order,
-/// from one listing and one read per vnode descriptor. The reads stop once
-/// every device is found.
+/// What a vnode descriptor names: the file's device and inode, and the device a character
+/// special file stands for.
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Vnode {
+    /// `vst_dev`.
+    dev: u32,
+    /// `vst_ino`.
+    ino: u64,
+    /// `vst_rdev`.
+    rdev: u32,
+}
+
+#[cfg(target_vendor = "apple")]
+impl Vnode {
+    /// The device a character special file stands for (`st_rdev`), as a scan's key.
+    fn rdev_key(&self) -> u128 {
+        u128::from(self.rdev)
+    }
+
+    /// The file itself (`st_dev` and `st_ino`), as a scan's key.
+    fn file_key(&self) -> u128 {
+        (u128::from(self.dev) << 64) | u128::from(self.ino)
+    }
+}
+
+/// How a scan reads each vnode descriptor, and the key it matches the vnode by.
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Copy)]
+struct Lookup {
+    /// The `proc_pidfdinfo` flavor read.
+    flavor: i32,
+    /// The size of that flavor's answer.
+    size: usize,
+    /// The scan's key of the vnode read.
+    key: fn(&Vnode) -> u128,
+    /// Whether a descriptor whose vnode the kernel refuses to describe
+    /// ([`Failed::Refused`]) is known not to be the one sought: true of a file
+    /// this process has `stat`ed itself, which the same check let through for
+    /// the same vnode, so a refused vnode is another.
+    refused_is_another: bool,
+}
+
+#[cfg(target_vendor = "apple")]
+impl Lookup {
+    /// A device by its `st_rdev`, read with the descriptor's path
+    /// (`PROC_PIDFDVNODEPATHINFO`): the keeper's read, whose path lookup also
+    /// says a dead vnode is dead (`ENOENT`).
+    const BY_RDEV: Self = Self {
+        flavor: ffi::PROC_PIDFDVNODEPATHINFO,
+        size: ffi::VNODE_PATH_SIZE,
+        key: Vnode::rdev_key,
+        refused_is_another: false,
+    };
+    /// A file by its device and inode, read without the path
+    /// (`PROC_PIDFDVNODEINFO`), which the match does not need. A descriptor on
+    /// a file in a protected folder is refused (`EPERM`) with or without it,
+    /// where `lsof` reads it through its entitlement
+    /// (`com.apple.rootless.datavault.metadata`; measured 2026-10-20: eight
+    /// system agents of this uid, `lsd`'s and `dmd`'s databases among them):
+    /// the file sought was `stat`ed, so such a descriptor is not on it.
+    const BY_FILE: Self = Self {
+        flavor: ffi::PROC_PIDFDVNODEINFO,
+        size: ffi::VNODE_FD_SIZE,
+        key: Vnode::file_key,
+        refused_is_another: true,
+    };
+}
+
+/// What `pid`'s descriptor table says of each key in `wanted`, in order, each vnode
+/// descriptor read as `lookup` reads it, from one listing and one read per vnode
+/// descriptor. The reads stop once every key is found.
 // Skip: bottoms out at the libproc FFI calls.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
-fn read_table(pid: u32, rdevs: &[u64]) -> Vec<TableRead> {
-    let every = |read| vec![read; rdevs.len()];
+fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
+    let every = |read| vec![read; wanted.len()];
     let Ok(pid) = i32::try_from(pid) else {
         return every(TableRead::Unreadable);
     };
     let fds = match list_fds(pid) {
         Ok(fds) => fds,
         Err(Failed::Exited) => return every(TableRead::Exited),
-        Err(Failed::Closed | Failed::Dead | Failed::Other) => {
+        Err(Failed::Closed | Failed::Dead | Failed::Refused | Failed::Other) => {
             return every(TableRead::Unreadable);
         }
     };
     #[cfg(test)]
     hook::after_listing(pid, &fds);
-    // Each asked device, sorted, with where its answer goes.
-    let mut wanted: Vec<(u64, usize)> = rdevs.iter().copied().zip(0..).collect();
+    // Each asked key, sorted, with where its answer goes.
+    let mut wanted: Vec<(u128, usize)> = wanted.iter().copied().zip(0..).collect();
     wanted.sort_unstable();
-    let mut held = vec![false; rdevs.len()];
+    let mut held = vec![false; wanted.len()];
     let mut found = 0;
     let mut unreadable = false;
     for (fd, kind) in fds {
         if kind != ffi::PROX_FDTYPE_VNODE {
             continue;
         }
-        match vnode_rdev(pid, fd) {
-            // `dev_t` is 32 bits on Darwin; the caller's u64 is `st_rdev` widened.
-            Ok(r) => {
-                let r = u64::from(r);
+        match vnode_of(pid, fd, lookup) {
+            // The scan's key of it: a device's `st_rdev` (32 bits on Darwin, widened),
+            // or a file's device and inode.
+            Ok(vnode) => {
+                let r = (lookup.key)(&vnode);
                 let from = wanted.partition_point(|(w, _)| *w < r);
                 for (_, at) in wanted.iter().skip(from).take_while(|(w, _)| *w == r) {
                     if let Some(slot) = held.get_mut(*at)
@@ -240,9 +410,12 @@ fn read_table(pid: u32, rdevs: &[u64]) -> Vec<TableRead> {
             // and one on a dead vnode names no device: nothing is held
             // through either.
             Err(Failed::Closed | Failed::Dead) => {}
-            // Any other failure makes the verdict unknown for every device
+            // A vnode whose metadata is refused is not a file this process
+            // could `stat` (`Lookup::refused_is_another`).
+            Err(Failed::Refused) if lookup.refused_is_another => {}
+            // Any other failure makes the verdict unknown for every key
             // not found.
-            Err(Failed::Other) => unreadable = true,
+            Err(Failed::Refused | Failed::Other) => unreadable = true,
         }
     }
     held.into_iter()
@@ -261,12 +434,80 @@ pub fn process_holds_rdev(_pid: u32, _rdev: u64) -> Option<bool> {
     None
 }
 
+/// Every libproc constant and layout the macOS scans read by, as the C expression the SDK
+/// must agree with: aterm-sysprobe's `tests/proc_info_sdk.rs` asserts each on `arm64` and
+/// `x86_64`, so a header that moved a field fails there, not in a wrong holder.
+#[cfg(target_vendor = "apple")]
+pub const SDK_ROWS: &[(&str, i64)] = &[
+    ("PROC_UID_ONLY", ffi::PROC_UID_ONLY as i64),
+    ("PROC_PIDLISTFDS", ffi::PROC_PIDLISTFDS as i64),
+    (
+        "PROC_PIDFDVNODEPATHINFO",
+        ffi::PROC_PIDFDVNODEPATHINFO as i64,
+    ),
+    ("PROX_FDTYPE_VNODE", ffi::PROX_FDTYPE_VNODE as i64),
+    ("PROX_FDTYPE_PSHM", ffi::PROX_FDTYPE_PSHM as i64),
+    ("sizeof(struct proc_fdinfo)", ffi::FDINFO_SIZE as i64),
+    (
+        "sizeof(struct vnode_fdinfowithpath)",
+        ffi::VNODE_PATH_SIZE as i64,
+    ),
+    ("PROC_PIDFDVNODEINFO", ffi::PROC_PIDFDVNODEINFO as i64),
+    ("sizeof(struct vnode_fdinfo)", ffi::VNODE_FD_SIZE as i64),
+    (
+        "offsetof(struct vnode_fdinfo, pvi.vi_stat.vst_dev)",
+        ffi::VST_DEV as i64,
+    ),
+    (
+        "offsetof(struct vnode_fdinfo, pvi.vi_stat.vst_ino)",
+        ffi::VST_INO as i64,
+    ),
+    (
+        "offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_dev)",
+        ffi::VST_DEV as i64,
+    ),
+    (
+        "offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_ino)",
+        ffi::VST_INO as i64,
+    ),
+    (
+        "offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_rdev)",
+        ffi::VST_RDEV as i64,
+    ),
+    (
+        "offsetof(struct vnode_fdinfowithpath, pvip.vip_path)",
+        ffi::VNODE_PATH as i64,
+    ),
+    ("MAXPATHLEN", ffi::MAXPATHLEN as i64),
+    ("PROC_PIDVNODEPATHINFO", ffi::PROC_PIDVNODEPATHINFO as i64),
+    (
+        "sizeof(struct proc_vnodepathinfo)",
+        ffi::VNODEPATHINFO_SIZE as i64,
+    ),
+    (
+        "offsetof(struct proc_vnodepathinfo, pvi_cdir.vip_path)",
+        ffi::CDIR_PATH as i64,
+    ),
+    ("PROC_PIDPATHINFO_MAXSIZE", ffi::PIDPATH_MAX as i64),
+    ("PROC_PIDFDPSHMINFO", ffi::PROC_PIDFDPSHMINFO as i64),
+    ("sizeof(struct pshm_fdinfo)", ffi::PSHM_FDINFO_SIZE as i64),
+    (
+        "offsetof(struct pshm_fdinfo, pshminfo.pshm_stat.vst_size)",
+        ffi::PSHM_VST_SIZE as i64,
+    ),
+];
+
 #[cfg(target_vendor = "apple")]
 mod ffi {
     // libproc.h / sys/proc_info.h.
     pub const PROC_UID_ONLY: u32 = 4;
     pub const PROC_PIDLISTFDS: i32 = 1;
     pub const PROC_PIDFDVNODEPATHINFO: i32 = 2;
+    /// `PROC_PIDFDVNODEINFO`: a descriptor's `struct vnode_fdinfo`, its vnode without its path.
+    pub const PROC_PIDFDVNODEINFO: i32 = 1;
+    /// `sizeof(struct vnode_fdinfo)`: the 24-byte `proc_fileinfo` and the 152-byte
+    /// `vnode_info`, as `vnode_fdinfowithpath` starts.
+    pub const VNODE_FD_SIZE: usize = 176;
     pub const PROX_FDTYPE_VNODE: u32 = 1;
     /// `PROX_FDTYPE_PSHM`: a POSIX shared-memory descriptor.
     pub const PROX_FDTYPE_PSHM: u32 = 3;
@@ -274,6 +515,12 @@ mod ffi {
     pub const FDINFO_SIZE: usize = 8;
     /// `sizeof(struct vnode_fdinfowithpath)`.
     pub const VNODE_PATH_SIZE: usize = 1200;
+    /// `offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_dev)`, and the same in
+    /// `struct vnode_fdinfo` (`pvi.vi_stat.vst_dev`).
+    pub const VST_DEV: usize = 24;
+    /// `offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_ino)`, and the same in
+    /// `struct vnode_fdinfo` (`pvi.vi_stat.vst_ino`).
+    pub const VST_INO: usize = 32;
     /// `offsetof(struct vnode_fdinfowithpath, pvip.vip_vi.vi_stat.vst_rdev)`.
     pub const VST_RDEV: usize = 140;
     /// `offsetof(struct vnode_fdinfowithpath, pvip.vip_path)`: after the
@@ -388,12 +635,129 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
         .collect())
 }
 
+/// See the macOS twin. Windows: every process whose owner is this process's
+/// token user, read WITHOUT opening any of them — the session manager answers
+/// the listing with each process's owner SID
+/// (`WTSEnumerateProcessesExW` at level 1, over `WTS_ANY_SESSION`, so a same-user
+/// process in another logon session counts too, as the macOS/Linux listing does
+/// across sessions). A process the manager named with no owner SID (`pUserSid`
+/// null, a system process we would not open) is left out, as another uid's is.
+/// This is only the LISTING: each pid is then read by the path-user scan
+/// ([`scan_path_users_of`]), which opens it and classes an unreadable same-user
+/// process as held.
+///
+/// # Errors
+///
+/// The token user or the process listing could not be read.
+#[cfg(windows)]
+pub fn uid_pids() -> io::Result<Vec<u32>> {
+    win_pids::same_user_pids()
+}
+
+/// This process's token-user SID and the session manager's process listing: the
+/// Windows [`uid_pids`] listing. The SID lives in a kept buffer the pointer
+/// borrows; `EqualSid` needs both live at once, so the buffer is held across the
+/// whole comparison.
+#[cfg(windows)]
+mod win_pids {
+    use super::io;
+    use crate::win::ffi;
+
+    /// `TOKEN_INFORMATION_CLASS::TokenUser`.
+    const TOKEN_USER: u32 = 1;
+    const TOKEN_QUERY: u32 = 0x0008;
+    /// `WTS_CURRENT_SERVER_HANDLE` (this server).
+    const WTS_CURRENT_SERVER: ffi::RawHandle = 0;
+    /// `WTS_ANY_SESSION` (`(DWORD)-2`): every session.
+    const WTS_ANY_SESSION: u32 = 0xFFFF_FFFE;
+    /// `WTS_PROCESS_INFO_TYPE::WTSTypeProcessInfoLevel1`.
+    const WTS_PROCESS_INFO_LEVEL1: u32 = 1;
+
+    /// This process's token-user SID, as the `TOKEN_USER` bytes that back it
+    /// (the SID is a pointer into them, so they are returned and kept alive).
+    fn own_sid() -> io::Result<(Vec<u8>, *const core::ffi::c_void)> {
+        let mut token: ffi::RawHandle = 0;
+        // SAFETY: `GetCurrentProcess` is a pseudo-handle; the out pointer is live.
+        if unsafe { ffi::OpenProcessToken(ffi::GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut len: u32 = 0;
+        // SAFETY: a sizing call — a null buffer asks for the length in `len`.
+        unsafe { ffi::GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            // SAFETY: closes the token this function opened.
+            let _ = unsafe { ffi::CloseHandle(token) };
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: `buf` is `len` writable bytes; `TOKEN_USER` fills it with a
+        // `SID_AND_ATTRIBUTES` whose `Sid` points inside `buf`.
+        let ok = unsafe {
+            ffi::GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), len, &mut len)
+        };
+        // SAFETY: closes the token this function opened.
+        let _ = unsafe { ffi::CloseHandle(token) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `TOKEN_USER { SID_AND_ATTRIBUTES User }`; `User.Sid` is the first
+        // pointer-sized field, a pointer into `buf`.
+        let sid = buf
+            .get(..std::mem::size_of::<usize>())
+            .and_then(|b| <[u8; std::mem::size_of::<usize>()]>::try_from(b).ok())
+            .map(usize::from_ne_bytes)
+            .filter(|p| *p != 0)
+            .ok_or_else(|| io::Error::other("the token user holds no SID"))?;
+        Ok((buf, sid as *const core::ffi::c_void))
+    }
+
+    /// [`super::uid_pids`]: the pids the session manager names with our owner SID.
+    pub(super) fn same_user_pids() -> io::Result<Vec<u32>> {
+        let (_buf, own) = own_sid()?;
+        let mut level = WTS_PROCESS_INFO_LEVEL1;
+        let mut info: *mut ffi::WtsProcessInfoExW = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        // SAFETY: level and out-params are live locals; on success the manager
+        // allocates `info`, freed below. We never open any listed process.
+        let ok = unsafe {
+            ffi::WTSEnumerateProcessesExW(
+                WTS_CURRENT_SERVER,
+                &mut level,
+                WTS_ANY_SESSION,
+                &mut info,
+                &mut count,
+            )
+        };
+        if ok == 0 || info.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut pids = Vec::new();
+        // SAFETY: `info` is `count` valid `WtsProcessInfoExW`s the call wrote.
+        let entries = unsafe { std::slice::from_raw_parts(info, count as usize) };
+        for e in entries {
+            // SAFETY: `e.pUserSid`, when non-null, is a valid SID inside the
+            // manager's allocation; `own` is our live token SID. Both outlive
+            // the comparison (`_buf` is still held).
+            let same = !e.pUserSid.is_null()
+                && unsafe { ffi::IsValidSid(e.pUserSid) } != 0
+                && unsafe { ffi::EqualSid(own, e.pUserSid) } != 0;
+            if same && e.ProcessId != 0 {
+                pids.push(e.ProcessId);
+            }
+        }
+        // SAFETY: frees the one allocation the enumerate call returned.
+        let _ = unsafe { ffi::WTSFreeMemoryExW(WTS_PROCESS_INFO_LEVEL1, info.cast(), count) };
+        Ok(pids)
+    }
+}
+
 /// See the macOS twin.
 ///
 /// # Errors
 ///
 /// Always `Unsupported`.
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
 pub fn uid_pids() -> io::Result<Vec<u32>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -445,31 +809,37 @@ fn list_fds(pid: i32) -> Result<Vec<(i32, u32)>, Failed> {
 }
 
 #[cfg(target_vendor = "apple")]
-fn vnode_rdev(pid: i32, fd: i32) -> Result<u32, Failed> {
+fn vnode_of(pid: i32, fd: i32, lookup: Lookup) -> Result<Vnode, Failed> {
+    // Both flavors' answers start with the 24-byte `proc_fileinfo` and the `vnode_info`
+    // the device and inode are read from; the larger holds either.
     let mut buf = [0u8; ffi::VNODE_PATH_SIZE];
+    let buf = buf.get_mut(..lookup.size).ok_or(Failed::Other)?;
     let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
     clear_errno();
-    // SAFETY: `buf` is exactly the structure this flavor fills.
-    let got = unsafe {
-        ffi::proc_pidfdinfo(
-            pid,
-            fd,
-            ffi::PROC_PIDFDVNODEPATHINFO,
-            buf.as_mut_ptr().cast(),
-            size,
-        )
-    };
+    // SAFETY: `buf` is exactly the structure `lookup.flavor` fills.
+    let got = unsafe { ffi::proc_pidfdinfo(pid, fd, lookup.flavor, buf.as_mut_ptr().cast(), size) };
     if got <= 0 {
         return Err(Failed::last());
     }
     if got != size {
         return Err(Failed::Other);
     }
-    let bytes = buf
-        .get(ffi::VST_RDEV..ffi::VST_RDEV + 4)
-        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+    let u32_at = |at: usize| {
+        buf.get(at..at + 4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(u32::from_ne_bytes)
+            .ok_or(Failed::Other)
+    };
+    let ino = buf
+        .get(ffi::VST_INO..ffi::VST_INO + 8)
+        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+        .map(u64::from_ne_bytes)
         .ok_or(Failed::Other)?;
-    Ok(u32::from_ne_bytes(bytes))
+    Ok(Vnode {
+        dev: u32_at(ffi::VST_DEV)?,
+        ino,
+        rdev: u32_at(ffi::VST_RDEV)?,
+    })
 }
 
 /// The size of the POSIX shared-memory object `fd` names in this process, or `None` when `fd` is
@@ -563,6 +933,8 @@ pub fn pshm_sizes_of(_pid: u32) -> io::Result<Vec<u64>> {
 mod paths;
 #[cfg(all(debug_assertions, target_vendor = "apple"))]
 pub use paths::a_force_detached_volume_is_no_working_directory;
+#[cfg(all(windows, any(test, debug_assertions)))]
+pub use paths::scan_path_users_of_within;
 pub use paths::{Exe, PathScan, PathUse, exe_of, scan_path_users, scan_path_users_of};
 
 /// Test seams: run a closure between one table's listing and the reads of its descriptors (to
@@ -778,7 +1150,8 @@ mod tests {
         assert_eq!(Failed::of(3), Failed::Exited, "ESRCH");
         assert_eq!(Failed::of(9), Failed::Closed, "EBADF");
         assert_eq!(Failed::of(2), Failed::Dead, "ENOENT");
-        for other in [0, 1, 12, 13, 22] {
+        assert_eq!(Failed::of(1), Failed::Refused, "EPERM");
+        for other in [0, 12, 13, 22] {
             assert_eq!(Failed::of(other), Failed::Other, "errno {other}");
         }
     }

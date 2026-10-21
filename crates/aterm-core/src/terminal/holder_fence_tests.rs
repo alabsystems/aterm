@@ -5,30 +5,50 @@
 //! The holder fence against a writer oracle, and §7's unit cases
 //! (docs/DESIGN-card-engine-2026-10-19.md).
 //!
-//! The oracle is black-box: every writer draws only its own glyph on its own
-//! background, so a cell names who wrote it. After every step each main row
-//! [`HolderView`] admits must hold only the current drawer's glyph or a
-//! blank on the default or its background, and an admitted alternate screen
-//! likewise. The archival scroll's splice law is checked beside it, since a
-//! seal makes an End that wrongly absorbs inserted rows unobservable to the
-//! oracle. Liveness probes say that what a stop, a full-screen tool and an
-//! `fg` should keep, the fence keeps, and no resize loses the anchors while
-//! the main cursor stands at the frontier (nothing drawn below its row).
+//! The oracle is black-box. Every drawer writes only its own glyphs (a
+//! narrow one, a wide one and one past the BMP, which no other writer and no
+//! corpus holds) with its own pen (the default background, its indexed one
+//! or its true colour, nothing else), so a cell names whether the current
+//! drawer wrote it. After every step, every range of main rows [`HolderView`]
+//! admits must hold only the current drawer's cells or blanks, and an
+//! admitted alternate screen likewise. A blank is what an erased default cell
+//! shows: no glyph, the default background, no reversed, underlined, struck
+//! or overlined stroke, no image, link or combining mark, on a single-size
+//! row. The oracle reads cells through the grid's own accessors, never
+//! through the fence's ink predicate.
+//!
+//! The other writers draw everything else: their own glyph on their own
+//! backgrounds, the rich payloads (wide and complex clusters, combining
+//! marks, true colours, DECDWL rows, protected cells, reversed, underlined,
+//! struck and linked blanks, kitty, sixel and iTerm2 images), and the
+//! `verify perf` corpora (aterm-bench's throughput frame and the
+//! pathological lane's five units): whole lines for a well-behaved writer,
+//! slices cut anywhere for a hostile one. The archival scroll's splice law is
+//! checked beside the oracle, since a seal makes an End that wrongly absorbs
+//! inserted rows unobservable to it. Liveness probes say that what a stop, a
+//! full-screen tool and an `fg` should keep, the fence keeps, and no resize
+//! loses the anchors while the main cursor stands at the frontier (nothing
+//! drawn below its row).
 //!
 //! Each seed draws a noise level: that share of writes are hostile (screen
-//! writes left where they ended, rectangle copies, margined edits, RIS,
-//! unscrolls), the rest a line-oriented program's, and a calm cut finds the
-//! cursor below what was drawn, as a shell's prompt is. Without the calm
-//! share nearly every mark taints and the oracle has nothing to check; the
-//! positive run counts the admitted rows it checked and holds a floor.
+//! writes left where they ended, corpus slices, rectangle copies, margined
+//! edits, RIS, unscrolls), the rest a line-oriented program's, and a calm
+//! cut finds the cursor below what was drawn, as a shell's prompt is.
+//! Without the calm share nearly every mark taints and the oracle has nothing
+//! to check; the positive run counts the admitted rows it checked and holds a
+//! floor.
 //!
 //! Each law has a knob ([`FenceKnob`]) that switches it off; the negative
 //! controls show the fuzz failing under every one, and the probes under
 //! the two that only lose too much.
 
-use aterm_grid::{AnchorRole, FenceKnob, with_knob};
+use std::fmt::Write as _;
+use std::sync::OnceLock;
+
+use aterm_grid::{AnchorRole, CellFlags, FenceKnob, LineSize, with_knob};
 
 use super::super::{CutKind, HolderAdoption, HolderCut, HolderView, Terminal};
+use crate::grid::Grid;
 use crate::scrollback::Scrollback;
 
 const ROWS: u16 = 10;
@@ -44,11 +64,25 @@ enum Who {
 }
 
 impl Who {
-    fn glyph(self) -> u16 {
+    /// The writer's narrow glyph. A drawer's is a Cyrillic capital that no
+    /// other writer and no corpus draws.
+    fn glyph(self) -> char {
         match self {
-            Self::Shell => u16::from(b's'),
-            Self::Tool => u16::from(b't'),
-            Self::Drawer(i) => u16::from(b'A' + i),
+            Self::Shell => 's',
+            Self::Tool => 't',
+            Self::Drawer(i) => ['Ж', 'Щ', 'Ю'][usize::from(i)],
+        }
+    }
+
+    /// A drawer's other glyphs: a wide one, and a narrow one past the BMP
+    /// (a complex cell). Nobody else draws them.
+    fn rich(self) -> [char; 2] {
+        match self {
+            Self::Drawer(i) => [
+                ['龍', '鳳', '麟'][usize::from(i)],
+                ['𝔄', '𝔅', '𝔇'][usize::from(i)],
+            ],
+            other => [other.glyph(); 2],
         }
     }
 
@@ -59,6 +93,34 @@ impl Who {
             Self::Drawer(i) => 170 + i,
         }
     }
+
+    /// The writer's true-colour background. A drawer's red is odd and its
+    /// green even: the style-churn corpus's per-cell `(b, r, g)` walk draws
+    /// all three channels with the cell's parity, so it never paints one.
+    fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::Shell => [2, 4, 6],
+            Self::Tool => [3, 5, 7],
+            Self::Drawer(i) => [1, 2, 3 + i],
+        }
+    }
+
+    /// `n` of the writer's glyphs as text, a drawer's mixing in its wide and
+    /// complex ones.
+    fn text(self, n: u64, rng: &mut Rng) -> String {
+        (0..n)
+            .map(|_| match (self, rng.below(8)) {
+                (Self::Drawer(_), 0) => self.rich()[0],
+                (Self::Drawer(_), 1) => self.rich()[1],
+                _ => self.glyph(),
+            })
+            .collect()
+    }
+}
+
+/// `n` of drawer `i`'s narrow glyph.
+fn own(i: u8, n: usize) -> String {
+    std::iter::repeat_n(Who::Drawer(i).glyph(), n).collect()
 }
 
 fn token(i: u8) -> u64 {
@@ -92,6 +154,10 @@ impl Rng {
     fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
     }
+
+    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[usize::try_from(self.below(items.len() as u64)).unwrap_or(0)]
+    }
 }
 
 fn term() -> Terminal {
@@ -99,18 +165,115 @@ fn term() -> Terminal {
     Terminal::with_scrollback(ROWS, COLS, 24, scrollback)
 }
 
-/// Whether `cell` is blank or `who`'s.
-fn is_theirs(cell: &crate::grid::Cell, who: Who) -> bool {
-    let c = cell.char_data();
-    let glyph_ok = c == u16::from(b' ') || c == 0 || c == who.glyph();
-    let colors = cell.colors();
-    let bg_ok = colors.bg_is_default() || (colors.bg_is_indexed() && colors.bg_index() == who.bg());
-    glyph_ok && bg_ok
+/// What the oracle reads in a cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shows {
+    /// What an erased cell shows, or a background of the writer asked about.
+    Blank,
+    /// One of that writer's glyphs, in its pen.
+    Own,
+    /// Anything else.
+    Foreign,
 }
 
-/// The oracle: every admitted cell is the current drawer's or blank.
-/// `Ok` counts the admitted main rows holding the drawer's glyph (the
-/// fuzz's measure of what it exercised).
+/// The strokes a blank cell shows: reverse video, any underline, a
+/// strikethrough, an overline (the superscript and subscript bits together).
+fn stroked(flags: CellFlags) -> bool {
+    flags.intersects(CellFlags(
+        CellFlags::INVERSE.0 | CellFlags::ALL_UNDERLINES.0 | CellFlags::STRIKETHROUGH.0,
+    )) || flags.contains(CellFlags::OVERLINE)
+}
+
+/// Read screen cell `(r, c)` of `grid` against `who` (`None`: every mark is
+/// foreign, as the frontier reads it).
+fn shows(grid: &Grid, r: u16, c: u16, who: Option<Who>) -> Shows {
+    let (Some(row), Some(cell)) = (grid.row(r), grid.cell(r, c)) else {
+        return Shows::Blank;
+    };
+    let extra = grid.cell_extra(r, c);
+    let painted = extra.is_some_and(|e| {
+        !e.images().is_empty() || !e.combining().is_empty() || e.hyperlink().is_some()
+    });
+    // A wide glyph's spacer shows its lead; only its own image tile is its.
+    if row.is_cell_wide_continuation(c) {
+        return if extra.is_some_and(|e| !e.images().is_empty()) {
+            Shows::Foreign
+        } else {
+            Shows::Blank
+        };
+    }
+    let flags = cell.flags();
+    if painted || stroked(flags) {
+        return Shows::Foreign;
+    }
+    // A true colour no tier holds draws the default, as the renderer
+    // resolves it.
+    let colors = cell.colors();
+    let bg_rgb = colors.bg_is_rgb().then(|| grid.bg_rgb_at(r, c)).flatten();
+    let bg_default = colors.bg_is_default() || (colors.bg_is_rgb() && bg_rgb.is_none());
+    let fg_default =
+        colors.fg_is_default() || (colors.fg_is_rgb() && grid.fg_rgb_at(r, c).is_none());
+    let pen_bg = who.is_some_and(|w| {
+        (colors.bg_is_indexed() && colors.bg_index() == w.bg()) || bg_rgb == Some(w.rgb())
+    });
+    let bg_ok = bg_default || pen_bg;
+    if cell.is_complex() {
+        let mut text = String::new();
+        let held = grid.push_complex_char_at(r, c, &mut text);
+        let mine = held && who.is_some_and(|w| text == w.rich()[1].to_string());
+        return if mine && bg_ok && fg_default {
+            Shows::Own
+        } else {
+            Shows::Foreign
+        };
+    }
+    let ch = cell.char();
+    if ch == ' ' || ch == '\0' {
+        return if bg_ok { Shows::Blank } else { Shows::Foreign };
+    }
+    // A drawer's glyph in its own pen: no style bit but the wide pair's
+    // and protection's (which draws nothing).
+    let style = flags.0 & !(CellFlags::WIDE.0 | CellFlags::PROTECTED.0 | CellFlags::COMPLEX.0);
+    let mine = who.is_some_and(|w| ch == w.glyph() || ch == w.rich()[0]);
+    if mine && bg_ok && style == 0 && fg_default {
+        Shows::Own
+    } else {
+        Shows::Foreign
+    }
+}
+
+/// The first cell of screen row `r` that is not blank or `who`'s, named; a
+/// double-size row is foreign whole (its size is a row's, not a cell's).
+fn foreign_in(grid: &Grid, r: u16, who: Option<Who>) -> Option<String> {
+    if grid
+        .row(r)
+        .is_some_and(|row| row.line_size() != LineSize::SingleWidth)
+    {
+        return Some(format!("row {r} is double-size"));
+    }
+    (0..grid.cols())
+        .find(|&c| shows(grid, r, c, who) == Shows::Foreign)
+        .map(|c| {
+            format!(
+                "row {r} col {c} holds {:?} {:?} {:?} rgb {:?} extra {:?}",
+                grid.resolved_char(r, c),
+                grid.cell(r, c).map(|cell| cell.flags()),
+                grid.cell(r, c).map(|cell| cell.colors()),
+                (grid.fg_rgb_at(r, c), grid.bg_rgb_at(r, c)),
+                grid.cell_extra(r, c),
+            )
+        })
+}
+
+/// Whether anything is drawn on screen row `r` or below it (the oracle's
+/// frontier, read without the fence's predicate).
+fn drawn_from(grid: &Grid, r: u16) -> bool {
+    (r..grid.rows()).any(|row| foreign_in(grid, row, None).is_some())
+}
+
+/// The oracle: every row of every range the view admits is the current
+/// drawer's or blank. `Ok` counts the admitted main rows holding one of the
+/// drawer's glyphs (the fuzz's measure of what it exercised).
 fn oracle(t: &Terminal) -> Result<u64, String> {
     let fence = t.holder_fence();
     if fence.marks.len() > super::MAX_HOLDER_MARKS {
@@ -129,44 +292,142 @@ fn oracle(t: &Terminal) -> Result<u64, String> {
     }
     let who = Who::Drawer(u8::try_from(view.token - 1000).expect("a drawer token"));
     let main = t.main_grid();
-    let mut drawn = 0;
-    for r in 0..main.rows() {
-        let abs = main.visible_to_absolute(r);
-        if !view.admits_rows(abs, abs + 1) {
-            continue;
-        }
-        if (0..main.cols()).any(|c| {
-            main.cell(r, c)
-                .is_some_and(|cell| cell.char_data() == who.glyph())
-        }) {
-            drawn += 1;
-        }
-        for c in 0..main.cols() {
-            if let Some(cell) = main.cell(r, c)
-                && !is_theirs(cell, who)
+    let rows = main.rows();
+    let base = main.visible_to_absolute(0);
+    let foreign: Vec<Option<String>> = (0..rows).map(|r| foreign_in(main, r, Some(who))).collect();
+    // Every range, not each row alone: the gate admits a range only when one
+    // span holds all of it.
+    for lo in 0..rows {
+        for hi in lo + 1..=rows {
+            if !view.admits_rows(base + u64::from(lo), base + u64::from(hi)) {
+                continue;
+            }
+            if let Some((r, what)) =
+                (lo..hi).find_map(|r| foreign[usize::from(r)].as_ref().map(|w| (r, w)))
             {
                 return Err(format!(
-                    "main row {r} (abs {abs}) col {c} holds {:?} bg {:?} under {who:?}: {view:?}",
-                    char::from_u32(u32::from(cell.char_data())),
-                    cell.colors(),
+                    "rows [{lo}, {hi}) (abs {}) admitted under {who:?}, main row {r}: {what}: {view:?}",
+                    base + u64::from(lo)
                 ));
             }
         }
     }
+    let drawn = (0..rows)
+        .filter(|&r| view.admits_rows(base + u64::from(r), base + u64::from(r) + 1))
+        .filter(|&r| (0..main.cols()).any(|c| shows(main, r, c, Some(who)) == Shows::Own))
+        .count();
     if t.modes().alternate_screen && view.admits_alt() {
         let alt = t.grid();
-        for r in 0..alt.rows() {
-            for c in 0..alt.cols() {
-                if let Some(cell) = alt.cell(r, c)
-                    && !is_theirs(cell, who)
-                {
-                    return Err(format!("alt row {r} col {c} is not {who:?}'s"));
-                }
-            }
+        if let Some(what) = (0..alt.rows()).find_map(|r| foreign_in(alt, r, Some(who))) {
+            return Err(format!("alt screen admitted under {who:?}: {what}"));
         }
     }
-    Ok(drawn)
+    Ok(drawn as u64)
 }
+
+/// The `verify perf` corpora, copied (aterm-core cannot depend on
+/// aterm-bench): the throughput lane's frame and the pathological lane's
+/// five units, at that lane's 24 × 80 geometry.
+struct Corpora {
+    /// Each unit whole, for slices cut anywhere.
+    units: Vec<Vec<u8>>,
+    /// The lines a line-oriented program prints (no cursor addressing, no
+    /// clear), each with its line end.
+    lines: Vec<Vec<u8>>,
+}
+
+fn corpora() -> &'static Corpora {
+    static CORPORA: OnceLock<Corpora> = OnceLock::new();
+    CORPORA.get_or_init(|| {
+        let throughput: [&[u8]; 8] = [
+            b"the quick brown fox jumps over the lazy dog 0123456789\r\n",
+            b"\x1b[1;38;5;202mERROR\x1b[0m \x1b[4;48;5;19mwarning\x1b[0m normal text here\r\n",
+            b"\x1b[2K\x1b[1Gredrawn line after erase-in-line and cursor-to-col-1\r\n",
+            b"\x1b[7minverse\x1b[27m \x1b[3mitalic\x1b[23m \x1b[9mstrike\x1b[29m mixed sgr\r\n",
+            b"\x1b[10;5Hpositioned via CUP \x1b[K then erased to end of line\r\n",
+            b"plain throughput line with a tab\tand more ascii content padding 42\r\n",
+            b"\x1b[38;2;120;200;255mtruecolor\x1b[0m run plus \x1b[48;2;10;10;10mbg\x1b[0m\r\n",
+            b"\x1b[H\x1b[2Jfull clear then home, forcing a screen reset every frame\r\n",
+        ];
+        let mut storm = String::new();
+        for i in 0u32..24 {
+            let (row, col) = (1 + (i * 7) % 24, 1 + (i * 13) % 80);
+            let _ = write!(
+                storm,
+                "\x1b7\x1b[{row};{col}H\x1b[1K*\x1b[{}A\x1b[{}Cx\x1b8",
+                1 + i % 8,
+                1 + i % 11
+            );
+        }
+        storm.push_str("\x1b[H\x1b[2J");
+        let mut churn = Vec::new();
+        for line in 0u32..20 {
+            let mut s = String::new();
+            for cell in line * 80..(line + 1) * 80 {
+                let (r, g, b) = ((cell * 7) & 0xff, (cell * 13) & 0xff, (cell * 29) & 0xff);
+                let ch = char::from(b'a' + u8::try_from(cell % 26).unwrap_or(0));
+                let _ = write!(s, "\x1b[38;2;{r};{g};{b}m\x1b[48;2;{b};{r};{g}m{ch}");
+            }
+            s.push_str("\x1b[0m\r\n");
+            churn.push(s.into_bytes());
+        }
+        let mut url = String::from("https://example.invalid/");
+        while url.len() < 900 {
+            let _ = write!(url, "seg{:04x}/", url.len());
+        }
+        let mut title = String::from("pathological-title-");
+        while title.len() < 600 {
+            let _ = write!(title, "{:03x}", title.len());
+        }
+        let escapes = format!(
+            "\x1b]8;;{url}\x1b\\link text under a kilobyte-long target\x1b]8;;\x1b\\ \
+             \x1b]0;{title}\x07 plain tail\r\n"
+        )
+        .into_bytes();
+        let wide = "漢字テスト混合行 한국어 텍스트 🚀👨\u{200d}👩\u{200d}👧\u{200d}👦🎨 \
+                    e\u{301}e\u{301}e\u{301} Ω≈ç√∫ 中文寬字符壓力測試 🔥💧🌈\r\n"
+            .as_bytes()
+            .to_vec();
+        let mut lines: Vec<Vec<u8>> = [0, 1, 2, 3, 5, 6]
+            .iter()
+            .map(|&i| throughput[i].to_vec())
+            .collect();
+        lines.extend([b"y\r\n".to_vec(), escapes.clone(), wide.clone()]);
+        lines.extend(churn.iter().cloned());
+        Corpora {
+            units: vec![
+                throughput.concat(),
+                b"y\r\n".to_vec(),
+                storm.into_bytes(),
+                churn.concat(),
+                escapes,
+                wide,
+            ],
+            lines,
+        }
+    })
+}
+
+/// What a non-drawer draws besides its glyph: wide and complex clusters,
+/// combining marks (one on a space), true colours, a DECDWL row, protected
+/// cells, reversed, underlined, struck, overlined and linked blanks, and
+/// images (the cursor left in place, or moved past).
+const RICH: &[&str] = &[
+    "漢字テ",
+    "👨\u{200d}👩\u{200d}👧 🚀",
+    "e\u{301}a\u{308} \u{301}",
+    "\x1b[38;2;9;9;9;48;2;200;10;10mrgb \x1b[49m ",
+    "\x1b#6dw",
+    "\x1b[1\"qprot\x1b[0\"q",
+    "\x1b[7m  \x1b[27m",
+    "\x1b[4m \x1b[4:3m \x1b[21m \x1b[24m",
+    "\x1b[9m \x1b[53m \x1b[0m",
+    "\x1b]8;;https://x.invalid/a\x1b\\  \x1b]8;;\x1b\\",
+    KITTY_IMAGE,
+    SIXEL_IMAGE,
+    ITERM_IMAGE,
+    "\x1b_Ga=T,f=24,s=1,v=1,c=3,r=1;AAAA\x1b\\",
+];
 
 /// The process world around the terminal.
 struct Sim {
@@ -178,16 +439,23 @@ struct Sim {
     stopped: Vec<u8>,
     alive: [bool; DRAWERS as usize],
     /// The seed's share of hostile writes, in percent: screen-addressed
-    /// writes left where they ended, rectangle copies, margined edits, RIS,
-    /// unscrolls. The rest are a line-oriented program's.
+    /// writes left where they ended, corpus slices, rectangle copies,
+    /// margined edits, RIS, unscrolls. The rest are a line-oriented
+    /// program's.
     noise: u64,
+    /// A double-size row was ever drawn: it is resized in place, never
+    /// rewrapped, so a width change's lend cannot vouch for the lines around
+    /// it and fails closed (the frontier law does not hold after one).
+    double_size: bool,
+    /// Resizes the frontier law judged (its premises held).
+    frontier_resizes: u64,
     log: Vec<String>,
 }
 
 impl Sim {
     fn new(seed: u64) -> Self {
         let mut rng = Rng(seed);
-        let noise = [3, 12, 40][usize::try_from(rng.below(3)).unwrap_or(0)];
+        let noise = *rng.pick(&[3, 12, 40]);
         Self {
             t: term(),
             rng,
@@ -196,6 +464,8 @@ impl Sim {
             parent: None,
             stopped: Vec::new(),
             alive: [false; DRAWERS as usize],
+            double_size: false,
+            frontier_resizes: 0,
             log: Vec::new(),
         }
     }
@@ -212,6 +482,7 @@ impl Sim {
     fn write(&mut self, bytes: &[u8]) {
         let mut out = self.pen();
         out.extend_from_slice(bytes);
+        self.double_size |= out.windows(2).any(|w| w == b"\x1b#");
         self.log.push(format!(
             "{:?} writes {:?}",
             self.fg,
@@ -220,27 +491,63 @@ impl Sim {
         self.t.process(&out);
     }
 
+    /// The foreground's pen: no link, no protection, every SGR reset, then
+    /// the default background, its indexed one or its true colour.
     fn pen(&mut self) -> Vec<u8> {
-        if self.rng.chance(25) {
-            b"\x1b[0m".to_vec()
-        } else {
-            format!("\x1b[0;48;5;{}m", self.fg.bg()).into_bytes()
+        let mut b = b"\x1b]8;;\x1b\\\x1b[0\"q".to_vec();
+        match self.rng.below(4) {
+            0 => b.extend_from_slice(b"\x1b[0m"),
+            1 => {
+                let [r, g, bl] = self.fg.rgb();
+                b.extend(format!("\x1b[0;48;2;{r};{g};{bl}m").into_bytes());
+            }
+            _ => b.extend(format!("\x1b[0;48;5;{}m", self.fg.bg()).into_bytes()),
         }
+        b
     }
 
     fn glyphs(&mut self, n: u64) -> Vec<u8> {
-        let g = u8::try_from(self.fg.glyph()).expect("an ASCII glyph");
         let mut out = self.pen();
-        out.extend(std::iter::repeat_n(g, usize::try_from(n).unwrap_or(0)));
+        out.extend(self.fg.text(n, &mut self.rng).into_bytes());
         out
+    }
+
+    /// A non-drawer's rich payload or corpus line, else its glyphs.
+    fn foreign_line(&mut self, n: u64) -> Vec<u8> {
+        if matches!(self.fg, Who::Drawer(_)) {
+            return self.glyphs(n);
+        }
+        match self.rng.below(4) {
+            0 => {
+                let mut b = self.pen();
+                b.extend_from_slice(self.rng.pick(RICH).as_bytes());
+                b
+            }
+            1 => {
+                let mut b = self.pen();
+                b.extend_from_slice(self.rng.pick(&corpora().lines));
+                b
+            }
+            _ => self.glyphs(n),
+        }
+    }
+
+    /// A slice of a corpus cut anywhere (in an escape, a string or a UTF-8
+    /// sequence), then CAN, which ends whatever it broke off.
+    fn corpus_slice(&mut self) -> Vec<u8> {
+        let unit = self.rng.pick(&corpora().units);
+        let start = usize::try_from(self.rng.below(unit.len() as u64)).unwrap_or(0);
+        let len = usize::try_from(self.rng.below(200) + 1).unwrap_or(1);
+        let mut b = unit[start..(start + len).min(unit.len())].to_vec();
+        b.push(0x18);
+        b
     }
 
     fn dead_drawer(&mut self) -> Option<u8> {
         let dead: Vec<u8> = (0..DRAWERS)
             .filter(|&i| !self.alive[usize::from(i)])
             .collect();
-        (!dead.is_empty())
-            .then(|| dead[usize::try_from(self.rng.below(dead.len() as u64)).unwrap_or(0)])
+        (!dead.is_empty()).then(|| *self.rng.pick(&dead))
     }
 
     /// The current holder's open span's first screen row, if on screen.
@@ -277,8 +584,7 @@ impl Sim {
             .filter_map(|r| r.checked_sub(base).and_then(|s| u16::try_from(s).ok()))
             .filter(|&s| s < main.rows())
             .collect();
-        (!rows.is_empty())
-            .then(|| rows[usize::try_from(self.rng.below(rows.len() as u64)).unwrap_or(0)])
+        (!rows.is_empty()).then(|| *self.rng.pick(&rows))
     }
 
     /// Whether this step's writer behaves (the seed's noise decides).
@@ -296,7 +602,7 @@ impl Sim {
         }
         let main = self.t.main_grid();
         let rows = main.rows();
-        let bytes = match (0..rows).find(|&r| !main.has_ink_from(r, 0)) {
+        let bytes = match (0..rows).find(|&r| !drawn_from(main, r)) {
             Some(r) => format!("\x1b[0m\x1b[{};1H", r + 1),
             None => format!("\x1b[0m\x1b[{rows};1H\r\n"),
         };
@@ -304,12 +610,12 @@ impl Sim {
         self.t.process(bytes.as_bytes());
     }
 
-    /// `n` lines of the writer's glyphs, each ended (with a reset pen) at
-    /// `ended` percent.
+    /// A line of the writer's (a non-drawer's sometimes rich or a corpus
+    /// line), ended (with a reset pen) at `ended` percent.
     fn lines(&mut self, ended: u64) -> Vec<u8> {
         let cols = u64::from(self.t.grid().cols());
         let n = self.rng.below(cols * 2 + 1);
-        let mut b = self.glyphs(n);
+        let mut b = self.foreign_line(n);
         if self.rng.chance(ended) {
             b.extend_from_slice(b"\x1b[0m\r\n");
         }
@@ -323,7 +629,7 @@ impl Sim {
         b.extend_from_slice(b"\x1b[H\x1b[2J");
         for _ in 0..=self.rng.below(4) {
             let n = self.rng.below(cols) + 1;
-            b.extend(self.glyphs(n));
+            b.extend(self.foreign_line(n));
             b.extend_from_slice(b"\x1b[0m\r\n");
         }
         b
@@ -362,7 +668,7 @@ impl Sim {
     /// 1049, 47 or 1047, set or reset. A screen swap renumbers no main row,
     /// so it never loses the anchors (the swap's liveness).
     fn alt_step(&mut self) -> Result<(), String> {
-        let mode = ["1049", "47", "1047"][usize::try_from(self.rng.below(3)).unwrap_or(0)];
+        let mode = *self.rng.pick(&["1049", "47", "1047"]);
         let set = if self.rng.chance(55) { 'h' } else { 'l' };
         let held = !self.t.main_grid().anchors().lost();
         let mut b = self.pen();
@@ -402,7 +708,7 @@ impl Sim {
                     b.extend_from_slice(b"\x1b[2K");
                 } else {
                     let n = self.rng.below(cols) + 1;
-                    b.extend(self.glyphs(n));
+                    b.extend(self.foreign_line(n));
                 }
                 b.extend_from_slice(b"\x1b8");
                 b
@@ -422,8 +728,9 @@ impl Sim {
     fn step(&mut self) -> Result<u64, String> {
         match self.rng.below(100) {
             0..=11 => self.cut_step(),
-            12..=89 => self.write_step()?,
-            90..=96 => self.resize_step()?,
+            12..=88 => self.write_step()?,
+            89..=94 => self.resize_step()?,
+            95 | 96 => self.reveal_step()?,
             _ => self.checkpoint_step()?,
         }
         self.stopped_keep_marks()?;
@@ -565,10 +872,10 @@ impl Sim {
         }
         let rows = u64::from(self.t.grid().rows());
         let cols = u64::from(self.t.grid().cols());
-        let bytes: Vec<u8> = match self.rng.below(30) {
+        let bytes: Vec<u8> = match self.rng.below(32) {
             0..=7 => {
                 let n = self.rng.below(cols * 2 + 1);
-                let mut b = self.glyphs(n);
+                let mut b = self.foreign_line(n);
                 if self.rng.chance(70) {
                     b.extend_from_slice(b"\r\n");
                 }
@@ -582,7 +889,7 @@ impl Sim {
                 };
                 let mut b = format!("\x1b[{};{}H", row + 1, self.rng.below(cols) + 1).into_bytes();
                 let n = self.rng.below(cols);
-                b.extend(self.glyphs(n));
+                b.extend(self.foreign_line(n));
                 b
             }
             11 => {
@@ -635,6 +942,7 @@ impl Sim {
                 let op = if self.rng.chance(50) { "'}" } else { "'~" };
                 format!("\x1b[{}{op}", self.rng.below(3) + 1).into_bytes()
             }
+            28 | 29 if !matches!(self.fg, Who::Drawer(_)) => self.corpus_slice(),
             _ => b"\r\n".to_vec(),
         };
         self.write(&bytes);
@@ -711,12 +1019,13 @@ impl Sim {
     /// owed under the screen (a bottom-push's rows, which a width change
     /// hands back below the cursor); a width change must also find the
     /// cursor's line readable from its head, before and after, since the
-    /// lend vouches for no line it cannot read whole.
+    /// lend vouches for no line it cannot read whole, and no double-size row
+    /// drawn (see [`Sim::double_size`]).
     fn resize_step(&mut self) -> Result<(), String> {
         let main = self.t.main_grid();
         let held = main.anchors().live_count() > 0 && !main.anchors().lost();
         let frontier =
-            !main.has_ink_from(main.cursor().row.saturating_add(1), 0) && main.pushed_rows() == 0;
+            !drawn_from(main, main.cursor().row.saturating_add(1)) && main.pushed_rows() == 0;
         let readable = main.lend_reads_cursor_line();
         let (rows, cols) = (self.t.grid().rows(), self.t.grid().cols());
         let rows2 = u16::try_from(self.rng.below(6) + 6).unwrap_or(ROWS);
@@ -744,8 +1053,42 @@ impl Sim {
         let after = self.t.main_grid();
         let lent = after.cols() != cols;
         let read_whole = !lent || (readable && after.lend_reads_cursor_line());
-        if held && frontier && read_whole && after.anchors().lost() {
-            return Err("a resize with the cursor at the frontier lost the anchors".into());
+        if held && frontier && read_whole && !self.double_size {
+            self.frontier_resizes += 1;
+            if after.anchors().lost() {
+                return Err("a resize with the cursor at the frontier lost the anchors".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// A stopped drawer's rows revealed from history and rewritten: the
+    /// window grows (the newest history comes back on top), the foreground
+    /// rewrites a revealed row in place, often one of a stopped drawer's,
+    /// and sometimes the window shrinks back.
+    fn reveal_step(&mut self) -> Result<(), String> {
+        if self.stopped.is_empty() || self.t.modes().alternate_screen {
+            return self.resize_step();
+        }
+        let (rows, cols) = (self.t.grid().rows(), self.t.grid().cols());
+        let grown = rows + u16::try_from(self.rng.below(4) + 1).unwrap_or(1);
+        self.log.push(format!(
+            "reveal: rows-only resize {rows}x{cols} to {grown}x{cols}"
+        ));
+        self.t.resize(grown, cols);
+        let row = match self.suspended_screen_row() {
+            Some(r) if self.rng.chance(70) => r,
+            _ => u16::try_from(self.rng.below(u64::from(grown - rows) + 1)).unwrap_or(0),
+        };
+        let n = self.rng.below(u64::from(cols)) + 1;
+        let mut b = format!("\x1b7\x1b[{};1H", row + 1).into_bytes();
+        b.extend(self.foreign_line(n));
+        b.extend_from_slice(b"\x1b8");
+        self.write(&b);
+        if self.rng.chance(50) {
+            self.log
+                .push(format!("rows-only resize {grown}x{cols} to {rows}x{cols}"));
+            self.t.resize(rows, cols);
         }
         Ok(())
     }
@@ -764,16 +1107,30 @@ impl Sim {
                 restored.grid().oldest_absolute_row(),
             ));
         }
-        // In place, as the seamless adopt does.
+        // In place, as the seamless adopt does. The host then makes its
+        // one actual holder adoption before any more output is fed.
         restored.restore_checkpoint(&c);
+        let (holder, drawer) = match self.fg {
+            Who::Drawer(i) => (token(i), true),
+            _ => (0, false),
+        };
+        restored.adopt_holder_after_restore(holder, drawer);
         self.t = restored;
         Ok(())
     }
 }
 
+/// What a run exercised: the admitted drawer rows the oracle checked, and
+/// the resizes the frontier law judged.
+#[derive(Clone, Copy, Debug, Default)]
+struct Coverage {
+    drawn: u64,
+    frontier: u64,
+}
+
 /// Run one seed; `Err` names the first violation with the steps that led
-/// to it, `Ok` the admitted drawer rows the oracle checked.
-fn fuzz(seed: u64, steps: usize) -> Result<u64, String> {
+/// to it.
+fn fuzz(seed: u64, steps: usize) -> Result<Coverage, String> {
     let mut sim = Sim::new(seed);
     let mut drawn = 0;
     for _ in 0..steps {
@@ -788,26 +1145,36 @@ fn fuzz(seed: u64, steps: usize) -> Result<u64, String> {
             }
         }
     }
-    Ok(drawn)
+    Ok(Coverage {
+        drawn,
+        frontier: sim.frontier_resizes,
+    })
 }
 
 const SEEDS: u64 = 1000;
 const STEPS: usize = 220;
+/// About half of what these seeds exercise: 144 199 admitted drawer rows and
+/// 2 812 frontier resizes when written.
+const DRAWN_FLOOR: u64 = 70_000;
+const FRONTIER_FLOOR: u64 = 1_400;
 
 #[test]
 fn every_admitted_cell_is_the_current_drawers_or_blank() {
-    let mut drawn = 0;
+    let mut total = Coverage::default();
     for seed in 0..SEEDS {
         match fuzz(seed, STEPS) {
-            Ok(n) => drawn += n,
+            Ok(c) => {
+                total.drawn += c.drawn;
+                total.frontier += c.frontier;
+            }
             Err(e) => panic!("{e}"),
         }
     }
-    // Not vacuous: a fence that admitted nothing would pass the oracle.
-    // The author reported 133 729 admitted drawer rows for these seeds.
+    // Not vacuous: a fence that admitted nothing would pass the oracle, and
+    // one that lost at every resize would pass a law it never judged.
     assert!(
-        drawn >= 60_000,
-        "the fuzz checked only {drawn} admitted drawer rows"
+        total.drawn >= DRAWN_FLOOR && total.frontier >= FRONTIER_FLOOR,
+        "the fuzz exercised too little: {total:?}"
     );
 }
 
@@ -815,10 +1182,12 @@ fn every_admitted_cell_is_the_current_drawers_or_blank() {
 
 /// Draw a card: three rows of the drawer's glyph on its background.
 fn card(i: u8) -> Vec<u8> {
-    let who = Who::Drawer(i);
-    let glyph = char::from(u8::try_from(who.glyph()).expect("ASCII"));
-    let row: String = std::iter::repeat_n(glyph, 6).collect();
-    format!("\x1b[48;5;{}m{row}\r\n{row}\r\n{row}\x1b[0m\r\n", who.bg()).into_bytes()
+    let row = own(i, 6);
+    format!(
+        "\x1b[48;5;{}m{row}\r\n{row}\r\n{row}\x1b[0m\r\n",
+        Who::Drawer(i).bg()
+    )
+    .into_bytes()
 }
 
 /// The absolute rows of the last card drawn, `[start, end)`.
@@ -826,7 +1195,7 @@ fn card_rows(t: &Terminal, i: u8) -> (u64, u64) {
     let main = t.main_grid();
     let glyph = Who::Drawer(i).glyph();
     let rows: Vec<u64> = (0..main.rows())
-        .filter(|&r| main.cell(r, 0).is_some_and(|c| c.char_data() == glyph))
+        .filter(|&r| main.cell(r, 0).is_some_and(|c| c.char() == glyph))
         .map(|r| main.visible_to_absolute(r))
         .collect();
     (rows[0], rows[rows.len() - 1] + 1)
@@ -1106,7 +1475,7 @@ fn a_background_row_handed_back_under_the_cursor_is_not_admitted() {
     t.resize(5, COLS);
     assert!(t.main_grid().pushed_rows() > 0, "precondition: rows owed");
     t.note_holder_cut(group(Some(token(0)), true));
-    t.process(b"\x1b[48;5;170mAAAA\x1b[0m\r\n");
+    t.process(format!("\x1b[48;5;170m{}\x1b[0m\r\n", own(0, 4)).as_bytes());
     assert_eq!(oracle(&t), Ok(1));
     t.resize(5, COLS + 4);
     let main = t.main_grid();
@@ -1117,6 +1486,456 @@ fn a_background_row_handed_back_under_the_cursor_is_not_admitted() {
     assert!(back, "precondition: the width change handed the row back");
     assert_eq!(oracle(&t), Ok(0), "the span admits none of it");
     assert!(main.anchors().lost(), "the lend saw a drawn line come in");
+}
+
+/// A bottom-push owes a row of another writer's background under the screen,
+/// the continuation of a blank wrapped line the cursor stands on. A width
+/// change rotates it back onto the cursor's own line, which the glyph trail
+/// cannot tell from blank: the lend refuses while rows are owed, so the span
+/// admits none of it. Found by the writer oracle at 31 346 seeds and more.
+#[test]
+fn a_pushed_row_rotated_onto_the_cursors_line_is_not_admitted() {
+    let other = Who::Drawer(1);
+    for (rows, cols, offloaded) in [
+        (9, COLS + 4, false),
+        (9, COLS + 4, true),
+        (6, COLS + 4, true),
+    ] {
+        let mut t = term();
+        // A blank line wrapping into one cell of the other writer's
+        // background, the cursor homed: the shrink pushes that cell's row.
+        t.process(
+            format!(
+                "\x1b[9;1H{}\x1b[48;5;{}m \x1b[0m\x1b[H",
+                " ".repeat(usize::from(COLS)),
+                other.bg()
+            )
+            .as_bytes(),
+        );
+        t.resize(9, COLS);
+        assert_eq!(t.main_grid().pushed_rows(), 1, "precondition: a row owed");
+        // The frontier: the wrapped line's head, blank to the screen's end.
+        t.process(b"\x1b[9;1H");
+        t.note_holder_cut(group(Some(token(0)), true));
+        assert!(!t.holder_view().tainted, "precondition: nothing drawn");
+        if offloaded {
+            let mut pending = t.resize_offloading_scrollback(rows, cols);
+            while let Some(job) = pending {
+                pending = t.finish_resize_offload(job.reflow());
+            }
+        } else {
+            t.resize(rows, cols);
+        }
+        let main = t.main_grid();
+        let back = (0..main.rows()).any(|r| {
+            (0..main.cols()).any(|c| {
+                main.cell(r, c).is_some_and(|cell| {
+                    cell.colors().bg_is_indexed() && cell.colors().bg_index() == other.bg()
+                })
+            })
+        });
+        assert!(back, "precondition: the resize handed the row back");
+        assert_eq!(
+            oracle(&t),
+            Ok(0),
+            "{rows}x{cols}: the span admits none of it"
+        );
+        assert!(main.anchors().lost(), "the lend refused the owed rows");
+    }
+}
+
+/// Ink below the cursor at the lay is anything an erased default cell does
+/// not show: a reversed, underlined, struck or overlined blank, an image (an
+/// image writes no glyph). Bold or coloured-foreground spaces show nothing.
+#[test]
+fn the_lay_taints_on_every_kind_of_ink() {
+    let tainted = |ink: &str| {
+        let mut t = term();
+        t.process(format!("\x1b[5;1H{ink}\x1b[0m\x1b[2;1H").as_bytes());
+        t.note_holder_cut(group(Some(token(0)), true));
+        t.holder_view().tainted
+    };
+    for (ink, why) in [
+        ("\x1b[7m   ", "reverse video"),
+        ("\x1b[4m   ", "an underline"),
+        ("\x1b[4:3m   ", "a curly underline"),
+        ("\x1b[9m   ", "a strikethrough"),
+        ("\x1b[53m   ", "an overline"),
+        (KITTY_IMAGE, "a kitty image"),
+        (SIXEL_IMAGE, "a sixel image"),
+        (ITERM_IMAGE, "an iTerm2 image"),
+        ("\x1b[41m   ", "a background"),
+        ("x", "a glyph"),
+        ("\x1b#6x\x1b[2K", "an erased double-width row"),
+        ("\x1b#3\x1b[2K", "an erased double-height row"),
+    ] {
+        assert!(tainted(ink), "{why} below the cursor taints the lay");
+    }
+    for (ink, why) in [
+        ("\x1b[1m   ", "bold"),
+        ("\x1b[3m   ", "italic"),
+        ("\x1b[31m   ", "a foreground colour"),
+        ("\x1b[8m   ", "hidden"),
+    ] {
+        assert!(!tainted(ink), "{why} spaces show nothing");
+    }
+}
+
+/// A Kitty image, 4 × 2 cells, the cursor left where it was.
+const KITTY_IMAGE: &str = "\x1b_Ga=T,f=24,s=1,v=1,c=4,r=2,C=1;AAAA\x1b\\";
+/// A sixel image, 8 × 18 pixels.
+const SIXEL_IMAGE: &str = "\x1bPq#0;2;100;0;0#0~~~~~~~~-~~~~~~~~-~~~~~~~~\x1b\\";
+/// An iTerm2 inline image, 4 × 2 cells (a 1 × 1 PNG).
+const ITERM_IMAGE: &str = "\x1b]1337;File=inline=1;width=4;height=2;preserveAspectRatio=0:\
+    iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\x07";
+
+/// A stopped drawer's card whose cells already carry extras (a link): an
+/// image another writer places over it adds a layer and changes no cell, so
+/// only a seal that reads the image layers sees it. Cut at `fg`.
+#[test]
+fn an_image_placed_over_a_stopped_card_is_cut_at_fg() {
+    let mut t = term();
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(
+        format!(
+            "\x1b]8;;https://example.com\x07{0}\x1b]8;;\x07\r\n{0}\r\n",
+            own(0, 6)
+        )
+        .as_bytes(),
+    );
+    let card = card_rows(&t, 0);
+    t.note_holder_cut(group(None, true));
+    let row = card.0 - t.main_grid().visible_to_absolute(0);
+    t.process(format!("\x1b7\x1b[{};1H{KITTY_IMAGE}\x1b8", row + 1).as_bytes());
+    assert!(
+        !t.images_row(usize::try_from(row).unwrap()).is_empty(),
+        "precondition: the image covers the card's first row"
+    );
+    t.note_holder_cut(group(Some(token(0)), true));
+    let view = t.holder_view();
+    assert!(!view.admits_rows(card.0, card.0 + 1), "{view:?}");
+    assert_eq!(oracle(&t), Ok(0));
+}
+
+/// A history row a stopped drawer's seal trusts (it was history at the seal,
+/// so nobody could write it) is trusted only while nothing re-keys history:
+/// a rows grow reveals it onto the screen, where the shell can rewrite it.
+#[test]
+fn a_revealed_history_row_rewritten_while_stopped_is_cut_at_fg() {
+    let mut t = term();
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(&card(0));
+    let card = card_rows(&t, 0);
+    t.process(
+        format!("{}\r\n", own(0, 6))
+            .repeat(usize::from(ROWS))
+            .as_bytes(),
+    );
+    assert!(
+        t.main_grid().visible_to_absolute(0) >= card.1,
+        "precondition: the card is history at the stop"
+    );
+    t.note_holder_cut(group(None, true));
+    // The window grows: the newest history comes back on top.
+    t.resize(ROWS + 8, COLS);
+    let base = t.main_grid().visible_to_absolute(0);
+    assert!(
+        base <= card.0,
+        "precondition: the card is on the screen again"
+    );
+    let row = card.0 - base;
+    t.process(format!("\x1b7\x1b[{};1Hssssss\x1b8", row + 1).as_bytes());
+    t.note_holder_cut(group(Some(token(0)), true));
+    let view = t.holder_view();
+    assert!(!view.admits_rows(card.0, card.0 + 1), "{view:?}");
+    assert_eq!(oracle(&t).map(|_| ()), Ok(()));
+}
+
+/// The gate admits a range only when one span holds all of it: not a range
+/// that starts above the lay on another drawer's card, not one that
+/// straddles the gap between two spans, not one that runs past a span's end.
+#[test]
+fn a_range_one_span_does_not_hold_is_not_admitted() {
+    let mut t = Terminal::new(30, 20);
+    t.note_holder_cut(group(Some(token(1)), true));
+    t.process(&card(1));
+    let other = card_rows(&t, 1);
+    t.note_holder_cut(group(None, false));
+    t.process(b"$ claude\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(&card(0));
+    t.note_holder_cut(group(None, true));
+    t.process(b"$ ls\r\nsss\r\n$ fg\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(b"AAAA\r\n");
+    let view = t.holder_view();
+    let [first, open] = view.spans() else {
+        panic!("precondition: two spans, {view:?}");
+    };
+    assert!(first.1 < open.0, "precondition: a gap between them");
+    assert!(view.admits_rows(first.0, first.1), "a whole span");
+    assert!(view.admits_rows(open.0, open.0 + 1));
+    for (lo, hi, why) in [
+        (other.0, first.1, "from another drawer's card into the span"),
+        (first.0 - 1, first.0 + 1, "across the span's start"),
+        (first.0, first.1 + 1, "past the span's end"),
+        (first.0, open.0 + 1, "across the gap between two spans"),
+    ] {
+        assert!(!view.admits_rows(lo, hi), "{why}: [{lo}, {hi}) {view:?}");
+    }
+}
+
+/// The crash journal's Exact rung is a keyframe and a replay of every byte
+/// after it, and no cut is journaled. A Ctrl-Z, `clear; cat card`, `fg`
+/// inside the tail replays as bytes with the drawer still current, so a
+/// carried mark that continued would admit the cat'd card: the tail fails
+/// closed: neither the current mark nor its old signed C admits the tail.
+/// With no byte after the keyframe the carried mark continues.
+#[test]
+fn a_tail_replayed_after_the_keyframe_does_not_continue_the_carried_mark() {
+    let mut t = term();
+    t.process(b"$ claude\r\n");
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(&card(0));
+    let keyframe = t.checkpoint();
+    let tail = [b"\x1b[H\x1b[2J".as_slice(), &card(1)].concat();
+    // Live: the cuts reach the fence.
+    t.note_holder_cut(group(None, true));
+    t.process(&tail);
+    t.note_holder_cut(group(Some(token(0)), true));
+    let cat = card_rows(&t, 1);
+    assert!(!t.holder_view().admits_rows(cat.0, cat.1), "live: cut");
+    // Restored from the keyframe and the tail, by either door.
+    let mut fresh = Terminal::from_checkpoint(&keyframe);
+    let mut in_place = term();
+    in_place.restore_checkpoint(&keyframe);
+    for restored in [&mut fresh, &mut in_place] {
+        restored.process(&tail);
+        assert_ne!(
+            restored.adopt_holder_after_restore(token(0), true),
+            HolderAdoption::Continued
+        );
+        let view = restored.holder_view();
+        assert!(!view.admits_rows(cat.0, cat.1), "restored: {view:?}");
+        assert_eq!(oracle(restored).map(|_| ()), Ok(()));
+    }
+    // No byte after the keyframe: the carried mark is the screen's.
+    let mut restored = Terminal::from_checkpoint(&keyframe);
+    assert_eq!(
+        restored.adopt_holder_after_restore(token(0), true),
+        HolderAdoption::Continued
+    );
+    let own = card_rows(&restored, 0);
+    assert!(restored.holder_view().admits_rows(own.0, own.1));
+    let mut again = Terminal::from_checkpoint(&keyframe);
+    again.process(b"");
+    assert_eq!(
+        again.adopt_holder_after_restore(token(0), true),
+        HolderAdoption::Continued,
+        "an empty read is no byte"
+    );
+
+    // A signed C in the keyframe is not fresh authority after a replay:
+    // the reader uses a new nonce, so the tail's old D/A/B/C can be ignored
+    // and leave the keyframe's Executing block and output start in place.
+    let (signed, above, under) = session_with_card_under_c();
+    let mut signed = Terminal::from_checkpoint(&signed.checkpoint());
+    assert_eq!(
+        signed.adopt_holder_after_restore(token(1), true),
+        HolderAdoption::Seeded
+    );
+    assert!(signed.holder_view().admits_rows(under.0, under.1));
+    signed.note_holder_cut(group(None, true));
+    signed.note_holder_cut(group(Some(token(2)), true));
+    signed.process(&card(2));
+    signed.note_holder_cut(group(None, true));
+    signed.note_holder_cut(group(Some(token(1)), true));
+    let keyframe = signed.checkpoint();
+    let stopped = keyframe
+        .holder
+        .marks
+        .iter()
+        .find(|m| m.token == token(2))
+        .unwrap()
+        .clone();
+    let old_id = super::super::ShellIntegrationNonce([7u8; 32]).to_hex();
+    let top = signed.main_grid().visible_to_absolute(0);
+    let row = under.0 - top;
+    // Remove the older same-glyph card one row at a time, then overwrite
+    // the running block's card. Unlike ED2, EL does not rebase that block's
+    // output start to the screen top: the stale C keeps the exact seed range.
+    let erase_above = (above.0..above.1)
+        .map(|absolute| format!("\x1b[{};1H\x1b[2K", absolute - top + 1))
+        .collect::<String>();
+    let tail = format!(
+        "\x1b]133;D;0;id={old_id}\x07\x1b]133;A;id={old_id}\x07\
+         \x1b]133;B;id={old_id}\x07cat card\r\n\x1b]133;C;id={old_id}\x07\
+         {erase_above}\x1b[{};1H{}",
+        row + 1,
+        String::from_utf8(card(0)).unwrap()
+    );
+    for recapture in [false, true] {
+        let mut replayed = Terminal::from_checkpoint(&keyframe);
+        replayed.authorize_shell_integration([9u8; 32]);
+        assert!(replayed.shell.current_block.as_ref().is_some_and(|b| {
+            b.state == super::super::BlockState::Executing && b.output_start_row == Some(under.0)
+        }));
+        let started = replayed.started_command_seq();
+        replayed.process(tail.as_bytes());
+        assert_eq!(
+            replayed.started_command_seq(),
+            started,
+            "the old C was rejected"
+        );
+        assert_eq!(
+            card_rows(&replayed, 0),
+            under,
+            "the foreign card occupies the old seed range"
+        );
+        assert!(
+            replayed.shell.current_block.as_ref().is_some_and(|b| {
+                b.state == super::super::BlockState::Executing
+                    && b.output_start_row == Some(under.0)
+            }),
+            "precondition: the old signed block survived the new-nonce replay"
+        );
+        let after = replayed.checkpoint();
+        assert!(after.holder.seed_untrusted);
+        // Negative control: losing only the uncertainty bit makes this
+        // same running block a seed for a different claimed drawer again.
+        let mut forgotten = replayed.checkpoint();
+        forgotten.holder.seed_untrusted = false;
+        let mut unguarded = Terminal::from_checkpoint(&forgotten);
+        assert_eq!(
+            unguarded.adopt_holder_after_restore(token(0), true),
+            HolderAdoption::Seeded
+        );
+        assert!(unguarded.holder_view().admits_rows(under.0, under.1));
+        assert_eq!(
+            after.holder.marks.iter().find(|m| m.token == token(2)),
+            Some(&stopped)
+        );
+        let mut adopted = if recapture {
+            Terminal::from_checkpoint(&after)
+        } else {
+            replayed
+        };
+        assert_eq!(
+            adopted.adopt_holder_after_restore(token(1), true),
+            HolderAdoption::Bare
+        );
+        assert!(!adopted.holder_view().admits_rows(under.0, under.1));
+        assert!(adopted.holder_fence().tokens().any(|t| t == token(2)));
+        assert_eq!(
+            adopted.adopt_holder_after_restore(token(1), true),
+            HolderAdoption::Bare,
+            "a second adoption cannot resurrect the old C"
+        );
+        let mut again = Terminal::from_checkpoint(&adopted.checkpoint());
+        assert_eq!(
+            again.adopt_holder_after_restore(token(0), true),
+            HolderAdoption::Bare,
+            "neither another token nor another checkpoint restores seed authority"
+        );
+        // A known holder may earn its current rows again by clearing. That
+        // valid untouched current mark continues; the stale C stays disabled.
+        adopted.process(b"\x1b[H\x1b[2J");
+        adopted.process(&card(1));
+        let owned = card_rows(&adopted, 1);
+        let mut restored = Terminal::from_checkpoint(&adopted.checkpoint());
+        assert_eq!(
+            restored.adopt_holder_after_restore(token(1), true),
+            HolderAdoption::Continued
+        );
+        assert!(restored.holder_view().admits_rows(owned.0, owned.1));
+    }
+    // No fence (an older producer) still needs to carry tail uncertainty.
+    let (legacy, _, _) = session_with_card_under_c();
+    let mut replayed = Terminal::from_checkpoint(&legacy.checkpoint());
+    replayed.authorize_shell_integration([9u8; 32]);
+    replayed.process(tail.as_bytes());
+    let after = replayed.checkpoint();
+    assert!(after.holder.marks.is_empty() && after.holder.seed_untrusted);
+    assert!(
+        !after.holder.is_empty(),
+        "the wire must keep the uncertainty bit"
+    );
+    let mut restored = Terminal::from_checkpoint(&after);
+    assert_eq!(
+        restored.adopt_holder_after_restore(token(1), true),
+        HolderAdoption::Bare
+    );
+}
+
+/// The restore seed needs the command still running: a finished block's
+/// output start names rows a later command may have written.
+#[test]
+fn a_restore_seed_needs_a_running_block() {
+    let (mut t, _, under) = session_with_card_under_c();
+    let id = super::super::ShellIntegrationNonce([7u8; 32]).to_hex();
+    t.process(format!("\x1b]133;D;0;id={id}\x07").as_bytes());
+    let mut adopted = Terminal::from_checkpoint(&t.checkpoint());
+    assert_eq!(
+        adopted.adopt_holder_after_restore(token(1), true),
+        HolderAdoption::Bare
+    );
+    assert!(!adopted.holder_view().admits_rows(under.0, under.1));
+}
+
+/// Eight stopped drawers of four spans each hold every anchor the grid has:
+/// a ninth drawer's mark evicts the oldest before it lays its span, so it
+/// gets one.
+#[test]
+fn a_new_drawer_at_full_anchor_capacity_gets_its_span() {
+    let mut t = Terminal::new(150, 20);
+    for i in 0..8u8 {
+        t.note_holder_cut(group(Some(token(i)), true));
+        t.process(b"AAAA\r\n");
+        t.note_holder_cut(group(None, true));
+    }
+    for _ in 0..3 {
+        for i in 0..8u8 {
+            t.note_holder_cut(group(Some(token(i)), true));
+            t.process(b"AAAA\r\n");
+            t.note_holder_cut(group(None, true));
+            t.process(b"$\r\n");
+        }
+    }
+    assert_eq!(t.holder_fence().marks.len(), super::MAX_HOLDER_MARKS);
+    assert_eq!(
+        t.grid().anchors().live_count(),
+        aterm_grid::MAX_ANCHORS,
+        "precondition: every anchor is held"
+    );
+    t.note_holder_cut(group(Some(token(9)), true));
+    let view = t.holder_view();
+    assert_eq!(view.token, token(9));
+    assert_eq!(view.n, 1, "the new drawer has its span: {view:?}");
+    assert!(
+        !t.holder_fence().tokens().any(|k| k == token(0)),
+        "the oldest went"
+    );
+}
+
+/// Once every drawer has gone the fence is the empty one again: no anchor
+/// slot is held, and a checkpoint carries nothing.
+#[test]
+fn once_every_drawer_is_gone_a_checkpoint_carries_nothing() {
+    let mut t = Terminal::new(10, 20);
+    t.note_holder_cut(group(Some(token(0)), true));
+    t.process(b"AAAA\r\n");
+    t.note_holder_cut(group(None, true));
+    t.note_holder_cut(group(Some(token(1)), true));
+    t.process(b"BBBB\r\n");
+    t.note_holder_cut(group(None, false));
+    t.retire_holder_mark(token(0));
+    assert!(t.holder_fence().is_empty());
+    assert_eq!(t.holder_fence(), &super::HolderFence::default());
+    assert!(
+        t.grid().anchors().slots().is_empty(),
+        "the anchor slots were released"
+    );
+    assert!(t.checkpoint().holder.is_empty());
 }
 
 #[test]
@@ -1246,11 +2065,11 @@ fn an_exec_drops_the_mark_and_a_new_image_lays_its_own() {
 
 #[test]
 fn a_row_keeps_its_fingerprint_when_it_scrolls_into_the_ring() {
-    // A rich row: true colours, a combining mark, an emoji cluster, a wide
-    // glyph, a hyperlink.
+    // A rich row: true colours, a combining mark, an emoji cluster, a lone
+    // emoji (the dense complex ring's), a wide glyph, a hyperlink.
     let mut t = term();
     t.process(
-        "\x1b[38;2;200;100;50;48;2;10;20;30me\u{301}x \u{1F44D}\u{1F3FD} \u{4E2D}\
+        "\x1b[38;2;200;100;50;48;2;10;20;30me\u{301}x \u{1F44D}\u{1F3FD} \u{1F600}\u{4E2D}\
          \x1b]8;;https://example.com\x07link\x1b]8;;\x07\x1b[0m\r\n"
             .as_bytes(),
     );

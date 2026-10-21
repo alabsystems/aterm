@@ -96,12 +96,23 @@ const MAX_HANDOFF_AGGREGATE_GRID_BYTES: u64 = 256 * 1024 * 1024;
 /// sends; a DOWNGRADE target is served by [`WireCaps::for_target`] instead.
 const MAX_HANDOFF_GRID_CELLS: u64 = MAX_HANDOFF_AGGREGATE_GRID_CELLS / 2;
 
-/// The per-grid cell ceiling every consumer up to and including v0.91.0
-/// enforced, frozen: what a producer must honour when the successor it hands
-/// to is OLDER than itself (a rollback), because that consumer's cap cannot be
-/// raised from here. See [`WireCaps::for_target`].
+/// The per-grid cell ceiling every consumer before
+/// [`RELAXED_CONSUMER_FROM_BUILD`] enforced, frozen: what a producer must
+/// honour when the successor it hands to is one of those (a rollback),
+/// because that consumer's cap cannot be raised from here. See
+/// [`WireCaps::for_target`].
 #[cfg(any(unix, test))]
 const LEGACY_HANDOFF_GRID_CELLS: u64 = 32 * 1024;
+
+/// The first build whose consumer enforces this build's per-grid cap
+/// ([`MAX_HANDOFF_GRID_CELLS`]) and bounds a line's attrs by its character
+/// count: v0.93.0's claim in `RELEASES.ledger`. v0.92.0 (1790278596) and
+/// every build before it enforce [`WireCaps::legacy`]'s; c6626970b3 and
+/// 4f46175a29, which relaxed both, landed after it was cut. A development
+/// build's number is its HEAD's commit time, so one built from a branch that
+/// predates them but committed later is priced as v0.93.0 is.
+#[cfg(any(unix, test))]
+const RELAXED_CONSUMER_FROM_BUILD: u64 = 1_790_305_290;
 /// Maximum scrollback lines a handoff checkpoint may carry, per session.
 ///
 /// The wire used to be defined as "exactly `rows` line records", which is why an
@@ -1781,11 +1792,12 @@ impl std::fmt::Display for AdmitRefusal {
 /// Consumer checks only ever become more lenient (law L3), so a successor
 /// NEWER than this build admits at least what this build admits and gets
 /// [`Self::current`]. A ROLLBACK is the one hop that runs the other way: its
-/// successor is an older build whose checks cannot be relaxed from here, so it
-/// gets [`Self::legacy`], and a session one of those stricter checks would
-/// refuse is carried at a lower rung ([`carry_for_wire`]) instead of being sent
-/// a grid its consumer refuses — which a consumer of v0.91.0's vintage answers
-/// by refusing the WHOLE adoption.
+/// successor is an older build whose checks cannot be relaxed from here. One
+/// from [`RELAXED_CONSUMER_FROM_BUILD`] on enforces this build's ceilings; one
+/// before it gets [`Self::legacy`], and a session one of those stricter checks
+/// would refuse is carried at a lower rung ([`carry_for_wire`]) instead of
+/// being sent a grid its consumer refuses — which a consumer of v0.91.0's
+/// vintage answers by refusing the WHOLE adoption.
 ///
 /// The consumer checks this branch relaxed, and so the whole of what a
 /// legacy consumer is stricter about (audited against `v0.91.0` on 2026-09-24):
@@ -1806,7 +1818,7 @@ impl std::fmt::Display for AdmitRefusal {
 pub(crate) struct WireCaps {
     per_grid_cells: u64,
     /// The successor's strict line decoder bounds a line's attrs RLE by the
-    /// grid's column count alone — v0.91.0 and every consumer before it.
+    /// grid's column count alone — v0.92.0 and every consumer before it.
     attrs_bounded_by_columns: bool,
     /// The successor restores the parser's partial state
     /// (`CheckpointMeta.parser`, the round-five plan's item 12). A consumer
@@ -1836,7 +1848,9 @@ impl WireCaps {
         }
     }
 
-    /// The frozen ceilings of every consumer up to and including v0.91.0.
+    /// The frozen ceilings of every consumer before
+    /// [`RELAXED_CONSUMER_FROM_BUILD`] (audited against v0.91.0; v0.92.0
+    /// enforces the same).
     #[must_use]
     #[cfg(any(unix, test))]
     pub(crate) const fn legacy() -> Self {
@@ -1861,19 +1875,29 @@ impl WireCaps {
     }
 
     /// [`Self::for_target`] with the running build named, so a test can pin
-    /// both directions of a hop.
+    /// both directions of a hop. An older successor from
+    /// [`RELAXED_CONSUMER_FROM_BUILD`] on admits this build's ceilings, but
+    /// what it restores beyond the screen is not known from here, so it is
+    /// handed no parser or output state (round eight's lead U24: such a hop
+    /// was priced as v0.91.0's, and a pane past 32 Ki cells crossed blank).
     #[must_use]
     #[cfg(any(unix, test))]
     pub(crate) fn for_hop(running_build: u64, target_build: u64) -> Self {
-        if target_build < running_build {
-            Self::legacy()
-        } else {
+        if target_build >= running_build {
             Self::current()
+        } else if target_build >= RELAXED_CONSUMER_FROM_BUILD {
+            Self {
+                carries_parser: false,
+                carries_output_state: false,
+                ..Self::current()
+            }
+        } else {
+            Self::legacy()
         }
     }
 
     /// Whether the successor continues a partial escape sequence the carry
-    /// holds. `false` for [`Self::legacy`] — every hop to an OLDER build, some
+    /// holds. `false` for every hop to an OLDER build ([`Self::for_hop`]), some
     /// of which predate the parser carry and would resume at Ground — so the
     /// capture treats ANY partial sequence over queued output as a timing miss
     /// there (`Terminal::partial_sequence_state`), not only the hooked DCS no
@@ -1886,9 +1910,9 @@ impl WireCaps {
     }
 
     /// Whether the successor resumes with the engine's in-flight output state
-    /// the carry holds (`CheckpointMeta.output_state`). `false` for
-    /// [`Self::legacy`] — every hop to an OLDER build, each of which predates
-    /// it — so there the capture treats an open OSC 8 link or a pending VT52
+    /// the carry holds (`CheckpointMeta.output_state`). `false` for every hop
+    /// to an OLDER build ([`Self::for_hop`]), some of which predate it — so
+    /// there the capture treats an open OSC 8 link or a pending VT52
     /// address over queued output as a timing miss
     /// (`Terminal::output_state_in_flight`): that successor would write the
     /// rest of the link's text unlinked and print the address bytes. To a
@@ -4844,6 +4868,13 @@ pub(crate) struct IncomingHandoff {
     /// (`App::adopt_status_carry`), never a reason to refuse. Empty for a
     /// boot that was offered no handoff.
     pub status_seen: Vec<(String, String)>,
+    /// Each adopted session's Autopilot end and its task's work, by sid
+    /// ([`crate::session_store::SessionRecord::autopilot_end`], read by
+    /// [`end_carry_of`]): the successor's `App::end_carry` as it is, spent
+    /// at each adopted session's first publication (`App::adopt_end_carry`),
+    /// never a reason to refuse. Empty for a boot that was offered no
+    /// handoff.
+    pub end_carry: std::collections::HashMap<String, crate::harness_end_carry::EndCarry>,
     /// The fleet needs the outgoing herald had told
     /// ([`crate::session_store::SessionHandoff::fleet_told`]), as the
     /// manifest carried them: read at this process's first fresh fleet read
@@ -5426,6 +5457,28 @@ impl AttestedParent {
                 creator == self.pid
             }
         }
+    }
+
+    /// Wait until the attested process has exited (`true`), or until
+    /// `deadline` with it still running (`false`). The kernel's exit event
+    /// wakes the wait where one is wired (Darwin's kqueue, Linux's pidfd), but
+    /// [`Self::still_alive`] alone judges: after an event it does not agree
+    /// with yet, or with no event to wait on, it is asked again on
+    /// [`aterm_uds::deadline::ExitWait`]'s fallback tick.
+    #[must_use]
+    pub(crate) fn exited_by(self, deadline: std::time::Instant) -> bool {
+        // The watch is on whatever holds the pid when it is taken. The witness
+        // still alive after that proves it was this process: one that ended
+        // never comes back at its pid with its birth, nor as our creator.
+        let mut exit = aterm_uds::deadline::ExitWait::on_pid(self.pid());
+        while self.still_alive() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            exit.wait(left);
+        }
+        true
     }
 
     /// Is `peer` — the kernel-attested pid of a LIVE listener this process just
@@ -6340,9 +6393,8 @@ pub(crate) enum ParentsEnd {
     BoundPassed,
 }
 
-/// Wait, bounded by `bound`, for the attested `parent` to end this candidate,
-/// asking every slice whether that exact process is still alive
-/// ([`AttestedParent::still_alive`]). Holds nothing while it waits: the caller
+/// Wait, bounded by `bound`, for the attested `parent` to end this candidate
+/// ([`AttestedParent::exited_by`]). Holds nothing while it waits: the caller
 /// has already closed every channel and adopted master.
 #[cfg(unix)]
 #[must_use]
@@ -6350,20 +6402,11 @@ pub(crate) fn await_parents_end(
     parent: Option<AttestedParent>,
     bound: std::time::Duration,
 ) -> ParentsEnd {
-    const SLICE: std::time::Duration = std::time::Duration::from_millis(25);
-    let Some(parent) = parent else {
-        return ParentsEnd::ParentGone;
-    };
-    let deadline = std::time::Instant::now() + bound;
-    loop {
-        if !parent.still_alive() {
-            return ParentsEnd::ParentGone;
+    match parent {
+        Some(parent) if !parent.exited_by(std::time::Instant::now() + bound) => {
+            ParentsEnd::BoundPassed
         }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return ParentsEnd::BoundPassed;
-        }
-        std::thread::sleep(SLICE.min(deadline - now));
+        _ => ParentsEnd::ParentGone,
     }
 }
 
@@ -8059,6 +8102,9 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     // THE TASK RECORD (the worker pillar), as the record
                     // carried it, re-validated at the seed.
                     task: rec.task.clone(),
+                    // THE AUTOPILOT'S END (§11.2.3, item 8): its face's time,
+                    // seeded onto the timeline before registration.
+                    autopilot_end: rec.autopilot_end.clone(),
                 },
             })
         })
@@ -8275,11 +8321,32 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
             .iter()
             .filter_map(|rec| Some((rec.sid.clone(), rec.status_seen.clone()?)))
             .collect(),
+        end_carry: end_carry_of(&manifest.sessions),
         #[cfg(unix)]
         person_stamps: Some(person_stamps_path(std::path::Path::new(&path))),
         mirror_dropped: manifest.mirror_dropped,
         mirror_served: manifest.mirror_served,
     }
+}
+
+/// THE CARRIED ENDS' INTAKE (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §11.2.3, item 8): each record's Autopilot end and its task's work
+/// ([`crate::session_store::SessionRecord::autopilot_end`], read by
+/// `harness_end_carry::EndCarry::parse`) by the sid it is adopted under —
+/// the successor's `App::end_carry` (through
+/// [`IncomingHandoff::end_carry`]), spent at each adopted session's first
+/// publication (`App::adopt_end_carry`), never a reason to refuse. A record
+/// with none, or one whose row does not read, gives none.
+pub(crate) fn end_carry_of(
+    sessions: &[crate::session_store::SessionRecord],
+) -> std::collections::HashMap<String, crate::harness_end_carry::EndCarry> {
+    sessions
+        .iter()
+        .filter_map(|rec| {
+            let carry = crate::harness_end_carry::EndCarry::parse(rec.autopilot_end.as_deref()?)?;
+            Some((rec.sid.clone(), carry))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -8308,6 +8375,10 @@ pub(crate) mod ladder_tests;
 #[cfg(all(test, unix))]
 #[path = "seamless_fixture_tests.rs"]
 mod fixture_tests;
+
+#[cfg(all(test, unix))]
+#[path = "seamless_fixture_cover.rs"]
+pub(crate) mod fixture_cover;
 
 /// Tier-1 for `NativeUpdateSuccessorWarmBeforeClaim` (the handoff environment
 /// snapshot, docs/DESIGN-warm-successor-2026-09-29.md P1).

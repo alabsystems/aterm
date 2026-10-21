@@ -338,13 +338,16 @@ fn the_test_clocks_count_a_sleep_only_where_a_test_counts() {
     assert_eq!(fx.wall_ms(), (NOW + 2460) * 1000);
     let count = fx.asleep().expect("counted");
     assert_eq!(count.asleep, secs(1900));
-    assert_eq!(count.boot.as_deref(), Some(TEST_BOOT));
+    assert_eq!(count.boot.map(|b| b.id()), Some(TEST_BOOT));
     assert_eq!(
         fx.last_sleep(),
         Some(((NOW + 660) * 1000, (NOW + 2460) * 1000))
     );
-    clock.set_boot("another");
-    assert_eq!(fx.asleep().and_then(|c| c.boot).as_deref(), Some("another"));
+    clock.set_boot(OTHER_TEST_BOOT);
+    assert_eq!(
+        fx.asleep().and_then(|c| c.boot).map(|b| b.id()),
+        Some(OTHER_TEST_BOOT)
+    );
 
     let origin = Instant::now();
     let virt = Arc::new(VirtualClock::new(origin, NOW * 1000));

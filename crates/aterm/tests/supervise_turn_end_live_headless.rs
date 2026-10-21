@@ -31,13 +31,20 @@
 //!   2026-09-27) — through the fenced write (`send if-gen=` on the judged
 //!   read, then a fenced Enter once the composer shows it) — once.
 //! * A LONG CONTINUATION IN A NARROW COMPOSER (lane B2's review, major 4):
-//!   64 columns and a rules file, so `keep going (standing rules: …)` wraps
-//!   over three composer rows, the last holding fewer characters than the
-//!   old 40-character guard named; it is read back whole and submitted
-//!   once.
+//!   64 columns and a rules file, so Cruise's continuation with its
+//!   standing rules wraps over seven composer rows, the last holding fewer
+//!   characters than the old 40-character guard named; it is read back whole
+//!   and submitted once.
 //!   Negative control: a worker whose composer does not show the text as
 //!   written (a pasted-text placeholder) gets no Enter, and the text left
 //!   typed is escalated.
+//! * WHAT IS TYPED: under the owner's default Autopilot, Cruise (FOREVER
+//!   CRUISE, a355109905), an ordinary turn end, a held Esc and a wall's reset
+//!   get Cruise's continuation, the default `continue_text`
+//!   ([`CONTINUE_TEXT`]: `[aterm harness] Autopilot is Cruise: keep going. …`),
+//!   and an answer carries aterm's own [`NEEDS_HINT`] after the owner's
+//!   `answer_text`. The suggestion is still accepted as it stands (`keep
+//!   going`, Claude Code's own words).
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private control socket, a config
 //! with every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
@@ -51,6 +58,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use aterm_agent::supervise::config::CONTINUE_TEXT;
+use aterm_agent::supervise::policy::needs::NEEDS_HINT;
 use aterm_agent::supervise::policy::turn_end::TurnEndTiming;
 use aterm_agent::supervise::prompt::fixtures::{
     BOX_BASH_TOUCH, END_529, GOAL_ACTIVE_SUGGESTION, composer, screen,
@@ -898,6 +907,24 @@ fn looks(journal: &str) -> usize {
         .count()
 }
 
+/// Whether the loop said it typed `text` under `rule`: a `CONTINUED` line
+/// naming the rule, the words after it the head of `text` (the line clips a
+/// long text to its first characters).
+fn continued_with(out: &str, rule: &str, text: &str) -> bool {
+    let named = format!(" rule={rule} ");
+    out.lines().any(|l| {
+        l.starts_with("CONTINUED ")
+            && l.split_once(&named)
+                .is_some_and(|(_, said)| !said.is_empty() && text.starts_with(said))
+    })
+}
+
+/// The worker's submit-log line for Cruise's continuation, typed whole
+/// ([`CONTINUE_TEXT`], the default `continue_text`).
+fn cruise_submit() -> String {
+    format!("SUBMIT:{CONTINUE_TEXT}")
+}
+
 /// What a failed wait says: the loop's output and journal (`"t"` its
 /// stamps), the lines and keys the worker took, and the worker's event
 /// record on the journal's clock ([`record`]) — enough to name which side
@@ -992,14 +1019,15 @@ fn a_529_end_is_continued_once_after_its_backoff() {
     assert!(out.contains("rule=api-retry@v1 "), "{out}");
 }
 
-/// The standing rules the narrow case rides: with them the continuation is
-/// 150 characters — `❯ ` and it fill two 64-column rows and 24 cells of a
-/// third, fewer than the 40-character tail the old guard named.
+/// The standing rules the narrow case rides: with them Cruise's
+/// continuation is 401 characters — `❯ ` and it fill six 64-column rows and
+/// 19 cells of a seventh, fewer than the 40-character tail the old guard
+/// named.
 const RULES: &str = "stay on the lane branch, never push to main,\nand run the lane's tests \
-                     before every commit, and keep the ledger rows exact";
+                     before every commit";
 
-/// A LONG CONTINUATION IN A NARROW COMPOSER, live (module header): the
-/// continuation with its standing rules wraps over three composer rows, is
+/// A LONG CONTINUATION IN A NARROW COMPOSER, live (module header): Cruise's
+/// continuation with its standing rules wraps over seven composer rows, is
 /// read back whole, and is submitted ONCE; the decision after it is
 /// escalated. Negative control: a composer that shows a pasted-text
 /// placeholder instead of the text gets no Enter — nothing submitted — and
@@ -1008,8 +1036,15 @@ const RULES: &str = "stay on the lane branch, never push to main,\nand run the l
 /// 6-9 s halves (measured 2026-10-05).
 #[test]
 fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
-    let want = format!("keep going (standing rules: {})", RULES.replace('\n', " "));
-    assert_eq!((2 + want.chars().count()) % 64, 24, "the last row's cells");
+    let want = format!(
+        "{CONTINUE_TEXT} (standing rules: {})",
+        RULES.replace('\n', " ")
+    );
+    let tail = (2 + want.chars().count()) % 64;
+    assert!(
+        (1..40).contains(&tail),
+        "the last row holds fewer than 40 cells, not {tail}"
+    );
     std::thread::scope(|scope| {
         let runs: Vec<_> = [false, true]
             .into_iter()
@@ -1056,10 +1091,7 @@ fn narrow_composer(want: &str, mangle: bool) {
             ["SUBMIT:go".to_string(), format!("SUBMIT:{want}")],
             "the loop said:\n{out}"
         );
-        assert!(
-            out.contains("rule=continue@v1 keep going (standing rules:"),
-            "{out}"
-        );
+        assert!(continued_with(&out, "continue@v1", want), "{out}");
         return;
     }
     // The control: the attention says what was left typed.
@@ -1143,8 +1175,9 @@ fn write_box(approve: &str) {
     );
 }
 
-/// FULL POWER, a request for a decision: ANSWERED — `answer_text` typed
-/// through the fenced write and submitted once — and nothing escalated.
+/// FULL POWER, a request for a decision: ANSWERED — `answer_text`, aterm's
+/// [`NEEDS_HINT`] after it, typed through the fenced write and submitted
+/// once — and nothing escalated.
 /// (The negative control, the answers off, is every test above: there the
 /// same decision is escalated and never typed into.)
 #[test]
@@ -1170,7 +1203,10 @@ fn a_decision_is_answered_with_the_answer_text() {
     let out = sup.stop();
     assert_eq!(
         submitted[..2],
-        ["SUBMIT:go".to_string(), format!("SUBMIT:{answer}")],
+        [
+            "SUBMIT:go".to_string(),
+            format!("SUBMIT:{answer} {NEEDS_HINT}")
+        ],
         "the loop said:\n{out}"
     );
     assert!(out.contains("rule=answer@v1"), "{out}");
@@ -1235,8 +1271,8 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
 /// A PERSON'S KEYSTROKE, live: a turn a person stopped with Esc (the
 /// vendor's `Interrupted · What should Claude do instead?`) is held for
 /// `human_grace_s` (3 s here) — nothing escalated — and then, nobody having
-/// come back, continued. (The hold's length is the decider's conformance
-/// walk's.)
+/// come back, continued with Cruise's continuation. (The hold's length is the
+/// decider's conformance walk's.)
 #[test]
 fn an_esc_interrupt_is_held_then_continued() {
     let inst = boot("i");
@@ -1265,7 +1301,7 @@ fn an_esc_interrupt_is_held_then_continued() {
     let out = sup.stop();
     assert_eq!(
         submitted[..2],
-        ["SUBMIT:go", "SUBMIT:keep going"],
+        ["SUBMIT:go".to_string(), cruise_submit()],
         "the loop said:\n{out}"
     );
     assert!(
@@ -1276,9 +1312,9 @@ fn an_esc_interrupt_is_held_then_continued() {
 
 /// THE WEEKLY WALL BEHIND A BACKGROUND SHELL
 /// of 2026-09-28, live. The server publishes it as a wall, not `busy`; the
-/// loop waits out its reset (5 s here) and the grace (1 s), types ONE `keep
-/// going` — the fenced write, echoed and submitted whole — and never before
-/// the reset. Before the reader looked under background work the screen read `busy` for as
+/// loop waits out its reset (5 s here) and the grace (1 s), types ONE
+/// continuation (Cruise's, [`CONTINUE_TEXT`]) — the fenced write, echoed and
+/// submitted whole — and never before the reset. Before the reader looked under background work the screen read `busy` for as
 /// long as the shell ran and nothing was ever typed.
 #[test]
 fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
@@ -1314,19 +1350,20 @@ fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
     );
     assert_eq!(
         submitted,
-        ["SUBMIT:go", "SUBMIT:keep going"],
+        ["SUBMIT:go".to_string(), cruise_submit()],
         "the loop said:\n{out}"
     );
     assert!(
-        out.contains("rule=usage-resume@v1 keep going"),
+        continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
         "the loop said:\n{out}"
     );
 }
 
 /// The same wall on a grid
 /// drawn one row high — the cursor on the row BELOW the prompt — is continued
-/// with `keep going`, never with a bare Enter on Claude's ghost text (which the
-/// fake worker logs as an empty `SUBMIT:`). The loop reads the composer where it
+/// with the continuation typed (Cruise's: `… keep going. …`), never with a
+/// bare Enter on Claude's ghost text (which the fake worker logs as an empty
+/// `SUBMIT:`). The loop reads the composer where it
 /// is drawn: the cursor's column is 2 and the caret row's cell is dim.
 #[test]
 fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_enter() {
@@ -1354,11 +1391,11 @@ fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_ent
     let out = sup.stop();
     assert_eq!(
         submitted,
-        ["SUBMIT:go", "SUBMIT:keep going"],
+        ["SUBMIT:go".to_string(), cruise_submit()],
         "the loop said:\n{out}"
     );
     assert!(
-        out.contains("rule=usage-resume@v1 keep going"),
+        continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
         "the loop said:\n{out}"
     );
 }
@@ -1404,7 +1441,7 @@ fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
 /// OUT OF VIEW. The loop reads the wall behind the shell and waits for its reset
 /// (6 s here); once it has written that wait down the owner scrolls back up the
 /// transcript, the wall's rows are gone and the screen reads `busy` with no wall (the server
-/// says `busy`, as it always did). The wait goes on: `keep going` is typed
+/// says `busy`, as it always did). The wait goes on: the continuation is typed
 /// once, at the reset and its grace, through the fenced write. Before the wall was
 /// remembered, the loop waited on a screen that read
 /// busy and typed nothing — the 4 h 44 m of 2026-09-28, by another door.
@@ -1428,11 +1465,11 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
     let out = sup.stop();
     assert_eq!(
         submitted,
-        ["SUBMIT:go", "SUBMIT:keep going"],
+        ["SUBMIT:go".to_string(), cruise_submit()],
         "the loop said:\n{out}"
     );
     assert!(
-        out.contains("rule=usage-resume@v1 keep going"),
+        continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
         "the loop said:\n{out}"
     );
 }
@@ -1443,7 +1480,7 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
 /// update, a fault — by a new one on the same ledger and the same tab. The
 /// first wrote the wall down; the second starts on a screen that reads `busy`
 /// with no wall, finds the row and goes on waiting for the same reset: ONE
-/// `keep going` is typed, by the second, at the reset and its grace, and the
+/// continuation is typed, by the second, at the reset and its grace, and the
 /// first typed nothing. Before the wall was written down, the successor had
 /// nothing to remember and the tab sat for hours.
 #[test]
@@ -1476,7 +1513,7 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
     let said_second = second.stop();
     assert_eq!(
         submitted,
-        ["SUBMIT:go", "SUBMIT:keep going"],
+        ["SUBMIT:go".to_string(), cruise_submit()],
         "the successor said:\n{said_second}\nthe first said:\n{said_first}"
     );
     assert!(
@@ -1484,7 +1521,7 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
         "the first loop typed nothing:\n{said_first}"
     );
     assert!(
-        said_second.contains("rule=usage-resume@v1 keep going"),
+        continued_with(&said_second, "usage-resume@v1", CONTINUE_TEXT),
         "the successor said:\n{said_second}"
     );
 }

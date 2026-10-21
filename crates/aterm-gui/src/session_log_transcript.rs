@@ -29,11 +29,11 @@
 //!   taken to its release, a full chunk's apart from the last's (which
 //!   also judges, flushes and takes the wake), and read by `metrics
 //!   percentiles` (`tx_chunk_*`, `tx_last_*`).
-//! - THE WAKE (S12). The last hold takes the log's owed wake
-//!   ([`SessionLog::take_log_wake`]); the resolver notifies the instance's
-//!   subscribers directly once the timeline is released
-//!   (`claude_footer::LogWake`), and tells the loop only when it owes a
-//!   settle tick or the clause switch is on.
+//! - THE WAKE (S12). The last hold takes the log's owed wake, which rings the
+//!   session's watchers under the timeline lock
+//!   ([`crate::session_timeline::SessionTimeline::slog_take_wake`]); the
+//!   resolver tells the loop only when it owes a settle tick or the clause
+//!   switch is on (`claude_footer::LogWake`).
 //!
 //! Nothing here holds text: a step is ids, a tool's name, class words and
 //! numbers (`aterm_agent::harness::steps::Step`), mapped field for field.
@@ -436,7 +436,7 @@ pub(crate) fn apply_batch_timed(
             if ready == Ready::NoRun || (ready == Ready::Unbound && !binds) {
                 applied.holds = 1;
                 applied.disarm = ready == Ready::NoRun || bound;
-                applied.owed = slog.take_log_wake();
+                applied.owed = g.slog_take_wake();
                 return applied;
             }
         }
@@ -457,7 +457,7 @@ pub(crate) fn apply_batch_timed(
         slog.transcript_count(TxEvent::Flush, now);
         let after = slog.wake();
         applied.settle = after.filter(|_| after != before);
-        applied.owed = slog.take_log_wake();
+        applied.owed = g.slog_take_wake();
         book(Hold::Last, now_ns().saturating_sub(taken));
         return applied;
     }

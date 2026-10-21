@@ -282,8 +282,12 @@ pub(crate) enum VertexFormat {
     UShort4 = 15,
     /// `Float32x4` — glyph rect and UV.
     Float4 = 31,
-    /// `Uint32` — the fire churn phase.
+    /// `Uint32` — the fire churn phase, the fx palette base and flags.
     UInt = 36,
+    /// `Uint16x2` — the fx sprite's destination size.
+    UShort2 = 13,
+    /// `Sint16x2` — the fx item origin.
+    Short2 = 16,
 }
 
 /// `MTLBlendFactor`: exactly the factors `crate::pipeline_table::Factor`

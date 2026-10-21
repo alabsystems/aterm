@@ -1,25 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Which sessions an open `edit` ticket holds (amacs design §6.7).
+//! Which sessions an open `edit` ticket holds, and the refusal that enforces
+//! it (amacs design §6.7; slices N1 and N4).
 //!
 //! While a session's program waits on an edit, what is typed into that session
-//! would queue in its TTY and reach the program only after the editor closes.
-//! The map names the ticket and view holding each such session: `app_edit` sets
-//! it when a ticket's view opens, starts its expiry when the last waiter leaves
-//! (an orphan clears itself five seconds later with no main-thread timer) and
-//! clears it when the ticket resolves. Slice N4 refuses typed input against it.
+//! would queue in its TTY and reach the program only after the editor closes:
+//! a harness's "keep going" would land in Claude Code's composer once its
+//! Ctrl-G editor exits. The map names the tickets and views holding each such
+//! session: `app_edit` sets a ticket's hold when its view opens, starts its
+//! expiry when the last waiter leaves (an orphan clears itself five seconds
+//! later with no main-thread timer) and clears it when the ticket resolves.
+//! A session stays held while any of its tickets does, so two edits one
+//! session asked for (`amacs a & amacs b`) are counted apart (`status
+//! editing=<n>`) and the first to resolve leaves the other's hold standing.
+//!
+//! An edit nothing waits on holds nothing: `edit … wait=0` (`amacs
+//! --no-wait`) marks its ticket [`Unwaited`] while the lane serves it, so the
+//! hold its view would set on opening is never taken, and its session stays
+//! typeable (`editing=` does not count it). A waiter that adopts the ticket
+//! later (`await edit`) holds the session as any waiter does.
+//!
+//! [`refusal`] is the enforcement: every control verb that types into a held
+//! session is answered `ERR busy editing ticket=<t> view=<v>`, for any
+//! principal, the harness's own token included. A session verb types into
+//! its target; an App verb that types (`hwkey`, `pointer`, `invoke Paste`)
+//! types into the terminal on screen, so it is refused while that terminal's
+//! session is held, and goes on while the edit's own view is in front.
+//! `ERR busy` is the transient class a driver already backs off from and
+//! retries (the harness's `write_refused`), so a continuation refused here is
+//! typed once the ticket resolves. A person's keyboard never reaches this
+//! seam.
 //!
 //! The lock is a leaf, named `edit_hold` at every acquisition: nothing else
 //! is acquired while it is held, and every function here takes and drops it
 //! within its own body.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use amacs::protocol::edit::Ticket;
 use aterm_types::MutexExt as _;
+use aterm_types::control_verbs::input_of;
 
 /// The ticket and view holding one session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,33 +60,101 @@ struct Entry {
     expires: Option<Instant>,
 }
 
-static EDIT_HOLD: Mutex<BTreeMap<u64, Entry>> = Mutex::new(BTreeMap::new());
+#[derive(Debug)]
+struct Holds {
+    /// Each held session's holds, in the order their tickets first held it.
+    sessions: BTreeMap<u64, Vec<Entry>>,
+    /// The tickets of `edit … wait=0` requests being served ([`Unwaited`]).
+    unwaited: BTreeSet<Ticket>,
+}
+
+static EDIT_HOLD: Mutex<Holds> = Mutex::new(Holds {
+    sessions: BTreeMap::new(),
+    unwaited: BTreeSet::new(),
+});
 
 /// The map's lock, a leaf (see the module doc). Callers lock it themselves
 /// (`edit_hold().lock_or_recover()`), so every acquisition carries the name.
-fn edit_hold() -> &'static Mutex<BTreeMap<u64, Entry>> {
+fn edit_hold() -> &'static Mutex<Holds> {
     &EDIT_HOLD
 }
 
-/// Session `session` is held by `hold`, until cleared; the latest ticket wins.
+/// The session verbs a held session refuses: every one that writes into its
+/// input or its program's turn (`send`, `key`, `ctrl`, `feed`, `feed-bin`,
+/// `mouse`, `paste`, `paste-bin`, `turn`, `focus`). `signal` stays
+/// answerable, so the caller can still be interrupted (an interrupted edit is
+/// orphaned, never aborted), and so does every read. The App verbs that type
+/// are [`crate::input_stall::writes_input`]'s others, asked of the terminal
+/// on screen ([`refusal`]).
+pub(crate) fn holds_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "send"
+            | "key"
+            | "ctrl"
+            | "feed"
+            | "feed-bin"
+            | "mouse"
+            | "paste"
+            | "paste-bin"
+            | "turn"
+            | "focus"
+    )
+}
+
+/// An `edit … wait=0` request's ticket, marked for as long as its lane
+/// serves it: opening its view sets no hold ([`set`]). Dropping the mark
+/// unmarks the ticket.
+#[derive(Debug)]
+pub(crate) struct Unwaited(Ticket);
+
+impl Unwaited {
+    /// Mark `ticket` before its request is posted to the main thread, whose
+    /// answer comes after its view has opened.
+    pub(crate) fn mark(ticket: Ticket) -> Self {
+        edit_hold().lock_or_recover().unwaited.insert(ticket);
+        Self(ticket)
+    }
+}
+
+impl Drop for Unwaited {
+    fn drop(&mut self) {
+        edit_hold().lock_or_recover().unwaited.remove(&self.0);
+    }
+}
+
+/// Ticket `hold.ticket` holds `session` until cleared; set again (a waiter
+/// came back), its expiry is lifted. Another ticket's hold on the session
+/// stands beside it. A ticket marked [`Unwaited`] holds nothing.
 pub(crate) fn set(session: u64, hold: Hold) {
-    edit_hold().lock_or_recover().insert(
-        session,
-        Entry {
+    let mut holds = edit_hold().lock_or_recover();
+    if holds.unwaited.contains(&hold.ticket) {
+        return;
+    }
+    let entries = holds.sessions.entry(session).or_default();
+    match entries
+        .iter_mut()
+        .find(|entry| entry.hold.ticket == hold.ticket)
+    {
+        Some(entry) => {
+            entry.hold = hold;
+            entry.expires = None;
+        }
+        None => entries.push(Entry {
             hold,
             expires: None,
-        },
-    );
+        }),
+    }
 }
 
 /// Ticket `ticket` no longer holds `session`. Another ticket's hold stays.
 pub(crate) fn clear(session: u64, ticket: Ticket) {
-    let mut map = edit_hold().lock_or_recover();
-    if map
-        .get(&session)
-        .is_some_and(|entry| entry.hold.ticket == ticket)
-    {
-        map.remove(&session);
+    let mut holds = edit_hold().lock_or_recover();
+    if let Some(entries) = holds.sessions.get_mut(&session) {
+        entries.retain(|entry| entry.hold.ticket != ticket);
+        if entries.is_empty() {
+            holds.sessions.remove(&session);
+        }
     }
 }
 
@@ -71,37 +162,89 @@ pub(crate) fn clear(session: u64, ticket: Ticket) {
 pub(crate) fn set_expiry(session: u64, ticket: Ticket, expires: Option<Instant>) {
     if let Some(entry) = edit_hold()
         .lock_or_recover()
+        .sessions
         .get_mut(&session)
-        .filter(|entry| entry.hold.ticket == ticket)
+        .and_then(|entries| entries.iter_mut().find(|entry| entry.hold.ticket == ticket))
     {
         entry.expires = expires;
     }
 }
 
-/// What holds `session` now, if anything: a lapsed hold is dropped here.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "slice N4 refuses typed input against the hold")
-)]
+/// What holds `session` now, if anything: the latest ticket that still does.
 pub(crate) fn get(session: u64) -> Option<Hold> {
     get_at(session, Instant::now())
 }
 
-/// [`get`] as of `now`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "slice N4 refuses typed input against the hold")
-)]
+/// `get` as of `now`: a lapsed hold is dropped here.
 pub(crate) fn get_at(session: u64, now: Instant) -> Option<Hold> {
-    let mut map = edit_hold().lock_or_recover();
-    let lapsed = map
-        .get(&session)
-        .is_some_and(|entry| entry.expires.is_some_and(|at| at <= now));
-    if lapsed {
-        map.remove(&session);
-        return None;
+    let mut holds = edit_hold().lock_or_recover();
+    live(&mut holds.sessions, session, now)
+        .last()
+        .map(|entry| entry.hold)
+}
+
+/// How many tickets hold `session` now (`status editing=<n>`).
+pub(crate) fn count(session: u64) -> usize {
+    count_at(session, Instant::now())
+}
+
+/// `count` as of `now`.
+pub(crate) fn count_at(session: u64, now: Instant) -> usize {
+    let mut holds = edit_hold().lock_or_recover();
+    live(&mut holds.sessions, session, now).len()
+}
+
+/// `session`'s holds standing at `now`, the lapsed ones dropped from the map.
+fn live(sessions: &mut BTreeMap<u64, Vec<Entry>>, session: u64, now: Instant) -> &[Entry] {
+    let Some(entries) = sessions.get_mut(&session) else {
+        return &[];
+    };
+    entries.retain(|entry| entry.expires.is_none_or(|at| at > now));
+    if entries.is_empty() {
+        sessions.remove(&session);
+        return &[];
     }
-    map.get(&session).map(|entry| entry.hold)
+    sessions.get(&session).map_or(&[], Vec::as_slice)
+}
+
+/// The answer to `verb` (argument tail `rest`) while an edit holds the
+/// session it types into: `ERR busy editing ticket=<t> view=<v>` naming the
+/// latest ticket, for every principal. A session verb ([`holds_verb`]) types
+/// into `session`, the request's target; an App verb that types
+/// ([`crate::input_stall::writes_input`] of its table class: `hwkey`,
+/// `pointer` but its `status` read, `invoke Paste`) into `front`, the
+/// terminal on screen (`None` while a native view, such as the edit's own, is
+/// in front). `None` lets the request on. The control dispatch asks it at the
+/// input admission (`control::admit_with`: session verbs and the binary
+/// frames, `front` `None`) and at the App lane (`control::dispatch_app`).
+pub(crate) fn refusal(
+    verb: &str,
+    rest: &str,
+    session: Option<u64>,
+    front: Option<u64>,
+) -> Option<String> {
+    let typed_into = if holds_verb(verb) {
+        session
+    } else if front.is_some()
+        && crate::input_stall::writes_input(input_of(verb), verb, rest.as_bytes())
+        && !reads_the_pointer(verb, rest)
+    {
+        front
+    } else {
+        None
+    };
+    let hold = get(typed_into?)?;
+    Some(format!(
+        "ERR busy editing ticket={} view={}\n",
+        hold.ticket, hold.view
+    ))
+}
+
+/// `pointer` or `pointer status` (`control_input::parse_pointer`'s
+/// `PointerAction::Status`): a read of where the pointer is, which stays
+/// answerable as every read does.
+fn reads_the_pointer(verb: &str, rest: &str) -> bool {
+    verb == "pointer" && matches!(rest.split_whitespace().next(), None | Some("status"))
 }
 
 #[cfg(test)]
@@ -113,6 +256,16 @@ mod tests {
     // Sessions far above any a test App mints, so this test shares the
     // process-wide map with the App tests without meeting their entries.
     const SESSION: u64 = u64::MAX - 7;
+    const REFUSING: u64 = u64::MAX - 8;
+    // The harness back-off test is unix's (its scratch relay server).
+    #[cfg(unix)]
+    const HARNESS: u64 = u64::MAX - 10;
+    const FRONT: u64 = u64::MAX - 12;
+
+    /// [`refusal`] for a session verb aimed at `session`, nothing on screen.
+    fn typed(verb: &str, session: u64) -> Option<String> {
+        refusal(verb, "", Some(session), None)
+    }
 
     #[test]
     fn edit_hold_is_set_cleared_by_its_own_ticket_and_lapses_at_expiry() {
@@ -127,8 +280,11 @@ mod tests {
         set(SESSION, first);
         assert_eq!(get(SESSION), Some(first));
         set(SESSION, second);
+        assert_eq!(get(SESSION), Some(second), "the latest ticket is named");
+        assert_eq!(count(SESSION), 2, "both hold it");
         clear(SESSION, first.ticket);
         assert_eq!(get(SESSION), Some(second), "only its own ticket clears it");
+        assert_eq!(count(SESSION), 1);
 
         let now = Instant::now();
         set_expiry(SESSION, first.ticket, Some(now));
@@ -148,6 +304,400 @@ mod tests {
         set_expiry(SESSION, second.ticket, Some(now + Duration::from_secs(5)));
         assert_eq!(get_at(SESSION, now + Duration::from_secs(5)), None);
         assert_eq!(get(SESSION), None, "a lapsed hold is gone");
+        assert_eq!(count(SESSION), 0);
         clear(SESSION, second.ticket);
+    }
+
+    /// Two tickets of one session: the first to resolve leaves the other's
+    /// hold standing, and a lapsed one stops counting while the other holds.
+    #[test]
+    fn a_session_stays_held_while_any_of_its_tickets_holds_it() {
+        const TWO: u64 = u64::MAX - 11;
+        let older = Hold {
+            ticket: Ticket(11),
+            view: 110,
+        };
+        let newer = Hold {
+            ticket: Ticket(12),
+            view: 120,
+        };
+        set(TWO, older);
+        set(TWO, newer);
+        clear(TWO, newer.ticket);
+        assert_eq!(get(TWO), Some(older), "the older edit still holds it");
+        set(TWO, newer);
+        let now = Instant::now();
+        set_expiry(TWO, older.ticket, Some(now));
+        assert_eq!(count_at(TWO, now), 1, "the orphan lapsed");
+        assert_eq!(get_at(TWO, now), Some(newer));
+        // Set again (its waiter came back), a hold's expiry is lifted.
+        set(TWO, newer);
+        set_expiry(TWO, newer.ticket, Some(now));
+        set(TWO, newer);
+        assert_eq!(get_at(TWO, now + Duration::from_secs(60)), Some(newer));
+        clear(TWO, newer.ticket);
+        assert_eq!(get(TWO), None);
+    }
+
+    /// Every verb that types into a held session is refused `ERR busy
+    /// editing`, naming the ticket and view; reads, `signal` and the verbs
+    /// that only open or wait on views are not. NEGATIVE CONTROL: the same
+    /// verbs pass on a session nothing holds, and once the hold clears.
+    #[test]
+    fn held_session_refuses_send_key_paste_turn_with_busy_editing() {
+        let typing = [
+            "send",
+            "key",
+            "ctrl",
+            "feed",
+            "feed-bin",
+            "mouse",
+            "paste",
+            "paste-bin",
+            "turn",
+            "focus",
+        ];
+        for verb in typing {
+            assert_eq!(typed(verb, REFUSING), None, "{verb}: nothing holds it");
+        }
+        set(
+            REFUSING,
+            Hold {
+                ticket: Ticket(41),
+                view: 7,
+            },
+        );
+        for verb in typing {
+            assert_eq!(
+                typed(verb, REFUSING).as_deref(),
+                Some("ERR busy editing ticket=41 view=7\n"),
+                "{verb}"
+            );
+        }
+        for verb in [
+            "signal", "status", "text", "screen", "meta", "lease", "edit", "await", "resize",
+            "hwkey", "pointer", "invoke",
+        ] {
+            assert_eq!(typed(verb, REFUSING), None, "{verb} stays answerable");
+        }
+        assert_eq!(
+            typed("send", REFUSING - 100),
+            None,
+            "another session is not held"
+        );
+        clear(REFUSING, Ticket(41));
+        for verb in typing {
+            assert_eq!(typed(verb, REFUSING), None, "{verb}: the hold cleared");
+        }
+    }
+
+    /// The App verbs that type (`hwkey`, `pointer`, `invoke Paste`) type into
+    /// the terminal on screen, so they are refused while that terminal's
+    /// session is held, and go on while a native view (the edit's own) is in
+    /// front. A session verb aimed elsewhere is not refused because the front
+    /// is held. NEGATIVE CONTROL: an `invoke` that types nothing goes on.
+    #[test]
+    fn app_verbs_that_type_are_refused_while_the_front_terminal_is_held() {
+        set(
+            FRONT,
+            Hold {
+                ticket: Ticket(61),
+                view: 8,
+            },
+        );
+        let busy = Some("ERR busy editing ticket=61 view=8\n".to_string());
+        for (verb, rest) in [("hwkey", "a"), ("pointer", "click"), ("invoke", "Paste")] {
+            assert_eq!(
+                refusal(verb, rest, None, Some(FRONT)),
+                busy,
+                "{verb} {rest}"
+            );
+            assert_eq!(
+                refusal(verb, rest, None, None),
+                None,
+                "{verb} {rest}: a native view is in front"
+            );
+            assert_eq!(
+                refusal(verb, rest, None, Some(FRONT - 100)),
+                None,
+                "{verb} {rest}: an unheld terminal is in front"
+            );
+        }
+        assert_eq!(refusal("invoke", "NewTab", None, Some(FRONT)), None);
+        for rest in ["", "status"] {
+            assert_eq!(
+                refusal("pointer", rest, None, Some(FRONT)),
+                None,
+                "`pointer {rest}` reads"
+            );
+        }
+        assert_eq!(
+            refusal("send", "x", Some(FRONT - 100), Some(FRONT)),
+            None,
+            "a session verb asks its own target"
+        );
+        assert_eq!(refusal("send", "x", Some(FRONT), None), busy);
+        clear(FRONT, Ticket(61));
+        assert_eq!(refusal("hwkey", "a", None, Some(FRONT)), None);
+    }
+
+    /// Through the App's own ticket seams: a session is refused from the
+    /// moment its ticket's view opens, and the refusal ends when the ticket
+    /// resolves (its view closed) and when it is orphaned (its waiter hung up
+    /// and none came back within [`crate::app_edit::ORPHAN_AFTER`]); the
+    /// orphan keeps its view. Every instant is injected, so no wall time
+    /// between two reads can lapse a hold.
+    #[test]
+    fn the_hold_clears_on_resolve_and_on_orphan() {
+        use amacs::protocol::edit::{AwaitKey, EditOk, EditRequest};
+
+        use crate::control_edit::{AwaitCall, EditCall, WaiterId};
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-edit-hold-app-")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("COMMIT_EDITMSG");
+        std::fs::write(&path, b"draft\n").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let mut app = crate::App::headless_for_test();
+        app.serve_edits_headless_for_test();
+        let wid = crate::WindowId(0);
+        // A session no other test's App mints: the map is process-wide.
+        let sid = 1 << 45;
+        app.next_session_id = sid;
+        app.push_stub_tab(wid, crate::stub_session(sid));
+        let caller_tab = app.windows[&wid].tab_set.active_id().unwrap();
+
+        // `edit`, then a parked `await edit ticket=`, as the client does.
+        let edit_and_wait = |app: &mut crate::App, waiter: u64| {
+            let ticket = crate::control_edit::mint_ticket();
+            let (reply, answer) = std::sync::mpsc::channel();
+            app.begin_edit(EditCall {
+                ticket,
+                session: sid,
+                request: EditRequest {
+                    uri: uri.clone(),
+                    line: None,
+                    create: false,
+                    for_word: None,
+                    wait: true,
+                },
+                real_uri: crate::control_edit::real_file_uri(&uri),
+                reply,
+            });
+            let ok = EditOk::parse(&answer.try_recv().expect("answered inline")).unwrap();
+            let (reply, done) = std::sync::mpsc::channel();
+            let waiter = WaiterId(waiter);
+            app.await_edit(AwaitCall {
+                waiter,
+                key: AwaitKey::Ticket(ticket),
+                real_uri: None,
+                reply,
+            });
+            (ok, waiter, done)
+        };
+        let busy =
+            |ok: &EditOk| format!("ERR busy editing ticket={} view={}\n", ok.ticket, ok.view);
+
+        // Resolve: the person closes the view.
+        let (ok, _, done) = edit_and_wait(&mut app, u64::MAX - 1);
+        for verb in ["send", "key", "turn", "paste"] {
+            assert_eq!(typed(verb, sid), Some(busy(&ok)), "{verb} while open");
+        }
+        assert_eq!(count(sid), 1);
+        app.close_active_native_tab(wid).unwrap();
+        assert!(
+            done.try_recv()
+                .unwrap()
+                .starts_with("OK edit done result=closed")
+        );
+        assert_eq!(typed("send", sid), None, "the ticket resolved");
+        assert_eq!(count(sid), 0);
+
+        // Orphan: the waiter hangs up and none comes back.
+        assert!(
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .tab_set
+                .switch_to(caller_tab)
+        );
+        app.sync_window(wid);
+        let (ok, waiter, _done) = edit_and_wait(&mut app, u64::MAX - 2);
+        assert_eq!(typed("turn", sid), Some(busy(&ok)), "held while waited on");
+        let left = Instant::now();
+        app.withdraw_edit_waiter_at(waiter, left);
+        assert_eq!(get_at(sid, left).map(|hold| hold.ticket), Some(ok.ticket));
+        app.sweep_orphaned_edits(left + crate::app_edit::ORPHAN_AFTER);
+        assert_eq!(typed("turn", sid), None, "the orphan's hold is gone");
+        assert!(
+            app.view_store
+                .get(crate::tab_model::ViewId::from_stored(ok.view))
+                .is_some(),
+            "an orphan keeps its view"
+        );
+    }
+
+    /// `edit … wait=0` (`amacs --no-wait`) opens its view holding nothing:
+    /// through the real lane ([`crate::control_edit::serve_edit`]) and the
+    /// App's own admission, the caller's session stays typeable and
+    /// `editing=` does not count it; a waiter that adopts the ticket later
+    /// holds the session as any waiter does. NEGATIVE CONTROL: the same
+    /// request without `wait=0` holds the session from the moment its view
+    /// opens, before any waiter arrives.
+    #[test]
+    fn an_edit_nobody_waits_on_holds_nothing() {
+        use amacs::protocol::edit::{AwaitKey, EditOk};
+
+        use crate::control::control_media::{Hops, MainPost, take_hop};
+        use crate::control_edit::{AwaitCall, WaiterId};
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-edit-unwaited-")
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("plan.md");
+        std::fs::write(&path, b"plan\n").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let mut app = crate::App::headless_for_test();
+        app.serve_edits_headless_for_test();
+        let wid = crate::WindowId(0);
+        // A session no other test's App mints: the map is process-wide.
+        let sid = 1 << 46;
+        app.next_session_id = sid;
+        app.push_stub_tab(wid, crate::stub_session(sid));
+        let edit = |app: &mut crate::App, tail: &str| {
+            // A count of hops of this test's own.
+            let hops: &'static Hops = Box::leak(Box::new(Hops::new()));
+            let line = crate::control_edit::serve_edit(
+                crate::control::Scope::Owner,
+                Some(sid),
+                &format!("{uri}{tail}"),
+                &mut MainPost::injected(
+                    |wake| match take_hop(wake) {
+                        crate::Wake::EditRequest(call) => {
+                            app.begin_edit(*call);
+                            true
+                        }
+                        other => panic!("unexpected {other:?}"),
+                    },
+                    hops,
+                ),
+                &mut || false,
+                // A hang detector, never a budget.
+                Duration::from_secs(60),
+                |left| left.min(Duration::from_millis(5)),
+            );
+            EditOk::parse(&line).unwrap_or_else(|why| panic!("{line}: {why}"))
+        };
+
+        let unwaited = edit(&mut app, " wait=0");
+        assert!(
+            app.view_store
+                .get(crate::tab_model::ViewId::from_stored(unwaited.view))
+                .is_some(),
+            "its view opened"
+        );
+        assert_eq!(typed("send", sid), None, "nothing waits on it");
+        assert_eq!(count(sid), 0, "editing=0");
+
+        let waited = edit(&mut app, "");
+        assert_eq!(
+            get(sid).map(|hold| hold.ticket),
+            Some(waited.ticket),
+            "a request that will be waited on holds its session at once"
+        );
+        assert_eq!(count(sid), 1);
+
+        let (reply, _done) = std::sync::mpsc::channel();
+        app.await_edit(AwaitCall {
+            waiter: WaiterId(u64::MAX - 3),
+            key: AwaitKey::Ticket(unwaited.ticket),
+            real_uri: None,
+            reply,
+        });
+        assert_eq!(count(sid), 2, "an adopted ticket holds as any does");
+        clear(sid, unwaited.ticket);
+        clear(sid, waited.ticket);
+    }
+
+    /// THE HARNESS BACKS OFF FROM THE HOLD (design §6.7): the refusal reaches
+    /// the harness's own transport (`RelayCtl`, which the hosted loop's
+    /// `HostCtl` wraps) as an `ERR busy` reply, the transient class its
+    /// `write_refused` backs off from and decides again, never `ERR halted`
+    /// (a hold's park) or a failure that ends the loop; and the write it
+    /// refused goes out once the ticket resolves. Through a scratch server
+    /// that answers every request with this module's own refusal.
+    #[cfg(unix)]
+    #[test]
+    fn the_harness_transport_reads_the_edit_hold_as_a_back_off() {
+        use std::io::{BufRead, BufReader, Write};
+
+        use aterm_agent::supervise::{Ctl as _, Endpoint, RelayCtl};
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-edit-hold-")
+            .tempdir()
+            .unwrap();
+        let sock = dir.path().join("a.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            'conns: while let Ok((stream, _)) = listener.accept() {
+                let mut w = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { continue 'conns };
+                    if line == "BYE" {
+                        break 'conns;
+                    }
+                    if line.starts_with("AUTH ") {
+                        continue;
+                    }
+                    let verb = line
+                        .split_whitespace()
+                        .find(|word| !word.starts_with('@'))
+                        .unwrap_or_default();
+                    let reply = typed(verb, HARNESS).unwrap_or_else(|| "OK\n".to_string());
+                    let _ = w.write_all(reply.as_bytes());
+                    seen.push(format!("{line} -> {}", reply.trim_end()));
+                }
+            }
+            seen
+        });
+
+        let endpoint = Endpoint::Socket(sock.to_string_lossy().into_owned());
+        let mut ctl = RelayCtl::new(endpoint, Some("tok".to_string()));
+        set(
+            HARNESS,
+            Hold {
+                ticket: Ticket(77),
+                view: 3,
+            },
+        );
+        let refused = ctl
+            .call(&["@s-h", "turn", "idle=600", "keep going"])
+            .unwrap();
+        assert!(!refused.ok(), "{refused:?}");
+        assert!(refused.is_err("busy"), "a back-off: {refused:?}");
+        assert!(!refused.is_err("halted"), "not a hold's park: {refused:?}");
+        assert_eq!(refused.err_text(), "ERR busy editing ticket=77 view=3");
+        assert!(ctl.call(&["@s-h", "status"]).unwrap().ok(), "reads go on");
+        clear(HARNESS, Ticket(77));
+        let typed = ctl
+            .call(&["@s-h", "turn", "idle=600", "keep going"])
+            .unwrap();
+        assert!(typed.ok(), "typed once the ticket resolved: {typed:?}");
+        drop(ctl);
+        let mut bye = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        bye.write_all(b"BYE\n").unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "@s-h turn idle=600 keep going -> ERR busy editing ticket=77 view=3",
+                "@s-h status -> OK",
+                "@s-h turn idle=600 keep going -> OK",
+            ]
+        );
     }
 }

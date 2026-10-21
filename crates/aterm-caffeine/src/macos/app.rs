@@ -12,7 +12,7 @@
 //! can arrive, so it is shown after the borrow ends.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use aterm_objc::send::{
@@ -20,7 +20,7 @@ use aterm_objc::send::{
     send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_isize, send_usize, send_v,
     send_v_id, send_v_id_bool, send_v_id_sel_id_id, send_v_sel_id_f64,
 };
-use aterm_objc::{CGPoint, Id, MainThread, Obj, Sel, autoreleasepool, class, sel};
+use aterm_objc::{Bool, CGPoint, Id, MainThread, Obj, Sel, autoreleasepool, class, sel};
 
 use super::ServeContext;
 use super::awake::Awake;
@@ -91,7 +91,7 @@ fn next_tick_secs(mode: Mode, now: u64) -> u64 {
 }
 
 /// What a click with the event `(type, modifier flags)` means; a click with no current
-/// event (an accessibility press) toggles.
+/// event toggles.
 fn click_of(event: Option<(usize, usize)>) -> Click {
     let (kind, flags) = event.unwrap_or((0, 0));
     menu::classify_click(
@@ -117,6 +117,9 @@ struct Mug {
     awake: Option<Awake>,
     /// The one activity-acquisition door; tests can refuse without acquiring it.
     awake_begin: fn(&str) -> Option<Awake>,
+    /// Whether a replaced origin still has the `caffeine` verb
+    /// ([`crate::code::serves_caffeine`]); tests answer without running anything.
+    origin_serves: fn(&Path) -> Option<bool>,
     /// The item in the menu bar; `None` before it is installed (and in tests).
     ui: Option<StatusUi>,
     /// The origin's code, watched when the mug restarts on an update.
@@ -172,7 +175,7 @@ impl Mug {
             }
         }
         let lit = self.awake.is_some();
-        let tip = menu::tooltip_for_activity(self.mode, now, lit);
+        let tip = menu::tooltip(self.mode, now);
         if let Some(ui) = self.ui.as_mut() {
             ui.show(lit, &tip);
         }
@@ -228,9 +231,30 @@ impl Mug {
             return stop;
         }
         if self.watch.as_mut().is_some_and(Watch::replaced) {
-            return Next::Stop(Exit::Restart);
+            return self.restart_or_retire();
         }
         Next::Tick(next_tick_secs(self.mode, now))
+    }
+
+    /// The origin was replaced: end for launchd to start the new build, unless the new build
+    /// has no `caffeine` verb (a rollback past it), which would fail every start launchd made
+    /// and be started again. Then the job ends for good (exit 0, which its KeepAlive does not
+    /// restart) and its Enable at Startup goes, so no login starts it either. Not knowing
+    /// restarts, as before.
+    fn restart_or_retire(&mut self) -> Next {
+        if (self.origin_serves)(&self.origin) != Some(false) {
+            return Next::Stop(Exit::Restart);
+        }
+        aterm_log::warn!(
+            "caffeine: {} has no `caffeine` verb now; the mug ends and Enable at Startup is off",
+            self.origin.display()
+        );
+        if launchd::startup_enabled(&self.paths, &self.label)
+            && let Err(err) = launchd::set_startup(&self.paths, &self.label, &self.origin, false)
+        {
+            aterm_log::warn!("caffeine: could not turn off Enable at Startup: {err}");
+        }
+        Next::Stop(Exit::Quit)
     }
 
     /// Take the writer's mode. Accepted requests are not saved back; a refused
@@ -264,8 +288,8 @@ struct TargetIvars {
 
 aterm_objc::declare_class! {
     /// What the mug's button, its menu items, the ticks, the workspace's wake notification
-    /// and the state-file notification send to. Every method is `- (void)x:(id)y` and
-    /// returns at once off the main thread.
+    /// and the state-file notification send to. Every method but the accessibility action's
+    /// is `- (void)x:(id)y`, and each returns at once off the main thread.
     struct CaffeineTarget: NSObject {
         const NAME: &str = "ATermCaffeineTarget";
         type Ivars = TargetIvars;
@@ -282,6 +306,35 @@ aterm_objc::declare_class! {
             match autoreleasepool(|_| current_click()) {
                 Click::Toggle => self.handle(|mug| mug.toggle(now)),
                 Click::Menu => self.show_menu(now),
+            }
+        }
+
+        /// The button's [`ui::SHOW_MENU`] accessibility action. It answers YES at once and
+        /// the menu opens on the run loop's next turn: the menu's tracking loop holds the
+        /// main thread until the menu closes, and the client (VoiceOver) waits on the answer.
+        @sel(showMenuAction:)
+        fn show_menu_action(&self, _action: Id) -> Bool {
+            if MainThread::new().is_none() {
+                return Bool::NO;
+            }
+            // SAFETY: as `schedule_stop`; `openMenu:` is a method the target declares.
+            unsafe {
+                send_v_sel_id_f64(
+                    self.as_id(),
+                    sel!(performSelector:withObject:afterDelay:),
+                    sel!(openMenu:),
+                    Id::NIL,
+                    0.0,
+                );
+            }
+            Bool::YES
+        }
+
+        /// The delayed perform [`Self::show_menu_action`] scheduled.
+        @sel(openMenu:)
+        fn open_menu(&self, _arg: Id) {
+            if MainThread::new().is_some() {
+                self.show_menu(now());
             }
         }
 
@@ -596,6 +649,7 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         instance,
     } = ctx;
     let watch = restart_on_update.then(|| Watch::start(origin.clone()));
+    let code_dir = paths.code_dir();
     let mug = Mug {
         // Read in `run_app`, once a writer's change can no longer be missed.
         mode: Mode::Off,
@@ -605,11 +659,20 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         version,
         awake: None,
         awake_begin: Awake::begin,
+        origin_serves: crate::code::serves_caffeine,
         ui: None,
         watch,
         exit: None,
     };
     let code = autoreleasepool(|_| run_app(main, mug));
+    // A mug that ends for good takes its copy of the app with it, while it still holds the
+    // lock (an update restart runs from a fresh copy anyway, made by the next holder).
+    if code == ExitCode::SUCCESS
+        && crate::code::runs_from_copy(&code_dir)
+        && let Err(e) = crate::code::discard_copies(&code_dir)
+    {
+        eprintln!("aterm caffeine: {}: {e}", code_dir.display());
+    }
     // The one-mug lock is let go only now, with the item off the bar and the activity
     // ended: a second mug never shares the bar with this one.
     drop(instance);
@@ -659,6 +722,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
         mug.ui = ui::install(
             target.as_id(),
             sel!(statusClicked:),
+            sel!(showMenuAction:),
             sel!(menuAction:),
             rows,
         );
@@ -697,7 +761,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use aterm_objc::{ClassType, class_name, method_types};
+    use aterm_objc::{ClassType, Encode, class_name, method_types};
 
     use super::*;
     use crate::model::{Choice, HOUR};
@@ -767,6 +831,7 @@ mod tests {
             mode: Mode::Off,
             awake: None,
             awake_begin: Awake::begin,
+            origin_serves: |_| Some(true),
             ui: None,
             watch: None,
             exit: None,
@@ -801,7 +866,6 @@ mod tests {
             assert_eq!(mug.mode, Mode::Off, "no assertion must never appear on");
             assert!(mug.awake.is_none());
             assert_eq!(saved(&mug), Some(Mode::Off));
-            assert_eq!(menu::tooltip(mug.mode, NOW), menu::tooltip(Mode::Off, NOW));
             assert!(
                 crate::cli::status_text(mug.mode, NOW, Some(42), false, "l.x")
                     .starts_with("caffeine=off\nuntil=-\n")
@@ -972,6 +1036,26 @@ mod tests {
         assert_eq!(mug.tick(NOW), Next::Tick(TICK_SECS));
         std::fs::write(&mug.origin, b"build two").expect("exe");
         assert_eq!(mug.tick(NOW + 60), Next::Stop(Exit::Restart));
+        // Not knowing whether the new build serves restarts too.
+        mug.origin_serves = |_| None;
+        assert_eq!(mug.restart_or_retire(), Next::Stop(Exit::Restart));
+    }
+
+    /// A rollback to a build without the verb: the job ends for good (exit 0, which launchd
+    /// does not restart) and takes its login item with it.
+    #[test]
+    fn a_replacement_without_the_verb_ends_the_job_and_its_login_item() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        std::fs::write(&mug.origin, b"build 1").expect("exe");
+        launchd::set_startup(&mug.paths, &mug.label, &mug.origin, true).expect("startup on");
+        assert!(launchd::startup_enabled(&mug.paths, &mug.label));
+        mug.watch = Some(Watch::start(mug.origin.clone()));
+        mug.origin_serves = |_| Some(false);
+        assert_eq!(mug.tick(NOW), Next::Tick(TICK_SECS));
+        std::fs::write(&mug.origin, b"an older build").expect("exe");
+        assert_eq!(mug.tick(NOW + 60), Next::Stop(Exit::Quit));
+        assert!(!launchd::startup_enabled(&mug.paths, &mug.label));
     }
 
     /// The registered class is what the runtime reports: its name, its superclass, the
@@ -995,6 +1079,7 @@ mod tests {
             ));
             for sel in [
                 sel!(statusClicked:),
+                sel!(openMenu:),
                 sel!(menuAction:),
                 sel!(tick:),
                 sel!(workspaceDidWake:),
@@ -1013,6 +1098,11 @@ mod tests {
                 // a delayed perform and a notification observer are sent as.
                 assert_eq!(method_types(cls, sel).as_deref(), Some("v@:@"), "{sel:?}");
             }
+            // The accessibility action's: `- (BOOL)x:(NSAccessibilityCustomAction *)action`.
+            assert_eq!(
+                method_types(cls, sel!(showMenuAction:)).as_deref(),
+                Some(format!("{}@:@", <Bool as Encode>::ENCODING).as_str())
+            );
             assert_eq!(method_types(cls, sel!(dealloc)).as_deref(), Some("v@:"));
         }
     }

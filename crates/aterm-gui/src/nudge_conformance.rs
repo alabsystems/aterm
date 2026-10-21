@@ -14,10 +14,11 @@
 //! repairs it.
 //!
 //! Each schedule runs the real event-loop steps in order - the epoch look
-//! (`observe_render_epochs`), then the nudge tick (`tick_nudges`) - against
-//! real time (the risk wait is one second, the never-touched person gate one
-//! and a half), so a schedule takes about four seconds, and asserts the
-//! outcome, not a latency: waits are hang detectors.
+//! (`observe_render_epochs`), then the nudge tick (`tick_nudges`) - on a clock
+//! of the rig's own that steps 5 ms between passes ([`Rig::step`]): the risk
+//! wait (one second) and the never-touched person gate (one and a half) are
+//! waited out in no real time, at the same pass every run, and the outcome is
+//! asserted, not a latency. The bound on the passes is a hang detector.
 //!
 //! WHAT IS ASSERTED. A session ADOPTED with a seeded debt (R08: the successor
 //! judges the tab natively) is repaired once: the stand-in read the short size
@@ -39,6 +40,9 @@ use crate::{App, WindowId};
 
 const ROWS: u16 = 12;
 const COLS: u16 = 40;
+
+/// The rig's clock between two passes of the machine ([`Rig::step`]).
+const STEP: Duration = Duration::from_millis(5);
 
 /// How the stand-in program answers a size it reads as changed.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -222,17 +226,36 @@ impl Rig {
             .any(|entry| entry.key.starts_with("render."))
     }
 
-    /// Pump until `done`, for at most `limit` (a hang detector, not a budget).
+    /// Pump until `done`, a [`Self::step`] of 5 ms between passes, for at
+    /// most `limit` of the rig's clock or a minute of real time (hang
+    /// detectors, not budgets).
     fn until(&mut self, limit: Duration, mut done: impl FnMut(&mut Rig) -> bool) -> bool {
-        let deadline = Instant::now() + limit;
-        while Instant::now() < deadline {
+        let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let mut waited = Duration::ZERO;
+        while waited < limit && Instant::now() < hang {
             self.pump();
             if done(self) {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            self.step(STEP);
+            waited += STEP;
         }
         false
+    }
+
+    /// TIME PASSES `by` FOR THIS RIG ALONE: the ledger's clock this test's
+    /// thread reads (`turn_ledger::advance_for_test`: the risk wait, the
+    /// person gate, the hold's deadlines) and this `App`'s output clock (its
+    /// `lat_epoch`, moved as far back, so the program's last output is that
+    /// much older: the quiet and settle waits). No other test's thread or
+    /// `App` reads either.
+    fn step(&mut self, by: Duration) {
+        crate::turn_ledger::advance_for_test(u64::try_from(by.as_millis()).unwrap_or(u64::MAX));
+        self.app.lat_epoch = self
+            .app
+            .lat_epoch
+            .checked_sub(by)
+            .expect("the output clock's epoch moves back");
     }
 
     fn header(&self) -> String {

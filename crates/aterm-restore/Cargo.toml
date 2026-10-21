@@ -59,3 +59,10 @@ path = "tests/engine_conformance.rs"
 [[test]]
 name = "shared_region"
 path = "tests/shared_region.rs"
+
+# A measurement, not a gate: what a damaged history ring costs `recover` (R12, the
+# bounded resync search in astream-wire's steps).
+[[bench]]
+name = "resync_walk"
+path = "benches/resync_walk.rs"
+harness = false

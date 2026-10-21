@@ -18,8 +18,8 @@
 //!
 //! `App::commit_session_rename` writes through
 //! [`crate::session_timeline::write_session_meta`] (the `meta` verb's validation, atomicity
-//! and `changed` gate), then runs the chrome refresh and subscriber notify directly: posting
-//! `Wake::MetaChanged` would run the refresh twice.
+//! and `changed` gate), then runs the chrome refresh directly (the record wakes the
+//! session's watchers): posting `Wake::MetaChanged` would run the refresh twice.
 //!
 //! A pin is not synchronously durable: the restore manifest is written on graceful,
 //! non-headless shutdown, so a crash between a rename and a quit loses it.
@@ -456,12 +456,6 @@ impl App {
                 self.mark_status_dirty();
             }
             self.reproject_pill_of(session);
-            if self.subscribers.any() {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(session);
-            }
         }
         Ok(changed)
     }
@@ -480,7 +474,7 @@ mod tests {
         let tl = ctx.timeline.lock().unwrap();
         tl.since(None)
             .filter(|e| e.kind == "meta-change")
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect()
     }
 

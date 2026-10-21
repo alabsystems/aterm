@@ -143,7 +143,10 @@ impl AnchorSet {
     }
 
     /// Free `id` (a no-op for a slot already free). The last one going
-    /// takes the loss with it: no anchor is left to be wrong.
+    /// leaves the empty set: no anchor is left to be wrong (the loss goes),
+    /// no seal names a row (the epoch restarts), and the slots are released,
+    /// so a session whose drawers have all gone holds no allocation and
+    /// checkpoints nothing.
     pub fn free(&mut self, id: AnchorId) {
         if let Some(a) = self.anchors.get_mut(usize::from(id.0))
             && a.live
@@ -151,7 +154,7 @@ impl AnchorSet {
             a.live = false;
             self.live -= 1;
             if self.live == 0 {
-                self.lost = false;
+                *self = Self::default();
             }
         }
     }

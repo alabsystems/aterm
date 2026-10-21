@@ -58,7 +58,8 @@
 //! [`arm_ready`] and waits with [`await_ready`]. The `aterm ctl` client helpers
 //! ([`ctl`], [`ctl_ok`], [`field`], …) are here once for every live file. The
 //! file that includes this module includes `support/launch_isolation.rs` as
-//! `launch_isolation` and `support/child_output.rs` as `child_output` too.
+//! `launch_isolation`, `support/child_output.rs` as `child_output` and
+//! `support/ctl_accept.rs` as `ctl_accept` too.
 
 #![allow(dead_code)]
 #![allow(
@@ -74,6 +75,7 @@ use aterm_agent::ready::{Ready, Signal};
 use aterm_spec::host::could_not_run;
 use aterm_spec::wait::MUST_HAPPEN;
 
+pub use crate::ctl_accept::{until_served, was_never_accepted, was_turned_away};
 use crate::{child_output, launch_isolation};
 
 /// How often a readiness EXTRA ([`boot_with`]'s `ready`: a token file, a
@@ -557,9 +559,10 @@ pub fn await_ready<T>(
             if let Some(why) = environment_refusal(&tail) {
                 could_not_run(format!("{why}; log tail:\n{tail}"));
             }
+            let stack = thread_stack(child(inst).id(), log, None);
             panic!(
                 "aterm --headless did not say its control socket listens within {MUST_HAPPEN:?}; \
-                 log tail:\n{tail}"
+                 log tail:\n{tail}\nits main thread now:\n{stack}"
             );
         }
         Signal::Failed(e) => panic!("could not read the instance's ready signal: {e}"),
@@ -571,6 +574,72 @@ pub fn await_ready<T>(
          {MUST_HAPPEN:?}; log tail:\n{}",
         log_tail(log)
     );
+}
+
+/// Where a hung instance waits: one of its threads as `/usr/bin/sample`
+/// reads it over one second (macOS) — the main thread, or the first whose
+/// line names `thread` (a Rust thread's name, `aterm-spare`) — its call
+/// graph's first [`STACK_LINES`] lines, written beside `log` and read back. A
+/// log names only the last step that finished: one startup hang, 1 in 160
+/// runs of the live spare module, said `headless mode` and nothing more. What
+/// could not be read says so instead.
+pub fn thread_stack(pid: u32, log: &Path, thread: Option<&str>) -> String {
+    /// Enough for the frames from a thread's entry to its wait, at aterm's
+    /// depth.
+    const STACK_LINES: usize = 80;
+    if !cfg!(target_os = "macos") {
+        return "(no sampler on this platform)".to_owned();
+    }
+    let file = log.with_file_name("hang.sample.txt");
+    // A hang detector on the sampler too: it suspends and symbolicates the
+    // instance, and a report that waited on it unbounded could outlast the
+    // very hang it reports.
+    let sampled = aterm_uds::spawnfd::command("/usr/bin/sample")
+        .arg(pid.to_string())
+        .args(["1", "-mayDie", "-file"])
+        .arg(&file)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .map(|mut sampler| {
+            let ended = aterm_spec::wait::within(MUST_HAPPEN, POLL_GAP, || {
+                sampler.try_wait().ok().flatten()
+            });
+            if ended.is_none() {
+                let _ = sampler.kill();
+                let _ = sampler.wait();
+            }
+            ended
+        });
+    let text = match (sampled, std::fs::read_to_string(&file)) {
+        (Ok(Some(_)), Ok(text)) => text,
+        (sampled, read) => return format!("(not sampled: {sampled:?}, {read:?})"),
+    };
+    let _ = std::fs::remove_file(&file);
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(graph) = lines.iter().position(|l| l.starts_with("Call graph:")) else {
+        return "(the sample has no call graph)".to_owned();
+    };
+    // A frame's depth is where its count starts, past the tree's own marks
+    // (`+ ! : |`, which `sample` draws once a graph has several threads).
+    let depth = |l: &str| l.len() - l.trim_start_matches([' ', '+', '!', ':', '|']).len();
+    // The call graph's first thread is the main one (`Main Thread`, or the
+    // main dispatch queue's); every thread's line sits at that depth.
+    let Some(top) = lines.get(graph + 1).map(|l| depth(l)) else {
+        return "(the sample's call graph is empty)".to_owned();
+    };
+    let Some(at) = (graph + 1..lines.len())
+        .find(|&k| depth(lines[k]) == top && thread.is_none_or(|name| lines[k].contains(name)))
+    else {
+        return format!("(the sample names no thread {thread:?})");
+    };
+    let below = lines[at + 1..].iter().take_while(|l| depth(l) > top);
+    std::iter::once(lines[at])
+        .chain(below.copied())
+        .take(STACK_LINES)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A `ctl` client that has not exited by now is hung: past every minute-long
@@ -634,44 +703,60 @@ pub fn said(out: &Output) -> String {
 }
 
 /// One bounded `aterm ctl` call, read until it exits
-/// (`support/child_output.rs`: a sibling's spawn can hold its pipes open).
-///
-/// A call the instance never ACCEPTED is asked again, for up to
-/// [`aterm_spec::wait::MUST_HAPPEN`]. `aterm ctl` gives the accept phase 10 s
-/// (`ACCEPT_DEADLINE`, which `--timeout` can only shorten) and then exits 2
-/// with "the instance took no request, so none was sent" — nothing ran, so
-/// asking again cannot run anything twice. On a loaded machine a live instance
-/// can miss those 10 s (`host_live_program`); a correctness test's wait for a
-/// listener that must answer is a hang detector, not a budget.
+/// (`support/child_output.rs`: a sibling's spawn can hold its pipes open), asked
+/// again while the instance has not yet ACCEPTED it or answers it busy
+/// ([`until_served`]): either way nothing was served.
 pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
-    until_accepted(|| {
+    until_served(|| {
         let child = client_command(inst, args).spawn().expect("spawn aterm ctl");
         child_output::wait_and_read(child, Instant::now() + CLIENT_EXIT_DEADLINE)
             .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
     })
 }
 
-/// Whether `out` is the `aterm ctl` client's refusal to send anything: the
-/// instance's control socket did not ACCEPT its connection within the client's own
-/// 10 s (`aterm-ctl`'s `ACCEPT_DEADLINE`, which `--timeout` can only shorten), and
-/// the client says "so none was sent", exit 2. The instance is alive and not yet
-/// taking connections - a debug build on a machine under a build storm can be slow
-/// to start - and nothing reached it.
-pub fn was_never_accepted(out: &Output) -> bool {
-    out.status.code() == Some(2)
-        && String::from_utf8_lossy(&out.stderr).contains("so none was sent")
-}
-
-/// Run `attempt` (one `aterm ctl` call) again for as long as it comes back
-/// [`was_never_accepted`], up to the hang detector. Nothing was sent, so asking again
-/// is waiting for the instance to be ready, not retrying an effect; any other
-/// answer, success or failure, is returned at once.
-pub fn until_accepted(mut attempt: impl FnMut() -> Output) -> Output {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+/// `aterm ctl --sock <sock> subscribe <args…>` against `inst`, returned once the
+/// server has ACKNOWLEDGED the subscription (`OK subscribe <n>`, which the client
+/// writes to stderr before any frame): from then on every push reaches the
+/// child's stdout, so a test that moves something next sees it. A client the
+/// instance never accepted ([`was_never_accepted`]) is started again, up to the
+/// hang detector, as is one the instance answered busy ([`was_turned_away`]);
+/// one that ends any other way before its acknowledgement fails
+/// the test with what it said.
+pub fn subscribed(inst: &Instance, args: &[&str]) -> Child {
+    let mut request = vec!["subscribe"];
+    request.extend_from_slice(args);
+    let give_up = Instant::now() + MUST_HAPPEN;
     loop {
-        let out = attempt();
-        if !was_never_accepted(&out) || Instant::now() >= give_up {
-            return out;
+        let mut child = client_command(inst, &request)
+            .spawn()
+            .expect("spawn aterm ctl subscribe");
+        // The client prefixes every stderr line with its name: `aterm-ctl: OK subscribe 1`.
+        let acked = child_output::await_stderr_line(
+            &mut child,
+            |line| {
+                line.trim_start_matches("aterm-ctl: ")
+                    .starts_with("OK subscribe")
+            },
+            Instant::now() + CLIENT_EXIT_DEADLINE,
+        );
+        match acked {
+            Ok(()) => return child,
+            Err(child_output::NoLine::Exited(out))
+                if (was_never_accepted(&out) || was_turned_away(&out))
+                    && Instant::now() < give_up => {}
+            Err(child_output::NoLine::Exited(out)) => panic!(
+                "aterm ctl {request:?} ended before its subscription was acknowledged:\n{}",
+                said(&out)
+            ),
+            Err(child_output::NoLine::Hung(stderr)) => panic!(
+                "aterm ctl {request:?} was not acknowledged within {}s; its stderr:\n{stderr}",
+                CLIENT_EXIT_DEADLINE.as_secs()
+            ),
+            Err(child_output::NoLine::OutputLimit { stream, captured }) => panic!(
+                "aterm ctl {request:?} reached the {} byte {stream} diagnostic limit before \
+                 its subscription was acknowledged:\n{captured}",
+                child_output::ACK_OUTPUT_LIMIT
+            ),
         }
     }
 }
@@ -841,4 +926,61 @@ pub fn status(inst: &Instance, sid: &str) -> String {
 pub fn type_line(inst: &Instance, sid: &str, line: &str) {
     ctl_ok(inst, &[&format!("@{sid}"), "send", line]);
     ctl_ok(inst, &[&format!("@{sid}"), "key", "enter"]);
+}
+
+/// A zsh for a live test, found as every live suite finds its shells
+/// ([`aterm_spec::host::test_shell`]): `$ATERM_TEST_ZSH`, which
+/// fails loudly when it names no file, else the usual places, else `$PATH`,
+/// else `None`: the host has none. A tab told `SHELL=<missing>` starts the
+/// person's login shell instead (`aterm: … does not exist (from $SHELL)`), so
+/// a test that names a zsh the host lacks runs bash and proves nothing of zsh:
+/// it asks [`need_zsh`] or [`login_shell`] instead.
+pub fn zsh() -> Option<&'static str> {
+    static ZSH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ZSH.get_or_init(|| {
+        aterm_spec::host::test_shell("zsh").map(|path| path.to_string_lossy().into_owned())
+    })
+    .as_deref()
+}
+
+/// [`zsh`] for a test whose claim is zsh's own: COULD NOT RUN where the host
+/// has none, never a pass under the shell aterm would start instead. The
+/// refusal names the test's line, not this one.
+#[track_caller]
+pub fn need_zsh() -> &'static str {
+    match zsh() {
+        Some(zsh) => zsh,
+        None => could_not_run(aterm_spec::host::tool("zsh").refusal()),
+    }
+}
+
+/// A login shell for a live test whose claim holds under every shell aterm
+/// integrates alike, and the startup file a tab of it reads from the
+/// instance's home.
+#[derive(Clone, Copy, Debug)]
+pub struct LoginShell {
+    pub path: &'static str,
+    /// `.zshrc` or `.bashrc`: aterm's loader reads it in every tab (bash's,
+    /// after the login profiles on macOS).
+    pub rc: &'static str,
+    pub kind: aterm_shell_integration::ShellType,
+}
+
+/// zsh where the host has one (every Mac; the lab's Linux lane), else bash,
+/// which every Unix host aterm supports has at `/bin/bash`. An rc a test
+/// writes for it reads the same in either: no `print`, no `setopt`.
+pub fn login_shell() -> LoginShell {
+    use aterm_shell_integration::ShellType;
+    match zsh() {
+        Some(path) => LoginShell {
+            path,
+            rc: ".zshrc",
+            kind: ShellType::Zsh,
+        },
+        None => LoginShell {
+            path: "/bin/bash",
+            rc: ".bashrc",
+            kind: ShellType::Bash,
+        },
+    }
 }

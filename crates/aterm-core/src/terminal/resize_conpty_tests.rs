@@ -226,24 +226,16 @@ fn conpty_rows_grow_keeps_a_scrolled_back_reader_on_the_same_line() {
     );
 }
 
-/// The text at absolute row `abs`, resolved the way every absolute-row
-/// consumer resolves it (`control_query::abs_row_text`): history below
-/// `oldest + scrollback`, the viewport above it.
+/// The text at absolute row `abs`, trailing blanks trimmed, resolved the way
+/// every absolute-row consumer resolves it ([`Terminal::abs_row_text_within`]):
+/// history below `oldest + scrollback`, the live screen above it.
 fn abs_text(t: &Terminal, abs: u64) -> String {
-    let grid = t.grid();
-    let Some(rel) = abs.checked_sub(grid.oldest_absolute_row()) else {
-        return String::new();
-    };
-    let rel = usize::try_from(rel).unwrap();
-    let text = if rel < grid.scrollback_lines() {
-        grid.get_history_line(rel)
-            .map(|l| l.to_string())
-            .unwrap_or_default()
-    } else {
-        let row = i32::try_from(rel - grid.scrollback_lines()).unwrap();
-        t.get_line_text(row, None).unwrap_or_default()
-    };
-    text.trim_end().to_string()
+    match t.abs_row_text_within(abs, usize::MAX) {
+        crate::terminal::AbsRowText::Text(text) => text.trim_end().to_string(),
+        crate::terminal::AbsRowText::Evicted
+        | crate::terminal::AbsRowText::OutOfRange
+        | crate::terminal::AbsRowText::Unreadable => String::new(),
+    }
 }
 
 /// OSC 133 marks are keyed by absolute row, never the renumber epoch: a ConPTY height drag

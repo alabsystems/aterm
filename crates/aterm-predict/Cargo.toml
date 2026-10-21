@@ -20,6 +20,11 @@ aterm-grapheme = { workspace = true }
 # std::time::Instant on native, a JS clock on wasm32. The state machine is
 # clockless (the host injects `now`); wasm hosts need a constructible Instant.
 aterm-time = { workspace = true }
+# The ONE bidi-class authority: a glyph is placed only on a row the engine's own
+# UAX #9 reorder leaves in logical order, and which characters make a row reorder
+# is that crate's question. Dependency-free, and already in the wasm closure
+# through aterm-core.
+aterm-bidi = { workspace = true }
 
 [dev-dependencies]
 # The headless engine the safety theorem (`tests/reconciled_view_safety.rs`) folds

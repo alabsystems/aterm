@@ -6,23 +6,49 @@
 //!
 //! * [`process_cwd`], [`process_path`] — another process's working directory
 //!   and executable, without forking `lsof` (the harness, the Claude Code
-//!   footer, `aterm ctl` session queries).
+//!   footer, `aterm ctl` session queries); on Windows `peb`, the one reader
+//!   of what another process was started with and where it works now.
 //! * [`group_memory`] — one process group's physical footprint (the agent
 //!   memory ceiling, `aterm_agent::supervise::memory`).
 //! * [`lone_group_leader`] — the name of a process that leads a group no
 //!   other process is in (a file citation's shell in front).
+//! * [`stdin_sharers`] — the members of a group that read its leader's own
+//!   input device: a program an agent handed its terminal to (a bare
+//!   Ctrl-R/Ctrl-S's owner, `aterm-gui`'s `App::front_agent_composer`).
 //! * [`physical_memory_mib`], [`machine_memory`], [`memory_pressure`],
 //!   [`swapped_kib`] and the [`SwapMeter`] — the machine's memory, the
 //!   kernel's pressure level and the swap rate the ceiling moves with.
 //! * [`volumes`] — the mount table, a fresh reading of one volume's free
 //!   space, and the pure lookups between a path and its mount (the disk
-//!   watch, `aterm harness disk`, `status disk=` and `await sys`).
+//!   watch, `aterm harness disk`, `status disk=` and `await sys`), and
+//!   [`volumes::file_id`], one file's device and number on every platform.
+//! * [`paths`] — the one rule that places a path under a directory across
+//!   Windows' spellings of one location (verbatim or plain, any case),
+//!   pure and tested on every platform.
 //! * The system-awareness stats' readers: [`Probe::core_ticks`] (every
-//!   logical core's ticks), [`cpu_layout`] (the clusters the OS names),
-//!   [`memory_detail`] (memory by page class, swap, pressure), [`gpu`] (the
-//!   GPU's device-wide use) and [`volume`] (the volume a path lives on).
+//!   logical core's ticks), [`Probe::throttle`] (the throttle level),
+//!   [`cpu_layout`] (the clusters the OS names), [`withdrawn_cores`] (the
+//!   cores the OS took away), [`memory_detail`] (memory by the OS's classes,
+//!   swap, commit, pressure), [`gpu`] (the GPU's device-wide use), [`volume`]
+//!   (the volume a path lives on), [`capacity`] (a cgroup's ceiling),
+//!   [`net_links`] (every network interface's counters, with
+//!   [`counts_toward_machine`] naming the machine's own links; the macOS
+//!   message layouts in [`iflist`]), [`process_limits`] (the process
+//!   table's ceilings) and [`load_average`] (the kernel's load averages).
 //! * [`processes`] — one sweep of the process table: each process's parent,
-//!   CPU time, footprint and name (the stats' aterm and tab scopes).
+//!   group, state, CPU time, footprint, disk bytes and name (the stats'
+//!   aterm and tab scopes, and the job units of the stuck-process engine).
+//! * [`jobs`] — the job probe: for each job member the stuck-process engine
+//!   names, its run state and threads' states, counters (CPU, system calls,
+//!   wakeups, context switches, disk and logical bytes), terminal and its
+//!   foreground group, and descriptors (an output file's growth, pipe wait
+//!   flags, TCP state, an event queue's interests), with lanes L6 and L7.
+//! * [`caps`] — what of all that the running machine can say ([`Caps`]),
+//!   and why a figure is unavailable ([`Why`]): never a zero.
+//! * [`kproc`] — the kernel's process records as `ps` and `lsof` read them
+//!   (groups, terminals, start times, argument words, the mapped image's
+//!   inode), without running either (the harness's job reads, `aterm
+//!   fabric`'s broker search).
 //!
 //! # No timer
 //!
@@ -35,8 +61,16 @@
 //! Mach host and processor statistics and the IORegistry (the private
 //! `iokit` module's declarations, held to the SDK by `tests/iokit_sdk.rs`).
 //! The Linux arm reads `/proc` and `/sys` through std alone ([`linux`]'s
-//! parsers are pure functions over `&str`, compiled and tested on every
-//! platform). Every other platform answers `None`.
+//! parsers are pure functions over `&str`, and its [`linux::Root`] readers
+//! read under any root directory, so both compile and are tested on every
+//! platform against fixture trees). The Windows arm (the private `win`
+//! module, 64-bit Windows) calls kernel32 and ntdll and hands every buffer
+//! to [`windows`]'s decoders, which are pure and tested on every platform.
+//! The volumes, file identities, path spellings and other processes'
+//! parameters are read through the private `win_paths` module's `kernel32`
+//! and `ntdll` declarations (each struct held to the SDK's layout by a test),
+//! the readers' assembly pure and tested on every platform. Every other
+//! platform, and every reader Windows has no arm for, answers `None`.
 //!
 //! # Bounded
 //!
@@ -60,20 +94,39 @@ use std::io::Read as _;
 use std::path::Path;
 use std::time::Instant;
 
+pub mod caps;
+pub mod iflist;
 #[cfg(target_os = "macos")]
 mod iokit;
+pub mod jobs;
+pub mod kproc;
 pub mod linux;
 mod machine;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod paths;
+#[cfg(windows)]
+pub mod peb;
+/// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one
+/// reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate
+/// reads it through (aterm-uds re-exports it as `aterm_uds::procargs`).
+pub mod procargs;
 pub mod procs;
 pub mod volumes;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod win;
+#[cfg(windows)]
+mod win_paths;
+pub mod windows;
 
 pub use procs::{ProcessReading, Sweep, processes};
 
+pub use caps::{Cap, CapSource, Caps, Why};
 pub use machine::{
-    Cluster, CoreTicks, CpuLayout, GpuReading, MemoryDetail, Probe, VolumeReading, cpu_layout, gpu,
-    memory_detail, volume,
+    Capacity, Cluster, Commit, CoreTicks, CpuLayout, GpuReading, LinkCounters, LinkKind,
+    LinkReading, MAX_LINKS, MemoryDetail, Probe, ProcessLimits, Throttle, ThrottleLevel,
+    VolumeReading, capacity, caps, counts_toward_machine, cpu_layout, gpu, layout_by_rank,
+    level_names, load_average, memory_detail, net_links, process_limits, volume, withdrawn_cores,
 };
 
 /// A path buffer (`PROC_PIDPATHINFO_MAXSIZE`).
@@ -119,9 +172,13 @@ impl MemoryLevel {
 /// The working directory of process `pid`, read from the OS: `None` where it
 /// cannot be read (the process is gone, not ours, or the platform has no
 /// reader here). macOS asks `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, Linux
-/// resolves `/proc/<pid>/cwd`. What an agent's session is ABOUT — Claude
-/// Code's folder-trust dialog asks for exactly this directory — where the
-/// shell reported none (no OSC 7).
+/// resolves `/proc/<pid>/cwd`, Windows reads the process environment block's
+/// `CurrentDirectory` ([`peb`]: a process of this account that grants
+/// `PROCESS_VM_READ`, never an elevated one), spelled as that process's own
+/// `GetCurrentDirectoryW` answers it — no trailing separator but at a root,
+/// and an 8.3 short name kept if the process was handed one. What an agent's
+/// session is ABOUT — Claude Code's folder-trust dialog asks for exactly this
+/// directory — where the shell reported none (no OSC 7).
 #[must_use]
 pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
@@ -134,10 +191,93 @@ pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
             .ok()
             .filter(|p| p.is_absolute())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        peb::cwd(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = pid;
         None
+    }
+}
+
+/// This thread's critical-error and open-file system boxes kept off until it
+/// drops ([`quiet_errors`]).
+///
+/// Neither `Send` nor `Sync`, on every platform: the mode it sets and
+/// restores is its OWN thread's. Dropped on another thread, it would leave
+/// its own thread quiet for good and hand the other one a mode that was
+/// never its own; the compiler refuses that move.
+#[must_use = "the boxes are off only while the guard lives"]
+pub struct QuietErrors {
+    /// The thread's mode to restore (Windows).
+    #[cfg(windows)]
+    _quiet: win_paths::Quiet,
+    /// Keeps the guard on the thread that made it.
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+/// Turn this thread's critical-error and open-file system boxes off until
+/// the answer drops: `SetThreadErrorMode(SEM_FAILCRITICALERRORS |
+/// SEM_NOOPENFILEERRORBOX)`, every other bit of the thread's mode kept and
+/// the old mode restored on drop — thread-scoped, never the process-wide
+/// `SetErrorMode`. On Windows a file-system call on an empty card reader or
+/// optical drive (a `canonicalize` of a tab's working directory on `E:\`, a
+/// listing that spells a process's 8.3 path long) otherwise puts a "There
+/// is no disk in the drive" box on the owner's desktop and parks the asking
+/// thread until someone answers it; with the boxes off the call fails with
+/// `ERROR_NOT_READY` and the caller's unknown arm answers. A thread that
+/// asks file systems about paths other processes and tabs report — the
+/// window's disk-watch look and first reading, the path-user scan's naming
+/// helper, `aterm harness disk` — holds one for its whole life; every reader
+/// of this crate that may reach a file system holds one already. Guards
+/// nest: each restores the mode it found, so each drops on its own thread
+/// in the reverse order of making ([`QuietErrors`] cannot leave it). Nothing
+/// elsewhere: no other platform raises such a box.
+pub fn quiet_errors() -> QuietErrors {
+    QuietErrors {
+        #[cfg(windows)]
+        _quiet: win_paths::quiet(),
+        _this_thread: std::marker::PhantomData,
+    }
+}
+
+/// The 8.3 short spelling of the existing `path` as the file system
+/// generated it (Windows' `GetShortPathNameW`: `C:\Users\ANDREW~1\x`), for
+/// a test that must start a process in, or report, a short-spelled path
+/// (`volumes::Table::long_spelling`'s callers' tests). `None` where none was
+/// generated (a volume that makes no short names, a name that needs none)
+/// or the path does not exist, and on every other platform. A test seam.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        win_paths::short_path(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Are this thread's critical-error and open-file system boxes both off now
+/// (`GetThreadErrorMode` holds both [`quiet_errors`] bits)? The seam a test
+/// reads inside a thread that must hold the guard. `true` off Windows: no
+/// other platform raises such a box. A test seam, as [`short_spelling`] is:
+/// every caller outside this crate is a test's.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn errors_quiet() -> bool {
+    #[cfg(windows)]
+    {
+        win_paths::errors_quiet()
+    }
+    #[cfg(not(windows))]
+    {
+        true
     }
 }
 
@@ -191,6 +331,85 @@ pub fn lone_group_leader(pid: u32) -> Option<String> {
         let _ = pid;
         None
     }
+}
+
+/// The members of the process group `leader` leads, other than the leader,
+/// whose STANDARD INPUT is the very device the leader's is: the programs the
+/// leader handed its terminal to without a group of their own. Claude Code
+/// runs `$EDITOR` so (inherited stdio, no `setpgid`), and the editor then
+/// reads the keys while the terminal's foreground group is still the one
+/// `claude` leads. A helper whose input is a pipe, a file or `/dev/null` (an
+/// MCP server, a hook) is not one of them. A snapshot, read now.
+///
+/// `Some(empty)` when no member shares it. `None` where it cannot be read:
+/// `leader` leads no group, its standard input is not a device (a pipe, a
+/// file, closed), the group cannot be listed, or the platform has no reader
+/// here (every platform but macOS and Linux).
+///
+/// macOS lists the group (`proc_listpids(PROC_PGRP_ONLY)`, at most
+/// [`MAX_GROUP_PIDS`] members) and compares each member's descriptor 0 with
+/// the leader's (`proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`'s `vst_dev` and
+/// `vst_ino`, the layout [`jobs::darwin::vnode`] decodes). Linux has no
+/// complete group reader here ([`lone_group_leader`]), so it reads the
+/// leader's own children (`/proc/<pid>/task/<tid>/children`,
+/// [`linux::children`]) that are still in its group, comparing
+/// `/proc/<pid>/fd/0`'s device and inode: a grandchild counts only through a
+/// child that shares the input too (a `sh -c "$EDITOR …"` does), and a kernel
+/// without those files answers `None`.
+///
+/// Cost on macOS: one short info, one group listing and one descriptor read
+/// per member; no sweep of the process table, no subprocess.
+#[must_use]
+pub fn stdin_sharers(leader: u32) -> Option<Vec<u32>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::stdin_sharers(leader)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_stdin_sharers(leader)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = leader;
+        None
+    }
+}
+
+/// [`stdin_sharers`] on Linux: the leader's children still in its group
+/// whose `/proc/<pid>/fd/0` is the leader's own device.
+#[cfg(target_os = "linux")]
+fn linux_stdin_sharers(leader: u32) -> Option<Vec<u32>> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let dir = |pid: u32| Path::new("/proc").join(pid.to_string());
+    let input = |pid: u32| {
+        std::fs::metadata(dir(pid).join("fd").join("0"))
+            .ok()
+            .filter(|m| m.file_type().is_char_device())
+            .map(|m| (m.dev(), m.ino()))
+    };
+    let group = |pid: u32| with_bounded(&dir(pid).join("stat"), linux::stat_pgrp).flatten();
+    if group(leader)? != leader {
+        return None;
+    }
+    let device = input(leader)?;
+    let tasks = std::fs::read_dir(dir(leader).join("task")).ok()?;
+    let (mut read, mut sharers) = (false, Vec::new());
+    for task in tasks.flatten().take(MAX_GROUP_PIDS) {
+        let Some(children) = with_bounded(&task.path().join("children"), linux::children) else {
+            continue;
+        };
+        read = true;
+        for child in children {
+            if !sharers.contains(&child)
+                && group(child) == Some(leader)
+                && input(child) == Some(device)
+            {
+                sharers.push(child);
+            }
+        }
+    }
+    read.then_some(sharers)
 }
 
 /// At most this many members of one process group are measured
@@ -600,8 +819,8 @@ pub(crate) fn read_into(path: &Path, buf: &mut [u8]) -> Result<(usize, bool), st
 /// `f` over the text of at most [`READ_CAP`] bytes of `path`, read into one
 /// stack buffer ([`read_bounded`] without its heap copy); `None` when the
 /// file cannot be read. Bytes that are not UTF-8 end the text where they
-/// start.
-#[cfg(any(target_os = "linux", test))]
+/// start. Compiled everywhere: [`linux::links_under`] reads a fixture root
+/// through it on any host.
 pub(crate) fn with_bounded<T>(path: &Path, f: impl FnOnce(&str) -> T) -> Option<T> {
     let mut buf = [0u8; READ_CAP];
     let (n, _) = read_into(path, &mut buf).ok()?;
@@ -659,4 +878,8 @@ pub const fn pressure_of(level: i64) -> Option<MemoryLevel> {
 }
 
 #[cfg(test)]
+mod linux_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod windows_tests;

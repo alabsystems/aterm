@@ -537,27 +537,49 @@ impl crate::App {
 /// Whether a person's gesture `ev` ([`is_person_gesture`]) reaches the
 /// program, as the session's lock-free mode mirror says before the seam
 /// routes it: a key press or repeat that encodes to bytes (under the
-/// mirror's keyboard mode), text, a key sequence or a paste; a wheel the
-/// seam sends the program bytes for (its route,
+/// mirror's keyboard mode), text that encodes to bytes (the seam's own
+/// [`crate::keymap::encode_committed_text`]: under kitty's report-all-keys
+/// mode a control character encodes to nothing), a key sequence, a paste
+/// that writes bytes (framed by its own answer or, for one that reads the
+/// live mode, the mirror's DEC 2004, then
+/// [`aterm_core::terminal::Terminal::paste_sends_bytes`], the formatter's
+/// own rule: bracketed always, unbracketed when a character survives the
+/// sanitizer); a wheel the seam sends the program bytes for (its route,
 /// [`crate::input::wheel_route_mirrored`], then the seam's own rule on that
 /// route: a report under a tracking mode that reports wheels,
 /// [`aterm_core::terminal::ModeMirror::reports_wheel`], so not X10; or
 /// alternate scroll's arrows, [`crate::input::alt_scroll_arrow`], so only a
 /// vertical wheel, whose arrow encodes to bytes, on a platform that scrolls
-/// a detent some lines, [`crate::input::alt_scroll_sends`]), a mouse press
+/// a detent some lines, [`crate::input::alt_scroll_sends`] on `platform`,
+/// the wheel rule the seam scrolls by: [`crate::input::WheelPlatform`]), a
+/// mouse press
 /// under mouse tracking, and a drag the tracking mode reports (button-event
 /// or any-event tracking,
 /// [`aterm_core::terminal::ModeMirror::reports_motion`], the encoder's own
 /// rule: X10 and normal tracking report no motion). A wheel or a view
 /// scroll that moves the viewport, a wheel the seam swallows (an X10
 /// report, a horizontal wheel on alternate scroll), a click or a drag that
-/// selects, a drag the mode does not report, and a composition's preedit
-/// (no bytes) do not: they can neither dismiss a box (T1) nor answer
-/// delivered mail (T39). The mirror trails a batch running now by that batch, as the key
-/// encoder's does; a reported drag that stays in its cell sends nothing
-/// more (the encoder's per-cell memo, under the lock), its press having
-/// reached the program first.
-pub(crate) fn reaches_program(ev: &InputEvent, mirror: &aterm_core::terminal::ModeMirror) -> bool {
+/// selects, a drag the mode does not report, an unbracketed paste of
+/// controls only and a composition's preedit (no bytes) do not: they can
+/// neither dismiss a box (T1) nor answer delivered mail (T39). The mirror
+/// trails a batch running now by that batch, as the key encoder's does.
+///
+/// THE LAW (phase 6, 6A-4; `session_log_attribution_tests.rs`'s conformance
+/// table): for every person gesture of every [`InputEvent`] class, on every
+/// mode the mirror holds and every platform's wheel rule, this is true
+/// exactly where the seam writes the program at least one byte, on a
+/// terminal whose state is the mirror's. The one gesture outside it is a
+/// reported drag that stays in the cell of the report before it (its press,
+/// or the last drag the encoder sent): the encoder's per-cell memo, held
+/// under the lock and not in the mirror, sends nothing for it, and this says
+/// it reached. That report before it reached the program from the same
+/// held button, so the person was already at the program; the table drives
+/// the pair through one terminal and pins this treatment.
+pub(crate) fn reaches_program(
+    ev: &InputEvent,
+    mirror: &aterm_core::terminal::ModeMirror,
+    platform: crate::input::WheelPlatform,
+) -> bool {
     match ev {
         InputEvent::Key {
             key,
@@ -577,9 +599,14 @@ pub(crate) fn reaches_program(ev: &InputEvent, mirror: &aterm_core::terminal::Mo
                 )
                 .is_empty()
         }
-        InputEvent::Text(t) => !t.is_empty(),
+        InputEvent::Text(t) => {
+            !crate::keymap::encode_committed_text(t, mirror.keyboard_mode()).is_empty()
+        }
         InputEvent::KeySequence(b) => !b.is_empty(),
-        InputEvent::Paste(..) => true,
+        InputEvent::Paste(text, framing) => aterm_core::terminal::Terminal::paste_sends_bytes(
+            text,
+            framing.bracketed(mirror.bracketed_paste()),
+        ),
         InputEvent::Wheel {
             dir,
             lines,
@@ -591,7 +618,7 @@ pub(crate) fn reaches_program(ev: &InputEvent, mirror: &aterm_core::terminal::Mo
             crate::input::WheelRoute::AltScroll => {
                 crate::input::alt_scroll_arrow(*dir, mirror.keyboard_mode())
                     .is_some_and(|arrow| !arrow.is_empty())
-                    && crate::input::alt_scroll_sends(*lines, *detent)
+                    && crate::input::alt_scroll_sends(platform, *lines, *detent)
             }
             crate::input::WheelRoute::Viewport => false,
         },
@@ -1127,7 +1154,7 @@ mod tests {
             let mirror = term.mode_mirror();
             let mode = String::from_utf8_lossy(set);
             assert_eq!(
-                reaches_program(&drag, mirror),
+                reaches_program(&drag, mirror, crate::input::WheelPlatform::Host),
                 motion,
                 "a drag under {mode:?}"
             );
@@ -1137,7 +1164,7 @@ mod tests {
                 "the encoder under {mode:?}"
             );
             assert_eq!(
-                reaches_program(&press, mirror),
+                reaches_program(&press, mirror, crate::input::WheelPlatform::Host),
                 !set.is_empty(),
                 "a press under {mode:?}"
             );

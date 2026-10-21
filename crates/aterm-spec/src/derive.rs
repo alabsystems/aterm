@@ -59,8 +59,8 @@
 //!    with a negative control. Anchor the real fns with
 //!    `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]`; the
 //!    crate's build script mounts `crates/aterm-spec-anchor/anchor_rules.rs` and its root
-//!    carries `#![cfg_attr(anchor_rules, feature(macro_attr))]` (aterm-spec-anchor's docs
-//!    say why).
+//!    carries `#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]`,
+//!    the cfg its anchors compile in (aterm-spec-anchor's docs say why).
 //! 4. **Progress** (it lands, drains, answers): state a `derive::Liveness` with
 //!    named fairness and register it with `#[aterm_spec::liveness(its_model)]`,
 //!    which `aterm-models/tests/non_vacuity.rs` discharges (`verify::audit_liveness`); copy
@@ -1714,87 +1714,6 @@ pub mod props {
     }
 }
 
-/// GPU glyph atlas texture residency across shelf appends (`occupied_h' = occupied_h + 1`)
-/// and full repacks (`epoch' = epoch + 1`).
-///
-/// * At `Buggy = 0`, when `occupied_h > uploaded_h` within `tex_h`, syncing the
-///   atlas uploads the dirty row band `[uploaded_h .. occupied_h)` so
-///   `uploaded_h' = occupied_h` without re-minting the texture (`AtlasRowsSynchronized`
-///   holds at present). A dirty resident upload first waits for all outstanding
-///   frame readers; fresh textures and unchanged resident textures keep them.
-/// * At `Buggy = 1`, removing `map.len()` from the texture key without uploading
-///   the dirty row band skips the upload when `uploaded_h > 0`, leaving
-///   `uploaded_h < occupied_h` at present. The same branch omits the reader wait
-///   and records an upload conflict when a dirty resident texture has readers.
-#[must_use]
-#[cfg(feature = "anchors")]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn metal_atlas_residency_model() -> Model {
-    crate::ty_model! {
-        MetalAtlasResidency {
-            const MaxEpoch = 2;
-            const TexH = 3;
-            const MaxReaders = 3;
-            const Buggy = 0;
-
-            var epoch = 1;
-            var tex_h = 3;
-            var occupied_h = 1;
-            var uploaded_h = 1;
-            var presented = 0;
-            var readers = 0;
-            var upload_conflict = 0;
-
-            action AppendShelf when (occupied_h <= tex_h - 1) {
-                occupied_h = occupied_h + 1;
-                presented = 0;
-            }
-
-            action FullRepack when (epoch <= MaxEpoch - 1) {
-                epoch = epoch + 1;
-                occupied_h = 1;
-                uploaded_h = 0;
-                presented = 0;
-            }
-
-            action SubmitFrame when (presented == 1 && readers <= MaxReaders - 1) {
-                readers = readers + 1;
-            }
-
-            action GpuComplete when (readers > 0) {
-                readers = readers - 1;
-            }
-
-            action SyncAndPresent when (presented == 0) {
-                readers = if uploaded_h > 0 && occupied_h > uploaded_h {
-                    if Buggy == 1 { readers } else { 0 }
-                } else {
-                    readers
-                };
-                upload_conflict = if Buggy == 1
-                    && uploaded_h > 0 && occupied_h > uploaded_h && readers > 0
-                {
-                    1
-                } else {
-                    upload_conflict
-                };
-                uploaded_h = if uploaded_h == 0 {
-                    occupied_h
-                } else {
-                    if Buggy == 1 { uploaded_h } else { occupied_h }
-                };
-                presented = 1;
-            }
-
-            invariant AtlasRowsSynchronized:
-                presented == 0 || (uploaded_h == occupied_h && uploaded_h <= tex_h);
-
-            invariant NoAtlasUploadConflict:
-                upload_conflict == 0;
-        }
-    }
-}
-
 /// Three-slot GPU frame ring (`slot0_in_flight..slot2_in_flight`, `cursor` in `0..2`).
 ///
 /// * At `Buggy = 0`, staging the next frame waits only if the target ring slot
@@ -2262,19 +2181,6 @@ mod tests {
             ),
             "quantified iff invariant: {tla}"
         );
-    }
-
-    #[test]
-    fn metal_atlas_residency_model_proves_and_catches_mutant() {
-        let m = metal_atlas_residency_model();
-        let states = crate::interp::prove_and_catch(&m);
-        assert!(states > 1, "must explore multiple states: {states}");
-        assert_eq!(
-            crate::interp::fired_actions(&m).len(),
-            m.actions.len(),
-            "all actions must fire at Buggy=0"
-        );
-        crate::verify::prove_and_catch_scalar(&m, "MetalAtlasResidency");
     }
 
     #[test]

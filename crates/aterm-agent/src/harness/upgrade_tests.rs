@@ -2495,7 +2495,11 @@ fn a_local_commands_output_in_a_system_row_starts_no_task() {
 /// person's command is still a command.
 #[test]
 fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
-    let cfg = crate::supervise::SupervisorConfig::default();
+    // The owner's own continuation words (the default's carry the mark).
+    let cfg = crate::supervise::SupervisorConfig {
+        continue_text: "keep going".to_string(),
+        ..crate::supervise::SupervisorConfig::default()
+    };
     let ours: Vec<Typed> = [
         (cfg.continue_text.as_str(), turn_end::RULE_CONTINUE),
         (cfg.answer_text.as_str(), turn_end::RULE_ANSWER),
@@ -2535,6 +2539,43 @@ fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
         answer_row("claude-haiku-4-5")
     );
     assert!(transcript_tasked(&command, &ours), "a person's command");
+}
+
+/// THE HARNESS'S OWN MARKED ACTS ARE NO TASK, LEDGER OR NOT (FOREVER CRUISE
+/// / FOREVER LAND): Cruise's continuation (`CONTINUE_TEXT`, the default
+/// `continue_text`), its prompt at a done claim, and Land's instruction and
+/// nudge open with the harness's mark, so a conversation whose only turns
+/// are these reads taskless with no ledger at all. NEGATIVE CONTROL: the
+/// owner's own unmarked `keep going`, with no ledger, is someone's prompt.
+#[test]
+fn the_harnesss_marked_acts_are_no_task_ledger_or_not() {
+    let json = |text: &str| {
+        let j = aterm_json::to_string(&Value::from(text)).expect("json");
+        j[1..j.len() - 1].to_string()
+    };
+    for act in [
+        crate::supervise::config::CONTINUE_TEXT.to_string(),
+        turn_end::DONE_CHECK.to_string(),
+        turn_end::land_text(None),
+        turn_end::land_nudge_text(Some("never push to main")),
+    ] {
+        let chain = [
+            prompt_row("[aterm harness] Upgraded: this session was restarted on 2.1.283."),
+            answer_row("claude-haiku-4-5"),
+            prompt_row(&json(&act)),
+            answer_row("claude-haiku-4-5"),
+        ]
+        .join("\n");
+        assert!(!transcript_tasked(&chain, &[]), "{act}");
+    }
+    let chain = [
+        prompt_row("[aterm harness] Upgraded: this session was restarted on 2.1.283."),
+        answer_row("claude-haiku-4-5"),
+        prompt_row("keep going"),
+        answer_row("claude-haiku-4-5"),
+    ]
+    .join("\n");
+    assert!(transcript_tasked(&chain, &[]), "CONTROL: unmarked words");
 }
 
 // ---------------------------------------------------------------- a finished task, by its record
@@ -2622,19 +2663,29 @@ fn bare_user_row(extra: &str, content: &str) -> String {
     )
 }
 
-/// A RESTART'S CARRY-ON THAT ASKS THE DONE CHECK IS THE CHECK TO THE RECORD
-/// (the review's RR4-RL-5): a relaunch into a done report types its facts and
-/// the check (`checking`, `continued:check`), and the worker's own word that
-/// it is done, answering it, finishes the task as an answer to the loop's
-/// own check does — the plain check, and the one that says to approve
-/// nothing irreversible. NEGATIVE CONTROLS: the same answers to the plain
-/// carry-on (`keep going`) finish nothing; an idle report answering the
-/// restart's check finishes nothing (its work going on); a person's prompt
-/// quoting the check's words is theirs.
+/// A RESTART'S CRUISE PROMPT LANDS NOTHING IN THE RECORD (FOREVER CRUISE): a
+/// relaunch into a done report types its facts and the Cruise prompt
+/// (`checking`, `continued:check`), and the worker's done answer to it is a
+/// claim again, never a finish — the record's last words claim done
+/// ([`FinishedScan::said_done`]), so the next relaunch asks the prompt
+/// again: the plain prompt, the one that says to approve nothing
+/// irreversible, and an older build's check in a restart's carry-on, the
+/// clean defense included. Typed into a landed task, each opens it, as a
+/// Land changed to Cruise reopens it. NEGATIVE CONTROLS: Land's instruction
+/// answered by the clean defense lands the task; the plain carry-on, typed
+/// into a landed task, opens nothing; a person's prompt quoting Land's words
+/// is theirs, and the defense answering it lands nothing.
 #[test]
-fn a_restarts_check_is_the_done_check_to_the_record() {
+fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
     use super::super::relaunch::{CAUSE_HOST, resumed_prompt};
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
+    let scan = |rows: &[String]| {
+        let mut s = FinishedScan::default();
+        for row in rows {
+            s.line(row);
+        }
+        s
+    };
     let carry_on = resumed_prompt("2.1.282", CAUSE_HOST);
     let report = [
         typed_row("Fix the lexer and land it."),
@@ -2647,62 +2698,65 @@ fn a_restarts_check_is_the_done_check_to_the_record() {
             .chain([typed_row(asked), model_row(answer)])
             .collect::<Vec<_>>()
     };
-    for irreversible in [false, true] {
-        let check = checking(&carry_on, irreversible);
+    let legacy_check = carry_on.replace(CARRY_ON, TOKEN_CHECK_FIXTURE);
+    assert_ne!(legacy_check, carry_on, "the fixture replaced the carry-on");
+    let checks = [
+        checking(&carry_on, false),
+        checking(&carry_on, true),
+        legacy_check,
+    ];
+    for check in &checks {
         assert!(check.starts_with(HARNESS_MARK), "{check}");
-        for answer in ["All done.", "DONE", "All tasks are complete and verified."] {
-            assert!(
-                finished(&answered(&check, answer)),
-                "{irreversible}: {answer}"
-            );
+        for answer in [
+            "All done.",
+            "DONE",
+            "All tasks are complete and verified.",
+            DEFENSE,
+        ] {
+            let s = scan(&answered(check, answer));
+            assert!(!s.finished(), "a claim, no landing: {answer}: {check}");
+            assert!(s.said_done(), "the claim stands: {answer}: {check}");
             assert!(
                 !finished(&answered(&carry_on, answer)),
                 "CONTROL, the carry-on: {answer}"
             );
         }
-        assert!(
-            !finished(&answered(
-                &check,
-                "No lander is running, so I'm not re-arming that watch."
-            )),
-            "CONTROL: an idle report is the work going on"
-        );
+        let mut reopened = landing_rows();
+        reopened.push(typed_row(check));
+        assert!(!finished(&reopened), "it opens a landed task: {check}");
     }
-    let legacy_check = carry_on.replace(CARRY_ON, TOKEN_CHECK_FIXTURE);
+    // NEGATIVE CONTROLS.
+    let land = turn_end::land_text(None);
+    assert!(finished(&answered(&land, DEFENSE)), "Land's instruction");
+    let mut carried = landing_rows();
+    carried.push(typed_row(&carry_on));
+    assert!(finished(&carried), "the plain carry-on opens nothing");
+    let quoted = format!("Please read this: {land}");
     assert!(
-        finished(&answered(
-            &legacy_check,
-            "The task is complete. All checks passed."
-        )),
-        "a restart's earlier completion check remains recognizable"
-    );
-    let quoted = format!("Please read this: {}", turn_end::DONE_CHECK);
-    assert!(
-        !finished(&answered(&quoted, "All done.")),
+        !finished(&answered(&quoted, DEFENSE)),
         "CONTROL: a person's prompt"
     );
 }
 
-/// A WALL'S RETRY DELIVERS AGAIN THE CHECK THE WALL CUT, TO THE RECORD TOO
+/// A WALL'S RETRY DELIVERS AGAIN THE LAND ACT THE WALL CUT, TO THE RECORD TOO
 /// (the merge review's M5-R1): the turn-end policy reads the answer to the
-/// retry of a wall that cut the done check's turn, or a land act's, as that
-/// act's (`TurnEndState::cut_check`, `cut_land`), and its done reply ends
-/// the task. So the record reads it: the check (or LAND) typed, Claude
-/// Code's 529 row, the policy's retry by its ledger, then the worker's own
-/// done word finishes the task — the check answered before the wall or not,
-/// across a second wall — and the closed answer is the check's. FAILS
-/// WITHOUT THE FIX: the retry read as the harness's own line took the check
-/// back, the done reply a first done report (`finished` false, `said_done`
-/// true), and a new loop or a relaunch typed the check (or LAND) into a task
-/// the previous loop had ended. NEGATIVE CONTROLS: a person's prompt after
-/// the wall opens the task; the supervisor's `/compact`, a restart's marked
-/// carry-on, the retry with no ledger (someone's words) and a retry after
-/// the worker went on past the wall keep no check; a wall inside a plain
-/// continuation's turn keeps none either (its done reply is a first one); an
-/// idle report answering the retried LAND finishes nothing and stays a done
-/// report.
+/// retry of a wall that cut a land act's turn as that act's
+/// (`TurnEndState::cut_land`), and its clean defense lands the task. So the
+/// record reads it: Land's instruction (or a nudge) typed, Claude Code's 529
+/// row, the policy's retry by its ledger, then the clean defense lands the
+/// task — the act answered before the wall or not, across a second wall,
+/// closed or not. FAILS WITHOUT THE FIX: the retry read as the harness's own
+/// line took the act back, the defense a first done report (`finished`
+/// false, `said_done` true), and a new loop or a relaunch typed Land's
+/// instruction into a task the previous loop had landed. NEGATIVE CONTROLS:
+/// a person's prompt after the wall opens the task; the supervisor's
+/// `/compact`, a restart's marked carry-on, the retry with no ledger
+/// (someone's words) and a retry after the worker went on past the wall keep
+/// no act; a wall inside a plain continuation's turn keeps none either; the
+/// Cruise prompt cut and retried lands nothing (its answer is a claim); an
+/// idle report answering the retried LAND lands nothing.
 #[test]
-fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
+fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
     use super::super::relaunch::{CAUSE_HOST, resumed_prompt};
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
     let retry = turn_end::wall_retry_text(
@@ -2742,31 +2796,27 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
     let check = || typed_row(turn_end::DONE_CHECK);
     let land = || typed_row(&turn_end::land_text(None));
     let nudge = || typed_row(&turn_end::land_nudge_text(Some("never push to main")));
-    let done = || model_row("All done. Nothing left to do.");
+    let done = || model_row(DEFENSE);
     let going = || model_row("Running the last suite before I say done.");
-    let finished: [(&str, Vec<String>); 6] = [
+    let finished: [(&str, Vec<String>); 5] = [
         (
-            "the check, cut, retried",
-            vec![check(), wall.clone(), retried.clone(), done()],
+            "LAND, cut, retried",
+            vec![land(), wall.clone(), retried.clone(), done()],
         ),
         (
-            "the check answered, then cut, retried",
-            vec![check(), going(), wall.clone(), retried.clone(), done()],
+            "LAND answered, then cut, retried",
+            vec![land(), going(), wall.clone(), retried.clone(), done()],
         ),
         (
-            "the check, cut twice",
+            "LAND, cut twice",
             vec![
-                check(),
+                land(),
                 wall.clone(),
                 retried.clone(),
                 wall.clone(),
                 retried.clone(),
                 done(),
             ],
-        ),
-        (
-            "LAND, cut, retried",
-            vec![land(), wall.clone(), retried.clone(), done()],
         ),
         (
             "a land nudge, cut, retried",
@@ -2780,9 +2830,9 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
             ],
         ),
         (
-            "the check, cut, retried, closed",
+            "LAND, cut, retried, closed",
             vec![
-                check(),
+                land(),
                 wall.clone(),
                 retried.clone(),
                 done(),
@@ -2793,22 +2843,16 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
     for (what, rows) in &finished {
         assert!(scan(rows, &ours).finished(), "{what}");
     }
-    let s = scan(&finished[5].1, &ours);
-    assert_eq!(
-        s.check_answer(),
-        Some(true),
-        "the retry's answer is the check's"
-    );
     // NEGATIVE CONTROLS.
     let carry_on = typed_row(&resumed_prompt("2.1.300", CAUSE_HOST));
     let compact = at(typed_row(
         "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
     ));
-    let open: [(&str, Vec<String>, &[Typed]); 6] = [
+    let open: [(&str, Vec<String>, &[Typed]); 7] = [
         (
             "a person's prompt after the wall",
             vec![
-                check(),
+                land(),
                 wall.clone(),
                 typed_row("Also fix the docs."),
                 done(),
@@ -2817,22 +2861,22 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
         ),
         (
             "the supervisor's /compact after the wall",
-            vec![check(), wall.clone(), compact, done()],
+            vec![land(), wall.clone(), compact, done()],
             &ours,
         ),
         (
             "a restart's carry-on after the wall",
-            vec![check(), wall.clone(), carry_on, done()],
+            vec![land(), wall.clone(), carry_on, done()],
             &ours,
         ),
         (
             "the retry with no ledger: someone's words",
-            vec![check(), wall.clone(), retried.clone(), done()],
+            vec![land(), wall.clone(), retried.clone(), done()],
             &[],
         ),
         (
             "the worker went on past the wall",
-            vec![check(), wall.clone(), going(), retried.clone(), done()],
+            vec![land(), wall.clone(), going(), retried.clone(), done()],
             &ours,
         ),
         (
@@ -2845,6 +2889,11 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
             ],
             &ours,
         ),
+        (
+            "the Cruise prompt, cut, retried",
+            vec![check(), wall.clone(), retried.clone(), done()],
+            &ours,
+        ),
     ];
     for (what, rows, ours) in &open {
         let s = scan(rows, ours);
@@ -2854,25 +2903,25 @@ fn a_walls_retry_delivers_the_check_it_cut_again_to_the_record() {
     let idle = model_row("No lander is running, so I'm not re-arming that watch.");
     let s = scan(&[land(), wall.clone(), retried, idle], &ours);
     assert!(
-        !s.finished() && s.said_done(),
+        !s.finished(),
         "CONTROL: an idle report answering the retried LAND"
     );
 }
 
-/// ONLY A WALL'S RETRY BY ITS LEDGER RULE DELIVERS AGAIN THE CHECK A WALL CUT
-/// (ATERM-KI-1016-1, the done report's tenth item): the usage resume types
-/// `keep going` (`usage-resume@v1`), and so does the continue policy
+/// ONLY A WALL'S RETRY BY ITS LEDGER RULE DELIVERS AGAIN THE LAND ACT A WALL
+/// CUT (ATERM-KI-1016-1, the done report's tenth item): the usage resume
+/// types `keep going` (`usage-resume@v1`), and so does the continue policy
 /// (`continue@v1`). The record read the next plain line the loop typed after
-/// a wall in the check's turn as the retry whatever rule typed it, so a done
-/// reply in words to a plain `keep going` there finished the task, where the
-/// turn-end policy reads that reply as a first done report and asks the
-/// check once more (`TurnEndState::acted`: only `is_wall_retry` rules carry
-/// `cut_check`). Now the ledger row's rule decides: the same words under the
-/// usage resume's rule deliver the check again and finish the task; under
-/// `continue@v1` they do not, and the reply stays a done report. NEGATIVE
-/// CONTROL: the retry's own text under its rule still finishes it.
+/// a wall in an act's turn as the retry whatever rule typed it, so a reply
+/// to a plain `keep going` there was the act's answer, where the turn-end
+/// policy reads it as a first one (`TurnEndState::acted`: only
+/// `is_wall_retry` rules carry `cut_land`). Now the ledger row's rule
+/// decides: the clean defense under the usage resume's rule delivers Land's
+/// instruction again and lands the task; under `continue@v1` it does not,
+/// and the reply stays a done report. NEGATIVE CONTROL: the retry's own
+/// rule still lands it.
 #[test]
-fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_check_again() {
+fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
     let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit · resets 3pm"}]},"isApiErrorMessage":true,"error":"rate_limit"}"#.to_string();
     let scan = |rule: &str| {
@@ -2886,10 +2935,10 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_check_again() {
         for row in [
             typed_row("Fix the lexer and land it."),
             model_row("All done: the parser and the lexer are in."),
-            typed_row(turn_end::DONE_CHECK),
+            typed_row(&turn_end::land_text(None)),
             wall.clone(),
             at(typed_row("keep going")),
-            model_row("All done. Nothing left to do."),
+            model_row(DEFENSE),
         ] {
             scan.line(&row);
         }
@@ -2898,14 +2947,14 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_check_again() {
     let resumed = scan(turn_end::RULE_LIMIT_RESUME);
     assert!(
         resumed.finished(),
-        "the usage resume delivers the check again"
+        "the usage resume delivers the act again"
     );
     let continued = scan(turn_end::RULE_CONTINUE);
     assert!(
         !continued.finished(),
-        "a plain continuation after the wall delivers no check"
+        "a plain continuation after the wall delivers no act"
     );
-    assert!(continued.said_done(), "its done reply is a done report");
+    assert!(continued.said_done(), "its defense is a done report");
     assert!(
         !scan("").finished(),
         "a ledger row that names no rule is no retry"
@@ -2916,20 +2965,20 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_check_again() {
     );
 }
 
-/// THE VENDOR'S OWN CONTINUATION DELIVERS AGAIN THE CHECK A LIMIT CUT, TO
-/// THE RECORD TOO (ATERM-KI-1016-1, the Land item): the done check or
-/// Land's instruction typed, the usage limit's row in its turn, and Claude
-/// Code's own continuation at the reset (`origin.kind`
-/// `auto-continuation`): the reply under it is the cut act's answer, as the
-/// turn-end policy reads it (`TurnEndState::observe`), and the worker's own
-/// done word finishes the task. Read as a turn nobody asked, the check stood
-/// no more, the reply was a first done report, and a relaunch or the upgrade
-/// asked the check (under Land a nudge) once more. NEGATIVE CONTROLS: with no
-/// act before the limit, the continuation's done reply is a done report and
-/// nothing more; a wake of a background task after the limit is no
-/// continuation of it.
+/// THE VENDOR'S OWN CONTINUATION DELIVERS AGAIN THE LAND ACT A LIMIT CUT, TO
+/// THE RECORD TOO (ATERM-KI-1016-1, the Land item): Land's instruction
+/// typed, the usage limit's row in its turn, and Claude Code's own
+/// continuation at the reset (`origin.kind` `auto-continuation`): the reply
+/// under it is the cut act's answer, as the turn-end policy reads it
+/// (`TurnEndState::observe`), and the clean defense lands the task. Read as a
+/// turn nobody asked, the act stood no more, the defense was a first done
+/// report, and a relaunch or the upgrade typed Land's instruction once more.
+/// NEGATIVE CONTROLS: with no act before the limit, the continuation's
+/// defense is a done report and nothing more; the Cruise prompt cut so lands
+/// nothing; a wake of a background task after the limit is no continuation
+/// of it.
 #[test]
-fn the_vendors_own_continuation_delivers_the_cut_check_again_to_the_record() {
+fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() {
     let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit · resets 3pm"}]},"isApiErrorMessage":true,"error":"rate_limit"}"#.to_string();
     let auto = asked_by_row(
         "auto-continuation",
@@ -2937,7 +2986,7 @@ fn the_vendors_own_continuation_delivers_the_cut_check_again_to_the_record() {
         "Your claude.ai usage limit has reset. Continue the task you were working on when the \
          limit was reached; do not repeat work that is already complete.",
     );
-    let done = model_row("All done. Nothing left to do.");
+    let done = model_row(DEFENSE);
     let scan = |rows: &[String]| {
         let mut scan = FinishedScan::default();
         for row in [
@@ -2951,26 +3000,26 @@ fn the_vendors_own_continuation_delivers_the_cut_check_again_to_the_record() {
         }
         scan
     };
-    for (what, asked) in [
-        ("the check", typed_row(turn_end::DONE_CHECK)),
-        ("LAND", typed_row(&turn_end::land_text(None))),
-    ] {
-        let s = scan(&[asked, wall.clone(), auto.clone(), done.clone()]);
-        assert!(s.finished(), "{what}: the continuation delivers it again");
-    }
+    let land = typed_row(&turn_end::land_text(None));
+    let s = scan(&[land.clone(), wall.clone(), auto.clone(), done.clone()]);
+    assert!(s.finished(), "the continuation delivers LAND again");
     for (what, rows) in [
         (
             "nothing asked before the limit",
             vec![wall.clone(), auto.clone(), done.clone()],
         ),
         (
-            "a background task's wake after the limit",
+            "the Cruise prompt before the limit",
             vec![
                 typed_row(turn_end::DONE_CHECK),
                 wall.clone(),
-                notification_row(),
+                auto.clone(),
                 done.clone(),
             ],
+        ),
+        (
+            "a background task's wake after the limit",
+            vec![land, wall.clone(), notification_row(), done.clone()],
         ),
     ] {
         let s = scan(&rows);
@@ -2979,26 +3028,30 @@ fn the_vendors_own_continuation_delivers_the_cut_check_again_to_the_record() {
     }
 }
 
-/// LAND'S ANSWER TO A QUESTION IS LAND'S CHECK TO THE RECORD ONCE THE LAND
+/// LAND'S ANSWER TO A QUESTION IS A LAND ACT TO THE RECORD ONCE THE LAND
 /// INSTRUCTION WAS TYPED (ATERM-KI-1016-1, the Land item): the turn-end
-/// policy lands a done reply to its `land-answer@v1` once the instruction
-/// was typed (`TurnEndState::acted`: `landing`), and the record read that
-/// answer as the harness's own line, so the done reply was a first done
-/// report and a relaunch or the upgrade asked the check once more. By the
-/// ledger row's rule, and the instruction read before it, the answer is
-/// Land's: the worker's own done word finishes the task, and the closed
-/// answer speaks as at the check. NEGATIVE CONTROLS: no instruction before
-/// it (the policy lands nothing there either), a person's prompt between
-/// (their task), and the answer's words under another rule, are the
-/// harness's own line, the reply a done report; an idle report answering it
-/// finishes nothing.
+/// policy lands a clean defense answering its `land-answer@v1` once the
+/// instruction was typed (`TurnEndState::acted`: `landing`), and the record
+/// read that answer as the harness's own line, so the defense was a first
+/// done report and a relaunch or the upgrade typed Land's instruction once
+/// more. By the ledger row's rule, and the instruction read before it, the
+/// answer is Land's: the clean defense lands the task. NEGATIVE CONTROLS: no
+/// instruction before it (the policy lands nothing there either), a
+/// person's prompt between (their task), and the answer's words under
+/// another rule, are the harness's own line, the reply a done report; an
+/// idle report answering it lands nothing.
 #[test]
-fn lands_answer_after_the_instruction_is_lands_check_to_the_record() {
+fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
     let land = || typed_row(&turn_end::land_text(None));
     let question = || model_row("Should I squash the two commits or keep them apart?");
     let answer = || at(typed_row(turn_end::LAND_ANSWER));
-    let done = || model_row("Kept them apart and pushed. All done. Nothing left to do.");
+    let done = || {
+        model_row(
+            "Kept them apart and pushed.\nNothing left: both commits are merged into the remote \
+             main branch.",
+        )
+    };
     let scan = |rows: &[String], rule: &str| {
         let ours = [Typed {
             at_ms: 1_000,
@@ -3027,7 +3080,6 @@ fn lands_answer_after_the_instruction_is_lands_check_to_the_record() {
         landed.finished(),
         "the answer after the instruction lands it"
     );
-    assert_eq!(landed.check_answer(), Some(true), "its closed answer");
     for (what, rows, rule) in [
         (
             "no instruction before it",
@@ -3063,39 +3115,55 @@ fn lands_answer_after_the_instruction_is_lands_check_to_the_record() {
     assert!(!s.finished(), "CONTROL: an idle report answering it");
 }
 
-/// The worker's report, ending its task with the token.
+/// The worker's report ending with the retired token, which lands nothing
+/// now: only a land act's clean defense does.
 const FINISHED_REPORT: &str = "Landed the fix and verified it on main.\n\nATERM-TASK-DONE";
 
-/// A TASK THE WORKER FINISHED STAYS FINISHED UNTIL SOMEONE ASKS
-/// ([`FinishedScan`]): the token as its answer's last line finishes it, and no
-/// turn nobody asked opens it again — Claude Code's own wakes (a background
-/// task's notification, its usage-limit continuation, an older build's
+/// A CLEAN DEFENSE (FOREVER LAND): a `Nothing left:` line, no need and no
+/// open work beside it — what lands a task answering one of Land's acts.
+const DEFENSE: &str = "Landed the fix and verified it.\nNothing left: it is merged into the \
+                       remote main branch.";
+
+/// A landing's rows: the task, the worker's report, Land's instruction and
+/// the clean defense answering it.
+fn landing_rows() -> Vec<String> {
+    vec![
+        typed_row("Fix the lexer and land it."),
+        model_row("The lexer is fixed and its tests pass."),
+        typed_row(&turn_end::land_text(None)),
+        model_row(DEFENSE),
+    ]
+}
+
+/// A LANDED TASK STAYS LANDED UNTIL SOMEONE ASKS ([`FinishedScan`]): the
+/// clean defense answering Land's instruction lands it, and no turn nobody
+/// asked opens it again — Claude Code's own wakes (a background task's
+/// notification, its usage-limit continuation, an older build's
 /// notification by its words, a `/loop` wake), the harness's own turns,
 /// compaction summaries, a person's command that starts no turn — whatever
-/// their answers say. A done reply to the done check finishes it too (the
-/// current check, one carrying the standing rules, and the earlier one).
-/// NEGATIVE CONTROLS: a person's prompt opens it at once, before any answer;
-/// so does a peer session's message (recorded `isMeta`, `system`-sourced), a
-/// row of a kind the fold does not know, and a command that starts a turn; a
-/// later text of the same turn takes the finish back (a tool's result is no
-/// new turn); the token quoted mid-sentence, written by `<synthetic>`, an API
-/// error or a subagent finishes nothing; a check answered "not yet" finishes
-/// nothing.
+/// their answers say. The Cruise prompt typed into a landed task opens it
+/// (a Land changed to Cruise), by every spelling of it, and its done answer
+/// lands nothing. NEGATIVE CONTROLS: a person's prompt opens it at once,
+/// before any answer; so does a peer session's message (recorded `isMeta`,
+/// `system`-sourced), a row of a kind the fold does not know, and a command
+/// that starts a turn; a later text of the same turn takes the landing back
+/// (a tool's result is no new turn); the retired token alone answering Land
+/// lands nothing, nor does the defense written by `<synthetic>`, an API
+/// error or a subagent.
 #[test]
 fn finished_holds_until_someone_asks() {
     let ask = typed_row("Fix the lexer and land it.");
-    let token = model_row(FINISHED_REPORT);
     let reply = |text: &str| model_row(text);
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
-    let base = [ask.clone(), token.clone()];
+    let base = landing_rows();
     let with = |more: &[String]| {
         base.iter()
             .cloned()
             .chain(more.iter().cloned())
             .collect::<Vec<_>>()
     };
-    assert!(!finished(std::slice::from_ref(&ask)), "asked, not answered");
-    assert!(finished(&base), "the token");
+    assert!(!finished(&base[..3]), "Land asked, not answered");
+    assert!(finished(&base), "the landing");
     let auto = asked_by_row(
         "auto-continuation",
         true,
@@ -3157,27 +3225,29 @@ fn finished_holds_until_someone_asks() {
     }
     // Folded a line at a time, the answer at each row.
     let mut scan = FinishedScan::default();
-    assert!(!scan.line(&ask));
-    assert!(scan.line(&token));
+    for row in &base[..3] {
+        assert!(!scan.line(row));
+    }
+    assert!(scan.line(&base[3]));
     assert!(scan.line(&notification_row()));
     assert!(scan.line(&reply("Done with the cleanup.")));
     assert!(!scan.line(&typed_row("Now add the flag.")));
-    // The done check, answered DONE: finished, by every spelling of the check.
-    let report = reply("All done: the suite passes.");
+    // The Cruise prompt typed into a landed task opens it, by every
+    // spelling of it, and its done answer lands nothing.
     let rules = format!(
         "{} (standing rules: never force-push)",
         turn_end::DONE_CHECK
     );
-    for check in [turn_end::DONE_CHECK, rules.as_str(), DONE_CHECK_BEFORE] {
-        let rows = [ask.clone(), report.clone(), typed_row(check), reply("DONE")];
-        assert!(finished(&rows), "{check}");
-        let not_yet = [
-            ask.clone(),
-            report.clone(),
-            typed_row(check),
-            reply("Not yet: the docs still need a pass."),
-        ];
-        assert!(!finished(&not_yet), "{check}: not yet");
+    for check in [
+        turn_end::DONE_CHECK,
+        rules.as_str(),
+        turn_end::DONE_CHECK_BEFORE,
+    ] {
+        assert!(!finished(&with(&[typed_row(check)])), "{check}: opened");
+        for said in ["DONE", DEFENSE] {
+            let rows = with(&[typed_row(check), reply(said)]);
+            assert!(!finished(&rows), "{check}: {said}");
+        }
     }
     // NEGATIVE CONTROLS.
     let peer = asked_by_row(
@@ -3192,9 +3262,18 @@ fn finished_holds_until_someone_asks() {
         "",
         r#"[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]"#,
     );
-    let synthetic = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"ATERM-TASK-DONE"}]}}"#.to_string();
-    let api_error = r#"{"isSidechain":false,"type":"assistant","isApiErrorMessage":true,"message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"ATERM-TASK-DONE"}]}}"#.to_string();
-    let subagent = r#"{"isSidechain":true,"type":"assistant","message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"ATERM-TASK-DONE"}]}}"#.to_string();
+    let asked_land = || base[..3].to_vec();
+    let after_land = |row: String| [asked_land(), vec![row]].concat();
+    let defense_json = aterm_json::to_string(&Value::from(DEFENSE)).expect("json");
+    let synthetic = format!(
+        r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":{defense_json}}}]}}}}"#
+    );
+    let api_error = format!(
+        r#"{{"isSidechain":false,"type":"assistant","isApiErrorMessage":true,"message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{defense_json}}}]}}}}"#
+    );
+    let subagent = format!(
+        r#"{{"isSidechain":true,"type":"assistant","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{defense_json}}}]}}}}"#
+    );
     let opened: [(&str, Vec<String>); 11] = [
         (
             "a person's prompt, not answered yet",
@@ -3219,80 +3298,74 @@ fn finished_holds_until_someone_asks() {
             with(&[tool, reply("Checked again: one test fails.")]),
         ),
         (
-            "the token quoted mid-sentence",
-            vec![
-                ask.clone(),
-                reply("I will write ATERM-TASK-DONE when the suite passes."),
-            ],
+            "the retired token alone answering Land",
+            after_land(reply("ATERM-TASK-DONE")),
         ),
-        ("the token by <synthetic>", vec![ask.clone(), synthetic]),
-        ("the token in an API error", vec![ask.clone(), api_error]),
-        ("the token in a subagent's row", vec![ask.clone(), subagent]),
+        ("the defense by <synthetic>", after_land(synthetic)),
+        ("the defense in an API error", after_land(api_error)),
+        ("the defense in a subagent's row", after_land(subagent)),
     ];
     for (what, rows) in &opened {
         assert!(!finished(rows), "{what}");
     }
     // A compaction's summary is no turn: a later text of the turn it fell in
-    // still takes the finish back.
+    // still takes the landing back.
     assert!(!finished(&with(&[summary, reply("And the changelog.")])));
+    assert!(!finished(std::slice::from_ref(&ask)), "asked, not answered");
 }
 
-/// THE CHECK TYPED AGAIN AFTER A `/compact` IS THE CHECK TO THE RECORD
-/// (ATERM-KI-1016-1, done-3): where a full context cut the done check's turn,
-/// the turn-end policy types the check again as the compaction's
-/// continuation (`TurnEndState::compact_owes`), and the record reads that row
-/// by its words as the check, so its done answer finishes the task at the
-/// check, as the policy ends it — whatever the compaction's summary kept.
-/// NEGATIVE CONTROL: `keep going` after the compaction delivers no check, and
-/// the done reply to it is a first done report (the record never reads a
-/// check across the `/compact`).
+/// LAND'S INSTRUCTION TYPED AGAIN AFTER A `/compact` IS A LAND ACT TO THE
+/// RECORD (ATERM-KI-1016-1, done-3): where a full context cut a land act's
+/// turn, the record reads the act typed again as the compaction's
+/// continuation by its words, so its clean defense lands the task —
+/// whatever the compaction's summary kept. NEGATIVE CONTROL: `keep going`
+/// after the compaction delivers no act, and the defense answering it is a
+/// done report (the record never reads an act across the `/compact`).
 #[test]
-fn the_check_typed_again_after_a_compaction_is_the_check_to_the_record() {
+fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record() {
     let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}]},"isApiErrorMessage":true,"error":"invalid_request"}"#.to_string();
     let compact = typed_row(
         "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
     );
     let summary = r#"{"type":"user","uuid":"s-1","isSidechain":false,"isCompactSummary":true,"message":{"role":"user","content":"This session is being continued."}}"#.to_string();
-    let done = model_row("All done: committed and pushed.");
+    let land = turn_end::land_text(None);
     let scan = |continuation: &str| {
         let mut s = FinishedScan::default();
         for row in [
             typed_row("Fix the lexer and land it."),
             model_row("All tasks are complete and verified; nothing is left to do."),
-            typed_row(turn_end::DONE_CHECK),
+            typed_row(&land),
             wall.clone(),
             compact.clone(),
             summary.clone(),
             typed_row(continuation),
-            done.clone(),
+            model_row(DEFENSE),
         ] {
             s.line(&row);
         }
         s
     };
-    let again = scan(turn_end::DONE_CHECK);
-    assert!(again.finished() && again.finished_at_check(), "{again:?}");
+    let again = scan(&land);
+    assert!(again.finished(), "{again:?}");
     let going = scan("keep going");
     assert!(!going.finished() && going.said_done(), "{going:?}");
 }
 
-/// THE DONE CHECK IS READ BY ITS WORDS, WHOEVER TYPED THEM (ATERM-KI-1016-1,
-/// done-2, the product's rule): a user row that opens with the check's words
-/// is the check to the record whether or not the session's ledger names it,
-/// so its done answer in the worker's words finishes the task at the check.
-/// The alternative, the ledger alone, misses a real check wherever the
-/// ledger has no row of it — a hand `/resume` tab whose ledger
-/// `conversation_typed` does not join, a row past `TYPED_WITHIN_MS` or cut
-/// at `KEEP_ROWS` (here: no ledger at all): its done answer would be a first
-/// done report under someone's prompt, the task read reopened, and a
-/// relaunch would type its carry-on into a finished task. Its one other
-/// case, a person who types the check word for word, gets what the check's
-/// words ask: a done answer ends the task, and nothing is typed after it (a
-/// person can always type). NEGATIVE CONTROL: a person's prompt that quotes
-/// the check after words of their own is theirs, and a done answer to it is
-/// a first done report, never a finish.
+/// LAND'S ACTS AND THE CRUISE PROMPT ARE READ BY THEIR WORDS, WHOEVER TYPED
+/// THEM (ATERM-KI-1016-1, done-2, the product's rule): a user row that opens
+/// with Land's instruction is a land act to the record whether or not the
+/// session's ledger names it, so the clean defense answering it lands the
+/// task; and a row that opens with the Cruise prompt is the prompt, so typed
+/// into a landed task it opens it. The alternative, the ledger alone, misses
+/// a real act wherever the ledger has no row of it — a hand `/resume` tab
+/// whose ledger `conversation_typed` does not join, a row past
+/// `TYPED_WITHIN_MS` or cut at `KEEP_ROWS` (here: no ledger at all). Its one
+/// other case, a person who types the words verbatim, gets what they ask.
+/// NEGATIVE CONTROL: a person's prompt that quotes them after words of their
+/// own is theirs, and the defense answering it is a first done report, never
+/// a landing.
 #[test]
-fn the_done_check_is_read_by_its_words_whoever_typed_them() {
+fn lands_acts_are_read_by_their_words_whoever_typed_them() {
     let ask = typed_row("Fix the lexer and land it.");
     let report = model_row("All tasks are complete and verified; nothing is left to do.");
     let scan = |rows: &[String]| {
@@ -3302,360 +3375,74 @@ fn the_done_check_is_read_by_its_words_whoever_typed_them() {
         }
         s
     };
-    for check in [
-        turn_end::DONE_CHECK.to_string(),
-        turn_end::done_check_text(Some("never push to main"), true),
+    for land in [
+        turn_end::land_text(None),
+        turn_end::land_text(Some("never push to main")),
+        turn_end::land_nudge_text(None),
     ] {
         let s = scan(&[
             ask.clone(),
             report.clone(),
-            typed_row(&check),
-            report.clone(),
+            typed_row(&land),
+            model_row(DEFENSE),
         ]);
-        assert!(s.finished() && s.finished_at_check(), "no ledger: {check}");
-        assert!(!s.said_done(), "the check's answer: {check}");
+        assert!(s.finished(), "no ledger: {land}");
     }
-    // NEGATIVE CONTROL: the check quoted after a person's own words.
-    let quoted = format!("Is this wording right? {}", turn_end::DONE_CHECK);
-    let s = scan(&[ask, report.clone(), typed_row(&quoted), report]);
+    for check in [
+        turn_end::DONE_CHECK.to_string(),
+        turn_end::done_check_text(Some("never push to main"), true),
+    ] {
+        let mut rows = landing_rows();
+        rows.push(typed_row(&check));
+        assert!(!scan(&rows).finished(), "no ledger, opened: {check}");
+    }
+    // NEGATIVE CONTROL: Land's words quoted after a person's own.
+    let quoted = format!("Is this wording right? {}", turn_end::land_text(None));
+    let s = scan(&[ask, report, typed_row(&quoted), model_row(DEFENSE)]);
     assert!(!s.finished() && s.said_done(), "{s:?}");
 }
 
-/// AN IDLE REPORT ALONE ANSWERING THE CHECK IN A SHORT TURN FINISHES THE TASK
-/// BY THE RECORD TOO (ATERM-KI-1016-1, done-1), as the turn-end policy ends
-/// it (`turn_end::check_answer_ends`): the check's turn's work by Claude
-/// Code's own measure — the `durationMs` of each `turn_duration` row that
-/// closes it, a wall's turn and its retry's summed — within
-/// `turn_end::MIN_WORK`, its answer only that nothing of the worker's runs: a
-/// finish at the check ([`FinishedScan::finished_at_check`]), its closed
-/// answer `Some(true)`. FAILS WITHOUT THE FIX: the record read it as the
-/// check's work going on, and a relaunch or a new loop carried on into a task
-/// the policy ended. The work is the vendor's, never the clock's (the
-/// review's DR-3): twenty seconds to a 529 and twenty after the retry typed
-/// ten minutes later are short, as the policy sums them; measured from the
-/// check's row to the end, the retry's wait read as work, and the record's
-/// `Some(false)` continued a task the screen's sum ends. A row that names no
-/// `durationMs` is measured from the row that asked the turn to it.
-/// NEGATIVE CONTROLS: the same answer closing a turn of real work, a check's
-/// turn a wall's retry split after real work, a turn whose rows name neither
-/// a duration nor a time, a land act's answer (Land's nudges are bounded),
-/// and an idle report outside the check finish nothing.
-#[test]
-fn an_idle_report_alone_answering_the_check_in_a_short_turn_finishes_it_by_the_record() {
-    let stamped = |row: String, secs: u64| {
-        let at = format!(
-            "1970-01-01T{:02}:{:02}:{:02}.000Z",
-            secs / 3600,
-            secs / 60 % 60,
-            secs % 60
-        );
-        row.replacen('{', &format!(r#"{{"timestamp":"{at}","#), 1)
-    };
-    let closed_after = |secs: u64, ms: u64| {
-        stamped(
-            format!(
-                r#"{{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":{ms},"messageCount":4,"isMeta":false}}"#
-            ),
-            secs,
-        )
-    };
-    let closed = |secs: u64| closed_after(secs, 20_000);
-    let unmeasured = |secs: u64| {
-        stamped(
-            r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","messageCount":4,"isMeta":false}"#.to_string(),
-            secs,
-        )
-    };
-    let idle = "Both branches have landed and no lander is running, so I'm leaving the watch off.";
-    let ask = typed_row("Fix the lexer and land it.");
-    let report = model_row(idle);
-    let check = stamped(typed_row(turn_end::DONE_CHECK), 100);
-    let scan = |rows: &[String], ours: &[Typed]| {
-        let mut s = FinishedScan::default();
-        s.supervisor_typed(ours);
-        for row in rows {
-            s.line(row);
-        }
-        s
-    };
-    let short = scan(
-        &[
-            ask.clone(),
-            report.clone(),
-            check.clone(),
-            report.clone(),
-            closed(120),
-        ],
-        &[],
+/// The open-items challenge as the last build that typed it worded it,
+/// naming `still open` (retired: no act types it now — the open work a done
+/// claim names is the done check's suffix), which conversation records still
+/// hold and [`FinishedScan`] still reads by [`turn_end::OPEN_ITEMS_HEAD`].
+fn old_challenge(irreversible: bool) -> String {
+    let text = format!(
+        "{} (still open): a done report ends nothing while any is left, a blocked item \
+         included. Do each item now and verify it, then commit and push it (merged to main \
+         where this repository lands work). Say the task is complete only when nothing is \
+         uncommitted, untracked, stashed or unpushed and your report names no open item, \
+         follow-up or next step.",
+        turn_end::OPEN_ITEMS_HEAD
     );
-    assert!(short.finished() && short.finished_at_check(), "{short:?}");
-    assert_eq!(short.check_answer(), Some(true));
-    // …and not before the turn is closed: the record lags the screen.
-    let open = scan(
-        &[ask.clone(), report.clone(), check.clone(), report.clone()],
-        &[],
-    );
-    assert!(!open.finished());
-    assert_eq!(open.check_answer(), None);
-    // The vendor's measure, not the clock's: a turn the worker spent twenty
-    // seconds of work in, closed ten minutes after the check (a box it
-    // waited at), is short…
-    let paused = scan(
-        &[
-            ask.clone(),
-            report.clone(),
-            check.clone(),
-            report.clone(),
-            closed(700),
-        ],
-        &[],
-    );
-    assert!(paused.finished(), "{paused:?}");
-    // …and a row that names no duration is measured by the clock.
-    for (end, ends) in [(120, true), (100 + 121, false)] {
-        let s = scan(
-            &[
-                ask.clone(),
-                report.clone(),
-                check.clone(),
-                report.clone(),
-                unmeasured(end),
-            ],
-            &[],
-        );
-        assert_eq!(s.finished(), ends, "no durationMs, closed at {end}: {s:?}");
+    if irreversible {
+        format!("{text} {}", turn_end::DONE_CHECK_REVERSIBLE)
+    } else {
+        text
     }
-    // NEGATIVE CONTROLS.
-    let long = scan(
-        &[
-            ask.clone(),
-            report.clone(),
-            check.clone(),
-            report.clone(),
-            closed_after(100 + 121, 121_000),
-        ],
-        &[],
-    );
-    assert!(!long.finished(), "a turn of real work");
-    assert_eq!(long.check_answer(), Some(false));
-    let unstamped = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","messageCount":4,"isMeta":false}"#.to_string();
-    let untimed = scan(
-        &[
-            ask.clone(),
-            report.clone(),
-            typed_row(turn_end::DONE_CHECK),
-            report.clone(),
-            unstamped,
-        ],
-        &[],
-    );
-    assert!(
-        !untimed.finished(),
-        "no duration and no times: no short turn"
-    );
-    let retry = turn_end::wall_retry_text(
-        turn_end::RULE_API_RETRY,
-        aterm_phase::WallKind::Overloaded,
-        aterm_phase::Program::Claude,
-    );
-    let ours = [Typed {
-        at_ms: 700_000,
-        text: retry.clone(),
-        rule: turn_end::RULE_API_RETRY.to_string(),
-    }];
-    let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 Overloaded"}]},"isApiErrorMessage":true,"error":"unknown"}"#.to_string();
-    let split = |before_wall: u64| {
-        scan(
-            &[
-                ask.clone(),
-                report.clone(),
-                check.clone(),
-                wall.clone(),
-                closed_after(120, before_wall),
-                stamped(typed_row(&retry), 700),
-                report.clone(),
-                closed(720),
-            ],
-            &ours,
-        )
-    };
-    // Twenty seconds to the wall and twenty after its retry: short in all,
-    // the retry's ten-minute wait no work (the review's DR-3).
-    let short_split = split(20_000);
-    assert!(
-        short_split.finished() && short_split.finished_at_check(),
-        "{short_split:?}"
-    );
-    // …and so are they where the rows name no duration: each measured from
-    // the row that asked it, the retry's from the retry's.
-    let unmeasured_split = scan(
-        &[
-            ask.clone(),
-            report.clone(),
-            check.clone(),
-            wall.clone(),
-            unmeasured(120),
-            stamped(typed_row(&retry), 700),
-            report.clone(),
-            unmeasured(720),
-        ],
-        &ours,
-    );
-    assert!(unmeasured_split.finished(), "{unmeasured_split:?}");
-    // NEGATIVE CONTROL: the idle line said before a wall cut the turn is no
-    // whole answer: the record finishes nothing at the wall's own close, only
-    // at the retry's answer.
-    let mut cut = FinishedScan::default();
-    cut.supervisor_typed(&ours);
-    for row in [
-        ask.clone(),
-        report.clone(),
-        check.clone(),
-        report.clone(),
-        wall.clone(),
-        closed_after(120, 20_000),
-    ] {
-        cut.line(&row);
-    }
-    assert!(!cut.finished(), "closed by a wall: {cut:?}");
-    for row in [stamped(typed_row(&retry), 700), report.clone(), closed(720)] {
-        cut.line(&row);
-    }
-    assert!(cut.finished() && cut.finished_at_check(), "{cut:?}");
-    // NEGATIVE CONTROL: five minutes of work to the wall, then the retry's
-    // twenty seconds: real work in all.
-    let long_split = split(300_000);
-    assert!(
-        !long_split.finished(),
-        "a check's turn a wall split: {long_split:?}"
-    );
-    assert_eq!(long_split.check_answer(), Some(false));
-    let land = scan(
-        &[
-            ask.clone(),
-            report.clone(),
-            stamped(typed_row(&turn_end::land_text(None)), 100),
-            report.clone(),
-            closed(120),
-        ],
-        &[],
-    );
-    assert!(
-        !land.finished() && land.said_done(),
-        "a land act's: {land:?}"
-    );
-    // NEGATIVE CONTROL: an idle line beside work it names to come or left is
-    // no idle report alone (the review's DR-1: each finished the task).
-    for reply in [
-        "OD-1 phase 1 has landed and no lander is running. OD-1 phase 2 is left; I'll start it now.",
-        "No lander is running. Remaining: OD-1 phase 2 (the parser rewrite) and the docs update.",
-        "No lander is running, so I'm not re-arming the watch. Starting OD-1 phase 2 now.",
-        "No lander is running. OD-1 phase 2 still needs doing.",
-        "Phase 1 landed and no lander is running. I'll do phase 2 next.",
-        "Phase 1 landed and no lander is running. Two tests still fail; fixing them now.",
-    ] {
-        let s = scan(
-            &[
-                ask.clone(),
-                report.clone(),
-                check.clone(),
-                model_row(reply),
-                closed(120),
-            ],
-            &[],
-        );
-        assert!(!s.finished(), "{reply}: {s:?}");
-        assert_eq!(s.check_answer(), Some(false), "{reply}");
-    }
-    let outside = scan(&[stamped(ask, 100), report, closed(120)], &[]);
-    assert!(!outside.finished() && outside.said_done(), "{outside:?}");
 }
 
-/// A FINISH BY THE DONE CHECK IS KEPT APART FROM THE TOKEN'S (F2 of the live
-/// lab of 2026-10-16, Claude Code 2.1.301): the record ends the task on a
-/// done reply in the worker's words to the check as it does on the token,
-/// and says which ([`FinishedScan::finished_at_check`]) — the turn-end loop
-/// journals the first under the check's rule, never as the worker having
-/// reported the token. NEGATIVE CONTROLS: the token answering the check, the
-/// token with no check, a check answered "not yet", and a later task's token
-/// after a finish at the check are no end at the check in words.
-#[test]
-fn a_finish_by_the_done_check_is_kept_apart_from_the_tokens() {
-    let ask = typed_row("Fix the lexer and land it.");
-    let report = model_row("All tasks are complete and verified; nothing is left to do.");
-    let check = typed_row(turn_end::DONE_CHECK);
-    let scan = |rows: &[String]| {
-        let mut s = FinishedScan::default();
-        for row in rows {
-            s.line(row);
-        }
-        s
-    };
-    let words = scan(&[ask.clone(), report.clone(), check.clone(), report.clone()]);
-    assert!(words.finished(), "a done reply in words finishes the task");
-    assert!(words.finished_at_check(), "…at the check");
-    // NEGATIVE CONTROLS.
-    let token = model_row(FINISHED_REPORT);
-    let s = scan(&[ask.clone(), report.clone(), check.clone(), token.clone()]);
-    assert!(
-        s.finished() && !s.finished_at_check(),
-        "the token answering the check"
-    );
-    let s = scan(&[ask.clone(), token.clone()]);
-    assert!(
-        s.finished() && !s.finished_at_check(),
-        "the token, no check"
-    );
-    let s = scan(&[
-        ask.clone(),
-        report.clone(),
-        check.clone(),
-        model_row("Not yet: the docs still need a pass."),
-    ]);
-    assert!(!s.finished() && !s.finished_at_check(), "not yet");
-    let s = scan(&[
-        ask,
-        report.clone(),
-        check,
-        report,
-        typed_row("Now add the flag."),
-        token,
-    ]);
-    assert!(
-        s.finished() && !s.finished_at_check(),
-        "a later task's token"
-    );
-}
-
-/// THE CHALLENGE IN THE RECORD ([`Asked::Challenge`]): a FINISHED whose own
-/// words name open work finishes nothing by the record (the owner's rule of
-/// 2026-10-19: the turn-end policy challenges such a report at every token,
-/// `turn_end::RULE_OPEN_ITEMS`), so a relaunch or the upgrade reads the job
-/// as going on; and the challenge, which the turn-end policy reads as the
-/// done check's kin, the record reads so too — by its opening words,
-/// whatever it names and whether or not the reversible clause rides it, and
-/// in the words main's first challenge used: its answer of work leaves the
-/// task open, a done reply in the worker's own word finishes it at the
-/// check, the token over a report with nothing left finishes it as the
-/// token's, the token over open work again finishes nothing, and an idle
-/// report is the work going on. Unanswered, the report it followed stays
-/// the last words' done report, so a relaunch asks the check after it. And
-/// a FINISHED with nothing left that a challenge follows has its finish
-/// taken back: read as the harness's own line (the ledger's), the challenge
-/// left the token's finish standing, so a loop that reads the record ended
-/// the job on any answer, journalled as the worker's token (the merge
-/// review's MG7-A1). NEGATIVE CONTROLS: the loop's own `keep going` after
-/// the token, by its ledger, takes nothing back; a person's prompt that
-/// quotes the challenge after words of their own is theirs, and a done
+/// THE RETIRED CHALLENGES ARE CHECKS TO THE RECORD ([`Asked::Challenge`]):
+/// older builds typed an open-items challenge (and an uncommitted-work one)
+/// after a done report naming open work, which conversation records still
+/// hold. The record reads each, by its opening words in every wording it was
+/// typed in and whether or not the reversible clause rides it, as the
+/// Cruise prompt is read: typed into a landed task it opens it; unanswered,
+/// the report it followed stays the last words' done report, so a relaunch
+/// asks the Cruise prompt after it; and no answer to it lands the task —
+/// work going on, a done reply in words (a claim), the retired token, the
+/// clean defense itself. NEGATIVE CONTROLS: the loop's own `keep going`
+/// after a landing, by its ledger, takes nothing back; a person's prompt
+/// that quotes the challenge after words of their own is theirs, and a done
 /// reply in words to it is a first done report.
 #[test]
-fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
+fn the_retired_challenges_are_checks_to_the_record() {
     let open = model_row(
         "Built and tested the parser; committed on main.\nStill open: the lexer's e2e suite \
          (not run).\nATERM-TASK-DONE",
     );
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
-    let challenge = turn_end::open_items_text(&["still open"], None, false);
+    let challenge = old_challenge(false);
     let ours: Vec<Typed> = [
         (challenge.as_str(), turn_end::RULE_OPEN_ITEMS),
         ("keep going", turn_end::RULE_CONTINUE),
@@ -3667,28 +3454,25 @@ fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
         rule: rule.to_string(),
     })
     .collect();
-    let scan_after = |report: &String, rows: &[String]| {
+    let scan_rows = |rows: &[String]| {
         let mut s = FinishedScan::default();
         s.supervisor_typed(&ours);
-        for row in [typed_row("Fix the parser and land it."), report.clone()]
-            .iter()
-            .chain(rows)
-        {
+        for row in rows {
             s.line(row);
         }
         s
     };
-    let scan = |rows: &[String]| scan_after(&open, rows);
+    let scan = |rows: &[String]| {
+        let prefix = [typed_row("Fix the parser and land it."), open.clone()];
+        scan_rows(&[&prefix[..], rows].concat())
+    };
     let s = scan(&[]);
     assert!(
         !s.finished() && s.said_done(),
-        "the token over open work finishes nothing"
+        "the token over open work lands nothing"
     );
-    let clean = model_row(FINISHED_REPORT);
-    assert!(scan_after(&clean, &[]).finished(), "the token finished it");
     let work = model_row("Ran the e2e suite: two tests fail. Investigating the timeout now.");
     let words = model_row("All done; nothing left to do.");
-    let idle = model_row("No lander is running, so I'm not re-arming that watch.");
     let earlier = "Your report ends with ATERM-TASK-DONE but still names open work (still open). \
                    Do each of those items you can still do yourself now, and verify it. End your \
                    reply with ATERM-TASK-DONE on a line by itself only when every item left needs \
@@ -3700,16 +3484,20 @@ fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
                     can still do yourself now, and verify it. Report whether the task is \
                     complete, the outcome, verification, and any remaining blockers in ordinary \
                     language.";
-    let dirty = crate::harness::repo_work::RepoWork {
-        repo: "/Users//a/Developer/parser".to_string(),
-        changed: 1,
-        paths: vec!["src/lexer.rs".to_string()],
-        ..Default::default()
-    };
+    // The uncommitted-work challenge as the last build that typed it worded
+    // it, over a repository with one changed file.
+    let uncommitted = format!(
+        "{}: /Users//a/Developer/parser: 1 changed (src/lexer.rs). A done report ends nothing \
+         while any is left. Commit and push it (merged to main where this repository lands \
+         work), a stash's work included; delete, overwrite and force-push nothing to get there. \
+         Say the task is complete only when nothing is uncommitted, untracked, stashed or \
+         unpushed and your report names no open item, follow-up or next step.",
+        turn_end::UNCOMMITTED_HEAD
+    );
     for asked in [
         challenge.clone(),
-        turn_end::open_items_text(&["still open"], None, true),
-        turn_end::uncommitted_text(&dirty, None, false),
+        old_challenge(true),
+        uncommitted,
         earlier.to_string(),
         earlier.replace("End your reply with", "Reply with"),
         ordinary.to_string(),
@@ -3717,25 +3505,28 @@ fn the_open_items_challenge_takes_the_tokens_finish_back_in_the_record() {
         let asked = at(typed_row(&asked));
         let s = scan(std::slice::from_ref(&asked));
         assert!(!s.finished() && s.said_done(), "unanswered: {asked}");
-        let s = scan_after(&clean, std::slice::from_ref(&asked));
-        assert!(!s.finished(), "the finish taken back: {asked}");
-        let s = scan(&[asked.clone(), work.clone()]);
-        assert!(!s.finished(), "work goes on: {asked}");
+        let mut reopened = landing_rows();
+        reopened.push(asked.clone());
+        assert!(!scan_rows(&reopened).finished(), "opens a landing: {asked}");
+        for (what, answer) in [
+            ("work goes on", &work),
+            ("done in words", &words),
+            ("the token", &model_row(FINISHED_REPORT)),
+            ("the clean defense", &model_row(DEFENSE)),
+        ] {
+            let s = scan(&[asked.clone(), answer.clone()]);
+            assert!(!s.finished(), "{what}: {asked}");
+        }
         let s = scan(&[asked.clone(), words.clone()]);
-        assert!(
-            s.finished() && s.finished_at_check(),
-            "done in words, at the check: {asked}"
-        );
-        let s = scan(&[asked.clone(), model_row(FINISHED_REPORT)]);
-        assert!(s.finished() && !s.finished_at_check(), "the token: {asked}");
-        let s = scan(&[asked.clone(), open.clone()]);
-        assert!(!s.finished(), "the token over open work again: {asked}");
-        let s = scan(&[asked.clone(), idle.clone()]);
-        assert!(!s.finished(), "an idle report is work going on: {asked}");
+        assert!(s.said_done(), "done in words is a claim: {asked}");
     }
     // NEGATIVE CONTROLS.
-    let s = scan_after(&clean, &[at(typed_row("keep going")), work.clone()]);
-    assert!(s.finished(), "the loop's own line reopens nothing");
+    let mut kept = landing_rows();
+    kept.extend([at(typed_row("keep going")), work.clone()]);
+    assert!(
+        scan_rows(&kept).finished(),
+        "the loop's own line reopens nothing"
+    );
     let quoted = at(typed_row(&format!("Please read this: {challenge}")));
     let s = scan(&[quoted, words]);
     assert!(
@@ -3753,10 +3544,15 @@ const TOKEN_CHECK_FIXTURE: &str = "Before you stop: do every open item, skipped 
      a decision, physical access) or cannot be done on this host, each item named with its \
      blocker; a slow check is not a blocker. Otherwise continue.";
 
-/// Old land instructions can remain in an existing conversation after an
-/// upgrade. Their ordinary completion replies still land the task.
+/// OLD LAND INSTRUCTIONS STAY LAND ACTS: an older build's instruction or
+/// nudge can remain in an existing conversation after an upgrade (the
+/// token's wordings, the ordinary-language ones, every retired set), and
+/// the record reads each by its words as Land's act: the clean defense
+/// answering it lands the task. NEGATIVE CONTROL: an ordinary completion
+/// report answering it — which those builds took as the end — is a claim
+/// now, and lands nothing; so is the retired token.
 #[test]
-fn legacy_land_instructions_accept_ordinary_completion_reports() {
+fn legacy_land_instructions_land_on_a_clean_defense() {
     let instruction = "[aterm harness] Autopilot is set to Land: wrap up this work cleanly. \
                        Finish only the step in hand and start nothing new. Make sure what is \
                        done is verified, and leave it committed (and pushed, if that is how \
@@ -3764,42 +3560,61 @@ fn legacy_land_instructions_accept_ordinary_completion_reports() {
                        and what is left, and reply with ATERM-TASK-DONE on a line by itself.";
     let nudge = "[aterm harness] Still landing: finish only what leaves the work clean, then \
                  reply with ATERM-TASK-DONE on a line by itself.";
-    for prompt in [
-        instruction,
-        nudge,
-        turn_end::LAND_BEFORE,
-        turn_end::LAND_NUDGE_BEFORE,
-    ] {
-        let rows = [
+    let answered = |prompt: &str, said: &str| {
+        [
             typed_row("Fix the lexer and land it."),
             model_row("The lexer is fixed; running its tests now."),
             typed_row(prompt),
-            model_row("The task is complete. The tests passed and the fix is committed."),
-        ];
-        assert!(transcript_finished(&rows.join("\n"), &[]), "{prompt}");
+            model_row(said),
+        ]
+        .join("\n")
+    };
+    for prompt in [instruction, nudge]
+        .into_iter()
+        .chain(turn_end::RETIRED_LANDS)
+        .chain(turn_end::RETIRED_LAND_NUDGES)
+    {
+        assert!(
+            transcript_finished(&answered(prompt, DEFENSE), &[]),
+            "{prompt}"
+        );
+        for said in [
+            "The task is complete. The tests passed and the fix is committed.",
+            FINISHED_REPORT,
+        ] {
+            assert!(
+                !transcript_finished(&answered(prompt, said), &[]),
+                "CONTROL: {said}: {prompt}"
+            );
+        }
     }
 }
 
-/// THE RECORD READS THE CHECK'S ANSWER AS THE SCREEN DOES AT THE CHECK
-/// ([`turn_end::says_done_outright`]): only the worker's own word ends the
-/// task there — the token on a line of its own (last or first), `DONE`, a
-/// done phrase (`I'm stopping here.`). An idle report (the 2026-10-04 02:08
-/// tail: `No lander is running … All queued work has landed.`, six hours of
-/// work followed it) and the check's own words echoed back (`Phase 1 is
-/// finished and verified; phase 2 is next.`) are the work going on, which
-/// the screen continues as progress: read as done, the record would end the
-/// task the screen goes on with. The check is known by every wording it was
-/// typed in, which records written then still hold: today's (alone, with the
-/// reversible clause, and with the standing rules after that), the token's
-/// first wording (2026-09-29 to 10-15) and the `reply DONE` one before it.
-/// NEGATIVE CONTROLS: a check answered `Not yet` finishes nothing; outside a
-/// check the idle report finishes nothing and the token does; a near miss
-/// of the check's words is someone's prompt, its `DONE` reply no finish.
+/// ONLY A LAND ACT'S CLEAN DEFENSE LANDS THE TASK IN THE RECORD (FOREVER
+/// LAND): never the token, never a check's reply. The Cruise prompt and
+/// every check an older build typed (today's alone, with the reversible
+/// clause, and with the standing rules after that; the token's wordings and
+/// the `reply DONE` one before them, which records written then still hold)
+/// land nothing whatever their answer — the token on a line of its own,
+/// `DONE`, a done phrase, the clean defense itself. Land's instruction and
+/// its nudge, today's and the retired, land the task on the clean defense
+/// alone: a done phrase, the token or `DONE` answering them is a claim, and
+/// a defense that names a need, or open work, lands nothing. NEGATIVE
+/// CONTROLS: outside any act neither the token nor the defense lands
+/// anything; a near miss of a check's words is someone's prompt.
 #[test]
-fn the_records_done_check_ends_the_task_only_on_the_workers_own_word() {
+fn only_a_land_acts_clean_defense_lands_the_task_in_the_record() {
     let ask = typed_row("Fix the lexer and land it.");
     let report = model_row("All done: the suite passes.");
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
+    let answered = |asked: &str, said: &str| {
+        [
+            ask.clone(),
+            report.clone(),
+            typed_row(asked),
+            model_row(said),
+        ]
+    };
     let reversible = format!(
         "{} {}",
         turn_end::DONE_CHECK,
@@ -3811,50 +3626,50 @@ fn the_records_done_check_ends_the_task_only_on_the_workers_own_word() {
         reversible.as_str(),
         rules.as_str(),
         TOKEN_CHECK_FIXTURE,
-        DONE_CHECK_TOKEN_BEFORE,
-        DONE_CHECK_BEFORE,
+        turn_end::DONE_CHECK_TOKEN_BEFORE,
+        turn_end::DONE_CHECK_BEFORE,
     ];
-    let ends = [
+    let claims = [
         "Verified on main.\n\nATERM-TASK-DONE",
         "ATERM-TASK-DONE\n\nThe suite passes on main.",
         "DONE",
         "I'm stopping here.",
         "The task is complete. All checks passed and the fix is committed.",
     ];
-    let goes_on = [
-        "No lander is running, so I'm not re-arming that watch. All queued work has landed.",
-        "Phase 1 is finished and verified; phase 2 is next.",
-        "Not yet: the docs still need a pass.",
-        WAITS_AT_THE_CHECK[0],
-        WAITS_AT_THE_CHECK[1],
-        WAITS_AT_THE_CHECK[2],
-    ];
     for check in checks {
-        for said in ends {
-            let rows = [
-                ask.clone(),
-                report.clone(),
-                typed_row(check),
-                model_row(said),
-            ];
-            assert!(finished(&rows), "{check}: {said}");
-        }
-        for said in goes_on {
-            let rows = [
-                ask.clone(),
-                report.clone(),
-                typed_row(check),
-                model_row(said),
-            ];
-            assert!(!finished(&rows), "{check}: {said}");
+        for said in claims.into_iter().chain([DEFENSE]) {
+            assert!(!finished(&answered(check, said)), "{check}: {said}");
         }
     }
-    // NEGATIVE CONTROLS: outside a check only the token's last line ends it.
-    assert!(!finished(&[ask.clone(), model_row(goes_on[0])]));
-    assert!(finished(&[ask.clone(), model_row(ends[0])]));
-    // A near miss of the check's words is someone's prompt.
+    let land = turn_end::land_text(None);
+    let nudge = turn_end::land_nudge_text(Some("never push to main"));
+    let acts = [
+        land.as_str(),
+        nudge.as_str(),
+        turn_end::LAND,
+        turn_end::LAND_NUDGE,
+    ]
+    .into_iter()
+    .chain(turn_end::RETIRED_LANDS)
+    .chain(turn_end::RETIRED_LAND_NUDGES);
+    let needs = format!("{DEFENSE}\nNEEDS YOU: the release credential.");
+    let open_work = "Pushed the lexer fix.\nNothing left: the parser's follow-up is still open.";
+    for act in acts {
+        assert!(finished(&answered(act, DEFENSE)), "{act}");
+        for said in claims {
+            assert!(!finished(&answered(act, said)), "a claim: {act}: {said}");
+        }
+        assert!(!finished(&answered(act, &needs)), "a need: {act}");
+        assert!(!finished(&answered(act, open_work)), "open work: {act}");
+    }
+    // NEGATIVE CONTROLS: outside any act nothing lands.
+    assert!(!finished(&[ask.clone(), model_row(claims[0])]));
+    assert!(!finished(&[ask.clone(), model_row(DEFENSE)]));
+    // A near miss of a check's words is someone's prompt.
     let near = typed_row("If the task is finished, reply DONE.");
-    assert!(!finished(&[ask, report, near, model_row("DONE")]));
+    let mut rows = landing_rows();
+    rows.extend([near, model_row("DONE")]);
+    assert!(!finished(&rows), "someone's prompt opens the landing");
 }
 
 /// A worker's waits on its own work in flight worded with a done phrase
@@ -3865,22 +3680,21 @@ const WAITS_AT_THE_CHECK: [&str; 3] = [
     "Everything I can do is queued behind the build, which is still running.",
 ];
 
-/// A WAIT AT THE CHECK IS REOPENED BY ITS OWN WAKE (the cross-lane review's
-/// F4): the check answered with a wait on the worker's own work in flight
-/// (`I'll stop here until CI reports back`) finishes nothing, so the wake
-/// that work causes — Claude Code's `<task-notification>`, nobody's prompt —
-/// ends on the worker's next step, an open task the loop continues. Read as
-/// the end, the record kept it ended through every later turn. NEGATIVE
-/// CONTROL: a stop at the check stays finished through the same wake (a
-/// wake reopens nothing).
+/// A WAIT AT LAND'S YIELD LANDS NOTHING, AND ITS OWN WAKE KEEPS IT OPEN (the
+/// cross-lane review's F4): Land's instruction answered with a wait on the
+/// worker's own work in flight (`I'll stop here until CI reports back`) is
+/// no clean defense, so the wake that work causes — Claude Code's
+/// `<task-notification>`, nobody's prompt — ends on the worker's next step,
+/// an open task. NEGATIVE CONTROL: the clean defense at Land's yield stays
+/// landed through the same wake (a wake reopens nothing).
 #[test]
-fn a_wait_at_the_check_is_reopened_by_its_own_wake() {
+fn a_wait_at_lands_yield_is_reopened_by_its_own_wake() {
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
     let rows = |said: &str| {
         [
             typed_row("Fix the lexer and land it."),
             model_row("All done."),
-            typed_row(turn_end::DONE_CHECK),
+            typed_row(&turn_end::land_text(None)),
             model_row(said),
             notification_row(),
             model_row("The release build passed. Next I'll publish the notes."),
@@ -3889,7 +3703,7 @@ fn a_wait_at_the_check_is_reopened_by_its_own_wake() {
     for wait in WAITS_AT_THE_CHECK {
         assert!(!finished(&rows(wait)), "{wait}");
     }
-    assert!(finished(&rows("I'm stopping here.")));
+    assert!(finished(&rows(DEFENSE)));
 }
 
 /// `row` written in the turn Claude Code numbers `id` (its `promptId`).
@@ -3906,21 +3720,24 @@ fn meta_row(text: &str) -> String {
     )
 }
 
-/// A TURN ITS OWN GOAL KEEPS GOING IS STILL THE TOKEN'S TURN
+/// A TURN ITS OWN GOAL KEEPS GOING IS STILL THE LANDING'S TURN
 /// ([`FinishedScan`]): a Stop hook's feedback (`Stop hook feedback: … not
 /// met`) or `/goal`'s check-in is written `isMeta` under the running turn's
 /// `promptId` a second after the model's text (MEASURED 2026-10-15, 39 and
 /// 16 such rows on this machine), and the worker works on in that turn: its
-/// later text that does not end on the token takes the finish back. So too
-/// on a build that numbers no turn. NEGATIVE CONTROLS: the hook row alone
-/// takes nothing back, nor does it when the worker says the token again; a
-/// row that asks nothing under a turn of its own (a `/loop`'s wake, a new
-/// `promptId`) begins a turn, and its answer leaves the finish standing.
+/// later text that is no clean defense takes the landing back. So too on a
+/// build that numbers no turn. NEGATIVE CONTROLS: the hook row alone takes
+/// nothing back, nor does it when the worker says the defense again; a row
+/// that asks nothing under a turn of its own (a `/loop`'s wake, a new
+/// `promptId`) begins a turn, and its answer leaves the landing standing.
 #[test]
-fn a_turn_its_own_goal_keeps_going_takes_the_finish_back() {
+fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
-    let ask = in_turn(&typed_row("Make the compiler build itself."), "p1");
-    let token = model_row(FINISHED_REPORT);
+    let ask = in_turn(&typed_row("Make the compiler build itself."), "p0");
+    let report = model_row("Stage 1 builds; stage 2 next.");
+    let land = in_turn(&typed_row(&turn_end::land_text(None)), "p1");
+    let defense = model_row(DEFENSE);
+    let landed = || vec![ask.clone(), report.clone(), land.clone(), defense.clone()];
     let tool = in_turn(
         &bare_user_row(
             "",
@@ -3934,31 +3751,28 @@ fn a_turn_its_own_goal_keeps_going_takes_the_finish_back() {
          satisfied: stage 2 fails.",
     );
     let goal = meta_row("Goal check-in: «The compiler builds itself» is not met yet.");
+    assert!(finished(&landed()), "the landing");
     for (what, kept) in [
         ("a Stop hook's feedback", &hook),
         ("/goal's check-in", &goal),
     ] {
         let kept = in_turn(kept, "p1");
-        let rows = [ask.clone(), token.clone(), kept.clone(), work.clone()];
+        let rows = [landed(), vec![kept.clone(), work.clone()]].concat();
         assert!(!finished(&rows), "{what}, then more work");
-        let rows = [
-            ask.clone(),
-            token.clone(),
-            kept.clone(),
-            tool.clone(),
-            work.clone(),
-        ];
+        let rows = [landed(), vec![kept.clone(), tool.clone(), work.clone()]].concat();
         assert!(!finished(&rows), "{what}, a tool's result, then more work");
         // NEGATIVE CONTROLS.
-        let rows = [ask.clone(), token.clone(), kept.clone()];
+        let rows = [landed(), vec![kept.clone()]].concat();
         assert!(finished(&rows), "{what} alone");
-        let rows = [ask.clone(), token.clone(), kept.clone(), token.clone()];
-        assert!(finished(&rows), "{what}, then the token again");
+        let rows = [landed(), vec![kept.clone(), defense.clone()]].concat();
+        assert!(finished(&rows), "{what}, then the defense again");
     }
     // A build that numbers no turn: the row goes on the turn too.
     let rows = [
         typed_row("Make the compiler build itself."),
-        token.clone(),
+        report.clone(),
+        typed_row(&turn_end::land_text(None)),
+        defense.clone(),
         hook.clone(),
         work.clone(),
     ];
@@ -3966,24 +3780,25 @@ fn a_turn_its_own_goal_keeps_going_takes_the_finish_back() {
     // NEGATIVE CONTROL: a `/loop`'s wake is a turn of its own.
     let wake = in_turn(&meta_row("keep going: check the land log"), "p2");
     let rows = [
-        ask.clone(),
-        token.clone(),
-        wake,
-        model_row("The land log shows nothing new."),
-    ];
+        landed(),
+        vec![wake, model_row("The land log shows nothing new.")],
+    ]
+    .concat();
     assert!(finished(&rows), "a /loop wake under a new promptId");
     // A `/loop`'s wake on a build that numbers no turn is a turn of its own
     // by its `scheduledTaskId` (ATERM-KI-1016-1: the 2.1.252 and 2.1.267
-    // bundles stamp it on the wake's user row): its answer without the
-    // token leaves the finish standing. Read as part of the token's turn,
-    // it took the finish back.
+    // bundles stamp it on the wake's user row): its answer leaves the
+    // landing standing. Read as part of the landing's turn, it took the
+    // landing back.
     let unnumbered_wake = bare_user_row(
         r#","isMeta":true,"promptSource":"system","scheduledTaskId":"t1""#,
         r#""keep going: check the land log""#,
     );
     let rows = [
         typed_row("Make the compiler build itself."),
-        token.clone(),
+        report,
+        typed_row(&turn_end::land_text(None)),
+        defense,
         unnumbered_wake,
         model_row("The land log shows nothing new."),
     ];
@@ -3996,18 +3811,17 @@ fn a_turn_its_own_goal_keeps_going_takes_the_finish_back() {
 /// was not running — what a relaunch's start meets — carries no
 /// `scheduledTaskId` (the 2.1.252 bundle: `if(l)l(e);else t(Pcr(e))`, and the
 /// REPL passes no `onMissed`; so too 2.1.302). On a build that numbers no
-/// turn it went on the token's turn, and its answer without the token took
-/// the finish back. Read by its fixed opening words it is a turn of its own,
-/// and so is a row whose `turnOrigin` names one with no `promptId` beside it
-/// (Claude Code's own rule, 2.1.302: `promptId || turnOrigin || !isMeta`).
-/// NEGATIVE CONTROLS: a Stop hook's feedback with neither still goes on the
-/// turn and takes the finish back, and so does the notice's text quoted
-/// inside other words.
+/// turn it went on the landing's turn, and its answer took the landing back.
+/// Read by its fixed opening words it is a turn of its own, and so is a row
+/// whose `turnOrigin` names one with no `promptId` beside it (Claude Code's
+/// own rule, 2.1.302: `promptId || turnOrigin || !isMeta`). NEGATIVE
+/// CONTROLS: a Stop hook's feedback with neither still goes on the turn and
+/// takes the landing back, and so does the notice's text quoted inside other
+/// words.
 #[test]
 fn a_missed_tasks_notice_is_a_turn_of_its_own_on_a_build_that_numbers_none() {
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
-    let ask = typed_row("Make the compiler build itself.");
-    let token = model_row(FINISHED_REPORT);
+    let landed = landing_rows;
     let answer = model_row("Shall I run the missed check of the land log now?");
     let missed = meta_row(
         "The following one-shot scheduled task was missed while Claude was not running. It \
@@ -4016,46 +3830,45 @@ fn a_missed_tasks_notice_is_a_turn_of_its_own_on_a_build_that_numbers_none() {
          execute if the user confirms.\n\n[at 09:00, created 10/16/2026, 8:58:00 AM]\ncheck \
          the land log",
     );
-    let rows = [ask.clone(), token.clone(), missed, answer.clone()];
+    let rows = [landed(), vec![missed, answer.clone()]].concat();
     assert!(finished(&rows), "a missed task's notice with no promptId");
     let originated = bare_user_row(
         r#","isMeta":true,"turnOrigin":"scheduled""#,
         r#""keep going: check the land log""#,
     );
-    let rows = [ask.clone(), token.clone(), originated, answer.clone()];
+    let rows = [landed(), vec![originated, answer.clone()]].concat();
     assert!(finished(&rows), "a turnOrigin with no promptId");
     // NEGATIVE CONTROLS.
     let hook = meta_row(
         "Stop hook feedback:\n[The compiler builds itself]: The condition has not been \
          satisfied: stage 2 fails.",
     );
-    let rows = [ask.clone(), token.clone(), hook, answer.clone()];
+    let rows = [landed(), vec![hook, answer.clone()]].concat();
     assert!(!finished(&rows), "a Stop hook's feedback goes on the turn");
     let quoted = meta_row(
         "Stop hook feedback: the log says \"The following one-shot scheduled task was \
          missed\"; the goal is not met.",
     );
-    let rows = [ask, token, quoted, answer];
+    let rows = [landed(), vec![quoted, answer]].concat();
     assert!(!finished(&rows), "the notice's words quoted go on the turn");
 }
 
 /// A PERSON'S `!` SHELL COMMAND ASKS THE WORKER NOTHING, AND A PROMPT TYPED
 /// WHILE IT WORKS IS SOMEONE'S ([`FinishedScan`]): `<bash-input>…` and its
-/// `<bash-stdout>…` (as 2.1.294 records them) leave a finished task finished
+/// `<bash-stdout>…` (as 2.1.294 records them) leave a landed task landed
 /// through the wakes after them; a prompt absorbed into a running turn,
 /// recorded only as a `queued_command` attachment (2.1.267 to 2.1.300),
-/// opens it at once, and the worker's token after it finishes it again.
+/// opens it at once, and the worker's defense after it lands nothing (no
+/// land act since); Land's instruction typed after it lands it again.
 /// NEGATIVE CONTROLS: a shell command a model turn follows is a turn of
 /// someone's; absorbed into a wake's turn, an attachment of a background
 /// task's notification, one of what the loop typed (its ledger), and a
-/// subagent's leave the finish standing; the same words with no ledger open
+/// subagent's leave the landing standing; the same words with no ledger open
 /// it.
 #[test]
 fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() {
     let finished = |rows: &[String], ours: &[Typed]| transcript_finished(&rows.join("\n"), ours);
-    let ask = typed_row("Fix the lexer and land it.");
-    let token = model_row(FINISHED_REPORT);
-    let base = || vec![ask.clone(), token.clone()];
+    let base = landing_rows;
     let bash_in = bare_user_row("", r#""<bash-input>cat notes.txt</bash-input>""#);
     let bash_out = bare_user_row(
         r#","turnOrigin":"human""#,
@@ -4090,8 +3903,14 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     assert!(!finished(&wake, &[]), "absorbed into a wake's turn");
     let replied = [wake.clone(), vec![model_row("Fixed the docs too.")]].concat();
     assert!(!finished(&replied, &[]), "absorbed, then answered");
-    let again = [wake, vec![token.clone()]].concat();
-    assert!(finished(&again, &[]), "absorbed, then the token");
+    let defended = [wake.clone(), vec![model_row(DEFENSE)]].concat();
+    assert!(!finished(&defended, &[]), "absorbed, then the defense");
+    let relanded = [
+        wake,
+        vec![typed_row(&turn_end::land_text(None)), model_row(DEFENSE)],
+    ]
+    .concat();
+    assert!(finished(&relanded, &[]), "absorbed, then landed again");
     // NEGATIVE CONTROLS.
     let ours = [Typed {
         at_ms: 1_000,
@@ -5030,14 +4849,19 @@ fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
 /// its rest; an idle, settled, empty composer with nothing under the agent,
 /// Claude's status `idle` or, where the model's status lags, `shell` over an
 /// idle screen read so `IDLE_LOOKS` looks in a row; the end of the agent's
-/// work exactly when the model saw work since the notice
-/// (`Facts::work_ended`). It asks (`Announce`, or `Rearm` from a rest)
-/// exactly where `HostAsks` or `HostReasks` is enabled, gives up exactly
-/// where `HostGivesUp` is, waits `status-stale` exactly where `HostHolds` is,
-/// and says its quiet word (`awaiting-ready`, `failed`) exactly where
-/// `HostWaits` is. Negative controls: `Buggy`, an ask with no work seen
-/// (`Nag`) and the wait held past the window (`Hold`) each disagree with the
-/// real reducer at some reachable point.
+/// work (`Facts::work_ended`) and the rest read by the driver's own clocks
+/// (`St::time_work`, `St::time_failed`) from the work the model saw since the
+/// notice, the notice (or the stop) past the work end's floor. It asks
+/// (`Announce`, or `Rearm` from a rest) exactly where `HostAsks` or
+/// `HostReasks` is enabled, gives up exactly where `HostGivesUp` is, waits
+/// `status-stale` exactly where `HostHolds` is, and says its quiet word
+/// (`awaiting-ready`, `failed`) exactly where `HostWaits` is. At every
+/// point before the look, a break of the work included (`screen == 1`: the
+/// work in the agent's own process, nothing under it), the driver reads the
+/// end of the work exactly at an idle point after work: never at a break,
+/// where the model's host takes no step. Negative controls: `Buggy`, an ask
+/// with no work seen (`Nag`) and the wait held past the window (`Hold`) each
+/// disagree with the real reducer at some reachable point.
 #[test]
 fn the_work_end_reducer_is_bound_to_its_model() {
     use aterm_models_harness::harness_upgrade_work_end_model;
@@ -5066,34 +4890,45 @@ fn the_work_end_reducer_is_bound_to_its_model() {
     let cap = model.consts.iter().find(|c| c.0 == "Cap").unwrap().1;
     // The model's asks onto the real count: its `Cap` is `MAX_ASKS`.
     let shift = i64::from(MAX_ASKS) - cap;
-    // The real reducer at a model point: which host action it takes.
-    let real = |s: &S| -> &'static str {
+    // The look at a model point: the round, and its facts as the driver reads
+    // them.
+    let look = |s: &S| -> (Phase, Facts) {
+        let since = if s["late"] == 1 {
+            REASK_S + 60
+        } else {
+            WORK_END_FLOOR_S + 60
+        };
         let phase = if s["phase"] == 1 {
             Phase::Announced {
-                at_s: if s["late"] == 1 {
-                    now - REASK_S - 60
-                } else {
-                    now - 60
-                },
+                at_s: now - since,
                 asks: u32::try_from(s["asks"] + shift).unwrap(),
             }
         } else {
             Phase::Failed(GAVE_UP.to_string())
         };
-        let facts = Facts {
-            work_ended: s["worked"] == 1,
-            failed_s: 60,
-            ..idle_facts()
+        let st = super::super::upgrade_drive::St {
+            phase: phase.clone(),
+            noticed_at: now - since,
+            failed_at: now - since,
+            work_seen: s["worked"] == 1,
+            ..Default::default()
         };
-        let facts = if s["lag"] == 1 {
-            Facts {
-                status: "shell".to_string(),
-                idle_looks: IDLE_LOOKS,
-                ..facts
-            }
-        } else {
-            facts
-        };
+        let mut facts = idle_facts();
+        if s["lag"] == 1 {
+            facts.status = "shell".to_string();
+            facts.idle_looks = IDLE_LOOKS;
+        }
+        if s["screen"] == 1 {
+            facts.status = "busy".to_string();
+            facts.background_point = true;
+        }
+        st.time_failed(&mut facts, now);
+        st.time_work(&mut facts, now);
+        (phase, facts)
+    };
+    // The real reducer at a model point: which host action it takes.
+    let real = |s: &S| -> &'static str {
+        let (phase, facts) = look(s);
         match next_step(&phase, &facts, false, now) {
             Step::Announce | Step::Rearm => "ask",
             Step::GiveUp => "gives-up",
@@ -5115,16 +4950,25 @@ fn the_work_end_reducer_is_bound_to_its_model() {
         .map(|(word, _)| word)
         .collect()
     };
-    let points: Vec<S> = reachable(&model)
+    let looks: Vec<S> = reachable(&model)
         .into_iter()
-        .filter(|s| s["screen"] == 0 && s["looked"] == 0)
+        .filter(|s| s["looked"] == 0)
         .collect();
+    let points: Vec<S> = looks.iter().filter(|s| s["screen"] == 0).cloned().collect();
     for (what, found) in [
         (
             "a rest after work",
             points.iter().any(|s| s["worked"] == 1 && s["phase"] == 2),
         ),
         ("no work seen", points.iter().any(|s| s["worked"] == 0)),
+        (
+            "a break of seen work, announced and resting",
+            [1, 2].iter().all(|phase| {
+                looks
+                    .iter()
+                    .any(|s| s["screen"] == 1 && s["worked"] == 1 && s["phase"] == *phase)
+            }),
+        ),
         (
             "a lag past the window",
             points
@@ -5137,6 +4981,13 @@ fn the_work_end_reducer_is_bound_to_its_model() {
         ),
     ] {
         assert!(found, "the model reaches {what}");
+    }
+    for s in &looks {
+        assert_eq!(
+            look(s).1.work_ended,
+            s["screen"] == 0 && s["worked"] == 1,
+            "the end of the work at {s:?}"
+        );
     }
     for s in &points {
         assert_eq!(
@@ -5917,8 +5768,9 @@ fn stdout_content(text: &str) -> String {
 /// second that stands under a `/rate-limit-options` command row, its text
 /// between the tags. It is what a limit reset's outcome is read from.
 ///
-/// EVERY RESET ROW HERE IS COMPOSED 2026-10-02, never captured: the texts
-/// are the 2.1.287 bundle's (`docs/SPEC-claude-accounts-resets-2026-10-02.md`
+/// EVERY RESET ROW HERE IS COMPOSED 2026-10-02 (reworded 2026-10-19), never
+/// captured: the texts are the 2.1.304 bundle's
+/// (`docs/SPEC-claude-accounts-resets-2026-10-02.md`
 /// §0), laid on the two rows MEASURED for this dialog's wait row
 /// (`upgrade_stall_tests.rs`: the `/rate-limit-options` command row, then
 /// its output row) in the full row shape measured for `/model`; the values
@@ -5937,8 +5789,9 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
     let same = "2026-09-27T15:04:28.344Z";
     let after = "2026-09-27T15:05:10.120Z";
     let later = "2026-09-27T15:09:00.000Z";
-    let spent = "Limits reset · your weekly reset day stays Oct 3 at 10am · 1 reset left";
-    let kept = "Reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
+    let spent =
+        "Weekly limits reset · your weekly reset day stays Oct 3 at 10am · 1 weekly reset left";
+    let kept = "Weekly reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
     let waited = "Claude Code will continue automatically at 6am";
 
     let dialog = |ts: &str| local_command_row(ts, &command_content("rate-limit-options"));

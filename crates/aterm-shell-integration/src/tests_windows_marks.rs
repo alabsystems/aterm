@@ -291,7 +291,7 @@ fn test_powershell_reports_the_exit_code_of_the_line_that_failed() {
 
 /// Git Bash for the live test: `$ATERM_TEST_GIT_BASH`, else Git for Windows' own `bash.exe`
 /// where it is installed. An override that names nothing is an operator error and fails,
-/// as `resolve_test_shell`'s does.
+/// as `aterm_spec::host::test_shell`'s does.
 #[cfg(windows)]
 fn git_bash_exe() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("ATERM_TEST_GIT_BASH") {
@@ -348,13 +348,10 @@ const GIT_BASH_LINES: &[(&str, &str, &str)] = &[
 #[cfg(windows)]
 #[test]
 fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
-    use std::io::Write as _;
     let Some(bash) = git_bash_exe() else {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "SKIP git bash blocks: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH"
+        aterm_spec::host::could_not_run(
+            "git bash blocks: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH",
         );
-        return;
     };
     let world = PowerShellWorld::new();
     let dir = world.root.path();
@@ -422,11 +419,9 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
         major > 5 || (major == 5 && minor.parse::<u32>().is_ok_and(|minor| minor >= 3))
     });
     if !funsub {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "SKIP git bash blocks: bash {version:?} is older than 5.3, which PS0 needs"
-        );
-        return;
+        aterm_spec::host::could_not_run(format!(
+            "git bash blocks: bash {version:?} is older than 5.3, which PS0 needs"
+        ));
     }
     assert_eq!(
         (lines, codes),
@@ -538,13 +533,10 @@ fn test_ctrl_j_accepts_the_line_in_powershell_and_git_bash() {
         );
     });
 
-    use std::io::Write as _;
     let Some(bash) = git_bash_exe() else {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "SKIP Ctrl+J on git bash: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH"
+        aterm_spec::host::could_not_run(
+            "Ctrl+J on git bash: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH",
         );
-        return;
     };
     let world = PowerShellWorld::new();
     let rc = world.root.path().join("rc.bash");
@@ -620,13 +612,10 @@ fn drawn_titles(seen: &[u8]) -> Vec<String> {
 #[cfg(windows)]
 #[test]
 fn test_a_git_bash_tab_starts_as_a_login_git_bash_that_loads_git_prompt_once() {
-    use std::io::Write as _;
     let Some(bash) = git_bash_exe() else {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "SKIP git bash start: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH"
+        aterm_spec::host::could_not_run(
+            "git bash start: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH",
         );
-        return;
     };
     let probe = "echo \"R$((40+2))=loads:$__gp_loads,profile:$__profile_runs,\
                  bashrc:$__bashrc_runs,login:$(shopt -q login_shell && echo y || echo n),\
@@ -718,13 +707,10 @@ const GIT_BASH_FLAGS_LINE: &str = "__s=\" $(command stty -a | tr '\\n' ' ') \"; 
 #[cfg(windows)]
 #[test]
 fn test_git_bash_repairs_its_tty_after_a_raw_program_that_ran_a_second() {
-    use std::io::Write as _;
     let Some(bash) = git_bash_exe() else {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "SKIP git bash tty repair: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH"
+        aterm_spec::host::could_not_run(
+            "git bash tty repair: no Git for Windows bash.exe and no ATERM_TEST_GIT_BASH",
         );
-        return;
     };
     let world = PowerShellWorld::new();
     let dir = world.root.path();
@@ -808,7 +794,6 @@ fn test_git_bash_repairs_its_tty_after_a_raw_program_that_ran_a_second() {
 #[cfg(windows)]
 #[test]
 fn test_a_command_title_is_the_whole_line_or_marks_its_cut() {
-    use std::io::Write as _;
     let short = |program: &str| format!("{program} # {}", "s".repeat(100));
     let long = |program: &str| format!("{program} # {}", "l".repeat(300));
     let cut = |line: &str| format!("{}…", line.chars().take(255).collect::<String>());
@@ -886,12 +871,10 @@ fn test_a_command_title_is_the_whole_line_or_marks_its_cut() {
     });
 
     let Some(bash) = git_bash_exe() else {
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "SKIP command titles on git bash: no Git for Windows bash.exe and no \
-             ATERM_TEST_GIT_BASH"
+        aterm_spec::host::could_not_run(
+            "command titles on git bash: no Git for Windows bash.exe and no \
+             ATERM_TEST_GIT_BASH",
         );
-        return;
     };
     let world = PowerShellWorld::new();
     let dir = world.root.path();

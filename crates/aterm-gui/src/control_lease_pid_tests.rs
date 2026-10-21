@@ -125,13 +125,13 @@ impl super::control_lanes::LaneService for LeaseService {
 
     fn serve_line(
         &self,
-        line: String,
+        request: super::Request,
         _scope: super::Scope,
         _stream: &CtlStream,
         _reader: &mut super::control_lanes::LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut super::control_lanes::Outbox,
     ) -> Option<super::ServeDisposition> {
-        let rest = line.strip_prefix("lease ").unwrap_or("");
+        let rest = request.line().strip_prefix("lease ").unwrap_or("");
         let reply = super::control_session::cmd_lease(&self.ctx, rest);
         self.replies
             .lock()
@@ -141,11 +141,11 @@ impl super::control_lanes::LaneService for LeaseService {
         None
     }
 
-    fn is_wait(&self, _line: &str, _scope: super::Scope) -> bool {
+    fn is_wait(&self, _request: &super::Request, _scope: super::Scope) -> bool {
         false
     }
 
-    fn subscribe(&self, _line: String, _scope: super::Scope, _stream: CtlStream) {}
+    fn subscribe(&self, _request: super::Request, _scope: super::Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
 
@@ -203,8 +203,9 @@ fn a_lease_taken_by_another_process_names_it_whatever_its_holder_says() {
         wait: 0,
         inline: 0,
         open: 4,
+        subscriptions: 0,
     });
-    assert_eq!(lanes.start(), 1, "the request lane starts");
+    assert_eq!(lanes.start().rpc, 1, "the request lane starts");
     lanes.publish(service.clone());
     let own = crate::harness_host::holder();
     let mut child = aterm_uds::spawnfd::command("/usr/bin/perl")

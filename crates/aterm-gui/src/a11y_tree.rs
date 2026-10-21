@@ -53,11 +53,22 @@ const MENU_ROWS: u64 = 64;
 /// below [`CHIP_BASE`] (`MENU_BASE + 1 + (2^22 − 1) · 64 + 63 < 2^30`).
 const MENU_EPOCH_BITS: u32 = 22;
 /// The chips in a Claude Code composer rule (design §9.2.1, owner surfaces §5) are
-/// `CHIP_BASE + session · 3 + chip` ([`chip_for`]): Autopilot `0`, `⚙` `1`, Team `2`.
+/// `CHIP_BASE + session · 2 + chip` ([`chip_for`]): Autopilot `0`, Team `1`.
 /// Between the menu's range and [`TAB_BASE`], so [`tab_index_for`] and
 /// [`ChromeMessage::from_node`] refuse a chip and a click on one never decodes as a tab
 /// switch or a band's capsule.
 const CHIP_BASE: u64 = 1 << 30;
+/// The stats bars (`crate::stats_deck`, `crate::stats_sill`; design §12.2
+/// Accessibility) are `STATS_BASE + …` ([`stats_node_id`]): a `Role::Group` a bar
+/// at `STATS_BASE + bar · 16` with its `Role::Meter` children after it, the core
+/// row's `Role::Grid` at `STATS_BASE + 64` and one meter a core from
+/// `STATS_BASE + 128`. Below [`MENU_BASE`] and far above every chrome message's
+/// slot, so no decoder takes a stats node for a message, a menu item, a chip or
+/// a tab; a stats node offers no action, so the routing never needs one.
+const STATS_BASE: u64 = 1 << 28;
+/// The cores a published core row may name (`STATS_BASE + 128 + core` stays
+/// below [`MENU_BASE`]).
+const STATS_CORES: usize = 1 << 20;
 /// Tab items are `TAB_BASE + tab_index`. A high, disjoint range so a tab id can never be
 /// mistaken for any other node by [`crate::App::on_accessibility_action`]'s routing.
 const TAB_BASE: u64 = 1 << 40;
@@ -467,15 +478,14 @@ pub(crate) struct GridMessage {
     pub(crate) capsules: Vec<BandCapsule>,
 }
 
-/// One of the chips in a Claude Code composer rule the tree publishes: the harness's two
-/// (design §9.2.1, §2.3) and the Team chip (owner surfaces §5).
+/// One of the chips in a Claude Code composer rule the tree publishes: the harness's
+/// Autopilot (design §9.2.1, §2.3) and the Team chip (owner surfaces §5). No settings
+/// button stands in the rule (owner, 2026-10-20), so none is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HarnessChip {
     /// The Autopilot chip: a click steps the session's word (or opens Settings ▸ Harness
     /// where no harness runs).
     Autopilot,
-    /// `⚙`: a click opens Settings ▸ Harness.
-    Settings,
     /// The Team chip (`✋ you`, `⇠ <manager>`, `⇉N`): a click hands the tab back, goes to
     /// the manager, or opens the Overview at a manager.
     Team,
@@ -483,14 +493,13 @@ pub(crate) enum HarnessChip {
 
 impl HarnessChip {
     /// The chips a session's ids have room for.
-    const SLOTS: u64 = 3;
+    const SLOTS: u64 = 2;
 
     /// Its place in its session's ids.
     const fn index(self) -> u64 {
         match self {
             Self::Autopilot => 0,
-            Self::Settings => 1,
-            Self::Team => 2,
+            Self::Team => 1,
         }
     }
 }
@@ -498,7 +507,7 @@ impl HarnessChip {
 /// One harness chip as the frame paints it (design §9.2.1): GLASS the `text` reads never
 /// see, so the tree is where a screen reader meets it — a `Role::Button` over its cells,
 /// clickable, NAMED IN WORDS and never a glyph (`Autopilot: cruise. Lands at 18:00.`,
-/// `Harness settings`), the trail's newest act its DESCRIPTION (`Last: approved at
+/// `Worker of lab-sweep`), the trail's newest act its DESCRIPTION (`Last: approved at
 /// 14:05.`), never a live region: a reader is not interrupted by every act.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GridChip {
@@ -574,7 +583,6 @@ pub(crate) fn chip_for(node: NodeId) -> Option<(u64, HarnessChip)> {
         .filter(|_| node.0 < TAB_BASE)?;
     let chip = match at % HarnessChip::SLOTS {
         0 => HarnessChip::Autopilot,
-        1 => HarnessChip::Settings,
         _ => HarnessChip::Team,
     };
     Some((at / HarnessChip::SLOTS, chip))
@@ -621,7 +629,7 @@ fn cells_rect(g: GridGeometry, row: usize, col: usize, width: usize, height: usi
 /// words with its newest act as its description; return their ids in painted order. The
 /// Autopilot chip also says it has a popup menu (`HasPopup::Menu`) and offers
 /// `Action::ShowContextMenu`, which opens it (design §9.3.3: what its right-click does,
-/// where a click cycles the mode); `⚙` has no menu.
+/// where a click cycles the mode); Team has no menu.
 fn push_chips(
     nodes: &mut Vec<(NodeId, Node)>,
     chips: &[GridChip],
@@ -703,6 +711,170 @@ fn push_menu(
     (menu_id, focus)
 }
 
+/// One stats meter: a gauge with its value within a known range, named stably
+/// ("CPU", "Super core 1") and described in words ("3.1 of 10 cores, rising").
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatsMeter {
+    /// The stable name; only the value changes.
+    pub(crate) name: String,
+    pub(crate) value: f64,
+    pub(crate) min: f64,
+    pub(crate) max: f64,
+    /// The value in words, with its motion and variance where they apply.
+    pub(crate) words: String,
+}
+
+/// One stats bar as a reader meets it: a group named for its scope, described
+/// by the scope's sentence (the one words function the lens and `sys` share),
+/// its meters, the core row (Global only) and its attention counts.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatsGroup {
+    /// "Global", "aterm" or "Tab".
+    pub(crate) name: &'static str,
+    /// The scope's sentence.
+    pub(crate) sentence: String,
+    /// CPU, GPU, memory, disk: whichever this scope reads.
+    pub(crate) meters: Vec<StatsMeter>,
+    /// One meter a core, in cluster order (Global only; empty elsewhere).
+    pub(crate) cores: Vec<StatsMeter>,
+    /// Stuck, quiet and waiting counts, as status text (aterm only).
+    pub(crate) marks: Option<String>,
+}
+
+/// The stats bars on this window (the Deck or the sill), `None` when off.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GridStats {
+    /// Global, aterm, Tab.
+    pub(crate) groups: Vec<StatsGroup>,
+    /// Where the bars' card sits, physical px.
+    pub(crate) bounds: Option<Rect>,
+    /// The open lens, while one is open.
+    pub(crate) lens: Option<StatsLens>,
+}
+
+/// The open stats lens as a reader meets it (design §12.2): a group holding
+/// the selected bar's well and the focus well, each named and described in
+/// the words the lens draws. The keyboard lens (⌘I) holds the keys, so it is
+/// the window's focus; a hover lens is only there to be read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatsLens {
+    /// Whether the keyboard opened it (it takes ←/→/↑/↓, Return, ⌘C, Esc).
+    pub(crate) keyboard: bool,
+    /// The selected bar ("Global", "aterm", "Tab") and its sentence.
+    pub(crate) bar: &'static str,
+    pub(crate) bar_words: String,
+    /// The focus well's instrument ("Cores") and its readout.
+    pub(crate) focus: &'static str,
+    pub(crate) focus_words: String,
+    /// Where the lens card sits, physical px.
+    pub(crate) bounds: Option<Rect>,
+}
+
+/// The lens group's id (its two wells follow it): after the three bars'
+/// groups (`STATS_BASE + bar · 16 + k`, bars 0–2) and before the core row's
+/// grid at `STATS_BASE + 64`.
+const STATS_LENS: u64 = STATS_BASE + 48;
+
+/// A stats node's id: `bar` 0–2 and its meter `k` (0 is the group itself);
+/// `STATS_BASE + 48` on belongs to the lens ([`STATS_LENS`]).
+fn stats_node_id(bar: usize, k: usize) -> Option<NodeId> {
+    (bar < 3 && k < 16).then(|| NodeId(STATS_BASE + bar as u64 * 16 + k as u64))
+}
+
+/// Emit the stats groups; return their ids in painted order (top down).
+fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> Vec<NodeId> {
+    let meter_node = |m: &StatsMeter| {
+        let mut node = Node::new(Role::Meter);
+        node.set_label(m.name.clone());
+        node.set_numeric_value(m.value);
+        node.set_min_numeric_value(m.min);
+        node.set_max_numeric_value(m.max);
+        node.set_description(m.words.clone());
+        node
+    };
+    let mut ids = Vec::with_capacity(stats.groups.len());
+    for (bar, group) in stats.groups.iter().enumerate() {
+        let Some(group_id) = stats_node_id(bar, 0) else {
+            continue;
+        };
+        let mut children = Vec::new();
+        for (k, m) in group.meters.iter().enumerate() {
+            let Some(id) = stats_node_id(bar, k + 1) else {
+                break;
+            };
+            nodes.push((id, meter_node(m)));
+            children.push(id);
+        }
+        if !group.cores.is_empty() {
+            let grid_id = NodeId(STATS_BASE + 64);
+            let mut cells = Vec::with_capacity(group.cores.len());
+            for (i, m) in group.cores.iter().take(STATS_CORES).enumerate() {
+                let id = NodeId(STATS_BASE + 128 + i as u64);
+                nodes.push((id, meter_node(m)));
+                cells.push(id);
+            }
+            let mut grid = Node::new(Role::Grid);
+            grid.set_label("Cores");
+            grid.set_children(cells);
+            nodes.push((grid_id, grid));
+            children.push(grid_id);
+        }
+        if let Some(marks) = &group.marks
+            && let Some(id) = stats_node_id(bar, 15)
+        {
+            let mut node = Node::new(Role::Status);
+            node.set_label(marks.clone());
+            nodes.push((id, node));
+            children.push(id);
+        }
+        let mut node = Node::new(Role::Group);
+        node.set_label(group.name);
+        node.set_description(group.sentence.clone());
+        if let Some(b) = stats.bounds {
+            node.set_bounds(b);
+        }
+        node.set_children(children);
+        nodes.push((group_id, node));
+        ids.push(group_id);
+    }
+    ids
+}
+
+/// Emit the open lens; return its group's id and the node that takes focus
+/// when the keyboard holds it (the focus well).
+fn push_stats_lens(nodes: &mut Vec<(NodeId, Node)>, lens: &StatsLens) -> (NodeId, NodeId) {
+    let (group_id, bar_id, focus_id) = (
+        NodeId(STATS_LENS),
+        NodeId(STATS_LENS + 1),
+        NodeId(STATS_LENS + 2),
+    );
+    let mut bar = Node::new(Role::Group);
+    bar.set_label(lens.bar);
+    bar.set_description(lens.bar_words.clone());
+    nodes.push((bar_id, bar));
+    let mut focus = Node::new(Role::Group);
+    focus.set_label(lens.focus);
+    focus.set_description(lens.focus_words.clone());
+    if lens.keyboard {
+        focus.add_action(Action::Focus);
+    }
+    nodes.push((focus_id, focus));
+    let mut group = Node::new(Role::Group);
+    group.set_label("System lens");
+    group.set_description(if lens.keyboard {
+        "Left and Right arrows choose the instrument, Up and Down the bar, Return keeps \
+         it open, Command-C copies the bar's sentence, Escape closes"
+    } else {
+        "Click to pin it; Escape or a click outside closes it"
+    });
+    if let Some(b) = lens.bounds {
+        group.set_bounds(b);
+    }
+    group.set_children(vec![bar_id, focus_id]);
+    nodes.push((group_id, group));
+    (group_id, focus_id)
+}
+
 /// Everything a frame publishes besides its plain visible grid: the tab strip, split
 /// panes, painted selection, find field, and chrome messages. `Default` describes an
 /// ordinary single-pane frame with nothing selected and no panel open.
@@ -725,6 +897,8 @@ pub(crate) struct GridFrame<'a> {
     pub(crate) chips: &'a [GridChip],
     /// The open Autopilot menu, while one is open.
     pub(crate) menu: Option<&'a GridMenu>,
+    /// The stats bars, while the window shows them (the Deck or the sill).
+    pub(crate) stats: Option<&'a GridStats>,
     /// The window's canonical title (`WindowState::current_title`), not necessarily the
     /// caption bar's string: `apply_title` suppresses the chrome write while the close
     /// warning or find status owns it.
@@ -1117,6 +1291,20 @@ pub(crate) fn grid_tree(
         root_children.push(TAB_LIST);
     }
 
+    // The stats bars, under the titlebar or in the bottom pad: named groups of meters
+    // whose values change in place (no live region: a reader asks, nothing announces).
+    let mut lens_focus = None;
+    if let Some(stats) = frame.stats {
+        root_children.extend(push_stats(&mut nodes, stats));
+        // The open lens over the grid: the keyboard lens holds the keys, so a
+        // reader lands in its focus well.
+        if let Some(lens) = &stats.lens {
+            let (id, focus) = push_stats_lens(&mut nodes, lens);
+            root_children.push(id);
+            lens_focus = lens.keyboard.then_some(focus);
+        }
+    }
+
     // The chrome messages, in painted order, between the strip and the grid, before the
     // terminal so a reader stepping into the window meets the interruption first.
     for message in ChromeMessage::ORDER
@@ -1182,6 +1370,8 @@ pub(crate) fn grid_tree(
         // The open menu holds the keys: its highlighted row, else the menu.
         (Some((id, row)), _, _) => row.unwrap_or(id),
         (None, true, _) => FIND,
+        // The keyboard lens holds the arrows: its focus well.
+        (None, false, _) if lens_focus.is_some() => lens_focus.unwrap_or(GRID),
         (None, false, Some(pane)) => pane,
         (None, false, None) => root_children.last().copied().unwrap_or(GRID),
     };
@@ -2142,7 +2332,7 @@ mod tests {
     }
 
     /// THE HARNESS'S CHIPS ARE BUTTONS IN WORDS (design §9.2.1): each drawn chip
-    /// (Autopilot, `⚙` and the Team chip) is one clickable `Role::Button` over its cells,
+    /// (Autopilot and the Team chip) is one clickable `Role::Button` over its cells,
     /// named with no symbol, the newest act its description and never a live region;
     /// their ids decode back to the chip and are refused by the tab and message decoders. NEGATIVE CONTROL: the words check
     /// refuses a glyph (`∞ cruise`), and a frame with no chip publishes no chip node.
@@ -2157,15 +2347,6 @@ mod tests {
                 description: Some("Last: approved at 14:05.".to_string()),
                 row: 2,
                 col: 4,
-                width: 1,
-            },
-            GridChip {
-                session: 4,
-                chip: HarnessChip::Settings,
-                label: "Harness settings".to_string(),
-                description: None,
-                row: 2,
-                col: 6,
                 width: 1,
             },
             GridChip {
@@ -2190,10 +2371,7 @@ mod tests {
             .iter()
             .map(|c| chip_node_id(c.session, c.chip).expect("an id"))
             .collect();
-        assert_eq!(
-            node(&update, ROOT).children(),
-            [ids[0], ids[1], ids[2], GRID]
-        );
+        assert_eq!(node(&update, ROOT).children(), [ids[0], ids[1], GRID]);
         for (chip, id) in chips.iter().zip(&ids) {
             let n = node(&update, *id);
             assert_eq!(n.role(), Role::Button);
@@ -2215,7 +2393,7 @@ mod tests {
             assert_eq!(tab_index_for(*id), None);
             assert_eq!(ChromeMessage::from_node(*id), None);
             // Autopilot's menu is announced and reachable without a pointer (design
-            // §9.3.3); `⚙` and Team have none (NEGATIVE CONTROL).
+            // §9.3.3); Team has none (NEGATIVE CONTROL).
             let menu = chip.chip == HarnessChip::Autopilot;
             assert_eq!(
                 n.has_popup(),

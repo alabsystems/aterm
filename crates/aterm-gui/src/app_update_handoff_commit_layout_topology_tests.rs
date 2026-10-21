@@ -34,6 +34,7 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
             root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                 sid: None,
                 lineage: None,
+                log_ep: None,
                 cwd: cwd.map(str::to_string),
                 title: title.to_string(),
                 profile: None,
@@ -46,6 +47,7 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
                 questions: None,
                 autopilot: None,
                 land_at: None,
+                autopilot_by: None,
                 identity: None,
                 theme: None,
                 agent: None,
@@ -170,6 +172,7 @@ fn a_real_topology_change_still_rejects_the_commit() {
         RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
             sid: None,
             lineage: None,
+            log_ep: None,
             cwd: Some("/work".to_string()),
             title: "zsh".to_string(),
             profile: None,
@@ -182,6 +185,7 @@ fn a_real_topology_change_still_rejects_the_commit() {
             questions: None,
             autopilot: None,
             land_at: None,
+            autopilot_by: None,
             identity: None,
             theme: None,
             agent: None,

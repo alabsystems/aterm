@@ -68,6 +68,17 @@ fn a_stat_line_gives_its_group_past_any_command_name() {
     assert_eq!(linux::stat_pgrp("77 sh S 1 76"), None, "no name");
 }
 
+/// A `children` text names each pid its space closes, so a text cut at the
+/// cap drops its torn last pid instead of naming a shorter one.
+/// NEGATIVE CONTROLS: the torn pid, an empty text and a word that is no pid.
+#[test]
+fn a_children_text_names_only_the_pids_its_spaces_close() {
+    assert_eq!(linux::children("812 9001 7 "), vec![812, 9001, 7]);
+    assert_eq!(linux::children("812 90"), vec![812], "the torn last pid");
+    assert_eq!(linux::children(""), Vec::<u32>::new());
+    assert_eq!(linux::children("812 x 7 "), vec![812, 7], "a word no pid");
+}
+
 #[cfg(unix)]
 #[test]
 fn the_auxiliary_vector_gives_the_page_size() {
@@ -270,6 +281,70 @@ fn only_a_complete_group_census_admits_its_leader() {
     assert!(!complete_lone_group(41, 8, &[41, -1, 0, 0]));
     assert!(!complete_lone_group(41, 8, &[41, 41, 0, 0]));
     assert!(!complete_lone_group(41, 4, &[]));
+}
+
+/// The members that read a group leader's own input device are the ones
+/// started in its group on that very device (as Claude Code starts
+/// `$EDITOR`: inherited stdio, no group of its own), and only those: a
+/// second open of the device is the same vnode, so it counts.
+/// NEGATIVE CONTROLS: members of the group on `/dev/null` (another device)
+/// and on a pipe, a process in a group of its own on the same device, a pid
+/// that leads no group, a leader whose input is a pipe, pid 0 and a pid that
+/// cannot exist.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_leaders_input_is_shared_only_by_members_on_that_very_device() {
+    use aterm_uds::spawnfd::{Child, Stdio, command};
+    /// A `sleep` killed (`SIGKILL`) and reaped by its own pid when the test
+    /// lets go of it, on a panic too: it is never left running, and its pid,
+    /// unreaped until then, cannot have been recycled.
+    struct Reaped(Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let zero = || std::fs::File::open("/dev/zero").expect("/dev/zero");
+    let sleep = |group: i32, input: Stdio| {
+        Reaped(
+            command("/bin/sleep")
+                .arg("30")
+                .process_group(group)
+                .stdin(input)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("sleep starts"),
+        )
+    };
+    let leader = sleep(0, zero().into());
+    let pgid = leader.0.id();
+    let group = i32::try_from(pgid).expect("a pid");
+    let handed = sleep(group, zero().into());
+    let _on_null = sleep(group, Stdio::null());
+    let _on_pipe = sleep(group, Stdio::piped());
+    let apart = sleep(0, zero().into());
+    let piped_leader = sleep(0, Stdio::piped());
+
+    assert_eq!(crate::stdin_sharers(pgid), Some(vec![handed.0.id()]));
+    assert_eq!(
+        crate::stdin_sharers(handed.0.id()),
+        None,
+        "a member leads no group"
+    );
+    assert_eq!(
+        crate::stdin_sharers(apart.0.id()),
+        Some(Vec::new()),
+        "alone in its group"
+    );
+    assert_eq!(
+        crate::stdin_sharers(piped_leader.0.id()),
+        None,
+        "a leader reading a pipe"
+    );
+    assert_eq!(crate::stdin_sharers(0), None);
+    assert_eq!(crate::stdin_sharers(u32::MAX), None);
 }
 
 /// The machine's facts read on this host: its physical memory and the
@@ -717,16 +792,20 @@ fn a_cpu_list_reads_its_ranges() {
     }
 }
 
-/// `/proc/meminfo` by page class: what maps is filled (wired is the four
-/// never-paged counters, file-backed the two file LRUs, app the anonymous
-/// pages, compressed and stored zswap's pool and contents), the rest zero.
-/// NEGATIVE CONTROL: no `MemFree` is no reading; a missing optional key is 0.
+/// `/proc/meminfo` in design §9.6's classes: app is the anonymous pages,
+/// shared the shared memory (never counted as cache), wired the kernel's
+/// slab, stacks and page tables, the cache `Cached − Shmem + Buffers`,
+/// compressed and stored zswap's pool and contents, and commit
+/// `Committed_AS` against `CommitLimit`, flagged a heuristic.
+/// NEGATIVE CONTROL: no `MemFree` is no reading; a missing optional class is
+/// `None` (never 0), a missing summed key adds nothing.
 #[test]
-fn meminfo_gives_the_page_classes_that_map() {
+fn meminfo_gives_the_classes_of_section_9_6() {
     const FULL: &str = "\
 MemTotal:       16318756 kB
 MemFree:          812344 kB
 MemAvailable:    4079689 kB
+Buffers:          204800 kB
 Cached:          3310000 kB
 SwapCached:        10000 kB
 Active:          9000000 kB
@@ -742,25 +821,68 @@ SwapFree:        1048576 kB
 Zswap:            100000 kB
 Zswapped:         300000 kB
 AnonPages:       8400000 kB
+Shmem:            500000 kB
+Slab:             400000 kB
+SReclaimable:     250000 kB
+SUnreclaim:       150000 kB
 KernelStack:       20000 kB
 PageTables:        60000 kB
-SUnreclaim:       150000 kB
+CommitLimit:    10256524 kB
+Committed_AS:   19000000 kB
 ";
     let k = |kib: u64| kib * 1024;
     let m = linux::memory_detail(FULL).expect("a meminfo");
     assert_eq!((m.total, m.free), (k(16_318_756), k(812_344)));
-    assert_eq!((m.active, m.inactive), (k(9_000_000), k(5_000_000)));
-    assert_eq!(m.wired, k(4_000 + 150_000 + 20_000 + 60_000));
-    assert_eq!((m.compressed, m.stored), (k(100_000), k(300_000)));
-    assert_eq!(m.file_backed, k(2_000_000 + 3_500_000));
     assert_eq!(m.app, k(8_400_000));
+    assert_eq!(m.shared, Some(k(500_000)));
+    // The slab the kernel can reclaim is cache, as `free(1)` counts it.
+    assert_eq!(m.wired, k(150_000 + 20_000 + 60_000));
+    assert_eq!(m.file_backed, k(3_310_000 - 500_000 + 204_800 + 250_000));
+    assert_eq!(
+        (m.active, m.inactive),
+        (Some(k(9_000_000)), Some(k(5_000_000)))
+    );
+    assert_eq!(
+        (m.compressed, m.stored),
+        (Some(k(100_000)), Some(k(300_000)))
+    );
     assert_eq!(
         (m.swap_used, m.swap_total),
         (k(2_097_148 - 1_048_576), k(2_097_148))
     );
-    assert_eq!((m.speculative, m.purgeable, m.pressure), (0, 0, None));
+    assert_eq!(
+        m.commit,
+        Some(Commit {
+            charge: k(19_000_000),
+            limit: k(10_256_524),
+            exact: false
+        }),
+        "overcommit: the charge passes an advisory limit"
+    );
+    assert_eq!(m.commit.and_then(|c| c.permille()), Some(1852));
+    assert_eq!((m.speculative, m.purgeable, m.pressure), (None, None, None));
+    assert!(!m.exact, "Linux leaves a remainder no class names");
+
     let old = linux::memory_detail(MEMINFO).expect("the short fixture");
-    assert_eq!((old.compressed, old.app), (0, 0), "missing keys read 0");
+    assert_eq!((old.compressed, old.shared, old.commit), (None, None, None));
+    assert_eq!(old.app, 0, "a summed key that is missing adds nothing");
+    assert_eq!(
+        old.file_backed,
+        k(3_310_000 + 204_800),
+        "no Shmem: nothing taken out"
+    );
+    // No `Slab`: its two halves, split the same way.
+    let halves = "MemTotal: 100 kB\nMemFree: 10 kB\nSReclaimable: 3 kB\nSUnreclaim: 4 kB\n";
+    assert_eq!(
+        linux::memory_detail(halves).map(|m| (m.wired, m.file_backed)),
+        Some((k(4), k(3)))
+    );
+    // A kernel too old to split its slab: all of it is the kernel's.
+    let whole = "MemTotal: 100 kB\nMemFree: 10 kB\nSlab: 9 kB\n";
+    assert_eq!(
+        linux::memory_detail(whole).map(|m| (m.wired, m.file_backed)),
+        Some((k(9), 0))
+    );
     assert_eq!(linux::memory_detail("MemTotal: 10 kB\n"), None);
 }
 
@@ -954,12 +1076,18 @@ fn memory_by_page_class_is_counted_from_one_read() {
         Some(MemoryLevel::Normal),
     );
     assert_eq!(m.free, 17_000 * page);
-    assert_eq!(m.speculative, 3_000 * page);
+    assert_eq!(m.speculative, Some(3_000 * page));
     assert_eq!(m.app, 920_000 * page);
-    assert_eq!(m.stored, 317_850 * page);
+    assert_eq!(m.stored, Some(317_850 * page));
     assert_eq!(
         (m.wired, m.compressed, m.file_backed),
-        (173_670 * page, 138_281 * page, 783_000 * page)
+        (173_670 * page, Some(138_281 * page), 783_000 * page)
+    );
+    assert!(m.exact, "macOS's classes partition physical memory");
+    assert_eq!(
+        (m.shared, m.commit),
+        (None, None),
+        "no such classes on macOS"
     );
     assert_eq!(
         (m.swap_used, m.swap_total, m.pressure),
@@ -977,7 +1105,7 @@ fn memory_by_page_class_is_counted_from_one_read() {
     assert_eq!((m.free, m.app), (0, 0), "differences stop at zero");
     assert_eq!(
         m.stored,
-        u64::MAX,
+        Some(u64::MAX),
         "products saturate, stored is not clamped"
     );
     assert_eq!((m.swap_used, m.swap_total), (0, 0), "no swap reading");
@@ -1122,14 +1250,15 @@ fn memory_by_page_class_reads_on_this_host_and_adds_up() {
     let m = crate::memory_detail().expect("HOST_VM_INFO64");
     let total = m.total;
     assert!(total >= 4 << 30, "{m:?}");
+    let class = |c: Option<u64>| c.expect("every class reads on macOS");
     for class in [
         m.free,
-        m.speculative,
-        m.active,
-        m.inactive,
+        class(m.speculative),
+        class(m.active),
+        class(m.inactive),
         m.wired,
-        m.compressed,
-        m.purgeable,
+        class(m.compressed),
+        class(m.purgeable),
         m.file_backed,
         m.app,
     ] {
@@ -1137,11 +1266,11 @@ fn memory_by_page_class_reads_on_this_host_and_adds_up() {
     }
     let sum = [
         m.wired,
-        m.active,
-        m.inactive,
-        m.speculative,
+        class(m.active),
+        class(m.inactive),
+        class(m.speculative),
         m.free,
-        m.compressed,
+        class(m.compressed),
     ]
     .iter()
     .fold(0u64, |a, b| a.saturating_add(*b));
@@ -1189,4 +1318,425 @@ fn the_root_volume_reads_on_this_host() {
         None
     );
     assert_eq!(crate::volume(Path::new("/\0")), None);
+}
+
+/// A QUIET GUARD CANNOT LEAVE ITS THREAD ([`QuietErrors`]; the 8.3 branch's
+/// review, rev4-3: it was `Send`): the mode it sets and restores is its own
+/// thread's, so one moved to another thread and dropped there would leave
+/// its own thread quiet for good and hand the other a mode that was never
+/// its own. The proof is that this test compiles — the `assert_not_impl_any`
+/// technique (`aterm-grid`'s `security_regression_5573`): every type answers
+/// [`OnItsThread`] through `()`, a `Send` one through `IsSend` too and a
+/// `Sync` one through `IsSync`, so for a guard that is either the call below
+/// has more than one answer and is ambiguous (E0283). Checked on every
+/// platform: the guard's type is one everywhere.
+#[test]
+fn a_quiet_guard_cannot_leave_its_thread() {
+    /// Answered through `()` by every type, and through a marker by a type
+    /// that is `Send` or `Sync`.
+    trait OnItsThread<A> {}
+    impl<T> OnItsThread<()> for T {}
+    /// The answer of a `Send` type.
+    struct IsSend;
+    impl<T: Send> OnItsThread<IsSend> for T {}
+    /// The answer of a `Sync` type.
+    struct IsSync;
+    impl<T: Sync> OnItsThread<IsSync> for T {}
+    fn on_its_thread<T: OnItsThread<A>, A>() {}
+    on_its_thread::<QuietErrors, _>();
+}
+
+// ---------------------------------------------------------------------------
+// Network links, the process table's ceilings and the load average.
+// ---------------------------------------------------------------------------
+
+/// A link that is up and running, named `name`, with `physical` as given.
+fn link(name: &str, physical: Option<bool>) -> LinkReading {
+    LinkReading {
+        name: name.to_owned(),
+        up: true,
+        physical,
+        ..LinkReading::default()
+    }
+}
+
+/// The machine's own links: on macOS (no device fact) the up, running
+/// `en*` and `pdp_ip*` links; on Linux (a device fact) the up, running
+/// links a device backs. NEGATIVE CONTROLS: every tunnel, bridge,
+/// peer-to-peer radio and virtual prefix, a loopback, a link that is not
+/// running, and a Linux link with no device, whatever its name.
+#[test]
+fn only_the_machines_own_links_count_toward_its_traffic() {
+    for name in ["en0", "en7", "pdp_ip0", "pdp_ip3"] {
+        assert!(counts_toward_machine(&link(name, None)), "{name}");
+    }
+    for name in [
+        "lo0", "utun4", "ipsec0", "ppp0", "gif0", "stf0", "bridge0", "awdl0", "llw0", "nan0",
+        "ap1", "anpi0", "vmenet0", "fw0", "XHC20", "",
+    ] {
+        assert!(!counts_toward_machine(&link(name, None)), "{name}");
+    }
+    for name in ["eth0", "enp3s0", "wlan0", "wlp2s0", "wwan0"] {
+        assert!(counts_toward_machine(&link(name, Some(true))), "{name}");
+        assert!(!counts_toward_machine(&link(name, Some(false))), "{name}");
+    }
+    for name in ["docker0", "veth12ab", "br-1f2e", "tun0", "wg0", "lo"] {
+        assert!(!counts_toward_machine(&link(name, Some(false))), "{name}");
+    }
+    assert!(
+        !counts_toward_machine(&link("bridge0", Some(true))),
+        "a prefix outranks a device"
+    );
+    let mut loopback = link("en9", None);
+    loopback.loopback = true;
+    assert!(!counts_toward_machine(&loopback));
+    let mut down = link("en0", None);
+    down.up = false;
+    assert!(!counts_toward_machine(&down));
+}
+
+/// A link's kind by name, where the OS does not class it.
+#[test]
+fn a_links_name_gives_its_kind_where_the_os_classes_none() {
+    for (name, kind) in [
+        ("pdp_ip0", LinkKind::Cellular),
+        ("wwan0", LinkKind::Cellular),
+        ("rmnet_data0", LinkKind::Cellular),
+        ("wlan0", LinkKind::Wifi),
+        ("wlp2s0", LinkKind::Wifi),
+        ("en0", LinkKind::Wired),
+        ("enp3s0", LinkKind::Wired),
+        ("eth1", LinkKind::Wired),
+        ("utun0", LinkKind::Other),
+        ("lo0", LinkKind::Other),
+        ("", LinkKind::Other),
+    ] {
+        assert_eq!(machine::kind_by_name(name), kind, "{name}");
+    }
+    assert_eq!(LinkKind::Wifi.as_str(), "wifi");
+    assert_eq!(LinkKind::default(), LinkKind::Other);
+}
+
+const NET_DEV: &str = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 4045398   40310    0    0    0     0          0         0  4045398   40310    0    0    0     0       0          0
+  eth0: 98765432101 1234567 3 4 0 0 0 99 12345678901 765432 5 6 0 0 0 0
+wlan0:7 8 9 10 0 0 0 0 11 12 13 14 0 0 0 0
+ bad0: 1 2 3
+ bad1: 1 2 3 4 5 6 7 8 9 10 11 x 13 14 15 16
+  ../x: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+  torn: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16";
+
+/// `/proc/net/dev`: each interface's received and sent counters, the header
+/// lines skipped, a name with no space after its colon read. NEGATIVE
+/// CONTROLS: a short line, a counter that does not parse, a name with `/`
+/// and a torn last line are left out.
+#[test]
+fn proc_net_dev_gives_each_interfaces_counters() {
+    let rows = linux::net_dev(NET_DEV);
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["lo", "eth0", "wlan0"]);
+    let eth = &rows[1];
+    assert_eq!(
+        eth.rx,
+        LinkCounters {
+            bytes: 98_765_432_101,
+            packets: 1_234_567,
+            errors: 3,
+            drops: 4
+        }
+    );
+    assert_eq!(
+        eth.tx,
+        LinkCounters {
+            bytes: 12_345_678_901,
+            packets: 765_432,
+            errors: 5,
+            drops: 6
+        }
+    );
+    assert_eq!((rows[2].rx.bytes, rows[2].tx.drops), (7, 14));
+    assert!(linux::net_dev("").is_empty());
+}
+
+/// sysfs's link facts: hex flags, up only with `IFF_UP` and an `operstate`
+/// of `up` or `unknown`, a speed in Mb/s as bits per second, and the kind
+/// from `wireless`, the name and `device`. NEGATIVE CONTROLS: a speed of
+/// `-1` or `0`, garbage, a link administratively down, an `operstate` of
+/// `down` or `dormant`.
+#[test]
+fn sysfs_link_facts_read_flags_state_speed_and_kind() {
+    assert_eq!(linux::hex_flags("0x1003\n"), Some(0x1003));
+    assert_eq!(linux::hex_flags("9"), Some(9));
+    assert_eq!(linux::hex_flags("0xZZ"), None);
+    assert!(linux::link_up(0x1003, "up\n"));
+    assert!(linux::link_up(0x9, "unknown\n"), "the loopback");
+    assert!(!linux::link_up(0x1002, "up"), "administratively down");
+    assert!(!linux::link_up(0x1003, "down"));
+    assert!(!linux::link_up(0x1003, "dormant"));
+    assert_eq!(linux::speed_bps("1000\n"), Some(1_000_000_000));
+    assert_eq!(linux::speed_bps("25000"), Some(25_000_000_000));
+    for bad in ["-1", "0", "", "fast"] {
+        assert_eq!(linux::speed_bps(bad), None, "{bad:?}");
+    }
+    assert_eq!(linux::sys_kind("wlan0", true, true), LinkKind::Wifi);
+    assert_eq!(linux::sys_kind("wwan0", false, true), LinkKind::Cellular);
+    assert_eq!(linux::sys_kind("enp3s0", false, true), LinkKind::Wired);
+    assert_eq!(linux::sys_kind("docker0", false, false), LinkKind::Other);
+    // A refused name is other whatever sysfs says, as on macOS.
+    assert_eq!(linux::sys_kind("ap0", true, true), LinkKind::Other);
+    assert_eq!(linux::sys_kind("bridge0", false, true), LinkKind::Other);
+}
+
+/// The Linux link reader on a fixture root: each `/proc/net/dev` row joined
+/// to its sysfs facts, a link with no sysfs directory read as not up with
+/// no device. Only the physical, running links count toward the machine.
+/// NEGATIVE CONTROL: a root with no `proc/net/dev`.
+#[test]
+fn the_link_reader_reads_a_fixture_root() {
+    let root = aterm_tempfile::tempdir().expect("scratch root");
+    let r = root.path();
+    std::fs::create_dir_all(r.join("proc/net")).unwrap();
+    std::fs::write(
+        r.join("proc/net/dev"),
+        "Inter-|\n face |\n\
+         \x20   lo: 10 1 0 0 0 0 0 0 10 1 0 0 0 0 0 0\n\
+         \x20 eth0: 500 5 1 2 0 0 0 0 300 3 0 1 0 0 0 0\n\
+         \x20wlan0: 70 7 0 0 0 0 0 0 80 8 0 0 0 0 0 0\n\
+         docker0: 9 9 0 0 0 0 0 0 9 9 0 0 0 0 0 0\n\
+         \x20 gone: 1 1 0 0 0 0 0 0 1 1 0 0 0 0 0 0\n",
+    )
+    .unwrap();
+    let sys = |name: &str, files: &[(&str, &str)], dirs: &[&str]| {
+        let dir = r.join("sys/class/net").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, text) in files {
+            std::fs::write(dir.join(file), text).unwrap();
+        }
+        for sub in dirs {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+    };
+    sys(
+        "lo",
+        &[
+            ("ifindex", "1\n"),
+            ("flags", "0x9\n"),
+            ("operstate", "unknown\n"),
+        ],
+        &[],
+    );
+    sys(
+        "eth0",
+        &[
+            ("ifindex", "2\n"),
+            ("flags", "0x1003\n"),
+            ("operstate", "up\n"),
+            ("speed", "1000\n"),
+        ],
+        &["device"],
+    );
+    sys(
+        "wlan0",
+        &[
+            ("ifindex", "3\n"),
+            ("flags", "0x1003\n"),
+            ("operstate", "up\n"),
+            ("speed", "-1\n"),
+        ],
+        &["device", "wireless"],
+    );
+    sys(
+        "docker0",
+        &[
+            ("ifindex", "4\n"),
+            ("flags", "0x1003\n"),
+            ("operstate", "up\n"),
+        ],
+        &[],
+    );
+    let links = linux::links_under(r).expect("the fixture");
+    let names: Vec<&str> = links.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["lo", "eth0", "wlan0", "docker0", "gone"]);
+
+    let lo = &links[0];
+    assert!(lo.up && lo.loopback && lo.physical == Some(false), "{lo:?}");
+    let eth = &links[1];
+    assert_eq!((eth.index, eth.kind), (2, LinkKind::Wired), "{eth:?}");
+    assert_eq!(eth.rate_bps, Some(1_000_000_000));
+    assert_eq!((eth.rx.bytes, eth.rx.errors, eth.tx.drops), (500, 1, 1));
+    let wlan = &links[2];
+    assert_eq!(
+        (wlan.kind, wlan.rate_bps),
+        (LinkKind::Wifi, None),
+        "{wlan:?}"
+    );
+    let docker = &links[3];
+    assert_eq!(
+        (docker.kind, docker.physical),
+        (LinkKind::Other, Some(false))
+    );
+    let gone = &links[4];
+    assert!(
+        !gone.up && gone.index == 0 && gone.physical == Some(false),
+        "{gone:?}"
+    );
+
+    let counted: Vec<&str> = links
+        .iter()
+        .filter(|l| counts_toward_machine(l))
+        .map(|l| l.name.as_str())
+        .collect();
+    assert_eq!(counted, ["eth0", "wlan0"]);
+
+    let empty = aterm_tempfile::tempdir().expect("scratch root");
+    assert_eq!(linux::links_under(empty.path()), None);
+}
+
+/// Two ceilings: the smaller of the known; an unlimited soft limit is no
+/// ceiling. Run on every host (the helpers are compiled for tests
+/// everywhere, as `volume_of` is).
+#[test]
+fn the_smaller_known_ceiling_wins_and_infinity_is_none() {
+    assert_eq!(machine::smaller(Some(10_666), Some(4_000)), Some(4_000));
+    assert_eq!(machine::smaller(Some(10_666), None), Some(10_666));
+    assert_eq!(machine::smaller(None, Some(7)), Some(7));
+    assert_eq!(machine::smaller(None, None), None);
+    assert_eq!(machine::rlimit_ceiling(10_666, u64::MAX), Some(10_666));
+    assert_eq!(machine::rlimit_ceiling(u64::MAX, u64::MAX), None);
+}
+
+/// Live: the process table's ceilings on this host. The machine's is known
+/// and positive; one user's, where known, is no larger (macOS clamps
+/// `kern.maxprocperuid` to `kern.maxproc`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_process_tables_ceilings_read_on_this_host() {
+    let l = crate::process_limits();
+    let system = l.system.expect("the machine's ceiling");
+    assert!(system > 0, "{l:?}");
+    if cfg!(target_os = "macos") {
+        let per_user = l.per_user.expect("one user's ceiling");
+        assert!(per_user <= system, "{l:?}");
+    }
+}
+
+/// Live: three load averages, each finite and non-negative.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_load_average_reads_on_this_host() {
+    let load = crate::load_average().expect("three load averages");
+    assert!(load.iter().all(|l| l.is_finite() && *l >= 0.0), "{load:?}");
+}
+
+/// Live: this Mac's interfaces. Each has a name and a distinct index; the
+/// loopback `lo0` is up, a loopback, and not the machine's traffic; every
+/// link the machine filter refuses by name (a tunnel, a bridge, a
+/// peer-to-peer or coprocessor link) reads other, whatever its functional
+/// type.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_network_links_read_a_structurally_valid_snapshot_on_this_host() {
+    let first = crate::net_links().expect("the interface list");
+    assert!(!first.is_empty());
+    let mut indexes: Vec<u32> = first.iter().map(|l| l.index).collect();
+    indexes.sort_unstable();
+    indexes.dedup();
+    assert_eq!(indexes.len(), first.len(), "{first:?}");
+    assert!(
+        first.iter().all(|l| !l.name.is_empty() && l.index > 0),
+        "{first:?}"
+    );
+    let lo = first.iter().find(|l| l.name == "lo0").expect("lo0");
+    assert!(lo.up && lo.loopback && !counts_toward_machine(lo), "{lo:?}");
+    for l in first
+        .iter()
+        .filter(|l| machine::never_the_machines(&l.name))
+    {
+        assert_eq!(l.kind, LinkKind::Other, "{l:?}");
+    }
+}
+
+/// The capability words agents read (`aterm ctl sys caps`): one word per
+/// answer, and the reason when unavailable. A NEGATIVE CONTROL: a platform
+/// with no arm says so on every row.
+#[test]
+fn capability_words_are_one_word_each() {
+    use crate::{Cap, CapSource, Caps, Why};
+    for (cap, word) in [
+        (Cap::Yes, "yes"),
+        (Cap::Estimate, "estimate"),
+        (Cap::No(Why::Unsupported), "unavailable(unsupported)"),
+        (Cap::No(Why::NotRead), "unavailable(not_read)"),
+        (
+            Cap::No(Why::NotEnabled("psi")),
+            "unavailable(not_enabled:psi)",
+        ),
+        (
+            Cap::No(Why::NeedsPrivilege("root")),
+            "unavailable(needs_privilege:root)",
+        ),
+        (Cap::No(Why::Asleep), "unavailable(asleep)"),
+        (Cap::No(Why::Absent), "unavailable(absent)"),
+    ] {
+        assert_eq!(cap.to_string(), word);
+        assert!(!word.contains(' '), "{word}");
+    }
+    assert_eq!(CapSource::default(), CapSource::Host);
+    assert_eq!(CapSource::CgroupLimit.word(), "cgroup_limit");
+    let rows = Caps::unsupported("plan9").rows();
+    assert_eq!(rows[0], ("os", "plan9".to_owned()));
+    assert_eq!(rows.last(), Some(&("capacity", "host".to_owned())));
+    for (name, word) in &rows[1..rows.len() - 1] {
+        assert_eq!(word, "unavailable(unsupported)", "{name}");
+    }
+}
+
+/// This host's own report names its OS and answers every row.
+#[test]
+fn this_hosts_capability_report_names_its_os() {
+    let rows = crate::caps().rows();
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "other"
+    };
+    assert_eq!(rows[0], ("os", os.to_owned()));
+    for (name, word) in &rows {
+        assert!(!word.is_empty() && !word.contains(' '), "{name}={word}");
+    }
+}
+
+/// Level names by count, and clusters by rank, fastest first. NEGATIVE
+/// CONTROLS: no ids is no layout; one rank is one `"CPU"` cluster.
+#[test]
+fn levels_are_named_by_count_and_ranked_fastest_first() {
+    assert!(crate::level_names(0).is_empty());
+    assert_eq!(crate::level_names(1), ["CPU"]);
+    assert_eq!(crate::level_names(2), ["Performance", "Efficiency"]);
+    assert_eq!(crate::level_names(3), ["Performance", "Mid", "Efficiency"]);
+    assert_eq!(
+        crate::level_names(5),
+        ["Performance", "Mid 1", "Mid 2", "Mid 3", "Efficiency"]
+    );
+    let layout =
+        crate::layout_by_rank(&[(3, 0), (0, 2), (2, 0), (1, 2), (1, 2)]).expect("a layout");
+    let got: Vec<(&str, &[u16])> = layout
+        .clusters
+        .iter()
+        .map(|c| (c.name.as_str(), c.logical.as_slice()))
+        .collect();
+    assert_eq!(
+        got,
+        [("Performance", &[0, 1][..]), ("Efficiency", &[2, 3][..])]
+    );
+    assert_eq!(crate::layout_by_rank(&[]), None);
+    let one = crate::layout_by_rank(&[(0, 5), (1, 5)]).expect("a layout");
+    assert_eq!(one.clusters.len(), 1);
+    assert_eq!(one.clusters[0].name, "CPU");
 }

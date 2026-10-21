@@ -33,6 +33,8 @@ use crate::platform_impl::wayland::wire::Inbox;
 pub(crate) mod data_device;
 mod keyboard;
 mod pointer;
+#[cfg(all(test, target_os = "linux"))]
+mod retire_tests;
 mod text_input;
 mod touch;
 
@@ -141,6 +143,23 @@ pub(crate) enum Retired {
     TextInput(Arc<TextInput>),
 }
 
+/// The negative control of `retire_tests`: cleared, a pointer or text input whose capability
+/// went is let go at once, as before LW.7's fix (the object then dies with its last holder,
+/// on that holder's thread).
+#[cfg(test)]
+pub(crate) static RETIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Keep `retired` on the loop's `list` until [`WinitState::reap_retired`] finds its reference
+/// the last.
+fn retire(list: &mut Vec<Retired>, retired: Retired) {
+    #[cfg(test)]
+    if !RETIRE.load(std::sync::atomic::Ordering::SeqCst) {
+        drop(retired);
+        return;
+    }
+    list.push(retired);
+}
+
 /// One `wl_seat.capability` bit, in the order sctk 0.19.2 handled them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeatCapability {
@@ -181,7 +200,7 @@ impl WinitState {
             // capability's are.
             if let Some(mut seat_state) = self.seats.remove(&seat) {
                 if let Some((text_input, _)) = seat_state.text_input.take() {
-                    self.retired.push(Retired::TextInput(text_input));
+                    retire(&mut self.retired, Retired::TextInput(text_input));
                 }
                 if let Some(pointer) = seat_state.pointer.take() {
                     self.retire_pointer(pointer);
@@ -309,7 +328,7 @@ impl WinitState {
         // The text input goes with any capability (a window keeps only a weak reference; it is
         // destroyed on this thread once no window holds it).
         if let Some((text_input, _)) = seat_state.text_input.take() {
-            self.retired.push(Retired::TextInput(text_input));
+            retire(&mut self.retired, Retired::TextInput(text_input));
         }
 
         match capability {
@@ -336,7 +355,7 @@ impl WinitState {
     fn retire_pointer(&mut self, pointer: Arc<WinitPointer>) {
         let _ = self.pointer_surfaces.remove(&pointer.surface_id());
         let _ = self.surface_scales.remove(&pointer.surface_id());
-        self.retired.push(Retired::Pointer(pointer));
+        retire(&mut self.retired, Retired::Pointer(pointer));
     }
 
     /// Destroy the retired objects no window holds any more (between dispatches, on the loop's

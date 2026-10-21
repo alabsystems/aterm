@@ -358,6 +358,17 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn can_restart(&self) -> bool {
         false
     }
+    /// THE OWNER'S `[harness] relaunch = false` IS WHAT KEEPS THIS HOST FROM
+    /// RELAUNCHING THE AGENT: with it on, [`Self::can_restart`] would hold. A
+    /// host that reads the key live masks it out of the loop's config (an
+    /// edit of it restarts no worker), so the policy reads it here where a
+    /// notice names the line that lets the tab switch, or why it cannot
+    /// ([`super::super::policy::turn_end::TurnEndReading::relaunch_off`]).
+    /// Asked only there: a usage limit whose roster word is read, and a
+    /// renewed login. The default: `false`.
+    fn relaunch_off(&self) -> bool {
+        false
+    }
     /// Whether the explicit `restart` would be CARRIED for the agent now: the
     /// host's one predicate for every word of a stall (aterm's
     /// `restart_act::offered`: a snapshot whose relaunch brings back what the
@@ -437,42 +448,22 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn taskless(&self) -> bool {
         false
     }
-    /// WHETHER THE CONVERSATION'S OWN RECORD SAYS ITS TASK IS FINISHED, by the
+    /// WHETHER THE CONVERSATION'S OWN RECORD SAYS ITS TASK LANDED, by the
     /// host's evidence (`crate::harness::upgrade::FinishedScan`): `Some(true)`
-    /// where the worker ended it (`ATERM-TASK-DONE`, or a done reply to the
-    /// done check) and no prompt of a person's or an orchestrator's has come
-    /// since — Claude Code's own wakes (a background task's notification,
-    /// its usage-limit continuation) and the harness's own turns being none;
-    /// `Some(false)` where it says otherwise. Read at every point a turn ran
-    /// and at a new loop's first point
-    /// ([`TurnEndReading::finished_record`]); the turn-end policy types
-    /// nothing into a finished task, whatever the screen's last words are.
-    /// The default reads no record (`None`): the screen decides.
+    /// where the worker answered one of Autopilot Land's acts with a clean
+    /// `Nothing left:` defense and no prompt of a person's or an
+    /// orchestrator's has come since — Claude Code's own wakes (a background
+    /// task's notification, its usage-limit continuation) and the harness's
+    /// own turns being none; `Some(false)` where it says otherwise. Never the
+    /// retired token, never a done reply to a check (FOREVER CRUISE / FOREVER
+    /// LAND). Read at every point a turn ran and at a new loop's first point
+    /// ([`TurnEndReading::finished_record`]): the turn-end policy ends nothing
+    /// on it (its own reading lands a task), while the loop keys a person's
+    /// left exchange by the turn this read reaches ([`Self::last_turn`]) and
+    /// probes the repository where it says landed. The default reads no
+    /// record (`None`): the screen decides.
     fn finished(&self) -> Option<bool> {
         None
-    }
-    /// WHAT THE DONE CHECK'S CLOSED ANSWER SAYS BY THE RECORD
-    /// (`crate::harness::upgrade::FinishedScan::check_answer`), as the read
-    /// [`Self::finished`] just made left it: `Some(false)` where the turn the
-    /// conversation ends on is the done check's, closed (`turn_duration`), and
-    /// its last words are no done word of the worker's own — the record keeps
-    /// inline code and fenced blocks, which the screen draws with no ticks and
-    /// no fences, so a tool's quoted `Build completed successfully` is no done
-    /// word there ([`TurnEndReading::check_record`], the review's RR4-TE-1).
-    /// The default reads no record (`None`): the screen decides.
-    fn check_answer(&self) -> Option<bool> {
-        None
-    }
-    /// WHETHER THE FINISH THE RECORD SAYS ([`Self::finished`]) IS A DONE
-    /// REPLY IN WORDS TO THE DONE CHECK, not the worker's `ATERM-TASK-DONE`
-    /// (`crate::harness::upgrade::FinishedScan::finished_at_check`), as the
-    /// read [`Self::finished`] just made left it
-    /// ([`TurnEndReading::finished_at_check`]): the task ends the same, and
-    /// the journal says the check's rule, never that the worker reported the
-    /// token (F2 of the live lab of 2026-10-16). The default: `false`, a
-    /// finish read as the token's.
-    fn finished_at_check(&self) -> bool {
-        false
     }
     /// THE TURN THE CONVERSATION ENDS ON, by every key that names it
     /// (`crate::harness::upgrade::FinishedScan::last_turn`: its last row's
@@ -655,9 +646,9 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
 
     /// THE TASK'S FACE AT A LOOP'S START, RESTATED FROM THE JOURNAL
-    /// (§9.4.8, §10.2.7): a landing or a done a loop before this one read,
-    /// seeded and told again, with `noted_ms` — the wall time (unix ms) the
-    /// journal noted that end at — so a window that holds no face of the
+    /// (§9.4.8, §10.2.7): a landing a loop before this one landed, seeded
+    /// and told again, with `noted_ms` — the wall time (unix ms) the journal
+    /// noted that landing at — so a window that holds no face of the
     /// session (a seamless update's new one) shows the time the work ended,
     /// not the start's. Reporting only, as [`Self::task_face`]; the default
     /// tells the face alone.
@@ -759,14 +750,34 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// have not changed (30) — a fault of aterm's own reading, not a wait.
     /// [`StallSeen::OwnWork`]: agy's or Muse Code's own background work, which
     /// their reader names, has run 90 minutes under words that stood still —
-    /// no title read and no screen unread, work that has not ended. Either
-    /// way the host keeps a record and a log line in the witness's words. The
-    /// third rung (three hours; an hour for a dialog) is an [`Exception`] of
+    /// no title read and no screen unread, work that has not ended.
+    /// [`StallSeen::NoProgress`]: a background call of the agent's own that
+    /// the host's jobs reading says has made no progress
+    /// ([`Self::background_jobs`]), told at once, with its pid and quiet age.
+    /// Each way the host keeps a record and a log line in the witness's words. The
+    /// third rung (three hours; an hour for a dialog; one unit past this one for
+    /// a call that made no progress) is an [`Exception`] of
     /// `ExceptionKind::Stalled` or `ExceptionKind::Dialog` through
     /// [`Self::exception`]. Nothing is typed either way. The default ignores
     /// it: the journal's `STALLED` line says it anyway.
     fn stall_unread(&self, stall: Option<StallSeen>) {
         let _ = stall;
+    }
+
+    /// WHAT THE KERNEL SAYS OF THE AGENT'S OWN BACKGROUND WORK, for the stall
+    /// canary ([`super::super::wall_memory`]; system awareness §14.5, the
+    /// hung-call design's R1): asked while the screen reads busy on that work
+    /// alone and a rung of the canary could be due, never otherwise.
+    /// [`crate::supervise::background::BackgroundEvidence::NoProgress`]: a
+    /// live background call of THIS session's agent that the host's jobs
+    /// reading says has made no progress (the one quiet longest), and the
+    /// canary climbs to `STALLED` at once naming it, then raises its exception
+    /// one unit later if it still stands. A host answers
+    /// [`crate::supervise::background::BackgroundEvidence::Unknown`] when its
+    /// reading is absent or stale, or names nothing of this session's. The
+    /// default reads nothing: today's ladder, in today's words.
+    fn background_jobs(&self) -> crate::supervise::background::BackgroundEvidence {
+        crate::supervise::background::BackgroundEvidence::Unknown
     }
 
     /// WHAT THE AGENT'S OWN SCREEN SAYS OF ITS ACCOUNT'S USAGE ([`UsageSeen`]:
@@ -879,7 +890,8 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// ([`super::super::policy::turn_end::TurnEndReading::login_superseded`]): its
     /// renewable row ([`Self::login_label`]) is bound to the renewed login,
     /// and the process is still on the one before it. Asked only at a lost
-    /// login on the screen of a session on a renewable login: at every
+    /// login on the screen of a session on a renewable login (its row, or the
+    /// `/login` dialog or `Login interrupted` of the loss the loop tracks): at every
     /// reading of such a point (a decision's, and each read for the loop's
     /// books after its act or restart), and, while a point decided on
     /// `false` stands, once each time [`Self::account_stamp`] moves (a
@@ -915,6 +927,20 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// WHAT THE ROSTER SAYS OF THE SESSION'S LOGIN
+    /// ([`super::super::policy::turn_end::RosterWord`]): whether its process
+    /// runs on a roster row's login, and which other row a sign-in by name
+    /// would make ready — or that the roster or the accounts' state could not
+    /// be read. Asked once a decision, only where the usage limit's notice
+    /// reads it — its weekly row on the screen, or a `/login` left at a usage
+    /// limit ([`super::super::policy::turn_end::TurnEndState::reads_roster`],
+    /// [`super::super::policy::turn_end::TurnEndReading::roster`]) — for the
+    /// owner's notice there; a host may read its roster and state file here.
+    /// `None` (the default): no roster is kept, told as no row's.
+    fn roster_word(&self) -> Option<super::super::policy::turn_end::RosterWord> {
+        None
+    }
+
     /// TAKE THE LOGIN'S ONE SIGN-IN, as the loop is about to type `/login`
     /// into this session's lost login: `Ok` — this tab's `/login` is the
     /// login's; `Err(by)` — tab `by` took it first, and nothing is typed (the
@@ -932,7 +958,10 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// point (`Login successful`, the worker's work past it, its turn
     /// delivered again and answered), told once a loss. A host hands the news
     /// to every tab that waited on this login's sign-in
-    /// ([`Self::login_shared`]). The default ignores it.
+    /// ([`Self::login_shared`]), and a roster row recorded signed out whose
+    /// own login this is may be `ok` again here — the loop's one word that a
+    /// lost login came back; a plain turn end is none (`Login interrupted`
+    /// reads as one). The default ignores it.
     fn login_back(&self) {}
 
     /// CLAUDE CODE SAID THE STORED LOGIN ENDS IN `days` DAYS
@@ -1028,7 +1057,12 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// vendor's ONE answer line from the transcript — never the screen — and
     /// records it for the claim it holds: [`ResetOutcome::Pending`] while no
     /// line is written yet (asked again, the last time with `end.last`), else
-    /// what the line says. Only `Limits reset · …` is a reset spent.
+    /// what the line says. Only a kind's spent line is a reset spent, read by
+    /// its head (`aterm_phase::ResetLine::Spent`: `Weekly limits reset · …`,
+    /// `Session limit reset · … · 1 five-hour reset left`, `Limits reset ·
+    /// …`), with its kind and, where the line draws it whole, that kind's
+    /// count; a spend whose line says the wall still
+    /// stands (`aterm_phase::ResetLine::Walled`) is [`ResetOutcome::Walled`].
     ///
     /// The default reads nothing ([`ResetOutcome::Unread`]): the loop then
     /// owes the session one continuation, as after any reset that was kept.

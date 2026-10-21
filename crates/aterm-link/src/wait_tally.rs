@@ -3,15 +3,18 @@
 
 //! THE BROKER-WAIT TALLY: how long the bridge's one loop spends blocked on the
 //! broker's replies, counted where it blocks — a development seam the fabric
-//! bench's ping-pong arm reads (`crates/aterm/tests/fabric_bench/pingpong.rs`).
+//! bench's ping-pong arm reads (`crates/aterm/tests/fabric_bench/run/pingpong.rs`).
 //!
 //! WHY IT IS COUNTED IN HERE. The bridge is one thread. While it waits for a
 //! group commit's answer or a publish's ack it does nothing else: a reply a
-//! session posted the moment its message arrived sits in aterm's outbox until
-//! the commit for that very delivery comes back. From outside, a bench sees
-//! only the round trip; how much of it is the loop parked on the broker is a
-//! fact only this process has. So the loop counts it, at the two places every
-//! wait passes through:
+//! session posted the moment its message arrived usually sits in aterm's
+//! outbox until the commit for that very delivery comes back. (Not always: the
+//! roster round at the top of a loop's pass reads the outbox too,
+//! `Bridge::roster_backstop`, before that pass commits, and a reply it finds
+//! there is published ahead of the commit.) From outside, a bench sees only
+//! the round trip; how much of it is the loop parked on the broker is a fact
+//! only this process has. So the loop counts it, at the two places every wait
+//! passes through:
 //!
 //! - every request that reads its own reply — a `Fetch`, a `Last` page, a
 //!   `Commit`, the `Will`, a `Budget`, a blocking `Publish` — hands its answer
@@ -32,12 +35,11 @@
 //! and the scheduler's.
 //!
 //! HOW IT LEAVES THE PROCESS. With [`SEAM`] set in a build that reads seams,
-//! the bridge opens `<state>/`[`FILE`] at its start and, each time its loop is
-//! about to park with nothing queued and the tally has moved since the last
-//! write, writes the tally there ([`Recorder::idle`]): one positioned write of
-//! one line of constant length at offset 0 — no temp, no rename, no flush. An
-//! idle moment delays nothing already queued, and the write is one system call,
-//! so the loop the arm measures is the loop that runs without it. The line
+//! the bridge opens `<state>/`[`FILE`] at its start and, at each idle moment —
+//! its loop found nothing queued and has read the acks it owed
+//! (`Bridge::settle_owed`) — when the tally has moved since the last write,
+//! writes the tally there ([`Recorder::idle`]): one positioned write of one
+//! line of constant length at offset 0 — no temp, no rename, no flush. The line
 //! carries a checksum of itself ([`Tally::parse`]), so a reader that raced a
 //! write reads a line that does not parse, never a count that is half old and
 //! half new.
@@ -47,6 +49,36 @@
 //! message it just saw (the loop's idle write after that commit), and refuses
 //! a pair of tallies from two processes ([`Tally::since`]) — a relaunched
 //! bridge starts again from zero.
+//!
+//! WHAT IT COSTS THE LOOP IT MEASURES. The loop the arm measures is NOT the
+//! loop that runs without the seam: it is that loop plus this, small beside a
+//! broker round trip (a Strict commit is an fsync, milliseconds), and not
+//! nothing.
+//!
+//! - Per request that reads its own reply: one clock read and two additions
+//!   ([`Recorder::request`]; the `Instant` at the write is read with or
+//!   without the seam, for the link's own round-trip note). Per group commit,
+//!   one clock read and two additions more ([`Recorder::commit`]).
+//! - Per settle of the owed pipelined acks (`Bridge::settle_acks`, run before
+//!   each request on the publisher connection that reads its own reply,
+//!   `Bridge::conn_now`, at each idle moment, and before an inbox commit a
+//!   claim rides on): one clock read before each look for an owed ack
+//!   ([`Recorder::ack_starts`]) — including the last look, which finds none
+//!   owed and reads nothing — and, per ack read, one clock read and two
+//!   additions after it ([`Recorder::ack`]). So two clock reads per ack, and
+//!   one more per settle, owed or not. (The settle's own `Instant`, for the
+//!   link's round-trip note, is read with or without the seam.)
+//! - Per idle moment: one comparison, and when the tally (cursor included)
+//!   differs from the one last written, rendering the line, hashing it, and
+//!   one `pwrite` ([`Recorder::idle`]). The loop judges the moment idle BEFORE
+//!   it settles its owed acks, and that settle blocks on each ack still in
+//!   flight (an fsync, on Strict), so an item queued during it is already
+//!   waiting when the write runs, and waits for it — as does one that arrives
+//!   while it runs. On the ping-pong arm's own path that is expected, not
+//!   rare: the bridge publishes a message, finds nothing queued and blocks on
+//!   the message's ack; on Strict the message turns visible at that same
+//!   fsync, so its delivery — the one the arm times — can be queued before the
+//!   settle returns, and then waits behind the write that ack just moved.
 //!
 //! A RELEASED BINARY HAS NO TALLY. `dev_seam!` is `None` there, the recorder is
 //! off, and every note below is one branch on that.
@@ -310,10 +342,11 @@ impl Recorder {
         }
     }
 
-    /// The loop is about to park with nothing queued, its inbox group cursor at
-    /// `committed`: write the tally if it moved since the last write. A write
-    /// that fails is said on stderr and turns the tally off, so a full disk
-    /// costs one line rather than one per round.
+    /// An idle moment — the loop found nothing queued and has since read the
+    /// acks it owed, during which an item may have arrived — its inbox group
+    /// cursor at `committed`: write the tally if it moved since the last
+    /// write. A write that fails is said on stderr and turns the tally off, so
+    /// a full disk costs one line rather than one per round.
     pub(crate) fn idle(&mut self, committed: u64) {
         use std::os::unix::fs::FileExt as _;
         let Some(out) = &self.out else {

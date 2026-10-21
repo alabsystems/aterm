@@ -250,14 +250,18 @@ impl Sandbox {
         // defaults change per-user settings even with a scratch config directory.
         // It closes a write path too: `aterm-ctl` auto-presents the token and
         // owner scope satisfies `ConfigWrite`, so a probe could rewrite the
-        // owner's real config.
+        // owner's real config. `bell_sound = false`: this window is never the
+        // owner's terminal, so a BEL its shell rings must not play the alert
+        // sound through their speakers (a headless aterm never beeps; this
+        // smoke's is windowed, and `--app` may name a build older than that gate).
         let cfgdir = tmp.join("cfg");
         std::fs::create_dir_all(cfgdir.join("aterm")).ok()?;
         chmod_700(&cfgdir)?;
         std::fs::write(
             cfgdir.join("aterm/aterm.toml"),
             format!(
-                "{extra}agents_auto_prime = false\n[update]\nenabled = false\nauto_apply = false\n\
+                "{extra}agents_auto_prime = false\nbell_sound = false\n\
+                 [update]\nenabled = false\nauto_apply = false\n\
                  [packages]\nenabled = false\n\
                  [machine]\nuniversal_control = \"leave\"\n"
             ),
@@ -668,7 +672,7 @@ fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
 
 /// WHAT A REPORTED p99 IS, and why these four bars read `>` and not `>=`.
 /// `aterm-gui`'s percentiles come from a histogram and report the containing
-/// bucket's EXCLUSIVE upper edge (`metrics.rs`'s `Histogram::percentile`:
+/// bucket's EXCLUSIVE upper edge (`metrics.rs`'s `HistCopy::percentile`:
 /// "every value in the bucket is strictly below it, so reporting it keeps
 /// percentiles conservative"). So a reported `p99 = 50.00` against a 50 ms bar
 /// says every sample was UNDER the bar, not at it — and `>=` failed such a run.
@@ -1112,7 +1116,10 @@ mod tests {
 
     #[test]
     fn the_sandbox_is_private_and_short_enough_for_a_unix_socket() {
-        let mut sb = Sandbox::with_config("atl", "").expect("sandbox");
+        // The pacing smoke's own head, so the parse below covers the file it
+        // really writes (a key the head and the fixed lines both set would be
+        // no document, and aterm would read none of it).
+        let mut sb = Sandbox::with_config("atl", SMOKE_CONFIG).expect("sandbox");
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&sb.rundir)
             .expect("stat")
@@ -1125,6 +1132,15 @@ mod tests {
         );
         assert!(sb.sock().as_os_str().len() < crate::smoke::SUN_LEN);
         assert!(sb.rundir.join("aterm").is_dir());
+        // The windowed smoke starts with the audible bell off (aterm's own
+        // default is on), as one document aterm's parser reads.
+        let toml = std::fs::read_to_string(sb.cfgdir.join("aterm/aterm.toml")).expect("written");
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(&toml).expect("one document");
+        assert_eq!(
+            doc.get("bell_sound").and_then(aterm_toml::Value::as_bool),
+            Some(false),
+            "{toml}"
+        );
 
         let mut r = Report::new("t");
         sb.teardown(&mut r);

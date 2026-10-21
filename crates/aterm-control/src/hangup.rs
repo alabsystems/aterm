@@ -28,9 +28,9 @@ thread_local! {
 }
 
 /// Whether the client of the connection this lane serves has closed it, so no
-/// answer can be read. A half-closed client (request sent, write side shut) is
-/// still waiting and not hung up (`aterm_uds::hangup`). `false` off a serving
-/// lane.
+/// answer can be read: the request policy of [`aterm_uds::hangup::PeerState`].
+/// A half-closed client (request sent, write side shut) is still waiting and
+/// not hung up, nor is one with a request queued. `false` off a serving lane.
 #[must_use]
 pub fn caller_hung_up() -> bool {
     #[cfg(unix)]

@@ -17,7 +17,50 @@ use aterm_core::terminal::Terminal;
 use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::Theme;
 
-use crate::common::{backends, max_channel_delta};
+use crate::common::{backends, bb, gg, rr};
+
+/// What the sprite streams may differ by, CPU against GPU, where they drew
+/// (`cat_parity.rs`, `rain_parity.rs`: target <= 1).
+const SPRITE_BAR: i32 = 2;
+
+/// What text may differ by, CPU against GPU: the glyph bar every parity suite
+/// holds text to (`gpu_matches_cpu.rs`).
+const GLYPH_BAR: i32 = 8;
+
+/// The worst channel delta between the CPU and GPU frames `(over the sprites,
+/// over the rest)`. The sprites' pixels are those where either backend's frame
+/// differs from its own frame `without` the sprites, so a sprite the GPU drew
+/// elsewhere, or not at all, is measured where both should have drawn it.
+///
+/// The rest is the word that wakes the feline pipeline (`kitty`): text, and
+/// held to the glyph bar, not the sprite bar. A GPU whose blender takes a
+/// glyph's coverage alpha at the 8-bit target's precision before it blends in
+/// linear light lands a faint fringe over a dark ground up to 5 off the CPU
+/// (NVIDIA GB10, GL arm, 2026-10-20: 17 fringe pixels of `kitty`, each where an
+/// 8-bit alpha puts it; wgpu's Vulkan frame there is byte-identical to the GL
+/// arm's, and lavapipe's, blending in float, is 1 off the CPU). Unlike
+/// `cat_parity.rs`'s block glyphs, this text is no byte-exact base.
+fn sprite_and_rest_delta(
+    cpu: &[u32],
+    gpu: &[u32],
+    cpu_without: &[u32],
+    gpu_without: &[u32],
+) -> (i32, i32) {
+    let (mut sprite, mut rest) = (0, 0);
+    for (((&c, &g), &c0), &g0) in cpu.iter().zip(gpu).zip(cpu_without).zip(gpu_without) {
+        let d = (rr(c) - rr(g))
+            .abs()
+            .max((gg(c) - gg(g)).abs())
+            .max((bb(c) - bb(g)).abs());
+        let worst = if c != c0 || g != g0 {
+            &mut sprite
+        } else {
+            &mut rest
+        };
+        *worst = (*worst).max(d);
+    }
+    (sprite, rest)
+}
 
 /// A NEAREST-1:1 free sprite (`aw/ah == w/h`, the cat bake==dest contract) at
 /// an on-grid pixel origin, under text (the default z).
@@ -133,11 +176,16 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
         "the exact CatBaker/free-sprite stream must paint on the GPU present path"
     );
 
+    let cpu_base = cpu.render_input(&bare).pixels;
     let cpu_cat = cpu.render_input(&cat_input).pixels;
-    let delta = max_channel_delta(&cpu_cat, &gpu_cat);
+    let (delta, text) = sprite_and_rest_delta(&cpu_cat, &gpu_cat, &cpu_base, &base);
     assert!(
-        delta <= 2,
-        "real CatBaker CPU/GPU parity exceeded the cat bar: {delta} > 2"
+        delta <= SPRITE_BAR,
+        "real CatBaker CPU/GPU parity exceeded the cat bar: {delta} > {SPRITE_BAR}"
+    );
+    assert!(
+        text <= GLYPH_BAR,
+        "the text beside the cat exceeded the glyph bar: {text} > {GLYPH_BAR}"
     );
 
     // Production composes both sprite atlases in one frame: phosphor rain, then the feline
@@ -168,10 +216,15 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
     );
 
     let cpu_rain_cat = cpu.render_input(&rain_and_cat).pixels;
-    let combined_delta = max_channel_delta(&cpu_rain_cat, &gpu_rain_cat);
+    let (combined_delta, text) =
+        sprite_and_rest_delta(&cpu_rain_cat, &gpu_rain_cat, &cpu_base, &base);
     assert!(
-        combined_delta <= 2,
+        combined_delta <= SPRITE_BAR,
         "rain + real CatBaker CPU/GPU parity exceeded the sprite bar: \
-         {combined_delta} > 2"
+         {combined_delta} > {SPRITE_BAR}"
+    );
+    assert!(
+        text <= GLYPH_BAR,
+        "the text beside rain and the cat exceeded the glyph bar: {text} > {GLYPH_BAR}"
     );
 }

@@ -76,6 +76,13 @@ pub(crate) struct TabStripMetadata {
     /// `App::stamp_presence_chips` from the team table (`crate::team`); always
     /// [`TabTeam::NONE`] from [`Self::from_presentation`]. Not a status mark.
     pub(crate) team: TabTeam,
+    /// The tab's LOAD METER (design §12.4): its focused session's cores-worth
+    /// on the machine's capacity in 255ths ([`chip_load_step`]), 0 for no
+    /// meter (under a tenth of a core, the stats bars off, a one-tab window,
+    /// no reading yet). Stamped by `App::stamp_presence_chips` from the vitals
+    /// snapshot; always 0 from [`Self::from_presentation`]. Not a status mark:
+    /// it takes no slot, so the packing is unchanged.
+    pub(crate) load: u8,
 }
 
 /// A tab's team marks (owner surfaces §5, S9): whether its session is a
@@ -156,6 +163,7 @@ impl TabStripMetadata {
             conn: presentation.conn,
             closable: presentation.closable,
             team: TabTeam::NONE,
+            load: 0,
         }
     }
 
@@ -202,6 +210,46 @@ impl TabStripMetadata {
             TabStatusKind::Connection => self.conn.is_some(),
         }
     }
+}
+
+/// How far a chip's load meter sits in from each end of the pill, in points.
+pub(crate) const CHIP_LOAD_INSET_PT: f32 = 10.0;
+/// How far above the pill's bottom the meter sits, in points: clear of the
+/// selected chip's 2 pt accent keyline.
+pub(crate) const CHIP_LOAD_LIFT_PT: f32 = 2.5;
+/// The meter's thickness, in points.
+pub(crate) const CHIP_LOAD_H_PT: f32 = 1.5;
+
+/// A tab's load step ([`TabStripMetadata::load`]) from its cores-worth and
+/// the machine's capacity in cores: 0 under a tenth of a core (quiet earns no
+/// meter) or with no capacity known, else its share in 255ths, at least 1 so
+/// a tenth of a core shows even on a machine of hundreds.
+#[must_use]
+pub(crate) fn chip_load_step(cores: f32, capacity: f32) -> u8 {
+    if !(cores >= 0.1 && capacity > 0.0) {
+        return 0;
+    }
+    let share = (cores / capacity).clamp(0.0, 1.0);
+    (share * 255.0).round().clamp(1.0, 255.0) as u8
+}
+
+/// The load meter's length in points on a pill `pill_w_pt` wide: the step's
+/// share of the track between the insets, in whole points, at least one.
+/// `None` for no meter or a pill too narrow to hold one. A native chip
+/// repaints only when this length moves (`toolbar.rs`'s `set_load`); the
+/// in-grid strip folds the step into its fingerprint, so it re-rasters with
+/// the frame the reading presents for the bars anyway.
+#[must_use]
+pub(crate) fn chip_load_len_pt(pill_w_pt: f32, load: u8) -> Option<f32> {
+    let track = pill_w_pt - 2.0 * CHIP_LOAD_INSET_PT;
+    if load == 0 || track.is_nan() || track < 4.0 {
+        return None;
+    }
+    Some(
+        (track * f32::from(load) / 255.0)
+            .round()
+            .clamp(1.0, track.floor()),
+    )
 }
 
 /// Horizontal centre for one status mark in a 16-unit design box. Active marks pack
@@ -908,6 +956,7 @@ const PLAIN_TAB: TabStripMetadata = TabStripMetadata {
     conn: None,
     team: TabTeam::NONE,
     closable: true,
+    load: 0,
 };
 
 /// Title/icon/status slots for one laid-out tab segment. The segment and
@@ -1762,7 +1811,7 @@ enum StripRole {
 /// toolbar (`DEFAULT_TAB_STRIP_ROWS` is 0), composites over titlebar vibrancy, and
 /// a grey band looked heavy (see [`strip_colors`]). Elsewhere it is the window's
 /// only chrome, so it takes a surface of its own.
-const STRIP_IS_CHROME_BAND: bool = !cfg!(target_os = "macos");
+pub(crate) const STRIP_IS_CHROME_BAND: bool = !cfg!(target_os = "macos");
 
 /// Does the strip carry the build's VERSION LABEL at its trailing end
 /// ([`TabHit::Version`])?
@@ -2561,7 +2610,7 @@ impl crate::App {
     pub(crate) fn strip_foot_px(&self, wid: crate::WindowId, strip: usize) -> usize {
         let cell_h = self.win_cell_size(wid).1;
         let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
-        let canvas = self.win_pad_top(wid) + self.win_head(wid) + strip * cell_h;
+        let canvas = self.strip_band_top_px(wid) + strip * cell_h;
         let target = crate::logical_to_device_px(
             self.config.tab_band_height_or_default().target_logical_px(),
             scale,
@@ -5053,6 +5102,7 @@ fn common_suffix_bytes(a: &str, b: &str) -> usize {
 #[cfg(any(windows, target_os = "linux"))]
 pub(crate) mod pixel_band {
     use super::*;
+    use crate::tray_raster::UnicodeChars;
     use crate::type_scale::TypeStep;
     use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 
@@ -5081,7 +5131,8 @@ pub(crate) mod pixel_band {
         pub cell_h: usize,
         /// Rows the strip occupies (`tab_strip_rows`).
         pub strip_rows: usize,
-        /// Band pixels above the grid (`pad_top + head`): the lip `ChromeBleed`
+        /// Band pixels above the grid (`pad_top + head`, less the stats Deck
+        /// over the head's top: `App::strip_band_top_px`): the lip `ChromeBleed`
         /// paints in the band tone. Part of the optical band and of the canvas
         /// (via the chrome-band lift).
         pub band_top_px: usize,
@@ -5424,6 +5475,38 @@ pub(crate) mod pixel_band {
                             }
                         }
                         drawn_tabs.push((seg.start_col, end, is_active || is_hovered, true));
+                    }
+                    // The tab's load meter (design §12.4), a capsule above the
+                    // card's foot: the Tab ink on the selected tab, the aterm
+                    // ink at 70 % on the others, solved on what each sits on.
+                    if let Some(item) = item {
+                        let x0 = f32::from(seg.start_col).mul_add(cw, design.gap_h);
+                        let x1 = f32::from(end).mul_add(cw, -design.gap_h);
+                        if let Some(len) = chip_load_len_pt((x1 - x0) / scale, item.load) {
+                            let ground = if is_active {
+                                colors.active_bg
+                            } else {
+                                colors.band_bg
+                            };
+                            let inks =
+                                crate::stats_deck::cached_inks(ground, colors.fg, colors.accent);
+                            let fill = if is_active {
+                                rgba(inks.tab, 255)
+                            } else {
+                                rgba(inks.aterm, 178)
+                            };
+                            let h = (CHIP_LOAD_H_PT * scale).max(1.0);
+                            prims.push(DrawPrim::Panel {
+                                x: CHIP_LOAD_INSET_PT.mul_add(scale, x0).round(),
+                                y: (CHIP_LOAD_LIFT_PT + CHIP_LOAD_H_PT)
+                                    .mul_add(-scale, design.card_bot)
+                                    .round(),
+                                w: (len * scale).round().max(1.0),
+                                h,
+                                radius: h * 0.5,
+                                fill,
+                            });
+                        }
                     }
                     // Inks follow the surface each label sits on (selected card,
                     // hover wash, quiet chip, or bare band), in `label_face`.
@@ -6932,16 +7015,12 @@ pub(crate) mod pixel_band {
             let mut glyphs = Vec::new();
             let mut cuts = Vec::with_capacity(text.len());
             for ch in text.chars() {
-                let gid = self.vf.cmap.lookup_glyph_index(ch);
+                let gid = self.vf.cmap.unicode_glyph_index(ch);
                 if gid == 0 {
                     return None;
                 }
                 if let Some(previous) = prev {
-                    pen += self
-                        .vf
-                        .cmap
-                        .horizontal_kern(previous, ch, px)
-                        .unwrap_or(0.0);
+                    pen += self.vf.cmap.char_kern(previous, ch, px).unwrap_or(0.0);
                 }
                 let (w, h, xmin, ymin, advance, cov) = self.face.glyph_raster(gid, px)?;
                 if w > 0 && h > 0 {
@@ -6994,12 +7073,7 @@ pub(crate) mod pixel_band {
                 match k.checked_sub(1).map(|i| cuts[i]) {
                     None => (0.0, 0),
                     Some(last) => (
-                        last.pen
-                            + self
-                                .vf
-                                .cmap
-                                .horizontal_kern(last.ch, '…', px)
-                                .unwrap_or(0.0),
+                        last.pen + self.vf.cmap.char_kern(last.ch, '…', px).unwrap_or(0.0),
                         last.glyphs,
                     ),
                 }
@@ -7485,6 +7559,7 @@ pub(crate) mod pixel_band {
                     conn: None,
                     closable: true,
                     team: TabTeam::NONE,
+                    load: 0,
                 };
                 n
             ]
@@ -7574,8 +7649,8 @@ pub(crate) mod pixel_band {
             bbox
         }
 
-        /// Install the host UI faces for this thread, or `None` when the host has no
-        /// system UI face; the band then declines and the test asserts nothing.
+        /// Install the host UI faces for this thread: `false` when the host has no
+        /// system UI face, where the band declines and the test ends COULD NOT RUN.
         fn with_ui_faces() -> bool {
             crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
             crate::tray_raster::strip_band_ui_ready()
@@ -7623,7 +7698,7 @@ pub(crate) mod pixel_band {
         fn version_slot_cols_cover_the_painted_width() {
             use crate::menu::{VersionRung, strip_version_label};
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let cell_w = (CELL_W as f32 * scale).round() as usize;
@@ -7652,7 +7727,14 @@ pub(crate) mod pixel_band {
                             "{rung:?} at {scale}x: {w} cells is more than the ceiling of {need} px"
                         );
                     }
-                    assert!(slot.short < slot.full, "the short rung is shorter");
+                    // The short rung drops the full one's `.<commits>`, so it
+                    // never takes more cells (a short label that grew past the
+                    // full one would). Not always fewer: this binary's stamp
+                    // counts one commit, and `.1` can round into the same
+                    // cells (Cantarell, Linux's face without Noto, at 1.5×:
+                    // 98.1 and 111.3 px are both 8 cells of 14). Each rung's
+                    // own count is pinned above.
+                    assert!(slot.short <= slot.full, "the short rung is never longer");
                 }
             }
             assert_eq!(
@@ -7672,7 +7754,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn the_band_draws_the_version_label_in_the_ui_face() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let (segments, metadata, label) = version_strip(132, false);
             let titles = vec!["Hello".to_string(), "World".to_string()];
@@ -7719,7 +7801,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn window_buttons_are_round_and_take_the_hover_wash() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let metadata = plain(1);
             let frame = crate::client_frame::ClientFrame {
@@ -7778,7 +7860,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn covers_every_column_with_one_band_image_of_the_strip_footprint() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let metadata = plain(2);
             let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
@@ -7844,7 +7926,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn rename_segment_is_left_uncovered_for_the_cell_well() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let metadata = plain(2);
             let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
@@ -7879,7 +7961,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn uncoverable_title_falls_back_per_segment_and_keeps_its_icon_rasters() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let metadata = plain(2);
             let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
@@ -7957,7 +8039,7 @@ pub(crate) mod pixel_band {
                 || !with_ui_faces()
             {
                 crate::tray_raster::clear_ui_fonts_for_test();
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let title = "日本語 shell";
             assert!(
@@ -8057,15 +8139,14 @@ pub(crate) mod pixel_band {
             .expect("embedded renderer");
             crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let label_px = band_label_px((BAND_TOP + CELL_H) as f32, 1.0);
             if crate::tray_raster::chrome_colour_emoji("\u{1F680}", emoji_box_px(label_px))
                 .is_none()
             {
-                crate::logging::stderr_line!("no colour emoji face on this host");
                 crate::tray_raster::clear_ui_fonts_for_test();
-                return;
+                aterm_spec::host::could_not_run("no colour emoji face here for the chrome");
             }
             let title = "\u{1F680} deploy";
             assert!(
@@ -8160,7 +8241,7 @@ pub(crate) mod pixel_band {
             renderer.set_runtime_font_discovery(false);
             crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             crate::tray_raster::set_ui_cjk_faces_for_test(None);
             let title = "日本語 shell";
@@ -8204,15 +8285,15 @@ pub(crate) mod pixel_band {
         #[test]
         fn each_labels_east_asian_faces_are_its_own_weights() {
             let Some(_live) = crate::tray_raster::install_unparsed_cjk_chain_for_test() else {
-                return;
+                aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
             };
             let Some(store) = crate::tray_raster::host_ui_cjk_faces_for_test() else {
                 crate::tray_raster::clear_ui_fonts_for_test();
-                return;
+                aterm_spec::host::could_not_run("no host UI CJK faces here");
             };
             crate::tray_raster::set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let (geometry, _) = window_band(100);
             let metadata = plain(3);
@@ -8288,10 +8369,10 @@ pub(crate) mod pixel_band {
         #[test]
         fn a_cjk_title_is_a_band_tab_on_its_first_frame_with_its_hairlines() {
             let Some(_live) = crate::tray_raster::install_unparsed_cjk_chain_for_test() else {
-                return;
+                aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
             };
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             assert!(
                 !crate::tray_raster::chrome_ui_reaches_for_test(TextFace::Ui, '日'),
@@ -8366,7 +8447,7 @@ pub(crate) mod pixel_band {
             renderer.set_runtime_font_discovery(false);
             crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let (geometry, cy) = window_band(100);
             let metadata = plain(4);
@@ -8419,7 +8500,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn active_label_the_variable_face_cannot_shape_draws_whole_through_the_cascade() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let Some(vf) = crate::tray_raster::strip_band_variable_semibold() else {
                 // Static UI regular: there is no variable path to regress.
@@ -8428,22 +8509,20 @@ pub(crate) mod pixel_band {
             };
             // A char outside the variable face's cmap that the chrome cascade draws
             // as real ink, probed rather than assumed, so a future face that covers
-            // it makes the test skip rather than lie.
+            // it makes the test end COULD NOT RUN rather than lie.
             let odd = [
                 '\u{2713}', '\u{2717}', '\u{2423}', '\u{2318}', '\u{23CE}', '\u{2500}', '\u{2588}',
                 '\u{2591}',
             ]
             .into_iter()
             .find(|&ch| {
-                vf.cmap.lookup_glyph_index(ch) == 0
-                    && crate::tray_raster::strip_band_run_coverable(&ch.to_string())
+                !vf.cmap.maps(ch) && crate::tray_raster::strip_band_run_coverable(&ch.to_string())
             });
             let Some(odd) = odd else {
-                crate::logging::stderr_line!(
-                    "no cascade-only char on this host; nothing to regress"
-                );
                 crate::tray_raster::clear_ui_fonts_for_test();
-                return;
+                aterm_spec::host::could_not_run(
+                    "no char here that the cascade draws and the variable face lacks",
+                );
             };
             let title = format!("Alpha{odd}Beta");
             // The decision in isolation: the whole run refuses the variable
@@ -8496,7 +8575,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn glyph_level_fit_matches_the_string_fit_glyph_for_glyph() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let Some(vf) = crate::tray_raster::strip_band_variable_semibold() else {
                 crate::tray_raster::clear_ui_fonts_for_test();
@@ -8567,8 +8646,11 @@ pub(crate) mod pixel_band {
         /// 27 columns the same title is cut.
         #[test]
         fn a_tabs_want_seats_its_title_and_ignores_a_spinner() {
-            if !STRIP_WINDOWS_PAINT || !with_ui_faces() {
+            if !STRIP_WINDOWS_PAINT {
                 return;
+            }
+            if !with_ui_faces() {
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let band_h = BAND_TOP + CELL_H;
             let title = "Claude Code: fix the strip floor under splits".to_string();
@@ -8649,7 +8731,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn the_selected_title_keeps_its_weight_on_light_and_dark_tabs() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             if crate::tray_raster::strip_band_variable_semibold().is_none() {
                 // Static UI regular: the selected title takes the corrected pen.
@@ -9018,7 +9100,7 @@ pub(crate) mod pixel_band {
         fn chip_titles_are_cut_for_the_ui_face_and_paths_keep_their_end() {
             if !with_ui_faces() {
                 crate::tray_raster::clear_ui_fonts_for_test();
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let label_px = 13.0;
             if !STRIP_WINDOWS_PAINT {
@@ -9149,9 +9231,13 @@ pub(crate) mod pixel_band {
         /// `A11-hidpi-selected-label-fit`, measured live at 150% and 200%).
         #[test]
         fn a_neighbours_title_costs_a_tab_no_characters() {
-            if !STRIP_WINDOWS_PAINT || !with_ui_faces() {
+            if !STRIP_WINDOWS_PAINT {
                 crate::tray_raster::clear_ui_fonts_for_test();
                 return;
+            }
+            if !with_ui_faces() {
+                crate::tray_raster::clear_ui_fonts_for_test();
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let claude = "Claude Code: reviewing platform_win.rs and the Default Light contrast of bright white on blue";
             let (cw, label_px) = (17.0, 26.0);
@@ -9313,7 +9399,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn the_label_stays_in_its_card_with_descender_room_at_every_font_px() {
             if !with_ui_faces() {
-                return;
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let colors = strip_colors_with_active(Theme::default(), None);
             for win in WIN_BANDS {
@@ -9416,8 +9502,11 @@ pub(crate) mod pixel_band {
         /// capsule above an unbroken seam, the darkest chip of a light band.
         #[test]
         fn a_selected_tab_opens_into_the_grid_and_quiet_tabs_are_bare() {
-            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+            if !SELECTED_TAB_IS_GROUND {
                 return;
+            }
+            if !with_ui_faces() {
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let (band_top, cell_h, foot) = (15usize, 23usize, 6usize);
             let h = band_top + cell_h;
@@ -9513,8 +9602,11 @@ pub(crate) mod pixel_band {
         /// judges' `settings-tab-ground-mismatch`, `selected-tab-opens-onto-grey-band`).
         #[test]
         fn the_selected_tab_joins_what_lies_under_the_seam() {
-            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+            if !SELECTED_TAB_IS_GROUND {
                 return;
+            }
+            if !with_ui_faces() {
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let (band_top, cell_h, foot) = (15usize, 23usize, 6usize);
             let h = band_top + cell_h;
@@ -9599,8 +9691,11 @@ pub(crate) mod pixel_band {
         /// but not the light terminal tab (`J4F-4-light-selected-tab-two-idioms`).
         #[test]
         fn a_selected_tab_the_band_would_swallow_wears_the_seam() {
-            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+            if !SELECTED_TAB_IS_GROUND {
                 return;
+            }
+            if !with_ui_faces() {
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let light =
                 Theme::from(&aterm_types::scheme::builtin("Default Light").expect("builtin"));
@@ -9708,8 +9803,11 @@ pub(crate) mod pixel_band {
         /// card's last row (the 2026-10-18 judges' `tab-title-descender-clearance`).
         #[test]
         fn a_compact_tab_keeps_its_descenders_inside() {
-            if !SELECTED_TAB_IS_GROUND || !with_ui_faces() {
+            if !SELECTED_TAB_IS_GROUND {
                 return;
+            }
+            if !with_ui_faces() {
+                aterm_spec::host::could_not_run("no system UI face here for the strip band");
             }
             let geometry = BandGeometry {
                 cols: 80,
@@ -10491,6 +10589,7 @@ mod tests {
                 conn: Some(TabConnRole::Both),
                 closable: false,
                 team: TabTeam::NONE,
+                load: 0,
             },
         ];
         let canonical = layout_segments_with_metadata(80, metadata.len(), &metadata, 0, false);
@@ -10548,6 +10647,7 @@ mod tests {
                     conn: None,
                     team: TabTeam::NONE,
                     closable: true,
+                    load: 0,
                 };
                 let mut images = Vec::new();
                 append_status_image(&mut images, 0, metadata, color);
@@ -10738,6 +10838,35 @@ mod tests {
         );
     }
 
+    /// THE LOAD METER (design §12.4): a tenth of a core shows even on a
+    /// machine of hundreds, quiet earns none, the length is the share of the
+    /// track between the insets in whole points and never past it, and the
+    /// meter takes no status slot.
+    #[test]
+    fn a_chip_load_meter_shows_a_tenth_of_a_core_in_whole_points() {
+        assert_eq!(chip_load_step(0.05, 10.0), 0, "quiet earns no meter");
+        assert_eq!(chip_load_step(0.1, 512.0), 1, "a tenth of a core shows");
+        assert_eq!(chip_load_step(5.0, 10.0), 128);
+        assert_eq!(chip_load_step(40.0, 10.0), 255, "the machine is the end");
+        assert_eq!(chip_load_step(1.0, 0.0), 0, "no capacity, no meter");
+        assert_eq!(chip_load_step(f32::NAN, 10.0), 0);
+        assert_eq!(chip_load_len_pt(120.0, 0), None);
+        assert_eq!(chip_load_len_pt(120.0, 1), Some(1.0));
+        assert_eq!(chip_load_len_pt(120.0, 128), Some(50.0));
+        assert_eq!(chip_load_len_pt(120.0, 255), Some(100.0));
+        assert_eq!(
+            chip_load_len_pt(22.0, 255),
+            None,
+            "no room between the insets"
+        );
+        let loaded = TabStripMetadata {
+            load: 200,
+            ..PLAIN_TAB
+        };
+        assert!(!loaded.has_status());
+        assert_eq!(loaded.status_count(), 0);
+    }
+
     /// THE TAB'S MARKS ARE TELLABLE APART (§5): every attention level draws
     /// its own shape — a finished task's dot is never the tab's own note (a
     /// failed command, a notice), which is a dash — so a background shell's
@@ -10753,6 +10882,7 @@ mod tests {
             conn: None,
             closable: true,
             team: TabTeam::NONE,
+            load: 0,
         };
         let levels = [
             ChipLevel::Note,

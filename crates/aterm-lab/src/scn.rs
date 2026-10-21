@@ -29,7 +29,11 @@
 //! card, a numbered reply, rating then undo; `s7` a `0` then a guarded Enter;
 //! `s8` a card over a background shell (the `bg` mode), lease TTLs;
 //! `x-startup-*`, `x-reader-*`, `x-tall-*`, `x-tail-dump-*` startup cards and
-//! pane heights.
+//! pane heights; `c1-approval`, `c2-question`, `c3-wall`, `c4-read` the
+//! harness tape corpus's own — a Bash box approved, a question answered, an
+//! API 500 wall waited out and continued past, a Read box outside the project
+//! approved on the policy's two looks at the disk (`crate::tape`: `tape
+//! promote`, `tape rerecord`).
 
 use std::fs;
 use std::path::PathBuf;
@@ -1007,6 +1011,17 @@ pub enum Plan {
     S8Lease(u32),
     /// What the hosted loop reads while the card is up.
     TailDump(u32),
+    /// THE CORPUS: a Bash box the harness approves (Claude Code launched in
+    /// its manual mode, which asks for every tool).
+    CorpusApproval,
+    /// THE CORPUS: an `AskUserQuestion` dialog the harness answers.
+    CorpusQuestion,
+    /// THE CORPUS: an API 500 wall the harness waits out and continues past.
+    CorpusWall,
+    /// THE CORPUS: a Read box outside the project (`/etc/hosts`, under a
+    /// system Read root) the harness approves after its two looks at the
+    /// disk: where the path's links lead, and no hidden twin on its way.
+    CorpusRead,
 }
 
 /// A named scenario.
@@ -1185,7 +1200,67 @@ pub fn scenarios() -> Vec<Scenario> {
     for n in [53, 50] {
         add(format!("x-tail-dump-{n}"), "", lines(n), Plan::TailDump(n));
     }
+    // The tape corpus's own (`crate::tape`'s `promote`, `rerecord`): one
+    // box or wall each, so each tape is one decision a reader can follow.
+    add("c1-approval".into(), "", none, Plan::CorpusApproval);
+    add("c2-question".into(), "", none, Plan::CorpusQuestion);
+    add("c3-wall".into(), "", none, Plan::CorpusWall);
+    add("c4-read".into(), "", none, Plan::CorpusRead);
     v
+}
+
+/// THE STUB'S ONE-SHOT API 500 (`c3-wall`): Anthropic's `api_error`,
+/// answered once with `x-should-retry: false` (so Claude Code's client draws
+/// the wall at once instead of retrying it for minutes), then `ok`.
+const WALL_500: &str = r#"{"status": 500, "headers": {"x-should-retry": "false"}, "json": {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}, "times": 1}"#;
+
+/// The index of the first journal line past the first `from` that holds
+/// `needle`, once one arrives within `timeout` seconds — a hang detector,
+/// never a budget — else `None`, the run's `error` naming what never came.
+fn journaled_after(ctx: &mut Ctx, from: usize, needle: &str, timeout: f64) -> R<Option<usize>> {
+    let end = now() + timeout;
+    loop {
+        if let Some(at) = ctx
+            .journal()
+            .iter()
+            .skip(from)
+            .position(|(_, r)| rec_s(r, "line").contains(needle))
+        {
+            ctx.mark(&format!("journaled {needle}"), None);
+            return Ok(Some(from + at));
+        }
+        if now() >= end {
+            ctx.put("error", format!("no {needle} journaled"));
+            return Ok(None);
+        }
+        stop::sleep(std::time::Duration::from_millis(200))?;
+    }
+}
+
+/// A corpus scenario's one decision: `start` begins it (a tool script and
+/// `toolstart`, or a wall and a prompt), then the harness's journal line
+/// holding `decided` must arrive within `timeout` seconds, and the turn it
+/// lets go on must end (`EVENT idle`, on a line past the decision's own)
+/// within a minute of it; the loop is ended as the run finishes
+/// ([`Ctx::finish`]), so its tape carries its end. The idle is looked for
+/// past the decision's line, never past what the journal held when the
+/// decision was seen: a question's answer ends a stub turn at once, and its
+/// idle can be journaled in the same breath.
+fn corpus_decision(
+    ctx: &mut Ctx,
+    start: impl FnOnce(&mut Ctx) -> R,
+    decided: &str,
+    timeout: f64,
+) -> R {
+    let from = ctx.journal().len();
+    start(ctx)?;
+    let Some(at) = journaled_after(ctx, from, decided, timeout)? else {
+        return Ok(());
+    };
+    if journaled_after(ctx, at + 1, "EVENT idle", 60.0)?.is_some() {
+        ctx.put("decided", decided);
+    }
+    secs(2.0)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2262,6 +2337,56 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             let jl = journal_lines(ctx, card.wall);
             put_journal(ctx, jl);
         }
+        Plan::CorpusApproval => corpus_decision(
+            ctx,
+            |ctx| {
+                crate::verbs::set_tool(
+                    &ctx.run,
+                    r#"[{"name": "Bash", "input": {"command": "touch @PROJ@/corpus-approval.txt", "description": "Make a file"}}, {"text": "Done."}]"#,
+                )?;
+                ctx.turn("toolstart").map(|_| ())
+            },
+            "APPROVED",
+            60.0,
+        )?,
+        Plan::CorpusQuestion => corpus_decision(
+            ctx,
+            |ctx| {
+                crate::verbs::set_tool(
+                    &ctx.run,
+                    r#"[{"name": "AskUserQuestion", "input": {"questions": [{"question": "Which color should the file be?", "header": "Color", "multiSelect": false, "options": [{"label": "Red", "description": "A warm color"}, {"label": "Blue", "description": "A cool color"}]}]}}, {"text": "Done."}]"#,
+                )?;
+                ctx.turn("toolstart").map(|_| ())
+            },
+            "CHOSE",
+            60.0,
+        )?,
+        // The harness waits out the wall on its server ladder (its first
+        // rung a minute after it reads the wall) before it continues: a
+        // minute past that is the hang detector.
+        Plan::CorpusWall => corpus_decision(
+            ctx,
+            |ctx| {
+                let spec =
+                    J::parse(WALL_500).map_err(|e| ScnErr::Failed(format!("WALL_500: {e}")))?;
+                crate::verbs::set_custom_mode(&ctx.run, "wall500", &spec)?;
+                ctx.turn("say hello").map(|_| ())
+            },
+            "rule=api-retry@v1",
+            120.0,
+        )?,
+        Plan::CorpusRead => corpus_decision(
+            ctx,
+            |ctx| {
+                crate::verbs::set_tool(
+                    &ctx.run,
+                    r#"[{"name": "Read", "input": {"file_path": "/etc/hosts"}}, {"text": "Done."}]"#,
+                )?;
+                ctx.turn("toolstart").map(|_| ())
+            },
+            "APPROVED",
+            60.0,
+        )?,
     }
     Ok(())
 }
@@ -2330,7 +2455,16 @@ pub fn run_one(s: &Scenario, k: u32, tag: &str) -> Result<Ctx, Stopped> {
         if s.name.starts_with("s8-") {
             ctx.setup_bg(14, 40);
         }
-        ctx.launch(60.0, Launch::default())?;
+        // A box needs Claude Code's manual mode: its auto mode runs the
+        // Bash call unasked.
+        let launch = match s.plan {
+            Plan::CorpusApproval | Plan::CorpusRead => Launch {
+                args: vec!["--permission-mode".into(), "manual".into()],
+                ..Launch::default()
+            },
+            _ => Launch::default(),
+        };
+        ctx.launch(60.0, launch)?;
         play(&mut ctx, s.plan)
     })();
     let stopped = match result {
@@ -2735,6 +2869,58 @@ mod tests {
             rows: rows.lines().map(str::to_string).collect(),
             i,
         }
+    }
+
+    /// A DECISION AND THE IDLE IT LETS GO ON, JOURNALED IN ONE BREATH: a
+    /// question's answer ends a stub turn at once, so the harness journals
+    /// the turn's `EVENT idle` in the same read of the journal as the
+    /// decision (c2-question-01: CHOSE, then its idle 67 ms later, and "no
+    /// EVENT idle journaled"). The idle is looked for past the decision's
+    /// own line, not past what the journal held when the decision was seen.
+    #[test]
+    fn the_idle_a_decision_lets_go_on_is_found_journaled_with_it() {
+        use std::time::{Duration, Instant};
+        let owned = aterm_tempfile::tempdir().expect("owned scratch");
+        // The tail reads through no link on its whole path; `/var` is one.
+        let path = std::fs::canonicalize(owned.path())
+            .expect("a physical scratch")
+            .join("journal");
+        let line = |kind: &str, line: &str| {
+            format!(
+                "{}\n",
+                J::obj([("t", J::Int(1)), ("kind", J::s(kind)), ("line", J::s(line))]).py()
+            )
+        };
+        std::fs::write(&path, line("event", "EVENT idle seq=1")).expect("a journal");
+        let mut ctx = Ctx::new("t", 1, "lab", "", LabKw::default(), true, false);
+        ctx.jr = Some(Journal::start(path.clone(), None));
+        // A hang detector, never a budget.
+        let held = |ctx: &Ctx, n: usize| {
+            let by = Instant::now() + Duration::from_secs(60);
+            while ctx.journal().len() < n {
+                assert!(Instant::now() < by, "the tail never held {n} line(s)");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        held(&ctx, 1);
+        let start = |ctx: &mut Ctx| -> R {
+            let both = format!(
+                "{}{}{}",
+                line("event", "EVENT idle seq=1"),
+                line("chose", "CHOSE seq=2 rule=answer-recommended@v1"),
+                line("event", "EVENT idle seq=3 ⏺ Done.")
+            );
+            let mut journal = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("the journal");
+            std::io::Write::write_all(&mut journal, both.as_bytes()).expect("appended");
+            held(ctx, 4);
+            Ok(())
+        };
+        corpus_decision(&mut ctx, start, "CHOSE", 60.0).expect("not interrupted");
+        assert_eq!(ctx.sumd.get("error"), None, "{}", ctx.sumd.py());
+        assert_eq!(ctx.sumd.get("decided").and_then(J::as_str), Some("CHOSE"));
     }
 
     #[test]

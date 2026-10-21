@@ -90,7 +90,11 @@
 //! ([`Unreached::OtherNode`]); one that claims the book's node and proves
 //! another key, or proves none where the book binds one, is not read as that
 //! node either ([`Unreached::Impostor`], [`Unreached::Unproved`]), and its
-//! survey is never asked.
+//! survey is never asked. A peer that proved a node speaks for that node
+//! alone: a survey whose `instance` header names another (any header, any
+//! `node=` field, as a reader decodes it) is refused whole
+//! ([`Unreached::Misnamed`]), so no reader takes a header's word over the
+//! proof — not `aterm ctl survey`, not the menu bar's glance.
 //!
 //! **Reading the fleet** ([`survey_all`]): every peer asked `survey` at once,
 //! at most [`AT_ONCE`] at a time, each under one deadline that covers its
@@ -131,12 +135,13 @@
 //! peer it knows meanwhile, and each member the book adds as soon as the book
 //! comes, each under one deadline: the first [`AT_ONCE`] dials share it, and a
 //! peer past them waits for a free place and is given the deadline of its
-//! own. A copy that answers as this machine is left out. A refusal counts
-//! only when it is the issuer's own: its node in the `ERR`, or its survey
-//! answering with its node at the address that refused. Then the copies go
-//! and the member reads the peers it knows, as before the book. When the
-//! issuer's survey found it at another address, the book is asked there; any
-//! other answer keeps the copies.
+//! own. A copy that proves this machine's node is left out; one that names
+//! it unproven is read as its claim. A refusal counts only when it is the
+//! issuer's own: its node in the `ERR`, or its survey answering with its node
+//! at the address that refused. Then the copies go and the member reads the
+//! peers it knows, as before the book. When the issuer's survey found it at
+//! another address, the book is asked there; any other answer keeps the
+//! copies.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -3006,6 +3011,19 @@ pub enum Unreached {
         /// issuer.
         issuer: bool,
     },
+    /// The address proved a node and its survey's `instance` header names
+    /// another: its own word contradicts its proof, so nothing it sent is
+    /// read — not its sessions, not which machine it is ([`survey_all`]);
+    /// and the peer's name did not answer as the target's node either.
+    Misnamed {
+        /// The address that answered.
+        at: SocketAddr,
+        /// The node it proved.
+        proved: String,
+        /// The node its header named, as the peer wrote it, made one
+        /// printable line ([`aterm_codec::tty::one_line`]).
+        claimed: String,
+    },
     /// This machine binds the book's node a key, and the address proved no
     /// node: an older aterm, one that holds no node key, or a peer that will
     /// not say — never read as that node; and the peer's name did not answer
@@ -3067,6 +3085,7 @@ impl Unreached {
             | Self::Reply(..)
             | Self::OtherNode { .. }
             | Self::Impostor { .. }
+            | Self::Misnamed { .. }
             | Self::Unproved { .. }
             | Self::Unbound { .. } => false,
         }
@@ -3264,6 +3283,19 @@ impl fmt::Display for Unreached {
                  rejoin)",
                 at.ip(),
                 node.get(..8).unwrap_or(node)
+            ),
+            // What makes an honest aterm say so: its node file replaced under
+            // a listener still proving the node it read at its start.
+            Self::Misnamed {
+                at,
+                proved,
+                claimed,
+            } => write!(
+                f,
+                "{} proved node {}, its survey says node {}: not read (restart aterm there)",
+                at.ip(),
+                proved.get(..8).unwrap_or(proved),
+                claimed.chars().take(8).collect::<String>()
             ),
             Self::Unproved { at, node } => write!(
                 f,
@@ -3636,7 +3668,10 @@ pub struct Surveyed {
     /// hand). A node bound to no key (an entry an older aterm recorded, a
     /// peer named by hand) is the peer's claim.
     pub proven: bool,
-    /// Its reply's lines after the `OK <n>` head, newlines dropped.
+    /// Its reply's lines after the `OK <n>` head, newlines dropped. Where it
+    /// proved a node, every `node=` its `instance` headers carry is that
+    /// node or `-` ([`Unreached::Misnamed`] otherwise): a header's word never
+    /// stands beside the proof.
     pub lines: Vec<String>,
 }
 
@@ -3664,7 +3699,9 @@ impl Surveyed {
 ///
 /// Each dial proves `me`, and each answer's node is judged by `keys` and the
 /// target's own key before its survey is asked ([`Unreached::Impostor`],
-/// [`Unreached::Unproved`]). A peer that answers as another node than the
+/// [`Unreached::Unproved`]), and a reply from a peer that proved a node is
+/// held to it: one whose header names another is refused
+/// ([`Unreached::Misnamed`]). A peer that answers as another node than the
 /// target's — the node it proved, or (proving none) its header's — is
 /// another member's: the target's name is asked in what is left of the
 /// deadline, never that address again, and an answer from it that is the
@@ -3753,13 +3790,14 @@ pub enum BookRead {
 /// one connection to it at a time, so a read never holds two of the issuer's
 /// per-address share — and a dial that failed for the book, or a book the
 /// deadline cut short, is the issuer's answer too, never dialled twice. A
-/// copy that answers as this machine (`own`, a place the issuer's person
-/// named by hand) is left out of the answer. Every other peer is asked
-/// meanwhile, at most [`AT_ONCE`] at once with the issuer's seat. The book's
-/// members ([`merge_book`] of `peers`) that are not among `peers` are queued
-/// the moment the book comes and given hands then, before the issuer's own
-/// read: an issuer whose control server is slow to answer its survey holds
-/// up none of them.
+/// copy that proves this machine's node (`own`, a place the issuer's person
+/// named by hand, where this machine proves its own key) is left out of the
+/// answer; one that names that node unproven is read, as its claim. Every
+/// other peer is asked meanwhile, at most [`AT_ONCE`] at once with the
+/// issuer's seat. The book's members ([`merge_book`] of `peers`) that are
+/// not among `peers` are queued the moment the book comes and given hands
+/// then, before the issuer's own read: an issuer whose control server is
+/// slow to answer its survey holds up none of them.
 ///
 /// A refusal counts only when it is the issuer's: `ERR no-book` naming the
 /// issuer's node, or one naming no node (`NO op` among them) from the
@@ -3995,12 +4033,16 @@ pub fn read_whole(
             *slot = Some(read);
         }
     }
-    // A copy that answered as this machine is this machine — a place its
-    // issuer's person named by hand, which names no node — and no peer.
+    // A copy that proved this machine's node is this machine — a place its
+    // issuer's person named by hand, which names no node — and no peer. Its
+    // node unproven is a claim (a Mac there that names this machine's node
+    // without its key, or this machine holding no key of its own to prove):
+    // it is read as one, never left out on its word.
     let itself = |peer: &Peer, read: &Option<Result<Surveyed, Unreached>>| {
         peer.via == Via::IssuerBook
             && own.is_some()
-            && matches!(read, Some(Ok(surveyed)) if surveyed.node.as_deref() == own)
+            && matches!(read, Some(Ok(surveyed))
+                if surveyed.proven && surveyed.node.as_deref() == own)
     };
     let answers = queued
         .peers
@@ -4234,8 +4276,9 @@ fn read_one(
 /// One target's `request` by `deadline` (and the `within` it was set from),
 /// its node checked: a peer that answers as another node (the one it proved,
 /// else its header's), claims the target's with another key or proves none
-/// where one is bound ([`answered_as`]) is not the target, and the target's
-/// name is asked in what is left of the deadline, never that address again.
+/// where one is bound ([`answered_as`]), or whose header contradicts its
+/// proof ([`Unreached::Misnamed`]) is not the target, and the target's name
+/// is asked in what is left of the deadline, never that address again.
 fn read_one_by(
     target: &Target,
     keys: &Keyring,
@@ -4269,6 +4312,7 @@ fn read_one_by(
         Err(
             other @ (Unreached::OtherNode { at, .. }
             | Unreached::Impostor { at, .. }
+            | Unreached::Misnamed { at, .. }
             | Unreached::Unproved { at, .. }),
         ) => (at, other),
         Err(unreached) => return Err(unreached),
@@ -4408,10 +4452,12 @@ fn drive_at(
 /// Dial `target` (at `addr` first, never at one in `avoid`) by `deadline`,
 /// judge the node that answered ([`answered_as`]) and only then ask
 /// `request`: its reply, and the node that answered — the one it proved,
-/// else the one its header names, which is refused ([`Unreached::Unproved`])
-/// when `keys` bind that node to a key. A peer that proved `me`, this
-/// machine's own node under its own key, is this machine (a place a person
-/// named by hand that is this one), proven though no keyring binds it.
+/// whose reply is refused ([`Unreached::Misnamed`]) when a header names
+/// another, else the one its header names, which is refused
+/// ([`Unreached::Unproved`]) when `keys` bind that node to a key. A peer that
+/// proved `me`, this machine's own node under its own key, is this machine
+/// (a place a person named by hand that is this one), proven though no
+/// keyring binds it.
 fn ask_at(
     target: &Target,
     keys: &Keyring,
@@ -4439,18 +4485,30 @@ fn ask_at(
             Asked::Local(why) => Unreached::Local(why),
         })?;
     let (node, proven) = match answered {
-        Some((node, proven)) => (Some(node), proven || proves_me(me, reached.peer.as_ref())),
-        None => match lines.first().and_then(|head| header_node(head)) {
+        Some((node, proven)) => {
+            // A peer that proved a node speaks for that node alone: a header
+            // anywhere in its reply that names another is its word against
+            // its proof, and nothing it sent is read.
+            if let Some(claimed) = header_nodes(&lines).find(|claimed| *claimed != node) {
+                return Err(Unreached::Misnamed {
+                    at: addr,
+                    proved: node,
+                    claimed: aterm_codec::tty::one_line(&claimed, 32),
+                });
+            }
+            (Some(node), proven || proves_me(me, reached.peer.as_ref()))
+        }
+        None => {
             // A header that names a node bound to a key, from a peer that
             // proved none, is that node's name without its key.
-            Some(said) if keys.bound(&said).is_some() => {
+            if let Some(said) = header_nodes(&lines).find(|said| keys.bound(said).is_some()) {
                 return Err(Unreached::Unproved {
                     at: addr,
                     node: said,
                 });
             }
-            said => (said, false),
-        },
+            (header_nodes(&lines).find(|said| is_node_id(said)), false)
+        }
     };
     Ok(Surveyed {
         scope: reached.scope,
@@ -4521,13 +4579,21 @@ fn answered_as(
     }
 }
 
-/// The node a survey's `instance` header names (`node=<32 hex>`), if any.
-fn header_node(head: &str) -> Option<String> {
-    head.strip_prefix("instance ")?
-        .split(' ')
-        .find_map(|field| field.strip_prefix("node="))
-        .filter(|node| is_node_id(node))
-        .map(str::to_owned)
+/// Every node a survey's `instance` headers name, in order, read the way the
+/// survey's readers read them (`aterm_ctl`'s fields, which the glance reads
+/// as JSON): each `node=` field of each line that is an `instance` header —
+/// a reply may send more than one, and a header more than one `node=` —
+/// percent-decoded. `node=-` and an empty one name none: a header that
+/// cannot read its node file says `-`.
+fn header_nodes(lines: &[String]) -> impl Iterator<Item = String> + '_ {
+    lines
+        .iter()
+        .filter(|line| line.starts_with("instance "))
+        .flat_map(|line| line.split(' ').skip(1))
+        .filter_map(|field| field.split_once('='))
+        .filter(|(key, _)| *key == "node")
+        .map(|(_, value)| aterm_codec::pct::decode(value))
+        .filter(|value| !value.is_empty() && value != "-")
 }
 
 /// Why [`ask_lines`] has no reply.

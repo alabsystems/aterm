@@ -74,6 +74,8 @@ const fn metal_attr_format(f: AttrFormat) -> VertexFormat {
         AttrFormat::Uint8x4 => VertexFormat::UChar4,
         AttrFormat::Float32x4 => VertexFormat::Float4,
         AttrFormat::Uint32 => VertexFormat::UInt,
+        AttrFormat::Sint16x2 => VertexFormat::Short2,
+        AttrFormat::Uint16x2 => VertexFormat::UShort2,
     }
 }
 
@@ -187,7 +189,7 @@ mod tests {
     #[test]
     fn every_table_row_builds_a_metal_pipeline() {
         let dev = device();
-        // Six libraries serve eighteen rows: compile each once.
+        // Six libraries serve twenty rows: compile each once.
         let libs: HashMap<ShaderLibrary, Library> = ShaderLibrary::ALL
             .into_iter()
             .map(|lib| {
@@ -225,6 +227,8 @@ mod tests {
             (AttrFormat::Uint16x4, 15, "MTLVertexFormatUShort4"),
             (AttrFormat::Float32x4, 31, "MTLVertexFormatFloat4"),
             (AttrFormat::Uint32, 36, "MTLVertexFormatUInt"),
+            (AttrFormat::Uint16x2, 13, "MTLVertexFormatUShort2"),
+            (AttrFormat::Sint16x2, 16, "MTLVertexFormatShort2"),
         ] {
             assert_eq!(metal_attr_format(f) as usize, raw, "{name}");
         }

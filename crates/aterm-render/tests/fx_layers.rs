@@ -19,7 +19,9 @@ use aterm_core::render::{
     SceneAtlas,
 };
 use aterm_core::terminal::Terminal;
-use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu, add_sat};
+use aterm_render::{
+    DamageOutcome, DirtyDecision, Renderer, Theme, WindowCpu, add_sat, compute_dirty_rows,
+};
 
 fn renderer() -> Renderer {
     let mut r = Renderer::from_system(18.0, Theme::default())
@@ -928,13 +930,13 @@ fn the_damaged_path_equals_a_full_render_over_fx_sequences() {
 
 /// A HISTORY SCROLL NEVER SLIDES A LAYER'S LIGHT: with layers held still (the
 /// same `Arc`s) over a scrolling viewport, every cached frame equals a full
-/// render. Until the fx damage arm marks a layer's rows over the slid pixels
-/// (design §4.4, lane B2), a frame with layers refuses the whole-row blit and
-/// repaints instead.
+/// render. The layers never refuse the whole-row blit (design §4.4): the
+/// scroll planner marks the bands their light was slid to and the bands it
+/// lands on, and the damaged tail rebuilds both over the slid pixels.
 ///
 /// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping the fx clause from `scroll_blittable_content` blits the
-/// light along with the text and fails this test.
+/// report): dropping `fx_damage::mark_fx_scroll` from `scroll_shift_plan`
+/// leaves the light the blit slid with the text and fails this test.
 #[test]
 fn a_history_scroll_never_slides_a_layers_light() {
     let mut rend = renderer();
@@ -976,4 +978,903 @@ fn a_history_scroll_never_slides_a_layers_light() {
             wc.last_damage()
         );
     }
+}
+
+/// The rows of a `rows`-row frame `h` pixels tall whose bands (the renderer's
+/// own band rule) window pixel rows `[y0, y1)` reach.
+fn rows_reached(rend: &Renderer, rows: usize, h: usize, (y0, y1): (i32, i32)) -> Vec<usize> {
+    (0..rows)
+        .filter(|&r| {
+            let (b0, b1) = rend.row_pixel_band(r, rows, h);
+            i32::try_from(b0).expect("small") < y1 && y0 < i32::try_from(b1).expect("small")
+        })
+        .collect()
+}
+
+/// The rows a layer's extent reaches in a frame (Grid space at the grid origin).
+fn layer_rows(rend: &Renderer, rows: usize, h: usize, l: &FxLayer) -> Vec<usize> {
+    let e = l.extent();
+    let dy = match l.space {
+        FxSpace::Window => 0,
+        FxSpace::Grid => i32::try_from(rend.grid_top()).expect("small"),
+    };
+    rows_reached(rend, rows, h, (e.y0 + dy, e.y1 + dy))
+}
+
+/// The sorted union of row sets.
+fn union(sets: &[&[usize]]) -> Vec<usize> {
+    let mut all: Vec<usize> = sets.iter().flat_map(|s| s.iter().copied()).collect();
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+/// THE FX ARM OF THE SHARED DAMAGE SEAM (design §4.4), under a padded grid
+/// with a head band so Window and Grid space map to rows differently: a layer
+/// that MOVED, CHANGED (a new `Arc`), was re-CLIPPED, APPEARED or VANISHED marks
+/// exactly the bands of its previous and current extent; layers equal by
+/// identity mark nothing and the frame gate-hits; a reorder marks the
+/// reordered layers; an occluder change marks the bands where it meets a
+/// layer, and nothing (a gate hit) with no layer on either side. Each case's
+/// cached frame then equals a full render.
+///
+/// The negative control is a mutation (run by hand, recorded in the lane
+/// report): marking only the CURRENT extent of a changed or vanished layer
+/// leaves its old light as a ghost in the cached frame and fails this test.
+#[test]
+fn compute_dirty_rows_tracks_fx_layers() {
+    let mut rend = renderer();
+    rend.set_pad(5);
+    rend.set_head(7);
+    let (cw, ch) = rend.cell_size();
+    let (rows, cols) = (10u16, 14u16);
+    let (nr, nc) = (usize::from(rows), usize::from(cols));
+    let mut t = term(rows, cols);
+    let h = rend.render_input(&t.cell_frame(nr, nc)).height;
+    let (top, chi) = (
+        i32::try_from(rend.grid_top()).expect("small"),
+        i32::try_from(ch).expect("small"),
+    );
+    let glow = |id: u64, y: i32, ink: u32| {
+        layer(
+            id,
+            vec![rect(8, y, 7 * cw, ch, 0)],
+            vec![FxInk::add(ink), FxInk::add(ink >> 1)],
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Exact,
+        )
+    };
+    // Window space: the lower half of row 2 and the upper half of row 3.
+    let a = glow(1, top + 2 * chi + chi / 2, 0x0030_2010);
+    // Grid space: inside row 6.
+    let b = layer(
+        2,
+        vec![rect(cw as i32, 6 * chi + 2, 4 * cw, ch - 4, 0)],
+        vec![FxInk::over(0x0040_2030, 0x80); 2],
+        FxSlot::Over,
+        FxSpace::Grid,
+        FxBlend::Exact,
+    );
+    // Window space in the head band, above the grid: row 0's band holds it.
+    let c = layer(
+        3,
+        vec![rect(0, 1, 9 * cw, 4, 0)],
+        vec![FxInk::add(0x0020_3040); 2],
+        FxSlot::Glow,
+        FxSpace::Window,
+        FxBlend::Exact,
+    );
+    let (ra, rb, rc) = (
+        layer_rows(&rend, nr, h, &a),
+        layer_rows(&rend, nr, h, &b),
+        layer_rows(&rend, nr, h, &c),
+    );
+    assert_eq!(ra, vec![2, 3], "the Window layer's bands");
+    assert_eq!(rb, vec![6], "the Grid layer's band, through grid_top");
+    assert_eq!(rc, vec![0], "the head band is row 0's");
+    let mut moved = a.clone();
+    moved.offset.1 += 3 * chi;
+    let rmoved = layer_rows(&rend, nr, h, &moved);
+    assert_eq!(rmoved, vec![5, 6]);
+    let changed = glow(1, top + 2 * chi + chi / 2, 0x0010_3020);
+    let mut clipped = a.clone();
+    clipped.clip = PxRect::new(i32::MIN, i32::MIN, i32::MAX, top + 3 * chi);
+    // An occluder over rows 3..=4, full width: it meets `a` on row 3 alone.
+    let occ = PxRect::new(i32::MIN, top + 3 * chi, i32::MAX, top + 5 * chi);
+
+    type Frame<'a> = (&'a [FxLayer], &'a [PxRect]);
+    let cases: [(&str, Frame, Frame, Vec<usize>); 12] = [
+        (
+            "settled",
+            (&[a.clone(), b.clone(), c.clone()], &[]),
+            (&[a.clone(), b.clone(), c.clone()], &[]),
+            vec![],
+        ),
+        (
+            "settled under a settled occluder",
+            (std::slice::from_ref(&a), &[occ]),
+            (std::slice::from_ref(&a), &[occ]),
+            vec![],
+        ),
+        (
+            "moved",
+            (std::slice::from_ref(&a), &[]),
+            (std::slice::from_ref(&moved), &[]),
+            union(&[&ra, &rmoved]),
+        ),
+        (
+            "moved back",
+            (std::slice::from_ref(&moved), &[]),
+            (std::slice::from_ref(&a), &[]),
+            union(&[&ra, &rmoved]),
+        ),
+        (
+            "changed",
+            (std::slice::from_ref(&a), &[]),
+            (&[changed], &[]),
+            ra.clone(),
+        ),
+        (
+            "re-clipped",
+            (std::slice::from_ref(&a), &[]),
+            (&[clipped], &[]),
+            ra.clone(),
+        ),
+        (
+            "appeared",
+            (std::slice::from_ref(&a), &[]),
+            (&[a.clone(), b.clone()], &[]),
+            rb.clone(),
+        ),
+        (
+            "vanished",
+            (&[a.clone(), b.clone()], &[]),
+            (std::slice::from_ref(&a), &[]),
+            rb.clone(),
+        ),
+        (
+            "head band",
+            (std::slice::from_ref(&c), &[]),
+            (&[], &[]),
+            rc.clone(),
+        ),
+        (
+            "reordered",
+            (&[a.clone(), b.clone()], &[]),
+            (&[b.clone(), a.clone()], &[]),
+            union(&[&ra, &rb]),
+        ),
+        (
+            "occluder",
+            (std::slice::from_ref(&a), &[]),
+            (std::slice::from_ref(&a), &[occ]),
+            vec![3],
+        ),
+        ("occluder over no layer", (&[], &[]), (&[], &[occ]), vec![]),
+    ];
+    for (name, (pl, po), (cl, co), want) in cases {
+        let frame = |t: &mut Terminal, l: &[FxLayer], o: &[PxRect]| {
+            let mut i = with_layers(t, rows, cols, l);
+            i.fx_occluders = o.to_vec();
+            i
+        };
+        let (prev, cur) = (frame(&mut t, pl, po), frame(&mut t, cl, co));
+        let mut dirty = Vec::new();
+        let d = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            rend.row_bands(),
+            &mut dirty,
+        );
+        let DirtyDecision::Rows(v) = d else {
+            panic!("{name}: the fx arm never forces a full repaint");
+        };
+        // Through the renderer first, so an under-marking seam shows as the
+        // ghost it leaves: the damaged frame is the full render.
+        let mut wc = WindowCpu::new();
+        let _ = rend.render_input_cached(&mut wc, &prev);
+        let cached = rend.render_input_cached(&mut wc, &cur).pixels().to_vec();
+        let damage = if want.is_empty() {
+            DamageOutcome::GateHit
+        } else {
+            DamageOutcome::Rows
+        };
+        assert_eq!(wc.last_damage(), damage, "{name}");
+        let fresh = rend.render_input(&cur).pixels;
+        assert!(
+            cached == fresh,
+            "{name}: the damaged frame equals a full render"
+        );
+        let marked: Vec<usize> = (0..nr).filter(|&r| dirty[r]).collect();
+        assert_eq!(marked, want, "{name}: the marked bands");
+        assert_eq!(v.is_gate_hit(), want.is_empty(), "{name}: the gate");
+        assert_eq!(v.fx_changed, !want.is_empty(), "{name}: fx_changed");
+    }
+}
+
+/// THE LAYERS NEVER REFUSE THE SCROLL BLIT (design §4.4): with settled layers
+/// of every slot and both spaces (one reaching up into the head band, one
+/// down into the bottom padding), a three-row wheel scroll-back, the scroll
+/// forward again, and an inline stream that scrolls three lines each take the
+/// whole-row blit, mark every band the current layers draw, repaint fewer
+/// rows than the frame has, and equal a full render.
+///
+/// The negative control is a mutation (run by hand, recorded in the lane
+/// report): dropping `fx_damage::mark_fx_scroll` from `scroll_shift_plan`
+/// leaves the light the blit slid with the text as a ghost and fails this
+/// test.
+#[test]
+fn fx_layers_never_refuse_the_blit_and_mark_their_rows() {
+    let mut rend = renderer();
+    rend.set_pad(5);
+    rend.set_head(7);
+    let (cw, ch) = rend.cell_size();
+    // Tall enough that the blit's rows (exposed strip, apron, the layers'
+    // bands before and after) are strictly fewer than the diff's: the
+    // planner takes a blit only when it saves rows.
+    let (rows, cols) = (20u16, 16u16);
+    let nr = usize::from(rows);
+    let mut t = Terminal::new(rows, cols);
+    t.process(b"\x1b[?25l");
+    for i in 0..60 {
+        t.process(format!("line {i}\r\n").as_bytes());
+    }
+    let h = rend
+        .render_input(&t.cell_frame(nr, usize::from(cols)))
+        .height;
+    let (top, chi) = (
+        i32::try_from(rend.grid_top()).expect("small"),
+        i32::try_from(ch).expect("small"),
+    );
+    let bottom = top + i32::from(rows) * chi;
+    let layers = vec![
+        layer(
+            1,
+            vec![rect(cw as i32, chi / 2, 6 * cw, 3 * ch, 0)],
+            vec![FxInk::add(0x0030_2010), FxInk::add(0x0010_2030)],
+            FxSlot::Under,
+            FxSpace::Grid,
+            FxBlend::Exact,
+        ),
+        layer(
+            2,
+            vec![rect(9 * cw as i32, 2, 4 * cw, (top + chi + 3) as usize, 0)],
+            vec![FxInk::over(0x0020_1010, 0x50); 2],
+            FxSlot::Over,
+            FxSpace::Window,
+            FxBlend::Exact,
+        ),
+        layer(
+            3,
+            vec![rect(2 * cw as i32, 6 * chi + 3, 9 * cw, ch, 0)],
+            vec![FxInk::add(0x0018_2830), FxInk::add(0x0030_1808)],
+            FxSlot::Glow,
+            FxSpace::Grid,
+            FxBlend::Exact,
+        ),
+        layer(
+            4,
+            vec![FxItem::Sprite(FxSprite {
+                x: 5 * cw as i32,
+                y: bottom - chi / 2,
+                dw: 3 * cw as u16,
+                dh: u16::try_from(h).expect("small") - (bottom - chi / 2) as u16,
+                flip_x: false,
+                art: straight_art(4, 3),
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })],
+            vec![FxInk::over(0x00ff_e0c0, 220)],
+            FxSlot::Over,
+            FxSpace::Window,
+            FxBlend::Linear,
+        ),
+    ];
+    let reach: Vec<usize> = union(
+        &layers
+            .iter()
+            .map(|l| layer_rows(&rend, nr, h, l))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        reach.contains(&0) && reach.contains(&(nr - 1)),
+        "the layers reach both edge rows: {reach:?}"
+    );
+    let mut wc = WindowCpu::new();
+    let first = with_layers(&mut t, rows, cols, &layers);
+    let _ = rend.render_input_cached(&mut wc, &first);
+    /// A named move of the frame under the settled layers.
+    type Step = (&'static str, fn(&mut Terminal));
+    let steps: [Step; 3] = [
+        ("wheel back 3", |t| t.scroll_display(3)),
+        ("wheel forward 3", |t| t.scroll_display(-3)),
+        ("an inline stream of 3 lines", |t| {
+            t.process(b"more 1\r\nmore 2\r\nmore 3\r\n")
+        }),
+    ];
+    for (name, step) in steps {
+        step(&mut t);
+        let input = with_layers(&mut t, rows, cols, &layers);
+        let cached = rend.render_input_cached(&mut wc, &input).pixels().to_vec();
+        assert!(
+            matches!(wc.last_damage(), DamageOutcome::Scroll { .. }),
+            "{name}: the layers do not refuse the blit ({:?})",
+            wc.last_damage()
+        );
+        // The pixels first, so an under-marking planner shows as the ghost
+        // light it leaves.
+        let fresh = rend.render_input(&input).pixels;
+        assert!(
+            cached == fresh,
+            "{name}: the blitted frame equals a full render"
+        );
+        let dirty = wc.dirty_rows().to_vec();
+        for r in &reach {
+            assert!(dirty[*r], "{name}: row {r} the layers draw is marked");
+        }
+        assert!(
+            dirty.iter().filter(|&&d| d).count() < nr,
+            "{name}: the blit repaints fewer rows than the frame: {dirty:?}"
+        );
+    }
+}
+
+/// A renderer at an explicit font px: the upward-overshoot seams of the
+/// damaged path show only at some cell-height/baseline geometries (px 13, 14
+/// and 18 with the accented capitals below, not 16), so the overshoot tests
+/// sweep px.
+fn renderer_px(px: f32) -> Renderer {
+    let mut r = Renderer::from_system(px, Theme::default())
+        .expect("no font: build with aterm-render's default embedded-font feature");
+    r.debug_block_on_lazy_fallbacks();
+    r
+}
+
+/// Line `i` of a glyph class (newline included): `accent` is accented
+/// capitals on every row, whose diacritics overshoot up into the row above;
+/// `mixed` alternates them with plain ASCII, so neighbouring rows differ in
+/// overshoot.
+fn overshoot_line(class: &str, i: usize) -> String {
+    let accent = format!("\u{c9}\u{c1}\u{d1}\u{c5}\u{ca}\u{cd}\u{c9}\u{c1}\u{d1}\u{c5} r{i}\r\n");
+    match class {
+        "accent" => accent,
+        "mixed" if i.is_multiple_of(2) => accent,
+        "mixed" => format!("plain line {i}\r\n"),
+        other => panic!("unknown class {other}"),
+    }
+}
+
+/// The pixels of `cached` that differ from `fresh`.
+fn diverging(cached: &[u32], fresh: &[u32]) -> usize {
+    cached.iter().zip(fresh).filter(|(a, b)| a != b).count()
+}
+
+/// THE BLIT DRAWS AN OVERSHOOT UNDER THE LIGHT ABOVE IT (design §4.4): a
+/// settled layer of each post-pass slot (Glow, Over Exact, Over Linear) and
+/// of the Under slot lights rows 2..=4 edge to edge over accented capitals,
+/// so row 5's diacritics reach up into the layer's last band, which the blit
+/// rebuilds while row 5 is blitted. An inline stream and a wheel scroll back
+/// and forward each take the whole-row blit, and every frame equals a full
+/// render at every px of the sweep: the blit's lower apron draws row 5's
+/// overshoot in the glyph phase, under the light, as the full path does.
+///
+/// The negative control is a mutation (run by hand, recorded in the lane
+/// report): running the E7 apron steps 2 and 3 after the post-passes, as
+/// before this test, draws row 5's diacritics over the Glow and Over light
+/// and fails this test at px 13 (accented rows, Glow, the first streamed
+/// frame). The Under slot's light is drawn before the glyphs, so its frames
+/// do not depend on that order.
+#[test]
+fn the_blit_draws_an_overshoot_under_the_light_above_it() {
+    let mut blits = 0usize;
+    for px in [11.0f32, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0] {
+        let mut warm = renderer_px(px);
+        let mut fresh = renderer_px(px);
+        let (cw, ch) = warm.cell_size();
+        let (rows, cols) = (16u16, 16u16);
+        let nc = usize::from(cols);
+        let (y, w, h) = (
+            2 * i32::try_from(ch).expect("small"),
+            u16::try_from(nc * cw).expect("small"),
+            u16::try_from(3 * ch).expect("small"),
+        );
+        let sheet = |slot: FxSlot| {
+            layer(
+                1,
+                vec![rect(0, y, usize::from(w), usize::from(h), 0)],
+                vec![FxInk::over(0x0060_2010, 0xa0); 2],
+                slot,
+                FxSpace::Grid,
+                FxBlend::Exact,
+            )
+        };
+        let sprite = layer(
+            1,
+            vec![FxItem::Sprite(FxSprite {
+                x: 0,
+                y,
+                dw: w,
+                dh: h,
+                flip_x: false,
+                art: straight_art(5, 3),
+                ink: 0,
+                clip: PxRect::EVERYWHERE,
+            })],
+            vec![FxInk::over(0x00ff_e0c0, 220)],
+            FxSlot::Over,
+            FxSpace::Grid,
+            FxBlend::Linear,
+        );
+        let cases = [
+            ("Under", sheet(FxSlot::Under)),
+            ("Glow", sheet(FxSlot::Glow)),
+            ("Over Exact", sheet(FxSlot::Over)),
+            ("Over Linear", sprite),
+        ];
+        for class in ["accent", "mixed"] {
+            for (slot, l) in &cases {
+                let mut t = Terminal::new(rows, cols);
+                t.process(b"\x1b[?25l");
+                for i in 0..60 {
+                    t.process(overshoot_line(class, i).as_bytes());
+                }
+                let mut wc = WindowCpu::new();
+                let first = with_layers(&mut t, rows, cols, std::slice::from_ref(l));
+                let _ = warm.render_input_cached(&mut wc, &first);
+                let mut moves: Vec<String> = (60..66).map(|i| overshoot_line(class, i)).collect();
+                moves.extend(["back", "back", "back", "fwd", "fwd", "fwd"].map(String::from));
+                for (step, m) in moves.iter().enumerate() {
+                    match m.as_str() {
+                        "back" => t.scroll_display(1),
+                        "fwd" => t.scroll_display(-1),
+                        line => t.process(line.as_bytes()),
+                    }
+                    let input = with_layers(&mut t, rows, cols, std::slice::from_ref(l));
+                    let cached = warm.render_input_cached(&mut wc, &input).pixels().to_vec();
+                    let damage = wc.last_damage();
+                    assert!(
+                        matches!(damage, DamageOutcome::Scroll { .. }),
+                        "px {px} {class} {slot} step {step}: the layer keeps the blit ({damage:?})"
+                    );
+                    blits += 1;
+                    let full = fresh.render_input(&input).pixels;
+                    assert!(
+                        cached == full,
+                        "px {px} {class} {slot} step {step}: the blitted frame equals a full \
+                         render ({} px differ)",
+                        diverging(&cached, &full)
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        blits,
+        8 * 2 * 4 * 12,
+        "every frame of the sweep took the blit"
+    );
+}
+
+/// LAYERS THAT CHANGE ON A SCROLL FRAME (design §4.4, §4.10): the blit's fx
+/// marks hold when the layers or occluders change on the very frame that
+/// scrolls, under a padded grid with a head band. A Window layer lighting only
+/// the head band vanishes as the wheel scrolls forward; a layer moves; an
+/// occluder appears and then goes; and an inline card rides its stream (its
+/// Grid offset follows each scrolled line, design §4.9's offset change). Each
+/// frame takes the whole-row blit and equals a full render.
+///
+/// The negative control is a mutation (run by hand, recorded in the lane
+/// report): dropping `mark_fx_scroll`'s padding rule (previous light above
+/// the grid marks row 0, below it the last row) leaves the vanished head-band
+/// light in place, the blit keeping the padding, and fails this test at
+/// "the head-band layer vanishes"; the other scroll tests hold their layers
+/// still, so the current frame's marks hid that rule.
+#[test]
+fn layers_that_change_on_a_scroll_frame_equal_a_full_render() {
+    let mut rend = renderer();
+    rend.set_pad(5);
+    rend.set_head(12);
+    let (cw, ch) = rend.cell_size();
+    let (rows, cols) = (20u16, 16u16);
+    let mut t = Terminal::new(rows, cols);
+    t.process(b"\x1b[?25l");
+    for i in 0..60 {
+        t.process(format!("line {i}\r\n").as_bytes());
+    }
+    let (top, chi) = (
+        i32::try_from(rend.grid_top()).expect("small"),
+        i32::try_from(ch).expect("small"),
+    );
+    // Light in the head band only, above the grid: row 0's band holds it.
+    let head = layer(
+        1,
+        vec![rect(
+            cw as i32,
+            2,
+            9 * cw,
+            usize::try_from(top - 4).expect("small"),
+            0,
+        )],
+        vec![FxInk::add(0x0030_4050), FxInk::add(0x0050_3010)],
+        FxSlot::Under,
+        FxSpace::Window,
+        FxBlend::Exact,
+    );
+    // Over rows 6..=8 of the grid.
+    let card = layer(
+        2,
+        vec![rect(2 * cw as i32, 6 * chi + 3, 8 * cw, 2 * ch, 0)],
+        vec![FxInk::over(0x0040_2030, 0x90); 2],
+        FxSlot::Over,
+        FxSpace::Grid,
+        FxBlend::Exact,
+    );
+    let occ = PxRect::new(i32::MIN, top + 6 * chi, i32::MAX, top + 7 * chi);
+    let mut moved = card.clone();
+    moved.offset.1 += 5 * chi;
+
+    let mut wc = WindowCpu::new();
+    let mut frame = |t: &mut Terminal, layers: &[FxLayer], occluders: &[PxRect], what: &str| {
+        let mut input = with_layers(t, rows, cols, layers);
+        input.fx_occluders = occluders.to_vec();
+        let cached = rend.render_input_cached(&mut wc, &input).pixels().to_vec();
+        let damage = wc.last_damage();
+        let fresh = rend.render_input(&input).pixels;
+        (damage, diverging(&cached, &fresh), what.to_owned())
+    };
+    let check = |(damage, bad, what): (DamageOutcome, usize, String)| {
+        assert!(
+            matches!(damage, DamageOutcome::Scroll { .. }),
+            "{what}: the frame takes the blit ({damage:?})"
+        );
+        assert_eq!(bad, 0, "{what}: the blitted frame equals a full render");
+    };
+
+    // Into history, with both layers; then forward one row as the head-band
+    // layer vanishes.
+    t.scroll_display(4);
+    let _ = frame(&mut t, &[head.clone(), card.clone()], &[], "warm");
+    t.scroll_display(-1);
+    check(frame(
+        &mut t,
+        std::slice::from_ref(&card),
+        &[],
+        "the head-band layer vanishes",
+    ));
+    t.scroll_display(-1);
+    check(frame(
+        &mut t,
+        std::slice::from_ref(&moved),
+        &[],
+        "a layer moves",
+    ));
+    t.scroll_display(1);
+    check(frame(
+        &mut t,
+        std::slice::from_ref(&moved),
+        &[occ],
+        "an occluder appears",
+    ));
+    t.scroll_display(-1);
+    check(frame(
+        &mut t,
+        &[moved.clone(), head.clone()],
+        &[],
+        "it goes as the head lights",
+    ));
+    t.scroll_display(-1);
+    check(frame(
+        &mut t,
+        std::slice::from_ref(&card),
+        &[],
+        "the layer moves back",
+    ));
+
+    // Live at the bottom: an inline card rides its stream. Each streamed line
+    // moves the content up a row, and the card's Grid offset with it.
+    t.scroll_display(-100);
+    let mut riding = card.clone();
+    riding.offset.1 += 8 * chi;
+    let _ = frame(&mut t, std::slice::from_ref(&riding), &[], "the bottom");
+    for i in 0..9 {
+        t.process(format!("streamed {i}\r\n").as_bytes());
+        riding.offset.1 -= chi;
+        check(frame(
+            &mut t,
+            std::slice::from_ref(&riding),
+            &[],
+            &format!("the card rides line {i}"),
+        ));
+    }
+}
+
+/// A LAYER THAT RIDES THE BLIT IS SLID, NOT REBUILT (design §4.4 as built,
+/// B3): an inline card's two layers (Window Under, Grid Over) moved by exactly
+/// each streamed line keep the whole-row blit and mark none of their rows: the
+/// blit carried their light to where the frame draws it. A layer the blit
+/// cannot carry is rebuilt as before, each case on its own stream: one held
+/// still while the text scrolls, one its clip cuts in both frames, one an
+/// occluder sits on, one reaching up into the head band (the blit keeps the
+/// padding), one moved two rows for one line, and two riding layers that swap
+/// order. Every frame equals a full render.
+///
+/// The negative controls are mutations (run by hand, recorded in the lane
+/// report): dropping the clip clause of `fx_damage::rides_the_blit` fails
+/// "clipped", dropping its occluder clause fails "occluded", and dropping its
+/// grid-band clause fails "into the head band", each on the light the blit
+/// slid where the frame no longer draws it.
+#[test]
+fn a_layer_that_rides_the_blit_is_slid_not_rebuilt() {
+    let mut rend = renderer();
+    rend.set_pad(5);
+    rend.set_head(12);
+    let (cw, ch) = rend.cell_size();
+    let (rows, cols) = (20u16, 16u16);
+    let nr = usize::from(rows);
+    let (top, chi) = (
+        i32::try_from(rend.grid_top()).expect("small"),
+        i32::try_from(ch).expect("small"),
+    );
+    // The card: Under in Window space over rows 9..=10, Over in Grid space
+    // over row 10, overlapping it.
+    let under = layer(
+        1,
+        vec![rect(cw as i32, top + 9 * chi + 2, 9 * cw, 2 * ch - 4, 0)],
+        vec![FxInk::add(0x0030_2010), FxInk::add(0x0010_2030)],
+        FxSlot::Under,
+        FxSpace::Window,
+        FxBlend::Exact,
+    );
+    let over = layer(
+        2,
+        vec![FxItem::Sprite(FxSprite {
+            x: 2 * cw as i32,
+            y: 10 * chi + 1,
+            dw: u16::try_from(5 * cw).expect("small"),
+            dh: u16::try_from(ch - 2).expect("small"),
+            flip_x: false,
+            art: straight_art(5, 3),
+            ink: 0,
+            clip: PxRect::EVERYWHERE,
+        })],
+        vec![FxInk::over(0x00ff_e0c0, 220)],
+        FxSlot::Over,
+        FxSpace::Grid,
+        FxBlend::Linear,
+    );
+    // Through the Under layer's middle in its first two frames.
+    let cut = PxRect::new(i32::MIN, i32::MIN, i32::MAX, top + 9 * chi + chi / 2);
+    // On the card's rows as it starts, which it leaves in two lines.
+    let shelf = PxRect::new(i32::MIN, top + 9 * chi, i32::MAX, top + 11 * chi);
+    // Four pixels into the head band and three rows down, a row further up
+    // each line.
+    let head = layer(
+        1,
+        vec![rect(cw as i32, top - 4, 9 * cw, 3 * ch, 0)],
+        vec![FxInk::add(0x0030_2010), FxInk::add(0x0010_2030)],
+        FxSlot::Under,
+        FxSpace::Window,
+        FxBlend::Exact,
+    );
+    let cases = [
+        ("rides", 5, true),
+        ("held", 3, false),
+        ("clipped", 1, false),
+        ("occluded", 2, false),
+        ("into the head band", 2, false),
+        ("two rows a line", 3, false),
+        ("swapped", 3, false),
+    ];
+    let mut slid_frames = 0usize;
+    for (name, lines, slides) in cases {
+        let card: [FxLayer; 2] = match name {
+            "clipped" => {
+                let (mut u, mut o) = (under.clone(), over.clone());
+                u.clip = cut;
+                o.clip = cut.translate(-5, -top);
+                [u, o]
+            }
+            "into the head band" => [head.clone(), over.clone()],
+            _ => [under.clone(), over.clone()],
+        };
+        let lay = |k: i32| -> Vec<FxLayer> {
+            let step = match name {
+                "held" => 0,
+                "two rows a line" => 2 * chi,
+                _ => chi,
+            };
+            let mut v: Vec<FxLayer> = card.iter().map(|l| moved(l, k * step)).collect();
+            if name == "swapped" && k % 2 == 1 {
+                v.reverse();
+            }
+            v
+        };
+        let occluders = if name == "occluded" {
+            vec![shelf]
+        } else {
+            vec![]
+        };
+        let mut t = Terminal::new(rows, cols);
+        t.process(b"\x1b[?25l");
+        for i in 0..60 {
+            t.process(format!("line {i}\r\n").as_bytes());
+        }
+        let mut wc = WindowCpu::new();
+        let mut input = with_layers(&mut t, rows, cols, &lay(0));
+        input.fx_occluders.clone_from(&occluders);
+        let _ = rend.render_input_cached(&mut wc, &input);
+        for k in 1..=lines {
+            t.process(format!("streamed {k}\r\n").as_bytes());
+            let layers = lay(k);
+            let mut input = with_layers(&mut t, rows, cols, &layers);
+            input.fx_occluders.clone_from(&occluders);
+            let cached = rend.render_input_cached(&mut wc, &input).pixels().to_vec();
+            let damage = wc.last_damage();
+            let what = format!("{name}, line {k}");
+            assert!(
+                matches!(damage, DamageOutcome::Scroll { delta_rows: 1 }),
+                "{what}: the frame takes the blit ({damage:?})"
+            );
+            let full = rend.render_input(&input);
+            assert_eq!(
+                diverging(&cached, &full.pixels),
+                0,
+                "{what}: the blitted frame equals a full render"
+            );
+            let reach: Vec<Vec<usize>> = layers
+                .iter()
+                .map(|l| layer_rows(&rend, nr, full.height, l))
+                .collect();
+            let card_rows = union(&reach.iter().map(Vec::as_slice).collect::<Vec<_>>());
+            let dirty = wc.dirty_rows().to_vec();
+            let rebuilt = card_rows.iter().filter(|&&r| dirty[r]).count();
+            if slides {
+                assert_eq!(rebuilt, 0, "{what}: no card row is rebuilt: {dirty:?}");
+                slid_frames += 1;
+            } else {
+                assert!(
+                    rebuilt > 0,
+                    "{what}: the card's rows are rebuilt: {dirty:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(slid_frames, 5, "every riding frame slid the card");
+}
+
+/// `l` moved `dy` pixels up.
+fn moved(l: &FxLayer, dy: i32) -> FxLayer {
+    let mut l = l.clone();
+    l.offset.1 -= dy;
+    l
+}
+
+/// LAYERS RIDING RANDOM SCROLLS EQUAL A FULL RENDER: over random sequences on
+/// a padded, headed 16-row grid, each frame streams 1-3 lines at the live
+/// bottom or wheels 1-2 rows either way, and each random layer (every slot,
+/// space and blend, clipped or not) rides the frame's shift exactly, stays
+/// put, or drifts a row off it, while occluders come and go. Every cached
+/// frame equals a full render, and the corpus reaches blitted frames that
+/// leave a riding layer's rows unrebuilt.
+///
+/// The negative controls are mutations (run by hand, recorded in the lane
+/// report): dropping any one clause of `fx_damage::rides_the_blit` (the clip,
+/// the occluders, the grid band, the offset's row delta) fails this sweep on a
+/// frame whose slid light the full render does not draw.
+#[test]
+fn layers_riding_random_scrolls_equal_a_full_render() {
+    let mut rend = renderer();
+    rend.set_pad(3);
+    rend.set_head(9);
+    let (cw, ch) = rend.cell_size();
+    let chi = i32::try_from(ch).expect("small");
+    let (rows, cols) = (16u16, 14u16);
+    let nr = usize::from(rows);
+    let mut rng = Rng(0x5eed_0b3c_0de5_7a11);
+    let (mut blits, mut slid) = (0usize, 0usize);
+    for seq in 0..24 {
+        let mut t = Terminal::new(rows, cols);
+        t.process(b"\x1b[?25l");
+        for i in 0..80 {
+            t.process(format!("s{seq} line {i}\r\n").as_bytes());
+        }
+        let mut layers: Vec<FxLayer> = (0..rng.range(1, 3))
+            .map(|id| {
+                let mut l = random_layer(&mut rng, id as u64, cw, ch);
+                l.offset.1 += rng.range(0, 8) as i32 * chi;
+                l
+            })
+            .collect();
+        let mut occluders: Vec<PxRect> = Vec::new();
+        let frame = |t: &mut Terminal, layers: &[FxLayer], occ: &[PxRect]| {
+            let mut i = with_layers(t, rows, cols, layers);
+            i.fx_occluders = occ.to_vec();
+            i
+        };
+        let mut wc = WindowCpu::new();
+        let _ = rend.render_input_cached(&mut wc, &frame(&mut t, &layers, &occluders));
+        let mut back = 0i32;
+        for step in 0..10 {
+            // The rows the content moves up this frame.
+            let up = match rng.below(3) {
+                0 if back < 30 => {
+                    let n = rng.range(1, 2) as i32;
+                    t.scroll_display(n);
+                    back += n;
+                    -n
+                }
+                1 if back > 0 => {
+                    let n = (rng.range(1, 2) as i32).min(back);
+                    t.scroll_display(-n);
+                    back -= n;
+                    n
+                }
+                _ if back == 0 => {
+                    let n = rng.range(1, 3) as i32;
+                    for k in 0..n {
+                        t.process(format!("s{seq} step {step}.{k}\r\n").as_bytes());
+                    }
+                    n
+                }
+                _ => {
+                    t.scroll_display(-back);
+                    let n = back;
+                    back = 0;
+                    n
+                }
+            };
+            let mut riding = Vec::new();
+            for l in &mut layers {
+                match rng.below(5) {
+                    0 => riding.push(false),
+                    1 => {
+                        l.offset.1 -= (up + [-1, 1][rng.below(2) as usize]) * chi;
+                        riding.push(false);
+                    }
+                    _ => {
+                        l.offset.1 -= up * chi;
+                        riding.push(true);
+                    }
+                }
+            }
+            if rng.below(4) == 0 {
+                occluders = if occluders.is_empty() {
+                    let y = i32::try_from(rend.grid_top()).expect("small")
+                        + rng.range(0, 15) as i32 * chi;
+                    vec![PxRect::new(i32::MIN, y, i32::MAX, y + chi)]
+                } else {
+                    Vec::new()
+                };
+            }
+            let input = frame(&mut t, &layers, &occluders);
+            let cached = rend.render_input_cached(&mut wc, &input).pixels().to_vec();
+            let damage = wc.last_damage();
+            let full = rend.render_input(&input);
+            assert_eq!(
+                diverging(&cached, &full.pixels),
+                0,
+                "sequence {seq}, step {step} ({up} up, {damage:?}): the cached frame equals a \
+                 full render"
+            );
+            if matches!(damage, DamageOutcome::Scroll { .. }) {
+                blits += 1;
+                let dirty = wc.dirty_rows();
+                slid += usize::from(layers.iter().zip(&riding).any(|(l, &r)| {
+                    let reach = layer_rows(&rend, nr, full.height, l);
+                    r && !reach.is_empty() && reach.iter().all(|&row| !dirty[row])
+                }));
+            }
+        }
+    }
+    eprintln!("riding random scrolls: {blits} blitted frames, {slid} slid a riding layer");
+    assert!(blits >= 60, "the corpus reaches the blit ({blits})");
+    assert!(slid >= 10, "the corpus slides riding layers ({slid})");
 }

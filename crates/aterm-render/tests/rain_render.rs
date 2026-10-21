@@ -419,9 +419,16 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
     let prev = frame(&settled, &halos, &atlas_v1);
     let cur = frame(&settled, &halos, &atlas_v1);
     let mut dirty = Vec::new();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(!d.rain_changed, "settled rain must not set rain_changed");
@@ -447,9 +454,16 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
         quad(4, [8, 64, 8, 16], [8, 0, 8, 16]),
     ];
     let cur = frame(&moved, &halos, &atlas_v1);
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(d.rain_changed, "moved quads must set rain_changed");
@@ -465,9 +479,16 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
     let mut mutated = settled.clone();
     mutated[3].ax = 8;
     let cur = frame(&mutated, &halos, &atlas_v1);
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(d.rain_changed);
@@ -479,9 +500,16 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
 
     // Atlas-version bump with byte-equal quads repaints every quad row.
     let cur = frame(&settled, &halos, &Arc::new(patterned_atlas(16, 16, 2)));
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -498,9 +526,16 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
     // Halo motion row 4 → 5: the [4, 5] band holds no settled quad, so the
     // marks are the prev∪cur halo rows alone.
     let cur = frame(&settled, &[halo(5, 0, 80, 8, 16, 0x0010_2010)], &atlas_v1);
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(!d.rain_changed, "settled quads must not set rain_changed");
@@ -574,9 +609,16 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
                 let prev = column(head - l..=head - 1, 0);
                 let cur = column(head - l + 1..=head, mt);
                 let mut dirty = Vec::new();
-                let DirtyDecision::Rows(_) =
-                    compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-                else {
+                let DirtyDecision::Rows(_) = compute_dirty_rows(
+                    &prev,
+                    &cur,
+                    false,
+                    None,
+                    false,
+                    None,
+                    aterm_render::RowBands::new(0, 16),
+                    &mut dirty,
+                ) else {
                     panic!("identical-geometry frames must take the row-damage path");
                 };
                 let (was, now) = (rows_of(&prev.rain_quads), rows_of(&cur.rain_quads));
@@ -658,9 +700,16 @@ fn real_rain_emission_leaves_no_changed_row_unmarked() {
         );
         cur.rain_atlas = engine.rain_atlas();
         let mut dirty = Vec::new();
-        if let DirtyDecision::Rows(_) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        {
+        if let DirtyDecision::Rows(_) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            aterm_render::RowBands::new(0, 16),
+            &mut dirty,
+        ) {
             row_frames += 1;
             let rebaked = prev.rain_atlas.as_ref().map(Arc::as_ptr)
                 != cur.rain_atlas.as_ref().map(Arc::as_ptr);

@@ -430,7 +430,7 @@ fn publish(
 
 /// `halt <reason>` / `halt off`.
 fn halt(cfg: &Config, cmd: &PersonCmd, person: &str, reason: Option<&str>) -> io::Result<()> {
-    let subject = format!("/f/{}/fleet/{person}/halt", cfg.fleet);
+    let subject = crate::subject::person_halt(&cfg.fleet, person);
     let mut body = format!(
         "v=1 t={} state={}",
         crate::now_ms(),
@@ -465,7 +465,7 @@ fn post(
     (sid, node, kind, re): (&str, &str, &str, Option<u64>),
     text: &str,
 ) -> io::Result<()> {
-    let subject = format!("/f/{}/in/{node}/{sid}/{person}/{kind}", cfg.fleet);
+    let subject = crate::subject::post_lane(&cfg.fleet, node, sid, person, kind);
     let mut body = Body::new(crate::now_ms());
     body.re = re;
     body.text = text.to_string();
@@ -505,8 +505,8 @@ fn inbox(
     peek: bool,
     out: &mut dyn io::Write,
 ) -> io::Result<()> {
-    let group = format!("/f/{}/cur/p/{person}/inbox", cfg.fleet);
-    let filter = format!("/f/{}/in/p/{person}/>", cfg.fleet);
+    let group = crate::subject::person_inbox_group(&cfg.fleet, person);
+    let filter = crate::subject::person_mail_filter(&cfg.fleet, person);
     let (mut conn, closer) = connect(cfg, cmd)?;
     // THE END OF THE MAIL IS THE BROKER'S MARK. A broker that sends none
     // cannot say "that was all", and an inbox that waited for silence instead
@@ -539,7 +539,7 @@ fn inbox(
     let mut sub = conn.subscribe_group(&group, &filter)?;
     // A broker that already answered and hung up leaves nothing to bound; its mail
     // is still read below, and its close ends the inbox in words.
-    transport::bound_reads(&closer, Some(astream_broker::IDLE_MARK_DEADLINE))?;
+    closer.set_read_timeout(Some(astream_broker::IDLE_MARK_DEADLINE))?;
     let cap = cmd.cap_files.join(" --cap-file ");
     let mut count = 0usize;
     loop {

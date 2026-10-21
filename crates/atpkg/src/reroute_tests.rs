@@ -2341,7 +2341,8 @@ fn run_stub(stub: &Path, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::p
 #[cfg(unix)]
 #[test]
 fn an_agents_stub_runs_the_twin_inside_aterm_and_the_users_own_copy_outside() {
-    for name in crate::stub::AGENT_PROGRAMS {
+    // Each program on its own store and its own copies: side by side.
+    crate::testdir::each_side_by_side(crate::stub::AGENT_PROGRAMS, |_, name| {
         let l = layout(&format!("agents-stub-{name}"));
         fake_twin(&l, name);
         lay(&l).unwrap();
@@ -2437,7 +2438,7 @@ fn an_agents_stub_runs_the_twin_inside_aterm_and_the_users_own_copy_outside() {
         let _ = std::fs::remove_dir_all(&local);
         let _ = std::fs::remove_dir_all(&brew);
         let _ = std::fs::remove_dir_all(&l.prefix);
-    }
+    });
 }
 
 /// NO RECURSION: a second reroute directory on PATH — another prefix's, holding its

@@ -63,6 +63,7 @@ fn stage(root: &Path) {
 #[test]
 #[cfg(unix)]
 fn what_it_writes_the_client_extracts_to_the_same_tree_root_with_links_kept() {
+    crate::shared::need_compressor();
     let tmp = scratch("tar-roundtrip");
     let root = tmp.path().join("stage");
     stage(&root);
@@ -98,6 +99,7 @@ fn what_it_writes_the_client_extracts_to_the_same_tree_root_with_links_kept() {
 #[test]
 #[cfg(unix)]
 fn the_archive_is_deterministic_whatever_the_stage_path_or_its_modes() {
+    crate::shared::need_compressor();
     let tmp = scratch("tar-determinism");
     let (a, b) = (tmp.path().join("one/stage"), tmp.path().join("two/x"));
     stage(&a);
@@ -128,6 +130,7 @@ fn a_symlink_or_an_empty_tree_is_refused() {
 /// 1 MiB cap (the floor), under the structure the client must read.
 #[test]
 fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content() {
+    crate::shared::need_compressor();
     let tmp = scratch("tar-size");
     let small = tmp.path().join("small");
     for i in 0..1500 {
@@ -160,6 +163,7 @@ fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content(
 #[test]
 #[cfg(unix)]
 fn a_compressor_that_fails_or_writes_another_stream_fails_the_pack() {
+    crate::shared::need_compressor();
     use aterm_zstd::frame::{self, Checksum};
     use std::ffi::OsStr;
 
@@ -247,6 +251,7 @@ fn the_compressor_probe_finds_only_an_executable_zstd() {
 #[test]
 #[cfg(unix)]
 fn a_compressor_loud_on_stderr_before_it_reads_still_packs() {
+    crate::shared::need_compressor();
     const CHILD: &str = "ATERM_PUBLISH_LOUD_COMPRESSOR_CHILD";
     const TEST: &str =
         "artifact::tarwrite::a_compressor_loud_on_stderr_before_it_reads_still_packs";

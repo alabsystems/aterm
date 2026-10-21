@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Style resolution: the selectable looks ([`GlowStyle`]), their spellings and
-//! compatibility aliases, and the resolved per-frame [`GlowConfig`].
+//! Style resolution: the selectable looks ([`GlowStyle`]), the spelling
+//! predicates that read the `spellings` table, and the resolved per-frame
+//! [`GlowConfig`]. The spellings and aliases themselves live in
+//! `cursor_glow::spellings`.
 
 use super::*;
 
@@ -19,17 +21,27 @@ pub enum GlowStyle {
     /// swept path, brighter and longer with typing heat, with a sparse
     /// twinkling starfield. The default presentation is the tall body: one
     /// smooth seven-anchor spectrum filling every swept glyph cell with the
-    /// letters inside it. `… tall` spellings name that geometry directly;
+    /// letters inside it (`… tall` spellings are aliases of the default);
     /// `… underline` spellings select the quieter highlighter plus
     /// under-baseline shoulder.
     RainbowKitty,
-    /// Phaser comet + a shower of additive spark particles.
+    /// A wide ribbon in one rolling hue (the whole streak steps round the wheel
+    /// a little each key; a multi-cell move sweeps half the wheel tail to
+    /// head) on its own tight bloom stack, plus a shower of night-sky grains:
+    /// round stardust and glitter, the odd crescent moon and mini-comet, and a
+    /// dealt four-point star. On a light ground the grains are ink and keep
+    /// off the letters.
     Sparkle,
     /// Black-body warm comet + rising, drifting embers.
     Fire,
-    /// A lightning bolt in storm violet ([`LASER_DEFAULT_COLOR`]) or the pinned
-    /// trail colour — dim tail brightening to the pure hue at the head, with a
-    /// tight same-hue bloom.
+    /// Lightning: a monochrome beam in storm violet ([`LASER_DEFAULT_COLOR`];
+    /// an explicit `cursor_trail_color` wins), its dim tail brightening to the
+    /// pure hue at the head around a white-hot filament core, a jagged strike
+    /// (white-hot main channel, same-hue forks) on a jump and short same-hue
+    /// crackle arcs off a hot typing run. Every bolt flashes once, and at most
+    /// three are born in any second. On a light ground the strike and crackles
+    /// are painted beneath the letters in a darkened ink of the hue, with no
+    /// white. Settings labels it "Lightning".
     Laser,
     /// Beam: a clean, steady tube of cool light with near-constant power along
     /// its length, no particles, scintillation or lightning. Instead of fading
@@ -38,6 +50,8 @@ pub enum GlowStyle {
     Beam,
     /// Fluid ocean wake — a deep-blue undertow under a thin travelling cyan
     /// crest — with droplets that spray up and arc back down under gravity.
+    /// On a light ground the wake is painted beneath the letters in the
+    /// ramp's darkened ink, and a landing lays the shared veil ripple.
     Water,
     /// Comet: an icy dust tail (white-hot at the head, freezing back through the
     /// base hue to a dusty tail) plus twinkling debris glitter shed along the
@@ -61,14 +75,13 @@ impl GlowStyle {
     /// (ribbon geometry, starfield, sound palette, momentum) is shared and the
     /// two companions differ only where one is drawn.
     ///
-    /// `rainbow kitty` and bare `kitty` are in this list: a style named kitty
-    /// should draw the cat, and the resident pet is visible from frame zero
-    /// where the flying head is a rare earned flypast. The flying head has its
-    /// own explicit spellings (`Self::style_names_flying_kitty`: `rainbow kitty
-    /// flying`, `flying kitty`, `kitty flying`), is offered in the Settings
-    /// picker (`prefs::CURSOR_TRAIL_STYLES`), and the historical aliases
-    /// `nyan rainbow` / `nyan` / `rainbow` still select it. The trail itself is
-    /// identical either way.
+    /// Read through [`spellings::canonical`]: true for the three canonical
+    /// rows that draw the cat (`rainbow kitty pet`, `rainbow kitty underline`,
+    /// `rainbow kitty flat`) and every alias of them, which includes
+    /// `rainbow kitty`, bare `kitty` and the `… tall` spellings. A style named
+    /// kitty draws the cat, and the underline and flat bodies are geometries,
+    /// not animals. The flying head keeps `rainbow kitty flying` and the
+    /// historical `nyan` / `rainbow` / `nyan rainbow` aliases.
     ///
     /// Both animals are never on glass at once: `app_render::trail_is_kitty_pet`
     /// ([`Self::style_names_any_pet`]) feeds `pet_mode`, the flying head is
@@ -76,37 +89,12 @@ impl GlowStyle {
     /// grounds a head already on glass once `pet_mode && sing <= 0.0`, including
     /// on a hot config reload. (The song tenure, `sing > 0.0`, is a bounded
     /// promise the pet does not own.)
-    ///
-    /// Every spelling [`Self::style_names_underline_ribbon`] recognizes takes the
-    /// pet too: the underline ribbon is a geometry, not an animal, and
-    /// `prefs::CURSOR_TRAIL_STYLE_ALIASES` canonicalises all four underline
-    /// spellings onto `"rainbow kitty underline"`
-    /// (`cursor_trail_style_aliases_agree_with_engine_parse` requires an alias
-    /// and its canonical to draw the same animal). The flying head keeps
-    /// `Self::style_names_flying_kitty` and the bare `nyan` / `rainbow` /
-    /// `nyan rainbow` aliases, none of which names a geometry.
     #[must_use]
     pub fn style_names_kitty_pet(s: &str) -> bool {
-        let s = s.trim();
-        [
-            "rainbow kitty pet",
-            "kitty pet",
-            "pet kitty",
-            // The bare spelling and word; the flying head keeps
-            // `style_names_flying_kitty` and the `nyan`/`rainbow` aliases.
-            "rainbow kitty",
-            "kitty",
-        ]
-        .iter()
-        .any(|o| s.eq_ignore_ascii_case(o))
-            || Self::style_names_underline_ribbon(s)
-            // The flat spelling: the A/B twin of the default body, differing in
-            // the body only, so the same resident.
-            || Self::style_names_flat_ribbon(s)
-            // The tall spellings: `… tall` names the geometry the default
-            // already draws (`ribbon_tall` is `!style_names_underline_ribbon`),
-            // so it must draw the default's animal too.
-            || Self::style_names_tall_ribbon(s)
+        matches!(
+            spellings::canonical(s),
+            Some("rainbow kitty pet" | "rainbow kitty underline" | "rainbow kitty flat")
+        )
     }
 
     /// Whether this style string explicitly asks for the flying kitty head
@@ -115,18 +103,13 @@ impl GlowStyle {
     ///
     /// Not consulted by the draw path (which asks
     /// [`Self::style_names_any_pet`]; the head is what a non-pet
-    /// [`GlowStyle::RainbowKitty`] draws). It declares the spellings in one
-    /// place for the picker and for
-    /// `every_kitty_spelling_draws_the_resident_and_flying_stays_reachable`,
-    /// which proves the two lists never overlap (an overlap would let the pet
-    /// silently win).
+    /// [`GlowStyle::RainbowKitty`] draws). Tests use it to prove the flying
+    /// and pet spellings never overlap (an overlap would let the pet silently
+    /// win).
     #[must_use]
     #[cfg(test)]
     pub fn style_names_flying_kitty(s: &str) -> bool {
-        let s = s.trim();
-        ["rainbow kitty flying", "flying kitty", "kitty flying"]
-            .iter()
-            .any(|o| s.eq_ignore_ascii_case(o))
+        spellings::canonical(s) == Some("rainbow kitty flying")
     }
 
     /// Whether this style string asks for the pet drawn as a dog
@@ -136,10 +119,7 @@ impl GlowStyle {
     /// in front of the caret differs.
     #[must_use]
     pub fn style_names_dog_pet(s: &str) -> bool {
-        let s = s.trim();
-        ["rainbow dog pet", "dog pet", "pet dog", "rainbow puppy pet"]
-            .iter()
-            .any(|o| s.eq_ignore_ascii_case(o))
+        spellings::canonical(s) == Some("rainbow dog pet")
     }
 
     /// Whether this style string asks for the full-body pet in any species: the
@@ -150,55 +130,22 @@ impl GlowStyle {
         Self::style_names_kitty_pet(s) || Self::style_names_dog_pet(s)
     }
 
-    /// Whether this style string explicitly spells the tall ribbon: a continuous
-    /// seven-anchor rainbow filling the glyph cell with the letters inside it.
+    /// Whether this style string selects the highlighter-plus-under-baseline
+    /// ribbon: `rainbow kitty underline` and its aliases.
     ///
-    /// True for exactly the four explicit `… tall` spellings. Every other
-    /// rainbow-kitty spelling (the bare name, cat/dog pet aliases, the flying
-    /// head, `nyan`/`rainbow`) also draws the tall body, the default; only the
-    /// `… underline` aliases select the highlighter-plus-under-baseline hybrid
-    /// (owner, 2026-08-29).
-    /// Both resolve to [`GlowStyle::RainbowKitty`], so every style-keyed table
-    /// is shared; only the body geometry forks at [`GlowConfig::ribbon_tall`].
-    #[must_use]
-    pub fn style_names_tall_ribbon(s: &str) -> bool {
-        let s = s.trim();
-        [
-            "rainbow kitty tall",
-            "rainbow tall",
-            "tall rainbow",
-            "nyan tall",
-        ]
-        .iter()
-        .any(|o| s.eq_ignore_ascii_case(o))
-    }
-
-    /// Whether this style string spells the highlighter-plus-under-baseline
-    /// ribbon explicitly.
-    ///
-    /// A raw-spelling predicate, not a geometry query: a bare `rainbow kitty`
-    /// (and every pet/flying/`nyan` spelling) draws the tall body while
-    /// returning `false` here and from [`Self::style_names_tall_ribbon`]. The
-    /// resolved geometry is `!style_names_underline_ribbon(raw)`; use this only
-    /// where what the string says matters (for example, the Settings label).
+    /// Every other rainbow spelling draws the tall body, the default (owner,
+    /// 2026-08-29), so the resolved geometry is
+    /// `!style_names_underline_ribbon(raw)` ([`GlowConfig::ribbon_tall`]).
     ///
     /// Not another [`GlowStyle`]: the classic field, scheduling, admission,
     /// companion, sound, sparkle, retract and delete machinery are one
     /// rainbow-kitty family; only the dark body geometry differs.
     #[must_use]
     pub fn style_names_underline_ribbon(s: &str) -> bool {
-        let s = s.trim();
-        [
-            "rainbow kitty underline",
-            "rainbow underline",
-            "underline rainbow",
-            "nyan underline",
-        ]
-        .iter()
-        .any(|o| s.eq_ignore_ascii_case(o))
+        spellings::canonical(s) == Some("rainbow kitty underline")
     }
 
-    /// Whether this style string spells the flat body explicitly
+    /// Whether this style string selects the flat body
     /// (`docs/design/RAINBOW-KITTY-V2.md` §30): the same shape at every cell, the
     /// bed alone below the row bottom, a uniform 18 ms edge-in.
     ///
@@ -211,15 +158,7 @@ impl GlowStyle {
     /// body (owner, 2026-09-13).
     #[must_use]
     pub fn style_names_flat_ribbon(s: &str) -> bool {
-        let s = s.trim();
-        [
-            "rainbow kitty flat",
-            "rainbow flat",
-            "flat rainbow",
-            "nyan flat",
-        ]
-        .iter()
-        .any(|o| s.eq_ignore_ascii_case(o))
+        spellings::canonical(s) == Some("rainbow kitty flat")
     }
 
     /// The resolved style's diagnostic name, printed by `trail status` beside the
@@ -243,8 +182,13 @@ impl GlowStyle {
     }
 
     /// Whether a resolved `classic` spelling names the mono face (the two-tone
-    /// `accent → color` tracer) rather than the default spectrum. Both spellings
-    /// resolve to [`Self::Classic`]; the fork lands where the colour is picked.
+    /// `accent → color` tracer) rather than the default spectrum: the old
+    /// `classic mono` spellings. They are aliases of `classic` in the
+    /// vocabulary ([`spellings::canonical`] answers `classic`), so this reads
+    /// the AUTHORED spelling, never the canonical one: a saved `classic mono`
+    /// still draws the mono face. Both faces resolve to [`Self::Classic`]; the
+    /// fork lands where the colour is picked (Classic with a trail colour
+    /// draws it too, `cursor_fx::resolve_glow_config`).
     #[must_use]
     pub fn style_names_classic_mono(style_raw: &str) -> bool {
         let s = style_raw.trim();
@@ -253,85 +197,15 @@ impl GlowStyle {
             .any(|o| s.eq_ignore_ascii_case(o))
     }
 
-    /// Parse a config string (case-insensitive); unknown → `Lumen`.
+    /// Parse a config string (trimmed, case-insensitive) through
+    /// [`spellings::canonical`]. `off` and an unknown spelling are `Lumen`,
+    /// the documented fallback of a page's `set_cursor_glow` (the native host
+    /// resolves unknown spellings to its own default before it gets here).
     pub fn parse(s: &str) -> Self {
-        // Case-insensitive without allocating (`eq_ignore_ascii_case`). The GUI
-        // resolves this once per config-asset generation, not per frame.
         let s = s.trim();
-        let any = |opts: &[&str]| opts.iter().any(|o| s.eq_ignore_ascii_case(o));
-        if any(&["phaser"]) {
-            Self::Phaser
-        } else if any(&[
-            "rainbow kitty",
-            // The bare word, admitted with the pet (`style_names_kitty_pet`): the
-            // companion predicate is consulted only for styles that parsed to
-            // `RainbowKitty`, so a pet spelling must land here or it would resolve
-            // to `Lumen` and fail `resident_pet_owner_present`'s style term.
-            "kitty",
-            "nyan rainbow",
-            "nyan",
-            "rainbow",
-            // The explicit flying-head spellings (`style_names_flying_kitty`):
-            // same ribbon and style, the head instead of the resident.
-            "rainbow kitty flying",
-            "flying kitty",
-            "kitty flying",
-            // The pet spellings resolve to the same style: the pet swaps the
-            // companion, not the trail (`style_names_kitty_pet`).
-            "rainbow kitty pet",
-            "kitty pet",
-            "pet kitty",
-            // …and the DOG spellings for the same reason again: a different
-            // species of the same companion, riding the same trail.
-            "rainbow dog pet",
-            "dog pet",
-            "pet dog",
-            "rainbow puppy pet",
-            // Presentation aliases: the tall body is the default; `… underline`
-            // selects the highlighter-plus-strip shoulder, and `… tall` spells the
-            // default out. Presentations of this style, not extra variants.
-            "rainbow kitty tall",
-            "rainbow tall",
-            "tall rainbow",
-            "nyan tall",
-            "rainbow kitty underline",
-            "rainbow underline",
-            "underline rainbow",
-            "nyan underline",
-            // The flat spellings (`style_names_flat_ribbon`): the A/B twin of the
-            // default comet body, a presentation of this same style.
-            "rainbow kitty flat",
-            "rainbow flat",
-            "flat rainbow",
-            "nyan flat",
-        ]) {
-            Self::RainbowKitty
-        } else if any(&["sparkle", "sparkles", "phaser-sparkle", "rainbow-sparkle"]) {
-            Self::Sparkle
-        } else if any(&["fire", "ember", "embers"]) {
-            Self::Fire
-        } else if any(&["laser"]) {
-            Self::Laser
-        } else if any(&["beam", "lightbeam", "light-beam"]) {
-            Self::Beam
-        } else if any(&["water", "ocean", "wave"]) {
-            Self::Water
-        } else if any(&["comet"]) {
-            Self::Comet
-        } else if any(&[
-            // `classic` is the picker's name.
-            "classic",
-            "classic wake",
-            // The mono face is a presentation of this style: the colour closure
-            // forks on the spelling (`style_names_classic_mono`).
-            "classic mono",
-            "classic lumen",
-            "mono classic",
-        ]) {
-            Self::Classic
-        } else {
-            Self::Lumen
-        }
+        spellings::row(s)
+            .and_then(|row| row.style)
+            .unwrap_or(Self::Lumen)
     }
     /// Whether this style spawns particles (sparks / embers / droplets /
     /// laser-ablation sparks / beam stardust / comet debris glitter).
@@ -424,14 +298,10 @@ pub struct GlowConfig {
     /// the underline presentation: an under-baseline strip plus a quieter
     /// glyph-band highlighter and momentum bloom toward the tapered typed
     /// streak. `true` is the default: the tall upward reach and full-strength
-    /// glyph-band shoulder, so the gradient fills the swept glyph cell. Ordinary
-    /// rainbow spellings and the four `… tall` aliases select it
-    /// (owner, 2026-08-29).
-    ///
-    /// The raw-name predicates are not complements: a bare `rainbow kitty`
-    /// answers `false` to both [`GlowStyle::style_names_tall_ribbon`] and
-    /// [`GlowStyle::style_names_underline_ribbon`] though its geometry is tall.
-    /// Resolve geometry with `!GlowStyle::style_names_underline_ribbon(raw)`.
+    /// glyph-band shoulder, so the gradient fills the swept glyph cell. Every
+    /// other rainbow spelling, the `… tall` aliases included, selects it
+    /// (owner, 2026-08-29). Resolve it with
+    /// `!GlowStyle::style_names_underline_ribbon(raw)`.
     ///
     /// There is one emitter; this flag selects only the upward reach and
     /// shoulder. Cohort admission, segment survival, retract, momentum,
@@ -463,6 +333,10 @@ pub struct GlowConfig {
 /// at, from which `cursor_trail_radius` scales it.
 pub const GLOW_RADIUS_DEFAULT: f32 = 0.6;
 
+/// The shipped `Length` (cells): the knob's default, against which a style
+/// whose tail is drawn by distance scales it (sparkle's gold rail).
+pub const GLOW_LENGTH_DEFAULT: usize = 24;
+
 /// One tuning knob of the cursor family that a style may or may not read:
 /// the `cursor_trail_*` keys the Settings Adjust card lists per style.
 /// (Every style reads its duration and brightness.)
@@ -488,9 +362,10 @@ pub enum TrailKnob {
 /// and the classic wake's colour face.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct KnobContext {
-    /// The ground is dark. On a light one Lumen and Sparkle draw no beam
-    /// (their glow and their stars are their look there), so nothing reads
-    /// their path's length or their tracer's accent.
+    /// The ground is dark. On a light one only Lumen (its glow behind the
+    /// caret) and Classic (its crown in ink, `classic_wake`) draw a crown,
+    /// so `Glow size` reaches no other style there, and no tracer fades from
+    /// the accent.
     pub dark: bool,
     /// The cursor is a bar: the light rod is its body in every style, and it
     /// wears an explicit trail colour.
@@ -530,9 +405,11 @@ impl GlowStyle {
     ///
     /// * `Length`: not the rainbow kitty's ribbon (its own walk), nor Laser,
     ///   Beam and Water, whose streaks span the whole move; Lumen's tracer
-    ///   and Sparkle's ribbon only where they are drawn, on a dark ground.
+    ///   and Sparkle's ribbon on either ground (on a light one they are ink
+    ///   under the letters, as long as the path).
     /// * `Radius`, `Ring`: not the rainbow kitty (the ribbon owns its head)
-    ///   or Beam (the tube is its whole look).
+    ///   or Beam (the tube is its whole look); on a light ground `Radius` is
+    ///   Lumen's alone, the one style that draws a crown there.
     /// * `Color`: every style's light rod on a bar cursor; on a block, not
     ///   the styles that colour from their own ramps (the rainbow kitty,
     ///   Fire, Water, Phaser's sweep).
@@ -548,10 +425,14 @@ impl GlowStyle {
         };
         match knob {
             TrailKnob::Length => match self {
-                Lumen | Sparkle => ctx.dark,
                 RainbowKitty | Laser | Beam | Water => false,
-                Phaser | Fire | Comet | Classic => true,
+                Lumen | Sparkle | Phaser | Fire | Comet | Classic => true,
             },
+            // On a light ground only Lumen (its glow behind the caret) and
+            // Classic (its crown as one ink mark on the caret's row) draw a
+            // crown; every other crown is light, which a light page cannot
+            // show.
+            TrailKnob::Radius if !ctx.dark => matches!(self, Lumen | Classic),
             TrailKnob::Radius | TrailKnob::Ring => !matches!(self, RainbowKitty | Beam),
             TrailKnob::Color => ctx.bar || !matches!(self, RainbowKitty | Fire | Water | Phaser),
             TrailKnob::Accent => match self {
@@ -598,7 +479,7 @@ pub fn style_has_beam(style_raw: &str) -> bool {
 /// [`style_has_beam`] for a caller that already parsed the style (the per-frame
 /// `glow_config` path), avoiding a re-parse while sharing one source of truth.
 /// `style_raw` is taken (currently unused) so a future raw-string distinction
-/// between spellings of one style needs no call-site changes.
+/// between spellings of one [`GlowStyle`] needs no call-site changes.
 #[must_use]
 pub fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
     !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty)
@@ -607,21 +488,27 @@ pub fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
 /// The default laser/lightning hue: storm violet (`0x00RRGGBB`), applied when
 /// no `cursor_trail_color` is pinned (a night strike is a white-violet flash).
 /// Blaze whitening still runs, so a hot bolt flashes white and cools to violet.
-/// An explicit trail colour wins, and every quad stays in that hue.
+/// An explicit trail colour wins, and every quad stays in that hue; a pinned
+/// cursor colour (config `cursor_color`, a live OSC 12) does NOT recolour it
+/// (`cursor_fx::glow_color_follows_live_cursor`).
 pub const LASER_DEFAULT_COLOR: u32 = 0x00B4_8CFF;
 
 /// The default beam hue: photon ice-blue (`0x00RRGGBB`), applied when no
-/// `cursor_trail_color` is pinned, so the tube reads as cool light (a
-/// searchlight, not a weapon). An explicit trail colour wins.
+/// `cursor_trail_color` is set and no cursor colour is pinned (config
+/// `cursor_color`, a live OSC 12 — either one recolours the tube), so the tube
+/// reads as cool light (a searchlight, not a weapon). An explicit trail colour
+/// wins.
 pub const BEAM_DEFAULT_COLOR: u32 = 0x008C_DCFF;
 
 /// The default sparkle hue: starlight gold (`0x00RRGGBB`), applied when no
-/// `cursor_trail_color` is pinned. Only the emitter block and monochrome accents
-/// use it; the ribbon stays rainbow.
+/// `cursor_trail_color` is set and no cursor colour is pinned (config
+/// `cursor_color`, a live OSC 12). Only the emitter block and monochrome
+/// accents use it; the ribbon stays rainbow.
 pub const SPARKLE_DEFAULT_COLOR: u32 = 0x00FF_D9A0;
 
 /// The default comet hue: pale glacial blue (`0x00RRGGBB`), applied when no
-/// `cursor_trail_color` is pinned (a comet is ice lit white-hot at the
-/// nucleus). An explicit trail colour wins, and the tail/coma/debris palette
-/// re-derives from it.
+/// `cursor_trail_color` is set and no cursor colour is pinned (config
+/// `cursor_color`, a live OSC 12) — a comet is ice lit white-hot at the
+/// nucleus. An explicit or pinned colour wins, and the tail/coma/debris
+/// palette and the cell bed re-derive from it.
 pub const COMET_DEFAULT_COLOR: u32 = 0x009E_D6FF;

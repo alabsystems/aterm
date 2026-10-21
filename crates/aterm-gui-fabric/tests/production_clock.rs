@@ -66,24 +66,24 @@ fn a_fenced_change_waits_the_production_bound_then_answers_busy() {
     // waited out first, so a verb waiting any bound but its session's fails
     // one of the two.
     session.fabric.set_fence_wait(Duration::ZERO);
-    assert_eq!(cmd_topic(&session, "add news").0, HOLD_BUSY);
+    assert_eq!(cmd_topic(&session, "add news"), HOLD_BUSY);
     assert_eq!(session.fabric.fence_waits(), 0, "a zero bound never parks");
     let bound = Duration::from_millis(50);
     session.fabric.set_fence_wait(bound);
     let started = Instant::now();
-    assert_eq!(cmd_topic(&session, "add news").0, HOLD_BUSY);
+    assert_eq!(cmd_topic(&session, "add news"), HOLD_BUSY);
     let waited = started.elapsed();
     assert!(
         waited >= bound,
         "answered busy after {waited:?}, inside the {bound:?} bound"
     );
     assert!(session.fabric.fence_waits() >= 1, "it parked on the fence");
-    let listed = cmd_topic(&session, "ls").0;
+    let listed = cmd_topic(&session, "ls");
     assert!(listed.starts_with("OK 0 "), "nothing changed: {listed}");
     session.fabric.lift_hold_fence();
-    let added = cmd_topic(&session, "add news").0;
+    let added = cmd_topic(&session, "add news");
     assert!(added.starts_with("OK news "), "{added}");
-    let listed = cmd_topic(&session, "ls").0;
+    let listed = cmd_topic(&session, "ls");
     assert!(listed.contains("topic news "), "{listed}");
 
     let own = Session {
@@ -94,7 +94,7 @@ fn a_fenced_change_waits_the_production_bound_then_answers_busy() {
         own.fabric.fence_hold(false);
         let before = own.fabric.fence_waits();
         std::thread::scope(|s| {
-            let waiter = s.spawn(|| cmd_topic(&own, verb).0);
+            let waiter = s.spawn(|| cmd_topic(&own, verb));
             let ended = aterm_spec::wait::within(
                 aterm_spec::wait::MUST_HAPPEN,
                 Duration::from_millis(1),

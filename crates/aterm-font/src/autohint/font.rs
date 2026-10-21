@@ -117,6 +117,15 @@ impl<'a> HintFont<'a> {
         self.face.tables().gsub
     }
 
+    /// The `GSUB` table's length in bytes (0 without one): what its walks
+    /// may spend ([`crate::work::LayoutWork`]).
+    pub(crate) fn gsub_len(&self) -> usize {
+        self.face
+            .raw_face()
+            .table(Tag::from_bytes(b"GSUB"))
+            .map_or(0, <[u8]>::len)
+    }
+
     /// The normalized location of user-space settings (empty: default).
     pub(crate) fn location(&self, settings: &[(u32, f32)]) -> Vec<F2Dot14> {
         super::location::location(self.fvar, self.avar, settings)

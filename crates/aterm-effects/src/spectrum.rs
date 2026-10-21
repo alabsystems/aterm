@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one spectrum (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2): the single
+//! The one spectrum (`docs/design/RAINBOW-KITTY-V2.md` §2.3, C1): the single
 //! colour rule the rainbow family resolves through.
 //!
 //! ```text

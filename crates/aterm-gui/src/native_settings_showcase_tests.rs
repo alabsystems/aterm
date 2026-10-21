@@ -11,7 +11,7 @@ use super::*;
 use crate::settings_preview::theme_card::Section;
 use showcase_page::{
     ShowcaseState, ShowcaseTrial, carried_override_keys, demo_font_candidate, palette_reset,
-    palette_with, save_as_text, save_name_problem,
+    palette_with, save_as_text, save_name_problem, suggested_save_name,
 };
 
 /// A Settings view on the Themes page over `source`, and the config service
@@ -303,6 +303,287 @@ fn showcase_try_then_revert_leaves_toml_byte_equal() {
         assert_eq!(state(&runtime, view).theme_trial_intent(), None, "{ending}");
         assert_eq!(service.snapshot().text.to_string(), before, "{ending}");
     }
+}
+
+/// Search Results or the compact category list replacing the Themes page
+/// end its trial, as leaving it does: the host reverts, nothing is written,
+/// the search preview draws the configured theme, and Escape goes to the
+/// surface on glass (the search, then the list), never to the hidden page
+/// (its trial, its filter). Focus alone (the search field before any text)
+/// keeps the trial: the page is still on glass.
+#[test]
+fn a_search_or_the_category_list_over_the_themes_page_ends_the_trial() {
+    let source = "theme = \"Dracula\"\n";
+    let (service, mut runtime, instance, view) = themes_view(source);
+    let before = service.snapshot().text.to_string();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.showcase.filter = crate::native_text_input::TextInputState::new("o".to_string());
+    }
+    let hearth = card_action(&runtime, view, "Hearth");
+    let mut effects = act(&mut runtime, instance, view, &hearth, None).effects;
+    assert_eq!(
+        state(&runtime, view).theme_trial_intent(),
+        Some(crate::control_theme::ThemeTrialIntent::Show(
+            "Hearth".to_string()
+        )),
+        "premise: Hearth is tried"
+    );
+    focus_key(&mut runtime, instance, view, "settings/search");
+    assert!(
+        state(&runtime, view).theme_trial_intent().is_some(),
+        "focus alone keeps the trial: the page is still on glass"
+    );
+    effects.extend(
+        runtime
+            .dispatch(instance, view, AppEvent::InsertText("bold".to_string()))
+            .unwrap()
+            .effects,
+    );
+    let replaced = state(&runtime, view);
+    assert_eq!(
+        replaced.search, "bold",
+        "premise: Search Results replace the page"
+    );
+    assert_eq!(replaced.theme_trial_intent(), None, "the trial ended");
+    assert_eq!(replaced.showcase_preview_id(), None);
+    let cx = view_cx_at(1_564.0, 854.0);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    for node in &compiled.semantics {
+        if node.key.as_str().starts_with("settings/preview/") {
+            assert!(
+                !format!("{:?}", node.value).contains("Hearth"),
+                "{}: the search preview draws the tried theme: {:?}",
+                node.key.as_str(),
+                node.value
+            );
+        }
+    }
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+        .unwrap();
+    let state_now = state(&runtime, view);
+    assert!(state_now.search.is_empty(), "Escape cleared the search");
+    assert_eq!(state_now.showcase.filter.value(), "o", "the filter stays");
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::ConfigPatch { .. })),
+        "nothing is written"
+    );
+    assert_eq!(service.snapshot().text.to_string(), before);
+
+    // The compact category list over the page.
+    let (_service, mut runtime, instance, view) = themes_view(source);
+    let hearth = card_action(&runtime, view, "Hearth");
+    act(&mut runtime, instance, view, &hearth, None);
+    assert!(state(&runtime, view).theme_trial_intent().is_some());
+    act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/compact-navigation",
+        None,
+    );
+    assert_eq!(state(&runtime, view).theme_trial_intent(), None);
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+        .unwrap();
+    assert!(
+        !state(&runtime, view).compact_navigation,
+        "Escape closed the list, not a trial it hid"
+    );
+}
+
+/// The Themes page keeps its heading at every size page_chrome keeps
+/// headings (it alone dropped it, at 80x24 and the shipped 102x29), and the
+/// filter field never moves while a filter is typed (the heading came back
+/// with "Nordz", which matched nothing, and the field dropped 39pt).
+#[test]
+fn the_themes_page_keeps_its_heading_and_its_filter_stays_put() {
+    for (width, height) in [
+        (584.0, 292.0),
+        (584.0, 348.0),
+        (584.0, 350.0),
+        (724.0, 380.0),
+        (724.0, 434.0),
+        (738.0, 418.0),
+        (1_074.0, 684.0),
+    ] {
+        let cx = view_cx_at(width, height);
+        let mut filter_y = None;
+        for filter in ["", "Nord", "Nordz"] {
+            let context = format!("{width}x{height} filter {filter:?}");
+            let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.showcase.filter =
+                    crate::native_text_input::TextInputState::new(filter.to_string());
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            // Nothing runs past the page's bottom: the demo gives up rows.
+            assert_zero_top_paint(&compiled, &context);
+            let heading = compiled
+                .semantic(&UiKey::new("settings/page-heading/themes"))
+                .unwrap_or_else(|| panic!("{context}: the page names itself"));
+            assert_eq!(heading.role, SemanticRole::Heading, "{context}");
+            let y = compiled
+                .semantic(&UiKey::new("settings/showcase/filter"))
+                .unwrap_or_else(|| panic!("{context}: the filter"))
+                .rect
+                .y;
+            match filter_y {
+                None => filter_y = Some(y),
+                Some(was) => assert_eq!(y, was, "{context}: the filter moved"),
+            }
+        }
+    }
+}
+
+/// Where `node`'s own top is: its painted rect's, uncut by the list's edge
+/// (its semantic rect is what shows of it).
+fn own_top(compiled: &crate::native_ui::CompiledUi, node: &crate::native_ui::SemanticNode) -> f32 {
+    compiled
+        .paint
+        .iter()
+        .find(|paint| paint.key == node.key)
+        .map_or(node.rect.y, |paint| paint.rect.y)
+}
+
+/// Every screen of the chooser names the section it starts in: a screen that
+/// starts inside BUILT IN repeats its caption over its first row there, as
+/// every Settings list repeats a group's caption; and the Customize sheet
+/// repeats COLORS over a screen that starts inside it.
+#[test]
+fn every_themes_screen_names_the_section_it_starts_in() {
+    let mut inside = 0;
+    for (width, height) in [(584.0, 350.0), (738.0, 418.0), (1_074.0, 684.0)] {
+        let cx = view_cx_at(width, height);
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let limit = state(&runtime, view).result_page_limit.get().unwrap_or(0);
+        for top in 0..=limit {
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.page_scroll = top;
+                state.page_reveal = None;
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let list = rect_of(&compiled, "settings/showcase/list");
+            // A list whose room cannot hold a caption over a row (the
+            // smallest windows, where the demo is down to one row) shows the
+            // row, its stop's content, and no caption can repeat.
+            if list.height < 24.0 + 8.0 + 32.0 {
+                continue;
+            }
+            let showcase = &state(&runtime, view).showcase;
+            // The first row whose top is on the screen.
+            let first = compiled
+                .semantics
+                .iter()
+                .filter(|node| node.role == SemanticRole::ListBoxOption && !node.offscreen)
+                .filter(|node| node.rect.y >= list.y - 0.5)
+                .min_by(|a, b| a.rect.y.total_cmp(&b.rect.y));
+            let Some(first) = first else {
+                continue;
+            };
+            let slug = first.key.as_str().trim_start_matches(ROW);
+            let Some(card) = showcase.card_by_slug(slug) else {
+                continue;
+            };
+            let Some(caption) = card.section.caption() else {
+                continue;
+            };
+            if card.section == Section::Community {
+                continue;
+            }
+            let heading = compiled.semantics.iter().find(|node| {
+                node.role == SemanticRole::Heading
+                    && !node.offscreen
+                    && node.label == caption
+                    && node.rect.y <= first.rect.y
+            });
+            assert!(
+                heading.is_some(),
+                "{width}x{height} screen {top}: {slug} with no {caption} over it"
+            );
+            inside += 1;
+        }
+    }
+    assert!(inside > 0, "some screen starts inside a captioned section");
+
+    // The Customize sheet: a screen that starts inside COLORS repeats it.
+    let mut inside = 0;
+    for (width, height) in [(584.0, 350.0), (738.0, 418.0)] {
+        let cx = view_cx_at(width, height);
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/customize",
+            None,
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let limit = state(&runtime, view).result_page_limit.get().unwrap_or(0);
+        for top in 0..=limit {
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.page_scroll = top;
+                state.page_reveal = None;
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let Some(list) = compiled
+                .semantic(&UiKey::new("settings/showcase/sheet-list"))
+                .map(|node| node.rect)
+            else {
+                continue;
+            };
+            // The first colour row whose top is on the screen: a row peeking
+            // in over the last screen's top is the screen before's.
+            let first = compiled
+                .semantics
+                .iter()
+                .filter(|node| !node.offscreen && own_top(&compiled, node) >= list.y - 0.5)
+                .filter(|node| {
+                    showcase_page::SHOWCASE_COLOR_KEYS
+                        .iter()
+                        .any(|key| node.key.as_str() == format!("settings/control/{key}"))
+                })
+                .min_by(|a, b| a.rect.y.total_cmp(&b.rect.y));
+            let Some(first) = first else {
+                continue;
+            };
+            if first.key.as_str()
+                == format!("settings/control/{}", showcase_page::SHOWCASE_COLOR_KEYS[0])
+                || list.height < 24.0 + 4.0 + 36.0
+            {
+                continue;
+            }
+            assert!(
+                compiled
+                    .semantics
+                    .iter()
+                    .any(|node| node.role == SemanticRole::Heading
+                        && !node.offscreen
+                        && node.label == "COLORS"
+                        && node.rect.y <= first.rect.y),
+                "{width}x{height} sheet screen {top}: {} with no COLORS over it",
+                first.key.as_str()
+            );
+            inside += 1;
+        }
+    }
+    let _ = inside;
 }
 
 /// Save as theme writes a file that reads back to exactly the colours the
@@ -1263,7 +1544,7 @@ fn save_as_during_a_trial_holds_it_until_the_select_lands() {
     finish_patch(&mut runtime, instance, view, select, true);
     assert_eq!(state(&runtime, view).theme_trial_intent(), None);
     let showcase = &state(&runtime, view).showcase;
-    let settled = showcase.settled.clone().expect("announced");
+    let settled = showcase.settled.clone().expect("announced").words;
     assert!(settled.ends_with(&showcase.label_of(&id)), "{settled}");
     assert!(!settled.ends_with(&showcase.label_of("Nord")), "{settled}");
 }
@@ -1346,6 +1627,8 @@ fn keep_from_the_keyboard_lands_on_the_kept_row() {
             studio_catalog("font_family = Berkeley Mono\n"),
         );
         let studio = card_action(&runtime, view, "Studio");
+        // The page is drawn before anything on it is pressed.
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
         let _ = act(&mut runtime, instance, view, &studio, None);
         if button == SHOWCASE_KEEP_COLOURS_KEY {
             let _ = act(
@@ -1506,10 +1789,7 @@ fn palette_slot_edit_writes_one_sparse_key() {
     // The notice names the slot as its chip does and says the colour, never
     // the raw key as an unknown one.
     let said = state_now.feedback.clone().unwrap_or_default();
-    assert!(
-        said.starts_with("Palette colour 12, bright blue "),
-        "{said}"
-    );
+    assert!(said.starts_with("Palette color 12, bright blue "), "{said}");
     assert!(said.contains("#123456"), "{said}");
     assert!(!said.contains("palette_overrides"), "{said}");
     assert!(!said.contains("Unknown key"), "{said}");
@@ -1655,49 +1935,66 @@ fn save_as_over_a_slot_override_selects_the_theme_and_clears_the_slot() {
         .unwrap();
     let said = state(&runtime, view).feedback.clone().unwrap_or_default();
     assert!(
-        said.contains(&format!("Palette colours now come from {id}")),
+        said.contains(&format!("Palette colors now come from {id}")),
         "{said}"
     );
     assert!(!said.contains("its default"), "{said}");
 }
 
 /// Save as over a pair that draws one theme on both sides selects the saved
-/// theme by Keep's rule, once the catalog knows what the saved theme is made
-/// for: a dark theme saved on a light OS takes both sides. The name alone
-/// (what the Save click knew) would have changed only the shown side,
-/// leaving the old theme on the other.
+/// theme by Keep's rule, as for any pair: only one side changes — the side
+/// the saved theme is made for (Dark, Hearth's, though this OS is light)
+/// where the page's Dark | Light segment names none, and the page then shows
+/// that side, the saved theme highlighted; the side the segment names once
+/// the person chose one. The old special case wrote the saved theme on both
+/// sides, a pair that follows nothing.
 #[test]
 fn save_as_over_a_one_theme_pair_selects_by_keeps_rule() {
-    let (mut service, mut runtime, instance, view) =
-        themes_view("theme = \"dark:Hearth,light:Hearth\"\n");
-    let (id, scheme, operation) = start_save_as(&mut runtime, instance, view);
-    assert_eq!(scheme.appearance, aterm_types::Appearance::Dark);
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::ThemesFinished {
-                operation,
-                outcome: ThemesOutcome::Saved { id: id.clone() },
-            },
-        )
-        .unwrap();
-    let published = publish_saved_catalog(&mut service, &mut runtime, instance, view, &id, scheme);
-    let patches = config_patches(&published);
-    assert_eq!(patches.len(), 1, "one select patch");
-    let (snapshot, _) = apply_real_config_patch(&mut service, &patches[0].0);
+    let select = |segment: Option<&str>| {
+        let (mut service, mut runtime, instance, view) =
+            themes_view("theme = \"dark:Hearth,light:Hearth\"\n");
+        if let Some(segment) = segment {
+            let _ = act(&mut runtime, instance, view, segment, None);
+        }
+        let (id, scheme, operation) = start_save_as(&mut runtime, instance, view);
+        assert_eq!(scheme.appearance, aterm_types::Appearance::Dark);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::ThemesFinished {
+                    operation,
+                    outcome: ThemesOutcome::Saved { id: id.clone() },
+                },
+            )
+            .unwrap();
+        let published =
+            publish_saved_catalog(&mut service, &mut runtime, instance, view, &id, scheme);
+        let patches = config_patches(&published);
+        assert_eq!(patches.len(), 1, "one select patch");
+        let (snapshot, _) = apply_real_config_patch(&mut service, &patches[0].0);
+        finish_patch(&mut runtime, instance, view, patches[0].1, true);
+        runtime
+            .dispatch(instance, view, AppEvent::ConfigChanged(snapshot.clone()))
+            .unwrap();
+        let highlighted = state(&runtime, view).highlighted_slug();
+        let saved = state(&runtime, view)
+            .showcase
+            .card_by_slug(highlighted.as_deref().unwrap_or_default())
+            .map(|card| card.id.clone());
+        (id, snapshot.config.theme.clone(), saved)
+    };
+    let (id, theme, highlighted) = select(None);
+    assert_eq!(theme, Some(format!("dark:{id},light:Hearth")));
     assert_eq!(
-        snapshot.config.theme.as_deref(),
-        Some(format!("dark:{id},light:{id}").as_str())
+        highlighted.as_deref(),
+        Some(id.as_str()),
+        "the page shows it"
     );
-    // The control: with the saved theme unknown (the Save click's view), the
-    // rule would have kept Hearth on the dark side.
-    let raw = Some("dark:Hearth,light:Hearth");
-    let unknown = crate::app_config::ThemeCatalog::empty();
-    assert_eq!(
-        prefs::theme_choice_value(raw, aterm_types::Appearance::Light, &id, &unknown).0,
-        format!("dark:Hearth,light:{id}")
-    );
+    // Negative control: the side the person chose wins.
+    let (id, theme, highlighted) = select(Some("settings/showcase/side/light"));
+    assert_eq!(theme, Some(format!("dark:Hearth,light:{id}")));
+    assert_eq!(highlighted.as_deref(), Some(id.as_str()));
 }
 
 fn hex(color: aterm_types::Rgb) -> String {
@@ -2242,6 +2539,50 @@ fn listed_ids(showcase: &ShowcaseState) -> BTreeSet<String> {
         .collect()
 }
 
+/// A COPY AN EARLIER RELEASE INSTALLED HAS NO COMMUNITY TWIN: a pack theme
+/// the chooser now shows under another name (its id kept), installed by a
+/// release that showed it under its id, is listed once, under Yours, and
+/// Community offers no second row that Keep would add again. Negative
+/// control: with no file, Community offers it under the name it is shown by.
+#[test]
+fn an_earlier_releases_pack_copy_has_no_community_twin() {
+    let renamed = aterm_theme_pack::themes()
+        .iter()
+        .find(|theme| theme.name != theme.id)
+        .expect("premise: a theme shown under another name");
+    let dir = aterm_tempfile::tempdir().expect("a themes folder");
+    for earlier in [false, true] {
+        if earlier {
+            let text = renamed.text.replacen(
+                &format!("\nname = {}\n", renamed.name),
+                &format!("\nname = {}\n", renamed.id),
+                1,
+            );
+            assert_ne!(text, renamed.text, "premise: the name line differs");
+            std::fs::write(dir.path().join(format!("{}.conf", renamed.id)), text).unwrap();
+        }
+        let mut showcase =
+            ShowcaseState::new(&crate::app_config::ThemeCatalog::discover_in(dir.path()));
+        showcase.pack_open = true;
+        let rows: Vec<(Section, String)> = showcase
+            .visible()
+            .into_iter()
+            .map(|index| &showcase.cards[index])
+            .filter(|card| {
+                card.id.eq_ignore_ascii_case(renamed.id)
+                    || card.label.eq_ignore_ascii_case(renamed.name)
+            })
+            .map(|card| (card.section, card.label.clone()))
+            .collect();
+        let want = if earlier {
+            (Section::Yours, renamed.id.to_string())
+        } else {
+            (Section::Community, renamed.name.to_string())
+        };
+        assert_eq!(rows, vec![want], "earlier copy: {earlier}");
+    }
+}
+
 /// COMMUNITY lists exactly the pack themes the folder has no file for, and
 /// only while it is open. Negative control: once the folder holds "Kanagawa
 /// Wave" its community row goes (its own row is under Yours).
@@ -2658,6 +2999,18 @@ fn focus_on(runtime: &mut NativeRuntime, view: crate::native_app::ViewId, key: &
     state.common.focus_visible = true;
 }
 
+/// The chooser scrolled back to the top of its list, as a reader scrolls it:
+/// the page opens on the highlighted row ([`SettingsViewState::reset_page_scroll`]),
+/// and a test of the list's first screen starts it there.
+fn list_at_top(runtime: &mut NativeRuntime, view: crate::native_app::ViewId) {
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!()
+    };
+    state.page_scroll = 0;
+    state.page_reveal = None;
+    state.scroll_record.replace(None);
+}
+
 fn intent(
     runtime: &NativeRuntime,
     view: crate::native_app::ViewId,
@@ -2983,7 +3336,7 @@ fn a_failed_pack_add_keeps_the_trial() {
     assert!(config_patches(&listed).is_empty());
 }
 
-/// With Match system on and the Light side chosen, Keep writes that side
+/// With Follow system on and the Light side chosen, Keep writes that side
 /// alone; the Dark side stays. Negative control: with one theme for both,
 /// Keep writes the plain name.
 #[test]
@@ -3028,6 +3381,310 @@ fn match_system_keep_writes_only_the_chosen_side() {
         config_patches(&kept)[0].0.edits[0].value.as_deref(),
         Some("Gruvbox Light")
     );
+}
+
+/// KEEP FILES A THEME BY THE SIDE IT IS MADE FOR: with Follow system on and
+/// no side chosen in the Dark | Light segment, keeping a light theme while the
+/// OS is dark replaces the Light side (the segment defaulted to the OS side
+/// and filed it under Dark) — and while it is tried the segment shows Light
+/// and the strip says "for Light". A dark theme still goes to Dark, and the
+/// light side's own theme, highlighted, is in use there, no trial. Negative
+/// controls: a side the person chose in the segment still wins, and Revert
+/// puts the page back on the side the OS picks.
+#[test]
+fn keep_files_a_theme_by_the_side_it_is_made_for() {
+    let mut cx = view_cx_at(1_284.0, 714.0);
+    cx.motion.system_dark = true;
+    let open = || {
+        let (service, mut runtime, instance, view) =
+            themes_view("theme = \"dark:Nord,light:Solarized Light\"\n");
+        let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        shown.presented_motion.set(cx.motion);
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        (service, runtime, instance, view)
+    };
+    let segment = |runtime: &NativeRuntime, instance, view| -> Vec<&'static str> {
+        let compiled = compile_settings_view(runtime, instance, view, &cx);
+        ["dark", "light"]
+            .into_iter()
+            .filter(|word| {
+                compiled
+                    .semantic(&UiKey::new(format!("settings/showcase/side/{word}")))
+                    .and_then(|node| node.state)
+                    .is_some_and(|state| state.selected)
+            })
+            .collect()
+    };
+    let strip = |runtime: &NativeRuntime, instance, view| -> String {
+        let compiled = compile_settings_view(runtime, instance, view, &cx);
+        compiled
+            .semantic(&UiKey::new(STATUS))
+            .map(|node| node.label.clone())
+            .unwrap_or_default()
+    };
+    let keep = |runtime: &mut NativeRuntime, instance, view| -> Option<String> {
+        let kept = act(runtime, instance, view, "settings/showcase/keep", None);
+        config_patches(&kept)
+            .first()
+            .and_then(|(patch, _)| patch.edits[0].value.clone())
+    };
+
+    // A light theme on a dark OS: tried for Light, kept on Light.
+    let (_service, mut runtime, instance, view) = open();
+    assert_eq!(
+        segment(&runtime, instance, view),
+        ["dark"],
+        "the OS side first"
+    );
+    let card = card_action(&runtime, view, "GitHub Light");
+    let _ = act(&mut runtime, instance, view, &card, None);
+    assert_eq!(segment(&runtime, instance, view), ["light"]);
+    let words = strip(&runtime, instance, view);
+    assert!(
+        words.contains("for Light") && words.contains("Solarized Light"),
+        "{words}"
+    );
+    assert_eq!(
+        keep(&mut runtime, instance, view).as_deref(),
+        Some("dark:Nord,light:GitHub Light")
+    );
+
+    // A dark theme goes to Dark; the light side's own theme is in use.
+    let (_service, mut runtime, instance, view) = open();
+    let solarized = card_action(&runtime, view, "Solarized Light");
+    let _ = act(&mut runtime, instance, view, &solarized, None);
+    assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
+    assert_eq!(segment(&runtime, instance, view), ["light"]);
+    let dracula = card_action(&runtime, view, "Dracula");
+    let _ = act(&mut runtime, instance, view, &dracula, None);
+    assert_eq!(segment(&runtime, instance, view), ["dark"]);
+    assert_eq!(
+        keep(&mut runtime, instance, view).as_deref(),
+        Some("dark:Dracula,light:Solarized Light")
+    );
+
+    // Negative control: the person's side wins.
+    let (_service, mut runtime, instance, view) = open();
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/side/dark",
+        None,
+    );
+    let card = card_action(&runtime, view, "GitHub Light");
+    let _ = act(&mut runtime, instance, view, &card, None);
+    assert_eq!(segment(&runtime, instance, view), ["dark"]);
+    assert_eq!(
+        keep(&mut runtime, instance, view).as_deref(),
+        Some("dark:GitHub Light,light:Solarized Light")
+    );
+
+    // Negative control: Revert is back on the OS side, its theme in use.
+    let (_service, mut runtime, instance, view) = open();
+    let card = card_action(&runtime, view, "GitHub Light");
+    let _ = act(&mut runtime, instance, view, &card, None);
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/revert",
+        None,
+    );
+    assert_eq!(segment(&runtime, instance, view), ["dark"]);
+    assert_eq!(
+        state(&runtime, view).highlighted_slug().as_deref(),
+        Some("nord")
+    );
+}
+
+/// THE CHOOSER COMES ON GLASS ON THE ROW IN USE, WHOLE: the list's first
+/// screen used to leave it wherever it fell — off the screen on a short
+/// window, cut by the chooser's bottom edge at 220×60 (GitHub Light, the
+/// last built-in row). Opening Themes, coming back to it from another page
+/// or from Search Results, and closing Customize land the list on it.
+/// Negative control: a row the filter hides asks for nothing, and the list
+/// starts at its top.
+#[test]
+fn the_chooser_comes_on_glass_on_the_row_in_use_whole() {
+    let whole = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+        compiled.paint.iter().any(|node| {
+            node.key.as_str() == key
+                && !node.peek
+                && node.clip.y <= node.rect.y + 0.01
+                && node.clip.bottom() + 0.01 >= node.rect.bottom()
+                && node.clip.width + 0.01 >= node.rect.width
+        })
+    };
+    // 220×60, 80×24 and between, at the 12px cell.
+    for (width, height) in [
+        (1_564.0, 852.0),
+        (584.0, 348.0),
+        (1_284.0, 714.0),
+        (900.0, 520.0),
+        (700.0, 420.0),
+    ] {
+        let cx = view_cx_at(width, height);
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"GitHub Light\"\n");
+        let row = card_action(&runtime, view, "GitHub Light");
+        let on_glass = |runtime: &mut NativeRuntime, step: &str| {
+            let compiled = compile_settings_view(runtime, instance, view, &cx);
+            assert!(
+                whole(&compiled, &row),
+                "{width}x{height} {step}: {row} whole"
+            );
+        };
+        on_glass(&mut runtime, "opening");
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/route/appearance",
+            None,
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let _ = act(&mut runtime, instance, view, "settings/route/themes", None);
+        on_glass(&mut runtime, "back from Appearance");
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/search",
+            Some("nord"),
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let _ = act(&mut runtime, instance, view, "settings/search-clear", None);
+        on_glass(&mut runtime, "back from Search Results");
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/customize",
+            None,
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/customize-done",
+            None,
+        );
+        on_glass(&mut runtime, "Customize closed");
+    }
+    // Negative control: a filter that hides the row in use lands on nothing.
+    let (_service, mut runtime, instance, view) = themes_view("theme = \"GitHub Light\"\n");
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/filter",
+        Some("nord"),
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/route/appearance",
+        None,
+    );
+    let _ = act(&mut runtime, instance, view, "settings/route/themes", None);
+    assert_eq!(state(&runtime, view).showcase_landing(), None);
+    assert_eq!(state(&runtime, view).page_reveal, None);
+}
+
+/// THE THEMES PAGE IS MEASURED, NEVER CUT: wherever the window is short,
+/// every part of it — the demo, the strip, the filter, the Dark | Light
+/// segment, each row, the Community disclosure, the footer, the Customize
+/// sheet's rows — is drawn whole on some screen of its list: the demo gives
+/// up rows, then the chooser's pinned parts join its list (beside the demo
+/// the footer first, then the filter), then the demo and the strip are the
+/// list's first stops. (At 80×24 at 2× the chooser got 122 of the 142pt its
+/// pinned filter and one row need: every row was cut on every screen.)
+#[test]
+fn every_part_of_the_themes_page_is_whole_on_some_screen() {
+    // The stops of the page: the demo, the strip's words and buttons (a list
+    // with a hard edge may cut the strip's empty band under them, never what
+    // it holds), the chooser's parts and rows, the sheet's colour rows.
+    let part = |key: &str| {
+        key == "settings/showcase/stage"
+            || key == "settings/showcase/status/title"
+            || key == "settings/showcase/customize"
+            || key == "settings/showcase/customize-done"
+            || key == "settings/showcase/filter"
+            || key == "settings/showcase/side"
+            || key == "settings/showcase/pack"
+            || key == "settings/showcase/footer/follow"
+            || key == "settings/showcase/footer/links"
+            || key == "settings/showcase/sheet-title"
+            || key == "settings/showcase/colours/heading"
+            || (key.starts_with("settings/showcase/card/") && key.matches('/').count() == 3)
+            || (key.starts_with("settings/row/") && key.contains("showcase"))
+    };
+    let whole = |node: &crate::native_ui::PaintNode| {
+        !node.peek
+            && node.clip.y <= node.rect.y + 0.5
+            && node.clip.bottom() + 0.5 >= node.rect.bottom()
+    };
+    at_each_text_scale(&[1.0, 2.0], "themes screens", |scale| {
+        for source in [
+            "theme = \"Dracula\"\n",
+            "theme = \"dark:Nord,light:GitHub Light\"\n",
+        ] {
+            for sheet in [false, true] {
+                // 80×24, 80×20, 80×16 and 60×12 of the 12px cell, and short
+                // windows wide enough to set the chooser beside the demo
+                // (each with room for the page's tallest stop at 2×).
+                for (width, height) in [
+                    (584.0, 348.0),
+                    (584.0, 292.0),
+                    (584.0, 236.0),
+                    (444.0, 180.0),
+                    (1_284.0, 236.0),
+                    (1_564.0, 236.0),
+                    (1_564.0, 320.0),
+                ] {
+                    let (_service, mut runtime, instance, view) = themes_view(source);
+                    if sheet {
+                        let _ = act(
+                            &mut runtime,
+                            instance,
+                            view,
+                            "settings/showcase/customize",
+                            None,
+                        );
+                    }
+                    let cx = view_cx_at(width, height);
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut shown_whole = std::collections::BTreeSet::new();
+                    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+                        for node in &compiled.paint {
+                            let key = node.key.as_str();
+                            if !part(key) || node.clip.height <= 0.0 {
+                                continue;
+                            }
+                            seen.insert(key.to_string());
+                            if whole(node) {
+                                shown_whole.insert(key.to_string());
+                            }
+                        }
+                    });
+                    let never: Vec<&String> = seen.difference(&shown_whole).collect();
+                    assert!(
+                        never.is_empty(),
+                        "{width}×{height} at {scale}× over {source:?} (sheet {sheet}): \
+                         never whole on any screen: {never:?}"
+                    );
+                    assert!(
+                        seen.contains("settings/showcase/stage"),
+                        "{width}×{height} at {scale}×: the demo is drawn"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Keep ▾'s chevron is there for a theme that carries type and can be kept
@@ -3305,24 +3962,37 @@ fn the_demo_is_present_at_every_shape() {
 /// terminal's line height makes the demo's rows: the demo gives up rows
 /// rather than leave the list short of its tallest stop. (Six rows on
 /// Windows' default 1.1 line left the list 19pt at 584×348, and the
-/// Community disclosure was cut to 25 of its 32pt.) Every screen draws its
-/// controls inside the chooser, under a demo that still shows, each live
-/// over exactly what shows of it and cut, if at all, only by the list's
-/// edge (THE LIST'S EDGE RULE), and holds one at least whole.
+/// Community disclosure was cut to 25 of its 32pt; that window now sets the
+/// demo beside the chooser, and is held to the same.) Every screen draws its
+/// controls inside the chooser, under or beside a demo that still shows,
+/// each live over exactly what shows of it and cut, if at all, only by the
+/// list's edge (THE LIST'S EDGE RULE) — the top edge of a screen's rows
+/// under the caption it repeats over them, where the last screen's peek
+/// comes in — and holds one at least whole.
 #[test]
 fn the_stacked_chooser_holds_a_whole_stop_at_every_line_height() {
-    for line_height in ["1.0", "1.1", "1.5"] {
+    for (line_height, width) in ["1.0", "1.1", "1.5"]
+        .into_iter()
+        .flat_map(|line_height| [(line_height, 556.0), (line_height, 584.0)])
+    {
         let (_service, mut runtime, instance, view) =
             themes_view(&format!("line_height = {line_height}\n"));
-        let cx = view_cx_at(584.0, 348.0);
+        let cx = view_cx_at(width, 348.0);
         each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
-            let context = format!("line height {line_height}, screen {top}");
+            let context = format!("{width}x348 line height {line_height}, screen {top}");
             assert!(
                 rect_of(compiled, STAGE).height > 0.0,
                 "{context}: the demo shows"
             );
             let chooser = rect_of(compiled, "settings/showcase/chooser");
             let list = rect_of(compiled, showcase_page::SHOWCASE_LIST);
+            // Where a screen repeats a section's caption over its rows, the
+            // rows' frame starts under it.
+            let rows_top = compiled
+                .paint
+                .iter()
+                .find(|paint| paint.key.as_str().ends_with("/scrolled-rows"))
+                .map_or(list.y, |paint| paint.rect.y);
             let mut whole = 0;
             for hit in &compiled.hits {
                 let paint = compiled
@@ -3339,7 +4009,8 @@ fn the_stacked_chooser_holds_a_whole_stop_at_every_line_height() {
                     whole += 1;
                 } else {
                     assert!(
-                        paint.rect.y < list.y - 0.01 || paint.rect.bottom() > list.bottom() + 0.01,
+                        paint.rect.y < rows_top - 0.01
+                            || paint.rect.bottom() > list.bottom() + 0.01,
                         "{context}: {:?} {:?} is cut inside the list {list:?}",
                         hit.key,
                         paint.rect
@@ -3811,6 +4482,175 @@ fn failed_theme_files_list_under_needs_attention() {
     assert_eq!(intent(&runtime, view), show("Harbour"));
 }
 
+/// NEEDS ATTENTION HOLDS ONLY THE FILES THAT DID NOT LOAD (the review of the
+/// themes page, ox4-1: with a theme file that failed, Aterm Night, Aterm Day
+/// — the theme in use — Hearth and Linen sat in NEEDS ATTENTION's card, its
+/// caption repeated over Linen where a screen started there). Under it the
+/// signature themes take a caption of their own, ATERM, and on every screen
+/// of the list — at the 864×574 window the review imaged and at the page's
+/// other shapes — the caption nearest over each row is its own section's,
+/// never NEEDS ATTENTION. NEGATIVE CONTROLS: with no file failing, the
+/// signature themes lead the list uncaptioned, as ever; and the list's
+/// blocks without their caption (the grouping that misread) put them in
+/// NEEDS ATTENTION's card, which with it holds the failed file alone.
+#[test]
+fn needs_attention_holds_only_the_files_that_did_not_load() {
+    const ATTENTION: &str = "NEEDS ATTENTION";
+    let dir = aterm_tempfile::tempdir().expect("a themes folder");
+    std::fs::write(dir.path().join("Broken.conf"), "foreground = \"#zz\"\n=\n").unwrap();
+    let failing = |failed: bool| {
+        let (mut service, mut runtime, instance, view) = themes_view("theme = \"Aterm Day\"\n");
+        if failed {
+            let published = service.replace_theme_catalog(std::sync::Arc::new(
+                crate::app_config::ThemeCatalog::discover_in(dir.path()),
+            ));
+            let _ = dispatch(
+                &mut runtime,
+                instance,
+                view,
+                AppEvent::ConfigChanged(published),
+            );
+        }
+        (service, runtime, instance, view)
+    };
+    // The caption each row's section is listed under, with NEEDS ATTENTION
+    // over the list.
+    let own = |section: Section| section.caption_after_rows(true);
+    let mut signature_captioned = 0;
+    for (width, height) in [(864.0, 574.0), (584.0, 350.0), (1_284.0, 714.0)] {
+        let cx = view_cx_at(width, height);
+        let (_service, mut runtime, instance, view) = failing(true);
+        assert_eq!(
+            state(&runtime, view).showcase.attention.len(),
+            1,
+            "premise: one file failed"
+        );
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let limit = state(&runtime, view).result_page_limit.get().unwrap_or(0);
+        for top in 0..=limit {
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.page_scroll = top;
+                state.page_reveal = None;
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let Some(list) = compiled
+                .semantic(&UiKey::new(showcase_page::SHOWCASE_LIST))
+                .map(|node| node.rect)
+            else {
+                continue;
+            };
+            // On the list: the sidebar's captions sit beside it.
+            let on_list = |rect: LogicalRect| {
+                rect.x >= list.x - 0.5
+                    && rect.x < list.right() - 0.5
+                    && rect.y >= list.y - 0.5
+                    && rect.y < list.bottom() - 0.5
+            };
+            let captions: Vec<_> = compiled
+                .semantics
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticRole::Heading && !node.offscreen && on_list(node.rect)
+                })
+                .collect();
+            let showcase = &state(&runtime, view).showcase;
+            for row in compiled.semantics.iter().filter(|node| {
+                node.role == SemanticRole::ListBoxOption && !node.offscreen && on_list(node.rect)
+            }) {
+                let slug = row.key.as_str().trim_start_matches(ROW);
+                let Some(card) = showcase.card_by_slug(slug) else {
+                    continue;
+                };
+                if card.section == Section::Community {
+                    continue;
+                }
+                let Some(over) = captions
+                    .iter()
+                    .filter(|caption| caption.rect.y <= row.rect.y)
+                    .max_by(|a, b| a.rect.y.total_cmp(&b.rect.y))
+                else {
+                    continue;
+                };
+                assert_ne!(
+                    over.label, ATTENTION,
+                    "{width}x{height} screen {top}: {} under NEEDS ATTENTION",
+                    card.id
+                );
+                assert_eq!(
+                    Some(over.label.as_str()),
+                    own(card.section),
+                    "{width}x{height} screen {top}: {} under {}",
+                    card.id,
+                    over.label
+                );
+                if card.section == Section::Signature {
+                    signature_captioned += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        signature_captioned > 0,
+        "premise: a signature row is listed under a caption"
+    );
+
+    // NEGATIVE CONTROL: no file failing, the signature themes lead the list
+    // uncaptioned.
+    let cx = view_cx_at(864.0, 574.0);
+    let (_service, mut runtime, instance, view) = failing(false);
+    list_at_top(&mut runtime, view);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/showcase/section/signature"))
+            .is_none(),
+        "the signature themes lead uncaptioned"
+    );
+
+    // NEGATIVE CONTROL: the grouping. With their caption the attention card
+    // holds the failed file's row alone; without it, the rows after it too.
+    let (_service, runtime, _instance, view) = failing(true);
+    let state = state(&runtime, view);
+    let failed = format!("{ROW}{}", state.showcase.attention[0].slug);
+    let attention_rows = |blocks: Vec<(UiNode, f32, Option<String>)>| {
+        showcase_page::section_items(blocks, 300.0, true)
+            .into_iter()
+            .find_map(|item| match item {
+                scroll::ListItem::Split(card)
+                    if card.key == "settings/showcase/section-rows/attention" =>
+                {
+                    Some(
+                        card.rows
+                            .iter()
+                            .map(|(node, _)| node.key.as_str().to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => None,
+            })
+            .expect("the attention card")
+    };
+    let blocks = showcase_page::list_blocks(state, 300.0, false);
+    assert_eq!(attention_rows(blocks.clone()), vec![failed.clone()]);
+    let uncaptioned: Vec<_> = blocks
+        .into_iter()
+        .filter(|(node, ..)| {
+            !node
+                .key
+                .as_str()
+                .starts_with("settings/showcase/section/signature")
+        })
+        .collect();
+    let misread = attention_rows(uncaptioned);
+    assert!(
+        misread.len() > 1 && misread[0] == failed,
+        "the control: {misread:?}"
+    );
+}
+
 /// Beside the demo the chooser panel holds every part inside its inset, and
 /// its footer sits on the panel's bottom edge whether the list is full or a
 /// filter leaves it one row.
@@ -3973,8 +4813,12 @@ fn colour_rows_are_one_line_with_one_field_column() {
         let mut right = None;
         for key in showcase_page::SHOWCASE_COLOR_KEYS {
             // A row off the sheet's screen is in the tree where scrolling
-            // brings it; its painted name is checked where it is drawn.
-            let field = rect_of(&compiled, &format!("settings/control/{key}"));
+            // brings it; its painted name is checked where it is drawn, beside
+            // the field as painted (a field the sheet's edge cuts answers over
+            // the part that shows, so its live rect is shorter than its row).
+            let control = format!("settings/control/{key}");
+            let field =
+                paint_rect(&compiled, &control).unwrap_or_else(|| rect_of(&compiled, &control));
             if let Some(label) = paint_rect(&compiled, &format!("settings/label/{key}")) {
                 assert!(
                     (label.y - field.y).abs() < 0.5 && (label.height - field.height).abs() < 0.5,
@@ -4244,4 +5088,1053 @@ fn a_closed_disclosure_opens_for_a_row_it_holds() {
         compiled.semantic(&pack_row).is_some(),
         "the community row is listed"
     );
+}
+
+/// A LIST IS SEATED ONCE PER RENDER: a theme of your own that turns up
+/// (listed under YOURS, over Community) while the keyboard is on a Community
+/// row in the middle of the screen moves the list by the rows it adds, so
+/// that row stays where it was, and every row is in the tree once. (Two
+/// seatings in one render put the screen's rows off it too, and the page did
+/// not compile: `DuplicateKey`.) Negative control: seating that list a
+/// second time in the same render chooses another top.
+#[test]
+fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
+    let cx = view_cx_at(1_284.0, 684.0);
+    let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    let _ = act(&mut runtime, instance, view, "settings/showcase/pack", None);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    list_at_top(&mut runtime, view);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    let order = state(&runtime, view).showcase.listed();
+    let community = |runtime: &NativeRuntime, slug: &str| {
+        state(runtime, view)
+            .showcase
+            .card_by_slug(slug)
+            .is_some_and(|card| card.section == Section::Community)
+    };
+    let first = order
+        .iter()
+        .position(|slug| community(&runtime, slug))
+        .expect("the open disclosure lists Community");
+    let _ = dispatch(
+        &mut runtime,
+        instance,
+        view,
+        AppEvent::ScrollLines(i32::try_from(first).unwrap() - 2),
+    );
+    let scrolled = compile_settings_view(&runtime, instance, view, &cx);
+    let shown: Vec<String> = scrolled
+        .semantics
+        .iter()
+        .filter(|node| node.role == SemanticRole::ListBoxOption && !node.offscreen)
+        .map(|node| node.key.as_str().to_string())
+        .filter(|key| community(&runtime, key.strip_prefix(ROW).unwrap_or(key)))
+        .collect();
+    // A Community row with rows of the screen under it: not at its edge.
+    let target = shown.get(2).expect("Community rows on the screen").clone();
+    let _ = act(&mut runtime, instance, view, &target, None);
+    let before = compile_settings_view(&runtime, instance, view, &cx);
+    let at = rect_of(&before, &target);
+    assert!(
+        !before
+            .semantic(&UiKey::new(target.as_str()))
+            .unwrap()
+            .offscreen
+    );
+
+    let _ = admit_catalog(
+        &mut service,
+        &mut runtime,
+        instance,
+        view,
+        vec![user_scheme("Harbour", aterm_types::Appearance::Dark)],
+    );
+    let after = compile_settings_view(&runtime, instance, view, &cx);
+    let listed = state(&runtime, view).showcase.listed();
+    let harbour = listed
+        .iter()
+        .position(|slug| id_of(&runtime, view, slug) == "Harbour")
+        .expect("the new theme is listed");
+    let held = listed
+        .iter()
+        .position(|slug| format!("{ROW}{slug}") == target)
+        .expect("the row is still listed");
+    assert!(harbour < held, "the new row is over the keyboard's");
+    let node = after
+        .semantic(&UiKey::new(target.as_str()))
+        .expect("in the tree");
+    assert!(!node.offscreen, "{target} stays on the screen");
+    assert_eq!(node.rect, at, "{target} holds its place");
+    assert_eq!(
+        drawn_rows(&after).len(),
+        listed.len(),
+        "each listed row is in the tree once"
+    );
+
+    let state = state(&runtime, view);
+    let (plan, shown) = state.scroll_shown().expect("the render recorded it");
+    let reseated = state.seat_scroll(&mut plan.clone());
+    assert_ne!(
+        reseated.start, shown.start,
+        "the control: a second seating in one render moves the list"
+    );
+}
+
+/// The words a text node `key` paints.
+fn painted_text(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<String> {
+    compiled.paint.iter().find_map(|node| match &node.content {
+        UiContent::Text(text) if node.key.as_str() == key => Some(text.text.clone()),
+        _ => None,
+    })
+}
+
+/// Whether the compiled tree draws `key` with the keyboard on it.
+fn has_focus(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
+    compiled
+        .semantic(&UiKey::new(key))
+        .and_then(|node| node.state)
+        .is_some_and(|state| state.focused)
+}
+
+/// AN UNDO TAKES THE THEME BACK, AND THE STRIP AND THE KEYBOARD WITH IT: Nord
+/// kept from the keyboard, then Undo — Dracula is in use again, the strip's
+/// live region no longer says what the Keep settled on and names Dracula,
+/// and the keyboard is on Dracula's row, the highlighted one, so the arrows
+/// step from there. Negative control: before the Undo the strip says the
+/// words the Keep settled on, for Nord, and the keyboard is on Nord's row.
+#[test]
+fn undo_of_a_keep_takes_the_strip_and_the_keyboard_to_the_restored_theme() {
+    let (width, height) = (1_284.0, 714.0);
+    let mut lab = super::modified::Lab::new("theme = \"Dracula\"\n");
+    lab.state_mut().navigate(SettingsRoute::Themes);
+    let _ = lab.compile(width, height);
+    let row_of = |lab: &super::modified::Lab, id: &str| {
+        let slug = lab
+            .state()
+            .showcase
+            .cards
+            .iter()
+            .find(|card| card.id == id)
+            .map(|card| card.slug.clone())
+            .unwrap_or_else(|| panic!("{id} has a row"));
+        format!("{ROW}{slug}")
+    };
+    let nord = row_of(&lab, "Nord");
+    let dracula = row_of(&lab, "Dracula");
+    let status = |lab: &super::modified::Lab| {
+        lab.compile(width, height)
+            .semantic(&UiKey::new(STATUS))
+            .expect("the strip")
+            .label
+            .clone()
+    };
+    lab.dispatch(AppEvent::FocusChanged(Some(UiKey::new(nord.as_str()))));
+    assert!(lab.invoke(&nord, None).is_none(), "Return tries");
+    let _ = lab.commit(&nord, None);
+    assert_eq!(lab.state().configured_theme_id(), "Nord");
+    let settled = lab
+        .state()
+        .showcase
+        .settled
+        .clone()
+        .expect("the Keep settles the strip");
+    assert_eq!(settled.id, "Nord");
+    assert!(status(&lab).starts_with(&settled.words), "{}", status(&lab));
+    assert!(has_focus(&lab.compile(width, height), &nord));
+
+    lab.undo().expect("the Keep is offered for Undo");
+    assert_eq!(lab.state().configured_theme_id(), "Dracula");
+    let said = status(&lab);
+    assert!(!said.contains(&settled.words), "{said}");
+    assert!(!said.contains("Nord"), "{said}");
+    assert!(
+        said.contains(&lab.state().showcase.label_of("Dracula")),
+        "{said}"
+    );
+    assert_eq!(
+        lab.state()
+            .highlighted_slug()
+            .map(|slug| format!("{ROW}{slug}")),
+        Some(dracula.clone())
+    );
+    let compiled = lab.compile(width, height);
+    assert!(has_focus(&compiled, &dracula), "the keyboard is on Dracula");
+    assert!(!has_focus(&compiled, &nord));
+}
+
+/// SAVE AS THEME PUTS THE KEYBOARD BACK ON SAVE AS THEME: Return in the name
+/// field, or Save, closes the name row, and the keyboard goes to the button
+/// that opened it, which the sheet draws focused — as Cancel and Escape send
+/// it. Negative control: while the row is open the keyboard is in the name
+/// field, a node that leaves the tree with the row.
+#[test]
+fn saving_puts_the_keyboard_back_on_save_as_theme() {
+    let cx = view_cx_at(1_284.0, 714.0);
+    for by_return in [true, false] {
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/save-as",
+            None,
+        );
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/save-name",
+            Some("Nord Mine"),
+        );
+        let open = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            has_focus(&open, "settings/showcase/save-name"),
+            "{by_return}"
+        );
+        let saved = if by_return {
+            dispatch(
+                &mut runtime,
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::Submit),
+            )
+        } else {
+            act(&mut runtime, instance, view, "settings/showcase/save", None)
+        };
+        assert!(
+            matches!(
+                themes_request(&saved),
+                Some((ThemesRequest::Save { .. }, _))
+            ),
+            "{by_return}: it saves"
+        );
+        let after = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            after
+                .semantic(&UiKey::new("settings/showcase/save-name"))
+                .is_none()
+        );
+        assert!(
+            has_focus(&after, "settings/showcase/save-as"),
+            "{by_return}: the keyboard is on Save as theme"
+        );
+    }
+}
+
+/// A ROW THAT LEAVES THE LIST TAKES NO KEYBOARD WITH IT: a theme of your own
+/// moved to the Trash from its row's Trash goes from the list once the
+/// folder is read again, and the keyboard goes to the row that followed it,
+/// or, for the last row, the one before it — never to nothing. Negative
+/// control: until the catalog drops the row the keyboard stays on its Trash.
+#[test]
+fn trashing_a_row_puts_the_keyboard_on_its_neighbour() {
+    let cx = view_cx_at(1_284.0, 934.0);
+    let mine = || {
+        vec![
+            user_scheme("harbour", aterm_types::Appearance::Dark),
+            user_scheme("lagoon", aterm_types::Appearance::Dark),
+            user_scheme("paper", aterm_types::Appearance::Light),
+        ]
+    };
+    for (trashed, neighbour) in [("lagoon", "paper"), ("paper", "lagoon")] {
+        let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        let _ = admit_catalog(&mut service, &mut runtime, instance, view, mine());
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let row = card_action(&runtime, view, trashed);
+        let trash = format!("{row}/trash");
+        let _ = act(&mut runtime, instance, view, &trash, None);
+        let (request, operation) =
+            themes_request(&act(&mut runtime, instance, view, &trash, None)).expect("moved");
+        assert!(matches!(request, ThemesRequest::Trash { .. }));
+        let _ = dispatch(
+            &mut runtime,
+            instance,
+            view,
+            AppEvent::ThemesFinished {
+                operation,
+                outcome: ThemesOutcome::Trashed {
+                    id: trashed.to_string(),
+                },
+            },
+        );
+        assert_eq!(
+            state(&runtime, view)
+                .common
+                .last_focus
+                .as_ref()
+                .map(UiKey::as_str),
+            Some(trash.as_str()),
+            "{trashed}: listed until the folder is read"
+        );
+        let left: Vec<_> = mine().into_iter().filter(|(id, _)| id != trashed).collect();
+        let _ = admit_catalog(&mut service, &mut runtime, instance, view, left);
+        let next = card_action(&runtime, view, neighbour);
+        assert_eq!(
+            state(&runtime, view)
+                .common
+                .last_focus
+                .as_ref()
+                .map(UiKey::as_str),
+            Some(next.as_str()),
+            "{trashed}"
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(compiled.semantic(&UiKey::new(row.as_str())).is_none());
+        assert!(has_focus(&compiled, &next), "{trashed}: drawn focused");
+    }
+}
+
+/// THE SEGMENT LANDS THE LIST ON ITS SIDE'S THEME: with the theme following
+/// the system, pressing Dark (the keyboard goes to the segment) scrolls the
+/// list to the Dark side's theme in use, its ✓ and its highlight shown, and
+/// the keyboard stays on the segment. Negative control: before the press
+/// that row is off the screen.
+#[test]
+fn choosing_a_side_shows_that_sides_theme() {
+    let cx = view_cx_at(1_284.0, 684.0);
+    // The dark theme listed last: off the first screen of the list.
+    let (_service, runtime, instance, view) = themes_view("");
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    let dark = state(&runtime, view)
+        .showcase
+        .listed()
+        .into_iter()
+        .rev()
+        .map(|slug| id_of(&runtime, view, &slug))
+        .find(|id| {
+            aterm_types::scheme::builtin_theme(id)
+                .is_some_and(|theme| theme.appearance == aterm_types::Appearance::Dark)
+        })
+        .expect("a dark built-in");
+    let (_service, mut runtime, instance, view) =
+        themes_view(&format!("theme = \"dark:{dark},light:Default Light\"\n"));
+    let row = card_action(&runtime, view, &dark);
+    // The page opens on the highlighted row; the reader scrolled to the top.
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    list_at_top(&mut runtime, view);
+    let before = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        before
+            .semantic(&UiKey::new(row.as_str()))
+            .is_some_and(|node| node.offscreen),
+        "the control: {dark} starts off the screen"
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/side/dark",
+        None,
+    );
+    let after = compile_settings_view(&runtime, instance, view, &cx);
+    let node = after.semantic(&UiKey::new(row.as_str())).expect("listed");
+    assert!(!node.offscreen, "{dark} is on the screen");
+    assert!(
+        node.state.is_some_and(|state| state.selected),
+        "highlighted"
+    );
+    assert!(
+        painted_text(&after, &format!("{row}/check")).is_some_and(|words| words == "\u{2713}"),
+        "its ✓ is drawn"
+    );
+    assert_eq!(
+        state(&runtime, view)
+            .common
+            .last_focus
+            .as_ref()
+            .map(UiKey::as_str),
+        Some("settings/showcase/side/dark")
+    );
+}
+
+/// Save as theme counts from a saved theme's own name: from Dracula it
+/// offers "Dracula Custom" (then 2, 3, … while those are taken), and from
+/// "Dracula Custom" — a theme saved here, customized again — the next free
+/// number, never "Dracula Custom Custom". Negative control: a name that only
+/// ends in a number keeps it.
+#[test]
+fn save_as_suggests_the_next_number_for_a_saved_custom_theme() {
+    let none = crate::app_config::ThemeCatalog::from_schemes([]);
+    let saved = crate::app_config::ThemeCatalog::from_schemes([user_scheme(
+        "Dracula Custom",
+        aterm_types::Appearance::Dark,
+    )]);
+    assert_eq!(suggested_save_name("Dracula", &none), "Dracula Custom");
+    assert_eq!(suggested_save_name("Dracula", &saved), "Dracula Custom 2");
+    assert_eq!(
+        suggested_save_name("Dracula Custom", &saved),
+        "Dracula Custom 2"
+    );
+    assert_eq!(
+        suggested_save_name("Dracula Custom 3", &saved),
+        "Dracula Custom 2"
+    );
+    assert_eq!(suggested_save_name("Base 2", &none), "Base 2 Custom");
+}
+
+/// WHILE A FILTER IS TYPED, COMMUNITY IS A CAPTION: its matches are listed
+/// whatever the disclosure says, so nothing there looks pressable. Negative
+/// control: with no filter it is the disclosure, a button that opens.
+#[test]
+fn community_is_a_caption_while_a_filter_is_typed() {
+    let cx = view_cx_at(1_284.0, 714.0);
+    let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    let open = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        open.semantic(&UiKey::new("settings/showcase/pack"))
+            .is_some()
+    );
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/filter",
+        Some("nightfox"),
+    );
+    let filtered = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        filtered
+            .semantic(&UiKey::new("settings/showcase/pack"))
+            .is_none()
+    );
+    let caption = filtered
+        .semantic(&UiKey::new("settings/showcase/section/community"))
+        .expect("Community's caption");
+    assert_eq!(caption.role, SemanticRole::Heading);
+    let nightfox = card_action(&runtime, view, "Nightfox");
+    assert!(filtered.semantic(&UiKey::new(nightfox.as_str())).is_some());
+}
+
+/// A NEEDS ATTENTION ROW SAYS WHY IN WORDS IT CAN SHOW: its name on one line
+/// and, under it, where and what in a few words (`Line 2: background isn't
+/// a color`), both at the column's one text edge, its caption's. The whole
+/// reason is what a reader hears. Another terminal's theme, of each format
+/// the parser names, paints its few words whole at every chooser width, so
+/// the step they give is on screen. Negative control: the parser's
+/// preamble, which a row cut to "theme parse…", is not in the row's words.
+#[test]
+fn a_needs_attention_row_reads_at_the_columns_edge() {
+    let dir = aterm_tempfile::tempdir().expect("a themes folder");
+    std::fs::write(
+        dir.path().join("Broken Sunset.conf"),
+        "foreground = #dddddd\nbackground = #zzz\n",
+    )
+    .unwrap();
+    // One file per foreign format the parser names.
+    for (name, text) in [
+        ("From kitty", "foreground #c0caf5\nbackground #1a1b26\n"),
+        ("From Ghostty", "background = 1a1b26\npalette = 0=#15161e\n"),
+        (
+            "From Alacritty",
+            "[colors.primary]\nbackground = '#1a1b26'\n",
+        ),
+        (
+            "From iTerm2",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict/>\n</plist>\n",
+        ),
+        (
+            "From Windows Terminal",
+            "{\n  \"name\": \"Night\",\n  \"background\": \"#1a1b26\"\n}\n",
+        ),
+    ] {
+        std::fs::write(dir.path().join(format!("{name}.conf")), text).unwrap();
+    }
+    for width in SHAPES {
+        let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+        let published = service.replace_theme_catalog(std::sync::Arc::new(
+            crate::app_config::ThemeCatalog::discover_in(dir.path()),
+        ));
+        let _ = dispatch(
+            &mut runtime,
+            instance,
+            view,
+            AppEvent::ConfigChanged(published),
+        );
+        let rows = state(&runtime, view).showcase.attention.clone();
+        assert_eq!(rows.len(), 6, "premise: every file needs attention");
+        let sunset = rows
+            .iter()
+            .find(|row| row.id == "Broken Sunset")
+            .expect("premise: the broken file's row");
+        let row = format!("{ROW}{}", sunset.slug);
+        // The rows that need attention head the list.
+        list_at_top(&mut runtime, view);
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, 934.0));
+        for other in rows.iter() {
+            let words = painted_text(&compiled, &format!("{ROW}{}/reason", other.slug));
+            assert_eq!(
+                words.as_deref(),
+                Some(other.summary.as_str()),
+                "{width}: {}'s few words are cut ({})",
+                other.id,
+                other.reason
+            );
+        }
+        let painted = |key: &str| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .map(|node| node.rect)
+                .unwrap_or_else(|| panic!("{width}: {key} painted"))
+        };
+        let caption = rect_of(&compiled, "settings/showcase/section/attention");
+        let name = painted(&format!("{row}/name"));
+        let reason = painted(&format!("{row}/reason"));
+        for (what, rect) in [("name", name), ("reason", reason)] {
+            assert!(
+                (rect.x - caption.x).abs() < 0.5,
+                "{width}: {what} {rect:?} beside the caption {caption:?}"
+            );
+        }
+        assert!(
+            reason.y >= name.bottom() - 0.5,
+            "{width}: the reason is under the name"
+        );
+        let words = painted_text(&compiled, &format!("{row}/reason")).expect("the reason's words");
+        assert!(words.starts_with("Line 2: background"), "{width}: {words}");
+        assert!(!words.contains("parse error"), "{width}: {words}");
+        let label = &compiled
+            .semantic(&UiKey::new(row.as_str()))
+            .expect("the row")
+            .label;
+        assert!(label.contains("theme parse error on line 2"), "{label}");
+    }
+}
+
+/// THE SHEET SAYS WHAT IT EDITS: the color settings drawn on every theme —
+/// its title says so, and while the theme follows the system it says when
+/// they leave the side the page does not show at text contrast under 3:1;
+/// a tried theme is drawn under them too, and the strip says that as well,
+/// in the one noun the Customize button counts them in. Negative control: a
+/// background the other side stays readable on says nothing of it.
+#[test]
+fn the_sheet_says_its_colors_draw_on_every_theme() {
+    let cx = view_cx_at(1_284.0, 714.0);
+    for (background, warned) in [("#fff8e7", true), ("#202020", false)] {
+        let (_service, mut runtime, instance, view) = themes_view(&format!(
+            "theme = \"dark:Default,light:Default Light\"\nbackground = \"{background}\"\n"
+        ));
+        let customize = compile_settings_view(&runtime, instance, view, &cx)
+            .semantic(&UiKey::new("settings/showcase/customize"))
+            .expect("Customize")
+            .clone();
+        let one = showcase_page::custom_colors(1);
+        assert!(customize.label.contains(&one), "{}", customize.label);
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/customize",
+            None,
+        );
+        let sheet = compile_settings_view(&runtime, instance, view, &cx);
+        let title = &sheet
+            .semantic(&UiKey::new("settings/showcase/sheet"))
+            .expect("the sheet")
+            .label;
+        assert_eq!(title, showcase_page::SHEET_TITLE);
+        let warning = sheet.semantic(&UiKey::new("settings/showcase/other-side/block"));
+        assert_eq!(warning.is_some(), warned, "{background}");
+        let _ = act(
+            &mut runtime,
+            instance,
+            view,
+            "settings/showcase/customize-done",
+            None,
+        );
+        let nord = card_action(&runtime, view, "Nord");
+        let _ = act(&mut runtime, instance, view, &nord, None);
+        let strip = compile_settings_view(&runtime, instance, view, &cx)
+            .semantic(&UiKey::new(STATUS))
+            .expect("the strip")
+            .label
+            .clone();
+        let note = showcase_page::override_note(&state(&runtime, view).showcase_colors())
+            .expect("premise: one custom color");
+        assert!(note.contains(&one), "{note}");
+        assert!(strip.contains(&note), "{strip}");
+    }
+}
+
+/// A CHOOSER ROW'S MARKS ARE WHOLE AT EVERY TEXT SIZE: the ✓ on the theme
+/// in use, "Aa" on a theme that sets type and ⚠ on one whose text contrast
+/// is low each paint in a column as wide as they draw at the live text
+/// size, so none runs past its column (the ✓ took 16.1 of a fixed 16pt at
+/// 2× text). Every row of every screen, Community open, in use on a theme of
+/// each mark.
+#[test]
+fn a_chooser_rows_marks_are_whole_at_every_text_size() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "chooser marks", |scale| {
+        let marks = ["/check", "/aa", "/low"];
+        let mut drawn = std::collections::BTreeSet::new();
+        for (width, height) in [(584.0, 700.0), (1_284.0, 900.0)] {
+            // Yours: a theme that sets type, and one whose text contrast
+            // is low and that sets type too (the row with every mark).
+            let theme = |text: &str| aterm_types::scheme::parse_theme_str(text).expect("a theme");
+            let themes = crate::app_config::ThemeCatalog::from_parsed([
+                (
+                    "Studio".to_string(),
+                    theme(
+                        "foreground = #e0e0e0\nbackground = #101418\nfont_family = Berkeley Mono\n",
+                    ),
+                ),
+                (
+                    "Murky".to_string(),
+                    theme("foreground = #555555\nbackground = #444444\nline_height = 1.2\n"),
+                ),
+            ]);
+            let (_service, mut runtime, instance, view) =
+                typography_view("theme = \"Murky\"\n", themes);
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.showcase.pack_open = true;
+            }
+            each_screen(
+                &mut runtime,
+                instance,
+                view,
+                &view_cx_at(width, height),
+                |compiled, top| {
+                    for node in &compiled.paint {
+                        let key = node.key.as_str();
+                        let Some(mark) = marks
+                            .iter()
+                            .find(|mark| key.starts_with(ROW) && key.ends_with(*mark))
+                        else {
+                            continue;
+                        };
+                        if let crate::native_ui::UiContent::Text(text) = &node.content
+                            && !text.text.is_empty()
+                        {
+                            drawn.insert(*mark);
+                        }
+                        let line = compiled.text_fit_audit_line(&node.key).unwrap_or_default();
+                        assert!(
+                            !line.contains("overflow=true"),
+                            "{width}×{height} at {scale}× screen {top}: {line}"
+                        );
+                    }
+                },
+            );
+        }
+        assert_eq!(
+            drawn.len(),
+            marks.len(),
+            "premise: every mark drawn: {drawn:?}"
+        );
+    });
+}
+
+/// THE STRIP IS MEASURED, NEVER CUT: at every width and text size, idle,
+/// trying a theme that sets type and with Keep ▾ open, its title is drawn
+/// and no button of it is cut by the strip's edge or cuts its words; and
+/// moving from one tried theme to another never changes its height. (At 22
+/// columns at 2× Customize took the strip and more, so the name was not
+/// drawn; Keep ▾ open cut Revert to nothing at 444pt.)
+#[test]
+fn the_strip_draws_its_title_and_every_button_whole() {
+    at_each_text_scale(&[1.0, 1.25, 2.0], "the strip", |scale| {
+        for width in [178.0, 206.0, 262.0, 318.0, 444.0, 584.0, 760.0, 1_284.0] {
+            let mut trial_heights = std::collections::BTreeSet::new();
+            for step in ["idle", "nord", "studio", "more"] {
+                let (_service, mut runtime, instance, view) = typography_view(
+                    "theme = \"Dracula\"\n",
+                    studio_catalog("font_family = Berkeley Mono\nline_height = 1.15\n"),
+                );
+                let cx = view_cx_at(width, 600.0);
+                if step != "idle" {
+                    let theme = if step == "nord" { "Nord" } else { "Studio" };
+                    let row = card_action(&runtime, view, theme);
+                    let _ = act(&mut runtime, instance, view, &row, None);
+                }
+                if step == "more" {
+                    let _ = act(
+                        &mut runtime,
+                        instance,
+                        view,
+                        "settings/showcase/keep-more",
+                        None,
+                    );
+                }
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let context = format!("{width} at {scale}× {step}");
+                let title = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "settings/showcase/status/title")
+                    .and_then(|node| match &node.content {
+                        crate::native_ui::UiContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                assert!(!title.is_empty(), "{context}: the strip names the theme");
+                let cut: Vec<String> = compiled
+                    .fit_failures()
+                    .into_iter()
+                    .filter(|line| {
+                        line.contains("key=\"settings/showcase/status")
+                            || line.contains("key=\"settings/showcase/customize")
+                            || line.contains("key=\"settings/showcase/keep")
+                            || line.contains("key=\"settings/showcase/revert")
+                    })
+                    .collect();
+                assert!(cut.is_empty(), "{context}:\n{}", cut.join("\n"));
+                if step == "nord" || step == "studio" {
+                    trial_heights.insert(
+                        rect_of(&compiled, "settings/showcase/status")
+                            .height
+                            .to_bits(),
+                    );
+                }
+            }
+            assert_eq!(
+                trial_heights.len(),
+                1,
+                "{width} at {scale}×: one tried theme to another keeps the strip's height"
+            );
+        }
+    });
+}
+
+/// A CHOOSER ROW'S NAME COMES FIRST: at every chooser width and text size a
+/// row whose name is cut inside its first word draws no slab beside it (the
+/// slab gives its column up to the name), and every row of a list keeps one
+/// form. (At 22 columns the slab left "GitHub Light" 36pt, painted "Git…",
+/// and at 2× every name was "…".)
+#[test]
+fn a_chooser_rows_name_comes_before_its_slab() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "row names", |scale| {
+        for width in [178.0, 206.0, 262.0, 318.0, 444.0, 584.0, 1_284.0] {
+            let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.showcase.pack_open = true;
+            }
+            let labels: std::collections::BTreeMap<String, String> = state(&runtime, view)
+                .showcase
+                .cards
+                .iter()
+                .map(|card| (card.slug.clone(), card.label.clone()))
+                .collect();
+            let mut slabbed = std::collections::BTreeSet::new();
+            each_screen(
+                &mut runtime,
+                instance,
+                view,
+                &view_cx_at(width, 900.0),
+                |compiled, top| {
+                    for node in &compiled.paint {
+                        let Some(slug) = node
+                            .key
+                            .as_str()
+                            .strip_prefix(ROW)
+                            .and_then(|rest| rest.strip_suffix("/name"))
+                        else {
+                            continue;
+                        };
+                        let crate::native_ui::UiContent::Text(text) = &node.content else {
+                            continue;
+                        };
+                        // A row a list's edge cuts may draw none of its slab.
+                        if node.clip.height + 0.5 < node.rect.height {
+                            continue;
+                        }
+                        let slab = compiled
+                            .paint
+                            .iter()
+                            .any(|other| other.key.as_str() == format!("{ROW}{slug}/slab"));
+                        let first = labels
+                            .get(slug)
+                            .and_then(|label| label.split_whitespace().next())
+                            .unwrap_or_default();
+                        assert!(
+                            !(slab && !text.text.starts_with(first)),
+                            "{width} at {scale}× screen {top}: {slug} paints {:?} beside its slab",
+                            text.text
+                        );
+                        slabbed.insert(slab);
+                    }
+                },
+            );
+            assert!(
+                slabbed.len() <= 1,
+                "{width} at {scale}×: every row keeps one form"
+            );
+        }
+    });
+}
+
+/// THE THEMES PAGE OPENS ON THE THEME IN USE (the review of the owner's
+/// pages, 2026-10-20: at 864×462 the stacked chooser opened at Aterm Night
+/// with `theme = "Dracula"`, its ✓ row out of view, and at 1144×462 the
+/// side-by-side one showed a sliver of Default under BUILT IN). Opened, the
+/// page lands the list on the highlighted row, as its Dark | Light segment
+/// does: the row is drawn whole inside the list's room, for a theme listed
+/// far down (One Dark: the short page's list beside the demo shows Dracula
+/// from its top) and for the default one, in either layout. NEGATIVE
+/// CONTROL: the same page at the top of its list, where it used to open,
+/// does not show that row whole.
+#[test]
+fn the_themes_page_opens_on_the_theme_in_use() {
+    let whole = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+        let list = rect_of(compiled, "settings/showcase/list");
+        compiled.semantic(&UiKey::new(key)).is_some_and(|row| {
+            !row.offscreen && row.rect.y >= list.y - 0.5 && row.rect.bottom() <= list.bottom() + 0.5
+        })
+    };
+    for (width, height) in [(864.0, 462.0), (1_144.0, 462.0)] {
+        let cx = view_cx_at(width, height);
+        for source in ["theme = \"One Dark\"\n", ""] {
+            let (_service, mut runtime, instance, view) = themes_view(source);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let slug = state(&runtime, view)
+                .highlighted_slug()
+                .expect("a highlighted row");
+            let key = format!("settings/showcase/card/{slug}");
+            assert!(
+                whole(&compiled, &key),
+                "{width}x{height} {source:?}: {key} is whole in the list"
+            );
+            if source.is_empty() {
+                continue;
+            }
+            // NEGATIVE CONTROL: the list at its top.
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.page_scroll = 0;
+                state.page_reveal = None;
+                state.scroll_record.replace(None);
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            assert!(
+                !whole(&compiled, &key),
+                "{width}x{height}: the control shows {key} from the top"
+            );
+        }
+    }
+}
+
+/// PAGE UP AND PAGE DOWN TURN THE CHOOSER BY THE SCREEN IT DRAWS: from the
+/// first row, Page Down after Page Down shows every row of the list whole
+/// on some screen and then turns on past the rows to the Community
+/// disclosure, whole; Page Up back from there shows every row whole again
+/// and ends on the first. (The step was the list's room in row heights, but
+/// a screen that starts inside a section repeats its caption over its first
+/// row: at 102×29 a screen held four whole rows under BUILT IN, the step was
+/// five, and One Dark was only ever a 1pt peek under the screen's edge; and
+/// from the last row Page Down did nothing, the disclosure left cut.)
+#[test]
+fn the_page_keys_show_every_chooser_row_whole() {
+    let whole = |node: &crate::native_ui::PaintNode| {
+        !node.peek
+            && node.clip.y <= node.rect.y + 0.5
+            && node.clip.bottom() + 0.5 >= node.rect.bottom()
+    };
+    at_each_text_scale(&[1.0, 2.0], "chooser page keys", |scale| {
+        // 102×29, 80×24, 150×48 and 220×60 of the 12px cell.
+        for (width, height) in [
+            (738.0, 418.0),
+            (584.0, 348.0),
+            (1_074.0, 684.0),
+            (1_564.0, 852.0),
+        ] {
+            let cx = view_cx_at(width, height);
+            let (_service, mut runtime, instance, view) = themes_view("theme = \"Default\"\n");
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            // The rows the list shows, in its order.
+            let shown = state(&runtime, view);
+            let order: Vec<String> = shown
+                .showcase
+                .visible()
+                .into_iter()
+                .map(|index| shown.showcase.cards[index].slug.clone())
+                .collect();
+            let _ = act(
+                &mut runtime,
+                instance,
+                view,
+                &format!("settings/showcase/card/{}", order[0]),
+                None,
+            );
+            // Down from the first row past the last, then Up back to the
+            // first: each press moves the highlight or the keyboard, until
+            // the list's end.
+            for direction in [1, -1] {
+                let mut seen = std::collections::BTreeSet::new();
+                let place = |runtime: &NativeRuntime| {
+                    let shown = state(runtime, view);
+                    (shown.highlighted_slug(), shown.common.last_focus.clone())
+                };
+                let mut at = place(&runtime);
+                let start = at.0.clone();
+                let mut scroll = state(&runtime, view).page_scroll;
+                let look =
+                    |runtime: &NativeRuntime, seen: &mut std::collections::BTreeSet<String>| {
+                        let compiled = compile_settings_view(runtime, instance, view, &cx);
+                        for node in &compiled.paint {
+                            let key = node.key.as_str();
+                            if let Some(slug) = key.strip_prefix("settings/showcase/card/")
+                                && !slug.contains('/')
+                                && whole(node)
+                            {
+                                seen.insert(slug.to_string());
+                            }
+                            if key == "settings/showcase/pack" && whole(node) {
+                                seen.insert(key.to_string());
+                            }
+                        }
+                    };
+                look(&runtime, &mut seen);
+                for _ in 0..=order.len() + 4 {
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollPage(direction))
+                        .unwrap();
+                    look(&runtime, &mut seen);
+                    let next = place(&runtime);
+                    let turned = state(&runtime, view).page_scroll;
+                    if next == at && turned == scroll {
+                        break;
+                    }
+                    (at, scroll) = (next, turned);
+                }
+                let end = if direction > 0 {
+                    &order[order.len() - 1]
+                } else {
+                    &order[0]
+                };
+                assert_eq!(
+                    at.0.as_ref(),
+                    Some(end),
+                    "{width}×{height} at {scale}×: paging {direction} ends on the list's end"
+                );
+                // Every row the keys turned over: all of them going down from
+                // the first, every one over the keyboard's going back up.
+                let never: Vec<&String> = order
+                    .iter()
+                    .filter(|slug| direction > 0 || Some(*slug) != start.as_ref())
+                    .filter(|slug| !seen.contains(*slug))
+                    .collect();
+                assert!(
+                    never.is_empty(),
+                    "{width}×{height} at {scale}×, paging {direction}: never whole: {never:?}"
+                );
+                if direction > 0 {
+                    assert!(
+                        seen.contains("settings/showcase/pack"),
+                        "{width}×{height} at {scale}×: Page Down past the rows shows the disclosure"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// The theme rows the chooser's list paints whole inside it, and those it
+/// paints cut (by its edge, or past it), by key.
+fn whole_and_cut_rows(compiled: &crate::native_ui::CompiledUi) -> (Vec<String>, Vec<String>) {
+    let list = rect_of(compiled, showcase_page::SHOWCASE_LIST);
+    let options = drawn_rows(compiled);
+    let (mut whole, mut cut) = (Vec::new(), Vec::new());
+    for paint in compiled
+        .paint
+        .iter()
+        .filter(|paint| options.iter().any(|key| key == paint.key.as_str()))
+        .filter(|paint| paint.clip.height > 0.0)
+    {
+        let inside = paint.rect.y >= list.y - 0.01 && paint.rect.bottom() <= list.bottom() + 0.01;
+        if paint.clip == paint.rect && inside {
+            whole.push(paint.key.as_str().to_string());
+        } else {
+            cut.push(paint.key.as_str().to_string());
+        }
+    }
+    (whole, cut)
+}
+
+/// THE CHOOSER IS USABLE AT THE DEFAULT WINDOW (the review of Settings at
+/// 80x24, 2026-10-20: at 584x350 the demo stacked over a list that showed a
+/// row and a half, the second cut mid-row). There the chooser stands beside
+/// the demo: on open its list paints four whole theme rows at the least and
+/// none cut, the demo keeps its 40 columns beside it with the strip under
+/// it, the strip and the chooser end on one line, and Down on a row tries
+/// the next theme in that demo. A tall window keeps the demo over the
+/// chooser, and a wide one keeps them side by side with the footer pinned
+/// under the list, as they were. NEGATIVE CONTROL: a window too narrow for
+/// the demo beside the chooser (556x348) stacks them, and the same count
+/// finds fewer than four whole rows there.
+#[test]
+fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
+    for source in ["theme = \"Default\"\n", "theme = \"Dracula\"\n"] {
+        let (_service, mut runtime, instance, view) = themes_view(source);
+        let cx = view_cx_at(584.0, 350.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let (whole, cut) = whole_and_cut_rows(&compiled);
+        assert!(whole.len() >= 4, "{source}: {whole:?}");
+        assert!(cut.is_empty(), "{source}: rows cut mid-row: {cut:?}");
+        let stage = rect_of(&compiled, STAGE);
+        let chooser = rect_of(&compiled, "settings/showcase/chooser");
+        let strip = rect_of(&compiled, STATUS);
+        assert!(
+            stage.x >= chooser.right(),
+            "{source}: {stage:?} {chooser:?}"
+        );
+        assert!(stage.width >= 40.0 * 12.0 * 0.6, "{source}: {stage:?}");
+        assert!(stage.bottom() <= strip.y, "{source}: {stage:?} {strip:?}");
+        assert!(
+            (strip.bottom() - chooser.bottom()).abs() < 0.01,
+            "{source}: {strip:?} {chooser:?}"
+        );
+        // Down on the first whole row tries the next one, and the demo
+        // beside the list draws it.
+        let order = drawn_rows(&compiled);
+        let at = order
+            .iter()
+            .position(|key| *key == whole[0])
+            .expect("a whole row is drawn");
+        let next = compiled
+            .semantic(&UiKey::new(order[at + 1].as_str()))
+            .expect("the row under it")
+            .label
+            .clone();
+        focus_on(&mut runtime, view, &whole[0]);
+        let _ = dispatch(&mut runtime, instance, view, AppEvent::StepFocus(1));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let demo = compiled.semantic(&UiKey::new(STAGE)).expect("the demo");
+        assert!(
+            format!("{:?}", demo.value).contains(next.as_str()),
+            "{source}: the demo draws {next}: {:?}",
+            demo.value
+        );
+        assert!(rect_of(&compiled, STAGE).x >= chooser.right());
+    }
+    // A tall window: the demo over the chooser, as before.
+    let (_service, runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(584.0, 574.0));
+    let stage = rect_of(&compiled, STAGE);
+    let chooser = rect_of(&compiled, "settings/showcase/chooser");
+    assert!(stage.bottom() <= chooser.y, "tall: {stage:?} {chooser:?}");
+    // A wide window: side by side, the footer pinned under the list.
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_144.0, 434.0));
+    let list = rect_of(&compiled, showcase_page::SHOWCASE_LIST);
+    let follow = rect_of(&compiled, "settings/showcase/footer/follow");
+    assert!(
+        rect_of(&compiled, STAGE).x >= rect_of(&compiled, "settings/showcase/chooser").right(),
+        "wide"
+    );
+    assert!(follow.y >= list.bottom(), "wide: {follow:?} under {list:?}");
+    // NEGATIVE CONTROL: too narrow for the demo beside, stacked and short.
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(556.0, 348.0));
+    let (whole, _) = whole_and_cut_rows(&compiled);
+    assert!(
+        rect_of(&compiled, STAGE).bottom() <= rect_of(&compiled, "settings/showcase/chooser").y,
+        "the control is stacked"
+    );
+    assert!(whole.len() < 4, "the control: {whole:?}");
 }

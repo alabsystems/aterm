@@ -349,8 +349,8 @@ fn history_retires_cursor_pixels_and_cursor_bodies() {
     let live_tick = app.cursor_frame(wid, live).expect("live cursor tick");
     let ws = app.windows.get(&wid).expect("window");
     assert!(
-        !ws.fx.cursor().trail_scratch.is_empty(),
-        "negative control owns a real classic trail"
+        !ws.fx.cursor().glow.under_quads().is_empty(),
+        "negative control owns a real comet tail"
     );
     assert!(
         !ws.fx.cursor().glow_scratch.is_empty() || ws.fx.cursor().glow.is_active(),
@@ -375,7 +375,11 @@ fn history_retires_cursor_pixels_and_cursor_bodies() {
     history.cursor_visible = true;
     let history_tick = app.cursor_frame(wid, history).expect("history tick");
     let ws = app.windows.get(&wid).expect("window");
-    assert!(ws.fx.cursor().trail_scratch.is_empty() && !ws.fx.cursor().trail.is_active());
+    assert!(
+        ws.fx.cursor().glow.under_quads().is_empty()
+            && ws.fx.cursor().trail_scratch.is_empty()
+            && !ws.fx.cursor().trail.is_active()
+    );
     assert!(
         ws.fx.cursor().glow_scratch.is_empty()
             && !ws.fx.cursor().glow.is_active()

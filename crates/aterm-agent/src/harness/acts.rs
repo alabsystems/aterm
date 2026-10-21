@@ -14,10 +14,12 @@
 //!   counter differ where the stats table already makes them differ: a
 //!   question dialog's key lights `Answered` and counts nothing (the
 //!   journal's `chose` counts the dialog, once).
-//! * [`TaskFace`] — the task's face under Land (§9.4.2): open, landed, done,
-//!   spent or theirs, and the word `status task=` prints for it. Told by the
-//!   loop through `IdleHost::task_face`
-//!   ([`crate::supervise::IdleHost::task_face`]).
+//! * [`TaskFace`] — the task's face (§9.4.2): open, landed or theirs, and
+//!   the word `status task=` prints for it. Told by the loop through
+//!   `IdleHost::task_face` ([`crate::supervise::IdleHost::task_face`]).
+//! * [`self_claim_act`] — the session log's act word for an act a
+//!   self-supervising agent (codex-alab) tells, its own FOREVER CRUISE /
+//!   FOREVER LAND acts and its landing ([`RULE_LANDED`]) among them.
 //!
 //! * [`sort`] — THE ONE SORT of a ledger row (its rule, its outcome and the
 //!   command it typed) into the act it lights and the counter it adds to
@@ -289,31 +291,46 @@ fn log_rule(rule_id: &str) -> String {
 /// under (`docs/measured/codex-alab-proof-2026-10-16.md`'s legs), and aterm
 /// writes it as the log's `act word=<w> rule=<act, @ written .>` beside the
 /// `harness-act` row — the word this table gives, as [`log_mark`] gives the
-/// loop's:
+/// loop's. codex-alab runs FOREVER CRUISE / FOREVER LAND itself (the
+/// contract's §5 Cruise and Land rows, owner 2026-10-19), under the rule ids
+/// aterm's own loop types them by, so its acts get the words the loop's get
+/// ([`log_mark`]: Cruise's defend prompt is a `continue`, Land's instruction
+/// and nudge a `dispatch`, Land's answer an `answer`), and its landing — a
+/// clean defense at a land act's yield, recorded and never typed — a word of
+/// its own:
 ///
 /// | `<act>` | `word=` |
 /// |---|---|
 /// | `approve-all@v1` | `approve` |
-/// | `answer-recommended@v1` | `answer` |
-/// | `continue@v1`, `usage-resume@v1` | `continue` |
+/// | `answer-recommended@v1`, `land-answer@v1` | `answer` |
+/// | `continue@v1`, `usage-resume@v1`, `continue-done-check@v1` | `continue` |
 /// | `upgrade@v1` | `relaunch` |
-/// | `harness-turn@v1` | `dispatch` |
+/// | `harness-turn@v1`, `land@v1`, `land-nudge@v1` | `dispatch` |
+/// | `landed@v1` | `landed` ([`LANDED_WORD`]) |
 ///
-/// Any other act (`finished@v1`, a word no proof showed) is `None`: its row
-/// stands alone, and no act mark is guessed for it. The rule is the act
-/// itself, so `rule=` never names a rule the holder did not.
+/// Any other act (`finished@v1`, the retired token's end, which no build
+/// records now; a word no proof showed) is `None`: its row stands alone,
+/// and no act mark is guessed for it. The rule is the act itself, so
+/// `rule=` never names a rule the holder did not.
 #[must_use]
 pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
     let word = match act {
         RULE_APPROVE_ALL => "approve",
-        RULE_ANSWER_RECOMMENDED => "answer",
-        RULE_CONTINUE | RULE_LIMIT_RESUME => "continue",
+        RULE_ANSWER_RECOMMENDED | RULE_LAND_ANSWER => "answer",
+        RULE_CONTINUE | RULE_LIMIT_RESUME | RULE_DONE_CHECK => "continue",
         RULE_UPGRADE => "relaunch",
-        RULE_HOST_TURN => "dispatch",
+        RULE_HOST_TURN | RULE_LAND | RULE_LAND_NUDGE => "dispatch",
+        RULE_LANDED => LANDED_WORD,
         _ => return None,
     };
     Some((word, log_rule(act)))
 }
+
+/// The session log's act word for a self-claim's landing ([`RULE_LANDED`],
+/// [`self_claim_act`]): everything on the remote main branch, defended
+/// clean — no act of aterm's own loop, whose landing is its `DONE … rule=land@v1`
+/// journal row and the task face [`TaskFace::Landed`].
+pub const LANDED_WORD: &str = "landed";
 
 /// The act word of the hosted lanes' relaunch and upgrade rows
 /// ([`relaunch_act`]).
@@ -343,32 +360,31 @@ pub fn relaunch_act(row: &str, step: &str) -> Option<String> {
 const RULE_APPROVE_ALL: &str = "approve-all@v1";
 /// codex-alab's re-exec onto a re-linked build (the proof's `upgrade` leg).
 const RULE_UPGRADE: &str = "upgrade@v1";
+/// codex-alab's LANDING under its own Land (the contract's §5 Land row): a
+/// clean `Nothing left:` defense at a land act's yield over a repository its
+/// probe finds clean, after which it types nothing until someone else's turn.
+/// Recorded with `meta set harness_act`, never typed.
+pub const RULE_LANDED: &str = "landed@v1";
 
 /// The longest `rule=` a session log id holds (`aterm_slog::ShortId::MAX`).
 const LOG_RULE_MAX: usize = 40;
 
-/// The task's face under Land (§9.4.2), told by the loop as it moves.
+/// The task's face (§9.4.2), told by the loop as it moves. FOREVER CRUISE /
+/// FOREVER LAND: Cruise never rests, so its face is open; Land's is open
+/// until a clean defense lands the work.
 ///
 /// | Face | Means | `task=` |
 /// |---|---|---|
 /// | [`TaskFace::Open`] | the work goes on, or a landing is under way | `open` |
-/// | [`TaskFace::Landed`] | the agent finished after the land instruction | `landed` |
-/// | [`TaskFace::Done`] | the agent said it was finished before a landing was asked | `done` |
-/// | [`TaskFace::Spent`] | no done reply after the instruction and its nudges | `spent` |
+/// | [`TaskFace::Landed`] | everything is on the remote main branch, defended clean | `landed` |
 /// | [`TaskFace::Theirs`] | a person's own exchange | `theirs` |
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TaskFace {
     /// Nothing ended: the work goes on, or a landing is under way.
     Open,
-    /// A done reply to a land act: the harness types nothing more until
-    /// someone else's turn.
+    /// A clean defense at a land act's yield: the harness types nothing
+    /// more until someone else's turn.
     Landed,
-    /// The done check or `FINISHED` ended it, not Land: nothing more is
-    /// typed, but nobody asked it to verify, commit and push.
-    Done,
-    /// The landing is spent: the instruction and its nudges typed, no done
-    /// reply. Nothing more is typed but a land answer to a question.
-    Spent,
     /// A person's own exchange: the harness types nothing until someone
     /// else's turn ends.
     Theirs,
@@ -376,13 +392,7 @@ pub enum TaskFace {
 
 impl TaskFace {
     /// Every face, in §9.4.1's order.
-    pub const ALL: [TaskFace; 5] = [
-        TaskFace::Open,
-        TaskFace::Landed,
-        TaskFace::Done,
-        TaskFace::Spent,
-        TaskFace::Theirs,
-    ];
+    pub const ALL: [TaskFace; 3] = [TaskFace::Open, TaskFace::Landed, TaskFace::Theirs];
 
     /// The word `status` and `ls` print for it (`task=`).
     #[must_use]
@@ -390,8 +400,6 @@ impl TaskFace {
         match self {
             TaskFace::Open => "open",
             TaskFace::Landed => "landed",
-            TaskFace::Done => "done",
-            TaskFace::Spent => "spent",
             TaskFace::Theirs => "theirs",
         }
     }
@@ -621,14 +629,14 @@ mod tests {
         assert_eq!(parted, want);
     }
 
-    /// The five faces print five words.
+    /// The three faces print three words.
     #[test]
     fn every_face_prints_its_own_status_word() {
         let words: std::collections::BTreeSet<_> =
             TaskFace::ALL.iter().map(|f| f.status()).collect();
         assert_eq!(
             words.into_iter().collect::<Vec<_>>(),
-            ["done", "landed", "open", "spent", "theirs"]
+            ["landed", "open", "theirs"]
         );
     }
 
@@ -702,11 +710,18 @@ mod tests {
 
     /// A SELF-SUPERVISED AGENT'S ACTS ARE THE LOG'S ACT WORDS (plan 5C-2):
     /// every act codex-alab's proof shows (`docs/measured/
-    /// codex-alab-proof-2026-10-16.md`) maps to one word, `rule=` the act
-    /// with `@` written `.`; the acts that are no act of the log's
-    /// (`finished@v1`, a word nobody measured, a near miss) map to none, and
-    /// the table counts them. NEGATIVE CONTROL: the loop's `approved` row
-    /// under a box's rule is no self-claim act.
+    /// codex-alab-proof-2026-10-16.md`), and every act of its own FOREVER
+    /// CRUISE / FOREVER LAND (the contract's §5 Cruise and Land rows), maps
+    /// to one word, `rule=` the act with `@` written `.`; the acts that are
+    /// no act of the log's (`finished@v1`, the retired token's end; a word
+    /// nobody measured; a near miss) map to none, and the table counts them.
+    /// Each word is one the session log's `word=` vocabulary holds, so the
+    /// mark is written (`aterm_slog::Fields::word`). NEGATIVE CONTROLS: a
+    /// Forever act's rule id spelled at another version, and the retired
+    /// rules (the open-items and uncommitted challenges no build types now),
+    /// map to none; a word outside the log's vocabulary is refused by it;
+    /// and a self-claim's act gets the word aterm's own loop's typed row
+    /// under the same rule gets ([`log_mark`]), landing aside.
     #[test]
     fn a_self_claims_acts_are_the_logs_act_words() {
         let cases = [
@@ -716,21 +731,57 @@ mod tests {
             ("usage-resume@v1", Some("continue")),
             ("upgrade@v1", Some("relaunch")),
             ("harness-turn@v1", Some("dispatch")),
+            ("continue-done-check@v1", Some("continue")),
+            ("land@v1", Some("dispatch")),
+            ("land-nudge@v1", Some("dispatch")),
+            ("land-answer@v1", Some("answer")),
+            ("landed@v1", Some("landed")),
             ("finished@v1", None),
             ("approve-all@v2", None),
             ("approve-all", None),
             ("read-only@v3", None),
             ("continue", None),
+            ("landed@v2", None),
+            ("land", None),
+            ("continue-open-items@v1", None),
+            ("continue-uncommitted@v1", None),
         ];
         for (act, want) in cases {
             let got = self_claim_act(act);
             assert_eq!(got.as_ref().map(|g| g.0), want, "{act}");
-            if let Some((_, rule)) = got {
+            if let Some((word, rule)) = got {
                 assert_eq!(rule, act.replace('@', "."), "{act}");
+                assert!(
+                    aterm_slog::Fields::new()
+                        .word(aterm_slog::Key::Word, word)
+                        .is_ok(),
+                    "{act}: the log has no word {word:?}"
+                );
             }
         }
         let unmarked = cases.iter().filter(|c| c.1.is_none()).count();
-        assert_eq!(unmarked, 5, "the acts that write no mark, counted");
+        assert_eq!(unmarked, 9, "the acts that write no mark, counted");
+        assert!(
+            aterm_slog::Fields::new()
+                .word(aterm_slog::Key::Word, "landing")
+                .is_err(),
+            "the vocabulary refuses a word it does not hold"
+        );
+        for rule in [
+            RULE_CONTINUE,
+            RULE_LIMIT_RESUME,
+            RULE_DONE_CHECK,
+            RULE_LAND,
+            RULE_LAND_NUDGE,
+            RULE_LAND_ANSWER,
+        ] {
+            let loops = log_mark(rule, Outcome::Typed, "words").expect("a typed act");
+            let (word, _) = self_claim_act(rule).expect("a self-claim act");
+            assert!(
+                loops.starts_with(&format!("act word={word} ")),
+                "{rule}: {loops}"
+            );
+        }
     }
 
     /// THE HOSTED LANES' ACT MARK (plan 5F-2, T25): a relaunch or upgrade
@@ -779,5 +830,45 @@ mod tests {
             assert_eq!(relaunch_act(row, step).as_deref(), want, "{row} {step}");
         }
         assert_eq!(RELAUNCH_WORD, "relaunch");
+    }
+
+    /// ONLY A STEP THAT BROUGHT A NEW AGENT UP STARTED ONE (session log
+    /// Phase 6 step 6C-1): of the hosted rows' steps that moved the session,
+    /// the relaunch line typed, the relaunched process adopted and a fresh
+    /// start brought a new agent process up; a turn typed into the running
+    /// agent (a notice, a carry-on, a release, a restore line, the done
+    /// check) and a stop with no start yet did not, and a step that moved
+    /// nothing started nothing. Every started step moved the session.
+    /// NEGATIVE CONTROL (by scratch revert): `started` read as `moved`
+    /// starts an agent on every typed turn and stop.
+    #[test]
+    fn only_a_step_that_brought_a_new_agent_up_started_one() {
+        use super::super::upgrade_drive::{moved, started};
+        let cases = [
+            ("relaunched", true),
+            ("adopted", true),
+            ("done:fresh", true),
+            ("done:unconfirmed", true),
+            ("announced:1", false),
+            ("continued", false),
+            ("continued:restore", false),
+            ("continued:check", false),
+            ("released:void", false),
+            ("terminated", false),
+            ("exited", false),
+            ("wait:held", false),
+            ("done", false),
+            ("done:resumed", false),
+            ("done:model-unconfirmed", false),
+            ("failed:no-resume", false),
+            ("gave-up", false),
+        ];
+        for (step, want) in cases {
+            assert_eq!(started(step), want, "{step}");
+            assert!(
+                !started(step) || moved(step),
+                "{step} started but did not move"
+            );
+        }
     }
 }

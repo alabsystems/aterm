@@ -213,16 +213,23 @@
 //!
 //! # Outside any lab
 //!
-//! Four verbs start a private aterm of their own, with no jail and no stub
+//! Five verbs start a private aterm of their own, with no jail and no stub
 //! ([`instance`]: a scratch HOME and XDG dirs, the automatic lanes off, the
 //! control socket its only door, a lifeline):
 //!
 //! * `instance` holds one headless for an agent or a person to drive with
 //!   `aterm ctl --sock` until the command ends (`--image <png>` takes one frame);
+//! * `trail-gallery` photographs cursor trail styles, one headless per style,
+//!   theme and scenario, with each frame's sidecars ([`trail_gallery`]), and
+//!   `trail-contrast` (no instance) turns a frame into WCAG contrast numbers
+//!   ([`trail_contrast`]): every trail check is measured with these two;
 //! * `presence-flap --window` opens ONE window and judges that it causes no
 //!   re-grid flap ([`presence`]); `--headless` checks the lane itself;
-//! * `meta-keys --window` opens ONE window and presses Option chords in it as
-//!   key presses, judging the bytes its program reads ([`meta_keys`]);
+//! * `meta-keys --window` opens ONE window, selects the U.S., German and
+//!   French layouts in turn (putting the person's back after,
+//!   [`input_sources`]) and presses Option chords in it as key presses,
+//!   judging the bytes its program reads against what each layout types
+//!   ([`meta_keys`]);
 //! * `codex-alab-proof` proves the codex-alab native harness end to end on
 //!   the real package ([`codex_alab_proof`], its jail, fake model and
 //!   stand-ins in [`codex_rig`]): the proven claim and the parked lane,
@@ -242,7 +249,8 @@
 //! aterm-effects replays ([`relay`], whose loop it is).
 //!
 //! Verified by: `targo --unverified test -p aterm-lab` (the stub served on
-//! loopback, the jail renderer, the readers, the judges, on typed data),
+//! loopback, the jail renderer, the readers, the judges, on typed data; the
+//! trail probe on synthetic frames),
 //! `selftest` (the whole proof against the real Claude Code),
 //! `codex-selftest` (the same against the real Codex), `gemini-selftest` and
 //! `agy-selftest` (against the real Gemini CLI and agy: nothing reaches
@@ -256,6 +264,8 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(target_os = "macos")]
+mod band;
 #[cfg(target_os = "macos")]
 mod clock;
 #[cfg(target_os = "macos")]
@@ -285,11 +295,15 @@ mod fleet_world;
 #[cfg(target_os = "macos")]
 mod footers;
 #[cfg(target_os = "macos")]
+mod forever;
+#[cfg(target_os = "macos")]
 mod gemini;
 #[cfg(target_os = "macos")]
 mod gemini_captures;
 #[cfg(target_os = "macos")]
 mod gemini_proof;
+#[cfg(target_os = "macos")]
+mod input_sources;
 #[cfg(target_os = "macos")]
 mod instance;
 #[cfg(target_os = "macos")]
@@ -299,13 +313,19 @@ mod lab;
 #[cfg(target_os = "macos")]
 mod linux;
 #[cfg(target_os = "macos")]
+mod linux_a11y;
+#[cfg(target_os = "macos")]
 mod linux_baseline;
+#[cfg(target_os = "macos")]
+mod linux_browser;
 #[cfg(target_os = "macos")]
 mod linux_gone;
 #[cfg(target_os = "macos")]
 mod linux_guest;
 #[cfg(target_os = "macos")]
 mod linux_proof;
+#[cfg(target_os = "macos")]
+mod mac;
 #[cfg(target_os = "macos")]
 mod meta_keys;
 #[cfg(target_os = "macos")]
@@ -374,6 +394,10 @@ mod sys;
 #[cfg(target_os = "macos")]
 mod tape;
 #[cfg(target_os = "macos")]
+mod trail_contrast;
+#[cfg(target_os = "macos")]
+mod trail_gallery;
+#[cfg(target_os = "macos")]
 mod tripwire;
 #[cfg(target_os = "macos")]
 mod upgrade_agy;
@@ -419,8 +443,9 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  LAB_SCALE LAB_PROXY=dead LAB_CLAUDE=/path/to/claude LAB_CODEX=/path/to/codex
                                  LAB_GEMINI=/path/to/gemini LAB_AGY=/path/to/agy LAB_MUSE=/path/to/muse
                                  LAB_ATERM=/physical/path/to/aterm LAB_STATE=/absolute/dir
-                                 LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V': handed to the lab's own instance at
-                                 every launch of it, recorded at up; TMPDIR and dev seams only, never a name the lab sets;
+                                 LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V': handed to the lab's
+                                 own instance at every launch of it, recorded at up; TMPDIR and dev seams only, never a name
+                                 the lab sets;
                                  LAB_CLOCK=1: the lab's sleep clock loaded into its instance and its Claude Code, for `sleep`)
   claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [-- claude args]   launch the managed Claude
                                  Code in the first tab (--relay: behind the PTY relay of nudge-trial, on the fullscreen renderer;
@@ -566,8 +591,8 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  lift its record names, run as written, must lift it (exit 0), else 1. --clear: `/clear`
                                  after the turn; the relaunch must resume the NEW conversation, its carry-on settled on
                                  step=done:taskless with nothing typed (no --land or --land-open with it: taskless, Land
-                                 has nothing to land or leave open). --land: the tab under Land LANDS first (the stub's answers done replies;
-                                 up to 6 min); after the relaunch it must read task=landed or done, autopilot=land, with
+                                 has nothing to land or leave open). --land: the tab under Land LANDS first (the stub's answers a clean defense;
+                                 up to 6 min); after the relaunch it must read task=landed, autopilot=land, with
                                  no land instruction and no carry-on typed (its journal's carry-on settles on
                                  step=done:said-done; watched 170 s). --land-open, its negative control: Land mid-work,
                                  aterm ends once the crash journal carries the word; the relaunch must not read it done
@@ -575,6 +600,23 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  step=done:landing past the waits and busy:another-sweep). A hold or Land the live
                                  instance's journal never carries on the tab within 30 s fails the run before aterm ends
                                  (1); a tab under Land before --land or --land-open sets it cannot run (3).
+  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both] [tag] [--keep]   FOREVER LAND and FOREVER
+                                 CRUISE live on a supervised harness: the real TUI on a lab of its own (all: one after
+                                 another, <tag>-<harness>), a tab per scenario chain, each in a scratch git repository
+                                 pushed to a local bare origin and left as the chain says, its Autopilot set, the stub
+                                 scripting each turn by what the harness typed (custom mode `forever`). Land (L1 a work
+                                 reply: land@v1 typed; L2 a defense beside a stated leftover: a nudge naming it; L3 NEEDS
+                                 YOU and a defense: the needs entry raised, the nudge carrying on; L4, L8-L11 a defense
+                                 over an untracked file, a changed file, a stash entry, an unpushed commit, a commit off
+                                 origin/main: a nudge naming that leg; L5 a clean defense over a clean pushed repository:
+                                 DONE rule=land@v1, task=landed, the need cleared, the ladder over and nothing typed
+                                 through its next step; L6 a reply taller than the window, NEEDS YOU on top, the defense
+                                 at the bottom: not landed, carried on; L7 a worker's task landed: its record done
+                                 why=landed), Cruise (C1 a done claim: continue-done-check@v1; C2 its defense read: never
+                                 DONE, the next point continues) and the Off control (no supervisor, nothing typed 270 s
+                                 after a done reply), each judged from the journal, ledger, status, meta, task record and
+                                 the stub's dumps (~15-30 min a harness); exit 0 every scenario PASS, 1 one FAIL or
+                                 UNOBSERVED, 2 usage, 3 could not run
   crash [tag] [--gap SECS] [--keep-tree]   aterm crashes under a lab that is up: its OWN instance (the pid env.sh records,
                                  refused unless that pid is still the lab's) SIGKILLed, and once it ended, the instance started
                                  again after SECS (0) with no instance, by restore's relaunch on the same state, socket and
@@ -659,6 +701,20 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  Claude Code): own HOME/XDG/state per instance under /tmp/af.*
   scn list|run|show|agg ...      the survey scenarios: `scn run <scenario> [--n N] [--start K]` (N fresh labs tagged
                                  $LAB_TAG or survey), `scn show <run>`, `scn agg [<scenario>]` (the cycle's min/median/max)
+  tape promote <results-run|dir|tape> [--as NAME] [--fewer]   the harness tape corpus (crates/aterm-agent/tests/
+                                 testdata/tapes/): a run's one ended tape, this machine's names (the lab state, the
+                                 checkout, the home, the temp dir, the user, the host) scrubbed to fixed tokens, linted
+                                 (/Users/, the home, the size cap: the corpus README), replayed strictly and in acts mode
+                                 from its scrubbed text, kept as NAME.atape.txt (default: the run's scenario) or refused;
+                                 refused too for a run whose summary.json records an error or exception, and for fewer
+                                 acts, or no approval/question/turn end/wall where the tape it replaces held one
+                                 (--fewer: a deliberate change); read it before it is committed
+  tape lint [FILE|DIR...]        the corpus's lint on this machine (default: the corpus); exit 1 when a tape is flagged
+  tape replay-jailed [FILE|DIR...]   each tape replayed by `aterm drive replay --check` under sandbox-exec, every
+                                 read but the binary's, the tape's and the loader's denied, every write, the network,
+                                 every program and fork; first a copy of a tape the profile does not name must be refused
+  tape rerecord NAME [--fewer]   the scenario NAME run again on a fresh lab, its tape promoted over the corpus's NAME
+                                 under promote's refusals
   ctl [tag] <verb> ...           raw `aterm ctl` against THIS lab's socket only
   protected HOME CCSOCKS         the owner's data the jail denies, as \"<kind> TAB <path>\" lines (the one list)
   paths                          LAB_STATE (runs/ logs/ captures/ results/) and LAB_ATERM (the aterm a new lab tests; a lab
@@ -669,18 +725,25 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  name them), keep the logs in $LAB_STATE/logs
 
 Outside any lab (no jail, no stub):
-  instance [--window] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--toml LINE]...
-           [--toml-after LINE]... [--home DIR] [--harness] [--pre VERB]... [--image PNG] [--post VERB]... [--keep]
-           [-- PROGRAM ARGS]
-                                 a private headless aterm in a scratch world (HOME, XDG dirs, the automatic lanes off),
-                                 held until this command ends (Ctrl-C, SIGTERM); prints its socket for `aterm ctl --sock`;
+  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N]
+           [--toml LINE]... [--toml-after LINE]... [--home DIR] [--harness] [--pre VERB]... [--image PNG] [--post VERB]...
+           [--pages cold] [--keep] [-- PROGRAM ARGS]
+                                 a private headless aterm in a scratch world (HOME, XDG dirs, the automatic lanes off,
+                                 the audible bell off: --toml 'bell_sound = true' rings it), held until this command
+                                 ends (Ctrl-C, SIGTERM); prints its socket for `aterm ctl --sock`;
+                                 --band app (headless default): aterm.app's scheduling band, its own launchd job heading
+                                 its own coalition at role UI_FOCAL; --band agent: a child of this command, inside the
+                                 caller's coalition and role (a windowed instance's only band);
                                  --window: OPENS A WINDOW, the same instance windowed: only a window presents, so
                                  `present_*`, `gpu_time_*` and `passes_last` in `metrics percentiles` need it;
                                  --toml: a top-level line at the head of its aterm.toml (theme = \"Aterm Day\");
                                  --toml-after: a line after its tables (`[disk]`); --home: a new HOME there (a scratch
                                  volume's folder); --harness: the harness host on (the disk watch runs only with it);
                                  --pre: a control verb once it is ready (open app settings /themes), reply printed;
-                                 --image: one settled frame written to PNG, then it ends; --post: a verb after the frame
+                                 --image: one settled frame written to PNG, then it ends; --post: a verb after the frame;
+                                 --pages cold: launch a copy (its bundle's, for an app) run once and then put out of the
+                                 page cache, so the launch pays aterm's own page-ins (the dyld cache stays warm); the
+                                 banner says how many of its pages the launch had read by ready
   disk-lane [--aterm PATH] [--keep]
                                  the disk awareness lane: an 8 GiB sparse APFS image mounted -nobrowse outside /Volumes,
                                  a headless instance whose HOME is on it ([disk] warn 6 GiB, floor 5 GiB, tier 3 on),
@@ -690,6 +753,19 @@ Outside any lab (no jail, no stub):
                                  macOS may show a removable-volume consent dialog for the image where the terminal that
                                  runs it lacks Full Disk Access; exit 0 pass, 1 a check failed, 3 not run (no hdiutil, or
                                  under 24 GiB free here)
+  trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]... [--extra 'key = value']...
+                [--columns N] [--lines N] [--font-px N] [--no-clean] <out_dir> [style ...]
+                                 photograph cursor trail styles: one private headless aterm per style x theme x scenario
+                                 (typing context steam enter-bottom idle10 cjk bidi settings, or all), a frame after every
+                                 key (headless advances effects only when a frame renders), each kept frame with its clean
+                                 twin, cursor, text and dims for trail-contrast; no style: every style the Settings picker
+                                 offers; <out_dir> outside the repository; exit 0 all taken, 1 a frame or instance failed,
+                                 2 usage, 3 not run; --help for the files and scenarios
+  trail-contrast <png> [--find TEXT]... [--cells ROW:COL[-COL]]... [--row N]... [--newest N] [--min X]
+                 [--newest-min X] [--caret-min X] [--dims FILE|--origin X,Y --cell WxH] [--no-clean] ...
+                                 the WCAG contrast of a frame's cells as JSON (ink and ground from its clean twin), its
+                                 caret against the page and the pixels the effects changed outside it; reads the
+                                 sidecars trail-gallery writes; exit 1 when a threshold fails, 2 usage or file; --help
   presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases \"A H B D T X\"] [--trials N] [--keep]
                                  OPENS A WINDOW: one private windowed aterm running a Claude-Code-shaped stand-in, driven
                                  through fenced and harness-shaped turns, a foreign lease and cross-source chrome pairs
@@ -697,12 +773,18 @@ Outside any lab (no jail, no stub):
                                  flap and no render risk. Run it after touching anything that can re-grid a window; exit 0
                                  clean, 1 a row failed, 3 not run or a phase X sweep formed no pair (not measured);
                                  --headless: the same steps with no window, to check the lane itself (no window verdict)
-  meta-keys --window [--aterm PATH] [--keep]
-                                 OPENS A WINDOW AND PRESSES KEYS IN IT: one private windowed aterm running a byte dump,
-                                 raised to the front; Option chords pressed as key presses (`hwkey … shape=press`) with
-                                 Meta off (the control: Option+e e composes é, Option+b types ∫) and on (each U.S. Option
-                                 dead key and Option+b go out as ESC and the bare letter); ~20 s; U.S. layout only;
-                                 exit 0 pass, 1 a row failed, 3 not run or the control did not compose
+  meta-keys --window [--layout ID]... [--aterm PATH] [--keep] | meta-keys --plan [--layout ID]... | meta-keys --restore
+                                 OPENS A WINDOW, SELECTS EACH KEYBOARD LAYOUT AND PRESSES KEYS: one private windowed aterm
+                                 running a byte dump, raised to the front; on the U.S., German and French layouts (or each
+                                 --layout, an input source ID or its last part), each selected for its rows and the
+                                 person's own put back after (a record file covers a run that dies), Option chords pressed
+                                 as key presses (`hwkey … shape=press`) with Meta off (the control: an Option dead key and
+                                 a letter compose, an Option chord types the layout's character) and on (Option dead keys
+                                 and chords go out as ESC and the key's own character; a bare dead key still composes),
+                                 every row derived from the layout itself; only at an idle desk; ~1 min; exit 0 pass, 1 a
+                                 row failed or the input sources did not come back, 3 not run or not measured;
+                                 --plan prints each layout's derived rows and changes nothing; --restore puts back what a
+                                 run's record names
   codex-alab-proof [--package DIR] [--aterm PATH] [--keep]
                                  the codex-alab native harness end to end on the REAL package (--package, $LAB_CODEX, else
                                  the managed codex when it is an ALab build), linked as the owner links it in a sandboxed
@@ -713,15 +795,22 @@ Outside any lab (no jail, no stub):
                                  exit 0 pass, 1 a check failed, 3 not run (no codex-alab package)
   reduce <transcript|rollout> --program claude|codex [--out FILE]
                                  a KEY-ONLY reduction (session log 5H-1, P11 as ruling T7 amends it): keys, row order,
-                                 closed words and numbers kept, times moved to 2000-01-01 by whole days, ids remapped one to
+                                 numbers and the closed words a reader reads kept (ruling U7: a word no reading reads
+                                 goes), times moved to 2000-01-01 by whole days, ids remapped one to
                                  one, a user row's opening marker kept, a notice written as the canonical phrase of the wall
-                                 its words read as, every other string replaced; to FILE (never over one) or stdout. The
-                                 shape a lab-read build is committed in (aterm-agent harness/testdata/steps/<build>.jsonl;
-                                 a Codex rollout's codex-<build>[-<leg>].jsonl)
+                                 its words read as, every other string replaced; to FILE (never over one) or stdout, and
+                                 only when the harness's readers read it as its source and read every word it keeps (else
+                                 exit 1, nothing written). The shape a lab-read build is committed in (aterm-agent
+                                 harness/testdata/steps/<build>.jsonl; a Codex rollout's codex-<build>[-<leg>].jsonl)
   ptyrec <log> -- <cmd> [args...]   run <cmd> behind a PTY in this terminal, everything passed through, and append
                                  every chunk to <log>: `<t_ns> O <hex>` (its output), `<t_ns> I <hex>` (input passed to
                                  it); its window follows this terminal's (at start and on SIGWINCH): the takes aterm-effects
                                  replays; exit: the program's
+  mac dmg [--image REF] [--fda] [--keep]
+                                 the macOS guest lane: atpkg's, aterm-containment's, aterm-uds' and aterm-update's
+                                 real disk-image acceptance (dmg_acceptance benches built here with --no-run) run in a
+                                 fresh tart VM with SIP on, tccd's log streamed, the clone deleted; nothing is attached on
+                                 this Mac (`mac help`; exit 3 NOT RUN without tart or on a row the guest refused)
   linux up|down|status|exec|proof|clean|destroy
                                  the Linux runtime lane: a lima VM (vz, Ubuntu 24.04 aarch64, Rosetta for x86_64) holding
                                  this checkout read-only; `exec` runs a command in it per arch under Xvfb, weston, Mutter
@@ -857,10 +946,12 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "watch" => scn::cmd_watch(args),
         "catch" => scn::cmd_catch(args),
         "scn" => scn::cmd_scn(args),
+        "tape" => tape::cmd_tape(args),
         "probe" => probe::cmd_probe(args),
         "selftest" => selftest::cmd_selftest(args),
         "nudge-trial" => nudge::cmd_nudge_trial(args),
         "restore" => restore::cmd_restore(args),
+        "forever" => forever::cmd_forever(args),
         "crash" => crash::cmd_crash(args),
         "sleep" => sleep::cmd_sleep(args),
         "workers" => workers::cmd_workers(args),
@@ -868,10 +959,13 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "paths" => verbs::cmd_paths(),
         "instance" => instance::cmd_instance(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
+        "trail-gallery" => trail_gallery::cmd_trail_gallery(args),
+        "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "presence-flap" => presence::cmd_presence_flap(args),
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
         "linux" => linux::cmd_linux(args),
+        "mac" => mac::cmd_mac(args),
         "reduce" => reduce::cmd_reduce(args),
         "protected" => match (args.first(), args.get(1)) {
             (Some(h), Some(c)) => {
@@ -943,6 +1037,10 @@ fn main() -> std::process::ExitCode {
                 "probe-tiocsti" => probe::tiocsti_child(),
                 "hold" => recorder::hold(rest),
                 "keeper" => instance::keeper_main(rest),
+                // an app-band instance's launchd job: its environment is the world's, read from the world
+                "band" => band::band_main(rest),
+                "band-launch" => band::launch_main(rest),
+                "band-standin" => band::standin_main(rest),
                 "presence-standin" => presence::standin_main(rest),
                 "key-dump" => meta_keys::keydump_main(rest),
                 "mcp-standin" => codex_rig::mcp_main(rest),
@@ -951,6 +1049,7 @@ fn main() -> std::process::ExitCode {
                     // calling shell inherited from them before any thread starts.
                     sys::forget_env(paths::forgotten);
                     sys::confine_env();
+                    // These read files or print and make nothing: no state dir to check.
                     let r = if matches!(
                         cmd.as_str(),
                         "" | "help"
@@ -960,6 +1059,7 @@ fn main() -> std::process::ExitCode {
                             | "protected"
                             | "fleet-sim"
                             | "reduce"
+                            | "trail-contrast"
                     ) {
                         dispatch(&cmd, rest)
                     } else {

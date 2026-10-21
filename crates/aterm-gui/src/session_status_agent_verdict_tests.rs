@@ -235,7 +235,7 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
         .unwrap()
         .since(None)
         .filter(|e| e.kind == "agent-change")
-        .map(|e| e.payload.clone())
+        .map(|e| e.payload.to_string())
         .collect();
     let stamp = prompt.stamp.expect("a published verdict carries its read");
     assert_eq!(
@@ -1368,7 +1368,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
         record.contains(
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- editing=0 gen="
         ),
         "{record}"
     );
@@ -1411,7 +1411,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
         record.contains(
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- gen="
+             log_seq=1 log_ep=1 run=- turn=- step=- need=- need_since_ms=- editing=0 gen="
         ),
         "{record}"
     );
@@ -2330,7 +2330,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         .unwrap()
         .since(None)
         .filter(|e| e.kind == "meta-change")
-        .map(|e| e.payload.clone())
+        .map(|e| e.payload.to_string())
         .collect();
     assert_eq!(
         meta_events.last().map(String::as_str),

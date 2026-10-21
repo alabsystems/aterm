@@ -346,13 +346,14 @@ impl Derived {
 /// Non-test `*.rs` under every workspace member's `src/` (`members = ["crates/*"]`).
 fn scan_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root.join("crates")) else {
+    let Ok(entries) = crate::tree::read_dir(&root.join("crates")) else {
         return files;
     };
     let mut dirs: Vec<PathBuf> = entries
+        .into_iter()
         .flatten()
-        .map(|e| e.path().join("src"))
-        .filter(|p| p.is_dir())
+        .map(|p| p.join("src"))
+        .filter(|p| crate::tree::is_dir(p))
         .collect();
     dirs.sort();
     for dir in dirs {
@@ -380,7 +381,7 @@ const SELF_EXCLUDED_DIR: &str = "crates/aterm-census/src";
 fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for path in files {
-        let Ok(raw) = std::fs::read_to_string(path) else {
+        let Ok(raw) = crate::tree::read_to_string(path) else {
             continue;
         };
         let rel = path

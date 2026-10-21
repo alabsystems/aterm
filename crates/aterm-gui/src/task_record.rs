@@ -17,10 +17,16 @@
 //! and `exited`. Its result is read back with `result` ([`cmd_result`]).
 //! The record is four states and the facts that say why:
 //!
-//! * `working` — the task is the agent's; nothing to read yet;
-//! * `done` — the worker finished: the verdict the window harness reaches
-//!   (`TurnEndState::task_done()`) when the worker ends its report with
-//!   ATERM-TASK-DONE, or says it is done twice across the done check;
+//! * `working` — the task is the agent's; nothing to read yet (a worker
+//!   under Autopilot Cruise stays here for good: Cruise takes no report as
+//!   the end, and a manager reads `status`, or moves it to Land);
+//! * `done` — the worker LANDED (`why=landed`): under Autopilot Land, the
+//!   window harness's verdict (`TurnEndState::landed()`) at a land act's
+//!   yield whose reply is a clean `Nothing left:` defense over a repository
+//!   holding nothing the remote main lacks — all of the work is on the
+//!   remote main branch. An older build's `why=marker|done-check` (a retired
+//!   token, a done check) still reads, from a record it carried across an
+//!   update, but no harness writes it any more;
 //! * `exited` — the agent is gone with no relaunch coming (`exit=` its code);
 //! * `stalled` — the worker never showed its composer (a login, a dialog no
 //!   rule answers), or, started, is HELD: at a screen the harness has no act
@@ -33,8 +39,11 @@
 //!
 //! ONE EDGE FOR A WAITER. `rev` moves on every change of the record, AND when
 //! the supervisor's own attention entry (`meta set attention owner=supervisor`,
-//! [`crate::harness_host::ATTENTION_OWNER`]) is raised or cleared on a session
-//! that has one ([`SessionTimeline::note_task_attention`]). So `await task
+//! [`crate::harness_host::ATTENTION_OWNER`]) or a worker's NEEDS YOU entry
+//! (`owner=needs`, [`crate::harness_host::NEEDS_ATTENTION_OWNER`]: a need
+//! that never blocks the work) is raised or cleared on a session that has one
+//! ([`SessionTimeline::note_task_attention`]: the flag stands while either
+//! does). So `await task
 //! since=<rev>` is edge-triggered on the one number: a re-armed wait never sees
 //! the same news twice, and a wait re-armed across the server's 600 s clamp or
 //! a self-update — past each target's rev from the start of the wait (the
@@ -58,7 +67,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::SessionCtx;
 use crate::control::Scope;
-use crate::subscribe::Subscribers;
 use crate::turn_ledger::TurnBy;
 
 /// A task's state ([the module](self)).
@@ -66,7 +74,8 @@ use crate::turn_ledger::TurnBy;
 pub(crate) enum TaskState {
     /// The task is the agent's; nothing to read yet.
     Working,
-    /// The worker finished.
+    /// The worker landed its work (or, in a record an older build carried,
+    /// finished by its retired rule).
     Done,
     /// The agent is gone with no relaunch coming.
     Exited,
@@ -106,9 +115,15 @@ impl TaskState {
 /// The closed `why=` vocabulary: what moved a task to its state. A word
 /// outside it is refused, so a reader can switch on it.
 pub(crate) const TASK_WHY: &[&str] = &[
-    // `done`: the worker ended its report with ATERM-TASK-DONE.
+    // `done`: Autopilot Land landed the work: a clean `Nothing left:`
+    // defense at a land act's yield, over a repository holding nothing the
+    // remote main lacks (FOREVER LAND). The one `done` a harness writes.
+    "landed",
+    // `done`, READ ONLY: an older build's retired token rule. A record it
+    // carried across a seamless update (or a rollback) still parses; no
+    // harness writes it, and it seeds no landing.
     "marker",
-    // `done`: the worker said it was done twice across the done check.
+    // `done`, READ ONLY: an older build's done check, as `marker` is.
     "done-check",
     // `exited`: the agent exited and no relaunch follows.
     "exit",
@@ -118,7 +133,7 @@ pub(crate) const TASK_WHY: &[&str] = &[
     "startup",
     // `stalled`: the agent started, and is held where nothing moves.
     "held",
-    // `working`: a later turn moved a finished task back to work.
+    // `working`: a later turn moved a landed task back to work.
     "turn",
     // `working`: a worker the held deadline stalled moved on.
     "moved",
@@ -531,11 +546,24 @@ fn spelled_as_its_parts(path: &Path) -> bool {
     }
 }
 
-/// Whether the supervisor's own attention entry stands in `meta`.
-fn supervisor_attention(meta: &crate::session_timeline::SessionMeta) -> bool {
-    meta.attention_owners
-        .get(crate::harness_host::ATTENTION_OWNER)
-        .is_some()
+/// Whether an attention entry written by `owner` moves the task record's
+/// attention flag ([`supervisor_attention`]): the supervisor's own, and a
+/// worker's NEEDS YOU entry.
+pub(crate) fn owner_moves_task(owner: &str) -> bool {
+    owner == crate::harness_host::ATTENTION_OWNER
+        || owner == crate::harness_host::NEEDS_ATTENTION_OWNER
+}
+
+/// Whether the task record's attention stands in `meta`: the supervisor's
+/// own entry, or a worker's NEEDS YOU entry (`owner=needs`, which never
+/// blocks the work but is news a manager waits on).
+pub(crate) fn supervisor_attention(meta: &crate::session_timeline::SessionMeta) -> bool {
+    [
+        crate::harness_host::ATTENTION_OWNER,
+        crate::harness_host::NEEDS_ATTENTION_OWNER,
+    ]
+    .iter()
+    .any(|owner| meta.attention_owners.get(owner).is_some())
 }
 
 /// A mark that waited out the session's fence bound
@@ -574,9 +602,8 @@ pub(crate) fn mark_session_task(
     ctx: &SessionCtx,
     local_id: u64,
     mark: &TaskMark,
-    subscribers: &Subscribers,
 ) -> Result<(TaskRecord, bool), MarkFenced> {
-    mark_session_task_within(ctx, local_id, mark, subscribers, ctx.fabric.fence_wait())
+    mark_session_task_within(ctx, local_id, mark, ctx.fabric.fence_wait())
 }
 
 /// [`mark_session_task`], waiting at most `fence_wait` on a committing
@@ -586,10 +613,9 @@ pub(crate) fn mark_session_task_within(
     ctx: &SessionCtx,
     local_id: u64,
     mark: &TaskMark,
-    subscribers: &Subscribers,
     fence_wait: std::time::Duration,
 ) -> Result<(TaskRecord, bool), MarkFenced> {
-    let marked = mark_session_task_if(ctx, local_id, mark, subscribers, fence_wait, |_| true)?;
+    let marked = mark_session_task_if(ctx, local_id, mark, fence_wait, |_| true)?;
     Ok(marked.expect("an unconditional mark is applied"))
 }
 
@@ -602,7 +628,6 @@ pub(crate) fn mark_session_task_if(
     ctx: &SessionCtx,
     local_id: u64,
     mark: &TaskMark,
-    subscribers: &Subscribers,
     fence_wait: std::time::Duration,
     when: impl FnOnce(Option<&TaskRecord>) -> bool,
 ) -> Result<Option<(TaskRecord, bool)>, MarkFenced> {
@@ -611,7 +636,6 @@ pub(crate) fn mark_session_task_if(
         local_id,
         Some(mark),
         AttentionEdit::Keep,
-        subscribers,
         fence_wait,
         |record, _| when(record),
     )?;
@@ -664,7 +688,6 @@ pub(crate) fn mark_session_task_with(
     local_id: u64,
     mark: Option<&TaskMark>,
     edit: AttentionEdit<'_>,
-    subscribers: &Subscribers,
     fence_wait: std::time::Duration,
     when: impl FnOnce(Option<&TaskRecord>, Option<&str>) -> bool,
 ) -> Result<Option<MarkedWith>, MarkFenced> {
@@ -705,33 +728,23 @@ pub(crate) fn mark_session_task_with(
                     (timeline.task().cloned(), moved)
                 }
             };
-            // The session log's `task` mark (and the attention's `meta`
-            // mark) owe its readers a wake, taken in this hold and sent
-            // below, after release (the one wake rule).
-            let log_owed = timeline.slog_take_wake();
+            // The rows this hold recorded (`task-change`, `meta-change`)
+            // rang the session's watchers; the session log's owed wake
+            // rings them here, under this lock.
+            timeline.slog_take_wake();
             drop(timeline);
             drop(meta);
-            Some((
-                MarkedWith {
-                    record,
-                    moved,
-                    attention_moved,
-                },
-                log_owed,
-            ))
+            Some(MarkedWith {
+                record,
+                moved,
+                attention_moved,
+            })
         })
         .ok_or(MarkFenced)?;
-    let (outcome, log_owed) = match outcome {
-        Some((marked, owed)) => (Some(marked), owed),
-        None => (None, false),
-    };
     let record_moved = outcome
         .as_ref()
         .is_some_and(|m| m.moved || m.attention_moved);
-    if log_owed || record_moved {
-        wake_task_waiters(subscribers, local_id);
-    }
-    // …and the main thread's need verdict, which reads the record
+    // The main thread's need verdict, which reads the record
     // (`Wake::TaskChanged`): only when the record moved, never for the
     // log's wake alone.
     if record_moved {
@@ -771,13 +784,7 @@ pub(crate) fn mark_session_task_with(
 /// again under the mark's own locks ([`mark_session_task_if`]), so this
 /// turn's published done is never opened again by its own submit. A record
 /// in any other state, and none, is left as it stands.
-pub(crate) fn reopen_at_turn(
-    ctx: &SessionCtx,
-    local_id: u64,
-    by: &TurnBy,
-    found: Option<u64>,
-    subscribers: &Subscribers,
-) {
+pub(crate) fn reopen_at_turn(ctx: &SessionCtx, local_id: u64, by: &TurnBy, found: Option<u64>) {
     let is_done = |r: Option<&TaskRecord>| {
         r.is_some_and(|r| r.state == TaskState::Done && Some(r.entered) == found)
     };
@@ -796,7 +803,7 @@ pub(crate) fn reopen_at_turn(
     let mut mark = TaskMark::new(TaskState::Working);
     mark.why = Some("turn");
     let fence = ctx.fabric.fence_wait();
-    if mark_session_task_if(ctx, local_id, &mark, subscribers, fence, is_done).is_err() {
+    if mark_session_task_if(ctx, local_id, &mark, fence, is_done).is_err() {
         aterm_log::warn!(
             "task: a turn into a finished worker was not marked working: an update is committing"
         );
@@ -808,7 +815,8 @@ pub(crate) const RESULT_USAGE: &str = "ERR usage: result [full]\n";
 
 /// `result [full]` on `ctx`: THE WORKER'S RESULT
 /// (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.3), the snapshot the
-/// window harness took at the done edge and named in the record
+/// window harness took at the landing (the report before the land act and
+/// its clean `Nothing left:` defense) and named in the record
 /// (`result_path=`), answered by [`aterm_agent::harness::result::answer`]:
 /// `OK <n> source=transcript session=<id> uuid=<row> bytes=<n>` and the
 /// text as lines, at most 24,000 characters of it, then `… truncated; full:
@@ -821,16 +829,12 @@ pub(crate) const RESULT_USAGE: &str = "ERR usage: result [full]\n";
 /// keeps its result, and answers it.
 ///
 /// A RESULT THE DONE EDGE MISSED to Claude Code's write lag (the snapshot's
-/// `why=no-reply|no-marker`, its sidecar naming the turn's user row) is read
+/// `why=no-reply`, or an older build's `no-marker`, its sidecar naming the
+/// turn's user row) is read
 /// again for THAT turn ([`aterm_agent::harness::result::reread`]) — never a
 /// later one — and, found, answered; it then becomes the result for good
 /// ([`repair_result`]).
-pub(crate) fn cmd_result(
-    ctx: &SessionCtx,
-    local_id: u64,
-    rest: &str,
-    subscribers: &Subscribers,
-) -> String {
+pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String {
     let full = match rest.trim() {
         "" => false,
         "full" => true,
@@ -849,7 +853,7 @@ pub(crate) fn cmd_result(
         (Some(path), TaskState::Done | TaskState::Exited) => {
             match aterm_agent::harness::result::reread(path) {
                 Some(found) => {
-                    repair_result(ctx, local_id, &record, path, &found, subscribers);
+                    repair_result(ctx, local_id, &record, path, &found);
                     found.answer(path, full)
                 }
                 None => aterm_agent::harness::result::answer(path, full),
@@ -875,7 +879,6 @@ fn repair_result(
     record: &TaskRecord,
     path: &Path,
     found: &aterm_agent::harness::result::Reread,
-    subscribers: &Subscribers,
 ) {
     let mark = TaskMark {
         state: record.state,
@@ -886,14 +889,7 @@ fn repair_result(
         result_path: record.result_path.clone(),
     };
     let same = |now: Option<&TaskRecord>| now.is_some_and(|now| now.rev == record.rev);
-    match mark_session_task_if(
-        ctx,
-        local_id,
-        &mark,
-        subscribers,
-        std::time::Duration::ZERO,
-        same,
-    ) {
+    match mark_session_task_if(ctx, local_id, &mark, std::time::Duration::ZERO, same) {
         Ok(Some(_)) => {
             if let Err(e) = found.write(path) {
                 aterm_log::warn!(
@@ -907,17 +903,6 @@ fn repair_result(
             "task: the result read again is not kept while an update commits; the next `result` \
              reads it again"
         ),
-    }
-}
-
-/// Wake `local_id`'s parked waiters now — the content-less notify `meta` and
-/// `turn` use after a scannable write.
-pub(crate) fn wake_task_waiters(subscribers: &Subscribers, local_id: u64) {
-    if subscribers.any() {
-        subscribers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .notify(local_id);
     }
 }
 
@@ -946,6 +931,9 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .seed_task(record);
+    // A worker an older build started, with no word: Land, as a spawn now
+    // writes it.
+    crate::session_timeline::keep_worker_autopilot(ctx);
 }
 
 /// `agent=<word> attention=<pct|->`: the session's published agent verdict
@@ -989,7 +977,8 @@ fn task_reply(ctx: &SessionCtx, record: Option<&TaskRecord>) -> String {
 ///   [why=] [exit=] [result_path=] agent= attention=`, or `OK task -`.
 /// * `task mark <state> [from=] [why=] [exit=] [result_bytes=]
 ///   [result_path=]` — Owner-only (an edge gets `ERR denied`; the dispatch
-///   gate refuses it first, through `escalated_op`): [`mark_session_task`],
+///   gate refuses it first, through the `task mark` form's `owner_only` in
+///   `aterm_types::control_verbs`): [`mark_session_task`],
 ///   answered with the record after it and ` changed=<0|1>`, or
 ///   [`crate::fabric::HOLD_BUSY`] when a committing update held it back. A
 ///   mark to anything but a deadline's stall (`stalled why=startup|held`)
@@ -998,13 +987,7 @@ fn task_reply(ctx: &SessionCtx, record: Option<&TaskRecord>) -> String {
 ///   such a stall is one rev carrying `attention=-`, never the done with the
 ///   stall's text still standing and a second rev to take it down (the
 ///   window host's `StartupMark::Over` stays the backstop).
-pub(crate) fn cmd_task(
-    ctx: &SessionCtx,
-    local_id: u64,
-    scope: Scope,
-    rest: &str,
-    subscribers: &Subscribers,
-) -> String {
+pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str) -> String {
     let rest = rest.trim();
     if rest.is_empty() {
         let record = ctx
@@ -1040,7 +1023,6 @@ pub(crate) fn cmd_task(
         local_id,
         Some(&parsed),
         edit,
-        subscribers,
         ctx.fabric.fence_wait(),
         |_, _| true,
     ) else {

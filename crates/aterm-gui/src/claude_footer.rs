@@ -43,6 +43,14 @@
 //!   Claude Code process is alive, so a passed wall leaves an idle footer.
 //!   Its reset is placed with a zone's offset AT an instant
 //!   ([`offset_at_cached`]).
+//! * THE SUBSCRIPTION. The selected Claude profile supplies its actual email, plan and
+//!   account-validated weekly quota, read together off the event loop. Missing, expired
+//!   and stale usage says `weekly unavailable`; an account switch replaces every field.
+//!   The values stay in the volatile footer facts and never enter account-stat records.
+//!   While a percentage is shown, the same local slow clock as a limit wall keeps
+//!   checking it after idle watches lapse, so stale or reset quota clears within a minute.
+//!   A settings/provider/profile-store check once per registered image and working
+//!   directory suppresses the whole tuple when Claude uses a different auth source.
 //! * THE ACCOUNT. Where `accounts.toml` lists two or more, `⎆ <label>` names
 //!   the roster row the process's login is (`accounts::footer_label`),
 //!   between the model and the path. The login is what the exec environment
@@ -189,6 +197,9 @@ pub(crate) struct SpliceLists {
     bare: Vec<u64>,
     /// The rules' compositions, written as [`rule_edits`].
     rules: Vec<RuleWrite>,
+    /// Top-rule composer border brand and tool logo edits, buffers reused across frames.
+    border_edits: Vec<AgyRowEdit>,
+    border_live: usize,
     /// agy's glass-only transcript markdown edits.
     agy_edits: Vec<AgyRowEdit>,
     /// Top-rule harness border toggle pill spans `(frame_row, term_row, cols, session, needs_write)`.
@@ -220,6 +231,7 @@ impl SpliceLists {
         self.seen.clear();
         self.bare.clear();
         self.rules.clear();
+        self.border_live = 0;
         self.agy_edits.clear();
         self.border_toggles.clear();
         self.lit.clear();
@@ -327,10 +339,11 @@ struct CachedPaneText {
     /// for ([`note_vendor_drift`], by a hash of its version): checked again
     /// only for another build or new readings.
     drift: std::cell::Cell<Option<u64>>,
-    /// The launch card on `rows` for the footer's open model or effort
-    /// (`footer::launch_card`): read at most once per rebuild, and only while
-    /// the facts leave one open ([`PaneTextCache::footer_card`]).
-    footer_card: std::cell::OnceCell<Option<aterm_phase::LaunchCard>>,
+    /// The launch card on `rows` for the footer's open model or effort, the
+    /// reader that read it and the rows it was read from
+    /// (`footer::launch_card_read`): read at most once per rebuild, and only
+    /// while the facts leave one open ([`PaneTextCache::footer_card`]).
+    footer_card: std::cell::OnceCell<Option<(aterm_phase::Program, aterm_phase::LaunchCardRead)>>,
     /// The rule's coverable run and its glyph on frame row `.0`
     /// ([`rule_mask`], `footer::rule_run`): taken at most once per rebuild —
     /// the scratch it was read off is the one `key`'s tokens name — and kept
@@ -575,10 +588,12 @@ impl PaneTextCache {
 
     /// A pane that no longer shows a Claude footer must not keep its old
     /// transcript resident just because another pane still has one — nor its
-    /// facts or its composition.
-    fn retain_active(&mut self, active: impl Fn(usize) -> bool) {
+    /// facts or its composition. A pane whose card alone was read this frame
+    /// (`card`: a drawer with no facts yet) keeps its transcript, where the
+    /// card's reading lives, and forgets its footer.
+    fn retain_active(&mut self, active: impl Fn(usize) -> bool, card: impl Fn(usize) -> bool) {
         for (index, cached) in self.panes.iter_mut().enumerate() {
-            if !active(index) {
+            if !active(index) && !card(index) {
                 *cached = None;
             }
         }
@@ -812,11 +827,15 @@ impl PaneTextCache {
     }
 
     /// The launch card on leaf `leaf_index`'s cached rows, while they are
-    /// `session`'s, for the footer's open model or effort
-    /// (`footer::launch_card`, behind the reader's panic fence): read at
-    /// most once per rebuild of the rows, every frame that reuses them
-    /// sharing the reading.
-    fn footer_card(&self, leaf_index: usize, session: u64) -> Option<&aterm_phase::LaunchCard> {
+    /// `session`'s, for the footer's open model or effort, with the reader
+    /// that read it and its rows (`footer::launch_card_read`, behind the
+    /// reader's panic fence): read at most once per rebuild of the rows,
+    /// every frame that reuses them sharing the reading.
+    fn footer_card(
+        &self,
+        leaf_index: usize,
+        session: u64,
+    ) -> Option<&(aterm_phase::Program, aterm_phase::LaunchCardRead)> {
         let cached = self.panes.get(leaf_index)?.as_ref()?;
         if cached.key.session != session {
             return None;
@@ -830,7 +849,7 @@ impl PaneTextCache {
                     session,
                     "Claude Code launch card",
                     &cached.rows,
-                    || footer::launch_card(&cached.rows),
+                    || footer::launch_card_read(&cached.rows),
                 )
                 .flatten()
             })
@@ -904,7 +923,7 @@ impl PaneTextCache {
     fn composed(&self, leaf_index: usize) -> &[RenderCell] {
         self.footers
             .get(leaf_index)
-            .map_or(&[], |f| f.rule.cells.as_slice())
+            .map_or(&[], |f| f.rule.paint.cells.as_slice())
     }
 
     /// The launch card on leaf `leaf_index`'s cached rows, while they are
@@ -980,9 +999,17 @@ struct ComposedRule {
     key: Option<RuleKey>,
     /// The chips' block it was composed with (`None`: no block), copied.
     block: Option<BlockCopy>,
+    paint: RulePaint,
+}
+
+/// A composed footer's cells and native text side channels, kept together.
+#[derive(Debug, Default)]
+struct RulePaint {
     cells: Vec<RenderCell>,
     lights_at: Option<usize>,
     glass: std::ops::Range<usize>,
+    clusters: Vec<(usize, Box<str>)>,
+    combining: Vec<(usize, Box<[char]>)>,
 }
 
 /// What a footer rule is composed from, beside the chips' block.
@@ -1177,12 +1204,8 @@ impl PaneFooter {
                 reason: b.reason,
             });
             let fit = footer::fit_rule(&self.shown, room, widths);
-            let (cells, lights_at, glass) =
-                compose_rule_spans(&fit, block, rule, blank, mark_fg, room);
             composed.key = Some(key);
-            composed.cells = cells;
-            composed.lights_at = lights_at;
-            composed.glass = glass;
+            composed.paint = compose_rule_spans(&fit, block, rule, blank, mark_fg, room);
             match block {
                 Some(block) => composed
                     .block
@@ -1192,9 +1215,9 @@ impl PaneFooter {
             }
         }
         (
-            composed.cells.len(),
-            composed.lights_at,
-            composed.glass.clone(),
+            composed.paint.cells.len(),
+            composed.paint.lights_at,
+            composed.paint.glass.clone(),
         )
     }
 }
@@ -1245,96 +1268,51 @@ pub(crate) fn post_changed(session: u64) {
 /// The follow-up reads after every request, measured from it. Two cases need
 /// them, and both were seen on a dev build (2026-09-24): Claude Code writes
 /// `sessions/<pid>.json` a moment AFTER it takes the foreground, so the read
-/// that fires on first sight of `claude` found nothing (now the first-row
-/// ladder's to catch, [`FIRST_ROW_STEP`]); and a turn's final transcript row
-/// lands as the screen settles, after the last sweep that asked. Bounded — a
-/// request buys these two reads and no more.
+/// that fires on first sight of `claude` found nothing (now the registry
+/// watch's to catch, [`crate::claude_registry`]); and a turn's final
+/// transcript row lands as the screen settles, after the last sweep that
+/// asked. Bounded — a request buys these two reads and no more. They serve
+/// the transcript chips, never the card's gate.
 const FOLLOW_UPS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(6)];
 
-/// THE FIRST-ROW LADDER: how often a Claude Code process is read again while
-/// no read has found its registry row (`sessions/<pid>.json`), and for how
-/// long after the first ask for it ([`FIRST_ROW_FOR`]). Every fact is read
-/// from that row — the footer and its chips, and the running build
-/// (`FooterFacts::version`) the harness card's decoration waits on
-/// (`claude_card`'s GATES) — and Claude Code writes it a moment AFTER it
-/// takes the foreground. Measured on 2.1.303 (2026-10-19, four launches in a
-/// trusted folder, on the fullscreen renderer it started with): the row was
-/// born 0.35-0.8 s after the process was named and 100-215 ms BEFORE its
-/// launch card was drawn, while the read after first sight's miss waited for
-/// [`FOLLOW_UPS`]' first, 2 s on; so the card stood bare and the footer
-/// absent for 1.3-1.7 s, and the kitty rode in that late. On the ladder a
-/// miss is read again a rung later, until the first read that finds the row
-/// — the footer, and with it the decoration, then land at the first rung
-/// after the row's birth, at most a step after it. That is the card's first
-/// frame where the row leads the card by more than the wait for that rung
-/// (all three launches measured after: the row 21-130 ms ahead), and a frame
-/// or a few into the card where it does not: where it leads by less, or
-/// comes after, as on Claude Code's inline renderer
-/// (`CLAUDE_CODE_NO_FLICKER=0`), which draws the card before it writes the
-/// row (the card bare 88 and 170 ms, two launches on a debug build). The
-/// ladder is over for that process there, whatever later reads find (a read
-/// landing mid-write is the kept-facts rule's, [`resolve_facts`]).
-/// Bounded: a process whose row is never read (a `claude` that is not Claude
-/// Code, a Claude home the resolver does not find) costs at most
-/// `FIRST_ROW_FOR / FIRST_ROW_STEP` reads, each one failed open of one small
-/// file, and is then on the follow-ups' and the idle clock's cadence alone;
-/// a watch stopped (another program in front) and asked for again climbs
-/// again, once per ask — never a poll for the process's life. Five seconds
-/// also covers a new folder's trust dialog the harness answers, after which
-/// Claude Code writes its row (measured once: 3.3 s after the harness's
-/// claim). On the resolver thread, as every read is: no frame waits on it.
-const FIRST_ROW_STEP: Duration = Duration::from_millis(100);
-const FIRST_ROW_FOR: Duration = Duration::from_secs(5);
-
-/// The rung after a read at `at` that found no row, for a process first asked
-/// for at `since`: [`FIRST_ROW_STEP`] on, while that is within
-/// [`FIRST_ROW_FOR`] of `since`; `None` once it is not — the ladder's bound.
-fn first_row_rung(since: std::time::Instant, at: std::time::Instant) -> Option<std::time::Instant> {
-    let next = at + FIRST_ROW_STEP;
-    (next <= since + FIRST_ROW_FOR).then_some(next)
-}
-
-/// Where a watched process stands on its first-row ladder ([`FIRST_ROW_STEP`]).
+/// Why one read ran: the `registry-read` dev row's `cause=`, which a live
+/// measurement counts (card engine §3.10, §8). `Ask`, `Event` and `Placed`
+/// are pushed; `FollowUp` and `Idle` are the two clocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ladder {
-    /// No read has found the process's row: read it again at `next`. `since`
-    /// is the first ask for the process, which the bound runs from.
-    Climbing {
-        since: std::time::Instant,
-        next: std::time::Instant,
-    },
-    /// A read found the row, or the bound passed with none: over for this
-    /// process, whatever a later read finds.
-    Done,
+enum Cause {
+    /// A request ([`request_footer`]).
+    Ask,
+    /// One of [`FOLLOW_UPS`].
+    FollowUp,
+    /// The registry watch saw the process's Claude dir move
+    /// ([`Command::RowsMoved`]).
+    Event,
+    /// A registry watch was newly placed for the process's Claude dir: what
+    /// was written before it is read now, what follows by its event.
+    Placed,
+    /// The idle clock ([`IDLE_RECHECK`], [`WALL_RECHECK`]).
+    Idle,
 }
 
-impl Ladder {
-    /// A process first asked for at `asked`, before its first read is told.
-    fn start(asked: std::time::Instant) -> Ladder {
-        Ladder::Climbing {
-            since: asked,
-            next: asked,
-        }
-    }
-
-    /// The ladder after a read at `at` that found the process's row (`row`)
-    /// or not.
-    fn after(self, at: std::time::Instant, row: bool) -> Ladder {
+impl Cause {
+    /// The word the dev row prints.
+    const fn word(self) -> &'static str {
         match self {
-            Ladder::Climbing { since, .. } if !row => first_row_rung(since, at)
-                .map_or(Ladder::Done, |next| Ladder::Climbing { since, next }),
-            Ladder::Climbing { .. } | Ladder::Done => Ladder::Done,
-        }
-    }
-
-    /// The rung owed, if the ladder still climbs.
-    fn rung(self) -> Option<std::time::Instant> {
-        match self {
-            Ladder::Climbing { next, .. } => Some(next),
-            Ladder::Done => None,
+            Cause::Ask => "ask",
+            Cause::FollowUp => "follow-up",
+            Cause::Event => "event",
+            Cause::Placed => "placed",
+            Cause::Idle => "idle",
         }
     }
 }
+
+/// How many times one turn places registry watches and reads what they were
+/// placed for ([`Resolver::settle`]): a placement can find the next level or
+/// the row itself there, which is placed and read in the next round. A
+/// Claude dir missing every level from the home inward is three rounds; past
+/// the bound the watches stand and the next turn goes on.
+const PLACE_ROUNDS: usize = 8;
 
 /// How often a Claude Code session's facts are re-read while nothing asks
 /// for them — the status sweep asks only while the screen moves, so a branch
@@ -1345,8 +1323,8 @@ const IDLE_RECHECK: Duration = Duration::from_secs(15);
 const WATCH_FOR: Duration = Duration::from_secs(10 * 60);
 
 /// How often a session is re-read past [`WATCH_FOR`] while its footer shows
-/// a limit wall and its Claude Code process lives: a wall whose reset passes
-/// leaves the glass within this.
+/// a limit wall or weekly percentage and its Claude Code process lives: a wall whose
+/// reset passes, or cached quota that expires, leaves the glass within this.
 const WALL_RECHECK: Duration = Duration::from_secs(60);
 
 /// How long the resolver's roster answers from its last read ([`RosterMemo`]).
@@ -1363,7 +1341,7 @@ fn recheck_after(now: std::time::Instant, asked: std::time::Instant) -> Duration
 }
 
 /// Whether a session last asked for at `asked` is still watched: within
-/// [`WATCH_FOR`] of the ask, or past it while its footer shows a limit wall
+/// [`WATCH_FOR`] of the ask, or past it while its footer shows a wall or weekly percentage
 /// and its process is ALIVE (`walled_alive`, asked only then — liveness, not
 /// a start time, so it holds on Linux too, and a sessions file a crash left
 /// behind cannot keep the clock running for days).
@@ -1376,44 +1354,30 @@ fn still_watched(
 }
 
 /// THE LOG'S WAKE from this thread (session log Phase 3B, rulings S12, A12,
-/// A13): the instance's subscribers, notified DIRECTLY once the timeline is
-/// released when the transcript's steps moved what a reader of the session's
-/// log sees — no hop through the loop, which a headless test App does not
-/// run — and the `[session_log] clause` switch, under which the loop is told
-/// too (`Wake::SessionLogMoved`) so the tab's chrome follows the clause. The
-/// loop is told as well when the steps armed the turn tracker's settle,
-/// whose tick only the loop keeps. Carried by each request (a field of the
-/// [`Job`]), never a static. The default (a test's) holds no subscribers and
-/// the switch off.
+/// A13): the session's watchers are rung under the timeline lock when the
+/// transcript's steps moved what a reader of the session's log sees
+/// (`SessionTimeline::slog_take_wake`) — no hop through the loop, which a
+/// headless test App does not run — and under the `[session_log] clause`
+/// switch the loop is told too (`Wake::SessionLogMoved`) so the tab's chrome
+/// follows the clause. The loop is told as well when the steps armed the
+/// turn tracker's settle, whose tick only the loop keeps. Carried by each
+/// request (a field of the [`Job`]), never a static. The default (a test's)
+/// has the switch off.
 #[derive(Clone, Default)]
 pub(crate) struct LogWake {
-    subscribers: Option<crate::subscribe::Subscribers>,
     clause: bool,
 }
 
 impl LogWake {
-    /// The wake for an instance's `subscribers`, the clause switch `clause`.
-    pub(crate) fn new(subscribers: &crate::subscribe::Subscribers, clause: bool) -> LogWake {
-        LogWake {
-            subscribers: Some(Arc::clone(subscribers)),
-            clause,
-        }
+    /// The wake under the clause switch `clause`.
+    pub(crate) fn new(clause: bool) -> LogWake {
+        LogWake { clause }
     }
 
     /// After a batch of transcript steps was applied to session `session`'s
-    /// log and every timeline hold released: wake its watchers when they are
-    /// owed one, and the loop when it owes a settle tick or the clause
-    /// switch is on.
+    /// log (its watchers already rung where the batch took the owed wake):
+    /// tell the loop when it owes a settle tick or the clause switch is on.
     pub(crate) fn after(&self, session: u64, applied: &crate::session_log::transcript::Applied) {
-        if applied.owed
-            && let Some(subscribers) = self.subscribers.as_ref()
-            && subscribers.any()
-        {
-            subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(session);
-        }
         if (applied.owed && self.clause) || applied.settle.is_some() {
             post_log_moved(session);
         }
@@ -1424,10 +1388,7 @@ impl LogWake {
 /// settle tick, the clause in its chrome).
 fn post_log_moved(session: u64) {
     if let Some(proxy) = PROXY.get() {
-        let _ = proxy.send_event(Wake::SessionLogMoved {
-            session,
-            notify: false,
-        });
+        let _ = proxy.send_event(Wake::SessionLogMoved { session });
     }
 }
 
@@ -1449,6 +1410,25 @@ enum Command {
         session: u64,
         pgid: Option<i32>,
     },
+    /// The registry watch saw the Claude dir `dir`'s rows move
+    /// ([`crate::claude_registry`]): each process awaited there is read once.
+    RowsMoved {
+        dir: PathBuf,
+    },
+    /// The registry watch saw a level outside a `sessions/` move: the turn
+    /// places the watches again, and reads only under a Claude dir where
+    /// that placed one ([`Resolver::settle`]). Nothing is read for the event
+    /// itself.
+    LevelMoved,
+}
+
+impl From<crate::claude_registry::Told> for Command {
+    fn from(told: crate::claude_registry::Told) -> Command {
+        match told {
+            crate::claude_registry::Told::Rows(dir) => Command::RowsMoved { dir },
+            crate::claude_registry::Told::Level => Command::LevelMoved,
+        }
+    }
 }
 
 /// The one background thread footer facts are read on, started on first use
@@ -1459,10 +1439,10 @@ static RESOLVER: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 
 /// Read `pgid`'s footer facts off-thread into `timeline` now, and again at
 /// each of [`FOLLOW_UPS`] — and, while no read has found the process's
-/// registry row, on the first-row ladder ([`FIRST_ROW_STEP`]). A newer
-/// request for the same session replaces the follow-ups still owed for it,
-/// and keeps its process's ladder. If the thread cannot be started the footer
-/// simply does not appear.
+/// registry row, whenever the registry watch sees its Claude dir move
+/// ([`crate::claude_registry`]). A newer request for the same session
+/// replaces the follow-ups still owed for it. If the thread cannot be started
+/// the footer simply does not appear.
 pub(crate) fn request_footer(
     session: u64,
     timeline: &Arc<Mutex<SessionTimeline>>,
@@ -1472,16 +1452,35 @@ pub(crate) fn request_footer(
     if pgid <= 0 {
         return;
     }
+    #[cfg(test)]
+    if CAPTURED_ASKS.with(|captured| {
+        captured
+            .borrow_mut()
+            .as_mut()
+            .map(|asks| asks.push((session, pgid)))
+            .is_some()
+    }) {
+        return;
+    }
     let mut slot = RESOLVER.lock().unwrap_or_else(|p| p.into_inner());
     if slot.is_none() {
         let (tx, rx) = channel::<Command>();
+        // The registry watch's forwarder tells the resolver through its own
+        // sender, so the thread's channel outlives no reader of it: the
+        // forwarder goes with the watch, the watch with the thread.
+        let rows = tx.clone();
+        let sink: crate::claude_registry::Sink =
+            Arc::new(move |told| rows.send(Command::from(told)).is_ok());
         let spawned = crate::qos::spawn_lane_thread(
             "aterm-claude-footer",
             crate::qos::Role::Responsive,
             move || {
                 // It takes the session timeline lock the UI thread contends,
                 // so the lock-holder floor applies.
-                run(&rx);
+                run(
+                    &rx,
+                    crate::claude_registry::RegistryWatch::new(atpkg::dirwatch::Watcher::new, sink),
+                );
             },
         );
         match spawned {
@@ -1536,6 +1535,11 @@ thread_local! {
     /// status observer's retirement test reads it).
     pub(crate) static STOPPED_SESSIONS: std::cell::RefCell<Vec<u64>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// While `Some`, [`request_footer`] on this thread keeps each ask here,
+    /// `(session, pgid)`, and starts no resolver: a status observer test
+    /// reads which asks the sweep made without reading anyone's Claude home.
+    pub(crate) static CAPTURED_ASKS: std::cell::RefCell<Option<Vec<(u64, i32)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn send_stop(session: u64, pgid: Option<i32>) {
@@ -1555,25 +1559,40 @@ struct WatchSchedule {
 }
 
 /// One watched session: its latest job, when it was last ASKED for and last
-/// READ — the idle re-reads ([`IDLE_RECHECK`]) run off these — and its
-/// process's first-row ladder ([`FIRST_ROW_STEP`]).
+/// READ — the idle re-reads ([`IDLE_RECHECK`]) run off these — and whether
+/// its process is AWAITED: its last read found no registry row, so the
+/// registry watch looks out for it ([`crate::claude_registry`]).
 struct Watch {
     job: Job,
     asked: std::time::Instant,
     read: std::time::Instant,
-    ladder: Ladder,
+    awaiting: bool,
+}
+
+/// What one batch of commands asks of the resolver ([`WatchSchedule::accept`]).
+#[derive(Default)]
+struct Accepted {
+    /// The newest ask per session, to read now.
+    latest: Vec<Job>,
+    /// The watched sessions a stop retired.
+    stopped: Vec<u64>,
+    /// The Claude dirs whose rows the registry watch saw move.
+    moved: HashSet<PathBuf>,
 }
 
 impl WatchSchedule {
     /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask,
     /// unless `walled_alive` — asked only then — says the session's footer
-    /// shows a limit wall and its process lives ([`still_watched`]).
+    /// shows a wall or weekly percentage and its process lives ([`still_watched`]).
     fn prune(&mut self, now: std::time::Instant, mut walled_alive: impl FnMut(u64, &Job) -> bool) {
         self.watched.retain(|session, watch| {
             still_watched(now, watch.asked, || walled_alive(*session, &watch.job))
         });
     }
 
+    /// When the next read is owed on a clock: a follow-up or an idle
+    /// re-read. An awaited process is owed nothing on a clock beyond those
+    /// (no first-row ladder): a read sooner is the registry watch's.
     fn next(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         self.owed
             .iter()
@@ -1583,11 +1602,6 @@ impl WatchSchedule {
                     .values()
                     .map(|watch| watch.read + recheck_after(now, watch.asked)),
             )
-            .chain(
-                self.watched
-                    .values()
-                    .filter_map(|watch| watch.ladder.rung()),
-            )
             .min()
     }
 
@@ -1596,10 +1610,10 @@ impl WatchSchedule {
     }
 
     /// Collapse queued requests while respecting a stop's position in the
-    /// channel. Returns the jobs to read now and the watched ids it retired.
-    fn accept(&mut self, commands: impl IntoIterator<Item = Command>) -> (Vec<Job>, Vec<u64>) {
+    /// channel, and gather the Claude dirs the registry watch told.
+    fn accept(&mut self, commands: impl IntoIterator<Item = Command>) -> Accepted {
         let mut latest: HashMap<u64, Job> = HashMap::new();
-        let mut stopped = Vec::new();
+        let mut accepted = Accepted::default();
         for command in commands {
             match command {
                 Command::Request(job) => {
@@ -1613,12 +1627,18 @@ impl WatchSchedule {
                         latest.remove(&session);
                     }
                     if self.stop(session, pgid) {
-                        stopped.push(session);
+                        accepted.stopped.push(session);
                     }
                 }
+                Command::RowsMoved { dir } => {
+                    accepted.moved.insert(dir);
+                }
+                // The turn's settle is what it asks for.
+                Command::LevelMoved => {}
             }
         }
-        (latest.into_values().collect(), stopped)
+        accepted.latest = latest.into_values().collect();
+        accepted
     }
 
     fn stop(&mut self, session: u64, pgid: Option<i32>) -> bool {
@@ -1635,27 +1655,20 @@ impl WatchSchedule {
     }
 
     /// Watch `job`, asked for and read at `asked`, that read having found
-    /// its process's registry row (`row`) or not. An ask for the process the
-    /// session already watches keeps its ladder, and so its bound; a new
-    /// process in the session starts one.
+    /// its process's registry row (`row`) or not.
     fn watch(&mut self, job: Job, asked: std::time::Instant, row: bool) {
         self.owed
             .retain(|(_, pending)| pending.session != job.session);
         for delay in FOLLOW_UPS {
             self.owed.push((asked + delay, job.clone()));
         }
-        let ladder = self
-            .watched
-            .get(&job.session)
-            .filter(|watch| watch.job.pgid == job.pgid)
-            .map_or_else(|| Ladder::start(asked), |watch| watch.ladder);
         self.watched.insert(
             job.session,
             Watch {
                 job,
                 asked,
                 read: asked,
-                ladder: ladder.after(asked, row),
+                awaiting: !row,
             },
         );
     }
@@ -1666,16 +1679,6 @@ impl WatchSchedule {
         due.into_iter().map(|(_, job)| job).collect()
     }
 
-    /// The jobs whose first-row rung is due at `now`. Each is read and told
-    /// back ([`Self::read`]), which moves its rung past `now` or ends it.
-    fn due_rungs(&self, now: std::time::Instant) -> Vec<Job> {
-        self.watched
-            .values()
-            .filter(|watch| watch.ladder.rung().is_some_and(|at| at <= now))
-            .map(|watch| watch.job.clone())
-            .collect()
-    }
-
     fn due_idle(&self, now: std::time::Instant) -> Option<Job> {
         self.watched
             .values()
@@ -1683,47 +1686,76 @@ impl WatchSchedule {
             .map(|watch| watch.job.clone())
     }
 
+    /// The job of each session in `sessions` whose process is awaited, in
+    /// session order.
+    fn awaited_in(&self, sessions: &HashSet<u64>) -> Vec<Job> {
+        let mut jobs: Vec<Job> = sessions
+            .iter()
+            .filter_map(|session| self.watched.get(session))
+            .filter(|watch| watch.awaiting)
+            .map(|watch| watch.job.clone())
+            .collect();
+        jobs.sort_by_key(|job| job.session);
+        jobs
+    }
+
     /// `session` was read at `at`, the read having found its process's
     /// registry row (`row`) or not.
     fn read(&mut self, session: u64, at: std::time::Instant, row: bool) {
         if let Some(watch) = self.watched.get_mut(&session) {
             watch.read = at;
-            watch.ladder = watch.ladder.after(at, row);
+            watch.awaiting = !row;
         }
     }
 
-    /// One pass of the resolver thread ([`run`]) over the asks it just took
-    /// (`latest`) and what is owed: each ask is read and watched, then each
-    /// follow-up due at the pass's instant, then each first-row rung due
-    /// then — after the follow-ups, so a process one of them just read has
-    /// its rung moved past the instant and is not read twice in one pass —
-    /// then each idle re-read due then. `read` reads a job and says whether
-    /// it found the process's registry row ([`Found::row`]); `clock` is the
-    /// time, asked as each read ends. Returns the pass's instant, and LEAVES
-    /// NOTHING OWED AT OR BEFORE IT: every read moves its own clock past the
-    /// instant or ends it, so the thread's next sleep ([`Self::next`]) is
-    /// never zero — a rung left unread would wake it at once, again and again.
+    /// Whether `job`'s process is awaited as a read of it starts: its watch
+    /// is for another process or none (a process never read is awaited), or
+    /// its last read found no row.
+    fn awaits(&self, job: &Job) -> bool {
+        self.watched
+            .get(&job.session)
+            .is_none_or(|watch| watch.job.pgid != job.pgid || watch.awaiting)
+    }
+
+    /// One pass of the resolver thread ([`Resolver::turn`]) over the asks it
+    /// just took (`latest`) and what is owed: each ask is read and watched,
+    /// then each follow-up due at the pass's instant, then each awaited
+    /// process of a session in `moved` (its Claude dir's rows moved) that
+    /// this pass has not read yet — once, however many events told it —
+    /// then each idle re-read due then. `read` reads a job for a [`Cause`],
+    /// told whether its process was awaited ([`Self::awaits`]), and says
+    /// whether it found the process's registry row ([`Found::row`]); `clock`
+    /// is the time, asked as each read ends. Returns the pass's instant, and
+    /// LEAVES NOTHING OWED AT OR BEFORE IT: every read moves its own clock
+    /// past the instant, so the thread's next sleep ([`Self::next`]) is
+    /// never zero.
     fn serve(
         &mut self,
         latest: Vec<Job>,
-        mut read: impl FnMut(&Job) -> bool,
+        moved: &HashSet<u64>,
+        mut read: impl FnMut(&Job, Cause, bool) -> bool,
         mut clock: impl FnMut() -> std::time::Instant,
     ) -> std::time::Instant {
+        let mut done: HashSet<u64> = HashSet::new();
         for job in latest {
-            let row = read(&job);
+            let row = read(&job, Cause::Ask, self.awaits(&job));
+            done.insert(job.session);
             self.watch(job, clock(), row);
         }
         let now = clock();
         for job in self.due_followups(now) {
-            let row = read(&job);
+            let row = read(&job, Cause::FollowUp, self.awaits(&job));
+            done.insert(job.session);
             self.read(job.session, clock(), row);
         }
-        for job in self.due_rungs(now) {
-            let row = read(&job);
-            self.read(job.session, clock(), row);
+        for job in self.awaited_in(moved) {
+            if done.insert(job.session) {
+                let row = read(&job, Cause::Event, true);
+                self.read(job.session, clock(), row);
+            }
         }
         while let Some(job) = self.due_idle(now) {
-            let row = read(&job);
+            let row = read(&job, Cause::Idle, self.awaits(&job));
             self.read(job.session, clock(), row);
         }
         now
@@ -1827,39 +1859,16 @@ impl ProcessTails {
 }
 
 /// The resolver thread: each request is read at once and again at each
-/// follow-up — a process whose registry row no read has found yet, on each
-/// rung of its first-row ladder too ([`FIRST_ROW_STEP`]) — and the thread
-/// sleeps exactly until the next one is owed. Each wake is one pass
-/// ([`WatchSchedule::serve`]), which leaves nothing owed at its instant.
-fn run(rx: &std::sync::mpsc::Receiver<Command>) {
-    let mut schedule = WatchSchedule::default();
-    let mut known: HashMap<u64, Identity> = HashMap::new();
-    // Per PROCESS: its transcript-tail memo, kept while the process lives.
-    let mut tails = ProcessTails::default();
-    // Per watched session: its usage fold, released with the watch.
-    let mut folds: HashMap<u64, footer::FooterCache> = HashMap::new();
-    // Sessions whose published footer shows a limit wall.
-    let mut walled: HashSet<u64> = HashSet::new();
-    // The accounts roster, for every session's label.
-    let mut roster = RosterMemo::default();
-    // Per session: its latest job, when it was last ASKED for, when it was
-    // last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this — and its
-    // process's first-row ladder ([`Watch`]).
+/// follow-up, a process whose registry row no read has found yet whenever
+/// the registry watch sees its Claude dir move, and the thread sleeps exactly
+/// until the next clock read is owed or a command comes in. Each wake is one
+/// turn ([`Resolver::turn`]), which leaves nothing owed at its instant.
+fn run(rx: &std::sync::mpsc::Receiver<Command>, registry: crate::claude_registry::RegistryWatch) {
+    let mut resolver = Resolver::new(registry, LIVE);
     loop {
         let now = std::time::Instant::now();
-        schedule.prune(now, |session, job| {
-            walled.contains(&session)
-                && u32::try_from(job.pgid).is_ok_and(crate::control_auth::pid_alive)
-        });
-        known.retain(|session, _| schedule.watched.contains_key(session));
-        folds.retain(|session, _| schedule.watched.contains_key(session));
-        walled.retain(|session| schedule.watched.contains_key(session));
-        tails.retain(
-            &schedule,
-            |pgid, started| birth_seconds(pgid) == Some(started),
-            now,
-        );
-        let first = match schedule.next(now) {
+        resolver.retain(now);
+        let first = match resolver.next(now) {
             Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
                 Ok(job) => Some(job),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -1873,70 +1882,277 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>) {
         // Everything already queued, collapsed to the newest ask per session:
         // a slow read (a stalled mount under one session's cwd) is paid once,
         // not once per ask that piled up behind it. A stop in the batch wins
-        // over an ask for the same group queued before it.
-        let (latest, stopped) = schedule.accept(
+        // over an ask for the same group queued before it, and the registry
+        // watch's events are one read per awaited process.
+        resolver.turn(
             first
                 .into_iter()
                 .chain(std::iter::from_fn(|| rx.try_recv().ok())),
+            std::time::Instant::now,
         );
-        for session in stopped {
-            forget(session, &mut known, &mut folds, &mut walled);
-            // The process's tail stays while the process lives: a stopped
-            // group may come back (`fg`), its pin with it ([`ProcessTails`]).
+    }
+}
+
+/// The resolver thread's whole state ([`run`]): its schedule; per session,
+/// the process known for it, its usage fold and its wall mark; per process,
+/// its transcript tail; the one roster; the registry watch over the rows it
+/// awaits; and what a read asks outside Claude Code's own files ([`Asks`]).
+/// A test drives it turn by turn on a clock it holds still.
+struct Resolver {
+    /// Per session: its latest job, when it was last ASKED for, when it was
+    /// last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this — and
+    /// whether its process is awaited ([`Watch`]).
+    schedule: WatchSchedule,
+    known: HashMap<u64, Identity>,
+    /// Per PROCESS: its transcript-tail memo, kept while the process lives.
+    tails: ProcessTails,
+    /// Per watched session: its usage fold, released with the watch.
+    folds: HashMap<u64, footer::FooterCache>,
+    /// Sessions whose footer has a wall or weekly percentage to expire on the slow clock.
+    walled: HashSet<u64>,
+    /// The accounts roster, for every session's label.
+    roster: RosterMemo,
+    registry: crate::claude_registry::RegistryWatch,
+    asks: Asks,
+}
+
+impl Resolver {
+    fn new(registry: crate::claude_registry::RegistryWatch, asks: Asks) -> Resolver {
+        Resolver {
+            schedule: WatchSchedule::default(),
+            known: HashMap::new(),
+            tails: ProcessTails::default(),
+            folds: HashMap::new(),
+            walled: HashSet::new(),
+            roster: RosterMemo::default(),
+            registry,
+            asks,
         }
+    }
+
+    /// Before the thread sleeps at `now`: the watches whose time is up go,
+    /// with what the reads hold for their sessions, the tails of processes
+    /// gone, and the registry watches nothing awaits now.
+    fn retain(&mut self, now: std::time::Instant) {
+        let walled = &self.walled;
+        self.schedule.prune(now, |session, job| {
+            walled.contains(&session)
+                && u32::try_from(job.pgid).is_ok_and(crate::control_auth::pid_alive)
+        });
+        let watched = &self.schedule.watched;
+        self.known
+            .retain(|session, _| watched.contains_key(session));
+        self.folds
+            .retain(|session, _| watched.contains_key(session));
+        self.walled.retain(|session| watched.contains_key(session));
+        self.tails.retain(
+            &self.schedule,
+            |pgid, started| birth_seconds(pgid) == Some(started),
+            now,
+        );
+        self.registry.let_go(&self.awaited());
+    }
+
+    /// When the next clock read is owed ([`WatchSchedule::next`]).
+    fn next(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.schedule.next(now)
+    }
+
+    /// One turn over `commands`, the batch the thread just took: a stop
+    /// forgets its session ([`forget`]; the process's tail stays while it
+    /// lives, since a stopped group may come back with its pin,
+    /// [`ProcessTails`]); the asks, the follow-ups due, the processes whose
+    /// rows moved and the idle re-reads due are read
+    /// ([`WatchSchedule::serve`]); and the registry watch is settled on what
+    /// is awaited after them ([`Self::settle`]). `clock` is the time, asked
+    /// as each read ends. Returns the pass's instant.
+    fn turn(
+        &mut self,
+        commands: impl IntoIterator<Item = Command>,
+        mut clock: impl FnMut() -> std::time::Instant,
+    ) -> std::time::Instant {
+        let now = self.serve_commands(commands, &mut clock);
+        self.settle(&mut clock);
+        now
+    }
+
+    /// [`Self::turn`]'s reads, before its registry watch is settled.
+    fn serve_commands(
+        &mut self,
+        commands: impl IntoIterator<Item = Command>,
+        clock: &mut impl FnMut() -> std::time::Instant,
+    ) -> std::time::Instant {
+        let accepted = self.schedule.accept(commands);
+        for session in accepted.stopped {
+            forget(session, &mut self.known, &mut self.folds, &mut self.walled);
+        }
+        let moved = self.sessions_under(&accepted.moved);
         let mut reads = Reads {
-            known: &mut known,
-            tails: &mut tails,
-            folds: &mut folds,
-            walled: &mut walled,
-            roster: &mut roster,
+            known: &mut self.known,
+            tails: &mut self.tails,
+            folds: &mut self.folds,
+            walled: &mut self.walled,
+            roster: &mut self.roster,
+            asks: self.asks,
         };
-        schedule.serve(latest, |job| reads.resolve(job), std::time::Instant::now);
+        self.schedule.serve(
+            accepted.latest,
+            &moved,
+            |job, cause, awaited| reads.resolve(job, cause, awaited),
+            clock,
+        )
+    }
+
+    /// Place the registry watches the awaited processes need
+    /// ([`crate::claude_registry::RegistryWatch::reconcile`]), then read
+    /// each process awaited under a Claude dir where one was newly placed
+    /// ([`Cause::Placed`]): what was written before the watch is found by
+    /// that read, what follows by its event. Again while a round places a
+    /// watch (a read can find the row's file there, whose watch is placed in
+    /// the next), at most [`PLACE_ROUNDS`] times.
+    fn settle(&mut self, clock: &mut impl FnMut() -> std::time::Instant) {
+        for _ in 0..PLACE_ROUNDS {
+            let fresh: HashSet<PathBuf> = self
+                .registry
+                .reconcile(&self.awaited())
+                .into_iter()
+                .collect();
+            if fresh.is_empty() {
+                return;
+            }
+            let jobs = self.schedule.awaited_in(&self.sessions_under(&fresh));
+            let mut reads = Reads {
+                known: &mut self.known,
+                tails: &mut self.tails,
+                folds: &mut self.folds,
+                walled: &mut self.walled,
+                roster: &mut self.roster,
+                asks: self.asks,
+            };
+            for job in jobs {
+                let row = reads.resolve(&job, Cause::Placed, true);
+                self.schedule.read(job.session, clock(), row);
+            }
+        }
+    }
+
+    /// The awaited processes whose Claude dir a read has resolved: what the
+    /// registry watch looks out for. One whose dir is not known yet (the
+    /// first ask fell in a `/bin/sh` shim's window, whose environment macOS
+    /// hides) is not watched; the re-ask at its drawer image's exec edge
+    /// reads it again (`StatusObserver::request_footer_if_due`).
+    fn awaited(&self) -> Vec<crate::claude_registry::Awaited> {
+        let mut awaited: Vec<_> = self
+            .schedule
+            .watched
+            .iter()
+            .filter(|(_, watch)| watch.awaiting)
+            .filter_map(|(session, watch)| {
+                let identity = self
+                    .known
+                    .get(session)
+                    .filter(|identity| identity.pid == watch.job.pgid)?;
+                Some(crate::claude_registry::Awaited {
+                    dir: identity.dir.clone()?,
+                    pid: u32::try_from(watch.job.pgid).ok()?,
+                })
+            })
+            .collect();
+        awaited.sort_by(|a, b| (&a.dir, a.pid).cmp(&(&b.dir, b.pid)));
+        awaited
+    }
+
+    /// The watched sessions whose process's Claude dir is one of `dirs`.
+    fn sessions_under(&self, dirs: &HashSet<PathBuf>) -> HashSet<u64> {
+        if dirs.is_empty() {
+            return HashSet::new();
+        }
+        self.schedule
+            .watched
+            .iter()
+            .filter(|(session, watch)| {
+                self.known.get(session).is_some_and(|identity| {
+                    identity.pid == watch.job.pgid
+                        && identity.dir.as_ref().is_some_and(|dir| dirs.contains(dir))
+                })
+            })
+            .map(|(session, _)| *session)
+            .collect()
     }
 }
 
 /// The resolver's state one read touches: per session, the process known
-/// for it, its usage fold and its wall mark; per process, its tail; and the
-/// one roster.
+/// for it, its usage fold and its wall mark; per process, its tail; the one
+/// roster; and what a read asks outside Claude Code's own files.
 struct Reads<'a> {
     known: &'a mut HashMap<u64, Identity>,
     tails: &'a mut ProcessTails,
     folds: &'a mut HashMap<u64, footer::FooterCache>,
     walled: &'a mut HashSet<u64>,
     roster: &'a mut RosterMemo,
+    asks: Asks,
 }
 
 impl Reads<'_> {
-    /// Read `job`'s session and keep it in the walled set exactly while its
-    /// published footer shows a limit wall. Whether the read found the
-    /// process's registry row (the schedule's first-row ladder).
-    fn resolve(&mut self, job: &Job) -> bool {
+    /// Read `job`'s session for `cause` and keep it in the walled set
+    /// exactly while its published footer has a wall or weekly percentage. Whether the
+    /// read found the process's registry row (whether it is still awaited).
+    /// A read of an `awaited` process is a `registry-read` dev row
+    /// ([`crate::holder_image::DEV_ROWS`]), `open=1` where the read opened
+    /// its registry row's path (its Claude dir was known): what a live
+    /// measurement counts, by cause, until the row is found. A read of a
+    /// process whose row was found is none, so the steady re-reads of a long
+    /// session never crowd its timeline.
+    fn resolve(&mut self, job: &Job, cause: Cause, awaited: bool) -> bool {
         let found = resolve_and_post(
             self.known,
             self.tails,
             self.folds.entry(job.session).or_default(),
             self.roster,
             job,
+            self.asks,
         );
-        note_wall(self.walled, job.session, found.wall);
+        note_wall(self.walled, job.session, found.timed);
+        if crate::holder_image::DEV_ROWS && awaited {
+            let open = self
+                .known
+                .get(&job.session)
+                .is_some_and(|identity| identity.pid == job.pgid);
+            job.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record(
+                    REGISTRY_READ,
+                    format!(
+                        "cause={} pid={} open={} row={} {}",
+                        cause.word(),
+                        job.pgid,
+                        u8::from(open),
+                        u8::from(found.row),
+                        crate::holder_image::dev_tail()
+                    ),
+                );
+        }
         found.row
     }
 }
+
+/// The dev timeline row of one read of an awaited process ([`Reads::resolve`]).
+pub(crate) const REGISTRY_READ: &str = "registry-read";
 
 /// What one read found, for the resolver's own state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Found {
     /// The process's registry row answered the read ([`footer::read_pid`]
-    /// gave facts): the first-row ladder ends at the first read it is true
-    /// for ([`FIRST_ROW_STEP`]).
+    /// gave facts): the process is awaited until a read it is true for.
     row: bool,
-    /// The footer the session's timeline now shows carries a limit wall.
-    wall: bool,
+    /// Its published wall or weekly percentage still needs clock-driven expiry.
+    timed: bool,
 }
 
-/// Keep `session` in `walled` exactly while its footer shows a limit wall.
-fn note_wall(walled: &mut HashSet<u64>, session: u64, shows_wall: bool) {
-    if shows_wall {
+/// Keep the slow clock while a footer value needs time-driven expiry.
+fn note_wall(walled: &mut HashSet<u64>, session: u64, timed: bool) {
+    if timed {
         walled.insert(session);
     } else {
         walled.remove(&session);
@@ -1993,6 +2209,12 @@ struct Identity {
     /// (`ATERM_TASK_FILE`, [`crate::survey::task_prompt_of_env`]): the
     /// survey's `prompt=` for a tasked session.
     task: Option<String>,
+    /// The image and settings directory the stored-login verdict belongs to.
+    login_checked_for: Option<(Option<u64>, PathBuf)>,
+    /// Settings, provider and profile-store evidence leave the stored login selected.
+    stored_login: bool,
+    /// Exact captured exec environment, fingerprinted without retaining credentials.
+    env_stamp: Option<[u8; 32]>,
 }
 
 /// The kernel's start time of `pid`, unix seconds, where this platform can
@@ -2016,25 +2238,27 @@ fn process_args(pid: i32) -> Option<atpkg::caller_shell::ProcArgs> {
         .and_then(atpkg::caller_shell::process_args)
 }
 
-/// `pid`'s Claude Code directory, from its own environment at exec (`args`)
-/// and, for a relative `CLAUDE_CONFIG_DIR` (empty included), the directory
-/// it runs in, by the one resolver ([`footer::claude_dir_of`]); aterm's home
-/// when that environment cannot be read.
+/// `pid`'s Claude Code directory, from its own environment at exec (`args`:
+/// its `CLAUDE_CONFIG_DIR`, and the variable its `os.homedir()` reads,
+/// [`accounts::HOMEDIR_ENV`], `USERPROFILE` on Windows) and, for a relative
+/// `CLAUDE_CONFIG_DIR` (empty included), the directory it runs in, by the
+/// one resolver ([`footer::claude_dir_of`]). An unread environment names no
+/// directory, so the next request can resolve it again.
 pub(crate) fn claude_dir_of_args(
     args: Option<&atpkg::caller_shell::ProcArgs>,
     pid: i32,
 ) -> Option<PathBuf> {
     match args {
         Some(args) => footer::claude_dir_of(
-            args.env_var("CLAUDE_CONFIG_DIR"),
-            args.env_var("HOME"),
+            args.env_var(accounts::HOME_ENV),
+            args.env_var(accounts::HOMEDIR_ENV),
             || {
                 u32::try_from(pid)
                     .ok()
                     .and_then(aterm_sysprobe::process_cwd)
             },
         ),
-        None => aterm_types::dirs::home_dir().map(|home| home.join(".claude")),
+        None => None,
     }
 }
 
@@ -2045,6 +2269,17 @@ fn login_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<account
     accounts::ProcessLogin::of_exec_env(&args?.env)
 }
 
+/// Reuse an image's auth verdict only for its exact captured environment. Lengths
+/// separate entries, and no raw credential value is retained in the identity cache.
+fn exec_env_stamp(env: &[String]) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    for entry in env {
+        digest.update(entry.len().to_le_bytes());
+        digest.update(entry.as_bytes());
+    }
+    digest.finalize()
+}
+
 /// The accounts roster as the resolver last read it, for the footer's label
 /// ([`accounts::footer_label`]). The resolver thread's own: no lock, and a
 /// new aterm process starts with none.
@@ -2052,12 +2287,12 @@ fn login_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<account
 struct RosterMemo {
     /// When `load` was last asked.
     read: Option<std::time::Instant>,
-    /// What it answered, where that lists two or more.
+    /// What it answered. A lone row can bind a named login's profile identity.
     roster: Option<accounts::Roster>,
 }
 
 impl RosterMemo {
-    /// The roster, where it lists two or more; `load` is asked at most every
+    /// The roster; `load` is asked at most every
     /// [`ROSTER_RECHECK`]. A load that fails is no roster until the next.
     fn at(
         &mut self,
@@ -2069,7 +2304,7 @@ impl RosterMemo {
             .is_none_or(|at| now.saturating_duration_since(at) >= ROSTER_RECHECK)
         {
             self.read = Some(now);
-            self.roster = load().filter(accounts::Roster::several);
+            self.roster = load();
         }
         self.roster.as_ref()
     }
@@ -2086,6 +2321,11 @@ fn live_roster() -> Option<accounts::Roster> {
         return None;
     }
     let roster = accounts::Roster::load(&accounts::default_roster_path()?).ok()?;
+    // A missing/unconfigured roster needs no machine binding store. In particular,
+    // the presentation still works while the harness host itself is switched off.
+    if roster.rows.is_empty() {
+        return Some(roster);
+    }
     // Through this machine's logins: a renewed login is its row's.
     let now = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok())?;
     accounts::Store::at(&crate::harness_host::harness_state()?)
@@ -2102,6 +2342,7 @@ struct Asks {
     args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>,
     roster: fn() -> Option<accounts::Roster>,
     home: fn() -> Option<PathBuf>,
+    stored_login: fn(u32, &[String], &str) -> bool,
 }
 
 /// [`process_args`], [`live_roster`] and [`aterm_types::dirs::home_dir`].
@@ -2109,6 +2350,7 @@ const LIVE: Asks = Asks {
     args: process_args,
     roster: live_roster,
     home: aterm_types::dirs::home_dir,
+    stored_login: crate::harness_netprobe::stored_login_of_agent,
 };
 
 /// [`resolve_into`], then wake the loop when the facts moved — and, when the
@@ -2123,6 +2365,7 @@ fn resolve_and_post(
     fold: &mut footer::FooterCache,
     roster: &mut RosterMemo,
     job: &Job,
+    asks: Asks,
 ) -> Found {
     let (session, timeline, pgid) = (job.session, &job.timeline, job.pgid);
     let started = birth_seconds(pgid);
@@ -2131,25 +2374,32 @@ fn resolve_and_post(
         .is_some_and(|id| id.pid == pgid && id.started.is_some() && id.started == started)
         .then(|| known.remove(&session))
         .flatten();
-    // The directory alone is taken from this read: the rest is read once
-    // the registry names the image ([`resolve_into`]).
     let mut identity = cached.unwrap_or_else(|| Identity {
         pid: pgid,
         started,
-        dir: claude_dir_of_args(process_args(pgid).as_ref(), pgid),
+        dir: None,
         launch: LaunchFacts::default(),
         launch_for: None,
         login: None,
         argv: Vec::new(),
         task: None,
+        login_checked_for: None,
+        stored_login: false,
+        env_stamp: None,
     });
+    // A readable launcher's directory is only a candidate until its registry
+    // names an image whose exec context was read. Keep it for watches, but
+    // resolve it again after an in-place exec may have changed HOME/config.
+    if identity.launch_for.is_none() {
+        identity.dir = claude_dir_of_args((asks.args)(pgid).as_ref(), pgid);
+    }
     let tail = tails.cache(
         session,
         identity.pid,
         identity.started,
         std::time::Instant::now(),
     );
-    let (moved, found, logged) = resolve_into(timeline, &mut identity, tail, fold, roster, LIVE);
+    let (moved, found, logged) = resolve_into(timeline, &mut identity, tail, fold, roster, asks);
     job.wake.after(session, &logged);
     // No directory is not remembered: a launch through the atpkg twin is
     // `/bin/sh` for its first milliseconds, whose environment macOS hides,
@@ -2300,6 +2550,28 @@ fn resolve_facts(
         now: aterm_agent::supervise::limit::unix_now(),
         offset_at: &offset_at_cached,
     };
+    resolve_facts_at(timeline, identity, tail, fold, roster, asks, &clock)
+}
+
+/// The same worker read with an explicit clock, so quota expiry can be driven without
+/// sleeps or changing the process's wall clock.
+fn resolve_facts_at(
+    timeline: &Arc<Mutex<SessionTimeline>>,
+    identity: &mut Identity,
+    tail: &mut footer::TailCache,
+    fold: &mut footer::FooterCache,
+    roster: &mut RosterMemo,
+    asks: Asks,
+    clock: &footer::ReadClock<'_>,
+) -> (Option<Option<PathBuf>>, Found) {
+    let is_claude = timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent()
+        .program
+        .as_deref()
+        .and_then(aterm_phase::program_of)
+        == Some(aterm_phase::Program::Claude);
     let started = identity.started;
     let mut facts = u32::try_from(identity.pid)
         .ok()
@@ -2324,7 +2596,25 @@ fn resolve_facts(
                     if args.is_some() {
                         identity.launch_for = Some(entry.started_at);
                     }
+                    identity.env_stamp = args.as_ref().map(|args| exec_env_stamp(&args.env));
                     identity.argv = args.map(|a| a.argv).unwrap_or_default();
+                }
+                if is_claude
+                    && identity
+                        .login_checked_for
+                        .as_ref()
+                        .is_none_or(|(image, cwd)| *image != entry.started_at || *cwd != entry.cwd)
+                {
+                    identity.stored_login = false;
+                    if identity.launch_for == Some(entry.started_at) {
+                        identity.stored_login = u32::try_from(identity.pid)
+                            .ok()
+                            .zip(entry.cwd.to_str())
+                            .is_some_and(|(pid, cwd)| {
+                                (asks.stored_login)(pid, &identity.argv, cwd)
+                            });
+                        identity.login_checked_for = Some((entry.started_at, entry.cwd.clone()));
+                    }
                 }
                 (identity.launch.clone(), identity.argv.clone())
             };
@@ -2335,20 +2625,30 @@ fn resolve_facts(
                 launch,
                 tail,
                 fold,
-                &clock,
+                clock,
                 crate::harness_host::harness_state().as_deref(),
                 (asks.home)().as_deref(),
             )
         });
     if facts.is_none() {
-        let non_registry_prog = timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent()
-            .program
-            .as_deref()
-            .and_then(aterm_phase::program_of)
-            .filter(|p| matches!(p, aterm_phase::Program::Agy | aterm_phase::Program::Muse));
+        let (non_registry_prog, prev_sub, prev_ctx) = {
+            let held = timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let prog = held
+                .agent()
+                .program
+                .as_deref()
+                .and_then(aterm_phase::program_of)
+                .filter(|p| matches!(p, aterm_phase::Program::Agy | aterm_phase::Program::Muse));
+            let sub = held
+                .claude_footer()
+                .and_then(|f| f.subscription.clone())
+                .unwrap_or_default();
+            let ctx = held
+                .claude_footer()
+                .and_then(|f| f.context.clone())
+                .unwrap_or_else(|| "ctx auto".into());
+            (prog, sub, ctx)
+        };
         if let Some(prog) = non_registry_prog {
             let prefix = match prog {
                 aterm_phase::Program::Muse => "muse",
@@ -2393,6 +2693,8 @@ fn resolve_facts(
                 }),
                 upgrade: None,
                 account: None,
+                subscription: Some(prev_sub),
+                context: Some(prev_ctx),
             });
         }
     }
@@ -2403,6 +2705,38 @@ fn resolve_facts(
             .at(std::time::Instant::now(), asks.roster)
             .and_then(|listed| accounts::footer_label(listed, who))
             .map(str::to_owned);
+    }
+    // A profile is selected by the process's own captured exec environment, never by
+    // the harness process's HOME. Replace all presentation fields on every read, so an
+    // account change or failed read cannot retain the preceding account's weekly quota.
+    let subscription = is_claude.then(|| {
+        (asks.args)(identity.pid)
+            .and_then(|args| {
+                // A refused auth-source check says nothing, and a registry write
+                // missed during an exec cannot borrow the prior image's verdict.
+                if !identity.stored_login
+                    || args.argv != identity.argv
+                    || Some(exec_env_stamp(&args.env)) != identity.env_stamp
+                {
+                    return None;
+                }
+                aterm_agent::harness::profile::subscription_for(
+                    &args.env,
+                    &(asks.home)()?,
+                    identity.dir.as_deref()?,
+                    roster.at(std::time::Instant::now(), asks.roster),
+                    clock.now,
+                )
+            })
+            .unwrap_or_default()
+    });
+    if let Some(facts) = facts.as_mut()
+        && is_claude
+    {
+        facts.subscription = subscription.clone();
+        if facts.context.is_none() {
+            facts.context = Some("ctx auto".into());
+        }
     }
     let denied = facts.as_ref().and_then(|f| f.repo_read_denied.clone());
     // The survey's excerpts, from the same tail read: published beside the
@@ -2425,13 +2759,28 @@ fn resolve_facts(
         && identity.started.is_some()
         && timeline.claude_footer_identity() == Some((identity.pid, identity.started))
     {
+        // A transient registry read may retain this process's model/usage fold, but
+        // account presentation is always replaced from the independently selected profile.
+        let moved = timeline.claude_footer().cloned().is_some_and(|mut kept| {
+            kept.subscription = subscription;
+            timeline.set_claude_footer(identity.pid, identity.started, Some(kept))
+        });
         return (
-            None,
+            moved.then_some(None),
             Found {
                 row,
-                wall: shows_wall(&timeline),
+                timed: needs_recheck(&timeline),
             },
         );
+    }
+    if let Some(f) = facts.as_mut()
+        && timeline.claude_footer_identity() == Some((identity.pid, identity.started))
+        && let Some(prev_ctx) = timeline
+            .claude_footer()
+            .and_then(|prev| prev.context.as_ref())
+            .filter(|c| *c != "ctx auto")
+    {
+        f.context = Some(prev_ctx.clone());
     }
     timeline.set_claude_excerpts(identity.pid, excerpts);
     let moved = timeline
@@ -2441,17 +2790,23 @@ fn resolve_facts(
         moved,
         Found {
             row,
-            wall: shows_wall(&timeline),
+            timed: needs_recheck(&timeline),
         },
     )
 }
 
-/// Whether the footer `timeline` shows NOW carries a limit wall.
-fn shows_wall(timeline: &SessionTimeline) -> bool {
-    timeline
-        .claude_footer()
-        .and_then(|facts| facts.usage.as_ref())
-        .is_some_and(|usage| usage.wall.is_some())
+/// Whether any currently published footer value still needs local clock checks.
+fn needs_recheck(timeline: &SessionTimeline) -> bool {
+    timeline.claude_footer().is_some_and(|facts| {
+        facts
+            .usage
+            .as_ref()
+            .is_some_and(|usage| usage.wall.is_some())
+            || facts
+                .subscription
+                .as_ref()
+                .is_some_and(|subscription| subscription.weekly.is_some())
+    })
 }
 
 /// A fingerprint of `facts` AS SHOWN — filled from the launch card `card`
@@ -2488,6 +2843,8 @@ pub(crate) fn fingerprint(
         owner,
         upgrade,
         account,
+        subscription,
+        context,
     } = facts;
     let version = version
         .as_deref()
@@ -2504,6 +2861,8 @@ pub(crate) fn fingerprint(
     )
         .hash(&mut h);
     (model_open, effort_open, effort_for, owner, upgrade, account).hash(&mut h);
+    subscription.hash(&mut h);
+    context.hash(&mut h);
     if usage {
         usage_facts.hash(&mut h);
     } else {
@@ -2613,7 +2972,7 @@ fn compose_rule_spans(
     blank: RenderCell,
     mark_fg: [u8; 3],
     room: usize,
-) -> (Vec<RenderCell>, Option<usize>, std::ops::Range<usize>) {
+) -> RulePaint {
     let mut out: Vec<RenderCell> = Vec::with_capacity(room);
     let mut lights_at = None;
     if let Some(block) = block.filter(|_| fit.chips) {
@@ -2634,6 +2993,8 @@ fn compose_rule_spans(
         out.push(blank);
     }
     let mut facts: Vec<RenderCell> = Vec::new();
+    let mut clusters = Vec::new();
+    let mut combining = Vec::new();
     if !fit.segments.is_empty() {
         let quiet = |fg: [u8; 3]| RenderCell {
             fg,
@@ -2667,6 +3028,8 @@ fn compose_rule_spans(
                 };
             }
         }
+        clusters = set.clusters;
+        combining = set.combining;
     }
     let mut glass = 0..0;
     if !out.is_empty() {
@@ -2674,8 +3037,21 @@ fn compose_rule_spans(
         glass = out.len()..out.len() + glyphs;
         out.extend(std::iter::repeat_n(rule, glyphs));
     }
+    let facts_at = out.len() + 1;
+    for (col, _) in &mut clusters {
+        *col += facts_at;
+    }
+    for (col, _) in &mut combining {
+        *col += facts_at;
+    }
     out.extend(facts);
-    (out, lights_at, glass)
+    RulePaint {
+        cells: out,
+        lights_at,
+        glass,
+        clusters,
+        combining,
+    }
 }
 
 /// [`compose_rule_spans`]' cells and where the chips start, as the tests
@@ -2689,8 +3065,8 @@ fn compose_rule(
     mark_fg: [u8; 3],
     room: usize,
 ) -> (Vec<RenderCell>, Option<usize>) {
-    let (cells, lights_at, _) = compose_rule_spans(fit, block, rule, blank, mark_fg, room);
-    (cells, lights_at)
+    let paint = compose_rule_spans(fit, block, rule, blank, mark_fg, room);
+    (paint.cells, paint.lights_at)
 }
 
 /// One rule's edits for [`write_edits`]: its `cells` at `col` of frame row
@@ -2794,6 +3170,63 @@ struct RowUndo {
     painted: Vec<RenderCell>,
     /// The row's D-2 revision before the write, when the write cleared it.
     rev_before: Option<u64>,
+    clusters: TextUndo<Box<str>>,
+    combining: TextUndo<Box<[char]>>,
+}
+
+/// Exact metadata owned by one cell edit, with returned payloads reused next frame.
+#[derive(Debug, Default)]
+struct TextUndo<T> {
+    owned: Vec<(usize, T)>,
+    live: usize,
+    spare: Vec<T>,
+}
+
+impl<T: Clone + Eq> TextUndo<T> {
+    fn publish(&mut self, channel: &mut Vec<(usize, T)>, col: usize, value: &T) {
+        if self.live == self.owned.len() {
+            self.owned.push((col, value.clone()));
+        } else {
+            let kept = &mut self.owned[self.live];
+            kept.0 = col;
+            if &kept.1 != value {
+                kept.1.clone_from(value);
+            }
+        }
+        self.live += 1;
+        // A fresh engine fill can replace the preceding frame before undo ran.
+        // Reserve its return slot now, so the first settled undo allocates nothing.
+        if self.spare.capacity() < self.live {
+            self.spare.reserve(self.live - self.spare.len());
+        }
+        // Several bases can carry differently sized marks. Match returned
+        // payloads rather than popping them in reverse paint order and resizing
+        // their boxes on every otherwise unchanged frame.
+        let matching = self.spare.iter().position(|payload| payload == value);
+        let mut payload = matching
+            .map(|index| self.spare.swap_remove(index))
+            .or_else(|| self.spare.pop())
+            .unwrap_or_else(|| value.clone());
+        if &payload != value {
+            payload.clone_from(value);
+        }
+        channel.push((col, payload));
+    }
+
+    fn intact(&self, channel: &[(usize, T)], span: &std::ops::Range<usize>) -> bool {
+        channel
+            .iter()
+            .filter(|(col, _)| span.contains(col))
+            .eq(self.owned[..self.live].iter())
+    }
+
+    fn remove(&mut self, channel: &mut Vec<(usize, T)>, span: &std::ops::Range<usize>) {
+        self.spare.extend(
+            channel
+                .extract_if(.., |(col, _)| span.contains(col))
+                .map(|(_, payload)| payload),
+        );
+    }
 }
 
 /// What the last footer splice overwrote in one window's scratch, with the
@@ -2818,9 +3251,56 @@ struct WriteSeal {
     after: Tokens,
     seq_before: u64,
     shifted_before: u64,
+    cluster_rows_before: usize,
+    combining_rows_before: usize,
 }
 
 impl FooterUndo {
+    /// Add native text only where this splice actually wrote its cells. A skipped
+    /// vendor-owned span gets no metadata, and undo verifies these exact payloads.
+    fn publish_text(
+        &mut self,
+        scratch: &mut RenderInput,
+        row: usize,
+        col: usize,
+        paint: &RulePaint,
+    ) {
+        if self.write.is_none() || (paint.clusters.is_empty() && paint.combining.is_empty()) {
+            return;
+        }
+        for (at, text) in &paint.clusters {
+            let at = col + at;
+            if let Some(edit) = self.rows[..self.live].iter_mut().find(|edit| {
+                edit.frame_row == row
+                    && (edit.col_off..edit.col_off + edit.painted.len()).contains(&at)
+            }) {
+                scratch
+                    .clusters
+                    .resize_with(scratch.clusters.len().max(row + 1), Vec::new);
+                edit.clusters.publish(&mut scratch.clusters[row], at, text);
+            }
+        }
+        for (at, marks) in &paint.combining {
+            let at = col + at;
+            if let Some(edit) = self.rows[..self.live].iter_mut().find(|edit| {
+                edit.frame_row == row
+                    && (edit.col_off..edit.col_off + edit.painted.len()).contains(&at)
+            }) {
+                scratch
+                    .combining
+                    .resize_with(scratch.combining.len().max(row + 1), Vec::new);
+                edit.combining
+                    .publish(&mut scratch.combining[row], at, marks);
+            }
+        }
+        if let Some(entries) = scratch.clusters.get_mut(row) {
+            entries.sort_unstable_by_key(|(col, _)| *col);
+        }
+        if let Some(entries) = scratch.combining.get_mut(row) {
+            entries.sort_unstable_by_key(|(col, _)| *col);
+        }
+    }
+
     /// The rows the write on the glass wrote — none once it is undone.
     fn written(&self) -> &[RowUndo] {
         if self.write.is_some() {
@@ -2897,29 +3377,63 @@ pub(crate) fn undo(slot: &mut FooterUndo, scratch: &mut RenderInput) -> bool {
     let Some(seal) = slot.write.take() else {
         return false;
     };
-    let rows = &slot.rows[..std::mem::take(&mut slot.live)];
+    let rows = &mut slot.rows[..std::mem::take(&mut slot.live)];
     if Tokens::of(scratch) != seal.after {
         return false;
     }
     let intact = rows.iter().all(|r| {
+        let span = r.col_off..r.col_off + r.painted.len();
         scratch
             .cells
             .get(r.frame_row)
             .and_then(|row| row.get(r.col_off..r.col_off + r.painted.len()))
             .is_some_and(|span| span == r.painted.as_slice())
+            && r.clusters.intact(
+                scratch.clusters.get(r.frame_row).map_or(&[], Vec::as_slice),
+                &span,
+            )
+            && r.combining.intact(
+                scratch
+                    .combining
+                    .get(r.frame_row)
+                    .map_or(&[], Vec::as_slice),
+                &span,
+            )
+            && !touches(&scratch.images, r.frame_row, &span)
     });
     if !intact {
         return false;
     }
     // Newest first: two panes side by side write the same frame row, and the
     // second write's `len_before` is the first write's padded length.
-    for r in rows.iter().rev() {
+    for r in rows.iter_mut().rev() {
+        let span = r.col_off..r.col_off + r.painted.len();
+        if let Some(entries) = scratch.clusters.get_mut(r.frame_row) {
+            r.clusters.remove(entries, &span);
+        }
+        if let Some(entries) = scratch.combining.get_mut(r.frame_row) {
+            r.combining.remove(entries, &span);
+        }
         let row = &mut scratch.cells[r.frame_row];
         row[r.col_off..r.col_off + r.before.len()].copy_from_slice(&r.before);
         row.truncate(r.len_before);
         if let (Some(rev), Some(slot)) = (r.rev_before, scratch.row_rev.get_mut(r.frame_row)) {
             *slot = rev;
         }
+    }
+    if scratch
+        .clusters
+        .get(seal.cluster_rows_before..)
+        .is_some_and(|rows| rows.iter().all(Vec::is_empty))
+    {
+        scratch.clusters.truncate(seal.cluster_rows_before);
+    }
+    if scratch
+        .combining
+        .get(seal.combining_rows_before..)
+        .is_some_and(|rows| rows.iter().all(Vec::is_empty))
+    {
+        scratch.combining.truncate(seal.combining_rows_before);
     }
     scratch.snapshot_seq = seal.seq_before;
     scratch.shifted_fill_seq = seal.shifted_before;
@@ -2965,6 +3479,8 @@ fn write_edits<'a>(
 ) {
     let seq_before = scratch.snapshot_seq;
     let shifted_before = scratch.shifted_fill_seq;
+    let cluster_rows_before = scratch.clusters.len();
+    let combining_rows_before = scratch.combining.len();
     let restamp = scratch.shifted_fill_seq != 0 && scratch.host_prepend_blessing();
     slot.write = None;
     slot.live = 0;
@@ -2987,6 +3503,8 @@ fn write_edits<'a>(
                 before: Vec::new(),
                 painted: Vec::new(),
                 rev_before: None,
+                clusters: TextUndo::default(),
+                combining: TextUndo::default(),
             });
         }
         let row = &mut slot.rows[slot.live];
@@ -2994,6 +3512,8 @@ fn write_edits<'a>(
         row.frame_row = frame_row;
         row.col_off = col_off;
         row.len_before = cells.len();
+        row.clusters.live = 0;
+        row.combining.live = 0;
         row.before.clear();
         row.before.extend_from_slice(
             cells
@@ -3030,6 +3550,8 @@ fn write_edits<'a>(
         after: Tokens::of(scratch),
         seq_before,
         shifted_before,
+        cluster_rows_before,
+        combining_rows_before,
     });
 }
 
@@ -3116,6 +3638,11 @@ impl App {
                 crate::harness_host::agent_of(timeline.agent()),
                 timeline.agent().program_pgid,
             );
+            // The harness card's gate (card engine §3.8): the current drawer,
+            // its reader and its build policy, which the splice judges the
+            // card by — with facts or without them.
+            let gate = timeline.card_gate().map_or(0, |gate| gate.key());
+            let drawer = !shows && timeline.card_drawer_current();
             drop(timeline);
             // The agent as the host admits it: a vendor `codex` has no
             // harness of aterm's, so no chips ([`crate::harness_host::admitted`]).
@@ -3134,9 +3661,16 @@ impl App {
                         .rotate_left(37)
                     // …and the Team chip (who drives, `crate::team`).
                     ^ self.team_term(session).rotate_left(53)
+            } else if drawer {
+                // A drawer with no facts yet takes the card's path alone: no
+                // chips, no team — the card is decorated on its first frame.
+                let (_, view, supervised) = self.session_autopilot_for(session, agent, &claims);
+                self.claude_card_term(ws, index, session, view, supervised)
+                    .rotate_left(37)
+                    ^ 0xd7a3_5e11
             } else {
                 0
-            };
+            } ^ gate.rotate_left(11);
             fp = fp.rotate_left(7) ^ leaf ^ note.rotate_left(17) ^ harness.rotate_left(29);
         }
         // The `[claude_footer] usage` switch, live: a reload that flips it
@@ -3191,18 +3725,16 @@ impl App {
             return;
         };
         self.splice_claude_footer_with(wid, plan, route, &mut lists);
-        // The launch card's amends wake their watchers outside the render
-        // path, on the loop's next turn (`Wake::SessionLogMoved`); a loop
-        // with no proxy (a headless test App) wakes them now.
+        // The launch card's amends rang their watchers in the hold that took
+        // the owed wake; the loop follows the log (its settle tick, the
+        // clause) on its next turn (`Wake::SessionLogMoved`), and a loop with
+        // no proxy (a headless test App) now.
         for session in lists.log_owed.drain(..) {
             match self.proxy.as_ref() {
                 Some(proxy) => {
-                    let _ = proxy.send_event(Wake::SessionLogMoved {
-                        session,
-                        notify: true,
-                    });
+                    let _ = proxy.send_event(Wake::SessionLogMoved { session });
                 }
-                None => self.wake_log_watchers(session, true),
+                None => self.on_session_log_moved(session),
             }
         }
         lists.clear();
@@ -3275,11 +3807,12 @@ impl App {
                 // upgrade's note —
                 // taken into the pane's footer ([`PaneFooter`]) only where
                 // one of them moved: a frame at rest copies none of them. And
-                // the process the facts are for (its group), which the
-                // harness card matches its card against. The pane's one
-                // timeline lock this frame: the PTY reader holds it while
-                // Claude streams.
-                let (held, agent) = {
+                // the harness card's gate (card engine §3.8): the current
+                // holder image's token, reader and build policy, facts or
+                // none — a drawer whose facts have not landed takes the
+                // card's path all the same. The pane's one timeline lock this
+                // frame: the PTY reader holds it while Claude streams.
+                let (held, agent, gate) = {
                     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                     #[cfg(test)]
                     crate::work_counts::footer_timeline_locked();
@@ -3307,16 +3840,20 @@ impl App {
                                     floor: None,
                                     session_id: format!("{prefix}-{pgid}"),
                                 }),
+                                subscription: Some(
+                                    aterm_agent::harness::profile::SubscriptionDisplay::default(),
+                                ),
+                                context: Some("ctx auto".into()),
                                 ..FooterFacts::default()
                             }),
                         );
                     }
-                    let held = timeline.claude_footer().map(|facts| {
+                    let held = timeline.claude_footer().is_some_and(|facts| {
                         let mut texts = ws.claude_footer_texts.borrow_mut();
                         let footer = texts.footer(leaf_index, session);
                         footer.note_facts(facts, timeline.claude_card(), usage);
                         footer.note_upgrade(timeline.upgrade_note());
-                        timeline.claude_footer_identity().map(|(pgid, _)| pgid)
+                        true
                     });
                     (
                         held,
@@ -3324,23 +3861,46 @@ impl App {
                             crate::harness_host::agent_of(timeline.agent()),
                             timeline.agent().program_pgid,
                         ),
+                        timeline.card_gate(),
                     )
                 };
+                let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
+                let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
+                let pane_rows = leaf.rect.size.height.round().max(1.0) as usize;
+                let pane_cols = leaf.rect.size.width.round().max(1.0) as usize;
+                let pane = crate::claude_card::PaneGeom {
+                    strip,
+                    row_off,
+                    col_off,
+                    rows: pane_rows,
+                    cols: pane_cols,
+                };
+                if !held && gate.is_none() {
+                    // No drawer and no facts: a card this window keeps for
+                    // the session left by its identity (Claude stopped or
+                    // gone), which bounds its next show
+                    // (`claude_card::RESHOW_MS`). Nothing is read.
+                    if ws.claude_card.keeps(session) {
+                        cards.push(crate::claude_card::drawerless_leaf(
+                            leaf_index, session, pane,
+                        ));
+                    }
+                    continue;
+                }
                 // The agent as the host admits it, read after the timeline's
                 // lock.
                 let agent = crate::harness_host::admitted_as(&entry.ctx, agent.0, agent.1);
-                let Some(pgid) = held else {
-                    continue;
-                };
                 // The session's Autopilot, read ONCE for this frame with no
                 // lock held (its own leaf lock alone): what the harness's
                 // chips say and whether the harness card wraps the pane.
                 let (word, view, supervised) = self.session_autopilot_for(session, agent, &claims);
                 let blank = source.implicit_blank;
-                let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
-                let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
-                let pane_rows = leaf.rect.size.height.round().max(1.0) as usize;
-                let pane_cols = leaf.rect.size.width.round().max(1.0) as usize;
+                // The gate's one verdict this frame, for the card and the
+                // footer's kept card alike, made from the frame's own fence.
+                let mut check = crate::claude_card::GateCheck::new(
+                    gate,
+                    crate::claude_card::FenceFrame::of(source),
+                );
                 let region = PaneTextRegion {
                     strip,
                     row_off,
@@ -3352,29 +3912,46 @@ impl App {
                 texts.rows(leaf_index, session, &ws.input_scratch, region);
                 let texts = &mut *texts;
                 // Nothing since this process started named its model or
-                // effort: its launch card may, read off a live REPL of its
-                // own build (`footer::launch_card`). It is read again on
-                // every rebuild of the pane's text while they stay open (every
+                // effort: its launch card may, read off a live REPL
+                // (`footer::launch_card_read`; agy's and Muse Code's live
+                // status row may name the model). It is read again on every
+                // rebuild of the pane's text while they stay open (every
                 // frame that reuses the text shares the reading), and the
-                // NEWEST reading for this owner is kept (`note_claude_card`):
-                // a card read in the moment between a new owner and the new
-                // process's first paint — its predecessor's, still on the
-                // glass — is replaced as soon as the new process draws its
-                // own. A frame with no card to read (it scrolled away, a
+                // NEWEST reading of the drawer's own rows is kept
+                // (`note_claude_card`): a predecessor's card still on the
+                // glass, or a card quoted under the drawer's, is never the
+                // drawer's. A frame with no card to read (it scrolled away, a
                 // message sits under it) keeps the last reading: the card
                 // still names what the process started on. A card kept anew
                 // shows now. A reading the timeline already keeps for these
                 // facts is no news, and takes no lock.
-                let footer = &texts.footers[leaf_index];
-                if let Some(owner) = footer.card_owner()
-                    && let Some(card) = texts.footer_card(leaf_index, session)
+                if let Some(footer) = texts.footers.get(leaf_index).filter(|_| held)
+                    && let Some(owner) = footer.card_owner()
+                    && let Some((program, read)) = texts.footer_card(leaf_index, session)
                 {
+                    let card = &read.card;
                     let same_as_kept = footer.kept_card().is_some_and(|kept| {
                         kept.model == card.model
                             && kept.effort == card.effort
                             && (kept.version == card.version || card.version.is_empty())
                     });
-                    if !same_as_kept {
+                    // Only the drawer's own reading is kept: its card the one
+                    // the gate's verdict admitted, its status row where the
+                    // drawer drew (`GateCheck::admits_reading`, card engine
+                    // §3.8). Judged before anything is copied or locked, so a
+                    // reading the gate refuses — a predecessor's card, a
+                    // quoted one, a Claude Code that is no drawer — costs a
+                    // settled frame nothing.
+                    if !same_as_kept
+                        && check.admits_reading(
+                            texts,
+                            leaf_index,
+                            session,
+                            *program,
+                            read.banner,
+                            read.status,
+                        )
+                    {
                         let mut card = card.clone();
                         if card.version.is_empty()
                             && let Some(kept) = footer.kept_card()
@@ -3390,9 +3967,9 @@ impl App {
                         if let Some((pgid, _)) = timeline.claude_footer_identity()
                             && timeline.note_claude_card(pgid, &owner, card)
                         {
-                            // The card's amend of the session log: its wake is
-                            // taken in this hold, its watchers woken after the
-                            // frame.
+                            // The card's amend of the session log: its owed
+                            // wake rings its watchers in this hold, and the
+                            // loop follows the log after the frame.
                             if timeline.slog_take_wake() {
                                 lists.log_owed.push(session);
                             }
@@ -3406,28 +3983,79 @@ impl App {
                         }
                     }
                 }
-                // The harness card reads the same rows, rect and strip, and
-                // the process as the facts read under that lock (what shows
-                // keeps the facts' build: `filled_from` fills the model and
-                // effort alone).
-                let version = texts.footers[leaf_index].shown().version.as_deref();
+                // A footer held for facts reads its account and context off
+                // the glass; a drawer with no facts has no footer to fill.
+                if held && let Some(Some(cached)) = texts.panes.get(leaf_index) {
+                    let shown = texts.footers[leaf_index].shown();
+                    let want_acct =
+                        agent == Some(aterm_phase::Program::Agy) && shown.subscription.is_some();
+                    let want_ctx = shown.context.is_some();
+                    if want_acct || want_ctx {
+                        let screen_acct = want_acct
+                            .then(|| aterm_phase::agy::launch_card_account(&cached.rows))
+                            .flatten();
+                        let screen_ctx = want_ctx
+                            .then(|| {
+                                aterm_phase::context_left(&cached.rows)
+                                    .map(|pct| format!("ctx {pct}% left"))
+                            })
+                            .flatten();
+                        let need_acct = screen_acct.as_ref().is_some_and(|(email, plan)| {
+                            shown.subscription.as_ref().is_some_and(|sub| {
+                                sub.email.as_deref() != Some(email.as_str())
+                                    || sub.plan.as_deref() != plan.as_deref()
+                            })
+                        });
+                        let need_ctx = screen_ctx
+                            .as_ref()
+                            .is_some_and(|ctx| shown.context.as_ref() != Some(ctx));
+                        if need_acct || need_ctx {
+                            let mut timeline =
+                                entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some((pgid, started)) = timeline.claude_footer_identity()
+                                && let Some(mut facts) = timeline.claude_footer().cloned()
+                            {
+                                if let Some((email, plan)) = screen_acct
+                                    && let Some(sub) = facts.subscription.as_mut()
+                                {
+                                    sub.email = Some(email);
+                                    sub.plan = plan;
+                                }
+                                if let Some(ctx) = screen_ctx {
+                                    facts.context = Some(ctx);
+                                }
+                                timeline.set_claude_footer(pgid, started, Some(facts));
+                                if let Some(facts) = timeline.claude_footer() {
+                                    texts.footer(leaf_index, session).note_facts(
+                                        facts,
+                                        timeline.claude_card(),
+                                        usage,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // The harness card reads the same rows, rect and strip, judged
+                // by the gate read under that lock — never by the footer's
+                // facts, whose build is the rule's to show (`filled_from`
+                // fills the model and effort alone).
                 cards.push(crate::claude_card::card_leaf(
                     texts,
                     self.config.claude_footer_card(),
                     leaf_index,
                     session,
-                    crate::claude_card::PaneGeom {
-                        strip,
-                        row_off,
-                        col_off,
-                        rows: pane_rows,
-                        cols: pane_cols,
-                    },
+                    pane,
                     blank,
                     view,
                     supervised,
-                    pgid.zip(version),
+                    &mut check,
                 ));
+                // The footer's row is the facts' alone.
+                if !held {
+                    continue;
+                }
+                let version = texts.footers[leaf_index].shown().version.as_deref();
                 // The rule to write into, found by structure, behind the
                 // reader's panic fence (`read_footer`) — a screen that panics
                 // it paints nothing — unless the chrome claimed that row: the
@@ -3480,7 +4108,8 @@ impl App {
                             blank,
                             rule_cell,
                             mark_fg,
-                            &mut lists.agy_edits,
+                            &mut lists.border_edits,
+                            &mut lists.border_live,
                             &mut lists.border_toggles,
                         );
                     }
@@ -3536,9 +4165,12 @@ impl App {
                 });
             }
             let seen = &lists.seen;
-            ws.claude_footer_texts
-                .borrow_mut()
-                .retain_active(|index| seen.iter().any(|pane| pane.leaf_index == index));
+            // A pane whose card was read with no facts keeps its text (the
+            // card's reading is the text cache's), its footer forgotten.
+            ws.claude_footer_texts.borrow_mut().retain_active(
+                |index| seen.iter().any(|pane| pane.leaf_index == index),
+                |index| cards.iter().any(|card| card.reads(index)),
+            );
         }
         for pane in lists.seen.drain(..) {
             self.observe_claude_lights(wid, pane.session, pane.lights);
@@ -3552,7 +4184,8 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.claude_card.lines().next().is_some());
-        if lists.panes.is_empty() && !lines && lists.agy_edits.is_empty() {
+        if lists.panes.is_empty() && !lines && lists.border_live == 0 && lists.agy_edits.is_empty()
+        {
             return;
         }
         for pane in lists.panes.drain(..) {
@@ -3655,6 +4288,9 @@ impl App {
                     r.ground,
                 )
             });
+            let border = lists.border_edits[..lists.border_live]
+                .iter()
+                .map(|e| (e.frame_row, e.col, e.cells.as_slice(), e.ground));
             let agy = lists
                 .agy_edits
                 .iter()
@@ -3662,17 +4298,40 @@ impl App {
             write_edits(
                 claude_footer_undo,
                 input_scratch,
-                card_edits.chain(rules).chain(agy),
+                card_edits.chain(rules).chain(border).chain(agy),
             );
+            for r in &lists.rules {
+                if let Some(footer) = texts.footers.get(r.leaf_index) {
+                    claude_footer_undo.publish_text(
+                        input_scratch,
+                        r.frame_row,
+                        r.col,
+                        &footer.rule.paint,
+                    );
+                }
+            }
             // Only a light the glass shows can be pointed at: a pane whose
             // write was skipped (`write_edits`) records none — keyed by the
             // edit's row AND column, since two panes side by side share a
             // frame row.
             let rows = claude_footer_undo.written();
-            // Every cell written — the chips, the facts, the card's line —
-            // is the resident pet's occupied ground (`crate::pet_chrome`).
+            // Every chrome cell written — the chips, the facts, the card's line,
+            // the top border — is the resident pet's occupied ground (`crate::pet_chrome`).
+            // Transcript markdown edits (`agy_edits`) are excluded so transcript text
+            // stays normal walkable terrain rather than an impassable chrome wall.
             for r in rows {
-                pet_chrome.note(r.frame_row, r.col_off, 1, r.painted.len());
+                if !lists
+                    .agy_edits
+                    .iter()
+                    .any(|e| e.frame_row == r.frame_row && e.col == r.col_off)
+                {
+                    pet_chrome.note(r.frame_row, r.col_off, 1, r.painted.len());
+                }
+            }
+            // And the harness card's glass — its border, trail, kitty and
+            // stars, drawn over cells the grid reads as blank.
+            for (row, col, rows, cols) in claude_card.glass_boxes() {
+                pet_chrome.note(row, col, rows, cols);
             }
             let took = |at: (usize, usize)| rows.iter().any(|r| (r.frame_row, r.col_off) == at);
             for l in &mut lists.lit {
@@ -3715,6 +4374,9 @@ impl App {
         // The lights ride this wake too: a toggle's next step, its deadline
         // and a refusal's end all arrive here (`crate::claude_lights`).
         self.drain_claude_lights();
+        // New facts can disagree with the drawer image's build: a fact for
+        // later, never a gate (card engine §3.10).
+        self.note_claude_build_drift(session);
         self.redraw_claude_footer(session);
     }
 
@@ -3855,18 +4517,28 @@ fn collect_composer_border_brand_edits(
     fallback_rule: RenderCell,
     mark_fg: [u8; 3],
     out: &mut Vec<AgyRowEdit>,
+    out_live: &mut usize,
     toggles: &mut Vec<(usize, usize, std::ops::Range<usize>, u64, bool)>,
 ) {
-    let (full_badge, short_badge) = match program {
+    let (left_brand, logo_chars, logo_rgb, full_badge, short_badge) = match program {
         aterm_phase::Program::Claude => (
+            " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C} claude ",
+            8usize,
+            [215, 119, 87],
             " \u{2726} alab kitty \u{00b7} claude harness \u{25cf} on ",
             " \u{2726} alab \u{00b7} claude \u{25cf} on ",
         ),
         aterm_phase::Program::Agy => (
+            " \u{2584}\u{2580}\u{2580}\u{2584} agy ",
+            5usize,
+            [88, 166, 255],
             " \u{2726} alab kitty \u{00b7} agy harness \u{25cf} on ",
             " \u{2726} alab \u{00b7} agy \u{25cf} on ",
         ),
         aterm_phase::Program::Muse => (
+            " \u{25C6} muse ",
+            2usize,
+            [168, 130, 255],
             " \u{2726} alab kitty \u{00b7} muse harness \u{25cf} on ",
             " \u{2726} alab \u{00b7} muse \u{25cf} on ",
         ),
@@ -3946,7 +4618,21 @@ fn collect_composer_border_brand_edits(
         }
         return;
     }
-    let mut cells = Vec::with_capacity(span_len);
+    if *out_live == out.len() {
+        out.push(AgyRowEdit {
+            frame_row: 0,
+            col: 0,
+            cells: Vec::with_capacity(span_len),
+            ground: blank,
+        });
+    }
+    let edit = &mut out[*out_live];
+    *out_live += 1;
+    edit.frame_row = frame_row;
+    edit.col = region.col_off + best.start;
+    edit.ground = blank;
+    let cells = &mut edit.cells;
+    cells.clear();
     let denom = span_len.saturating_sub(1).max(1);
     for i in 0..span_len {
         let stop = (i * 255) / denom;
@@ -3974,6 +4660,20 @@ fn collect_composer_border_brand_edits(
             .position(|c| c == '\u{25cf}')
             .unwrap_or(b_len);
         let agent_fg = mix(mark_fg, blank.fg, 0.35);
+        let left_len = left_brand.chars().count();
+        let l_start = 2usize;
+        if l_start + left_len + 2 <= b_start {
+            let logo_fg = mix(logo_rgb, blank.fg, 0.15);
+            for (k, ch) in left_brand.chars().enumerate() {
+                let fg = if k <= logo_chars { logo_fg } else { agent_fg };
+                cells[l_start + k] = RenderCell {
+                    ch,
+                    fg,
+                    bold: true,
+                    ..blank
+                };
+            }
+        }
         for (k, ch) in badge_str.chars().enumerate() {
             let fg = if k < dot_pos {
                 brand_letter_fg((k * 255) / dot_pos.max(1), blank)
@@ -4000,12 +4700,6 @@ fn collect_composer_border_brand_edits(
             true,
         ));
     }
-    out.push(AgyRowEdit {
-        frame_row,
-        col: region.col_off + best.start,
-        cells,
-        ground: blank,
-    });
 }
 
 /// Whether `row` is an agy tool-call header (`● Ran (…)`, `● Explored …`,
@@ -4560,6 +5254,10 @@ pub(crate) mod probe;
 #[path = "claude_footer_cost_tests.rs"]
 mod cost_tests;
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "claude_footer_registry_tests.rs"]
+mod registry_tests;
+
 /// THE FOOTER READ FOR OTHER MODULES' TESTS (session log Phase 3B, addendum
 /// A25): a Claude home on disk, and one read of a process in it through the
 /// resolver's own path ([`resolve_into`], then the wake [`LogWake::after`]),
@@ -4637,6 +5335,9 @@ pub(crate) mod rig {
             login: None,
             argv: Vec::new(),
             task: None,
+            login_checked_for: None,
+            stored_login: false,
+            env_stamp: None,
         };
         let asks = Asks {
             args: |_| {
@@ -4648,6 +5349,7 @@ pub(crate) mod rig {
             },
             roster: || None,
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         let (_, _, applied) = super::resolve_into(
             timeline,
@@ -4779,9 +5481,9 @@ mod tests {
     /// and the cell after them are blank — never a rule glyph, a title's
     /// word or a fact — and the chips always fit (main's other half: the gap
     /// never costs the chips their place). The widths are the rows' own:
-    /// a light alone, the harness's two at rest (`∞ ⚙`, 3 cells; `⤓ land ⚙`,
-    /// 8), and the two beside a light (`∞ ⚙ ⏸ plan`, 10), each with the
-    /// titles a hover gives them. The painted row, on the measured screen:
+    /// Autopilot alone at rest (`∞`, 1 cell; `⤓ land`, 6), a light alone,
+    /// and Autopilot beside a light (`∞ ⏸ plan`, 8), each with the titles a
+    /// hover gives them (and wider rows still). The painted row, on the measured screen:
     /// `claude_lights`'
     /// `the_effort_tail_stays_on_claudes_row_and_every_chip_stands_clear_in_the_rule`.
     #[test]
@@ -4868,10 +5570,15 @@ mod tests {
             model.action_enabled("IdleRead", &state),
             schedule.due_idle(now + IDLE_RECHECK).is_some()
         );
-        // Its row unread, the process is on the first-row ladder, which goes
-        // with the watch.
-        assert_eq!(schedule.next(now), Some(now + FIRST_ROW_STEP));
-        let (immediate, stopped) = schedule.accept([Command::Stop {
+        // Its row unread, the process is awaited: by the registry watch,
+        // never a clock — the next read owed is the first follow-up.
+        assert!(schedule.watched[&7].awaiting);
+        assert_eq!(schedule.next(now), Some(now + FOLLOW_UPS[0]));
+        let Accepted {
+            latest: immediate,
+            stopped,
+            ..
+        } = schedule.accept([Command::Stop {
             session: 7,
             pgid: None,
         }]);
@@ -4906,7 +5613,11 @@ mod tests {
             true,
         );
         assert!(model.fire("AskOld", &mut state));
-        let (mut immediate, stopped) = schedule.accept([
+        let Accepted {
+            latest: mut immediate,
+            stopped,
+            ..
+        } = schedule.accept([
             Command::Request(Job {
                 session: 7,
                 timeline,
@@ -4926,7 +5637,11 @@ mod tests {
         assert_eq!(replacement.pgid, 43);
         schedule.watch(replacement, now, true);
         assert_eq!(state["watch"], watch_model_projection(&schedule));
-        let (immediate, stopped) = schedule.accept([Command::Stop {
+        let Accepted {
+            latest: immediate,
+            stopped,
+            ..
+        } = schedule.accept([Command::Stop {
             session: 7,
             pgid: Some(42),
         }]);
@@ -5037,7 +5752,7 @@ mod tests {
                 // A lapse with no limit wall on show.
                 "lapse" => schedule.prune(later, |_, _| false),
                 "stop" => {
-                    let (_, stopped) = schedule.accept([Command::Stop {
+                    let Accepted { stopped, .. } = schedule.accept([Command::Stop {
                         session: 7,
                         pgid: Some(4242),
                     }]);
@@ -5133,7 +5848,7 @@ mod tests {
         let changed = cache.rows(0, 8, &scratch, full);
         assert_eq!(&changed[0], "zbcd");
         assert!(!Arc::ptr_eq(&other_session, &changed));
-        cache.retain_active(|index| index == 1);
+        cache.retain_active(|index| index == 1, |_| false);
         assert!(cache.panes[0].is_none());
         assert!(cache.panes[1].is_some());
         cache.trim(1);
@@ -5321,10 +6036,11 @@ mod tests {
                 .0
                 .is_empty()
         );
-        // With a harness host, the harness's two stand at the rule's left end
-        // at rest (owner, 2026-10-15), full size — Cruise's `∞` in the marks'
-        // accent itself, the gear in the pane's ink — the rule's glyphs run on
-        // to the owner's facts, unchanged at its right end.
+        // With a harness host, Autopilot stands at the rule's left end at
+        // rest (owner, 2026-10-15), full size — Cruise's `∞` in the marks'
+        // accent itself, and no settings button beside it (owner,
+        // 2026-10-20) — the rule's glyphs run on to the owner's facts,
+        // unchanged at its right end.
         let harness = crate::claude_lights::Block::of_autopilot(
             crate::autopilot::AutopilotView::Cruise,
             blank,
@@ -5342,16 +6058,12 @@ mod tests {
         assert_eq!(lights, Some(1));
         assert_eq!(cells.len(), 76, "the rule's glyphs run on to the facts");
         let text = text_of(&cells);
-        assert!(text.starts_with(" \u{221e} \u{2699} \u{2500}"), "{text:?}");
+        assert!(text.starts_with(" \u{221e} \u{2500}"), "{text:?}");
         assert!(
             text.ends_with(" \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "),
             "{text:?}"
         );
-        assert_eq!(
-            (cells[1].fg, cells[3].fg),
-            ([0, 128, 255], blank.fg),
-            "cruise in the accent, the gear in the pane's ink"
-        );
+        assert_eq!(cells[1].fg, [0, 128, 255], "cruise in the accent");
         assert_eq!(cells[1].script, aterm_core::terminal::Script::Normal);
     }
 
@@ -5622,196 +6334,6 @@ mod tests {
         assert!(schedule.watched.is_empty(), "no wall: the watch ends");
     }
 
-    /// The process each of `jobs` reads.
-    fn pgids(jobs: &[Job]) -> Vec<i32> {
-        jobs.iter().map(|job| job.pgid).collect()
-    }
-
-    /// THE FIRST-ROW LADDER (owner, 2026-10-19: "have this banner animation
-    /// happen at load not a bit later"). Claude Code writes its registry row
-    /// a moment after the read on first sight of the process, and every fact
-    /// is that row's — the build the harness card's decoration waits on among
-    /// them. Here the resolver's own read misses the unwritten row and says
-    /// so ([`Found::row`]); the schedule reads the process again a
-    /// [`FIRST_ROW_STEP`] on — not at [`FOLLOW_UPS`]' first, 2 s on, which
-    /// held the decoration and its ride-in 1.3-1.7 s past the card — and at
-    /// each rung while it misses; the rung's read that finds the row
-    /// publishes the build, and the ladder is over: the next read is the
-    /// follow-ups' again. NEGATIVE CONTROLS: a later miss of the same process
-    /// (a read landing mid-write) and the status sweep's re-ask of it climb
-    /// no ladder again; a new process in the session climbs its own; a
-    /// process whose first read finds its row climbs none.
-    #[test]
-    fn a_new_process_is_read_on_the_first_row_ladder_until_its_row() {
-        const PID: i32 = 4244;
-        let (root, claude) = claude_home("footer-first-row", PID, 1_790_607_848);
-        let registry = claude.join(format!("sessions/{PID}.json"));
-        let written = std::fs::read(&registry).unwrap();
-        // First sight: Claude Code has not written its row yet.
-        std::fs::remove_file(&registry).unwrap();
-        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
-        timeline.lock().unwrap().note_foreground_group(PID);
-        let asks = Asks {
-            args: |_| Some(args_of(&["HOME=/home/someone"])),
-            roster: || None,
-            home: scratch_home,
-        };
-        let mut identity = unread(PID, &claude);
-        let read = |identity: &mut Identity| {
-            resolve_into(
-                &timeline,
-                identity,
-                &mut footer::TailCache::default(),
-                &mut footer::FooterCache::default(),
-                &mut RosterMemo::default(),
-                asks,
-            )
-            .1
-        };
-        let job = |pgid| Job {
-            session: 7,
-            timeline: Arc::clone(&timeline),
-            pgid,
-            wake: LogWake::default(),
-        };
-        let t0 = std::time::Instant::now();
-        let mut schedule = WatchSchedule::default();
-        let found = read(&mut identity);
-        assert_eq!(
-            found,
-            Found {
-                row: false,
-                wall: false
-            }
-        );
-        schedule.watch(job(PID), t0, found.row);
-        let rung = t0 + FIRST_ROW_STEP;
-        assert_eq!(schedule.next(t0), Some(rung), "a rung on, not 2 s on");
-        assert!(
-            schedule
-                .due_rungs(rung - Duration::from_millis(1))
-                .is_empty()
-        );
-        assert_eq!(pgids(&schedule.due_rungs(rung)), [PID]);
-        // Missed at the rung too: the next is a step on.
-        schedule.read(7, rung, read(&mut identity).row);
-        let rung = rung + FIRST_ROW_STEP;
-        assert_eq!(schedule.next(t0), Some(rung));
-        // Claude Code writes its row; the rung's read finds it and publishes
-        // the build the card's decoration is gated on.
-        std::fs::write(&registry, &written).unwrap();
-        assert_eq!(pgids(&schedule.due_rungs(rung)), [PID]);
-        let found = read(&mut identity);
-        assert!(found.row);
-        schedule.read(7, rung, found.row);
-        assert_eq!(
-            timeline
-                .lock()
-                .unwrap()
-                .claude_footer()
-                .and_then(|facts| facts.version.clone())
-                .as_deref(),
-            Some("2.1.287")
-        );
-        assert_eq!(
-            schedule.next(rung),
-            Some(t0 + FOLLOW_UPS[0]),
-            "the follow-ups' cadence again"
-        );
-        let bound = t0 + FIRST_ROW_FOR;
-        assert!(schedule.due_rungs(bound).is_empty());
-        // CONTROLS: a later miss of the process, then the sweep's re-ask.
-        std::fs::remove_file(&registry).unwrap();
-        schedule.read(7, rung + FIRST_ROW_STEP, read(&mut identity).row);
-        schedule.watch(job(PID), t0 + RECHECK, false);
-        assert!(schedule.due_rungs(bound).is_empty());
-        assert_eq!(
-            schedule.next(t0 + RECHECK),
-            Some(t0 + RECHECK + FOLLOW_UPS[0])
-        );
-        // A new process in the session climbs its own ladder; one whose
-        // first read found its row, none.
-        let t1 = t0 + Duration::from_secs(60);
-        schedule.watch(job(PID + 1), t1, false);
-        assert_eq!(pgids(&schedule.due_rungs(t1 + FIRST_ROW_STEP)), [PID + 1]);
-        schedule.watch(job(PID + 2), t1, true);
-        assert!(schedule.due_rungs(t1 + FIRST_ROW_FOR).is_empty());
-        assert_eq!(schedule.next(t1), Some(t1 + FOLLOW_UPS[0]));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// THE LADDER'S BOUND, AS THE RESOLVER THREAD READS IT. A process whose
-    /// registry row no read finds (a `claude` that is not Claude Code, a
-    /// Claude home the resolver does not find), driven through the thread's
-    /// own pass ([`WatchSchedule::serve`]) and its sleep to
-    /// [`WatchSchedule::next`] on an injected clock, is read at the ask and
-    /// then every [`FIRST_ROW_STEP`] to [`FIRST_ROW_FOR`] after it — the
-    /// status sweep's re-ask on the way is one of those reads and keeps the
-    /// bound, never restarting it, and a follow-up that falls on a rung is
-    /// one read — and then on the follow-ups' and the idle clock's cadence
-    /// alone. No pass leaves a read owed at or before its own instant: with
-    /// the run loop's rung reads deleted every schedule test passed (the
-    /// review of the ladder), while the thread, its rung owed and never
-    /// moved, woke at once on every turn — a spin until the follow-ups ended
-    /// the ladder.
-    #[test]
-    fn a_process_whose_row_is_never_read_leaves_the_ladder_at_its_bound() {
-        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
-        let job = || Job {
-            session: 7,
-            timeline: Arc::clone(&timeline),
-            pgid: 42,
-            wake: LogWake::default(),
-        };
-        let t0 = std::time::Instant::now();
-        // The asks the thread takes: Claude Code named, then the status
-        // sweep's re-ask while the screen moves.
-        let mut asks = vec![t0, t0 + RECHECK];
-        let end = t0 + Duration::from_secs(10);
-        let mut schedule = WatchSchedule::default();
-        let mut reads = Vec::new();
-        let mut now = t0;
-        // The thread's turns: sleep to the next read owed, or until an ask
-        // comes in, then a pass.
-        while let Some(wake) = schedule
-            .next(now)
-            .into_iter()
-            .chain(asks.first().copied())
-            .min()
-            && wake <= end
-        {
-            now = wake;
-            let taken = asks.iter().take_while(|&&at| at <= now).count();
-            let latest = asks.drain(..taken).map(|_| job()).collect();
-            let served = schedule.serve(
-                latest,
-                |read| {
-                    assert_eq!(read.pgid, 42);
-                    reads.push(now);
-                    false
-                },
-                || now,
-            );
-            assert!(
-                schedule.next(served).is_none_or(|next| next > served),
-                "the pass {:?} after the ask leaves a read owed: the thread spins",
-                served - t0
-            );
-        }
-        let steps = u32::try_from(FIRST_ROW_FOR.as_millis() / FIRST_ROW_STEP.as_millis()).unwrap();
-        let ladder: Vec<_> = (0..=steps).map(|k| t0 + FIRST_ROW_STEP * k).collect();
-        assert_eq!(
-            reads.get(..ladder.len()),
-            Some(&ladder[..]),
-            "the ask, then a rung a step on, to the bound"
-        );
-        assert_eq!(
-            reads[ladder.len()..],
-            [t0 + RECHECK + FOLLOW_UPS[1]],
-            "then the re-ask's last follow-up, and the idle clock past it"
-        );
-    }
-
     /// A retired session's resolver state goes whole: its fold, its watch,
     /// the follow-ups owed and its wall mark — another session's stays.
     #[test]
@@ -5841,13 +6363,20 @@ mod tests {
                     login: None,
                     argv: Vec::new(),
                     task: None,
+                    login_checked_for: None,
+                    stored_login: false,
+                    env_stamp: None,
                 },
             );
             folds.insert(session, footer::FooterCache::default());
             walled.insert(session);
         }
         // What the status observer's retirement sends (`stop_session`).
-        let (immediate, stopped) = schedule.accept([Command::Stop {
+        let Accepted {
+            latest: immediate,
+            stopped,
+            ..
+        } = schedule.accept([Command::Stop {
             session: 1,
             pgid: None,
         }]);
@@ -5905,7 +6434,11 @@ mod tests {
         folds.insert(1, footer::FooterCache::default());
         walled.insert(1);
         let mut stop = |pgid| {
-            let (immediate, stopped) = schedule.accept([Command::Stop {
+            let Accepted {
+                latest: immediate,
+                stopped,
+                ..
+            } = schedule.accept([Command::Stop {
                 session: 1,
                 pgid: Some(pgid),
             }]);
@@ -5977,12 +6510,270 @@ mod tests {
         assert_eq!(accounts::footer_label(&roster, &own_home), None);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unread_exec_directory_is_retried_for_the_same_process() {
+        fn recovered_args(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
+            let home = std::env::temp_dir().join(format!(
+                "aterm-gui-footer-exec-context-{}",
+                std::process::id()
+            ));
+            Some(atpkg::caller_shell::ProcArgs {
+                argv: vec!["claude".to_string()],
+                env: vec![
+                    format!("HOME={}", home.display()),
+                    format!("CLAUDE_CONFIG_DIR={}", home.join("claude").display()),
+                ],
+                ..Default::default()
+            })
+        }
+
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let started = birth_seconds(pid).expect("this test process's kernel start");
+        // Fail before any registry read if the old guessed-home branch returns.
+        assert_eq!(claude_dir_of_args(None, pid), None);
+        let (root, claude) = claude_home("footer-exec-context", pid, started);
+        let profile =
+            aterm_agent::harness::profile::path_in(&root, Some(&claude.to_string_lossy()), &claude);
+        std::fs::write(
+            profile,
+            r#"{"oauthAccount":{"accountUuid":"recovered-account","emailAddress":"recovered@example.test","planDisplayName":"Pro"}}"#,
+        )
+        .unwrap();
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        {
+            let mut held = timeline.lock().unwrap();
+            held.note_foreground_group(pid);
+            held.set_program(pid, Some("claude".to_string()));
+        }
+        let job = Job {
+            session: 17,
+            timeline: Arc::clone(&timeline),
+            pgid: pid,
+            wake: LogWake::new(false),
+        };
+        let asks = Asks {
+            args: |_| None,
+            roster: || None,
+            home: scratch_home,
+            stored_login: |_, _, _| true,
+        };
+        let mut known = HashMap::new();
+        let mut tails = ProcessTails::default();
+        let mut fold = footer::FooterCache::default();
+        let mut roster = RosterMemo::default();
+        let first = resolve_and_post(&mut known, &mut tails, &mut fold, &mut roster, &job, asks);
+        assert!(!first.row);
+        assert!(
+            known.is_empty(),
+            "an unread exec context must not pin a guessed directory"
+        );
+
+        let recovered = resolve_and_post(
+            &mut known,
+            &mut tails,
+            &mut fold,
+            &mut roster,
+            &job,
+            Asks {
+                args: recovered_args,
+                ..asks
+            },
+        );
+        assert!(
+            recovered.row,
+            "the next request finds the custom directory's registry"
+        );
+        let identity = known.get(&job.session).unwrap();
+        assert_eq!(
+            identity.started,
+            Some(started),
+            "the process did not restart"
+        );
+        assert_eq!(identity.dir.as_deref(), Some(claude.as_path()));
+        assert_eq!(
+            timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .subscription
+                .as_ref()
+                .unwrap()
+                .email
+                .as_deref(),
+            Some("recovered@example.test")
+        );
+        assert_eq!(
+            claude_dir_of_args(Some(&args_of(&["HOME=/home/someone"])), pid),
+            Some(PathBuf::from("/home/someone/.claude")),
+            "a readable HOME still supplies the default Claude directory"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readable_launcher_directory_is_provisional_until_the_registered_image_is_read() {
+        thread_local! {
+            static EXEC_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            static AUTH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        fn args(registered: bool) -> Option<atpkg::caller_shell::ProcArgs> {
+            EXEC_READS.set(EXEC_READS.get() + 1);
+            let root = std::env::temp_dir().join(format!(
+                "aterm-gui-footer-readable-launcher-{}",
+                std::process::id()
+            ));
+            let mut env = vec![format!(
+                "HOME={}",
+                root.join(if registered {
+                    "selected-home"
+                } else {
+                    "launcher-home"
+                })
+                .display()
+            )];
+            if registered {
+                env.push(format!(
+                    "CLAUDE_CONFIG_DIR={}",
+                    root.join("claude").display()
+                ));
+            }
+            Some(atpkg::caller_shell::ProcArgs {
+                argv: vec![if registered { "claude" } else { "launcher" }.into()],
+                env,
+                ..Default::default()
+            })
+        }
+
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let started = birth_seconds(pid).expect("this test process's kernel start");
+        let (root, claude) = claude_home("footer-readable-launcher", pid, started);
+        let launcher_dir = root.join("launcher-home/.claude");
+        std::fs::create_dir_all(&launcher_dir).unwrap();
+        let now = aterm_agent::supervise::limit::unix_now();
+        let profile = aterm_json::json!({
+            "oauthAccount": {
+                "accountUuid": "selected-account",
+                "emailAddress": "selected@example.test",
+                "planDisplayName": "Pro"
+            },
+            "cachedUsageUtilization": {
+                "fetchedAtMs": now * 1000,
+                "accountUuid": "selected-account",
+                "utilization": {
+                    "seven_day": { "utilization": 71, "resets_at": "2099-01-01T00:00:00Z" }
+                }
+            }
+        });
+        std::fs::write(
+            claude.join(".claude.json"),
+            aterm_json::to_string(&profile).unwrap(),
+        )
+        .unwrap();
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        {
+            let mut held = timeline.lock().unwrap();
+            held.note_foreground_group(pid);
+            held.set_program(pid, Some("claude".into()));
+        }
+        let job = Job {
+            session: 18,
+            timeline: Arc::clone(&timeline),
+            pgid: pid,
+            wake: LogWake::new(false),
+        };
+        let asks = Asks {
+            args: |_| args(false),
+            roster: || None,
+            home: scratch_home,
+            stored_login: |_, _, _| {
+                AUTH_READS.set(AUTH_READS.get() + 1);
+                true
+            },
+        };
+        let mut known = HashMap::new();
+        let mut tails = ProcessTails::default();
+        let mut fold = footer::FooterCache::default();
+        let mut roster = RosterMemo::default();
+        let first = resolve_and_post(&mut known, &mut tails, &mut fold, &mut roster, &job, asks);
+        assert!(!first.row);
+        let provisional = known.get(&job.session).unwrap();
+        assert_eq!(provisional.dir.as_deref(), Some(launcher_dir.as_path()));
+        assert_eq!(provisional.launch_for, None);
+
+        let selected = Asks {
+            args: |_| args(true),
+            ..asks
+        };
+        let recovered = resolve_and_post(
+            &mut known,
+            &mut tails,
+            &mut fold,
+            &mut roster,
+            &job,
+            selected,
+        );
+        assert!(
+            recovered.row,
+            "the same process now names its custom directory"
+        );
+        let confirmed = known.get(&job.session).unwrap().clone();
+        assert_eq!(confirmed.started, Some(started));
+        assert_eq!(confirmed.dir.as_deref(), Some(claude.as_path()));
+        assert_eq!(confirmed.launch_for, Some(Some(started)));
+        let display = timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .subscription
+            .clone()
+            .unwrap();
+        assert_eq!(display.email.as_deref(), Some("selected@example.test"));
+        assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(AUTH_READS.get(), 1);
+
+        // A confirmed image keeps its directory, launch and auth-source verdict;
+        // only the subscription's fresh exec guard reads argv/environment again.
+        for registry_present in [true, false] {
+            if !registry_present {
+                std::fs::remove_file(claude.join(format!("sessions/{pid}.json"))).unwrap();
+            }
+            let before = EXEC_READS.get();
+            let found = resolve_and_post(
+                &mut known,
+                &mut tails,
+                &mut fold,
+                &mut roster,
+                &job,
+                selected,
+            );
+            assert_eq!(found.row, registry_present);
+            assert_eq!(EXEC_READS.get(), before + 1);
+            assert_eq!(AUTH_READS.get(), 1);
+            assert_eq!(known.get(&job.session), Some(&confirmed));
+            assert_eq!(
+                timeline
+                    .lock()
+                    .unwrap()
+                    .claude_footer()
+                    .unwrap()
+                    .subscription
+                    .as_ref(),
+                Some(&display)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The resolver's roster is read on the first ask, answered from memory
     /// within [`ROSTER_RECHECK`] and read again after it: a footer read costs
     /// no file read of its own, and a roster edited under a running window
     /// shows within one period. CONTROLS: one row, a load that fails and an
-    /// empty roster are no roster — and are not asked again within the
-    /// period either.
+    /// empty roster are kept too: a lone row can bind a named login, and
+    /// every answer is memoized for the same period.
     #[test]
     fn the_roster_is_read_at_most_every_recheck() {
         let t0 = std::time::Instant::now();
@@ -6015,11 +6806,15 @@ mod tests {
         assert_eq!(asked.get(), 2);
         // NEGATIVE CONTROLS.
         let t2 = t1 + ROSTER_RECHECK;
-        assert_eq!(at(t2, Some(one)), None, "one account: none to tell apart");
+        assert_eq!(
+            at(t2, Some(one.clone())),
+            Some(one.clone()),
+            "one account binds identity"
+        );
         assert_eq!(
             at(t2 + Duration::from_secs(1), Some(two.clone())),
-            None,
-            "no roster is an answer too, kept for the period"
+            Some(one),
+            "the answer is kept for the period"
         );
         assert_eq!(asked.get(), 3);
         let t3 = t2 + ROSTER_RECHECK;
@@ -6027,7 +6822,7 @@ mod tests {
         let t4 = t3 + ROSTER_RECHECK;
         assert_eq!(
             at(t4, Some(accounts::Roster::default())),
-            None,
+            Some(accounts::Roster::default()),
             "none listed"
         );
         let t5 = t4 + ROSTER_RECHECK;
@@ -6062,6 +6857,9 @@ mod tests {
             login: None,
             argv: Vec::new(),
             task: None,
+            login_checked_for: None,
+            stored_login: false,
+            env_stamp: None,
         }
     }
 
@@ -6086,6 +6884,389 @@ mod tests {
         timeline.claude_footer().map(|facts| facts.account.clone())
     }
 
+    #[test]
+    fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadable() {
+        const PID: i32 = 4243;
+        const START: u64 = 1_790_607_848;
+        let (root, claude) = claude_home("footer-subscription-resolve", PID, START);
+        let profile =
+            aterm_agent::harness::profile::path_in(&root, Some(&claude.to_string_lossy()), &claude);
+        let now = aterm_agent::supervise::limit::unix_now();
+        let content = |email: &str, account: &str| {
+            aterm_json::json!({
+                "oauthAccount": {
+                    "accountUuid": account,
+                    "emailAddress": email,
+                    "organizationType": "claude_max",
+                    "planDisplayName": "Max 5x"
+                },
+                "cachedUsageUtilization": {
+                    "fetchedAtMs": now * 1000,
+                    "accountUuid": "first-account",
+                    "utilization": {
+                        "seven_day": { "utilization": 71, "resets_at": "2099-01-01T00:00:00Z" }
+                    }
+                }
+            })
+        };
+        std::fs::write(
+            &profile,
+            aterm_json::to_string(&content("first@example.com", "first-account")).unwrap(),
+        )
+        .unwrap();
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        {
+            let mut held = timeline.lock().unwrap();
+            held.note_foreground_group(PID);
+            held.set_program(PID, Some("claude".into()));
+        }
+        let mut identity = unread(PID, &claude);
+        identity.started = Some(START);
+        let mut tail = footer::TailCache::default();
+        let mut fold = footer::FooterCache::default();
+        let mut memo = RosterMemo::default();
+        let asks = Asks {
+            args: |_| {
+                let root = std::env::temp_dir().join(format!(
+                    "aterm-gui-footer-subscription-resolve-{}",
+                    std::process::id()
+                ));
+                Some(args_of(&[
+                    &format!("HOME={}", root.display()),
+                    &format!("CLAUDE_CONFIG_DIR={}", root.join("claude").display()),
+                ]))
+            },
+            roster: || None,
+            home: scratch_home,
+            stored_login: |_, _, _| true,
+        };
+        let mut refresh = || {
+            resolve_facts(
+                &timeline,
+                &mut identity,
+                &mut tail,
+                &mut fold,
+                &mut memo,
+                asks,
+            );
+            timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .subscription
+                .clone()
+                .unwrap()
+        };
+        let first = refresh();
+        assert_eq!(first.email.as_deref(), Some("first@example.com"));
+        assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
+        std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
+        std::fs::write(
+            &profile,
+            aterm_json::to_string(&content("second@example.com", "second-account")).unwrap(),
+        )
+        .unwrap();
+        let second = refresh();
+        assert_eq!(second.email.as_deref(), Some("second@example.com"));
+        assert!(
+            second.weekly.is_none(),
+            "the previous account's quota cannot survive"
+        );
+        std::fs::write(&profile, "{").unwrap();
+        assert_eq!(
+            refresh(),
+            aterm_agent::harness::profile::SubscriptionDisplay::default()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
+        const PID: i32 = 4245;
+        const IMAGE: u64 = 1_790_607_848;
+        thread_local! {
+            static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            static ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        fn args(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
+            let root = std::env::temp_dir().join(format!(
+                "aterm-gui-footer-subscription-auth-{}",
+                std::process::id()
+            ));
+            Some(atpkg::caller_shell::ProcArgs {
+                argv: vec![
+                    "claude".into(),
+                    "--settings".into(),
+                    r#"{"apiKeyHelper":"/opt/key.sh"}"#.into(),
+                ],
+                env: vec![
+                    format!("HOME={}", root.display()),
+                    format!("CLAUDE_CONFIG_DIR={}", root.join("claude").display()),
+                ],
+                ..Default::default()
+            })
+        }
+        let (root, claude) = claude_home("footer-subscription-auth", PID, IMAGE);
+        let profile =
+            aterm_agent::harness::profile::path_in(&root, Some(&claude.to_string_lossy()), &claude);
+        let now = aterm_agent::supervise::limit::unix_now();
+        let content = aterm_json::json!({
+            "oauthAccount": { "accountUuid": "auth-account", "emailAddress": "auth@example.com", "planDisplayName": "Max 5x" },
+            "cachedUsageUtilization": {
+                "fetchedAtMs": now * 1000, "accountUuid": "auth-account",
+                "utilization": { "seven_day": { "utilization": 71, "resets_at": "2099-01-01T00:00:00Z" } }
+            }
+        });
+        std::fs::write(&profile, aterm_json::to_string(&content).unwrap()).unwrap();
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        {
+            let mut held = timeline.lock().unwrap();
+            held.note_foreground_group(PID);
+            held.set_program(PID, Some("claude".into()));
+        }
+        let mut identity = unread(PID, &claude);
+        identity.started = Some(IMAGE);
+        let mut tail = footer::TailCache::default();
+        let mut fold = footer::FooterCache::default();
+        let mut memo = RosterMemo::default();
+        let asks = Asks {
+            args,
+            roster: || None,
+            home: scratch_home,
+            stored_login: |pid, argv, cwd| {
+                assert_eq!(pid, PID as u32);
+                assert_eq!(argv[0], "claude");
+                assert!(std::path::Path::new(cwd).is_absolute());
+                CHECKS.set(CHECKS.get() + 1);
+                ALLOWED.get()
+            },
+        };
+        let mut refresh = |asks| {
+            resolve_facts(
+                &timeline,
+                &mut identity,
+                &mut tail,
+                &mut fold,
+                &mut memo,
+                asks,
+            );
+            timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .subscription
+                .clone()
+                .unwrap()
+        };
+        let unavailable = aterm_agent::harness::profile::SubscriptionDisplay::default();
+        assert_eq!(
+            refresh(asks),
+            unavailable,
+            "helper/provider/refused sources suppress every field"
+        );
+        assert_eq!(refresh(asks), unavailable);
+        assert_eq!(
+            CHECKS.get(),
+            1,
+            "one auth-source gather per registered image"
+        );
+        ALLOWED.set(true);
+        assert_eq!(
+            refresh(asks),
+            unavailable,
+            "the verdict belongs to the old image"
+        );
+
+        let registry = claude.join(format!("sessions/{PID}.json"));
+        let mut row: aterm_json::Value =
+            aterm_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        row.as_object_mut()
+            .unwrap()
+            .insert("startedAt".into(), aterm_json::json!((IMAGE + 60) * 1000));
+        std::fs::write(&registry, aterm_json::to_string(&row).unwrap()).unwrap();
+        let display = refresh(asks);
+        assert_eq!(display.email.as_deref(), Some("auth@example.com"));
+        assert_eq!(display.plan.as_deref(), Some("Max 5x"));
+        assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(refresh(asks), display);
+        assert_eq!(CHECKS.get(), 2);
+
+        let cwd = root.join("another-work");
+        std::fs::create_dir(&cwd).unwrap();
+        row.as_object_mut()
+            .unwrap()
+            .insert("cwd".into(), aterm_json::json!(cwd));
+        std::fs::write(&registry, aterm_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(refresh(asks), display);
+        assert_eq!(
+            CHECKS.get(),
+            3,
+            "different project settings need a new gather"
+        );
+        let unregistered = Asks {
+            args: |pid| {
+                let mut args = args(pid)?;
+                args.argv.push("--new-image".into());
+                Some(args)
+            },
+            ..asks
+        };
+        assert_eq!(
+            refresh(unregistered),
+            unavailable,
+            "an exec cannot borrow a prior image's verdict"
+        );
+        assert_eq!(CHECKS.get(), 3);
+        let changed_home = Asks {
+            args: |pid| {
+                let mut args = args(pid)?;
+                args.env[0].push_str("/another-home");
+                Some(args)
+            },
+            ..asks
+        };
+        assert_eq!(
+            refresh(changed_home),
+            unavailable,
+            "the same argv with another HOME cannot borrow the old settings verdict"
+        );
+        assert_eq!(CHECKS.get(), 3);
+        assert_ne!(
+            exec_env_stamp(&["A=B".into(), "C=D".into()]),
+            exec_env_stamp(&["A=BC=D".into()]),
+            "entry boundaries are part of the environment identity"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn weekly_quota_expires_on_the_local_clock_after_the_idle_watch_lapses() {
+        const PID: i32 = 4244;
+        const START: u64 = 1_790_607_848;
+        const OBSERVED: i64 = 1_792_050_000;
+        let (root, claude) = claude_home("footer-subscription-expiry", PID, START);
+        let profile =
+            aterm_agent::harness::profile::path_in(&root, Some(&claude.to_string_lossy()), &claude);
+        let asks = Asks {
+            args: |_| {
+                let root = std::env::temp_dir().join(format!(
+                    "aterm-gui-footer-subscription-expiry-{}",
+                    std::process::id()
+                ));
+                Some(args_of(&[
+                    &format!("HOME={}", root.display()),
+                    &format!("CLAUDE_CONFIG_DIR={}", root.join("claude").display()),
+                ]))
+            },
+            roster: || None,
+            home: scratch_home,
+            stored_login: |_, _, _| true,
+        };
+        // Both the natural fifteen-minute age and a reset before that age must
+        // clear a settled percentage. No sleep, real account or network is involved.
+        for (reset, expires_after) in [("2099-01-01T00:00:00Z", 900), ("2026-10-15T07:50:50Z", 650)]
+        {
+            let content = aterm_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "expiry-account",
+                    "emailAddress": "expiry@example.com",
+                    "organizationType": "claude_max",
+                    "planDisplayName": "Max 5x"
+                },
+                "cachedUsageUtilization": {
+                    "fetchedAtMs": OBSERVED * 1000,
+                    "accountUuid": "expiry-account",
+                    "utilization": { "seven_day": { "utilization": 71, "resets_at": reset } }
+                }
+            });
+            std::fs::write(&profile, aterm_json::to_string(&content).unwrap()).unwrap();
+            let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+            {
+                let mut held = timeline.lock().unwrap();
+                held.note_foreground_group(PID);
+                held.set_program(PID, Some("claude".into()));
+            }
+            let mut identity = unread(PID, &claude);
+            identity.started = Some(START);
+            let mut tail = footer::TailCache::default();
+            let mut fold = footer::FooterCache::default();
+            let mut memo = RosterMemo::default();
+            let mut refresh = |elapsed| {
+                let (_, found) = resolve_facts_at(
+                    &timeline,
+                    &mut identity,
+                    &mut tail,
+                    &mut fold,
+                    &mut memo,
+                    asks,
+                    &footer::ReadClock {
+                        read_at: std::time::SystemTime::now(),
+                        now: OBSERVED + elapsed,
+                        offset_at: &|_, _| Some(0),
+                    },
+                );
+                let display = timeline
+                    .lock()
+                    .unwrap()
+                    .claude_footer()
+                    .unwrap()
+                    .subscription
+                    .clone()
+                    .unwrap();
+                (found, display)
+            };
+            let (found, display) = refresh(601);
+            assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+            assert!(found.timed, "weekly without a wall still needs the clock");
+
+            let asked = std::time::Instant::now();
+            let mut schedule = WatchSchedule::default();
+            schedule.watch(
+                Job {
+                    session: 7,
+                    timeline: timeline.clone(),
+                    pgid: PID,
+                    wake: LogWake::default(),
+                },
+                asked,
+                true,
+            );
+            let past = asked + Duration::from_secs(601);
+            let _ = schedule.due_followups(past);
+            schedule.read(7, past, found.row);
+            schedule.prune(past, |_, _| found.timed);
+            assert!(
+                schedule.watched.contains_key(&7),
+                "quota keeps the idle clock"
+            );
+            for elapsed in (661..=961).step_by(60) {
+                let at = asked + Duration::from_secs(elapsed as u64);
+                assert_eq!(schedule.next(at), Some(at));
+                assert!(schedule.due_idle(at).is_some());
+                let (found, display) = refresh(elapsed);
+                assert_eq!(display.email.as_deref(), Some("expiry@example.com"));
+                assert_eq!(display.plan.as_deref(), Some("Max 5x"));
+                schedule.read(7, at, found.row);
+                schedule.prune(at, |_, _| found.timed);
+                if elapsed > expires_after {
+                    assert!(display.weekly.is_none(), "stale quota cleared: {reset}");
+                    assert!(!found.timed);
+                    assert!(
+                        schedule.watched.is_empty(),
+                        "quota expiry releases the clock"
+                    );
+                    assert!(elapsed <= expires_after + 60, "bounded by the slow clock");
+                    break;
+                }
+                assert!(display.weekly.is_some());
+            }
+            assert!(schedule.watched.is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// THE ACCOUNT IS LAID IN BY THE READ THAT ANSWERS: the published facts
     /// carry the label of the row the process's login names. CONTROLS, each
     /// publishing the same facts with no account: a login no row names; no
@@ -6103,11 +7284,13 @@ mod tests {
             args,
             roster: || Some(two_accounts()),
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         let unasked = |args| Asks {
             args,
             roster: || unreachable!("no login was read: the roster is not asked"),
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         let read = |asks: Asks| {
             let mut memo = RosterMemo::default();
@@ -6130,6 +7313,7 @@ mod tests {
             args: on_main,
             roster: || None,
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         assert_eq!(read(none), (Some(None), true), "no roster: asked, none");
         assert_eq!(
@@ -6160,6 +7344,7 @@ mod tests {
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         assert_eq!(read(nothing), (None, false));
         let _ = std::fs::remove_dir_all(&root);
@@ -6193,6 +7378,7 @@ mod tests {
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         let read = |asks: Asks| {
             let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -6223,6 +7409,7 @@ mod tests {
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         assert_eq!(read(nothing), (false, None));
         let _ = std::fs::remove_dir_all(&root);
@@ -6244,6 +7431,7 @@ mod tests {
             args,
             roster: || Some(two_accounts()),
             home: scratch_home,
+            stored_login: |_, _, _| true,
         };
         let mut memo = RosterMemo::default();
         // What a read before the registry row held: the launcher's.
@@ -6388,6 +7576,74 @@ mod tests {
             assert_eq!(again, 0, "frame {frame}: the rows' buffers reused");
             assert_eq!(s.cells, first, "frame {frame}: the same write");
         }
+    }
+
+    #[test]
+    fn unicode_footer_side_channels_undo_exactly_reuse_buffers_and_respect_foreign_writes() {
+        let blank = cell(' ', [0, 0, 0]);
+        let rule = cell('\u{2500}', [60, 60, 60]);
+        let facts = FooterFacts {
+            subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                email: Some("jose\u{0301}👩‍💻@example.com".into()),
+                plan: Some("Pro".into()),
+                weekly: Some("weekly 29% left".into()),
+            }),
+            ..FooterFacts::default()
+        };
+        let fit = footer::fit_rule(&facts, 76, None);
+        let paint = compose_rule_spans(&fit, None, rule, blank, [0, 128, 255], 76);
+        assert!(!paint.clusters.is_empty() && !paint.combining.is_empty());
+        let mut scratch = engine_fill(3);
+        scratch.cells[2] = vec![rule; 100];
+        scratch.clusters.resize_with(3, Vec::new);
+        scratch.combining.resize_with(3, Vec::new);
+        scratch.combining[0].push((0, vec!['\u{0300}'].into_boxed_slice()));
+        let original = scratch.clone();
+        let mut slot = FooterUndo::default();
+        let write = |slot: &mut FooterUndo, scratch: &mut RenderInput| {
+            write_edits(
+                slot,
+                scratch,
+                rule_edits(2, 10, &paint.cells, &paint.glass, blank),
+            );
+            slot.publish_text(scratch, 2, 10, &paint);
+        };
+        write(&mut slot, &mut scratch);
+        let painted = scratch.clone();
+        for frame in 0..3 {
+            assert!(undo(&mut slot, &mut scratch), "frame {frame}");
+            assert_eq!(
+                scratch, original,
+                "cells, metadata and reuse identity restored"
+            );
+            let ((), allocations) =
+                crate::work_counts::allocations_in(|| write(&mut slot, &mut scratch));
+            assert_eq!(allocations, 0, "frame {frame}: metadata buffers reused");
+            assert_eq!(scratch, painted);
+        }
+        scratch.combining[2][0].1 = vec!['\u{0300}'].into_boxed_slice();
+        let changed = scratch.clone();
+        assert!(
+            !undo(&mut slot, &mut scratch),
+            "another writer changed our mark"
+        );
+        assert_eq!(
+            scratch, changed,
+            "foreign metadata and cells are left alone"
+        );
+
+        let mut occupied = original;
+        occupied.combining[2].push((
+            10 + paint.combining[0].0,
+            vec!['\u{0300}'].into_boxed_slice(),
+        ));
+        let before = occupied.clone();
+        write(&mut slot, &mut occupied);
+        assert_eq!(
+            occupied, before,
+            "a skipped vendor span gets no footer metadata"
+        );
+        assert!(!slot.is_written());
     }
 
     /// The whole point: the footer comes off exactly, and the scratch is an
@@ -6997,6 +8253,9 @@ mod tests {
         };
         let rows = claude_rows("footer-bypass-idle", 80);
         let bottom = aterm_phase::phase::composer_bottom(&rows).unwrap();
+        // Its card is its drawer's own: a 2.1.283 image, the card painted
+        // after its cut (card engine §3.8).
+        super::probe::drawer(&app, session, 4242, "claude", "2.1.283");
         feed_rows(&app, session, &rows);
         publish(&app, session, open.clone());
         let plan = app.active_visible_leaf_plan(wid).unwrap();
@@ -7062,32 +8321,114 @@ mod tests {
             "{:?}",
             rule(&app)
         );
-        // A card of another build is not this process's.
+        // A card of another build is not this process's: a 2.1.284 image
+        // under the 2.1.283 card. Its facts name no build, so the fill's own
+        // version filter (`filled_model_effort`) would pass the card: the
+        // gate alone refuses it.
         let (mut app, wid, session) = glass(80);
+        super::probe::drawer(&app, session, 4242, "claude", "2.1.284");
         feed_rows(&app, session, &rows);
         publish(
             &app,
             session,
             FooterFacts {
-                version: Some("2.1.284".into()),
+                version: None,
                 ..open
             },
         );
         frame(&mut app, wid);
         let text = text_of(&app.windows[&wid].input_scratch.cells[strip + bottom]);
         assert!(!text.contains("Opus"), "{text:?}");
+        let entry = app.pool.get(session).unwrap();
+        assert!(
+            entry.ctx.timeline.lock().unwrap().claude_card().is_none(),
+            "not kept"
+        );
     }
 
-    /// THE NEWEST CARD WINS: while the facts stay open the card is read on
-    /// every rebuild of the pane's text, and a newer reading replaces the
-    /// kept one — a predecessor's card of the same build, read in the moment
-    /// between the new owner and the new process's first paint, gives way
-    /// the moment the new process draws its own. A frame with no card to read (it scrolled
-    /// away) keeps the newest reading. NEGATIVE CONTROL: the stale reading
-    /// is what the footer showed first (the memo read once kept it for good).
+    /// A CARD QUOTED UNDER THE DRAWER'S OWN IS NOT KEPT (card engine §3.8:
+    /// the footer keeps only the reading the gate admitted): a tool's output
+    /// quoting a launch card — another build's, or the very build's — sits
+    /// under the drawer's own card, where the footer's reader takes the last
+    /// row naming a banner. Its banner row is not the card the gate admitted,
+    /// so the drawer's own card stays kept and the footer keeps its model and
+    /// effort. CONTROL: the drawer's own card is kept first. Mutation-checked:
+    /// a reading held to the verdict alone, not to its banner row, keeps the
+    /// quote.
+    #[test]
+    fn a_card_quoted_under_the_drawers_own_is_not_kept() {
+        for quoted in ["2.1.200", "2.1.283"] {
+            let (mut app, wid, session) = glass(80);
+            let open = FooterFacts {
+                path: Some("~/aterm".into()),
+                version: Some("2.1.283".into()),
+                model_open: true,
+                effort_open: true,
+                owner: Some(footer::FactsOwner {
+                    floor: Some(1_790_607_848),
+                    session_id: "00000000-0000-4000-8000-000000000006".into(),
+                }),
+                ..FooterFacts::default()
+            };
+            let rows = claude_rows("footer-bypass-idle", 80);
+            let bottom = aterm_phase::phase::composer_bottom(&rows).unwrap();
+            super::probe::drawer(&app, session, 4242, "claude", "2.1.283");
+            feed_rows(&app, session, &rows);
+            publish(&app, session, open);
+            frame(&mut app, wid);
+            let strip = strip(&app, wid);
+            let rule = |app: &App| text_of(&app.windows[&wid].input_scratch.cells[strip + bottom]);
+            assert!(
+                rule(&app).contains("\u{25C6} Opus 5.5 xhigh"),
+                "CONTROL: the drawer's own card: {:?}",
+                rule(&app)
+            );
+            let mut quoting = rows.clone();
+            quoting[10] = format!(
+                "  \u{23BF}  \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   Claude Code \
+                 v{quoted}"
+            );
+            quoting[11] = "     Haiku 4.5 \u{00B7} API Usage Billing".into();
+            feed_rows(&app, session, &quoting);
+            frame(&mut app, wid);
+            let read = app.windows[&wid]
+                .claude_footer_texts
+                .borrow()
+                .footer_card(0, session)
+                .map(|(_, read)| (read.banner, read.card.model.clone()));
+            assert_eq!(
+                read,
+                Some((Some(10), "Haiku 4.5".to_string())),
+                "{quoted}: the footer's reader takes the quote"
+            );
+            assert!(
+                rule(&app).contains("\u{25C6} Opus 5.5 xhigh"),
+                "{quoted}: the quote is not kept: {:?}",
+                rule(&app)
+            );
+            let entry = app.pool.get(session).unwrap();
+            let kept = entry.ctx.timeline.lock().unwrap().claude_card().cloned();
+            assert_eq!(
+                kept.map(|card| (card.version, card.model)),
+                Some(("2.1.283".to_string(), "Opus 5.5".to_string())),
+                "{quoted}"
+            );
+        }
+    }
+
+    /// THE NEWEST CARD WINS, AND ONLY THE DRAWER'S: while the facts stay
+    /// open the card is read on every rebuild of the pane's text, and a
+    /// newer reading of the drawer's own replaces the kept one. A
+    /// predecessor's card of the same build, still on the glass between the
+    /// new owner and the new process's first paint, is not the drawer's
+    /// (card engine §3.8: the gate's one verdict serves the footer's kept
+    /// card) and is never kept; the new process's own card is, the moment
+    /// it draws it. A frame with no card to read (it scrolled away) keeps
+    /// the newest reading. CONTROL: the same predecessor's card painted
+    /// after the drawer's cut — the drawer's own — is kept, so the gate,
+    /// not the reader, refuses it.
     #[test]
     fn a_newer_launch_card_replaces_the_kept_one() {
-        let (mut app, wid, session) = glass(80);
         let open = FooterFacts {
             path: Some("~/aterm".into()),
             version: Some("2.1.283".into()),
@@ -7101,23 +8442,26 @@ mod tests {
         };
         let rows = claude_rows("footer-bypass-idle", 80);
         let bottom = aterm_phase::phase::composer_bottom(&rows).unwrap();
-        // The predecessor's card, still on the glass: `Haiku 4.5`, no effort.
+        // The predecessor's card: `Haiku 4.5`, no effort.
         let stale: Vec<String> = rows
             .iter()
             .map(|r| r.replace("Opus 5.5 with xhigh effort", "Haiku 4.5"))
             .collect();
         assert_ne!(stale, rows, "the fixture's card names Opus 5.5");
+        let (mut app, wid, session) = glass(80);
+        // Still on the glass when the new process takes the front.
         feed_rows(&app, session, &stale);
-        publish(&app, session, open);
+        super::probe::drawer(&app, session, 4242, "claude", "2.1.283");
+        publish(&app, session, open.clone());
         frame(&mut app, wid);
         let strip = strip(&app, wid);
         let rule = |app: &App| text_of(&app.windows[&wid].input_scratch.cells[strip + bottom]);
         assert!(
-            rule(&app).contains("\u{25C6} Haiku 4.5   \u{2302} ~/aterm"),
-            "the stale reading shows first: {:?}",
+            !rule(&app).contains('\u{25C6}'),
+            "the predecessor's card is not kept: {:?}",
             rule(&app)
         );
-        // The new process draws its own card: the newer reading wins.
+        // The new process draws its own card: kept.
         feed_rows(&app, session, &rows);
         frame(&mut app, wid);
         assert!(
@@ -7125,17 +8469,36 @@ mod tests {
             "{:?}",
             rule(&app)
         );
+        // It draws another (`/model`): the newer reading wins.
+        feed_rows(&app, session, &stale);
+        frame(&mut app, wid);
+        assert!(
+            rule(&app).contains("\u{25C6} Haiku 4.5   \u{2302} ~/aterm"),
+            "{:?}",
+            rule(&app)
+        );
         // Its card scrolls away: the newest reading stands.
-        let mut scrolled = rows.clone();
+        let mut scrolled = stale.clone();
         for r in scrolled.iter_mut().take(5) {
             r.clear();
         }
         feed_rows(&app, session, &scrolled);
         frame(&mut app, wid);
         assert!(
-            rule(&app).contains("\u{25C6} Opus 5.5 xhigh"),
+            rule(&app).contains("\u{25C6} Haiku 4.5"),
             "{:?}",
             rule(&app)
+        );
+        // CONTROL: the predecessor's card painted after the cut is kept.
+        let (mut app, wid, session) = glass(80);
+        super::probe::drawer(&app, session, 4242, "claude", "2.1.283");
+        feed_rows(&app, session, &stale);
+        publish(&app, session, open);
+        frame(&mut app, wid);
+        let rule = text_of(&app.windows[&wid].input_scratch.cells[strip + bottom]);
+        assert!(
+            rule.contains("\u{25C6} Haiku 4.5   \u{2302} ~/aterm"),
+            "CONTROL: {rule:?}"
         );
     }
 
@@ -7555,6 +8918,8 @@ mod tests {
             rule,
             "? for shortcuts                                                                                  Gemini 4 Argon \u{00B7} medium".into(),
         ];
+        // agy's card is its drawer's own (ProvenanceOnly: the fence alone).
+        super::probe::drawer(&app, session, 4242, "agy", "1.4.2");
         feed_rows(&app, session, &rows);
         frame(&mut app, wid);
 
@@ -7567,11 +8932,22 @@ mod tests {
             "agy card line on row top+4: {card_line:?}"
         );
         assert!(
-            !app.windows[&wid].input_scratch.glow_under.is_empty(),
+            app.windows[&wid]
+                .claude_card
+                .painted_layers()
+                .iter()
+                .any(|l| l.slot == aterm_core::render::FxSlot::Under
+                    && !l.content.items().is_empty()),
             "agy card rainbow border and trail drawn"
         );
         assert!(
-            !app.windows[&wid].input_scratch.nova_add.is_empty(),
+            app.windows[&wid]
+                .claude_card
+                .painted_layers()
+                .iter()
+                .any(
+                    |l| l.slot == aterm_core::render::FxSlot::Over && !l.content.items().is_empty()
+                ),
             "agy card kitty and stars drawn"
         );
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 7]);
@@ -7581,8 +8957,8 @@ mod tests {
         );
         let bottom_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom_rule.contains('\u{221E}') && bottom_rule.contains('\u{2699}'),
-            "agy composer rule has autopilot and settings chips: {bottom_rule:?}"
+            bottom_rule.contains('\u{221E}') && !bottom_rule.contains('\u{2699}'),
+            "agy composer rule has the autopilot chip and no settings button: {bottom_rule:?}"
         );
         assert!(
             bottom_rule
@@ -7590,6 +8966,103 @@ mod tests {
             "agy composer rule has model, effort, path, and branch: {bottom_rule:?}"
         );
         host.shutdown_and_join();
+    }
+
+    /// AGY'S MODEL FOLLOWS ITS OWN STATUS ROW (card engine §3.8): agy's
+    /// facts leave the model open, and agy's own status row under its
+    /// composer names the model it runs on. Once its card has scrolled away,
+    /// a model switch shows in aterm's footer from that row alone — a row
+    /// the drawer drew, inside its fence. CONTROL: a predecessor's agy
+    /// screen, there before the drawer took the front, names no model the
+    /// footer keeps. Mutation-checked: a status row not held to the fence
+    /// keeps the predecessor's model.
+    #[test]
+    fn agy_follows_its_own_status_row_once_its_card_is_gone() {
+        let rule = "\u{2500}".repeat(120);
+        let screen = |card: bool, model: &str| -> Vec<String> {
+            let mut rows = vec![String::new()];
+            if card {
+                rows.extend([
+                    "      \u{2584}\u{2580}\u{2580}\u{2584}        Antigravity CLI 1.4.0".to_string(),
+                    "     \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}       redacted-user@example.test (Google AI Ultra)".to_string(),
+                    "    \u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}      Gemini 4 Argon (Medium)".to_string(),
+                    "   \u{2584}\u{2580}\u{2580}    \u{2580}\u{2580}\u{2584}     ~/aterm".to_string(),
+                    "  \u{2584}\u{2580}\u{2580}      \u{2580}\u{2580}\u{2584}".to_string(),
+                ]);
+            } else {
+                rows.extend([
+                    "\u{25CF} Switched the model.".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ]);
+            }
+            rows.extend([
+                String::new(),
+                rule.clone(),
+                "> ".into(),
+                rule.clone(),
+                format!("? for shortcuts{}{model}", " ".repeat(60)),
+            ]);
+            rows
+        };
+        let agy_facts = |app: &App, session: u64| {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(4242);
+            timeline.set_program(4242, Some("agy".into()));
+            assert!(timeline.set_claude_footer(
+                4242,
+                None,
+                Some(FooterFacts {
+                    model_open: true,
+                    effort_open: true,
+                    path: Some("~/aterm".into()),
+                    owner: Some(footer::FactsOwner {
+                        floor: None,
+                        session_id: "agy-4242".into(),
+                    }),
+                    ..FooterFacts::default()
+                }),
+            ));
+        };
+        let bottom = |app: &App, wid: WindowId| {
+            text_of(&app.windows[&wid].input_scratch.cells[strip(app, wid) + 9])
+        };
+        let (mut app, wid, session) = glass(120);
+        agy_facts(&app, session);
+        super::probe::drawer(&app, session, 4242, "agy", "1.4.2");
+        feed_rows(
+            &app,
+            session,
+            &screen(true, "Gemini 4 Argon \u{00B7} medium"),
+        );
+        frame(&mut app, wid);
+        assert!(
+            bottom(&app, wid).contains("\u{25C6} Gemini 4 Argon medium"),
+            "{:?}",
+            bottom(&app, wid)
+        );
+        // The card scrolled away; agy switched its model.
+        feed_rows(&app, session, &screen(false, "Gemini 4 Pro \u{00B7} high"));
+        frame(&mut app, wid);
+        assert!(
+            bottom(&app, wid).contains("\u{25C6} Gemini 4 Pro high"),
+            "its own status row: {:?}",
+            bottom(&app, wid)
+        );
+        // CONTROL: a predecessor's screen, there before the drawer's cut.
+        let (mut app, wid, session) = glass(120);
+        agy_facts(&app, session);
+        feed_rows(&app, session, &screen(false, "Gemini 4 Pro \u{00B7} high"));
+        super::probe::drawer(&app, session, 4242, "agy", "1.4.2");
+        frame(&mut app, wid);
+        assert!(
+            !bottom(&app, wid).contains("Gemini 4 Pro"),
+            "CONTROL: not the drawer's row: {:?}",
+            bottom(&app, wid)
+        );
     }
 
     #[test]
@@ -7641,6 +9114,8 @@ mod tests {
             rule,
             "  gpt-5.4 \u{00B7} high \u{00B7} ~/aterm \u{00B7} Auto-review".into(),
         ];
+        // Muse Code's card is its drawer's own (ProvenanceOnly).
+        super::probe::drawer(&app, session, 5151, "muse", "0.9.3");
         feed_rows(&app, session, &rows);
         frame(&mut app, wid);
 
@@ -7653,11 +9128,22 @@ mod tests {
             "muse card line on row top+1: {card_line:?}"
         );
         assert!(
-            !app.windows[&wid].input_scratch.glow_under.is_empty(),
+            app.windows[&wid]
+                .claude_card
+                .painted_layers()
+                .iter()
+                .any(|l| l.slot == aterm_core::render::FxSlot::Under
+                    && !l.content.items().is_empty()),
             "muse card rainbow border and trail drawn"
         );
         assert!(
-            !app.windows[&wid].input_scratch.nova_add.is_empty(),
+            app.windows[&wid]
+                .claude_card
+                .painted_layers()
+                .iter()
+                .any(
+                    |l| l.slot == aterm_core::render::FxSlot::Over && !l.content.items().is_empty()
+                ),
             "muse card kitty and stars drawn"
         );
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 3]);
@@ -7667,8 +9153,8 @@ mod tests {
         );
         let bottom_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            bottom_rule.contains('\u{221E}') && bottom_rule.contains('\u{2699}'),
-            "muse composer rule has autopilot and settings chips: {bottom_rule:?}"
+            bottom_rule.contains('\u{221E}') && !bottom_rule.contains('\u{2699}'),
+            "muse composer rule has the autopilot chip and no settings button: {bottom_rule:?}"
         );
         assert!(
             bottom_rule.contains("\u{25C6} gpt-5.4 high   \u{2302} ~/aterm   \u{2387} main"),
@@ -7679,7 +9165,7 @@ mod tests {
 
     #[test]
     fn single_toggle_switch_disables_and_reenables_entire_harness_for_claude_agy_and_muse() {
-        let rule = "\u{2500}".repeat(120);
+        let rule = "\u{2500}".repeat(160);
         let claude_fixture = vec![
             String::new(),
             " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C}   Claude Code v2.1.92".into(),
@@ -7713,12 +9199,12 @@ mod tests {
             "  gpt-5.4 \u{00B7} high \u{00B7} ~/aterm \u{00B7} Auto-review".into(),
         ];
 
-        for (prog, rows, top_rule_row, card_row) in [
-            ("claude", claude_fixture, 5usize, 4usize),
-            ("agy", agy_fixture, 6usize, 4usize),
-            ("muse", muse_fixture, 3usize, 2usize),
+        for (prog, build, rows, top_rule_row, card_row) in [
+            ("claude", "2.1.92", claude_fixture, 5usize, 4usize),
+            ("agy", "1.4.2", agy_fixture, 6usize, 4usize),
+            ("muse", "0.9.3", muse_fixture, 3usize, 2usize),
         ] {
-            let (mut app, wid, session) = glass(120);
+            let (mut app, wid, session) = glass(160);
             {
                 let entry = app.pool.get(session).expect("session");
                 let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -7736,6 +9222,10 @@ mod tests {
                             floor: None,
                             session_id: format!("{prog}-7000"),
                         }),
+                        subscription: Some(
+                            aterm_agent::harness::profile::SubscriptionDisplay::default(),
+                        ),
+                        context: Some("ctx auto".into()),
                         ..FooterFacts::default()
                     }),
                 ));
@@ -7755,23 +9245,51 @@ mod tests {
             )
             .expect("claim");
 
+            // The card is the drawer's own: its image, the card after its cut.
+            super::probe::drawer(&app, session, 7000, prog, build);
             feed_rows(&app, session, &rows);
             frame(&mut app, wid);
 
             let strip = strip(&app, wid);
+            let expected_left_logo = match prog {
+                "claude" => "\u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C} claude",
+                "agy" => "\u{2584}\u{2580}\u{2580}\u{2584} agy",
+                "muse" => "\u{25C6} muse",
+                _ => unreachable!(),
+            };
             let expected_badge = format!("\u{2726} alab kitty \u{00B7} {prog} harness \u{25CF} on");
             let top_on = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
             assert!(
-                top_on.contains(&expected_badge),
-                "{prog}: active harness brands composer top rule: {top_on:?}"
+                top_on.contains(expected_left_logo) && top_on.contains(&expected_badge),
+                "{prog}: active harness brands composer top rule with left tool logo and right toggle: {top_on:?}"
             );
+            let bottom_on =
+                text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row + 2]);
+            assert!(
+                bottom_on.contains("\u{2386} ")
+                    && bottom_on.contains("\u{25f7} weekly ")
+                    && bottom_on.contains("\u{25D0} ctx auto"),
+                "{prog}: standardized bottom rule carries account email, weekly budget, and context: {bottom_on:?}"
+            );
+            if prog == "agy" {
+                assert!(
+                    bottom_on.contains("redacted-user@example.test")
+                        && bottom_on.contains("Google AI Ultra"),
+                    "agy: launch card account email and plan populate standardized footer: {bottom_on:?}"
+                );
+            }
             let card_on = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             assert!(
                 card_on.contains("enhanced by aterm harness") && card_on.contains("autopilot"),
                 "{prog}: active harness draws launch card banner: {card_on:?}"
             );
             assert!(
-                !app.windows[&wid].input_scratch.nova_add.is_empty(),
+                app.windows[&wid]
+                    .claude_card
+                    .painted_layers()
+                    .iter()
+                    .any(|l| l.slot == aterm_core::render::FxSlot::Over
+                        && !l.content.items().is_empty()),
                 "{prog}: active harness draws rainbow kitty"
             );
 

@@ -170,7 +170,7 @@ mod tests {
             0,
             "inheritable here"
         );
-        let probe = format!("[ -e /dev/fd/{raw} ] && exit 3; exit 0");
+        let probe = crate::spawnfd::test_support::held_probe(raw);
 
         let control = crate::spawnfd::test_support::leaky_status("/bin/sh", &["-c", &probe])
             .expect("control spawn");

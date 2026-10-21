@@ -461,7 +461,10 @@ fn control_type(role: Role) -> UIA_CONTROLTYPE_ID {
         Role::ListBoxOption => UIA_ListItemControlTypeId,
         Role::Menu => UIA_MenuControlTypeId,
         Role::MenuItem | Role::MenuItemRadio => UIA_MenuItemControlTypeId,
-        Role::ProgressIndicator => UIA_ProgressBarControlTypeId,
+        // UIA has no meter type: a read-only progress bar with a range value
+        // is the platform's gauge.
+        Role::ProgressIndicator | Role::Meter => UIA_ProgressBarControlTypeId,
+        Role::Grid => UIA_DataGridControlTypeId,
         Role::Status | Role::Alert => UIA_StatusBarControlTypeId,
         Role::Label | Role::Heading | Role::TextRun => UIA_TextControlTypeId,
         _ => UIA_GroupControlTypeId,

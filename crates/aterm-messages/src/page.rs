@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The Settings ▸ Messages page's model: the projection a host builds once
-//! from the center ([`MessagesState::of`]) (every record newest first, the
+//! from the center ([`MessagesState::of`]) (every record newest first, one a
+//! later row tells on as part of that row, the
 //! live rows in their current words, the band row each is on, whether each
 //! authored intent can still be pressed, the tags in the chips' order) and the
 //! rules and words the page reads it through: the plain words of a state, a
@@ -16,7 +17,7 @@
 //! host performed ([`act_feedback`]).
 //!
 //! It also holds the page's chrome words ([`HEADING`], [`SUBTITLE`],
-//! [`severity_segment_words`], [`ALL_TAGS`], [`Chip::label`],
+//! [`SUBTITLE_OPEN_FIRST`], [`severity_segment_words`], [`ALL_TAGS`], [`Chip::label`],
 //! [`tag_menu_label`], [`tag_menu_name`], [`COPY_ALL`], [`copy_all_text`],
 //! [`EMPTY`], [`NO_MATCH`], [`SHOW_ALL`], [`MessageView::meta_words`],
 //! [`TECHNICAL`], [`button_label`], [`COPY`]). A host's own affordances keep their words
@@ -77,6 +78,12 @@ pub const HEADING: &str = "Messages";
 /// never on the band, so the log is what aterm reported, not only what it
 /// told you. One line at every width.
 pub const SUBTITLE: &str = "What aterm reported, newest first.";
+
+/// [`SUBTITLE`] while an open exception leads the list: one is placed first
+/// whatever its age ([`MessagesState::of`]), so the list is not newest first
+/// and the page says what it is instead ([`MessagesState::subtitle`]). One
+/// line at every width.
+pub const SUBTITLE_OPEN_FIRST: &str = "What aterm reported, open items first.";
 
 /// The page's one line where the log is empty, in place of its filters and
 /// its list.
@@ -249,8 +256,16 @@ pub struct MessagesState {
     /// The wall clock at the build, for the relative times.
     pub now_unix_ms: u64,
     /// Every record in the ring, newest first, but one a later row tells
-    /// the story of on (it stands for it); at most `LOG_CAP`.
+    /// the story of on (it stands for it, [`Self::told_on`]); at most
+    /// `LOG_CAP`.
     pub entries: Vec<MessageView>,
+    /// `(told on, standing)`: every record of the ring a later row tells the
+    /// story of on, by raw id, and the entry that stands for it now, a chain
+    /// followed to its head. A host re-points what it holds by a record's id
+    /// (the open entry, the focused row, a deep link) through it
+    /// ([`Self::standing_for`]), so an entry that moved on stays open as the
+    /// row that tells it now.
+    pub told_on: Vec<(u64, u64)>,
     /// `(tag, count)` for every tag present, in [`tags::ALL`] then first-seen
     /// order: the page's filter chips.
     pub tags: Vec<(String, usize)>,
@@ -279,6 +294,7 @@ impl MessagesState {
             revision: 0,
             now_unix_ms: 0,
             entries: Vec::new(),
+            told_on: Vec::new(),
             tags: Vec::new(),
             log_folder: None,
             saved: true,
@@ -292,8 +308,84 @@ impl MessagesState {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// The page's subtitle over this projection: [`SUBTITLE_OPEN_FIRST`]
+    /// while an open exception leads the list (it stands first whatever its
+    /// age, so newer records follow it), else [`SUBTITLE`].
+    #[must_use]
+    pub fn subtitle(&self) -> &'static str {
+        if self
+            .entries
+            .first()
+            .is_some_and(|entry| entry.state == "review")
+        {
+            SUBTITLE_OPEN_FIRST
+        } else {
+            SUBTITLE
+        }
+    }
+
+    /// The entry that stands for record `id` now, where a later row tells
+    /// its story on ([`Self::told_on`]); `None` for a record that is its own
+    /// entry, or one the ring no longer holds.
+    #[must_use]
+    pub fn standing_for(&self, id: u64) -> Option<u64> {
+        self.told_on
+            .iter()
+            .find(|(told, _)| *told == id)
+            .map(|(_, standing)| *standing)
+    }
+
+    /// When to reread this projection's time words: their next change on its
+    /// own wall clock ([`words::words_change_after`] over every entry, the
+    /// ones a filter hides too), or within a day to recheck the zone. `None`
+    /// with no entry: an empty page says no time, so nothing is owed for the
+    /// clock.
+    ///
+    /// `offset_at` is the reader's zone: its offset from UTC, in seconds, at
+    /// an instant (unix ms). The words are read on [`Self::utc_offset_s`], the
+    /// offset at the build; a zone that moves its offset re-reads every local
+    /// clock word (`9:02 AM` becomes `10:02 AM`) and turns its day words at
+    /// another midnight. With at most one offset change in the capped span,
+    /// halving it finds the change within one second; the publish reads the
+    /// zone again. This is not a search for arbitrary multiple transitions.
+    /// A stamp far ahead of the clock can keep its words for months: the daily
+    /// recheck keeps such a span from hiding a pair of seasonal changes whose
+    /// ending offset is the build's again.
+    #[must_use]
+    pub fn words_change_at(&self, offset_at: impl Fn(u64) -> Option<i64>) -> Option<u64> {
+        // The lead column reads each entry's own stamp, the meta line its
+        // story's start.
+        let at = self
+            .entries
+            .iter()
+            .flat_map(|entry| [entry.at_unix_ms, entry.began_unix_ms])
+            .map(|at| words::words_change_after(self.now_unix_ms, at, self.utc_offset_s))
+            .min()?
+            .min(self.now_unix_ms.saturating_add(86_400_000));
+        // A zone that cannot be read at an instant keeps the build's offset.
+        let same_offset =
+            |instant: u64| offset_at(instant).is_none_or(|offset| offset == self.utc_offset_s);
+        if same_offset(at) {
+            return Some(at);
+        }
+        // The offset reads otherwise by `at`: the first second it does,
+        // within one, and never before the build.
+        let (mut same, mut moved) = (self.now_unix_ms, at);
+        while moved.saturating_sub(same) > 1_000 {
+            let mid = same + (moved - same) / 2;
+            if same_offset(mid) {
+                same = mid;
+            } else {
+                moved = mid;
+            }
+        }
+        Some(moved)
+    }
+
     /// The projection, built once from the ring: every record newest first
-    /// (one a later row replaced is that row's past, not a row of its own),
+    /// (one a later row replaced is that row's past, not a row of its own,
+    /// but a failure only a failure tells on: [`Self::told_on`]; the row
+    /// standing for it starts when it did, [`MessageView::began_unix_ms`]),
     /// the live rows in their current words, the band row each is on (echoes
     /// counted), and whether each authored intent can still be pressed
     /// ([`MessageView::of`]). Tag counts in the chips' order: [`tags::ALL`]
@@ -316,12 +408,27 @@ impl MessagesState {
         // page whatever its age, so it is never buried under newer records.
         let mut to_look_at = Vec::new();
         let mut counts: Vec<(String, usize)> = Vec::new();
+        // (told on, the entry standing for it), and each standing entry's
+        // story start: the earliest stamp of the records it stands for.
+        let mut told_on: Vec<(u64, u64)> = Vec::new();
+        let mut began: Vec<(u64, u64)> = Vec::new();
         for rec in log.records().rev() {
             // ONE FACT, ONE ROW: a record a later row tells the story of on
             // (a keyed post in new words, a notice moved to its next state, an
             // exception taking over a row) is that row's past, not a row of its
-            // own; the `messages` verb still prints it, `superseded`.
-            if told_on(log, rec) {
+            // own; the `messages` verb still prints it, `superseded`. Newest
+            // first, its successor was met already, so a chain resolves to the
+            // entry at its head.
+            if let Some(by) = told_on_by(log, rec) {
+                let standing = told_on
+                    .iter()
+                    .find(|(id, _)| *id == by.raw())
+                    .map_or(by.raw(), |(_, standing)| *standing);
+                told_on.push((rec.id.raw(), standing));
+                match began.iter_mut().find(|(id, _)| *id == standing) {
+                    Some((_, at)) => *at = (*at).min(rec.stamp.unix_ms),
+                    None => began.push((standing, rec.stamp.unix_ms)),
+                }
                 continue;
             }
             let live = center.live(rec.id);
@@ -356,6 +463,11 @@ impl MessagesState {
             });
         }
         entries.splice(0..0, to_look_at);
+        for (id, at) in began {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.began_unix_ms = entry.began_unix_ms.min(at);
+            }
+        }
         let mut chips: Vec<(String, usize)> = tags::ALL
             .iter()
             .map(|tag| tag.as_str())
@@ -375,6 +487,7 @@ impl MessagesState {
             revision: center.projection_revision(),
             now_unix_ms,
             entries,
+            told_on,
             tags: chips,
             log_folder: host.log_folder(),
             saved: host.saved(),
@@ -393,6 +506,14 @@ pub struct MessageView {
     pub id: u64,
     /// The wall clock at ingress.
     pub at_unix_ms: u64,
+    /// When what the entry tells began: the earliest stamp of the records it
+    /// stands for ([`MessagesState::told_on`]: a lost login's sign-in before
+    /// the cancel that replaced it), its own [`Self::at_unix_ms`] where it
+    /// stands for none. The meta line's clock and an outcome's span (`took`,
+    /// `lasted`, `ended with a problem after`) read from it; the lead column,
+    /// the day sections, Copy and the row's own time on the band (`shown
+    /// for`) keep the entry's stamp.
+    pub began_unix_ms: u64,
     /// The reporter family.
     pub tag: String,
     /// The wire word: `success` / `info` / `warn` / `error`.
@@ -523,6 +644,7 @@ impl MessageView {
         let mut view = Self {
             id: rec.id.raw(),
             at_unix_ms: rec.stamp.unix_ms,
+            began_unix_ms: rec.stamp.unix_ms,
             tag: rec.tag.as_str().to_string(),
             severity: severity.as_str(),
             glyph: cut_off_mark(glyph, severity, state).ch(),
@@ -589,13 +711,20 @@ impl MessageView {
     /// stood: `showing now`, `waiting to show`, `shown for 2 min`, `recorded`
     /// (never on the band), `replaced by a newer message after 40 s`,
     /// `answered: Not now`, `took 40 s` (delivered or fixed), `lasted 40 s`
-    /// (ended with no outcome), `ended with a problem after 3 h`. The wire
-    /// keeps its own words ([`MessageView::state`], `copy_text`).
+    /// (ended with no outcome), `ended with a problem after 3 h`. An
+    /// outcome's span (`took`, `lasted`, `ended with a problem after`) runs
+    /// from when what the entry tells began ([`Self::began_unix_ms`]: a lost
+    /// login fixed took from its first notice); the row's own time (`shown
+    /// for`, `stopped reporting after`) from its own stamp. The wire keeps its
+    /// own words ([`MessageView::state`], `copy_text`).
     #[must_use]
     pub fn state_words(&self) -> String {
-        let span = self
-            .retired_unix_ms
-            .map(|at| span_words(at.saturating_sub(self.at_unix_ms)));
+        let span_from = |from: u64| {
+            self.retired_unix_ms
+                .map(|at| span_words(at.saturating_sub(from)))
+        };
+        let span = span_from(self.at_unix_ms);
+        let story = span_from(self.began_unix_ms);
         let after = |words: &str| match &span {
             Some(span) => format!("{words} after {span}"),
             None => words.to_string(),
@@ -632,13 +761,16 @@ impl MessageView {
             // or a problem that was fixed (its record now reads ✓ Success)
             // took its span; anything else withdrawn lasted it, never the
             // wire's `withdrawn`, nor `done` under a fixed warning.
-            "resolved-ok" | "withdrawn" => match (&span, self.severity) {
+            "resolved-ok" | "withdrawn" => match (&story, self.severity) {
                 (Some(span), "success") => format!("took {span}"),
                 (Some(span), _) => format!("lasted {span}"),
                 (None, "success") => "finished".to_string(),
                 (None, _) => "ended".to_string(),
             },
-            "resolved-warn" => after("ended with a problem"),
+            "resolved-warn" => match &story {
+                Some(span) => format!("ended with a problem after {span}"),
+                None => "ended with a problem".to_string(),
+            },
             "dismissed" => "dismissed".to_string(),
             "answered" => match &self.answer {
                 Some(label) => format!("answered: {label}"),
@@ -711,16 +843,17 @@ impl MessageView {
             .any(|l| l.starts_with(char::is_whitespace))
     }
 
-    /// An expanded entry's meta line: the local time it was stamped
-    /// ([`words::local_words`] on a clock `utc_offset_s` from UTC, read at
-    /// `now_unix_ms`), its state in plain words ([`MessageView::state_words`])
-    /// and, for a post folded in more than once, `×N`: `Today 12:53:49 PM ·
-    /// showing now · ×3`. Unwrapped: a host wraps it to its own measure.
+    /// An expanded entry's meta line: the local time what it tells began
+    /// ([`Self::began_unix_ms`], [`words::local_words`] on a clock
+    /// `utc_offset_s` from UTC, read at `now_unix_ms`), its state in plain
+    /// words ([`MessageView::state_words`]) and, for a post folded in more
+    /// than once, `×N`: `Today 12:53:49 PM · showing now · ×3`. Unwrapped: a
+    /// host wraps it to its own measure.
     #[must_use]
     pub fn meta_words(&self, now_unix_ms: u64, utc_offset_s: i64) -> String {
         let meta = format!(
             "{} \u{00b7} {}",
-            words::local_words(now_unix_ms, self.at_unix_ms, utc_offset_s),
+            words::local_words(now_unix_ms, self.began_unix_ms, utc_offset_s),
             self.state_words()
         );
         if self.repeats > 1 {
@@ -847,8 +980,10 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         // The keeper's recovered sessions are ended from the live row only.
         Intent::NotNow { .. }
         | Intent::StopPaste { .. }
-        | Intent::ShowTab { .. }
+        | Intent::ShowSession { .. }
         | Intent::EndRecovered => live,
+        // An old ordinal has no destination identity to revalidate.
+        Intent::ShowTab { .. } => false,
         Intent::ApplyUpdate { build } => host.staged_build() == Some(*build),
         Intent::OpenPath { path } => host.is_regular_file(path),
         // A navigation's moment never passes; whether it is pressable is
@@ -875,12 +1010,25 @@ pub(crate) fn cut_off_mark(glyph: Glyph, severity: Severity, state: &str) -> Gly
     }
 }
 
-/// Whether `rec` was replaced by a LATER record the ring still holds
-/// ([`Retired::Superseded`]): the row that tells its story on stands for it on
+/// The LATER record that tells `rec`'s story on, when there is one: the
+/// record it was replaced by ([`Retired::Superseded`]), which stands for it on
 /// the page. A replacement the ring no longer holds, or one that would point
 /// back (no chain can loop), leaves the record its own row, `replaced`.
-fn told_on(log: &crate::log::MessageLog, rec: &LogRecord) -> bool {
-    matches!(rec.retired(), Some(Retired::Superseded { by }) if *by > rec.id && log.get(*by).is_some())
+///
+/// A FAILURE IS TOLD ON ONLY BY A FAILURE: an `✕` record stands for itself
+/// unless the record that replaced it was posted an `✕` too
+/// ([`LogRecord::posted_severity`]). A script's error replaced by a retry
+/// under its key (`notice progress`, then `done ok`) keeps its own `replaced`
+/// row in Problems, as an error whose row folded before the retry came does,
+/// so whether a failure stays listed never hangs on when the next word came.
+/// One failure told again in new words (a file that still does not load, a
+/// disk still full) is one row, the latest, and stays one once that is fixed.
+fn told_on_by(log: &crate::log::MessageLog, rec: &LogRecord) -> Option<MessageId> {
+    let Some(Retired::Superseded { by }) = rec.retired() else {
+        return None;
+    };
+    let next = log.get(*by).filter(|_| *by > rec.id)?;
+    (rec.severity != Severity::Error || next.posted_severity == Severity::Error).then_some(*by)
 }
 
 /// Whether `intent` is a word for a tab whose upgrade this host does not have
@@ -934,6 +1082,8 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::StopPaste { .. }, false) => "The paste had already finished".to_string(),
         (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
         (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
+        (Intent::ShowSession { .. }, true) => "Showed session".to_string(),
+        (Intent::ShowSession { .. }, false) => "That session is gone".to_string(),
         // Written off this thread and queued, not done: what it did lands as
         // the pressed entry's own words, or as a row if the harness refuses it.
         (Intent::AgentUpgrade { .. }, true) => {
@@ -1172,9 +1322,10 @@ impl MessagesState {
 ///   ([`MessagesState::severity_counts`]); the count line ([`status_words`],
 ///   empty for an empty log, which shows no count); the not-saved note
 ///   ([`NOT_SAVED`]) only while unsaved; the log folder only where there is
-///   one. Then the chrome: the [`HEADING`] and the [`SUBTITLE`]; the severity
-///   segments' words over those counts ([`severity_segment_words`]); the first
-///   tag chip's words ([`ALL_TAGS`]) and whether it is down (no tag filter);
+///   one. Then the chrome: the [`HEADING`] and the subtitle
+///   ([`MessagesState::subtitle`]); the severity segments' words over those
+///   counts ([`severity_segment_words`]); the first tag chip's words
+///   ([`ALL_TAGS`]) and whether it is down (no tag filter);
 ///   the tag pop-up's painted words and spoken name ([`tag_menu_label`],
 ///   [`tag_menu_name`]); the count line's report button and its spoken name
 ///   ([`COPY_ALL`], [`COPY_ALL_NAME`]), pressable while `shown` is above 0 (a
@@ -1301,7 +1452,7 @@ fn page_line(state: &MessagesState, filter: &MessagesFilter, shown: usize) -> St
     }
     let (all_words, problems_words) = severity_segment_words(all, problems);
     head.field("heading", HEADING)
-        .field("subtitle", SUBTITLE)
+        .field("subtitle", state.subtitle())
         .field("all_words", &all_words)
         .field("problems_words", &problems_words)
         .field("all_tags", ALL_TAGS)
@@ -1326,7 +1477,7 @@ fn entry_line(state: &MessagesState, clock: MessagesClock, entry: &MessageView) 
         .field("when", &clock.when(entry.at_unix_ms))
         .field(
             "local",
-            &words::local_words(state.now_unix_ms, entry.at_unix_ms, state.utc_offset_s),
+            &words::local_words(state.now_unix_ms, entry.began_unix_ms, state.utc_offset_s),
         )
         .field("tag", &entry.tag)
         .field("tag_words", &tag_words(&entry.tag))

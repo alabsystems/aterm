@@ -103,13 +103,16 @@ pub(super) fn stable_wasm32() -> Result<PathBuf, LaneRun> {
     {
         return Err(LaneRun::skip(
             "node not found; the toy runs under node",
-            crate::install_fix("node", "node", "nodejs"),
+            aterm_uds::host::tool("node").remedy(),
         ));
     }
     let Some(rustup) = crate::rustup::find_rustup() else {
         return Err(LaneRun::skip(
             format!("no rustup ({})", crate::rustup::RUSTUP_LOOKED),
-            "install rustup (https://rustup.rs) and the stable wasm32 target",
+            format!(
+                "{}, with stable's wasm32 std",
+                aterm_uds::host::tool("rustup").remedy()
+            ),
         ));
     };
     let has_target = command(&rustup)

@@ -30,8 +30,19 @@
 //!   top-left corner before that tap (Mutter makes the pointer with its first
 //!   motion and announces it to the window a frame later, before the keyboard
 //!   made after it), so every step's motion reaches a seat that has it.
+//!   When they drive a finger, a tap in that corner makes the touchscreen
+//!   (no client hears the first touch either); the client must have bound
+//!   it before a finger step reaches it, which the lab awaits with a file.
 //!   The session ends once the frame is inactive again. An `<app>` of `-`
 //!   awaits no frame: the client paces the steps with files of its own;
+//! * `xseat <app> <app-pid> <step>...`: `seat`'s steps faked through XTEST on
+//!   the X display `DISPLAY` names ([`xtest`]): the input of weston's x11
+//!   backend nested in that display, whose seat reads its X window. Its
+//!   keyboard and pointer are weston's for as long as weston runs, so no key
+//!   primes them and the frame keeps the focus after the steps; they start
+//!   once the frame is `active`, and a pointer session parks the pointer in
+//!   the top-left corner first, as `seat`'s does. A key is pressed only where
+//!   the X keymap's first level holds its keysym; XTEST fakes no finger;
 //! * `xdnd <window> <uri> <marks-dir>`: an XDND drag source, a second X
 //!   client on the display `DISPLAY` names, that drags `<uri>` over the X
 //!   window `<window>` and away, then over it and drops it ([`xdnd`]);
@@ -48,14 +59,19 @@
 //!   many logical pixels: RemoteDesktop moves it absolutely only inside a
 //!   screencast stream, relatively always) and `move:@PATH` (by the `DX DY`
 //!   the file holds when the step runs, so the lab can aim from what the
-//!   window reports), `sleep:MS` (a key held that long: a stimulus, never a
-//!   wait), `touch:PATH` (create the file: the lab waits for it) and
-//!   `wait:PATH` (until the lab creates it; the devices live until the
-//!   session's last step). A key `K` is an X keysym, by name or `0x…`.
+//!   window reports), `finger-down:X,Y`, `finger-move:X,Y` and `finger-up:`
+//!   (a touchscreen's finger, at a point of the screen in its pixels, or
+//!   `@PATH` for the `X Y` a file holds: RemoteDesktop places a finger only
+//!   in a screencast stream's space, so a session with a finger records the
+//!   primary monitor, which needs pipewire), `sleep:MS` (a key held that
+//!   long: a stimulus, never a wait), `touch:PATH` (create the file: the lab
+//!   waits for it) and `wait:PATH` (until the lab creates it; the devices
+//!   live until the session's last step). A key `K` is an X keysym, by name
+//!   or `0x…`.
 //!
 //! Exit 0 done, 1 failed, 2 usage, 3 not available here (no accessibility
-//! bus, no such application, no Mutter, no X server): the lane reads 3 as NOT
-//! RUN.
+//! bus, no such application, no Mutter, no X server, no XTEST): the lane reads
+//! 3 as NOT RUN.
 //!
 //! Untrusted input: every reply comes from another process on the bus; a
 //! reading this tool cannot make sense of is printed as `ERR(<why>)` in its
@@ -69,6 +85,8 @@ mod unix;
 mod xdnd;
 #[cfg(unix)]
 mod xgrab;
+#[cfg(unix)]
+mod xtest;
 
 fn main() -> ExitCode {
     #[cfg(unix)]

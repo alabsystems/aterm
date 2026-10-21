@@ -7,7 +7,10 @@
 //!
 //! The lane pins Playwright's build of Firefox, a zip it unpacks into a user
 //! cache as it does chrome-headless-shell (Mozilla ships Firefox for macOS
-//! as a disk image to install). `-headless` runs it with no window. Nothing
+//! as a disk image to install), for macOS on Apple silicon and for Ubuntu
+//! 24.04 on aarch64 (the Linux lane's guest). `-headless` runs it with no
+//! window; on Linux it still makes its WebGL context on an X display
+//! ([`display_missing`]). Nothing
 //! drives it over a protocol: it opens the cpu page with
 //! `?post=1&next=gpu,worker` on its command line, and each page POSTs its
 //! answer to the lane's server ([`super::serve::Server::answer`]) and opens
@@ -17,7 +20,7 @@
 //! the pinned build in this machine's cache (`verify fetch-browser` puts it
 //! there). Neither is a COULD NOT RUN naming the fetch.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// Playwright's Firefox build the lane pins (Firefox 155.0, built
@@ -37,14 +40,27 @@ pub(crate) struct Pinned {
     pub binary: &'static str,
 }
 
-/// The pinned archives, one per platform the lane has run Firefox on.
-pub(crate) const PINNED: [Pinned; 1] = [Pinned {
-    platform: "mac-arm64",
-    archive: "firefox-mac-arm64.zip",
-    sha256: "12798eac57cad33a466d7315ddae1350a326dedd167ee4ac73307425f4fa8f28",
-    bytes: 109_388_736,
-    binary: "firefox/Nightly.app/Contents/MacOS/firefox",
-}];
+/// The pinned archives, one per platform the lane has run Firefox on. The
+/// build for x86_64 Linux (`firefox-ubuntu-24.04.zip`) gave no answer in 280 s
+/// under Rosetta in the Linux lane's guest, with or without its sandboxes, so
+/// it is not pinned: no x86_64 Linux host has run it
+/// (docs/measured/linux-browser-2026-10-20.md).
+pub(crate) const PINNED: [Pinned; 2] = [
+    Pinned {
+        platform: "mac-arm64",
+        archive: "firefox-mac-arm64.zip",
+        sha256: "12798eac57cad33a466d7315ddae1350a326dedd167ee4ac73307425f4fa8f28",
+        bytes: 109_388_736,
+        binary: "firefox/Nightly.app/Contents/MacOS/firefox",
+    },
+    Pinned {
+        platform: "ubuntu-24.04-arm64",
+        archive: "firefox-ubuntu-24.04-arm64.zip",
+        sha256: "10a0c716eb93ee7e57aabf8d626bd35b5c4007517c90708f67634f640a47a569",
+        bytes: 105_297_546,
+        binary: "firefox/firefox",
+    },
+];
 
 /// The environment variable naming a Firefox to run instead.
 pub(crate) const FIREFOX_ENV: &str = "ATERM_FIREFOX";
@@ -68,8 +84,24 @@ pub(crate) fn fix() -> &'static str {
 pub(crate) fn platform_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("mac-arm64"),
+        ("linux", "aarch64") => Some("ubuntu-24.04-arm64"),
         _ => None,
     }
+}
+
+/// Why Firefox can make no WebGL2 context on `os` with `display` (the
+/// `DISPLAY` it would inherit), if it cannot. On Linux it makes the context
+/// on an X display even under `-headless`: measured with build 1543 on
+/// Ubuntu 24.04 aarch64, with no `DISPLAY` every context failed ("tryNativeGL
+/// … Exhausted GL driver options"), and under an Xvfb it drew on Mesa's
+/// llvmpipe, still with no window. So a Linux host without a display is NOT
+/// RUN, never a page that fails.
+pub(crate) fn display_missing(os: &str, display: Option<&OsStr>) -> Option<String> {
+    (os == "linux" && display.is_none_or(OsStr::is_empty)).then(|| {
+        "Firefox on Linux makes its WebGL2 context on an X display, even headless, and \
+         DISPLAY is not set (an Xvfb will do)"
+            .to_string()
+    })
 }
 
 /// This host's pinned archive, if it has one.
@@ -137,13 +169,18 @@ pub(crate) fn find() -> Result<Firefox, String> {
 
 /// The lane's profile preferences (its `user.js`). The unmasked renderer
 /// names the adapter as Chromium's does (Firefox otherwise reports a
-/// family, "Apple M1, or similar"); `performance.now()` keeps its
+/// family, "Apple M1, or similar"); WebGL is forced past Firefox's driver
+/// blocklist, which refuses WebGL2 on Mesa's llvmpipe ("AllowWebgl2:false
+/// restricts context creation on this system", measured in the Linux lane's
+/// guest), and the session is held to the adapter it names all the same;
+/// `performance.now()` keeps its
 /// microseconds (Firefox otherwise rounds the page's timings to 1 ms);
 /// fingerprinting protection, which can perturb a canvas readback, is off;
 /// colour management is off, so a canvas copy is not converted; and
 /// nothing first-run, updating or reporting starts.
 pub(crate) const PREFS: &str = "\
 user_pref(\"webgl.sanitize-unmasked-renderer\", false);
+user_pref(\"webgl.force-enabled\", true);
 user_pref(\"privacy.reduceTimerPrecision\", false);
 user_pref(\"privacy.resistFingerprinting\", false);
 user_pref(\"privacy.fingerprintingProtection\", false);
@@ -253,7 +290,13 @@ mod tests {
     fn the_pin_maps_to_its_archive_and_cache_dir() {
         assert_eq!(platform_for("macos", "aarch64"), Some("mac-arm64"));
         assert_eq!(platform_for("macos", "x86_64"), None);
+        assert_eq!(platform_for("linux", "aarch64"), Some("ubuntu-24.04-arm64"));
         assert_eq!(platform_for("linux", "x86_64"), None);
+        assert_eq!(
+            archive_url(&PINNED[1]),
+            "https://cdn.playwright.dev/dbazure/download/playwright/builds/firefox/1543/\
+             firefox-ubuntu-24.04-arm64.zip"
+        );
         assert_eq!(
             archive_url(&PINNED[0]),
             "https://cdn.playwright.dev/dbazure/download/playwright/builds/firefox/1543/\
@@ -327,6 +370,16 @@ mod tests {
         );
         remove_home(&home);
         assert!(!home.exists());
+    }
+
+    /// Linux needs an X display for WebGL2, set and not empty; macOS needs
+    /// none.
+    #[test]
+    fn firefox_on_linux_needs_a_display() {
+        assert!(display_missing("linux", None).is_some());
+        assert!(display_missing("linux", Some(OsStr::new(""))).is_some());
+        assert!(display_missing("linux", Some(OsStr::new(":91"))).is_none());
+        assert!(display_missing("macos", None).is_none());
     }
 
     /// Only a host with a pin is told to fetch one.

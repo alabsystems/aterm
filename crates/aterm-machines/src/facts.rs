@@ -142,15 +142,37 @@ pub fn user(sys: &dyn System, name: &str) -> Result<User, String> {
 /// twice (one keyboard on two services) is listed once, built in if any row says so.
 #[must_use]
 pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
+    hidutil_keyboards_from(text, false).unwrap_or_default()
+}
+
+/// A service census used to establish every local keyboard obligation. Unlike
+/// the best-effort facts projection, unknown headers or nonempty unparsed rows
+/// cannot establish an empty or partial census. A genuinely empty Services
+/// section is valid, including when it has no table header.
+pub(crate) fn parse_hidutil_keyboards_complete(text: &str) -> Result<Vec<Keyboard>, String> {
+    hidutil_keyboards_from(text, true)
+}
+
+fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, String> {
+    let invalid =
+        || "hidutil did not return a complete, recognized keyboard service list".to_owned();
     let sectioned = text
         .lines()
         .any(|l| l.trim_end() == "Services:" || l.trim_end() == "Devices:");
     let mut in_services = !sectioned;
     let mut columns: Option<Vec<(String, usize)>> = None;
     let mut out: Vec<Keyboard> = Vec::new();
+    let mut services = false;
     for row in text.lines() {
         let trimmed = row.trim_end();
         if sectioned && !row.starts_with(' ') && trimmed.ends_with(':') {
+            if complete {
+                match trimmed {
+                    "Services:" if !services => services = true,
+                    "Devices:" => {}
+                    _ => return Err(invalid()),
+                }
+            }
             in_services = trimmed == "Services:";
             columns = None;
             continue;
@@ -159,7 +181,21 @@ pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
             continue;
         }
         let Some(cols) = &columns else {
-            columns = Some(header_columns(row));
+            let header = header_columns(row);
+            if complete
+                && ["VendorID", "ProductID", "Product", "Built-In"]
+                    .iter()
+                    .any(|required| {
+                        header
+                            .iter()
+                            .filter(|(name, _)| name.as_str() == *required)
+                            .count()
+                            != 1
+                    })
+            {
+                return Err(invalid());
+            }
+            columns = Some(header);
             continue;
         };
         let field = |name: &str| column(row, cols, name);
@@ -167,10 +203,21 @@ pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
             field("VendorID").and_then(|v| parse_hex(&v)),
             field("ProductID").and_then(|v| parse_hex(&v)),
         ) else {
+            if complete {
+                return Err(invalid());
+            }
             continue;
         };
         // Built-In is the last column; its last word is its value whatever the alignment.
-        let builtin = trimmed.split_whitespace().last() == Some("1");
+        let builtin = if complete {
+            match trimmed.split_whitespace().last() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => return Err(invalid()),
+            }
+        } else {
+            trimmed.split_whitespace().last() == Some("1")
+        };
         let name = field("Product").unwrap_or_default();
         match out
             .iter_mut()
@@ -185,7 +232,11 @@ pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
             }),
         }
     }
-    out
+    if complete && !services {
+        Err(invalid())
+    } else {
+        Ok(out)
+    }
 }
 
 /// The `hidutil list` run that names the keyboards.
@@ -497,6 +548,261 @@ fn parse_hex(text: &str) -> Option<u32> {
     u32::from_str_radix(text.strip_prefix("0x")?, 16).ok()
 }
 
+/// Gather live system telemetry ([`crate::protocol::HostVitals`]) from non-privileged OS
+/// readers (`sysctl`, `vm_stat`, `df -k /`, `ioreg -r -d 1 -c IOAccelerator`).
+///
+/// Returns `None` when no vitals tool answered (such as in a minimal fake test fixture).
+#[must_use]
+pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::protocol::HostVitals> {
+    let cpu_cores = line(sys, &Cmd::new("/usr/sbin/sysctl").args(["-n", "hw.ncpu"]))
+        .parse::<u32>()
+        .unwrap_or(0);
+    let load_avg_100 = run(
+        sys,
+        &Cmd::new("/usr/sbin/sysctl").args(["-n", "vm.loadavg"]),
+    )
+    .filter(Ran::success)
+    .and_then(|r| parse_loadavg(&r.out()));
+    let vm_stat_parsed = run(sys, &Cmd::new("/usr/bin/vm_stat"))
+        .filter(Ran::success)
+        .and_then(|r| parse_vm_stat(&r.out()));
+    let swap_used_bytes = run(
+        sys,
+        &Cmd::new("/usr/sbin/sysctl").args(["-n", "vm.swapusage"]),
+    )
+    .filter(Ran::success)
+    .and_then(|r| parse_swapusage(&r.out()));
+    let mem_pressure = match line(
+        sys,
+        &Cmd::new("/usr/sbin/sysctl").args(["-n", "kern.memorystatus_vm_pressure_level"]),
+    )
+    .as_str()
+    {
+        "1" => Some("normal".to_owned()),
+        "2" => Some("warn".to_owned()),
+        "4" => Some("critical".to_owned()),
+        _ => None,
+    };
+    let df_parsed = run(sys, &Cmd::new("/bin/df").args(["-k", "/"]))
+        .filter(Ran::success)
+        .and_then(|r| parse_df_k(&r.out()));
+    let gpu_parsed = run(
+        sys,
+        &Cmd::new("/usr/sbin/ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]),
+    )
+    .filter(Ran::success)
+    .and_then(|r| parse_ioreg_gpu(&r.out()));
+
+    if cpu_cores == 0
+        && load_avg_100.is_none()
+        && vm_stat_parsed.is_none()
+        && df_parsed.is_none()
+        && gpu_parsed.is_none()
+    {
+        return None;
+    }
+
+    let cpu_busy_pct = load_avg_100.and_then(|[l1, _, _]| {
+        (cpu_cores > 0).then(|| (l1.saturating_mul(100) / (cpu_cores * 100)).min(100) as u8)
+    });
+    let (mem_used_bytes, mem_wired_bytes, mem_compressed_bytes) = match vm_stat_parsed {
+        Some((used, wired, comp)) => (used, Some(wired), Some(comp)),
+        None => (0, None, None),
+    };
+    let (disk_total_bytes, disk_used_bytes, disk_avail_bytes) =
+        df_parsed.unwrap_or((facts.disk_bytes, 0, 0));
+    let (gpu_name, gpu_busy_pct) = match gpu_parsed {
+        Some((name, pct)) => (name, pct),
+        None => (None, None),
+    };
+    let uptime_secs = (facts.boot_time > 0)
+        .then(|| sys.now().saturating_sub(facts.boot_time))
+        .filter(|u| *u > 0);
+
+    Some(crate::protocol::HostVitals {
+        cpu_cores,
+        cpu_busy_pct,
+        load_avg_100,
+        gpu_name,
+        gpu_busy_pct,
+        gpu_temp_c: None,
+        gpu_power_deciwatts: None,
+        mem_total_bytes: facts.memory_bytes,
+        mem_used_bytes: mem_used_bytes.min(facts.memory_bytes.max(mem_used_bytes)),
+        mem_wired_bytes,
+        mem_compressed_bytes,
+        swap_used_bytes,
+        mem_pressure,
+        disk_total_bytes,
+        disk_used_bytes,
+        disk_avail_bytes,
+        uptime_secs,
+        rtt_us: None,
+    })
+}
+
+/// Parse `sysctl -n vm.loadavg` (`{ 1.80 1.49 1.58 }`) or `/proc/loadavg` (`1.10 1.59 1.22 ...`)
+/// into `[1m, 5m, 15m]` scaled by 100.
+#[must_use]
+pub fn parse_loadavg(text: &str) -> Option<[u32; 3]> {
+    let mut vals = text
+        .split(|c: char| c.is_whitespace() || matches!(c, '{' | '}'))
+        .filter(|tok| !tok.is_empty())
+        .filter_map(|tok| tok.parse::<f64>().ok());
+    let l1 = (vals.next()?.max(0.0) * 100.0).round() as u32;
+    let l5 = (vals.next()?.max(0.0) * 100.0).round() as u32;
+    let l15 = (vals.next()?.max(0.0) * 100.0).round() as u32;
+    Some([l1, l5, l15])
+}
+
+/// Parse macOS `vm_stat` into `(used_bytes, wired_bytes, compressed_bytes)`.
+#[must_use]
+pub fn parse_vm_stat(text: &str) -> Option<(u64, u64, u64)> {
+    let mut page_size = 16_384u64;
+    if let Some(first) = text.lines().next()
+        && let Some((_, after)) = first.split_once("page size of ")
+    {
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(ps) = digits.parse::<u64>()
+            && ps > 0
+        {
+            page_size = ps;
+        }
+    }
+    let mut active = 0u64;
+    let mut wired = 0u64;
+    let mut compressed = 0u64;
+    let mut anonymous = 0u64;
+    let mut purgeable = 0u64;
+    let mut saw_any = false;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let num_str: String = v
+            .trim()
+            .trim_end_matches('.')
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let Ok(pages) = num_str.parse::<u64>() else {
+            continue;
+        };
+        match k.trim() {
+            "Pages active" => {
+                active = pages;
+                saw_any = true;
+            }
+            "Pages wired down" => {
+                wired = pages;
+                saw_any = true;
+            }
+            "Pages occupied by compressor" => {
+                compressed = pages;
+                saw_any = true;
+            }
+            "Anonymous pages" => {
+                anonymous = pages;
+                saw_any = true;
+            }
+            "Pages purgeable" => {
+                purgeable = pages;
+            }
+            _ => {}
+        }
+    }
+    if !saw_any {
+        return None;
+    }
+    let app_pages = if anonymous > 0 {
+        anonymous.saturating_sub(purgeable)
+    } else {
+        active
+    };
+    let used_bytes = app_pages
+        .saturating_add(wired)
+        .saturating_add(compressed)
+        .saturating_mul(page_size);
+    Some((
+        used_bytes,
+        wired.saturating_mul(page_size),
+        compressed.saturating_mul(page_size),
+    ))
+}
+
+/// Parse `sysctl -n vm.swapusage` (`total = 2048.00M  used = 1043.31M  free = 1004.69M`).
+#[must_use]
+pub fn parse_swapusage(text: &str) -> Option<u64> {
+    let (_, after) = text.split_once("used =")?;
+    let tok = after.split_whitespace().next()?;
+    let unit = tok.chars().last()?;
+    let num: f64 = tok[..tok.len().saturating_sub(1)].parse().ok()?;
+    let mult = match unit {
+        'G' | 'g' => 1024.0 * 1024.0 * 1024.0,
+        'M' | 'm' => 1024.0 * 1024.0,
+        'K' | 'k' => 1024.0,
+        _ => return None,
+    };
+    Some((num.max(0.0) * mult).round() as u64)
+}
+
+/// Parse `df -k /` into `(total_bytes, used_bytes, avail_bytes)`.
+#[must_use]
+pub fn parse_df_k(text: &str) -> Option<(u64, u64, u64)> {
+    let row = text.lines().skip(1).find(|l| !l.trim().is_empty())?;
+    let mut cols = row.split_whitespace();
+    let _fs = cols.next()?;
+    let total_kb = cols.next()?.parse::<u64>().ok()?;
+    let _used_kb = cols.next()?.parse::<u64>().ok()?;
+    let avail_kb = cols.next()?.parse::<u64>().ok()?;
+    let total = total_kb.saturating_mul(1024);
+    let avail = avail_kb.saturating_mul(1024).min(total);
+    let used = total.saturating_sub(avail);
+    Some((total, used, avail))
+}
+
+/// Parse `ioreg -r -d 1 -c IOAccelerator` into `(gpu_name, device_utilization_pct)`.
+#[must_use]
+pub fn parse_ioreg_gpu(text: &str) -> Option<(Option<String>, Option<u8>)> {
+    let mut model = None;
+    let mut cores = None;
+    let mut pct = None;
+    for line in text.lines() {
+        if model.is_none()
+            && let Some((_, rest)) = line.split_once("\"model\" = \"")
+            && let Some(val) = rest.strip_suffix('"')
+            && !val.trim().is_empty()
+        {
+            model = Some(val.trim().to_owned());
+        }
+        if cores.is_none()
+            && let Some((_, rest)) = line.split_once("\"gpu-core-count\" = ")
+            && let Ok(c) = rest.trim().parse::<u32>()
+            && c > 0
+        {
+            cores = Some(c);
+        }
+        if pct.is_none()
+            && let Some((_, rest)) = line.split_once("\"Device Utilization %\"=")
+        {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(p) = digits.parse::<u8>() {
+                pct = Some(p.min(100));
+            }
+        }
+    }
+    if model.is_none() && pct.is_none() {
+        return None;
+    }
+    let gpu_name = match (model, cores) {
+        (Some(m), Some(c)) => Some(format!("{m} ({c}c)")),
+        (Some(m), None) => Some(m),
+        (None, Some(c)) => Some(format!("GPU ({c}c)")),
+        (None, None) => None,
+    };
+    Some((gpu_name, pct))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,6 +1094,30 @@ UserShell: /bin/zsh
                 },
             ]
         );
+        assert_eq!(parse_hidutil_keyboards_complete(VM_HIDUTIL).unwrap(), k);
+        assert_eq!(
+            parse_hidutil_keyboards_complete(LAPTOP_HIDUTIL).unwrap(),
+            parse_hidutil_keyboards(LAPTOP_HIDUTIL)
+        );
+        for empty in ["Services:\n", "Services:\n\nDevices:\n"] {
+            assert!(parse_hidutil_keyboards_complete(empty).unwrap().is_empty());
+        }
+        let malformed_id = VM_HIDUTIL.replacen("0x5ac", "bogus", 1);
+        assert_eq!(parse_hidutil_keyboards(&malformed_id).len(), 1);
+        let partial = VM_HIDUTIL.replacen("Devices:", "unparsed-service-row\nDevices:", 1);
+        for invalid in [
+            "Services:\nUnknownHeader\nnonempty unparsed row\n",
+            "Services:\n\nServices:\n",
+            "Devices:\n",
+            "Services:\nVendorID ProductID Product Built-In\n0x1      0x2       kbd     x\n",
+            malformed_id.as_str(),
+            partial.as_str(),
+        ] {
+            assert!(
+                parse_hidutil_keyboards_complete(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -1047,13 +1377,16 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
 
     #[test]
     fn the_live_keyboard_list_parses_where_hidutil_answers() {
-        // Read-only: `hidutil list` changes nothing. Skips where it is absent or refuses.
-        let Ok(ran) = crate::port::Live::new().run(&hidutil_keyboards()) else {
-            return;
+        // Read-only: `hidutil list` changes nothing. Where it is absent or refuses, the
+        // test ends COULD NOT RUN.
+        let ran = match crate::port::Live::new().run(&hidutil_keyboards()) {
+            Ok(ran) if ran.success() => ran,
+            Ok(ran) => aterm_uds::host::could_not_run(format!(
+                "hidutil refused the keyboard list: {}",
+                ran.describe()
+            )),
+            Err(e) => aterm_uds::host::could_not_run(format!("hidutil did not run: {e:?}")),
         };
-        if !ran.success() {
-            return;
-        }
         let text = ran.out();
         let rows = text
             .split_once("Services:")

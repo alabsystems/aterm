@@ -108,11 +108,25 @@ fn parse_pack_args(args: &[OsString]) -> Result<Option<PackArgs>, String> {
     Ok(Some(parsed))
 }
 
+/// Why `id` names no pack theme: an id a release shipped that has left the
+/// pack names the theme that replaces it, and how to use that one.
+fn no_pack_theme(id: &str) -> String {
+    match aterm_theme_pack::withdrawn(id) {
+        Some(theme) if aterm_theme_pack::find(theme).is_some() => format!(
+            "{id:?} left the pack; the pack theme {theme:?} replaces it: \
+             aterm theme install {theme:?}"
+        ),
+        Some(theme) => format!(
+            "{id:?} left the pack; the built-in theme {theme:?} replaces it: \
+             theme = {theme:?} in aterm.toml"
+        ),
+        None => format!("no pack theme {id:?}; `aterm theme pack` lists them"),
+    }
+}
+
 /// An unknown pack id, as a usage error.
 fn unknown(id: &str) -> Outcome {
-    Outcome::usage_error(&format!(
-        "no pack theme {id:?}; `aterm theme pack` lists them"
-    ))
+    Outcome::usage_error(&no_pack_theme(id))
 }
 
 /// `aterm theme pack …`.
@@ -260,9 +274,7 @@ fn parse_install_args(
         (false, false) => {
             let mut themes = Vec::new();
             for id in &ids {
-                let theme = aterm_theme_pack::find(id).ok_or_else(|| {
-                    format!("no pack theme {id:?}; `aterm theme pack` lists them")
-                })?;
+                let theme = aterm_theme_pack::find(id).ok_or_else(|| no_pack_theme(id))?;
                 if !themes.iter().any(|t: &&PackTheme| t.id == theme.id) {
                     themes.push(theme);
                 }
@@ -505,6 +517,72 @@ mod tests {
         let replaced = theme(&["install", "Iceberg Dark", "--replace"], Some(&dir));
         assert_eq!(replaced.code, 0);
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), iceberg.text);
+    }
+
+    /// A pack theme answers to the name the chooser shows it under too, and
+    /// installs under its id; a copy an earlier release installed under that
+    /// id is listed installed and kept, never doubled. An id a release
+    /// shipped that left the pack is refused, naming the theme that replaces
+    /// it. Negative control: an id nothing ever named names no theme.
+    #[test]
+    fn install_takes_the_shown_name_and_keeps_an_earlier_copy() {
+        let owned = scratch("names");
+        let dir = owned.path().to_path_buf();
+        let renamed = aterm_theme_pack::themes()
+            .iter()
+            .find(|theme| theme.name != theme.id)
+            .expect("premise: a theme shown under another name");
+        let dest = dir.join(format!("{}.conf", renamed.id));
+        let out = theme(&["install", renamed.name], Some(&dir));
+        assert_eq!(out.code, 0, "{out:?}");
+        assert_eq!(files(&dir), [format!("{}.conf", renamed.id)]);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), renamed.text);
+        // The copy an earlier release wrote: shown under its id.
+        let earlier = renamed.text.replacen(
+            &format!("\nname = {}\n", renamed.name),
+            &format!("\nname = {}\n", renamed.id),
+            1,
+        );
+        assert_ne!(earlier, renamed.text, "premise: the name line differs");
+        std::fs::write(&dest, &earlier).unwrap();
+        let listed = theme(&["pack", "--format", "tsv"], Some(&dir));
+        let row = listed
+            .stdout
+            .lines()
+            .find(|line| line.split('\t').next() == Some(renamed.id))
+            .expect("its row");
+        assert_eq!(row.rsplit('\t').next(), Some("installed"), "{row}");
+        for argv in [vec!["install", renamed.id], vec!["install", "--all"]] {
+            let out = theme(&argv, Some(&dir));
+            assert_eq!(out.code, 0, "{argv:?}: {out:?}");
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), earlier, "{argv:?}");
+        }
+        assert_eq!(
+            files(&dir)
+                .iter()
+                .filter(|file| file.starts_with(&format!("{}.", renamed.id))
+                    || file.starts_with(&format!("{}.", renamed.name)))
+                .count(),
+            1,
+            "{:?}",
+            files(&dir)
+        );
+
+        let gone = theme(&["install", "GitHub Light Default"], Some(&dir));
+        assert_eq!(gone.code, 2, "{gone:?}");
+        let standing = aterm_theme_pack::withdrawn("GitHub Light Default").expect("withdrawn");
+        assert!(
+            gone.stderr.contains(&format!("{standing:?}")),
+            "{}",
+            gone.stderr
+        );
+        let unknown = theme(&["install", "Nope"], Some(&dir));
+        assert_eq!(unknown.code, 2);
+        assert!(
+            !unknown.stderr.contains(&format!("{standing:?}")),
+            "{}",
+            unknown.stderr
+        );
     }
 
     /// `install --all` into an empty folder writes every pack theme; an

@@ -1805,3 +1805,139 @@ fn a_refused_expansion_is_the_persons_stop_or_the_models_turn() {
         assert!(interrupted(&cancelled), "{what}: the control");
     }
 }
+
+/// A REPLY TALLER THAN THE SCREEN IS NO WHOLE REPLY ([`said_whole`]): its
+/// `✦` head scrolled above the rows read, its last words are the rows in
+/// sight, and the need its head said is not in them — so a reader of a
+/// landing knows to read the rest (the recheck of d88a7bf289 found only
+/// Claude Code's cut read, and a tall report here land on its last rows).
+/// NEGATIVE CONTROL: the same reply with its head on the rows is whole, the
+/// need in its words.
+#[test]
+fn a_reply_whose_head_scrolled_away_is_no_whole_reply() {
+    let rows = screen(END_OF_TURN);
+    let at = rows
+        .iter()
+        .rposition(|r| r.starts_with("✦ "))
+        .expect("the reply");
+    let mut drawn = rows[..at].to_vec();
+    drawn.push("✦ NEEDS YOU: the signing credential".to_string());
+    drawn.extend((0..40).map(|i| format!("  - merged item {i}")));
+    drawn.push("  Nothing left: all of it is merged.".to_string());
+    drawn.extend(rows[at + 1..].iter().cloned());
+    let cut = drawn[drawn.len() - rows.len()..].to_vec();
+    let tail = said_tail(&cut).expect("the rows in sight");
+    assert!(
+        tail.ends_with("Nothing left: all of it is merged.") && !tail.contains("NEEDS YOU"),
+        "{tail}"
+    );
+    assert!(!said_whole(&cut) && !Program::Gemini.reader().said_whole(&cut));
+    // NEGATIVE CONTROL: the head on the rows.
+    assert!(said_whole(&drawn) && Program::Gemini.reader().said_whole(&drawn));
+    assert!(said_tail(&drawn).is_some_and(|t| t.starts_with("NEEDS YOU: the signing")));
+}
+
+/// A NEED SAID BEFORE A TOOL CALL IS THE TURN'S ([`turn_said_before`]): the
+/// `✦` reply above a tool's box, under the person's band, is read with the
+/// turn its last reply ends — a `NEEDS YOU:` there stands however the last
+/// reply says nothing is left (the recheck of ea564676a3 found the turn's
+/// earlier words read on Claude Code alone). The turn is whole with its
+/// band on the rows ([`turn_whole`]); with its band above them it is not,
+/// and the history read above them stops at the band's top
+/// ([`turn_history_stop`]). NEGATIVE CONTROL: the same turn with no reply
+/// before the call holds no other words.
+#[test]
+fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
+    let rows = screen(END_OF_TURN);
+    let at = rows
+        .iter()
+        .rposition(|r| r.starts_with("✦ "))
+        .expect("the reply");
+    let turn = |before: &[&str]| {
+        let mut drawn = rows[..at].to_vec();
+        drawn.extend(before.iter().map(|r| (*r).to_string()));
+        drawn.extend(
+            [
+                "",
+                "╭──────────────────────────────────────╮",
+                "│ ✓  Shell git push origin main        │",
+                "╰──────────────────────────────────────╯",
+                "",
+                "✦ Nothing left: all of it is merged.",
+            ]
+            .map(str::to_string),
+        );
+        drawn.extend(rows[at + 1..].iter().cloned());
+        drawn
+    };
+    let reader = Program::Gemini.reader();
+    let drawn = turn(&[
+        "✦ NEEDS YOU: the signing credential, to sign the release.",
+        "  I will push the branch now.",
+    ]);
+    let need =
+        "NEEDS YOU: the signing credential, to sign the release.\nI will push the branch now.";
+    assert_eq!(turn_said_before(&drawn).as_deref(), Some(need));
+    assert_eq!(reader.turn_said_before(&drawn).as_deref(), Some(need));
+    assert_eq!(
+        said_tail(&drawn).as_deref(),
+        Some("Nothing left: all of it is merged.")
+    );
+    assert!(turn_whole(&drawn) && reader.turn_whole(&drawn));
+    // The band above the rows: the turn is cut, and the read above stops at
+    // the band's top.
+    let band = drawn
+        .iter()
+        .position(|r| r == " > think slowly")
+        .expect("the band");
+    let cut = drawn[band + 2..].to_vec();
+    assert!(said_whole(&cut) && !turn_whole(&cut) && !reader.turn_whole(&cut));
+    assert!(turn_history_stop(&drawn[band - 1]) && reader.turn_history_stop(&drawn[band - 1]));
+    for row in &drawn[band..band + 4] {
+        assert!(!turn_history_stop(row), "{row}");
+    }
+    // NEGATIVE CONTROL: no reply before the call.
+    let plain = turn(&[]);
+    assert_eq!(turn_said_before(&plain), None);
+    assert!(turn_whole(&plain) && said_tail(&plain).is_some());
+}
+
+/// THE MESSAGE THAT OPENED THE TURN IS READ OFF ITS BAND ([`turn_opened_by`]):
+/// the sent row's text past its ` > `, and the rows it wrapped onto three
+/// columns in, joined — what tells a successor whether its land act opened
+/// the turn whose defense stands (the review of b8/residuals found a
+/// defense said under a person's earlier message landed on Gemini CLI,
+/// nothing reading the band). NEGATIVE CONTROLS: the band above the rows,
+/// and Claude Code's reader, read none.
+#[test]
+fn the_message_that_opened_the_turn_is_read_off_its_band() {
+    let rows = screen(END_OF_TURN);
+    let reader = Program::Gemini.reader();
+    assert_eq!(turn_opened_by(&rows).as_deref(), Some("think slowly"));
+    assert_eq!(
+        reader.turn_opened_by(&rows).as_deref(),
+        Some("think slowly")
+    );
+    let band = rows
+        .iter()
+        .position(|r| r == " > think slowly")
+        .expect("the band");
+    let mut wrapped = rows.clone();
+    wrapped[band] = " > [aterm harness] Autopilot is Land: land ALL".to_string();
+    wrapped.insert(
+        band + 1,
+        "   of this work into the remote main branch".to_string(),
+    );
+    assert!(said_tail(&wrapped).is_some());
+    assert_eq!(
+        turn_opened_by(&wrapped).as_deref(),
+        Some(
+            "[aterm harness] Autopilot is Land: land ALL of this work into the remote main branch"
+        )
+    );
+    // NEGATIVE CONTROLS.
+    let cut = rows[band + 2..].to_vec();
+    assert!(said_tail(&cut).is_some());
+    assert_eq!(turn_opened_by(&cut), None);
+    assert_eq!(ClaudeReader.turn_opened_by(&rows), None);
+}

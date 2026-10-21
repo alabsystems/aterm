@@ -1,0 +1,732 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+#[cfg(unix)]
+use std::path::Path;
+
+use super::*;
+#[cfg(unix)]
+use crate::volumes::{Mount, Table};
+
+// ---------------------------------------------------------------------------
+// State words.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_kernel_state_word_maps_to_one_run_state() {
+    assert_eq!(RunState::from_bsd(1), RunState::Idle);
+    assert_eq!(RunState::from_bsd(2), RunState::Running);
+    assert_eq!(RunState::from_bsd(3), RunState::Sleeping);
+    assert_eq!(RunState::from_bsd(4), RunState::Stopped);
+    assert_eq!(RunState::from_bsd(5), RunState::Zombie);
+    assert_eq!(RunState::from_bsd(9), RunState::Unknown);
+    assert_eq!(RunState::from_mach_thread(1), RunState::Running);
+    assert_eq!(RunState::from_mach_thread(2), RunState::Stopped);
+    assert_eq!(RunState::from_mach_thread(3), RunState::Sleeping);
+    assert_eq!(RunState::from_mach_thread(4), RunState::Uninterruptible);
+    assert_eq!(RunState::from_mach_thread(5), RunState::Stopped);
+    for (c, s) in [
+        (b'R', RunState::Running),
+        (b'S', RunState::Sleeping),
+        (b'D', RunState::Uninterruptible),
+        (b'T', RunState::Stopped),
+        (b't', RunState::Stopped),
+        (b'Z', RunState::Zombie),
+        (b'I', RunState::Idle),
+        (b'?', RunState::Unknown),
+    ] {
+        assert_eq!(RunState::from_linux(c), s, "{}", c as char);
+    }
+    assert_eq!(TcpState::from_darwin(4), TcpState::Established);
+    assert_eq!(TcpState::from_darwin(2), TcpState::SynSent);
+    assert_eq!(TcpState::from_linux(1), TcpState::Established);
+    assert_eq!(TcpState::from_linux(0x0A), TcpState::Listen);
+    assert_eq!(KnoteFilter::from_darwin(-1), KnoteFilter::Read);
+    assert_eq!(KnoteFilter::from_darwin(-7), KnoteFilter::Timer);
+    assert_eq!(KnoteFilter::from_darwin(-99), KnoteFilter::Other(-99));
+}
+
+// ---------------------------------------------------------------------------
+// Darwin layouts, decoded from bytes written here.
+// ---------------------------------------------------------------------------
+
+fn put(b: &mut [u8], at: usize, v: &[u8]) {
+    b[at..at + v.len()].copy_from_slice(v);
+}
+
+#[test]
+fn a_vnode_answer_gives_mode_size_identity_and_path() {
+    let mut b = vec![0u8; darwin::VNODE_PATH_SIZE];
+    put(
+        &mut b,
+        darwin::VNODE_OPENFLAGS_AT,
+        &darwin::FWRITE.to_ne_bytes(),
+    );
+    put(
+        &mut b,
+        darwin::VNODE_MODE_AT,
+        &(darwin::S_IFREG | 0o644).to_ne_bytes(),
+    );
+    put(&mut b, darwin::VNODE_DEV_AT, &16_777_232u32.to_ne_bytes());
+    put(&mut b, darwin::VNODE_INO_AT, &987_654u64.to_ne_bytes());
+    put(&mut b, darwin::VNODE_SIZE_AT, &36i64.to_ne_bytes());
+    put(
+        &mut b,
+        darwin::VNODE_PATH_AT,
+        b"/private/tmp/t/1.output\0junk",
+    );
+    let v = darwin::vnode(&b).unwrap();
+    assert!(v.regular() && !v.char_device());
+    assert_eq!((v.dev, v.ino, v.size), (16_777_232, 987_654, 36));
+    assert_eq!(v.path, b"/private/tmp/t/1.output");
+    // A negative size reads 0; a short buffer reads nothing.
+    put(&mut b, darwin::VNODE_SIZE_AT, &(-5i64).to_ne_bytes());
+    assert_eq!(darwin::vnode(&b).unwrap().size, 0);
+    assert_eq!(darwin::vnode(&b[..darwin::VNODE_PATH_SIZE - 1]), None);
+    put(
+        &mut b,
+        darwin::VNODE_MODE_AT,
+        &(darwin::S_IFCHR | 0o620).to_ne_bytes(),
+    );
+    assert!(darwin::vnode(&b).unwrap().char_device());
+}
+
+#[test]
+fn a_pipe_answer_gives_handles_flags_and_direction() {
+    let mut b = [0u8; darwin::PIPE_SIZE];
+    put(
+        &mut b,
+        darwin::PIPE_OPENFLAGS_AT,
+        &darwin::FREAD.to_ne_bytes(),
+    );
+    put(&mut b, darwin::PIPE_QUEUED_AT, &65_536i64.to_ne_bytes());
+    put(&mut b, darwin::PIPE_HANDLE_AT, &0xAAAAu64.to_ne_bytes());
+    put(&mut b, darwin::PIPE_PEER_AT, &0xBBBBu64.to_ne_bytes());
+    put(
+        &mut b,
+        darwin::PIPE_STATUS_AT,
+        &darwin::PIPE_WANTW.to_ne_bytes(),
+    );
+    let p = darwin::pipe(&b).unwrap();
+    assert_eq!((p.handle, p.peer, p.queued), (0xAAAA, 0xBBBB, 65_536));
+    assert_eq!(p.status & darwin::PIPE_WANTW, darwin::PIPE_WANTW);
+    assert!(!p.write_end());
+    put(
+        &mut b,
+        darwin::PIPE_OPENFLAGS_AT,
+        &darwin::FWRITE.to_ne_bytes(),
+    );
+    assert!(darwin::pipe(&b).unwrap().write_end());
+    assert_eq!(darwin::pipe(&b[..10]), None);
+}
+
+fn tcp_bytes(state: i32, vflag: u8, faddr: &[u8], fport: u16, lport: u16, rcv: u32) -> Vec<u8> {
+    let mut b = vec![0u8; darwin::SOCKET_SIZE];
+    put(
+        &mut b,
+        darwin::SOCKET_KIND_AT,
+        &darwin::SOCKINFO_TCP.to_ne_bytes(),
+    );
+    put(&mut b, darwin::SOCKET_TCP_STATE_AT, &state.to_ne_bytes());
+    put(&mut b, darwin::SOCKET_VFLAG_AT, &[vflag]);
+    put(&mut b, darwin::SOCKET_FADDR_AT, faddr);
+    put(
+        &mut b,
+        darwin::SOCKET_FPORT_AT,
+        &i32::from(fport.to_be()).to_ne_bytes(),
+    );
+    put(
+        &mut b,
+        darwin::SOCKET_LPORT_AT,
+        &i32::from(lport.to_be()).to_ne_bytes(),
+    );
+    put(&mut b, darwin::SOCKET_RCV_CC_AT, &rcv.to_ne_bytes());
+    b
+}
+
+#[test]
+fn a_socket_answer_names_tcp_state_peer_and_queue() {
+    let mut v4 = [0u8; 16];
+    v4[12..].copy_from_slice(&[192, 0, 2, 10]);
+    let b = tcp_bytes(4, darwin::INI_IPV4, &v4, 8080, 50_123, 0);
+    let t = darwin::socket(&b).unwrap().unwrap();
+    assert_eq!(TcpState::from_darwin(t.state), TcpState::Established);
+    assert_eq!(t.remote, Some("192.0.2.10:8080".parse().unwrap()));
+    assert_eq!((t.local_port, t.queued_read), (50_123, 0));
+
+    let v6: [u8; 16] = "2001:db8::1"
+        .parse::<std::net::Ipv6Addr>()
+        .unwrap()
+        .octets();
+    let b = tcp_bytes(2, darwin::INI_IPV6, &v6, 443, 1, 7);
+    let t = darwin::socket(&b).unwrap().unwrap();
+    assert_eq!(t.remote, Some("[2001:db8::1]:443".parse().unwrap()));
+    assert_eq!(t.queued_read, 7);
+
+    // A listener's peer is the wildcard on port 0: none.
+    let b = tcp_bytes(1, darwin::INI_IPV4, &[0; 16], 0, 5173, 0);
+    assert_eq!(darwin::socket(&b).unwrap().unwrap().remote, None);
+
+    // Not TCP: a socket, no TCP part; short: nothing.
+    let mut b = vec![0u8; darwin::SOCKET_SIZE];
+    put(&mut b, darwin::SOCKET_KIND_AT, &3i32.to_ne_bytes());
+    assert_eq!(darwin::socket(&b), Some(None));
+    assert_eq!(darwin::socket(&b[..100]), None);
+}
+
+#[test]
+fn a_kqueue_answer_gives_its_sleep_and_its_knotes() {
+    let mut b = [0u8; darwin::KQUEUE_SIZE];
+    put(
+        &mut b,
+        darwin::KQUEUE_STATE_AT,
+        &(darwin::PROC_KQUEUE_SLEEP | 0x10).to_ne_bytes(),
+    );
+    assert_eq!(
+        darwin::kqueue_state(&b).map(|s| s & darwin::PROC_KQUEUE_SLEEP),
+        Some(darwin::PROC_KQUEUE_SLEEP)
+    );
+    let mut k = vec![0u8; darwin::KNOTE_SIZE * 2];
+    put(&mut k, darwin::KNOTE_IDENT_AT, &3u64.to_ne_bytes());
+    put(&mut k, darwin::KNOTE_FILTER_AT, &(-1i16).to_ne_bytes());
+    put(
+        &mut k,
+        darwin::KNOTE_SIZE + darwin::KNOTE_IDENT_AT,
+        &9u64.to_ne_bytes(),
+    );
+    put(
+        &mut k,
+        darwin::KNOTE_SIZE + darwin::KNOTE_FILTER_AT,
+        &(-7i16).to_ne_bytes(),
+    );
+    assert_eq!(darwin::knotes(&k, 2), vec![(3, -1), (9, -7)]);
+    // A count past the buffer stops where the buffer does.
+    assert_eq!(darwin::knotes(&k, 5).len(), 2);
+}
+
+#[test]
+fn a_kinfo_answer_gives_a_zombies_parent_group_and_state() {
+    let mut b = vec![0u8; darwin::KINFO_SIZE];
+    put(
+        &mut b,
+        darwin::KINFO_START_SEC_AT,
+        &1_760_000_000i64.to_ne_bytes(),
+    );
+    put(
+        &mut b,
+        darwin::KINFO_START_USEC_AT,
+        &250_000i32.to_ne_bytes(),
+    );
+    put(
+        &mut b,
+        darwin::KINFO_FLAG_AT,
+        &darwin::P_CONTROLT.to_ne_bytes(),
+    );
+    b[darwin::KINFO_STAT_AT] = 5;
+    put(&mut b, darwin::KINFO_PID_AT, &6302u32.to_ne_bytes());
+    put(&mut b, darwin::KINFO_COMM_AT, b"node\0");
+    put(&mut b, darwin::KINFO_RUID_AT, &501u32.to_ne_bytes());
+    put(&mut b, darwin::KINFO_PPID_AT, &6301u32.to_ne_bytes());
+    put(&mut b, darwin::KINFO_PGID_AT, &6301u32.to_ne_bytes());
+    put(&mut b, darwin::KINFO_TDEV_AT, &0x1000_0003u32.to_ne_bytes());
+    put(&mut b, darwin::KINFO_TPGID_AT, &6301u32.to_ne_bytes());
+    put(
+        &mut b,
+        darwin::KINFO_EFLAG_AT,
+        &darwin::EPROC_SLEADER.to_ne_bytes(),
+    );
+    let k = darwin::kinfo(&b).unwrap();
+    assert_eq!(
+        (k.pid, k.ppid, k.pgid, k.stat, k.uid),
+        (6302, 6301, 6301, 5, 501)
+    );
+    assert_eq!(k.start_us, 1_760_000_000_250_000);
+    assert_eq!((k.tty, k.tpgid), (Some(0x1000_0003), Some(6301)));
+    assert!(k.session_leader);
+    assert_eq!(k.comm, "node");
+    // Without `P_CONTROLT` the terminal is none, whatever `e_tdev` says.
+    put(&mut b, darwin::KINFO_FLAG_AT, &0u32.to_ne_bytes());
+    assert_eq!(darwin::kinfo(&b).unwrap().tty, None);
+    assert_eq!(darwin::kinfo(&b[..100]), None);
+}
+
+// ---------------------------------------------------------------------------
+// Linux parsers.
+// ---------------------------------------------------------------------------
+
+const STAT: &str = "4711 (my (odd) cmd) S 4700 4711 4600 34817 4711 4194560 900 0 3 0 \
+                    150 50 20 10 20 0 3 0 123456 0 0";
+
+#[test]
+fn a_stat_line_gives_every_field_past_any_command_name() {
+    let s = linux::parse_stat(STAT).unwrap();
+    assert_eq!(s.name, "my (odd) cmd");
+    assert_eq!(
+        (s.state, s.ppid, s.pgrp, s.session),
+        (b'S', 4700, 4711, 4600)
+    );
+    assert_eq!((s.tty_nr, s.tpgid), (34_817, 4711));
+    assert_eq!(
+        (s.majflt, s.utime, s.stime, s.cutime, s.cstime),
+        (3, 150, 50, 20, 10)
+    );
+    assert_eq!((s.threads, s.start), (3, 123_456));
+    // No terminal: `tty_nr` 0, `tpgid` -1.
+    let s = linux::parse_stat("9 (d) R 1 9 9 0 -1 0 0 0 0 0 1 2 0 0 20 0 1 0 7 0 0").unwrap();
+    assert_eq!((s.tty_nr, s.tpgid), (0, 0));
+    assert_eq!(linux::parse_stat("9 (d) R 1"), None);
+    assert_eq!(linux::parse_stat("garbage"), None);
+}
+
+#[test]
+fn io_status_schedstat_and_wchan_parse() {
+    let io = linux::parse_io(
+        "rchar: 10\nwchar: 2048\nsyscr: 5\nsyscw: 7\nread_bytes: 4096\nwrite_bytes: 8192\n\
+         cancelled_write_bytes: 0\n",
+    );
+    assert_eq!(
+        (io.wchar, io.syscr, io.syscw, io.read_bytes, io.write_bytes),
+        (Some(2048), Some(5), Some(7), Some(4096), Some(8192))
+    );
+    let (uid, csw) = linux::parse_status(
+        "Name:\tsleep\nUid:\t501\t501\t501\t501\nvoluntary_ctxt_switches:\t12\n\
+         nonvoluntary_ctxt_switches:\t3\n",
+    );
+    assert_eq!((uid, csw), (Some(501), Some(15)));
+    assert_eq!(linux::parse_schedstat("1500 300 4\n"), Some((1500, 300)));
+    assert_eq!(
+        linux::parse_wchan("hrtimer_nanosleep"),
+        Some("hrtimer_nanosleep".to_owned())
+    );
+    assert_eq!(linux::parse_wchan("0"), None);
+    assert_eq!(linux::parse_wchan(""), None);
+    assert_eq!(
+        linux::max_processes(
+            "Limit                     Soft Limit           Hard Limit           Units\n\
+             Max processes             63432                63432                processes\n"
+        ),
+        Some(63_432)
+    );
+    assert_eq!(
+        linux::max_processes("Max processes             unlimited            unlimited\n"),
+        None
+    );
+    assert!(linux::event_wait("ep_poll") && linux::event_wait("do_select"));
+    assert!(!linux::event_wait("pipe_read"));
+}
+
+#[test]
+fn fd_links_and_fdinfo_parse() {
+    use linux::FdLink;
+    assert_eq!(linux::parse_fd_link("pipe:[123]"), FdLink::Pipe(123));
+    assert_eq!(linux::parse_fd_link("socket:[77]"), FdLink::Socket(77));
+    assert_eq!(
+        linux::parse_fd_link("anon_inode:[eventpoll]"),
+        FdLink::EventPoll
+    );
+    assert_eq!(linux::parse_fd_link("anon_inode:inotify"), FdLink::Inotify);
+    assert_eq!(linux::parse_fd_link("/dev/pts/3"), FdLink::Tty);
+    assert_eq!(linux::parse_fd_link("/dev/null"), FdLink::Device);
+    assert_eq!(
+        linux::parse_fd_link("/tmp/out.log"),
+        FdLink::Path("/tmp/out.log".into())
+    );
+    assert_eq!(linux::parse_fd_link("/proc/1/stat"), FdLink::Other);
+    assert_eq!(linux::parse_fd_link("pipe:[x]"), FdLink::Other);
+    let i = linux::parse_fdinfo("pos:\t36\nflags:\t02000001\nmnt_id:\t28\nino:\t991\n");
+    assert_eq!((i.pos, i.ino), (36, Some(991)));
+    assert!(i.write_only());
+    let e = linux::parse_fdinfo(
+        "pos:\t0\nflags:\t02\nmnt_id:\t15\ntfd:        5 events:       19 data: 5  pos:0 ino:4 sdev:d\n\
+         tfd:        7 events:        4 data: 7  pos:0 ino:5 sdev:d\n",
+    );
+    assert_eq!(e.interests, vec![(5, 0x19), (7, 0x4)]);
+    assert!(!e.write_only());
+}
+
+const NET_TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 1111 1 0\n\
+   1: 0100007F:C3A1 0A0200C0:1F90 01 00000000:00000000 00:00000000 00000000   501        0 2222 1 0\n\
+   2: 0100007F:C3A2 0A0200C0:1F90 02 00000000:0000000";
+
+#[test]
+fn a_tcp_table_gives_state_peer_and_queue_and_skips_a_torn_row() {
+    let rows = linux::parse_net_tcp(NET_TCP, false);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].state, TcpState::Listen);
+    assert_eq!((rows[0].local_port, rows[0].remote), (8080, None));
+    assert_eq!(rows[1].state, TcpState::Established);
+    assert_eq!(rows[1].remote, Some("192.0.2.10:8080".parse().unwrap()));
+    assert_eq!((rows[1].inode, rows[1].rx_queue), (2222, 0));
+    let v6 = "  sl  local remote st q\n\
+   0: 00000000000000000000000001000000:1F90 B80D0120000000000000000001000000:01BB 01 00000000:00000005 00:0 0 501 0 3333 1\n";
+    let rows = linux::parse_net_tcp(v6, true);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].remote, Some("[2001:db8::1]:443".parse().unwrap()));
+    assert_eq!(rows[0].rx_queue, 5);
+}
+
+// ---------------------------------------------------------------------------
+// The Linux arm over a fixture tree written here.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn write(root: &Path, rel: &str, text: &str) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, text).unwrap();
+}
+
+#[cfg(unix)]
+fn link(root: &Path, rel: &str, target: &str) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(target, p).unwrap();
+}
+
+/// A `/proc` tree with one agent call: `4711` (`cat`) reads a pipe whose
+/// writer is `4712`, holds an output file on fd 1, a TCP socket and an
+/// epoll set; `4713` is a zombie; `4714` belongs to another user (no `io`).
+#[cfg(unix)]
+#[test]
+fn the_linux_arm_reads_a_fixture_tree() {
+    let dir = aterm_tempfile::tempdir().expect("scratch root");
+    let r = dir.path();
+    write(r, "4711/stat", STAT);
+    write(
+        r,
+        "4711/status",
+        "Uid:\t501\t501\t501\t501\nvoluntary_ctxt_switches:\t4\nnonvoluntary_ctxt_switches:\t1\n",
+    );
+    write(
+        r,
+        "4711/io",
+        "wchar: 36\nsyscr: 9\nsyscw: 3\nread_bytes: 0\nwrite_bytes: 4096\n",
+    );
+    write(r, "4711/schedstat", "2000000000 500000000 10\n");
+    write(r, "4711/wchan", "pipe_read");
+    write(r, "4711/task/4711/stat", STAT);
+    write(r, "4711/task/4711/wchan", "pipe_read");
+    write(r, "4711/task/4715/stat", &STAT.replace(" S ", " D "));
+    link(r, "4711/fd/0", "pipe:[555]");
+    write(r, "4711/fdinfo/0", "pos:\t0\nflags:\t00\n");
+    link(r, "4711/fd/1", "/tmp/claude/t/1.output");
+    write(r, "4711/fdinfo/1", "pos:\t36\nflags:\t02001\nino:\t991\n");
+    link(r, "4711/fd/2", "/dev/pts/3");
+    link(r, "4711/fd/3", "socket:[2222]");
+    link(r, "4711/fd/4", "anon_inode:[eventpoll]");
+    write(
+        r,
+        "4711/fdinfo/4",
+        "pos:\t0\nflags:\t02\ntfd:        3 events:       19 data: 3\n",
+    );
+    link(r, "4711/fd/5", "anon_inode:inotify");
+    write(r, "4711/net/tcp", NET_TCP);
+    write(
+        r,
+        "4713/stat",
+        "4713 (zed) Z 4711 4711 4600 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9 0 0",
+    );
+    write(
+        r,
+        "4714/stat",
+        "4714 (other) S 1 4714 4714 0 -1 0 0 0 0 0 5 5 0 0 20 0 1 0 9 0 0",
+    );
+
+    let f = linux::read(r, 4711, true, 100).unwrap();
+    assert_eq!(
+        (f.ppid, f.pgid, f.sid, f.start),
+        (4700, 4711, Some(4600), Some(123_456))
+    );
+    assert_eq!(
+        (f.tty, f.tpgid, f.uid),
+        (Some(34_817), Some(4711), Some(501))
+    );
+    assert_eq!(f.state, RunState::Sleeping);
+    assert_eq!(f.wchan.as_deref(), Some("pipe_read"));
+    let c = f.counters.unwrap();
+    assert_eq!(c.cpu_ns, 2_000_000_000, "200 ticks at 100 Hz");
+    assert_eq!(c.child_cpu_ns, Some(300_000_000));
+    assert_eq!(
+        (c.syscalls, c.ctx_switches, c.logical_writes),
+        (Some(12), Some(5), Some(36))
+    );
+    assert_eq!(
+        (c.disk_written, c.runnable_ns, c.pageins),
+        (Some(4096), Some(2_500_000_000), Some(3))
+    );
+    let ts = f.threads.unwrap();
+    assert_eq!(ts.len(), 2);
+    assert_eq!(ts[1].state, RunState::Uninterruptible);
+    assert_eq!(ts[0].wchan.as_deref(), Some("pipe_read"));
+    let fds = f.fds.unwrap();
+    let kind = |n: i32| fds.iter().find(|d| d.fd == n).map(|d| d.kind.clone());
+    assert_eq!(
+        kind(0),
+        Some(FdKind::Pipe {
+            handle: 555,
+            peer: 555,
+            status: None,
+            queued: None,
+            write_end: Some(false)
+        })
+    );
+    assert_eq!(
+        kind(1),
+        Some(FdKind::File {
+            regular: true,
+            size: 36,
+            dev: 0,
+            ino: 991,
+            lf_tail: None
+        })
+    );
+    assert_eq!(kind(2), Some(FdKind::Device { tty: true }));
+    assert_eq!(
+        kind(3),
+        Some(FdKind::Tcp {
+            state: TcpState::Established,
+            remote: Some("192.0.2.10:8080".parse().unwrap()),
+            local_port: 50_081,
+            queued_read: Some(0)
+        })
+    );
+    assert_eq!(
+        kind(4),
+        Some(FdKind::EventQueue {
+            sleeping: Some(false),
+            knotes: Some(vec![Knote {
+                ident: 3,
+                filter: KnoteFilter::Read
+            }])
+        })
+    );
+    assert_eq!(kind(5), Some(FdKind::Watch));
+
+    // A zombie is named, with no counters and no threads.
+    let z = linux::read(r, 4713, true, 100).unwrap();
+    assert_eq!(z.state, RunState::Zombie);
+    assert!(z.counters.is_none() && z.threads.is_none() && z.fds.is_none());
+    // Another user's `io` is refused: counters unknown, not zero.
+    let o = linux::read(r, 4714, false, 100).unwrap();
+    assert!(o.counters.is_none());
+    assert!(o.fds.is_none());
+    // A pid not in the tree reads nothing.
+    assert!(linux::read(r, 9999, false, 100).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// The output tail.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn table(mounts: &[(&str, bool, bool)]) -> Table {
+    Table {
+        mounts: mounts
+            .iter()
+            .map(|(on, local, automounted)| Mount {
+                on: (*on).into(),
+                from: "/dev/disk3s5".to_owned(),
+                fstype: if *automounted { "autofs" } else { "apfs" }.to_owned(),
+                local: *local,
+                automounted: *automounted,
+                read_only: false,
+                container: None,
+            })
+            .collect(),
+        complete: true,
+        firmlinks: Vec::new(),
+    }
+}
+
+/// Only a temporary-files root on a local, non-automounted mount is
+/// opened. NEGATIVE CONTROLS: a home folder, a remote mount under `/tmp`,
+/// an automount, a `..` that would climb out. Unix: [`TAIL_ROOTS`] are unix
+/// folders, and a Windows table places no `/…` path (nor is a tail read
+/// there: [`tail_has_lf`] answers `None`).
+#[cfg(unix)]
+#[test]
+fn only_a_local_temporary_file_is_opened_for_its_tail() {
+    let t = table(&[
+        ("/", true, false),
+        ("/private/tmp/nfs", false, false),
+        ("/tmp/auto", true, true),
+    ]);
+    assert!(tail_allowed(
+        Path::new("/private/tmp/agent-501/t/1.output"),
+        &t
+    ));
+    assert!(tail_allowed(Path::new("/private/var/folders/x/T/out"), &t));
+    assert!(!tail_allowed(Path::new("/Users//me/Documents/out.log"), &t));
+    assert!(!tail_allowed(Path::new("/private/tmp/nfs/out.log"), &t));
+    assert!(!tail_allowed(Path::new("/tmp/auto/out.log"), &t));
+    assert!(!tail_allowed(Path::new("/private/tmp/../Users//me/x"), &t));
+    assert!(!tail_allowed(Path::new("relative/tmp/x"), &t));
+    assert!(!tail_allowed(Path::new("/private/tmp/x"), &table(&[])));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_tail_check_reads_only_the_appended_bytes() {
+    let dir = aterm_tempfile::tempdir().expect("scratch dir");
+    let p = dir.path().join("out");
+    std::fs::write(&p, b"line one\nspin\rspin\r").unwrap();
+    // The first nine bytes hold the line feed; the rest only returns.
+    assert_eq!(tail_has_lf(&p, 0, 9), Some(true));
+    assert_eq!(tail_has_lf(&p, 9, 19), Some(false));
+    assert_eq!(tail_has_lf(&p, 9, 9), None);
+    assert_eq!(tail_has_lf(&dir.path().join("missing"), 0, 4), None);
+    // A symlink as the final component is refused.
+    let l = dir.path().join("link");
+    std::os::unix::fs::symlink(&p, &l).unwrap();
+    assert_eq!(tail_has_lf(&l, 0, 9), None);
+}
+
+// ---------------------------------------------------------------------------
+// Live self-reads (macOS): shapes only, never timings.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+#[test]
+fn this_process_reads_itself_with_threads_counters_and_descriptors() {
+    let mut fds = [0 as std::ffi::c_int; 2];
+    // SAFETY: two writable descriptors' room.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut reader = JobsReader::new();
+    let me = std::process::id();
+    let f = reader
+        .read(ReadReq { pid: me, fds: true })
+        .expect("this process reads itself");
+    assert!(f.ppid > 0 && f.pgid > 0, "{f:?}");
+    assert!(f.start.is_some_and(|s| s > 0));
+    assert!(f.sid.is_some());
+    // The executable's own file name, whole (the test binary's name passes
+    // `p_comm`'s 16 bytes).
+    let own = std::env::current_exe().expect("this test's executable");
+    assert_eq!(
+        f.exe.as_deref(),
+        own.file_name().and_then(|n| n.to_str()),
+        "{f:?}"
+    );
+    assert!(
+        f.counters
+            .is_some_and(|c| c.cpu_ns > 0 && c.syscalls.is_some())
+    );
+    let ts = f.threads.as_ref().expect("threads");
+    assert!(!ts.is_empty());
+    assert!(
+        ts.iter().any(|t| t.state == RunState::Running),
+        "the reading thread is on a core: {ts:?}"
+    );
+    let list = f.fds.as_ref().expect("descriptors");
+    let pipe = |n| {
+        list.iter().find_map(|d| match d.kind {
+            FdKind::Pipe {
+                handle,
+                peer,
+                write_end,
+                ..
+            } if d.fd == n => Some((handle, peer, write_end)),
+            _ => None,
+        })
+    };
+    let (rh, rp, rw) = pipe(fds[0]).expect("the read end");
+    let (wh, wp, ww) = pipe(fds[1]).expect("the write end");
+    assert_eq!((rp, wp), (wh, rh), "each end's peer is the other's handle");
+    assert_eq!((rw, ww), (Some(false), Some(true)));
+    // SAFETY: our own descriptors.
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+}
+
+/// Both lanes pass their self-check in a plain test binary (design §5.3:
+/// each lane self-checks inside the running binary).
+#[cfg(target_os = "macos")]
+#[test]
+fn both_lanes_self_check_on() {
+    let lanes = JobsReader::new().lanes();
+    assert_eq!(lanes.kqueue_detail, Lane::On, "{lanes:?}");
+    assert_eq!(lanes.pipe_flags, Lane::On, "{lanes:?}");
+}
+
+/// A stopped child reads `Stopped`, a zombie child `Zombie` with no
+/// counters, and the session leader of a new session leads it with no
+/// terminal.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stopped_child_and_a_zombie_child_read_their_states() {
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("60")
+        .setsid(true)
+        .spawn()
+        .expect("sleep starts");
+    let pid = child.id();
+    let mut reader = JobsReader::new();
+    let f = reader
+        .read(ReadReq { pid, fds: true })
+        .expect("the child reads");
+    assert_eq!(f.sid, Some(pid), "it leads its own session");
+    assert_eq!((f.tty, f.tpgid), (None, None));
+    assert_eq!(f.ppid, std::process::id());
+    // The sweep says the same: it leads a session, with no terminal.
+    let sweep = crate::processes().expect("a sweep");
+    let row = sweep
+        .procs
+        .iter()
+        .find(|p| p.pid == pid)
+        .expect("the child is swept");
+    assert_eq!(
+        (row.session_leader, row.has_tty),
+        (Some(true), Some(false)),
+        "{row:?}"
+    );
+    // SAFETY: our own child.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+    let stopped = (0..6000).find_map(|_| {
+        let s = reader.read(ReadReq { pid, fds: false }).map(|f| f.state);
+        if s == Some(RunState::Stopped) {
+            s
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        }
+    });
+    assert_eq!(
+        stopped,
+        Some(RunState::Stopped),
+        "hang detector: one minute"
+    );
+    child.kill().expect("kill");
+    // Not reaped yet: a zombie.
+    let zombie = (0..6000).find_map(|_| {
+        let f = reader.read(ReadReq { pid, fds: false });
+        if f.as_ref().is_some_and(|f| f.state == RunState::Zombie) {
+            f
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        }
+    });
+    let z = zombie.expect("hang detector: one minute");
+    assert!(z.counters.is_none() && z.threads.is_none());
+    // An exited process has left its session: its parent is what is known.
+    assert_eq!(z.ppid, std::process::id());
+    assert!(
+        z.start.is_some_and(|s| s == f.start.unwrap_or(0)),
+        "{z:?} {f:?}"
+    );
+    // The sweep lists it too, from the sysctl.
+    let sweep = crate::processes().expect("a sweep");
+    let row = sweep
+        .procs
+        .iter()
+        .find(|p| p.pid == pid)
+        .expect("the zombie is swept");
+    assert_eq!(
+        (row.state, row.ppid),
+        (RunState::Zombie, std::process::id())
+    );
+    child.wait().expect("reaped");
+}

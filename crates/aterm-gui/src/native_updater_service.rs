@@ -1551,7 +1551,7 @@ impl NativeUpdaterService {
         if staged.is_installed_activation() {
             // ABSENCE OF EVIDENCE IS NOT EVIDENCE THE BUNDLE CHANGED. `installed`
             // is `None` whenever the facts worker could not PROVE the bundle this
-            // pass — `installed_update_facts` fails closed, and its `spctl` probe
+            // pass — the installed-facts probe fails closed, and its `spctl` probe
             // rides a 30 s ceiling that a captive portal or half-open network
             // reaches routinely. Retiring on that observation threw away a
             // perfectly good activation, and nothing re-announced it: the check
@@ -2164,6 +2164,65 @@ mod tests {
             ..installed
         };
         assert!(stub.activation_stage(11, 0).is_none());
+    }
+
+    /// NO UPDATE AUTHORITY NAMES A BUILD AT OR BELOW THE RUNNING ONE, so no lane hands a
+    /// session to a build older than the one that wrote its records: a download staged
+    /// there and an installed bundle there mint no stage and back no activation, and the
+    /// one same-image hop (the QA seam, a launch-record renewal) runs this very build.
+    /// Round eight of the update audit's U6 (a quiet restart's record read by a build
+    /// that predates `quiet`) and U13 (a successor that predates the timeline id carry)
+    /// both need such a hop. NEGATIVE CONTROL: one build newer is a stage both ways.
+    #[test]
+    fn no_update_authority_names_a_build_at_or_below_the_running_one() {
+        let running = 11;
+        let commit = "0".repeat(40);
+        let staged_at = |build: u64| DurableUpdateStatus {
+            linux_host: false,
+            linux: None,
+            enabled: true,
+            current_build: running,
+            staged_build: Some(build),
+            staged_version: Some(format!("0.{build}.0")),
+            staged_commit: Some(commit.clone()),
+            staged_dmg_sha256: Some("ab".repeat(32)),
+            changelog: None,
+            outcome: String::new(),
+            failing_checks: 0,
+            failing_persistent: false,
+            failing_kind: String::new(),
+            failing_applies: 0,
+            apply_failure: String::new(),
+            apply_failure_build: 0,
+            apply_failures_for_target: 0,
+            installable: Some(true),
+            channel_unreadable: false,
+            checked_at: None,
+        };
+        let installed_at = |build: u64| InstalledUpdate {
+            build,
+            commit: commit.clone(),
+            version: Some(format!("0.{build}.0")),
+            receipt_build: None,
+            receipt_dmg_sha256: None,
+            trial_launches: 0,
+        };
+        for build in [running - 1, running] {
+            assert!(
+                staged_from_status(running, 0, &staged_at(build)).is_none(),
+                "a download of build {build} is no stage"
+            );
+            assert!(verified_download_build(running, &staged_at(build)).is_none());
+            assert!(
+                installed_at(build).activation_stage(running, 0).is_none(),
+                "an installed build {build} is no activation"
+            );
+            assert!(!installed_at(build).backs_activation(running, build, &commit));
+        }
+        let newer = running + 1;
+        assert!(staged_from_status(running, 0, &staged_at(newer)).is_some());
+        assert!(installed_at(newer).activation_stage(running, 0).is_some());
+        assert!(installed_at(newer).backs_activation(running, newer, &commit));
     }
 
     /// The ledger's persistent verdict reaches the snapshot while a stage is HELD

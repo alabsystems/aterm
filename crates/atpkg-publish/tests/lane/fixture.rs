@@ -23,16 +23,17 @@ use atpkg_publish::lane::report::Recorded;
 use atpkg_publish::testkit::{Keys, NOW};
 use atpkg_publish::triple::Triple;
 
-use super::super::shared::scratch;
+use super::super::shared::{Made, made_once, scratch};
 
-/// `git -C <dir> <args>` with a fixed identity, failing the test on an error.
+/// `git -C <dir> <args>` ([`atpkg_publish::testkit::git`]) with a fixed identity, failing the
+/// test on an error.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     git_at(dir, args, None)
 }
 
 /// [`git`] with the author and committer date fixed (`YYYY-MM-DDT12:00:00Z`).
 pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
-    let mut cmd = aterm_uds::spawnfd::command("git");
+    let mut cmd = atpkg_publish::testkit::git();
     cmd.arg("-C")
         .arg(dir)
         .args([
@@ -46,6 +47,10 @@ pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
             "init.defaultBranch=main",
             "-c",
             "advice.detachedHead=false",
+            // No template: a fixture repository carries no sample hooks, no description and
+            // no info/exclude, files every test lays down and removes and nothing reads.
+            "-c",
+            "init.templateDir=",
         ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -66,13 +71,21 @@ pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
 }
 
 /// A fresh repository on `main` with `commits` empty commits, written by ONE
-/// `git fast-import` (a build number is a commit count, and pins run to the hundreds).
-pub fn repo(dir: &Path, commits: u64) {
+/// `git fast-import` (a build number is a commit count, and pins run to the hundreds); its
+/// commits, oldest first. The history is the same bytes every time (a fixed identity and
+/// fixed dates), so each count is made once per process and laid down after.
+pub fn repo(dir: &Path, commits: u64) -> Vec<String> {
+    static MADE: Made<u64, Vec<String>> = Mutex::new(BTreeMap::new());
+    made_once(&MADE, &commits, dir, |dir| make_repo(dir, commits))
+}
+
+/// [`repo`], made: its commits, oldest first.
+fn make_repo(dir: &Path, commits: u64) -> Vec<String> {
     use std::io::Write as _;
     std::fs::create_dir_all(dir).expect("mkdir repo");
     git(dir, &["init", "-q"]);
     if commits == 0 {
-        return;
+        return Vec::new();
     }
     let mut stream = String::new();
     for i in 1..=commits {
@@ -87,10 +100,15 @@ pub fn repo(dir: &Path, commits: u64) {
         }
         stream.push('\n');
     }
-    let mut child = aterm_uds::spawnfd::command("git")
+    // Each mark's commit, read back from fast-import itself rather than one more git.
+    let marks = dir.join(".git/fixture-marks");
+    let mut child = atpkg_publish::testkit::git()
         .arg("-C")
         .arg(dir)
-        .args(["fast-import", "--quiet"])
+        // One pack, not a loose object (and a directory) per commit: below its unpack limit
+        // fast-import explodes what it wrote, and every test lays the tree down and removes it.
+        .args(["-c", "fastimport.unpackLimit=0", "fast-import", "--quiet"])
+        .arg(format!("--export-marks={}", marks.display()))
         .stdin(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("spawn git fast-import");
@@ -102,6 +120,23 @@ pub fn repo(dir: &Path, commits: u64) {
         .expect("feed fast-import");
     assert!(child.wait().expect("wait fast-import").success());
     git(dir, &["reset", "-q", "--hard", "main"]);
+    let text = std::fs::read_to_string(&marks).expect("read fast-import marks");
+    std::fs::remove_file(&marks).expect("drop fast-import marks");
+    let mut history: Vec<(u64, String)> = text
+        .lines()
+        .map(|line| {
+            let (mark, sha) = line.split_once(' ').expect("a `:mark sha` line");
+            let mark = mark.trim_start_matches(':').parse().expect("a mark number");
+            (mark, sha.to_string())
+        })
+        .collect();
+    history.sort();
+    assert_eq!(
+        history.len(),
+        usize::try_from(commits).expect("a count"),
+        "{text}"
+    );
+    history.into_iter().map(|(_, sha)| sha).collect()
 }
 
 /// One more empty commit; its sha.
@@ -221,14 +256,15 @@ impl Fx {
             .publish_quad(&self.host, &self.ctx.index_slug(), n, text);
     }
 
-    /// A dev repo for `repo` with `commits` commits, cloneable from staging; its head sha.
+    /// A dev repo for `repo` with `commits` commits, cloneable from staging; where it is,
+    /// and its commits, oldest first.
     #[must_use]
-    pub fn dev_repo(&self, repo: &str, commits: u64) -> PathBuf {
+    pub fn dev_repo(&self, repo: &str, commits: u64) -> (PathBuf, Vec<String>) {
         let dir = self.path(&format!("dev/{repo}"));
-        self::repo(&dir, commits);
+        let history = self::repo(&dir, commits);
         self.host
             .add_clone_source(&self.ctx.staging_slug(repo), &dir);
-        dir
+        (dir, history)
     }
 
     /// A signed source release `tag` of `repo` on the public owner, whose SUMS names the

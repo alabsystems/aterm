@@ -58,12 +58,13 @@
 //! the reader's epoch: see [`Log::read`].
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use crate::field::{FieldError, Fields, Key, Tier, Val};
 use crate::fold::{Fold, SessionState};
 use crate::line::{EncodeError, MAX_RECORD_BYTES, encode_bus, encoded_size};
 use crate::rec::{Rec, Stamp};
-use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, Src};
+use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, ShortId, Src};
 use crate::words::{Out, RunOut, StepOut, TurnOut};
 
 #[path = "carry.rs"]
@@ -422,10 +423,15 @@ impl Close {
 }
 
 /// Whether the log writes `key` itself on a record of `op`: `orphan=` on an
-/// open; the outcome, duration and rollup on a close. A caller's fields
-/// carrying one are refused, so a close always says what the log decided.
+/// open; the outcome, duration and rollup on a close; and `op_by=` (a turn
+/// close's restated opener, Phase 6 step 6C-2) on none but the log's own
+/// close, so no caller writes it on any record. A caller's fields carrying
+/// one are refused, so a close always says what the log decided.
 #[must_use]
 pub fn log_owned(op: Op, key: Key) -> bool {
+    if key == Key::OpBy {
+        return true;
+    }
     match op {
         Op::Open => key == Key::Orphan,
         Op::Close => matches!(
@@ -662,6 +668,19 @@ pub struct Read<'a> {
     pub next: Cursor,
 }
 
+/// A [`Read`] that hands out the ring's own shared records
+/// ([`Log::read_shared`]): a reader keeps one past the read with
+/// `Arc::clone`, a count bump, never a copy of its fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedRead<'a> {
+    /// The gap the reader crossed, if any.
+    pub gap: Option<Gap>,
+    /// The records, oldest first.
+    pub recs: Vec<&'a Arc<Rec>>,
+    /// Where to read next.
+    pub next: Cursor,
+}
+
 /// A node's counters, written into its close record (§2.3 "Rollup").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rollup {
@@ -781,9 +800,12 @@ impl IdCounters {
     }
 }
 
+/// A live record and its encoded size. The record is shared with every
+/// reader that kept it ([`Log::read_shared`]); it never changes once
+/// appended.
 #[derive(Clone, Debug)]
 struct Entry {
-    rec: Rec,
+    rec: Arc<Rec>,
     bytes: usize,
     /// The record's place in the bus class's dense count (phase 4, design
     /// §5.5): `1..` for a bus-class record ([`Rec::is_bus_class`]), 0 for a
@@ -913,11 +935,16 @@ pub struct Log {
     mirror: Option<Box<mirror::Mirror>>,
 }
 
-/// One live record's estimated heap: its ring entry, its fields' vector and
-/// the text and tokens they hold.
+/// One live record's estimated heap: its ring entry, the shared record's own
+/// allocation (the record and its two reference counts, [`Entry::rec`]), its
+/// fields' vector and the text and tokens they hold.
 fn entry_heap(rec: &Rec) -> usize {
     let strings: usize = rec.f.iter().map(|(_, v)| v.heap_len()).sum();
-    std::mem::size_of::<Entry>() + rec.f.len() * std::mem::size_of::<(Key, Val)>() + strings
+    let shared = std::mem::size_of::<Rec>() + 2 * std::mem::size_of::<usize>();
+    std::mem::size_of::<Entry>()
+        + shared
+        + rec.f.len() * std::mem::size_of::<(Key, Val)>()
+        + strings
 }
 
 /// The index of a numbered level in [`Log::issued`].
@@ -1345,7 +1372,7 @@ impl Log {
 
     /// The live records, oldest first.
     pub fn window(&self) -> impl DoubleEndedIterator<Item = &Rec> + ExactSizeIterator {
-        self.ring.iter().map(|e| &e.rec)
+        self.ring.iter().map(|e| &*e.rec)
     }
 
     /// The fold of every record ever appended, evicted or not.
@@ -1436,6 +1463,33 @@ impl Log {
     /// one that has read nothing (`since=0`).
     #[must_use]
     pub fn read(&self, cursor: Cursor, max: usize) -> Read<'_> {
+        let (gap, range, next) = self.page(cursor, max);
+        Read {
+            gap,
+            recs: self.ring.range(range).map(|e| &*e.rec).collect(),
+            next,
+        }
+    }
+
+    /// [`Log::read`] handing out the ring's shared records: the same gap,
+    /// records and next cursor. A host that renders a reply after releasing
+    /// its lock on the log keeps the records it shows with `Arc::clone`,
+    /// so the copy taken under the lock is a count bump per record.
+    #[must_use]
+    pub fn read_shared(&self, cursor: Cursor, max: usize) -> SharedRead<'_> {
+        let (gap, range, next) = self.page(cursor, max);
+        SharedRead {
+            gap,
+            recs: self.ring.range(range).map(|e| &e.rec).collect(),
+            next,
+        }
+    }
+
+    /// The page a read from `cursor` returns, as [`Log::read`] states it: the
+    /// gap it crossed, the ring positions of the live records it takes (at
+    /// most `max`), and where to read next. Both reads take their records
+    /// from it, so they agree by construction.
+    fn page(&self, cursor: Cursor, max: usize) -> (Option<Gap>, std::ops::Range<usize>, Cursor) {
         // A fenced log shows its readers nothing past the fence.
         let head = self.reader_last_seq();
         let reset = cursor.ep > self.ep
@@ -1445,13 +1499,10 @@ impl Log {
         let from = if reset { 0 } else { cursor.seq };
         let start = self.ring.partition_point(|e| e.rec.seq <= from);
         let end = self.ring.partition_point(|e| e.rec.seq <= head).max(start);
-        let recs: Vec<&Rec> = self
-            .ring
-            .range(start..end)
-            .take(max)
-            .map(|e| &e.rec)
-            .collect();
-        let next = match (max, recs.last()) {
+        let range = start..end.min(start.saturating_add(max));
+        let first = self.ring.get(range.start).filter(|_| !range.is_empty());
+        let last = range.end.checked_sub(1).and_then(|i| self.ring.get(i));
+        let next = match (max, last.filter(|_| !range.is_empty())) {
             // A probe: the seqs up to the first live record.
             (0, _) => self
                 .ring
@@ -1459,7 +1510,7 @@ impl Log {
                 .filter(|e| e.rec.seq <= head)
                 .map_or(head, |e| e.rec.seq.saturating_sub(1))
                 .max(from),
-            (_, Some(last)) if recs.len() == max => last.seq,
+            (_, Some(last)) if range.len() == max => last.rec.seq,
             _ => head,
         };
         let lost = self
@@ -1475,13 +1526,9 @@ impl Log {
                 GapWhy::Evicted
             },
             lost,
-            resync_to: recs.first().map_or(next, |r| r.seq.saturating_sub(1)),
+            resync_to: first.map_or(next, |e| e.rec.seq.saturating_sub(1)),
         });
-        Read {
-            gap,
-            recs,
-            next: Cursor::new(self.ep, next),
-        }
+        (gap, range, Cursor::new(self.ep, next))
     }
 
     // ---- writing -----------------------------------------------------
@@ -1715,6 +1762,7 @@ impl Log {
         if !m.kind.is_mark() {
             return Err(Refused::KindDoesNotFit(m.kind));
         }
+        refuse_owned(Op::Mark, &m.f)?;
         let node = match m.at {
             Some(n) if self.is_open(n) => n,
             _ => self.open.last().map_or(Node::SESSION, |e| e.node),
@@ -1767,6 +1815,7 @@ impl Log {
         if !self.nodes.contains_key(&node) && self.structural_parent(node).is_none() {
             return Err(Refused::Forgotten(node));
         }
+        refuse_owned(Op::Amend, &a.f)?;
         let rec = Rec {
             seq: 0,
             t: at.wall_ms,
@@ -2010,6 +2059,7 @@ impl Log {
             let _ = f.set(*k, v.clone());
         }
         let restated = self.restated_ledger(node, &f);
+        let opener = self.restated_opener(node);
         let mut rec = Rec {
             seq: 0,
             t: at.wall_ms,
@@ -2040,6 +2090,17 @@ impl Log {
             if fits(&rec).is_err() {
                 rec.f = before;
                 break;
+            }
+        }
+        // The opener last, so the size guard drops it first: a close at the
+        // record cap, or with no field slot left, goes without it.
+        if let Some(by) = opener {
+            let mut grown = rec.f.clone();
+            if grown.set(Key::OpBy, Val::Id(by)).is_ok() {
+                let before = std::mem::replace(&mut rec.f, grown);
+                if fits(&rec).is_err() {
+                    rec.f = before;
+                }
             }
         }
         if let Some(p) = parent {
@@ -2077,6 +2138,34 @@ impl Log {
             .and_then(|e| e.rec.f.get_u(Key::Ledger))
     }
 
+    /// A TURN'S CLOSE RESTATES WHO OPENED IT (Phase 6 step 6C-2, ruling U6):
+    /// the `by=` of turn `node`'s open record, which the ring still holds (as
+    /// [`Self::restated_ledger`] reads it), as the id `op_by=` takes, so a
+    /// `brief` holding the close alone still names the turn's author. Only
+    /// a turn's, and only an opener the record names (`-` restates
+    /// nothing). It is restated whoever closes the turn, so a reader never
+    /// takes the closer for the opener: a turn nobody opened (`by=-`) that
+    /// the transcript closes `by=vendor` names no `op_by=`, where one the
+    /// vendor opened would. HOST tier ([`Key::OpBy`]): an edge's raw sid
+    /// never reaches the bus by it.
+    fn restated_opener(&self, node: Node) -> Option<ShortId> {
+        if node.lvl != Lvl::Turn {
+            return None;
+        }
+        let by = self
+            .ring
+            .iter()
+            .rev()
+            .find(|e| e.rec.node == node && e.rec.op == Op::Open)
+            .map(|e| e.rec.by)?;
+        // `-` is how `Actor::Nobody` (and a sid named like an actor word)
+        // prints: no author to restate.
+        match by.word() {
+            "-" => None,
+            word => ShortId::new(word),
+        }
+    }
+
     /// Append a record that fits: assign its seq, apply it to the fold,
     /// index it, then evict a batch when the ring is past its limits.
     fn push(&mut self, mut rec: Rec) -> u64 {
@@ -2093,7 +2182,11 @@ impl Log {
         self.fold.apply(&rec);
         self.index_push(&rec, bytes);
         self.heap = self.heap.saturating_add(entry_heap(&rec));
-        self.ring.push_back(Entry { rec, bytes, ms });
+        self.ring.push_back(Entry {
+            rec: Arc::new(rec),
+            bytes,
+            ms,
+        });
         self.bytes = self.bytes.saturating_add(bytes);
         // A claim's append keeps the marks within their quarter of the ring
         // (`log_quota`), before any batch: the batch then sees the ring the

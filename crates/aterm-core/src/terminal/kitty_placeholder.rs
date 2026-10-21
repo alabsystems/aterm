@@ -11,7 +11,7 @@
 //! serves the renderer (`render_cells::images_row_into`) and the handler, which damages the
 //! cells an image change repaints.
 
-use aterm_grid::{CellExtra, Grid};
+use aterm_grid::{CellExtra, Grid, PackedColors};
 
 /// The Kitty Unicode placeholder base character.
 pub(crate) const PLACEHOLDER: char = '\u{10EEEE}';
@@ -32,17 +32,25 @@ pub(crate) struct PlaceholderCell {
     pub(crate) col: u16,
 }
 
-/// Decode the cell at (`row`, `col`) of `grid`, whose extra is `extra`, if it is
-/// a Kitty Unicode placeholder; `None` for any other cell. A missing diacritic
-/// decodes as `0`.
+/// Decode the cell at live screen (`row`, `col`) of `grid`, whose extra is
+/// `extra`, if it is a Kitty Unicode placeholder; `None` for any other cell. A
+/// missing diacritic decodes as `0`.
+///
+/// The coordinates are the extras map's, which name the live screen whatever
+/// the viewport shows, so the cell is read off the live row
+/// ([`Grid::row_at_screen`]), not through the display offset `Grid::cell`
+/// applies, which while scrolled back pairs another row's text with this
+/// cell's extras.
 pub(crate) fn decode_cell(
     grid: &Grid,
     row: u16,
     col: u16,
     extra: &CellExtra,
 ) -> Option<PlaceholderCell> {
-    // The placeholder is non-BMP, so it always resolves via the overflow table.
-    if grid.resolved_char(row, col) != Some(PLACEHOLDER) {
+    let cell = grid.row_at_screen(row)?.get(col)?;
+    // The placeholder is non-BMP, so it is always a complex cell, resolved via
+    // the overflow table.
+    if !cell.is_complex() || grid.complex_char_at(row, col) != Some(PLACEHOLDER) {
         return None;
     }
     let marks = extra.combining();
@@ -52,24 +60,26 @@ pub(crate) fn decode_cell(
         .underline_color_index()
         .map_or_else(|| extra.underline_color().map_or(0, rgb_id), u32::from);
     Some(PlaceholderCell {
-        image_id: (id_high << 24) | fg_image_id(grid, row, col),
+        image_id: (id_high << 24) | fg_image_id(grid, row, col, cell.colors()),
         placement_id,
         row: u16::try_from(mark(0)).unwrap_or(0),
         col: u16::try_from(mark(1)).unwrap_or(0),
     })
 }
 
-/// The low 24 bits of a Kitty image id, encoded in a cell's foreground color:
+/// The low 24 bits of a Kitty image id, encoded in the foreground color of
+/// the live cell at screen (`row`, `col`), whose packed colours are `colors`:
 /// an RGB fg is `(r<<16)|(g<<8)|b`; an indexed fg is the palette index; a
 /// default fg is 0 (matching kitty's `colorToId`).
-fn fg_image_id(grid: &Grid, row: u16, col: u16) -> u32 {
+fn fg_image_id(grid: &Grid, row: u16, col: u16, colors: PackedColors) -> u32 {
     if let Some(rgb) = grid.fg_rgb_at(row, col) {
         return rgb_id(rgb);
     }
-    grid.cell(row, col)
-        .map(aterm_grid::Cell::colors)
-        .filter(aterm_grid::PackedColors::fg_is_indexed)
-        .map_or(0, |colors| u32::from(colors.fg_index()))
+    if colors.fg_is_indexed() {
+        u32::from(colors.fg_index())
+    } else {
+        0
+    }
 }
 
 /// A 24-bit id spelled as an RGB colour.

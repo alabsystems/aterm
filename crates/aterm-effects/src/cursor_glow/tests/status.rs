@@ -102,7 +102,8 @@ fn unauthored_output_is_declined_and_the_status_verb_shows_it_dark() {
 fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     let base = TrailStatus {
         style_raw: "rainbow kitty pet",
-        style: GlowStyle::RainbowKitty,
+        style: Some(GlowStyle::RainbowKitty),
+        unknown: false,
         config_enabled: true,
         effective: true,
         focused: true,
@@ -158,6 +159,8 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
             park_returns: 5,
             park_flushed: 6,
         },
+        comet_cells: 7,
+        comet_alpha_max: 96,
     };
     let line = base.line();
     for key in [
@@ -206,6 +209,9 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         " swallowed_no_echo=4",
         " park_returns=5",
         " park_flushed=6",
+        " issue=none",
+        " comet_cells=7",
+        " comet_alpha_max=96",
     ] {
         assert!(line.contains(key), "missing {key:?} in {line}");
     }
@@ -217,6 +223,16 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     );
     // One line: a status the caller can grep without reassembly.
     assert!(!line.contains('\n'), "the status row is one line: {line}");
+    // A style that draws nothing says so, not the engine's placeholder enum.
+    let off = TrailStatus {
+        style_raw: "off",
+        style: None,
+        effective: false,
+        intensity: 0.0,
+        ..base
+    }
+    .line();
+    assert!(off.contains(" resolved=off "), "{off}");
     // Never a fabricated reason.
     let quiet = TrailStatus {
         tally: AdmissionTally::default(),
@@ -302,7 +318,8 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
 fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
     TrailStatus {
         style_raw: "rainbow kitty pet",
-        style: GlowStyle::RainbowKitty,
+        style: Some(GlowStyle::RainbowKitty),
+        unknown: false,
         config_enabled: true,
         effective: true,
         focused: true,
@@ -340,7 +357,75 @@ fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
         flow,
         inserts: InsertTally::default(),
         in_flight: InFlightTally::default(),
+        comet_cells: 0,
+        comet_alpha_max: 0,
     }
+}
+
+/// `resolved=` names what the spelling resolved to: `off` resolves to NO
+/// style and the row says `off` rather than the placeholder enum a disabled
+/// config carries. A spelling naming nothing drawable (a typo, a bare
+/// `pack:`, a pack that did not load) falls back to the default style, so the
+/// row reads that default and `issue=` says why it was not honoured as
+/// written (the control: a style honoured as written reads `issue=none`).
+#[test]
+fn the_row_reports_off_and_names_why_a_spelling_fell_back() {
+    let dark = TrailStatus {
+        effective: false,
+        intensity: 0.0,
+        ribbon_look: "none",
+        ..row_for(rk::Flow::default())
+    };
+    let off = TrailStatus {
+        style_raw: "off",
+        style: None,
+        unknown: false,
+        ..dark
+    }
+    .line();
+    assert!(
+        off.contains(" resolved=off ") && off.contains(" issue=none"),
+        "{off}"
+    );
+    for raw in ["rainbw", "pack:synthwav"] {
+        let line = TrailStatus {
+            style_raw: raw,
+            style: Some(GlowStyle::RainbowKitty),
+            unknown: true,
+            ..row_for(rk::Flow::default())
+        }
+        .line();
+        assert!(
+            line.contains(" resolved=rainbow-kitty ") && line.contains(" issue=unknown"),
+            "{line}"
+        );
+    }
+    let honoured = TrailStatus {
+        style_raw: "rainbow kitty",
+        style: Some(GlowStyle::RainbowKitty),
+        unknown: false,
+        ..row_for(rk::Flow::default())
+    }
+    .line();
+    assert!(
+        honoured.contains(" resolved=rainbow-kitty ") && honoured.contains(" issue=none"),
+        "{honoured}"
+    );
+    let comet = TrailStatus {
+        style_raw: "comet",
+        style: Some(GlowStyle::Comet),
+        ribbon_look: "none",
+        comet_cells: 12,
+        comet_alpha_max: 140,
+        ..row_for(rk::Flow::default())
+    }
+    .line();
+    assert!(
+        comet.contains(" resolved=comet ")
+            && comet.contains(" ribbon_look=none ")
+            && comet.contains(" comet_cells=12 comet_alpha_max=140"),
+        "{comet}"
+    );
 }
 
 /// The row reports the engine's flow: a run of fast keys moves `flow=` and
@@ -481,7 +566,8 @@ fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
 fn the_status_row_names_who_owns_the_block_cursor() {
     let quiet = TrailStatus {
         style_raw: "lumen",
-        style: GlowStyle::Lumen,
+        style: Some(GlowStyle::Lumen),
+        unknown: false,
         config_enabled: true,
         effective: true,
         focused: true,
@@ -519,6 +605,8 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         flow: rk::Flow::default(),
         inserts: InsertTally::default(),
         in_flight: InFlightTally::default(),
+        comet_cells: 0,
+        comet_alpha_max: 0,
     };
     let line = quiet.line();
     assert!(
@@ -634,6 +722,52 @@ fn the_status_row_names_who_owns_the_block_cursor() {
     }
     // One line, still — the whole row stays greppable without reassembly.
     assert!(!owned.line().contains('\n'));
+}
+
+/// The engine asks its host for the rows above and below the caret's for
+/// every style with an over-text rule that reads them, not only while the
+/// rainbow kitty owns the frame: Fire (its over-ink ledger and light flame
+/// cap), the beam family (its dark bed's split between bed and beam) and the
+/// particle styles count an unread row as text or as air, which is wrong
+/// either way over a blank row or old output, and the classic wake's mono
+/// face (its bed's rail and its over-ink account). Negative control: the
+/// classic wake's spectrum face reads neither, and a fresh engine has no
+/// style.
+#[test]
+fn the_styles_that_read_the_flanking_rows_ask_for_them() {
+    let g = geom();
+    let ask_face = |style: GlowStyle, mono: bool| {
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let c = GlowConfig {
+            classic_mono: mono,
+            ..cfg(style, true)
+        };
+        glow.tick(Some((2, 3)), Instant::now(), &c, g, &mut out);
+        glow.reads_neighbor_rows()
+    };
+    let ask = |style: GlowStyle| ask_face(style, false);
+    assert!(
+        ask_face(GlowStyle::Classic, true),
+        "the classic wake's mono face reads the flanking rows"
+    );
+    for style in [
+        GlowStyle::Fire,
+        GlowStyle::Comet,
+        GlowStyle::Sparkle,
+        GlowStyle::Laser,
+        GlowStyle::Lumen,
+        GlowStyle::Phaser,
+        GlowStyle::Water,
+        GlowStyle::Beam,
+    ] {
+        assert!(ask(style), "{style:?} reads the flanking rows");
+    }
+    assert!(
+        !ask(GlowStyle::Classic),
+        "control: the classic wake reads neither"
+    );
+    assert!(!CursorGlow::default().reads_neighbor_rows());
 }
 
 /// The classic wake lights every observed move without the licensed spawn

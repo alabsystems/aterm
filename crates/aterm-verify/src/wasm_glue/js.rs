@@ -978,7 +978,7 @@ mod tests {
             Err(aterm_uds::deadline::RunError::Spawn(e)) => panic!(
                 "{}: node could not start ({e}); the generated glue runs under node; {}",
                 crate::libtest::COULD_NOT_RUN_SENTINEL,
-                crate::install_fix("node", "node", "nodejs")
+                aterm_uds::host::tool("node").remedy()
             ),
             Err(e) => panic!("Node fixture did not complete: {e}"),
         };

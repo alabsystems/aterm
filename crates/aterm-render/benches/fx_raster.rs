@@ -15,6 +15,9 @@
 //!   opaque and gradient quads, the shared `draw_flat_add` loop the fx rects
 //!   now share (`fill_glow_span`); its body uses only APIs older than the fx
 //!   layers, so the same function measures a pre-fx tree.
+//! * `scroll_under_card`: an inline stream (one line a frame) on the cached
+//!   path with and without a settled card layer, against full repaints of the
+//!   same frames, the price B1a's refusal of the blit paid (§4.4).
 //!
 //! ```sh
 //! targo --unverified bench -p aterm-render --bench fx_raster
@@ -42,6 +45,7 @@ fn main() {
     sprite_vs_rects(&mut rend, Scale::Between);
     settled_at_rest(&mut rend);
     glow_stream(&mut rend);
+    scroll_under_card(&mut rend);
 }
 
 const ROWS: usize = 12;
@@ -411,4 +415,111 @@ fn glow_stream(rend: &mut Renderer) {
         us(m[1]),
         us(m[1]) - us(m[0]),
     );
+}
+
+/// THE BLIT UNDER A SETTLED CARD (§4.4): a Claude-sized frame streaming one
+/// line a frame on the cached path, with no layer (the blit alone) and under
+/// a settled card layer (the blit plus the card's bands, re-rastered over the
+/// slid pixels), each frame checked to take the blit; and the same frames
+/// repainted in full, which is what every frame paid while a layer refused
+/// the blit (B1a). Two cards: the card's own shape (a 2 px ring round an
+/// 8-row box, with the dithered kitty in it) and a worst case that fills the
+/// box with light. Frame building is outside the timed span.
+fn scroll_under_card(rend: &mut Renderer) {
+    const SROWS: usize = 40;
+    const SCOLS: usize = 100;
+    let (cw, ch) = rend.cell_size();
+    let art = dithered_art();
+    let (left, top) = (cw as i32, 28 * ch as i32);
+    let (w, h) = ((90 * cw) as u16, (8 * ch) as u16);
+    let kitty = FxItem::Sprite(FxSprite {
+        x: 70 * cw as i32,
+        y: top + ch as i32,
+        dw: 4 * art.w(),
+        dh: 3 * art.h(),
+        flip_x: false,
+        art,
+        ink: 2,
+        clip: PxRect::EVERYWHERE,
+    });
+    let rect = |x: i32, y: i32, w: u16, h: u16| FxItem::Rect(FxRect { x, y, w, h, ink: 0 });
+    let card = |items: Vec<FxItem>| {
+        FxLayer::new(
+            7,
+            Arc::new(FxContent::new(
+                items,
+                vec![
+                    FxInk::add(0x0020_1008),
+                    FxInk::add(0x0008_1020),
+                    FxInk::add(0x0040_3020),
+                    FxInk::add(0x0030_2010),
+                    FxInk::add(0x0010_2030),
+                ],
+            )),
+            FxSlot::Under,
+            FxSpace::Grid,
+            FxBlend::Exact,
+        )
+    };
+    let ring = card(vec![
+        rect(left, top, w, 2),
+        rect(left, top + i32::from(h) - 2, w, 2),
+        rect(left, top, 2, h),
+        rect(left + i32::from(w) - 2, top, 2, h),
+        kitty.clone(),
+    ]);
+    let filled = card(vec![rect(left, top, w, h), kitty]);
+    let mut run = |layers: &[FxLayer], cached: bool| {
+        let mut t = Terminal::new(SROWS as u16, SCOLS as u16);
+        t.process(b"\x1b[?25l");
+        for i in 0..SROWS {
+            t.process(format!("warm {i}\r\n").as_bytes());
+        }
+        let mut wc = WindowCpu::new();
+        let (mut times, mut marked) = (Vec::with_capacity(ITERS), 0);
+        for i in 0..8 + ITERS {
+            let pad = "the quick brown fox ".repeat(1 + i % 4);
+            t.process(format!("streamed line {i} {pad}\r\n").as_bytes());
+            let mut input = t.cell_frame(SROWS, SCOLS);
+            input.fx_layers = layers.to_vec();
+            let s = Instant::now();
+            if cached {
+                black_box(rend.render_input_cached(&mut wc, &input).pixels()[0]);
+            } else {
+                black_box(rend.render_input(&input).pixels[0]);
+            }
+            let spent = s.elapsed();
+            if i < 8 {
+                continue;
+            }
+            times.push(spent);
+            if cached {
+                assert!(
+                    matches!(wc.last_damage(), DamageOutcome::Scroll { .. }),
+                    "every streamed frame takes the blit ({:?})",
+                    wc.last_damage()
+                );
+                marked += wc.dirty_rows().iter().filter(|&&d| d).count();
+            }
+        }
+        (us(median(times)), marked as f64 / ITERS as f64)
+    };
+    let (blit, rows) = run(&[], true);
+    let (full, _) = run(&[], false);
+    println!(
+        "scroll_under_card (one streamed line a frame, {SCOLS}x{SROWS} cells, an 8-row card): \
+         no layer: the blit {blit:.1} us ({rows:.1} rows), a full repaint {full:.1} us"
+    );
+    for (what, layer) in [
+        ("the card's ring and kitty", &ring),
+        ("a filled box", &filled),
+    ] {
+        let (held, rows) = run(std::slice::from_ref(layer), true);
+        let (full, _) = run(std::slice::from_ref(layer), false);
+        println!(
+            "scroll_under_card ({what}): the blit under it {held:.1} us ({rows:.1} rows), \
+             a full repaint under it (B1a's refusal) {full:.1} us ({:.2}x)",
+            full / held,
+        );
+    }
 }

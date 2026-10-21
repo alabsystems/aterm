@@ -171,19 +171,31 @@ fn a_declined_seed_adopts_nothing_and_lays_no_stubs() {
     // NON-VACUITY: the same fixture with the default config reaches the
     // adoption line and lays the stubs, so the empty lists above are the gate's doing.
     // (A build that pins no root key is disabled either way and has nothing to show.)
-    if atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        let fx = Fixture::new("enabled");
-        let out = fx.seed(false);
-        let text = describe(&out);
-        assert!(
-            fx.layout.adopted().is_file(),
-            "an enabled seed adopts: {text}"
+    needs_a_pinned_root();
+    let fx = Fixture::new("enabled");
+    let out = fx.seed(false);
+    let text = describe(&out);
+    assert!(
+        fx.layout.adopted().is_file(),
+        "an enabled seed adopts: {text}"
+    );
+    assert!(
+        fx.layout.bin_dir().is_dir(),
+        "an enabled seed lays pending stubs: {text}"
+    );
+    assert!(fx.zsh_hook().is_file(), "and the shell hooks: {text}");
+}
+
+/// End the calling test COULD NOT RUN in a build that pins no root key
+/// ([`atpkg::PKG_TRUST_ANCHORS`] empty): the manager is off there and adopts nothing,
+/// so an enabled seed has nothing to show. Every build of this tree pins one
+/// (atpkg-keys' `owner_to_client` asserts it); the call keeps a build that does not
+/// from passing a test that ran nothing.
+fn needs_a_pinned_root() {
+    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
+        aterm_uds::host::could_not_run(
+            "this build pins no root key, so the package manager is off and adopts nothing",
         );
-        assert!(
-            fx.layout.bin_dir().is_dir(),
-            "an enabled seed lays pending stubs: {text}"
-        );
-        assert!(fx.zsh_hook().is_file(), "and the shell hooks: {text}");
     }
 }
 
@@ -212,9 +224,7 @@ fn a_seed_on_a_declined_store_writes_nothing() {
 /// documents).
 #[test]
 fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return; // A build that pins no root key adopts nothing (the test above).
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("hooks");
     let out = fx.seed(false);
     let text = describe(&out);
@@ -226,6 +236,9 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
     );
 
     let bin = fx.layout.bin_dir();
+    // Where the hooked shell cannot run, the rest still runs, then the test ends COULD
+    // NOT RUN.
+    let mut not_run = None;
     match in_hooked_zsh(&fx, "print -r -- $PATH; whence -p targo") {
         Ok(shell) => {
             assert!(shell.status.success(), "{}", describe(&shell));
@@ -249,7 +262,7 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
                 && std::fs::symlink_metadata("/bin/zsh")
                     .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
         {
-            eprintln!("unavailable: /bin/zsh is absent; shell-hook execution was not checked");
+            not_run = Some("/bin/zsh is absent, so no hooked shell's PATH or `targo` was read");
         }
         Err(e) => panic!("run zsh: {e}"),
     }
@@ -287,6 +300,9 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
         "a deleted block is not re-added: {}",
         describe(&again)
     );
+    if let Some(why) = not_run {
+        aterm_uds::host::could_not_run(why);
+    }
 }
 
 /// ONE STORE WHATEVER `$XDG_DATA_HOME` SAYS (docs/TOOLCHAIN-PACKAGE-MANAGER.md §10). The
@@ -296,9 +312,7 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
 /// empty store the hooks move to (and a multi-GB set downloaded twice).
 #[test]
 fn the_store_and_its_hook_do_not_follow_xdg_data_home() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return; // A build that pins no root key adopts nothing.
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("xdg-data");
     fx.configure(false);
     let data = fx.home.join("data");
@@ -491,9 +505,7 @@ fn exit_and_stdout(mut child: Child) -> (std::process::ExitStatus, String) {
 /// stub, the command runs with its arguments and its stdout is the tool's alone.
 #[test]
 fn an_unattended_targo_waits_for_trust_and_then_runs() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("wait");
     let out = fx.seed(false);
     assert!(out.status.success(), "{}", describe(&out));
@@ -527,9 +539,7 @@ fn an_unattended_targo_waits_for_trust_and_then_runs() {
 /// wait that ended only with the pass would hold the tool call for the pass's whole length.
 #[test]
 fn an_unattended_targo_answers_once_trust_lands_without_it() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("landed-without");
     let out = fx.seed(false);
     assert!(out.status.success(), "{}", describe(&out));
@@ -560,9 +570,7 @@ fn an_unattended_targo_answers_once_trust_lands_without_it() {
 /// gone keeps nobody waiting — the same stub answers 127 at once.
 #[test]
 fn an_unattended_targo_waits_for_the_pass_the_window_seed_promised() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("promise");
     let out = fx.seed(false);
     assert!(out.status.success(), "{}", describe(&out));
@@ -657,9 +665,7 @@ fn an_unattended_targo_waits_for_the_pass_the_window_seed_promised() {
 /// fires if it does).
 #[test]
 fn a_waiting_targo_answers_once_the_promised_plan_leaves_trust_out() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("left-out");
     let out = fx.seed(false);
     assert!(out.status.success(), "{}", describe(&out));
@@ -694,9 +700,7 @@ fn a_waiting_targo_answers_once_the_promised_plan_leaves_trust_out() {
 /// so a stub waiting on it answers at once rather than at the promise's deadline.
 #[test]
 fn a_whole_update_ends_the_promise_it_was_spawned_on() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("promise-end");
     let config = fx.root.path().join("config");
     std::fs::create_dir_all(config.join("aterm")).unwrap();
@@ -766,9 +770,7 @@ fn a_whole_update_ends_the_promise_it_was_spawned_on() {
 #[test]
 fn a_window_seed_asks_no_index_and_a_typed_one_does() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return; // A build that pins no root key adopts nothing and asks nothing.
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("window");
     let config = fx.root.path().join("config");
     std::fs::create_dir_all(config.join("aterm")).unwrap();
@@ -931,9 +933,7 @@ fn window_seed(fx: &Fixture, spawner: u32) {
 /// and the window's update, whose spawner holds it, retires it when it returns.
 #[test]
 fn a_typed_update_leaves_a_window_seeds_promise_to_that_window() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("foreign-retire");
     no_vendors(&fx);
     let me = std::process::id().to_string();
@@ -968,9 +968,7 @@ fn a_typed_update_leaves_a_window_seeds_promise_to_that_window() {
 /// same promise naming the live owner as it started keeps the stub waiting.
 #[test]
 fn a_promise_whose_owner_pid_is_another_process_keeps_nobody_waiting() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("promise-born");
     let out = fx.seed(false);
     assert!(out.status.success(), "{}", describe(&out));
@@ -1005,9 +1003,7 @@ fn a_promise_whose_owner_pid_is_another_process_keeps_nobody_waiting() {
 #[test]
 fn a_pending_stub_says_whether_a_person_asked() {
     use std::os::fd::{FromRawFd as _, OwnedFd};
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("asker");
     let out = fx.seed(false);
     assert!(out.status.success(), "{}", describe(&out));
@@ -1055,9 +1051,7 @@ fn a_pending_stub_says_whether_a_person_asked() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandboxed_stub_that_cannot_read_the_owners_start_time_still_waits() {
-    if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        return;
-    }
+    needs_a_pinned_root();
     let fx = Fixture::new("promise-sandboxed");
     let out = fx.seed(false);
     assert!(out.status.success(), "{}", describe(&out));

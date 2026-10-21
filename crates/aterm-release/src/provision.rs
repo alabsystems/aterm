@@ -17,7 +17,8 @@
 //! LIVE-tested notarytool credential, the credentials profile, `gh` auth and the
 //! channel token. On a machine with none of that, the front door is `aterm pkg install
 //! trust`, then this verb: a full run first ACQUIRES the stock exceptions it audits
-//! ([`acquire`]: rustup, the stable slices, the wasm32 pin, rustup's `trust` link).
+//! ([`acquire`]: rustup, the stable slices, the wasm32 pin, rustup's `trust` link, the
+//! wasm-glue oracle's wasm-bindgen).
 //!
 //! The order is the safety argument:
 //!
@@ -2502,7 +2503,11 @@ fn gh_verdict(ran: std::result::Result<(bool, String), String>) -> Check {
         Err(e) => {
             return Check::Fail {
                 what: format!("could not run gh: {e}"),
-                fix: "install the GitHub CLI (`brew install gh`), then `gh auth login`".into(),
+                // The owner's on a release host (docs/DESIGN-init-system-2026-10-20.md §4.6):
+                // aterm installs no gh, and S15's REST retires it.
+                fix: "the GitHub CLI is the owner's to put on a release host (aterm installs \
+                      none), then `gh auth login`"
+                    .into(),
             };
         }
     };

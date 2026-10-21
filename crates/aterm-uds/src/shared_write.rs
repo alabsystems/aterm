@@ -975,6 +975,35 @@ mod tests {
         }
     }
 
+    /// A path is judged as it stands, a final link not followed: a link reads as its own
+    /// `0777` (every Linux link's; Darwin's is set so here), never as the `0644` file it names.
+    /// The install-path walk refuses a link itself, so this is what a component swapped for a
+    /// link between the walk's `lstat` and this judgment reads as.
+    #[test]
+    fn a_link_is_judged_as_it_stands_not_through() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-uds-shared-write.")
+            .tempdir()
+            .expect("scratch");
+        let file = scratch.path().join("file");
+        std::fs::write(&file, "").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        #[cfg(target_vendor = "apple")]
+        {
+            let c = std::ffi::CString::new(link.as_os_str().as_encoded_bytes()).expect("path");
+            // SAFETY: a NUL-terminated path, live for the call.
+            let rc = unsafe {
+                libc::fchmodat(libc::AT_FDCWD, c.as_ptr(), 0o777, libc::AT_SYMLINK_NOFOLLOW)
+            };
+            assert_eq!(rc, 0, "lchmod: {}", std::io::Error::last_os_error());
+        }
+        assert!(!others_can_write_at(&file).expect("judged"));
+        assert!(others_can_write_at(&link).expect("judged"));
+    }
+
     /// The walk over the accounts: it keeps the uids whose primary group is the one asked,
     /// grows the record buffer on `ERANGE` (the same entry asked again) up to the limit and
     /// no further, and a failure at any step, though every entry before it admits the group,

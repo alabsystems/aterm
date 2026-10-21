@@ -34,6 +34,7 @@ fn facts(view: AutopilotView) -> MenuFacts {
         land_at: None,
         armed_at_ms: None,
         armed: None,
+        set_by: None,
     }
 }
 
@@ -532,6 +533,103 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
     );
 }
 
+/// WHO SET IT, UNDER THE HEADER (design §11.7.1, §11.7.3, item 6): the note
+/// is one inert row under the header in the note's ink — never chosen, never
+/// lit — where it is whole in the card's room; broken at its comma onto two
+/// rows where only its halves are whole (`… from Settings ▸ Harness,` then
+/// `every session`); absent where no half is; and absent with no setter.
+/// IT GIVES WAY FIRST ([`fit_rows`]): in a pane that holds every choice only
+/// without it, or only by moving the card over its chip, the card drops the
+/// note and keeps every choice whole on its side. NEGATIVE CONTROL: the rows
+/// placed with the note in that tight pane cut the card to a prefix (the
+/// in-test check below), which `fit_rows` returning its rows untouched would
+/// ship.
+#[test]
+fn the_setters_note_is_whole_or_absent_and_gives_way_first() {
+    let with = |set_by: &str, room: usize| {
+        rows(&MenuFacts {
+            set_by: Some(set_by.to_string()),
+            room,
+            ..facts(AutopilotView::Off)
+        })
+    };
+    let notes = |rows: &[MenuRow]| -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| match r {
+                MenuRow::SetBy { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let plain = rows(&facts(AutopilotView::Off));
+    let noted = with("set 14:05 over aterm ctl", MAX_CONTENT);
+    assert_eq!(notes(&plain), Vec::<String>::new(), "no setter, no note");
+    assert_eq!(
+        noted[1],
+        MenuRow::SetBy {
+            text: "set 14:05 over aterm ctl".into(),
+            floor: 0
+        },
+        "under the header"
+    );
+    assert_eq!(noted.len(), plain.len() + 1);
+    assert_eq!(keys(&noted[2..]), keys(&plain[1..]), "every choice kept");
+    assert!(!noted[1].selectable());
+    assert_eq!(
+        step(&noted, None, true, noted.len()),
+        Some(2),
+        "the first choice is lit, never the note"
+    );
+    // The bulk row's words are wider than the card: two whole rows.
+    let bulk = "set 14:05 from Settings \u{25b8} Harness, every session";
+    assert!(display_cells(bulk) > MAX_CONTENT);
+    assert_eq!(
+        notes(&with(bulk, MAX_CONTENT)),
+        ["set 14:05 from Settings \u{25b8} Harness,", "every session"]
+    );
+    // A room no half fits: none, never a cut note.
+    assert_eq!(notes(&with(bulk, 24)), Vec::<String>::new());
+    assert_eq!(
+        notes(&with("set 14:05 over aterm ctl", 20)),
+        Vec::<String>::new()
+    );
+
+    // THE NOTE GIVES WAY: the chip on the frame's last row, a tab strip of
+    // one row. Tall, the card hangs above it with the note.
+    let fit = |frame_rows: usize, chip_row: usize| {
+        let pane = (0..frame_rows, 0..120);
+        let fitted = fit_rows(
+            noted.clone(),
+            (chip_row, 4),
+            pane.clone(),
+            (120, frame_rows),
+            1,
+        );
+        let rect = place(&fitted, (chip_row, 4), pane, (120, frame_rows), 1).expect("a card");
+        (fitted, rect)
+    };
+    let (kept, rect) = fit(24, 23);
+    assert_eq!(kept, noted, "room for it: kept");
+    assert_eq!(rect.h, noted.len() + 2, "whole");
+    assert!(rect.row + rect.h <= 23, "above its chip");
+    // Twelve rows above the chip: the plain card whole above it, the noted
+    // one only over the chip — the note goes.
+    let (fitted, rect) = fit(15, 13);
+    assert_eq!(fitted, plain, "the note gave way");
+    assert_eq!(rect.h, plain.len() + 2, "every choice whole");
+    assert!(rect.row + rect.h <= 13, "still above its chip");
+    // Twelve rows in all: the plain card only over the chip, whole; with
+    // the note, a prefix.
+    let (fitted, rect) = fit(13, 12);
+    assert_eq!(fitted, plain);
+    assert_eq!(rect.h, plain.len() + 2, "whole");
+    let cut = place(&noted, (12, 4), (0..13, 0..120), (120, 13), 1).expect("a card");
+    assert!(
+        cut.h < noted.len() + 2,
+        "CONTROL: with the note this pane shows a prefix ({cut:?})"
+    );
+}
+
 /// A headless App with a host, its session a Claude Code pane drawn with its
 /// footer (the chips' fixture in `claude_lights`): 120 columns, the facts
 /// published, the composer between its two rules.
@@ -759,7 +857,11 @@ fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
     let (mut app, wid, session, host) = claude_app();
     frame(&mut app, wid);
     crate::autopilot_timers::set_fake_clocks(None);
-    assert!(app.choose_autopilot_timer(session, crate::autopilot_timers::TimerChoice::In(120)));
+    assert!(app.choose_autopilot_timer(
+        session,
+        crate::autopilot_timers::TimerChoice::In(120),
+        crate::autopilot::Surface::Menu
+    ));
     frame(&mut app, wid);
     let press_row = |app: &mut App, key: &str| {
         let menu = app.autopilot_menu.as_ref().unwrap();
@@ -1283,7 +1385,11 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
     let lines = |app: &App| app.autopilot_menu_controls().join("\n");
 
     // A wire Off whose wake lands under the open menu: rebuilt.
-    assert!(app.choose_autopilot_timer(session, crate::autopilot_timers::TimerChoice::In(120)));
+    assert!(app.choose_autopilot_timer(
+        session,
+        crate::autopilot_timers::TimerChoice::In(120),
+        crate::autopilot::Surface::Menu
+    ));
     frame(&mut app, wid);
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
@@ -1317,7 +1423,11 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
 
     // A wire Off stored, its wake in flight: the cancel the menu still shows
     // writes nothing.
-    assert!(app.choose_autopilot_timer(session, crate::autopilot_timers::TimerChoice::In(120)));
+    assert!(app.choose_autopilot_timer(
+        session,
+        crate::autopilot_timers::TimerChoice::In(120),
+        crate::autopilot::Surface::Menu
+    ));
     frame(&mut app, wid);
     app.open_front_autopilot_menu().unwrap();
     let at = row_of(&app, cancel).expect("offered");
@@ -1332,7 +1442,11 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
 
     // A new arm stored at another instant, its wake in flight: the cancel
     // names the old one, and drops nothing.
-    assert!(app.choose_autopilot_timer(session, crate::autopilot_timers::TimerChoice::In(60)));
+    assert!(app.choose_autopilot_timer(
+        session,
+        crate::autopilot_timers::TimerChoice::In(60),
+        crate::autopilot::Surface::Menu
+    ));
     frame(&mut app, wid);
     app.open_front_autopilot_menu().unwrap();
     let at = row_of(&app, cancel).expect("offered");
@@ -1356,7 +1470,11 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
     );
 
     // The timer fires under the open menu: rebuilt, Land checked, no cancel.
-    assert!(app.choose_autopilot_timer(session, crate::autopilot_timers::TimerChoice::In(60)));
+    assert!(app.choose_autopilot_timer(
+        session,
+        crate::autopilot_timers::TimerChoice::In(60),
+        crate::autopilot::Surface::Menu
+    ));
     frame(&mut app, wid);
     app.open_front_autopilot_menu().unwrap();
     assert!(row_of(&app, cancel).is_some());
@@ -1375,14 +1493,26 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
     // NEGATIVE CONTROLS: a cancel with no timer stored writes nothing, over
     // `land`, `off` or a bare Cruise.
     let cancel_now = |app: &mut App| {
-        app.choose_autopilot_timer(session, crate::autopilot_timers::TimerChoice::Cancel)
+        app.choose_autopilot_timer(
+            session,
+            crate::autopilot_timers::TimerChoice::Cancel,
+            crate::autopilot::Surface::Menu,
+        )
     };
     assert!(!cancel_now(&mut app));
     assert_eq!(pair(&app, session), (Some("land".into()), None));
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Menu
+    ));
     assert!(!cancel_now(&mut app));
     assert_eq!(pair(&app, session), (Some("off".into()), None));
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Cruise)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Menu
+    ));
     assert!(!cancel_now(&mut app));
     assert_eq!(pair(&app, session), (Some("cruise".into()), None));
     crate::autopilot_timers::set_fake_clocks(None);
@@ -1749,8 +1879,8 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
 /// `ShowContextMenu`, which opens it as the keyboard does — its first
 /// choice lit — so once a frame has painted it the tree's focus is Cruise.
 /// NEGATIVE CONTROLS: the chip's Click still cycles the mode and opens no
-/// menu; `⚙` offers no menu and asking it opens none; a request for a chip
-/// the glass no longer shows (a box covered the composer) opens none.
+/// menu; a request for a chip the glass no longer shows (a box covered the
+/// composer) opens none.
 #[cfg(a11y_tree)]
 #[test]
 fn a_reader_opens_the_menu_from_the_autopilot_chip() {
@@ -1771,11 +1901,6 @@ fn a_reader_opens_the_menu_from_the_autopilot_chip() {
     assert_eq!(node.has_popup(), Some(HasPopup::Menu));
     assert!(node.supports_action(Action::ShowContextMenu));
     assert!(node.supports_action(Action::Click));
-    let (gear, gear_node) = chip(&app, HarnessChip::Settings);
-    assert_eq!(gear_node.has_popup(), None);
-    assert!(!gear_node.supports_action(Action::ShowContextMenu));
-    reader(&mut app, wid, Action::ShowContextMenu, gear);
-    assert!(app.autopilot_menu.is_none(), "⚙ has no menu");
 
     // NEGATIVE CONTROL: a Click cycles the mode and opens no menu.
     let before = pair(&app, session).0;
@@ -1789,9 +1914,16 @@ fn a_reader_opens_the_menu_from_the_autopilot_chip() {
     reader(&mut app, wid, Action::ShowContextMenu, autopilot);
     let menu = app.autopilot_menu.as_ref().expect("opened");
     assert_eq!(menu.session, session);
+    // The first choice, under the header and the note the click's own word
+    // brought (`set … from the chip`, §11.7.1).
+    assert!(
+        matches!(menu.rows.get(1), Some(MenuRow::SetBy { text, .. }) if text.ends_with(" from the chip")),
+        "{:?}",
+        menu.rows.get(1)
+    );
     assert_eq!(
         menu.highlight,
-        Some(1),
+        Some(2),
         "the first choice lit, as a keyboard open"
     );
     frame(&mut app, wid);
@@ -1913,7 +2045,7 @@ fn a_control_click_opens_the_menu_in_terminal_and_mixed_tabs() {
             before,
             "the real chip acts: mixed={mixed}"
         );
-        assert!(app.set_session_autopilot(session, None));
+        assert!(app.set_session_autopilot(session, None, crate::autopilot::Surface::Menu));
         frame(&mut app, wid);
         eprintln!("Ctrl-click fixture: mixed={mixed}, restored composed chip");
         let chip = chip_cell(&app, wid, session);
@@ -1962,17 +2094,26 @@ fn an_armed_timer_can_be_cancelled_without_a_local_time_face() {
     crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
     frame(&mut app, wid);
     // Ordinary localized control before the unavailable-zone case.
-    assert!(app.choose_autopilot_timer(session, TimerChoice::In(60)));
+    assert!(app.choose_autopilot_timer(
+        session,
+        TimerChoice::In(60),
+        crate::autopilot::Surface::Menu
+    ));
     app.open_front_autopilot_menu().unwrap();
     assert!(row_of(&app, "autopilot-menu/land-cancel").is_some());
     app.close_autopilot_menu();
-    assert!(app.choose_autopilot_timer(session, TimerChoice::Cancel));
+    assert!(app.choose_autopilot_timer(
+        session,
+        TimerChoice::Cancel,
+        crate::autopilot::Surface::Menu
+    ));
     let resolved = resolve(When::In(120), wall, &|_| None).expect("elapsed duration needs no zone");
     assert_eq!(resolved.offset_s, None);
     assert!(app.set_session_autopilot_timed(
         session,
         Some(Autopilot::Cruise),
-        Some(resolved.at_ms)
+        Some(resolved.at_ms),
+        crate::autopilot::Surface::Menu
     ));
     app.autopilot_timers
         .arm(session, resolved.at_ms, mono, wall, &|_| None, None);
@@ -2019,7 +2160,7 @@ fn a_menu_opened_before_the_master_switch_went_off_cannot_write_a_mode() {
     let land = row_of(&app, "autopilot-menu/mode/land").unwrap();
     app.choose_autopilot_menu_row(land);
     assert_eq!(pair(&app, session), (Some("land".into()), None));
-    assert!(app.set_session_autopilot(session, None));
+    assert!(app.set_session_autopilot(session, None, crate::autopilot::Surface::Menu));
     frame(&mut app, wid);
     app.open_front_autopilot_menu().unwrap();
     let land = row_of(&app, "autopilot-menu/mode/land").unwrap();
@@ -2461,6 +2602,45 @@ fn the_menus_harness_settings_lands_the_page_on_its_sessions_row() {
     host.shutdown_and_join();
 }
 
+/// THE MENU'S CARD IS THE PET'S OVERLAY, NOT ITS GROUND (review of
+/// owner-eye-6, lab `rv-day-menu`): the splice notes the card apart from the
+/// chrome (`PetChrome::note_overlay`), so the pet's rest seat is solved
+/// without it and opening the menu sends the sleeping cat nowhere; closing
+/// it clears the overlay. NEGATIVE CONTROL (as run, failing this test): the
+/// card noted as chrome (`PetChrome::note`), it is ground.
+#[test]
+fn the_open_menus_card_is_the_pets_overlay_not_its_ground() {
+    let (mut app, wid, _session, host) = claude_app();
+    let _host = MenuTestHost(host);
+    frame(&mut app, wid);
+    app.open_front_autopilot_menu().unwrap();
+    frame(&mut app, wid);
+    let rect = app
+        .autopilot_menu
+        .as_ref()
+        .and_then(|m| m.rect)
+        .expect("painted");
+    let dims = |r: &aterm_effects::pet_world::PetRect| (r.rows, r.cols);
+    let card = (rect.h as f32, rect.w as f32);
+    let chrome = &app.windows[&wid].pet_chrome;
+    assert_eq!(
+        chrome.held_overlays().iter().map(dims).collect::<Vec<_>>(),
+        [card],
+        "the card is the one overlay"
+    );
+    assert!(
+        chrome.held().iter().all(|r| dims(r) != card),
+        "and no chrome: {:?}",
+        chrome.held()
+    );
+    assert!(app.close_autopilot_menu());
+    frame(&mut app, wid);
+    assert!(
+        app.windows[&wid].pet_chrome.held_overlays().is_empty(),
+        "closed, no overlay"
+    );
+}
+
 /// THE CARD IS ON TOP OF THE CARET AND THE PET (surfaces-F3): an open menu
 /// is painted after the frame published its overlays, so the composer's
 /// caret under it and the resident pet sitting where it opened would paint
@@ -2555,8 +2735,16 @@ fn repainted(
     cell_h: usize,
 ) -> Vec<usize> {
     let mut dirty = Vec::new();
-    match aterm_render::compute_dirty_rows(prev, now, false, None, false, None, cell_h, &mut dirty)
-    {
+    match aterm_render::compute_dirty_rows(
+        prev,
+        now,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, cell_h),
+        &mut dirty,
+    ) {
         aterm_render::DirtyDecision::FullRepaint => (0..now.rows).collect(),
         aterm_render::DirtyDecision::Rows(_) => (0..dirty.len()).filter(|&r| dirty[r]).collect(),
     }
@@ -2727,7 +2915,11 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
         };
         for before_the_frame in [true, false] {
             crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
-            assert!(app.choose_autopilot_timer(session, TimerChoice::In(60)));
+            assert!(app.choose_autopilot_timer(
+                session,
+                TimerChoice::In(60),
+                crate::autopilot::Surface::Menu
+            ));
             frame(&mut app, wid);
             app.open_front_autopilot_menu().unwrap();
             frame(&mut app, wid);
@@ -2779,7 +2971,10 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
         arm_elsewhere(&mut app, session);
         frame(&mut app, wid);
         let grown = rect_of(&app).expect("painted");
-        assert_eq!(grown.h, rect.h + 1, "the cancel row arrived: the card grew");
+        // The cancel row arrived, and the note of who armed it under the name
+        // (`set … over aterm ctl`, §11.7.1): the card grew by both, upward,
+        // so only the cancel moved the choices above it.
+        assert_eq!(grown.h, rect.h + 2, "the cancel row arrived: the card grew");
         assert_eq!(
             key_on(&app, frame_row).as_deref(),
             Some(OFF),
@@ -2966,7 +3161,7 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
             "{how:?}: the next press chose it"
         );
         assert_ne!(pair(&app, session), before, "{how:?}: {under} written");
-        app.set_session_autopilot(session, None);
+        app.set_session_autopilot(session, None, crate::autopilot::Surface::Menu);
         let before = pair(&app, session);
         // A keyboard open under the resting pointer: the same.
         frame(&mut app, wid);
@@ -2998,4 +3193,107 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
         assert_ne!(pair(&app, session), before, "{how:?}: {under} written");
         app.on_cursor_left(wid);
     }
+}
+
+/// THE MENU CUTS THE LIGHT (`docs/DESIGN-card-engine-2026-10-19.md` §7
+/// `fx_occluders_compose`): the open Autopilot menu, then the paste question
+/// over the top rows, each push an engine occluder, so light in every fx slot
+/// over the whole frame leaves both byte-identical to the frame without it.
+/// CONTROLS (rendered in the helper): with no occluder the light lands on
+/// both; a single cut (the question's, the last writer's) leaves it on the
+/// menu.
+#[test]
+fn fx_occluders_compose_over_the_autopilot_menu_and_the_paste_banner() {
+    use crate::app_render::fx_occluder_tests::{
+        Shape, assert_chrome_cuts_the_light, chrome_written, trace_splice,
+    };
+    let (mut app, wid, session, _host) = claude_app();
+    frame(&mut app, wid);
+    app.open_front_autopilot_menu()
+        .expect("the chip is on the glass");
+    let mut before = None;
+    frame_with(&mut app, wid, |app| {
+        before = Some(app.windows[&wid].input_scratch.clone());
+    });
+    assert!(
+        app.autopilot_menu.as_ref().and_then(|m| m.rect).is_some(),
+        "the menu painted"
+    );
+    let menu = chrome_written(
+        &mut app,
+        wid,
+        "Autopilot menu",
+        Shape::Card,
+        &before.expect("the frame reached the menu's splice"),
+    );
+    app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+        wid,
+        Some(session),
+        "one\ntwo\nthree".to_owned(),
+        crate::input::Source::Human,
+        crate::input::PasteFraming::AtDrain,
+    ));
+    let banner = trace_splice(&mut app, wid, "paste banner", Shape::Band, |app| {
+        app.splice_paste_banner(wid);
+    });
+    assert_chrome_cuts_the_light(&mut app, wid, &[menu, banner]);
+}
+
+/// THREE SURFACES IN ONE FRAME (`docs/DESIGN-card-engine-2026-10-19.md` §7
+/// `fx_occluders_compose`): the open Autopilot menu, the paste question over
+/// the top rows and the caption of a hovered link on the bottom row, each
+/// spliced over the same frame, each push an engine occluder, and light in
+/// every fx slot leaves all three byte-identical to the frame without it.
+/// The tab menu cannot join them: the link caption yields to it
+/// (`compose_link_caption`), so this is the largest set of the four that
+/// shares a frame. CONTROLS (rendered in the helper): with no occluder the
+/// light lands on all three; a single cut (the caption's, the last writer's)
+/// leaves it on the menu and the question.
+#[test]
+fn fx_occluders_compose_over_the_autopilot_menu_the_question_and_the_caption() {
+    use crate::app_render::fx_occluder_tests::{
+        Shape, assert_chrome_cuts_the_light, chrome_written, trace_splice,
+    };
+    let (mut app, wid, session, _host) = claude_app();
+    // An OSC 8 link mid-screen, the composer's caret put back after it.
+    feed(
+        &app,
+        session,
+        b"\x1b[7;1HVisit \x1b]8;;https://example.com/a\x1b\\example.com\x1b]8;;\x1b\\ now\x1b[22;3H",
+    );
+    frame(&mut app, wid);
+    let (x, y) = app.frame_cell_centre(wid, (6, 8));
+    app.on_cursor_moved(wid, x, y);
+    app.open_front_autopilot_menu()
+        .expect("the chip is on the glass");
+    let mut before = None;
+    frame_with(&mut app, wid, |app| {
+        before = Some(app.windows[&wid].input_scratch.clone());
+    });
+    assert!(
+        app.autopilot_menu.as_ref().and_then(|m| m.rect).is_some(),
+        "the menu painted"
+    );
+    let menu = chrome_written(
+        &mut app,
+        wid,
+        "Autopilot menu",
+        Shape::Card,
+        &before.expect("the frame reached the menu's splice"),
+    );
+    app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+        wid,
+        Some(session),
+        "one\ntwo\nthree".to_owned(),
+        crate::input::Source::Human,
+        crate::input::PasteFraming::AtDrain,
+    ));
+    let banner = trace_splice(&mut app, wid, "paste banner", Shape::Band, |app| {
+        app.splice_paste_banner(wid);
+    });
+    let caption = trace_splice(&mut app, wid, "link caption", Shape::Band, |app| {
+        app.splice_link_target(wid);
+    });
+    assert_chrome_cuts_the_light(&mut app, wid, &[menu, banner, caption]);
+    app.on_cursor_left(wid);
 }

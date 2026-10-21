@@ -1194,7 +1194,7 @@ fn a_stalled_task_is_a_need_once_its_wake_lands() {
         why: Some("held"),
         ..TaskMark::new(TaskState::Stalled)
     };
-    mark_session_task(&ctx, 0, &stalled, &app.subscribers).expect("unfenced");
+    mark_session_task(&ctx, 0, &stalled).expect("unfenced");
     assert_eq!(needs(&app).as_deref(), Some("-"), "not before its wake");
     let wakes = crate::presence::take_task_wakes();
     assert_eq!(wakes, [0]);
@@ -1206,7 +1206,7 @@ fn a_stalled_task_is_a_need_once_its_wake_lands() {
         why: Some("moved"),
         ..TaskMark::new(TaskState::Working)
     };
-    mark_session_task(&ctx, 0, &moved, &app.subscribers).expect("unfenced");
+    mark_session_task(&ctx, 0, &moved).expect("unfenced");
     for session in crate::presence::take_task_wakes() {
         app.on_task_changed(session);
     }
@@ -1628,5 +1628,32 @@ fn a_writers_wait_carries_its_words() {
             WaitWord::Limit,
             "waiting out the session usage limit".to_string()
         )
+    );
+}
+
+/// A WORKER'S NEEDS YOU ENTRY IS AN ASK (FOREVER CRUISE / FOREVER LAND): the
+/// loop raises `owner=needs kind=ask "<program> needs you: … — carrying on"`
+/// for a report's `NEEDS YOU:` lines, and the classifier reads it as the ask
+/// it is — the border, the pill, `◇`, `❯N` and the menu bar's "needs you" —
+/// with no reader of its own. Its words are the entry's. NEGATIVE CONTROL: the
+/// same owner's entry written `kind=wait` is a wait, never an ask.
+#[test]
+fn a_workers_needs_you_entry_is_an_ask() {
+    let owner = crate::harness_host::NEEDS_ATTENTION_OWNER;
+    let text = "Claude needs you: approval to publish \u{2014} carrying on";
+    let v = of(&NeedFacts {
+        attention: vec![entry(owner, text, Some(AttentionKind::Ask))],
+        ..facts()
+    });
+    assert_eq!(words(&v), (Some(NeedWord::Ask), None));
+    assert_eq!(v.need.as_ref().map(|n| n.what.as_str()), Some(text));
+    let waited = of(&NeedFacts {
+        attention: vec![entry(owner, text, Some(AttentionKind::Wait))],
+        ..facts()
+    });
+    assert_eq!(
+        words(&waited),
+        (None, Some(WaitWord::Entry)),
+        "CONTROL: kind=wait"
     );
 }

@@ -23,12 +23,10 @@ pub struct HostCapabilities {
     /// index", which an empty `Vec` alone could not distinguish from "no
     /// sessions".
     pub roster: bool,
-    /// An input sink is reachable ([`SessionHost::write_input`] can land bytes).
-    pub input_sink: bool,
 }
 
 impl HostCapabilities {
-    /// Headless daemon capabilities (`roster` and `input_sink` enabled, no windowing or clipboard).
+    /// Headless daemon capabilities (`roster` enabled, no windowing or clipboard).
     #[must_use]
     pub const fn headless_daemon() -> Self {
         Self {
@@ -36,11 +34,10 @@ impl HostCapabilities {
             event_loop: false,
             clipboard: false,
             roster: true,
-            input_sink: true,
         }
     }
 
-    /// Full GUI capabilities (all 5 facilities enabled).
+    /// Full GUI capabilities (all 4 facilities enabled).
     #[must_use]
     pub const fn full_gui() -> Self {
         Self {
@@ -48,14 +45,7 @@ impl HostCapabilities {
             event_loop: true,
             clipboard: true,
             roster: true,
-            input_sink: true,
         }
-    }
-
-    /// Whether the host can resolve a session and write input to it (`roster && input_sink`).
-    #[must_use]
-    pub const fn can_drive_session(self) -> bool {
-        self.roster && self.input_sink
     }
 
     /// Whether the host can capture rendered window frames (`frame_source && event_loop`).
@@ -64,14 +54,13 @@ impl HostCapabilities {
         self.frame_source && self.event_loop
     }
 
-    /// Count of enabled host facilities (`0..=5`).
+    /// Count of enabled host facilities (`0..=4`).
     #[must_use]
     pub const fn enabled_count(self) -> u8 {
         (self.frame_source as u8)
             + (self.event_loop as u8)
             + (self.clipboard as u8)
             + (self.roster as u8)
-            + (self.input_sink as u8)
     }
 }
 
@@ -131,35 +120,13 @@ pub struct SessionEntry {
     pub has_meta: bool,
 }
 
-/// Where a rostered session lives and what it is doing: the trailing `window=`
-/// `active=` `wfocus=` `detail=` columns of a `sessions`/`ls` line, keyed by
-/// [`SessionEntry::sid`].
-///
-/// Separate from [`SessionEntry`] because it costs more: placement needs the
-/// window layer (one main-thread turn per batch) and `detail` each engine's
-/// lock, while the roster is a registry read. A host answers them together
-/// ([`SessionHost::placements`]) or not at all.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SessionPlacement {
-    /// The process-local id this placement extends.
-    pub sid: u64,
-    /// The window the session is reported under (the front window when it shows
-    /// the session, else the lowest window id), `None` when no window hosts it.
-    pub window: Option<u64>,
-    /// On that window's active tab.
-    pub active_tab: bool,
-    /// That window is the front window.
-    pub window_focused: bool,
-    /// The sanitized running command (program + allow-listed subcommand, never
-    /// an argument), `None` when idle or when the engine lock was contended.
-    pub detail: Option<String>,
-}
-
 /// A wire `@<selector>` target the roster can answer. `@.` (self) is absent:
 /// self is the connection's own session, which the dispatcher knows and the
 /// roster does not. So is a bare `@`, which names nothing: the dispatcher
 /// refuses it (`aterm_types::control_verbs::EMPTY_SELECTOR`), never reading
-/// it as self.
+/// it as self. The wire's selector is read by the one request grammar
+/// ([`aterm_types::control_request::Selector`]); an `Id` is a body that
+/// grammar reads as a stable id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selector<'a> {
     /// `@<n>` — the process-local sid.
@@ -168,20 +135,20 @@ pub enum Selector<'a> {
     Id(&'a str),
 }
 
-impl<'a> Selector<'a> {
-    /// Classify the body after the leading `@`: all-digits is a local sid,
-    /// anything else a stable id. `None` for the self token `.` and for an
-    /// empty body, neither of which the roster answers (an empty one is
-    /// refused, not self: see [`Selector`]). One parser, so hosts cannot
-    /// disagree about what `@12` addresses.
-    #[must_use]
-    pub fn parse(body: &'a str) -> Option<Self> {
-        match body {
-            "" | "." => None,
-            b => Some(b.parse::<u64>().map_or(Selector::Id(b), Selector::Local)),
+impl<'a> From<Selector<'a>> for aterm_types::control_request::Selector<'a> {
+    /// The wire's reading of a roster selector, so a host resolves it through the
+    /// lookup the dispatcher resolves `@<body>` through: an `Id` that is no stable
+    /// id's spelling names no session.
+    fn from(selector: Selector<'a>) -> Self {
+        use aterm_types::control_request::{Selector as Wire, Sid};
+        match selector {
+            Selector::Local(n) => Wire::Local(n),
+            Selector::Id(id) => Sid::parse(id).map_or(Wire::Invalid(id), Wire::Sid),
         }
     }
+}
 
+impl<'a> Selector<'a> {
     /// Return the local sid if `self` is [`Selector::Local`].
     #[must_use]
     pub const fn local_sid(self) -> Option<u64> {
@@ -208,12 +175,13 @@ impl<'a> Selector<'a> {
 /// in that gap still leaves a notify pending.
 pub trait ChangeWait {
     /// Park until the session changes, or until `timeout` elapses. `true` on a
-    /// wake, `false` on timeout. A spurious/coalesced wake is fine — every
-    /// caller re-reads the state it is waiting on.
+    /// wake, `false` on timeout, or earlier once [`Self::caller_gone`] would
+    /// answer `true`. A spurious/coalesced wake is fine — every caller
+    /// re-reads the state it is waiting on.
     fn wait(&self, timeout: Duration) -> bool;
 
     /// Whether the client that asked for this wait has hung up. A socket host
-    /// checks its connection (parking in slices short enough to notice); the
+    /// checks its connection, and parks in slices short enough to notice; the
     /// default is never gone. Waiting verbs return their lane when `true`.
     fn caller_gone(&self) -> bool {
         false
@@ -233,9 +201,10 @@ pub trait ChangeWait {
 /// ```
 /// use aterm_control::{Selector, SessionHost};
 ///
-/// fn write_selected(host: &impl SessionHost, sel: Selector<'_>, bytes: &[u8]) -> Option<bool> {
+/// fn clear_selected(host: &impl SessionHost, sel: Selector<'_>) -> Option<()> {
 ///     let sid = host.resolve(sel)?;  // fleet-wide answer
-///     host.write_input(sid, bytes)   // None unless THIS host serves that sid
+///     host.with_terminal_mut(sid, |t| t.text_selection_mut().clear())
+///                                    // None unless THIS host serves that sid
 /// }
 /// ```
 ///
@@ -254,20 +223,6 @@ pub trait SessionHost {
     /// empty.
     fn sessions(&self) -> Vec<SessionEntry>;
 
-    /// The roster's placements ([`SessionPlacement`]), in roster order. `None`
-    /// means this host could not look (no window layer, or no answer), printed
-    /// `window=-`; a detached session comes back inside `Some` with
-    /// `window: None` (`window=none`). The two must stay distinct. Defaults to
-    /// `None`.
-    ///
-    /// The shipped `sessions` line is written by the GUI's own verb from the
-    /// same rows, and the GUI host mirrors it; no production path calls this
-    /// yet (only `aterm-gui/src/control_host.rs` tests). It lets a non-GUI host
-    /// answer placement through the trait.
-    fn placements(&self) -> Option<Vec<SessionPlacement>> {
-        None
-    }
-
     /// Resolve a `@<selector>` against the roster; `None` when it holds no such
     /// session (the caller answers `ERR no such session` rather than falling
     /// back) and for every selector on a host with no roster. The sid need not
@@ -280,22 +235,6 @@ pub trait SessionHost {
 
     /// [`SessionHost::with_terminal`] with mutable access.
     fn with_terminal_mut<R>(&self, sid: u64, f: impl FnOnce(&mut Terminal) -> R) -> Option<R>;
-
-    /// Write `bytes` to session `sid`'s input sink (the raw path `send` and
-    /// `feed` take to the child), whole frames only.
-    ///
-    /// `None` when this host does not serve `sid`, checked before the sink.
-    /// `Some(false)` when the write did not happen (a wedged or absent sink,
-    /// [`HostCapabilities::input_sink`] false).
-    ///
-    /// Empty `bytes` is the checkable no-op: it answers `Some(true)` iff a sink
-    /// is there, letting conformance prove honest reporting without injecting a
-    /// byte.
-    ///
-    /// The human-vocabulary verbs (`key`/`ctrl`/`mouse`/`paste`/`focus`) are not
-    /// this method; their encoder reads live keyboard/mouse mode on the host's
-    /// side.
-    fn write_input(&self, sid: u64, bytes: &[u8]) -> Option<bool>;
 
     /// Ask the host to repaint `sid`. A no-op on a host with no event loop, and on
     /// a sid it does not serve.
@@ -336,30 +275,30 @@ pub trait SessionHost {
 mod tests {
     use super::*;
 
-    /// The selector grammar: `.` is the connection's own session and an empty
-    /// body names nothing (neither is a roster lookup), all-digits is a local
-    /// sid, anything else a stable id.
+    /// A roster selector reads as the wire grammar reads its body: a local sid
+    /// stays one, an `Id` spelled as a stable id is that id, and any other `Id`
+    /// names no session.
     #[test]
-    fn selector_parses_the_wire_forms() {
-        assert_eq!(Selector::parse(""), None);
-        assert_eq!(Selector::parse("."), None);
-        assert_eq!(Selector::parse("12"), Some(Selector::Local(12)));
-        assert_eq!(Selector::parse("s-0f1e"), Some(Selector::Id("s-0f1e")));
-        // Too big for a u64 local id ⇒ a stable id, never a silent wrap.
-        let huge = "99999999999999999999";
-        assert_eq!(Selector::parse(huge), Some(Selector::Id(huge)));
+    fn selector_reads_as_the_wire_grammar() {
+        use aterm_types::control_request::{Selector as Wire, Sid};
+        assert_eq!(Wire::from(Selector::Local(12)), Wire::Local(12));
+        let sid = Sid::parse("s-0f1e").expect("a stable id");
+        assert_eq!(Wire::from(Selector::Id("s-0f1e")), Wire::Sid(sid));
+        assert_eq!(Wire::from(Selector::Id("S-0F1E")), Wire::Invalid("S-0F1E"));
         assert_eq!(Selector::Local(12).local_sid(), Some(12));
+        assert_eq!(Selector::Id("s-0f1e").local_sid(), None);
         assert_eq!(Selector::Id("s-0f1e").stable_id(), Some("s-0f1e"));
+        assert_eq!(Selector::Local(12).stable_id(), None);
     }
 
     #[test]
     fn host_capabilities_and_session_state_const_helpers() {
         let daemon = HostCapabilities::headless_daemon();
-        assert!(daemon.can_drive_session() && !daemon.can_capture_frames());
-        assert_eq!(daemon.enabled_count(), 2);
+        assert!(daemon.roster && !daemon.can_capture_frames());
+        assert_eq!(daemon.enabled_count(), 1);
         let gui = HostCapabilities::full_gui();
-        assert!(gui.can_drive_session() && gui.can_capture_frames());
-        assert_eq!(gui.enabled_count(), 5);
+        assert!(gui.roster && gui.can_capture_frames());
+        assert_eq!(gui.enabled_count(), 4);
         assert_eq!(SessionState::Spawning.as_str(), "spawning");
         assert!(SessionState::Alive.can_accept_input() && !SessionState::Alive.is_exited());
         assert!(SessionState::Exited.is_exited() && !SessionState::Exited.can_accept_input());

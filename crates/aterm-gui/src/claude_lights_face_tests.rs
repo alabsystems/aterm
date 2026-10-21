@@ -10,7 +10,6 @@
 use super::*;
 
 use aterm_agent::harness::acts::{Act, TaskFace};
-use aterm_agent::supervise::policy::turn_end::LAND_NUDGES;
 
 /// The footer's mark accent, as a theme gives it: Cruise's ink.
 const ACCENT: [u8; 3] = [0, 128, 255];
@@ -104,12 +103,6 @@ fn rows() -> Vec<Row> {
         short,
         spoken: spoken.to_owned(),
     };
-    let spent = format!(
-        "autopilot: land, quiet \u{2014} no done reply after the instruction and {LAND_NUDGES} \
-         nudges; the harness types nothing more but a land answer to a question \u{b7} click: off \
-         \u{b7} right-click: more"
-    );
-    let spent_spoken = format!("Autopilot: land. Quiet: no done reply after {LAND_NUDGES} nudges.");
     vec![
         row(
             AutopilotView::Cruise,
@@ -147,62 +140,32 @@ fn rows() -> Vec<Row> {
             "autopilot: cruise until Sat 16:00, then land",
             "Autopilot: cruise. Lands Saturday at 16:00.",
         ),
-        // §10.2.1: under Cruise a task's end wears `∞ ✓ done` / `∞ ✓ landed`
-        // in Cruise's accent, its rung the `✓`; an armed timer moves to the
-        // title, and a click lands now.
-        row(
-            AutopilotView::Cruise,
-            told(TaskFace::Done),
-            ChipFace::CruiseDone,
-            "\u{221e} \u{2713} done",
-            "\u{2713}",
-            (Accent, Accent),
-            "autopilot: cruise, done 17:42 \u{2014} the agent said it was finished; the harness \
-             types nothing more until someone else's turn, then keeps the work moving \u{b7} \
-             click: land \u{b7} right-click: more",
-            "autopilot: cruise, done 17:42",
-            "Autopilot: cruise. Done at 17:42.",
-        ),
+        // FOREVER CRUISE: Cruise takes nothing as the end, so a landing a
+        // loop under Land told keeps `∞` (and, with a timer armed, the
+        // timer's face): no task face shows under Cruise.
         row(
             AutopilotView::Cruise,
             told(TaskFace::Landed),
-            ChipFace::CruiseLanded,
-            "\u{221e} \u{2713} landed",
-            "\u{2713}",
+            ChipFace::Cruise,
+            "\u{221e}",
+            "\u{221e}",
             (Accent, Accent),
-            "autopilot: cruise, landed 17:42 \u{2014} a landing ended the task; the harness types \
-             nothing more until someone else's turn, then keeps the work moving \u{b7} click: \
-             land \u{b7} right-click: more",
-            "autopilot: cruise, landed 17:42",
-            "Autopilot: cruise. Landed at 17:42.",
-        ),
-        row(
-            AutopilotView::Cruise,
-            told_under(TaskFace::Done, 18, 0, None),
-            ChipFace::CruiseDone,
-            "\u{221e} \u{2713} done",
-            "\u{2713}",
-            (Accent, Accent),
-            "autopilot: cruise, done 17:42, lands 18:00 \u{2014} the agent said it was finished; \
-             the harness types nothing more until someone else's turn, then keeps the work \
-             moving; at 18:00 Autopilot switches to land, with nothing left to land \u{b7} \
-             click: land now \u{b7} right-click: more",
-            "autopilot: cruise, done 17:42, lands 18:00",
-            "Autopilot: cruise. Done at 17:42. Lands at 18:00.",
+            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
+             more",
+            "autopilot: cruise",
+            "Autopilot: cruise.",
         ),
         row(
             AutopilotView::Cruise,
             told_under(TaskFace::Landed, 16, 0, Some(Weekday::Sat)),
-            ChipFace::CruiseLanded,
-            "\u{221e} \u{2713} landed",
-            "\u{2713}",
-            (Accent, Accent),
-            "autopilot: cruise, landed 17:42, lands Sat 16:00 \u{2014} a landing ended the task; \
-             the harness types nothing more until someone else's turn, then keeps the work \
-             moving; at Sat 16:00 Autopilot switches to land, with nothing left to land \u{b7} \
+            ChipFace::CruiseUntil,
+            "\u{221e} \u{2913}16:00",
+            "\u{221e}",
+            (Accent, Amber),
+            "autopilot: cruise until Sat 16:00, then land \u{2014} keeps the work moving \u{b7} \
              click: land now \u{b7} right-click: more",
-            "autopilot: cruise, landed 17:42, lands Sat 16:00",
-            "Autopilot: cruise. Landed at 17:42. Lands Saturday at 16:00.",
+            "autopilot: cruise until Sat 16:00, then land",
+            "Autopilot: cruise. Lands Saturday at 16:00.",
         ),
         // A person's own exchange under Cruise keeps `∞` (§10.2.4), and with
         // a timer armed, the timer's face.
@@ -259,35 +222,11 @@ fn rows() -> Vec<Row> {
             "\u{2713} landed",
             "\u{2713}",
             (Amber, Amber),
-            "autopilot: land, landed 17:42 \u{2014} the agent finished after the land \
-             instruction; the harness types nothing more until someone else's turn \u{b7} click: \
-             off \u{b7} right-click: more",
+            "autopilot: land, landed 17:42 \u{2014} all of the work is on the remote main \
+             branch; the harness types nothing more until someone else's turn \u{b7} click: off \
+             \u{b7} right-click: more",
             "autopilot: land, landed 17:42",
             "Autopilot: land. Landed at 17:42.",
-        ),
-        row(
-            AutopilotView::Land,
-            told(TaskFace::Done),
-            ChipFace::Done,
-            "\u{2713} done",
-            "\u{2713}",
-            (Amber, Amber),
-            "autopilot: land, done 17:42 \u{2014} the agent said it was finished before a \
-             landing was asked; the harness types nothing more until someone else's turn \u{b7} \
-             click: off \u{b7} right-click: more",
-            "autopilot: land, done 17:42",
-            "Autopilot: land. Done at 17:42.",
-        ),
-        row(
-            AutopilotView::Land,
-            told(TaskFace::Spent),
-            ChipFace::Spent,
-            "\u{2913} quiet",
-            "\u{2913}",
-            (Dim, Dim),
-            &spent,
-            "autopilot: land, quiet",
-            &spent_spoken,
         ),
         row(
             AutopilotView::Land,
@@ -395,7 +334,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
             "{what}"
         );
         if row.view == AutopilotView::Unhosted {
-            // No host: neither harness chip is drawn (§2.3).
+            // No host: no Autopilot chip is drawn (§2.3).
             let w = lights(row.view, row.glass);
             assert!(
                 w.block(7, blank(), now, ACCENT, Keep::Drawn)
@@ -407,11 +346,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
         let w = lights(row.view, row.glass);
         let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
         let n = row.drawn.chars().count();
-        assert_eq!(
-            text(&block.lights),
-            format!("{} \u{2699}", row.drawn),
-            "{what}"
-        );
+        assert_eq!(text(&block.lights), row.drawn, "{what}: the chip alone");
         assert_eq!(block.cols[0], (0..n, Chip::Autopilot), "{what}");
         let glyph = row.face.glyph().chars().count();
         let (glyph_ink, word_ink) = (ink(row.tones.0), ink(row.tones.1));
@@ -483,15 +418,14 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
     }
 }
 
-/// CRUISE SAYS DONE (§10.2.3, item 1; §10.2.5): over view × task face ×
-/// timer, under Cruise a done or landed face beats an armed timer (the timer
-/// moves to the title), and every other face — a person's own exchange, a
-/// spent landing Cruise never has, open, unknown — reads `Cruise`, or
-/// `CruiseUntil` with the timer; Land's faces are §9.4's, the timer no part
-/// of them. NEGATIVE CONTROL: the timer's face with no task's end is still
-/// the timer's.
+/// CRUISE NEVER RESTS: over view × task face × timer, under Cruise every
+/// face — a landing a loop under Land told, a person's own exchange, open,
+/// unknown — reads `Cruise`, or `CruiseUntil` with the timer: Cruise takes
+/// nothing as the end. Land's faces are open, landed and theirs, the timer
+/// no part of them. NEGATIVE CONTROL: the same landed glass under Land
+/// wears `✓ landed`.
 #[test]
-fn under_cruise_a_tasks_end_beats_the_timer_and_land_is_unchanged() {
+fn under_cruise_no_task_face_shows_and_land_wears_its_own() {
     let faces = std::iter::once(None).chain(TaskFace::ALL.into_iter().map(Some));
     for task in faces {
         for armed in [false, true] {
@@ -501,11 +435,10 @@ fn under_cruise_a_tasks_end_beats_the_timer_and_land_is_unchanged() {
                 land_at: armed.then(|| timer(18, 0, None).land_at).flatten(),
                 ..ChipGlass::default()
             };
-            let cruise = match (task, armed) {
-                (Some(TaskFace::Done), _) => ChipFace::CruiseDone,
-                (Some(TaskFace::Landed), _) => ChipFace::CruiseLanded,
-                (_, true) => ChipFace::CruiseUntil,
-                (_, false) => ChipFace::Cruise,
+            let cruise = if armed {
+                ChipFace::CruiseUntil
+            } else {
+                ChipFace::Cruise
             };
             assert_eq!(
                 ChipFace::of(AutopilotView::Cruise, &glass),
@@ -514,8 +447,6 @@ fn under_cruise_a_tasks_end_beats_the_timer_and_land_is_unchanged() {
             );
             let land = match task {
                 Some(TaskFace::Landed) => ChipFace::Landed,
-                Some(TaskFace::Done) => ChipFace::Done,
-                Some(TaskFace::Spent) => ChipFace::Spent,
                 Some(TaskFace::Theirs) => ChipFace::Theirs,
                 Some(TaskFace::Open) | None => ChipFace::Land,
             };
@@ -527,8 +458,8 @@ fn under_cruise_a_tasks_end_beats_the_timer_and_land_is_unchanged() {
         }
     }
     assert_eq!(
-        ChipFace::of(AutopilotView::Cruise, &timer(18, 0, None)),
-        ChipFace::CruiseUntil,
+        ChipFace::of(AutopilotView::Land, &told(TaskFace::Landed)),
+        ChipFace::Landed,
         "NEGATIVE CONTROL"
     );
 }
@@ -543,12 +474,7 @@ fn under_cruise_a_tasks_end_beats_the_timer_and_land_is_unchanged() {
 #[test]
 fn every_face_clock_names_its_day_when_it_is_not_today() {
     let tomorrow = Some(TODAY + 1);
-    for (view, task, word) in [
-        (AutopilotView::Land, TaskFace::Landed, "landed"),
-        (AutopilotView::Land, TaskFace::Done, "done"),
-        (AutopilotView::Cruise, TaskFace::Done, "done"),
-        (AutopilotView::Cruise, TaskFace::Landed, "landed"),
-    ] {
+    for (view, task, word) in [(AutopilotView::Land, TaskFace::Landed, "landed")] {
         let glass = told(task);
         let face = ChipFace::of(view, &glass);
         let what = format!("{view:?} {task:?}");
@@ -575,7 +501,7 @@ fn every_face_clock_names_its_day_when_it_is_not_today() {
         }
     }
     // NEGATIVE CONTROL: no clock, no day.
-    let quiet = told(TaskFace::Spent);
+    let quiet = told(TaskFace::Theirs);
     let (whole, short) = autopilot_title(AutopilotView::Land, &quiet, "", tomorrow);
     assert!(!whole.contains("Fri"), "{whole}");
     assert_eq!(short, "autopilot: land, quiet");
@@ -672,7 +598,10 @@ fn each_mode_phrase_holds_no_cut_mark() {
         }
     }
     // NEGATIVE CONTROL: a title that is no Autopilot whole title has none.
-    assert_eq!(lean_titles(SETTINGS_TITLE), [("", ""); LEAN_FORMS]);
+    assert_eq!(
+        lean_titles("worker of lab-sweep \u{b7} task working 4m \u{2014} click to go there"),
+        [("", ""); LEAN_FORMS]
+    );
     assert_eq!(lean_titles("autopilot: cruise"), [("", ""); LEAN_FORMS]);
 }
 
@@ -690,11 +619,12 @@ fn each_mode_phrase_holds_no_cut_mark() {
 /// back; each form stands from exactly the room the one before it no
 /// longer fits in down to exactly its own width; the facts stay whole
 /// wherever a title is drawn; and every form wider than the phrase keeps `·
-/// click: `. Then the done face's own rule at 160, 120, 110 and 90 columns.
+/// click: `. Then the landed face's own rule at 160, 120, 110 and 90 columns
+/// (the finding's face was Cruise's `done`, retired under FOREVER CRUISE).
 ///
 /// NEGATIVE CONTROL: the same block with the two forms taken out (their
 /// widths 0, the ladder main had) goes from v1's words straight to the
-/// phrase, and the done face's 160-column rule shows no click.
+/// phrase, and the landed face's 160-column rule shows no click.
 #[test]
 fn every_face_keeps_its_clicks_after_its_explanation() {
     use aterm_agent::harness::footer::{self, FooterFacts, LightsWidth, TitleFit};
@@ -817,29 +747,30 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
             );
         }
     }
-    // The finding's own rule: the done face under Cruise, hovered.
-    let done = rows()
+    // The finding's own rule, on the face that took the retired Cruise
+    // done's place as an end with a time: Land's landing, hovered.
+    let landed = rows()
         .into_iter()
-        .find(|r| r.face == ChipFace::CruiseDone && r.glass.land_at.is_none())
-        .expect("the done face");
-    let (block, widths) = hovered(&done, "");
+        .find(|r| r.face == ChipFace::Landed && r.glass.land_at.is_none())
+        .expect("the landed face");
+    let (block, widths) = hovered(&landed, "");
     let rule = |cols: usize, widths: LightsWidth| {
         let fit = footer::fit_rule(&facts, footer::rule_room(&(0..cols)), Some(widths));
         laid(&block, fit.title)
     };
     assert_eq!(
         rule(160, widths),
-        "autopilot: cruise, done 17:42 \u{b7} click: land \u{b7} right-click: more  "
+        "autopilot: land, landed 17:42 \u{b7} click: off \u{b7} right-click: more  "
     );
     assert_eq!(rule(120, widths), rule(160, widths), "both clicks at 120");
     assert_eq!(
         rule(110, widths),
-        "autopilot: cruise, done 17:42 \u{b7} click: land  ",
+        "autopilot: land, landed 17:42 \u{b7} click: off  ",
         "the click at 110 columns"
     );
     assert_eq!(
         rule(90, widths),
-        "autopilot: cruise, done 17:42  ",
+        "autopilot: land, landed 17:42  ",
         "the phrase alone at 90"
     );
     let from = |title: TitleFit| {
@@ -851,7 +782,7 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
             .min()
     };
     eprintln!(
-        "the done face: whole from {:?} columns, v1's words from {:?}, both clicks from {:?}, \
+        "the landed face: whole from {:?} columns, v1's words from {:?}, both clicks from {:?}, \
          the click from {:?}, the phrase from {:?}",
         from(TitleFit::Full),
         from(TitleFit::Lean(1)),
@@ -865,7 +796,7 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
     };
     assert_eq!(
         rule(160, main),
-        "autopilot: cruise, done 17:42  ",
+        "autopilot: land, landed 17:42  ",
         "CONTROL: main's ladder gives the clicks up"
     );
 }
@@ -910,10 +841,10 @@ fn each_spoken_label_holds_no_glyph() {
 }
 
 /// EACH `GlyphOnly` RUNG is the face's rung alone, in the glyph's ink —
-/// `∞`, `⤓`, `✓`, `○`, `⊘`, and Cruise's done and landed `✓` (§10.2.3, item
-/// 1), never their `∞` — with `⚙` and every light given up, and measured as
-/// laid out. A click in flight is `◐` there as everywhere. NEGATIVE CONTROL:
-/// only Cruise's two ends have a rung that is not their glyph.
+/// `∞`, `⤓`, `✓`, `○`, `⊘` — with every light given up, and
+/// measured as laid out. A click in flight is `◐` there as everywhere.
+/// CONTROL: no face has a rung apart from its glyph (Cruise wears no
+/// task's end).
 #[test]
 fn each_glyph_only_rung_is_the_glyph_alone() {
     let now = Instant::now();
@@ -929,7 +860,7 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
             block.lights.iter().all(|c| c.fg == ink(row.tones.0)),
             "{what}"
         );
-        assert!(!block.shows(Chip::Settings), "{what}");
+        assert_eq!(block.cols.len(), 1, "{what}: Autopilot alone");
         let s = &w.sessions[&7];
         let on = drawn_at(s, now, None, None, Keep::GlyphOnly);
         assert_eq!(
@@ -959,14 +890,17 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
         .into_iter()
         .filter(|face| face.rung() != face.glyph())
         .collect();
-    assert_eq!(apart, [ChipFace::CruiseDone, ChipFace::CruiseLanded]);
+    assert!(
+        apart.is_empty(),
+        "every face's rung is its glyph: {apart:?}"
+    );
 }
 
 /// A NARROW RULE GIVES A STANDING FACE DOWN TO ITS GLYPH (§9.3.2), and v1's
-/// faces as v1 did. Walked from a room that holds both chips down to none,
-/// each state's Autopilot chip is its whole face beside `⚙`, then its whole
-/// face alone, then — for a standing face of v2's alone (`∞ ⤓18:00`,
-/// `✓ landed`, `✓ done`, `⤓ quiet`) — its glyph alone, in the
+/// faces as v1 did. Walked from a room that holds the chip down to none,
+/// each state's Autopilot chip is its whole face, then — for a standing
+/// face of v2's alone (`∞ ⤓18:00`,
+/// `✓ landed`, `⤓ quiet`) — its glyph alone, in the
 /// glyph's ink and holding the room, down to one cell. v1's faces (`∞`,
 /// `⤓ land`, `○ off`, `⊘ off`) give the chip up whole below their width,
 /// as v1's ladder did, so the default glass draws nothing new. No chip comes
@@ -977,16 +911,8 @@ fn a_narrow_rule_gives_a_standing_face_down_to_its_glyph() {
     let standing: Vec<ChipFace> = ChipFace::ALL.into_iter().filter(|f| f.standing()).collect();
     assert_eq!(
         standing,
-        [
-            ChipFace::CruiseUntil,
-            ChipFace::CruiseDone,
-            ChipFace::CruiseLanded,
-            ChipFace::Landed,
-            ChipFace::Done,
-            ChipFace::Spent,
-            ChipFace::Theirs,
-        ],
-        "CONTROL: v2's standing faces, and v3's Cruise ends"
+        [ChipFace::CruiseUntil, ChipFace::Landed, ChipFace::Theirs],
+        "CONTROL: v2's standing faces"
     );
     for view in AutopilotView::ALL {
         assert!(
@@ -1005,9 +931,7 @@ fn a_narrow_rule_gives_a_standing_face_down_to_its_glyph() {
         for room in (0..=face + 4).rev() {
             let block = w.fitted(7, blank(), now, ACCENT, None, None, room);
             let drawn = block.as_ref().map(|b| text(&b.lights));
-            let want = if room >= face + 2 {
-                Some(format!("{} \u{2699}", row.drawn))
-            } else if room >= face {
+            let want = if room >= face {
                 Some(row.drawn.to_owned())
             } else if room >= 1 && row.face.standing() {
                 Some(row.glyph.to_owned())
@@ -1119,8 +1043,6 @@ fn unpack(term: u64) -> Unpacked {
     let task = match field(32, 3) {
         0 => None,
         1 => Some(TaskFace::Landed),
-        2 => Some(TaskFace::Done),
-        3 => Some(TaskFace::Spent),
         4 => Some(TaskFace::Theirs),
         n => panic!("no face {n}"),
     };
@@ -1250,7 +1172,7 @@ fn the_trail_moves_the_term_only_while_the_chip_is_read() {
         w.autopilot_term(7, None, AutopilotView::Cruise, glass)
     };
     assert_eq!(term(&w, 3), term(&w, 4), "no one reads the title");
-    w.hover = Some((7, Chip::Settings));
+    w.hover = Some((7, Chip::Light(Light::Mode)));
     assert_eq!(term(&w, 3), term(&w, 4), "another chip's title");
     w.hover = Some((8, Chip::Autopilot));
     assert_eq!(term(&w, 3), term(&w, 4), "another session's chip");
@@ -1262,8 +1184,8 @@ fn the_trail_moves_the_term_only_while_the_chip_is_read() {
 }
 
 /// A FACE THAT KEEPS ITS KIND AND MOVES ITS CLOCK REPAINTS A TITLE BEING
-/// READ (§10.2, slice 1c: the title carries the face's clock, `done 17:42`
-/// then `done 18:05`): the footer's term moves while the Autopilot chip is
+/// READ (§10.2, slice 1c: the title carries the face's clock, `landed 17:42`
+/// then `landed 18:05`): the footer's term moves while the Autopilot chip is
 /// hovered, and not while no one reads its title, which a frame at rest
 /// does not draw.
 ///
@@ -1279,7 +1201,7 @@ fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
     assert!(crate::harness_glass::on_task(
         &mut app,
         7,
-        Some(TaskFace::Done),
+        Some(TaskFace::Landed),
         1_792_249_200_000
     ));
     let before = app.chip_glass(7);
@@ -1289,7 +1211,7 @@ fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
     assert!(crate::harness_glass::on_task(
         &mut app,
         7,
-        Some(TaskFace::Done),
+        Some(TaskFace::Landed),
         1_792_250_700_000
     ));
     let after = app.chip_glass(7);
@@ -1377,7 +1299,7 @@ fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
         }
         for (view, glass, amber) in [
             (AutopilotView::Land, ChipGlass::default(), 0..6),
-            (AutopilotView::Land, told(TaskFace::Done), 0..6),
+            (AutopilotView::Land, told(TaskFace::Landed), 0..8),
             (AutopilotView::Cruise, timer(18, 0, None), 2..8),
         ] {
             let w = lights(view, glass);

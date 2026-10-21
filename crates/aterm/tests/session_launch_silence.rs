@@ -269,4 +269,6 @@ fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing(
         "precondition held: nothing could lay the reroute"
     );
     let _ = std::fs::remove_dir_all(&root);
+    // The unwritable-prefix half did not run as root; the reroute half above did.
+    aterm_uds::host::could_not_run_as_root("a root-owned prefix this user cannot write");
 }

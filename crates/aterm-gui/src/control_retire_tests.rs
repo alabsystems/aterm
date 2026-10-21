@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use aterm_uds::{CtlListener, CtlStream};
 
-use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes};
-use super::{Scope, ServeDisposition, read_request_line};
+use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes, Outbox};
+use super::{Request, Scope, ServeDisposition, read_request_line};
 use crate::control_listener::{Endpoint, Supervisor, rebind_socket, socket_file_id};
 
 /// How long a wait for something that must happen may take before the test
@@ -70,12 +70,13 @@ impl LaneService for MainThreadVerbs {
 
     fn serve_line(
         &self,
-        line: String,
+        request: Request,
         _scope: Scope,
         _stream: &CtlStream,
         _reader: &mut LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut Outbox,
     ) -> Option<ServeDisposition> {
+        let line = request.line();
         if line == "hold" {
             let mut hold = self.hold.lock().unwrap_or_else(PoisonError::into_inner);
             hold.holding = true;
@@ -91,11 +92,11 @@ impl LaneService for MainThreadVerbs {
         None
     }
 
-    fn is_wait(&self, _line: &str, _scope: Scope) -> bool {
+    fn is_wait(&self, _request: &Request, _scope: Scope) -> bool {
         false
     }
 
-    fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
+    fn subscribe(&self, _request: Request, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
 
@@ -150,6 +151,7 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
         wait: 1,
         inline: 1,
         open: 8,
+        subscriptions: 1,
     });
     lanes.start();
     let verbs = Arc::new(MainThreadVerbs::default());

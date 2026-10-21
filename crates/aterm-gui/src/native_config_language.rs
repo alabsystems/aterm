@@ -360,6 +360,7 @@ const UNIVERSAL_CONTROL_POLICIES: &[&str] = &["off", "leave"];
 /// `[sys] stats_bars` - the stats bars' forms (`stats_deck::StatsBars`'s own words).
 const STATS_BARS_FORMS: &[&str] = &[
     crate::stats_deck::StatsBars::Deck.word(),
+    crate::stats_deck::StatsBars::Sill.word(),
     crate::stats_deck::StatsBars::Off.word(),
 ];
 const WINDOWING_BEHAVIOR_ALIASES: &[&str] = &[
@@ -1213,9 +1214,9 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["keeper", "crash", "recover", "pty", "session"],
         true,
     ),
-    // The `[session_log]` table (phase 2B; D3, decided 2026-10-19: opt-in): the disk
-    // journal of what each session did. Off by default; read at launch; no
-    // Settings row while it is opt-in.
+    // The `[session_log]` table (phase 2B; D3, ruled 2026-10-19: on): the disk
+    // journal of what each session did. On by default where the desk is kept
+    // and restore_session is on; read at launch; a Settings row.
     manual(
         "session_log",
         "Session log",
@@ -1230,9 +1231,9 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["session", "log", "journal", "crash", "history"],
         true,
     ),
-    // `[session_log] clause` (session log phase 3B): the log's
-    // clause in a tab's tooltip and menu. Off by default; read live; no
-    // Settings row while it is opt-in.
+    // `[session_log] clause` (session log phase 3B; D6, ruled 2026-10-19:
+    // on): the log's clause in a tab's tooltip and menu. On by default; read
+    // live; a Settings row.
     manual(
         "session_log.clause",
         "Show what a tab is doing in its tooltip",
@@ -1252,12 +1253,12 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "sys.stats_bars",
-        "Stats bars under the titlebar",
+        "Stats bars: under the titlebar, in the bottom padding, or off",
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: STATS_BARS_FORMS,
         }),
         &[
-            "system", "cpu", "gpu", "memory", "disk", "stats", "deck", "bars",
+            "system", "cpu", "gpu", "memory", "disk", "stats", "deck", "sill", "bars", "lens",
         ],
         true,
     ),
@@ -1552,6 +1553,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Take a limit reset the plan offers",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &["supervisor", "usage limit", "limit reset", "reset"],
+        true,
+    ),
+    // Read only with `limit_reset` on: which kinds it may spend, in order.
+    manual(
+        "harness.limit_reset_kinds",
+        "Kinds of limit reset to take, first preferred",
+        ConfigSchemaKind::StringList,
+        &["supervisor", "usage limit", "limit reset", "reset", "kind"],
         true,
     ),
     // Ships off: its `true` changes what a relaunched Claude Code's argv
@@ -4019,13 +4028,21 @@ fn validate_registered_values(
                 let Some(value) = item.as_str() else {
                     continue;
                 };
-                if aterm_types::scheme::parse_hex(value).is_none() {
+                if !crate::prefs::color_value_is_valid(setting.key, value) {
                     push_diagnostic(
                         analysis,
                         source,
                         range,
                         ConfigDiagnosticSeverity::Error,
-                        format!("{} must be an RRGGBB, #RRGGBB or #RGB color", setting.key),
+                        if setting.key == crate::prefs::EDIT_CURSOR_TRAIL_COLOR {
+                            format!(
+                                "{} must be an RRGGBB, #RRGGBB or #RGB color, or {}",
+                                setting.key,
+                                crate::prefs::TRAIL_COLOR_CURSOR
+                            )
+                        } else {
+                            format!("{} must be an RRGGBB, #RRGGBB or #RGB color", setting.key)
+                        },
                     );
                 }
             }
@@ -4488,7 +4505,10 @@ pub(crate) fn registered_enum_value_is_valid(key: &str, value: &str, options: &[
     if key == "sparkle_words.custom.ink.colorway" {
         return custom_ink_colorway_is_valid(value);
     }
-    if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE {
+    if matches!(
+        key,
+        crate::prefs::EDIT_CURSOR_TRAIL_STYLE | crate::prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF
+    ) {
         return crate::prefs::cursor_trail_style_canonical(value).is_some();
     }
     // The typing-sound picker's domain is the synth's own roster + aliases
@@ -6071,6 +6091,11 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "true / false; with no accounts listed, the one Claude Code account's usage credits and \
          its own warnings that a window fills each get a digest line"
             .to_string()
+    } else if setting.key == crate::prefs::EDIT_CURSOR_TRAIL_COLOR {
+        format!(
+            "RRGGBB, #RRGGBB or #RGB, or {} for the cursor's color",
+            crate::prefs::TRAIL_COLOR_CURSOR
+        )
     } else if setting.key == "harness.trust_roots" {
         // The default is empty (`SupervisorConfig::default`): the help says
         // what a list of one's own is, and when it is read.
@@ -6204,6 +6229,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         crate::prefs::EDIT_CONFIRM_MULTILINE_PASTE => {
             " · asks before pasting text with a line break into a program that does not use bracketed paste"
         }
+        crate::prefs::EDIT_PREDICTIVE_ECHO_EDITING => {
+            " · true: a bare ←, → or end-of-line Backspace is shown before its echo too; in adaptive a Backspace once the line has shown it echoes, an arrow once the shell has also echoed an arrow exactly; always shows them at once · false: those keys wait for the echo · inert while predictive_echo is off"
+        }
         crate::prefs::EDIT_OPTION_AS_META => {
             " · true: Option/Alt acts as Meta in shells and editors · false: it types your keyboard layout's characters (é, ü, …)"
         }
@@ -6211,7 +6239,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
         }
         crate::prefs::EDIT_DESKTOP_ALERTS => {
-            " · aterm's OWN alerts (the menu bar's escalations, macOS permissions, update health) as system notifications — macOS, run from the app, only as aterm itself: once macOS allows it (turning Notify Me on asks, as does the first notice while this is on), none until then or once it says no, and none from one in your Desktop, Documents or Downloads folder (where aterm does not read its name) until it moves to Applications; not run from the app, through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon (not update health); none on other platforms · off keeps them in the message band, the menu bar and messages.log · program notifications (OSC 9/99/777) are allow_notifications'"
+            " · aterm's OWN alerts (the menu bar's escalations, macOS permissions, update health) as system notifications — macOS, run from the app, only as aterm itself: once macOS allows it (turning Notify Me on asks, as does the first notice while this is on), none until then or once it says no, none from one in your Desktop, Documents or Downloads folder (where aterm does not read its name) until it moves to Applications, and none from one started through a link to it (such as ~/.local/bin/aterm, where aterm does not read its identity either) until aterm.app itself is opened; not run from the app, through terminal-notifier if installed, else osascript (shown as Script Editor); Windows a notification-area balloon (not update health); none on other platforms · off keeps them in the message band, the menu bar and messages.log · program notifications (OSC 9/99/777) are allow_notifications'"
         }
         // The Settings rows are named in plain words; the escape sequences
         // each one gates are named here.
@@ -6279,7 +6307,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · read by aterm harness accounts renew --due alone · each is host or host:/abs/path/to/aterm"
         }
         "harness.limit_reset" => {
-            " · Claude Code only, through the usage-limit dialog's own reset row and its confirmation (keys only, no command typed) · needs resume_limits · built, off by default, and never run against a real wall"
+            " · Claude Code only, through the usage-limit dialog's own reset row and its confirmation (keys only, no command typed) · only the one reset on offer, unless limit_reset_kinds names the kinds it may spend (which kinds: aterm harness accounts --help) · needs resume_limits · built, off by default, and never run against a real wall"
+        }
+        "harness.limit_reset_kinds" => {
+            " · 5-hour, weekly or full, first preferred · the row of the first listed kind on offer is taken, whatever else is offered, never an unlisted kind or a Fable reset · empty: only the one reset on offer"
         }
         "harness.usage_tap" => {
             " · through Claude Code's own status line on the relaunch lines aterm types, for this machine's own login only; not where your own statusLine or --settings is set; it moves no session · off by default"
@@ -6336,13 +6367,13 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · host[:port] or [IPv6]:port, the port 7100 when none is written; listed and checked by `aterm fleet peers`"
         }
         "session_log.journal" => {
-            " · off: aterm keeps no journal, creates no file and deletes nothing · on: a record of what each session did under the logs folder's `session-log/`: each command's first word as typed (`detail=`, so a secret typed at a prompt and run is kept too) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, at most 64 MiB and 2048 files of its own (oldest deleted first), so `log @<sid>` and `brief @<sid>` answer for a session from an earlier run or a crash · read at launch; follows restore_session; a window's only · macOS and Linux"
+            " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's first word as typed (`detail=`, so a secret typed at a prompt and run is kept too) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `log @<sid>` and `brief @<sid>` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "sys.stats_bars" => {
-            " · default deck: three bars under the titlebar (Global, aterm, Tab), each core a tile whose fill is its use, with glow for rising load, a ghost for the recent peak and a notch for a stuck process; the GPU, memory and swap, and the disk the tab is in · off: no bars, and the terminal gets the rows back · read live"
+            " · default deck: three bars under the titlebar (Global, aterm, Tab), each core a tile whose fill is its use, with a warm glow and a notch for rising load and a dotted ghost at the 20-second average; the GPU, memory and swap, and the disk the tab is in · sill: the same three bars as thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on an instrument, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
         }
         "session_log.clause" => {
-            " · off: a tab's tooltip and context menu are as they were · on: one more line after `activity:`, `now:` and what the session's log says the tab is doing (`now: running shell`, `now: approval · bash`, a harness's or your own label), in the menu with how long it has held; never a label another client wrote · read live"
+            " · on (the default): one more line after `activity:`, `now:` and what the session's log says the tab is doing (`now: running shell`, `now: approval · bash`, `now: limit · resets 14:05`; what needs you first), in the menu with how long it has held; never a label another client wrote; the tab's name is unchanged · off: a tab's tooltip and context menu are as they were · read live"
         }
         "update.auto_apply" => {
             " · off, a downloaded build installs only when you ask — Update to Latest Now on macOS, `aterm update apply` on Linux · the native updater runs on macOS and Linux"

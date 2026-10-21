@@ -401,6 +401,18 @@ impl Window {
         self.window_id
     }
 
+    /// The window's state, which a request from another thread locks (`retire_tests`).
+    #[cfg(test)]
+    pub(crate) fn shared_state(&self) -> Arc<Mutex<WindowState>> {
+        Arc::clone(&self.window_state)
+    }
+
+    /// The window's `wl_surface` (`retire_tests` gives it a buffer).
+    #[cfg(test)]
+    pub(crate) fn wl_surface(&self) -> Proxy {
+        self.surface
+    }
+
     #[inline]
     pub fn set_title(&self, title: impl ToString) {
         let new_title = title.to_string();

@@ -991,7 +991,7 @@ impl Grid {
     /// [`invalidate_rings`](crate::extra_collection::CellExtras::invalidate_rings)
     /// clears the ring. Gated on the cell's COMPLEX flag so stale ring slots are
     /// not resurrected; skips cells already HashMap-backed (ZWJ/skin-tone).
-    fn migrate_complex_ring_to_extras(&mut self) {
+    pub(super) fn migrate_complex_ring_to_extras(&mut self) {
         // Only visible rows can match (`GridStorage::row` returns `None` past
         // `visible_rows`), so the ring-scrollback tail need not be probed.
         // `.min(rows.len())` guards a degenerate `visible_rows > rows.len()`
@@ -1030,7 +1030,7 @@ impl Grid {
     /// second resize of a quiet flap) the early-out returns before reading a
     /// cell. Runs at the pre-`adjust_row_count` positions, so the entries ride
     /// the same row shift as combining marks and links.
-    fn migrate_rgb_ring_to_extras(&mut self) {
+    pub(super) fn migrate_rgb_ring_to_extras(&mut self) {
         if !self.storage.extras.has_rgb_ring() {
             return;
         }

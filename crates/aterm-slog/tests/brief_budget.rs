@@ -4,11 +4,11 @@
 //! `brief` (§7.4): its shape, its budget and its shedding order.
 
 use aterm_slog::{
-    Actor, Amend, BoxWord, Close, Conf, Fields, Key, Kind, Limits, Log, Mark, Node, Open, Out,
-    RunOut, ShortId, Src, StepOut, TurnTracker, Verdict, WallKind, tokens,
+    Actor, Amend, BoxWord, BriefInput, Close, Conf, Cursor, Fields, Key, Kind, Limits, Log, Mark,
+    Node, Open, Out, RunOut, ShortId, Src, StepOut, TurnTracker, Verdict, WallKind, tokens,
 };
 
-use crate::support::{WALL0, agent_session, at};
+use crate::support::{WALL0, agent_session, at, brief_mail_links_hold};
 
 /// A session of `turns` turns, each with an approval box, a person's input
 /// mark on every third, the last turn left open on a box; the OSC title set
@@ -139,6 +139,36 @@ fn brief_stays_within_its_budget() {
                 b.used,
                 b.text
             );
+        }
+    }
+}
+
+/// THE FLOOR IS THE FIT AT ZERO, RENDERED ONCE: over sessions of 1 to 120
+/// turns, read whole, past a cursor and across an epoch (a gap line),
+/// `Briefing::floor` is byte for byte `fit` at budget 0, the one-line form.
+/// NEGATIVE CONTROL: the one-line form fitted at budget 1 differs from it,
+/// in its header's budget alone, so the equality reads the whole reply.
+#[test]
+fn briefing_floor_is_its_fit_at_zero() {
+    for turns in [1, 5, 30, 120] {
+        let (log, now) = session(turns);
+        for cursor in [
+            Cursor::new(log.ep(), 0),
+            Cursor::new(log.ep(), log.last_seq() - 3),
+            Cursor::new(log.ep() + 7, 3),
+        ] {
+            let read = log.read(cursor, usize::MAX);
+            let input = BriefInput::new(read.recs, read.gap, log.state(), &[]);
+            let briefing = input.scanned();
+            let floor = briefing.floor("s-1", now);
+            assert_eq!(floor, briefing.fit("s-1", 0, now), "{turns} turns");
+            assert_eq!(floor.level, 4, "{}", floor.text);
+
+            // NEGATIVE CONTROL.
+            let one = briefing.fit("s-1", 1, now);
+            assert_eq!(one.level, 4, "{}", one.text);
+            assert_ne!(one.text, floor.text);
+            assert_eq!(one.text, floor.text.replacen(" budget=0 ", " budget=1 ", 1));
         }
     }
 }
@@ -277,7 +307,15 @@ fn brief_keeps_the_open_turn_its_window_lacks() {
         "the open turn's open record is pinned"
     );
     let without: Vec<&aterm_slog::Rec> = log.window().filter(|r| r.k != Kind::Turn).collect();
-    let b = aterm_slog::brief("s-1", without, None, log.state(), 100_000, WALL0 + 60_000);
+    let b = aterm_slog::brief(
+        "s-1",
+        without,
+        None,
+        log.state(),
+        &[],
+        100_000,
+        WALL0 + 60_000,
+    );
     let turn = b
         .text
         .lines()
@@ -285,6 +323,175 @@ fn brief_keeps_the_open_turn_its_window_lacks() {
         .unwrap_or_else(|| panic!("no open turn line:\n{}", b.text));
     assert!(turn.contains(" by=harness ledger=7"), "{turn}");
     assert!(turn.contains("· p1 approval edit open"), "{turn}");
+}
+
+/// A TURN WHOSE OPEN WAS EVICTED KEEPS ITS AUTHOR AND ITS EXCHANGE (Phase 6
+/// step 6C-2, ruling U6): on a 20-record ring, a harness `ctl turn`
+/// (`ledger=7`) settles, and later turns evict its open record while its
+/// close stays; the close restates `ledger=` (5F-4a) and its opener as
+/// `op_by=harness`, so the brief's line for it still says `by=harness
+/// ledger=7`. NEGATIVE CONTROLS (scratch reverts): a close without
+/// `op_by=` loses `by=`; a brief that reads `ledger=` only from the open
+/// loses `ledger=`.
+#[test]
+fn a_harness_turn_whose_open_was_evicted_still_briefs_its_author_and_ledger() {
+    let mut log = Log::with_limits(1, Limits::new(20, 1 << 20).expect("a 20-record ring"));
+    let run = agent_session(&mut log, 0);
+    let mut tr = TurnTracker::new(run);
+    tr.ctl_turn(&mut log, Actor::Harness, 7, at(10));
+    tr.observe(&mut log, Verdict::Busy, None, at(20));
+    tr.observe(&mut log, Verdict::Idle, None, at(30));
+    tr.tick(&mut log, at(60_000));
+    let t1 = log
+        .window()
+        .find(|r| r.op == aterm_slog::Op::Close && r.k == Kind::Turn)
+        .map(|r| r.node)
+        .expect("the harness turn closed");
+    let has = |log: &Log, op: aterm_slog::Op| log.window().any(|r| r.node == t1 && r.op == op);
+    let mut ms = 61_000;
+    while has(&log, aterm_slog::Op::Open) {
+        let t = log
+            .open(
+                Open::new(Kind::Turn, Src::Screen, Conf::Strong)
+                    .under(run)
+                    .by(Actor::Ctl),
+                at(ms),
+            )
+            .expect("a later turn");
+        log.close(
+            t,
+            Close::new(
+                Out::Turn(aterm_slog::TurnOut::Done),
+                Src::Screen,
+                Conf::Strong,
+            ),
+            at(ms + 5),
+        )
+        .expect("it closes");
+        ms += 10;
+        assert!(ms < 70_000, "the ring never evicted t1's open");
+    }
+    assert!(
+        has(&log, aterm_slog::Op::Close),
+        "PRECONDITION: t1's close is live"
+    );
+    let b = log.brief("s-1", 100_000, WALL0 + ms);
+    let line = b
+        .text
+        .lines()
+        .find(|l| l.starts_with(&format!("{t1} ")))
+        .unwrap_or_else(|| panic!("no line for {t1}:\n{}", b.text));
+    assert!(line.contains(" by=harness ledger=7"), "{line}");
+}
+
+/// A log whose `mails` (`kind`, `off`) were delivered 10 ms apart, then a
+/// turn of `by` naming `cause` (if any) opened: the log, the turn and when.
+fn mail_then_turn(mails: &[(&str, u64)], by: Actor, cause: Option<&str>) -> (Log, Node, u64) {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mut ms = 10;
+    for (kind, off) in mails {
+        let f = Fields::new()
+            .word(Key::Dir, "in")
+            .and_then(|f| f.word(Key::MailKind, kind))
+            .and_then(|f| f.u(Key::Off, *off))
+            .expect("mail fields");
+        log.mark(
+            Mark::new(Kind::Mail, Src::Fabric, Conf::Exact)
+                .at(Node::SESSION)
+                .by(Actor::Bridge)
+                .fields(f),
+            at(ms),
+        )
+        .expect("the mail mark");
+        ms += 10;
+    }
+    let f = cause.map_or_else(Fields::new, |c| Fields::new().cause(c).expect("a cause"));
+    let src = if by == Actor::Human {
+        Src::Input
+    } else {
+        Src::Ctl
+    };
+    let t = log
+        .open(
+            Open::new(Kind::Turn, src, Conf::Strong)
+                .under(run)
+                .by(by)
+                .fields(f),
+            at(ms),
+        )
+        .expect("the turn opens");
+    (log, t, ms)
+}
+
+/// `t`'s line in `log`'s brief at `ms`.
+fn turn_line_of(log: &Log, t: Node, ms: u64) -> String {
+    let b = log.brief("s-1", 100_000, WALL0 + ms);
+    b.text
+        .lines()
+        .find(|l| l.starts_with(&format!("{t} ")))
+        .unwrap_or_else(|| panic!("no line for {t}:\n{}", b.text))
+        .to_string()
+}
+
+/// THE MAIL A TURN PROBABLY ANSWERED (Phase 6 step 6C-3, ruling U5): a
+/// `ctl` turn opened after one delivered `kind=task` mail briefs
+/// ` mail=@9~` after its own fields, open and once closed (the fold keeps
+/// the newest closed turn's link); a `kind=note` mail, two task mails (the
+/// fold's `mail_amb=`, T10c), a person's turn and a turn naming its cause
+/// print none, the cause staying `cause=@9`; and no record `log` prints
+/// names the link. NEGATIVE CONTROLS (scratch reverts): a renderer that
+/// writes the token without its suffix fails here, in the conformance
+/// walk and in the `.seq` corpus; one that never writes it fails here.
+#[test]
+fn a_turn_after_one_task_mail_briefs_it_as_a_guess() {
+    let (mut log, t, ms) = mail_then_turn(&[("task", 9)], Actor::Ctl, None);
+    let line = turn_line_of(&log, t, ms + 1000);
+    assert!(
+        line.starts_with(&format!("{t} open 1s by=ctl mail=@9~ ")),
+        "{line}"
+    );
+    assert_eq!(brief_mail_links_hold(&log, WALL0 + ms + 1000), Ok(1));
+    log.close(
+        t,
+        Close::new(
+            Out::Turn(aterm_slog::TurnOut::Done),
+            Src::Screen,
+            Conf::Strong,
+        ),
+        at(ms + 2000),
+    )
+    .expect("it closes");
+    let line = turn_line_of(&log, t, ms + 3000);
+    assert!(line.contains(" by=ctl mail=@9~ "), "{line}");
+    assert_eq!(brief_mail_links_hold(&log, WALL0 + ms + 3000), Ok(1));
+
+    for (mails, by, cause, what) in [
+        (&[("note", 9)][..], Actor::Ctl, None, "a note"),
+        (
+            &[("task", 9), ("task", 10)][..],
+            Actor::Ctl,
+            None,
+            "two task mails",
+        ),
+        (&[("task", 9)][..], Actor::Human, None, "a person's turn"),
+        (&[("task", 9)][..], Actor::Ctl, Some("@9"), "a named cause"),
+    ] {
+        let (log, t, ms) = mail_then_turn(mails, by, cause);
+        let line = turn_line_of(&log, t, ms + 1000);
+        assert!(!line.contains("mail="), "{what}: {line}");
+        assert_eq!(
+            brief_mail_links_hold(&log, WALL0 + ms + 1000),
+            Ok(0),
+            "{what}"
+        );
+        if cause.is_some() {
+            assert!(line.contains(" by=ctl cause=@9 "), "{what}: {line}");
+        }
+        if mails.len() == 2 {
+            assert_eq!(log.state().totals.mail_amb, 1, "{what}");
+        }
+    }
 }
 
 /// Many walled turns (never ordinary, so never ranges) shed oldest first
@@ -334,11 +541,11 @@ fn a_narrowed_window_reports_only_the_gap_its_read_crossed() {
         usize::MAX,
     );
     assert!(past.gap.is_none());
-    let b = aterm_slog::brief("s-1", past.recs, past.gap, log.state(), 2000, now);
+    let b = aterm_slog::brief("s-1", past.recs, past.gap, log.state(), &[], 2000, now);
     assert!(!b.text.contains("gap "), "{}", b.text);
     let stale = log.read(aterm_slog::Cursor::new(log.ep() + 7, 3), usize::MAX);
     let g = stale.gap.expect("another epoch's cursor is reset");
-    let b = aterm_slog::brief("s-1", stale.recs, stale.gap, log.state(), 2000, now);
+    let b = aterm_slog::brief("s-1", stale.recs, stale.gap, log.state(), &[], 2000, now);
     assert!(
         b.text.contains(&format!(
             "\ngap why=reset lost={} resync_to={}\nmore=",

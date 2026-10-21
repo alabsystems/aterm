@@ -443,6 +443,31 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         "Adopt",
         "Land",
     ]);
+    // A spare adopted while its escape scan waits out its window, as a
+    // warming one is; the verdict after it finds no spare to act on.
+    lockstep(&[
+        "Book",
+        "Spawned",
+        "ParkMark",
+        "GateOpens",
+        "Promote",
+        "StartMark",
+        "Adopt",
+        "Verified",
+        "Land",
+    ]);
+    // A generation that moves under a verifying spare: refused, then retired.
+    lockstep(&[
+        "Book",
+        "Spawned",
+        "ParkMark",
+        "GateOpens",
+        "Promote",
+        "StartMark",
+        "GenerationMoves",
+        "Adopt",
+        "Retire",
+    ]);
     // A generation that moves under a ready spare: refused, then retired.
     lockstep(&[
         "Book",

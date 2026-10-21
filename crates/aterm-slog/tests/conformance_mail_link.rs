@@ -31,7 +31,10 @@
 //!
 //! THE CARRY (T10a): a turn's link crosses a seamless update on its own
 //! `fold` line; a carry without the `ml` tokens (3B-shaped) reads with no
-//! link, the same state otherwise, and the same brief, byte for byte.
+//! link, the same state otherwise, and the same brief, byte for byte. Since
+//! Phase 6 step 6C-5 (ruling U19) the waiting task mails and the mail latch
+//! cross too, on the totals line (`mlw=`, `mlh=`): a task mail delivered
+//! before the update links the successor's next turn.
 
 use aterm_models_session::session_log_mail_link_model;
 use aterm_slog::{
@@ -43,7 +46,7 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
 use aterm_spec::rng::XorShift;
 
-use crate::support::{WALL0, agent_session, at};
+use crate::support::{WALL0, agent_session, at, brief_mail_links_hold};
 
 /// What the walk knows of a mail it sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -395,6 +398,7 @@ fn mail_link_conforms_to_derived_model() {
     let m = session_log_mail_link_model();
     let mut ran = std::collections::BTreeSet::new();
     let mut seen = std::collections::BTreeSet::new();
+    let mut briefed = 0;
     for seed in 1..=400u64 {
         let mut rng = XorShift::new(seed);
         let mut w = World::new();
@@ -405,6 +409,18 @@ fn mail_link_conforms_to_derived_model() {
             if let Some(action) = w.step(&m, &mut rng) {
                 let next = w.project();
                 admitted(&m, action, &prev, &next);
+                // Waiting mail implies the latch (Phase 6 step 6C-5): the
+                // carry's reader refuses the one without the other, so no
+                // fold may hold it. NEGATIVE CONTROL (by scratch revert): a
+                // fold whose task mail sets no latch fails here.
+                assert!(
+                    w.log.fold().mail_waiting().is_empty() || w.log.fold().in_since_human(),
+                    "seed {seed} after `{action}`: mail waits without the latch"
+                );
+                // The brief prints the link the fold holds, with its `~`,
+                // and no other (Phase 6 step 6C-3, ruling U5).
+                briefed += brief_mail_links_hold(&w.log, w.now())
+                    .unwrap_or_else(|e| panic!("seed {seed} after `{action}`: {e}"));
                 ran.insert(action);
                 let opened = action == "OpenTurn";
                 let past_view = std::mem::replace(&mut last, action) == "HumanNoReach";
@@ -436,6 +452,7 @@ fn mail_link_conforms_to_derived_model() {
     }
     assert_eq!(ran.len(), 9, "every action driven: {ran:?}");
     assert_eq!(seen.len(), 8, "every witness reached: {seen:?}");
+    assert!(briefed > 0, "no brief printed a link");
 }
 
 /// The world after `path` of the model's actions, each checked.
@@ -673,7 +690,9 @@ fn adopt_at(log: &Log, ms: u64) -> CarryAdopt {
 /// count cross a seamless update on their own fold lines; a 3B-shaped carry
 /// (no `ml` tokens, no `mail_amb=`) reads with neither and the same state
 /// otherwise; a token this build does not know on the same line is skipped
-/// (the R13 rule); and no brief, `log` line or record prints the link.
+/// (the R13 rule); the brief that read it back prints it as
+/// `mail=@<off>~` (6C-3, U5) and the 3B one does not, the two otherwise
+/// byte for byte; and no `log` line or record prints the link.
 #[test]
 fn a_carried_link_reads_back_and_a_3b_carry_reads_none() {
     let mut w = World::new();
@@ -811,11 +830,28 @@ fn a_carried_link_reads_back_and_a_3b_carry_reads_none() {
         }
 
         let now = WALL0 + 900_000;
-        assert_eq!(
+        let token = format!(" mail=@{}~", l.off);
+        let (with, without) = (
             back.brief("s-1", 4000, now).text,
             b3.brief("s-1", 4000, now).text,
-            "the link changes no brief byte"
         );
+        assert_eq!(with.matches(&token).count(), 1, "{with}");
+        assert!(!without.contains("mail=@"), "{without}");
+        // The body past the header, whose `used=` counts the token's bytes.
+        let body_without_link = |t: &str| {
+            t.lines()
+                .skip(1)
+                .map(|l| l.replace(&token, ""))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            body_without_link(&with),
+            body_without_link(&without),
+            "the link changes no other brief byte"
+        );
+        for log in [&back, &b3] {
+            brief_mail_links_hold(log, now).expect("the read-back brief");
+        }
         let recs = |log: &Log| -> Vec<String> {
             log.window()
                 .map(|r| aterm_slog::encode(r, aterm_slog::Tier::Content).expect("fits"))
@@ -827,4 +863,195 @@ fn a_carried_link_reads_back_and_a_3b_carry_reads_none() {
             "no record names a link"
         );
     }
+}
+
+/// The totals line of a carry (`fold totals …`).
+fn totals_line(lines: &[String]) -> &str {
+    lines
+        .iter()
+        .find(|l| l.starts_with("fold totals "))
+        .expect("the totals line")
+}
+
+/// `lines` with `token` (a ` <key>=<value>` the totals line carries) taken
+/// off the totals line alone.
+fn without_on_totals(lines: &[String], key: &str) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| {
+            if l.starts_with("fold totals ") {
+                l.split(' ')
+                    .filter(|w| !w.starts_with(&format!("{key}=")))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                l.clone()
+            }
+        })
+        .collect()
+}
+
+/// A ctl turn opened on `log` under `run` at `ms`, and its link.
+fn ctl_turn_link(log: &mut Log, run: Node, ms: u64) -> Option<MailLink> {
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Ctl, Conf::Strong)
+                .under(run)
+                .by(Actor::Ctl),
+            at(ms),
+        )
+        .expect("the turn opens");
+    log.fold().mail_link(turn)
+}
+
+/// THE MAIL LATCH AND THE WAITING MAILS CROSS AN UPDATE (Phase 6 step
+/// 6C-5, rulings U19, T10a): a `kind=task` mail delivered before a seamless
+/// update rides the carry's totals line as `mlw=<off>:<t>`, with the latch
+/// as `mlh=1`; the successor holds both, and its next ctl turn (inside the
+/// window) links the mail, heuristically. The latch is the fold's own: a
+/// `reached=0` mark leaves it, a reached `human` mark clears it, and a carry
+/// after that names no `mlh=`. A 3B-shaped carry (no `ml` tokens) still
+/// reads: no waiting mail, no latch, the same state otherwise, and the turn
+/// links none. A token of the wrong shape refuses the carry, as do more
+/// waiting mails than a fold holds and waiting mail without the latch (no
+/// fold holds it: `mail_link_conforms_to_derived_model` checks that on every
+/// step). NEGATIVE CONTROLS (scratch revert of `fold_snap.rs`'s
+/// `push_mail`): a carry that drops `mlw=` loses the mail, and the
+/// successor's turn links none; one that drops `mlh=` loses the latch, and
+/// is refused. A `read_mail` that takes the mail without the latch reads it.
+#[test]
+fn a_waiting_task_mail_and_the_latch_cross_an_update() {
+    let mut w = World::new();
+    w.real("TaskMail");
+    let sent = w.sent[0];
+    assert_eq!(w.log.fold().mail_waiting().len(), 1, "the task mail waits");
+    assert!(w.log.fold().in_since_human(), "the mail set the latch");
+
+    let out = w
+        .log
+        .carry(CarryBudget::SESSION, &[])
+        .expect("the carry fits");
+    let ms = w.clock + 1_000;
+    let (back, _, _) = Log::from_carry(&out.lines, adopt_at(&w.log, ms)).expect("reads");
+
+    // The successor's next turn links the mail it was handed.
+    let mut turned = back.clone();
+    let link = ctl_turn_link(&mut turned, w.run, ms + 10);
+    assert_eq!(
+        link,
+        Some(MailLink {
+            off: sent.off,
+            conf: Conf::Heuristic
+        }),
+        "the turn after the update links the task mail delivered before it"
+    );
+    assert!(turned.fold().mail_waiting().is_empty(), "the turn took it");
+    assert!(back.fold().in_since_human(), "the latch crossed");
+    assert_eq!(back.fold().mail_waiting(), w.log.fold().mail_waiting());
+    let totals = totals_line(&out.lines);
+    assert!(
+        totals.ends_with(&format!(" mlh=1 mlw={}:{}", sent.off, sent.t)),
+        "{totals}"
+    );
+
+    // The latch: a gesture that reached no program leaves it; a reached
+    // `human` mark clears it, and the next carry names none.
+    let mark = |log: &mut Log, reached: bool, ms: u64| {
+        let mut m = Mark::new(Kind::Human, Src::Input, Conf::Strong)
+            .at(Node::SESSION)
+            .by(Actor::Human);
+        if !reached {
+            m = m.fields(Fields::new().u(Key::Reached, 0).expect("reached=0"));
+        }
+        log.mark(m, at(ms)).expect("the human mark");
+    };
+    let mut latched = back.clone();
+    mark(&mut latched, false, ms + 1);
+    assert!(
+        latched.fold().in_since_human(),
+        "reached=0 answered nothing"
+    );
+    mark(&mut latched, true, ms + 2);
+    assert!(
+        !latched.fold().in_since_human(),
+        "the person's input took it"
+    );
+    let after = latched
+        .carry(CarryBudget::SESSION, &[])
+        .expect("the carry fits");
+    assert!(
+        !totals_line(&after.lines).contains(" ml"),
+        "{:?}",
+        after.lines
+    );
+
+    // A 3B-shaped carry: neither crosses, nothing else moves.
+    let old = strip_links(&out.lines);
+    assert!(!totals_line(&old).contains(" ml"));
+    let (mut b3, _, _) = Log::from_carry(&old, adopt_at(&w.log, ms)).expect("a 3B carry reads");
+    assert!(b3.fold().mail_waiting().is_empty());
+    assert!(!b3.fold().in_since_human());
+    let (fresh, _, _) = Log::from_carry(&out.lines, adopt_at(&w.log, ms)).expect("reads");
+    assert_eq!(
+        fresh.fold().state(),
+        b3.fold().state(),
+        "the tokens moved nothing else"
+    );
+    assert_eq!(ctl_turn_link(&mut b3, w.run, ms + 10), None);
+
+    // Each token alone: the latch without the mail reads (a turn took the
+    // mail, and the person has not acted since); the mail without the latch
+    // is a fold no record makes, and refuses the carry.
+    let latch_only = without_on_totals(&out.lines, "mlw");
+    let (one, _, _) = Log::from_carry(&latch_only, adopt_at(&w.log, ms)).expect("reads");
+    assert!(one.fold().mail_waiting().is_empty());
+    assert!(one.fold().in_since_human());
+    assert!(
+        matches!(
+            Log::from_carry(&without_on_totals(&out.lines, "mlh"), adopt_at(&w.log, ms)),
+            Err(aterm_slog::CarryError::Fold(aterm_slog::SnapError::Line))
+        ),
+        "waiting mail without the latch"
+    );
+
+    // A shape this build never writes refuses the carry.
+    let planted = |from: &str, to: &str| -> Vec<String> {
+        let lines: Vec<String> = out.lines.iter().map(|l| l.replace(from, to)).collect();
+        assert_ne!(lines, out.lines, "{from} -> {to}");
+        lines
+    };
+    for (from, to) in [
+        (" mlh=1", " mlh=0"),
+        (" mlh=1", " mlh=yes"),
+        (" mlw=", " mlw=x"),
+        (" mlw=", " mlw=:"),
+        (" mlw=", " mlw=,"),
+    ] {
+        assert!(
+            matches!(
+                Log::from_carry(&planted(from, to), adopt_at(&w.log, ms)),
+                Err(aterm_slog::CarryError::Fold(aterm_slog::SnapError::Line))
+            ),
+            "{from} -> {to}"
+        );
+    }
+    let pair = format!("{}:{}", sent.off, sent.t);
+    let five = [pair.as_str(); aterm_slog::MAX_MAIL_WAITING + 1].join(",");
+    assert!(matches!(
+        Log::from_carry(
+            &planted(&format!(" mlw={pair}"), &format!(" mlw={five}")),
+            adopt_at(&w.log, ms)
+        ),
+        Err(aterm_slog::CarryError::Fold(aterm_slog::SnapError::Bound))
+    ));
+    let four = [pair.as_str(); aterm_slog::MAX_MAIL_WAITING].join(",");
+    let (full, _, _) = Log::from_carry(
+        &planted(&format!(" mlw={pair}"), &format!(" mlw={four}")),
+        adopt_at(&w.log, ms),
+    )
+    .expect("a full waiting list reads");
+    assert_eq!(
+        full.fold().mail_waiting().len(),
+        aterm_slog::MAX_MAIL_WAITING
+    );
 }

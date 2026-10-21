@@ -395,10 +395,11 @@ pub struct Paths {
 
 impl Paths {
     /// The tier the broker this root runs acks under: the named one, else the
-    /// build's default.
+    /// build's default for a guarded broker ([`crate::durability::default_for`]):
+    /// the job `on` writes always names its mint secret ([`Self::broker_argv`]).
     #[must_use]
     pub fn tier(&self) -> crate::durability::Durability {
-        crate::durability::resolve(self.durability)
+        crate::durability::resolve(self.durability, true)
     }
 }
 
@@ -740,7 +741,7 @@ impl Paths {
     }
 }
 
-fn default_root(home: &Path) -> PathBuf {
+pub(crate) fn default_root(home: &Path) -> PathBuf {
     home.join(".local/share/aterm-fabric")
 }
 
@@ -1250,38 +1251,25 @@ fn undo_command(program: &str, scope: &[(&str, Option<String>)]) -> String {
     s
 }
 
-/// The login user's home directory FROM THE PASSWORD DATABASE — `~<user>` as
-/// `sh` expands it, which POSIX defines through `getpwnam()`, never `$HOME`.
-/// `None` when `id -un` or the shell cannot answer, or answers something that
-/// is not an absolute path (an unexpanded `~user` is "no such user").
+/// The login user's home directory FROM THE PASSWORD DATABASE, never `$HOME`:
+/// the account database's home for this process's effective uid
+/// (`getpwuid_r`), the directory `sh` expands `~$(id -un)` to (POSIX defines
+/// `~<name>` through `getpwnam()`, which answers the same entry). `None` when
+/// the database has no entry for the uid, or names a home that is not an
+/// absolute path; every other platform answers `None`.
 ///
-/// Two subprocesses rather than a `libc` dependency: this crate counts its
-/// third-party packages (Cargo.toml), `uid()` already shells out for the same
-/// reason, and it runs once per `on`/`off`.
+/// Read in this process: every `aterm fabric` step resolves its [`Paths`],
+/// and the `id -un` and `sh -c` children this once ran cost 69 spawns and
+/// 1.75 s of one `fabric_on` test run on a loaded Mac.
 fn login_home() -> Option<PathBuf> {
-    let user = aterm_uds::spawnfd::command("id")
-        .arg("-un")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|u| {
-            !u.is_empty()
-                && u.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
-        })?;
-    let expanded = aterm_uds::spawnfd::command("sh")
-        .arg("-c")
-        .arg(format!("printf '%s' ~{user}"))
-        .env_remove("HOME")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-    let home = Path::new(&expanded);
-    (home.is_absolute() && !expanded.starts_with('~')).then(|| home.to_path_buf())
+    #[cfg(unix)]
+    {
+        aterm_uds::account::home_of(aterm_uds::peer::our_uid()).filter(|h| h.is_absolute())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// `<control socket dir>/fabric.toml`.
@@ -2522,15 +2510,17 @@ fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, String> 
     }
 }
 
+/// This process's effective uid, as `id -u` prints it: the `gui/<uid>`
+/// launchd domain every job here is written to.
+#[cfg(unix)]
 pub(crate) fn uid() -> String {
-    aterm_uds::spawnfd::command("id")
-        .arg("-u")
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "501".to_string())
+    aterm_uds::peer::our_uid().to_string()
+}
+
+/// No uid off Unix: the launchd steps that name one are macOS's alone.
+#[cfg(not(unix))]
+pub(crate) fn uid() -> String {
+    "501".to_string()
 }
 
 /// `launchctl <args>`; `Ok(())` on exit 0.
@@ -3513,13 +3503,14 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
     );
     // A relaxed broker is said every run, with what its ack does not promise,
-    // and so is an ordered one, with the tier this build serves it at; a
+    // and so is an ordered one, with what a power loss can take from it (and
+    // that astream serves it strict where the device cannot keep the order); a
     // switch back to strict is said once, as the job it rewrites.
     let kept_from = match (opts.durability, &durability_job) {
         (None, Some(job)) => format!(", kept from {job}"),
         _ => String::new(),
     };
-    match (p.tier(), crate::durability::resolve(job_durability)) {
+    match (p.tier(), crate::durability::resolve(job_durability, true)) {
         (crate::durability::Durability::Relaxed, _) => out.note(
             "durability",
             &format!(
@@ -3530,15 +3521,19 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         (crate::durability::Durability::Ordered, _) => out.note(
             "durability",
             &format!(
-                "ordered{kept_from}, {}",
+                "ordered{kept_from} — {}; `--durability strict` returns to acks on the disk",
                 crate::durability::describe_own(crate::durability::Durability::Ordered)
             ),
         ),
-        (crate::durability::Durability::Strict, crate::durability::Durability::Relaxed) => {
+        (
+            crate::durability::Durability::Strict,
+            was @ (crate::durability::Durability::Relaxed | crate::durability::Durability::Ordered),
+        ) => {
             out.note(
                 "durability",
                 &format!(
-                    "strict, was relaxed — {}",
+                    "strict, was {} — {}",
+                    was.name(),
                     crate::durability::Durability::Strict.promise()
                 ),
             );
@@ -4193,6 +4188,20 @@ fn renew_remedy(again: &str) -> String {
     )
 }
 
+/// The fix for a broker whose log is POISONED and still served — read in band
+/// (`aterm fabric`'s poisoned warning, [`fabric::POISONED_WARNING`]) or by a
+/// bridge (`fabric=stalled reason=poisoned`). The log refuses every write until
+/// it is reopened; a broker of this build reopens it by exiting for its
+/// supervisor ([`crate::broker_health`]), so one still poisoned is inside those
+/// seconds, an earlier release's, or one run by hand. Never a re-minted cap or
+/// a repair: the node is fine and the log is sound — only its open is spent.
+const POISONED_LOG_REMEDY: &str = "the broker's log is poisoned and refuses every write until \
+     it is reopened, which a broker of this build does itself: it exits within seconds and its \
+     supervisor starts it again. One that stays poisoned predates this build: stop it (`kill \
+     <pid>`, the broker pid `aterm fabric --json` names) and its supervisor starts it on the \
+     reopened log (one you run by hand, start again yourself); if it poisons again at once, the \
+     disk under its log is failing flushes";
+
 /// The fix the broker's OWN LAST WORD names, when warning `w` quotes it from
 /// its supervisor's `broker.err` (`fabric::warnings`: "its supervisor's
 /// broker.err, …") — read the one way for every warning that carries it, the
@@ -4216,6 +4225,30 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
              the aterm release that wrote them (or a later one), then {again} restarts the \
              broker. No repair applies, and the log is untouched"
         )
+    } else if s(&format!(": {}", crate::broker_health::POISONED_EXIT_WORDS)) {
+        // THE BROKER LEFT ITS POISONED LOG ([`crate::broker_health::poisoned_line`],
+        // whose opening words these are — they survive the quote's cut, which
+        // astream's reason at the line's end does not), and it is not back.
+        // Never a repair: the log is sound, only its open is spent.
+        if s(crate::broker_health::UNSUPERVISED_WORDS) {
+            // No `aterm fabric on` job runs it: the line names the command
+            // that starts it again, which the quote may have cut.
+            "the broker exited over a poisoned log, and no `aterm fabric on` job runs it: unless \
+             something else restarts it, start it again with the command its line names (the \
+             whole line is the last of broker.err); if it poisons again at once, the disk under \
+             its log is failing flushes"
+                .to_string()
+        } else {
+            // Its supervisor restarts it: launchd no sooner than ten seconds
+            // after its last start, systemd a second after the exit. One
+            // still down after that is one nothing restarted.
+            format!(
+                "the broker exited over a poisoned log for its supervisor to reopen, and it is \
+                 not back yet: launchd starts it again within ten seconds, systemd within one; \
+                 if it stays down, {again} starts it again; if it poisons again at once, the \
+                 disk under its log is failing flushes"
+            )
+        }
     } else if s(crate::cli::CORRUPT_LOG_REMEDY) {
         // THE BROKER'S OWN LINE said its log has a corrupt record, and named
         // the shipped repair with the log's path.
@@ -4260,6 +4293,23 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
             "{again} restarts it on the build on disk (a broker of this build or later \
              restarts itself within a minute of its executable being replaced)"
         )
+    } else if s(fabric::POISONED_WARNING) {
+        // THE BROKER ITSELF SAYS ITS LOG IS POISONED (its `Hello`'s entry
+        // 0x04, [`crate::broker_health`]): nothing on this node is wrong and
+        // a re-minted cap cannot help, and `on` keeps a broker that answers
+        // its probe. The cure is the reopen, which a broker of this build
+        // makes itself by exiting; one still poisoned when this was read is
+        // inside those seconds, or predates the exit, or a hand-run one.
+        POISONED_LOG_REMEDY.to_string()
+    } else if s(fabric::FLUSH_FAILED_WARNING) {
+        // A COUNT, NOT A VERDICT ON WHAT WAS LOST: astream raises it before
+        // the disk work a poison waits on (`fabric::warnings`), so the fix
+        // names the disk and where to read whether the log was poisoned.
+        "check the disk under the broker's log (Disk Utility's First Aid, or the system log's \
+         I/O errors). A failed flush that put acked records at risk poisons the log, which a \
+         broker of this build then exits to reopen: run `aterm fabric` again to see whether \
+         this one did. The count starts again at zero when the broker next opens its log"
+            .to_string()
     } else if s("checks no capability") {
         format!(
             "{again} rewrites the broker's job and restarts it guarded with the root's mint \
@@ -4288,6 +4338,12 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
             }),
             "no-ack" => format!("the broker accepts and never answers: {again} restarts it"),
             "expired" => renew_remedy(&again),
+            // The broker answers and its log takes no write until it is
+            // reopened ([`crate::broker_health`]): nothing on this node is
+            // wrong, and a re-minted cap cannot help. Nor does `on`: a
+            // poisoned broker still answers its probe (reads are served), so
+            // `on` keeps it — the remedy for one that stays is its process.
+            "poisoned" => POISONED_LOG_REMEDY.to_string(),
             "attach" => format!(
                 "the broker refuses this node's cap: move <root>/node.cap aside and run {again}"
             ),
@@ -4593,8 +4649,8 @@ fn instance_flag(pid: u32, sock: Option<&str>) -> String {
     }
 }
 
-/// `--retire-ghosts`: publish `exited` for every presence row this node
-/// advertises LIVE that no local instance hosts.
+/// `--retire-ghosts`: publish `exited` for every presence row this machine's
+/// nodes advertise LIVE that no local instance hosts.
 ///
 /// The bridge's own sweep ([`crate::bridge::Bridge::retire_ghost_presence`])
 /// retires only what it can PROVE unhosted — its own incarnation's rows and
@@ -4604,14 +4660,24 @@ fn instance_flag(pid: u32, sock: Option<&str>) -> String {
 ///
 /// DRY BY DEFAULT: it lists and exits. With a `y` (or `--yes`) it publishes.
 ///
-/// A RUNNING LOCAL BRIDGE PUBLISHES IT: a record goes out under the NODE's
-/// producer id at a sequence reserved through the state dir, which has one
-/// writer — the holder of `StateDir::lock_bridge`. With no bridge up the CLI
-/// takes that lock itself (`fabric::publish_exited`) and refuses when one
-/// holds it: a CLI racing a live bridge for the next sequence would hand the
-/// broker a `(producer_id, seq)` pair it has already seen, which it answers
-/// with the original offset and appends NOTHING — a retire that reports
-/// success and did not happen.
+/// A RUNNING BRIDGE OF THE ROW'S OWN NODE PUBLISHES IT: a record goes out
+/// under the NODE's producer id at a sequence reserved through the state dir,
+/// which has one writer — the holder of `StateDir::lock_bridge`. With no
+/// bridge of that node up, the CLI takes that lock itself
+/// (`fabric::publish_exited`) — for the node this command's state dir names,
+/// the only one whose state dir and cap it holds — and refuses when one holds
+/// it: a CLI racing a live bridge for the next sequence would hand the broker
+/// a `(producer_id, seq)` pair it has already seen, which it answers with the
+/// original offset and appends NOTHING — a retire that reports success and
+/// did not happen.
+///
+/// NEVER ANOTHER NODE'S BRIDGE ([`publisher_for`]). A bridge retires only on
+/// its own node's face (`Bridge::retire_on_request`), so a ghost node's rows
+/// asked of this machine's running aterm were dropped there unrefused — the
+/// doctor waited out [`RETIRE_WAIT`] and exited 2 — and that is exactly what
+/// `aterm fabric` told the operator to do for a `remote` node: run this
+/// under that node's state dir. Each node's rows now go to their own
+/// publisher, and a node with none here is named as such.
 fn retire_ghosts_action(yes: bool) -> ExitCode {
     let report = match fabric::gather() {
         Ok(r) => r,
@@ -4657,50 +4723,120 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
     for (sid, node) in &ghosts {
         println!("  @{} on {}", safe(sid, 64), safe(node, 64));
     }
-    // A RUNNING BRIDGE OWNS THE PUBLISH, SO IT IS ASKED TO DO IT. The listing
-    // is the whole value of a dry run and costs nothing either way.
-    let bridge = running_bridge(&report.instances);
+    // EACH NODE'S ROWS TO THAT NODE'S PUBLISHER: a running bridge of it owns
+    // the publish, so it is asked to do it. The listing is the whole value of
+    // a dry run and costs nothing either way.
+    let mut by_node: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    for (sid, node) in &ghosts {
+        by_node
+            .entry(node.as_str())
+            .or_default()
+            .push((sid.clone(), node.clone()));
+    }
     if !yes && !confirmed() {
-        if let Some(pid) = bridge {
-            println!("  note: with --yes, instance {pid}'s bridge is asked to publish them");
+        for node in by_node.keys() {
+            match publisher_for(&report, node) {
+                Publisher::Bridge(pid) => println!(
+                    "  note: with --yes, instance {pid}'s bridge is asked to publish {}'s",
+                    safe(node, 64)
+                ),
+                Publisher::Itself => {}
+                Publisher::Nobody => println!("  note: {}", nobody_publishes(node)),
+            }
         }
         println!("  nothing published (dry). Re-run with --yes, or answer y.");
         return ExitCode::SUCCESS;
     }
-    if let Some(pid) = bridge {
-        return retire_through_bridge(&report, pid, &ghosts);
+    let mut all = true;
+    for (node, rows) in &by_node {
+        all &= match publisher_for(&report, node) {
+            Publisher::Bridge(pid) => retire_through_bridge(&report, pid, node, rows),
+            Publisher::Itself => match fabric::publish_exited(&report, rows) {
+                Ok(n) => {
+                    println!("  published `exited` for {n} row(s)");
+                    true
+                }
+                Err(e) => {
+                    println!("  could not publish: {e}");
+                    false
+                }
+            },
+            Publisher::Nobody => {
+                for (sid, _) in rows {
+                    println!(
+                        "  @{}: not retired: {}",
+                        safe(sid, 64),
+                        nobody_publishes(node)
+                    );
+                }
+                false
+            }
+        };
     }
-    match fabric::publish_exited(&report, &ghosts) {
-        Ok(n) => {
-            println!("  published `exited` for {n} row(s)");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            println!("  could not publish: {e}");
-            ExitCode::from(2)
-        }
+    if all {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
     }
 }
 
+/// Who may publish `exited` over a row of `node` ([`publisher_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publisher {
+    /// The running bridge of the instance at this pid, which answers as the
+    /// node.
+    Bridge(u32),
+    /// This command: the node is its state dir's, and no bridge of it is up.
+    Itself,
+    /// Nothing here: no bridge of the node is up, and this command's state
+    /// dir is another node's.
+    Nobody,
+}
+
+/// The publisher of `node`'s retirements: a running bridge of THAT node
+/// ([`running_bridge`]), else this command when its state dir names the node
+/// (its lock still refuses one a bridge this report missed holds), else
+/// nobody — a node publishes as itself, and only its own cap grants its faces.
+fn publisher_for(report: &fabric::Report, node: &str) -> Publisher {
+    match running_bridge(&report.instances, node) {
+        Some(pid) => Publisher::Bridge(pid),
+        None if report.node.as_deref() == Some(node) => Publisher::Itself,
+        None => Publisher::Nobody,
+    }
+}
+
+/// Why a row of `node` cannot be retired from here, and how it can be.
+fn nobody_publishes(node: &str) -> String {
+    format!(
+        "no bridge of {} is up here and this command's state dir is another node's: run it \
+         under a [fabric] command naming {}'s own state dir and cap",
+        safe(node, 64),
+        safe(node, 64)
+    )
+}
+
 /// THE BRIDGE-UP PATH: ask the instance at `pid` — over its Owner token, on a
-/// connection of its own — to retire the rows through its bridge (`fabric
-/// retire <sid>…`), then read the bus back until every row says `exited` or
-/// [`RETIRE_WAIT`] is up. The CLI writes no sequence: the bridge publishes
-/// under its own, which is what makes the two safe together. A row the bridge
-/// REFUSED (a sibling instance hosts the session; the node could not be asked)
-/// is named with the reason its `presence-retire-refused` event gives; any other
-/// row still unretired at the deadline is reported as exactly that.
+/// connection of its own — to retire `node`'s rows through its bridge, which
+/// answers as `node` ([`publisher_for`]; `fabric retire <sid>…`), then read
+/// the bus back until every row says `exited` or [`RETIRE_WAIT`] is up. The
+/// CLI writes no sequence: the bridge publishes under its own, which is what
+/// makes the two safe together. A row the bridge REFUSED (a sibling instance
+/// hosts the session; the node could not be asked) is named with the reason
+/// its `presence-retire-refused` event gives; any other row still unretired
+/// at the deadline is reported as exactly that. `true` when every row was
+/// retired.
 ///
 /// An instance too old for the verb answers `ERR usage`; that is reported
 /// with its remedy, and nothing is published.
 fn retire_through_bridge(
     report: &fabric::Report,
     pid: u32,
+    node: &str,
     ghosts: &[(String, String)],
-) -> ExitCode {
+) -> bool {
     let Some(instance) = report.instances.iter().find(|i| i.pid == pid) else {
         println!("  could not find the instance at pid {pid} in the report");
-        return ExitCode::from(2);
+        return false;
     };
     let sids: Vec<&str> = ghosts.iter().map(|(sid, _)| sid.as_str()).collect();
     let reply = (|| -> Result<String, String> {
@@ -4714,7 +4850,7 @@ fn retire_through_bridge(
         Ok(h) => h,
         Err(e) => {
             println!("  could not ask the instance at pid {pid}: {e}");
-            return ExitCode::from(2);
+            return false;
         }
     };
     if !header.starts_with("OK") {
@@ -4728,7 +4864,7 @@ fn retire_through_bridge(
                  again"
             );
         }
-        return ExitCode::from(2);
+        return false;
     }
     println!("  asked the bridge at pid {pid}: {}", safe(&header, 80));
     let mut done = 0;
@@ -4743,7 +4879,7 @@ fn retire_through_bridge(
     let mut refusals_read = false;
     while !pending.is_empty() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let Ok(progress) = fabric::retire_progress(report, &pending, since) else {
+        let Ok(progress) = fabric::retire_progress(report, node, &pending, since) else {
             refusals_read = false;
             continue;
         };
@@ -4773,18 +4909,19 @@ fn retire_through_bridge(
         );
     }
     println!("  published `exited` for {done} row(s) through the bridge");
-    if pending.is_empty() && refused.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(2)
-    }
+    pending.is_empty() && refused.is_empty()
 }
 
 /// How long the bridge-up path waits for the bus to show the retirements.
 const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The pid of a local instance whose bridge is up, if one is.
-fn running_bridge(instances: &[fabric::InstanceView]) -> Option<u32> {
+/// The pid of a local instance whose bridge is up AND answers as `node`, if
+/// one is. Only its own node's: a bridge retires a row only on its own node's
+/// face, and drops another node's request unrefused
+/// (`Bridge::retire_on_request`). An instance whose node this report could not
+/// read is nobody's — the state dir's lock, which `fabric::publish_exited`
+/// takes, is what then refuses a CLI beside a bridge it missed.
+fn running_bridge(instances: &[fabric::InstanceView], node: &str) -> Option<u32> {
     instances
         .iter()
         .find(|i| {
@@ -4792,13 +4929,14 @@ fn running_bridge(instances: &[fabric::InstanceView]) -> Option<u32> {
             // `bridge_pids` is the observed truth — a child that exists — and
             // it is what settles the two cases the state words miss: a
             // `stale` link (connected, owing an answer) and a bridge whose
-            // `fabric status` this report could not read. Either one still
-            // owns this node's publish sequence.
+            // `fabric status` gave no state word. Either one still owns
+            // this node's publish sequence.
             //
             // EXCEPT ONE THAT STANDS BY (`bridge::hold_state_dir`): it owns
             // nothing until the holder exits, and a `fabric retire` asked of it
             // is taken, never published, and waited out to "unretired".
-            i.reason.as_deref() != Some("state-locked")
+            i.node.as_deref() == Some(node)
+                && i.reason.as_deref() != Some("state-locked")
                 && (!i.bridge_pids.is_empty()
                     || i.supervised == Some(true)
                     || matches!(i.fabric.as_deref(), Some("connected" | "stalled" | "stale")))
@@ -4878,8 +5016,24 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
                 println!(
                     "  durability: {} — {}",
                     d.name(),
-                    crate::durability::describe_served(d, report.broker.served)
+                    crate::durability::describe_served(
+                        d,
+                        report.broker.served,
+                        report.broker.guarded
+                    )
                 );
+            }
+            // And the log's health: the broker's own word in its `Hello`
+            // (entry 0x04 — poisoned or not, and its flushes), then what the
+            // log holds, from astream's snapshot beside it, said as the serving
+            // broker's own only when astream's reader says so
+            // ([`crate::broker_health`]). A poisoned log, and a failed flush,
+            // are warnings below as well, each with its fix.
+            if let Some(row) = fabric::health_row(&report.broker) {
+                println!("  health: {row}");
+            }
+            if let Some(row) = fabric::holds_row(&report.broker, report.now_ms) {
+                println!("  holds: {row}");
             }
             if warnings.is_empty() {
                 println!("  no warnings");
@@ -4909,6 +5063,14 @@ mod tests {
     /// sequence, and that is true of a bridge whose link went `stale` and of
     /// one whose `fabric status` this report could not read. `bridge_pids` is
     /// the observed truth — a child that exists — so it decides first.
+    ///
+    /// **AND IT IS ONLY ITS OWN NODE'S.** A bridge retires a row only on its
+    /// own node's face (`Bridge::retire_on_request`: "has no presence row on
+    /// this node; nothing to retire"), so a ghost node's rows sent to another
+    /// node's bridge were dropped there, unrefused, and the doctor waited out
+    /// its five seconds and exited 2 — the remedy `aterm fabric` gives for a
+    /// `remote` node, followed while this machine's own aterm ran. NEGATIVE
+    /// CONTROL: the same instance asked for its own node is its bridge.
     #[test]
     fn running_bridge_sees_a_stale_one_and_a_bare_pid() {
         let inst = |fabric: Option<&str>, supervised, pids: Vec<u32>| fabric::InstanceView {
@@ -4916,27 +5078,44 @@ mod tests {
             fabric: fabric.map(str::to_string),
             supervised,
             bridge_pids: pids,
+            node: Some("n-a".to_string()),
             ..fabric::InstanceView::default()
         };
         assert_eq!(
-            running_bridge(&[inst(None, None, vec![99])]),
+            running_bridge(&[inst(None, None, vec![99])], "n-a"),
             Some(42),
             "a bridge child exists: that is a running bridge"
         );
         assert_eq!(
-            running_bridge(&[inst(Some("stale"), Some(false), vec![])]),
+            running_bridge(&[inst(Some("stale"), Some(false), vec![])], "n-a"),
             Some(42),
             "a stale link is a bridge that still owns the sequence"
         );
         assert_eq!(
-            running_bridge(&[inst(Some("connected"), None, vec![])]),
+            running_bridge(&[inst(Some("connected"), None, vec![])], "n-a"),
             Some(42)
         );
         assert_eq!(
-            running_bridge(&[inst(Some("absent"), Some(false), vec![])]),
+            running_bridge(&[inst(Some("absent"), Some(false), vec![])], "n-a"),
             None
         );
-        assert_eq!(running_bridge(&[]), None);
+        assert_eq!(running_bridge(&[], "n-a"), None);
+        // ANOTHER NODE'S BRIDGE IS NOT THIS NODE'S, however alive: a ghost
+        // node's rows are never sent to it.
+        assert_eq!(
+            running_bridge(&[inst(Some("connected"), Some(true), vec![99])], "n-ghost"),
+            None,
+            "n-a's bridge cannot retire n-ghost's rows"
+        );
+        let unread = fabric::InstanceView {
+            node: None,
+            ..inst(Some("connected"), Some(true), vec![99])
+        };
+        assert_eq!(
+            running_bridge(&[unread], "n-a"),
+            None,
+            "a bridge whose node was not read is nobody's: the state dir's lock decides"
+        );
         // A bridge standing by for the state dir owns no sequence: the
         // holder is asked, wherever the two sit in the listing.
         let standby = fabric::InstanceView {
@@ -4945,13 +5124,16 @@ mod tests {
             ..inst(Some("stalled"), Some(true), vec![98])
         };
         assert_eq!(
-            running_bridge(&[
-                standby.clone(),
-                inst(Some("connected"), Some(true), vec![99])
-            ]),
+            running_bridge(
+                &[
+                    standby.clone(),
+                    inst(Some("connected"), Some(true), vec![99])
+                ],
+                "n-a"
+            ),
             Some(42)
         );
-        assert_eq!(running_bridge(&[standby]), None);
+        assert_eq!(running_bridge(&[standby], "n-a"), None);
     }
 
     /// **A PLANTED NAME IS NEVER WRITTEN THROUGH.** A file written into a
@@ -5077,21 +5259,47 @@ mod tests {
         );
         // The login home unknown: nothing is the default root.
         assert_ne!(paths("/Users//example", None).label(), LABEL);
-        // And the real machine's answer, measured: the login home is an
-        // absolute path and `$HOME` does not decide it.
-        let measured = login_home();
+    }
+
+    /// THE LOGIN HOME AND THE UID ARE THE ONES `id` AND THE SHELL ANSWER, on
+    /// the live machine, though no child is run for them: [`login_home`] is
+    /// `~$(id -un)` as `sh` expands it with no `$HOME` to read, and [`uid`] is
+    /// `id -u`. A test-only oracle; `$HOME` decides neither.
+    #[cfg(unix)]
+    #[test]
+    fn the_login_home_and_uid_are_what_id_and_the_shell_answer() {
+        let run = |program: &str, args: &[&str]| {
+            let out = aterm_uds::spawnfd::command(program)
+                .args(args)
+                .env_remove("HOME")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .unwrap_or_else(|e| panic!("run {program}: {e}"));
+            assert!(out.status.success(), "{program} {args:?}: {out:?}");
+            String::from_utf8(out.stdout)
+                .expect("utf-8")
+                .trim()
+                .to_string()
+        };
+        let user = run("id", &["-un"]);
+        let expanded = run("sh", &["-c", &format!("printf '%s' ~{user}")]);
         assert!(
-            measured.as_deref().is_some_and(Path::is_absolute),
-            "login_home on this machine: {measured:?}"
+            Path::new(&expanded).is_absolute(),
+            "the shell expanded ~{user} to {expanded:?}"
         );
+        assert_eq!(login_home(), Some(PathBuf::from(&expanded)), "~{user}");
+        assert_eq!(uid(), run("id", &["-u"]));
     }
 
     /// THE TIER IS IN THE JOB. A NAMED tier rides after the secret, on both
     /// wires — `--durability relaxed`, and `--durability strict` too, so a job
     /// that chose strict keeps it under a build whose default differs — and a
-    /// job that names none carries nothing, so every strict job an earlier
-    /// `on` wrote is still current and runs the build's default. A switch is
-    /// "the job changed" and restarts the broker. The socket still follows
+    /// job that names none carries nothing, and runs the build's default:
+    /// ordered for this guarded broker (served strict where astream cannot
+    /// keep the order). A bare job an earlier `on` wrote is still current,
+    /// and moves to that default when its broker next starts under this build.
+    /// A switch is "the job changed" and restarts the broker. The socket still follows
     /// `broker`, which is how the process table finds it. A bare `on` keeps the
     /// tier the installed job NAMES (none, strict, ordered or relaxed), and
     /// with no job it names none.
@@ -5118,7 +5326,15 @@ mod tests {
         assert_eq!(argv[argv.len() - 2..], ["--durability", "relaxed"]);
         assert!(!bare.broker_argv().iter().any(|w| w == "--durability"));
         assert_eq!(bare.broker_argv()[..], argv[..argv.len() - 2]);
-        assert_eq!(bare.tier(), Durability::Strict, "this build's default");
+        // THE BUILD'S DEFAULT for the broker `on` writes, which always names
+        // its mint secret: ordered, on every platform (astream serves it
+        // strict where the device cannot keep the order, and says so).
+        assert_eq!(
+            bare.tier(),
+            Durability::Ordered,
+            "this build's default for `on`'s guarded broker"
+        );
+        assert_eq!(bare.tier(), crate::durability::default_for(true));
         let strict = named(Durability::Strict);
         let words = strict.broker_argv();
         assert_eq!(
@@ -5160,7 +5376,8 @@ mod tests {
     /// restarts it (or, under `--service none`, the warning says how). One
     /// running the tier asked for, or whose process this host cannot read
     /// (no tier: a remote broker, no `ps`), is current on that count; a bare
-    /// job and a named strict one ask for the same tier in this build. A
+    /// job asks for the build's default, which a named strict one is not on
+    /// macOS. A
     /// replaced build and an unguarded broker are named first.
     #[test]
     fn a_broker_running_another_tier_is_not_current() {
@@ -5201,11 +5418,19 @@ mod tests {
             durability: None,
             ..p(strict)
         };
-        assert_eq!(
-            not_current(&bare, &view(Some(strict))),
-            None,
-            "bare is strict here"
-        );
+        // A bare job asks for the build's default (ordered for this guarded
+        // broker): a broker running it is current, and one running the other
+        // is not — a named strict job an earlier `on` wrote is NOT what a bare
+        // one asks for.
+        let default = crate::durability::default_for(true);
+        assert_eq!(not_current(&bare, &view(Some(default))), None);
+        if default != strict {
+            assert_eq!(
+                not_current(&bare, &view(Some(strict))),
+                Some("it runs at durability strict"),
+                "a bare job no longer asks for strict"
+            );
+        }
         assert_eq!(not_current(&p(relaxed), &view(None)), None, "no tier read");
         let replaced = fabric::BrokerView {
             replaced: Some("/usr/local/bin/aterm".to_string()),
@@ -5770,10 +5995,33 @@ mod tests {
     #[test]
     fn the_eight_grants_are_the_node_ring() {
         let g = node_grants("local", "n-a");
+        // THE WHOLE LIST, IN ORDER: SPECS.md's `node-and-person-grants` row
+        // says "exactly … in that order", so a grant added, dropped, widened
+        // or moved fails here — not only one at an index this happened to
+        // look at.
+        assert_eq!(
+            g,
+            [
+                "rw,p=n-a:/f/local/pub/n-a/>",
+                "ro:/f/local/pub/>",
+                "ro:/f/local/fleet/>",
+                "rw,p=n-a:/f/local/in/*/*/n-a/*",
+                "ro:/f/local/in/n-a/>",
+                "rw,p=n-a:/f/local/cur/n-a/>",
+                "ro:/f/local/term/n-a/>",
+                "rw,p=n-a:/f/local/term/n-a/*/screen",
+            ]
+        );
+        // Another fleet and node are spelled into every grant that names
+        // them, and into no other.
+        let other = node_grants("lab", "n-b");
+        assert_eq!(
+            other,
+            g.iter()
+                .map(|x| x.replace("/local/", "/lab/").replace("n-a", "n-b"))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(g.len(), 8);
-        assert_eq!(g[0], "rw,p=n-a:/f/local/pub/n-a/>");
-        assert_eq!(g[3], "rw,p=n-a:/f/local/in/*/*/n-a/*");
-        assert_eq!(g[7], "rw,p=n-a:/f/local/term/n-a/*/screen");
         assert_eq!(g.iter().filter(|x| x.contains("p=n-a:")).count(), 4);
         assert_eq!(g.iter().filter(|x| x.starts_with("ro:")).count(), 4);
         // Six of the eight NAME the node (the module doc's number): the four
@@ -6114,12 +6362,19 @@ mod tests {
             "no rendezvous file at /x",
             "instance 1's bridge is another build than the instance: bridge a, instance b",
             "instance 1 could not parse 3 of its bridge's lines (lane_faults=3)",
-            "node n-a holds 3072 of the 4096 distinct subjects one node may ever mint, and nothing \
-             reclaims one: past the bound a new session gets no presence row and its posts are \
-             refused; the remedy is a new node id",
+            "node n-a holds 3072 of the 4096 distinct subjects one node may ever mint, and none but \
+             a closed session's own `ev` face (under [fabric] log = \"turns\") is ever given \
+             back: past the bound a new session gets no presence row and its posts are refused; \
+             the remedy is a new node id",
             "the presence roster has more than 4096 rows and the read stopped there (rows=4096+ \
              truncated): NODES, SESSIONS and every warning drawn from them leave out what lies \
              past it",
+            "the broker at /x says its log is POISONED (a flush failed): it refuses every write \
+             until the log is reopened, so no record lands; a broker of this build exits within \
+             seconds for its supervisor to reopen it",
+            "the broker at /x says a flush of its log failed 2 time(s) since it opened: the disk \
+             under /x.log is failing writes, and the log was not poisoned when this asked (a \
+             failed flush that put acked records at risk poisons it, and the next report says so)",
         ] {
             for role in &roles {
                 let fix = fix_for(w, role);
@@ -6205,6 +6460,81 @@ mod tests {
         assert_eq!(
             crate::cli::log_refusal_remedy(K::AlreadyExists, "/r/bus.log"),
             None
+        );
+    }
+
+    /// **A POISONED LOG IS THE BROKER'S, NEVER THIS NODE'S.** A bridge's
+    /// `reason=poisoned` and a broker.err whose last line is the broker's exit
+    /// over a poisoned log ([`crate::broker_health::poisoned_line`], either
+    /// form) each get the poisoned remedy — the broker's own restart, never a
+    /// re-minted cap, a repair or "fix the quoted cause first", and never
+    /// `on`, which keeps a poisoned broker that still answers. NEGATIVE
+    /// CONTROLS: `reason=attach` keeps the refused-cap fix, and another quoted
+    /// line keeps "fix that first".
+    #[test]
+    fn a_poisoned_log_is_answered_by_the_brokers_restart() {
+        let role = Role::default();
+        let quoted = |last: &str| {
+            fix_for(
+                &format!(
+                    "the broker at /r/bus.sock does not answer (connect: x): no record lands and \
+                     none is delivered; its supervisor's broker.err, written 1s ago: {last}"
+                ),
+                &role,
+            )
+        };
+        let reason = "a flush failed (EIO) with records no full flush covers";
+        for restart in [None, Some("aterm link broker /r/bus.sock /r/bus.log")] {
+            let exited = quoted(&crate::broker_health::poisoned_line(
+                "/r/bus.log",
+                reason,
+                restart,
+            ));
+            assert!(
+                exited.starts_with("the broker exited over a poisoned log")
+                    && !exited.contains("--repair")
+                    && !exited.contains("fix that first"),
+                "{exited}"
+            );
+            // Supervised, the supervisor restarts it and `on` is the fallback;
+            // with no `aterm fabric on` job, `on` starts none: its own line's
+            // command does.
+            if restart.is_some() {
+                assert!(
+                    exited.contains("the command its line names")
+                        && !exited.contains("`aterm fabric on` starts"),
+                    "{exited}"
+                );
+            } else {
+                assert!(
+                    exited.contains("`aterm fabric on` starts it again")
+                        && !exited.contains("the command its line names"),
+                    "{exited}"
+                );
+            }
+        }
+        assert!(
+            quoted("aterm link broker: open /r/bus.log: address in use").contains("fix that first")
+        );
+        let down = |reason: &str| {
+            fix_for(
+                &format!(
+                    "instance 1's bridge is attached but its broker link is down (fabric=stalled \
+                     reason={reason}, last ack 3s ago)"
+                ),
+                &role,
+            )
+        };
+        let poisoned = down("poisoned");
+        assert!(
+            poisoned.starts_with("the broker's log is poisoned")
+                && !poisoned.contains("node.cap")
+                && !poisoned.contains("`aterm fabric on`"),
+            "{poisoned}"
+        );
+        assert!(
+            down("attach").contains("node.cap"),
+            "the refused cap keeps its fix"
         );
     }
 

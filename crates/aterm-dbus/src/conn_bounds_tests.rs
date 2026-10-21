@@ -24,6 +24,7 @@ fn connected(stream: CtlStream) -> Connection {
         max_incoming: DEFAULT_MAX_INCOMING,
         discard: 0,
         broken: false,
+        send_timeout: None,
     }
 }
 

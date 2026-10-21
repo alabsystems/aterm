@@ -33,7 +33,12 @@
 //! number, which must equal its slot's commit word; a history chunk's steps are
 //! dense across the ring's wraps. Inside a region bounded by a commit word, a torn
 //! tail cannot appear, so any end the step scan reports other than `Clean` is a
-//! fault (astream's "refuse to build on a mid-log fault", applied read-only).
+//! fault (astream's "refuse to build on a mid-log fault", applied read-only), save
+//! one: the zeroed gap the writer leaves at the ring's physical end when the next
+//! chunk would straddle it. The ring walk (`recover.rs`) reads a non-`Clean` end there
+//! as that gap when every byte after the last record is zero and the run goes on at
+//! the ring's start, so it relies on the scan accepting every record before the zeros
+//! and stopping where they start.
 //!
 //! A keyframe's body is `aterm_lz4::compress_prepend_size` of:
 //!
@@ -58,6 +63,12 @@
 //! · u64 clear_gen · u64 reveal_gen
 //! lz4( u32 frame_len | serialize_lines(≤ 1024 lines) )
 //! ```
+//!
+//! # The control record (CTR v1)
+//!
+//! The control slot holds one astream step record whose step is the slot's commit word,
+//! around `u8 version=1 · aterm_lz4::compress_prepend_size(carry)`. The carry is the
+//! window's (`aterm-gui`'s crash carry of the session's turn ledger), opaque here.
 //!
 //! Every decoder here is panic-free on any bytes: lengths are checked before they
 //! index, and every LZ4 size prefix is bounded before anything is allocated.
@@ -553,6 +564,72 @@ impl std::fmt::Display for EncodeError {
             Self::Nonce => f.write_str("a checkpoint carrying a nonce is never journaled"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The control record (CTR v1, increment 7)
+// ---------------------------------------------------------------------------
+
+/// The control record's body version.
+pub const CTR_VERSION: u8 = 1;
+/// The largest carry a reader decompresses from a control record: what the update
+/// handoff's own control sidecar may hold (`aterm-gui`'s `handoff_carry::MAX_SIDECAR_BYTES`,
+/// which a whole 512-record ledger stays well under), so a crash carry is held to the
+/// bound an update's is, and a size prefix past it is refused before anything is
+/// allocated.
+pub const MAX_CONTROL_CARRY: usize = 4 * 1024 * 1024;
+
+/// Why a control record was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlFault {
+    /// Not one step record whose step is the slot's commit word, or its CRC fails.
+    Step(StepFault),
+    /// A body version this build does not read.
+    Version(u8),
+    /// The LZ4 block is malformed or its size prefix is past [`MAX_CONTROL_CARRY`].
+    Compressed,
+}
+
+/// Encode a control record (the slot's sequence number `seq`, nonzero): the window's
+/// CONTROL CARRY (`carry`, opaque here: `aterm-gui`'s crash carry of the session's turn
+/// ledger) as an astream step record whose step is `seq`, around
+/// `u8 CTR_VERSION · aterm_lz4::compress_prepend_size(carry)`. The carry is compressed
+/// because the slot is small and a ledger's JSON compresses well: more of the newest turns
+/// fit.
+///
+/// # Errors
+///
+/// [`EncodeError::TooLarge`] for a carry past [`MAX_CONTROL_CARRY`] or a record past what
+/// a frame holds.
+pub fn encode_control(seq: u64, carry: &[u8]) -> Result<Vec<u8>, EncodeError> {
+    if carry.len() > MAX_CONTROL_CARRY {
+        return Err(EncodeError::TooLarge);
+    }
+    let compressed = aterm_lz4::compress_prepend_size(carry);
+    let mut body = Vec::with_capacity(1 + compressed.len());
+    body.push(CTR_VERSION);
+    body.extend_from_slice(&compressed);
+    encode_step(seq, &body).map_err(|_| EncodeError::TooLarge)
+}
+
+/// Decode the control step record `record`, whose slot's commit word is `seq`: the carry.
+///
+/// Strict: one step record whose step is `seq` and whose CRC holds, a body version this
+/// build reads, and an LZ4 size bounded before anything is allocated. Panic-free on any
+/// bytes.
+///
+/// # Errors
+///
+/// The first [`ControlFault`].
+pub fn decode_control(record: &[u8], seq: u64) -> Result<Vec<u8>, ControlFault> {
+    let body = one_step(record, seq).map_err(ControlFault::Step)?;
+    let (&version, compressed) = body
+        .split_first()
+        .ok_or(ControlFault::Step(StepFault::Count(0)))?;
+    if version != CTR_VERSION {
+        return Err(ControlFault::Version(version));
+    }
+    bounded_lz4(compressed, MAX_CONTROL_CARRY).ok_or(ControlFault::Compressed)
 }
 
 // ---------------------------------------------------------------------------

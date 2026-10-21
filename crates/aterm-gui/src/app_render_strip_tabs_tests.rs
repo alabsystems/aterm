@@ -153,7 +153,7 @@ fn a_floor_change_rebuilds_the_strip_band() {
     }
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     if !crate::tray_raster::strip_band_ui_ready() {
-        return;
+        aterm_spec::host::could_not_run("no system UI face here for the strip band");
     }
     let mut app = App::headless_for_test();
     let wid = WindowId(0);

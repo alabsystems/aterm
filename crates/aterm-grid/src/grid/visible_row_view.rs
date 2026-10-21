@@ -5,7 +5,7 @@
 //! Display-offset-aware per-row reads, shared by the render snapshot and text extraction.
 //!
 //! Scrolled back (`display_offset > 0`), [`Grid::row`] returns historical cells, but the
-//! coordinate-keyed extras accessors (`cell_render_data`, `complex_char_str_at`,
+//! coordinate-keyed extras accessors (`cell_render_data`, `push_complex_char_at`,
 //! `CellExtras::get`) read the live extras map at the raw visible row, while scrolled-off
 //! extras live in `ring_extras`, the lazy buffer or the tiered store. [`VisibleRowView`]
 //! resolves live-vs-history once per row and routes history rows through
@@ -227,9 +227,8 @@ impl<'a> VisibleRowView<'a> {
                 grid, screen_row, ..
             } => {
                 if cell.is_complex() {
-                    match grid.complex_char_str_at(*screen_row, col) {
-                        Some(cs) => out.push_str(&cs),
-                        None => out.push('\u{FFFD}'),
+                    if !grid.push_complex_char_at(*screen_row, col, out) {
+                        out.push('\u{FFFD}');
                     }
                 } else {
                     let ch = cell.char();

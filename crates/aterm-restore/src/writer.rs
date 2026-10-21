@@ -50,9 +50,19 @@
 //! restored as exact with the prompt's state lost. Here every slice's marks are counted
 //! ([`JournalWriter::note_marks`]) before the slice's append, budget or not.
 //!
-//! Words other threads own (`stream_gathered`, the resize word, `config_fp`, the cell size)
-//! have free functions over the store ([`store_gathered`], [`store_resize_word`],
-//! [`store_config_fp`], [`store_cell_px`]) so their threads need no writer.
+//! - **Control slot** ([`ControlWriter`], the window's journal worker alone): store
+//!   `ctl_commit` 0, copy the record, store `ctl_len`, store `ctl_commit` = the record's
+//!   sequence number, then zero what a longer record left past it. A death anywhere
+//!   between the first store and the last commit word leaves the slot empty, never a
+//!   record its commit word does not name: a restore then carries no control state,
+//!   never a wrong one. One slot, so that death loses the record the slot held before
+//!   the write as well; the count beside it (`ctl_count`, [`store_ctl_count`]) is a word
+//!   no control write touches, and survives it.
+//!
+//! Words other threads own (`stream_gathered`, the resize word, `config_fp`, the cell size,
+//! `ctl_count`) have free functions over the store ([`store_gathered`],
+//! [`store_resize_word`], [`store_config_fp`], [`store_cell_px`], [`store_ctl_count`]) so
+//! their threads need no writer.
 
 use std::collections::VecDeque;
 
@@ -61,19 +71,19 @@ use aterm_core::scrollback::Line;
 use aterm_core::terminal::TerminalCheckpoint;
 
 use crate::layout::{
-    Geometry, LAYOUT_VERSION, LayoutError, MAGIC, OFF_CELL_PX, OFF_CONFIG_FP,
-    OFF_ENGINE_RESIZE_LIFETIME, OFF_ENGINE_RESIZE_ORDINAL, OFF_HIST_CAP, OFF_HIST_CAP_PHYS,
-    OFF_HIST_END_ROW, OFF_HIST_HI, OFF_HIST_IDENTITY, OFF_HIST_LO, OFF_HIST_LO_SEQ, OFF_HIST_OFF,
-    OFF_KF_CAP, OFF_KF_OFF, OFF_LOCAL_ID, OFF_MAGIC, OFF_REGION_LEN, OFF_SID, OFF_STREAM_GATHERED,
-    OFF_STREAM_PROCESSED, OFF_TAIL_CAP, OFF_TAIL_COMMIT, OFF_TAIL_FLOOR, OFF_TAIL_MARKS,
-    OFF_TAIL_OFF, OFF_WRITER_BIRTH, OFF_WRITER_BUILD, OFF_WRITER_PID, SID_LEN, cell_px_word,
-    kf_commit_word, kf_len_word, slot_of,
+    ERASED_COUNT_V1, Geometry, LAYOUT_VERSION, LayoutError, MAGIC, OFF_CELL_PX, OFF_CONFIG_FP,
+    OFF_CTL_COMMIT, OFF_CTL_COUNT, OFF_CTL_LEN, OFF_ENGINE_RESIZE_LIFETIME,
+    OFF_ENGINE_RESIZE_ORDINAL, OFF_HIST_CAP, OFF_HIST_CAP_PHYS, OFF_HIST_END_ROW, OFF_HIST_HI,
+    OFF_HIST_IDENTITY, OFF_HIST_LO, OFF_HIST_LO_SEQ, OFF_HIST_OFF, OFF_KF_CAP, OFF_KF_OFF,
+    OFF_LOCAL_ID, OFF_MAGIC, OFF_REGION_LEN, OFF_SID, OFF_STREAM_GATHERED, OFF_STREAM_PROCESSED,
+    OFF_TAIL_CAP, OFF_TAIL_COMMIT, OFF_TAIL_FLOOR, OFF_TAIL_MARKS, OFF_TAIL_OFF, OFF_WRITER_BIRTH,
+    OFF_WRITER_BUILD, OFF_WRITER_PID, SID_LEN, cell_px_word, kf_commit_word, kf_len_word, slot_of,
 };
 use crate::records::{
     EncodeError, HistoryIdentity, KeyframeHead, MAX_BYTES_PAYLOAD, TAIL_RECORD_HEADER, TailRecord,
-    encode_history_chunk, encode_keyframe, pad_header,
+    encode_control, encode_history_chunk, encode_keyframe, pad_header,
 };
-use crate::store::{RegionStore, StoreError};
+use crate::store::{RegionStore, RegionView, StoreError, Touched};
 
 /// Who wrote a region: header facts a restore reports, never trusts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +219,11 @@ pub(crate) enum WriterFault {
     /// Every word is right once the append ends, so only a death between the commit
     /// word and the copy shows it.
     CommitBeforeCopy,
+    /// The control slot's commit word is stored with the new record's sequence number
+    /// before its copy, never zeroed first ([`ControlWriter`]): every word is right once
+    /// the write ends, so only a death inside it shows it, as a slot whose commit word
+    /// names a record the slot does not hold.
+    ControlPublishEarly,
 }
 
 /// THE HISTORY RING'S WRITER (the plan's §2.4 "History append" and "Fence reset"): the
@@ -375,6 +390,53 @@ pub fn store_cell_px<S: RegionStore + ?Sized>(
     px: Option<(u16, u16)>,
 ) -> Result<(), StoreError> {
     store.store_u64_release(OFF_CELL_PX, cell_px_word(px))
+}
+
+/// Store the window's control count ([`OFF_CTL_COUNT`]: `aterm-gui`'s turn-id count) from
+/// the thread that raised it. The caller keeps the stores rising (one lock across its read
+/// of the count and the store): a restore takes the word as a count past every one the
+/// window used.
+///
+/// # Errors
+///
+/// The store's refusal.
+pub fn store_ctl_count<S: RegionStore + ?Sized>(store: &S, count: u64) -> Result<(), StoreError> {
+    store.store_u64_release(OFF_CTL_COUNT, count)
+}
+
+/// ERASE a region no writer journals into any more: a counter-only marker first, so
+/// every screen/control reader takes the META rung after that atomic store, then zero
+/// every written page except that marker and the monotonic turn-id count. No keyframe,
+/// control record, tail or history byte survives a complete erase. The count remains
+/// available independently, including after a stop inside the erase. An unwritten page
+/// is not written: the erase makes nothing resident.
+///
+/// For a region that outlives its writer while the keeper holds it: the memory shed's
+/// superseded one, until the keeper link takes the custody of the region that replaced
+/// it. A clear made meanwhile has no writer left there to settle it
+/// ([`JournalWriter::settle_clear`]), so the whole region goes.
+///
+/// # Errors
+///
+/// The store's refusal.
+pub fn erase_region<S: RegionStore>(region: &Touched<S>) -> Result<(), StoreError> {
+    // The first atomic store refuses every screen/control reader without losing the
+    // process's count. A crash at any later primitive still leaves that scalar readable.
+    region.store_u64_release(OFF_MAGIC, ERASED_COUNT_V1)?;
+    for page in region.written_pages() {
+        let mut at = page.start;
+        for keep in [OFF_MAGIC..OFF_MAGIC + 8, OFF_CTL_COUNT..OFF_CTL_COUNT + 8] {
+            let end = keep.start.min(page.end);
+            if at < end {
+                zero(region, at, end - at)?;
+            }
+            at = at.max(keep.end.min(page.end));
+        }
+        if at < page.end {
+            zero(region, at, page.end - at)?;
+        }
+    }
+    Ok(())
 }
 
 fn word(n: usize) -> u64 {
@@ -1284,6 +1346,146 @@ impl HistoryWriter {
             .map_or(0, |first| self.end_row.saturating_sub(first));
         self.run_bytes = self.hi.saturating_sub(self.lo);
         Ok(seq)
+    }
+}
+
+/// THE CONTROL SLOT'S WRITER (the crash-restore plan's increment 7): the window's journal
+/// worker alone writes the slot (`aterm-gui`'s `crash_restore`), at most once every two
+/// seconds and only when the session's turn ledger changed, so it is a value of its own,
+/// handed the region's store at every call, as [`HistoryWriter`] is. The slot holds one
+/// record ([`encode_control`]), the newest carry, which replaces the one before (module
+/// doc, "Control slot").
+///
+/// One slot, not two as for keyframes: a death inside a write leaves no carry rather than
+/// the one before, and the write is one copy of at most the slot's 64 KiB, made at human
+/// rates, so that window is microseconds a turn. Two would halve what one carry holds. The
+/// window's count (`ctl_count`, [`store_ctl_count`]) is no part of the slot: a death inside
+/// a write leaves it, so the restorer still knows how far the dead window counted.
+#[derive(Debug, Default)]
+pub struct ControlWriter {
+    /// The sequence number of the record the slot holds; 0 before the first write.
+    seq: u64,
+    /// One past the highest slot byte written in the current region: what a shorter
+    /// record leaves behind to be zeroed.
+    high: usize,
+    #[cfg(test)]
+    fault: Option<WriterFault>,
+}
+
+impl ControlWriter {
+    /// A writer for a region whose slot was never written.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Plant a defect (the control slot's negative control).
+    #[cfg(test)]
+    pub(crate) fn plant(&mut self, fault: WriterFault) {
+        self.fault = Some(fault);
+    }
+
+    /// Whether `fault` was planted: always `false` outside a test build.
+    fn planted(&self, fault: WriterFault) -> bool {
+        #[cfg(test)]
+        {
+            self.fault == Some(fault)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (self, fault);
+            false
+        }
+    }
+
+    /// The sequence number of the record the slot holds (0: none written).
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Write `carry` as the slot's next record (module doc, "Control slot"). Returns its
+    /// sequence number.
+    ///
+    /// # Errors
+    ///
+    /// [`WriteError::TooLarge`] for a record past the slot (nothing is stored: the caller
+    /// carries less); the store's refusal.
+    pub fn write<S: RegionStore + ?Sized>(
+        &mut self,
+        store: &S,
+        geometry: &Geometry,
+        carry: &[u8],
+    ) -> Result<u64, WriteError> {
+        let seq = self.seq.saturating_add(1);
+        let record = encode_control(seq, carry).map_err(|_| WriteError::TooLarge {
+            len: usize::MAX,
+            cap: geometry.ctl_cap(),
+        })?;
+        self.write_record(store, geometry, seq, &record)?;
+        Ok(seq)
+    }
+
+    /// Give a fresh region (`to`, laid out by [`JournalWriter::create`]) the record the slot
+    /// of `from`, the region it replaces, holds: the memory shed's replacement
+    /// (`aterm-gui`'s `crash_restore`), before anything is told the fresh region exists, so
+    /// a crash restored from either one carries the same control state. The record is
+    /// copied as it is, under its own sequence number. Nothing when `from`'s slot is empty.
+    ///
+    /// # Errors
+    ///
+    /// The store's refusal, or [`WriteError::TooLarge`] for a slot `from`'s words say is
+    /// longer than the slot.
+    pub fn carry_into<V: RegionView + ?Sized, S: RegionStore + ?Sized>(
+        &mut self,
+        from: &V,
+        to: &S,
+        geometry: &Geometry,
+    ) -> Result<(), WriteError> {
+        self.high = 0;
+        let seq = from.load_u64_acquire(OFF_CTL_COMMIT)?;
+        if seq == 0 {
+            return Ok(());
+        }
+        let len = usize::try_from(from.load_u64_acquire(OFF_CTL_LEN)?).unwrap_or(usize::MAX);
+        let cap = geometry.ctl_cap();
+        if len > cap {
+            return Err(WriteError::TooLarge { len, cap });
+        }
+        let mut record = vec![0u8; len];
+        from.read(geometry.ctl_off(), &mut record)?;
+        self.write_record(to, geometry, seq, &record)
+    }
+
+    /// The slot's write protocol (module doc): commit word 0, copy, length, commit word,
+    /// then the stale bytes past a shorter record zeroed.
+    fn write_record<S: RegionStore + ?Sized>(
+        &mut self,
+        store: &S,
+        geometry: &Geometry,
+        seq: u64,
+        record: &[u8],
+    ) -> Result<(), WriteError> {
+        let (len, cap) = (record.len(), geometry.ctl_cap());
+        if len > cap {
+            return Err(WriteError::TooLarge { len, cap });
+        }
+        let early = self.planted(WriterFault::ControlPublishEarly);
+        store.store_u64_release(OFF_CTL_COMMIT, if early { seq } else { 0 })?;
+        // The high-water mark before the copy, so a copy cut short still counts.
+        let stale = self.high;
+        self.high = stale.max(len);
+        store.write(geometry.ctl_off(), record)?;
+        store.store_u64_release(OFF_CTL_LEN, word(len))?;
+        if !early {
+            store.store_u64_release(OFF_CTL_COMMIT, seq)?;
+        }
+        self.seq = seq;
+        if stale > len {
+            zero(store, geometry.ctl_off() + len, stale - len)?;
+        }
+        self.high = len;
+        Ok(())
     }
 }
 

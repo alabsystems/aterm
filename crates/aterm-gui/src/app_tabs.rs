@@ -512,6 +512,21 @@ pub(crate) enum NativeTabInstallError {
     DuplicateTab,
 }
 
+/// THE INSTANT A TASK'S END WAS TOLD AT, unix ms, for the menu bar's Done
+/// for you row (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4.3, item
+/// 1): `told`, the time the timeline holds for the end's face (the face, or
+/// the one held across the host's "unknown" between loop runs;
+/// `SessionTimeline::task_face_at`) — the instant the end's own clock
+/// (`EndGlass::at`) was read from (`harness_glass::on_task`) — else, where
+/// the timeline holds no time for that face, the end's own minute
+/// (`Stamp::unix_ms`); `0` where neither is known, and the row says no age.
+/// A compare on the common path: the zone is read only in that corner.
+pub(crate) fn end_wall_ms(end: crate::harness_glass::EndGlass, told: Option<i64>) -> u64 {
+    told.or_else(|| end.at.and_then(crate::harness_glass::Stamp::unix_ms))
+        .and_then(|ms| u64::try_from(ms).ok())
+        .unwrap_or(0)
+}
+
 /// The `home`-relative suffix of `path`: `Some("")` when `path` IS the home
 /// directory, `Some("/sub")` (the `/`-prefixed remainder) when it lives under
 /// it, `None` otherwise. Matches on a component boundary exactly like the zsh
@@ -1398,7 +1413,9 @@ impl App {
                     use crate::cwd_native::ReportedCwd as _;
                     // The cwd rung is a LABEL: it must read as a path on this
                     // platform, so it goes through the native conversion rather
-                    // than showing the engine's RFC 8089 `/C:/…` URI path.
+                    // than showing the engine's RFC 8089 `/C:/…` URI path — a
+                    // report from another machine excepted, which keeps it, as
+                    // every consumer does (`crate::cwd_native`).
                     let cwd = t.native_working_directory();
                     resolved_terminal_title_rung(None, t.title(), cwd.as_deref())
                         .unwrap_or_default()
@@ -2724,23 +2741,16 @@ impl App {
         }
     }
 
-    /// The session's shell-reported cwd by registry LOCAL id (raw, the
-    /// [`Self::tab_session_cwd`] rung without the tab resolution) — the
-    /// connected spawn's origin-cwd default (design §6: `cwd=` overrides it) —
-    /// with whether a program other than its shell holds it. Such a folder
-    /// (ssh, any program) that is not here is not taken, as for a New Tab: the
-    /// check that judges it ([`crate::spawn_folder::PaneFolder::resolve`])
-    /// runs where the spawn may wait, not here.
+    /// The folder the session with registry LOCAL id `local` hands a spawn
+    /// ([`Self::session_folder`], the New Tab's own reader: the native path,
+    /// with whether a program other than its shell holds it) — the connected
+    /// spawn's origin-cwd default (design §6: `cwd=` overrides it). Such a
+    /// folder (ssh, any program) that is not here is not taken, as for a New
+    /// Tab: the check that judges it
+    /// ([`crate::spawn_folder::PaneFolder::resolve`]) runs where the spawn may
+    /// wait, not here.
     fn session_folder_by_local(&self, local: u64) -> Option<crate::spawn_folder::PaneFolder> {
-        let s = self.pool.get(local)?;
-        let reported = term_lock(&s.term)
-            .current_working_directory()
-            .filter(|c| !c.is_empty())
-            .map(str::to_string)?;
-        Some(crate::spawn_folder::PaneFolder {
-            reported,
-            held: Self::session_held(s),
-        })
+        self.pool.get(local).and_then(Self::session_folder)
     }
 
     /// Mint a CONNECTED spawn's `both` session connection through the ONE mint
@@ -2954,12 +2964,19 @@ impl App {
     /// leaf locks one at a time, the terminal's only by a try-lock. The
     /// caller holds NO registry guard (the label reads the registry again).
     /// The item classifies nothing itself (§2.3), so its rows and its
-    /// notifications say what `status needs=` and the survey say.
+    /// notifications say what `status needs=` and the survey say. Its
+    /// supervised agent's task END (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+    /// §11.4.3, item 1) is read off the harness's glass, an App field, and
+    /// its instant off the timeline under the lock already taken.
     pub(crate) fn status_session_row(
         &self,
         h: &crate::session_store::SessionHandle,
     ) -> crate::status_item::SessionRow {
-        let (verdict, agent, task) = {
+        let glass_end = self
+            .harness_glass
+            .get(&h.local_id)
+            .and_then(crate::harness_glass::SessionGlass::end);
+        let (verdict, agent, task, told) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
                 tl.need().clone(),
@@ -2974,11 +2991,17 @@ impl App {
                     result_path: t.result_path.clone(),
                     seen: false,
                 }),
+                glass_end.and_then(|end| tl.task_face_at(end.face.task_face())),
             )
         };
         let task = task.map(|mut t| {
             t.seen = self.done_seen.get(&h.local_id) == Some(&t.entered);
             t
+        });
+        let end = glass_end.map(|end| crate::status_item::EndRow {
+            serial: end.serial,
+            since_unix_ms: end_wall_ms(end, told),
+            seen: !end.unseen(),
         });
         crate::status_item::SessionRow {
             id: h.local_id,
@@ -2994,6 +3017,7 @@ impl App {
             held_since: self.presence.herald.held_since(h.local_id),
             person_refusals: h.ctx.fabric.person_refusals(),
             held_by_host: h.ctx.fabric.holds().remote().map(|r| r.host.clone()),
+            end,
         }
     }
 
@@ -3034,6 +3058,7 @@ impl App {
         let now_unix = status_unix_now();
         if let Some(row) = &row {
             self.adopt_status_carry(session, row, now_unix);
+            self.adopt_end_carry(session, &row.sid);
         }
         if self
             .presence
@@ -3085,6 +3110,123 @@ impl App {
         self.presence
             .herald
             .adopt(session, carry, now_unix, std::time::Instant::now());
+    }
+
+    /// A SEAMLESS UPDATE'S CARRIED END, at `session`'s first publication
+    /// here (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8;
+    /// slice 2b): what the outgoing process held of its Autopilot task
+    /// (`SessionRecord::autopilot_end`, by sid `sid`). Beside
+    /// [`Self::adopt_status_carry`], and spent at once as it is:
+    ///
+    /// * THE WORK goes into the A/B book (`AbBook::carry_work`), so the
+    ///   task's next end reads the work since it opened across the update
+    ///   (R12: a move from "unknown" zeroes nothing).
+    /// * THE END goes onto the session's glass as it stood
+    ///   (`SessionGlass::carry_end`): its kind, its own clock, seen or not —
+    ///   so an end nobody had looked at wears the tab's `•` here until
+    ///   someone does. It is no new end (`harness_task::is_a_task_end`): it
+    ///   counts nothing and records nothing. Dropped, fail-closed, where the
+    ///   loop has already restated a face that is not the one the timeline
+    ///   was seeded with at its very time (`CarriedEnd::told`): another face
+    ///   (`open`: it moved on), or the same face at another time (a landing
+    ///   withdrawn and told again: another landing, no end) — a face
+    ///   restated later is `harness_glass::on_task`'s, which clears an end at
+    ///   open or theirs.
+    /// * JUDGED AT ONCE by the one looking rule against the frontmost window
+    ///   (`App::see_front`), as an end told here is
+    ///   (`App::note_harness_end`): one in a pane someone looks at is seen
+    ///   now and marks nothing. One left unseen re-stamps every strip and
+    ///   dirties the glance (`App::restamp_for_end`), once.
+    ///
+    /// Not the restore's user-meta seed (`App::seed_restored_user_meta`):
+    /// it returns early where a leaf carries no user field — the owner's
+    /// usual tab, which follows the default (the review's R6).
+    fn adopt_end_carry(&mut self, session: u64, sid: &str) {
+        if self.end_carry.is_empty() {
+            return;
+        }
+        let Some(carry) = self.end_carry.remove(sid) else {
+            return;
+        };
+        if carry.worked_ms > 0 {
+            self.harness_screen.ab.carry_work(session, carry.worked_ms);
+        }
+        let Some(end) = carry.end else {
+            return;
+        };
+        let told = self.pool.get(session).and_then(|s| {
+            s.ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .task_face()
+        });
+        if told.is_some_and(|told| told != end.told()) {
+            return;
+        }
+        let at = crate::harness_glass::Stamp::at(end.at_ms.div_euclid(1000));
+        if !self
+            .harness_glass
+            .entry(session)
+            .or_default()
+            .carry_end(end.face, at, end.seen)
+        {
+            return;
+        }
+        let seen = self
+            .frontmost_window
+            .map(|front| self.see_front(front))
+            .unwrap_or_default();
+        if seen.task {
+            self.mark_status_dirty();
+        }
+        if self.end_unseen(session) {
+            self.restamp_for_end();
+        }
+    }
+
+    /// Each session's Autopilot end and its task's work, as the rows a
+    /// seamless update's park stamps on its manifest
+    /// (`SessionRecord::autopilot_end`, `app_update_handoff::stamp_autopilot_end`;
+    /// §11.2.3, item 8): the end standing on the glass — its kind, the wall
+    /// time the timeline holds for that face, and whether it was seen — and
+    /// the A/B book's work since the task opened, at the park's instant.
+    /// An end where the timeline holds no time for its face (a face moved
+    /// under it that is no end's) is not carried, fail-closed. A session
+    /// with neither — every shell — has no row; the timeline's leaf lock is
+    /// taken only where an end stands.
+    #[cfg(unix)]
+    pub(crate) fn end_carry_rows(&self) -> Vec<(u64, String)> {
+        let now = crate::turn_ledger::now_ms();
+        self.pool
+            .iter()
+            .filter_map(|session| {
+                let id = session.id;
+                let end = self
+                    .harness_glass
+                    .get(&id)
+                    .and_then(crate::harness_glass::SessionGlass::end)
+                    .and_then(|end| {
+                        let at_ms = session
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .task_face_at(end.face.task_face())?;
+                        Some(crate::harness_end_carry::CarriedEnd {
+                            face: end.face,
+                            at_ms,
+                            seen: !end.unseen(),
+                        })
+                    });
+                crate::harness_end_carry::EndCarry {
+                    end,
+                    worked_ms: self.harness_screen.ab.worked(id, now),
+                }
+                .row()
+                .map(|row| (id, row))
+            })
+            .collect()
     }
 
     /// What the status item knows of each session, as the rows a seamless
@@ -3400,8 +3542,10 @@ impl App {
 
     /// The owner went to session `session` from the menu bar or a notice: a
     /// done its task stands at is seen ([`Self::mark_done_seen`]), and leaves
-    /// Done for you and its tab's `•`.
+    /// Done for you and its tab's `•`; so does its supervised agent's task
+    /// END on the glass (§11.2.3, item 6; [`Self::see_session_end`]).
     pub(crate) fn note_session_done_seen(&mut self, session: u64) {
+        self.see_session_end(session);
         let done = self
             .pool
             .get(session)
@@ -3487,7 +3631,10 @@ impl App {
     /// The menu-bar item's mark as one introspection line (`aterm ctl
     /// chrome`, §3), from `glance`: the title it shows, how many needs it
     /// counts and how many of them are stuck, how many entries the digest
-    /// holds, and the fleet read's state. The same glance the item is drawn
+    /// holds, how many rows stand under Done for you (a worker's done, a
+    /// supervised agent's end nobody has looked at: `done=`,
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4.1), and the fleet
+    /// read's state. The same glance the item is drawn
     /// from, so the cue the owner sees is a cue an agent can read — headless
     /// too, which has no menu bar. `fleet=off` where no fleet glance runs — in
     /// no fleet, headless, or before the item installs — since no fleet is
@@ -3498,11 +3645,12 @@ impl App {
             .as_ref()
             .map_or_else(|| "off".to_string(), |f| f.copy().word());
         format!(
-            "statusitem title={} needs={} stuck={} exceptions={} fleet={fleet}",
+            "statusitem title={} needs={} stuck={} exceptions={} done={} fleet={fleet}",
             glance.button_title(),
             glance.need_count(),
             glance.stuck_count(),
             glance.exceptions.len(),
+            glance.done.len(),
         )
     }
 
@@ -3567,8 +3715,10 @@ impl App {
 
     /// Read Result: a finished worker's result as a Markdown document tab on
     /// the front window, raised ([`Self::raise_window`]), which marks its done
-    /// seen — only once the tab is asked for: a result that did not open was
-    /// not looked at, so its Done for you row and the bar's `❯•` stay.
+    /// seen, and the captured supervised agent's task end with it
+    /// ([`Self::see_session_end`]) — only once the tab is asked for: a result
+    /// that did not open was not looked at, so its Done for you row and the
+    /// bar's `❯•` stay.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn read_status_result(&mut self, result: &crate::status_item::ResultRef) {
         let Some(wid) = self
@@ -3588,6 +3738,31 @@ impl App {
         }
         self.raise_window(wid);
         self.mark_done_seen(result.session, result.entered);
+        // A painted result names the end it shared, not an end that arrived
+        // while that menu stayed open. No end captured means none was read.
+        if result.end_serial.is_some_and(|serial| {
+            self.harness_glass
+                .get(&result.session)
+                .and_then(crate::harness_glass::SessionGlass::end)
+                .is_some_and(|end| end.serial == serial)
+        }) {
+            self.see_session_end(result.session);
+        }
+    }
+
+    /// Someone looked at session `session`'s supervised agent's task END on
+    /// the glass (§11.2.3, item 6): the menu bar's Go, or its Read Result on
+    /// a worker whose task row is that end's Done for you row. Seen; where
+    /// that moved anything, every strip is stamped again and the glance
+    /// dirtied ([`Self::restamp_for_end`]).
+    fn see_session_end(&mut self, session: u64) {
+        if self
+            .harness_glass
+            .get_mut(&session)
+            .is_some_and(crate::harness_glass::SessionGlass::see_end)
+        {
+            self.restamp_for_end();
+        }
     }
 
     /// The status menu is opening (`Wake::StatusMenuOpening`) painted from
@@ -5257,6 +5432,22 @@ impl App {
     /// all-document durability batch are proven before any topology, runtime, pool, or
     /// document ownership edge changes.
     pub(crate) fn close_active_native_tab(&mut self, wid: WindowId) -> Result<(), String> {
+        self.close_active_native_tab_keeping(wid, None)
+    }
+
+    /// [`Self::close_active_native_tab`], then `keep` in front where it is given and
+    /// still stands: a BACKGROUND tab closed ([`Self::close_tab_at`] selects it first,
+    /// so its app's close preflight and any refusal banner show on it) hands the front
+    /// back to the tab that was there, in the same topology edit, before any sync. Left
+    /// to the removal's neighbour rule, the neighbour came to the front: the strip's ✕,
+    /// the tab menu and `ctl tab close` on a Settings tab behind moved the selection,
+    /// and a looked-at window saw the neighbour's unseen end (the final check of
+    /// 2026-10-20, W2).
+    fn close_active_native_tab_keeping(
+        &mut self,
+        wid: WindowId,
+        keep: Option<crate::tab_model::TabId>,
+    ) -> Result<(), String> {
         let (tab_id, leaves, exits_window) = self
             .windows
             .get(&wid)
@@ -5333,6 +5524,9 @@ impl App {
                 .tab_set
                 .remove(tab_id)
                 .ok_or_else(|| "active tab disappeared".to_string())?;
+            if let Some(keep) = keep.filter(|keep| *keep != tab_id) {
+                ws.tab_set.switch_to(keep);
+            }
             if was_last {
                 ws.pending_close = true;
             }
@@ -5677,6 +5871,9 @@ impl App {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .set_state(session, session_store::SessionState::Exited);
+        // Every parked observer (`await`, `ready`, `wait`, `subscribe`) was woken
+        // by the `state-change` record that write made, and reads `Exited`, a
+        // kept pane's too.
         // Its program is gone, kept pane or not: what is parked on it ends now
         // (`SessionFabric::close`).
         if let Some(ended) = self.pool.get(session) {
@@ -5684,15 +5881,6 @@ impl App {
         }
         // The exit ledger takes the child's status now, before teardown discards it.
         self.note_shell_exit_for_ledger(session);
-        // Wake every parked observer (`await`, `ready`, `wait`, `subscribe`) so it
-        // sees `Exited` and returns, a kept pane's too; these verbs are fully
-        // event-driven.
-        if self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(session);
-        }
         // A shell that failed at start keeps its pane in every viewer, the way
         // `--hold` keeps one; otherwise its error shows for a frame and the tab
         // (with one tab, aterm itself) is gone with nothing saying why.
@@ -5751,20 +5939,17 @@ impl App {
         if self.log_closes_deferred.contains(&session) {
             return;
         }
-        let owed = self.pool.get(session).is_some_and(|ended| {
-            ended
+        if let Some(ended) = self.pool.get(session) {
+            let owed = ended
                 .ctx
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .slog_mut()
-                .take_close_due()
-        });
-        if owed && self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(session);
+                .take_close_due();
+            if owed {
+                ended.ctx.watchers.ring_watchers();
+            }
         }
     }
 
@@ -6556,10 +6741,14 @@ impl App {
             return false;
         }
         if is_native {
+            // The tab in front, where it is another: it stays in front once the
+            // close succeeds ([`Self::close_active_native_tab_keeping`]).
+            let mut front = None;
             if let Some(ws) = self.windows.get_mut(&wid) {
+                front = ws.tab_set.active_id().filter(|front| *front != tab_id);
                 ws.tab_set.switch_to(tab_id);
             }
-            return match self.close_active_native_tab(wid) {
+            return match self.close_active_native_tab_keeping(wid, front) {
                 Ok(()) => canonical_count == 1,
                 Err(why) => {
                     // Keep the refused tab selected: its app-owned banner and
@@ -7084,13 +7273,13 @@ impl App {
         // The exit ledger's tale: the gesture that started this close said why.
         let (reason, by) = session_store::current_close_attribution();
         // THE CLOSED-SESSION INDEX's input (`session_log::ClosedLogs`): the
-        // session's ctx, read under the store's read lock and released.
-        let closing = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_local(id)
-            .map(|h| std::sync::Arc::clone(&h.ctx));
+        // session's ctx, read under the store's read lock and released, with
+        // the instance's watcher list.
+        let (closing, instance) = {
+            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+            let ctx = store.by_local(id).map(|h| std::sync::Arc::clone(&h.ctx));
+            (ctx, store.instance_watchers())
+        };
         // A session with a task record may be a worker with a task file.
         let tasked = closing.as_ref().is_some_and(|ctx| {
             ctx.timeline
@@ -7099,6 +7288,13 @@ impl App {
                 .task()
                 .is_some()
         });
+        // The deregister's `closing` and `state-change` records ring the
+        // session's watchers, and its roster exit the instance's: both held
+        // until the closed-session entry below is linked.
+        let held = (
+            closing.as_ref().map(|ctx| ctx.watchers.hold_rings()),
+            instance.hold_rings(),
+        );
         let stable = self
             .store
             .write()
@@ -7116,8 +7312,7 @@ impl App {
         // The index's entry, built from the log the deregister just closed
         // under that session's timeline lock alone, then linked under the
         // store's write lock (no other lock held); what the link frees is
-        // dropped after. Before the wake below, so a verb it wakes finds the
-        // session's log already answering.
+        // dropped after.
         if let (Some(stable), Some(ctx), Some((reads, read_rows)), Some(keep)) =
             (stable.as_ref(), closing, reads, keep)
         {
@@ -7140,22 +7335,20 @@ impl App {
                 .link_closed_log(entry);
             drop(freed);
         }
+        // THE WAKE: every verb parked on the session (`await`, `ready`, `wait`,
+        // `subscribe`) and every `sessions` stream reads that it ended. After
+        // the link, so a verb it wakes finds the session's log already
+        // answering.
+        drop(held);
         // The harness's glass and Autopilot's timer go with the session
         // (design §9.2.3, §9.3.6): no label outlives it, and no deadline of
         // its is folded again.
         self.forget_harness_glass(id);
         self.autopilot_timers.forget(id);
+        // …and what its Autopilot records said (§11.7.3, item 3).
+        self.autopilot_recorded.remove(&id);
         // The front pane may be another now: a warm spare follows it (`spare`).
         self.spare_poke();
-        // Wake every verb parked on the closed session's changes (`await`,
-        // `ready`, `wait`, `subscribe`) to read that it ended, now rather than at
-        // its next slice or deadline — as a shell's exit wakes them.
-        if self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(id);
-        }
         if let Some(stable) = stable {
             // A positively retired session no longer owns a process-local login
             // story. Its persisted notice is neither resolved nor rewritten.
@@ -8966,13 +9159,7 @@ mod session_chrome_app_tests {
         assert_eq!(app.windows[&wid].tab_set.active_index(), Some(0));
         // B is a live worker, so only the answer decides the stop.
         let b_local = app.store.read().unwrap().by_sid(&b_sid).unwrap().local_id;
-        mark_session_task(
-            &b_ctx,
-            b_local,
-            &TaskMark::new(TaskState::Working),
-            &app.subscribers,
-        )
-        .expect("unfenced");
+        mark_session_task(&b_ctx, b_local, &TaskMark::new(TaskState::Working)).expect("unfenced");
         // No sheet: the Overview's confirm, armed on B, and no signal.
         app.dispatch_tab_menu_connection(wid, tab_a, &b_sid, ConnVerb::StopWorker);
         assert_eq!(app.agents.stop_signals, 0, "nothing was signalled");
@@ -9644,10 +9831,9 @@ mod status_glance_tests {
         let mut app = App::headless_for_test();
         app.push_stub_tab(WindowId(0), crate::stub_session(1));
         let ctx = app.pool.get(1).expect("pooled").ctx.clone();
-        let subscribers = app.subscribers.clone();
         let mark = |app: &mut App, state| {
             let mark = crate::task_record::TaskMark::new(state);
-            crate::task_record::mark_session_task(&ctx, 1, &mark, &subscribers).expect("marked");
+            crate::task_record::mark_session_task(&ctx, 1, &mark).expect("marked");
             app.on_task_changed(1);
         };
         mark(&mut app, crate::task_record::TaskState::Working);
@@ -9691,11 +9877,9 @@ mod status_glance_tests {
             match task {
                 Some(row) => crate::task_record::seed_carried(&ctx, Some(row)),
                 None => {
-                    let subscribers = app.subscribers.clone();
                     for state in [TaskState::Working, TaskState::Done] {
                         let mark = crate::task_record::TaskMark::new(state);
-                        crate::task_record::mark_session_task(&ctx, 1, &mark, &subscribers)
-                            .expect("marked");
+                        crate::task_record::mark_session_task(&ctx, 1, &mark).expect("marked");
                     }
                 }
             }
@@ -10497,8 +10681,7 @@ mod exit_attribution_tests {
         let g = app.store.read().unwrap_or_else(|p| p.into_inner());
         let rec = g
             .roster_since(0)
-            .filter(|r| r.change == RosterChange::Exited)
-            .last()
+            .rfind(|r| r.change == RosterChange::Exited)
             .expect("one exit record after the close");
         (rec.reason, rec.actor.as_wire().to_string())
     }
@@ -11062,8 +11245,7 @@ mod exit_attribution_tests {
         let g = app.store.read().unwrap_or_else(|p| p.into_inner());
         let rec = g
             .roster_since(0)
-            .filter(|r| r.change == RosterChange::Exited && r.local_id == session)
-            .last()
+            .rfind(|r| r.change == RosterChange::Exited && r.local_id == session)
             .expect("an exit record for the session");
         (rec.reason, rec.actor.as_wire().to_string())
     }
@@ -11889,7 +12071,7 @@ mod shell_start_exit_tests {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (tl.slog().log().ep(), tl.slog().log().last_seq())
         };
-        let (store, subscribers) = (app.store.clone(), app.subscribers.clone());
+        let store = app.store.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::control::cmd_await(
@@ -11898,7 +12080,6 @@ mod shell_start_exit_tests {
                 session,
                 &ctx,
                 &format!("log close=session since={head} ep={ep} timeout=600000"),
-                &subscribers,
             ));
         });
         rx
@@ -11953,7 +12134,6 @@ mod shell_start_exit_tests {
             session,
             &pooled.ctx,
             "log close=session timeout=0",
-            &app.subscribers,
         )
     }
 
@@ -12444,3 +12624,7 @@ mod shell_start_exit_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "status_end_tests.rs"]
+mod status_end_tests;

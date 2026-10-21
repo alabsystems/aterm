@@ -7,7 +7,8 @@
 //! The host needs the `zstd` CLI on `PATH`, as a publishing host does: every real pack
 //! is compressed by it (`artifact::tarwrite::COMPRESSOR`), so without it the tests that
 //! pack a tree (tarwrite, pack, bundle and the end-to-end ones) fail with "did not
-//! start". It is not a stock macOS tool: `brew install zstd`.
+//! start". It is not a stock macOS tool and aterm provides none (S12's Compressor port
+//! removes the tests' need), so without it these tests end COULD NOT RUN.
 
 mod artifact;
 mod channel;

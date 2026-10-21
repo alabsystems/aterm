@@ -32,12 +32,23 @@ pub mod engine;
 pub mod envelope;
 pub mod facts;
 pub mod hardware;
+pub mod init;
+pub mod init_accounts;
+pub mod init_activation;
+pub mod init_github;
+pub mod init_preferences;
+pub mod init_spotlight;
+pub mod init_trackpad;
 pub mod items;
 pub mod model;
 pub mod plist;
 pub mod port;
 pub mod protocol;
 pub mod sessions;
+
+/// The converge engine the families run on (docs/DESIGN-init-system-2026-10-20.md §3).
+pub use aterm_converge as converge;
+pub use engine::Bound;
 
 /// Where the agent lives on a managed host: root:wheel, nothing below it writable by
 /// anyone else (design §3).

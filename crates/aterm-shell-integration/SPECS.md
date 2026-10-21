@@ -13,6 +13,13 @@
 > Added later on 2026-10-16: `sh-pwsh-keys` (the PowerShell readline key layer), sampled by the 6
 > tests in `src/tests_pwsh_keys.rs`. Its §1 and §2 rows and its place in the tables below are
 > written; the headline counts (166 tests, 45 specs, 160 covered) predate it.
+>
+> 2026-10-20 (predictive editing, review of increment 4): a signed `133;B` that stands where the buffer starts
+> says so (`aterm_input=start`): bash's and fish's, which end the prompt, always; zsh's, sent from zle-line-init,
+> only over an empty buffer (a line pre-filled from the buffer stack is drawn first). `sh-bash-ps1-one-133b`'s test
+> also checks the word and that a PS1 an older body marked sheds its mark; `sh-zsh-line-init-marks` gains
+> `an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one`. The fish lane did not run on the
+> host that wrote it (no fish there).
 
 Source: `crates/aterm-shell-integration` (read only). The `#[test]` fns are src/lib.rs 2,
 src/tests.rs 129, src/tests_loader.rs 21, src/tests_tty.rs 12, tests/prepare_fish_xdg_default.rs 1
@@ -47,7 +54,7 @@ leaves it out. No spec here is blocked by gap 0 alone, because every Rust fn in 
 - `OURS` = `WSLENV_ENTRIES` = `["ATERM_SHELL_INTEGRATION_DIR/p","ATERM_SHELL_NONCE","ATERM_WSL_CWD"]`.
   `name(e)` is the prefix of e before its first `/`, and `names(OURS)` = {name(o) | o ∈ OURS}.
 - `pev(p)` = `path_env_value(p)` = `String::from_utf8_lossy(p.as_os_str().as_encoded_bytes())`.
-- `SET` = `script_set()`: the 10 (relative path, bytes) pairs. `ADDR` = `script_set_address()`.
+- `SET` = `script_set()`: the 14 (relative path, bytes) pairs. `ADDR` = `script_set_address()`.
 - `Match(d)` ⇔ ∀(r,b)∈SET: `fs::read(d/r) = Ok(b)`.
 - `pct(s)`: the OSC 7 percent encoding. Bytes in `[A-Za-z0-9_.~/-]` are kept. Every other byte becomes
   `%XX` in uppercase hex.
@@ -180,6 +187,7 @@ src/tests_tty.rs	an_integrated_bash_repairs_its_tty_after_a_raw_program_fails	sh
 src/tests_tty.rs	an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty	sh-tty-sanity	
 src/tests_tty.rs	an_integrated_zsh_refreezes_when_a_thawed_command_is_interrupted	sh-tty-sanity	
 src/tests_tty.rs	an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init	sh-zsh-line-init-marks	
+src/tests_tty.rs	an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one	sh-zsh-line-init-marks	
 src/tests_tty.rs	an_integrated_zsh_under_xtrace_traces_the_users_commands_and_not_aterms	sh-user-semantics-preserved	
 src/tests_tty.rs	an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms	sh-user-semantics-preserved	
 src/tests_tty.rs	an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bash_does	sh-user-semantics-preserved	
@@ -253,12 +261,14 @@ Actions: 6 delete, 0 become-spec, 0 keep.
    contains the needle satisfies them. The fish tests had to work around this by filtering out comment
    lines. `script-const-lints` restates the meaningful ones as decidable predicates over non-comment
    lines.
-8. **Skip equals pass.** The live tests in `src/tests_loader.rs` and `src/tests_tty.rs` skip silently
-   (eprintln and return) where zsh, fish or `script` is missing, and several zsh lanes run only on
-   macOS. On such hosts a green suite says nothing about the `sh-*` specs. `resolve_test_shell`'s own
-   comment documents this hazard. `src/tests_pwsh_keys.rs` skips its pwsh 7 half where no pwsh
-   resolves, but writes the SKIP to the stderr handle, past libtest's capture, so a green run there
-   says that pwsh did not run.
+8. **Seven zsh lanes are macOS-only.** The skip-equals-pass half closed with the init design's S2: a
+   missing zsh, fish, pwsh or pty-capable `script` now ends COULD NOT RUN. What remains: seven live zsh
+   tests in `src/tests_loader.rs` and their `spawn_live_zsh_from` are `#[cfg(target_os = "macos")]` and
+   take macOS's `/bin/zsh` (`zsh_shell().expect(..)`, not `need_zsh()`); the line-init one drives BSD
+   `script`'s argv. On a Linux host with zsh they are not compiled, so a green suite there says nothing
+   about their `sh-*` specs. A port (`need_zsh()`, util-linux's `script -c` as the fish lanes use) would
+   run on no lane today: the Linux guest's lanes test none of this crate (`aterm-lab/src/linux_proof.rs`
+   and `linux_a11y.rs`, `TESTED`).
 
 ## 6. Proof order (easiest high-value first)
 

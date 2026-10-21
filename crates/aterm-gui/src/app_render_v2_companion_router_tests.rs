@@ -50,6 +50,7 @@ fn the_router_lead_is_the_footprints_own_lead() {
             cursor: (4, 10),
             look,
             bob: 0.0,
+            lift: 0.0,
         })
         .expect("a mid-line footprint");
     let cursor_right = 11 * i32::from(GEOM.cell_w);

@@ -1663,6 +1663,8 @@ pub enum ReadOutcome {
     /// Never produced on Windows (the waiter thread closes the pseudoconsole when the
     /// child exits, which EOFs the reader); present to mirror the Unix enum.
     Exited,
+    /// Never produced on Windows (no process watch); present to mirror the Unix enum.
+    Proc,
 }
 
 /// Windows has no orphaned-different-pgroup reader-pin problem (ConPTY teardown flows
@@ -1676,7 +1678,13 @@ pub fn make_wake_pipe() -> Option<(i32, i32)> {
 /// With no wake pipe on Windows (`wake_rd` is always the `-1` sentinel), this is a
 /// plain blocking read reported as [`ReadOutcome`]. No exit watch either: the
 /// child's exit already ends the read.
-pub fn read_or_wake(master: i32, buf: &mut [u8], _wake_rd: i32, _exit_rd: i32) -> ReadOutcome {
+pub fn read_or_wake(
+    master: i32,
+    buf: &mut [u8],
+    _wake_rd: i32,
+    _exit_rd: i32,
+    _proc_rd: i32,
+) -> ReadOutcome {
     let n = read(master, buf);
     if n > 0 {
         ReadOutcome::Data(n as usize)

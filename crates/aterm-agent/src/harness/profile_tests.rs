@@ -30,6 +30,160 @@ fn tmp_dir(tag: &str) -> Tmp {
         .expect("temp dir")
 }
 
+#[test]
+fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache() {
+    let value = with(
+        composed(),
+        &["oauthAccount", "emailAddress"],
+        json!("owner@example.com"),
+    );
+    let now = 1_792_050_000;
+    let text = aterm_json::to_string(&value).unwrap();
+    let display = parse_subscription(text.as_bytes(), now).unwrap();
+    assert_eq!(display.email.as_deref(), Some("owner@example.com"));
+    assert_eq!(display.plan.as_deref(), Some("Max 5x"));
+    assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+    assert!(!format!("{display:?}").contains(SENTINEL));
+    assert!(!format!("{:?}", parse(text.as_bytes()).unwrap()).contains("owner@example.com"));
+
+    let switched = with(
+        with(
+            value.clone(),
+            &["oauthAccount", "accountUuid"],
+            json!("another-account"),
+        ),
+        &["oauthAccount", "emailAddress"],
+        json!("second@example.com"),
+    );
+    let display =
+        parse_subscription(aterm_json::to_string(&switched).unwrap().as_bytes(), now).unwrap();
+    assert_eq!(display.email.as_deref(), Some("second@example.com"));
+    assert!(
+        display.weekly.is_none(),
+        "the old account's cache was rejected"
+    );
+    for time in [now - 1, now + 15 * 60 + 1, DAY + 10 * 24 * 60 * 60] {
+        let display = parse_subscription(text.as_bytes(), time).unwrap();
+        assert!(
+            display.weekly.is_none(),
+            "future, stale or expired cache: {time}"
+        );
+    }
+}
+
+#[test]
+fn subscription_display_follows_process_profile_selection_and_clears_on_missing() {
+    let root = tmp_dir("footer-subscription");
+    let records = root.path().join(".claude");
+    std::fs::create_dir(&records).unwrap();
+    let profile = root.path().join(".claude.json");
+    let custom = root.path().join(".claude-custom-oauth.json");
+    let first = with(
+        composed(),
+        &["oauthAccount", "emailAddress"],
+        json!("first@example.com"),
+    );
+    let second = with(
+        composed(),
+        &["oauthAccount", "emailAddress"],
+        json!("second@example.com"),
+    );
+    std::fs::write(&profile, aterm_json::to_string(&first).unwrap()).unwrap();
+    std::fs::write(&custom, aterm_json::to_string(&second).unwrap()).unwrap();
+    let mut env = vec![format!("HOME={}", root.path().display())];
+    let roster = super::super::accounts::Roster::default();
+    let read =
+        |env: &[String]| subscription_for(env, root.path(), &records, Some(&roster), 1_792_050_000);
+    assert_eq!(
+        read(&env).unwrap().email.as_deref(),
+        Some("first@example.com")
+    );
+    env.push("CLAUDE_CODE_CUSTOM_OAUTH_URL=https://example.invalid".into());
+    assert_eq!(
+        read(&env).unwrap().email.as_deref(),
+        Some("second@example.com")
+    );
+    std::fs::remove_file(&custom).unwrap();
+    assert!(read(&env).is_none());
+    env.push("ANTHROPIC_API_KEY=synthetic-test-key".into());
+    assert!(
+        read(&env).is_none(),
+        "a private credential route is not the stored account"
+    );
+    assert!(
+        read(&[]).is_none(),
+        "an unread environment names no profile"
+    );
+}
+
+#[test]
+fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
+    use super::super::accounts::{LOGIN_ENV, Roster, Row};
+
+    let root = tmp_dir("footer-shared-logins");
+    let records = root.path().join(".claude");
+    std::fs::create_dir(&records).unwrap();
+    let profile = root.path().join(".claude.json");
+    let roster = Roster {
+        rows: vec![
+            Row {
+                label: "first".into(),
+                email: Some("first@example.com".into()),
+                ..Row::default()
+            },
+            Row {
+                label: "second".into(),
+                dir: Some("/logins/second".into()),
+                email: Some("second@example.com".into()),
+                ..Row::default()
+            },
+        ],
+    };
+    let first_env = vec![format!("HOME={}", root.path().display())];
+    let mut second_env = first_env.clone();
+    second_env.push(format!("{LOGIN_ENV}=/logins/second"));
+    let write = |email: &str| {
+        let value = with(composed(), &["oauthAccount", "emailAddress"], json!(email));
+        std::fs::write(&profile, aterm_json::to_string(&value).unwrap()).unwrap();
+    };
+    let read = |env: &[String], roster| {
+        subscription_for(env, root.path(), &records, roster, 1_792_050_000)
+    };
+
+    write("first@example.com");
+    let first = read(&first_env, Some(&roster)).unwrap();
+    assert_eq!(first.email.as_deref(), Some("first@example.com"));
+    assert_eq!(first.plan.as_deref(), Some("Max 5x"));
+    assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
+    assert!(read(&second_env, Some(&roster)).is_none());
+
+    // Starting the other login overwrites the same home profile, not either env.
+    write("second@example.com");
+    assert!(read(&first_env, Some(&roster)).is_none());
+    assert_eq!(
+        read(&second_env, Some(&roster)).unwrap().email.as_deref(),
+        Some("second@example.com")
+    );
+    assert!(read(&second_env, None).is_none(), "unknown binding");
+    assert!(
+        read(&first_env, None).is_none(),
+        "an unread roster cannot rebind a shared profile"
+    );
+    let mut missing_email = roster.clone();
+    missing_email.rows[1].email = None;
+    assert!(read(&second_env, Some(&missing_email)).is_none());
+    // The same binding works when a renewal moved the login to another item.
+    let mut renewed = roster.clone();
+    let previous = renewed.rows[1].dir.take();
+    renewed.rows[1].was.push(previous);
+    renewed.rows[1].dir = Some("/logins/renewed-second".into());
+    assert!(read(&second_env, Some(&renewed)).is_some());
+    let lone = Roster {
+        rows: vec![roster.rows[1].clone()],
+    };
+    assert!(read(&second_env, Some(&lone)).is_some());
+}
+
 /// A whole composed profile: every allowlisted field, and a sentinel in
 /// every credential and identity field the real file can hold.
 fn composed() -> Value {
@@ -1089,4 +1243,59 @@ fn a_fifo_is_not_a_profile_and_does_not_block() {
     }
     assert_eq!(answer.ok(), Some(Err(NoProfile::NotAFile)));
     reader.join().expect("reader");
+}
+
+/// [`answers_to`]: the effective profile's `oauthAccount.emailAddress`
+/// compared with a row's address, case aside, in a home the process's
+/// environment names — `CLAUDE_CONFIG_DIR`'s profile inside it. NEGATIVE
+/// CONTROLS: another address, an address that is no string, a profile with
+/// none, one that is not JSON and none at all say no or nothing; the plain
+/// profile beside a set `CLAUDE_CONFIG_DIR` is not that home's.
+#[test]
+fn a_login_answers_to_its_rows_address_alone() {
+    let tmp = tmp_dir("answers");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let env = vec![format!("HOME={}", home.display())];
+    let plain = home.join(".claude.json");
+    let row = "owner@example.com";
+    std::fs::write(
+        &plain,
+        r#"{"primaryApiKey":"sk-invented","oauthAccount":{"emailAddress":"Owner@Example.COM","organizationType":"claude_max"}}"#,
+    )
+    .expect("profile");
+    assert_eq!(answers_to(&env, &home, row), Some(true));
+    // NEGATIVE CONTROLS.
+    assert_eq!(answers_to(&env, &home, "other@example.com"), Some(false));
+    for (text, want) in [
+        (r#"{"oauthAccount":{"emailAddress":7}}"#, None),
+        (
+            r#"{"oauthAccount":{"emailAddress":{"a":"owner@example.com"}}}"#,
+            None,
+        ),
+        (r#"{"oauthAccount":{"accountUuid":"u-1"}}"#, None),
+        ("not JSON", None),
+    ] {
+        std::fs::write(&plain, text).expect("profile");
+        assert_eq!(answers_to(&env, &home, row), want, "{text}");
+    }
+    std::fs::remove_file(&plain).expect("gone");
+    assert_eq!(answers_to(&env, &home, row), None);
+    // A home of its own: its own profile, never the plain one.
+    let own = tmp.path().join("own");
+    std::fs::create_dir_all(&own).expect("own home");
+    std::fs::write(
+        &plain,
+        r#"{"oauthAccount":{"emailAddress":"owner@example.com"}}"#,
+    )
+    .expect("plain");
+    let mut in_own = env.clone();
+    in_own.push(format!("CLAUDE_CONFIG_DIR={}", own.display()));
+    assert_eq!(answers_to(&in_own, &home, row), None);
+    std::fs::write(
+        own.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"owner@example.com"}}"#,
+    )
+    .expect("own profile");
+    assert_eq!(answers_to(&in_own, &home, row), Some(true));
 }

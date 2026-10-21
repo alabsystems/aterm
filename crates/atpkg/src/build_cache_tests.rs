@@ -50,7 +50,8 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// The Rust half on the fixture's real files.
+/// The Rust half on the fixture's real files, rendered as the shim's harness prints it:
+/// `env=<dir>` first where it exports one, then the arguments it leaves.
 fn rust(
     home: &Path,
     cwd: &Path,
@@ -65,7 +66,34 @@ fn rust(
         read: &read_config,
         writable: &writable,
     };
-    with_build_dir(args, tool, &m).unwrap_or_else(|| args.to_vec())
+    match decide(args, tool, &m) {
+        Some(BuildDir::TrustEnv(dir)) => std::iter::once(format!("env={dir}"))
+            .chain(args.iter().cloned())
+            .collect(),
+        _ => with_build_dir(args, tool, &m).unwrap_or_else(|| args.to_vec()),
+    }
+}
+
+/// What a case must come out as.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum Want<'a> {
+    /// As typed.
+    Typed,
+    /// The shared cache's `--config` first.
+    Cache,
+    /// `--config build.build-dir='<dir>'` first: the target directory's own folder.
+    Target(&'a str),
+    /// `CARGO_BUILD_BUILD_DIR=<dir>` exported for `targo trust`, the line as typed.
+    Trust(&'a str),
+}
+
+/// `true` is the shared cache, `false` the line as typed.
+#[cfg(unix)]
+impl From<bool> for Want<'_> {
+    fn from(cache: bool) -> Self {
+        if cache { Self::Cache } else { Self::Typed }
+    }
 }
 
 /// The shells the block must parse alike: macOS's `/bin/sh` (bash in POSIX mode), and
@@ -98,7 +126,8 @@ fn block(tool: Tool) -> String {
     shim_block(name).unwrap()
 }
 
-/// The `sh` half, run for real: the block, then the arguments it leaves, one per line.
+/// The `sh` half, run for real: the block, then `env=<dir>` where it exports one and the
+/// arguments it leaves, one per line.
 #[cfg(unix)]
 fn sh(
     shell: &[&str],
@@ -112,7 +141,7 @@ fn sh(
     cmd.args(&shell[1..])
         .arg("-c")
         .arg(format!(
-            "{}[ $# -eq 0 ] || printf '%s\\n' \"$@\"",
+            "{}[ -z \"$__atb_D\" ] || [ -z \"$__atb_e\" ] || printf 'env=%s\\n' \"$CARGO_BUILD_BUILD_DIR\"\n[ $# -eq 0 ] || printf '%s\\n' \"$@\"",
             block(tool)
         ))
         .arg("sh")
@@ -143,32 +172,38 @@ fn sh(
         .collect()
 }
 
-/// One case through both halves for `targo`: `applied` says whether `--config <value>`
-/// must come first, and every shell and the Rust rule must agree.
+/// One case through both halves for `targo`: what it must come out as ([`Want`]), and
+/// every shell and the Rust rule must agree.
 #[cfg(unix)]
-fn check(f: &Fixture, cwd: &Path, env: &[(&'static str, &str)], args: &[&str], applied: bool) {
-    check_tool(f, Tool::Targo, cwd, env, args, applied);
+fn check<'a>(
+    f: &Fixture,
+    cwd: &Path,
+    env: &[(&'static str, &str)],
+    args: &[&str],
+    want: impl Into<Want<'a>>,
+) {
+    check_tool(f, Tool::Targo, cwd, env, args, want);
 }
 
 /// [`check`] for `tool`'s shim.
 #[cfg(unix)]
-fn check_tool(
+fn check_tool<'a>(
     f: &Fixture,
     tool: Tool,
     cwd: &Path,
     env: &[(&'static str, &str)],
     args: &[&str],
-    applied: bool,
+    want: impl Into<Want<'a>>,
 ) {
     let env: HashMap<&str, String> = env.iter().map(|(k, v)| (*k, (*v).to_owned())).collect();
     let args = strings(args);
-    let want = if applied {
-        let mut w = vec!["--config".to_owned(), f.value()];
-        w.extend(args.iter().cloned());
-        w
-    } else {
-        args.clone()
+    let first = match want.into() {
+        Want::Typed => vec![],
+        Want::Cache => vec!["--config".to_owned(), f.value()],
+        Want::Target(dir) => vec!["--config".to_owned(), format!("build.build-dir='{dir}'")],
+        Want::Trust(dir) => vec![format!("env={dir}")],
     };
+    let want: Vec<String> = first.into_iter().chain(args.iter().cloned()).collect();
     assert_eq!(
         rust(&f.home, cwd, &env, &args, tool),
         want,
@@ -186,9 +221,11 @@ fn check_tool(
 }
 
 /// Every rule, in both halves and every shell found: a building verb with `--unverified`
-/// (or `clean`) under `$HOME` gets the cache; each choice of the user's (an environment
-/// variable, a flag, a config line, a folder outside the home or inside the cache, an
-/// unwritable cache), the verified lane and the verbs that do not build keep it as typed.
+/// (or `clean`) under `$HOME` gets the cache; one into a target directory it chose, or
+/// with no cache to write, gets `<target>/build.noindex`, and `targo trust` gets that
+/// folder in its environment; a build directory of the user's (a variable, a flag, a
+/// config line), a folder outside the home or inside the cache, a target already in a
+/// `*.noindex` folder, and the verbs that do not build keep it as typed.
 #[cfg(unix)]
 #[test]
 fn the_shim_and_the_rust_rule_decide_every_case_alike() {
@@ -228,13 +265,21 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &["--version"],
         &["build"],
         &["test"],
-        &["trust", "check", "--lib"],
         &["--unverified", "metadata"],
         &["--unverified", "install", "x"],
         &["new", "x"],
         &["--unverified", "verify"],
-        &["--unverified", "build", "--target-dir", "x"],
-        &["--unverified", "build", "--target-dir=x"],
+        &["--unverified", "build", "--target-dir"],
+        &["--unverified", "build", "--target-dir="],
+        &["--unverified", "build", "--target-dir", "x.noindex"],
+        &[
+            "--unverified",
+            "build",
+            "--target-dir",
+            "/t/lane.noindex/sub",
+        ],
+        &["--unverified", "build", "--target-dir", "o'x"],
+        &["--unverified", "build", "--target-dir", "x{y}"],
         &["--config", "build.target-dir='x'", "--unverified", "build"],
         &["--unverified", "build", "--config=build.build-dir='y'"],
         &["--config", "my.toml", "--unverified", "build"],
@@ -308,26 +353,93 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     ] {
         check_tool(&f, Tool::Tippy, &ws, &[], args, true);
     }
-    check_tool(&f, Tool::Tippy, &ws, &[], &["--target-dir", "t"], false);
+    let ws_t = format!("{}/t/build.noindex", ws.display());
+    check_tool(
+        &f,
+        Tool::Tippy,
+        &ws,
+        &[],
+        &["--target-dir", "t"],
+        Want::Target(&ws_t),
+    );
     check_tool(
         &f,
         Tool::Tippy,
         &ws,
         &[("CARGO_TARGET_DIR", "/t")],
         &[],
-        false,
+        Want::Target("/t/build.noindex"),
     );
     check_tool(&f, Tool::Tippy, &f.dir("elsewhere/lint"), &[], &[], false);
 
     let build = &["--unverified", "build"][..];
-    for var in [
-        "CARGO_TARGET_DIR",
-        "CARGO_BUILD_TARGET_DIR",
-        "CARGO_BUILD_BUILD_DIR",
-    ] {
-        check(&f, &ws, &[(var, "/x")], build, false);
+    let trust = &["trust", "check", "--lib"][..];
+    let x = Want::Target("/x/build.noindex");
+    for var in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+        check(&f, &ws, &[(var, "/x")], build, x);
+        check(&f, &ws, &[(var, "/x")], &["clean"], x);
+        check(
+            &f,
+            &ws,
+            &[(var, "/x")],
+            trust,
+            Want::Trust("/x/build.noindex"),
+        );
         check(&f, &ws, &[(var, "")], build, false);
+        check(&f, &ws, &[(var, "/x/lane.noindex")], build, false);
     }
+    check(&f, &ws, &[("CARGO_BUILD_BUILD_DIR", "/x")], build, false);
+    check(&f, &ws, &[("CARGO_BUILD_BUILD_DIR", "")], build, false);
+    check(&f, &ws, &[("CARGO_BUILD_BUILD_DIR", "/x")], trust, false);
+
+    // A chosen target directory: the flag outranks CARGO_TARGET_DIR, which outranks
+    // CARGO_BUILD_TARGET_DIR, and a relative one is the working directory's.
+    let lane = format!("{}/target/lane/build.noindex", ws.display());
+    check(
+        &f,
+        &ws,
+        &[("CARGO_TARGET_DIR", "target/lane")],
+        build,
+        Want::Target(&lane),
+    );
+    check(
+        &f,
+        &ws,
+        &[],
+        &["--unverified", "build", "--target-dir=target/lane"],
+        Want::Target(&lane),
+    );
+    check(
+        &f,
+        &ws,
+        &[("CARGO_TARGET_DIR", "/b")],
+        &["--unverified", "test", "--target-dir", "target/lane"],
+        Want::Target(&lane),
+    );
+    check(
+        &f,
+        &ws,
+        &[("CARGO_TARGET_DIR", "/x"), ("CARGO_BUILD_TARGET_DIR", "/b")],
+        build,
+        x,
+    );
+    check(
+        &f,
+        &ws,
+        &[("CARGO_BUILD_TARGET_DIR", "/x")],
+        &["--unverified", "build", "--", "--target-dir", "y"],
+        x,
+    );
+    check(&f, &ws, &[("CARGO_TARGET_DIR", "o'q")], build, false);
+
+    // Trust's verified lane builds into Cargo's default target: its own folder there,
+    // through the environment.
+    let default = Want::Trust("{workspace-root}/target/build.noindex");
+    check(&f, &ws, &[], trust, default);
+    check(&f, &ws, &[], &["trust", "test", "-p", "x"], default);
+    check(&f, &f.dir("elsewhere/trusted"), &[], trust, false);
+    check(&f, &f.dir("home/lab.noindex/ws"), &[], trust, false);
+    check(&f, &f.dir("home/lab.noindex/ws"), &[], build, true);
 
     // Config files up the tree: a line naming either key chooses unless it is a comment
     // (a mention after a value counts: the safe side), the legacy name counts, and an
@@ -336,7 +448,11 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         "home/chosen/.cargo/config.toml",
         "[build]\ntarget-dir = \"out\"\n",
     );
-    check(&f, &f.dir("home/chosen"), &[], build, false);
+    let chosen = f.dir("home/chosen");
+    check(&f, &chosen, &[], build, false);
+    check(&f, &chosen, &[], trust, false);
+    // A target-dir line is outranked by a chosen target; a build-dir line never is.
+    check(&f, &chosen, &[("CARGO_TARGET_DIR", "/x")], build, x);
     f.file(
         "home/commented/.cargo/config.toml",
         "# target-dir = \"out\"\n[build]\n  \t# build-dir = \"b\"\njobs = 2\n",
@@ -355,7 +471,10 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     f.file("home/legacy/.cargo/config", "build.build-dir = 'b'");
     check(&f, &f.dir("home/legacy"), &[], build, false);
     f.file("home/up/.cargo/config.toml", "[build]\nbuild-dir = \"b\"\n");
-    check(&f, &f.dir("home/up/a/b"), &[], build, false);
+    let up = f.dir("home/up/a/b");
+    check(&f, &up, &[], build, false);
+    check(&f, &up, &[("CARGO_TARGET_DIR", "/x")], build, false);
+    check(&f, &up, &[("CARGO_TARGET_DIR", "/x")], trust, false);
     f.file("cargohome/config.toml", "[build]\ntarget-dir = \"t\"\n");
     let cargo_home = f.root.join("cargohome").display().to_string();
     check(&f, &ws, &[("CARGO_HOME", &cargo_home)], build, false);
@@ -364,6 +483,52 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     f.file("home/.cargo/config.toml", "build.target-dir = \"t\"\n");
     check(&f, &ws, &[], build, false);
     std::fs::remove_file(f.root.join("home/.cargo/config.toml")).unwrap();
+
+    // An alias builds as what its first word builds, defined under `[alias]` or as
+    // `alias.<name>` anywhere, in an ancestor's config or CARGO_HOME's.
+    f.file(
+        "home/aliased/.cargo/config.toml",
+        "alias.ship = \"run --profile gate -p aterm-release --\"\n[build]\njobs = 2\n\
+         [alias]\n# lint = \"tippy\"\nverify = \"run -q -p aterm-verify --\"\n\
+         lab = [\"run\", \"-q\", \"-p\", \"aterm-lab\", \"--\"]\ntree2 = \"tree -d\"\n\
+         [env]\nfake = \"build\"\n",
+    );
+    let aliased = f.dir("home/aliased/sub");
+    for verb in ["verify", "lab", "ship"] {
+        check(&f, &aliased, &[], &["--unverified", verb, "x"], true);
+    }
+    for args in [
+        &["--unverified", "tree2"][..],
+        &["--unverified", "fake"],
+        &["--unverified", "lint"],
+        &["--unverified", "verif"],
+        &["--unverified", "verifyx"],
+        &["--unverified", "nope"],
+        &["verify"],
+        &["--unverified"],
+    ] {
+        check(&f, &aliased, &[], args, false);
+    }
+    check(
+        &f,
+        &aliased,
+        &[("CARGO_TARGET_DIR", "/x")],
+        &["--unverified", "verify"],
+        x,
+    );
+    f.file(
+        "cargohome2/config.toml",
+        "[alias]\nxt = \"run -p xtask --\"\n",
+    );
+    let cargo_home2 = f.root.join("cargohome2").display().to_string();
+    check(
+        &f,
+        &ws,
+        &[("CARGO_HOME", &cargo_home2)],
+        &["--unverified", "xt"],
+        true,
+    );
+    check(&f, &ws, &[], &["--unverified", "xt"], false);
 
     // Where the command runs: outside the home, the home itself, the cache.
     check(&f, &f.dir("elsewhere/ws"), &[], build, false);
@@ -374,17 +539,19 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     std::fs::remove_dir_all(f.home.join("Library/Caches/aterm")).unwrap();
 
     // A cache this process cannot write (a containment tab's), or no caches folder at all:
-    // the command is kept as typed.
+    // the build keeps its intermediates in its own target directory's folder.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+        let own = Want::Target("{workspace-root}/target/build.noindex");
         let caches = f.home.join("Library/Caches");
         std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o555)).unwrap();
-        check(&f, &ws, &[], build, false);
+        check(&f, &ws, &[], build, own);
         std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o755)).unwrap();
         check(&f, &ws, &[], build, true);
         std::fs::remove_dir(&caches).unwrap();
-        check(&f, &ws, &[], build, false);
+        check(&f, &ws, &[], build, own);
+        check(&f, &f.dir("home/lab.noindex/ws"), &[], build, false);
     }
 }
 
@@ -480,9 +647,11 @@ fn an_upstream_cargo_keeps_its_toolchain_first() {
         strings(&["+nightly", "metadata"])
     );
     assert_eq!(run(&["install", "x"]), strings(&["install", "x"]));
+    assert_eq!(run(&["trust", "check"]), strings(&["trust", "check"]));
+    let t = format!("build.build-dir='{}/t/build.noindex'", ws.display());
     assert_eq!(
-        run(&["build", "--target-dir", "t"]),
-        strings(&["build", "--target-dir", "t"])
+        run(&["+1.97.1", "build", "--target-dir", "t"]),
+        strings(&["+1.97.1", "--config", &t, "build", "--target-dir", "t"])
     );
 }
 
@@ -576,10 +745,12 @@ fn the_targo_shim_carries_the_block_and_reads_as_before() {
         body.ends_with("exec '/p/store/trust/9192/bin/targo' \"$@\"\n"),
         "{body}"
     );
+    // It never execs, and exports only `targo trust`'s build directory.
     for line in SH_BLOCK.lines() {
         let line = line.trim();
+        assert!(!line.starts_with("exec"), "{line}");
         assert!(
-            !line.starts_with("exec") && !line.starts_with("export "),
+            !line.starts_with("export ") || line == "export CARGO_BUILD_BUILD_DIR",
             "{line}"
         );
     }
@@ -631,6 +802,13 @@ fn the_rendered_shim_hands_targo_the_config() {
         format!("--config {} --unverified test -q\n", f.value())
     );
     assert_eq!(run(&["trust", "check"]), "trust check\n");
+    assert_eq!(
+        run(&["--unverified", "build", "--target-dir", "t"]),
+        format!(
+            "--config build.build-dir='{}/t/build.noindex' --unverified build --target-dir t\n",
+            ws.display()
+        )
+    );
 }
 
 /// Sets `path`'s modification time `ago` before now.
@@ -712,7 +890,13 @@ fn reclaim_removes_only_what_nobody_builds_into() {
 
     let mut removed = reclaim(&root, home, SystemTime::now());
     removed.sort();
-    let mut want = vec![emptied_leaf.clone(), gone_leaf.clone()];
+    // The two stages an earlier pass left are finished, and said so with what went.
+    let mut want = vec![
+        emptied_leaf.clone(),
+        gone_leaf.clone(),
+        leftover.clone(),
+        beside.clone(),
+    ];
     want.sort();
     assert_eq!(removed, want);
     assert!(!mirror(&gone).exists() && !mirror(&emptied).exists());
@@ -767,6 +951,92 @@ fn reclaim_removes_only_what_nobody_builds_into() {
     assert!(old.is_dir());
 }
 
+/// The watch's pass below its floor: [`reclaim_watched`] with
+/// [`RECLAIM_GONE_UNDER_PRESSURE`] and no mount table, now, `record` asked of each path
+/// about to go; the paths that went.
+#[cfg(unix)]
+fn pressure(
+    root: &Path,
+    home: Option<&Path>,
+    record: &mut dyn FnMut(&Path) -> bool,
+) -> Vec<PathBuf> {
+    reclaim_watched(
+        root,
+        home,
+        SystemTime::now(),
+        RECLAIM_GONE_UNDER_PRESSURE,
+        None,
+        &mut |p, _| record(p),
+    )
+    .into_iter()
+    .map(|(p, _)| p)
+    .collect()
+}
+
+/// WHY EACH WENT ([`Unused`]: what the disk ledger, the watch's log and its resume say of
+/// it), asked before it goes and returned with it: a gone workspace's build directory
+/// past the pass's window is `Gone`, with its own idle time and that window; a live
+/// workspace's past a month is `Idle` — its workspace still stands, and nothing is said
+/// of it; a stage an earlier pass left is `Unfinished`. NEGATIVE CONTROL: the live
+/// workspace's directory two days idle stays, asked nothing.
+#[cfg(unix)]
+#[test]
+fn reclaim_watched_says_why_each_directory_went() {
+    let f = Fixture::new("build-cache-why");
+    let root = cache_root(&f.home);
+    std::fs::create_dir_all(&root).unwrap();
+    let home = Some(f.home.as_path());
+    let quarter_hour = Duration::from_secs(15 * 60);
+    let gone_leaf = lay(&root, &f.root.join("home/wt-removed"), quarter_hour);
+    let live = f.dir("home/live");
+    std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let live_leaf = lay(&root, &live, 40 * DAY);
+    let recent = f.dir("home/recent");
+    std::fs::write(recent.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let recent_leaf = lay(&root, &recent, 2 * DAY);
+    let stage = build_dir(&root, &f.root.join("home/orphan")).with_file_name(DOOMED);
+    std::fs::create_dir_all(&stage).unwrap();
+
+    let mut asked = Vec::new();
+    let mut went = reclaim_watched(
+        &root,
+        home,
+        SystemTime::now(),
+        RECLAIM_GONE_UNDER_PRESSURE,
+        None,
+        &mut |p, why| {
+            asked.push((p.to_path_buf(), why));
+            true
+        },
+    );
+    went.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut want = vec![gone_leaf.clone(), live_leaf.clone(), stage.clone()];
+    want.sort();
+    assert_eq!(
+        went.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        want
+    );
+    for (path, why) in &went {
+        match why {
+            Unused::Gone { idle, after } if *path == gone_leaf => {
+                assert_eq!(*after, RECLAIM_GONE_UNDER_PRESSURE);
+                assert!(*idle >= quarter_hour && *idle < DAY, "{idle:?}");
+            }
+            Unused::Idle { idle } if *path == live_leaf => {
+                assert!(*idle >= 40 * DAY && *idle < 41 * DAY, "{idle:?}");
+            }
+            // The stage an earlier pass left: its intent asked, and its removal said.
+            Unused::Unfinished if *path == stage => {}
+            other => panic!("{}: {other:?}", path.display()),
+        }
+        assert!(asked.contains(&(path.clone(), *why)), "asked first");
+    }
+    assert!(!stage.exists());
+    assert!(recent_leaf.is_dir());
+    assert!(!asked.iter().any(|(p, _)| *p == recent_leaf));
+    assert!(live.join("Cargo.toml").is_file(), "its workspace stands");
+}
+
 /// UNDER PRESSURE a gone workspace's build directory goes after ten minutes unwritten, not
 /// a day: the removed worktree's cache that filled the disk. NEGATIVE CONTROLS, each kept
 /// byte for byte: the same gone workspace written a minute ago, a live workspace's idle one,
@@ -803,7 +1073,7 @@ fn under_pressure_a_removed_workspaces_cache_goes_after_ten_minutes() {
     // WRITE-AHEAD: a directory whose intent cannot be put on record is kept.
     let mut asked = Vec::new();
     assert!(
-        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+        pressure(&root, home, &mut |p| {
             asked.push(p.to_path_buf());
             false
         })
@@ -815,7 +1085,7 @@ fn under_pressure_a_removed_workspaces_cache_goes_after_ten_minutes() {
     // Recorded, it goes — the record asked while it still stood.
     let mut stood = Vec::new();
     assert_eq!(
-        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+        pressure(&root, home, &mut |p| {
             stood.push(p.join("debug/deps/x").is_file());
             true
         }),
@@ -857,7 +1127,7 @@ fn pressure_reclamation_records_an_orphaned_stage_before_removing_it() {
     );
     let mut recorded = Vec::new();
     assert_eq!(
-        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+        pressure(&root, home, &mut |p| {
             recorded.push((
                 p.to_path_buf(),
                 std::fs::read(p.join("debug/deps/x")).unwrap(),
@@ -875,7 +1145,7 @@ fn pressure_reclamation_records_an_orphaned_stage_before_removing_it() {
     std::fs::write(&payload, b"staged bytes need an intent").unwrap();
     let mut denied = Vec::new();
     assert!(
-        reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+        pressure(&root, home, &mut |p| {
             denied.push(p.to_path_buf());
             false
         })
@@ -890,7 +1160,7 @@ fn pressure_reclamation_records_an_orphaned_stage_before_removing_it() {
 
     // The same stage can go once recorded, and the callback sees its original bytes.
     let mut allowed = Vec::new();
-    let _ = reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+    let _ = pressure(&root, home, &mut |p| {
         allowed.push((p.to_path_buf(), std::fs::read(p.join("retained")).unwrap()));
         true
     });
@@ -898,6 +1168,66 @@ fn pressure_reclamation_records_an_orphaned_stage_before_removing_it() {
         allowed,
         vec![(stage.clone(), b"staged bytes need an intent".to_vec())]
     );
+    assert!(!stage.exists());
+}
+
+/// WHAT GOES IS SAID ONCE, WHEN IT IS GONE: a build directory whose removal is cut short
+/// (a folder in it nobody may write) is not returned by the pass that moved it aside, and
+/// its rest, a stage, is returned as [`Unused::Unfinished`] by the pass that finishes it —
+/// the bytes it frees counted there, never twice. NEGATIVE CONTROL: while the removal
+/// still cannot finish, the stage's intent is asked at each pass and nothing is returned.
+#[cfg(unix)]
+#[test]
+fn a_removal_cut_short_is_returned_by_the_pass_that_finishes_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new("build-cache-cut-short");
+    let root = cache_root(&f.home);
+    let home = Some(f.home.as_path());
+    let leaf = lay(
+        &root,
+        &f.root.join("home/removed"),
+        Duration::from_secs(15 * 60),
+    );
+    let stage = leaf.with_file_name(DOOMED);
+    let deps = leaf.join("debug/deps");
+    let mode = |dir: &Path, bits: u32| {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(bits)).unwrap();
+    };
+    mode(&deps, 0o500);
+    // The test runs as no superuser: a folder nobody may write keeps its file.
+    let mut asked = Vec::new();
+    let first = pressure(&root, home, &mut |p| {
+        asked.push(p.to_path_buf());
+        true
+    });
+    assert!(first.is_empty(), "returned before it went: {first:?}");
+    assert_eq!(asked, vec![leaf.clone()]);
+    assert!(!leaf.exists() && stage.join("debug/deps/x").is_file());
+
+    // NEGATIVE CONTROL: still cut short, the stage is asked for again and kept.
+    asked.clear();
+    let again = pressure(&root, home, &mut |p| {
+        asked.push(p.to_path_buf());
+        true
+    });
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(asked, vec![stage.clone()]);
+
+    mode(&stage.join("debug/deps"), 0o700);
+    let mut why = Vec::new();
+    let went = reclaim_watched(
+        &root,
+        home,
+        SystemTime::now(),
+        RECLAIM_GONE_UNDER_PRESSURE,
+        None,
+        &mut |p, w| {
+            why.push((p.to_path_buf(), w));
+            true
+        },
+    );
+    assert_eq!(went, vec![(stage.clone(), Unused::Unfinished)]);
+    assert_eq!(why, went, "its intent asked before it went");
     assert!(!stage.exists());
 }
 
@@ -919,7 +1249,7 @@ fn pressure_reclamation_keeps_a_leaf_beside_an_unrecorded_stage() {
     let payload = stage.join("retained");
     std::fs::write(&payload, b"the previous generation").unwrap();
     let mut intents = Vec::new();
-    let removed = reclaim_under_pressure(&root, home, SystemTime::now(), &mut |p| {
+    let removed = pressure(&root, home, &mut |p| {
         intents.push(p.to_path_buf());
         p != stage
     });

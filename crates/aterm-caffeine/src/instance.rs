@@ -281,15 +281,20 @@ impl Holder {
 /// Who holds the lock at `path`, if anyone does, as its file says (the pid unchecked: a mug
 /// killed outright leaves its pid behind, which a probe holding the lock for an instant then
 /// reads as live; [`running_mug`] checks it).
-///
-/// The text is read as the probe opens the file: never through a link, never waiting on a
-/// FIFO, and only from a regular file.
 #[must_use]
 pub fn running_holder(path: &Path) -> Option<Holder> {
-    use std::io::Read as _;
     if aterm_uds::ownerlock::probe(path) != aterm_uds::ownerlock::Owner::Live {
         return None;
     }
+    last_holder(path)
+}
+
+/// Who the lock file at `path` names, held or not: the running mug, or one that died without
+/// letting go (a crash, a signal), whose pid and label stay in the file. The text is read
+/// never through a link, never waiting on a FIFO, and only from a regular file.
+#[must_use]
+pub fn last_holder(path: &Path) -> Option<Holder> {
+    use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -375,35 +380,18 @@ fn parse_holder(text: &str) -> Option<Holder> {
     })
 }
 
-/// This boot of the Mac (`kern.bootsessionuuid`, as 128 bits); `None` where it cannot be read.
-/// Unlike `kern.boottime`, which macOS moves whenever the wall clock is stepped, it holds for
-/// the whole boot and only for it.
+/// This boot of the Mac (`kern.bootsessionuuid`, as 128 bits, big-endian); `None` where it
+/// cannot be read, or reads as the all-zero id a damaged answer would, which must never pass
+/// as a boot (two equal damaged answers would read as one boot, and a mode saved before a
+/// restart would come back). Unlike `kern.boottime`, which macOS moves whenever the wall
+/// clock is stepped, it holds for the whole boot and only for it.
+///
+/// Read through `astream_sys::boot_session`, the reading aterm-link's broker opens its log in,
+/// so this crate keeps no `sysctlbyname` of its own.
 #[must_use]
 #[cfg(target_os = "macos")]
-// Skip: bottoms out at the `sysctlbyname` FFI call.
-#[cfg_attr(trust_verify, trust::skip)]
 pub fn boot_id() -> Option<u128> {
-    // A UUID's 36 characters and its NUL, with room to spare: a longer answer is refused by
-    // the kernel (`ENOMEM`), never cut short.
-    let mut buf = [0u8; 64];
-    let mut len = buf.len();
-    // SAFETY: `buf` is `len` writable bytes, which the kernel fills with a NUL-terminated
-    // string and does not retain; `len` is updated in place; nothing is written (`newp` is
-    // null).
-    let read = unsafe {
-        libc::sysctlbyname(
-            c"kern.bootsessionuuid".as_ptr(),
-            buf.as_mut_ptr().cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if read != 0 {
-        return None;
-    }
-    let text = std::ffi::CStr::from_bytes_until_nul(buf.get(..len)?).ok()?;
-    crate::state::parse_boot(text.to_str().ok()?)
+    astream_sys::boot_session().map(u128::from_be_bytes)
 }
 
 /// This boot of the Mac: not read off macOS.
@@ -779,5 +767,10 @@ mod tests {
         let boot = boot_id().expect("kern.bootsessionuuid");
         assert_ne!(boot, 0);
         assert_eq!(boot_id(), Some(boot));
+        // The stamp the state file gets reads back as this boot.
+        assert_eq!(
+            crate::state::parse_boot(&crate::state::boot_text(boot)),
+            Some(boot)
+        );
     }
 }

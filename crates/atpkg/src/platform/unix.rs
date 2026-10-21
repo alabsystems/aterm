@@ -170,33 +170,7 @@ fn process_birth_platform(_pid: libc::pid_t) -> crate::platform::Birth {
 /// this is the real home" and does not write.
 #[must_use]
 pub fn account_home() -> Option<PathBuf> {
-    // The reentrant form, which every ABI cell this crate ships declares (Darwin and
-    // Linux alike), with a buffer sized for any real passwd record.
-    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf = [0u8; 4096];
-    let mut out: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: `pw` is a valid, writable passwd out-param; `buf` is a valid writable
-    // buffer of the stated length that outlives the call and that `pw`'s string fields
-    // point INTO on success; `out` is a valid out-pointer. getpwuid_r writes nothing past
-    // buflen. `pw_dir` is read only when `out` is non-null (success) and is then a
-    // NUL-terminated C string inside `buf`, copied out before `buf` goes out of scope.
-    unsafe {
-        let rc = libc::getpwuid_r(
-            libc::getuid(),
-            &mut pw,
-            buf.as_mut_ptr().cast::<libc::c_char>(),
-            buf.len(),
-            &mut out,
-        );
-        if rc != 0 || out.is_null() || pw.pw_dir.is_null() {
-            return None;
-        }
-        let bytes = std::ffi::CStr::from_ptr(pw.pw_dir).to_bytes();
-        if bytes.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(OsStr::from_bytes(bytes)))
-    }
+    aterm_uds::account::home()
 }
 
 /// Mark `dir` as excluded from Time Machine and every backup tool that honours the
@@ -291,11 +265,11 @@ pub const UNIVERSAL_CONTROL_KEYS: [&str; 2] = ["Disable", "DisableMagicEdges"];
 /// READ-ONLY. `/usr/bin/defaults` is named absolutely, never through `PATH`.
 /// Non-macOS: `[None, None]`.
 #[must_use]
-pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
+pub fn universal_control_state() -> [crate::machine::Read<bool>; 2] {
     #[cfg(target_os = "macos")]
     {
         let read = |key: &str| {
-            use crate::machine::KeyRead;
+            use crate::machine::Read;
             let mut cmd = aterm_uds::spawnfd::command("/usr/bin/defaults");
             cmd.arg("-currentHost")
                 .arg("read")
@@ -309,11 +283,16 @@ pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
             // and must not be folded into the same `None` the OS default arrives as.
             match bounded_exit_and_stdout(&mut cmd) {
                 Some((true, out)) => match crate::machine::parse_defaults_bool(&out) {
-                    Some(value) => KeyRead::Value(value),
-                    None => KeyRead::Unusable,
+                    Some(value) => Read::Value(value),
+                    None => Read::Unusable(format!("`defaults read` printed no boolean for {key}")),
                 },
-                Some((false, out)) if out.is_empty() => KeyRead::Absent,
-                Some((false, _)) | None => KeyRead::Unusable,
+                Some((false, out)) if out.is_empty() => Read::Absent,
+                Some((false, _)) => Read::Unusable(format!(
+                    "`defaults read` of {key} exited nonzero and printed something"
+                )),
+                None => Read::Unusable(format!(
+                    "`defaults read` of {key} did not run or passed its deadline"
+                )),
             }
         };
         [
@@ -325,10 +304,7 @@ pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
     {
         // Not macOS: there is no domain to read, which is a measured absence of the
         // feature, not a failed read.
-        [
-            crate::machine::KeyRead::Absent,
-            crate::machine::KeyRead::Absent,
-        ]
+        [crate::machine::Read::Absent, crate::machine::Read::Absent]
     }
 }
 
@@ -638,32 +614,6 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
         st.f_bsize
     };
     Some((st.f_bavail as u64).saturating_mul(frsize as u64))
-}
-
-/// What one `statvfs` says of the volume holding `dir` (which must EXIST): the bytes
-/// free to an unprivileged user (`f_bavail`), the volume's size (`f_blocks`) and the
-/// inodes free (`f_favail`) — a volume out of inodes fails a write with `ENOSPC` as one
-/// out of blocks does. `None` on any failure.
-#[must_use]
-pub fn volume_stats(dir: &Path) -> Option<crate::freespace::VolumeStats> {
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    // SAFETY: as `volume_free_bytes`: a NUL-terminated C string that outlives the call and a
-    // valid, writable out-param of the exact `statvfs` type the libc call expects.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
-    if rc != 0 {
-        return None;
-    }
-    let frsize = if st.f_frsize != 0 {
-        st.f_frsize
-    } else {
-        st.f_bsize
-    } as u64;
-    Some(crate::freespace::VolumeStats {
-        free: (st.f_bavail as u64).saturating_mul(frsize),
-        total: (st.f_blocks as u64).saturating_mul(frsize),
-        files_free: Some(st.f_favail as u64),
-    })
 }
 
 /// Atomically point `link` at `target`: create a sibling temp symlink and `rename(2)` it

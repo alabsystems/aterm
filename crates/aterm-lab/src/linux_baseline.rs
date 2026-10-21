@@ -79,9 +79,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::linux::{self, Out, Up};
-use crate::linux_guest::{self as guest, Arch, Display, Screen, Selection};
+use crate::linux_guest::{self as guest, Arch, Display, Screen, Seat, Selection};
 use crate::linux_proof::{self as proof, Gui};
 use crate::{Fail, LAB, Res};
+
+mod deck;
+
+pub(crate) use deck::{row as deck_row, row_name as deck_row_name};
 
 /// Where the recordings are committed, under the checkout.
 pub const DIR: &str = "crates/aterm-lab/linux-baseline";
@@ -98,6 +102,15 @@ pub const COMPOSE_LIVE: &str = "echo X-x";
 pub const COMPOSE_AFTER: &str = "-Y";
 pub const COMPOSED: &str = "X-x\u{e9}-Y";
 
+/// The input-method check (Mutter, under GNOME Shell): after `echo X-` and a
+/// plain `x`, one burst of BackSpace, `dead_acute` and `e`, aterm-gui stopped
+/// across it. The input method passes the BackSpace back as a key and commits
+/// the `é` through text-input-v3, both read in one dispatch once aterm-gui
+/// continues; applied in the order they came (fb676e9b67), the BackSpace takes
+/// the `x` and the shell prints `X-é-Y`. Applied commit first, it would take
+/// the `é`, and the shell would print `X-x-Y`.
+pub const IME_COMPOSED: &str = "X-\u{e9}-Y";
+
 /// ibus's engine for the XIM check: its simple engine, which composes dead
 /// keys (an engine must be set, or ibus passes every key through untouched).
 pub const XIM_ENGINE: &str = "xkb:us::eng";
@@ -113,11 +126,50 @@ pub const DND_DIR: &str = "/tmp/aterm-lane-dnd";
 pub const DND_FILE: &str = "dropped file.txt";
 pub const DND_URI: &str = "file:///tmp/aterm-lane-dnd/dropped%20file.txt";
 
+/// Why weston's outside resize is not driven: Mutter's is, through a binding
+/// its RemoteDesktop keyboard presses.
+pub const RESIZE_OS_WESTON: &str = "weston's headless backend has no seat, so no binding of its own reaches the window, and no tool here resizes a Wayland client from outside (Mutter's is driven, resize.os.tiled-left, and weston-x11's, resize.os.maximized from its seat)";
+
+/// The Wayland global a compositor offers PRIMARY through.
+pub const PRIMARY_GLOBAL: &str = "zwp_primary_selection_device_manager_v1";
+
+/// What the CPU item types on the seat's keyboard and enters, and the row
+/// only the shell's answer makes: every key on its key's first level, as
+/// `lane-bus xseat` presses keys.
+pub const CPU_TYPED: &str = "echo lane-seat";
+pub const CPU_ECHO: &str = "lane-seat";
+
+/// Why touch is not driven under weston's x11 backend, headless weston and
+/// the X11 screens: Mutter's is, through a RemoteDesktop finger.
+pub const TOUCH_WESTON_X11: &str = "weston's x11 backend gives its seat a pointer and a keyboard, no touch, and XTEST fakes no touchscreen (lane-bus xseat refuses a finger step); Mutter's is driven, through a RemoteDesktop finger";
+pub const TOUCH_WESTON: &str = "weston's headless backend advertises no wl_seat, so no touch reaches a client; Mutter's is driven, through a RemoteDesktop finger";
+pub const TOUCH_X11: &str = "the lane's X servers have no touch device, which XInput 2's touch events come from, and XTEST fakes no touchscreen; Mutter's is driven, through a RemoteDesktop finger";
+
+/// The seat's steps that type `text`, a key each: a space is `space`, any
+/// other character its own keysym.
+#[must_use]
+pub fn seat_taps(text: &str) -> Vec<String> {
+    text.chars()
+        .map(|c| match c {
+            ' ' => "tap:space".to_string(),
+            c => format!("tap:{c}"),
+        })
+        .collect()
+}
+
 /// What the drop types that no earlier row shows: awaited on the typed line.
 pub const DND_STEM: &str = "aterm-lane-dnd";
 
 /// A window pixel, `(x, y)`.
 type Px = (i32, i32);
+
+/// How a check types through the window system: XTEST on an X display (to
+/// an XIM `server` or not), or the RemoteDesktop keyboard (Mutter).
+#[derive(Clone, Copy)]
+enum Typist<'a> {
+    X { display: &'a str, server: bool },
+    Seat,
+}
 
 /// A decoded frame: RGBA pixels, row-major.
 struct Frame {
@@ -220,6 +272,97 @@ pub fn text_input_wire(log: &str) -> String {
         show(&requests),
         show(&events)
     )
+}
+
+/// The touch part of a client's Wayland wire log (`WAYLAND_DEBUG=client`):
+/// each request (`->`) it made for or on a touch (`wl_seat.get_touch`,
+/// `wl_touch.*`) and each `wl_touch` event, by interface and name, once
+/// each, in the order they first came.
+#[must_use]
+pub fn touch_wire(log: &str) -> String {
+    let mut requests: Vec<String> = Vec::new();
+    let mut events: Vec<String> = Vec::new();
+    for line in log.lines() {
+        let request = line.contains("->");
+        let named = |iface: &str| -> Option<String> {
+            let at = line.find(iface)?;
+            let rest = line[at + iface.len()..].strip_prefix(['@', '#'])?;
+            let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            let name: String = rest
+                .strip_prefix('.')?
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then(|| format!("{iface}.{name}"))
+        };
+        let entry = if request && line.contains(".get_touch(") {
+            Some("wl_seat.get_touch".to_string())
+        } else {
+            named("wl_touch")
+        };
+        let Some(entry) = entry else {
+            continue;
+        };
+        let list = if request { &mut requests } else { &mut events };
+        if !list.contains(&entry) {
+            list.push(entry);
+        }
+    }
+    let show = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(" ")
+        }
+    };
+    format!("requests {}; events {}", show(&requests), show(&events))
+}
+
+/// The arguments of the first `wl_touch.down` in a client's Wayland wire log
+/// past its serial, time and surface: the touch's id and its surface-local
+/// position, as logged.
+#[must_use]
+pub fn touch_down_at(log: &str) -> Option<String> {
+    let line = log
+        .lines()
+        .find(|l| !l.contains("->") && l.contains("wl_touch") && l.contains(".down("))?;
+    let args = line
+        .split(".down(")
+        .nth(1)?
+        .trim_end()
+        .trim_end_matches(')');
+    let parts: Vec<&str> = args.split(", ").collect();
+    (parts.len() == 6).then(|| format!("id {} at {},{}", parts[3], parts[4], parts[5]))
+}
+
+/// What a Wayland drag source's report `lines` (`lane-wl drag`'s) says past
+/// its first `seen` lines, once it says what `want` waits for; `None` until
+/// then. `want` is a target type (its last `target` line past `seen`) with
+/// the action `want.1` (its last `action` line anywhere), when one is wanted:
+/// the target, and the action when one came past `seen` (how many `target
+/// none` came on the way, while Mutter moved the drag's focus, follows the
+/// motions: the whole stream is measured). A `want.0` of `none` is the
+/// window's leave: `target none` past `seen` (Mutter tells the source so),
+/// else an `action none` there, the offer weston makes the client under the
+/// pointer next (weston 13 tells the source nothing at a leave, and its
+/// desktop-shell's panel and background take a drag's offer, as every
+/// client of its toolkit does, without accepting it: measured 2026-10-19,
+/// the source heard `action none` then `action copy` and no target).
+#[must_use]
+pub fn source_heard(lines: &[&str], seen: usize, want: (&str, Option<&str>)) -> Option<String> {
+    let new = lines.get(seen..).unwrap_or_default();
+    let target = new.iter().rev().find_map(|l| l.strip_prefix("target "));
+    let action = lines.iter().rev().find_map(|l| l.strip_prefix("action "));
+    let new_action = new.iter().rev().find_map(|l| l.strip_prefix("action "));
+    if target == Some(want.0) && want.1.is_none_or(|a| action == Some(a)) {
+        let mut said = format!("target {}", want.0);
+        if let Some(a) = new_action {
+            let _ = write!(said, ", action {a}");
+        }
+        return Some(said);
+    }
+    (want == ("none", None) && target.is_none() && new.contains(&"action none"))
+        .then(|| "action none".to_string())
 }
 
 /// The window's own frame as aterm-gui's `chrome` verb reports it (its
@@ -369,28 +512,30 @@ pub fn caption_slot_cols(cell_w: u32, scale: f64) -> u16 {
     }
 }
 
-/// How a header slot `[x0, x1)` × `[0, y1)` of frame `f` reads: `drawn` when
-/// more than a tenth of its pixels differ from the slot's top-left one (the
-/// bare band above the button row), else `bare`; and the count.
-fn slot_class(f: &Frame, x0: usize, x1: usize, y1: usize) -> (&'static str, usize) {
+/// How a header slot `[x0, x1)` × `[y0, y1)` of frame `f` reads: `drawn`
+/// when more than a tenth of its pixels differ from the slot's top-left one
+/// (the bare band above the button row), else `bare`; and the count. `y0` is
+/// where the band starts: the frame's top, or the foot of a stats Deck over
+/// it.
+fn slot_class(f: &Frame, x0: usize, x1: usize, y0: usize, y1: usize) -> (&'static str, usize) {
     let (x1, y1) = (x1.min(f.w), y1.min(f.h));
-    if x0 >= x1 || y1 == 0 {
+    if x0 >= x1 || y0 >= y1 {
         return ("bare", 0);
     }
     let px = |x: usize, y: usize| {
         let i = (y * f.w + x) * 4;
         f.rgba.get(i..i + 4)
     };
-    let ground = px(x0, 0);
+    let ground = px(x0, y0);
     let mut differ = 0;
-    for y in 0..y1 {
+    for y in y0..y1 {
         for x in x0..x1 {
             if px(x, y) != ground {
                 differ += 1;
             }
         }
     }
-    let class = if differ * 10 > (x1 - x0) * y1 {
+    let class = if differ * 10 > (x1 - x0) * (y1 - y0) {
         "drawn"
     } else {
         "bare"
@@ -1233,6 +1378,9 @@ struct Session<'a> {
     screen: Screen,
     /// lane-bus in the guest.
     bus: String,
+    /// aterm-wayland's `lane-wl` example in the guest: the Wayland drag
+    /// source.
+    wl: String,
     /// Where the run's report and fresh recordings go on this Mac (frames
     /// too).
     results: PathBuf,
@@ -1527,14 +1675,17 @@ impl Session<'_> {
     }
 
     /// A resize the window system makes (X11: the window's size set from
-    /// outside, as a window manager would), then the size put back.
+    /// outside, as a window manager would; Mutter: [`Self::mutter_os_resize`]),
+    /// then the size put back.
     fn os_resize(&mut self) {
         let Some(display) = self.x_display() else {
-            self.rec.not_driven(
-                "resize.os",
-                "no-resize-tool",
-                "no headless Wayland compositor here resizes a client from outside (no window manager tooling)",
-            );
+            match self.screen.display.seat() {
+                Some(Seat::RemoteDesktop) => self.mutter_os_resize(),
+                Some(Seat::Xtest) => self.weston_os_resize(),
+                None => self
+                    .rec
+                    .not_driven("resize.os", "no-resize-tool", RESIZE_OS_WESTON),
+            }
             return;
         };
         let Some(win) = self.x_window(&display) else {
@@ -1583,6 +1734,68 @@ impl Session<'_> {
                 .rec
                 .behaviour("resize.os.restored", format!("failed: {e}")),
         }
+    }
+
+    /// A resize the compositor makes under Mutter: its `toggle-tiled-left`
+    /// binding (Super+Left, through the RemoteDesktop keyboard while the
+    /// window has its focus) tiles the window to the screen's left half, at
+    /// a size the client never asked for, and the same binding again puts it
+    /// back. Mutter 46's keyboard resize (Alt+F8 and arrows) moved nothing a
+    /// RemoteDesktop keyboard drove (measured), so the tiling is the outside
+    /// resize here.
+    fn mutter_os_resize(&mut self) {
+        self.binding_os_resize("Super_L+Left", "Super+Left", "resize.os.tiled-left");
+    }
+
+    /// A resize the compositor makes under weston's x11 backend: desktop-shell's
+    /// maximize binding (Super+Shift+M, through XTEST while the window has
+    /// weston's keyboard focus) gives the window the output's work area, at a
+    /// size the client never asked for, and the same binding puts it back.
+    /// weston has no tiling, and its interactive resize binding (Super and a
+    /// right drag) is a gesture's, which the header item drives from the
+    /// window's own edge.
+    fn weston_os_resize(&mut self) {
+        self.binding_os_resize("Super_L+Shift_L+m", "Super+Shift+M", "resize.os.maximized");
+    }
+
+    /// The compositor's binding `chord` (`shown` in an error) pressed on the
+    /// seat's keyboard, the grid it moved to recorded as `key`, then pressed
+    /// again and the grid it went back to as `resize.os.restored`.
+    fn binding_os_resize(&mut self, chord: &str, shown: &str, key: &str) {
+        let grid = |r: &str| {
+            let mut it = r.split_whitespace().skip(1);
+            (it.next().map(str::to_string), it.next().map(str::to_string))
+        };
+        let was = grid(&self.ctl(&["dims"]).unwrap_or_default());
+        let step = format!("chord:{chord}");
+        let press = |s: &Self| {
+            s.seat_keys(&[step.as_str()])
+                .map_err(|e| format!("{shown}: {e}"))
+        };
+        let moved = press(self)
+            .and_then(|()| self.dims_until(&|r| grid(r) != was))
+            .and_then(|_| self.settled_dims());
+        let moved_ok = moved.is_ok();
+        self.rec.behaviour(
+            key,
+            match moved {
+                Ok(d) => dims_summary(&d),
+                Err(e) => format!("failed: {e}"),
+            },
+        );
+        if !moved_ok {
+            return;
+        }
+        let back = press(self)
+            .and_then(|()| self.dims_until(&|r| grid(r) == was))
+            .and_then(|_| self.settled_dims());
+        self.rec.behaviour(
+            "resize.os.restored",
+            match back {
+                Ok(d) => dims_summary(&d),
+                Err(e) => format!("failed: {e}"),
+            },
+        );
     }
 
     fn ledger(&mut self) {
@@ -1869,9 +2082,11 @@ impl Session<'_> {
         }
     }
 
-    fn mutter_selections(&mut self, wayland: &str) {
+    /// CLIPBOARD and PRIMARY through wl-clipboard and the screen's seat
+    /// (Mutter's RemoteDesktop session, or XTEST into weston's x11 backend).
+    fn wl_selections(&mut self, wayland: &str) {
         // CLIPBOARD out: the echo row selected, copied by Ctrl+Shift+C on the
-        // virtual keyboard, read by wl-paste while the keyboard lives (a
+        // seat's keyboard, read by wl-paste while the keyboard lives (a
         // client without a keyboard cannot read a selection on Mutter).
         let out = (|| -> Result<String, String> {
             let screen = self.ctl(&["text"])?;
@@ -1927,24 +2142,40 @@ impl Session<'_> {
                 Err(e) => format!("failed: {e}"),
             },
         );
-        self.mutter_primary(wayland);
+        self.wl_primary(wayland);
     }
 
-    /// PRIMARY under Mutter, from the RemoteDesktop pointer (LW.7 recorded it
-    /// on the sctk backend before switching): out, a real drag across the
-    /// echo row (copy-on-select) read by `wl-paste --primary`; in, `wl-copy
+    /// PRIMARY from the seat's pointer (under Mutter, LW.7 recorded it on the
+    /// sctk backend before switching): out, a real drag across the echo row
+    /// (copy-on-select) read by `wl-paste --primary`; in, `wl-copy
     /// --primary`'s text pasted by a real middle click over the grid. The
     /// seat moves only relatively, so each aim is made from where the window
-    /// reads its pointer (`pointer status`), as the header gestures aim.
-    fn mutter_primary(&mut self, wayland: &str) {
-        let out = self.mutter_primary_out(wayland);
+    /// reads its pointer (`pointer status`), as the header gestures aim. A
+    /// compositor that offers no primary selection (weston 13: wl-copy said
+    /// so, measured) has none to carry, and the line says so.
+    fn wl_primary(&mut self, wayland: &str) {
+        let info = self.wl(wayland, &["wayland-info"]);
+        let globals = wayland_globals(&info.text);
+        if !info.ok() || globals.is_empty() {
+            self.rec
+                .behaviour("primary", format!("failed: wayland-info: {}", info.tail(2)));
+            return;
+        }
+        if !globals.contains(PRIMARY_GLOBAL) {
+            self.rec.behaviour(
+                "primary",
+                format!("none: the compositor offers no {PRIMARY_GLOBAL}"),
+            );
+            return;
+        }
+        let out = self.wl_primary_out(wayland);
         self.rec.behaviour(
             "primary.out",
             out.unwrap_or_else(|e| format!("failed: {e}")),
         );
         let text = "WLPRIMARY-42";
         let want = "x-wlprimary-42";
-        let r = self.mutter_primary_in(wayland, text, want);
+        let r = self.wl_primary_in(wayland, text, want);
         self.stop_unit(&format!("{}wlcopy", guest::UNIT_PREFIX));
         self.rec.behaviour(
             "primary.in",
@@ -1983,7 +2214,7 @@ impl Session<'_> {
             .unwrap_or(1.0)
     }
 
-    fn mutter_primary_out(&mut self, wayland: &str) -> Result<String, String> {
+    fn wl_primary_out(&mut self, wayland: &str) -> Result<String, String> {
         let marks = format!("{}/primary", self.gui.dir);
         let mark = |name: &str| format!("{marks}/{name}");
         let fresh = self.sh(&[
@@ -2049,7 +2280,7 @@ impl Session<'_> {
         Ok(out)
     }
 
-    fn mutter_primary_in(&mut self, wayland: &str, text: &str, want: &str) -> Result<(), String> {
+    fn wl_primary_in(&mut self, wayland: &str, text: &str, want: &str) -> Result<(), String> {
         // wl-copy takes PRIMARY while a keyboard lives.
         let holder = self.seat_unit(&[])?;
         let copier = guest::Unit {
@@ -2123,12 +2354,27 @@ impl Session<'_> {
         self.appeared(want)
     }
 
-    /// `lane-bus seat <steps>` as a lane unit, so a keyboard lives while
-    /// another client acts: it touches `ready` once its keyboard has the
-    /// window's focus, runs `steps`, touches `done`, and lets go when
-    /// [`SeatUnit::stop`] says so. Returned once `ready` is there (a hang
-    /// detector).
+    /// The screen's seat driving `steps` as a lane unit, so a keyboard lives
+    /// while another client acts: under Mutter `lane-bus seat` (a
+    /// RemoteDesktop session), under weston's x11 backend `lane-bus xseat`
+    /// (XTEST on the X display weston is nested in). It touches `ready` once
+    /// its keyboard has the window's focus, runs `steps`, touches `done`, and
+    /// lets go when [`SeatUnit::stop`] says so. Returned once `ready` is there
+    /// (a hang detector).
     fn seat_unit(&self, steps: &[&str]) -> Result<SeatUnit, String> {
+        self.seat_unit_of(&format!("{}mutter", guest::UNIT_PREFIX), APP, steps)
+    }
+
+    /// [`Self::seat_unit`] of the compositor that is lane unit `compositor`
+    /// (a Mutter's; weston's x11 backend needs none named), for application
+    /// `app` (`-`: one whose focus is not awaited, and the steps then take it
+    /// themselves).
+    fn seat_unit_of(
+        &self,
+        compositor: &str,
+        app: &str,
+        steps: &[&str],
+    ) -> Result<SeatUnit, String> {
         let dir = format!("{}/seat", self.gui.dir);
         let seat = SeatUnit {
             name: format!("{}seat", guest::UNIT_PREFIX),
@@ -2146,29 +2392,38 @@ impl Session<'_> {
         if !fresh.ok() {
             return Err(format!("{dir}: {}", fresh.tail(2)));
         }
-        let mut argv = vec![
-            self.bus.clone(),
-            "seat".to_string(),
-            self.unit_pid(&format!("{}mutter", guest::UNIT_PREFIX))
-                .unwrap_or_else(|| "0".into()),
-            APP.into(),
+        let mut env = vec![(
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            format!("unix:path={}/bus", self.up().runtime),
+        )];
+        let mut argv = vec![self.bus.clone()];
+        match (self.screen.display.seat(), self.screen.display.input_x()) {
+            (Some(Seat::Xtest), Some(x)) => {
+                argv.push("xseat".into());
+                env.push(("DISPLAY".into(), x.into()));
+            }
+            _ => {
+                argv.push("seat".into());
+                argv.push(self.unit_pid(compositor).unwrap_or_else(|| "0".into()));
+            }
+        }
+        let verb = argv[1].clone();
+        argv.extend([
+            app.into(),
             self.pid().unwrap_or_else(|| "0".into()),
             format!("touch:{}", seat.ready),
-        ];
+        ]);
         argv.extend(steps.iter().map(|s| (*s).to_string()));
         argv.push(format!("touch:{}", seat.done));
         argv.push(format!("wait:{}", seat.stop));
         let unit = guest::Unit {
             name: seat.name.clone(),
-            env: vec![(
-                "DBUS_SESSION_BUS_ADDRESS".into(),
-                format!("unix:path={}/bus", self.up().runtime),
-            )],
+            env,
             argv,
             socket: String::new(),
         };
         if !self.sh(&guest::run_unit(&unit, None)).ok() {
-            return Err("lane-bus seat did not start".into());
+            return Err(format!("lane-bus {verb} did not start"));
         }
         if !self.sh(&guest::wait_file(&seat.ready, 60)).ok() {
             let why = self.unit_journal(&seat.name);
@@ -2206,7 +2461,7 @@ impl Session<'_> {
     }
 
     fn key_repeat(&mut self) {
-        let held = match (self.x_display(), self.screen.display) {
+        let held = match (self.x_display(), self.screen.display.seat()) {
             (Some(display), _) => {
                 let Some(win) = self.x_window(&display) else {
                     self.rec
@@ -2234,7 +2489,7 @@ impl Session<'_> {
                     Err(format!("the hold: {}", out.tail(2)))
                 }
             }
-            (None, Display::Mutter) => {
+            (None, Some(_)) => {
                 self.clear_line();
                 let hold = format!("sleep:{HOLD_MS}");
                 self.seat_unit(&["down:a", &hold, "up:a"])
@@ -2250,7 +2505,7 @@ impl Session<'_> {
                 self.rec.not_driven(
                     "keyrepeat",
                     "no-seat",
-                    "weston's headless backend advertises no wl_seat, so no key reaches a client (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)",
+                    "weston's headless backend advertises no wl_seat, so no key reaches a client (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)",
                 );
                 return;
             }
@@ -2303,22 +2558,37 @@ impl Session<'_> {
             .and_then(|m| proof::field(&m, "n_ime").and_then(|v| v.parse().ok()))
     }
 
-    /// A plain key, then a dead key and a letter, typed through the X
-    /// `display` between `echo X-` and `-Y`: what the shell printed, and
-    /// whether aterm counted IME events for it. The plain key must reach the
-    /// screen before the dead key goes, so the whole input path (an XIM
+    /// `steps` driven on the screen's seat in one session
+    /// ([`Self::seat_unit`]: Mutter's RemoteDesktop keyboard and pointer, or
+    /// XTEST into weston's x11 backend), which ends once they have gone.
+    fn seat_keys(&self, steps: &[&str]) -> Result<(), String> {
+        let seat = self.seat_unit(steps)?;
+        let done = seat.done(self);
+        seat.stop(self);
+        done
+    }
+
+    /// A plain key, then a dead key and a letter, typed through the window
+    /// system (`typist`) between `echo X-` and `-Y`: what the shell printed,
+    /// and whether aterm counted IME events for it. The plain key must reach
+    /// the screen before the dead key goes, so the whole input path (an XIM
     /// server's input context included) is live when it does: typed at once
     /// after the window took focus, the dead key was sometimes lost under
-    /// ibus (measured). Through an XIM `server` the letter is held down
-    /// until the composed letter is on the line ([`Self::held_letter`]).
-    fn composed(&self, display: &str, server: bool) -> String {
+    /// ibus (measured). Through an XIM server the letter is held down until
+    /// the composed letter is on the line ([`Self::held_letter`]).
+    fn composed(&self, typist: Typist<'_>) -> String {
         let before = self.ime_events();
         let r = (|| -> Result<String, String> {
             self.clear_line();
             self.ctl(&["send", COMPOSE_BEFORE])?;
-            let plain = self.x(display, &["xdotool", "key", "x"]);
-            if !plain.ok() {
-                return Err(format!("the plain key: {}", plain.tail(2)));
+            match typist {
+                Typist::X { display, .. } => {
+                    let plain = self.x(display, &["xdotool", "key", "x"]);
+                    if !plain.ok() {
+                        return Err(format!("the plain key: {}", plain.tail(2)));
+                    }
+                }
+                Typist::Seat => self.seat_keys(&["tap:x"])?,
             }
             self.typed(COMPOSE_LIVE)
                 .map_err(|_| format!("a plain key never reached the screen ({COMPOSE_LIVE})"))?;
@@ -2327,14 +2597,22 @@ impl Session<'_> {
             // line first. Keys that compose nothing pass the hang detector,
             // and the line then shows what they did.
             let composed = format!("{COMPOSE_LIVE}\u{e9}");
-            if server {
-                self.held_letter(display, &composed)?;
-            } else {
-                let typed = self.x(display, &["xdotool", "key", "dead_acute", "e"]);
-                if !typed.ok() {
-                    return Err(format!("the keys: {}", typed.tail(2)));
+            match typist {
+                Typist::X {
+                    display,
+                    server: true,
+                } => self.held_letter(display, &composed)?,
+                Typist::X { display, .. } => {
+                    let typed = self.x(display, &["xdotool", "key", "dead_acute", "e"]);
+                    if !typed.ok() {
+                        return Err(format!("the keys: {}", typed.tail(2)));
+                    }
+                    let _ = self.typed(&composed);
                 }
-                let _ = self.typed(&composed);
+                Typist::Seat => {
+                    self.seat_keys(&["tap:dead_acute", "tap:e"])?;
+                    let _ = self.typed(&composed);
+                }
             }
             self.ctl(&["send", COMPOSE_AFTER])?;
             self.ctl(&["key", "enter"])?;
@@ -2405,11 +2683,13 @@ impl Session<'_> {
     }
 
     /// Compose: `dead_acute` then `e` through the window system, with no
-    /// input-method server: Xlib's own compose on X11. (On Wayland the winit
-    /// fork composes with xkbcommon, which LW.7's aterm-xkb takes over, but no
-    /// headless keyboard here can type a dead key.)
+    /// input-method server: Xlib's own compose on X11; under Mutter, through
+    /// the RemoteDesktop keyboard on the baseline's `us intl` keymap
+    /// ([`guest::MUTTER_XKB_US`]), aterm-window's own compose over
+    /// libxkbcommon's table (aterm-xkb, LW.6-7). A bare Mutter runs no input
+    /// method, though the window enables text-input-v3: the keys reach it.
     fn compose(&mut self) {
-        let r = match (self.x_display(), self.screen.display) {
+        let r = match (self.x_display(), self.screen.display.seat()) {
             (Some(display), _) => {
                 let Some(win) = self.x_window(&display) else {
                     self.rec
@@ -2420,21 +2700,17 @@ impl Session<'_> {
                     self.rec.behaviour("compose", format!("failed: {e}"));
                     return;
                 }
-                self.composed(&display, false)
+                self.composed(Typist::X {
+                    display: &display,
+                    server: false,
+                })
             }
-            (None, Display::Mutter) => {
-                self.rec.not_driven(
-                    "compose",
-                    "no-keycode",
-                    "a bare Mutter's keymap is plain us, with no dead key (GNOME Shell sets the keymap on a desktop): RemoteDesktop finds no keycode for dead_acute (measured: \"No keycode found for keyval fe51\")",
-                );
-                return;
-            }
+            (None, Some(_)) => self.composed(Typist::Seat),
             (None, _) => {
                 self.rec.not_driven(
                     "compose",
                     "no-seat",
-                    "weston's headless backend advertises no wl_seat, so no key reaches a client (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)",
+                    "weston's headless backend advertises no wl_seat, so no key reaches a client (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)",
                 );
                 return;
             }
@@ -2566,6 +2842,232 @@ impl Session<'_> {
         self.clear_line();
     }
 
+    /// A Wayland drag from the screen's seat (Mutter's RemoteDesktop pointer,
+    /// or XTEST into weston's x11 backend): a second client, `lane-wl drag`,
+    /// drags [`DND_URI`] from a window of its own with the seat's pointer,
+    /// over aterm's window, away past its top-left corner and back, and drops
+    /// it. The source's window is maximized, so the pointer, at the screen's
+    /// centre (on aterm's window), presses on it wherever it is; it unmaps
+    /// once the drag has begun, and a motion then finds aterm's window under
+    /// the pointer. Recorded as XDND is on X11: what the source heard at each
+    /// point (`dnd.source.*`; the whole stream measured), the drop highlight
+    /// from three frames, and what the drop typed at the prompt. Each point
+    /// waits (a hang detector) for the source to have heard what the window
+    /// answered: aterm accepts `text/uri-list` and the copy action as the drag
+    /// enters, and the compositor tells the source.
+    fn wl_dnd(&mut self, wayland: &str) {
+        let marks = format!("{}/dnd", self.gui.dir);
+        let report = format!("{marks}/report");
+        let source = guest::Unit {
+            name: format!("{}lane-wl", guest::UNIT_PREFIX),
+            env: vec![("WAYLAND_DISPLAY".into(), wayland.into())],
+            argv: vec![
+                self.wl.clone(),
+                "drag".into(),
+                DND_URI.into(),
+                marks.clone(),
+            ],
+            socket: String::new(),
+        };
+        let mark = |name: &str| format!("{marks}/{name}");
+        let r = (|| -> Result<(), String> {
+            let made = self.sh(&[
+                "sh".into(),
+                "-c".into(),
+                "rm -rf \"$1\" \"$2\" && install -d \"$1\" \"$2\" && : > \"$1/$3\"".into(),
+                "dnd-files".into(),
+                DND_DIR.into(),
+                marks.clone(),
+                DND_FILE.into(),
+            ]);
+            if !made.ok() {
+                return Err(format!("the dropped file: {}", made.tail(2)));
+            }
+            self.clear_line();
+            let rest = self.frame("dnd-rest.png")?;
+            let steps = [
+                // From the top-left corner, where `lane-bus seat` parked its
+                // pointer, to the screen's centre, on aterm's window.
+                "move:640,400".to_string(),
+                format!("touch:{}", mark("centred")),
+                // The source's window, mapped over it: two motions make
+                // Mutter find the window under the pointer.
+                format!("wait:{}", mark("mapped")),
+                "move:1,0".to_string(),
+                "move:-1,0".to_string(),
+                format!("wait:{}", mark("pointed")),
+                "press:left".to_string(),
+                // The drag began and the source's window went: a motion
+                // finds aterm's window under the pointer again.
+                format!("wait:{}", mark("dragging")),
+                "move:1,1".to_string(),
+                format!("touch:{}", mark("over")),
+                format!("wait:{}", mark("hovered")),
+                format!("move:@{}", mark("to-away")),
+                format!("touch:{}", mark("away")),
+                format!("wait:{}", mark("left")),
+                format!("move:@{}", mark("to-back")),
+                format!("touch:{}", mark("back")),
+                format!("wait:{}", mark("returned")),
+                "release:left".to_string(),
+                format!("touch:{}", mark("released")),
+            ];
+            let words: Vec<&str> = steps.iter().map(String::as_str).collect();
+            let seat = self.seat_unit(&words)?;
+            let go = |name: &str| {
+                let _ = self.sh(&["touch".into(), mark(name)]);
+            };
+            let mut frames = Vec::new();
+            let mut heard = Vec::new();
+            let dragged = (|| -> Result<(), String> {
+                self.seat_reached(&seat, &marks, "centred")?;
+                let (x, y) = self.settled_px().map_err(|e| format!("centred: {e}"))?;
+                // Away: 20 seat pixels past the window's top-left corner,
+                // from where the pointer will be (one pixel right of and
+                // below the centre); back: the same way back.
+                let scale = self.dims_scale();
+                let logical = |px: i32| (f64::from(px) / scale).round() as i32;
+                let (ax, ay) = (-logical(x) - 21, -logical(y) - 21);
+                self.put_file(&mark("to-away"), &format!("{ax} {ay}"))?;
+                self.put_file(&mark("to-back"), &format!("{} {}", -ax, -ay))?;
+                if !self.sh(&guest::run_unit(&source, None)).ok() {
+                    return Err("lane-wl drag did not start".into());
+                }
+                // At each point, what the source heard since the last one; the
+                // window's answer is awaited by its target (and, entering, the
+                // copy action: Mutter 46 sends no action at a leave).
+                let mut seen = 0;
+                for (point, answer, want, frame) in [
+                    (
+                        "over",
+                        "hovered",
+                        ("text/uri-list", Some("copy")),
+                        Some("dnd-hover.png"),
+                    ),
+                    ("away", "left", ("none", None), Some("dnd-left.png")),
+                    ("back", "returned", ("text/uri-list", Some("copy")), None),
+                ] {
+                    self.seat_reached(&seat, &marks, point)?;
+                    let (new, lines) =
+                        self.source_heard_until(&report, seen, want).map_err(|e| {
+                            format!("{e}; the source: {}", self.unit_journal(&source.name))
+                        })?;
+                    seen = lines;
+                    heard.push((point, new));
+                    if let Some(name) = frame {
+                        frames.push(self.frame(name));
+                    }
+                    go(answer);
+                }
+                self.seat_reached(&seat, &marks, "released")?;
+                if !self.sh(&guest::wait_unit_gone(&source.name, 60)).ok() {
+                    return Err(format!(
+                        "the drag source never heard the drag end (60 s): {}",
+                        self.unit_journal(&source.name)
+                    ));
+                }
+                Ok(())
+            })();
+            let done = if dragged.is_ok() {
+                seat.done(self)
+            } else {
+                Ok(())
+            };
+            seat.stop(self);
+            self.stop_unit(&source.name);
+            let events = self.sh(&["cat".into(), report.clone()]).text;
+            for (point, new) in &heard {
+                self.rec
+                    .behaviour(&format!("dnd.source.{point}"), new.clone());
+            }
+            dragged?;
+            done?;
+            // What the source heard once the drop came: the lines after the
+            // last `action` (the drag's return), repeats in a row folded.
+            let tail: Vec<&str> = events
+                .lines()
+                .rev()
+                .take_while(|l| !l.starts_with("action ") && !l.starts_with("target "))
+                .collect();
+            let mut drop_seen: Vec<&str> = tail.into_iter().rev().collect();
+            drop_seen.dedup();
+            self.rec.behaviour(
+                "dnd.source.drop",
+                if drop_seen.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    drop_seen.join(", ")
+                },
+            );
+            self.rec
+                .measured("dnd.source.events", one_line(events.trim_end()));
+            let changes: Vec<(String, String)> = frames
+                .into_iter()
+                .map(|f| match f {
+                    Ok(f) => frame_change(&rest, &f),
+                    Err(e) => (format!("failed: {e}"), String::new()),
+                })
+                .collect();
+            let [hover, left] = changes.as_slice() else {
+                return Err("two frames".into());
+            };
+            self.rec.behaviour(
+                "dnd.highlight",
+                format!(
+                    "hovered against rest: {}; after the leave against rest: {}",
+                    hover.0, left.0
+                ),
+            );
+            self.rec.measured(
+                "dnd.highlight.pixels",
+                format!("hovered {}; after the leave {}", hover.1, left.1),
+            );
+            let dropped = self.typed(DND_STEM);
+            let screen = self.ctl(&["text"])?;
+            self.rec.behaviour(
+                "dnd.typed",
+                match dropped {
+                    Ok(()) => typed_line(&screen),
+                    Err(e) => format!("failed: {e}; the prompt line {:?}", typed_line(&screen)),
+                },
+            );
+            Ok(())
+        })();
+        if let Err(e) = r {
+            self.rec.behaviour("dnd", format!("failed: {e}"));
+        }
+        self.stop_unit(&source.name);
+        self.clear_line();
+    }
+
+    /// Wait (a hang detector) until the Wayland drag source's report, past
+    /// its first `seen` lines, says what `want` waits for ([`source_heard`]):
+    /// what the source then holds, and how many lines the report then had.
+    fn source_heard_until(
+        &self,
+        report: &str,
+        seen: usize,
+        want: (&str, Option<&str>),
+    ) -> Result<(String, usize), String> {
+        let t0 = Instant::now();
+        loop {
+            let text = self.sh(&["cat".into(), report.into()]).text;
+            let lines: Vec<&str> = text.lines().collect();
+            if let Some(said) = source_heard(&lines, seen, want) {
+                return Ok((said, lines.len()));
+            }
+            if t0.elapsed() > HANG {
+                return Err(format!(
+                    "the drag source never heard target {}{} (60 s): it heard {:?}",
+                    want.0,
+                    want.1.map(|a| format!(", action {a}")).unwrap_or_default(),
+                    lines.get(seen..).unwrap_or_default().join(", ")
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// The drag source's report, a behaviour line per answer.
     fn record_dnd_report(&mut self, report: &str) {
         let out = self.sh(&["cat".into(), report.into()]);
@@ -2682,7 +3184,10 @@ impl Session<'_> {
                 .x_window(&display)
                 .ok_or("xdotool found no window for the XIM aterm-gui")?;
             self.focus_x(&display, &win)?;
-            Ok(self.composed(&display, true))
+            Ok(self.composed(Typist::X {
+                display: &display,
+                server: true,
+            }))
         })();
         self.gui.stop();
         self.stop_unit(&ibus.name);
@@ -2761,6 +3266,410 @@ impl Session<'_> {
         );
     }
 
+    /// Wait (a hang detector) until the client's Wayland wire log `log` has
+    /// a line `pattern` (an extended regular expression) matches.
+    fn wire_until(&self, log: &str, pattern: &str) -> Result<(), String> {
+        let seen = self.sh(&[
+            "timeout".into(),
+            "60".into(),
+            "sh".into(),
+            "-c".into(),
+            "until grep -qE -e \"$2\" \"$1\"; do sleep 0.1; done".into(),
+            "wire-until".into(),
+            log.into(),
+            pattern.into(),
+        ]);
+        if seen.ok() {
+            Ok(())
+        } else {
+            Err(format!("the wire never showed /{pattern}/ (60 s)"))
+        }
+    }
+
+    /// A fresh aterm-gui under `display` (its socket in `extra`, if it is
+    /// not the screen's own), its Wayland wire written to `log`
+    /// (`WAYLAND_DEBUG=client`), started and `ready`.
+    fn logged_gui(&self, log: &str, extra: &[(String, String)]) -> Result<(), String> {
+        self.gui.prepare()?;
+        let mut env = vec![("WAYLAND_DEBUG".to_string(), "client".to_string())];
+        env.extend(extra.iter().cloned());
+        let invocation = self
+            .gui
+            .start_logged(Some(self.screen.display), &env, log)?;
+        if !self.sh(&guest::wait_socket(&self.gui.sock(), 60)).ok() {
+            return Err(format!(
+                "aterm-gui never listened (60 s): {}",
+                crate::util::one_line(&self.gui.journal(&invocation), 300)
+            ));
+        }
+        let r = self.ctl(&["ready", "60000"])?;
+        if r.starts_with("OK ready") {
+            Ok(())
+        } else {
+            Err(format!("`ready` answered {r}"))
+        }
+    }
+
+    /// Keep a client's wire log beside the report, and return it.
+    fn keep_wire(&self, log: &str, what: &str) -> String {
+        let wire = self.sh(&["cat".into(), log.into()]).text;
+        let _ = std::fs::write(
+            self.results.join(format!(
+                "{}-{}-{what}.txt",
+                self.arch.name(),
+                self.screen.name()
+            )),
+            &wire,
+        );
+        wire
+    }
+
+    /// Touch under Mutter: a finger through the RemoteDesktop session's
+    /// touchscreen, which Mutter places in a screencast stream's space, in
+    /// the monitor's pixels (`lane-bus seat` records the monitor, and taps
+    /// once first: Mutter makes the touchscreen with that tap, which no
+    /// client hears). The finger goes down where the pointer sits on aterm's
+    /// window, moves and lifts, once aterm-gui has asked for the touch
+    /// (`wl_seat.get_touch`, a hang detector). aterm-gui does nothing with a
+    /// touch (its `WindowEvent::Touch` only ends an update hand-off), so what
+    /// is recorded is what the window heard (the wire), that the screen
+    /// stayed as it was, and, measured, where the touch landed against the
+    /// pointer (surface-local, logical pixels both).
+    fn touch(&mut self) {
+        if self.screen.display != Display::Mutter {
+            return;
+        }
+        let log = format!("{}/touch-wayland-debug.txt", self.gui.dir);
+        let marks = format!("{}/touch", self.gui.dir);
+        let mark = |name: &str| format!("{marks}/{name}");
+        let r = (|| -> Result<(String, String, String), String> {
+            self.logged_gui(&log, &[])?;
+            let fresh = self.sh(&[
+                "sh".into(),
+                "-c".into(),
+                "rm -rf \"$1\" && install -d \"$1\"".into(),
+                "touch-marks".into(),
+                marks.clone(),
+            ]);
+            if !fresh.ok() {
+                return Err(format!("{marks}: {}", fresh.tail(2)));
+            }
+            let before = self.settled_text()?;
+            let steps = [
+                "move:640,400".to_string(),
+                format!("touch:{}", mark("centred")),
+                format!("wait:{}", mark("aimed")),
+                format!("finger-down:@{}", mark("at")),
+                format!("finger-move:@{}", mark("to")),
+                "finger-up:".to_string(),
+                format!("touch:{}", mark("lifted")),
+                format!("wait:{}", mark("heard")),
+            ];
+            let words: Vec<&str> = steps.iter().map(String::as_str).collect();
+            let seat = self.seat_unit(&words)?;
+            let mut pointer = String::new();
+            let touched = (|| -> Result<(), String> {
+                self.seat_reached(&seat, &marks, "centred")?;
+                let (px, py) = self
+                    .settled_px()
+                    .map_err(|e| format!("the pointer on the window: {e}"))?;
+                let scale = self.dims_scale();
+                pointer = format!("{:.2},{:.2}", f64::from(px) / scale, f64::from(py) / scale);
+                let (x, y) = (
+                    (640.0 * scale).round() as i32,
+                    (400.0 * scale).round() as i32,
+                );
+                self.put_file(&mark("at"), &format!("{x} {y}"))?;
+                self.put_file(&mark("to"), &format!("{} {}", x + 15, y + 15))?;
+                self.wire_until(&log, r"get_touch\(")?;
+                let _ = self.sh(&["touch".into(), mark("aimed")]);
+                self.seat_reached(&seat, &marks, "lifted")?;
+                self.wire_until(&log, r"wl_touch[@#][0-9]+\.up\(")?;
+                let _ = self.sh(&["touch".into(), mark("heard")]);
+                Ok(())
+            })();
+            let done = if touched.is_ok() {
+                seat.done(self)
+            } else {
+                Ok(())
+            };
+            seat.stop(self);
+            touched?;
+            done?;
+            let after = self.settled_text()?;
+            let screen = if after == before {
+                "the screen as it was".to_string()
+            } else {
+                format!(
+                    "the screen changed: {:?}",
+                    after
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                )
+            };
+            self.gui.stop();
+            let wire = self.keep_wire(&log, "touch-wayland-debug");
+            let landed = format!(
+                "touch {}; the pointer at {pointer}",
+                touch_down_at(&wire).unwrap_or_else(|| "down not logged".into())
+            );
+            Ok((touch_wire(&wire), screen, landed))
+        })();
+        self.gui.stop();
+        match r {
+            Ok((wire, screen, landed)) => {
+                self.rec.behaviour("touch.wire", wire);
+                self.rec.behaviour("touch.screen", screen);
+                self.rec.measured("touch.at", landed);
+            }
+            Err(e) => self.rec.behaviour("touch", format!("failed: {e}")),
+        }
+    }
+
+    /// An input method composing through text-input-v3, under GNOME Shell
+    /// (Mutter and its IBus bridge: the one input method that reaches
+    /// Mutter's `zwp_text_input_manager_v3`), in place of the screen's bare
+    /// Mutter, on the same monitor and settings ([`Screen::gnome_shell`]).
+    /// GNOME Shell starts IBus and gives it the engine of its `us+intl`
+    /// source, `xkb:us::eng`, whose engine process is awaited (a hang
+    /// detector). A fresh aterm-gui comes up on it; GNOME Shell gives a new
+    /// window no focus until it is clicked, so the RemoteDesktop pointer
+    /// clicks it, once aterm-gui has its pointer, and the keys wait for its
+    /// text input's `enable`. Then [`IME_COMPOSED`]: a plain `x` seen on the
+    /// typed line, and a burst of BackSpace, `dead_acute` and `e` with
+    /// aterm-gui stopped (`SIGSTOP`) across it, continued once GNOME Shell's
+    /// own wire log (`WAYLAND_DEBUG=server`) shows the commit and the `e`'s
+    /// release posted to it (hang detectors), so the BackSpace and the commit
+    /// reach aterm-gui in one read and one dispatch (fb676e9b67). Unstopped,
+    /// the BackSpace reached it 3 to 39 ms before the commit, a dispatch of
+    /// its own (measured), and nothing held the order. The wire says the
+    /// letter came as an input method's commit, not a key.
+    fn text_input_v3_ime(&mut self) {
+        if self.screen.display != Display::Mutter {
+            return;
+        }
+        let Some(mut shell) = self.screen.gnome_shell(&self.up().runtime) else {
+            return;
+        };
+        // Outside the session's directory, which `logged_gui` empties.
+        let shell_log = format!("{}/{}-wire.txt", self.up().runtime, shell.name);
+        shell.env.push(("WAYLAND_DEBUG".into(), "server".into()));
+        shell
+            .env
+            .push(("ATERM_LANE_STDERR".into(), shell_log.clone()));
+        let mut argv = vec![
+            "sh".to_string(),
+            "-c".into(),
+            "exec \"$0\" \"$@\" 2>\"$ATERM_LANE_STDERR\"".into(),
+        ];
+        argv.append(&mut shell.argv);
+        shell.argv = argv;
+        let log = format!("{}/ime-wayland-debug.txt", self.gui.dir);
+        let marks = format!("{}/ime", self.gui.dir);
+        let mark = |name: &str| format!("{marks}/{name}");
+        for (pkg, key) in [("gnome-shell", "ime.gnome-shell"), ("ibus", "ime.ibus")] {
+            let v = self.sh(&[
+                "dpkg-query".into(),
+                "-W".into(),
+                "-f".into(),
+                "${Version}".into(),
+                pkg.into(),
+            ]);
+            if v.ok() {
+                self.rec.stack(key, v.text.trim());
+            }
+        }
+        // What GNOME Shell said on its stderr, its wire lines left out.
+        let shell_said = || {
+            let said = self.sh(&[
+                "sh".into(),
+                "-c".into(),
+                "grep -v '^\\[' \"$1\" | tail -n 3".into(),
+                "shell-said".into(),
+                shell_log.clone(),
+            ]);
+            crate::util::one_line(&said.text, 300)
+        };
+        let before = std::cell::Cell::new(None);
+        let r = (|| -> Result<String, String> {
+            // The screen's own Mutter goes first: one compositor answers
+            // for RemoteDesktop and the screen's monitor.
+            self.stop_unit(&format!("{}mutter", guest::UNIT_PREFIX));
+            if !self.sh(&guest::run_unit(&shell, None)).ok() {
+                return Err("gnome-shell did not start".into());
+            }
+            if !self.sh(&guest::wait_socket(&shell.socket, 60)).ok() {
+                return Err(format!(
+                    "gnome-shell never listened (60 s): {}",
+                    shell_said()
+                ));
+            }
+            let engine = self.sh(&[
+                "timeout".into(),
+                "60".into(),
+                "sh".into(),
+                "-c".into(),
+                "cg=/sys/fs/cgroup$(systemctl --user show -p ControlGroup --value \"$1\") && \
+                 until for p in $(cat \"$cg/cgroup.procs\"); do cat \"/proc/$p/comm\" 2>/dev/null; done \
+                 | grep -q '^ibus-engine-sim'; do sleep 0.1; done"
+                    .into(),
+                "ibus-engine".into(),
+                format!("{}.service", shell.name),
+            ]);
+            if !engine.ok() {
+                return Err(format!(
+                    "GNOME Shell's IBus never ran an engine (60 s): {}",
+                    shell_said()
+                ));
+            }
+            self.logged_gui(&log, &[("WAYLAND_DISPLAY".into(), shell.socket.clone())])?;
+            before.set(self.ime_events());
+            let fresh = self.sh(&[
+                "sh".into(),
+                "-c".into(),
+                "rm -rf \"$1\" && install -d \"$1\"".into(),
+                "ime-marks".into(),
+                marks.clone(),
+            ]);
+            if !fresh.ok() {
+                return Err(format!("{marks}: {}", fresh.tail(2)));
+            }
+            let steps = [
+                // The pointer, made and parked in the top-left corner; a
+                // motion waits until the window has it.
+                "move:-4000,-4000".to_string(),
+                format!("touch:{}", mark("parked")),
+                format!("wait:{}", mark("bound")),
+                "move:640,400".to_string(),
+                "move:1,0".to_string(),
+                "move:-1,0".to_string(),
+                "press:left".to_string(),
+                "release:left".to_string(),
+                format!("touch:{}", mark("clicked")),
+                format!("wait:{}", mark("focused")),
+                "tap:x".to_string(),
+                format!("touch:{}", mark("plain")),
+                format!("wait:{}", mark("plain-seen")),
+                "tap:BackSpace".to_string(),
+                "tap:dead_acute".to_string(),
+                "tap:e".to_string(),
+                format!("touch:{}", mark("keyed")),
+            ];
+            let words: Vec<&str> = steps.iter().map(String::as_str).collect();
+            let seat = self.seat_unit_of(&shell.name, "-", &words)?;
+            let go = |name: &str| {
+                let _ = self.sh(&["touch".into(), mark(name)]);
+            };
+            let stopped = std::cell::Cell::new(false);
+            let keyed = (|| -> Result<(), String> {
+                self.seat_reached(&seat, &marks, "parked")?;
+                self.wire_until(&log, r"get_pointer\(")?;
+                go("bound");
+                self.seat_reached(&seat, &marks, "clicked")?;
+                self.wire_until(&log, r"-> zwp_text_input_v3[@#][0-9]+\.enable\(")
+                    .map_err(|e| format!("the click gave the window no focus: {e}"))?;
+                self.ctl(&["send", COMPOSE_BEFORE])?;
+                self.typed(COMPOSE_BEFORE)?;
+                go("focused");
+                self.seat_reached(&seat, &marks, "plain")?;
+                self.typed(COMPOSE_LIVE).map_err(|_| {
+                    format!("a plain key never reached the screen ({COMPOSE_LIVE})")
+                })?;
+                // Stopped across the burst, so all of it waits in the
+                // socket and one read takes it.
+                if !self.gui.signal("SIGSTOP") {
+                    return Err("aterm-gui would not stop".into());
+                }
+                stopped.set(true);
+                go("plain-seen");
+                self.seat_reached(&seat, &marks, "keyed")?;
+                self.wire_until(
+                    &shell_log,
+                    "-> zwp_text_input_v3[@#][0-9]+\\.commit_string\\(\"\u{e9}\"\\)",
+                )
+                .map_err(|e| format!("GNOME Shell never posted the commit: {e}"))?;
+                self.wire_until(
+                    &shell_log,
+                    r"-> wl_keyboard[@#][0-9]+\.key\([0-9]+, [0-9]+, 18, 0\)",
+                )
+                .map_err(|e| format!("GNOME Shell never posted the e's release: {e}"))?;
+                Ok(())
+            })();
+            let continued = !stopped.get() || self.gui.signal("SIGCONT");
+            let done = if keyed.is_ok() {
+                seat.done(self)
+            } else {
+                Ok(())
+            };
+            seat.stop(self);
+            keyed?;
+            if !continued {
+                return Err("aterm-gui would not continue".into());
+            }
+            done?;
+            // The composed letter on the typed line first (a hang detector;
+            // keys that compose nothing pass it, and the line shows what
+            // they did), then the suffix.
+            let _ = self.typed(&format!("{COMPOSE_BEFORE}\u{e9}"));
+            self.ctl(&["send", COMPOSE_AFTER])?;
+            self.ctl(&["key", "enter"])?;
+            if self.appeared(IME_COMPOSED).is_ok() {
+                Ok(format!("{IME_COMPOSED} printed"))
+            } else {
+                let screen = self.ctl(&["text"]).unwrap_or_default();
+                let shown = screen
+                    .lines()
+                    .rev()
+                    .find(|l| l.starts_with("X-"))
+                    .unwrap_or("nothing")
+                    .to_string();
+                Ok(format!(
+                    "{IME_COMPOSED} never printed; the shell printed {shown:?}"
+                ))
+            }
+        })();
+        let ime = match (before.get(), self.ime_events()) {
+            (Some(b), Some(a)) if a > b => "IME events",
+            (Some(_), Some(_)) => "no IME event",
+            _ => "IME events unread",
+        };
+        self.gui.stop();
+        self.stop_unit(&shell.name);
+        // GNOME Shell's side of the keyboard and the text input, beside the
+        // report; the whole log goes.
+        let posted = self.sh(&[
+            "sh".into(),
+            "-c".into(),
+            "grep -E 'zwp_text_input_v3|wl_keyboard' \"$1\"; rm -f \"$1\"".into(),
+            "shell-wire".into(),
+            shell_log.clone(),
+        ]);
+        let _ = std::fs::write(
+            self.results.join(format!(
+                "{}-{}-ime-shell-wayland-debug.txt",
+                self.arch.name(),
+                self.screen.name()
+            )),
+            &posted.text,
+        );
+        match r {
+            Ok(what) => {
+                self.rec
+                    .behaviour("text-input-v3.ime", format!("{what}; {ime}"));
+                let wire = self.keep_wire(&log, "ime-wayland-debug");
+                self.rec
+                    .behaviour("text-input-v3.ime.wire", text_input_wire(&wire));
+            }
+            Err(e) => {
+                let _ = self.keep_wire(&log, "ime-wayland-debug");
+                self.rec
+                    .behaviour("text-input-v3.ime", format!("failed: {e}"));
+            }
+        }
+    }
+
     /// The front window's `strip-caption` (LW.5), or why not.
     fn caption(&self) -> Result<Caption, String> {
         let chrome = self.ctl(&["chrome"])?;
@@ -2798,8 +3707,14 @@ impl Session<'_> {
     fn click_button(&self, caption: &Caption, name: &str) -> Result<(), String> {
         let col = caption
             .middle(name)
-            .ok_or_else(|| format!("no {name} button (buttons={})", caption.names()))?
-            .to_string();
+            .ok_or_else(|| format!("no {name} button (buttons={})", caption.names()))?;
+        self.click_strip(col)
+    }
+
+    /// Click the strip at column `col`: the pointer on the chrome row that
+    /// is the strip ([`Self::click_button`]), then `pointer click`.
+    fn click_strip(&self, col: u16) -> Result<(), String> {
+        let col = col.to_string();
         let d = self.ctl(&["dims"])?;
         let num = |k: &str| proof::field(&d, k).and_then(|v| v.parse::<u32>().ok());
         let strip_bottom = num("pad_top").unwrap_or(0)
@@ -2896,7 +3811,7 @@ impl Session<'_> {
             let x = |c: u16| (pad + u32::from(c) * cell_w) as usize;
             let (mut classes, mut counts) = (Vec::new(), Vec::new());
             for (s, e) in slots {
-                let (class, n) = slot_class(&f, x(s), x(e), band as usize);
+                let (class, n) = slot_class(&f, x(s), x(e), 0, band as usize);
                 classes.push(class);
                 counts.push(n.to_string());
             }
@@ -3025,17 +3940,19 @@ impl Session<'_> {
         }
     }
 
-    /// LW.5 under Mutter: the frame's gestures from a real seat, which the
-    /// control socket cannot make (a compositor move, resize or window menu
-    /// takes a press's serial): a second aterm-gui with `WAYLAND_DEBUG=client`
-    /// and a RemoteDesktop pointer, aimed from what the window reads back
-    /// (`pointer status`'s `px=`). A press on the bare band dragged 40,30
-    /// after the move starts (the window follows the pointer, so the pointer
-    /// ends where it started on the window), a press on the right edge
-    /// dragged 60 px right (the window widens), and a right press on the band
-    /// (the window menu); with the `xdg_toplevel` requests the wire log shows.
+    /// LW.5 under a seat (Mutter's RemoteDesktop, or XTEST into weston's x11
+    /// backend): the frame's gestures, which the control socket cannot make
+    /// (a compositor move, resize or window menu takes a press's serial): a
+    /// second aterm-gui with `WAYLAND_DEBUG=client` and the seat's pointer,
+    /// aimed from what the window reads back (`pointer status`'s `px=`). A
+    /// press on the bare band dragged 40,30 (40 left where the screen's right
+    /// would leave no room for the edge's drag) after the move starts (the
+    /// window follows the pointer, so the pointer ends where it started on the
+    /// window), a press on the right edge dragged 60 px right (the window
+    /// widens), and a right press on the band (the window menu); with the
+    /// `xdg_toplevel` requests the wire log shows.
     fn header_gestures(&mut self) {
-        if self.screen.display != Display::Mutter {
+        if self.screen.display.seat().is_none() {
             return;
         }
         let r = self.header_gestures_run();
@@ -3091,7 +4008,7 @@ impl Session<'_> {
             return Err(format!("{marks}: {}", fresh.tail(2)));
         }
         let invocation = self.gui.start_logged(
-            Some(Display::Mutter),
+            Some(self.screen.display),
             &[("WAYLAND_DEBUG".into(), "client".into())],
             &log,
         )?;
@@ -3137,7 +4054,7 @@ impl Session<'_> {
             "press:left".to_string(),
             "move:6,0".to_string(),
             "sleep:300".to_string(),
-            "move:40,30".to_string(),
+            format!("move:@{}", mark("to-move")),
             "sleep:300".to_string(),
             "release:left".to_string(),
             format!("touch:{}", mark("moved")),
@@ -3190,6 +4107,15 @@ impl Session<'_> {
             let (bx, by) = self
                 .px_at(band, slack)
                 .map_err(|e| format!("on the band: {e}"))?;
+            // The move: 40 seat pixels right and 30 down, or left when the
+            // right edge would then leave too little of the screen for the
+            // edge's 60 px drag. The pointer sits at the screen's centre, so the
+            // window's left edge is that far left of it: Mutter centres a new
+            // window, and weston's desktop-shell places one at random.
+            let left = guest::SCREEN.0 / 2 - logical(x);
+            let room = guest::SCREEN.0 - (left + 46 + logical(w));
+            let dx = if room > 60 + 2 * slack { 40 } else { -40 };
+            self.put_file(&mark("to-move"), &format!("{dx} 30"))?;
             go("drag-band");
             self.seat_reached(&seat, &marks, "moved")?;
             let (mx, my) = self
@@ -3265,37 +4191,178 @@ impl Session<'_> {
         Ok(lines)
     }
 
+    /// LW.6's Wayland CPU presenter (`wl_shm`) driven by a seat: under weston's
+    /// x11 backend, the one weston here whose seat has a keyboard and a pointer
+    /// (XTEST, [`Seat::Xtest`]). A second aterm-gui with `--cpu`, typed at and
+    /// resized only through that seat: [`CPU_TYPED`] and Return on its
+    /// keyboard, desktop-shell's maximize binding (Super+Shift+M), the proof's
+    /// [`proof::MORE`] typed and not entered (a frame that changes one row),
+    /// and the binding again. After each change the frame aterm presented is
+    /// held to weston's own output pixels where its scene graph puts the
+    /// window, exactly, as the proof's headless CPU row holds it
+    /// ([`Gui::held_to_server`]; weston-x11 runs with `--debug`). Maximized,
+    /// the window's surface is not whole cells: the frame sits at `dims`'
+    /// offset in it, and the remainder bands around it must each be the
+    /// frame's nearest pixel ([`proof::bands_held`]).
+    /// The seat's first session parks the pointer in the top-left corner, on
+    /// desktop-shell's panel, so no cursor is drawn over the window and no
+    /// button of its header is hovered.
+    fn cpu_seat(&mut self) {
+        if self.screen.display.seat() != Some(Seat::Xtest) {
+            return;
+        }
+        self.gui.cpu = true;
+        let r = self.cpu_seat_run();
+        self.gui.stop();
+        self.gui.cpu = false;
+        match r {
+            Ok(lines) => {
+                for (behaviour, key, value) in lines {
+                    if behaviour {
+                        self.rec.behaviour(&key, value);
+                    } else {
+                        self.rec.measured(&key, value);
+                    }
+                }
+            }
+            Err(e) => self.rec.behaviour("cpu.seat", format!("failed: {e}")),
+        }
+    }
+
+    /// [`Self::cpu_seat`]'s session: its lines (`true` for behaviour), or why
+    /// it could not run.
+    fn cpu_seat_run(&self) -> Result<Vec<(bool, String, String)>, String> {
+        self.gui.prepare()?;
+        let invocation = self.gui.start(Some(self.screen.display), &[])?;
+        let mut lines: Vec<(bool, String, String)> = Vec::new();
+        let r = (|| -> Result<(), String> {
+            if !self.sh(&guest::wait_socket(&self.gui.sock(), 60)).ok() {
+                return Err("aterm-gui --cpu never listened (60 s)".into());
+            }
+            let r = self.ctl(&["ready", "60000"])?;
+            if !r.starts_with("OK ready") {
+                return Err(format!("`ready` answered {r}"));
+            }
+            let start = self.settled_dims()?;
+            lines.push((true, "cpu.start.dims".into(), dims_summary(&start)));
+            // `move:0,0` makes xseat park the pointer before the keys.
+            let mut typed = vec!["move:0,0".to_string()];
+            typed.extend(seat_taps(CPU_TYPED));
+            typed.push("tap:Return".into());
+            self.seat_keys(&typed.iter().map(String::as_str).collect::<Vec<_>>())?;
+            if !self.matched(&format!("^{}\\s*$", regex_literal(CPU_ECHO))) {
+                return Err(format!(
+                    "`{CPU_TYPED}` typed on the seat, and {CPU_ECHO} never appeared (60 s)"
+                ));
+            }
+            lines.push((
+                true,
+                "cpu.echo".into(),
+                format!("typed `{CPU_TYPED}` on the seat, {CPU_ECHO} appeared"),
+            ));
+            let grid = |r: &str| {
+                let mut it = r.split_whitespace().skip(1);
+                (it.next().map(str::to_string), it.next().map(str::to_string))
+            };
+            let was = grid(&start);
+            let binding = ["chord:Super_L+Shift_L+m"];
+            self.seat_keys(&binding)
+                .map_err(|e| format!("Super+Shift+M: {e}"))?;
+            self.dims_until(&|r| grid(r) != was)?;
+            let d = self.settled_dims()?;
+            lines.push((true, "cpu.maximized".into(), dims_summary(&d)));
+            lines.extend(self.cpu_held("maximized"));
+            let more = seat_taps(proof::MORE);
+            self.seat_keys(&more.iter().map(String::as_str).collect::<Vec<_>>())?;
+            self.typed(proof::MORE)?;
+            lines.extend(self.cpu_held("typed"));
+            self.seat_keys(&binding)
+                .map_err(|e| format!("Super+Shift+M again: {e}"))?;
+            self.dims_until(&|r| grid(r) == was)?;
+            let d = self.settled_dims()?;
+            lines.push((true, "cpu.restored".into(), dims_summary(&d)));
+            lines.extend(self.cpu_held("restored"));
+            Ok(())
+        })();
+        if let Err(why) = r {
+            let journal = self.gui.journal(&invocation);
+            let kept = self.gui.keep_crash_reports(&self.results);
+            return Err(format!(
+                "{why}; aterm-gui's journal: {}{kept}",
+                crate::util::one_line(&journal, 400)
+            ));
+        }
+        Ok(lines)
+    }
+
+    /// The CPU item's lines after its `phase`: what drew the frame
+    /// (`status`'s `render=`, `metrics`' `backend=`), and whether weston's
+    /// output shows that frame exactly, with the pixel hold's detail as a
+    /// measured line (where weston placed the window moves run to run).
+    fn cpu_held(&self, phase: &str) -> Vec<(bool, String, String)> {
+        let render = self
+            .ctl(&["status"])
+            .ok()
+            .and_then(|s| proof::field(&s, "render").map(str::to_string));
+        let backend = self
+            .ctl(&["metrics"])
+            .ok()
+            .and_then(|m| proof::field(&m, "backend").map(str::to_string));
+        let drawn = format!(
+            "render={} backend={}",
+            render.as_deref().unwrap_or("?"),
+            backend.as_deref().unwrap_or("?")
+        );
+        let held =
+            self.gui
+                .held_to_server(self.screen.display, &self.results, &format!("-cpu-{phase}"));
+        let (pixels, detail) = match held {
+            Ok(detail) => (
+                "weston's output shows the presented frame exactly".to_string(),
+                detail,
+            ),
+            Err(e) => (format!("failed: {e}"), String::new()),
+        };
+        let mut lines = vec![
+            (true, format!("cpu.{phase}.drawn"), drawn),
+            (true, format!("cpu.{phase}.pixels"), pixels),
+        ];
+        if !detail.is_empty() {
+            lines.push((false, format!("cpu.{phase}.pixels.detail"), detail));
+        }
+        lines
+    }
+
     /// What a later step can compare against for input it could not drive.
     fn not_driven(&mut self) {
         match self.screen.display {
-            Display::Mutter => {
+            Display::Mutter => {}
+            Display::WestonX11 => {
                 self.rec.not_driven(
-                    "text-input-v3.compose",
-                    "no-im-bridge",
-                    "the client's half of text-input-v3 is recorded (text-input-v3.client), but no input method composes through it: one reaches Mutter's zwp_text_input_manager_v3 only through GNOME Shell's IBus bridge, which a bare headless Mutter does not run (by reading Mutter 46 and GNOME Shell, not a run), and its keymap has no dead key to compose",
+                    "text-input-v3",
+                    "v1-only",
+                    "weston 13 offers zwp_text_input_manager_v1 only, which aterm-window does not bind",
                 );
-                self.rec.not_driven(
-                    "dnd",
-                    "no-pointer-motion",
-                    "a Wayland drag needs a pointer that moves over the window with a button held, from a client with a seat serial; Mutter's RemoteDesktop pointer moves absolutely only within a screencast stream, which the lane does not open (not tried)",
-                );
+                self.rec
+                    .not_driven("touch", "no-touchscreen", TOUCH_WESTON_X11);
             }
             Display::Weston => {
                 self.rec.not_driven(
                     "text-input-v3",
                     "v1-only",
-                    "weston 13 offers zwp_text_input_manager_v1 only, which the winit fork does not bind",
+                    "weston 13 offers zwp_text_input_manager_v1 only, which aterm-window does not bind",
                 );
                 self.rec.not_driven(
                     "header.gestures",
                     "no-seat",
-                    "the frame's move, resize and window menu take a press's serial from a seat, and weston's headless backend has none (header.maximize is driven: maximize takes no serial)",
+                    "the frame's move, resize and window menu take a press's serial from a seat, and weston's headless backend has none (header.maximize is driven: maximize takes no serial; the weston-x11 screen drives the gestures from its x11 backend's seat)",
                 );
                 self.rec.not_driven(
                     "dnd",
                     "no-seat",
-                    "weston's headless backend advertises no wl_seat, and a drag starts from a seat's pointer (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)",
+                    "weston's headless backend advertises no wl_seat, and a drag starts from a seat's pointer (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)",
                 );
+                self.rec.not_driven("touch", "no-seat", TOUCH_WESTON);
             }
             Display::Xvfb | Display::Xwayland => {
                 self.rec.not_driven(
@@ -3303,6 +4370,7 @@ impl Session<'_> {
                     "system-frame",
                     "an X11 window's frame is the window manager's (this lane runs none), so aterm draws no header and its band is not caption",
                 );
+                self.rec.not_driven("touch", "no-touchscreen", TOUCH_X11);
             }
         }
     }
@@ -3387,10 +4455,11 @@ fn record_session(
     arch: Arch,
     screen: Screen,
     bin: &str,
-    bus: &str,
+    probes: (&str, &str),
     lock: &str,
     results: &Path,
 ) -> Result<Recording, String> {
+    let (bus, wl) = probes;
     let dir = format!(
         "/tmp/{}{}-{}",
         guest::UNIT_PREFIX,
@@ -3403,21 +4472,16 @@ fn record_session(
         dir: dir.clone(),
         name: format!("{}-{}", arch.name(), screen.name()),
         cpu: false,
+        deck: false,
     };
     gui.prepare().map_err(|e| format!("scratch world: {e}"))?;
-    linux::start_screen(up, screen)?;
-    if let Some(step) = screen.baseline_keymap() {
-        let out = up.lima.shell(&up.home, &step.argv, None);
-        if !out.ok() {
-            up.stop_units();
-            return Err(format!("{}: {}", step.label, out.tail(3)));
-        }
-    }
+    linux::start_baseline_screen(up, screen)?;
     let mut s = Session {
         gui,
         arch,
         screen,
         bus: bus.to_string(),
+        wl: wl.to_string(),
         results: results.to_path_buf(),
         rec: Recording::default(),
         roles: Vec::new(),
@@ -3530,25 +4594,33 @@ fn record_session(
     s.mark("ledger");
     s.ledger();
     s.mark("selections");
-    match (s.x_display(), screen.display) {
+    match (s.x_display(), screen.display.seat()) {
         (Some(x), _) => s.x11_selections(&x),
-        (None, Display::Mutter) => {
+        (None, Some(_)) => {
             let w = s.wayland_display().unwrap_or_default();
-            s.mutter_selections(&w);
+            s.wl_selections(&w);
         }
         (None, _) => s.rec.not_driven(
             "clipboard",
             "no-seat",
-            "weston's headless backend advertises no wl_seat, and a Wayland selection is set with a seat's serial (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)",
+            "weston's headless backend advertises no wl_seat, and a Wayland selection is set with a seat's serial (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)",
         ),
     }
     s.mark("key-repeat");
     s.key_repeat();
     s.mark("compose");
     s.compose();
-    if let Some(x) = s.x_display() {
-        s.mark("dnd");
-        s.dnd(&x);
+    match (s.x_display(), screen.display.seat()) {
+        (Some(x), _) => {
+            s.mark("dnd");
+            s.dnd(&x);
+        }
+        (None, Some(_)) => {
+            s.mark("dnd");
+            let w = s.wayland_display().unwrap_or_default();
+            s.wl_dnd(&w);
+        }
+        (None, _) => {}
     }
     s.mark("header");
     s.header();
@@ -3607,6 +4679,10 @@ fn record_session(
     s.xim();
     s.text_input_v3();
     s.header_gestures();
+    s.cpu_seat();
+    s.touch();
+    // Last: it puts GNOME Shell in place of the screen's Mutter.
+    s.text_input_v3_ime();
     up.stop_units();
     Ok(s.rec)
 }
@@ -3641,12 +4717,14 @@ pub fn slowest_present(metrics: &str, marks: &[(&str, f64)]) -> String {
     )
 }
 
-/// What every baseline session of one lane run shares: lane-bus, built once
-/// natively (a probe, not under test) while accessibility is on; the
+/// What every baseline session of one lane run shares: lane-bus and
+/// `lane-wl`, built once natively (probes, not under test) while
+/// accessibility is on; the
 /// checkout's lock, for the stack lines; where the recordings are committed;
 /// where the fresh ones go; and whether this run records or replays.
 pub struct Baseline {
     bus: String,
+    wl: String,
     lock: String,
     committed: PathBuf,
     results: PathBuf,
@@ -3657,7 +4735,7 @@ pub struct Baseline {
 
 /// Set at-spi2-core's `org.a11y.Status.IsEnabled`: aterm's AT-SPI
 /// publisher (aterm-a11y) publishes only while it is on.
-fn accessibility(up: &Up, on: bool) -> Out {
+pub(crate) fn accessibility(up: &Up, on: bool) -> Out {
     up.sh(&[
         "busctl".into(),
         "--user".into(),
@@ -3672,7 +4750,7 @@ fn accessibility(up: &Up, on: bool) -> Out {
 }
 
 impl Baseline {
-    /// Build lane-bus, and see that at-spi2-core can turn accessibility on
+    /// Build lane-bus and `lane-wl`, and see that at-spi2-core can turn accessibility on
     /// (it is off again until a session starts: the proof's own rows and the
     /// guest's other aterms run without it).
     ///
@@ -3682,7 +4760,7 @@ impl Baseline {
         let repo = linux::repo();
         let t0 = Instant::now();
         let not_run = |detail: String| proof::Row {
-            name: "baseline: lane-bus and the accessibility bus".into(),
+            name: "baseline: lane-bus, lane-wl and the accessibility bus".into(),
             verdict: proof::Verdict::NotRun,
             secs: t0.elapsed().as_secs_f64(),
             detail,
@@ -3697,38 +4775,42 @@ impl Baseline {
         }
         let lane = up.lane_dir();
         let env = guest::cargo_env(Arch::Aarch64, &format!("{lane}/target"), false);
-        println!("\n=== lane-bus (aarch64, the baseline's probe) ===");
-        let built = up.lima.shell_streamed(
-            &up.home,
-            &guest::with_env(
-                &env,
-                &[
-                    "cargo".into(),
-                    "build".into(),
-                    "--locked".into(),
-                    "--manifest-path".into(),
-                    format!("{repo}/Cargo.toml"),
-                    "-p".into(),
-                    "aterm-dbus".into(),
-                    "--bin".into(),
-                    "lane-bus".into(),
-                ],
-            ),
-            "  | ",
-        );
-        if !built.ok() {
-            return Err(not_run(format!(
-                "lane-bus build: {}",
-                proof::tally(&built.text)
-                    .error
-                    .unwrap_or_else(|| built.tail(3))
-            )));
+        // lane-bus, and the Wayland drag source (aterm-wayland's `lane-wl`
+        // example): probes, built natively, not under test.
+        for (what, package, target) in [
+            ("lane-bus", "aterm-dbus", ["--bin", "lane-bus"]),
+            ("lane-wl", "aterm-wayland", ["--example", "lane-wl"]),
+        ] {
+            println!("\n=== {what} (aarch64, the baseline's probe) ===");
+            let mut argv: Vec<String> = [
+                "cargo",
+                "build",
+                "--locked",
+                "--manifest-path",
+                &format!("{repo}/Cargo.toml"),
+                "-p",
+                package,
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+            argv.extend(target.iter().map(|s| (*s).to_string()));
+            let built = up
+                .lima
+                .shell_streamed(&up.home, &guest::with_env(&env, &argv), "  | ");
+            if !built.ok() {
+                return Err(not_run(format!(
+                    "{what} build: {}",
+                    proof::tally(&built.text)
+                        .error
+                        .unwrap_or_else(|| built.tail(3))
+                )));
+            }
         }
+        let bin_dir = Arch::Aarch64.bin_dir(&format!("{lane}/target"));
         Ok(Baseline {
-            bus: format!(
-                "{}/lane-bus",
-                Arch::Aarch64.bin_dir(&format!("{lane}/target"))
-            ),
+            bus: format!("{bin_dir}/lane-bus"),
+            wl: format!("{bin_dir}/examples/lane-wl"),
             lock,
             committed: PathBuf::from(&repo).join(DIR),
             results: results.to_path_buf(),
@@ -3763,7 +4845,15 @@ impl Baseline {
         // publisher publishes only while it is.
         let enabled = accessibility(up, true);
         let recorded = if enabled.ok() {
-            record_session(up, arch, screen, bin, &self.bus, &self.lock, &self.results)
+            record_session(
+                up,
+                arch,
+                screen,
+                bin,
+                (&self.bus, &self.wl),
+                &self.lock,
+                &self.results,
+            )
         } else {
             Err(format!("IsEnabled: {}", enabled.tail(2)))
         };
@@ -4130,13 +5220,70 @@ mod tests {
                 "weston-scale2",
                 "mutter",
                 "mutter-scale1.5",
-                "xwayland"
+                "xwayland",
+                "weston-x11"
             ]
         );
         assert_eq!(
             file_name(Arch::Aarch64, Screen::BASELINE[5]),
             "aarch64-mutter-scale1.5.txt"
         );
+    }
+
+    /// The drag source's reports as Mutter 46 and weston 13 sent them over
+    /// aterm's window, away past its corner and back (measured 2026-10-19).
+    #[test]
+    fn a_drag_source_hears_the_window_take_and_leave_the_drag() {
+        let over = ("text/uri-list", Some("copy"));
+        let away = ("none", None);
+        let mutter = [
+            "target none",
+            "action none",
+            "target text/uri-list",
+            "action copy",
+            "target none",
+            "target text/uri-list",
+            "action copy",
+        ];
+        assert_eq!(
+            source_heard(&mutter[..4], 0, over).as_deref(),
+            Some("target text/uri-list, action copy")
+        );
+        assert_eq!(source_heard(&mutter[..4], 4, away), None, "nothing yet");
+        assert_eq!(
+            source_heard(&mutter[..5], 4, away).as_deref(),
+            Some("target none")
+        );
+        assert_eq!(
+            source_heard(&mutter[..6], 5, over).as_deref(),
+            Some("target text/uri-list"),
+            "the action wanted is the last one anywhere"
+        );
+        assert_eq!(
+            source_heard(&mutter, 5, over).as_deref(),
+            Some("target text/uri-list, action copy")
+        );
+        let weston = [
+            "target text/uri-list",
+            "action copy",
+            "action none",
+            "action copy",
+        ];
+        assert_eq!(
+            source_heard(&weston[..2], 0, over).as_deref(),
+            Some("target text/uri-list, action copy")
+        );
+        assert_eq!(
+            source_heard(&weston, 2, away).as_deref(),
+            Some("action none"),
+            "weston says nothing at a leave: the next client's offer starts at none"
+        );
+        assert_eq!(
+            source_heard(&["action none", "target text/uri-list"], 0, away),
+            None,
+            "a target past the point is no leave"
+        );
+        assert_eq!(source_heard(&["action copy"], 0, away), None);
     }
 
     /// The slowest present is named by the item it ended in: the last mark
@@ -4229,6 +5376,25 @@ mod tests {
         assert!(!regex_literal("a b c").contains(' '));
     }
 
+    /// The CPU item's typing: a key per character, the space by name.
+    #[test]
+    fn text_is_typed_on_the_seat_a_key_each() {
+        assert_eq!(
+            seat_taps("echo a-1"),
+            [
+                "tap:e",
+                "tap:c",
+                "tap:h",
+                "tap:o",
+                "tap:space",
+                "tap:a",
+                "tap:-",
+                "tap:1"
+            ]
+        );
+        assert!(seat_taps("").is_empty());
+    }
+
     /// The stream's text changes, undone from the end walk's text, and its
     /// last caret event; the negative controls: an insert whose text is not
     /// where it says, and a caret that moved after its last event.
@@ -4298,6 +5464,31 @@ mod tests {
         );
     }
 
+    /// A wire log's touch lines as libwayland prints them (measured under
+    /// Mutter 46 through a RemoteDesktop touchscreen, 2026-10-19).
+    #[test]
+    fn the_touch_wire_keeps_names_and_the_first_down() {
+        let log = "[1166175.811]  -> wl_seat@7.get_touch(new id wl_touch@33)
+[1176533.604] wl_touch@33.down(57, 1285080, wl_surface@16, 736, 640.00000000, 400.00000000)
+[1176533.614] wl_touch@33.frame()
+[1176534.035] wl_touch@33.motion(1285080, 736, 650.00000000, 410.00000000)
+[1176534.041] wl_touch@33.frame()
+[1176534.043] wl_touch@33.up(58, 1285080, 736)
+[1177545.446]  -> wl_touch@33.release()
+";
+        assert_eq!(
+            touch_wire(log),
+            "requests wl_seat.get_touch wl_touch.release; events wl_touch.down wl_touch.frame wl_touch.motion wl_touch.up"
+        );
+        assert_eq!(
+            touch_down_at(log).as_deref(),
+            Some("id 736 at 640.00000000,400.00000000")
+        );
+        let none = "[1.0] wl_keyboard@81.enter(31, wl_surface@22, array[0])\n";
+        assert_eq!(touch_wire(none), "requests none; events none");
+        assert_eq!(touch_down_at(none), None);
+    }
+
     /// The `strip-caption` line as aterm-gui's `chrome` prints it (LW.5).
     #[test]
     fn the_caption_line_reads_back_the_frame_and_its_buttons() {
@@ -4364,9 +5555,14 @@ mod tests {
             }
         }
         let f = Frame { rgba, w: 8, h: 4 };
-        assert_eq!(slot_class(&f, 4, 8, 4), ("drawn", 9));
-        assert_eq!(slot_class(&f, 0, 4, 4), ("bare", 0));
-        assert_eq!(slot_class(&f, 8, 9, 4), ("bare", 0), "past the frame");
+        assert_eq!(slot_class(&f, 4, 8, 0, 4), ("drawn", 9));
+        assert_eq!(slot_class(&f, 0, 4, 0, 4), ("bare", 0));
+        assert_eq!(slot_class(&f, 8, 9, 0, 4), ("bare", 0), "past the frame");
+        // Read from under a band on top (a stats Deck's): the ground is the
+        // slot's top-left pixel there, and the rows above it are not read.
+        assert_eq!(slot_class(&f, 4, 8, 1, 4), ("drawn", 9));
+        assert_eq!(slot_class(&f, 4, 8, 2, 4), ("drawn", 6));
+        assert_eq!(slot_class(&f, 4, 8, 4, 4), ("bare", 0), "no rows");
     }
 
     #[test]

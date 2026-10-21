@@ -55,6 +55,20 @@ impl ScrollChange {
     pub fn changed(self) -> bool {
         self.translated_rows > 0 || self.invalidated || self.band_moves > 0
     }
+
+    /// A whole-plane translation and nothing else: every retained mark moved
+    /// with the grid, so the rows the content witness names after the sync
+    /// (`CursorGlow::ribbon_rows`) are this frame's, and a host reads them
+    /// under the lock that took the snapshot. The row probe stays fenced
+    /// (pre-scroll bytes never diff against the new row); the witness does
+    /// not, or a box a program redrew in place under the scroll (Claude
+    /// Code's composer under a transcript that grew) is drawn for that frame
+    /// where the scroll carried its band (`Witness::scroll_carry`).
+    #[inline]
+    #[must_use]
+    pub fn translated_only(self) -> bool {
+        self.translated_rows > 0 && !self.invalidated && self.band_moves == 0
+    }
 }
 
 /// What the torn-space retirement does with Rainbow Kitty's band, which is
@@ -117,6 +131,11 @@ pub struct CursorStep<'a> {
     /// fresh-ink reduced arm).
     pub animate: bool,
     pub row_probe: Option<RowProbe<'a>>,
+    /// The cells of the frame about to be presented (window rows), whose
+    /// text tells the dark streak where it crosses air
+    /// ([`crate::cursor_glow::CursorGlow::observe_frame_text`]); `None` keeps
+    /// the rows the probe missed unknown.
+    pub frame_cells: Option<&'a [Vec<RenderCell>]>,
     /// Keystrokes the host batched since its last step, replayed at this
     /// frame's instant after the history fence (a page's straggler keys; a
     /// native window notes each key at its press and passes `0`).
@@ -898,9 +917,14 @@ impl EffectsPipeline {
     /// 3. **The seat** (L-D, the occlusion fix): for the flying head,
     ///    [`companion::placement`] over the shipped footprint, the emitter's
     ///    own lead and an ink probe on `cells` (the snapshot the head is
-    ///    drawn over; a cell outside it reads as inked), applied through the
-    ///    two pose parameters the emitter reads — `pose.lead` (sign-corrected
-    ///    for the facing) and `bob` (whole rows of lift).
+    ///    drawn over; a cell outside it reads as inked): a seat behind the
+    ///    caret through `pose.lead` (sign-corrected for the facing), which the
+    ///    emitter's follower glides, and the seat's whole rows of lift as the
+    ///    answer, for the host's [`crate::word_decorations::KittyCursorLayout::lift`]
+    ///    and frame, where the follower glides it too. (It rode the hover `bob`
+    ///    until 2026-10-20, which the follower excludes, so a seat that rose to
+    ///    the row above, or came back down, moved the head a whole row in one
+    ///    present.)
     pub fn route_flying_head(
         &mut self,
         duty: CompanionDuty,
@@ -909,12 +933,12 @@ impl EffectsPipeline {
         geom: EffectGeom,
         cat_frame: &mut crate::kitty_cursor::CatFrame,
         animate: bool,
-    ) {
+    ) -> f32 {
         use crate::rainbow_kitty::companion::{
             self as companion, Body, BodyImpulse, CompanionAdmission, Reaction, SeatQuery,
         };
         if self.cursor.glow.v2_status().is_none() {
-            return;
+            return 0.0;
         }
         let body = companion::body_for(CompanionAdmission {
             duty,
@@ -944,7 +968,8 @@ impl EffectsPipeline {
             | BodyImpulse::Ignore => {}
         }
         let Body::Flying { cell } = body else {
-            return;
+            self.flying_sky_row = None;
+            return 0.0;
         };
         let Some(rest) =
             self.decos
@@ -953,9 +978,10 @@ impl EffectsPipeline {
                     cursor: cell,
                     look: cat_frame.render_look(),
                     bob: cat_frame.bob,
+                    lift: 0.0,
                 })
         else {
-            return;
+            return 0.0;
         };
         let ink = |row: u16, col: u16| -> Option<bool> {
             cells
@@ -979,9 +1005,11 @@ impl EffectsPipeline {
                 },
                 rest,
                 lead_px: WordDecorations::kitty_cursor_lead_px(geom.cell_w),
+                held_sky: self.flying_sky_row == Some(cell.0),
             },
             ink,
         );
+        self.flying_sky_row = (seat.lift_rows > 0 && !seat.over_ink).then_some(cell.0);
         let dx = seat.x.saturating_sub(rest.x);
         if dx != 0 && geom.cell_w > 0 {
             // The emitter draws `round(pose.lead · cw)` px ahead, mirrored when
@@ -993,11 +1021,7 @@ impl EffectsPipeline {
             let lead_cells = dx as f32 / f32::from(geom.cell_w);
             cat_frame.pose.lead += if facing_left { -lead_cells } else { lead_cells };
         }
-        if seat.lift_rows > 0 {
-            // A row of lift is a whole `ch` on the footprint's `y`, which the
-            // footprint carries as `round(bob · ch)` — exact for whole rows.
-            cat_frame.bob -= f32::from(seat.lift_rows);
-        }
+        f32::from(seat.lift_rows)
     }
 
     /// The flying head at its resolved placement.
@@ -1364,6 +1388,9 @@ pub(super) fn step_cursor_family(
         .glow
         .observe_print_anchor_glyph(step.print_anchor, step.print_anchor_glyph);
     cursor.glow.observe_caret_drawn(step.caret_drawn);
+    if let Some(cells) = step.frame_cells {
+        cursor.glow.observe_frame_text(step.input.cur, cells, now);
+    }
     let frame = cursor.tick(&step.input, step.glow, step.trail);
     CursorStepOut {
         frame,
@@ -1496,6 +1523,7 @@ mod flying_head_tests {
             cursor,
             look: frame.render_look(),
             bob: frame.bob,
+            lift: 0.0,
         }
     }
 

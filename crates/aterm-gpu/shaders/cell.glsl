@@ -19,7 +19,7 @@
 // entry's attributes and varyings live under its `ATERM_VS_` guard, so one
 // file serves every interface without two `in`s sharing a location.
 //
-// BINDINGS (shader_twins.rs reads them): the `Uniforms` block is `aterm_b0`
+// BINDINGS (src/gl/shaders.rs checks them): the `Uniforms` block is `aterm_b0`
 // (binding point 0), the atlas is `aterm_t0` (texture unit 0 with its sampler
 // object at unit 0) — the cell rows' BindSpec slots.
 precision highp float;
@@ -502,5 +502,122 @@ void fs_sprite_over() {
     vec3 tinted = roundEven(c.rgb * v_color.rgb * 255.0) / vec3(255.0);
     float a = roundEven(c.a * v_color.a * 255.0) / 255.0;
     o_frag = vec4(s2l(tinted), a);
+}
+#endif
+
+// ---------------------------------------------------------------- FX LAYERS
+// FX_LAYOUT: 0 => Uint16x4 (the slice rect), 1 => Sint16x2 (the item origin
+// mod 2^16), 2 => Uint16x2 (a sprite's dw, dh), 3 => Uint16x4 (the atlas
+// region; [w, 0, 0, 0] for Rect and Ramps), 4 => Uint32 (the absolute
+// palette entry), 5 => Uint32 (flags), all integers. Pixel law F, the WGSL
+// fs_fx / fs_fx_linear twins op for op (see their comment): flat operands,
+// the fragment's own pixel and the item's unclamped origin, texels read with
+// texelFetch and their bytes recovered with roundEven.
+//
+// BINDINGS (BindSpec::FX): the Index8 atlas is aterm_t0, the RGBA atlas
+// aterm_t1, and the frame palette aterm_t2: GLSL ES 3.00 has no storage
+// buffer, so the palette is an RGBA8 texture 1024 entries wide (entry j at
+// (j % 1024, j / 1024)) from the arm's ring of three, one per frame.
+#if defined(ATERM_VS_vs_fx)
+flat ATERM_VARYING ivec2 v_origin;
+flat ATERM_VARYING uvec2 v_dst;
+flat ATERM_VARYING uvec4 v_src;
+flat ATERM_VARYING uint v_pal;
+flat ATERM_VARYING uint v_flags;
+#endif
+
+#if defined(ATERM_VERTEX) && defined(ATERM_VS_vs_fx)
+layout(location = 0) in uvec4 a_rect;
+layout(location = 1) in ivec2 a_origin;
+layout(location = 2) in uvec2 a_dst;
+layout(location = 3) in uvec4 a_src;
+layout(location = 4) in uint a_pal;
+layout(location = 5) in uint a_flags;
+void vs_fx() {
+    vec4 rect = vec4(a_rect);
+    vec2 k = corner(uint(gl_VertexID));
+    vec2 px = rect.xy + k * rect.zw;
+    gl_Position = vec4(to_ndc(px), 0.0, 1.0);
+    v_origin = a_origin;
+    v_dst = a_dst;
+    v_src = a_src;
+    v_pal = a_pal;
+    v_flags = a_flags;
+}
+#endif
+
+#if defined(ATERM_FRAGMENT) && (defined(ATERM_FS_fs_fx) || defined(ATERM_FS_fs_fx_linear))
+uniform highp sampler2D aterm_t1;
+uniform highp sampler2D aterm_t2;
+
+// Palette entry j as bytes (r, g, b, a).
+uvec4 fx_ink(uint j) {
+    return uvec4(roundEven(texelFetch(aterm_t2, ivec2(int(j % 1024u), int(j / 1024u)), 0)
+                           * 255.0));
+}
+
+// The stored byte of each Unorm8 channel.
+uvec4 fx_byte4(vec4 v) {
+    return uvec4(roundEven(v * 255.0));
+}
+
+// The item-local pixel l = (p - O) mod 2^16.
+uvec2 fx_local() {
+    ivec2 p = ivec2(floor(gl_FragCoord.xy));
+    return uvec2(p - v_origin) & uvec2(65535u);
+}
+
+// The sprite texel under l: t = (l.x*w / dw, l.y*h / dh), mirrored under
+// flip_x, offset to the art's atlas region.
+ivec2 fx_texel(uvec2 l) {
+    uvec2 t = uvec2(l.x * v_src.z / v_dst.x, l.y * v_src.w / v_dst.y);
+    if ((v_flags & 4u) != 0u) {
+        t.x = v_src.z - 1u - t.x;
+    }
+    return ivec2(v_src.xy + t);
+}
+#endif
+
+// The Exact law: (c, a) / 255 raw into src + dst*(1 - a) on the Unorm view.
+#if defined(ATERM_FRAGMENT) && defined(ATERM_FS_fs_fx)
+void fs_fx() {
+    uvec2 l = fx_local();
+    uint kind = v_flags & 3u;
+    uvec4 c;
+    if (kind == 2u) {
+        ivec2 t = fx_texel(l);
+        if (((v_flags >> 3u) & 3u) == 0u) {
+            // Index8: 0 writes nothing; k names entry ink + k - 1, and an
+            // index past the palette writes nothing.
+            uint k = fx_byte4(texelFetch(aterm_t0, t, 0)).x;
+            uint reach = (v_flags >> 8u) & 255u;
+            if (k == 0u || k > reach) {
+                discard;
+            }
+            c = fx_ink(v_pal + clamp(k, 1u, reach) - 1u);
+        } else {
+            // Rgba8Premul: the texel is its own (c, a); a = 0 is light.
+            c = fx_byte4(texelFetch(aterm_t1, t, 0));
+        }
+    } else {
+        // Rect (row 0) and Ramps (row l.y).
+        uint j = v_pal + 2u * (kind == 1u ? l.y : 0u);
+        c = glow_lerp4(fx_ink(j), fx_ink(j + 1u), l.x, max(v_src.x, 1u));
+    }
+    o_frag = vec4(c) / vec4(255.0);
+}
+#endif
+
+// The Linear law (FreeSprite's), on the sRGB view.
+#if defined(ATERM_FRAGMENT) && defined(ATERM_FS_fs_fx_linear)
+void fs_fx_linear() {
+    uvec2 l = fx_local();
+    uvec4 v = fx_byte4(texelFetch(aterm_t1, fx_texel(l), 0));
+    uvec4 tint = fx_ink(v_pal);
+    uvec4 p = (v * tint + uvec4(127u)) / uvec4(255u);
+    if (p.w == 0u) {
+        discard;
+    }
+    o_frag = vec4(s2l(vec3(p.xyz) / vec3(255.0)), float(p.w) / 255.0);
 }
 #endif

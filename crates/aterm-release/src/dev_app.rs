@@ -71,10 +71,10 @@ pub const USAGE: &str = "
                             install there, not in /Applications (~/Applications
                             when /Applications is not writable); LaunchServices is
                             told only of an install in those two
-        --no-link           leave `aterm` on PATH (~/.local/bin/aterm) as it is; by
-                            default a link there is pointed at this build, which
-                            never updates, and what it displaced is named (a
-                            regular file there is always left alone)
+        --no-link           leave `aterm` and `amacs` on PATH (~/.local/bin) as
+                            they are; by default a link there is pointed at this
+                            build, which never updates, and what it displaced is
+                            named (a regular file there is always left alone)
         --no-pin            omit the ATermDevBuild mark: the updater then tries
                             this install and every apply fails
 
@@ -110,7 +110,7 @@ pub struct Options {
     pub install: Install,
     /// The [`DEV_MARK_KEY`] mark (off with `--no-pin`).
     pub pin: bool,
-    /// Point `~/.local/bin/aterm` at the installed build (off with `--no-link`).
+    /// Point `~/.local/bin/aterm` and `amacs` at the installed build (off with `--no-link`).
     pub link: bool,
     pub sign: SignWith,
 }
@@ -346,11 +346,14 @@ fn target_dir(root: &Path, env: Option<OsString>) -> PathBuf {
 /// pinned to `stamp`. What would swap the proved toolchain (RUSTC, CARGO_BUILD_RUSTC,
 /// RUSTUP_TOOLCHAIN), move the binary out of `<target>/release` (CARGO_BUILD_TARGET)
 /// or mark it a release is scrubbed; RUSTFLAGS is not — steering a dev build is the
-/// caller's right.
+/// caller's right. Led by `build_dir` (`--config build.build-dir=<target>/build.noindex`,
+/// `aterm_verify::fallback_build_dir`) when there is one, so the build's intermediates
+/// stay out of Spotlight while the binary still lands in `<target>/release/aterm`.
 fn build_command(
     stage2: &Path,
     root: &Path,
     target: &Path,
+    build_dir: Option<&str>,
     path: &OsStr,
     stamp: &Stamp,
 ) -> Command {
@@ -360,6 +363,9 @@ fn build_command(
         joined.push(path);
     }
     let mut cmd = aterm_uds::spawnfd::command(stage2.join("targo"));
+    if let Some(value) = build_dir {
+        cmd.arg("--config").arg(value);
+    }
     cmd.current_dir(root)
         .args([
             "--unverified",
@@ -426,10 +432,13 @@ pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
         "==> targo --unverified build --release -p aterm  [{}, build {}]",
         stamp.commit, stamp.build
     );
+    let build_dir =
+        aterm_verify::fallback_build_dir(&aterm_verify::EnvSnapshot::capture(), root, &target);
     let status = build_command(
         &stage2,
         root,
         &target,
+        build_dir.as_deref(),
         &std::env::var_os("PATH").unwrap_or_default(),
         &stamp,
     )
@@ -723,9 +732,12 @@ fn install(
         installed.display()
     );
     match bin_dir {
-        Some(bin_dir) => println!("  on PATH: {}", bin_dir.join("aterm").display()),
+        Some(bin_dir) => println!(
+            "  CLI path: {} (aterm pkg shell-setup --path adds it in new shells)",
+            bin_dir.join("aterm").display()
+        ),
         None => println!(
-            "  on PATH: unchanged (--no-link); run it at {}",
+            "  CLI path: unchanged (--no-link); run it at {}",
             exe.display()
         ),
     }
@@ -742,33 +754,20 @@ fn install(
     Ok(())
 }
 
-/// Point `<bin_dir>/aterm` at `exe`, replacing a link (atomically) and never a file.
-/// The `aterm` on PATH is a daily driver and this build never updates, so a link to
-/// anything else is named, with the one command that puts it back. Returns the target
-/// it displaced.
+/// Point `<bin_dir>/aterm` at `exe`, and `<bin_dir>/amacs` at the `amacs` beside it,
+/// replacing a link (atomically) and never a file. The `aterm` on PATH is a daily driver
+/// and this build never updates, so a link to anything else is named, with the one
+/// command that puts it back. Returns the `aterm` target it displaced.
+///
+/// `amacs` (aterm's editor, `docs/DESIGN-amacs-2026-10-19.md` §8.1) goes with `aterm`: a
+/// tab finds `~/.local/bin` ahead of its window's bundle, and the editor client hands its
+/// file to the window that runs the tab, so a dev window's `amacs` must be this build's,
+/// not the release's. The release's hooks pass leaves the pair aimed here and brings
+/// `amacs` back once `aterm` runs the release again (atpkg's `ensure_command_links_from`).
 fn link_cli(exe: &Path, bin_dir: &Path, run: &dyn Run) -> Result<Option<PathBuf>, String> {
     std::fs::create_dir_all(bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
     let link = bin_dir.join("aterm");
-    let prior = match std::fs::symlink_metadata(&link) {
-        Ok(meta) if !meta.file_type().is_symlink() => {
-            eprintln!(
-                "ship dev-app: {} is not a link, so it is left as it is (--no-link skips this)",
-                link.display()
-            );
-            return Ok(None);
-        }
-        Ok(_) => std::fs::read_link(&link)
-            .ok()
-            .map(|target| bin_dir.join(target)),
-        Err(_) => None,
-    };
-    let displaced = prior.filter(|p| p != exe && p.is_file());
-    let tmp = bin_dir.join(format!(".aterm.dev-app.{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(exe, &tmp).map_err(|e| format!("symlink {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &link)
-        .map_err(|e| format!("move {} to {}: {e}", tmp.display(), link.display()))?;
+    let displaced = point_link(exe, &link)?;
     if let Some(prior) = &displaced {
         let version =
             first_line(run, prior, &["--version"]).unwrap_or_else(|| "version unknown".into());
@@ -783,6 +782,46 @@ fn link_cli(exe: &Path, bin_dir: &Path, run: &dyn Run) -> Result<Option<PathBuf>
             link.display()
         );
     }
+    let editor = exe.with_file_name("amacs");
+    if std::fs::symlink_metadata(&editor).is_ok() {
+        let link = bin_dir.join("amacs");
+        // Named, not run: the editor takes no `--version` (it answers a usage error).
+        if let Some(prior) = point_link(&editor, &link)? {
+            eprintln!(
+                "ship dev-app: {} now runs this dev build's editor (was: {})",
+                link.display(),
+                prior.display()
+            );
+        }
+    }
+    Ok(displaced)
+}
+
+/// Point the link `link` at `target`, atomically, unless something other than a link
+/// holds the name (said, and left). Returns the file the link ran before, when that was
+/// another one.
+fn point_link(target: &Path, link: &Path) -> Result<Option<PathBuf>, String> {
+    let dir = link.parent().unwrap_or(Path::new("."));
+    let prior = match std::fs::symlink_metadata(link) {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            eprintln!(
+                "ship dev-app: {} is not a link, so it is left as it is (--no-link skips this)",
+                link.display()
+            );
+            return Ok(None);
+        }
+        Ok(_) => std::fs::read_link(link).ok().map(|old| dir.join(old)),
+        Err(_) => None,
+    };
+    let displaced = prior.filter(|p| p != target && p.is_file());
+    let name = link.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.dev-app.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, &tmp)
+        .map_err(|e| format!("symlink {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, link)
+        .map_err(|e| format!("move {} to {}: {e}", tmp.display(), link.display()))?;
     Ok(displaced)
 }
 
@@ -908,10 +947,30 @@ mod tests {
     #[test]
     fn the_build_is_the_trust_targo_on_its_unverified_lane() {
         let stage2 = Path::new("/store/trust/9192/bin");
+        let led = build_command(
+            stage2,
+            Path::new("/src/aterm"),
+            Path::new("/src/aterm/target"),
+            Some("build.build-dir='/src/aterm/target/build.noindex'"),
+            OsStr::new("/usr/bin:/bin"),
+            &stamp(),
+        );
+        let led: Vec<&OsStr> = led.get_args().collect();
+        assert_eq!(
+            led[..3],
+            [
+                "--config",
+                "build.build-dir='/src/aterm/target/build.noindex'",
+                "--unverified"
+            ]
+            .map(OsStr::new),
+            "the intermediates go where Spotlight never looks"
+        );
         let cmd = build_command(
             stage2,
             Path::new("/src/aterm"),
             Path::new("/src/aterm/target"),
+            None,
             OsStr::new("/usr/bin:/bin"),
             &stamp(),
         );
@@ -1304,5 +1363,59 @@ mod tests {
             std::fs::read(bin.join("aterm")).unwrap(),
             b"a copied binary"
         );
+    }
+
+    /// `amacs` goes with `aterm`: the dev bundle's editor takes the release's link, and is
+    /// named, never run. A file at the name stays; a dev bundle without the editor leaves
+    /// the link where it was.
+    #[test]
+    fn the_editor_link_goes_with_aterm() {
+        let (_dir, root) = scratch();
+        let bin = root.join("bin");
+        let bundle = |app: &str, editor: bool| -> PathBuf {
+            let macos = root.join(app).join("Contents/MacOS");
+            std::fs::create_dir_all(&macos).unwrap();
+            std::fs::write(macos.join("aterm"), app.as_bytes()).unwrap();
+            if editor {
+                std::os::unix::fs::symlink("aterm", macos.join("amacs")).unwrap();
+            }
+            macos
+        };
+        let release = bundle("aterm.app", true);
+        let dev = bundle("aterm (dev).app", true);
+        let older = bundle("older (dev).app", false);
+        std::fs::create_dir_all(&bin).unwrap();
+        for name in ["aterm", "amacs"] {
+            std::os::unix::fs::symlink(release.join(name), bin.join(name)).unwrap();
+        }
+        let target = |name: &str| std::fs::read_link(bin.join(name)).ok();
+        let fake = Fake::new(World::default());
+
+        assert_eq!(
+            link_cli(&dev.join("aterm"), &bin, &fake),
+            Ok(Some(release.join("aterm")))
+        );
+        assert_eq!(target("aterm"), Some(dev.join("aterm")));
+        assert_eq!(target("amacs"), Some(dev.join("amacs")));
+        assert_eq!(log(&fake), vec!["aterm --version".to_string()]);
+
+        assert_eq!(
+            link_cli(&older.join("aterm"), &bin, &fake),
+            Ok(Some(dev.join("aterm")))
+        );
+        assert_eq!(target("aterm"), Some(older.join("aterm")));
+        assert_eq!(
+            target("amacs"),
+            Some(dev.join("amacs")),
+            "no editor in the bundle, no link"
+        );
+
+        std::fs::remove_file(bin.join("amacs")).unwrap();
+        std::fs::write(bin.join("amacs"), b"someone's own").unwrap();
+        assert_eq!(
+            link_cli(&dev.join("aterm"), &bin, &fake),
+            Ok(Some(older.join("aterm")))
+        );
+        assert_eq!(std::fs::read(bin.join("amacs")).unwrap(), b"someone's own");
     }
 }

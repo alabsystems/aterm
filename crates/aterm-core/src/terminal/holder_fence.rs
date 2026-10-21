@@ -169,6 +169,9 @@ pub struct HolderFence {
     pub(crate) current: Option<u8>,
     pub(crate) marks: Vec<Mark>,
     pub(crate) clock: u64,
+    /// A restored stream had output without holder observations. Its carried
+    /// command start cannot seed a writer range, even after another checkpoint.
+    pub(crate) seed_untrusted: bool,
 }
 
 /// Where the main cursor stands, read once per fence operation.
@@ -289,6 +292,11 @@ impl HolderFence {
             Some(c) if c > index => u8::try_from(c - 1).ok(),
             other => other.and_then(|c| u8::try_from(c).ok()),
         };
+        // The clock orders marks only: with none left the fence is the
+        // empty one, as a session no drawer ran in holds.
+        if self.marks.is_empty() {
+            self.clock = 0;
+        }
     }
 
     /// Drop a mark's spans that hold no row (`end <= start`, or an anchor
@@ -471,7 +479,9 @@ impl HolderFence {
             self.current = u8::try_from(index).ok();
             return;
         }
-        // A new mark: at capacity the oldest suspended one goes.
+        // A new mark: at capacity the oldest suspended one goes first, so
+        // its anchors are free for the new span.
+        self.make_room(grid);
         let mut mark = Mark {
             token,
             spans: Vec::new(),
@@ -481,7 +491,7 @@ impl HolderFence {
             suspended_at: 0,
         };
         Self::lay(&mut mark, grid, at);
-        self.push_current(mark, grid);
+        self.push_current(mark);
     }
 
     /// A suspended drawer is gone (the host saw it die): its mark goes. The
@@ -581,9 +591,10 @@ impl HolderFence {
         }
     }
 
-    /// Make `mark` current, evicting the oldest suspended marks past the
-    /// capacity. No mark may be current.
-    fn push_current(&mut self, mark: Mark, grid: &mut Grid) {
+    /// Evict the oldest suspended marks until a new one fits the capacity,
+    /// before it lays its span: eight marks of four closed spans hold every
+    /// anchor the grid has. No mark may be current.
+    fn make_room(&mut self, grid: &mut Grid) {
         debug_assert!(self.current.is_none(), "a new mark replaces no current one");
         while self.marks.len() >= Self::capacity() {
             let Some(oldest) = self
@@ -597,12 +608,18 @@ impl HolderFence {
             };
             self.drop_mark(oldest, grid);
         }
+    }
+
+    /// Make `mark` current ([`Self::make_room`] made room for it).
+    fn push_current(&mut self, mark: Mark) {
+        debug_assert!(self.marks.len() < Self::capacity(), "room was made");
         self.marks.push(mark);
         self.current = u8::try_from(self.marks.len() - 1).ok();
     }
 
     /// After a restore, take `token` (a drawer when `drawer`) as the holder:
-    /// a carried current mark of an Exact drawer's token continues; otherwise the carried
+    /// a carried current mark of an Exact drawer's token continues when the
+    /// carry is `untouched` (no byte came after it); otherwise the carried
     /// current mark and any of that token go, and a drawer gets one mark,
     /// its open span from `seed`'s row (`alt_fresh` its flag) or, without
     /// one, tainted until it clears the screen itself.
@@ -610,12 +627,19 @@ impl HolderFence {
         &mut self,
         token: u64,
         drawer: bool,
+        untouched: bool,
         seed: Option<(u64, bool)>,
         grid: &mut Grid,
     ) -> HolderAdoption {
-        if drawer && token != 0 && self.current_token() == Some(token) {
+        if drawer
+            && untouched
+            && token != 0
+            && self.current_token() == Some(token)
+            && (!self.seed_untrusted || self.current_mark().is_some_and(|m| !m.tainted))
+        {
             return HolderAdoption::Continued;
         }
+        let seed = if self.seed_untrusted { None } else { seed };
         self.absorb_lost(grid);
         if let Some(index) = self.current.map(usize::from) {
             self.drop_mark(index, grid);
@@ -626,6 +650,7 @@ impl HolderFence {
         if token == 0 || !drawer {
             return HolderAdoption::Bare;
         }
+        self.make_room(grid);
         let mut mark = Mark {
             token,
             spans: Vec::new(),
@@ -636,7 +661,7 @@ impl HolderFence {
         };
         let at = At::of(grid);
         Self::open_span(&mut mark, seed.map_or(at.lay_row(), |(row, _)| row), grid);
-        self.push_current(mark, grid);
+        self.push_current(mark);
         if seed.is_some() {
             HolderAdoption::Seeded
         } else {
@@ -688,15 +713,24 @@ impl HolderFence {
 fn holder_fence_environment_waivers() {}
 
 impl super::Terminal {
-    /// The fence's anchors live in the main grid: the inactive one while the
-    /// alternate screen is up.
-    fn fence_and_main_grid(&mut self) -> (&mut HolderFence, &mut Grid) {
+    /// The fence and the main grid its anchors live in (the inactive one
+    /// while the alternate screen is up), borrowed apart. The one place that
+    /// names the main grid mutably: the cuts, the checkpoint's install and
+    /// the width lend all reach it here, so the anchors never land in the
+    /// other grid.
+    pub(super) fn fence_and_main_grid(&mut self) -> (&mut HolderFence, &mut Grid) {
         let grid = if self.modes.alternate_screen {
             self.alt_grid.as_mut().unwrap_or(&mut self.grid)
         } else {
             &mut self.grid
         };
         (&mut self.holder_fence, grid)
+    }
+
+    /// The primary-content grid, mutably: the inactive one while the
+    /// alternate screen is up.
+    pub(super) fn main_grid_mut(&mut self) -> &mut Grid {
+        self.fence_and_main_grid().1
     }
 
     /// The foreground holder changed (see [`HolderCut`]). The host calls this
@@ -816,16 +850,29 @@ impl super::Terminal {
 
     /// After a restore (a seamless rung of any kind, a crash restore, a
     /// predecessor with no fence), take `token` as the foreground holder,
-    /// `drawer_exact` when it is a drawer whose build passes Exact.
+    /// `drawer_exact` when it is a drawer whose build passes Exact. Call it
+    /// once, right after the restore and before any output is fed.
     ///
     /// A carried fence whose current mark is `token`'s continues only for an
-    /// Exact drawer. Otherwise a
-    /// drawer is seeded from the running command's output start (OSC 133 C),
-    /// only when shell-integration marks are nonce-signed, so no program can
-    /// have forged it; `alt_fresh` when the session is on the alternate screen
-    /// with that command still running. Without a signed running block it
-    /// stays bare until it clears the screen itself.
+    /// Exact drawer, and only when no byte was parsed between the carry's
+    /// install and this call: a crash journal's tail replay feeds bytes whose
+    /// cuts were never journaled (a Ctrl-Z, `clear; cat card`, `fg` inside
+    /// the tail), so after one the carried current mark is not trusted (the
+    /// tail fails closed). That uncertainty also survives an intermediate
+    /// checkpoint and forbids a seed from the old running block: replay may
+    /// have ignored its old-nonce D/C marks. It is retained for this lineage;
+    /// a later owned full clear can still produce a current mark that an
+    /// untouched restore continues. Otherwise a drawer is seeded from the running
+    /// command's output start (OSC 133 C), only when shell-integration marks
+    /// are nonce-signed, so no program can have forged it; `alt_fresh` when
+    /// the session is on the alternate screen with that command still
+    /// running. Without a signed running block it stays bare until it clears
+    /// the screen itself.
     pub fn adopt_holder_after_restore(&mut self, token: u64, drawer_exact: bool) -> HolderAdoption {
+        // One adoption consumes the install. A repeated/out-of-sequence
+        // call must not turn the carried C into fresh writer authority.
+        let untouched = self.holder_carried_at.take() == Some(self.transient.screen_mutations);
+        self.holder_fence.seed_untrusted |= !untouched;
         let seed = self
             .shell
             .current_block
@@ -835,6 +882,6 @@ impl super::Terminal {
             .and_then(|block| block.output_start_row)
             .map(|row| (row, self.modes.alternate_screen));
         let (fence, grid) = self.fence_and_main_grid();
-        fence.adopt(token, drawer_exact, seed, grid)
+        fence.adopt(token, drawer_exact, untouched, seed, grid)
     }
 }

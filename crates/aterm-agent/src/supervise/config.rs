@@ -88,10 +88,11 @@
 //!
 //! One key says how far the harness carries a session's work: `autopilot`
 //! ([`Autopilot`]; `docs/DESIGN-harness-autopilot-2026-10-15.md` §2),
-//! `cruise` (the default: keep the work moving until the agent's clear final
-//! statement), `land` (wrap the work up cleanly, then type nothing more but
-//! the land answer to a question asked in prose) or `off` (hands off: plain
-//! Claude Code), any case, and the owner's own words for them
+//! `cruise` (the default: keep the work going, and nothing the agent says
+//! ends it — FOREVER CRUISE), `land` (land all of the work on the remote
+//! main branch, nudged at every point until a clean `Nothing left:` defense
+//! stands over a clean repository, then nothing typed until someone's turn —
+//! FOREVER LAND) or `off` (hands off: plain Claude Code), any case, and the owner's own words for them
 //! (`forever`/`infinity`, `wrap-up`/`wrapup`/`wrap`). Each step down
 //! takes power away, so `land` and `off` are limits and `off` (any off
 //! spelling) is the key's; a value that is none of them keeps `cruise` and
@@ -125,12 +126,26 @@
 
 use std::path::{Path, PathBuf};
 
-use aterm_phase::Program;
+use aterm_phase::{Program, ResetKind};
 
 use super::policy::approval::QuestionPriority;
 
 use super::memory::MemoryCeiling;
 use crate::harness::accounts::Mode;
+use crate::harness::harness_mark;
+
+/// CRUISE'S CONTINUATION, the default `continue_text` (FOREVER CRUISE): keep
+/// going, land what is in hand, and keep hunting for what would make the
+/// work more complete and more correct — never stopping to ask, a person's
+/// part put on a `NEEDS YOU:` line. Marked as the harness's own turn
+/// (`crate::harness::upgrade::HARNESS_MARK`).
+pub const CONTINUE_TEXT: &str = concat!(
+    harness_mark!(),
+    " Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then \
+     keep hunting for what would make the work more complete and more correct. Never stop to \
+     ask: put what only a person can give on a line starting NEEDS YOU: and carry on with \
+     everything else."
+);
 
 /// Every `[harness]` key, in the order the help and Settings list them.
 pub const KEYS: &[&str] = &[
@@ -155,6 +170,7 @@ pub const KEYS: &[&str] = &[
     "limit_wait",
     "accounts",
     "limit_reset",
+    "limit_reset_kinds",
     "usage_tap",
     "usage_notes",
     "usage_credits",
@@ -249,27 +265,35 @@ impl Approve {
 /// so a key may only move it down that order.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Autopilot {
-    /// Keep the work moving: every point answered, the work continued until
-    /// the agent's clear final statement (a done reply to the done check, or
-    /// a legacy explicit-finish report); a final report that still names open
-    /// work, a blocked item included, or a session repository that still
-    /// holds uncommitted, untracked, stashed or unpushed work is challenged
-    /// at every done report while it is left (`policy::turn_end`'s
-    /// `RULE_OPEN_ITEMS` and `RULE_UNCOMMITTED`). The harness as it ran before
-    /// Autopilot. The default.
+    /// FOREVER CRUISE: keep the work moving toward completeness and
+    /// correctness, for good. Every point is answered and every free turn end
+    /// gets a typed act — the continuation (`continue_text`), or, where the
+    /// agent claims it is done (a done phrase, an idle report, a legacy
+    /// `ATERM-TASK-DONE`, a `Nothing left:` defense), the defend-and-find-more
+    /// prompt (`policy::turn_end`'s `DONE_CHECK`, `RULE_DONE_CHECK`), naming
+    /// the open work the claim still names and the work the session's
+    /// repository still holds that no remote main has. Nothing the agent says
+    /// ends a Cruise task; only a person's own exchange rests it. The
+    /// short-turn back-off paces it (cost control, never a stop). A line
+    /// starting `NEEDS YOU:` is put on the person's screen and never holds
+    /// the work. The default.
     #[default]
     Cruise,
-    /// Wrap the work up cleanly, then stop: the turn-end policy types the
-    /// land instruction once (finish the step in hand, start nothing new,
-    /// leave it verified, committed and pushed, write down what is left,
-    /// report the outcome in ordinary language), at most `LAND_NUDGES`
-    /// nudges after it, and then nothing but the land answer, which a
-    /// question asked in prose at a turn end gets whether or not the nudges
-    /// are spent (`policy::turn_end`'s `RULE_LAND`, `RULE_LAND_NUDGE`,
-    /// `RULE_LAND_ANSWER`). A question DIALOG is answered as under `Cruise`
-    /// (the session's `questions` word, else `question_priority`: the land
-    /// answer for a dialog is deferred, the design's §2.2), and so are boxes
-    /// and walls: the wrap-up still has to finish.
+    /// FOREVER LAND: land ALL of the work into the remote main branch, no
+    /// exceptions, then end the session cleanly. The turn-end policy types
+    /// the land instruction at the episode's first point and a land nudge at
+    /// every free point after it, with no bound, paced by the same back-off
+    /// (`policy::turn_end`'s `RULE_LAND`, `RULE_LAND_NUDGE`); a question
+    /// asked in prose at a turn end gets the land answer (`RULE_LAND_ANSWER`).
+    /// The task lands only on a clean `Nothing left:` defense at a land act's
+    /// yield: no `NEEDS YOU:` need standing, no open work read strictly (no
+    /// blocker excuses an item; unlanded, parked, WIP or for-later work
+    /// counts), and nothing in the session's repository that no remote main
+    /// has (uncommitted, untracked, stashed, unpushed, or off the remote's
+    /// default branch). A question DIALOG is answered as under `Cruise` (the
+    /// session's `questions` word, else `question_priority`: the land answer
+    /// for a dialog is deferred, the design's §2.2), and so are boxes and
+    /// walls: the landing still has to finish.
     Land,
     /// Hands off: the harness answers nothing and types nothing into the
     /// session — plain Claude Code, the owner's A/B baseline. The loop parks
@@ -397,7 +421,9 @@ pub struct SupervisorConfig {
     pub dismiss_surveys: bool,
     /// Type a continuation when a worker ends a turn with work left.
     pub continue_policy: bool,
-    /// What a continuation types when the worker offers no suggestion of its own.
+    /// What a continuation types when the worker offers no suggestion of its
+    /// own: by default Cruise's strict continuation (`[aterm harness]
+    /// Autopilot is Cruise: keep going. …`), marked as the harness's own turn.
     pub continue_text: String,
     /// At most this many continuations per session per hour; `0` is no cap.
     /// Without a cap, a worker that keeps stopping short is continued on a
@@ -452,15 +478,37 @@ pub struct SupervisorConfig {
     /// `docs/SPEC-claude-accounts-resets-2026-10-02.md`): keys only, through
     /// the dialog's reset row matched by its exact label, then its
     /// confirmation read whole. No command is ever typed for it, and a
-    /// confirmation that does not read exactly is closed with the reset kept. Off by default: a reset is the owner's
-    /// scarce purchase, so `true` is more power, as [`Self::stall_term`]'s
-    /// is: [`Self::limit`] leaves it off and a misplaced table never turns it
-    /// on. Acts only with
+    /// confirmation that does not read exactly is closed with the reset kept.
+    /// From Claude Code 2.1.304, which draws a row per kind of reset on
+    /// offer, a row is taken only where it is the dialog's one reset and of a
+    /// kind the step takes ([`aterm_phase::ResetKind::takeable`]: 5-hour,
+    /// weekly or full, never Fable); a dialog offering several kinds gets its
+    /// wait row, the choice being the owner's, unless
+    /// [`Self::limit_reset_kinds`] names the kinds it may spend (the spec's
+    /// R2; `aterm harness accounts --help` says the same to a user). Off by
+    /// default: a reset is the owner's scarce purchase, so `true` is more
+    /// power, as [`Self::stall_term`]'s is: [`Self::limit`] leaves it off and
+    /// a misplaced table never turns it on. Acts only with
     /// [`Self::resume_limits`] on (the loop's gate; this reader takes the key
     /// as written). Never yet run against a real wall: its screens were
     /// composed from the vendor's bundle, so the default stays `false` until
     /// that spec's live check (§6) passes.
     pub limit_reset: bool,
+    /// WHICH KINDS OF LIMIT RESET [`Self::limit_reset`] MAY SPEND, AND IN
+    /// WHAT ORDER (`[harness] limit_reset_kinds = ["full", "weekly",
+    /// "5-hour"]`; [`reset_kind_word`] names each kind). Empty, the default:
+    /// a row is taken only where it is the dialog's ONE reset, of a kind the
+    /// step takes (the spec's R2). Listed: the row of the first listed kind
+    /// the dialog offers is taken, whatever else is on offer, and an
+    /// unlisted kind never; a Fable reset is never taken and cannot be
+    /// listed, nor can a kind twice. Read only with [`Self::limit_reset`]
+    /// on: off, no list spends anything, so [`Self::limits`] admits a list
+    /// that differs from the one before only while the step is off — a list
+    /// spends where the default does not (several on offer) and the default
+    /// where a list does not (an unlisted lone kind), so neither is less
+    /// power than the other. It has no least of its own ([`Self::limit`]):
+    /// which kinds is how the step spends, `limit_reset` whether.
+    pub limit_reset_kinds: Vec<ResetKind>,
     /// The usage tap (`crate::harness::tap`; the accounts design v2 §3.1,
     /// ruling R-7): put Claude Code's own status-line setting — an inline
     /// `--settings` whose command is `<aterm> harness tap` — on the relaunch
@@ -698,6 +746,13 @@ pub struct Rebuilt {
     /// For each key the texts named that this build has retired, the note
     /// [`SupervisorConfig::set`] gave as it read it.
     pub retired: Vec<String>,
+    /// For each value [`SupervisorConfig::set`] refused, the note it gave as
+    /// it read the value the way an owner's file is read (the key's default
+    /// kept, or an off read as its limit), and the value it read in its place
+    /// (`…; this build read <key>=<text>`) — only ever filled by
+    /// [`SupervisorConfig::rebuild_nearest`], for a policy its header already
+    /// says no file spells; [`SupervisorConfig::rebuild`] refuses instead.
+    pub refused: Vec<String>,
 }
 
 impl Default for SupervisorConfig {
@@ -719,7 +774,7 @@ impl Default for SupervisorConfig {
                 .to_string(),
             dismiss_surveys: true,
             continue_policy: true,
-            continue_text: "keep going".to_string(),
+            continue_text: CONTINUE_TEXT.to_string(),
             continue_per_hour: 0,
             rules_file: None,
             retry_api_errors: true,
@@ -729,6 +784,7 @@ impl Default for SupervisorConfig {
             autocompact_offer: Some(AUTOCOMPACT_DEFAULT_K),
             accounts: Mode::Early,
             limit_reset: false,
+            limit_reset_kinds: Vec::new(),
             usage_tap: false,
             usage_notes: false,
             usage_credits: false,
@@ -849,6 +905,15 @@ impl SupervisorConfig {
                 "renew" => self.logins = true,
                 "off" => self.logins = false,
                 _ => return bad(self, "renew or off"),
+            },
+            "limit_reset_kinds" => match reset_kinds(v) {
+                Ok(kinds) => self.limit_reset_kinds = kinds,
+                Err(why) => {
+                    return Err(format!(
+                        "harness.limit_reset_kinds: {why} — no setting, so limit_reset_kinds \
+                         keeps its default"
+                    ));
+                }
             },
             "hosts" => {
                 self.hosts = value
@@ -1019,8 +1084,9 @@ impl SupervisorConfig {
     /// default), no record of the one account's usage is kept (`usage_notes =
     /// false`, its default), no session is carried onto usage credits
     /// (`usage_credits = false`, its default), an agent's own switch (`codex.enabled`) is that
-    /// agent off. A text and `question_priority` (HOW a question is answered)
-    /// keep their defaults: neither carries power.
+    /// agent off. A text, `question_priority` (HOW a question is answered)
+    /// and `limit_reset_kinds` (HOW a reset is chosen; `limit_reset` is
+    /// whether) keep their defaults: none carries power of its own.
     pub fn limit(&mut self, key: &str) {
         match key {
             "enabled" => self.enabled = false,
@@ -1041,6 +1107,9 @@ impl SupervisorConfig {
             "hosts" => self.hosts.clear(),
             // An opt-in: its least power is its default, no reset taken.
             "limit_reset" => self.limit_reset = false,
+            // How the step chooses, not whether it spends: no least of its
+            // own ([`Self::limit_reset_kinds`]).
+            "limit_reset_kinds" => {}
             // An opt-in too: its least power is its default, no tap added.
             "usage_tap" => self.usage_tap = false,
             // An opt-in too: no record and no line.
@@ -1074,14 +1143,14 @@ impl SupervisorConfig {
     /// Tests: the full-power default with `key` alone moved off it — by its
     /// limit, else by the first of a few values that is the key's own (an
     /// opt-in's `true`, a text, the priority's other word, a path or list, a
-    /// time). A key none of them moves fails here by name, so every test that
+    /// time, a kind of reset). A key none of them moves fails here by name, so every test that
     /// walks [`KEYS`] through it takes a new key in by construction.
     #[cfg(test)]
     pub(crate) fn moved_off_default(key: &str) -> Self {
         let full = Self::default();
         let mut moved = full.clone();
         moved.limit(key);
-        for value in ["true", "long-term", "~/flip/root", "18:00"] {
+        for value in ["true", "long-term", "~/flip/root", "18:00", "full"] {
             if moved != full {
                 break;
             }
@@ -1237,7 +1306,7 @@ impl SupervisorConfig {
                     let key = key.as_str();
                     let quoted = value.trim_start().starts_with(['"', '\'']);
                     let before = cfg.clone();
-                    let list = matches!(key, "trust_roots" | "hosts");
+                    let list = matches!(key, "trust_roots" | "hosts" | "limit_reset_kinds");
                     let refused = if value.trim_start().starts_with('[') && !list {
                         Some(no_shape(key, "array"))
                     } else {
@@ -1304,11 +1373,13 @@ impl SupervisorConfig {
             Value::Boolean(_) | Value::Integer(_) => {
                 self.set_scalar(key, &scalar_text(value).unwrap_or_default(), false)
             }
-            // An array is `trust_roots`' shape alone.
-            Value::Array(_) if matches!(key, "trust_roots" | "hosts") => match scalar_text(value) {
-                Some(text) => self.set(key, &text),
-                None => Err(no_shape(key, value.type_str())),
-            },
+            // An array is the lists' shape alone.
+            Value::Array(_) if matches!(key, "trust_roots" | "hosts" | "limit_reset_kinds") => {
+                match scalar_text(value) {
+                    Some(text) => self.set(key, &text),
+                    None => Err(no_shape(key, value.type_str())),
+                }
+            }
             _ if RETIRED_KEYS.contains(&key) => Err(retired_no_setting(key)),
             _ if KEYS.contains(&key) => Err(no_shape(key, value.type_str())),
             _ => match agent_key(key) {
@@ -1370,6 +1441,7 @@ impl SupervisorConfig {
                 || self.autocompact_offer == before.autocompact_offer)
             && accounts_rank(self.accounts) <= accounts_rank(before.accounts)
             && no_more(self.limit_reset, before.limit_reset)
+            && (!self.limit_reset || self.limit_reset_kinds == before.limit_reset_kinds)
             && no_more(self.usage_tap, before.usage_tap)
             && no_more(self.usage_notes, before.usage_notes)
             && no_more(self.usage_credits, before.usage_credits)
@@ -1394,7 +1466,7 @@ impl SupervisorConfig {
     /// Settings ▸ Harness lists it, each value against the full-power
     /// default's, as the effective `[harness]` table.
     #[must_use]
-    pub fn texts(&self) -> [(&'static str, String); 36] {
+    pub fn texts(&self) -> [(&'static str, String); 37] {
         let Self {
             enabled,
             // No key in [`KEYS`]: the agents' own tables ([`Self::agent_texts`];
@@ -1421,6 +1493,7 @@ impl SupervisorConfig {
             autocompact_offer,
             accounts,
             limit_reset,
+            limit_reset_kinds,
             usage_tap,
             usage_notes,
             usage_credits,
@@ -1462,6 +1535,10 @@ impl SupervisorConfig {
             ("limit_wait", limit_wait.to_string()),
             ("accounts", accounts.as_str().to_string()),
             ("limit_reset", limit_reset.to_string()),
+            (
+                "limit_reset_kinds",
+                reset_kinds_text(limit_reset_kinds, ","),
+            ),
             ("usage_tap", usage_tap.to_string()),
             ("usage_notes", usage_notes.to_string()),
             ("usage_credits", usage_credits.to_string()),
@@ -1574,11 +1651,43 @@ impl SupervisorConfig {
     /// A key said twice or unknown to this build, a value [`Self::set`]
     /// refuses, or a withheld rule this build does not have — each named.
     pub fn rebuild(texts: &PolicyTexts) -> Result<Rebuilt, String> {
+        Self::rebuild_reading(texts, false)
+    }
+
+    /// [`Self::rebuild`] for texts of a policy NO FILE CAN SPELL — a tape
+    /// whose header said so (`exact=false`, `tape::header`): a value
+    /// [`Self::set`] refuses is read as the owner's file reads it (the key's
+    /// default kept, or an off read as its limit) and its note kept in
+    /// [`Rebuilt::refused`], where [`Self::rebuild`] refuses the texts whole.
+    ///
+    /// WHY ONLY THERE: a run's policy is captured as it was, and a test (or
+    /// any caller of the loop's API) can build one with a value the owner's
+    /// reader never yields — a trust root with a comma in it, which `set`
+    /// takes but splits in two, or an `autocompact_offer` off Claude Code's
+    /// ladder, which `set` refuses. The header checks the rebuild as it is
+    /// captured and marks either policy inexact. The first kind always read
+    /// back, under its mark; the second the strict reader refused whole, so
+    /// that tape could not be read at all. Read leniently and NAMED, the
+    /// replay runs under the nearest policy the texts give and says which
+    /// values it could not take and what it read in their place. Texts that
+    /// claim to rebuild exactly (`exact=true`) still go through the strict
+    /// reader: there a refused value is damage, not a policy no file spells.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::rebuild`], but for a value [`Self::set`] refuses.
+    pub fn rebuild_nearest(texts: &PolicyTexts) -> Result<Rebuilt, String> {
+        Self::rebuild_reading(texts, true)
+    }
+
+    /// [`Self::rebuild`], or with `nearest` [`Self::rebuild_nearest`].
+    fn rebuild_reading(texts: &PolicyTexts, nearest: bool) -> Result<Rebuilt, String> {
         let PolicyTexts {
             keys,
             agents,
             withheld,
         } = texts;
+        let mut refused = Vec::new();
         let mut cfg = Self::default();
         let wanted: Vec<String> = cfg.texts().iter().map(|(k, _)| k.to_string()).collect();
         let agent_keys: Vec<String> = cfg.agent_texts().into_iter().map(|(k, _)| k).collect();
@@ -1594,8 +1703,26 @@ impl SupervisorConfig {
             }
             for (key, value) in list {
                 if names.contains(key) {
-                    cfg.set(key, value)
-                        .map_err(|e| format!("{e} (as the policy wrote it)"))?;
+                    // `set` reads a value it refuses as the owner's file
+                    // does before it answers `Err` — the default kept, or an
+                    // off read as its limit — so the nearest policy is what
+                    // `cfg` already holds.
+                    match cfg.set(key, value) {
+                        Ok(()) => {}
+                        Err(note) if nearest => {
+                            // The value read in its place, said: what a
+                            // replay names is what this build supplied.
+                            let read = cfg
+                                .texts()
+                                .into_iter()
+                                .map(|(k, v)| (k.to_string(), v))
+                                .chain(cfg.agent_texts())
+                                .find(|(k, _)| k == key)
+                                .map_or_else(String::new, |(_, v)| v);
+                            refused.push(format!("{note}; this build read {key}={read}"));
+                        }
+                        Err(e) => return Err(format!("{e} (as the policy wrote it)")),
+                    }
                 } else if what == "key" && RETIRED_KEYS.contains(&key.as_str()) {
                     retired_keys.push((key, value));
                 } else {
@@ -1630,6 +1757,7 @@ impl SupervisorConfig {
             policy: cfg,
             supplied,
             retired,
+            refused,
         })
     }
 
@@ -1647,6 +1775,10 @@ impl SupervisorConfig {
         match key {
             "trust_roots" => Some(format!("[{}]", full.trust_roots.join(", "))),
             "hosts" => Some(format!("[{}]", full.hosts.join(", "))),
+            "limit_reset_kinds" => Some(format!(
+                "[{}]",
+                reset_kinds_text(&full.limit_reset_kinds, ", ")
+            )),
             // No time offered.
             "land_at" if text.is_empty() => Some("none".to_string()),
             _ if text.is_empty() => None,
@@ -1683,6 +1815,7 @@ impl SupervisorConfig {
                 "false" | "" => "off".to_string(),
                 _ if key == "trust_roots" => self.trust_roots.join(", "),
                 _ if key == "hosts" => self.hosts.join(", "),
+                _ if key == "limit_reset_kinds" => reset_kinds_text(&self.limit_reset_kinds, ", "),
                 _ => value,
             };
             written.limits.push(format!("{key}: {shown}"));
@@ -1936,6 +2069,50 @@ pub fn spells_off(value: &str) -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "none" | "never" | "disabled"
         )
+}
+
+/// `[harness] limit_reset_kinds`' word for a kind of reset: its name as the
+/// usage-limit dialog draws it, less ` reset` (`5-hour`, `weekly`, `full`;
+/// `fable`, which no list may hold).
+#[must_use]
+pub fn reset_kind_word(kind: ResetKind) -> &'static str {
+    match kind {
+        ResetKind::Session => "5-hour",
+        ResetKind::Weekly => "weekly",
+        ResetKind::Fable => "fable",
+        ResetKind::Full => "full",
+    }
+}
+
+/// `kinds` in [`reset_kind_word`]'s words, joined by `sep`.
+fn reset_kinds_text(kinds: &[ResetKind], sep: &str) -> String {
+    kinds
+        .iter()
+        .map(|kind| reset_kind_word(*kind))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// `[harness] limit_reset_kinds` read from its words joined by `,`
+/// ([`reset_kind_word`], ASCII case ignored): the kinds in the owner's order,
+/// none for no words. Refused whole, with why: a word that names no kind, the
+/// Fable kind, a kind twice.
+fn reset_kinds(text: &str) -> Result<Vec<ResetKind>, String> {
+    let mut kinds = Vec::new();
+    for word in text.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        let kind = ResetKind::ALL
+            .into_iter()
+            .find(|kind| reset_kind_word(*kind).eq_ignore_ascii_case(word))
+            .ok_or_else(|| format!("expected 5-hour, weekly or full, got {word:?}"))?;
+        if !kind.takeable() {
+            return Err(format!("{word:?}: a Fable reset is never taken"));
+        }
+        if kinds.contains(&kind) {
+            return Err(format!("{word:?} is listed twice"));
+        }
+        kinds.push(kind);
+    }
+    Ok(kinds)
 }
 
 /// Whether `note` (one of [`SupervisorConfig::from_aterm_toml`]'s) says a key
@@ -2288,7 +2465,8 @@ mod tests {
             // A text has no limit, and neither has how a question is answered
             // (`question_priority`): no power to take; nor `stall_term`, whose
             // default (the warning) is already its least, nor `limit_reset`,
-            // whose default (no reset taken) is, nor `usage_tap` (no tap), nor
+            // whose default (no reset taken) is, nor `limit_reset_kinds` (how a
+            // reset is chosen, not whether), nor `usage_tap` (no tap), nor
             // `usage_notes` (no record), nor `usage_credits` (the
             // subscription), nor `hosts`, whose default (no machine) is, nor
             // `land_at`, which only offers a time.
@@ -2302,6 +2480,7 @@ mod tests {
                     | "rules_file"
                     | "stall_term"
                     | "limit_reset"
+                    | "limit_reset_kinds"
                     | "usage_tap"
                     | "usage_notes"
                     | "usage_credits"
@@ -2929,6 +3108,104 @@ mod tests {
         }
     }
 
+    /// `[harness] limit_reset_kinds`: the owner's order of the kinds the
+    /// limit reset may spend. Empty by default (the one reset on offer); an
+    /// array or its words joined by `,`, case ignored, read back by its
+    /// text; a word no kind has, the Fable kind and a kind twice are no
+    /// setting and are said; an off is no setting either (which kinds is
+    /// not whether: `limit_reset` is). Neither a list nor the default is
+    /// less power than the other, so a misplaced or repeated list is admitted
+    /// only with the step off, and against the default a list is the owner's
+    /// own choice. NEGATIVE CONTROL: the same misplaced list with the step on
+    /// is refused, and with the step off admitted.
+    #[test]
+    fn limit_reset_kinds_is_the_owners_order_and_moves_only_with_the_step_off() {
+        use aterm_phase::ResetKind::{Full, Session, Weekly};
+        let full = SupervisorConfig::default();
+        assert!(
+            full.limit_reset_kinds.is_empty(),
+            "the default is the lone offer"
+        );
+        assert_eq!(
+            SupervisorConfig::default_shown("limit_reset_kinds").as_deref(),
+            Some("[]")
+        );
+        for (text, want) in [
+            (
+                "[\"full\", \"weekly\", \"5-hour\"]",
+                vec![Full, Weekly, Session],
+            ),
+            ("[\"Weekly\"]", vec![Weekly]),
+            ("\"5-hour, full\"", vec![Session, Full]),
+            ("[]", vec![]),
+            ("\"\"", vec![]),
+        ] {
+            let (c, notes) = SupervisorConfig::from_aterm_toml(&format!(
+                "[harness]\nlimit_reset = true\nlimit_reset_kinds = {text}\n"
+            ));
+            assert_eq!(c.limit_reset_kinds, want, "{text}");
+            assert!(notes.is_empty(), "{text}: {notes:?}");
+            let mut back = full.clone();
+            let (_, said) = c
+                .texts()
+                .into_iter()
+                .find(|(k, _)| *k == "limit_reset_kinds")
+                .expect("a text");
+            back.set("limit_reset_kinds", &said).expect("its own text");
+            assert_eq!(
+                back.limit_reset_kinds, want,
+                "{text} read back from {said:?}"
+            );
+        }
+        for text in [
+            "[\"fable\"]",
+            "[\"full\", \"Fable\"]",
+            "[\"full\", \"full\"]",
+            "[\"session\"]",
+            "[\"monthly\"]",
+            "false",
+            "\"none\"",
+            "[1]",
+        ] {
+            let (c, notes) = SupervisorConfig::from_aterm_toml(&format!(
+                "[harness]\nlimit_reset_kinds = {text}\n"
+            ));
+            assert_eq!(c, full, "{text}: no setting");
+            assert_eq!(notes.len(), 1, "{text}: {notes:?}");
+            assert!(notes[0].contains("limit_reset_kinds"), "{text}: {notes:?}");
+        }
+        // The power order: a list moves only with the step off.
+        let listed = |on: bool, kinds: Vec<aterm_phase::ResetKind>| SupervisorConfig {
+            limit_reset: on,
+            limit_reset_kinds: kinds,
+            ..full.clone()
+        };
+        assert!(!listed(true, vec![Full]).limits(&listed(true, vec![])));
+        assert!(!listed(true, vec![]).limits(&listed(true, vec![Full])));
+        assert!(!listed(true, vec![Weekly]).limits(&listed(true, vec![Full, Weekly])));
+        assert!(
+            listed(false, vec![Full]).limits(&listed(true, vec![])),
+            "off limits"
+        );
+        assert!(listed(false, vec![Full]).limits(&listed(false, vec![])));
+        let mut c = listed(true, vec![Full]);
+        c.limit("limit_reset_kinds");
+        assert_eq!(c, listed(true, vec![Full]), "no least of its own");
+        assert_eq!(
+            listed(true, vec![Full, Weekly]).against_default(),
+            Written {
+                limits: Vec::new(),
+                own: vec!["limit_reset", "limit_reset_kinds"],
+            }
+        );
+        // Misplaced: admitted only with the step off.
+        let misplaced = "[theme]\nharness.limit_reset_kinds = [\"full\"]\n";
+        let on = read(&format!("[harness]\nlimit_reset = true\n{misplaced}"));
+        assert_eq!(on, listed(true, vec![]), "refused with the step on");
+        let off = read(misplaced);
+        assert_eq!(off, listed(false, vec![Full]), "admitted with the step off");
+    }
+
     /// `[harness] usage_notes` (accounts v2 S5): the record of a machine's one
     /// account's usage and the two digest lines it makes are a new alert, so
     /// the key SHIPS `false`; the root table's own `true` turns it on, its
@@ -3270,6 +3547,7 @@ mod tests {
                     policy: want.clone(),
                     supplied: Vec::new(),
                     retired: Vec::new(),
+                    refused: Vec::new(),
                 }),
                 "{texts:?}"
             );
@@ -3384,6 +3662,47 @@ mod tests {
             &|t| t.withheld.push(("trust_dialog".into(), "false".into())),
             "trust_dialog",
         );
+    }
+
+    /// THE NEAREST REBUILD, for a policy no file spells (a header's
+    /// `exact=false`): a value `set` refuses — an `autocompact_offer` off
+    /// Claude Code's ladder, as a test can build one — is read as the
+    /// owner's file reads it, the default kept, and named in
+    /// [`Rebuilt::refused`]; every other text stands. The strict rebuild of
+    /// the same texts refuses them (the negative control), and the nearest
+    /// one still refuses what no reading can take: a key a newer build wrote.
+    #[test]
+    fn rebuild_nearest_reads_a_refused_value_as_the_owners_file_and_names_it() {
+        let mut ran = SupervisorConfig::default();
+        ran.set("approve", "safe").expect("approve");
+        ran.autocompact_offer = Some(450);
+        let texts = ran.policy_texts();
+        let e = SupervisorConfig::rebuild(&texts).expect_err("450k is on no ladder");
+        assert!(e.contains("autocompact_offer"), "{e}");
+        let back = SupervisorConfig::rebuild_nearest(&texts).expect("the nearest policy");
+        assert_eq!(
+            back.policy,
+            SupervisorConfig {
+                autocompact_offer: Some(AUTOCOMPACT_DEFAULT_K),
+                ..ran
+            },
+            "the refused value keeps its default; what else was said stands"
+        );
+        assert_eq!(back.refused.len(), 1, "{back:?}");
+        assert!(
+            back.refused[0].starts_with("harness.autocompact_offer: ")
+                && back.refused[0].contains("450k")
+                && back.refused[0].ends_with("; this build read autocompact_offer=400k"),
+            "what was refused and what was read in its place: {back:?}"
+        );
+        assert!(
+            back.supplied.is_empty() && back.retired.is_empty(),
+            "{back:?}"
+        );
+        let mut newer = texts;
+        newer.keys.push(("no_such".into(), "1".into()));
+        let e = SupervisorConfig::rebuild_nearest(&newer).expect_err("a newer build's key");
+        assert!(e.contains("no_such"), "{e}");
     }
 
     #[test]

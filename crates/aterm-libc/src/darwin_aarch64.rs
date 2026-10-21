@@ -290,6 +290,63 @@ pub struct proc_bsdinfo {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct proc_fdinfo {
+    pub proc_fd: i32,
+    pub proc_fdtype: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct proc_taskallinfo {
+    pub pbsd: proc_bsdinfo,
+    pub ptinfo: proc_taskinfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct proc_taskinfo {
+    pub pti_virtual_size: u64,
+    pub pti_resident_size: u64,
+    pub pti_total_user: u64,
+    pub pti_total_system: u64,
+    pub pti_threads_user: u64,
+    pub pti_threads_system: u64,
+    pub pti_policy: i32,
+    pub pti_faults: i32,
+    pub pti_pageins: i32,
+    pub pti_cow_faults: i32,
+    pub pti_messages_sent: i32,
+    pub pti_messages_received: i32,
+    pub pti_syscalls_mach: i32,
+    pub pti_syscalls_unix: i32,
+    pub pti_csw: i32,
+    pub pti_threadnum: i32,
+    pub pti_numrunning: i32,
+    pub pti_priority: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct proc_threadinfo {
+    pub pth_user_time: u64,
+    pub pth_system_time: u64,
+    pub pth_cpu_usage: i32,
+    pub pth_policy: i32,
+    pub pth_run_state: i32,
+    pub pth_flags: i32,
+    pub pth_sleep_time: i32,
+    pub pth_curpri: i32,
+    pub pth_priority: i32,
+    pub pth_maxpriority: i32,
+    pub pth_name: [c_char; 64],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
 pub struct processor_cpu_load_info {
     pub cpu_ticks: [c_uint; 4],
 }
@@ -991,6 +1048,8 @@ pub const MAP_NOCACHE: c_int = 0x0400;
 pub const MAP_NORESERVE: c_int = 0x0040;
 pub const MAP_PRIVATE: c_int = 0x0002;
 pub const MAP_SHARED: c_int = 0x0001;
+pub const MAXCOMLEN: usize = 16;
+pub const MAXTHREADNAMESIZE: usize = 64;
 pub const MCL_CURRENT: c_int = 0x0001;
 pub const MCL_FUTURE: c_int = 0x0002;
 pub const MSG_CTRUNC: c_int = 0x20;
@@ -1080,12 +1139,19 @@ pub const PRIO_PGRP: c_int = 1;
 pub const PRIO_PROCESS: c_int = 0;
 pub const PRIO_USER: c_int = 2;
 pub const PROCESSOR_CPU_LOAD_INFO: c_int = 2;
+pub const PROC_PIDLISTFDS: c_int = 1;
 pub const PROC_PIDPATHINFO_MAXSIZE: c_int = 4096;
+pub const PROC_PIDTASKALLINFO: c_int = 2;
 pub const PROC_PIDTBSDINFO: c_int = 3;
+pub const PROC_PIDTHREADINFO: c_int = 5;
 pub const PROT_EXEC: c_int = 4;
 pub const PROT_NONE: c_int = 0;
 pub const PROT_READ: c_int = 1;
 pub const PROT_WRITE: c_int = 2;
+pub const PROX_FDTYPE_KQUEUE: c_int = 5;
+pub const PROX_FDTYPE_PIPE: c_int = 6;
+pub const PROX_FDTYPE_SOCKET: c_int = 2;
+pub const PROX_FDTYPE_VNODE: c_int = 1;
 pub const P_ALL: idtype_t = 0;
 pub const P_PGID: idtype_t = 2;
 pub const P_PID: idtype_t = 1;
@@ -1120,6 +1186,7 @@ pub const SF_SETTABLE: c_uint = 0x3fff0000;
 pub const SHUT_RD: c_int = 0;
 pub const SHUT_RDWR: c_int = 2;
 pub const SHUT_WR: c_int = 1;
+pub const SIDL: u32 = 1;
 pub const SIGABRT: c_int = 6;
 pub const SIGALRM: c_int = 14;
 pub const SIGBUS: c_int = 10;
@@ -1179,6 +1246,9 @@ pub const SO_SNDBUF: c_int = 0x1001;
 pub const SO_SNDTIMEO: c_int = 0x1005;
 pub const SO_TIMESTAMP: c_int = 0x0400;
 pub const SO_TYPE: c_int = 0x1008;
+pub const SRUN: u32 = 2;
+pub const SSLEEP: u32 = 3;
+pub const SSTOP: u32 = 4;
 pub const STDERR_FILENO: c_int = 2;
 pub const STDIN_FILENO: c_int = 0;
 pub const STDOUT_FILENO: c_int = 1;
@@ -1226,6 +1296,11 @@ pub const TCP_NODELAY: c_int = 1;
 pub const TCSADRAIN: c_int = 1;
 pub const TCSAFLUSH: c_int = 2;
 pub const TCSANOW: c_int = 0;
+pub const TH_STATE_HALTED: c_int = 5;
+pub const TH_STATE_RUNNING: c_int = 1;
+pub const TH_STATE_STOPPED: c_int = 2;
+pub const TH_STATE_UNINTERRUPTIBLE: c_int = 4;
+pub const TH_STATE_WAITING: c_int = 3;
 pub const TIOCEXCL: c_int = 0x2000740d;
 pub const TIOCGWINSZ: c_ulong = 0x40087468;
 pub const TIOCNXCL: c_int = 0x2000740e;
@@ -1527,6 +1602,13 @@ unsafe extern "C" {
     pub fn pread(fd: c_int, buf: *mut c_void, count: size_t, offset: off_t) -> ssize_t;
     pub fn proc_listallpids(buffer: *mut c_void, buffersize: c_int) -> c_int;
     pub fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut rusage_info_t) -> c_int;
+    pub fn proc_pidfdinfo(
+        pid: c_int,
+        fd: c_int,
+        flavor: c_int,
+        buffer: *mut c_void,
+        buffersize: c_int,
+    ) -> c_int;
     pub fn proc_pidinfo(
         pid: c_int,
         flavor: c_int,

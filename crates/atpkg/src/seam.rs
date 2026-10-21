@@ -4460,14 +4460,18 @@ mod tests {
     /// End to end with a real process: a copy of this test binary stands in the store as
     /// `targo` and runs from the view ([`probe_parks_in_the_view_until_killed`]). An update
     /// leaves the view as it stands and says so; once the process is gone the next
-    /// re-assertion lays the new build.
+    /// re-assertion lays the new build. The view's copy is a new file macOS assesses on its
+    /// first exec, so nothing replaces or removes it before the probe wrote [`VIEW_PARKED`]
+    /// (the kernel's path for it shows while it still waits for the verdict); a probe that
+    /// never does leaves the fixture in place.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn reassert_leaves_a_view_a_live_build_runs_from_and_says_so() {
         if std::env::var_os(VIEW_PROBE_ENV).is_some() {
             return;
         }
-        let fx = Fixture::new("view-live");
+        // Dropped (removed) only once the probe has run; never by an unwind before that.
+        let fx = std::mem::ManuallyDrop::new(Fixture::new("view-live"));
         let old = fx.install_trust(100);
         let store_targo = old.join("bin").join("targo");
         std::fs::remove_file(&store_targo).unwrap();
@@ -4489,6 +4493,8 @@ mod tests {
                  runs_from_and_says_so: the probe's executable reads as the translator, never \
                  the view's targo; a CPU of this code's architecture decides it"
             );
+            // Nothing ran from the fixture.
+            drop(std::mem::ManuallyDrop::into_inner(fx));
             return;
         }
 
@@ -4507,22 +4513,25 @@ mod tests {
                 .args(["--exact", "--nocapture", "--quiet", VIEW_PROBE])
                 .env(VIEW_PROBE_ENV, "1")
                 .stdin(aterm_uds::spawnfd::Stdio::null())
-                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
                 .stderr(aterm_uds::spawnfd::Stdio::null())
                 .spawn()
                 .expect("spawn the view's targo"),
         );
-        // `spawn` does not promise the exec happened; the table is what is measured.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while crate::gc::runs_from(&view) != Some(true) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the probe never came up running from {} within a minute — the spawn failed, \
-                 which is not what this case is about",
-                view.display()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // `spawn` does not promise the exec happened, and the kernel's path for the probe
+        // shows before its first exec's assessment is done: its line is the proof it runs.
+        aterm_uds::deadline::prints(
+            &mut probe.0,
+            VIEW_PARKED,
+            aterm_uds::deadline::FIRST_EXEC_HANG,
+        );
+        let fx = std::mem::ManuallyDrop::into_inner(fx);
+        assert_eq!(
+            crate::gc::runs_from(&view),
+            Some(true),
+            "PRECONDITION: the process table shows the probe running from {}",
+            view.display()
+        );
 
         let new = fx.install_trust(200);
         let lines = reassert(&fx.layout, &fx.rustup);
@@ -4563,15 +4572,20 @@ mod tests {
     const VIEW_PROBE_ENV: &str = "ATPKG_SEAM_VIEW_PROBE";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const VIEW_PROBE: &str = "seam::tests::probe_parks_in_the_view_until_killed";
+    /// The line the probe writes once it runs from the view.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    const VIEW_PARKED: &str = "parked in the view";
 
-    /// The copy's whole job: run from the view until the parent kills it — or goes away,
-    /// so a parent that dies first leaves no stray in the process table.
+    /// The copy's whole job: say [`VIEW_PARKED`], then run from the view until the parent
+    /// kills it — or goes away, so a parent that dies first leaves no stray in the process
+    /// table.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn probe_parks_in_the_view_until_killed() {
         if std::env::var_os(VIEW_PROBE_ENV).is_none() {
             return;
         }
+        println!("{VIEW_PARKED}");
         // SAFETY: `getppid` takes no arguments, reads no memory we own and cannot fail.
         let spawner = unsafe { libc::getppid() };
         loop {

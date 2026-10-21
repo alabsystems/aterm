@@ -50,6 +50,7 @@ mod kitty_chunked_load;
 mod kitty_graphics_delete;
 mod osc_param_tail;
 mod palette_refusal_told_once;
+mod primary_flap_with_output;
 mod reload_keeps_program_colours;
 mod replay_corpus_probe;
 mod replay_offset_determinism;

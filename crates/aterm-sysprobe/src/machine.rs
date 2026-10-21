@@ -3,16 +3,33 @@
 
 //! THE MACHINE NOW — the readers the system-awareness stats call, once a
 //! second on their probe thread while a window shows them (design
-//! `docs/DESIGN-system-awareness-2026-10-16.md` §4.3, §5.2, §9):
+//! `docs/DESIGN-system-awareness-2026-10-16.md` §4.3, §5.2, §5.4, §9, §16):
 //!
 //! * [`Probe::core_ticks`] — every logical core's cumulative ticks;
+//! * [`Probe::throttle`] — the throttle level (`none` … `severe`);
 //! * [`cpu_layout`] — the cores grouped into the clusters the OS names;
-//! * [`memory_detail`] — memory by the OS's own page classes, swap, pressure;
+//! * [`memory_detail`] — memory by the OS's own classes, swap, commit,
+//!   pressure;
 //! * [`gpu`] — the GPU's device-wide use;
-//! * [`volume`] — the size and free space of the volume a path lives on.
+//! * [`volume`] — the size and free space of the volume a path lives on;
+//! * [`net_links`] — every network interface's kind, state, link rate and
+//!   cumulative counters, with [`counts_toward_machine`] naming the links
+//!   whose traffic is the machine's own;
+//! * [`process_limits`] — how many processes the machine, and one user, may
+//!   run;
+//! * [`load_average`] — the kernel's 1, 5 and 15 minute load averages;
+//! * [`capacity`] — what this process may use (a Linux cgroup's limits);
+//! * [`caps`] — what of all this the running machine can say.
 //!
 //! Each answers once, when asked: no thread, no timer, no subprocess, no
 //! unbounded read. Nothing here derives a rate; the caller takes deltas.
+//! What an OS cannot give is `None` (with a [`Why`] where the caller needs
+//! one), never a zero.
+//!
+//! The macOS arm is the private `macos` module; the Linux arm is
+//! [`crate::linux`]'s readers under a root directory (`/` here, a fixture
+//! tree in tests); the Windows arm is the private `win` module over
+//! [`crate::windows`]'s pure decoders.
 //!
 //! # Cost
 //!
@@ -20,16 +37,24 @@
 //! macOS 27) on 2026-10-19 at load average 30–32 (every core busy), release
 //! build, by `examples/live.rs`: the median of 2,000 back-to-back calls each,
 //! quoted in each reader's doc. No reader allocates beyond what it returns,
-//! except the kernel's and the IORegistry's own: `host_processor_info` maps
-//! its answer into this task (released before [`Probe::core_ticks`]
-//! returns) and [`gpu`] copies one CoreFoundation dictionary per call.
+//! except the kernel's and the IORegistry's own and [`net_links`]' scratch:
+//! `host_processor_info` maps its answer into this task (released before
+//! [`Probe::core_ticks`] returns), [`gpu`] copies one CoreFoundation
+//! dictionary per call, and [`net_links`] reads into a 64 KiB heap buffer
+//! it frees before it returns (macOS: the interface list, grown up to 4 MiB
+//! where the kernel asks for more; Linux: `/proc/net/dev`, then one path
+//! buffer for every interface's sysfs files, and the rows it parsed). The
+//! buffer is made per call, not kept, because one that had grown would hold
+//! up to 4 MiB for the life of the process.
 
 use std::path::{Path, PathBuf};
 
-use crate::MemoryLevel;
+use crate::{CapSource, Caps, MemoryLevel, Why};
 
-/// One logical core's cumulative ticks since boot (100 Hz on macOS and on
-/// Linux's `USER_HZ`). The caller takes the deltas of two readings.
+/// One logical core's cumulative ticks since boot, in the platform's unit
+/// (100 Hz on macOS and on Linux's `USER_HZ`; 100 ns on Windows). Only the
+/// ratios of two readings' deltas mean anything, so the unit never leaves
+/// the caller's arithmetic.
 ///
 /// macOS keeps each count in 32 bits, so a core's count of one state wraps
 /// after 2³² ticks (about 497 days of that state at 100 Hz): a delta that
@@ -38,7 +63,8 @@ use crate::MemoryLevel;
 pub struct CoreTicks {
     /// Running user code at normal or raised priority.
     pub user: u64,
-    /// Running the kernel (Linux: `system + irq + softirq`).
+    /// Running the kernel (Linux: `system + irq + softirq`; Windows: kernel
+    /// time less idle time, DPCs and interrupts included).
     pub system: u64,
     /// Idle (Linux: `idle + iowait`, since a core waiting on a disk is free
     /// to run anything else).
@@ -64,14 +90,19 @@ impl CoreTicks {
 }
 
 /// The per-core sampler. It holds only what the next
-/// [`core_ticks`](Self::core_ticks) reuses (on Linux the `/proc/stat` buffer
-/// and the present core count; nothing on macOS): no thread, no timer, no
-/// syscall until the first read. `Send`, so the host builds it anywhere and
-/// moves it to its probe thread.
+/// [`core_ticks`](Self::core_ticks) and [`throttle`](Self::throttle) reuse
+/// (on Linux the `/proc/stat` buffer, the present core count and the last
+/// throttle count; on Windows the processor groups' widths and a buffer;
+/// nothing on macOS): no thread, no timer, no syscall until the first read.
+/// `Send`, so the host builds it anywhere and moves it to its probe thread.
 #[derive(Debug)]
 pub struct Probe {
     #[cfg(target_os = "linux")]
     stat: crate::linux::StatReader,
+    #[cfg(target_os = "linux")]
+    throttle: crate::linux::ThrottleReader,
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    win: crate::win::Ticks,
     _private: (),
 }
 
@@ -83,12 +114,20 @@ impl Default for Probe {
 
 impl Probe {
     /// A sampler that has read nothing. On Linux it sizes its buffer
-    /// ([`crate::linux::STAT_CAP`]) and reads how many cores are present.
+    /// ([`crate::linux::STAT_CAP`]) and reads how many cores are present; on
+    /// Windows it reads the processor groups' widths.
     #[must_use]
     pub fn new() -> Self {
         Self {
             #[cfg(target_os = "linux")]
-            stat: crate::linux::StatReader::new(Path::new("/"), linux_present().len()),
+            stat: crate::linux::StatReader::new(
+                Path::new("/"),
+                crate::linux::Root::system().present_or_parallelism().len(),
+            ),
+            #[cfg(target_os = "linux")]
+            throttle: crate::linux::ThrottleReader::new(crate::linux::Root::system()),
+            #[cfg(all(windows, target_pointer_width = "64"))]
+            win: crate::win::Ticks::new(),
             _private: (),
         }
     }
@@ -105,6 +144,11 @@ impl Probe {
     /// * **Linux**: one read of `/proc/stat`, at most
     ///   [`crate::linux::STAT_CAP`] bytes into a buffer the probe keeps
     ///   ([`crate::linux::proc_stat_cores`]). An offline core reads all zero.
+    /// * **Windows**: one `NtQuerySystemInformationEx(
+    ///   SystemProcessorPerformanceInformation)` per processor group
+    ///   ([`crate::windows::processor_times`]); logical id `i` is the group's
+    ///   offset (the widths of the groups before it) plus the processor's
+    ///   number in its group, as [`cpu_layout`] numbers them.
     /// * Elsewhere: `None`.
     pub fn core_ticks(&mut self) -> Option<Vec<CoreTicks>> {
         #[cfg(target_os = "macos")]
@@ -115,11 +159,93 @@ impl Probe {
         {
             self.stat.sample()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        {
+            self.win.sample()
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            all(windows, target_pointer_width = "64")
+        )))]
         {
             None
         }
     }
+
+    /// The throttle level now, or why it is unavailable.
+    ///
+    /// * **Linux**: a HEURISTIC level ([`Throttle::exact`] false) from the
+    ///   thermal zones' temperatures against their trip points and whether
+    ///   the CPUs' thermal throttle counters rose since the last call
+    ///   ([`crate::linux::throttle_level`]); [`Why::Absent`] on a machine
+    ///   with neither (most virtual machines).
+    /// * **macOS**: [`Why::NotRead`] — the public thermal notify level is not
+    ///   read by this build (design §5.2's validated reader is owed).
+    /// * **Windows**: [`Why::Unsupported`] (design §8.1).
+    ///
+    /// On Linux one call reads up to 512 per-core counter files (256 cores,
+    /// two counters each) and, for each of at most 32 thermal zones, its
+    /// temperature and up to 16 trip points' type and temperature: about
+    /// 1,600 small sysfs reads on the largest machine. It is an on-demand
+    /// reading (a `sys` query), bounded by those caps, and nothing calls it
+    /// per tick; a caller that would poll it every second keeps the trip
+    /// points it read, which do not change, rather than re-read them.
+    ///
+    /// # Errors
+    ///
+    /// The [`Why`] when no level can be given.
+    pub fn throttle(&mut self) -> Result<Throttle, Why> {
+        #[cfg(target_os = "linux")]
+        {
+            self.throttle.sample()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Err(Why::NotRead)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(Why::Unsupported)
+        }
+    }
+}
+
+/// How hard the machine is throttling its cores (design §8.1): the OS's own
+/// level mapped onto four words, ordered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ThrottleLevel {
+    /// Full speed.
+    Nominal,
+    /// Throttling has begun.
+    Light,
+    /// Throttling hard.
+    Heavy,
+    /// At the point the OS shuts work, or the machine, down.
+    Severe,
+}
+
+impl ThrottleLevel {
+    /// The wire word: `none`, `light`, `heavy`, `severe`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            ThrottleLevel::Nominal => "none",
+            ThrottleLevel::Light => "light",
+            ThrottleLevel::Heavy => "heavy",
+            ThrottleLevel::Severe => "severe",
+        }
+    }
+}
+
+/// A throttle reading ([`Probe::throttle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Throttle {
+    /// The level.
+    pub level: ThrottleLevel,
+    /// The OS's own level (`true`), or a heuristic from temperatures and
+    /// counters (`false`: Linux).
+    pub exact: bool,
 }
 
 /// One CPU cluster as the OS names it ("Super", "Performance",
@@ -186,9 +312,19 @@ impl CpuLayout {
 ///   --qos-check`). xnu indexes `host_processor_info`'s array by that same
 ///   CPU number. 187 µs median: eight sysctls and three registry reads per
 ///   device-tree node, so read it once, not every tick.
-/// * **Linux**: one cluster `"CPU"` holding the present cores
-///   (`/sys/devices/system/cpu/present`).
+/// * **Linux**: the present cores (`/sys/devices/system/cpu/present`) split
+///   by the hybrid PMUs (`/sys/devices/cpu_core/cpus` "Performance",
+///   `cpu_atom` "Efficiency") where the kernel lists them, else by each
+///   core's `cpu_capacity` (ARM big.LITTLE and its kin, fastest first),
+///   else one cluster `"CPU"` ([`crate::linux::layout_from`]).
+/// * **Windows**: the CPU Sets (`GetSystemCpuSetInformation`) grouped by
+///   `EfficiencyClass`, highest (fastest) first; one `"CPU"` cluster where
+///   every core has the same class ([`crate::windows::layout_from_cpu_sets`]).
 /// * Elsewhere: one cluster `"CPU"` of `available_parallelism` cores.
+///
+/// Linux and Windows name no level: two levels read "Performance" and
+/// "Efficiency" (the Deck's `P` and `E`), and any between them "Mid"
+/// ([`level_names`]).
 #[must_use]
 pub fn cpu_layout() -> CpuLayout {
     #[cfg(target_os = "macos")]
@@ -197,35 +333,105 @@ pub fn cpu_layout() -> CpuLayout {
     }
     #[cfg(target_os = "linux")]
     {
-        let present = linux_present();
-        CpuLayout {
-            clusters: vec![Cluster {
-                name: "CPU".to_owned(),
-                logical: present,
-            }],
-        }
+        crate::linux::Root::system().cpu_layout()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win::cpu_layout()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         CpuLayout::single(parallelism())
     }
 }
 
+/// The cores the OS took away now, by logical id, ascending; `None` where
+/// unread.
+///
+/// * **Linux**: present but offline (`/sys/devices/system/cpu/{present,
+///   online}`, [`crate::linux::Root::withdrawn`]).
+/// * **Windows**: the parked CPU Sets (`GetSystemCpuSetInformation`).
+/// * **macOS**: `None` — `kern.sched_recommended_cores` is not read by this
+///   build ([`crate::caps`] says `not_read`).
+#[must_use]
+pub fn withdrawn_cores() -> Option<Vec<u16>> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::Root::system().withdrawn()
+    }
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win::withdrawn()
+    }
+    #[cfg(not(any(target_os = "linux", all(windows, target_pointer_width = "64"))))]
+    {
+        None
+    }
+}
+
 /// `available_parallelism` as a core count, `0` where unknown.
-#[cfg(not(target_os = "macos"))]
-fn parallelism() -> u16 {
+pub(crate) fn parallelism() -> u16 {
     std::thread::available_parallelism().map_or(0, |n| u16::try_from(n.get()).unwrap_or(u16::MAX))
 }
 
-/// The present cores' logical ids (Linux `/sys/devices/system/cpu/present`),
-/// else `0..available_parallelism`.
-#[cfg(target_os = "linux")]
-fn linux_present() -> Vec<u16> {
-    crate::with_bounded(Path::new("/sys/devices/system/cpu/present"), |t| {
-        crate::linux::cpulist(t)
-    })
-    .flatten()
-    .unwrap_or_else(|| (0..parallelism()).collect())
+/// The names of `n` performance levels the OS ranks but does not name,
+/// fastest first: one level is `"CPU"`; two are `"Performance"` and
+/// `"Efficiency"`; one between those two is `"Mid"`, and two or more are
+/// `"Mid 1"`, `"Mid 2"`, … fastest first, so no two levels share a name
+/// (or the Deck's short label, `M1`, `M2`). PURE.
+#[must_use]
+pub fn level_names(n: usize) -> Vec<String> {
+    match n {
+        0 => Vec::new(),
+        1 => vec!["CPU".to_owned()],
+        _ => (0..n)
+            .map(|i| {
+                if i == 0 {
+                    "Performance".to_owned()
+                } else if i + 1 == n {
+                    "Efficiency".to_owned()
+                } else if n == 3 {
+                    "Mid".to_owned()
+                } else {
+                    format!("Mid {i}")
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Clusters from logical ids each carrying a rank where a HIGHER rank is
+/// faster (a Linux `cpu_capacity`, a Windows `EfficiencyClass`): one
+/// cluster per distinct rank, fastest first, each named by
+/// [`level_names`] and holding its ids ascending. `None` for no ids. PURE.
+#[must_use]
+pub fn layout_by_rank(ranked: &[(u16, u32)]) -> Option<CpuLayout> {
+    let mut ranks: Vec<u32> = ranked.iter().map(|(_, r)| *r).collect();
+    ranks.sort_unstable_by(|a, b| b.cmp(a));
+    ranks.dedup();
+    if ranks.is_empty() {
+        return None;
+    }
+    let names = level_names(ranks.len());
+    let clusters = ranks
+        .iter()
+        .zip(names)
+        .map(|(rank, name)| {
+            let mut logical: Vec<u16> = ranked
+                .iter()
+                .filter(|(_, r)| r == rank)
+                .map(|(id, _)| *id)
+                .collect();
+            logical.sort_unstable();
+            logical.dedup();
+            Cluster { name, logical }
+        })
+        .collect();
+    Some(CpuLayout { clusters })
 }
 
 /// One performance level as macOS names it (`hw.perflevelN.*`).
@@ -344,7 +550,35 @@ pub(crate) fn layout_of(levels: &[Level], cpus: &[DtCpu], logical: u16) -> CpuLa
     }
 }
 
-/// The machine's memory by the OS's own page classes, bytes.
+/// Commit: the memory the OS has promised processes, against what it can
+/// back (design §9.6, "commit is the core on Windows").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Commit {
+    /// Bytes charged (Windows `CommitTotal`; Linux `Committed_AS`).
+    pub charge: u64,
+    /// The limit (Windows `CommitLimit`, RAM plus page files; Linux
+    /// `CommitLimit`).
+    pub limit: u64,
+    /// The limit is enforced (Windows: an allocation past it fails), not
+    /// advisory (Linux: under overcommit the charge passes it freely, so the
+    /// figure is a heuristic).
+    pub exact: bool,
+}
+
+impl Commit {
+    /// The charge as thousandths of the limit (`None` for a zero limit);
+    /// past the limit reads past 1000.
+    #[must_use]
+    pub fn permille(&self) -> Option<u64> {
+        (self.limit > 0).then(|| {
+            u64::try_from(u128::from(self.charge) * 1000 / u128::from(self.limit))
+                .unwrap_or(u64::MAX)
+        })
+    }
+}
+
+/// The machine's memory by the OS's own classes, bytes. A class this OS does
+/// not have is `None`, never 0.
 ///
 /// On macOS the classes come from ONE `host_statistics64(HOST_VM_INFO64)`
 /// read (pages × `vm.pagesize`), so they are consistent with each other, and
@@ -352,44 +586,72 @@ pub(crate) fn layout_of(levels: &[Level], cpus: &[DtCpu], logical: u16) -> CpuLa
 /// memory less what the VM never manages (firmware and early-kernel carve-outs:
 /// 0.82 GiB of 32 on the M5). `app + file_backed = active + inactive +
 /// speculative` (the pageable queues). On Linux see
-/// [`crate::linux::memory_detail`] for what each field holds.
+/// [`crate::linux::memory_detail`] and on Windows
+/// [`crate::windows::memory_detail_of`] for what each field holds: neither
+/// partitions physical memory exactly ([`exact`](Self::exact) is false), so
+/// `total` less the classes is memory no class names (design §9.6).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryDetail {
-    /// Physical memory (`hw.memsize`; Linux `MemTotal`).
+    /// Physical memory (`hw.memsize`; Linux `MemTotal`; Windows
+    /// `ullTotalPhys`).
     pub total: u64,
     /// Truly free: `free_count − speculative_count`. The kernel's
     /// `free_count` holds the speculative pages, which are given apart in
     /// [`speculative`](Self::speculative) (as `vm_stat`'s "Pages free" is).
+    /// Linux `MemFree`; Windows the free and zeroed lists (available less
+    /// the standby cache).
     pub free: u64,
     /// Speculative read-ahead pages (`speculative_count`): free to take.
-    pub speculative: u64,
-    /// The active queue (`active_count`).
-    pub active: u64,
-    /// The inactive queue (`inactive_count`).
-    pub inactive: u64,
-    /// Wired: never paged out or compressed (`wire_count`).
+    /// macOS only.
+    pub speculative: Option<u64>,
+    /// The active queue (`active_count`; Linux `Active`).
+    pub active: Option<u64>,
+    /// The inactive queue (`inactive_count`; Linux `Inactive`).
+    pub inactive: Option<u64>,
+    /// Wired: never paged out or compressed (`wire_count`). Linux: kernel
+    /// memory, `Slab + KernelStack + PageTables`; Windows: the kernel's
+    /// paged and nonpaged pools, at most what is in use.
     pub wired: u64,
-    /// Physical memory holding compressed data (`compressor_page_count`).
-    pub compressed: u64,
+    /// Physical memory holding compressed data (`compressor_page_count`;
+    /// Linux zswap's pool, `Zswap`, where the kernel reports it).
+    pub compressed: Option<u64>,
     /// The uncompressed size of what the compressor holds
-    /// (`total_uncompressed_pages_in_compressor`): NOT physical memory, and
-    /// it can exceed [`total`](Self::total).
-    pub stored: u64,
-    /// Purgeable pages (`purgeable_count`).
-    pub purgeable: u64,
-    /// File-backed pages (`external_page_count`).
+    /// (`total_uncompressed_pages_in_compressor`; Linux `Zswapped`): NOT
+    /// physical memory, and it can exceed [`total`](Self::total).
+    pub stored: Option<u64>,
+    /// Purgeable pages (`purgeable_count`). macOS only.
+    pub purgeable: Option<u64>,
+    /// The reclaimable cache: file-backed pages (`external_page_count`).
+    /// Linux `Cached − Shmem + Buffers` (shared memory is listed under
+    /// `Cached` but only swap can reclaim it); Windows the standby cache
+    /// (`SystemCache`), at most what is available.
     pub file_backed: u64,
     /// Anonymous memory of processes: `internal_page_count −
     /// purgeable_count` (Activity Monitor's "App Memory"), zero where
-    /// purgeable exceeds internal.
+    /// purgeable exceeds internal. Linux `AnonPages`; Windows what is in use
+    /// less the kernel's pools.
     pub app: u64,
-    /// Swap in use (`vm.swapusage` `xsu_used`; Linux `SwapTotal − SwapFree`).
+    /// Shared memory, which only swap can reclaim (Linux `Shmem`: tmpfs and
+    /// shared mappings). Linux only.
+    pub shared: Option<u64>,
+    /// Swap in use (`vm.swapusage` `xsu_used`; Linux `SwapTotal − SwapFree`;
+    /// Windows the page files in use).
     pub swap_used: u64,
-    /// Swap allocated (`vm.swapusage` `xsu_total`; Linux `SwapTotal`). macOS
-    /// grows and shrinks its swap files on demand, so this moves.
+    /// Swap allocated (`vm.swapusage` `xsu_total`; Linux `SwapTotal`;
+    /// Windows the page files' size). macOS grows and shrinks its swap files
+    /// on demand, so this moves.
     pub swap_total: u64,
-    /// The kernel's pressure level ([`crate::memory_pressure`]).
+    /// Commit charge and limit (Linux, Windows); `None` on macOS, which has
+    /// no commit limit.
+    pub commit: Option<Commit>,
+    /// The kernel's pressure level ([`crate::memory_pressure`] on macOS;
+    /// Linux PSI, [`crate::linux::psi_level`]; Windows commit against its
+    /// limit, [`crate::windows::commit_level`]). `None` where unread (Linux
+    /// without PSI).
     pub pressure: Option<MemoryLevel>,
+    /// The classes partition physical memory exactly (macOS), or leave a
+    /// remainder no class names (Linux, Windows).
+    pub exact: bool,
 }
 
 /// The `HOST_VM_INFO64` page counts [`memory_detail_of`] reads.
@@ -424,22 +686,25 @@ pub(crate) fn memory_detail_of(
     MemoryDetail {
         total,
         free: b(p.free.saturating_sub(p.speculative)),
-        speculative: b(p.speculative),
-        active: b(p.active),
-        inactive: b(p.inactive),
+        speculative: Some(b(p.speculative)),
+        active: Some(b(p.active)),
+        inactive: Some(b(p.inactive)),
         wired: b(p.wired),
-        compressed: b(p.compressor),
-        stored: b(p.stored),
-        purgeable: b(p.purgeable),
+        compressed: Some(b(p.compressor)),
+        stored: Some(b(p.stored)),
+        purgeable: Some(b(p.purgeable)),
         file_backed: b(p.external),
         app: b(p.internal.saturating_sub(p.purgeable)),
+        shared: None,
         swap_used,
         swap_total,
+        commit: None,
         pressure,
+        exact: true,
     }
 }
 
-/// The machine's memory by page class, swap and pressure; `None` where
+/// The machine's memory by class, swap, commit and pressure; `None` where
 /// unreadable.
 ///
 /// * **macOS**: one `host_statistics64(HOST_VM_INFO64)`, one
@@ -447,7 +712,11 @@ pub(crate) fn memory_detail_of(
 ///   (`hw.memsize` and `vm.pagesize` are read once per process). 3.3 µs
 ///   median on the M5.
 /// * **Linux**: one bounded read of `/proc/meminfo`
-///   ([`crate::linux::memory_detail`]); no pressure level.
+///   ([`crate::linux::memory_detail`]) and one of `/proc/pressure/memory`
+///   for the level ([`crate::linux::psi_level`]; `None` without PSI).
+/// * **Windows**: `GlobalMemoryStatusEx`, `K32GetPerformanceInfo`, the page
+///   files (`NtQuerySystemInformation(SystemPageFileInformation)`) and the
+///   low-memory resource notification ([`crate::windows::memory_detail_of`]).
 /// * Elsewhere: `None`.
 #[must_use]
 pub fn memory_detail() -> Option<MemoryDetail> {
@@ -457,9 +726,17 @@ pub fn memory_detail() -> Option<MemoryDetail> {
     }
     #[cfg(target_os = "linux")]
     {
-        crate::with_bounded(Path::new("/proc/meminfo"), crate::linux::memory_detail).flatten()
+        crate::linux::Root::system().memory_detail()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win::memory_detail()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         None
     }
@@ -469,7 +746,9 @@ pub fn memory_detail() -> Option<MemoryDetail> {
 /// percent, refreshed on the driver's own schedule).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GpuReading {
-    /// `PerformanceStatistics` "Device Utilization %", at most 100.
+    /// `PerformanceStatistics` "Device Utilization %" (Linux amdgpu's
+    /// `gpu_busy_percent`), at most 100; `None` with [`unread`](Self::unread)
+    /// saying why.
     pub device_pct: Option<u8>,
     /// "Renderer Utilization %", at most 100.
     pub renderer_pct: Option<u8>,
@@ -477,10 +756,21 @@ pub struct GpuReading {
     pub tiler_pct: Option<u8>,
     /// "In use system memory", bytes.
     pub in_use_bytes: Option<u64>,
+    /// "Alloc system memory": what the driver has allocated, in use or not,
+    /// bytes.
+    pub alloc_bytes: Option<u64>,
+    /// "recoveryCount": how many times the driver has recovered the GPU
+    /// from a fault (a GPU reset) since it started.
+    pub recoveries: Option<u64>,
     /// `gpu-core-count` on the accelerator entry, where present.
     pub cores: Option<u16>,
-    /// The accelerator's `model` (`"Apple M5"`), else its IOKit class name.
+    /// The accelerator's `model` (`"Apple M5"`), else its IOKit class name;
+    /// on Linux the DRM driver's name (`amdgpu`, `i915`).
     pub name: Option<String>,
+    /// Why [`device_pct`](Self::device_pct) is `None`: the device sleeps
+    /// ([`Why::Asleep`], known idle and not woken), its driver publishes no
+    /// figure ([`Why::Unsupported`]), or only a privilege could read one.
+    pub unread: Option<Why>,
 }
 
 /// A driver's utilization figure as a percentage: negative is unknown, past
@@ -497,8 +787,16 @@ pub(crate) fn percent_of(value: i64) -> Option<u8> {
 /// * **macOS**: the first `IOAccelerator` service, matched once per process
 ///   and cached with its name and core count; each call copies its
 ///   `PerformanceStatistics` property (one IORegistry read, no user client
-///   opened). 26 µs median on the M5. A Mac with two GPUs reads the first
-///   one matched.
+///   opened) and reads six keys of it. 26 µs median on the M5. A Mac with
+///   two GPUs reads the first one matched.
+/// * **Linux**: the DRM cards in `/sys/class/drm` ([`crate::linux::Root::gpu`]):
+///   a card's `power/runtime_status` first (a suspended one is
+///   [`Why::Asleep`] and never read, so never woken), then amdgpu's
+///   `gpu_busy_percent`; i915 and xe publish none without `CAP_PERFMON`,
+///   NVIDIA's driver none outside NVML, and the rest none at all.
+/// * **Windows**: `None` — the public source, PDH's `GPU Engine` counters,
+///   expands one instance per engine per process and costs more per read
+///   than the whole sampler ([`crate::caps`] says `not_read`).
 /// * Elsewhere: `None`.
 #[must_use]
 pub fn gpu() -> Option<GpuReading> {
@@ -506,7 +804,11 @@ pub fn gpu() -> Option<GpuReading> {
     {
         crate::macos::gpu()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::Root::system().gpu()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
@@ -532,7 +834,12 @@ pub struct VolumeReading {
 /// [`VolumeReading`] from block counts and the block size: `free` held to at
 /// most `total` and `available` to at most `free`, every product
 /// saturating. PURE.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    all(windows, target_pointer_width = "64"),
+    test
+))]
 #[must_use]
 pub(crate) fn volume_of(
     blocks: u64,
@@ -580,6 +887,12 @@ pub(crate) fn c_path<'a>(path: &Path, buf: &'a mut [u8]) -> Option<&'a std::ffi:
 /// * **Linux**: the mount table ([`crate::volumes::table`]) names the mount
 ///   and its type; a mount it does not call local, or one the automounter
 ///   owns, is `None` without being asked; else one `statvfs` of `path`.
+/// * **Windows**: the drive is judged from the path's own spelling
+///   ([`crate::windows::drive_root`]: a UNC path is never asked), then
+///   `GetDriveTypeW` on its root: only a fixed disk or a RAM disk is read,
+///   by `GetDiskFreeSpaceExW` (quota-aware: `available` is what this user
+///   may write) and `GetVolumeInformationW` for the file system's name.
+///   The mount is the drive's root (`C:\`).
 /// * Elsewhere: `None`.
 #[must_use]
 pub fn volume(path: &Path) -> Option<VolumeReading> {
@@ -591,10 +904,82 @@ pub fn volume(path: &Path) -> Option<VolumeReading> {
     {
         linux_volume(path)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win::volume(path)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         let _ = path;
         None
+    }
+}
+
+/// What this process may use ([`capacity`]): a Linux cgroup's limits, else
+/// the host's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capacity {
+    /// CPU this process may use, thousandths of a core (`cpu.max`'s quota
+    /// over its period, the tightest on the cgroup's path); `None`: no limit
+    /// below the host's cores.
+    pub cpu_millicores: Option<u32>,
+    /// Memory this process may use (`memory.max`, the tightest on the
+    /// path); `None`: no limit below the host's memory.
+    pub mem_bytes: Option<u64>,
+    /// Where the figures come from.
+    pub source: CapSource,
+}
+
+/// What this process may use now.
+///
+/// * **Linux**: cgroup v2 ([`crate::linux::Root::capacity`]): the process's
+///   cgroup from `/proc/self/cgroup`, then `cpu.max` and `memory.max` in it
+///   and every ancestor under `/sys/fs/cgroup`, the tightest of each. Inside
+///   a container this is the container's ceiling while `/proc` shows the
+///   host. Under cgroup v1 or with no limit set it is the host's.
+/// * Elsewhere: the host's ([`CapSource::Host`], no figures).
+#[must_use]
+pub fn capacity() -> Capacity {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::Root::system().capacity()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Capacity::default()
+    }
+}
+
+/// What the running machine's readers can say ([`Caps`]), measured now: a
+/// few file probes on Linux (PSI, zswap, the thermal zones, the DRM cards,
+/// another user's `/proc` entry), one GPU read on macOS and Linux, nothing
+/// else. Not for every tick: the report changes with the machine's
+/// configuration, not its load.
+#[must_use]
+pub fn caps() -> Caps {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::caps()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::Root::system().caps()
+    }
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        crate::win::caps()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
+    {
+        Caps::unsupported("other")
     }
 }
 
@@ -628,4 +1013,308 @@ fn linux_volume(path: &Path) -> Option<VolumeReading> {
         m.on.clone(),
         m.fstype.clone(),
     ))
+}
+
+/// What a network link is, as the OS classes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LinkKind {
+    /// Ethernet: built in, USB or Thunderbolt.
+    Wired,
+    /// Wi-Fi.
+    Wifi,
+    /// Cellular data.
+    Cellular,
+    /// Anything else: loopback, a tunnel, a bridge, a peer-to-peer or
+    /// companion radio, a coprocessor or guest link (whatever type the OS
+    /// gives it: see [`net_links`]), or a link the OS does not class.
+    #[default]
+    Other,
+}
+
+impl LinkKind {
+    /// Return the canonical lowercase name (`"wired"`, `"wifi"`,
+    /// `"cellular"`, `"other"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wired => "wired",
+            Self::Wifi => "wifi",
+            Self::Cellular => "cellular",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One direction's cumulative counters on a link, since the interface was
+/// created. 64-bit on both platforms, so they do not wrap, except one: on
+/// macOS the sent side's [`drops`](Self::drops) is 32-bit and wraps after
+/// 2³².
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkCounters {
+    /// Bytes.
+    pub bytes: u64,
+    /// Packets.
+    pub packets: u64,
+    /// Errors.
+    pub errors: u64,
+    /// Packets dropped (macOS: on input `ifi_iqdrops`; on output the send
+    /// queue's `ifm_snd_drops`, the one 32-bit counter, which the kernel
+    /// keeps as a signed `int`: it is read unsigned, so it wraps to zero
+    /// after 2³² as a 32-bit counter does).
+    pub drops: u64,
+}
+
+/// One network interface now ([`net_links`]).
+///
+/// An interface destroyed and created again (an adapter plugged back in, a
+/// VPN reconnected) can come back under another index with its counters at
+/// zero: a caller keys its baseline by name and index, and reads a counter
+/// that went down as a new baseline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkReading {
+    /// Its name (`en0`, `wlan0`).
+    pub name: String,
+    /// Its interface index.
+    pub index: u32,
+    /// What it is ([`LinkKind`]).
+    pub kind: LinkKind,
+    /// Up and running: administratively up and with a link (macOS
+    /// `IFF_UP` and `IFF_RUNNING`; Linux `IFF_UP` with `operstate` `up`, or
+    /// `unknown` for a driver that keeps none).
+    pub up: bool,
+    /// A loopback interface (`IFF_LOOPBACK`).
+    pub loopback: bool,
+    /// Whether a device backs it (Linux: `/sys/class/net/<if>/device`
+    /// exists; a bridge, a tunnel or a container's `veth` has none); `None`
+    /// where the reader cannot tell (macOS).
+    pub physical: Option<bool>,
+    /// The link rate the driver reports, bits per second (macOS
+    /// `ifi_baudrate`: Wi-Fi's current rate, which moves with the radio;
+    /// Linux `/sys/class/net/<if>/speed`); `None` where it reports none.
+    pub rate_bps: Option<u64>,
+    /// Received.
+    pub rx: LinkCounters,
+    /// Sent.
+    pub tx: LinkCounters,
+}
+
+/// The most interfaces one [`net_links`] reading holds.
+pub const MAX_LINKS: usize = 1024;
+
+/// Name prefixes of links whose traffic is never the machine's own: the
+/// loopback (`lo`); tunnels, whose traffic is counted again on the link
+/// that carries it (`utun`, `ipsec`, `ppp`, `gif`, `stf`); bridges, which
+/// count their members' traffic again (`bridge`); Apple's peer-to-peer and
+/// companion radios (`awdl`, `llw`, `nan`, `ap`); the internal links to the
+/// Mac's coprocessors (`anpi`, which reports itself wired); and the
+/// Virtualization framework's guest links (`vmenet`).
+const NOT_MACHINE_LINKS: &[&str] = &[
+    "lo", "utun", "ipsec", "ppp", "gif", "stf", "bridge", "awdl", "llw", "nan", "ap", "anpi",
+    "vmenet",
+];
+
+/// Whether `name` starts with one of [`NOT_MACHINE_LINKS`]' prefixes: a
+/// loopback, tunnel, bridge, peer-to-peer or companion radio, coprocessor
+/// or guest link, whose traffic is never the machine's own and whose kind
+/// is [`LinkKind::Other`] whatever the OS says of it. PURE.
+#[must_use]
+pub(crate) fn never_the_machines(name: &str) -> bool {
+    NOT_MACHINE_LINKS
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Whether `link`'s traffic counts toward the machine's own: it is up and
+/// running, not a loopback, and its name starts with none of the prefixes
+/// of tunnels, bridges, peer-to-peer radios and virtual links (`lo`,
+/// `utun`, `ipsec`, `ppp`, `gif`, `stf`, `bridge`, `awdl`, `llw`, `nan`,
+/// `ap`, `anpi`, `vmenet`). Then where the reader knows whether a device
+/// backs it (Linux), that decides; where it does not (macOS), the name
+/// does: `en*` (built-in, USB and Thunderbolt Ethernet, and Wi-Fi) or
+/// `pdp_ip*` (cellular). A VPN's tunnel stays out because its traffic is
+/// counted again on the link that carries it; inside a container's network
+/// namespace no link has a device, so none counts. PURE.
+#[must_use]
+pub fn counts_toward_machine(link: &LinkReading) -> bool {
+    if !link.up || link.loopback || never_the_machines(&link.name) {
+        return false;
+    }
+    match link.physical {
+        Some(physical) => physical,
+        None => link.name.starts_with("en") || link.name.starts_with("pdp_ip"),
+    }
+}
+
+/// A link's kind from its name alone, where the OS does not class it:
+/// `pdp_ip*`, `wwan*` and `rmnet*` cellular; `wl*` Wi-Fi; `en*` and `eth*`
+/// wired; anything else other. On a Mac whose functional-type ask failed
+/// this reads Wi-Fi's `en0` as wired. PURE.
+#[must_use]
+pub(crate) fn kind_by_name(name: &str) -> LinkKind {
+    let any = |prefixes: &[&str]| prefixes.iter().any(|p| name.starts_with(p));
+    if any(&["pdp_ip", "wwan", "rmnet"]) {
+        LinkKind::Cellular
+    } else if any(&["wl"]) {
+        LinkKind::Wifi
+    } else if any(&["en", "eth"]) {
+        LinkKind::Wired
+    } else {
+        LinkKind::Other
+    }
+}
+
+/// Every network interface's kind, state, link rate and cumulative
+/// counters now, at most [`MAX_LINKS`]; `None` where unreadable. The links
+/// whose traffic is the machine's own are the ones
+/// [`counts_toward_machine`] admits.
+///
+/// * **macOS**: one `sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`
+///   into a 64 KiB buffer (grown to what the kernel asks for, up to 4 MiB,
+///   where that is too small), decoded by [`crate::iflist::links_of`]: the
+///   64-bit `if_data64` counters and the name the message carries. One
+///   datagram socket then asks the functional type
+///   (`SIOCGIFFUNCTIONALTYPE`: wired, Wi-Fi, cellular), which names Wi-Fi
+///   apart from Ethernet where the name cannot, of every interface whose
+///   name [`counts_toward_machine`] does not refuse; where the ask fails
+///   the name decides ([`crate::iflist::link_kind`]). A refused name is
+///   [`LinkKind::Other`] unasked: macOS gives `utun`, `bridge` and `anpi`
+///   links the wired type and `llw` and `ap` links the Wi-Fi one. 44 µs
+///   median on the owner's M5 Max (24 interfaces, 8 of them asked,
+///   2026-10-20), of which the list's `sysctl` is 33 µs.
+/// * **Linux**: `/proc/net/dev` (this process's network namespace) read
+///   into a [`crate::linux::NET_DEV_CAP`]-byte buffer, then per interface
+///   its `/sys/class/net/<if>/` `ifindex`, `flags`, `operstate`, `speed`
+///   (a link with a device only), each read into one stack buffer, and
+///   whether `device` and `wireless` exist ([`crate::linux::links_under`]).
+/// * Elsewhere: `None`.
+#[must_use]
+pub fn net_links() -> Option<Vec<LinkReading>> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::net_links()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::links_under(Path::new("/"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// How many processes the process table admits ([`process_limits`]): the
+/// ceilings a `fork` fails at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessLimits {
+    /// The most processes the whole machine may run (macOS `kern.maxproc`;
+    /// Linux the smaller of `kernel/pid_max` and `kernel/threads-max`,
+    /// which every thread counts against too).
+    pub system: Option<u64>,
+    /// The most processes one user may run: on macOS the smaller of
+    /// `kern.maxprocperuid` and this process's soft `RLIMIT_NPROC`, on
+    /// Linux the soft `RLIMIT_NPROC` (which counts the user's threads too);
+    /// `None` where unknown or unlimited. Children inherit the limit, so a
+    /// tab's shell runs under aterm's.
+    pub per_user: Option<u64>,
+}
+
+/// The smaller of two ceilings, either of which may be unknown. PURE.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[must_use]
+pub(crate) fn smaller(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (one, None) | (None, one) => one,
+    }
+}
+
+/// A soft resource limit as a ceiling: `None` for the platform's
+/// `RLIM_INFINITY`. PURE.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[must_use]
+pub(crate) fn rlimit_ceiling(soft: u64, infinity: u64) -> Option<u64> {
+    (soft != infinity).then_some(soft)
+}
+
+/// This process's soft `RLIMIT_NPROC` (one `getrlimit`); `None` where
+/// unlimited or refused.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_pointer_width = "64",
+    expect(
+        clippy::useless_conversion,
+        reason = "rlim_t is u64 on LP64 and may be u32 on 32-bit"
+    )
+)]
+pub(crate) fn nproc_rlimit() -> Option<u64> {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `r` is a writable `rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &raw mut r) } != 0 {
+        return None;
+    }
+    rlimit_ceiling(u64::from(r.rlim_cur), u64::from(libc::RLIM_INFINITY))
+}
+
+/// How many processes the machine, and one user, may run, read now (they
+/// are tunables: read them once, or rarely).
+///
+/// * **macOS**: `kern.maxproc`, `kern.maxprocperuid` and one `getrlimit`.
+///   1.2 µs median on the M5 Max; it read 16,000 and 10,666 there.
+/// * **Linux**: `/proc/sys/kernel/pid_max` and `threads-max`, each read
+///   into one stack buffer, and one `getrlimit`.
+/// * Elsewhere: every field `None`.
+#[must_use]
+pub fn process_limits() -> ProcessLimits {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::process_limits()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let read = |path: &str| {
+            crate::with_bounded(Path::new(path), |t| t.trim().parse::<u64>().ok()).flatten()
+        };
+        ProcessLimits {
+            system: smaller(
+                read("/proc/sys/kernel/pid_max"),
+                read("/proc/sys/kernel/threads-max"),
+            ),
+            per_user: nproc_rlimit(),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        ProcessLimits::default()
+    }
+}
+
+/// The kernel's load averages over 1, 5 and 15 minutes: the mean count of
+/// threads running or waiting to run (Linux also counts a thread waiting on
+/// a disk). One `getloadavg` (a `sysctl` on macOS, 0.3 µs median on the M5
+/// Max; `/proc/loadavg` on Linux); `None` where it answers fewer than three,
+/// or a value that is not a finite non-negative number, and on every other
+/// platform.
+#[must_use]
+pub fn load_average() -> Option<[f64; 3]> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        unsafe extern "C" {
+            /// `<stdlib.h>`; declared here: the first-party `libc` does not
+            /// export it.
+            fn getloadavg(loadavg: *mut f64, nelem: libc::c_int) -> libc::c_int;
+        }
+        let mut load = [0f64; 3];
+        // SAFETY: `load` is a writable array of three doubles, and
+        // `getloadavg` writes at most the count it is given.
+        let n = unsafe { getloadavg(load.as_mut_ptr(), 3) };
+        (n == 3 && load.iter().all(|l| l.is_finite() && *l >= 0.0)).then_some(load)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }

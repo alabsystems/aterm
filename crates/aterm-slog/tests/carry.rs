@@ -6,9 +6,9 @@
 //! successor's continuation, the readers' fence, and hostile input.
 
 use aterm_slog::{
-    Actor, BoxWord, CarryAdopt, CarryBudget, Close, Conf, Cursor, Fields, Fold, GapWhy, IdCounters,
-    Key, Kind, Limits, Log, Mark, Node, Open, Out, Rec, RunOut, SessionOut, Src, Stamp, StepOut,
-    Tier, TurnOut, TurnTracker, Verdict, WallKind, encode,
+    Actor, BoxWord, CarryAdopt, CarryBudget, CarryError, Close, Conf, Cursor, Fields, Fold, GapWhy,
+    IdCounters, Key, Kind, Limits, Log, Mark, Node, Open, Out, Rec, RunOut, SessionOut, SnapError,
+    Src, Stamp, StepOut, Tier, TurnOut, TurnTracker, Verdict, WallKind, encode,
 };
 use aterm_spec::rng::XorShift;
 
@@ -1398,4 +1398,191 @@ fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
     let mut over = at_bounds.lines.clone();
     over[last].push('y');
     assert!(refused(&over), "host lines one byte past their bytes");
+}
+
+/// One line put before line `i` of a carry, its header's line count raised
+/// to match: framed so the outer reader admits it, and only the fold's own
+/// agreement with the log can refuse it.
+fn with_line_at(lines: &[String], i: usize, line: String) -> Vec<String> {
+    let mut v = lines.to_vec();
+    v.insert(i, line);
+    let count = v.len();
+    v[0] = v[0]
+        .split(' ')
+        .map(|w| {
+            if w.starts_with("lines=") {
+                format!("lines={count}")
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    v
+}
+
+/// The index of `node`'s `fold open` line in a carry.
+fn fold_open_line(lines: &[String], node: Node) -> usize {
+    lines
+        .iter()
+        .position(|l| l.starts_with(&format!("fold open {node} ")))
+        .expect("the node's fold open line")
+}
+
+/// An agent session's carry with a turn open under its run, and a `cmd`
+/// run before it the log holds closed.
+fn carried_turn() -> (Log, Node, Node, Node, Vec<String>) {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let ghost = log
+        .open(Open::new(Kind::Cmd, Src::Shell, Conf::Strong), at(5))
+        .expect("a cmd");
+    log.close(
+        ghost,
+        Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+        at(6),
+    )
+    .expect("the cmd closes");
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong)
+                .under(run)
+                .by(Actor::Human),
+            at(10),
+        )
+        .expect("a turn");
+    let out = log.carry(CarryBudget::SESSION, &[]).expect("fits");
+    (log, run, turn, ghost, out.lines)
+}
+
+/// RULING U2 (phase 6, C-1 d): a carried fold that tracks an open node
+/// twice disagrees with its log, which holds it open once. Read, the log's
+/// close of the turn would leave the fold's other copy open for good, so the
+/// carry is refused whole, never repaired. CONTROL: the carry as written
+/// reads, and the turn's close closes it in the fold too.
+/// NEGATIVE CONTROL: without the check (`Fold::agrees_with_open`), the
+/// duplicate reads and the fold keeps the closed turn open.
+#[test]
+fn a_duplicated_fold_open_line_is_refused() {
+    let (log, _, turn, _, lines) = carried_turn();
+    let close = |mut back: Log| {
+        back.close(
+            turn,
+            Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
+            at(950),
+        )
+        .expect("the turn closes");
+        back.fold().state().open[1].as_ref().map(|o| o.node)
+    };
+    let (back, _, _) = Log::from_carry(&lines, adopt_at(&log, 900)).expect("CONTROL: reads");
+    assert_eq!(
+        close(back),
+        None,
+        "CONTROL: the turn's close closes it in the fold"
+    );
+
+    let i = fold_open_line(&lines, turn);
+    let dup = with_line_at(&lines, i, lines[i].clone());
+    match Log::from_carry(&dup, adopt_at(&log, 900)) {
+        Err(e) => assert_eq!(
+            e,
+            CarryError::Fold(SnapError::Log),
+            "refused by the fold's agreement with its log: {}",
+            e.why()
+        ),
+        Ok((back, _, _)) => panic!(
+            "a duplicated fold open line was accepted; after the turn's close the fold \
+             still shows open turn {:?}",
+            close(back)
+        ),
+    }
+}
+
+/// RULING U2 (phase 6, C-1 e): a carried fold's open node must be one the
+/// carried log holds open, of the same kind and under the same parent (the
+/// deepest open node above it). Each disagreement refuses the whole carry:
+/// a `fold open` line for a run the log holds closed, the open turn's line
+/// moved under the session, the open run's line of another run kind.
+/// NEGATIVE CONTROL: without the check each reads, and the fold shows a run
+/// or a turn the log does not hold so.
+#[test]
+fn a_fold_open_line_for_a_node_the_log_does_not_hold_open_is_refused() {
+    let (log, run, turn, ghost, lines) = carried_turn();
+    assert!(!log.is_open(ghost), "CONTROL: the log holds the cmd closed");
+    let refused = |v: &[String], what: &str| match Log::from_carry(v, adopt_at(&log, 900)) {
+        Err(e) => assert_eq!(e, CarryError::Fold(SnapError::Log), "{what}: {}", e.why()),
+        Ok((back, _, _)) => panic!(
+            "{what} was accepted: the fold's open run {:?}, turn {:?}; the log's deepest \
+             open run {:?}",
+            back.fold().state().open[0]
+                .as_ref()
+                .map(|o| (o.node, o.kind)),
+            back.fold().state().open[1]
+                .as_ref()
+                .map(|o| (o.node, o.par)),
+            back.deepest_open(aterm_slog::Lvl::Run)
+        ),
+    };
+
+    let i = fold_open_line(&lines, turn);
+    let ghost_line = lines[i].replacen(
+        &format!("fold open {turn} turn par={run} "),
+        &format!("fold open {ghost} cmd par=- "),
+        1,
+    );
+    assert_ne!(ghost_line, lines[i], "CONTROL: the line was rewritten");
+    refused(
+        &with_line_at(&lines, i, ghost_line),
+        "a fold open line for a run the log holds closed",
+    );
+
+    let mut moved = lines.clone();
+    moved[i] = moved[i].replacen(&format!(" par={run} "), " par=- ", 1);
+    assert_ne!(moved[i], lines[i], "CONTROL: the line was rewritten");
+    refused(&moved, "the open turn's fold line under the session");
+
+    let r = fold_open_line(&lines, run);
+    let mut retyped = lines.clone();
+    retyped[r] = retyped[r].replacen(
+        &format!("fold open {run} agent "),
+        &format!("fold open {run} cmd "),
+        1,
+    );
+    assert_ne!(retyped[r], lines[r], "CONTROL: the line was rewritten");
+    refused(&retyped, "the open run's fold line of another run kind");
+}
+
+/// RULING U2 (phase 6), the closed summary's side: a closed session holds
+/// nothing open, so a summary whose fold tracks an open node disagrees with
+/// it and is refused whole. CONTROL: the summary as written reads.
+/// NEGATIVE CONTROL: without the check it reads, its fold showing a run
+/// open in a closed session.
+#[test]
+fn a_closed_summary_whose_fold_holds_a_node_open_is_refused() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    log.close_session(
+        Close::new(Out::Session(SessionOut::UiClose), Src::Aterm, Conf::Exact),
+        at(20),
+    )
+    .expect("the session closes");
+    let summary = log.closed_summary();
+    assert!(
+        Log::from_closed_summary(&summary).is_ok(),
+        "CONTROL: the summary reads"
+    );
+    assert!(!summary.contains("fold open "), "CONTROL: none written");
+    let open = format!(
+        "fold open {run} agent par=- by=- src=status conf=strong t={}",
+        at(0).wall_ms
+    );
+    let forged = summary.replacen("\nfold totals ", &format!("\n{open}\nfold totals "), 1);
+    assert_ne!(forged, summary, "CONTROL: the line was put in");
+    match Log::from_closed_summary(&forged) {
+        Err(e) => assert_eq!(e, CarryError::Fold(SnapError::Log), "{}", e.why()),
+        Ok(back) => panic!(
+            "a closed summary holding {run} open was accepted: the fold's open run {:?}",
+            back.fold().state().open[0].as_ref().map(|o| o.node)
+        ),
+    }
 }

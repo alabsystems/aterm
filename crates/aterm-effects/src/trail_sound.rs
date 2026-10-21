@@ -364,6 +364,9 @@ impl SoundVoice {
         ("plip", SoundVoice::Of(GlowStyle::Water)),
         ("phaser", SoundVoice::Of(GlowStyle::Phaser)),
         ("laser", SoundVoice::Of(GlowStyle::Laser)),
+        // The laser trail's Settings name, so the trail-style spelling works
+        // here too.
+        ("lightning", SoundVoice::Of(GlowStyle::Laser)),
         ("beam", SoundVoice::Of(GlowStyle::Beam)),
         ("tube", SoundVoice::Of(GlowStyle::Beam)),
         ("fire", SoundVoice::Of(GlowStyle::Fire)),

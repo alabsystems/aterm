@@ -11,8 +11,22 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 
 # Dependency-free on every platform (the Windows side is raw FFI) so the
 # whole transport stays auditable in one small crate, but for one first-party
-# declaration crate on Unix.
+# declaration crate on Unix and aterm-sysprobe's readers: `KERN_PROCARGS2`'s
+# (`procargs`, re-exported) on Unix and Windows, and its path rule and process
+# reader on Windows.
 [dependencies]
+
+[target.'cfg(any(unix, windows))'.dependencies]
+# aterm-sysprobe: `procargs`, the workspace's one `KERN_PROCARGS2` reader and
+# parser, which this crate re-exports and its `process` reads argv with; on
+# Windows, the one rule that places a kernel path under a directory across
+# Windows' spellings (`volumes::Table::is_under`, over the mount table it
+# reads): the path-user scan compares through it and nothing else; and the one
+# reader of another process's image and environment block (`peb`), which names
+# each scanned process's image and working directory. Pure Rust, libc on Unix
+# and kernel32/ntdll FFI on Windows, so the transport stays auditable; its own
+# dependency on this crate is dev-only.
+aterm-sysprobe = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # aterm-libc (package `libc`): generated, oracle-checked ABI declarations, no

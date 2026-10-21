@@ -31,6 +31,18 @@ pub(crate) fn take_hint_fresh(
 /// so the next key may re-lay unchanged text a retired cell was typed beside.
 pub(super) const RECENT_TYPED_RUN_CAP: usize = 256;
 
+/// The farthest, in rows, a cross-row park may stand from the row it left
+/// (`CursorGlow::park_candidate`): a footer repainted under a composer's box
+/// while a key's echo is late. Claude Code's and agy's footers sit under the
+/// box's border, two or three rows below the input
+/// (`tests/codex_background_redraw.rs`). Past the adjacent row a park is held
+/// only where the program's print ended (`CursorGlow::landing_ends_a_print`):
+/// a bare jump of two or three rows with a press in flight (vim's `}`, `2j`,
+/// `3k`) went there, and is judged on its own frame as on the adjacent-row
+/// bound. A caret farther away (vim's `G`) is judged at once too, instead of
+/// held for a return that never comes.
+pub(super) const CROSS_ROW_PARK_ROWS_MAX: u16 = 3;
+
 #[derive(Clone, Copy)]
 pub(super) struct RecentTypedRun {
     pub(super) row: u16,
@@ -870,6 +882,13 @@ pub enum InsertWidth {
     /// Priced in cells from the very text put on the wire
     /// (`Terminal::paste_insert_cells`). `Cells(0)` arms nothing.
     Cells(u16),
+    /// One line priced in cells, then the one line break that ends it (the
+    /// GUI's `paste_insert_width`: a link copied with its line ending).
+    /// Its echo is the line's cells on the row the hand was on when armed and
+    /// the break's new line on the row under it, often in one frame
+    /// ([`CursorGlow::line_insert_echo`]); a host that swallows the break
+    /// echoes it as [`Self::Cells`]. `Line(0)` is the unknown class.
+    Line(u16),
     /// The text cannot say: a Tab's completion, a raw ⌃V, a multi-line or
     /// tabbed body, a body past the price probe. Bounded at
     /// [`CursorGlow::INSERT_GESTURE_CELLS`] and spendable only on the row the
@@ -902,6 +921,10 @@ pub(super) struct InsertLicence {
     /// Whether `cells` is a priced width ([`InsertWidth::Cells`]); an
     /// accumulation is priced only when every part was.
     pub(super) known: bool,
+    /// Whether the priced line ends in its line break ([`InsertWidth::Line`]).
+    /// An accumulation holding a break is a multi-line body: the unknown
+    /// class.
+    pub(super) breaks: bool,
     /// The row witness: the row the hand was on when the licence was armed
     /// ([`CursorGlow::insert_row`]: the visible caret's row, unless the
     /// anchored lane established the echo row elsewhere, else the last
@@ -1216,6 +1239,7 @@ impl InsertSeam {
         dispatched_at: Instant,
         cells: u16,
         known: bool,
+        breaks: bool,
         row: Option<u16>,
     ) -> InsertLicence {
         self.tally.delivered += 1;
@@ -1225,6 +1249,16 @@ impl InsertSeam {
             at.saturating_duration_since(prev.at).as_secs_f32() <= CursorGlow::INSERT_HINT_FRESH
         });
         let armed = match prior {
+            // A line break in either part puts the parts on two lines: a
+            // multi-line body, whose width the text cannot say.
+            Some(prev) if prev.breaks || breaks => InsertLicence {
+                at,
+                dispatched_at: prev.dispatched_at.min(dispatched_at),
+                cells: CursorGlow::INSERT_GESTURE_CELLS,
+                known: false,
+                breaks: false,
+                row: row.or(prev.row),
+            },
             Some(prev) => InsertLicence {
                 at,
                 dispatched_at: prev.dispatched_at.min(dispatched_at),
@@ -1237,6 +1271,7 @@ impl InsertSeam {
                     prev.cells
                 },
                 known: prev.known && known,
+                breaks: false,
                 row: row.or(prev.row),
             },
             None => InsertLicence {
@@ -1244,6 +1279,7 @@ impl InsertSeam {
                 dispatched_at,
                 cells,
                 known,
+                breaks,
                 row,
             },
         };
@@ -1809,15 +1845,21 @@ impl CursorGlow {
         dispatched_at: Instant,
         width: InsertWidth,
     ) -> Option<InsertLicence> {
-        let (cells, known) = match width {
+        let (cells, known, breaks) = match width {
             InsertWidth::Cells(0) => return None,
-            InsertWidth::Cells(cells) => (cells, true),
-            InsertWidth::Unknown => (Self::INSERT_GESTURE_CELLS, false),
+            InsertWidth::Cells(cells) => (cells, true, false),
+            InsertWidth::Line(0) | InsertWidth::Unknown => {
+                (Self::INSERT_GESTURE_CELLS, false, false)
+            }
+            InsertWidth::Line(cells) => (cells, true, true),
         };
         self.recent_typed_run = None;
         self.unsettle();
         let row = self.insert_row(at);
-        Some(self.insert.arm(at, dispatched_at, cells, known, row))
+        Some(
+            self.insert
+                .arm(at, dispatched_at, cells, known, breaks, row),
+        )
     }
 
     /// The insert's row at `now`, read once as [`InsertLicence::row`] (not the
@@ -1940,6 +1982,42 @@ impl CursorGlow {
         let hop = usize::from(cc - pc);
         (Self::insert_row_identity(cr, hop, ins) && !self.fresher_class_owns_hop(hop, ins, now))
             .then_some(ins)
+    }
+
+    /// The line insert's echo across its break ([`InsertWidth::Line`]): the
+    /// caret leaves the insert's own row for the row under it and lands at or
+    /// left of where the line began (the new line's start: a composer's
+    /// indent, a shell's column 0), the line's whole width fits on its row, no
+    /// press dispatched before the insert is unpaid (its glyph would share the
+    /// line), and no fresher press class owns the line
+    /// ([`Self::fresher_class_owns_hop`]). Returns the licence and the column
+    /// the line ends at; `None` otherwise, and the move is judged as any
+    /// other. A row identity as strict as an unknown width's: the witnessed
+    /// row alone.
+    pub(super) fn line_insert_echo(
+        &self,
+        (pr, pc): (u16, u16),
+        (cr, cc): (u16, u16),
+        now: Instant,
+        cfg: &GlowConfig,
+        geom: Geom,
+    ) -> Option<(InsertLicence, u16)> {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) || pr.checked_add(1) != Some(cr) || cc > pc
+        {
+            return None;
+        }
+        let ins = self
+            .insert
+            .fresh(now)
+            .filter(|ins| ins.known && ins.breaks && ins.row == Some(pr))?;
+        let end = pc
+            .checked_add(ins.cells)
+            .filter(|&end| usize::from(end) < geom.cols)?;
+        let ahead = self
+            .type_press_ring
+            .cells_where(now, |key_at| key_at <= ins.dispatched_at);
+        (ahead == 0 && !self.fresher_class_owns_hop(usize::from(ins.cells), ins, now))
+            .then_some((ins, end))
     }
 
     /// Whether a fresher press class owns this same-row forward hop, so the
@@ -2083,6 +2161,8 @@ impl CursorGlow {
             self.user_gesture_hint = None;
         }
         self.last_licensed_row = Some((cr, now));
+        self.hand_row = Some(HandRow::at(cr));
+        self.unowned_caret = None;
         if self.v2.engaged() {
             // Born on the delivery clock (the echoing frame shows the run lit,
             // no edge-in), floored like a key's sweep.

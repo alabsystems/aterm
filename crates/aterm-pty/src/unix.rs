@@ -2915,6 +2915,15 @@ pub enum ReadOutcome {
     /// at its session leader's exit, so the master may never EOF. The caller passes on
     /// what the master holds and ends the session as at EOF.
     Exited,
+    /// The session's process watch (`proc_rd`, `aterm_uds::procwatch`) has events queued.
+    /// Checked before the master, so the caller drains them before it reads a byte: an
+    /// `exec` is heard before any byte its new image wrote (card engine §3.3).
+    Proc,
+}
+
+/// Whether a `poll(2)` entry for a process watch says it has events: readable.
+fn proc_fired(entry: &libc::pollfd) -> bool {
+    entry.revents & libc::POLLIN != 0
 }
 
 /// Whether a `poll(2)` entry for an exit watch says the process exited: a
@@ -2940,9 +2949,24 @@ const WAKELESS_POLL_TIMEOUT_MS: libc::c_int = 250;
 /// `wake_rd < 0` (fd exhaustion) does not fall back to a blocking `read`, which would
 /// pin the reader on an orphan-held master: it polls with a bounded timeout and returns
 /// [`ReadOutcome::Idle`] so the caller can check an fd-free stop flag.
-pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32, exit_rd: i32) -> ReadOutcome {
+///
+/// `proc_rd` (`-1`: none) is the session's process watch, the fourth descriptor of the
+/// same poll: readable, it answers [`ReadOutcome::Proc`] after the wake and the exit and
+/// before the master. A watch that reports an error is dropped from the poll.
+pub fn read_or_wake(
+    master: i32,
+    buf: &mut [u8],
+    wake_rd: i32,
+    exit_rd: i32,
+    proc_rd: i32,
+) -> ReadOutcome {
     let exit_watch = libc::pollfd {
         fd: exit_rd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let proc_watch = libc::pollfd {
+        fd: proc_rd,
         events: libc::POLLIN,
         revents: 0,
     };
@@ -2954,10 +2978,11 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32, exit_rd: i32) -> 
                 revents: 0,
             },
             exit_watch,
+            proc_watch,
         ];
-        // SAFETY: `fds` is a valid 2-element pollfd array for the duration of the
-        // call; a negative `fd` (no exit watch) is skipped by `poll`.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, WAKELESS_POLL_TIMEOUT_MS) };
+        // SAFETY: `fds` is a valid 3-element pollfd array for the duration of the
+        // call; a negative `fd` (no exit or process watch) is skipped by `poll`.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, WAKELESS_POLL_TIMEOUT_MS) };
         if r < 0 {
             let e = io::Error::last_os_error();
             // EINTR → hand control back so the caller re-checks its stop flag and retries;
@@ -2973,6 +2998,9 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32, exit_rd: i32) -> 
         }
         if exit_fired(&fds[1]) {
             return ReadOutcome::Exited;
+        }
+        if proc_fired(&fds[2]) {
+            return ReadOutcome::Proc;
         }
         // POLLHUP/ERR/NVAL fall through to `read`, which surfaces the 0/-1 as Eof.
         let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -3007,11 +3035,12 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32, exit_rd: i32) -> 
             revents: 0,
         },
         exit_watch,
+        proc_watch,
     ];
     loop {
-        // SAFETY: `fds` is a valid 3-element pollfd array for the duration of the
-        // call; a negative `fd` (no exit watch) is skipped by `poll`.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+        // SAFETY: `fds` is a valid 4-element pollfd array for the duration of the
+        // call; a negative `fd` (no exit or process watch) is skipped by `poll`.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 4, -1) };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -3029,6 +3058,12 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32, exit_rd: i32) -> 
         }
         if fds[2].revents != 0 {
             fds[2].fd = -1; // a broken watch: poll without it rather than spin
+        }
+        if proc_fired(&fds[3]) {
+            return ReadOutcome::Proc;
+        }
+        if fds[3].revents != 0 {
+            fds[3].fd = -1; // a broken process watch: likewise
         }
         // POLLHUP/ERR/NVAL fall through to `read`, which surfaces the 0/-1 as Eof.
         let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -3061,26 +3096,63 @@ pub fn read_or_wake(master: i32, buf: &mut [u8], wake_rd: i32, exit_rd: i32) -> 
 ///     refill gaps are bridged with up to `DRAIN_SPIN_MAX` short spins, not sleeps.
 ///
 /// EOF or an error just ends the top-up; the next `read_or_wake` reports it.
-pub fn drain_more(master: i32, buf: &mut [u8], mut filled: usize) -> usize {
+pub fn drain_more(master: i32, buf: &mut [u8], filled: usize) -> usize {
+    drain_more_watched(master, buf, filled, -1, &mut |_| false)
+}
+
+/// [`drain_more`] with the session's process watch `proc_rd` (`-1`: none) in each of its
+/// polls, before the master: when the watch is readable, `heard(filled)` runs at that
+/// offset, before any byte read after the poll (the host drains the watch there), and
+/// `true` ends the batch. A batch that ends at a quiet poll therefore ends where no `exec`
+/// the watch could hear had happened; one that ends with its buffer full asks the watch
+/// once more (one `poll(2)`), so an `exec` is never heard only after the batch that holds
+/// its image's bytes. The watch adds no system call to the per-chunk polls.
+pub fn drain_more_watched(
+    master: i32,
+    buf: &mut [u8],
+    mut filled: usize,
+    proc_rd: i32,
+    heard: &mut dyn FnMut(usize) -> bool,
+) -> usize {
     /// One kernel tty output queue's worth — at/above this the writer saturated it.
     const SATURATED: usize = 1024;
     /// Spin-retry budget bridging the writer's refill gaps (~0.5–1 µs each).
     const DRAIN_SPIN_MAX: u32 = 16;
     let mut spins = 0u32;
+    // Every byte in `buf` was read before a poll that found the watch quiet (or heard it).
+    // The caller's bytes were read after its own poll: not yet.
+    let mut proven = false;
     while filled < buf.len() {
-        let mut fds = [libc::pollfd {
-            fd: master,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        // SAFETY: `fds` is a valid 1-element pollfd array for the duration of the call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
-        if r > 0 && fds[0].revents & libc::POLLIN != 0 {
+        let mut fds = [
+            libc::pollfd {
+                fd: proc_rd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `fds` is a valid 2-element pollfd array for the duration of the call; a
+        // negative `fd` is ignored.
+        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
+        if r > 0 && proc_fired(&fds[0]) {
+            proven = true;
+            if heard(filled) {
+                break;
+            }
+            continue;
+        }
+        proven |= r >= 0 && fds[0].revents == 0;
+        if r > 0 && fds[1].revents & libc::POLLIN != 0 {
             let n = read(master, &mut buf[filled..]);
             if n <= 0 {
                 break; // EOF/error: keep what we have; the next outer poll reports it
             }
             filled += n as usize;
+            proven = false;
             spins = 0;
         } else {
             // Quiet (or POLLHUP/EINTR — the outer read_or_wake handles those).
@@ -3093,7 +3165,77 @@ pub fn drain_more(master: i32, buf: &mut [u8], mut filled: usize) -> usize {
             }
         }
     }
+    if proc_rd >= 0 && !proven && watch_ready(proc_rd) {
+        heard(filled);
+    }
     filled
+}
+
+// The batch-end watch checks this thread has made (tests only): what a batch's proof cost
+// in system calls of its own, counted rather than timed.
+#[cfg(test)]
+thread_local! {
+    static WATCH_CHECKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the process watch `proc_rd` is readable now: one `poll(2)` with no wait.
+fn watch_ready(proc_rd: i32) -> bool {
+    #[cfg(test)]
+    WATCH_CHECKS.with(|n| n.set(n.get() + 1));
+    let mut fds = [libc::pollfd {
+        fd: proc_rd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    // SAFETY: one pollfd, live for the call, no wait.
+    unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) > 0 && proc_fired(&fds[0]) }
+}
+
+/// What a small batch's end poll found ([`drain_more_nonblocking`]): the watch first, then
+/// the master.
+enum EndPoll {
+    /// The process watch is readable.
+    Proc,
+    /// The watch is quiet and the master has more.
+    Master,
+    /// Both quiet: the batch ends here, proven.
+    Quiet,
+    /// The poll failed (`EINTR`) or the watch reports an error: no proof; the read decides.
+    Unknown,
+}
+
+/// A small batch's end poll: `[proc_rd, master]`, no wait. It stands in for the dry `read`
+/// that would otherwise end the batch, so it costs no system call of its own.
+fn end_poll(master: i32, proc_rd: i32) -> EndPoll {
+    let mut fds = [
+        libc::pollfd {
+            fd: proc_rd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: a valid 2-element pollfd array of descriptors this gather owns, no wait.
+    let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
+    if r < 0 {
+        return EndPoll::Unknown;
+    }
+    if proc_fired(&fds[0]) {
+        return EndPoll::Proc;
+    }
+    if fds[0].revents != 0 {
+        return EndPoll::Unknown; // a broken watch proves nothing
+    }
+    let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    if fds[1].revents & ready != 0 {
+        EndPoll::Master
+    } else {
+        EndPoll::Quiet
+    }
 }
 
 /// Default idle-refill patience. Measured (500 MB flood + CPR probe): 0 µs ⇒ 231 MB/s;
@@ -3128,7 +3270,14 @@ fn idle_poll_us() -> u32 {
 /// the same batch) or delivery is due (quiet timeout, wake signal, HUP, error).
 enum BridgeWait {
     Refill,
+    /// The park's wait ran out with every descriptor quiet, the process watch included: the
+    /// burst is over, and every byte read before it was written before any `exec` it watches.
+    Quiet,
+    /// The wake, an error or a hangup: deliver what the batch holds.
     Deliver,
+    /// The process watch went readable during the park: the host hears it at the same
+    /// offset before the gather reads on.
+    Proc,
 }
 
 // The bridge polls this thread has taken (tests only), so a test reads which park a
@@ -3176,9 +3325,10 @@ fn batch_budget(shipped: std::time::Duration) -> std::time::Duration {
     shipped
 }
 
-/// Park for the writer's next refill: one bounded poll on `[master, wake_rd]`. A pending
-/// wake byte is not consumed: [`read_or_wake`] must see it after the batch is delivered.
-fn bridge_poll(master: i32, wake_rd: i32, timeout_ms: i32) -> BridgeWait {
+/// Park for the writer's next refill: one bounded poll on `[master, wake_rd, proc_rd]`. A
+/// pending wake byte is not consumed: [`read_or_wake`] must see it after the batch is
+/// delivered. A negative `wake_rd` or `proc_rd` is skipped by `poll`.
+fn bridge_poll(master: i32, wake_rd: i32, proc_rd: i32, timeout_ms: i32) -> BridgeWait {
     #[cfg(test)]
     BRIDGE_POLLS.with(|n| n.set(n.get() + 1));
     let mut fds = [
@@ -3192,15 +3342,25 @@ fn bridge_poll(master: i32, wake_rd: i32, timeout_ms: i32) -> BridgeWait {
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: proc_rd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
-    let nfds: libc::nfds_t = if wake_rd >= 0 { 2 } else { 1 };
     // SAFETY: polling fds this gather owns, with a bounded timeout.
-    let r = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
-    if r <= 0 {
-        return BridgeWait::Deliver; // timeout (burst over), EINTR, or error
+    let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout_ms) };
+    if r == 0 {
+        return BridgeWait::Quiet; // timeout: the burst is over
     }
-    if nfds == 2 && fds[1].revents != 0 {
+    if r < 0 {
+        return BridgeWait::Deliver; // EINTR or error
+    }
+    if fds[1].revents != 0 {
         return BridgeWait::Deliver; // teardown wake — deliver what we have
+    }
+    if proc_fired(&fds[2]) {
+        return BridgeWait::Proc;
     }
     if fds[0].revents & libc::POLLIN != 0 {
         return BridgeWait::Refill;
@@ -3209,8 +3369,9 @@ fn bridge_poll(master: i32, wake_rd: i32, timeout_ms: i32) -> BridgeWait {
 }
 
 /// Park the parser-idle cutoff for the writer's next refill: a bounded `select(2)` on
-/// `[master, wake_rd]` (`poll(2)` is ms-granular; these gaps are µs). A pending wake
-/// byte is left for [`read_or_wake`], as in [`bridge_poll`]. Timeout and error deliver.
+/// `[master, wake_rd, proc_rd]` (`poll(2)` is ms-granular; these gaps are µs). A pending
+/// wake byte is left for [`read_or_wake`], as in [`bridge_poll`]. Timeout and error
+/// deliver; a readable process watch answers [`BridgeWait::Proc`].
 ///
 /// A signal handler that runs on this thread meanwhile does not: `select` is never
 /// restarted after one (signal(7)), so the park resumes for the time it has left. Any
@@ -3218,9 +3379,12 @@ fn bridge_poll(master: i32, wake_rd: i32, timeout_ms: i32) -> BridgeWait {
 /// thread of a process it translates whenever it syncs them (an internal `SIGTRAP`), and
 /// a gather that delivered on that `EINTR` split the batch this wait exists to keep
 /// whole (x86_64 under Rosetta, measured 2026-10-17: 2048 of 4096 bytes).
-fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
+fn idle_refill_wait(master: i32, wake_rd: i32, proc_rd: i32, wait_us: u32) -> BridgeWait {
     // select cannot represent fds >= FD_SETSIZE — deliver, same as knob-off.
-    if master >= libc::FD_SETSIZE as i32 || wake_rd >= libc::FD_SETSIZE as i32 {
+    if master >= libc::FD_SETSIZE as i32
+        || wake_rd >= libc::FD_SETSIZE as i32
+        || proc_rd >= libc::FD_SETSIZE as i32
+    {
         return BridgeWait::Deliver;
     }
     let wait = std::time::Duration::from_micros(u64::from(wait_us));
@@ -3235,6 +3399,9 @@ fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
             if wake_rd >= 0 {
                 libc::FD_SET(wake_rd, &mut set);
             }
+            if proc_rd >= 0 {
+                libc::FD_SET(proc_rd, &mut set);
+            }
         }
         let mut tv = libc::timeval {
             tv_sec: left.as_secs() as _,
@@ -3243,7 +3410,7 @@ fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
         // SAFETY: selecting on fds this gather owns, with a bounded timeout.
         let r = unsafe {
             libc::select(
-                master.max(wake_rd) + 1,
+                master.max(wake_rd).max(proc_rd) + 1,
                 &mut set,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -3265,12 +3432,19 @@ fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
         }
         break (r, set);
     };
-    if r <= 0 {
-        return BridgeWait::Deliver; // timeout (burst over) or error
+    if r == 0 {
+        return BridgeWait::Quiet; // timeout: the burst is over
+    }
+    if r < 0 {
+        return BridgeWait::Deliver; // error
     }
     // SAFETY: reading a set select just filled; fds are < FD_SETSIZE.
     if wake_rd >= 0 && unsafe { libc::FD_ISSET(wake_rd, &set) } {
         return BridgeWait::Deliver; // teardown wake — byte left for read_or_wake
+    }
+    // SAFETY: as above.
+    if proc_rd >= 0 && unsafe { libc::FD_ISSET(proc_rd, &set) } {
+        return BridgeWait::Proc;
     }
     // SAFETY: as above.
     if unsafe { libc::FD_ISSET(master, &set) } {
@@ -3301,24 +3475,44 @@ fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
 /// wait instead of the poll, so an echo typed into a streaming program arrives on the
 /// human's schedule while a TUI repaint still coalesces.
 ///
-/// `at_gap(filled)` is the host's fence, called at each dry gap just before parking;
-/// `true` delivers now and leaves any refill queued. aterm-gui samples the foreground
-/// process group there: every byte read so far is in `buf`, so a group change is cut
-/// exactly at `filled`. A host with no fence passes `&mut |_| false`.
+/// `at_gap(filled, false)` is the host's fence, called at each dry gap just before
+/// parking; `true` delivers now and leaves any refill queued. aterm-gui samples the
+/// foreground process group there: every byte read so far is in `buf`, so a group change
+/// is cut exactly at `filled`. `proc_rd` (`-1`: none) is the session's process watch,
+/// which joins each park: when it goes readable the park ends and the fence is called
+/// again at the same offset as `at_gap(filled, true)` (the host drains the watch there),
+/// before any byte read after the park. Its answer is the fence's: `true` delivers. A
+/// host with no fence passes `&mut |_, _| false`.
+///
+/// With a watch, no batch ends past an `exec` the watch could hear (card engine §3.3,
+/// R2x): a batch under one outq ends at a poll of the watch and the master in place of its
+/// dry `read` (a readable watch is heard there, `at_gap(filled, true)`), a park's wait that
+/// runs out quiet proves the batch whole, and a batch that ends any other way after its
+/// last such poll (a full buffer, the budget, the knob off, a wake, EOF) asks the watch
+/// once more and is told `at_gap(filled, true)` when it is readable, whatever the answer.
+/// A batch the fence itself delivers is the host's to hear at its end. So the watch adds
+/// no system call to an interactive batch or a parked one, and one `poll(2)` to a batch
+/// that ends unparked.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the gather threads its owned descriptors and independent scheduling inputs explicitly"
+)]
 pub fn drain_more_nonblocking(
     master: i32,
     buf: &mut [u8],
     filled: usize,
     wake_rd: i32,
+    proc_rd: i32,
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
     interactive_pending: fn() -> bool,
-    at_gap: &mut dyn FnMut(usize) -> bool,
+    at_gap: &mut dyn FnMut(usize, bool) -> bool,
 ) -> usize {
     drain_more_nonblocking_with_idle_wait_after_gap(
         master,
         buf,
         filled,
         wake_rd,
+        proc_rd,
         parse_in_flight,
         interactive_pending,
         idle_poll_us(),
@@ -3327,9 +3521,10 @@ pub fn drain_more_nonblocking(
 }
 
 /// Shared gather body, with the idle hysteresis explicit so tests can drive values other
-/// than the cached [`idle_poll_us`]. `at_gap(filled)` runs once per dry gap, just before
-/// whichever park runs (idle wait or bridge poll); `true` delivers instead. It is also
-/// the seam that lands a test's refill provably inside the park.
+/// than the cached [`idle_poll_us`]. `at_gap(filled, false)` runs once per dry gap, just
+/// before whichever park runs (idle wait or bridge poll); `true` delivers instead. It is
+/// also the seam that lands a test's refill provably inside the park. A park the process
+/// watch ends, and a batch end that finds it readable, run `at_gap(filled, true)`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the gather's knobs are threaded explicitly so tests can drive each one \
@@ -3340,10 +3535,11 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
     buf: &mut [u8],
     mut filled: usize,
     wake_rd: i32,
+    proc_rd: i32,
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
     interactive_pending: fn() -> bool,
     idle_wait_us: u32,
-    mut at_gap: impl FnMut(usize) -> bool,
+    mut at_gap: impl FnMut(usize, bool) -> bool,
 ) -> usize {
     /// One kernel tty output queue's worth — at/above this the writer saturated it.
     const SATURATED: usize = 1024;
@@ -3357,10 +3553,36 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
     const BATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
     let start = std::time::Instant::now();
     let mut spins = 0u32;
+    // With a process watch: every byte in `buf` was read before a poll that found the watch
+    // quiet, or the host heard it after them (R2x). A batch that would end without that
+    // asks the watch once more at its end. The caller's bytes were read after its own
+    // poll: not yet.
+    let mut proven = false;
     while filled < buf.len() {
+        // A batch under one tty queue ends at its first quiet poll of the watch and the
+        // master, which stands in for the dry `read` that would end it: no added system
+        // call, and the batch never ends past an `exec` the watch could hear.
+        if proc_rd >= 0 && filled < SATURATED {
+            match end_poll(master, proc_rd) {
+                EndPoll::Proc => {
+                    proven = true;
+                    if at_gap(filled, true) {
+                        break;
+                    }
+                    continue;
+                }
+                EndPoll::Quiet => {
+                    proven = true;
+                    break;
+                }
+                EndPoll::Master => proven = true,
+                EndPoll::Unknown => {}
+            }
+        }
         let n = read(master, &mut buf[filled..]);
         if n > 0 {
             filled += n as usize;
+            proven = false;
             spins = 0; // fresh probe budget per refill gap
             continue;
         }
@@ -3400,27 +3622,67 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                     }
                     // A µs-bounded wait for the refill instead of delivering a
                     // churn-sized batch; the budget is re-checked per dry gap.
-                    if at_gap(filled) {
+                    if at_gap(filled, false) {
+                        proven = true; // the fence's edge: its host hears the watch
                         break; // the host's fence: deliver this batch now
                     }
-                    match idle_refill_wait(master, wake_rd, idle_wait_us) {
+                    match idle_refill_wait(master, wake_rd, proc_rd, idle_wait_us) {
                         BridgeWait::Refill => {
+                            proven = true;
                             spins = 0;
                             continue;
+                        }
+                        BridgeWait::Proc => {
+                            proven = true;
+                            if at_gap(filled, true) {
+                                break;
+                            }
+                            spins = 0;
+                            continue;
+                        }
+                        BridgeWait::Quiet => {
+                            proven = true;
+                            break;
                         }
                         BridgeWait::Deliver => break,
                     }
                 }
-                if at_gap(filled) {
+                if at_gap(filled, false) {
+                    proven = true; // the fence's edge: its host hears the watch
                     break; // the host's fence: deliver this batch now
                 }
-                match bridge_poll(master, wake_rd, BRIDGE_POLL_MS) {
-                    BridgeWait::Refill => spins = 0,
+                match bridge_poll(master, wake_rd, proc_rd, BRIDGE_POLL_MS) {
+                    BridgeWait::Refill => {
+                        proven = true;
+                        spins = 0;
+                    }
+                    // The watch is heard at the park's offset; the gather goes on
+                    // unless the host's fence delivers.
+                    BridgeWait::Proc => {
+                        proven = true;
+                        if at_gap(filled, true) {
+                            break;
+                        }
+                        spins = 0;
+                    }
+                    BridgeWait::Quiet => {
+                        proven = true;
+                        break;
+                    }
                     BridgeWait::Deliver => break,
                 }
             }
             _ => break, // hard error: the next read_or_wake surfaces it
         }
+    }
+    // A batch that ends past its last proof (its buffer full, its budget spent, the knob
+    // off, a wake, EOF or an error) asks the watch once more: one `poll(2)` for these
+    // batch ends only, so an `exec` is heard at the end of the batch that may hold its
+    // image's first bytes, never after it. The fence's own edge needs none: a host that
+    // cuts there hears the watch at that batch's end itself (aterm-gui's
+    // `ExecEdges::absorb`, which takes the new leader's `exec` as the edge's own).
+    if proc_rd >= 0 && !proven && watch_ready(proc_rd) {
+        at_gap(filled, true);
     }
     filled
 }
@@ -3432,18 +3694,6 @@ pub fn wake(wake_wr: i32) {
     // SAFETY: `wake_wr` is the pipe write end; a 1-byte write is atomic (never partial).
     unsafe {
         libc::write(wake_wr, b.as_ptr() as *const libc::c_void, 1);
-    }
-}
-
-/// Declares the calling thread `QOS_CLASS_USER_INTERACTIVE` (macOS; a no-op elsewhere),
-/// for a worker holding a lock the UI thread contends (the sink's spill drainer). A safe
-/// wrapper for `forbid(unsafe_code)` callers.
-pub fn declare_interactive_thread() {
-    #[cfg(target_os = "macos")]
-    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates no
-    // shared state, so there is nothing for another thread to observe.
-    unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 
@@ -3463,9 +3713,12 @@ pub(crate) const PRIO_DARWIN_ROLE: libc::c_int = 6;
 /// aterm's own UI thread (47, the frontmost app's). Measured 2026-10-18 (LAG-7, M4
 /// Max, 12 busy threads beside it): a cold spawn reached its first prompt in 20.5 ms
 /// instead of 27.0 (medians, n=30), and zsh echoed a typed key at p90 0.09-1.07 ms
-/// instead of 0.44-2.75. An idle machine already ran the shell on a performance core.
-/// The price: a starting shell outranks aterm's own Responsive lanes (37), so on that
-/// busy machine a control `spawn`'s reply took 4.65 ms instead of 3.50.
+/// instead of 0.44-2.75. An idle machine already ran the shell on a performance core
+/// inside an agent's coalition; in aterm.app's own, quiet coalition the shell runs
+/// about 40% of its start on the efficiency cores at role UI and at `UI_FOCAL` alike
+/// (LAG-13, `docs/DESIGN-warm-spare-2026-10-16.md` D6). The price: a starting shell
+/// outranks aterm's own Responsive lanes (37), so on that busy machine a control
+/// `spawn`'s reply took 4.65 ms instead of 3.50.
 ///
 /// THE ROLE STOPS AT THE SHELL. It survives `execve` (a shell that `exec`s keeps it)
 /// and not `fork`: every program the shell starts runs in the default band again, so

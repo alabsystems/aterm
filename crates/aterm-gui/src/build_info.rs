@@ -6,11 +6,11 @@
 //! `aterm ctl version` ([`control_line`]).
 //!
 //! Every build fact is the binary's [`BuildStamp`], compiled into `crates/aterm` and installed
-//! first thing in `main`; this library compiles none in. [`binary_signature`] hashes the
-//! running executable, so a signed `.app` binary and the bare `target/release` one differ.
+//! first thing in `main`; this library compiles none in. [`binary_signature`] is the running
+//! code's code directory hash on macOS (a hash of the executable elsewhere), so a signed `.app`
+//! binary and the bare `target/release` one differ.
 
 use aterm_types::version::BuildStamp;
-use std::hash::Hasher;
 use std::sync::OnceLock;
 
 pub(crate) const AUTHOR_ATTRIBUTION: &str = "By Andrew Yates";
@@ -276,23 +276,67 @@ pub(crate) fn compiler_summary() -> String {
     }
 }
 
-/// A content signature of the running binary: a 16-hex FxHash of `current_exe()`, computed
-/// once; `"unknown"` if the executable can't be read. A fingerprint to tell builds apart, not
-/// a cryptographic attestation.
+/// A content signature of the running code, 16 hex digits, computed once; `"unknown"` if
+/// nothing can be read. A fingerprint to tell builds apart, not a cryptographic attestation.
+///
+/// On macOS it is the head of the running slice's code directory hash ([`running_cdhash`]),
+/// what `codesign -dvvv` prints as `CDHash=`. The code directory hashes every page of the
+/// slice and the signature's identity, so any two builds differ, and so do a signed `.app`
+/// binary and the bare `target/release` one. Elsewhere, and where the kernel has no code
+/// directory (an unsigned x86_64 build), it is an FxHash of `current_exe()`'s bytes.
+///
+/// NOT THE FILE ON MACOS (2026-10-20, r6 sweep #19): hashing the file read all of it on every
+/// start, both slices of the universal binary (120.7 MB of disk reads with its pages cold, and
+/// 120 MB of heap and copying with them warm), beside the main thread's own page-ins.
 #[must_use]
 pub(crate) fn binary_signature() -> &'static str {
     static SIG: OnceLock<String> = OnceLock::new();
     SIG.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        if let Some(cdhash) = running_cdhash() {
+            return aterm_codec::hex::encode_lower(&cdhash[..8]);
+        }
         std::env::current_exe()
             .and_then(std::fs::read)
-            .map(|bytes| {
-                let mut h = aterm_hash::FxHasher::default();
-                h.write(&bytes);
-                format!("{:016x}", h.finish())
-            })
+            .map(|bytes| format!("{:016x}", aterm_hash::fx_hash_bytes(&bytes)))
             .unwrap_or_else(|_| "unknown".to_string())
     })
     .as_str()
+}
+
+/// Whether [`binary_signature`] reads and hashes the whole executable (tens of MB): off macOS,
+/// and on a macOS build the kernel holds no code directory for (an unsigned x86_64 dev build,
+/// since only arm64 links signed). The control server then computes it once off its lanes.
+#[must_use]
+pub(crate) fn binary_signature_reads_the_file() -> bool {
+    #[cfg(target_os = "macos")]
+    return running_cdhash().is_none();
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+/// The running image's code directory hash, the kernel's own copy from the exec
+/// (`csops(getpid(), CS_OPS_CDHASH)`), so no file is read; `None` when it has none.
+#[cfg(target_os = "macos")]
+fn running_cdhash() -> Option<[u8; 20]> {
+    // xnu `bsd/sys/codesign.h`: the op, and the one buffer size it answers (`CS_CDHASH_LEN`).
+    const CS_OPS_CDHASH: u32 = 5;
+    unsafe extern "C" {
+        /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`; no SDK
+        /// header declares it.
+        fn csops(pid: libc::pid_t, ops: u32, useraddr: *mut libc::c_void, usersize: usize) -> i32;
+    }
+    let mut cdhash = [0u8; 20];
+    // SAFETY: `cdhash` is 20 writable bytes, the size passed; `getpid` has no preconditions.
+    let rc = unsafe {
+        csops(
+            libc::getpid(),
+            CS_OPS_CDHASH,
+            cdhash.as_mut_ptr().cast(),
+            cdhash.len(),
+        )
+    };
+    (rc == 0).then_some(cdhash)
 }
 
 /// Structured `(key, value)` provenance rows: the one source the native `/about` route paints,
@@ -521,6 +565,59 @@ mod tests {
                 .skip(1)
                 .all(|kv| kv.contains('=')),
             "every token after OK is key=value: {line}"
+        );
+    }
+
+    /// On macOS the signature is the head of the running code's code directory hash, which
+    /// the kernel holds from the exec, not a hash of the file: re-derived here from this test
+    /// binary's embedded signature (SHA-256 over its SHA-256 code directory, the cdhash
+    /// `codesign -dvvv` prints), which an FxHash of the executable's bytes never equals. A
+    /// test binary linked unsigned (x86_64 links no signature) gives the kernel none to hold:
+    /// its signature is the file's FxHash, the one the control server computes off its lanes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn signature_is_the_running_code_directory_hash() {
+        let exe = std::fs::read(std::env::current_exe().expect("current_exe")).expect("read");
+        let le = |o: usize| u32::from_le_bytes(exe[o..o + 4].try_into().expect("4 bytes"));
+        let be = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().expect("4 bytes"));
+        assert_eq!(le(0), 0xfeed_facf, "a thin 64-bit Mach-O");
+        // The load commands follow the 32-byte `mach_header_64`; LC_CODE_SIGNATURE is 0x1d,
+        // a `linkedit_data_command` whose data is the signature's superblob.
+        let mut at = 32;
+        let mut blob = None;
+        for _ in 0..le(16) {
+            if le(at) == 0x1d {
+                let off = le(at + 8) as usize;
+                blob = Some(&exe[off..off + le(at + 12) as usize]);
+            }
+            at += le(at + 4) as usize;
+        }
+        let Some(blob) = blob else {
+            assert!(
+                binary_signature_reads_the_file(),
+                "no code directory to read"
+            );
+            assert_eq!(
+                binary_signature(),
+                format!("{:016x}", aterm_hash::fx_hash_bytes(&exe))
+            );
+            return;
+        };
+        assert!(
+            !binary_signature_reads_the_file(),
+            "a signed binary's signature is the kernel's"
+        );
+        assert_eq!(be(blob, 0), 0xfade_0cc0, "CSMAGIC_EMBEDDED_SIGNATURE");
+        let directory = (0..be(blob, 8) as usize)
+            .map(|i| &blob[be(blob, 16 + 8 * i) as usize..])
+            .filter(|b| be(b, 0) == 0xfade_0c02)
+            .map(|b| &b[..be(b, 4) as usize])
+            .find(|b| b[37] == 2)
+            .expect("a SHA-256 code directory (CS_HASHTYPE_SHA256 at byte 37)");
+        let cdhash = aterm_digest::Sha256::digest(directory);
+        assert_eq!(
+            binary_signature(),
+            aterm_codec::hex::encode_lower(&cdhash[..8])
         );
     }
 }

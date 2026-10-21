@@ -25,7 +25,7 @@ use crate::native_document_journal::{
     JournalRewriteResult, execute_journal_append, execute_journal_reseat, execute_journal_rewrite,
     verify_carried_draft,
 };
-use crate::native_editor::{EditorCommand, EditorEffect, Selection};
+use crate::native_editor::{CloseWhy, EditorCommand, EditorEffect, Selection};
 use crate::{App, WindowId};
 use amacs::input::{EditorInput, Follow, Reduction};
 
@@ -704,7 +704,13 @@ fn prepare_config_save_observation(
 struct JournalSlot {
     settled: std::cell::OnceCell<Result<DocumentJournalStore, String>>,
     opening: std::cell::Cell<Option<std::thread::JoinHandle<Result<DocumentJournalStore, String>>>>,
+    /// What the first look runs inline when no worker is opening the store
+    /// ([`Self::deferred`]).
+    deferred: std::cell::Cell<Option<JournalOpener>>,
 }
+
+/// How a [`JournalSlot`] opens its store: `DocumentJournalStore::system_default`.
+type JournalOpener = fn() -> Result<DocumentJournalStore, String>;
 
 impl JournalSlot {
     /// A slot already settled to `store`.
@@ -712,6 +718,21 @@ impl JournalSlot {
         Self {
             settled: std::cell::OnceCell::from(store),
             opening: std::cell::Cell::new(None),
+            deferred: std::cell::Cell::new(None),
+        }
+    }
+
+    /// A slot `open` settles inline at its first look: [`Self::opening`]
+    /// without the worker. The headless App's (`App::headless_for_test`): nine
+    /// in ten of the test binary's Apps never look, and so never mint a secret
+    /// behind its two barriers or make a root for the exit sweep to remove
+    /// (2026-10-20, `-p aterm-gui --lib`: 4,176 stores opened a run, 325
+    /// deferred; the sweep after the last test 0.9-4.6 s, 0.16-0.53 s deferred).
+    fn deferred(open: JournalOpener) -> Self {
+        Self {
+            settled: std::cell::OnceCell::new(),
+            opening: std::cell::Cell::new(None),
+            deferred: std::cell::Cell::new(Some(open)),
         }
     }
 
@@ -739,6 +760,7 @@ impl JournalSlot {
                 Self {
                     settled: std::cell::OnceCell::new(),
                     opening: std::cell::Cell::new(Some(worker)),
+                    deferred: std::cell::Cell::new(None),
                 }
             }
             Err(_) => Self::open(open()),
@@ -750,7 +772,10 @@ impl JournalSlot {
             Some(worker) => worker.join().unwrap_or_else(|_| {
                 Err("document recovery is unavailable: opening its journal panicked".to_string())
             }),
-            None => Err("document recovery is unavailable".to_string()),
+            None => self.deferred.take().map_or_else(
+                || Err("document recovery is unavailable".to_string()),
+                |open| open(),
+            ),
         })
     }
 
@@ -884,8 +909,11 @@ impl Default for DocumentHostRuntime {
 }
 
 impl DocumentHostRuntime {
+    /// The headless App's runtime: its journal store opens at the first look
+    /// ([`JournalSlot::deferred`]), as the running App's ([`Self::opening`])
+    /// is joined there, with no worker.
     pub(crate) fn new() -> Self {
-        Self::with_journals(JournalSlot::open(DocumentJournalStore::system_default()))
+        Self::with_journals(JournalSlot::deferred(DocumentJournalStore::system_default))
     }
 
     /// The running App's runtime: its journal store opens on a worker
@@ -1462,6 +1490,12 @@ impl App {
             _ => None,
         };
 
+        // The reducer checks every command it runs, from a key, M-x, a row
+        // or a macro, against what this gesture carries
+        // (`command_registry::editor_grant`). Set on every reduction, so a
+        // control client's narrower grant never outlives its own input.
+        self.editor_workspace.granted =
+            crate::command_registry::editor_grant(self.person_gesture_refused());
         let effects = {
             let (runtime, workspace, store) = (
                 &mut self.native_runtime,
@@ -2687,8 +2721,198 @@ impl App {
             EditorEffect::RevertDocument { document } => {
                 self.discard_document_changes(document, source_view)?;
             }
+            EditorEffect::CloseView {
+                why: CloseWhy::Plain,
+            } => {
+                if let Err(why) = self.close_editor_view(source_view) {
+                    let status = self.editor_close_status(source_view, None, &why);
+                    self.set_editor_view_status(source_view, &status);
+                }
+            }
+            // An edit ticket's answer: until a waiting client's ticket is
+            // wired to its view (slice N3), no view has one to answer.
+            EditorEffect::CloseView {
+                why: CloseWhy::Finish | CloseWhy::Abort,
+            } => {
+                self.set_editor_view_status(source_view, NO_EDIT_WAITING);
+            }
+            EditorEffect::KillBuffer { query } => {
+                self.kill_open_editor_buffer(source_view, &query);
+            }
+            // The engine hands over a kill only for a person's input (the
+            // Clipboard class `editor_grant` withholds from a control client).
+            EditorEffect::KillToClipboard { text } => {
+                if !crate::control::pbcopy(&text) {
+                    aterm_log::warn!("editor: the kill did not reach the clipboard");
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Why the editor command `event` names may not run on this gesture:
+    /// a class it needs that the gesture's grant lacks
+    /// (`command_registry::editor_grant`), said in the view's status line
+    /// too. A completion row names the command it would run. `None` when it
+    /// may run, or when `event` names no command.
+    pub(crate) fn refuse_editor_command(
+        &mut self,
+        view: crate::tab_model::ViewId,
+        event: &AppEvent,
+    ) -> Option<String> {
+        let command = match event {
+            AppEvent::EditorCommand(command) => *command,
+            AppEvent::EditorCompletion(crate::native_editor::EditorCompletionAction::Choose(
+                index,
+            )) => {
+                let Some(AppViewState::Editor(state)) = self.native_runtime.view_state(view) else {
+                    return None;
+                };
+                let crate::native_editor::Minibuffer::Command { query, .. } =
+                    &state.buffer.as_ref()?.minibuffer
+                else {
+                    return None;
+                };
+                *crate::native_editor::command_completions(query).get(*index)?
+            }
+            _ => return None,
+        };
+        let grant = crate::command_registry::editor_grant(self.person_gesture_refused());
+        let refusal = self.editor_workspace.refusal(command, &grant)?;
+        aterm_log::info!(
+            "editor: {:?} refused: {refusal}",
+            crate::command_registry::editor_command(command)
+        );
+        if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
+            state.status = Some(refusal.clone());
+            state.common.presentation_revision =
+                state.common.presentation_revision.saturating_add(1);
+        }
+        Some(refusal)
+    }
+
+    /// Close one Editor view as ⌘W closes it: focused first, then the leaf
+    /// of a split or the whole tab, through the same document barrier (a
+    /// changed draft is saved before the view goes; the close finishes when
+    /// the save lands). The reason when it did not close.
+    fn close_editor_view(&mut self, view: crate::tab_model::ViewId) -> Result<(), String> {
+        let (wid, tab) = self
+            .windows
+            .iter()
+            .find_map(|(wid, ws)| {
+                ws.tab_set
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.root.contains(view))
+                    .map(|tab| (*wid, tab.id))
+            })
+            .ok_or_else(|| "Editor window is no longer available".to_string())?;
+        let focused = self.windows.get_mut(&wid).is_some_and(|ws| {
+            ws.tab_set.switch_to(tab)
+                && ws
+                    .tab_set
+                    .active_mut()
+                    .is_some_and(|active| active.set_focus(view))
+        });
+        if !focused {
+            return Err("Editor view could not take focus to close".to_string());
+        }
+        self.resync_active_or_window(wid);
+        let split = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.active())
+            .is_some_and(|active| active.root.len() > 1);
+        let closed = if split {
+            self.close_focused_mixed_leaf(wid)
+        } else {
+            self.close_active_native_tab(wid)
+        };
+        self.request_native_redraw(wid);
+        closed
+    }
+
+    /// What to tell the person when closing the Editor `view` (whose buffer
+    /// is `title`, or "this buffer") did not close it at once. A changed
+    /// draft is saved before its view goes, and the close started that save:
+    /// a split's leaf then closes by itself once the save lands, while a
+    /// whole tab stays for the person to close again. Any other `why` is a
+    /// refusal, said as it is.
+    fn editor_close_status(
+        &self,
+        view: crate::tab_model::ViewId,
+        title: Option<&str>,
+        why: &str,
+    ) -> String {
+        let buffer = title.unwrap_or("this buffer");
+        let document_view = DocumentViewId(view.get());
+        let document = match self.view_store.get(view) {
+            Some(crate::tab_model::View::Native(native)) => {
+                self.native_runtime.document_id(native.instance)
+            }
+            _ => None,
+        };
+        let queued = document
+            .and_then(|document| self.native_documents.pending_closes.get(&document))
+            .is_some_and(|closes| {
+                closes
+                    .iter()
+                    .any(|close| close.views.contains(&document_view))
+            });
+        if queued {
+            return format!("Closing {buffer} once its draft is saved");
+        }
+        let saving = document.is_some_and(|document| self.document_save_owed(document));
+        if saving {
+            format!("Saving {buffer} first; close it again once the save lands")
+        } else {
+            match title {
+                Some(title) => format!("Buffer {title} stays open: {why}"),
+                None => format!("This buffer stays open: {why}"),
+            }
+        }
+    }
+
+    /// `kill-buffer` of an open buffer named as `switch-to-buffer` names one:
+    /// its view closes as [`Self::close_editor_view`] closes it, and the
+    /// person stays where they were.
+    fn kill_open_editor_buffer(&mut self, source_view: crate::tab_model::ViewId, query: &str) {
+        let (_, _, _, target_view, title) =
+            match self.resolve_open_editor_buffer(source_view, query) {
+                Ok(found) => found,
+                Err(status) => {
+                    self.set_editor_view_status(source_view, &status);
+                    return;
+                }
+            };
+        if let Err(why) = self.close_editor_view(target_view) {
+            let status = self.editor_close_status(target_view, Some(&title), &why);
+            self.set_editor_view_status(source_view, &status);
+        } else {
+            self.set_editor_view_status(source_view, &format!("Killed buffer {title}"));
+        }
+        if target_view == source_view {
+            return;
+        }
+        // Back to the view the command ran in.
+        let source = self.windows.iter_mut().find_map(|(wid, ws)| {
+            let tab = ws
+                .tab_set
+                .tabs()
+                .iter()
+                .find(|tab| tab.root.contains(source_view))?
+                .id;
+            (ws.tab_set.switch_to(tab)
+                && ws
+                    .tab_set
+                    .active_mut()
+                    .is_some_and(|active| active.set_focus(source_view)))
+            .then_some(*wid)
+        });
+        if let Some(wid) = source {
+            self.resync_active_or_window(wid);
+            self.request_native_redraw(wid);
+        }
     }
 
     /// Resolve an exact minibuffer name to an already-open Editor tab in the
@@ -2696,6 +2920,38 @@ impl App {
     /// an `EditorApp`/`DocumentViewId`, so persistence grants, journals, and save
     /// generations remain attached to their original canonical documents.
     fn switch_to_open_editor_buffer(&mut self, source_view: crate::tab_model::ViewId, query: &str) {
+        let (wid, index, instance, target_view, title) =
+            match self.resolve_open_editor_buffer(source_view, query) {
+                Ok(found) => found,
+                Err(status) => {
+                    self.set_editor_view_status(source_view, &status);
+                    return;
+                }
+            };
+        self.switch_tab_in(wid, index);
+        self.set_editor_view_status(target_view, &format!("Switched to buffer {title}"));
+        self.refresh_native_presentation(wid, instance, target_view);
+        self.request_native_redraw(wid);
+    }
+
+    /// The one open Editor buffer in `source_view`'s window that `query`
+    /// names exactly, by title or file URI: its window, tab index, app
+    /// instance, view and title. The status that says why when none or more
+    /// than one does.
+    fn resolve_open_editor_buffer(
+        &self,
+        source_view: crate::tab_model::ViewId,
+        query: &str,
+    ) -> Result<
+        (
+            WindowId,
+            usize,
+            crate::tab_model::AppInstanceId,
+            crate::tab_model::ViewId,
+            String,
+        ),
+        String,
+    > {
         let source_window = self.windows.iter().find_map(|(wid, state)| {
             state
                 .tab_set
@@ -2705,15 +2961,10 @@ impl App {
                 .then_some(*wid)
         });
         let Some(wid) = source_window else {
-            self.set_editor_view_status(source_view, "Editor window is no longer available");
-            return;
+            return Err("Editor window is no longer available".to_string());
         };
         if query.is_empty() {
-            self.set_editor_view_status(
-                source_view,
-                "Buffer name is required; no document changed",
-            );
-            return;
+            return Err("Buffer name is required; no document changed".to_string());
         }
 
         let matches = self.windows.get(&wid).map_or_else(Vec::new, |state| {
@@ -2745,7 +2996,7 @@ impl App {
                 .collect::<Vec<_>>()
         });
         let [(index, instance, target_view, title)] = matches.as_slice() else {
-            let status = if matches.is_empty() {
+            return Err(if matches.is_empty() {
                 let open_elsewhere = self.windows.iter().any(|(candidate_window, state)| {
                     *candidate_window != wid
                         && state.tab_set.tabs().iter().any(|tab| {
@@ -2775,17 +3026,9 @@ impl App {
                 }
             } else {
                 format!("Buffer name `{query}` is ambiguous; use its full file URI")
-            };
-            self.set_editor_view_status(source_view, &status);
-            return;
+            });
         };
-
-        let (index, instance, target_view, title) =
-            (*index, *instance, *target_view, title.clone());
-        self.switch_tab_in(wid, index);
-        self.set_editor_view_status(target_view, &format!("Switched to buffer {title}"));
-        self.refresh_native_presentation(wid, instance, target_view);
-        self.request_native_redraw(wid);
+        Ok((wid, *index, *instance, *target_view, title.clone()))
     }
 
     fn set_editor_view_status(&mut self, view: crate::tab_model::ViewId, message: &str) {
@@ -4930,6 +5173,10 @@ fn ensure_config_file(path: &std::path::Path) -> Result<std::path::PathBuf, Stri
     }
     Ok(path.to_path_buf())
 }
+
+/// What `finish-edit` and `abort-edit` say while no client waits on the
+/// view's file.
+const NO_EDIT_WAITING: &str = "nothing is waiting on this file; C-x C-s saves";
 
 fn editor_error_message(error: &crate::native_editor::EditorError) -> String {
     use crate::native_editor::EditorError;
@@ -8604,6 +8851,49 @@ mod tests {
         let after = project(&model, &app, document, controller);
         assert_action(&model, &state, &after, "CommitClose");
         assert_eq!(fs::read_to_string(&path).unwrap(), "first latest base\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A close that has to wait on a save says so, and what comes next:
+    /// C-x C-c on a buffer whose save is still landing leaves the tab open,
+    /// for the person to close again once the save lands, and the same keys
+    /// then close it with the edit on disk.
+    #[test]
+    fn a_close_waiting_on_its_save_says_so() {
+        let dir = fresh_dir("aterm-editor-close-waits");
+        let path = dir.join("waits.txt");
+        fs::write(&path, "base\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let tabs = |app: &App| app.windows.get(&wid).unwrap().tab_set.len();
+        let opened = tabs(&app);
+        commit(&mut app, wid, "edit ");
+        let save = begin_inflight_save_for_test(&mut app, document);
+        let close = |app: &mut App| {
+            for event in [
+                key(Key::Character('x'), Modifiers::CTRL),
+                key(Key::Character('c'), Modifiers::CTRL),
+            ] {
+                assert!(app.native_input_event(wid, &event));
+            }
+        };
+        close(&mut app);
+        assert_eq!(tabs(&app), opened);
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor view");
+        };
+        assert_eq!(
+            state.status.as_deref(),
+            Some("Saving this buffer first; close it again once the save lands")
+        );
+        finish_inflight_save_for_test(&mut app, document, view, save);
+        close(&mut app);
+        assert_eq!(tabs(&app), opened - 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "edit base\n");
         let _ = fs::remove_dir_all(dir);
     }
 

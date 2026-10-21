@@ -913,10 +913,8 @@ pub(crate) fn journal_dir() -> Option<PathBuf> {
     crate::restore::manifest_path().and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
-#[cfg(all(test, unix))]
-pub(crate) use unix::classify_death;
 #[cfg(unix)]
-pub(crate) use unix::{JournalOwner, claim_at_boot};
+pub(crate) use unix::{JournalOwner, claim_at_boot, classify_death};
 
 #[cfg(not(unix))]
 pub(crate) fn claim_at_boot(
@@ -3171,7 +3169,9 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             holds: a_holds,
             sid: a_sid,
             lineage: a_lineage,
+            log_ep: a_log_ep,
             land_at: a_land_at,
+            autopilot_by: a_autopilot_by,
             theme: a_theme,
             lost: a_lost,
         } = a;
@@ -3194,7 +3194,9 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             holds: b_holds,
             sid: b_sid,
             lineage: b_lineage,
+            log_ep: b_log_ep,
             land_at: b_land_at,
+            autopilot_by: b_autopilot_by,
             theme: b_theme,
             lost: b_lost,
         } = b;
@@ -3215,7 +3217,9 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             && a_holds == b_holds
             && a_sid == b_sid
             && a_lineage == b_lineage
+            && a_log_ep == b_log_ep
             && a_land_at == b_land_at
+            && a_autopilot_by == b_autopilot_by
             && a_theme == b_theme
             && a_lost == b_lost
     }
@@ -3663,6 +3667,9 @@ mod writer {
                         Some(Ok(())) => {
                             on_disk = true;
                             inherited.store(false, Ordering::Release);
+                            // This run keeps its desk now: the layout its launch
+                            // took goes (the take's second phase).
+                            crate::restore::settle_take();
                         }
                         Some(Err(error)) => {
                             on_disk = false;
@@ -3727,6 +3734,7 @@ pub(crate) mod fixtures {
             restore::TerminalLeafRestore {
                 sid: None,
                 lineage: None,
+                log_ep: None,
                 cwd: cwd.map(str::to_string),
                 title: title.to_string(),
                 profile: None,
@@ -3739,6 +3747,7 @@ pub(crate) mod fixtures {
                 questions: None,
                 autopilot: None,
                 land_at: None,
+                autopilot_by: None,
                 identity: None,
                 theme: None,
                 agent: None,

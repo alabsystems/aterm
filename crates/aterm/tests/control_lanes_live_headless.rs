@@ -10,8 +10,8 @@
 //!   `await`-parked drivers, then fresh clients, raw and through `aterm ctl`, are answered
 //!   every time, and the held connections still answer in order.
 //! * `waits_past_their_lanes_are_told_busy_and_hung_up_waits_give_their_places_back`, the
-//!   negative control: waits fill every wait lane and the request lanes' wait budget (half of
-//!   them); the next wait gets the busy line on a connection that stays open (`aterm ctl`
+//!   negative control: waits fill every wait lane and the request lanes' wait budget; the
+//!   next wait gets the busy line on a connection that stays open (`aterm ctl`
 //!   reports busy, never "Broken pipe"), and waits that hang up give their places back at
 //!   once. The listener's health fields are on `metrics`.
 //! * `pipelined_waits_are_held_while_wait_lanes_are_free`: a wait with a request right behind
@@ -59,6 +59,8 @@ use std::time::{Duration, Instant};
 
 use aterm_spec::host::could_not_run;
 
+#[path = "support/ctl_accept.rs"]
+mod ctl_accept;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
@@ -66,11 +68,14 @@ const MAX_SOCK_PATH: usize = 100;
 
 /// The server's request lanes (`CONTROL_WORKERS` in `aterm-gui/src/control.rs`),
 /// its wait lanes (`CONTROL_WAIT_WORKERS`) and the request lanes that may serve
-/// a wait at once (`CONTROL_INLINE_WAITS`): where the negative control expects
-/// a wait to be told busy, spelled here because the wire does not say it.
+/// a wait at once (`CONTROL_INLINE_WAITS`: what the artifact captures,
+/// `ARTIFACT_HANDOFF_LIMIT` of them, leave of the request lanes, less one):
+/// where the negative control expects a wait to be told busy, spelled here
+/// because the wire does not say it.
 const RPC_LANES: usize = 8;
 const WAIT_LANES: usize = 64;
-const INLINE_WAITS: usize = RPC_LANES / 2;
+const ARTIFACT_CAPTURES: usize = 4;
+const INLINE_WAITS: usize = RPC_LANES - ARTIFACT_CAPTURES - 1;
 
 /// The busy reply, word for word (`aterm_types::control_verbs::CONTROL_BUSY_REPLY`:
 /// the listener's to a connection it cannot admit, a lane's to a wait none of
@@ -326,6 +331,7 @@ impl Driver {
             Ok(0) => Some("<EOF>".to_string()),
             Ok(_) => Some(reply.trim_end().to_string()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(e) if hung_up(&e) => Some("<EOF>".to_string()),
             Err(e) => Some(format!("<read error: {e}>")),
         }
     }
@@ -335,6 +341,7 @@ impl Driver {
         match self.reader.read_line(&mut reply) {
             Ok(0) => "<EOF>".to_string(),
             Ok(_) => reply.trim_end().to_string(),
+            Err(e) if hung_up(&e) => "<EOF>".to_string(),
             Err(e) => format!("<read error: {e}>"),
         }
     }
@@ -369,8 +376,17 @@ fn probe(sock: &Path, token: &str) -> String {
     match BufReader::new(stream).read_line(&mut reply) {
         Ok(0) => "<EOF>".to_string(),
         Ok(_) => reply.trim_end().to_string(),
+        Err(e) if hung_up(&e) => "<EOF>".to_string(),
         Err(e) => format!("<read error: {e}>"),
     }
+}
+
+/// Whether a read error is the listener's close. Linux answers a read on a
+/// connection closed with input still unread (a wait refused busy, its request
+/// line never read) with `ECONNRESET` once, then end-of-file; macOS with
+/// end-of-file. `aterm ctl` reads both as a hang-up (`is_hangup`).
+fn hung_up(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::ConnectionReset
 }
 
 /// A fresh idle driver: dialled, authenticated and served one `version` (reads
@@ -518,16 +534,7 @@ fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
         std::thread::sleep(Duration::from_millis(50));
     }
     // The CLI path a person types.
-    let mut ctl = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut ctl, &world.0);
-    let out = ctl
-        .arg("ctl")
-        .arg("--sock")
-        .arg(&sock)
-        .arg("status")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run aterm ctl status");
+    let out = aterm_ctl(&world.0, &sock, &["status"]);
     assert!(
         out.status.success(),
         "aterm ctl status failed with the drivers open: {}{}",
@@ -713,17 +720,22 @@ fn the_connection_past_the_cap_takes_the_stalest_place_and_tabs_still_open() {
     drop(waits);
 }
 
-/// `aterm ctl --sock <sock> <args…>` in the world's isolation.
+/// `aterm ctl --sock <sock> <args…>` in the world's isolation, asked again, a fresh client
+/// each time, while the instance has not yet accepted it ([`ctl_accept::until_accepted`]): the
+/// client's own 10 s accept budget is a person's, and a loaded machine can miss it. A busy
+/// refusal is an answer, returned at once.
 fn aterm_ctl(root: &Path, sock: &Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut cmd, root);
-    cmd.arg("ctl")
-        .arg("--sock")
-        .arg(sock)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run aterm ctl")
+    ctl_accept::until_accepted(|| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        launch_isolation::apply(&mut cmd, root);
+        cmd.arg("ctl")
+            .arg("--sock")
+            .arg(sock)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run aterm ctl")
+    })
 }
 
 #[test]
@@ -987,7 +999,7 @@ fn carried_timeout(sock: &Path, token: &str, text: &str) -> Result<(String, Stri
 
 #[test]
 fn pipelined_waits_are_held_while_wait_lanes_are_free() {
-    // Twice the request lanes, so four times their wait budget.
+    // Twice the request lanes, so far past their wait budget.
     const PIPELINED: usize = 2 * RPC_LANES;
     /// The waits' own timeout: a hang bound they never reach. They end by the
     /// event they wait for (the text typed below), so the test takes as long as
@@ -1195,4 +1207,60 @@ fn peers_that_stop_mid_exchange_take_no_lane() {
         );
     }
     drop(silent);
+}
+
+/// THE TWO WAYS A LIVE TEST ASKS, on answers made here: [`ctl_accept::until_served`] (every
+/// other live test's) asks again on a missed accept and on the busy line, neither of which
+/// served anything, and returns the first answer that is neither, a failure included;
+/// [`ctl_accept::until_accepted`] (this file's, whose verdicts are the busy line) returns the
+/// busy line as it stands.
+#[test]
+fn a_busy_answer_is_asked_again_where_it_is_not_the_verdict() {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{ExitStatus, Output};
+    let answer = |code: i32, stderr: &str| Output {
+        status: ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    };
+    let missed = || {
+        answer(
+            2,
+            "aterm-ctl: no answer from /s within 10s: the instance took no request, so none was sent\n",
+        )
+    };
+    let busy = || answer(1, &format!("aterm-ctl: {BUSY}\n"));
+    let refused = || answer(1, "aterm-ctl: ERR unknown verb\n");
+    let served = || answer(0, "");
+
+    let mut script = vec![missed(), busy(), busy(), served()].into_iter();
+    let mut asks = 0;
+    let out = ctl_accept::until_served(|| {
+        asks += 1;
+        script.next().expect("asked past the last answer")
+    });
+    assert_eq!((asks, out.status.code()), (4, Some(0)));
+
+    let mut script = vec![busy(), refused()].into_iter();
+    let mut asks = 0;
+    let out = ctl_accept::until_served(|| {
+        asks += 1;
+        script.next().expect("asked past the last answer")
+    });
+    assert_eq!(asks, 2);
+    assert_eq!(
+        out.stderr,
+        refused().stderr,
+        "another refusal is the answer"
+    );
+
+    let mut script = vec![missed(), busy(), served()].into_iter();
+    let mut asks = 0;
+    let out = ctl_accept::until_accepted(|| {
+        asks += 1;
+        script.next().expect("asked past the last answer")
+    });
+    assert_eq!(asks, 2);
+    assert!(ctl_accept::was_turned_away(&out), "{out:?}");
+    assert!(!ctl_accept::was_turned_away(&served()) && !ctl_accept::was_turned_away(&missed()));
 }

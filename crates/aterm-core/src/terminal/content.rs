@@ -12,7 +12,7 @@ use crate::search::LineCells;
 
 use super::Terminal;
 
-pub(super) fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
+fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
     // Live-frame (screen-row) reads: the extras lookups are keyed by the live
     // visible row, and callers pass terminal-relative rows (the renderer's
     // `sel_row = viewport_row - display_offset`). Display-mapped cells would
@@ -37,9 +37,7 @@ fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut St
     }
     if cell.is_complex() {
         // Use full string for text extraction (handles multi-char HashMap entries)
-        if let Some(s) = grid.complex_char_str_at(row, col) {
-            out.push_str(&s);
-        } else {
+        if !grid.push_complex_char_at(row, col, out) {
             out.push('\u{FFFD}');
         }
     } else {
@@ -81,7 +79,22 @@ pub(crate) fn visible_row_bounds_to_string(
     end_col: u16,
     trailing: TrailingBlanks,
 ) -> String {
-    visible_row_text(grid, row, start_col, end_col, trailing, None)
+    let mut line = String::new();
+    push_visible_row_text(grid, row, start_col, end_col, trailing, None, &mut line);
+    line
+}
+
+/// [`visible_row_bounds_to_string`] appended to `out`. What `out` held is kept:
+/// the trailing-blank rule reads only the appended text.
+pub(crate) fn push_visible_row_bounds(
+    grid: &Grid,
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+    trailing: TrailingBlanks,
+    out: &mut String,
+) {
+    push_visible_row_text(grid, row, start_col, end_col, trailing, None, out);
 }
 
 /// Live-frame row `row` as written (every cell up to `Row::len`, trailing
@@ -92,28 +105,32 @@ pub(crate) fn visible_row_bounds_to_string(
 #[must_use]
 pub(crate) fn visible_row_written(grid: &Grid, row: u16) -> (String, LineCells) {
     let mut cells = LineCells::new();
-    let text = visible_row_text(
+    let mut text = String::new();
+    push_visible_row_text(
         grid,
         row,
         0,
         grid.cols().saturating_sub(1),
         TrailingBlanks::Written,
         Some(&mut cells),
+        &mut text,
     );
     (text, cells)
 }
 
-/// [`visible_row_bounds_to_string`], recording into `cells`, when given, the
-/// cell each piece of the text was read from, its column counted from the
-/// range's first.
-fn visible_row_text(
+/// [`visible_row_bounds_to_string`] appended to `out`, recording into `cells`,
+/// when given, the cell each piece of the text was read from: its column counted
+/// from the range's first, its bytes from where the append began. The
+/// trailing-blank rule reads only the appended text.
+fn push_visible_row_text(
     grid: &Grid,
     row: u16,
     start_col: u16,
     end_col: u16,
     trailing: TrailingBlanks,
     mut cells: Option<&mut LineCells>,
-) -> String {
+    out: &mut String,
+) {
     // Clamp end_col to the grid width: `side_adjusted_bounds` uses u16::MAX as
     // an "entire row" sentinel.
     let last_col = grid.cols().saturating_sub(1);
@@ -143,11 +160,10 @@ fn visible_row_text(
     let end_col = effective_end.min(last_col);
 
     // One byte per column is exact for ASCII and a lower bound otherwise, so a
-    // plain row takes one allocation. Bounded by one row's width. Mirrors
-    // `Grid::row_text_screen_into`.
-    let mut line = String::with_capacity(
-        usize::from(end_col.saturating_sub(effective_start)).saturating_add(1),
-    );
+    // plain row takes one allocation (none when `out` already has the room).
+    // Bounded by one row's width. Mirrors `Grid::row_text_screen_into`.
+    let base = out.len();
+    out.reserve(usize::from(end_col.saturating_sub(effective_start)).saturating_add(1));
     if let Some(row_cells) = grid.row_at_screen(row) {
         let end_col = match trailing {
             TrailingBlanks::Trim => Some(end_col),
@@ -158,8 +174,8 @@ fn visible_row_text(
         };
         if let Some(end_col) = end_col {
             for col in effective_start..=end_col {
-                let start = line.len();
-                push_row_cell_text(grid, row, row_cells, col, &mut line);
+                let start = out.len();
+                push_row_cell_text(grid, row, row_cells, col, out);
                 if let Some(cells) = cells.as_deref_mut() {
                     // A wide glyph's right half pushes no text, so it is no
                     // cell of its own: the left half covers both columns.
@@ -169,7 +185,7 @@ fn visible_row_text(
                         1
                     };
                     cells.push(
-                        start..line.len(),
+                        start - base..out.len() - base,
                         usize::from(col.saturating_sub(effective_start)),
                         width,
                     );
@@ -179,10 +195,9 @@ fn visible_row_text(
     }
 
     if trailing == TrailingBlanks::Trim {
-        let trimmed_len = line.trim_end().len();
-        line.truncate(trimmed_len);
+        let kept = base + out[base..].trim_end().len();
+        out.truncate(kept);
     }
-    line
 }
 
 impl Terminal {
@@ -245,33 +260,26 @@ impl Terminal {
     /// accents and ZWJ clusters included).
     ///
     /// A wide-continuation cell returns the empty string (its glyph belongs to
-    /// the lead cell). `None` only for out-of-range coordinates; `Some("")`
+    /// the lead cell). `None` only for out-of-range coordinates; `Some(" ")`
     /// for a blank cell.
+    ///
+    /// One cell, resolving its row each call. A rows × cols sweep (`aterm ctl
+    /// screen`, `subscribe … cells`) holds one [`Grid::screen_row_view`] per
+    /// row and appends each cell's text with
+    /// [`push_cell_text`](aterm_grid::VisibleRowView::push_cell_text), testing
+    /// for wide continuations itself; that walk yields these same bytes.
     #[must_use]
     pub fn cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
-        let mut out = String::new();
-        self.cell_grapheme_into(row, col, &mut out).then_some(out)
-    }
-
-    /// The buffer-reusing twin of [`cell_grapheme`](Self::cell_grapheme): the
-    /// same bytes appended to `out`, returning whether the coordinates were in
-    /// range. Out of range appends nothing and returns `false`; a blank cell
-    /// appends a space and a wide continuation nothing, both returning `true`.
-    ///
-    /// Both forms share `push_cell_text`. This one serves rows × cols sweeps
-    /// (`aterm ctl screen`, `subscribe … cells`) with one allocation per row
-    /// instead of per cell.
-    pub fn cell_grapheme_into(&self, row: usize, col: usize, out: &mut String) -> bool {
-        let (Ok(r), Ok(c)) = (u16::try_from(row), u16::try_from(col)) else {
-            return false;
-        };
+        let r = u16::try_from(row).ok()?;
+        let c = u16::try_from(col).ok()?;
         if usize::from(r) >= usize::from(self.grid.rows())
             || usize::from(c) >= usize::from(self.grid.cols())
         {
-            return false;
+            return None;
         }
-        push_cell_text(&self.grid, r, c, out);
-        true
+        let mut out = String::new();
+        push_cell_text(&self.grid, r, c, &mut out);
+        Some(out)
     }
 
     /// The combining-aware grapheme text of a display cell, accounting for
@@ -384,35 +392,6 @@ impl Terminal {
         } else {
             aterm_types::text_shaping::AmbiguousWidth::Single
         }
-    }
-
-    /// Text of an absolute terminal row (the search index's coordinate), read
-    /// from the same sources `build_search_index` indexes, so a snippet equals
-    /// the line the match came from: history via the bounded
-    /// `get_history_line`, visible rows via `written_line_text`. `None` when
-    /// `abs` is evicted or past the live viewport. Feeds `search_summary`'s
-    /// snippet.
-    #[must_use]
-    pub fn abs_row_text(&self, abs: u64) -> Option<String> {
-        use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
-        let grid = &self.grid;
-        let oldest = grid.oldest_absolute_row();
-        if abs < oldest {
-            return None;
-        }
-        let rel = usize::try_from(abs - oldest).ok()?;
-        let scrollback = grid.scrollback_lines();
-        if rel < scrollback {
-            return grid.get_history_line(rel).map(|l| {
-                line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
-            });
-        }
-        let visible_row = rel - scrollback;
-        if visible_row >= usize::from(self.rows()) {
-            return None;
-        }
-        let r = i32::try_from(visible_row).ok()?;
-        self.written_line_text(r)
     }
 
     /// Smart word boundaries at a position on a display-relative row.

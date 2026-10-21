@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use crate::headless_boot;
 
 use headless_boot::{
-    Instance, boot_session, client_command, ctl, ctl_ok, field, status, type_line,
+    Instance, boot_session, client_command, ctl, ctl_ok, field, status, subscribed, type_line,
+    until_served,
 };
 
 /// Boot one headless instance, 40x120 ([`headless_boot::boot`]: an environment
@@ -117,10 +118,8 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let go = inst.tmp.join("go");
     std::fs::write(&script, FAKE_WORKER).expect("write the fake worker");
 
-    // The events stream, opened before anything moves.
-    let mut sub = client_command(&inst, &["subscribe", &format!("@{sid}"), "events"])
-        .spawn()
-        .expect("spawn subscribe");
+    // The events stream, acknowledged before anything moves.
+    let mut sub = subscribed(&inst, &[&format!("@{sid}"), "events"]);
     let events = sub.stdout.take().expect("subscribe stdout");
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -173,7 +172,9 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
             &inst,
             &[&format!("@{sid}"), "await", "agent", "prompt", HANG_MS],
         );
-        move || cmd.output().expect("await agent")
+        // Asked again while the instance has not yet accepted it, or answers it busy: the
+        // verdict is latched, so a waiter armed late still answers it.
+        move || until_served(|| cmd.output().expect("await agent"))
     });
     std::thread::sleep(Duration::from_millis(200));
 
@@ -318,10 +319,8 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
     let die = inst.tmp.join("die");
     std::fs::write(&script, FAKE_EXIT).expect("write the fake");
 
-    // One subscription for all three rounds, opened before anything moves.
-    let mut sub = client_command(&inst, &["subscribe", &format!("@{sid}"), "events"])
-        .spawn()
-        .expect("spawn subscribe");
+    // One subscription for all three rounds, acknowledged before anything moves.
+    let mut sub = subscribed(&inst, &[&format!("@{sid}"), "events"]);
     let stream = sub.stdout.take().expect("subscribe stdout");
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -572,7 +571,9 @@ fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> Stri
             inst,
             &[&format!("@{sid}"), "await", "agent", "idle", HANG_MS],
         );
-        move || cmd.output().expect("await agent idle")
+        // Asked again while the instance has not yet accepted it, or answers it busy: the
+        // verdict is latched, so a waiter armed late still answers it.
+        move || until_served(|| cmd.output().expect("await agent idle"))
     });
     // The verdict is LATCHED (`await agent`): a wait arriving now answers at once if
     // `idle` is already published, so `timeout=0` is the check itself.

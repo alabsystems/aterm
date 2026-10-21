@@ -23,6 +23,7 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
         state,
         mark,
         fact: fact.to_string(),
+        path: None,
         version: Some("1.2.3".to_string()),
     }
 }
@@ -31,7 +32,7 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
 /// signed out and preferred (by the fleet document), Claude Code fine,
 /// Antigravity CLI unmeasured, Muse Code not used here; reviews granted to
 /// Codex CLI and Claude Code by this machine's table.
-fn fixture() -> HarnessState {
+pub(super) fn fixture() -> HarnessState {
     let (local, notes) = aterm_agent::ai::config::read(
         "[ai]\nreviewers = [\"codex\", \"claude\"]\nmachine = \"m7\"\n",
     );
@@ -399,4 +400,66 @@ fn a_stale_sign_in_action_cannot_override_the_current_use_switch() {
         !asks_sign_in(press(&mut runtime, instance, view, "ai/sign-in/codex")),
         "a queued action cannot restore a disabled CLI"
     );
+}
+
+/// THE PAGE'S FACT CARDS KEEP THEIR LABELS WHOLE AT LARGE TYPE (the review
+/// of the post-landing check's page fixes): WHO REVIEWS and WHAT IS HELD
+/// each size their label column as Settings ▸ Harness's fact cards do
+/// (`fact_label_width`), so at 2× text on the lab's 504 pt page and a wide
+/// one `Permissions` and `Each review` are whole, and their values wrap
+/// whole. NEGATIVE CONTROL: About's column (capped at 1.2×) paints
+/// `Permissi…`.
+#[test]
+fn the_ai_fact_cards_keep_their_labels_whole_at_large_type() {
+    at_each_text_scale(&[1.0, 2.0], "the AI page's fact cards", |scale| {
+        for (width, height) in [(504.0, 628.0), (924.0, 640.0)] {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let (mut runtime, instance, view) = ai_route(fixture());
+            let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, height));
+            super::harness::fact_cards_whole(&pages, &["ai/reviews/", "ai/fleet/"], &context);
+        }
+    });
+}
+
+/// A ONE-LINE ROW KEEPS THE END OF THE PATH ITS LOOK NAMED (item A5 of the
+/// round-9 narrow sweep): a CLI not installed by aterm whose copy lives under
+/// `~/Library/Application Support/` — a path with a space, where aterm's own
+/// reroute copies live — is cut in its middle on a desktop row too narrow
+/// for it, its binary and what the line says after it kept. The row found
+/// the path by the next space and painted "…/Library/Application", the
+/// binary and "(not measured in this build)" gone. NEGATIVE CONTROL: the
+/// same row told no path is cut at a word, which never names the binary.
+#[test]
+fn a_one_line_cli_row_keeps_the_end_of_a_path_with_a_space() {
+    let path = "/Users//someone/Library/Application Support/aterm/pkg/reroute/agy";
+    let fact = format!(
+        "not installed by aterm (a copy it does not manage is at {path}) \
+         (not measured in this build)"
+    );
+    let painted = |named: Option<&str>| {
+        let mut state = fixture();
+        let reading = state.ai.reading.as_mut().expect("the fixture's reading");
+        reading.clis[2] = AiCli {
+            path: named.map(str::to_string),
+            ..cli("agy", State::NotInstalled, Mark::Fail, &fact)
+        };
+        let (mut runtime, instance, view) = ai_route(state);
+        let pages = every_page(&mut runtime, instance, view, &view_cx_at(1_095.0, 700.0));
+        pages
+            .iter()
+            .flat_map(|page| page.paint.iter())
+            .find_map(|node| match &node.content {
+                UiContent::Text(text) if node.key.as_str() == "ai/cli/agy/detail" => {
+                    Some(text.text.clone())
+                }
+                _ => None,
+            })
+            .expect("a one-line row paints the detail on one line")
+    };
+    let line = painted(Some(path));
+    assert_ne!(line, fact, "the line is cut");
+    assert!(line.contains("/reroute/agy)"), "{line:?}");
+    assert!(line.ends_with(" (not measured in this build)"), "{line:?}");
+    let unnamed = painted(None);
+    assert!(!unnamed.contains("/agy"), "{unnamed:?}");
 }

@@ -50,7 +50,7 @@ use std::fmt::Write as _;
 use aterm_codec::pct;
 
 use crate::field::{Fields, Key, Tier, Val};
-use crate::fold::{Need, OpenNode, SessionState};
+use crate::fold::{MailLink, Need, OpenNode, SessionState};
 use crate::log::{Cursor, Gap};
 use crate::rec::Rec;
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
@@ -491,7 +491,7 @@ fn step_line(n: u32, s: &StepInfo<'_>, now: u64) -> Option<String> {
     Some(line)
 }
 
-fn turn_line(n: u32, t: &TurnInfo<'_>, shed: TxShed, now: u64) -> String {
+fn turn_line(n: u32, t: &TurnInfo<'_>, link: Option<MailLink>, shed: TxShed, now: u64) -> String {
     let mut line = format!("t{n}");
     let by = t.open.map_or(Actor::Nobody, |o| o.by);
     match t.close {
@@ -510,10 +510,24 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, shed: TxShed, now: u64) -> String {
     }
     if by != Actor::Nobody {
         let _ = write!(line, " by={}", by.word());
+    } else if t.open.is_none()
+        && let Some(Val::Id(opener)) = t.close.and_then(|c| c.f.get(Key::OpBy))
+    {
+        // THE OPEN WAS EVICTED (Phase 6 step 6C-2, ruling U6): the close's
+        // restated opener, printed as the text it is, never read back into
+        // an actor.
+        let _ = write!(line, " by={opener}");
     }
-    if let Some(o) = t.open {
-        for key in [Key::Ledger, Key::Cause, Key::Cont] {
-            match o.f.get(key) {
+    // The open's own `ledger=`, `cause=` and `cont=`; with the open evicted,
+    // the `ledger=` its close restates (5F-4a), the one of them a close
+    // carries.
+    let (from, keys): (Option<&Rec>, &[Key]) = match t.open {
+        Some(o) => (Some(o), &[Key::Ledger, Key::Cause, Key::Cont]),
+        None => (t.close, &[Key::Ledger]),
+    };
+    if let Some(r) = from {
+        for key in keys {
+            match r.f.get(*key) {
                 Some(Val::U(v)) => {
                     let _ = write!(line, " {}={v}", key.word());
                 }
@@ -523,6 +537,13 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, shed: TxShed, now: u64) -> String {
                 _ => {}
             }
         }
+    }
+    // THE MAIL IT PROBABLY ANSWERED (Phase 6 step 6C-3, ruling U5): the
+    // fold's heuristic link, printed with its confidence's suffix, so it
+    // never reads without the `~` that says it is a guess. A turn that
+    // names its cause has none (the fold never links one).
+    if let Some(l) = link {
+        let _ = write!(line, " mail=@{}{}", l.off, l.conf.suffix());
     }
     if t.close.is_none() {
         let open_step = |line: &mut String, sn: u32, o: &Rec| {
@@ -748,6 +769,7 @@ fn render(
     scan: &Scan<'_>,
     gap: Option<&Gap>,
     st: &SessionState,
+    links: &[(Node, MailLink)],
     (level, drop, shed): (u8, usize, TxShed),
     counts: bool,
     now: u64,
@@ -782,7 +804,11 @@ fn render(
                     continue;
                 }
             }
-            let mut unit = vec![turn_line(n, t, shed, now)];
+            let link = links
+                .iter()
+                .find(|(node, _)| *node == Node::new(Lvl::Turn, n))
+                .map(|(_, l)| *l);
+            let mut unit = vec![turn_line(n, t, link, shed, now)];
             let detail = level == 0 || Some(n) == newest;
             if detail {
                 for (sn, s) in &t.steps {
@@ -916,91 +942,218 @@ fn assemble(sid: &str, st: &SessionState, budget: usize, body: &[String]) -> (St
     (format!("{header}\n{body_text}"), used)
 }
 
+/// What a brief reads apart from its budget: the window the reader asked
+/// for, the fold's open turn and step whose open records the window no
+/// longer holds, the gap the read crossed, the fold's state, and the fold's
+/// heuristic mail links. [`BriefInput::scanned`] sorts it once into a
+/// [`Briefing`], which renders it at any budget.
+pub struct BriefInput<'a> {
+    window: Vec<&'a Rec>,
+    seeds: Vec<Rec>,
+    gap: Option<Gap>,
+    st: &'a SessionState,
+    links: &'a [(Node, MailLink)],
+}
+
+impl<'a> BriefInput<'a> {
+    /// `window` is the records the reader asked for (the whole ring, one
+    /// node's subtree, or those past its cursor) and `gap` the gap that read
+    /// crossed ([`crate::log::Read::gap`]): the one `gap` line says exactly
+    /// that, never a loss inferred from where a narrowed window starts.
+    ///
+    /// `links` are the fold's heuristic mail links
+    /// ([`crate::Fold::mail_links`]): a linked turn's line ends its fields
+    /// with ` mail=@<off>~` (Phase 6 step 6C-3, ruling U5). The fold holds
+    /// links for the open turns and the newest closed one only, so an older
+    /// closed turn's line has none. The local brief passes its fold's; a
+    /// brief of the bus passes none.
+    #[must_use]
+    pub fn new(
+        window: impl IntoIterator<Item = &'a Rec>,
+        gap: Option<Gap>,
+        st: &'a SessionState,
+        links: &'a [(Node, MailLink)],
+    ) -> Self {
+        let window: Vec<&Rec> = window.into_iter().collect();
+        let seeds = open_path_seeds(st, &window);
+        BriefInput {
+            window,
+            seeds,
+            gap,
+            st,
+            links,
+        }
+    }
+
+    /// The window sorted into turns, their steps and the marks worth a line,
+    /// with and without what a transcript added ([`scan_stripped`]).
+    #[must_use]
+    pub fn scanned(&self) -> Briefing<'_> {
+        #[cfg(any(test, debug_assertions))]
+        SCANS.with(|n| n.set(n.get() + 1));
+        let (stripped, transcript) = scan_stripped(&self.window, &self.seeds);
+        Briefing {
+            scan: scan(&self.window, &self.seeds),
+            stripped,
+            transcript,
+            gap: self.gap.as_ref(),
+            st: self.st,
+            links: self.links,
+        }
+    }
+}
+
+/// A [`BriefInput`], scanned: the brief at any budget renders from it
+/// without reading the window again.
+pub struct Briefing<'b> {
+    scan: Scan<'b>,
+    /// The window without the transcript's records ([`TxShed::Stripped`]).
+    stripped: Scan<'b>,
+    /// The window held a transcript record.
+    transcript: bool,
+    gap: Option<&'b Gap>,
+    st: &'b SessionState,
+    links: &'b [(Node, MailLink)],
+}
+
+impl Briefing<'_> {
+    /// The rendering at shedding `level`, `drop` oldest turn units shed, its
+    /// header naming `budget`, with the count lines when `counts` and as much
+    /// of what a transcript added as `shed` keeps; and how many turn units it
+    /// could shed.
+    fn at_with(
+        &self,
+        (sid, budget, now): (&str, usize, u64),
+        (level, drop): (u8, usize),
+        counts: bool,
+        shed: TxShed,
+    ) -> (Brief, usize) {
+        let scan = if shed == TxShed::Stripped {
+            &self.stripped
+        } else {
+            &self.scan
+        };
+        let r = render(
+            scan,
+            self.gap,
+            self.st,
+            self.links,
+            (level, drop, shed),
+            counts,
+            now,
+        );
+        let (text, used) = assemble(sid, self.st, budget, &r.lines);
+        (Brief { text, used, level }, r.units)
+    }
+
+    /// [`Self::at_with`] past the count lines and the transcript's records:
+    /// the levels shed what the brief held without them.
+    fn at(&self, sid: &str, budget: usize, now: u64, level: u8, drop: usize) -> (Brief, usize) {
+        self.at_with((sid, budget, now), (level, drop), false, TxShed::Stripped)
+    }
+
+    /// The brief of session `sid` within `budget` tokens at `now_wall`
+    /// ([`brief`]).
+    #[must_use]
+    pub fn fit(&self, sid: &str, budget: usize, now_wall: u64) -> Brief {
+        let whole = (sid, budget, now_wall);
+        // The count lines first, shed before any other (S15): the mail a 3B
+        // producer counts and the acts and stories.
+        let totals = &self.st.totals;
+        if self.scan.acts + self.scan.stories > 0 || totals.mail_in > 0 || totals.mail_out > 0 {
+            let (b, _) = self.at_with(whole, (0, 0), true, TxShed::Full);
+            if b.used <= budget {
+                return b;
+            }
+        }
+        // Then what the transcript added (S15): collapsed, then none of it.
+        if self.transcript {
+            for shed in [TxShed::Full, TxShed::Collapsed] {
+                let (b, _) = self.at_with(whole, (0, 0), false, shed);
+                if b.used <= budget {
+                    return b;
+                }
+            }
+        }
+        let mut units = 0;
+        for level in 0..=3u8 {
+            let (b, n) = self.at(sid, budget, now_wall, level, 0);
+            if b.used <= budget {
+                return b;
+            }
+            units = n;
+        }
+        // Level 3, shedding the oldest turn units: the fewest drops that fit
+        // (fewer units only ever shorten the body).
+        if units > 1 {
+            let (most, _) = self.at(sid, budget, now_wall, 3, units - 1);
+            if most.used <= budget {
+                let (mut lo, mut hi, mut best) = (1, units - 1, most);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let (b, _) = self.at(sid, budget, now_wall, 3, mid);
+                    if b.used <= budget {
+                        best = b;
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                return best;
+            }
+        }
+        self.at(sid, budget, now_wall, 4, 0).0
+    }
+
+    /// Exactly `fit(sid, 0, now_wall)`, rendered once: no rendering fits a
+    /// budget of 0 (a reply's estimate is at least one token), so that brief
+    /// is the one-line form with `budget=0` in its header.
+    #[must_use]
+    pub fn floor(&self, sid: &str, now_wall: u64) -> Brief {
+        self.at(sid, 0, now_wall, 4, 0).0
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many windows [`BriefInput::scanned`] has sorted on this thread: a
+/// test's count of the scans a reply made.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn scans_on_this_thread() -> u64 {
+    SCANS.with(std::cell::Cell::get)
+}
+
 /// The brief of session `sid` (§7.4): the least-shed rendering whose token
 /// estimate fits `budget`, or the one-line form when none does. At level 3
 /// the oldest turn lines go one unit at a time (the fewest that fit), so the
 /// brief reaches the one-line form only when even the session line and the
 /// newest turn do not fit.
 ///
-/// `window` is the records the reader asked for (the whole ring, one node's
-/// subtree, or those past its cursor) and `gap` the gap that read crossed
-/// ([`crate::log::Read::gap`]): the one `gap` line says exactly that, never
-/// a loss inferred from where a narrowed window starts.
+/// `window`, `gap` and `links` are as [`BriefInput::new`] takes them. A
+/// reader that renders one window at several budgets scans it once
+/// ([`BriefInput::scanned`]) and fits each from the [`Briefing`].
 pub fn brief<'a>(
     sid: &str,
     window: impl IntoIterator<Item = &'a Rec>,
     gap: Option<Gap>,
-    st: &SessionState,
+    st: &'a SessionState,
+    links: &'a [(Node, MailLink)],
     budget: usize,
     now_wall: u64,
 ) -> Brief {
-    let window: Vec<&Rec> = window.into_iter().collect();
-    let seeds = open_path_seeds(st, &window);
-    let scan_full = scan(&window, &seeds);
-    let (stripped, transcript) = scan_stripped(&window, &seeds);
-    let at_with = |level: u8, drop: usize, counts: bool, shed: TxShed| {
-        let sc = if shed == TxShed::Stripped {
-            &stripped
-        } else {
-            &scan_full
-        };
-        let r = render(sc, gap.as_ref(), st, (level, drop, shed), counts, now_wall);
-        let (text, used) = assemble(sid, st, budget, &r.lines);
-        (Brief { text, used, level }, r.units)
-    };
-    // Past the count lines and the transcript's records, the levels shed
-    // what the brief held without them.
-    let at = |level: u8, drop: usize| at_with(level, drop, false, TxShed::Stripped);
-    // The count lines first, shed before any other (S15): the mail a 3B
-    // producer counts and the acts and stories.
-    if scan_full.acts + scan_full.stories > 0 || st.totals.mail_in > 0 || st.totals.mail_out > 0 {
-        let (b, _) = at_with(0, 0, true, TxShed::Full);
-        if b.used <= budget {
-            return b;
-        }
-    }
-    // Then what the transcript added (S15): collapsed, then none of it.
-    if transcript {
-        for shed in [TxShed::Full, TxShed::Collapsed] {
-            let (b, _) = at_with(0, 0, false, shed);
-            if b.used <= budget {
-                return b;
-            }
-        }
-    }
-    let mut units = 0;
-    for level in 0..=3u8 {
-        let (b, n) = at(level, 0);
-        if b.used <= budget {
-            return b;
-        }
-        units = n;
-    }
-    // Level 3, shedding the oldest turn units: the fewest drops that fit
-    // (fewer units only ever shorten the body).
-    if units > 1 {
-        let (most, _) = at(3, units - 1);
-        if most.used <= budget {
-            let (mut lo, mut hi, mut best) = (1, units - 1, most);
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let (b, _) = at(3, mid);
-                if b.used <= budget {
-                    best = b;
-                    hi = mid;
-                } else {
-                    lo = mid + 1;
-                }
-            }
-            return best;
-        }
-    }
-    at(4, 0).0
+    BriefInput::new(window, gap, st, links)
+        .scanned()
+        .fit(sid, budget, now_wall)
 }
 
 impl crate::log::Log {
-    /// [`brief`] over this log's whole window and fold: its gap is the ring's
-    /// own eviction (a reader that holds nothing, `since=0`).
+    /// [`brief`] over this log's whole window and fold, its mail links
+    /// among it: its gap is the ring's own eviction (a reader that holds
+    /// nothing, `since=0`).
     #[must_use]
     pub fn brief(&self, sid: &str, budget: usize, now_wall: u64) -> Brief {
         let read = self.read(Cursor::new(self.ep(), 0), usize::MAX);
@@ -1009,6 +1162,7 @@ impl crate::log::Log {
             read.recs,
             read.gap,
             self.reader_state(),
+            self.reader_fold().mail_links(),
             budget,
             now_wall,
         )

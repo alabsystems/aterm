@@ -75,7 +75,9 @@ impl App {
         if !shown && self.kitty_animations.next.get(&session) == Some(&None) {
             return;
         }
-        let Ok(mut term) = term.try_lock() else {
+        // A shown frame is the session's styled frame too: the hold that
+        // steps it rings the session's screen readers as it ends (`TermGuard`).
+        let Some(mut term) = crate::term_try_lock(&term) else {
             if let Some(Some(at)) = self.kitty_animations.next.get_mut(&session) {
                 *at = (*at).max(now + LOCK_RETRY);
             }
@@ -142,12 +144,18 @@ mod tests {
     /// terminal arms nothing; a running animation on screen arms exactly its
     /// next frame, and serving that wake shows the frame and arms the one
     /// after; a stopped one disarms. Before 2026-09-29 nothing played frames
-    /// on a clock at all.
+    /// on a clock at all. A shown frame also rings the session's screen
+    /// readers (the hold that steps it moves its frame), so a content
+    /// subscription pushes it on that ring; a look that shows no frame rings
+    /// nobody.
     #[test]
     fn a_playing_animation_arms_one_wake_per_frame_and_an_idle_one_none() {
         let mut app = App::headless_for_test();
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut watcher = crate::session_watch::Subscription::new();
+        let _ = watcher.watch_frame(&app.pool.get(0).expect("session").ctx.watchers);
+        let rang = || watcher.wait(Duration::ZERO);
         app.tick_kitty_animations(0, t0);
         assert_eq!(app.kitty_animation_deadline(), None, "idle: no wake");
 
@@ -176,6 +184,10 @@ mod tests {
             term.process_at(&apc("a=p,i=7,C=1,q=2", b""), at);
             term.process_at(&apc("a=a,i=7,s=3", b""), at);
         }
+        assert!(
+            rang(),
+            "the placement's hold rang, as the reader's tee would"
+        );
         app.tick_kitty_animations(0, ms(10));
         assert_eq!(
             app.kitty_animation_deadline(),
@@ -183,11 +195,14 @@ mod tests {
             "the root's 30 ms gap, not now"
         );
         assert_eq!(placed_frame(), Some(1));
+        assert!(!rang(), "arming the clock shows no frame");
 
         app.service_kitty_animations(ms(20));
         assert_eq!(placed_frame(), Some(1), "not due yet");
+        assert!(!rang(), "no frame shown, no ring");
         app.service_kitty_animations(ms(30));
         assert_eq!(placed_frame(), Some(2), "the due frame is shown");
+        assert!(rang(), "the shown frame rang the session's watchers");
         assert_eq!(
             app.kitty_animation_deadline(),
             Some(ms(60)),

@@ -39,6 +39,14 @@ use super::{Args, Halt, Scratch, await_socket, private, sha256_file, without_ate
 use crate::perf::LaneRun;
 use crate::perf::stats::{median, tail_summary};
 
+/// Every launch's scratch `aterm.toml`: no persisted window, no update or
+/// package cadence, and the audible bell off (this window is never the
+/// owner's terminal, so a BEL its shell rings must not play their alert
+/// sound; the key is read once with the rest and costs the start nothing).
+const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
+                      [update]\nenabled = false\nauto_apply = false\n\
+                      [packages]\nenabled = false\n";
+
 /// The grid every launch asks for, and checks it got.
 pub(crate) const COLS: u64 = 110;
 pub(crate) const ROWS: u64 = 32;
@@ -764,13 +772,9 @@ impl Launcher {
         }
         // No persisted window may enter the measurement and no update cadence
         // may turn it into an update benchmark: off through the config, the
-        // way a person turns them off.
-        std::fs::write(
-            root.join("config/aterm/aterm.toml"),
-            "restore_session = false\n\n[update]\nenabled = false\nauto_apply = false\n\
-             [packages]\nenabled = false\n",
-        )
-        .map_err(|e| format!("could not write the config: {e}"))?;
+        // way a person turns them off ([`CONFIG`]).
+        std::fs::write(root.join("config/aterm/aterm.toml"), CONFIG)
+            .map_err(|e| format!("could not write the config: {e}"))?;
         // The readiness gate is "the socket exists", so a warm root's previous
         // socket file must not satisfy it.
         let _ = std::fs::remove_file(sock);
@@ -901,11 +905,22 @@ pub(crate) struct Frozen {
 /// How long a child may run past its own budget before it is called hung.
 const HUNG: Duration = Duration::from_secs(60);
 
+/// How long a new copy's first run may take: the system assesses a new file at
+/// its first exec, which a loaded host has held for minutes (a fresh 167 MB
+/// debug build took 64 s, `aterm_spec::wait::FIRST_EXEC`). A hang detector of
+/// its own, never a budget.
+const FIRST_EXEC: Duration = Duration::from_secs(10 * 60);
+
 /// `aterm --version`'s first line, which must name aterm (the lines after it
 /// name the copy that runs, so a frozen copy answers them differently).
 pub(crate) fn identity(path: &Path) -> Result<String, String> {
+    identity_within(path, HUNG)
+}
+
+/// [`identity`], its run called hung after `hang`.
+fn identity_within(path: &Path, hang: Duration) -> Result<String, String> {
     let out =
-        aterm_uds::deadline::output_until(command(path).arg("--version"), Instant::now() + HUNG)
+        aterm_uds::deadline::output_until(command(path).arg("--version"), Instant::now() + hang)
             .map_err(|e| format!("{} --version: {e}", path.display()))?;
     let text = format!(
         "{}{}",
@@ -922,7 +937,10 @@ pub(crate) fn identity(path: &Path) -> Result<String, String> {
     Ok(first)
 }
 
-/// Freeze `source` into `dir/<label>-aterm`.
+/// Freeze `source` into `dir/<label>-aterm` (`dir` a [`super::Scratch`]'s). The
+/// copy is a new file the system assesses at its first exec, its identity run:
+/// `dir` is kept, not removed, unless that run printed aterm's line
+/// ([`super::live::starting_from`]).
 pub(crate) fn freeze(label: &str, source: &Path, dir: &Path) -> Result<Frozen, String> {
     let source = source
         .canonicalize()
@@ -942,7 +960,12 @@ pub(crate) fn freeze(label: &str, source: &Path, dir: &Path) -> Result<Frozen, S
     if before != after || before != staged {
         return Err(format!("{label}: the source changed while it was staged"));
     }
-    if identity(&frozen)? != version {
+    super::live::starting_from(dir);
+    let staged_identity = identity_within(&frozen, FIRST_EXEC);
+    if staged_identity.is_ok() {
+        super::live::ran_from(dir);
+    }
+    if staged_identity? != version {
         return Err(format!("{label}: the staged executable's identity changed"));
     }
     Ok(Frozen {
@@ -1314,6 +1337,75 @@ fn start_json(artifact: &Frozen, chip: &str, args: &Args, samples: &[Sample]) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Every launch starts with the audible bell off (aterm's default is on)
+    /// and the restore, update and package lanes off, as one document
+    /// aterm's parser reads.
+    #[test]
+    fn a_start_launch_has_the_audible_bell_off() {
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(CONFIG).expect("one document");
+        let flag = |v: Option<&aterm_toml::Value>| v.and_then(aterm_toml::Value::as_bool);
+        assert_eq!(flag(doc.get("bell_sound")), Some(false));
+        assert_eq!(flag(doc.get("restore_session")), Some(false));
+        assert_eq!(
+            flag(doc.get("update").and_then(|t| t.get("enabled"))),
+            Some(false)
+        );
+        assert_eq!(
+            flag(doc.get("packages").and_then(|t| t.get("enabled"))),
+            Some(false)
+        );
+    }
+
+    /// A frozen copy whose first run printed aterm's line leaves its run root
+    /// free to go; one whose run did not keeps it (macOS may still be assessing
+    /// a copy that never showed it ran). The stand-in answers as aterm from its
+    /// own path and as something else from the frozen copy's (`*-aterm`).
+    /// NEGATIVE CONTROL: the first half, whose root goes.
+    #[cfg(unix)]
+    #[test]
+    fn a_frozen_copy_that_never_answered_keeps_its_run_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let lay = |dir: &Path, frozen_says: &str| {
+            let source = dir.join("source");
+            std::fs::write(
+                &source,
+                format!(
+                    "#!/bin/sh
+case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
+                     *) echo 'aterm 9.9.9' ;; esac\n"
+                ),
+            )
+            .expect("the stand-in");
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            source
+        };
+        let sources = super::super::Scratch::new("atv-freeze-src").expect("scratch");
+
+        let answered = super::super::Scratch::new("atv-freeze-ran").expect("scratch");
+        let root = answered.path().to_path_buf();
+        let source = lay(sources.path(), "aterm 9.9.9");
+        let frozen = freeze("ran", &source, &root).expect("the copy answers as aterm");
+        assert!(frozen.frozen.starts_with(&root));
+        drop(answered);
+        assert!(!root.exists(), "it ran: its root goes");
+
+        let silent = super::super::Scratch::new("atv-freeze-kept").expect("scratch");
+        let root = silent.path().to_path_buf();
+        std::fs::remove_file(&source).expect("the next stand-in");
+        let source = lay(sources.path(), "not aterm");
+        let refused = freeze("kept", &source, &root);
+        drop(silent);
+        let kept = root.join("kept-aterm").is_file();
+        // The frozen copy ran to its exit (it printed the wrong line): removing it is safe.
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            kept,
+            "a copy that never printed aterm's line keeps its root"
+        );
+    }
 
     /// A valid current-schema metrics read: every partition reconciles, the
     /// reveal sits BELOW first-present (an early-reveal platform), and `bias`

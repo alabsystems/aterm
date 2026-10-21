@@ -266,8 +266,46 @@ mod mac {
         label: String,
     }
 
-    fn here() -> Result<Here, String> {
+    /// The mug's files, when this process has the login's own roots. The mug is a launchd
+    /// job of the login, which reads the files under the login's home whatever `$HOME` this
+    /// shell has: a verb run with a scratch `$HOME` or a private state root
+    /// (`ATERM_STATE_HOME`, a test's) would start a real mug that never reads what it wrote,
+    /// and report on files that mug never writes, so it is refused. The homes are compared as
+    /// the directories they name (a link or firmlink to the same one is the same home); an
+    /// account home that cannot be read refuses nothing.
+    fn login_paths() -> Result<Paths, String> {
         let paths = Paths::from_env().ok_or("no home directory")?;
+        if aterm_types::dirs::runs_under_private_state_root() {
+            return Err(
+                "this process has a private state root (ATERM_STATE_HOME); the mug is the \
+                 login's, and reads only the login's own files"
+                    .to_string(),
+            );
+        }
+        if let (Some(home), Some(account)) =
+            (aterm_types::dirs::home_dir(), aterm_uds::account::home())
+            && !same_dir(&home, &account)
+        {
+            return Err(format!(
+                "HOME is {}, not this login's home {}; the mug is the login's, and reads only \
+                 the login's own files",
+                home.display(),
+                account.display()
+            ));
+        }
+        Ok(paths)
+    }
+
+    /// Whether `a` and `b` name one directory: resolved when both resolve, else as spelled.
+    fn same_dir(a: &Path, b: &Path) -> bool {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        }
+    }
+
+    fn here() -> Result<Here, String> {
+        let paths = login_paths()?;
         let origin = std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .map_err(|e| format!("this executable's path cannot be read: {e}"))?;
@@ -347,8 +385,9 @@ mod mac {
     }
 
     pub(super) fn off() -> ExitCode {
-        let Some(paths) = Paths::from_env() else {
-            return fail("no home directory");
+        let paths = match login_paths() {
+            Ok(paths) => paths,
+            Err(why) => return fail(why),
         };
         match set_mode(&paths, Mode::Off) {
             Ok(()) => answer("caffeine=off\n"),
@@ -408,9 +447,14 @@ mod mac {
             .ok_or_else(|| format!("{pid} is not a mug's pid"))?;
         // SAFETY: two integers; `pid` is positive and not launchd's, so this signals one process.
         if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        // Gone between the look and the signal (it quit, or exited for an update): ended.
+        if e.raw_os_error() == Some(libc::ESRCH) {
             Ok(())
         } else {
-            Err(format!("kill {pid}: {}", std::io::Error::last_os_error()))
+            Err(format!("kill {pid}: {e}"))
         }
     }
 
@@ -419,35 +463,49 @@ mod mac {
     const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
     pub(super) fn quit() -> ExitCode {
-        let here = match here() {
-            Ok(here) => here,
+        let (here, now) = match here_now() {
+            Ok(both) => both,
             Err(why) => return fail(why),
         };
-        // Off first, so a mug that comes back anyway comes back empty.
-        let saved = set_mode(&here.paths, Mode::Off);
+        // Off first, so a mug that comes back anyway comes back empty. A mode that already
+        // reads off (no file, an earlier boot's, a span run out) is left as it is: `quit`
+        // writes no state file where none was, and the self-uninstall sweep, which lists the
+        // mug's files before it asks for `quit`, finds none it did not list.
+        let saved = if state::load(&here.paths.state_file(), now) == Mode::Off {
+            Ok(())
+        } else {
+            set_mode(&here.paths, Mode::Off)
+        };
+        let lock = here.paths.lock_file();
         let holder = running_mug(&here.paths);
         // A job's mug is ended by launchd (`bootout`): its KeepAlive restarts one that dies
-        // of a signal. The job is the running mug's (the label it wrote beside its pid),
-        // whichever build runs `quit`; this build's when no mug names one. Any other holder
-        // (one run by hand) gets the SIGTERM itself.
-        let label = holder
+        // of a signal. The jobs are the one the running mug names (the label it wrote beside
+        // its pid), else the one a mug that died without letting go left named in the lock
+        // (launchd may be holding it back between crashes), and this build's, whichever
+        // build runs `quit`. Each is booted out while loaded, with a process this instant or
+        // not, or it would start again after `quit`. Any other holder (one run by hand) gets
+        // the SIGTERM itself.
+        let mut labels: Vec<String> = holder
             .as_ref()
             .and_then(|holder| holder.label.clone())
-            .unwrap_or_else(|| here.label.clone());
-        let job_pid = match launchd::job_state(&label) {
-            Ok(JobState::Loaded { pid: Some(pid) }) => Some(pid),
-            _ => None,
-        };
-        let mut ended = Vec::new();
-        if let Some(pid) = job_pid {
-            if let Err(e) = launchd::bootout(&label) {
-                return fail(e);
+            .or_else(|| instance::last_holder(&lock).and_then(|named| named.label))
+            .into_iter()
+            .collect();
+        if !labels.contains(&here.label) {
+            labels.push(here.label.clone());
+        }
+        let mut ended: Vec<u32> = Vec::new();
+        for label in &labels {
+            if let Ok(JobState::Loaded { pid }) = launchd::job_state(label) {
+                if let Err(e) = launchd::bootout(label) {
+                    return fail(e);
+                }
+                ended.extend(pid);
             }
-            ended.push(pid);
         }
         if let Some(pid) = holder
             .map(|holder| holder.pid)
-            .filter(|pid| Some(*pid) != job_pid)
+            .filter(|pid| !ended.contains(pid))
         {
             if let Err(why) = terminate(pid) {
                 return fail(why);
@@ -456,18 +514,37 @@ mod mac {
         }
         // `caffeine=quit` says the mug has ended, not that it was told to: the self-uninstall
         // sweep takes the lock next, and a mug still leaving would keep its files.
-        if let Err(pid) = instance::await_released(&here.paths.lock_file(), &ended, QUIT_WAIT) {
+        if let Err(pid) = instance::await_released(&lock, &ended, QUIT_WAIT) {
             return fail(format!(
                 "the mug (pid {pid}) still holds {} {} s after it was ended",
-                here.paths.lock_file().display(),
+                lock.display(),
                 QUIT_WAIT.as_secs()
             ));
+        }
+        // Also a copy left by a mug a logout or a restart ended, which removes none itself.
+        if here.paths.code_dir().exists() {
+            discard_copy(&here.paths);
         }
         match saved {
             Err(why) => fail(why),
             Ok(()) if !ended.is_empty() => answer("caffeine=quit\n"),
             Ok(()) => answer("caffeine=stopped\n"),
         }
+    }
+
+    /// Remove the ended mug's copy of the app, as a mug that quits from its menu does: once
+    /// an update retires the bundle it was cloned from, its blocks are its own. Done holding
+    /// the one-mug lock, so no mug starting now runs from what is removed (one that starts
+    /// meanwhile waits for the lock: [`hold`]); a lock another process holds by now (a mug
+    /// started since) keeps the copy.
+    fn discard_copy(paths: &Paths) {
+        let Ok(Some(held)) = Instance::try_hold(&paths.lock_file()) else {
+            return;
+        };
+        if let Err(e) = code::discard_copies(&paths.code_dir()) {
+            eprintln!("{VERB}: {}: {e}", paths.code_dir().display());
+        }
+        drop(held);
     }
 
     /// The one stderr line of a `serve` that will not run, and exit 0: launchd's KeepAlive
@@ -494,6 +571,8 @@ mod mac {
         let code_dir = paths.code_dir();
         let lock = paths.lock_file();
         let (origin, instance) = if code::runs_from_copy(&code_dir) {
+            // First thing from a copy: its exec is over, so it may go once this mug ends.
+            code::mark_ran(&code_dir);
             let Some(origin) = code::origin_exe(&code_dir) else {
                 return refuse(format!(
                     "running from a copy in {}, but {} names no executable it was started as",
@@ -565,18 +644,28 @@ mod mac {
         })
     }
 
+    /// How long [`hold`] waits out a lock held by something other than a running mug.
+    const HOLD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// Take the one-mug lock; `None` (said on stderr) when another mug holds it, or it cannot
     /// be taken (a FIFO, a directory or a link at its name: [`refuse`]'s case).
     ///
-    /// A refusal while no running mug holds it is tried once more: `status`, `start`, `on` and
-    /// `quit` read the lock with `ownerlock::probe`, which holds a free lock for an instant,
-    /// and a `serve` that lands in that instant must not leave as if a mug ran (it exits 0, so
-    /// launchd would not start it again). A mug that has the lock but has not yet written its
-    /// pid refuses the second try too.
+    /// A refusal while no running mug holds it is tried again for up to [`HOLD_PATIENCE`]:
+    /// `status`, `start`, `on` and `quit` read the lock with `ownerlock::probe`, which holds a
+    /// free lock for an instant, and `quit` holds it while it removes an ended mug's copy, and
+    /// a `serve` that lands then must not leave as if a mug ran (it exits 0, so launchd would
+    /// not start it again). A mug that has the lock but has not yet written its pid is waited
+    /// on the same way, and then refused.
     fn hold(paths: &Paths) -> Option<Instance> {
         let lock = paths.lock_file();
+        let code_dir = paths.code_dir();
+        let start = std::time::Instant::now();
         let mut taken = Instance::try_hold(&lock);
-        if matches!(taken, Ok(None)) && instance::running_mug(&lock, &paths.code_dir()).is_none() {
+        while matches!(taken, Ok(None))
+            && instance::running_mug(&lock, &code_dir).is_none()
+            && start.elapsed() < HOLD_PATIENCE
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
             taken = Instance::try_hold(&lock);
         }
         match taken {

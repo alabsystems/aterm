@@ -582,6 +582,8 @@ impl Floor {
         // never a false reject.
         let _lock = self.acquire_file_lock();
         let (recorded, corrupt) = self.read_floor_reported();
+        #[cfg(test)]
+        tests::floor_window(&self.path);
         if index_build < recorded {
             return (Err(Reject::Rollback), None);
         }
@@ -615,6 +617,8 @@ impl Floor {
     /// direction.
     pub fn rebase(&self, value: u64) {
         let _lock = self.acquire_file_lock();
+        #[cfg(test)]
+        tests::floor_window(&self.path);
         if let Err(error) = self.write(value) {
             // Fail-closed (the old, higher floor keeps refusing), but a rescue that did not
             // land is said.
@@ -664,13 +668,14 @@ impl Floor {
 
     /// Whether the floor file is already published at the mode every reader needs
     /// (`0644` — see [`Self::write`]). `false` when it cannot be stat'd at all, so an
-    /// absent floor always takes the write path. A platform without POSIX bits reports
-    /// `0` from `permission_mode` and has nothing to migrate, so it reads as published.
+    /// absent floor always takes the write path. A platform without POSIX bits has nothing
+    /// to migrate, so there it reads as published; where the bits exist, a floor at any
+    /// other mode is not — a mode-`000` one included, which only root can read.
     fn is_published(&self) -> bool {
         match std::fs::symlink_metadata(&self.path) {
             Ok(meta) => {
-                let mode = crate::platform::permission_mode(&meta) & 0o777;
-                mode == 0 || mode == 0o644
+                !crate::platform::HAS_POSIX_MODES
+                    || crate::platform::permission_mode(&meta) & 0o777 == 0o644
             }
             Err(_) => false,
         }
@@ -1237,6 +1242,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What a test runs inside the floor's locked window: between the read and the
+    /// compare → write of an advance, or before a re-base's write.
+    type FloorAct = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static FLOOR_WINDOW: std::cell::RefCell<Option<FloorAct>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The floor's locked window: run the act this thread armed, if any.
+    pub(super) fn floor_window(path: &Path) {
+        if let Some(act) = FLOOR_WINDOW.with(|window| window.borrow_mut().take()) {
+            act(path);
+        }
+    }
+
+    /// THE RATCHET IS READ AND ADVANCED UNDER ITS LOCK (CWE-362): inside the read →
+    /// compare → write window, a second opener of `<floor>.lock` cannot take it. Two
+    /// processes that both read floor F before either wrote could otherwise leave the
+    /// floor below the higher of their builds. A re-base writes under the same lock, or an
+    /// advance racing it could undo the re-base, or the re-base the advance.
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_is_read_and_advanced_under_its_lock() {
+        let dir = private_tmp_dir("floor-lock");
+        let floor = Floor::new(dir.join("index_build.floor"));
+        let advance = || assert_eq!(floor.check_and_record(7), Ok(()));
+        let rebase = || floor.rebase(3);
+        for (what, touch) in [
+            ("an advance", &advance as &dyn Fn()),
+            ("a re-base", &rebase),
+        ] {
+            let lock = dir.join("index_build.floor.lock");
+            let held = std::rc::Rc::new(std::cell::Cell::new(None));
+            let probe = std::rc::Rc::clone(&held);
+            FLOOR_WINDOW.with(|window| {
+                *window.borrow_mut() = Some(Box::new(move |_: &Path| {
+                    let file = std::fs::File::open(&lock).unwrap();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a probe: released below on the path that takes it"
+                    )]
+                    let took = file.try_lock();
+                    probe.set(Some(matches!(took, Err(std::fs::TryLockError::WouldBlock))));
+                    if took.is_ok() {
+                        let _ = file.unlock();
+                    }
+                }));
+            });
+            touch();
+            assert_eq!(
+                held.get(),
+                Some(true),
+                "{what} ran its window with the lock held"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A ratchet touch that advances nothing does not rewrite the file (on Apple targets a
     /// rewrite costs two full drive flushes). The witness is a hard link taken before the
     /// touch: a temp+`rename` rewrite moves the path to a new inode. A not-yet-0644 or corrupt
@@ -1284,14 +1348,23 @@ mod tests {
         assert_eq!(Floor::new(path.clone()).current(), 5);
 
         // ...and so is a floor not yet `0644`, even at an unchanged value
-        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(floor.check_and_record(5), Ok(()));
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o644,
-            "a legacy 0600 floor is re-published readable even at an unchanged value"
-        );
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md): a legacy 0600 one, and one
+        // anybody could write (and so lower).
+        for legacy in [0o600, 0o666] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(legacy)).unwrap();
+            assert_eq!(floor.check_and_record(5), Ok(()));
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o644,
+                "a {legacy:o} floor is re-published 0644 even at an unchanged value"
+            );
+        }
+        // A floor at mode 000 is not published either: only root can open it, and root
+        // taking it for published would never re-publish it for anyone else.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let published = floor.is_published();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!published, "a mode-000 floor is not published");
 
         // ...and so is a corrupt file: it reads as the fail-open 0, so the ratchet has to
         // re-arm by rewriting it even at `index_build` 0, where nothing "advances".

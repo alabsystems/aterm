@@ -2,10 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The minibuffer: the typed modal queries (M-x, isearch, switch-to-buffer,
-//! goto-line) that take input in place of the document, and how each is
-//! typed into, navigated and accepted.
+//! goto-line, and a command's own prompts) that take input in place of the
+//! document, and how each is typed into, navigated and accepted.
 
-use super::command::{EditorCompletionAction, command_completions};
+use super::command::{EditorCommand, EditorCompletionAction, Invocation, command_completions};
 use super::projection::byte_of_line;
 use super::view::{EditorBufferView, Selection, previous_boundary};
 use super::workspace::{EditorEffect, EditorError, EditorWorkspace, snapshot_for_view};
@@ -35,6 +35,28 @@ pub enum Minibuffer {
         query: String,
         origin: usize,
     },
+    /// A command's prompt ([`super::EditorCommand::prompts`]): `query` is the
+    /// answer being typed, and `invocation` the command with the answers it
+    /// has so far. Enter adds `query` to them and runs the command once the
+    /// last is in. A prompt only ever collects text: the document is left
+    /// alone until the command runs.
+    Prompt {
+        invocation: Invocation,
+        query: String,
+    },
+}
+
+impl Minibuffer {
+    /// The label of a command prompt's line (`Kill buffer (default this
+    /// buffer): `), or `None` for the other kinds, which a face labels itself.
+    pub fn prompt_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Prompt { invocation, .. } => {
+                invocation.next_prompt().map(|prompt| prompt.label())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl EditorWorkspace {
@@ -55,7 +77,9 @@ impl EditorWorkspace {
             Minibuffer::Search { query, .. } => {
                 (push_bounded(query, text, MINIBUFFER_QUERY_LIMIT), true)
             }
-            Minibuffer::Buffer { query } | Minibuffer::GotoLine { query, .. } => {
+            Minibuffer::Buffer { query }
+            | Minibuffer::GotoLine { query, .. }
+            | Minibuffer::Prompt { query, .. } => {
                 (push_bounded(query, text, MINIBUFFER_QUERY_LIMIT), false)
             }
             Minibuffer::Inactive => {
@@ -95,7 +119,8 @@ impl EditorWorkspace {
             }
             Minibuffer::Search { query, .. }
             | Minibuffer::Buffer { query }
-            | Minibuffer::GotoLine { query, .. } => query,
+            | Minibuffer::GotoLine { query, .. }
+            | Minibuffer::Prompt { query, .. } => query,
             Minibuffer::Inactive => {
                 return Ok(vec![EditorEffect::Bell]);
             }
@@ -144,35 +169,73 @@ impl EditorWorkspace {
                 }
                 .to_string(),
             )]),
-            Minibuffer::Buffer { query } => Ok(vec![EditorEffect::SwitchBuffer { query }]),
-            Minibuffer::GotoLine { query, origin } => {
-                let Ok(line) = query.trim().parse::<usize>() else {
-                    view.minibuffer = Minibuffer::GotoLine { query, origin };
-                    return Ok(vec![EditorEffect::Status(
-                        "Line number must be a positive integer".to_string(),
-                    )]);
-                };
-                if line == 0 {
-                    view.minibuffer = Minibuffer::GotoLine { query, origin };
-                    return Ok(vec![EditorEffect::Status(
-                        "Line numbers start at 1".to_string(),
-                    )]);
+            // A macro being defined keeps each answer with the command its
+            // key recorded, as for a command prompt below.
+            Minibuffer::Buffer { query } => {
+                self.record_answers(EditorCommand::SwitchBuffer, std::slice::from_ref(&query));
+                Ok(vec![EditorEffect::SwitchBuffer { query }])
+            }
+            // An invalid line number keeps the minibuffer open to be fixed.
+            Minibuffer::GotoLine { query, origin } => match self.goto_line(store, view, &query)? {
+                Ok(effects) => {
+                    self.record_answers(EditorCommand::GotoLine, std::slice::from_ref(&query));
+                    Ok(effects)
                 }
-                let snapshot = snapshot_for_view(store, view)?;
-                let target = byte_of_line(&snapshot.text, line.saturating_sub(1));
-                view.selections = vec![Selection::caret(target)];
-                view.primary = 0;
-                view.viewport_anchor = target;
-                view.mark_active = false;
-                let landed = snapshot.text[..target].matches('\n').count() + 1;
-                Ok(vec![EditorEffect::Status(if landed < line {
-                    format!("Line {landed} (last line)")
-                } else {
-                    format!("Line {line}")
-                })])
+                Err(refusal) => {
+                    view.minibuffer = Minibuffer::GotoLine { query, origin };
+                    Ok(vec![EditorEffect::Status(refusal)])
+                }
+            },
+            // The answer joins the command's; the next prompt asks for the
+            // next one, and the last runs the command.
+            Minibuffer::Prompt {
+                mut invocation,
+                query,
+            } => {
+                invocation.args.push(query);
+                if invocation.next_prompt().is_some() {
+                    view.minibuffer = Minibuffer::Prompt {
+                        invocation,
+                        query: String::new(),
+                    };
+                    return Ok(Vec::new());
+                }
+                self.answer_prompt(store, view, invocation)
             }
             Minibuffer::Inactive => Ok(vec![EditorEffect::Bell]),
         }
+    }
+
+    /// `goto-line` to the line `query` names, from 1: past the end the caret
+    /// lands on the last line. A query that names no line is refused with
+    /// the reason, and nothing moves.
+    pub(super) fn goto_line(
+        &mut self,
+        store: &DocumentStore,
+        view: &mut EditorBufferView,
+        query: &str,
+    ) -> Result<Result<Vec<EditorEffect>, String>, EditorError> {
+        let Ok(line) = query.trim().parse::<usize>() else {
+            return Ok(Err("Line number must be a positive integer".to_string()));
+        };
+        if line == 0 {
+            return Ok(Err("Line numbers start at 1".to_string()));
+        }
+        let snapshot = snapshot_for_view(store, view)?;
+        let target = byte_of_line(&snapshot.text, line.saturating_sub(1));
+        view.selections = vec![Selection::caret(target)];
+        view.primary = 0;
+        view.viewport_anchor = target;
+        view.mark_active = false;
+        let landed = snapshot.text[..target]
+            .matches('\n')
+            .count()
+            .saturating_add(1);
+        Ok(Ok(vec![EditorEffect::Status(if landed < line {
+            format!("Line {landed} (last line)")
+        } else {
+            format!("Line {line}")
+        })]))
     }
 
     /// Navigate, complete, or activate the one semantic M-x result list. This
@@ -189,19 +252,21 @@ impl EditorWorkspace {
             _ => return Ok(vec![EditorEffect::Bell]),
         };
         let candidates = command_completions(&query);
-        if candidates.is_empty() {
+        // The guard is on the local count, so the wrap's `%` and `count - 1`
+        // below are provably panic-free (Trust does not see through `is_empty`).
+        let count = candidates.len();
+        if count == 0 {
             return Ok(vec![EditorEffect::Status(format!(
                 "No editor command matches `{query}`"
             ))]);
         }
+        let last = count - 1;
         match action {
             EditorCompletionAction::Previous | EditorCompletionAction::Next => {
                 let next = if action == EditorCompletionAction::Previous {
-                    selected
-                        .checked_sub(1)
-                        .unwrap_or(candidates.len().saturating_sub(1))
+                    selected.checked_sub(1).unwrap_or(last)
                 } else {
-                    selected.saturating_add(1) % candidates.len()
+                    selected.saturating_add(1) % count
                 };
                 if let Minibuffer::Command { selected, .. } = &mut view.minibuffer {
                     *selected = next;
@@ -209,19 +274,21 @@ impl EditorWorkspace {
                 Ok(Vec::new())
             }
             EditorCompletionAction::Complete => {
-                let chosen = selected.min(candidates.len() - 1);
-                if let Minibuffer::Command {
-                    query,
-                    selected: current,
-                } = &mut view.minibuffer
+                if let (
+                    Some(candidate),
+                    Minibuffer::Command {
+                        query,
+                        selected: current,
+                    },
+                ) = (candidates.get(selected.min(last)), &mut view.minibuffer)
                 {
-                    *query = candidates[chosen].name().to_string();
+                    *query = candidate.name().to_string();
                     *current = 0;
                 }
                 Ok(Vec::new())
             }
             EditorCompletionAction::Choose(index) => {
-                if index >= candidates.len() {
+                if index >= count {
                     return Ok(vec![EditorEffect::Bell]);
                 }
                 if let Minibuffer::Command { selected, .. } = &mut view.minibuffer {

@@ -25,14 +25,16 @@
 //!
 //! Inputs (phase 5, ruling T1): the host ADMITS an input under the lock it
 //! takes before a byte (`TurnTracker::admit`) and ACCEPTS it after the write
-//! (`TurnTracker::accept`), the model's `Admit` and `Accept`, one in flight
+//! (`TurnTracker::accept`), the model's `AdmitCtl` or `AdmitHarness` (by
+//! the input's actor, phase 6, 6A-5) and `Accept`, one in flight
 //! at a time; a person's input is both at once (`Person`); time passing
 //! past `STEP_ACT_MS` and `STEP_INPUT_LEAD_MS` is its `Age` and `LeadOut`.
 //! The rig keeps the model's ghosts from what it fed and what the log
 //! shows: an input bound to a step it was neither admitted under nor led to
 //! (`gn`), a binding still held after it attributed a close (`ab`), a close
 //! read approved, declined or answered with no fresh, proven, acted input
-//! bound to it (`ga`).
+//! bound to it (`ga`), and who sent the input the open step is bound to
+//! (`bs`), which the tracker's binding must name (`ba`).
 //!
 //! NEGATIVE CONTROLS: the Codex mid-answer idle closed at once, an early
 //! wake that closes, a turn closed on `unknown`, a projection that forgets
@@ -40,7 +42,9 @@
 //! turn, a refutation that leaves the wall's settle armed, and T1's five
 //! mutants (an acceptance after box 1 closed that binds box 2, a stale input
 //! that approves, an act a person's input does not supersede, on the box or
-//! on the lead, a binding a close keeps) are each rejected.
+//! on the lead, a binding a close keeps) are each rejected, and so is a
+//! binding that names the other acting actor (`ActorSwap`, 6A-5), from a
+//! ctl act and from the harness's.
 
 use aterm_models_session::turn_tracker_model;
 use aterm_slog::{
@@ -122,6 +126,26 @@ fn timed(prev: &State, next: &State, ticks: usize) -> Vec<&'static str> {
     path
 }
 
+/// The model's code for an acting actor (6A-5): 1 ctl, 2 the harness, 3
+/// any other (no model step makes it, so a path or a law refuses it).
+fn actor_code(by: Actor) -> i64 {
+    match by {
+        Actor::Ctl => 1,
+        Actor::Harness => 2,
+        _ => 3,
+    }
+}
+
+/// The model's admission of an input from `by` (6A-5): the model knows two
+/// acting actors beside the person.
+fn admit_action(by: Actor) -> &'static str {
+    match by {
+        Actor::Ctl => "AdmitCtl",
+        Actor::Harness => "AdmitHarness",
+        other => panic!("the model's acting actors are ctl and the harness, not {other:?}"),
+    }
+}
+
 fn step_code(s: ScreenStep) -> i64 {
     match s {
         ScreenStep::Approval(_) => 1,
@@ -160,6 +184,10 @@ pub struct Rig {
     pub bound_next: bool,
     pub bound_twice: bool,
     pub approved_unseen: bool,
+    /// Who sent the input the open step is bound to, as the rig fed it
+    /// (the model's `bs`, 6A-5), and who sent the act accepted on the lead.
+    pub bound_sender: Option<Actor>,
+    pub lead_sender: Option<Actor>,
     /// The ring's bounds, which an update's successor keeps.
     pub limits: Limits,
     /// Its birth order and the host calls it made, while
@@ -198,6 +226,8 @@ impl Rig {
             bound_next: false,
             bound_twice: false,
             approved_unseen: false,
+            bound_sender: None,
+            lead_sender: None,
             limits,
             born: seq_twins::born(),
             path: Vec::new(),
@@ -266,8 +296,13 @@ impl Rig {
         let (adm, by, act, ..) = self.pending.take()?;
         let stamp = self.stamp();
         let bound = self.tracker.accept(&self.log, by, act, adm, stamp);
-        if matches!(bound, Binding::Step(_)) {
-            self.person_on = None;
+        match bound {
+            Binding::Step(_) => {
+                self.person_on = None;
+                self.bound_sender = Some(by);
+            }
+            Binding::Lead => self.lead_sender = Some(by),
+            Binding::Late(_) | Binding::Unbound => {}
         }
         self.judge(before, Call::Accept);
         Some(bound)
@@ -327,6 +362,10 @@ impl Rig {
                     Call::Other => false,
                 };
             self.bound_next |= !legit;
+            // An act's lead the open bound: its sender is the lead's.
+            if matches!(call, Call::See) && by != Actor::Human {
+                self.bound_sender = self.lead_sender;
+            }
             // A person's lead the open bound: the step's latest input is
             // the person's, from when it was accepted (the model's `pp`).
             if matches!(call, Call::See)
@@ -630,6 +669,23 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
     let pp = rig
         .person_on
         .is_some_and(|(n, t)| Some(n) == open && rig.now - t <= STEP_ACT_MS);
+    // 6A-5: who sent the input in flight or on the lead (`pa`), whom the
+    // fresh act's binding names (`ba`) and who sent it (`bs`, the rig's).
+    let a = rig.tracker.attribution();
+    let pd = pending_code(rig);
+    let pa = match rig.pending {
+        Some((_, by, ..)) => actor_code(by),
+        None if pd == 3 => a.lead.map_or(0, |(by, ..)| actor_code(by)),
+        None => 0,
+    };
+    let (ba, bs) = if bk == 1 {
+        (
+            a.bound.map_or(0, |(_, by, ..)| actor_code(by)),
+            rig.bound_sender.map_or(0, actor_code),
+        )
+    } else {
+        (0, 0)
+    };
     [
         ("turn", i64::from(turn)),
         ("extra", (open_turns - 1).max(0)),
@@ -643,9 +699,12 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
         ("rf", i64::from(rig.tracker.tx_view().refuted.is_some())),
         ("wg", i64::from(rig.wall_gone)),
         ("bk", bk),
-        ("pd", pending_code(rig)),
+        ("pd", pd),
         ("pp", i64::from(pp)),
         ("pl", person_lead(rig)),
+        ("pa", pa),
+        ("ba", ba),
+        ("bs", bs),
         ("ab", i64::from(rig.bound_twice)),
         ("gn", i64::from(rig.bound_next)),
         ("ga", i64::from(rig.approved_unseen)),
@@ -771,8 +830,9 @@ pub enum Step {
     /// does not cross) and every input's binding (T1: none is carried);
     /// uncarried, it starts as the model's initial state.
     Handoff(bool),
-    /// The host admits an input from the actor with its act (T1's `Admit`;
-    /// one is in flight at a time).
+    /// The host admits an input from the actor with its act (T1's
+    /// admission: the model's `AdmitCtl` or `AdmitHarness` by the actor,
+    /// 6A-5; one is in flight at a time).
     Admit(Actor, Option<ActWord>),
     /// The host accepts the input in flight (`Accept`; nothing when none
     /// is).
@@ -967,7 +1027,14 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
         Step::Admit(by, act) => {
             assert_eq!(prev["pd"], 0, "one input in flight at a time");
             rig.admit(by, act);
-            admitted(m, rig, &["Admit"], &prev, &project(rig, None), before);
+            admitted(
+                m,
+                rig,
+                &[admit_action(by)],
+                &prev,
+                &project(rig, None),
+                before,
+            );
         }
         Step::Accept => {
             let path: &[&str] = if rig.accept().is_some() {
@@ -993,6 +1060,7 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
             // not seen to open here (T1).
             rig.pending = None;
             rig.person_on = None;
+            (rig.bound_sender, rig.lead_sender) = (None, None);
             rig.opened = rig.open_binding().map(|n| (n, None));
             let want = if carried {
                 let mut kept = prev.clone();
@@ -1003,6 +1071,9 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
                     ("pd", 0),
                     ("pp", 0),
                     ("pl", 0),
+                    ("pa", 0),
+                    ("ba", 0),
+                    ("bs", 0),
                 ] {
                     kept.insert(k, v);
                 }
@@ -1114,7 +1185,13 @@ fn turn_tracker_conforms_to_derived_model() {
             apply(&m, &mut rig, step);
             let next = project(&rig, None);
             for (name, moved) in [
-                ("Admit", matches!(step, Step::Admit(..))),
+                ("AdmitCtl", matches!(step, Step::Admit(Actor::Ctl, _))),
+                (
+                    "AdmitHarness",
+                    matches!(step, Step::Admit(Actor::Harness, _)),
+                ),
+                ("a ctl act binds", next["bk"] == 1 && next["ba"] == 1),
+                ("a harness act binds", next["bk"] == 1 && next["ba"] == 2),
                 ("Accept binds", prev["pd"] == 1 && next["bk"] == 1),
                 ("Accept on the lead", prev["pd"] == 2 && next["pd"] == 3),
                 ("Accept late", prev["pd"] == 4 && next["pd"] == 0),
@@ -1172,7 +1249,10 @@ fn turn_tracker_conforms_to_derived_model() {
         "TxRefute under the turn",
         "TxRefute on the run",
         "SeeNextBox",
-        "Admit",
+        "AdmitCtl",
+        "AdmitHarness",
+        "a ctl act binds",
+        "a harness act binds",
         "Accept binds",
         "Accept on the lead",
         "Accept late",
@@ -1440,7 +1520,14 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
         "a late acceptance bound box 2"
     );
     let mut bad = late.clone();
-    for (k, v) in [("bk", 1), ("pd", 0), ("gn", 1)] {
+    for (k, v) in [
+        ("bk", 1),
+        ("ba", late["pa"]),
+        ("bs", late["pa"]),
+        ("pa", 0),
+        ("pd", 0),
+        ("gn", 1),
+    ] {
         bad.insert(k, v);
     }
     caught("ActBindsNextBox", "ActNeverBindsNextBox", &late, &bad);
@@ -1556,10 +1643,63 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
         .expect("box 1 closed");
     assert_eq!((close.out(), close.by), (Some("approved"), Actor::Harness));
     let mut bad = m.successors("SeeNextBox", &bound).remove(0);
-    for (k, v) in [("bk", 1), ("ab", 1)] {
+    for (k, v) in [
+        ("bk", 1),
+        ("ba", bound["ba"]),
+        ("bs", bound["bs"]),
+        ("ab", 1),
+    ] {
         bad.insert(k, v);
     }
     caught("ActTwice", "AttributesOnce", &bound, &bad);
+
+    // 6A-5: an act binds as the actor who sent it. The harness's approve
+    // closes its box `approved by=harness`; reading it as ctl's
+    // (`ActorSwap`) breaks HarnessActNotCtl. A ctl approve, bound under the
+    // box or on the lead, closes `passed by=ctl` (ctl is no proven author);
+    // reading it as the harness's breaks ActorKeepsItsAct.
+    assert_eq!((bound["bk"], bound["ba"], bound["bs"]), (1, 2, 2));
+    let bad = with(&bound, &[("ba", 1)]);
+    caught("ActorSwap", "HarnessActNotCtl", &bound, &bad);
+    for lead in [false, true] {
+        let mut steps = vec![Step::See(Verdict::Busy)];
+        if !lead {
+            steps.push(Step::See(edit));
+        }
+        steps.extend([
+            Step::Admit(Actor::Ctl, Some(ActWord::Approve)),
+            Step::Accept,
+        ]);
+        if lead {
+            steps.push(Step::See(edit));
+        }
+        let mut rig = drive(&steps);
+        let ctl = project(&rig, None);
+        assert_eq!(
+            (ctl["bk"], ctl["ba"], ctl["bs"], ctl["pa"]),
+            (1, 1, 1, 0),
+            "a ctl act binds as ctl's (on the lead: {lead})"
+        );
+        let seq0 = rig.log.last_seq();
+        checked(&mut rig, Step::See(Verdict::Busy));
+        let close = rig
+            .since(seq0)
+            .into_iter()
+            .find(|r| r.op == Op::Close && r.k == Kind::Approval)
+            .expect("the box closed");
+        assert_eq!((close.out(), close.by), (Some("passed"), Actor::Ctl));
+        let bad = with(&ctl, &[("ba", 2)]);
+        caught("ActorSwap", "ActorKeepsItsAct", &ctl, &bad);
+    }
+}
+
+/// `s` with `kv` set.
+fn with(s: &State, kv: &[(&'static str, i64)]) -> State {
+    let mut b = s.clone();
+    for (k, v) in kv {
+        b.insert(k, *v);
+    }
+    b
 }
 
 /// The fold's `appr_by` (human, harness, ctl, other) counts each approval

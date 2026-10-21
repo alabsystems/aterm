@@ -3728,6 +3728,13 @@ impl Stardust {
     /// brightest pixel is at most [`AURORA_COV_PEAK`]. Dark is additive
     /// `spectrum(tri(t))`; light is the same veil as over-text ink (§3.3).
     fn draw_veil(&self, ctx: &Ctx<'_>, halos: &mut Vec<RainHalo>, light_cap: usize) {
+        // On paper the aurora is not drawn: ink cannot glow, and a pale tint
+        // along the row above the ribbon read as a flat strip with hard
+        // edges and square ends (a selection's), not as light. The stars it
+        // carried on dark keep their own marks.
+        if !ctx.cfg.dark_theme {
+            return;
+        }
         let g = ctx.geom;
         let ch = g.ch as f32;
         let intensity = clamp01(ctx.cfg.intensity);
@@ -5261,23 +5268,24 @@ fn price_centre(
 /// One light-theme star, as [`push_twinkle_over_twin`] takes it:
 /// `push_twinkle_star`'s parameter set minus the quad budget.
 #[derive(Clone, Copy, Debug)]
-struct LightStar {
+pub(crate) struct LightStar {
     /// Device-pixel centre.
-    centre: (i32, i32),
+    pub(crate) centre: (i32, i32),
     /// The steady arm half-length in px: the arm clock's trough, already
     /// taxed by `STAR_ARM_INK` (§3.3). It sizes the nucleus, body, waist and
     /// glint offset.
-    mass: f32,
+    pub(crate) mass: f32,
     /// The arm clock's integer step above its trough (§5.5): only the tip
     /// lays take it.
-    step: i32,
-    /// The star's ink on the page ([`star_ink_on_paper`]); the ink roles
-    /// price its alpha.
-    rgb: u32,
+    pub(crate) step: i32,
+    /// The star's ink on the page ([`star_ink_on_paper`] here; the cursor
+    /// glow's sparkle passes its may-touch-text ink); the ink roles price its
+    /// alpha.
+    pub(crate) rgb: u32,
     /// Whether to lay the four diagonal glint dots (gold, at twinkle peak).
-    gold: bool,
+    pub(crate) gold: bool,
     /// The star's additive coverage request, as a byte.
-    cov: u8,
+    pub(crate) cov: u8,
 }
 
 /// A star's ink on a light page (§3.3, C1): a stop's or gold's point-mark ink
@@ -5301,7 +5309,12 @@ fn star_ink_on_paper(tint: u32, cfg: &Config) -> u32 {
 /// The per-lay alpha solves for the three-lay centre stack, so the crossing
 /// matches the family's plus. Everything but the tip lays' reach is sized
 /// from `mass`, so the size clock moves only the points.
-fn push_twinkle_over_twin(halos: &mut Vec<RainHalo>, geom: Geom, cap: usize, star: LightStar) {
+pub(crate) fn push_twinkle_over_twin(
+    halos: &mut Vec<RainHalo>,
+    geom: Geom,
+    cap: usize,
+    star: LightStar,
+) {
     let LightStar {
         centre,
         mass,
@@ -7851,6 +7864,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ON PAPER THERE IS NO AURORA STRIP: the same hot run on a light ground
+    /// lays no veil over the row above the ribbon (a pale band with hard
+    /// edges and square ends), while on dark it does (the control).
+    #[test]
+    fn the_aurora_is_not_drawn_on_paper() {
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let veiled = |dark: bool| -> usize {
+            let mut c = cfg(dark);
+            if !dark {
+                (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+            }
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            let mut n = 0;
+            for k in 0..40u16 {
+                let at = key_at(t0, k);
+                let mut cx = ctx(at, &c, (5, 10 + k));
+                cx.disp = disp_at_12cps(k);
+                cx.birth_disp = cx.disp;
+                cx.caret_t = 0.0;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                let mut sc = Scratch::default();
+                sky.emit(&cx, &mut sc.frame());
+                // A veil: an ellipse as wide as the aurora's reach, clipped to
+                // one cell's own column, at most 0.35 ch tall.
+                let g = geom();
+                n += sc
+                    .halos
+                    .iter()
+                    .filter(|h| {
+                        f32::from(h.rx) >= AURORA_REACH_CW * g.cw as f32 - 1.0
+                            && h.rx > h.ry
+                            && i32::from(h.w) <= g.cw as i32
+                            && (i32::from(h.x) - i32::from(g.origin_x)) % g.cw as i32 == 0
+                            && i32::from(h.h) <= (AURORA_TALL_CH * g.ch as f32).ceil() as i32
+                    })
+                    .count();
+            }
+            n
+        };
+        assert!(veiled(true) > 0, "control: the dark aurora draws");
+        assert_eq!(veiled(false), 0, "a veil strip on paper");
     }
 
     /// The aurora leaves with the ribbon: after the last key the veil is gone

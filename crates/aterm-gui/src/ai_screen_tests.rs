@@ -24,6 +24,7 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
         state,
         mark,
         fact: fact.to_string(),
+        path: None,
         version: Some("1.2.3".to_string()),
     }
 }
@@ -582,4 +583,32 @@ fn an_old_ai_completion_cannot_settle_a_new_policy_look() {
     );
     app.finish_ai_look(reenabled, Ok(reading()));
     assert!(app.ai_state().reading.is_some());
+}
+
+/// THE READING SAYS WHICH PATH A FACT NAMES (item A5 of the round-9 narrow
+/// sweep): the copy on `PATH` aterm does not manage, whole — a folder with a
+/// space in it included — where the fact says it, so the page's row cuts its
+/// detail around the path rather than at the path's first space. None where
+/// there is no such copy, or the fact (cut at its bound) does not say all of
+/// it.
+#[test]
+fn a_reading_names_the_whole_path_its_fact_says() {
+    let path = Path::new("/Users//someone/Library/Application Support/aterm/pkg/reroute/agy");
+    let fact = format!(
+        "not installed by aterm (a copy it does not manage is at {}) (not measured in this build)",
+        path.display()
+    );
+    assert_eq!(
+        named_path(&fact, Some(path)).as_deref(),
+        Some("/Users//someone/Library/Application Support/aterm/pkg/reroute/agy")
+    );
+    assert_eq!(named_path(&fact, None), None);
+    assert_eq!(named_path("not installed", Some(path)), None);
+    assert_eq!(
+        named_path(
+            "not installed by aterm (a copy it does not manage is at /Users//someone/Library/Appl",
+            Some(path)
+        ),
+        None
+    );
 }

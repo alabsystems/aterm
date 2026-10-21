@@ -35,17 +35,23 @@ aterm-uds = { workspace = true }
 # The Containment write roots, which the script cache must lie outside
 # (`test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots`).
 aterm-containment = { workspace = true }
-# `stand_in`: the live fixtures' stand-in programs, one pre-assessed inode per body
-# (in an optimized test build too).
-aterm-tempfile = { workspace = true, features = ["test-support"] }
+# `stand_in`: the live fixtures' stand-in programs, one pre-assessed inode per body.
+aterm-tempfile = { workspace = true }
 # The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
 # the two env-clearing integration tests in shell_suite must clear a shell var
 # for the length of one call, and every mutation in the workspace routes through
 # that helper rather than a raw `set_var`/`remove_var`.
 aterm-log = { workspace = true }
 # `aterm_spec::host::could_not_run`: a live test whose shell or pty this host
-# lacks ends COULD NOT RUN, never a silent pass.
+# lacks ends COULD NOT RUN, never a silent pass; `aterm_spec::host::test_shell`
+# finds the live shells, as it does for atpkg's real-shell tests.
 aterm-spec = { workspace = true }
+
+# `LiveShell::spawn` starts every live shell with SIGINT and SIGQUIT at their defaults,
+# as aterm-pty starts a tab's (`signal` between fork and exec). The workspace's `libc`
+# is first-party (crates/aterm-libc).
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
 
 # The Windows key-press test (src/tests_pwsh_keys.rs) types at a live PowerShell
 # prompt through the ConPTY a tab gets: aterm-pty's spawn, with the caps the test

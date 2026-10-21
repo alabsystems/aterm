@@ -500,7 +500,7 @@ impl MacCpuFrame<'_> {
             if !transaction.is_null() {
                 appkit::send_v(transaction.as_id(), sel!(commit));
             }
-            CGImageRelease(image);
+            CGImageRelease(image.cast());
         }
         Ok(())
     }

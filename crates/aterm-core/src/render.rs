@@ -18,9 +18,13 @@ use crate::terminal::{CursorStyle, RenderCell};
 use aterm_hash::FxHashMap;
 
 // The engine's sprite and bitmap primitive (design: docs/DESIGN-card-engine-2026-10-19.md §4).
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use crate::render_fx::fx_counts_here;
 pub use crate::render_fx::{
-    FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxRowRuns, FxRun, FxSlot,
-    FxSpace, FxSprite, FxTexels, PxRect,
+    FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer,
+    FxRamps, FxRect, FxRowRuns, FxRun, FxSlot, FxSpace, FxSprite, FxTexels, PxRect,
+    fx_layer_builds, fx_payload_copies,
 };
 
 /// One faded cell of the cursor motion trail: a cell the cursor recently swept
@@ -1473,9 +1477,12 @@ pub struct RenderInput {
     pub fire_patch_damage: EffectStreamDamage,
     /// Host-resolved cursor fill override (`0x00RRGGBB`), or `None` for the
     /// theme/OSC-12 colour. Applies to every cursor shape (block, hollow, bar,
-    /// underline, Bolt); block glyph cut-outs and other shapes still go through
-    /// `floor_cursor_fill`, keeping contrast. Host-owned (rainbow, forge,
-    /// phaser, lightning).
+    /// underline, Bolt). The host holds an effect-owned fill to its own page
+    /// floor before it lands here (aterm-effects `cursor_fx::floor_block_fill`);
+    /// the renderer then applies `floor_cursor_fill`, which is the user's
+    /// minimum-contrast knob (off by default: the fill is used as given), to the
+    /// fill and the block cut-out alike. Host-owned (rainbow, forge, phaser,
+    /// lightning, comet, droplet, light rod, momentum).
     pub cursor_fill_override: Option<u32>,
     /// Sparkle-word decorations for this frame: small sprites over cells of
     /// matched profanity / feline words. Host-owned (`cell_frame_into` leaves
@@ -3483,29 +3490,215 @@ impl RenderInput {
         let Some(cell) = cells.get_mut(frame_col) else {
             return false;
         };
-        let (fg, bg) = (cell.fg, cell.bg);
-        let dim = |f: u8, b: u8| f.midpoint(b);
-        *cell = RenderCell {
-            ch,
-            fg: [dim(fg[0], bg[0]), dim(fg[1], bg[1]), dim(fg[2], bg[2])],
-            wide: false,
-            emoji_presentation: false,
-            text_presentation: false,
-            bold: false,
-            italic: false,
-            underline: crate::terminal::UnderlineStyle::None,
-            strikethrough: false,
-            overline: false,
-            underline_color: None,
-            ..*cell
-        };
+        *cell = ghost_cell(*cell, ch);
+        self.drop_marks(row, frame_col);
+        true
+    }
+
+    /// Drop the grapheme cluster and combining marks of frame cell
+    /// (`row`, `frame_col`): both renderers prefer them to the cell's `ch`, so a
+    /// cell a prediction repaints would draw the old grapheme over the new one.
+    fn drop_marks(&mut self, row: usize, frame_col: usize) {
         if let Some(clusters) = self.clusters.get_mut(row) {
             clusters.retain(|&(c, _)| c != frame_col);
         }
         if let Some(combining) = self.combining.get_mut(row) {
             combining.retain(|&(c, _)| c != frame_col);
         }
+    }
+
+    /// Paint a predictive-echo SPAN, `aterm-predict`'s state chain on one row:
+    /// each `(col, cell)` of `cells` (logical columns, strictly increasing) is
+    /// painted as its [`SpanCell`] says, ALL OR NOTHING. Returns whether it
+    /// painted; `false` leaves the frame untouched. An empty span paints nothing
+    /// and is painted (a pure motion's state changes no cell).
+    ///
+    /// A chain is a STATE: a glyph typed, or erased, inside a line moves the
+    /// text right of the cursor one cell, and a part of a state is a frame no
+    /// program draws. So every cell is checked before any is written, and the
+    /// span is refused when:
+    /// * the row is missing, drawn in another order (BiDi: a logical column is
+    ///   not its frame column, and moved text would land elsewhere) or at
+    ///   another size (DEC double width), or a column is at or past `cols`;
+    /// * the columns are not strictly increasing;
+    /// * a painted cell would SPLIT a wide glyph of the frame: a continuation
+    ///   painted without its lead, or a lead without its continuation (both
+    ///   halves painted replace the glyph as a unit);
+    /// * a moved cell's source is not a narrow cell without marks (a shift
+    ///   moves the plain text the predictor saw there, never half a glyph), or
+    ///   the moved cells reorder their sources (a shift keeps the text's order).
+    ///
+    /// Then every source is read before the cell it stands on is written: a
+    /// chain can shift both ways (a glyph typed, an erase further along), and the
+    /// moved cells are painted leftward-moving first, left to right, then
+    /// rightward-moving, right to left, then the typed and vacated cells, which
+    /// read nothing, and a moved cell whose source is its own column, which no
+    /// pass before it writes. Because the moved cells keep their order, no
+    /// source is written before it is read.
+    ///
+    /// * [`SpanCell::Typed`] is a ghost, as [`Self::paint_prediction_ghost`]
+    ///   paints one: its glyph dimmed toward the cell's background, inherited
+    ///   SGR and geometry dropped.
+    /// * [`SpanCell::Moved`] is the source cell itself, in its own colours and
+    ///   attributes (the text is certain, only its place is speculative), if it
+    ///   holds the expected glyph; else that glyph as a typed ghost, so the
+    ///   painted text is the span's whatever the frame holds.
+    /// * [`SpanCell::Vacated`] is `blank`, the terminal's implicit blank.
+    ///
+    /// Past a trimmed row's end the row is extended with `blank`, as the ghost
+    /// painter extends it, and a source past it reads as `blank`. Each painted
+    /// cell's grapheme cluster and combining marks go.
+    pub fn paint_prediction_span<I>(
+        &mut self,
+        row: usize,
+        cells: I,
+        cols: usize,
+        blank: RenderCell,
+    ) -> bool
+    where
+        I: IntoIterator<Item = (usize, SpanCell)>,
+        I::IntoIter: Clone + DoubleEndedIterator,
+    {
+        let cells = cells.into_iter();
+        if !self.prediction_span_paintable(row, cells.clone(), cols) {
+            return false;
+        }
+        // The furthest column the span writes: the row grows to it first, with
+        // the terminal's blank, so every write below lands inside it. (A source
+        // past the row's end reads that blank, before or after the growth.)
+        if let Some(furthest) = cells.clone().map(|(c, _)| c).max()
+            && let Some(frame_row) = self.cells.get_mut(row)
+            && frame_row.len() <= furthest
+        {
+            frame_row.resize(furthest + 1, blank);
+        }
+        let write = |input: &mut Self, col: usize, cell: RenderCell| {
+            if let Some(target) = input.cells.get_mut(row).and_then(|r| r.get_mut(col)) {
+                *target = cell;
+            }
+            input.drop_marks(row, col);
+        };
+        let moved = |input: &Self, col: usize, from: usize, ch: char| {
+            let cell = input
+                .cells
+                .get(row)
+                .and_then(|r| r.get(from))
+                .copied()
+                .unwrap_or(blank);
+            if cell.ch == ch {
+                cell
+            } else {
+                let at = input
+                    .cells
+                    .get(row)
+                    .and_then(|r| r.get(col))
+                    .copied()
+                    .unwrap_or(blank);
+                ghost_cell(at, ch)
+            }
+        };
+        for (col, cell) in cells.clone() {
+            if let SpanCell::Moved { from, ch } = cell
+                && col < from
+            {
+                let painted = moved(self, col, from, ch);
+                write(self, col, painted);
+            }
+        }
+        for (col, cell) in cells.clone().rev() {
+            if let SpanCell::Moved { from, ch } = cell
+                && col > from
+            {
+                let painted = moved(self, col, from, ch);
+                write(self, col, painted);
+            }
+        }
+        // A moved cell whose source is its own column moves nothing: its source
+        // is no other cell's, and none of the passes above writes it, so it is
+        // read here as it stands, and painted as every moved cell is.
+        for (col, cell) in cells {
+            let painted = match cell {
+                SpanCell::Typed(ch) => {
+                    let at = self
+                        .cells
+                        .get(row)
+                        .and_then(|r| r.get(col))
+                        .copied()
+                        .unwrap_or(blank);
+                    ghost_cell(at, ch)
+                }
+                SpanCell::Vacated => blank,
+                SpanCell::Moved { from, ch } if from == col => moved(self, col, from, ch),
+                SpanCell::Moved { .. } => continue,
+            };
+            write(self, col, painted);
+        }
         true
+    }
+
+    /// Whether [`Self::paint_prediction_span`] would paint `cells` on `row`:
+    /// its refusal, asked without painting (see there for every condition).
+    #[must_use]
+    pub fn prediction_span_paintable<I>(&self, row: usize, cells: I, cols: usize) -> bool
+    where
+        I: IntoIterator<Item = (usize, SpanCell)>,
+    {
+        let Some(frame_row) = self.cells.get(row) else {
+            return false;
+        };
+        if !self.visual_to_logical_row(row).is_empty()
+            || self
+                .line_sizes
+                .get(row)
+                .is_some_and(|size| *size != LineSize::SingleWidth)
+        {
+            return false;
+        }
+        let continuation = |c: usize| frame_row.get(c).is_some_and(|cell| cell.wide);
+        let marked = |c: usize| {
+            self.clusters
+                .get(row)
+                .is_some_and(|marks| marks.iter().any(|(at, _)| *at == c))
+                || self
+                    .combining
+                    .get(row)
+                    .is_some_and(|marks| marks.iter().any(|(at, _)| *at == c))
+        };
+        let mut previous: Option<usize> = None;
+        let mut previous_source: Option<usize> = None;
+        // A painted continuation needs its lead painted just before it; a
+        // painted lead needs its continuation painted just after it, which the
+        // next cell is checked for (`owed`).
+        let mut owed: Option<usize> = None;
+        for (col, cell) in cells {
+            if col >= cols || previous.is_some_and(|p| col <= p) {
+                return false;
+            }
+            if let Some(need) = owed.take()
+                && need != col
+            {
+                return false;
+            }
+            if continuation(col) && previous != col.checked_sub(1) {
+                return false;
+            }
+            if continuation(col + 1) {
+                owed = Some(col + 1);
+            }
+            if let SpanCell::Moved { from, .. } = cell {
+                if from >= cols
+                    || continuation(from)
+                    || continuation(from + 1)
+                    || marked(from)
+                    || previous_source.is_some_and(|p| from <= p)
+                {
+                    return false;
+                }
+                previous_source = Some(from);
+            }
+            previous = Some(col);
+        }
+        owed.is_none()
     }
 
     /// Whether [`Self::paint_prediction_ghost`] would paint a ghost at logical
@@ -4107,6 +4300,48 @@ mod ime_preedit_caret_query_tests {
     }
 }
 
+/// One cell of a predictive-echo span ([`RenderInput::paint_prediction_span`]):
+/// what `aterm-predict`'s state chain shows there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanCell {
+    /// A glyph a key typed, whose echo has not come: painted as a ghost.
+    Typed(char),
+    /// The glyph `ch` the frame shows at logical column `from` of the same row,
+    /// moved here by a shift: painted as that cell, in its own style.
+    Moved {
+        /// The column the glyph stands on in the unpainted frame.
+        from: usize,
+        /// The glyph the predictor expects there.
+        ch: char,
+    },
+    /// A cell an erase vacated: the terminal's blank.
+    Vacated,
+}
+
+/// `cell` repainted as a predictive-echo ghost of `ch`: the glyph, its
+/// foreground dimmed halfway toward the cell's background (tentative, legible
+/// on any theme), its background kept, inherited SGR and geometry dropped. The
+/// one ghost style ([`RenderInput::paint_prediction_ghost`],
+/// [`RenderInput::paint_prediction_span`]).
+fn ghost_cell(cell: RenderCell, ch: char) -> RenderCell {
+    let (fg, bg) = (cell.fg, cell.bg);
+    let dim = |f: u8, b: u8| f.midpoint(b);
+    RenderCell {
+        ch,
+        fg: [dim(fg[0], bg[0]), dim(fg[1], bg[1]), dim(fg[2], bg[2])],
+        wide: false,
+        emoji_presentation: false,
+        text_presentation: false,
+        bold: false,
+        italic: false,
+        underline: crate::terminal::UnderlineStyle::None,
+        strikethrough: false,
+        overline: false,
+        underline_color: None,
+        ..cell
+    }
+}
+
 #[cfg(test)]
 mod prediction_ghost_tests {
     use super::RenderInput;
@@ -4242,6 +4477,184 @@ mod prediction_ghost_tests {
         let before = f.clone();
         assert!(!f.paint_prediction_ghost(0, 6, 'y', 6, blank()));
         assert!(!f.paint_prediction_ghost(9, 0, 'y', 6, blank()));
+        assert_eq!(f.cells, before.cells);
+    }
+
+    use super::SpanCell::{Moved, Typed, Vacated};
+
+    /// The frame's text on row 0, as a string.
+    fn text(f: &RenderInput) -> String {
+        f.cells[0].iter().map(|c| c.ch).collect()
+    }
+
+    /// A SHIFT: `x` typed before `c` of `ab` + bold red `cd`. The typed glyph is
+    /// a ghost (dimmed, no SGR); the text it moved is the very cells it came
+    /// from, bold and red; nothing outside the span changes.
+    #[test]
+    fn a_span_moves_text_in_its_own_style_and_types_its_glyph() {
+        let before = frame(1, 10, b"ab\x1b[1;31mcd\x1b[0mef");
+        let mut after = before.clone();
+        let span = [
+            (2, Typed('x')),
+            (3, Moved { from: 2, ch: 'c' }),
+            (4, Moved { from: 3, ch: 'd' }),
+            (5, Moved { from: 4, ch: 'e' }),
+            (6, Moved { from: 5, ch: 'f' }),
+        ];
+        assert!(after.paint_prediction_span(0, span, 10, blank()));
+        assert_eq!(text(&after), "abxcdef");
+        let (x, c) = (after.cells[0][2], after.cells[0][3]);
+        assert!(
+            !x.bold && x.fg != before.cells[0][2].fg,
+            "the typed glyph: a ghost"
+        );
+        assert_eq!(c, before.cells[0][2], "`c` in its own style, moved");
+        assert_eq!(after.cells[0][4], before.cells[0][3]);
+        assert_eq!(
+            after.cells[0][..2],
+            before.cells[0][..2],
+            "left of the span"
+        );
+    }
+
+    /// Text moving both ways in one span (an insert, and an erase further on):
+    /// every source is read before the cell it stands on is written. Rightward
+    /// `b`, leftward `g` and `h`, a vacated cell after them.
+    ///
+    /// The text alone cannot tell the order: a moved cell whose source was
+    /// written first falls back to a ghost of the glyph it expects, which reads
+    /// the same. So every moved glyph is bold red, which a ghost never is, and
+    /// each must land as the very cell it came from.
+    #[test]
+    fn a_span_reads_every_source_before_writing_it() {
+        let before = frame(1, 12, b"a\x1b[1;31mb\x1b[0mcdef\x1b[1;31mgh\x1b[0mij");
+        let mut f = before.clone();
+        let span = [
+            (1, Typed('x')),
+            (2, Moved { from: 1, ch: 'b' }),
+            (5, Moved { from: 6, ch: 'g' }),
+            (6, Moved { from: 7, ch: 'h' }),
+            (7, Vacated),
+        ];
+        assert!(f.paint_prediction_span(0, span, 12, blank()));
+        assert_eq!(text(&f), "axbdegh ij");
+        for (to, from) in [(2, 1), (5, 6), (6, 7)] {
+            assert!(before.cells[0][from].bold, "fixture: ({from}) is bold");
+            assert_eq!(
+                f.cells[0][to], before.cells[0][from],
+                "({to}) is the cell it came from, in its own style"
+            );
+        }
+    }
+
+    /// A moved cell whose source is its own column is painted as every moved
+    /// cell is: itself, where it holds the glyph the span expects, else a ghost
+    /// of that glyph. Nothing else changes.
+    #[test]
+    fn a_span_cell_moved_onto_itself_is_painted() {
+        let before = frame(1, 10, b"ab\x1b[1;31mcd\x1b[0m");
+        let mut same = before.clone();
+        assert!(same.paint_prediction_span(0, [(2, Moved { from: 2, ch: 'c' })], 10, blank()));
+        assert_eq!(same.cells, before.cells, "the cell it is");
+        let mut other = before.clone();
+        assert!(other.paint_prediction_span(0, [(2, Moved { from: 2, ch: 'z' })], 10, blank()));
+        assert_eq!(text(&other), "abzd");
+        assert!(!other.cells[0][2].bold, "a ghost of the expected glyph");
+        only_changed(&before, &other, Some((0, 2)));
+    }
+
+    /// A span never SPLITS a wide glyph: painting either half alone is refused,
+    /// and both halves together replace the glyph as a unit. A wide glyph is no
+    /// moved cell's source. Asking (`prediction_span_paintable`) answers what
+    /// painting does, and paints nothing.
+    #[test]
+    fn a_span_never_splits_a_wide_glyph() {
+        let before = frame(1, 10, "ab日c".as_bytes());
+        assert!(before.cells[0][3].wide, "fixture: the continuation at 3");
+        for span in [
+            vec![(2, Typed('x'))],
+            vec![(3, Typed('x'))],
+            vec![(1, Moved { from: 2, ch: '日' })],
+            vec![(1, Typed('x')), (3, Typed('y'))],
+        ] {
+            let mut after = before.clone();
+            assert!(
+                !before.prediction_span_paintable(0, span.clone(), 10),
+                "{span:?}"
+            );
+            assert!(!after.paint_prediction_span(0, span.clone(), 10, blank()));
+            assert_eq!(after.cells, before.cells, "{span:?}: nothing painted");
+        }
+        let mut after = before.clone();
+        let whole = [(2, Typed('x')), (3, Typed('y'))];
+        assert!(before.prediction_span_paintable(0, whole, 10));
+        assert!(after.paint_prediction_span(0, whole, 10, blank()));
+        assert_eq!(text(&after), "abxyc");
+        assert!(!after.cells[0][3].wide, "the glyph replaced as a unit");
+    }
+
+    /// A span is refused on a row drawn in another order (BiDi) or at another
+    /// size, past `cols`, on a missing row, with columns out of order, and with
+    /// moved cells that reorder their sources or move a marked cell.
+    #[test]
+    fn a_span_is_refused_where_its_cells_are_not_what_it_names() {
+        let plain = frame(2, 10, b"abcd");
+        let mut reordered = plain.clone();
+        reordered.visual_to_logical = vec![vec![1, 0, 2, 3], Vec::new()];
+        let mut double = plain.clone();
+        double.line_sizes = vec![
+            crate::grid::LineSize::DoubleWidth,
+            crate::grid::LineSize::SingleWidth,
+        ];
+        let marked = frame(1, 10, "ae\u{301}cd".as_bytes());
+        let ok = [(1, Moved { from: 2, ch: 'c' })];
+        assert!(plain.prediction_span_paintable(0, ok, 10), "control");
+        assert!(!reordered.prediction_span_paintable(0, ok, 10), "BiDi");
+        assert!(!double.prediction_span_paintable(0, ok, 10), "double width");
+        assert!(
+            !plain.prediction_span_paintable(0, [(10, Typed('x'))], 10),
+            "cols"
+        );
+        assert!(!plain.prediction_span_paintable(5, ok, 10), "missing row");
+        assert!(
+            !plain.prediction_span_paintable(0, [(2, Vacated), (1, Vacated)], 10),
+            "out of order"
+        );
+        assert!(
+            !plain.prediction_span_paintable(
+                0,
+                [
+                    (0, Moved { from: 2, ch: 'c' }),
+                    (1, Moved { from: 1, ch: 'b' })
+                ],
+                10
+            ),
+            "reordered sources"
+        );
+        assert!(
+            !marked.prediction_span_paintable(0, [(0, Moved { from: 1, ch: 'e' })], 10),
+            "a marked source"
+        );
+    }
+
+    /// A moved cell whose source does not hold the glyph the span expects is
+    /// painted as that glyph, a ghost: the painted text is the span's whatever
+    /// the frame holds. A painted cell's marks go; a short row is padded with
+    /// the terminal's blank; an empty span paints nothing and is painted.
+    #[test]
+    fn a_span_paints_its_own_text_whatever_the_frame_holds() {
+        let mut f = frame(1, 10, "ae\u{301}b".as_bytes());
+        let span = [
+            (1, Moved { from: 2, ch: 'z' }),
+            (2, Typed('q')),
+            (5, Vacated),
+        ];
+        assert!(f.paint_prediction_span(0, span, 10, blank()));
+        assert_eq!(text(&f), "azq   ");
+        assert!(f.combining[0].is_empty(), "the mark on `e` went with it");
+        assert_eq!(f.cells[0][3], blank(), "padded");
+        let before = f.clone();
+        assert!(f.paint_prediction_span(0, [], 10, blank()));
         assert_eq!(f.cells, before.cells);
     }
 }

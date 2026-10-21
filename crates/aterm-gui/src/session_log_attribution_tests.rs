@@ -57,7 +57,6 @@ fn approval_closes(h: &SessionHandle) -> Vec<Rec> {
 fn harness_approve(h: &SessionHandle) -> InputMark {
     InputMark::at_epoch(
         &h.ctx,
-        None,
         h.local_id,
         Actor::Harness,
         InputVerb::Key,
@@ -178,8 +177,7 @@ fn acted_input(
     let store = crate::session_store::new_store();
     store.write().unwrap().register(h.clone());
     let key = |act| {
-        InputMark::at_epoch(&h.ctx, None, h.local_id, actor, InputVerb::Key, None, false)
-            .acting(act)
+        InputMark::at_epoch(&h.ctx, h.local_id, actor, InputVerb::Key, None, false).acting(act)
     };
     // The burst's first input, before the agent runs: it binds nothing.
     assert!(testing::paste(&h, &key(None), "x"));
@@ -408,6 +406,69 @@ fn a_held_persons_key_after_mail_links_no_later_ctl_turn() {
     assert_eq!(link_after(false), Some(9), "the unbound log lost the key");
 }
 
+/// THE MAIL A TURN PROBABLY ANSWERED, IN THE VERBS' BRIEFS (Phase 6 step
+/// 6C-3, ruling U5): delivered `kind=task` mail, then a `ctl turn` that
+/// names no cause. The `brief` verb and `brief all` (what `survey --brief`
+/// prints) end the turn's fields with ` mail=@9~`, the `~` saying it is a
+/// guess, and `log` names no link at either tier.
+/// NEGATIVE CONTROL (scratch revert): a `BriefCopy` that copies none of
+/// the fold's links prints no token, and both briefs fail here.
+#[cfg(unix)]
+#[test]
+fn the_brief_verbs_name_the_task_mail_a_ctl_turn_probably_answered() {
+    let (h, _reader) = testing::owned_handle(0);
+    let hand = hand_clock(&h.ctx.timeline);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        g.note_root_group(100);
+        assert!(g.note_foreground_group(300));
+        assert!(g.set_program(300, Some("claude".into())));
+        let pgid = g.agent().program_pgid;
+        let _ = g.sweep_slog(&crate::session_log::BlockRead::default(), false, 100, pgid);
+        g.publish_agent("idle", None, None, CLAUDE, stamp(1));
+    }
+    hand.set(100);
+    let line = format!(
+        "{} off=9 from=h-a kind=task trust=agent text=x",
+        h.ctx.self_id.as_str()
+    );
+    assert!(crate::fabric::cmd_deliver(&store, &line).starts_with("OK"));
+    hand.set(200);
+    let turn = {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let now = g.slog().now();
+        let _ = g.slog_mut().ctl_turn(Actor::Ctl, 1, None, now);
+        hand.set(300);
+        g.publish_agent("busy", None, None, CLAUDE, stamp(2));
+        let log = g.slog().log();
+        for tier in ["", "tier=content"] {
+            let q = crate::session_log::LogQuery::parse(tier).expect("a log query");
+            let text = crate::session_log::render_log(log, &q);
+            assert!(
+                !text.contains("mail=@"),
+                "`log {tier}` names a link:\n{text}"
+            );
+        }
+        log.window()
+            .rfind(|r| r.op == Op::Open && r.k == Kind::Turn)
+            .map(|r| r.node)
+            .expect("the ctl turn")
+    };
+    for verb in ["", "all"] {
+        let text = crate::control::cmd_brief(&h.ctx, &store, verb);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&format!("{turn} ")))
+            .unwrap_or_else(|| panic!("`brief {verb}` has no line for {turn}:\n{text}"));
+        assert!(
+            line.contains(" by=ctl ledger=1 mail=@9~ "),
+            "`brief {verb}`: {line}"
+        );
+    }
+}
+
 /// The approval box's close after a harness's `approve` (accepted through
 /// the real `InputMark::finish`) and then a person's gesture `ev` through the
 /// seam's class ([`crate::app_input::note_person_event`], no mouse tracking,
@@ -531,6 +592,77 @@ fn a_gesture_that_reaches_no_program_answers_no_mail() {
     }
     let _ = crate::app_input::note_person_event(&h.ctx, &key);
     assert_eq!(after_mail(), 1, "the key after the mail");
+}
+
+/// THE MAIL LATCH CROSSES A SEAMLESS UPDATE (Phase 6 step 6C-5, ruling
+/// U19): mail delivered, then an update before the person touched the
+/// session. On the successor, inside a burst already running (so no burst
+/// opens), the person's first input that reaches the program writes `mark -
+/// human` after the handoff, as it would have before the update; the latch
+/// is the log's own fold's, so it is cleared there, and a second input in
+/// the burst writes none. POSITIVE CONTROL: the same inputs on a successor
+/// whose producer was delivered no mail write no mark.
+/// NEGATIVE CONTROL (scratch revert of `aterm-slog`'s `fold_snap.rs`
+/// `push_mail`): a carry without `mlh=` loses the latch, and the mailed
+/// successor's input writes no mark either.
+#[test]
+fn a_persons_first_input_after_an_update_answers_mail_delivered_before_it() {
+    let marks_after_handoff = |mailed: bool| {
+        let h = crate::session_store::test_handle(35);
+        let _hand = hand_clock(&h.ctx.timeline);
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(h.clone());
+        if mailed {
+            let line = format!(
+                "{} off=9 from=h-a kind=task trust=agent text=x",
+                h.ctx.self_id.as_str()
+            );
+            assert!(crate::fabric::cmd_deliver(&store, &line).starts_with("OK"));
+        }
+        let (next, _next_store, _hand2) =
+            super::tests::hand_over(&h, &store.read().unwrap(), 1_000, true);
+        let latch = next
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .log()
+            .fold()
+            .in_since_human();
+        // A burst already running on the successor (its stamp ahead of
+        // every clock): the inputs below open none.
+        let _ = next.ctx.human_input.note(u64::MAX / 2, Gesture::Other);
+        let human = || {
+            next.ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .slog()
+                .log()
+                .window()
+                .filter(|r| r.op == Op::Mark)
+                .skip_while(|r| r.k != Kind::Handoff)
+                .filter(|r| r.k == Kind::Human)
+                .count()
+        };
+        let _ = crate::app_input::note_person_reaching(&next.ctx, Gesture::Other, true);
+        let first = human();
+        let _ = crate::app_input::note_person_reaching(&next.ctx, Gesture::Other, true);
+        ((first, human()), latch)
+    };
+    let (marks, latch) = marks_after_handoff(true);
+    assert_eq!(
+        marks,
+        (1, 1),
+        "the first input after the update answers the mail delivered before it, once"
+    );
+    assert!(latch, "the latch the carry handed the successor");
+    assert_eq!(
+        marks_after_handoff(false),
+        ((0, 0), false),
+        "no mail, no mark"
+    );
 }
 
 /// T2, ONE COUNT DELIVERED ONCE: delivered mail; a person's key that opens
@@ -681,7 +813,11 @@ fn a_burst_a_gesture_that_reaches_no_program_opens_answers_no_mail() {
     let (others, key) = gestures();
     let wheel = &others[0];
     let mirror = aterm_core::terminal::ModeMirror::default();
-    assert!(!crate::human_input::reaches_program(wheel, &mirror));
+    assert!(!crate::human_input::reaches_program(
+        wheel,
+        &mirror,
+        crate::input::WheelPlatform::Host
+    ));
     let crate::input::InputEvent::Wheel {
         lines,
         detent,
@@ -722,5 +858,384 @@ fn a_burst_a_gesture_that_reaches_no_program_opens_answers_no_mail() {
             "{ev:?} under {:?} is the person's answer",
             String::from_utf8_lossy(set)
         );
+    }
+}
+
+/// The class of `ev`, by an exhaustive match: a class added to the seam
+/// fails to build here until [`every_event`] drives it through the table.
+fn class_of(ev: &crate::input::InputEvent) -> &'static str {
+    use crate::input::InputEvent as E;
+    match ev {
+        E::Key { .. } => "key",
+        E::Text(_) => "text",
+        E::KeySequence(_) => "key-sequence",
+        E::MouseButton { .. } => "mouse-button",
+        E::MouseMove { .. } => "mouse-move",
+        E::Wheel { .. } => "wheel",
+        E::ScrollView(_) => "scroll-view",
+        E::Paste(..) => "paste",
+        E::Resize { .. } => "resize",
+        E::ResizeWindowPx { .. } => "resize-window-px",
+        E::Focus(_) => "focus",
+    }
+}
+
+/// Every [`crate::input::InputEvent`] class, each in the shapes whose bytes
+/// differ by mode: keys pressed, repeated and released (a character, an
+/// arrow, Enter, Backspace, a keypad digit and the keypad's Enter, a bare
+/// modifier and a lock that legacy encodes to nothing, plain and with Ctrl,
+/// Alt and Meta), committed text (a control character that kitty's
+/// report-all-keys encodes to nothing, an empty one), a key sequence and an
+/// empty one, mouse presses and releases of three buttons, drags and a
+/// hover, wheels in all four directions with no modifier, Shift and Alt, a
+/// detent and a precise row of one and three lines, a view scroll, pastes
+/// under every framing (text, a line break, and controls only, which the
+/// sanitizer empties), two geometry changes and focus.
+fn every_event() -> Vec<crate::input::InputEvent> {
+    use crate::input::{InputEvent, PasteFraming, PixelOffset, ScrollIntent};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    use aterm_types::mouse::{ALT_MASK, MouseButton, SHIFT_MASK, WheelDir};
+    let side = aterm_core::selection::SelectionSide::Left;
+    let mut out = Vec::new();
+    for event_type in [
+        KeyEventType::Press,
+        KeyEventType::Repeat,
+        KeyEventType::Release,
+    ] {
+        for key in [
+            Key::Character('y'),
+            Key::Named(NamedKey::ArrowUp),
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Backspace),
+            Key::Named(NamedKey::Numpad5),
+            Key::Named(NamedKey::NumpadEnter),
+            Key::Named(NamedKey::ShiftLeft),
+            Key::Named(NamedKey::CapsLock),
+        ] {
+            for mods in [
+                Modifiers::empty(),
+                Modifiers::CTRL,
+                Modifiers::ALT,
+                Modifiers::META,
+            ] {
+                out.push(InputEvent::Key {
+                    key: key.clone(),
+                    mods,
+                    base_layout: None,
+                    layout_text: None,
+                    event_type,
+                });
+            }
+        }
+    }
+    for text in ["é", "ok", "\t", ""] {
+        out.push(InputEvent::Text(text.to_string()));
+    }
+    out.push(InputEvent::KeySequence(b"\x1b[A".to_vec()));
+    out.push(InputEvent::KeySequence(Vec::new()));
+    for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+        for pressed in [true, false] {
+            for mods in [0, SHIFT_MASK] {
+                out.push(InputEvent::MouseButton {
+                    button,
+                    pressed,
+                    row: 1,
+                    col: 4,
+                    mods,
+                    click_count: 1,
+                    side,
+                    block: false,
+                    suppress_copy_on_select: false,
+                    px_off: PixelOffset::CELL_ORIGIN,
+                });
+            }
+        }
+    }
+    for buttons in [0, 1, 2, 3] {
+        out.push(InputEvent::MouseMove {
+            buttons,
+            row: 2,
+            col: 7,
+            mods: 0,
+            side,
+            px_off: PixelOffset::CELL_ORIGIN,
+        });
+    }
+    for dir in [
+        WheelDir::Up,
+        WheelDir::Down,
+        WheelDir::Left,
+        WheelDir::Right,
+    ] {
+        for mods in [0, SHIFT_MASK, ALT_MASK] {
+            for detent in [true, false] {
+                for lines in [1, 3] {
+                    out.push(InputEvent::Wheel {
+                        dir,
+                        lines,
+                        detent,
+                        row: 0,
+                        col: 0,
+                        mods,
+                        px_off: PixelOffset::CELL_ORIGIN,
+                    });
+                }
+            }
+        }
+    }
+    out.push(InputEvent::ScrollView(ScrollIntent::Up));
+    for (text, framing) in [
+        ("x", PasteFraming::Gesture { bracketed: false }),
+        ("x", PasteFraming::Gesture { bracketed: true }),
+        ("x", PasteFraming::AtDrain),
+        ("a\nb", PasteFraming::Gesture { bracketed: false }),
+        (CONTROLS_ONLY, PasteFraming::Gesture { bracketed: false }),
+        (CONTROLS_ONLY, PasteFraming::Gesture { bracketed: true }),
+        (CONTROLS_ONLY, PasteFraming::AtDrain),
+    ] {
+        out.push(InputEvent::Paste(text.to_string(), framing));
+    }
+    out.push(InputEvent::Resize {
+        rows: 30,
+        cols: 100,
+        echo_to_window: false,
+    });
+    out.push(InputEvent::ResizeWindowPx {
+        width: 800,
+        height: 600,
+    });
+    out.push(InputEvent::Focus(true));
+    out.push(InputEvent::Focus(false));
+    out
+}
+
+/// A paste the sanitizer empties: ESC, a C1 CSI and ETX, no character it
+/// keeps. Unbracketed it writes nothing; bracketed, its markers.
+const CONTROLS_ONLY: &str = "\x1b\u{9b}\x03";
+
+/// The mode-mirror states of the table, each the bytes a program writes to
+/// set it: no mode; X10, normal, button-event (SGR) and any-event tracking;
+/// the alternate screen without and with DEC 1007, and with DECCKM, X10 or
+/// normal tracking or kitty's every flag on top; focus reporting; bracketed
+/// paste; and each keyboard mode the encoder reads: DECCKM, DECKPAM, VT52,
+/// xterm's modifyOtherKeys 1 and 2 and formatOtherKeys, DECBKM,
+/// altSendsEscape reset, metaSendsEscape, numLock reset, and kitty's
+/// flags 1, 2, 4, 8 and 16 alone and every flag.
+const MIRROR_STATES: [(&str, &[u8]); 29] = [
+    ("none", b""),
+    ("x10", b"\x1b[?9h"),
+    ("normal", b"\x1b[?1000h"),
+    ("button-event", b"\x1b[?1002h\x1b[?1006h"),
+    ("any-event", b"\x1b[?1003h"),
+    ("alt", b"\x1b[?1049h"),
+    ("alt+1007", b"\x1b[?1049h\x1b[?1007h"),
+    ("alt+1007+decckm", b"\x1b[?1049h\x1b[?1007h\x1b[?1h"),
+    ("alt+1007+x10", b"\x1b[?1049h\x1b[?1007h\x1b[?9h"),
+    ("alt+1007+normal", b"\x1b[?1049h\x1b[?1007h\x1b[?1000h"),
+    ("alt+1007+kitty-all", b"\x1b[?1049h\x1b[?1007h\x1b[>31u"),
+    ("focus", b"\x1b[?1004h"),
+    ("bracketed", b"\x1b[?2004h"),
+    ("decckm", b"\x1b[?1h"),
+    ("deckpam", b"\x1b="),
+    ("vt52", b"\x1b[?2l"),
+    ("modify-other-keys-1", b"\x1b[>4;1m"),
+    ("modify-other-keys-2", b"\x1b[>4;2m"),
+    ("format-other-keys", b"\x1b[>4;2m\x1b[>4;1f"),
+    ("decbkm", b"\x1b[?67h"),
+    ("alt-sends-no-escape", b"\x1b[?1039l"),
+    ("meta-sends-escape", b"\x1b[?1036h"),
+    ("num-lock-reset", b"\x1b[?1035l"),
+    ("kitty-disambiguate", b"\x1b[>1u"),
+    ("kitty-event-types", b"\x1b[>2u"),
+    ("kitty-alternate-keys", b"\x1b[>4u"),
+    ("kitty-all-keys", b"\x1b[>8u"),
+    ("kitty-associated-text", b"\x1b[>16u"),
+    ("kitty-all", b"\x1b[>31u"),
+];
+
+/// 6A-4 (F10's remainder; ruling U20), WHAT REACHES THE PROGRAM IS WHAT THE
+/// SEAM SENDS, ON EVERY PLATFORM: every person gesture of every
+/// [`crate::input::InputEvent`] class ([`every_event`]), on a fresh terminal
+/// in every mode-mirror state ([`MIRROR_STATES`]), under every platform's
+/// wheel rule ([`crate::input::WheelPlatform::ARMS`]: macOS, the free
+/// desktops, Windows at three lines, "wheel scrolling off" and a page),
+/// goes through the real seam (`input::seam_encode_on`, the one seam core,
+/// the bytes it produced). `human_input::reaches_program` on the session's
+/// mirror is true exactly where the seam produced at least one byte. The
+/// events no person makes (a release, a hover, focus, geometry) are driven
+/// too and are outside the law: the classifier is never asked for them.
+/// Witnesses keep the table honest: an X10 wheel and a horizontal wheel on
+/// alternate scroll write nothing, a vertical detent on alternate scroll
+/// writes arrows on macOS and nothing with Windows' wheel off, a paste of
+/// controls only writes nothing unbracketed and its markers under DEC 2004
+/// when it reads the live mode, and every class was driven. A drag that
+/// stays in its press's cell is the law's one exception, which needs the
+/// press before it on the same terminal: `a_drag_in_its_reports_cell_*`.
+/// NEGATIVE CONTROLS (scratch-applied): a classifier that counts an X10
+/// wheel as reaching fails; a seam that drops an alternate-scroll arrow
+/// while the classifier says reached fails; a classifier blind to the
+/// platform fails on Windows' wheel off; a text arm that says any text
+/// reaches fails on a tab under kitty's report-all-keys; a paste arm that
+/// says every paste reaches (the arm before phase 6's review) fails on the
+/// unbracketed controls; one that frames a live-mode paste as unbracketed
+/// (a mirror with no DEC 2004) fails under `bracketed`; a key arm blind in
+/// VT52 fails on the `vt52` row alone.
+#[test]
+fn what_reaches_the_program_is_what_the_seam_sends_on_every_platform() {
+    use crate::input::{InputEvent, WheelPlatform};
+    let events = every_event();
+    let mut classes: Vec<&str> = events.iter().map(class_of).collect();
+    classes.sort_unstable();
+    classes.dedup();
+    assert_eq!(
+        classes.len(),
+        11,
+        "every InputEvent class is driven: {classes:?}"
+    );
+    let sink = aterm_session::sink::SinkWriter::new(-1);
+    let mut wrong = Vec::new();
+    let mut wrote_of = std::collections::BTreeMap::new();
+    let (mut asked, mut outside) = (0_usize, 0_usize);
+    for platform in WheelPlatform::ARMS {
+        for (state, set) in MIRROR_STATES {
+            for (i, ev) in events.iter().enumerate() {
+                let term = std::sync::Arc::new(std::sync::Mutex::new(
+                    aterm_core::terminal::Terminal::new(24, 80),
+                ));
+                term.lock().unwrap().process(set);
+                let mirror = crate::mode_mirror_of(&term);
+                let (_, bytes) = crate::input::seam_encode_on(platform, &term, &mirror, &sink, ev);
+                let wrote = !bytes.is_empty();
+                wrote_of.insert((format!("{platform:?}"), state, i), wrote);
+                if !crate::human_input::is_person_gesture(ev) {
+                    outside += 1;
+                    continue;
+                }
+                asked += 1;
+                let reaches = crate::human_input::reaches_program(ev, &mirror, platform);
+                if reaches != wrote {
+                    wrong.push(format!(
+                        "{platform:?} {state}: {ev:?} reaches={reaches} wrote={bytes:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {asked} gestures disagree; the first: {:#?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(8)]
+    );
+    assert!(asked > 0 && outside > 0, "asked {asked}, outside {outside}");
+    let at = |want: &InputEvent| {
+        events
+            .iter()
+            .position(|e| e == want)
+            .expect("the witness is in the table")
+    };
+    let wheel = |dir, detent| InputEvent::Wheel {
+        dir,
+        lines: 1,
+        detent,
+        row: 0,
+        col: 0,
+        mods: 0,
+        px_off: crate::input::PixelOffset::CELL_ORIGIN,
+    };
+    let up = at(&wheel(aterm_types::mouse::WheelDir::Up, true));
+    let left = at(&wheel(aterm_types::mouse::WheelDir::Left, true));
+    let wrote = |platform: WheelPlatform, state: &'static str, i: usize| {
+        wrote_of[&(format!("{platform:?}"), state, i)]
+    };
+    let off = WheelPlatform::Windows(crate::input::WheelNotch::Lines(0));
+    let paste = |framing| at(&InputEvent::Paste(CONTROLS_ONLY.to_string(), framing));
+    let (unbracketed, bracketed, live) = (
+        paste(crate::input::PasteFraming::Gesture { bracketed: false }),
+        paste(crate::input::PasteFraming::Gesture { bracketed: true }),
+        paste(crate::input::PasteFraming::AtDrain),
+    );
+    for (platform, state, i, want) in [
+        (WheelPlatform::Mac, "none", unbracketed, false),
+        (WheelPlatform::Mac, "bracketed", unbracketed, false),
+        (WheelPlatform::Mac, "none", bracketed, true),
+        (WheelPlatform::Mac, "none", live, false),
+        (WheelPlatform::Mac, "bracketed", live, true),
+        (WheelPlatform::Mac, "x10", up, false),
+        (WheelPlatform::Mac, "normal", up, true),
+        (WheelPlatform::Mac, "alt+1007", left, false),
+        (WheelPlatform::Mac, "alt+1007", up, true),
+        (WheelPlatform::Vte, "alt+1007", up, true),
+        (off, "alt+1007", up, false),
+        (off, "alt+1007+normal", up, true),
+    ] {
+        assert_eq!(
+            wrote(platform, state, i),
+            want,
+            "witness: {platform:?} {state} {:?}",
+            events[i]
+        );
+    }
+}
+
+/// THE LAW'S ONE EXCEPTION, PINNED (`human_input::reaches_program`'s THE
+/// LAW): under each tracking mode that reports a drag, on one terminal, a
+/// press reaches the program and writes its report; a drag that stays in
+/// the press's cell writes nothing (the encoder's per-cell memo, under the
+/// lock), while the classifier, which reads only the mirror, says it
+/// reached; a drag into the next cell writes and reaches; and a drag back
+/// into that cell again writes nothing. Under normal tracking no drag is
+/// reported, and the classifier says so. The memo's repeat follows a report
+/// that already reached the program from the same held button.
+/// NEGATIVE CONTROL (scratch-applied): a seam with no per-cell memo writes
+/// the same-cell drag, and the pin fails.
+#[test]
+fn a_drag_in_its_reports_cell_writes_nothing_and_its_report_had_reached() {
+    use crate::input::{InputEvent, PixelOffset, WheelPlatform};
+    let side = aterm_core::selection::SelectionSide::Left;
+    let press = InputEvent::MouseButton {
+        button: aterm_types::mouse::MouseButton::Left,
+        pressed: true,
+        row: 1,
+        col: 4,
+        mods: 0,
+        click_count: 1,
+        side,
+        block: false,
+        suppress_copy_on_select: false,
+        px_off: PixelOffset::CELL_ORIGIN,
+    };
+    let drag = |col| InputEvent::MouseMove {
+        buttons: 0,
+        row: 1,
+        col,
+        mods: 0,
+        side,
+        px_off: PixelOffset::CELL_ORIGIN,
+    };
+    let sink = aterm_session::sink::SinkWriter::new(-1);
+    for (state, set, reports) in [
+        ("button-event", &b"\x1b[?1002h\x1b[?1006h"[..], true),
+        ("any-event", b"\x1b[?1003h", true),
+        ("normal", b"\x1b[?1000h", false),
+    ] {
+        let term = std::sync::Arc::new(std::sync::Mutex::new(aterm_core::terminal::Terminal::new(
+            24, 80,
+        )));
+        term.lock().unwrap().process(set);
+        let mirror = crate::mode_mirror_of(&term);
+        let mut seen = Vec::new();
+        for ev in [&press, &drag(4), &drag(5), &drag(5)] {
+            let (_, bytes) =
+                crate::input::seam_encode_on(WheelPlatform::Mac, &term, &mirror, &sink, ev);
+            let reaches = crate::human_input::reaches_program(ev, &mirror, WheelPlatform::Mac);
+            seen.push((!bytes.is_empty(), reaches));
+        }
+        let want = if reports {
+            vec![(true, true), (false, true), (true, true), (false, true)]
+        } else {
+            vec![(true, true), (false, false), (false, false), (false, false)]
+        };
+        assert_eq!(seen, want, "{state}: (wrote, reaches) for press, drags");
     }
 }

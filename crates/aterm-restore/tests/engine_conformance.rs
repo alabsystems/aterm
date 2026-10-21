@@ -19,8 +19,8 @@
 //! then settled (`JournalWriter::settle_clear`), so every later check restores across the
 //! settle.
 //!
-//! At every record boundary and every keyframe the region is copied and restored by the
-//! real `recover` into a scratch engine built as the restorer builds one (with the host's
+//! At every record boundary and every keyframe the region is restored by the real
+//! `recover` into a scratch engine built as the restorer builds one (with the host's
 //! settings of that moment): the restored visible screen must equal the live one and the
 //! restore must say it is exact — or, when a verified mark sat in the tail past the
 //! keyframe budget, a regrid or a kitty-graphics command sat in it, or the replay ended
@@ -471,17 +471,23 @@ impl Session {
         let decision =
             self.policy
                 .after_slice(self.now, self.writer.tail_since_keyframe(), verified);
-        self.decide(decision);
+        // With no keyframe due, the policy alone moved: the region and the engine are
+        // the ones just checked, and the same check would see the same bytes.
+        if decision.keyframe.is_some() {
+            self.decide(decision);
+            self.check(&format!("{label}, after its keyframe"))?;
+        }
         Ok(())
     }
 
-    /// Restore a copy of the region and hold it to the live engine.
+    /// Restore the region and hold it to the live engine.
     fn check(&mut self, label: &str) -> Result<(), String> {
         self.checks += 1;
-        let region = self.writer.store().snapshot();
+        // `recover` only reads its view, and nothing writes the region while it runs:
+        // the writer's own store is the region as a death here would leave it.
         let host = self.host;
         let recovery = recover(
-            &region,
+            self.writer.store(),
             RecoverPolicy {
                 tail: true,
                 config_fp: host.fingerprint(),
@@ -571,7 +577,8 @@ fn differing(a: &TerminalCheckpoint, b: &TerminalCheckpoint) -> Vec<String> {
         color,
         shell,
         title,
-        output_state
+        output_state,
+        holder
     );
     if a.grid != b.grid {
         out.push("grid".to_string());
@@ -583,13 +590,16 @@ fn differing(a: &TerminalCheckpoint, b: &TerminalCheckpoint) -> Vec<String> {
 }
 
 /// A terminal's visible state as a restore can reproduce it: its visible-only journal
-/// projection, with the kitty keyboard stack's entries at and above each stack pointer
-/// cleared. Those entries are unreachable (a push writes its slot before a pop can read
-/// it), and `restore_snapshot` carries only the live ones, so a live engine that pushed
-/// and popped still holds a stale value there that no restore, seamless or crash, ever
-/// brings back. `None` while the parser holds a sequence no keyframe carries whole.
+/// projection, less its lineage's seed uncertainty (`HolderRepr::seed_untrusted`: a
+/// restore that took output after its install carries it by design, for the host's
+/// adoption to read, and a live engine never does), with the kitty keyboard stack's
+/// entries at and above each stack pointer cleared. Those entries are unreachable (a
+/// push writes its slot before a pop can read it), and `restore_snapshot` carries only
+/// the live ones, so a live engine that pushed and popped still holds a stale value
+/// there that no restore, seamless or crash, ever brings back. `None` while the parser
+/// holds a sequence no keyframe carries whole.
 fn visible(t: &Terminal) -> Option<TerminalCheckpoint> {
-    let mut c = t.checkpoint_journal(0)?;
+    let mut c = t.checkpoint_journal(0)?.without_seed_lineage();
     let k = &mut c.kitty_keyboard;
     for (stack, sp) in [(&mut k.main_stack, k.main_sp), (&mut k.alt_stack, k.alt_sp)] {
         for entry in stack.iter_mut().skip(usize::from(sp)) {
@@ -661,14 +671,12 @@ fn run_with(
                     let (slice, tail) = rest.split_at(n);
                     let label = format!("step {i}, a slice");
                     session.slice(slice, false, &label)?;
-                    session.check(&label)?;
                     rest = tail;
                 }
             }
             Step::Synthesized(bytes) => {
                 let label = format!("step {i}, synthesized bytes");
                 session.slice(bytes, true, &label)?;
-                session.check(&label)?;
             }
             Step::Mark(op) => {
                 let hex = ShellIntegrationNonce(NONCE).to_hex();
@@ -678,7 +686,6 @@ fn run_with(
                     false,
                     &label,
                 )?;
-                session.check(&label)?;
             }
             Step::Width(..) if !width_changes => {}
             Step::Resize(rows, cols) | Step::Width(rows, cols) => {
@@ -726,7 +733,6 @@ fn run_with(
                 for (j, piece) in pieces.iter().enumerate() {
                     let label = format!("step {i}, piece {j}");
                     session.slice(piece, false, &label)?;
-                    session.check(&label)?;
                 }
             }
         }
@@ -735,11 +741,26 @@ fn run_with(
 }
 
 /// The scenario, cut at many seeded boundaries, restores exactly at every record and
-/// every keyframe.
+/// every keyframe. Each seed is its own session sharing nothing with the others, so the
+/// seeds run side by side and are held to the claims in seed order.
 #[test]
 fn every_boundary_restores_the_live_screen() {
-    for seed in 1..=6 {
-        let session = run(seed, false, true).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+    let runs: Vec<(u64, Result<Session, String>)> = std::thread::scope(|scope| {
+        let seeds: Vec<_> = (1..=6)
+            .map(|seed| (seed, scope.spawn(move || run(seed, false, true))))
+            .collect();
+        seeds
+            .into_iter()
+            .map(|(seed, handle)| {
+                let run = handle.join().unwrap_or_else(|panic| {
+                    std::panic::resume_unwind(panic);
+                });
+                (seed, run)
+            })
+            .collect()
+    });
+    for (seed, run) in runs {
+        let session = run.unwrap_or_else(|why| panic!("seed {seed}: {why}"));
         assert!(
             session.keyframes > 5,
             "seed {seed}: {} keyframes",

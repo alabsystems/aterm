@@ -59,6 +59,7 @@ use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, TaskFace};
 use crate::harness::repo_work::RepoWork;
 use crate::harness::upgrade::{LastTurn, StandingLimit};
+use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
 use crate::supervise::policy::exception::Exception;
@@ -69,6 +70,7 @@ use crate::supervise::policy::reset::{
 use crate::supervise::policy::turn_end::{
     AccountAdvice, AccountBad, AccountPoint, HostTurn, Reach, Restart,
 };
+use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
     Guard, HostStep, IdlePoint, ProbeMiss, ProbeNo, StallSeen, StuckSurvey, UsageSeen, WaitPlan,
 };
@@ -479,6 +481,104 @@ impl TapeValue for Option<LoginShared> {
     }
 }
 
+/// What the roster says of the session's login
+/// ([`super::super::IdleHost::roster_word`]) as a tape holds it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RosterWire {
+    Unlisted,
+    /// The row to sign in next, and whether by renewal; no other row ready,
+    /// and nothing of the roster's holding the tab ([`RosterWord::Row`]'s
+    /// `held`) — what a tape an earlier build wrote says of any row with no
+    /// other ready, read so.
+    Row(Option<(String, bool)>),
+    /// The same, with the other row ready to run now
+    /// ([`RosterWord::Row`]'s `ready`). `held`: what holds the tab at the
+    /// limit ([`held_word`]); none, nothing does — and a tape written before
+    /// it was kept holds none, read so (its one reader, the notice's `{why}`
+    /// beside a ready row, tells no hold as the earlier limit, as that
+    /// build did).
+    Ready {
+        next: Option<(String, bool)>,
+        ready: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held: Option<String>,
+    },
+    /// No other row ready, and what holds the tab at the limit even once one
+    /// is ([`held_word`]).
+    Held {
+        next: Option<(String, bool)>,
+        held: String,
+    },
+    Unread,
+}
+
+/// [`HeldBy`]'s word on a tape.
+fn held_word(held: HeldBy) -> &'static str {
+    match held {
+        HeldBy::Earlier => "earlier",
+        HeldBy::Pin => "pin",
+        HeldBy::Reset => "reset",
+    }
+}
+
+fn held_of(word: &str) -> Result<HeldBy, CodecError> {
+    [HeldBy::Earlier, HeldBy::Pin, HeldBy::Reset]
+        .into_iter()
+        .find(|held| held_word(*held) == word)
+        .ok_or(bad("a hold of the roster's this build does not know"))
+}
+
+impl TapeValue for Option<RosterWord> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|word| match word {
+            RosterWord::Unlisted => RosterWire::Unlisted,
+            RosterWord::Row { next, ready, held } => {
+                let next = next.as_ref().map(|n| (n.label.clone(), n.renew));
+                let held = held.map(|held| held_word(held).to_string());
+                match (ready, held) {
+                    (Some(ready), held) => RosterWire::Ready {
+                        next,
+                        ready: ready.label.clone(),
+                        held,
+                    },
+                    (None, Some(held)) => RosterWire::Held { next, held },
+                    (None, None) => RosterWire::Row(next),
+                }
+            }
+            RosterWord::Unread => RosterWire::Unread,
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        let next_of =
+            |next: Option<(String, bool)>| next.map(|(label, renew)| SignInNext { label, renew });
+        of_json::<Option<RosterWire>>(bytes)?
+            .map(|wire| {
+                Ok(match wire {
+                    RosterWire::Unlisted => RosterWord::Unlisted,
+                    RosterWire::Row(next) => RosterWord::Row {
+                        next: next_of(next),
+                        ready: None,
+                        held: None,
+                    },
+                    RosterWire::Ready { next, ready, held } => RosterWord::Row {
+                        next: next_of(next),
+                        ready: Some(Ready { label: ready }),
+                        held: held.as_deref().map(held_of).transpose()?,
+                    },
+                    RosterWire::Held { next, held } => RosterWord::Row {
+                        next: next_of(next),
+                        ready: None,
+                        held: Some(held_of(&held)?),
+                    },
+                    RosterWire::Unread => RosterWord::Unread,
+                })
+            })
+            .transpose()
+    }
+}
+
 /// [`HostTurn`]'s word on a tape.
 fn turn_word(turn: HostTurn) -> &'static str {
     match turn {
@@ -560,6 +660,71 @@ impl TapeValue for Option<(String, HostTurn)> {
             Ok(wire) => wire.map(|w| Ok((w.line, turn_of(&w.turn)?))).transpose(),
             Err(_) => Ok(of_json::<Option<String>>(bytes)?.map(|line| (line, HostTurn::Notice))),
         }
+    }
+}
+
+/// `background_jobs`'s answer as a tape holds it
+/// ([`BackgroundEvidence`]): `"unknown"`, or the call that made no progress.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum EvidenceWire {
+    Unknown,
+    NoProgress {
+        pid: u32,
+        pgid: u32,
+        exe: String,
+        task: Option<String>,
+        quiet_ms: u64,
+        wait: Option<String>,
+    },
+}
+
+impl TapeValue for BackgroundEvidence {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match self {
+            BackgroundEvidence::Unknown => EvidenceWire::Unknown,
+            BackgroundEvidence::NoProgress { worst } => {
+                let BackgroundCall {
+                    pid,
+                    pgid,
+                    exe,
+                    task,
+                    quiet_ms,
+                    wait,
+                } = worst;
+                EvidenceWire::NoProgress {
+                    pid: *pid,
+                    pgid: *pgid,
+                    exe: exe.clone(),
+                    task: task.clone(),
+                    quiet_ms: *quiet_ms,
+                    wait: wait.clone(),
+                }
+            }
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json(bytes)? {
+            EvidenceWire::Unknown => BackgroundEvidence::Unknown,
+            EvidenceWire::NoProgress {
+                pid,
+                pgid,
+                exe,
+                task,
+                quiet_ms,
+                wait,
+            } => BackgroundEvidence::NoProgress {
+                worst: BackgroundCall {
+                    pid,
+                    pgid,
+                    exe,
+                    task,
+                    quiet_ms,
+                    wait,
+                },
+            },
+        })
     }
 }
 
@@ -652,7 +817,8 @@ impl TapeValue for Option<LastTurn> {
     }
 }
 
-/// [`RepoWork`] as a tape holds it.
+/// [`RepoWork`] as a tape holds it. A tape recorded before the probe read
+/// the remote's default branch holds no `unlanded` or `main_ref`: none known.
 #[derive(Serialize, Deserialize)]
 struct RepoWorkWire {
     repo: String,
@@ -660,7 +826,15 @@ struct RepoWorkWire {
     untracked: usize,
     stashes: usize,
     unpushed: usize,
+    #[serde(default)]
+    unlanded: usize,
+    #[serde(default)]
+    main_ref: String,
     paths: Vec<String>,
+    /// The work's state ([`RepoWork::state`]); a tape recorded before the
+    /// probe read it holds none: not read.
+    #[serde(default)]
+    state: Option<u64>,
 }
 
 impl TapeValue for Option<RepoWork> {
@@ -672,7 +846,10 @@ impl TapeValue for Option<RepoWork> {
                 untracked,
                 stashes,
                 unpushed,
+                unlanded,
+                main_ref,
                 paths,
+                state,
             } = w;
             RepoWorkWire {
                 repo: repo.clone(),
@@ -680,7 +857,10 @@ impl TapeValue for Option<RepoWork> {
                 untracked: *untracked,
                 stashes: *stashes,
                 unpushed: *unpushed,
+                unlanded: *unlanded,
+                main_ref: main_ref.clone(),
                 paths: paths.clone(),
+                state: *state,
             }
         }))
     }
@@ -692,7 +872,10 @@ impl TapeValue for Option<RepoWork> {
             untracked: w.untracked,
             stashes: w.stashes,
             unpushed: w.unpushed,
+            unlanded: w.unlanded,
+            main_ref: w.main_ref,
             paths: w.paths,
+            state: w.state,
         }))
     }
 }
@@ -805,6 +988,22 @@ impl TapeValue for Result<(), ProbeNo> {
 }
 
 /// [`ResetWord`] as a tape holds it.
+///
+/// A RESET STEP TAPED BEFORE THE CLAUDE CODE 2.1.304 PORT DOES NOT REPLAY,
+/// on purpose: the step reads one vendor build's wording, and no reset tape
+/// from a real wall exists to keep. Its requests are compared byte for byte
+/// before its answer is read, and they changed shape: [`ResetAsk`]'s kind
+/// is no longer optional (`kind: Full`, where an earlier build wrote `kind:
+/// Some(Full)` or none), and [`ResetEnd`]'s
+/// offer carries its kind (`ResetOffer { kind, left, use_by }`, where it
+/// wrote `(left, use_by)`); the loop's own `RESET … used (<kindResets>
+/// left)` line is new too; and a dialog in 2.1.287–2.1.303's words reads as
+/// no grant row to this build, so its replay presses the wait row where the
+/// tape took the reset. Such a replay diverges at the first of these. An
+/// answer of the earlier shape — a go or a spend with no kind — is refused
+/// here as every byte this build did not write is, never read with a kind
+/// guessed: where the requests before it matched (an end that carried no
+/// offer), the replay diverges at that answer instead.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ResetWordWire {
@@ -812,13 +1011,10 @@ enum ResetWordWire {
         until: i64,
         long: bool,
         limits: Vec<String>,
+        /// The row's kind by its vendor id (`aterm_phase::ResetKind::word`).
+        kind: String,
         left: u32,
         day: String,
-        /// The row's kind of reset by its word (`aterm_phase::ResetKind::word`);
-        /// absent from a tape written before Claude Code 2.1.304's kinds,
-        /// whose rows named none.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        kind: Option<String>,
     },
     Again,
     No(String),
@@ -832,17 +1028,17 @@ impl TapeValue for ResetWord {
                     until,
                     long,
                     limits,
+                    kind,
                     left,
                     day,
-                    kind,
                 } = go;
                 ResetWordWire::Take {
                     until: *until,
                     long: *long,
                     limits: limits.clone(),
+                    kind: kind.word().to_string(),
                     left: *left,
                     day: day.clone(),
-                    kind: kind.map(|kind| kind.word().to_string()),
                 }
             }
             ResetWord::Again => ResetWordWire::Again,
@@ -856,21 +1052,16 @@ impl TapeValue for ResetWord {
                 until,
                 long,
                 limits,
+                kind,
                 left,
                 day,
-                kind,
             } => ResetWord::Take(ResetGo {
                 until,
                 long,
                 limits,
+                kind: kind_of(&kind)?,
                 left,
                 day,
-                kind: kind
-                    .map(|word| {
-                        aterm_phase::ResetKind::of_word(&word)
-                            .ok_or(bad("a kind of reset this build does not name"))
-                    })
-                    .transpose()?,
             }),
             ResetWordWire::Again => ResetWord::Again,
             ResetWordWire::No(word) => ResetWord::No(
@@ -880,15 +1071,29 @@ impl TapeValue for ResetWord {
     }
 }
 
-/// [`ResetOutcome`] as a tape holds it.
+/// A kind of reset by its vendor id, as a tape holds it: one this build
+/// knows, or the value is refused.
+fn kind_of(word: &str) -> Result<aterm_phase::ResetKind, CodecError> {
+    aterm_phase::ResetKind::of_word(word).ok_or(bad("a kind of reset this build does not know"))
+}
+
+/// [`ResetOutcome`] as a tape holds it; a spend with no kind, as an earlier
+/// build taped it, is refused ([`ResetWordWire`] says why).
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum OutcomeWire {
     Pending,
     Spent {
+        /// The kind spent, by its vendor id (`aterm_phase::ResetKind::word`).
+        kind: String,
         asks: bool,
         left: Option<u32>,
         cleared_at: i64,
+    },
+    /// [`ResetOutcome::Walled`]; `kind` as for `Spent`.
+    Walled {
+        kind: String,
+        left: u32,
     },
     Lifted {
         asks: bool,
@@ -906,13 +1111,19 @@ impl TapeValue for ResetOutcome {
         json(&match *self {
             ResetOutcome::Pending => OutcomeWire::Pending,
             ResetOutcome::Spent {
+                kind,
                 asks,
                 left,
                 cleared_at,
             } => OutcomeWire::Spent {
+                kind: kind.word().to_string(),
                 asks,
                 left,
                 cleared_at,
+            },
+            ResetOutcome::Walled { kind, left } => OutcomeWire::Walled {
+                kind: kind.word().to_string(),
+                left,
             },
             ResetOutcome::Lifted { asks, cleared_at } => OutcomeWire::Lifted { asks, cleared_at },
             ResetOutcome::Kept => OutcomeWire::Kept,
@@ -925,13 +1136,19 @@ impl TapeValue for ResetOutcome {
         Ok(match of_json(bytes)? {
             OutcomeWire::Pending => ResetOutcome::Pending,
             OutcomeWire::Spent {
+                kind,
                 asks,
                 left,
                 cleared_at,
             } => ResetOutcome::Spent {
+                kind: kind_of(&kind)?,
                 asks,
                 left,
                 cleared_at,
+            },
+            OutcomeWire::Walled { kind, left } => ResetOutcome::Walled {
+                kind: kind_of(&kind)?,
+                left,
             },
             OutcomeWire::Lifted { asks, cleared_at } => ResetOutcome::Lifted { asks, cleared_at },
             OutcomeWire::Kept => ResetOutcome::Kept,

@@ -196,12 +196,86 @@ const BLOB_VIOLET: [u8; 3] = [0xB0, 0x5C, 0xFF];
 /// The rainbow arch's sixth stripe (the blob palette covers the other five).
 const RAINBOW_TEAL: [u8; 3] = [0x21, 0xC2, 0xB7];
 
+/// The aurora's tile grid: columns, rows.
+const AURORA_GRID: (usize, usize) = (112, 64);
+/// How far each aurora tile is poured from the surface toward its hue.
+const AURORA_MIX: f32 = 0.30;
+/// The contrast every aurora tile keeps against the page-chrome ink drawn on
+/// it (WCAG 1.4.3 for body text).
+pub(crate) const AURORA_INK_FLOOR: f32 = 4.5;
+/// What a tile is solved to: a quarter step over [`AURORA_INK_FLOOR`], because
+/// a small glyph's antialiased strokes never reach the full ink, and the text
+/// should still measure at the floor on glass.
+const AURORA_INK_TARGET: f32 = AURORA_INK_FLOOR + 0.25;
+
+/// Tile `(i, j)` of the aurora at its full pour, before the ink hold
+/// ([`aurora_tile`]): a diagonal spectrum (`hue ∝ x + y`) with a gentle value
+/// falloff toward the bottom, so the content zone is calmer than the sky.
+#[cfg(test)]
+pub(crate) fn aurora_tile_unheld(surface: [u8; 3], i: usize, j: usize) -> [u8; 3] {
+    crate::native_appearance::mix_srgb(surface, aurora_hue(i, j), AURORA_MIX)
+}
+
+fn aurora_hue(i: usize, j: usize) -> [u8; 3] {
+    let (cols, rows) = AURORA_GRID;
+    let hue = (i as f32 / cols as f32 + j as f32 / rows as f32) * 0.5;
+    let v = 0.92 - 0.16 * (j as f32 / rows as f32);
+    crate::widget::hsv_to_rgb(hue, 0.86, v)
+}
+
+/// Tile `(i, j)` of the aurora as painted: the full pour where the page-chrome
+/// `ink` keeps [`AURORA_INK_TARGET`] on it, otherwise the deepest pour that
+/// does. The heading, subtitle, pager and empty line sit straight on the
+/// aurora, so the wash yields to them rather than the text to the wash: on a
+/// dark page the bright yellow-green band pours a little shallower.
+pub(crate) fn aurora_tile(surface: [u8; 3], ink: [u8; 3], i: usize, j: usize) -> [u8; 3] {
+    use crate::native_appearance::contrast_ratio;
+    let hue = aurora_hue(i, j);
+    let full = crate::native_appearance::mix_srgb(surface, hue, AURORA_MIX);
+    if contrast_ratio(ink, full) >= AURORA_INK_TARGET
+        || contrast_ratio(ink, surface) < AURORA_INK_FLOOR
+    {
+        // Either the full pour holds, or not even the bare surface reaches the
+        // floor (a palette the role contract already failed), so pouring less
+        // buys nothing. A surface between the floor and the target is not
+        // that case: the search below then pours nothing and the tile keeps
+        // the surface's own contrast.
+        return full;
+    }
+    let (mut lo, mut hi) = (0.0_f32, AURORA_MIX);
+    for _ in 0..12 {
+        let mid = (lo + hi) * 0.5;
+        if contrast_ratio(ink, crate::native_appearance::mix_srgb(surface, hue, mid))
+            >= AURORA_INK_TARGET
+        {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    crate::native_appearance::mix_srgb(surface, hue, lo)
+}
+
+/// One palette's aurora tiles, keyed by the `(surface, ink)` pair they wash.
+type AuroraTiles = (([u8; 3], [u8; 3]), Vec<[u8; 3]>);
+
+thread_local! {
+    /// The last palette's tiles: the wash is a pure function of `(surface,
+    /// ink)`, and the canvas repaints with every animated preview frame.
+    static AURORA_TILES: std::cell::RefCell<Option<AuroraTiles>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The Settings surface's aurora: the wallpaper treatment, procedurally — a
 /// dim DIAGONAL spectrum wash over the whole canvas, exactly the hue ramp the
 /// user's rainbow terminal wears (`hue ∝ x + y`). Painted as a coarse tile
-/// grid of translucent Panels over the theme surface: at this alpha adjacent
-/// tiles differ by a whisper of hue, so the grid fuses into a smooth wash
-/// while staying a bounded, cache-friendly prim count. Deliberately STATIC.
+/// grid of opaque Panels over the theme surface: adjacent tiles differ by a
+/// whisper of hue, so the grid fuses into a smooth wash while staying a
+/// bounded, cache-friendly prim count. Deliberately STATIC.
+///
+/// `ink` is the quietest text painted straight on the canvas (the subtitle,
+/// pager and empty line; the heading's ink is stronger): every tile holds it
+/// at [`AURORA_INK_FLOOR`] ([`aurora_tile`]).
 pub(crate) fn paint_settings_aurora(
     prims: &mut Vec<DrawPrim>,
     x: f32,
@@ -209,34 +283,46 @@ pub(crate) fn paint_settings_aurora(
     w: f32,
     h: f32,
     surface: [u8; 3],
+    ink: [u8; 3],
 ) {
     if w <= 0.0 || h <= 0.0 {
         return;
     }
-    let cols = 112usize;
-    let rows = 64usize;
+    let (cols, rows) = AURORA_GRID;
     let cw = w / cols as f32;
     let ch = h / rows as f32;
-    for j in 0..rows {
-        for i in 0..cols {
-            let hue = (i as f32 / cols as f32 + j as f32 / rows as f32) * 0.5;
-            // A gentle value falloff toward the bottom keeps the content zone
-            // calmer than the sky above it.
-            let v = 0.92 - 0.16 * (j as f32 / rows as f32);
-            let c = crate::widget::hsv_to_rgb(hue, 0.86, v);
-            // OPAQUE tiles, pre-mixed into the surface: translucent neighbours
-            // double up wherever they overlap and etch a lattice into the sky;
-            // opaque paint makes the half-pixel seam bleed invisible.
-            prims.push(DrawPrim::Panel {
-                x: x + i as f32 * cw,
-                y: y + j as f32 * ch,
-                w: cw + 0.75,
-                h: ch + 0.75,
-                radius: 0.0,
-                fill: rgba(crate::native_appearance::mix_srgb(surface, c, 0.30), 0xFF),
-            });
+    AURORA_TILES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache
+            .as_ref()
+            .is_none_or(|(palette, _)| *palette != (surface, ink))
+        {
+            let tiles = (0..rows)
+                .flat_map(|j| (0..cols).map(move |i| (i, j)))
+                .map(|(i, j)| aurora_tile(surface, ink, i, j))
+                .collect();
+            *cache = Some(((surface, ink), tiles));
         }
-    }
+        let Some((_, tiles)) = cache.as_ref() else {
+            return;
+        };
+        for j in 0..rows {
+            for i in 0..cols {
+                // OPAQUE tiles, pre-mixed into the surface: translucent
+                // neighbours double up wherever they overlap and etch a
+                // lattice into the sky; opaque paint makes the half-pixel
+                // seam bleed invisible.
+                prims.push(DrawPrim::Panel {
+                    x: x + i as f32 * cw,
+                    y: y + j as f32 * ch,
+                    w: cw + 0.75,
+                    h: ch + 0.75,
+                    radius: 0.0,
+                    fill: rgba(tiles[j * cols + i], 0xFF),
+                });
+            }
+        }
+    });
 }
 
 /// The §L.5 composition as a NATIVE Settings hero banner: a pastel rainbow arch
@@ -378,6 +464,38 @@ pub(crate) fn write_str(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ink that clears the floor on the bare surface but not the solve's
+    /// quarter-step margin is still held: the wash pours less (down to none)
+    /// rather than at full strength. Control: that ink fails the full pour.
+    #[test]
+    fn an_ink_between_the_floor_and_the_target_still_holds_every_tile() {
+        use crate::native_appearance::contrast_ratio;
+        let surface = [30, 30, 30];
+        let ink = (0..=255u8)
+            .rev()
+            .map(|g| [g, g, g])
+            .find(|&ink| {
+                let ratio = contrast_ratio(ink, surface);
+                (AURORA_INK_FLOOR..AURORA_INK_TARGET).contains(&ratio)
+            })
+            .expect("a grey between the floor and the target on this surface");
+        let (cols, rows) = AURORA_GRID;
+        let tiles = || (0..rows).flat_map(|j| (0..cols).map(move |i| (i, j)));
+        assert!(
+            tiles().any(|(i, j)| {
+                contrast_ratio(ink, aurora_tile_unheld(surface, i, j)) < AURORA_INK_FLOOR
+            }),
+            "control: the full pour fails this ink somewhere"
+        );
+        for (i, j) in tiles() {
+            let ratio = contrast_ratio(ink, aurora_tile(surface, ink, i, j));
+            assert!(
+                ratio >= AURORA_INK_FLOOR,
+                "tile ({i}, {j}) holds the ink at {ratio:.2}:1"
+            );
+        }
+    }
 
     #[test]
     fn enum_runtime_aliases_normalize_in_structured_display() {

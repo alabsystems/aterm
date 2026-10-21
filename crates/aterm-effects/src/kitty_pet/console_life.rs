@@ -6,7 +6,9 @@
 
 use super::*;
 use crate::pet_world::TaskbarProgress;
-use crate::pet_world::{PetAnchor, PetPane, PetRect, PetWorld, PetWorldFacts, PetWorldStamp};
+use crate::pet_world::{
+    PetAnchor, PetPane, PetRect, PetReserve, PetWorld, PetWorldFacts, PetWorldStamp,
+};
 use aterm_core::terminal::BlockState;
 
 const INPUT_HOLD: f32 = 0.65;
@@ -24,9 +26,48 @@ const CONTACT_MARGIN: f32 = 0.45;
 /// The most cells of one frame's typing [`typed_run`] discounts from contact.
 const TYPED_RUN_MAX: usize = 4;
 const PERCH_REACH: f32 = 24.0;
+/// How far the cat goes for a landing's stage ([`PetBrain::cheer_stage`]):
+/// columns either way, and rows up in tenths (never down: below the cat is
+/// the prompt it keeps clear of, or the floor it stands on).
+const CHEER_STAGE_COLS: f32 = 96.0;
+const CHEER_STAGE_TENTHS_UP: u8 = 60;
+
+/// A landing's stage ([`PetBrain::cheer_stage`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct CheerStage {
+    /// Where to land, `(col, row)`, the brain's own seat; `None` where the
+    /// cat already stands on it.
+    pub(super) at: Option<(f32, f32)>,
+    /// How its ♪/♥ take the air there: in their lanes on the side the cat
+    /// will face, or the compact spray.
+    pub(super) air: CheerAir,
+}
+
 /// The caret is home. Located output may direct the gaze, but must not park
 /// the resident across the pane. Rows cost twice a column in this bound.
 const HOME_REACH: f32 = 6.0;
+/// The most rows a body rides with the content round it in one observation
+/// ([`PetBrain::content_ride`]): a composer growing a line or two at once.
+const RIDE_ROWS_MAX: usize = 3;
+/// How far a resident moved off a protected stand ([`PetBrain::console_station`])
+/// looks for CLEAN ground — no glyph under its body — before it settles behind
+/// text within [`HOME_REACH`]. Rows cost twice a column, and the two add as a
+/// Euclidean length ([`PetWorld::nearest_clear_perch`]).
+///
+/// Wide enough for the ground a full-screen program leaves beside its own
+/// chrome: under Claude Code 2.1.304 the composer row sits between two rules
+/// aterm paints over (protected), so a 1.7-row body cannot stand at the caret,
+/// and the nearest blank seat is two rows under the footer on a fresh screen
+/// (5.7 away). On a full one it is beside the last line above the rule, or the
+/// footer's blank tail on the last two rows: 30 to 53 away at 120 columns, by
+/// how long those lines are. The ink-blind [`HOME_REACH`] search alone sat the
+/// sleeping cat on the footer's words (`auto🐱de`, owner-eye-6, 2026-10-20).
+const REST_REACH: f32 = 64.0;
+
+/// How far from a kept rest seat the search may find it again: its own
+/// place, give or take the float rounding of the foot row it is stored by
+/// ([`PetBrain::console_station`]).
+const SEAT_KEPT: f32 = 0.5;
 
 /// How long the resident holds still for an unpainted caret before the
 /// ordinary ladder takes over again. A DECTCEM hide means "I am repainting",
@@ -427,6 +468,42 @@ pub(super) struct ConsoleLife {
     /// Synthesized composer caret when a TUI parks its hidden DECTCEM cursor
     /// at the bottom-left corner and draws an inverse/block cursor in the prompt.
     faux_caret: Option<(u16, u16)>,
+    /// THE REST SEAT [`PetBrain::console_station`] last chose on clean
+    /// ground, `(col, foot row)`: kept while it is still clean, reachable
+    /// and within [`REST_REACH`] of the stand, so the cat moves only when
+    /// its ground is taken. Written from that `&self` reading (both the
+    /// escort and the resident ask it); dropped with the surface.
+    rest_seat: std::cell::Cell<Option<(f32, f32)>>,
+    /// Whether the station [`PetBrain::console_station`] last answered is
+    /// that rest seat: ground that stays put while the caret moves, so a
+    /// flight to it aims at it, with no caret drift
+    /// ([`PetBrain::aims_ahead`]). Aimed ahead like a caret's stand, a hop
+    /// to a seat 64 columns off landed five past it.
+    pub(super) rest_seated: std::cell::Cell<bool>,
+    /// THE ROWS AS THE LAST TWO DIFFERENT OBSERVATIONS WROTE THEM: one hash
+    /// of each pane row's characters (`row_sig`), and the same for the last
+    /// observation whose rows differed (`row_sig_prev`), on one surface and
+    /// grid. What [`PetBrain::content_ride`] reads to tell that the rows
+    /// round the body moved down together (a composer growing a line pushes
+    /// its rule and the footer under it a row down) and to carry the body
+    /// with them.
+    row_sig: Vec<u64>,
+    row_sig_prev: Vec<u64>,
+    /// Scratch for the observation being hashed, kept for its capacity.
+    row_sig_next: Vec<u64>,
+}
+
+/// One pane row's characters as a hash (FNV-1a), for [`ConsoleLife::row_sig`];
+/// 0 for a row with nothing written on it.
+fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
+    if row.iter().all(|cell| matches!(cell.ch, ' ' | '\0')) {
+        return 0;
+    }
+    row.iter()
+        .fold(0xcbf2_9ce4_8422_2325, |h, cell| {
+            (h ^ u64::from(u32::from(cell.ch))).wrapping_mul(0x0100_0000_01b3)
+        })
+        .max(1)
 }
 
 impl ConsoleLife {
@@ -575,6 +652,44 @@ impl PetBrain {
         pane: PetPane,
         exclusions: &[PetRect],
     ) {
+        self.observe_console_with_reserve(input, facts, pane, PetReserve::protected(exclusions));
+    }
+
+    /// As [`Self::observe_console_with_exclusions`], with the host's
+    /// transient overlays apart (`overlays`: the Autopilot menu, the find
+    /// bar; [`PetWorld::observe_with_overlays`]). They protect their cells
+    /// alike, but the rest seat is solved without them, as without a live
+    /// selection ([`PetBrain::console_station`]).
+    pub fn observe_console_with_overlays(
+        &mut self,
+        input: &aterm_core::render::RenderInput,
+        facts: &PetWorldFacts,
+        pane: PetPane,
+        exclusions: &[PetRect],
+        overlays: &[PetRect],
+    ) {
+        self.observe_console_with_reserve(
+            input,
+            facts,
+            pane,
+            PetReserve {
+                protected: exclusions,
+                overlays,
+                ink: &[],
+            },
+        );
+    }
+
+    /// The host's late overlays told apart ([`PetReserve`]): its chrome and
+    /// its transient overlays protected, the person's typed glyphs (the
+    /// predicted echo, the IME preedit) as ink.
+    pub fn observe_console_with_reserve(
+        &mut self,
+        input: &aterm_core::render::RenderInput,
+        facts: &PetWorldFacts,
+        pane: PetPane,
+        reserve: PetReserve<'_>,
+    ) {
         // The hidden-cursor resident holds its last drawn body, so keep that
         // body's cells inside the observation window (centering a large pane
         // would make an unchanged blank home look unknown). A new
@@ -605,7 +720,7 @@ impl PetBrain {
             .console
             .last_body
             .and_then(|r| local_ink(world, r, typed));
-        world.observe_with_exclusions_near(input, facts, pane, exclusions, held_center);
+        world.observe_with_exclusions_near(input, facts, pane, reserve, held_center);
         if world.stamp().is_some()
             && (prior_stamp != world.stamp()
                 || prior_selection != world.selection_target()
@@ -649,6 +764,7 @@ impl PetBrain {
             self.console.failure_quiet_until = None;
             self.console.faux_caret = None;
         }
+        self.note_row_signatures(input, pane, prior_stamp);
         self.console.faux_caret = if !input.cursor_visible
             && input.display_offset == 0
             && input.cursor_row + 2 >= pane.row + pane.rows
@@ -658,6 +774,64 @@ impl PetBrain {
         } else {
             None
         };
+    }
+
+    /// Hash this observation's pane rows ([`ConsoleLife::row_sig`]). Rows
+    /// unchanged since the last observation keep both sets as they are, so a
+    /// second read of one frame, or a frame that only moved the cat, still
+    /// sees the move before it. A new surface or grid has no rows before it.
+    fn note_row_signatures(
+        &mut self,
+        input: &aterm_core::render::RenderInput,
+        pane: PetPane,
+        prior: Option<PetWorldStamp>,
+    ) {
+        let console = &mut self.console;
+        let Some(stamp) = console.world.as_ref().and_then(|w| w.stamp()) else {
+            console.row_sig.clear();
+            console.row_sig_prev.clear();
+            return;
+        };
+        console.row_sig_next.clear();
+        let rows = pane.rows.min(input.cells.len().saturating_sub(pane.row));
+        for r in pane.row..pane.row + rows {
+            let row = &input.cells[r];
+            let end = (pane.col + pane.cols).min(row.len());
+            console
+                .row_sig_next
+                .push(row_signature(row.get(pane.col..end).unwrap_or(&[])));
+        }
+        let same_grid = prior.is_some_and(|p| p.surface == stamp.surface)
+            && console.row_sig.len() == console.row_sig_next.len();
+        if !same_grid {
+            console.row_sig_prev.clear();
+            std::mem::swap(&mut console.row_sig, &mut console.row_sig_next);
+        } else if console.row_sig != console.row_sig_next {
+            std::mem::swap(&mut console.row_sig_prev, &mut console.row_sig);
+            std::mem::swap(&mut console.row_sig, &mut console.row_sig_next);
+        }
+    }
+
+    /// How many rows the content round `rect` moved down (1 to
+    /// [`RIDE_ROWS_MAX`]) between the last two different observations: every
+    /// row from the one above the body to its last one is found again that
+    /// many rows lower, and they are not all blank (a blank row matches any
+    /// other). `None` when the rows did not move together.
+    fn content_ride(&self, rect: PetRect) -> Option<f32> {
+        let (cur, prev) = (&self.console.row_sig, &self.console.row_sig_prev);
+        if prev.is_empty() || prev.len() != cur.len() || !rect.valid() {
+            return None;
+        }
+        let top = (rect.row.floor() as i64 - 1).max(0) as usize;
+        let bottom = ((rect.row + rect.rows).ceil() as i64 - 1).max(0) as usize;
+        let rows = top..=bottom;
+        (1..=RIDE_ROWS_MAX).find_map(|k| {
+            (bottom + k < cur.len()
+                && rows.clone().all(|r| prev[r] == cur[r + k])
+                && rows.clone().any(|r| prev[r] != 0)
+                && rows.clone().any(|r| prev[r] != cur[r]))
+            .then_some(k as f32)
+        })
     }
 
     /// Exact locomotion occupancy where the map covers the whole footprint.
@@ -730,6 +904,203 @@ impl PetBrain {
         )
     }
 
+    /// A LANDING'S STAGE (§11.3 of `docs/DESIGN-harness-autopilot-2026-10-15.md`):
+    /// ground where the cat can cheer with its ♪/♥ legible — its body, and
+    /// the air the three of them fill side by side in their lanes on the
+    /// side it faces ([`PetBrain::cheer_air`]), clear of ink, the caret's
+    /// ring and anything protected: [`PetWorld::clear`], the law every mote
+    /// on glass is held to (`finish_console_frame`). The side it faces is
+    /// tried first, then the other, and the cat cheers facing the side the
+    /// stage kept ([`CheerStage::air`]); only where neither side's lanes
+    /// find air within reach (a narrow pane) does the stage keep the compact
+    /// spray's ([`CheerAir::Compact`]), its ♪/♥ close together but on glass.
+    /// An agent's transcript leaves one blank row between its lines, too
+    /// little for a ♪, so the cat goes to the nearest open ground beside a short line, on its
+    /// own rows or up to six above (where nothing above is open, as a cat
+    /// resting under an agent's footer finds it, up to six below), by a path
+    /// that crosses nothing protected (the host's chrome; a body already
+    /// over some is judged by where it lands). `None` with no observed world
+    /// (the pane is all the cat's), or where no stage is within reach: it
+    /// cheers where it stands, as it faces. A stage with no `at` where it
+    /// already stands on one. Else where to land, `(col, row)`, the brain's
+    /// own seat: `prefer` (the stage a cut flight was bound for) while it is
+    /// still clear and reachable, else the nearest. The search below is
+    /// pinned by `a_home_under_the_footer_cheers_on_the_ground_below_it` and
+    /// `a_landing_in_a_narrow_pane_shows_its_notes`.
+    pub(super) fn cheer_stage(
+        &self,
+        sense: PetSense,
+        width: f32,
+        prefer: Option<(f32, f32)>,
+    ) -> Option<CheerStage> {
+        if !self.console.presentable {
+            return None;
+        }
+        let world = self.console.world.as_ref()?;
+        world.stamp()?;
+        let body = self.console_body(sense);
+        // The stage for `air` with the cat seated at `(col, row)`: its body
+        // there as it will be drawn (rounded to the pixel, held inside the
+        // grid), and the air over it. A seat the search lands on is judged
+        // by exactly the rect the cat will find there on arrival, or a body
+        // half a pixel off its shifted copy reads the ink beside it and hops
+        // half a pixel more.
+        let stage_at = |air: CheerAir, (col, row): (f32, f32)| {
+            let body = still_body_rect(
+                (col, row),
+                Stance::NEUTRAL,
+                (sense.cell_w, sense.cell_h),
+                (sense.cols, sense.rows),
+            );
+            let (left, top, right, bottom) =
+                self.cheer_air((col, row), (sense.cell_w, sense.cell_h), width, air);
+            let (row0, col0) = (top.min(body.row), left.min(body.col));
+            PetRect::new(
+                row0,
+                col0,
+                bottom.max(body.row + body.rows) - row0,
+                right.max(body.col + body.cols) - col0,
+            )
+        };
+        let shifted =
+            |r: PetRect, (dc, dr): (f32, f32)| PetRect::new(r.row + dr, r.col + dc, r.rows, r.cols);
+        // The path is the swept body. A body the map already holds over
+        // something protected (a sleeper whose feet rest, to the pixel, on a
+        // rule the host's chrome reserves) would sweep it into every corridor
+        // and never leave; its hop off is judged by where it lands, as the
+        // eviction's is.
+        let from =
+            (world.under_text_clearance_past_caret(body, CLEARANCE) != Some(false)).then_some(body);
+        let reachable = |air: CheerAir, (dc, dr): (f32, f32)| {
+            world.clear(stage_at(air, (self.col + dc, self.row + dr)), CLEARANCE)
+                && from.is_none_or(|from| {
+                    world.under_text_corridor_clear_past_caret(
+                        from,
+                        shifted(from, (dc, dr)),
+                        CLEARANCE,
+                    )
+                })
+        };
+        // Half a pixel, the most a seat's rounding moves the body: a stage
+        // aligned to a column is aligned that much right of it.
+        let half_px = 0.5 / f32::from(sense.cell_w.max(1));
+        // The lanes either side, the side it faces first; then, only where
+        // neither finds air within reach, the compact spray.
+        let tiers = [
+            [
+                Some(CheerAir::Lanes(self.facing_left)),
+                Some(CheerAir::Lanes(!self.facing_left)),
+            ],
+            [Some(CheerAir::Compact), None],
+        ];
+        for tier in tiers {
+            let stages: Vec<(CheerAir, PetRect)> = tier
+                .into_iter()
+                .flatten()
+                .map(|air| (air, stage_at(air, (self.col, self.row))))
+                .collect();
+            if let Some(&(air, _)) = stages
+                .iter()
+                .find(|(_, stage)| world.clear(*stage, CLEARANCE))
+            {
+                return Some(CheerStage { at: None, air });
+            }
+            // A flight the console law cut short is flown again to the stage
+            // it was bound for: the search below climbs first, and the stage
+            // may lie below where the cut flight came down.
+            if let Some((col, row)) = prefer
+                && let Some(&(air, _)) = stages
+                    .iter()
+                    .find(|&&(air, _)| reachable(air, (col - self.col, row - self.row)))
+            {
+                return Some(CheerStage {
+                    at: Some((col, row)),
+                    air,
+                });
+            }
+            let mut best: Option<(f32, (f32, f32), CheerAir)> = None;
+            // Up first, as far as six rows; then, only where nothing above is
+            // open, as far down. A cat at rest on the clean ground under an
+            // agent's footer (`console_station`'s rest seat) has the footer's
+            // words over its head and the composer's rules beyond them, which
+            // it may not cross, while the blank rows under it are open air:
+            // its stage is below.
+            for dir in [-1.0, 1.0] {
+                for step in 0..=CHEER_STAGE_TENTHS_UP {
+                    if dir > 0.0 && step == 0 {
+                        continue;
+                    }
+                    let dr = dir * 0.1 * f32::from(step);
+                    for &(air, stage) in &stages {
+                        // Unseen cells are never clear, so the grid bounds the
+                        // search and the map's coverage window bounds the
+                        // answers.
+                        for c in 0..sense.cols {
+                            let dc = f32::from(c) + CLEARANCE + half_px - stage.col;
+                            let distance = (2.0 * dr.abs()).max(dc.abs());
+                            if distance > CHEER_STAGE_COLS
+                                || best.is_some_and(|(d, _, _)| distance >= d)
+                            {
+                                continue;
+                            }
+                            if reachable(air, (dc, dr)) {
+                                best = Some((distance, (dc, dr), air));
+                            }
+                        }
+                    }
+                }
+                if best.is_some() {
+                    break;
+                }
+            }
+            if let Some((_, (dc, dr), air)) = best {
+                return Some(CheerStage {
+                    at: Some((self.col + dc, self.row + dr)),
+                    air,
+                });
+            }
+        }
+        None
+    }
+
+    /// A LANDING SEEN AT FIRST LOOK (§11.3): a cat off glass when its cheer
+    /// comes due (its home under the host's chrome, where the console law
+    /// hides it, or not yet faded in) has no flight anyone could watch, and a
+    /// flight from a refused body is stepped aside on its first frame, the
+    /// whole arc translated with it, so it lands off its stage. It appears on
+    /// the stage instead ([`Self::cheer_stage`]), fading in there as any
+    /// unshown body is re-seated ([`Self::reseat_unshown_console_body`]).
+    /// Whether it did, which is the stage's first trip: `false` on glass,
+    /// and `false` with no observed world or no open ground within reach,
+    /// where the search is spent and it cheers where it stands.
+    pub(super) fn appear_on_cheer_stage(&mut self, sense: PetSense, width: f32) -> bool {
+        if self.console.on_glass || self.flight.is_some() {
+            return false;
+        }
+        let stage = self.cheer_stage(sense, width, None);
+        self.room_cheer_air = stage.map(|s| s.air);
+        let Some((col, row)) = stage.and_then(|s| s.at) else {
+            self.room_cheer_trips = CHEER_STAGE_TRIPS;
+            return false;
+        };
+        self.room_cheer_trips = 1;
+        self.room_cheer_stage = Some((col, row));
+        if let Some(CheerAir::Lanes(facing_left)) = self.room_cheer_air {
+            self.facing_left = facing_left;
+        }
+        // A completed static placement, as reduced motion's: the motion
+        // sensor synced, or `needs_frames` reads the move as travel.
+        self.col = col;
+        self.row = row;
+        self.home = col;
+        self.col_at_tick = col;
+        self.alpha = 0.0;
+        self.console.hold = VisibilityHold::default();
+        self.console.trip = None;
+        self.console.target = None;
+        true
+    }
+
     /// THE RE-SIGHTING GHOST'S ADMISSION ON ITS OWN GLASS, judged at the
     /// boundary ([`PetBrain::resight_coordinate_space`]) — before the retire
     /// drops the old surface's map, so the map is the observation the body
@@ -772,6 +1143,52 @@ impl PetBrain {
         world.seen_under_text_clearance_past_caret(rect)
     }
 
+    /// WHERE A SLEEPER MAY STRETCH (2026-10-20): the body where the cat lies
+    /// covers no ink and nothing protected the map sees
+    /// ([`PetWorld::ink_clearance`], which counts as ink every cell anything
+    /// protects: the host's chrome, an image, a selection, an overlay, a row
+    /// it cannot see), so the stretch is drawn in front of blank ground and
+    /// never under a word. The stretch's
+    /// own widening ([`STRETCH_AMP`], 3% a side, a sixth of a cell at most)
+    /// is not judged: it reaches no glyph's ink, and judging it would take
+    /// the stretch from a key's wake beside the letter it just echoed. The
+    /// owner's captures of a landing in front showed the stretch's ears
+    /// through the foot of the done line's first word: the console law had
+    /// stepped the sleeper off the reserved rule onto ground behind the text
+    /// (`place_console_body_at_home`), where ordinary ink permits residency,
+    /// and it stretched there. Where this is `false` only the stretch is
+    /// withheld: the landing's cheer goes straight to its stage, the
+    /// console's success keeps the cat's own pose (no other sign of it),
+    /// every other wake (a key, a trick, an eviction's handed-back sleeper)
+    /// is drawn sitting up (the look's `Waking` arm), and a sleeper's fall
+    /// stays asleep through the beat it would stretch in the air (the look's
+    /// `Leap` arm). The cat is still drawn where it lies, behind the words,
+    /// as ordinary ink's residency has always let it: this moves no cat off
+    /// a word. `true` with no observed world (the pane is all the cat's);
+    /// `false` on a map that cannot see that ground, or none certified. At
+    /// the last tick's cell metrics and grid.
+    pub(super) fn console_stretch_on_blank(&self) -> bool {
+        self.console_stretch_on_blank_at((self.col, self.row))
+    }
+
+    /// [`Self::console_stretch_on_blank`] for a body at `at` (cells): the
+    /// sleeper's fall judges where it falls from and where it lands.
+    pub(super) fn console_stretch_on_blank_at(&self, at: (f32, f32)) -> bool {
+        if !self.console.presentable {
+            return true;
+        }
+        let Some(world) = self.console.world.as_ref() else {
+            return true;
+        };
+        let rect = still_body_rect(
+            at,
+            Stance::NEUTRAL,
+            (self.last_cell_w, self.last_cell_h),
+            self.last_grid,
+        );
+        world.ink_clearance(rect, 0.0) == Some(true)
+    }
+
     /// An examined obstruction under the pet's natural body. `clear` would
     /// also answer `false` for "outside the coverage window", and this
     /// predicate authorizes a teleport, so it acts only on a certified
@@ -788,6 +1205,12 @@ impl PetBrain {
                 world.under_text_clearance_past_caret(self.console_body(sense), CLEARANCE)
                     == Some(false)
             })
+    }
+
+    /// The brain's own stream watch has the cat: a stare under way, or the
+    /// vigil it armed (see `tick_console_resident`).
+    fn watching_stream(&self) -> bool {
+        (self.watch_heat >= WATCH_GATE && !self.watch_spent) || self.vigil_armed || self.vigil
     }
 
     pub(super) fn reseat_unshown_console_body(&mut self, sense: PetSense, width: f32) {
@@ -840,6 +1263,7 @@ impl PetBrain {
         let body = self.console_body(sense);
         let Some(stamp) = self.console.world.as_ref().and_then(|w| w.stamp()) else {
             self.console.cursor_home = None;
+            self.console.rest_seat.set(None);
             self.console.resident = false;
             self.console.trip = None;
             return;
@@ -853,6 +1277,7 @@ impl PetBrain {
         if !same_surface {
             self.console.anchor = None;
             self.console.target = None;
+            self.console.rest_seat.set(None);
             self.console.trip = None;
             self.console.progress_key = None;
             self.console.progress_at = None;
@@ -900,6 +1325,7 @@ impl PetBrain {
             self.pending_big_jump = false;
             self.pending_pointer_pounce = None;
             self.pending_cheer = None;
+            self.drop_room_cheer();
             self.pending_sulk = false;
             self.pending_vigil_pounce = false;
             self.vigil_cheer = None;
@@ -947,6 +1373,7 @@ impl PetBrain {
             self.console.completion = None;
             self.pending_sulk = false;
             self.pending_cheer = None;
+            self.drop_room_cheer();
             self.pending_vigil_pounce = false;
             self.vigil_cheer = None;
             self.console.pose = Some(if gaze.0 < self.row - 0.5 {
@@ -1070,7 +1497,32 @@ impl PetBrain {
         // opening beat, a one-shot still playing, a commanded seat still held.
         // Each term is finite or interruptible, and none is in
         // `console_frames`, so a resident that owns the tick still parks.
-        if self.pending_pet > 0 || self.pet_hold_t > 0.0 || self.trick_engaged() {
+        //
+        // So is a landing's cheer (`PetBrain::note_room_landed`, §11.3 of
+        // `docs/DESIGN-harness-autopilot-2026-10-15.md`): the agent's work came
+        // down and the person is looking, in a pane whose agent is one running
+        // command. It holds the cat until it has played, its ♪/♥ gone; a fresh
+        // key and a held selection (above) wipe it first.
+        //
+        // Spent, it hands the cat back. Where the escort's stand is refused
+        // (the host's chrome over it, no perch within reach: the stand
+        // `console_caret_home` gives, already corrected where a perch is), the
+        // escort would chase a station the cat can never stand on, and the
+        // console law steps every flight there aside onto ground it refuses
+        // again on landing: a hop in place, frames without end. So the cat
+        // leaves the glass where it stands instead and goes home off glass,
+        // as a re-sighting finds it (`PetBrain::room_cheer_leaving`).
+        if self.room_cheer && !self.room_cheer_in_play() {
+            if home.is_some_and(|stand| {
+                world.under_text_clearance_past_caret(stand, CLEARANCE) == Some(false)
+            }) {
+                self.room_cheer_leaving = true;
+            } else {
+                self.room_cheer = false;
+            }
+        }
+        if self.pending_pet > 0 || self.pet_hold_t > 0.0 || self.trick_engaged() || self.room_cheer
+        {
             self.console.resident = false;
             self.console.trip = None;
             self.console.pose = None;
@@ -1188,11 +1640,17 @@ impl PetBrain {
             } else {
                 "command-exit-success"
             };
-            self.console.pose = Some(if failed {
-                PetGlyphId::PetInspectDown
+            // The success's stretch only on blank ground
+            // ([`Self::console_stretch_on_blank`]): over a word it would be
+            // drawn under the glyphs, ears through them, so there the cat
+            // keeps its own pose through the hold, still behind the words,
+            // and the success shows no other sign.
+            self.console.pose = if failed {
+                Some(PetGlyphId::PetInspectDown)
             } else {
-                PetGlyphId::PetStretchHind
-            });
+                self.console_stretch_on_blank()
+                    .then_some(PetGlyphId::PetStretchHind)
+            };
             self.console.target = Self::console_may_stand(world, body, CLEARANCE).then_some(body);
             self.console.resident = true;
             self.console.still = true;
@@ -1484,6 +1942,24 @@ impl PetBrain {
             self.console.resident_handoff = true;
             return None;
         }
+        // THE STREAM WATCH OUTRANKS THE OUTPUT HOLD. Both are the cat
+        // watching a running command's output (one rung of the attention
+        // precedence): the brain's stare, its hug and its vigil, and this
+        // hold's gaze. A stare under way (heat over the gate, its cap not
+        // spent) or a vigil armed by one keeps the cat. The hold zeroes the
+        // heat, and it took the cat the first frame its seat could be held,
+        // so whether a streamed answer was watched at all turned on whether
+        // the seat cleared the console law by a tenth of a cell.
+        if matches!(
+            self.console.attention,
+            PetAttention::Output | PetAttention::Progress
+        ) && self.watching_stream()
+        {
+            self.console.resident = false;
+            self.console.target = None;
+            self.console.trip = None;
+            return None;
+        }
         self.console.resident_handoff = false;
         // A resident branch has already yielded affection to protected
         // reading or another interest; retire its suppressed latch even with
@@ -1772,28 +2248,258 @@ impl PetBrain {
     ///  * an unknown (`None` is a bound on this map, not a claim about the
     ///    terminal).
     ///
-    /// The correction searches with [`PetWorld::nearest_under_text_perch`], not
-    /// `home_perch`: the escort takes the closest place it may stand.
+    /// Which correction, by what refuses the stand:
+    ///
+    ///  * ONLY A SELECTION OR A TRANSIENT OVERLAY (the Autopilot menu, the
+    ///    find bar; the person's typed glyphs, the predicted echo and an IME
+    ///    preedit, are ink, never either; on the ground plane the stand is not
+    ///    refused, [`PetWorld::ground_under_text_clearance_past_caret`]): the
+    ///    closest place it may stand behind text
+    ///    ([`PetWorld::nearest_under_text_perch`], within [`HOME_REACH`]), or
+    ///    none, and the pet yields where it is. A hand's selection never
+    ///    sends the cat across the pane.
+    ///  * WHAT PROTECTS THE GROUND FOR GOOD (the host's chrome round an
+    ///    agent's composer, an image), under the stand or BETWEEN THE BODY ON
+    ///    GLASS AND IT ([`Self::console_walled`]: a stand it cannot walk to is
+    ///    no stand; a draft wrapped onto the composer's second line put the
+    ///    stand inside the box, clear, and the cat resting above the rule
+    ///    hopped at it, stepped back off the rule each time, for as long as
+    ///    the keys came): REST GROUND. The nearest clean seat —
+    ///    nothing under the body, not even a gap inside a line
+    ///    ([`PetWorld::nearest_clear_perch`], within [`REST_REACH`], solved
+    ///    without the selection and overlays, so they never move it) — that
+    ///    the body on glass can walk to without crossing that chrome
+    ///    ([`Self::rest_reach_from`]); then the closest place behind text
+    ///    within [`HOME_REACH`] it can walk to; then none. A seat beyond the
+    ///    rules is never chased: the console law stepped every flight there
+    ///    back off the rule, and the cat leapt in place for as long as the
+    ///    window stayed up. A seat chosen so is KEPT while it is still clean
+    ///    ground the body can reach, within `REST_REACH` of the stand
+    ///    (`ConsoleLife::rest_seat`): the cat moves when its ground is taken,
+    ///    not whenever nearer ground opens. A command list that Claude Code
+    ///    redraws under the composer at every key sent it leaping up and
+    ///    down the pane after the list's end.
+    ///
+    /// Both the escort and the resident read this one answer, so they agree.
     pub(super) fn console_station(
         &self,
         desired: (f32, f32),
         sense_dims: (u16, u16),
         width: f32,
     ) -> Option<(f32, f32)> {
+        self.console.rest_seated.set(false);
         if !self.console.presentable {
             return None;
         }
         let world = self.console.world.as_ref()?;
         world.stamp()?;
         let body = Self::console_stand_rect(desired, sense_dims.0, width);
-        if world.under_text_clearance_past_caret(body, CLEARANCE) != Some(false) {
+        let from = self.rest_reach_from(world, sense_dims.0, width);
+        let walled = from.is_some_and(|from| Self::console_walled(world, from, body));
+        if !walled && world.under_text_clearance_past_caret(body, CLEARANCE) != Some(false) {
+            self.console.rest_seat.set(None);
             return None;
         }
         // No perch in reach is `None`, not "stay where you are": both callers
         // fall back to the baseline station, so the pet keeps following the
         // caret.
-        let next = world.nearest_under_text_perch(body, CLEARANCE, HOME_REACH)?;
-        Some((next.col, next.foot_row()))
+        if !walled && world.ground_under_text_clearance_past_caret(body, CLEARANCE) != Some(false) {
+            let next = world.nearest_under_text_perch(body, CLEARANCE, HOME_REACH)?;
+            return Some((next.col, next.foot_row()));
+        }
+        // The seat kept: the search's own acceptance, at the seat alone. A
+        // seat gone, the ground the cat rests on is kept in its place while
+        // it is a seat: the seat can move on while the cat stays (a frolic,
+        // a startle), and a caret run back toward it is no reason to leave.
+        let keep = |seat: (f32, f32)| {
+            let held = Self::console_stand_rect(seat, sense_dims.0, width);
+            ((2.0 * (held.row - body.row)).hypot(held.col - body.col) <= REST_REACH)
+                .then(|| world.nearest_clear_perch(held, CLEARANCE, SEAT_KEPT, from))
+                .flatten()
+        };
+        let keep_any_clear = |seat: (f32, f32)| {
+            let held = Self::console_stand_rect(seat, sense_dims.0, width);
+            world.nearest_clear_perch(held, CLEARANCE, SEAT_KEPT, from)
+        };
+        let resting = (self.flight.is_none() && self.alpha > 0.0).then_some((self.col, self.row));
+        let kept = self
+            .console
+            .rest_seat
+            .get()
+            .and_then(keep)
+            .or_else(|| resting.and_then(keep));
+        if let Some(next) = kept
+            .or_else(|| world.nearest_clear_perch(body, CLEARANCE, REST_REACH, from))
+            .or_else(|| {
+                self.console
+                    .rest_seat
+                    .get()
+                    .and_then(keep_any_clear)
+                    .or_else(|| resting.and_then(keep_any_clear))
+            })
+            .or_else(|| {
+                // The search requires a finite reach. Cover the whole pane,
+                // including a stand whose column lies outside it.
+                let across = body
+                    .col
+                    .abs()
+                    .max((f32::from(sense_dims.1) - body.col).abs());
+                let reach = (2.0 * f32::from(sense_dims.0)).hypot(across);
+                world.nearest_clear_perch(body, CLEARANCE, reach, from)
+            })
+        {
+            let seat = (next.col, next.foot_row());
+            self.console.rest_seat.set(Some(seat));
+            self.console.rest_seated.set(true);
+            return Some(seat);
+        }
+        let keep_under = |seat: (f32, f32)| {
+            let held = Self::console_stand_rect(seat, sense_dims.0, width);
+            ((2.0 * (held.row - body.row)).hypot(held.col - body.col) <= REST_REACH)
+                .then(|| world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from))
+                .flatten()
+        };
+        let keep_any_under = |seat: (f32, f32)| {
+            let held = Self::console_stand_rect(seat, sense_dims.0, width);
+            world.nearest_under_text_perch_from(held, CLEARANCE, SEAT_KEPT, from)
+        };
+        let next = self
+            .console
+            .rest_seat
+            .get()
+            .and_then(keep_under)
+            .or_else(|| resting.and_then(keep_under))
+            .or_else(|| world.nearest_under_text_perch_from(body, CLEARANCE, HOME_REACH, from))
+            .or_else(|| {
+                self.console
+                    .rest_seat
+                    .get()
+                    .and_then(keep_any_under)
+                    .or_else(|| resting.and_then(keep_any_under))
+            })
+            .or_else(|| {
+                let across = body
+                    .col
+                    .abs()
+                    .max((f32::from(sense_dims.1) - body.col).abs());
+                let reach = (2.0 * f32::from(sense_dims.0)).hypot(across);
+                world.nearest_under_text_perch_from(body, CLEARANCE, reach, from)
+            });
+        if let Some(next) = next {
+            let seat = (next.col, next.foot_row());
+            self.console.rest_seat.set(Some(seat));
+            self.console.rest_seated.set(true);
+            return Some(seat);
+        }
+        self.console.rest_seat.set(None);
+        None
+    }
+
+    /// The arc a flight from the body to `to` (`(col, foot row)`) may rise
+    /// by: `arc`, or half, a quarter or none of it, the highest whose path
+    /// keeps the body (padded for the flight's stretch) off every cell the
+    /// console protects. The corridor a seat is chosen by is the box between
+    /// the two bodies on the ground ([`Self::console_walled`]); a bound's
+    /// rise is not in it. Launched from beside the host's chips on a
+    /// composer's rule, the bound rose into them in its first frames and
+    /// the console law stepped the body a column and more sideways in the
+    /// air (2026-10-20). `arc` unchanged where the ground path itself is
+    /// not clear: flattening could not help it.
+    pub(super) fn console_clear_arc(&self, to: (f32, f32), arc: f32, big: bool) -> f32 {
+        const PAD_COLS: f32 = 0.5;
+        const PAD_ROWS: f32 = 0.1;
+        if !self.console.presentable || arc <= 0.0 {
+            return arc;
+        }
+        let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
+            return arc;
+        };
+        let width = art_cols(self.last_cell_w.max(1), self.last_cell_h.max(1));
+        let from = (self.col, self.row);
+        let steps = ((to.0 - from.0).abs().max((to.1 - from.1).abs() * 2.0) * 2.0)
+            .ceil()
+            .clamp(4.0, 256.0) as usize;
+        let clips = |a: f32| {
+            (0..=steps).any(|i| {
+                let u = i as f32 / steps as f32;
+                let col = from.0 + (to.0 - from.0) * u;
+                let row = from.1 + (to.1 - from.1) * u - Self::flight_lift(a, u, big);
+                let body = PetRect::new(row + 1.0 - ART_ROWS, col, ART_ROWS, width);
+                let padded = PetRect::new(
+                    body.row - PAD_ROWS,
+                    body.col - PAD_COLS,
+                    body.rows + PAD_ROWS,
+                    body.cols + 2.0 * PAD_COLS,
+                );
+                Self::console_must_yield(world, padded)
+            })
+        };
+        if !clips(arc) || clips(0.0) {
+            return arc;
+        }
+        [0.5 * arc, 0.25 * arc]
+            .into_iter()
+            .find(|&a| !clips(a))
+            .unwrap_or(0.0)
+    }
+
+    /// Where a rest seat must be reachable from ([`Self::console_station`]):
+    /// the body on glass, at the seat a flight in the air is bound for. A
+    /// body over ground the host's chrome protects is where the console law
+    /// will step it to ([`Self::place_console_body_at_home`]'s search). A
+    /// body not on glass (a first sighting, after a fade) has no path to
+    /// keep: `None`, and the seat is the nearest one anywhere.
+    fn rest_reach_from(&self, world: &PetWorld, rows: u16, width: f32) -> Option<PetRect> {
+        if self.alpha <= 0.0 {
+            return None;
+        }
+        let seat = self
+            .flight
+            .as_ref()
+            .map_or((self.col, self.row), |f| (f.to_col, f.to_row));
+        let body = Self::console_stand_rect(seat, rows, width);
+        match world.ground_under_text_clearance_past_caret(body, 0.0) {
+            Some(true) => Some(body),
+            Some(false) => world.nearest_under_text_perch(body, CLEARANCE, HOME_REACH),
+            None => None,
+        }
+    }
+
+    /// Whether a flight's aim leads by the caret's drift: a rhythm is open
+    /// and the station follows the caret. A console rest seat stays put
+    /// while the caret runs ([`Self::console_station`]), so a flight to it
+    /// lands on it.
+    pub(super) fn aims_ahead(&self) -> bool {
+        self.rhythm_open() && !self.console.rest_seated.get()
+    }
+
+    /// Whether the host's chrome stands between the body on glass, `from`,
+    /// and `to`: a protected cell observed in the box a flight between them
+    /// sweeps ([`PetWorld::ground_corridor_walled`]). An unknown cell is no
+    /// wall: only a positive observation bars the way, as only one moves a
+    /// body.
+    fn console_walled(world: &PetWorld, from: PetRect, to: PetRect) -> bool {
+        world.ground_corridor_walled(from, to)
+    }
+
+    /// Whether the console bars the escort from a stand at `desired`
+    /// (`(col, foot row)`): protected ground under it, or between the body
+    /// on glass and it ([`Self::console_walled`]). The live-edge hug asks
+    /// this of its own stand ([`PetBrain::tick`]'s watch station) and stays
+    /// where it is when barred: chased, the console law stepped every
+    /// flight across the composer's rule back off it.
+    pub(super) fn console_bars(&self, desired: (f32, f32), rows: u16, width: f32) -> bool {
+        if !self.console.presentable {
+            return false;
+        }
+        let Some(world) = self.console.world.as_ref().filter(|w| w.stamp().is_some()) else {
+            return false;
+        };
+        let body = Self::console_stand_rect(desired, rows, width);
+        world.under_text_clearance_past_caret(body, CLEARANCE) == Some(false)
+            || self
+                .rest_reach_from(world, rows, width)
+                .is_some_and(|from| Self::console_walled(world, from, body))
     }
 
     /// The body rect the escort's own station puts the pet in, unchanged. The
@@ -1939,6 +2645,23 @@ impl PetBrain {
         if !Self::console_must_yield(world, rect) {
             return;
         }
+        // The rows round the body moved down together and brought the
+        // protected cells with them (the host's chips ride the rule of a
+        // composer that grew a line): the body goes down with its ground, the
+        // whole rows they went and no column sideways, in the frame its
+        // ground moved in. The nearest perch instead slid it a column or more
+        // sideways onto the rule, or a row down and two columns over.
+        if let Some(dy) = self.content_ride(rect) {
+            let ridden = PetFrame {
+                row: frame.row + dy,
+                ..*frame
+            };
+            if body_rect(&ridden, sense).is_some_and(|r| world.under_text_clear(r, CLEARANCE)) {
+                self.carry_console_body(frame, ridden, dy);
+                self.console.reason = "content-ride";
+                return;
+            }
+        }
         // It steps aside, not home: the shortest move off the protected
         // surface is all this layer owes.
         let Some(safe) = world.nearest_under_text_perch(rect, CLEARANCE, HOME_REACH) else {
@@ -1955,6 +2678,7 @@ impl PetBrain {
         let natural_w = ((natural_h * ART_ASPECT).round() as i32).clamp(1, i32::from(u16::MAX));
         let dest_w = (rect.cols * cw).round() as i32;
         let dest_h = (rect.rows * ch).round();
+        let ground_row = ((safe.row * ch).round() + dest_h) / ch - 1.0;
         let shifted = PetFrame {
             col: ((safe.col * cw).round() - (natural_w / 2) as f32 + (dest_w / 2) as f32) / cw,
             row: ((safe.row * ch).round() + dest_h + (frame.lift * ch).round()) / ch - 1.0,
@@ -1965,11 +2689,18 @@ impl PetBrain {
             self.console.reason = "protected-home-rounding";
             return;
         }
-        let (dx, dy) = (shifted.col - frame.col, shifted.row - frame.row);
-        *frame = shifted;
+        let ground_dy = ground_row - frame.row;
+        self.carry_console_body(frame, shifted, ground_dy);
         self.console.reason = "cursor-home";
+    }
+
+    /// Move the drawn body to `to` and every motion coordinate with it, or
+    /// the next tick's lerp would restore the body to where it was.
+    fn carry_console_body(&mut self, frame: &mut PetFrame, to: PetFrame, ground_dy: f32) {
+        let (dx, dy) = (to.col - frame.col, to.row - frame.row);
+        *frame = to;
         self.col += dx;
-        self.row += dy;
+        self.row += ground_dy;
         self.col_at_tick += dx;
         // A STILL GHOST IS THIS BODY A FRAME AGO — the fading half of an
         // in-place crossfade — so it steps aside with the body, or the swap
@@ -1981,7 +2712,7 @@ impl PetBrain {
             if let Some(record) = record.as_mut().filter(|d| d.still && !d.resight) {
                 record.from_col += dx;
                 record.edge += dx;
-                record.row += dy;
+                record.row += ground_dy;
                 if let Some(drawn) = drawn.as_mut() {
                     drawn.col += dx;
                     drawn.row += dy;
@@ -1991,26 +2722,26 @@ impl PetBrain {
         if let Some(flight) = self.flight.as_mut() {
             flight.from_col += dx;
             flight.to_col += dx;
-            flight.from_row += dy;
-            flight.to_row += dy;
+            flight.from_row += ground_dy;
+            flight.to_row += ground_dy;
         }
         if let Some((col, row, _)) = self.bound2.as_mut() {
             *col += dx;
-            *row += dy;
+            *row += ground_dy;
         }
         if let Some((col, row)) = self.deferred_hidden_landing.as_mut() {
             *col += dx;
-            *row += dy;
+            *row += ground_dy;
         }
         if let Some(target) = self.console.target.as_mut() {
             target.col += dx;
-            target.row += dy;
+            target.row += ground_dy;
         }
         if let Some(trip) = self.console.trip.as_mut() {
             trip.from.0 += dx;
             trip.to.0 += dx;
-            trip.from.1 += dy;
-            trip.to.1 += dy;
+            trip.from.1 += ground_dy;
+            trip.to.1 += ground_dy;
         }
     }
 
@@ -2473,11 +3204,17 @@ fn typed_run(
     pane: PetPane,
     last: Option<(u16, u16)>,
 ) -> Option<(usize, usize, usize)> {
-    if !input.cursor_visible || input.display_offset != 0 {
+    if input.display_offset != 0 {
         return None;
     }
     let row = input.cursor_row.checked_sub(pane.row)?;
     let col = input.cursor_col.checked_sub(pane.col)?;
+    if !input.cursor_visible {
+        let (_, c) = last.filter(|&(r, c)| {
+            usize::from(r) == row && usize::from(c) < col && col - usize::from(c) <= TYPED_RUN_MAX
+        })?;
+        return Some((row, usize::from(c), col + 1));
+    }
     let first = last
         .filter(|&(r, c)| usize::from(r) == row && usize::from(c) < col)
         .map_or(col.saturating_sub(1), |(_, c)| usize::from(c));
@@ -2629,6 +3366,7 @@ fn detect_faux_composer_caret(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pet_world::PetCell;
     use aterm_core::selection::{SelectionSide, SelectionType};
     use aterm_core::terminal::Terminal;
 
@@ -2946,6 +3684,70 @@ mod tests {
             here,
             "the baseline escort must still answer when the console cannot"
         );
+
+        // A first sighting can use clear ground beyond the nearby search.
+        // Only these two rows have a certified projection; their blank left
+        // strip is more than REST_REACH from the protected desired stand.
+        for row in [15, 16] {
+            let line = format!("\x1b[{row};1H\x1b#5\x1b[2K\x1b[{row};9H{}", "X".repeat(72));
+            s.term.process(line.as_bytes());
+        }
+        s.term.process(b"\x1b[6;17H");
+        s.frame(0.016);
+        s.pet.alpha = 0.0;
+        s.pet.flight = None;
+        s.pet.console.rest_seat.set(None);
+        let desired = (70.0, 5.0);
+        let body = PetBrain::console_stand_rect(desired, 20, width);
+        let world = s.pet.console.world.as_ref().expect("observed pane");
+        assert_eq!(
+            world.nearest_clear_perch(body, CLEARANCE, REST_REACH, None),
+            None,
+            "the nearby search cannot reach the clear strip"
+        );
+        let seat = s
+            .pet
+            .console_station(desired, (20, 80), width)
+            .expect("clear ground elsewhere in the pane");
+        let seated = PetBrain::console_stand_rect(seat, 20, width);
+        assert!(
+            (2.0 * (seated.row - body.row)).hypot(seated.col - body.col) > REST_REACH,
+            "the fallback reaches beyond the nearby search: {seated:?}"
+        );
+        assert!(
+            world.ground_clear(seated, CLEARANCE),
+            "the distant seat must still be certified clear ground"
+        );
+    }
+
+    /// THE STREAM WATCH OUTRANKS THE OUTPUT HOLD. A running command's
+    /// output hold has the cat at a seat it may hold, and the brain is
+    /// already staring at the stream: the stare goes on (the cat perks, the
+    /// heat only cools) and the resident stands aside, instead of zeroing the
+    /// heat on its first held frame. Measured in the recorded Claude Code take
+    /// (`full_screen_tests`): the inline answer was stared at, hugged and
+    /// waited up for only while the cat's seat at the pane's wall failed the
+    /// console law's clearance; a seat a fifth of a cell inside it lost all
+    /// three.
+    /// NEGATIVE CONTROL (as run, failing this test): `watching_stream`
+    /// answering `false`.
+    #[test]
+    fn a_stream_the_cat_is_staring_at_is_not_taken_by_the_output_hold() {
+        let mut s = Scene::new();
+        s.executing();
+        s.pet.watch_heat = 1.0;
+        let frames = s.watch(0.3);
+        assert!(
+            s.pet.watch_heat >= WATCH_GATE,
+            "the heat only cools, it is not taken: {:.2}",
+            s.pet.watch_heat
+        );
+        assert!(
+            frames.iter().all(|f| f.action == PetAction::Perk),
+            "perked at the stream throughout: {:?}",
+            frames.iter().map(|f| f.action).collect::<Vec<_>>()
+        );
+        assert!(!s.pet.console.resident, "the hold stood aside");
     }
 
     #[test]
@@ -3698,6 +4500,1283 @@ mod tests {
         );
     }
 
+    /// A LANDING CHEERS OVER A RUNNING COMMAND (§11.3 of
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md`): an agent's TUI is one
+    /// executing block (`C` with no `D`), whose resident watches its output
+    /// and holds the cat, wiping its motes, on every tick it owns. The
+    /// landing's cheer outranks that watch as affection does: the cat is
+    /// taken off the resident, perks, frolics with its three ♪/♥ on glass
+    /// together, and once the last of them has gone the running command has
+    /// its watcher back and the frames stop. (The ♪/♥ are counted in the
+    /// air, in the brain: on glass the console law hides each where it would
+    /// cross ink or the caret's ring, as it does every mote.) NEGATIVE
+    /// CONTROL (as run, failing this test): the cheer's term left out of the
+    /// release, the resident keeps every tick and the cheer never plays.
+    #[test]
+    fn a_landing_cheers_over_a_running_command_and_hands_the_cat_back() {
+        let mut s = Scene::new();
+        s.executing();
+        assert!(
+            !s.pet.needs_frames(),
+            "fixture: the running command's resident is parked"
+        );
+        s.pet.note_room_landed();
+        let mut frames = Vec::new();
+        let mut aloft = 0;
+        for _ in 0..(5.0 / 0.016) as usize {
+            frames.push(s.frame(0.016));
+            aloft = aloft.max(s.pet.cheer_motes_aloft());
+        }
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the landing frolics over the running command");
+        assert!(
+            frames[..frolic].iter().any(|f| f.action == PetAction::Perk),
+            "perked first"
+        );
+        assert_eq!(aloft, 3, "its three ♪/♥ in the air together");
+        assert!(s.pet.pending_cheer.is_none() && !s.pet.room_cheer, "spent");
+        assert!(
+            s.pet.console.resident,
+            "the running command has its watcher back"
+        );
+        assert_eq!(s.pet.console_attention(), PetAttention::Output);
+        for _ in 0..240 {
+            s.frame(0.016);
+            if !s.pet.needs_frames() {
+                break;
+            }
+        }
+        assert!(!s.pet.needs_frames(), "and the frames stop");
+    }
+
+    /// An agent's pane as Claude Code 2.1.304 leaves it at a task's end
+    /// (read off a lab instance, `aterm ctl text`): its banner, the prompt
+    /// on its full-width band, the reply, one blank row between lines, the one-row composer boxed by
+    /// two rules, the mode line, and the terminal's own cursor hidden at the
+    /// composer, all inside one running command. 30 x 100 at 15 x 28 px
+    /// cells, fed the way the host feeds a hidden caret (present, not
+    /// painted), minus the host's chrome over it as the host reserves it
+    /// (`pet_console_exclusions`): the harness card's line on the upper rule
+    /// and the footer's chips on the lower one. The third field is the
+    /// pane's geometry ([`PaneGeom`]): the lab's 100 columns at 2x, or a
+    /// narrower pane ([`AgentPane::narrow`]).
+    struct AgentPane(Scene, Option<PetRect>, PaneGeom);
+
+    /// An agent pane's width and cell metrics (30 rows), and the host's
+    /// chrome over its composer's rules: the harness card's line on the
+    /// upper rule (its last 38 columns) and the footer's chips on the lower.
+    #[derive(Clone, Copy, Debug)]
+    struct PaneGeom {
+        cols: u16,
+        cell: (u16, u16),
+    }
+
+    impl PaneGeom {
+        /// The lab's pane: 100 x 30 at 2x (15 x 28 px cells).
+        const WIDE: Self = Self {
+            cols: 100,
+            cell: (15, 28),
+        };
+
+        fn chrome(self) -> [PetRect; 2] {
+            let card = f32::from(self.cols.min(38));
+            [
+                PetRect::new(12.0, f32::from(self.cols) - card, 1.0, card),
+                PetRect::new(14.0, 0.0, 1.0, 16.0),
+            ]
+        }
+    }
+
+    impl AgentPane {
+        fn new() -> Self {
+            Self::new_warm(200)
+        }
+
+        fn new_warm(warm: usize) -> Self {
+            Self::with_transcript(
+                "\x1b[2J\x1b[1;1H \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259b}\u{2588}   \
+                 Claude Code v2.1.304\r\n\u{259d}\u{259c}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\
+                 \u{2588}\u{2580}  Opus 5.5 \u{b7} API Usage Billing\r\n \u{259d}\u{259d}   \
+                 \u{259d}\u{259d}   /private/tmp/proj\r\n\r\n\r\n\x1b[48;2;55;55;55m\u{276f} finish the parser\
+                 \x1b[K\x1b[0m\r\n\r\n\
+                 \u{23fa} Committed and pushed the parser and its tests.\r\n  ATERM-TASK-DONE\r\n\r\n\
+                 \u{273b} Churned for 40s \u{b7} done 3:01 AM\r\n\r\n",
+                warm,
+            )
+        }
+
+        /// The pane with `transcript` (its twelve rows over the composer)
+        /// drawn first, then the composer's rules, prompt and footer on rows
+        /// 12 to 15, the rows under them blank.
+        fn with_transcript(transcript: &str, warm: usize) -> Self {
+            Self::with_geom(transcript, warm, PaneGeom::WIDE)
+        }
+
+        /// A narrow agent pane, `cols` wide at `cell` px cells, as the lab
+        /// leaves Claude Code 2.1.304 at 44 columns when Land lands (read off
+        /// a lab instance, `aterm ctl text`): the tail of the first turn, the
+        /// harness's prompt on its band, the clean defense wrapped onto two
+        /// rows, and the done line beside open ground, over the composer.
+        fn narrow(cols: u16, cell: (u16, u16)) -> Self {
+            Self::with_geom(
+                "\x1b[2J\x1b[1;1H  pushed to origin/main.\r\n\r\n\
+                 \u{273b} Baked for 40s \u{b7} done 1:39 PM\r\n\r\n\
+                 \x1b[48;2;55;55;55m\u{276f} [aterm harness] Autopilot is Land: land\x1b[K\r\n\
+                 \x20 remote main, defend that in a few lines\x1b[K\x1b[0m\r\n\r\n\
+                 \u{23fa} Nothing left: the work is committed and\r\n\
+                 \x20 pushed to origin/main.\r\n\r\n\
+                 \u{273b} Cooked for 40s \u{b7} done 1:41 PM\r\n\r\n",
+                200,
+                PaneGeom { cols, cell },
+            )
+        }
+
+        fn with_geom(transcript: &str, warm: usize, geom: PaneGeom) -> Self {
+            let mut term = Terminal::new(30, geom.cols);
+            term.process(b"\x1b]11;#000000\x07");
+            term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07claude\r\n\x1b]133;C\x07");
+            term.process(transcript.as_bytes());
+            let rule = "\u{2500}".repeat(usize::from(geom.cols));
+            term.process(
+                format!(
+                    "{rule}\u{276f} \r\n{rule}  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\
+                     \x1b[?25l\x1b[14;3H"
+                )
+                .as_bytes(),
+            );
+            let now = Instant::now();
+            let pet = PetBrain {
+                col: 6.0,
+                row: 10.0,
+                alpha: 1.0,
+                action: PetAction::Sit,
+                quiet: 2.0,
+                last_caret: Some((13, 2)),
+                last_now: Some(now),
+                ..PetBrain::default()
+            };
+            let mut pane = Self(Scene { term, pet, now }, None, geom);
+            for _ in 0..warm {
+                pane.frame();
+            }
+            pane
+        }
+
+        /// Frames until the cat parks (no frame owed); whether it did within
+        /// `secs`.
+        fn parks_within(&mut self, secs: f32) -> bool {
+            for _ in 0..(secs / 0.016) as usize {
+                self.frame();
+                if !self.0.pet.needs_frames() {
+                    return true;
+                }
+            }
+            false
+        }
+
+        /// The pane as the host observes it, its chrome reserved, with no
+        /// tick.
+        fn observe(&mut self) {
+            let (extra, geom) = (self.1, self.2);
+            let s = &mut self.0;
+            let input = s.term.cell_frame(30, usize::from(geom.cols));
+            let facts = PetWorldFacts::read(&s.term, 17);
+            let [card, chips] = geom.chrome();
+            let chrome = [card, chips, extra.unwrap_or_default()];
+            let n = if extra.is_some() { 3 } else { 2 };
+            s.pet.observe_console_with_exclusions(
+                &input,
+                &facts,
+                PetPane::full(&input),
+                &chrome[..n],
+            );
+            s.pet.set_console_presentable(true);
+        }
+
+        fn frame(&mut self) -> PetFrame {
+            self.0.now += Duration::from_millis(16);
+            self.observe();
+            let geom = self.2;
+            let s = &mut self.0;
+            let c = s.term.cursor();
+            s.pet.tick(PetSense {
+                caret_drawn: s.term.cursor_visible(),
+                now: s.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows: 30,
+                cols: geom.cols,
+                cell_w: geom.cell.0,
+                cell_h: geom.cell.1,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+            })
+        }
+    }
+
+    /// A LANDING IN AN AGENT'S PANE CHEERS ON OPEN GROUND (§11.3): the
+    /// transcript's single blank rows are too little air for a ♪, and the
+    /// console law hides every mote that would cross ink or the caret's ring
+    /// (`finish_console_frame`), so the cat hops once to ground where its
+    /// body and the air above it are clear (`PetBrain::cheer_stage`), perks,
+    /// frolics with all three ♪/♥ on glass, and stays while they rise; then
+    /// it goes home on glass, as it came, and parks: a home it may stand on
+    /// is no reason to leave the glass.
+    /// NEGATIVE CONTROLS (as run, each failing this test): no stage (the
+    /// cheer played where the cat stands), not one ♪/♥ reaches the glass; a
+    /// spent cheer that leaves the glass whatever its home
+    /// (`room_cheer_leaving` always set), the cat fades out on its stage.
+    #[test]
+    fn a_landing_in_an_agents_pane_cheers_on_open_ground_with_its_notes_on_glass() {
+        let mut p = AgentPane::new();
+        assert!(p.parks_within(10.0), "fixture: the cat parks");
+        p.0.pet.note_room_landed();
+        let mut frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the landing frolics in the agent's pane");
+        assert!(
+            frames[..frolic].iter().any(|f| f.action == PetAction::Perk),
+            "perked first"
+        );
+        assert_eq!(
+            frames[frolic..]
+                .iter()
+                .map(|f| f.motes.iter().flatten().count())
+                .max(),
+            Some(3),
+            "its three ♪/♥ on glass together"
+        );
+        let stage = (frames[frolic].col, frames[frolic].row);
+        assert_ne!(
+            stage,
+            (frames[0].col, frames[0].row),
+            "it went to open ground"
+        );
+        assert!(
+            frames[frolic..]
+                .iter()
+                .take_while(|f| f.motes.iter().flatten().count() > 0)
+                .all(|f| f.action != PetAction::Leap),
+            "the cat stays on its stage while they rise"
+        );
+        for _ in 0..(10.0 / 0.016) as usize {
+            frames.push(p.frame());
+            if !p.0.pet.needs_frames() {
+                break;
+            }
+        }
+        assert!(!p.0.pet.needs_frames(), "then it parks");
+        assert!(
+            !p.0.pet.room_cheer && p.0.pet.pending_cheer.is_none(),
+            "spent"
+        );
+        assert_ne!(
+            (p.0.pet.col, p.0.pet.row),
+            stage,
+            "and the cat has gone home"
+        );
+        let faded = frames[frolic..]
+            .iter()
+            .filter(|f| f.alpha < 255)
+            .map(|f| (f.action, f.col, f.row, f.alpha))
+            .collect::<Vec<_>>();
+        assert!(
+            faded.is_empty() && p.0.pet.console.on_glass,
+            "on glass all the way home: a home it may stand on is no reason to \
+             leave: {faded:?}"
+        );
+    }
+
+    /// A CAT ASLEEP ON THE TRANSCRIPT WAKES INTO THE CHEER, NOT INTO AN
+    /// EVICTION (§11.3): where the landing finds the cat (asleep under the
+    /// agent's last line, its feet on the composer's upper rule, which the
+    /// host reserves whole at a task's end, as a lab found it), the eviction
+    /// would hop it off with its pose handed back on landing, and in an
+    /// agent's pane, where the escort's stand is never clear, hop it again on
+    /// every landing. A landing's cheer is never evicted: the cat wakes,
+    /// goes once to its stage, and cheers there with its three ♪/♥ on
+    /// glass. It wakes without the stretch (2026-10-20): its body there lies
+    /// over the done line's `✻`, and the stretch drawn there showed its ears
+    /// through the foot of that word in the owner's captures
+    /// ([`a_sleeper_stretches_only_on_blank_ground`]). Spent, it goes home on
+    /// glass, to the clean ground beside its caret it can walk to
+    /// (`console_station`'s rest seat: the escort's stand is under the
+    /// reserved rule), and parks. NEGATIVE CONTROLS (as run, each failing
+    /// this test): the cheer evicted like any pose, the cat hops and never
+    /// frolics; the stage's path swept from a body already over the reserved
+    /// rule, no stage is ever clear and the ♪/♥ rise into the words, where
+    /// none is drawn; the rest seat chosen with no reach (`rest_reach_from`
+    /// answering `None`), the spent cat chases a seat beyond the composer's
+    /// rules and never parks.
+    #[test]
+    fn a_cat_asleep_on_the_transcript_wakes_into_the_cheer_not_an_eviction() {
+        let mut p = AgentPane::new();
+        // The upper rule reserved whole, as the host reserved it at a task's
+        // end in a lab instance (its map read cell by cell at the landing),
+        // and the sleeper where that lab found it: its feet, rounded to the
+        // pixel, on that rule.
+        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+        p.0.pet.col = 0.371;
+        p.0.pet.row = 10.995;
+        p.0.pet.set_action(PetAction::Sleep);
+        p.0.pet.note_room_landed();
+        let frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
+        let woke = frames
+            .iter()
+            .position(|f| f.action != PetAction::Sleep)
+            .expect("it wakes");
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("and frolics");
+        assert!(woke < frolic);
+        assert_eq!(
+            frames[frolic..]
+                .iter()
+                .map(|f| f.motes.iter().flatten().count())
+                .max(),
+            Some(3),
+            "its three ♪/♥ on glass together"
+        );
+        p.assert_home_on_clean_ground("the sleeper's cheer", None);
+    }
+
+    /// A SUCCESS STRETCHES ONLY ON BLANK GROUND (the console's result,
+    /// 2026-10-20): a command that ends well earns a stretch where the cat
+    /// is, held for [`RESULT_HOLD`]; where a line of output runs through its
+    /// body that stretch would be drawn under the words, ears through them,
+    /// so there it keeps its own pose through the hold, the result still
+    /// answered; on blank ground it stretches, in front, as before. Under
+    /// the words only the stretch is withheld: the cat stays where it lies,
+    /// on glass, drawn behind the words in its own pose, as ordinary ink's
+    /// residency let it lie there before the success, and nothing else
+    /// marks the success. NEGATIVE CONTROLS (as run, each failing this
+    /// test): `console_stretch_on_blank` answering `true`, the stretch is
+    /// drawn under the output's words; the `Result` arm always stretching,
+    /// the same; the ink's z-order not held (`ZHold::update` answering
+    /// `false`), the cat is drawn over the words.
+    #[test]
+    fn a_success_stretches_only_on_blank_ground() {
+        for under_a_word in [true, false] {
+            let why = if under_a_word {
+                "under a word"
+            } else {
+                "on blank ground"
+            };
+            let mut s = Scene::new();
+            for _ in 0..30 {
+                s.frame(0.016);
+            }
+            let (col, row) = (s.pet.col, s.pet.row);
+            if under_a_word {
+                // A line of output across the cat's body, its caret back home.
+                s.term.process(
+                    format!(
+                        "\x1b[{};{}Hall 42 tests passed in 31.9s\x1b[6;17H",
+                        row as usize + 1,
+                        col.floor() as usize
+                    )
+                    .as_bytes(),
+                );
+            }
+            s.pet
+                .note_command_done(s.now, false, Some(CHEER_BIG_MS + 1_000));
+            let first = s.frame(0.016);
+            assert_eq!(
+                s.pet.console_reason(),
+                "command-exit-success",
+                "{why}: the result is answered"
+            );
+            let mut frames = vec![first];
+            frames.extend(s.watch(RESULT_HOLD + 0.5));
+            let world = s.pet.console_world().expect("observed");
+            let stretches: Vec<_> = frames
+                .iter()
+                .filter(|f| {
+                    f.alpha > 0
+                        && matches!(f.pose, PetGlyphId::PetStretch | PetGlyphId::PetStretchHind)
+                })
+                .map(|f| {
+                    let (x0, x1, y0, y1) = f.body_px(10, 20, 80, 20).expect("on glass");
+                    let rect = PetRect::new(
+                        y0 as f32 / 20.0,
+                        x0 as f32 / 10.0,
+                        (y1 - y0) as f32 / 20.0,
+                        (x1 - x0) as f32 / 10.0,
+                    );
+                    world.ink_clearance(rect, 0.0)
+                })
+                .collect();
+            if under_a_word {
+                assert!(
+                    stretches.is_empty(),
+                    "{why}: no stretch drawn under the words: {stretches:?}"
+                );
+                let held: Vec<_> = frames
+                    .iter()
+                    .take_while(|f| f.action != PetAction::Leap)
+                    .take((RESULT_HOLD / 0.016) as usize)
+                    .map(|f| {
+                        let (x0, x1, y0, y1) = f.body_px(10, 20, 80, 20).expect("on glass");
+                        let rect = PetRect::new(
+                            y0 as f32 / 20.0,
+                            x0 as f32 / 10.0,
+                            (y1 - y0) as f32 / 20.0,
+                            (x1 - x0) as f32 / 10.0,
+                        );
+                        (f.alpha, f.under_ink, world.ink_clearance(rect, 0.0), f.pose)
+                    })
+                    .collect();
+                assert!(
+                    held.len() >= (RESULT_HOLD / 0.016) as usize - 1
+                        && held.iter().all(|&(alpha, under, ink, _)| {
+                            alpha > 0 && under && ink == Some(false)
+                        }),
+                    "{why}: through the hold the cat stays where it lies, on glass, drawn \
+                     behind the words: {held:?}"
+                );
+            } else {
+                assert!(
+                    !stretches.is_empty() && stretches.iter().all(|&c| c == Some(true)),
+                    "{why}: the stretch plays, in front of blank ground: {stretches:?}"
+                );
+            }
+        }
+    }
+
+    /// EVERY WAKE STRETCHES ONLY ON BLANK GROUND (2026-10-20): the landing's
+    /// and the success's stretches are not the only ones. A key wakes a
+    /// sleeper wherever it lies, and a shell's ordinary ink lets a sleeper lie
+    /// under a line of output (drawn behind the glyphs); a trick asks for a
+    /// stretch too. Each is the brain's `Waking`, and its look draws the
+    /// stretch, which there would be drawn under the words. Where the
+    /// stretched body would cover any ink the cat wakes in place sitting up
+    /// instead (`PetBrain::console_stretch_on_blank`, read by the look); on
+    /// blank ground it stretches as before. NEGATIVE CONTROL (as run, failing
+    /// this test): the look's guard removed, the key's wake is drawn as a
+    /// stretch under the output's words.
+    #[test]
+    fn a_key_wakes_a_sleeper_under_a_word_without_the_stretch() {
+        for under_a_word in [true, false] {
+            let why = if under_a_word {
+                "under a word"
+            } else {
+                "on blank ground"
+            };
+            let mut s = Scene::new();
+            for _ in 0..30 {
+                s.frame(0.016);
+            }
+            let (col, row) = (s.pet.col, s.pet.row);
+            if under_a_word {
+                // A line of output across the cat's body, its caret back home.
+                s.term.process(
+                    format!(
+                        "\x1b[{};{}Hall 42 tests passed in 31.9s\x1b[6;17H",
+                        row as usize + 1,
+                        col.floor() as usize
+                    )
+                    .as_bytes(),
+                );
+            }
+            // The output read and settled, then asleep where it stands.
+            s.watch(3.0);
+            s.pet.set_action(PetAction::Sleep);
+            s.pet.quiet = 30.0;
+            let asleep = s.watch(0.064).pop().expect("a frame");
+            assert_eq!(asleep.action, PetAction::Sleep, "{why}: fixture: asleep");
+            let (x0, x1, y0, y1) = asleep.body_px(10, 20, 80, 20).expect("on glass");
+            let sleeper = PetRect::new(
+                y0 as f32 / 20.0,
+                x0 as f32 / 10.0,
+                (y1 - y0) as f32 / 20.0,
+                (x1 - x0) as f32 / 10.0,
+            );
+            assert_eq!(
+                s.pet
+                    .console_world()
+                    .expect("observed")
+                    .ink_clearance(sleeper, 0.0),
+                Some(!under_a_word),
+                "{why}: fixture: the sleeper's body and the words"
+            );
+            s.input(PetInputKind::Text);
+            let frames = s.watch(1.5);
+            assert!(
+                frames.iter().any(|f| f.action == PetAction::Waking),
+                "{why}: the key wakes it"
+            );
+            let world = s.pet.console_world().expect("observed");
+            let stretches: Vec<_> = frames
+                .iter()
+                .filter(|f| {
+                    f.alpha > 0
+                        && matches!(f.pose, PetGlyphId::PetStretch | PetGlyphId::PetStretchHind)
+                })
+                .map(|f| {
+                    let (x0, x1, y0, y1) = f.body_px(10, 20, 80, 20).expect("on glass");
+                    let rect = PetRect::new(
+                        y0 as f32 / 20.0,
+                        x0 as f32 / 10.0,
+                        (y1 - y0) as f32 / 20.0,
+                        (x1 - x0) as f32 / 10.0,
+                    );
+                    world.ink_clearance(rect, 0.0)
+                })
+                .collect();
+            if under_a_word {
+                assert!(
+                    stretches.is_empty(),
+                    "{why}: no stretch drawn under the words: {stretches:?}"
+                );
+            } else {
+                assert!(
+                    !stretches.is_empty() && stretches.iter().all(|&c| c == Some(true)),
+                    "{why}: the stretch plays, in front of blank ground: {stretches:?}"
+                );
+            }
+        }
+    }
+
+    /// A SLEEPER'S FALL STRETCHES ONLY ON BLANK GROUND (2026-10-20): a line
+    /// typed beside a sleeping cat that wraps under it takes the row it lay
+    /// on, and the cat falls one row (the drop), spending its wake stretch in
+    /// the air, which was drawn over the words that took the row (a lab's
+    /// shell showed it over `echo 'all 42`). The fall is judged at both ends:
+    /// where it falls from (its head under the line above) and where it
+    /// lands (its feet on the row the caret opened). Over ink at either end
+    /// it stays asleep through that beat, then descends; where both are
+    /// blank (spaces) the fall still stretches. Four floors: the typed words
+    /// (ink at both ends), a blank line (none), a line of output over its
+    /// head with a blank line under it (ink where it falls from only), and a
+    /// painted band under it (ink where it lands only: a band is no glyph,
+    /// so it never refuses the drop). NEGATIVE CONTROLS (as run, each
+    /// failing this test): the fall's guard removed, the stretch is drawn
+    /// over the typed words; only the start judged, the stretch is drawn
+    /// over the band; only the end judged, it is drawn under the output.
+    #[test]
+    fn a_sleepers_fall_stretches_only_on_blank_ground() {
+        // Each floor: what is written on the row over the sleeper's head and
+        // on the row under its feet before it sleeps, whether words are
+        // typed (else spaces), and whether the ground is blank where it
+        // falls from and where it lands. The fall may stretch only where
+        // both are.
+        let words = |n: usize| -> String {
+            "echo 'all 42 tests passed in 31.9s; the parser and its tests are pushed' "
+                .chars()
+                .cycle()
+                .take(n)
+                .collect()
+        };
+        let floors: [(&str, &str, &str, bool, [bool; 2]); 4] = [
+            ("over the typed words", "", "", true, [false, false]),
+            ("over a blank line", "", "", false, [true, true]),
+            (
+                "from under a line of output onto a blank line",
+                "test result: ok. 271 passed; 0 failed; 0 ignored; 0 measured; 1776 filtered out",
+                "",
+                false,
+                [false, true],
+            ),
+            (
+                "from blank ground onto a painted band",
+                "",
+                "\x1b[48;2;55;55;55m\x1b[K\x1b[0m",
+                false,
+                [true, false],
+            ),
+        ];
+        for (why, above, below, typed_words, blank) in floors {
+            let mut s = Scene::new();
+            for _ in 0..30 {
+                s.frame(0.016);
+            }
+            // The rows over the sleeper's head and under its feet, the caret
+            // back home (row 5, column 16).
+            s.term
+                .process(format!("\x1b[5;1H{above}\x1b[7;1H{below}\x1b[6;17H").as_bytes());
+            s.watch(3.0);
+            s.pet.set_action(PetAction::Sleep);
+            s.pet.quiet = 30.0;
+            let asleep = s.watch(0.064).pop().expect("a frame");
+            assert_eq!(asleep.action, PetAction::Sleep, "{why}: fixture: asleep");
+            assert_eq!(s.pet.row, 5.0, "{why}: fixture: asleep on the caret's row");
+            // From the caret to the row's end and three cells on: the caret
+            // wraps one row down, under the sleeper's row.
+            let wrap = 80 - usize::from(s.term.cursor().col) + 3;
+            let line = if typed_words {
+                words(wrap)
+            } else {
+                " ".repeat(wrap)
+            };
+            s.term.process(line.as_bytes());
+            let mut fell = None;
+            let mut frames = Vec::new();
+            for _ in 0..(1.0 / 0.016) as usize {
+                frames.push(s.frame(0.016));
+                fell = fell.or(s.pet.flight.filter(|f| f.drop));
+            }
+            let fell = fell.unwrap_or_else(|| panic!("{why}: fixture: the sleeper falls one row"));
+            // The two ends as the guard judges them, for the fixture.
+            let ends = [
+                s.pet
+                    .console_stretch_on_blank_at((fell.from_col, fell.from_row)),
+                s.pet
+                    .console_stretch_on_blank_at((fell.to_col, fell.to_row)),
+            ];
+            assert_eq!(ends, blank, "{why}: fixture: blank ground at (from, to)");
+            let world = s.pet.console_world().expect("observed");
+            let stretches: Vec<_> = frames
+                .iter()
+                .filter(|f| {
+                    f.alpha > 0
+                        && matches!(f.pose, PetGlyphId::PetStretch | PetGlyphId::PetStretchHind)
+                })
+                .map(|f| {
+                    let (x0, x1, y0, y1) = f.body_px(10, 20, 80, 20).expect("on glass");
+                    let rect = PetRect::new(
+                        y0 as f32 / 20.0,
+                        x0 as f32 / 10.0,
+                        (y1 - y0) as f32 / 20.0,
+                        (x1 - x0) as f32 / 10.0,
+                    );
+                    world.ink_clearance(rect, 0.0)
+                })
+                .collect();
+            if blank == [true, true] {
+                assert!(
+                    !stretches.is_empty() && stretches.iter().all(|&c| c == Some(true)),
+                    "{why}: the fall stretches, in front of blank ground: {stretches:?}"
+                );
+            } else {
+                assert!(
+                    stretches.is_empty(),
+                    "{why}: no stretch drawn in the fall: {stretches:?}"
+                );
+            }
+        }
+    }
+
+    impl AgentPane {
+        /// Every frame that draws the stretch (`PetStretch`,
+        /// `PetStretchHind`) over a cell of the map that is not blank
+        /// ground: `(frame, cells)` for each.
+        fn stretches_over_ink(&self, frames: &[PetFrame]) -> Vec<(usize, Vec<(i32, i32)>)> {
+            let world = self.0.pet.console_world().expect("observed");
+            let PaneGeom {
+                cols,
+                cell: (cw, ch),
+            } = self.2;
+            let (cw, ch) = (i32::from(cw), i32::from(ch));
+            frames
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    f.alpha > 0
+                        && matches!(f.pose, PetGlyphId::PetStretch | PetGlyphId::PetStretchHind)
+                })
+                .filter_map(|(k, f)| {
+                    let (x0, x1, y0, y1) = f.body_px(self.2.cell.0, self.2.cell.1, cols, 30)?;
+                    let under: Vec<_> = (y0.div_euclid(ch)..(y1 + ch - 1).div_euclid(ch))
+                        .flat_map(|r| {
+                            (x0.div_euclid(cw)..(x1 + cw - 1).div_euclid(cw)).map(move |c| (r, c))
+                        })
+                        .filter(|&(r, c)| {
+                            world.cell(r as usize, c as usize) != crate::pet_world::PetCell::Clear
+                        })
+                        .collect();
+                    (!under.is_empty()).then_some((k, under))
+                })
+                .collect()
+        }
+    }
+
+    /// A SLEEPER STRETCHES ONLY ON BLANK GROUND (2026-10-20): the owner's
+    /// captures of a landing in front showed the stretch drawn over the foot
+    /// of the done line's first word — the console law had stepped the
+    /// sleeper off the composer's reserved rule onto ground behind the text,
+    /// and the cheer's wake stretched there, under the glyphs. Where the
+    /// stretch would cover any cell that is not blank ground the cat wakes
+    /// without it, straight into its hop to the stage, with no wake beat
+    /// before it (`PetBrain::console_stretch_on_blank`); asleep on blank
+    /// ground it still stretches awake. Either way it frolics with its three
+    /// ♪/♥ on glass. Ground with no glyph on it that the host's chrome is
+    /// drawn over is no blank ground for the stretch either
+    /// (`PetWorld::ink_clearance` counts a protected cell as ink); the
+    /// console law moves a body off such ground on its next frame (an
+    /// eviction, `console_obstructed`), before a landing could wake it
+    /// there, so the guard's own answer is what is asserted. NEGATIVE
+    /// CONTROLS (as run, each failing this test): the stretch played
+    /// wherever the cat lies (`console_stretch_on_blank` answering `true`),
+    /// it is drawn over the done line's `✻` at the lab's spot; the landing's
+    /// guard dropped, a wake beat before the hop (the `Waking` the look
+    /// draws sitting up over the words); the map's ink not counting what
+    /// protects a cell (`others` dropped from `inked` in `PetWorld`), the
+    /// guard answers yes under the host's chrome.
+    #[test]
+    fn a_sleeper_stretches_only_on_blank_ground() {
+        // Asleep where the lab found it at a landing in front: its body over
+        // the done line's `✻`, its feet on the reserved rule.
+        let mut p = AgentPane::new();
+        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+        p.0.pet.col = 0.371;
+        p.0.pet.row = 10.995;
+        p.0.pet.set_action(PetAction::Sleep);
+        p.0.pet.note_room_landed();
+        let frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
+        let over = p.stretches_over_ink(&frames);
+        assert!(
+            over.is_empty(),
+            "no stretch drawn over a word: {over:?} (frames, cells under the body)"
+        );
+        let leap = frames
+            .iter()
+            .position(|f| f.action == PetAction::Leap)
+            .expect("it hops to its stage");
+        assert!(
+            frames[..leap].iter().all(|f| f.action == PetAction::Sleep),
+            "no wake beat before the hop: {:?}",
+            frames[..leap].iter().map(|f| f.action).collect::<Vec<_>>()
+        );
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("it wakes and frolics on its stage");
+        assert_eq!(
+            frames[frolic..]
+                .iter()
+                .map(|f| f.motes.iter().flatten().count())
+                .max(),
+            Some(3),
+            "its three ♪/♥ on glass together"
+        );
+
+        // Asleep at its home, the clean ground beside the transcript's last
+        // line: the stretch plays there, on blank ground.
+        let mut p = AgentPane::new();
+        assert!(p.parks_within(10.0), "fixture: the cat parks at home");
+        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+        p.0.pet.set_action(PetAction::Sleep);
+        p.0.pet.note_room_landed();
+        let frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
+        let stretched = frames
+            .iter()
+            .filter(|f| matches!(f.pose, PetGlyphId::PetStretch | PetGlyphId::PetStretchHind))
+            .count();
+        assert!(stretched > 0, "a sleeper on blank ground stretches awake");
+        let over = p.stretches_over_ink(&frames);
+        assert!(over.is_empty(), "on blank ground: {over:?}");
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Frolic),
+            "and frolics"
+        );
+
+        // Asleep at that home with the host's chrome drawn over the blank
+        // ground under it: no ink there, but protected.
+        let mut p = AgentPane::new();
+        assert!(p.parks_within(10.0), "fixture: the cat parks at home");
+        p.0.pet.set_action(PetAction::Sleep);
+        p.frame();
+        assert!(
+            p.0.pet.console_stretch_on_blank(),
+            "fixture: asleep on blank ground"
+        );
+        let body = p.0.pet.console_body(PetSense {
+            caret_drawn: false,
+            now: p.0.now,
+            caret: None,
+            wrapped: false,
+            rows: 30,
+            cols: 100,
+            cell_w: 15,
+            cell_h: 28,
+            reduced_motion: false,
+            output_burst: false,
+            pointer: None,
+        });
+        p.1 = Some(body);
+        p.observe();
+        let world = p.0.pet.console_world().expect("observed");
+        assert_eq!(
+            world.under_text_clearance_past_caret(body, 0.0),
+            Some(false),
+            "fixture: the host's chrome over the sleeper"
+        );
+        assert!(
+            !p.0.pet.console_stretch_on_blank(),
+            "under the host's chrome: no blank ground for the stretch"
+        );
+    }
+
+    impl AgentPane {
+        /// The pane as a re-sighting leaves it at a task's end: the upper
+        /// rule reserved whole, and the cat at its home (`console_station`'s
+        /// rest seat: clean ground beside the caret, the escort's stand
+        /// being under that rule) but off glass, as a switch onto the landed
+        /// tab or a window's focus finds it, a fresh sighting not yet faded
+        /// in. Its home, `(col, row)`, is the second half.
+        fn at_first_look(asleep: bool) -> (Self, (f32, f32)) {
+            let mut p = Self::new();
+            p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+            assert!(p.parks_within(10.0), "fixture: the cat parks at home");
+            assert!(
+                p.0.pet.console.on_glass,
+                "fixture: its home is clean ground it may stand on: {}",
+                p.0.pet.console.reason
+            );
+            let home = (p.0.pet.col, p.0.pet.row);
+            p.0.pet.alpha = 0.0;
+            p.0.pet.console.on_glass = false;
+            p.0.pet.set_action(if asleep {
+                PetAction::Sleep
+            } else {
+                PetAction::Sit
+            });
+            (p, home)
+        }
+
+        /// After a cheer: the cat parks within ten seconds on glass, at its
+        /// home (`home`, where given) on clean ground — no glyph, rule or
+        /// chrome under its body — owing nothing.
+        fn assert_home_on_clean_ground(&mut self, why: &str, home: Option<(f32, f32)>) {
+            assert!(
+                self.parks_within(10.0),
+                "{why}: the cat parks after the cheer, not a hop in place: \
+                 {:?} at {:.2},{:.2}",
+                self.0.pet.action,
+                self.0.pet.col,
+                self.0.pet.row
+            );
+            let f = self.frame();
+            assert!(
+                self.0.pet.console.on_glass && f.alpha > 0,
+                "{why}: home on glass ({})",
+                self.0.pet.console.reason
+            );
+            let PaneGeom {
+                cols,
+                cell: (cw, ch),
+            } = self.2;
+            let (x0, x1, y0, y1) = f.body_px(cw, ch, cols, 30).expect("on glass");
+            let world = self.0.pet.console_world().expect("observed");
+            let (cw, ch) = (i32::from(cw), i32::from(ch));
+            let under: Vec<_> = (y0.div_euclid(ch)..(y1 + ch - 1).div_euclid(ch))
+                .flat_map(|r| {
+                    (x0.div_euclid(cw)..(x1 + cw - 1).div_euclid(cw)).map(move |c| (r, c))
+                })
+                .filter(|&(r, c)| {
+                    world.cell(r as usize, c as usize) != crate::pet_world::PetCell::Clear
+                })
+                .collect();
+            assert!(
+                under.is_empty(),
+                "{why}: nothing under the cat at home ({:.2}, {:.2}): {under:?}",
+                self.0.pet.col,
+                self.0.pet.row
+            );
+            if let Some((col, row)) = home {
+                assert!(
+                    (self.0.pet.col - col).abs() < 0.5 && (self.0.pet.row - row).abs() < 0.5,
+                    "{why}: back at its home ({col:.2}, {row:.2}): {:.2},{:.2}",
+                    self.0.pet.col,
+                    self.0.pet.row
+                );
+            }
+            assert!(
+                !self.0.pet.room_cheer && self.0.pet.pending_cheer.is_none(),
+                "{why}: spent"
+            );
+        }
+    }
+
+    /// A LANDING SEEN AT FIRST LOOK (§11.3: a switch onto the landed tab, a
+    /// window's focus): the cat is off glass at its home, clean ground beside
+    /// the caret (the escort's stand is under the host's chrome). It has no
+    /// flight anyone could watch. It appears on its stage instead, fading in
+    /// there (a sleeper stretching awake), perks and frolics with its three
+    /// ♪/♥ on glass; spent, it goes home on glass and parks there. Awake and
+    /// asleep. NEGATIVE CONTROL (as run, failing this test): no appearance
+    /// (`appear_on_cheer_stage` answering `false`), the cat is seen flying
+    /// in from its home.
+    #[test]
+    fn a_first_look_appears_on_open_ground_cheers_and_goes_home() {
+        for asleep in [false, true] {
+            let why = if asleep { "asleep" } else { "awake" };
+            let (mut p, home) = AgentPane::at_first_look(asleep);
+            p.0.pet.note_room_landed();
+            let frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
+            let frolic = frames
+                .iter()
+                .position(|f| f.action == PetAction::Frolic)
+                .unwrap_or_else(|| panic!("{why}: the landing frolics"));
+            assert!(
+                frames[..frolic].iter().any(|f| f.action == PetAction::Perk),
+                "{why}: perked first"
+            );
+            assert_eq!(
+                frames[frolic..]
+                    .iter()
+                    .map(|f| f.motes.iter().flatten().count())
+                    .max(),
+                Some(3),
+                "{why}: its three ♪/♥ on glass together"
+            );
+            let stage = (frames[frolic].col, frames[frolic].row);
+            let seen_elsewhere = frames[..frolic]
+                .iter()
+                .filter(|f| f.alpha > 0 && (f.col, f.row) != stage)
+                .map(|f| (f.action, f.col, f.row))
+                .collect::<Vec<_>>();
+            assert!(
+                seen_elsewhere.is_empty(),
+                "{why}: the cat is seen only on its stage {stage:?}, never flying \
+                 in: {seen_elsewhere:?}"
+            );
+            p.assert_home_on_clean_ground(why, Some(home));
+        }
+    }
+
+    impl AgentPane {
+        /// The landing's cheer from where the cat stands: five seconds of
+        /// frames, and the stage's air the brain chose on the way
+        /// (`PetBrain::room_cheer_air`, taken by the frolic).
+        fn landing(&mut self) -> (Vec<PetFrame>, Option<CheerAir>) {
+            self.0.pet.note_room_landed();
+            let mut air = None;
+            let frames = (0..(5.0 / 0.016) as usize)
+                .map(|_| {
+                    let f = self.frame();
+                    air = self.0.pet.room_cheer_air.or(air);
+                    f
+                })
+                .collect();
+            (frames, air)
+        }
+
+        /// The most ♪/♥ a frame of `frames` draws on glass together, and
+        /// how many times two of their drawn tiles meet
+        /// (`crate::kitty_pet::mote_box_px`, the emitter's own placement).
+        fn notes_on_glass(&self, frames: &[PetFrame]) -> (usize, usize) {
+            let PaneGeom { cols, cell } = self.2;
+            let mut most = 0;
+            let mut meets = 0;
+            for f in frames.iter().filter(|f| f.alpha > 0) {
+                let boxes: Vec<_> = f
+                    .motes
+                    .iter()
+                    .flatten()
+                    .filter(|m| {
+                        matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart) && m.alpha > 0
+                    })
+                    .filter_map(|m| {
+                        crate::kitty_pet::mote_box_px((m.col, m.row), m.scale, cell, (cols, 30))
+                    })
+                    .collect();
+                most = most.max(boxes.len());
+                for (i, a) in boxes.iter().enumerate() {
+                    meets += boxes[i + 1..]
+                        .iter()
+                        .filter(|b| {
+                            a.0 < b.0 + i32::from(b.2)
+                                && b.0 < a.0 + i32::from(a.2)
+                                && a.1 < b.1 + i32::from(b.2)
+                                && b.1 < a.1 + i32::from(a.2)
+                        })
+                        .count();
+                }
+            }
+            (most, meets)
+        }
+    }
+
+    /// A LANDING IN A NARROW PANE SHOWS ITS NOTES (§11.3, 2026-10-20): the
+    /// stage kept the lanes' air on both sides of the cat, which no ground
+    /// within reach of a 44-column pane held at 2x or at 1x, so the cat
+    /// cheered where it stood and the console law hid every ♪/♥ against the
+    /// reply's words (a lab's capture at 44 columns: not one on screen,
+    /// where main's three rose bunched beside the done line). The stage now
+    /// keeps the lanes' air on one side, the side the cat faces first, then
+    /// the other ([`CheerAir::Lanes`]); only where neither finds air within
+    /// reach, the compact spray's ([`CheerAir::Compact`]). At 44 columns,
+    /// 2x and 1x, the three rise in their lanes on glass together, no two
+    /// tiles meeting; at 41 columns at 1x, where no lanes' air is within
+    /// reach, they rise in the compact spray, close but on glass. None
+    /// takes more than one flight (`a_stage_is_reached_in_one_flight`).
+    /// NEGATIVE CONTROLS (as run, each failing this test): the lanes' air
+    /// kept on both sides (the `Lanes` arm of `cheer_air` symmetric), at 44
+    /// columns at 1x the compact spray, the lanes' air nowhere within reach;
+    /// that with the compact tier dropped too (the stage as first built),
+    /// not one ♪/♥ on glass there; the compact tier dropped alone, not one
+    /// at 41 columns at 1x.
+    #[test]
+    fn a_landing_in_a_narrow_pane_shows_its_notes() {
+        for (cols, cell, compact) in [
+            (44, (15, 28), false),
+            (44, (7, 14), false),
+            (41, (7, 14), true),
+        ] {
+            let why = format!("{cols} columns at {} x {} px", cell.0, cell.1);
+            let mut p = AgentPane::narrow(cols, cell);
+            assert!(p.parks_within(10.0), "{why}: fixture: the cat parks");
+            let (frames, air) = p.landing();
+            let frolic = frames
+                .iter()
+                .position(|f| f.action == PetAction::Frolic)
+                .unwrap_or_else(|| panic!("{why}: the landing frolics"));
+            let flights = frames[..frolic]
+                .windows(2)
+                .filter(|w| w[1].action == PetAction::Leap && w[0].action != PetAction::Leap)
+                .count();
+            assert!(
+                flights <= 1,
+                "{why}: {flights} flights, not one to its stage"
+            );
+            let (most, meets) = p.notes_on_glass(&frames[frolic..]);
+            assert_eq!(most, 3, "{why}: its three ♪/♥ on glass together");
+            assert_eq!(
+                air.map(|a| a == CheerAir::Compact),
+                Some(compact),
+                "{why}: the stage's air ({air:?})"
+            );
+            if !compact {
+                assert_eq!(meets, 0, "{why}: no two ♪/♥ tiles meet");
+            }
+        }
+    }
+
+    /// A STAGE IS REACHED IN ONE FLIGHT (§11.3, 2026-10-20): a stage is
+    /// judged at the seat as the body will be drawn there (rounded to the
+    /// pixel), so a cat that lands on it finds the ground it was promised
+    /// and cheers. In a 60-column pane at 1x, the composer's upper rule
+    /// reserved, a cat at rest behind the reply's last line hops once to
+    /// ground beside it and frolics with its three ♪/♥ on glass. NEGATIVE
+    /// CONTROL (as run, failing this test): the stage judged at its shifted
+    /// copy (the body where the cat stands, moved), the seat as drawn sits
+    /// half a pixel off it and the cat hops a second time.
+    #[test]
+    fn a_stage_is_reached_in_one_flight() {
+        let mut p = AgentPane::narrow(60, (7, 14));
+        assert!(p.parks_within(10.0), "fixture: the cat parks");
+        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 60.0));
+        (p.0.pet.col, p.0.pet.row) = (20.0, 8.495);
+        let (frames, air) = p.landing();
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the landing frolics");
+        let flights = frames[..frolic]
+            .windows(2)
+            .filter(|w| w[1].action == PetAction::Leap && w[0].action != PetAction::Leap)
+            .count()
+            + usize::from(frames[0].action == PetAction::Leap);
+        assert_eq!(flights, 1, "one flight to its stage ({air:?})");
+        let (most, meets) = p.notes_on_glass(&frames[frolic..]);
+        assert_eq!(most, 3, "its three ♪/♥ on glass together");
+        assert_eq!(meets, 0, "no two ♪/♥ tiles meet");
+    }
+
+    /// A CAT AT THE PANE'S EDGE CHEERS FACING INTO THE PANE (§11.3,
+    /// 2026-10-20): the stage keeps the lanes' air on one side only, so the
+    /// cat faces that side when it perks and when it frolics; its ♪/♥ rise
+    /// the way it faces. A cat on open ground against the pane's right edge,
+    /// facing the edge, has no air there: it turns into the pane, where the
+    /// air is, perks and frolics facing left, and its three ♪/♥ are on glass
+    /// together, no two tiles meeting. NEGATIVE CONTROLS (as run, each
+    /// failing this test): the stage's side not taken (the perk and the
+    /// frolic keep the facing the cat had), it frolics facing the edge; the
+    /// lanes' air kept on both sides, there is none where it stands and it
+    /// hops away.
+    #[test]
+    fn a_cat_at_the_panes_edge_cheers_facing_into_the_pane() {
+        let mut p = AgentPane::narrow(60, (15, 28));
+        assert!(p.parks_within(10.0), "fixture: the cat parks");
+        // Open ground right of the first done line, against the edge.
+        let w = art_cols(15, 28);
+        let edge = 60.0 - w - 0.2;
+        (p.0.pet.col, p.0.pet.row) = (edge, 2.85);
+        p.0.pet.facing_left = false;
+        let (frames, air) = p.landing();
+        assert_eq!(air, Some(CheerAir::Lanes(true)), "the air is to its left");
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the landing frolics");
+        assert!(
+            frames[..=frolic]
+                .iter()
+                .all(|f| f.action != PetAction::Leap && (f.col - edge).abs() < 0.5),
+            "it cheers where it stands, against the edge"
+        );
+        assert!(
+            frames[frolic..]
+                .iter()
+                .take_while(|f| f.action == PetAction::Frolic)
+                .all(|f| f.facing_left),
+            "it frolics facing into the pane"
+        );
+        let (most, meets) = p.notes_on_glass(&frames[frolic..]);
+        assert_eq!(most, 3, "its three ♪/♥ on glass together");
+        assert_eq!(meets, 0, "no two ♪/♥ tiles meet");
+    }
+
+    /// THE HOST RESERVES THE RULE AS THE LANDING COMES DOWN (§11.3): the cat
+    /// was at its caret home on the composer's row (where the escort sat it
+    /// before its rest seat moved to clean ground), and on the frame the end
+    /// lands the composer's upper rule is reserved whole over it. The console
+    /// law steps its first flight aside onto open ground on its first frame,
+    /// the whole arc translated with it, so it comes down off its stage;
+    /// where it lands is judged again, and it flies once more to the stage it
+    /// was bound for, and cheers there with its three ♪/♥ on glass; then it
+    /// goes home on clean ground and parks. The cat is seated there by hand:
+    /// the fixture's home is clean ground now, from which no flight is cut,
+    /// and the test held only by a second hop half a pixel long (a stage
+    /// judged at its shifted copy, not at the seat as drawn; 2026-10-20).
+    /// NEGATIVE CONTROLS (as run, each failing this test): one trip
+    /// (`CHEER_STAGE_TRIPS` 1), it cheers where the cut flight came down,
+    /// after one flight; the re-plan without the stage it was bound for
+    /// (`prefer` ignored), it cheers elsewhere.
+    #[test]
+    fn a_cut_flight_flies_again_to_the_stage_it_was_bound_for() {
+        let mut p = AgentPane::new();
+        assert!(p.parks_within(10.0), "fixture: the cat parks at home");
+        assert!(p.0.pet.console.on_glass, "fixture: on glass");
+        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+        (p.0.pet.col, p.0.pet.row) = (3.0, 13.0);
+        p.0.pet.note_room_landed();
+        let mut bound_for = None;
+        let mut frames = Vec::new();
+        for _ in 0..(5.0 / 0.016) as usize {
+            frames.push(p.frame());
+            bound_for = bound_for.or(p.0.pet.room_cheer_stage);
+        }
+        let to_frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the landing frolics");
+        let flights = frames[..to_frolic]
+            .windows(2)
+            .filter(|w| w[1].action == PetAction::Leap && w[0].action != PetAction::Leap)
+            .count()
+            + usize::from(frames[0].action == PetAction::Leap);
+        assert_eq!(flights, 2, "the first flight was cut, and flown again");
+        let bound_for = bound_for.expect("it set out for a stage");
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the landing frolics");
+        assert_eq!(
+            (frames[frolic].col, frames[frolic].row),
+            bound_for,
+            "it cheers on the stage it was first bound for"
+        );
+        assert_eq!(
+            frames[frolic..]
+                .iter()
+                .map(|f| f.motes.iter().flatten().count())
+                .max(),
+            Some(3),
+            "its three ♪/♥ on glass together"
+        );
+        assert_eq!(
+            p.0.pet.room_cheer_trips, 2,
+            "the first flight was cut, and flown again"
+        );
+        p.assert_home_on_clean_ground("the cut flight's cheer", None);
+    }
+
+    /// A HOME UNDER THE FOOTER CHEERS ON THE GROUND BELOW IT (§11.3): in a
+    /// tall pane the cat at rest on the blank rows just under the composer's
+    /// footer keeps its ground there (`console_station`'s kept seat: the
+    /// ground a cat rests on, clean and within reach of the caret's refused
+    /// stand, is its seat). At a task's end, with the
+    /// composer's upper rule reserved whole, nothing above its home is open
+    /// ground it can reach: the composer's rules and the footer are between.
+    /// The stage search, finding nothing above, looks below, so the cat goes
+    /// once to the open ground under its home, perks and frolics with its
+    /// three ♪/♥ on glass, and goes home on glass and parks. NEGATIVE CONTROL
+    /// (as run, failing this test): the stage searched upward only, no stage
+    /// is found and not one ♪/♥ reaches the glass.
+    #[test]
+    fn a_home_under_the_footer_cheers_on_the_ground_below_it() {
+        let mut p = AgentPane::new_warm(0);
+        p.0.pet.col = 4.0;
+        p.0.pet.row = 17.0;
+        for _ in 0..200 {
+            p.frame();
+        }
+        assert!(p.parks_within(10.0), "fixture: the cat parks at home");
+        let home = (p.0.pet.col, p.0.pet.row);
+        assert!(
+            p.0.pet.console.on_glass && home.1 > 15.0,
+            "fixture: its home is under the footer, on glass: {home:?} ({})",
+            p.0.pet.console.reason
+        );
+        p.1 = Some(PetRect::new(12.0, 0.0, 1.0, 100.0));
+        p.0.pet.note_room_landed();
+        let frames: Vec<PetFrame> = (0..(4.0 / 0.016) as usize).map(|_| p.frame()).collect();
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the landing frolics");
+        assert!(
+            frames[..frolic].iter().any(|f| f.action == PetAction::Perk),
+            "perked first"
+        );
+        assert_eq!(
+            frames[frolic..]
+                .iter()
+                .map(|f| f.motes.iter().flatten().count())
+                .max(),
+            Some(3),
+            "its three ♪/♥ on glass together"
+        );
+        let stage = (frames[frolic].col, frames[frolic].row);
+        assert!(
+            stage.1 > home.1,
+            "its stage is the open ground below its home {home:?}: {stage:?}"
+        );
+        p.assert_home_on_clean_ground("the home under the footer", Some(home));
+    }
+
+    /// A KEY SPENDS A LANDING'S CHEER (§11.3.4): a key in the agent's pane
+    /// before the cheer has played wipes it, the console law for every
+    /// verdict latch, and takes the cat for the typing; nothing plays, then or
+    /// after, and the running command has its watcher back. NEGATIVE CONTROL
+    /// (as run, failing this test): a key that leaves the landing owed (the
+    /// fresh key's and the live key's wipes of the latch left out), the cheer
+    /// plays after the typing.
+    #[test]
+    fn a_key_before_a_landings_cheer_spends_it_unplayed() {
+        let mut s = Scene::new();
+        s.executing();
+        s.pet.note_room_landed();
+        s.input(PetInputKind::Text);
+        s.term.process(b"x");
+        let mut frames = Vec::new();
+        let mut aloft = 0;
+        for _ in 0..(4.0 / 0.016) as usize {
+            frames.push(s.frame(0.016));
+            aloft = aloft.max(s.pet.cheer_motes_aloft());
+        }
+        assert!(
+            frames.iter().all(|f| f.action != PetAction::Frolic) && aloft == 0,
+            "nothing plays"
+        );
+        assert!(
+            s.pet.pending_cheer.is_none() && !s.pet.room_cheer,
+            "spent, not owed"
+        );
+        assert!(
+            s.pet.console.resident,
+            "the running command has its watcher back"
+        );
+    }
+
     /// A held selection drops the latch: nothing plays over a selection, and
     /// nothing replays when it is released.
     #[test]
@@ -4084,6 +6163,993 @@ mod tests {
             "kitty inside walled TUI box should step past the words into the interior blank space (col >= 15), got col {} row {}",
             last.col,
             last.row
+        );
+    }
+
+    /// A full-screen program's console as the host shows it to the pet: a
+    /// terminal of any size, the host's chrome (`aterm-gui`'s `pet_chrome`)
+    /// as exclusions, the program's own cursor hidden or not, ticked at 60 fps
+    /// from a pet that has never been on glass.
+    struct Console {
+        term: Terminal,
+        pet: PetBrain,
+        now: Instant,
+        rows: u16,
+        cols: u16,
+        chrome: Vec<PetRect>,
+        /// The host's transient overlays (the Autopilot menu's card).
+        overlays: Vec<PetRect>,
+        /// Whether the host's ink probe is fed before each tick
+        /// ([`PetBrain::sense_ink`], every row's inked span and the newest
+        /// inked row, as `WordDecorations::pet_ink` reads them), and whether
+        /// the program's output is a burst ([`PetSense::output_burst`]).
+        ink: bool,
+        burst: bool,
+    }
+
+    impl Console {
+        fn new(rows: u16, cols: u16, screen: &str, chrome: Vec<PetRect>) -> Self {
+            let mut term = Terminal::new(rows, cols);
+            term.process(b"\x1b]11;#000000\x07");
+            term.process(screen.as_bytes());
+            Self {
+                term,
+                pet: PetBrain::default(),
+                now: Instant::now(),
+                rows,
+                cols,
+                chrome,
+                overlays: Vec::new(),
+                ink: false,
+                burst: false,
+            }
+        }
+
+        /// An agent's console: `screen` drawn by a program the shell runs
+        /// (an executing OSC 133 block, as Claude Code is), so the resident
+        /// watches its output.
+        fn agent(rows: u16, cols: u16, screen: &str, chrome: Vec<PetRect>) -> Self {
+            Self::new(
+                rows,
+                cols,
+                &format!("\x1b]133;A\x07$ \x1b]133;B\x07claude\r\n\x1b]133;C\x07\x1b[2J{screen}"),
+                chrome,
+            )
+        }
+
+        /// The program repaints its whole screen.
+        fn repaint(&mut self, screen: &str, chrome: Vec<PetRect>) {
+            self.term.process(b"\x1b[2J");
+            self.term.process(screen.as_bytes());
+            self.chrome = chrome;
+        }
+
+        /// Frames for `secs`: the leaps among them, and when the pet first
+        /// owed no frame (parked), in seconds.
+        fn watch(&mut self, secs: f32) -> (usize, Option<f32>, PetFrame) {
+            let (mut leaps, mut parked) = (0, None);
+            let mut last = self.frame();
+            for i in 1..(secs * 60.0) as usize {
+                last = self.frame();
+                if last.action == PetAction::Leap {
+                    leaps += 1;
+                }
+                if parked.is_none() && !self.pet.needs_frames() {
+                    parked = Some(i as f32 / 60.0);
+                }
+            }
+            (leaps, parked, last)
+        }
+
+        fn frame(&mut self) -> PetFrame {
+            self.now += Duration::from_secs_f32(1.0 / 60.0);
+            let input = self
+                .term
+                .cell_frame(usize::from(self.rows), usize::from(self.cols));
+            let facts = PetWorldFacts::read(&self.term, 17);
+            self.pet.observe_console_with_overlays(
+                &input,
+                &facts,
+                PetPane::full(&input),
+                &self.chrome,
+                &self.overlays,
+            );
+            self.pet.set_console_presentable(true);
+            if self.ink {
+                let spans: Vec<(u16, u16)> = (0..usize::from(self.rows))
+                    .map(|r| {
+                        let text: Vec<char> =
+                            self.term.row_text(r).unwrap_or_default().chars().collect();
+                        let first = text.iter().position(|c| !c.is_whitespace());
+                        let end = text.iter().rposition(|c| !c.is_whitespace());
+                        first
+                            .zip(end)
+                            .map_or((0, 0), |(f, e)| (f as u16, e as u16 + 1))
+                    })
+                    .collect();
+                let live = spans.iter().rposition(|&(f, e)| e > f).map(|r| r as u16);
+                self.pet.sense_ink(0, &spans, live);
+            }
+            let c = self.term.cursor();
+            self.pet.tick(PetSense {
+                caret_drawn: self.term.cursor_visible(),
+                now: self.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows: self.rows,
+                cols: self.cols,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: self.burst,
+                pointer: None,
+            })
+        }
+
+        /// The frame after `secs` of quiet: long enough to arrive and settle.
+        fn rest(&mut self, secs: f32) -> PetFrame {
+            let mut last = self.frame();
+            for _ in 1..(secs * 60.0) as usize {
+                last = self.frame();
+            }
+            last
+        }
+
+        /// Every cell the drawn body covers that is not clear ground — a
+        /// glyph, a coloured background, the host's chrome — by the world the
+        /// pet itself observed.
+        fn covered(&self, frame: &PetFrame) -> Vec<(usize, usize, PetCell)> {
+            let (x0, x1, y0, y1) = frame
+                .body_px(10, 20, self.cols, self.rows)
+                .expect("the pet is on glass");
+            let world = self.pet.console_world().expect("observed");
+            let mut out = Vec::new();
+            for r in y0.div_euclid(20)..(y1 + 19).div_euclid(20) {
+                for c in x0.div_euclid(10)..(x1 + 9).div_euclid(10) {
+                    let cell = world.cell(r as usize, c as usize);
+                    if cell != PetCell::Clear {
+                        out.push((r as usize, c as usize, cell));
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    /// Claude Code 2.1.304's screen as the lab read it: the launch card on
+    /// rows 0..=2, the composer between its two rules with Claude's painted
+    /// block caret at column 2 (where it parks the hidden cursor), and the
+    /// footer's words under the lower rule. `history` rows of words sit
+    /// between the card and the upper rule, which is on row `rule`.
+    fn claude_screen(cols: usize, rule: usize, history: &[(usize, &str)]) -> String {
+        let line = "\u{2500}".repeat(cols);
+        let mut out = String::from(
+            "\x1b[1;1H \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   Claude Code v2.1.304\
+             \x1b[2;1H\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 \u{b7} API Usage Billing\
+             \x1b[3;1H \u{259D}\u{259D}   \u{259D}\u{259D}   /private/tmp/lab/proj",
+        );
+        for (row, text) in history {
+            out.push_str(&format!("\x1b[{};1H{text}", row + 1));
+        }
+        out.push_str(&format!(
+            "\x1b[{};1H{line}\x1b[{};1H\u{276F} \x1b[7m \x1b[27m\x1b[{};1H{line}\
+             \x1b[{};1H  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)\x1b[{};3H\x1b[?25l",
+            rule + 1,
+            rule + 2,
+            rule + 3,
+            rule + 4,
+            rule + 2,
+        ));
+        out
+    }
+
+    /// The chrome aterm paints over that screen, as the lab's pet world read
+    /// it (`r05:PPPP…`, `r07:IIIPPPPPIII…PPPP`): the harness card's glass
+    /// with its air (rows 0..=4 when the upper rule is row 5), the upper
+    /// rule's rainbow and labels across the pane, and the lower rule's chips
+    /// (`∞` at the left, read when `⚙` still stood beside it, so its rect
+    /// is a few cells wider than the chip; the model and the path at the
+    /// right).
+    fn claude_chrome(cols: usize, rule: usize, card: bool) -> Vec<PetRect> {
+        let cols = cols as f32;
+        let mut chrome = vec![
+            PetRect::new(rule as f32, 0.0, 1.0, cols),
+            PetRect::new(rule as f32 + 2.0, 3.0, 1.0, 5.0),
+            PetRect::new(rule as f32 + 2.0, cols - 36.0, 1.0, 35.0),
+        ];
+        if card {
+            chrome.push(PetRect::new(0.0, 0.0, 5.0, 87.0));
+        }
+        chrome
+    }
+
+    /// OWNER-EYE-6 (2026-10-20), traced on a real Claude Code 2.1.304 in the
+    /// lab at 120x40 and 220x50: the hidden cursor is ON Claude's painted
+    /// composer caret, `(6, 2)`, so the faux-caret correction has nothing to
+    /// correct. The 1.7-row body cannot stand at the caret — both rules round
+    /// the composer are aterm's protected chrome — and the station's
+    /// correction, ink-blind, seated it on the footer's words: `auto🐱de`.
+    /// The resting pet now takes the nearest clean ground (two blank rows
+    /// under the footer), and its home stays the real composer caret.
+    ///
+    /// NEGATIVE CONTROL: with the correction searching under text only
+    /// (`nearest_under_text_perch` alone, as before), the body covers the
+    /// footer's ink on row 8.
+    #[test]
+    fn a_hidden_composer_caret_at_the_top_of_a_tall_pane_rests_clear_of_every_word() {
+        let mut s = Console::new(
+            40,
+            120,
+            &claude_screen(120, 5, &[]),
+            claude_chrome(120, 5, true),
+        );
+        let last = s.rest(6.0);
+        assert!(
+            matches!(
+                last.action,
+                PetAction::Sit | PetAction::Loaf | PetAction::Sleep
+            ),
+            "fixture: the pet has come to rest, got {:?}",
+            last.action
+        );
+        assert_eq!(
+            s.pet.last_caret,
+            Some((6, 2)),
+            "the home is the real composer caret, not one synthesized for it"
+        );
+        let covered = s.covered(&last);
+        assert!(
+            covered.is_empty(),
+            "the resting pet covers no word and no chrome; at ({}, {}) it covers {covered:?}",
+            last.col,
+            last.row
+        );
+        assert!(
+            last.row > 8.5 && last.row < 11.0 && last.col < 8.0,
+            "the nearest clean ground: under the footer, at the caret's side, got ({}, {})",
+            last.col,
+            last.row
+        );
+    }
+
+    /// The same screen near the bottom of a full pane, nothing clean above
+    /// the upper rule (Claude's words to the margin): the nearest clean
+    /// ground is the footer's blank tail on the last two rows, right of its
+    /// words — never the words.
+    ///
+    /// NEGATIVE CONTROL: the under-text correction alone seats the body on the
+    /// footer's words (row 14).
+    #[test]
+    fn near_the_bottom_the_resting_pet_takes_the_footers_blank_tail_not_its_words() {
+        let words =
+            "Claude wrote this line all the way to the margin of the pane and on ".repeat(2);
+        let history: Vec<(usize, &str)> = (3..=10).map(|row| (row, &words[..120])).collect();
+        let mut s = Console::new(
+            16,
+            120,
+            &claude_screen(120, 11, &history),
+            claude_chrome(120, 11, false),
+        );
+        let last = s.rest(6.0);
+        assert_eq!(
+            s.pet.last_caret,
+            Some((12, 2)),
+            "fixture: the composer caret"
+        );
+        let covered = s.covered(&last);
+        assert!(
+            covered.is_empty(),
+            "the resting pet covers no word and no chrome; at ({}, {}) it covers {covered:?}",
+            last.col,
+            last.row
+        );
+        assert!(
+            last.row > 14.0 && last.col >= 38.0,
+            "the footer's blank tail, right of `(shift+tab to cycle)`, got ({}, {})",
+            last.col,
+            last.row
+        );
+    }
+
+    /// A REAL CARET KEEPS ITS STAND. Beside a visible caret on a prompt with
+    /// output to the margin above it, the ink ladder's stand is the caret's
+    /// own row (its feet on blank ground, its ears over the line above, as
+    /// they always were): nothing there is protected, so no clean-ground
+    /// search moves the resting pet off its caret.
+    ///
+    /// NEGATIVE CONTROL (as run, failing this test): a correction that seats
+    /// the pet beside every caret on clean ground (the protected gate and the
+    /// ground plane's branch both removed, so every stand goes to
+    /// `nearest_clear_perch`) moves the stand off the prompt row, to row
+    /// 10.85. The protected gate alone removed passes here (the stand is
+    /// not refused, and the ground plane's search answers the stand itself);
+    /// it fails the full-screen replays instead
+    /// (`full_screen_tests::a_main_screen_stream_still_perks_hugs_and_waits`
+    /// and `a_full_screen_program_stands_down_a_vigil_armed_before_it`: the
+    /// vigil never arms).
+    #[test]
+    fn a_real_caret_keeps_its_stand_beside_it() {
+        let words = "x".repeat(80);
+        let mut screen = String::new();
+        for row in 1..=10 {
+            screen.push_str(&format!("\x1b[{row};1H{words}"));
+        }
+        screen.push_str("\x1b[11;1H$ ");
+        let mut s = Console::new(24, 80, &screen, Vec::new());
+        let last = s.rest(6.0);
+        assert!(s.term.cursor_visible(), "fixture: a real, visible caret");
+        assert_eq!(s.pet.last_caret, Some((10, 2)));
+        let width = art_cols(10, 20);
+        let (col, row) = s.pet.station_safe((10, 2), 80, 24, width);
+        assert!(
+            (row - 10.0).abs() < 0.25,
+            "the escort's stand stays on the caret's row, got {row}"
+        );
+        assert!(
+            (last.col - col).abs() <= ARRIVED && (last.row - 10.0).abs() < 0.25,
+            "the resting pet stays at its caret's stand ({col}, {row}), got ({}, {})",
+            last.col,
+            last.row
+        );
+    }
+
+    /// The transcript a first turn leaves over the composer in the lab
+    /// (Claude Code 2.1.304, `aterm ctl text`): the prompt on its band, the
+    /// reply, the turn's status line, one blank row between each.
+    const TURN: [(usize, &str); 3] = [
+        (5, "\x1b[48;2;55;55;55m\u{276F} hi there\x1b[K\x1b[0m"),
+        (
+            7,
+            "\u{23FA} Hi! I am the local lab stub, not a model. (reply 1)",
+        ),
+        (9, "\u{273B} Cooked for 0s \u{b7} done 6:54 AM"),
+    ];
+
+    /// A TURN MOVES THE COMPOSER PAST THE RESTING CAT (review of
+    /// owner-eye-6, 2026-10-20; lab `rv-tl`, Claude Code 2.1.304 at
+    /// 120 x 40): the cat rests on clean ground under the fresh footer; a
+    /// turn repaints the transcript over it and the composer six rows down,
+    /// the upper rule aterm paints across the pane between them. The clean
+    /// ground nearest the new caret is under the new footer, beyond that
+    /// rule. Chased, the console law stepped every flight back off the rule,
+    /// and the cat leapt in place on `✻ Co🐱ked` for the whole 20 s window
+    /// (about 890 frames under video). It now takes the nearest clean seat
+    /// it can walk to, beside the turn's last line above the rule, and
+    /// parks there.
+    ///
+    /// NEGATIVE CONTROL: with no reach (`rest_reach_from` answering `None`)
+    /// the cat chases the seat beyond the rule and never parks.
+    #[test]
+    fn a_turn_under_the_resting_cat_parks_it_on_clean_ground_it_can_walk_to() {
+        let mut s = Console::agent(
+            40,
+            120,
+            &claude_screen(120, 5, &[]),
+            claude_chrome(120, 5, true),
+        );
+        let rested = s.rest(6.0);
+        assert!(
+            s.covered(&rested).is_empty() && rested.row > 8.5,
+            "fixture: at rest under the fresh footer, at ({}, {})",
+            rested.col,
+            rested.row
+        );
+        s.repaint(&claude_screen(120, 11, &TURN), claude_chrome(120, 11, true));
+        let (leaps, parked, last) = s.watch(4.0);
+        assert!(
+            parked.is_some() && leaps < 60,
+            "the cat parks after one trip: first parked at {parked:?} s, {leaps} leap \
+             frames, at ({}, {}) {:?}",
+            last.col,
+            last.row,
+            last.action
+        );
+        let seat = (last.col, last.row);
+        let (leaps, _, last) = s.watch(16.0);
+        assert!(
+            leaps == 0 && (last.col - seat.0).abs() < 0.05 && (last.row - seat.1).abs() < 0.05,
+            "and stays parked on its seat {seat:?}: {leaps} leap frames, at ({}, {})",
+            last.col,
+            last.row
+        );
+        let covered = s.covered(&last);
+        assert!(
+            covered.is_empty(),
+            "at rest it covers no word and no chrome; at ({}, {}) it covers {covered:?}",
+            last.col,
+            last.row
+        );
+        assert!(
+            last.row < 11.0,
+            "on the near side of the upper rule, got ({}, {})",
+            last.col,
+            last.row
+        );
+    }
+
+    /// Claude Code's composer as it redraws at each key (lab `tc-b1`, Claude
+    /// Code 2.1.304 at 120 x 40, one turn above it): the upper rule on row
+    /// 11, `❯ ` and the draft wrapped at 118 columns with its painted block
+    /// caret after it (the hidden cursor on that caret), the lower rule
+    /// under the draft's last line and the footer under that, the rows
+    /// below blank. Its chrome as the host reserves it: the card's glass,
+    /// the upper rule whole, the lower rule's chips.
+    fn composer_with(draft: &str) -> (String, Vec<PetRect>) {
+        let rule = "\u{2500}".repeat(120);
+        let chars: Vec<char> = draft.chars().collect();
+        let lines: Vec<String> = if chars.is_empty() {
+            vec![String::new()]
+        } else {
+            chars.chunks(118).map(|c| c.iter().collect()).collect()
+        };
+        let mut out = String::new();
+        for row in 11..20 {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+        }
+        out.push_str(&format!("\x1b[12;1H{rule}"));
+        for (i, line) in lines.iter().enumerate() {
+            let lead = if i == 0 { "\u{276F} " } else { "  " };
+            out.push_str(&format!("\x1b[{};1H{lead}{line}", 13 + i));
+        }
+        let last = lines.len() - 1;
+        let caret_col = 2 + lines[last].chars().count();
+        out.push_str("\x1b[7m \x1b[27m");
+        let lower = 12 + lines.len();
+        out.push_str(&format!(
+            "\x1b[{};1H{rule}\x1b[{};1H  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)\x1b[{};{}H\x1b[?25l",
+            lower + 1,
+            lower + 2,
+            13 + last,
+            caret_col + 1
+        ));
+        let lower = lower as f32;
+        let chrome = vec![
+            PetRect::new(0.0, 0.0, 5.0, 87.0),
+            PetRect::new(11.0, 0.0, 1.0, 120.0),
+            PetRect::new(lower, 3.0, 1.0, 5.0),
+            PetRect::new(lower, 84.0, 1.0, 35.0),
+        ];
+        (out, chrome)
+    }
+
+    /// The pane a turn leaves, the cat resting above the composer's upper
+    /// rule (`a_turn_under_the_resting_cat_parks_it_on_clean_ground_it_can_walk_to`),
+    /// the host's ink probe fed as the host feeds it.
+    fn resting_above_the_composer() -> Console {
+        let mut s = Console::agent(
+            40,
+            120,
+            &claude_screen(120, 5, &[]),
+            claude_chrome(120, 5, true),
+        );
+        s.ink = true;
+        s.rest(6.0);
+        let (bottom, chrome) = composer_with("");
+        s.repaint(
+            &format!("{}{bottom}", claude_screen(120, 11, &TURN)),
+            chrome,
+        );
+        let rested = s.rest(8.0);
+        assert!(
+            rested.row < 11.0 && s.covered(&rested).is_empty() && !s.pet.needs_frames(),
+            "fixture: at rest above the composer's upper rule, on clean ground, at ({}, {})",
+            rested.col,
+            rested.row
+        );
+        s
+    }
+
+    /// A landing off its seats: where it came down, and the seats the
+    /// station kept while it flew.
+    type Landing = ((f32, f32), Vec<(f32, f32)>);
+
+    /// A watch for hops, frame by frame: the flights it starts, its frames
+    /// the console law stepped back off protected ground (`cursor-home`),
+    /// and each landing on none of the seats the station kept while it flew.
+    #[derive(Default)]
+    struct Hops {
+        leaps: usize,
+        asides: usize,
+        missed: Vec<Landing>,
+        seats: Vec<(f32, f32)>,
+        aloft: bool,
+    }
+
+    impl Hops {
+        fn frame(&mut self, s: &mut Console) {
+            let f = s.frame();
+            let aloft = f.action == PetAction::Leap;
+            if aloft && !self.aloft {
+                self.leaps += 1;
+                self.seats.clear();
+            }
+            if let Some(seat) = s.pet.console.rest_seat.get() {
+                self.seats.push(seat);
+            }
+            if self.aloft && !aloft {
+                let on =
+                    |&(c, r): &(f32, f32)| (f.col - c).abs() <= 1.0 && (f.row - r).abs() < 0.25;
+                if !self.seats.iter().any(on) {
+                    self.seats.dedup();
+                    self.missed
+                        .push(((f.col, f.row), std::mem::take(&mut self.seats)));
+                }
+            }
+            self.aloft = aloft;
+            if s.pet.console.reason == "cursor-home" {
+                self.asides += 1;
+            }
+        }
+    }
+
+    /// TYPING INTO AN AGENT'S COMPOSER NEVER SENDS THE CAT HOPPING (lab
+    /// `tt-3`, Claude Code 2.1.304 at 120 x 40: 200 keys typed into the
+    /// composer, then 200 backspaces, the cat resting above the composer's
+    /// upper rule, which the host reserves whole). A draft wrapped onto the
+    /// composer's second line puts the caret's stand inside the composer
+    /// box, where nothing under the body is protected; chased, every flight
+    /// across the rule was stepped back off it by the console law, and the
+    /// cat hopped in place on its side of the rule. A stand the body on
+    /// glass cannot walk to is no stand: the cat keeps a seat it can reach
+    /// (`PetBrain::console_station`). And a flight to a seat lands on it: a
+    /// seat does not run with the caret, so the aim leads by no drift
+    /// (`PetBrain::aims_ahead`; aimed ahead, it landed five columns past).
+    /// The seat moves only when the stand is past [`REST_REACH`]: twice
+    /// here as the draft is typed, once along the first line and once at the
+    /// wrap, and twice as the backspaces run the caret back over the wrap and
+    /// along the first line (a held delete frightens the cat once and no
+    /// longer freezes it until the deletes stop).
+    ///
+    /// NEGATIVE CONTROLS (as run, each failing this test): the stand never
+    /// walled (`console_walled` answering `false`), 6 leaps and 13 frames
+    /// stepped back off the rule; the aim led by the caret's drift at a seat
+    /// too (`aims_ahead` as `rhythm_open`), both landings five columns past
+    /// their seats; no resting ground kept once the seat has moved on, a
+    /// third leap as the backspaces run the caret back.
+    #[test]
+    fn typing_into_an_agents_composer_never_sends_the_cat_hopping() {
+        let mut s = resting_above_the_composer();
+        let draft = "the quick brown fox jumps over the lazy dog ".repeat(4);
+        let mut hops = Hops::default();
+        let keys = (1..=150)
+            .map(|n| (n, PetInputKind::Text))
+            .chain((0..150).rev().map(|n| (n, PetInputKind::Delete)));
+        let mut typed_leaps = 0;
+        for (i, (n, kind)) in keys.enumerate() {
+            if i == 150 {
+                typed_leaps = hops.leaps;
+            }
+            s.pet.note_console_input(s.now, kind);
+            let (bottom, chrome) = composer_with(&draft[..n]);
+            s.term.process(bottom.as_bytes());
+            s.chrome = chrome;
+            for _ in 0..(2 + i % 2) {
+                hops.frame(&mut s);
+            }
+        }
+        for _ in 0..(3 * 60) {
+            hops.frame(&mut s);
+        }
+        let deleted_leaps = hops.leaps - typed_leaps;
+        assert!(
+            hops.asides == 0 && typed_leaps <= 2 && deleted_leaps <= 2 && hops.missed.is_empty(),
+            "the cat keeps a seat it can reach and lands on it: {typed_leaps} leaps typing and \
+             {deleted_leaps} deleting, {} frames stepped back off the rule, landings off the \
+             seat {:?}",
+            hops.asides,
+            hops.missed
+        );
+        let (_, parked, last) = s.watch(6.0);
+        assert!(
+            parked.is_some() && last.row < 11.0 && s.covered(&last).is_empty(),
+            "and parks above the rule on clean ground, at ({}, {})",
+            last.col,
+            last.row
+        );
+    }
+
+    /// THE LIVE-EDGE HUG NEVER CHASES ACROSS THE HOST'S CHROME (lab `tt-3`):
+    /// while Claude Code's output is a burst, the watch re-stations the cat
+    /// beside the newest inked row's end, the footer under the composer.
+    /// From its seat above the composer's upper rule that stand is beyond
+    /// the rule, which the host reserves whole: the console law stepped
+    /// every flight there back off it, and the cat hopped in place every
+    /// 0.6 s for as long as the burst lasted. A stand the console bars
+    /// (`PetBrain::console_bars`) is no hug: the cat keeps watching from
+    /// its seat.
+    ///
+    /// NEGATIVE CONTROLS (as run, each failing this test): the hug that
+    /// never asks the console, and `console_walled` answering `false` (the
+    /// footer's stand is clear; only the rule on the way bars it): 7 leaps
+    /// and 29 frames stepped back off the rule in four seconds.
+    #[test]
+    fn the_live_edge_hug_never_chases_across_the_hosts_chrome() {
+        let mut s = resting_above_the_composer();
+        let seat = (s.pet.col, s.pet.row);
+        s.burst = true;
+        let mut hops = Hops::default();
+        let mut armed = 0;
+        for _ in 0..(4 * 60) {
+            hops.frame(&mut s);
+            armed += usize::from(s.pet.hug_armed);
+        }
+        assert!(armed > 0, "fixture: the burst armed the live-edge hug");
+        assert!(
+            hops.asides == 0 && hops.leaps == 0,
+            "the cat watches from its seat {seat:?}: {} leaps, {} frames stepped back off \
+             the rule, at ({:.2}, {:.2})",
+            hops.leaps,
+            hops.asides,
+            s.pet.col,
+            s.pet.row
+        );
+    }
+
+    /// The pane of a shell after a long listing, as the review's lab drew it
+    /// (100 x 30): output to row 27, `short`, the prompt on the last row.
+    fn shell_after_output() -> String {
+        let mut screen = String::new();
+        for i in 12..=40 {
+            screen.push_str(&format!("line {i} of the output, words words words\r\n"));
+        }
+        screen.push_str("$ ");
+        screen
+    }
+
+    /// A HAND'S SELECTION NEVER SENDS THE CAT ACROSS THE PANE (review, lab
+    /// `rv-drag`: a shell at 100 x 30, a block selection grown a row at a
+    /// time from the prompt up and right over the words). Only the
+    /// selection refuses the escort's stand there, so the correction is the
+    /// local one it always was: the closest place behind text within
+    /// `HOME_REACH`, or the pet yields where it is. When the selection goes
+    /// it is back at its stand. The rest seat's long search ran for any
+    /// refused stand, and walked the cat about 45 columns along the
+    /// selection's edge. Here the stand is under the last output line's
+    /// words, as a shell's usually is, and the nearest clean ground is past
+    /// their end, 37 columns away.
+    ///
+    /// NEGATIVE CONTROLS (as run, each failing this test): the seat solved
+    /// on the live plane (the selection counted), and the long search for
+    /// every refused stand (the ground plane's question skipped): the cat
+    /// travels farther than `HOME_REACH`.
+    #[test]
+    fn a_growing_selection_moves_the_shell_pet_no_farther_than_home_reach() {
+        let mut s = Console::new(30, 100, &shell_after_output(), Vec::new());
+        let rested = s.rest(5.0);
+        let home = (rested.col, rested.row);
+        assert!(
+            (home.1 - 29.0).abs() < 0.25,
+            "fixture: at rest beside the prompt, at {home:?}"
+        );
+        let mut farthest = 0.0f32;
+        for k in 1..=14u16 {
+            let sel = s.term.text_selection_mut();
+            sel.start_selection(
+                29 - i32::from(k),
+                2,
+                SelectionSide::Left,
+                SelectionType::Block,
+            );
+            sel.update_selection(29, 14 + 4 * k, SelectionSide::Right);
+            for _ in 0..18 {
+                let f = s.frame();
+                if f.alpha > 0 {
+                    farthest =
+                        farthest.max((f.col - home.0).abs().max((f.row - home.1).abs() * 2.0));
+                }
+            }
+        }
+        assert!(
+            farthest <= HOME_REACH + ARRIVED,
+            "seen no farther than HOME_REACH from its stand, got {farthest}"
+        );
+        s.term.text_selection_mut().clear();
+        let back = s.rest(4.0);
+        assert!(
+            (back.col - home.0).abs() <= ARRIVED && (back.row - home.1).abs() < 0.25,
+            "back at its stand {home:?}, got ({}, {})",
+            back.col,
+            back.row
+        );
+    }
+
+    /// A SELECTION OVER THE REST SEAT HIDES THE CAT WHERE IT LIES (review,
+    /// lab `rv-csel`: Claude Code at 120 x 30, the hand copy-drags the last
+    /// output): the seat is solved on the ground plane, without the live
+    /// selection, so a selection growing over the sleeping cat gives it no
+    /// new seat. The console law moves it no farther than off a selection
+    /// anywhere (a step within `HOME_REACH`; here nothing that near is
+    /// free, so it yields where it lies), and it is back there when the
+    /// selection goes. The live-plane search sent it leaping ten rows up
+    /// after the selection, and flying back on clear.
+    ///
+    /// NEGATIVE CONTROL (as run, failing this test): the seat solved on the
+    /// live plane (selections counted), the cat moves off its seat.
+    #[test]
+    fn a_selection_over_the_rest_seat_hides_the_cat_in_place() {
+        let mut s = Console::agent(
+            40,
+            120,
+            &claude_screen(120, 5, &[]),
+            claude_chrome(120, 5, true),
+        );
+        s.rest(6.0);
+        s.repaint(&claude_screen(120, 11, &TURN), claude_chrome(120, 11, true));
+        let (_, parked, rested) = s.watch(6.0);
+        assert!(parked.is_some(), "fixture: parked");
+        let seat = (rested.col, rested.row);
+        assert!(
+            seat.1 < 11.0 && s.covered(&rested).is_empty(),
+            "fixture: at rest beside the turn's last line, at {seat:?}"
+        );
+        let mut moved = 0.0f32;
+        for k in 1..=8u16 {
+            let sel = s.term.text_selection_mut();
+            sel.start_selection(10, 0, SelectionSide::Left, SelectionType::Block);
+            sel.update_selection(10 - i32::from(k), 20 + 9 * k, SelectionSide::Right);
+            for _ in 0..20 {
+                s.frame();
+                moved = moved.max(
+                    (s.pet.col - seat.0)
+                        .abs()
+                        .max((s.pet.row - seat.1).abs() * 2.0),
+                );
+            }
+        }
+        assert!(
+            moved <= ARRIVED,
+            "the cat keeps its seat under the selection, moved {moved}"
+        );
+        s.term.text_selection_mut().clear();
+        let (_, parked, back) = s.watch(3.0);
+        assert!(
+            parked.is_some()
+                && back.alpha > 0
+                && (back.col - seat.0).abs() <= ARRIVED
+                && (back.row - seat.1).abs() < 0.25,
+            "back on its seat {seat:?}, seen: ({}, {}) alpha {}",
+            back.col,
+            back.row,
+            back.alpha
+        );
+    }
+
+    /// OPENING THE AUTOPILOT MENU OVER THE SLEEPING CAT MOVES NOTHING
+    /// (review, lab `rv-day-menu`: a fresh Claude Code screen, 120 x 40). The
+    /// menu's card is a transient overlay
+    /// ([`PetBrain::observe_console_with_overlays`]), not ground: the rest
+    /// seat is solved without it, so the cat yields where it lies under the
+    /// card (nothing within `HOME_REACH` is free) and is there again when it
+    /// closes. As chrome, the card sent the cat eleven rows down under it,
+    /// then ten back up on close.
+    ///
+    /// NEGATIVE CONTROLS (as run, each failing this test): the card fed as
+    /// chrome (an overlay counted as lasting), and the ground plane not kept
+    /// (the seat solved on the live plane): the cat leaves its seat.
+    #[test]
+    fn the_autopilot_menu_over_the_cat_hides_it_in_place() {
+        let mut s = Console::agent(
+            40,
+            120,
+            &claude_screen(120, 5, &[]),
+            claude_chrome(120, 5, true),
+        );
+        let rested = s.rest(6.0);
+        let seat = (rested.col, rested.row);
+        assert!(
+            s.covered(&rested).is_empty() && seat.1 > 8.5,
+            "fixture: at rest under the footer, at {seat:?}"
+        );
+        // The card drops from the footer's Autopilot chip over the blank
+        // rows under it, where the cat sleeps.
+        s.overlays = vec![PetRect::new(8.0, 2.0, 11.0, 40.0)];
+        let mut moved = 0.0f32;
+        let mut seen = 0;
+        for _ in 0..(3.0 * 60.0) as usize {
+            let f = s.frame();
+            moved = moved.max(
+                (s.pet.col - seat.0)
+                    .abs()
+                    .max((s.pet.row - seat.1).abs() * 2.0),
+            );
+            if f.alpha > 0 {
+                seen += 1;
+            }
+        }
+        assert!(
+            moved <= ARRIVED,
+            "the cat keeps its seat under the menu, moved {moved}"
+        );
+        assert!(seen < 30, "and yields there, seen {seen} frames");
+        s.overlays.clear();
+        let (_, parked, back) = s.watch(3.0);
+        assert!(
+            parked.is_some()
+                && back.alpha > 0
+                && (back.col - seat.0).abs() <= ARRIVED
+                && (back.row - seat.1).abs() < 0.25,
+            "the menu closed, it is on its seat {seat:?}: ({}, {}) alpha {}",
+            back.col,
+            back.row,
+            back.alpha
+        );
+    }
+
+    /// A COMMAND LIST REDRAWN AT EVERY KEY MOVES THE CAT ONCE (lab
+    /// `b-day-slash`, Claude Code 2.1.304 at 120 x 40: `/compa` sent a key at
+    /// a time, then backspaced): the list Claude Code draws under the
+    /// composer covers the cat's seat under the footer, and it goes once to
+    /// the clean ground past the list's end. As the list shrinks with the
+    /// next keys, that seat is still clean ground it can reach, so it stays:
+    /// nearer ground opening up is no reason to move. A longer list over the
+    /// seat moves it again.
+    ///
+    /// NEGATIVE CONTROL (as run, failing this test): no seat kept
+    /// (`ConsoleLife::rest_seat` never read), the cat leaps back up after the
+    /// shorter list's end.
+    #[test]
+    fn a_command_list_redrawn_at_every_key_moves_the_resting_cat_once() {
+        let list = |rows: usize| {
+            let mut screen = claude_screen(120, 5, &[]);
+            for row in 9..9 + rows {
+                screen.push_str(&format!(
+                    "\x1b[{};1H    /command-{row:<16}A long description of what the command does, \
+                     and when to use it",
+                    row + 1
+                ));
+            }
+            screen.push_str("\x1b[7;3H");
+            screen
+        };
+        let mut s = Console::agent(
+            40,
+            120,
+            &claude_screen(120, 5, &[]),
+            claude_chrome(120, 5, true),
+        );
+        let rested = s.rest(6.0);
+        assert!(
+            s.covered(&rested).is_empty() && rested.row < 12.0,
+            "fixture: at rest under the fresh footer, at ({}, {})",
+            rested.col,
+            rested.row
+        );
+        s.repaint(&list(16), claude_chrome(120, 5, true));
+        let (_, parked, moved) = s.watch(4.0);
+        assert!(
+            parked.is_some() && moved.row > 25.0 && s.covered(&moved).is_empty(),
+            "the long list took its seat: it went past the list's end, at ({}, {})",
+            moved.col,
+            moved.row
+        );
+        let seat = (moved.col, moved.row);
+        for rows in [12, 8, 4] {
+            s.repaint(&list(rows), claude_chrome(120, 5, true));
+            let (leaps, _, last) = s.watch(3.0);
+            assert!(
+                leaps == 0
+                    && (last.col - seat.0).abs() <= ARRIVED
+                    && (last.row - seat.1).abs() < 0.25,
+                "a {rows}-row list leaves its seat {seat:?} clean: it stays, {leaps} leap \
+                 frames, at ({}, {})",
+                last.col,
+                last.row
+            );
+        }
+        s.repaint(&list(20), claude_chrome(120, 5, true));
+        let (_, parked, last) = s.watch(4.0);
+        assert!(
+            parked.is_some() && last.row > 29.0 && s.covered(&last).is_empty(),
+            "a longer list over its seat moves it again, past the end, at ({}, {})",
+            last.col,
+            last.row
+        );
+    }
+
+    /// A GAP INSIDE A LINE IS NOT GROUND (review, lab `rv-slash`: `/compa`
+    /// typed into a fresh composer, Claude Code drawing its command list
+    /// under the footer). The rest seat stays off every line's ink hull, so
+    /// the cat never sleeps between `/cd` and its description; it rests past
+    /// the list's longest line, or under it.
+    ///
+    /// NEGATIVE CONTROL: with the hulls ignored, the seat is in the list's
+    /// gutter.
+    #[test]
+    fn the_rest_seat_never_takes_the_gutter_of_a_command_list() {
+        let list = [
+            (
+                9,
+                "  /cd                         Change the working directory",
+            ),
+            (10, "  /clear                      Clear the conversation"),
+            (11, "  /compact                    Compact the conversation"),
+            (12, "  /config                     Open the settings"),
+            (13, "  /copy                       Copy the last reply"),
+        ];
+        let mut screen = claude_screen(120, 5, &[]);
+        for (row, text) in list {
+            screen.push_str(&format!("\x1b[{};1H{text}", row + 1));
+        }
+        screen.push_str("\x1b[7;3H");
+        let mut s = Console::agent(40, 120, &screen, claude_chrome(120, 5, true));
+        let last = s.rest(6.0);
+        let covered = s.covered(&last);
+        assert!(covered.is_empty(), "no glyph under the cat: {covered:?}");
+        let (x0, x1, y0, y1) = last.body_px(10, 20, 120, 40).expect("on glass");
+        let cols = x0.div_euclid(10)..(x1 + 9).div_euclid(10);
+        for row in y0.div_euclid(20)..(y1 + 19).div_euclid(20) {
+            let Some((_, text)) = list.iter().find(|(r, _)| *r == row) else {
+                continue;
+            };
+            let first = text.find(|c: char| c != ' ').unwrap_or(0) as i32;
+            let end = text.trim_end().chars().count() as i32;
+            assert!(
+                cols.end <= first || cols.start >= end,
+                "off the list's lines, not in their gutter: columns {cols:?} on row {row}, \
+                 whose words run {first}..{end}, the cat at ({}, {})",
+                last.col,
+                last.row
+            );
+        }
+    }
+
+    #[test]
+    fn full_transcript_above_the_composer_keeps_an_under_text_seat_without_hopping_or_bobbing() {
+        let mut s = resting_above_the_composer();
+        let full = "Claude wrote this line all the way to the margin of the pane and on ".repeat(2);
+        let dense: Vec<(usize, &str)> = (5..=10).map(|row| (row, &full[..120])).collect();
+        let (bottom, chrome) = composer_with("");
+        s.repaint(
+            &format!("{}{bottom}", claude_screen(120, 11, &dense)),
+            chrome,
+        );
+        let rested = s.rest(4.0);
+        assert!(
+            rested.row < 11.0 && matches!(rested.action, PetAction::Sit | PetAction::Loaf),
+            "fixture: seated on under-text ground above the rule, got ({}, {}) {:?}",
+            rested.col,
+            rested.row,
+            rested.action
+        );
+        let draft = "the quick brown fox jumps over the lazy dog ".repeat(2);
+        let mut hops = Hops::default();
+        let mut stands = 0usize;
+        let mut contacts = 0usize;
+        for (i, n) in (1..=60).chain((0..30).rev()).enumerate() {
+            let kind = if i < 60 {
+                PetInputKind::Text
+            } else {
+                PetInputKind::Delete
+            };
+            s.pet.note_console_input(s.now, kind);
+            let (bottom, chrome) = composer_with(&draft[..n]);
+            s.term.process(bottom.as_bytes());
+            s.chrome = chrome;
+            for _ in 0..3 {
+                hops.frame(&mut s);
+                if !hops.aloft && s.pet.action == PetAction::Stand {
+                    stands += 1;
+                }
+                if s.pet.console_attention() == PetAttention::Contact {
+                    contacts += 1;
+                }
+            }
+        }
+        assert!(
+            hops.asides == 0 && hops.leaps <= 2 && hops.missed.is_empty(),
+            "reachable under-text seat above the rule is kept: {} leaps, {} cursor-home asides, \
+             missed {:?}",
+            hops.leaps,
+            hops.asides,
+            hops.missed
+        );
+        assert_eq!(
+            contacts, 0,
+            "typing in a hidden-cursor composer never braces the cat as foreign contact"
+        );
+        assert!(
+            stands <= 30,
+            "seated cat on its rest seat does not pop into Stand on every key (got {stands} Stand frames)"
         );
     }
 }

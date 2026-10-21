@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The measured phases, over two worlds booted exactly as the fabric suite
-//! boots them (`harness::World`: a guarded — so Strict — broker in this
-//! process, a headless `aterm`, and the real `aterm link serve` child it
-//! launched):
+//! boots them (`harness::World`: a guarded broker in this process, opened with
+//! aterm's own options for the arm's tier — strict by default — a headless
+//! `aterm`, and the real `aterm link serve` child it launched):
 //!
 //! 1. MESSAGING, on one node. [`latency`]: session A posts a `note` to session
 //!    B, one at a time on an idle bridge, and the clock runs from the `post`
@@ -21,10 +21,10 @@
 //!    for each population in the spec; the census of what it wrote, the
 //!    killed bridge's fired will counted apart.
 //!
-//! Each world also runs the [`calibrate`] yardstick — bare Strict publishes,
-//! no aterm — before and after its phases, and every headline is reported in
-//! yardstick units beside its milliseconds: a correction for the disk, not
-//! for a busy CPU.
+//! Each world also runs the [`calibrate`] yardstick — bare strict, ordered and
+//! escalated publishes, no aterm — before and after its phases, and every
+//! headline is reported in strict yardstick units beside its milliseconds: a
+//! correction for the disk, not for a busy CPU.
 //!
 //! Separate worlds, not one, so the attach populations are exactly what the
 //! spec names (sessions are never closed here), the messaging numbers are not
@@ -59,15 +59,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use astream_broker::{Broker, BrokerHandle, Durability, Subscription};
+use astream_broker::{Broker, BrokerHandle, Durability, FlushCounts, OpenOptions, Subscription};
 use aterm_json::{Value, json};
 use aterm_link::ctl::{Ctl, Reply};
 
 use crate::census::{self, Rec};
-use crate::clock::{self, Clock, StopOnDrop, Timeline, ms};
+use crate::clock::{self, Clock, Heads, StopOnDrop, ms};
 use crate::harness::{self, DEADLINE, FLEET, World, kv, until};
 use crate::profile::{self, Profile};
-use crate::spec::{Spec, Tier};
+use crate::spec::{ORDERED_HORIZON_MS, Spec, Tier};
 use crate::stats;
 
 #[path = "run/pingpong.rs"]
@@ -478,12 +478,18 @@ fn stop_and_read(w: &mut World) -> Vec<Rec> {
 }
 
 /// Run `phases` beside a head sampler on `w`'s broker: what they answered, and
-/// the timeline.
-fn sampled<T: Send>(w: &World, clock: Clock, phases: impl FnOnce() -> T + Send) -> (T, Timeline) {
+/// both heads over the run ([`Heads`]).
+fn sampled<T: Send>(w: &World, clock: Clock, phases: impl FnOnce() -> T + Send) -> (T, Heads) {
     let broker = w.broker.as_ref().expect("the world serves its own broker");
     let stop = AtomicBool::new(false);
     std::thread::scope(|s| {
-        let sampler = s.spawn(|| clock::sample_heads(clock, || broker.visible_head(), &stop));
+        let sampler = s.spawn(|| {
+            clock::sample_heads(
+                clock,
+                || (broker.visible_head(), broker.durable_head()),
+                &stop,
+            )
+        });
         let answer = {
             let _stop = StopOnDrop(&stop);
             phases()
@@ -495,6 +501,85 @@ fn sampled<T: Send>(w: &World, clock: Clock, phases: impl FnOnce() -> T + Send) 
 /// `ms(a, b)` for a landing the sampler may not have seen.
 fn ms_opt(a: Option<u64>, b: Option<u64>) -> Option<f64> {
     Some(ms(a?, b?))
+}
+
+/// THE LAST RECORDS, SEEN DURABLE. On a broker that serves ordered, wait until
+/// its durable head has caught up with its acked head as it stands now — the
+/// horizon's full flush, at most the horizon plus a batch and a flush away —
+/// so the phases' last records are seen durable before the sampler stops
+/// (without it, the burst's whole "every record durable" milestone falls
+/// after the run). Called after a world's timed phases, never inside one.
+/// Strict needs no wait (its two heads are one), and relaxed never flushes
+/// (its durable head does not move until a clean close), so neither waits.
+/// The wait is a hang detector, never a budget.
+fn await_durable(broker: &Broker) {
+    if broker.served_durability().served != astream_broker::Tier::Ordered {
+        return;
+    }
+    let target = broker.visible_head();
+    aterm_spec::wait::within(DEADLINE, IDLE_POLL, || {
+        (broker.durable_head() >= target).then_some(())
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "the ordered broker's durable head never reached {target} within {DEADLINE:?}: \
+             its horizon flush did not come"
+        )
+    });
+}
+
+// ---------------------------------------------------------------------------
+// the broker's flushes, counted
+// ---------------------------------------------------------------------------
+
+/// The flushes a window cost: `after - before`, field by field, of
+/// [`Broker::flush_counts`] read at its two ends (under the log lock, so each
+/// count is between two whole batches; never inside a timed round trip).
+fn flushes_between(before: FlushCounts, after: FlushCounts) -> FlushCounts {
+    FlushCounts {
+        barrier: after.barrier - before.barrier,
+        full: after.full - before.full,
+        skipped: after.skipped - before.skipped,
+        failed: after.failed - before.failed,
+    }
+}
+
+/// A window's flushes for the report's JSON: the counts and each per delivered
+/// message.
+fn flushes_json(f: FlushCounts, n: usize) -> Value {
+    let per = |v: u64| (n > 0).then(|| stats::round3(v as f64 / n as f64));
+    json!({
+        "barrier": f.barrier,
+        "full": f.full,
+        "skipped": f.skipped,
+        "failed": f.failed,
+        "barrier_per_message": per(f.barrier),
+        "full_per_message": per(f.full),
+        "skipped_per_message": per(f.skipped),
+    })
+}
+
+/// A window's flushes for the report's tables: what a strict broker spends one
+/// full flush on per batch, an ordered one spends a barrier on, plus a full
+/// flush per escalated batch and per horizon; a relaxed one spends nothing.
+fn flushes_line(f: FlushCounts, n: usize) -> String {
+    let per = |v: u64| {
+        if n == 0 {
+            "–".to_string()
+        } else {
+            format!("{:.3}", v as f64 / n as f64)
+        }
+    };
+    format!(
+        "Broker flushes in the window (`Broker::flush_counts`): {} barrier ({} per message), {} \
+         full ({} per message), {} full skipped as covered, {} failed.\n",
+        f.barrier,
+        per(f.barrier),
+        f.full,
+        per(f.full),
+        f.skipped,
+        f.failed
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -509,17 +594,22 @@ const CALIBRATION_PUBLISHES: usize = 50;
 /// dedup; its subject (`/f/<F>/bench/…`) is under no filter a bridge holds.
 const CALIBRATION_PRODUCER: u64 = 0x0fab_0be7_0000_0001;
 
-/// THE YARDSTICK: `CALIBRATION_PUBLISHES` bare Strict publishes, one at a time,
-/// from a client in this process to the world's own broker — one round trip
-/// and one fsync each, no aterm, no bridge. Every number above it is
-/// "some fsyncs plus aterm's work", and the fsync is the machine's: on a
-/// shared host another job's writes stretch every `F_FULLFSYNC` (each one
-/// flushes the drive's whole cache). So each world runs a block before its
-/// phases and one after, and the report divides by the yardstick's p50 as
-/// well as quoting milliseconds — a ratio taken in one run on one disk.
+/// THE YARDSTICK: blocks of `CALIBRATION_PUBLISHES` bare publishes, one at a
+/// time, from a client in this process — one round trip each, no aterm, no
+/// bridge — of three kinds ([`Yardstick`]): to a STRICT broker (one full
+/// flush each: the unit), to an ORDERED one on an ordinary subject (one
+/// barrier each), and to the same ordered broker on a PERSON-LANE subject,
+/// which aterm's table escalates (one full flush each, before the ack). Every
+/// number above it is "some flushes plus aterm's work", and the flush is the
+/// machine's: on a shared host another job's writes stretch every
+/// `F_FULLFSYNC` (each one flushes the drive's whole cache). So each world
+/// runs a block of each before its phases and after, and the report divides
+/// by the strict yardstick's p50 as well as quoting milliseconds — a ratio
+/// taken in one run on one disk. The ordered and escalated blocks say what a
+/// barrier and an escalation cost on this disk at this moment, beside it.
 ///
 /// WHAT IT DOES NOT CORRECT FOR: CPU contention. It times one thread's round
-/// trip and one fsync; the phases above it hop through three processes and
+/// trip and one flush; the phases above it hop through three processes and
 /// several threads, and on a loaded host each hop waits for a core the
 /// yardstick never asked for. The baseline's own runs show it (2026-10-16:
 /// 2.40 / 1.65 / 1.55 yardstick units for one build at load 15-28 and 12-13),
@@ -527,67 +617,135 @@ const CALIBRATION_PRODUCER: u64 = 0x0fab_0be7_0000_0001;
 /// ledger entry's load average is the only CPU measure. Reported, never
 /// judged.
 ///
-/// ALWAYS STRICT. Under the ceiling arm (`durability=relaxed`) the world's
-/// broker no longer fsyncs, so its publishes would time the page cache, not
-/// the disk; the yardstick then publishes to a Strict broker of its own
-/// ([`Ruler`]), so every run's unit is the same fsync and the arms compare in
-/// it.
-fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Vec<f64> {
-    let mut god = ruler.client(w);
-    let subject = format!("/f/{FLEET}/bench/strict-publish");
-    (0..CALIBRATION_PUBLISHES)
-        .map(|_| {
-            *seq += 1;
-            let t0 = clock.us();
-            god.publish(CALIBRATION_PRODUCER, *seq, &subject, b"yardstick")
-                .unwrap_or_else(|e| panic!("yardstick publish {seq} on {subject}: {e}"));
-            ms(t0, clock.us())
-        })
-        .collect()
+/// THE UNIT IS ALWAYS STRICT. Under the ordered and relaxed arms the world's
+/// broker does not flush every ack in full, so its publishes would not time
+/// the disk; the strict block then publishes to a Strict broker of its own
+/// ([`Ruler`]), so every run's unit is the same full flush and the arms
+/// compare in it.
+fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Yardstick {
+    let block = |c: &mut astream_broker::Client, subject: &str, seq: &mut u64| -> Vec<f64> {
+        (0..CALIBRATION_PUBLISHES)
+            .map(|_| {
+                *seq += 1;
+                let t0 = clock.us();
+                c.publish(CALIBRATION_PRODUCER, *seq, subject, b"yardstick")
+                    .unwrap_or_else(|e| panic!("yardstick publish {seq} on {subject}: {e}"));
+                ms(t0, clock.us())
+            })
+            .collect()
+    };
+    let mut strict = ruler.strict_client(w);
+    let mut ordered = ruler.ordered_client();
+    // The person lane a bridge's `post to=h-bench` would land on: escalated by
+    // aterm's `Subject("/f/*/in/p/>")` rule, whoever writes it.
+    let escalated = format!(
+        "{}/note",
+        aterm_link::subject::person_lane(FLEET, "h-bench", &w.node)
+    );
+    Yardstick {
+        strict: block(
+            &mut strict,
+            &format!("/f/{FLEET}/bench/strict-publish"),
+            seq,
+        ),
+        ordered: block(
+            &mut ordered,
+            &format!("/f/{FLEET}/bench/ordered-publish"),
+            seq,
+        ),
+        escalated: block(&mut ordered, &escalated, seq),
+    }
 }
 
-/// The broker the yardstick publishes to: the world's own when the world is
-/// Strict (what every run before the tier knob measured), else a Strict broker
-/// opened for it in the world's scratch directory, served on its own socket
-/// and dropped with this. One fsync either way, on the same disk.
+/// One yardstick block of each kind ([`calibrate`]), in milliseconds.
+struct Yardstick {
+    /// Bare publishes to a strict broker: the unit.
+    strict: Vec<f64>,
+    /// Bare publishes to an ordered broker (aterm's options, the default
+    /// horizon), on a subject its table does not escalate.
+    ordered: Vec<f64>,
+    /// The same, on a person-lane subject its table escalates.
+    escalated: Vec<f64>,
+}
+
+/// The brokers the yardstick publishes to: for the strict block, the world's
+/// own when the world is Strict (what every run before the tier knob
+/// measured), else a Strict broker opened for it in the world's scratch
+/// directory; for the ordered and escalated blocks, always an ordered broker
+/// of its own, opened with aterm's ordered options (the default horizon and
+/// aterm's table), so the world's log holds none of their records. Each is
+/// served on its own socket and dropped with this. One flush per publish, on
+/// the same disk.
 struct Ruler {
     own: Option<(Broker, BrokerHandle)>,
     sock: String,
+    ordered: (Broker, BrokerHandle),
+    ordered_sock: String,
 }
 
 impl Ruler {
     fn for_world(w: &World) -> Ruler {
-        if w.durability == Durability::Strict {
+        let serve = |log: &str, sock: &str, tier: aterm_link::durability::Durability| {
+            let sock = w.tmp.join(sock).to_string_lossy().into_owned();
+            let broker = harness::open_broker(w.tmp.join(log), &harness::broker_opts(tier));
+            let handle = broker
+                .serve(&sock)
+                .unwrap_or_else(|e| panic!("serve the yardstick's broker on {sock}: {e}"));
+            ((broker, handle), sock)
+        };
+        let (ordered, ordered_sock) = serve(
+            "yo.log",
+            "yo.sock",
+            aterm_link::durability::Durability::Ordered,
+        );
+        if w.opts.durability == Durability::Strict {
             return Ruler {
                 own: None,
                 sock: w.broker_sock.clone(),
+                ordered,
+                ordered_sock,
             };
         }
-        let sock = w.tmp.join("y.sock").to_string_lossy().into_owned();
-        let broker = Broker::open_guarded_with(
-            w.tmp.join("y.log"),
-            harness::SECRET.to_vec(),
-            Durability::Strict,
-        )
-        .expect("the yardstick's Strict broker");
-        let handle = broker.serve(&sock).expect("serve the yardstick's broker");
+        let (own, sock) = serve(
+            "y.log",
+            "y.sock",
+            aterm_link::durability::Durability::Strict,
+        );
         Ruler {
-            own: Some((broker, handle)),
+            own: Some(own),
             sock,
+            ordered,
+            ordered_sock,
         }
     }
 
-    /// A client holding the whole fleet's cap, as [`World::god`] is.
-    fn client(&self, w: &World) -> astream_broker::Client {
-        if self.own.is_none() {
-            return w.god();
-        }
-        let mut c = harness::broker_client(&self.sock);
+    /// A client of `sock` holding the whole fleet's cap, as [`World::god`] is.
+    fn god_of(sock: &str) -> astream_broker::Client {
+        let mut c = harness::broker_client(sock);
         let cap = astream_cap::mint(harness::SECRET, &format!("/f/{FLEET}/>"))
             .expect("mint the yardstick's cap");
         c.attach(&cap.filter, &cap.tag)
             .expect("attach the yardstick's cap");
         c
+    }
+
+    /// A god client of the strict block's broker.
+    fn strict_client(&self, w: &World) -> astream_broker::Client {
+        if self.own.is_none() {
+            return w.god();
+        }
+        Self::god_of(&self.sock)
+    }
+
+    /// A god client of the ordered blocks' broker.
+    fn ordered_client(&self) -> astream_broker::Client {
+        Self::god_of(&self.ordered_sock)
+    }
+
+    /// What the ordered blocks' broker serves (astream serves ordered strict
+    /// off Apple and off the boot volume): the report says, beside them.
+    fn ordered_served(&self) -> astream_broker::ServedInfo {
+        self.ordered.0.served_durability()
     }
 }
 
@@ -596,20 +754,32 @@ impl Drop for Ruler {
         if let Some((_, handle)) = &mut self.own {
             handle.shutdown();
         }
+        self.ordered.1.shutdown();
     }
 }
 
-/// The astream tier a [`Tier`] names.
-fn durability(tier: Tier) -> Durability {
-    match tier {
-        Tier::Strict => Durability::Strict,
-        Tier::Relaxed => Durability::Relaxed,
+/// The options a run's world opens its broker with: aterm's own for the arm's
+/// tier ([`harness::broker_opts`]: the tier and, on a weak one, aterm's
+/// escalation table) — so the ordered arm measures aterm's real table — with
+/// the arm's horizon when it names one.
+fn opts_for(spec: &Spec) -> OpenOptions {
+    use aterm_link::durability::Durability as Aterm;
+    let mut opts = harness::broker_opts(match spec.durability {
+        Tier::Strict => Aterm::Strict,
+        Tier::Ordered => Aterm::Ordered,
+        Tier::Relaxed => Aterm::Relaxed,
+    });
+    if let Some(ms) = spec.horizon_ms {
+        opts.durability = Durability::Ordered {
+            horizon: Some(Duration::from_millis(ms)),
+        };
     }
+    opts
 }
 
-/// The yardstick's p50 over both blocks.
-fn yardstick(before: &[f64], after: &[f64]) -> Option<f64> {
-    let pooled: Vec<f64> = before.iter().chain(after).copied().collect();
+/// The strict yardstick's p50 over both blocks: the run's unit.
+fn yardstick(before: &Yardstick, after: &Yardstick) -> Option<f64> {
+    let pooled: Vec<f64> = before.strict.iter().chain(&after.strict).copied().collect();
     stats::summarize(&pooled).map(|s| s.p50)
 }
 
@@ -620,14 +790,52 @@ fn per_unit(v: Option<f64>, unit: Option<f64>) -> Option<f64> {
 }
 
 /// The yardstick's table rows.
-fn yardstick_rows(before: &[f64], after: &[f64]) -> Vec<String> {
+fn yardstick_rows(ruler: &Ruler, before: &Yardstick, after: &Yardstick) -> Vec<String> {
+    let served = ruler.ordered_served();
     vec![
-        "| yardstick: one bare Strict publish, client -> broker (ms) | n | mean | p50 | p95 | p99 |"
+        "| yardstick: one bare publish, client -> broker (ms) | n | mean | p50 | p95 | p99 |"
             .to_string(),
         "|---|---:|---:|---:|---:|---:|".to_string(),
-        stats::row("before the phases", before),
-        stats::row("after the phases", after),
+        stats::row("strict, before the phases (the unit)", &before.strict),
+        stats::row("strict, after the phases (the unit)", &after.strict),
+        stats::row("ordered, before the phases", &before.ordered),
+        stats::row("ordered, after the phases", &after.ordered),
+        stats::row(
+            "ordered, escalated (a person lane), before",
+            &before.escalated,
+        ),
+        stats::row(
+            "ordered, escalated (a person lane), after",
+            &after.escalated,
+        ),
+        String::new(),
+        format!(
+            "The ordered yardstick's broker serves {} (asked {}, reason {:?}).\n",
+            aterm_link::durability::tier_name(served.served),
+            aterm_link::durability::tier_name(served.requested),
+            served.reason
+        ),
     ]
+}
+
+/// The yardstick blocks for the report's JSON.
+fn yardstick_json(
+    ruler: &Ruler,
+    before: &Yardstick,
+    after: &Yardstick,
+    unit: Option<f64>,
+) -> Value {
+    json!({
+        "what": "one bare publish round trip, a client in the bench process to a broker, serial: strict (the unit: one full flush), ordered (one barrier) and ordered on an escalated person-lane subject (one full flush before the ack)",
+        "before_ms": stats::to_json(&before.strict),
+        "after_ms": stats::to_json(&after.strict),
+        "p50_ms": unit.map(stats::round3),
+        "ordered_before_ms": stats::to_json(&before.ordered),
+        "ordered_after_ms": stats::to_json(&after.ordered),
+        "escalated_before_ms": stats::to_json(&before.escalated),
+        "escalated_after_ms": stats::to_json(&after.escalated),
+        "ordered_served": aterm_link::durability::tier_name(ruler.ordered_served().served),
+    })
 }
 
 fn fmt_x(v: Option<f64>) -> String {
@@ -660,6 +868,10 @@ struct LatRaw {
     texts: Vec<String>,
     /// The newest row id it listed.
     since: u64,
+    /// The broker's flushes over the measured round trips: from just before
+    /// the first measured post to the end of the last one's idle wait (its
+    /// commit acked).
+    flushes: FlushCounts,
 }
 
 /// The latency phase: `warmup + samples` round trips, one at a time.
@@ -679,12 +891,23 @@ struct LatRaw {
 /// and a bridge that writes anything between a delivery and its commit fails
 /// the run by name rather than leaving a fsync of tail in every sample.
 /// Back-to-back traffic is what [`burst`] measures.
+///
+/// ON AN ORDERED BROKER the wait is for the commit to be ACKED (the visible
+/// head), not durable: the next message is posted while the horizon's full
+/// flush may still be owed, as it would be in use, and when that flush lands
+/// inside a later round trip that round trip pays for it — which the full
+/// flush count and the p95 say.
 fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &str) -> LatRaw {
     let mut ctl = w.ctl();
     let mut since = newest_id(&mut ctl, b);
     let mut out = Vec::with_capacity(spec.samples);
     let mut texts = Vec::with_capacity(spec.warmup + spec.samples);
+    let mut flushes_before = broker.flush_counts();
     for i in 0..spec.warmup + spec.samples {
+        if i == spec.warmup {
+            // Between two round trips: the last warm-up's commit is acked.
+            flushes_before = broker.flush_counts();
+        }
         let text = format!("lat-{i}");
         let (t_call, t_ret) = post(&mut ctl, clock, a, b, &text);
         let (woke_at, t_seen) =
@@ -718,6 +941,7 @@ fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &s
         samples: out,
         texts,
         since,
+        flushes: flushes_between(flushes_before, broker.flush_counts()),
     }
 }
 
@@ -729,11 +953,16 @@ struct BurstRaw {
     rets: Vec<u64>,
     /// Each message's row, by index ([`tally`]: each seen exactly once).
     seen: Vec<Seen>,
-    /// The broker's FLUSHES over the burst: writer batches that appended a
+    /// The broker's BATCHES over the burst: writer batches that appended a
     /// record, from just before the first post to the record past the last
-    /// message (the burst's commit) — on the Strict log one `fsync` each, the
-    /// cost pipelining folds ([`burst`]).
-    flushes: u64,
+    /// message (the burst's commit) — on the Strict log one full flush each,
+    /// on the Ordered one one barrier each: the cost pipelining folds
+    /// ([`burst`]). (Entries before the ordered arm called these
+    /// `broker_flushes`: on their strict broker the two were one.)
+    batches: u64,
+    /// The flushes those batches cost, by kind, over the same window
+    /// ([`Broker::flush_counts`]).
+    flushes: FlushCounts,
 }
 
 /// The burst phase, reading `b`'s inbox on from row `since` (the latency
@@ -774,6 +1003,7 @@ fn burst(
         stats.writer_batches - stats.empty_batches
     };
     let flushed_before = flushed();
+    let flush_counts_before = broker.flush_counts();
     let (t0, rets, consumed) = std::thread::scope(|scope| {
         let consumer = scope.spawn(|| {
             let _close = CloseOnDrop(&credit);
@@ -819,7 +1049,8 @@ fn burst(
     .unwrap_or_else(|| {
         panic!("burst: nothing landed after the last message's offset {b_last} within {DEADLINE:?}")
     });
-    let flushes = flushed() - flushed_before;
+    let batches = flushed() - flushed_before;
+    let flushes = flushes_between(flush_counts_before, broker.flush_counts());
     post(&mut ctl, clock, a, b, "fence-0");
     consume(&mut ctl, clock, b, consumed.since, "fence-", 1, None)
         .unwrap_or_else(|e| panic!("burst fence: {e}"));
@@ -828,15 +1059,40 @@ fn burst(
         t0,
         rets,
         seen,
+        batches,
         flushes,
     }
+}
+
+/// What a world's broker serves, in one line for its section: the tier in
+/// force, the one asked, why they differ, the horizon and the rule count —
+/// read from the broker itself (astream serves ordered strict off Apple and
+/// off the boot volume), never from the arm's word.
+fn served_line(w: &World) -> String {
+    let s = w
+        .broker
+        .as_ref()
+        .expect("the world serves its own broker")
+        .served_durability();
+    let horizon = s
+        .horizon_ms
+        .map_or_else(|| "none".to_string(), |ms| format!("{ms} ms"));
+    format!(
+        "The world's broker serves **{}** (asked {}, reason {:?}; horizon {horizon}; {} \
+         escalation rules).\n",
+        aterm_link::durability::tier_name(s.served),
+        aterm_link::durability::tier_name(s.requested),
+        s.reason,
+        s.rules
+    )
 }
 
 /// The messaging world: boot, measure, census.
 fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the messaging world");
-    let mut w = World::boot_durable("fbench-msg", durability(spec.durability));
+    let mut w = World::boot_opts("fbench-msg", opts_for(spec));
     w.wait_ready();
+    let served = served_line(&w);
     let (a, b) = w.two_sessions();
     wait_live(
         &w,
@@ -851,7 +1107,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "fabric bench: latency, {} round trips ({} warm-up)",
         spec.samples, spec.warmup
     );
-    let ((lat_raw, bur), timeline) = sampled(&w, clock, || {
+    let ((lat_raw, bur), heads) = sampled(&w, clock, || {
         let broker = w.broker.as_ref().expect("the world serves its own broker");
         let lat = latency(&w, broker, spec, clock, &a, &b);
         eprintln!(
@@ -860,6 +1116,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             spec.burst_senders()
         );
         let bur = burst(&w, broker, spec, clock, &a, &b, lat.since);
+        await_durable(broker);
         (lat, bur)
     });
     let cal_after = calibrate(&ruler, &w, clock, &mut cal_seq);
@@ -896,25 +1153,27 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             )
         });
     }
-    let lat = lat_raw.samples;
+    let lat = &lat_raw.samples;
 
     // --- latency
     let mut post_call = Vec::new();
     let mut deliver = Vec::new();
     let mut end_to_end = Vec::new();
-    let mut to_landed = Vec::new();
-    let mut landed_to_visible = Vec::new();
+    let mut to_acked = Vec::new();
+    let mut acked_to_visible = Vec::new();
+    let mut to_durable = Vec::new();
     let mut visible_to_committed = Vec::new();
-    for s in &lat {
+    for s in lat {
         let seq = seq_of(&s.text);
-        let landed = timeline.landed(seq);
-        let committed =
-            census::covering_commit(&recs, &group, seq, seq).and_then(|r| timeline.landed(r.seq));
+        let acked = heads.acked.landed(seq);
+        let committed = census::covering_commit(&recs, &group, seq, seq)
+            .and_then(|r| heads.acked.landed(r.seq));
         post_call.push(ms(s.t_call, s.t_ret));
         deliver.push(ms(s.t_ret, s.t_seen));
         end_to_end.push(ms(s.t_call, s.t_seen));
-        to_landed.extend(ms_opt(Some(s.t_ret), landed));
-        landed_to_visible.extend(ms_opt(landed, Some(s.t_seen)));
+        to_acked.extend(ms_opt(Some(s.t_ret), acked));
+        acked_to_visible.extend(ms_opt(acked, Some(s.t_seen)));
+        to_durable.extend(ms_opt(Some(s.t_ret), heads.durable.landed(seq)));
         visible_to_committed.extend(ms_opt(Some(s.t_seen), committed));
     }
     let lat_lo = seq_of(&lat.first().expect("at least one sample").text);
@@ -926,10 +1185,12 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     // --- burst
     let n = bur.rets.len();
     let mut b_deliver = Vec::new();
-    let mut b_to_landed = Vec::new();
-    let mut b_landed_to_visible = Vec::new();
+    let mut b_to_acked = Vec::new();
+    let mut b_acked_to_visible = Vec::new();
+    let mut b_to_durable = Vec::new();
     let mut seqs = Vec::with_capacity(n);
-    let mut landed_all = Vec::with_capacity(n);
+    let mut acked_all = Vec::with_capacity(n);
+    let mut durable_all = Vec::with_capacity(n);
     for (j, &t_ret) in bur.rets.iter().enumerate() {
         let seen = bur.seen[j];
         let seq = seq_of(&format!("burst-{j}"));
@@ -938,19 +1199,25 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "burst-{j}: the row's off= is the record's offset"
         );
         seqs.push(seq);
-        let landed = timeline.landed(seq);
-        landed_all.push(landed);
+        let acked = heads.acked.landed(seq);
+        let durable = heads.durable.landed(seq);
+        acked_all.push(acked);
+        durable_all.push(durable);
         b_deliver.push(ms(t_ret, seen.t));
-        b_to_landed.extend(ms_opt(Some(t_ret), landed));
-        b_landed_to_visible.extend(ms_opt(landed, Some(seen.t)));
+        b_to_acked.extend(ms_opt(Some(t_ret), acked));
+        b_acked_to_visible.extend(ms_opt(acked, Some(seen.t)));
+        b_to_durable.extend(ms_opt(Some(t_ret), durable));
     }
+    let latest = |all: &[Option<u64>]| -> Option<u64> {
+        all.iter()
+            .copied()
+            .collect::<Option<Vec<u64>>>()
+            .and_then(|v| v.into_iter().max())
+    };
     let t_sent = bur.rets.iter().copied().max().unwrap_or(bur.t0);
     let t_all_visible = bur.seen.iter().map(|s| s.t).max().unwrap_or(bur.t0);
-    let t_all_landed = landed_all
-        .iter()
-        .copied()
-        .collect::<Option<Vec<u64>>>()
-        .and_then(|v| v.into_iter().max());
+    let t_all_acked = latest(&acked_all);
+    let t_all_durable = latest(&durable_all);
     let b_lo = seqs.iter().copied().min().unwrap_or(0);
     let b_last = seqs.iter().copied().max().unwrap_or(0);
     // THE FENCE HELD: the burst's commit landed before the fence's record, so
@@ -963,7 +1230,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         )
     });
     let cover = census::covering_commit(&recs, &group, b_last, b_last);
-    let t_covered = cover.and_then(|r| timeline.landed(r.seq));
+    let t_covered = cover.and_then(|r| heads.acked.landed(r.seq));
     let b_hi = cover.map_or(b_last, |r| r.seq);
     let b_census = census::census(census::window(&recs, b_lo, b_hi));
     let after = |t: Option<u64>| t.map(|t| stats::round3(ms(bur.t0, t)));
@@ -975,15 +1242,12 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 
     let json = json!({
         "node": w.node.clone(),
-        "head_changes_sampled": timeline.len(),
-        "yardstick": {
-            "what": "one bare Strict publish round trip, a client in the bench process to the world's broker, serial",
-            "before_ms": stats::to_json(&cal_before),
-            "after_ms": stats::to_json(&cal_after),
-            "p50_ms": unit.map(stats::round3),
-        },
+        "served": served.trim_end(),
+        "head_changes_sampled": heads.acked.len(),
+        "durable_head_changes_sampled": heads.durable.len(),
+        "yardstick": yardstick_json(&ruler, &cal_before, &cal_after, unit),
         "normalized": {
-            "what": "the measure divided by the yardstick's p50: how many bare Strict publishes it costs. Takes the disk's speed out, not CPU contention: compare runs at similar load",
+            "what": "the measure divided by the strict yardstick's p50: how many bare Strict publishes it costs. Takes the disk's speed out, not CPU contention: compare runs at similar load",
             "deliver_p50_in_publishes": deliver_x,
             "burst_ms_per_message": burst_ms_per_message.map(stats::round3),
             "burst_publishes_per_message": burst_x,
@@ -994,9 +1258,11 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "post_call_ms": stats::to_json(&post_call),
             "deliver_ms": stats::to_json(&deliver),
             "end_to_end_ms": stats::to_json(&end_to_end),
-            "post_to_durable_ms": stats::to_json(&to_landed),
-            "durable_to_visible_ms": stats::to_json(&landed_to_visible),
-            "visible_to_commit_durable_ms": stats::to_json(&visible_to_committed),
+            "post_to_acked_ms": stats::to_json(&to_acked),
+            "acked_to_visible_ms": stats::to_json(&acked_to_visible),
+            "post_to_durable_head_ms": stats::to_json(&to_durable),
+            "visible_to_commit_acked_ms": stats::to_json(&visible_to_committed),
+            "flushes": flushes_json(lat_raw.flushes, lat.len()),
             "census": census::to_json(&lat_census, lat.len(), (lat_lo, lat_hi)),
         },
         "burst": {
@@ -1004,16 +1270,19 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "senders": bur.senders,
             "in_flight_max": BURST_WINDOW,
             "all_accepted_ms": after(Some(t_sent)),
-            "all_durable_ms": after(t_all_landed),
+            "all_acked_ms": after(t_all_acked),
+            "all_durable_head_ms": after(t_all_durable),
             "all_visible_ms": after(Some(t_all_visible)),
             "commit_covered_ms": after(t_covered),
-            "durable_rate_per_s": rate(t_all_landed),
+            "acked_rate_per_s": rate(t_all_acked),
             "visible_rate_per_s": rate(Some(t_all_visible)),
-            "broker_flushes": bur.flushes,
-            "broker_flushes_per_message": (n > 0).then(|| stats::round3(bur.flushes as f64 / n as f64)),
+            "broker_batches": bur.batches,
+            "broker_batches_per_message": (n > 0).then(|| stats::round3(bur.batches as f64 / n as f64)),
+            "flushes": flushes_json(bur.flushes, n),
             "deliver_ms": stats::to_json(&b_deliver),
-            "post_to_durable_ms": stats::to_json(&b_to_landed),
-            "durable_to_visible_ms": stats::to_json(&b_landed_to_visible),
+            "post_to_acked_ms": stats::to_json(&b_to_acked),
+            "acked_to_visible_ms": stats::to_json(&b_acked_to_visible),
+            "post_to_durable_head_ms": stats::to_json(&b_to_durable),
             "census": census::to_json(&b_census, n, (b_lo, b_hi)),
         },
     });
@@ -1025,11 +1294,16 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "## Messaging: post -> deliver on one node (node `{}`)\n",
             w.node
         ),
+        served.clone(),
         format!(
             "{} round trips after {} warm-up, one at a time on an idle bridge: session A posts \
-             `kind=note` (no `--wait`) to session B, and B's `await inbox` is answered. Durable = \
-             the record's offset first seen under the broker's visible head; the inbox commit \
-             follows the delivery, after the row is visible.\n",
+             `kind=note` (no `--wait`) to session B, and B's `await inbox` is answered. Acked = \
+             the record's offset first seen under the broker's visible head (its publish acked, \
+             readers may see it); durable = first seen under its durable head (on stable media \
+             by a full flush). On a strict broker the two are one; on an ordered one durable \
+             follows at the next full flush, at most the horizon plus a batch and a flush after \
+             the first uncovered ack; on a relaxed one no record is ever durable. The inbox \
+             commit follows the delivery, after the row is visible.\n",
             lat.len(),
             spec.warmup
         ),
@@ -1038,10 +1312,12 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         stats::row("post call (request -> `OK`)", &post_call),
         stats::row("**post -> visible in B's inbox**", &deliver),
         stats::row("post call -> visible (end to end)", &end_to_end),
-        stats::row("post -> durable on the broker", &to_landed),
-        stats::row("durable -> visible", &landed_to_visible),
-        stats::row("visible -> the inbox commit durable", &visible_to_committed),
+        stats::row("post -> acked on the broker", &to_acked),
+        stats::row("acked -> visible", &acked_to_visible),
+        stats::row("post -> durable on the broker", &to_durable),
+        stats::row("visible -> the inbox commit acked", &visible_to_committed),
         String::new(),
+        flushes_line(lat_raw.flushes, lat.len()),
         format!(
             "Records the broker wrote per delivered message (offsets {lat_lo}..={lat_hi}, through \
              the commit covering the last one):\n"
@@ -1068,14 +1344,18 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             fmt_ms(after(Some(t_sent)))
         ),
         format!(
-            "| every record durable on the broker | {} | {} |",
-            fmt_ms(after(t_all_landed)),
-            fmt_rate(rate(t_all_landed))
+            "| every record acked on the broker | {} | {} |",
+            fmt_ms(after(t_all_acked)),
+            fmt_rate(rate(t_all_acked))
         ),
         format!(
             "| **every message visible in the recipient's inbox** | {} | {} |",
             fmt_ms(after(Some(t_all_visible))),
             fmt_rate(rate(Some(t_all_visible)))
+        ),
+        format!(
+            "| every record durable on the broker | {} | – |",
+            fmt_ms(after(t_all_durable))
         ),
         format!(
             "| the recipient bridge's commit covers them | {} | – |",
@@ -1085,38 +1365,38 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "| per message (ms) | n | mean | p50 | p95 | p99 |".to_string(),
         "|---|---:|---:|---:|---:|---:|".to_string(),
         stats::row("post -> visible", &b_deliver),
-        stats::row("post -> durable", &b_to_landed),
-        stats::row("durable -> visible", &b_landed_to_visible),
+        stats::row("post -> acked", &b_to_acked),
+        stats::row("acked -> visible", &b_acked_to_visible),
+        stats::row("post -> durable", &b_to_durable),
         String::new(),
         format!(
-            "Broker flushes over the burst (writer batches that appended a record, through the \
+            "Broker batches over the burst (writer batches that appended a record, through the \
              record past the last message): {} — {} per message.\n",
-            bur.flushes,
+            bur.batches,
             if n == 0 {
                 "–".to_string()
             } else {
-                format!("{:.3}", bur.flushes as f64 / n as f64)
+                format!("{:.3}", bur.batches as f64 / n as f64)
             }
         ),
+        flushes_line(bur.flushes, n),
         format!("Records per delivered message (offsets {b_lo}..={b_hi}):\n"),
     ]);
     md.extend(census::rows(&b_census, n));
     md.push(String::new());
-    md.extend(yardstick_rows(&cal_before, &cal_after));
-    md.extend([
-        String::new(),
-        format!(
-            "Normalized to the yardstick's p50 ({} ms): post -> visible p50 = **{} publishes**; \
-             the burst = {} ms per message = **{} publishes per message**. The ratio takes the \
-             disk's speed out of a comparison, not CPU contention (the yardstick is one thread \
-             and one fsync; the fabric is three processes): compare runs taken at similar load \
-             averages.\n",
-            fmt_x(unit),
-            fmt_x(deliver_x),
-            fmt_x(burst_ms_per_message),
-            fmt_x(burst_x)
-        ),
-    ]);
+    md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
+    md.extend([format!(
+        "Normalized to the strict yardstick's p50 ({} ms): post -> visible p50 = **{} \
+             publishes**; the burst = {} ms per message = **{} publishes per message**. The ratio \
+             takes the disk's speed out of a comparison, not CPU contention (the yardstick is one \
+             thread and one flush; the fabric is three processes): compare runs taken at similar \
+             load averages.\n",
+        fmt_x(unit),
+        fmt_x(deliver_x),
+        fmt_x(burst_ms_per_message),
+        fmt_x(burst_x)
+    )]);
+    drop(ruler);
     (json, md)
 }
 
@@ -1292,8 +1572,9 @@ impl AttachRecords {
 /// at each size, census.
 fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the attach world");
-    let mut w = World::boot_durable("fbench-att", durability(spec.durability));
+    let mut w = World::boot_opts("fbench-att", opts_for(spec));
     w.wait_ready();
+    let served = served_line(&w);
     let first = until("aterm's boot session", || {
         w.sessions().first().map(|(_, sid, _)| sid.clone())
     });
@@ -1302,7 +1583,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let ruler = Ruler::for_world(&w);
     let mut cal_seq = 0;
     let cal_before = calibrate(&ruler, &w, clock, &mut cal_seq);
-    let (rounds, timeline) = sampled(&w, clock, || {
+    let (rounds, heads) = sampled(&w, clock, || {
         let broker = w.broker.as_ref().expect("the world serves its own broker");
         let mut sids = vec![first];
         let mut pid = w.bridge_pid();
@@ -1352,6 +1633,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 });
             }
         }
+        await_durable(broker);
         rounds
     });
     let cal_after = calibrate(&ruler, &w, clock, &mut cal_seq);
@@ -1361,7 +1643,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 
     // Each round, read off the log: where the new bridge's rows landed.
     let mut by_size: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
-    let mut series: BTreeMap<usize, [Vec<f64>; 5]> = BTreeMap::new();
+    let mut series: BTreeMap<usize, [Vec<f64>; 6]> = BTreeMap::new();
     let mut records: BTreeMap<usize, AttachRecords> = BTreeMap::new();
     for r in &rounds {
         let rows: Vec<(u64, &str, &str)> = recs
@@ -1379,9 +1661,10 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 )
             });
         let last = found.last();
-        let t_node = timeline.landed(found.node);
-        let t_all = timeline.landed(last);
-        let t_last_session = found.last_session().and_then(|s| timeline.landed(s));
+        let t_node = heads.acked.landed(found.node);
+        let t_all = heads.acked.landed(last);
+        let t_last_session = found.last_session().and_then(|s| heads.acked.landed(s));
+        let t_all_durable = heads.durable.landed(last);
         let in_window = || census::window(&recs, r.mark, last);
         let c = census::census(in_window().filter(|rec| !fired.contains(&rec.seq)));
         let fired_here = in_window().filter(|rec| fired.contains(&rec.seq)).count();
@@ -1391,6 +1674,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         s[2].extend(ms_opt(t_node, t_last_session));
         s[3].push(ms(r.t_kill, r.t_pid));
         s[4].extend(ms_opt(Some(r.t_kill), t_all));
+        s[5].extend(ms_opt(Some(r.t_pid), t_all_durable));
         by_size.entry(r.sessions).or_default().push(json!({
             "mark": r.mark,
             "pid": r.pid,
@@ -1411,11 +1695,13 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "## Attach: a bridge starting with N sessions (node `{}`)\n",
             w.node
         ),
+        served.clone(),
         format!(
             "The bridge is SIGKILLed and aterm's supervisor relaunches it; the clock starts when \
              the new bridge writes its pid (its aterm connection is up) and stops when its node \
              row and every session's presence row — the rows under its own pid and incarnation, \
-             whichever lands last — are durable again. Inside that window the bench asks the \
+             whichever lands last — are acked again (on a strict broker, durable; \"pid -> every \
+             row durable\" is the durable head's). Inside that window the bench asks the \
              broker nothing: it holds one subscription to the node's presence rows, opened before \
              the kill, and reads the times off the log afterwards. \"node row -> last session \
              row\" is negative for a bridge that publishes a session's row before its node's. {} \
@@ -1436,11 +1722,12 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "|---:|---:|---:|---:|---:|".to_string(),
     ];
     let names = [
-        "**pid -> every row durable (attach)**",
-        "pid -> node row durable",
+        "**pid -> every row acked (attach)**",
+        "pid -> node row acked",
         "node row -> last session row",
         "kill -> new pid (supervisor relaunch)",
-        "kill -> every row durable",
+        "kill -> every row acked",
+        "pid -> every row durable",
     ];
     for (size, s) in &series {
         for (name, values) in names.iter().zip(s.iter()) {
@@ -1475,6 +1762,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "node_to_last_session_ms": stats::to_json(&s[2]),
             "kill_to_pid_ms": stats::to_json(&s[3]),
             "kill_to_all_ms": stats::to_json(&s[4]),
+            "attach_durable_ms": stats::to_json(&s[5]),
             "records_per_attach": stats::to_json(&recs_per),
             "commit_records_per_attach": stats::to_json(&commits_per),
             "records_by_kind_mean": Value::Object(by_kind),
@@ -1512,20 +1800,18 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         ));
     }
     md.push(String::new());
-    md.extend(yardstick_rows(&cal_before, &cal_after));
-    md.push(String::new());
+    md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
     md.extend(normalized);
     md.push(String::new());
     let json = json!({
         "node": w.node.clone(),
-        "head_changes_sampled": timeline.len(),
-        "yardstick": {
-            "before_ms": stats::to_json(&cal_before),
-            "after_ms": stats::to_json(&cal_after),
-            "p50_ms": unit.map(stats::round3),
-        },
+        "served": served.trim_end(),
+        "head_changes_sampled": heads.acked.len(),
+        "durable_head_changes_sampled": heads.durable.len(),
+        "yardstick": yardstick_json(&ruler, &cal_before, &cal_after, unit),
         "sizes": Value::Array(sizes),
     });
+    drop(ruler);
     (json, md)
 }
 
@@ -1533,19 +1819,31 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 // the run
 // ---------------------------------------------------------------------------
 
-/// What the run's broker promised, for the report's head and its JSON: under
-/// Relaxed, every "durable" in the tables is an ack into the page cache.
-fn broker_note(tier: Tier) -> &'static str {
-    match tier {
-        Tier::Strict => {
-            "astream Broker::open_guarded (Durability::Strict: every ack after an fsync)"
-        }
-        Tier::Relaxed => {
-            "astream Broker::open_guarded_with(Durability::Relaxed): every ack after the \
-             batch's page-cache write, NO fsync. The ceiling arm, not what aterm runs: every \
-             \"durable\" below means acked into the page cache. The yardstick is still one Strict \
-             publish, on a Strict broker of its own."
-        }
+/// What the run's broker promised, for the report's head and its JSON. Each
+/// world's section also says what its broker SERVES, read from the broker
+/// (astream serves ordered strict off Apple and off the boot volume).
+fn broker_note(spec: &Spec) -> String {
+    match spec.durability {
+        Tier::Strict => "astream Broker::open_opts with aterm's strict options (Durability::Strict: \
+                         every ack after a full flush, so acked and durable are one)"
+            .to_string(),
+        Tier::Ordered => format!(
+            "astream Broker::open_opts with aterm's ordered options (Durability::Ordered at a {} \
+             ms horizon, aterm's four-rule escalation table): every ack after an ordering barrier \
+             (F_BARRIERFSYNC), a full flush once the horizon has passed since the first ack no \
+             full flush covers (at most the horizon plus a batch and a flush after it) and \
+             before the ack of every \
+             escalated record. \"Acked\" below is the barrier's; \"durable\" the full flush's. \
+             The yardstick's unit is still one Strict publish, on a Strict broker of its own.",
+            spec.horizon_ms.unwrap_or(ORDERED_HORIZON_MS)
+        ),
+        Tier::Relaxed => "astream Broker::open_opts with aterm's relaxed options \
+                          (Durability::Relaxed, aterm's escalation table): every ack after the \
+                          batch's page-cache write, NO flush. The ceiling arm, not what aterm runs \
+                          by default: \"acked\" below means in the page cache, and no record of the \
+                          run is ever durable. The yardstick's unit is still one Strict publish, on \
+                          a Strict broker of its own."
+            .to_string(),
     }
 }
 
@@ -1561,10 +1859,7 @@ pub fn measure(spec: &Spec) -> Report {
     let (messaging, messaging_md) = messaging(spec, clock);
     let (pingpong, pingpong_md) = pingpong::measure(spec, clock);
     let (attach, attach_md) = attach(spec, clock);
-    let mut md = vec![
-        format!("**Broker:** {}", broker_note(spec.durability)),
-        String::new(),
-    ];
+    let mut md = vec![format!("**Broker:** {}", broker_note(spec)), String::new()];
     md.extend(messaging_md);
     md.extend(pingpong_md);
     md.extend(attach_md);
@@ -1580,7 +1875,7 @@ pub fn measure(spec: &Spec) -> Report {
         "build": arm.map_or("a binary in neither arm's build directory", Profile::describe),
         "aterm_binary": harness::ATERM,
         "aterm_binary_identity": { "start": binary_at_start, "end": binary_at_end },
-        "broker": broker_note(spec.durability),
+        "broker": broker_note(spec),
         "clock": "one monotonic origin in the bench process; microsecond stamps",
         "elapsed_s": stats::round3(started.elapsed().as_secs_f64()),
         "messaging": messaging,
@@ -1601,6 +1896,51 @@ fn binary_identity() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// EACH ARM OPENS ITS BROKER AS ATERM OPENS IT: aterm's options for the
+    /// tier — the escalation table on the weak tiers, none on strict — and
+    /// the arm's horizon on ordered, aterm's own unless named. The std-only
+    /// spec's spelling of that horizon is aterm's.
+    ///
+    /// THE DEFAULT ARM IS WHAT ATERM SHIPS: a bare spec opens the broker as
+    /// aterm opens its guarded one by default
+    /// (`aterm_link::durability::default_for`), so a bare `verify perf
+    /// fabric` measures that configuration and moves with it.
+    #[test]
+    fn each_arm_opens_its_broker_with_aterms_options() {
+        use super::*;
+        use aterm_link::durability::{Durability as Aterm, escalation};
+        assert_eq!(
+            Duration::from_millis(ORDERED_HORIZON_MS),
+            aterm_link::durability::ORDERED_HORIZON
+        );
+        let spec = |words: &str| crate::spec::parse(&format!("out=/o {words}")).expect(words);
+        let bare = opts_for(&spec(""));
+        let shipped = harness::broker_opts(aterm_link::durability::default_for(true));
+        assert_eq!(
+            (bare.durability, bare.escalation),
+            (shipped.durability, shipped.escalation),
+            "the bench's default arm is aterm's default for its guarded broker"
+        );
+        let strict = opts_for(&spec("durability=strict"));
+        assert_eq!(strict.durability, Durability::Strict);
+        assert!(strict.escalation.is_empty());
+        assert_eq!(strict.guard.as_deref(), Some(harness::SECRET));
+        let ordered = opts_for(&spec("durability=ordered"));
+        assert_eq!(ordered.durability, Aterm::Ordered.tier());
+        assert_eq!(ordered.escalation, escalation());
+        let slow = opts_for(&spec("durability=ordered horizon_ms=1000"));
+        assert_eq!(
+            slow.durability,
+            Durability::Ordered {
+                horizon: Some(Duration::from_millis(1000))
+            }
+        );
+        assert_eq!(slow.escalation, escalation(), "the horizon only");
+        let relaxed = opts_for(&spec("durability=relaxed"));
+        assert_eq!(relaxed.durability, Durability::Relaxed);
+        assert_eq!(relaxed.escalation, escalation());
+    }
+
     #[test]
     fn an_inbox_listing_yields_its_message_rows() {
         use super::*;

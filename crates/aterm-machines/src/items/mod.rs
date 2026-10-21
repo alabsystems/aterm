@@ -58,7 +58,9 @@ impl Ctx {
     }
 }
 
-/// One setting the engine probes, plans, applies and verifies.
+/// One setting the engine probes, plans, applies and verifies, handed the `System` and
+/// context it runs against on each call; [`crate::engine::Bound`] makes it an
+/// [`aterm_converge::Item`].
 pub trait Item: Send + Sync {
     /// Stable id, unique within a run (e.g. `power.sleep`, `defaults.com.apple.dock.autohide@alice`).
     fn id(&self) -> String;
@@ -78,6 +80,14 @@ pub trait Item: Send + Sync {
     /// # Errors
     /// One line saying what did not work.
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String>;
+
+    /// Reapply an idempotent runtime setting whose saved preferences already match.
+    /// Called only in apply mode after an `Ok` probe. `Some` requires another matching
+    /// probe; `None` preserves the ordinary already-correct path without another read.
+    /// This must not change the user's saved choice or install background work.
+    fn refresh(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<Result<(), String>> {
+        None
+    }
 
     /// The command that undoes `apply`, if one exists.
     fn revert(&self) -> Option<String> {
@@ -105,7 +115,7 @@ pub trait Item: Send + Sync {
     /// (atpkg's exits 75 and 69). The engine then reports the item `Blocked` with this
     /// line rather than probing it again. `None`, the default, when the apply did its
     /// work or returned an error.
-    fn stood_aside(&self) -> Option<String> {
+    fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
         None
     }
 }

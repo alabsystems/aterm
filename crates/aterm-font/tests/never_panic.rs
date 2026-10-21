@@ -1268,38 +1268,79 @@ fn seeds_answer() {
 /// macOS host (one through a system face); 128 rounds a face (48 for a big
 /// one), with a generator per face, caught three and missed the CFF INDEX
 /// offset `n - 1` and the `glyf` point count `endpoints.last() + 1`.
+///
+/// The mutations are made in one fixed sequence, one generator over every
+/// seed in order, and each round's queries run on a pool: a round is
+/// independent of every other (its bytes and its own generator are fixed
+/// before it runs), so the pool asks exactly what one thread would.
 #[test]
 fn mutated_faces_never_panic() {
-    let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
-    for (label, seed) in seeds() {
-        let targets = targets(&seed, 0);
-        assert!(!targets.is_empty(), "seed `{label}` has no tables");
-        let glyph_programs: Vec<(usize, usize)> = targets
-            .iter()
-            .filter(|t| t.charstrings)
-            .flat_map(|&t| charstrings(&seed, t, t.cff2))
-            .take(2048)
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2));
+    let (send, queue) = std::sync::mpsc::sync_channel::<(usize, &str, u32, Vec<u8>)>(workers);
+    let queue = std::sync::Mutex::new(queue);
+    let mut panicked: Vec<(usize, &str, u32)> = std::thread::scope(|scope| {
+        let pool: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut panicked = Vec::new();
+                    loop {
+                        let next = queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv();
+                        let Ok((at, label, round, bytes)) = next else {
+                            return panicked;
+                        };
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut inner = Lcg(u64::from(round) ^ 0x5DEE_CE66);
+                            exercise(&bytes, &mut inner, 2048)
+                        }));
+                        if r.is_err() {
+                            panicked.push((at, label, round));
+                        }
+                    }
+                })
+            })
             .collect();
-        assert!(
-            !label.starts_with("CFF") || !glyph_programs.is_empty(),
-            "seed `{label}`: no charstrings found to mutate"
-        );
-        // Every glyph (a mutated charstring or glyph record is reached only
-        // by drawing that glyph), over fewer rounds for a big face.
-        let rounds = if seed.len() > 1 << 20 { 150 } else { 400 };
-        let glyph_cap = 2048;
-        for round in 0..rounds {
-            let bytes = mutate(&seed, &targets, &glyph_programs, &mut rng);
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut inner = Lcg(u64::from(round as u32) ^ 0x5DEE_CE66);
-                exercise(&bytes, &mut inner, glyph_cap)
-            }));
+        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
+        for (at, (label, seed)) in seeds().into_iter().enumerate() {
+            let targets = targets(&seed, 0);
+            assert!(!targets.is_empty(), "seed `{label}` has no tables");
+            let glyph_programs: Vec<(usize, usize)> = targets
+                .iter()
+                .filter(|t| t.charstrings)
+                .flat_map(|&t| charstrings(&seed, t, t.cff2))
+                .take(2048)
+                .collect();
             assert!(
-                r.is_ok(),
-                "seed `{label}` round {round} panicked (replay: mutate the seed with this round's LCG state)"
+                !label.starts_with("CFF") || !glyph_programs.is_empty(),
+                "seed `{label}`: no charstrings found to mutate"
             );
+            // Every glyph (a mutated charstring or glyph record is reached
+            // only by drawing that glyph, up to 2048 of them), over fewer
+            // rounds for a big face.
+            let rounds = if seed.len() > 1 << 20 { 150 } else { 400 };
+            for round in 0..rounds {
+                let bytes = mutate(&seed, &targets, &glyph_programs, &mut rng);
+                send.send((at, label, round, bytes))
+                    .expect("a query worker is alive");
+            }
         }
-    }
+        drop(send);
+        pool.into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .expect("a query worker panicked outside a round")
+            })
+            .collect()
+    });
+    panicked.sort_unstable();
+    assert!(
+        panicked.is_empty(),
+        "mutated seeds panicked (seed number, seed, round): {panicked:?} (replay: mutate \
+         the seed with that round's LCG state)"
+    );
 }
 
 /// Arbitrary bytes, and arbitrary bytes behind a valid sfnt header.

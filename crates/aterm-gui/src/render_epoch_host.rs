@@ -49,16 +49,12 @@ impl crate::App {
             };
             let probe = crate::resize_ledger::EngineProbe::sample(&guard);
             drop(guard);
-            let moved = timeline
+            // A verdict that moved is recorded, and the record wakes the
+            // session's watchers.
+            let _ = timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .evaluate_resizes(probe, now_ms);
-            if moved && self.subscribers.any() {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(session.id);
-            }
         }
     }
 

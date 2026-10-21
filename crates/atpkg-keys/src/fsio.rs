@@ -195,6 +195,8 @@ fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io:
             &sequence.to_string(),
             ".tmp",
         ]);
+        #[cfg(test)]
+        window::reached("temp name drawn", &tmp);
         // A pid is reused across reboots, so a name collision with a dead run's litter is
         // possible; take the next sequence number rather than failing on someone else's
         // corpse.
@@ -321,6 +323,59 @@ pub fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The test seam for what another process does inside a window between a check and its
+/// use: litter at the temporary name just drawn, a lock file swapped after it was opened, a
+/// write that lands between ours and its read-back. A test arms one act for one named
+/// window on its own thread ([`with`](window::with)); the code under test marks the window
+/// with [`reached`](window::reached). Test builds only: a release build has no window.
+#[cfg(test)]
+pub(crate) mod window {
+    use std::cell::RefCell;
+
+    type Act = Box<dyn FnOnce(&str)>;
+
+    thread_local! {
+        static ARMED: RefCell<Option<(&'static str, Act)>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` with `act` armed for the window `name` on this thread. It fires once, with
+    /// the path the window names. Panics if `f` never reached the window, so a test cannot
+    /// pass without its act having run. Disarmed after, unwinding included.
+    pub(crate) fn with<R>(
+        name: &'static str,
+        act: impl FnOnce(&str) + 'static,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                ARMED.with(|armed| *armed.borrow_mut() = None);
+            }
+        }
+        ARMED.with(|armed| *armed.borrow_mut() = Some((name, Box::new(act))));
+        let disarm = Disarm;
+        let out = f();
+        let unreached = ARMED.with(|armed| armed.borrow().is_some());
+        drop(disarm);
+        assert!(!unreached, "the window `{name}` was never reached");
+        out
+    }
+
+    /// The window `name`, at `path`: run the act armed for it, if any.
+    pub(crate) fn reached(name: &'static str, path: &str) {
+        let act = ARMED.with(|armed| {
+            let mut armed = armed.borrow_mut();
+            match armed.as_ref() {
+                Some((window, _)) if *window == name => armed.take().map(|(_, act)| act),
+                _ => None,
+            }
+        });
+        if let Some(act) = act {
+            act(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +489,24 @@ mod tests {
         // And it is left alone rather than silently consumed: it is somebody else's
         // evidence, not this run's scratch space.
         assert_eq!(std::fs::read(&stale).unwrap(), b"bytes from a dead process");
+
+        // A dead run under a reused pid left litter at the very name this write draws: the
+        // write takes the next name rather than failing on it, and leaves the litter be.
+        let corpse = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let found = std::rc::Rc::clone(&corpse);
+        window::with(
+            "temp name drawn",
+            move |tmp| {
+                std::fs::write(tmp, b"a reused pid's corpse").unwrap();
+                *found.borrow_mut() = tmp.to_string();
+            },
+            || write_bytes_atomic(&path, b"later").expect("the next name is free"),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"later");
+        assert_eq!(
+            std::fs::read(corpse.borrow().as_str()).unwrap(),
+            b"a reused pid's corpse"
+        );
     }
 
     /// AN OWNER FILE IS WHOLE, PRIVATE, AND NEVER REPLACED. All three at once is the

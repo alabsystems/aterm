@@ -57,12 +57,18 @@ pub enum Role {
     AlertDialog,
     Application,
     Document,
+    /// A grid of cells read by row and column: the stats bars' core row
+    /// (one [`Role::Meter`] a core).
+    Grid,
     Group,
     Heading,
     ListBox,
     /// One option of a [`Role::ListBox`].
     ListBoxOption,
     MenuItemRadio,
+    /// A read-only gauge of a value within a known range (a CPU, memory or
+    /// GPU level): never a control, never a task's progress.
+    Meter,
     Navigation,
     ProgressIndicator,
     Slider,

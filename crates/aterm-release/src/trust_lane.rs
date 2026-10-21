@@ -102,11 +102,11 @@ pub struct Config {
     /// Slots at once; `None` is one per six cores and per 16 GiB, at least one.
     pub jobs: Option<usize>,
     /// Where the slots' target directories and the logs go, never moved when named. `None`
-    /// is the first of `<repo>/target-trust` and this checkout's directory of the user's
+    /// is the first of `<repo>/target-trust.noindex` and this checkout's directory of the user's
     /// cache ([`choose_root`]) whose every component `targo trust` admits
     /// ([`refused_component`]): a checkout made under a login's umask `002` is `0775`, so
     /// there the run says it falls back, and when neither is admitted it runs nothing. A
-    /// default run retires the checkout's cache directory once `<repo>/target-trust` is
+    /// default run retires the checkout's cache directory once `<repo>/target-trust.noindex` is
     /// admitted again, and prunes those whose checkout is gone ([`prune_orphans`]).
     pub target_root: Option<PathBuf>,
     pub budget: Duration,
@@ -1238,8 +1238,6 @@ impl Bench for Machine {
         done: &mut dyn FnMut(Finished, &mut dyn Checks),
         out: &mut dyn Write,
     ) -> Result<(), String> {
-        reap_stale_checks(&prep.root);
-        clear_slots(&prep.root);
         let sock = trustd::socket();
         let want = trustd::build_digest(&prep.driver.bin.join("trustd"));
         trustd::wait_usable(&sock, &want, cfg.trustd_wait, out)?;
@@ -1343,7 +1341,8 @@ fn run_on(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Outcome {
     let ran = match prepare(cfg, bench, out) {
         Ok(prep) => {
             let judged = check_and_conclude(cfg, &prep, bench, out).map_err(Stop::CouldNotRun);
-            clear_slots(&prep.root);
+            // the next run empties what this could not
+            let _ = clear_slots(&prep.root);
             judged
         }
         Err(stop) => Err(stop),
@@ -1376,6 +1375,9 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         note,
     } = target_root(cfg, bench.cache().as_deref())?;
     if let Some(note) = note {
+        let _ = writeln!(out, "trust: {note}");
+    }
+    if let Some(note) = legacy_root_note(cfg).or_else(|| indexed_root_note(cfg, &root)) {
         let _ = writeln!(out, "trust: {note}");
     }
     let logdir = root.join("logs");
@@ -1434,6 +1436,23 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
             );
         }
     }
+    // Only a run that files reads its slots' dep-info, and needs the prover's identity
+    // (a hash of the whole toolchain).
+    let files = matches!(cfg.scope, Scope::WholeTree | Scope::Remeasure);
+    // THE SLOTS START EMPTY: a check a killed run left is ended and every slot goes, so
+    // each dep-info file the judge reads at the end was written by this run's compiles.
+    // Where a file is says whose it is; its stamp could not (it is its file system's
+    // clock, which can lag the wall clock). A run that files stops on a slot it cannot
+    // empty; a -p run reads none, and its checks name their units by a fresh session
+    // nonce, so it says so and goes on.
+    reap_stale_checks(&root);
+    if let Err(e) = clear_slots(&root) {
+        let why = format!("{}: a slot could not be emptied ({e})", root.display());
+        if files {
+            return Err(why.into());
+        }
+        let _ = writeln!(out, "trust: {why}; a -p run reads none of it");
+    }
     let git = GitCli::new(&cfg.repo);
     let common = crate::ledger::git_ok(
         &git,
@@ -1450,8 +1469,6 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         .map_err(|e| format!("targo metadata printed no JSON: {e}"))?;
     let repo = cfg.repo.clone();
     let libs = gate_list(&meta, &|m| profile_rows_for(m, &repo))?;
-    // Only a run that files needs the prover's identity: a hash of the whole toolchain.
-    let files = matches!(cfg.scope, Scope::WholeTree | Scope::Remeasure);
     // A run over the whole tree answers for every library the floors name.
     let gone = if files {
         let floors = cfg.repo.join(trust_facts::RATCHET);
@@ -1649,10 +1666,6 @@ fn check_and_conclude(
             }
         })
         .collect();
-    let since = SystemTime::now();
-    let since_secs = since
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
     let mut new_costs: BTreeMap<String, Cost> = BTreeMap::new();
     if !jobs.is_empty() {
         let slots = prep.jobs.min(jobs.len());
@@ -1718,7 +1731,6 @@ fn check_and_conclude(
         push_kv(&mut plan, "cargo-home", &bench.cargo_home());
         push_kv(&mut plan, "target-root", &prep.root.display().to_string());
         for (k, v) in [
-            ("since", since_secs.to_string()),
             (
                 "host",
                 format!("{} cores, {} GiB", prep.cores, prep.mem >> 30),
@@ -1932,18 +1944,27 @@ fn tree_state(repo: &Path) -> Option<(String, String)> {
 
 /// The slots are scratch: every check names its units by a fresh session nonce, so
 /// nothing one check builds is reused, and a kept slot only grows.
-fn clear_slots(root: &Path) {
-    if let Ok(rd) = fs::read_dir(root) {
-        for e in rd.flatten() {
-            let n = e.file_name();
-            let n = n.to_string_lossy();
-            if n.strip_prefix('j')
-                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-            {
-                let _ = fs::remove_dir_all(e.path());
-            }
+///
+/// # Errors
+/// A slot that could not be removed (the first such error).
+fn clear_slots(root: &Path) -> std::io::Result<()> {
+    let rd = match fs::read_dir(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        rd => rd?,
+    };
+    let mut first = Ok(());
+    for e in rd.flatten() {
+        let n = e.file_name();
+        let n = n.to_string_lossy();
+        if n.strip_prefix('j')
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            && let Err(e) = fs::remove_dir_all(e.path())
+            && first.is_ok()
+        {
+            first = Err(e);
         }
     }
+    first
 }
 
 /// End the checks a killed run left (`.check.<slot>` names each by pid and start
@@ -2001,6 +2022,15 @@ fn push_kv(plan: &mut String, k: &str, v: &str) {
 // Where a run's slots go, and the toolchain they are checked with
 // ---------------------------------------------------------------------------
 
+/// The checkout's own target root, `<repo>/target-trust.noindex`: a folder named
+/// `*.noindex` is skipped by Spotlight with all it holds, so no check's intermediates
+/// feed `mds_stores`.
+pub(crate) const OWN_ROOT: &str = "target-trust.noindex";
+
+/// The checkout's own target root before it was named for Spotlight to skip: a run
+/// with no `--target-root` says when one is left, since nothing builds there now.
+const LEGACY_ROOT: &str = "target-trust";
+
 /// The fallback target roots' directory in the user's cache, beside the Linux worker's
 /// `aterm-linux-worker`.
 const CACHE_DIR: &str = "aterm-trust-lane";
@@ -2051,12 +2081,52 @@ const ELSEWHERE_ROOT: &str = "give --target-root a directory under one you own";
 /// A run's target root: where; for a default root, this checkout's directory of the
 /// user's cache (the root itself when it falls back, else one an earlier fallback run may
 /// have left, which the run retires), beside the others whose orphans it prunes; and the
-/// line saying why it is not `<repo>/target-trust`.
+/// line saying why it is not `<repo>/target-trust.noindex`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Root {
     path: PathBuf,
     mine: Option<PathBuf>,
     note: Option<String>,
+}
+
+/// The line a default run prints when the checkout still holds the root it used before
+/// [`OWN_ROOT`] (a directory, never followed through a link): left for its owner to
+/// remove, because an older run may still hold it or its logs may still be read.
+fn legacy_root_note(cfg: &Config) -> Option<String> {
+    if cfg.target_root.is_some() {
+        return None;
+    }
+    let legacy = cfg.repo.join(LEGACY_ROOT);
+    fs::symlink_metadata(&legacy)
+        .is_ok_and(|m| m.is_dir())
+        .then(|| {
+            format!(
+                "{} is this lane's target root from before it was named {OWN_ROOT} (out of \
+                 Spotlight); nothing builds there now: remove it once no older run holds it \
+                 and its logs are read",
+                legacy.display()
+            )
+        })
+}
+
+/// The line a run with a named `--target-root` prints on macOS when no component of it
+/// is named `*.noindex`: Spotlight indexes every file the run writes there.
+fn indexed_root_note(cfg: &Config, root: &Path) -> Option<String> {
+    let skipped = |p: &Path| {
+        p.components().any(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .ends_with(atpkg::build_cache::NOINDEX)
+        })
+    };
+    (cfg!(target_os = "macos") && cfg.target_root.is_some() && !skipped(root)).then(|| {
+        format!(
+            "the target root {} is in no folder named *.noindex, so Spotlight indexes every \
+             file this run writes there: name it {}",
+            root.display(),
+            atpkg::build_cache::noindex(&root.display().to_string())
+        )
+    })
 }
 
 /// The checkout as the file system names it: what keys its fallback root.
@@ -2140,7 +2210,7 @@ fn checkout_key(repo: &Path) -> String {
     format!("{name}-{}", hex.get(..12).unwrap_or(&hex))
 }
 
-/// The default target root: `<repo>/target-trust` wherever `targo trust` admits it (no
+/// The default target root: `<repo>/target-trust.noindex` wherever `targo trust` admits it (no
 /// change on a checkout writable by its owner alone), else `<cache>/<key>` (`cache` from
 /// [`cache_base`], `key` from [`checkout_key`]), said on one line; `refused` answers for a
 /// path as [`refused_component`] does.
@@ -2153,7 +2223,7 @@ fn choose_root(
     cache: Option<&Path>,
     refused: &dyn Fn(&Path) -> Option<Refused>,
 ) -> Result<Root, String> {
-    let own = repo.join("target-trust");
+    let own = repo.join(OWN_ROOT);
     let mine = cache.map(|c| c.join(key));
     let Some(first) = refused(&own) else {
         return Ok(Root {
@@ -4246,7 +4316,7 @@ mod tests {
         // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
         // process runs this one test (`--exact`), so no other create sees the mask.
         unsafe { umask(0o002) };
-        let slot = PathBuf::from(dir).join("target-trust/j0");
+        let slot = PathBuf::from(dir).join("target-trust.noindex/j0");
         owner_dirs(&slot).unwrap();
         assert_eq!(refused_component(&slot), None, "{}", slot.display());
     }
@@ -4316,13 +4386,15 @@ mod tests {
     // -- a whole run, over a bench the test drives -------------------------------
 
     /// Checks that end at once, each having printed `log` and written one fresh
-    /// dep-info file in its slot.
+    /// dep-info file in its slot, stamped `stamp` when that is set (as a file system
+    /// whose clock lags the wall clock would stamp it).
     struct Quick<'a> {
         root: PathBuf,
         log: &'static str,
         interrupt: bool,
         now: Duration,
         started: &'a mut Vec<String>,
+        stamp: Option<SystemTime>,
     }
 
     struct Over;
@@ -4346,7 +4418,14 @@ mod tests {
             job.target = self.root.join(format!("j{}", job.slot));
             let deps = job.target.join("debug/deps");
             fs::create_dir_all(&deps)?;
-            fs::write(deps.join(format!("{}.d", job.name)), "lib.rs: src/lib.rs\n")?;
+            let dep = deps.join(format!("{}.d", job.name));
+            fs::write(&dep, "lib.rs: src/lib.rs\n")?;
+            if let Some(t) = self.stamp {
+                fs::File::options()
+                    .write(true)
+                    .open(&dep)?
+                    .set_modified(t)?;
+            }
             fs::write(&job.log, self.log)?;
             Ok(Box::new(Over))
         }
@@ -4383,6 +4462,8 @@ mod tests {
         log: &'static str,
         interrupt: bool,
         meanwhile: Option<fn(&Path)>,
+        /// The stamp each check's dep-info gets ([`Quick`]).
+        stamp: Option<SystemTime>,
     }
 
     impl Bench for Site {
@@ -4440,6 +4521,7 @@ mod tests {
                 interrupt: self.interrupt,
                 now: Duration::ZERO,
                 started: &mut self.started,
+                stamp: self.stamp,
             };
             let ran = run_slots(jobs, slots, 1, cfg.budget, &mut quick, done);
             if let Some(edit) = self.meanwhile.take() {
@@ -4507,7 +4589,7 @@ mod tests {
             .tempdir_in(slots_base())
             .unwrap();
         // Under the slots' base, which targo admits, so a test can make the checkout's own
-        // `target-trust` admitted or refused by the checkout's mode alone.
+        // `target-trust.noindex` admitted or refused by the checkout's mode alone.
         let repo = slots.path().join("repo");
         crate::ledger::testing::init(
             &repo,
@@ -4537,7 +4619,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let mut cfg = Config::new(&repo, scope);
         cfg.jobs = Some(1);
-        cfg.target_root = Some(slots.path().join("target-trust"));
+        cfg.target_root = Some(slots.path().join("target-trust.noindex"));
         cfg.state = Some(dir.path().join("state"));
         let cache = slots.path().join("cache");
         Site {
@@ -4557,6 +4639,7 @@ mod tests {
             log: DONE,
             interrupt: false,
             meanwhile: None,
+            stamp: None,
         }
     }
 
@@ -4599,8 +4682,56 @@ mod tests {
             plan.contains("\nfile \n"),
             "nothing kept it from filing: {plan}"
         );
-        assert!(plan.contains("\nlane-passed PATH\n") && plan.contains("\nsince "));
+        assert!(plan.contains("\nlane-passed PATH\n"));
         assert!(!root_of(&s).join("j0").exists(), "the slots are scratch");
+    }
+
+    /// THE RUN'S DEP-INFO IS WHAT ITS SLOTS HOLD, whatever the host's clocks say: every
+    /// bench empties the slots before its checks start, so a dep-info file a check wrote
+    /// counts however old its file system stamped it, and one a killed run left in a slot
+    /// is gone before the checks start, though it names the floors. (The start-of-run
+    /// stamp test this replaces read a file written within a tick of the run's start as
+    /// older than the run, which only an instant bench like this one did; and only the real
+    /// bench emptied its slots.) A slot that cannot be emptied, whoever runs the tests,
+    /// stops a run that files before any check, so nothing it holds is read as this run's;
+    /// a -p run reads no dep-info, says so and goes on.
+    #[test]
+    fn a_runs_dep_info_is_what_its_slots_hold_whatever_the_clock() {
+        let mut lagged = site(Scope::WholeTree);
+        lagged.stamp = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000));
+        let (outcome, said, filed) = run_site(&mut lagged);
+        assert_eq!((outcome, filed.len()), (Outcome::Pass, 1), "{said}");
+
+        let mut left = site(Scope::WholeTree);
+        let stale = root_of(&left).join("j3/debug/deps/stale.d");
+        owner_dirs(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, format!("x: {}\n", trust_facts::RATCHET)).unwrap();
+        let (outcome, said, filed) = run_site(&mut left);
+        assert_eq!((outcome, filed.len()), (Outcome::Pass, 1), "{said}");
+        assert!(!stale.exists(), "a killed run's slot is gone");
+
+        // A file where a slot goes: removing a directory tree fails on it (not a
+        // directory) for every user, root too, which a permission bit would not.
+        let stuck = |scope| {
+            let s = site(scope);
+            let root = root_of(&s);
+            owner_dirs(&root).unwrap();
+            fs::write(root.join("j9"), "").unwrap();
+            s
+        };
+        let mut whole = stuck(Scope::WholeTree);
+        let (outcome, said, filed) = run_site(&mut whole);
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why) if why.contains("could not be emptied")),
+            "{outcome:?}: {said}"
+        );
+        assert!(filed.is_empty() && whole.started.is_empty(), "{said}");
+
+        let mut named = stuck(Scope::Packages(vec!["alpha".into()]));
+        let (outcome, said, filed) = run_site(&mut named);
+        assert_eq!(outcome, Outcome::Pass, "{said}");
+        assert!(said.contains("could not be emptied"), "it says so: {said}");
+        assert!(filed.is_empty() && named.started == ["alpha"], "{said}");
     }
 
     /// `--update-ratchet` REWRITES THE COMMITTED COST SEED beside the floors: the row it
@@ -4942,8 +5073,8 @@ mod tests {
     /// umask `002` makes it) runs under its own directory of the user's cache: said on one
     /// line, recorded with its checkout, made as targo admits it, the same directory the
     /// next run; a root there whose checkout is gone is pruned, and the checkout is left
-    /// with no `target-trust`. Once the checkout is `chmod go-w`'d (the note's fix), the
-    /// run is back in `target-trust`, and the fallback root goes, with what a killed run
+    /// with no `target-trust.noindex`. Once the checkout is `chmod go-w`'d (the note's fix), the
+    /// run is back in `target-trust.noindex`, and the fallback root goes, with what a killed run
     /// left in it, and orphans are still pruned.
     #[test]
     fn a_refused_checkout_runs_under_its_own_cache_root() {
@@ -4975,7 +5106,7 @@ mod tests {
         )
         .unwrap();
         let root_s = root.display().to_string();
-        let own_s = s.repo.join("target-trust").display().to_string();
+        let own_s = s.repo.join("target-trust.noindex").display().to_string();
         for run in ["first", "second"] {
             let (outcome, said, _) = run_site(&mut s);
             assert_eq!(outcome, Outcome::Pass, "{run}: {said}");
@@ -5012,7 +5143,7 @@ mod tests {
             assert_eq!(refused_component(&root.join("j0")), None);
         }
         assert!(!first_orphan.exists(), "the orphan is pruned");
-        assert!(!s.repo.join("target-trust").exists());
+        assert!(!s.repo.join("target-trust.noindex").exists());
 
         // What a SIGKILLed fallback run leaves: a slot, and a record of its check.
         fs::create_dir_all(root.join("j0/debug")).unwrap();
@@ -5023,7 +5154,7 @@ mod tests {
         let (outcome, said, _) = run_site(&mut s);
         assert_eq!(outcome, Outcome::Pass, "{said}");
         assert!(
-            s.repo.join("target-trust/logs/.plan").is_file(),
+            s.repo.join("target-trust.noindex/logs/.plan").is_file(),
             "back in the checkout: {said}"
         );
         // No fallback note; one line, saying the fallback root was removed.
@@ -5074,7 +5205,7 @@ mod tests {
         let open = d.path().join("open");
         fs::create_dir(&open).unwrap();
         fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
-        let r = refused_component(&open.join("target-trust")).unwrap();
+        let r = refused_component(&open.join("target-trust.noindex")).unwrap();
         assert_eq!(r.dir, fs::canonicalize(&open).unwrap());
         assert!(r.why.contains("world-writable"), "{}", r.why);
     }
@@ -5118,7 +5249,58 @@ mod tests {
         })
     }
 
-    /// THE DEFAULT TARGET ROOT: `<repo>/target-trust` wherever targo admits it; else this
+    /// A checkout that still holds the root from before the `.noindex` name is told so by
+    /// a default run, and nothing is removed; a named root, an absent one and a link are
+    /// not mentioned.
+    #[test]
+    fn a_default_run_names_the_root_left_from_before_the_noindex_name() {
+        let dir = tmp("trust-legacy");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let cfg = Config::new(&repo, Scope::WholeTree);
+        assert_eq!(legacy_root_note(&cfg), None, "nothing left");
+        assert_eq!(
+            choose_root(&repo, "k", None, &|_| None).unwrap().path,
+            repo.join(OWN_ROOT)
+        );
+        let legacy = repo.join("target-trust");
+        fs::create_dir_all(legacy.join("logs")).unwrap();
+        let note = legacy_root_note(&cfg).expect("the old root is named");
+        assert!(note.contains(&legacy.display().to_string()), "{note}");
+        assert!(legacy.join("logs").is_dir(), "the note removes nothing");
+        let mut named = cfg.clone();
+        named.target_root = Some(legacy.clone());
+        assert_eq!(
+            legacy_root_note(&named),
+            None,
+            "a named root is the caller's"
+        );
+        fs::remove_dir_all(&legacy).unwrap();
+        std::os::unix::fs::symlink(dir.path(), &legacy).unwrap();
+        assert_eq!(legacy_root_note(&cfg), None, "a link is never followed");
+
+        // A named root Spotlight would index is told so on macOS; the default and one
+        // under a `*.noindex` folder are not.
+        let mine = Path::new("/w/target/trust-gui1");
+        assert_eq!(
+            indexed_root_note(&cfg, &repo.join(OWN_ROOT)),
+            None,
+            "the default"
+        );
+        let note = indexed_root_note(&named, mine);
+        if cfg!(target_os = "macos") {
+            let note = note.expect("an indexed root is named");
+            assert!(note.contains("/w/target/trust-gui1.noindex"), "{note}");
+        } else {
+            assert_eq!(note, None, "Spotlight is macOS's");
+        }
+        assert_eq!(
+            indexed_root_note(&named, Path::new("/w/target/mine.noindex/trust")),
+            None
+        );
+    }
+
+    /// THE DEFAULT TARGET ROOT: `<repo>/target-trust.noindex` wherever targo admits it; else this
     /// checkout's directory of the user's cache, said with the fix that would bring the
     /// first back; when neither is admitted, nothing runs and each refusal is named with
     /// its fix.
@@ -5133,7 +5315,7 @@ mod tests {
         assert_eq!(
             admitted,
             Root {
-                path: "/w/aterm/target-trust".into(),
+                path: "/w/aterm/target-trust.noindex".into(),
                 mine: Some(mine.clone()),
                 note: None,
             },
@@ -5141,7 +5323,7 @@ mod tests {
         );
         assert_eq!(
             choose_root(repo, "aterm-0123", None, &|_| None).map(|r| (r.path, r.mine)),
-            Ok(("/w/aterm/target-trust".into(), None))
+            Ok(("/w/aterm/target-trust.noindex".into(), None))
         );
 
         let fallback = choose_root(repo, "aterm-0123", Some(cache), &in_repo).unwrap();
@@ -5153,7 +5335,7 @@ mod tests {
                 &note,
                 &[
                     "/h/.cache/aterm-trust-lane/aterm-0123",
-                    "/w/aterm/target-trust",
+                    "/w/aterm/target-trust.noindex",
                     "/w/aterm",
                     "775",
                     "chmod go-w /w/aterm",
@@ -5170,7 +5352,7 @@ mod tests {
             says_in_order(
                 &both,
                 &[
-                    "/w/aterm/target-trust",
+                    "/w/aterm/target-trust.noindex",
                     "/w/aterm",
                     "run: chmod go-w /w/aterm",
                     "/h/.cache/aterm-trust-lane/aterm-0123",
@@ -5255,24 +5437,24 @@ mod tests {
         let cache = base.path().join("cache");
         owner_dirs(&cache).unwrap();
         let mut cfg = Config::new(base.path(), Scope::WholeTree);
-        cfg.target_root = Some(open.join("target-trust"));
+        cfg.target_root = Some(open.join("target-trust.noindex"));
         let why = target_root(&cfg, Some(&cache)).unwrap_err();
         assert!(
             says_in_order(
                 &why,
                 &[
-                    &open.join("target-trust").display().to_string(),
+                    &open.join("target-trust.noindex").display().to_string(),
                     "mode 775",
                     &format!("run: chmod go-w {}", open.display()),
                 ]
             ),
             "{why}"
         );
-        cfg.target_root = Some(base.path().join("target-trust"));
+        cfg.target_root = Some(base.path().join("target-trust.noindex"));
         assert_eq!(
             target_root(&cfg, Some(&cache)),
             Ok(Root {
-                path: base.path().join("target-trust"),
+                path: base.path().join("target-trust.noindex"),
                 mine: None,
                 note: None,
             }),

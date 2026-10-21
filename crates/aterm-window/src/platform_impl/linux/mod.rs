@@ -860,7 +860,6 @@ impl<T: 'static> EventLoop<T> {
         match *self {
             #[cfg(wayland_platform)]
             EventLoop::Wayland(_) => true,
-            #[cfg(x11_platform)]
             _ => false,
         }
     }

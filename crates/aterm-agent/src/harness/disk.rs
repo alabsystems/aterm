@@ -112,11 +112,15 @@
 //!   will not write — `unsafe` is banned here". That was wrong: std's
 //!   `File::try_lock` takes cargo's `flock` with no `unsafe`, and the reclaim
 //!   holds every one of a profile's locks while it deletes.
-//! * [`Class::ClaudeStaleVersions`] — a vendor version directory that is not
-//!   the live symlink's resolved target. The witness NAMES the live target,
-//!   and if the live target cannot be resolved at all, every row in the
-//!   class becomes unsafe: with nothing to compare against, "not the live
-//!   one" is an assumption, not a witness.
+//! * [`Class::ClaudeStaleVersions`] — a vendor version that is not the live
+//!   one: not the live symlink's resolved target, or on Windows, where
+//!   `claude.exe` is a COPY, not the version it is a byte-for-byte copy of
+//!   ([`versions`]). The witness NAMES the live one, and if the launcher
+//!   names none strictly inside `versions/`, every row in the class becomes
+//!   unsafe: with nothing to compare against, "not the live one" is an
+//!   assumption, not a witness. A version Claude Code's lock or a running
+//!   process holds (on Windows, also one newer than the live one) is reported
+//!   and kept.
 //! * [`Class::AtpkgGc`] — a package build superseded by the live build of
 //!   the same program. Reported, never removed from here: `store/` is under
 //!   atpkg's single-writer lock and `aterm pkg gc` is its one gardener, so
@@ -300,6 +304,13 @@ pub mod idle;
 #[path = "disk_beat.rs"]
 pub mod beat;
 
+#[path = "disk_versions.rs"]
+pub mod versions;
+
+#[cfg(windows)]
+#[path = "disk_win.rs"]
+pub(crate) mod win;
+
 pub use target::{CARGO_LOCKS, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, Profile, TargetDir};
 
 /// `disk.idle_build_dirs`: tier 3 is ON (design §8, stage 7), turned on once
@@ -351,7 +362,7 @@ const DAY_S: i64 = 86_400;
 pub enum Class {
     /// Package builds superseded by the live one. Delegated to `aterm pkg gc`.
     AtpkgGc,
-    /// Vendor version directories that are not the live symlink's target.
+    /// Vendor versions that are not the live one ([`versions`]).
     ClaudeStaleVersions,
     /// Build directories whose idle cargo profiles' `incremental/` goes —
     /// and below the floor, recent profiles', least recently used first.
@@ -807,15 +818,20 @@ impl Thresholds {
 // The survey — every fact the decision needs, injected
 // ---------------------------------------------------------------------------
 
-/// One vendor version directory under `versions/`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One vendor version under `versions/`: a directory, or (every native
+/// install, and Windows') a single executable FILE.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VersionDir {
     /// Absolute path.
     pub path: PathBuf,
-    /// Size in bytes, as far as the walk got.
+    /// Size in bytes: a file's length, a directory's as far as the walk got.
     pub bytes: u64,
     /// `true` when the walk hit [`MAX_WALK_ENTRIES`] and stopped.
     pub bytes_partial: bool,
+    /// Why it is KEPT though it is not the live one ([`versions::kept`]): a
+    /// Claude Code lock holds it, a running process uses it, or (Windows) it
+    /// is newer than the live one. `None`: nothing holds it.
+    pub kept: Option<String>,
 }
 
 /// One build in the package store.
@@ -875,8 +891,16 @@ pub struct Survey {
     pub targets: Vec<TargetDir>,
     /// Vendor version directories.
     pub versions: Vec<VersionDir>,
-    /// The live symlink's resolved target, when it resolved.
+    /// The live version, when the launcher named one ([`versions::live_of`]):
+    /// the entry the live symlink's resolved target lies in, or (Windows) the
+    /// one the launcher is a byte-for-byte copy of.
     pub live_version: Option<PathBuf>,
+    /// When [`Self::live_version`] was named BY CONTENT, the launcher that is
+    /// its copy (`~\.local\bin\claude.exe`); `None` when a link named it.
+    pub live_copy: Option<PathBuf>,
+    /// Why no live version was named, when the launcher named none (`None`:
+    /// the live symlink did not resolve).
+    pub live_unnamed: Option<String>,
     /// Builds in the package store.
     pub store: Vec<StoreBuild>,
     /// The live build of each program in the store.
@@ -918,6 +942,8 @@ impl Survey {
             targets: Vec::new(),
             versions: Vec::new(),
             live_version: None,
+            live_copy: None,
+            live_unnamed: None,
             store: Vec::new(),
             live_builds: BTreeMap::new(),
             transcripts_root: None,
@@ -1029,6 +1055,15 @@ pub enum Witness {
         /// The live symlink's resolved target, named so a reader can check.
         live: PathBuf,
     },
+    /// A vendor version the live launcher is not a COPY of (Windows:
+    /// `claude.exe` is the installer's byte-for-byte copy of the live one,
+    /// named by equal length and SHA-256: [`versions::copy_of`]).
+    NotLauncherCopy {
+        /// The launcher compared.
+        launcher: PathBuf,
+        /// The version it is a copy of, named so a reader can check.
+        live: PathBuf,
+    },
     /// A package build superseded by the live build of the same program.
     Superseded {
         /// The program.
@@ -1097,6 +1132,11 @@ impl Witness {
             Witness::NotLinkTarget { live } => {
                 format!("not the live symlink target {}", live.display())
             }
+            Witness::NotLauncherCopy { launcher, live } => format!(
+                "not the live version {}, of which {} is a byte-for-byte copy",
+                live.display(),
+                launcher.display()
+            ),
             Witness::Superseded { program, live } => {
                 format!("superseded: {program} live build is {live}")
             }
@@ -1113,6 +1153,7 @@ impl Witness {
             Witness::OwnerGone { .. } => "owner-gone",
             Witness::IdleWhole { .. } => "idle-whole",
             Witness::NotLinkTarget { .. } => "not-link-target",
+            Witness::NotLauncherCopy { .. } => "not-launcher-copy",
             Witness::Superseded { .. } => "superseded",
             Witness::VendorReports { .. } => "vendor-reports",
         }
@@ -1190,7 +1231,8 @@ impl Row {
         }
     }
 
-    /// The text-report line.
+    /// The text-report line, every path in it spelled as a person reads it
+    /// ([`shown`]).
     #[must_use]
     pub fn line(&self) -> String {
         let size = human_bytes(self.bytes);
@@ -1202,13 +1244,48 @@ impl Row {
         let tier = self
             .tier()
             .map_or_else(String::new, |t| format!(" tier={}", t.number()));
-        format!(
+        shown(&format!(
             "{:<22} {size}{partial:<1} {}{tier} — {} [{state}]",
             self.class.as_str(),
             self.path.display(),
             self.witness.describe()
-        )
+        ))
+        .into_owned()
     }
+}
+
+/// `text` as a person reads it: on Windows every path in it spelled plain —
+/// `\\?\C:\x` reads `C:\x` and `\\?\UNC\srv\share\x` reads `\\srv\share\x`
+/// ([`aterm_sysprobe::paths::plain`]'s rule, applied to each path a line of
+/// prose names; any other verbatim spelling, a volume GUID path, stays).
+/// DISPLAY ONLY: a row's path, the journal's and `--json`'s keep the verbatim
+/// spelling, the one that opens past `MAX_PATH` (a tool reads those), and
+/// nothing parses this answer back into a path. Off Windows the text as it
+/// is: there a `\` is a character of a name.
+#[must_use]
+pub fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    const VERBATIM: &str = r"\\?\";
+    if !cfg!(windows) || !text.contains(VERBATIM) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(VERBATIM) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + VERBATIM.len()..];
+        if let Some(share) = tail.strip_prefix(r"UNC\") {
+            out.push_str(r"\\");
+            rest = share;
+        } else if matches!(tail.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
+        {
+            rest = tail;
+        } else {
+            out.push_str(VERBATIM);
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// The whole §5.5 report.
@@ -1298,13 +1375,14 @@ impl Hog {
         line
     }
 
-    /// The line, the path written `at`.
+    /// The line, the path written `at`, every path in why it is kept spelled
+    /// as a person reads it ([`shown`]).
     fn line_at(&self, at: &str) -> String {
         format!(
             "{at} {}{} ({})",
             human_bytes(self.bytes),
             if self.bytes_partial { "+" } else { "" },
-            self.why
+            shown(&self.why)
         )
     }
 }
@@ -1312,10 +1390,24 @@ impl Hog {
 /// The fewest characters of a hog's path [`Hog::line_within`] keeps.
 const HOG_PATH_MIN: usize = 24;
 
-/// `path` with `$HOME` written `~`.
+/// `path` as a person reads it (on Windows [`aterm_sysprobe::paths::plain`]:
+/// a canonical `\\?\C:\x` reads `C:\x`), with `$HOME` written `~` — whichever
+/// of the two spellings either is in (`$HOME` from the environment is plain,
+/// a canonical path verbatim). DISPLAY ONLY.
 fn display_home(path: &Path, home: Option<&Path>) -> String {
-    match home.and_then(|h| path.strip_prefix(h).ok()) {
-        Some(rel) if !rel.as_os_str().is_empty() => format!("~/{}", rel.display()),
+    fn plain(p: &Path) -> std::borrow::Cow<'_, Path> {
+        if cfg!(windows) {
+            aterm_sysprobe::paths::plain(p)
+        } else {
+            std::borrow::Cow::Borrowed(p)
+        }
+    }
+    let path = plain(path);
+    let home = home.map(plain);
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rel) if !rel.as_os_str().is_empty() => {
+            format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display())
+        }
         _ => path.display().to_string(),
     }
 }
@@ -1568,25 +1660,41 @@ pub fn report(survey: &Survey, config: Config) -> Report {
     // -- claude-stale-versions --------------------------------------------
     match &survey.live_version {
         Some(live) => {
+            // What proved it live: the link's target, or (Windows) the
+            // launcher's content.
+            let witness = match &survey.live_copy {
+                Some(launcher) => Witness::NotLauncherCopy {
+                    launcher: launcher.clone(),
+                    live: live.clone(),
+                },
+                None => Witness::NotLinkTarget { live: live.clone() },
+            };
             for v in survey.versions.iter().take(MAX_ROWS_PER_CLASS) {
                 if &v.path == live {
                     continue;
                 }
+                // Not the live one, but something still holds it (a lock, a
+                // running process, an update not yet swapped in): reported,
+                // never removable.
                 rows.push(Row {
                     class: Class::ClaudeStaleVersions,
                     path: v.path.clone(),
                     bytes: v.bytes,
                     bytes_partial: v.bytes_partial,
-                    witness: Witness::NotLinkTarget { live: live.clone() },
-                    removable: true,
-                    blocked: None,
+                    witness: witness.clone(),
+                    removable: v.kept.is_none(),
+                    blocked: v.kept.clone(),
                 });
             }
         }
         None if !survey.versions.is_empty() => {
-            // The tie breaks safe: with no resolved live target, "not the
-            // live one" is an assumption, so every version directory is
-            // listed as blocked.
+            // The tie breaks safe: with no live version named, "not the live
+            // one" is an assumption, so every version directory is listed as
+            // blocked.
+            let why = survey
+                .live_unnamed
+                .as_deref()
+                .unwrap_or("the live symlink did not resolve");
             for v in survey.versions.iter().take(MAX_ROWS_PER_CLASS) {
                 rows.push(Row {
                     class: Class::ClaudeStaleVersions,
@@ -1597,16 +1705,12 @@ pub fn report(survey: &Survey, config: Config) -> Report {
                         live: PathBuf::new(),
                     },
                     removable: false,
-                    blocked: Some(
-                        "the live symlink did not resolve, so nothing here has a witness"
-                            .to_owned(),
-                    ),
+                    blocked: Some(format!("{why}, so nothing here has a witness")),
                 });
             }
-            notes.push(
-                "claude-stale-versions: the live symlink did not resolve — every row is blocked"
-                    .to_owned(),
-            );
+            notes.push(format!(
+                "claude-stale-versions: {why} — every row is blocked"
+            ));
         }
         None => {}
     }
@@ -2057,6 +2161,7 @@ pub fn hogs_left(
                 | Witness::LeastRecentlyUsed { .. }
                 | Witness::IdleWhole { .. } => removed.bytes != row.bytes,
                 Witness::NotLinkTarget { .. }
+                | Witness::NotLauncherCopy { .. }
                 | Witness::Superseded { .. }
                 | Witness::VendorReports { .. } => false,
             })
@@ -2302,6 +2407,82 @@ fn pressure_rows(
     rows.extend(picks);
 }
 
+/// Is `path` at or under `dir`, where a miss must never be read as "not
+/// under" (S1, the one path rule): by [`aterm_sysprobe::paths::is_under`] —
+/// on Windows any case, a verbatim or a plain spelling — and where that
+/// cannot place the two (on Windows two roots, an 8.3 name), by FILE
+/// IDENTITY: `dir`'s file id met among `path`'s ancestors, each a link
+/// followed. `None`: neither could tell (an identity not read), which every
+/// caller reads as under. The key's "not under" stands, so both sides must
+/// be spelled alike (the canonical build directories and profiles
+/// [`speaker`] and [`decided_by`] compare); the transcripts fence, whose
+/// root is not canonical, is [`under_transcripts`]. Unix always answers by
+/// component, as before.
+pub(crate) fn placed_under(path: &Path, dir: &Path) -> Option<bool> {
+    if let Some(placed) = aterm_sysprobe::paths::is_under(path, dir) {
+        return Some(placed);
+    }
+    let want = aterm_sysprobe::volumes::file_id(dir, true)?;
+    for at in path.ancestors().filter(|a| !a.as_os_str().is_empty()) {
+        if aterm_sysprobe::volumes::file_id(at, true)? == want {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Is `path` at or under the transcripts root `root`, for the removal
+/// fences ([`guard`], [`guard_row`])? By [`placed_under`]; and on Windows by
+/// FILE IDENTITY as well even where the key says "not under": the root comes
+/// as the home names it (`home.join(".claude").join("projects")`), never
+/// canonical, while a row's path is canonical, so a `~\.claude` that is a
+/// junction to another folder of the same drive would read beside every
+/// transcript (`\\?\C:\data\claude\projects\x` against
+/// `C:\Users\u\.claude\projects`). The root's identity met among `path`'s
+/// ancestors is under; one of them that cannot be read is `None` (under,
+/// to the fence). A root that is not there holds nothing, so only the key
+/// can place a path under it — never a refusal for a path the key cannot
+/// place against a root that does not exist (a hand-named directory on
+/// another drive while `~\.claude\projects` was never made). Unix compares
+/// by component, as before.
+fn under_transcripts(path: &Path, root: &Path) -> Option<bool> {
+    #[cfg(windows)]
+    {
+        let keyed = aterm_sysprobe::paths::is_under(path, root);
+        if keyed == Some(true) {
+            return Some(true);
+        }
+        let Some(want) = aterm_sysprobe::volumes::file_id(root, true) else {
+            return match std::fs::metadata(root) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+                _ => None,
+            };
+        };
+        for at in path.ancestors().filter(|a| !a.as_os_str().is_empty()) {
+            if aterm_sysprobe::volumes::file_id(at, true)? == want {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+    #[cfg(not(windows))]
+    {
+        placed_under(path, root)
+    }
+}
+
+/// Are `a` and `b` one path by the one path rule (on Windows the key of
+/// [`aterm_sysprobe::paths::windows_key`]; a path it cannot key is no
+/// other's)? By component elsewhere, as before.
+fn same_place(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        let key = aterm_sysprobe::paths::windows_key;
+        key(a).is_some_and(|a| key(b).is_some_and(|b| a == b))
+    } else {
+        a == b
+    }
+}
+
 /// Which of `dirs` speaks for the profile at `profile`, in the idle pass and
 /// under pressure alike: the innermost one holding it (the first of two that
 /// are the same). A build directory named inside another is walked by both
@@ -2313,7 +2494,7 @@ fn pressure_rows(
 fn speaker(dirs: &[&Path], profile: &Path) -> Option<usize> {
     dirs.iter()
         .enumerate()
-        .filter(|(_, d)| profile.starts_with(d))
+        .filter(|(_, d)| placed_under(profile, d) != Some(false))
         .max_by_key(|&(i, d)| (d.components().count(), std::cmp::Reverse(i)))
         .map(|(i, _)| i)
 }
@@ -2333,7 +2514,7 @@ fn decided_by(t: &TargetDir, at: Option<usize>, deciding: &[&Path]) -> (TargetDi
         .retain(|p| speaker(deciding, &p.path) == Some(at));
     let leaves = deciding
         .iter()
-        .filter(|d| **d != t.path && d.starts_with(&t.path))
+        .filter(|d| !same_place(d, &t.path) && placed_under(d, &t.path) != Some(false))
         .map(|d| d.to_path_buf())
         .collect();
     (own, leaves)
@@ -2684,7 +2865,7 @@ pub fn guard(
         return Err(Refusal::NotAnchored(path.to_path_buf()));
     }
     if let Some(t) = survey_transcripts
-        && (path == t || path.starts_with(t))
+        && under_transcripts(path, t) != Some(false)
     {
         return Err(Refusal::Transcript(path.to_path_buf()));
     }
@@ -2740,7 +2921,7 @@ fn guard_path(survey_transcripts: Option<&Path>, path: &Path) -> Result<(), Refu
         return Err(Refusal::NotAnchored(path.to_path_buf()));
     }
     if let Some(t) = survey_transcripts
-        && (path == t || path.starts_with(t))
+        && under_transcripts(path, t) != Some(false)
     {
         return Err(Refusal::Transcript(path.to_path_buf()));
     }
@@ -2910,12 +3091,71 @@ pub fn reserve_row(now: i64, action: &str, bytes: Option<u64>, text: &str) -> St
         .unwrap_or_else(|_| "{\"kind\":\"reserve\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// One `build-cache-sweep` row of the disk ledger: a removed workspace's
-/// build directory in aterm's Rust build cache, `bytes` in it, about to go
-/// whole under its locks (`action` `removing`, the write-ahead intent row)
-/// or gone (`removed`) (`atpkg::build_cache::reclaim_under_pressure`).
+/// Why the watch's sweep took a build directory of aterm's Rust build cache,
+/// in words, with the figures it was taken on (`atpkg::build_cache::Unused`):
+/// the `text` of its ledger rows ([`sweep_row`]).
 #[must_use]
-pub fn sweep_row(now: i64, path: &Path, action: &str, bytes: u64) -> String {
+pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
+    use atpkg::build_cache::Unused;
+    let span = sweep_span;
+    match why {
+        Unused::Gone { idle, after } => format!(
+            "its workspace is gone, and nothing wrote it for {} (the sweep takes one unwritten \
+             {}); no build held its locks",
+            span(idle),
+            span(after)
+        ),
+        Unused::Idle { idle } => format!(
+            "nothing wrote it for {}, a month or more, whatever its workspace's state; no build \
+             held its locks",
+            span(idle)
+        ),
+        Unused::Unfinished => {
+            "an earlier sweep renamed it aside and did not finish removing it".to_owned()
+        }
+    }
+}
+
+/// Why the watch's sweep took a build directory, in the few words its line in
+/// the watch's account carries (the log, the freed entry, the resume): `its
+/// workspace is gone`, `unwritten 31d`.
+#[must_use]
+pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
+    use atpkg::build_cache::Unused;
+    match why {
+        Unused::Gone { .. } => "its workspace is gone".to_owned(),
+        Unused::Idle { idle } => format!("unwritten {}", sweep_span(idle)),
+        Unused::Unfinished => "left half-removed by an earlier sweep".to_owned(),
+    }
+}
+
+/// A span of a sweep's figures a person can read: minutes under an hour,
+/// hours under two days (the sweep's day-long window reads `24h`, not `1d`),
+/// whole days after.
+fn sweep_span(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 3_600 {
+        format!("{} min", s / 60)
+    } else if s < 2 * 86_400 {
+        format!("{}h", s / 3_600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+/// One `build-cache-sweep` row of the disk ledger: a build directory of
+/// aterm's Rust build cache, `bytes` in it, about to go whole under its locks
+/// (`action` `removing`, the write-ahead intent row) or gone (`removed`), and
+/// why ([`sweep_words`]; `atpkg::build_cache::reclaim_watched`, the watch's
+/// pass with no session supervised).
+#[must_use]
+pub fn sweep_row(
+    now: i64,
+    path: &Path,
+    action: &str,
+    bytes: u64,
+    why: atpkg::build_cache::Unused,
+) -> String {
     let mut o = Map::new();
     o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
     o.insert("sid".to_owned(), Value::from(String::new()));
@@ -2928,11 +3168,7 @@ pub fn sweep_row(now: i64, path: &Path, action: &str, bytes: u64) -> String {
     o.insert("bytes".to_owned(), Value::from(bytes));
     o.insert(
         "text".to_owned(),
-        Value::from(
-            "a removed workspace's build cache, whole: unwritten ten minutes, no build \
-             holding its locks"
-                .to_owned(),
-        ),
+        Value::from(format!("a build cache, whole: {}", sweep_words(why))),
     );
     aterm_json::to_string(&Value::Object(o))
         .unwrap_or_else(|_| "{\"kind\":\"build-cache-sweep\"}".to_owned())
@@ -3363,11 +3599,33 @@ fn remove_rows(
 /// processes read again) — and [`Class::ClaudeStaleVersions`] through
 /// [`remove_tree`]. A delegated class never reaches a remover ([`plan`]
 /// refuses it).
-pub fn remover(judge: Judge) -> impl FnMut(&Row) -> std::io::Result<Removed> {
+///
+/// `sessions` reads this instance's sessions AS THEY STAND NOW (tier 3's
+/// clause 4a, [`idle::Sessions`]): the window's re-reads its tabs, the
+/// owner's verb answers its own working directory. Every OS: a tier-3 row
+/// is judged against it again before the reclaim opens anything and under
+/// each profile's locks — never only against the survey's copy, which is a
+/// look old by then — each working directory resolved as the survey
+/// resolves it ([`idle::SessionCwd::on`]: quietly, link by link, and only
+/// where the mount table places every step on a local, non-automounted
+/// volume — never a folder on a share or an automount, through a link onto
+/// one or spelled so the table cannot place it — so no read of it waits on
+/// a stalled server with cargo's locks held). One not resolved is compared
+/// as written on unix; on Windows it keeps every candidate of its volume,
+/// and all of them when it names none. Each reading is on a mount table
+/// read whole: before the reclaim, the one that reading judges by; under the
+/// locks, the very one the mount fence read there. A table not read whole
+/// refuses the removal.
+pub fn remover(
+    judge: Judge,
+    sessions: impl Fn() -> idle::Sessions,
+) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     remover_among(
         judge,
         discover::scan_processes,
         discover::running_claude_census,
+        sessions,
+        aterm_sysprobe::volumes::table,
     )
 }
 
@@ -3375,11 +3633,17 @@ pub fn remover(judge: Judge) -> impl FnMut(&Row) -> std::io::Result<Removed> {
 /// processes `processes` reads ([`discover::Processes`]) and a session's
 /// against the running Claude Codes and the directories the processes were
 /// started with (`census`, [`discover::Census`]): the product's are every
-/// process of this uid, a test's the ones it names.
+/// process of this uid, a test's the ones it names. A live checkout's whole
+/// idle build directory is judged against the sessions `sessions` reads at
+/// the removal ([`remover`]), each reading on a mount table `tables` reads
+/// (the product's [`aterm_sysprobe::volumes::table`]; a test's one it
+/// shapes).
 pub(crate) fn remover_among(
     judge: Judge,
     processes: impl Fn(&[PathBuf], &[u32]) -> std::io::Result<aterm_uds::holders::PathScan>,
     census: impl Fn(Option<&Path>) -> discover::ClaudeCensus,
+    sessions: impl Fn() -> idle::Sessions,
+    tables: impl Fn() -> aterm_sysprobe::volumes::Table,
 ) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     move |row: &Row| match row.class {
         Class::CargoTargets => match &row.witness {
@@ -3427,13 +3691,23 @@ pub(crate) fn remover_among(
                     &mut || discover::recheck(owner, &row.path, judge.now, *quiet_s, &census),
                 )
             }
-            // TIER 3: clause 4 read again at the removal — no process in the
-            // checkout or the build directory, its git files and its working
-            // tree quiet — BEFORE anything there is opened; then each profile
-            // emptied under its locks, its directory and lock files kept,
-            // clause 3 and the mount table read again under them, and the
-            // processes and the git files once more, under each profile's
+            // TIER 3: clause 4 read again at the removal — no session of this
+            // instance in the checkout or the build directory and none whose
+            // working directory is unknown, as `sessions` reads them NOW; no
+            // process there; its git files and its working tree quiet —
+            // BEFORE anything there is opened; then each profile emptied
+            // under its locks, its directory and lock files kept, clause 3
+            // and the mount table read again under them, and the sessions,
+            // the processes and the git files once more, under each profile's
             // locks, right before its delete ([`target::reclaim_profiles`]).
+            //
+            // Every reading of the sessions is on a table read whole (every
+            // OS): on one that is not, clause 4a resolves no working
+            // directory, and unix compares each as written — a `$PWD` in the
+            // checkout spelled through a link would read as elsewhere. So
+            // the table read before the locks refuses here when it is not
+            // whole, and under the locks the sessions and the git files are
+            // judged on the one table the mount fence read there.
             Witness::IdleWhole {
                 checkout,
                 last_used,
@@ -3445,7 +3719,11 @@ pub(crate) fn remover_among(
                 let window_s = window_days.max(&1).saturating_mul(DAY_S);
                 let no_longer =
                     |why: String| std::io::Error::other(format!("no longer a candidate: {why}"));
-                let table = aterm_sysprobe::volumes::table();
+                let table = tables();
+                mounts_clear(&row.path, Some(&table)).map_err(no_longer)?;
+                sessions()
+                    .clear(checkout, &row.path, Some(&table))
+                    .map_err(no_longer)?;
                 idle::git_quiet(checkout, judge.now, window_s, Some(&table)).map_err(no_longer)?;
                 idle::tree_quiet(
                     checkout,
@@ -3456,6 +3734,11 @@ pub(crate) fn remover_among(
                 )
                 .map_err(no_longer)?;
                 discover::unused_under(&dirs, &processes).map_err(no_longer)?;
+                // The table the fence read under this profile's locks, taken
+                // by the check right after it (asked only once the fence
+                // passed): each profile's checks read a table of their own.
+                let locked: std::cell::Cell<Option<aterm_sysprobe::volumes::Table>> =
+                    std::cell::Cell::new(None);
                 target::reclaim_profiles(
                     &row.path,
                     &Judge {
@@ -3464,8 +3747,17 @@ pub(crate) fn remover_among(
                     },
                     *last_used,
                     window_s,
-                    &mut || mounts_clear(&row.path, Some(&aterm_sysprobe::volumes::table())),
                     &mut || {
+                        let fresh = tables();
+                        let fence = mounts_clear(&row.path, Some(&fresh));
+                        locked.set(Some(fresh));
+                        fence
+                    },
+                    &mut || {
+                        let Some(table) = locked.take() else {
+                            return Err("the mount table was not read under its locks".to_owned());
+                        };
+                        sessions().clear(checkout, &row.path, Some(&table))?;
                         discover::unused_under(&dirs, &processes)?;
                         idle::git_quiet(checkout, judge.now, window_s, Some(&table))
                     },
@@ -3555,8 +3847,17 @@ pub struct Roots {
     pub volume: Option<PathBuf>,
     /// The vendor's `versions/` directory.
     pub versions_dir: Option<PathBuf>,
-    /// The live `claude` symlink.
+    /// The live launcher: the `claude` symlink into `versions/` (macOS,
+    /// Linux), or `claude.exe`, the installer's COPY of the live version
+    /// (Windows) ([`versions::live_of`]).
     pub live_link: Option<PathBuf>,
+    /// Claude Code's lock folder (`~/.local/state/claude/locks`): a version
+    /// with a `<version>.lock` there is held ([`versions::kept`]).
+    pub version_locks: Option<PathBuf>,
+    /// The digest cache under the harness state directory
+    /// ([`versions::HASH_FILE`]): a launcher copy is matched by content
+    /// without reading a quarter GiB twice on every survey.
+    pub version_hashes: Option<PathBuf>,
     /// The package store's root (`<prefix>/store`), read only: every row it
     /// produces is delegated to `aterm pkg gc`, so nothing here takes the
     /// store lock or writes under it.
@@ -3594,6 +3895,10 @@ pub struct Roots {
     /// The working directory of every session of this instance (tier 3's
     /// clause 4a).
     pub session_cwds: Vec<PathBuf>,
+    /// Why the working directory of some session of this instance is not
+    /// known (on Windows a live tab that reported no absolute native one):
+    /// while it stands tier 3 takes nothing ([`idle::Context::cwd_unknown`]).
+    pub session_cwd_unknown: Option<String>,
     /// The folders whose links clause 5 reads (`~/.local/bin`,
     /// `~/.cargo/bin`, `$ATPKG_BIN`, `~/.rustup/toolchains`).
     pub link_dirs: Vec<PathBuf>,
@@ -3648,39 +3953,14 @@ pub fn scan_with(
     // only with every lock free, and below the floor the recent tier may take
     // any of them.
     let pressure = config.below_warn(free_bytes) || roots.demand.is_some();
-    // Both sides are canonical or neither is compared: `report` decides the
-    // whole class by path equality, and on macOS `/var` resolves to
-    // `/private/var`, so comparing a resolved link against an unresolved
-    // listing would make the live version read as stale.
-    let versions_root = roots
-        .versions_dir
-        .as_ref()
-        .and_then(|d| std::fs::canonicalize(d).ok());
-    s.live_version = roots
-        .live_link
-        .as_ref()
-        .and_then(|l| std::fs::canonicalize(l).ok())
-        // The link points at the executable inside a version directory on a
-        // native install; the version directory is the ancestor whose parent
-        // is the versions root, else the link's own target.
-        .map(|p| version_dir_of(&p, versions_root.as_deref()));
-    if let Some(dir) = &versions_root {
-        s.versions = read_children(dir)
-            .into_iter()
-            // A child that will not canonicalize has no comparable identity,
-            // so it gets no row rather than an unchecked one.
-            .filter_map(|p| std::fs::canonicalize(&p).ok())
-            .take(MAX_ROWS_PER_CLASS)
-            .map(|path| {
-                let (bytes, bytes_partial) = dir_bytes(&path);
-                VersionDir {
-                    path,
-                    bytes,
-                    bytes_partial,
-                }
-            })
-            .collect();
-    }
+    // The vendor's versions, the live one and what holds the others
+    // ([`versions::read`]); the running processes are read through the same
+    // `processes` as tier 3's clause 4b.
+    let read = versions::read(roots, processes);
+    s.versions = read.entries;
+    s.live_version = read.live;
+    s.live_copy = read.copy_of;
+    s.live_unnamed = read.unnamed;
     if let Some(store) = &roots.store_dir {
         scan_store(store, &mut s);
     }
@@ -3766,16 +4046,17 @@ fn assess_idle_whole(
     let mounts = s.mounts.clone();
     let links = idle::inbound_links(&roots.link_dirs, mounts.as_ref());
     let found: Vec<PathBuf> = s.targets.iter().map(|t| t.path.clone()).collect();
-    let cwds: Vec<PathBuf> = roots
+    let cwds: Vec<idle::SessionCwd> = roots
         .session_cwds
         .iter()
-        .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.clone()))
+        .map(|c| idle::SessionCwd::on(c, mounts.as_ref()))
         .collect();
     let cx = idle::Context {
         now,
         window_s: config.idle_build_days.max(1).saturating_mul(DAY_S),
         device: s.volume_device,
         session_cwds: &cwds,
+        cwd_unknown: roots.session_cwd_unknown.as_deref(),
         links: &links,
         found: &found,
         home: roots.home.as_deref(),
@@ -3797,9 +4078,10 @@ fn assess_idle_whole(
         .iter()
         .map(|(_, c, d)| (c.clone(), d.clone()))
         .collect();
-    for ((i, ..), clear) in candidates
-        .iter()
-        .zip(idle::processes_clear(&pairs, processes))
+    for ((i, ..), clear) in
+        candidates
+            .iter()
+            .zip(idle::processes_clear(&pairs, processes, mounts.as_ref()))
     {
         if let (Err(why), Some(t)) = (clear, s.targets.get_mut(*i)) {
             t.idle = Some(Err(why));
@@ -3846,19 +4128,17 @@ fn scan_store(store: &Path, s: &mut Survey) {
     }
 }
 
-/// Which directory under `versions_dir` a resolved link target names.
-fn version_dir_of(resolved: &Path, versions_dir: Option<&Path>) -> PathBuf {
-    let Some(root) = versions_dir else {
-        return resolved.to_path_buf();
-    };
-    let mut p = resolved;
-    while let Some(parent) = p.parent() {
-        if parent == root {
-            return p.to_path_buf();
-        }
-        p = parent;
-    }
-    resolved.to_path_buf()
+/// Which entry of `versions_dir` a resolved link target names: the ancestor
+/// of `resolved` (itself included) whose parent is `versions_dir`, both
+/// canonical. `None` unless `resolved` lies STRICTLY inside it — a target
+/// elsewhere (a copy of the launcher resolves to itself) names no version, and
+/// standing in for one it would make every real version read as not live.
+fn version_dir_of(resolved: &Path, versions_dir: Option<&Path>) -> Option<PathBuf> {
+    let root = versions_dir?;
+    resolved
+        .ancestors()
+        .find(|p| p.parent() == Some(root))
+        .map(Path::to_path_buf)
 }
 
 /// One build directory's facts, or `None` when the path is not a directory:
@@ -3975,14 +4255,29 @@ fn walk_bytes(
     (total, unread)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What [`volume_of`] read of its thread's error mode as it resolved
+    /// ([`aterm_sysprobe::errors_quiet`]): the test seam of its guard.
+    static VOLUME_ERRORS_QUIET: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The volume holding `path`, read now through the mount table `table`
 /// ([`aterm_sysprobe::volumes`]): one `statfs` (macOS) or `statvfs` (Linux)
 /// on the mount point, never a fork. The path's own spelling is placed first
-/// ([`aterm_sysprobe::volumes::mount_of`], which touches nothing): one on a
-/// remote or automounted mount is answered unread without a `stat`, since a
-/// stalled one answers by blocking. Otherwise its nearest existing ancestor
-/// is resolved (a link followed, `/tmp` to `/private/tmp`) and that one's
-/// mount read.
+/// ([`aterm_sysprobe::volumes::mount_of`], which touches nothing; a Windows
+/// spelling with 8.3 short names spelled long before, which only a local
+/// volume is asked for): one on a remote or automounted mount is answered
+/// unread without a `stat`, since a stalled one answers by blocking.
+/// Otherwise its nearest existing ancestor is resolved (a link followed,
+/// `/tmp` to `/private/tmp`) and that one's mount read.
+///
+/// The resolve runs with the system's error boxes off
+/// ([`aterm_sysprobe::quiet_errors`]) on whatever thread asks — the control
+/// socket's `await sys` holds no guard of its own — so on Windows a path on
+/// an empty card reader or optical drive fails to resolve instead of putting
+/// "There is no disk in the drive" on the owner's desktop.
 ///
 /// # Errors
 ///
@@ -3994,10 +4289,17 @@ pub fn volume_of(
     table: &aterm_sysprobe::volumes::Table,
 ) -> Result<aterm_sysprobe::volumes::Reading, aterm_sysprobe::volumes::Unread> {
     use aterm_sysprobe::volumes::{self, Unread};
-    let spelled = volumes::mount_of(path, table).ok_or(Unread::NoMount)?;
+    // A Windows path spelled with 8.3 short names (a tab's or an agent's
+    // directory under a short `%TEMP%`) keys nowhere: spelled long first,
+    // asked of a local volume only ([`volumes::Table::long_spelling`]).
+    let path = table.long_spelling(path);
+    let spelled = volumes::mount_of(&path, table).ok_or(Unread::NoMount)?;
     if spelled.automounted || !spelled.local {
         return volumes::read(spelled);
     }
+    let _quiet = aterm_sysprobe::quiet_errors();
+    #[cfg(test)]
+    VOLUME_ERRORS_QUIET.set(Some(aterm_sysprobe::errors_quiet()));
     let placed = path
         .ancestors()
         .find_map(|a| std::fs::canonicalize(a).ok())
@@ -4023,21 +4325,50 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
 /// It refuses a symlink: `remove_dir_all` through one would reach a tree no
 /// witness was taken of.
 ///
+/// On Windows it removes as every reclaim removes, FAIL CLOSED
+/// ([`target::remove_entry`]): only on a local fixed disk (the volume fence
+/// every reclaim clears first: never a removable, optical or RAM drive, a
+/// share, or a volume of unknown kind), the entry's folder pinned from its
+/// volume's root (`aterm_dirfd::pin`, placeholders exposed, never through a
+/// link or any other reparse point), the entry found in that folder's
+/// listing by its exact name, and removed through that handle — each unlink
+/// held to the identity the listing gave it, a directory entered only once
+/// its opened identity is the listed one — so nothing is resolved by name
+/// after the check. Any failure to pin the folder refuses, naming it: a cloud
+/// sync root on the way (each file a delete there removes is removed from
+/// the cloud and every synced device), a junction or a folder a volume is
+/// mounted on (`LOOP`), a share, a denial, a thread whose placeholders
+/// could not be exposed — never a fall back to a delete by path, which
+/// follows a link in any component above the entry. An entry that is a
+/// link, or a reparse point that is no link, is refused too. The window and
+/// the verb call this inside their placeholder guard, but the refusal holds
+/// without it.
+///
 /// # Errors
 ///
-/// The path is a symlink, or the removal failed.
+/// The path is a symlink, the removal failed — and on Windows its folder
+/// is on no local fixed disk or could not be pinned (a cloud sync root, a
+/// link or another reparse point on the way), or the entry is a placeholder
+/// or gone.
 pub fn remove_tree(p: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(p)?;
-    if meta.is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "refusing to remove through a symlink",
-        ));
+    #[cfg(windows)]
+    {
+        target::remove_entry(p).map(|_| ())
     }
-    if meta.is_dir() {
-        std::fs::remove_dir_all(p)
-    } else {
-        std::fs::remove_file(p)
+    #[cfg(not(windows))]
+    {
+        let meta = std::fs::symlink_metadata(p)?;
+        if meta.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to remove through a symlink",
+            ));
+        }
+        if meta.is_dir() {
+            std::fs::remove_dir_all(p)
+        } else {
+            std::fs::remove_file(p)
+        }
     }
 }
 

@@ -224,13 +224,20 @@ const WALK_HEAD_BUDGET: u32 = 48;
 /// the first build the channel publishes ([`newest_index`]).
 const FIRST_INDEX_SEARCH_LIMIT: u64 = 1 << 20;
 
-/// How many requests one discovery round, candidate fetch or manifest prefetch keeps in
-/// flight. Each is still its own `curl` process over the unchanged single-URL calls (`-q`
-/// first, `--` before the one URL, https only, capped, retried per URL); twenty of them at
-/// once measured the same wall time as one batched `curl -Z` (0.25–0.48 s), where twenty in
-/// turn took four seconds — a fresh process and two TLS handshakes each. Twenty is also the
-/// ALab set's manifest prefetch (ten programs, a manifest and its signature each) in one wave.
+/// How many requests one discovery round or candidate fetch keeps in flight. Each is still
+/// its own `curl` process over the unchanged single-URL calls (`-q` first, `--` before the
+/// one URL, https only, capped, retried per URL); twenty of them at once measured the same
+/// wall time as one batched `curl -Z` (0.25–0.48 s), where twenty in turn took four seconds
+/// — a fresh process and two TLS handshakes each.
 const FETCH_CONCURRENCY: usize = 20;
+
+/// How many requests the manifest prefetch keeps in flight: both halves of every pair of a
+/// set of up to 32 programs in ONE wave. It was [`FETCH_CONCURRENCY`], ten programs' pairs,
+/// and the prescan grew to eleven: the last program's pair (`ty`, last in plan order) waited
+/// for the first of twenty to land and was a second round of GitHub's redirect and the
+/// asset host before the install announcement, on every first launch (PKG-9's trace: twenty
+/// manifest fetches at once, then two).
+const MANIFEST_WAVE: usize = 64;
 
 /// The most HEADs one discovery asks AHEAD of its walk ([`ahead_of_walk`]), beyond the ones
 /// the walk itself asks (which [`WALK_HEAD_BUDGET`] bounds): a host whose answers keep
@@ -241,6 +248,15 @@ const WALK_AHEAD_BUDGET: usize = 2 * WALK_HEAD_BUDGET as usize;
 /// The calling thread works the queue too, so a thread the system refuses only narrows the
 /// fan-out; a job that panics panics here, as it would have called in turn.
 pub(crate) fn fan_out<T: Sync, R: Send>(items: &[T], job: &(dyn Fn(&T) -> R + Sync)) -> Vec<R> {
+    fan_out_upto(items, FETCH_CONCURRENCY, job)
+}
+
+/// [`fan_out`], up to `width` at once.
+fn fan_out_upto<T: Sync, R: Send>(
+    items: &[T],
+    width: usize,
+    job: &(dyn Fn(&T) -> R + Sync),
+) -> Vec<R> {
     if items.len() < 2 {
         return items.iter().map(job).collect();
     }
@@ -257,7 +273,7 @@ pub(crate) fn fan_out<T: Sync, R: Send>(items: &[T], job: &(dyn Fn(&T) -> R + Sy
                 mine.push((i, job(item)));
             }
         };
-        let helpers: Vec<_> = (1..items.len().min(FETCH_CONCURRENCY))
+        let helpers: Vec<_> = (1..items.len().min(width))
             .filter_map(|_| {
                 std::thread::Builder::new()
                     .name("atpkg-fetch".into())
@@ -1016,9 +1032,9 @@ impl GithubFetcher {
 
     /// [`crate::flow::Fetcher::prefetch_manifests`] over an injected byte fetch: every pair
     /// of `pins` the memo does not hold yet, both halves of all of them asked at once
-    /// ([`fan_out`]), each under its own cap. A pair that arrives WHOLE is memoized, exactly
-    /// as [`Self::manifest_pair`] memoizes it; one that does not is left out, so the read
-    /// that wants it fetches it again and meets the failure itself.
+    /// ([`MANIFEST_WAVE`]), each under its own cap. A pair that arrives WHOLE is memoized,
+    /// exactly as [`Self::manifest_pair`] memoizes it; one that does not is left out, so the
+    /// read that wants it fetches it again and meets the failure itself.
     fn prefetch_with(&self, pins: &[(String, String, u64)], fetch: &WebFetch<'_>) {
         let mut wanted: Vec<(ManifestKey, String, String)> = Vec::new();
         for (repo, program, build) in pins {
@@ -1040,7 +1056,8 @@ impl GithubFetcher {
             .iter()
             .flat_map(|(_, toml, sig)| [(toml.as_str(), MANIFEST_CAP), (sig.as_str(), SIG_CAP)])
             .collect();
-        let mut fetched = fan_out(&urls, &|&(url, cap)| fetch(url, cap)).into_iter();
+        let mut fetched =
+            fan_out_upto(&urls, MANIFEST_WAVE, &|&(url, cap)| fetch(url, cap)).into_iter();
         for (key, ..) in wanted {
             if let (Some(Ok(toml)), Some(Ok(sig))) = (fetched.next(), fetched.next())
                 && let Ok(mut memo) = self.manifests.lock()
@@ -3148,6 +3165,9 @@ mod tests {
                 .args(["--exact", "--nocapture", LINK_PROBE])
                 .env(LINK_PROBE_ENV, dir.path())
                 .env(aterm_update_core::CURL_SEAM, &wrapper)
+                // The online HEAD's attempts two and three come after curl's backoff, at
+                // a thousandth under the fast-timers seam: the count is what is pinned.
+                .env(aterm_types::domain::ENV_DEV_FAST_TIMERS, "1")
                 .stdin(aterm_uds::spawnfd::Stdio::null())
                 .output()
                 .unwrap();
@@ -3270,6 +3290,44 @@ mod tests {
         asked.lock().unwrap().clear();
         f.prefetch_with(&pins[..2], &wire);
         assert!(asked.lock().unwrap().is_empty());
+    }
+
+    /// THE PREFETCH IS ONE WAVE: a set with more pairs than the shared fan-out keeps in
+    /// flight has every request out at once, so no program's manifest waits for another's to
+    /// land — the eleventh program's pair was a second round before the announcement. Each
+    /// request is answered only once all of them have arrived; a minute is the hang detector.
+    #[test]
+    fn the_manifest_prefetch_asks_every_pair_in_one_wave() {
+        let f = GithubFetcher::new("alabsystems".into());
+        let pins: Vec<(String, String, u64)> = (0..=FETCH_CONCURRENCY / 2)
+            .map(|i| (format!("p{i}"), format!("p{i}"), 1))
+            .collect();
+        let want = 2 * pins.len();
+        let arrived = (std::sync::Mutex::new(0usize), std::sync::Condvar::new());
+        let wire = |url: &str, _cap: u64| -> Result<Vec<u8>, String> {
+            let (count, all_in) = &arrived;
+            let mut n = count.lock().unwrap();
+            *n += 1;
+            all_in.notify_all();
+            let timed_out = all_in
+                .wait_timeout_while(n, aterm_spec::wait::MUST_HAPPEN, |n| *n < want)
+                .unwrap()
+                .1
+                .timed_out();
+            if timed_out {
+                Err(format!(
+                    "{url}: answered before all {want} requests were out"
+                ))
+            } else {
+                Ok(url.as_bytes().to_vec())
+            }
+        };
+        f.prefetch_with(&pins, &wire);
+        assert_eq!(
+            f.manifests.lock().unwrap().len(),
+            pins.len(),
+            "every pair of {want} requests in flight at once"
+        );
     }
 
     /// A host whose every answer is "published" cannot hold the walk: it stops at its HEAD

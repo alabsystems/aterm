@@ -70,6 +70,11 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
 /// decision 5). A trip is the owner's raise-or-shrink call, never a re-record.
 pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 
+/// The GPU module's size ceiling in bytes, on the post-`wasm-opt -O3`
+/// `aterm_gpu_web_bg.wasm` (`wasm_gpu_module_bytes`), the same rule as the
+/// CPU module's: the measured 4,901,631 B (2026-10-19) + 10%.
+pub(crate) const WASM_GPU_MODULE_BYTES_CAP: f64 = 5_391_794.0;
+
 /// The node driver, beside this crate.
 fn bench_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/wasm/bench.mjs")
@@ -89,7 +94,7 @@ pub(crate) fn lane_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     if !answers(Path::new("node"), &["--version"]) {
         return Err(LaneRun::skip(
             "node not found; the lane runs the wasm under node",
-            crate::install_fix("node", "node", "nodejs"),
+            aterm_uds::host::tool("node").remedy(),
         ));
     }
     build_tools(wasm_opt)
@@ -103,7 +108,10 @@ pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     let Some(rustup) = crate::rustup::find_rustup() else {
         return Err(LaneRun::skip(
             format!("no rustup ({})", crate::rustup::RUSTUP_LOOKED),
-            "install rustup (https://rustup.rs) and the stable wasm32 target",
+            format!(
+                "{}, with stable's wasm32 std",
+                aterm_uds::host::tool("rustup").remedy()
+            ),
         ));
     };
     let has_target = command(&rustup)
@@ -125,14 +133,14 @@ pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
         return Err(LaneRun::skip(
             "wasm-opt not found; the lane applies the shipping -O3 pass and never measures \
              pre-opt modules",
-            crate::install_fix("binaryen", "binaryen", "binaryen"),
+            aterm_uds::host::tool("wasm-opt").remedy(),
         ));
     }
     Ok(rustup)
 }
 
 /// WASM floors: the shipped modules under node, every gated key against its
-/// floor, plus the module-size ceiling.
+/// floor, plus the module-size ceilings.
 pub(crate) fn gate_wasm(record: bool) -> LaneRun {
     let root = workspace_root();
     let rustup = match lane_tools(true) {
@@ -144,9 +152,12 @@ pub(crate) fn gate_wasm(record: bool) -> LaneRun {
         Err(e) => return LaneRun::fail(e),
     };
     let mut run = floors::judge_keyed(&WASM_LANE, &json, record);
-    match wasm_module_fence(&json) {
-        Some(finding) => run.add_failure(finding),
-        None => run.fence_held(WASM_LANE.cli),
+    let findings = wasm_module_fences(&json);
+    if findings.is_empty() {
+        run.fence_held(WASM_LANE.cli);
+    }
+    for finding in findings {
+        run.add_failure(finding);
     }
     run
 }
@@ -316,10 +327,18 @@ fn build_modules(
         .map_err(|e| format!("could not create {}: {e}", neutral.display()))?;
     eprintln!("  building aterm-wasm + aterm-gpu-web (wasm32, {profile}) on stable");
     let mut build = stable.cargo();
+    let target = root.join("target");
+    // The intermediates go where Spotlight never looks; the `.wasm` files are
+    // uplifted to `<target>/wasm32-unknown-unknown/<profile>/` as before.
+    if let Some(value) =
+        crate::fallback_build_dir(&crate::EnvSnapshot::capture(), &neutral, &target)
+    {
+        build.arg("--config").arg(value);
+    }
     build
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("CARGO_TARGET_DIR", &target)
         .current_dir(&neutral)
         .args([
             "build",
@@ -423,26 +442,37 @@ fn run_step(cmd: &mut aterm_uds::spawnfd::Command, what: &str) -> Result<(), Str
     }
 }
 
-/// The module-size ceiling: `Some(finding)` when it is breached or the size
-/// is missing (an unmeasured size is not a small one).
-pub(crate) fn wasm_module_fence(json: &Value) -> Option<String> {
-    let key = "wasm_cpu_module_bytes";
-    let cap = WASM_CPU_MODULE_BYTES_CAP;
-    match floors::number(json, key) {
-        Some(v) if v <= cap => {
-            eprintln!(
+/// The module-size ceilings, CPU then GPU: a finding for each one breached or
+/// missing (an unmeasured size is not a small one).
+pub(crate) fn wasm_module_fences(json: &Value) -> Vec<String> {
+    let fences = [
+        (
+            "wasm_cpu_module_bytes",
+            WASM_CPU_MODULE_BYTES_CAP,
+            "WASM_CPU_MODULE_BYTES_CAP",
+        ),
+        (
+            "wasm_gpu_module_bytes",
+            WASM_GPU_MODULE_BYTES_CAP,
+            "WASM_GPU_MODULE_BYTES_CAP",
+        ),
+    ];
+    let mut findings = Vec::new();
+    for (key, cap, name) in fences {
+        match floors::number(json, key) {
+            Some(v) if v <= cap => eprintln!(
                 "    {key}: GREEN — {v:.0} B <= ceiling {cap:.0} B ({:.0} B of headroom)",
                 cap - v
-            );
-            None
+            ),
+            Some(v) => findings.push(format!(
+                "{key} {v:.0} B > ceiling {cap:.0} B by {:.0} B ({name}): raise the ceiling or \
+                 shrink the module — an owner call, not a re-record",
+                v - cap
+            )),
+            None => findings.push(format!("{key} missing from the bench report")),
         }
-        Some(v) => Some(format!(
-            "{key} {v:.0} B > ceiling {cap:.0} B by {:.0} B (WASM_CPU_MODULE_BYTES_CAP): raise \
-             the ceiling or shrink the module — an owner call, not a re-record",
-            v - cap
-        )),
-        None => Some(format!("{key} missing from the bench report")),
     }
+    findings
 }
 
 #[cfg(test)]
@@ -453,12 +483,31 @@ mod tests {
         aterm_json::from_str(text).expect("test JSON parses")
     }
 
+    fn sizes(cpu: u64, gpu: u64) -> Value {
+        json(&format!(
+            "{{\"wasm_cpu_module_bytes\":{cpu},\"wasm_gpu_module_bytes\":{gpu}}}"
+        ))
+    }
+
     #[test]
-    fn the_wasm_module_ceiling_holds_absolutely() {
-        assert!(wasm_module_fence(&json("{\"wasm_cpu_module_bytes\":5351532}")).is_none());
-        assert!(wasm_module_fence(&json("{\"wasm_cpu_module_bytes\":5886685}")).is_none());
-        assert!(wasm_module_fence(&json("{\"wasm_cpu_module_bytes\":5886686}")).is_some());
-        assert!(wasm_module_fence(&json("{\"wasm_gpu_module_bytes\":1}")).is_some());
+    fn the_wasm_module_ceilings_hold_absolutely() {
+        assert!(wasm_module_fences(&sizes(4_703_802, 4_901_631)).is_empty());
+        assert!(wasm_module_fences(&sizes(5_886_685, 5_391_794)).is_empty());
+        let cpu_over = wasm_module_fences(&sizes(5_886_686, 5_391_794));
+        assert_eq!(cpu_over.len(), 1);
+        assert!(cpu_over[0].starts_with("wasm_cpu_module_bytes 5886686 B > ceiling"));
+        let gpu_over = wasm_module_fences(&sizes(5_886_685, 5_391_795));
+        assert_eq!(gpu_over.len(), 1);
+        assert!(gpu_over[0].starts_with("wasm_gpu_module_bytes 5391795 B > ceiling"));
+        assert_eq!(wasm_module_fences(&sizes(5_886_686, 5_391_795)).len(), 2);
+        assert_eq!(
+            wasm_module_fences(&json("{\"wasm_cpu_module_bytes\":1}")),
+            ["wasm_gpu_module_bytes missing from the bench report"]
+        );
+        assert_eq!(
+            wasm_module_fences(&json("{\"wasm_gpu_module_bytes\":1}")),
+            ["wasm_cpu_module_bytes missing from the bench report"]
+        );
     }
 
     #[test]

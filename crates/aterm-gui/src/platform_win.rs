@@ -1030,14 +1030,10 @@ pub(crate) fn resync_forced_chrome_palette() -> bool {
     crate::chrome_band::install_forced_chrome(resolve_forced_chrome(high_contrast)) || accent_moved
 }
 
-/// How far ONE wheel notch travels, per the user's Windows mouse settings.
-/// [`WheelNotch::Page`] is the "One screen at a time" slider position, which has no
-/// line count — the consumer supplies its own viewport height.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WheelNotch {
-    Lines(u32),
-    Page,
-}
+/// How far ONE wheel notch travels, per the user's Windows mouse settings: the
+/// platform-neutral [`crate::input::WheelNotch`], so Windows' wheel rule runs on
+/// every host (`input::WheelPlatform`, session log phase 6, 6A-4).
+pub(crate) use crate::input::WheelNotch;
 
 /// Interpret a raw `SPI_GETWHEELSCROLLLINES` value. `0` is legal and means "wheel
 /// scrolling off" — honoured as zero lines rather than clamped up to 1, because a
@@ -2547,6 +2543,8 @@ impl AppRt for AppRtWindows {
                 high_contrast,
                 transparency_effects_enabled(),
             ),
+            // Windows has no colour-independence setting of its own.
+            differentiate_without_color: false,
             text_scale: os_text_scale(),
         }
     }
@@ -2576,16 +2574,17 @@ impl AppRt for AppRtWindows {
 }
 
 /// Photograph the window — caption CHROME (dark/light title bar, buttons) plus the
-/// GPU-rendered grid — to tightly-packed top-down RGBA8 via
-/// `PrintWindow(PW_RENDERFULLCONTENT)`. This is the robust capture: it renders the
-/// window itself (so it works even occluded / off-screen, unlike a screen grab) and
-/// `PW_RENDERFULLCONTENT` pulls in the DirectComposition GPU surface. Returns
-/// `(rgba, width, height)`; serves the Windows `window` introspection verb for the
+/// GPU-rendered grid — to tightly-packed top-down BGRX via
+/// `PrintWindow(PW_RENDERFULLCONTENT)`, as `GetDIBits` writes it: the fourth byte is
+/// undefined, and the encode worker makes it opaque RGBA. This is the robust capture:
+/// it renders the window itself (so it works even occluded / off-screen, unlike a
+/// screen grab) and `PW_RENDERFULLCONTENT` pulls in the DirectComposition GPU
+/// surface. Returns `(bgrx, width, height)`; serves the Windows `window` introspection verb for the
 /// ordinary `background_material = "none"` case. This is explicitly window-local,
 /// square, and opaque: DWM's rounded-corner clip and Mica/Acrylic backdrop exist only
 /// in compositor output. The caller therefore refuses non-`none` materials instead of
 /// mislabeling this bitmap as the native on-glass result.
-pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32), String> {
+pub(crate) fn capture_window_bgrx(window: &Window) -> Result<(Vec<u8>, u32, u32), String> {
     let hwnd = hwnd_of(window).ok_or_else(|| "no window to capture (headless)".to_string())?;
     // SAFETY: hand-rolled GDI capture. Every created GDI object (mem DC, bitmap) is
     // released on every return path; `hwnd` is winit-owned and only read from; the
@@ -2677,11 +2676,6 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
         DeleteDC(mem);
         ReleaseDC(0, screen);
         validate_window_capture_transfer(print_succeeded, lines, h)?;
-        // GetDIBits yields BGRX (blue,green,red, alpha undefined); make it opaque RGBA.
-        for px in buf.as_chunks_mut::<4>().0 {
-            px.swap(0, 2);
-            px[3] = 255;
-        }
         Ok((buf, w as u32, h as u32))
     }
 }
@@ -3077,6 +3071,7 @@ mod tests {
             crate::native_appearance::install_preferences(AppearancePreferences {
                 high_contrast: false,
                 reduced_transparency: reduced,
+                differentiate_without_color: false,
                 text_scale: 1.0,
             });
         };
@@ -3124,7 +3119,9 @@ mod tests {
         // it set is testing a different thing, and should say so rather than fail
         // mysteriously.
         if super::force_hc_chrome_env() {
-            return;
+            aterm_spec::host::could_not_run(
+                "the high-contrast chrome override is set here, so the negative arm cannot hold",
+            );
         }
         assert_eq!(resolve_forced_chrome(false), None);
         // Under HC the five slots are read; the VALUES are the live machine's, so
@@ -3148,6 +3145,7 @@ mod tests {
         let normalized = AppearancePreferences {
             high_contrast: false,
             reduced_transparency: false,
+            differentiate_without_color: false,
             text_scale: scale,
         }
         .normalized();

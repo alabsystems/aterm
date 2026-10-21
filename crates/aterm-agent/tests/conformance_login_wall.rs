@@ -45,7 +45,22 @@
 //! back there (`LoginShared::Back`, 2). The real decider types no `/login`
 //! while that tab carries it (a wait with an end: no rest, the owner told
 //! there), and the turn it delivers again once the login is back
-//! (`login-back@v1`) is the model's `Continue` at its wall.
+//! (`login-back@v1`) is the model's `Continue` at its wall. So is the turn of
+//! a tab whose own `/login` carried the sign-in, or a person's left there,
+//! when the login comes back in the other tab (`BackElsewhere`): the host is
+//! asked at that `/login`'s `Login interrupted` too, no notice stands, a task
+//! the wall reopened is delivered all the same, and with a renewal standing
+//! the tab moves onto the renewed login (`Relaunch`) as a tab that waited
+//! does. The dialog of aterm's `/login` is drawn where it stands (`track` and
+//! `wall`: the measured 2.1.303 picker while `picker` is 1, else the browser
+//! hand-off), so the decider, the exception and the picker gate
+//! ([`picker_gate`], over the host's word) are checked there: with the login
+//! back elsewhere the owner is told to close it (`TellClose`), never to sign
+//! in, nothing is typed into it and its picker is answered by nobody; so too
+//! with a renewal made while that `/login` was up, which is followed once it
+//! is left (`Relaunch` at its `Login interrupted`). The host's advice is
+//! handed to the decider only where the real loop asks for it
+//! (`TurnEndState::account_point`, after the point is folded in).
 //!
 //! Negative controls: the model with any one defect switched on (`Buggy`, and each
 //! knob) disagrees with the real code somewhere.
@@ -63,7 +78,10 @@ use aterm_agent::harness::upgrade::{
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::approval::Decision;
 use aterm_agent::supervise::policy::exception::{Exception, Urgency, exception_for};
-use aterm_agent::supervise::policy::login::{LoginShared, pick_method};
+use aterm_agent::supervise::policy::login::{
+    LoginShared, PickerGate, pick_method, picker_gate, renewal_followed,
+};
+use aterm_agent::supervise::policy::notice::{LOGIN_BACK_DIALOG, LOGIN_RENEWED_DIALOG};
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
 use aterm_agent::supervise::policy::turn_end::{
     AccountAdvice, AccountAt, RULE_CONTINUE, RULE_LOGIN, RULE_LOGIN_BACK, Restart, TurnEndAction,
@@ -71,9 +89,10 @@ use aterm_agent::supervise::policy::turn_end::{
 };
 use aterm_json::Value;
 use aterm_models_harness::harness_login_wall_model;
-use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, LOGIN_PICKER, screen};
+use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, LOGIN_HANDOFF, LOGIN_PICKER, screen};
 use aterm_phase::{LoginMethod, LoginScreen};
 use aterm_spec::derive::Model;
+use aterm_spec::interp::Resolved;
 
 type S = BTreeMap<&'static str, i64>;
 
@@ -87,22 +106,26 @@ fn to() -> Version {
     Version::parse("2.1.283").expect("to")
 }
 
-/// Every state `m` reaches, invariants unchecked.
+/// Every state `m` reaches by [`Model::fire`] (each action's first successor),
+/// invariants unchecked, in breadth-first order. Walked resolved
+/// ([`Resolved::successors`] is [`Model::successors`] case for case, in the same
+/// order, without a string-keyed environment per step): walked by name, it was
+/// 1.3 s of the test's 17.7 s at a load of 20-40.
 fn reachable(m: &Model) -> Vec<S> {
+    let r = Resolved::new(m).expect("the login wall model resolves");
     let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([m.init_state()]);
+    let mut queue = VecDeque::from([r.init()]);
     let mut out = Vec::new();
     while let Some(s) = queue.pop_front() {
         if !seen.insert(s.clone()) {
             continue;
         }
-        for a in &m.actions {
-            let mut next = s.clone();
-            if m.fire(a.name, &mut next) {
+        for a in 0..m.actions.len() {
+            if let Some(next) = r.successors(a, &s).into_iter().next() {
                 queue.push_back(next);
             }
         }
-        out.push(s);
+        out.push(r.state(&s));
     }
     out
 }
@@ -125,6 +148,34 @@ const WALL_ROW: &str = "⏺ Login expired · Please run /login";
 /// A person's own `/login`, left with Esc under the wall.
 const LEFT: [&str; 4] = [WALL_ROW, "", "❯ /login", "  ⎿  Login interrupted"];
 
+/// The recorded screen with the dialog of the `/login` aterm typed at the wall
+/// standing under its row, in the composer's place: the measured 2.1.303
+/// method picker while `picker` is 1 (the picker of the `/login` aterm typed,
+/// unanswered), else its browser hand-off — each as the measured screen draws
+/// it under its own prompt's.
+fn with_dialog(picker: bool) -> Vec<String> {
+    let dialog = screen(if picker { LOGIN_PICKER } else { LOGIN_HANDOFF });
+    let typed = dialog
+        .iter()
+        .position(|r| r.trim_end() == "❯ /login")
+        .expect("the measured dialog's /login row");
+    let mut r = screen(LOGIN_EXPIRED);
+    let at = r
+        .iter()
+        .position(|row| row.starts_with("⏺ Login expired"))
+        .expect("the wall row");
+    r.truncate(at + 1);
+    r.push(String::new());
+    r.extend(dialog[typed..].iter().cloned());
+    r
+}
+
+/// Whether the screen of state `s` is the dialog of aterm's `/login`, standing
+/// under the wall's row ([`with_dialog`]).
+fn dialog_up(s: &S) -> bool {
+    s["wall"] == 1 && s["track"] == 1 && !(s["left"] == 1 && s["back"] == 0)
+}
+
 /// The screen state `s` stands for.
 fn screen_of(s: &S) -> Vec<String> {
     if s["left"] == 1 && s["back"] == 0 {
@@ -135,6 +186,8 @@ fn screen_of(s: &S) -> Vec<String> {
         } else {
             with_tail(&LEFT)
         }
+    } else if dialog_up(s) {
+        with_dialog(s["picker"] == 1)
     } else if s["wall"] == 1 {
         with_tail(&[WALL_ROW])
     } else if s["back"] == 1 {
@@ -348,7 +401,17 @@ struct Upgrade {
     screen_wall: bool,
     stands: bool,
     undelivered: bool,
+    /// Where an announced upgrade's window has not run out (`phase` 1,
+    /// `window` 0): whether the real clock lets it run out ([`window_runs`]).
+    runs: Option<bool>,
 }
+
+/// The variables [`upgrade_at`] reads (through the screen, the transcript and
+/// the phase); the others are the model's own records or the supervisor's.
+const UPGRADE_VARS: [&str; 11] = [
+    "asks", "back", "left", "phase", "picker", "ready", "stood", "track", "unread", "wall",
+    "window",
+];
 
 fn upgrade_at(m: &Model, s: &S) -> Upgrade {
     let rows = screen_of(s);
@@ -402,6 +465,7 @@ fn upgrade_at(m: &Model, s: &S) -> Upgrade {
         screen_wall,
         stands: said.stands,
         undelivered,
+        runs: (s["phase"] == 1 && s["window"] == 0).then(|| window_runs(m, s)),
     }
 }
 
@@ -468,17 +532,22 @@ const LABEL: &str = "m7-a";
 /// The tab that carries the login's sign-in in an `elsewhere` state.
 const PEER: &str = "@2";
 
-/// `r` as the window's host hands it over for state `s`. At a lost login, the
-/// other tab's sign-in of it (`elsewhere`: carried there, or the login back
-/// there), as the host's latch answers the loop's ask. On a rostered login:
+/// `r` as the window's host hands it over for state `s`, the loop's books `st`
+/// as they stood before it. At a lost login — its row, or the `/login` dialog
+/// or `Login interrupted` of the loss the books track — the other tab's
+/// sign-in of it (`elsewhere`: carried there, or the login back there), as the
+/// host's latch answers the loop's ask. On a rostered login:
 /// the session's renewable label and a host that relaunches; once renewed, the
 /// process on the superseded login and the advice to move onto the renewed one
 /// (what `accounts::advise` gives at a lost login or a turn end). Elsewhere no
-/// host keeps a roster for it.
-fn hosted(s: &S, renewed: bool, r: TurnEndReading) -> TurnEndReading {
+/// host keeps a roster for it. The advice is the host's answer to the loop's
+/// ask, so it is set only where the loop asks ([`advised`]).
+fn hosted(s: &S, st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReading {
     let by = PEER.to_string();
+    let asked = r.wall == Some(aterm_phase::WallKind::Auth)
+        || (st.login_track().is_some() && (r.login_screen.is_some() || r.login_interrupted));
     let login_shared = match s["elsewhere"] {
-        _ if r.wall != Some(aterm_phase::WallKind::Auth) => None,
+        _ if !asked => None,
         1 => Some(LoginShared::Carried { by }),
         2 => Some(LoginShared::Back { by }),
         _ => None,
@@ -491,21 +560,61 @@ fn hosted(s: &S, renewed: bool, r: TurnEndReading) -> TurnEndReading {
         login_label: Some(LABEL.to_string()),
         login_superseded: renewed,
         restartable: true,
-        account: renewed.then(|| AccountAdvice::Move {
+        ..r
+    }
+}
+
+/// `r` with the host's advice, as the loop hands it to the decider: asked
+/// once the point is folded into `st`, and only where the loop asks
+/// ([`TurnEndState::account_point`]) — once renewed, the move onto the
+/// renewed login (what `accounts::advise` gives at a lost login or a turn
+/// end); else nothing.
+fn advised(st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReading {
+    let asked = st.account_point(&r, &SupervisorConfig::default()).is_some();
+    TurnEndReading {
+        account: (renewed && asked).then(|| AccountAdvice::Move {
             to: LABEL.to_string(),
         }),
         ..r
     }
 }
 
+/// The approval loop's picker gate at `r` ([`picker_gate`]): behind the
+/// `/login` the books `st` typed, the host's word on that login's sign-in,
+/// and a renewal the tab follows ([`renewal_followed`]).
+fn gate_at(st: &TurnEndState, r: &TurnEndReading) -> PickerGate {
+    picker_gate(
+        st.login_typed_at().is_some(),
+        r.login_shared.as_ref(),
+        renewal_followed(
+            r.login_superseded,
+            &SupervisorConfig::default(),
+            r.restartable,
+        ),
+    )
+}
+
+/// State `s` as it stood at the loss's earlier reads ([`supervisor_at`]): the
+/// login back in another tab came after them — after this tab's `/login`
+/// (`BackElsewhere`), or after the person's own was left under the other
+/// tab's sign-in (`OtherBack`).
+fn earlier(s: &S) -> S {
+    let mut then = s.clone();
+    if then["elsewhere"] == 2 {
+        then.insert("elsewhere", if s["track"] == 1 { 0 } else { 1 });
+    }
+    then
+}
+
 /// What the real supervisor decides at the point state `s` stands for, the
-/// exception it raises there, and whether a picker read there is behind the
-/// `/login` it typed (the approval loop's gate: `login_typed_at`). Its policy is
+/// exception it raises there, and whose a picker read there is (the approval
+/// loop's gate, [`picker_gate`]: behind the `/login` it typed, by
+/// `login_typed_at`, and the host's word on that login's sign-in). Its policy is
 /// fresh, except where the state's lost-login track stands (it typed `/login`
 /// at the wall's first point), where a person's own `/login` was left there
 /// (`left`), and where the wall came over a finished task (the task seeded
 /// done).
-fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, bool) {
+fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, PickerGate) {
     let cfg = SupervisorConfig::default();
     let t0 = Instant::now() + Duration::from_secs(10 * 3600);
     let mut st = TurnEndState::default();
@@ -513,8 +622,10 @@ fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, bool) {
     // The instant the state's own reading is a minute after: the wall's, or
     // the `/login` typed at it once the wait it decided there ended.
     let mut from = t0;
+    let then = earlier(s);
     let worked = if s["track"] == 1 {
-        let first = hosted(s, false, first_wall(s, &mut st));
+        let first = first_wall(s, &mut st);
+        let first = hosted(&then, &st, false, first);
         st.observe(&first, t0);
         let (a, first, at) = settled_at(&st, &first, &cfg, t0);
         assert!(
@@ -526,31 +637,35 @@ fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, bool) {
         None
     } else if s["left"] == 1 && s["back"] == 0 {
         // The wall read, then the person's own `/login` left under it.
-        let first = hosted(s, false, first_wall(s, &mut st));
+        let first = first_wall(s, &mut st);
+        let first = hosted(&then, &st, false, first);
         st.observe(&first, t0);
-        let gone = hosted(s, false, reading(&with_tail(&LEFT), None));
+        let gone = hosted(&then, &st, false, reading(&with_tail(&LEFT), None));
         st.observe(&gone, t0 + Duration::from_secs(30));
         assert!(st.login_cancelled(), "the person's /login left at {s:?}");
         None
     } else if s["done"] == 1 && s["wall"] == 1 {
         // The wall over the finished task, read first now.
-        let r = hosted(s, s["renewed"] == 1, first_wall(s, &mut st));
+        let r = first_wall(s, &mut st);
+        let r = hosted(s, &st, s["renewed"] == 1, r);
         st.observe(&r, t0);
+        let r = advised(&st, s["renewed"] == 1, r);
         return (
             settled(&st, &r, &cfg, t0),
             exception_for(&st, &r, &cfg, t0),
-            st.login_typed_at().is_some(),
+            gate_at(&st, &r),
         );
     } else {
         long
     };
     let now = from + Duration::from_secs(60);
-    let r = hosted(s, s["renewed"] == 1, reading(&screen_of(s), worked));
+    let r = hosted(s, &st, s["renewed"] == 1, reading(&screen_of(s), worked));
     st.observe(&r, now);
+    let r = advised(&st, s["renewed"] == 1, r);
     (
         decide_turn_end(&st, &r, &cfg, now),
         exception_for(&st, &r, &cfg, now),
-        st.login_typed_at().is_some(),
+        gate_at(&st, &r),
     )
 }
 
@@ -608,14 +723,19 @@ fn supervisor_action(a: &TurnEndAction) -> Option<&'static str> {
 }
 
 /// The owner told now: the login exception, not escalated (the host's ask on
-/// the glass), with the owner's four-part notice.
-fn tells_now(e: Option<&Exception>) -> bool {
-    e.is_some_and(|e| {
-        e.kind == ExceptionKind::Login
-            && e.when == Urgency::Now
-            && !e.escalated
-            && e.notice.is_some()
-    })
+/// the glass), with the owner's four-part notice — the notice to close a
+/// dialog whose login came back elsewhere ([`LOGIN_BACK_DIALOG`]) or was
+/// renewed ([`LOGIN_RENEWED_DIALOG`]): `TellClose`; or any other (`TellNow`).
+fn tells_now(e: Option<&Exception>) -> Option<&'static str> {
+    e.filter(|e| e.kind == ExceptionKind::Login && e.when == Urgency::Now && !e.escalated)
+        .and_then(|e| e.notice.as_ref())
+        .map(|n| {
+            if n.id == LOGIN_BACK_DIALOG.id || n.id == LOGIN_RENEWED_DIALOG.id {
+                "TellClose"
+            } else {
+                "TellNow"
+            }
+        })
 }
 
 /// Whether the real picker policy chooses at the measured picker for a state
@@ -634,29 +754,110 @@ fn picks(known: bool) -> bool {
     )
 }
 
+/// The variables [`supervisor_at`] reads (through the screen and the host's
+/// readings); the others are the model's own records or the upgrade's.
+const SUPERVISOR_VARS: [&str; 9] = [
+    "back",
+    "done",
+    "elsewhere",
+    "left",
+    "picker",
+    "renewed",
+    "rostered",
+    "track",
+    "wall",
+];
+
+/// What the real supervisor decides at the look a state stands for: its
+/// decision (`sup`: the model's action it is, or a rest), its exception (`ask`:
+/// the owner told now, `TellNow` or `TellClose`), and the picker gate (`carry`:
+/// the picker is aterm's to answer).
+struct Supervised {
+    decided: TurnEndAction,
+    exception: Option<Exception>,
+    sup: Option<&'static str>,
+    ask: Option<&'static str>,
+    carry: bool,
+}
+
+impl Supervised {
+    fn at(s: &S) -> Self {
+        let (decided, exception, gate) = supervisor_at(s);
+        let carry = gate == PickerGate::Carried;
+        let ask = tells_now(exception.as_ref());
+        // At a wall nothing typed at, nobody told and no wait with an end: a
+        // rest.
+        let waits = matches!(decided, TurnEndAction::WaitUntil { .. });
+        let sup = supervisor_action(&decided).or((s["wall"] == 1
+            && s["track"] == 0
+            && ask.is_none()
+            && !waits)
+            .then_some("Rest"));
+        Self {
+            decided,
+            exception,
+            sup,
+            ask,
+            carry,
+        }
+    }
+}
+
+/// The real code's decisions, kept by the variables each side reads
+/// ([`UPGRADE_VARS`], [`SUPERVISOR_VARS`]) and handed only those, so a read of
+/// any other panics rather than going unkeyed. Each side is pure in them (a
+/// fresh screen, transcript, phase and policy per look): the 11,034 states read
+/// 232 upgrades and 75 supervisors. Read at every state, they were 4.5 s of the
+/// walk's 17.7 s at a load of 20-40.
+#[derive(Default)]
+struct Looks {
+    upgrades: BTreeMap<S, Upgrade>,
+    supervisors: BTreeMap<S, Supervised>,
+}
+
+impl Looks {
+    fn at(&mut self, m: &Model, s: &S) -> (&Upgrade, &Supervised) {
+        let only = |names: &[&'static str]| -> S { names.iter().map(|&k| (k, s[k])).collect() };
+        let up = self
+            .upgrades
+            .entry(only(&UPGRADE_VARS))
+            .or_insert_with_key(|vars| upgrade_at(m, vars));
+        let sv = self
+            .supervisors
+            .entry(only(&SUPERVISOR_VARS))
+            .or_insert_with_key(Supervised::at);
+        (up, sv)
+    }
+}
+
 /// Whether the model `m` agrees at `s` with what the real code decided: the
-/// upgrade, the supervisor, its exception, the picker gate (`carry`) and
-/// policy (`picked`, by whether the method is known), and, where the model's
-/// renewal is enabled, what the real renewal touched (`renew_clean`: no check
-/// under any login but its new one, the live login left as it was).
+/// upgrade and its clock, the supervisor, its exception, the picker gate
+/// (`carry`) and policy (`picked`, by whether the method is known), and, where
+/// the model's renewal is enabled, what the real renewal touched
+/// (`renew_clean`: no check under any login but its new one, the live login
+/// left as it was).
 fn agrees(
     m: &Model,
     s: &S,
-    up: &Upgrade,
-    (sup, ask, carry): (Option<&'static str>, bool, bool),
+    (up, sv): (&Upgrade, &Supervised),
     renew_clean: bool,
     picked: [bool; 2],
 ) -> bool {
+    let Supervised {
+        sup, ask, carry, ..
+    } = sv;
     let taken = upgrade_action(&up.step);
     let upgrade_ok = ["Announce", "GiveUp", "Restart"]
         .iter()
         .all(|a| m.action_enabled(a, s) == (taken == Some(*a)));
     let supervisor_ok = ["TypeLogin", "Continue", "Relaunch", "Follow", "Rest"]
         .iter()
-        .all(|a| m.action_enabled(a, s) == (sup == Some(*a)));
-    let ask_ok = m.action_enabled("TellNow", s) == ask;
+        .all(|a| m.action_enabled(a, s) == (*sup == Some(*a)));
+    let ask_ok = ["TellNow", "TellClose"]
+        .iter()
+        .all(|a| m.action_enabled(a, s) == (*ask == Some(*a)));
     let pick_ok = s["picker"] == 0
-        || m.action_enabled("PickMethod", s) == (carry && picked[usize::from(s["known"] == 1)]);
+        || m.action_enabled("PickMethod", s) == (*carry && picked[usize::from(s["known"] == 1)]);
     let renew_ok = !m.action_enabled("Renew", s) || {
         let mut next = s.clone();
         m.fire("Renew", &mut next)
@@ -674,8 +875,9 @@ fn agrees(
             && (next["asks"] == s["asks"]) == (up.asks == before && before > 0)
             && (real_asks(m, next["asks"]) == MAX_ASKS) == (up.asks >= MAX_ASKS)
     };
-    let clock_ok = !(s["phase"] == 1 && s["window"] == 0)
-        || m.action_enabled("Elapse", s) == window_runs(m, s);
+    let clock_ok = up
+        .runs
+        .is_none_or(|runs| m.action_enabled("Elapse", s) == runs);
     upgrade_ok && supervisor_ok && ask_ok && pick_ok && renew_ok && asks_ok && clock_ok
 }
 
@@ -802,6 +1004,7 @@ fn defective() -> Vec<(&'static str, Model)> {
         ("Buggy4", aterm_spec::interp::with_buggy(&model, 4)),
         ("Buggy5", aterm_spec::interp::with_buggy(&model, 5)),
         ("Buggy6", aterm_spec::interp::with_buggy(&model, 6)),
+        ("Buggy7", aterm_spec::interp::with_buggy(&model, 7)),
     ]
     .into_iter()
     .chain(
@@ -821,6 +1024,11 @@ fn defective() -> Vec<(&'static str, Model)> {
             "ReloginOverLeft",
             "PickAnyPicker",
             "NoLatch",
+            "NoCarrierBack",
+            "SignInOverBack",
+            "PickAfterBack",
+            "NoFollowAfterLogin",
+            "SignInOverRenewed",
         ]
         .into_iter()
         .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
@@ -833,8 +1041,10 @@ fn the_real_code_conforms_to_the_login_wall_model() {
     let model = harness_login_wall_model();
     let states = reachable(&model);
     assert!(states.len() > 100, "{} states", states.len());
-    let defective = defective();
-    let mut disagree: BTreeMap<&str, usize> = defective.iter().map(|(n, _)| (*n, 0)).collect();
+    // Each defect is caught by one state where it disagrees: a defective model
+    // is judged until then (each judged at every state was 11.3 s of the walk's
+    // 17.7 s at a load of 20-40).
+    let mut uncaught = defective();
     let mut taken = BTreeSet::new();
     let renew_clean = real_renewal_is_clean();
     let picked = [picks(false), picks(true)];
@@ -843,12 +1053,15 @@ fn the_real_code_conforms_to_the_login_wall_model() {
         renew_clean,
         "the real renewal checks its staging home alone"
     );
+    let mut looks = Looks::default();
     for s in &states {
+        let env = model.eval_env(s);
         for inv in &model.invariants {
-            assert!(model.check_invariant(inv.name, s), "{} at {s:?}", inv.name);
+            assert!(model.check_invariant_in(inv, &env), "{} at {s:?}", inv.name);
         }
-        let up = upgrade_at(&model, s);
-        // The real facts are the state's.
+        let (up, sv) = looks.at(&model, s);
+        // The real facts are the state's (the wall's row read above the
+        // dialog of aterm's `/login` too).
         assert_eq!(up.screen_wall, s["wall"] == 1, "the screen's wall at {s:?}");
         assert_eq!(up.stands, s["stood"] == 1, "the transcript's wall at {s:?}");
         assert_eq!(
@@ -863,38 +1076,27 @@ fn the_real_code_conforms_to_the_login_wall_model() {
                 "the notice's fate at {s:?}"
             );
         }
-        let (decided, exception, carry) = supervisor_at(s);
-        let ask = tells_now(exception.as_ref());
-        // At a wall nothing typed at, nobody told and no wait with an end: a
-        // rest.
-        let waits = matches!(decided, TurnEndAction::WaitUntil { .. });
-        let sup =
-            supervisor_action(&decided)
-                .or((s["wall"] == 1 && s["track"] == 0 && !ask && !waits).then_some("Rest"));
         assert!(
-            agrees(&model, s, &up, (sup, ask, carry), renew_clean, picked),
+            agrees(&model, s, (up, sv), renew_clean, picked),
             "at {s:?}: the real upgrade took {:?} (asks {}, about {:?}), the supervisor \
-             {decided:?} ({sup:?}), its exception {exception:?}",
+             {:?} ({:?}), its exception {:?}",
             up.step,
             up.asks,
-            up.asked_about
+            up.asked_about,
+            sv.decided,
+            sv.sup,
+            sv.exception
         );
         taken.extend(upgrade_action(&up.step));
-        taken.extend(sup);
-        if ask {
-            taken.insert("TellNow");
-        }
-        if s["picker"] != 0 && carry && picked[usize::from(s["known"] == 1)] {
+        taken.extend(sv.sup);
+        taken.extend(sv.ask);
+        if s["picker"] != 0 && sv.carry && picked[usize::from(s["known"] == 1)] {
             taken.insert("PickMethod");
         }
         if model.action_enabled("Renew", s) {
             taken.insert("Renew");
         }
-        for (name, m) in &defective {
-            if !agrees(m, s, &up, (sup, ask, carry), renew_clean, picked) {
-                *disagree.get_mut(name).expect("a knob") += 1;
-            }
-        }
+        uncaught.retain(|(_, m)| agrees(m, s, (up, sv), renew_clean, picked));
     }
     assert_eq!(
         taken,
@@ -907,15 +1109,15 @@ fn the_real_code_conforms_to_the_login_wall_model() {
             "Relaunch",
             "Follow",
             "TellNow",
+            "TellClose",
             "PickMethod",
             "Renew",
         ]),
         "every decision of the real code is taken somewhere"
     );
-    for (name, n) in &disagree {
-        assert!(
-            *n > 0,
-            "the real code has the `{name}` defect: {disagree:?}"
-        );
-    }
+    let uncaught: Vec<&str> = uncaught.iter().map(|(name, _)| *name).collect();
+    assert!(
+        uncaught.is_empty(),
+        "the real code has these defects: {uncaught:?}"
+    );
 }

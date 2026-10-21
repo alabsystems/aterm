@@ -133,6 +133,44 @@ fn away(c: Rgb, dl: f32, dark: bool) -> Rgb {
     from_lab(x)
 }
 
+/// `away(ground, dl)` with `dl` grown from its first value until the result
+/// stands at least `floor` : 1 from the ground (the floors of design §12.1
+/// are solved, not assumed: the rules stay, the values move).
+fn away_floored(ground: Rgb, dl: f32, floor: f32, dark: bool) -> Rgb {
+    let mut d = dl;
+    let mut c = away(ground, d, dark);
+    while contrast(c, ground) < floor && d < 1.0 {
+        d += 0.005;
+        c = away(ground, d, dark);
+    }
+    c
+}
+
+/// `fg` mixed `t` of the way toward `ground`, with `t` eased back toward the
+/// foreground until the mix reads at least `floor` : 1 on the ground; a
+/// theme whose own foreground falls short (Solarized Light's is 4.1:1 on its
+/// background) is then moved further from the ground in lightness.
+fn words_floored(fg: Rgb, ground: Rgb, t: f32, floor: f32) -> Rgb {
+    let mut k = t;
+    let mut c = mix(fg, ground, k);
+    while contrast(c, ground) < floor && k > 0.0 {
+        k = (k - 0.01).max(0.0);
+        c = mix(fg, ground, k);
+    }
+    let dark = is_dark(ground);
+    let mut d = 0.0;
+    while contrast(c, ground) < floor && d < 1.0 {
+        d += 0.01;
+        c = away(fg, d, dark);
+    }
+    c
+}
+
+/// The WCAG AA floor every word on a stats surface meets (F5).
+pub const WORD_AA: f32 = 4.5;
+/// The rim floor (F1): a tile's or capsule's edge against its ground.
+pub const RIM_FLOOR: f32 = 1.5;
+
 /// The load ramp's five stops (0, 25, 50, 75, 100 %) for a ground's polarity:
 /// the sRGB design §12.1 measured for its OkLCh stops (`oklch(0.340 0.050
 /// 258)` … `oklch(0.910 0.170 98)` dark, `oklch(0.860 0.035 245)` …
@@ -180,8 +218,11 @@ pub struct VitalsInks {
     pub load: [Rgb; 5],
     /// An idle capacity: a bar's or tile's empty part.
     pub track: Rgb,
-    /// A tile's or capsule's rim.
+    /// A tile's or capsule's rim, at least [`RIM_FLOOR`] from the ground.
     pub rim: Rgb,
+    /// A hairline groove between two bars (a step darker than the ground on
+    /// either polarity, like an engraved line).
+    pub groove: Rgb,
     /// The 1 px tide line at a fill's top or a bar's end.
     pub tide: Rgb,
     /// The glow and the rising sliver's pull.
@@ -199,9 +240,15 @@ pub struct VitalsInks {
     pub mem: [Rgb; 4],
     /// Stuck work (frost).
     pub stuck: Rgb,
+    /// Quiet work: frost eased toward the ground, still 3:1 (O35, F7).
+    pub quiet: Rgb,
+    /// A state that wants a look: memory pressure at warn, swap in use.
+    pub warn: Rgb,
+    /// A state that wants action: memory pressure critical.
+    pub critical: Rgb,
     /// Primary words.
     pub words: Rgb,
-    /// Secondary words (labels, units).
+    /// Secondary words (labels, units), still [`WORD_AA`] on the ground.
     pub words2: Rgb,
 }
 
@@ -243,12 +290,31 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         x.b *= 0.5;
         from_lab(x)
     };
+    let stuck = if dark {
+        oklch(0.90, 0.06, 225.0)
+    } else {
+        oklch(0.42, 0.07, 235.0)
+    };
+    let quiet = {
+        let mut k = 0.4;
+        let mut c = mix(stuck, ground, k);
+        while contrast(c, ground) < 3.0 && k > 0.0 {
+            k = (k - 0.02).max(0.0);
+            c = mix(stuck, ground, k);
+        }
+        c
+    };
     VitalsInks {
         dark,
         ground,
         load: ramp_stops(dark),
         track,
-        rim: away(ground, 0.12, dark),
+        rim: away_floored(ground, 0.12, RIM_FLOOR, dark),
+        groove: {
+            let mut x = g;
+            x.l = (g.l - if dark { 0.025 } else { 0.035 }).clamp(0.0, 1.0);
+            from_lab(x)
+        },
         tide: if dark {
             oklch(0.96, 0.01, 250.0)
         } else {
@@ -264,13 +330,20 @@ pub fn vitals_inks(ground: Rgb, fg: Rgb, accent: Rgb) -> VitalsInks {
         aterm,
         tab,
         mem: [neutral(0.42), neutral(0.30), neutral(0.17), track],
-        stuck: if dark {
-            oklch(0.90, 0.06, 225.0)
+        stuck,
+        quiet,
+        warn: if dark {
+            [0xE9, 0xC4, 0x6A]
         } else {
-            oklch(0.42, 0.07, 235.0)
+            [0x8A, 0x61, 0x00]
         },
-        words: mix(fg, ground, 0.05),
-        words2: mix(fg, ground, 0.38),
+        critical: if dark {
+            [0xFF, 0x6E, 0x6E]
+        } else {
+            [0xC4, 0x26, 0x2E]
+        },
+        words: words_floored(fg, ground, 0.05, WORD_AA),
+        words2: words_floored(fg, ground, 0.38, WORD_AA),
     }
 }
 
@@ -392,6 +465,63 @@ mod tests {
             assert!(contrast(inks.words, ground) >= 4.5);
             // F7 (first cut): frost reaches 3:1 on the ground.
             assert!(contrast(inks.stuck, ground) >= 3.0, "{inks:?}");
+            assert!(contrast(inks.quiet, ground) >= 3.0, "{inks:?}");
+        }
+    }
+
+    /// Every word on a stats surface meets AA and every rim F1, on the
+    /// grounds the Deck, the sill and the lens paint on: the band grounds of
+    /// Default and Default Light, the terminal backgrounds the sill sits on,
+    /// and the extremes, pure black and pure white. Default Light's secondary
+    /// words were 4.08:1 and its rim 1.48:1 before these were solved.
+    #[test]
+    fn words_meet_aa_and_rims_meet_f1_on_every_ground() {
+        let cases = [
+            (DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT),
+            (LIGHT_BAND, LIGHT_FG, LIGHT_ACCENT),
+            ([0x11, 0x13, 0x18], [0xD0, 0xD0, 0xD0], DEFAULT_ACCENT),
+            ([0xF6, 0xF7, 0xF9], LIGHT_FG, LIGHT_ACCENT),
+            ([0, 0, 0], [0xC0, 0xC0, 0xC0], DEFAULT_ACCENT),
+            ([255, 255, 255], [0x60, 0x60, 0x60], LIGHT_ACCENT),
+            ([0x00, 0x2B, 0x36], [0x83, 0x94, 0x96], [0x93, 0xA1, 0xA1]),
+            ([0xFD, 0xF6, 0xE3], [0x65, 0x7B, 0x83], [0x58, 0x6E, 0x75]),
+        ];
+        for (ground, fg, acc) in cases {
+            let inks = vitals_inks(ground, fg, acc);
+            assert!(
+                contrast(inks.words, ground) >= WORD_AA,
+                "{ground:?} {inks:?}"
+            );
+            assert!(
+                contrast(inks.words2, ground) >= WORD_AA,
+                "{ground:?} {inks:?}"
+            );
+            assert!(
+                contrast(inks.rim, ground) >= RIM_FLOOR,
+                "{ground:?} {inks:?}"
+            );
+            // The secondary words stay quieter than the primary ones.
+            assert!(
+                contrast(inks.words2, ground) <= contrast(inks.words, ground) + 1e-3,
+                "{ground:?} {inks:?}"
+            );
+        }
+    }
+
+    /// The warn and critical inks read at 3:1 on both band grounds (they mark
+    /// a state, beside words that carry it too).
+    #[test]
+    fn the_state_inks_read_on_both_grounds() {
+        for (ground, fg, acc) in [
+            (DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT),
+            (LIGHT_BAND, LIGHT_FG, LIGHT_ACCENT),
+        ] {
+            let inks = vitals_inks(ground, fg, acc);
+            assert!(contrast(inks.warn, ground) >= 3.0, "{inks:?}");
+            assert!(contrast(inks.critical, ground) >= 3.0, "{inks:?}");
+            // The groove is a step from the ground, quieter than the track.
+            let d = |c: Rgb| (to_lab(c).l - to_lab(ground).l).abs();
+            assert!(d(inks.groove) > 0.01 && d(inks.groove) < 0.06, "{inks:?}");
         }
     }
 

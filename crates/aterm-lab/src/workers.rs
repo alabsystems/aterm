@@ -26,17 +26,22 @@
 //! Each WORKER is the real Claude Code that the server's `spawn agent=claude`
 //! typed into a new tab — the lab starts none — on the manager's Claude home
 //! (`CLAUDE_CONFIG_DIR` rides its line), whose settings point it at the stub.
-//! Its script runs one Bash (a file in the project) and ends with its report
-//! and a line `ATERM-TASK-DONE`. Everything runs in the lab's jail. A worker's
+//! Its script runs one Bash (a file in the project) and ends its turn with its
+//! report. A worker is under Autopilot Land (a spawn's default), so its
+//! harness then types the LAND instruction, and the script answers it with a
+//! clean defense, a few lines starting `Nothing left:` (the project is no
+//! repository, so its probe finds nothing unlanded): Land's landing, which
+//! alone ends a worker's task. No token anywhere. Everything runs in the lab's jail. A worker's
 //! shell is the login shell the server spawned, which rebuilds its PATH and
 //! lists the shim LAST: an `aterm` a worker typed would be the first one on
 //! that PATH, not necessarily the aterm under test. The workers here type none.
 //!
 //! The checks, each printed `ok`/`FAIL` (exit 1 when one fails):
 //!
-//! * each worker's `task` is `state=done why=marker` with `result_bytes>0`;
-//! * each `result` prints its stubbed report BYTE FOR BYTE (the marker line
-//!   dropped), and its header's `bytes=` is the report's length;
+//! * each worker's `task` is `state=done why=landed` with `result_bytes>0`;
+//! * each `result` prints its stubbed report, a blank line and its defense
+//!   BYTE FOR BYTE (the landing's result: the report before the land act,
+//!   then what the defense adds), and its header's `bytes=` is their length;
 //! * each worker's record moved from rev 1 to the rev it reads now through
 //!   `working` and `done` alone, every rev recorded on the session's own
 //!   `timeline` (rev 1 is the spawn's, before any watch could subscribe to the
@@ -95,9 +100,6 @@ use crate::run::{Run, is_run};
 use crate::util::{atomic_write, now, stamp};
 use crate::{Fail, Res, stop};
 
-/// The marker a worker ends its report with (what the harness reads as done).
-const MARKER: &str = "ATERM-TASK-DONE";
-
 /// One worker of the proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Worker {
@@ -107,8 +109,21 @@ pub struct Worker {
     pub task: String,
     /// The file its Bash writes in the project dir.
     pub file: String,
-    /// Its report: the final message before the marker.
+    /// Its report: the final message of its first turn.
     pub report: String,
+    /// Its answer to the LAND instruction: a clean defense (`Nothing left:`),
+    /// Land's landing.
+    pub defense: String,
+}
+
+impl Worker {
+    /// What its `result` prints after the landing: the report before the
+    /// land act, a blank line, then the defense (`harness::result`'s check
+    /// rule), and a newline.
+    #[must_use]
+    pub fn result(&self) -> String {
+        format!("{}\n\n{}\n", self.report, self.defense)
+    }
 }
 
 /// What the manager is asked and every conversation's script.
@@ -141,6 +156,7 @@ impl Plan {
                 ),
                 file: "w1.out".into(),
                 report: "Worker one: wrote w1.out with one Bash call (its token, one line).".into(),
+                defense: "Nothing left: w1.out holds its token, checked with wc; this folder is no repository.".into(),
             },
             Worker {
                 token: tok(2),
@@ -150,6 +166,7 @@ impl Plan {
                 ),
                 file: "w2.out".into(),
                 report: "Worker two: the quotes, `backticks`, $(…), ${…} and \\backslashes came through; wrote w2.out.".into(),
+                defense: "Nothing left: w2.out is written and the task's bytes arrived whole; this folder is no repository.".into(),
             },
             Worker {
                 token: tok(3),
@@ -159,6 +176,7 @@ impl Plan {
                 ),
                 file: "w3.out".into(),
                 report: "Worker three: read all four lines.\n\n- the indented one\n  - and the blank ones\n- wrote w3.out".into(),
+                defense: "Nothing left:\n- w3.out is written\n- this folder is no repository".into(),
             },
         ];
         Plan {
@@ -240,7 +258,8 @@ impl Plan {
                 format!("Write {}", w.file),
                 false,
             ));
-            steps.push(say(&w.token, &format!("{}\n{MARKER}", w.report)));
+            steps.push(say(&w.token, &w.report));
+            steps.push(say(&w.token, &w.defense));
         }
         J::Arr(steps)
     }
@@ -1008,9 +1027,9 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         c.check(
-            kv(&task, "state") == Some("done") && kv(&task, "why") == Some("marker") && rb > 0,
+            kv(&task, "state") == Some("done") && kv(&task, "why") == Some("landed") && rb > 0,
             &format!(
-                "{label}: task state=done why=marker result_bytes>0 ({})",
+                "{label}: task state=done why=landed result_bytes>0 ({})",
                 task.trim().chars().take(140).collect::<String>()
             ),
         );
@@ -1054,12 +1073,12 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         // the result, byte for byte
         let res = door.ctl(&[at.as_str(), "result"])?;
         let header = res.stderr.lines().find(|l| l.contains("OK ")).unwrap_or("");
-        let want = format!("{}\n", w.report);
+        let want = w.result();
+        let bytes = want.len() - 1;
         c.check(
             res.code == 0 && res.stdout == want,
             &format!(
-                "{label}: result is its stubbed report byte for byte ({} bytes){}",
-                w.report.len(),
+                "{label}: result is its stubbed report and defense byte for byte ({bytes} bytes){}",
                 if res.stdout == want {
                     String::new()
                 } else {
@@ -1068,11 +1087,8 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             ),
         );
         c.check(
-            kv(header, "bytes") == Some(w.report.len().to_string().as_str()),
-            &format!(
-                "{label}: result header says bytes={} ({header})",
-                w.report.len()
-            ),
+            kv(header, "bytes") == Some(bytes.to_string().as_str()),
+            &format!("{label}: result header says bytes={bytes} ({header})"),
         );
         // the first user row: the task as sent, a blank line, one line of fact naming the manager
         let wt = transcript_of(&all, &w.token).unwrap_or_default();
@@ -1110,7 +1126,7 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         let reply_ms = wt
             .iter()
             .rev()
-            .find(|r| r.kind == "assistant" && r.text.contains(MARKER))
+            .find(|r| r.kind == "assistant" && r.text.contains(&w.defense))
             .and_then(|r| r.ts);
         let done_ms = moves
             .iter()
@@ -1480,6 +1496,7 @@ mod tests {
     #[test]
     fn the_script_keys_each_conversation_and_the_stub_plays_it() {
         use crate::stub::{ToolTurn, tool_turn};
+        use aterm_agent::supervise::policy::turn_end::clean_defense;
         let plan = Plan::new("0badc0de");
         let script = plan.script();
         let req =
@@ -1558,7 +1575,8 @@ mod tests {
             tool_turn(req(&m).as_bytes(), &script),
             Some(ToolTurn::Say(plan.summary.clone(), 8))
         );
-        // a worker's conversation is its own: one Bash, then its report and the marker
+        // a worker's conversation is its own: one Bash, its report, then its
+        // defense at the LAND instruction
         let w = &plan.workers[1];
         let task_row = user(&format!("{}\n\n(Started by `s-m` …)", w.task));
         assert!(matches!(
@@ -1567,11 +1585,28 @@ mod tests {
         ));
         assert_eq!(
             tool_turn(
-                req(&[task_row, used, result("2 w2.out")]).as_bytes(),
+                req(&[task_row.clone(), used.clone(), result("2 w2.out")]).as_bytes(),
                 &script
             ),
-            Some(ToolTurn::Say(format!("{}\n{MARKER}", w.report), 1))
+            Some(ToolTurn::Say(w.report.clone(), 1))
         );
+        let land = user("[aterm harness] Autopilot is Land: land ALL of this work …");
+        assert_eq!(
+            tool_turn(
+                req(&[task_row, used, result("2 w2.out"), said(&w.report), land]).as_bytes(),
+                &script
+            ),
+            Some(ToolTurn::Say(w.defense.clone(), 2))
+        );
+        // Each defense lands the work under Land's own reading, and no
+        // report or result names the retired token. NEGATIVE CONTROL: a
+        // report alone is no landing.
+        for w in &plan.workers {
+            assert!(clean_defense(Some(&w.defense)), "{}", w.defense);
+            assert!(!clean_defense(Some(&w.report)), "{}", w.report);
+            assert!(!w.result().contains("ATERM-TASK-DONE"));
+            assert_eq!(w.result(), format!("{}\n\n{}\n", w.report, w.defense));
+        }
         // no token is another's: a worker's task names no other conversation's key
         for w in &plan.workers {
             assert!(!w.task.contains(&plan.mgr));
@@ -1626,7 +1661,7 @@ mod tests {
             "sub 1 s-w",
             "EVENT * session-created s-w",
             "EVENT 1 task rev=1 state=working attention=0",
-            "EVENT 1 task rev=2 state=done attention=0 why=marker",
+            "EVENT 1 task rev=2 state=done attention=0 why=landed",
             "EVENT 7 task rev=1 state=stalled attention=1 why=shell",
             "GAP 1 events-dropped=2",
         ]
@@ -1642,10 +1677,10 @@ mod tests {
             (
                 "s-w".into(),
                 5.0,
-                "rev=2 state=done attention=0 why=marker".into()
+                "rev=2 state=done attention=0 why=landed".into()
             )
         );
-        assert_eq!(kv(&p.tasks[1].2, "why"), Some("marker"));
+        assert_eq!(kv(&p.tasks[1].2, "why"), Some("landed"));
         // a move of a session no ack named is kept, and named by its local id
         assert_eq!(p.tasks[2].0, "local:7");
         assert_eq!(p.gaps.len(), 1);
@@ -1780,7 +1815,7 @@ mod tests {
             event 1 t=5 kind=spawned pid=7\n\
             event 2 t=6 kind=task-change rev=1 state=working attention=0\n\
             event 3 t=9 kind=agent-change agent=busy\n\
-            event 4 t=12 kind=task-change rev=2 state=done attention=0 why=marker\n";
+            event 4 t=12 kind=task-change rev=2 state=done attention=0 why=landed\n";
         let moves = task_moves(timeline);
         assert_eq!(
             moves,

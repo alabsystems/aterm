@@ -74,7 +74,9 @@ pub(crate) fn install_signal_handlers_as(arming: Arming) {
 /// a matter of course (measured 2026-09-24 on the owner's Mac: 13 non-bundle GUI
 /// starts in one day's `aterm.log`, `does not run from a .app bundle`); reporting
 /// those would bury the one true report under false ones. So the name says which
-/// it is, and only [`MarkerOwner::App`] is ever reported. Unix only: the Windows
+/// it is, and only [`MarkerOwner::App`] is ever reported — but for the lab's own
+/// desk ([`MarkerOwner::Lab`]), whose marker is news to its own scratch root's
+/// scan alone ([`MarkerOwner::is_news_to`]). Unix only: the Windows
 /// lane keeps its `crash-signal-*` markers — held against deletion by the
 /// owner's open handle rather than an owner-named lock — and reports crashes
 /// alone.
@@ -91,6 +93,15 @@ pub(crate) enum MarkerOwner {
     /// bundle, a DMG or translocated launch, a `--headless` start, and a handoff
     /// candidate its parent may still reject (and reap with SIGKILL).
     Other,
+    /// A LAB DESK's (session log Phase 6, step 6C-4, ruling U9): a headless
+    /// instance under the lab's desk seam in a development build, under a
+    /// private state root ([`crate::desk::Desk::LabHeadless`]), whose log
+    /// directory is that root's. Its dead, empty marker is news to the next
+    /// lab desk's scan of the same root, so the lab's recovery census reads a
+    /// SIGKILLed run as killed and its node log's `prev_end=` is real; to every
+    /// other scan it is an `other` marker. The daily driver's directory never
+    /// holds one: the seam counts only under a private state root.
+    Lab,
 }
 
 impl MarkerOwner {
@@ -100,6 +111,21 @@ impl MarkerOwner {
         match self {
             Self::App => "app",
             Self::Other => "other",
+            Self::Lab => "lab",
+        }
+    }
+
+    /// Whether this owner's dead, empty marker is NEWS to a sweep run by a
+    /// launch whose own marker is `scan`'s ([`markers::sweep`]): an `app` one
+    /// to every sweep (the windowed launch reports it), a `lab` one to a lab
+    /// desk's sweep alone, and an `other` one to none. What is news is left in
+    /// place for its reader; anything else dead is removed.
+    #[cfg(unix)]
+    pub(crate) const fn is_news_to(self, scan: MarkerOwner) -> bool {
+        match self {
+            Self::App => true,
+            Self::Lab => matches!(scan, Self::Lab),
+            Self::Other => false,
         }
     }
 }
@@ -118,6 +144,10 @@ pub(crate) enum Arming {
     /// the same process after its Commit IS the daily driver, and after a
     /// machine's first update every daily driver is one.
     AppAfterCommit,
+    /// As [`MarkerOwner::Lab`], for good: a lab desk
+    /// ([`crate::desk::Desk::LabHeadless`]), whose launch also runs the
+    /// recovery census on its own private root (`recovery_census::cold_census`).
+    Lab,
 }
 
 impl Arming {
@@ -125,14 +155,20 @@ impl Arming {
     /// classification of the running copy (`which_copy::Running::InstalledApp` —
     /// an owned `.app`, not dev-marked, not on a disk image, not translocated),
     /// `headless` whether the launch arms headless mode, `handoff_candidate`
-    /// whether it arrived through a validated update handoff.
+    /// whether it arrived through a validated update handoff, and `lab_desk`
+    /// whether its desk is the lab's (`desk::Desk::of(headless) ==
+    /// Desk::LabHeadless`: the seam, read only by a development build, under a
+    /// private state root), which arms as [`Arming::Lab`] whatever else holds.
     #[must_use]
     pub(crate) const fn for_launch(
         installed_bundle: bool,
         headless: bool,
         handoff_candidate: bool,
+        lab_desk: bool,
     ) -> Self {
-        if !installed_bundle || headless {
+        if lab_desk {
+            Self::Lab
+        } else if !installed_bundle || headless {
             Self::Other
         } else if handoff_candidate {
             Self::AppAfterCommit
@@ -147,6 +183,7 @@ impl Arming {
         match self {
             Self::App => MarkerOwner::App,
             Self::Other | Self::AppAfterCommit => MarkerOwner::Other,
+            Self::Lab => MarkerOwner::Lab,
         }
     }
 }
@@ -348,7 +385,9 @@ fn sweep_stale_markers(dir: &std::path::Path) {
 ///   however it dies.
 /// * a sweep removes an empty marker only when it can take that lock (owner
 ///   gone), and leaves a dead [`super::MarkerOwner::App`] one for the windowed
-///   launch that reports it (`logging::take_kill_evidence`). A dead marker named
+///   launch that reports it (`logging::take_kill_evidence`), as a lab desk's
+///   sweep leaves a dead [`super::MarkerOwner::Lab`] one for its own census
+///   (`logging::take_lab_kill_evidence`; [`super::MarkerOwner::is_news_to`]). A dead marker named
 ///   with THIS process's pid was this process's previous image — the updater's
 ///   boot re-exec keeps the pid and closes the close-on-exec fd, releasing the
 ///   lock — so it is removed, never reported.
@@ -399,6 +438,7 @@ pub(crate) mod markers {
         let owner = match parts.next()? {
             "app" => MarkerOwner::App,
             "other" => MarkerOwner::Other,
+            "lab" => MarkerOwner::Lab,
             _ => return None,
         };
         Some(MarkerName { pid, nanos, owner })
@@ -488,8 +528,10 @@ pub(crate) mod markers {
     }
 
     /// Remove the markers in `dir` whose owners are gone and whose emptiness is
-    /// not news (the rules on this module). `own_pid` is the sweeping process's
-    /// pid. Called AT INSTALL TIME, before this process's own marker exists.
+    /// not news to `scan` (the rules on this module;
+    /// [`MarkerOwner::is_news_to`]). `own_pid` is the sweeping process's pid,
+    /// `scan` the owner its own marker is created under. Called AT INSTALL
+    /// TIME, before this process's own marker exists.
     ///
     /// Answers the dead, empty markers of OTHER processes it removed: each is a
     /// run that ended with no signal and no exit path, which is no row for a
@@ -497,7 +539,7 @@ pub(crate) mod markers {
     /// reopen that run's layout (`crate::crash_journal::classify_death`). The
     /// install keeps the answer ([`swept_at_install`]); this process's own
     /// previous image is not in it — a boot re-exec is not a death.
-    pub(crate) fn sweep(dir: &Path, own_pid: u32) -> Vec<MarkerName> {
+    pub(crate) fn sweep(dir: &Path, own_pid: u32, scan: MarkerOwner) -> Vec<MarkerName> {
         let mut swept = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
             return swept;
@@ -518,7 +560,7 @@ pub(crate) mod markers {
                     let _ = std::fs::remove_file(&path);
                 }
             } else if let Some(marker) = parse(name) {
-                let news = marker.owner == MarkerOwner::App && marker.pid != own_pid;
+                let news = marker.owner.is_news_to(scan) && marker.pid != own_pid;
                 if !news
                     && probe(&path) == Owner::Dead
                     && std::fs::remove_file(&path).is_ok()
@@ -552,8 +594,19 @@ pub(crate) mod markers {
     /// The dead, empty [`MarkerOwner::App`] markers in `dir` another process
     /// left: evidence that the daily driver ended without a signal and without
     /// a clean exit. `own_pid` excludes this process's own previous image.
+    /// The windowed launch's scan reads them through
+    /// `logging::consume_dead_markers`; the tests read them here.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn dead_app_markers(dir: &Path, own_pid: u32) -> Vec<PathBuf> {
+        dead_markers_of(dir, own_pid, MarkerOwner::App)
+    }
+
+    /// The dead, empty markers of `owner` in `dir` another process left
+    /// ([`dead_app_markers`]'s rule, for any owner: a lab desk reads its own,
+    /// [`MarkerOwner::Lab`]).
+    #[must_use]
+    pub(crate) fn dead_markers_of(dir: &Path, own_pid: u32, owner: MarkerOwner) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
@@ -563,7 +616,7 @@ pub(crate) mod markers {
                 let name = entry.file_name();
                 name.to_str()
                     .and_then(parse)
-                    .is_some_and(|marker| marker.owner == MarkerOwner::App && marker.pid != own_pid)
+                    .is_some_and(|marker| marker.owner == owner && marker.pid != own_pid)
                     && empty_regular_file(entry)
                     && probe(&entry.path()) == Owner::Dead
             })
@@ -949,7 +1002,7 @@ mod imp {
             return -1;
         };
         let pid = std::process::id();
-        super::markers::keep_swept(super::markers::sweep(&dir, pid));
+        super::markers::keep_swept(super::markers::sweep(&dir, pid, owner));
         // The fd is leaked on purpose: the marker must stay open for the whole
         // process so the handler can write to it (and its lock must stay held).
         // The OS reclaims it at exit.
@@ -1139,6 +1192,9 @@ mod marker_tests {
         );
         let other = markers::file_name(1, 2, MarkerOwner::Other);
         assert_eq!(markers::parse(&other).unwrap().owner, MarkerOwner::Other);
+        let lab = markers::file_name(1, 2, MarkerOwner::Lab);
+        assert_eq!(lab, "crash-marker-1-2-lab.log");
+        assert_eq!(markers::parse(&lab).unwrap().owner, MarkerOwner::Lab);
         for stranger in [
             "crash-signal-4242-7.log",
             "crash-marker-4242-7-app.log.seen",
@@ -1174,7 +1230,7 @@ mod marker_tests {
         assert_eq!(markers::probe(&live), Owner::Live);
         assert_eq!(markers::probe(&dead), Owner::Dead);
 
-        markers::sweep(dir.path(), own.wrapping_add(1));
+        markers::sweep(dir.path(), own.wrapping_add(1), MarkerOwner::Other);
         assert!(
             live.exists(),
             "a live owner's marker must survive the sweep"
@@ -1264,7 +1320,7 @@ mod marker_tests {
             markers::dead_app_markers(dir.path(), own),
             vec![killed.clone()]
         );
-        markers::sweep(dir.path(), own);
+        markers::sweep(dir.path(), own, MarkerOwner::Other);
         assert!(killed.exists(), "left for the report");
         assert!(!test_start.exists(), "a test start's corpse is not news");
         assert!(
@@ -1274,10 +1330,49 @@ mod marker_tests {
         assert!(live_app.exists());
         // A non-empty marker is a crash record: never swept, never "killed".
         std::fs::write(&killed, b"aterm: fatal signal 11").unwrap();
-        markers::sweep(dir.path(), own);
+        markers::sweep(dir.path(), own, MarkerOwner::Other);
         assert!(killed.exists());
         assert!(markers::dead_app_markers(dir.path(), own).is_empty());
         let_go(fd);
+    }
+
+    /// A LAB DESK'S MARKER IS NEWS TO A LAB DESK'S SWEEP ALONE (session log
+    /// Phase 6, step 6C-4, ruling U9): under a lab desk's sweep a dead `lab`
+    /// marker of another process is left for that desk's census (and its own
+    /// kill scan finds it), while a dead `other` one beside it goes and this
+    /// process's own previous image's `lab` one goes too; under the installed
+    /// app's sweep, or any other start's, the same `lab` marker is not news and
+    /// goes, and no windowed launch's kill scan ever reports one. NEGATIVE
+    /// CONTROL (scratch revert): a `lab` marker read as an `other` one is
+    /// swept under the lab desk's sweep too.
+    #[test]
+    fn a_lab_marker_is_news_to_a_lab_desks_sweep_alone() {
+        for scan in [MarkerOwner::Lab, MarkerOwner::App, MarkerOwner::Other] {
+            let dir = scratch("marker-lab");
+            let own = std::process::id();
+            let gone = reaped_pid();
+            let lab = dead_marker(dir.path(), gone, MarkerOwner::Lab);
+            let test_start = dead_marker(dir.path(), gone.wrapping_add(1), MarkerOwner::Other);
+            let previous_image = dead_marker(dir.path(), own, MarkerOwner::Lab);
+            assert!(markers::dead_app_markers(dir.path(), own).is_empty());
+            markers::sweep(dir.path(), own, scan);
+            let news = scan == MarkerOwner::Lab;
+            assert_eq!(
+                lab.exists(),
+                news,
+                "a dead lab marker under a {scan:?} sweep"
+            );
+            assert!(!test_start.exists(), "a test start's corpse is never news");
+            assert!(
+                !previous_image.exists(),
+                "this process's own previous image"
+            );
+            assert_eq!(
+                markers::dead_markers_of(dir.path(), own, MarkerOwner::Lab),
+                if news { vec![lab.clone()] } else { Vec::new() }
+            );
+            assert!(markers::dead_app_markers(dir.path(), own).is_empty());
+        }
     }
 
     /// The sweep ANSWERS the corpses it removed: a dead `other` start's empty
@@ -1306,7 +1401,7 @@ mod marker_tests {
         )
         .unwrap();
 
-        let swept = markers::sweep(dir.path(), own);
+        let swept = markers::sweep(dir.path(), own, MarkerOwner::Other);
         assert_eq!(
             swept,
             vec![markers::MarkerName {
@@ -1345,7 +1440,7 @@ mod marker_tests {
         let stale_pending = dir.path().join(format!(".{name}.pending"));
         std::fs::write(&stale_pending, b"").unwrap();
 
-        markers::sweep(dir.path(), own.wrapping_add(1));
+        markers::sweep(dir.path(), own.wrapping_add(1), MarkerOwner::Other);
         assert!(
             alive.exists(),
             "an older build still running keeps its marker"

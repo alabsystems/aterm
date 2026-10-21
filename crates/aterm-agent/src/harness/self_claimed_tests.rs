@@ -483,10 +483,15 @@ fn record_reads_are_bounded_regular_files_and_only_absence_is_never_seen() {
 fn the_record_is_read_only_while_its_process_runs() {
     let dir = aterm_tempfile::TempDir::new().expect("dir");
     let home = std::fs::canonicalize(dir.path()).expect("canonical");
-    // A platform binary's environment is hidden from `KERN_PROCARGS2`: a
-    // copy, signed ad hoc, shows its own.
-    let sleep = home.join("sleep");
-    aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/sleep"), &sleep);
+    // A platform binary's environment is hidden from `KERN_PROCARGS2`: the
+    // kept stand-in, signed ad hoc, shows its own. It is run in place, never
+    // copied here: this directory goes when the test ends, and a Mach-O
+    // removed while macOS still assesses its first exec crashes syspolicyd
+    // (`aterm_uds::deadline::stand_in`).
+    let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )))
+    .expect("the kept stand-in");
     let sleep_s = sleep.to_string_lossy().into_owned();
     let mut child = aterm_uds::spawnfd::command(&sleep)
         .arg("60")
@@ -579,7 +584,7 @@ fn the_idle_point_is_the_records_own_rest() {
 }
 
 /// THE IDLE POINT IS READ LIVE, of a real process, from a PLANTED record
-/// ([`read_idle`]): a stand-in process (a signed copy of `sleep`, its
+/// ([`read_idle`]): a stand-in process (the kept signed `sleep`, its
 /// `CODEX_HOME` the test's directory) whose record says `idle` with an empty
 /// draft is at its idle point; the same process is not once its record says
 /// anything else. NEGATIVE CONTROLS: busy, a draft, no draft named, the
@@ -590,10 +595,15 @@ fn the_idle_point_is_the_records_own_rest() {
 fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
     let dir = aterm_tempfile::TempDir::new().expect("dir");
     let home = std::fs::canonicalize(dir.path()).expect("canonical");
-    // A platform binary's environment is hidden from `KERN_PROCARGS2`: a
-    // copy, signed ad hoc, shows its own.
-    let sleep = home.join("sleep");
-    aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/sleep"), &sleep);
+    // A platform binary's environment is hidden from `KERN_PROCARGS2`: the
+    // kept stand-in, signed ad hoc, shows its own. It is run in place, never
+    // copied here: this directory goes when the test ends, and a Mach-O
+    // removed while macOS still assesses its first exec crashes syspolicyd
+    // (`aterm_uds::deadline::stand_in`).
+    let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )))
+    .expect("the kept stand-in");
     let sleep_s = sleep.to_string_lossy().into_owned();
     let mut child = aterm_uds::spawnfd::command(&sleep)
         .arg("60")

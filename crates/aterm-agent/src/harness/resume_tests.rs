@@ -400,7 +400,11 @@ fn the_footers_resume_line_carries_the_home_its_process_runs_under() {
     let homedir = other.to_string_lossy().into_owned();
     assert_eq!(
         read(Some(Path::new("/u/me")), None),
-        Some(format!("HOME={} {bare}", word(&homedir))),
+        Some(format!(
+            "{}={} {bare}",
+            super::super::accounts::HOMEDIR_ENV,
+            word(&homedir)
+        )),
         "another HOME's records"
     );
     let config = claude.to_string_lossy().into_owned();

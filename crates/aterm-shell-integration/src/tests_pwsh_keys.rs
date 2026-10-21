@@ -511,7 +511,7 @@ fn expected_layer(
 
 /// pwsh 7 for the live tests: `$ATERM_TEST_PWSH`, else the first `pwsh.exe` on
 /// PATH. An override that names nothing is an operator error and fails, as
-/// `resolve_test_shell`'s does on unix. The PATH entry is read without being
+/// `aterm_spec::host::test_shell`'s does on unix. The PATH entry is read without being
 /// followed: a Store install's `pwsh.exe` (under `WindowsApps`) is an app
 /// execution alias, a reparse point, which `CreateProcess` runs.
 #[cfg(windows)]
@@ -531,24 +531,18 @@ fn pwsh_exe() -> Option<PathBuf> {
 }
 
 /// Run `check` on Windows PowerShell 5.1, which every supported Windows has, and
-/// on pwsh 7 where it resolves. Where it does not, the pwsh half is skipped, and
-/// the skip is written to the stderr handle rather than through `eprintln!`,
-/// which libtest captures and drops for a passing test (measured 2026-10-16 with
-/// pwsh taken off PATH: the `eprintln!` note never showed). So a green run says
-/// that pwsh did not run, unlike the silent skips of SPECS.md §5.8.
+/// on pwsh 7 where it resolves. Where it does not, the 5.1 half has run and the
+/// test ends COULD NOT RUN for the pwsh half: a pass never claims a pwsh that did
+/// not run (a `SKIP` note on stderr beside a pass hid the lane in a green run).
 #[cfg(windows)]
 fn on_each_powershell(test: &str, mut check: impl FnMut(&Path)) {
     check(Path::new("powershell.exe"));
     match pwsh_exe() {
         Some(pwsh) => check(&pwsh),
-        None => {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "SKIP {test} on pwsh 7: no pwsh.exe on PATH and no ATERM_TEST_PWSH; only \
-                 Windows PowerShell 5.1 ran"
-            );
-        }
+        None => aterm_spec::host::could_not_run(format!(
+            "{test} on pwsh 7: no pwsh.exe on PATH and no ATERM_TEST_PWSH; only Windows \
+             PowerShell 5.1 ran"
+        )),
     }
 }
 

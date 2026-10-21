@@ -42,7 +42,8 @@ pub(super) fn project(
     candidate_sock: &str,
     gate: Option<&crate::spawn::DeferredReaderGate>,
 ) -> State {
-    let named = crate::proxy::read_graph_entry(sock_dir, sid).map(|(sock, _)| sock);
+    let named =
+        crate::proxy::read_graph_entry(sock_dir, crate::proxy::sid_of(sid)).map(|(sock, _)| sock);
     State::from([
         ("cand", 1),
         ("registered", 1),
@@ -138,7 +139,7 @@ fn candidate() -> Candidate {
     for sid in [&root.0, &carried] {
         crate::proxy::write_graph_entry(&sock_dir, sid, &parent_sock, &LaunchNonce::generate());
     }
-    let bound = bind_control_listener(&plan, None, || false, |_| false, None)
+    let bound = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .expect("bind the candidate's socket");
     Candidate {
         _dir: dir,
@@ -213,7 +214,8 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
             "a carried id named the candidate while the parent owns it"
         );
         assert_eq!(
-            crate::proxy::read_graph_entry(&c.sock_dir, &sid).map(|(sock, _)| sock),
+            crate::proxy::read_graph_entry(&c.sock_dir, crate::proxy::sid_of(&sid))
+                .map(|(sock, _)| sock),
             Some(c.parent_sock.clone()),
             "the parent's entry stands"
         );

@@ -16,10 +16,14 @@
 //! batch path's own (the forward iterator's
 //! scan, [`CaseInsensitiveMatcher`], the same capped regex and [`scan_line`]), rows
 //! arrive in the batch build's order, and [`MAX_SEARCH_MATCHES`] applies to the
-//! final retained suffix. Rows the deterministic eviction schedule would drop are
-//! consumed unverified, so a capped evicted prefix cannot starve newer matches. A
+//! retained window. The one-shot index holds the newest `max_cached_lines` rows,
+//! the depth window aterm-core's bulk builder feeds it, with its watermark at the
+//! window's first row; the older rows are consumed unverified, so a match cap
+//! reached in them cannot starve newer matches. A
 //! row whose regex scan runs out of budget keeps the matches found so far and counts
-//! in [`SearchResults::cut_short_lines`], as in the one-shot search.
+//! in [`SearchResults::cut_short_lines`], as in the one-shot search, and so does a
+//! retained row whose text stops short of its end ([`LineCells::is_truncated`]),
+//! once if both apply.
 //!
 //! The engine knows nothing about content generations; its owner
 //! (aterm-core's `Terminal::search_budgeted`) discards it when the content changes.
@@ -31,8 +35,7 @@ use aterm_types::text_shaping::AmbiguousWidth;
 use crate::cells::LineCells;
 use crate::grapheme::ColumnMap;
 use crate::index::{
-    CaseInsensitiveMatcher, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError,
-    final_evicted_prefix, scan_line,
+    CaseInsensitiveMatcher, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError, scan_line,
 };
 use crate::iterators::next_literal_match;
 use crate::types::{SearchMatch, SearchResults};
@@ -53,8 +56,6 @@ enum RowMatcher {
 /// `[base_row, base_row + total_rows)`, fed one row at a time in ascending order.
 /// See the module docs for the results-equality contract.
 pub struct BudgetedSearch {
-    /// The batch index's cache cap; no row cache is kept here.
-    max_cached_lines: usize,
     /// The query string (verbatim; folding/compilation lives in `matcher`).
     query: String,
     /// Per-row verifier fixed at construction.
@@ -68,15 +69,16 @@ pub struct BudgetedSearch {
     total_rows: usize,
     /// Rows consumed so far.
     rows_fed: usize,
-    /// Window-relative first row the completed index retains; earlier rows are
-    /// consumed unverified.
+    /// Window-relative first row the one-shot index holds, the first of the newest
+    /// `max_cached_lines`; earlier rows are consumed unverified.
     verify_from: usize,
-    /// The one-shot watermark, known up front from the eviction schedule; zero
-    /// means no eviction.
+    /// The one-shot watermark, that row's absolute number, known at construction;
+    /// zero when the depth window holds every row.
     final_lowest_retained_line: usize,
     /// The `ambiguous_width` policy match columns are measured under.
     ambiguous_width: AmbiguousWidth,
-    /// Verified rows whose regex scan ran out of its budget part-way
+    /// Retained rows whose text stops short of its end, and other verified rows
+    /// whose regex scan ran out of its budget part-way
     /// ([`SearchResults::cut_short_lines`]).
     cut_short_rows: usize,
 }
@@ -101,7 +103,8 @@ impl BudgetedSearch {
         )
     }
 
-    /// [`new`](Self::new) with an explicit index cache cap (eviction bound).
+    /// [`new`](Self::new) with an explicit depth window: the one-shot index holds the
+    /// newest `max_cached_lines` rows.
     pub fn with_max_cached_lines(
         query: &str,
         case_sensitive: bool,
@@ -117,15 +120,13 @@ impl BudgetedSearch {
         } else {
             RowMatcher::CaseInsensitive(CaseInsensitiveMatcher::new(query))
         };
-        let max_cached_lines = max_cached_lines.max(1);
-        let verify_from = final_evicted_prefix(total_rows, max_cached_lines);
+        let verify_from = total_rows.saturating_sub(max_cached_lines.max(1));
         let final_lowest_retained_line = if verify_from > 0 {
             base_row.saturating_add(verify_from)
         } else {
             0
         };
         Ok(Self {
-            max_cached_lines,
             query: query.to_string(),
             matcher,
             matches: Vec::new(),
@@ -172,25 +173,18 @@ impl BudgetedSearch {
         let row_offset = self.rows_fed;
         let abs_row = self.base_row.saturating_add(row_offset);
         self.rows_fed += 1;
-        // The batch index's one-time truncation warning, at its first eviction.
-        if self.verify_from > 0 && row_offset == self.max_cached_lines {
-            let lowest = self
-                .base_row
-                .saturating_add(final_evicted_prefix(self.rows_fed, self.max_cached_lines));
-            aterm_log::warn!(
-                "search past the {}-line cache; results incomplete below line {}",
-                self.max_cached_lines,
-                lowest,
-            );
-        }
         if row_offset < self.verify_from {
             return;
         }
+        // The batch index counts every retained truncated line, the cap or not.
+        let truncated = cells.is_some_and(LineCells::is_truncated);
+        if truncated {
+            self.cut_short_rows = self.cut_short_rows.saturating_add(1);
+        }
         // Past the cap nothing can change the result (the batch path stops there
-        // too); verifying only the retained suffix means eviction never removes a
-        // capped match.
+        // too); verifying only the depth window means no older row spends the cap.
         if self.matches.len() < MAX_SEARCH_MATCHES {
-            self.verify_row(abs_row, &text, cells);
+            self.verify_row(abs_row, &text, cells, truncated);
         }
     }
 
@@ -240,8 +234,8 @@ impl BudgetedSearch {
     }
 
     /// Clone at most `limit` matches from `start`, with metadata for the whole
-    /// search. Verification starts at the final retained suffix, so a slice already
-    /// handed out is never invalidated by later eviction.
+    /// search. Verification starts at the depth window's first row, so a slice
+    /// already handed out holds only rows the finished search keeps.
     #[must_use]
     pub fn results_range(&self, start: usize, limit: usize) -> SearchResults {
         let start = start.min(self.matches.len());
@@ -258,8 +252,15 @@ impl BudgetedSearch {
             .with_cut_short_lines(self.cut_short_rows)
     }
 
-    /// Append row `abs_row`'s matches to `self.matches`, up to the cap.
-    fn verify_row(&mut self, abs_row: usize, text: &str, cells: Option<&LineCells>) {
+    /// Append row `abs_row`'s matches to `self.matches`, up to the cap. A row whose
+    /// text stops short of its end (`truncated`) is already counted cut short.
+    fn verify_row(
+        &mut self,
+        abs_row: usize,
+        text: &str,
+        cells: Option<&LineCells>,
+        truncated: bool,
+    ) {
         if self.query.is_empty() && !matches!(&self.matcher, RowMatcher::Regex(_)) {
             return;
         }
@@ -306,7 +307,7 @@ impl BudgetedSearch {
                         break;
                     }
                 }
-                if scan.step_limit_exceeded() {
+                if scan.step_limit_exceeded() && !truncated {
                     self.cut_short_rows = self.cut_short_rows.saturating_add(1);
                 }
             }
@@ -333,6 +334,24 @@ mod tests {
         index
             .search_results_opts(query, case_sensitive, is_regex)
             .expect("oracle search must succeed")
+    }
+
+    /// The one-shot index over the depth window of `rows`: the newest `cap` of them,
+    /// numbered from `base`, with the watermark at the window's first row, as
+    /// aterm-core's bulk builder makes it.
+    fn depth_window_index(
+        rows: &[&str],
+        cells: Option<&[LineCells]>,
+        base: usize,
+        cap: usize,
+    ) -> SearchIndex {
+        let skipped = rows.len().saturating_sub(cap);
+        let mut index = SearchIndex::with_capacity_and_max(rows.len() - skipped, cap);
+        for (i, row) in rows.iter().enumerate().skip(skipped) {
+            index.index_line_cow(base + i, Cow::Borrowed(row), cells.map(|cells| &cells[i]));
+        }
+        index.set_history_prefix_eviction((skipped > 0).then_some(base + skipped));
+        index
     }
 
     /// Feed `rows` to `search` one row per call until it completes. A caller's
@@ -410,22 +429,41 @@ mod tests {
         }
     }
 
-    /// `final_evicted_prefix` equals the real index's eviction schedule.
+    /// Past its cap a budgeted search equals the one-shot index over the depth window
+    /// (the newest `cap` rows, watermark at the first of them). NEGATIVE CONTROL: the append-path index, which evicts to its 3/4 low-water mark
+    /// once past the cap, keeps fewer rows and answers differently on the same feed.
     #[test]
-    fn final_evicted_prefix_matches_real_index_schedule() {
-        for cap in 1..=20 {
-            for total in 0..=100 {
-                let mut index = SearchIndex::with_max_cached_lines(cap);
-                for row in 0..total {
-                    index.index_line(row, "row");
-                }
-                assert_eq!(
-                    final_evicted_prefix(total, cap),
-                    index.lowest_retained_line(),
-                    "cap={cap} total={total}"
-                );
-            }
+    fn past_its_cap_the_search_equals_the_depth_window_not_the_eviction_schedule() {
+        let rows: Vec<String> = (0..100).map(|i| format!("needle row {i}")).collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let oracle = depth_window_index(&rows, None, 5, 10)
+            .search_results_opts("needle", true, false)
+            .expect("oracle search");
+        assert!(
+            oracle.incomplete,
+            "the rows past the window are not searched"
+        );
+        assert_eq!(oracle.lowest_retained_line, 5 + 90);
+        assert_eq!(oracle.matches.len(), 10, "every row of the window");
+        let mut search = BudgetedSearch::with_max_cached_lines("needle", true, false, 5, 100, 10)
+            .expect("budgeted construction");
+        for row in &rows {
+            search.feed_row(row);
         }
+        assert_eq!(search.results(), oracle);
+        let mut evicting = SearchIndex::with_max_cached_lines(10);
+        for (i, row) in rows.iter().enumerate() {
+            evicting.index_line(5 + i, row);
+        }
+        let scheduled = evicting
+            .search_results_opts("needle", true, false)
+            .expect("search");
+        assert_eq!(
+            scheduled.lowest_retained_line,
+            5 + 92,
+            "the low-water schedule"
+        );
+        assert_ne!(scheduled, oracle);
     }
 
     /// The row feed equals the one-shot search, in every mode, at a non-zero base
@@ -469,54 +507,31 @@ mod tests {
         assert_eq!(got, oracle);
     }
 
-    /// With eviction mid-build, the completed search equals the one-shot search over
-    /// the same capped index.
+    /// Hitting the match cap in rows older than the depth window must not starve
+    /// the window.
     #[test]
-    fn eviction_matches_one_shot_capped_index() {
-        let rows: Vec<String> = (0..100).map(|i| format!("needle row {i}")).collect();
-        let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-
-        let mut oracle_index = SearchIndex::with_max_cached_lines(10);
-        for (i, row) in row_refs.iter().enumerate() {
-            oracle_index.index_line(i, row);
-        }
-        let oracle = oracle_index
-            .search_results_opts("needle", true, false)
-            .expect("oracle search");
-        assert!(oracle.incomplete, "eviction must be reported");
-
-        let search =
-            BudgetedSearch::with_max_cached_lines("needle", true, false, 0, row_refs.len(), 10)
-                .expect("budgeted construction");
-        assert_eq!(drive(search, &row_refs), oracle);
-    }
-
-    /// Hitting the match cap in rows that are later evicted must not starve the
-    /// retained suffix.
-    #[test]
-    fn combined_match_cap_and_eviction_equals_one_shot() {
+    fn combined_match_cap_and_depth_window_equals_one_shot() {
         const CACHE_LINES: usize = 10;
         const ROWS: usize = 20;
-        // Over MAX_SEARCH_MATCHES matches before the retained suffix, and matches
-        // in every retained row.
+        // Over MAX_SEARCH_MATCHES matches before the window, and matches in every
+        // row of it.
         let dense = "a".repeat(MAX_SEARCH_MATCHES / 2 + 1);
         let rows: Vec<&str> = (0..ROWS).map(|_| dense.as_str()).collect();
 
-        let mut oracle_index = SearchIndex::with_max_cached_lines(CACHE_LINES);
-        for (i, row) in rows.iter().enumerate() {
-            oracle_index.index_line(i, row);
-        }
-        let oracle = oracle_index
+        let oracle = depth_window_index(&rows, None, 0, CACHE_LINES)
             .search_results_opts("a", true, false)
             .expect("oracle search");
-        assert!(oracle.incomplete, "cap plus eviction must be reported");
+        assert!(
+            oracle.incomplete,
+            "cap plus the depth window must be reported"
+        );
         assert_eq!(oracle.matches.len(), MAX_SEARCH_MATCHES);
         assert!(
             oracle
                 .matches
                 .iter()
                 .all(|m| m.line >= oracle.lowest_retained_line),
-            "oracle only returns the retained suffix"
+            "oracle only returns the window"
         );
 
         let search =
@@ -571,6 +586,59 @@ mod tests {
         }
     }
 
+    /// A row whose text stops short of its end is counted cut short as the one-shot
+    /// index counts it: in every mode, once when its regex scan stops too, and not
+    /// at all once it is older than the depth window.
+    #[test]
+    fn a_row_read_short_of_its_end_is_reported_like_the_one_shot() {
+        let wide = "x".repeat(4096);
+        let rows = [
+            "x z aa",
+            wide.as_str(),
+            "after z aa",
+            "x z aa again",
+            "z tail",
+        ];
+        let cells: Vec<LineCells> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let mut cells = LineCells::identity(row.len());
+                if i == 1 {
+                    cells.mark_truncated();
+                }
+                cells
+            })
+            .collect();
+        for (pattern, case_sensitive, is_regex, cap, cut_short) in [
+            ("aa", true, false, 100, 1),
+            ("AA", false, false, 100, 1),
+            ("z", true, true, 100, 1),
+            // The scan stops on the truncated row too: still one line.
+            ("(?:x?){1020}z", true, true, 100, 1),
+            // A cap of 3 keeps rows 2 to 4, without the truncated row.
+            ("z", true, true, 3, 0),
+        ] {
+            let oracle = depth_window_index(&rows, Some(&cells), 0, cap)
+                .search_results_opts(pattern, case_sensitive, is_regex)
+                .expect("searched");
+            assert_eq!(oracle.cut_short_lines, cut_short, "{pattern:?}: {oracle:?}");
+            let mut search = BudgetedSearch::with_max_cached_lines(
+                pattern,
+                case_sensitive,
+                is_regex,
+                0,
+                rows.len(),
+                cap,
+            )
+            .expect("compiles");
+            for (row, cells) in rows.iter().zip(&cells) {
+                search.feed_row_cells((*row).to_string(), cells);
+            }
+            assert_eq!(search.results(), oracle, "{pattern:?} cap {cap}");
+        }
+    }
+
     /// Partial results are a prefix of the final results; overfeeding is a no-op.
     #[test]
     fn partial_results_are_a_prefix_and_overfeed_is_a_noop() {
@@ -598,10 +666,10 @@ mod tests {
         assert_eq!(done, one_shot(&rows, 0, "needle", false, false));
     }
 
-    /// Emitted range slices stay a prefix across an eviction boundary, and range
-    /// reads are bounded.
+    /// Emitted range slices stay a prefix as rows past the depth window arrive, and
+    /// range reads are bounded.
     #[test]
-    fn result_ranges_are_bounded_and_stable_across_eviction() {
+    fn result_ranges_are_bounded_and_stable_past_the_cap() {
         let rows: Vec<String> = (0..20).map(|i| format!("needle row {i}")).collect();
         let mut search =
             BudgetedSearch::with_max_cached_lines("needle", true, false, 0, rows.len(), 10)
@@ -612,9 +680,9 @@ mod tests {
         }
         let first = search.results_range(0, 2);
         assert!(first.matches.len() <= 2);
-        assert!(first.matches.iter().all(|m| m.line >= 12));
+        assert!(first.matches.iter().all(|m| m.line >= 10));
         assert!(first.incomplete);
-        assert_eq!(first.lowest_retained_line, 12);
+        assert_eq!(first.lowest_retained_line, 10);
 
         for row in rows.iter().skip(14) {
             search.feed_row(row);
@@ -623,7 +691,7 @@ mod tests {
         assert_eq!(
             &final_results.matches[..first.matches.len()],
             first.matches.as_slice(),
-            "an emitted delta must remain a prefix after later eviction"
+            "an emitted delta must remain a prefix of the finished search"
         );
         let second = search.results_range(first.matches.len(), 2);
         assert!(second.matches.len() <= 2);

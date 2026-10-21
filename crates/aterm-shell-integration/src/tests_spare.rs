@@ -77,6 +77,17 @@ impl SpareRig {
     /// the spare's life: the shell's open never blocks, and a line written
     /// before the shell reads waits in the pipe.
     fn fifo(&self) -> std::fs::File {
+        self.make_fifo();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.fifo)
+            .expect("hold the FIFO")
+    }
+
+    /// Make the spare's FIFO and hold nothing of it: a hold's open then waits
+    /// for a writer ([`Self::writer_met_by`]).
+    fn make_fifo(&self) {
         let made = Command::new("/usr/bin/mkfifo")
             .arg("-m")
             .arg("600")
@@ -84,11 +95,37 @@ impl SpareRig {
             .status()
             .expect("mkfifo");
         assert!(made.success(), "mkfifo {}", self.fifo.display());
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.fifo)
-            .expect("hold the FIFO")
+    }
+
+    /// A writer of the FIFO [`Self::make_fifo`] made, opened as `sh`'s hold opens
+    /// it to read: a FIFO's open for writing waits for a reader, so when this
+    /// returns the hold has the FIFO open, and what is written and closed now is
+    /// what it reads, then end of file. Its parked mark is printed before that
+    /// open, so a writer let go of on seeing the mark could close before the
+    /// open and leave it waiting for a writer for good. A hang detector: a hold
+    /// that never opens the FIFO fails at [`LiveShell::TIMEOUT`].
+    fn writer_met_by(&self, sh: &LiveShell) -> std::fs::File {
+        let path = self.fifo.clone();
+        let (met, meeting) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = met.send(std::fs::OpenOptions::new().write(true).open(path));
+        });
+        match meeting.recv_timeout(LiveShell::TIMEOUT) {
+            Ok(writer) => writer.expect("open the FIFO to write"),
+            Err(_) => {
+                // A reader of this process's own lets the waiting open go.
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let _ = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&self.fifo);
+                panic!(
+                    "{}: the hold never opened its FIFO\n{}",
+                    sh.label,
+                    sh.transcript()
+                );
+            }
+        }
     }
 
     /// An interactive `shell` on a real pty, started from this build's folder the
@@ -165,8 +202,7 @@ impl SpareRig {
             .env("TERM", "xterm-256color")
             .env("ATERM_CHILD", "1")
             .env("ATERM_SHELL_NONCE", SPARE_NONCE)
-            .env("ATERM_REKEY_PATH", &self.rekey)
-            .env_remove("BASH_ENV");
+            .env("ATERM_REKEY_PATH", &self.rekey);
         for (key, value) in env_add {
             cmd.env(key, value);
         }
@@ -184,7 +220,7 @@ impl SpareRig {
                     format!(
                         "{}:{}",
                         dir.join("fish-xdg").display(),
-                        hermetic.home().join("data").display()
+                        hermetic_data(hermetic.home()).display()
                     ),
                 )
                 .env("TERM", "dumb");
@@ -238,16 +274,7 @@ impl LiveShell {
 
     /// Wait for the shell (and so `script`) to exit; a hang detector.
     fn wait_exit(&mut self) {
-        let started = std::time::Instant::now();
-        while !matches!(self.child.try_wait(), Ok(Some(_))) {
-            assert!(
-                started.elapsed() < Self::TIMEOUT,
-                "{}: did not exit\n{}",
-                self.label,
-                self.transcript()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
+        self.wait_exit_status("did not exit");
     }
 
     /// End a shell the test no longer needs: `script` killed, its pty closed,
@@ -302,7 +329,7 @@ fn spare_bash() -> &'static str {
 /// holds only where a signal fails the hold's FIFO open (bash 3.2).
 #[cfg(unix)]
 fn bash_major_version(bash: &str) -> u32 {
-    let out = Command::new(bash)
+    let out = shell_command(bash)
         .args(["-c", "echo ${BASH_VERSINFO[0]}"])
         .output()
         .unwrap_or_else(|e| panic!("{bash} -c: {e}"));
@@ -956,8 +983,12 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
     // released it), so under it the cut hold cannot be released and there is
     // nothing to control — the loop exists for 3.2's hold.
     let bash = spare_bash();
-    if bash_major_version(bash) >= 5 {
-        return;
+    let major = bash_major_version(bash);
+    if major >= 5 {
+        aterm_spec::host::could_not_run(format!(
+            "{bash} is bash {major}, which restarts the interrupted open, so the negative \
+             control has no cut hold to show (it needs bash 3.2, macOS's /bin/bash)"
+        ));
     }
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let cut = folder_with_edits(
@@ -974,11 +1005,13 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
     );
     let rig = SpareRig::new();
     rig.rc(".bashrc", "PS1='P> '\n");
-    let mut host = rig.fifo();
+    rig.make_fifo();
     let mut sh = rig.spawn_from(ShellType::Bash, bash, &cut);
     let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
-    // `run`, and the host lets go of its writer at once: the parked hold still
-    // reads the line it holds, and the warm hold's open waits for a writer.
+    // `run` to the parked hold that has the FIFO open, and the writer let go of
+    // at once: the hold reads the line, and the warm hold's open waits for a
+    // writer.
+    let mut host = rig.writer_met_by(&sh);
     tell(&mut host, "run");
     drop(host);
     let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
@@ -1046,12 +1079,14 @@ fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
                 if at_warm { "warm" } else { "parked" }
             );
         }
-        // The FIFO gone and the host's writer closed: the hold ends the shell.
+        // The FIFO gone and the host's writer closed: the hold that holds it
+        // reads end of file and ends the shell.
         let rig = SpareRig::new();
         rig.rc(rc_name, rc);
-        let host = rig.fifo();
+        rig.make_fifo();
         let mut sh = rig.spawn(shell, program);
         sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+        let host = rig.writer_met_by(&sh);
         std::fs::remove_file(&rig.fifo).unwrap();
         drop(host);
         sh.wait_exit();
@@ -1380,7 +1415,7 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
         let mut cmd = shell_command(fish);
         let home = cmd.home().to_path_buf();
         std::fs::write(
-            home.join("config/fish/conf.d/00-probe.fish"),
+            home.join(".config/fish/conf.d/00-probe.fish"),
             "string join \\n -- \"$__fish_sysconf_dir\" $__fish_vendor_confdirs $vendor_confdirs \
              >$HOME/walked\n",
         )
@@ -1391,7 +1426,7 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
             .arg("functions -e __fish_on_interactive; __aterm_start_mark cold")
             .env(
                 "XDG_DATA_DIRS",
-                format!("{}:{}", inherited.display(), home.join("data").display()),
+                format!("{}:{}", inherited.display(), hermetic_data(&home).display()),
             )
             .output()
             .expect("spawn fish");
@@ -1429,6 +1464,15 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
 /// it was then); `appended`, another session adds two commands after the
 /// start (during the hold, or before a cold start); `named`, the config names
 /// its own history session (`fish_history`).
+///
+/// fish shows another session's entry only once it is no later than the
+/// boundary its own last `history merge` (or its start) set, in whole seconds,
+/// and a merge only marks the file to be read again at the next use. So the
+/// two a warm hold appends are stamped as a concurrent session stamps them,
+/// AFTER the hold began: the second after its start mark was seen. The release
+/// is sent only once the clock reads that second, so a merge made at the release
+/// shows them, and one made before the hold began (or none) never does, however
+/// fast the machine is. A cold start reads them stamped long ago.
 #[cfg(unix)]
 fn fish_history_reading(
     fish: &str,
@@ -1460,32 +1504,29 @@ fn fish_history_reading(
         ),
     )
     .expect("history");
-    let append = || {
+    let append = |when: u64| {
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&file)
             .expect("history");
         f.write_all(
-            format!(
-                "{}{}",
-                entry("echo three", 1_700_000_003),
-                entry("echo four", 1_700_000_004)
-            )
-            .as_bytes(),
+            format!("{}{}", entry("echo three", when), entry("echo four", when)).as_bytes(),
         )
         .expect("append");
     };
     let mut host = warm.then(|| rig.fifo());
     if appended && !warm {
-        append();
+        append(1_700_000_003);
     }
     let mut sh = rig.spawn(ShellType::Fish, fish);
     let kind = if warm { "spare" } else { "cold" };
     let start = sh.wait_for_after(&signed_p(&format!("AtermStart={kind}")), 0);
     if let Some(host) = host.as_mut() {
         if appended {
-            append();
+            let after_the_start = unix_secs() + 1;
+            append(after_the_start);
+            until_the_clock_reads(after_the_start);
         }
         tell(host, "go");
     }
@@ -1499,31 +1540,65 @@ fn fish_history_reading(
     reading
 }
 
+/// Whole seconds since the epoch, by the wall clock fish stamps its history with.
+#[cfg(unix)]
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock past 1970")
+        .as_secs()
+}
+
+/// Return once the wall clock reads second `at` or later: a wait for the
+/// clock, which must happen (within a second here), never for a process.
+#[cfg(unix)]
+fn until_the_clock_reads(at: u64) {
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at);
+    while let Ok(left) = at.duration_since(std::time::SystemTime::now()) {
+        std::thread::sleep(left);
+    }
+}
+
 /// S3, fish: the history a warm tab holds after its release is a cold tab's,
 /// over the matrix of a config that reads the history at its start or not,
 /// commands another session adds during the hold or not, and the default
 /// history session or one the config names: the release takes in what
 /// arrived (`history merge`), a history nothing read yet is read afresh at
 /// first use, as a cold start reads it. The cold reading is the control each
-/// warm one must match.
+/// warm one must match. A merge made before the hold began, or none, misses
+/// the commands added during it ([`fish_history_reading`]'s stamps). The eight
+/// cases share nothing and run side by side.
 #[cfg(unix)]
 #[test]
 fn a_warm_fish_holds_the_history_a_cold_one_does() {
     let fish = spare_fish();
+    let mut cases: Vec<(String, Box<dyn FnOnce() + Send>)> = Vec::new();
     for rc_reads in [false, true] {
         for appended in [false, true] {
             for named in [false, true] {
-                let cold = fish_history_reading(fish, false, rc_reads, appended, named);
-                let warm = fish_history_reading(fish, true, rc_reads, appended, named);
-                assert!(
-                    cold.contains("echo two"),
-                    "fish: the control read the file ({cold:?})"
-                );
-                assert_eq!(
-                    warm, cold,
-                    "fish: rc_reads={rc_reads} appended={appended} named={named}"
-                );
+                let case = move || {
+                    let cold = fish_history_reading(fish, false, rc_reads, appended, named);
+                    let warm = fish_history_reading(fish, true, rc_reads, appended, named);
+                    assert!(
+                        cold.contains("echo two"),
+                        "fish: the control read the file ({cold:?})"
+                    );
+                    assert_eq!(
+                        warm, cold,
+                        "fish: rc_reads={rc_reads} appended={appended} named={named}"
+                    );
+                };
+                cases.push((
+                    format!(
+                        "fish-history-r{}-a{}-n{}",
+                        u8::from(rc_reads),
+                        u8::from(appended),
+                        u8::from(named)
+                    ),
+                    Box::new(case),
+                ));
             }
         }
     }
+    side_by_side(cases);
 }

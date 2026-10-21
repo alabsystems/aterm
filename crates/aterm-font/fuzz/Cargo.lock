@@ -9,16 +9,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
+name = "astream-sys"
+version = "0.2.0"
+
+[[package]]
+name = "astream-wire"
+version = "0.2.0"
+
+[[package]]
 name = "aterm-alloc"
-version = "0.105.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-bidi"
-version = "0.105.0"
+version = "0.107.0"
+
+[[package]]
+name = "aterm-durable"
+version = "0.107.0"
+dependencies = [
+ "astream-sys",
+]
 
 [[package]]
 name = "aterm-font"
-version = "0.105.0"
+version = "0.107.0"
 dependencies = [
  "aterm-bidi",
  "aterm-grapheme",
@@ -34,31 +49,48 @@ dependencies = [
 
 [[package]]
 name = "aterm-grapheme"
-version = "0.105.0"
+version = "0.107.0"
 dependencies = [
  "aterm-types",
 ]
 
 [[package]]
 name = "aterm-hash"
-version = "0.105.0"
+version = "0.107.0"
+dependencies = [
+ "astream-wire",
+]
 
 [[package]]
 name = "aterm-log"
-version = "0.105.0"
+version = "0.107.0"
+
+[[package]]
+name = "aterm-tempfile"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-time"
-version = "0.105.0"
+version = "0.107.0"
 
 [[package]]
 name = "aterm-types"
-version = "0.105.0"
+version = "0.107.0"
 dependencies = [
  "aterm-alloc",
+ "aterm-durable",
  "aterm-hash",
  "aterm-log",
+ "aterm-tempfile",
  "aterm-time",
+ "aterm-uds",
+]
+
+[[package]]
+name = "aterm-uds"
+version = "0.107.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -202,13 +202,19 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
         format!("+1.97.1\n--config\n{config}\ntest\n")
     );
     assert_eq!(run("1.97.1", &["metadata"], &[]), "metadata\n");
+    // A target directory the caller chose keeps the intermediates in its own
+    // `build.noindex`.
     assert_eq!(
         run("1.97.1", &["build"], &[("CARGO_TARGET_DIR", "/t")]),
+        "--config\nbuild.build-dir='/t/build.noindex'\nbuild\n"
+    );
+    assert_eq!(
+        run("1.97.1", &["build"], &[("CARGO_BUILD_BUILD_DIR", "/b")]),
         "build\n"
     );
     assert_eq!(run("1.85.0", &["build"], &[]), "build\n");
-    // Trust's own cargo (targo): its verified lane runs as typed; `--unverified` gets the
-    // setting.
+    // Trust's own cargo (targo): a bare verb, which Trust refuses, runs as typed;
+    // `--unverified` gets the setting.
     assert_eq!(run("trust", &["check"], &[]), "check\n");
     assert_eq!(
         run("trust", &["build", "--unverified"], &[]),

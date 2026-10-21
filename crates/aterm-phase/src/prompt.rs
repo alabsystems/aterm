@@ -4623,6 +4623,15 @@ pub mod fixtures {
     /// After the accept row's Enter: the outcome line, the composer back.
     pub const AUTOCOMPACT_SAVED: &str =
         include_str!("fixtures/claude-2.1.302-autocompact-offer-saved.txt");
+    /// MEASURED on 2.1.304 (the lab, 2026-10-20): Claude Code's pinned
+    /// `transcript-writer-degraded` notice at idle ([`crate::disk_full`]),
+    /// the session's transcript file made read-only after its first turn, so
+    /// its code is `EACCES` — no full disk: the lab fills no volume, which
+    /// takes a disk image macOS may raise a consent dialog for. Drawn under
+    /// the composer's bottom rule, over the mode row: two columns in, the
+    /// vendor's `⚠` and one space, then the words.
+    pub const TRANSCRIPT_DEGRADED_EACCES_2_1_304: &str =
+        include_str!("fixtures/claude-2.1.304-transcript-degraded-eacces.txt");
     /// A saved capture whose head has scrolled off.
     pub const WAIT_BG3: &str = include_str!("fixtures/wait_bg3.out");
     /// A saved capture with the session survey parked under the done row.

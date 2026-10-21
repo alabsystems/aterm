@@ -396,7 +396,8 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
 /// A COMMIT WHOSE ANSWERS TOOK TIME HOLDS ITS CLAIM THROUGH THE FENCE (round
 /// eight of the update audit, #18). A live `video` request is answered only
 /// under the claim (round six, #22), and its answer can block the main
-/// thread — here a reply its client takes 50 ms to read; a key the OS queued
+/// thread — here a reply its client writes one fence grain
+/// (`HANDOFF_INPUT_DRAIN_YIELD`) after it reads it; a key the OS queued
 /// to this process meanwhile died with the `_exit` when the successor had not
 /// taken the keyboard. The claim's pass now answers the take and keeps the
 /// claim (the worker cannot reject a claimed attempt): no Commit is written,
@@ -409,6 +410,10 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
 /// rejection, as activity, with the take still answered. A row the park's
 /// carry left is closed only at the write (ruling 441 (d)): the refused pass
 /// keeps running with it open, its reporter's id still live.
+///
+/// CONTROL: answers that cost under one grain hold nothing — the claim's own
+/// pass writes the Commit and closes the row there. The cost is chosen
+/// (`App::handoff_commit_answers_took`), in place of what the slow reply took.
 ///
 /// The derived machine says the same (`NativeUpdateOverlapHandoff`): input
 /// queued under the claim disables `CommitModern` until it drains.
@@ -433,7 +438,11 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
         "the machine writes no Commit over input queued under the claim"
     );
 
-    for quit_during_the_fence in [false, true] {
+    let under_a_grain = super::HANDOFF_INPUT_DRAIN_YIELD - std::time::Duration::from_micros(1);
+    // (what the claim's answers are taken to cost, a quit pressed during the fence)
+    for (chosen_cost, quit_during_the_fence) in
+        [(None, false), (None, true), (Some(under_a_grain), false)]
+    {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = crate::App::headless_for_test();
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -444,20 +453,20 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             .session
             .master = master;
         let (root, replies) = live_take(&mut app);
-        // The take's client reads its answer 50 ms after it is SENT: it
-        // waits for the answer first, so the 50 ms is always time the
-        // claim's pass spent answering, however late the main thread
-        // got there (begun when the thread is spawned instead, a machine at
-        // load ~20 reaches the answer after the 50 ms has passed: the pass
-        // takes under the 2 ms yield and writes the Commit at once).
+        // The take's client writes its answer one fence grain after it is SENT:
+        // it waits for the answer first, so that grain is always time the
+        // claim's pass spent answering, however late the main thread got
+        // there (a clock begun before the claim can run out first, and the
+        // pass then answers under the yield and writes the Commit at once).
         let (wire, release) = crate::control::ReplyWire::new();
         app.video_reply_wires.push(wire);
         let reader = std::thread::spawn(move || {
             let answer = replies.recv().expect("the claim answered the take");
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(super::HANDOFF_INPUT_DRAIN_YIELD);
             drop(release);
             answer
         });
+        app.handoff_commit_answers_took = chosen_cost;
         let (record, _cancelled, _stood_down, _transferred) =
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
@@ -515,6 +524,31 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             .expect("the client read its answer")
             .into_parts();
         assert_eq!(body, "ERR video: recording aborted: aterm is updating\n");
+        if chosen_cost.is_some() {
+            // CONTROL: under one grain, the claim's own pass wrote the Commit.
+            assert_eq!(arbiter.phase(), crate::HandoffAttemptPhase::Rejecting);
+            assert!(rejected.try_recv().is_ok(), "the worker is told to reject");
+            assert_eq!(
+                app.handoff_rejections,
+                ["attempt-bound Commit pipe closed before its atomic write"],
+                "written in the claim's pass"
+            );
+            assert!(
+                app.handoff_reposts.as_ref().is_some_and(Vec::is_empty),
+                "nothing held, nothing re-posted"
+            );
+            assert!(
+                app.messages.live(uncarried).is_none(),
+                "the write closed the row"
+            );
+            app.pending_update_handoff = None;
+            app.update_handoff_prelaunch = None;
+            drop(app);
+            aterm_pty::close_fd(slave);
+            aterm_pty::close_fd(master);
+            let _ = std::fs::remove_dir_all(root);
+            continue;
+        }
         assert_eq!(
             arbiter.phase(),
             crate::HandoffAttemptPhase::Committing,
@@ -591,7 +625,8 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
 /// round eight's #18). A supervised tab waits at a question box the
 /// in-window supervisor escalated: its badge (`meta set attention
 /// owner=supervisor …`) stands, and the park draws it into the manifest.
-/// The Commit's answers took real time, so its claim is held through one
+/// The Commit's answers took one fence grain (chosen,
+/// `App::handoff_commit_answers_took`), so its claim is held through one
 /// more input-dispatch fence, and the pass after it reads the admission
 /// again — the escalations among it (`carried_claims_held`). A stopped
 /// worker's last act clears the badges it raised (`release_attention`, on
@@ -680,12 +715,9 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     });
 
     let (root, replies) = live_take(&mut app);
-    // The take's client reads its answer a while after the Commit is written: the
-    // Commit's answers take real time, and its claim is held. The wire is made here
-    // and its reader started right before the Commit (below), so its clock cannot run
-    // out while a starved main thread is still setting the park up.
-    let (wire, release) = crate::control::ReplyWire::new();
-    app.video_reply_wires.push(wire);
+    // The Commit's answers cost one fence grain, so its claim is held, however late a
+    // loaded main thread reaches it.
+    app.handoff_commit_answers_took = Some(super::HANDOFF_INPUT_DRAIN_YIELD);
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(7, ApplyMode::Immediate);
     let nonce = record.nonce.clone();
     app.update_handoff_prelaunch = Some(record);
@@ -721,12 +753,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
     drop(commit_rd);
     let (reject, rejected) = std::sync::mpsc::sync_channel(1);
-    // The claim counts as held when its answers took `HANDOFF_INPUT_DRAIN_YIELD`
-    // (2 ms); 250 ms leaves a loaded machine room to reach the wait first.
-    let reader = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        drop(release);
-    });
     app.finish_proven_handoff(crate::UpdateHandoffCompletion {
         attempt_id: 7,
         nonce: Some(nonce),
@@ -739,7 +765,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
         input_drain_spins: 1,
         child_death: crate::ChildDeathEvidence::Unobserved,
     });
-    reader.join().expect("the client read its answer");
     assert!(replies.try_recv().is_ok(), "the claim answered the take");
     assert!(
         app.pending_update_handoff
@@ -802,8 +827,8 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
 }
 
 /// THE SUCCESSOR TAKES THE FRONT AT THE WRITE, NEVER AT A HELD CLAIM (the
-/// second review of round eight's #18). The Commit's answers took real time
-/// (a `video` reply its client reads 50 ms late), so its claim is held
+/// second review of round eight's #18). The Commit's answers took one fence
+/// grain (chosen, `App::handoff_commit_answers_took`), so its claim is held
 /// through one more input-dispatch fence. The successor used to be
 /// activated at the claim, before that fence: the keys the person typed
 /// through it went to the successor's pre-Commit queue and died with it
@@ -874,14 +899,9 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             .session
             .master = master;
         let (root, replies) = live_take(&mut app);
-        // The take's client reads its answer 50 ms after it is sent: the
-        // Commit's answers take real time, and its claim is held.
-        let (wire, release) = crate::control::ReplyWire::new();
-        app.video_reply_wires.push(wire);
-        let reader = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            drop(release);
-        });
+        // The Commit's answers cost one fence grain, so its claim is held, however
+        // late a loaded main thread reaches it.
+        app.handoff_commit_answers_took = Some(super::HANDOFF_INPUT_DRAIN_YIELD);
         let (record, _cancelled, _stood_down, _transferred) =
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
@@ -919,7 +939,6 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             input_drain_spins: 1,
             child_death: crate::ChildDeathEvidence::Unobserved,
         });
-        reader.join().expect("the client read its answer");
         assert!(replies.try_recv().is_ok(), "the claim answered the take");
         assert_eq!(arbiter.phase(), crate::HandoffAttemptPhase::Committing);
         assert!(
@@ -1115,7 +1134,7 @@ fn a_park_that_misses_keeps_a_live_take() {
     let term = app.pool.get(0).expect("session 0").term.clone();
     // On the real rung: a test park's default deadline would wait it out.
     let real = super::park_budget_for_test::real();
-    let holder = super::dry_run_capture_tests::hold_engine_past_every_rung(&term);
+    let holder = super::dry_run_capture_tests::hold_engine_until_the_park_gives_up(&term);
     let missed = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
     holder.join().expect("the holder finished");
     drop(real);
@@ -1164,8 +1183,8 @@ fn a_park_that_misses_keeps_a_live_take() {
 /// the connection thread writes it, after the channel hand-off. Each
 /// stand-in below is a connection thread that writes its reply 150 ms
 /// after the answer arrives (and releases the request's [`ReplyWire`] as
-/// the real write does, `write_control_reply_with_timeout_arm`), and the
-/// export worker answers 200 ms after the cancel: Commit's step
+/// the real connection does once the last byte is out, `Outbox::deliver_to`),
+/// and the export worker answers 200 ms after the cancel: Commit's step
 /// (`App::video_answer_before_commit`, which the Commit arm alone calls)
 /// returns only once both replies are WRITTEN, inside its bound.
 ///

@@ -128,6 +128,24 @@ impl Terminal {
             .intersects(KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
     }
 
+    /// Whether the active keyboard mode sends a control chord (Ctrl plus a
+    /// letter, which the legacy encoder sends as its C0 byte: Ctrl-A is `SOH`)
+    /// as an escape sequence instead: a Kitty mode that reports functional keys
+    /// (`CSI 97;5u`) or xterm's modifyOtherKeys at level 2 (`CSI 27;5;97~`).
+    /// Level 1 leaves an unambiguous chord as its byte.
+    ///
+    /// For the typing predictor: Ctrl-A and Ctrl-E are line-edge keys only as
+    /// `SOH` and `ENQ`, and a line editor that cannot decode the escaped form
+    /// beeps or inserts it (`aterm_predict::KeySample::escaped_chords`,
+    /// R-KITTY). A read-only projection of [`Self::keyboard_mode`], bound to
+    /// the encoder by its test; it never feeds an encoder.
+    #[must_use]
+    pub fn control_chords_escaped(&self) -> bool {
+        let mode = self.keyboard_mode();
+        mode.intersects(KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
+            || mode.xterm_modify_other_keys_level() >= 2
+    }
+
     /// Whether the active Kitty keyboard mode makes predictive local echo unsafe:
     /// `REPORT_ALL_KEYS_AS_ESC` routes even plain text through CSI-u, and
     /// `REPORT_EVENT_TYPES` marks an application-owned composer (Codex on the
@@ -820,5 +838,54 @@ mod console_host_modify_other_keys_tests {
         // The posture gates the capability; it does not destroy the negotiation.
         term.set_console_host_posture(ResizePolicy::Native);
         assert_eq!(chords(&term), negotiated);
+    }
+}
+
+#[cfg(test)]
+mod control_chord_tests {
+    //! `control_chords_escaped` is the encoder's own answer: for every mode a
+    //! program can negotiate, Ctrl-A and Ctrl-E encode as `SOH` and `ENQ`
+    //! exactly when it is false.
+    use crate::terminal::Terminal;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, encode_key_with_layout};
+
+    /// The bytes Ctrl plus `c` sends under `term`'s keyboard mode.
+    fn chord(term: &Terminal, c: char) -> Vec<u8> {
+        encode_key_with_layout(
+            &Key::Character(c),
+            Modifiers::CTRL,
+            term.keyboard_mode(),
+            KeyEventType::Press,
+            None,
+        )
+    }
+
+    /// The legacy encoder, Kitty's two modes that report functional keys, its
+    /// modes that do not, and modifyOtherKeys at each level: escaped exactly
+    /// where the encoder escapes (`CSI 97;5u`, `CSI 27;5;97~`). NEGATIVE
+    /// CONTROLS: Kitty's REPORT_EVENT_TYPES alone and modifyOtherKeys level 1
+    /// leave the chord its byte, and read false.
+    #[test]
+    fn control_chords_escaped_is_what_the_encoder_sends() {
+        let negotiations: [(&str, &[u8], bool); 7] = [
+            ("legacy", b"", false),
+            ("kitty disambiguate", b"\x1b[>1u", true),
+            ("kitty report all keys", b"\x1b[>8u", true),
+            ("kitty event types alone", b"\x1b[>2u", false),
+            ("modifyOtherKeys 1", b"\x1b[>4;1m", false),
+            ("modifyOtherKeys 2", b"\x1b[>4;2m", true),
+            ("modifyOtherKeys 2 reset", b"\x1b[>4;2m\x1b[>4;0m", false),
+        ];
+        for (label, bytes, escaped) in negotiations {
+            let mut term = Terminal::new(4, 20);
+            term.process(bytes);
+            assert_eq!(term.control_chords_escaped(), escaped, "{label}");
+            assert_eq!(
+                chord(&term, 'a') != [0x01] && chord(&term, 'e') != [0x05],
+                escaped,
+                "{label}: the encoder agrees ({:?})",
+                String::from_utf8_lossy(&chord(&term, 'a'))
+            );
+        }
     }
 }

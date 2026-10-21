@@ -64,7 +64,7 @@ impl From<&str> for TextRope {
                 end = text[start..]
                     .char_indices()
                     .nth(1)
-                    .map_or(text.len(), |(relative, _)| start + relative);
+                    .map_or(text.len(), |(relative, _)| start.saturating_add(relative));
             }
             leaves.push(leaf(&text[start..end]));
             start = end;
@@ -188,10 +188,51 @@ fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     Arc::new(Node::Branch {
         bytes: bytes(&left).saturating_add(bytes(&right)),
         newlines: newlines(&left).saturating_add(newlines(&right)),
-        height: height(&left).max(height(&right)).saturating_add(1),
+        height: taller_child(height(&left), height(&right)).saturating_add(1),
         left,
         right,
     })
+}
+
+trust_contract_fn! {
+    /// The taller of two subtree heights, the one a branch over them stands
+    /// one above: never below either child, and always one of them.
+    fn taller_child(left: u8, right: u8) -> u8
+    clauses [ensures result >= left && result >= right by taller_child_covers_both
+             ensures result == left || result == right by taller_child_is_a_child]
+    {
+        if left < right { right } else { left }
+    }
+}
+
+// Specs `taller-child-covers-both` and `taller-child-is-a-child` (SPECS.md),
+// kernel-checked against the compiled body: one case split on its comparison.
+verify_island! {
+    clean {
+        theorem taller_child_covers_both (left right : UInt8) :
+            And (Nat.le (UInt8.toNat left) (UInt8.toNat (trust_import_amacs__text__taller_child left right)))
+                (Nat.le (UInt8.toNat right) (UInt8.toNat (trust_import_amacs__text__taller_child left right))) :=
+          @Decidable.casesOn (LT.lt left right)
+            (fun (d : Decidable (LT.lt left right)) =>
+              And (Nat.le (UInt8.toNat left) (UInt8.toNat (@ite UInt8 (LT.lt left right) d right left)))
+                  (Nat.le (UInt8.toNat right) (UInt8.toNat (@ite UInt8 (LT.lt left right) d right left))))
+            (instDecidableUInt8Lt left right)
+            (fun (h : Not (LT.lt left right)) =>
+              And.intro (Nat.le_refl (UInt8.toNat left)) (Nat.ge_of_not_lt h))
+            (fun (h : LT.lt left right) =>
+              And.intro (Nat.le_of_lt h) (Nat.le_refl (UInt8.toNat right)))
+
+        theorem taller_child_is_a_child (left right : UInt8) :
+            Or (Eq (trust_import_amacs__text__taller_child left right) left)
+               (Eq (trust_import_amacs__text__taller_child left right) right) :=
+          @Decidable.casesOn (LT.lt left right)
+            (fun (d : Decidable (LT.lt left right)) =>
+              Or (Eq (@ite UInt8 (LT.lt left right) d right left) left)
+                 (Eq (@ite UInt8 (LT.lt left right) d right left) right))
+            (instDecidableUInt8Lt left right)
+            (fun (_ : Not (LT.lt left right)) => Or.inl (Eq.refl left))
+            (fun (_ : LT.lt left right) => Or.inr (Eq.refl right))
+    }
 }
 
 fn concat(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
@@ -333,7 +374,10 @@ fn chunk_count(node: &Node) -> usize {
 fn is_boundary(node: &Node, offset: usize) -> bool {
     match node {
         Node::Empty => offset == 0,
-        Node::Leaf { text, .. } => text.is_char_boundary(offset),
+        Node::Leaf { text, .. } => text
+            .as_bytes()
+            .get(offset)
+            .map_or(offset == text.len(), |&byte| utf8_char_start(byte)),
         Node::Branch { left, right, .. } => {
             let left_bytes = bytes(left);
             if offset < left_bytes {
@@ -344,6 +388,31 @@ fn is_boundary(node: &Node, offset: usize) -> bool {
                 is_boundary(right, offset - left_bytes)
             }
         }
+    }
+}
+
+trust_contract_fn! {
+    /// Whether a character starts at a byte of UTF-8 text: an ASCII byte
+    /// (below 0x80) or a lead byte (0xC0 and up), never a continuation byte
+    /// (0x80..=0xBF). Inside a leaf, the char boundaries are exactly the
+    /// offsets of such bytes, and its end.
+    #[expect(
+        clippy::manual_range_contains,
+        reason = "Trust kernel-imports a bool tree of comparisons, not a call to `Range::contains` (E6 refuses calls)"
+    )]
+    fn utf8_char_start(byte: u8) -> bool
+    clauses [ensures result == (byte < 128 || byte >= 192) by utf8_char_start_skips_continuations]
+    {
+        byte < 0x80 || byte >= 0xC0
+    }
+}
+
+// Spec `utf8-char-start` (SPECS.md), kernel-checked against the compiled body.
+verify_island! {
+    clean {
+        theorem utf8_char_start_skips_continuations (byte : UInt8) :
+            trust_import_amacs__text__utf8_char_start byte = (decide (byte < 128) || decide (192 <= byte)) := by
+          simp only [trust_import_amacs__text__utf8_char_start]
     }
 }
 
@@ -369,6 +438,24 @@ impl Eq for TextRope {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contracted_scalar_core_matches_the_std_forms_it_replaced() {
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(utf8_char_start(byte), !(0x80..=0xBF).contains(&byte));
+            for other in u8::MIN..=u8::MAX {
+                assert_eq!(taller_child(byte, other), byte.max(other));
+            }
+        }
+        let source = "a\u{e9}\u{20ac}\u{1f980}\n".repeat(400);
+        let rope = TextRope::from(source.as_str());
+        for offset in 0..=source.len().saturating_add(2) {
+            assert_eq!(
+                rope.is_char_boundary(offset),
+                source.is_char_boundary(offset)
+            );
+        }
+    }
 
     #[test]
     fn large_text_is_chunked_balanced_and_round_trips() {

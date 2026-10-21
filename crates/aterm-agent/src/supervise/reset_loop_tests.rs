@@ -7,7 +7,7 @@
 // ([`ResetWorld`]) and a scripted host ([`ResetHost`]).
 //
 // NOTHING HERE HAS BEEN SEEN. Every screen the world shows is COMPOSED from
-// the 2.1.287 bundle's texts (`aterm_phase::reset::fixtures`, each saying so
+// the 2.1.304 bundle's texts (`aterm_phase::reset::fixtures`, each saying so
 // on its first line) and every transition of it is READ there, never
 // observed: these tests pin what the loop does with the reset program as the
 // bundle describes it, and say nothing of a real wall.
@@ -43,12 +43,13 @@ fn placed(when: &str) -> i64 {
 /// The whole of the confirmation's body and detail as the composed fixture
 /// draws it, joined as the reader joins it.
 const RESET_HEAD: &str = "Refills your weekly limit now · your weekly reset day stays Oct 9 at 5am \
-                          2 resets left · use by Oct 5 at 3pm";
+                          2 weekly resets left · use by Oct 5 at 3pm";
 
 /// A reset spent, as a host reads it: the vendor queued its own
 /// continuation.
 fn spent() -> ResetOutcome {
     ResetOutcome::Spent {
+        kind: aterm_phase::ResetKind::Weekly,
         asks: false,
         left: Some(1),
         cleared_at: TEST_NOW,
@@ -61,7 +62,7 @@ fn spent() -> ResetOutcome {
 /// generation and the yes row as drawn — waits out `Resetting…`, and tells
 /// its host once. THOSE THREE KEYS AND NOTHING ELSE: no `send`, no `turn`,
 /// no arrow at the confirmation. The row is an `APPROVED` line; the spend is
-/// said (`RESET … used (1 left)`); the ledger holds the row, the yes and the
+/// said (`RESET … used (1 weekly reset left)`); the ledger holds the row, the yes and the
 /// step's end, and no typed act; nothing is asked of the owner.
 ///
 /// NEGATIVE CONTROL: with the host's `No` the dialog gets the wait row by
@@ -93,7 +94,7 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
             ),
             format!(
                 "key if-human=0 if-gen=* if={} enter",
-                guard_of("   ❯ Yes, use my reset")
+                guard_of("   ❯ Yes, use my weekly reset")
             ),
         ],
         "{:#?}",
@@ -115,14 +116,14 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
     // the Enter, and told the end once, with the offer the confirmation
     // showed.
     let ask = format!(
-        "take left=2 day=Oct 5 day_start=Some({})",
+        "take kind=weekly left=2 day=Oct 5 day_start=Some({})",
         placed("Oct 5 at 12am")
     );
     assert_eq!(host.said("take"), [ask.clone(), ask]);
     assert_eq!(
         host.said("told"),
         [format!(
-            "told entered=true kept=- offer=Some((2, Some({}))) last=false",
+            "told entered=true kept=- offer=weekly 2 Some({}) last=false",
             placed("Oct 5 at 3pm")
         )]
     );
@@ -136,9 +137,8 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
         run.lines
     );
     assert!(
-        run.lines.iter().any(
-            |l| l.starts_with("RESET seq=") && l.ends_with("rule=limit-reset@v1 used (1 left)")
-        ),
+        run.lines.iter().any(|l| l.starts_with("RESET seq=")
+            && l.ends_with("rule=limit-reset@v1 used (1 weekly reset left)")),
         "{:#?}",
         run.lines
     );
@@ -155,7 +155,7 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
         run.rows(),
         [
             format!("approved|{RESET_GRANT}|taken: wall until {}", host.until),
-            format!("approved|Yes, use my reset|{RESET_HEAD}"),
+            format!("approved|Yes, use my weekly reset|{RESET_HEAD}"),
             "waiting|limit reset|ended: used".to_string(),
         ]
     );
@@ -316,6 +316,68 @@ fn a_gate_of_the_loops_shut_passes_the_reset_over_before_the_host_is_asked() {
     assert!(said[0].ends_with("rule=limit-reset@v1 gate=no-host"));
 }
 
+/// A SPEND IS SAID, WHATEVER IT LEFT STANDING: after the whole path, a host
+/// that read the still-walled line (`ResetOutcome::Walled`, a reset spent
+/// at a wall it did not lift) has the step say `RESET … used (no Fable
+/// resets left), the wall still stands` — a line, not a journal note — book
+/// `ended: used`, and leave the ONE continuation a kept reset leaves owed,
+/// typed under `usage-resume@v1`; and a spend whose line named no count
+/// (`Spent { left: None }`) is said `used (weekly reset)`, booked the same,
+/// with nothing typed (the vendor queued its own continuation). NEGATIVE
+/// CONTROL: a reset kept is noted, never said (the early-use test), and the
+/// whole path's spend is said with its count.
+#[test]
+fn a_walled_or_countless_spend_is_said_and_booked_as_used() {
+    let walled = ResetOutcome::Walled {
+        kind: aterm_phase::ResetKind::Fable,
+        left: 0,
+    };
+    let countless = ResetOutcome::Spent {
+        kind: aterm_phase::ResetKind::Weekly,
+        asks: false,
+        left: None,
+        cleared_at: TEST_NOW,
+    };
+    for (tag, outcome, words, typed) in [
+        (
+            "walled",
+            walled,
+            "used (no Fable resets left), the wall still stands",
+            1,
+        ),
+        ("countless", countless, "used (weekly reset)", 0),
+    ] {
+        let host = ResetHost::reading(outcome);
+        let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
+        let run = reset_watch(tag, &mut m, reset_opts(&host, true, 120), &fresh, |_| {});
+        assert_eq!(
+            reset_keys(&m),
+            ["down@dialog", "enter@dialog", "enter@confirm"],
+            "{tag}"
+        );
+        let said = format!("rule=limit-reset@v1 {words}");
+        assert!(
+            run.lines
+                .iter()
+                .any(|l| l.starts_with("RESET seq=") && l.ends_with(&said)),
+            "{tag}: said, not only noted: {:#?}",
+            run.lines
+        );
+        assert_eq!(
+            run.rows().last().map(String::as_str),
+            Some("waiting|limit reset|ended: used"),
+            "{tag}"
+        );
+        assert_eq!(run.typed().len(), typed, "{tag}: {:#?}", run.ledger);
+        if typed > 0 {
+            assert!(run.typed()[0].contains("usage-resume@v1"), "{tag}");
+        }
+        assert_eq!(count(&m, "send"), 0, "{tag}");
+        assert_eq!(m.attention, None, "{tag}");
+        assert_eq!(reset_violations(&m, &host), Vec::<String>::new(), "{tag}");
+    }
+}
+
 /// THE EARLY-USE CONFIRMATION — the vendor's line that the limit is not
 /// reached — is ESCAPED, never entered: one `key if-human=<n> if=<the title
 /// row> esc`, the reset kept (`inexact-early`), the ledger's `declined` row
@@ -345,7 +407,13 @@ fn the_early_use_confirmation_is_escaped_and_one_continuation_is_owed() {
     let presses = m.presses();
     assert_eq!(
         presses.last().map(|r| r.as_str()),
-        Some(format!("key if-human=0 if={} esc", guard_of("   Use your reset?")).as_str()),
+        Some(
+            format!(
+                "key if-human=0 if={} esc",
+                guard_of("   Use a weekly reset?")
+            )
+            .as_str()
+        ),
         "{presses:#?}"
     );
     assert_eq!(reset_world(&mut m).yes_taken, 0);
@@ -360,7 +428,7 @@ fn the_early_use_confirmation_is_escaped_and_one_continuation_is_owed() {
         run.rows(),
         [
             format!("approved|{RESET_GRANT}|taken: wall until {}", host.until),
-            "declined|Use your reset?|inexact-early".to_string(),
+            "declined|Use a weekly reset?|inexact-early".to_string(),
             "waiting|limit reset|ended: kept".to_string(),
         ]
     );
@@ -418,249 +486,244 @@ fn a_confirmation_with_the_focus_on_no_is_escaped_never_arrowed() {
     assert_eq!(
         host.said("told"),
         [format!(
-            "told entered=false kept=focus offer=Some((2, Some({}))) last=false",
+            "told entered=false kept=focus offer=weekly 2 Some({}) last=false",
             placed("Oct 5 at 3pm")
         )]
     );
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// CLAUDE CODE 2.1.304'S LONE RESET takes the whole path's three keys: the
-/// row of a full reset, the only reset on offer (the reader's composed
-/// dialog), is entered, then its confirmation's `Yes, use my full reset`;
-/// the host is asked with the row's kind, and told the end with the offer
-/// the confirmation showed. NEGATIVE CONTROL: the same row whose
-/// confirmation mounts for a weekly reset is escaped, the reset kept for its
-/// kind, nothing spent.
+/// A KIND DRAWN BESIDE THE ROW WHILE THE ARROWS MOVE (the resets spec's
+/// R2): the full reset, the one reset on offer when the dialog was decided,
+/// is reached; as the arrow lands, the dialog draws another kind's row
+/// (2.1.304 draws a row per kind as its offers come in, and its Select keeps
+/// the focus on the row's value, so the cursor stays on the full reset) —
+/// a weekly reset ABOVE it, or a Fable reset UNDER it. Two kinds are then on
+/// offer and which to spend is the owner's, so the full reset's row is NOT
+/// entered: the press is `Press::Changed`, the dialog is decided again on
+/// what is drawn and gets its wait row, the host is told its claim was kept
+/// (`not-opened`), and nothing is spent. NEGATIVE CONTROL: the same dialog
+/// with no row drawn enters the full reset's row and its confirmation.
 #[test]
-fn claude_code_2_1_304s_lone_reset_is_entered_and_another_kinds_confirmation_is_kept() {
+fn a_kind_drawn_beside_the_row_as_the_arrow_lands_is_never_entered() {
     use aterm_phase::prompt::fixtures::screen;
     use aterm_phase::reset::fixtures as f;
-    const FULL: &str = "Use a full reset (2 left, until Oct 5)";
-    const HEAD: &str = "Refills your session and weekly limits now · your weekly reset day stays \
-                        Oct 9 at 5am 2 full resets left · use by Oct 5 at 3pm";
-    let kinds = |host: &ResetHost, grant: &str, confirm: Vec<String>, exact: bool| {
-        let rows = [RESET_STOP, grant, RESET_WAIT, RESET_CREDITS];
-        let mut m = reset_mock(vec![], &rows, 0, host);
-        let world = reset_world(&mut m);
-        world.grant = grant.to_string();
-        world.confirm = confirm;
-        world.exact = exact;
-        world.resetting = screen(f::KINDS_RESETTING);
-        m
-    };
-    let host = ResetHost::reading(spent());
-    let mut m = kinds(&host, FULL, screen(f::KINDS_CONFIRM), true);
-    let run = reset_watch(
-        "kinds",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    let presses: Vec<String> = m.presses().iter().map(|r| ungen(r)).collect();
-    assert_eq!(
-        presses,
-        [
-            format!(
-                "key if-human=0 if-gen=* if={} down",
-                guard_of("   What do you want to do?")
-            ),
-            format!(
-                "key if-human=0 if-gen=* if={} enter",
-                guard_of(&format!("   ❯ 2. {FULL}"))
-            ),
-            format!(
-                "key if-human=0 if-gen=* if={} enter",
-                guard_of("   ❯ Yes, use my full reset")
-            ),
-        ],
-        "{:#?}",
-        m.requests
-    );
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"]
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    assert_eq!(reset_world(&mut m).chosen, [FULL]);
-    let ask = format!(
-        "take left=2 day=Oct 5 day_start=Some({}) kind=full",
-        placed("Oct 5 at 12am")
-    );
-    assert_eq!(host.said("take"), [ask.clone(), ask]);
-    assert_eq!(
-        host.said("told"),
-        [format!(
-            "told entered=true kept=- offer=Some((2, Some({}))) last=false",
-            placed("Oct 5 at 3pm")
-        )]
-    );
-    assert_eq!(
-        run.rows(),
-        [
-            format!("approved|{FULL}|taken: wall until {}", host.until),
-            format!("approved|Yes, use my reset|{HEAD}"),
-            "waiting|limit reset|ended: used".to_string(),
-        ]
-    );
-    assert_eq!(run.typed(), Vec::<&str>::new());
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-
-    // THE CONTROL: the confirmation is a weekly reset's.
-    let weekly: Vec<String> = screen(f::KINDS_CONFIRM)
-        .iter()
-        .map(|row| row.replace("full reset", "weekly reset"))
-        .collect();
-    let host = ResetHost::reading(ResetOutcome::Kept);
-    let mut m = kinds(&host, FULL, weekly, false);
-    let run = reset_watch(
-        "kinds-other",
-        &mut m,
-        reset_opts(&host, true, 120),
-        &fresh,
-        |_| {},
-    );
-    assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "esc@confirm"],
-        "{:#?}",
-        run.journal
-    );
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
-    assert_eq!(
-        host.said("told"),
-        [format!(
-            "told entered=false kept=kind offer=Some((2, Some({}))) last=false",
-            placed("Oct 5 at 3pm")
-        )]
-    );
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
-    // A current confirmation cannot borrow an old grant, and an external
-    // host's partial grant still cannot authorize the global account clear.
-    for (name, grant, confirm) in [
-        ("legacy-cross-kind", RESET_GRANT, screen(f::KINDS_CONFIRM)),
-        (
-            "partial-kind",
-            "Use a 5-hour reset (2 left, until Oct 5)",
-            screen(f::KINDS_CONFIRM)
-                .into_iter()
-                .map(|row| {
-                    row.replace("full reset", "5-hour reset")
-                        .replace("2 5-hour resets left", "2 five-hour resets left")
-                        .replace(
-                            "Refills your session and weekly limits now",
-                            "Refills your session limit now",
-                        )
-                })
-                .collect(),
-        ),
-    ] {
-        let mut host = ResetHost::reading(ResetOutcome::Kept);
-        if name == "partial-kind" {
-            Arc::get_mut(&mut host)
-                .expect("unshared scripted host")
-                .limits = vec!["session".to_string()];
-        }
-        let mut m = kinds(&host, grant, confirm, false);
-        let run = reset_watch(name, &mut m, reset_opts(&host, true, 120), &fresh, |_| {});
-        assert_eq!(
-            reset_keys(&m),
-            ["down@dialog", "enter@dialog", "esc@confirm"],
-            "{name}: {:?}\n{:?}",
-            m.requests,
-            run.journal
-        );
-        assert_eq!(reset_world(&mut m).yes_taken, 0, "{name}");
-        assert!(
-            reset_violations(&m, &host).is_empty(),
-            "{name}: {:?}",
-            run.journal
-        );
-    }
-}
-
-/// A KIND DRAWN UNDER THE ROW WHILE THE ARROWS MOVE: the full reset, the one
-/// reset on offer when the dialog was decided, is reached; as the arrow
-/// lands, the dialog draws a Fable reset's row under it (2.1.304 draws a row
-/// per kind as its offers come in). Two kinds are then on offer and which to
-/// spend is the owner's, so the full reset's row is NOT entered: the host is
-/// told its claim was kept (`not-opened`), and the dialog gets its wait row,
-/// nothing spent. NEGATIVE CONTROL: the same dialog with no row drawn enters
-/// the full reset's row and its confirmation (the lone reset above).
-#[test]
-fn a_kind_drawn_under_the_row_as_the_arrow_lands_is_never_entered() {
-    use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::reset::fixtures as f;
-    const FULL: &str = "Use a full reset (2 left, until Oct 5)";
+    const FULL: &str = "Use a full reset (1 left, until Oct 5)";
     const FABLE: &str =
         "Use a Fable reset (1 left, until Oct 6) · frees up only what Fable used this week";
     let rows = [RESET_STOP, FULL, RESET_WAIT, RESET_CREDITS];
-    let world = |host: &ResetHost, drawn: Option<(usize, String)>| {
+    let world = |host: &ResetHost, drawn: Option<(usize, &str)>| {
         let mut m = reset_mock(vec![], &rows, 0, host);
         let world = reset_world(&mut m);
         world.grant = FULL.to_string();
-        world.confirm = screen(f::KINDS_CONFIRM);
-        world.resetting = screen(f::KINDS_RESETTING);
-        world.drawn_at_arrow = drawn;
+        world.confirm = screen(f::CONFIRM_FULL);
+        world.drawn_at_arrow = drawn.map(|(at, label)| (at, label.to_string()));
         m
     };
+    for (tag, at, label, labels) in [
+        (
+            "weekly-above",
+            1,
+            RESET_GRANT,
+            [RESET_STOP, RESET_GRANT, FULL, RESET_WAIT, RESET_CREDITS],
+        ),
+        (
+            "fable-under",
+            2,
+            FABLE,
+            [RESET_STOP, FULL, FABLE, RESET_WAIT, RESET_CREDITS],
+        ),
+    ] {
+        let host = ResetHost::reading(spent());
+        let mut m = world(&host, Some((at, label)));
+        let run = reset_watch(tag, &mut m, reset_opts(&host, true, 120), &fresh, |_| {});
+        assert_eq!(
+            reset_world(&mut m).labels,
+            labels,
+            "{tag}: the row was drawn"
+        );
+        assert_eq!(
+            reset_world(&mut m).chosen,
+            [RESET_WAIT],
+            "{tag}: {:#?}",
+            run.journal
+        );
+        assert_eq!(reset_world(&mut m).yes_taken, 0, "{tag}");
+        assert!(
+            reset_keys(&m).iter().all(|k| k.ends_with("@dialog")),
+            "{tag}: {:?}",
+            reset_keys(&m)
+        );
+        assert_eq!(
+            host.said("told"),
+            ["told entered=false kept=not-opened offer=None last=true"],
+            "{tag}: {:#?}",
+            run.journal
+        );
+        assert!(
+            run.rows().iter().all(|r| !r.starts_with("approved|")),
+            "{tag}: {:#?}",
+            run.rows()
+        );
+        assert_eq!(reset_violations(&m, &host), Vec::<String>::new(), "{tag}");
+    }
+
+    // THE CONTROL: no row drawn, the lone full reset's row and its
+    // confirmation are entered.
     let host = ResetHost::reading(spent());
-    let mut m = world(&host, Some((2, FABLE.to_string())));
+    let mut m = world(&host, None);
     let run = reset_watch(
-        "kind-drawn",
+        "none-drawn",
         &mut m,
         reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(
+        reset_keys(&m),
+        ["down@dialog", "enter@dialog", "enter@confirm"],
+        "{:#?}",
+        run.journal
+    );
+    assert_eq!(reset_world(&mut m).chosen, [FULL]);
+    assert_eq!(reset_world(&mut m).yes_taken, 1);
+    assert!(
+        run.rows()
+            .iter()
+            .any(|r| r.starts_with("approved|Yes, use my full reset|")),
+        "{:#?}",
+        run.rows()
+    );
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+}
+
+/// UNDER THE OWNER'S ORDER (`[harness] limit_reset_kinds`, the resets
+/// spec's R2) THE ROW'S PRESS READS THE DIALOG AGAIN BY THAT ORDER, as the
+/// row was chosen ([`Session::reset_take`] keeps it). As the arrow lands a
+/// weekly reset is drawn above the full reset the dialog was decided on:
+///
+/// * under `["full", "weekly"]`, the full reset is still the first listed
+///   kind on offer, so its row and confirmation are entered at once, the
+///   host asked twice (the row, then the Enter) — with no list (the test
+///   above) two on offer would leave it unentered;
+/// * under `["weekly", "full"]`, with a 5-hour reset on offer beside the
+///   full one from the first read, the weekly reset is now the row the rule
+///   takes, so the full reset's row is NOT entered and nothing is spent.
+///   NEGATIVE CONTROL (seen by mutation): a press that read the dialog again
+///   by the lone-offer rule finds no row of its own in the first read (two
+///   on offer), checks nothing, and enters the full reset;
+/// * and with nothing drawn, a dialog with two on offer from its first read
+///   has the listed kind taken and spent under `["full"]` — the policy's
+///   context carries the list (`BoxFacts` into `ApprovalCtx`) — where with
+///   no list it gets the wait row.
+#[test]
+fn under_the_owners_order_the_press_reads_the_dialog_again_by_that_order() {
+    use aterm_phase::ResetKind::{Full, Weekly};
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::reset::fixtures as f;
+    const FULL: &str = "Use a full reset (1 left, until Oct 5)";
+    const SESSION: &str = "Use a 5-hour reset (2 left, until Oct 5)";
+    let world = |host: &ResetHost, rows: &[&str], drawn: bool| {
+        let mut m = reset_mock(vec![], rows, 0, host);
+        let world = reset_world(&mut m);
+        world.grant = FULL.to_string();
+        world.confirm = screen(f::CONFIRM_FULL);
+        world.drawn_at_arrow = drawn.then(|| (1, RESET_GRANT.to_string()));
+        m
+    };
+    let listed = |host: &std::sync::Arc<ResetHost>, order: Vec<aterm_phase::ResetKind>| {
+        let mut opts = reset_opts(host, true, 120);
+        opts.policy.limit_reset_kinds = order;
+        opts
+    };
+    // The full reset first: still the row the rule takes, entered.
+    let host = ResetHost::reading(spent());
+    let mut m = world(&host, &[RESET_STOP, FULL, RESET_WAIT, RESET_CREDITS], true);
+    let run = reset_watch(
+        "full-first",
+        &mut m,
+        listed(&host, vec![Full, Weekly]),
         &fresh,
         |_| {},
     );
     assert_eq!(
         reset_world(&mut m).labels,
-        [RESET_STOP, FULL, FABLE, RESET_WAIT, RESET_CREDITS],
+        [RESET_STOP, RESET_GRANT, FULL, RESET_WAIT, RESET_CREDITS],
         "the row was drawn"
     );
     assert_eq!(
-        reset_world(&mut m).chosen,
-        [RESET_WAIT],
+        reset_keys(&m),
+        ["down@dialog", "enter@dialog", "enter@confirm"],
         "{:#?}",
         run.journal
     );
-    assert_eq!(reset_world(&mut m).yes_taken, 0);
-    assert!(
-        reset_keys(&m).iter().all(|k| k.ends_with("@dialog")),
-        "{:?}",
-        reset_keys(&m)
-    );
-    assert_eq!(
-        host.said("told"),
-        ["told entered=false kept=not-opened offer=None last=true"],
-        "{:#?}",
-        run.journal
-    );
-    assert!(
-        run.rows().iter().all(|r| !r.starts_with("approved|")),
-        "{:#?}",
-        run.rows()
-    );
+    assert_eq!(host.said("take").len(), 2, "{:#?}", run.journal);
+    assert_eq!(reset_world(&mut m).chosen, [FULL]);
+    assert_eq!(reset_world(&mut m).yes_taken, 1);
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 
-    // THE CONTROL: no row drawn, the lone full reset is taken.
+    // The weekly reset first: the full reset's row is no longer the rule's.
     let host = ResetHost::reading(spent());
-    let mut m = world(&host, None);
-    let _ = reset_watch(
-        "kind-alone",
+    let mut m = world(
+        &host,
+        &[RESET_STOP, FULL, SESSION, RESET_WAIT, RESET_CREDITS],
+        true,
+    );
+    let run = reset_watch(
+        "weekly-first",
         &mut m,
-        reset_opts(&host, true, 120),
+        listed(&host, vec![Weekly, Full]),
         &fresh,
         |_| {},
     );
     assert_eq!(
-        reset_keys(&m),
-        ["down@dialog", "enter@dialog", "enter@confirm"]
+        reset_world(&mut m).labels,
+        [
+            RESET_STOP,
+            RESET_GRANT,
+            FULL,
+            SESSION,
+            RESET_WAIT,
+            RESET_CREDITS
+        ],
+        "the row was drawn"
     );
-    assert_eq!(reset_world(&mut m).chosen, [FULL]);
-    assert_eq!(reset_world(&mut m).yes_taken, 1);
-    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+    assert!(
+        !reset_world(&mut m).chosen.iter().any(|c| c == FULL),
+        "{:#?}",
+        run.journal
+    );
+    assert_eq!(reset_world(&mut m).yes_taken, 0, "{:#?}", run.journal);
+
+    // Two on offer from the first read and nothing drawn: the listed kind
+    // is taken and spent, where with no list the dialog is the wait row's.
+    for (order, chosen, yes) in [(vec![Full], FULL, 1), (vec![], RESET_WAIT, 0)] {
+        let host = ResetHost::reading(spent());
+        let mut m = world(
+            &host,
+            &[RESET_STOP, FULL, SESSION, RESET_WAIT, RESET_CREDITS],
+            false,
+        );
+        let run = reset_watch(
+            "two-on-offer",
+            &mut m,
+            listed(&host, order.clone()),
+            &fresh,
+            |_| {},
+        );
+        assert_eq!(
+            reset_world(&mut m).chosen,
+            [chosen],
+            "{order:?}: {:#?}",
+            run.journal
+        );
+        assert_eq!(reset_world(&mut m).yes_taken, yes, "{order:?}");
+        assert_eq!(
+            reset_violations(&m, &host),
+            Vec::<String>::new(),
+            "{order:?}"
+        );
+    }
 }
 
 /// THE CLAIM IS ASKED ABOUT AGAIN before the Enter, and anything but the
@@ -975,6 +1038,97 @@ fn at_the_confirmation(host: &Arc<ResetHost>, confirm: Option<Vec<String>>) -> M
     m
 }
 
+/// A CONFIRMATION OF ANOTHER KIND THAN THE ROW TAKEN IS KEPT (the resets
+/// spec's R11): the 5-hour row taken, at a wall drawn by both the session's
+/// and the week's names, the box that mounts is the WEEKLY reset's — exact
+/// as it reads, its count and day the row's — and it is Escaped (`kind`):
+/// no reset spent, the host told it was kept. Every other check would have
+/// entered it: only the kind tells it from the row's own. NEGATIVE CONTROL:
+/// the same row with its own confirmation (`Use a 5-hour reset?`, `2
+/// five-hour resets left`) is entered, the ask naming the row's kind, and
+/// the ledger's Enter names that kind's yes.
+#[test]
+fn a_confirmation_of_another_kind_than_the_row_is_kept() {
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::reset::fixtures as composed;
+    const SESSION: &str = "Use a 5-hour reset (2 left, until Oct 5)";
+    let rows = [RESET_STOP, SESSION, RESET_WAIT, RESET_CREDITS];
+    let world = |host: &Arc<ResetHost>, confirm: &str, exact: bool| {
+        let mut m = reset_mock(vec![], &rows, 0, host);
+        let w = reset_world(&mut m);
+        w.grant = SESSION.to_string();
+        w.confirm = screen(confirm);
+        w.exact = exact;
+        m
+    };
+
+    // The control: the row's own confirmation, entered.
+    let host = ResetHost::reading_at(spent(), &["session", "weekly"]);
+    let mut m = world(&host, composed::CONFIRM_SESSION, true);
+    let run = reset_watch(
+        "own-kind",
+        &mut m,
+        reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(
+        reset_keys(&m),
+        ["down@dialog", "enter@dialog", "enter@confirm"],
+        "{:#?}",
+        run.journal
+    );
+    assert_eq!(reset_world(&mut m).yes_taken, 1);
+    assert_eq!(reset_world(&mut m).chosen, [SESSION]);
+    let takes = host.said("take");
+    assert!(
+        !takes.is_empty()
+            && takes
+                .iter()
+                .all(|t| t.starts_with("take kind=session left=2 ")),
+        "{takes:?}"
+    );
+    assert!(
+        run.rows()
+            .iter()
+            .any(|r| r.starts_with("approved|Yes, use my 5-hour reset|Refills your session")),
+        "{:#?}",
+        run.rows()
+    );
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+
+    // Another kind's confirmation after the same row: kept.
+    let host = ResetHost::reading_at(ResetOutcome::Kept, &["session", "weekly"]);
+    let mut m = world(&host, composed::CONFIRM, false);
+    let run = reset_watch(
+        "other-kind",
+        &mut m,
+        reset_opts(&host, true, 120),
+        &fresh,
+        |_| {},
+    );
+    assert_eq!(
+        reset_keys(&m),
+        ["down@dialog", "enter@dialog", "esc@confirm"],
+        "{:#?}",
+        run.journal
+    );
+    assert_eq!(reset_world(&mut m).yes_taken, 0, "no reset spent");
+    assert!(
+        run.rows()
+            .contains(&"declined|Use a weekly reset?|kind".to_string()),
+        "{:#?}",
+        run.rows()
+    );
+    let told = host.said("told");
+    assert!(
+        told.len() == 1 && told[0].starts_with("told entered=false kept=kind "),
+        "{told:?}"
+    );
+    assert_eq!(m.attention, None);
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+}
+
 /// A host whose key is off under a world an earlier loop left its step in:
 /// the claim that loop was given still stands, its row taken (`ph`: 1, or 2
 /// where the confirmation's Enter was written), and nobody will be told how
@@ -985,11 +1139,28 @@ fn key_off_after(m: &mut Mock, host: &ResetHost, ph: i64) {
     reset_world(m).untold = true;
 }
 
+/// What the `declined` row of a successor's Escape names on the world's
+/// confirmation: its title as drawn (`Use a weekly reset?`), or, where none
+/// is drawn, the untitled name — a successor holds no go whose kind would
+/// name one.
+fn declined_as(m: &mut Mock) -> String {
+    reset_world(m)
+        .confirm
+        .iter()
+        .find(|row| aterm_phase::reset_title(row).is_some())
+        .map_or_else(
+            || "the reset confirmation".to_string(),
+            |row| row.trim().to_string(),
+        )
+}
+
 /// What a key-off successor's step left, the same at every confirmation it
 /// meets: ONE key, the Escape, no reset spent; the host neither asked nor
 /// told nor left a record; the earlier loop's row, the `declined` row and
 /// the `waiting` row that ends the step untold; nothing typed, nothing
-/// continued, no badge; and no key the model forbids.
+/// continued, no badge; and no key the model forbids. The `declined` row
+/// names the confirmation's title as drawn, or — on a box whose title is
+/// reworded or off the pane, a successor holding no go — the untitled name.
 fn assert_ended_untold(tag: &str, m: &mut Mock, host: &ResetHost, run: &ResetRun) {
     assert_eq!(reset_keys(m), ["esc@confirm"], "{tag}: {:#?}", run.journal);
     assert_eq!(reset_world(m).yes_taken, 0, "{tag}");
@@ -998,7 +1169,7 @@ fn assert_ended_untold(tag: &str, m: &mut Mock, host: &ResetHost, run: &ResetRun
         run.rows(),
         [
             format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
-            "declined|Use your reset?|successor".to_string(),
+            format!("declined|{}|successor", declined_as(m)),
             "waiting|limit reset|ended: untold (key off)".to_string(),
         ],
         "{tag}"
@@ -1055,7 +1226,7 @@ fn a_successor_escapes_the_confirmation_and_never_enters_it() {
     assert_eq!(
         host.said("told"),
         [format!(
-            "told entered=false kept=successor offer=Some((2, Some({}))) last=false",
+            "told entered=false kept=successor offer=weekly 2 Some({}) last=false",
             placed("Oct 5 at 3pm")
         )]
     );
@@ -1064,7 +1235,7 @@ fn a_successor_escapes_the_confirmation_and_never_enters_it() {
         run.rows(),
         [
             format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
-            "declined|Use your reset?|successor".to_string(),
+            "declined|Use a weekly reset?|successor".to_string(),
             "waiting|limit reset|ended: kept".to_string(),
         ]
     );
@@ -1141,7 +1312,7 @@ fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
         run.rows(),
         [
             format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
-            "declined|Use your reset?|successor".to_string(),
+            "declined|the reset confirmation|successor".to_string(),
             "waiting|limit reset|ended: kept".to_string(),
         ]
     );
@@ -1160,6 +1331,116 @@ fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
         |_| {},
     );
     assert_ended_untold("successor-key-off", &mut m, &host, &run);
+}
+
+/// The weekly reset's confirmation in Claude Code 2.1.304's SCREEN-READER
+/// layout (`sr` @234846790 draws `oir` @234804179 where `ot()` says a
+/// screen reader is on): the title and body as ever, then LETTERED answers
+/// and a typed one — `y. Yes, use my weekly reset`, `n. No, keep it`,
+/// `Enter y/n: `. COMPOSED, never captured. The reader takes no box from it
+/// (no option is read), so only its title says it is the confirmation.
+fn screen_reader_confirmation() -> Vec<String> {
+    let rows = confirm_frame(&[
+        "   Use a weekly reset?",
+        "",
+        "   Refills your weekly limit now · your weekly reset day stays Oct 9 at 5am",
+        "   2 weekly resets left · use by Oct 5 at 3pm",
+        "",
+        "   y. Yes, use my weekly reset",
+        "   n. No, keep it",
+        "   Enter y/n: ",
+        "",
+        "   Enter to confirm · Esc to cancel",
+    ]);
+    let read = aterm_phase::read(Some("claude"), &rows, None);
+    assert!(read.prompt.is_none(), "no box is read: {:#?}", read.prompt);
+    rows
+}
+
+/// A CONFIRMATION WITH NO BOX THE READER TAKES, ITS TITLE STILL UP, IS THE
+/// STEP'S UNTIL ITS ENTER IS WRITTEN (`reset_shows`: an owed step whose Enter
+/// was not written reads a `Use a <kind>?` row as its confirmation,
+/// `inexact-options`): a successor facing 2.1.304's screen-reader layout
+/// ([`screen_reader_confirmation`]) Escapes it once it has stood one
+/// person's grace, under the guard of the TITLE row (the vendor's Escape
+/// keeps the reset there too), and never types `y` or presses Enter: no
+/// reset spent. NEGATIVE CONTROL: once the earlier loop's Enter is on the
+/// ledger the title stands over the vendor's claim, and nothing is keyed on
+/// it at all, for five times the grace. (Seen by mutation: with the title
+/// test gone from `reset_shows`, the first frame is read as nothing and no
+/// key goes; with it asked after the Enter too, the claim's title is
+/// Escaped.)
+#[test]
+fn a_successor_escapes_a_titled_confirmation_with_no_box_until_its_enter_is_written() {
+    let frame = screen_reader_confirmation();
+    let title = frame
+        .iter()
+        .find(|row| aterm_phase::reset_title(row).is_some())
+        .cloned()
+        .expect("the title row");
+    let host = ResetHost::reading(ResetOutcome::Kept);
+    host.shared.claim.store(1, Ordering::SeqCst);
+    host.shared.ph.store(1, Ordering::SeqCst);
+    let mut m = at_the_confirmation(&host, Some(frame.clone()));
+    let run = reset_watch(
+        "screen-reader",
+        &mut m,
+        reset_opts(&host, true, 1),
+        &taken_row,
+        |_| {},
+    );
+    assert_eq!(reset_keys(&m), ["esc@confirm"], "{:#?}", run.journal);
+    assert_eq!(
+        m.presses().last().map(|r| ungen(r)),
+        Some(format!("key if-human=0 if={} esc", guard_of(&title))),
+        "the guard of the title row"
+    );
+    assert_eq!(reset_world(&mut m).yes_taken, 0);
+    assert_eq!(
+        host.said("told"),
+        ["told entered=false kept=successor offer=None last=false"]
+    );
+    assert_eq!(
+        run.rows(),
+        [
+            format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
+            "declined|Use a weekly reset?|successor".to_string(),
+            "waiting|limit reset|ended: kept".to_string(),
+        ]
+    );
+    assert_eq!(m.attention, None);
+    assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
+
+    // The control: the earlier loop's Enter on the ledger, the same frame.
+    let entered_row = |ledger: &Path| {
+        taken_row(ledger);
+        let yes = aterm_phase::ResetKind::Weekly.yes();
+        let row = approvals::Row {
+            rule_id: "limit-reset@v1",
+            outcome: approvals::Outcome::Approved,
+            command: &yes,
+            reason: RESET_HEAD,
+            box_seq: 9,
+        };
+        let now = crate::supervise::journal::unix_ms();
+        let mut body = std::fs::read_to_string(ledger).expect("the ledger");
+        body.push_str(&format!("{}\n", row.to_json(now, None)));
+        std::fs::write(ledger, body).expect("the ledger");
+    };
+    let host = ResetHost::reading(ResetOutcome::Kept);
+    host.shared.claim.store(1, Ordering::SeqCst);
+    host.shared.ph.store(2, Ordering::SeqCst);
+    let mut m = at_the_confirmation(&host, Some(frame));
+    // The claim's screen stands as long as the watch: five times the grace
+    // after which the same frame was Escaped above.
+    let mut opts = reset_opts(&host, true, 1);
+    opts.max = Duration::from_secs(5);
+    let run = reset_watch("screen-reader-entered", &mut m, opts, &entered_row, |_| {});
+    assert_eq!(reset_keys(&m), Vec::<String>::new(), "{:#?}", run.journal);
+    assert_eq!(m.presses(), Vec::<&String>::new());
+    assert!(reset_world(&mut m).reads > 1, "the frame was read again");
+    assert_eq!(reset_world(&mut m).yes_taken, 0);
+    assert_eq!(m.attention, None);
 }
 
 /// THE YES FULL POWER WOULD TAKE: a key-off successor's first look meets the
@@ -1304,10 +1585,13 @@ fn a_key_off_successor_escapes_a_reworded_consent_and_never_takes_its_yes() {
 fn a_key_off_successor_waits_out_resetting_and_owes_nothing() {
     let entered_row = |ledger: &Path| {
         taken_row(ledger);
+        // The Enter as an OLDER aterm's ledger names it (2.1.287–2.1.303:
+        // `Yes, use my reset`, no kind): read as written all the same
+        // (`approvals::reset_owed`), so the successor never keys.
         let row = approvals::Row {
             rule_id: "limit-reset@v1",
             outcome: approvals::Outcome::Approved,
-            command: "Yes, use my reset",
+            command: approvals::RESET_YES_2_1_287,
             reason: RESET_HEAD,
             box_seq: 9,
         };
@@ -1329,7 +1613,7 @@ fn a_key_off_successor_waits_out_resetting_and_owes_nothing() {
     let rows = |end: &str| {
         [
             format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
-            format!("approved|Yes, use my reset|{RESET_HEAD}"),
+            format!("approved|{}|{RESET_HEAD}", approvals::RESET_YES_2_1_287),
             format!("waiting|limit reset|ended: {end}"),
         ]
     };
@@ -1698,7 +1982,7 @@ fn an_enter_whose_answer_never_came_is_on_the_books() {
         run.rows(),
         [
             format!("approved|{RESET_GRANT}|taken: wall until {}", host.until),
-            format!("approved|Yes, use my reset|{RESET_HEAD}"),
+            format!("approved|Yes, use my weekly reset|{RESET_HEAD}"),
             "waiting|limit reset|ended: used".to_string(),
         ]
     );
@@ -1762,7 +2046,7 @@ fn a_row_older_than_a_step_can_be_is_escaped_and_ended_untold() {
                 run.rows(),
                 [
                     format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
-                    "declined|Use your reset?|successor".to_string(),
+                    format!("declined|{}|successor", declined_as(&mut m)),
                     "waiting|limit reset|ended: stale".to_string(),
                 ],
                 "{tag}"
@@ -1864,7 +2148,7 @@ fn a_key_off_successors_escape_that_does_not_take_is_tried_again_and_recorded_on
         run.rows(),
         [
             format!("approved|{RESET_GRANT}|taken: wall until 1790265300"),
-            "declined|Use your reset?|successor".to_string(),
+            "declined|the reset confirmation|successor".to_string(),
             "waiting|limit reset|ended: untold (key off)".to_string(),
         ]
     );
@@ -1935,6 +2219,10 @@ fn an_attended_loop_takes_no_step_up() {
 ///
 /// Each is ESCAPED under the guard of its first visible row (`inexact-title`)
 /// and never handed to a rule of the approval policy: no reset is spent.
+/// With no title drawn, the ledger's `declined` row names the title of the
+/// row TAKEN's kind (`Use a weekly reset?` after the weekly row, `Use a
+/// 5-hour reset?` after the 5-hour one), never the kind-less name a
+/// successor with no go holds.
 /// NEGATIVE CONTROL: the composed confirmation, exact, is entered (the whole
 /// path) — and (seen by mutation) the second box, left to the rules, is
 /// answered by keys that are not the step's, and the third, judged the
@@ -1944,7 +2232,7 @@ fn an_attended_loop_takes_no_step_up() {
 fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
     let no_title = confirm_frame(&[
         "   Refills your weekly limit now · your weekly reset day stays Oct 9 at 5am",
-        "   2 resets left · use by Oct 5 at 3pm",
+        "   2 weekly resets left · use by Oct 5 at 3pm",
         "",
         "   ❯ Sure, use it",
         "     No, keep it",
@@ -1961,19 +2249,32 @@ fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
         "",
         "   Enter to confirm · Esc to cancel",
     ]);
-    // The box's first visible row, and how many reads `Checking…` stands.
-    for (tag, frame, first, check_reads) in [
+    const SESSION: &str = "Use a 5-hour reset (2 left, until Oct 5)";
+    // The box's first visible row, and how many reads `Checking…` stands;
+    // the row taken, the wall's limits and the title its kind names.
+    let boxes = [
         ("no-title", no_title, 3, 1),
         ("nothing-left", nothing_left, 3, 1),
         ("nothing-left-first-read", nothing_left_head_off(), 0, 0),
-    ] {
+    ];
+    let grants: [(&str, &[&str], &str); 2] = [
+        (RESET_GRANT, &["weekly"], "Use a weekly reset?"),
+        (SESSION, &["session", "weekly"], "Use a 5-hour reset?"),
+    ];
+    for ((tag, frame, first, check_reads), (grant, limits, title)) in boxes
+        .iter()
+        .flat_map(|b| grants.iter().map(move |g| (b.clone(), *g)))
+    {
+        let tag = format!("{tag} after {grant}");
         let first = frame[first].clone();
-        let host = ResetHost::reading(ResetOutcome::Kept);
-        let mut m = reset_mock(vec![], &RESET_ROWS, 0, &host);
+        let host = ResetHost::reading_at(ResetOutcome::Kept, limits);
+        let rows = [RESET_STOP, grant, RESET_WAIT, RESET_CREDITS];
+        let mut m = reset_mock(vec![], &rows, 0, &host);
+        reset_world(&mut m).grant = grant.to_string();
         reset_world(&mut m).confirm = frame;
         reset_world(&mut m).exact = false;
         reset_world(&mut m).check_reads = check_reads;
-        let run = reset_watch(tag, &mut m, reset_opts(&host, true, 120), &fresh, |_| {});
+        let run = reset_watch(&tag, &mut m, reset_opts(&host, true, 120), &fresh, |_| {});
         assert_eq!(
             reset_keys(&m),
             ["down@dialog", "enter@dialog", "esc@confirm"],
@@ -1992,6 +2293,12 @@ fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
             "{tag}"
         );
         assert_eq!(reset_world(&mut m).yes_taken, 0, "{tag}");
+        assert!(
+            run.rows()
+                .contains(&format!("declined|{title}|inexact-title")),
+            "{tag}: {:#?}",
+            run.rows()
+        );
         assert_eq!(m.attention, None, "{tag}");
         assert_eq!(reset_violations(&m, &host), Vec::<String>::new(), "{tag}");
     }

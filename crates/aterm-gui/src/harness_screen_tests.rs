@@ -512,10 +512,18 @@ fn the_app_feeds_the_ab_clock_at_each_change() {
     app.note_harness_phase(0);
     assert_eq!(stretch(&app, 0), Some((AbPhase::Busy, AbArm::Cruise)));
     // Land written: its own arm at once, never Cruise's.
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Settings
+    ));
     assert_eq!(stretch(&app, 0), Some((AbPhase::Busy, AbArm::Land)));
     // Off written: not the baseline while the claim is live.
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Settings
+    ));
     assert_eq!(stretch(&app, 0), Some((AbPhase::Busy, AbArm::Unsupervised)));
     // A wait published: the busy stretch closes, the wait opens.
     assert!(publish(&ctx, "idle"));
@@ -533,9 +541,10 @@ fn the_app_feeds_the_ab_clock_at_each_change() {
 /// THE FACE AND THE PAUSE MOVE THE BOOK'S CAUSE (§10.5.3 B.3), told
 /// through `apply_harness_fact` as the host tells them: under Cruise at the
 /// prompt, a pause makes the prompt's time from there the harness's
-/// pausing, a face of done makes it finished (first, over a pause still
-/// standing), and a face of open none again. NEGATIVE CONTROL: under Off,
-/// with no claim, the same pause gives none.
+/// pausing, and a face of landed moves nothing (Cruise takes nothing as the
+/// end); under Land the landed face makes it landed (first, over a pause
+/// still standing), and a face of open gives the pause back. NEGATIVE
+/// CONTROL: under Off, with no claim, the same pause gives none.
 #[test]
 fn the_face_and_the_pause_told_move_the_books_cause() {
     use aterm_agent::harness::acts::TaskFace;
@@ -557,14 +566,31 @@ fn the_face_and_the_pause_told_move_the_books_cause() {
     let cause = |app: &App| open(app).and_then(|(_, _, cause)| cause);
     app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
     assert_eq!(cause(&app), Some(AbCause::Pausing));
-    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Done)));
-    assert_eq!(cause(&app), Some(AbCause::Finished));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Landed)));
+    assert_eq!(cause(&app), Some(AbCause::Pausing), "Cruise never lands");
     app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
-    assert_eq!(cause(&app), Some(AbCause::Finished));
+    assert_eq!(cause(&app), None);
+    // Under Land the landing is the cause, first.
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Chip));
+    app.note_harness_arm(0);
     app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Open)));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Landed)));
+    assert_eq!(
+        open(&app),
+        Some((AbPhase::AtPrompt, AbArm::Land, Some(AbCause::Landed)))
+    );
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
+    assert_eq!(cause(&app), Some(AbCause::Landed));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Open)));
+    assert_eq!(cause(&app), Some(AbCause::Pausing));
+    app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
     assert_eq!(cause(&app), None);
     // Off, its claim given back: no harness to say why.
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Settings
+    ));
     crate::session_timeline::release_supervisor(
         &ctx,
         None,
@@ -704,6 +730,7 @@ fn a_reading_writes_this_books_file_and_reads_the_others() {
         "2-2.json",
         noon,
         utc,
+        &FleetSlot::default(),
     )
     .expect("a reading");
     assert_eq!(report.ab_others, [off_day(DAY, 10, 5_000)], "never its own");
@@ -712,7 +739,15 @@ fn a_reading_writes_this_books_file_and_reads_the_others() {
     let unread = writes
         .snapshot((ring_of(off_day(DAY, 20, 7_000)), DAY))
         .unwrap();
-    let failed = read_harness_stats(None, Some(hs.path()), Some(&unread), "3-3.json", noon, utc);
+    let failed = read_harness_stats(
+        None,
+        Some(hs.path()),
+        Some(&unread),
+        "3-3.json",
+        noon,
+        utc,
+        &FleetSlot::default(),
+    );
     assert!(failed.is_err());
     assert!(file("3-3.json").exists());
     // NEGATIVE CONTROL: a book never fed writes nothing, reads the rest.
@@ -723,13 +758,22 @@ fn a_reading_writes_this_books_file_and_reads_the_others() {
         "4-4.json",
         noon,
         utc,
+        &FleetSlot::default(),
     )
     .expect("a reading");
     assert!(!file("4-4.json").exists());
     assert_eq!(unfed.ab_others, read_others(hs.path(), "4-4.json", DAY));
     assert_eq!(unfed.ab_others[0].arms[AbArm::Off.index()].busy_ms, 19_000);
     // NEGATIVE CONTROL: no harness state, no book.
-    let none = read_harness_stats(Some(state.path()), None, Some(&mine), "5-5.json", noon, utc);
+    let none = read_harness_stats(
+        Some(state.path()),
+        None,
+        Some(&mine),
+        "5-5.json",
+        noon,
+        utc,
+        &FleetSlot::default(),
+    );
     assert!(none.is_err());
     assert!(!file("5-5.json").exists());
 }
@@ -790,7 +834,11 @@ fn the_ab_arm_reads_whose_claim_is_live() {
     let now_us = crate::metrics::now_us();
     claim(&ctx);
     assert_eq!(app.harness_ab_arm(0), AbArm::Cruise);
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Settings
+    ));
     assert_eq!(app.harness_ab_arm(0), AbArm::Unsupervised, "ours, live");
     // Another supervisor's live claim: claimed, not ours.
     crate::session_timeline::release_supervisor(&ctx, None, now_us, aterm_slog::Actor::Ctl);
@@ -928,7 +976,11 @@ fn a_lapsed_claim_moves_the_ab_arm_as_a_released_one_does() {
     let host = idle_host();
     app.harness = Some(host.clone());
     let ctx = app.pool.get(session).unwrap().ctx.clone();
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Settings
+    ));
     // Another supervisor's ttl claim lands (its `Wake::MetaChanged`), and the
     // agent waits at its prompt.
     let holder = "aterm-supervise:42";
@@ -1298,7 +1350,11 @@ fn an_off_press_pins_off_under_a_default_of_off() {
         Some(Autopilot::Off),
         "no word: Off pinned, not left to the default"
     );
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        0,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Settings
+    ));
     press(&mut app, Autopilot::Off);
     assert_eq!(
         app.session_autopilot(0),
@@ -1469,6 +1525,22 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
             .map(|(_, w)| w.as_str()),
         Some("no safe rule proved 0 today \u{b7} 3 in 7 days"),
     );
+    // A worker's NEEDS YOU told this week: a row of its own after "Needed
+    // you" (the labels above, with none told, have no such row).
+    today.needs_told = 1;
+    week.needs_told = 2;
+    state.stats.report = report(&today, &week);
+    let rows = state.projection().did_rows;
+    let at = |label: &str| rows.iter().position(|(l, _)| l == label);
+    assert_eq!(
+        at("Needs told"),
+        at("Needed you").map(|i| i + 1),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[at("Needs told").unwrap()].1,
+        "1 today \u{b7} 2 in 7 days"
+    );
 }
 
 /// ONE NAME FOR EACH COUNT, FROM THE CHIP TO THE PAGE (the post-check of
@@ -1615,6 +1687,7 @@ fn a_sessions_row_names_its_agent_once() {
             view: AutopilotView::Cruise,
             glass: crate::claude_lights::ChipGlass::default(),
             armed_at_ms: None,
+            set_by: None,
             default: Some(Autopilot::Cruise),
             supervised: true,
         }];
@@ -1623,13 +1696,13 @@ fn a_sessions_row_names_its_agent_once() {
     for title in ["Claude Code", "\u{2733} Claude Code"] {
         assert_eq!(
             detail(title),
-            "Tab 1 \u{b7} supervised \u{b7} autopilot cruise \u{b7} the default",
+            "Tab 1 \u{b7} supervised \u{b7} autopilot cruise",
             "{title:?}"
         );
     }
     assert_eq!(
         detail("Fix login bug"),
-        "Tab 1 \u{b7} Claude Code \u{b7} supervised \u{b7} autopilot cruise \u{b7} the default"
+        "Tab 1 \u{b7} Claude Code \u{b7} supervised \u{b7} autopilot cruise"
     );
 }
 
@@ -1713,17 +1786,16 @@ fn a_sessions_row_drops_its_agents_spinner_frame() {
 
 /// THE SESSIONS STATE LINE is formatted from the row's glass for every state
 /// (design §9.3.4, §10.2.3 item 2), as the chip's face reads it: the timer
-/// under Cruise (its weekday on another day), the task's end under Cruise
-/// and Land — under Cruise with a timer armed over it after ` · ` — the
-/// task's other faces and the goal hold under Land, else the trail's newest
-/// act — clock times, never an age. NEGATIVE CONTROLS: the default glass
-/// says nothing under any view (v1's row), and a face or a timer outside its
-/// own mode falls through to the trail.
+/// under Cruise (its weekday on another day), the landing and a person's own
+/// exchange under Land, else the trail's newest act — clock times, never an
+/// age. Cruise takes nothing as the end: a landed face under it says the
+/// timer or the trail. NEGATIVE CONTROLS: the default glass says nothing
+/// under any view (v1's row), and a face or a timer outside its own mode
+/// falls through to the trail.
 #[test]
 fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
     use crate::claude_lights::{ChipGlass, Clock, LandAtGlass, Stamp, Weekday};
     use aterm_agent::harness::acts::{Act, TaskFace};
-    use aterm_agent::supervise::policy::turn_end::LAND_NUDGES;
     // The day the faces were told (a Friday) and the publish's day.
     const TODAY: i64 = 20_007;
     let dated = |view: AutopilotView, glass: ChipGlass, today: i64| HarnessSessionRow {
@@ -1738,6 +1810,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         glass,
         armed_at_ms: None,
         today,
+        setting: "follows the default".to_string(),
     };
     let row = |view: AutopilotView, glass: ChipGlass| dated(view, glass, TODAY);
     let clock = |h: u16, m: u16| Clock::of_minute(h * 60 + m);
@@ -1774,37 +1847,22 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
             told(TaskFace::Landed),
             "landed 17:42".to_string(),
         ),
-        (
-            AutopilotView::Land,
-            told(TaskFace::Done),
-            "done 17:42".to_string(),
-        ),
-        // §10.2: Cruise's ends, and a timer armed over them.
-        (
-            AutopilotView::Cruise,
-            told(TaskFace::Done),
-            "done 17:42".to_string(),
-        ),
-        (
-            AutopilotView::Cruise,
-            told(TaskFace::Landed),
-            "landed 17:42".to_string(),
-        ),
-        (
-            AutopilotView::Cruise,
-            ChipGlass {
-                land_at: timer(None).land_at,
-                ..told(TaskFace::Done)
-            },
-            "done 17:42 \u{b7} lands 18:00".to_string(),
-        ),
+        // Cruise takes nothing as the end: the timer's line, or the trail's.
         (
             AutopilotView::Cruise,
             ChipGlass {
                 land_at: timer(Some(Weekday::Sat)).land_at,
                 ..told(TaskFace::Landed)
             },
-            "landed 17:42 \u{b7} lands Sat 18:00".to_string(),
+            "lands Sat 18:00".to_string(),
+        ),
+        (
+            AutopilotView::Cruise,
+            ChipGlass {
+                last,
+                ..told(TaskFace::Landed)
+            },
+            "last: \u{2713} approved 14:05".to_string(),
         ),
         (
             AutopilotView::Cruise,
@@ -1813,11 +1871,6 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
                 ..told(TaskFace::Theirs)
             },
             "lands at 18:00".to_string(),
-        ),
-        (
-            AutopilotView::Land,
-            told(TaskFace::Spent),
-            format!("quiet: no done reply after {LAND_NUDGES} nudges"),
         ),
         (
             AutopilotView::Land,
@@ -1863,19 +1916,6 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
             AutopilotView::Land,
             told(TaskFace::Landed),
             "landed Fri 17:42",
-        ),
-        (
-            AutopilotView::Cruise,
-            told(TaskFace::Done),
-            "done Fri 17:42",
-        ),
-        (
-            AutopilotView::Cruise,
-            ChipGlass {
-                land_at: timer(Some(Weekday::Sat)).land_at,
-                ..told(TaskFace::Done)
-            },
-            "done Fri 17:42 \u{b7} lands Sat 18:00",
         ),
         (
             AutopilotView::Cruise,
@@ -1930,12 +1970,12 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
     assert_eq!(row(AutopilotView::Land, timer(None)).state_line(), None);
     // A face told where the zone could not be read names no time.
     let unplaced = ChipGlass {
-        task: Some(TaskFace::Done),
+        task: Some(TaskFace::Landed),
         ..ChipGlass::default()
     };
     assert_eq!(
         row(AutopilotView::Land, unplaced).state_line().as_deref(),
-        Some("done")
+        Some("landed")
     );
 }
 
@@ -1962,6 +2002,7 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         glass,
         armed_at_ms: None,
         today: TODAY,
+        setting: "follows the default".to_string(),
     };
     let stamp = |h: u16, m: u16| Stamp {
         clock: Clock::of_minute(h * 60 + m),
@@ -1996,15 +2037,15 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         Some("lands at 19:00"),
         "the timer's line wins"
     );
-    let done = ChipGlass {
-        task: Some(TaskFace::Done),
+    let landed = ChipGlass {
+        task: Some(TaskFace::Landed),
         task_at: Some(stamp(17, 42)),
         ..pausing
     };
     assert_eq!(
-        row(AutopilotView::Land, done).state_line().as_deref(),
-        Some("done 17:42"),
-        "the face's end wins"
+        row(AutopilotView::Land, landed).state_line().as_deref(),
+        Some("landed 17:42"),
+        "the landing wins"
     );
     // NEGATIVE CONTROL: no pause, the trail's newest act.
     assert_eq!(
@@ -2573,8 +2614,8 @@ fn a_scroll_or_an_arrow_lets_the_landed_row_go() {
 
 /// A PAGE HELD OPEN ACROSS MIDNIGHT NAMES A FACE'S DAY FROM THEN ON
 /// (§10.2.3 item 6; §10.2.5, "Idle"): with no `[harness] land_at`,
-/// Settings ▸ Harness shown at 23:58 on a Friday, its session landed at
-/// 23:50, reads `landed 23:50` and owes ONE wake, at the next local
+/// Settings ▸ Harness shown at 23:58 on a Friday, its session under Land
+/// landed at 23:50, reads `landed 23:50` and owes ONE wake, at the next local
 /// midnight; there the page is published again and the row reads `landed
 /// Fri 23:50`, owing the next midnight. NEGATIVE CONTROL: with the page
 /// closed nothing is owed, and the loop's next pass drops the note.
@@ -2586,6 +2627,11 @@ fn a_page_held_open_across_midnight_names_the_faces_day_from_then_on() {
     run_claude(&app, 0);
     let host = idle_host();
     app.harness = Some(host.clone());
+    assert!(app.set_session_autopilot(
+        0,
+        Some(aterm_agent::supervise::Autopilot::Land),
+        crate::autopilot::Surface::Chip
+    ));
     let fri = 1_792_177_200_i64;
     let off = local_offset_at(fri).expect("the zone reads");
     let day = (fri + off).div_euclid(86_400);
@@ -2788,10 +2834,11 @@ fn statuss_today_says_its_nonzero_families_in_their_order() {
 }
 
 /// A SESSIONS ROW'S DAY (§10.3.1): `today:`, the person's need first (how
-/// often, how long, the last time), then at most three nonzero families,
-/// then `partial` where its own ledgers were cut. NEGATIVE CONTROLS: a
-/// session with nothing today has no line; zeros are never said; with no
-/// zone the clock says UTC.
+/// often, how long, the last time), then the worker's NEEDS YOU told while
+/// the work went on, then at most three nonzero families, then `partial`
+/// where its own ledgers were cut. NEGATIVE CONTROLS: a session with
+/// nothing today has no line; zeros are never said; with no zone the clock
+/// says UTC.
 #[test]
 fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
     use aterm_agent::harness::stats::Tally;
@@ -2847,6 +2894,26 @@ fn a_rows_day_line_says_its_need_then_three_families_then_partial() {
         day_line(&unproven, Some(0)).as_deref(),
         Some("today: 2 approved")
     );
+    // A worker's NEEDS YOU told: after the need, before the families, and
+    // never a need of the person's (no "needed you").
+    let told = Tally {
+        needs_told: 2,
+        approved: 1,
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&told, Some(0)).as_deref(),
+        Some("today: 2 needs told \u{b7} 1 approved")
+    );
+    let both = Tally {
+        escalated: 1,
+        needs_told: 1,
+        ..Tally::default()
+    };
+    assert_eq!(
+        day_line(&both, Some(0)).as_deref(),
+        Some("today: needed you once \u{b7} 1 need told")
+    );
 }
 
 /// THE JOIN (§10.3.3, item 5): each row's day comes from ITS sid's share of
@@ -2868,6 +2935,7 @@ fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
         view: AutopilotView::Cruise,
         glass: crate::claude_lights::ChipGlass::default(),
         armed_at_ms: None,
+        set_by: None,
         default: Some(Autopilot::Cruise),
         supervised: true,
     };
@@ -2956,6 +3024,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
             view: AutopilotView::Cruise,
             glass: crate::claude_lights::ChipGlass::default(),
             armed_at_ms: None,
+            set_by: None,
             default: Some(Autopilot::Cruise),
             supervised: false,
         };
@@ -3142,8 +3211,8 @@ fn show_raises_the_sessions_tab_and_focuses_its_pane() {
 }
 
 /// A LANDING STANDS UNTIL A RENDER HAS DRAWN IT (post-check of wave 1,
-/// behaviour-2 and owner-eye-2): `⚙` (or the menu's `Harness settings…`, or
-/// `⊘ off`) on a Settings ▸ Harness tab that is already open and drawn —
+/// behaviour-2 and owner-eye-2): the Autopilot menu's `Harness settings…`
+/// (or `⊘ off`) on a Settings ▸ Harness tab that is already open and drawn —
 /// scrolled to its bottom, or at its top with the row below the fold —
 /// lands the page on the session's row, or on SUPERVISION, even where a
 /// reply to the refreshes the open started reaches the view before the
@@ -3258,7 +3327,7 @@ fn a_landing_stands_until_a_render_has_drawn_it() {
     let landed = drawn(&app, late);
     assert!(selected(&landed), "listed, and landed on: {landed:?}");
     // A LATER OPEN REPLACES A LANDING STILL WAITING FOR ITS ROW (the review
-    // of the fix): `⚙` for a session not listed yet, then View ▸ Coding
+    // of the fix): `Harness settings…` for a session not listed yet, then View ▸ Coding
     // Agent Harness… (the page's top) — the session listed afterwards moves
     // nothing: the page stays at its top, STATUS on screen, and no row is
     // drawn selected.
@@ -3301,7 +3370,8 @@ fn a_landing_stands_until_a_render_has_drawn_it() {
     host.shutdown_and_join();
 }
 
-/// THE PAGE LANDS ON THE ROW (§10.3.3, item 8): `⚙` for a session whose row
+/// THE PAGE LANDS ON THE ROW (§10.3.3, item 8): the Autopilot menu's
+/// `Harness settings…` (`open_harness_settings` with the session) for a session whose row
 /// is off the page's first screen opens the page with that row in view and
 /// its Show drawn selected — before any render has measured the page, and
 /// again after one has, for another row; the next press lets the selection
@@ -3309,7 +3379,7 @@ fn a_landing_stands_until_a_render_has_drawn_it() {
 /// the page opened at its top shows the far row off screen and nothing
 /// selected.
 #[test]
-fn the_gear_lands_the_page_on_its_sessions_row_drawn_selected() {
+fn harness_settings_lands_the_page_on_its_sessions_row_drawn_selected() {
     use crate::app_introspect::AuxTarget;
     use crate::harness_screen::HarnessFocus;
     let mut app = App::headless_for_test();
@@ -3430,6 +3500,7 @@ fn state_deciding(
         view: AutopilotView::Cruise,
         glass: crate::claude_lights::ChipGlass::default(),
         armed_at_ms: None,
+        set_by: None,
         default: Some(Autopilot::Cruise),
         supervised: true,
     }];
@@ -3496,7 +3567,8 @@ fn decided_rows_name_a_live_and_a_closed_session() {
             DecisionKind::Answered,
             (
                 "What should I add next?",
-                "the land answer: finish cleanly soonest, start nothing new",
+                "the land answer: land all of the work on the remote main soonest, start nothing \
+                 new",
                 None,
             ),
         ),
@@ -3529,7 +3601,7 @@ fn decided_rows_name_a_live_and_a_closed_session() {
                 i4,
                 "18:34".to_string(),
                 "A closed session asked \u{201c}What should I add next?\u{201d} \u{2192} the land \
-                 answer: finish cleanly soonest, start nothing new"
+                 answer: land all of the work on the remote main soonest, start nothing new"
                     .to_string(),
                 None
             ),
@@ -3858,4 +3930,213 @@ fn the_stats_reading_dials_a_sibling_on_its_auth_line_and_never_blind() {
         blind.iter().all(Vec::is_empty),
         "and sent nothing blind: {blind:?}"
     );
+}
+
+/// SETTINGS ▸ HARNESS'S READING ASKS NOTHING OF THE FLEET (the post-landing
+/// check's perf-1): a reading begun while only Settings ▸ Harness is shown
+/// sweeps no fleet — no sibling sockets, no LAN, and none of this Mac's
+/// vitals with their 30 ms sample and two `sysctl` spawns, none of which
+/// the page draws; one begun while Tab Control / Fleet Monitor is shown
+/// sweeps it, sampling this Mac's vitals on its thread only while
+/// `VitalsHost` has no snapshot for that page. The sweep comes after the
+/// ledgers, as the reading's slot asks it then ([`FleetSlot::take`]): a
+/// slot raised before sweeps, a slot taken takes no raise, and a reading
+/// that failed sweeps nothing. NEGATIVE CONTROL: the sweep on every reading
+/// (main's `collect_fleet_and_sibling_tabs()` with no ask) counts one for
+/// the Harness page's reading, and fails here.
+#[test]
+fn the_harness_reading_asks_nothing_of_the_fleet() {
+    let sweeps = || FLEET_SWEEPS.with(std::cell::Cell::get);
+    let utc = |_: i64| Some(0);
+    let state = aterm_tempfile::tempdir().expect("scratch state");
+    let hs = aterm_tempfile::tempdir().expect("scratch harness state");
+    let read = |slot: &FleetSlot| {
+        read_harness_stats(
+            Some(state.path()),
+            Some(hs.path()),
+            None,
+            "1-1.json",
+            0,
+            utc,
+            slot,
+        )
+        .expect("a reading")
+    };
+    let before = sweeps();
+    read(&FleetSlot::default());
+    assert_eq!(
+        sweeps(),
+        before,
+        "the Harness page's reading sweeps nothing"
+    );
+    let fleet = FleetAsk {
+        fleet: true,
+        local_vitals: true,
+    };
+    read(&FleetSlot::new(fleet));
+    assert_eq!(
+        sweeps(),
+        before + 1,
+        "CONTROL: Tab Control's sweeps the fleet"
+    );
+    // A Harness reading raised before it is done with the ledgers sweeps the
+    // fleet; one already done with them takes no raise.
+    let raised = FleetSlot::default();
+    assert!(raised.raise(fleet));
+    read(&raised);
+    assert_eq!(sweeps(), before + 2, "a raised reading sweeps the fleet");
+    // A reading that failed sweeps nothing: its report is dropped.
+    let _ = read_harness_stats(None, None, None, "1-1.json", 0, utc, &FleetSlot::new(fleet));
+    assert_eq!(sweeps(), before + 2, "a failed reading sweeps nothing");
+    assert!(
+        !raised.raise(fleet),
+        "taken: a raise after it does not count"
+    );
+    let taken = FleetSlot::default();
+    assert_eq!(taken.take(), FleetAsk::default());
+    assert!(!taken.raise(fleet));
+
+    let mut app = App::headless_for_test();
+    assert!(app.open_harness_settings(WindowId(0), HarnessFocus::Top));
+    assert!(app.harness_page_shown() && !app.tabs_page_shown());
+    app.start_harness_stats_refresh();
+    assert_eq!(app.harness_screen.last_fleet_ask, Some(FleetAsk::default()));
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Tabs));
+    assert!(app.tabs_page_shown());
+    app.start_harness_stats_refresh();
+    assert_eq!(app.harness_screen.last_fleet_ask, Some(fleet));
+    app.vitals.snapshot = Some(std::sync::Arc::new(aterm_vitals::model::Snapshot::default()));
+    app.start_harness_stats_refresh();
+    assert_eq!(
+        app.harness_screen.last_fleet_ask,
+        Some(FleetAsk {
+            fleet: true,
+            local_vitals: false,
+        }),
+        "VitalsHost's snapshot is this Mac's vitals"
+    );
+}
+
+/// A READING THAT ASKED NOTHING OF THE FLEET LEAVES TAB CONTROL ITS LAST
+/// SWEEP, AND SWEEPS IT WHERE TAB CONTROL COMES (perf-1's fix, on the Tab
+/// Control side, and its review): a Settings ▸ Harness reading lands
+/// keeping the fleet the last reading read, never an empty one; where Tab
+/// Control comes on screen while it reads the ledgers, its arrival raises
+/// the running reading's ask ([`FleetSlot::raise`]), which then sweeps the
+/// fleet (this Mac's vitals too, with no `VitalsHost` snapshot yet) and
+/// lands it, with no second reading of the ledgers; only where Tab Control
+/// came after the reading was done with them does the landing ask for a
+/// reading at once. NEGATIVE CONTROLS: a reading of the fleet replaces it;
+/// with only the Harness page shown nothing more is asked; the arrival
+/// joining the running reading without raising it (the first fix) asks a
+/// second reading of every ledger at the landing.
+#[test]
+fn a_fleetless_reading_keeps_the_last_sweep_and_owes_tab_control_one() {
+    let wid = WindowId(0);
+    let report = |sibling: &str| {
+        let mut report = HarnessStatsReport::new(
+            HarnessStats::per_session(0),
+            HarnessStats::new(0),
+            0,
+            Some(0),
+            &|_| Some(0),
+        );
+        if !sibling.is_empty() {
+            report.sibling_tabs = vec![TabSpreadsheetRow {
+                key: sibling.to_string(),
+                ..TabSpreadsheetRow::default()
+            }];
+        }
+        Box::new(report)
+    };
+    let land = |app: &mut App, landed: Box<HarnessStatsReport>| {
+        app.harness_screen.stats.collecting = true;
+        let sequence = app.harness_screen.sequence;
+        app.finish_harness_stats(sequence, Ok(landed));
+    };
+    let siblings = |app: &App| {
+        app.harness_screen.stats.report.as_deref().map(|r| {
+            r.sibling_tabs
+                .iter()
+                .map(|t| t.key.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let mut app = App::headless_for_test();
+    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+    app.harness_screen.reading = FleetAsk {
+        fleet: true,
+        local_vitals: false,
+    };
+    land(&mut app, report("sibling/1"));
+    assert_eq!(siblings(&app), Some(vec!["sibling/1".to_string()]));
+    // The Harness page's own reading: no fleet read, the last one kept.
+    app.start_harness_stats_refresh();
+    assert!(!app.harness_screen.reading.fleet);
+    let asked = app.harness_screen.readings_asked;
+    land(&mut app, report(""));
+    assert_eq!(
+        siblings(&app),
+        Some(vec!["sibling/1".to_string()]),
+        "the last sweep kept"
+    );
+    assert_eq!(
+        app.harness_screen.readings_asked, asked,
+        "CONTROL: Tab Control not shown, nothing more asked"
+    );
+    // Tab Control comes while a Harness reading reads the ledgers: its
+    // arrival raises the running reading, which sweeps the fleet and lands
+    // it — no second reading.
+    let swept = FleetAsk {
+        fleet: true,
+        local_vitals: true,
+    };
+    app.start_harness_stats_refresh();
+    app.harness_screen.stats.collecting = true;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Tabs));
+    assert!(
+        app.harness_screen.reading.fleet,
+        "the running reading raised"
+    );
+    assert_eq!(
+        app.harness_screen.fleet_slot.take(),
+        swept,
+        "the reading's thread sweeps the fleet once done with the ledgers"
+    );
+    let asked = app.harness_screen.readings_asked;
+    let sequence = app.harness_screen.sequence;
+    app.finish_harness_stats(sequence, Ok(report("sibling/2")));
+    assert_eq!(
+        app.harness_screen.readings_asked, asked,
+        "no second reading of the ledgers"
+    );
+    assert_eq!(
+        siblings(&app),
+        Some(vec!["sibling/2".to_string()]),
+        "the raised reading's fleet replaces the last"
+    );
+    // Back to the Harness page alone; then Tab Control comes after a
+    // Harness reading was done with the ledgers: too late to raise it, so
+    // the landing asks for a reading of the fleet at once.
+    assert!(app.open_harness_settings(wid, HarnessFocus::Top));
+    assert!(!app.tabs_page_shown());
+    app.start_harness_stats_refresh();
+    assert!(!app.harness_screen.reading.fleet);
+    app.harness_screen.stats.collecting = true;
+    assert_eq!(app.harness_screen.fleet_slot.take(), FleetAsk::default());
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Tabs));
+    assert!(!app.harness_screen.reading.fleet, "taken: not raised");
+    let asked = app.harness_screen.readings_asked;
+    let sequence = app.harness_screen.sequence;
+    app.finish_harness_stats(sequence, Ok(report("")));
+    assert_eq!(
+        siblings(&app),
+        Some(vec!["sibling/2".to_string()]),
+        "the last sweep kept"
+    );
+    assert_eq!(app.harness_screen.readings_asked, asked + 1, "owed at once");
+    assert_eq!(app.harness_screen.last_fleet_ask, Some(swept));
+    // CONTROL: a reading of the fleet replaces it.
+    land(&mut app, report("sibling/3"));
+    assert_eq!(siblings(&app), Some(vec!["sibling/3".to_string()]));
 }

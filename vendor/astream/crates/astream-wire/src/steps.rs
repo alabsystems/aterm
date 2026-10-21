@@ -34,14 +34,86 @@
 //!   held nothing anyone was told was committed.
 //! * [`StepEnd::Fault`]: anything else — a record this build cannot read, a step
 //!   out of order, or damage with an intact record after it. None of these is a
-//!   crash's signature, so a reader must not treat the bytes from there on as
-//!   merely torn. Truncating at a fault in a file destroys records that were
-//!   acknowledged.
+//!   crash's signature (but see the nested frame below), so a reader must not
+//!   treat the bytes from there on as merely torn. Truncating at a fault in a
+//!   file destroys records that were acknowledged.
 //!
 //! The rule that separates the two, [`frame_decodes_after`], is the one
 //! `astream-engine`'s log store applies to its own envelope records: a crash
 //! leaves nothing decodable behind its partial frame. Every function here is
 //! pure and panic-free, so the classification is a function of the bytes alone.
+//!
+//! ### How far the search for a frame after the break goes
+//!
+//! "Nothing decodable after it" is looked for byte by byte, because a damaged
+//! header carries no trustworthy length to skip by. A candidate whose header
+//! looks like a frame (the magic, version 1, zero flags, a length within the
+//! payload cap) and whose length fits the bytes runs a CRC over that length,
+//! and nothing vouches for the bytes after a break: they are whatever the
+//! damage, a foreign writer, or the record bodies an embedder stored left
+//! there, and they may hold such a candidate at many offsets, each naming a
+//! length near the whole buffer. Hashing them all is quadratic in the bytes, so
+//! the search runs under a CRC-byte budget, `max(RESYNC_CRC_PER_BYTE * after,
+//! RESYNC_CRC_FLOOR)` for the `after` bytes it scans: a candidate is charged its
+//! declared length before its CRC runs, and the search stops when the next one
+//! would overrun the budget. A stopped search answers that a frame decodes
+//! after the break — a **fault**, never a torn tail. That is the safe direction:
+//! a torn tail may be truncated, and a record a writer acknowledged, which the
+//! unsearched bytes might hold, must never be dropped as one.
+//!
+//! So the bounded answer is the unbounded one, or "fault" when the budget ran
+//! out, and what that costs is exactly this:
+//!
+//! * A fault is never read as torn. A `Torn` answer means every byte was
+//!   scanned within the budget and no frame decodes there.
+//! * The answers differ only where the unbounded search would find no frame
+//!   (`Torn`) and the declared lengths of the look-alikes it passes over — whose
+//!   CRCs fail — add up past the budget before the bytes run out. That torn tail
+//!   is reported as the fault at the break instead: `CorruptFrame` or
+//!   `LengthPastEnd` at the same offset.
+//! * The prefix the scan keeps (its records and `valid_len`) is never touched:
+//!   it is fixed before the end is classified. In a file the over-strictness is
+//!   a refused `open` (its `open_truncating` repairs); inside a commit-word
+//!   region any end that is not `Clean` is already a fault, so only the variant
+//!   reported changes.
+//! * Below the floor nothing changes at all: the answers are equal whenever the
+//!   unbounded search would hash at most [`RESYNC_CRC_FLOOR`] bytes.
+//!
+//! The bound gives whoever chooses the bytes after a break no verdict they
+//! could not already force: twelve bytes are a whole frame (the magic, version
+//! 1, zero flags, length 0 and CRC 0, the CRC of no bytes), so any such party
+//! could always turn a torn tail into a fault. What the bound takes away is the
+//! time.
+//!
+//! ### A body that holds a frame of its own
+//!
+//! The rule reads bytes, not intent, and a body is opaque, so it cannot tell a
+//! frame that follows the damage from a frame nested **inside** the damaged
+//! record's own body. A step's output that embeds an encoded astream frame — a
+//! step record, a log record, anything an astream-based workflow may hand back —
+//! therefore changes what a crash leaves:
+//!
+//! * a cut inside that record **after** the nested frame's last byte is a
+//!   [`StepFault::LengthPastEnd`] fault at the record, not [`StepEnd::Torn`]:
+//!   the partial record's length runs past the end and a complete frame decodes
+//!   after its start, which is exactly what a rotted length field looks like;
+//! * a cut before the nested frame is complete is still `Torn`;
+//! * damage to the last record, if it holds one, is a [`StepFault::CorruptFrame`]
+//!   fault rather than `Torn`.
+//!
+//! The error runs one way only. A nested frame adds a frame that decodes; it
+//! never hides one, so it can turn a torn tail into a fault but never a fault
+//! into a torn tail. The prefix the scan keeps is the same either way, so the
+//! nested frame never costs an acknowledged record; its cost is over-strictness:
+//! a file's reader refuses where it could have truncated (the workflow journal's
+//! `open` refuses, and its explicit `open_truncating` is the repair). The rule
+//! cannot be made exact from the bytes alone — a body may nest the very record
+//! a rotted length would hide behind it — and it errs strict on purpose: a rule
+//! that read such a cut as torn would read a rotted length mid-file as torn
+//! too, and a file's reader would truncate acknowledged records. Inside a
+//! region bounded by a commit word (below) the case cannot arise: nothing torn
+//! lies below the word, and an intact record is accepted by its length before
+//! anything looks inside its body.
 //!
 //! ## Inside a region bounded by a commit word
 //!
@@ -63,7 +135,8 @@
 //! `astream-engine`'s workflow journal is the file-backed user of this module: it
 //! truncates a `Torn` tail on open and refuses to open past a `Fault`.
 
-use crate::frame::{Frame, FrameError, HEADER_SIZE, MAX_PAYLOAD_LEN};
+use crate::frame::{decode_frame_header_bytes, Frame, FrameError, HEADER_SIZE, MAX_PAYLOAD_LEN};
+use crate::hash::crc32_ieee_prefix;
 use std::ops::Range;
 
 // The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
@@ -164,7 +237,8 @@ pub const fn encode_step_header(
 /// inside a CRC [`Frame`].
 ///
 /// A body too large for the frame's payload cap is [`FrameError::TooLarge`], as
-/// it would be from [`Frame::encode`]; it is refused before anything is copied.
+/// it would be from [`Frame::encode`]; it is refused before anything is copied,
+/// because [`encode_step_header`] checks the length first.
 pub fn encode_step(step: u64, body: &[u8]) -> Result<Vec<u8>, FrameError> {
     let hdr = encode_step_header(step, body.len())?;
     let mut payload = Vec::with_capacity(STEP_HEADER + 256);
@@ -272,7 +346,11 @@ pub enum StepEnd {
     /// on the very last record looks the same.)
     Torn,
     /// Not a crash's signature: the record at byte `at` is readable but wrong, or
-    /// damaged with an intact record after it.
+    /// damaged with an intact record after it. The one exception is a crash's
+    /// partial record whose body nests a complete frame of its own, which reads
+    /// as a `LengthPastEnd` or `CorruptFrame` fault (see the module doc). A
+    /// nested frame can make a torn tail read as a fault, never a fault read as
+    /// torn.
     Fault {
         /// Byte offset of the offending record in the scanned bytes.
         at: usize,
@@ -451,26 +529,150 @@ pub const fn end_at_corrupt_frame(bytes: &[u8], pos: usize, e: FrameError) -> St
     }
 }
 
+/// The CRC bytes the resync search may hash for each byte it scans after the
+/// break, over and above [`RESYNC_CRC_FLOOR`]: the slope of the linear bound.
+/// A candidate frame is charged its declared length (the bytes its CRC would
+/// cover) before the CRC runs, and the search stops when the next candidate
+/// would carry the total past the budget (see [`frame_decodes_after`]).
+pub const RESYNC_CRC_PER_BYTE: usize = 2;
+
+/// The least CRC work the resync search may do, whatever the bytes after the
+/// break: one frame at the payload cap (16 MiB).
+///
+/// The slope alone already hashes the first candidate in full (a frame that
+/// fits in the `after` bytes declares fewer than `after` of them, under the
+/// slope's `2 * after`). The floor is what keeps the bound out of sight on
+/// ordinary inputs: the bounded answer equals the unbounded one whenever the
+/// unbounded search would hash at most 16 MiB, which is every file or region
+/// short of the frame-look-alikes it takes to hash that much (about 20 KiB of
+/// them packed end to end; the engine's frozen-oracle comparison scans a few
+/// hundred bytes at a time). Its price is the worst case: up to 16 MiB of CRC
+/// for one search over however few bytes.
+pub const RESYNC_CRC_FLOOR: usize = MAX_PAYLOAD_LEN;
+
+/// The resync search's CRC-byte budget over `bytes` after `pos`:
+/// `max(RESYNC_CRC_PER_BYTE * after, RESYNC_CRC_FLOOR)`, linear in the `after`
+/// bytes it would scan plus a constant.
+#[must_use]
+const fn resync_budget(bytes: &[u8], pos: usize) -> usize {
+    let start = pos.saturating_add(1);
+    let after = bytes.len().saturating_sub(start);
+    let proportional = after.saturating_mul(RESYNC_CRC_PER_BYTE);
+    if proportional > RESYNC_CRC_FLOOR {
+        proportional
+    } else {
+        RESYNC_CRC_FLOOR
+    }
+}
+
+/// What a bounded resync search found, and the CRC bytes it hashed doing it.
+///
+/// `hashed` is a counted-work seam, not a clock: a test drives [`resync`] with
+/// a chosen budget and reads it to prove the hostile case is linear and that
+/// the unbounded search (a huge budget) is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Resync {
+    /// A complete CRC-valid frame decodes after the break, OR the budget ran
+    /// out before the search could rule one out (`found` is then conservative).
+    found: bool,
+    /// The CRC bytes hashed: at most `budget` on a bounded answer.
+    hashed: usize,
+}
+
+/// Look for a complete, CRC-valid frame after `pos` under a CRC-byte `budget`.
+///
+/// Each candidate header is decoded first (magic, version, flags, length — no
+/// CRC), so a mismatch or a length past the bytes costs nothing and is passed
+/// over, exactly as [`crate::frame::validate_frame_at`] would. Only a candidate
+/// whose length fits the bytes would run a CRC; it is charged that length
+/// before the CRC runs, and the search returns `found: true` the moment the
+/// next such candidate would carry the total past `budget`. That is the
+/// conservative answer: the search has not ruled out a frame in the bytes it
+/// did not reach, and reading the break as torn there could truncate a record a
+/// writer acknowledged (the module doc states the cost). `found: false` is
+/// returned only after every byte has been scanned within budget, so a genuine
+/// fault is never read as a torn tail — only a torn tail crowded with
+/// frame-look-alikes past the budget is read as a fault.
+#[must_use]
+const fn resync(bytes: &[u8], pos: usize, budget: usize) -> Resync {
+    let mut hashed = 0usize;
+    if pos == usize::MAX {
+        return Resync {
+            found: false,
+            hashed,
+        };
+    }
+    let start = pos.saturating_add(1);
+    let Some(mut rest) = drop_prefix(bytes, start) else {
+        return Resync {
+            found: false,
+            hashed,
+        };
+    };
+    while let &[_, ref next @ ..] = rest {
+        if let &[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, ref payload @ ..] = rest {
+            if let Ok((len, crc)) =
+                decode_frame_header_bytes(&[b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11])
+            {
+                // Only a candidate whose length fits the bytes would run a CRC;
+                // a length past the end is passed over for free, as
+                // `validate_frame_at` does (`Ok(None)`).
+                if len <= payload.len() {
+                    // A CRC over `len` bytes would run here. Charge it first; the
+                    // next candidate that would overrun the budget ends the search.
+                    if len > budget.saturating_sub(hashed) {
+                        return Resync {
+                            found: true,
+                            hashed,
+                        };
+                    }
+                    hashed = hashed.saturating_add(len);
+                    if let Some(actual) = crc32_ieee_prefix(payload, len) {
+                        if actual == crc {
+                            return Resync {
+                                found: true,
+                                hashed,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        rest = next;
+    }
+    Resync {
+        found: false,
+        hashed,
+    }
+}
+
 /// Whether a complete, CRC-valid frame starts anywhere after `pos` (never at
-/// `pos` itself). A crash leaves nothing decodable behind its partial frame.
-/// Scanning byte by byte is the honest test: a damaged header carries no
-/// trustworthy length to skip by.
+/// `pos` itself), answered conservatively under a linear CRC-byte budget
+/// ([`resync_budget`]). A crash leaves nothing decodable behind its partial
+/// frame, unless that frame's own body nests one, which this test cannot tell
+/// from a frame that follows it (the module doc says what that costs). Scanning
+/// byte by byte is the honest test: a damaged header carries no trustworthy
+/// length to skip by.
+///
+/// The budget bounds the one superlinear cost the byte-by-byte scan had: a
+/// candidate whose header looks like a frame and whose length fits runs a CRC
+/// over that length, and bytes nobody vouches for can hold one at many offsets,
+/// each naming a length near the whole buffer — an O(n²) search with no bound.
+/// The declared length is charged before the CRC runs and the search stops when
+/// the budget is spent, so one call hashes at most
+/// `max(RESYNC_CRC_PER_BYTE * after, RESYNC_CRC_FLOOR)` bytes. When the budget
+/// stops the search the answer is `true` (a fault), never `false` (a torn
+/// tail): a torn tail may be truncated and a record a writer acknowledged must
+/// never be dropped as one, so the unsearched bytes are treated as possibly
+/// holding a frame. A `false` answer still means every byte was scanned, so a
+/// real fault is never seen as torn. The module doc states exactly where the
+/// bounded answer differs from the unbounded one.
 #[must_use]
 pub const fn frame_decodes_after(bytes: &[u8], pos: usize) -> bool {
     if pos == usize::MAX {
         return false;
     }
-    let start = pos.saturating_add(1);
-    let Some(mut rest) = drop_prefix(bytes, start) else {
-        return false;
-    };
-    while let &[_, ref tail @ ..] = rest {
-        if matches!(crate::frame::validate_frame_at(rest), Ok(Some(_))) {
-            return true;
-        }
-        rest = tail;
-    }
-    false
+    resync(bytes, pos, resync_budget(bytes, pos)).found
 }
 
 #[cfg(test)]
@@ -527,7 +729,30 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_body_is_refused_before_it_is_copied() {
+    fn the_header_refuses_a_body_length_past_the_cap_on_its_own() {
+        // The guard `encode_step` runs before it copies a byte lives here, so it is
+        // pinned here: `encode_step`'s error is the same TooLarge whether its guard
+        // ran or `Frame::encode` refused after the copy, and cannot show which.
+        // Without the guard the header would cast the length to `u32` and return
+        // a record header that lies about its body: `usize::MAX` would come back
+        // as `Ok` with a length field of `u32::MAX`.
+        for body_len in [MAX_STEP_BODY + 1, MAX_PAYLOAD_LEN, usize::MAX] {
+            assert_eq!(
+                encode_step_header(0, body_len),
+                Err(FrameError::TooLarge),
+                "a {body_len}-byte body"
+            );
+        }
+        // The largest body the cap admits gets a header naming exactly its length.
+        let hdr = encode_step_header(7, MAX_STEP_BODY).unwrap();
+        assert_eq!(
+            decode_step_header_bytes(&hdr, STEP_HEADER + MAX_STEP_BODY),
+            Some((7, MAX_STEP_BODY))
+        );
+    }
+
+    #[test]
+    fn an_oversized_body_is_too_large_and_the_largest_body_frames() {
         // One byte past what the frame can carry is the frame's own TooLarge.
         let body = vec![0u8; MAX_STEP_BODY + 1];
         assert_eq!(encode_step(0, &body), Err(FrameError::TooLarge));
@@ -554,6 +779,246 @@ mod tests {
         // Past the end, and at usize::MAX, it is simply false.
         assert!(!frame_decodes_after(&two, two.len()));
         assert!(!frame_decodes_after(&two, usize::MAX));
+    }
+
+    /// Bytes nobody vouches for after a break, crammed with frame-like headers
+    /// each naming a length that reaches the end (so its CRC would run) and a
+    /// wrong CRC (so none decodes): the worst case for the resync search.
+    ///
+    /// Every header names at least one byte. A header naming none would be a
+    /// real frame, not a look-alike: its zero CRC is the CRC of no bytes.
+    fn hostile_resync_bytes(n: usize) -> Vec<u8> {
+        let mut b = vec![0u8; n];
+        let mut p = 0usize;
+        while p + HEADER_SIZE < n {
+            write_look_alike(&mut b, p, (n - p - HEADER_SIZE).min(MAX_PAYLOAD_LEN));
+            p += HEADER_SIZE;
+        }
+        b
+    }
+
+    /// Write a frame-like header at `p` naming `len` payload bytes: the magic,
+    /// version 1, zero flags, the length, and a CRC of 0. The CRC is wrong for
+    /// every `len` above zero, so the search runs it, rejects it and walks on.
+    fn write_look_alike(b: &mut [u8], p: usize, len: usize) {
+        assert!(
+            len > 0,
+            "a length-0 header with CRC 0 is a real empty frame"
+        );
+        let len = u32::try_from(len).expect("a look-alike length fits the field");
+        b[p] = crate::frame::MAGIC[0];
+        b[p + 1] = crate::frame::MAGIC[1];
+        b[p + 2] = crate::frame::VERSION;
+        b[p + 3] = 0; // flags
+        b[p + 4..p + 8].copy_from_slice(&len.to_le_bytes());
+        b[p + 8..p + HEADER_SIZE].fill(0);
+    }
+
+    /// The negative control: the search with no budget over `bytes` after 0.
+    /// It must find no frame, so whatever the bounded search answers differently
+    /// is the budget's doing and not a frame the bytes really hold.
+    fn unbounded_finds_nothing(bytes: &[u8]) -> Resync {
+        let unbounded = resync(bytes, 0, usize::MAX);
+        assert!(
+            !unbounded.found,
+            "the control holds a real frame in {} bytes",
+            bytes.len()
+        );
+        unbounded
+    }
+
+    #[test]
+    fn twelve_bytes_are_a_whole_frame() {
+        // Why the look-alikes above all name a length: the empty frame is the
+        // magic, the version, zero flags, length 0 and CRC 0. It is also why the
+        // bound gives whoever writes the bytes after a break no verdict they
+        // could not already force: these twelve bytes make any break a fault.
+        let empty = [
+            crate::frame::MAGIC[0],
+            crate::frame::MAGIC[1],
+            crate::frame::VERSION,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(
+            crate::frame::validate_frame_at(&empty),
+            Ok(Some((0, &[][..])))
+        );
+        let mut after = vec![0xFFu8];
+        after.extend_from_slice(&empty);
+        assert!(frame_decodes_after(&after, 0));
+    }
+
+    #[test]
+    fn the_resync_search_is_linear_and_the_unbounded_one_is_not() {
+        // A small explicit budget, so the bound bites with small bytes (the
+        // production budget's 16 MiB floor would need a far larger buffer).
+        let budget = 64 * 1024usize;
+        for &n in &[8 * 1024usize, 16 * 1024, 32 * 1024] {
+            let bytes = hostile_resync_bytes(n);
+            let bounded = resync(&bytes, 0, budget);
+            // The hostile case hashes no more than its budget, whatever the
+            // size: the work is linear in the budget, not quadratic in the bytes.
+            assert!(
+                bounded.hashed <= budget,
+                "bounded hashed {} over budget {budget} at {n} bytes",
+                bounded.hashed
+            );
+            // And it answers conservatively: the budget ran out before the
+            // search could rule a frame out, so the break is a fault, not torn.
+            assert!(
+                bounded.found,
+                "budget cut off is a conservative fault at {n}"
+            );
+
+            // The negative control: the same search with no budget finds no
+            // frame and hashes far more than the bound (the quadratic the
+            // budget tames).
+            let unbounded = unbounded_finds_nothing(&bytes);
+            assert!(
+                unbounded.hashed > budget,
+                "unbounded hashed {} does not exceed the bound {budget} at {n}",
+                unbounded.hashed
+            );
+        }
+        // Unbounded work is super-linear: doubling the bytes more than doubles it.
+        let small = unbounded_finds_nothing(&hostile_resync_bytes(8 * 1024)).hashed;
+        let large = unbounded_finds_nothing(&hostile_resync_bytes(16 * 1024)).hashed;
+        assert!(
+            large > small.saturating_mul(2),
+            "unbounded resync is super-linear: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn the_production_budget_turns_a_crammed_torn_tail_into_a_fault() {
+        // A real frame a short way after the break is found cheaply and read as a
+        // fault, as it always was (the safety direction the budget keeps).
+        let mut real = vec![0xFFu8; 3];
+        real.extend_from_slice(&encode_step(0, b"x").unwrap());
+        assert!(frame_decodes_after(&real, 0));
+
+        // Below the floor nothing changes: these look-alikes cost the unbounded
+        // search less than 16 MiB, and the bounded answer is its answer, torn.
+        let light = hostile_resync_bytes(16 * 1024);
+        assert!(unbounded_finds_nothing(&light).hashed <= RESYNC_CRC_FLOOR);
+        assert!(!frame_decodes_after(&light, 0));
+
+        for n in [24 * 1024usize, 48 * 1024] {
+            // Crammed past the floor: the unbounded search hashes more than the
+            // budget and finds no frame, so by the unbounded rule this is a
+            // torn tail.
+            let crammed = hostile_resync_bytes(n);
+            let budget = resync_budget(&crammed, 0);
+            assert_eq!(budget, RESYNC_CRC_FLOOR, "the floor's regime at {n}");
+            let unbounded = unbounded_finds_nothing(&crammed);
+            assert!(
+                unbounded.hashed > budget,
+                "the control must exceed the budget it is proving at {n}"
+            );
+
+            // The production search hashes at most its budget and answers a
+            // fault, never a torn tail: the budget alone made the difference.
+            let bounded = resync(&crammed, 0, budget);
+            assert!(bounded.hashed <= budget, "{} over {budget}", bounded.hashed);
+            assert!(bounded.found);
+            assert!(frame_decodes_after(&crammed, 0));
+
+            // In a run, the record before the break is kept either way, and the
+            // break is the fault at the same offset where the unbounded rule
+            // would have said Torn.
+            let mut run = encode_step(7, b"kept").unwrap();
+            let kept = run.len();
+            run.extend_from_slice(&crammed);
+            let scan = scan_steps_from(&run, 7);
+            assert_eq!(
+                scan.steps,
+                vec![(7, HEADER_SIZE + STEP_HEADER..kept)],
+                "the prefix at {n}"
+            );
+            assert_eq!(scan.valid_len, kept);
+            assert_eq!(
+                scan.end,
+                StepEnd::Fault {
+                    at: kept,
+                    kind: StepFault::CorruptFrame(FrameError::ChecksumMismatch),
+                },
+                "at {n}"
+            );
+        }
+
+        // Ordinary torn bytes with no frame after are still torn (false): a
+        // genuine fault is never seen as torn, and a torn tail is not forced to
+        // a fault unless the budget truly ran out.
+        let plain = vec![0u8; 64 * 1024];
+        assert!(!frame_decodes_after(&plain, 0));
+    }
+
+    #[test]
+    fn past_eight_mib_after_the_break_the_budget_is_twice_those_bytes() {
+        // The floor's regime ends where the slope passes it: at 8 MiB scanned the
+        // budget is still the floor, one byte more and it is twice the bytes. A
+        // search from `pos` scans the bytes after it, `len - pos - 1` of them.
+        let at_the_floor = RESYNC_CRC_FLOOR / RESYNC_CRC_PER_BYTE;
+        assert_eq!(at_the_floor, 8 << 20);
+        let edge = vec![0u8; at_the_floor + 1];
+        assert_eq!(resync_budget(&edge, 0), RESYNC_CRC_FLOOR);
+        let edge = vec![0u8; at_the_floor + 2];
+        assert_eq!(resync_budget(&edge, 0), RESYNC_CRC_FLOOR + 2);
+        let n = 9 << 20;
+        let zeros = vec![0u8; n];
+        let budget = 2 * (n - 1);
+        assert_eq!(resync_budget(&zeros, 0), budget);
+        assert_eq!(resync_budget(&zeros, 4096), 2 * (n - 4097));
+
+        // Through the production path: three look-alikes right after the break,
+        // the first two each naming the rest of the 9 MiB and the third the
+        // remainder of the budget, so their declared lengths add up to exactly
+        // the slope's budget (the floor's 16 MiB would stop the search at the
+        // second). Every candidate is hashed, no frame decodes, and the answer
+        // is the unbounded one: Torn.
+        let first = n - 1 - HEADER_SIZE; // at 1, its payload runs to the end
+        let second = n - 1 - 2 * HEADER_SIZE; // at 13, the same
+        let third = budget - first - second;
+        let look_alikes = |third: usize| {
+            let mut b = vec![0u8; n];
+            write_look_alike(&mut b, 1, first);
+            write_look_alike(&mut b, 1 + HEADER_SIZE, second);
+            write_look_alike(&mut b, 1 + 2 * HEADER_SIZE, third);
+            b
+        };
+        let exact = look_alikes(third);
+        assert_eq!(unbounded_finds_nothing(&exact).hashed, budget);
+        assert_eq!(
+            resync(&exact, 0, resync_budget(&exact, 0)),
+            Resync {
+                found: false,
+                hashed: budget
+            }
+        );
+        assert!(!frame_decodes_after(&exact, 0));
+
+        // One byte more and the third would carry the total past the budget: the
+        // search stops before its CRC runs and answers a fault, while the
+        // unbounded search still finds no frame. A budget that grew past the
+        // slope (or had no bound at all) would read this Torn.
+        let over = look_alikes(third + 1);
+        assert_eq!(unbounded_finds_nothing(&over).hashed, budget + 1);
+        assert_eq!(
+            resync(&over, 0, resync_budget(&over, 0)),
+            Resync {
+                found: true,
+                hashed: first + second
+            }
+        );
+        assert!(frame_decodes_after(&over, 0));
     }
 
     #[test]

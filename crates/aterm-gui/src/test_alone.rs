@@ -105,13 +105,25 @@ pub(crate) fn alone() -> bool {
 /// As [`alone`].
 #[track_caller]
 pub(crate) fn run_alone_with(env: &[(&str, &OsStr)]) {
+    spawn_alone_with(env).passed();
+}
+
+/// [`run_alone_with`]'s child, started and not yet waited for: for a caller
+/// that must hold a lock while the child inherits this process's environment
+/// (`seamless::tests::ENV_LOCK`) but not while the child runs.
+///
+/// # Panics
+///
+/// When the child cannot be started.
+#[track_caller]
+pub(crate) fn spawn_alone_with(env: &[(&str, &OsStr)]) -> Running {
     let test = current_test();
     let mut child = StandIn::new(&test, "alone in its own process");
     child.command().env(ALONE, &test);
     for (key, value) in env {
         child.command().env(key, value);
     }
-    child.spawn().passed();
+    child.spawn()
 }
 
 /// A helper test of this binary, about to run as a process of its own: the
@@ -433,7 +445,10 @@ impl Running {
     }
 
     /// Wait for its exit, and require that it ran exactly its one test and
-    /// passed it.
+    /// passed it. A child that ended COULD NOT RUN ends the caller so too,
+    /// with the child's reason: its own libtest report, nested in a failure
+    /// message, would read as a failure (`aterm-verify`'s `libtest`
+    /// classifier splits blocks on the child's `failures:` lines).
     ///
     /// # Panics
     ///
@@ -442,6 +457,9 @@ impl Running {
     pub(crate) fn passed(self) -> Ran {
         let ran = self.wait();
         if let Err(why) = ran.passed_one() {
+            if let Some(reason) = ran.could_not_run() {
+                aterm_spec::host::could_not_run(format!("`{}`, {}: {reason}", ran.test, ran.how));
+            }
             panic!("{why}");
         }
         ran
@@ -477,6 +495,16 @@ impl Running {
 /// run: it failed, or ran no test of its name (a renamed helper), and its
 /// output says which. One that passed before `ready` never readied it.
 ///
+/// An end is judged only after `ready` is asked once more: what a stand-in did
+/// before its exit is there once its exit is seen, so one that readied and
+/// ended between the two looks of a round (a quick child: its marker, its
+/// calls, its exit) readied it. Judged on the first look alone, such a child
+/// read as one that passed without readying: measured once in nine runs of the
+/// whole lib beside the live spare suite at load ~100
+/// (`native_document_host_tests::writerless_fifo_…`, `passed without: the
+/// child reaches the FIFO calls`), and in 51 of 2400 runs of five tests that
+/// wait so, beside the live suite at load 73-239; 0 of 2400 since.
+///
 /// # Panics
 ///
 /// When a stand-in ended first, or `ready` never held.
@@ -493,7 +521,8 @@ pub(crate) fn until_or_ended(
             if ready() {
                 return Some(None);
             }
-            stand_ins.iter_mut().position(Running::exited).map(Some)
+            let ended = stand_ins.iter_mut().position(Running::exited)?;
+            Some((!ready()).then_some(ended))
         },
     );
     match seen {
@@ -564,6 +593,20 @@ impl Ran {
         Ok(())
     }
 
+    /// What the child's one test said when it ended COULD NOT RUN: the rest of
+    /// its line that opens with [`aterm_spec::host::COULD_NOT_RUN`]. `None`
+    /// for a pass, a wedge or any other failure.
+    fn could_not_run(&self) -> Option<&str> {
+        if self.status.is_none_or(|status| status.success()) {
+            return None;
+        }
+        self.stdout
+            .lines()
+            .chain(self.stderr.lines())
+            .find_map(|line| line.trim().strip_prefix(aterm_spec::host::COULD_NOT_RUN))
+            .map(|rest| rest.trim_start_matches([' ', '—', ':']).trim())
+    }
+
     /// `Ok` when libtest selected exactly its test, however it ended.
     #[cfg(unix)]
     fn selected_one(&self) -> Result<(), String> {
@@ -593,5 +636,45 @@ impl Ran {
             self.how,
             self.output()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Running, StandIn, until_or_ended};
+
+    /// The stand-in role of [`a_stand_in_that_readied_then_ended_between_two_looks_readied`].
+    const ROLE: &str = "ATERM_TEST_ALONE_READIED_THEN_ENDED";
+
+    /// A stand-in that readied the caller and then ended, both between the
+    /// wait's first look at `ready` and its look at the stand-ins, readied it:
+    /// the wait asks `ready` again before it judges the end. The stand-in here
+    /// has already ended and passed, and `ready` answers `false` to its first
+    /// question only, which is that interleaving every time.
+    /// NEGATIVE CONTROL: on the wait that judged the end on its first look,
+    /// this panicked with `passed without: the second look`.
+    #[cfg(unix)]
+    #[test]
+    fn a_stand_in_that_readied_then_ended_between_two_looks_readied() {
+        if std::env::var_os(ROLE).is_some() {
+            return;
+        }
+        let mut stand_in = StandIn::this_test();
+        stand_in.command().env(ROLE, "1");
+        let mut stand_ins = [stand_in.spawn()];
+        let ended = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(5),
+            || stand_ins[0].exited().then_some(()),
+        );
+        assert!(ended.is_some(), "the stand-in never ended");
+        let mut looks = 0;
+        until_or_ended("the second look", &mut stand_ins, || {
+            looks += 1;
+            looks > 1
+        });
+        assert_eq!(looks, 2, "readied on the look after the end was seen");
+        let [stand_in] = stand_ins;
+        Running::passed(stand_in);
     }
 }

@@ -357,11 +357,13 @@ impl Mover {
 }
 
 /// The one action: a sentence that says it, and (when one press does it) the button.
-/// Built by [`Then::press`] or [`Then::step`] only.
+/// Built by [`Then::press`] or [`Then::step`] only, with a short form where the
+/// sentence must never be cut ([`Then::or_short`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Then {
     step: Step,
     mover: Option<Mover>,
+    short: Option<Step>,
 }
 
 impl Then {
@@ -372,6 +374,7 @@ impl Then {
         Self {
             step: Step::new(step),
             mover: Some(mover),
+            short: None,
         }
     }
 
@@ -381,6 +384,7 @@ impl Then {
         Self {
             step: Step::new(step),
             mover: None,
+            short: None,
         }
     }
 
@@ -396,10 +400,31 @@ impl Then {
         self.mover.as_ref()
     }
 
-    /// Why the sentence is not one action ([`Step::fault`]).
+    /// THE WORDS THE BAND SHOWS IN THE STEP'S PLACE where the step does not
+    /// stand whole beside the title (`Run the command under Details.`): a
+    /// step whose cut says something else than the step does — a command,
+    /// whose cut label is another account's command — is shown whole or
+    /// replaced by these, never cut (the review of the band, 2026-10-20).
+    /// Details shows the step whole; the short form, too, is one action.
+    #[must_use]
+    pub fn or_short(mut self, short: impl AsRef<str>) -> Self {
+        self.short = Some(Step::new(short));
+        self
+    }
+
+    /// The short form ([`Self::or_short`]), if the step has one.
+    #[must_use]
+    pub fn short(&self) -> Option<&str> {
+        self.short.as_ref().map(Step::as_str)
+    }
+
+    /// Why the sentence, or its short form, is not one action
+    /// ([`Step::fault`]).
     #[must_use]
     pub fn fault(&self) -> Option<&'static str> {
-        self.step.fault()
+        self.step
+            .fault()
+            .or_else(|| self.short.as_ref().and_then(Step::fault))
     }
 }
 

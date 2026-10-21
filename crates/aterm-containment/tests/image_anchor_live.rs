@@ -11,12 +11,17 @@
 //! retargeted mid-run must stay `live`.
 //!
 //! The child is this test binary, re-entered through the first real test,
-//! which dispatches `anchor_probe_child` before its parent assertions.
+//! which dispatches `anchor_probe_child` before its parent assertions. It runs
+//! from a new copy, which macOS assesses at its first exec: its first reading is
+//! the proof it runs, and until then nothing moves or removes the scratch
+//! directory (a child killed first leaves it in place,
+//! [`aterm_uds::deadline::KeptUntilRan`]).
 
 #![cfg(target_os = "macos")]
 
+use aterm_uds::deadline::{FIRST_EXEC_HANG, KeptUntilRan};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 // `spawnfd`'s: the probe holds its stdio and nothing else of this process. A
 // std child on a std without the SP-1 strip keeps any descriptor another test
 // thread had open unflagged at the spawn, for as long as the child lives.
@@ -34,6 +39,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 struct Probe {
     child: Child,
     readings: Receiver<String>,
+    /// What it was started as, for a failure's words.
+    exe: PathBuf,
 }
 
 impl Probe {
@@ -61,14 +68,31 @@ impl Probe {
                 }
             }
         });
-        Self { child, readings }
+        Self {
+            child,
+            readings,
+            exe: exe.to_path_buf(),
+        }
+    }
+
+    /// The child's first reading, the proof its copy runs: within the system's first-exec
+    /// wait, a hang detector of its own.
+    fn first(&mut self, step: &str) -> String {
+        self.within(step, FIRST_EXEC_HANG)
     }
 
     /// The child's next reading; fails rather than hanging on a silent child.
     fn read(&mut self, step: &str) -> String {
-        self.readings
-            .recv_timeout(READ_TIMEOUT)
-            .unwrap_or_else(|e| panic!("{step}: no `{TAG}` reading from the child: {e}"))
+        self.within(step, READ_TIMEOUT)
+    }
+
+    fn within(&mut self, step: &str, hang: Duration) -> String {
+        self.readings.recv_timeout(hang).unwrap_or_else(|e| {
+            panic!(
+                "{step}: no `{TAG}` reading from the child running {}: {e}",
+                self.exe.display()
+            )
+        })
     }
 
     /// Let the child take its next reading.
@@ -87,7 +111,7 @@ impl Drop for Probe {
 }
 
 /// Lay `<root>/<name>/Contents/MacOS/probe`, a copy of this test binary.
-fn lay_bundle(root: &Path, name: &str) -> std::path::PathBuf {
+fn lay_bundle(root: &Path, name: &str) -> PathBuf {
     let macos = root.join(name).join("Contents/MacOS");
     std::fs::create_dir_all(&macos).expect("bundle layout");
     let exe = macos.join("probe");
@@ -101,12 +125,15 @@ fn the_anchor_follows_a_bundle_renamed_and_then_deleted_under_a_live_process() {
         anchor_probe_child();
         return;
     }
-    let scratch = aterm_tempfile::tempdir().expect("tempdir");
-    let root = scratch.path();
+    let mut scratch = KeptUntilRan::new(aterm_tempfile::tempdir().expect("tempdir").keep());
+    let root = &scratch.path().to_path_buf();
     let exe = lay_bundle(root, "A.app");
     let mut probe = Probe::spawn(&exe);
 
-    assert_eq!(probe.read("before"), "live", "the negative control");
+    let before = probe.first("before");
+    // The one copy started has run: what follows may move and delete it.
+    scratch.ran();
+    assert_eq!(before, "live", "the negative control");
 
     // The apply's swap: the incoming bundle takes the name, the running one
     // lands at `A.app.rollback`.
@@ -126,15 +153,18 @@ fn the_anchor_follows_a_bundle_renamed_and_then_deleted_under_a_live_process() {
 /// the anchor must stay `live`: the bundle this process runs from is untouched.
 #[test]
 fn a_retargeted_launch_symlink_is_not_a_displacement() {
-    let scratch = aterm_tempfile::tempdir().expect("tempdir");
-    let root = scratch.path();
+    let mut scratch = KeptUntilRan::new(aterm_tempfile::tempdir().expect("tempdir").keep());
+    let root = &scratch.path().to_path_buf();
     let exe = lay_bundle(root, "R.app");
     let other = lay_bundle(root, "S.app");
     let shim = root.join("shim");
     std::os::unix::fs::symlink(&exe, &shim).expect("symlink");
     let mut probe = Probe::spawn(&shim);
 
-    assert_eq!(probe.read("before"), "live");
+    let before = probe.first("before");
+    // The one copy started has run (`S.app`'s never is).
+    scratch.ran();
+    assert_eq!(before, "live");
     std::fs::remove_file(&shim).expect("unlink shim");
     std::os::unix::fs::symlink(&other, &shim).expect("retarget shim");
     probe.nudge();

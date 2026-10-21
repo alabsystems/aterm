@@ -24,7 +24,9 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use aterm_spec::verify::validate_transition_tiered;
 
-use crate::app_introspect::{SnapshotPng, begin_snapshot_generation, write_snapshot_artifacts};
+use crate::app_introspect::{
+    begin_snapshot_generation, encode_frame_png, write_snapshot_artifacts,
+};
 use crate::control_auth::ConfinedImage;
 use crate::pinned_dir::PinnedDir;
 
@@ -682,9 +684,14 @@ fn reader_lease(
 ) -> Option<(crate::control_auth::ArtifactPathLease, PinnedDir)> {
     let pinned_root = PinnedDir::open_resolved(root).unwrap();
     let recording = pinned_root.child(fresh).unwrap();
-    crate::control_auth::retain_video_artifact_path(pinned_root, fresh.to_os_string(), &recording)
-        .unwrap()
-        .map(|lease| (lease, recording))
+    crate::control_auth::retain_video_artifact_path(
+        pinned_root,
+        fresh.to_os_string(),
+        &recording,
+        &crate::control::ArtifactBudgets::shipping(),
+    )
+    .unwrap()
+    .map(|lease| (lease, recording))
 }
 
 /// Read the shipping lease registry. `leases`, `armed` and `sweeping` are the
@@ -952,9 +959,13 @@ fn real_video_reader_registry_refuses_a_replaced_recording() {
 
     let pinned_root = PinnedDir::open_resolved(&root).unwrap();
     let replacement = pinned_root.child(&fresh).unwrap();
-    let error =
-        crate::control_auth::retain_video_artifact_path(pinned_root, fresh.clone(), &replacement)
-            .expect_err("a replacement cannot join the live lease group");
+    let error = crate::control_auth::retain_video_artifact_path(
+        pinned_root,
+        fresh.clone(),
+        &replacement,
+        &crate::control::ArtifactBudgets::shipping(),
+    )
+    .expect_err("a replacement cannot join the live lease group");
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     let refused = observe_reader(&model, &key, false, true);
     assert_transition(
@@ -1018,7 +1029,7 @@ fn real_snapshot_generation_fence_conforms_and_rejects_stale_commit_mutant() {
     );
     assert_eq!(initial, model.init_state());
 
-    write_snapshot_artifacts(&SnapshotPng::encode(&frame_one), "generation-one", &first)
+    write_snapshot_artifacts(&encode_frame_png(&frame_one), "generation-one", &first)
         .expect("commit generation one");
     assert_eq!(marker_generation(&done_path), 1);
     let committed_one = project_snapshot(
@@ -1058,7 +1069,7 @@ fn real_snapshot_generation_fence_conforms_and_rejects_stale_commit_mutant() {
         "snapshot generation-two begin",
     );
 
-    let stale = write_snapshot_artifacts(&SnapshotPng::encode(&frame_one), "stale", &first)
+    let stale = write_snapshot_artifacts(&encode_frame_png(&frame_one), "stale", &first)
         .expect_err("superseded worker must fail closed");
     assert!(stale.contains("superseded"));
     assert!(!done_path.exists());
@@ -1090,7 +1101,7 @@ fn real_snapshot_generation_fence_conforms_and_rejects_stale_commit_mutant() {
         &selected_two,
         "snapshot scheduler selects current worker",
     );
-    write_snapshot_artifacts(&SnapshotPng::encode(&frame_two), "generation-two", &second)
+    write_snapshot_artifacts(&encode_frame_png(&frame_two), "generation-two", &second)
         .expect("current worker commits");
     assert_eq!(marker_generation(&done_path), 2);
     assert_eq!(

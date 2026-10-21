@@ -237,7 +237,7 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
 /// screen, which streaming output can overwrite cell by cell under an unchanged
 /// row number. Rows above are archived history, immutable except for eviction and
 /// wholesale renumbering, which the engine already accounted for (the same
-/// argument `CachedSearchIndex` relies on).
+/// argument a search index's refresh relies on, `SearchKey::refreshable_from`).
 ///
 /// `live_top_abs` is `absolute_row_counter − rows`, i.e. `Grid::base_y()`, not
 /// `top_visible_absolute_row()`, which folds in `display_offset` and would make
@@ -316,10 +316,11 @@ pub(crate) struct CountFacts {
     pub(crate) searched_lines: Option<usize>,
     /// The list stopped at [`aterm_search::MAX_SEARCH_MATCHES`].
     pub(crate) match_capped: bool,
-    /// A regex scan could not finish some line within the line's budget
-    /// ([`aterm_search::SearchResults::cut_short_lines`]): a soft-wrapped run
-    /// of megabytes, say. Its matches up to where the scan stopped are counted;
-    /// the rest of that line was not searched.
+    /// Some line was not searched to its end
+    /// ([`aterm_search::SearchResults::cut_short_lines`]): a regex scan could
+    /// not finish it within the line's budget (a soft-wrapped run of megabytes,
+    /// say), or it is a history line read only up to its first MiB. Its matches
+    /// up to that point are counted; the rest of that line was not searched.
     pub(crate) cut_short: bool,
 }
 
@@ -363,7 +364,7 @@ impl CountFacts {
     }
 
     /// `long line partly searched` (`short`: `line cut short`, which fits the
-    /// bar's status zone) when a regex scan could not finish some line. A word
+    /// bar's status zone) when some line was not searched to its end. A word
     /// of its own beside the cause, because it says what the depth cap and the
     /// match limit do not: matches are missing INSIDE the history that was
     /// searched.
@@ -530,8 +531,8 @@ pub(crate) struct SearchState {
     /// The batch stopped at [`aterm_search::MAX_SEARCH_MATCHES`]: there are
     /// more hits than the list holds. Implies [`Self::truncated`].
     pub(crate) match_capped: bool,
-    /// A regex scan could not finish some line within its budget, so the rest
-    /// of that line went unsearched ([`CountFacts::cut_short`]). Implies
+    /// Some line was not searched to its end: a regex scan out of budget, or a
+    /// history line read only up to its first MiB ([`CountFacts::cut_short`]). Implies
     /// [`Self::truncated`].
     pub(crate) cut_short: bool,
     /// The search ran while a width change's rewrap held the session's history
@@ -1219,10 +1220,12 @@ impl App {
                 true,
             )
         } else {
-            // No viewport snap before searching. `search_full_history_direction` never
-            // reads `display_offset`, and the `base_y()` the result is tagged with is
+            // No viewport snap before searching. `search_full_history_direction` reads
+            // every row, its soft-wrap flag included, from the live frame
+            // (`Terminal::read_search_rows`, `Terminal::logical_origin`), never through
+            // `display_offset`, and the `base_y()` the result is tagged with is
             // display-offset-independent, so the stated rationale for snapping — stable
-            // coordinates — was already true without moving the user's view.
+            // coordinates — holds without moving the user's view.
             let engine_direction = match direction {
                 SearchDirection::Forward => EngineSearchDirection::Forward,
                 SearchDirection::Backward => EngineSearchDirection::Backward,
@@ -2442,7 +2445,6 @@ mod tests {
     /// recompute — which does have the real number — drops it again.
     #[test]
     fn output_since_the_count_is_marked_on_the_glass_and_on_the_wire() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -2528,7 +2530,6 @@ mod tests {
     /// sees the whole glass across such a grow, whatever the grid's bookkeeping.
     #[test]
     fn growing_the_window_after_a_clear_keeps_the_visible_screen_searchable() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -2579,7 +2580,6 @@ mod tests {
     /// refreshed band for a wrongly keyed index to misfile.
     #[test]
     fn shrinking_the_window_after_a_screen_clear_keeps_history_correctly_keyed() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -2953,7 +2953,6 @@ mod tests {
     /// and legacy Cmd-F resets an open search to forward/first-match behavior.
     #[test]
     fn emacs_direction_reversal_repeat_wrap_empty_recall_and_cmd_f_legacy() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -2998,7 +2997,6 @@ mod tests {
     /// Emacs point semantics instead of jumping to a global buffer extreme.
     #[test]
     fn emacs_search_is_anchored_to_scrolled_viewport_in_both_directions() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -3060,7 +3058,6 @@ mod tests {
     /// navigates relative to the old point, so a newly appended hit is visible.
     #[test]
     fn streaming_output_marks_search_dirty_then_repeat_refreshes_latest_content() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -3108,7 +3105,6 @@ mod tests {
     /// while its live-screen twin keeps passing.
     #[test]
     fn streaming_output_keeps_a_scrollback_highlight_alive() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -3157,7 +3153,6 @@ mod tests {
     /// anything. Positioning by absolute row makes "no row" mean "no movement".
     #[test]
     fn opening_find_with_nothing_to_show_does_not_move_the_viewport() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -3201,7 +3196,6 @@ mod tests {
     /// because a splice only renumbers rows BELOW the insertion point.
     #[test]
     fn cancel_restores_a_scrolled_back_origin_across_a_footer_splice() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let rows = app.windows[&wid].rows;
@@ -3249,7 +3243,6 @@ mod tests {
     /// the viewport.
     #[test]
     fn a_neutral_close_parks_the_find_origin_for_the_next_open() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -3290,7 +3283,6 @@ mod tests {
 
     #[test]
     fn query_edit_after_repeat_stays_at_emacs_point() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -3318,7 +3310,6 @@ mod tests {
 
     #[test]
     fn resize_without_output_wake_cannot_step_or_accept_stale_results() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
@@ -3593,7 +3584,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn emacs_navigation_conforms_to_derived_transition_model() {
-        let _serial = crate::control::search_cap_test_guard();
         let model = aterm_models_render::emacs_search_navigation_model();
         emacs_navigation_trace(&model, no_nav_patch).unwrap_or_else(|why| panic!("{why}"));
 
@@ -3644,7 +3634,6 @@ mod tests {
     /// hit is still current, never a stale or transient first hit.
     #[test]
     fn codex_protected_footer_refresh_preserves_backward_last_match() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let rows = app.windows[&wid].rows;
@@ -3690,7 +3679,6 @@ mod tests {
     /// strict comparison would incorrectly skip this first retained hit.
     #[test]
     fn codex_protected_footer_forward_refresh_keeps_row_zero_match() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let rows = app.windows[&wid].rows;
@@ -3727,7 +3715,6 @@ mod tests {
     /// restores it, with backward initial selection correct in both modes.
     #[test]
     fn claude_classic_and_alternate_active_grid_search_routing() {
-        let _serial = crate::control::search_cap_test_guard();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();

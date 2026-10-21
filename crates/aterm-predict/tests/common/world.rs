@@ -13,9 +13,12 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use aterm_core::grid::LineSize;
-use aterm_core::render::RenderInput;
+use aterm_core::render::{RenderInput, SpanCell};
 use aterm_core::terminal::{RenderCell, Terminal};
-use aterm_predict::{EditKey, EditOutcome, KeySample, PredictMode, Predictor, Rule, Seen};
+use aterm_predict::{
+    EditKey, EditOutcome, EditorContext, GhostCell, InputStart, KeySample, PredictMode, Predictor,
+    Rule, Seen,
+};
 use aterm_spec::rng::XorShift;
 
 /// A small screen, so lines wrap and the bottom row scrolls within a few keys.
@@ -33,6 +36,10 @@ pub(crate) const SETTLE: Duration = Duration::from_millis(2001);
 pub(crate) const ECHO_DEADLINE: Duration = Duration::from_millis(250);
 /// The shell prompt the line editor prints.
 pub(crate) const PROMPT: &str = "$ ";
+
+/// The prompt a shell's `reset-prompt` redraws in [`PROMPT`]'s place and back
+/// ([`Unprompted::ResetPrompt`]): another width, so the buffer moves.
+pub(crate) const WIDE_PROMPT: &str = "$$$ ";
 /// The right prompt the line editor draws with each prompt under
 /// [`Config::rprompt`], zsh's RPROMPT: at the right edge, one column short of
 /// it (zsh's `ZLE_RPROMPT_INDENT`), in italics, which is how this file tags a
@@ -43,6 +50,10 @@ pub(crate) const RPROMPT: &str = "<r>";
 pub(crate) const TEXT: [char; 14] = [
     'a', 'b', 'c', 'd', 'e', 'i', 'n', 'o', 's', ' ', ' ', 'é', '日', '\u{301}',
 ];
+/// The right-to-left letter a press now and then types under
+/// [`Config::bidi`]: Hebrew alef, one cell wide, which the engine's implicit
+/// BiDi draws in another order beside another right-to-left letter.
+pub(crate) const RTL: char = '\u{5d0}';
 
 pub(crate) type KeyId = usize;
 
@@ -56,6 +67,11 @@ pub(crate) enum Key {
     Left,
     Right,
     Enter,
+    /// Home, End, Ctrl-A, Ctrl-E or Delete: a LEARNED key, handed to
+    /// `Predictor::predict_edit` with the shell's authenticated buffer start
+    /// (`Terminal::input_region_start`); the far end does what its keymap binds
+    /// it to ([`Keymap`]).
+    Learned(EditKey),
     Unmodelled(Unmodelled),
     Paste(Vec<char>),
 }
@@ -68,21 +84,27 @@ pub(crate) enum Unmodelled {
     KillLine,
     KillWord,
     Interrupt,
-    /// Home or Ctrl-A: to the start of the buffer.
-    Home,
-    /// End or Ctrl-E: to the end of the buffer.
-    End,
-    /// The Delete key (`ESC [ 3 ~`): the glyph under the cursor erased.
-    DeleteKey,
     /// Alt-B: back to the start of the word (a word motion is not an arrow).
     WordLeft,
     /// Up: the previous command from history, replacing the line.
     Up,
     /// Escape alone: a prefix the editor waits on, nothing drawn.
     Esc,
-    /// The keypad's Left under DECKPAM (`ESC O t`): no motion; readline and
-    /// zle leave it unbound.
+    /// The keypad's Left while a Kitty mode that reports the keypad is on
+    /// (DISAMBIGUATE: `CSI 57417 u`): no motion; readline and zle leave it
+    /// unbound. Under the legacy encoder the keypad's Left sends the main
+    /// block's `ESC [ D` and is [`Key::Left`].
     KeypadLeft,
+    /// zsh's push-line (`ESC q`): the buffer goes onto the buffer stack, the
+    /// line is cleared, and the prompt after the next command pops it pre-filled
+    /// (`Program::push_line`). Under readline the pre-filled prompt is bash's
+    /// operate-and-get-next's, whose `B` is drawn before the line.
+    PushLine,
+    /// Ctrl-K, kill-line: the buffer from the cursor to its end is erased
+    /// (`Program::kill_to_end`). The theorem's generator never presses it
+    /// (`Sim::key_for`); the measurement's corpus does (`tests/editing_win.rs`,
+    /// a line retyped after Ctrl-A Ctrl-K).
+    KillToEnd,
 }
 
 /// Output the program produced with nobody typing.
@@ -106,9 +128,27 @@ pub(crate) enum Unprompted {
     SilentNoEcho,
     EchoOn,
     Ris,
+    /// The shell re-executes itself with the next [`Keymap`] (`exec zsh` with
+    /// another setup), the host re-keys its integration nonce for it, and it
+    /// draws a fresh prompt signed with the new one: a new editor context.
+    Rebind,
+    /// A program prints an OSC 133 `A` and `B` with no nonce at the cursor (a
+    /// `cat` of a log that holds them): the nonce gate drops both.
+    ForgedMark,
+    /// The shell pushes Kitty `DISAMBIGUATE` (fish 4 does at its prompt) or
+    /// modifyOtherKeys level 2 (a precmd's `CSI > 4;2 m`, or a program's left
+    /// behind), or pops what it pushed: Ctrl-A then arrives as `CSI 97;5u` or
+    /// `CSI 27;5;97~`, which no keymap here binds.
+    KittyChords,
+    /// zsh's `reset-prompt` (an async prompt segment resolving, a vi-mode
+    /// indicator): the prompt redrawn in place, [`PROMPT`] and [`WIDE_PROMPT`]
+    /// in turn, the buffer after it. zle-line-init does not run, so no new `B`
+    /// is sent: the engine keeps the old one where it stood.
+    ResetPrompt,
 }
 
-pub(crate) const UNPROMPTED: [Unprompted; 18] = [
+pub(crate) const UNPROMPTED: [Unprompted; 19] = [
+    Unprompted::ResetPrompt,
     Unprompted::Notice,
     Unprompted::Redraw,
     Unprompted::RightPrompt,
@@ -192,8 +232,9 @@ pub(crate) enum Host {
     /// Hands Alt-B, a word motion, to the predictor as a bare `←` (FRAME
     /// FIDELITY: the far end goes back a word, the frame a cell).
     WordMotionAsArrow,
-    /// Hands the keypad's Left, which DECKPAM turns into `ESC O t`, to the
-    /// predictor as `←` (FRAME FIDELITY: the far end does not move).
+    /// Hands the keypad's Left, which Kitty DISAMBIGUATE sends as
+    /// `CSI 57417 u`, to the predictor as `←` (FRAME FIDELITY: the far end does
+    /// not move).
     KeypadArrowAsArrow,
     /// Draws a state chain's cursor as it draws the glyph lane's, one past the
     /// newest ghost it painted, instead of the chain's own (FRAME FIDELITY: a
@@ -205,6 +246,46 @@ pub(crate) enum Host {
     /// Draws a state chain's cursor without asking about its own cell (CURSOR
     /// LOCALITY: a cursor on a wide glyph's right half).
     CursorOnAContinuation,
+    /// Draws a state chain's cursor whether or not the span painter took its
+    /// cells (ATOMICITY: a state's cursor over a frame that shows another
+    /// state's cells).
+    CursorWithoutSpan,
+    /// Paints a shift's span on to the margin, the rest of the row moved with
+    /// the text the predictor knows, as ICH would move it (LOCALITY: a right
+    /// prompt or a suggestion past the line, which the far end leaves or
+    /// clears, moved on glass).
+    PaintsPastTheLine,
+    /// Remembers the cell of the last input start it read, not which prompt it
+    /// was, and hands it on whatever happened since, a command started or the
+    /// rows moved, as a prompt no line terminator was pressed at (FRAME
+    /// FIDELITY: a program's own prompt where the shell's stood is taken for
+    /// the shell's buffer, and Home there for beginning-of-line). Handed with
+    /// the prompt it was read at, the first-key gate refuses it: a terminator
+    /// pressed at that prompt.
+    StaleInputStart,
+    /// Takes the input start from any OSC 133 `B` the engine kept, and the
+    /// prompt a line terminator is pressed at from any `A`, with the
+    /// capability-nonce gate never turned on (FRAME FIDELITY: a mark a
+    /// program printed at the end of a pre-filled line, saying it stands where
+    /// the buffer starts, is taken for the buffer's start).
+    UnsignedInputStart,
+    /// Takes the input start from the signed `B` of the prompt in front without
+    /// asking whether it says it stands where the buffer starts (FRAME
+    /// FIDELITY: zsh's `B` after a line pre-filled from its buffer stack is
+    /// taken for the buffer's start, and Home there for beginning-of-line).
+    UnattestedInputStart,
+    /// Hands the predictor one editor context forever (FRAME FIDELITY: the
+    /// bindings one shell taught are used in the next, which binds otherwise).
+    StaleEditorContext,
+    /// Never asks the terminal's Kitty keyboard mode, neither for R-KITTY nor
+    /// for the editor context (FRAME FIDELITY: Ctrl-A goes out as `CSI 97;5u`,
+    /// which the far end does not bind, and is shown as beginning-of-line).
+    IgnoresKittyChords,
+    /// Asks only Kitty's keyboard mode whether control chords go out escaped,
+    /// for R-KITTY and the editor context (FRAME FIDELITY: under
+    /// modifyOtherKeys level 2 Ctrl-A goes out as `CSI 27;5;97~`, which the far
+    /// end does not bind, and is shown as beginning-of-line).
+    IgnoresModifyOtherKeys,
     /// aterm's wiring around a predictor with one [`Rule`] switched off
     /// (`Predictor::disable_rule_for_test`): the clause that rule keeps.
     Rule(Rule),
@@ -216,15 +297,23 @@ impl Host {
         match self {
             Self::Faithful => None,
             Self::FrozenCoordinates | Self::BlindToAltScreen => Some("provenance"),
-            Self::PaintsBesideTheGuess | Self::PaintsOverWideGlyphs => Some("locality"),
+            Self::PaintsBesideTheGuess | Self::PaintsOverWideGlyphs | Self::PaintsPastTheLine => {
+                Some("locality")
+            }
             Self::ForcesAlways => Some("secrecy"),
             Self::IgnoresLineSubmits | Self::IgnoresAmbiguousWidth => Some("fidelity"),
             Self::TailBlind
             | Self::WordMotionAsArrow
             | Self::KeypadArrowAsArrow
-            | Self::CursorAfterNewestGlyph => Some("frame-fidelity"),
+            | Self::CursorAfterNewestGlyph
+            | Self::StaleInputStart
+            | Self::UnsignedInputStart
+            | Self::UnattestedInputStart
+            | Self::StaleEditorContext
+            | Self::IgnoresKittyChords
+            | Self::IgnoresModifyOtherKeys => Some("frame-fidelity"),
             Self::KeepsStaleGhosts | Self::StaleClock => Some("timeliness"),
-            Self::PaintsPartialState => Some("atomicity"),
+            Self::PaintsPartialState | Self::CursorWithoutSpan => Some("atomicity"),
             Self::CursorOnAContinuation => Some("cursor-locality"),
             Self::Rule(rule) => rule_clause(rule),
         }
@@ -238,7 +327,21 @@ impl Host {
     }
 }
 
-pub(crate) const MUTANT_HOSTS: [Host; 19] = [
+/// The mutants the seeded sweep catches, each in its clause
+/// (`the_checker_catches_every_mutant_host_in_its_clause`). The rest are caught
+/// at their named cases only: `TailBlind` at `mid_line_over_a_space` (the
+/// sweep's case that caught it moved when increment 4 put the integration
+/// in the world), and the input-start, Kitty and end-of-line mutants at the
+/// learned keys' cases, whose interleavings (a forged mark at the cell a line
+/// then starts on, a program's prompt where the shell's stood, a learned
+/// chord under a pushed Kitty mode or modifyOtherKeys, a suggestion at the end
+/// of a burst, a line pre-filled from zsh's buffer stack) the sweep does not
+/// reach on its seed. `StaleEditorContext` and `WitnessFreshPrompt` switched
+/// off left the sweep when the first-key gate and the push-line and
+/// reset-prompt motifs changed which lines it witnesses; each is caught at its
+/// named case (`a_new_shell_relearns_its_bindings`,
+/// `home_after_a_tab_completion_is_not_predicted`).
+pub(crate) const MUTANT_HOSTS: [Host; 20] = [
     Host::FrozenCoordinates,
     Host::BlindToAltScreen,
     Host::PaintsBesideTheGuess,
@@ -246,7 +349,6 @@ pub(crate) const MUTANT_HOSTS: [Host; 19] = [
     Host::ForcesAlways,
     Host::IgnoresLineSubmits,
     Host::IgnoresAmbiguousWidth,
-    Host::TailBlind,
     Host::KeepsStaleGhosts,
     Host::StaleClock,
     Host::Rule(Rule::ExpiryOwes),
@@ -254,10 +356,12 @@ pub(crate) const MUTANT_HOSTS: [Host; 19] = [
     Host::CursorAfterNewestGlyph,
     Host::Rule(Rule::SmallestMatch),
     Host::Rule(Rule::NetNullUncredited),
-    Host::Rule(Rule::WholeStateMatch),
     Host::Rule(Rule::MotionClassProof),
     Host::Rule(Rule::StateExpiryFlushes),
     Host::Rule(Rule::CarryCursor),
+    Host::Rule(Rule::InsertShiftProof),
+    Host::Rule(Rule::EraseShiftProof),
+    Host::Rule(Rule::LearnedBindings),
 ];
 
 /// The clause a predictor rule keeps, which a run with it switched off must
@@ -285,37 +389,124 @@ pub(crate) const MUTANT_HOSTS: [Host; 19] = [
 ///   leaves a line that still echoes.
 /// * `VacateRefusal` off arms an erase beside text past the end of the line. In
 ///   this world that text is decoration (a suggestion, a right prompt), which an
-///   erase leaves or clears and the decoration rule counts; an unseen buffer tail
-///   it would pull left needs a line known only up to the middle of its buffer,
-///   which no line here is (the known line grows only from proved appends).
+///   erase leaves, clears or fetches anew into the vacated cell
+///   (`Editor::Autosuggest`), and the decoration rule counts each
+///   (`late_decoration`: the vacated blank under the suggestion fetched there);
+///   an unseen buffer tail it would pull left needs a line known only up to the
+///   middle of its buffer, which no line here is (the known line grows only from
+///   proved appends and states the whole screen matched).
+///   Two hundred seeds with it off find none, once a Backspace beside an unproven
+///   shift no longer cancels its glyph (`CancelsOnlyKnownShifts`, whose break this
+///   rule had masked at seed index 152).
+/// * `MidLineDeclineFlushes` off declines a glyph typed inside the text that a
+///   chain cannot place as a glyph at the end of the line is declined, its
+///   pixels kept. The far end reads it after every op in flight, so each op's
+///   output settles before its echo moves the tail, and the frames showing them
+///   are held to those settled screens; a frame caught with its output landed
+///   finds an opaque wide glyph or a state no longer matched, and flushes. The
+///   flush stays as the fail-closed choice (a frame between two pieces of that
+///   output is no settled screen), pinned by the predictor's unit test and the
+///   named case `a_wide_glyph_mid_line_retires_the_tail`.
+///   Two hundred seeds with it off find none.
 /// * `EditOpsOwe` off owes nothing for a declined arrow or a flushed motion. An
 ///   arrow moves only the cursor, and a guess typed after one with nothing
 ///   placed is a glyph-lane guess at the live cursor whose proof the tail guard
 ///   and the cursor advance already refuse; the sweep finds no counterexample.
+/// * `InsideRunsNeverProve` off lets a glyph-lane run started inside the known
+///   text prove as the tail guard reads it. Since a glyph typed inside the text
+///   is a shift of the edit lane, such a run is one the lane refused, and in
+///   this twelve-column world that is R-ROW's refusal: the line's end, one
+///   cell on, at the last column. The glyph typed after the run's echo then
+///   pushes the tail past the margin, which leaves the editor's model, and the
+///   frame showing it is out of FRAME FIDELITY's scope. The unit test
+///   `a_run_started_inside_the_text_proves_nothing` holds the rule to the frame
+///   between its glyph and its tail redraw, where the proof is earned.
+///   Two hundred seeds with it off find none.
+/// * `CancelOwesItsBlank` off credits a space typed on a cancelled cell with
+///   the erase's blank, caught part-way (`\b ` landed, the step back not),
+///   a credit ATTRIBUTION leaves out while the erase's own output is in
+///   transit; the step back onto that cell then takes the credit back
+///   (`CreditTakenBack`, the review of increment 4), before the space typed
+///   next can be credited with the first one's real echo, which is what its
+///   named case `a_cancelled_glyph_s_erase_is_no_space_s_echo` found. The unit
+///   test of the same name holds it to the part-way frame.
+/// * `CancelsOnlyKnownShifts` off pops a glyph typed inside the text with the
+///   Backspace after it, as a pair that cancels, while overwrite mode replaced
+///   a glyph with it and rubbed it out: the line lost a glyph its states still
+///   hold. Once that output lands its cell reads blank (or the tail moved onto
+///   it), and the transit wait now takes a blank only where an op of the chain
+///   writes one (`TransitBlanks`, the review of increment 5): the `←` left in
+///   flight writes none, so the chain is flushed before any frame on a settled
+///   base shows it, which is what its named case
+///   `a_backspace_cancels_no_glyph_of_an_unproven_shift` found. The unit test of
+///   the same name holds it with `TransitBlanks` off too.
+/// * `ScrollKeepsFirstKey` off shuts THE FIRST KEY's gate at a coordinate move,
+///   as the reset it runs does: fewer lines are witnessed, and nothing more is
+///   shown. The measurement of what predictive editing buys
+///   (`tests/editing_win.rs`) counts the lines witnessed with it on and off.
+/// * `ScreenAsItWas` off flushes a head guess whose cell still shows the glyph
+///   its press read there, as the predictor did before the review of phase 0:
+///   a glyph typed over text goes at the first frame after its press, and
+///   nothing more is shown. The measurement's `Baseline` switches it off with
+///   every other rule, which is what makes that variant the predictor before
+///   the plan; its unit test holds the wait and the flush.
 pub(crate) fn rule_clause(rule: Rule) -> Option<&'static str> {
     match rule {
-        Rule::ExpiryOwes | Rule::CancelTransit | Rule::UncreditedVoids | Rule::StaleAnchor => {
-            Some("fidelity")
-        }
+        Rule::ExpiryOwes
+        | Rule::EngineWrapFlag
+        | Rule::CancelTransit
+        | Rule::UncreditedVoids
+        | Rule::StaleAnchor
+        | Rule::StaleCancel
+        | Rule::CursorReach => Some("fidelity"),
         Rule::TypedOwesSameGlyph
         | Rule::CursorAdvance
         | Rule::CancelOwes
         | Rule::SmallestMatch
-        | Rule::NetNullUncredited => Some("attribution"),
+        | Rule::NetNullUncredited
+        | Rule::ParkedAtTheEnd
+        | Rule::ChainAttributedWhole
+        | Rule::EditOwedAfter
+        | Rule::InPlaceReadsFewer
+        | Rule::PartWayEchoes
+        | Rule::PartWayStepBack => Some("attribution"),
         Rule::TailGuard
         | Rule::StandingTail
         | Rule::MotionClassProof
         | Rule::ProofsEndWithTheEpoch
         | Rule::TextEdges
-        | Rule::CarryCursor => Some("frame-fidelity"),
+        | Rule::CarryCursor
+        | Rule::MarkedEcho
+        | Rule::InsertShiftProof
+        | Rule::EraseShiftProof
+        | Rule::ShiftProofDistinguishes
+        | Rule::RightToLeftRows
+        | Rule::WitnessFreshPrompt
+        | Rule::WitnessFirstKey
+        | Rule::LearnedBindings
+        | Rule::EndRefusal
+        | Rule::OpaqueHead
+        | Rule::TransitBlanks => Some("frame-fidelity"),
         Rule::WholeStateMatch => Some("provenance"),
+        Rule::TransitReach
+        | Rule::SpaceNeverProves
+        | Rule::StandingGlyph
+        | Rule::DarkBehindAWait
+        | Rule::FloorBelow => Some("secrecy"),
+        Rule::CreditTakenBack => Some("attribution"),
         Rule::StateExpiryFlushes => Some("timeliness"),
         Rule::TypedOwes
         | Rule::TypedOwesCleanTail
         | Rule::VacatedBlankInMatch
         | Rule::MotionsNeverProve
         | Rule::VacateRefusal
-        | Rule::EditOpsOwe => None,
+        | Rule::EditOpsOwe
+        | Rule::MidLineDeclineFlushes
+        | Rule::InsideRunsNeverProve
+        | Rule::CancelOwesItsBlank
+        | Rule::CancelsOnlyKnownShifts
+        | Rule::ScrollKeepsFirstKey
+        | Rule::ScreenAsItWas => None,
     }
 }
 
@@ -341,6 +532,52 @@ pub(crate) struct Config {
     /// The far end's line editor at the prompt, in the byte forms each sends
     /// ([`Editor`]).
     pub(crate) editor: Editor,
+    /// Now and then a glyph typed is a right-to-left letter (`א`), which the
+    /// engine's implicit BiDi draws in another order: a row a state chain can
+    /// name no cell of (R-OPAQUE).
+    pub(crate) bidi: bool,
+    /// aterm's shell integration, as aterm-gui runs it for a shell it spawned:
+    /// the host authorizes a capability nonce and requires it (as
+    /// `launch_witness.rs` does), and the far end signs its OSC 133 `A`, `B`,
+    /// `C` and `D` marks with it. The host then hands the predictor the
+    /// authenticated buffer start (`Terminal::input_region_start`), and Home,
+    /// End, Ctrl-A, Ctrl-E and Delete are learned keys; without it they stay
+    /// input the predictor does not model.
+    pub(crate) integration: bool,
+    /// What the far end's line editor binds Home, End, Ctrl-A, Ctrl-E and
+    /// Delete to ([`Keymap`]); [`Unprompted::Rebind`] moves to the next.
+    pub(crate) keymap: Keymap,
+}
+
+/// What a line editor binds the learned keys to, each as measured (zsh 5.9
+/// `-f` and with aterm's integration, its vi insert mode; bash 3.2.57's
+/// readline). The predictor assumes none of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keymap {
+    /// readline, and zsh with aterm's integration (which binds Home, End and
+    /// Delete in the keymap it loads into): Home and Ctrl-A beginning-of-line,
+    /// End and Ctrl-E end-of-line, Delete delete-char (a beep at the end).
+    Canonical,
+    /// `zsh -f`: Home and End are undefined keys (a beep, nothing moves), and
+    /// `ESC [ 3 ~` reads as an undefined prefix and a `~`, which is inserted;
+    /// Ctrl-A and Ctrl-E are beginning- and end-of-line.
+    ZshVanilla,
+    /// zsh's vi insert mode: Ctrl-A and Ctrl-E self-insert, drawn `^A` and `^E`
+    /// (two cells each); Home, End and Delete as the integration binds them.
+    ViIns,
+}
+
+/// The keymaps [`Unprompted::Rebind`] cycles through, and a sweep rotates.
+pub(crate) const KEYMAPS: [Keymap; 3] = [Keymap::Canonical, Keymap::ZshVanilla, Keymap::ViIns];
+
+/// The session id the world's host hands the predictor's editor context: one
+/// session, swapped away and back by a host reset.
+pub(crate) const SESSION: u64 = 1;
+
+/// The capability nonce the host authorizes for the `n`-th shell of a case
+/// (each [`Unprompted::Rebind`] re-keys).
+pub(crate) fn nonce(n: u8) -> [u8; 32] {
+    [0xA0 ^ n; 32]
 }
 
 /// The far end's line editor, each in the byte forms measured from it (bash
@@ -368,14 +605,33 @@ pub(crate) enum Editor {
     /// erases the line's last character (`\b \b`, twice for a `^X` cell pair).
     /// No motion is ever exact here, so no motion may ever show.
     Cooked,
+    /// readline in overwrite mode (`overwrite-mode`, bound to Insert): a glyph
+    /// typed inside the line REPLACES the glyph under the cursor, written in
+    /// place; a Backspace inside it blanks the glyph before the cursor (`\b
+    /// \b`) and moves nothing; at the end of the line both act as in insert
+    /// mode. Motions and edges are readline's. No shift is ever exact here, so
+    /// no shift may ever show.
+    Overwrite,
+    /// zle with an autosuggestion plugin (zsh-autosuggestions' behaviour): a
+    /// suggestion is drawn dim after the buffer, from history, after an append
+    /// whose glyph does not continue it; a glyph that does continue it
+    /// consumes its first cell; any edit inside the buffer clears it and now
+    /// and then finds one for the new buffer, drawn after its new end (it
+    /// moves with the buffer's end as a shifted tail does); an erase at the end
+    /// fetches it anew (into the cell the erase vacated); `→` at the end of the
+    /// buffer, or End, ACCEPTS it into the buffer. The suggestion
+    /// is DECORATION, which moves and changes as the far end pleases.
+    Autosuggest,
 }
 
 /// The editors a sweep rotates through.
-pub(crate) const EDITORS: [Editor; 4] = [
+pub(crate) const EDITORS: [Editor; 6] = [
     Editor::ReadlineIch,
     Editor::Readline,
     Editor::Zle,
     Editor::Cooked,
+    Editor::Overwrite,
+    Editor::Autosuggest,
 ];
 
 /// A coordinate space: a content generation and a screen epoch (bumped by every
@@ -442,6 +698,34 @@ pub(crate) struct KeyLog {
     /// The edit key the host handed the predictor for this press, if any: what
     /// the PROVENANCE oracle folds it as.
     edit: Option<EditKey>,
+    /// How Ctrl-A or Ctrl-E went out: under the keyboard mode the terminal
+    /// had at the press (its C0 byte for every other key).
+    chord: ChordForm,
+}
+
+/// How a control chord went out ([`KeyLog::chord`]), as the terminal's keyboard
+/// mode at its press encoded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChordForm {
+    /// Its C0 byte: `SOH` for Ctrl-A.
+    Byte,
+    /// A Kitty mode that reports functional keys: `CSI 97;5u`.
+    Kitty,
+    /// xterm's modifyOtherKeys at level 2: `CSI 27;5;97~`.
+    ModifyOtherKeys,
+}
+
+impl ChordForm {
+    /// How a chord goes out under `term`'s keyboard mode now.
+    fn of(term: &Terminal) -> Self {
+        if term.kitty_reports_functional_keys() {
+            Self::Kitty
+        } else if term.control_chords_escaped() {
+            Self::ModifyOtherKeys
+        } else {
+            Self::Byte
+        }
+    }
 }
 
 /// The cursor a state chain's frame carries: the predictor's, and the one the
@@ -462,6 +746,9 @@ pub(crate) struct FrameShown {
     decoration: Vec<Vec<bool>>,
     /// Frame cells a ghost was painted on.
     ghosts: Vec<(usize, usize)>,
+    /// The ghosts that painted a BLANK over a cell the screen under them showed
+    /// text on: a state chain's vacated cells, an erase's effect, no glyph.
+    vacated: Vec<(usize, usize)>,
     /// The cursor the GUI draws one past the newest painted ghost; `None` at the
     /// right margin, where it clamps the column and the drawn cursor is a guess
     /// about the far end's wrap policy, not a claim.
@@ -470,6 +757,17 @@ pub(crate) struct FrameShown {
     unprompted: u64,
     /// The oldest pending guess's key at this frame.
     oldest: KeyId,
+    /// What learned keys the frame shows (a state chain holding one).
+    learned: LearnedShown,
+}
+
+/// Whether a displayed frame shows a learned key's op (Home, End, Ctrl-A,
+/// Ctrl-E, Delete), and whether one of them is a Delete: FRAME FIDELITY's
+/// comparisons of such frames are counted apart (`Stats::learned_fidelity_checks`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LearnedShown {
+    any: bool,
+    delete: bool,
 }
 
 /// One segment of program output: what it is, and which key caused it.
@@ -534,6 +832,48 @@ pub(crate) struct Program {
     /// The column the right prompt starts at on the prompt's row, while it is on
     /// screen: the editor erases it before the line reaches it.
     rprompt: Option<usize>,
+    /// [`Editor::Autosuggest`]'s suggestion, drawn right after the buffer's end
+    /// while it is on screen; empty when there is none.
+    suggestion: Vec<char>,
+    /// The column the suggestion's first cell is on, while there is one.
+    suggestion_at: usize,
+    /// The shell signs its OSC 133 marks ([`Config::integration`]).
+    integration: bool,
+    /// Which shell of the case this is ([`nonce`]): each
+    /// [`Unprompted::Rebind`] is a new one, with a new nonce.
+    shell: u8,
+    /// What the line editor binds the learned keys to.
+    keymap: Keymap,
+    /// The prompt the shell draws now: [`PROMPT`], or [`WIDE_PROMPT`] after a
+    /// [`Unprompted::ResetPrompt`].
+    prompt: &'static str,
+    /// zsh's buffer stack ([`Unmodelled::PushLine`]): the line the next prompt
+    /// draws pre-filled.
+    pushed: Vec<char>,
+    /// A command the shell marked with `C` runs: its `D` is owed before the
+    /// next prompt's `A`.
+    running: bool,
+    /// The keyboard mode the shell pushed ([`Unprompted::KittyChords`]): Kitty
+    /// `DISAMBIGUATE` or modifyOtherKeys level 2, under which a control chord
+    /// goes out escaped, or neither.
+    chords: ChordForm,
+    /// How the key being read went out, if it is a control chord: as the
+    /// terminal's keyboard mode at its press encoded it (`KeyLog::chord`). What
+    /// the far end reads is the bytes the press sent, whatever its mode is by now.
+    reading_chord: ChordForm,
+    /// The cooked program a command started reads ONE line (`read -p`, after
+    /// clearing the screen and printing a prompt of its own), then the shell
+    /// prompts again.
+    reads_one_line: bool,
+    /// The words Tab completes ([`Sim::corpus_shell`]): the word before the
+    /// cursor, a unique proper prefix of one of them, completed to it and a
+    /// space; anything else a beep. Empty, Tab inserts `ion ` wherever it is
+    /// pressed, the theorem's completion, which no word decides.
+    completions: &'static [&'static str],
+    /// The lines Enter submitted, newest last, which Up recalls
+    /// ([`Sim::corpus_shell`]); `None`, Up recalls `ls -la` (the theorem's
+    /// history, one line).
+    history: Option<Vec<Vec<char>>>,
     /// The key being read, which everything emitted meanwhile is charged to.
     cause: Option<KeyId>,
     inbox: VecDeque<KeyId>,
@@ -563,6 +903,19 @@ impl Program {
             cat: false,
             cooked_cells: Vec::new(),
             rprompt: None,
+            suggestion: Vec::new(),
+            suggestion_at: 0,
+            integration: cfg.integration,
+            shell: 0,
+            keymap: cfg.keymap,
+            prompt: PROMPT,
+            pushed: Vec::new(),
+            running: false,
+            chords: ChordForm::Byte,
+            reading_chord: ChordForm::Byte,
+            reads_one_line: false,
+            completions: &[],
+            history: None,
             line: Vec::new(),
             cur: 0,
             noecho: false,
@@ -623,23 +976,112 @@ impl Program {
         }
     }
 
+    /// OSC 133 `mark` signed with this shell's nonce, as aterm's integration
+    /// sends it; nothing without the integration.
+    fn mark(&self, mark: &str) -> String {
+        self.mark_saying(mark, "")
+    }
+
+    /// [`Self::mark`] with `word` after the signature (`;aterm_input=start`,
+    /// as aterm's integration ends a `B` that stands where the buffer starts).
+    fn mark_saying(&self, mark: &str, word: &str) -> String {
+        if !self.integration {
+            return String::new();
+        }
+        format!(
+            "\x1b]133;{mark};id={}{word}\x07",
+            aterm_core::terminal::ShellIntegrationNonce(nonce(self.shell)).to_hex()
+        )
+    }
+
+    /// A command the shell runs starts: its `C` (after the line's newline,
+    /// from the shell's preexec), and its `D` owed.
+    fn start_command(&mut self) -> String {
+        self.running = self.integration;
+        self.mark("C")
+    }
+
+    /// The marks around a prompt about to be drawn: the `D` of a command that
+    /// ran, then the `A` before the prompt, and the `B` after it, where the
+    /// buffer starts, saying so: every caller draws it over an empty buffer.
+    fn prompt_marks(&mut self) -> (String, String) {
+        let done = if self.running {
+            self.mark("D;0")
+        } else {
+            String::new()
+        };
+        self.running = false;
+        (
+            format!("{done}{}", self.mark("A")),
+            self.mark_saying("B", ";aterm_input=start"),
+        )
+    }
+
+    /// The line editor is zle ([`Editor::Zle`], [`Editor::Autosuggest`]): its
+    /// `B` comes from zle-line-init, after zle drew the line.
+    fn zle(&self) -> bool {
+        matches!(self.editor, Editor::Zle | Editor::Autosuggest)
+    }
+
     /// Text printed at the start of a fresh row, then the prompt: the column is
-    /// exact again.
+    /// exact again. A line pushed onto the buffer stack ([`Unmodelled::PushLine`])
+    /// is popped into the buffer, pre-filled, the cursor after it. zle draws it
+    /// before zle-line-init runs, so its `B` lands after the text and does not
+    /// say it stands where the buffer starts (aterm's integration says so only
+    /// over an empty buffer); readline draws it after the prompt that ends in
+    /// the `B` (bash's operate-and-get-next, whose `B` is in PS1).
     fn prompt_after(&mut self, text: &str) {
-        self.reply(format!("{text}{PROMPT}"));
-        self.col = PROMPT.chars().count();
-        self.reliable = true;
+        let (a, b) = self.prompt_marks();
+        let prompt = self.prompt;
+        let held = std::mem::take(&mut self.pushed);
+        let line: String = held.iter().collect();
+        if held.is_empty() {
+            self.reply(format!("{text}{a}{prompt}{b}"));
+        } else if self.zle() {
+            let b = self.mark("B");
+            self.reply(format!("{text}{a}{prompt}{line}{b}"));
+        } else {
+            self.reply(format!("{text}{a}{prompt}{b}{line}"));
+        }
+        self.col = prompt.chars().count() + self.col_span(&held);
+        self.line = held;
+        self.cur = self.line.len();
+        // A pre-filled line that reaches the margin wraps: beyond this model.
+        self.reliable = self.col < self.cols;
         self.rprompt = None;
         // The right prompt, drawn in italics behind a cursor save and restore,
-        // where it leaves at least one column between it and the prompt.
+        // where it leaves at least one column between it and the prompt. zsh
+        // clears the row first (PROMPT_SP fills it with blanks and returns
+        // before the prompt): a prompt drawn on a row a wrapped line or a
+        // program left text on kept that text right of the right prompt, where
+        // the erase that hides it later took it away with it, the very frame
+        // before a correct ghost settling otherwise (seed index 1202 of the
+        // review of increment 4).
         let lo = self.cols.saturating_sub(1 + RPROMPT.chars().count());
         if self.draws_rprompt && lo > self.col + 1 {
             self.reply(format!(
-                "\x1b7\x1b[{}G\x1b[3m{RPROMPT}\x1b[23m\x1b8",
+                "\x1b[K\x1b7\x1b[{}G\x1b[3m{RPROMPT}\x1b[23m\x1b8",
                 lo + 1
             ));
             self.rprompt = Some(lo);
         }
+    }
+
+    /// zsh's push-line (`ESC q`): the buffer goes onto the buffer stack and
+    /// the line is cleared, the prompt redrawn alone; the next prompt pops it
+    /// pre-filled ([`Self::prompt_after`]). A line that wrapped leaves the
+    /// cursor below the prompt's row, where the carriage return does not
+    /// reach: beyond this model.
+    fn push_line(&mut self) {
+        let prompt = self.prompt;
+        if prompt.chars().count() + self.col_span(&self.line) >= self.cols {
+            self.reliable = false;
+        }
+        self.pushed = std::mem::take(&mut self.line);
+        self.reset_line();
+        self.reply(format!("\r\x1b[K{prompt}"));
+        self.col = prompt.chars().count();
+        self.rprompt = None;
     }
 
     /// Erase the right prompt before an insert that would bring the line up to
@@ -650,7 +1092,7 @@ impl Program {
             return;
         };
         let wide = self.wide;
-        let end = PROMPT.chars().count()
+        let end = self.prompt.chars().count()
             + self.line.iter().map(|&g| width(g, wide)).sum::<usize>()
             + width(c, wide);
         if self.cur < self.line.len() || end >= lo {
@@ -685,8 +1127,20 @@ impl Program {
             .collect()
     }
 
-    /// Cursor back over the tail after a redraw, as a fresh string.
+    /// The cells `chars` take on screen.
+    fn col_span(&self, chars: &[char]) -> usize {
+        chars.iter().map(|&c| width(c, self.wide)).sum()
+    }
+
+    /// Cursor back over the tail after a redraw, as a fresh string. While echo
+    /// is off the buffer is a secret, which no redraw shows: the prompt alone.
+    /// (Redrawn, it was the far end echoing the keys typed at its no-echo read,
+    /// which a frame then took for their echoes; the clause that holds such
+    /// keys dark cannot hold a far end that displays them.)
     fn line_redraw(&self) -> String {
+        if self.noecho {
+            return self.prompt.to_owned();
+        }
         let text: String = self.line.iter().collect();
         let tail: usize = self
             .line
@@ -695,10 +1149,11 @@ impl Program {
             .iter()
             .map(|&c| width(c, self.wide))
             .sum();
+        let prompt = self.prompt;
         if tail == 0 {
-            format!("{PROMPT}{text}")
+            format!("{prompt}{text}")
         } else {
-            format!("{PROMPT}{text}\x1b[{tail}D")
+            format!("{prompt}{text}\x1b[{tail}D")
         }
     }
 
@@ -713,9 +1168,29 @@ impl Program {
             self.hide_rprompt_for(c);
         }
         let kind = echo_of.map_or(SegKind::Reply, SegKind::Echo);
-        if self.cur < self.line.len() && width(c, self.wide) > 0 {
+        let w = width(c, self.wide);
+        if self.cur < self.line.len() && w > 0 {
             if self.col >= self.cols {
                 self.reliable = false; // an insert from the parked slot is beyond this model
+            }
+            if self.editor == Editor::Overwrite {
+                // Overwrite mode REPLACES the glyph under the cursor, written in
+                // place; nothing right of it moves. A glyph of another width
+                // than the one it replaces moves the tail after all: beyond this
+                // model.
+                let replaced = self.line.get(self.cur).copied().unwrap_or(' ');
+                if width(replaced, self.wide) != w {
+                    self.reliable = false;
+                }
+                self.put(kind, c);
+                if let Some(cell) = self.line.get_mut(self.cur) {
+                    *cell = c;
+                }
+                self.cur += 1;
+                if echo_of.is_some() && self.cur == self.line.len() {
+                    self.suggest_after(choice);
+                }
+                return;
             }
             // An insert whose shift pushes the tail past the right margin is
             // beyond it too: ICH drops what crosses the edge, where a real editor
@@ -728,10 +1203,15 @@ impl Program {
                 .iter()
                 .map(|&g| width(g, wide))
                 .sum();
-            if self.col + width(c, wide) + tail > self.cols {
+            if self.col + w + tail > self.cols {
                 self.reliable = false;
             }
-            if matches!(self.editor, Editor::Readline | Editor::Zle) {
+            if matches!(
+                self.editor,
+                Editor::Readline | Editor::Zle | Editor::Autosuggest
+            ) {
+                // The buffer's end before the insert: where a suggestion starts.
+                let end = self.col + tail;
                 // The glyph first, over the cell the tail starts on; then the
                 // tail one cell on; then the cursor back to just after the glyph.
                 self.put(kind, c);
@@ -743,9 +1223,29 @@ impl Program {
                 self.reply(back);
                 self.line.insert(self.cur, c);
                 self.cur += 1;
+                // An edit inside the buffer drops the suggestion: the shifted
+                // tail wrote over its first cell, the rest is blanked; then one
+                // for the new buffer may be found.
+                self.blank_suggestion(end + w);
+                self.refetch_after_edit(end + w);
                 return;
             }
-            self.reply(format!("\x1b[{}@", width(c, self.wide)));
+            // The gap ICH opens leaves a zero-width code point the cursor stands
+            // before (a combining mark, its base left of the cursor) drawn on
+            // that base, while the buffer now pairs it with the glyph inserted:
+            // the editor no longer knows its screen.
+            if self
+                .line
+                .get(self.cur)
+                .is_some_and(|&next| width(next, self.wide) == 0)
+            {
+                self.reliable = false;
+            }
+            self.reply(format!("\x1b[{w}@"));
+        }
+        if self.editor == Editor::Autosuggest && w > 0 && self.cur == self.line.len() {
+            self.append_along_suggestion(c, kind, echo_of.is_some(), choice);
+            return;
         }
         self.put(kind, c);
         self.line.insert(self.cur, c);
@@ -778,11 +1278,104 @@ impl Program {
         }
     }
 
-    /// Clear the line being edited.
+    /// [`Editor::Autosuggest`] appends `c` at the end of the buffer: a glyph that
+    /// continues the suggestion takes its first cell (written plain over it,
+    /// the rest left as it is); one that does not drops it, the rest of it
+    /// blanked; and a typed glyph (`typed`) may bring up a new one from
+    /// history (`choice`).
+    fn append_along_suggestion(&mut self, c: char, kind: SegKind, typed: bool, choice: u32) {
+        let continues = self.suggestion.first() == Some(&c) && self.suggestion_at == self.col;
+        self.put(kind, c);
+        self.line.push(c);
+        self.cur = self.line.len();
+        if continues {
+            self.suggestion.remove(0);
+            self.suggestion_at = self.col;
+            return;
+        }
+        self.blank_suggestion(self.col);
+        if typed && choice % 8 == 3 {
+            let s = ["ion", "sne", "ab", "dice", "e a"][((choice / 8) % 5) as usize];
+            self.draw_suggestion(&s.chars().collect::<Vec<char>>());
+        }
+    }
+
+    /// Draw `s` as [`Editor::Autosuggest`]'s suggestion at the cursor, which
+    /// stands at the end of the buffer: dim and italic (DECORATION, see FRAME
+    /// FIDELITY), the cursor stepped back over it. Only where it fits short of
+    /// the right prompt and the margin, as zsh-autosuggestions truncates.
+    fn draw_suggestion(&mut self, s: &[char]) {
+        let n = self.col_span(s);
+        let limit = self.rprompt.map_or(self.cols, |lo| lo.saturating_sub(1));
+        if n == 0 || self.noecho || self.alt || self.col + n >= limit {
+            return;
+        }
+        let text: String = s.iter().collect();
+        self.reply(format!("\x1b[2;3m{text}\x1b[0m\x1b[{n}D"));
+        self.suggestion = s.to_vec();
+        self.suggestion_at = self.col;
+    }
+
+    /// After an edit inside the buffer, [`Editor::Autosuggest`] fetches a
+    /// suggestion for the new buffer, as zsh-autosuggestions does on every
+    /// widget that changes it: now and then one is found (the buffer's length
+    /// decides, so a run is a function of its ops), drawn dim and italic from
+    /// `end`, the buffer's new end, behind a cursor save and restore (the
+    /// cursor stays inside the buffer). It moves with the buffer's end, as the
+    /// text a shift moves does: no cell tells the two apart.
+    fn refetch_after_edit(&mut self, end: usize) {
+        if self.editor != Editor::Autosuggest || self.line.len() % 3 != 2 {
+            return;
+        }
+        let s: Vec<char> = "ion".chars().collect();
+        let n = self.col_span(&s);
+        let limit = self.rprompt.map_or(self.cols, |lo| lo.saturating_sub(1));
+        if self.noecho || self.alt || end + n >= limit {
+            return;
+        }
+        self.reply(format!("\x1b7\x1b[{}G\x1b[2;3mion\x1b[0m\x1b8", end + 1));
+        self.suggestion = s;
+        self.suggestion_at = end;
+    }
+
+    /// Drop [`Editor::Autosuggest`]'s suggestion, blanking its cells from
+    /// column `from` on (behind a cursor save and restore, as the right prompt
+    /// is hidden): the cells before `from` were written over already.
+    fn blank_suggestion(&mut self, from: usize) {
+        if self.suggestion.is_empty() {
+            return;
+        }
+        let end = self.suggestion_at + self.col_span(&self.suggestion);
+        let from = from.max(self.suggestion_at);
+        self.suggestion.clear();
+        if from < end {
+            self.reply(format!(
+                "\x1b7\x1b[{}G{}\x1b8",
+                from + 1,
+                " ".repeat(end - from)
+            ));
+        }
+    }
+
+    /// [`Editor::Autosuggest`] ACCEPTS its suggestion (`→` or End at the end
+    /// of the buffer): its text joins the buffer, written plain over the dim
+    /// cells, the cursor after it.
+    fn accept_suggestion(&mut self) {
+        let s = std::mem::take(&mut self.suggestion);
+        for &c in &s {
+            self.put(SegKind::Reply, c);
+            self.line.push(c);
+        }
+        self.cur = self.line.len();
+    }
+
+    /// Clear the line being edited. A suggestion still on screen is the
+    /// editor's no longer.
     fn reset_line(&mut self) {
         self.line.clear();
         self.cooked_cells.clear();
         self.cur = 0;
+        self.suggestion.clear();
     }
 
     /// The line discipline is cooked: the tty echoes and edits the line.
@@ -793,9 +1386,37 @@ impl Program {
     /// A key at an edge of the line (`←` at its start, `→` or Delete at its
     /// end, an unbound sequence): readline beeps, zle stays silent.
     fn edge(&mut self) {
-        if matches!(self.editor, Editor::Readline | Editor::ReadlineIch) {
+        if matches!(
+            self.editor,
+            Editor::Readline | Editor::ReadlineIch | Editor::Overwrite
+        ) {
             self.reply("\x07");
         }
+    }
+
+    /// Backspace: [`Self::erase_back`] of one character, except in overwrite
+    /// mode inside the line, where readline's rubout REPLACES the glyph before
+    /// the cursor with a space and moves nothing (`\b \b`).
+    fn rubout(&mut self) {
+        if self.editor != Editor::Overwrite || self.cur == 0 || self.cur >= self.line.len() {
+            self.erase_back(1);
+            return;
+        }
+        let i = self.cur - 1;
+        let gone = self.line.get(i).copied().unwrap_or(' ');
+        let w = width(gone, self.wide);
+        if w != 1 {
+            self.reliable = false; // a wide glyph blanked by one space: beyond this model
+        }
+        if let Some(cell) = self.line.get_mut(i) {
+            *cell = ' ';
+        }
+        self.cur = i;
+        let back = self.back(w);
+        self.reply(back);
+        self.put(SegKind::Reply, ' ');
+        let back = self.back(1);
+        self.reply(back);
     }
 
     /// Erase the `n` characters before the insertion point and redraw the tail:
@@ -813,7 +1434,50 @@ impl Program {
         self.cur = start;
         let mut out = self.back_over(&erased);
         let tail: Vec<char> = self.line.get(self.cur..).unwrap_or_default().to_vec();
-        if self.editor == Editor::Zle {
+        // A tail that begins with a zero-width mark is redrawn onto the cell before
+        // the cursor, or, at the start of a row, onto the cell the erase then
+        // blanks, while the buffer holds it after the cursor, where the next glyph
+        // inserted takes it on: the screen no longer shows the buffer (found by
+        // the review of increment 4's sweep, seed index 1287, `a` shown plain
+        // where it settled marked). Beyond this model, as an ICH in front of a
+        // mark is (`Program::insert`).
+        if tail.first().is_some_and(|&c| width(c, self.wide) == 0) {
+            self.reliable = false;
+        }
+        if self.editor == Editor::Autosuggest && tail.is_empty() && n == 1 {
+            // An erase at the end FETCHES the suggestion anew, into the cell it
+            // vacated: the erased glyph and the old suggestion after it, or,
+            // with none on screen, now and then a fresh one from history (the
+            // frame showed that cell blank: a decoration it lacked).
+            self.reply(out);
+            let old = std::mem::take(&mut self.suggestion);
+            let old_cells = self.col_span(&old);
+            let fresh: Vec<char> = if !old.is_empty() {
+                erased.iter().copied().chain(old).collect()
+            } else if self.line.len() % 3 == 1 {
+                "ion".chars().collect()
+            } else {
+                Vec::new()
+            };
+            self.draw_suggestion(&fresh);
+            if self.suggestion.is_empty() {
+                // Nothing drawn there: the vacated cells, and an old suggestion
+                // after them, blanked (`\b \b`).
+                let n = self.col_span(&erased) + old_cells;
+                let blanks: Vec<char> = std::iter::repeat_n(' ', n).collect();
+                for &c in &blanks {
+                    self.put(SegKind::Reply, c);
+                }
+                let back = self.back_over(&blanks);
+                self.reply(back);
+            }
+            return;
+        }
+        if matches!(self.editor, Editor::Zle | Editor::Autosuggest) {
+            // An edit inside the buffer (or of more than one glyph) drops the
+            // suggestion with the tail rewrite.
+            let end = self.col + self.col_span(&tail) + self.col_span(&erased);
+            self.blank_suggestion(end);
             self.reply(out);
             let wide = self.wide;
             let blanks = erased.iter().map(|&c| width(c, wide)).sum::<usize>();
@@ -827,6 +1491,8 @@ impl Program {
             }
             let back = self.back_over(&rewritten);
             self.reply(back);
+            let end = self.col + self.col_span(&tail);
+            self.refetch_after_edit(end);
             return;
         }
         // Erasing to the end of the row takes a right prompt with it.
@@ -858,18 +1524,34 @@ impl Program {
     /// right margin, whose wrap a cursor move cannot take.
     fn right(&mut self) {
         let Some(&c) = self.line.get(self.cur) else {
-            self.edge();
+            // At the end of the buffer zsh-autosuggestions ACCEPTS the
+            // suggestion; anywhere else it is an edge.
+            if self.editor == Editor::Autosuggest
+                && !self.suggestion.is_empty()
+                && self.suggestion_at == self.col
+            {
+                self.accept_suggestion();
+            } else {
+                self.edge();
+            }
             return;
         };
         self.cur += 1;
         let w = width(c, self.wide);
+        if w == 0 {
+            // A code point that takes no cell (a combining mark the editor
+            // steps over by code point): the cursor stays. (Sent as `ESC [ 0 C`
+            // it moved a cell, a zero parameter being one, and the editor lost
+            // its column while it claimed to know it.)
+            return;
+        }
         let fits = self.col + w < self.cols;
         match self.editor {
-            Editor::Readline if fits => {
+            Editor::Readline | Editor::Overwrite if fits => {
                 self.reply("\x1b[C".repeat(w));
                 self.col += w;
             }
-            Editor::Zle if fits => {
+            Editor::Zle | Editor::Autosuggest if fits => {
                 self.reply(format!("\x1b[{w}C"));
                 self.col += w;
             }
@@ -886,6 +1568,10 @@ impl Program {
         }
         let gone = self.line.remove(self.cur);
         let blanks = width(gone, self.wide);
+        // An edit inside the buffer drops the suggestion, and may find one for
+        // the new buffer.
+        let rest = self.col_span(self.line.get(self.cur..).unwrap_or_default());
+        self.blank_suggestion(self.col + rest + blanks);
         let rewritten: Vec<char> = self
             .line
             .get(self.cur..)
@@ -899,13 +1585,73 @@ impl Program {
         }
         let back = self.back_over(&rewritten);
         self.reply(back);
+        self.refetch_after_edit(self.col + rest);
+    }
+
+    /// A learned key, as the line editor's keymap binds it ([`Keymap`]). Sent
+    /// under Kitty `DISAMBIGUATE` or modifyOtherKeys level 2, Ctrl-A and Ctrl-E
+    /// arrive as `CSI 97;5u` or `CSI 27;5;97~`, which no keymap here binds: a
+    /// beep, as for any undefined key.
+    fn learned_key(&mut self, key: EditKey) {
+        if self.reading_chord != ChordForm::Byte {
+            self.reply("\x07");
+            return;
+        }
+        match (self.keymap, key) {
+            (Keymap::ZshVanilla, EditKey::Home | EditKey::End) => self.reply("\x07"),
+            (Keymap::ZshVanilla, EditKey::Delete) => self.insert('~', None, 0),
+            (Keymap::ViIns, EditKey::CtrlA | EditKey::CtrlE) => {
+                // Self-inserted, drawn as two glyphs, `^A` or `^E`.
+                let letter = if key == EditKey::CtrlA { 'A' } else { 'E' };
+                self.insert('^', None, 0);
+                self.insert(letter, None, 0);
+            }
+            (_, EditKey::Home | EditKey::CtrlA) => self.line_start(),
+            (_, EditKey::End | EditKey::CtrlE) => self.line_end(),
+            (_, EditKey::Delete) => self.delete_forward(),
+            (_, EditKey::Left | EditKey::Right | EditKey::Backspace) => {}
+        }
+    }
+
+    /// beginning-of-line: the cursor back over the buffer before it.
+    fn line_start(&mut self) {
+        let before: Vec<char> = self.line.get(..self.cur).unwrap_or_default().to_vec();
+        self.cur = 0;
+        let back = self.back_over(&before);
+        self.reply(back);
+    }
+
+    /// end-of-line: the cursor over the buffer after it, reprinting it. At the
+    /// end of the buffer already, zsh-autosuggestions ACCEPTS its suggestion
+    /// (end-of-line is one of its accept widgets, which accept only with the
+    /// cursor at the end); anywhere else the suggestion stays where it is.
+    fn line_end(&mut self) {
+        let at_end = self.cur >= self.line.len();
+        while let Some(&c) = self.line.get(self.cur) {
+            self.cur += 1;
+            self.put(SegKind::Reply, c);
+        }
+        if at_end && !self.suggestion.is_empty() && self.suggestion_at == self.col {
+            self.accept_suggestion();
+        }
     }
 
     /// Up: the previous command from history replaces the line, redrawn from the
     /// prompt. A line that wrapped leaves the cursor below the prompt's row,
-    /// where the carriage return does not reach it: beyond this model.
+    /// where the carriage return does not reach it: beyond this model. The
+    /// history is `ls -la` alone, or, in the corpus shell, the lines Enter
+    /// submitted, the newest recalled (a beep while there is none).
     fn recall(&mut self) {
-        const HISTORY: &str = "ls -la";
+        let recalled: Vec<char> = match &self.history {
+            None => "ls -la".chars().collect(),
+            Some(lines) => match lines.last() {
+                Some(line) => line.clone(),
+                None => {
+                    self.reply("\x07");
+                    return;
+                }
+            },
+        };
         let wide = self.wide;
         let before: usize = self
             .line
@@ -914,14 +1660,73 @@ impl Program {
             .iter()
             .map(|&c| width(c, wide))
             .sum();
-        if PROMPT.chars().count() + before >= self.cols {
+        if self.prompt.chars().count() + before >= self.cols {
             self.reliable = false;
         }
+        // The row is cleared from the carriage return: a suggestion with it.
         self.reset_line();
-        self.line.extend(HISTORY.chars());
+        let text: String = recalled.iter().collect();
+        self.reply(format!("\r\x1b[K{}{text}", self.prompt));
+        self.col = self.prompt.chars().count() + self.col_span(&recalled);
+        self.line = recalled;
         self.cur = self.line.len();
-        self.reply(format!("\r\x1b[K{PROMPT}{HISTORY}"));
-        self.col = PROMPT.chars().count() + HISTORY.chars().count();
+        self.rprompt = None;
+    }
+
+    /// Tab: in the corpus shell ([`Self::completions`]), the word before the
+    /// cursor completed to the one word it is a proper prefix of, and a space,
+    /// each glyph inserted as typed text is (so a completion inside the line
+    /// shifts the tail as an insert does); a beep where it is no such prefix.
+    /// Otherwise `ion `, the theorem's completion.
+    fn complete(&mut self) {
+        if self.completions.is_empty() {
+            for c in "ion ".chars() {
+                self.insert(c, None, 0);
+            }
+            return;
+        }
+        let completions = self.completions;
+        let before = self.line.get(..self.cur).unwrap_or_default();
+        let start = before.iter().rposition(|&c| c == ' ').map_or(0, |i| i + 1);
+        let word: String = before.get(start..).unwrap_or_default().iter().collect();
+        let mut hits = completions
+            .iter()
+            .filter(|w| w.starts_with(word.as_str()) && w.len() > word.len());
+        let (Some(hit), None, false) = (hits.next(), hits.next(), word.is_empty()) else {
+            self.reply("\x07");
+            return;
+        };
+        let rest: Vec<char> = hit
+            .chars()
+            .skip(word.chars().count())
+            .chain([' '])
+            .collect();
+        for c in rest {
+            self.insert(c, None, 0);
+        }
+    }
+
+    /// Ctrl-K, kill-line: the buffer from the cursor to its end erased. zle
+    /// writes blanks over it and steps back (dropping a suggestion past it);
+    /// readline clears to the end of the row (`ESC [ K`), a right prompt with
+    /// it. At the end of the buffer nothing is drawn.
+    fn kill_to_end(&mut self) {
+        let tail: Vec<char> = self.line.drain(self.cur..).collect();
+        if tail.is_empty() {
+            return;
+        }
+        if matches!(self.editor, Editor::Zle | Editor::Autosuggest) {
+            let end = self.col + self.col_span(&tail);
+            self.blank_suggestion(end);
+            let blanks: Vec<char> = std::iter::repeat_n(' ', self.col_span(&tail)).collect();
+            for &c in &blanks {
+                self.put(SegKind::Reply, c);
+            }
+            let back = self.back_over(&blanks);
+            self.reply(back);
+            return;
+        }
+        self.reply("\x1b[K");
         self.rprompt = None;
     }
 
@@ -1000,6 +1805,14 @@ impl Program {
             self.run_command(choice);
             return;
         }
+        if self.reads_one_line {
+            // `read` has its line: the script ends and the shell prompts.
+            self.cat = false;
+            self.reads_one_line = false;
+            self.reset_line();
+            self.prompt_after("\r\n");
+            return;
+        }
         self.reset_line();
         self.reply("\r\n");
         self.col = 0;
@@ -1013,12 +1826,19 @@ impl Program {
 
     /// What Enter does at the shell: the line goes, a command runs.
     fn run_command(&mut self, choice: u32) {
+        // zsh-autosuggestions drops the suggestion before the line is accepted.
+        self.blank_suggestion(0);
+        // The corpus shell keeps what was submitted, for Up (`recall`).
+        if let Some(history) = self.history.as_mut().filter(|_| !self.line.is_empty()) {
+            history.push(self.line.clone());
+        }
         self.reset_line();
         // The submitted line keeps its right prompt; the editor is done with it.
         self.rprompt = None;
+        let c = self.start_command();
         match choice % 8 {
             4 => {
-                self.reply("\r\n");
+                self.reply(format!("\r\n{c}"));
                 self.noecho = true;
                 self.noecho_serial += 1;
                 let serial = self.noecho_serial;
@@ -1027,18 +1847,18 @@ impl Program {
                 self.reliable = true;
             }
             5 => {
-                self.reply("\r\n");
+                self.reply(format!("\r\n{c}"));
                 self.col = 0;
                 self.alt = true;
                 self.alt_from_command = true;
                 self.reply("\x1b[?1049h\x1b[H\x1b[2J~\r\n~ app");
             }
             6 => {
-                self.reply("\r\n");
+                self.reply(format!("\r\n{c}"));
                 self.prompt_after("\x1b[H\x1b[2J");
             }
             7 => {
-                let mut out = String::from("\r\n");
+                let mut out = format!("\r\n{c}");
                 for i in 0..7 {
                     let _ = write!(out, "line {i}\r\n");
                 }
@@ -1047,13 +1867,23 @@ impl Program {
             // `cat`: a cooked program reads the tty until ^C, on the row after
             // the line, so a line the shell proved meets a cooked far end.
             3 if (choice / 8) % 2 == 1 => {
-                self.reply("\r\n");
+                self.reply(format!("\r\n{c}"));
                 self.col = 0;
                 self.cat = true;
                 self.reliable = true;
             }
+            // `read -p '$ '` after a `clear`: a cooked program reads one line
+            // after a prompt of its own, drawn where the shell's stood, then the
+            // shell prompts again. Its prompt is no shell's: no mark names it.
+            3 if self.integration && (choice / 8) % 4 == 2 => {
+                self.reply(format!("\r\n{c}\x1b[H\x1b[2J{PROMPT}"));
+                self.col = PROMPT.chars().count();
+                self.cat = true;
+                self.reads_one_line = true;
+                self.reliable = true;
+            }
             _ => {
-                let mut out = String::from("\r\n");
+                let mut out = format!("\r\n{c}");
                 for i in 0..(choice / 8) % 3 {
                     let _ = write!(out, "out{i}\r\n");
                 }
@@ -1067,10 +1897,11 @@ impl Program {
         self.alt = false;
         self.reset_line();
         self.rprompt = None;
-        self.reply(format!("\x1b[?1049l{PROMPT}"));
+        let (a, b) = self.prompt_marks();
+        self.reply(format!("\x1b[?1049l{a}{}{b}", self.prompt));
         if self.alt_from_command {
             // The main screen comes back at the fresh row the command left.
-            self.col = PROMPT.chars().count();
+            self.col = self.prompt.chars().count();
             self.reliable = true;
         } else {
             self.reliable = false;
@@ -1091,7 +1922,7 @@ impl Program {
                 Key::Left | Key::Right => self.reply("\x1b[2;2H"),
                 Key::Paste(cs) => self.reply(cs.iter().collect::<String>()),
                 Key::Unmodelled(Unmodelled::Interrupt) => self.quit_app(),
-                Key::Unmodelled(_) => self.reply("\x1b[2;1H~"),
+                Key::Unmodelled(_) | Key::Learned(_) => self.reply("\x1b[2;1H~"),
             }
         } else if self.noecho {
             // A password prompt: everything is taken silently until the line ends.
@@ -1104,23 +1935,25 @@ impl Program {
                 Key::Enter => {
                     self.noecho = false;
                     self.cat = false;
+                    self.reads_one_line = false;
                     self.reset_line();
                     self.prompt_after("\r\nok\r\n");
                 }
                 Key::Unmodelled(Unmodelled::Interrupt) => {
                     self.noecho = false;
                     self.cat = false;
+                    self.reads_one_line = false;
                     self.reset_line();
                     self.prompt_after("^C\r\n");
                 }
-                Key::Left | Key::Right | Key::Unmodelled(_) => {}
+                Key::Left | Key::Right | Key::Unmodelled(_) | Key::Learned(_) => {}
             }
         } else if self.cooked() {
             self.consume_cooked(id, key, choice);
         } else {
             match key {
                 Key::Glyph(c) => self.insert(*c, Some(id), choice),
-                Key::Backspace => self.erase_back(1),
+                Key::Backspace => self.rubout(),
                 Key::Left => self.left(),
                 Key::Right => self.right(),
                 Key::Enter => self.run_command(choice),
@@ -1133,12 +1966,9 @@ impl Program {
                         }
                     }
                 }
-                Key::Unmodelled(Unmodelled::Tab) => {
-                    for c in "ion ".chars() {
-                        self.insert(c, None, 0);
-                    }
-                }
+                Key::Unmodelled(Unmodelled::Tab) => self.complete(),
                 Key::Unmodelled(Unmodelled::KillLine) => self.erase_back(self.cur),
+                Key::Unmodelled(Unmodelled::KillToEnd) => self.kill_to_end(),
                 Key::Unmodelled(Unmodelled::KillWord) => {
                     let n = self.word_before();
                     self.erase_back(n);
@@ -1147,19 +1977,7 @@ impl Program {
                     self.reset_line();
                     self.prompt_after("^C\r\n");
                 }
-                Key::Unmodelled(Unmodelled::Home) => {
-                    let before: Vec<char> = self.line.get(..self.cur).unwrap_or_default().to_vec();
-                    self.cur = 0;
-                    let back = self.back_over(&before);
-                    self.reply(back);
-                }
-                Key::Unmodelled(Unmodelled::End) => {
-                    while let Some(&c) = self.line.get(self.cur) {
-                        self.cur += 1;
-                        self.put(SegKind::Reply, c);
-                    }
-                }
-                Key::Unmodelled(Unmodelled::DeleteKey) => self.delete_forward(),
+                Key::Learned(k) => self.learned_key(*k),
                 Key::Unmodelled(Unmodelled::WordLeft) => {
                     let n = self.word_before();
                     let start = self.cur - n;
@@ -1172,6 +1990,7 @@ impl Program {
                 Key::Unmodelled(Unmodelled::Up) => self.recall(),
                 Key::Unmodelled(Unmodelled::Esc) => {}
                 Key::Unmodelled(Unmodelled::KeypadLeft) => self.edge(),
+                Key::Unmodelled(Unmodelled::PushLine) => self.push_line(),
             }
         }
         self.cause = None;
@@ -1218,13 +2037,27 @@ impl Program {
             Key::Unmodelled(Unmodelled::Interrupt) => {
                 // The tty echoes ^C and the program dies; the shell prompts.
                 self.cat = false;
+                self.reads_one_line = false;
                 self.reset_line();
                 self.prompt_after("^C\r\n");
             }
-            Key::Unmodelled(Unmodelled::Home) => self.tty_echo(&seq("\x1b[H"), SegKind::Reply),
-            Key::Unmodelled(Unmodelled::End) => self.tty_echo(&seq("\x1b[F"), SegKind::Reply),
-            Key::Unmodelled(Unmodelled::DeleteKey) => {
-                self.tty_echo(&seq("\x1b[3~"), SegKind::Reply);
+            // The tty echoes what the key sends: a control chord as `^X`, under
+            // Kitty `DISAMBIGUATE` its `CSI u`, under modifyOtherKeys level 2 its
+            // `CSI 27`.
+            Key::Learned(k) => {
+                let sent: &[char] = &match (k, self.reading_chord) {
+                    (EditKey::Home, _) => seq("\x1b[H"),
+                    (EditKey::End, _) => seq("\x1b[F"),
+                    (EditKey::Delete, _) => seq("\x1b[3~"),
+                    (EditKey::CtrlA, ChordForm::Byte) => vec!['\x01'],
+                    (EditKey::CtrlE, ChordForm::Byte) => vec!['\x05'],
+                    (EditKey::CtrlA, ChordForm::Kitty) => seq("\x1b[97;5u"),
+                    (EditKey::CtrlE, ChordForm::Kitty) => seq("\x1b[101;5u"),
+                    (EditKey::CtrlA, ChordForm::ModifyOtherKeys) => seq("\x1b[27;5;97~"),
+                    (EditKey::CtrlE, ChordForm::ModifyOtherKeys) => seq("\x1b[27;5;101~"),
+                    (EditKey::Left | EditKey::Right | EditKey::Backspace, _) => Vec::new(),
+                };
+                self.tty_echo(sent, SegKind::Reply);
             }
             Key::Unmodelled(Unmodelled::WordLeft) => {
                 self.tty_echo(&seq("\x1bb"), SegKind::Reply);
@@ -1234,14 +2067,19 @@ impl Program {
             Key::Unmodelled(Unmodelled::KeypadLeft) => {
                 self.tty_echo(&seq("\x1bOt"), SegKind::Reply);
             }
+            Key::Unmodelled(Unmodelled::PushLine) => self.tty_echo(&seq("\x1bq"), SegKind::Reply),
+            // Not the tty's VKILL (Ctrl-U): a character of the line, `^K`.
+            Key::Unmodelled(Unmodelled::KillToEnd) => self.tty_echo(&['\x0b'], SegKind::Reply),
         }
     }
 
     /// Output nobody typed for.
     fn unprompted_output(&mut self, what: Unprompted, param: u32) {
         // Whatever it draws, the editor no longer knows where its right prompt
-        // is, so it stops managing it (it stays on screen until overwritten).
+        // is, so it stops managing it (it stays on screen until overwritten),
+        // nor its suggestion.
         self.rprompt = None;
+        self.suggestion.clear();
         match what {
             Unprompted::Notice => {
                 let redraw = self.line_redraw();
@@ -1254,14 +2092,20 @@ impl Program {
                 self.reliable = false;
             }
             Unprompted::RightPrompt => {
+                // In italics, as every right prompt here: DECORATION, which a
+                // frame may show stale (FRAME FIDELITY's decoration rule). Drawn
+                // plain, a line editor's erase that cleared it to the end of the
+                // row (`\b ESC[K`) made every frame showing it beside a correct
+                // ghost a violation, though nothing the predictor painted moved.
                 let n = 1 + param % 9;
-                self.unprompted(format!("\x1b7\x1b[{n}C<rp>\x1b8"));
+                self.unprompted(format!("\x1b7\x1b[{n}C\x1b[3m<rp>\x1b[23m\x1b8"));
             }
             Unprompted::Suggest => {
                 if self.cur == self.line.len() && !self.noecho && !self.alt {
                     let s = ["ion", "sne", "ab", "dice", "e a"][(param % 5) as usize];
                     let n = s.chars().count();
-                    self.unprompted(format!("\x1b[2m{s}\x1b[0m\x1b[{n}D"));
+                    // Dim and italic, as the editor's own suggestions: decoration.
+                    self.unprompted(format!("\x1b[2;3m{s}\x1b[0m\x1b[{n}D"));
                     if self.col + n >= self.cols {
                         self.reliable = false; // the step back cannot climb a row
                     }
@@ -1335,17 +2179,89 @@ impl Program {
                 if self.noecho {
                     self.noecho = false;
                     self.reset_line();
-                    self.unprompted(format!("\r\n{PROMPT}"));
-                    self.col = PROMPT.chars().count();
+                    let (a, b) = self.prompt_marks();
+                    self.unprompted(format!("\r\n{a}{}{b}", self.prompt));
+                    self.col = self.prompt.chars().count();
                     self.reliable = true;
                 }
+            }
+            Unprompted::Rebind => {
+                // Only the shell at its prompt can exec itself.
+                if !self.integration || self.alt || self.noecho || self.cat {
+                    return;
+                }
+                let next = KEYMAPS
+                    .iter()
+                    .position(|&k| k == self.keymap)
+                    .map_or(0, |i| (i + 1) % KEYMAPS.len());
+                self.keymap = KEYMAPS[next];
+                self.shell = self.shell.wrapping_add(1);
+                self.running = false;
+                self.reset_line();
+                let (a, b) = self.prompt_marks();
+                self.unprompted(format!("\r\n{a}{}{b}", self.prompt));
+                self.col = self.prompt.chars().count();
+                self.reliable = true;
+            }
+            Unprompted::ForgedMark => {
+                // Drawn nowhere: the cursor and the column stay. The `B` says it
+                // stands where the buffer starts, as aterm's integration's does.
+                self.unprompted("\x1b]133;A\x07\x1b]133;B;aterm_input=start\x07");
+            }
+            Unprompted::KittyChords => {
+                if !self.alt {
+                    // Pushed: Kitty `DISAMBIGUATE` (fish 4 at its prompt), or
+                    // modifyOtherKeys level 2 (a precmd's, or a program's left
+                    // behind); popped: whichever is on.
+                    let (bytes, next) = match (self.chords, param % 2) {
+                        (ChordForm::Byte, 0) => ("\x1b[>1u", ChordForm::Kitty),
+                        (ChordForm::Byte, _) => ("\x1b[>4;2m", ChordForm::ModifyOtherKeys),
+                        (ChordForm::Kitty, _) => ("\x1b[<u", ChordForm::Byte),
+                        (ChordForm::ModifyOtherKeys, _) => ("\x1b[>4;0m", ChordForm::Byte),
+                    };
+                    self.unprompted(bytes);
+                    self.chords = next;
+                }
+            }
+            Unprompted::ResetPrompt => {
+                // Only the shell's line editor at its prompt, its line on the
+                // prompt's row before and after (a carriage return reaches the
+                // cursor's row alone): the prompt in the other width, the line
+                // after it, the row cleared past it, the cursor back over the tail.
+                // Its column is known: the editor stays reliable.
+                if self.alt || self.noecho || self.cooked() {
+                    return;
+                }
+                let next = if self.prompt == PROMPT {
+                    WIDE_PROMPT
+                } else {
+                    PROMPT
+                };
+                let line = self.col_span(&self.line);
+                let widest = self.prompt.chars().count().max(next.chars().count());
+                if widest + line >= self.cols {
+                    return;
+                }
+                let tail = self.col_span(self.line.get(self.cur..).unwrap_or_default());
+                let text: String = self.line.iter().collect();
+                let back = if tail == 0 {
+                    String::new()
+                } else {
+                    format!("\x1b[{tail}D")
+                };
+                self.prompt = next;
+                self.unprompted(format!("\r{next}{text}\x1b[K{back}"));
+                self.col = next.chars().count() + line - tail;
             }
             Unprompted::Ris => {
                 self.alt = false;
                 self.cat = false;
+                self.reads_one_line = false;
+                self.chords = ChordForm::Byte;
                 self.reset_line();
-                self.unprompted(format!("\x1bc{PROMPT}"));
-                self.col = PROMPT.chars().count();
+                let (a, b) = self.prompt_marks();
+                self.unprompted(format!("\x1bc{a}{}{b}", self.prompt));
+                self.col = self.prompt.chars().count();
                 self.reliable = true;
             }
         }
@@ -1421,6 +2337,43 @@ pub(crate) struct Stats {
     pub(crate) transit_waits: u64,
     pub(crate) decline_motions: u64,
     pub(crate) vacate_refusals: u64,
+    /// Frames that displayed a SHIFT: a chain's state whose text moved, painted
+    /// as the cells it came from.
+    pub(crate) shifts_displayed: u64,
+    /// Shifts armed while the far end was in overwrite mode: tracked, and (the
+    /// class ladder) never shown.
+    pub(crate) overwrite_shifts_armed: u64,
+    /// Frames (Adaptive) that displayed a shift while the far end was in
+    /// overwrite mode, which never shifts: the class ladder keeps this at zero.
+    pub(crate) overwrite_shifts_displayed: u64,
+    /// Cells of displayed frames where a state chain's vacated blank stood and
+    /// the settled screen drew decoration (a suggestion the erase fetched):
+    /// counted, not a violation (the decoration rule).
+    pub(crate) late_decoration: u64,
+    /// The predictor's own increment-3 decisions (`Predictor::events_for_test`).
+    pub(crate) shifts_armed: u64,
+    pub(crate) shifts_proven: u64,
+    pub(crate) opaque_refusals: u64,
+    pub(crate) mid_line_flushes: u64,
+    pub(crate) ambiguous_shifts: u64,
+    pub(crate) bidi_refusals: u64,
+    /// Frames that displayed a state chain holding a learned key's op (Home,
+    /// End, Ctrl-A, Ctrl-E, Delete): learned bindings shown at once.
+    pub(crate) line_edge_displayed: u64,
+    /// Of those, frames showing a learned Delete.
+    pub(crate) delete_displayed: u64,
+    /// FRAME FIDELITY's comparisons of a frame showing a learned key, and of one
+    /// showing a learned Delete: a frame recorded (consecutive identical ones
+    /// once) and in the clause's scope when its key settled.
+    pub(crate) learned_fidelity_checks: u64,
+    pub(crate) delete_fidelity_checks: u64,
+    /// The predictor's own increment-4 decisions (`Predictor::events_for_test`).
+    pub(crate) witnessed_lines: u64,
+    pub(crate) line_edge_armed: u64,
+    pub(crate) probes_armed: u64,
+    pub(crate) bindings_learned: u64,
+    pub(crate) bindings_unlearned: u64,
+    pub(crate) kitty_refusals: u64,
 }
 
 impl Stats {
@@ -1457,6 +2410,26 @@ impl Stats {
         self.transit_waits += o.transit_waits;
         self.decline_motions += o.decline_motions;
         self.vacate_refusals += o.vacate_refusals;
+        self.shifts_displayed += o.shifts_displayed;
+        self.overwrite_shifts_armed += o.overwrite_shifts_armed;
+        self.overwrite_shifts_displayed += o.overwrite_shifts_displayed;
+        self.late_decoration += o.late_decoration;
+        self.shifts_armed += o.shifts_armed;
+        self.shifts_proven += o.shifts_proven;
+        self.opaque_refusals += o.opaque_refusals;
+        self.mid_line_flushes += o.mid_line_flushes;
+        self.ambiguous_shifts += o.ambiguous_shifts;
+        self.bidi_refusals += o.bidi_refusals;
+        self.line_edge_displayed += o.line_edge_displayed;
+        self.delete_displayed += o.delete_displayed;
+        self.learned_fidelity_checks += o.learned_fidelity_checks;
+        self.delete_fidelity_checks += o.delete_fidelity_checks;
+        self.witnessed_lines += o.witnessed_lines;
+        self.line_edge_armed += o.line_edge_armed;
+        self.probes_armed += o.probes_armed;
+        self.bindings_learned += o.bindings_learned;
+        self.bindings_unlearned += o.bindings_unlearned;
+        self.kitty_refusals += o.kitty_refusals;
     }
 }
 
@@ -1532,30 +2505,83 @@ pub(crate) fn displayed_cursor(row: u16, col: u16, cols: u16) -> Option<(u16, u1
     (next < cols).then_some((row, next))
 }
 
+/// What a chain's cell of kind `kind` showing `ch` is to aterm-core's span
+/// painter (`RenderInput::paint_prediction_span`), as aterm-gui maps it.
+pub(crate) fn span_cell(ch: char, kind: GhostCell) -> SpanCell {
+    match kind {
+        GhostCell::Typed => SpanCell::Typed(ch),
+        GhostCell::Moved { from } => SpanCell::Moved {
+            from: usize::from(from),
+            ch,
+        },
+        GhostCell::Vacated => SpanCell::Vacated,
+    }
+}
+
+/// `Host::PaintsPastTheLine`'s span: the chain's own, and past its last cell
+/// the rest of the row moved by the shift its last moved cell makes, as if
+/// the text the predictor knows ran to the margin (an insert painted as ICH
+/// paints it). A right prompt or a suggestion past the line moves with it.
+fn span_past_the_line(d: &RenderInput, row: usize, span: &mut Vec<(usize, SpanCell)>, cols: usize) {
+    let shift = span.iter().rev().find_map(|&(col, cell)| match cell {
+        SpanCell::Moved { from, .. } => Some(col.wrapping_sub(from)),
+        _ => None,
+    });
+    let (Some(shift), Some(&(last, _))) = (shift, span.last()) else {
+        return;
+    };
+    let cells = d.cells.get(row).map_or(&[][..], Vec::as_slice);
+    for col in last + 1..cols {
+        let from = col.wrapping_sub(shift);
+        let cell = match cells.get(from) {
+            Some(source) if from < cols => SpanCell::Moved {
+                from,
+                ch: source.ch,
+            },
+            _ => SpanCell::Vacated,
+        };
+        span.push((col, cell));
+    }
+}
+
 /// How `host` paints a state chain's frame into `d` (`(cols, blank)` the grid
-/// width and the terminal blank): `shown`, the chain's cells, and
-/// `chain_cursor`, the cursor the predictor gives it. aterm-gui's rule: ALL OR
-/// NONE, asking the painter's own refusal first
-/// (`RenderInput::prediction_ghost_paintable`), and the chain's cursor drawn
-/// only when every cell was painted and the cursor's own cell is no wide
-/// glyph's right half; with no cursor from the predictor, the glyph lane's
-/// cursor, one past the newest cell painted. Returns which cells were painted
-/// and the cursor drawn (`None`: the engine's).
+/// width and the terminal blank): `shown`, the chain's cells with their kinds
+/// (`GhostCell`), and `chain_cursor`, the cursor the predictor gives it.
+/// aterm-gui's rule: the cells are one SPAN on the chain's row, painted ALL OR
+/// NONE by aterm-core's span painter (`RenderInput::paint_prediction_span`:
+/// typed glyphs as ghosts, moved text as the cells it came from, vacated cells
+/// blank), and the chain's cursor drawn only when the span was painted and
+/// the cursor's own cell is no wide glyph's right half once it was; with no
+/// cursor from the predictor, the glyph lane's cursor, one past the newest
+/// cell painted. Returns which cells were painted and the cursor drawn (`None`:
+/// the engine's).
 pub(crate) fn paint_chain(
     d: &mut RenderInput,
-    shown: &[(u16, u16, char)],
+    (shown, kinds): (&[(u16, u16, char)], &[GhostCell]),
     chain_cursor: Option<(u16, u16)>,
     (cols, blank): (u16, RenderCell),
     host: Host,
 ) -> (Vec<bool>, Option<(u16, u16)>) {
     let width = usize::from(cols);
-    let paintable = shown
-        .iter()
-        .all(|&(r, c, _)| d.prediction_ghost_paintable(usize::from(r), usize::from(c), width));
     let mut painted = vec![false; shown.len()];
-    if paintable || host == Host::PaintsPartialState {
+    if host == Host::PaintsPartialState {
+        // Each cell on its own, the ones the painter refuses left out.
         for (&(r, c, ch), painted) in shown.iter().zip(&mut painted) {
             *painted = d.paint_prediction_ghost(usize::from(r), usize::from(c), ch, width, blank);
+        }
+    } else if let Some(&(row, _, _)) = shown.first() {
+        let row = usize::from(row);
+        let mut span: Vec<(usize, SpanCell)> = shown
+            .iter()
+            .zip(kinds)
+            .map(|(&(_, c, ch), &kind)| (usize::from(c), span_cell(ch, kind)))
+            .collect();
+        if host == Host::PaintsPastTheLine {
+            span_past_the_line(d, row, &mut span, width);
+        }
+        let one_row = shown.iter().all(|&(r, _, _)| usize::from(r) == row);
+        if one_row && d.paint_prediction_span(row, span, width, blank) {
+            painted.fill(true);
         }
     }
     let all = painted.iter().all(|&p| p);
@@ -1575,6 +2601,7 @@ pub(crate) fn paint_chain(
         (Host::CursorAfterNewestGlyph, _) | (_, None) => glyph_lane_cursor,
         (Host::PaintsPartialState, cursor) => cursor,
         (Host::CursorOnAContinuation, cursor) => cursor.filter(|_| all),
+        (Host::CursorWithoutSpan, cursor) => cursor.filter(|&c| !on_continuation(c)),
         (_, cursor) => cursor.filter(|&c| all && !on_continuation(c)),
     };
     (painted, drawn)
@@ -1646,18 +2673,26 @@ pub(crate) fn frame_decoration(f: &RenderInput, rows: usize, cols: usize) -> Vec
         .collect()
 }
 
-/// A fresh engine of the world's size, under its ambiguous-width policy: the
-/// wide one is the host's `ambiguous_width = "wide"`, applied the way the host
-/// applies its config (`Terminal::apply_config`); RIS keeps it, as a host
-/// setting.
-pub(crate) fn engine(cfg: Config) -> Terminal {
-    let mut term = Terminal::new(ROWS, COLS);
+/// A fresh engine of `rows` by `cols` (the theorem's [`ROWS`] by [`COLS`], the
+/// measurement's a screen wide enough for the command lines its corpus types),
+/// under the world's ambiguous-width policy: the wide one is the host's
+/// `ambiguous_width = "wide"`, applied the way the host applies its config
+/// (`Terminal::apply_config`); RIS keeps it, as a host setting.
+pub(crate) fn engine(cfg: Config, rows: u16, cols: u16) -> Terminal {
+    let mut term = Terminal::new(rows, cols);
     if cfg.wide {
         let config = aterm_core::config::TerminalConfig {
             ambiguous_width_double: true,
             ..aterm_core::config::TerminalConfig::default()
         };
         term.apply_config(&config);
+    }
+    // aterm's shell integration: the host authorizes the first shell's nonce
+    // and requires it, so only that shell's signed marks are kept. A host that
+    // never turns the gate on keeps any mark (`Host::UnsignedInputStart`).
+    if cfg.integration {
+        term.authorize_shell_integration(nonce(0));
+        term.set_require_shell_integration_nonce(cfg.host != Host::UnsignedInputStart);
     }
     term
 }
@@ -1696,6 +2731,9 @@ pub(crate) struct Sim {
     press_scratch: RenderInput,
     /// The cursor row the press hands the predictor, refilled in place.
     press_row: Vec<Seen>,
+    /// The row under it, which the press hands too (`KeySample::below`), refilled
+    /// in place; empty on the last row.
+    press_below: Vec<Seen>,
     stats: Stats,
     /// The newest Enter pressed: a state chain displayed with an op typed before
     /// it is carried across its terminator.
@@ -1703,8 +2741,71 @@ pub(crate) struct Sim {
     /// The PROVENANCE oracle's base for the state chain in flight (see
     /// [`OracleBase`]).
     oracle: Option<OracleBase>,
+    /// The input start `Host::StaleInputStart` read last, and hands on.
+    stale_start: Option<InputStart>,
+    /// The shell whose nonce the host authorized last ([`Program::shell`]).
+    shell: u8,
     /// A step-by-step account, kept only when replaying a shrunk failure.
     trace: Option<String>,
+    /// The checker runs (every clause of the theorem, on every frame). A
+    /// measurement of a predictor with rules switched off turns it off
+    /// (`Sim::without_checks`): that predictor breaks clauses by design, and
+    /// what it showed is what is measured.
+    checks: bool,
+    /// What the last frame put on glass (`Sim::on_glass`).
+    glass_frame: Option<OnGlass>,
+    /// What prediction cost the host, counted (`Sim::cost`).
+    cost: Cost,
+    /// The host's edit-lane setting (aterm-gui's `predictive_echo_editing`),
+    /// handed to the predictor (`Predictor::set_editing`): on, every edit key
+    /// reads the cursor row at its press; off, none does, since the predictor
+    /// then routes them as it did before the lane and asks no row
+    /// (`Sim::set_editing`).
+    editing: bool,
+}
+
+/// What a frame put on glass: the displayed view `D`, the cursor drawn on it
+/// (`None`: the engine's) and the rows a ghost was painted on.
+#[derive(Clone, Debug)]
+pub(crate) struct OnGlass {
+    pub(crate) frame: RenderInput,
+    pub(crate) cursor: Option<(u16, u16)>,
+    pub(crate) rows: Vec<u16>,
+}
+
+/// What prediction cost the host, counted rather than timed: the observe calls
+/// each frame's reconcile made, the ops the predictor folded each frame and each
+/// press (`PredictEvents::ops_folded`), and the row cells each press read for
+/// the key-time sample (the cursor row and the row under it).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Cost {
+    pub(crate) reconciles: u64,
+    pub(crate) observe_calls: u64,
+    pub(crate) observe_max: u64,
+    pub(crate) frame_folds: u64,
+    pub(crate) frame_folds_max: u64,
+    pub(crate) presses: u64,
+    pub(crate) press_folds: u64,
+    pub(crate) press_folds_max: u64,
+    pub(crate) row_samples: u64,
+    pub(crate) row_cells: u64,
+    pub(crate) row_cells_max: u64,
+}
+
+impl Cost {
+    pub(crate) fn add(&mut self, o: Cost) {
+        self.reconciles += o.reconciles;
+        self.observe_calls += o.observe_calls;
+        self.observe_max = self.observe_max.max(o.observe_max);
+        self.frame_folds += o.frame_folds;
+        self.frame_folds_max = self.frame_folds_max.max(o.frame_folds_max);
+        self.presses += o.presses;
+        self.press_folds += o.press_folds;
+        self.press_folds_max = self.press_folds_max.max(o.press_folds_max);
+        self.row_samples += o.row_samples;
+        self.row_cells += o.row_cells;
+        self.row_cells_max = self.row_cells_max.max(o.row_cells_max);
+    }
 }
 
 /// Where the PROVENANCE oracle starts a state chain's fold: the screen `A` at
@@ -1724,7 +2825,14 @@ pub(crate) struct OracleBase {
 
 impl Sim {
     fn new(cfg: Config) -> Self {
-        let term = engine(cfg);
+        Self::sized(cfg, ROWS, COLS)
+    }
+
+    /// A session on a screen of `rows` by `cols` (the theorem's is [`ROWS`] by
+    /// [`COLS`]; a host reset still toggles between those and
+    /// [`ALT_GEOMETRY`]).
+    pub(crate) fn sized(cfg: Config, rows: u16, cols: u16) -> Self {
+        let term = engine(cfg, rows, cols);
         let generation = term.content_scroll_state().coordinate_generation();
         let mut predictor = Predictor::new(Self::host_mode_of(cfg));
         if let Host::Rule(rule) = cfg.host {
@@ -1734,13 +2842,14 @@ impl Sim {
         Self {
             cfg,
             term,
-            reference: engine(cfg),
+            reference: engine(cfg, rows, cols),
             scratch: RenderInput::empty(),
             predictor,
-            program: Program::new(COLS, cfg),
+            program: Program::new(cols, cfg),
             glass: Vec::new(),
             press_scratch: RenderInput::empty(),
             press_row: Vec::new(),
+            press_below: Vec::new(),
             now: start,
             last_press: start,
             keys: Vec::new(),
@@ -1755,7 +2864,155 @@ impl Sim {
             last_enter: None,
             oracle: None,
             trace: None,
+            stale_start: None,
+            shell: 0,
+            checks: true,
+            glass_frame: None,
+            cost: Cost::default(),
+            editing: true,
         }
+    }
+
+    /// The host's edit-lane setting, as aterm-gui's config hands it: to the
+    /// predictor, and to the press, which reads the row for an edit key only
+    /// with the lane on (`app_input.rs`, `pediting`).
+    pub(crate) fn set_editing(&mut self, on: bool) {
+        self.editing = on;
+        self.predictor.set_editing(on);
+    }
+
+    /// The predictor, for a measurement to configure before the first key
+    /// (`Predictor::set_editing`, `Predictor::disable_rule_for_test`) and to read
+    /// its counts (`Predictor::events_for_test`).
+    pub(crate) fn predictor_mut(&mut self) -> &mut Predictor {
+        &mut self.predictor
+    }
+
+    /// The engine: the authoritative screen `A`.
+    pub(crate) fn term(&self) -> &Terminal {
+        &self.term
+    }
+
+    /// The checker off (see `Sim::checks`).
+    pub(crate) fn without_checks(&mut self) {
+        self.checks = false;
+    }
+
+    /// The coverage counts so far: the world's own, and the predictor's
+    /// decisions (`Predictor::events_for_test`).
+    pub(crate) fn stats(&self) -> Stats {
+        let events = self.predictor.events_for_test();
+        Stats {
+            expiry_owes: events.expiry_owes,
+            tail_refusals: events.tail_refusals,
+            decorated_proofs: events.decorated_proofs,
+            typed_owes: events.typed_owes,
+            standing_voids: events.standing_voids,
+            advance_waits: events.advance_waits,
+            motions_proven: events.motions_proven,
+            net_null_retired: events.net_null_retired,
+            transit_waits: events.transit_waits,
+            decline_motions: events.decline_motions,
+            vacate_refusals: events.vacate_refusals,
+            shifts_armed: events.shifts_armed,
+            shifts_proven: events.shifts_proven,
+            opaque_refusals: events.opaque_refusals,
+            mid_line_flushes: events.mid_line_flushes,
+            ambiguous_shifts: events.ambiguous_shifts,
+            bidi_refusals: events.bidi_refusals,
+            witnessed_lines: events.witnessed_lines,
+            line_edge_armed: events.line_edge_armed,
+            probes_armed: events.probes_armed,
+            bindings_learned: events.bindings_learned,
+            bindings_unlearned: events.bindings_unlearned,
+            kitty_refusals: events.kitty_refusals,
+            ..self.stats
+        }
+    }
+
+    /// What prediction has cost the host so far.
+    pub(crate) fn cost(&self) -> Cost {
+        self.cost
+    }
+
+    /// What the last frame put on glass, `None` when it painted nothing and drew
+    /// the engine's cursor (`D = A`).
+    pub(crate) fn on_glass(&self) -> Option<&OnGlass> {
+        self.glass_frame.as_ref()
+    }
+
+    /// The authoritative screen `A` the last frame reconciled against and
+    /// painted over (`D` is it, where [`Self::on_glass`] is `None`).
+    pub(crate) fn screen(&self) -> &RenderInput {
+        &self.scratch
+    }
+
+    /// THE CORPUS SHELL: Tab completes the word before the cursor from
+    /// `completions`, and Up recalls the newest line submitted, as a shell with
+    /// a history and a completion table does. The theorem's world completes
+    /// `ion ` and recalls `ls -la` whatever was typed.
+    pub(crate) fn corpus_shell(&mut self, completions: &'static [&'static str]) {
+        self.program.completions = completions;
+        self.program.history = Some(Vec::new());
+    }
+
+    /// The shell draws its prompt (with its marks under the integration) and
+    /// it reaches the screen, before the first key.
+    pub(crate) fn fresh_prompt(&mut self) -> Result<(), Violation> {
+        self.program.prompt_after("");
+        let total = self.program.pending_bytes();
+        self.deliver(total)?;
+        self.frame()
+    }
+
+    /// A press, routed the way aterm-gui routes it, and the redraw after it.
+    pub(crate) fn press_and_draw(&mut self, key: Key) -> Result<(), Violation> {
+        let folded = self.predictor.events_for_test().ops_folded;
+        self.press(key)?;
+        let folds = self.predictor.events_for_test().ops_folded - folded;
+        self.cost.presses += 1;
+        self.cost.press_folds += folds;
+        self.cost.press_folds_max = self.cost.press_folds_max.max(folds);
+        self.frame()
+    }
+
+    /// The far end reads the oldest key it has not read; `choice` decides what
+    /// a command it runs prints (`Program::run_command`). Returns the bytes of
+    /// output that key caused.
+    pub(crate) fn read_key(&mut self, choice: u32) -> usize {
+        let before = self.program.pending_bytes();
+        self.program_step(1, choice);
+        self.program.pending_bytes() - before
+    }
+
+    /// The far end's buffer as it stands: its length and the cursor's index in
+    /// it.
+    pub(crate) fn buffer(&self) -> (usize, usize) {
+        (self.program.line.len(), self.program.cur)
+    }
+
+    /// `n` bytes of the output in flight reach the screen, and the redraw after
+    /// them.
+    pub(crate) fn deliver_and_draw(&mut self, n: usize) -> Result<(), Violation> {
+        self.deliver(n)?;
+        self.frame()
+    }
+
+    /// The clock moves to `at` (never back); a deadline that falls due wakes the
+    /// host's expiry sweep and its erase frame, as [`Op::Advance`] does.
+    /// Returns whether that frame was drawn.
+    pub(crate) fn advance_to(&mut self, at: Instant) -> Result<bool, Violation> {
+        self.advance_by(at.saturating_duration_since(self.now))
+    }
+
+    /// The predictor's next deadline, for a host's timer.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.predictor.next_deadline()
+    }
+
+    /// The clock.
+    pub(crate) fn now(&self) -> Instant {
+        self.now
     }
 
     fn generation(&self) -> u64 {
@@ -1806,14 +3063,107 @@ impl Sim {
         }
     }
 
+    /// Where the line editor's buffer starts, as the host hands it to the
+    /// predictor at a press: aterm-core's authenticated `B` that says it
+    /// stands where the buffer starts, and its prompt
+    /// (`Terminal::input_region_start`), or a mutant's. One that remembers the
+    /// last it read hands it on whatever happened since; one that never turned
+    /// the nonce gate on reads any `B` the engine kept, at the prompt in front;
+    /// one that does not ask whether the `B` says it stands at the buffer's
+    /// start takes the signed `B` of the prompt in front wherever it stands.
+    fn host_input_start(&mut self) -> Option<InputStart> {
+        let term = &self.term;
+        // The `B` the engine keeps for the current block, on screen, at the
+        // live bottom of the main screen: what a host that skipped one of
+        // `input_region_start`'s conjuncts reads.
+        let kept = |prompt: u64| {
+            let block = term.current_block()?;
+            let open = term.shell_state() == aterm_core::terminal::ShellState::EnteringCommand
+                && !term.is_alternate_screen()
+                && term.grid().display_offset() == 0;
+            let row = block
+                .command_start_row?
+                .checked_sub(term.grid().visible_to_absolute(0))?;
+            let row = u16::try_from(row).ok().filter(|&r| r < term.rows())?;
+            open.then_some(InputStart {
+                cell: (row, block.command_start_col?),
+                prompt,
+            })
+        };
+        let faithful = term.input_region_start().map(|s| InputStart {
+            cell: (s.row, s.col),
+            prompt: s.prompt,
+        });
+        match self.cfg.host {
+            Host::StaleInputStart => {
+                self.stale_start = faithful.or(self.stale_start);
+                self.stale_start.map(|s| InputStart {
+                    prompt: u64::MAX,
+                    ..s
+                })
+            }
+            Host::UnsignedInputStart => kept(term.current_block()?.id),
+            Host::UnattestedInputStart => kept(term.prompt_in_front()?),
+            _ => faithful,
+        }
+    }
+
+    /// The prompt a line terminator is pressed at, as the host hands it to
+    /// `Predictor::note_line_submit_at`: aterm-core's authenticated prompt in
+    /// front (`Terminal::prompt_in_front`), or, for the host that never turned
+    /// the nonce gate on, the block any `A` opened.
+    fn host_submit_prompt(&self) -> Option<u64> {
+        match self.cfg.host {
+            Host::UnsignedInputStart => self
+                .term
+                .current_block()
+                .filter(|_| {
+                    self.term.shell_state() == aterm_core::terminal::ShellState::EnteringCommand
+                })
+                .map(|b| b.id),
+            _ => self.term.prompt_in_front(),
+        }
+    }
+
+    /// The editor context the host hands the predictor: the session, the
+    /// nonce in use, DECCKM and whether control chords go out escaped, as
+    /// aterm-gui reads them under the press's hold; a mutant's never changes,
+    /// or never asks the keyboard mode, or asks Kitty's alone.
+    fn host_context(&self) -> EditorContext {
+        let term = &self.term;
+        EditorContext::new(
+            SESSION,
+            match self.cfg.host {
+                Host::StaleEditorContext => None,
+                _ => term.shell_integration_nonce_in_use(),
+            }
+            .as_ref(),
+            self.cfg.host != Host::StaleEditorContext && term.modes().application_cursor_keys,
+            self.cfg.host != Host::StaleEditorContext && self.host_escaped_chords(),
+        )
+    }
+
+    /// Whether the host says control chords go out escaped (R-KITTY):
+    /// aterm-core's `control_chords_escaped`, or a mutant's that never asks, or
+    /// asks Kitty's mode alone and misses modifyOtherKeys.
+    fn host_escaped_chords(&self) -> bool {
+        match self.cfg.host {
+            Host::IgnoresKittyChords => false,
+            Host::IgnoresModifyOtherKeys => self.term.kitty_reports_functional_keys(),
+            _ => self.term.control_chords_escaped(),
+        }
+    }
+
     /// The edit key the host hands `Predictor::predict_edit` for `key`: a bare
-    /// main-block arrow or Backspace, as aterm-gui classifies the unfolded event.
-    /// A mutant also hands it a word motion, or a keypad arrow, as `←`.
+    /// main-block arrow or Backspace, as aterm-gui classifies the unfolded event,
+    /// and a learned key. A mutant also hands it a word motion, or a keypad
+    /// arrow, as `←`.
     fn edit_key_of(&self, key: &Key) -> Option<EditKey> {
         match (key, self.cfg.host) {
             (Key::Backspace, _) => Some(EditKey::Backspace),
             (Key::Left, _) => Some(EditKey::Left),
             (Key::Right, _) => Some(EditKey::Right),
+            (Key::Learned(k), _) => Some(*k),
             (Key::Unmodelled(Unmodelled::WordLeft), Host::WordMotionAsArrow)
             | (Key::Unmodelled(Unmodelled::KeypadLeft), Host::KeypadArrowAsArrow) => {
                 Some(EditKey::Left)
@@ -1926,6 +3276,11 @@ impl Sim {
             echo_landed: false,
             unprompted_at_press: self.unprompted_delivered,
             edit: None,
+            chord: if matches!(key, Key::Learned(EditKey::CtrlA | EditKey::CtrlE)) {
+                ChordForm::of(&self.term)
+            } else {
+                ChordForm::Byte
+            },
         });
         // The edit key the host hands the predictor, if any: a bare arrow or
         // Backspace, as aterm-gui classifies them (a mutant also hands it a word
@@ -1936,19 +3291,30 @@ impl Sim {
         }
         // Whether the press reads the cursor row: asked before the terminal hold,
         // as aterm-gui asks it, so type-ahead never pays for the row (an edit key
-        // always reads it).
-        let wants_row =
-            (matches!(key, Key::Glyph(_)) && self.predictor.wants_key_row()) || edit.is_some();
+        // reads it whenever the edit lane is on, and never with it off).
+        let wants_row = (matches!(key, Key::Glyph(_)) && self.predictor.wants_key_row())
+            || (edit.is_some() && self.editing);
         // The key-time sample, read under one terminal hold.
         let cursor = self.term.cursor();
         let coords = self.host_generation();
         let grid = (self.term.cols(), self.term.rows());
         let no_echo = self.host_alt();
         let has_row = wants_row && self.sample_press_row(cursor.row, cursor.col);
+        // The integration's word on the buffer's start, the editor context,
+        // and whether control chords go out escaped (Ctrl-A as Kitty's `CSI
+        // u` or modifyOtherKeys' `CSI 27`), under the same hold; and, for a
+        // line terminator, the prompt it is pressed at.
+        let input_start = self.host_input_start();
+        let context = self.host_context();
+        let escaped_chords = self.host_escaped_chords();
+        let submit_prompt = self.host_submit_prompt();
+        // The engine's own deferred-wrap flag, read under the same hold.
+        let wrap_pending = self.term.grid().pending_wrap();
         // The local termios: canonical with ECHO clear. Invisible behind a link.
         let tty_swallows = !self.cfg.remote && self.program.noecho && !self.program.alt;
         let now = self.now;
         let mode = self.host_mode();
+        let shifts_before = self.predictor.events_for_test().shifts_armed;
         let ends_epoch = match key {
             _ if (matches!(key, Key::Glyph(_)) || edit.is_some()) && (no_echo || tty_swallows) => {
                 // The no-echo gate: refused as input we did not model, and owed.
@@ -1964,6 +3330,12 @@ impl Sim {
                     coords,
                     grid,
                     row: has_row.then_some(self.press_row.as_slice()),
+                    below: (has_row && !self.press_below.is_empty())
+                        .then_some(self.press_below.as_slice()),
+                    wrap_pending: Some(wrap_pending),
+                    input_start,
+                    context,
+                    escaped_chords,
                 };
                 let accepted = self.predictor.predict_glyph(c, &sample, now);
                 self.sync(accepted.then_some(id), false)?;
@@ -1977,12 +3349,18 @@ impl Sim {
                     coords,
                     grid,
                     row: has_row.then_some(self.press_row.as_slice()),
+                    below: (has_row && !self.press_below.is_empty())
+                        .then_some(self.press_below.as_slice()),
+                    wrap_pending: Some(wrap_pending),
+                    input_start,
+                    context,
+                    escaped_chords,
                 };
                 let outcome = self.predictor.predict_edit(k, &sample, now);
                 match outcome {
                     EditOutcome::Armed => {
                         self.stats.edit_keys_armed += 1;
-                        if self.program.cooked() && k != EditKey::Backspace {
+                        if self.program.cooked() && matches!(k, EditKey::Left | EditKey::Right) {
                             self.stats.cooked_motions_armed += 1;
                         }
                         self.sync(Some(id), false)?;
@@ -1995,12 +3373,17 @@ impl Sim {
             Key::Enter => {
                 self.last_enter = Some(id);
                 if self.cfg.host != Host::IgnoresLineSubmits {
-                    self.predictor.note_line_submit(now);
+                    self.predictor.note_line_submit_at(submit_prompt, now);
                 }
                 self.sync(None, false)?;
                 true
             }
-            Key::Backspace | Key::Left | Key::Right | Key::Unmodelled(_) | Key::Paste(_) => {
+            Key::Backspace
+            | Key::Left
+            | Key::Right
+            | Key::Learned(_)
+            | Key::Unmodelled(_)
+            | Key::Paste(_) => {
                 self.predictor.note_unmodelled_input(now);
                 self.sync(None, false)?;
                 true
@@ -2008,6 +3391,14 @@ impl Sim {
         };
         if let Some(log) = self.keys.get_mut(id) {
             log.ends_epoch = ends_epoch;
+        }
+        // A shift armed against overwrite mode, which never moves the tail: the
+        // class ladder must keep it dark.
+        if self.predictor.events_for_test().shifts_armed > shifts_before
+            && self.program.editor == Editor::Overwrite
+            && !self.program.cooked()
+        {
+            self.stats.overwrite_shifts_armed += 1;
         }
         self.program.inbox.push_back(id);
         Ok(())
@@ -2032,6 +3423,18 @@ impl Sim {
                 seen_at(input, usize::from(row), c)
             }
         }));
+        // The row under it, as aterm-gui reads it under the same hold (none on the
+        // last row).
+        self.press_below.clear();
+        let below = usize::from(row) + 1;
+        if below < rows {
+            self.press_below
+                .extend((0..cols).map(|c| seen_at(input, below, c)));
+        }
+        let read = (self.press_row.len() + self.press_below.len()) as u64;
+        self.cost.row_samples += 1;
+        self.cost.row_cells += read;
+        self.cost.row_cells_max = self.cost.row_cells_max.max(read);
         true
     }
 
@@ -2042,9 +3445,11 @@ impl Sim {
                 break;
             };
             let reliable = self.program.reliable;
-            let Some(key) = self.keys.get(id).map(|log| log.key.clone()) else {
+            let Some((key, chord)) = self.keys.get(id).map(|log| (log.key.clone(), log.chord))
+            else {
                 continue;
             };
+            self.program.reading_chord = chord;
             self.program
                 .consume(id, &key, choice.rotate_left(u32::from(i) * 7));
             // Reliable when the editor knew its column as it read the key AND
@@ -2208,11 +3613,13 @@ impl Sim {
     /// model). The DECORATION RULE: a cell the far end draws as decoration (a
     /// right prompt) may be shown stale, in a frame whose screen still had it or
     /// that lacked one the settled screen drew; that is counted, not a violation,
-    /// because no ghost is involved and the decoration is the program's to move.
-    /// A ghost GLYPH where the settled screen differs is a violation, decoration
-    /// or not.
+    /// because no typed glyph is involved and the decoration is the program's to
+    /// move. A blank ghost (the cell a state chain's erase vacated) under
+    /// decoration the settled screen drew is the second case: the frame showed
+    /// no glyph there, only lacked what the far end then drew. A ghost GLYPH
+    /// where the settled screen differs is a violation, decoration or not.
     fn settled(&mut self, k: KeyId) -> Result<(), Violation> {
-        if self.cfg.mode != PredictMode::Adaptive {
+        if !self.checks || self.cfg.mode != PredictMode::Adaptive {
             return Ok(());
         }
         let Some(log) = self.keys.get_mut(k) else {
@@ -2244,6 +3651,12 @@ impl Sim {
                 continue; // a resize: another space, already excluded
             }
             self.stats.frame_fidelity_checks += 1;
+            if f.learned.any {
+                self.stats.learned_fidelity_checks += 1;
+            }
+            if f.learned.delete {
+                self.stats.delete_fidelity_checks += 1;
+            }
             let mut wrong = Vec::new();
             for (r, (shown, settled)) in f.text.iter().zip(&truth).enumerate() {
                 for (c, (a, b)) in shown.iter().zip(settled).enumerate() {
@@ -2251,9 +3664,20 @@ impl Sim {
                         continue;
                     }
                     let ghost = f.ghosts.contains(&(r, c));
+                    let settled_decoration =
+                        truth_decoration.get(r).and_then(|row| row.get(c)) == Some(&true);
                     let decoration = f.decoration.get(r).and_then(|row| row.get(c)) == Some(&true)
-                        || truth_decoration.get(r).and_then(|row| row.get(c)) == Some(&true);
-                    if !ghost && decoration {
+                        || settled_decoration;
+                    // A VACATED ghost, the blank a state chain's erase painted
+                    // over its glyph, shows no typed glyph: where the settled
+                    // screen draws decoration on it (an autosuggestion the
+                    // editor brings up in the erase's own output), the frame
+                    // lacked a decoration the far end drew, as a frame with no
+                    // ghost may.
+                    let vacated = f.vacated.contains(&(r, c)) && settled_decoration;
+                    if vacated {
+                        self.stats.late_decoration += 1;
+                    } else if !ghost && decoration {
                         self.stats.stale_decoration += 1;
                     } else {
                         wrong.push((r, c, a.0, b.0));
@@ -2313,7 +3737,20 @@ impl Sim {
     /// the press: an unprompted autosuggestion drawn with the cursor not yet
     /// stepped back shows a typed glyph with the cursor past it (the forty-seed
     /// sweep's seed 33, a guess anchored on a cancelled glyph's cell under it).
-    fn attributed(&mut self, credited: &[u64]) -> Result<(), Violation> {
+    ///
+    /// "Overdue" is judged by `window`, the predictor's window as it stood
+    /// before the reconcile that made the credits: that is the window the
+    /// predictor asked every owe under, and the credit's own sample may then
+    /// widen it. Judged by the widened one, a cancelled glyph's erase unread for
+    /// longer than the window the credit was made under (its typed owe lapsed,
+    /// the cancelled echo still on screen) counted as on time, and the guess
+    /// typed on the cancelled cell was held to an attribution the predictor
+    /// never promised (two-hundred-seed sweep, seed index 173, case 267, a
+    /// harness scope present on main before predictive editing's increment 3).
+    fn attributed(&mut self, credited: &[u64], window: Duration) -> Result<(), Violation> {
+        if !self.checks {
+            return Ok(());
+        }
         for &seq in credited {
             let Some(k) = self.keys.iter().rposition(|log| log.seq == Some(seq)) else {
                 continue;
@@ -2324,7 +3761,7 @@ impl Sim {
             if log.unprompted_at_press != self.unprompted_delivered
                 || !self.program.reliable
                 || self.late_predecessor(k)
-                || self.overdue_predecessor(k)
+                || self.overdue_predecessor(k, window)
                 || self.output_in_transit_before(k)
                 || self.unprompted_in_transit()
             {
@@ -2366,8 +3803,8 @@ impl Sim {
     /// erase the program has not read, its Backspace typed more than a window ago,
     /// leaves the cancelled glyph's echo and its cursor advance on screen, where a
     /// glyph typed again on that cell is retired by them.
-    fn overdue_predecessor(&self, k: KeyId) -> bool {
-        let window = ECHO_DEADLINE.max(self.predictor.glitch_window_for_test());
+    fn overdue_predecessor(&self, k: KeyId, window: Duration) -> bool {
+        let window = ECHO_DEADLINE.max(window);
         let unarrived = |j: KeyId| {
             self.program.inbox.contains(&j)
                 || self.program.pipe.iter().any(|seg| seg.cause == Some(j))
@@ -2412,7 +3849,7 @@ impl Sim {
         let Some((id, row, col, space, unprompted)) = self.landing.take() else {
             return Ok(());
         };
-        if self.cfg.mode != PredictMode::Adaptive || space != self.space() {
+        if !self.checks || self.cfg.mode != PredictMode::Adaptive || space != self.space() {
             return Ok(());
         }
         let Some(log) = self.keys.get(id) else {
@@ -2452,6 +3889,13 @@ impl Sim {
         let alt = self.host_alt();
         let now = self.host_clock();
         self.predictor.set_mode(self.host_mode());
+        // The window this turn's credits are judged under: as it stood before
+        // them (`Sim::attributed`).
+        let window = self.predictor.glitch_window_for_test();
+        // THE COST of the frame, counted: the cells the reconcile asked the
+        // host for, and the ops the reconcile and the overlay folded.
+        let folded = self.predictor.events_for_test().ops_folded;
+        let mut observed = 0u64;
         {
             let input = &self.scratch;
             let blind = self.cfg.host == Host::TailBlind;
@@ -2461,6 +3905,7 @@ impl Sim {
                 alt,
                 now,
                 |r, c| {
+                    observed += 1;
                     // After an echo the cursor stands on the first cell of the
                     // tail, so the blind host reads from it rightward.
                     if blind && r == cursor.row && c >= cursor.col {
@@ -2472,20 +3917,26 @@ impl Sim {
             );
         }
         let credited = self.predictor.take_credited_for_test();
-        self.attributed(&credited)?;
+        self.attributed(&credited, window)?;
         self.sync(None, false)?;
         self.read_oracle_base();
-        let shown: Vec<(u16, u16, char)> = self
+        let (shown, kinds): (Vec<(u16, u16, char)>, Vec<GhostCell>) = self
             .predictor
             .overlay(now)
             .iter()
-            .map(|p| (p.row, p.col, p.ch))
-            .collect();
+            .map(|p| ((p.row, p.col, p.ch), p.ghost()))
+            .unzip();
+        let folds = self.predictor.events_for_test().ops_folded - folded;
+        self.cost.reconciles += 1;
+        self.cost.observe_calls += observed;
+        self.cost.observe_max = self.cost.observe_max.max(observed);
+        self.cost.frame_folds += folds;
+        self.cost.frame_folds_max = self.cost.frame_folds_max.max(folds);
         self.sync(None, false)?;
         // A state chain's frame is its displayed state, painted all or none.
         let chain_cursor = self.predictor.overlay_cursor();
         if chain_cursor.is_some() || (self.predictor.engaged_for_test() && !shown.is_empty()) {
-            return self.frame_chain(&shown, chain_cursor);
+            return self.frame_chain(&shown, &kinds, chain_cursor);
         }
         // What the host puts on glass: the overlay, each ghost with its key; a host
         // that skips the erase frame leaves the last frame's ghosts instead.
@@ -2530,6 +3981,28 @@ impl Sim {
             });
         }
         let checked = self.check(&shown, &glass, displayed.as_ref(), &painted);
+        // On glass: `D`, and the cursor the GUI draws one past the newest ghost
+        // it painted (with none painted, `D = A` and the engine's cursor).
+        let mut rows: Vec<u16> = glass
+            .iter()
+            .zip(&painted)
+            .filter(|&(_, &p)| p)
+            .map(|(&(_, row, _, _), _)| row)
+            .collect();
+        rows.dedup();
+        let newest = glass
+            .iter()
+            .zip(&painted)
+            .rfind(|&(_, &p)| p)
+            .map(|(&(_, row, col, _), _)| (row, col));
+        self.glass_frame = match (displayed, newest) {
+            (Some(frame), Some((row, col))) => Some(OnGlass {
+                frame,
+                cursor: displayed_cursor(row, col, self.term.cols()),
+                rows,
+            }),
+            _ => None,
+        };
         self.glass = glass;
         checked
     }
@@ -2572,11 +4045,19 @@ impl Sim {
     fn frame_chain(
         &mut self,
         shown: &[(u16, u16, char)],
+        kinds: &[GhostCell],
         chain_cursor: Option<(u16, u16)>,
     ) -> Result<(), Violation> {
         let visible = self.predictor.visible_ops_for_test();
         let ids: Vec<KeyId> = self.mirror.iter().copied().take(visible).collect();
         let Some(&newest) = ids.last() else {
+            if !self.checks {
+                // A predictor with rules off, measured: what it shows with no op
+                // displayed is nothing a host paints.
+                self.glass_frame = None;
+                self.glass.clear();
+                return Ok(());
+            }
             return Err(violation(
                 "provenance",
                 format!("a chain's cursor {chain_cursor:?} is drawn with no op displayed"),
@@ -2586,7 +4067,7 @@ impl Sim {
         let blank = self.term.implicit_blank_render_cell();
         let (painted, drawn) = paint_chain(
             &mut d,
-            shown,
+            (shown, kinds),
             chain_cursor,
             (self.term.cols(), blank),
             self.cfg.host,
@@ -2615,12 +4096,49 @@ impl Sim {
         let checked = self.check_chain(&ids, shown, &painted, (chain_cursor, drawn), &d);
         if checked.is_ok() && (drawn.is_some() || !cells.is_empty()) {
             self.stats.edit_frames_displaying += 1;
+            // A shift on glass: text the chain's state moved, painted as the
+            // cell it came from.
+            if kinds
+                .iter()
+                .zip(&painted)
+                .any(|(&k, &p)| p && matches!(k, GhostCell::Moved { .. }))
+            {
+                self.stats.shifts_displayed += 1;
+                if self.cfg.mode == PredictMode::Adaptive
+                    && self.program.editor == Editor::Overwrite
+                    && !self.program.cooked()
+                {
+                    self.stats.overwrite_shifts_displayed += 1;
+                }
+            }
             if ids.iter().any(|&k| {
                 self.keys
                     .get(k)
                     .is_some_and(|l| matches!(l.edit, Some(EditKey::Left | EditKey::Right)))
             }) {
                 self.stats.motions_displayed += 1;
+            }
+            let edit_of = |k: &KeyId| self.keys.get(*k).and_then(|l| l.edit);
+            let learned = LearnedShown {
+                any: ids.iter().any(|k| {
+                    matches!(
+                        edit_of(k),
+                        Some(
+                            EditKey::Home
+                                | EditKey::End
+                                | EditKey::CtrlA
+                                | EditKey::CtrlE
+                                | EditKey::Delete
+                        )
+                    )
+                }),
+                delete: ids.iter().any(|k| edit_of(k) == Some(EditKey::Delete)),
+            };
+            if learned.any {
+                self.stats.line_edge_displayed += 1;
+            }
+            if learned.delete {
+                self.stats.delete_displayed += 1;
             }
             if self
                 .last_enter
@@ -2629,7 +4147,7 @@ impl Sim {
                 self.stats.carried_chains += 1;
             }
             if self.cfg.mode == PredictMode::Adaptive {
-                self.record_frame(&d, &cells, newest, drawn);
+                self.record_frame(&d, &cells, newest, drawn, learned);
             }
         }
         self.glass = shown
@@ -2638,6 +4156,15 @@ impl Sim {
             .filter(|&(_, &p)| p)
             .map(|(&(r, c, ch), _)| (newest, r, c, ch))
             .collect();
+        // On glass: `D` and the chain's cursor, when the span was painted or the
+        // cursor drawn (a motion paints no cell).
+        let mut rows: Vec<u16> = cells.iter().map(|&(r, _)| r).collect();
+        rows.dedup();
+        self.glass_frame = (drawn.is_some() || !cells.is_empty()).then_some(OnGlass {
+            frame: d,
+            cursor: drawn,
+            rows,
+        });
         checked
     }
 
@@ -2662,6 +4189,9 @@ impl Sim {
         (chain_cursor, drawn): ChainCursors,
         d: &RenderInput,
     ) -> Result<(), Violation> {
+        if !self.checks {
+            return Ok(());
+        }
         let (rows, cols) = (self.term.rows(), self.term.cols());
         let alt = self.term.is_alternate_screen();
         let space = self.space();
@@ -2762,6 +4292,15 @@ impl Sim {
                     }
                     cursor = cursor.saturating_sub(1);
                 }
+                // The learned keys as their canonical bindings: the line's
+                // start, its end, the glyph under the cursor erased.
+                (Some(EditKey::Home | EditKey::CtrlA), _) => cursor = lo,
+                (Some(EditKey::End | EditKey::CtrlE), _) => cursor = end(&text),
+                (Some(EditKey::Delete), _) => {
+                    if at < text.len() {
+                        text.remove(at);
+                    }
+                }
                 (None, Key::Glyph(c)) => {
                     text.insert(at.min(text.len()), *c);
                     cursor = cursor.saturating_add(1);
@@ -2853,6 +4392,9 @@ impl Sim {
         if !shown.is_empty() {
             self.stats.frames_displaying += 1;
             self.stats.max_displayed = self.stats.max_displayed.max(shown.len());
+        }
+        if !self.checks {
+            return Ok(());
         }
         // The overlay is a leading run of the pending guesses (the mirror).
         let ids: Vec<KeyId> = self.mirror.iter().copied().take(shown.len()).collect();
@@ -3000,7 +4542,7 @@ impl Sim {
                 .map(|(&(_, r, c, _), _)| (r, c))
                 .collect();
             let cursor = displayed_cursor(row, col, self.term.cols());
-            self.record_frame(d, &cells, newest, cursor);
+            self.record_frame(d, &cells, newest, cursor, LearnedShown::default());
         }
         Ok(())
     }
@@ -3013,7 +4555,11 @@ impl Sim {
         painted: &[(u16, u16)],
         newest: KeyId,
         cursor: Option<(u16, u16)>,
+        learned: LearnedShown,
     ) {
+        if !self.checks {
+            return;
+        }
         // A SETTLED BASE: every key typed before the oldest pending guess has
         // been read and all its output has landed. A frame caught mid-way
         // through an earlier key's output (a cancelled glyph drawn and about to
@@ -3048,14 +4594,28 @@ impl Sim {
         }) {
             self.stats.rprompt_frames += 1;
         }
+        let text = frame_text(d, rows, cols);
+        let under = frame_text(&self.scratch, rows, cols);
+        let cell =
+            |t: &[Vec<CellText>], (r, c): (usize, usize)| t.get(r).and_then(|l| l.get(c)).cloned();
+        let vacated = ghosts
+            .iter()
+            .copied()
+            .filter(|&at| {
+                cell(&text, at).is_some_and(|t| t.0 == ' ' && t.2.is_none())
+                    && cell(&under, at).is_some_and(|u| u.0 != ' ')
+            })
+            .collect();
         let frame = FrameShown {
-            text: frame_text(d, rows, cols),
+            text,
             decoration,
             ghosts,
+            vacated,
             cursor,
             space: self.space(),
             unprompted: self.unprompted_delivered,
             oldest,
+            learned,
         };
         if let Some(log) = self.keys.get_mut(newest)
             && log.frames.last().is_none_or(|last| {
@@ -3065,6 +4625,7 @@ impl Sim {
                     || last.space != frame.space
                     || last.unprompted != frame.unprompted
                     || last.oldest != frame.oldest
+                    || last.learned != frame.learned
             })
         {
             log.frames.push(frame);
@@ -3163,6 +4724,7 @@ impl Sim {
             self.program.cols = usize::from(cols);
             self.program.reliable = false;
             self.program.rprompt = None;
+            self.program.suggestion.clear();
         } else {
             let estimate = self.predictor.take_link_estimate();
             self.predictor.restore_link_estimate(estimate);
@@ -3175,14 +4737,22 @@ impl Sim {
     /// The clock moves; a due deadline wakes the host's expiry sweep and its
     /// erase frame.
     fn advance(&mut self, ms: u32) -> Result<(), Violation> {
-        self.now += Duration::from_millis(u64::from(ms));
+        self.advance_by(Duration::from_millis(u64::from(ms)))
+            .map(|_drew| ())
+    }
+
+    /// [`Self::advance`] by any duration: the measurement's link runs in
+    /// microseconds.
+    fn advance_by(&mut self, by: Duration) -> Result<bool, Violation> {
+        self.now += by;
         let now = self.host_clock();
         if self.predictor.next_deadline().is_some_and(|d| d <= now) {
             self.predictor.expire_due(now);
             self.sync(None, false)?;
             self.frame()?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Resolve and run one op.
@@ -3208,7 +4778,17 @@ impl Sim {
                 self.deliver(n)?;
                 self.frame()?;
             }
-            Op::Unprompted(what, param) => self.program.unprompted_output(what, param),
+            Op::Unprompted(what, param) => {
+                self.program.unprompted_output(what, param);
+                // A new shell: the host re-keys the integration for it, as
+                // aterm-gui authorizes the nonce of a shell it spawns.
+                if self.program.shell != self.shell {
+                    self.shell = self.program.shell;
+                    let key = nonce(self.shell);
+                    self.term.authorize_shell_integration(key);
+                    self.reference.authorize_shell_integration(key);
+                }
+            }
             Op::Advance(ms) => self.advance(ms)?,
             Op::Frame => self.frame()?,
             Op::HostReset(resize) => self.host_reset(resize)?,
@@ -3228,6 +4808,11 @@ impl Sim {
             0..=69 => {
                 if secret_context {
                     Key::Glyph(char::from(b'0' + (detail % 10) as u8))
+                } else if self.cfg.bidi && (detail >> 24) % 8 == 5 {
+                    // Now and then a right-to-left letter (`Config::bidi`): a
+                    // detail `glyph` never builds, so a named case's keys keep
+                    // their meaning.
+                    Key::Glyph(RTL)
                 } else {
                     // The wide and combining glyphs are rare.
                     let i = detail as usize % (TEXT.len() * 4);
@@ -3239,6 +4824,17 @@ impl Sim {
             87..=95 => match detail % 13 {
                 1 => Key::Left,
                 2 => Key::Right,
+                // The learned keys; with the integration, now and then the
+                // control chord in Home's or End's place (a detail no named
+                // case without it reads otherwise).
+                6 if self.cfg.integration && (detail / 13) % 2 == 1 => Key::Learned(EditKey::CtrlA),
+                7 if self.cfg.integration && (detail / 13) % 2 == 1 => Key::Learned(EditKey::CtrlE),
+                6 => Key::Learned(EditKey::Home),
+                7 => Key::Learned(EditKey::End),
+                8 => Key::Learned(EditKey::Delete),
+                // Now and then push-line in Tab's place (a detail no named case
+                // reads otherwise).
+                0 if (detail / 13) % 4 == 3 => Key::Unmodelled(Unmodelled::PushLine),
                 n => Key::Unmodelled(
                     [
                         Unmodelled::Tab,
@@ -3247,9 +4843,9 @@ impl Sim {
                         Unmodelled::KillLine,
                         Unmodelled::KillWord,
                         Unmodelled::Interrupt,
-                        Unmodelled::Home,
-                        Unmodelled::End,
-                        Unmodelled::DeleteKey,
+                        Unmodelled::Tab,
+                        Unmodelled::Tab,
+                        Unmodelled::Tab,
                         Unmodelled::WordLeft,
                         Unmodelled::Up,
                         Unmodelled::Esc,
@@ -3348,19 +4944,7 @@ pub(crate) fn run_traced(
         .try_for_each(|(i, &op)| sim.step(op).map_err(|v| (i, v)))
         .and_then(|()| sim.settle().map_err(|v| (ops.len(), v)));
     *trace = sim.trace.take();
-    let events = sim.predictor.events_for_test();
-    sim.stats.expiry_owes = events.expiry_owes;
-    sim.stats.tail_refusals = events.tail_refusals;
-    sim.stats.decorated_proofs = events.decorated_proofs;
-    sim.stats.typed_owes = events.typed_owes;
-    sim.stats.standing_voids = events.standing_voids;
-    sim.stats.advance_waits = events.advance_waits;
-    sim.stats.motions_proven = events.motions_proven;
-    sim.stats.net_null_retired = events.net_null_retired;
-    sim.stats.transit_waits = events.transit_waits;
-    sim.stats.decline_motions = events.decline_motions;
-    sim.stats.vacate_refusals = events.vacate_refusals;
-    result.map(|()| sim.stats)
+    result.map(|()| sim.stats())
 }
 
 /// How fast the far end answers, which decides what Adaptive may show.
@@ -3416,6 +5000,14 @@ pub(crate) fn gen_ops(rng: &mut XorShift, len: usize, link: Link) -> Vec<Op> {
             }
             if calm && pick == 97 {
                 edit_motif(rng, link, &mut ops);
+                continue;
+            }
+            if calm && pick == 96 {
+                shift_motif(rng, link, &mut ops);
+                continue;
+            }
+            if calm && pick == 95 {
+                line_edge_motif(rng, link, &mut ops);
                 continue;
             }
             let op = if calm {
@@ -3608,6 +5200,253 @@ pub(crate) fn edit_motif(rng: &mut XorShift, link: Link, ops: &mut Vec<Op>) {
     ]);
 }
 
+/// Editing INSIDE the line, as a typist fixes a word: a word of three to six
+/// letters typed at the end, each read and echoed; a pause to notice; `←` one
+/// to three times, each read and echoed (the first proves the motion class);
+/// then one to three glyphs, or Backspaces, typed there, each a SHIFT of the
+/// text right of the cursor: the first usually read and echoed on its own,
+/// which proves its class (or, in overwrite mode, does not), the rest now and
+/// then in a burst, so a frame shows them with the tail moved before their
+/// echo; then `→` back toward the end. Each key's output is delivered in whole
+/// or in part, as `edit_motif`'s are.
+pub(crate) fn shift_motif(rng: &mut XorShift, link: Link, ops: &mut Vec<Op>) {
+    let letters = 3 + rng.index(4);
+    for _ in 0..letters {
+        ops.extend([
+            glyph(TEXT[rng.index(9)]),
+            Op::Program(1, 0),
+            Op::Advance(advance_ms(rng, link)),
+            Op::Deliver(1024),
+        ]);
+    }
+    ops.push(Op::Advance(
+        300 + u32::try_from(rng.below(200)).unwrap_or(0),
+    ));
+    let lefts = 1 + rng.index(3);
+    for _ in 0..lefts {
+        ops.extend([
+            LEFT,
+            Op::Program(1, 0),
+            Op::Advance(advance_ms(rng, link)),
+            Op::Deliver(1024),
+        ]);
+    }
+    let erase = rng.below(3) == 0;
+    let shifts = 1 + rng.index(3);
+    let mut unread = 0u8;
+    let keys = (0..shifts)
+        .map(|_| {
+            if erase {
+                BACKSPACE
+            } else {
+                glyph(TEXT[rng.index(9)])
+            }
+        })
+        .chain(std::iter::repeat_n(RIGHT, lefts))
+        .collect::<Vec<Op>>();
+    for (i, key) in keys.into_iter().enumerate() {
+        ops.push(key);
+        unread += 1;
+        if (i == 0 && rng.below(4) != 0) || rng.below(3) == 0 {
+            let part = if rng.below(4) == 0 {
+                u16::try_from(1 + rng.below(1023)).unwrap_or(1)
+            } else {
+                1024
+            };
+            ops.extend([
+                Op::Program(unread, 0),
+                Op::Advance(advance_ms(rng, link)),
+                Op::Deliver(part),
+            ]);
+            unread = 0;
+        }
+        ops.push(Op::Advance(40 + u32::try_from(rng.below(120)).unwrap_or(0)));
+    }
+    ops.extend([
+        Op::Program(unread, 0),
+        Op::Advance(advance_ms(rng, link)),
+        Op::Deliver(1024),
+    ]);
+}
+
+/// The ops that press each learned key and draw a frame (a detail
+/// `Sim::key_for` maps to it, with `detail % 4 != 0`): Home, End, Ctrl-A and
+/// Ctrl-E (Home and End without the integration) and Delete.
+pub(crate) const HOME: Op = Op::Key(87, 6);
+pub(crate) const END: Op = Op::Key(87, 7);
+pub(crate) const CTRL_A: Op = Op::Key(87, 19);
+pub(crate) const CTRL_E: Op = Op::Key(87, 46);
+pub(crate) const DELETE: Op = Op::Key(87, 21);
+
+/// The op that presses ^C (Interrupt) and draws a frame.
+pub(crate) const INTERRUPT: Op = Op::Key(87, 5);
+
+/// The op that presses zsh's push-line (`ESC q`) and draws a frame.
+pub(crate) const PUSH_LINE: Op = Op::Key(87, 39);
+
+/// The learned keys at a fresh prompt, as a typist uses them: Enter and a
+/// command whose output ends in a prompt (signed under the integration), or
+/// the one that clears the screen and reads a line after a prompt of its own;
+/// a pause; a word typed, each glyph read and echoed; a pause to notice; the
+/// line's two edges, Home and End or Ctrl-A and Ctrl-E, each pressed twice in
+/// turn and read on its own, so their bindings are learned from their echoes
+/// where the far end binds them so, and half the time Delete twice at the
+/// start; then three to eight keys from those, Delete, `←` and a glyph (a
+/// prefix after the start, a suffix after the end), each read and its output
+/// delivered now and then, so a learned key is shown at once; and now and
+/// then, between them, output nobody typed for that changes what the keys
+/// reach: the shell re-executing with the next keymap under a new nonce, a
+/// forged mark, Kitty's `DISAMBIGUATE` or modifyOtherKeys level 2 pushed or
+/// popped, the prompt redrawn in another width with no new `B`. Now and then
+/// the line before the Enter is pushed onto zsh's buffer stack, and the prompt
+/// comes pre-filled with it.
+pub(crate) fn line_edge_motif(rng: &mut XorShift, link: Link, ops: &mut Vec<Op>) {
+    let command = [0, 6, 8, 19][rng.index(4)];
+    // Whatever was in flight read and delivered, and ^C, which brings every
+    // far end here back to its shell's prompt: so the Enter below is the key
+    // the shell reads next.
+    ops.extend([
+        Op::Program(u8::MAX, 0),
+        Op::Advance(advance_ms(rng, link)),
+        Op::Deliver(1024),
+        INTERRUPT,
+        Op::Program(1, 0),
+        Op::Advance(advance_ms(rng, link)),
+        Op::Deliver(1024),
+    ]);
+    if rng.below(4) == 0 {
+        for key in [
+            glyph(TEXT[rng.index(9)]),
+            glyph(TEXT[rng.index(9)]),
+            PUSH_LINE,
+        ] {
+            ops.extend([
+                key,
+                Op::Program(1, 0),
+                Op::Advance(advance_ms(rng, link)),
+                Op::Deliver(1024),
+            ]);
+        }
+    }
+    ops.extend([
+        Op::Key(79, 1),
+        Op::Program(1, command),
+        Op::Advance(advance_ms(rng, link)),
+        Op::Deliver(1024),
+        Op::Advance(300 + u32::try_from(rng.below(400)).unwrap_or(0)),
+    ]);
+    for _ in 0..3 + rng.below(4) {
+        ops.extend([
+            glyph(TEXT[rng.index(9)]),
+            Op::Program(1, 0),
+            Op::Advance(advance_ms(rng, link)),
+            Op::Deliver(1024),
+        ]);
+    }
+    ops.push(Op::Advance(
+        300 + u32::try_from(rng.below(200)).unwrap_or(0),
+    ));
+    let (start, end) = if rng.below(2) == 0 {
+        (HOME, END)
+    } else {
+        (CTRL_A, CTRL_E)
+    };
+    let read = |key: Op, rng: &mut XorShift, ops: &mut Vec<Op>| {
+        ops.extend([
+            key,
+            Op::Program(1, 0),
+            Op::Advance(advance_ms(rng, link)),
+            Op::Deliver(1024),
+            Op::Advance(40 + u32::try_from(rng.below(120)).unwrap_or(0)),
+        ]);
+    };
+    for _ in 0..2 {
+        for key in [start, end] {
+            read(key, rng, ops);
+        }
+    }
+    // Delete taught too, half the time: the line's start, then Delete twice
+    // there, each read on its own, so delete-char is learned from two echoes
+    // that shift the text left, where the far end binds it so; then the end,
+    // `←`, and Delete once more, shown at once where it was learned.
+    if rng.below(2) == 0 {
+        for key in [start, DELETE, DELETE, end, LEFT, DELETE] {
+            read(key, rng, ops);
+        }
+    }
+    let mut unread = 0u8;
+    for _ in 0..3 + rng.below(6) {
+        let key = match rng.below(10) {
+            0..=2 => start,
+            3 | 4 => end,
+            5 => [HOME, END, CTRL_A, CTRL_E][rng.index(4)],
+            // Delete, half the time after a `←` (one at the end of the text
+            // changes nothing and is not modelled).
+            6 | 7 if rng.below(2) == 0 => {
+                ops.push(LEFT);
+                unread += 1;
+                DELETE
+            }
+            6 | 7 => DELETE,
+            8 => LEFT,
+            // Now and then a combining mark, which joins the cell before it:
+            // typed while a chain is in flight, its echo makes a cell of the
+            // chain's line opaque (R-OPAQUE).
+            _ if rng.below(4) == 0 => glyph('\u{301}'),
+            _ => glyph(TEXT[rng.index(9)]),
+        };
+        ops.push(key);
+        unread += 1;
+        if rng.below(10) == 0 {
+            let what = [
+                Unprompted::Rebind,
+                Unprompted::ForgedMark,
+                Unprompted::KittyChords,
+                Unprompted::ResetPrompt,
+            ][rng.index(4)];
+            ops.push(Op::Unprompted(
+                what,
+                u32::try_from(rng.below(2)).unwrap_or(0),
+            ));
+        }
+        if rng.below(3) != 0 {
+            let part = if rng.below(4) == 0 {
+                u16::try_from(1 + rng.below(1023)).unwrap_or(1)
+            } else {
+                1024
+            };
+            ops.extend([
+                Op::Program(unread, 0),
+                Op::Advance(advance_ms(rng, link)),
+                Op::Deliver(part),
+            ]);
+            unread = 0;
+        }
+        ops.push(Op::Advance(40 + u32::try_from(rng.below(120)).unwrap_or(0)));
+    }
+    ops.extend([
+        Op::Program(unread, 0),
+        Op::Advance(advance_ms(rng, link)),
+        Op::Deliver(1024),
+    ]);
+    // Now and then a prefix, the end and a combining mark in one burst: the
+    // mark, typed at the end of the text the chain leaves, is declined with
+    // the chain's pixels kept, and its echo joins the line's last cell while
+    // the chain is in flight, a cell no state can name (R-OPAQUE). (The start
+    // and the end alone would leave the line as it was: a net-null burst.)
+    if rng.below(3) == 0 {
+        ops.extend([
+            start,
+            glyph(TEXT[rng.index(9)]),
+            end,
+            glyph('\u{301}'),
+            Op::Program(4, 0),
+            Op::Advance(advance_ms(rng, link)),
+            Op::Deliver(1024),
+        ]);
+    }
+}
+
 /// Whether `ops` still breaks the same clause.
 pub(crate) fn still_fails(cfg: Config, ops: &[Op], clause: &str) -> bool {
     matches!(run(cfg, ops), Err((_, v)) if v.clause == clause)
@@ -3662,6 +5501,9 @@ pub(crate) fn faithful_configs() -> Vec<Config> {
                     wide,
                     rprompt: false,
                     editor: Editor::ReadlineIch,
+                    bidi: false,
+                    integration: false,
+                    keymap: Keymap::Canonical,
                 });
             }
         }
@@ -3687,6 +5529,9 @@ pub(crate) fn case_world(cfg: Config, seed: u64, case: usize) -> (Config, u64, L
         forced_wrap: (case / LINKS.len()) % 2 == 1,
         rprompt: (case / (LINKS.len() * 2)) % 2 == 1,
         editor: EDITORS[(case / (LINKS.len() * 4)) % EDITORS.len()],
+        bidi: (case / (LINKS.len() * 4 * EDITORS.len())) % 3 == 2,
+        integration: !case.is_multiple_of(3),
+        keymap: KEYMAPS[(case / 3) % KEYMAPS.len()],
         ..cfg
     };
     (cfg, case_seed, link, gen_ops(&mut rng, OPS_PER_CASE, link))
@@ -3734,6 +5579,11 @@ pub(crate) fn glyph(c: char) -> Op {
     Op::Key(0, detail)
 }
 
+/// The op that presses [`RTL`] and draws a frame under [`Config::bidi`]: a
+/// detail whose high byte `Sim::key_for` reads as the right-to-left letter
+/// (and `% 4 != 0`).
+pub(crate) const RTL_GLYPH: Op = Op::Key(0, (5 << 24) | 1);
+
 /// The op that presses `←` and draws a frame.
 pub(crate) const LEFT: Op = Op::Key(87, 1);
 
@@ -3742,3 +5592,7 @@ pub(crate) const RIGHT: Op = Op::Key(87, 2);
 
 /// The op that presses Backspace and draws a frame.
 pub(crate) const BACKSPACE: Op = Op::Key(70, 1);
+
+/// The op that presses Alt-B (a word motion, input the predictor does not
+/// model) and draws a frame.
+pub(crate) const WORD_LEFT: Op = Op::Key(87, 9);

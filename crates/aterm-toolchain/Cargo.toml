@@ -18,7 +18,13 @@ publish = false
 description = "The pinned Trust toolchain's discovery, rustup's home and binary, the shared build-cache rule, the gone-checkout rule and the toolchain lease, std only"
 
 [dependencies]
-# None: std only.
+# None: std only — but on Windows, where a device is a volume serial and one
+# path has many spellings: there the gone-checkout rule reads a device through
+# the one identity export and compares paths through the one key
+# (`aterm_sysprobe::volumes::file_id`, `aterm_sysprobe::paths`), both pure Rust
+# and kernel32 FFI with no dependency of their own.
+[target.'cfg(windows)'.dependencies]
+aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]
 # The lease tests' scratch prefixes, and their one-minute hang detector.

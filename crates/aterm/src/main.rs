@@ -17,10 +17,10 @@
 //! ```
 //!
 //! argv0 aliases: the bundle ships symlinks (`aterm-ctl`, `atpkg`, `aterm-fleet`,
-//! `aterm-drive`, `aterm-askpass`, `aterm-link`, `aterm-gui`, `aterm-cli`) onto this binary, a
-//! login renewal links `aterm-open-url` to it, `aterm machines enroll` links
-//! `aterm-machines-askpass` to it in its scratch directory, and main dispatches as whichever
-//! tool it was invoked as.
+//! `aterm-drive`, `aterm-askpass`, `aterm-link`, `aterm-gui`, `aterm-cli`, `amacs`, …; the
+//! list is `aterm_types::argv0::ALIASES`) onto this binary, a login renewal links
+//! `aterm-open-url` to it, `aterm machines enroll` links `aterm-machines-askpass` to it in its
+//! scratch directory, and main dispatches as whichever tool it was invoked as.
 
 // No `windows_subsystem = "windows"` here: this file is the console image. A Windows shell
 // waits for a console-subsystem child and not a GUI one, so with the attribute no shell would
@@ -98,12 +98,13 @@ const CTL_LOCAL: aterm_ctl::LocalVerbs = aterm_ctl::LocalVerbs {
 
 /// `cast drift` computed by the client: against a server that predates the verb (from the
 /// `cast`, `text`, `cursor` and `modes` it fetched; a racy cut is answered by the replays
-/// against each other, as the server does), or offline over saved files. The analysis is
-/// `aterm_control::cast_drift`, the server's code, with `computed=client` on its header. The
-/// seam policy is `Native`: the client cannot see which PTY backs the session (a ConPTY
-/// session's fidelity gate says so rather than accusing a resize). The engine's resize undo is
-/// dropped for an aterm older than the verb (older than the undo too) and matched against the
-/// screen for a saved recording (`undo=off` when dropped).
+/// against each other, as the server does), or offline over saved files. The recording is
+/// read back by `aterm_control::asciicast`, the codec the server writes `cast` with, and the
+/// analysis is `aterm_control::cast_drift`, the server's code, with `computed=client` on its
+/// header. The seam policy is `Native`: the client cannot see which PTY backs the session (a
+/// ConPTY session's fidelity gate says so rather than accusing a resize). The engine's resize
+/// undo is dropped for an aterm older than the verb (older than the undo too) and matched
+/// against the screen for a saved recording (`undo=off` when dropped).
 fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
     use aterm_control::cast_drift::{self as drift, Cut, DriftArgs, LiveScreen, Undo};
     let mut args = DriftArgs::parse(job.args).map_err(str::to_string)?;
@@ -111,7 +112,8 @@ fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
         aterm_ctl::DriftPeer::PreUndo => Undo::Drop,
         aterm_ctl::DriftPeer::Unknown => Undo::Match,
     };
-    let mut cast = drift::parse_asciicast(job.cast).map_err(|e| format!("cast drift: {e}"))?;
+    let mut cast =
+        aterm_control::asciicast::parse(job.cast).map_err(|e| format!("cast drift: {e}"))?;
     if let Some(until) = job.until {
         cast = cast.until(until);
     }
@@ -232,18 +234,17 @@ pub(crate) fn main() -> ExitCode {
     // Explorer launch; the window library's entry asks again itself.
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
-    let mut argv: Vec<OsString> = std::env::args_os().collect();
-    let rest: Vec<OsString> = if argv.is_empty() {
-        Vec::new()
-    } else {
-        argv.split_off(1)
-    };
+    // The program name, then the rest, taken off the iterator: no index into the list, so no
+    // `split_off` bound for the panic-freedom check to leave unproved.
+    let mut args_os = std::env::args_os();
+    let argv0_os: Option<OsString> = args_os.next();
+    let rest: Vec<OsString> = args_os.collect();
 
     // --- argv0 aliases (bundle symlinks, old installs) ----------------------
     // `file_name`, not a substring match, so only a real alias dispatches; EXE_SUFFIX is
     // trimmed for Windows.
-    let argv0 = argv
-        .first()
+    let argv0 = argv0_os
+        .as_ref()
         .map(|a| {
             std::path::Path::new(a)
                 .file_name()
@@ -270,6 +271,7 @@ pub(crate) fn main() -> ExitCode {
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
         AliasRoute::OpenUrl => return aterm_agent::harness::open_url::main_entry(rest),
+        AliasRoute::Amacs => return aterm_cli::amacs_launch::run(rest),
         AliasRoute::Link => {
             #[cfg(unix)]
             return dispatch_link(
@@ -391,6 +393,13 @@ pub(crate) fn main() -> ExitCode {
             aterm_cli::Verb::Machines => aterm_machines::cli::main_entry(forwarded),
             #[cfg(not(target_os = "macos"))]
             aterm_cli::Verb::Machines => machines_unavailable(),
+            #[cfg(target_os = "macos")]
+            aterm_cli::Verb::Init => aterm_machines::init::main_entry(forwarded),
+            #[cfg(not(target_os = "macos"))]
+            aterm_cli::Verb::Init => {
+                eprintln!("aterm init: local macOS setup is available on macOS only");
+                ExitCode::from(2)
+            }
             // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md).
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
@@ -411,6 +420,8 @@ pub(crate) fn main() -> ExitCode {
             // library's catalog and classifier (handed in as `WindowThemes`); import is a pure
             // conversion plus one file write. No window either way.
             aterm_cli::Verb::Theme => aterm_cli::theme_main_entry(forwarded, &WindowThemes),
+            // amacs, aterm's editor: its client hands the file to the window hosting this tab.
+            aterm_cli::Verb::Edit => aterm_cli::amacs_launch::run(forwarded),
             // The wt-shaped windowing grammar. `WindowedSibling`: typed at a prompt this is the
             // console image on Windows, so a spawned window goes to the windowed sibling and
             // the prompt comes back.
@@ -455,6 +466,12 @@ pub(crate) fn main() -> ExitCode {
         // parse_args returns only for a launch decision, which cannot happen
         // for a mode-free first token; defend anyway.
         return ExitCode::SUCCESS;
+    }
+
+    // `aterm amacs …` is `aterm edit …`: the editor is built in, so its name never reaches the
+    // store's dispatch or the rosters' `pkg run` below, whatever a store or roster holds.
+    if first == "amacs" {
+        return aterm_cli::amacs_launch::run(rest.get(1..).unwrap_or(&[]).to_vec());
     }
 
     // Toolchain dispatch (`aterm <tool> …`, docs/ATERM-DISTRIBUTION-WEDGE.md §4):
@@ -659,7 +676,7 @@ pub(crate) fn main() -> ExitCode {
     if cfg!(target_os = "macos")
         && session_lane_is_interactive()
         && let Some(layout) = layout.as_ref()
-        && atpkg::machine::launch_apply_due(layout, now).runs(|why| aterm_log::info!("{why}"))
+        && atpkg::machine::launch_apply_due(layout, now).runs(log_launch_apply_stood_aside)
     {
         spawn_detached_machine_apply();
     }
@@ -916,6 +933,13 @@ fn session_pass_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
         )
 }
 
+/// Why the launch's `pkg machine apply` claim stood aside ([`atpkg::machine::LaunchApply::runs`]),
+/// as a log line. A named fn, not a closure at the call: the claim's `impl FnOnce` then names
+/// this item, whose own rows the panic-freedom check reports here.
+fn log_launch_apply_stood_aside(why: &'static str) {
+    aterm_log::info!("{why}");
+}
+
 /// One detached `aterm pkg machine apply`: the lock-free host settings, once a day
 /// ([`atpkg::machine::launch_apply_due`]). Separate from [`spawn_detached_pkg_update`] because
 /// the gates differ: a package pass is due or not and can be switched off; the `[machine]`
@@ -1026,6 +1050,10 @@ enum AliasRoute {
     /// directory: it answers with the password `enroll` feeds `ssh`'s standard input. An
     /// alias for the reason `aterm-askpass` is one: `ssh` execs it as `[path, prompt]`.
     MachinesAskpass,
+    /// `amacs …`, aterm's editor (`aterm edit`, docs/DESIGN-amacs-2026-10-19.md §8.1): an alias
+    /// because `$EDITOR` names one executable, which `git` and the rest run with the file and no
+    /// room for a verb.
+    Amacs,
     /// Not an alias: `aterm`, `aterm-cli` (the front door forced to a session), a renamed copy.
     FrontDoor,
 }
@@ -1048,6 +1076,7 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
         "aterm-machines-askpass" => AliasRoute::MachinesAskpass,
         "aterm-link" => AliasRoute::Link,
         "aterm-open-url" => AliasRoute::OpenUrl,
+        "amacs" => AliasRoute::Amacs,
         "aterm-gui" | "aterm-windowed" => match aterm_cli::Verb::from_operand(first) {
             Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
             // Every other verb stays out: `aterm-gui` means "the window".
@@ -3165,6 +3194,14 @@ mod tests {
             alias_route("aterm-open-url", "https://claude.ai/x"),
             AliasRoute::OpenUrl
         );
+        // `$EDITOR`: the editor, whatever it is handed, a verb's name included.
+        for operand in ["", ".git/COMMIT_EDITMSG", "+3", "new-window", "edit"] {
+            assert_eq!(
+                alias_route("amacs", operand),
+                AliasRoute::Amacs,
+                "{operand:?}"
+            );
+        }
         // And the front door is still the front door under every other name.
         for name in ["aterm", "aterm-cli", "my-renamed-aterm"] {
             assert_eq!(

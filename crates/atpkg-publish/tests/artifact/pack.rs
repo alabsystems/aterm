@@ -194,6 +194,7 @@ fn declared(w: &World) -> String {
 
 #[test]
 fn a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root() {
+    crate::shared::need_compressor();
     let w = world("pack-signed");
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
     let out = pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t).expect("packed");
@@ -310,6 +311,7 @@ fn a_bundle_only_program_and_a_declared_bin_that_did_not_build_are_refused() {
 
 #[test]
 fn the_declared_bundle_ships_unshimmed_and_build_args_reach_the_build() {
+    crate::shared::need_compressor();
     let w = world("pack-bundle-decl");
     let meta = metadata_json(
         &w.checkout,
@@ -451,6 +453,7 @@ fn a_live_switch_refuses_a_receiptless_compiler_before_the_checkout_is_read() {
 
 #[test]
 fn an_unproven_row_is_not_signed_once_the_mint_lands_mid_pack() {
+    crate::shared::need_compressor();
     let w = world("pack-mint-mid-pack");
     let bare = w.ctx.home.join("trust.git");
     let pusher = w.root.join("minter");
@@ -475,6 +478,7 @@ fn an_unproven_row_is_not_signed_once_the_mint_lands_mid_pack() {
 
 #[test]
 fn a_merge_extends_the_first_targets_manifest_for_the_second() {
+    crate::shared::need_compressor();
     let w = world("pack-merge");
     let arm = vec![("ay", bin_bytes(macho(CPU_ARM64), "ay arm64"))];
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), arm);
@@ -503,6 +507,7 @@ fn a_merge_extends_the_first_targets_manifest_for_the_second() {
 
 #[test]
 fn an_upload_stages_a_prerelease_and_a_public_pack_is_immutable() {
+    crate::shared::need_compressor();
     let w = world("pack-upload");
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
     let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
@@ -552,6 +557,7 @@ fn an_upload_stages_a_prerelease_and_a_public_pack_is_immutable() {
 
 #[test]
 fn nothing_unsigned_publishes_and_an_unsigned_pack_leaves_no_signature() {
+    crate::shared::need_compressor();
     let w = world("pack-unsigned");
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
     let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
@@ -611,6 +617,7 @@ fn preflight_refuses_bytes_that_no_longer_match_the_signed_row() {
 
 #[test]
 fn a_receipt_carrying_compiler_packs_under_a_live_switch_and_says_so() {
+    crate::shared::need_compressor();
     let w = world("pack-seed-mint");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
     std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
@@ -632,6 +639,7 @@ fn a_receipt_carrying_compiler_packs_under_a_live_switch_and_says_so() {
 
 #[test]
 fn the_switch_is_read_from_the_trust_repo_the_context_names_start_and_finish() {
+    crate::shared::need_compressor();
     let w = world("pack-trust-repo");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
     std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
@@ -658,6 +666,7 @@ fn the_switch_is_read_from_the_trust_repo_the_context_names_start_and_finish() {
 
 #[test]
 fn a_caller_adds_a_cross_linker_only_and_never_outranks_the_seals_compiler() {
+    crate::shared::need_compressor();
     let w = world("pack-env");
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
     for key in [

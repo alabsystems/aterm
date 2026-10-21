@@ -16,7 +16,7 @@
 //!
 //! Each winit `ApplicationHandler` root calls [`beat`] on entry with a
 //! [`Breadcrumb`] naming where the main thread is. `beat` bumps a monotonic
-//! [`HEARTBEAT`] counter and stamps the [`BREADCRUMB`]. A background sampler
+//! heartbeat counter and stamps the breadcrumb ([`MainWatch`]). A background sampler
 //! thread (started by [`start`]) wakes every [`sample_interval`] (half this
 //! build's stall bar); if the
 //! heartbeat has not advanced for longer than [`STALL_THRESHOLD`] *and* the last
@@ -188,6 +188,7 @@
 //! stalled, such a verb is refused before anything is posted, with
 //! `ERR main thread stalled <N>s; retry` (`control_media`).
 
+use crate::label_enum::label_enum;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -234,14 +235,77 @@ const RELEASE_STALL_THRESHOLD: Duration = Duration::from_secs(5);
 /// carry the growing duration.
 const STALL_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Monotonic main-thread liveness counter. [`beat`] increments it on every winit
-/// root entry; the sampler watches it for a frozen span.
-static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+/// THE MAIN THREAD'S WATCH: the cells [`beat`] stamps and the sampler, the
+/// control workers and a forking worker read. One for the process ([`MAIN`]);
+/// the tests drive watches of their own, since the default harness is
+/// threaded and the process's watch has writers in other tests (every
+/// `spawn::park_reader` handoff spin beats [`Breadcrumb::UpdateHandoff`], a
+/// park point, on whatever thread runs it), so an assertion on the process's
+/// cells would race them.
+pub(crate) struct MainWatch {
+    /// Monotonic main-thread liveness counter. [`beat`] increments it on every
+    /// winit root entry; the sampler watches it for a frozen span.
+    heartbeat: AtomicU64,
+    /// The last main-loop root [`beat`] was called from, as a [`Breadcrumb`]
+    /// `u8`. Initialised to [`Breadcrumb::Startup`] so the pre-event-loop launch
+    /// window is treated as a park point (no false stall during heavy
+    /// synchronous startup).
+    breadcrumb: AtomicU8,
+    /// Whether the root named by `breadcrumb` has RETURNED — its handler is off
+    /// the stack and the main thread is back in AppKit / CoreFoundation,
+    /// between aterm's handlers. [`beat`] clears it (a root was just entered);
+    /// the guard [`enter`] hands out sets it when the handler returns. The
+    /// 2026-09-26 line said "while inside `NewEvents`" for a thread whose
+    /// `new_events` had long returned and that was spinning in CoreFoundation's
+    /// timer catch-up; this is the bit that tells those apart.
+    returned: AtomicBool,
+}
 
-/// The last main-loop root [`beat`] was called from, as a [`Breadcrumb`] `u8`.
-/// Initialised to [`Breadcrumb::Startup`] so the pre-event-loop launch window is
-/// treated as a park point (no false stall during heavy synchronous startup).
-static BREADCRUMB: AtomicU8 = AtomicU8::new(Breadcrumb::Startup as u8);
+impl MainWatch {
+    /// A watch no root has entered: at [`Breadcrumb::Startup`], no beat yet.
+    pub(crate) const fn new() -> Self {
+        Self {
+            heartbeat: AtomicU64::new(0),
+            breadcrumb: AtomicU8::new(Breadcrumb::Startup as u8),
+            returned: AtomicBool::new(false),
+        }
+    }
+
+    /// The breadcrumb the main thread last stamped.
+    fn current(&self) -> Breadcrumb {
+        Breadcrumb::from_u8(self.breadcrumb.load(Ordering::Relaxed))
+    }
+
+    /// Whether the main thread is at a park point now: in its OS event wait
+    /// (or not yet in its loop), not inside a turn.
+    fn parked(&self) -> bool {
+        Breadcrumb::from_u8(self.breadcrumb.load(Ordering::Acquire)).is_park_point()
+    }
+
+    /// Wait at most `bound` for the main thread to park ([`Self::parked`]):
+    /// what a worker asks before it forks this process ([`park_before_fork`]).
+    /// A fork holds every malloc zone's lock (`_malloc_fork_prepare`) and the
+    /// VM map for its whole length, so an event-loop turn that allocates or
+    /// faults meanwhile waits it out, wall time with no CPU: one session's step
+    /// of the status sweep stretched to 2-3 ms at 40 tabs under load once kits
+    /// let a tab's fork start right after its booking turn (2026-10-17). `true`
+    /// once it saw the park; past `bound` the caller forks anyway.
+    fn wait_for_park(&self, bound: Duration) -> bool {
+        let until = std::time::Instant::now() + bound;
+        loop {
+            if self.parked() {
+                return true;
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(PARK_POLL);
+        }
+    }
+}
+
+/// The process's main-thread watch ([`MainWatch`]).
+static MAIN: MainWatch = MainWatch::new();
 
 /// The work the main thread last ANNOUNCED inside the current root, as a
 /// [`Phase`] `u8` — the second word of a stall line, where the root alone is
@@ -253,116 +317,71 @@ static BREADCRUMB: AtomicU8 = AtomicU8::new(Breadcrumb::Startup as u8);
 /// that never announced it. Written through [`phase`], read by the sampler.
 static PHASE: AtomicU8 = AtomicU8::new(Phase::None as u8);
 
-/// Whether the root named by [`BREADCRUMB`] has RETURNED — its handler is off
-/// the stack and the main thread is back in AppKit / CoreFoundation, between
-/// aterm's handlers. [`beat`] clears it (a root was just entered); the guard
-/// [`enter`] hands out sets it when the handler returns. The 2026-09-26 line
-/// said "while inside `NewEvents`" for a thread whose `new_events` had long
-/// returned and that was spinning in CoreFoundation's timer catch-up; this is
-/// the bit that tells those apart.
-static RETURNED: AtomicBool = AtomicBool::new(false);
-
-/// The main-loop roots the watchdog can pin a stall to. `#[repr(u8)]` so it round
-/// trips through the [`BREADCRUMB`] atomic with no allocation and no symbols — the
-/// NAME survives into a stripped-release log line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum Breadcrumb {
-    /// Before the event loop runs (synchronous launch). Park point: startup does
-    /// heavy main-thread work by design and must not trip the guard.
-    Startup = 0,
-    /// The loop has finished `about_to_wait`'s work and is parked in the OS
-    /// event wait (stamped as that handler returns, [`enter_about_to_wait`]).
-    /// Park point — the heartbeat legitimately freezes here.
-    AboutToWait = 1,
-    /// `window_event`: OS-delivered input/resize/close for a window. WORK root.
-    WindowEvent = 2,
-    /// `user_event`: a proxy `Wake` (control socket, config reload, …). WORK root.
-    UserEvent = 3,
-    /// `new_events`: a `WaitUntil` deadline fired (blink / bell / resize settle).
-    /// WORK root.
-    NewEvents = 4,
-    /// The resize-settle flush — the coalesced final width lands here, the exact
-    /// path that funnels into `Grid::resize`'s width-reflow sink. WORK root.
-    ResizeSettle = 5,
-    /// The overlap-handoff park + readiness wait: the main thread deliberately
-    /// blocks (bounded) while the update child boots under the frozen frame,
-    /// beating every poll tick. Park point — a frozen heartbeat here is the
-    /// designed wait, not a stall (the wait itself is deadline-bounded).
-    UpdateHandoff = 6,
-    /// A NESTED MODAL RUN LOOP spun from inside a work root — `-[NSAlert
-    /// runModal]` (`menu::confirm`, `menu::notify`) and `-[NSOpenPanel
-    /// runModal]` (`menu::choose_local_file`). AppKit is running the loop and
-    /// the user is looking at a dialog; winit's observers fire but bail because
-    /// its handler cell is borrowed for the outer event, so no App root runs and
-    /// nothing beats. Park point — the freeze lasts exactly as long as the user
-    /// takes to answer. Found by the 2026-09-02 abort audit: without it every
-    /// confirm/notify/open dialog left open past the threshold logged a spurious
-    /// `MAIN-THREAD STALL`, and aborted the process under `ATERM_WATCHDOG=abort`.
-    /// Entered and left through [`park_modal`], never by a bare [`beat`].
-    Modal = 7,
-    /// `about_to_wait`'s BODY: the message settle, the restore pass, the crash
-    /// journal's capture, the update reconcile and every deadline fold, run on
-    /// every loop iteration before the wait. WORK root, booked as
-    /// `about_to_wait`: while it was the park point, a wedge in it that took no
-    /// CPU (a lock, a wait on a thread) tripped nothing, and its time — the
-    /// larger part of a flood's main-thread CPU, sampled — was in no census.
-    /// Entered through [`enter_about_to_wait`], whose guard hands the thread
-    /// to [`Breadcrumb::AboutToWait`] as the handler returns.
-    AboutToWaitWork = 8,
-}
-
-impl Breadcrumb {
-    /// Reconstruct a breadcrumb from its stored `u8` (unknown values fold to
-    /// [`Breadcrumb::Startup`], the benign park point).
-    pub(crate) fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Breadcrumb::AboutToWait,
-            2 => Breadcrumb::WindowEvent,
-            3 => Breadcrumb::UserEvent,
-            4 => Breadcrumb::NewEvents,
-            5 => Breadcrumb::ResizeSettle,
-            6 => Breadcrumb::UpdateHandoff,
-            7 => Breadcrumb::Modal,
-            8 => Breadcrumb::AboutToWaitWork,
-            _ => Breadcrumb::Startup,
-        }
-    }
-
-    /// The same root as a published METRIC label: snake_case, matching the owner
+label_enum! {
+    /// The main-loop roots the watchdog can pin a stall to. `#[repr(u8)]` so it round
+    /// trips through the breadcrumb atomic ([`MainWatch`]) with no allocation and no
+    /// symbols — the NAME ([`Breadcrumb::ident`]) survives into a stripped-release log
+    /// line.
+    ///
+    /// The label is the root as a published METRIC: snake_case, matching the owner
     /// vocabulary the rest of the `metrics` line already speaks
     /// (`deadline_owner=frame_cap`, `wake_owner=session_status`), so a reader
     /// never has to know that one field spells its owners differently from its
-    /// neighbours. Stable like [`Breadcrumb::name`] — it is a wire label.
-    pub(crate) fn metric_name(self) -> &'static str {
-        match self {
-            Breadcrumb::Startup => "startup",
-            // Never booked (a park point): the handler's work is booked as
-            // `about_to_wait` ([`Breadcrumb::AboutToWaitWork`]).
-            Breadcrumb::AboutToWait => "idle",
-            Breadcrumb::WindowEvent => "window_event",
-            Breadcrumb::UserEvent => "user_event",
-            Breadcrumb::NewEvents => "new_events",
-            Breadcrumb::ResizeSettle => "resize_settle",
-            Breadcrumb::UpdateHandoff => "update_handoff",
-            Breadcrumb::Modal => "modal",
-            Breadcrumb::AboutToWaitWork => "about_to_wait",
-        }
+    /// neighbours. [`Breadcrumb::AboutToWait`] is never booked (a park point):
+    /// the handler's work is booked as `about_to_wait`
+    /// ([`Breadcrumb::AboutToWaitWork`]).
+    #[repr(u8)]
+    pub(crate) enum Breadcrumb {
+        /// Before the event loop runs (synchronous launch). Park point: startup does
+        /// heavy main-thread work by design and must not trip the guard.
+        Startup => "startup",
+        /// The loop has finished `about_to_wait`'s work and is parked in the OS
+        /// event wait (stamped as that handler returns, [`enter_about_to_wait`]).
+        /// Park point — the heartbeat legitimately freezes here.
+        AboutToWait => "idle",
+        /// `window_event`: OS-delivered input/resize/close for a window. WORK root.
+        WindowEvent => "window_event",
+        /// `user_event`: a proxy `Wake` (control socket, config reload, …). WORK root.
+        UserEvent => "user_event",
+        /// `new_events`: a `WaitUntil` deadline fired (blink / bell / resize settle).
+        /// WORK root.
+        NewEvents => "new_events",
+        /// The resize-settle flush — the coalesced final width lands here, the exact
+        /// path that funnels into `Grid::resize`'s width-reflow sink. WORK root.
+        ResizeSettle => "resize_settle",
+        /// The overlap-handoff park + readiness wait: the main thread deliberately
+        /// blocks (bounded) while the update child boots under the frozen frame,
+        /// beating every poll tick. Park point — a frozen heartbeat here is the
+        /// designed wait, not a stall (the wait itself is deadline-bounded).
+        UpdateHandoff => "update_handoff",
+        /// A NESTED MODAL RUN LOOP spun from inside a work root — `-[NSAlert
+        /// runModal]` (`menu::confirm`, `menu::notify`) and `-[NSOpenPanel
+        /// runModal]` (`menu::choose_local_file`). AppKit is running the loop and
+        /// the user is looking at a dialog; winit's observers fire but bail because
+        /// its handler cell is borrowed for the outer event, so no App root runs and
+        /// nothing beats. Park point — the freeze lasts exactly as long as the user
+        /// takes to answer. Found by the 2026-09-02 abort audit: without it every
+        /// confirm/notify/open dialog left open past the threshold logged a spurious
+        /// `MAIN-THREAD STALL`, and aborted the process under `ATERM_WATCHDOG=abort`.
+        /// Entered and left through [`park_modal`], never by a bare [`beat`].
+        Modal => "modal",
+        /// `about_to_wait`'s BODY: the message settle, the restore pass, the crash
+        /// journal's capture, the update reconcile and every deadline fold, run on
+        /// every loop iteration before the wait. WORK root, booked as
+        /// `about_to_wait`: while it was the park point, a wedge in it that took no
+        /// CPU (a lock, a wait on a thread) tripped nothing, and its time — the
+        /// larger part of a flood's main-thread CPU, sampled — was in no census.
+        /// Entered through [`enter_about_to_wait`], whose guard hands the thread
+        /// to [`Breadcrumb::AboutToWait`] as the handler returns.
+        AboutToWaitWork => "about_to_wait",
     }
+}
 
-    /// Stable, symbol-free name for the log line.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Breadcrumb::Startup => "Startup",
-            Breadcrumb::AboutToWait => "AboutToWait",
-            Breadcrumb::WindowEvent => "WindowEvent",
-            Breadcrumb::UserEvent => "UserEvent",
-            Breadcrumb::NewEvents => "NewEvents",
-            Breadcrumb::ResizeSettle => "ResizeSettle",
-            Breadcrumb::UpdateHandoff => "UpdateHandoff",
-            Breadcrumb::Modal => "Modal",
-            Breadcrumb::AboutToWaitWork => "AboutToWaitWork",
-        }
+impl Breadcrumb {
+    /// The breadcrumb a `u8` cell holds as its [`index`](Self::index); unknown
+    /// values fold to [`Breadcrumb::Startup`], the benign park point.
+    pub(crate) fn from_u8(v: u8) -> Self {
+        Self::from_index(usize::from(v)).unwrap_or(Self::Startup)
     }
 
     /// Whether a main thread that is ON-CPU with a frozen heartbeat at this
@@ -505,9 +524,9 @@ fn main_stall(
 /// beat just entered with the stamp of the long idle before it, and refuse a
 /// verb on a thread that had just woken.
 pub(crate) fn main_stall_now(hop_since_ns: Option<u64>) -> Option<MainStall> {
-    let root = Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Acquire));
+    let root = Breadcrumb::from_u8(MAIN.breadcrumb.load(Ordering::Acquire));
     let last_beat_ns = TURNS.last_beat_ns.load(Ordering::Relaxed);
-    let returned = RETURNED.load(Ordering::Relaxed);
+    let returned = MAIN.returned.load(Ordering::Relaxed);
     main_stall(
         crate::metrics::now_ns(),
         last_beat_ns,
@@ -1097,10 +1116,11 @@ const LONG_TURN_THRESHOLD_NS: u64 = crate::metrics::SLOW_FRAME_THRESHOLD_NS;
 /// its two writes, leaving a fresh window with a stale owner label on a zero —
 /// the same benign race every `max_`/owner pair on that line already accepts.
 struct TurnLedger {
-    /// When the CURRENT root was entered (`crate::metrics::now_ns` clock).
-    /// 0 = disarmed: no turn is open, so the next beat books nothing. That is
-    /// the state at process start and immediately after a reset, both of which
-    /// would otherwise book a span that began outside the window.
+    /// When the CURRENT root was entered (`crate::metrics::now_ns` clock), for
+    /// the window stats. 0 = disarmed: no turn is open, so the next beat books
+    /// nothing to the window. That is the state at process start and
+    /// immediately after a reset, both of which would otherwise book a span
+    /// that began outside the window.
     open_ns: AtomicU64,
     /// When the main thread last entered a root, on the same clock: the
     /// heartbeat's timestamp, which [`main_stall`] reads. Not `open_ns`, which
@@ -1131,6 +1151,10 @@ struct TurnLedger {
     /// here, where no max can show it.
     busy_ns: AtomicU64,
     window_from_ns: AtomicU64,
+    /// Each root's booked turns since reset, indexed by [`Breadcrumb::index`]:
+    /// `turns_by_root` (responsiveness audit item 3), because last/max/count
+    /// alone could not attribute a p95 key-queue tail to a main-thread root.
+    by_root: [crate::metrics::Histogram; Breadcrumb::COUNT],
 }
 
 impl TurnLedger {
@@ -1146,6 +1170,7 @@ impl TurnLedger {
             long_turns: AtomicU64::new(0),
             busy_ns: AtomicU64::new(0),
             window_from_ns: AtomicU64::new(0),
+            by_root: [const { crate::metrics::Histogram::new() }; Breadcrumb::COUNT],
         }
     }
 
@@ -1169,7 +1194,7 @@ impl TurnLedger {
     fn close(&self, previous: Breadcrumb, now_ns: u64) -> Option<u64> {
         let open = self.open_ns.swap(now_ns, Ordering::Relaxed);
         let span = Self::attributable_span(previous, open, now_ns)?;
-        crate::metrics::note_turn(previous as u8, span);
+        self.by_root[previous.index()].record(span);
         self.last_ns.store(span, Ordering::Relaxed);
         self.turns.fetch_add(1, Ordering::Relaxed);
         self.busy_ns.fetch_add(span, Ordering::Relaxed);
@@ -1200,6 +1225,23 @@ impl TurnLedger {
         }
     }
 
+    /// `(root, n, p50_ms, p95_ms, p99_ms)` per root with at least one booked
+    /// turn, in [`Breadcrumb::ALL`] order: `turns_by_root`.
+    fn root_rows(&self) -> Vec<(&'static str, u64, f64, f64, f64)> {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        Breadcrumb::ALL
+            .into_iter()
+            .filter_map(|root| {
+                let h = self.by_root[root.index()].copy_out();
+                let n = h.n();
+                (n != 0).then(|| {
+                    let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
+                    (root.as_str(), n, p(0.50), p(0.95), p(0.99))
+                })
+            })
+            .collect()
+    }
+
     /// Clear the window, INCLUDING the open stamp: the turn straddling a reset
     /// began before the window it would be booked to, and a driver that resets,
     /// drives a workload and reads must see that workload's worst turn. The
@@ -1216,6 +1258,9 @@ impl TurnLedger {
         self.max_at_ns.store(0, Ordering::Relaxed);
         self.turns.store(0, Ordering::Relaxed);
         self.long_turns.store(0, Ordering::Relaxed);
+        for h in &self.by_root {
+            h.reset();
+        }
     }
 }
 
@@ -1257,11 +1302,11 @@ impl TurnCensus {
     }
 }
 
-/// `main_busy_ms_per_s` now, for the `metrics percentiles` line (the summary
-/// line carries it in [`turn_census_fields_text`]).
+/// `main_busy_ms_per_s` at `now_ns`, for the `metrics percentiles` line (the
+/// summary line carries it in [`emit_turn_census`]).
 #[must_use]
-pub(crate) fn main_busy_ms_per_s() -> f64 {
-    turn_census().busy_ms_per_s(crate::metrics::now_ns())
+pub(crate) fn main_busy_ms_per_s(now_ns: u64) -> f64 {
+    turn_census().busy_ms_per_s(now_ns)
 }
 
 /// Record that the main thread just entered `bc`, and price the turn that ended.
@@ -1281,7 +1326,7 @@ pub(crate) fn beat(bc: Breadcrumb) {
 /// would make any assertion about a span a race.
 #[inline]
 fn beat_at(bc: Breadcrumb, now_ns: u64) -> Option<u64> {
-    beat_into(&TURNS, &PHASE, bc, now_ns)
+    beat_into(&MAIN, &TURNS, &PHASE, bc, now_ns)
 }
 
 /// The beat path with its LEDGER and its PHASE cell passed in too, on the
@@ -1292,14 +1337,20 @@ fn beat_at(bc: Breadcrumb, now_ns: u64) -> Option<u64> {
 /// `ensure_pixel_backend` holds [`Phase::PixelBackendRedeem`] on [`PHASE`] for
 /// the length of a font seal, and none of them takes this module's beat lock.
 #[inline]
-fn beat_into(turns: &TurnLedger, phase: &AtomicU8, bc: Breadcrumb, now_ns: u64) -> Option<u64> {
+fn beat_into(
+    main: &MainWatch,
+    turns: &TurnLedger,
+    phase: &AtomicU8,
+    bc: Breadcrumb,
+    now_ns: u64,
+) -> Option<u64> {
     // The heartbeat's timestamp, for `main_stall`: the clock value this beat
     // already read, stamped BEFORE the root is published (the swap below is
     // `Release`, and `main_stall_now` reads the root with `Acquire` before the
     // stamp), so a reader never pairs this root with the previous beat's time.
     // `max(1)` keeps 0 meaning "no beat yet".
     turns.last_beat_ns.store(now_ns.max(1), Ordering::Relaxed);
-    let previous = Breadcrumb::from_u8(BREADCRUMB.swap(bc as u8, Ordering::Release));
+    let previous = Breadcrumb::from_u8(main.breadcrumb.swap(bc as u8, Ordering::Release));
     let booked = turns.close(previous, now_ns);
     // A root entry starts with NO announced phase (see `PHASE`): one more
     // relaxed store on the hot path, the only way a phase ever ends besides its
@@ -1307,8 +1358,8 @@ fn beat_into(turns: &TurnLedger, phase: &AtomicU8, bc: Breadcrumb, now_ns: u64) 
     // reason the breadcrumb is — the sampler must never read a fresh count
     // against a stale word.
     phase.store(Phase::None as u8, Ordering::Relaxed);
-    RETURNED.store(false, Ordering::Relaxed);
-    HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+    main.returned.store(false, Ordering::Relaxed);
+    main.heartbeat.fetch_add(1, Ordering::Relaxed);
     booked
 }
 
@@ -1319,8 +1370,18 @@ fn beat_into(turns: &TurnLedger, phase: &AtomicU8, bc: Breadcrumb, now_ns: u64) 
 /// one for its whole body.
 #[must_use = "the root lasts only as long as the guard lives"]
 pub(crate) fn enter(bc: Breadcrumb) -> RootGuard {
-    beat(bc);
-    RootGuard { park: None }
+    enter_in(&MAIN, bc)
+}
+
+/// [`enter`] on `main`.
+fn enter_in(main: &'static MainWatch, bc: Breadcrumb) -> RootGuard {
+    beat_on(main, bc);
+    RootGuard { main, park: None }
+}
+
+/// [`beat`] on `main`, with the process's ledger, phase cell and clock.
+fn beat_on(main: &MainWatch, bc: Breadcrumb) {
+    beat_into(main, &TURNS, &PHASE, bc, crate::metrics::now_ns());
 }
 
 /// Enter `about_to_wait`: its body is the WORK root
@@ -1329,14 +1390,22 @@ pub(crate) fn enter(bc: Breadcrumb) -> RootGuard {
 /// only the OS event wait after it is the park.
 #[must_use = "the root lasts only as long as the guard lives"]
 pub(crate) fn enter_about_to_wait() -> RootGuard {
-    beat(Breadcrumb::AboutToWaitWork);
+    enter_about_to_wait_in(&MAIN)
+}
+
+/// [`enter_about_to_wait`] on `main`.
+fn enter_about_to_wait_in(main: &'static MainWatch) -> RootGuard {
+    beat_on(main, Breadcrumb::AboutToWaitWork);
     RootGuard {
+        main,
         park: Some(Breadcrumb::AboutToWait),
     }
 }
 
 /// The RAII half of [`enter`] and [`enter_about_to_wait`].
 pub(crate) struct RootGuard {
+    /// The watch the root was entered on.
+    main: &'static MainWatch,
     /// The park point the thread goes to as the handler returns, beaten on
     /// drop (closing the handler's turn); `None`: the root's turn runs on to
     /// the next root's beat.
@@ -1346,9 +1415,9 @@ pub(crate) struct RootGuard {
 impl Drop for RootGuard {
     fn drop(&mut self) {
         if let Some(park) = self.park {
-            beat(park);
+            beat_on(self.main, park);
         }
-        RETURNED.store(true, Ordering::Relaxed);
+        self.main.returned.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1358,89 +1427,64 @@ pub(crate) fn turn_census() -> TurnCensus {
     TURNS.snapshot()
 }
 
-/// Clear the turn census. Called by [`crate::metrics::reset`], so the census is a
-/// window stat like every other `max_` on that line.
+/// Clear the turn census, its per-root distributions included. Called by
+/// [`crate::metrics::reset`], so the census is a window stat like every other
+/// `max_` on that line; the heartbeat stays.
 pub(crate) fn reset_turn_census() {
     TURNS.reset();
 }
 
-/// The turn-census fields of the `metrics` summary, text form.
-///
-/// Spliced as ONE fragment (the `echo_rtt::percentile_fields_text` discipline) so
-/// the text and JSON summaries cannot drift apart and neither giant `format!`
-/// grows seven more positional holes.
+/// The turn-census fields of the `metrics` summary.
 ///
 /// `max_turn_at_ms` is on the `crate::metrics::now_ns` PROCESS clock — the one
-/// `metrics_now_ms` reads at the same instant — so "how long ago" is one
+/// `metrics_now_ms` reads for the same reply — so "how long ago" is one
 /// subtraction, the rule every other `_at_ms` on the line already follows.
-#[must_use]
-pub(crate) fn turn_census_fields_text() -> String {
+pub(crate) fn emit_turn_census(
+    ctx: &crate::metrics::wire::ReadCtx,
+    s: &mut dyn crate::metrics::wire::FieldSink,
+) {
+    use crate::metrics::wire::{ms, ms_f64, ms1};
     let c = turn_census();
-    let ms = |ns: u64| ns as f64 / 1e6;
-    format!(
-        " max_turn_ms={:.2} max_turn_owner={} max_turn_at_ms={:.2} last_turn_ms={:.2} \
-         turns={} long_turns={} long_turn_threshold_ms={:.1} main_busy_ms_per_s={:.2}",
-        ms(c.max_ns),
-        c.max_owner.map_or("none", Breadcrumb::metric_name),
-        ms(c.max_at_ns),
-        ms(c.last_ns),
-        c.turns,
-        c.long_turns,
-        ms(LONG_TURN_THRESHOLD_NS),
-        c.busy_ms_per_s(crate::metrics::now_ns()),
-    )
+    s.decimal("max_turn_ms", ms(c.max_ns));
+    s.label(
+        "max_turn_owner",
+        c.max_owner.map_or("none", Breadcrumb::as_str),
+    );
+    s.decimal("max_turn_at_ms", ms(c.max_at_ns));
+    s.decimal("last_turn_ms", ms(c.last_ns));
+    s.count("turns", c.turns);
+    s.count("long_turns", c.long_turns);
+    s.decimal("long_turn_threshold_ms", ms1(LONG_TURN_THRESHOLD_NS));
+    s.decimal("main_busy_ms_per_s", ms_f64(c.busy_ms_per_s(ctx.now_ns)));
 }
 
-/// Field-for-field JSON twin of [`turn_census_fields_text`] — a leading comma, so
-/// it splices straight in before the closing brace.
-#[must_use]
-pub(crate) fn turn_census_fields_json() -> String {
-    let c = turn_census();
-    let ms = |ns: u64| ns as f64 / 1e6;
-    format!(
-        ",\"max_turn_ms\":{:.2},\"max_turn_owner\":\"{}\",\"max_turn_at_ms\":{:.2},\
-         \"last_turn_ms\":{:.2},\"turns\":{},\"long_turns\":{},\
-         \"long_turn_threshold_ms\":{:.1},\"main_busy_ms_per_s\":{:.2}",
-        ms(c.max_ns),
-        c.max_owner.map_or("none", Breadcrumb::metric_name),
-        ms(c.max_at_ns),
-        ms(c.last_ns),
-        c.turns,
-        c.long_turns,
-        ms(LONG_TURN_THRESHOLD_NS),
-        c.busy_ms_per_s(crate::metrics::now_ns()),
-    )
+/// `turns_by_root` for `metrics percentiles`: each root with a turn booked
+/// since the last reset, `root:n/p50/p95/p99` in ms (`none` when every root is
+/// empty), an object of `{n, p50_ms, p95_ms, p99_ms}` records in JSON.
+pub(crate) fn emit_turns_by_root(s: &mut dyn crate::metrics::wire::FieldSink) {
+    use crate::metrics::wire::{Cell, ms_f64};
+    let rows = TURNS.root_rows();
+    let records: Vec<[(&str, Cell<'_>); 4]> = rows
+        .iter()
+        .map(|&(_, n, p50, p95, p99)| {
+            [
+                ("n", Cell::Count(n)),
+                ("p50_ms", Cell::Decimal(ms_f64(p50))),
+                ("p95_ms", Cell::Decimal(ms_f64(p95))),
+                ("p99_ms", Cell::Decimal(ms_f64(p99))),
+            ]
+        })
+        .collect();
+    let pairs: Vec<(&str, Cell<'_>)> = rows
+        .iter()
+        .zip(&records)
+        .map(|(row, record)| (row.0, Cell::Rec(record)))
+        .collect();
+    s.pairs("turns_by_root", &pairs, "none");
 }
 
-/// Whether the main thread is at a park point now: in its OS event wait (or
-/// not yet in its loop), not inside a turn.
-pub(crate) fn main_parked() -> bool {
-    Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Acquire)).is_park_point()
-}
-
-/// How often [`wait_for_main_park`] looks again.
+/// How often [`MainWatch::wait_for_park`] looks again.
 const PARK_POLL: Duration = Duration::from_micros(50);
-
-/// Wait at most `bound` for the main thread to park ([`main_parked`]): what a
-/// worker asks before it forks this process. A fork holds every malloc zone's
-/// lock (`_malloc_fork_prepare`) and the VM map for its whole length, so an
-/// event-loop turn that allocates or faults meanwhile waits it out, wall time
-/// with no CPU: one session's step of the status sweep stretched to 2-3 ms at
-/// 40 tabs under load once kits let a tab's fork start right after its booking
-/// turn (2026-10-17). `true` once it saw the park; past `bound` the caller
-/// forks anyway.
-pub(crate) fn wait_for_main_park(bound: Duration) -> bool {
-    let until = std::time::Instant::now() + bound;
-    loop {
-        if main_parked() {
-            return true;
-        }
-        if std::time::Instant::now() >= until {
-            return false;
-        }
-        std::thread::sleep(PARK_POLL);
-    }
-}
 
 thread_local! {
     /// How long this thread's forks wait for the park ([`forks_wait_for_park`]);
@@ -1474,14 +1518,20 @@ pub(crate) fn forks_wait_for_park<R>(bound: Duration, spawn: impl FnOnce() -> R)
 /// spawns (the boot session, a restore, a window), which no park can precede.
 /// `true` once it saw the park.
 pub(crate) fn park_before_fork() -> bool {
-    let bound = FORK_PARK_BOUND.get();
-    !bound.is_zero() && wait_for_main_park(bound)
+    park_before_fork_on(&MAIN)
 }
 
-/// The breadcrumb the main thread last stamped.
-#[cfg(any(target_os = "macos", test))]
+/// [`park_before_fork`] on `main`.
+fn park_before_fork_on(main: &MainWatch) -> bool {
+    let bound = FORK_PARK_BOUND.get();
+    !bound.is_zero() && main.wait_for_park(bound)
+}
+
+/// The breadcrumb the main thread last stamped (macOS's dialog refusal; the
+/// tests read their own watch).
+#[cfg(target_os = "macos")]
 pub(crate) fn current() -> Breadcrumb {
-    Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed))
+    MAIN.current()
 }
 
 /// Park the watchdog for the duration of a nested modal run loop.
@@ -1493,23 +1543,30 @@ pub(crate) fn current() -> Breadcrumb {
 /// send and nothing else; a guard that outlives its dialog is a park that
 /// never ends, which is exactly the wedge the sampler exists to name.
 #[must_use = "the park lasts only as long as the guard lives"]
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn park_modal() -> ModalPark {
-    let previous = current();
-    beat(Breadcrumb::Modal);
-    ModalPark { previous }
+    park_modal_in(&MAIN)
+}
+
+/// [`park_modal`] on `main`.
+#[cfg(any(target_os = "macos", test))]
+fn park_modal_in(main: &'static MainWatch) -> ModalPark {
+    let previous = main.current();
+    beat_on(main, Breadcrumb::Modal);
+    ModalPark { main, previous }
 }
 
 /// The RAII half of [`park_modal`].
 #[cfg(any(target_os = "macos", test))]
 pub(crate) struct ModalPark {
+    main: &'static MainWatch,
     previous: Breadcrumb,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl Drop for ModalPark {
     fn drop(&mut self) {
-        beat(self.previous);
+        beat_on(self.main, self.previous);
     }
 }
 
@@ -1747,7 +1804,7 @@ impl Drop for PhaseGuard {
 
 /// Where the main thread was when a stall was reported, as far as the
 /// heartbeat can tell: inside the root it last entered, or back in AppKit /
-/// CoreFoundation after that root RETURNED ([`RETURNED`]).
+/// CoreFoundation after that root RETURNED ([`MainWatch`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Locus {
     /// The root's handler is still on the stack.
@@ -1783,13 +1840,13 @@ fn stall_message(
              (the L0 freeze hazard) or a park that will never end (a lock or lazy-init \
              cycle). This line names the main-loop root without symbols; a hang report \
              is not required to find it.",
-            bc.name(),
+            bc.ident(),
             phase.clause()
         ),
         (Locus::Inside, _) => format!(
             "MAIN-THREAD STALL CONTINUES: still no heartbeat after {frozen:?} inside \
              `{}`{}{cpu} — this is a wedge, not a slow frame.",
-            bc.name(),
+            bc.ident(),
             phase.clause()
         ),
         (Locus::Returned, 1) => format!(
@@ -1798,12 +1855,12 @@ fn stall_message(
              own run-loop work (a timer, source or observer; the 2026-09-26 freeze was \
              CoreFoundation's catch-up for a late timer), and the UI is not responding. \
              The stack lines that follow name the frame.",
-            bc.name()
+            bc.ident()
         ),
         (Locus::Returned, _) => format!(
             "MAIN-THREAD STALL CONTINUES: still no heartbeat after {frozen:?} since `{}` \
              returned{cpu} — the main thread is still outside aterm's handlers.",
-            bc.name()
+            bc.ident()
         ),
     }
 }
@@ -1820,12 +1877,12 @@ fn stall_ended_message(ended: Ended) -> String {
         EndedBy::Beat => format!(
             "MAIN-THREAD STALL ENDED: the main thread beat again after about {frozen:?} \
              stalled at `{}`.",
-            root.name()
+            root.ident()
         ),
         EndedBy::Quiet => format!(
             "MAIN-THREAD STALL ENDED: the main thread stopped spinning at `{}` after about \
              {frozen:?} on-CPU and is parked in the event wait again.",
-            root.name()
+            root.ident()
         ),
     }
 }
@@ -2006,7 +2063,7 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
         // line can say how much of a gap fell in it.
         let mut last = Clocks::now();
         let mut sampler =
-            Sampler::with_threshold(last.mono, HEARTBEAT.load(Ordering::Relaxed), threshold);
+            Sampler::with_threshold(last.mono, MAIN.heartbeat.load(Ordering::Relaxed), threshold);
         loop {
             let asleep = Instant::now();
             std::thread::sleep(sample);
@@ -2021,8 +2078,8 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
                 here.mono,
                 sample,
                 here.since(last, asleep),
-                HEARTBEAT.load(Ordering::Relaxed),
-                Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed)),
+                MAIN.heartbeat.load(Ordering::Relaxed),
+                MAIN.current(),
                 crate::main_thread_probe::cpu_time(),
             );
             last = here;
@@ -2042,7 +2099,7 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
                 // the root the main thread is in now (a beat clears both). A
                 // nested phase that ended before the report reads as the phase
                 // around it.
-                let locus = if RETURNED.load(Ordering::Relaxed) {
+                let locus = if MAIN.returned.load(Ordering::Relaxed) {
                     Locus::Returned
                 } else {
                     Locus::Inside
@@ -2090,11 +2147,16 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
 mod tests {
     use super::*;
 
-    /// [`BREADCRUMB`] and [`HEARTBEAT`] are process-global and the tests in this
-    /// binary run in parallel, so every test that BEATS takes this first. Without
-    /// it a beat from a sibling test lands between two of this one's and swaps the
-    /// breadcrumb out from under the assertion — a green run under one filter and
-    /// a red one under another.
+    /// The process's ledger ([`TURNS`]) and phase cell ([`PHASE`]) are
+    /// process-global and the tests in this binary run in parallel, so every
+    /// test here that BEATS takes this first. The breadcrumb, the heartbeat
+    /// and the returned bit each test asserts on are its own ([`MainWatch`]):
+    /// the process's have writers no lock here can hold (every
+    /// `spawn::park_reader` handoff spin in another module's test beats
+    /// [`Breadcrumb::UpdateHandoff`], a park point), and a beat of theirs
+    /// between two of a test's swapped the breadcrumb out from under its
+    /// assertion — under load, `a_fork_waits_for_the_park_only_inside_a_spawn_
+    /// that_asks` saw the process's thread parked inside a turn.
     static BEAT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn beat_serial() -> std::sync::MutexGuard<'static, ()> {
@@ -2107,15 +2169,16 @@ mod tests {
     /// the guard drops, and it comes back with a fresh beat.
     #[test]
     fn park_modal_restores_the_outer_root_with_a_fresh_beat() {
+        static WATCH: MainWatch = MainWatch::new();
         let _serial = beat_serial();
-        beat(Breadcrumb::WindowEvent);
-        let before = HEARTBEAT.load(Ordering::Relaxed);
+        beat_on(&WATCH, Breadcrumb::WindowEvent);
+        let before = WATCH.heartbeat.load(Ordering::Relaxed);
         {
-            let _park = park_modal();
-            assert_eq!(current(), Breadcrumb::Modal);
+            let _park = park_modal_in(&WATCH);
+            assert_eq!(WATCH.current(), Breadcrumb::Modal);
         }
-        assert_eq!(current(), Breadcrumb::WindowEvent);
-        assert!(HEARTBEAT.load(Ordering::Relaxed) >= before + 2);
+        assert_eq!(WATCH.current(), Breadcrumb::WindowEvent);
+        assert_eq!(WATCH.heartbeat.load(Ordering::Relaxed), before + 2);
     }
 
     /// A phase is the SECOND word of a stall line: announced by a guard,
@@ -2131,10 +2194,7 @@ mod tests {
     /// whole of a font seal, and `spawn::park_reader`'s handoff spin CLEARS it
     /// on every turn of a loop that takes no lock at all — so an assertion on
     /// the shared cell would race them both ways. Every claim here is therefore
-    /// about this test's own cell; the lock is still taken because [`beat_into`]
-    /// writes the real [`BREADCRUMB`] and [`HEARTBEAT`], which locked siblings
-    /// do assert on, and the heartbeat is only ever read for ADVANCE (that same
-    /// unlocked spin makes any exact count a coin flip).
+    /// about this test's own cells, its watch's breadcrumb and heartbeat too.
     #[test]
     fn a_phase_is_scoped_to_its_guard_and_cleared_by_the_next_root() {
         static PH: AtomicU8 = AtomicU8::new(Phase::None as u8);
@@ -2143,11 +2203,12 @@ mod tests {
 
         let _serial = beat_serial();
         let turns = TurnLedger::new();
-        let before = HEARTBEAT.load(Ordering::Relaxed);
+        let watch = MainWatch::new();
 
-        beat_into(&turns, &PH, Breadcrumb::UserEvent, T0);
-        assert!(
-            HEARTBEAT.load(Ordering::Relaxed) > before,
+        beat_into(&watch, &turns, &PH, Breadcrumb::UserEvent, T0);
+        assert_eq!(
+            watch.heartbeat.load(Ordering::Relaxed),
+            1,
             "a root entry beats"
         );
         assert_eq!(phase_in(&PH), Phase::None, "a root entry announces nothing");
@@ -2170,7 +2231,7 @@ mod tests {
         }
         assert_eq!(phase_in(&PH), Phase::None);
         let held = announce(&PH, Phase::PixelBackendRedeem);
-        beat_into(&turns, &PH, Breadcrumb::AboutToWait, T0 + MS);
+        beat_into(&watch, &turns, &PH, Breadcrumb::AboutToWait, T0 + MS);
         assert_eq!(
             phase_in(&PH),
             Phase::None,
@@ -2192,10 +2253,10 @@ mod tests {
         // the outer guard's drop after it. Unreachable today (neither
         // `render_image` nor `ensure_pixel_backend` beats or parks); pinned
         // so it stays a non-event if either ever does.
-        beat_into(&turns, &PH, Breadcrumb::UserEvent, T0 + 2 * MS);
+        beat_into(&watch, &turns, &PH, Breadcrumb::UserEvent, T0 + 2 * MS);
         let outer = announce(&PH, Phase::ImageCapture);
         let inner = announce(&PH, Phase::PixelBackendRedeem);
-        beat_into(&turns, &PH, Breadcrumb::AboutToWait, T0 + 3 * MS);
+        beat_into(&watch, &turns, &PH, Breadcrumb::AboutToWait, T0 + 3 * MS);
         assert_eq!(phase_in(&PH), Phase::None);
         drop(inner);
         assert_eq!(
@@ -2209,7 +2270,7 @@ mod tests {
         // pair is still alive, keeps its own restore chain intact.
         let outer = announce(&PH, Phase::ImageCapture);
         let inner = announce(&PH, Phase::PixelBackendRedeem);
-        beat_into(&turns, &PH, Breadcrumb::UserEvent, T0 + 4 * MS);
+        beat_into(&watch, &turns, &PH, Breadcrumb::UserEvent, T0 + 4 * MS);
         let fresh = announce(&PH, Phase::ImageCapture);
         assert_eq!(phase_in(&PH), Phase::ImageCapture);
         drop(fresh);
@@ -2221,9 +2282,6 @@ mod tests {
         drop(inner);
         drop(outer);
         assert_eq!(phase_in(&PH), Phase::None);
-
-        // Leave the global breadcrumb where the rest of the suite expects it.
-        beat(Breadcrumb::AboutToWait);
     }
 
     /// THE ATTRIBUTION RULE (2026-09-15 responsiveness audit). A turn that ended
@@ -2253,7 +2311,7 @@ mod tests {
                 "a 300 ms park in `{}` is the exact reading this census exists to \
                  name: the release sampler ignores it and the redraw timer never \
                  sees it",
-                work.metric_name()
+                work.as_str()
             );
         }
         for park in [
@@ -2267,7 +2325,7 @@ mod tests {
                 None,
                 "`{}` is a DESIGNED freeze — booking it would make every reading \
                  on this line meaningless",
-                park.metric_name()
+                park.as_str()
             );
         }
         // A disarmed stamp — process start, or the turn straddling a reset —
@@ -2339,12 +2397,24 @@ mod tests {
              late all the time"
         );
 
+        // Each booked turn lands in its root's distribution.
+        let roots = |ledger: &TurnLedger| {
+            ledger
+                .root_rows()
+                .into_iter()
+                .map(|(root, n, ..)| (root, n))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roots(&ledger), [("window_event", 1), ("user_event", 1)]);
+
         // Ten minutes idle at the park point books nothing at all.
+        let idle = T0 + LONG + SHORT;
         assert_eq!(
-            ledger.close(Breadcrumb::AboutToWait, T0 + LONG + SHORT + 600_000_000_000),
+            ledger.close(Breadcrumb::AboutToWait, idle + 600_000_000_000),
             None
         );
         assert_eq!(ledger.snapshot().turns, 2);
+        assert_eq!(roots(&ledger), [("window_event", 1), ("user_event", 1)]);
 
         // A reset clears the window AND disarms the open stamp, so the turn
         // straddling it is not charged to the fresh window.
@@ -2352,6 +2422,7 @@ mod tests {
         let c = ledger.snapshot();
         assert_eq!((c.max_ns, c.last_ns, c.turns, c.long_turns), (0, 0, 0, 0));
         assert_eq!(c.max_owner, None);
+        assert_eq!(roots(&ledger), [], "the distributions are window stats");
         assert_eq!(
             ledger.close(Breadcrumb::UserEvent, T0 + 900_000_000_000),
             None,
@@ -2365,10 +2436,10 @@ mod tests {
     /// that the turn it closes is booked to the root that OWNED it — the
     /// `user_event` park, not the `about_to_wait` that ended it.
     ///
-    /// The ledger and the phase cell are local and the beat path is serialized,
-    /// so nothing here depends on test order. What is left uncovered is the
-    /// one-line binding of `beat` to the global ledger, the global phase cell
-    /// and the process clock.
+    /// The ledger, the phase cell and the watch are local and the beat path is
+    /// serialized, so nothing here depends on test order. What is left
+    /// uncovered is the one-line binding of `beat` to the process's watch,
+    /// ledger, phase cell and clock.
     #[test]
     fn a_beat_books_the_turn_it_closes_to_the_root_that_owned_it() {
         let _serial = beat_serial();
@@ -2376,15 +2447,19 @@ mod tests {
         const PARKED: u64 = 250_000_000;
         let turns = TurnLedger::new();
         let phase = AtomicU8::new(Phase::None as u8);
+        let watch = MainWatch::new();
 
         // Enter the Output arm's root; nothing is closed yet.
-        assert_eq!(beat_into(&turns, &phase, Breadcrumb::UserEvent, T0), None);
-        assert_eq!(current(), Breadcrumb::UserEvent);
+        assert_eq!(
+            beat_into(&watch, &turns, &phase, Breadcrumb::UserEvent, T0),
+            None
+        );
+        assert_eq!(watch.current(), Breadcrumb::UserEvent);
 
         // 250 ms of bookkeeping later the loop reaches its park point, and the
         // beat that gets there prices what just happened.
         assert_eq!(
-            beat_into(&turns, &phase, Breadcrumb::AboutToWait, T0 + PARKED),
+            beat_into(&watch, &turns, &phase, Breadcrumb::AboutToWait, T0 + PARKED),
             Some(PARKED),
             "the beat that ends a 250 ms `user_event` turn must book it"
         );
@@ -2401,6 +2476,7 @@ mod tests {
         // The idle park that follows books nothing, however long the user is away.
         assert_eq!(
             beat_into(
+                &watch,
                 &turns,
                 &phase,
                 Breadcrumb::NewEvents,
@@ -2409,9 +2485,6 @@ mod tests {
             None
         );
         assert_eq!(turns.snapshot().turns, 1);
-
-        // Leave the global breadcrumb where the rest of the suite expects it.
-        beat(Breadcrumb::AboutToWait);
     }
 
     /// Each root's verdict at the stall bar, and its round trip through the
@@ -2447,8 +2520,6 @@ mod tests {
                 "{bc:?} frozen {frozen:?} at the {bar:?} bar"
             );
             assert_eq!(Breadcrumb::from_u8(bc as u8), bc);
-            // Every root has its slot in the per-root turn distribution.
-            assert!(usize::from(bc as u8) < crate::metrics::TURN_ROOT_SLOTS);
         }
         assert_eq!(Breadcrumb::from_u8(200), Breadcrumb::Startup);
         assert!(Breadcrumb::from_u8(200).is_park_point());
@@ -2476,10 +2547,7 @@ mod tests {
         );
         let c = ledger.snapshot();
         assert_eq!((c.turns, c.busy_ns), (2, 3 * MS));
-        assert_eq!(
-            c.max_owner.map(Breadcrumb::metric_name),
-            Some("about_to_wait")
-        );
+        assert_eq!(c.max_owner.map(Breadcrumb::as_str), Some("about_to_wait"));
         // From process start (no reset yet) to a read 3 s in: 1 ms per second.
         assert!((c.busy_ms_per_s(3_000 * MS) - 1.0).abs() < 1e-9);
         assert_eq!(c.busy_ms_per_s(0), 0.0, "an empty window is idle");
@@ -2493,6 +2561,7 @@ mod tests {
     /// and the wait answers at once. NEGATIVE CONTROL: every work root.
     #[test]
     fn a_fork_waits_for_the_main_thread_to_park() {
+        let watch = MainWatch::new();
         let _serial = beat_serial();
         for root in [
             Breadcrumb::UserEvent,
@@ -2500,18 +2569,19 @@ mod tests {
             Breadcrumb::NewEvents,
             Breadcrumb::AboutToWaitWork,
         ] {
-            beat(root);
-            assert!(!main_parked(), "{root:?} is a turn");
-            assert!(!wait_for_main_park(Duration::ZERO), "{root:?}");
+            beat_on(&watch, root);
+            assert!(!watch.parked(), "{root:?} is a turn");
+            assert!(!watch.wait_for_park(Duration::ZERO), "{root:?}");
         }
         for park in [
             Breadcrumb::AboutToWait,
             Breadcrumb::Startup,
             Breadcrumb::Modal,
+            Breadcrumb::UpdateHandoff,
         ] {
-            beat(park);
-            assert!(main_parked(), "{park:?} is a park point");
-            assert!(wait_for_main_park(Duration::from_secs(60)), "{park:?}");
+            beat_on(&watch, park);
+            assert!(watch.parked(), "{park:?} is a park point");
+            assert!(watch.wait_for_park(Duration::from_secs(60)), "{park:?}");
         }
     }
 
@@ -2522,15 +2592,20 @@ mod tests {
     /// set, or left behind by a spawn that returned or panicked.
     #[test]
     fn a_fork_waits_for_the_park_only_inside_a_spawn_that_asks() {
+        let watch = MainWatch::new();
         let _serial = beat_serial();
         let bound = Duration::from_millis(30);
         let ambient = || FORK_PARK_BOUND.get();
-        beat(Breadcrumb::UserEvent);
+        beat_on(&watch, Breadcrumb::UserEvent);
         assert_eq!(ambient(), Duration::ZERO, "no spawn asked: no wait");
-        assert!(!park_before_fork());
+        assert!(!park_before_fork_on(&watch));
         let inside = forks_wait_for_park(bound, || {
             let t0 = std::time::Instant::now();
-            (ambient(), park_before_fork(), t0.elapsed() >= bound)
+            (
+                ambient(),
+                park_before_fork_on(&watch),
+                t0.elapsed() >= bound,
+            )
         });
         assert_eq!(
             inside,
@@ -2547,29 +2622,29 @@ mod tests {
             Duration::ZERO,
             "the bound went with the unwound spawn"
         );
-        beat(Breadcrumb::AboutToWait);
+        beat_on(&watch, Breadcrumb::AboutToWait);
         // A hang detector: a park missed would hold it the whole minute.
-        assert!(forks_wait_for_park(
-            Duration::from_secs(60),
-            park_before_fork
-        ));
+        assert!(forks_wait_for_park(Duration::from_secs(60), || {
+            park_before_fork_on(&watch)
+        }));
     }
 
     /// The guard `about_to_wait` holds stamps its body as the work root, and
     /// the idle park point as it drops, with the root marked returned.
     #[test]
     fn about_to_wait_s_guard_parks_only_as_the_handler_returns() {
+        static WATCH: MainWatch = MainWatch::new();
         let _serial = beat_serial();
-        beat(Breadcrumb::UserEvent);
-        let before = HEARTBEAT.load(Ordering::Relaxed);
+        beat_on(&WATCH, Breadcrumb::UserEvent);
+        let before = WATCH.heartbeat.load(Ordering::Relaxed);
         {
-            let _root = enter_about_to_wait();
-            assert_eq!(current(), Breadcrumb::AboutToWaitWork);
-            assert!(!RETURNED.load(Ordering::Relaxed));
+            let _root = enter_about_to_wait_in(&WATCH);
+            assert_eq!(WATCH.current(), Breadcrumb::AboutToWaitWork);
+            assert!(!WATCH.returned.load(Ordering::Relaxed));
         }
-        assert_eq!(current(), Breadcrumb::AboutToWait);
-        assert!(RETURNED.load(Ordering::Relaxed));
-        assert!(HEARTBEAT.load(Ordering::Relaxed) >= before + 2);
+        assert_eq!(WATCH.current(), Breadcrumb::AboutToWait);
+        assert!(WATCH.returned.load(Ordering::Relaxed));
+        assert_eq!(WATCH.heartbeat.load(Ordering::Relaxed), before + 2);
     }
 
     /// A block inside `about_to_wait`'s body that takes no CPU (a lock, a
@@ -2767,13 +2842,20 @@ mod tests {
     /// OUTSIDE aterm and spinning, not "inside `NewEvents`".
     #[test]
     fn the_2026_09_26_spin_is_named_as_outside_aterm_and_on_cpu() {
+        static WATCH: MainWatch = MainWatch::new();
         let _serial = beat_serial();
         {
-            let _root = enter(Breadcrumb::NewEvents);
-            assert!(!RETURNED.load(Ordering::Relaxed), "inside the handler");
+            let _root = enter_in(&WATCH, Breadcrumb::NewEvents);
+            assert!(
+                !WATCH.returned.load(Ordering::Relaxed),
+                "inside the handler"
+            );
         }
-        assert!(RETURNED.load(Ordering::Relaxed), "the handler returned");
-        assert_eq!(current(), Breadcrumb::NewEvents);
+        assert!(
+            WATCH.returned.load(Ordering::Relaxed),
+            "the handler returned"
+        );
+        assert_eq!(WATCH.current(), Breadcrumb::NewEvents);
 
         let t0 = Instant::now();
         let mut s = Sampler::with_threshold(t0, 9, RELEASE_STALL_THRESHOLD);
@@ -2799,10 +2881,10 @@ mod tests {
         assert!(!line.contains("while inside"), "{line}");
         // A modal restores the OUTER root as still running.
         {
-            let _root = enter(Breadcrumb::UserEvent);
-            drop(park_modal());
+            let _root = enter_in(&WATCH, Breadcrumb::UserEvent);
+            drop(park_modal_in(&WATCH));
             assert!(
-                !RETURNED.load(Ordering::Relaxed),
+                !WATCH.returned.load(Ordering::Relaxed),
                 "back inside the outer root"
             );
         }
@@ -3755,6 +3837,8 @@ mod tests {
     /// (what `user_event` runs first on a posted hop) and [`main_stall`] (the
     /// reader). One model tick is [`REFUSAL_TICK_NS`] of the clock.
     struct RefusalLockstep<'a> {
+        /// This lockstep's own main-thread watch, which the writer stamps.
+        watch: &'a MainWatch,
         ledger: &'a TurnLedger,
         phase: &'a AtomicU8,
         /// `'static`, as the process's own is, so a real `Wake::Hop` can
@@ -3780,7 +3864,7 @@ mod tests {
 
     impl RefusalLockstep<'_> {
         fn enter_root(&mut self, root: Breadcrumb, returned: bool) {
-            beat_into(self.ledger, self.phase, root, self.now);
+            beat_into(self.watch, self.ledger, self.phase, root, self.now);
             self.root = root;
             self.returned = returned;
         }
@@ -3871,11 +3955,13 @@ mod tests {
     ) -> Vec<(i64, i64, bool)> {
         let ledger = TurnLedger::new();
         let phase = AtomicU8::new(Phase::None as u8);
+        let watch = MainWatch::new();
         // Leaked, one small count per schedule, for the `'static` a real
         // `Wake::Hop` needs.
         let hops: &'static crate::control::control_media::Hops =
             Box::leak(Box::new(crate::control::control_media::Hops::new()));
         let mut real = RefusalLockstep {
+            watch: &watch,
             ledger: &ledger,
             phase: &phase,
             hops,
@@ -4026,8 +4112,5 @@ mod tests {
             "counted until its reply, a queued settings write makes a healthy idle thread \
              read as stuck"
         );
-
-        // Leave the global breadcrumb where the rest of the suite expects it.
-        beat(Breadcrumb::AboutToWait);
     }
 }

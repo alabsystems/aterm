@@ -300,7 +300,9 @@ fast/slow split) is an instance of one of the general specs above.
 ## 6. The three specs I would prove first (easiest, high value)
 
 1. **`osc-bulk-copy-len`**. This is pure linear `usize` arithmetic (`min`, `saturating_sub`) with no
-   loops, so it is an `omega`-class proof. It retires the breakpoint-enumeration test and is the
+   loops, so it is an `omega`-class proof. *Blocked on seal `150efe4a` (2026-10-19):* E6 gives no
+   arithmetic body an import (`AutoBoundHeadOverApplied`), so it waits on the proven-core route; its
+   test stays. It retires the breakpoint-enumeration test and is the
    arithmetic core of the OSC half of the master simulation (the 8 MiB cap parity tests).
 2. **`param-accumulator`** (`add_param_digit`/`finalize_param`/`push_current_param`/`close_params`).
    This is `&mut self` field updates, saturating `u32` and one bounded `ArrayVec<u16,24>` push. It

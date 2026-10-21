@@ -32,9 +32,20 @@
 //!   second crash too: B exported its history ring once its import had put A's lines
 //!   back (and keyframed the renumbering the import made), so C comes back with
 //!   `history_lost=0` and B's whole scrollback.
+//! * THE TURN LEDGER (increment 7): a `turn` driven into A's session is carried into the
+//!   region's control slot (`journal_ledger_lag=0`), and after A's SIGKILL B's `history`
+//!   still finds it, `carried=1`, under its id, with the crash's floor said
+//!   (`unheld_below=`) and B's own turn ids going on past it. A shed region's replacement
+//!   carries it too.
 //! * NEGATIVE CONTROL: the same world with A's journal off through the debug seam
 //!   (`$ATERM_DEBUG_NO_CRASH_JOURNAL`): A settles its claim with no region, and B's
-//!   recovery comes back `restore=meta restore_why=no-region`, the screen blank.
+//!   recovery comes back `restore=meta restore_why=no-region`, the screen blank and the
+//!   turn A recorded not in B's `history`. There A boots before the keeper starts, and its
+//!   session is still recovered: the link registers with the first keeper that answers.
+//! * THE CENSUS ROWS the crash restore's soak judges: through the census's seam
+//!   (`$ATERM_DEBUG_RECOVERY_LEDGER`) every instance writes the row the installed app's cold
+//!   start would, and each says its boot's `keeper=` (`on`, or `absent` for the A that booted
+//!   before its keeper) and its recovery's `restored=` (`1:0:0` exact, `0:0:1` blank).
 //!
 //! Every wait is on a causal event (a ready signal, a status line, the keeper's own
 //! count, a marker or the shell's prompt on screen) under the one-minute hang detector.
@@ -51,6 +62,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use aterm_update::recovery_ledger::{KeeperAtLaunch, Row, ledger_path, read_rows};
+
 use crate::live_ctl::{Ctl, fields};
 use crate::{child_output, headless_boot, launch_isolation};
 
@@ -65,6 +78,11 @@ const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
 /// The window's keyframes held after the first, so a crash leaves a tail to replay
 /// (`crash_restore::HOLD_KEYFRAMES_SEAM`).
 const HOLD_KEYFRAMES_SEAM: &str = "ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES";
+
+/// The recovery census's seam (`recovery_census::LEDGER_SEAM`): every instance writes the
+/// row the installed app's cold start would into the world's own ledger, so the test reads
+/// the `keeper=` and `restored=` words the soak judges (`aterm_update::restore_soak`).
+const LEDGER_SEAM: &str = "ATERM_DEBUG_RECOVERY_LEDGER";
 
 /// One scratch world the keeper and both instances share: one `$HOME`, one config with
 /// the keeper on, one `$XDG_RUNTIME_DIR` (where the keeper's socket lives, `/tmp` being no
@@ -197,6 +215,11 @@ fn boot(root: &Path, tag: &str, seams: &[&str]) -> (Proc, String) {
     for seam in seams {
         cmd.env(seam, "1");
     }
+    let ledger = ledger_dir(root);
+    if let Err(e) = std::fs::create_dir_all(&ledger) {
+        aterm_spec::host::could_not_run(format!("cannot make the census's folder ({e})"));
+    }
+    cmd.env(LEDGER_SEAM, &ledger);
     let lifeline = launch_isolation::lifeline(&mut cmd, root);
     let mut ready = headless_boot::arm_ready(&mut cmd, root);
     let child = match cmd.spawn() {
@@ -215,6 +238,24 @@ fn boot(root: &Path, tag: &str, seams: &[&str]) -> (Proc, String) {
         |_| true,
     );
     (instance, sock.to_string_lossy().into_owned())
+}
+
+/// The world's recovery ledger folder, every instance's census row in it.
+fn ledger_dir(root: &Path) -> PathBuf {
+    root.join("ledger")
+}
+
+/// The census row instance `pid`'s cold start wrote (its census thread's, awaited under the
+/// hang detector).
+#[track_caller]
+fn census_row(root: &Path, pid: u32) -> Row {
+    let path = ledger_path(&ledger_dir(root));
+    let mut last = Vec::new();
+    let row = aterm_spec::wait::within(HANG, GAP, || {
+        last = read_rows(&path);
+        last.iter().find(|row| row.pid == pid).cloned()
+    });
+    row.unwrap_or_else(|| panic!("pid {pid} wrote no census row; the ledger: {last:#?}"))
 }
 
 /// Wait until the instance's session `status` has `key=value`; the last line read.
@@ -356,7 +397,8 @@ fn run_a(root: &Path, ctl: &mut Ctl, seam: bool) -> (Vec<String>, BTreeMap<Strin
 }
 
 /// A SIGKILLed by its own pid (never `pkill`), then the keeper's word that the session is
-/// an orphan, then B booted in the same world with `seams`: B's recovered session.
+/// an orphan, then B booted in the same world with `seams`: B's recovered session, on a
+/// connection made once B's recovery-count fence has lifted ([`admitted`]).
 fn crash_and_recover(root: &Path, a: Proc, seams: &[&str]) -> (Proc, Ctl) {
     let mut a = a;
     let pid = a.child.id();
@@ -370,8 +412,28 @@ fn crash_and_recover(root: &Path, a: Proc, seams: &[&str]) -> (Proc, Ctl) {
     await_keeper(root, "orphaned=1");
     let tag = format!("after-{pid}");
     let (b, sock) = boot(root, &tag, seams);
-    let ctl = Ctl::connect(&sock);
+    let ctl = admitted(&sock);
     (b, ctl)
+}
+
+/// What every request to a recovered instance answers while an old journal the keeper
+/// may still offer has no accepted successor (`keeper_link::RecoveryCountAdmission`):
+/// the instance serves nothing and closes the connection until the keeper confirms it
+/// read each adopted session's new journal (its SYNC answer behind the COMPANION).
+const FENCED: &str = "ERR recovery-count-custody unconfirmed";
+
+/// A connection to the instance at `sock` once its recovery-count fence has lifted
+/// ([`FENCED`]): a must-happen wait, each refused connection dropped and a new one asked.
+/// A recovery with no journal to retire is admitted at its first request.
+#[track_caller]
+fn admitted(sock: &str) -> Ctl {
+    let mut last = String::new();
+    let ctl = aterm_spec::wait::within(HANG, GAP, || {
+        let mut ctl = Ctl::connect(sock);
+        last = ctl.line("status");
+        (last != FENCED).then_some(ctl)
+    });
+    ctl.unwrap_or_else(|| panic!("the recovery-count fence never lifted: {last}"))
 }
 
 #[test]
@@ -415,8 +477,26 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
         "premise: A's scrollback reaches its first numbered line"
     );
     drop(ctl);
+    // A's census row: a keeper answered its boot, and it recovered nothing.
+    let a_pid = a.child.id();
+    let a_row = census_row(&root, a_pid);
+    assert_eq!(
+        (a_row.keeper, a_row.restores),
+        (Some(KeeperAtLaunch::On), None)
+    );
 
     let (b, mut ctl) = crash_and_recover(&root, a, &[HOLD_KEYFRAMES_SEAM]);
+    // B's: a keeper answered, and the one session it offered came back exactly — the words
+    // the soak judges, as `main_entry` hands them to the census.
+    let b_row = census_row(&root, b.child.id());
+    assert_eq!(b_row.keeper, Some(KeeperAtLaunch::On));
+    assert_eq!(b_row.prev.pid, Some(a_pid), "B's row follows A's");
+    assert_eq!(
+        b_row
+            .restores
+            .map(|r| (r.exact, r.screen, r.meta, r.refused)),
+        Some((1, 0, 0, 0))
+    );
     let status = await_status(&mut ctl, "restore", "exact");
     let f = fields(&status);
     for (key, want) in [
@@ -509,33 +589,139 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
     );
 }
 
+/// One `turn` typed into the session at its prompt (`echo <marker>`, settled): its id.
+fn drive_turn(ctl: &mut Ctl, marker: &str) -> u64 {
+    let (header, _) = ctl.counted(&format!("turn idle=200 timeout=30000 -- echo {marker}"));
+    let f = fields(&header);
+    assert_eq!(f.get("status"), Some(&"settled"), "{header}");
+    f.get("id")
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("an id= in {header}"))
+}
+
+/// `history`: its header's fields and its rows.
+fn history_rows(ctl: &mut Ctl) -> (String, Vec<String>) {
+    ctl.counted("history")
+}
+
+/// THE TURN LEDGER ACROSS A REAL CRASH (the crash-restore plan's increment 7): a `turn`
+/// driven into A's session, A's journal worker carries the session's ledger into the
+/// region's control slot (`journal_ledger_lag=0`, the one-minute hang detector), and A is
+/// SIGKILLed. B's `history` still finds the turn, `carried=1`, under its id and with its
+/// text, and says the floor below which the crash may have lost turns (`unheld_below=`,
+/// above the carried id: A could have recorded more after its last carry); B's own next
+/// turn takes an id at or past that floor.
+#[test]
+fn a_crashed_window_s_turns_are_still_in_history() {
+    let world = world("t");
+    let root = world.0.clone();
+    let _keeper = keeper(&root);
+    let (a, sock) = boot(&root, "a", &[]);
+    let mut ctl = Ctl::connect(&sock);
+    await_status(&mut ctl, "journal", "live");
+    await_prompt(&mut ctl, None);
+    let id = drive_turn(&mut ctl, "LEDGER-ONE");
+    await_prompt(&mut ctl, Some("LEDGER-ONE"));
+    await_status(&mut ctl, "journal_ledger_lag", "0");
+    await_keeper(&root, "journals=1");
+    let (_, a_rows) = history_rows(&mut ctl);
+    assert_eq!(
+        a_rows.len(),
+        1,
+        "premise: A's ledger holds the turn: {a_rows:?}"
+    );
+    drop(ctl);
+
+    let (_b, mut ctl) = crash_and_recover(&root, a, &[]);
+    let (header, rows) = history_rows(&mut ctl);
+    assert_eq!(
+        rows.len(),
+        1,
+        "B's history holds A's turn: {header} {rows:?}"
+    );
+    let row = &rows[0];
+    let f = fields(row);
+    assert_eq!(
+        row.split_whitespace().nth(1),
+        Some(id.to_string().as_str()),
+        "the turn's own id: {row}"
+    );
+    assert_eq!(f.get("carried"), Some(&"1"), "{row}");
+    assert_eq!(f.get("submitted"), Some(&"1"), "{row}");
+    let (_, text) = row.split_once(" text=").expect("text= is the tail");
+    assert!(text.contains("LEDGER-ONE"), "{row}");
+    let floor: u64 = fields(&header)
+        .get("unheld_below")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the crash's floor: {header}"));
+    assert!(floor > id, "the floor is past the carried turn: {header}");
+    await_prompt(&mut ctl, Some("LEDGER-ONE"));
+    let next = drive_turn(&mut ctl, "LEDGER-TWO");
+    assert!(
+        next >= floor,
+        "B's turn ids go on past the floor: {next} < {floor}"
+    );
+}
+
 /// NEGATIVE CONTROL: A's journal off by the seam, so the keeper is told A's session has
-/// no region; B's recovery takes the META rung, the screen blank.
+/// no region; B's recovery takes the META rung, the screen blank, and the turn A recorded
+/// is not in B's `history`.
+///
+/// And A boots BEFORE the keeper starts, as a person's first window after a login does
+/// (the keeper is a submitted job no reboot or logout keeps, and `aterm keeper start` in a
+/// tab starts it): A's census row says `keeper=absent`, its link registers the session with
+/// the keeper once it answers, and the kill is one the keeper held — B recovers it. The
+/// soak counts such a kill as held (`restore_soak`'s `no-miss`).
 #[test]
 fn without_a_journal_the_recovery_comes_back_blank() {
     let world = world("n");
     let root = world.0.clone();
-    let _keeper = keeper(&root);
     let (a, sock) = boot(&root, "a", &[NO_JOURNAL_SEAM]);
+    let a_row = census_row(&root, a.child.id());
+    assert_eq!(
+        (a_row.keeper, a_row.restores),
+        (Some(KeeperAtLaunch::Absent), None)
+    );
+    let _keeper = keeper(&root);
     let mut ctl = Ctl::connect(&sock);
     let (screen, _) = run_a(&root, &mut ctl, true);
     assert!(
         screen.iter().any(|row| row == "ARMED-42"),
         "premise: A's screen holds the marker: {screen:?}"
     );
+    drive_turn(&mut ctl, "LEDGER-NC");
+    let (_, a_rows) = history_rows(&mut ctl);
+    assert_eq!(
+        a_rows.len(),
+        1,
+        "premise: A's ledger holds the turn: {a_rows:?}"
+    );
     drop(ctl);
 
-    let (_b, mut ctl) = crash_and_recover(&root, a, &[]);
+    let (b, mut ctl) = crash_and_recover(&root, a, &[]);
     let status = await_status(&mut ctl, "restore", "meta");
     assert_eq!(
         fields(&status).get("restore_why"),
         Some(&"no-region"),
         "{status}"
     );
+    let b_row = census_row(&root, b.child.id());
+    assert_eq!(b_row.keeper, Some(KeeperAtLaunch::On));
+    assert_eq!(
+        b_row
+            .restores
+            .map(|r| ((r.exact, r.screen, r.meta, r.refused), r.whys)),
+        Some(((0, 0, 1, 0), vec![("no-region".to_string(), 1)]))
+    );
     let blank = ctl.text();
     assert!(
         !blank.iter().any(|row| row.contains("ARMED-42")),
         "the META rung brings no screen back: {blank:?}"
+    );
+    let (header, rows) = history_rows(&mut ctl);
+    assert!(
+        rows.is_empty(),
+        "no region, no ledger: B's history is empty: {header} {rows:?}"
     );
 }
 
@@ -543,7 +729,8 @@ fn without_a_journal_the_recovery_comes_back_blank() {
 /// journals its screen and 5,000 lines of scrollback, then memory pressure (`pressure
 /// critical`, the injection a development build takes in place of macOS's source) takes
 /// its history ring away: the session's region is replaced by a fresh one whose ring is
-/// never written (`journal_ring=shed`, fewer `journal_bytes=`), and the keeper takes the
+/// never written (`journal_ring=shedding` until the keeper confirms it read the fresh
+/// region, then `shed`, with fewer `journal_bytes=`), and the keeper takes the
 /// fresh region (`companions_taken=` moves while `journals=1` holds). A is SIGKILLed. B's
 /// recovery is exact, which it can only be from the FRESH region (the one it superseded
 /// says `restore_why=superseded`), with A's screen and modes, and it counts every scrollback
@@ -557,6 +744,13 @@ fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
     let (a, sock) = boot(&root, "a", &[]);
     let mut ctl = Ctl::connect(&sock);
     run_a(&root, &mut ctl, false);
+    // A turn whose ledger the region's control slot carries before the shed replaces the
+    // region: the replacement must carry it too (increment 7).
+    let turn_id = drive_turn(&mut ctl, "LEDGER-SHED");
+    await_prompt(&mut ctl, Some("LEDGER-SHED"));
+    await_status(&mut ctl, "journal_ledger_lag", "0");
+    await_status(&mut ctl, "journal_tail", "0");
+    await_status(&mut ctl, "journal_ring_lag", "0");
     let number = |status: &str, key: &str| -> u64 {
         fields(status)
             .get(key)
@@ -575,8 +769,9 @@ fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
     let f = fields(&reply);
     assert_eq!(f.get("level"), Some(&"critical"), "{reply}");
     assert_eq!(f.get("rings_shed"), Some(&"1"), "{reply}");
-    let shed = ctl.status();
-    assert_eq!(fields(&shed).get("journal_ring"), Some(&"shed"), "{shed}");
+    // The ring says `shedding` until the keeper confirms it read the replacement region
+    // (its SYNC answer behind the COMPANION), then `shed`: a must-happen wait.
+    let shed = await_status(&mut ctl, "journal_ring", "shed");
     assert!(
         number(&shed, "journal_bytes") < number(&before, "journal_bytes"),
         "the ring's pages left the window: {before} / {shed}"
@@ -614,4 +809,13 @@ fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
         a_lines - b_lines,
         "every line of A's above the bridge is counted lost: {status}"
     );
+    // The turn, from the fresh region's control slot.
+    let (header, rows) = history_rows(&mut ctl);
+    assert_eq!(rows.len(), 1, "A's turn: {header} {rows:?}");
+    assert_eq!(
+        rows[0].split_whitespace().nth(1),
+        Some(turn_id.to_string().as_str()),
+        "{rows:?}"
+    );
+    assert_eq!(fields(&rows[0]).get("carried"), Some(&"1"), "{rows:?}");
 }

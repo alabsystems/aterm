@@ -7,6 +7,7 @@
 use aterm_slog::{Actor, Conf, Fields, Key, Kind, Mark, Src};
 
 use super::tests::{WALL0, opened, stamp, with_claude};
+use crate::App;
 
 /// `log_seq= log_ep= run= turn= step= need= need_since_ms=`: a fresh session
 /// names nothing open; an agent's turn with a Bash box names the run, the
@@ -318,6 +319,108 @@ fn an_edges_dropped_count_rides_only_its_own_mark() {
     assert!(a.contains(&format!(" dropped={dropped} ")), "A's own: {a}");
 }
 
+/// U18'S OVERFLOWED AUTHORS (Phase 6 step 6C-6): sixteen edges hold the
+/// named slots, each spent out by its acted keys (in debt for twenty
+/// seconds), so edges A and B, past them, share the overflow's tokens; A's
+/// fifty acted keys spend them, then A and B flood on. What each was short
+/// of is its own (an acted key is either marked or counted): a second on,
+/// A's next acted key says A's count and, a second later, B's says B's,
+/// neither as the pool's. Then thirty-three more edges past the slots are
+/// each short of their keys: the owed-only table keeps thirty-two, the
+/// first's count spills into the shared pool, and the first's next acted
+/// key says it as the pool's (`dropped=<n> pool=shared`); the second's says
+/// its own, plain. NEGATIVE CONTROL (by scratch revert of `aterm-slog`'s
+/// limiter to 5D-2/T1's one shared count past the slots): A's mark says A's
+/// and B's together, and B's says nothing.
+#[test]
+fn overflowed_edges_each_say_their_own_dropped_count() {
+    let (tl, hand) = opened();
+    let edge = |i: u32| Actor::Sid(aterm_slog::ShortId::new(&format!("s-{i:020x}")).expect("sid"));
+    let deny = super::InputAct {
+        act: Some(aterm_slog::ActWord::Deny),
+        re: None,
+    };
+    let key = |by: Actor| {
+        let mut g = tl.lock().unwrap();
+        let at = g.slog().now();
+        g.slog_mut().ctl_input(by, InputVerb::Key, None, deny, at);
+    };
+    let by_word = |by: Actor| format!(" by={} ", by.word());
+    let marks_by = |by: Actor| -> Vec<String> {
+        let w = by_word(by);
+        input_marks(&tl)
+            .into_iter()
+            .filter(|l| l.contains(&w))
+            .collect()
+    };
+    let burst = usize::try_from(aterm_slog::MARK_BURST).expect("small");
+    let slots = u32::try_from(aterm_slog::MARK_ACTORS).expect("small");
+    for i in 0..slots {
+        for _ in 0..=burst {
+            key(edge(i));
+        }
+    }
+    let (a, b) = (edge(100), edge(101));
+    let (a_keys, b_keys) = (50, 12);
+    for _ in 0..a_keys {
+        key(a);
+    }
+    for _ in 0..b_keys {
+        key(b);
+    }
+    // Every acted key is marked or counted.
+    let a_short = a_keys - marks_by(a).len();
+    let b_short = b_keys - marks_by(b).len();
+    assert!(
+        a_short > 0 && b_short > 0,
+        "both were short: {a_short} {b_short}"
+    );
+    assert!(
+        marks_by(a).len() <= 1 + burst,
+        "A had the overflow's tokens"
+    );
+    hand.advance(1_000);
+    key(a);
+    let a_mark = marks_by(a).pop().expect("A's mark");
+    assert!(
+        a_mark.contains(&format!(" dropped={a_short} by=")),
+        "A says its own: {a_mark}"
+    );
+    hand.advance(1_000);
+    key(b);
+    let b_mark = marks_by(b).pop().expect("B's mark");
+    assert!(
+        b_mark.contains(&format!(" dropped={b_short} by=")),
+        "B says its own: {b_mark}"
+    );
+
+    // Past the owed-only table: the pool, said as the pool's.
+    let past: Vec<Actor> = (0..=u32::try_from(aterm_slog::MARK_OWED_AUTHORS).expect("small"))
+        .map(|i| edge(2000 + i))
+        .collect();
+    for &by in &past {
+        key(by);
+        key(by);
+    }
+    let first_short = 2 - marks_by(past[0]).len();
+    let second_short = 2 - marks_by(past[1]).len();
+    assert!(first_short > 0 && second_short > 0);
+    hand.advance(1_000);
+    key(past[0]);
+    let first = marks_by(past[0]).pop().expect("the first's mark");
+    assert!(
+        first.contains(&format!(" dropped={first_short} pool=shared by=")),
+        "the spilled count is the pool's: {first}"
+    );
+    hand.advance(1_000);
+    key(past[1]);
+    let second = marks_by(past[1]).pop().expect("the second's mark");
+    assert!(
+        second.contains(&format!(" dropped={second_short} by=")),
+        "its own, plain: {second}"
+    );
+}
+
 /// A turn is the last author's within five seconds: the harness's `send`
 /// then `busy` 4 s on opens `by=harness`; NEGATIVE at 6 s the turn is
 /// nobody's; a person's keys after the harness's input take the turn.
@@ -406,13 +509,12 @@ fn a_caused_send_names_its_turn() {
 
 // ---- the wake (design §2.2; ruling R9) -------------------------------------
 
-/// A registration on `session`'s subscriber slot, with any notify already
-/// pending drained.
-fn watching(
-    subscribers: &crate::subscribe::Subscribers,
-    session: u64,
-) -> crate::subscribe::Subscription {
-    let sub = crate::subscribe::SubscriberSet::register(subscribers, &[session]);
+/// A registration on `session`'s watcher list, any ring already pending
+/// drained.
+fn watching(app: &App, session: u64) -> crate::session_watch::Subscription {
+    let sub = crate::session_watch::Subscription::single(
+        &app.pool.get(session).expect("a live session").ctx.watchers,
+    );
     let _ = sub.wait(std::time::Duration::ZERO);
     sub
 }
@@ -420,7 +522,7 @@ fn watching(
 /// The site woke `session`'s watchers (a one-minute hang detector: a site that
 /// forgot its wake leaves the watcher parked) and took the wake it owed.
 fn woke_and_took(
-    sub: &crate::subscribe::Subscription,
+    sub: &crate::session_watch::Subscription,
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     site: &str,
 ) {
@@ -446,7 +548,7 @@ fn the_sweep_wakes_the_logs_watchers() {
     let timeline = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx.timeline);
     let t0 = Instant::now();
     app.observe_session_statuses(t0);
-    let sub = watching(&app.subscribers, session);
+    let sub = watching(&app, session);
     let _ = timeline.lock().unwrap().slog_take_wake();
     crate::term_lock(&term).process(
         b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\false\r\n\x1b]133;C\x1b\\\
@@ -485,7 +587,7 @@ fn the_settle_tick_wakes_the_logs_watchers() {
         );
         let _ = g.slog_take_wake();
     }
-    let sub = watching(&app.subscribers, 0);
+    let sub = watching(&app, 0);
     hand.set(aterm_slog::SETTLE_MS);
     app.session_status.slog_wakes.note(0, Some(0));
     app.tick_session_logs();
@@ -500,7 +602,7 @@ fn a_persons_burst_wakes_the_logs_watchers() {
     let session = app.front_terminal(wid).expect("front").session;
     let timeline = app.pool.get(session).expect("pooled").ctx.timeline.clone();
     let _ = timeline.lock().unwrap().slog_take_wake();
-    let sub = watching(&app.subscribers, session);
+    let sub = watching(&app, session);
     let _ = app.input(
         wid,
         crate::input::InputEvent::Text("x".into()),
@@ -538,7 +640,7 @@ fn a_failure_seen_wakes_the_logs_watchers() {
         app.observe_session_statuses(t0);
         app.observe_session_statuses(t0 + Duration::from_secs(1));
         let _ = timeline.lock().unwrap().slog_take_wake();
-        let sub = watching(&app.subscribers, session);
+        let sub = watching(&app, session);
         if carried {
             let block = crate::session_status::completed_block(&crate::term_lock(&term));
             {
@@ -576,7 +678,7 @@ fn a_lifted_fence_wakes_the_logs_watchers() {
             .expect("an overlap record");
         let _ = g.slog_take_wake();
     }
-    let sub = watching(&app.subscribers, 0);
+    let sub = watching(&app, 0);
     app.lift_session_log_fences();
     woke_and_took(&sub, &timeline, "a lifted fence");
 }

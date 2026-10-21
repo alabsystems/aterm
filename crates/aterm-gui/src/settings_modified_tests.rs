@@ -220,7 +220,7 @@ impl Lab {
         Some(())
     }
 
-    fn undo(&mut self) -> Option<()> {
+    pub(super) fn undo(&mut self) -> Option<()> {
         self.undo_with(AppEvent::Action(ActionInvocation {
             id: ActionId::new("settings/undo"),
             value: None,
@@ -792,11 +792,19 @@ fn a_long_modified_row_puts_its_facts_on_a_second_line() {
         .collect::<Vec<_>>()
         .join(" ");
     // When the change applies is always the second line's; the default is
-    // on whichever line has the room, whole.
-    assert!(
-        lines.contains("Applies at the next ALab tools check"),
-        "{lines}"
-    );
+    // on whichever line has the room, whole. Where Universal Control does
+    // nothing (every platform but macOS, `row_available_here`), the row says
+    // that there instead, in the platform note's own words, and claims no
+    // timing.
+    let availability = SettingsAvailability::for_state(lab.state());
+    let first_fact = if row_available_here(key, availability) {
+        "Applies at the next ALab tools check".to_string()
+    } else {
+        platform_unavailability(lab.state(), None, key, availability)
+            .expect("a row that does nothing here says why")
+            .visual
+    };
+    assert!(lines.contains(&first_fact), "{first_fact:?} in {lines}");
     let visual = painted_row_label(&compiled, key).unwrap_or_default();
     assert!(
         lines.contains("Default: Off") || visual.contains("Default: Off"),
@@ -1523,6 +1531,11 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
             .collect();
         (format!("{visual} {painted}"), control, segments)
     };
+    // The row and its control say when Off lands only where Universal Control
+    // does anything (macOS, `row_available_here`); elsewhere they say it does
+    // nothing here and name no timing, while the timing itself, the status
+    // after a save and the Keep switch's flip below hold on every platform.
+    let actuates = row_available_here(key, SettingsAvailability::for_state(Lab::new("").state()));
     for (source, timing) in [
         (
             "[machine]\nuniversal_control = \"off\"\n",
@@ -1545,8 +1558,18 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
         let mut lab = Lab::new(source);
         lab.state_mut().navigate(SettingsRoute::Modified);
         let (painted, control, segments) = row_words(&lab);
+        if !actuates {
+            let availability = SettingsAvailability::for_state(lab.state());
+            let note = platform_unavailability(lab.state(), None, key, availability)
+                .expect("a row that does nothing here says why")
+                .visual;
+            assert!(
+                painted.contains(&note),
+                "{source}: where it does nothing the row says so ({note:?}): {painted:?}"
+            );
+        }
         for phrase in [NextToolsCheck, DailyLaunchApply].map(prefs::ApplicationTiming::words) {
-            let says = timing.map(prefs::ApplicationTiming::words) == Some(phrase);
+            let says = actuates && timing.map(prefs::ApplicationTiming::words) == Some(phrase);
             assert_eq!(
                 painted.contains(phrase),
                 says,
@@ -1585,10 +1608,18 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
         } else {
             NextToolsCheck
         };
-        assert!(
-            projection.application_timings.contains(&off_timing) || !native_advanced_key(key),
-            "{source}: saving Off says {off_timing:?}: {projection:?}"
-        );
+        if actuates {
+            assert!(
+                projection.application_timings.contains(&off_timing) || !native_advanced_key(key),
+                "{source}: saving Off says {off_timing:?}: {projection:?}"
+            );
+        } else {
+            assert!(
+                projection.application_timings.is_empty()
+                    && !projection.unavailable_notes.is_empty(),
+                "{source}: where it does nothing, saving Off says so and no timing: {projection:?}"
+            );
+        }
     }
     // An unsaved patch that turns Keep on with it flips the words.
     let lab = Lab::new("[packages]\nenabled = false\n[machine]\nuniversal_control = \"leave\"\n");

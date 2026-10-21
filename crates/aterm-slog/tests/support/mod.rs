@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 
 use aterm_slog::{
-    Actor, Close, Conf, Fields, Key, Kind, Log, Mark, Node, Open, Out, RunOut, Src, Stamp, TurnOut,
+    Actor, Close, Conf, Fields, Key, Kind, Log, Lvl, Mark, Node, Open, Out, RunOut, Src, Stamp,
+    TurnOut,
 };
 
 /// Wall time of the test epoch (2025-10-09), so `t=` reads like a real one.
@@ -118,6 +119,49 @@ pub fn time_order_holds(lines: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// THE MAIL LINK IN `brief`, NEVER WITHOUT ITS `~` (Phase 6 step 6C-3,
+/// ruling U5), on `log` at `now_wall`: in its brief with nothing shed, a
+/// `mail=` token is exactly `mail=@<off>~` and only on the line of a turn
+/// the fold links to mail `<off>`, heuristically; a linked turn's line
+/// carries it; and no record `log` prints holds one. `Ok` is how many
+/// tokens the brief printed (a caller's proof it checked something).
+pub fn brief_mail_links_hold(log: &Log, now_wall: u64) -> Result<usize, String> {
+    let links = log.reader_fold().mail_links();
+    let text = log.brief("s-1", 1 << 24, now_wall).text;
+    let mut printed = 0;
+    for line in text.lines().skip(1) {
+        let link = line
+            .split(' ')
+            .next()
+            .and_then(|head| head.strip_prefix('t'))
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|n| {
+                links
+                    .iter()
+                    .find(|(node, _)| *node == Node::new(Lvl::Turn, n))
+                    .map(|(_, l)| *l)
+            });
+        let tokens: Vec<&str> = line.split(' ').filter(|w| w.starts_with("mail=")).collect();
+        match (link, tokens.as_slice()) {
+            (None, []) => {}
+            (Some(l), [tok])
+                if l.conf == Conf::Heuristic && *tok == format!("mail=@{}~", l.off) =>
+            {
+                printed += 1;
+            }
+            _ => {
+                return Err(format!(
+                    "the brief line `{line}` against the fold's link {link:?}:\n{text}"
+                ));
+            }
+        }
+    }
+    if let Some(l) = lines(log).iter().find(|l| l.contains("mail=@")) {
+        return Err(format!("`log` prints a mail link: `{l}`"));
+    }
+    Ok(printed)
 }
 
 /// A realistic session's records: an agent run with turns of verdict marks,

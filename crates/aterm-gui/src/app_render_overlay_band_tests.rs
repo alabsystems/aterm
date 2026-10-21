@@ -36,7 +36,7 @@ fn overlay_band_narrows_each_pane_selection_independently() {
         pane_selection((0, 4), (7, 7), SelectionClip::new(0, 8, 4, 8)),
     ];
 
-    super::scrub_overlay_row_band(&mut input, 3..5, 16);
+    super::scrub_overlay_row_band(&mut input, 3..5, aterm_render::RowBands::new(0, 16));
 
     assert_eq!(
         input.selections.len(),
@@ -75,7 +75,7 @@ fn overlay_band_narrows_each_pane_selection_independently() {
 
     // A band strictly interior to the only pane's box: not expressible as one
     // rectangle, so the entry fails safe and drops, emptying the list.
-    super::scrub_overlay_row_band(&mut composed, 3..5, 16);
+    super::scrub_overlay_row_band(&mut composed, 3..5, aterm_render::RowBands::new(0, 16));
 
     assert!(
         composed.selections.is_empty(),
@@ -105,7 +105,7 @@ fn overlay_band_narrows_each_pane_selection_independently() {
         (7, 7),
         SelectionClip::new(0, 8, 4, 8),
     )];
-    super::scrub_overlay_row_band(&mut edge, 0..2, 16);
+    super::scrub_overlay_row_band(&mut edge, 0..2, aterm_render::RowBands::new(0, 16));
     assert_eq!(
         edge.selections.len(),
         1,
@@ -250,10 +250,10 @@ fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
 
     // The caret: hidden on the card, standing beside it on the same row.
     let mut under = fresh((3, 6));
-    super::scrub_overlay_card(&mut under, card, cell, pad);
+    super::scrub_overlay_card(&mut under, card, cell, (pad, 0));
     assert!(!under.cursor_visible, "the caret under the card is hidden");
     let mut beside = fresh((3, 3));
-    super::scrub_overlay_card(&mut beside, card, cell, pad);
+    super::scrub_overlay_card(&mut beside, card, cell, (pad, 0));
     assert!(
         beside.cursor_visible,
         "CONTROL: the caret beside the card stands"
@@ -330,7 +330,7 @@ fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
     }];
     let before = free_texels(&input.free_sprites[..4]);
 
-    super::scrub_overlay_card(&mut input, card, cell, pad);
+    super::scrub_overlay_card(&mut input, card, cell, (pad, 0));
 
     assert_eq!(
         input.cursor_trail.iter().map(|t| t.col).collect::<Vec<_>>(),
@@ -421,7 +421,7 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     input.selection = simple_selection((1, 0), (3, 15));
     let before = tinted(&input);
     assert_eq!(before.len(), 48);
-    super::scrub_overlay_card(&mut input, card, (10, 20), 5);
+    super::scrub_overlay_card(&mut input, card, (10, 20), (5, 0));
     assert_eq!(input.selection_clip, Some(SelectionClip::new(0, 8, 10, 16)));
     let after = tinted(&input);
     assert!(after.iter().all(|cell| !on_card(cell)), "{after:?}");
@@ -430,7 +430,7 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     // CONTROL: a selection clear of the card keeps its clip.
     let mut clear = fresh(16);
     clear.selection = simple_selection((6, 0), (7, 15));
-    super::scrub_overlay_card(&mut clear, card, (10, 20), 5);
+    super::scrub_overlay_card(&mut clear, card, (10, 20), (5, 0));
     assert_eq!(clear.selection_clip, None, "a selection clear of the card");
     assert_eq!(tinted(&clear).len(), 32);
 
@@ -450,7 +450,7 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     let mut input = fresh(24);
     input.selections = vec![left.clone(), middle.clone(), right.clone()];
     input.selection = left.selection.clone();
-    super::scrub_overlay_card(&mut input, card, (10, 20), 5);
+    super::scrub_overlay_card(&mut input, card, (10, 20), (5, 0));
     assert_eq!(
         input.selections.iter().map(|e| e.clip).collect::<Vec<_>>(),
         [SelectionClip::new(0, 8, 0, 4), right.clip],
@@ -461,7 +461,7 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     let mut input = fresh(24);
     input.selections = vec![middle.clone()];
     input.selection = middle.selection.clone();
-    super::scrub_overlay_card(&mut input, card, (10, 20), 5);
+    super::scrub_overlay_card(&mut input, card, (10, 20), (5, 0));
     assert!(!input.any_selection(), "nothing the card covers is tinted");
 
     // A meter row on the card's rows is retired; one beside them stays.
@@ -498,7 +498,7 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
         deco(3, 3, -3, 0),
         deco(3, 5, 0, 0),
     ];
-    super::scrub_overlay_card(&mut input, card, (10, 20), 5);
+    super::scrub_overlay_card(&mut input, card, (10, 20), (5, 0));
     assert_eq!(
         input
             .chrome_rasters

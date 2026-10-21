@@ -459,7 +459,7 @@ fn deliver(
             );
             return;
         }
-        Route::Centerless if crate::control_privacy::running_bundle_id().is_none() => {
+        Route::Centerless if crate::signing_identity::running_bundle_id().is_none() => {
             aterm_log::info!(
                 "notices: one not posted: aterm does not read this aterm.app's identity (it sits \
                  in a folder macOS guards, such as Downloads, or was started through a link), so \
@@ -821,7 +821,7 @@ pub(crate) fn learn_voice(
                 center.answer(),
                 running_bundled(),
                 notifier_path().is_some(),
-                crate::control_privacy::running_bundle_id().is_some(),
+                crate::signing_identity::running_bundle_id().is_some(),
             );
             *VOICE
                 .lock()

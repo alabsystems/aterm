@@ -33,6 +33,7 @@ fn canonical_host_chrome_order_is_base_then_tray_then_bell_then_overlay() {
         0,
         10,
         10,
+        0..0,
         Some(tray),
         true,
         Some(overlay),
@@ -48,6 +49,85 @@ fn canonical_host_chrome_order_is_base_then_tray_then_bell_then_overlay() {
         0x00FF_0000,
         "the retired CPU order (effects before tray) is a real negative control"
     );
+}
+
+/// The CPU present places the frame with its chrome rows' bands continued,
+/// then composites the tray: a full-width card over a chrome row (the stats
+/// Deck in the head, whose bottom rule runs edge to edge) must reach the
+/// remainder bands as the GPU blit's does, which samples the tray-composited
+/// copy (a maximized `--cpu` window under weston read 5 of 26790 band pixels
+/// off, first at (0,75), before this). Rows outside the chrome extent keep the
+/// band colour, and the bell invert never flips a band.
+#[test]
+fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
+    const BAND: u32 = 0x0011_2233;
+    const RULE: u32 = 0x00C0_FFEE;
+    let (fw, fh) = (10usize, 8usize);
+    let src: Vec<u32> = (0..fw * fh).map(|i| 0x0040_0000 | i as u32).collect();
+    let (dw, dh) = (fw + 5, fh + 2);
+    let (ox, oy) = (
+        aterm_render::band_offset(dw, fw),
+        aterm_render::band_offset_y(dh, fh),
+    );
+    // The card: the frame's full width on row 3, opaque.
+    let rgba: Vec<u8> = (0..fw).flat_map(|_| [0xC0, 0xFF, 0xEE, 0xFF]).collect();
+    let tray = || aterm_gpu::TrayQuad {
+        rgba: &rgba,
+        pw: fw as u32,
+        ph: 1,
+        dx: 0,
+        dy: 3,
+        scrim: None,
+    };
+    for (edge_rows, invert) in [(0..5, false), (0..5, true), (0..2, false)] {
+        let mut dst = vec![0u32; dw * dh];
+        aterm_render::place_frame_bands(
+            &mut dst,
+            dw,
+            dh,
+            &src,
+            fw,
+            fh,
+            false,
+            BAND,
+            edge_rows.clone(),
+        );
+        apply_host_chrome_at(
+            &mut dst,
+            dw,
+            dh,
+            ox,
+            oy,
+            fw,
+            fh,
+            edge_rows.clone(),
+            Some(tray()),
+            invert,
+            None,
+        );
+        let y = (3 + oy) as usize;
+        let x0 = ox as usize;
+        let row = &dst[y * dw..y * dw + dw];
+        let bands = row[..x0].iter().chain(&row[x0 + fw..]);
+        if edge_rows.contains(&3) {
+            assert!(
+                bands.clone().all(|&p| p & 0x00ff_ffff == RULE),
+                "{edge_rows:?} invert={invert}: the card's row reaches the window edge: {row:08x?}"
+            );
+        } else {
+            assert!(
+                bands.clone().all(|&p| p == BAND),
+                "{edge_rows:?}: a terminal row's bands stay the band colour: {row:08x?}"
+            );
+        }
+        // The row under it is a chrome row the card did not touch: its bands
+        // continue the frame's own edge, as placed.
+        if edge_rows.contains(&4) {
+            let y = (4 + oy) as usize;
+            assert_eq!(dst[y * dw] & 0x00ff_ffff, src[4 * fw]);
+            assert_eq!(dst[y * dw + dw - 1] & 0x00ff_ffff, src[4 * fw + fw - 1]);
+        }
+    }
 }
 
 /// At a band offset the band-aware overlay twins paint the same
@@ -95,6 +175,7 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
         dy: 0,
         fp: 0,
         geom: 0,
+        raster_fingerprint_once: std::sync::OnceLock::new(),
     };
     let mut t2 = vec![0u32; 4 * 3];
     composite_tray_at(&mut t2, 4, 3, 1, 2, &card);
@@ -195,6 +276,7 @@ fn composite_tray_src_over_and_clamps() {
         dy,
         fp: 0,
         geom: 0,
+        raster_fingerprint_once: std::sync::OnceLock::new(),
     };
     // 1×1 card, full alpha → exactly the source color.
     let mut fb = vec![0x0010_2030u32; 4];
@@ -245,6 +327,7 @@ fn tray_floor_crop_preserves_banner_and_exact_rgba_suffix() {
         dy: 1,
         fp: 0,
         geom: 0,
+        raster_fingerprint_once: std::sync::OnceLock::new(),
     };
     let original = card.rgba.clone();
     let quad = tray_quad_below_y(&card, 3).expect("two uncovered rows");

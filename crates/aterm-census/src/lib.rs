@@ -68,6 +68,7 @@ mod lex;
 mod lock_order;
 pub mod scan_set;
 mod scope_census;
+mod tree;
 mod wasm_census;
 pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
 pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
@@ -470,12 +471,12 @@ pub fn is_test_file(path: &Path) -> bool {
 /// Recursively collect `*.rs` files under `dir`, skipping `target/` and hidden
 /// directories (`.git`, worktrees under `.claude/`).
 pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !dir.exists() {
+    if !tree::exists(dir) {
         return Ok(());
     }
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
+    for entry in tree::read_dir(dir)? {
+        let path = entry?;
+        if tree::is_dir(&path) {
             // Compare encoded bytes, not `OsStr::to_str`: the same answer for
             // these ASCII names, without `to_str`'s UTF-8-revalidation unsafe in
             // this frame (the Trust L0 hardened lane). The function-path
@@ -513,18 +514,16 @@ struct GuiFn {
 /// as `crates/aterm-gui/src` is, so every walk of the GUI takes them too. A
 /// crate split must not narrow a gate.
 pub(crate) fn gui_split_src_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
+    let mut dirs: Vec<PathBuf> = tree::read_dir(&root.join("crates"))
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("aterm-gui-")
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("aterm-gui-"))
         })
-        .map(|entry| entry.path().join("src"))
-        .filter(|src| src.is_dir())
+        .map(|path| path.join("src"))
+        .filter(|src| tree::is_dir(src))
         .collect();
     dirs.sort();
     dirs
@@ -910,7 +909,7 @@ fn marker_sweep_file(p: &Path) -> bool {
 fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
     let mut found = Vec::new();
     for file in files {
-        let Ok(text) = std::fs::read_to_string(file) else {
+        let Ok(text) = tree::read_to_string(file) else {
             continue;
         };
         let rel = file
@@ -971,10 +970,9 @@ fn collect_out_of_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Mark
         .filter_map(|d| d.strip_suffix("/src"))
         .collect();
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
+    if let Ok(entries) = tree::read_dir(&root.join("crates")) {
+        for path in entries.into_iter().flatten() {
+            if !tree::is_dir(&path) {
                 continue;
             }
             let rel = path
@@ -996,7 +994,7 @@ fn collect_out_of_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Mark
 /// Does `<root>/<rel_file>` still hold a `fn <symbol>` definition (comment lines
 /// excluded)? The OB-3 stale-sanction check.
 fn fn_defined_in(root: &Path, rel_file: &str, symbol: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(root.join(rel_file)) else {
+    let Ok(text) = tree::read_to_string(&root.join(rel_file)) else {
         return false;
     };
     text.lines()
@@ -1147,7 +1145,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     // Build the aterm-gui call graph + per-fn hazard classification.
     let mut fns: Vec<GuiFn> = Vec::new();
     for file in gui_source_files(root) {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = tree::read_to_string(&file) else {
             continue;
         };
         let rel = file
@@ -1442,6 +1440,71 @@ mod tests {
         assert!(!test("crates/aterm-pty/src/tests_dir/lib.rs"));
     }
 
+    /// `files` (repo-relative paths) as an empty-file synthetic tree.
+    fn empty_files(name: &str, files: &[&str]) -> crate::tree::memory::Tree {
+        let files: Vec<_> = files
+            .iter()
+            .map(|rel| ((*rel).to_string(), String::new()))
+            .collect();
+        synth_tree("aterm-census-walk", name, &files)
+    }
+
+    /// [`collect_rs_files`] collects every `.rs` below the directory at any
+    /// depth, and none under a `target/` or any dot directory (a worktree under
+    /// `.claude/`, a tool's hidden scratch), whose copies are not the
+    /// checkout's sources.
+    #[test]
+    fn the_rs_walk_skips_target_and_dot_directories() {
+        let root = empty_files(
+            "skips",
+            &[
+                "crates/a/src/lib.rs",
+                "crates/a/src/m/x.rs",
+                "crates/a/src/notes.md",
+                "crates/a/target/debug/build/out.rs",
+                "crates/a/.claude/worktrees/w/src/lib.rs",
+                "crates/a/src/.scratch/x.rs",
+            ],
+        );
+        let mut files = Vec::new();
+        collect_rs_files(&root.join("crates"), &mut files).expect("every entry reads");
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                root.join("crates/a/src/lib.rs"),
+                root.join("crates/a/src/m/x.rs")
+            ]
+        );
+    }
+
+    /// What the walk cannot read ends it with the error, however deep: an
+    /// entry a directory's listing cannot read, or a directory it may not list
+    /// (the disk's unreadable directory). The walks that refuse on it
+    /// (`held_guard::scan_tree`, the guards' corpus) would otherwise pass a
+    /// tree they did not see whole. Negative control: the same tree read whole.
+    #[test]
+    fn the_rs_walk_stops_where_it_cannot_read() {
+        use std::io::ErrorKind;
+        let walk = |fault: fn(&crate::tree::memory::Tree)| {
+            let root = empty_files("unread", &["crates/a/src/lib.rs", "crates/a/src/m/x.rs"]);
+            fault(&root);
+            let mut files = Vec::new();
+            collect_rs_files(&root.join("crates"), &mut files)
+                .map(|()| files.len())
+                .map_err(|e| e.kind())
+        };
+        assert_eq!(walk(|_| {}), Ok(2), "read whole");
+        assert_eq!(
+            walk(|root| root.unreadable("crates/a/src/m/x.rs")),
+            Err(ErrorKind::Other)
+        );
+        assert_eq!(
+            walk(|root| root.unlistable("crates/a/src/m")),
+            Err(ErrorKind::PermissionDenied)
+        );
+    }
+
     #[test]
     fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
         fn clean(_: &Path) -> CensusOutcome {
@@ -1709,7 +1772,6 @@ mod tests {
         files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
         let root = synth_tree("aterm-census", "green", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "expected GREEN, got:\n{}", out.log);
         assert!(
             out.log.contains("main-loop census: GREEN"),
@@ -1746,7 +1808,6 @@ mod tests {
         files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
         let root = synth_tree("aterm-census", "red-ob5", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(out.log.contains("[OB-5]"), "log:\n{}", out.log);
         assert!(
@@ -1838,7 +1899,6 @@ mod tests {
         files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
         let root = synth_tree("aterm-census", "mask-cfg-all-test", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             out.ok,
             "a `cfg(all(test, ..))` helper never enters the shipped GUI \
@@ -1865,7 +1925,6 @@ mod tests {
         files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
         let root = synth_tree("aterm-census", "no-mask-any-test", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             !out.ok,
             "`any(test, unix)` compiles on a shipped unix build — the hazard \
@@ -1887,7 +1946,6 @@ mod tests {
         files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
         let root = synth_tree("aterm-census", "red-ob6", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(out.log.contains("[OB-6]"), "log:\n{}", out.log);
         assert!(
@@ -1912,7 +1970,6 @@ mod tests {
             .collect();
         let root = synth_tree("aterm-census", "red-ob3-ob4", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(out.log.contains("[OB-3]"), "log:\n{}", out.log);
         assert!(out.log.contains("[OB-4]"), "log:\n{}", out.log);
@@ -1935,7 +1992,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-census", "red-ob2", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(out.log.contains("[OB-2]"), "log:\n{}", out.log);
         assert!(
@@ -1968,7 +2024,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-census", "out-of-closure", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             out.ok,
             "an out-of-closure marker must NOT enter OB-1 coherence; log:\n{}",
@@ -2018,7 +2073,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-census", "moved-marker", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(
             out.log.contains("[OB-1]")
@@ -2048,7 +2102,6 @@ mod tests {
             .collect();
         let root = synth_tree("aterm-census", "underivable", &files);
         let out = run_mainloop_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(
             out.log.contains("SCAN-SET DERIVATION FAILED"),

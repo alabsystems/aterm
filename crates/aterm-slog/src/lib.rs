@@ -49,7 +49,7 @@ pub mod turn;
 pub mod vocab;
 pub mod words;
 
-pub use brief::{Brief, DEFAULT_BUDGET, INSTANCE_BUDGET, brief, tokens};
+pub use brief::{Brief, BriefInput, Briefing, DEFAULT_BUDGET, INSTANCE_BUDGET, brief, tokens};
 pub use field::{
     BoundedText, BoundedToken, Cap, Charset, FIELDS, FieldError, Fields, Key, MAX_FIELDS, Tier, Val,
 };
@@ -61,7 +61,7 @@ pub use fold::{
     need_raised, need_takes_amend, shown_label, shown_proven_label, shown_verdicts, starts_epoch,
     turn_out_rebucket,
 };
-pub use limit::{MARK_ACTORS, MARK_BURST, MARK_REFILL_MS, MarkLimiter};
+pub use limit::{MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed};
 pub use line::{
     BusRec, DecodeError, EncodeError, MAX_RECORD_BYTES, decode, decode_bus, encode, encode_bus,
     encode_mirror, encode_with_table,
@@ -76,7 +76,7 @@ pub use log::{
     CarryError, CarryOut, CarrySnapshot, CarryStats, Close, Cursor, Dur, EvictClass, Gap, GapWhy,
     IdCounters, JOURNAL_IMAGE_MAX_RECORDS, JournalImage, Limits, Log, MAX_BYTES, MAX_HOLES,
     MAX_OPEN, MAX_RECORDS, Mark, NodeView, Notify, Open, OpenEntry, PreparedCarry, Read, Refused,
-    Rollup, SEQ_LIMIT, closes_over_half, evict_class, log_owned, low_water, mark_quota,
+    Rollup, SEQ_LIMIT, SharedRead, closes_over_half, evict_class, log_owned, low_water, mark_quota,
     natural_parent, over_limits,
 };
 pub use node_log::{NODE_LOG_RECORDS, NODE_MARKS, NodeLog};

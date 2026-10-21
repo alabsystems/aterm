@@ -3,7 +3,7 @@
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
@@ -33,11 +33,12 @@
 //!    a connection that has proved nothing gives its slot up to a newcomer
 //!    (r13 NET-1), and a peer that dribbles bytes is still cut off at its
 //!    deadline. Modelled as `NetSlotDisplacement` (`aterm-models-core`).
-//! 4. [`fleet_member`] — membership (`aterm fleet init|join|peers|leave`): the
-//!    join code, this machine's node id and node key, the issuer's book of
+//! 4. [`fleet_member`] — membership (`aterm fleet init|join|peers|allow|leave`):
+//!    the join code, this machine's node id and node key, the issuer's book of
 //!    peers and the node keys it binds, the registration a member makes with
 //!    it and the member's read of that book, and the fleet client `aterm ctl
-//!    survey --fleet` reads every peer through.
+//!    survey --fleet` reads every peer through and `aterm ctl --host` drives
+//!    one through ([`fleet_member::drive`]).
 //!
 //! The network drive that stood here before the fleet (`[net]`, `dial`, an
 //! edge token presented to an operator-certified listener that relayed it to

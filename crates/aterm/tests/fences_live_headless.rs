@@ -187,10 +187,14 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
                 "timeout=150000",
             ],
         );
-        let child = cmd.spawn().expect("spawn the await");
+        // Asked again while the instance has not yet accepted it, or answers it busy: the go file
+        // waits for the arm, so a waiter armed late is still armed over box A.
         std::thread::spawn(move || {
-            child_output::wait_and_read(child, Instant::now() + Duration::from_secs(150) + HANG)
-                .expect("the await exits after its own timeout")
+            headless_boot::until_served(|| {
+                let child = cmd.spawn().expect("spawn the await");
+                child_output::wait_and_read(child, Instant::now() + Duration::from_secs(150) + HANG)
+                    .expect("the await exits after its own timeout")
+            })
         })
     };
     // Armed, or the waiter ended without arming: the two events that decide

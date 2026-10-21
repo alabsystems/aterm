@@ -68,6 +68,13 @@ fn field(v: &Value, key: &str) -> String {
         .map_or_else(|| "?".into(), |f| format!("{f}"))
 }
 
+/// The lane's scratch `aterm.toml`: retention above the fill, no restored
+/// window, the update and package lanes off, and the audible bell off (this
+/// window is never the owner's terminal, so a BEL its shell rings must not
+/// play their alert sound).
+const CONFIG: &str = "scrollback_lines = 200000\nrestore_session = false\nbell_sound = false\n\n\
+                      [update]\nenabled = false\n[packages]\nenabled = false\n";
+
 /// The `scroll` lane.
 pub(crate) fn run(args: &Args) -> LaneRun {
     super::outcome(run_inner(args))
@@ -92,12 +99,8 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
         private(d)?;
     }
     // Retention above the fill is configuration, set before launch.
-    std::fs::write(
-        config.join("aterm/aterm.toml"),
-        "scrollback_lines = 200000\nrestore_session = false\n\n[update]\nenabled = false\n\
-         [packages]\nenabled = false\n",
-    )
-    .map_err(|e| format!("could not write the config: {e}"))?;
+    std::fs::write(config.join("aterm/aterm.toml"), CONFIG)
+        .map_err(|e| format!("could not write the config: {e}"))?;
     let sock = sockets.sock("scroll.sock")?;
     let log = std::fs::File::create(root.join("gui.log")).map_err(|e| format!("log: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("log: {e}"))?;
@@ -202,6 +205,29 @@ mod tests {
         assert_eq!(fill_line(0), "0 abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN\n");
         assert_eq!(fill_line(1), "1 bcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO\n");
         assert_eq!(fill_line(66), fill_line(0).replacen('0', "66", 1));
+    }
+
+    /// The lane's window starts with the audible bell off (aterm's default
+    /// is on) and its retention above the fill, as one document aterm's
+    /// parser reads.
+    #[test]
+    fn the_scroll_window_starts_with_the_audible_bell_off() {
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(CONFIG).expect("one document");
+        assert_eq!(
+            doc.get("bell_sound").and_then(aterm_toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            doc.get("scrollback_lines")
+                .and_then(aterm_toml::Value::as_integer),
+            Some(200_000)
+        );
+        assert_eq!(
+            doc.get("update")
+                .and_then(|t| t.get("enabled"))
+                .and_then(aterm_toml::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

@@ -11,6 +11,12 @@
 //! is registered here while it lives, and [`guard`] turns SIGINT, SIGTERM and
 //! SIGHUP into: kill and reap every live group, stop the ghostty copies,
 //! remove the scratch directories, exit `128 + signal`.
+//!
+//! A scratch directory holding a program copied there and started, which has
+//! not yet shown it ran ([`starting_from`]), is kept instead, by [`remove_dir`]
+//! and by an interrupt: macOS assesses a new file at its first exec, and
+//! removing the file before that assessment is done crashes `syspolicyd`,
+//! stranding every launch on the host until each is killed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +36,9 @@ struct Live {
     /// retire holds the handle).
     groups: BTreeMap<u32, Option<Child>>,
     dirs: BTreeSet<PathBuf>,
+    /// Those of `dirs` holding a program started from a copy there that has not
+    /// yet shown it ran ([`starting_from`]): kept, never removed.
+    unproven: BTreeSet<PathBuf>,
     /// Ghostty copies opened through `open -na`: launchd's children, not ours.
     apps: BTreeSet<PathBuf>,
 }
@@ -37,6 +46,7 @@ struct Live {
 static LIVE: Mutex<Live> = Mutex::new(Live {
     groups: BTreeMap::new(),
     dirs: BTreeSet::new(),
+    unproven: BTreeSet::new(),
     apps: BTreeSet::new(),
 });
 
@@ -150,10 +160,43 @@ pub(crate) fn make_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Remove a directory [`make_dir`] made, and forget it.
+/// Remove a directory [`make_dir`] made, and forget it; kept instead (and
+/// named) while a program started from a copy in it has not shown it ran.
+/// The decision, the removal and the forgetting of both marks happen under
+/// one hold of the table: two holds would let an interrupt between them find
+/// the directory still listed but no longer unproven, and remove the one this
+/// had just decided to keep.
 pub(crate) fn remove_dir(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
-    live().dirs.remove(dir);
+    let mut live = live();
+    if live.unproven.remove(dir) {
+        eprintln!("{}", kept(dir));
+    } else {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    live.dirs.remove(dir);
+}
+
+/// A program copied into `dir` (a [`make_dir`] directory) is about to start:
+/// until [`ran_from`] says it ran, `dir` is kept rather than removed (module
+/// docs).
+pub(crate) fn starting_from(dir: &Path) {
+    live().unproven.insert(dir.to_path_buf());
+}
+
+/// The program [`starting_from`] noted in `dir` has shown it ran (it printed
+/// its line): `dir` may go.
+pub(crate) fn ran_from(dir: &Path) {
+    live().unproven.remove(dir);
+}
+
+/// The words for a scratch directory kept because a program copied there never
+/// showed it ran.
+fn kept(dir: &Path) -> String {
+    format!(
+        "verify perf: kept {}: a program copied there was started and never showed it ran, so \
+         macOS may still be assessing its first exec; remove it once no process runs from it",
+        dir.display()
+    )
 }
 
 /// Note a ghostty copy about to be opened, so an interrupt stops it too.
@@ -240,14 +283,19 @@ fn interrupted(sig: i32) -> ! {
             .stderr(Stdio::null())
             .status();
     }
+    let mut removed = 0;
     for dir in &live.dirs {
-        let _ = std::fs::remove_dir_all(dir);
+        if live.unproven.contains(dir) {
+            eprintln!("{}", kept(dir));
+        } else {
+            let _ = std::fs::remove_dir_all(dir);
+            removed += 1;
+        }
     }
     eprintln!(
-        "verify perf: interrupted by signal {sig}; retired {} terminal group(s) and removed {} \
-         scratch director(ies)",
+        "verify perf: interrupted by signal {sig}; retired {} terminal group(s) and removed \
+         {removed} scratch director(ies)",
         live.groups.len(),
-        live.dirs.len()
     );
     std::process::exit(128 + sig)
 }
@@ -269,5 +317,29 @@ mod tests {
             "{pid} outlived its retire"
         );
         assert!(!live().groups.contains_key(&pid), "the table forgets it");
+    }
+
+    /// A scratch directory a started copy has not shown it ran from is kept;
+    /// once it ran, the same directory goes. NEGATIVE CONTROL: the second half.
+    #[test]
+    fn a_directory_a_started_copy_never_ran_from_is_kept() {
+        let unproven = make_dir(&std::env::temp_dir(), "atv-unproven-").expect("scratch");
+        std::fs::write(unproven.join("aterm"), b"copied").expect("the copy");
+        starting_from(&unproven);
+        remove_dir(&unproven);
+        let kept = unproven.join("aterm").is_file();
+        let forgotten = !live().dirs.contains(&unproven);
+        let unmarked = !live().unproven.contains(&unproven);
+        // Nothing ran from this copy: the test's own cleanup is safe.
+        let _ = std::fs::remove_dir_all(&unproven);
+        assert!(kept, "kept while unproven");
+        assert!(forgotten && unmarked, "and forgotten, both marks");
+
+        let proven = make_dir(&std::env::temp_dir(), "atv-proven-").expect("scratch");
+        std::fs::write(proven.join("aterm"), b"copied").expect("the copy");
+        starting_from(&proven);
+        ran_from(&proven);
+        remove_dir(&proven);
+        assert!(!proven.exists(), "it ran: removed");
     }
 }

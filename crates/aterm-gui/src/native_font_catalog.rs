@@ -1657,9 +1657,11 @@ mod tests {
 
     /// One font-size unit: on a 2× window the config's `font_px` is px at 1×
     /// like Settings' slider and the default, so 13 draws at 26 device px, one
-    /// point above the default's 24, and 12 draws exactly what the default
-    /// draws. Negative control: the old explicit pin drew 13 at 13 device px,
-    /// half the default's size, from what the slider calls one step up.
+    /// step above the default draws one step above the default's own (macOS:
+    /// 13 at 26 over 12 at 24), and the default named draws exactly what the
+    /// default draws. Negative control: the old explicit pin drew a named size
+    /// at that many device px, so macOS's 13 drew at 13, half the default's
+    /// size, from what the slider calls one step up.
     #[test]
     fn a_configured_size_draws_at_the_window_scale() {
         let at_2x = |text: &str| {
@@ -1679,7 +1681,7 @@ mod tests {
         assert_eq!(default, (crate::FONT_PX, (crate::FONT_PX * 2.0).round()));
         assert_eq!(at_2x("font_px = 13.0\n"), (13.0, 26.0));
         assert!(
-            at_2x("font_px = 13.0\n").1 > default.1,
+            at_2x(&format!("font_px = {:.1}\n", crate::FONT_PX + 1.0)).1 > default.1,
             "one step up grows the text"
         );
         assert_eq!(

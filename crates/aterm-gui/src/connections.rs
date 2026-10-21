@@ -500,6 +500,7 @@ mod tests {
     fn handle(local_id: u64) -> SessionHandle {
         let sid = SessionId::generate();
         let nonce = LaunchNonce::generate();
+        let observed = crate::session_watch::Observed::default();
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(-1)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
@@ -512,20 +513,21 @@ mod tests {
             cast: Arc::new(Mutex::new(crate::cast::CastRecorder::new(80, 24))),
             temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
             byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
-            turns: Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::default())),
+            turns: observed.turns,
             meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
-            timeline: Arc::new(Mutex::new(
-                crate::session_timeline::SessionTimeline::default(),
-            )),
+            timeline: observed.timeline,
             fabric: std::sync::Arc::default(),
             idem: Default::default(),
             rewrap_gauge: std::sync::Arc::default(),
             human_input: Default::default(),
+            licence: Default::default(),
             launch: Default::default(),
             reset_lane: Default::default(),
             crash_journal: Default::default(),
             typed: Default::default(),
             update_parked: Default::default(),
+            watchers: observed.watchers,
+            frame: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
         });

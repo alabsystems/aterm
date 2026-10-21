@@ -82,27 +82,30 @@ pub(crate) fn lay_target(dir: &Path) -> PathBuf {
 
 /// One cargo profile at `profile`: every build lock, `.fingerprint/`,
 /// `deps/liblay.rlib` (4 KiB), `build/`, and one incremental session holding
-/// an 8 KiB query cache.
+/// an 8 KiB query cache. Each `/`-separated name is joined one component at a
+/// time: under a verbatim `\\?\` profile (what `canonicalize` answers on
+/// Windows) a `/` is a character of the name, not a separator.
 pub(crate) fn lay_profile(profile: &Path) {
+    let at = |rel: &str| rel.split('/').fold(profile.to_path_buf(), |p, c| p.join(c));
     for d in [
         "deps",
         ".fingerprint/lay-2bcb77ac5af7c69c",
         "build",
         "incremental/lay-1x2y3z/s-abc-def",
     ] {
-        std::fs::create_dir_all(profile.join(d)).expect("profile dirs");
+        std::fs::create_dir_all(at(d)).expect("profile dirs");
     }
     for lock in CARGO_LOCKS {
         std::fs::write(profile.join(lock), b"").expect("lock");
     }
     std::fs::write(profile.join("deps").join("liblay.rlib"), vec![7u8; 4096]).expect("rlib");
     std::fs::write(
-        profile.join(".fingerprint/lay-2bcb77ac5af7c69c/lib-lay"),
+        at(".fingerprint/lay-2bcb77ac5af7c69c/lib-lay"),
         b"0123456789abcdef",
     )
     .expect("fingerprint");
     std::fs::write(
-        profile.join("incremental/lay-1x2y3z/s-abc-def/query-cache.bin"),
+        at("incremental/lay-1x2y3z/s-abc-def/query-cache.bin"),
         vec![9u8; 8192],
     )
     .expect("query cache");
@@ -118,11 +121,15 @@ pub(crate) fn synthetic_target(tmp: &Tmp, name: &str) -> PathBuf {
 /// The real remover under the default stale window at `now`, on any device.
 #[cfg(unix)]
 fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
-    remover(Judge {
-        now,
-        threshold_days: DEFAULT_TARGET_STALE_DAYS,
-        device: None,
-    })
+    remover(
+        Judge {
+            now,
+            threshold_days: DEFAULT_TARGET_STALE_DAYS,
+            device: None,
+            volume: None,
+        },
+        idle::Sessions::default,
+    )
 }
 
 /// A remover that counts its calls and removes nothing, answering the row's
@@ -308,6 +315,7 @@ fn a_version_dir_that_is_not_the_link_target_is_reported_and_the_live_one_is_not
             path: PathBuf::from("/v").join(name),
             bytes,
             bytes_partial: false,
+            kept: None,
         });
     }
     survey.live_version = Some(PathBuf::from("/v/2.1.265"));
@@ -330,6 +338,7 @@ fn an_unresolvable_live_symlink_blocks_every_version_row_rather_than_guessing() 
         path: PathBuf::from("/v/2.1.259"),
         bytes: 200,
         bytes_partial: false,
+        kept: None,
     });
     survey.live_version = None;
     let rep = report(&survey, applying());
@@ -521,6 +530,7 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
         path: reported.clone(),
         bytes: 200,
         bytes_partial: false,
+        kept: None,
     });
     survey.live_version = Some(PathBuf::from(abs("/v/2.1.265")));
     let rep = report(&survey, applying());
@@ -583,6 +593,7 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
         path: root.join("repo"),
         bytes: 999,
         bytes_partial: false,
+        kept: None,
     });
     survey.live_version = Some(PathBuf::from(abs("/v/2.1.265")));
     let rep = report(&survey, applying());
@@ -620,6 +631,96 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
     );
 }
 
+/// WINDOWS: THE TRANSCRIPTS FENCE HOLDS IN EVERY SPELLING. The root is
+/// spelled plain (`home.join(".claude").join("projects")`) and a row as
+/// `canonicalize` spells it (`\\?\C:\…`, the case on disk) or in capitals:
+/// both are refused, on the report or not. A path the key cannot place (an
+/// 8.3-shaped name) is placed by file identity: refused under the root,
+/// passed beside it, and refused where an ancestor cannot be read.
+/// NEGATIVE CONTROL: a folder beside the root passes the fence.
+#[cfg(windows)]
+#[test]
+fn the_transcripts_fence_holds_in_every_windows_spelling() {
+    let tmp = Tmp::new("transcripts-win");
+    let root = tmp.path().join(".claude").join("projects");
+    let session = root.join("C--Users-x-repo");
+    std::fs::create_dir_all(&session).expect("transcripts");
+    std::fs::write(session.join("s.jsonl"), b"{}\n").expect("a transcript");
+    let shorty = root.join("ABC~1");
+    std::fs::create_dir_all(&shorty).expect("an 8.3-shaped name");
+    let beside = tmp.path().join("elsewhere").join("ABC~1");
+    std::fs::create_dir_all(&beside).expect("beside");
+    let rep = report(&Survey::new(NOW), applying());
+    let refused = |p: &Path| guard_path(Some(&root), p).map_err(|r| r.code());
+    let verbatim = std::fs::canonicalize(session.join("s.jsonl")).expect("canonical");
+    let capitals = PathBuf::from(session.to_string_lossy().to_uppercase());
+    for p in [&verbatim, &capitals, &shorty, &shorty.join("missing")] {
+        assert_eq!(refused(p), Err("transcript"), "{p:?}");
+        let code = guard(&rep, Some(&root), Class::CargoTargets, p).map_err(|r| r.code());
+        assert_eq!(code, Err("transcript"), "{p:?}");
+    }
+    assert_eq!(refused(&beside), Ok(()));
+    assert_eq!(refused(&tmp.path().join("elsewhere")), Ok(()));
+    assert_eq!(
+        refused(&tmp.path().join("elsewhere").join("ABC~1").join("missing")),
+        Err("transcript"),
+        "an ancestor not read is not ruled out"
+    );
+    assert_eq!(placed_under(&shorty, &root), Some(true));
+    assert_eq!(placed_under(&beside, &root), Some(false));
+}
+
+/// WINDOWS: THE TRANSCRIPTS FENCE SEES THROUGH A LINKED `~\.claude`. The
+/// root comes as the home names it, through a junction to another folder of
+/// the same drive, where the key alone reads a canonical row under the real
+/// folder as beside it: the row is refused all the same, on the report or
+/// not, by the root's file identity among the row's ancestors. A root that
+/// is not there holds nothing: a path the key cannot place (8.3-shaped)
+/// passes rather than being called a transcript, while one the key places
+/// under it is still refused. NEGATIVE CONTROL: a folder beside the real one
+/// passes.
+#[cfg(windows)]
+#[test]
+fn the_transcripts_fence_sees_through_a_linked_claude_folder() {
+    let tmp = Tmp::new("transcripts-linked");
+    let real = tmp.path().join("data").join("claude");
+    let session = real.join("projects").join("C--Users-x-repo");
+    std::fs::create_dir_all(&session).expect("transcripts");
+    std::fs::write(session.join("s.jsonl"), b"{}\n").expect("a transcript");
+    let beside = tmp.path().join("data").join("other");
+    std::fs::create_dir_all(&beside).expect("beside");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    atpkg::platform::atomic_symlink(&real, &home.join(".claude")).expect("a junction");
+    let root = home.join(".claude").join("projects");
+    let rep = report(&Survey::new(NOW), applying());
+    let code = |root: &Path, p: &Path| guard_path(Some(root), p).map_err(|r| r.code());
+
+    let row = std::fs::canonicalize(&session).expect("canonical");
+    assert_eq!(
+        aterm_sysprobe::paths::is_under(&row, &root),
+        Some(false),
+        "the key alone reads the row beside the linked root"
+    );
+    assert_eq!(code(&root, &row), Err("transcript"));
+    assert_eq!(
+        guard(&rep, Some(&root), Class::CargoTargets, &row).map_err(|r| r.code()),
+        Err("transcript")
+    );
+    let beside = std::fs::canonicalize(&beside).expect("canonical");
+    assert_eq!(code(&root, &beside), Ok(()));
+
+    let missing = tmp.path().join("nobody").join(".claude").join("projects");
+    let shorty = tmp.path().join("elsewhere").join("ABC~1");
+    std::fs::create_dir_all(&shorty).expect("an 8.3-shaped name");
+    assert_eq!(
+        code(&missing, &shorty),
+        Ok(()),
+        "a root not there holds nothing"
+    );
+    assert_eq!(code(&missing, &missing.join("x")), Err("transcript"));
+}
+
 #[test]
 fn a_removal_that_fails_is_a_denial_row_and_does_not_abandon_the_rest() {
     let mut survey = Survey::new(NOW);
@@ -628,6 +729,7 @@ fn a_removal_that_fails_is_a_denial_row_and_does_not_abandon_the_rest() {
             path: PathBuf::from(abs("/v")).join(name),
             bytes: 10,
             bytes_partial: false,
+            kept: None,
         });
     }
     survey.live_version = Some(PathBuf::from(abs("/v/2.1.265")));
@@ -693,6 +795,143 @@ fn remove_tree_refuses_a_symlink() {
     }
     #[cfg(not(unix))]
     let _ = link;
+}
+
+/// A STALE VERSION IN A REAL CLOUD SYNC ROOT STAYS. A scratch folder registered as a cloud
+/// sync root ([`aterm_dirfd::seam::SyncRoot`]) holds a versions folder whose version file and
+/// version folder are in-sync placeholders; [`remove_tree`] refuses both and every byte stays,
+/// whatever placeholder mode the calling thread is in. NEGATIVE CONTROL: with `aterm-dirfd`'s
+/// placeholders left disguised, the sync root reads as a plain folder and both go.
+#[cfg(windows)]
+#[test]
+fn remove_tree_refuses_a_version_in_a_cloud_sync_root() {
+    let tmp = Tmp::new("win-sync-versions");
+    let sync = std::fs::canonicalize(tmp.path())
+        .expect("canonical")
+        .join("synced");
+    let versions = sync.join("versions");
+    std::fs::create_dir_all(versions.join("2.0.0-dir")).expect("dir");
+    std::fs::write(versions.join("2.0.0"), b"exe").expect("file");
+    std::fs::write(versions.join("2.0.0-dir").join("f"), b"x").expect("file");
+    let root = aterm_dirfd::seam::SyncRoot::register(&sync).expect("a sync root");
+    for made in [
+        versions.clone(),
+        versions.join("2.0.0"),
+        versions.join("2.0.0-dir"),
+        versions.join("2.0.0-dir").join("f"),
+    ] {
+        root.convert(&made).expect("a placeholder");
+    }
+    for p in [versions.join("2.0.0"), versions.join("2.0.0-dir")] {
+        let err = remove_tree(&p).expect_err("in a sync root");
+        assert!(err.to_string().contains("cloud sync root"), "{err}");
+    }
+    assert_eq!(std::fs::read(versions.join("2.0.0")).expect("kept"), b"exe");
+    assert_eq!(
+        std::fs::read(versions.join("2.0.0-dir").join("f")).expect("kept"),
+        b"x"
+    );
+
+    // NEGATIVE CONTROL: disguised, the sync root is a plain folder and both go.
+    aterm_dirfd::seam::leave_placeholders_disguised(true);
+    let file = remove_tree(&versions.join("2.0.0"));
+    let dir = remove_tree(&versions.join("2.0.0-dir"));
+    aterm_dirfd::seam::leave_placeholders_disguised(false);
+    file.expect("disguised: the file goes");
+    dir.expect("disguised: the folder goes");
+    assert!(!versions.join("2.0.0").exists());
+    assert!(!versions.join("2.0.0-dir").exists());
+    drop(root);
+}
+
+/// A VERSION WHOSE FOLDER CANNOT BE PINNED STAYS, WHATEVER THE REASON: a versions folder
+/// reached through a junction (no cloud sync root anywhere: `aterm_dirfd::pin` answers `LOOP`
+/// at the junction) holds a version file and a version folder; [`remove_tree`] of each,
+/// spelled through the junction, refuses, names why, and every byte stays — the refusal that
+/// fired for a sync root alone let this through to a delete by path, which followed the
+/// junction. A version entry that is itself a junction is refused as a link, its target
+/// whole. NEGATIVE CONTROL: the same two entries by their real path go, the folder with
+/// everything in it, and the junctions stay as they were.
+#[cfg(windows)]
+#[test]
+fn remove_tree_refuses_a_version_whose_folder_is_reached_through_a_junction() {
+    let tmp = Tmp::new("win-junction-versions");
+    // Plain, as `mklink /J` takes its operands (it refuses the verbatim spelling).
+    let base = tmp.path().to_path_buf();
+    let versions = base.join("real").join("versions");
+    std::fs::create_dir_all(versions.join("2.0.0-dir").join("sub")).expect("dir");
+    std::fs::write(versions.join("2.0.0"), b"exe").expect("file");
+    std::fs::write(versions.join("2.0.0-dir").join("sub").join("f"), b"x").expect("file");
+    let elsewhere = base.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("dir");
+    std::fs::write(elsewhere.join("g"), b"y").expect("file");
+    let link = base.join("link");
+    atpkg::platform::atomic_symlink(&base.join("real"), &link).expect("a junction");
+    atpkg::platform::atomic_symlink(&elsewhere, &versions.join("2.0.1")).expect("a junction");
+
+    let through = link.join("versions");
+    for p in [through.join("2.0.0"), through.join("2.0.0-dir")] {
+        let err = remove_tree(&p).expect_err("its folder is reached through a junction");
+        assert!(
+            err.to_string()
+                .contains("could not be opened from its volume's root"),
+            "{err}"
+        );
+    }
+    let err = remove_tree(&versions.join("2.0.1")).expect_err("a junction itself");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert!(err.to_string().contains("symlink or junction"), "{err}");
+    assert_eq!(std::fs::read(versions.join("2.0.0")).expect("kept"), b"exe");
+    assert_eq!(
+        std::fs::read(versions.join("2.0.0-dir").join("sub").join("f")).expect("kept"),
+        b"x"
+    );
+    assert_eq!(std::fs::read(elsewhere.join("g")).expect("kept"), b"y");
+
+    // NEGATIVE CONTROL: by their real path, both go; the junctions stay.
+    remove_tree(&versions.join("2.0.0")).expect("the real path: the file goes");
+    remove_tree(&versions.join("2.0.0-dir")).expect("the real path: the folder goes");
+    assert!(!versions.join("2.0.0").exists());
+    assert!(!versions.join("2.0.0-dir").exists());
+    assert!(std::fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()));
+    assert!(std::fs::symlink_metadata(versions.join("2.0.1")).is_ok_and(|m| m.is_symlink()));
+    assert_eq!(std::fs::read(elsewhere.join("g")).expect("kept"), b"y");
+}
+
+/// A VERSION OFF A FIXED DISK STAYS: the volume fence every reclaim clears first holds for a
+/// Claude Code version too. A versions folder whose volume reads as not fixed (a removable
+/// stick, through the drive seam: this machine has fixed disks only) or as of a kind that
+/// cannot be read holds a version file and a version folder; [`remove_tree`] of each refuses,
+/// says why, and every byte stays. NEGATIVE CONTROL: the drive read as it is (fixed), both go.
+#[cfg(windows)]
+#[test]
+fn remove_tree_refuses_a_version_off_a_fixed_disk() {
+    let tmp = Tmp::new("win-drive-versions");
+    let versions = tmp.path().join("versions");
+    std::fs::create_dir_all(versions.join("2.0.0-dir").join("sub")).expect("dir");
+    std::fs::write(versions.join("2.0.0"), b"exe").expect("file");
+    std::fs::write(versions.join("2.0.0-dir").join("sub").join("f"), b"x").expect("file");
+    for (kind, why) in [(Some(false), "removable"), (None, "could not be read")] {
+        target::pretend_drive_kind(Some(kind));
+        for p in [versions.join("2.0.0"), versions.join("2.0.0-dir")] {
+            let err = remove_tree(&p).expect_err("off a fixed disk");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+            let err = err.to_string();
+            assert!(err.contains(why) && err.contains("fixed disk"), "{err}");
+        }
+        assert_eq!(std::fs::read(versions.join("2.0.0")).expect("kept"), b"exe");
+        assert_eq!(
+            std::fs::read(versions.join("2.0.0-dir").join("sub").join("f")).expect("kept"),
+            b"x"
+        );
+    }
+
+    // NEGATIVE CONTROL: the drive read as it is, both go.
+    target::pretend_drive_kind(None);
+    remove_tree(&versions.join("2.0.0")).expect("a fixed disk: the file goes");
+    remove_tree(&versions.join("2.0.0-dir")).expect("a fixed disk: the folder goes");
+    assert!(!versions.join("2.0.0").exists());
+    assert!(!versions.join("2.0.0-dir").exists());
 }
 
 // -- the vocabulary -------------------------------------------------------------
@@ -766,6 +1005,7 @@ fn the_report_json_carries_every_row_with_its_witness() {
         path: PathBuf::from("/v/2.1.259"),
         bytes: 7,
         bytes_partial: true,
+        kept: None,
     });
     survey.live_version = Some(PathBuf::from("/v/2.1.265"));
     let rep = report(&survey, Config::default());
@@ -804,6 +1044,66 @@ fn the_free_figure_is_read_on_the_volume_a_path_resolves_to() {
     assert_eq!(linked.mount, here.mount);
     assert!(free_bytes(tmp.path()).is_some());
     assert!(free_bytes(Path::new("relative/path")).is_none());
+}
+
+/// A DIRECTORY SPELLED WITH 8.3 SHORT NAMES READS ITS VOLUME (live1's first
+/// finding: a tab or an agent working under a short `%TEMP%` read
+/// `NoMount`, so no volume and no disk line): the short spelling of a real
+/// long-named folder reads the volume its long spelling reads, and so does
+/// a directory under it that is not made yet (the 8.3 branch's review,
+/// rev4-6: `await sys vol=` naming a folder still to be made, or a tab whose
+/// directory was removed, read `NoMount`). NEGATIVE CONTROL: the short
+/// spelling alone places on no mount. PREMISE, stated where it fails: the
+/// volume generates short names.
+#[cfg(windows)]
+#[test]
+fn a_short_spelled_directory_reads_its_volume() {
+    let tmp = Tmp::new("short-volume");
+    let folder = std::fs::canonicalize(tmp.path())
+        .expect("canonical")
+        .join("a folder with a long name");
+    std::fs::create_dir(&folder).expect("the long-named folder");
+    let short = aterm_sysprobe::short_spelling(&folder).unwrap_or_else(|| {
+        panic!(
+            "PREMISE: the volume generates 8.3 short names; none for {}",
+            folder.display()
+        )
+    });
+    let table = aterm_sysprobe::volumes::table();
+    assert!(
+        aterm_sysprobe::volumes::mount_of(&short, &table).is_none(),
+        "{short:?} places on no mount as spelled"
+    );
+    let long = volume_of(&folder, &table).expect("the long spelling's volume");
+    let read = volume_of(&short, &table).expect("the short spelling's volume");
+    assert_eq!((&read.mount, &read.key), (&long.mount, &long.key));
+    let ghost = short.join("not-made-yet").join("deeper");
+    let read = volume_of(&ghost, &table).expect("a directory still to be made");
+    assert_eq!((&read.mount, &read.key), (&long.mount, &long.key));
+}
+
+/// A VOLUME IS PLACED WITH THE SYSTEM'S ERROR BOXES OFF, on whatever thread
+/// asks (wave 3's soundness review, its first finding: the control socket's
+/// `await sys` holds no guard of its own): [`volume_of`] resolves the path,
+/// and on Windows a query of an empty card reader or optical drive otherwise
+/// puts a box on the owner's desktop and parks the asker. Read inside the
+/// resolve through its seam; the caller's mode is back once it returns.
+/// NEGATIVE CONTROL: this test's thread, before and after, reads the boxes
+/// on (Windows; elsewhere no such box exists and the seam answers quiet).
+#[test]
+fn a_volume_is_placed_with_the_error_boxes_off() {
+    let tmp = Tmp::new("volume-quiet");
+    let table = aterm_sysprobe::volumes::table();
+    let unguarded = !cfg!(windows);
+    VOLUME_ERRORS_QUIET.set(None);
+    assert_eq!(aterm_sysprobe::errors_quiet(), unguarded, "no guard before");
+    assert!(volume_of(tmp.path(), &table).is_ok(), "a local volume");
+    assert_eq!(VOLUME_ERRORS_QUIET.get(), Some(true), "inside the resolve");
+    assert_eq!(
+        aterm_sysprobe::errors_quiet(),
+        unguarded,
+        "the caller's mode restored"
+    );
 }
 
 #[test]
@@ -1111,6 +1411,7 @@ fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
             path: versions.join("2.1.1"),
             bytes: 4096,
             bytes_partial: false,
+            kept: None,
         });
         survey.live_version = Some(versions.join("2.1.2"));
         survey
@@ -1349,5 +1650,401 @@ fn claude_codes_windows_temp_root_is_under_its_temp() {
     {
         let live = discover::claude_tmp_root(discover::own_uid());
         assert!(live.is_absolute() && live.ends_with("claude"), "{live:?}");
+    }
+}
+
+/// THE CLAUDE CENSUS PASSES OVER ITS OWN PROCESS, every OS
+/// ([`discover::census_of_running`]): this process (aterm's verb, or the window whose look
+/// asks) is never read, never counted a Claude Code however its path reads — on Windows one
+/// run from a Claude Code scratchpad has a `claude` component in its image — and never
+/// refuses the census unread. NEGATIVE CONTROLS: another pid read the same is a Claude Code,
+/// and another one that cannot be read refuses the census.
+#[test]
+fn the_claude_census_passes_over_its_own_process() {
+    use discover::{Exe, Exec, Process};
+    let me = std::process::id();
+    let other = me.wrapping_add(1);
+    let claude = |pid: u32| Process {
+        pid,
+        exe: Some(Exe::At(PathBuf::from("/opt/x/bin/claude"))),
+        exec: Some(Exec {
+            path: "/opt/x/bin/claude".to_owned(),
+            argv: vec!["claude".to_owned()],
+            config: None,
+            home: None,
+        }),
+        cwd: Some(PathBuf::from("/proj")),
+        started: None,
+    };
+    let unread = |pid: u32| Process {
+        pid,
+        exe: Some(Exe::Unnamed),
+        ..Process::default()
+    };
+    let mut asked = Vec::new();
+    let census = discover::census_of_running(
+        [me, other],
+        |pid| {
+            asked.push(pid);
+            Some(claude(pid))
+        },
+        None,
+        None,
+    )
+    .expect("read whole");
+    assert_eq!(asked, [other], "this process is never read");
+    let pids: Vec<u32> = census.claudes.iter().map(|c| c.pid).collect();
+    assert_eq!(pids, [other]);
+    assert_eq!(
+        discover::census_of_running([me], |pid| Some(unread(pid)), None, None),
+        Ok(discover::Running::default())
+    );
+    let refused = discover::census_of_running([other], |pid| Some(unread(pid)), None, None);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|why| why.starts_with(&format!("process {other} "))),
+        "{refused:?}"
+    );
+}
+
+/// A live checkout at `<tmp>/repo` (its git files, a source file) whose
+/// whole build directory `target/` (one profile) was last used at `now`,
+/// and its tier-3 row, eight days idle in a seven-day window: the canonical
+/// checkout, the canonical build directory, the row.
+fn idle_whole(tmp: &Tmp, now: i64) -> (PathBuf, PathBuf, Row) {
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git").join("logs")).expect("git");
+    std::fs::write(repo.join(".git").join("index"), b"DIRC").expect("index");
+    std::fs::write(repo.join(".git").join("logs").join("HEAD"), b"0 1 a\n").expect("head");
+    std::fs::create_dir_all(repo.join("src")).expect("src");
+    std::fs::write(repo.join("src").join("main.rs"), b"fn main() {}\n").expect("source");
+    let target = lay_target(&repo.join("target"));
+    let canon = |p: &Path| std::fs::canonicalize(p).expect("canonical");
+    let (repo, target) = (canon(&repo), canon(&target));
+    let row = Row {
+        class: Class::CargoTargets,
+        path: target.clone(),
+        bytes: 8192,
+        bytes_partial: false,
+        witness: Witness::IdleWhole {
+            marker: "CACHEDIR.TAG".to_owned(),
+            checkout: repo.clone(),
+            profiles: 1,
+            last_used: now,
+            age_s: 8 * DAY_S,
+            window_days: 7,
+            device: target::dev_of(&target).expect("the build directory's device"),
+        },
+        removable: true,
+        blocked: None,
+    };
+    (repo, target, row)
+}
+
+/// The real remover at `now` on a tier-3 `row`: no process runs, no Claude
+/// Code, the sessions `sessions` reads and the mount tables `tables` reads.
+fn remove_idle_whole(
+    row: &Row,
+    now: i64,
+    sessions: &dyn Fn() -> idle::Sessions,
+    tables: &dyn Fn() -> aterm_sysprobe::volumes::Table,
+) -> std::io::Result<Removed> {
+    remover_among(
+        Judge {
+            now,
+            threshold_days: DEFAULT_TARGET_STALE_DAYS,
+            device: None,
+            volume: target::VolumeGuid::of_path_now(&row.path),
+        },
+        |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default()),
+        |_| Ok(discover::Running::default()),
+        sessions,
+        tables,
+    )(row)
+}
+
+/// TIER 3'S CLAUSE 4A IS READ AGAIN AT THE REMOVAL, from the sessions as they
+/// stand then — never the survey's copy, a look old by the delete (on
+/// Windows the only witness of a PowerShell tab, whose `Set-Location` moves
+/// no process's working directory). Every OS: a session reporting the
+/// checkout after the survey refuses the removal before anything is opened;
+/// a tab whose working directory turns unknown refuses it with that reason;
+/// one that moves into the build directory after that first reading, while
+/// the reclaim holds the profile's locks, refuses it there. Nothing is
+/// emptied. NEGATIVE CONTROL: with no session in it, the same row's profile
+/// is emptied.
+#[test]
+fn a_session_that_moves_into_the_checkout_after_the_survey_keeps_it() {
+    let now = now_after_write(8);
+    let tmp = Tmp::new("idle-sessions-now");
+    let (repo, target, row) = idle_whole(&tmp, now);
+    let remove = |sessions: &dyn Fn() -> idle::Sessions| {
+        remove_idle_whole(&row, now, sessions, &aterm_sysprobe::volumes::table)
+    };
+    let rlib = target.join("debug").join("deps").join("liblay.rlib");
+
+    let in_src = || idle::Sessions {
+        cwds: vec![repo.join("src")],
+        unknown: None,
+    };
+    let refused = remove(&in_src).expect_err("a session works in the checkout");
+    assert!(
+        refused.to_string().contains("a session works in"),
+        "{refused}"
+    );
+
+    let why = "tab 7 reported no working directory this window can place, so any checkout may \
+               be one's";
+    let unknown = || idle::Sessions {
+        cwds: Vec::new(),
+        unknown: Some(why.to_owned()),
+    };
+    let refused = remove(&unknown).expect_err("a tab's directory is unknown");
+    assert!(refused.to_string().contains(why), "{refused}");
+
+    // Clear at the first reading, in the build directory at the next: under
+    // the profile's locks, right before its delete.
+    let reads = std::cell::Cell::new(0usize);
+    let moves_in = || {
+        reads.set(reads.get() + 1);
+        idle::Sessions {
+            cwds: if reads.get() == 1 {
+                Vec::new()
+            } else {
+                vec![target.join("debug")]
+            },
+            unknown: None,
+        }
+    };
+    let refused = remove(&moves_in).expect_err("a session moved in under the locks");
+    assert!(
+        refused.to_string().contains("a session works in"),
+        "{refused}"
+    );
+    assert!(
+        reads.get() >= 2,
+        "read again under the locks: {}",
+        reads.get()
+    );
+    assert!(rlib.exists(), "nothing was emptied");
+
+    let removed = remove(&idle::Sessions::default).expect("no session in it");
+    assert!(
+        removed.units.iter().any(|u| u.ends_with("debug")),
+        "{removed:?}"
+    );
+    assert!(!rlib.exists(), "the profile was emptied");
+}
+
+/// TIER 3'S REMOVAL READS ITS SESSIONS ON A MOUNT TABLE READ WHOLE
+/// ([`remover`]). Every OS: a table read before the reclaim that is not
+/// whole refuses the removal there, before anything is opened — on it
+/// clause 4a resolves no working directory (unix would compare each as
+/// written), and the fence under the locks, which reads a table of its own,
+/// would find that one whole and let the reclaim go on (the old removal
+/// emptied the profile). Windows: under the locks the sessions are judged on
+/// the table the mount fence read there, not on the one read before — a
+/// session beside the checkout, resolved on the table as read, keeps it
+/// once the table read under the locks calls its volume remote (not
+/// resolved, it keeps every candidate of its volume). Nothing is emptied.
+/// NEGATIVE CONTROL: with every table as read, the same session keeps
+/// nothing and the profile is emptied.
+#[test]
+fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
+    use aterm_sysprobe::volumes::{self, Table};
+    let now = now_after_write(8);
+    let tmp = Tmp::new("idle-sessions-table");
+    let (_, target, row) = idle_whole(&tmp, now);
+    let beside = tmp.path().join("beside");
+    std::fs::create_dir_all(&beside).expect("beside");
+    let rlib = target.join("debug").join("deps").join("liblay.rlib");
+    let reads = std::cell::Cell::new(0usize);
+    // Each table as read, the `n`th of this removal (from 1) as `shape`
+    // leaves it.
+    let tables = |shape: &dyn Fn(usize, Table) -> Table| {
+        reads.set(reads.get() + 1);
+        shape(reads.get(), volumes::table())
+    };
+    let cut_first = |n: usize, t: Table| Table {
+        complete: t.complete && n > 1,
+        ..t
+    };
+    let refused = remove_idle_whole(&row, now, &idle::Sessions::default, &|| tables(&cut_first))
+        .expect_err("the first table was not read whole");
+    assert!(refused.to_string().contains("not read whole"), "{refused}");
+    assert_eq!(reads.get(), 1, "refused before the locks");
+    assert!(rlib.exists(), "nothing was emptied");
+
+    let in_beside = || idle::Sessions {
+        cwds: vec![beside.clone()],
+        unknown: None,
+    };
+    #[cfg(windows)]
+    {
+        // As read before the locks; under them its volume is remote.
+        let on = volumes::mount_of(&target, &volumes::table())
+            .expect("a mount holds it")
+            .on
+            .clone();
+        let remote_after_first = |n: usize, mut t: Table| {
+            for m in t.mounts.iter_mut().filter(|m| n > 1 && m.on == on) {
+                m.local = false;
+            }
+            t
+        };
+        reads.set(0);
+        let refused = remove_idle_whole(&row, now, &in_beside, &|| tables(&remote_after_first))
+            .expect_err("a session beside it, not resolved under the locks");
+        assert!(
+            refused.to_string().contains("a session works in"),
+            "{refused}"
+        );
+        assert!(reads.get() >= 2, "read under the locks: {}", reads.get());
+        assert!(rlib.exists(), "nothing was emptied");
+    }
+
+    let removed = remove_idle_whole(&row, now, &in_beside, &volumes::table)
+        .expect("a session beside it keeps nothing");
+    assert!(
+        removed.units.iter().any(|u| u.ends_with("debug")),
+        "{removed:?}"
+    );
+    assert!(!rlib.exists(), "the profile was emptied");
+}
+
+/// A SESSION'S WORKING DIRECTORY IS OPENED ONLY ON A LOCAL VOLUME
+/// ([`idle::SessionCwd::on`], the one reading of the survey and of the
+/// removal, which reads it again under cargo's locks): where the mount table
+/// calls the folder's volume remote (a share that may stall) or automounted,
+/// it is never opened and reads as written: `Unresolved`, though it exists.
+/// So does one reached through a link onto a folder the table calls remote
+/// — the old gate placed the link's own folder, local, and opened it, and
+/// the open followed the link onto the share — and every one with no table,
+/// or one not read whole, to say which volumes are local. Every OS.
+/// NEGATIVE CONTROLS: on the table as read the folder, and the link, are
+/// resolved: placed where the folder is, as the one path rule compares it.
+#[test]
+fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
+    use aterm_sysprobe::paths::is_under;
+    let tmp = Tmp::new("idle-cwd-on");
+    let dir = tmp.path().join("work");
+    std::fs::create_dir_all(&dir).expect("work");
+    let canonical = std::fs::canonicalize(&dir).expect("canonical");
+    let table = aterm_sysprobe::volumes::table();
+    let on = aterm_sysprobe::volumes::mount_of(&dir, &table)
+        .expect("a mount holds it")
+        .on
+        .clone();
+    // Resolved to `want`'s place, in whatever spelling it resolved to.
+    let at = |cwd: &idle::SessionCwd, want: &Path| {
+        matches!(cwd, idle::SessionCwd::Placed(p)
+            if is_under(p, want) == Some(true) && is_under(want, p) == Some(true))
+    };
+    let read = idle::SessionCwd::on(&dir, Some(&table));
+    assert!(at(&read, &canonical), "{read:?}");
+    assert_eq!(
+        idle::SessionCwd::on(&dir, None),
+        idle::SessionCwd::Unresolved(dir.clone())
+    );
+    let cut = aterm_sysprobe::volumes::Table {
+        complete: false,
+        ..table.clone()
+    };
+    assert_eq!(
+        idle::SessionCwd::on(&dir, Some(&cut)),
+        idle::SessionCwd::Unresolved(dir.clone())
+    );
+    let far = tmp.path().join("far");
+    std::fs::create_dir_all(&far).expect("far");
+    let far_canonical = std::fs::canonicalize(&far).expect("canonical");
+    let via = tmp.path().join("via");
+    atpkg::platform::atomic_symlink(&far, &via).expect("a link (a junction on Windows)");
+    let followed = idle::SessionCwd::on(&via, Some(&table));
+    assert!(at(&followed, &far_canonical), "{followed:?}");
+    let mut shared = table.clone();
+    shared.mounts.push(aterm_sysprobe::volumes::Mount {
+        on: far_canonical,
+        from: "nas:/far".to_owned(),
+        fstype: "nfs".to_owned(),
+        local: false,
+        automounted: false,
+        read_only: false,
+        container: None,
+    });
+    assert_eq!(
+        idle::SessionCwd::on(&via, Some(&shared)),
+        idle::SessionCwd::Unresolved(via.clone()),
+        "a link onto a share is not followed"
+    );
+    for remote in [true, false] {
+        let mut t = table.clone();
+        for m in t.mounts.iter_mut().filter(|m| m.on == on) {
+            if remote {
+                m.local = false;
+            } else {
+                m.automounted = true;
+            }
+        }
+        assert_eq!(
+            idle::SessionCwd::on(&dir, Some(&t)),
+            idle::SessionCwd::Unresolved(dir.clone()),
+            "remote {remote}, else automounted"
+        );
+    }
+}
+
+/// THE TEXT FORM SPELLS PATHS AS A PERSON READS THEM (Windows): a row's line
+/// and a hog's line show `C:\…` where the row holds the canonical `\\?\C:\…`
+/// — the row's own path, in its line, in its blocked reason, in its witness —
+/// a share `\\srv\share\…`, and a hog under `$HOME` `~\…` whichever spelling
+/// `$HOME` is in; the row keeps its verbatim path, the one that opens past
+/// `MAX_PATH` and the one the journal and `--json` carry. NEGATIVE CONTROLS:
+/// a volume GUID path, which has no plain spelling, stays as it is; off
+/// Windows nothing is respelled (a `\` is a character of a unix name).
+#[test]
+fn the_text_form_spells_paths_plain_and_the_row_keeps_its_own() {
+    let verbatim = PathBuf::from(r"\\?\C:\Users\u\repo\target");
+    let row = Row {
+        class: Class::ClaudeStaleVersions,
+        path: verbatim.clone(),
+        bytes: 1024,
+        bytes_partial: false,
+        witness: Witness::NotLinkTarget {
+            live: PathBuf::from(r"\\?\UNC\srv\share\v\2.1.3"),
+        },
+        removable: false,
+        blocked: Some(
+            r"process 9 uses \\?\C:\Users\u\repo\target\debug\x.d (its open file)".to_owned(),
+        ),
+    };
+    let hog = Hog {
+        path: verbatim.clone(),
+        bytes: 1 << 20,
+        bytes_partial: false,
+        why: r"kept by \\?\Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}\x".to_owned(),
+    };
+    let line = row.line();
+    let hog_line = hog.line(Some(Path::new(r"C:\Users\u")));
+    let hog_verbatim_home = hog.line(Some(Path::new(r"\\?\C:\Users\u")));
+    assert_eq!(row.path, verbatim, "the row keeps its own spelling");
+    if cfg!(windows) {
+        assert!(!line.contains(r"\\?\"), "{line}");
+        assert!(line.contains(r" C:\Users\u\repo\target — "), "{line}");
+        assert!(
+            line.contains(r"uses C:\Users\u\repo\target\debug\x.d"),
+            "{line}"
+        );
+        assert!(line.contains(r"target \\srv\share\v\2.1.3"), "{line}");
+        assert!(hog_line.starts_with(r"~\repo\target 1.0 MiB"), "{hog_line}");
+        assert_eq!(hog_verbatim_home, hog_line);
+        assert!(
+            hog_line.contains(r"kept by \\?\Volume{6140fc3b"),
+            "no plain spelling: {hog_line}"
+        );
+    } else {
+        let text = r"uses \\?\C:\x and \\?\UNC\srv\share";
+        assert_eq!(shown(text), text);
+        assert!(line.contains(r"\\?\C:\Users\u\repo\target"), "{line}");
     }
 }

@@ -404,7 +404,10 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
         let mut body_t = 0usize;
         let room = share - head_t;
         if room >= BODY_MIN_TOKENS {
-            let b = aterm_slog::brief(sid, space.records(), None, st, room, now_ms);
+            // No mail links: the mail marks a link is read from never
+            // cross the bus, so a peer's brief never guesses one (Phase 6
+            // step 6C-3, ruling U5).
+            let b = aterm_slog::brief(sid, space.records(), None, st, &[], room, now_ms);
             // The session's own lines, not its reply header.
             body = b.text.lines().skip(1).map(|l| safe(l, 512)).collect();
             body_t = body.iter().map(|l| line_tokens(l)).sum();

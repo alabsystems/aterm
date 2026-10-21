@@ -162,6 +162,12 @@ pub struct LogRecord {
     /// The severity: the live row's while it lives, the one it retired
     /// under once retired.
     pub severity: Severity,
+    /// The severity it was posted at, its `posted` line's: the one its
+    /// reporter told it in, whatever mark it shows later (restated, or
+    /// retired fixed or delivered under `✓`). Settings ▸ Messages reads it to
+    /// tell whether a later record told a failure on as a failure
+    /// ([`crate::page::MessagesState::told_on`]).
+    pub posted_severity: Severity,
     /// The glyph, as the severity.
     pub glyph: Glyph,
     /// The title (final words once retired).
@@ -201,6 +207,7 @@ impl LogRecord {
             stamp,
             tag: msg.tag.clone(),
             severity: msg.severity,
+            posted_severity: msg.severity,
             glyph: msg.glyph,
             title: msg.title.clone(),
             detail: msg.detail.clone(),
@@ -536,6 +543,7 @@ fn decode_posted(fields: &Fields) -> Result<LogLine, CodecError> {
         },
         tag,
         severity,
+        posted_severity: severity,
         glyph,
         title: clip(&fields.need("title")?, TITLE_CAP),
         detail: capped_detail(&fields.get_or("detail")),
@@ -1148,6 +1156,11 @@ impl MessageLog {
                 });
             if let Some(i) = same {
                 let mine = &mut self.ring[i];
+                // A carried row may have been posted after this process's boot
+                // load. Its live words and mark stay its own, but its original
+                // severity is the authoritative file's, even for an older carry
+                // that knew only the row's current severity.
+                mine.posted_severity = rec.posted_severity;
                 if mine.is_live() {
                     continue;
                 }
@@ -1566,6 +1579,7 @@ pub(crate) mod tests {
             },
             tag: tags::CRASH,
             severity: Severity::Error,
+            posted_severity: Severity::Error,
             glyph: Glyph::new('\u{26a0}').unwrap(),
             title: "tab\there \\ back\nnew\rcr\u{1f}us \u{00b7} end".into(),
             detail: vec!["line one\twith tab".into(), String::new(), "three\\".into()],

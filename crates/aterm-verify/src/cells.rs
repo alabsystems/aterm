@@ -11,6 +11,8 @@
 //! `cfg`, so the triple's own compile is the only one that sees them.
 //! The cells a fleet machine hosts are that machine's own `verify lint test`,
 //! and the cell whose triple is this machine's is never cross-checked here.
+//! A run that checks a Windows cell also runs both windows-sys oracles
+//! ([`WIN32_ORACLES`]), one row each.
 //!
 //! STOCK EXCEPTION: the Trust sysroot carries only the host std, so each cell
 //! compiles on a rustup toolchain carrying its triple's std (stable first),
@@ -28,7 +30,7 @@ use aterm_forge::model::{Cell, Graph, PkgId};
 
 use crate::Ctx;
 use crate::exec::{self, Cmd};
-use crate::ladder::Report;
+use crate::ladder::{Outcome, Report, Severity};
 use crate::plan::{Lane, lane_dir};
 use crate::rustup;
 use crate::stages::lane_jobs;
@@ -240,7 +242,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             CellOutcome::Skipped {
                 why: format!("no rustup {}", rustup::RUSTUP_LOOKED),
                 fix: format!(
-                    "install rustup, then `rustup target add {} --toolchain stable`",
+                    "{}, with stable's {} std",
+                    aterm_uds::host::tool("rustup").remedy(),
                     cell.triple
                 ),
             }
@@ -264,7 +267,126 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             }
         }
     }
+    if runs_win32_oracles(&cells) {
+        win32_oracles(ctx, r, rustup.is_some());
+    }
     audit_policy(ctx, r, &policy, &cells);
+}
+
+/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1 and WB.3 of
+/// docs/AUDIT-third-party-2026-10-15.md), each with what it holds to the
+/// registry crate of its version: the declarations' types, layouts, values and
+/// signatures, the DLL each import resolves from, and every planted mismatch
+/// caught. Each verb compiles both Windows triples, so a run that checks
+/// either Windows cell runs each once. The same STOCK EXCEPTION as the cells:
+/// stock stable compiles Windows std, and no Windows program runs.
+pub const WIN32_ORACLES: [(&str, &str); 2] = [
+    (
+        "oracle",
+        "the windows-sys 0.61 facade and aterm-win32's closure against registry windows-sys 0.61.2",
+    ),
+    (
+        "oracle-052",
+        "the windows-sys 0.52 facade (crates/aterm-windows-sys-052) against registry windows-sys 0.52.0",
+    ),
+];
+
+/// Does this run check a Windows cell, which brings the [`WIN32_ORACLES`]?
+#[must_use]
+pub fn runs_win32_oracles(cells: &[Cell]) -> bool {
+    cells.iter().any(|c| c.triple.ends_with("-pc-windows-msvc"))
+}
+
+/// `targo --unverified run -q -p aterm-win32-oracle --target-dir
+/// <cells lane>/win32-oracle-bin -- <verb> --root <R>`, from `<R>`. The driver
+/// builds in the cells lane; the Windows builds it drives stay in the
+/// per-checkout directories the oracle defaults to, because the facades are
+/// path units a directory shared across checkouts could answer for. Both
+/// paths are absolute because the oracle's children run from other cwds.
+///
+/// # Errors
+/// The current-directory error from making a relative path absolute.
+pub fn win32_oracle_cmd(ctx: &Ctx, verb: &str) -> std::io::Result<Cmd> {
+    let root = std::path::absolute(&ctx.root)?;
+    let lane = std::path::absolute(
+        lane_dir(ctx, Lane::CellsTarget).unwrap_or_else(|| ctx.target_dir.clone()),
+    )?;
+    let mut cmd = Cmd::new(&ctx.tools.targo).args(
+        [
+            "--unverified",
+            "run",
+            "-q",
+            "-p",
+            "aterm-win32-oracle",
+            "--target-dir",
+        ]
+        .map(String::from)
+        .into_iter()
+        .chain([
+            lane.join("win32-oracle-bin").display().to_string(),
+            "--".to_string(),
+            verb.to_string(),
+            "--root".to_string(),
+            root.display().to_string(),
+        ]),
+    );
+    cmd.cwd = Some(root);
+    Ok(cmd)
+}
+
+/// The reason an oracle that decided nothing gives on its last
+/// `… could not run: <reason>` line.
+#[must_use]
+pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .find_map(|l| l.split_once(" could not run: ").map(|(_, why)| why.trim()))
+        .filter(|why| !why.is_empty())
+        .map(str::to_string)
+}
+
+/// One row per [`WIN32_ORACLES`] verb. The oracle's exit is read as the libc
+/// oracle's: 0 passes, 1 is a finding, 3 or a signal decided nothing.
+fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
+    for (verb, holds) in WIN32_ORACLES {
+        let label = format!("win32 {verb} ({holds}; x86_64 and aarch64 pc-windows-msvc)");
+        if !ctx.tools.have_targo() {
+            r.skip(format!("{label} — no targo to build the driver"));
+            continue;
+        }
+        if !have_rustup {
+            r.skip(format!(
+                "{label} — no rustup {} (fix: {}, with stable's x86_64-pc-windows-msvc and \
+                 aarch64-pc-windows-msvc stds)",
+                rustup::RUSTUP_LOOKED,
+                aterm_uds::host::tool("rustup").remedy()
+            ));
+            continue;
+        }
+        let cmd = match win32_oracle_cmd(ctx, verb) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                r.cannot_run(format!("{label} — cannot resolve the checkout: {error}"));
+                continue;
+            }
+        };
+        let started = Instant::now();
+        let out = exec::run(&cmd, ctx.exec_env());
+        r.raw(out.output.as_str());
+        r.raw(format!("win32 {verb}: {}s", started.elapsed().as_secs()));
+        let outcome = crate::stages::libc_oracle_outcome(&out);
+        let why = if outcome == Outcome::Fail(Severity::CouldNotRun) {
+            out.environment_failure()
+                .or_else(|| win32_oracle_not_run_reason(&out.output))
+        } else {
+            None
+        };
+        match why {
+            Some(why) => r.cannot_run(format!("{label} — {why}")),
+            None => r.record_child(&out, outcome, label),
+        }
+    }
 }
 
 /// The `cshim` rows no cell of this run used: one naming a triple no forge
@@ -713,9 +835,7 @@ fn check_cell(
         Err(e) => return could_not("NO-TOOLCHAIN", vec![e]),
     };
 
-    let target_dir = lane_dir(ctx, Lane::CellsTarget)
-        .unwrap_or_else(|| ctx.state_dir().join("cells"))
-        .join(&cell.name);
+    let target_dir = crate::plan::cells_dir(ctx).join(&cell.name);
     let cwd = ctx.scratch.join(format!("cells-{}", cell.name));
     if let Err(e) = std::fs::create_dir_all(&cwd) {
         return could_not(
@@ -2050,10 +2170,93 @@ mod tests {
             };
             (get("CARGO_TARGET_DIR"), get("CARGO_BUILD_JOBS"))
         };
-        let dir = Some("/repo/target/verify/cells/win".to_string());
+        let dir = Some("/repo/target/verify/cells.noindex/win".to_string());
         assert_eq!(env_of(None), (dir.clone(), Some("4".to_string())));
         assert_eq!(env_of(Some("2")), (dir.clone(), Some("2".to_string())));
         assert_eq!(env_of(Some("16")), (dir, Some("4".to_string())));
+    }
+
+    /// Either Windows cell brings both windows-sys oracles, once each; a run
+    /// with no Windows cell runs neither. The driver builds in the cells
+    /// lane, and the oracle is told the checkout it holds.
+    #[test]
+    fn a_windows_cell_brings_both_windows_sys_oracles_built_in_the_cells_lane() {
+        let all = aterm_forge::resolve::default_cells();
+        let pick = |names: &[&str]| {
+            aterm_forge::resolve::select(
+                &all,
+                &names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>(),
+            )
+            .expect("forge cells")
+        };
+        assert!(runs_win32_oracles(&pick(&["win"])));
+        assert!(runs_win32_oracles(&pick(&["win-arm"])));
+        assert!(runs_win32_oracles(&pick(&["linux-arm", "win", "win-arm"])));
+        assert!(!runs_win32_oracles(&pick(&[
+            "linux-arm",
+            "wasm-cpu",
+            "mac-x64"
+        ])));
+        assert!(runs_win32_oracles(&foreign_cells()), "the default run");
+        assert_eq!(
+            WIN32_ORACLES.map(|(verb, _)| verb),
+            ["oracle", "oracle-052"]
+        );
+
+        let ctx = Ctx::new(
+            PathBuf::from("/repo"),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        );
+        let cmd = win32_oracle_cmd(&ctx, "oracle-052").expect("absolute paths");
+        let argv = cmd.argv();
+        assert_eq!(
+            argv[1..],
+            [
+                "--unverified",
+                "run",
+                "-q",
+                "-p",
+                "aterm-win32-oracle",
+                "--target-dir",
+                "/repo/target/verify/cells.noindex/win32-oracle-bin",
+                "--",
+                "oracle-052",
+                "--root",
+                "/repo",
+            ]
+        );
+        assert_eq!(cmd.cwd.as_deref(), Some(Path::new("/repo")));
+        assert!(
+            !cmd.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),
+            "the oracle's own Windows builds keep their per-checkout directories"
+        );
+    }
+
+    /// An oracle that decided nothing says why on its last `could not run`
+    /// line, which becomes the row's reason; a finding's output has none.
+    #[test]
+    fn a_win32_oracle_that_could_not_run_names_its_reason() {
+        assert_eq!(
+            win32_oracle_not_run_reason(
+                "== x86_64-pc-windows-msvc\nwin32 oracle could not run: no cached \
+                 windows-sys0.61.2; use --upstream\n"
+            )
+            .as_deref(),
+            Some("no cached windows-sys0.61.2; use --upstream")
+        );
+        assert_eq!(
+            win32_oracle_not_run_reason(
+                "windows-sys 0.52 oracle could not run: stock cargo failed\n"
+            )
+            .as_deref(),
+            Some("stock cargo failed")
+        );
+        assert_eq!(
+            win32_oracle_not_run_reason("  FAIL plant-dll was not caught\nwin32 oracle: FAIL\n"),
+            None
+        );
     }
 
     #[test]

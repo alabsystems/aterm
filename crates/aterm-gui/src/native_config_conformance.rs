@@ -808,6 +808,7 @@ fn installed_custom_kitty_projection(
                 look: aterm_effects::kitty_registry::KittyLook::default(),
                 colors: aterm_effects::cat_baker::CatColorKey::default(),
                 bob: 0.0,
+                lift: 0.0,
                 alpha: 255,
                 pose: aterm_effects::kitty_cursor::CatPose::STILL,
                 sing: 0.0,

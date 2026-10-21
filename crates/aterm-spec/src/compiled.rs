@@ -67,6 +67,74 @@ enum Node {
     FnValued,
     /// A `lo..hi` set in a scalar position (`eval` panics).
     SetValued,
+    /// `Gt`/`Le`/`Eq`/`Neq` of two atoms: one step where the tree takes three.
+    Cmp(Cmp, Atom, Atom),
+    /// `Add`/`Sub` of two atoms, wrapping as `eval`'s.
+    Arith(Arith, Atom, Atom),
+}
+
+/// An integer operand that reads without evaluating anything: a constant, a state variable,
+/// a `\A` index. Reading one can neither panic nor yield a `Bool`, so an operation over two of
+/// them is `eval`'s operation over two `Int`s, in one step.
+#[derive(Debug, Clone, Copy)]
+enum Atom {
+    Int(i64),
+    Slot(usize),
+    Local(usize),
+}
+
+impl Atom {
+    /// What `node` reads, when it is an atom.
+    fn of(node: &Node) -> Option<Self> {
+        match node {
+            Node::Int(i) => Some(Atom::Int(*i)),
+            Node::Slot(i) => Some(Atom::Slot(*i)),
+            Node::Local(d) => Some(Atom::Local(*d)),
+            _ => None,
+        }
+    }
+
+    fn read(self, s: &[i64], locals: &[i64]) -> i64 {
+        match self {
+            Atom::Int(i) => i,
+            Atom::Slot(i) => s[i],
+            Atom::Local(d) => locals[d],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Cmp {
+    Gt,
+    Le,
+    Eq,
+    Neq,
+}
+
+impl Cmp {
+    fn holds(self, a: i64, b: i64) -> bool {
+        match self {
+            Cmp::Gt => a > b,
+            Cmp::Le => a <= b,
+            Cmp::Eq => a == b,
+            Cmp::Neq => a != b,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Arith {
+    Add,
+    Sub,
+}
+
+impl Arith {
+    fn apply(self, a: i64, b: i64) -> i64 {
+        match self {
+            Arith::Add => a.wrapping_add(b),
+            Arith::Sub => a.wrapping_sub(b),
+        }
+    }
 }
 
 impl Node {
@@ -135,6 +203,8 @@ impl Node {
                 "InRange (`lo..hi`) is set-valued; it is meaningful only as a nondeterministic \
                  update RHS — fire the action via `Model::successors`, not scalar `eval`"
             ),
+            Node::Cmp(op, a, b) => Value::Bool(op.holds(a.read(s, locals), b.read(s, locals))),
+            Node::Arith(op, a, b) => Value::Int(op.apply(a.read(s, locals), b.read(s, locals))),
         }
     }
 }
@@ -179,6 +249,33 @@ impl Scope<'_> {
         let two = |a: &Expr, b: &Expr, bound: &mut Vec<&'static str>| {
             (Box::new(self.node(a, bound)), Box::new(self.node(b, bound)))
         };
+        // An operation over two atoms is one node, and over two constants its value: neither
+        // reads anything that can panic, so `eval`'s order and laziness have nothing to keep.
+        let fused = |a: &Node, b: &Node| Atom::of(a).zip(Atom::of(b));
+        let cmp = |op: Cmp,
+                   a: &Expr,
+                   b: &Expr,
+                   bound: &mut Vec<&'static str>,
+                   tree: fn(Box<Node>, Box<Node>) -> Node| {
+            let (a, b) = two(a, b, bound);
+            match fused(&a, &b) {
+                Some((Atom::Int(x), Atom::Int(y))) => Node::Bool(op.holds(x, y)),
+                Some((x, y)) => Node::Cmp(op, x, y),
+                None => tree(a, b),
+            }
+        };
+        let arith = |op: Arith,
+                     a: &Expr,
+                     b: &Expr,
+                     bound: &mut Vec<&'static str>,
+                     tree: fn(Box<Node>, Box<Node>) -> Node| {
+            let (a, b) = two(a, b, bound);
+            match fused(&a, &b) {
+                Some((Atom::Int(x), Atom::Int(y))) => Node::Int(op.apply(x, y)),
+                Some((x, y)) => Node::Arith(op, x, y),
+                None => tree(a, b),
+            }
+        };
         match e {
             Expr::Int(i) => Node::Int(*i),
             Expr::Bool(b) => Node::Bool(*b),
@@ -193,30 +290,12 @@ impl Scope<'_> {
                     Node::Unbound(n)
                 }
             }
-            Expr::Add(a, b) => {
-                let (a, b) = two(a, b, bound);
-                Node::Add(a, b)
-            }
-            Expr::Sub(a, b) => {
-                let (a, b) = two(a, b, bound);
-                Node::Sub(a, b)
-            }
-            Expr::Gt(a, b) => {
-                let (a, b) = two(a, b, bound);
-                Node::Gt(a, b)
-            }
-            Expr::Le(a, b) => {
-                let (a, b) = two(a, b, bound);
-                Node::Le(a, b)
-            }
-            Expr::Eq(a, b) => {
-                let (a, b) = two(a, b, bound);
-                Node::Eq(a, b)
-            }
-            Expr::Neq(a, b) => {
-                let (a, b) = two(a, b, bound);
-                Node::Neq(a, b)
-            }
+            Expr::Add(a, b) => arith(Arith::Add, a, b, bound, Node::Add),
+            Expr::Sub(a, b) => arith(Arith::Sub, a, b, bound, Node::Sub),
+            Expr::Gt(a, b) => cmp(Cmp::Gt, a, b, bound, Node::Gt),
+            Expr::Le(a, b) => cmp(Cmp::Le, a, b, bound, Node::Le),
+            Expr::Eq(a, b) => cmp(Cmp::Eq, a, b, bound, Node::Eq),
+            Expr::Neq(a, b) => cmp(Cmp::Neq, a, b, bound, Node::Neq),
             Expr::Or(a, b) => {
                 let (a, b) = two(a, b, bound);
                 Node::Or(a, b)

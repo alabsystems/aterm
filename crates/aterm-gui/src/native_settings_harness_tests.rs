@@ -26,7 +26,7 @@ mod every;
 /// session on Land by its own word, a reading of the ledgers and a later one
 /// that failed, A/B time in every arm, and a policy that writes `approve =
 /// "safe"`.
-fn fixture() -> HarnessState {
+pub(super) fn fixture() -> HarnessState {
     let mut today = HarnessStats::new(0);
     today.approved = 3;
     today.answered = 1;
@@ -57,6 +57,7 @@ fn fixture() -> HarnessState {
             supervised: true,
             glass: crate::claude_lights::ChipGlass::default(),
             armed_at_ms: None,
+            set_by: None,
         }],
         stats: HarnessStatsSlot {
             report: Some(std::sync::Arc::new(HarnessStatsReport::new(
@@ -92,7 +93,7 @@ fn ab_week() -> AbWeek {
     week.arms[AbArm::Land.index()] = AbArmTotals {
         busy_ms: 60_000,
         at_prompt_ms: 3_540_000,
-        finished_ms: 3_000_000,
+        landed_ms: 3_000_000,
         ..AbArmTotals::default()
     };
     week.arms[AbArm::Off.index()] = AbArmTotals {
@@ -136,7 +137,6 @@ fn fixture_led(both: bool) -> HarnessState {
         AbArmTotals::default()
     };
     week.ends.landed = 5;
-    week.ends.quiet = 1;
     week.ends.landing[crate::harness_ab::bucket(6 * 60_000)] = 5;
     state.ab = week;
     state
@@ -297,13 +297,16 @@ fn the_harness_route_renders_its_cards_and_controls() {
         rows.contains(&prefs::EDIT_HARNESS_QUESTION_PRIORITY),
         "{rows:?}"
     );
-    // The session: its title and detail whole in the row's semantics, and
-    // the three buttons, Land selected; the default's (Cruise) says a press
-    // follows the default.
+    // The session: its title and detail whole in the row's semantics, its
+    // setting line under it, and the three buttons, Land selected; the
+    // default's (Cruise) says a press follows the default.
     assert_eq!(
         node(&pages, "harness/session/7").label,
-        "fix the build: Tab 2 \u{b7} Claude Code \u{b7} supervised \u{b7} autopilot land \
-         \u{b7} its own setting"
+        "fix the build: Tab 2 \u{b7} Claude Code \u{b7} supervised \u{b7} autopilot land"
+    );
+    assert_eq!(
+        node(&pages, "harness/session/7/setting").label,
+        "its own setting"
     );
     for (word, selected, default) in [
         ("cruise", false, true),
@@ -365,12 +368,9 @@ fn the_harness_route_renders_its_cards_and_controls() {
         ("held", "Held: 0% of working time on Cruise \u{b7} 2% off"),
         (
             "at-its-prompt",
-            "At its prompt: Cruise 3% of 1m: finished 0%, pausing 0% \u{b7} Off 40% of 1m",
+            "At its prompt: Cruise 3% of 1m: pausing 0% \u{b7} Off 40% of 1m",
         ),
-        (
-            "land",
-            "Land: held 0% \u{b7} at its prompt 98%, finished 83%",
-        ),
+        ("land", "Land: held 0% \u{b7} at its prompt 98%, landed 83%"),
         (
             "unsupervised",
             "Unsupervised: at its prompt 50% of 1m, in no comparison",
@@ -1035,6 +1035,260 @@ fn the_harness_route_is_whole_on_every_host() {
     });
 }
 
+/// The words the paint node `key` draws, on whichever page draws it: its
+/// text, or the lines of a text wrapped to its column (`<key>/line-<n>`),
+/// joined again.
+fn painted_text(pages: &[crate::native_ui::CompiledUi], key: &str) -> String {
+    let node = pages
+        .iter()
+        .find_map(|page| page.paint.iter().find(|n| n.key.as_str() == key))
+        .unwrap_or_else(|| panic!("{key} is painted on no page"));
+    if let crate::native_ui::UiContent::Text(text) = &node.content {
+        return text.text.clone();
+    }
+    // Its lines, from whichever pages draw them (a list's edge may part
+    // them), each once, in order.
+    let lines = pages
+        .iter()
+        .flat_map(|page| page.paint.iter())
+        .filter(|n| {
+            n.key
+                .as_str()
+                .strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix("/line-"))
+                .is_some_and(|index| index.parse::<usize>().is_ok())
+        })
+        .filter_map(|n| match &n.content {
+            crate::native_ui::UiContent::Text(text) => {
+                Some((n.key.as_str().to_string(), text.text.clone()))
+            }
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut lines = lines.into_iter().collect::<Vec<_>>();
+    lines.sort_by_key(|(key, _)| {
+        key.rsplit_once("/line-")
+            .and_then(|(_, index)| index.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    let lines = lines.into_iter().map(|(_, text)| text).collect::<Vec<_>>();
+    painted_words(&lines.join("\n"))
+}
+
+/// WHOSE WORD IT RUNS UNDER, ON A LINE OF ITS OWN (design §11.7.1,
+/// §11.7.7): a SESSIONS row with the longest setter's words — the Every
+/// session row's, set more than a year back so its date names the year —
+/// says `its own setting, set 4 Oct 2024 14:05 from Settings ▸ Harness,
+/// every session` on the line under it (`harness/session/<id>/setting`),
+/// its detail no longer carrying `its own setting`. On every host — the
+/// page's default, the narrow ones and the 80 × 24 window's page — at 1×
+/// and 2× text the line's label is the words whole (what a screen reader
+/// hears), and what it paints is the words whole, on as many lines as the
+/// column needs (once cut after a comma with an ellipsis); no text
+/// overflows, nothing is clipped, every hit target material. CONTROL: on the
+/// narrowest host at 2× the painted words take more than one line — the row
+/// wraps them where it used to cut them.
+#[test]
+fn a_rows_setting_line_is_whole_in_its_label_on_every_host() {
+    use crate::autopilot::{SetByWords, Surface};
+    let mut state = fixture();
+    state.today = 20_400;
+    state.sessions[0].set_by = Some(SetByWords {
+        by: Surface::EverySession.phrase().to_string(),
+        at: Some(crate::harness_glass::Stamp {
+            clock: crate::claude_lights::Clock::of_minute(14 * 60 + 5),
+            day: 20_000,
+        }),
+    });
+    let row = state.projection().sessions[0].clone();
+    let words =
+        "its own setting, set 4 Oct 2024 14:05 from Settings \u{25b8} Harness, every session";
+    assert_eq!(row.setting, words);
+    assert_eq!(
+        row.detail,
+        "Tab 2 \u{b7} Claude Code \u{b7} supervised \u{b7} autopilot land"
+    );
+    let cut = std::sync::atomic::AtomicBool::new(false);
+    at_each_text_scale(&[1.0, 2.0], "the setting line", |scale| {
+        let (mut runtime, instance, view) = harness_route(state.clone());
+        for (width, height) in [
+            (1_200.0, 820.0),
+            (320.0, 348.0),
+            (320.0, 568.0),
+            (584.0, 348.0),
+            (744.0, 420.0),
+            (849.0, 513.0),
+        ] {
+            let cx = view_cx_at(width, height);
+            let pages = every_page(&mut runtime, instance, view, &cx);
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            assert_eq!(
+                node(&pages, "harness/session/7/setting").label,
+                words,
+                "{context}: the label is the words whole"
+            );
+            let shown = painted_text(&pages, "harness/session/7/setting/text");
+            if pages.iter().any(|page| {
+                page.paint
+                    .iter()
+                    .any(|n| n.key.as_str() == "harness/session/7/setting/text/line-1")
+            }) {
+                cut.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            assert_eq!(shown, words, "{context}: the painted words are whole");
+            for (page, compiled) in pages.iter().enumerate() {
+                let context = format!("{context} page {page}");
+                compiled
+                    .validate_parity()
+                    .unwrap_or_else(|error| panic!("{context}: {error:?}"));
+                let failures: Vec<String> = compiled
+                    .fit_failures()
+                    .into_iter()
+                    .filter(|line| !line.contains("key=\"settings/nav/"))
+                    .collect();
+                assert!(
+                    failures.is_empty(),
+                    "{context}: text overflow or clip:\n{}",
+                    failures.join("\n")
+                );
+                assert_all_hits_material_and_contained(compiled, &context);
+            }
+        }
+    });
+    assert!(
+        cut.load(std::sync::atomic::Ordering::Relaxed),
+        "control: the painted words wrap somewhere"
+    );
+}
+
+/// A STACKED ROW'S FLOW COUNTS ITS SETTING LINE (design §10.3.4, §11.7.7):
+/// on short hosts at 2× text, a stacked SESSIONS row with its setting, state
+/// and day lines takes only as many lines of buttons as let the whole row
+/// fit one card of the page — its faces cut, their labels whole, where it
+/// must — so some page shows the row whole wherever a shorter flow could
+/// (on the shortest hosts not even one line of buttons lets it fit), and no
+/// text overflows: every height from the 80 × 24 window's page to a tall
+/// phone page, on the phone's width and the narrow window's.
+/// NEGATIVE CONTROL: a flow measured without the setting line takes a line
+/// of buttons too many, and the row is cut at the foot of every page on
+/// 424–452 pt tall hosts.
+#[test]
+fn a_stacked_rows_flow_counts_its_setting_line() {
+    use crate::harness_glass::Stamp;
+    use aterm_agent::harness::acts::Act;
+    let mut state = fixture_with_a_day(true);
+    state.sessions[0].glass.last = Some((
+        Act::Approved,
+        Stamp {
+            clock: crate::claude_lights::Clock::of_minute(14 * 60 + 5),
+            day: 0,
+        },
+    ));
+    state.sessions[0].set_by = Some(crate::autopilot::SetByWords {
+        by: crate::autopilot::Surface::Menu.phrase().to_string(),
+        at: Some(Stamp {
+            clock: crate::claude_lights::Clock::of_minute(14 * 60 + 5),
+            day: 0,
+        }),
+    });
+    let row = state.projection().sessions[0].clone();
+    assert!(
+        row.state_line().is_some() && row.day_line.is_some(),
+        "{row:?}"
+    );
+    // Every host, dealt round-robin to EIGHT runtimes, each on a thread of
+    // its own at 2x text: a host's pages are its own. In one runtime the
+    // sweep was the binary's last test to finish, 31 to 69 s after it
+    // started; alone it took 13 to 38 s, and eight take 2.1 to 3.9 s for
+    // some 30% more CPU (12 to 17 CPU-s against 15 to 23; 2026-10-20).
+    const RUNTIMES: usize = 8;
+    let hosts: Vec<(f32, f32)> = [320.0, 584.0]
+        .into_iter()
+        .flat_map(|width| {
+            (300..=760)
+                .step_by(4)
+                .map(move |height| (width, f32::from(u16::try_from(height).expect("small"))))
+        })
+        .collect();
+    let dealt = std::sync::atomic::AtomicUsize::new(0);
+    at_each_text_scale(&[2.0; RUNTIMES], "the stacked row's flow", |scale| {
+        let hand = dealt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (mut runtime, instance, view) = harness_route(state.clone());
+        for &(width, height) in hosts.iter().skip(hand).step_by(RUNTIMES) {
+            let cx = view_cx_at(width, height);
+            let pages = every_page(&mut runtime, instance, view, &cx);
+            assert!(
+                pages.iter().all(|page| page
+                    .semantic(&UiKey::new("harness/session/7/head"))
+                    .is_none()),
+                "{width}: stacked"
+            );
+            // Each row's block is seen whole on some page — all but its
+            // own bottom inset, which the card's padding may take — unless
+            // its buttons are already on one line, the shortest flow there
+            // is: a row taller than the page's room is cut at the foot of
+            // every page.
+            let blocks: std::collections::BTreeSet<&str> = pages
+                .iter()
+                .flat_map(|page| page.paint.iter())
+                .map(|paint| paint.key.as_str())
+                .filter(|key| key.starts_with("harness/session/") && key.ends_with("/block"))
+                .collect();
+            assert!(
+                blocks.contains("harness/session/7/block"),
+                "{width}\u{d7}{height}: {blocks:?}"
+            );
+            let inset = crate::native_settings::harness_page::CARD_GAP / 2.0;
+            for block in blocks {
+                let row = block.trim_end_matches("block");
+                let button_lines = pages
+                    .iter()
+                    .map(|page| {
+                        page.semantics
+                            .iter()
+                            .filter(|node| {
+                                node.key.as_str().starts_with(row)
+                                    && node.role == SemanticRole::Button
+                            })
+                            .map(|node| node.rect.y.round().to_bits())
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let whole = pages
+                    .iter()
+                    .flat_map(|page| page.paint.iter())
+                    .any(|paint| {
+                        paint.key.as_str() == block
+                            && paint.clip.y <= paint.rect.y + 1.0
+                            && paint.clip.y + paint.clip.height
+                                >= paint.rect.y + paint.rect.height - inset - 1.0
+                    });
+                assert!(
+                    whole || button_lines <= 1,
+                    "{scale}\u{d7} {width}\u{d7}{height}: {block}, its buttons on \
+                     {button_lines} lines, is whole on no page"
+                );
+            }
+            for (page, compiled) in pages.iter().enumerate() {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height} page {page}");
+                let failures: Vec<String> = compiled
+                    .fit_failures()
+                    .into_iter()
+                    .filter(|line| !line.contains("key=\"settings/nav/"))
+                    .collect();
+                assert!(
+                    failures.is_empty(),
+                    "{context}: text overflow or clip:\n{}",
+                    failures.join("\n")
+                );
+                assert_all_hits_material_and_contained(compiled, &context);
+            }
+        }
+    });
+}
+
 /// THE DEFAULT AUTOPILOT is a short choice, so it is drawn as segments in
 /// its row on the page (no page-wide picker) — on whichever page its row
 /// falls, under one switch per supervised agent — and a segment saves its
@@ -1500,8 +1754,8 @@ fn painted<'a>(
 /// §10.3.3 item 6): on the 80 × 24 window's page (584 × 348) and the shipped
 /// 744 × 420, at 1× and 2× text, page 0 holds SESSIONS' heading. Today's
 /// lines take what the first screen has left: Hero type where it has the
-/// room (744 × 420, at 1× and 2×), the page's plain type where it has not
-/// (584 × 348 at 1×), and at 2× on the short page, none (WHAT THE HARNESS DID still says
+/// room (744 × 420, at 1× and 2×; 584 × 348 at 1×, its toolbar naming the
+/// page), and at 2× on the short page, none (WHAT THE HARNESS DID still says
 /// every count today) — under macOS's UI face; Windows' measures leave that page
 /// the room for the plain type. Linux's UI face is the host's, Noto Sans on a stock
 /// desktop, wider than both: at 2× its Hero line (716pt in Noto Sans SemiBold, 730pt
@@ -1520,7 +1774,7 @@ fn sessions_stays_on_the_first_screen_under_todays_lines() {
     let first = "3 approved today \u{b7} 1 answered";
     // The last column: on Linux the host's face decides between Hero and plain.
     for (scale, width, height, want, face_decides) in [
-        (1.0, 584.0, 348.0, Some(StyleRef::Primary), false),
+        (1.0, 584.0, 348.0, Some(StyleRef::Hero), false),
         (1.0, 744.0, 420.0, Some(StyleRef::Hero), false),
         (1.0, 849.0, 900.0, Some(StyleRef::Hero), false),
         (
@@ -1583,8 +1837,9 @@ fn sessions_stays_on_the_first_screen_under_todays_lines() {
 /// Hero type and the second line where the budget holds both; plain type
 /// first where it does not, or where the Hero line is not whole at the
 /// width; then the second line goes; then the block. A plain line too wide
-/// is cut at a ` · ` joint, never inside a family. NEGATIVE CONTROL: the
-/// label keeps both lines whole whatever is drawn.
+/// for one line is whole on as many lines as the width needs (it was cut at
+/// a ` · ` joint, and a note with none, "nothing y…", inside a word).
+/// NEGATIVE CONTROL: the label keeps both lines whole whatever is drawn.
 #[test]
 fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
     use crate::native_settings::harness_page::today_block;
@@ -1593,6 +1848,8 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
         "37 approved today \u{b7} 12 kept going \u{b7} 4 answered".to_string(),
         "2 resumed \u{b7} 1 land prompt \u{b7} waited on you 4m".to_string(),
     );
+    // Each line's style and words: a text, or a line wrapped to the width
+    // (its lines joined again).
     let drawn = |block: &Option<(UiNode, f32)>| -> Vec<(StyleRef, String)> {
         block
             .as_ref()
@@ -1601,6 +1858,18 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
                     .iter()
                     .map(|child| match &child.content {
                         UiContent::Text(text) => (text.style, text.text.clone()),
+                        UiContent::Group(group) => (
+                            group.style,
+                            child
+                                .children
+                                .iter()
+                                .map(|line| match &line.content {
+                                    UiContent::Text(text) => text.text.clone(),
+                                    other => panic!("a line: {other:?}"),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
                         other => panic!("a text: {other:?}"),
                     })
                     .collect()
@@ -1635,20 +1904,33 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
             [(StyleRef::Primary, lines.0.clone())]
         );
         assert!(today_block(&lines, 1_000.0, 20.0).is_none());
-        // Narrow: no Hero line that is not whole; a plain line cut at a joint.
-        let narrow = drawn(&today_block(&lines, 200.0, 400.0));
-        assert_eq!(narrow[0].0, StyleRef::Primary, "{narrow:?}");
-        for (_, text) in &narrow {
-            assert!(
-                lines.0.starts_with(text.as_str()) || lines.1.starts_with(text.as_str()),
-                "{text:?} is a head of its line"
-            );
-            assert!(
-                !text.ends_with(" \u{b7}") && !text.ends_with('\u{2026}'),
-                "{text:?} is cut at a joint"
-            );
-        }
-        assert!(narrow[0].1.len() < lines.0.len(), "cut: {narrow:?}");
+        // Narrow: no Hero line that is not whole; each plain line whole, on
+        // more lines than one.
+        let block = today_block(&lines, 200.0, 400.0);
+        assert_eq!(
+            drawn(&block),
+            [
+                (StyleRef::Primary, lines.0.clone()),
+                (StyleRef::Primary, lines.1.clone())
+            ]
+        );
+        assert!(
+            block.as_ref().is_some_and(|(node, _)| node
+                .children
+                .iter()
+                .all(|line| matches!(line.content, UiContent::Group(_)))),
+            "wrapped"
+        );
+        // A note with no joint, narrower than itself: whole on lines (it read
+        // "nothing y…" at 2× on a 24-column page).
+        let note = (
+            crate::harness_screen::TODAY_NOTHING_YET.to_string(),
+            String::new(),
+        );
+        assert_eq!(
+            drawn(&today_block(&note, 60.0, 400.0)),
+            [(StyleRef::Primary, note.0.clone())]
+        );
         let label = today_block(&lines, 200.0, 400.0).map(|(node, _)| match node.content {
             UiContent::Group(group) => group.label.unwrap_or_default(),
             other => panic!("a group: {other:?}"),
@@ -1747,9 +2029,16 @@ fn todays_notes_are_drawn_in_the_pages_plain_type() {
             let (_, plain) = drawn("3 approved today", 1_000.0, short);
             assert_eq!(drawn(note, 1_000.0, short).1, plain, "{note}: short");
             assert!(plain < hero_height, "{note}: {plain} under {hero_height}");
-            // Too narrow for Hero type: a plain line's height (the counts go
-            // plain there too).
-            assert_eq!(drawn(note, 40.0, 400.0).1, plain, "{note}: narrow");
+            // Too narrow for Hero type, wide enough for a plain line: a plain
+            // line's height (the counts go plain there too).
+            let (px, face) =
+                crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+            let narrow = crate::tray_raster::ui_text_width_for(face, note, px) + 1.0;
+            assert!(
+                !fits_in_hero(note, narrow),
+                "{note}: Hero type is wider than {narrow}"
+            );
+            assert_eq!(drawn(note, narrow, 400.0).1, plain, "{note}: narrow");
         }
         let context = format!("{scale}\u{d7}");
         let (style, before) = sessions_at(reading());
@@ -1776,6 +2065,12 @@ fn todays_notes_are_drawn_in_the_pages_plain_type() {
             "{context}: SESSIONS stands where it stood as the counts come"
         );
     });
+}
+
+/// Whether `text` is one line of Hero type in `width`.
+fn fits_in_hero(text: &str, width: f32) -> bool {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Hero);
+    crate::tray_raster::ui_text_width_for(face, text, px) <= width
 }
 
 /// A fixture whose session 7 has a day of its own today, and a second row
@@ -2047,9 +2342,10 @@ fn a_landed_rows_card_holds_its_whole_block_clear_of_its_words() {
 }
 
 /// THE LANDING DRAWS ALL OF THE BLOCK IT SELECTS (the review of
-/// v3/polish-page's fixes, finding 2): `⚙` lands Settings ▸ Harness on a
-/// SESSIONS row and draws its whole block — the row, its state, its day, its
-/// open timer — on the accent, so the page scrolls until all of that block
+/// v3/polish-page's fixes, finding 2): the Autopilot menu's `Harness settings…`
+/// lands Settings ▸ Harness on a SESSIONS row and draws its whole block —
+/// the row, its state, its day, its open timer — on the accent, so the page
+/// scrolls until all of that block
 /// is whole in the list's room (live, not cut by its edge nor a fading
 /// picture in the strip kept for a status bar) wherever the room holds it,
 /// and to the block's top where it is taller than the list: on the 80 × 24
@@ -2148,6 +2444,401 @@ fn a_landing_draws_all_of_the_block_it_selects() {
     );
 }
 
+/// THE LANDING DRAWS ALL OF A BLOCK THAT HEADS A CONTINUED CARD (the
+/// post-landing check's behaviour-1): at 2× text on the lab's narrow page
+/// (504 × 628 pt, and a few heights about it), three sessions each under
+/// an `18:00` timer, the Autopilot menu's `Harness settings…` lands on
+/// each row with its Timer open. Where the
+/// row heads `SESSIONS · CONTINUED`, its block fits the list's room but not
+/// under the card's caption kept whole over it (the block and the caption's
+/// lead together are taller than the room); the landing then seats the list
+/// past the caption, which scrolls off whole, and draws all of the block,
+/// live — wherever the block is no taller than the room; and the seat holds
+/// through a republish (another session's word changing, the page rendered
+/// again), the block where it was drawn. NEGATIVE CONTROLS: the landing by
+/// stops alone (`reveal_selected`, r2's) puts the block under the caption
+/// and the room's edge cuts its open Timer and its outline's bottom edge,
+/// and the 628 pt page fails; a seat past the caption never carried to the
+/// next render (`seat_fits` false for a bare seat) drops the block 43 pt
+/// under the caption again at the republish.
+#[test]
+fn a_landing_draws_all_of_a_block_that_heads_a_continued_card() {
+    use crate::native_app::SemanticInput;
+    let mut state = fixture_with_a_day(true);
+    let mut third = state.sessions[1].clone();
+    third.local_id = 9;
+    third.sid = "s-9".to_string();
+    third.place = "in tab 2".to_string();
+    state.sessions.push(third);
+    let mut policy = SupervisorConfig::default();
+    policy.set("land_at", "18:00").expect("a known key");
+    state.config = config_rows(&policy);
+    let at = crate::claude_lights::LandAtGlass {
+        clock: crate::claude_lights::Clock::of_minute(18 * 60),
+        other_day: None,
+    };
+    state.land_at_offer = Some(at);
+    for session in &mut state.sessions {
+        session.word = Some(Autopilot::Cruise);
+        session.view = AutopilotView::Cruise;
+        session.armed_at_ms = Some(1_792_173_600_000);
+        session.glass.land_at = Some(at);
+    }
+    let headed = std::sync::Mutex::new(0_usize);
+    at_each_text_scale(&[2.0], "the continued card's landed block", |scale| {
+        for height in [600.0, 628.0, 660.0] {
+            for id in [7_u64, 8, 9] {
+                let context = format!("{scale}\u{d7} 504\u{d7}{height}, session {id}");
+                let (mut runtime, instance, view) = harness_route(state.clone());
+                press_for_requests(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &format!("harness/session/{id}/timer"),
+                    None,
+                );
+                press_for_requests(
+                    &mut runtime,
+                    instance,
+                    view,
+                    crate::harness_screen::HARNESS_LAND,
+                    Some(SemanticInput::Text(format!("session/{id}"))),
+                );
+                let page =
+                    compile_settings_view(&runtime, instance, view, &view_cx_at(504.0, height));
+                let room = {
+                    let Some(AppViewState::Settings(settings)) = runtime.view_state(view) else {
+                        unreachable!()
+                    };
+                    settings.scroll_plan().expect("the page's list").room()
+                };
+                let key = format!("harness/session/{id}/block");
+                let block = painted(&page, &key)
+                    .unwrap_or_else(|| panic!("{context}: the landed block is drawn"));
+                {
+                    let Some(AppViewState::Settings(settings)) = runtime.view_state(view) else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        settings.harness_timer_open,
+                        Some(id),
+                        "{context}: its Timer is open"
+                    );
+                }
+                // The card the block is drawn in, and the caption's lead
+                // over it where the block heads that card.
+                let card = page
+                    .paint
+                    .iter()
+                    .filter(|n| {
+                        let k = n.key.as_str();
+                        k == "harness/sessions" || k.starts_with("harness/sessions/continued-")
+                    })
+                    .find(|n| {
+                        n.rect.y <= block.rect.y + 0.01
+                            && n.rect.y + n.rect.height >= block.rect.y + block.rect.height - 0.01
+                    })
+                    .unwrap_or_else(|| panic!("{context}: the block's card is drawn"));
+                let lead = block.rect.y - card.rect.y;
+                if card.key.as_str().starts_with("harness/sessions/continued-")
+                    && lead < 60.0
+                    && lead + block.rect.height > room + 0.01
+                    && block.rect.height <= room + 0.01
+                {
+                    *headed.lock().unwrap() += 1;
+                }
+                if block.rect.height <= room + 0.01 {
+                    assert!(
+                        block.clip == block.rect && !block.peek && block.fade.is_none(),
+                        "{context}: a block {:?} no taller than the room ({room}) is drawn \
+                         whole (drawn {:?}, peek={}, fade={:?}; its card {} {:?})",
+                        block.rect,
+                        block.clip,
+                        block.peek,
+                        block.fade,
+                        card.key.as_str(),
+                        card.rect
+                    );
+                }
+                // THE SEAT HOLDS THROUGH A REPUBLISH: the next event to the
+                // page lets the landing go (`settle_page_scroll`), so the
+                // list holds its place by the seat the landing chose; then
+                // another session's word changes (a background press, a
+                // done), the host publishes, and the page renders again —
+                // the landed block stays where it was drawn, as whole.
+                let (drawn, clip) = (block.rect, block.clip);
+                let focus = {
+                    let Some(AppViewState::Settings(settings)) = runtime.view_state(view) else {
+                        unreachable!()
+                    };
+                    settings.common.last_focus.clone()
+                };
+                runtime
+                    .dispatch(instance, view, AppEvent::FocusChanged(focus))
+                    .unwrap();
+                {
+                    let Some(AppViewState::Settings(settings)) = runtime.view_state(view) else {
+                        unreachable!()
+                    };
+                    assert!(
+                        settings.page_reveal.is_none(),
+                        "{context}: the landing let go once drawn"
+                    );
+                }
+                let mut moved = state.clone();
+                let other = moved
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.local_id != id)
+                    .expect("another session");
+                other.word = Some(Autopilot::Land);
+                other.view = AutopilotView::Land;
+                assert!(runtime.replace_settings_harness(moved, 2));
+                let again =
+                    compile_settings_view(&runtime, instance, view, &view_cx_at(504.0, height));
+                let block = painted(&again, &key)
+                    .unwrap_or_else(|| panic!("{context}: the landed block is drawn again"));
+                assert_eq!(
+                    (block.rect, block.clip),
+                    (drawn, clip),
+                    "{context}: the landed block holds its place through a republish"
+                );
+            }
+        }
+    });
+    assert!(
+        *headed.lock().unwrap() >= 1,
+        "some landed block heads a continued card, and with the caption's lead is taller than \
+         the room"
+    );
+}
+
+/// [`fixture_led`] with the long words the lab's book shows: STATUS's
+/// `Automatic, limited by 2 settings in aterm.toml`, four landings in Ends,
+/// and WHAT THE HARNESS DID's full set of rows with four-digit hours
+/// (`1123h 53m in 7 days`).
+fn fixture_long_facts() -> HarnessState {
+    let mut state = fixture_led(true);
+    state.words = "Automatic, limited by 2 settings in aterm.toml".to_string();
+    state.ab.ends.landed = 4;
+    let mut today = HarnessStats::new(0);
+    today.rows = 300;
+    today.escalated = 322;
+    today.human_wait_ms = 18 * 3_600_000 + 47 * 60_000;
+    let mut week = HarnessStats::new(0);
+    week.rows = 900;
+    week.approved = 41;
+    week.escalated = 799;
+    week.human_wait_ms = 1123 * 3_600_000 + 53 * 60_000;
+    state.stats.report = Some(std::sync::Arc::new(HarnessStatsReport::new(
+        today,
+        week,
+        1_000_000_000,
+        Some(0),
+        &|_| Some(0),
+    )));
+    state
+}
+
+/// The fact cards keyed by `cards` on `pages`, read as they paint: every
+/// label and every value line whole (no `…`), and each card's values at one
+/// x, which it returns by card.
+pub(super) fn fact_cards_whole<'a>(
+    pages: &[crate::native_ui::CompiledUi],
+    cards: &[&'a str],
+    context: &str,
+) -> std::collections::BTreeMap<&'a str, f32> {
+    fact_cards_read(pages, cards, true, context)
+}
+
+/// [`fact_cards_whole`], its values' lines held whole only where `values`
+/// says so (a value longer than [`MAX_METADATA_VALUE_LINES`] lines ends in
+/// `…` by design).
+pub(super) fn fact_cards_read<'a>(
+    pages: &[crate::native_ui::CompiledUi],
+    cards: &[&'a str],
+    values: bool,
+    context: &str,
+) -> std::collections::BTreeMap<&'a str, f32> {
+    use crate::native_ui::UiContent;
+    let mut labels = 0;
+    let mut value_x: std::collections::BTreeMap<&str, std::collections::BTreeSet<i64>> =
+        std::collections::BTreeMap::new();
+    for node in pages.iter().flat_map(|page| page.paint.iter()) {
+        let key = node.key.as_str();
+        let Some(card) = cards.iter().find(|card| key.starts_with(*card)) else {
+            continue;
+        };
+        let UiContent::Text(text) = &node.content else {
+            continue;
+        };
+        let label = key.starts_with(&format!("{card}label/"));
+        let value = key.starts_with(&format!("{card}value/"));
+        if (label || (value && values)) && !text.text.is_empty() {
+            assert!(
+                !text.text.contains('\u{2026}'),
+                "{context}: {key} paints {:?} whole",
+                text.text
+            );
+        }
+        if label && !text.text.is_empty() {
+            labels += 1;
+        }
+        if value && !key.contains("/line-") {
+            value_x
+                .entry(*card)
+                .or_default()
+                .insert((node.rect.x * 2.0).round() as i64);
+        }
+    }
+    assert!(
+        labels >= cards.len(),
+        "{context}: the cards' labels are drawn ({labels})"
+    );
+    assert_eq!(value_x.len(), cards.len(), "{context}: every card's values");
+    value_x
+        .into_iter()
+        .map(|(card, xs)| {
+            assert_eq!(xs.len(), 1, "{context}: one value column in {card}, {xs:?}");
+            (card, *xs.iter().next().expect("a value") as f32 / 2.0)
+        })
+        .collect()
+}
+
+/// THE FACT CARDS' LABELS ARE WHOLE AT LARGE TYPE, AND THEIR VALUES WRAP
+/// (the post-landing check's owner-eye-2 / behaviour-3, and its review):
+/// STATUS, EFFECT OF EACH AUTOPILOT and WHAT THE HARNESS DID size their
+/// label column from their own labels at the text scale now, as far as it
+/// leaves the values their widest word (`fact_label_width`), and a value too
+/// long for its column wraps between its words, each fact it lists starting
+/// a line (`metadata_value_lines`). So at 1×, 1.5× and 2× text, on the lab's
+/// 504 × 628 pt page (a 64 × 44 window), the 80 × 24 window's page, the
+/// shipped one, the lab's 924 pt one and a wide one, with the lab book's
+/// long words, every painted label (`Supervision`, `Waited at limits`,
+/// `Unsupervised`, …) and every value line (`Automatic, limited by 2
+/// settings in aterm.toml`) is whole. Each card's column is its own: its values
+/// start at one x, and STATUS's, sized from `Supervision`, starts left of
+/// WHAT THE HARNESS DID's, sized from its longer labels, wherever the text
+/// is larger than About's column holds. At 1× every column is About's (104
+/// pt). NEGATIVE CONTROLS: About's column (`about_metadata_label_width`,
+/// capped at 1.2×) paints `Supervi…` and `Waited on y…`; a column capped at
+/// two fifths of the card paints `Waited at li…` on the 504 pt page; a value
+/// wrapped at its ` · ` joints alone paints `Automatic, limited by 2 settings …`; one
+/// column over the three cards' labels puts STATUS's values at WHAT THE
+/// HARNESS DID's x.
+#[test]
+fn the_fact_cards_labels_are_whole_at_large_type() {
+    let state = fixture_long_facts();
+    at_each_text_scale(&[1.0, 1.5, 2.0], "the fact cards' labels", |scale| {
+        for (width, height) in [
+            (504.0, 628.0),
+            (584.0, 348.0),
+            (744.0, 420.0),
+            (924.0, 640.0),
+            (1_200.0, 820.0),
+        ] {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let (mut runtime, instance, view) = harness_route(state.clone());
+            let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, height));
+            let x_of = fact_cards_whole(
+                &pages,
+                &["harness/status/", "harness/ab/", "harness/did/"],
+                &context,
+            );
+            if scale > 1.2 {
+                assert!(
+                    x_of["harness/status/"] + 1.0 < x_of["harness/did/"],
+                    "{context}: STATUS's column is its own, {x_of:?}"
+                );
+            }
+            if (scale - 1.0).abs() < 0.01 {
+                assert!(
+                    x_of.values()
+                        .all(|x| (x - x_of["harness/status/"]).abs() < 0.01),
+                    "{context}: About's column in every card at 1\u{d7}, {x_of:?}"
+                );
+                let x = x_of["harness/status/"];
+                let label = pages
+                    .iter()
+                    .flat_map(|page| page.paint.iter())
+                    .find(|n| n.key.as_str().starts_with("harness/status/label/"))
+                    .expect("a STATUS label")
+                    .rect;
+                assert!(
+                    (x - label.x - 104.0 - 10.0).abs() < 0.5,
+                    "{context}: About's column at 1\u{d7}, {label:?} then {x}"
+                );
+            }
+        }
+    });
+}
+
+/// TAB CONTROL'S SUMMARY KEEPS ITS LABELS WHOLE AT LARGE TYPE (the review
+/// of the post-landing check's page fixes): FLEET & TAB SUMMARY sizes its
+/// label column as Settings ▸ Harness's fact cards do (`fact_label_width`),
+/// so at 2× text on the 504 pt page and a wide one `Computers`, `System
+/// Vitals` and `Live Monitor` are whole, and on the wide one this Mac's
+/// vitals wrap whole (on the narrow one at 2× they take more than the
+/// value's eight lines). NEGATIVE CONTROL: About's column paints `Comput…`,
+/// `System …` and `Live Mo…`.
+#[test]
+fn tab_controls_summary_keeps_its_labels_whole_at_large_type() {
+    use crate::harness_screen::{TabComputer, TabControlState};
+    use crate::native_app::HarnessRequest;
+    let mut state = fixture();
+    state.tabs = TabControlState {
+        computers: vec![TabComputer {
+            id: "local".to_string(),
+            name: "MacBook-Pro (this Mac)".to_string(),
+            address: "local".to_string(),
+            os_version: "macos".to_string(),
+            status: "online".to_string(),
+            vitals: "CPU 14% \u{b7} GPU 6% \u{b7} RAM 38.2/128.0 GiB (30%) \u{b7} Disk 1.12/7.28 \
+                     TiB (15%) \u{b7} up 5d 11h"
+                .to_string(),
+            instances: 1,
+            tabs: 2,
+            ai_clis: 1,
+            active_ai: 1,
+        }],
+        tabs: Vec::new(),
+    };
+    at_each_text_scale(&[1.0, 2.0], "Tab Control's summary", |scale| {
+        for (width, height) in [(504.0, 628.0), (924.0, 640.0)] {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let (mut runtime, instance, view) = setup();
+            assert!(runtime.replace_settings_harness(state.clone(), 1));
+            let outcome = runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: route_action(SettingsRoute::Tabs),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            assert!(
+                outcome
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, AppEffect::Harness(HarnessRequest::Refresh)))
+            );
+            let pages = every_page(&mut runtime, instance, view, &view_cx_at(width, height));
+            assert_eq!(
+                node(&pages, "tabs/summary/row/system-vitals").label,
+                format!(
+                    "System Vitals: this Mac: {} \u{2014} fleet telemetry: 1 full kernel/SSH \
+                     \u{b7} 0 live LAN RTT",
+                    state.tabs.computers[0].vitals
+                ),
+                "{context}"
+            );
+            fact_cards_read(&pages, &["tabs/summary/"], width > 600.0, &context);
+        }
+    });
+}
+
 /// TWO ROWS THAT SHARE A TITLE READ APART (hunt surfaces-F5): two Claude
 /// Code panes of one tab are two rows whose every button is spoken by a
 /// name of its own — the title and the pane. CONTROL: the two rows' titles
@@ -2205,13 +2896,12 @@ fn two_rows_that_share_a_title_have_buttons_that_read_apart() {
 /// narrowest Medium page (760), on Medium pages where a fifth fixed button
 /// squeezed the words (780, 820), and on Compact pages (320, 340, 584), at
 /// 1×, 1.25× and 2× text: each row paints its place (`Tab 1, left pane`,
-/// `Window 2, tab 1, right pane`) whole at the head of its detail wherever
-/// the page's column can hold it at all, and no face of its five buttons is
-/// cut. CONTROL: on a roomy page at 1× and
+/// `Window 2, tab 1, right pane`) whole at the head of its detail — on a
+/// stacked row narrower than the place, on as many lines as it takes — and no
+/// face of its five buttons is cut. CONTROL: on a roomy page at 1× and
 /// 1.25× the words sit beside the buttons, on one line.
 #[test]
 fn a_rows_words_keep_its_place_whole_and_its_buttons_their_faces() {
-    use crate::native_ui::UiContent;
     let faces = [
         "autopilot/cruise",
         "autopilot/land",
@@ -2243,28 +2933,14 @@ fn a_rows_words_keep_its_place_whole_and_its_buttons_their_faces() {
                         format!("Window 2, tab 1, {side} pane")
                     };
                     let detail = find(&format!("harness/session/{id}/detail"));
-                    let UiContent::Text(text) = &detail.content else {
-                        panic!("{context}: the detail is a text")
-                    };
-                    // Where the column holds the place at all, it is whole.
-                    // Only 2× text on a 320-point page is narrower than
-                    // `Window 2, tab 1, left pane` itself (the row's label
-                    // still says it whole).
-                    let room =
-                        crate::native_ui::native_status_label_width(&format!("{place}\u{2026}"));
-                    if room <= detail.rect.width {
-                        assert!(
-                            text.text.starts_with(&place),
-                            "{context}: the place whole, {:?}",
-                            text.text
-                        );
-                    } else {
-                        assert!(
-                            scale >= 2.0 && width < 584.0 && !window.is_empty(),
-                            "{context}: a column of {} under a place of {room}",
-                            detail.rect.width
-                        );
-                    }
+                    // The place whole at the head of its detail — on a stacked
+                    // row whose column is narrower than the place itself, on
+                    // as many lines as it takes (once cut to the column).
+                    let text = painted_text(&pages, &format!("harness/session/{id}/detail"));
+                    assert!(
+                        text.starts_with(&place),
+                        "{context}: the place whole, {text:?}"
+                    );
                     for face in faces {
                         let painted = button_face(&pages, &format!("harness/session/{id}/{face}"));
                         assert!(
@@ -2662,6 +3338,7 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 address: "local".to_string(),
                 os_version: "macos".to_string(),
                 status: "online".to_string(),
+                vitals: "CPU 14% ▂▂▃▂ · GPU 6% ▁▁▂▁ · RAM 38.2/128.0 GiB (30%) · Disk 1.12/7.28 TiB (15%) · up 5d 11h".to_string(),
                 instances: 1,
                 tabs: 2,
                 ai_clis: 1,
@@ -2673,6 +3350,7 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 address: "192.168.1.42".to_string(),
                 os_version: "macOS 15.4".to_string(),
                 status: "online".to_string(),
+                vitals: String::new(),
                 instances: 1,
                 tabs: 1,
                 ai_clis: 1,
@@ -2693,6 +3371,7 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 ai_status: "working: Bash · targo test (14s)".to_string(),
                 autopilot: "land (supervised)".to_string(),
                 human: "12s ago".to_string(),
+                vitals: "CPU 8.4% · RSS 142 MiB".to_string(),
                 show_local_id: Some(7),
             },
             TabSpreadsheetRow {
@@ -2708,6 +3387,7 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
                 ai_status: "waiting for a person".to_string(),
                 autopilot: "cruise".to_string(),
                 human: "3m ago".to_string(),
+                vitals: String::new(),
                 show_local_id: None,
             },
         ],
@@ -2746,6 +3426,13 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
         "AI CLIs: 2 running · 1 active"
     );
     assert!(
+        node(&pages, "tabs/computer/local")
+            .label
+            .contains("CPU 14% ▂▂▃▂ · GPU 6% ▁▁▂▁ · RAM 38.2/128.0 GiB (30%)"),
+        "{}",
+        node(&pages, "tabs/computer/local").label
+    );
+    assert!(
         node(&pages, "tabs/computer/studio-m4")
             .label
             .contains("1 aterm instance · 1 open tab · 1 AI CLI (0 active)")
@@ -2753,7 +3440,10 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
     assert!(
         node(&pages, "tabs/row/local/7")
             .label
-            .contains("working: Bash · targo test (14s)"),
+            .contains("working: Bash · targo test (14s)")
+            && node(&pages, "tabs/row/local/7")
+                .label
+                .contains("vitals: CPU 8.4% · RSS 142 MiB"),
         "{}",
         node(&pages, "tabs/row/local/7").label
     );
@@ -2790,6 +3480,7 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
         address: "observed-peer.local".to_string(),
         os_version: "OS version unknown".to_string(),
         status: "advertised (lan)".to_string(),
+        vitals: String::new(),
         instances: 0,
         tabs: 0,
         ai_clis: 0,
@@ -2905,7 +3596,7 @@ fn the_lead_says_what_it_measures_and_the_held_row_gives_way() {
     assert!(!all.iter().any(|k| k == "harness/ab/row/held"), "{all:#?}");
     assert_eq!(
         node(&pages, "harness/ab/row/ends").label,
-        "Ends: Land landed 5, quiet 1 \u{b7} Land to landed: about 6m (5)"
+        "Ends: Land landed 5 \u{b7} Land to landed: about 6m (5)"
     );
     assert!(
         all.iter().position(|k| k == "harness/ab/lead")
@@ -3104,10 +3795,24 @@ fn the_leads_words_stand_on_its_figures_baseline() {
     at_each_text_scale(&[1.0, 2.0], "the lead's baseline", |scale| {
         let (mut runtime, instance, view) = harness_route(fixture_led(true));
         let pages = every_page(&mut runtime, instance, view, &view_cx());
+        // The one page that paints the lead whole: a page whose foot the
+        // lead's first line peeks over measures from another top.
+        let keys = [
+            "caption",
+            "cruise/share",
+            "cruise/of",
+            "off/share",
+            "off/of",
+        ];
+        let page = pages
+            .iter()
+            .find(|page| {
+                keys.iter()
+                    .all(|key| painted(page, &format!("harness/ab/lead/{key}")).is_some())
+            })
+            .unwrap_or_else(|| panic!("{scale}\u{d7}: the lead is painted whole"));
         let baseline = |key: &str| {
-            let node = pages
-                .iter()
-                .find_map(|page| painted(page, &format!("harness/ab/lead/{key}")))
+            let node = painted(page, &format!("harness/ab/lead/{key}"))
                 .unwrap_or_else(|| panic!("{scale}\u{d7}: {key} is painted"));
             let UiContent::Text(text) = &node.content else {
                 panic!("{key}: a text");

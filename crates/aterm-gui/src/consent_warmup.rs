@@ -1003,7 +1003,7 @@ mod tests {
         // `WarmupState`. Nothing is carried over — including any claim about a
         // modal that may still be on the screen (§3.5, §7 S12). The other half
         // of the successor rule, the empty Full Disk Access probe cache, is
-        // `control_privacy::ConsentState`'s and is asserted there.
+        // `consent_state::ConsentState`'s and is asserted there.
         let successor = WarmupState::default();
         assert!(!successor.is_live());
         assert!(successor.rows().is_empty());

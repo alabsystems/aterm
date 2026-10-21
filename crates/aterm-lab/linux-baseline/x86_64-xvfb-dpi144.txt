@@ -2,24 +2,15 @@
 # = behaviour, compared exactly by the replay; ~ measured, shown when it moves; @ the stack
 # replay: targo --unverified lab linux baseline --arch x86_64 --screen xvfb-dpi144 (add --record to rewrite this file)
 # not-driven.header.gestures system-frame: an X11 window's frame is the window manager's (this lane runs none), so aterm draws no header and its band is not caption
-@ crate.calloop 0.13.0
-@ crate.calloop-wayland-source 0.3.0
-@ crate.rustix 0.38.44 (path)
-@ crate.rustix.2 1.1.4
-@ crate.smithay-client-toolkit 0.19.2
+# not-driven.touch no-touchscreen: the lane's X servers have no touch device, which XInput 2's touch events come from, and XTEST fakes no touchscreen; Mutter's is driven, through a RemoteDesktop finger
+@ crate.aterm-dl 0.106.0 (path)
+@ crate.aterm-wayland 0.106.0 (path)
+@ crate.aterm-window 0.30.13 (path)
+@ crate.aterm-x11 0.106.0 (path)
+@ crate.aterm-xkb 0.106.0 (path)
 @ crate.softbuffer 0.4.8
-@ crate.tiny-xlib 0.2.5
-@ crate.wayland-backend 0.3.15
-@ crate.wayland-client 0.31.14
-@ crate.wayland-cursor 0.31.14
-@ crate.wayland-protocols 0.32.12
 @ crate.wgpu 29.0.3
 @ crate.wgpu-hal 29.0.3
-@ crate.winit 0.30.13 (path)
-@ crate.x11-dl 2.21.0
-@ crate.x11rb 0.13.2
-@ crate.x11rb-protocol 0.13.2
-@ crate.xkbcommon-dl 0.4.2
 = start.dims 24x80 scale=1.50 cell_w=14 cell_h=30 font_px=23.00 window_rows=24 window_cols=80 grid_w=1120 grid_h=720 frame_w=1156 frame_h=792 surface_w=1156 surface_h=792 offset_x=0 offset_y=0 band_left=0 band_right=0 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=18 pad_top=3 pad_bottom=18 head=21 tab_rows=1
 = echo typed `echo LANE-$((6*7))`, LANE-42 appeared
 = atspi.walk.start apps 1
@@ -38,17 +29,17 @@
 = status render=ok resizes=6
 ~ status.flaps 0
 = resizes.1 1 ord=1 from=80x24 to=100x30 alt=0 sync=0 site=input win=100x30 chrome=1
-~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=input win=100x30 chrome=1
+~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=100x30 chrome=1
 = resizes.2 2 ord=2 from=100x30 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
-~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=input win=80x24 chrome=1
+~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
 = resizes.3 3 ord=3 from=80x24 to=80x23 alt=0 sync=0 site=input win=80x23 chrome=1
-~ resizes.3.rows 3 run=3 ord=3 from=80x24 to=80x23 alt=0 sync=0 trimmed=1 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=input win=80x23 chrome=1
+~ resizes.3.rows 3 run=3 ord=3 from=80x24 to=80x23 alt=0 sync=0 trimmed=1 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x23 chrome=1
 = resizes.4 4 ord=4 from=80x23 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
-~ resizes.4.rows 4 run=4 ord=4 from=80x23 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=1 restored=0 shift=+0 site=input win=80x24 chrome=1
+~ resizes.4.rows 4 run=4 ord=4 from=80x23 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=1 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
 = resizes.5 5 ord=5 from=80x24 to=68x20 alt=0 sync=0 site=window win=68x20 chrome=1
-~ resizes.5.rows 5 run=5 ord=5 from=80x24 to=68x20 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=window win=68x20 chrome=1
+~ resizes.5.rows 5 run=5 ord=5 from=80x24 to=68x20 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=window win=68x20 chrome=1
 = resizes.6 6 ord=6 from=68x20 to=80x24 alt=0 sync=0 site=window win=80x24 chrome=1
-~ resizes.6.rows 6 run=6 ord=6 from=68x20 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=window win=80x24 chrome=1
+~ resizes.6.rows 6 run=6 ord=6 from=68x20 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=window win=80x24 chrome=1
 ~ runs.1 1 n=1 alt=0 geom=80x24>100x30 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
 ~ runs.2 2 n=1 alt=0 geom=100x30>80x24 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
 ~ runs.3 3 n=1 alt=0 geom=80x24>80x23 net=changed displaced=+0 verdict=none first_out_ms=- healed_ms=-
@@ -65,7 +56,7 @@
 = primary.in xclip's XPRIMARY-42 pasted: x-xprimary-42
 @ keyrepeat.server X server autorepeat delay=660 rate=25
 = keyrepeat repeats
-~ keyrepeat.count 21 characters for a 1500 ms hold
+~ keyrepeat.count 22 characters for a 1500 ms hold
 = compose X-xé-Y printed; no IME event
 = dnd.aware 5
 = dnd.hover.status accept=1 action=XdndActionPrivate
@@ -83,6 +74,7 @@
 = header.pixels bare,bare,bare
 ~ header.pixels.differ 56,56,56
 = not-driven.header.gestures system-frame
+= not-driven.touch no-touchscreen
 = atspi.walk.end apps 1
 = atspi.walk.end.1 depth=0 role=application name="aterm-gui" description="" states=- interfaces=Accessible,Application attributes=ERR(org.freedesktop.DBus.Error.UnknownMethod:_Unknown_method_'GetAttributes') children=1 child_count=1
 ~ atspi.path.end.1 /org/a11y/atspi/accessible/root
@@ -91,8 +83,8 @@
 = atspi.walk.end.3 depth=2 role=terminal name="aterm terminal" description="" states=enabled,focusable,focused,sensitive,showing,visible interfaces=Accessible,Component,Text attributes=- characters=177 caret=161 text="lane$ echo LANE-$((6*7))\nLANE-42\nlane$ echo X-XCLIP-42 | tr A-Z a-z\nx-xclip-42\nlane$ echo X-XPRIMARY-42 | tr A-Z a-z\nx-xprimary-42\nlane$ echo X-xé-Y\nX-xé-Y\nlane$\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" extents_window=18,54,1120,720 extents_screen=18,54,1120,720 children=0 child_count=0
 ~ atspi.path.end.3 /org/a11y/atspi/accessible/0/18446744073709551616
 @ gpu llvmpipe (LLVM 20.1.2, 256 bits) (Gl)
-~ present.software software rendering (llvmpipe (LLVM 20.1.2, 256 bits) (Gl)): n_present=45 present_p50/p95/p99_ms=9.44/41.94/738.20
-~ input.software n_input=36 input_p50/p95/p99_ms=10.49/83.89/738.20
+~ present.software software rendering (llvmpipe (LLVM 20.1.2, 256 bits) (Gl)): n_present=46 present_p50/p95/p99_ms=9.44/18.87/402.65
+~ input.software n_input=37 input_p50/p95/p99_ms=11.53/75.50/402.65
 = atspi.events.kinds Object.ActiveDescendantChanged@application Object.BoundsChanged@terminal Object.ChildrenChanged:add@application Object.StateChanged:active=1@frame Object.StateChanged:focused=1@terminal Object.TextCaretMoved@terminal Object.TextChanged:delete@terminal Object.TextChanged:insert@terminal Window.Activate@frame
 = atspi.events.text the text changes undo cleanly from the end walk's text; the last caret event names the end walk's caret
 ~ atspi.events.count 93
@@ -169,21 +161,21 @@
 ~ atspi.event.71 Object.TextCaretMoved <terminal> detail="" d1=157 d2=0 any=0
 ~ atspi.event.72 Object.TextChanged <terminal> detail="insert" d1=157 d2=1 any="a"
 ~ atspi.event.73 Object.TextCaretMoved <terminal> detail="" d1=158 d2=0 any=0
-~ atspi.event.74 Object.TextChanged <terminal> detail="delete" d1=136 d2=22 any=" aaaaaaaaaaaaaaaaaaaaa"
-~ atspi.event.75 Object.TextCaretMoved <terminal> detail="" d1=136 d2=0 any=0
-~ atspi.event.76 Object.TextChanged <terminal> detail="insert" d1=136 d2=8 any=" echo X-"
-~ atspi.event.77 Object.TextCaretMoved <terminal> detail="" d1=144 d2=0 any=0
-~ atspi.event.78 Object.TextChanged <terminal> detail="insert" d1=144 d2=1 any="x"
-~ atspi.event.79 Object.TextCaretMoved <terminal> detail="" d1=145 d2=0 any=0
-~ atspi.event.80 Object.TextChanged <terminal> detail="insert" d1=145 d2=1 any="é"
-~ atspi.event.81 Object.TextCaretMoved <terminal> detail="" d1=146 d2=0 any=0
-~ atspi.event.82 Object.TextChanged <terminal> detail="insert" d1=146 d2=2 any="-Y"
-~ atspi.event.83 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
-~ atspi.event.84 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
-~ atspi.event.85 Object.PropertyChange <frame> detail="accessible-name" d1=0 d2=0 any="echo X-xé-Y"
-~ atspi.event.86 Object.TextChanged <terminal> detail="delete" d1=149 d2=1 any="\n"
-~ atspi.event.87 Object.TextChanged <terminal> detail="insert" d1=149 d2=12 any="X-xé-Y\nlane$"
-~ atspi.event.88 Object.PropertyChange <frame> detail="accessible-name" d1=0 d2=0 any="~"
+~ atspi.event.74 Object.TextChanged <terminal> detail="insert" d1=158 d2=1 any="a"
+~ atspi.event.75 Object.TextCaretMoved <terminal> detail="" d1=159 d2=0 any=0
+~ atspi.event.76 Object.TextChanged <terminal> detail="delete" d1=136 d2=23 any=" aaaaaaaaaaaaaaaaaaaaaa"
+~ atspi.event.77 Object.TextCaretMoved <terminal> detail="" d1=136 d2=0 any=0
+~ atspi.event.78 Object.TextChanged <terminal> detail="insert" d1=136 d2=8 any=" echo X-"
+~ atspi.event.79 Object.TextCaretMoved <terminal> detail="" d1=144 d2=0 any=0
+~ atspi.event.80 Object.TextChanged <terminal> detail="insert" d1=144 d2=1 any="x"
+~ atspi.event.81 Object.TextCaretMoved <terminal> detail="" d1=145 d2=0 any=0
+~ atspi.event.82 Object.TextChanged <terminal> detail="insert" d1=145 d2=1 any="é"
+~ atspi.event.83 Object.TextCaretMoved <terminal> detail="" d1=146 d2=0 any=0
+~ atspi.event.84 Object.TextChanged <terminal> detail="insert" d1=146 d2=2 any="-Y"
+~ atspi.event.85 Object.TextCaretMoved <terminal> detail="" d1=148 d2=0 any=0
+~ atspi.event.86 Object.TextCaretMoved <terminal> detail="" d1=149 d2=0 any=0
+~ atspi.event.87 Object.TextChanged <terminal> detail="delete" d1=149 d2=1 any="\n"
+~ atspi.event.88 Object.TextChanged <terminal> detail="insert" d1=149 d2=12 any="X-xé-Y\nlane$"
 ~ atspi.event.89 Object.TextCaretMoved <terminal> detail="" d1=161 d2=0 any=0
 ~ atspi.event.90 Object.TextChanged <terminal> detail="insert" d1=161 d2=38 any=" /tmp/aterm-lane-dnd/dropped\\ file.txt"
 ~ atspi.event.91 Object.TextCaretMoved <terminal> detail="" d1=199 d2=0 any=0
@@ -208,6 +200,6 @@
 @ guest.mesa-vulkan-drivers:amd64 25.2.8-0ubuntu0.24.04.4
 @ guest.mutter:arm64 46.2-1ubuntu0.24.04.18
 @ guest.weston:arm64 13.0.0-4build3
-@ guest.xvfb:arm64 2:21.1.12-1ubuntu1.8
+@ guest.xvfb:arm64 2:21.1.12-1ubuntu1.9
 @ guest.xwayland:arm64 2:23.2.6-1ubuntu0.8
 = xim ibus XIM, engine xkb:us::eng: X-xé-Y printed; IME events

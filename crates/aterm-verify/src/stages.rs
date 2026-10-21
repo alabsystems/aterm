@@ -597,7 +597,7 @@ pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, Str
 
 /// `targo --unverified run -q -p aterm-libc-oracle --target-dir <lane>/gate-bin
 /// -- --root <R> --target-dir <lane>`, from `<R>`: the oracle built and run
-/// inside its own lane ([`Lane::LibcOracleTarget`], `<R>/libc-oracle/target`),
+/// inside its own lane ([`Lane::LibcOracleTarget`], `<R>/libc-oracle/target.noindex`),
 /// so it never queues on the main workspace's cargo lock. Both paths are
 /// absolute because the oracle's children run from other cwds.
 ///
@@ -1201,7 +1201,7 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
 // ---------------------------------------------------------------------------
 // Tippy: the lint under the Trust toolchain's Clippy fork. Present means
 // `-D warnings` must pass; absent is a named skip. Its own target dir
-// (`<target>/verify/tippy`) lets it compile beside the test build.
+// (`<target>/verify/tippy.noindex`) lets it compile beside the test build.
 // ---------------------------------------------------------------------------
 /// The exact command the lint stage spawns, so the test asserts on it rather
 /// than a replica.
@@ -1341,8 +1341,16 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str, names: &[&str]) {
 /// The export check's row.
 pub const EXPORT_LABEL: &str = "ship check --export";
 
+/// The `SIGTERM` grace `ship check --export` gets at its ceiling. The release
+/// starts each of its own children in a session of its own, which the group
+/// `SIGKILL` never reaches, and hands a `SIGTERM` on to them within 50 ms; a
+/// `SIGKILL` at once left the engine's `git fetch` waiting on its credential
+/// helper after the run that started it was gone.
+pub const EXPORT_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// `ship check --export` from the root, its release tools built in
-/// `<target>/verify/trust` ([`Lane::TrustTarget`]).
+/// `<target>/verify/trust.noindex` ([`Lane::TrustTarget`]), ended at its ceiling with
+/// [`EXPORT_TERM_GRACE`].
 #[must_use]
 pub fn export_cmd(ctx: &Ctx) -> Cmd {
     in_lane(
@@ -1350,6 +1358,7 @@ pub fn export_cmd(ctx: &Ctx) -> Cmd {
         Lane::TrustTarget,
         targo(ctx, ship_args(["check", "--export"])),
     )
+    .term_grace(EXPORT_TERM_GRACE)
 }
 
 /// The `fix:` lines a transcript printed, joined: what a skip row shows. Only
@@ -2166,9 +2175,7 @@ fn linux_lane(ctx: &Ctx, r: &mut Report) {
 /// goldens and the driver held to wasm-bindgen 0.2.108 on the toy's
 /// `#[wasm_bindgen]` twin, with its negative controls).
 fn wasm_glue(ctx: &Ctx, r: &mut Report) {
-    let work = lane_dir(ctx, Lane::CellsTarget)
-        .unwrap_or_else(|| ctx.state_dir().join("cells"))
-        .join("wasm-glue");
+    let work = crate::plan::cells_dir(ctx).join("wasm-glue");
     let root = ctx.root.clone();
     glue_row(
         ctx,
@@ -3021,9 +3028,13 @@ mod tests {
 
     /// `ship check --export`'s exit code is the verdict: `0` passes, `1` and
     /// `2` are findings, `3` is a skip that shows the fix lines it printed, and
-    /// an interrupt is never green. It builds in `<target>/verify/trust`.
+    /// an interrupt is never green. It builds in `<target>/verify/trust.noindex`, and
+    /// its ceiling sends `SIGTERM` first, which the release hands on to the
+    /// children it started in sessions of their own.
     #[test]
     fn the_export_check_reads_ship_checks_exit_code() {
+        let cmd = export_cmd(&ctx(Scope::workspace()));
+        assert_eq!(cmd.term_grace, Some(EXPORT_TERM_GRACE));
         assert_eq!(export_outcome(Some(0), "").0, Outcome::Ok);
         for code in [1, 2, 101] {
             assert_eq!(
@@ -3322,17 +3333,26 @@ mod tests {
     /// THE MAIN LANE SHARES PLAIN TARGO'S CACHE: where the run found the
     /// shim's build-cache value, every main-lane child leads with it as
     /// `--config` and no child is pinned to a CARGO_TARGET_DIR; a side lane
-    /// never gets it. Where it found none, the children are pinned as before.
+    /// never gets it. Where it found none, the children are pinned as before,
+    /// their intermediates in `<target>/build.noindex`.
     #[test]
     fn the_main_lanes_children_lead_with_the_shims_build_dir() {
         let mut c = ctx(Scope::workspace());
-        assert_eq!(c.main_build_dir, None, "no HOME in the fixture: no cache");
+        let fallback = "build.build-dir='/repo/target/build.noindex'";
+        assert_eq!(
+            c.main_build_dir.as_deref(),
+            Some(fallback),
+            "no HOME in the fixture: no shim cache"
+        );
         assert!(
             c.child_env_add
                 .iter()
                 .any(|(k, v)| k == "CARGO_TARGET_DIR" && v == "/repo/target")
         );
-        assert_eq!(main_targo(&c, vec!["x".into()]).argv()[1..], ["x"]);
+        assert_eq!(
+            main_targo(&c, vec!["x".into()]).argv()[1..],
+            ["--config", fallback, "x"]
+        );
         let value = "build.build-dir='/h/Library/Caches/aterm/cargo-build.noindex{workspace-root}/.cargo-build'";
         c.main_build_dir = Some(value.to_string());
         let [compile, run] = test_cmds(&c, false);
@@ -3376,7 +3396,13 @@ mod tests {
         let aterm = codex_aterm_binary(&c);
         let build = codex_aterm_build_cmd(&c);
         let suite = codex_alab_proof_cmd(&c);
-        assert_eq!(build.argv()[1..], codex_aterm_build_args()[..]);
+        // Led by the main lane's build dir (`<target>/build.noindex` here).
+        let lead = [
+            "--config".to_string(),
+            c.main_build_dir.clone().expect("a build dir"),
+        ];
+        assert_eq!(build.argv()[1..3], lead);
+        assert_eq!(build.argv()[3..], codex_aterm_build_args()[..]);
         assert!(build.demoted, "the build only compiles");
         assert!(!suite.demoted, "the suite runs code");
         assert_eq!(lane(&build), None, "the main target, inherited");
@@ -3409,7 +3435,13 @@ mod tests {
         use crate::Outcome;
         let c = ctx(Scope::workspace()).with_checks(&[crate::checks::Check::Linux]);
         let build = linux_lab_build_cmd(&c);
-        assert_eq!(build.argv()[1..], linux_lab_build_args()[..]);
+        // Led by the main lane's build dir (`<target>/build.noindex` here).
+        let lead = [
+            "--config".to_string(),
+            c.main_build_dir.clone().expect("a build dir"),
+        ];
+        assert_eq!(build.argv()[1..3], lead);
+        assert_eq!(build.argv()[3..], linux_lab_build_args()[..]);
         assert!(linux_lab_build_args().windows(2).any(|w| w == MAIN_PROFILE));
         assert!(
             !build.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),
@@ -3432,11 +3464,14 @@ mod tests {
             linux_lane_outcome(Some(1), "").0,
             Outcome::Fail(Severity::GateFailed)
         );
-        let transcript =
-            "aterm-lab: NOT RUN: no limactl (brew install lima, or LAB_LIMACTL=/path/to/limactl)\n";
+        let transcript = "aterm-lab: NOT RUN: no limactl: `targo --unverified verify provision \
+                          --linux` provides it (or LAB_LIMACTL=/path/to/limactl names one)\n";
         let (outcome, label) = linux_lane_outcome(Some(3), transcript);
         assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun));
-        assert!(label.contains("no limactl (brew install lima"), "{label}");
+        assert!(
+            label.contains("no limactl: `targo --unverified verify provision"),
+            "{label}"
+        );
         assert_eq!(
             linux_lane_outcome(None, "").0,
             Outcome::Fail(Severity::CouldNotRun)

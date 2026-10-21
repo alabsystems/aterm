@@ -26,8 +26,9 @@ use crate::harness_glass::{Arrival, on_act, on_act_at};
 /// A switch a test flips (`true`: the label withheld), by name.
 type Switch = (&'static str, fn(&mut App, bool));
 
-/// The chips at rest in a hosted Cruise session: Autopilot's `∞` and `⚙`.
-const CHIPS: &str = "\u{221e} \u{2699}";
+/// The chips at rest in a hosted Cruise session: Autopilot's `∞` alone (no
+/// settings button beside it, owner 2026-10-20).
+const CHIPS: &str = "\u{221e}";
 
 /// `app` hosted, its session drawing Claude Code in bypass under the
 /// owner's whole facts, `cols` wide, one frame painted.
@@ -121,8 +122,8 @@ fn an_acts_label_lights_beside_the_whole_facts_for_its_dwell_then_goes() {
         assert_eq!(footer_fp(&app, wid), lit_key, "frame {i}");
     }
     let (row, col) = hit(&app, wid, Chip::Autopilot);
-    // `∞ ⚙`, the title's two-cell gap, then the label.
-    let check = cell_at(&app, wid, (row, col + 5));
+    // `∞`, the title's two-cell gap, then the label.
+    let check = cell_at(&app, wid, (row, col + 3));
     assert_eq!(check.ch, '\u{2713}');
     assert_eq!(
         check.fg,
@@ -224,8 +225,9 @@ const SPLIT_PATH: &str = "/private/tmp/claude-502/-Users-person-aterm/\
 ///
 /// RED before the fix: the label and the title were paired with the WHOLE
 /// facts only, so neither was drawn and a hover only underlined the chip.
-/// NEGATIVE CONTROL: at 60 columns, where the cut facts leave no room for
+/// NEGATIVE CONTROL: at 58 columns, where the cut facts leave no room for
 /// it, the label is not drawn and leaves no lone glyph; the facts stand.
+/// (60 columns before the `⚙` chip's two cells went, 2026-10-20.)
 #[test]
 fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     let t0 = Instant::now();
@@ -267,7 +269,7 @@ fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     assert!(hovered.contains(facts), "no fact gave way: {hovered:?}");
     app.hover_claude_chip(wid, None);
     // NEGATIVE CONTROL: where the cut facts leave it no room, no label.
-    assert!(app.apply_term_resize(wid, 24, 60));
+    assert!(app.apply_term_resize(wid, 24, 58));
     draw_claude(&app, session, BYPASS);
     on_act_at(&mut app, session, Act::Declined, arrival(t0, 20_000));
     assert_eq!(
@@ -279,7 +281,7 @@ fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     let narrow = rule(&app, wid);
     assert!(
         !narrow.contains('\u{2717}') && narrow.contains(facts),
-        "60 columns: no label, the facts stand: {narrow:?}"
+        "58 columns: no label, the facts stand: {narrow:?}"
     );
 }
 
@@ -410,11 +412,12 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
 }
 
 /// A HOVERED CHIP NAMES ITS FACE CLOCK'S DAY WHERE IT IS NOT TODAY (§10.2.3,
-/// item 3) on a real frame: a session with no trail whose task was done two
-/// days back reads, hovered, `done <weekday> HH:MM` — the hover's start reads
-/// today's day for the face clock alone, since the title names one.
+/// item 3) on a real frame: a session under Land with no trail whose work
+/// landed two days back reads, hovered, `landed <weekday> HH:MM` — the
+/// hover's start reads today's day for the face clock alone, since the title
+/// names one.
 ///
-/// NEGATIVE CONTROL: a face done now reads its bare clock, no weekday — the
+/// NEGATIVE CONTROL: a landing now reads its bare clock, no weekday — the
 /// day is named only where it differs.
 #[test]
 fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
@@ -431,10 +434,15 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
     };
     let hovered_after = |done_unix: i64| {
         let (mut app, wid, session, host) = ticker_app(200);
+        assert!(app.set_session_autopilot(
+            session,
+            Some(aterm_agent::supervise::Autopilot::Land),
+            crate::autopilot::Surface::Chip
+        ));
         assert!(crate::harness_glass::on_task(
             &mut app,
             session,
-            Some(TaskFace::Done),
+            Some(TaskFace::Landed),
             done_unix * 1000
         ));
         crate::claude_footer::post_changed(session);
@@ -453,10 +461,10 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
     let wkd = crate::claude_lights::Weekday::of_days(stamp.day).short();
     let old = hovered_after(then);
     assert!(
-        old.contains(&format!("done {wkd} {}", stamp.clock.as_str())),
+        old.contains(&format!("landed {wkd} {}", stamp.clock.as_str())),
         "two days back, the weekday: {old:?}"
     );
-    // NEGATIVE CONTROL: done now, the bare clock (where the wall's date did
+    // NEGATIVE CONTROL: landed now, the bare clock (where the wall's date did
     // not turn between the face and the hover).
     let now = wall_now();
     let stamp = Stamp::at(now).expect("the zone reads here");
@@ -464,8 +472,8 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
     if local_day_at(wall_now()) == stamp.day {
         let wkd = crate::claude_lights::Weekday::of_days(stamp.day).short();
         assert!(
-            fresh.contains(&format!("done {}", stamp.clock.as_str()))
-                && !fresh.contains(&format!("done {wkd} ")),
+            fresh.contains(&format!("landed {}", stamp.clock.as_str()))
+                && !fresh.contains(&format!("landed {wkd} ")),
             "today, no weekday: {fresh:?}"
         );
     }
@@ -556,11 +564,13 @@ fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
 }
 
 /// THE CHIPS ARE BUTTONS A SCREEN READER CAN PRESS (§9.2.1): the tree's
-/// chips are the frame's — Autopilot and `⚙`, each over the cells the
-/// painter recorded, named in words (`Autopilot: cruise.`, `Harness
-/// settings`), the newest act Autopilot's description (none once it is a
-/// day old, as the title leaves it out) — and a reader's click on Autopilot
-/// steps its word, as a click on its cells does.
+/// chips are the frame's — Autopilot alone, over the cells the painter
+/// recorded, named in words (`Autopilot: cruise.`), the newest act its
+/// description (none once it is a day old, as the title leaves it out) —
+/// and a reader's click on it steps its word, as a click on its cells does.
+/// No `Harness settings` button is published: the rule draws none (owner,
+/// 2026-10-20), and the tree is the frame's (RED on the tree before the
+/// removal, which published two).
 ///
 /// NEGATIVE CONTROL: a click on a chip the glass does not show (a pane too
 /// narrow for it) does nothing.
@@ -577,7 +587,7 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
     on_act_at(&mut app, session, Act::Approved, now);
     frame(&mut app, wid);
     let chips = app.claude_chips_a11y(wid);
-    assert_eq!(chips.len(), 2, "{chips:?}");
+    assert_eq!(chips.len(), 1, "Autopilot alone: {chips:?}");
     let strip = usize::from(app.chrome_rows(wid));
     let (row, col) = hit(&app, wid, Chip::Autopilot);
     assert_eq!(
@@ -589,13 +599,9 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
         chips[0].description,
         Some(format!("Last: approved at {clock}."))
     );
-    assert_eq!(
-        (chips[1].chip, chips[1].label.as_str(), chips[1].col),
-        (
-            HarnessChip::Settings,
-            "Harness settings",
-            hit(&app, wid, Chip::Settings).1
-        )
+    assert!(
+        chips.iter().all(|c| !c.label.contains("settings")),
+        "no settings button: {chips:?}"
     );
     // A day and a minute old, the act is told no more.
     let (mut old, _) = arrival_now(t0, 20_000);
@@ -724,9 +730,13 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
     app.end_session_rename_editor(wid);
     assert_eq!(pinned(&app), None);
     app.switch_tab_in(wid, 0);
+    // The master switch off: the reader's click on `⊘ off` opens Settings.
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
     frame(&mut app, wid);
-    rename(&mut app, "reader gear");
-    app.press_claude_chip_for_reader(wid, session, HarnessChip::Settings);
+    rename(&mut app, "reader off chip");
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Autopilot);
     let (at, _, view, _) = app
         .native_settings_route_view_target(SettingsRoute::Harness)
         .expect("the reader opened Settings");
@@ -737,7 +747,7 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
         "the reader actually focused Settings"
     );
     assert!(app.inline_rename_edit(wid).is_none());
-    assert_eq!(pinned(&app).as_deref(), Some("reader gear"));
+    assert_eq!(pinned(&app).as_deref(), Some("reader off chip"));
 }
 
 /// A HOVERED TITLE WITH A TRAIL GIVES ITS PARTS UP IN ORDER (§9.2.1; review

@@ -33,6 +33,7 @@ mod content;
 mod csi_dispatch_table;
 pub mod custody;
 mod foreground_handback;
+mod frame_watchers;
 mod grouped_state;
 mod handler;
 mod handler_dec;
@@ -103,6 +104,8 @@ mod shell_api;
 pub mod scrollback_shared_budget;
 mod search_budgeted;
 mod search_index;
+mod search_plan;
+mod search_query;
 mod search_rows;
 mod stack_response;
 mod state;
@@ -165,6 +168,7 @@ pub use checkpoint_state::{
 pub use clipboard_auth::ClipboardAccess;
 pub use custody::CustodyTransition;
 pub use foreground_handback::{ForegroundHandback, evidence as program_evidence};
+pub use frame_watchers::FrameWatchers;
 pub use holder_fence::{
     CutKind, HolderAdoption, HolderCut, HolderFence, HolderView, MAX_HOLDER_MARKS, MAX_HOLDER_SPANS,
 };
@@ -179,12 +183,23 @@ pub use processing::{ClockReading, KittyAnimationStep};
 pub use render_cells::{RenderCell, Script, UnderlineStyle};
 pub use resize_journal::{RESIZE_JOURNAL_CAP, RenderDebt, ResizeReport};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
-pub use search_rows::history_line_text_cells;
+pub use search_index::SearchDiscard;
+pub use search_plan::{
+    BuiltSearch, SearchKey, SearchLayout, SearchPlan, SearchRequest, SearchVerdict, SearchWindow,
+};
+#[cfg(any(test, debug_assertions))]
+pub use search_query::take_narrowed_query_steps;
+pub use search_query::{
+    NarrowStack, WrapFrame, join_wrapped_rows, query_search_index, query_search_index_narrowing,
+};
+pub(crate) use search_rows::history_line_text_cells;
+pub use search_rows::{AbsRowText, SearchRows};
 pub use selection::smart_word_in_cells;
 pub use shell::{
     Annotation, BlockState, CommandMark, OutputBlock, ShellState, StartFlags, StartKind, StartMark,
     TerminalMark,
 };
+pub use shell_api::InputRegionStart;
 pub use state::{
     CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,
 };

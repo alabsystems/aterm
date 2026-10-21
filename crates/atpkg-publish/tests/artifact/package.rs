@@ -344,6 +344,7 @@ fn the_version_form_and_the_origin_are_read_exactly() {
 /// names the signing key.
 #[test]
 fn a_package_packs_whole_and_signs_what_a_client_stages() {
+    crate::shared::need_compressor();
     let w = world("pkg-ok");
     let pkg = w.package("ok", &w.lay());
     // The key at another path: the machine's own is moved away.
@@ -399,6 +400,7 @@ fn a_package_packs_whole_and_signs_what_a_client_stages() {
 /// `atpkg-codex-<build>` — and only there (the in-memory host: no test reaches a network).
 #[test]
 fn upload_goes_to_the_staging_codex_alab_release_only_when_asked() {
+    crate::shared::need_compressor();
     let w = world("pkg-upload");
     let pkg = w.package("up", &w.lay());
     let mut req = w.request(&pkg, ALAB);
@@ -430,6 +432,7 @@ fn upload_goes_to_the_staging_codex_alab_release_only_when_asked() {
 /// package fact, the source, the compiler, and the tree.
 #[test]
 fn each_gate_refuses_before_anything_is_signed() {
+    crate::shared::need_compressor();
     let w = world("pkg-gates");
     let base = w.lay();
     let side = {
@@ -569,6 +572,7 @@ fn each_gate_refuses_before_anything_is_signed() {
 /// publish reads no codex pack and keeps the live row. `--pack-dir` reads a local pack.
 #[test]
 fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
+    crate::shared::need_compressor();
     let w = world("pkg-index");
     let pkg = w.package("pinned", &w.lay());
     let o = w.pack(&w.request(&pkg, ALAB)).expect("packs");

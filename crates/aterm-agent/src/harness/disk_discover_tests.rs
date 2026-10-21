@@ -117,6 +117,7 @@ fn roots_at(tmp: &Tmp) -> Roots {
         agent_target_dirs: Vec::new(),
         claude_tmp: Some(tmp.path().join("claude-tmp")),
         device: None,
+        volume: None,
         mounts: Vec::new(),
         skip_home_children: false,
     }
@@ -880,6 +881,7 @@ fn judge_at(now: i64) -> Judge {
         now,
         threshold_days: crate::harness::disk::DEFAULT_TARGET_STALE_DAYS,
         device: None,
+        volume: None,
     }
 }
 
@@ -889,7 +891,13 @@ fn real_with(
     now: i64,
     processes: impl Fn(&[PathBuf], &[u32]) -> std::io::Result<PathScan>,
 ) -> impl FnMut(&Row) -> std::io::Result<Removed> {
-    remover_among(judge_at(now), processes, |_| Ok(Running::default()))
+    remover_among(
+        judge_at(now),
+        processes,
+        |_| Ok(Running::default()),
+        crate::harness::disk::idle::Sessions::default,
+        aterm_sysprobe::volumes::table,
+    )
 }
 
 /// The real remover at `now`, among the processes `pids` (the test's own).
@@ -1230,6 +1238,7 @@ fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
         walk_cut_short: None,
         profiles: Vec::new(),
         device: Some(1),
+        volume: None,
         probed_recent: false,
         origin,
         owned: Owned::NotOwned,
@@ -1369,6 +1378,7 @@ fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
         table: Some(&table),
         demand: None,
         session_cwds: &[],
+        session_cwd_unknown: None,
         link_dirs: &[],
     };
     let mut real = real_with(now, processes);
@@ -1610,7 +1620,8 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
         .expect("a test binary's stand-in");
     let seen = until_err(|| unused(owner, &row.path, &among(vec![tests.id()])));
     let err = real_among(now, vec![tests.id()])(&row).expect_err("a process works in deps/");
-    let shipped = remover(judge_at(now))(&row).expect_err("the product reads it too");
+    let shipped = remover(judge_at(now), crate::harness::disk::idle::Sessions::default)(&row)
+        .expect_err("the product reads it too");
     let _ = tests.kill();
     let _ = tests.wait();
     assert!(seen.is_err_and(|why| why.contains("working directory")));
@@ -1631,7 +1642,8 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     let seen = until_err(|| unused(owner, &row.path, &among(vec![holder.id()])));
     let err = real_among(now, vec![holder.id()])(&row)
         .expect_err("a process holds a file of the session's");
-    let shipped = remover(judge_at(now))(&row).expect_err("the product reads it too");
+    let shipped = remover(judge_at(now), crate::harness::disk::idle::Sessions::default)(&row)
+        .expect_err("the product reads it too");
     let _ = holder.kill();
     let _ = holder.wait();
     assert!(seen.is_err_and(|why| why.contains("open file")));

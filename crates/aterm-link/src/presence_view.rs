@@ -610,13 +610,14 @@ fn follow(
     let mut sub = conn.subscribe(next, &filter)?;
     // THE ACK DEADLINE COMES OFF once the tail is open: parking with nothing to
     // deliver is what a subscription does. It comes back as the LIVENESS bound
-    // on the broker's first mark, below.
-    crate::transport::bound_reads(closer, None)?;
+    // on the broker's first mark, re-armed on every one: astream's `recv_live`
+    // rule, read event by event (`recv_live_event`) because a mark's `next`
+    // is what makes the view exact up to it.
+    closer.set_read_timeout(None)?;
     loop {
-        match sub.recv_event()? {
+        match sub.recv_live_event(closer, astream_broker::IDLE_MARK_DEADLINE)? {
             None => return Ok(()),
             Some(astream_broker::Event::Mark { next, head, .. }) => {
-                crate::transport::bound_reads(closer, Some(astream_broker::IDLE_MARK_DEADLINE))?;
                 if !view.mark(generation, next, head) {
                     return Ok(());
                 }

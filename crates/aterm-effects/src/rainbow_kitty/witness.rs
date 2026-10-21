@@ -44,7 +44,9 @@
 //! away (nearest first: `−1, +1, −2, +2`), clocks intact
 //! (`Ribbon::translate_run`, [`Witness::translate_cells`]). A shift pass
 //! ([`Witness::shift_runs`]) does the same along the row for a mid-line
-//! insert (owner, 2026-09-22).
+//! insert (owner, 2026-09-22). Past those offsets the pass searches only the
+//! row a carry names: a scroll's ([`Witness::scroll_carry`]), or the caret's,
+//! when the caret went that far with its box ([`Witness::carry_caret`]).
 //!
 //! A glyph at a destination counts as an arrival only if it was not already a
 //! copy there: every record accumulates per offset whether a copy of its glyph
@@ -463,6 +465,28 @@ impl Seen {
 /// Every follow offset's bit ([`FOLLOW_DRS`]).
 const ALL_OFFSETS: u8 = 0x0F;
 
+/// The scroll return's candidate index in [`Witness::judge_follow`], past the
+/// four [`FOLLOW_DRS`]: the offset back down by [`Witness::scroll_carry`]
+/// rows, its arrival bit `1 << RETURN_K`.
+const RETURN_K: usize = FOLLOW_DRS.len();
+
+/// The arrival bit of the scroll return ([`RETURN_K`]), set on every armed
+/// record while a carry past the follow offsets is pending: a scroll moved the
+/// records with the screen, so nothing they saw before it is about the row
+/// they came from ([`Witness::scroll_carry`]).
+const RETURN_BIT: u8 = 1 << RETURN_K;
+
+/// The caret's carry's candidate index in [`Witness::judge_follow`], past the
+/// scroll return: the offset to the row the caret was seen on this frame
+/// ([`Witness::carry_caret`]), its arrival bit `1 << CARRY_K`.
+const CARRY_K: usize = RETURN_K + 1;
+
+/// The arrival bit of the caret's carry ([`CARRY_K`]), set on every armed
+/// record while one is pending: the row is past the follow offsets, so no
+/// record ever looked at it, and the caret that moved there is the second
+/// witness ([`Witness::carry_caret`]).
+const CARRY_BIT: u8 = 1 << CARRY_K;
+
 /// A cell whose recorded glyph went BLANK this walk — provisional until its
 /// run has decided the clock ([`Witness::walk`]).
 #[derive(Clone, Copy, Debug)]
@@ -586,6 +610,16 @@ pub struct Witness {
     /// copies on rows it brings in from here, starting their [`Seen::pending`]
     /// clocks ([`Witness::translate`]). `None` until the first walk.
     last_walk: Option<Instant>,
+    /// The rows full-grid scrolls carried every record up since the last walk
+    /// ([`Witness::translate`]); a band move, a reset and the next walk end
+    /// it. The follow pass searches back down by this much
+    /// ([`Witness::scroll_carry`]).
+    scroll_carry: u16,
+    /// The rows from the caret mirror to the row the caret was seen on this
+    /// frame, while that is past the follow offsets and not the scroll return
+    /// ([`Witness::carry_caret`]); `0` for none. Set for one follow pass and
+    /// ended with it ([`Witness::end_scroll_carry`]).
+    caret_carry: i16,
     /// The shift pass's view of one run ([`Witness::shift_runs`]): every
     /// resident, non-leaving cell as `(col, recorded, gone)` in column order;
     /// `recorded` is `None` for a never-armed cell, `gone` when the recorded
@@ -630,7 +664,10 @@ pub struct FollowRun {
     pub lo: u16,
     /// The rightmost column carried, grown the same way.
     pub hi: u16,
-    /// Rows to the text: `−1` one row up, `+1` one row down, then `±2`.
+    /// Rows to the text: `−1` one row up, `+1` one row down, then `±2`; past
+    /// those only the scroll return, `+k` for a carry of `k`, searched first
+    /// ([`Witness::scroll_carry`]), and the caret's carry, the rows the caret
+    /// moved this frame, searched next ([`Witness::carry_caret`]).
     pub dr: i16,
 }
 
@@ -674,8 +711,8 @@ enum SoleArrival {
     /// The exact short held park's source run: an exact relaid suffix of at
     /// least three glyphs ([`Witness::follow_runs_with_short_park`]).
     ShortPark,
-    /// The hand's own glyph at column `glyph`, the frame's caret standing on
-    /// row `to` ([`Witness::follow_hand`]).
+    /// The hand's last witnessed glyph at column `glyph`, the frame's caret
+    /// standing on row `to` ([`Witness::follow_hand`]).
     Hand { glyph: u16, to: u16 },
 }
 
@@ -707,8 +744,74 @@ impl Witness {
             deferred_runs: Vec::with_capacity(WITNESS_CAP),
             awaiting: None,
             last_walk: None,
+            scroll_carry: 0,
+            caret_carry: 0,
             shift_cells: Vec::new(),
         }
+    }
+
+    /// THE SCROLL RETURN: how many rows full-grid scrolls carried the records
+    /// up since the last walk, while that is past the follow offsets
+    /// (`> 2`), else `0`. A bottom-anchored TUI (Claude Code's composer under
+    /// a transcript that grew while it ran a tool) rewrites the screen in one
+    /// synchronized frame: the transcript's new rows first, a line feed past
+    /// the last row scrolling `k` rows, then its box redrawn on the screen row
+    /// it had. The grid reports the scroll, so the host carries every cell up
+    /// `k` and samples nothing that frame; the next frame finds the box's
+    /// text `k` rows below its light, past `±1`/`±2`. The follow pass then
+    /// searches that one row too ([`Witness::follow_runs`]), and
+    /// `Engine::ribbon_rows_for` names it. A carry of one or two rows is
+    /// already among [`FOLLOW_DRS`].
+    #[must_use]
+    pub fn scroll_carry(&self) -> u16 {
+        if self.scroll_carry > 2 {
+            self.scroll_carry
+        } else {
+            0
+        }
+    }
+
+    /// THE CARET'S CARRY: this frame's caret stands `dr` rows from the caret
+    /// mirror, the hand's row, with no key to say why (a relocation the
+    /// licence gate declined, `Engine::observe_caret`). A bottom-anchored TUI
+    /// on a screen its transcript has not filled yet (Claude Code's composer
+    /// in a fresh session, while it runs tools) pushes its box down with no
+    /// scroll: each tool step writes its rows where the box stood and redraws
+    /// the box under them, the caret back in it, `k` rows lower. Nothing in
+    /// the grid says how far, and three or four rows are past `±1`/`±2`, so
+    /// the band was left on the transcript's new rows and melted there. The
+    /// caret says how far: the follow pass searches that one row too, after
+    /// the scroll return, under the same gone, half and block gates with every
+    /// record counted as arrived (no record ever looked at a row that far).
+    /// The gone gate is the evidence the text left; the caret is the second
+    /// witness that it went exactly there. On a scroll's frame the offset is
+    /// in the carried frame, so a box pushed down as far as the bottom and
+    /// then scrolled (the step that fills the screen) is found too. Within
+    /// the follow offsets, or equal to the scroll return, it adds nothing.
+    /// Set before the follow pass and ended with it.
+    pub(crate) fn carry_caret(&mut self, dr: i16) {
+        let ret = i16::try_from(self.scroll_carry()).unwrap_or(i16::MAX);
+        self.caret_carry = if dr.unsigned_abs() > 2 && dr != ret {
+            dr
+        } else {
+            0
+        };
+    }
+
+    /// The caret's carry pending for this frame's follow pass
+    /// ([`Witness::carry_caret`]), `0` for none.
+    #[must_use]
+    pub(crate) fn caret_carry(&self) -> i16 {
+        self.caret_carry
+    }
+
+    /// The follow pass searched the carries ([`Witness::scroll_carry`],
+    /// [`Witness::carry_caret`]) on this frame's rows: they end here, as the
+    /// scroll's does at the walk, which a scroll's own frame skips
+    /// (`CursorGlow::scroll_rows`).
+    pub(crate) fn end_scroll_carry(&mut self) {
+        self.scroll_carry = 0;
+        self.caret_carry = 0;
     }
 
     /// The follow pass's search (see the module doc). For every run
@@ -731,6 +834,21 @@ impl Witness {
     ///   block, a prefix or suffix of the run, never letters either side of a
     ///   hole. The first qualifying `dr` wins; a twin row is refused and the
     ///   search continues (`a_twin_testifies_only_about_its_own_row`).
+    /// * Searched before those, after scrolls carried the records up `k > 2`
+    ///   rows since the last walk: the row `k` below, where the text stood on
+    ///   screen before the scroll ([`Witness::scroll_carry`]), under the same
+    ///   gates with every record counted as arrived, since what each saw
+    ///   before the scroll is not about that row. It leads because a box
+    ///   redrawn in place stands there, and its other line can stand one or
+    ///   two rows from where the scroll put this one. The gone gate is the
+    ///   evidence that the text did not scroll: a transcript that scrolled
+    ///   keeps its glyphs where the scroll put them and is never followed
+    ///   (`tests/composer_under_a_scrolling_transcript.rs`).
+    /// * Searched next, while the caret was seen this frame on a row past the
+    ///   follow offsets from the hand's: that row ([`Witness::carry_caret`]),
+    ///   under the same gates with every record counted as arrived. A box
+    ///   pushed down by a transcript that has not filled the screen stands
+    ///   there.
     ///
     /// A glyph found without evidence of arrival is neutral: in a composer the
     /// row above is the previous line of the paragraph, and a glyph under the
@@ -821,8 +939,10 @@ impl Witness {
     /// and ride with the block, so a wake whose text an insert pushed along
     /// cannot dilute the half-gate. With `rode_to` the frame's caret stands on
     /// that row, a second witness: one arrived glyph there, the hand's own,
-    /// with no other counted record, names the run. Pure in records, cells
-    /// and samples; names nothing for a hand with no typed glyph under it.
+    /// with no other counted record, names the run. The hand's own is its last
+    /// glyph the witness holds a record of: a blank typed after it (the space
+    /// that ends a word) has none to arrive. Pure in records, cells and
+    /// samples; names nothing for a hand with no typed glyph under it.
     pub(crate) fn follow_hand(
         &mut self,
         cells: &[Cell],
@@ -830,12 +950,26 @@ impl Witness {
         hand: (u16, u16),
         rode_to: Option<u16>,
     ) -> Option<FollowRun> {
-        let glyph = hand.1.checked_sub(1)?;
+        let last = hand.1.checked_sub(1)?;
         let cohort = cells
             .iter()
-            .filter(|c| !c.leaving() && c.typing && c.row == hand.0 && c.col == glyph)
+            .filter(|c| !c.leaving() && c.typing && c.row == hand.0 && c.col == last)
             .max_by_key(|c| c.born)?
             .cohort;
+        let glyph = cells
+            .iter()
+            .filter(|c| {
+                !c.leaving()
+                    && c.typing
+                    && c.row == hand.0
+                    && c.cohort == cohort
+                    && c.col <= last
+                    && self
+                        .find(c.row, c.col, c.born)
+                        .is_some_and(|i| !self.seen[i].released)
+            })
+            .map(|c| c.col)
+            .max()?;
         let sole = rode_to.map_or(SoleArrival::Refused, |to| SoleArrival::Hand { glyph, to });
         self.judge_follow(cells, rows, (hand.0, cohort), true, sole)
             .0
@@ -858,6 +992,13 @@ impl Witness {
         let Some(own) = rows.iter().find(|s| s.row == row) else {
             return (None, 0);
         };
+        // The scroll return ([`Witness::scroll_carry`]) and the caret's carry
+        // ([`Witness::carry_caret`]): one more offset each, every record
+        // arrived there.
+        let carry = self.scroll_carry();
+        let caret_carry = self.caret_carry;
+        let ret =
+            if carry > 0 { RETURN_BIT } else { 0 } | if caret_carry != 0 { CARRY_BIT } else { 0 };
         self.follow_armed.clear();
         for cell in cells {
             if cell.leaving()
@@ -876,7 +1017,7 @@ impl Witness {
             }
             let gone = unit_at(own.cols, cell.col) != seen.unit;
             self.follow_armed
-                .push((cell.col, seen.unit, gone, seen.arrivals()));
+                .push((cell.col, seen.unit, gone, seen.arrivals() | ret));
         }
         self.follow_armed.sort_unstable_by_key(|a| a.0);
         self.follow_armed.dedup_by_key(|a| a.0);
@@ -894,7 +1035,17 @@ impl Witness {
         }
         let relaid = Self::relaid_suffix(&self.follow_armed, own.cols);
         let mut evidence = false;
-        for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
+        // The return leads: after a scroll it is where the text stands if the
+        // program redrew it in place, and a line one or two rows from where
+        // the scroll put it is the box's other line.
+        // The caret's carry follows it: the caret moved there this frame.
+        let back = i16::try_from(carry).ok().filter(|&dr| dr > 0);
+        let offsets = back
+            .map(|dr| (RETURN_K, dr))
+            .into_iter()
+            .chain((caret_carry != 0).then_some((CARRY_K, caret_carry)))
+            .chain(FOLLOW_DRS.into_iter().enumerate());
+        for (k, dr) in offsets {
             let Some(target) = row.checked_add_signed(dr) else {
                 continue;
             };
@@ -945,11 +1096,17 @@ impl Witness {
             // The extent, riders included, grows over a bordering cell of the
             // run with no record in the verdict (never armed, or not typed
             // under `typed_only`) while no record past it on that side stayed
-            // behind.
+            // behind. On the scroll return the whole line came back, so a
+            // leaving cell of the run's rides too (the tail a wrap's fold is
+            // drawing in), not melting on the row the scroll put it on; on
+            // the caret's carry the whole box moved, and the same holds.
             let is_cell = |col: u16| {
-                cells
-                    .iter()
-                    .any(|c| !c.leaving() && c.row == row && c.cohort == cohort && c.col == col)
+                cells.iter().any(|c| {
+                    (!c.leaving() || k >= RETURN_K)
+                        && c.row == row
+                        && c.cohort == cohort
+                        && c.col == col
+                })
             };
             let armed_at = |col: u16| {
                 self.follow_armed
@@ -1348,6 +1505,8 @@ impl Witness {
         self.seen.clear();
         self.blank_seen.clear();
         self.awaiting = None;
+        self.scroll_carry = 0;
+        self.caret_carry = 0;
     }
 
     /// THE HAND'S LONE GLYPH WAITS FOR ITS CARET. `run` (the hand's run, named
@@ -1385,6 +1544,7 @@ impl Witness {
         if rows == 0 {
             return;
         }
+        self.scroll_carry = self.scroll_carry.saturating_add(rows);
         let first_new = bottom.saturating_sub(rows);
         let last_walk = self.last_walk;
         self.seen.retain_mut(|s| {
@@ -1433,6 +1593,8 @@ impl Witness {
         if delta == 0 || top > bottom {
             return;
         }
+        // Not one uniform carry any more: no scroll return.
+        self.scroll_carry = 0;
         self.seen
             .retain_mut(|s| match band_row(s.row, top, bottom, delta) {
                 Some(row) => {
@@ -1611,8 +1773,10 @@ impl Witness {
         for s in &mut self.seen {
             s.live = false;
         }
-        // The frame a scroll before the next walk dates its rows from.
+        // The frame a scroll before the next walk dates its rows from, and
+        // the end of the carry the follow pass just searched.
         self.last_walk = Some(now);
+        self.scroll_carry = 0;
         // The rows sampled at every follow offset from the row last looked up,
         // recomputed only when the walk changes row.
         let mut nb_row = None;

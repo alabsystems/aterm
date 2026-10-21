@@ -2181,7 +2181,8 @@ type Decide<'a> = dyn Fn(&[String], crate::build_cache::Tool) -> Option<Vec<Stri
 /// An upstream `cargo`'s `args`, with the build cache's `--config` ([`crate::build_cache`])
 /// when `decide` adds it and the cargo that runs reads `build.build-dir` (its `-vV`
 /// release, resolved and cached as a signpost resolves it). Trust's own `cargo` is
-/// `targo`, so it follows `targo`'s rule: its verified lane is left alone. Anything
+/// `targo`, so it follows `targo`'s rule, but its `trust` lane is handed nothing here
+/// (that folder goes through the environment, which only the shim sets). Anything
 /// unknown keeps the line as typed.
 fn upstream_cargo_args(
     target: &Path,

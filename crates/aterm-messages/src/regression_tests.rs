@@ -242,8 +242,10 @@ fn a_squatter_moved_by_the_seed_lands_above_the_parents_band() {
             unix_ms: 3,
             tag: "system".into(),
             severity: "warn".into(),
+            posted_severity: None,
             glyph: '\u{26a0}',
             title: "Parent row".into(),
+            short_title: None,
             detail: Vec::new(),
             actions: Vec::new(),
             hold: Hold::Default.encode(),
@@ -686,7 +688,10 @@ fn a_forced_short_elapsed_slot_spends_nothing() {
         live: true,
         glyph: '\u{21e3}',
         title: "Installing Homebrew",
+        title_short: None,
         detail0: None,
+        step: false,
+        step_short: None,
         meter: Some((None, "~3 GB")),
         busy: true,
         animated: false,
@@ -914,8 +919,10 @@ fn a_squatter_the_seed_moved_merges_its_ending_on_reload() {
                 unix_ms: 300,
                 tag: "system".into(),
                 severity: "info".into(),
+                posted_severity: None,
                 glyph: '\u{2139}',
                 title: "Parent row".into(),
+                short_title: None,
                 detail: Vec::new(),
                 actions: Vec::new(),
                 hold: Hold::Default.encode(),
@@ -1113,6 +1120,7 @@ fn view_at(at_unix_ms: u64) -> MessageView {
     MessageView {
         id: 1,
         at_unix_ms,
+        began_unix_ms: at_unix_ms,
         tag: "toolchain".into(),
         severity: "info",
         glyph: '\u{2139}',
@@ -1391,6 +1399,45 @@ fn messages_prints_load_only_where_the_glass_says_it() {
         !line.contains(" load="),
         "the wire says a load the glass does not: {line}"
     );
+}
+
+/// A ROW IN ITS REVEAL'S GRACE SAYS SO ON THE WIRE (the review of the login
+/// carry, 2026-10-20: `lab instance --image` waited half a second of quiet
+/// and imaged a band with no standing ask on it, its two-second grace still
+/// running): `reveal=pending` until the row is eligible for the band, then
+/// never again. NEGATIVE CONTROL: a row posted with no grace never says it.
+#[test]
+fn messages_says_a_row_in_its_grace_is_pending_until_it_is_revealed() {
+    let now = t0();
+    let mut c = fresh(now);
+    let enc = |s: &str| s.to_string();
+    let pending = |c: &MessageCenter| -> Vec<bool> {
+        message_rows(c, &ReadQuery::default(), 2, &enc)
+            .iter()
+            .map(|l| l.contains(" reveal=pending"))
+            .collect()
+    };
+    let msg = Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.92.0")
+        .in_flight()
+        .hold(Hold::Live {
+            stale_after: STALE_TAILED,
+        })
+        .key("update.progress")
+        .reveal_after(PROGRESS_GRACE);
+    c.post(msg, stamp(1), now);
+    assert_eq!(pending(&c), [true]);
+    c.settle(now + PROGRESS_GRACE, true);
+    assert_eq!(pending(&c), [false], "revealed");
+    // NEGATIVE CONTROL.
+    let mut c = fresh(now);
+    let msg = Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.92.0")
+        .in_flight()
+        .hold(Hold::Live {
+            stale_after: STALE_TAILED,
+        })
+        .key("update.progress");
+    c.post(msg, stamp(1), now);
+    assert_eq!(pending(&c), [false]);
 }
 
 /// A page host with nothing staged, no files and no upgrades.

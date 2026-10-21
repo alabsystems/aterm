@@ -555,6 +555,51 @@ fn an_ended_renewable_login_is_due_and_never_signed_out() {
     assert_eq!(signed_out(&r, &state, &enrolled, NOW + HOUR), ["work-2"]);
 }
 
+/// [`note_signed_back`] (the review's acct-6): a renewable login ended,
+/// then signed in again in its tab, is `ok` again — out of the due list, a
+/// candidate's word — its forecast started over from that sign-in (the old
+/// notice gone); a struck row with no email leaves the signed-out list.
+/// NEGATIVE CONTROLS: a row not recorded signed out, and a word older than
+/// the one on record, change nothing.
+#[test]
+fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
+    let r = roster();
+    let enrolled = every(&r);
+    let (mut state, mut logins) = renewed(NOW);
+    assert!(note_login_notice(&mut logins, "main", 2, NOW + HOUR));
+    note_login_end(&mut state, &mut logins, "main", NOW + 2 * HOUR);
+    assert_eq!(
+        renew_due(&r, &logins, &state, &enrolled, NOW + 2 * HOUR),
+        ["main"]
+    );
+    let back = NOW + 3 * HOUR;
+    let events = note_signed_back(&mut state, &mut logins, "main", back);
+    assert!(
+        events.iter().any(|e| e.kind == Kind::Auth && e.wakes()),
+        "{events:?}"
+    );
+    assert_eq!(state.account("main").auth, Auth::Ok);
+    let binding = logins.get("main").expect("bound");
+    assert_eq!(
+        (binding.renewed_at, binding.notice_end, binding.served_at),
+        (Some(back), None, Some(back))
+    );
+    assert!(renew_due(&r, &logins, &state, &enrolled, back).is_empty());
+    // A struck row with no email.
+    note_auth(&mut state, "work-2", Auth::SignedOut, back);
+    assert_eq!(signed_out(&r, &state, &enrolled, back), ["work-2"]);
+    assert!(!note_signed_back(&mut state, &mut logins, "work-2", back + 60).is_empty());
+    assert!(signed_out(&r, &state, &enrolled, back + 60).is_empty());
+    assert!(logins.get("work-2").is_none(), "no binding made");
+    // NEGATIVE CONTROLS: not signed out; older than the word on record.
+    let before = (state.clone(), logins.clone());
+    assert!(note_signed_back(&mut state, &mut logins, "main", back + HOUR).is_empty());
+    assert_eq!((state.clone(), logins.clone()), before);
+    note_auth(&mut state, "work-2", Auth::SignedOut, back + 2 * HOUR);
+    assert!(note_signed_back(&mut state, &mut logins, "work-2", back + HOUR).is_empty());
+    assert_eq!(state.account("work-2").auth, Auth::SignedOut);
+}
+
 #[test]
 fn due_logins_and_none_working_are_the_renewable_rows() {
     let r = roster();

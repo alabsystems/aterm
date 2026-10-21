@@ -818,6 +818,51 @@ fn sparse_combining_columns_and_duplicates_match_cpu() {
     }
 }
 
+/// Small footer marks use the base's script raster and horizontal nudge in
+/// both passes: atlas collection and emission. Ordinary marks stay unchanged.
+#[test]
+fn small_script_combining_marks_and_nudges_match_cpu() {
+    use aterm_core::terminal::Script;
+
+    let (mut cpu, mut gpu) = backends(24.0, Theme::default());
+    let mut win = aterm_gpu::WindowGpu::new();
+    for double in [false, true] {
+        for script in [
+            Script::Normal,
+            Script::Sub { nudge: -8 },
+            Script::Sub { nudge: 0 },
+            Script::Sub { nudge: 8 },
+        ] {
+            let mut term = Terminal::new(3, 12);
+            term.process(b"\x1b[?25l\x1b[2;4Hx");
+            let mut input = term.cell_frame(3, 12);
+            input.cells[1][3].script = script;
+            input.combining[1] = vec![(3, vec!['\u{0301}', '\u{0323}'].into_boxed_slice())];
+            if double {
+                input.line_sizes[1] = LineSize::DoubleWidth;
+            }
+            let mut bare = input.clone();
+            bare.combining[1].clear();
+            let bare_frame = cpu.render_input(&bare);
+            let cpu_frame = cpu.render_input(&input);
+            let gpu_frame = gpu.render_input(&mut win, &input, None);
+            assert_ne!(
+                cpu_frame.pixels, bare_frame.pixels,
+                "{script:?}, double-width {double}: no visible accent ink"
+            );
+            assert_eq!(
+                (gpu_frame.width, gpu_frame.height),
+                (cpu_frame.width, cpu_frame.height)
+            );
+            let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+            assert!(
+                delta <= 8,
+                "{script:?}, double-width {double}: accent parity delta {delta} > 8"
+            );
+        }
+    }
+}
+
 /// A renderer reused across changing dimensions produces frames identical to a
 /// fresh renderer: grow, shrink, grow and a repeated size, each compared pixel
 /// for pixel, so stale resident resources are caught.

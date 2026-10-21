@@ -19,15 +19,15 @@
 // These tests drive REAL shells on a REAL pty (`script`, like the fish lanes),
 // started the way aterm starts a tab — the ZDOTDIR wrapper for zsh, the
 // `--rcfile` wrapper for bash — and measure the two symptoms the owner hit:
-// Ctrl-C sent into `sleep 4` must end it (the integration's own `133;D;130`, the
-// status its SIGINT gives it), and `read -r x` must end on a CR. The raw-mode program is `sh -c
+// Ctrl-C sent into a `head -c 1` waiting for input must end it (the integration's own
+// `133;D;130`, the status its SIGINT gives it), and `read -r x` must end on a CR. The raw-mode program is `sh -c
 // 'stty raw -echo; …'` ending by SIGKILL, `exit 1` or `exit 0` — never by an
 // abort (no crash reports), and no python or node needed.
 //
 // NEGATIVE CONTROL, in the tests themselves: the same shells are also started
 // from a folder holding THIS build's scripts with only the fix's call sites cut
 // out (`unfixed_folder`), and there the same measurements must show the defect —
-// ISIG off, Ctrl-C not ending `sleep 4`, CR not ending `read`. A pass is
+// ISIG off, Ctrl-C not ending `head -c 1`, CR not ending `read`. A pass is
 // therefore never a property of the harness.
 
 /// The folder name the unfixed scripts are installed under: a folder address
@@ -146,28 +146,39 @@ impl LiveShell {
         flags
     }
 
-    /// Ctrl-C into a running `sleep 4`: did it END the sleep? Judged by the
-    /// command's own status in the integration's `133;D;<status>`, not by a clock:
-    /// 130 is `sleep` killed by the SIGINT a working ISIG makes of ^C, and a ^C the
-    /// tty swallowed as a byte lets it run out with 0. Leaves the shell at a
-    /// prompt either way, with the line editor's buffer cleared (a ^C that was NOT
-    /// a signal is a byte zle may still hold).
-    fn ctrl_c_interrupts_sleep(&mut self) -> bool {
+    /// Ctrl-C into a `head -c 1` waiting for input: did it END the command?
+    /// Judged by the command's own status in the integration's
+    /// `133;D;<status>`, never by a clock: 130 is `head` killed by the SIGINT a
+    /// working ISIG makes of ^C, and a ^C the tty swallowed is a byte `head`
+    /// reads, ending with 0. Leaves the shell at a prompt either way, with the
+    /// line editor's buffer cleared.
+    fn ctrl_c_interrupts(&mut self) -> bool {
         self.ctrl_c_status("") == "130"
     }
 
-    /// Type `<runner>sh -c 'echo SLEEP42; exec sleep 4'`, send Ctrl-C once the
-    /// command runs, and return its status. "Runs" is the command's OWN word: a
-    /// foreground job owns the tty before it execs (both shells' children call
-    /// `tcsetpgrp` first), so a ^C after `SLEEP42` reaches `sh` or the `sleep` it
-    /// became, never the shell. A fixed pause after `133;C` stood in for that and
-    /// under load sent the ^C while zsh was still forking, where it interrupted
-    /// nothing (`133;D;0` after `^C`).
+    /// Type `<runner>sh -c 'echo WAIT42; exec head -c 1 >/dev/null'`, send
+    /// Ctrl-C and a newline once the command runs, and return its status.
+    /// "Runs" is the command's OWN word: a foreground job owns the tty before it
+    /// execs (both shells' children call `tcsetpgrp` first), so a ^C after
+    /// `WAIT42` reaches `sh` or the `head` it became, never the shell. A fixed
+    /// pause after `133;C` stood in for that and under load sent the ^C while
+    /// zsh was still forking, where it interrupted nothing (`133;D;0` after `^C`).
+    ///
+    /// `head` ends on input alone, so no timer decides the outcome: a `sleep 4`
+    /// here ran out before a ^C sent under load reached it (`133;D;0` on a
+    /// healthy tty, seen at load 65), and the control waited out all 4 s. The
+    /// newline is for a tty whose ISIG is off but ICANON on, where `head` gets
+    /// the ^C byte only once a line ends. Where ISIG is on, the ^C's SIGINT is
+    /// posted before the newline is queued, so it kills `head` whatever it
+    /// reads; the newline is then an empty line at the prompt, which marks no
+    /// command.
     fn ctrl_c_status(&mut self, runner: &str) -> String {
         let from = self.len();
-        self.send_bytes(format!("{runner}sh -c 'echo SLEEP$((40+2)); exec sleep 4'\r").as_bytes());
-        let running = self.wait_for_after("SLEEP42", from);
-        self.send_bytes(b"\x03");
+        self.send_bytes(
+            format!("{runner}sh -c 'echo WAIT$((40+2)); exec head -c 1 >/dev/null'\r").as_bytes(),
+        );
+        let running = self.wait_for_after("WAIT42", from);
+        self.send_bytes(b"\x03\n");
         let status = self.status_after(running);
         // Ctrl-U: kill-whole-line in both line editors' default emacs bindings.
         self.send_bytes(b"\x15");
@@ -226,7 +237,7 @@ impl LiveShell {
 
 /// Assert the tty is sane for the next command: the flags a raw mode clears are
 /// back on (IXON as `want_ixon` says — the user's own choice), Ctrl-C ends
-/// `sleep 4` and a CR ends `read`.
+/// `head -c 1` and a CR ends `read`.
 #[cfg(unix)]
 fn assert_tty_usable(sh: &mut LiveShell, what: &str, want_ixon: bool) {
     let flags = sh.flags();
@@ -247,8 +258,8 @@ fn assert_tty_usable(sh: &mut LiveShell, what: &str, want_ixon: bool) {
         );
     }
     assert!(
-        sh.ctrl_c_interrupts_sleep(),
-        "{}: {what}: Ctrl-C did not end `sleep 4` (its status was not 130)\n{}",
+        sh.ctrl_c_interrupts(),
+        "{}: {what}: Ctrl-C did not end `head -c 1` (its status was not 130)\n{}",
         sh.label,
         sh.transcript()
     );
@@ -273,8 +284,8 @@ fn assert_tty_broken(sh: &mut LiveShell, what: &str) {
         );
     }
     assert!(
-        !sh.ctrl_c_interrupts_sleep(),
-        "{}: {what}: the control's Ctrl-C ended `sleep 4` — the measurement cannot tell\n{}",
+        !sh.ctrl_c_interrupts(),
+        "{}: {what}: the control's Ctrl-C ended `head -c 1` — the measurement cannot tell\n{}",
         sh.label,
         sh.transcript()
     );
@@ -402,8 +413,7 @@ fn spawn_pty_shell_unwaited(
     }
     cmd.env("HOME", &fx.home)
         .env("PATH", "/usr/bin:/bin")
-        .env("TERM", "xterm-256color")
-        .env_remove("BASH_ENV");
+        .env("TERM", "xterm-256color");
     for (key, value) in env_add {
         cmd.env(key, value);
     }
@@ -430,7 +440,7 @@ fn live_pty_zsh() -> &'static str {
 }
 
 /// A NEW integrated zsh: a raw-mode child dying by SIGKILL, `exit 1` or `exit 0`
-/// leaves the next command's tty sane — Ctrl-C ends `sleep 4`, a CR ends `read`
+/// leaves the next command's tty sane — Ctrl-C ends `head -c 1`, a CR ends `read`
 /// — and the user's own `stty -ixon`, typed before, survives all three (the
 /// freeze puts back exactly what the shell had). The shell reports its tty
 /// frozen. The same scenario from the unfixed scripts is the negative control.
@@ -788,9 +798,10 @@ fn an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty() {
 /// a `ttyctl -f` written after the command never ran — and Ctrl-C at `tset`'s
 /// "TERM = (unknown)?" question, or during `reset`'s pause, is the ordinary way
 /// that happens. The re-freeze is in an `always` block now, which runs on that
-/// path too. Driven through `__aterm_tty_thaw_run` with a `sleep` so the timing is
-/// the test's, not a terminal database's; the shell must report its tty frozen
-/// afterwards, and a raw child's `exit 0` must then leave the next command sane.
+/// path too. Driven through `__aterm_tty_thaw_run` with a `head -c 1` that ends
+/// only on the ^C, so the timing is the test's, not a terminal database's; the
+/// shell must report its tty frozen afterwards, and a raw child's `exit 0` must
+/// then leave the next command sane.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_refreezes_when_a_thawed_command_is_interrupted() {
@@ -804,7 +815,7 @@ fn an_integrated_zsh_refreezes_when_a_thawed_command_is_interrupted() {
     assert_eq!(
         status,
         "130",
-        "zsh: Ctrl-C ended the thawed `sleep 4`\n{}",
+        "zsh: Ctrl-C ended the thawed `head -c 1`\n{}",
         sh.transcript()
     );
     assert!(
@@ -1936,5 +1947,60 @@ fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
     block(&mut sh, "echo in-log");
     block(&mut sh, "exec >&3 3>&-");
     assert_eq!(read("out-exec"), "in-log\n", "bash: `exec >out-exec`");
+    sh.finish();
+}
+
+/// zsh's `133;B` says it stands where the buffer starts (`aterm_input=start`)
+/// only over an EMPTY buffer. zle draws a line pre-filled from its buffer stack
+/// before zle-line-init runs, and the mark comes from zle-line-init: after that
+/// text, where aterm-core must not take it for the buffer's start
+/// (`Terminal::input_region_start`). Here `print -z` pushes `echo pushed`, and
+/// the next prompt pops it: its signed `B` comes after the popped text and
+/// does not say so, while the prompt before it, over an empty buffer, does
+/// (the NEGATIVE CONTROL of the same shell).
+#[cfg(unix)]
+#[test]
+fn an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one() {
+    let zsh = live_pty_zsh();
+    let fx = LiveFixture::new();
+    let dir = install_script_set(&fx.base).expect("install");
+    std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
+    let mut sh = spawn_pty_shell(
+        ShellType::Zsh,
+        zsh,
+        &fx,
+        &dir,
+        &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
+    );
+    let signed_b = format!("\x1b]133;B;id={REKEY_OLD}");
+    // The mark through its terminator, from the offset where it starts.
+    let mark_at = |sh: &mut LiveShell, from: usize| -> String {
+        let end = sh.wait_for_after(&signed_b, from);
+        let close = sh.wait_for_after("\x07", end);
+        stdout_between(sh, end - signed_b.len(), close)
+    };
+    let empty = mark_at(&mut sh, 0);
+    assert_eq!(
+        empty,
+        format!("{signed_b};aterm_input=start\x07"),
+        "zsh: over an empty buffer the B says so\n{}",
+        sh.transcript()
+    );
+    let next = sh.run_line("print -z echo pushed", "0");
+    let prefilled = mark_at(&mut sh, next);
+    assert_eq!(
+        prefilled,
+        format!("{signed_b}\x07"),
+        "zsh: after a pre-filled line the B says nothing of the buffer's start\n{}",
+        sh.transcript()
+    );
+    let drawn = stdout_between(&sh, next, sh.len());
+    let (text, mark) = (drawn.find("echo pushed"), drawn.find(&signed_b));
+    assert!(
+        matches!((text, mark), (Some(t), Some(m)) if t < m),
+        "zsh: the popped line is drawn before the mark\n{drawn:?}"
+    );
+    // Ctrl-U takes the popped line back before `exit`.
+    sh.send_bytes(b"\x15");
     sh.finish();
 }

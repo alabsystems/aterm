@@ -4,6 +4,7 @@
 use super::*;
 use crate::layout::{OFF_HIST_CAP, PAGE};
 use crate::records::{KIND_BYTES, KIND_PAD, TailHeader, decode_keyframe};
+use crate::recover::ControlVerdict;
 use crate::store::{RegionView, VecStore};
 use aterm_core::terminal::Terminal;
 
@@ -736,6 +737,135 @@ fn the_settle_keeps_a_record_behind_a_pad() {
     assert_eq!(w.tail_floor(), 72);
 }
 
+/// AN ERASED REGION HOLDS NOTHING IT RECORDED AND READS AS NO REGION (R6 review). The
+/// memory shed's superseded region outlives its writer while the keeper holds it, and a
+/// clear made then has no writer left to settle it there, so the whole region is erased:
+/// no token a keyframe, the tail or the history ring held is left, a restore takes the
+/// META rung, no page nothing wrote is made resident, and a stop anywhere in the erase
+/// leaves either the region as it was (no store made yet) or one that reads as no region,
+/// never a screen rebuilt from what is left.
+/// NEGATIVE CONTROL: before the erase the region holds every token and restores a screen.
+#[test]
+fn an_erased_region_holds_nothing_it_recorded_and_reads_as_no_region() {
+    use crate::recover::{RecoverPolicy, Recovery, recover};
+    use crate::store::{CountdownStore, Touched};
+    let geometry = Geometry::custom(64 * 1024, 4096, 16 * 1024).expect("a small region");
+    // The session's journal up to the erase, and the erase itself when `erase`.
+    let build = |budget: Option<usize>, erase: bool| {
+        let store = Touched::new(CountdownStore::new(geometry.region_len, budget), None);
+        let mut w = JournalWriter::create(store, geometry, &WRITER).expect("created");
+        let mut t = Terminal::new(4, 30);
+        let fence = t.history_fence();
+        w.reset_history(
+            HistoryIdentity::of(&fence),
+            fence.oldest,
+            geometry.hist_cap_phys,
+            false,
+        )
+        .expect("the ring");
+        keyframe_of(&mut w, &t, 64);
+        for i in 0..40u64 {
+            let line = format!("{}\r\n", &token(i)[..24]);
+            t.process(line.as_bytes());
+            w.append_slice(line.as_bytes()).expect("appended");
+            if i == 29 {
+                keyframe_of(&mut w, &t, 64);
+            }
+        }
+        let fence = t.history_fence();
+        let lines = t
+            .history_lines_since_fence(&fence, fence.oldest, 1024)
+            .expect("holds");
+        w.append_history(fence.oldest, &lines).expect("fits");
+        store_ctl_count(w.store(), 47_000).expect("count before clear");
+        let before = w.store().get_ref().stores();
+        if erase {
+            erase_region(w.store()).expect("erased");
+        }
+        (w, before)
+    };
+    let restores = |w: &JournalWriter<Touched<CountdownStore>>| {
+        matches!(
+            recover(
+                &w.store().get_ref().snapshot(),
+                RecoverPolicy {
+                    tail: true,
+                    config_fp: 1,
+                    scratch_nonce: [0xA5; 32],
+                },
+                Terminal::new,
+            ),
+            Recovery::Restored(_)
+        )
+    };
+    let (kept, _) = build(None, false);
+    assert_eq!(
+        tokens_left(&kept, 0..40),
+        40,
+        "the control: all of it is there"
+    );
+    assert!(restores(&kept), "the control restores a screen");
+
+    let (erased, before) = build(None, true);
+    assert_eq!(
+        tokens_left(&erased, 0..40),
+        0,
+        "nothing it recorded is left"
+    );
+    let bytes = region_of(&erased);
+    assert!(
+        bytes.iter().enumerate().all(|(at, &b)| {
+            (OFF_MAGIC..OFF_MAGIC + 8).contains(&at)
+                || (OFF_CTL_COUNT..OFF_CTL_COUNT + 8).contains(&at)
+                || b == 0
+        }),
+        "only the counter-only marker and count remain"
+    );
+    assert_eq!(
+        crate::read_erased_turn_count(&erased.store().get_ref().snapshot()),
+        Some(47_000)
+    );
+    assert!(!restores(&erased), "the META rung");
+    // An arbitrary count word alone does not authorize the counter-only reader.
+    // The old zero-magic erase cannot carry it: the new marker is required.
+    let legacy = erased.store().get_ref().snapshot();
+    legacy
+        .store_u64_release(OFF_MAGIC, 0)
+        .expect("old erased marker");
+    assert_eq!(
+        legacy.load_u64_acquire(OFF_CTL_COUNT).expect("count"),
+        47_000
+    );
+    assert_eq!(crate::read_erased_turn_count(&legacy), None);
+    assert!(crate::read_header(&legacy).is_err());
+    assert_eq!(
+        erased.store().touched_bytes(),
+        kept.store().touched_bytes(),
+        "no page nothing wrote is made resident"
+    );
+    let total = erased.store().get_ref().stores();
+    assert!(total > before + 1, "the erase stores more than the magic");
+    for budget in before..=total {
+        let (dying, _) = build(Some(budget), true);
+        let image = dying.store().get_ref().snapshot();
+        assert_eq!(
+            image.load_u64_acquire(OFF_CTL_COUNT).expect("count"),
+            47_000
+        );
+        assert_eq!(
+            crate::read_erased_turn_count(&image),
+            (budget > before).then_some(47_000)
+        );
+        assert_eq!(
+            restores(&dying),
+            budget == before,
+            "a stop after {} of the erase's {} stores",
+            budget - before,
+            total - before
+        );
+    }
+}
+
 /// The adaptive cap (the plan's §2.6): a line limit at the corpus's rate with a quarter to
 /// spare, never under 32 bytes a line or 256 KiB, never over the physical ring, the whole
 /// ring for an unlimited scrollback, always a multiple of 8.
@@ -845,4 +975,295 @@ fn the_ring_writer_stands_apart_from_the_journal_writer() {
         fence.end,
         "the ring's words stand"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The control slot (increment 7)
+// ---------------------------------------------------------------------------
+
+/// A small layout with a control slot of `ctl_cap` bytes between the tail and the ring
+/// (`Geometry::custom` packs none).
+fn with_control(ctl_cap: usize) -> Geometry {
+    let g = Geometry::custom(4096, 1024, 4096).expect("a test layout");
+    let hist_off = g.tail_off + g.tail_cap + ctl_cap;
+    let geometry = Geometry {
+        hist_off,
+        region_len: (hist_off + g.hist_cap_phys).div_ceil(PAGE) * PAGE,
+        ..g
+    };
+    assert_eq!(geometry.validate(), Ok(()));
+    assert_eq!(geometry.ctl_cap(), ctl_cap);
+    geometry
+}
+
+/// Carry `i`: a long carry for odd `i`, a short one for even, so a short record is
+/// written over a long one and the slot's stale bytes are exercised.
+fn control_carry(i: u64) -> Vec<u8> {
+    let n = if i % 2 == 1 { 300 } else { 7 };
+    (0..n)
+        .flat_map(|k| format!("turn {i}.{k} {}; ", k * 7919 % 1009).into_bytes())
+        .collect()
+}
+
+fn control_of<V: RegionView + ?Sized>(view: &V, geometry: &Geometry) -> ControlVerdict {
+    crate::recover::read_control(view, geometry)
+}
+
+/// A carry round-trips through the slot, and the next replaces it whole: a shorter record
+/// written over a longer one leaves no byte of the longer one past it.
+#[test]
+fn a_control_record_round_trips_and_replaces_the_one_before() {
+    let geometry = with_control(8192);
+    let store = VecStore::new(geometry.region_len);
+    assert_eq!(control_of(&store, &geometry), ControlVerdict::Empty);
+    let mut ctl = ControlWriter::new();
+    for i in 1..=4 {
+        let carry = control_carry(i);
+        assert_eq!(ctl.write(&store, &geometry, &carry), Ok(i), "write {i}");
+        assert_eq!(
+            control_of(&store, &geometry),
+            ControlVerdict::Valid { seq: i, carry },
+            "write {i}"
+        );
+        let len = usize::try_from(store.load_u64_acquire(OFF_CTL_LEN).expect("len")).expect("len");
+        let mut past = vec![0xAA; geometry.ctl_cap() - len];
+        store
+            .read(geometry.ctl_off() + len, &mut past)
+            .expect("the slot past the record");
+        assert!(
+            past.iter().all(|b| *b == 0),
+            "write {i}: no byte of a longer record stays past this one"
+        );
+    }
+    assert!(
+        control_carry(1).len() > 4 * control_carry(2).len(),
+        "premise: the long carries are long"
+    );
+}
+
+/// A carry too large for the slot is refused with nothing stored: the slot still holds
+/// the record before it.
+#[test]
+fn a_control_carry_past_the_slot_is_refused_and_stores_nothing() {
+    let geometry = with_control(256);
+    let store = crate::store::CountdownStore::new(geometry.region_len, None);
+    let mut ctl = ControlWriter::new();
+    let small = b"turn 1 settled".to_vec();
+    assert_eq!(ctl.write(&store, &geometry, &small), Ok(1));
+    let stores = store.stores();
+    // Incompressible: a stream of distinct words.
+    let big: Vec<u8> = (0u64..4096)
+        .flat_map(|k| k.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes())
+        .collect();
+    assert!(matches!(
+        ctl.write(&store, &geometry, &big),
+        Err(WriteError::TooLarge { cap: 256, .. })
+    ));
+    assert_eq!(store.stores(), stores, "nothing was stored");
+    assert_eq!(ctl.seq(), 1);
+    assert_eq!(
+        control_of(&store, &geometry),
+        ControlVerdict::Valid {
+            seq: 1,
+            carry: small
+        }
+    );
+    // A layout with no slot refuses every carry.
+    let none = Geometry::custom(4096, 1024, 4096).expect("a test layout");
+    assert!(matches!(
+        ControlWriter::new().write(&VecStore::new(none.region_len), &none, b"x"),
+        Err(WriteError::TooLarge { cap: 0, .. })
+    ));
+    assert_eq!(
+        control_of(&VecStore::new(none.region_len), &none),
+        ControlVerdict::NoSlot
+    );
+}
+
+/// What a death after `budget` primitive stores of `writes` control writes (carries 1, 2,
+/// …) leaves the slot holding, with `fault` planted; and how many stores the whole run
+/// makes. The run starts with the window's count word stored ([`store_ctl_count`]), as a
+/// window stores it before any carry; it is the first store, so `budget` counts it.
+fn control_death(
+    geometry: &Geometry,
+    writes: u64,
+    budget: Option<usize>,
+    fault: Option<WriterFault>,
+) -> (ControlVerdict, u64, usize) {
+    let store = crate::store::CountdownStore::new(geometry.region_len, budget);
+    store_ctl_count(&store, CONTROL_COUNT).expect("a dropped store is no refusal");
+    let mut ctl = ControlWriter::new();
+    if let Some(fault) = fault {
+        ctl.plant(fault);
+    }
+    for i in 1..=writes {
+        ctl.write(&store, geometry, &control_carry(i))
+            .expect("a dropped store is no refusal");
+    }
+    let snapshot = store.snapshot();
+    let count = snapshot
+        .load_u64_acquire(crate::layout::OFF_CTL_COUNT)
+        .expect("the count word");
+    (control_of(&snapshot, geometry), count, store.stores())
+}
+
+/// The count [`control_death`] stores before its writes.
+const CONTROL_COUNT: u64 = 4_242;
+
+/// Every verdict a death at any primitive store of a run of control writes leaves that is
+/// not what the one-slot protocol promises (module doc, "Control slot"), and every death
+/// that cost the count word: the sweep's findings (empty for a sound writer).
+///
+/// What it promises, for a death after `k` stores: when `k` is where write `i` ended and
+/// the next had not begun, write `i`'s carry (none before the first); inside write `i + 1`,
+/// no carry or exactly write `i + 1`'s, under its sequence number. Never write `i`'s
+/// carry from inside write `i + 1`: one slot, so the carry it held is lost with it.
+fn control_sweep(fault: Option<WriterFault>) -> Vec<(usize, ControlVerdict)> {
+    let geometry = with_control(8192);
+    let writes = 4;
+    let (whole, _, stores) = control_death(&geometry, writes, None, fault);
+    assert_eq!(
+        whole,
+        ControlVerdict::Valid {
+            seq: writes,
+            carry: control_carry(writes)
+        },
+        "premise: the whole run ends holding its last carry"
+    );
+    let valid = |seq: u64| ControlVerdict::Valid {
+        seq,
+        carry: control_carry(seq),
+    };
+    // Where each write ended: `ends[i]` stores (the count word's included) after write `i`.
+    let mut ends = vec![control_death(&geometry, 0, None, fault).2];
+    for i in 1..=writes {
+        ends.push(control_death(&geometry, i, None, fault).2);
+    }
+    let mut bad = Vec::new();
+    for k in 0..=stores {
+        let (verdict, count, _) = control_death(&geometry, writes, Some(k), fault);
+        let ended = ends.iter().position(|&at| at == k).map(|i| i as u64);
+        let inside = ends.iter().position(|&at| at > k).map(|i| i as u64);
+        let promised = match (ended, inside) {
+            (Some(0), _) => verdict == ControlVerdict::Empty,
+            (Some(i), _) => verdict == valid(i),
+            (None, Some(i)) => verdict == ControlVerdict::Empty || verdict == valid(i),
+            (None, None) => false,
+        };
+        // The count word is stored first and no control write touches it.
+        let counted = k == 0 || count == CONTROL_COUNT;
+        if !promised || !counted {
+            bad.push((k, verdict));
+        }
+    }
+    bad
+}
+
+/// THE CONTROL SLOT'S DEATH SWEEP (the plan's increment 7 test, "a torn slot yields no
+/// carry, never a wrong one"): a writer killed after every primitive store of a run of
+/// writes (long, short, long, short records) leaves the slot empty or holding exactly a
+/// carry one write wrote, under that write's sequence number, never a record the reader
+/// must refuse. A write's carry stands from its last store until the next write's first:
+/// ONE slot, so a death inside a write loses the carry the slot held before it too
+/// ([`control_sweep`] holds the writer to exactly that). The window's count word, which no
+/// control write touches, survives every death. NEGATIVE CONTROL: a writer that stores the
+/// commit word with the new sequence number before its copy (`ControlPublishEarly`), right
+/// once each write ends, leaves a slot whose commit word names a record it does not hold,
+/// and the sweep finds it.
+#[test]
+fn every_death_inside_a_control_write_leaves_no_carry_or_a_whole_one() {
+    assert_eq!(control_sweep(None), Vec::new());
+    let caught = control_sweep(Some(WriterFault::ControlPublishEarly));
+    assert!(
+        caught
+            .iter()
+            .any(|(_, v)| matches!(v, ControlVerdict::Record(_) | ControlVerdict::Length(_))),
+        "the planted early commit is refused somewhere: {caught:?}"
+    );
+}
+
+/// A shed's fresh region is given the slot's record as it is, under its sequence number;
+/// a death inside that copy leaves the fresh region empty or holding it, never another; a
+/// source never written gives nothing.
+#[test]
+fn a_fresh_region_is_given_the_control_record_whole() {
+    let geometry = with_control(8192);
+    let old = VecStore::new(geometry.region_len);
+    let mut ctl = ControlWriter::new();
+    for i in 1..=3 {
+        ctl.write(&old, &geometry, &control_carry(i))
+            .expect("written");
+    }
+    let want = control_of(&old, &geometry);
+    assert!(matches!(want, ControlVerdict::Valid { seq: 3, .. }));
+    let whole = crate::store::CountdownStore::new(geometry.region_len, None);
+    ctl.carry_into(&old, &whole, &geometry).expect("copied");
+    assert_eq!(control_of(&whole.snapshot(), &geometry), want);
+    for k in 0..whole.stores() {
+        let fresh = crate::store::CountdownStore::new(geometry.region_len, Some(k));
+        let mut copy = ControlWriter::new();
+        copy.carry_into(&old, &fresh, &geometry).expect("copied");
+        let got = control_of(&fresh.snapshot(), &geometry);
+        assert!(
+            got == ControlVerdict::Empty || got == want,
+            "a death after {k} stores: {got:?}"
+        );
+    }
+    // The writer goes on in the fresh region from the copied record: the next write is
+    // the next sequence number, and a shorter record leaves none of the copy past it.
+    ctl.write(&whole, &geometry, &control_carry(4))
+        .expect("written");
+    assert_eq!(
+        control_of(&whole.snapshot(), &geometry),
+        ControlVerdict::Valid {
+            seq: 4,
+            carry: control_carry(4)
+        }
+    );
+    let empty = VecStore::new(geometry.region_len);
+    let fresh = crate::store::CountdownStore::new(geometry.region_len, None);
+    ControlWriter::new()
+        .carry_into(&empty, &fresh, &geometry)
+        .expect("nothing to copy");
+    assert_eq!(fresh.stores(), 0, "an empty slot copies nothing");
+}
+
+/// Damage the commit word does not explain is refused, never read as a carry: every
+/// single-byte change to a valid record, a commit word naming another record, and a
+/// length past the slot or of zero.
+#[test]
+fn a_damaged_control_slot_is_refused_never_read_as_a_carry() {
+    let geometry = with_control(8192);
+    let store = VecStore::new(geometry.region_len);
+    let mut ctl = ControlWriter::new();
+    ctl.write(&store, &geometry, &control_carry(1))
+        .expect("written");
+    let len = usize::try_from(store.load_u64_acquire(OFF_CTL_LEN).expect("len")).expect("len");
+    let mut record = vec![0u8; len];
+    store.read(geometry.ctl_off(), &mut record).expect("record");
+    for (at, byte) in record.iter().enumerate() {
+        let damaged = store.snapshot();
+        damaged
+            .write(geometry.ctl_off() + at, &[byte ^ 0x5A])
+            .expect("inside");
+        assert!(
+            matches!(control_of(&damaged, &geometry), ControlVerdict::Record(_)),
+            "a changed byte {at} is refused"
+        );
+    }
+    let other = store.snapshot();
+    other.store_u64_release(OFF_CTL_COMMIT, 2).expect("word");
+    assert!(matches!(
+        control_of(&other, &geometry),
+        ControlVerdict::Record(_)
+    ));
+    for bad in [0, geometry.ctl_cap() as u64 + 1, u64::MAX] {
+        let long = store.snapshot();
+        long.store_u64_release(OFF_CTL_LEN, bad).expect("word");
+        assert_eq!(
+            control_of(&long, &geometry),
+            ControlVerdict::Length(bad),
+            "length {bad}"
+        );
+    }
 }

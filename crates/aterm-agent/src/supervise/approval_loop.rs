@@ -276,6 +276,7 @@ use super::super::policy::approval::{
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
+use super::super::policy::login::PickerGate;
 use super::super::policy::question::{begun, fall_back_to, is_question_rule};
 use super::*;
 use crate::harness::upgrade_drive::{LiveTab, roster_rows, unique_tab_for_group};
@@ -426,7 +427,7 @@ pub(super) struct QuestionMemory {
 /// read). Any other answer of the whole box (a focus move, a decline typed
 /// in: each re-reads the box off the screen, where its head is cut) is not
 /// carried out from a joined read, and the cut's own decision, `cut`, stands.
-pub(super) fn whole_box_decision(
+pub(crate) fn whole_box_decision(
     whole: Decision,
     rows: &[String],
     screen: &[String],
@@ -494,11 +495,11 @@ pub(super) struct StepperTrack {
     /// while the stepper moves (the size, and so the box's identity, does
     /// not).
     offer: Option<String>,
-    /// The key just decided and the size it was decided at, not yet seen
-    /// pressed.
+    /// The key just decided and the size it was decided at (tokens, as
+    /// drawn), not yet seen pressed.
     deciding: Option<(&'static str, u32)>,
     /// The last stepper key pressed on this offer and the size it was
-    /// pressed at.
+    /// pressed at (tokens, as drawn).
     last: Option<(&'static str, u32)>,
     /// Stepper keys pressed on this offer.
     keys: usize,
@@ -724,6 +725,22 @@ pub(super) struct AutopilotWord {
     /// ([`Self::begin`]): its word is the decision's, and no second round
     /// trip is made for it.
     fresh: bool,
+    /// A bare `meta` reply was ever read ([`Self::note`]). Until one is,
+    /// the word is UNREAD, not absent: `kept` says nothing yet, and the next
+    /// decision reads it ([`Self::worth_a_read`]). A loop whose start-up
+    /// read was lost — a seamless update's successor starts its loops a few
+    /// milliseconds before its control socket listens — took the table's
+    /// word for the session's and never read it again, so a session under
+    /// its own Land ran the whole loop under the table's Cruise and typed
+    /// the done check into its landed work (the final check of 2026-10-20,
+    /// W1). A refused read reads nothing either.
+    read: bool,
+    /// The host answered a bare `meta` ([`Self::note`], [`Self::refused`]):
+    /// what the word is for the loop's decisions is known — the session's
+    /// where one was read, the table's where the host refused. Until it is,
+    /// a seeded landing is decided by nothing and its face is told to no one
+    /// (`Session::look`'s first read; the second review of 2026-10-20, R1).
+    answered: bool,
 }
 
 impl AutopilotWord {
@@ -739,6 +756,26 @@ impl AutopilotWord {
             .as_deref()
             .and_then(Autopilot::parse);
         self.fresh = true;
+        self.read = true;
+        self.answered = true;
+    }
+
+    /// Whether a decision should read the word: the host keeps one, or no
+    /// reply was ever read ([`Self::read`]) — only a host that answered and
+    /// named no word is left to the table without a round trip.
+    pub(super) fn worth_a_read(&self) -> bool {
+        self.kept || !self.read
+    }
+
+    /// Whether a bare `meta` reply was ever read ([`Self::read`]).
+    pub(super) fn read(&self) -> bool {
+        self.read
+    }
+
+    /// Whether the host ever answered a bare `meta`, read or refused
+    /// ([`Self::answered`]).
+    pub(super) fn answered(&self) -> bool {
+        self.answered
     }
 
     /// A bare `meta` the server refused: it says nothing of the word, so the
@@ -748,6 +785,7 @@ impl AutopilotWord {
     /// makes no second round trip for it.
     fn refused(&mut self) {
         self.fresh = true;
+        self.answered = true;
     }
 }
 
@@ -1197,10 +1235,13 @@ impl<C: Ctl> Session<'_, C> {
             .and_then(|s| s.strip_prefix('@'))
             .filter(|s| s.starts_with("s-"))
             .map(str::to_string);
-        let r = self
-            .ctl
-            .call(&["who"])
-            .map_err(|e| format!("`who` failed: {e}"))?;
+        // The roster of the instance hosting the worker, which need not be the
+        // one an unselected request reaches.
+        let r = match stable.as_deref() {
+            Some(sid) => self.ctl.call_at_host_of(sid, &["who"]),
+            None => self.ctl.call(&["who"]),
+        }
+        .map_err(|e| format!("`who` failed: {e}"))?;
         if !r.ok() {
             return Err(format!("`who` refused: {}", r.stderr.trim()));
         }
@@ -1246,6 +1287,20 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn box_gone(&mut self) {
         self.box_first_seen = None;
         self.spend_proved();
+    }
+
+    /// A read with no box on it and the composer back (`composer`: its frame
+    /// on the screen, which the autocompact offer replaces): any offer has
+    /// left, and the stepper's record of it goes with it ([`StepperTrack`]),
+    /// so a later offer — drawn with the same title and keep row — is
+    /// stepped afresh, not escalated on a key pressed on this one. Not part
+    /// of [`Self::box_gone`]: a stepper key's own change of the box's
+    /// identity calls that too ([`Self::box_left`]). A read with neither a
+    /// box nor a composer (a frame torn mid-draw) keeps the record.
+    pub(super) fn offer_gone(&mut self, composer: bool) {
+        if composer {
+            self.stepper = StepperTrack::default();
+        }
     }
 
     /// Spend the remembered transcript candidate, without asserting its mount.
@@ -1297,12 +1352,43 @@ impl<C: Ctl> Session<'_, C> {
         // Claude Code's `/login` method picker behind the `/login` THIS LOOP
         // typed into a lost login ([`TurnEndState::login_typed_at`]): the
         // turn-end policy's carry, which `approve` does not govern. Any other
-        // picker — a person's own `/login` — is a box as any other.
-        let login_carry = self.turn_end.login_typed_at().is_some()
-            && matches!(
-                aterm_phase::login_screen(&screen.rows),
-                Some(aterm_phase::LoginScreen::Picker(_))
+        // picker — a person's own `/login` — is a box as any other. A picker
+        // at a lost login no track here holds is that loss's first
+        // ([`TurnEndState::take_up_login`]): the `/login` a loop before this
+        // one typed is this loop's own, before the box is decided.
+        let picker = matches!(
+            aterm_phase::login_screen(&screen.rows),
+            Some(aterm_phase::LoginScreen::Picker(_))
+        );
+        if picker {
+            let now = self.fx.mono();
+            self.turn_end.take_up_login(
+                aterm_phase::login_at_wall(&screen.rows).as_ref(),
+                false,
+                now,
             );
+        }
+        // …and none at all once the login came back in another tab
+        // ([`PickerGate::Back`]): the owner is told to
+        // close it, never sent to a browser sign-in nobody needs.
+        let typed = picker && self.turn_end.login_typed_at().is_some();
+        let shared = typed
+            .then(|| opts.idle_host.as_deref().and_then(|h| h.login_shared()))
+            .flatten();
+        // …nor once a renewal the tab follows by itself replaced the login
+        // that `/login` signs in ([`PickerGate::Renewed`]).
+        let renewed = typed
+            && opts.idle_host.as_deref().is_some_and(|h| {
+                super::super::policy::login::renewal_followed(
+                    h.login_superseded(),
+                    &opts.policy,
+                    h.can_restart(),
+                )
+            });
+        let gate = super::super::policy::login::picker_gate(typed, shared.as_ref(), renewed);
+        let login_carry = gate == PickerGate::Carried;
+        let login_back = gate == PickerGate::Back;
+        let login_renewed = gate == PickerGate::Renewed;
         let own_rule = |limit_reset: bool| {
             aterm_phase::read(None, &screen.rows, None)
                 .prompt
@@ -1310,11 +1396,15 @@ impl<C: Ctl> Session<'_, C> {
                     p.kind == PromptKind::Question
                         || p.kind == PromptKind::McpServer
                         || login_carry
+                        || login_back
+                        || login_renewed
                         || p.kind == PromptKind::AutocompactOffer
                             && opts.policy.autocompact_offer.is_some()
                         || p.kind == PromptKind::UsageLimit
                             && (opts.policy.limit_wait
-                                || limit_reset && aterm_phase::reset_row(&p).is_some())
+                                || limit_reset
+                                    && aterm_phase::reset_row(&p, &opts.policy.limit_reset_kinds)
+                                        .is_some())
                 })
         };
         let owners = || Decision::Escalate {
@@ -1395,6 +1485,8 @@ impl<C: Ctl> Session<'_, C> {
         // `/login`: the method the session's login already is, as its host
         // reads it — asked of no other box.
         facts.login_carry = login_carry;
+        facts.login_back = login_back;
+        facts.login_renewed = login_renewed;
         if login_carry {
             facts.login_method = opts.idle_host.as_deref().and_then(|h| h.login_method());
         }
@@ -1757,12 +1849,13 @@ impl<C: Ctl> Session<'_, C> {
     /// [`Self::autopilot`] for a decision about to act: read fresh — one bare
     /// `meta` — unless a bare `meta` was read since the decision began
     /// ([`AutopilotWord::begin`]; the box's cwd, the question's word: that
-    /// reply's word is the decision's) or the host keeps no word (nothing to
-    /// read: the table's decides). A refused read keeps the word last read
-    /// ([`AutopilotWord::refused`]: the table's only where none ever was);
-    /// one not served is the outage it is.
+    /// reply's word is the decision's) or the host answered and keeps no
+    /// word (nothing to read: the table's decides). A word never read is
+    /// read ([`AutopilotWord::worth_a_read`]). A refused read keeps the word
+    /// last read ([`AutopilotWord::refused`]: the table's only where none
+    /// ever was); one not served is the outage it is.
     pub(super) fn autopilot_read(&mut self, opts: &SuperviseOpts) -> Result<Autopilot, Fail> {
-        if self.autopilot.kept && !self.autopilot.fresh {
+        if self.autopilot.worth_a_read() && !self.autopilot.fresh {
             self.read_autopilot_word()?;
         }
         Ok(self.autopilot(opts))
@@ -1772,11 +1865,14 @@ impl<C: Ctl> Session<'_, C> {
     /// hours in one turn while the owner changes the session's word. Read it
     /// at that boundary, before a survey key or a host step.
     /// A refused read leaves the remembered word intact for parking, but
-    /// proves no admission for this action. Older hosts that keep no word
-    /// still use the table without an unsupported round trip.
+    /// proves no admission for this action — where a word was ever kept;
+    /// with none ever read, the table's decides, as on an older host that
+    /// keeps no word, which is asked no unsupported round trip once it has
+    /// answered one. A word never read is read here.
     pub(super) fn autopilot_allows_busy(&mut self, opts: &SuperviseOpts) -> Result<bool, Fail> {
         self.autopilot.begin();
-        let known = !self.autopilot.kept || self.read_autopilot_word()?;
+        let known =
+            !self.autopilot.worth_a_read() || self.read_autopilot_word()? || !self.autopilot.kept;
         Ok(known && self.autopilot(opts) != Autopilot::Off)
     }
 
@@ -1833,10 +1929,12 @@ impl<C: Ctl> Session<'_, C> {
         // An act's row carries the machine's count of its sleep at its stamp,
         // for a loop that follows to set its own against
         // ([`approvals::last_act_count_in`]).
-        let count = (outcome == approvals::Outcome::Typed)
-            .then(|| self.fx.asleep())
-            .flatten();
-        let row = self.ledger.write_counted(
+        let (count, captured_boot) = if outcome == approvals::Outcome::Typed {
+            self.fx.asleep_for_ledger()
+        } else {
+            (None, None)
+        };
+        let row = self.ledger.write_counted_with_boot_text(
             self.fx.stamp_ms(),
             &approvals::Row {
                 rule_id,
@@ -1846,6 +1944,7 @@ impl<C: Ctl> Session<'_, C> {
                 box_seq,
             },
             count.as_ref(),
+            captured_boot.as_deref(),
             &mut std::io::stderr(),
         );
         if let Some(row) = row {
@@ -1872,8 +1971,9 @@ impl<C: Ctl> Session<'_, C> {
     /// `decision` to step it that reverses the last key on the same offer,
     /// repeats a key that did not move the size (the list's end), or would
     /// be past [`MAX_STEPPER_KEYS`], is escalated instead — the target is not
-    /// among the sizes this offer steps through. Any other read (another
-    /// box, or the offer gone) forgets the offer.
+    /// among the sizes this offer steps through. Another box forgets the
+    /// offer here; the offer gone (no box, the composer back) is forgotten
+    /// by [`Self::offer_gone`].
     fn stepper_check(
         &mut self,
         reading: &aterm_phase::Reading,
@@ -1913,7 +2013,7 @@ impl<C: Ctl> Session<'_, C> {
         let key = *key;
         let ended = match track.last {
             Some((last, _)) if last != key => Some("the stepper turned back"),
-            Some((_, at)) if at == offer.size => Some("the stepper did not move past it"),
+            Some((_, at)) if at == offer.tokens => Some("the stepper did not move past it"),
             _ if track.keys >= MAX_STEPPER_KEYS => Some("the stepper never reached it"),
             _ => None,
         };
@@ -1922,12 +2022,12 @@ impl<C: Ctl> Session<'_, C> {
             return Decision::Escalate {
                 reason: format!(
                     "an autocompact offer, and autocompact_offer = {target} is not among the \
-                     sizes this offer steps through ({why} at {}k)",
-                    offer.size
+                     sizes this offer steps through ({why} at {})",
+                    aterm_phase::autocompact::size_words(offer.tokens)
                 ),
             };
         }
-        track.deciding = Some((key, offer.size));
+        track.deciding = Some((key, offer.tokens));
         decision
     }
 

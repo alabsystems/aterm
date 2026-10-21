@@ -177,6 +177,11 @@ struct Mock {
     /// Every wait naps real time, never skips ([`Self::waits`]): for a run
     /// beside a host that reads the system's clock, as a shipped host does.
     real_time: bool,
+    /// Run after every request is served, on the loop's own thread: what
+    /// stops a hosted run ([`run_engine_tests.rs`]'s `Stop`) at a step of the
+    /// loop and an instant of the run's clock, never at a moment of another
+    /// thread's.
+    after_call: Option<Box<dyn FnMut() + Send>>,
     stalls: u32,
     /// `await idle` passes over busy screens (see the struct doc).
     idle_skips_busy: bool,
@@ -367,6 +372,12 @@ struct Mock {
     /// set after this loop's (the server shows the most recent).
     human_attention: Option<String>,
     human_on_top: bool,
+    /// The worker's NEEDS YOU entry (`owner=needs`), as the server holds it:
+    /// its text, and every `meta … owner=needs` request in order — no
+    /// scripted reply spent on it, and no attention of the loop's or a
+    /// person's moved.
+    needs_attention: Option<String>,
+    needs_calls: Vec<String>,
     /// Claude Code's digit rule for a rating card: a `0` pressed within
     /// this long of the first read that served the card is DROPPED (it stays in
     /// the composer as text). `None`: a card takes its digit at once.
@@ -506,6 +517,9 @@ struct Mock {
     /// The `who` roster's rows, answered to every `who` (`None`: the
     /// built-in answer).
     who: Option<String>,
+    /// The session each [`Ctl::call_at_host_of`] aimed its request at, in
+    /// order (the request itself is served as [`Ctl::call`] serves it).
+    aimed: Vec<String>,
     /// `await gone` judged as the server judges it: on the screen current
     /// during the wait (the next to be served, when the worker moved on),
     /// only over its `rows <a> <b>`; a row still matching runs the wait out
@@ -534,6 +548,10 @@ struct Mock {
     /// does (`None`: a host whose `search` and `line`
     /// get the bare `OK` every unscripted verb gets).
     scrollback: Option<Vec<String>>,
+    /// The screen (by index) from which [`Self::scrollback`] stands above
+    /// the screen: before it is served, the history is empty (`None`: from
+    /// the first) — the history of one tall turn, not of every screen.
+    scrollback_from: Option<usize>,
     /// `line <n>` of a history row above this one is `ERR evicted`.
     evicted_below: u64,
     /// The ALTERNATE screen's archive of the rows that scrolled off it,
@@ -575,6 +593,13 @@ struct Mock {
     /// How many bare `task` reads, from the first, are turned away
     /// unserved (`ERR control server busy`): a read the loop asks again.
     task_lost: usize,
+    /// THE HOST HANGS THE LOOP'S CONNECTION UP at the first request whose
+    /// words (past the `@sid`) begin with this: it and every request after
+    /// it fail in the transport, as the window's host cuts a loop short
+    /// to stop it at once (`Ctl::interrupter`).
+    hang_up_at: Option<&'static str>,
+    /// The connection was hung up ([`Self::hang_up_at`]).
+    hung_up: bool,
 }
 
 /// Where the `/usage` panel's world stands ([`PanelWorld`]).
@@ -834,7 +859,7 @@ struct ResetShared {
 
 /// CLAUDE CODE'S LIMIT-RESET PROGRAM AS THE LOOP MEETS IT, a world that
 /// reacts to the keys the server writes. EVERY SCREEN AND EVERY
-/// TRANSITION OF IT IS COMPOSED FROM THE 2.1.287 BUNDLE, NEVER SEEN
+/// TRANSITION OF IT IS COMPOSED FROM THE 2.1.304 BUNDLE, NEVER SEEN
 /// (`docs/SPEC-claude-accounts-resets-2026-10-02.md` §0; the frames are
 /// `aterm_phase::reset::fixtures`, each COMPOSED and saying so):
 ///
@@ -865,8 +890,8 @@ struct ResetShared {
 struct ResetWorld {
     at: ResetAt,
     labels: Vec<String>,
-    /// The dialog's row that spends a reset ([`RESET_GRANT`], or a 2.1.304
-    /// row of one kind of reset's): the world's own oracle of the row.
+    /// The dialog's row that spends a reset (2.1.304's `Use a <kind> …`
+    /// row, of one kind of reset's): the world's own oracle of the row.
     grant: String,
     focus: usize,
     check_reads: usize,
@@ -901,8 +926,9 @@ struct ResetWorld {
     /// is asked for the claim.
     person_at_row_key: usize,
     /// A row the dialog draws as the loop's first arrow lands, at this
-    /// index, the cursor kept on its own row: Claude Code 2.1.304 draws a
-    /// row per kind of reset as its offers come in, while the dialog is up.
+    /// index, the cursor kept on its own row (the vendor's Select keeps its
+    /// focus on the row's value): Claude Code 2.1.304 draws a row per kind
+    /// of reset as its offers come in, while the dialog is up.
     drawn_at_arrow: Option<(usize, String)>,
     /// A PERSON presses Enter on the confirmation's yes, at the first
     /// read of it this long after it mounted: the claim begins with no
@@ -1028,7 +1054,7 @@ impl ResetWorld {
                     .trim_start()
                     .trim_start_matches('❯')
                     .trim_start();
-                // `Yes, use my reset`, 2.1.304's `Yes, use my <kind>`.
+                // 2.1.304's `Yes, use my <kind>`, of every kind.
                 row.starts_with("Yes, use my ") || row.starts_with("No, keep it")
             })
             .collect();
@@ -1149,6 +1175,7 @@ impl Mock {
             end_when_parked: false,
             waits: None,
             real_time: false,
+            after_call: None,
             title: None,
             stalls: 0,
             idle_skips_busy: false,
@@ -1216,6 +1243,8 @@ impl Mock {
             order: Vec::new(),
             human_attention: None,
             human_on_top: false,
+            needs_attention: None,
+            needs_calls: Vec::new(),
             card_ignores_within: None,
             card_first_served: None,
             early_zeroes: 0,
@@ -1256,12 +1285,14 @@ impl Mock {
             agent_zone: None,
             status_sid: "-",
             who: None,
+            aimed: Vec::new(),
             gone_on_next: false,
             gone_held: 0,
             gone_ran_out: false,
             after_gone: Vec::new(),
             alt_screen: None,
             scrollback: None,
+            scrollback_from: None,
             evicted_below: 0,
             alt_archive: None,
             archive_gap: false,
@@ -1274,6 +1305,8 @@ impl Mock {
             task_reopens_at: None,
             task_busy: 0,
             task_lost: 0,
+            hang_up_at: None,
+            hung_up: false,
         }
     }
     /// A `task` request ([`Self::task`]): the record, or the record after
@@ -1335,19 +1368,42 @@ impl Mock {
     }
     /// The bare `meta` reply, `attention=` pct-encoded as the server spells
     /// it (`-` = unset): the latest entry of the loop's keyed one (owner
-    /// `supervisor`) or a person's bare one, its owner, and how many stand.
+    /// `supervisor`) or a person's bare one — the worker's NEEDS YOU entry
+    /// (owner `needs`) where it stands alone — its owner, how many stand,
+    /// and each one's kind by owner (`attention_kinds=`, `<kind>:<owner>`).
     fn meta_line(&self) -> String {
         let shown = match (&self.attention, &self.human_attention) {
             (Some(_), Some(h)) if self.human_on_top => Some((h, "%2D")),
             (Some(a), _) => Some((a, "supervisor")),
             (None, Some(h)) => Some((h, "%2D")),
-            (None, None) => None,
+            (None, None) => self.needs_attention.as_ref().map(|n| (n, "needs")),
         };
         let (attention, owner) = shown.map_or(("-".to_string(), "-"), |(t, o)| {
             (aterm_codec::pct::encode(t), o)
         });
-        let owners =
-            usize::from(self.attention.is_some()) + usize::from(self.human_attention.is_some());
+        let owners = usize::from(self.attention.is_some())
+            + usize::from(self.human_attention.is_some())
+            + usize::from(self.needs_attention.is_some());
+        let mut kinds = Vec::new();
+        if self.attention.is_some() {
+            let kind = self
+                .attention_kind
+                .as_deref()
+                .and_then(|k| k.strip_prefix("kind="))
+                .unwrap_or("-");
+            kinds.push(format!("{kind}:supervisor"));
+        }
+        if self.human_attention.is_some() {
+            kinds.push("-:-".to_string());
+        }
+        if self.needs_attention.is_some() {
+            kinds.push("ask:needs".to_string());
+        }
+        let kinds = if kinds.is_empty() {
+            "-".to_string()
+        } else {
+            kinds.join(",")
+        };
         let cwd = self.cwd.as_deref().unwrap_or("-");
         let agent_cwd = self.agent_cwd.as_deref().unwrap_or("-");
         let trusted_cwd = self
@@ -1363,7 +1419,8 @@ impl Mock {
         format!(
             "OK title=- user_title=- description=- icon=- role=- attention={attention} \
              cwd={cwd} state=alive attention_owner={owner} attention_owners={owners} \
-             supervisor=-{questions} agent_cwd={agent_cwd} trusted_cwd={trusted_cwd}{autopilot}\n"
+             attention_kinds={kinds} supervisor=-{questions} agent_cwd={agent_cwd} \
+             trusted_cwd={trusted_cwd}{autopilot}\n"
         )
     }
     /// The `status` reply: the fields the loop reads.
@@ -1446,7 +1503,7 @@ impl Mock {
     /// `search <^literal> regex` over [`Self::scrollback`] and the screen
     /// last served: the rows that open with the literal.
     fn scrollback_search(&self, tail: &[&str]) -> CtlReply {
-        let history = self.scrollback.as_deref().unwrap_or_default();
+        let history = self.history();
         let verb = "search";
         // No pattern: the server's answer that places the screen alone.
         if tail.is_empty() {
@@ -1497,7 +1554,7 @@ impl Mock {
         if self.unreadable_row == Some(row) {
             return err("unreadable");
         }
-        let history = self.scrollback.as_deref().unwrap_or_default();
+        let history = self.history();
         let text = usize::try_from(row)
             .ok()
             .and_then(|k| history.iter().chain(self.last_served()).nth(k));
@@ -1554,8 +1611,29 @@ impl Mock {
         )
     }
 
+    /// [`Self::scrollback`] as it stands above the screen last served
+    /// ([`Self::scrollback_from`]).
+    fn history(&self) -> &[String] {
+        let from = self.scrollback_from.unwrap_or(0);
+        if self.served.saturating_sub(1) < from {
+            return &[];
+        }
+        self.scrollback.as_deref().unwrap_or_default()
+    }
+
     fn last_served(&self) -> &[String] {
         &self.screens[self.served.saturating_sub(1).min(self.screens.len() - 1)]
+    }
+
+    /// THE HISTORY ABOVE THE SCREEN SERVED, as aterm's own hosts serve it,
+    /// and empty where no test set one: `search` places the screen at row 0
+    /// and `modes` says the main screen, so a read of what stands above the
+    /// screen reaches the history's first row (a Land defense whose turn
+    /// begins above the screen of a host with no history to read lands
+    /// nothing: `Session::said_read_whole`).
+    pub(super) fn history_served(&mut self) {
+        self.scrollback.get_or_insert_with(Vec::new);
+        self.alt_screen.get_or_insert(false);
     }
     /// The screen the loop is on sits until a `turn` releases it
     /// ([`Self::turn_releases`], [`Self::turn_gates`]).
@@ -1589,7 +1667,8 @@ impl Mock {
         } else if self.held()
             || tail.is_none() && after_tail && self.whole_sees_the_tail && self.served > 0
         {
-            self.served - 1
+            // The last screen is served again past the script's end.
+            (self.served - 1).min(self.screens.len() - 1)
         } else {
             let i = self.served.min(self.screens.len() - 1);
             self.served += 1;
@@ -2938,6 +3017,17 @@ impl Mock {
                 "OK %20 {} 111318 {}\n",
                 self.cell_fg, self.cell_attrs
             ))),
+            // The worker's NEEDS YOU: an entry of its own owner's, which
+            // spends no scripted reply and moves no other entry.
+            "meta" if tail.get(2) == Some(&"owner=needs") => {
+                self.needs_calls.push(tail.join(" "));
+                match tail.first() {
+                    Some(&"set") => self.needs_attention = Some(tail[4..].join(" ")),
+                    Some(&"unset") => self.needs_attention = None,
+                    _ => {}
+                }
+                Ok(ok("OK\n"))
+            }
             "meta" => {
                 if tail.first() == Some(&"set") && tail.get(1) == Some(&"attention") {
                     self.attentions += 1;
@@ -2991,6 +3081,22 @@ impl Mock {
 
 impl Ctl for Mock {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        let r = self.answer_call(args);
+        if let Some(after) = self.after_call.as_mut() {
+            after();
+        }
+        r
+    }
+
+    fn call_at_host_of(&mut self, sid: &str, args: &[&str]) -> Result<CtlReply, String> {
+        self.aimed.push(sid.to_string());
+        self.call(args)
+    }
+}
+
+impl Mock {
+    /// [`Ctl::call`]'s answer to `args`.
+    fn answer_call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
         // The supervisor claim: the loop's bookkeeping, outside every
         // script's indexes (see `claims`).
         let words: Vec<&str> = args
@@ -2998,6 +3104,16 @@ impl Ctl for Mock {
             .copied()
             .filter(|a| !a.starts_with('@'))
             .collect();
+        if self.hung_up
+            || self
+                .hang_up_at
+                .is_some_and(|at| words.join(" ").starts_with(at))
+        {
+            // Asked, and cut short: a request the loop made, unserved.
+            self.hung_up = true;
+            self.order.push((args.join(" "), false));
+            return Err("the host hung the loop's connection up".to_string());
+        }
         if words.len() >= 3 && words[0] == "meta" && words[2] == "supervisor" {
             self.claims.push(args.join(" "));
             let r = self.claim_replies.pop_front().unwrap_or_else(|| ok("OK\n"));
@@ -3144,6 +3260,19 @@ fn host_stops(
     opts: &SuperviseOpts,
     hand_over: bool,
 ) -> (Result<(), String>, Vec<String>) {
+    let (r, lines, _) = host_stops_taped(m, sid, ledger, opts, hand_over);
+    (r, lines)
+}
+/// [`host_stops`], and the run's tape as it was replayed (its real header
+/// in place): what a counterfactual's test replays again under another
+/// policy.
+fn host_stops_taped(
+    m: &mut Mock,
+    sid: Option<&str>,
+    ledger: PathBuf,
+    opts: &SuperviseOpts,
+    hand_over: bool,
+) -> (Result<(), String>, Vec<String>, Vec<u8>) {
     m.stall_sleep = Some(Duration::from_millis(5));
     let from = m.order.len();
     let stop = Arc::new(AtomicBool::new(false));
@@ -3228,7 +3357,8 @@ fn host_stops(
         &sent(side.inner, from),
         &lines,
     );
-    (r, lines)
+    let bytes = tape.reframed(&header.encode());
+    (r, lines, bytes)
 }
 /// The header a hosted run over `s` with `opts` records under, the memory
 /// tape's id: whether it had a window host is its presence only — a run
@@ -3640,11 +3770,22 @@ fn auto(max_s: u64) -> SuperviseOpts {
             resume_limits: false,
             model_fallback: None,
             compact_on_context_wall: false,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         yield_when_held: false,
         idle_host: None,
         tasks: None,
+    }
+}
+
+/// The owner's policy as the loop's scripted screens run it: every default,
+/// the continuation the short `keep going` those screens draw and guard on
+/// one row. The default's own words (`config::CONTINUE_TEXT`, Cruise's long
+/// instruction) are the turn-end policy's tests'; these pin the loop.
+fn owners_policy() -> SupervisorConfig {
+    SupervisorConfig {
+        continue_text: "keep going".to_string(),
+        ..SupervisorConfig::default()
     }
 }
 
@@ -4225,7 +4366,13 @@ fn taped_session<'m, 't>(
 /// sitting screen skip ([`Mock::waits`]), and the transport `m` through its
 /// door.
 fn memory_tape(m: &mut Mock) -> (MemoryTape, TapedCtl<'_, Mock>) {
-    let clock = Arc::new(super::super::fx::ScriptedClock::default());
+    memory_tape_on(m, Arc::default())
+}
+/// [`memory_tape`] over `clock`.
+fn memory_tape_on(
+    m: &mut Mock,
+    clock: Arc<super::super::fx::ScriptedClock>,
+) -> (MemoryTape, TapedCtl<'_, Mock>) {
     m.waits = (!m.real_time).then(|| Arc::clone(&clock));
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(clock)));
     let taped = TapedCtl::new(m, tape.fx.clone(), crate::supervise::tape::doors::CTL);
@@ -4470,6 +4617,47 @@ fn a_busy_row_that_stays_over_a_box_is_waited_on_two_seconds_at_most() {
     let (_, waits) = gone_waits("claude", vec![busy_screen(), busy_screen(), idle_screen()]);
     assert!(
         waits.iter().any(|w| w.ends_with(" timeout 20000")),
+        "the control: {waits:#?}"
+    );
+}
+
+/// THE LOOP WAITS IN ITS SETUP'S STEP (`SessionSetup::wait_step`), read once
+/// as the setup was made, never in this process's live settle: each step is
+/// the `timeout` of an `await` the tape records, and a replay in a process
+/// with another settle seam must ask the recorded run's. A step of 7 s (this
+/// process's is 20 s): the turn's wait for the busy row to leave asks
+/// `timeout 7000` — and the run REPLAYS from its tape alone
+/// ([`watch_lines_with`]), its header carrying the step, where a loop that
+/// read the step live would ask the replaying process's `timeout 20000`.
+/// NEGATIVE CONTROL: the same run under the shipped setup asks the 20 s step.
+#[test]
+fn the_loop_waits_in_its_setups_step_and_replays_in_it() {
+    let step = Duration::from_secs(7);
+    assert_ne!(step, next_wait_step(), "a step this process does not read");
+    let gone_waits = |setup_step: Option<Duration>| {
+        let mut m = Mock::new(vec![busy_screen(), busy_screen(), idle_screen()]);
+        m.vanish_after = Some(0);
+        let _ = watch_lines_with(&mut m, &auto(30), |s| {
+            if let Some(step) = setup_step {
+                s.setup.wait_step = step;
+            }
+        });
+        m.requests
+            .iter()
+            .filter(|r| r.contains("await gone ") && r.contains(" rows "))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let waits = gone_waits(Some(step));
+    assert!(!waits.is_empty(), "a scoped wait for the busy row");
+    assert!(
+        waits.iter().all(|w| w.ends_with(" timeout 7000")),
+        "{waits:#?}"
+    );
+    let waits = gone_waits(None);
+    assert!(!waits.is_empty(), "the control: a scoped wait");
+    assert!(
+        waits.iter().all(|w| w.ends_with(" timeout 20000")),
         "the control: {waits:#?}"
     );
 }
@@ -6502,6 +6690,14 @@ fn a_request_not_served_is_told_from_a_server_answer() {
     for r in [
         closed(),
         failed(1, "server hung up before the complete response"),
+        // aterm-ctl's own words for a reply cut part-way (its counted and
+        // guarded readers, and a byte-framed body).
+        failed(1, "server hung up before the complete line-framed response"),
+        failed(
+            1,
+            "server hung up before the complete guarded artifact response",
+        ),
+        failed(1, "server hung up mid-body (got 12 of 4096 bytes)"),
         failed(1, refused),
         failed(1, gone),
         failed(1, "Connection reset by peer (os error 54)"),
@@ -6731,11 +6927,15 @@ fn watch_rides_out_a_lost_connection_to_the_next_event() {
             "text --json tail=40",
             "text --json tail=40",
             "text --json tail=40",
-            // The loop again: settle, read, report (the `questions` word
-            // read; the question to the worker's attention, `status` read
-            // first with no manager, `stall.rs`), wait past the point.
+            // The loop again: settle, read, report (the turn that ran read
+            // up to the row that opened it — a host that keeps no history
+            // answers nothing — the `questions` word read; the question to
+            // the worker's attention, `status` read first with no manager,
+            // `stall.rs`), wait past the point.
             "await idle 500 timeout 1500",
             "text --json tail=40",
+            "modes",
+            "offscreen tail=1",
             "meta",
             "status",
             "meta set attention owner=supervisor claude question: Did the suite pass on your machine? (the worker \
@@ -6886,6 +7086,11 @@ fn after_an_outage_the_point_is_reported_again_and_waited_past_on_the_new_seq() 
             // Busy under the footer: its leaving is the next wait.
             "await gone esc.to.interrupt rows 2 7 timeout 20000",
             "text --json tail=40",
+            // The turn that ran ends on rows that do not reach the row that
+            // opened it: the history above is asked for its earlier words
+            // (a host that keeps none answers nothing).
+            "modes",
+            "offscreen tail=1",
             "await seq 14 timeout 20000",
         ],
         "{:?}",
@@ -7231,9 +7436,22 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
     );
     assert_eq!(code, EXIT_TIMEOUT);
     // Nothing after the budget but the watcher's last act: the badge it
-    // raised for the question, read and cleared.
+    // raised for the question, read and cleared. The wait past the badge is
+    // the request lost in flight where it went out before the 100 ms did; a
+    // loaded host spends the budget first and never sends it.
+    let badge = m
+        .requests
+        .iter()
+        .position(|request| request.starts_with("meta set attention "))
+        .expect("the question's badge was raised");
+    let after = &m.requests[badge + 1..];
+    let lost = usize::from(
+        after
+            .first()
+            .is_some_and(|r| r.starts_with("await seq 101 ")),
+    );
     assert_eq!(
-        m.requests[7..],
+        after[lost..],
         ["meta unset attention owner=supervisor"],
         "nothing after: {:?}",
         m.requests
@@ -8306,14 +8524,14 @@ fn usage_probe_violations(m: &Mock, host: &ProbeHost) -> Vec<String> {
 // the host that gives the go, the server its keys are written to, and
 // the Tier-1 projection — shared by `reset_loop_tests.rs` (every exit
 // of the step) and `run_engine_tests.rs` (the walk against the model).
-// NOTHING OF IT HAS BEEN SEEN: the world is composed from the 2.1.287
+// NOTHING OF IT HAS BEEN SEEN: the world is composed from the 2.1.304
 // bundle ([`ResetWorld`]).
 // ------------------------------------------------------------------
 
 /// The usage-limit dialog's rows as the composed fixture draws them
 /// (`aterm_phase::reset::fixtures::DIALOG_GRANT`): the grant row second.
 const RESET_STOP: &str = "Stop and wait for limit to reset";
-const RESET_GRANT: &str = "Use your reset now (2 left, until Oct 5)";
+const RESET_GRANT: &str = "Use a weekly reset (2 left, until Oct 5)";
 const RESET_WAIT: &str = "Wait here, then continue automatically at Oct 9 at 5am";
 const RESET_CREDITS: &str = "Switch to usage credits";
 const RESET_ROWS: [&str; 4] = [RESET_STOP, RESET_GRANT, RESET_WAIT, RESET_CREDITS];
@@ -8366,10 +8584,15 @@ impl ResetHost {
     /// A host whose go is for a weekly wall a week off, and which reads
     /// `outcome` at the step's end.
     fn reading(outcome: ResetOutcome) -> Arc<Self> {
+        Self::reading_at(outcome, &["weekly"])
+    }
+
+    /// [`Self::reading`] at a wall drawn by `limits`.
+    fn reading_at(outcome: ResetOutcome, limits: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             until: TEST_NOW + 7 * 86_400,
             long: true,
-            limits: vec!["weekly".to_string()],
+            limits: limits.iter().map(|l| (*l).to_string()).collect(),
             short_from: Mutex::new(None),
             no: Mutex::new(None),
             again: Mutex::new(Vec::new()),
@@ -8428,12 +8651,12 @@ impl IdleHost for ResetHost {
     }
     fn reset_take(&self, ask: &ResetAsk) -> ResetWord {
         let n = self.asks.fetch_add(1, Ordering::SeqCst) + 1;
-        let kind = ask
-            .kind
-            .map_or_else(String::new, |kind| format!(" kind={}", kind.word()));
         self.said.lock().unwrap().push(format!(
-            "take left={} day={} day_start={:?}{kind}",
-            ask.left, ask.day, ask.day_start
+            "take kind={} left={} day={} day_start={:?}",
+            ask.kind.word(),
+            ask.left,
+            ask.day,
+            ask.day_start
         ));
         if self.again.lock().unwrap().contains(&n) {
             return ResetWord::Again;
@@ -8455,11 +8678,14 @@ impl IdleHost for ResetHost {
     }
     fn reset_told(&self, end: &ResetEnd) -> ResetOutcome {
         self.said.lock().unwrap().push(format!(
-            "told entered={} kept={} offer={:?} last={}",
+            "told entered={} kept={} offer={} last={}",
             end.entered,
             end.kept
                 .map_or_else(|| "-".to_string(), |why| why.to_string()),
-            end.offer,
+            end.offer.map_or_else(
+                || "None".to_string(),
+                |o| format!("{} {} {:?}", o.kind.word(), o.left, o.use_by)
+            ),
             end.last
         ));
         // A claim whose row was never taken ends as the model's clock
@@ -9647,6 +9873,13 @@ mod turn_end {
     include!("turn_end_loop_tests.rs");
 }
 
+/// The worker's NEEDS YOU on the person's screen (`needs_loop_tests.rs`;
+/// FOREVER CRUISE / FOREVER LAND, `escalate.rs`'s `sync_needs`).
+mod needs_loop {
+    use super::*;
+    include!("needs_loop_tests.rs");
+}
+
 /// The session's Autopilot in the loop (`autopilot_loop_tests.rs`): Land's
 /// instruction, Off's park.
 mod autopilot_loop {
@@ -9694,4 +9927,35 @@ mod tape_loop {
 mod replay_loop {
     use super::*;
     include!("replay_loop_tests.rs");
+}
+
+/// `aterm drive replay --why` over a recorded loop (`why_loop_tests.rs`): a
+/// recorded approval explained from the tape alone and decided again on its
+/// facts, a fact or a look the tape lacks (or holds only after the point)
+/// named among what the decision needed, and a turn end's trace computed in
+/// a strict replay to the point.
+mod why_loop {
+    use super::*;
+    include!("why_loop_tests.rs");
+}
+
+/// A COUNTERFACTUAL over a recorded loop (`counterfactual_loop_tests.rs`): a
+/// recorded run replayed in acts mode under another policy diverges at the
+/// first act it takes otherwise, both sides said; one that changes nothing
+/// the run consults reproduces; a build that reads the clock more often
+/// still replays in acts mode and drifts in a strict one; and the shadow
+/// re-decides every recorded box under the candidate.
+mod counterfactual_loop {
+    use super::*;
+    include!("counterfactual_loop_tests.rs");
+}
+
+/// A CORPUS TAPE made from a recorded loop (`corpus_loop_tests.rs`): the
+/// recording machine's home scrubbed to the lab's token in the header and on
+/// the screen, the kept text checked in acts mode by `replay --check`; and a
+/// tape refused — a planted unscrubbed path, a scrub that changes what the
+/// loop does, no end, a tape that does not replay as recorded.
+mod corpus_loop {
+    use super::*;
+    include!("corpus_loop_tests.rs");
 }

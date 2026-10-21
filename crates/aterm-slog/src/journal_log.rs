@@ -63,7 +63,7 @@ impl Log {
             .ring
             .iter()
             .find(|e| e.rec.node == Node::SESSION && e.rec.op == Op::Open)
-            .map(|e| e.rec.clone())
+            .map(|e| Rec::clone(&e.rec))
             .into_iter()
             .collect();
         if self.session_closed {
@@ -76,7 +76,7 @@ impl Log {
                 .rev()
                 .find(|e| e.rec.node == o.node && e.rec.op == Op::Open)
             {
-                out.push(e.rec.clone());
+                out.push(Rec::clone(&e.rec));
             }
         }
         out
@@ -103,7 +103,7 @@ impl Log {
         copy.ring
             .iter()
             .filter(|e| e.rec.seq > head)
-            .map(|e| e.rec.clone())
+            .map(|e| Rec::clone(&e.rec))
             .collect()
     }
 

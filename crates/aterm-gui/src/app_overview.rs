@@ -1014,7 +1014,7 @@ mod tests {
             from: Some(from.to_string()),
             ..TaskMark::new(TaskState::Working)
         };
-        mark_session_task(&ctx, local_of(app, worker), &mark, &app.subscribers).expect("unfenced");
+        mark_session_task(&ctx, local_of(app, worker), &mark).expect("unfenced");
     }
 
     /// The open card's item ordinal of the chip for `sid`.
@@ -1390,7 +1390,6 @@ mod tests {
                     &ctx,
                     local_of(&app, &sids[1]),
                     &TaskMark::new(TaskState::Done),
-                    &app.subscribers,
                 )
                 .expect("unfenced");
             }

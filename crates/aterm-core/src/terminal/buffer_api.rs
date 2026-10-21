@@ -42,6 +42,26 @@ fn paste_char_allowed(c: char) -> bool {
     !(c.is_control() && c != '\t' && c != '\n' && c != '\r')
 }
 
+/// Whether one byte of a paste's UTF-8 shows that the text holds a character
+/// the sanitizer keeps ([`paste_char_allowed`]), so that
+/// `text.bytes().any(paste_byte_kept) == text.chars().any(paste_char_allowed)`
+/// for every `&str` (`paste_sends_bytes_is_the_formatters_output_for_every_char`
+/// proves it over every `char`). A control (`char::is_control`: U+0000-U+001F
+/// and U+007F-U+009F) is one byte below 0x20 or 0x7F, or 0xC2 then
+/// 0x80-0x9F. So a byte that is TAB, LF, CR or 0x20-0x7E is a kept ASCII
+/// character; a lead byte 0xC3 or above starts a character at U+00C0 or
+/// above, never a control; a continuation byte 0xA0-0xBF follows either
+/// 0xC2 (U+00A0-U+00BF, kept) or a lead of a kept character. Every other
+/// byte (the other C0 bytes, 0x7F, 0x80-0x9F and 0xC2) belongs to a control
+/// or to a character another of its bytes already shows.
+#[inline]
+const fn paste_byte_kept(b: u8) -> bool {
+    matches!(
+        b,
+        b'\t' | b'\n' | b'\r' | 0x20..=0x7e | 0xa0..=0xbf | 0xc3..=0xff
+    )
+}
+
 /// Whether one sanitizer-surviving character can advance or reposition the
 /// cursor. Zero-width marks, variation selectors and joiners cannot land a
 /// cursor on their own.
@@ -478,6 +498,29 @@ impl Terminal {
         self.format_paste_framed(text, self.modes.bracketed_paste)
     }
 
+    /// Whether a paste of `text` framed `bracketed` writes the program at least
+    /// one byte: exactly when [`Self::format_paste_framed`]`(text, bracketed)`
+    /// is not empty. Bracketed, always (the markers); unbracketed, when a
+    /// character of the bounded text survives the sanitizer. A host that must
+    /// say whether a person's paste reached the program before the seam frames
+    /// it (the session log's `reached=`, a box's dismissal) asks this rather
+    /// than assume every paste does: a clipboard of controls only, pasted
+    /// with no bracketing, writes nothing.
+    ///
+    /// Allocates nothing and stops at the first 64-byte block holding a kept
+    /// byte ([`paste_byte_kept`], one test per byte with no lookahead, so a
+    /// block is one vector pass), so a cap-sized control-only clipboard costs
+    /// one scan of its bytes and an ordinary paste one block.
+    #[must_use]
+    pub fn paste_sends_bytes(text: &str, bracketed: bool) -> bool {
+        bracketed
+            || bounded_paste_text(text).as_bytes().chunks(64).any(|block| {
+                block
+                    .iter()
+                    .fold(false, |kept, &b| kept | paste_byte_kept(b))
+            })
+    }
+
     /// [`Self::format_paste`] with the bracketed-paste decision supplied by the
     /// caller rather than read from the live mode; the body is identical either
     /// way.
@@ -529,7 +572,10 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PASTE_BYTES, PASTE_GESTURE_PROBE_BYTES, PASTE_INSERT_PRICE_BYTES, Terminal};
+    use super::{
+        MAX_PASTE_BYTES, PASTE_GESTURE_PROBE_BYTES, PASTE_INSERT_PRICE_BYTES, Terminal,
+        paste_char_allowed,
+    };
 
     fn write_lines(t: &mut Terminal, start: usize, n: usize) {
         for i in start..start + n {
@@ -694,6 +740,64 @@ mod tests {
             !Terminal::paste_has_payload(&hidden),
             "content beyond the constant-cost prefix is conservatively unlicensed"
         );
+    }
+
+    /// A PASTE SENDS BYTES EXACTLY WHEN THE FORMATTER WRITES SOME
+    /// ([`Terminal::paste_sends_bytes`]), for every `char` alone, with a
+    /// control-only prefix and suffix around it, under both framings; and a
+    /// control-only text of every control, each alone and all together, and
+    /// past the 64-byte block and the 16 MiB cap, sends bytes only
+    /// bracketed. Per-char equality is the whole law: `any` over a string's
+    /// bytes is the OR of each char's.
+    /// NEGATIVE CONTROL (scratch-applied): a byte class that admits 0xC2
+    /// (U+0080-U+009F's lead) fails on U+0085; one that omits 0xA0-0xBF
+    /// fails on U+00A0.
+    #[test]
+    fn paste_sends_bytes_is_the_formatters_output_for_every_char() {
+        let term = Terminal::new(24, 80);
+        let mut buf = [0u8; 4];
+        let mut kept = 0usize;
+        for c in (0..=0x10_ffff_u32).filter_map(char::from_u32) {
+            let alone = c.encode_utf8(&mut buf);
+            let wrapped = format!("\x1b\u{0085}{alone}\x03");
+            for text in [&*alone, &*wrapped] {
+                for bracketed in [false, true] {
+                    assert_eq!(
+                        Terminal::paste_sends_bytes(text, bracketed),
+                        !term.format_paste_framed(text, bracketed).is_empty(),
+                        "{c:?} in {text:?}, bracketed={bracketed}"
+                    );
+                }
+            }
+            kept += usize::from(paste_char_allowed(c));
+        }
+        assert!(kept > 1_000_000, "the walk met the kept chars: {kept}");
+        let controls: String = (0..=0x9f_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| !paste_char_allowed(*c))
+            .collect();
+        assert_eq!(
+            controls.chars().count(),
+            0x20 + 0x21 - 3,
+            "every control but TAB, LF, CR"
+        );
+        for text in [
+            controls.clone(),
+            controls.repeat(3),
+            "\x1b".repeat(MAX_PASTE_BYTES + 1),
+            format!("{}x", "\x1b".repeat(MAX_PASTE_BYTES)),
+        ] {
+            assert!(
+                !Terminal::paste_sends_bytes(&text, false),
+                "{:?}",
+                &text[..8]
+            );
+            assert!(Terminal::paste_sends_bytes(&text, true));
+        }
+        assert!(Terminal::paste_sends_bytes(
+            &format!("{}x", "\x1b".repeat(200)),
+            false
+        ));
     }
 
     /// C0 signal bytes (0x03, 0x04, 0x1a, DEL, …) are stripped from a

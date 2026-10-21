@@ -46,14 +46,26 @@
 //! The walk never follows a symlink — except a `target*` link, which is
 //! RESOLVED to the directory it names (`target -> target.noindex`), never
 //! into another mount — never enters a hidden directory, `~/Library` or (on
-//! macOS) a privacy-guarded folder of `$HOME` ([`HOME_SKIP`]), never enters
+//! macOS) a privacy-guarded folder of `$HOME` ([`HOME_SKIP`]; on Windows
+//! `AppData` and every `OneDrive*`, and anywhere a folder whose attributes
+//! say a look would fetch it from the cloud, or a reparse point that is no
+//! link: [`fetches_or_reparses`], read with cloud placeholders exposed
+//! ([`expose_placeholders`]) since a process is shown one inside a sync root
+//! as a plain folder; and never lists or reads a marker in any directory
+//! that lies in a cloud sync root, nor records one — a root, a working
+//! directory inside OneDrive's Documents, an agent's `CARGO_TARGET_DIR`
+//! there, where a `target*` link leads, a sync root a listing meets:
+//! [`in_sync_root`], each one said once in the notes), never enters
 //! or even `stat`s a mount point ([`Roots::mounts`]: a stalled network
 //! mount answers by blocking), never reports or walks a directory off the
-//! measured device ([`Roots::device`]), never enters an x.py checkout's
+//! measured device ([`Roots::device`]; on Windows off its volume's GUID
+//! either, [`Roots::volume`]), never enters an x.py checkout's
 //! `build/` but by the bootstrap rule, and stops at a build directory it
 //! found (its profiles are the profile walk's, `super::target`). Two names
 //! for one directory (a link and its target, a cwd that is also `$HOME`'s
-//! child) are one, by device and inode, its origins MERGED
+//! child; on Windows a verbatim, a plain and a differently cased spelling)
+//! are one, by device and inode (the one identity export,
+//! [`aterm_sysprobe::volumes::file_id`]), its origins MERGED
 //! ([`Origin::merge`]). It is bounded in entries, wall clock and directories
 //! found ([`Budget`]); a walk cut short keeps what it found and says so.
 //!
@@ -147,8 +159,10 @@ pub use aterm_toolchain::checkout;
 
 /// Directories never walked (as `$HOME`'s children, where a working
 /// directory that is `$HOME` meets them too) — the system's own trees and,
-/// on macOS, the privacy-guarded folders ([`checkout::HOME_SKIP`]). A
-/// checkout there is still searched from an agent working in it.
+/// on macOS, the privacy-guarded folders; on Windows `AppData` and every
+/// `OneDrive*` ([`checkout::HOME_SKIP`], matched by [`checkout::home_skip`]
+/// blind to case as the file system is). A checkout there is still searched
+/// from an agent working in it.
 pub use checkout::HOME_SKIP;
 
 /// What the kernel says of a running process's executable ([`Process::exe`]).
@@ -197,10 +211,20 @@ pub struct Roots {
     pub agent_target_dirs: Vec<PathBuf>,
     /// Claude Code's per-user temp root ([`claude_tmp_root`]).
     pub claude_tmp: Option<PathBuf>,
-    /// The device of the volume whose free space is measured: a root, a
-    /// directory or a build directory on any other is never entered or
-    /// reported (removing it frees nothing there). `None`: any device.
+    /// The device of the volume whose free space is measured ([`device_of`]:
+    /// `st_dev`, on Windows the volume serial — one width,
+    /// [`aterm_sysprobe::volumes::FileId::dev`]): a root, a directory or a
+    /// build directory on any other is never entered or reported (removing it
+    /// frees nothing there). `None`: any device (the hand-run verb's reach;
+    /// the window's watch removes nothing then).
     pub device: Option<u64>,
+    /// On Windows, that measured volume's own GUID
+    /// ([`super::target::VolumeGuid::of_path`], as its free-space reading
+    /// keys it): while [`Self::device`] fences, a root, a directory or a build
+    /// directory must be on the volume of this GUID too — a cloned volume
+    /// shares its source's serial, never its GUID — and with none read
+    /// nothing is on the measured volume. Unread elsewhere.
+    pub volume: Option<super::target::VolumeGuid>,
     /// The system's mount points ([`mount_points`]): never entered, never
     /// even `stat`ed — a stalled network mount answers a `stat` of its root
     /// by blocking, and a blocked look holds the disk watch until restart.
@@ -323,6 +347,50 @@ fn project_name(dir: &str) -> String {
         .collect()
 }
 
+/// A working directory as Claude Code spells the one it names its project
+/// after: on Windows a verbatim prefix dropped (`\\?\C:\x` is `C:\x`,
+/// `\\?\UNC\srv\share\x` is `\\srv\share\x`) and a trailing separator past
+/// a drive's root (the PEB keeps `C:\x\`; Node's `process.cwd()` says
+/// `C:\x`); elsewhere as it is.
+fn as_claude_spells(cwd: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !cfg!(windows) {
+        return Cow::Borrowed(cwd);
+    }
+    let cwd: Cow<'_, str> = match cwd.strip_prefix(r"\\?\") {
+        None => Cow::Borrowed(cwd),
+        Some(rest) => match rest.get(..4) {
+            Some(unc) if unc.eq_ignore_ascii_case(r"UNC\") => {
+                Cow::Owned(format!(r"\\{}", &rest[4..]))
+            }
+            _ => Cow::Borrowed(rest),
+        },
+    };
+    let trimmed = cwd.trim_end_matches(['\\', '/']);
+    // `C:\` keeps its separator: a root is never trimmed to `C:`.
+    if trimmed.len() <= 2 || trimmed.len() == cwd.len() {
+        cwd
+    } else {
+        Cow::Owned(trimmed.to_owned())
+    }
+}
+
+/// The repository a Claude Code worktree working directory lies in
+/// (`<repo>/.claude/worktrees/<name>`; on Windows either separator, any
+/// case), if it lies in one.
+fn worktree_repo(cwd: &str) -> Option<&str> {
+    if !cfg!(windows) {
+        return cwd.split_once("/.claude/worktrees/").map(|(repo, _)| repo);
+    }
+    let marker = r"\.claude\worktrees\";
+    let at = cwd.as_bytes().windows(marker.len()).position(|w| {
+        w.iter()
+            .zip(marker.as_bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b) || (*a == b'/' && *b == b'\\'))
+    })?;
+    cwd.get(..at)
+}
+
 impl RunningClaude {
     /// May it hold a session of the project folder `project` (its temp
     /// directory's `<project>`)? Claude Code names that folder after the
@@ -335,6 +403,12 @@ impl RunningClaude {
     /// repository. A working directory not read, or not ASCII (the name is
     /// written from its NFC form, one `-` per UTF-16 unit, which the
     /// kernel's spelling need not share), may hold any.
+    ///
+    /// On Windows the kernel's working directory (the PEB's) keeps a
+    /// trailing separator Claude Code's own (`process.cwd()`) drops, a
+    /// worktree is `<repo>\.claude\worktrees\<name>`, and the file system is
+    /// blind to case: there names compare blind to ASCII case, so a spelling
+    /// in another case holds the project rather than missing it.
     #[must_use]
     pub fn may_hold(&self, project: &std::ffi::OsStr) -> bool {
         let (Some(cwd), Some(project)) = (
@@ -346,28 +420,37 @@ impl RunningClaude {
         ) else {
             return true;
         };
+        let spelled = as_claude_spells(cwd);
+        let cwd: &str = &spelled;
+        // Two names alike: exactly, or on Windows blind to ASCII case.
+        let same = |a: &str, b: &str| {
+            if cfg!(windows) {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        let begins = |s: &str, head: &str| s.get(..head.len()).is_some_and(|h| same(h, head));
         // `name` as Claude Code writes it: whole up to the cap, past it its
         // head, a `-` and a hash. (`name` is ASCII: a byte is a character.)
         let cap = PROJECT_NAME_CAP;
         let named = |name: &str| {
             if name.len() <= cap {
-                project == name
+                same(project, name)
             } else {
-                project.starts_with(&name[..cap]) && project.as_bytes().get(cap) == Some(&b'-')
+                begins(project, &name[..cap]) && project.as_bytes().get(cap) == Some(&b'-')
             }
         };
         // A directory's own project, or one of a directory under it.
         let at_or_under = |name: &str| {
             if name.len() < cap {
-                project == name || project.starts_with(&format!("{name}-"))
+                same(project, name) || begins(project, &format!("{name}-"))
             } else {
-                project.starts_with(&name[..cap])
+                begins(project, &name[..cap])
             }
         };
         named(&project_name(cwd))
-            || cwd
-                .split_once("/.claude/worktrees/")
-                .is_some_and(|(repo, _)| at_or_under(&project_name(repo)))
+            || worktree_repo(cwd).is_some_and(|repo| at_or_under(&project_name(repo)))
     }
 
     /// Where it runs, for a line.
@@ -387,8 +470,9 @@ pub struct Process {
     /// What the kernel says of its executable, read AFTER its exec record,
     /// so one that exited meanwhile reads [`Exe::Exited`]. `None`: not read.
     pub exe: Option<Exe>,
-    /// Its exec record (`KERN_PROCARGS2` on macOS, `/proc` on Linux), `None`
-    /// when it could not be read.
+    /// Its exec record (`KERN_PROCARGS2` on macOS, `/proc` on Linux, its
+    /// process parameters on Windows: [`atpkg::caller_shell::process_args`]),
+    /// `None` when it could not be read.
     pub exec: Option<Exec>,
     /// Its working directory, read only for a Claude Code or a process whose
     /// own directory is not read ([`RunningClaude::cwd`]).
@@ -409,8 +493,28 @@ pub struct Exec {
     pub argv: Vec<String>,
     /// `CLAUDE_CONFIG_DIR` in its environment at exec.
     pub config: Option<String>,
-    /// `HOME` in its environment at exec.
+    /// The variable its `os.homedir()` reads, in its environment at exec:
+    /// `HOME`, on Windows `USERPROFILE` ([`super::super::accounts::HOMEDIR_ENV`]).
     pub home: Option<String>,
+}
+
+impl Exec {
+    /// What the census keeps of the exec record `args` ([`Exec`]): its path,
+    /// `argv[0]` and `argv[1]`, and its two variables — the rest dropped
+    /// here. `None` for a record naming neither a path nor an argument (the
+    /// kernel's for a process that is no program's).
+    fn of(args: atpkg::caller_shell::ProcArgs) -> Option<Self> {
+        use super::super::accounts::{HOME_ENV, HOMEDIR_ENV};
+        if args.exec_path.is_empty() && args.argv.is_empty() {
+            return None;
+        }
+        Some(Self {
+            config: args.env_var(HOME_ENV).map(str::to_owned),
+            home: args.env_var(HOMEDIR_ENV).map(str::to_owned),
+            path: args.exec_path,
+            argv: args.argv.into_iter().take(2).collect(),
+        })
+    }
 }
 
 /// The names Claude Code's own binary answers to as a TOOL, not a Claude
@@ -423,6 +527,10 @@ pub struct Exec {
 /// session lost.
 const CLAUDE_TOOLS: &[&str] = &["ugrep", "bfs", "rg", "apply-seccomp"];
 
+/// The extensions a Windows program file carries, which [`claude_code`]
+/// reads a component without (`claude.exe` is `claude`), ASCII case aside.
+const WINDOWS_PROGRAMS: &[&str] = &["exe", "cmd", "bat", "ps1"];
+
 /// Is a process running `exe` (the kernel's, resolved), exec'd as `exec`, a
 /// Claude Code? Its executable, exec path, `argv[0]` or `argv[1]` has a
 /// path component `claude` or `claude-code` (ASCII case aside) — the atpkg
@@ -432,14 +540,63 @@ const CLAUDE_TOOLS: &[&str] = &["ugrep", "bfs", "rg", "apply-seccomp"];
 /// `…/claude-code/<version>/claude`, npm's `node
 /// …/@anthropic-ai/claude-code/cli.js`; never `~/.claude/…` nor the temp
 /// root's `claude-<uid>` — and its `argv[0]` is not one of the binary's own
-/// tools ([`CLAUDE_TOOLS`]).
-fn claude_code(exe: Option<&Exe>, exec: &Exec) -> bool {
+/// tools ([`CLAUDE_TOOLS`]). On Windows a component is also read without an
+/// executable's extension ([`WINDOWS_PROGRAMS`]): the native installer runs
+/// `~\.local\bin\claude.exe` (a copy, its versions' folder named nowhere on
+/// the way), npm's shim is `claude.cmd`.
+///
+/// `scratch` is Claude Code's temp root on Windows ([`Scratch`]:
+/// `%TEMP%\claude`, spelled long), `None` elsewhere. There a path that lies
+/// in that root (the root itself included) names the folder the sessions'
+/// scratchpads live in, never the program — as macOS's `claude-<uid>` names
+/// no Claude Code — so a program run from a scratchpad
+/// (`%TEMP%\claude\<project>\<session>\scratchpad\…\aterm.exe`, a test
+/// binary, a build's tool) is no Claude Code: none of its `claude`
+/// components counts, the root's own, one under it, and one `%TEMP%` itself
+/// lies in (`…\claude\tmp\claude\…`: the temp path, not a program). Each
+/// path is spelled long first ([`Scratch::long`]: a scratchpad's paths, and
+/// every `argv[0]` started from one, keep `%TEMP%`'s 8.3 short names where
+/// it has them), then placed by the one path rule
+/// ([`aterm_sysprobe::paths::windows_under`]: verbatim or plain, any case,
+/// `/` read as Win32 reads it). A path it cannot place against the root (an
+/// 8.3 spelling nothing spells long, a relative `argv[0]`) still counts —
+/// one more kept project, never a session lost.
+fn claude_code(exe: Option<&Exe>, exec: &Exec, scratch: Option<&Scratch>) -> bool {
+    let named = |s: &std::ffi::OsStr| {
+        s.to_str().is_some_and(|s| {
+            s.eq_ignore_ascii_case("claude") || s.eq_ignore_ascii_case("claude-code")
+        })
+    };
+    // `claude.exe` on Windows: the name without a program's extension.
+    let program = |s: &std::ffi::OsStr| {
+        let p = Path::new(s);
+        cfg!(windows)
+            && p.extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|e| WINDOWS_PROGRAMS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+            && p.file_stem().is_some_and(named)
+    };
+    // Does this path (spelled long) lie in the temp root, or is it the root?
+    let in_scratch = |path: &Path| scratch.is_some_and(|s| s.holds(path));
     let claude = |n: &String| {
-        Path::new(n).components().any(|c| match c {
-            std::path::Component::Normal(s) => s.to_str().is_some_and(|s| {
-                s.eq_ignore_ascii_case("claude") || s.eq_ignore_ascii_case("claude-code")
-            }),
-            _ => false,
+        let path = scratch.map_or(std::borrow::Cow::Borrowed(Path::new(n)), |s| {
+            s.long(Path::new(n))
+        });
+        // In the root: every `claude` on the way is the temp path's.
+        if in_scratch(&path) {
+            return false;
+        }
+        // Else by component: one through which the path is placed in the
+        // root (the rest of it unplaceable) is the temp path's alike.
+        let mut through = PathBuf::new();
+        path.components().any(|c| {
+            through.push(c);
+            match c {
+                std::path::Component::Normal(s) => {
+                    (named(s) || program(s)) && !in_scratch(&through)
+                }
+                _ => false,
+            }
         })
     };
     let tool = exec
@@ -474,12 +631,17 @@ const SYSTEM_EXECUTABLES: &[&str] = &[
 
 /// Can the census tell what a process is, its exec record read as `exec`
 /// and then its executable as `exe`: its record read, it exited, or it runs
-/// one of the system's own executables ([`SYSTEM_EXECUTABLES`])? One it
-/// cannot tell may be a Claude Code ([`claude_census`]).
+/// one of the system's own executables ([`SYSTEM_EXECUTABLES`]; on Windows
+/// exactly one of the measured services that refuse every same-user reader,
+/// [`platform_service`] — `ctfmon.exe` and `taskhostw.exe` in the system's
+/// own `System32`, Defender's `DefenderSessionHelper.exe` in a version
+/// folder of its platform, never a folder alone)? One it cannot tell may be
+/// a Claude Code ([`claude_census`]).
 fn told(exec: Option<&Exec>, exe: &Exe) -> bool {
     exec.is_some()
         || match exe {
             Exe::Exited => true,
+            Exe::At(exe) if cfg!(windows) => platform_service(Some(exe)),
             Exe::At(exe) => SYSTEM_EXECUTABLES.iter().any(|root| exe.starts_with(root)),
             Exe::Unnamed => false,
         }
@@ -533,7 +695,9 @@ fn settled(
 /// flight ([`settled`]) — and it is not one of the system's own
 /// executables. One the kernel says EXITED runs nothing — but one whose
 /// executable cannot be named (unlinked since its exec, or the read refused)
-/// still runs, and is refused like any other not read.
+/// still runs, and is refused like any other not read. On Windows a program
+/// run from Claude Code's temp root is no Claude Code by its path there
+/// ([`claude_code`], against [`Scratch::read`]).
 ///
 /// # Errors
 ///
@@ -541,6 +705,96 @@ fn settled(
 pub fn claude_census(
     processes: impl IntoIterator<Item = Process>,
     home: Option<&Path>,
+) -> ClaudeCensus {
+    census_of(processes, home, Scratch::read().as_ref())
+}
+
+/// Claude Code's temp root as the census places a program's path against
+/// it ([`claude_code`]), on Windows: the root spelled long
+/// ([`claude_scratch_root`]), and the rule that spells each path long
+/// before it is placed. The kernel names a process's image long, but a
+/// session's scratchpad paths keep `%TEMP%` as the environment spells it
+/// (Node's `os.tmpdir()` answers it as set), and so does the `argv[0]` of
+/// every program started from one: on a machine whose `%TEMP%` carries 8.3
+/// short names (`C:\Users\ANDREW~1\…`, `C:/Users//ANDREW~1/…` from Git Bash)
+/// those key nowhere until they are spelled long.
+pub(crate) struct Scratch {
+    /// The root, spelled long where it could be.
+    root: PathBuf,
+    /// The mount table a short-spelled path is placed on before the file
+    /// system is asked to spell it long (a local, non-automounted volume
+    /// only): read the first time one is met, once per census.
+    table: std::cell::OnceCell<aterm_sysprobe::volumes::Table>,
+    /// The long spelling of the part of a path through its last short name
+    /// ([`aterm_sysprobe::volumes::long_name`]; a test's own stand-in).
+    expand: fn(&Path) -> Option<PathBuf>,
+}
+
+impl Scratch {
+    /// The census's own: Claude Code's temp root on Windows
+    /// ([`claude_scratch_root`]), each path spelled long by the file
+    /// system. `None` elsewhere.
+    fn read() -> Option<Self> {
+        claude_scratch_root().map(|root| Self {
+            root,
+            table: std::cell::OnceCell::new(),
+            expand: aterm_sysprobe::volumes::long_name,
+        })
+    }
+
+    /// `path` spelled long where it carries 8.3 short names and lies on a
+    /// local, non-automounted volume
+    /// ([`aterm_sysprobe::volumes::Table::long_spelling_by`]: lexical, no
+    /// link followed, with the system's error boxes off); as it is
+    /// otherwise, and where the file system cannot spell it (a scratchpad
+    /// removed since), which places it nowhere.
+    fn long<'p>(&self, path: &'p Path) -> std::borrow::Cow<'p, Path> {
+        if aterm_sysprobe::paths::short_spelled(path).is_none() {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let _quiet = aterm_sysprobe::quiet_errors();
+        self.table
+            .get_or_init(aterm_sysprobe::volumes::table)
+            .long_spelling_by(path, self.expand)
+    }
+
+    /// Does `path`, spelled long ([`Self::long`]), lie in the root, or is it
+    /// the root? By the one path rule; one it cannot place does not.
+    fn holds(&self, path: &Path) -> bool {
+        aterm_sysprobe::paths::windows_under(path, &self.root) == Some(true)
+    }
+}
+
+/// Claude Code's temp root as [`claude_code`] places a path against it, on
+/// Windows ([`Scratch`]): [`claude_tmp_root`] (`%TEMP%\claude`, the root the
+/// search walks for the sessions' scratch builds), spelled long where
+/// `%TEMP%` carries 8.3 short names (a long or spaced user name gets
+/// `C:\Users\ANDREW~1\…`): [`aterm_sysprobe::volumes::Table::long_spelling`],
+/// asked of a local, non-automounted volume only, with the system's error
+/// boxes off. `None` elsewhere, where the root is `claude-<uid>`, which no
+/// component rule reads as a Claude Code's name.
+fn claude_scratch_root() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let root = claude_tmp_root(own_uid());
+    if aterm_sysprobe::paths::short_spelled(&root).is_none() {
+        return Some(root);
+    }
+    let _quiet = aterm_sysprobe::quiet_errors();
+    Some(
+        aterm_sysprobe::volumes::table()
+            .long_spelling(&root)
+            .into_owned(),
+    )
+}
+
+/// [`claude_census`] with Claude Code's temp root `scratch` (Windows,
+/// [`Scratch`]) already read.
+fn census_of(
+    processes: impl IntoIterator<Item = Process>,
+    home: Option<&Path>,
+    scratch: Option<&Scratch>,
 ) -> ClaudeCensus {
     let mut out = Running::default();
     for Process {
@@ -570,7 +824,7 @@ pub fn claude_census(
         // One whose own directory is not read here may be a Claude Code the
         // kernel does not name one (a copy renamed) keeping its registry
         // there: it keeps its project, as one no registry pins does.
-        if claude_code(exe.as_ref(), &exec) || dir == OwnDir::Unread {
+        if claude_code(exe.as_ref(), &exec, scratch) || dir == OwnDir::Unread {
             out.claudes.push(RunningClaude { pid, started, cwd });
         }
         if let OwnDir::Read(dir) = dir
@@ -586,7 +840,8 @@ pub fn claude_census(
 /// it ([`claude_census`]).
 #[derive(Debug, PartialEq, Eq)]
 enum OwnDir {
-    /// Neither `CLAUDE_CONFIG_DIR` nor `HOME` names one.
+    /// Neither `CLAUDE_CONFIG_DIR` nor `HOME` (`USERPROFILE` on Windows)
+    /// names one.
     Unset,
     /// Read: its registry and transcripts are judged.
     Read(PathBuf),
@@ -628,19 +883,16 @@ fn in_aterm_state(dir: &Path, home: Option<&Path>) -> bool {
         ..aterm_types::dirs::StatePlatform::default()
     };
     aterm_types::dirs::resolve_state_dir(None, platform).is_some_and(|state| {
-        dir.starts_with(&state)
+        aterm_sysprobe::paths::is_under(dir, &state) == Some(true)
             && !dir
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
     })
 }
 
-/// [`claude_census`] of every process of this uid running now: each one's
-/// exec record read (`KERN_PROCARGS2` on macOS, `/proc` on Linux; again
-/// while a spawn is in flight, [`settled`]) and dropped at once but for what
-/// it was exec'd as and its two variables — never kept, never logged; a
-/// Claude Code's working directory and start read from the kernel. Read
-/// below the floor only; this process's own too.
+/// [`claude_census`] of every process of this uid running now, each read by
+/// [`read_process`], this process's own passed over ([`census_of_running`]).
+/// Read below the floor only.
 ///
 /// # Errors
 ///
@@ -648,46 +900,90 @@ fn in_aterm_state(dir: &Path, home: Option<&Path>) -> bool {
 pub fn running_claude_census(home: Option<&Path>) -> ClaudeCensus {
     let pids = aterm_uds::holders::uid_pids()
         .map_err(|e| format!("the running processes could not be listed ({e})"))?;
-    let processes = pids.into_iter().filter_map(|pid| {
-        let read = || {
-            let exec = atpkg::caller_shell::process_args(pid)
-                .filter(|args| !args.exec_path.is_empty() || !args.argv.is_empty())
-                .map(|args| Exec {
-                    config: args.env_var("CLAUDE_CONFIG_DIR").map(str::to_owned),
-                    home: args.env_var("HOME").map(str::to_owned),
-                    path: args.exec_path,
-                    argv: args.argv.into_iter().take(2).collect(),
-                });
-            (exec, aterm_uds::holders::exe_of(pid))
-        };
-        let (exec, exe) = settled(read, std::thread::sleep);
-        let (mut cwd, mut started) = (None, None);
-        let claude = exec.as_ref().is_some_and(|e| claude_code(Some(&exe), e));
-        if claude
-            || exec
-                .as_ref()
-                .is_some_and(|e| own_dir(e, None, home) == OwnDir::Unread)
-        {
-            cwd = aterm_sysprobe::process_cwd(pid);
-            // One that exited since it was listed holds nothing.
-            if cwd.is_none() && aterm_uds::holders::exe_of(pid) == Exe::Exited {
-                return None;
-            }
+    let scratch = Scratch::read();
+    census_of_running(
+        pids,
+        |pid| read_process(pid, home, scratch.as_ref()),
+        home,
+        scratch.as_ref(),
+    )
+}
+
+/// [`claude_census`] of the running processes `pids` names, each read by
+/// `read`, Claude Code's temp root `scratch` already read — THIS PROCESS
+/// PASSED OVER, unread, on every OS. It is aterm (the verb, or the window
+/// whose look asks), never a Claude Code, whatever its path says: on
+/// Windows one run from a Claude Code scratchpad has a `claude` component
+/// in its image (`%TEMP%\claude\…`), and anywhere one started with a
+/// `CLAUDE_CONFIG_DIR` the watch never reads would read as a Claude Code
+/// that keeps its project. The Claude Code directory it was started with is
+/// the caller's, which the survey reads anyway ([`claude_dirs`]).
+pub(crate) fn census_of_running(
+    pids: impl IntoIterator<Item = u32>,
+    read: impl FnMut(u32) -> Option<Process>,
+    home: Option<&Path>,
+    scratch: Option<&Scratch>,
+) -> ClaudeCensus {
+    let me = std::process::id();
+    census_of(
+        pids.into_iter().filter(|&pid| pid != me).filter_map(read),
+        home,
+        scratch,
+    )
+}
+
+/// The running process `pid` as [`claude_census`] reads it: its exec record
+/// read ([`atpkg::caller_shell::process_args`]: `KERN_PROCARGS2` on macOS,
+/// `/proc` on Linux, its process parameters on Windows; again while a spawn
+/// is in flight, [`settled`]) and dropped at once but for what it was exec'd
+/// as and its two variables ([`Exec::of`]) — never kept, never logged; the
+/// working directory of a Claude Code, or of one whose own directory is not
+/// read, and a Claude Code's start, from the kernel ([`process_cwd`]) — a
+/// Claude Code by [`claude_code`]'s rule, Claude Code's temp root `scratch`
+/// (Windows) as the census reads it. `None`: it exited meanwhile, and holds
+/// nothing.
+fn read_process(pid: u32, home: Option<&Path>, scratch: Option<&Scratch>) -> Option<Process> {
+    let read = || {
+        let exec = atpkg::caller_shell::process_args(pid).and_then(Exec::of);
+        (exec, aterm_uds::holders::exe_of(pid))
+    };
+    let (exec, exe) = settled(read, std::thread::sleep);
+    let (mut cwd, mut started) = (None, None);
+    let claude = exec
+        .as_ref()
+        .is_some_and(|e| claude_code(Some(&exe), e, scratch));
+    if claude
+        || exec
+            .as_ref()
+            .is_some_and(|e| own_dir(e, None, home) == OwnDir::Unread)
+    {
+        cwd = process_cwd(pid);
+        // One that exited since it was listed holds nothing.
+        if cwd.is_none() && aterm_uds::holders::exe_of(pid) == Exe::Exited {
+            return None;
         }
-        // Only one the kernel names a Claude Code can be pinned: another's
-        // registry is not read.
-        if claude {
-            started = super::super::upgrade_drive::kernel_start(pid);
-        }
-        Some(Process {
-            pid,
-            exe: Some(exe),
-            exec,
-            cwd,
-            started,
-        })
-    });
-    claude_census(processes, home)
+    }
+    // Only one the kernel names a Claude Code can be pinned: another's
+    // registry is not read.
+    if claude {
+        started = super::super::upgrade_drive::kernel_start(pid);
+    }
+    Some(Process {
+        pid,
+        exe: Some(exe),
+        exec,
+        cwd,
+        started,
+    })
+}
+
+/// The working directory of process `pid` as the kernel holds it
+/// ([`aterm_sysprobe::process_cwd`]; on Windows its process parameters',
+/// spelled without the trailing separator the PEB keeps, which
+/// [`RunningClaude::may_hold`] reads past either way). `None` where it
+/// cannot be read: that process may then hold any project.
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    aterm_sysprobe::process_cwd(pid)
 }
 
 /// This process's real uid.
@@ -871,31 +1167,32 @@ pub struct Discovered {
 /// and a walk cut short before they are done reaches no owner's at all (each
 /// later walk reads nothing once the budget is spent), so an owner's build
 /// directory is never one a checkout the walk missed might use.
+///
+/// The whole walk runs with this thread seeing cloud placeholders as the
+/// reparse points they are (the walk holds [`expose_placeholders`]'s guard,
+/// [`Walk::new`]): in a process's default mode one inside a sync root reads
+/// as a plain folder, and every attribute skip here would pass it. A thread
+/// that cannot be switched searches nothing. And no root is read into — no
+/// listing, no marker — before it is known to lie in no sync root
+/// ([`Walk::outside_sync_root`]): a look into a file or folder not yet
+/// fetched fetches it.
 #[must_use]
 pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
-    let mut w = Walk {
-        started: Instant::now(),
-        budget,
-        entries: 0,
-        cut: None,
-        seen: BTreeMap::new(),
-        found: Vec::new(),
-        device: roots.device,
-        mounts: roots.mounts.iter().cloned().collect(),
-        // The mounts a `target*` link must not lead into: every one but the
-        // root and those `$HOME` lives on.
-        foreign: roots
-            .mounts
-            .iter()
-            .filter(|m| m.as_path() != Path::new("/"))
-            .filter(|m| !roots.home.as_deref().is_some_and(|h| h.starts_with(m)))
-            .cloned()
-            .collect(),
-        notes: Vec::new(),
+    let mut w = match Walk::new(roots, budget) {
+        Ok(w) => w,
+        Err(why) => {
+            let why = format!("nothing was searched: {why}");
+            return Discovered {
+                found: Vec::new(),
+                notes: vec![format!("cargo-targets: {why}")],
+                cut: Some(why),
+            };
+        }
     };
     for dir in &roots.agent_target_dirs {
         if dir.is_absolute()
             && let Ok(real) = std::fs::canonicalize(dir)
+            && w.outside_sync_root(&real)
             && marked(&real)
         {
             w.add(&real, &Origin::AgentTargetDir);
@@ -921,10 +1218,11 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
         .filter(|_| !roots.skip_home_children)
         .and_then(|h| std::fs::canonicalize(h).ok())
         && w.on_device(&home)
+        && w.outside_sync_root(&home)
     {
         for (name, child, ty) in w.children(&home) {
             let n = name.to_string_lossy();
-            if !ty.is_dir() || n.starts_with('.') || HOME_SKIP.contains(&n.as_ref()) {
+            if !ty.is_dir() || n.starts_with('.') || home_skipped(&name) {
                 continue;
             }
             if !w.same_device(&child) {
@@ -958,8 +1256,11 @@ pub fn discover(roots: &Roots, budget: Budget) -> Discovered {
 }
 
 /// Does `dir` carry a build tool's marker: a signed `CACHEDIR.TAG`, or
-/// cargo's `.rustc_info.json`?
+/// cargo's `.rustc_info.json`? It reads the tag's bytes, so the walk asks
+/// only of a directory it listed, or of one it first found in no sync root
+/// ([`Walk::outside_sync_root`]).
 fn marked(dir: &Path) -> bool {
+    read_into(dir);
     cachedir_tag_signed(&dir.join("CACHEDIR.TAG"))
         || std::fs::symlink_metadata(dir.join(RUSTC_INFO)).is_ok_and(|m| m.is_file())
 }
@@ -1054,32 +1355,193 @@ fn small_text(p: &Path) -> Option<String> {
     String::from_utf8(small_bytes(p)?).ok()
 }
 
-/// The device of `p`, a link NOT followed.
+/// The device of `p`, a link NOT followed, through the one identity export
+/// ([`aterm_sysprobe::volumes::file_id`]: `st_dev` on unix, on Windows the
+/// 64-bit volume serial — the one width every device fence compares),
+/// `None` where it cannot be read (a FAT volume keeps no file ids) — never a
+/// constant, which would pass every device fence and let [`placing_of`]
+/// accept a complete table with a home device of 0.
 fn dev_nofollow(p: &Path) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::symlink_metadata(p).ok().map(|m| m.dev())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = p;
-        Some(0)
+    aterm_sysprobe::volumes::file_id(p, false).map(|id| id.dev)
+}
+
+/// `(device, inode)` of the directory at `p`, a link followed: the one
+/// identity export's ([`aterm_sysprobe::volumes::FileId`]: on unix `st_dev`
+/// and `st_ino`, on Windows the volume serial and the 128-bit file id).
+/// `None` where it cannot be read: such a directory is never recorded.
+fn identity(p: &Path) -> Option<(u64, u128)> {
+    aterm_sysprobe::volumes::file_id(p, true).map(|id| (id.dev, id.ino))
+}
+
+/// Is `path` strictly inside `dir` (under it, not it)? On Windows by the one
+/// path rule ([`aterm_sysprobe::paths::is_under`]: any case, a verbatim or a
+/// plain spelling), a path it cannot place NOT inside — an owner's verdict
+/// never reaches a directory it cannot place in the owner's folder; by
+/// component elsewhere.
+fn strictly_inside(path: &Path, dir: &Path) -> bool {
+    if cfg!(windows) {
+        use aterm_sysprobe::paths::{is_under, windows_key};
+        is_under(path, dir) == Some(true) && windows_key(path) != windows_key(dir)
+    } else {
+        path.starts_with(dir) && path != dir
     }
 }
 
-/// `(device, inode)` of the directory at `p`, a link followed.
-fn identity(p: &Path) -> Option<(u64, u64)> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+/// Is `name` (a directory's child, as listed) one of `$HOME`'s folders the
+/// walk never enters ([`HOME_SKIP`])? On Windows blind to case as NTFS is,
+/// `OneDrive*` matching every `OneDrive - <organization>`
+/// ([`checkout::home_skip`]); exactly as listed elsewhere.
+fn home_skipped(name: &std::ffi::OsStr) -> bool {
+    if cfg!(windows) {
+        checkout::home_skip(name).is_some()
+    } else {
+        HOME_SKIP.iter().any(|s| name == *s)
     }
-    #[cfg(not(unix))]
+}
+
+/// Why the walk's listing passes over an entry ([`fetches_or_reparses`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(windows),
+    expect(dead_code, reason = "only Windows passes over an entry it lists")
+)]
+enum PassedOver {
+    /// A reparse point that is no link, and carries no bit that says a look
+    /// fetches it: a cloud sync root or a placeholder of one (OneDrive's, or
+    /// another sync client's), or another kind. One that is a directory is asked whether
+    /// it lies in a sync root ([`in_sync_root`]: opened as itself, which
+    /// fetches nothing) and, if so, said ([`Walk::children`]).
+    Reparse,
+    /// A look into it could make a cloud client fetch it (recalled on open
+    /// or on data access, offline), whether or not it is also a reparse
+    /// point — so it is never opened, not even to ask why — or its
+    /// attributes could not be read.
+    Fetches,
+}
+
+/// Is the directory entry `e` one a look into could make a cloud client
+/// fetch, or that is a reparse point other than a link — never entered or
+/// marked — and which? Windows reads its attributes from the directory's
+/// own listing (the find data: what kind of entry, never how fresh it is):
+/// recalled on open or on data access (a OneDrive or other cloud
+/// placeholder), or offline, whatever else it carries — a reparse point
+/// among them too, so nothing opens it even to ask whether it is a sync
+/// root; else a reparse point std does not read as a link (a link is the
+/// walk's [`std::fs::FileType::is_symlink`] arm). `None` — entered as any
+/// other — always, elsewhere.
+fn fetches_or_reparses(e: &std::fs::DirEntry, ty: std::fs::FileType) -> Option<PassedOver> {
+    #[cfg(windows)]
     {
-        let _ = p;
+        use std::os::windows::fs::MetadataExt as _;
+        // FILE_ATTRIBUTE_REPARSE_POINT, _OFFLINE, _RECALL_ON_OPEN,
+        // _RECALL_ON_DATA_ACCESS.
+        const REPARSE: u32 = 0x0000_0400;
+        const FETCHES: u32 = 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
+        // Attributes not read: passed over, as one that fetches is.
+        let Ok(attributes) = e.metadata().map(|m| m.file_attributes()) else {
+            return Some(PassedOver::Fetches);
+        };
+        // A fetch bit first: one that carries it is never opened.
+        if attributes & FETCHES != 0 {
+            Some(PassedOver::Fetches)
+        } else if attributes & REPARSE != 0 && !ty.is_symlink() {
+            Some(PassedOver::Reparse)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (e, ty);
         None
     }
+}
+
+/// What [`expose_placeholders`] holds: on Windows the thread's mode to put
+/// back ([`aterm_dirfd::ExposedPlaceholders`]); nothing elsewhere.
+#[cfg(windows)]
+pub(crate) type Exposed = aterm_dirfd::ExposedPlaceholders;
+/// What [`expose_placeholders`] holds: on Windows the thread's mode to put
+/// back ([`aterm_dirfd::ExposedPlaceholders`]); nothing elsewhere.
+#[cfg(not(windows))]
+pub(crate) struct Exposed;
+
+/// While the returned guard lives, this thread's reads through `std` see a
+/// cloud placeholder as the reparse point it is — on Windows, where a
+/// process is shown a placeholder inside a sync root (OneDrive's Documents
+/// and Desktop) as a plain file or folder by default, so an attribute skip
+/// ([`fetches_or_reparses`]) would pass it. `aterm-dirfd`'s own calls switch
+/// it themselves; this is for the disk code's `std` reads. Guards nest, and
+/// the thread's own mode is back when the last drops. Nothing elsewhere.
+///
+/// # Errors
+/// The thread could not be switched (the system refuses only an invalid
+/// mode or a thread with no TEB): the caller judges nothing a placeholder
+/// might be.
+pub(crate) fn expose_placeholders() -> Result<Exposed, String> {
+    #[cfg(windows)]
+    {
+        aterm_dirfd::expose_placeholders().map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Exposed)
+    }
+}
+
+/// Does the canonical directory `p` lie in a cloud sync root — the root
+/// itself, or a placeholder folder under one (OneDrive's Documents or
+/// Desktop, a working directory inside them)? Then nothing in it is a
+/// candidate: each file a delete there removes is removed from the cloud
+/// and from every synced device, and a look into a folder not yet fetched
+/// fetches it. Read as the reclaim reads it (`aterm_dirfd::pin`, every
+/// component opened as itself with placeholders exposed): a component that
+/// is a reparse point other than a link refuses the pin — any such, a
+/// virtualization root's too, which the reclaim would refuse alike. Any
+/// other answer (a share, a component gone) leaves the walk's own rules to
+/// judge. Never, elsewhere. Asked through [`Walk::outside_sync_root`].
+fn in_sync_root(p: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        aterm_dirfd::pin(p).err() == Some(aterm_dirfd::Errno::FOREIGN_REPARSE)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = p;
+        false
+    }
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// [`record_reads`].
+    static READS: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A test's witness of what the walk reads INTO: on this thread, from
+/// `record_reads(true)` until `record_reads(false)` (which answers them, in
+/// order), every directory the walk lists ([`Walk::children`]) or reads a
+/// build tool's marker in ([`marked`]) — what would make a cloud client
+/// fetch a folder or a file not yet fetched.
+#[cfg(all(test, windows))]
+fn record_reads(on: bool) -> Vec<PathBuf> {
+    READS
+        .with(|r| std::mem::replace(&mut *r.borrow_mut(), on.then(Vec::new)))
+        .unwrap_or_default()
+}
+
+/// Note `dir`, about to be read into, for [`record_reads`] (a test's, on
+/// Windows; nothing otherwise).
+fn read_into(dir: &Path) {
+    #[cfg(all(test, windows))]
+    READS.with(|r| {
+        if let Some(reads) = r.borrow_mut().as_mut() {
+            reads.push(dir.to_path_buf());
+        }
+    });
+    #[cfg(not(all(test, windows)))]
+    let _ = dir;
 }
 
 /// Is Claude Code's temp root at `tmp` this user's own private directory —
@@ -1112,11 +1574,19 @@ struct Walk {
     budget: Budget,
     entries: usize,
     cut: Option<String>,
-    /// Each build directory found, by `(device, inode)`: its index in `found`.
-    seen: BTreeMap<(u64, u64), usize>,
+    /// Each build directory found, by `(device, inode)` ([`identity`]): its
+    /// index in `found`.
+    seen: BTreeMap<(u64, u128), usize>,
     found: Vec<Found>,
     /// [`Roots::device`].
     device: Option<u64>,
+    /// [`Roots::volume`] (read on Windows only).
+    #[cfg(windows)]
+    volume: Option<super::target::VolumeGuid>,
+    /// The mount table each directory's volume GUID is read from
+    /// ([`Self::on_volume`]), read once while [`Self::device`] fences.
+    #[cfg(windows)]
+    table: Option<aterm_sysprobe::volumes::Table>,
     /// [`Roots::mounts`].
     mounts: BTreeSet<PathBuf>,
     /// The mount points a `target*` link is never followed into
@@ -1124,9 +1594,57 @@ struct Walk {
     foreign: Vec<PathBuf>,
     /// What a root could not be searched for, said once each.
     notes: Vec<String>,
+    /// This thread sees cloud placeholders as reparse points while the walk
+    /// lives ([`expose_placeholders`]): every listing ([`Self::children`])
+    /// and attribute skip ([`fetches_or_reparses`]) reads them so. Last, so
+    /// it drops after everything else the walk holds.
+    _exposed: Exposed,
 }
 
 impl Walk {
+    /// A walk of `roots` within `budget`, its thread switched to seeing cloud
+    /// placeholders as the reparse points they are until it drops.
+    ///
+    /// # Errors
+    /// The thread could not be switched ([`expose_placeholders`]): nothing
+    /// may be searched, since every attribute skip would pass a placeholder.
+    fn new(roots: &Roots, budget: Budget) -> Result<Walk, String> {
+        let exposed = expose_placeholders()?;
+        Ok(Walk {
+            started: Instant::now(),
+            budget,
+            entries: 0,
+            cut: None,
+            seen: BTreeMap::new(),
+            found: Vec::new(),
+            device: roots.device,
+            #[cfg(windows)]
+            volume: roots.volume,
+            // Read once, on Windows only while a device fences: where each
+            // directory's volume GUID is looked up ([`Walk::on_volume`]).
+            #[cfg(windows)]
+            table: roots.device.map(|_| aterm_sysprobe::volumes::table()),
+            mounts: roots.mounts.iter().cloned().collect(),
+            // The mounts a `target*` link must not lead into: every one but
+            // the root and those `$HOME` lives on (on Windows placed by the
+            // one path rule: one it cannot place `$HOME` on stays foreign).
+            foreign: roots
+                .mounts
+                .iter()
+                .filter(|m| m.as_path() != Path::new("/"))
+                .filter(|m| {
+                    !roots
+                        .home
+                        .as_deref()
+                        .is_some_and(|h| aterm_sysprobe::paths::is_under(h, m) == Some(true))
+                })
+                .cloned()
+                .collect(),
+            notes: Vec::new(),
+            _exposed: exposed,
+        })
+    }
+
     /// Is the budget spent? Says why the first time.
     fn spent(&mut self) -> bool {
         if self.cut.is_some() {
@@ -1142,45 +1660,154 @@ impl Walk {
         self.cut.is_some()
     }
 
-    /// Is the directory at `p` (a link followed) on the measured device?
+    /// Is the directory at `p` (a link followed) on the measured device — on
+    /// Windows by its volume's GUID too ([`Self::on_volume`])?
     fn on_device(&self, p: &Path) -> bool {
         self.device
-            .is_none_or(|d| identity(p).is_some_and(|(dev, _)| dev == d))
+            .is_none_or(|d| identity(p).is_some_and(|(dev, _)| dev == d) && self.on_volume(p, true))
+    }
+
+    /// While [`Self::device`] fences, is the directory at `p` on the volume
+    /// of [`Self::volume`]'s GUID, by its mount in the table read for this
+    /// walk — `p` resolved first when `follow` (a link followed, a `subst`
+    /// letter placed), else read as spelled (a child as a canonical
+    /// directory lists it, never a link)? A cloned volume shares its
+    /// source's serial, so the serial alone passes it. With no GUID or no
+    /// table read, a path that does not resolve or a mount with no GUID,
+    /// nothing is. Always, elsewhere (the device is the whole fence).
+    fn on_volume(&self, p: &Path, follow: bool) -> bool {
+        #[cfg(windows)]
+        {
+            use super::target::VolumeGuid;
+            let resolved;
+            let p = if follow {
+                let Ok(real) = std::fs::canonicalize(p) else {
+                    return false;
+                };
+                resolved = real;
+                resolved.as_path()
+            } else {
+                p
+            };
+            let here = self
+                .table
+                .as_ref()
+                .and_then(|t| aterm_sysprobe::volumes::mount_of(p, t))
+                .and_then(aterm_sysprobe::volumes::Mount::key)
+                .and_then(|k| VolumeGuid::of_key(&k));
+            self.volume.is_some() && here == self.volume
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (p, follow);
+            true
+        }
     }
 
     /// Does the link at `link` name a path under a mount point other than
     /// the root and `$HOME`'s ([`Roots::mounts`])? Read as written, before
     /// anything resolves it: resolving would `stat` that mount's root, and a
     /// stalled one answers by blocking. An unreadable link is treated as one.
+    ///
+    /// On Windows the link's text (a junction's `\\?\C:\…`, a symbolic
+    /// link's as written) and the mount points (`D:\`, `C:\mnt\data`, the
+    /// network's `\\`) are compared by the one path key, lexically as on
+    /// unix: a text the key cannot place (relative past `..`, an 8.3 name, a
+    /// volume GUID path) or a mount point it cannot key is treated as one.
     fn leads_into_mount(&self, link: &Path) -> bool {
         let Ok(to) = std::fs::read_link(link) else {
             return true;
         };
         let abs = link.parent().map_or_else(|| to.clone(), |p| p.join(&to));
+        if cfg!(windows) {
+            use aterm_sysprobe::paths::{key_under, windows_key};
+            let Some(key) = windows_key(&abs) else {
+                return true;
+            };
+            return self.foreign.iter().any(|m| {
+                if m.as_os_str() == aterm_sysprobe::volumes::NETWORK {
+                    key.starts_with(r"\\")
+                } else {
+                    windows_key(m).is_none_or(|m| key_under(&key, &m))
+                }
+            });
+        }
         self.foreign.iter().any(|m| abs.starts_with(m))
     }
 
-    /// Is the entry at `p` (a link NOT followed) on the measured device?
+    /// Is `p` (a child as a directory lists it) one of [`Roots::mounts`]? On
+    /// Windows by the one path key (the table lists `C:\mnt\data`, a walk
+    /// meets `\\?\C:\mnt\data` in any case), a child it cannot key counted
+    /// as one: never entered.
+    fn is_mount(&self, p: &Path) -> bool {
+        if cfg!(windows) {
+            let Some(key) = aterm_sysprobe::paths::windows_key(p) else {
+                return true;
+            };
+            return self
+                .mounts
+                .iter()
+                .any(|m| aterm_sysprobe::paths::windows_key(m).is_some_and(|m| m == key));
+        }
+        self.mounts.contains(p)
+    }
+
+    /// Is the entry at `p` (a link NOT followed) on the measured device — on
+    /// Windows by its volume's GUID too ([`Self::on_volume`])?
     fn same_device(&self, p: &Path) -> bool {
-        self.device.is_none_or(|d| dev_nofollow(p) == Some(d))
+        self.device
+            .is_none_or(|d| dev_nofollow(p) == Some(d) && self.on_volume(p, false))
     }
 
     /// The children of `dir`, sorted, each with its type as the directory
     /// lists it (a link is a link, never followed) — a mount point left out
-    /// before anything asks its file system.
+    /// before anything asks its file system ([`Self::is_mount`]), and so is
+    /// (on Windows) an entry a look could make a cloud client fetch, or a
+    /// reparse point that is no link ([`fetches_or_reparses`]).
+    ///
+    /// A folder left out as a reparse point that is no link is asked whether
+    /// it lies in a cloud sync root ([`in_sync_root`]: opened as itself from
+    /// its volume's root, which fetches nothing) and, when it does, said once
+    /// ([`Self::sync_root`]) — the sync root a `$HOME` search meets (a
+    /// sync client's folder, a `Synced` folder, one a checkout holds), never a folder
+    /// under it, which the walk never lists. Not one whose name the walk
+    /// passes over anyway: a hidden folder, or one of `$HOME`'s it never
+    /// enters ([`HOME_SKIP`]: the owner's own `OneDrive*` is skipped by name,
+    /// silently, as `AppData` is).
     fn children(&mut self, dir: &Path) -> Vec<(OsString, PathBuf, std::fs::FileType)> {
         if self.spent() {
             return Vec::new();
         }
+        read_into(dir);
         let Ok(rd) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
+        let mut reparse_folders = Vec::new();
         let mut out: Vec<(OsString, PathBuf, std::fs::FileType)> = rd
             .take(MAX_CHILDREN)
             .flatten()
-            .filter(|e| !self.mounts.contains(&e.path()))
-            .filter_map(|e| Some((e.file_name(), e.path(), e.file_type().ok()?)))
+            .filter(|e| !self.is_mount(&e.path()))
+            .filter_map(|e| {
+                let ty = e.file_type().ok()?;
+                match fetches_or_reparses(&e, ty) {
+                    None => Some((e.file_name(), e.path(), ty)),
+                    Some(PassedOver::Reparse)
+                        if ty.is_dir()
+                            && !e.file_name().to_string_lossy().starts_with('.')
+                            && !home_skipped(&e.file_name()) =>
+                    {
+                        reparse_folders.push(e.path());
+                        None
+                    }
+                    Some(_) => None,
+                }
+            })
             .collect();
+        for folder in reparse_folders {
+            if in_sync_root(&folder) {
+                self.sync_root(&folder);
+            }
+        }
         self.entries = self.entries.saturating_add(out.len());
         super::beat::tick(out.len());
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1207,11 +1834,17 @@ impl Walk {
         let Some(id) = identity(&path) else {
             return;
         };
-        if self.device.is_some_and(|d| d != id.0) {
+        if self
+            .device
+            .is_some_and(|d| d != id.0 || !self.on_volume(&path, false))
+        {
+            return;
+        }
+        if !self.outside_sync_root(&path) {
             return;
         }
         let origin = match origin.owner_dir() {
-            Some(owner) if !(path.starts_with(owner) && path != owner) => Origin::Linked {
+            Some(owner) if !strictly_inside(&path, owner) => Origin::Linked {
                 from: via.to_path_buf(),
             },
             _ => origin.clone(),
@@ -1234,6 +1867,11 @@ impl Walk {
     /// `build/` (the bootstrap rule's alone).
     fn checkout(&mut self, root: &Path) {
         if !self.on_device(root) || inside_xpy_build(root) {
+            return;
+        }
+        // Never walked inside a sync root: nothing there is a candidate, and
+        // a look into a folder not yet fetched fetches it.
+        if !self.outside_sync_root(root) {
             return;
         }
         if is_xpy(root) {
@@ -1262,15 +1900,17 @@ impl Walk {
                 return;
             }
             let n = name.to_string_lossy();
-            if n.starts_with('.') || (xpy && n == "build") || HOME_SKIP.contains(&n.as_ref()) {
+            if n.starts_with('.') || (xpy && n == "build") || home_skipped(&name) {
                 continue;
             }
             if ty.is_symlink() {
-                // The ONE link followed: a checkout's `target -> target.noindex`.
+                // The ONE link followed: a checkout's `target -> target.noindex`
+                // — its marker never read where it leads into a sync root.
                 if n.starts_with("target")
                     && !self.leads_into_mount(&path)
                     && let Ok(real) = std::fs::canonicalize(&path)
                     && std::fs::metadata(&real).is_ok_and(|m| m.is_dir())
+                    && self.outside_sync_root(&real)
                     && marked(&real)
                 {
                     self.add_via(&real, origin, &path);
@@ -1315,6 +1955,51 @@ impl Walk {
         }
     }
 
+    /// Say once that `dir`, in a cloud sync root ([`in_sync_root`]), is
+    /// neither searched nor offered — in the words every refusal of such a
+    /// place uses ([`super::target::IN_SYNC_ROOT`]).
+    fn sync_root(&mut self, dir: &Path) {
+        let note = format!(
+            "cargo-targets: {} {}",
+            dir.display(),
+            super::target::IN_SYNC_ROOT
+        );
+        if !self.notes.contains(&note) {
+            self.notes.push(note);
+        }
+    }
+
+    /// May the walk read into the directory at `dir` — list it, read a
+    /// marker in it, record it? Not when it lies in a cloud sync root
+    /// ([`in_sync_root`], said once: [`Self::sync_root`]). Asked of every
+    /// directory the walk did not reach by a listing of one already asked:
+    /// each root (an agent's `CARGO_TARGET_DIR`, a checkout, `$HOME`, the
+    /// build cache, Claude Code's temp root), where a `target*` link leads,
+    /// and each build directory recorded. A listing's entries need no asking:
+    /// a placeholder or a sync root among them reads as a reparse point that
+    /// is no link while the walk lives ([`Self::_exposed`]), and the listing
+    /// leaves it out ([`fetches_or_reparses`]). On Windows `dir` is resolved
+    /// first, as every read of it would resolve it (a link on the way into a
+    /// sync root is seen through); one that does not resolve is not read
+    /// into either. Always, elsewhere.
+    fn outside_sync_root(&mut self, dir: &Path) -> bool {
+        let resolved;
+        let asked = if cfg!(windows) {
+            let Ok(real) = std::fs::canonicalize(dir) else {
+                return false;
+            };
+            resolved = real;
+            resolved.as_path()
+        } else {
+            dir
+        };
+        if in_sync_root(asked) {
+            self.sync_root(dir);
+            return false;
+        }
+        true
+    }
+
     /// Each Claude Code session's `scratchpad/` under `tmp`
     /// (`<tmp>/<project>/<session>/scratchpad`) — only when `tmp` is this
     /// user's private directory ([`private_dir`]).
@@ -1335,6 +2020,9 @@ impl Walk {
         let Ok(tmp) = std::fs::canonicalize(tmp) else {
             return;
         };
+        if !self.outside_sync_root(&tmp) {
+            return;
+        }
         for (project, pdir, ty) in self.children(&tmp) {
             if !ty.is_dir() || project.to_string_lossy().starts_with('.') {
                 continue;
@@ -1364,9 +2052,18 @@ impl Walk {
     }
 
     /// The Rust build cache under `$HOME` (`atpkg::build_cache`): every
-    /// marked `.cargo-build` under the mirror of its workspace's path.
+    /// marked `.cargo-build` under the mirror of its workspace's path, the
+    /// workspace read back as `/` joined to the mirror's path below the
+    /// cache — the inverse of the writer's join on macOS, the one platform
+    /// anything writes the cache on. On Windows nothing does (a workspace's
+    /// `C:` could not be a component below it), and a folder found there
+    /// anyway names `\<rel>`, no absolute path: its owner is never seen gone
+    /// (`checkout::gone_placed` refuses it), so it is kept.
     fn build_cache(&mut self, cache: &Path) {
-        if !std::fs::symlink_metadata(cache).is_ok_and(|m| m.is_dir()) || !self.on_device(cache) {
+        if !std::fs::symlink_metadata(cache).is_ok_and(|m| m.is_dir())
+            || !self.on_device(cache)
+            || !self.outside_sync_root(cache)
+        {
             return;
         }
         let mut stack = vec![(cache.to_path_buf(), 0usize)];
@@ -1881,7 +2578,7 @@ pub fn owns(owner: &Owner, path: &Path) -> Result<(), String> {
             owner.dir().display()
         )
     })?;
-    if path.starts_with(&dir) && path != dir {
+    if strictly_inside(path, &dir) {
         Ok(())
     } else {
         Err(format!(
@@ -1897,12 +2594,86 @@ pub fn owns(owner: &Owner, path: &Path) -> Result<(), String> {
 /// directory or descriptors of `lsd`, `UserEventAgent`, `routined` and
 /// other agents under `/usr/libexec` and `/System`, always; counting them
 /// would keep every directory forever.
+///
+/// Windows (measured 2026-10-19: of 89 same-user processes, these three and
+/// no other refused a reader, always): ONLY an image that is exactly
+/// `%SystemRoot%\System32\ctfmon.exe` (the text-input host),
+/// `%SystemRoot%\System32\taskhostw.exe` (the task host), or
+/// `DefenderSessionHelper.exe` directly in a version folder of
+/// `%ProgramData%\Microsoft\Windows Defender\Platform\` — never a directory
+/// alone, which would pass any program the system's tree holds
+/// ([`windows_service`]); the folders are the system's own readings
+/// (`GetSystemDirectoryW`, `SHGetKnownFolderPath`), never the environment's.
+/// An unreadable process whose image is not named stays held.
 pub(crate) fn platform_service(exe: Option<&Path>) -> bool {
-    exe.is_some_and(|p| {
-        ["/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/"]
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static SYSTEM: OnceLock<Option<PathBuf>> = OnceLock::new();
+        static PROGRAM_DATA: OnceLock<Option<PathBuf>> = OnceLock::new();
+        exe.is_some_and(|p| {
+            windows_service(
+                p,
+                SYSTEM.get_or_init(super::win::system_directory).as_deref(),
+                PROGRAM_DATA
+                    .get_or_init(super::win::program_data)
+                    .as_deref(),
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        exe.is_some_and(|p| {
+            ["/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/"]
+                .iter()
+                .any(|root| p.starts_with(root))
+        })
+    }
+}
+
+/// [`platform_service`]'s Windows rule over `exe`, an unreadable process's
+/// image, given the system directory `system` (`…\System32`) and the
+/// program data folder `program_data`: `exe` is exactly `ctfmon.exe` or
+/// `taskhostw.exe` directly in `system`, or `DefenderSessionHelper.exe`
+/// directly in a version folder (digits, `.` and `-`) directly in
+/// `program_data\Microsoft\Windows Defender\Platform`. Compared by the one
+/// path key ([`aterm_sysprobe::paths::windows_key`]: any case, a verbatim
+/// or a plain spelling); a path either side cannot key, or a folder not
+/// read, is no service.
+#[must_use]
+pub fn windows_service(exe: &Path, system: Option<&Path>, program_data: Option<&Path>) -> bool {
+    use aterm_sysprobe::paths::windows_key;
+    let Some(image) = windows_key(exe) else {
+        return false;
+    };
+    let keyed = |dir: &Path, name: &str| windows_key(&dir.join(name));
+    if let Some(system) = system
+        && ["ctfmon.exe", "taskhostw.exe"]
             .iter()
-            .any(|root| p.starts_with(root))
-    })
+            .any(|name| keyed(system, name).is_some_and(|k| k == image))
+    {
+        return true;
+    }
+    let Some(platform) = program_data.and_then(|d| {
+        windows_key(
+            &d.join("Microsoft")
+                .join("Windows Defender")
+                .join("Platform"),
+        )
+    }) else {
+        return false;
+    };
+    let Some(version) = image
+        .strip_prefix(platform.as_str())
+        .and_then(|rest| rest.strip_prefix('\\'))
+        .and_then(|rest| rest.strip_suffix(r"\DEFENDERSESSIONHELPER.EXE"))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-')
 }
 
 /// The running processes [`unused`] judges: given the directories (each
@@ -1944,9 +2715,25 @@ pub fn unused(owner: &Owner, path: &Path, processes: Processes<'_>) -> Result<()
 ///
 /// Who uses one, or why that could not be ruled out.
 pub fn unused_under(dirs: &[PathBuf], processes: Processes<'_>) -> Result<(), String> {
-    let scan = processes(dirs, &[std::process::id()])
+    scan_says_unused(&processes(dirs, &[std::process::id()]), |_| true)
+}
+
+/// [`unused_under`]'s verdict on a `scan` already read, counting only the
+/// uses `counts` keeps (one scan over several directories, judged for each):
+/// a counted use, a process that could not be read (unless a platform
+/// service) or a scan that failed says why it is not unused.
+///
+/// # Errors
+///
+/// Who uses it, or why that could not be ruled out.
+pub fn scan_says_unused(
+    scan: &std::io::Result<aterm_uds::holders::PathScan>,
+    counts: impl Fn(&aterm_uds::holders::PathUse) -> bool,
+) -> Result<(), String> {
+    let scan = scan
+        .as_ref()
         .map_err(|e| format!("the running processes could not be listed: {e}"))?;
-    if let Some(u) = scan.users.first() {
+    if let Some(u) = scan.users.iter().find(|u| counts(u)) {
         return Err(format!(
             "process {} uses {} (its {})",
             u.pid,
@@ -2010,6 +2797,7 @@ fn own_use(
     own: &[(&'static str, std::io::Result<PathBuf>)],
     dirs: &[PathBuf],
 ) -> std::io::Result<Option<(&'static str, PathBuf)>> {
+    let table = cfg!(windows).then(aterm_sysprobe::volumes::table);
     for (how, path) in own {
         let path = path.as_ref().map_err(|error| {
             std::io::Error::new(
@@ -2026,7 +2814,14 @@ fn own_use(
                 ),
             )
         })?;
-        if dirs.iter().any(|d| path.starts_with(d)) {
+        // One it cannot place against a directory (on Windows the one path
+        // rule over the mount table read now answers `None`) is a use.
+        if dirs.iter().any(|d| {
+            table.as_ref().map_or_else(
+                || aterm_sysprobe::paths::is_under(&path, d),
+                |t| t.is_under(&path, d),
+            ) != Some(false)
+        }) {
             return Ok(Some((*how, path)));
         }
     }
@@ -2120,3 +2915,8 @@ pub fn newest_write(dir: &Path, max: usize) -> Result<Option<i64>, String> {
 #[path = "disk_discover_tests.rs"]
 #[cfg(all(test, unix))]
 mod tests;
+
+// Windows: spellings, junctions, attributes, the measured platform services.
+#[path = "disk_discover_windows_tests.rs"]
+#[cfg(all(test, windows))]
+mod windows_tests;

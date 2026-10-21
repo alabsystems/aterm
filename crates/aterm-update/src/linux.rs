@@ -1073,12 +1073,18 @@ const TIME_NAMESPACE: &str = "/proc/self/ns/time";
 /// Whole seconds on `CLOCK_MONOTONIC`, named by the boot (`boot_id`) and the time
 /// namespace (`time_namespace`) they count on ([`Steady`]); `None` when the boot has no
 /// name to read or the clock cannot be read, and the wall clock judges alone.
+///
+/// The boot's text must be one astream's reader of the kernel's boot id takes
+/// (`astream_sys::parse_boot_id`, the judge aterm-link's broker and the supervisor's sleep
+/// count read the boot with): a UUID, and not the all-zero id a damaged answer reads as —
+/// two starts stamped with one damaged answer must never read as one boot, or a steady second
+/// of each would be set against the other.
+/// The name keeps the kernel's text as it came (trimmed), so a stamp an older build wrote
+/// still names the same clock.
 fn steady_clock(boot_id: &Path, time_namespace: &Path) -> Option<Steady> {
     let boot = fs::read_to_string(boot_id).ok()?;
+    astream_sys::parse_boot_id(boot.as_bytes())?;
     let boot = boot.trim();
-    if boot.is_empty() {
-        return None;
-    }
     let namespace = fs::read_link(time_namespace)
         .map(|link| link.to_string_lossy().into_owned())
         .unwrap_or_default();

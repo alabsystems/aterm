@@ -1166,7 +1166,8 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
 fn trail_line(h: &Host) -> String {
     aterm_effects::cursor_glow::TrailStatus {
         style_raw: "rainbow kitty",
-        style: GlowStyle::RainbowKitty,
+        style: Some(GlowStyle::RainbowKitty),
+        unknown: false,
         config_enabled: true,
         effective: true,
         focused: true,
@@ -1203,6 +1204,8 @@ fn trail_line(h: &Host) -> String {
         flow: h.glow.flow_status(),
         inserts: aterm_effects::cursor_glow::InsertTally::default(),
         in_flight: aterm_effects::cursor_glow::InFlightTally::default(),
+        comet_cells: 0,
+        comet_alpha_max: 0,
     }
     .line_v2(h.glow.v2_status())
 }

@@ -104,6 +104,8 @@ pub(crate) struct KeyRow {
     combining: Vec<(usize, Box<[char]>)>,
     /// One [`Seen`] per logical column of the row last read.
     seen: Vec<Seen>,
+    /// The row under it, read the same way, empty when it was the last row.
+    below: Vec<Seen>,
 }
 
 impl KeyRow {
@@ -111,13 +113,32 @@ impl KeyRow {
     pub(crate) fn cells(&self) -> &[Seen] {
         &self.seen
     }
+
+    /// The row under it, as [`seen_row`] read it (`KeySample::below`, THE
+    /// FLOOR a run's proof stands on); `None` when that was the last row.
+    pub(crate) fn below(&self) -> Option<&[Seen]> {
+        (!self.below.is_empty()).then_some(self.below.as_slice())
+    }
 }
 
 /// Read visible row `row` of `t` into `out` as the predictor's key-time sample:
 /// one [`Seen`] per column of the grid, projected exactly as [`seen_at`] projects
-/// the same row of a frame. Call under the press's terminal hold, beside the
+/// the same row of a frame. The row under it too, read the same way, unless
+/// `row` is the last. Call under the press's terminal hold, beside the
 /// cursor read.
 pub(crate) fn seen_row(t: &Terminal, row: u16, out: &mut KeyRow) {
+    // The row under it first, read into `seen` and swapped into `below`: both
+    // buffers stay resident.
+    out.below.clear();
+    if row.saturating_add(1) < t.rows() {
+        read_row(t, row.saturating_add(1), out);
+        std::mem::swap(&mut out.seen, &mut out.below);
+    }
+    read_row(t, row, out);
+}
+
+/// Read visible row `row` of `t` into `out.seen`, one [`Seen`] per column.
+fn read_row(t: &Terminal, row: u16, out: &mut KeyRow) {
     let logical = t.logical_row_into(
         usize::from(row),
         &mut out.cells,
@@ -182,6 +203,29 @@ mod tests {
             };
             assert_eq!(opaque, expected_opaque, "{label}: {:?}", key.cells());
         }
+    }
+
+    /// The press also reads the row UNDER the cursor row (`KeySample::below`, the
+    /// predictor's floor), projected as the frame's observe projects that row,
+    /// and none under the last row.
+    #[test]
+    fn the_key_row_reads_the_row_under_it_as_the_frame_does() {
+        let mut term = row_of("$ ab\r\nPassword: \x1b[A\x1b[5G".as_bytes());
+        let mut key = KeyRow::default();
+        seen_row(&term, 0, &mut key);
+        let mut frame = RenderInput::empty();
+        term.cell_frame_into(&mut frame, 2, 12);
+        let under: Vec<Seen> = (0..12).map(|c| seen_at(&frame, 1, c)).collect();
+        assert_eq!(key.below(), Some(under.as_slice()));
+        let top: Vec<Seen> = (0..12).map(|c| seen_at(&frame, 0, c)).collect();
+        assert_eq!(
+            key.cells(),
+            top.as_slice(),
+            "the cursor row is still the row read"
+        );
+        seen_row(&term, 1, &mut key);
+        assert_eq!(key.below(), None, "no row under the last");
+        assert_eq!(key.cells(), under.as_slice());
     }
 
     /// The one cell the projections disagree on: a bracket inside right-to-left

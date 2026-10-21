@@ -8,6 +8,7 @@ use super::*;
 fn test_session(id: u64) -> Session {
     let self_id = SessionId::generate();
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let observed = crate::session_watch::Observed::default();
     let ctx = Arc::new(SessionCtx {
         sink: Arc::new(SinkWriter::new(-1)),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
@@ -24,22 +25,21 @@ fn test_session(id: u64) -> Session {
             crate::temporal::TemporalRecorder::new(),
         )),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
-        turns: Arc::new(std::sync::Mutex::new(
-            crate::turn_ledger::TurnLedger::default(),
-        )),
+        turns: observed.turns,
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-        timeline: Arc::new(std::sync::Mutex::new(
-            crate::session_timeline::SessionTimeline::default(),
-        )),
+        timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        licence: Default::default(),
         launch: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
         update_parked: Default::default(),
+        watchers: observed.watchers,
+        frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
     });
@@ -61,6 +61,7 @@ fn test_session(id: u64) -> Session {
         body_loader: false,
         integration_frozen: false,
         identity: None,
+        _identity_admission: None,
         ctx,
         child_proxy: None,
         output_wake_pending: Arc::new(AtomicU64::new(0)),
@@ -128,14 +129,14 @@ fn detach_drops_session_exactly_when_last_view_leaves() {
 }
 
 /// Tier-1 conformance of the real session lifecycle to `proxy_registry_model`
-/// (`ProxyRegistry`): the proxy table never holds more child capabilities than live
+/// (`ProxyRegistry`): the parent never retains more child edge-token files than live
 /// sessions. `Spawn` is `spawn::provision_child_proxy` (scratch socket dir) plus the pool
 /// taking a session holding its `ChildProxy` (stored by hand, since `spawn_session` needs
-/// an event loop); `Close` is the last detach. Every step of a fill-and-drain script must
-/// be a model step, and a closed child's 0600 token file must be gone.
+/// an event loop); `Close` is the last detach. `registered` counts the children whose
+/// 0600 file still exists. Every step of a fill-and-drain script must be a model step.
 ///
-/// Negative control: `Buggy = 1` (a `Drop` that forgets to deregister) rejects the real
-/// `Close` steps.
+/// Negative control: `Buggy = 1` (a `Drop` that forgets to remove the file) rejects the
+/// real `Close` steps.
 #[test]
 fn session_close_conforms_to_proxy_registry_no_leak() {
     use aterm_spec::verify::validate_transition_tiered;
@@ -144,25 +145,20 @@ fn session_close_conforms_to_proxy_registry_no_leak() {
     let dir = std::env::temp_dir().join(format!("aterm-s1-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch socket dir");
     let mut pool = SessionPool::default();
-    // (pool id, child sid, edge-token file) for every child provisioned.
-    let mut children: Vec<(u64, SessionId, std::path::PathBuf)> = Vec::new();
-    let project = |pool: &SessionPool, children: &[(u64, SessionId, std::path::PathBuf)]| {
-        let table = crate::proxy::proxies();
-        let table = table.read().unwrap_or_else(|p| p.into_inner());
+    // (pool id, edge-token file) for every child provisioned.
+    let mut children: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    let project = |pool: &SessionPool, children: &[(u64, std::path::PathBuf)]| {
         std::collections::BTreeMap::from([
             (
                 "live",
                 children
                     .iter()
-                    .filter(|(id, ..)| pool.get(*id).is_some())
+                    .filter(|(id, _)| pool.get(*id).is_some())
                     .count() as i64,
             ),
             (
                 "registered",
-                children
-                    .iter()
-                    .filter(|(_, sid, _)| table.contains_key(sid))
-                    .count() as i64,
+                children.iter().filter(|(_, file)| file.exists()).count() as i64,
             ),
         ])
     };
@@ -187,21 +183,13 @@ fn session_close_conforms_to_proxy_registry_no_leak() {
                     .find(|(key, _)| key == aterm_types::domain::ENV_EDGE_TOKENS)
                     .map(|(_, path)| std::path::PathBuf::from(path))
                     .expect("the file channel with a private dir");
-                children.push((step, child.sid().clone(), edge_file));
+                children.push((step, edge_file));
                 let mut session = test_session(step);
                 session.child_proxy = Some(child);
                 pool.insert(session);
             }
             _ => {
                 assert!(pool.detach(step), "the last view drops session {step}");
-                let (_, _, edge_file) = children
-                    .iter()
-                    .find(|(id, ..)| *id == step)
-                    .expect("a spawned session");
-                assert!(
-                    !edge_file.exists(),
-                    "session {step}'s edge-token file outlived it"
-                );
             }
         }
         let next = project(&pool, &children);
@@ -234,7 +222,7 @@ fn session_close_conforms_to_proxy_registry_no_leak() {
     }
     assert_eq!(
         buggy_rejected_closes, 4,
-        "the forgot-to-deregister mutant must part from every real close"
+        "the forgot-to-remove mutant must part from every real close"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

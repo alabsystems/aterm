@@ -38,6 +38,8 @@ fn seams(trust: &crate::vendor_direct::lane::Trust) -> PassSeams<'_> {
         translated: || false,
         flip_policy: || crate::quiet::FlipPolicy::Now,
         running: &no_processes,
+        vendor_read_grace: VENDOR_READ_GRACE,
+        read_ahead_in: &no_read_ahead_note,
     }
 }
 

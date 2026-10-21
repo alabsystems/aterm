@@ -242,7 +242,7 @@ impl GlDevice {
                     (gl.uniform_block_binding)(program, idx, n);
                 }
             }
-            for &n in b.fragment_textures {
+            for &n in b.fragment_textures.iter().chain(b.fragment_palette.iter()) {
                 let name = std::ffi::CString::new(format!("aterm_t{n}")).expect("no NUL");
                 let loc = (gl.get_uniform_location)(program, name.as_ptr());
                 if loc >= 0 {
@@ -321,6 +321,16 @@ pub(crate) unsafe fn specify_instance_layout(cur: &Current<'_>, layout: &VertexL
                     a.location,
                     1,
                     ffi::GL_UNSIGNED_INT,
+                    stride,
+                    offset,
+                ),
+                AttrFormat::Sint16x2 => {
+                    (gl.vertex_attrib_i_pointer)(a.location, 2, ffi::GL_SHORT, stride, offset)
+                }
+                AttrFormat::Uint16x2 => (gl.vertex_attrib_i_pointer)(
+                    a.location,
+                    2,
+                    ffi::GL_UNSIGNED_SHORT,
                     stride,
                     offset,
                 ),

@@ -11,6 +11,7 @@
 //!
 //! ```text
 //!  Autopilot · tab 3 “fix the footer”
+//!  set 14:05 over aterm ctl                  only where its own word stands
 //!  ∞  Cruise                              ●
 //!  ⤓  Land now
 //!  ○  Off
@@ -44,6 +45,15 @@
 //! ([`place`]). Its name goes on two rows where one would cut it: the
 //! place, then the session's name in quotes; and the place breaks at its
 //! comma where a narrow pane cannot hold it whole ([`rows`]).
+//!
+//! **Who set it** (design §11.7.1): under the name, where the session runs
+//! under its own word, a note says who set it and when (`set 14:05 over
+//! aterm ctl`, `set Fri 09:12 from the chip`; clock times, never ages) —
+//! whole on one row, or broken at its comma onto two, or absent where the
+//! card's room cannot hold it whole. It is the first row to give way: where
+//! the pane's rows cannot hold the card whole with it, or would move the
+//! card to the chip's other side, the card is laid out without it
+//! ([`fit_rows`]).
 //!
 //! **On top.** It is painted after the frame published its overlays, so its
 //! splice takes its cells back from them (`app_render::scrub_overlay_card`):
@@ -151,6 +161,14 @@ pub(crate) enum MenuRow {
     /// Why the rows below are off: `harness off in Settings`, or the agent's
     /// own switch by name (`Supervise Claude Code sessions is off`).
     Note(String),
+    /// Who set the session's own word, and when (§11.7.1): `set 14:05 over
+    /// aterm ctl` — one row, or two where it breaks at its comma; inert, in
+    /// the note's ink, and the first row to give way ([`fit_rows`]). `floor`:
+    /// the cells it asks of the card at the least — 0 at a build, and the
+    /// cells the shown note asked where one built again takes its place
+    /// ([`keep_places`]), so a note that says less (the timer's fire under
+    /// an open menu) never narrows the card under a still pointer.
+    SetBy { text: String, floor: usize },
     /// A rule between groups.
     Rule,
     /// The place of a choice that left while the menu was open (the timer
@@ -183,7 +201,7 @@ impl MenuRow {
     /// apart, flush right).
     fn text(&self) -> String {
         match self {
-            Self::Header(text) | Self::Note(text) => text.clone(),
+            Self::Header(text) | Self::Note(text) | Self::SetBy { text, .. } => text.clone(),
             Self::Name(name) => quoted(name),
             Self::Rule | Self::Gap(_) => String::new(),
             Self::Item { glyph, label, .. } => {
@@ -237,6 +255,10 @@ pub(crate) struct MenuFacts {
     pub(crate) armed_at_ms: Option<i64>,
     /// Its optional local face, used only to name the cancel row.
     pub(crate) armed: Option<LandAtGlass>,
+    /// Who set the session's own word, and when (§11.7.1: `set 14:05 over
+    /// aterm ctl`), composed at the build; `None` where it runs under the
+    /// default.
+    pub(crate) set_by: Option<String>,
 }
 
 /// A clock time as the title and the page write it: `18:00`, or `Sat 16:00`
@@ -281,6 +303,10 @@ pub(crate) fn rows(facts: &MenuFacts) -> Vec<MenuRow> {
         }
         None => place_rows(&facts.title, facts.room),
     };
+    // Who set it, under the name: whole, or not at all (§11.7.1).
+    if let Some(set_by) = &facts.set_by {
+        out.extend(set_by_rows(set_by, facts.room));
+    }
     if !on {
         // Why, as the chip's title says it: an agent's own switch by name.
         let why = match facts.view {
@@ -372,6 +398,63 @@ fn place_rows(title: &str, room: usize) -> Vec<MenuRow> {
     }
 }
 
+/// The setter's note as rows in `room` cells (§11.7.1): one where it is
+/// whole, else broken after its last comma where both halves are whole
+/// (`set 14:05 from Settings ▸ Harness,` then `every session`), else none —
+/// it is never cut.
+fn set_by_rows(note: &str, room: usize) -> Vec<MenuRow> {
+    let row = |text: String| MenuRow::SetBy { text, floor: 0 };
+    if display_cells(note) <= room {
+        return vec![row(note.to_string())];
+    }
+    match note.rsplit_once(", ") {
+        Some((head, tail)) if display_cells(head) < room && display_cells(tail) <= room => {
+            vec![row(format!("{head},")), row(tail.to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// THE NOTE GIVES WAY FIRST (§11.7.3, item 6): `rows` as the card shows
+/// them over the chip at `anchor` in `pane` of the frame `frame` under `top`
+/// chrome rows ([`place`]'s inputs) — with the setter's note where the card
+/// holds every row with it, on the side of the chip it would take without
+/// it; else without the note, so a tight pane loses the note before any
+/// choice, and the note never moves the card over its chip or into the
+/// frame's rows. Pure.
+#[must_use]
+pub(crate) fn fit_rows(
+    rows: Vec<MenuRow>,
+    anchor: (usize, usize),
+    pane: (std::ops::Range<usize>, std::ops::Range<usize>),
+    frame: (usize, usize),
+    top: usize,
+) -> Vec<MenuRow> {
+    if !rows.iter().any(|row| matches!(row, MenuRow::SetBy { .. })) {
+        return rows;
+    }
+    let without: Vec<MenuRow> = rows
+        .iter()
+        .filter(|row| !matches!(row, MenuRow::SetBy { .. }))
+        .cloned()
+        .collect();
+    let side = |rect: MenuRect| {
+        if rect.row + rect.h <= anchor.0 {
+            0u8
+        } else if rect.row > anchor.0 {
+            2
+        } else {
+            1
+        }
+    };
+    let with = place(&rows, anchor, pane.clone(), frame, top);
+    let bare = place(&without, anchor, pane, frame, top);
+    match (with, bare) {
+        (Some(with), Some(bare)) if with.h == rows.len() + 2 && side(with) == side(bare) => rows,
+        _ => without,
+    }
+}
+
 /// Whether `a` offers the choice `b` offered, in the same words: a lit row
 /// stays lit across a rebuild only where Return would still do what it said.
 fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
@@ -400,6 +483,7 @@ fn row_width(row: &MenuRow) -> usize {
     match row {
         MenuRow::Gap(cells) => *cells,
         MenuRow::Item { .. } => display_cells(&row.text()) + CHECK_CELLS,
+        MenuRow::SetBy { floor, .. } => display_cells(&row.text()).max(*floor),
         _ => display_cells(&row.text()),
     }
 }
@@ -444,12 +528,14 @@ fn side_pad(w: usize, rows: &[MenuRow]) -> usize {
 }
 
 /// The rows a card must show to be worth opening in a pane: its header and
-/// the three modes (every row before the first rule), and its borders. A
-/// pane with fewer rows lends it the frame's.
+/// the three modes (every row before the first rule, but the setter's note,
+/// which gives way first: [`fit_rows`]), and its borders. A pane with fewer
+/// rows lends it the frame's.
 fn least_rows(rows: &[MenuRow]) -> usize {
     rows.iter()
-        .position(|row| matches!(row, MenuRow::Rule))
-        .unwrap_or(rows.len())
+        .take_while(|row| !matches!(row, MenuRow::Rule))
+        .filter(|row| !matches!(row, MenuRow::SetBy { .. }))
+        .count()
         + 2
 }
 
@@ -460,6 +546,7 @@ fn same_place(shown: &MenuRow, fresh: &MenuRow) -> bool {
         (MenuRow::Header(_), MenuRow::Header(_))
         | (MenuRow::Name(_), MenuRow::Name(_))
         | (MenuRow::Note(_), MenuRow::Note(_))
+        | (MenuRow::SetBy { .. }, MenuRow::SetBy { .. })
         | (MenuRow::Rule, MenuRow::Rule) => true,
         (MenuRow::Item { act: a, .. }, MenuRow::Item { act: b, .. }) => a == b,
         _ => false,
@@ -477,11 +564,17 @@ pub(crate) fn keep_places(shown: &[MenuRow], fresh: &[MenuRow]) -> Option<Vec<Me
     let mut next = fresh.iter().peekable();
     let laid = shown
         .iter()
-        .map(|old| {
-            next.next_if(|new| same_place(old, new))
-                .cloned()
-                .unwrap_or_else(|| MenuRow::Gap(row_width(old)))
-        })
+        .map(
+            |old| match next.next_if(|new| same_place(old, new)).cloned() {
+                // A note built again asks at least the cells the shown one did.
+                Some(MenuRow::SetBy { text, floor }) => MenuRow::SetBy {
+                    text,
+                    floor: floor.max(row_width(old)),
+                },
+                Some(new) => new,
+                None => MenuRow::Gap(row_width(old)),
+            },
+        )
         .collect();
     next.peek().is_none().then_some(laid)
 }
@@ -665,7 +758,9 @@ pub(crate) fn paint(
         let bg = if selected { c.sel_bg } else { c.card_bg };
         let (fg, bold) = match row {
             MenuRow::Header(_) | MenuRow::Name(_) => (c.band.value, true),
-            MenuRow::Note(_) | MenuRow::Item { enabled: false, .. } => (c.disabled, false),
+            MenuRow::Note(_) | MenuRow::SetBy { .. } | MenuRow::Item { enabled: false, .. } => {
+                (c.disabled, false)
+            }
             MenuRow::Item { .. } if selected => (c.sel_fg, true),
             _ => (c.band.value, false),
         };
@@ -872,7 +967,7 @@ impl AutopilotMenu {
                 )),
                 MenuRow::Rule => out.push(format!("autopilot-menu rule index={i}")),
                 MenuRow::Gap(_) => out.push(format!("autopilot-menu gap index={i}")),
-                MenuRow::Header(text) | MenuRow::Note(text) => {
+                MenuRow::Header(text) | MenuRow::Note(text) | MenuRow::SetBy { text, .. } => {
                     out.push(format!("autopilot-menu label index={i} text={text:?}"));
                 }
                 MenuRow::Name(_) => {
@@ -927,6 +1022,7 @@ impl std::hash::Hash for MenuRow {
             Self::Note(t) => (1u8, t).hash(h),
             Self::Rule => 2u8.hash(h),
             Self::Gap(cells) => (4u8, cells).hash(h),
+            Self::SetBy { text, floor } => (6u8, text, floor).hash(h),
             Self::Item {
                 label,
                 act,
@@ -986,6 +1082,28 @@ impl App {
             Some(name) => format!("Autopilot, {place}, {name}"),
             None => format!("Autopilot, {place}"),
         };
+        // Who set its own word, and when (§11.7.1): one wall read, at the
+        // build, for the day the clock is named against; none where it runs
+        // under the default.
+        let set_by = self
+            .pool
+            .get(session)
+            .is_some_and(|s| {
+                s.ctx
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .autopilot
+                    .is_some()
+            })
+            .then(|| self.autopilot_set_by_words(session))
+            .flatten()
+            .map(|words| {
+                let today = crate::harness_glass::local_day_at(
+                    crate::autopilot_timers::wall_ms().div_euclid(1000),
+                );
+                words.line(Some(today))
+            });
         MenuFacts {
             title: format!("Autopilot \u{b7} {place}"),
             name,
@@ -1003,7 +1121,31 @@ impl App {
             }),
             armed_at_ms: self.autopilot_timers.land_at_ms(session),
             armed: self.autopilot_timers.glass(session),
+            set_by,
         }
+    }
+
+    /// `rows` as the card over `session`'s chip at `anchor` in window `wid`
+    /// shows them: the setter's note given way where the pane cannot hold
+    /// the card whole with it ([`fit_rows`]).
+    fn autopilot_menu_fit(
+        &self,
+        wid: WindowId,
+        session: u64,
+        anchor: (usize, usize),
+        rows: Vec<MenuRow>,
+    ) -> Vec<MenuRow> {
+        let frame = self.windows.get(&wid).map_or((0, 0), |ws| {
+            (ws.input_scratch.cols, ws.input_scratch.cells.len())
+        });
+        let top = usize::from(self.chrome_rows(wid));
+        fit_rows(
+            rows,
+            anchor,
+            self.autopilot_menu_pane(wid, session),
+            frame,
+            top,
+        )
     }
 
     /// OPEN session `session`'s menu in window `wid`, hung from its
@@ -1024,7 +1166,7 @@ impl App {
             room: content_room(self.autopilot_menu_pane(wid, session).1.len()),
             ..self.autopilot_menu_facts(session)
         };
-        let rows = rows(&facts);
+        let rows = self.autopilot_menu_fit(wid, session, anchor, rows(&facts));
         let highlight = keyboard
             .then(|| step(&rows, None, true, rows.len()))
             .flatten();
@@ -1068,14 +1210,18 @@ impl App {
             return;
         }
         self.note_land_at_offer();
-        let Some(wid) = self.autopilot_menu.as_ref().map(|menu| menu.wid) else {
+        let Some((wid, anchor)) = self
+            .autopilot_menu
+            .as_ref()
+            .map(|menu| (menu.wid, menu.anchor))
+        else {
             return;
         };
         let facts = MenuFacts {
             room: content_room(self.autopilot_menu_pane(wid, local_id).1.len()),
             ..self.autopilot_menu_facts(local_id)
         };
-        let fresh = rows(&facts);
+        let fresh = self.autopilot_menu_fit(wid, local_id, anchor, rows(&facts));
         let cancels = self.autopilot_timers.land_at_ms(local_id);
         let Some(menu) = self.autopilot_menu.as_mut() else {
             return;
@@ -1204,16 +1350,18 @@ impl App {
     ///
     /// The menu's card is the last of the host's chrome over the grid the
     /// resident pet must not sit on, after the footer's write: its cells are
-    /// noted, and the pass ends here (`crate::pet_chrome`) — a pass whose
-    /// cells moved under a pet that read the old ones asks for the frame that
-    /// shows them to it.
+    /// noted, as a transient overlay (it protects its cells from the pet but
+    /// never moves its rest seat), and the pass ends here (`crate::pet_chrome`) — a
+    /// pass whose cells moved under a pet that read the old ones asks for the
+    /// frame that shows them to it.
     pub(crate) fn splice_autopilot_menu(&mut self, wid: WindowId) {
         let rect = self.paint_autopilot_menu(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         if let Some(rect) = rect {
-            ws.pet_chrome.note(rect.row, rect.col, rect.h, rect.w);
+            ws.pet_chrome
+                .note_overlay(rect.row, rect.col, rect.h, rect.w);
         }
         if ws.pet_chrome.commit()
             && let Some(window) = ws.os_window.as_ref()
@@ -1235,6 +1383,7 @@ impl App {
         let top = usize::from(self.chrome_rows(wid));
         let theme = self.overlay_card_theme(wid);
         let ((cw, ch), pad) = (self.win_cell_size(wid), self.win_pad(wid));
+        let grid_top = self.win_pad_top(wid) + self.win_head(wid);
         let pane = self.autopilot_menu_pane(wid, session);
         let menu = self.autopilot_menu.as_ref()?;
         let ws = self.windows.get(&wid)?;
@@ -1290,12 +1439,17 @@ impl App {
                 im.retain(|(col, _)| !span.contains(col));
             }
         }
-        crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect, cw, pad);
+        crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect);
         // THE CARD IS ON TOP: the caret under it, the resident pet and every
         // other overlay yield its cells (`scrub_overlay_card`) — the pet's
         // seat avoids them from the next frame (`crate::pet_chrome`), this
         // cut covers the frames before it moves.
-        crate::app_render::scrub_overlay_card(&mut ws.input_scratch, rect, (cw, ch), pad);
+        crate::app_render::scrub_overlay_card(
+            &mut ws.input_scratch,
+            rect,
+            (cw, ch),
+            (pad, grid_top),
+        );
         // A host write, as the tab menu's is: every reuse lane refills, and
         // the renderer compares every row — not only the rows whose engine
         // revision moved, which painted the card in strips over rows the
@@ -1333,11 +1487,20 @@ impl App {
                     .default_mode()
                     .is_some()
                 {
-                    self.set_session_autopilot(session, Some(mode));
+                    self.set_session_autopilot(
+                        session,
+                        Some(mode),
+                        crate::autopilot::Surface::Menu,
+                    );
                 }
             }
             MenuAct::Timer(choice) => {
-                self.choose_autopilot_timer_naming(session, choice, cancels);
+                self.choose_autopilot_timer_naming(
+                    session,
+                    choice,
+                    cancels,
+                    crate::autopilot::Surface::Menu,
+                );
             }
             MenuAct::Settings => {
                 self.open_harness_settings(
@@ -1549,9 +1712,11 @@ impl App {
         let mut items = Vec::new();
         let mut selected = None;
         let mut note = None;
+        let mut set_by: Vec<&str> = Vec::new();
         for (i, row) in menu.rows.iter().enumerate().take(shown_rows(rect)) {
             match row {
                 MenuRow::Note(text) => note = Some(text.as_str()),
+                MenuRow::SetBy { text, .. } => set_by.push(text.as_str()),
                 MenuRow::Item {
                     spoken,
                     act,
@@ -1572,10 +1737,17 @@ impl App {
                 MenuRow::Header(_) | MenuRow::Name(_) | MenuRow::Rule | MenuRow::Gap(_) => {}
             }
         }
-        let label = match note {
-            Some(note) => format!("{}, {note}", menu.spoken),
-            None => menu.spoken.clone(),
-        };
+        // In the card's order: its name, who set it (§11.7.1: its two rows
+        // read as the one line they are), then why its rows are off.
+        let mut label = menu.spoken.clone();
+        if !set_by.is_empty() {
+            label.push_str(", ");
+            label.push_str(&set_by.join(" "));
+        }
+        if let Some(note) = note {
+            label.push_str(", ");
+            label.push_str(note);
+        }
         Some(GridMenu {
             label,
             epoch: menu.a11y_epoch(),

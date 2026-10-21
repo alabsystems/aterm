@@ -35,7 +35,11 @@
 //!   aterm-gui writes it) and `human` (the `human` mark aterm-gui writes of
 //!   a person's input after delivered mail, T39): records of the log
 //!   alone, which move nothing the tracker or its model holds (checked on
-//!   the screen rig).
+//!   the screen rig);
+//! - `turn-mail` (6A-6): a mail mark on the open turn (`src=aterm
+//!   conf=exact`), as `transcript_replays` writes one by hand. No host
+//!   writes mail under a turn (the fabric's marks are the session's), so
+//!   it only fills the turn's `mail=` rollup; a record of the log alone.
 //!
 //! The SCREEN rig is `conformance_turn`'s: every step is a model step,
 //! checked against the derived `TurnTracker` model as `drive` checks it
@@ -50,7 +54,11 @@
 //! its states, below) and adds `state on|partial|off`, `file <ino>` (the
 //! path now names another file), `adopt keep-tx|drop-tx [after=<ms>]` (a
 //! successor adopted the tracker's carry line with or without its `tx_`
-//! tokens, `after` ms after it was written) and
+//! tokens, `after` ms after it was written), `close-run <out>` (6A-6: the
+//! agent's run closes `out=<out> src=status conf=strong`, as the glue's
+//! `close_run` writes it, and the steps open under it with it, `out=gone`;
+//! a record of the log alone, which the screen rig's model has no step
+//! for) and
 //! `tx <event> [dated=<ms>] [off=<n>] [slice=<file>:<a>-<b>]`, the event
 //! one of `prompt <vref>`, `interrupt`, `tool <id> [tool=] [cls=]
 //! [subagent]`, `result <id> [error]`, `end [vdur=] [in=] [out=]`,
@@ -100,9 +108,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use aterm_models_session::{transcript_join_model, turn_tracker_model};
 use aterm_slog::{
-    ActWord, Actor, Conf, Cursor, Fields, GapWhy, Key, Kind, Limits, Log, Lvl, MAX_BYTES, Mark,
-    Node, Op, Open, Rec, ShortId, Src, Tier, TurnTracker, TxEvent, TxPos, TxState, Verdict,
-    WallJudge, WallKind, encode,
+    ActWord, Actor, Close, Conf, Cursor, Fields, GapWhy, Key, Kind, Limits, Log, Lvl, MAX_BYTES,
+    Mark, Node, Op, Open, Out, Rec, RunOut, ShortId, Src, Tier, TurnTracker, TxEvent, TxPos,
+    TxState, Verdict, WallJudge, WallKind, encode,
 };
 use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{State, admits, with_buggy};
@@ -110,7 +118,7 @@ use aterm_spec::interp::{State, admits, with_buggy};
 use crate::conformance_transcript::project_parts;
 use crate::conformance_turn::{self, Rig, Step, handoff};
 use crate::seq_twins::{self, Took};
-use crate::support::{WALL0, agent_session, at, time_order_holds};
+use crate::support::{self, WALL0, agent_session, at, time_order_holds};
 
 /// Where the corpus lives.
 pub const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/sequences");
@@ -179,6 +187,10 @@ pub enum Ev {
     },
     /// The person's input mark (T39).
     Human,
+    /// `turn-mail`: a mail mark on the open turn, by hand (6A-6).
+    TurnMail,
+    /// `close-run <out>`: the agent's run closes (6A-6).
+    CloseRun(RunOut),
     Handoff(bool),
     Half,
     Elapse,
@@ -562,6 +574,22 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
             })
         }
         ["human"] => Ok(Ev::Human),
+        ["turn-mail"] => Ok(Ev::TurnMail),
+        ["close-run", out] => {
+            let o = [
+                RunOut::Ok,
+                RunOut::Fail,
+                RunOut::Signal,
+                RunOut::Gone,
+                RunOut::Superseded,
+                RunOut::Retracted,
+                RunOut::Unknown,
+            ]
+            .into_iter()
+            .find(|o| Out::Run(*o).word() == *out)
+            .ok_or_else(|| format!("`{out}` is no run's outcome"))?;
+            only(!screen, Ev::CloseRun(o))
+        }
         ["handoff", "carried"] => Ok(Ev::Handoff(true)),
         ["handoff", "uncarried"] => Ok(Ev::Handoff(false)),
         ["half"] => only(screen, Ev::Half),
@@ -625,14 +653,20 @@ fn mail_mark(kind: &str, off: u64) -> Result<Mark, aterm_slog::FieldError> {
         .fields(f))
 }
 
-/// A step that writes into the log alone (`mail`, `human`): `true` when
-/// `ev` is one, written at `stamp`.
+/// A step that writes into the log alone (`mail`, `human`, `turn-mail`):
+/// `true` when `ev` is one, written at `stamp`.
 fn log_only(log: &mut Log, ev: &Ev, stamp: aterm_slog::Stamp) -> Result<bool, String> {
     let mark = match ev {
         Ev::Mail { kind, off } => mail_mark(kind, *off).map_err(|e| format!("{e:?}"))?,
         Ev::Human => Mark::new(Kind::Human, Src::Input, Conf::Strong)
             .at(Node::SESSION)
             .by(Actor::Human),
+        Ev::TurnMail => {
+            let turn = log
+                .deepest_open(Lvl::Turn)
+                .ok_or("`turn-mail` with no turn open")?;
+            Mark::new(Kind::Mail, Src::Aterm, Conf::Exact).at(turn)
+        }
         _ => return Ok(false),
     };
     log.mark(mark, stamp)
@@ -875,8 +909,14 @@ impl TxRig {
                 );
                 self.took(format!("{} ctl cause={cause}", self.now), seq0);
             }
-            Ev::Mail { .. } | Ev::Human => {
+            Ev::Mail { .. } | Ev::Human | Ev::TurnMail => {
                 log_only(&mut self.log, ev, stamp)?;
+            }
+            Ev::CloseRun(out) => {
+                let close = Close::new(Out::Run(*out), Src::Status, Conf::Strong);
+                self.log
+                    .close(self.run, close, stamp)
+                    .map_err(|e| format!("the run's close was refused: {e:?}"))?;
             }
             Ev::Handoff(carried) => {
                 let seq0 = self.log.last_seq();
@@ -1012,6 +1052,9 @@ pub struct Replay {
     pub every: Vec<String>,
     pub lines: Vec<String>,
     pub lost: u64,
+    /// How many `mail=@<off>~` tokens its briefs printed, one brief after
+    /// each line (6C-3).
+    pub mail_tokens: usize,
 }
 
 fn enc(r: &Rec) -> String {
@@ -1334,6 +1377,7 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
     let mut next: BTreeMap<(&'static str, Lvl), usize> = BTreeMap::new();
     let mut named: BTreeMap<(&'static str, Lvl), usize> = BTreeMap::new();
     let mut states = Vec::new();
+    let mut mail_tokens = 0;
     for line in &seq.lines {
         let at_line = |e: String| format!("{}:{}: `{}`: {e}", seq.name, line.no, line.text);
         // `at <ms>` waits first on every line, an `expect` too: a checkpoint
@@ -1424,6 +1468,10 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
             state,
             appended: recs.iter().map(enc).collect(),
         });
+        // Every line's brief prints the fold's mail link, with its `~`,
+        // and only it (6C-3, U5): both rigs.
+        mail_tokens +=
+            support::brief_mail_links_hold(live.log(), WALL0 + live.now()).map_err(at_line)?;
         if let Some(e) = expect {
             if let Expect::Rec { op, lvl, .. } = e {
                 *named.entry((op.word(), *lvl)).or_insert(0) += 1;
@@ -1461,6 +1509,7 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
         every,
         lines: log.window().map(enc).collect(),
         lost: log.lost(),
+        mail_tokens,
     })
 }
 
@@ -1620,7 +1669,21 @@ pub const TURN_MUTANTS: &[Mutant] = &[
         dial: 2,
         name: "ActBindsNextBox",
         law: "ActNeverBindsNextBox",
-        hand: |s| set(s, &[("bk", 1), ("pp", 0), ("ab", 0), ("pd", 0), ("gn", 1)]),
+        hand: |s| {
+            set(
+                s,
+                &[
+                    ("bk", 1),
+                    ("ba", s["pa"]),
+                    ("bs", s["pa"]),
+                    ("pp", 0),
+                    ("ab", 0),
+                    ("pa", 0),
+                    ("pd", 0),
+                    ("gn", 1),
+                ],
+            )
+        },
     },
     Mutant {
         join: false,
@@ -1633,6 +1696,8 @@ pub const TURN_MUTANTS: &[Mutant] = &[
                 s,
                 &[
                     ("bk", 0),
+                    ("ba", 0),
+                    ("bs", 0),
                     ("pp", 0),
                     ("ab", 0),
                     ("ga", 1),
@@ -1684,6 +1749,17 @@ pub const TURN_MUTANTS: &[Mutant] = &[
                 ],
             )
         },
+    },
+    // 6A-5: a binding that names the other acting actor. Named by the law
+    // a swap of a ctl act breaks (read as the harness's, a proven author:
+    // the false `out=approved`); the harness's side (HarnessActNotCtl) is
+    // caught by `conformance_turn`'s hand-built successors.
+    Mutant {
+        join: false,
+        dial: 2,
+        name: "ActorSwap",
+        law: "ActorKeepsItsAct",
+        hand: |s| set(s, &[("ba", 3 - s["ba"])]),
     },
 ];
 
@@ -1977,6 +2053,10 @@ fn every_corpus_file_replays_and_meets_its_expects() {
     assert!(
         replays.iter().any(|(_, r)| r.lost > 0),
         "no file evicts: the cursor contract never meets a gap"
+    );
+    assert!(
+        replays.iter().any(|(_, r)| r.mail_tokens > 0),
+        "no file's brief prints a mail link: the `~` check never met one"
     );
     for (s, (_, r)) in seqs.iter().zip(&replays) {
         let fresh = s.lines.iter().any(|l| matches!(l.ev, Ev::Handoff(false)));

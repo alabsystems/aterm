@@ -57,6 +57,16 @@ impl Api {
 
     /// Fetch (or reuse) one API document as parsed JSON.
     fn doc(&self, rel_url: &str, cache_file: &str, max_age_s: u64) -> Result<Value, String> {
+        self.doc_with_freshness(rel_url, cache_file, max_age_s, true)
+    }
+
+    fn doc_with_freshness(
+        &self,
+        rel_url: &str,
+        cache_file: &str,
+        max_age_s: u64,
+        allow_stale: bool,
+    ) -> Result<Value, String> {
         if self.writable {
             self.prefix.ensure_api_cache()?;
         }
@@ -83,7 +93,9 @@ impl Api {
             }
             Err(e) => {
                 // Stale cache beats no answer (offline work, design §6).
-                if let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, API_BYTES) {
+                if allow_stale
+                    && let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, API_BYTES)
+                {
                     eprintln!("abrew: offline; using stale API cache for {cache_file}");
                     parse_json(&bytes)
                 } else {
@@ -133,11 +145,23 @@ impl Api {
             &format!("formula-{short}.json"),
             3600,
         )
+        .map_err(|e| not_found_error(&e, "formula", short))
+    }
+
+    fn cask_doc(&self, token: &str) -> Result<Value, String> {
+        let short = Formula::short_name(token);
+        self.doc(
+            &format!("cask/{short}.json"),
+            &format!("cask-{short}.json"),
+            3600,
+        )
+        .map_err(|e| not_found_error(&e, "cask", short))
     }
 
     pub fn formula(&self, name: &str) -> Result<Formula, String> {
         let short = Formula::short_name(name);
-        let f = Formula::from_api(&self.formula_doc(name)?)?;
+        let mut f = Formula::from_api(&self.formula_doc(name)?)?;
+        f.resolve_variations();
         // Bind metadata to the request: the record must name the
         // requested formula (or carry it as a known alias/oldname), so a
         // mismatched cache/redirect body cannot rename the install.
@@ -160,11 +184,7 @@ impl Api {
 
     pub fn cask(&self, token: &str) -> Result<Cask, String> {
         let short = Formula::short_name(token);
-        let v = self.doc(
-            &format!("cask/{short}.json"),
-            &format!("cask-{short}.json"),
-            3600,
-        )?;
+        let v = self.cask_doc(token)?;
         let c = Cask::from_api(&v)?;
         if c.token != short {
             return Err(format!(
@@ -175,23 +195,87 @@ impl Api {
         Ok(c)
     }
 
+    /// The raw API record for `info --json`: brew's JSON info is
+    /// the API document itself, so abrew emits the same record it
+    /// parsed (identity-bound like [`Api::formula`]).
+    pub(super) fn formula_value(&self, name: &str) -> Result<Value, String> {
+        let _ = self.formula(name)?;
+        self.formula_doc(name)
+    }
+
+    /// [`Api::formula_value`] for a cask token.
+    pub(super) fn cask_value(&self, token: &str) -> Result<Value, String> {
+        let _ = self.cask(token)?;
+        self.cask_doc(token)
+    }
+
     /// The full formula or cask index (for `search`): (name, desc).
     /// The index fetched now, ignoring cache freshness (`abrew update`).
     pub fn index_fresh(&self, casks: bool) -> Result<Vec<(String, String)>, String> {
-        self.index_inner(casks, 0)
+        Ok(self
+            .index_inner(casks, 0, false)?
+            .into_iter()
+            .map(|(name, _, desc)| (name, desc))
+            .collect())
     }
 
     pub fn index(&self, casks: bool) -> Result<Vec<(String, String)>, String> {
-        self.index_inner(casks, 86_400)
+        Ok(self
+            .index_inner(casks, 86_400, true)?
+            .into_iter()
+            .map(|(name, _, desc)| (name, desc))
+            .collect())
     }
 
-    fn index_inner(&self, casks: bool, max_age_s: u64) -> Result<Vec<(String, String)>, String> {
+    /// The index with cask display names (`desc` search prints and
+    /// matches them): (name/token, display names joined, desc).
+    /// Formula rows carry an empty display field.
+    pub fn desc_index(&self, casks: bool) -> Result<Vec<(String, String, String)>, String> {
+        self.index_inner(casks, 86_400, true)
+    }
+
+    /// Declared install options per formula from the raw index
+    /// records. Only rows the parse can fully see are returned;
+    /// options are empty across homebrew/core today.
+    pub fn options_index(&self) -> Result<Vec<OptionsRow>, String> {
+        let v = self.doc_with_freshness("formula.json", "formula-index.json", 86_400, true)?;
+        let mut out = Vec::new();
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                let (options, head) = parse_options_record(item);
+                let full_name = item
+                    .get("full_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name)
+                    .to_string();
+                out.push(OptionsRow {
+                    full_name,
+                    options,
+                    head,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn index_inner(
+        &self,
+        casks: bool,
+        max_age_s: u64,
+        allow_stale: bool,
+    ) -> Result<Vec<(String, String, String)>, String> {
         let (rel, file) = if casks {
             ("cask.json", "cask-index.json")
         } else {
             ("formula.json", "formula-index.json")
         };
-        let v = self.doc(rel, file, max_age_s)?;
+        let v = self.doc_with_freshness(rel, file, max_age_s, allow_stale)?;
         let mut out = Vec::new();
         if let Some(arr) = v.as_array() {
             for item in arr {
@@ -202,9 +286,23 @@ impl Api {
                 }
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+                let display = if casks {
+                    item.get("name")
+                        .and_then(Value::as_array)
+                        .map(|names| {
+                            names
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let desc = item.get("desc").and_then(Value::as_str).unwrap_or_default();
                 if !name.is_empty() {
-                    out.push((name.to_string(), desc.to_string()));
+                    out.push((name.to_string(), display, desc.to_string()));
                 }
             }
         }
@@ -212,28 +310,75 @@ impl Api {
     }
 }
 
+/// One formula's declared install options, for `brew options`.
+pub struct OptionsRow {
+    pub full_name: String,
+    /// (flag without `--`, description), sorted by flag.
+    pub options: Vec<(String, String)>,
+    pub head: bool,
+}
+
+/// One raw API record's declared options and HEAD presence, for
+/// `brew options`: ([(flag without `--`, description)] sorted by
+/// flag as brew dumps them, has HEAD spec).
+pub(super) fn parse_options_record(v: &Value) -> (Vec<(String, String)>, bool) {
+    let mut options: Vec<(String, String)> = v
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|opt| {
+                    let flag = opt.get("option").and_then(Value::as_str)?;
+                    if flag.is_empty() {
+                        return None;
+                    }
+                    let desc = opt
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    Some((flag.to_string(), desc.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    options.sort();
+    let head = v
+        .get("urls")
+        .and_then(|u| u.get("head"))
+        .is_some_and(|h| h.as_object().is_some());
+    (options, head)
+}
+
 pub(super) fn dependency_formula(v: &Value, name: &str) -> Result<Formula, String> {
     if !super::valid_component(name) {
         return Err("abrew: invalid formula name".to_string());
     }
-    let formula = Formula::from_api(v)?;
+    let mut formula = Formula::from_api(v)?;
+    if !formula.resolve_variations() {
+        return Err(format!(
+            "abrew: {name} has unknown system dependency metadata"
+        ));
+    }
     if formula.name != name {
         return Err(format!(
             "abrew: dependency metadata for {name} names {}",
             formula.name
         ));
     }
-    if !super::valid_component(&formula.version) {
+    if !super::valid_cask_version(&formula.version) {
         return Err("abrew: invalid formula version".to_string());
     }
     if v.get("revision").and_then(Value::as_u64) != Some(formula.revision) {
         return Err(format!("abrew: {name} has no known package revision"));
     }
-    let deps = v
+    // The raw document must carry a complete top-level array of plain
+    // names, and the system-resolved list (a variation may replace it)
+    // must be plain too: neither may smuggle a malformed entry past.
+    let raw = v
         .get("dependencies")
         .and_then(Value::as_array)
         .ok_or_else(|| format!("abrew: {name} has no complete dependency array"))?;
-    for dep in deps {
+    for dep in raw {
         let dep = dep
             .as_str()
             .filter(|s| !s.is_empty())
@@ -242,7 +387,22 @@ pub(super) fn dependency_formula(v: &Value, name: &str) -> Result<Formula, Strin
             return Err(format!("abrew: malformed dependency of {name}"));
         }
     }
+    for dep in &formula.dependencies {
+        if dep.is_empty() || !super::valid_name(dep) {
+            return Err(format!("abrew: malformed dependency of {name}"));
+        }
+    }
     Ok(formula)
+}
+
+/// A 404 from the per-package API is a plain "no such package",
+/// not a transport failure worth showing curl's stderr for.
+fn not_found_error(error: &str, kind: &str, name: &str) -> String {
+    if error.contains("404") {
+        format!("abrew: no such {kind}: {name}")
+    } else {
+        error.to_string()
+    }
 }
 
 fn parse_json(bytes: &[u8]) -> Result<Value, String> {
@@ -374,5 +534,25 @@ mod tests {
             Some("homebrew/core/wget")
         );
         assert_eq!(ghcr_repo_of("https://example.com/x.tar.gz"), None);
+    }
+
+    #[test]
+    fn options_record_sorts_flags_and_sees_head() {
+        let v: Value = aterm_json::from_slice(
+            br#"{"options":[{"option":"with-z","description":"Zed"},{"option":"with-a","description":"Ay"},{"option":"","description":"skip"}],"urls":{"head":{"url":"https://example.com/x.git"}}}"#,
+        )
+        .unwrap();
+        let (options, head) = parse_options_record(&v);
+        assert_eq!(
+            options,
+            [
+                ("with-a".to_string(), "Ay".to_string()),
+                ("with-z".to_string(), "Zed".to_string())
+            ]
+        );
+        assert!(head);
+        let bare: Value =
+            aterm_json::from_slice(br#"{"options":[],"urls":{"stable":{}}}"#).unwrap();
+        assert_eq!(parse_options_record(&bare), (vec![], false));
     }
 }

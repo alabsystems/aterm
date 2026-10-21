@@ -12,9 +12,10 @@
 //!
 //! Threading: text/cursor/cell/search read the shared [`Terminal`] directly;
 //! send/key/resize write the PTY master fd. `image` needs the renderer on the
-//! main thread, so this thread pushes an [`ImageReq`], wakes the event loop with
-//! [`Wake::Control`] and blocks on the reply; the main thread renders, writes
-//! the PNG and replies with the frame dimensions.
+//! main thread, so this thread posts an [`ImageReq`] as [`Wake::Image`] through
+//! the main-thread RPC (`control_media::post_main`) and blocks on the reply;
+//! the main thread renders, and the encode worker writes the PNG and replies
+//! with the frame dimensions.
 //!
 //! In a window, `image` (and the SIGUSR1 snapshot) re-renders the current
 //! terminal through the same renderer and splice/composite sequence as the
@@ -25,37 +26,48 @@
 //! deterministic cursor state use the `cursor` verb.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use aterm_uds::{CtlListener, CtlStream};
 
 use aterm_containment::log_denial;
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_session::{EdgeToken, Op, SessionId, decide_edge};
+use aterm_types::control_request::{self, Head, Selector, Sid};
+use aterm_types::control_verbs::{Body, Input, Resolved, input_of};
 use aterm_window::event_loop::EventLoopProxy;
 
+use crate::budget::{BudgetEvent, Slot, Slots, UnitBudget, UnitPermit};
 use crate::control_auth::{self, AuthOutcome};
 use crate::input::{Egress, InputEvent, InputOutcome, PasteFraming, ScrollIntent, Source};
 use crate::session_store::Store;
-use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested, Subscribers};
+use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested};
 use crate::{SessionCtx, Wake, term_lock};
 
 /// Read-only screen introspection serializers, dispatched as
-/// `control_query::cmd_*` from [`handle`]. The file is `src/control_query.rs`.
+/// `control_query::cmd_*` from [`dispatch_request`]'s class handlers. The file is
+/// `src/control_query.rs`.
 #[path = "control_query.rs"]
 mod control_query;
-// Query serializers reached as `crate::control::NAME` (`crate::subscribe`).
+// Query serializers reached as `crate::control::NAME` (`crate::subscribe`,
+// `crate::frame_key`).
 pub(crate) use control_query::{
-    ScreenGen, gather_styled_frame, rows_hash, screen_gen, screen_stamp, screen_text,
-    serialize_styled_frame, trimmed_len, visible_row,
+    ScreenGen, StyledFrameSnapshot, gather_styled_frame, line_size_name, row_line_size, screen_gen,
+    screen_text, serialize_styled_frame, trimmed_len, visible_row,
 };
-// A test reads a generation the way a fenced driver does, through the verb's
-// own function (`control_tests.rs`).
+// The ground truths the published text is held to.
 #[cfg(test)]
-pub(crate) use control_query::{cmd_text_json_looked, text_args};
+pub(crate) use control_query::rows_hash;
+#[cfg(all(test, unix))]
+pub(crate) use control_query::screen_stamp;
+// A test reads a generation the way a fenced driver does, through the verb's
+// own function (`control_tests.rs`); the subscribe tests read `screen` beside
+// a `cells` watch the same way.
+#[cfg(test)]
+pub(crate) use control_query::{cmd_screen_styled_json, cmd_text_json_looked, text_args};
 // Full-history search (shared by ⌘F and the `search` verb) and its index depth
 // cap, reached as `crate::control::NAME`.
 #[cfg(test)]
@@ -67,14 +79,11 @@ pub(crate) use control_query::{
 // callers split gather/serialize so JSON rendering runs off the mutex.
 #[cfg(test)]
 pub(crate) use control_query::styled_frame_payload;
-// Test-only serialization of searches that share the process-global index cache, so a
-// test that asserts reuse or counts a cold build's copy is not churned by another's.
-#[cfg(test)]
-pub(crate) use control_query::search_cap_test_guard;
 
 /// Input-injection verbs and their parsers
 /// (key/ctrl/send/feed/signal/mouse/paste/focus/resize/scroll/tab), dispatched
-/// as `control_input::cmd_*` from [`handle`]. The file is `src/control_input.rs`.
+/// as `control_input::cmd_*` from [`dispatch_request`]'s class handlers. The file
+/// is `src/control_input.rs`.
 #[path = "control_input.rs"]
 mod control_input;
 // Parsers reached as `crate::control::NAME` (`crate::input`, `input_stall`), and
@@ -96,24 +105,26 @@ pub(crate) use control_input::{cmd_signal, restart_verb};
 // (`app_presence::resume_if_stopped`).
 pub(crate) use control_input::signal_verb;
 // The press path's wiring test drives a `key`/`ctrl`/`paste` body through the
-// control fence and then the verb's own post, as `handle` does.
+// control fence and then the verb's own post, as `serve_session_verb` does.
 #[cfg(all(test, unix))]
 pub(crate) use control_input::{control_fence, paste_event};
 
 /// Selection/copy/block verbs (`select`/`selection`/`copy`/`blocks`/
 /// `blocktext`/`wait`), implemented in the winit-free `aterm-control` crate over
-/// a [`SessionHost`](aterm_control::SessionHost); aliased for [`handle`].
+/// a [`SessionHost`](aterm_control::SessionHost); aliased for [`serve_session_verb`].
 use aterm_control::selection as control_selection;
 // Smart-selection gesture helpers for `app_mouse.rs`'s double/triple click;
 // they take a bare `&mut Terminal`.
 pub(crate) use aterm_control::selection::{select_line, select_word, word_span};
 // Response-framing primitives, re-exported so `crate::control::NAME` and
 // `super::` callers resolve.
-pub(crate) use aterm_control::wire::{json_escape, json_escape_into, pct_encode, visible_char};
+#[cfg(test)]
+pub(crate) use aterm_control::wire::json_escape;
+pub(crate) use aterm_control::wire::{json_escape_into, pct_encode, visible_char};
 use aterm_control::wire::{json_ok, json_str_field};
 
 /// This crate's [`SessionHost`](aterm_control::SessionHost): a borrowed adapter
-/// over the target [`handle`] resolved. The file is `src/control_host.rs`.
+/// over the target [`dispatch_session`] resolved. The file is `src/control_host.rs`.
 #[path = "control_host.rs"]
 mod control_host;
 use control_host::GuiHost;
@@ -151,7 +162,8 @@ pub(crate) use clipboard::PRIMARY_STUB;
 pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_get_owned, primary_set};
 
 /// Media-capture verbs (`image`/`image read`/`window`/`chrome`), dispatched as
-/// `control_media::cmd_*` from [`handle`]. The file is `src/control_media.rs`.
+/// `control_media::cmd_*` from [`dispatch_request`]'s class handlers. The file is
+/// `src/control_media.rs`.
 #[path = "control_media.rs"]
 // `pub(crate)` so sibling verb modules (`control_privacy`) can reach
 // `call_main`.
@@ -159,9 +171,6 @@ pub(crate) mod control_media;
 /// The aimed-spawn target: built in `control_media::cmd_spawn`, carried in
 /// `Wake::SpawnSession`.
 pub(crate) use control_media::{IdentitySpec, SpawnAim, resolve_spawn_identity};
-// Re-export `image_payload`: `control_query::styled_image_json` reaches it through
-// `super::image_payload`, which now resolves to this sibling module's serializer.
-pub(crate) use control_media::image_payload;
 
 /// The handshake's `ERR auth` audit line, thinned per refusal kind; and the
 /// fleet's refusals (`crate::fleet_listen`, the fleet gate), thinned by the
@@ -174,7 +183,7 @@ pub(crate) mod control_denials;
 pub(crate) mod control_disk;
 /// Session-graph and capability verbs (`sessions`/`family`/`ready`/`cast`/
 /// `edges`/`grant`/`revoke`/`whoami`), dispatched as `control_session::cmd_*`
-/// from [`handle`]. The file is `src/control_session.rs`.
+/// from [`dispatch_request`]'s class handlers. The file is `src/control_session.rs`.
 #[path = "control_session.rs"]
 mod control_session;
 #[cfg(test)]
@@ -185,10 +194,20 @@ pub(crate) use control_session::turn_ids_for_handoff;
 #[cfg(unix)]
 pub(crate) use control_session::turn_ids_past_handoff_ceiling;
 pub(crate) use control_session::{TURN_ID_RESERVE, raise_turn_ids, turn_ids_minted};
+// A turn id minted as `turn` mints one, for the crash-restore tests.
+#[cfg(all(test, unix))]
+pub(crate) use control_session::mint_turn_id_for_test;
 // The two reads a handoff's end-to-end test drives the harness's report reader
 // (`Session::report`) through (the handoff is unix-only, and so is that test).
 #[cfg(all(test, unix))]
 pub(crate) use control_query::cmd_offscreen;
+/// `meta`'s who-set-it fields, for the unix restore test that carries a
+/// setter (design §11.7.5).
+#[cfg(all(test, unix))]
+pub(crate) use control_session::autopilot_by_fields;
+/// The `cast` read, for the recorder's serializer tests.
+#[cfg(test)]
+pub(crate) use control_session::cmd_cast;
 #[cfg(all(test, unix))]
 pub(crate) use control_session::cmd_history;
 /// The `meta` verb, for the need publication's tests (what a write answers
@@ -197,6 +216,8 @@ pub(crate) use control_session::cmd_history;
 /// the App's index.
 #[cfg(test)]
 pub(crate) use control_session::cmd_meta;
+#[cfg(test)]
+pub(crate) use control_session::harness_act_face;
 /// The `turn` composite and its io, for the tests that drive a REAL turn
 /// through the lease seam (the session log's and the input stall's).
 #[cfg(test)]
@@ -204,6 +225,11 @@ pub(crate) use control_session::{TurnIo, cmd_turn};
 /// The `log` and `brief` reads, for the session log's own tests.
 #[cfg(test)]
 pub(crate) use control_session::{cmd_brief, cmd_log, cmd_log_json};
+/// The same store write by a named writer and the Owner rule's refusal,
+/// for the tests of who set a session's Autopilot (`crate::autopilot`'s
+/// `set_by_tests`, design §11.7.5).
+#[cfg(test)]
+pub(crate) use control_session::{cmd_meta_by, meta_questions_denied};
 
 /// The `await` verb, for the exit and restore paths' `await log` tests
 /// (`app_tabs`, `app_restore_tests`).
@@ -282,6 +308,12 @@ pub(crate) struct DimsSnapshot {
     pub(crate) pad_bottom: u32,
     pub(crate) head: u32,
     pub(crate) tab_rows: u32,
+    /// The stats Deck's rows in the frame (`App::deck_rows_px`): its top and
+    /// height in device px, both 0 while the window draws none. Part of
+    /// `head`: under macOS's titlebar its foot, over a Linux or Windows strip
+    /// band its top.
+    pub(crate) deck_y: u32,
+    pub(crate) deck_h: u32,
     pub(crate) viewers: u32,
     pub(crate) visible_viewers: u32,
     pub(crate) geometry: &'static str,
@@ -526,56 +558,62 @@ fn sessionless_front_window_resize(
     )
 }
 
-/// Lane for an aimed `spawn`/`tab` (`@<sid> spawn …`, `@<sid> tab …`). `None`
-/// means not aimed; flagless and `@.` forms use the ordinary App lane.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AimedAppLane {
-    /// Owner: the selector reaches the session resolver, which passes the
-    /// session to `cmd_spawn(.., Some(session))` / `cmd_tab_aimed`. A dead sid
-    /// answers `ERR no such session`.
-    ResolveSession,
-    /// Edge: `ERR denied`, BEFORE the sid is looked up — an unauthorised
-    /// caller learns nothing about which sessions exist.
-    Denied,
+/// The window an App-target verb acts on ([`app_route`]).
+enum AppAim {
+    /// No selector or `@.`: the front window. A bare `@` never gets here
+    /// ([`empty_selector_refusal`]).
+    Front,
+    /// An Owner's `@<sid>` naming a session this instance hosts. `spawn`, `tab`
+    /// and `panes` act on the window hosting it, `theme`'s session forms on the
+    /// session itself and `edit` beside its tab; every other App verb acts on
+    /// the front window, the selector having only routed the request here.
+    Aimed(Target),
 }
 
-/// App-target verbs whose aimed form (`@<sid> <verb> …`) goes to the session
-/// resolver instead of the App lane.
-///
-/// One list for two readers: [`aimed_app_lane`] uses it to route past
-/// `dispatch_before_session`'s [`crate::fabric::app_halt_refusal`] gate, and
-/// the session dispatch re-asks that App-lane question after resolution (an
-/// aimed App verb drives the window, not the session; see [`handle`]).
-fn is_aimed_app_verb(verb: &str) -> bool {
-    matches!(verb, "spawn" | "tab" | "theme" | "edit")
-}
-
-/// Classify an aimed `spawn`/`tab`. The selector is the verb's argument ("the
-/// window hosting `<sid>`"), so for an Owner it must reach the session resolver;
-/// the ordinary App lane would validate and drop it, degrading to the flagless
-/// form.
-///
-/// Authority does not travel with the routing: an Edge is refused by
-/// [`native_control_decision`]'s App verdict (Tier-1 pins
-/// `edge_app_allowed = 0`). Otherwise a write-input edge on one session could
-/// spawn or close tabs in that session's window. Non-App verdicts fail closed.
-fn aimed_app_lane(
-    verb: &str,
-    selector: Option<&Selector>,
-    principal: NativeControlPrincipal,
-) -> Option<AimedAppLane> {
-    if !is_aimed_app_verb(verb) || matches!(selector, None | Some(Selector::SelfTok)) {
-        return None;
+impl AppAim {
+    /// The aimed session's local id, `None` for the front window: what
+    /// `cmd_spawn`, `cmd_tab_aimed`, `cmd_panes`, `cmd_theme` and `cmd_edit`
+    /// take as their aim.
+    fn session(&self) -> Option<u64> {
+        match self {
+            AppAim::Front => None,
+            AppAim::Aimed((_, _, session, _)) => Some(*session),
+        }
     }
-    Some(
-        match native_control_decision(false, true, principal, NativeControlTarget::App) {
-            NativeControlDecision::WithoutSession => AimedAppLane::ResolveSession,
-            NativeControlDecision::Denied
-            | NativeControlDecision::ResolveSession
-            | NativeControlDecision::NoActiveTerminal
-            | NativeControlDecision::NoSuchSession => AimedAppLane::Denied,
-        },
-    )
+}
+
+/// An App-target request's aim, or the line refusing it.
+///
+/// The authority verdict is [`native_control_decision`]'s App case (Tier-1 pins
+/// `edge_app_allowed = 0`), asked before `resolve` runs: an Edge is denied every
+/// App verb before its selector is looked up, so it learns nothing about which
+/// sessions exist, and a write-input edge on one session cannot spawn or close
+/// tabs in that session's window. An Owner's explicit selector is then resolved
+/// once: a session here is the aim, a dead one is `ERR no such session`, and an
+/// id two instances answer to is refused by name. Non-App verdicts fail closed.
+fn app_route(
+    principal: NativeControlPrincipal,
+    selector: Option<&Selector<'_>>,
+    resolve: impl FnOnce(&Selector<'_>) -> Resolution,
+) -> Result<AppAim, String> {
+    match native_control_decision(false, true, principal, NativeControlTarget::App) {
+        NativeControlDecision::WithoutSession => {}
+        NativeControlDecision::Denied => return Err("ERR denied\n".to_string()),
+        NativeControlDecision::ResolveSession
+        | NativeControlDecision::NoActiveTerminal
+        | NativeControlDecision::NoSuchSession => {
+            return Err("ERR invalid control target\n".to_string());
+        }
+    }
+    let Some(selector) = selector.filter(|s| !s.is_self()) else {
+        return Ok(AppAim::Front);
+    };
+    match resolve(selector) {
+        Resolution::Hosted(target) => Ok(AppAim::Aimed(target)),
+        Resolution::SelfTok => Ok(AppAim::Front),
+        Resolution::Missing => Err("ERR no such session\n".to_string()),
+        Resolution::Ambiguous(refusal) => Err(refusal),
+    }
 }
 
 /// What a connection is authorized to do, resolved at handshake. `Debug` is
@@ -656,6 +694,15 @@ impl Scope {
         }
     }
 
+    /// The principal [`native_control_decision`] judges: Owner-class or Edge.
+    fn principal(self) -> NativeControlPrincipal {
+        if self.is_owner_class() {
+            NativeControlPrincipal::Owner
+        } else {
+            NativeControlPrincipal::Edge
+        }
+    }
+
     /// Whether this is the inherited bridge connection — never, where there is
     /// no bridge lane.
     pub(crate) fn is_bridge(self) -> bool {
@@ -684,17 +731,15 @@ pub(crate) enum Principal {
     Harness,
 }
 
-/// The op-class a verb needs, from [`VERBS`] (the one verb table, from which
-/// the help catalog is generated and against which the dispatch router is
-/// checked). `ReadScreen` observes; `WriteInput` injects human input and
-/// drives the app; `Signal` sends signals; `ConfigWrite` (settings) and
-/// `ClipboardWrite` (copy) are separate fine ops an inherited base edge cannot
-/// reach. `None` for Owner-only or meta verbs (gated before the op check) or an
-/// unknown verb (`ERR unknown verb`). `turn` also requires read authority for
-/// scoped callers, enforced in its arm.
-fn required_op(verb: &str) -> Option<Op> {
+/// The fine [`Op`] an op class needs. `None` for [`OpClass::Owner`]: the
+/// privilege/identity and build-meta rows, which their [`Access`] gate answers
+/// before any op check, so no op gate admits them.
+///
+/// [`OpClass::Owner`]: aterm_types::control_verbs::OpClass::Owner
+/// [`Access`]: aterm_types::control_verbs::Access
+fn op_of(class: aterm_types::control_verbs::OpClass) -> Option<Op> {
     use aterm_types::control_verbs::OpClass;
-    aterm_types::control_verbs::spec(verb).and_then(|s| match s.op {
+    match class {
         OpClass::Read => Some(Op::ReadScreen),
         OpClass::Write => Some(Op::WriteInput),
         OpClass::Signal => Some(Op::Signal),
@@ -703,11 +748,61 @@ fn required_op(verb: &str) -> Option<Op> {
         OpClass::ConfigWrite => Some(Op::ConfigWrite),
         OpClass::ClipboardWrite => Some(Op::ClipboardWrite),
         OpClass::Owner => None,
-    })
+    }
 }
 
-/// Argument-dependent authority: seams where a plain `WriteInput` edge could
-/// otherwise reach a fenced op that [`required_op`] cannot see.
+/// The op-class a verb's ROW needs, from [`VERBS`] (the one verb table, from which
+/// the help catalog is generated and against which the dispatch router is
+/// checked), whatever its arguments: what the relay and
+/// [`cross_session_authorized`] gate on. `ReadScreen` observes; `WriteInput`
+/// injects human input and drives the app; `Signal` sends signals; `ConfigWrite`
+/// (settings) and `ClipboardWrite` (copy) are separate fine ops an inherited base
+/// edge cannot reach. `None` for Owner-only or meta verbs (gated before the op
+/// check) or an unknown verb (`ERR unknown verb`). The dispatch gate reads the
+/// whole request instead ([`need_of`]). `turn` also requires read authority for
+/// scoped callers, enforced in its arm.
+///
+/// [`VERBS`]: aterm_types::control_verbs::VERBS
+fn required_op(verb: &str) -> Option<Op> {
+    aterm_types::control_verbs::spec(verb).and_then(|s| op_of(s.op))
+}
+
+/// What a request needs at the dispatch's op gate: a fine [`Op`] a granted edge
+/// can satisfy, or Owner-only where no op expresses it. Owner-class scopes satisfy
+/// both ([`scope_holds_need`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Need {
+    /// Requires the fine op — `scope_holds_op` decides (an edge granted exactly this op
+    /// passes; Owner always passes).
+    Op(Op),
+    /// Requires the per-instance Owner token — no fine op is sufficient (a scoped Edge,
+    /// however privileged, is DENIED).
+    OwnerOnly,
+}
+
+/// What the request `verb rest` needs at the dispatch's op gate, `form` being its
+/// resolution in the verb table ([`aterm_types::control_verbs::spec_for`]): the
+/// [`argument_escalation`] the table cannot state, else the form's owner-only
+/// flag, else its op. The form replaces its row's facts, so `meta set`, `theme
+/// set|commit|<any other word>`, `theme session set|clear`, `inbox seen`, `family
+/// <sid>`, `pointer click|mods`, `task mark` and `window|controls connections`
+/// need what their table form says, and a plain WriteInput edge cannot tunnel to
+/// a fine op through any of them. `None` for an [`OpClass::Owner`] row, which no
+/// op gate admits.
+///
+/// [`OpClass::Owner`]: aterm_types::control_verbs::OpClass::Owner
+fn need_of(form: &aterm_types::control_verbs::Resolved, verb: &str, rest: &str) -> Option<Need> {
+    if let Some(need) = argument_escalation(verb, rest) {
+        return Some(need);
+    }
+    if form.owner_only {
+        return Some(Need::OwnerOnly);
+    }
+    op_of(form.op).map(Need::Op)
+}
+
+/// Authority that depends on an argument's VALUE, which no table form can match:
+/// seams where a plain `WriteInput` edge could otherwise reach a fenced op.
 ///
 ///   * `invoke <action>`: each menu action is classified exhaustively by
 ///     [`menu::MenuAction::invoke_authority`]. Clipboard actions
@@ -722,35 +817,37 @@ fn required_op(verb: &str) -> Option<Op> {
 ///     authorization, so the gateway needs `ConfigWrite`; a Settings ▸ Harness
 ///     session press (`harness/session/…`) writes an Autopilot word and is
 ///     Owner-only. Both are defence in depth today: `act` is an App-target
-///     verb, which `dispatch_before_session` refuses every Edge before this
-///     is asked (`native_control_decision`).
-///   * `open menu` / `open palette` and `open update` are Owner-only, like their
-///     `invoke` twins.
+///     verb, which [`dispatch_app`] refuses every Edge before this is asked
+///     ([`app_route`], by `native_control_decision`).
+///   * `open menu` / `open palette` and `open update` are Owner-only, like
+///     their `invoke` twins, and `open overview` (its old `connections`
+///     keyword too) lists every session, Owner-only like `flows`.
+///   * `spawn connected=…|identity=…`, `brief all` and `log n` (the instance's
+///     node log) are Owner-only.
 ///
-/// Returns the escalated requirement, else `None`. The dispatch checks it with
-/// the same per-session predicate as the base gate.
-fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
+/// Returns the escalated requirement, else `None` (the table form decides).
+fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
     use crate::menu::{InvokeAuthority, MenuAction};
     // Classify what the verb will run, not its raw spelling: `hwkey`, `pointer` and
     // `invoke` take a leading `unread=ok` off before they parse (`take_app_unread_ok`),
     // so `pointer unread=ok click` or `invoke unread=ok OpenPalette` must escalate
     // exactly as the bare forms do.
-    let (_, rest) = control_input::take_app_unread_ok(verb, rest);
+    let (_, rest) = control_input::take_app_unread_ok(input_of(verb), rest);
     match verb {
         "invoke" => {
             let action = MenuAction::from_invoke_name(rest.trim())?;
             match action.invoke_authority() {
                 // Benign: the base `WriteInput` gate already covers it.
                 InvokeAuthority::WriteInput => None,
-                InvokeAuthority::ConfigWrite => Some(Escalation::Op(Op::ConfigWrite)),
-                InvokeAuthority::ClipboardWrite => Some(Escalation::Op(Op::ClipboardWrite)),
+                InvokeAuthority::ConfigWrite => Some(Need::Op(Op::ConfigWrite)),
+                InvokeAuthority::ClipboardWrite => Some(Need::Op(Op::ClipboardWrite)),
                 // The palette (a gateway to EVERY action) and the update-apply twins:
                 // no single fine op expresses "only the god token", so require Owner.
-                InvokeAuthority::OwnerOnly => Some(Escalation::OwnerOnly),
+                InvokeAuthority::OwnerOnly => Some(Need::OwnerOnly),
                 // The person's own: at least Owner here, so an edge is refused
                 // at the gate like every Owner-only seam, and `cmd_invoke`
                 // refuses the Owner token itself (`ERR denied`).
-                InvokeAuthority::PersonOnly => Some(Escalation::OwnerOnly),
+                InvokeAuthority::PersonOnly => Some(Need::OwnerOnly),
             }
         }
         // Classify by the target token only: `cmd_open` treats a trailing
@@ -764,7 +861,7 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
         {
             // The versioned Settings app is the same capability as `open prefs`;
             // classify it here, before the main-thread hop.
-            Some(Escalation::Op(Op::ConfigWrite))
+            Some(Need::Op(Op::ConfigWrite))
         }
         // A Settings ▸ Harness session press writes that session's Autopilot word,
         // which is Owner-only like `meta set autopilot` (`meta_questions_denied`):
@@ -776,12 +873,12 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
                     .starts_with(crate::harness_screen::SESSION_ACTION_PREFIX)
             }) =>
         {
-            Some(Escalation::OwnerOnly)
+            Some(Need::OwnerOnly)
         }
         // `act app/v1 ...` resolves its view kind only on the main thread, so the
         // gateway requires ConfigWrite rather than trusting the action spelling.
         "act" if aterm_types::app_inspection::parse_act(rest).is_ok() => {
-            Some(Escalation::Op(Op::ConfigWrite))
+            Some(Need::Op(Op::ConfigWrite))
         }
         // A connected spawn (`spawn connected=… of=<sid>`) mints session-connection
         // authority, `identity=` opens a session under another login's
@@ -807,25 +904,26 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
                 })
             }) =>
         {
-            Some(Escalation::OwnerOnly)
+            Some(Need::OwnerOnly)
         }
-        // The Overview (`open`, `controls`, `window overview`, and the map's
-        // old `connections` keyword) lists every session of the instance:
-        // Owner-only like `flows`. Classified by the target token, so the
-        // `close` variant escalates too.
-        "open" | "controls" | "window"
+        // The Overview (`open overview`, and the map's old `connections`
+        // keyword) lists every session of the instance: Owner-only like
+        // `flows` (its readout and capture, `controls overview|connections`
+        // and `window overview|connections`, are table forms). Classified by
+        // the target token, so the `close` variant escalates too.
+        "open"
             if matches!(
                 rest.split_whitespace().next(),
                 Some("overview" | "connections")
             ) =>
         {
-            Some(Escalation::OwnerOnly)
+            Some(Need::OwnerOnly)
         }
         "open" => match crate::app_introspect::AuxTarget::parse(
             rest.split_whitespace().next().unwrap_or(""),
         ) {
             // The Settings tab flips default-OFF security knobs => ConfigWrite.
-            Some(crate::app_introspect::AuxTarget::Prefs) => Some(Escalation::Op(Op::ConfigWrite)),
+            Some(crate::app_introspect::AuxTarget::Prefs) => Some(Need::Op(Op::ConfigWrite)),
             // The palette, software-update overlay and in-grid tab menu are
             // gateways, Owner-only like their `invoke` twins.
             Some(
@@ -833,80 +931,23 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
                 | crate::app_introspect::AuxTarget::TabMenu
                 | crate::app_introspect::AuxTarget::AutopilotMenu
                 | crate::app_introspect::AuxTarget::Update,
-            ) => Some(Escalation::OwnerOnly),
+            ) => Some(Need::OwnerOnly),
             _ => None,
         },
-        // `meta set`/`meta unset` write session metadata, so they need
-        // `WriteInput`; bare `meta` is a read.
-        "meta" => match rest.split_whitespace().next() {
-            Some("set" | "unset") => Some(Escalation::Op(Op::WriteInput)),
-            _ => None,
-        },
-        // `theme` reads; its preview lane changes what every window draws
-        // (runtime-only, like `rain`), so it needs `WriteInput`; `set` and
-        // `commit` rewrite `aterm.toml` like `settings set`, so `ConfigWrite`.
-        // Classified by the sub-form word the parser reads, so no spelling of a
-        // write form passes as a read.
-        // `theme session set|clear` changes one session's colours (runtime
-        // only, carried by an update and a restore): `WriteInput`, like a
-        // preview; `theme session [status]` and `theme palette` read.
-        "theme" => {
-            let mut words = rest.split_whitespace();
-            match (words.next(), words.next()) {
-                (None | Some("status" | "list" | "palette"), _) => None,
-                (Some("session"), None | Some("status")) => None,
-                (Some("session"), Some(_)) => Some(Escalation::Op(Op::WriteInput)),
-                (Some("preview" | "revert"), _) => Some(Escalation::Op(Op::WriteInput)),
-                (Some(_), _) => Some(Escalation::Op(Op::ConfigWrite)),
-            }
-        }
-        // `inbox seen` advances the handled watermark, so it needs `WriteInput`;
-        // the listing and `inbox get` are reads.
-        "inbox" => match rest.split_whitespace().next() {
-            Some("seen") => Some(Escalation::Op(Op::WriteInput)),
-            _ => None,
-        },
-        // `family <sid>` walks the tree from an arbitrary node: Owner-only.
-        "family" if !rest.trim().is_empty() => Some(Escalation::OwnerOnly),
-        // `task mark` writes a worker's task record, which a manager acts on:
-        // Owner-only, like `meta set supervisor`; bare `task` is a read.
-        "task" if rest.split_whitespace().next() == Some("mark") => Some(Escalation::OwnerOnly),
         // `brief all` reads every session's log, the whole roster: Owner-only
         // like `sessions`. `brief [<node>]` reads only its target. Classified by
         // the verb's own parser (which takes `all` anywhere among the
         // arguments), fail-closed: only a request it reads as a target's brief
         // stays a read, so no spelling of the instance-wide form passes as one.
         "brief" if !crate::session_log::BriefQuery::parse(rest).is_ok_and(|q| !q.all) => {
-            Some(Escalation::OwnerOnly)
+            Some(Need::OwnerOnly)
         }
         // `log n` reads the INSTANCE's node log (session log 5J-3): Owner-only
         // like `brief all`. Any bare `n` word names it (`n=<count>` is a count),
         // so no spelling of it passes as a session's read.
-        "log" if crate::session_log_node::names_node_log(rest) => Some(Escalation::OwnerOnly),
-        // `pointer click` presses whatever is under the pointer, including every
-        // message-band capsule, so it is Owner-only like `notice act` and spends
-        // its budget (`App::pointer_cmd`). `pointer mods` sets the modifiers the
-        // window reads for keys and clicks until the person next touches it
-        // (`App::release_scripted_mods`): with `link` a plain click opens a link,
-        // with `cmd` a typed `v` pastes, so it is Owner-only like the click it arms.
-        "pointer" if matches!(rest.split_whitespace().next(), Some("click" | "mods")) => {
-            Some(Escalation::OwnerOnly)
-        }
+        "log" if crate::session_log_node::names_node_log(rest) => Some(Need::OwnerOnly),
         _ => None,
     }
-}
-
-/// Escalated requirement from [`escalated_op`]: a fine [`Op`] a granted edge can
-/// satisfy, or Owner-only where no op expresses it. Resolved by
-/// [`dispatch_authorized`]; Owner satisfies both.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Escalation {
-    /// Requires the fine op — `scope_holds_op` decides (an edge granted exactly this op
-    /// passes; Owner always passes).
-    Op(Op),
-    /// Requires the per-instance Owner token — no fine op is sufficient (a scoped Edge,
-    /// however privileged, is DENIED).
-    OwnerOnly,
 }
 
 /// What owns controller-directed input in the front window (internal,
@@ -929,7 +970,7 @@ pub(crate) enum FrontControlSurface {
 }
 
 /// Whether `scope` may exercise `need` against `ctx`'s session, shared by the
-/// base op gate and the [`escalated_op`] fence. Owner always holds; an `Edge`
+/// base op gate and the [`need_of`] fence. Owner always holds; an `Edge`
 /// needs a [`decide_edge`]-permitted token for exactly `need`, bound to this
 /// session's table and launch nonce (default deny).
 fn scope_holds_op(scope: Scope, need: Op, ctx: &SessionCtx) -> bool {
@@ -949,10 +990,12 @@ fn scope_holds_op(scope: Scope, need: Op, ctx: &SessionCtx) -> bool {
     }
 }
 
-fn scope_holds_escalation(scope: Scope, need: Escalation, ctx: &SessionCtx) -> bool {
+/// Whether `scope` meets `need` against `ctx`'s session: a fine op as
+/// [`scope_holds_op`] decides it, Owner-only for the Owner class alone.
+fn scope_holds_need(scope: Scope, need: Need, ctx: &SessionCtx) -> bool {
     match need {
-        Escalation::Op(op) => scope_holds_op(scope, op, ctx),
-        Escalation::OwnerOnly => scope.is_owner_class(),
+        Need::Op(op) => scope_holds_op(scope, op, ctx),
+        Need::OwnerOnly => scope.is_owner_class(),
     }
 }
 
@@ -962,37 +1005,55 @@ fn scope_holds_escalation(scope: Scope, need: Escalation, ctx: &SessionCtx) -> b
 ///
 /// Bare: the short catalog (a three-line header and one summary row per verb,
 /// under `SHORT_CATALOG_MAX_BYTES`). `help <verb>`: that verb's full entry,
-/// wrapped. `help --full`: the complete catalog under the protocol header,
-/// pinned to a golden. Anything else is `ERR usage`.
+/// wrapped. `help --full`: the complete catalog under the protocol header.
+/// Anything else is `ERR usage`.
+///
+/// The three whole-catalog answers are pure functions of the compile-time
+/// table, so each is built on its first ask ([`HELP_SHORT`], [`HELP_FULL`],
+/// [`HELP_JSON`]) and copied out after; `help <verb>` wraps its one entry per
+/// ask.
 fn cmd_help(rest: &str) -> String {
-    use aterm_types::control_verbs::{JSON_CAPABLE_VERBS, catalog_lines, spec};
+    use aterm_types::control_verbs::spec;
     let tail = rest.trim();
-    if tail == "--full" {
-        return cmd_help_full();
+    match tail {
+        "" => return HELP_SHORT.to_string(),
+        "--full" => return HELP_FULL.to_string(),
+        "--json" => return HELP_JSON.to_string(),
+        _ => {}
     }
-    if tail == "--json" {
-        return help_catalog_json();
+    let usage = || "ERR usage: help [<verb> | --full | --json]\n".to_string();
+    if tail.starts_with('-') {
+        return usage();
     }
-    if tail.starts_with('-') || tail.contains(char::is_whitespace) {
-        return "ERR usage: help [<verb> | --full | --json]\n".to_string();
-    }
-    if !tail.is_empty() {
-        return match spec(tail) {
-            Some(s) => {
-                let lines = s.entry_lines();
-                let mut body = format!("OK {}\n", lines.len());
-                for line in lines {
-                    body.push_str(&line);
-                    body.push('\n');
-                }
-                body
+    // A verb, or the two words of a listed sub-form row (`inbox get`).
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    match spec(&words.join(" ")) {
+        Some(s) => {
+            let lines = s.entry_lines();
+            let mut body = format!("OK {}\n", lines.len());
+            for line in lines {
+                body.push_str(&line);
+                body.push('\n');
             }
-            None => format!("ERR unknown verb '{tail}' (help lists them)\n"),
-        };
+            body
+        }
+        None if words.len() > 1 => usage(),
+        None => format!("ERR unknown verb '{tail}' (help lists them)\n"),
     }
-    // Short form: framing, the generated `--json` set, pointers to the other
-    // forms, then one summary row per verb.
-    let json_verbs = JSON_CAPABLE_VERBS.join("/");
+}
+
+/// Bare `help`, built once by [`help_short_catalog`].
+static HELP_SHORT: LazyLock<Box<str>> = LazyLock::new(|| help_short_catalog().into_boxed_str());
+/// `help --full`, built once by [`help_full_catalog`].
+static HELP_FULL: LazyLock<Box<str>> = LazyLock::new(|| help_full_catalog().into_boxed_str());
+/// `help --json`, built once by [`help_json_catalog`].
+static HELP_JSON: LazyLock<Box<str>> = LazyLock::new(|| help_json_catalog().into_boxed_str());
+
+/// Bare `help`: framing, the generated `--json` set, pointers to the other
+/// forms, then one summary row per verb.
+fn help_short_catalog() -> String {
+    use aterm_types::control_verbs::{catalog_lines, json_verbs};
+    let json_verbs = json_verbs().collect::<Vec<_>>().join("/");
     let mut body = format!(
         "# Framing: one \"OK …\"/\"ERR …\" status line, or \"OK <count>\" + <count> content lines; \
          EMPTY content = no data, never an error\n\
@@ -1011,7 +1072,7 @@ fn cmd_help(rest: &str) -> String {
 /// `help --json`: `OK 1` then one JSON line,
 /// `{"verbs":[{"name","op","framing","target","access","summary"}, …]}` in table
 /// order, projected from the `VerbSpec` table.
-fn help_catalog_json() -> String {
+fn help_json_catalog() -> String {
     use aterm_control::wire::json_escape;
     let rows: Vec<String> = aterm_types::control_verbs::VERBS
         .iter()
@@ -1032,14 +1093,15 @@ fn help_catalog_json() -> String {
     format!("OK 1\n{{\"verbs\":[{}]}}\n", rows.join(","))
 }
 
-/// `help --full`: the complete catalog under the full protocol header, pinned to
-/// a golden.
-fn cmd_help_full() -> String {
+/// `help --full`: the complete catalog under the full protocol header.
+fn help_full_catalog() -> String {
     // "OK <count> …\n" plus <count> body lines so aterm-ctl streams it like other
     // list verbs. A fixed header (framing, cross-session, targeting, seeing
-    // modes), then the catalog generated from `VERBS`; the `--json` list comes
-    // from `JSON_CAPABLE_VERBS`.
-    let json_verbs = aterm_types::control_verbs::JSON_CAPABLE_VERBS.join("/");
+    // modes), then the catalog generated from `VERBS`; the `--json` list is the
+    // table's JSON-emitting rows.
+    let json_verbs = aterm_types::control_verbs::json_verbs()
+        .collect::<Vec<_>>()
+        .join("/");
     let header = &format!(
         r#"# Framing: every reply is a STATUS line ("OK …" / "ERR …") OR raw CONTENT lines. Content
 # verbs prefix "OK <count>" then <count> lines — except the Bytes-framed verbs (cast,
@@ -1161,13 +1223,28 @@ mod help_tests {
         assert_eq!(super::cmd_help(" image "), h, "the tail is trimmed");
     }
 
-    /// An unknown verb is named back with the way to the list; any other flag
-    /// or extra token is a usage error, never the whole catalog.
+    /// An unknown verb is named back with the way to the list; a listed sub-form
+    /// row is looked up by its two words; any other flag or extra token is a usage
+    /// error, never the whole catalog.
     #[test]
     fn help_rejects_unknown_verbs_and_bad_tails() {
         assert_eq!(
             super::cmd_help("nosuch"),
             "ERR unknown verb 'nosuch' (help lists them)\n"
+        );
+        let inbox_get = super::cmd_help("inbox get");
+        assert!(inbox_get.starts_with("OK "), "{inbox_get}");
+        assert!(
+            inbox_get
+                .lines()
+                .nth(1)
+                .is_some_and(|row| row.starts_with("inbox get ")),
+            "{inbox_get}"
+        );
+        assert_eq!(
+            super::cmd_help(" inbox \t get "),
+            inbox_get,
+            "any separator"
         );
         for tail in [
             "-h",
@@ -1176,6 +1253,8 @@ mod help_tests {
             "--full image",
             "--json image",
             "a b",
+            "inbox nope",
+            "inbox get extra",
         ] {
             assert_eq!(
                 super::cmd_help(tail),
@@ -1205,37 +1284,6 @@ mod help_tests {
             rest = &rest[at + row.len()..];
         }
     }
-}
-
-/// Whether an `update` sub-command is Owner-only: bare/`status` is a read for
-/// any scope; `check` (stages a build) and `apply` (handoff or disk replacement)
-/// mutate, like the Owner-only `invoke ApplyUpdate` / `open update`.
-fn update_is_owner_only_subcmd(rest: &str) -> bool {
-    matches!(rest.trim(), "check" | "apply")
-}
-
-/// `aterm_update::installed_update_facts()` cached for [`INSTALLED_FACTS_TTL`]:
-/// on macOS the probe spawns codesign/spctl/PlistBuddy, and `update status` is
-/// polled by any scope. A pure observation.
-fn cached_installed_update_facts() -> Option<aterm_update::InstalledUpdateFacts> {
-    const INSTALLED_FACTS_TTL: std::time::Duration = std::time::Duration::from_secs(20);
-    static CACHE: std::sync::Mutex<
-        Option<(
-            std::time::Instant,
-            Option<aterm_update::InstalledUpdateFacts>,
-        )>,
-    > = std::sync::Mutex::new(None);
-    let mut guard = CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((at, facts)) = guard.as_ref()
-        && at.elapsed() < INSTALLED_FACTS_TTL
-    {
-        return facts.clone();
-    }
-    let facts = aterm_update::installed_update_facts();
-    *guard = Some((std::time::Instant::now(), facts.clone()));
-    facts
 }
 
 /// Brackets a person's `update check` for the window
@@ -1313,9 +1361,13 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let build = crate::build_info::build_number()
         .parse::<u64>()
         .unwrap_or(0);
-    // `check` and `apply` are Owner-only (see `update_is_owner_only_subcmd`);
-    // `status` answers any scope. The in-session AI drives with the Owner token.
-    if update_is_owner_only_subcmd(rest) && !scope.is_owner_class() {
+    // `check` (stages a build) and `apply` (hands off or replaces the bundle on
+    // disk) are Owner-only, like `invoke ApplyUpdate` / `open update`: the table's
+    // `update` forms. Bare and `status` answer any scope. The in-session AI drives
+    // with the Owner token.
+    if aterm_types::control_verbs::spec_for("update", rest).is_some_and(|form| form.owner_only)
+        && !scope.is_owner_class()
+    {
         log_denial(
             AUDIT_SUBSYSTEM,
             &format!("update {}", rest.trim()),
@@ -1362,8 +1414,9 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
                 }
                 // Report the stage the reducer will act on (read as `status`
                 // reads it) and where the verdict lands.
+                let activation = crate::update_control::published_activation();
                 let staged = aterm_update::status(build).and_then(|mut st| {
-                    fold_installed_activation(&mut st);
+                    fold_installed_activation(&mut st, activation.as_ref());
                     st.staged_build
                         .filter(|staged| *staged > st.current_build)
                         .map(|staged| (staged, st.staged_version))
@@ -1390,7 +1443,22 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let Some(mut st) = st else {
         return update_status_unreadable_line();
     };
-    fold_installed_activation(&mut st);
+    let apply_snapshot = crate::control::control_media::call_main_within(
+        proxy,
+        std::time::Duration::from_secs(2),
+        |reply| Wake::ReadUpdateControl { reply },
+    )
+    .ok();
+    // The published activation is read (a lock and a clone) only when the event
+    // loop cannot answer; its own stage outranks it.
+    let published = apply_snapshot
+        .is_none()
+        .then(crate::update_control::published_activation)
+        .flatten();
+    fold_installed_activation(
+        &mut st,
+        crate::update_control::status_activation(apply_snapshot.as_ref(), published.as_ref()),
+    );
     let staged_build = st
         .staged_build
         .map(|b| b.to_string())
@@ -1400,12 +1468,6 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     // Historical wire key: a newer stage EXISTS. Apply permission and scheduling
     // are separate facts; a stage can be blocked or require manual action.
     let relaunch_ready = st.staged_build.is_some_and(|b| b > st.current_build);
-    let apply_snapshot = crate::control::control_media::call_main_within(
-        proxy,
-        std::time::Duration::from_secs(2),
-        |reply| Wake::ReadUpdateControl { reply },
-    )
-    .ok();
     let apply_posture = apply_snapshot
         .as_ref()
         .map_or("unknown", |live| live.apply_posture(&st));
@@ -1602,45 +1664,156 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
 }
 
 /// Fold in the activation lane the ledger cannot see: a verified installed
-/// bundle newer than this process is staged in memory by the GUI reducer (no
-/// `ready.toml`) and outranks any download on disk. Derived from the same
-/// source the reducer uses, so the line and `update apply` agree. The probe
-/// runs codesign and is cached.
-fn fold_installed_activation(st: &mut aterm_update::UpdateStatus) {
-    if st.enabled
-        && let Some(installed) = cached_installed_update_facts()
-        && installed.build_number > st.current_build
-        && !installed.yanked
-        && crate::native_updater_service::usable_commit_identity(&installed.git_commit)
-    {
-        st.staged_build = Some(installed.build_number);
-        st.staged_version = installed
-            .version
-            .clone()
-            .or_else(|| Some(format!("build {}", installed.build_number)));
-        st.staged_commit = Some(installed.git_commit.clone());
-        st.staged_dmg_sha256 = None;
-        st.changelog = None;
-        // The reducer's sentence for the same state, word for word, so this verb and
-        // Software Update never describe it twice.
-        st.outcome = format!(
-            "{} (ledger: {})",
-            crate::native_updater_service::NativeUpdaterService::installed_activation_outcome(
-                installed.version.as_deref()
-            ),
-            st.outcome
-        );
+/// bundle newer than this process, which the updater reducer stages in memory
+/// (no `ready.toml`) and which outranks any download on disk. `stage` is the
+/// reducer's own, so the line and `update apply` report what the reducer acts
+/// on, and no verb probes the bundle (codesign and spctl are the facts
+/// worker's). A download stage folds nothing: the ledger already names it.
+fn fold_installed_activation(
+    st: &mut aterm_update::UpdateStatus,
+    stage: Option<&crate::native_updater_service::StagedUpdate>,
+) {
+    let Some(activation) = stage.filter(|stage| {
+        st.enabled && stage.build > st.current_build && stage.is_installed_activation()
+    }) else {
+        return;
+    };
+    st.staged_build = Some(activation.build);
+    st.staged_version = Some(activation.version.clone());
+    st.staged_commit = activation.commit.clone();
+    st.staged_dmg_sha256 = None;
+    st.changelog = None;
+    // The reducer names a bundle whose plist carries no version `build <N>`; the
+    // sentence then goes without one.
+    let version = Some(activation.version.as_str())
+        .filter(|version| *version != format!("build {}", activation.build));
+    // The reducer's sentence for the same state, word for word, so this verb and
+    // Software Update never describe it twice.
+    st.outcome = format!(
+        "{} (ledger: {})",
+        crate::native_updater_service::NativeUpdaterService::installed_activation_outcome(version),
+        st.outcome
+    );
+}
+
+#[cfg(test)]
+mod installed_activation_fold_tests {
+    use super::fold_installed_activation;
+    use crate::native_updater_service::{StagedUpdate, installed_activation_digest};
+
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn ledger() -> aterm_update::UpdateStatus {
+        aterm_update::UpdateStatus {
+            enabled: true,
+            installable: true,
+            current_build: 10,
+            staged_build: None,
+            staged_version: None,
+            staged_commit: None,
+            staged_dmg_sha256: None,
+            changelog: None,
+            outcome: "up to date".into(),
+            updated_at: String::new(),
+            failing_checks: 0,
+            failing_kind: String::new(),
+            failing_applies: 0,
+            failing_since: String::new(),
+            failing_persistent: false,
+            failing_checks_kind: String::new(),
+            channel_unreadable: false,
+            linux: None,
+        }
+    }
+
+    const DOWNLOAD_OUTCOME: &str = "staged 0.39.5 (build 11) — verified and ready to apply";
+
+    /// The ledger holding a downloaded build 11, which an activation of build 12
+    /// outranks.
+    fn ledger_with_download() -> aterm_update::UpdateStatus {
+        aterm_update::UpdateStatus {
+            staged_build: Some(11),
+            staged_version: Some("0.39.5".into()),
+            staged_commit: Some("f".repeat(40)),
+            staged_dmg_sha256: Some("c".repeat(64)),
+            changelog: Some("notes".into()),
+            outcome: DOWNLOAD_OUTCOME.into(),
+            ..ledger()
+        }
+    }
+
+    fn activation(build: u64, version: &str) -> StagedUpdate {
+        StagedUpdate {
+            build,
+            version: version.into(),
+            commit: Some(COMMIT.into()),
+            dmg_sha256: installed_activation_digest(build, COMMIT),
+            changelog: None,
+            generation: 1,
+        }
+    }
+
+    /// The reducer's activation is the line's stage, in the reducer's words, over
+    /// a download the ledger holds: the download's digest and changelog go with
+    /// it (left, the posture would weigh the activation as that download and say
+    /// `unreconciled`, and the line would print the download's notes). A
+    /// version-less bundle (`build <N>`, as the reducer names it) is said
+    /// without one.
+    #[test]
+    fn the_reducers_activation_is_the_stage_in_its_own_words() {
+        for (version, said) in [("0.40.0", Some("0.40.0")), ("build 12", None)] {
+            let mut st = ledger_with_download();
+            fold_installed_activation(&mut st, Some(&activation(12, version)));
+            assert_eq!(st.staged_build, Some(12), "{version}");
+            assert_eq!(st.staged_version.as_deref(), Some(version));
+            assert_eq!(st.staged_commit.as_deref(), Some(COMMIT), "{version}");
+            assert_eq!(st.staged_dmg_sha256, None, "an activation has no download");
+            assert_eq!(st.changelog, None, "nor the download's notes");
+            assert_eq!(
+                st.outcome,
+                format!(
+                    "{} (ledger: {DOWNLOAD_OUTCOME})",
+                    crate::native_updater_service::NativeUpdaterService::installed_activation_outcome(
+                        said
+                    )
+                )
+            );
+        }
+    }
+
+    /// Only an activation newer than this process, on an enabled updater,
+    /// folds; a download stage, one not newer, a disabled updater and no stage
+    /// leave the ledger's line as it was (each the negative control of the
+    /// test above).
+    #[test]
+    fn nothing_but_a_newer_activation_folds() {
+        let mut download = activation(12, "0.40.0");
+        download.dmg_sha256 = "b".repeat(64);
+        let mut disabled = ledger();
+        disabled.enabled = false;
+        for (mut st, stage) in [
+            (ledger(), Some(download)),
+            (ledger(), Some(activation(10, "0.39.0"))),
+            (disabled, Some(activation(12, "0.40.0"))),
+            (ledger(), None),
+        ] {
+            let before = format!("{st:?}");
+            fold_installed_activation(&mut st, stage.as_ref());
+            assert_eq!(format!("{st:?}"), before, "{stage:?}");
+        }
     }
 }
 
 /// The scope a connection's first line authenticates to (with any folded-in
 /// verb), or the denial `serve` logs before `ERR auth`.
 ///
-/// Tier 1: the per-instance token is `Scope::Owner`. Tier 2: otherwise it is
-/// tried as an edge token against the active session's table (`Scope::Edge`),
-/// which is what a forwarded connection presents, so it never forwards on
-/// (`proxy_forward_plan` forwards Owner-class only). A line with no token is
-/// its own refusal kind (`control_denials`).
+/// Tier 1: the per-instance token is `Scope::Owner`, which is also what a
+/// forward presents (the token beside the host's socket). Tier 2: otherwise it
+/// is tried as an edge token against the active session's table
+/// (`Scope::Edge`), and an edge-scoped connection never forwards on
+/// (`proxy_forward_plan` forwards Owner-class only), so an edge cannot reach
+/// past its grant. A line with no token is its own refusal kind
+/// (`control_denials`).
 ///
 /// The harness's in-memory token is the instance's power under another
 /// name ([`Principal::Harness`]): Owner, labelled for the session log only.
@@ -1699,9 +1872,10 @@ fn edge_scope_from_first_line(
 /// A request for the main thread to render the live screen to a PNG.
 ///
 /// The control thread fills the confined target (canonical dir plus a single
-/// filename from `confine_image_path`), sends [`Wake::Control`] and blocks on
+/// filename from `confine_image_path`), posts it as [`Wake::Image`] and blocks on
 /// `reply` for `(width, height)`. Passing dir plus filename lets the writer
 /// `openat` under a dir fd, so no path component can be swapped after the check.
+#[derive(Debug)]
 pub(crate) struct ImageReq {
     /// A confined image target for file output, or a descriptor-free sentinel
     /// for `--bytes` that the encode worker consumes before any file operation.
@@ -1814,110 +1988,168 @@ pub(crate) trait WireRetention: Send {
     fn prepare_write(&mut self) -> Result<(), String>;
 }
 
-/// Bound on queued, in-flight and quarantined artifact handoffs together. The
-/// descriptor-unit cap also counts retained directory-chain depth, so a few
-/// deep paths cannot defeat a count-only limit.
+/// Captures in flight at once, path and in-memory alike. Each holds a request
+/// lane while it captures, so this cap is what keeps captures off every lane
+/// (the const assert beside [`CONTROL_INLINE_WAITS`]); it is also the count cap
+/// on path artifacts, quarantined ones included ([`ArtifactBudgets`]).
 const ARTIFACT_HANDOFF_LIMIT: usize = 4;
 const ARTIFACT_HANDOFF_SUFFIX_UNITS: usize =
     crate::pinned_dir::PINNED_DIR_OPERATION_DESCRIPTOR_UNITS;
 const ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT: usize =
     crate::pinned_dir::PINNED_DIR_OPEN_COMPONENT_LIMIT + ARTIFACT_HANDOFF_SUFFIX_UNITS;
-const ARTIFACT_CLEANUP_TEST_LIMIT: usize = 32;
-
-/// The count [`ReplyRetention::try_reserve_cleanup_for_path`] charges: the process's one,
-/// or in a test build the calling test thread's own (`test_thread_budget`).
-fn artifact_cleanup_live() -> &'static AtomicUsize {
-    #[cfg(test)]
-    {
-        test_thread_budget!(AtomicUsize, AtomicUsize::new(0))
-    }
-    #[cfg(not(test))]
-    {
-        static LIVE: AtomicUsize = AtomicUsize::new(0);
-        &LIVE
-    }
-}
-
-/// The usage [`ReplyRetention::try_reserve_video_retention_for_path`] charges: the
-/// process's one, or in a test build the calling test thread's own
-/// (`test_thread_budget`).
-fn video_retention_usage() -> &'static Mutex<VideoRetentionUsage> {
-    const EMPTY: VideoRetentionUsage = VideoRetentionUsage {
-        live: 0,
-        descriptor_units: 0,
-    };
-    #[cfg(test)]
-    {
-        test_thread_budget!(Mutex<VideoRetentionUsage>, Mutex::new(EMPTY))
-    }
-    #[cfg(not(test))]
-    {
-        static USAGE: Mutex<VideoRetentionUsage> = Mutex::new(EMPTY);
-        &USAGE
-    }
-}
-
-/// In a test build, a budget the CALLING TEST THREAD owns, made once per thread and
-/// leaked (a few bytes per test): the lib-test process runs up to 54 tests at once over
-/// one cleanup worker, so a process-wide count let a sibling's backlog refuse this
-/// test's admission (`AdmissionRefused`, then `None`, at load 20-30). A permit keeps the
-/// `&'static` it was charged to, so whichever thread drops it (the worker's, mostly)
-/// releases the right budget. The limits and the production counts are unchanged.
-#[cfg(test)]
-macro_rules! test_thread_budget {
-    ($ty:ty, $init:expr) => {{
-        thread_local! {
-            static OWN: &'static $ty = Box::leak(Box::new($init));
-        }
-        OWN.with(|own| *own)
-    }};
-}
-#[cfg(test)]
-pub(crate) use test_thread_budget;
+/// Directory chains the best-effort cleanup worker may hold past their reply
+/// permits: one, so a sweep spanning batches holds the only one.
+const ARTIFACT_CLEANUP_LIMIT: usize = 1;
+/// Cleanup tasks reserved and not yet run.
+pub(crate) const ARTIFACT_CLEANUP_QUEUE_LIMIT: usize = 32;
 pub(crate) const ARTIFACT_HANDOFF_BUSY: &str = "other captures are still pending; retry";
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ArtifactHandoffUsage {
-    live: usize,
-    descriptor_units: usize,
+/// The capacity artifact verbs admit against. The shipping verbs use
+/// [`Self::process`]; a test builds its own with [`Self::shipping`], at the same
+/// caps, so no sibling test competes for its slots. Every permit keeps its
+/// budget alive and gives back to it on whatever thread drops it.
+pub(crate) struct ArtifactBudgets {
+    /// Captures in flight ([`ARTIFACT_HANDOFF_LIMIT`]): taken at admission by
+    /// both kinds, given back once an in-memory body is flushed or a path
+    /// reply's acknowledgement is judged. A quarantine never holds one, so
+    /// failed path handoffs cannot refuse an in-memory capture.
+    in_flight: Arc<Slots>,
+    /// Path artifacts and the directory chains they retain: at most
+    /// [`ARTIFACT_HANDOFF_LIMIT`] of them charging at most
+    /// [`ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT`] units, each its path's depth, so a
+    /// few deep paths cannot defeat a count-only limit. Held through the
+    /// acknowledgement and a failed one's quarantine (fail-closed). Its moves
+    /// are the `ArtifactHandoffCapacity` machine's.
+    descriptors: Arc<UnitBudget>,
+    /// Root capacity reserved while one video artifact is live; its final lease
+    /// hands it, with the pinned root, to the cleanup worker. Separate, so
+    /// best-effort GC never starves an armed video's sweep.
+    video: Arc<UnitBudget>,
+    /// The directory chains the best-effort cleanup worker holds past their
+    /// reply permits ([`ARTIFACT_CLEANUP_LIMIT`]).
+    cleanup: Arc<Slots>,
+    /// Places in the cleanup queue, reserved before the work becomes visible
+    /// so a final drop's enqueue never blocks or fails.
+    cleanup_queue: Arc<Slots>,
 }
 
-#[derive(Debug)]
-struct ArtifactHandoffPermit {
-    usage: &'static Mutex<ArtifactHandoffUsage>,
-    descriptor_units: usize,
-    descriptor_limit: usize,
+impl ArtifactBudgets {
+    /// A fresh set at the shipping caps.
+    pub(crate) fn shipping() -> Self {
+        Self {
+            in_flight: Arc::new(Slots::new(ARTIFACT_HANDOFF_LIMIT)),
+            descriptors: Arc::new(UnitBudget::new(
+                ARTIFACT_HANDOFF_LIMIT,
+                ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT,
+                observe_artifact_handoff,
+            )),
+            video: Arc::new(UnitBudget::new(
+                ARTIFACT_HANDOFF_LIMIT,
+                ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT,
+                |_| {},
+            )),
+            cleanup: Arc::new(Slots::new(ARTIFACT_CLEANUP_LIMIT)),
+            cleanup_queue: Arc::new(Slots::new(ARTIFACT_CLEANUP_QUEUE_LIMIT)),
+        }
+    }
+
+    /// The process's own set, which every shipping artifact verb shares. In a
+    /// test build it is the CALLING TEST THREAD's own set, made once per thread
+    /// and leaked (a few bytes per test): the lib-test process runs up to 54
+    /// tests at once over one cleanup worker, so one shared set let a sibling's
+    /// backlog refuse this test's admission (`AdmissionRefused`, then `None`, at
+    /// load 20-30). A permit keeps the budget it was charged to, so whichever
+    /// thread drops it (the worker's, mostly) gives back to the right one. The
+    /// caps are the shipping ones either way.
+    pub(crate) fn process() -> &'static Self {
+        #[cfg(test)]
+        {
+            thread_local! {
+                static OWN: &'static ArtifactBudgets = Box::leak(Box::new(ArtifactBudgets::shipping()));
+            }
+            OWN.with(|own| *own)
+        }
+        #[cfg(not(test))]
+        {
+            static PROCESS: std::sync::LazyLock<ArtifactBudgets> =
+                std::sync::LazyLock::new(ArtifactBudgets::shipping);
+            &PROCESS
+        }
+    }
+
+    /// Admission for a target-free body: an in-flight slot, and no directory
+    /// chain because none is owned.
+    pub(crate) fn try_reserve_in_memory(&self) -> Option<ReplyRetentionPermit> {
+        Some(ReplyRetentionPermit {
+            in_flight: self.in_flight.try_take()?,
+            descriptors: None,
+        })
+    }
+
+    /// Admission for a path artifact: an in-flight slot plus a lexical
+    /// descriptor estimate before the path resolves; `PinnedDir` reconciles the
+    /// exact depth before opening. A saturated request does no filesystem I/O.
+    pub(crate) fn try_reserve_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<ReplyRetentionPermit> {
+        let in_flight = self.in_flight.try_take()?;
+        let descriptors = self.descriptors.try_take(artifact_descriptor_units(path))?;
+        Some(ReplyRetentionPermit {
+            in_flight,
+            descriptors: Some(descriptors),
+        })
+    }
+
+    /// Transfer one open directory chain to the cleanup worker. Paths outside
+    /// the pinned-depth contract are refused.
+    pub(crate) fn try_reserve_cleanup_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<ArtifactCleanupPermit> {
+        if artifact_descriptor_units(path) > ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT {
+            return None;
+        }
+        Some(ArtifactCleanupPermit {
+            _slot: self.cleanup.try_take()?,
+        })
+    }
+
+    /// One place in the cleanup queue.
+    pub(crate) fn try_reserve_cleanup_queue(&self) -> Option<Slot> {
+        self.cleanup_queue.try_take()
+    }
+
+    /// Pre-reserve the root capacity an armed video sweep will hand the
+    /// cleanup worker, independent of best-effort cleanup admission.
+    pub(crate) fn try_reserve_video_retention_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<VideoRetentionPermit> {
+        Some(VideoRetentionPermit {
+            _root: self.video.try_take(artifact_descriptor_units(path))?,
+        })
+    }
 }
 
-/// Capacity reserved before an artifact job starts; binding it to a guard
-/// carries the permit through reply, ACK and failed-ACK quarantine.
+/// Capacity reserved before an artifact job starts: its in-flight slot and,
+/// for a path artifact, its descriptor chain. Binding it to a guard carries
+/// both through reply and ACK; a failed ACK's quarantine keeps only the chain.
 #[derive(Debug)]
-pub(crate) struct ReplyRetentionPermit(ArtifactHandoffPermit);
+pub(crate) struct ReplyRetentionPermit {
+    in_flight: Slot,
+    descriptors: Option<UnitPermit>,
+}
 
 /// Admission for an in-memory artifact body: no path to preserve after the
 /// bounded flush, so it is outside the acknowledgement/quarantine machine.
 pub(crate) struct WriteOnlyRetention {
-    _permit: ArtifactHandoffPermit,
+    _in_flight: Slot,
 }
 
-/// One reserved descriptor chain for the asynchronous retention worker,
-/// separate from the video-retention lane so best-effort GC never starves an
-/// armed video's sweep.
+/// One directory chain held by the asynchronous retention worker.
 pub(crate) struct ArtifactCleanupPermit {
-    live: &'static AtomicUsize,
-}
-
-impl Drop for ArtifactCleanupPermit {
-    fn drop(&mut self) {
-        let previous = self.live.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "artifact cleanup permit underflow");
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct VideoRetentionUsage {
-    live: usize,
-    descriptor_units: usize,
+    _slot: Slot,
 }
 
 /// A slot reserved while one video artifact is live. The final lease hands it,
@@ -1925,39 +2157,19 @@ struct VideoRetentionUsage {
 /// cannot block or fail.
 #[derive(Debug)]
 pub(crate) struct VideoRetentionPermit {
-    usage: &'static Mutex<VideoRetentionUsage>,
-    descriptor_units: usize,
+    _root: UnitPermit,
 }
 
-impl Drop for VideoRetentionPermit {
-    fn drop(&mut self) {
-        let mut usage = self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(usage.live > 0, "video retention permit underflow");
-        debug_assert!(
-            usage.descriptor_units >= self.descriptor_units,
-            "video retention descriptor budget underflow"
-        );
-        usage.live = usage.live.saturating_sub(1);
-        usage.descriptor_units = usage.descriptor_units.saturating_sub(self.descriptor_units);
-    }
-}
-
-#[cfg(test)]
-impl ReplyRetentionPermit {
-    /// Isolate unit fixtures from the process-global admission pool so parallel
-    /// tests do not race for its slots.
-    pub(crate) fn unmetered_for_test() -> Self {
-        static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
-            live: 0,
-            descriptor_units: 0,
-        });
-        Self(
-            ArtifactHandoffPermit::try_acquire_from(&USAGE, usize::MAX, usize::MAX, 1)
-                .expect("unmetered test permit capacity"),
-        )
+/// The descriptor budget's moves, told to the `ArtifactHandoffCapacity`
+/// machine.
+fn observe_artifact_handoff(event: BudgetEvent) {
+    match event {
+        BudgetEvent::Acquire => artifact_handoff_acquire_anchor(),
+        BudgetEvent::RefuseAtCap => artifact_handoff_refuse_anchor(),
+        BudgetEvent::Release => artifact_handoff_release_anchor(),
+        BudgetEvent::ReconcileGrow => artifact_handoff_reconcile_grow_anchor(),
+        BudgetEvent::ReconcileShrink => artifact_handoff_reconcile_shrink_anchor(),
+        BudgetEvent::RefuseReconcile => artifact_handoff_refuse_reconcile_anchor(),
     }
 }
 
@@ -2021,107 +2233,23 @@ fn artifact_handoff_reconcile_shrink_anchor() {}
 )]
 fn artifact_handoff_refuse_reconcile_anchor() {}
 
-impl ArtifactHandoffPermit {
-    fn try_acquire_from(
-        usage: &'static Mutex<ArtifactHandoffUsage>,
-        live_limit: usize,
-        descriptor_limit: usize,
-        descriptor_units: usize,
-    ) -> Option<Self> {
-        let mut current = usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let available = current.live < live_limit
-            && descriptor_units > 0
-            && descriptor_units <= descriptor_limit
-            && current.descriptor_units <= descriptor_limit - descriptor_units;
-        if available {
-            current.live += 1;
-            current.descriptor_units += descriptor_units;
-            drop(current);
-            artifact_handoff_acquire_anchor();
-            Some(Self {
-                usage,
-                descriptor_units,
-                descriptor_limit,
-            })
-        } else {
-            drop(current);
-            artifact_handoff_refuse_anchor();
-            None
-        }
-    }
-
-    fn try_acquire(descriptor_units: usize) -> Option<Self> {
-        static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
-            live: 0,
-            descriptor_units: 0,
-        });
-        Self::try_acquire_from(
-            &USAGE,
-            ARTIFACT_HANDOFF_LIMIT,
-            ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT,
-            descriptor_units,
-        )
-    }
-
-    /// Replace the provisional charge with the exact pinned path's depth,
-    /// atomically; on failure the old charge stays so the drop balances.
-    fn try_reconcile_descriptor_units(&mut self, descriptor_units: usize) -> bool {
-        if descriptor_units == 0 || descriptor_units > self.descriptor_limit {
-            artifact_handoff_refuse_reconcile_anchor();
-            return false;
-        }
-        let previous_units = self.descriptor_units;
-        let mut usage = self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(usage.descriptor_units >= self.descriptor_units);
-        let other_units = usage.descriptor_units.saturating_sub(self.descriptor_units);
-        if other_units > self.descriptor_limit - descriptor_units {
-            drop(usage);
-            artifact_handoff_refuse_reconcile_anchor();
-            return false;
-        }
-        usage.descriptor_units = other_units + descriptor_units;
-        self.descriptor_units = descriptor_units;
-        drop(usage);
-        match descriptor_units.cmp(&previous_units) {
-            std::cmp::Ordering::Greater => artifact_handoff_reconcile_grow_anchor(),
-            std::cmp::Ordering::Less => artifact_handoff_reconcile_shrink_anchor(),
-            std::cmp::Ordering::Equal => {}
-        }
-        true
-    }
-}
-
-impl Drop for ArtifactHandoffPermit {
-    fn drop(&mut self) {
-        let mut usage = self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(usage.live > 0, "artifact handoff permit underflow");
-        debug_assert!(
-            usage.descriptor_units >= self.descriptor_units,
-            "artifact handoff descriptor budget underflow"
-        );
-        usage.live = usage.live.saturating_sub(1);
-        usage.descriptor_units = usage.descriptor_units.saturating_sub(self.descriptor_units);
-        drop(usage);
-        artifact_handoff_release_anchor();
-    }
-}
-
 /// Type-erased ownership that stays live until a reply is consumed and
 /// acknowledged; concrete guards revalidate filesystem identities at the wire.
 pub(crate) struct ReplyRetention {
     guard: Option<Box<dyn WireRetention>>,
+    /// How far the guard got, read only by the drop to tell the model an
+    /// unprepared guard was aborted (`AbortQueued`): kept where the anchors are
+    /// (test and debug builds).
+    #[cfg(any(test, debug_assertions))]
     phase: ReplyRetentionPhase,
-    _permit: Option<ArtifactHandoffPermit>,
+    /// A path artifact's directory chain, which a quarantine keeps.
+    _descriptors: Option<UnitPermit>,
+    /// Given back when the handoff's outcome is judged: a quarantine keeps the
+    /// guard and its chain, not a capture's place in flight.
+    in_flight: Option<Slot>,
 }
 
+#[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReplyRetentionPhase {
     Queued,
@@ -2130,107 +2258,13 @@ enum ReplyRetentionPhase {
 }
 
 impl ReplyRetention {
-    #[cfg(all(test, unix))]
-    pub(crate) fn try_reserve() -> Option<ReplyRetentionPermit> {
-        Self::try_reserve_in_memory()
-    }
-
-    /// Reserve a live-object slot for a target-free body; no directory chain is
-    /// charged because none is owned.
-    pub(crate) fn try_reserve_in_memory() -> Option<ReplyRetentionPermit> {
-        ArtifactHandoffPermit::try_acquire(1).map(ReplyRetentionPermit)
-    }
-
-    /// Reserve the count slot plus a lexical descriptor estimate before resolving
-    /// a path; `PinnedDir` reconciles the exact depth before opening. A saturated
-    /// request does no filesystem I/O.
-    pub(crate) fn try_reserve_for_path(path: &std::path::Path) -> Option<ReplyRetentionPermit> {
-        let descriptor_units = artifact_descriptor_units(path);
-        ArtifactHandoffPermit::try_acquire(descriptor_units).map(ReplyRetentionPermit)
-    }
-
-    /// Transfer one open directory chain to the cleanup worker. Paths outside the
-    /// pinned-depth contract are refused; at most one such capability outlives
-    /// its reply permit.
-    pub(crate) fn try_reserve_cleanup_for_path(
-        path: &std::path::Path,
-    ) -> Option<ArtifactCleanupPermit> {
-        if artifact_descriptor_units(path) > ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT {
-            return None;
-        }
-        let limit = if cfg!(test) {
-            ARTIFACT_CLEANUP_TEST_LIMIT
-        } else {
-            1
-        };
-        let live = artifact_cleanup_live();
-        live.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < limit).then_some(current + 1)
-        })
-        .ok()
-        .map(|_| ArtifactCleanupPermit { live })
-    }
-
-    fn try_reserve_video_retention_from(
-        usage: &'static Mutex<VideoRetentionUsage>,
-        live_limit: usize,
-        descriptor_limit: usize,
-        descriptor_units: usize,
-    ) -> Option<VideoRetentionPermit> {
-        let mut current = usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let available = current.live < live_limit
-            && descriptor_units > 0
-            && descriptor_units <= descriptor_limit
-            && current.descriptor_units <= descriptor_limit - descriptor_units;
-        if !available {
-            return None;
-        }
-        current.live += 1;
-        current.descriptor_units += descriptor_units;
-        Some(VideoRetentionPermit {
-            usage,
-            descriptor_units,
-        })
-    }
-
-    /// Pre-reserve the root capacity an armed video sweep will hand the cleanup
-    /// worker, independent of best-effort cleanup admission.
-    pub(crate) fn try_reserve_video_retention_for_path(
-        path: &std::path::Path,
-    ) -> Option<VideoRetentionPermit> {
-        let units = artifact_descriptor_units(path);
-        let (live_limit, descriptor_limit) = if cfg!(test) {
-            (
-                ARTIFACT_CLEANUP_TEST_LIMIT,
-                ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT.saturating_mul(ARTIFACT_CLEANUP_TEST_LIMIT),
-            )
-        } else {
-            (ARTIFACT_HANDOFF_LIMIT, ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT)
-        };
-        Self::try_reserve_video_retention_from(
-            video_retention_usage(),
-            live_limit,
-            descriptor_limit,
-            units,
-        )
-    }
-
-    #[cfg(all(test, unix))]
-    fn try_new<G: WireRetention + 'static>(guard: G) -> Result<Self, G> {
-        let Some(permit) = Self::try_reserve() else {
-            return Err(guard);
-        };
-        Ok(permit.retain(guard))
-    }
-
     #[cfg(test)]
     fn new(guard: impl WireRetention + 'static) -> Self {
         Self {
             guard: Some(Box::new(guard)),
             phase: ReplyRetentionPhase::Queued,
-            _permit: None,
+            _descriptors: None,
+            in_flight: None,
         }
     }
 
@@ -2248,10 +2282,21 @@ impl ReplyRetention {
             .as_mut()
             .expect("live reply retention owns its guard")
             .prepare_write();
-        if result.is_ok() {
-            self.phase = ReplyRetentionPhase::Prepared;
+        #[cfg(any(test, debug_assertions))]
+        {
+            if result.is_ok() {
+                self.phase = ReplyRetentionPhase::Prepared;
+            }
         }
         result
+    }
+
+    /// Note that the guard's outcome is decided, so its drop aborts nothing.
+    fn classified(&mut self) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.phase = ReplyRetentionPhase::Classified;
+        }
     }
 
     #[cfg_attr(
@@ -2263,7 +2308,7 @@ impl ReplyRetention {
         )
     )]
     fn acknowledge_peer_anchor(&mut self) {
-        self.phase = ReplyRetentionPhase::Classified;
+        self.classified();
     }
 
     #[cfg_attr(
@@ -2275,7 +2320,7 @@ impl ReplyRetention {
         )
     )]
     fn acknowledge_failed_anchor(&mut self) {
-        self.phase = ReplyRetentionPhase::Classified;
+        self.classified();
     }
 
     #[cfg_attr(
@@ -2287,7 +2332,7 @@ impl ReplyRetention {
         )
     )]
     fn prepare_failed_anchor(&mut self) {
-        self.phase = ReplyRetentionPhase::Classified;
+        self.classified();
     }
 
     #[cfg_attr(
@@ -2299,9 +2344,10 @@ impl ReplyRetention {
         )
     )]
     fn write_failed_anchor(&mut self) {
-        self.phase = ReplyRetentionPhase::Classified;
+        self.classified();
     }
 
+    #[cfg(any(test, debug_assertions))]
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2325,31 +2371,46 @@ impl ReplyRetention {
 
 impl ReplyRetentionPermit {
     /// Reconcile the provisional charge after path resolution, before the
-    /// ancestor chain opens (called by `PinnedDir`).
+    /// ancestor chain opens (called by `PinnedDir`). A permit with no chain
+    /// has no path to admit.
     pub(crate) fn try_reconcile_for_resolved_path(&mut self, path: &std::path::Path) -> bool {
-        self.0
-            .try_reconcile_descriptor_units(artifact_descriptor_units(path))
+        self.descriptors
+            .as_mut()
+            .is_some_and(|chain| chain.reconcile(artifact_descriptor_units(path)))
     }
 
     pub(crate) fn retain(self, guard: impl WireRetention + 'static) -> ReplyRetention {
         ReplyRetention {
             guard: Some(Box::new(guard)),
+            #[cfg(any(test, debug_assertions))]
             phase: ReplyRetentionPhase::Queued,
-            _permit: Some(self.0),
+            _descriptors: self.descriptors,
+            in_flight: Some(self.in_flight),
         }
     }
 
+    /// Close `path_capability`, then give back its descriptor chain; the
+    /// in-flight slot stays with the in-memory body until it is flushed.
     pub(crate) fn release_path_and_retain_in_memory<T>(
-        mut self,
+        self,
         path_capability: T,
     ) -> WriteOnlyRetention {
-        // Close the filesystem capability before changing its charge.
         drop(path_capability);
-        assert!(
-            self.0.try_reconcile_descriptor_units(1),
-            "shrinking a live artifact permit to its in-memory charge must fit"
-        );
-        WriteOnlyRetention { _permit: self.0 }
+        drop(self.descriptors);
+        WriteOnlyRetention {
+            _in_flight: self.in_flight,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ReplyRetentionPermit {
+    /// An in-memory permit from a fresh budget at the shipping caps: real
+    /// admission that no sibling test competes for.
+    pub(crate) fn from_own_budget() -> Self {
+        ArtifactBudgets::shipping()
+            .try_reserve_in_memory()
+            .expect("a fresh budget has room")
     }
 }
 
@@ -2361,9 +2422,11 @@ fn artifact_descriptor_units(path: &std::path::Path) -> usize {
 
 impl Drop for ReplyRetention {
     fn drop(&mut self) {
-        if self.phase == ReplyRetentionPhase::Queued {
-            self.abort_queued_anchor();
-            self.phase = ReplyRetentionPhase::Classified;
+        #[cfg(any(test, debug_assertions))]
+        {
+            if self.phase == ReplyRetentionPhase::Queued {
+                self.abort_queued_anchor();
+            }
         }
         // Fire the refinement anchor after the guard really drops (a Drop body
         // runs before its fields), so Tier-1 conformance sees the release.
@@ -2379,18 +2442,12 @@ pub(crate) enum ReplyHandoff {
     WriteOnly(WriteOnlyRetention),
 }
 
+#[cfg(test)]
 impl ReplyHandoff {
     pub(crate) fn prepare_write(&mut self) -> Result<(), String> {
         match self {
             Self::Acknowledged(retention) => retention.prepare_write(),
             Self::WriteOnly(_) => Ok(()),
-        }
-    }
-
-    fn prepare_failed_anchor(&mut self) {
-        match self {
-            Self::Acknowledged(retention) => retention.prepare_failed_anchor(),
-            Self::WriteOnly(_) => unreachable!("write-only handoff preparation cannot fail"),
         }
     }
 }
@@ -2761,7 +2818,7 @@ impl ImageFrameMetadata {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "image-meta-version=2 frame-kind={} frame-phase={} window={} view={} generation={} config-revision={} update-revision={} document-seq={} presentation-revision={} paint-revision={} capture-serial={} dimensions={}x{} pixel-fingerprint={:016x} compiled-fingerprint={} raster-fingerprint={:016x} raster-model-fingerprint={:016x} raster-geometry={:016x} overlay-fingerprint={:016x} theme-fingerprint={:016x} leaf-count={} leaves={}",
+            "image-meta-version=3 frame-kind={} frame-phase={} window={} view={} generation={} config-revision={} update-revision={} document-seq={} presentation-revision={} paint-revision={} capture-serial={} dimensions={}x{} pixel-fingerprint={:016x} compiled-fingerprint={} raster-fingerprint={:016x} raster-model-fingerprint={:016x} raster-geometry={:016x} overlay-fingerprint={:016x} theme-fingerprint={:016x} leaf-count={} leaves={}",
             self.frame_kind,
             self.phase,
             self.window,
@@ -2787,9 +2844,6 @@ impl ImageFrameMetadata {
         )
     }
 }
-
-/// Shared queue of pending [`ImageReq`]s, drained by the main thread.
-pub(crate) type ImageQueue = Arc<Mutex<VecDeque<ImageReq>>>;
 
 /// Fixed admission queue between the socket listener and the control workers.
 /// The listener only does a bounded non-blocking enqueue; workers are created
@@ -2827,6 +2881,7 @@ impl<T> Drop for DispatchCompletion<'_, T> {
 }
 
 impl<T> BoundedDispatch<T> {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(max_capacity: usize) -> Self {
         Self::with_resume_room(max_capacity, 0)
@@ -2924,34 +2979,9 @@ impl<T> BoundedDispatch<T> {
         assert!(previous > 0, "completed control work was never admitted");
     }
 
-    /// Whether an admission would find a lane now.
-    pub(crate) fn has_room(&self) -> bool {
-        self.outstanding.load(Ordering::Acquire) < self.capacity.load(Ordering::Acquire)
-    }
-
-    /// Whether one more lane fits the fixed inbox.
-    pub(crate) fn can_grow(&self) -> bool {
-        self.capacity.load(Ordering::Acquire) < self.max_capacity
-    }
-
-    /// Publish one more lane that now exists (grown after admission began);
-    /// `false` at the fixed inbox's bound, where nothing is published.
-    pub(crate) fn add_capacity(&self) -> bool {
-        self.capacity
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                (c < self.max_capacity).then_some(c + 1)
-            })
-            .is_ok()
-    }
-
     #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
         self.outstanding.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity.load(Ordering::Acquire)
     }
 }
 
@@ -2997,23 +3027,12 @@ impl<T> BoundedConnectionQueue<T> {
 mod control_lanes;
 
 /// Request lanes. A lane holds a connection only while it authenticates or
-/// serves a request: idle connections park and waits move to wait lanes
-/// (`control_lanes.rs`). Push subscriptions get their own pool. A fresh peer
-/// gets a busy reply when every lane is working, or when
-/// [`control_connections_cap`] connections are open and no parked one gives
-/// way to it (`control_lanes.rs`, Admission).
+/// serves a request: idle connections park, waits move to wait lanes and push
+/// streams to subscription lanes (`control_lanes.rs`). A fresh peer gets a busy
+/// reply when every lane is working, or when [`control_connections_cap`]
+/// connections are open and no parked one gives way to it (`control_lanes.rs`,
+/// Admission).
 const CONTROL_WORKERS: usize = 8;
-/// The push lanes started with the socket. Each long-lived subscription
-/// holds one for its life (`subscribe` is push-only), so more are grown one
-/// thread at a time while every started lane is taken, up to
-/// [`control_subscriptions_cap`], and kept: a native harness keeps one
-/// `subscribe @self` stream per agent tab (codex-alab's contract §2), and a
-/// fixed four refused the fifth codex-alab of an instance its claim for good
-/// (the end-to-end run of 2026-10-16, AD-2).
-const CONTROL_SUBSCRIPTION_WORKERS: usize = 4;
-/// The CEILING on push lanes at once. The bound in force is
-/// [`control_subscriptions_cap`], which answers to the descriptor limit too.
-const CONTROL_SUBSCRIPTION_MAX: usize = 64;
 /// The WAIT lanes' cap (`await`, `ready`, `wait`, `turn`, a parking `post` or
 /// `inbox get @…`, a relay). Started on demand, kept once started. Every
 /// supervised agent tab spends most of its life in one 20 s `await`.
@@ -3021,14 +3040,20 @@ const CONTROL_WAIT_WORKERS: usize = 64;
 /// The REQUEST lanes that may serve a wait at once: a wait no wait lane can
 /// take (every one taken; a wait with requests pipelined behind it moves with
 /// them) is served on its request lane only within this budget, and past it
-/// gets the busy reply on its connection. Half the lanes, so the other half always
-/// serve requests: before this bound, waits past the wait lanes took request
-/// lanes without limit, and eight of them left a parked driver's next request
-/// queued behind them for up to the waits' 600 s clamp (`control_lanes.rs`).
-const CONTROL_INLINE_WAITS: usize = CONTROL_WORKERS / 2;
+/// gets the busy reply on its connection. Before this bound, waits past the
+/// wait lanes took request lanes without limit, and eight of them left a parked
+/// driver's next request queued behind them for up to the waits' 600 s clamp
+/// (`control_lanes.rs`).
+///
+/// The other long holders of a request lane are artifact captures: an `image`,
+/// `window` or `video` holds its lane while it captures (up to minutes), and
+/// at most `ARTIFACT_HANDOFF_LIMIT` are in flight at once
+/// ([`ArtifactBudgets::try_reserve_in_memory`], [`ArtifactBudgets::try_reserve_for_path`]).
+/// What both can hold together leaves one request lane always free for requests.
+const CONTROL_INLINE_WAITS: usize = CONTROL_WORKERS - ARTIFACT_HANDOFF_LIMIT - 1;
 const _: () = assert!(
-    CONTROL_INLINE_WAITS < CONTROL_WORKERS,
-    "a request lane must always be left for requests"
+    ARTIFACT_HANDOFF_LIMIT + CONTROL_INLINE_WAITS < CONTROL_WORKERS && CONTROL_INLINE_WAITS > 0,
+    "captures and inline waits together must always leave a request lane for requests"
 );
 /// The CEILING on control connections open at once. The bound in force is
 /// [`control_connections_cap`], which also answers to the process's descriptor
@@ -3036,7 +3061,8 @@ const _: () = assert!(
 const CONTROL_CONNECTIONS_MAX: usize = 1024;
 
 /// Most control connections open at once in this process (push subscriptions
-/// count against their own pool): the parker's capacity.
+/// have a cap of their own, [`control_subscriptions_cap`]): the parker's
+/// capacity.
 ///
 /// Every open connection holds a descriptor, and the window's descriptor budget
 /// is small: an app started by launchd (the Dock, Finder, `open`) runs with a
@@ -3080,95 +3106,41 @@ pub(crate) fn soft_descriptor_limit() -> Option<u64> {
     (read == 0).then_some(limit.rlim_cur)
 }
 
-/// Most push subscriptions at once in this process: an EIGHTH of the soft
-/// descriptor limit read at startup (32 at launchd's 256, beside the
-/// connections' quarter), never more than [`CONTROL_SUBSCRIPTION_MAX`] and
-/// never fewer than the [`CONTROL_SUBSCRIPTION_WORKERS`] started with the
-/// socket. Each holds a descriptor and a thread.
-fn control_subscriptions_cap() -> usize {
-    subscriptions_cap_for(soft_descriptor_limit())
-}
-
-/// [`control_subscriptions_cap`] for a soft descriptor limit (`None`:
-/// unreadable, which keeps the started lanes' bound).
-fn subscriptions_cap_for(soft_limit: Option<u64>) -> usize {
-    soft_limit.map_or(CONTROL_SUBSCRIPTION_WORKERS, |soft| {
-        usize::try_from(soft / 8)
-            .unwrap_or(usize::MAX)
-            .clamp(CONTROL_SUBSCRIPTION_WORKERS, CONTROL_SUBSCRIPTION_MAX)
-    })
-}
-
 /// No parker runs off unix, so the cap bounds nothing there (the lanes do).
 #[cfg(not(unix))]
 pub(crate) fn soft_descriptor_limit() -> Option<u64> {
     None
 }
 
-struct SubscriptionJob {
-    line: String,
-    scope: Scope,
-    stream: CtlStream,
+/// The FLOOR on push subscriptions served at once: the fixed subscription pool
+/// this cap replaced held four.
+const CONTROL_SUBSCRIPTIONS_MIN: usize = 4;
+/// The CEILING on push subscriptions served at once.
+const CONTROL_SUBSCRIPTIONS_MAX: usize = 256;
+
+/// Most push subscriptions served at once in this process: the subscription
+/// lanes' cap (`control_lanes.rs`).
+///
+/// A subscription holds its stream's descriptor and one thread parked on its
+/// sessions' wakes for its whole life; on unix nothing more, since the peer
+/// watch polls that same descriptor ([`crate::peer_watch`]). Idle, it costs a
+/// parked thread, so what bounds it is the descriptor budget: a SIXTEENTH of
+/// the soft `RLIMIT_NOFILE` — 16 at launchd's 256 — on top of the open
+/// connections' quarter ([`control_connections_cap`]); never fewer than
+/// [`CONTROL_SUBSCRIPTIONS_MIN`], never more than [`CONTROL_SUBSCRIPTIONS_MAX`].
+/// A subscription past it is answered `ERR subscription capacity busy; retry`.
+fn control_subscriptions_cap() -> usize {
+    subscriptions_cap_for(soft_descriptor_limit())
 }
 
-/// Starts one more push lane serving the dispatch's jobs; whether it started.
-type GrowLane = Box<dyn Fn() -> bool + Send + Sync>;
-
-struct SubscriptionDispatch {
-    jobs: Arc<BoundedDispatch<SubscriptionJob>>,
-    /// How a lane is grown ([`spawn_subscription_workers`] sets it once the
-    /// started lanes run); none, nothing grows.
-    grow: std::sync::OnceLock<GrowLane>,
-    /// One grower at a time, so two submitters at a full pool grow one lane
-    /// each, never past the ceiling.
-    growing: Mutex<()>,
-}
-
-impl SubscriptionDispatch {
-    /// A dispatch of at most `ceiling` push lanes.
-    fn new(ceiling: usize) -> Self {
-        Self {
-            jobs: Arc::new(BoundedDispatch::new(ceiling)),
-            grow: std::sync::OnceLock::new(),
-            growing: Mutex::new(()),
-        }
-    }
-
-    /// Admit a long-lived subscription onto a free push lane, growing one
-    /// when every started lane is taken and the ceiling allows; `Err` (the
-    /// stream back, for its refusal) only at the ceiling, or when no lane
-    /// could be started.
-    fn try_submit(&self, line: String, scope: Scope, stream: CtlStream) -> Result<(), CtlStream> {
-        let mut job = SubscriptionJob {
-            line,
-            scope,
-            stream,
-        };
-        loop {
-            match self.jobs.try_submit(job) {
-                Ok(()) => return Ok(()),
-                Err(back) => job = back,
-            }
-            if !self.grow_one() {
-                return Err(job.stream);
-            }
-        }
-    }
-
-    /// One more lane (or one freed meanwhile): whether a submission may try again.
-    fn grow_one(&self) -> bool {
-        let _one = self
-            .growing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.jobs.has_room() {
-            return true;
-        }
-        let Some(grow) = self.grow.get() else {
-            return false;
-        };
-        self.jobs.can_grow() && grow() && self.jobs.add_capacity()
-    }
+/// [`control_subscriptions_cap`] for a soft descriptor limit (`None`:
+/// unreadable, and off unix, which keeps the floor).
+fn subscriptions_cap_for(soft_limit: Option<u64>) -> usize {
+    soft_limit.map_or(CONTROL_SUBSCRIPTIONS_MIN, |soft| {
+        usize::try_from(soft / 16)
+            .unwrap_or(usize::MAX)
+            .clamp(CONTROL_SUBSCRIPTIONS_MIN, CONTROL_SUBSCRIPTIONS_MAX)
+    })
 }
 
 /// Drop guard for the bridge connection's end. When it ends (child exited or was
@@ -3181,9 +3153,9 @@ impl SubscriptionDispatch {
 /// sharing the bridge's uid can kill it, and that must never lift a hold.
 #[cfg(any(unix, test))]
 struct BridgeLostGuard {
+    /// The registry whose sessions the halt holds; its `hold` marks ring each
+    /// session's watchers ([`wake_sid_watchers`]).
     store: Store,
-    /// The halt's `hold` marks wake each session log's readers.
-    subscribers: Subscribers,
     /// The incarnation this guard speaks for. The hold sweep ignores it, but
     /// `fabric=disconnected` is stored only while this generation owns the link,
     /// so a stale guard cannot report its live replacement dead (see
@@ -3195,7 +3167,7 @@ struct BridgeLostGuard {
 impl Drop for BridgeLostGuard {
     fn drop(&mut self) {
         crate::fabric::bridge_lost_waking(&self.store, self.generation, &|sid| {
-            wake_sid_watchers(&self.store, &self.subscribers, sid);
+            wake_sid_watchers(&self.store, sid);
         });
     }
 }
@@ -3203,12 +3175,10 @@ impl Drop for BridgeLostGuard {
 struct ControlWorkerContext {
     active: ActiveHandle,
     store: Store,
-    subscribers: Subscribers,
     proxy: EventLoopProxy<Wake>,
-    image_queue: ImageQueue,
     token: Arc<String>,
     sock_dir: std::path::PathBuf,
-    subscriptions: Arc<SubscriptionDispatch>,
+    recovery_count_admission: Arc<crate::keeper_link::RecoveryCountAdmission>,
 }
 
 /// Local resource preparation, not Commit authority. Fixed-path candidates
@@ -3273,8 +3243,8 @@ impl Drop for ControlPreparationGuard {
 /// What every pooled lane serves with (`control_lanes.rs`): the handshake, one
 /// request at a time, wait classification, the push flip and claim release.
 impl control_lanes::LaneService for ControlWorkerContext {
-    fn owed_input_reply(&self, line: &str) -> Option<FinalReply> {
-        owed_input_reply(&self.store, line)
+    fn owed_input_reply(&self, request: &Request) -> Option<FinalReply> {
+        owed_input_reply(&self.store, request)
     }
 
     fn authenticate(
@@ -3294,79 +3264,95 @@ impl control_lanes::LaneService for ControlWorkerContext {
 
     fn serve_line(
         &self,
-        line: String,
+        request: Request,
         scope: Scope,
         stream: &CtlStream,
         reader: &mut control_lanes::LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut control_lanes::Outbox,
     ) -> Option<ServeDisposition> {
         serve_request_line(
-            line,
+            request,
             scope,
             stream,
             reader,
             out,
             &self.active,
             &self.store,
-            &self.subscribers,
             &self.proxy,
-            &self.image_queue,
             &self.sock_dir,
+            &self.recovery_count_admission,
         )
     }
 
-    fn frame_header(&self, line: &str, scope: Scope, out: &mut Vec<u8>) -> bool {
-        // The header of `@ feed-bin <n>` or `@ spawn … len=<n>` is refused as
-        // its whole line would be ([`empty_selector_refusal`]): no `GO`, no
-        // input boundary, and the connection closes.
-        if let Some(refusal) = empty_selector_refusal(line) {
+    fn frame_header(
+        &self,
+        request: &Request,
+        scope: Scope,
+        out: &mut control_lanes::Outbox,
+    ) -> bool {
+        if let Some(refusal) = recovery_count_refusal(&self.recovery_count_admission) {
             out.extend_from_slice(refusal.as_bytes());
             return false;
         }
-        match binary_frame_verb(line) {
-            Some(verb) => {
-                let route = FeedBinRoute {
-                    active: &self.active,
-                    store: &self.store,
-                    scope,
-                    subscribers: None,
-                };
-                let mut clear_license =
-                    |session| front_routed_license_clear(&self.proxy, session, false);
-                feed_bin_header(line, verb, route, &mut clear_license, out)
-            }
-            // A worker's spawn: its task is sent only once this answer says
-            // the server reads it (`task_frame_go`) — unless it is aimed where
-            // it would be relayed, which is refused unsent.
-            None => match spawn_frame_len(line) {
-                Some(Ok(n)) => match worker_frame_refusal(line, &self.store) {
-                    Some(refusal) => {
-                        out.extend_from_slice(refusal.as_bytes());
-                        false
-                    }
-                    None => {
-                        out.extend_from_slice(
-                            aterm_types::control_verbs::task_frame_go(n).as_bytes(),
-                        );
-                        true
-                    }
-                },
-                // A `post`'s body has no header to act on.
-                _ => true,
+        // The header of `@ feed-bin <n>` or `@ spawn … len=<n>` is refused as
+        // its whole line would be ([`empty_selector_refusal`]): no `GO`, no
+        // input boundary, and the connection closes.
+        if let Some(refusal) = empty_selector_refusal(request) {
+            out.extend_from_slice(refusal.as_bytes());
+            return false;
+        }
+        let head = request.head();
+        if request.frame().is_some() {
+            let route = FeedBinRoute {
+                active: &self.active,
+                store: &self.store,
+                scope,
+            };
+            return feed_bin_header(head.selector.as_ref(), route, out);
+        }
+        // A worker's spawn: its task is sent only once this answer says the
+        // server reads it (`task_frame_go`) — unless it is aimed where it would
+        // be relayed, which is refused unsent.
+        match spawn_frame_len(&head) {
+            Some(Ok(n)) => match worker_frame_refusal(&head, &self.store) {
+                Some(refusal) => {
+                    out.extend_from_slice(refusal.as_bytes());
+                    false
+                }
+                None => {
+                    out.extend_from_slice(aterm_types::control_verbs::task_frame_go(n).as_bytes());
+                    true
+                }
             },
+            // A `post`'s body has no header to act on.
+            _ => true,
         }
     }
 
-    fn is_wait(&self, line: &str, scope: Scope) -> bool {
-        is_wait_request(line, scope, &self.store)
+    fn is_wait(&self, request: &Request, scope: Scope) -> bool {
+        self.recovery_count_admission.ready() && is_wait_request(request, scope, &self.store)
     }
 
-    fn subscribe(&self, line: String, scope: Scope, stream: CtlStream) {
-        handoff_subscription(&self.subscriptions, line, scope, stream);
+    fn subscribe(&self, request: Request, scope: Scope, mut stream: CtlStream) {
+        // This direct connection moved from a request lane to this push lane:
+        // its peer context is set again here. The inherited bridge's inline
+        // subscription ([`Self::serve_bridge`]) never gains DirectPeer authority.
+        let _serving = ServingFd::enter(&stream);
+        #[cfg(unix)]
+        let _direct = DirectPeer::enter();
+        // Hangs the connection up as the push stream ends, as an ordinary lane
+        // does, waking a vanished peer out of the AF_UNIX kernel path.
+        run_subscribe_socket(
+            request.head(),
+            &self.active,
+            &self.store,
+            scope,
+            &mut stream,
+        );
     }
 
     fn release(&self, id: u64) {
-        release_connection_claims(&self.store, &self.subscribers, Some(&self.proxy), id);
+        release_connection_claims(&self.store, Some(&self.proxy), id);
     }
 
     #[cfg(unix)]
@@ -3387,7 +3373,6 @@ impl ControlWorkerContext {
         crate::fabric::bridge_attached(generation);
         let _lost = BridgeLostGuard {
             store: self.store.clone(),
-            subscribers: self.subscribers.clone(),
             generation,
         };
         match serve_preresolved(
@@ -3395,10 +3380,9 @@ impl ControlWorkerContext {
             Scope::Bridge,
             &self.active,
             &self.store,
-            &self.subscribers,
             &self.proxy,
-            &self.image_queue,
             &self.sock_dir,
+            &self.recovery_count_admission,
         ) {
             // Each half on its own ([`aterm_uds::hangup::hang_up`]): the lane
             // closes on the bridge's EOF, and Darwin refuses a both-ways
@@ -3406,17 +3390,16 @@ impl ControlWorkerContext {
             ServeDisposition::Close => {
                 aterm_uds::hangup::hang_up(&stream);
             }
-            // The bridge's push subscription is served inline, not handed to the
-            // subscription pool: the `BridgeLostGuard` fires when this function
+            // The bridge's push subscription is served inline, not handed to a
+            // subscription lane: the `BridgeLostGuard` fires when this function
             // returns, so handing off would apply the fabric-lost halt at the
-            // flip. The bridge also uses none of the shared request or wait lanes.
-            ServeDisposition::Subscribe { line, scope } => {
+            // flip. The bridge also uses none of the shared lanes.
+            ServeDisposition::Subscribe { request, scope } => {
                 // Hangs the lane up when its push stream ends.
                 run_subscribe_socket(
-                    &line,
+                    request.head(),
                     &self.active,
                     &self.store,
-                    &self.subscribers,
                     scope,
                     &mut stream,
                 );
@@ -3447,33 +3430,12 @@ impl ControlWorkerContext {
             Scope::Fleet { content, drive },
             &self.active,
             &self.store,
-            &self.subscribers,
             &self.proxy,
-            &self.image_queue,
             &self.sock_dir,
+            &self.recovery_count_admission,
         );
         SERVING_FLEET_PEER.with(|serving| serving.set(None));
         aterm_uds::hangup::hang_up(&stream);
-    }
-
-    fn serve_subscription(&self, mut job: SubscriptionJob) {
-        // This direct connection moved from a request lane to this push lane.
-        // Re-establish its actual peer context here; the inherited bridge's
-        // inline subscription deliberately never gains DirectPeer authority.
-        let _serving = ServingFd::enter(&job.stream);
-        #[cfg(unix)]
-        let _direct = DirectPeer::enter();
-        // Match the ordinary lane teardown: the push stream hangs its
-        // connection up as it ends, waking a vanished peer out of the AF_UNIX
-        // kernel path before Drop releases this reusable lane.
-        run_subscribe_socket(
-            &job.line,
-            &self.active,
-            &self.store,
-            &self.subscribers,
-            job.scope,
-            &mut job.stream,
-        );
     }
 }
 
@@ -3573,58 +3535,6 @@ pub(crate) fn attach_fleet_drive(
     .is_ok()
 }
 
-/// Create the push lanes started with the socket, and install the grower that
-/// starts more on demand ([`SubscriptionDispatch::try_submit`]). Returns how
-/// many started so startup can fail closed if none did.
-fn spawn_subscription_workers(
-    dispatch: &Arc<SubscriptionDispatch>,
-    context: &Arc<std::sync::OnceLock<Arc<ControlWorkerContext>>>,
-) -> usize {
-    let started = (0..CONTROL_SUBSCRIPTION_WORKERS)
-        .filter(|&index| spawn_subscription_worker(index, &dispatch.jobs, context))
-        .count();
-    dispatch.jobs.set_capacity(started);
-    if started > 0 {
-        let (jobs, context) = (Arc::clone(&dispatch.jobs), Arc::clone(context));
-        let next = AtomicUsize::new(started);
-        let _ = dispatch.grow.set(Box::new(move || {
-            let index = next.fetch_add(1, Ordering::Relaxed);
-            spawn_subscription_worker(index, &jobs, &context)
-        }));
-    }
-    started
-}
-
-/// One push lane, serving `jobs` for good; whether its thread started.
-fn spawn_subscription_worker(
-    index: usize,
-    jobs: &Arc<BoundedDispatch<SubscriptionJob>>,
-    context: &Arc<std::sync::OnceLock<Arc<ControlWorkerContext>>>,
-) -> bool {
-    let (jobs, context) = (Arc::clone(jobs), Arc::clone(context));
-    let name = format!("aterm-subscribe-{index}");
-    // Same QoS floor as the RPC lanes: the push loop takes `term_lock` per
-    // target per tick.
-    match crate::qos::spawn_lane_thread(name, crate::qos::Role::Responsive, move || {
-        loop {
-            if !jobs.serve_next(|job| {
-                context
-                    .get()
-                    .expect("context published before dispatch")
-                    .serve_subscription(job);
-            }) {
-                aterm_log::warn!("subscription worker recovered after a connection panic");
-            }
-        }
-    }) {
-        Ok(_) => true,
-        Err(error) => {
-            aterm_log::warn!("subscription worker {index} could not start: {error}");
-            false
-        }
-    }
-}
-
 /// The same admitted Commit gate and process witness that protect PTY adoption.
 /// No raw environment flag or PID can grant control-socket takeover authority.
 #[cfg(unix)]
@@ -3644,7 +3554,7 @@ impl IncomingControlHandoff {
             bind_control_listener(
                 _plan,
                 Some(&self.gate),
-                || self.parent.still_alive(),
+                |deadline| self.parent.exited_by(deadline),
                 |pid| self.parent.owns_retiring_socket(pid),
                 Some(&self.identity),
             )
@@ -3792,17 +3702,22 @@ const HANDOFF_BIND_WAIT: std::time::Duration = std::time::Duration::from_secs(2)
 /// stopped listening. The reader gate is shared with the control worker, so a
 /// rejected candidate never touches the parent's socket, token or discovery.
 /// Runs on the control worker, never the event loop.
+///
+/// `parent_exited(deadline)` waits for the attested predecessor's exit: `true`
+/// once it has exited, `false` at `deadline` with it still running
+/// ([`crate::seamless::AttestedParent::exited_by`]). It and `parent_owns_peer`
+/// are asked only with a `handoff_gate`.
 fn bind_control_listener(
     plan: &control_auth::SocketPlan,
     handoff_gate: Option<&crate::spawn::DeferredReaderGate>,
-    parent_alive: impl Fn() -> bool,
+    parent_exited: impl FnMut(std::time::Instant) -> bool,
     parent_owns_peer: impl Fn(u32) -> bool,
     identity: Option<&crate::control_socket_identity::SocketIdentity>,
 ) -> Option<BoundControl> {
     bind_control_listener_within(
         plan,
         handoff_gate,
-        parent_alive,
+        parent_exited,
         parent_owns_peer,
         identity,
         HANDOFF_BIND_WAIT,
@@ -3821,7 +3736,7 @@ fn bind_control_listener(
 fn bind_control_listener_within(
     plan: &control_auth::SocketPlan,
     handoff_gate: Option<&crate::spawn::DeferredReaderGate>,
-    parent_alive: impl Fn() -> bool,
+    mut parent_exited: impl FnMut(std::time::Instant) -> bool,
     parent_owns_peer: impl Fn(u32) -> bool,
     identity: Option<&crate::control_socket_identity::SocketIdentity>,
     handoff_wait: std::time::Duration,
@@ -3835,19 +3750,17 @@ fn bind_control_listener_within(
             return None;
         }
         // Commit's write precedes the parent's _exit by a few instructions.
-        // Wait on the attested process, not repeated socket connects: a live
-        // listener with a full backlog can block connect beyond any deadline.
-        // The ordinary strict socket probe below still refuses unrelated owners.
+        // Wait for the attested process's exit, not on repeated socket
+        // connects: a live listener with a full backlog can block connect
+        // beyond any deadline. The ordinary strict socket probe below still
+        // refuses unrelated owners.
         let deadline = std::time::Instant::now() + handoff_wait;
-        while parent_alive() {
-            if std::time::Instant::now() >= deadline {
-                aterm_log::warn!(
-                    "control socket {sock_path}: predecessor still alive after handoff Commit; \
-                     preserving its socket and token"
-                );
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        if !parent_exited(deadline) {
+            aterm_log::warn!(
+                "control socket {sock_path}: predecessor still alive after handoff Commit; \
+                 preserving its socket and token"
+            );
+            return None;
         }
         // Darwin can report process death before final socket teardown. A
         // successful connect must identify the attested predecessor before any
@@ -3965,7 +3878,17 @@ fn bind_control_listener_within(
         }
     };
     let _ = std::fs::remove_file(&sock_path);
-    let listener = bind_prepared_control_listener(plan, handoff_gate.is_some())?;
+    let policy = if handoff_gate.is_some() {
+        BindRetry::HANDOFF
+    } else {
+        BindRetry::STARTUP
+    };
+    let listener = bind_with_retry(
+        plan,
+        policy,
+        |path| CtlListener::bind(path),
+        std::thread::sleep,
+    )?;
     Some(BoundControl::bound(listener, token, sock_path))
 }
 
@@ -4002,110 +3925,120 @@ pub(crate) fn sweep_after_handoff(plan: Option<&control_auth::SocketPlan>) {
     );
 }
 
-const HANDOFF_BIND_ATTEMPTS: u32 = 3;
-
-/// A consumed handoff witness never authorizes another unlink. A failed bind
-/// may try again only while the path is demonstrably absent, within its budget.
-fn handoff_bind_retry_allowed(failed_attempt: u32, path_missing: bool) -> bool {
-    path_missing && failed_attempt < HANDOFF_BIND_ATTEMPTS
+/// What a failed control-socket bind may do to its path before binding again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnlinkRule {
+    /// Nothing. A consumed handoff witness never authorizes another unlink, so
+    /// a failed bind is tried again only while the path is demonstrably absent.
+    Never,
+    /// Remove the stale file after the pause. A shared explicit path (no
+    /// `latest` link) is probed first, since a sibling may have bound it while
+    /// this one slept; a per-instance path cannot be anyone else's.
+    Stale,
 }
 
-/// The handoff bind retry loop with its two OS effects passed in, so tests can
-/// fail a bind or place a foreign listener during backoff deterministically.
-fn bind_handoff_control_listener(
+/// How a control-socket bind recovers from a transient failure (an AV scan, a
+/// racing cleanup) rather than losing introspection for the process lifetime.
+#[derive(Clone, Copy, Debug)]
+struct BindRetry {
+    /// Binds in all, the first included.
+    attempts: u32,
+    /// The pause after failed bind `n` (from 1).
+    backoff: fn(u32) -> std::time::Duration,
+    unlink: UnlinkRule,
+}
+
+impl BindRetry {
+    /// Startup's, after its own live-owner refusal and unlink.
+    const STARTUP: Self = Self {
+        attempts: 3,
+        backoff: |_| std::time::Duration::from_millis(750),
+        unlink: UnlinkRule::Stale,
+    };
+
+    /// A committed handoff's, after its one authorized token rotation and
+    /// unlink. Never startup's stale-path policy, so an endpoint that arrives
+    /// during backoff is preserved.
+    const HANDOFF: Self = Self {
+        attempts: 3,
+        backoff: |attempt| std::time::Duration::from_millis(50 * u64::from(attempt)),
+        unlink: UnlinkRule::Never,
+    };
+
+    /// May bind `failed_attempt`'s failure be followed by another, within the
+    /// budget? Judged before the pause, so a refusal pays none. `path_missing`:
+    /// nothing is at the path, not even a dangling symlink.
+    fn retry_allowed(self, failed_attempt: u32, path_missing: bool) -> bool {
+        failed_attempt < self.attempts
+            && match self.unlink {
+                UnlinkRule::Never => path_missing,
+                UnlinkRule::Stale => true,
+            }
+    }
+}
+
+/// Bind `plan`'s path under `policy`, once the caller has provisioned the
+/// token and removed the path. `bind` and `pause` are its two OS effects,
+/// passed in so tests can fail a bind or place a foreign listener during
+/// backoff deterministically.
+fn bind_with_retry(
     plan: &control_auth::SocketPlan,
+    policy: BindRetry,
     mut bind: impl FnMut(&str) -> std::io::Result<CtlListener>,
     mut pause: impl FnMut(std::time::Duration),
 ) -> Option<CtlListener> {
-    for attempt in 1..=HANDOFF_BIND_ATTEMPTS {
-        match bind(&plan.sock_path) {
-            Ok(listener) => return Some(listener),
-            Err(error) => {
-                aterm_log::warn!(
-                    "control socket handoff bind failed at {} (attempt {attempt}/{HANDOFF_BIND_ATTEMPTS}): {error}",
-                    plan.sock_path
-                );
-                // symlink_metadata treats a dangling symlink as occupied too.
-                // No connect probe: a full foreign backlog can look stale.
-                let missing = std::fs::symlink_metadata(&plan.sock_path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-                if !handoff_bind_retry_allowed(attempt, missing) {
-                    crate::logging::stderr_line!(
-                        "aterm-gui: control socket handoff bind could not complete at {}; preserving any replacement endpoint",
-                        plan.sock_path
-                    );
-                    return None;
-                }
-                pause(std::time::Duration::from_millis(50 * u64::from(attempt)));
-            }
-        }
-    }
-    None
-}
-
-/// Bind after the caller's one authorized token rotation and path removal.
-/// Handoff retries bind only, never startup's stale-path unlink policy.
-fn bind_prepared_control_listener(
-    plan: &control_auth::SocketPlan,
-    handoff: bool,
-) -> Option<CtlListener> {
-    if handoff {
-        return bind_handoff_control_listener(
-            plan,
-            |path| CtlListener::bind(path),
-            std::thread::sleep,
-        );
-    }
     let sock_path = plan.sock_path.as_str();
-    // Retry transient bind failures (AV scan, racing cleanup) with a short delay
-    // rather than losing introspection for the process lifetime.
-    let mut listener = None;
-    let max_attempts = 3u32;
-    for attempt in 1..=max_attempts {
-        match CtlListener::bind(sock_path) {
-            Ok(l) => {
+    let attempts = policy.attempts;
+    for attempt in 1..=attempts {
+        let error = match bind(sock_path) {
+            Ok(listener) => {
                 if attempt > 1 {
                     aterm_log::info!(
                         "control socket bind succeeded on retry {attempt} at {sock_path}"
                     );
                 }
-                listener = Some(l);
-                break;
+                return Some(listener);
             }
-            Err(e) => {
+            Err(error) => error,
+        };
+        aterm_log::warn!(
+            "control socket bind failed at {sock_path} (attempt {attempt}/{attempts}): {error}"
+        );
+        crate::logging::stderr_line!(
+            "aterm-gui: control socket bind failed at {sock_path} \
+             (attempt {attempt}/{attempts}): {error}"
+        );
+        // symlink_metadata treats a dangling symlink as occupied too. No
+        // connect probe: a full foreign backlog can look stale.
+        let missing = std::fs::symlink_metadata(sock_path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if !policy.retry_allowed(attempt, missing) {
+            let why = if attempt < attempts {
+                "its path is occupied; preserving the endpoint there"
+            } else {
+                "out of bind attempts"
+            };
+            aterm_log::warn!("control socket {sock_path} disabled: {why}");
+            crate::logging::stderr_line!("aterm-gui: control socket {sock_path} disabled: {why}");
+            return None;
+        }
+        pause((policy.backoff)(attempt));
+        if policy.unlink == UnlinkRule::Stale {
+            if plan.latest_link.is_none() && control_auth::socket_is_live(sock_path) {
                 aterm_log::warn!(
-                    "control socket bind failed at {sock_path} (attempt {attempt}/{max_attempts}): {e}"
+                    "control socket {sock_path} became live during retry; \
+                     running socketless rather than hijacking it"
                 );
                 crate::logging::stderr_line!(
-                    "aterm-gui: control socket bind failed at {sock_path} \
-                     (attempt {attempt}/{max_attempts}): {e}"
+                    "aterm-gui: control socket {sock_path} became live during \
+                     retry; running socketless rather than hijacking it"
                 );
-                if attempt < 3 {
-                    std::thread::sleep(std::time::Duration::from_millis(750));
-                    // Shared explicit paths: re-probe before unlinking, since a
-                    // sibling may have bound while we slept. Per-instance paths
-                    // cannot be owned by anyone else.
-                    if plan.latest_link.is_none() && control_auth::socket_is_live(sock_path) {
-                        aterm_log::warn!(
-                            "control socket {sock_path} became live during retry; \
-                             running socketless rather than hijacking it"
-                        );
-                        crate::logging::stderr_line!(
-                            "aterm-gui: control socket {sock_path} became live during \
-                             retry; running socketless rather than hijacking it"
-                        );
-                        return None;
-                    }
-                    let _ = std::fs::remove_file(sock_path);
-                }
+                return None;
             }
+            let _ = std::fs::remove_file(sock_path);
         }
     }
-    let Some(listener) = listener else {
-        aterm_log::warn!("control socket disabled: bind failed after 3 attempts");
-        return None;
-    };
-    Some(listener)
+    None
 }
 
 /// Spawn the control-listener thread: provision the token, bind the socket
@@ -4117,14 +4050,12 @@ fn bind_prepared_control_listener(
 /// verb. Without a token the socket is never bound.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the control server's full set of independent collaborators (active handle, store, subscribers, proxy, image queue, socket plan); a config struct would only move the list"
+    reason = "the control server's full set of independent collaborators (active handle, store, proxy, socket plan); a config struct would only move the list"
 )]
 pub(crate) fn spawn(
     active: ActiveHandle,
     store: Store,
-    subscribers: Subscribers,
     proxy: EventLoopProxy<Wake>,
-    queue: ImageQueue,
     plan: control_auth::SocketPlan,
     // The startup config generation already admitted; no second config read
     // before deciding on the optional fabric bridge and fleet listener.
@@ -4138,6 +4069,7 @@ pub(crate) fn spawn(
     // The handle the cold update lane retires the socket by before its `exec`
     // (`control_listener::Endpoint`); the supervised accept loop serves it.
     endpoint: crate::control_listener::Endpoint,
+    recovery_count_admission: Arc<crate::keeper_link::RecoveryCountAdmission>,
     // Only fixed-path incoming candidates wait: per-process sockets cannot collide.
     handoff: Option<IncomingControlHandoff>,
     // A per-process update candidate's Commit gate: bind at once, publish and
@@ -4170,7 +4102,7 @@ pub(crate) fn spawn(
             // threads; only the incoming fixed endpoint reserves before the Commit
             // gate permits a bind.
             let ordinary_binding = if handoff.is_none() {
-                let Some(binding) = bind_control_listener(&plan, None, || false, |_| false, None)
+                let Some(binding) = bind_control_listener(&plan, None, |_| true, |_| false, None)
                 else {
                     return;
                 };
@@ -4179,19 +4111,17 @@ pub(crate) fn spawn(
                 None
             };
             let connections_cap = control_connections_cap();
+            let subscriptions_cap = control_subscriptions_cap();
             let lanes = control_lanes::Lanes::new(control_lanes::LaneLimits {
                 rpc: CONTROL_WORKERS,
                 wait: CONTROL_WAIT_WORKERS,
                 inline: CONTROL_INLINE_WAITS,
                 open: connections_cap,
+                subscriptions: subscriptions_cap,
             });
-            let subscriptions_cap = control_subscriptions_cap();
-            let subscription_dispatch = Arc::new(SubscriptionDispatch::new(subscriptions_cap));
-            let context_slot = Arc::new(std::sync::OnceLock::new());
-            let workers = lanes.start();
-            let subscription_workers =
-                spawn_subscription_workers(&subscription_dispatch, &context_slot);
-            if !control_lanes_prepared(workers, subscription_workers) {
+            let started = lanes.start();
+            let workers = started.rpc;
+            if !control_lanes_prepared(workers, started.subscriptions) {
                 aterm_log::warn!("control startup refused: no runnable RPC or subscription lane");
                 crate::logging::stderr_line!(
                     "aterm-gui: control startup refused: no runnable RPC or subscription lane"
@@ -4219,26 +4149,18 @@ pub(crate) fn spawn(
             let worker_context = Arc::new(ControlWorkerContext {
                 active: active.clone(),
                 store: store.clone(),
-                subscribers: subscribers.clone(),
                 proxy: proxy.clone(),
-                image_queue: queue.clone(),
                 token: token.clone(),
                 sock_dir: sock_dir.clone(),
-                subscriptions: subscription_dispatch.clone(),
+                recovery_count_admission,
             });
             // No stream enters any queue before this context is available.
-            let _ = context_slot.set(worker_context.clone());
             lanes.publish(worker_context.clone());
             // A bridge attached later must never find a half-built process.
             let _ = BRIDGE_CONTEXT.set(worker_context.clone());
             if workers != CONTROL_WORKERS {
                 aterm_log::warn!(
                     "control socket started with {workers}/{CONTROL_WORKERS} connection workers"
-                );
-            }
-            if subscription_workers != CONTROL_SUBSCRIPTION_WORKERS {
-                aterm_log::warn!(
-                    "control socket started with {subscription_workers}/{CONTROL_SUBSCRIPTION_WORKERS} subscription workers"
                 );
             }
             // The service is actually runnable. Only now authorize exit cleanup,
@@ -4276,7 +4198,7 @@ pub(crate) fn spawn(
             // The one line whose ABSENCE from the file log now positively means
             // "control setup failed before bind" (every failure branch warns above).
             aterm_log::info!(
-                "control socket listening at {sock_path} ({workers} RPC lanes, up to {CONTROL_WAIT_WORKERS} wait lanes and {CONTROL_INLINE_WAITS} waits on RPC lanes, up to {connections_cap} connections, {subscription_workers} subscription lanes grown up to {subscriptions_cap}; excess peers and waits get retry)"
+                "control socket listening at {sock_path} ({workers} RPC lanes, up to {CONTROL_WAIT_WORKERS} wait lanes and {CONTROL_INLINE_WAITS} waits on RPC lanes, up to {connections_cap} connections, up to {subscriptions_cap} subscription lanes; excess peers, waits and subscriptions get retry)"
             );
             #[cfg(not(windows))]
             crate::logging::stderr_line!(
@@ -4303,16 +4225,20 @@ pub(crate) fn spawn(
             // it wrote at Commit (`identity_claim`). No-op without a handoff.
             crate::identity_claim::settle_transferred();
             // Every `aterm ctl` begins with `version`, whose reply carries the
-            // executable's content signature (a hash of tens of MB). Compute it once
-            // here, off every lane; a racing probe waits on the same `OnceLock`.
-            let _ = crate::qos::spawn_lane_thread(
-                "aterm-build-signature",
-                crate::qos::Role::Responsive,
-                || {
-                    // A lane may be waiting on this result: never below the lanes.
-                    let _ = crate::build_info::binary_signature();
-                },
-            );
+            // executable's content signature. Where that is a hash of tens of MB (off
+            // macOS, and an unsigned x86_64 macOS dev build), compute it once here, off
+            // every lane; a racing probe waits on the same `OnceLock`. A signed macOS
+            // build's is the kernel's code directory hash, one syscall, so no thread.
+            if crate::build_info::binary_signature_reads_the_file() {
+                let _ = crate::qos::spawn_lane_thread(
+                    "aterm-build-signature",
+                    crate::qos::Role::Responsive,
+                    || {
+                        // A lane may be waiting on this result: never below the lanes.
+                        let _ = crate::build_info::binary_signature();
+                    },
+                );
+            }
             // The fabric bridge, off unless `[fabric] command` (or a development seam)
             // is set. Launched after the bind, the lanes and `BRIDGE_CONTEXT`, so its
             // inherited connection is served by a complete process; it uses none of
@@ -4447,227 +4373,216 @@ pub(crate) fn accept_error_backoff(
     Some(prev.map_or(FIRST, |p| (p * 2).min(CAP)))
 }
 
-/// Resolve a stable-id selector to a child this aterm holds authority over and
-/// its live socket path. Shared by `@`-first verbs and `subscribe`. Fail
-/// closed: locally hosted sids are not hops, unspawned children have no entry,
-/// and a nonce mismatch (relaunched child) is rejected.
-fn resolve_proxy_child(
-    sid: &SessionId,
-    sock_dir: &std::path::Path,
-) -> Option<(crate::proxy::ProxyEntry, String)> {
-    let entry = crate::proxy::lookup_child(sid)?;
-    let (sock_path, nonce) = crate::proxy::read_graph_entry(sock_dir, sid)?;
-    if !entry.nonce.ct_eq(&nonce) {
-        return None; // graph entry is for a DIFFERENT launch — fail closed
-    }
-    // Confine the discovered socket to our runtime dir before dialing with the
-    // edge token: the graph entry is same-uid writable, so the nonce check alone
-    // cannot stop a redirect to an attacker socket. Fail closed.
-    let sock_path = crate::control_auth::confine_proxy_sock(sock_dir, &sock_path)?;
-    Some((entry, sock_path))
-}
-
-/// Resolve a stable-id selector to a sibling instance's socket: a session hosted
-/// by another same-uid aterm this process did not spawn, found through its
-/// published graph entry.
+/// Resolve a stable-id selector to the socket of the instance that hosts it: a
+/// session another same-uid aterm hosts (one this process spawned, one that
+/// one spawned, or an instance opened separately), found through the graph
+/// entry that instance published.
 ///
 /// Fail-closed guards, in order:
 /// * a locally hosted sid is not a hop ([`proxy_forward_plan`] checks first);
 /// * no graph entry means unknown sid;
 /// * the socket path must confine to our runtime dir
-///   ([`crate::control_auth::confine_proxy_sock`]);
-/// * self-dial guard: an entry naming our own socket is stale and refused;
-/// * the socket must have a live listener;
-/// * the sibling's per-launch token must be readable
-///   ([`crate::proxy::read_sibling_token`]), the credential any same-uid client
-///   could use directly.
+///   ([`crate::control_auth::confine_proxy_sock`]): the entry is same-uid
+///   writable, and the forward presents the token beside the socket it dials;
+/// * self-dial guard: an entry naming our own socket is stale and refused.
 ///
-/// The token is read only to decide; the forward reads the token beside the
-/// socket after connecting ([`crate::proxy::ForwardToken::BesideSocket`]), since
-/// an update successor may take the socket in between.
-fn resolve_sibling(sid: &SessionId, sock_dir: &std::path::Path) -> Option<String> {
+/// Whether anything listens there, and the token to present, are the forward's
+/// own connect's to find ([`crate::proxy::connect_hop`]): no probe connection
+/// is made here, and the token is read once the connection exists, since an
+/// update successor may take the socket in between.
+fn resolve_sibling(sid: Sid<'_>, sock_dir: &std::path::Path) -> Option<String> {
     let (sock_path, _nonce) = crate::proxy::read_graph_entry(sock_dir, sid)?;
     let sock_path = crate::control_auth::confine_proxy_sock(sock_dir, &sock_path)?;
     if crate::proxy::self_sock_path().as_deref() == Some(sock_path.as_str()) {
         return None; // stale entry for a session we no longer host — never self-dial
     }
-    if !crate::control_auth::socket_is_live(&sock_path) {
-        return None; // dead instance leftovers — swept later, never dialed
-    }
-    crate::proxy::read_sibling_token(&sock_path)?;
     Some(sock_path)
 }
 
-/// The one session a `subscribe` names, read from its text alone (`rest` is the
-/// line after the verb): `Some((sid, tail))` for a single `@<sid>`, `tail` being
-/// the line after that selector; `None` for self (`@.`), a bare `@`, a local id, a
-/// list, `@*` (this instance's live target set, never one session) or no
-/// selector. [`proxy_forward_plan`] relays only such a session and
-/// [`is_wait_request`] classes the same text, so whether a `subscribe` is
-/// relayed and which lane it takes cannot disagree.
-fn subscribe_session(rest: &str) -> Option<(SessionId, &str)> {
-    let rest = rest.trim_start();
-    let (token, tail) = rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len()));
-    let body = token.strip_prefix('@')?;
-    if body == "*" || body.contains(',') {
-        return None;
-    }
-    match Selector::parse(body)? {
-        Selector::Sid(sid) => Some((sid, tail)),
-        Selector::SelfTok | Selector::Local(_) => None,
-    }
-}
-
-/// Decide whether `line` from `scope` must be forwarded to another instance,
-/// returning `(target_sock_path, first_line)`, else `None` (handle locally).
-/// Two hop kinds, in order:
+/// The session `request` from `scope` would be relayed to, if it names one on
+/// another instance: an Owner-class connection's request whose verb acts on a
+/// session or an instance (its row's target is [`Target::Session`] or
+/// [`Target::App`]) and names one stable id, an explicit `@<sid>` or the one
+/// session a selectorless `subscribe` names second
+/// ([`control_request::subscribe_target`]). Pure: whether the store hosts it
+/// is the caller's question.
 ///
-/// 1. Spawned child ([`resolve_proxy_child`]): forwarded with the per-op edge
-///    token minted at spawn, the selector rewritten to `@.` so the child runs
-///    the verb on itself and cannot re-forward.
-/// 2. Sibling instance ([`resolve_sibling`]): forwarded with the sibling's own
-///    per-launch token (Owner there), keeping `@<sid>`. Only Owner-scope callers
-///    reach this, and the credential is one any same-uid client could read. The
-///    forward reads the token beside the socket after connecting
-///    ([`crate::proxy::ForwardToken`]).
+/// An Edge never forwards (it falls through to local resolution, which denies
+/// the cross-process sid), and a [`Target::Meta`] verb answers here whatever
+/// it names, as the far instance would. [`proxy_forward_plan`] and
+/// [`is_wait_request`] both ask this, so whether a line is relayed and which
+/// lane it takes cannot disagree.
 ///
-/// Pure, so the security decisions are unit-testable without a relay.
-fn proxy_forward_plan(
-    line: &str,
-    scope: Scope,
-    store: &Store,
-    sock_dir: &std::path::Path,
-) -> Option<(String, crate::proxy::ForwardLine)> {
-    // Only Owner-class scopes forward; an Edge falls through to local
-    // resolution, which denies the cross-process sid.
+/// [`Target::Session`]: aterm_types::control_verbs::Target::Session
+/// [`Target::App`]: aterm_types::control_verbs::Target::App
+/// [`Target::Meta`]: aterm_types::control_verbs::Target::Meta
+fn relay_candidate(request: &Request, scope: Scope) -> Option<Sid<'_>> {
+    use aterm_types::control_verbs::Target;
     if !scope.is_owner_class() {
         return None;
     }
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    // A sid this instance hosts is a normal in-process target, never a hop on
-    // either path — asked once per request, before both resolvers.
-    let hosted = |sid: &SessionId| {
-        store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_sid(sid)
-            .is_some()
-    };
-
-    // `subscribe` takes its selector second (`subscribe @<sel> <streams> …`), so
-    // handle it here; only a single remote session forwards
-    // ([`subscribe_session`]), a list or `@*` stays local.
-    if let Some(rest) = line.strip_prefix("subscribe ") {
-        let (sid, tail) = subscribe_session(rest)?;
-        if hosted(&sid) {
-            return None;
+    match request.form()?.row.target {
+        Target::Session | Target::App => {}
+        Target::Meta => return None,
+    }
+    let head = request.head();
+    match head.selector {
+        Some(Selector::Sid(sid)) => Some(sid),
+        None if head.verb == "subscribe" => {
+            control_request::subscribe_target(head.rest).map(|(sid, _)| sid)
         }
-        let op = required_op("subscribe")?; // ReadScreen
-        if let Some((entry, sock_path)) = resolve_proxy_child(&sid, sock_dir) {
-            let tok = entry.token_for(op)?;
-            // Rewrite the child's selector to `@.` while preserving the streams + flags.
-            let rewritten = format!("subscribe @.{tail}");
-            return Some((
-                sock_path,
-                crate::proxy::ForwardLine::edge(tok.to_hex(), rewritten),
-            ));
-        }
-        // Sibling hop: keep the selector (the sibling resolves the sid itself).
-        let sock_path = resolve_sibling(&sid, sock_dir)?;
-        return Some((
-            sock_path,
-            crate::proxy::ForwardLine::sibling(line.to_string()),
-        ));
+        _ => None,
     }
-
-    let (first, verb_line) = line.split_once(' ')?;
-    let sel_body = first.strip_prefix('@')?; // no @selector → local self path
-    let Some(Selector::Sid(sid)) = Selector::parse(sel_body) else {
-        return None; // only stable-id selectors cross processes
-    };
-    if hosted(&sid) {
-        return None;
-    }
-    let verb = verb_line.split_whitespace().next().unwrap_or("");
-    // Only op-classed verbs (read/write/signal) cross processes — identity /
-    // privilege verbs (`grant`/`whoami`/...) stay strictly local on BOTH hops.
-    let op = required_op(verb)?;
-    if let Some((entry, sock_path)) = resolve_proxy_child(&sid, sock_dir) {
-        let tok = entry.token_for(op)?;
-        // The child is the DIRECT target: rewrite its selector to `@.` (run on self).
-        let rewritten = format!("@. {verb_line}");
-        return Some((
-            sock_path,
-            crate::proxy::ForwardLine::edge(tok.to_hex(), rewritten),
-        ));
-    }
-    // Sibling hop keeps `@<sid>` so the sibling resolves among its own tabs.
-    //
-    // A relaunched child (nonce mismatch above) falls through here on purpose:
-    // it is reachable like any sibling, with its own token, never the stale
-    // edge tokens.
-    let sock_path = resolve_sibling(&sid, sock_dir)?;
-    Some((
-        sock_path,
-        crate::proxy::ForwardLine::sibling(line.to_string()),
-    ))
 }
 
-/// If `line` targets a session this process does not host, forward the whole
+/// The socket of the instance `request` from `scope` must be forwarded to, or
+/// `None` to handle it locally: a [`relay_candidate`] this instance does not
+/// host whose graph entry [`resolve_sibling`] accepts. The line goes as it
+/// came, selector kept, presented with the host's own per-launch token (Owner
+/// there), so the host resolves the session among its own tabs; the credential
+/// is one any same-uid client could read.
+///
+/// Pure (no connection), so the security decisions are unit-testable without a
+/// relay.
+fn proxy_forward_plan(
+    request: &Request,
+    scope: Scope,
+    store: &Store,
+    sock_dir: &std::path::Path,
+) -> Option<String> {
+    let sid = relay_candidate(request, scope)?;
+    // A sid this instance hosts is a normal in-process target, never a hop.
+    let hosted = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_selector(&Selector::Sid(sid))
+        .is_some();
+    if hosted {
+        return None;
+    }
+    resolve_sibling(sid, sock_dir)
+}
+
+/// If `request` targets a session this process does not host, forward the whole
 /// connection ([`proxy_forward_plan`]) and relay bytes, returning `true` (the
 /// caller then ends the connection); `false` for a local request.
-fn try_proxy_forward<R: Read>(
-    line: &str,
+///
+/// The forward's connect is its liveness test, made before the connection is
+/// touched: a stale entry ([`crate::proxy::ForwardError::NotAHop`]: nothing
+/// listening, no token beside the socket) returns `false`, leaving the read
+/// timeout and the bytes `reader` already holds to the local dispatch, which
+/// answers `ERR no such session`.
+fn try_proxy_forward(
+    request: &Request,
     scope: Scope,
     store: &Store,
     sock_dir: &std::path::Path,
     client: &CtlStream,
-    reader: &mut BufReader<R>,
+    reader: &mut control_lanes::LaneReader<'_>,
 ) -> bool {
-    let Some((sock_path, first_line)) = proxy_forward_plan(line, scope, store, sock_dir) else {
+    let Some(sock_path) = proxy_forward_plan(request, scope, store, sock_dir) else {
         return false;
+    };
+    let reply = |line: &str| {
+        let _ = (&*client).write_all(line.as_bytes());
+        let _ = (&*client).flush();
+    };
+    // A failure before any byte reaches the host leaves the client stream
+    // untouched, so honor the contract and answer ERR rather than a silent EOF.
+    // A connect timeout is reported as such; other failures say the host could
+    // not be reached.
+    let forward_error = |error: &std::io::Error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            reply(&format!("ERR forward: {error}\n"));
+        } else {
+            reply("ERR forward: could not reach the aterm that hosts that session\n");
+        }
+    };
+    let hop = match crate::proxy::connect_hop(&sock_path) {
+        Ok(hop) => hop,
+        Err(crate::proxy::ForwardError::NotAHop) => return false,
+        Err(crate::proxy::ForwardError::Unreachable(error)) => {
+            forward_error(&error);
+            return true;
+        }
     };
     // Relay takeover is intentionally long-lived. Keep the inherited socket
     // explicitly deadline-free even if handshake policy changes independently.
     if client.set_read_timeout(None).is_err() {
-        let _ = (&*client).write_all(b"ERR forward timeout setup\n");
-        let _ = (&*client).flush();
+        reply("ERR forward timeout setup\n");
         return true;
     }
-    // Forward anything the BufReader already read past the request line, then relay.
-    let pre = crate::proxy::drain_buffered(reader);
-    // A dial/handshake failure happens BEFORE any relay byte (the client stream is
-    // untouched), so honor the contract and answer ERR rather than a silent EOF.
-    if let Err(error) = crate::proxy::connect_and_relay(&sock_path, &first_line, client, &pre) {
-        // A connect timeout is reported as such; other failures say the host
-        // could not be reached.
-        let reply = if error.kind() == std::io::ErrorKind::TimedOut {
-            format!("ERR forward: {error}\n")
-        } else {
-            "ERR forward: could not reach the aterm that hosts that session\n".to_string()
-        };
-        let _ = (&*client).write_all(reply.as_bytes());
-        let _ = (&*client).flush();
+    // Forward anything already read past the request line, then relay.
+    let pre = reader.take_buffered();
+    if let Err(error) = crate::proxy::relay_hop(hop, request.line(), client, &pre) {
+        forward_error(&error);
     }
     true
 }
 
-/// Parse the optional selector and verb without resolving a terminal target.
-/// This is deliberately the first dispatch step for ordinary request lines.
-///
-/// A leading `@` that names nothing is no selector ([`Selector::parse`]): the
-/// token stays the verb, which no verb answers to, so even a path that missed
-/// [`empty_selector_refusal`] could not read it as the active session.
-fn request_head(line: &str) -> (Option<Selector>, &str, &str) {
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    let (first, tail) = line.split_once(' ').unwrap_or((line, ""));
-    let (selector, line) = match first.strip_prefix('@').and_then(Selector::parse) {
-        Some(selector) => (Some(selector), tail),
-        None => (None, line),
-    };
-    match line.split_once(' ') {
-        Some((verb, rest)) => (selector, verb, rest),
-        None => (selector, line, ""),
+/// One request line, read once where its lane first holds it whole: the
+/// request grammar's spans ([`control_request::Spans`]), its verb's table form
+/// ([`aterm_types::control_verbs::spec_for`]) and the body it announces. The
+/// lane's wait test, a frame's header, the relay, serve and dispatch all read
+/// this one parse, so no two stages split or classify a line two ways.
+struct Request {
+    line: String,
+    spans: control_request::Spans,
+    form: Option<Resolved>,
+    body: usize,
+}
+
+impl Request {
+    /// Read a request line, decoded ([`decode_request_line`]).
+    fn parse(line: String) -> Self {
+        let spans = control_request::Spans::of(&line);
+        let head = spans.head(&line);
+        let form = aterm_types::control_verbs::spec_for(head.verb, head.rest);
+        let body = announced_body(&head, form);
+        Self {
+            line,
+            spans,
+            form,
+            body,
+        }
+    }
+
+    /// The line as the client sent it.
+    fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// Its selector, verb and rest.
+    fn head(&self) -> Head<'_> {
+        self.spans.head(&self.line)
+    }
+
+    /// Its verb's table form; `None` for an unknown verb.
+    fn form(&self) -> Option<Resolved> {
+        self.form
+    }
+
+    /// The bytes of body that follow its line ([`announced_body`]).
+    fn body_len(&self) -> usize {
+        self.body
+    }
+
+    /// A counted frame's header (`feed-bin`, `paste-bin`: its row's
+    /// [`Body::Counted`]); `None` for any other request.
+    fn frame(&self) -> Option<FeedBinFrame<'_>> {
+        match self.form?.row.body {
+            Body::Counted { keyed } => Some(parse_frame_header(self.head().rest, keyed)),
+            Body::None | Body::PostLen => None,
+        }
+    }
+
+    /// A length-prefixed `post`'s announced body ([`post_frame_len`]); `None` for
+    /// an inline `post` and any other request.
+    fn post_frame(&self) -> Option<Result<usize, String>> {
+        match self.form?.row.body {
+            Body::PostLen => post_frame_len(self.head().rest),
+            Body::None | Body::Counted { .. } => None,
+        }
     }
 }
 
@@ -4703,58 +4618,94 @@ mod stray_args_tests {
     }
 }
 
+/// Build and meta verbs (`Access::AnyScopeMeta`: `version`, `update`, `help`,
+/// `verbs`, `privacy`), answered for any authenticated scope with no session.
 fn dispatch_meta_verb(
-    verb: &str,
-    rest: &str,
-    selector: Option<&Selector>,
+    form: &Resolved,
+    head: &Head<'_>,
     scope: Scope,
     proxy: &EventLoopProxy<Wake>,
-) -> Option<String> {
-    match verb {
-        "version" => {
-            Some(refuse_stray_args(verb, rest).unwrap_or_else(crate::build_info::control_line))
+) -> String {
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = *head;
+    // `privacy` — the macOS consent posture. Instance-wide and self-scoped:
+    // unlike the other meta verbs (whose answer is the same whoever is
+    // named, so a selector is merely ignored), this one aggregates PER
+    // SESSION, so a selector would read as "the posture of that session"
+    // and be silently wrong. It is rejected, as the verb's help states.
+    // The scope goes with it: an edge's report lists only the sessions it
+    // may read, never the roster `sessions` withholds from it.
+    let privacy = |json: bool, rest: &str| match selector {
+        None | Some(Selector::SelfTok) => {
+            crate::control_privacy::cmd_privacy(json, rest, scope, proxy)
         }
-        "update" => Some(cmd_update(rest, scope, proxy)),
-        "help" | "verbs" => Some(cmd_help(rest)),
-        // `privacy` — the macOS consent posture. Instance-wide and self-scoped:
-        // unlike the other meta verbs (whose answer is the same whoever is
-        // named, so a selector is merely ignored), this one aggregates PER
-        // SESSION, so a selector would read as "the posture of that session"
-        // and be silently wrong. It is rejected, as the verb's help states.
-        // The scope goes with it: an edge's report lists only the sessions it
-        // may read, never the roster `sessions` withholds from it.
-        "privacy" => Some(match selector {
-            None | Some(Selector::SelfTok) => {
-                crate::control_privacy::cmd_privacy(rest, scope, proxy)
-            }
-            Some(_) => crate::control_privacy::no_selector_error().to_string(),
-        }),
-        _ => None,
+        Some(_) => crate::control_privacy::no_selector_error().to_string(),
+    };
+    match json_ask(form, verb, rest) {
+        JsonAsk::No => {}
+        JsonAsk::Refuse(refusal) => return refusal,
+        JsonAsk::Emit(body) => {
+            return match verb {
+                "privacy" => privacy(true, &body),
+                // A JSON-emitting row with no emitter here: one `ERR` line.
+                _ => no_handler(verb),
+            };
+        }
+    }
+    match verb {
+        "version" => refuse_stray_args(verb, rest).unwrap_or_else(crate::build_info::control_line),
+        "update" => cmd_update(rest, scope, proxy),
+        "help" | "verbs" => cmd_help(rest),
+        "privacy" => privacy(false, rest),
+        _ => no_handler(verb),
     }
 }
 
-/// Dispatch app-level verbs without a PTY mirror; an optional terminal only
-/// fills the `metrics` rows/cols while the front is a terminal.
+/// The App-target verbs' arms, past [`dispatch_app`]'s route and gates. `aim` is
+/// the window an aimed `spawn`, `tab` or `panes` acts on, the session an aimed
+/// `theme session` or `theme palette session` colours, and the session whose tab
+/// an `edit` opens its view beside; every other arm acts on the front window.
+/// `active_term` (the front terminal, if any) only fills the `metrics` rows/cols.
 ///
 /// Only owner-class scopes reach this (`native_control_decision` denies edges
 /// every App verb), so exit-ledger attribution for `tab close` / `invoke
 /// CloseTab` is by kind, `ctl` or `bridge`
 /// ([`control_session::caller_actor_of`] with `None`).
-#[allow(clippy::too_many_arguments)]
 fn dispatch_app_verb(
     verb: &str,
     rest: &str,
-    scope: Scope,
-    proxy: &EventLoopProxy<Wake>,
-    sock_dir: &std::path::Path,
+    form: &Resolved,
+    aim: &AppAim,
+    cx: &DispatchCx<'_>,
     active_term: Option<&Arc<Mutex<Terminal>>>,
     typist: Option<Arc<crate::typed_by::Caller>>,
 ) -> ControlReply {
-    let response = match verb {
-        "window" => return control_media::cmd_window(proxy, rest, sock_dir),
-        "video" => {
-            return control_media::cmd_video(proxy, rest, sock_dir, scope.is_owner_class());
+    let DispatchCx {
+        scope,
+        proxy,
+        sock_dir,
+        ..
+    } = *cx;
+    match json_ask(form, verb, rest) {
+        JsonAsk::No => {}
+        JsonAsk::Refuse(refusal) => return refusal.into(),
+        JsonAsk::Emit(body) => {
+            return match verb {
+                "metrics" => control_query::cmd_metrics_json(active_term, &body),
+                // A JSON-emitting row with no emitter here: one `ERR` line.
+                _ => no_handler(verb),
+            }
+            .into();
         }
+    }
+    let response = match verb {
+        // `window` and `video` capture the front window: their artifact replies
+        // carry their own retention.
+        "window" => return control_media::cmd_window(proxy, rest, sock_dir),
+        "video" => return control_media::cmd_video(proxy, rest, sock_dir, scope.is_owner_class()),
         "chrome" => control_media::cmd_chrome(proxy),
         // `appearance`: the OS light/dark reading and what it drew; a dev
         // build can inject a flip.
@@ -4768,6 +4719,9 @@ fn dispatch_app_verb(
         // `login-notice`: the harness's login notices, listed; a development
         // build raises one for the front tab through the host's own path.
         "login-notice" => crate::login_notice_verb::cmd(proxy, rest),
+        // `card`: the harness card's constellation pin; a debug build pins
+        // it, so two builds' cards can be compared pixel for pixel.
+        "card" => crate::card_verb::cmd(proxy, rest),
         // `security-posture`: where Settings ▸ Security's MACOS ACCESS block's
         // posture comes from; a development build's headless instance can stage
         // a named fixture.
@@ -4779,11 +4733,16 @@ fn dispatch_app_verb(
         // `messages`: the message log, one row per record (the band and
         // Settings ▸ Messages as text). Instance state.
         "messages" => control_query::cmd_messages(proxy, rest),
-        "panes" => control_media::cmd_panes(proxy, None),
+        // `panes`: the split layout of the window whose active tab shows the
+        // aimed session (`OK 0` with `panes=0` when no window shows it), else
+        // the front window's; `@<sid> image` names the same window.
+        "panes" => control_media::cmd_panes(proxy, aim.session()),
         "controls" => control_media::cmd_controls(proxy, rest),
         "inspect" => control_media::cmd_inspect(proxy, rest),
         "open" => control_media::cmd_open(proxy, rest),
-        "edit" => crate::control_edit::cmd_edit(proxy, scope, None, rest),
+        // `@<sid> edit <file-uri>`: a fresh Editor view beside the aimed
+        // session's tab, answered once it is installed; unaimed, its usage.
+        "edit" => crate::control_edit::cmd_edit(proxy, scope, aim.session(), rest),
         "act" => control_media::cmd_act(proxy, rest),
         "invoke" => control_media::cmd_invoke(
             proxy,
@@ -4793,16 +4752,36 @@ fn dispatch_app_verb(
         ),
         "confirm" => control_media::cmd_confirm(proxy, rest),
         "rain" => control_media::cmd_rain(proxy, rest),
-        "theme" => control_media::cmd_theme(proxy, rest, None),
+        // `theme [status|list|palette|preview|revert|commit|set]`: the live theme
+        // and its transient preview lane. The session-scoped forms (`theme
+        // session …`, `theme palette session`) act on the aimed session, else on
+        // the front terminal.
+        "theme" => control_media::cmd_theme(proxy, rest, aim.session()),
         "fx" => control_media::cmd_fx(proxy, rest),
         "streak" => control_media::cmd_streak(proxy, rest),
         "tone" => control_media::cmd_tone(proxy, rest),
         "trail" => control_media::cmd_trail(proxy, rest),
         "kitty" => control_media::cmd_kitty(proxy, rest),
-        // No selector on this path, so no `@<sid>` aim; `window=` still aims.
-        "spawn" => control_media::cmd_spawn(proxy, rest, None),
+        // `spawn`: mint one new tab session and reply `OK <sid>`, addressable at
+        // once. Aimed, it lands in the window hosting the session on any tab
+        // (`App::window_of_session`), wider than `@<sid> image`, which needs the
+        // session on an active tab; where both answer they name the same window.
+        // `window=` still aims, and wins.
+        "spawn" => control_media::cmd_spawn(proxy, rest, aim.session()),
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
-        "tab" => control_input::cmd_tab(proxy, rest, control_session::caller_actor_of(scope, None)),
+        // `tab`: aimed, the tabs of the window hosting the session, so an agent in
+        // a background window can walk its own tabs; flagless, the front window's.
+        "tab" => {
+            let by = control_session::caller_actor_of(scope, None);
+            match aim.session() {
+                Some(session) => control_media::cmd_tab_aimed(proxy, rest, session, by),
+                None => control_input::cmd_tab(proxy, rest, by),
+            }
+        }
+        // `hwkey`: a real NSEvent posted through the OS event queue to the front
+        // window, the path a physical keypress takes, whatever it shows — a
+        // terminal or a native view such as Settings; it needs no session.
+        "hwkey" => control_input::cmd_hwkey(proxy, rest),
         "hover" => control_input::cmd_hover(proxy, rest),
         // Window-surface drives target the front window and need no PTY, so they
         // are answered here alone. `find` drives the find bar (`App::find_cmd`
@@ -4813,32 +4792,10 @@ fn dispatch_app_verb(
         "find" => control_input::cmd_find(proxy, rest),
         "pane" => control_input::cmd_pane(proxy, rest),
         "pointer" => control_input::cmd_pointer(proxy, rest),
-        // `hwkey`: a real NSEvent posted to the front window, whatever it shows —
-        // a terminal or a native view such as Settings; it needs no session.
-        "hwkey" => control_input::cmd_hwkey(proxy, rest),
         "metrics" => control_query::cmd_metrics(active_term, rest),
-        // EVERY App-target row is answered here: one this lane has no handler for
-        // says so, never falling through to the session resolver, which would
-        // answer "no active terminal" — a refusal naming the wrong cause.
-        _ => format!("ERR {verb}: no App-lane handler\n"),
+        _ => no_handler(verb),
     };
     response.into()
-}
-
-fn selector_is_live(store: &Store, selector: &Selector) -> bool {
-    match selector {
-        Selector::SelfTok => true,
-        Selector::Local(id) => store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_local(*id)
-            .is_some(),
-        Selector::Sid(id) => store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .by_sid(id)
-            .is_some(),
-    }
 }
 
 /// Tombstones for removed verbs: not advertised and without an authority
@@ -4947,14 +4904,13 @@ fn cmd_fabric_retire(words: &[&str], store: &Store) -> String {
 /// standing fleet hold is refused, so a fleet halt cannot be lifted locally.
 ///
 /// Every refusal is audited (edge tokens, selectors, Owner naming the fleet or
-/// touching a fleet hold). Both dispatch entries route `hold` here before the
+/// touching a fleet hold). [`dispatch_owner`] routes `hold` here before the
 /// silent generic `OwnerOnly` gate. Pure over `(rest, selector, scope, store)`.
 fn dispatch_hold_verb(
     rest: &str,
     selector: Option<&Selector>,
     scope: Scope,
     store: &Store,
-    subscribers: &Subscribers,
 ) -> String {
     use crate::fabric::{HOLD_DENIED, HoldIssuer, cmd_hold_waking};
 
@@ -4988,7 +4944,7 @@ fn dispatch_hold_verb(
     }
     // The `hold` mark wakes the session log's readers.
     let reply = cmd_hold_waking(store, rest, issuer, &|sid| {
-        wake_sid_watchers(store, subscribers, sid);
+        wake_sid_watchers(store, sid);
     });
     if reply == HOLD_DENIED {
         log_denial(
@@ -5058,11 +5014,11 @@ fn word_journaled(store: &Store, reply: String) -> String {
     durable.settle(reply, bound)
 }
 
-/// THE `meta` VERB'S ANSWER ([`handle`]'s arm, all of it but the proxy):
-/// `meta set|unset supervisor` first, then `harness_act`, then a non-Owner
-/// `questions` or `autopilot` write refused, then [`control_session::cmd_meta`]'s
-/// closed set. On an actual change `on_change` runs the arm's wakes
-/// (`Wake::MetaChanged`, the subscribers) BEFORE an Autopilot word's answer
+/// THE `meta` VERB'S ANSWER ([`serve_session_verb`]'s arm, all of it but the
+/// proxy): `meta set|unset supervisor` first, then `harness_act`, then a
+/// non-Owner `questions` or `autopilot` write refused, then
+/// [`control_session::cmd_meta`]'s closed set. On an actual change `on_change`
+/// runs the arm's wake (`Wake::MetaChanged`) BEFORE an Autopilot word's answer
 /// waits on the journal ([`word_journaled`]): the window repaints and the
 /// loop captures the word while the verb waits. One door for the dispatch
 /// and a test (`meta_line_for_test`), so the wait the answer takes is the
@@ -5105,6 +5061,48 @@ fn serve_meta(
     }
 }
 
+/// THE `meta` ARM, WIRED ([`serve_session_verb`]'s arm, all of it but its
+/// sink): [`serve_meta`], and on an actual change each wake
+/// [`meta_change_wakes`] lists handed to `post`, in order. The arm passes the
+/// event loop's proxy; the wire test (`meta_wakes_for_test`) a list. The loop
+/// over the wakes is this function's, so a wake the arm stops posting fails
+/// that test. An `events` watcher is woken by the change's `meta-change`
+/// record, not here.
+#[allow(clippy::too_many_arguments)]
+fn serve_meta_wired(
+    rest: &str,
+    term: &Arc<Mutex<Terminal>>,
+    master: i32,
+    session: u64,
+    ctx: &SessionCtx,
+    store: &Store,
+    scope: Scope,
+    post: &mut dyn FnMut(Wake),
+) -> String {
+    serve_meta(rest, term, master, session, ctx, store, scope, || {
+        for wake in meta_change_wakes(session, ctx.self_id.as_str(), rest) {
+            post(wake);
+        }
+    })
+}
+
+/// THE WAKES THE `meta` ARM POSTS on an actual change of session `session`
+/// (sid `sid`, line `rest`), in the order it posts them
+/// ([`serve_meta_wired`]): `Wake::MetaChanged` (the tab's repaint), then, for
+/// a proven self-claim's recorded act, the face that act tells
+/// (`Wake::HarnessFact`, FOREVER LAND §10.4: `landed@v1` lands the task, any
+/// other act reopens it).
+fn meta_change_wakes(session: u64, sid: &str, rest: &str) -> Vec<Wake> {
+    let mut wakes = vec![Wake::MetaChanged { session }];
+    if let Some(face) = control_session::harness_act_face(rest) {
+        wakes.push(Wake::HarnessFact {
+            sid: sid.to_string(),
+            fact: crate::HarnessFact::SelfTask(face),
+        });
+    }
+    wakes
+}
+
 /// Whether a `meta` line writes the Autopilot word (`set autopilot …`,
 /// `unset autopilot`): a word about typing ([`word_journaled`]).
 fn meta_moves_autopilot(rest: &str) -> bool {
@@ -5119,8 +5117,8 @@ const FABRIC_USAGE: &str =
 /// RECORD (`status story=`). Owner-only (a child edge must not write a choice
 /// for a session it does not drive) and session-scoped by selector: `@<sid>
 /// story chose`, or bare `story …` for the connection's own session, which
-/// falls through to `handle`; the `None` arm is defensive. Grammar is checked
-/// in [`control_query::cmd_story`].
+/// [`dispatch_owner`] takes from the front terminal; the `None` arm is
+/// defensive. Grammar is checked in [`control_query::cmd_story`].
 fn dispatch_story_verb(
     rest: &str,
     selector: Option<&Selector>,
@@ -5140,14 +5138,14 @@ fn dispatch_story_verb(
     }
     let session = match selector {
         Some(Selector::Local(n)) => *n,
-        Some(Selector::Sid(sid)) => {
+        Some(sel) if !sel.is_self() => {
             let g = store.read().unwrap_or_else(|p| p.into_inner());
-            match g.by_sid(sid) {
+            match g.by_selector(sel) {
                 Some(h) => h.local_id,
                 None => return "ERR no such session\n".to_string(),
             }
         }
-        None | Some(Selector::SelfTok) => match self_session {
+        _ => match self_session {
             Some(s) => s,
             None => return "ERR story: no session (name one: @<sid> story …)\n".to_string(),
         },
@@ -5185,9 +5183,8 @@ fn dispatch_rekey_verb(
     let (term, master, sid) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         let handle = match selector {
-            Some(Selector::Local(n)) => g.by_local(*n),
-            Some(Selector::Sid(sid)) => g.by_sid(sid),
-            None | Some(Selector::SelfTok) => return REKEY_USAGE.to_string(),
+            Some(sel) if !sel.is_self() => g.by_selector(sel),
+            _ => return REKEY_USAGE.to_string(),
         };
         match handle {
             Some(h) => (h.term.clone(), h.master, h.sid.clone()),
@@ -5346,9 +5343,7 @@ mod rekey_verb_tests {
     #[test]
     fn rekey_is_owner_class_and_names_its_tab() {
         let store = crate::session_store::new_store();
-        let tab = Some(Selector::Sid(aterm_session::SessionId::new(
-            "s-00000000000000000001",
-        )));
+        let tab = Some(Selector::parse("s-00000000000000000001"));
         assert_eq!(
             dispatch_rekey_verb(
                 "shell=4242",
@@ -5438,7 +5433,6 @@ fn dispatch_topic_verb(
     selector: Option<&Selector>,
     scope: Scope,
     store: &Store,
-    subscribers: &Subscribers,
     self_session: Option<u64>,
 ) -> String {
     if !scope.is_owner_class() {
@@ -5450,12 +5444,11 @@ fn dispatch_topic_verb(
         );
         return "ERR denied\n".to_string();
     }
-    let (local, ctx) = {
+    let ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         let handle = match selector {
-            Some(Selector::Local(n)) => g.by_local(*n),
-            Some(Selector::Sid(sid)) => g.by_sid(sid),
-            None | Some(Selector::SelfTok) => match self_session {
+            Some(sel) if !sel.is_self() => g.by_selector(sel),
+            _ => match self_session {
                 Some(s) => g.by_local(s),
                 None => {
                     return "ERR topic: no session (name one: @<sid> topic ls)\n".to_string();
@@ -5463,16 +5456,12 @@ fn dispatch_topic_verb(
             },
         };
         match handle {
-            Some(h) => (h.local_id, h.ctx.clone()),
+            Some(h) => h.ctx.clone(),
             None => return "ERR no such session\n".to_string(),
         }
     };
-    let (reply, changed) = crate::fabric::cmd_topic(&ctx, rest);
-    // The record drains NOW, not on the next 250 ms tick — `meta`'s rule.
-    if changed {
-        wake_watchers(subscribers, local);
-    }
-    reply
+    // A change records its `topic` row, which wakes the session's watchers.
+    crate::fabric::cmd_topic(&ctx, rest)
 }
 
 /// `fabric` sub-forms. `attach`'s argv is the line's whitespace words, never
@@ -5661,8 +5650,7 @@ fn cmd_fabric(rest: &str, store: &Store) -> String {
 }
 
 /// The bridge plane: the `Access::BridgeOnly` verbs `deliver`, `link`, `hello`,
-/// `outbox`, `outbox sent`, `log-take` and `log-landed`. `None` means not a
-/// bridge verb.
+/// `outbox`, `outbox sent`, `log-take` and `log-landed`.
 ///
 /// A LINE OF THE PLANE THIS ENDPOINT CANNOT PARSE is counted for the lane
 /// (`fabric::note_lane_fault`, `fabric status lane_faults=`): every one of
@@ -5687,11 +5675,7 @@ fn dispatch_bridge_verb(
     selector: Option<&Selector>,
     scope: Scope,
     store: &Store,
-    subscribers: &Subscribers,
-) -> Option<String> {
-    if !aterm_types::control_verbs::is_bridge_only(verb) {
-        return None;
-    }
+) -> String {
     if !matches!(selector, None | Some(Selector::SelfTok)) || !scope.is_bridge() {
         log_denial(
             AUDIT_SUBSYSTEM,
@@ -5699,11 +5683,11 @@ fn dispatch_bridge_verb(
             aterm_containment::mode_or_containment(),
             &format!("only the inherited bridge connection may run {verb}"),
         );
-        return Some("ERR denied\n".to_string());
+        return "ERR denied\n".to_string();
     }
     let generation = crate::fabric::lane_generation();
     // A `mail` or `mail-landed` mark wakes the session log's readers.
-    let log_wake = |sid: &aterm_session::SessionId| wake_sid_watchers(store, subscribers, sid);
+    let log_wake = |sid: &aterm_session::SessionId| wake_sid_watchers(store, sid);
     let reply = match verb {
         "deliver" => crate::fabric::cmd_deliver_waking(store, rest, &log_wake),
         // The bridge's own broker link, gated to the lane's incarnation. A
@@ -5742,7 +5726,7 @@ fn dispatch_bridge_verb(
     if reply.starts_with("ERR usage") {
         crate::fabric::note_lane_fault(generation);
     }
-    Some(reply)
+    reply
 }
 
 /// The words after `task` when `await`'s argument is the LIST form (`task`
@@ -5769,7 +5753,6 @@ fn dispatch_await_task(
     words: &[&str],
     active: &ActiveHandle,
     store: &Store,
-    subscribers: &Subscribers,
     scope: Scope,
 ) -> String {
     let args = match crate::task_record::parse_await_task(words, true) {
@@ -5778,19 +5761,20 @@ fn dispatch_await_task(
     };
     let mut held: Vec<(u64, Arc<SessionCtx>, Option<u64>)> = Vec::new();
     for target in &args.targets {
-        let Some(sel) = Selector::parse(&target.selector) else {
+        // A list element that names nothing is refused like a bare `@`
+        // ([`empty_selector_refusal`]), never read as the active tab.
+        if !aterm_types::control_verbs::selector_body_names_something(&target.selector) {
             return format!("{}\n", aterm_types::control_verbs::EMPTY_SELECTOR);
-        };
-        let resolved = match &sel {
-            Selector::SelfTok => Ok(resolve_active(active)),
-            Selector::Local(_) | Selector::Sid(_) => resolve_explicit(store, &sel),
-        };
-        let resolved = match resolved {
-            Ok(resolved) => resolved,
-            Err(refusal) => return refusal,
+        }
+        let sel = Selector::parse(&target.selector);
+        let resolved = match resolve(store, &sel) {
+            Resolution::SelfTok => resolve_active(active),
+            Resolution::Hosted(target) => Some(target),
+            Resolution::Missing => None,
+            Resolution::Ambiguous(refusal) => return refusal,
         };
         let Some((_, _, local_id, ctx)) = resolved else {
-            return if matches!(sel, Selector::SelfTok) {
+            return if sel.is_self() {
                 NO_ACTIVE_TERMINAL.to_string()
             } else {
                 format!("ERR no such session @{}\n", target.selector)
@@ -5821,7 +5805,6 @@ fn dispatch_await_task(
         args.combine,
         args.timeout_ms
             .unwrap_or(aterm_control::wire::WAIT_DEFAULT_MS),
-        subscribers,
     )
 }
 
@@ -5832,394 +5815,506 @@ fn no_handler(verb: &str) -> String {
     format!("ERR {verb} has no handler\n")
 }
 
-/// Handle requests whose authority/target class does not depend on a session.
-/// Returning `None` means the normal session/edge resolver must continue.
-/// `(selector, verb, rest)` is the line's [`request_head`], parsed once by
-/// [`dispatch_request`].
-#[allow(clippy::too_many_arguments)]
-fn dispatch_before_session(
-    selector: &Option<Selector>,
-    verb: &str,
-    rest: &str,
-    active: &ActiveHandle,
-    store: &Store,
-    subscribers: &Subscribers,
-    scope: Scope,
-    proxy: &EventLoopProxy<Wake>,
-    queue: &ImageQueue,
-    sock_dir: &std::path::Path,
-) -> Option<ControlReply> {
-    use aterm_types::control_verbs::{Access, Target};
+/// The class handler a request goes to ([`route`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// `Access::AnyScopeMeta`: [`dispatch_meta_verb`].
+    Meta,
+    /// `Access::BridgeOnly`: [`dispatch_bridge_verb`].
+    Bridge,
+    /// `Access::OwnerOnly`, whatever the target: [`dispatch_owner`].
+    Owner,
+    /// A scoped `Target::App` verb: [`dispatch_app`].
+    App,
+    /// A scoped session verb: [`dispatch_session`].
+    Session,
+}
 
+/// A request's route and table form, or the line that refuses it before any
+/// handler: a removed verb's tombstone ([`retired_verb_error`]), or `ERR unknown
+/// verb`. The route is the row's `(access, target)`, read once off the form the
+/// request was parsed with (a listed sub-form row shares its verb's access and
+/// target, which aterm-types asserts at compile time), so no handler
+/// re-classifies the verb and no arm can serve a verb the table does not list.
+fn route(verb: &str, form: Option<Resolved>) -> Result<(Route, Resolved), String> {
+    use aterm_types::control_verbs::{Access, Target as RowTarget};
     if let Some(error) = retired_verb_error(verb) {
-        return Some(error.into());
+        return Err(error);
     }
-    let Some(spec) = aterm_types::control_verbs::spec(verb) else {
-        return Some("ERR unknown verb (try: help)\n".into());
+    let Some(form) = form else {
+        return Err("ERR unknown verb (try: help)\n".to_string());
     };
-
-    if spec.access == Access::AnyScopeMeta {
-        return dispatch_meta_verb(verb, rest, selector.as_ref(), scope, proxy).map(Into::into);
-    }
-
-    // `log n`: the instance's node log (session log 5J-3), whatever terminal
-    // there is or is not; Owner-only like `brief all`, and no selector names
-    // it (node `n` is no session's).
-    if verb == "log" && crate::session_log_node::names_node_log(rest) {
-        return Some(node_log_reply(rest, selector.as_ref(), scope).into());
-    }
-
-    // Fleet reads and connection metadata work with no terminal; session
-    // authority mutations (`grant`/`revoke`/`whoami`) fall through and report
-    // the typed no-terminal error.
-    if spec.access == Access::OwnerOnly {
-        // `hold` first: it names its session as an argument, so a fleet halt must
-        // land even on a windowless instance, and `dispatch_hold_verb` audits
-        // each refusal where the generic gate would refuse silently.
-        if verb == "hold" {
-            return Some(
-                dispatch_hold_verb(rest, selector.as_ref(), scope, store, subscribers).into(),
-            );
-        }
-        // `topic` resolves its selector's session with no terminal, like `story`.
-        if verb == "topic" {
-            return match selector.as_ref() {
-                Some(sel @ (Selector::Local(_) | Selector::Sid(_))) => Some(
-                    dispatch_topic_verb(rest, Some(sel), scope, store, subscribers, None).into(),
-                ),
-                None | Some(Selector::SelfTok) => None,
-            };
-        }
-        // `story` resolves a selector-named session here, before the self-only
-        // gate; the bare form is resolved by `handle`.
-        if verb == "story" {
-            return match selector.as_ref() {
-                Some(sel @ (Selector::Local(_) | Selector::Sid(_))) => {
-                    Some(dispatch_story_verb(rest, Some(sel), scope, store, None, proxy).into())
-                }
-                None | Some(Selector::SelfTok) => None,
-            };
-        }
-        // `rekey` names its tab the same way, and needs no terminal of the
-        // connection's own: the tab it heals is the one the selector names.
-        if verb == "rekey" {
-            return Some(dispatch_rekey_verb(rest, selector.as_ref(), scope, store).into());
-        }
-        if let Some(reply) = fleet_survey(verb, rest, scope, store) {
-            return Some(reply.into());
-        }
-        if let Some(refusal) = owner_only_refusal(verb, selector.as_ref(), scope) {
-            return Some(refusal.into());
-        }
-        return match verb {
-            "sessions" => Some(match rest.trim() {
-                "bridge" => control_session::cmd_sessions_bridge(store),
-                "status" => control_session::cmd_sessions_status(proxy),
-                _ => refuse_stray_args(verb, rest)
-                    .unwrap_or_else(|| control_session::cmd_sessions_store(store, Some(proxy))),
-            }),
-            // The survey reads only what the sessions publish: answerable
-            // with no terminal, like `sessions`.
-            "survey" => Some(crate::survey::cmd_survey(
-                store,
-                rest,
-                crate::survey::SurveyLevel::Content,
-                usize::MAX,
-                &crate::survey::Here::now(),
-            )),
-            "who" => Some(
-                refuse_stray_args(verb, rest)
-                    .unwrap_or_else(|| control_session::cmd_who(store, subscribers)),
-            ),
-            // The exit ledger is a store read like `sessions` — the instance's
-            // past stays answerable with no terminal at all.
-            "exits" => Some(control_session::cmd_exits(store, rest)),
-            // The identity roster is a directory plus store read, so identities
-            // stay listable and forgettable with no terminal.
-            "identities" => Some(crate::agent_identity::cmd_identities(store, rest)),
-            // `appnotice <lane> <text>`: a pull-down row from outside the process;
-            // app state, answered with no terminal.
-            "appnotice" => Some(control_query::cmd_appnotice(proxy, rest)),
-            // `notice <post|progress|done|ask|dismiss|act> …`: the message band's write
-            // face; app state, answered with no terminal.
-            "notice" => Some(control_query::cmd_notice(proxy, rest)),
-            // `devtools hand-over [now]`: the window's Developer Tools hand-over; app
-            // state, answered with no terminal (a headless instance says so).
-            "devtools" => Some(control_query::cmd_devtools(proxy, rest)),
-            // `fabric status|attach`: this process's bridge supervisor, answered
-            // with no terminal (a windowless instance is the one that needs it).
-            "fabric" => Some(dispatch_fabric_verb(rest, selector.as_ref(), scope, store)),
-            _ => None,
-        }
-        .map(Into::into);
-    }
-
-    // `spec` is `verb`'s row already, so ask its class here rather than let the
-    // callee scan the table again for every non-bridge verb.
-    if spec.access == Access::BridgeOnly
-        && let Some(response) =
-            dispatch_bridge_verb(verb, rest, selector.as_ref(), scope, store, subscribers)
-    {
-        return Some(response.into());
-    }
-
-    // `await task @a,@b,…`: the list form names its targets as an argument, like
-    // `subscribe`, so it resolves them here, needing no terminal of the
-    // connection's own. A leading selector keeps the single form
-    // (`@<sid> await task`, answered by the session's `cmd_await`).
-    if verb == "await"
-        && selector.is_none()
-        && let Some(words) = await_task_list(rest)
-    {
-        return Some(dispatch_await_task(&words, active, store, subscribers, scope).into());
-    }
-
-    let principal = if scope.is_owner_class() {
-        NativeControlPrincipal::Owner
-    } else {
-        NativeControlPrincipal::Edge
+    let route = match (form.row.access, form.row.target) {
+        (Access::AnyScopeMeta, _) => Route::Meta,
+        (Access::BridgeOnly, _) => Route::Bridge,
+        (Access::OwnerOnly, _) => Route::Owner,
+        (Access::Scoped, RowTarget::App) => Route::App,
+        // A scoped row never targets `Meta` (asserted in aterm-types).
+        (Access::Scoped, RowTarget::Session | RowTarget::Meta) => Route::Session,
     };
+    Ok((route, form))
+}
 
-    // A bare `paste` with a native Editor in front has no ActiveSession: post the
-    // same InputEvent a human paste uses and let App::input enforce the native
-    // boundary. With a terminal front or an explicit selector, return None.
-    if verb == "paste"
-        && let Some(route) = sessionless_front_paste_event(
-            verb,
-            || control_input::paste_text(rest),
-            selector.as_ref(),
-            resolve_active(active).is_some(),
-            principal,
+/// What a request is dispatched with: its connection's scope and the instance
+/// state the class handlers read.
+struct DispatchCx<'a> {
+    active: &'a ActiveHandle,
+    store: &'a Store,
+    scope: Scope,
+    proxy: &'a EventLoopProxy<Wake>,
+    sock_dir: &'a std::path::Path,
+}
+
+/// Full request dispatch: [`route`] once, then the class handler. Classification
+/// precedes terminal resolution, so native-only windows stay controllable
+/// without a fabricated ActiveSession, and only the session and App handlers
+/// look a selector up.
+fn dispatch_request(request: &Request, cx: &DispatchCx<'_>) -> ControlReply {
+    let head = request.head();
+    let (route, form) = match route(head.verb, request.form()) {
+        Ok(routed) => routed,
+        Err(refusal) => return refusal.into(),
+    };
+    match route {
+        Route::Meta => dispatch_meta_verb(&form, &head, cx.scope, cx.proxy).into(),
+        Route::Bridge => dispatch_bridge_verb(
+            head.verb,
+            head.rest,
+            head.selector.as_ref(),
+            cx.scope,
+            cx.store,
         )
-    {
-        return Some(
-            match route {
-                Ok(event) => {
-                    control_input::input_reply_to_str(post_input_reply(proxy, vec![event]))
-                }
-                Err(error) => error.to_string(),
+        .into(),
+        Route::Owner => dispatch_owner(&head, cx, || {
+            resolve_active(cx.active).ok_or(NO_ACTIVE_TERMINAL)
+        })
+        .into(),
+        Route::App => dispatch_app(&head, &form, cx),
+        Route::Session => dispatch_session(&head, &form, cx),
+    }
+}
+
+/// Which session an owner-only request acts on ([`owner_aim`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OwnerAim {
+    /// Instance state, or a session named by argument or selector: answered with
+    /// no terminal.
+    Instance,
+    /// The connection's own session: the front terminal, else `ERR no active
+    /// terminal`.
+    OwnSession,
+}
+
+/// What an owner-only `verb` acts on: the connection's own session for `grant`,
+/// `revoke` and `whoami` (the authority of the session asking), and for `topic`
+/// and `story` with no selector or `@.`; everything else is instance state, so a
+/// windowless instance or a native tab in front still answers it.
+fn owner_aim(verb: &str, selector: Option<&Selector>) -> OwnerAim {
+    match verb {
+        "grant" | "revoke" | "whoami" => OwnerAim::OwnSession,
+        "topic" | "story" if selector.is_none_or(Selector::is_self) => OwnerAim::OwnSession,
+        _ => OwnerAim::Instance,
+    }
+}
+
+/// Owner-only verbs (`Access::OwnerOnly`): only an owner-class connection may run
+/// them, and a selector is refused ([`owner_only_refusal`]). `hold`, `rekey`,
+/// `topic` and `story` name their session by argument or selector and decide their
+/// own refusals, each audited, instead of that silent generic gate (`hold` first,
+/// so a fleet halt lands on a windowless instance). Then [`owner_aim`] decides
+/// once whether the verb needs `own`, which yields the front terminal or the line
+/// refusing its absence; no other owner verb asks for a terminal.
+fn dispatch_owner(
+    head: &Head<'_>,
+    cx: &DispatchCx<'_>,
+    own: impl FnOnce() -> Result<Target, &'static str>,
+) -> String {
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = *head;
+    let selector = selector.as_ref();
+    let DispatchCx {
+        store,
+        scope,
+        proxy,
+        ..
+    } = *cx;
+    match verb {
+        "hold" => return dispatch_hold_verb(rest, selector, scope, store),
+        // `rekey` heals the tab its selector names, never the connection's own.
+        "rekey" => return dispatch_rekey_verb(rest, selector, scope, store),
+        "topic" | "story" => {}
+        _ => {
+            // A fleet peer's `survey`, at the level its listener proved.
+            if let Some(reply) = fleet_survey(verb, rest, scope, store) {
+                return reply;
             }
-            .into(),
-        );
-    }
-
-    // A bare `key` with a native view in front reaches that view's keyboard
-    // handling through the same input seam a person's keypress takes.
-    if verb == "key"
-        && let Some(route) = sessionless_front_key_event(
-            rest,
-            selector.as_ref(),
-            resolve_active(active).is_some(),
-            principal,
-        )
-    {
-        return Some(
-            match route {
-                Ok(event) => {
-                    control_input::input_reply_to_str(post_input_reply(proxy, vec![event]))
-                }
-                Err(error) => error.to_string(),
+            if let Some(refusal) = owner_only_refusal(verb, selector, scope) {
+                return refusal;
             }
-            .into(),
-        );
-    }
-
-    // `resize px` names the window; like the paste lane: bare/self Owner only,
-    // App authority, the cell form untouched.
-    if verb == "resize"
-        && let Some(route) = sessionless_front_window_resize(
-            verb,
-            rest,
-            selector.as_ref(),
-            resolve_active(active).is_some(),
-            principal,
-        )
-    {
-        return Some(
-            match route {
-                Ok(event) => {
-                    control_input::input_reply_to_str(post_input_reply(proxy, vec![event]))
-                }
-                Err(error) => error.to_string(),
-            }
-            .into(),
-        );
-    }
-
-    // A native tab has a framebuffer but no terminal session, so a bare Owner
-    // `image` targets the front native window. `image read` and explicit
-    // selectors stay on the session path.
-    if verb == "image"
-        && resolve_active(active).is_none()
-        && scope.is_owner_class()
-        && matches!(selector, None | Some(Selector::SelfTok))
-        && rest.split_whitespace().next() != Some("read")
-    {
-        return Some(control_media::cmd_image(proxy, queue, rest, sock_dir, None));
-    }
-
-    // An aimed `spawn`/`tab`: for an Owner the selector reaches the session
-    // resolver; the App authority verdict still applies (see `aimed_app_lane`).
-    match aimed_app_lane(verb, selector.as_ref(), principal) {
-        Some(AimedAppLane::ResolveSession) => return None,
-        Some(AimedAppLane::Denied) => return Some("ERR denied\n".into()),
-        None => {}
-    }
-
-    if spec.target != Target::App {
-        return None;
-    }
-    let explicit_live = selector
-        .as_ref()
-        .is_none_or(|selector| selector_is_live(store, selector));
-    if !explicit_live {
-        return Some("ERR no such session\n".into());
-    }
-    match native_control_decision(
-        resolve_active(active).is_some(),
-        explicit_live,
-        principal,
-        NativeControlTarget::App,
-    ) {
-        NativeControlDecision::WithoutSession => {}
-        NativeControlDecision::Denied => return Some("ERR denied\n".into()),
-        NativeControlDecision::NoSuchSession => {
-            return Some("ERR no such session\n".into());
-        }
-        NativeControlDecision::ResolveSession | NativeControlDecision::NoActiveTerminal => {
-            return None;
         }
     }
-    // Fleet halt, App lane (design §5.3). These App-target verbs resolve no
-    // session, so the session dispatch's halt gate never sees their bare forms;
-    // `fabric::is_pty_reaching` decides generically. The fenced set:
-    //
-    // * `invoke`: `invoke Paste` writes the clipboard into the front PTY
-    //   (`App::paste_clipboard`), and `invoke SelectAll` + `copy` picks those
-    //   bytes from the session's screen.
-    // * `hwkey`: posts a real NSEvent, indistinguishable from a keypress.
-    // * `pointer`: moves aterm's pointer, reported to the program under DEC
-    //   1000/1002/1003.
-    // * `pane`: moves keyboard focus, and with it which session flagless verbs
-    //   drive.
-    // * `tab`: `tab close [N]` destroys a session (`App::close_tab_via_verb`).
-    // * `confirm`: `confirm yes` runs a parked close or quit (`close_confirm`).
-    //
-    // Checked after authorization so an unauthorized caller learns nothing.
-    // `app_halt_refusal` asks whether any session is held, not just the front
-    // one. Aimed forms (`@<sid> tab …`) are routed by `aimed_app_lane` and gated
-    // by the second `app_halt_refusal` call in the session dispatch. `open` of
-    // a gateway card (the palette, a tab's menu, the Overview) is the same
-    // question: each card is `invoke`'s rows behind a key.
-    // The person's own acts, where a development build stands a test in the
-    // person's place ([`control_media::person_invoke_act`]), are theirs under
-    // any hold.
-    if let Some(refusal) = crate::fabric::app_halt_refusal(store, verb)
-        .filter(|_| !(verb == "invoke" && control_media::person_invoke_act(rest)))
-        .or_else(|| crate::fabric::open_halt_refusal(store, verb, rest))
-    {
-        return Some(refusal.into());
+    let own_target = match owner_aim(verb, selector) {
+        OwnerAim::Instance => None,
+        OwnerAim::OwnSession => match own() {
+            Ok((_, _, session, ctx)) => Some((session, ctx)),
+            Err(refusal) => return refusal.to_string(),
+        },
+    };
+    let own_session = own_target.as_ref().map(|(session, _)| *session);
+    let own_ctx = own_target.as_ref().map(|(_, ctx)| ctx.as_ref());
+    match verb {
+        "topic" => dispatch_topic_verb(rest, selector, scope, store, own_session),
+        "story" => dispatch_story_verb(rest, selector, scope, store, own_session, proxy),
+        "sessions" => match rest.trim() {
+            "bridge" => control_session::cmd_sessions_bridge(store),
+            "status" => control_session::cmd_sessions_status(proxy),
+            _ => refuse_stray_args(verb, rest)
+                .unwrap_or_else(|| control_session::cmd_sessions_store(store, Some(proxy))),
+        },
+        // The survey reads only what the sessions publish: answerable with no
+        // terminal, like `sessions`.
+        "survey" => crate::survey::cmd_survey(
+            store,
+            rest,
+            crate::survey::SurveyLevel::Content,
+            usize::MAX,
+            &crate::survey::Here::now(),
+        ),
+        "who" => refuse_stray_args(verb, rest).unwrap_or_else(|| control_session::cmd_who(store)),
+        // The exit ledger is a store read like `sessions`: the instance's past
+        // stays answerable with no terminal at all.
+        "exits" => control_session::cmd_exits(store, rest),
+        // The identity roster is a directory plus store read, so identities stay
+        // listable and forgettable with no terminal.
+        "identities" => crate::agent_identity::cmd_identities(store, rest),
+        // The op-level authority primitives and their connection-grain twins
+        // share the repaint poke: a successful act moves the tab marks, which no
+        // funnel epoch would otherwise notice.
+        "grant" => on_own_session(own_ctx, verb, |ctx| {
+            poke_connections_on_ok(proxy, control_session::cmd_grant(ctx, scope, rest))
+        }),
+        // A revoke also reaches a closed session's still-revocable grants.
+        "revoke" => on_own_session(own_ctx, verb, |ctx| {
+            poke_connections_on_ok(
+                proxy,
+                control_session::cmd_revoke_with_closed(ctx, store, scope, rest),
+            )
+        }),
+        "whoami" => on_own_session(own_ctx, verb, |ctx| {
+            refuse_stray_args(verb, rest).unwrap_or_else(|| control_session::cmd_whoami(ctx, scope))
+        }),
+        // `connect`/`disconnect`: the declarative session-connection verbs. Their
+        // endpoints ride as `dst=`/`src=`, so they resolve both from the store and
+        // act on the destination's table.
+        "connect" => {
+            poke_connections_on_ok(proxy, control_session::cmd_connect(store, scope, rest))
+        }
+        "disconnect" => {
+            poke_connections_on_ok(proxy, control_session::cmd_disconnect(store, scope, rest))
+        }
+        // `flows`: the aggregated connection graph (pure read, no poke).
+        "flows" => control_session::cmd_flows(store, scope, rest),
+        // `raise <sid>`: raise the hosting window and select the tab (a
+        // main-thread hop; window and tab state is App-owned).
+        "raise" => control_session::cmd_raise(proxy, store, scope, rest),
+        // `appnotice <lane> <text>`: a pull-down row from outside the process.
+        "appnotice" => control_query::cmd_appnotice(proxy, rest),
+        // `notice <post|progress|done|ask|dismiss|act> …`: the message band's
+        // write face.
+        "notice" => control_query::cmd_notice(proxy, rest),
+        // `devtools hand-over [now]`: the window's Developer Tools hand-over (a
+        // headless instance says so).
+        "devtools" => control_query::cmd_devtools(proxy, rest),
+        // `fabric status|attach`: this process's bridge supervisor (a windowless
+        // instance is the one that needs it).
+        "fabric" => dispatch_fabric_verb(rest, selector, scope, store),
+        _ => no_handler(verb),
     }
-    let active = resolve_active(active);
-    // Unread-input gate (`input_stall`) for `hwkey`, `pointer` and `invoke Paste`
-    // against the session they write to; a leading `unread=ok` lifts it for one
-    // gesture, as on `send`/`key`. A slow read warns in the `OK` rather than
-    // refusing (owner, 2026-09-29).
-    let (unread_ok, rest) = control_input::take_app_unread_ok(verb, rest);
+}
+
+/// `act` on the connection's own session, which [`dispatch_owner`] resolved
+/// because [`owner_aim`] named it; an arm that [`owner_aim`] does not name fails
+/// closed with [`no_handler`].
+fn on_own_session(
+    own: Option<&SessionCtx>,
+    verb: &str,
+    act: impl FnOnce(&SessionCtx) -> String,
+) -> String {
+    own.map_or_else(|| no_handler(verb), act)
+}
+
+/// App-target verbs (scoped `Target::App`): the front window, or the window
+/// hosting the session an Owner's `@<sid>` names ([`app_route`]). Gated once,
+/// before the arm and after authorization, so an unauthorized caller learns
+/// nothing:
+///
+/// * the fleet halt (design §5.3), first on the aimed session, whose own
+///   `reason=`/`origin=` an aimed `tab close` answers, then on the App lane
+///   ([`crate::fabric::app_halt_refusal`]): these verbs drive whatever window
+///   they reach, so the question is whether any session here is held, and the
+///   row's input class (`Input::PTY`) decides which verbs it binds (`invoke`,
+///   `hwkey`, `pointer`, `pane`, `tab`, `confirm`), then the gateway cards an
+///   `open` may raise ([`app_verb_halt`]);
+/// * the edit hold (amacs §6.7): the input-writing App verbs (`hwkey`,
+///   `pointer` but its `status` read, `invoke Paste`) answer `ERR busy editing`
+///   while the terminal on screen is a session an `edit` ticket holds, and go
+///   on while a native view (the edit's own) is in front
+///   ([`crate::control_edit::hold::refusal`]);
+/// * the unread-input gate (`input_stall`) against the front session, the one
+///   the input-writing App verbs (`hwkey`, `pointer`, `invoke Paste`) write to
+///   whatever the aim; a leading `unread=ok` lifts it for one gesture, as on
+///   `send`/`key`, and a slow read warns in the `OK` rather than refusing
+///   (owner, 2026-09-29).
+fn dispatch_app(head: &Head<'_>, form: &Resolved, cx: &DispatchCx<'_>) -> ControlReply {
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = *head;
+    let store = cx.store;
+    let aim = match app_route(cx.scope.principal(), selector.as_ref(), |selector| {
+        resolve(store, selector)
+    }) {
+        Ok(aim) => aim,
+        Err(refusal) => return refusal.into(),
+    };
+    let class = form.row.input_class();
+    if let Some(refusal) = app_verb_halt(&aim, store, class, verb, rest) {
+        return refusal.into();
+    }
+    let active = resolve_active(cx.active);
+    let (unread_ok, rest) = control_input::take_app_unread_ok(class, rest);
+    // The edit hold (amacs §6.7) for `hwkey`, `pointer` and `invoke Paste`, which
+    // type into the terminal on screen.
+    let front = active.as_ref().map(|(_, _, front, _)| *front);
+    if let Some(refusal) = crate::control_edit::hold::refusal(verb, rest, None, front) {
+        return refusal.into();
+    }
     let admitted = active
         .as_ref()
         .map_or(crate::input_stall::Admission::Open, |(_, _, _, ctx)| {
-            crate::input_stall::admission(ctx, verb, rest, unread_ok)
+            crate::input_stall::gate(ctx, class, verb, rest.as_bytes(), unread_ok)
         });
     let warning = match admitted {
-        crate::input_stall::Admission::Refuse(refusal) => return Some(refusal.into()),
+        crate::input_stall::Admission::Refuse(refusal) => return refusal.into(),
         crate::input_stall::Admission::Warn(warning) => Some(warning),
         crate::input_stall::Admission::Open => None,
     };
     // `invoke Paste` types the clipboard into the front tab: its caller rides
     // the hop and is credited there if the paste lands at once (S9,
     // `App::invoke_typist`), read here, on the lane that serves it.
-    let typist = (verb == "invoke" && crate::input_stall::is_input_writing(verb, rest))
-        .then(|| {
-            active
-                .as_ref()
-                .and_then(|(_, _, _, ctx)| serving_caller(scope, ctx))
-        })
-        .flatten();
+    let typist = (verb == "invoke"
+        && crate::input_stall::writes_input(class, verb, rest.as_bytes()))
+    .then(|| {
+        active
+            .as_ref()
+            .and_then(|(_, _, _, ctx)| serving_caller(cx.scope, ctx))
+    })
+    .flatten();
     let active_term = active.map(|(term, _, _, _)| term);
-    Some(
-        dispatch_app_verb(
+    dispatch_app_verb(verb, rest, form, &aim, cx, active_term.as_ref(), typist)
+        .warned(warning.as_deref())
+}
+
+/// The fleet halt's refusal of an App-target verb, or `None`. A verb whose input
+/// `class` the halt binds (`Input::PTY`) asks the aimed session's own hold first,
+/// so a held one answers with its own `reason=`/`origin=`, then the App lane's
+/// question, whether any session here is held ([`crate::fabric::app_halt_refusal`]).
+/// An aimed `tab close N` retires whatever session tab N hosts, so an unheld aim
+/// does not clear a held window-mate. The person's own acts, where a development
+/// build stands a test in the person's place ([`control_media::person_invoke_act`]),
+/// are theirs under any hold. `open` of a gateway card (the palette, a tab's menu,
+/// the Overview) is the same question ([`crate::fabric::open_halt_refusal`]): each
+/// card is `invoke`'s rows behind a key.
+fn app_verb_halt(
+    aim: &AppAim,
+    store: &Store,
+    class: Input,
+    verb: &str,
+    rest: &str,
+) -> Option<String> {
+    let person = verb == "invoke" && control_media::person_invoke_act(rest);
+    if class.contains(Input::PTY) && !person {
+        if let AppAim::Aimed((_, _, _, ctx)) = aim
+            && let Some(refusal) = crate::fabric::hold_refusal(ctx)
+        {
+            return Some(refusal);
+        }
+        if let Some(refusal) = crate::fabric::any_hold_refusal(store) {
+            return Some(refusal);
+        }
+    }
+    crate::fabric::open_halt_refusal(store, verb, rest)
+}
+
+/// Session-target verbs: [`session_route`] picks the front terminal or the named
+/// session, resolved once; [`serve_session_verb`] gates and serves the verb on it.
+/// With no terminal in front, a bare request may still reach a native front
+/// ([`sessionless_front`]).
+///
+/// Two forms name no session of their own and are answered first, whatever
+/// terminal there is or is not: `log n`, the instance's node log (session log
+/// 5J-3, Owner-only like `brief all`, [`node_log_reply`]), and `await task`'s
+/// list form, which names its targets as an argument like `subscribe` and
+/// resolves them itself ([`dispatch_await_task`]; a leading selector keeps the
+/// single form, answered by the session's `cmd_await`).
+fn dispatch_session(head: &Head<'_>, form: &Resolved, cx: &DispatchCx<'_>) -> ControlReply {
+    let selector = head.selector.as_ref();
+    if head.verb == "log" && crate::session_log_node::names_node_log(head.rest) {
+        return node_log_reply(head.rest, selector, cx.scope).into();
+    }
+    if head.verb == "await"
+        && selector.is_none()
+        && let Some(words) = await_task_list(head.rest)
+    {
+        return dispatch_await_task(&words, cx.active, cx.store, cx.scope).into();
+    }
+    let resolution = selector.map_or(Resolution::SelfTok, |s| resolve(cx.store, s));
+    let SessionRoute {
+        active_target,
+        decision,
+    } = session_route(selector, &resolution, cx.active, cx.scope);
+    match decision {
+        NativeControlDecision::ResolveSession => {}
+        NativeControlDecision::Denied => return "ERR denied\n".into(),
+        NativeControlDecision::NoActiveTerminal => {
+            return sessionless_front(head, cx).unwrap_or_else(|| NO_ACTIVE_TERMINAL.into());
+        }
+        // A session that closed in this process may still answer `log` and
+        // `brief` from the closed-session index; anything else is no such
+        // session.
+        NativeControlDecision::NoSuchSession => {
+            return closed_session_reply(selector, head.verb, head.rest, cx.store, cx.scope).into();
+        }
+        NativeControlDecision::WithoutSession => {
+            return "ERR invalid control target\n".into();
+        }
+    }
+    // Capture the front tab's id before `active_target` is consumed: an explicit
+    // `@<sid>` naming it goes through the App input seam (`InputRoute`).
+    let front_active_session = active_target.as_ref().map(|(_, _, session, _)| *session);
+    let target = match resolution {
+        Resolution::SelfTok => active_target,
+        Resolution::Hosted(target) => Some(target),
+        Resolution::Missing => None,
+        // Two instances answer to this id: refuse, do not pick one.
+        Resolution::Ambiguous(refusal) => return refusal.into(),
+    };
+    let Some(target) = target else {
+        return if selector.is_some_and(|s| !s.is_self()) {
+            // It closed between the route and the resolve.
+            closed_session_reply(selector, head.verb, head.rest, cx.store, cx.scope)
+        } else {
+            NO_ACTIVE_TERMINAL.to_string()
+        }
+        .into();
+    };
+    let mut tail = ReplyTail::default();
+    let body = serve_session_verb(head, form, &target, front_active_session, cx, &mut tail);
+    ControlReply::with_tail(body, tail)
+}
+
+/// A bare or `@.` session verb with no terminal in front (a native Settings or
+/// Editor tab): `paste`, `key` and `resize px` post the input event a person's
+/// own paste, keypress or window drag makes, which `App::input` delivers to the
+/// native view under its own boundary, and an Owner's framebuffer `image` (any
+/// form but `image read`) captures the front native window. Each decision is its
+/// `sessionless_front_*` classifier's, by [`native_control_decision`]'s App case
+/// (an Edge is denied). `None` for every other request, which the caller refuses
+/// with [`NO_ACTIVE_TERMINAL`].
+fn sessionless_front(head: &Head<'_>, cx: &DispatchCx<'_>) -> Option<ControlReply> {
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = *head;
+    let selector = selector.as_ref();
+    let principal = cx.scope.principal();
+    let route = match verb {
+        "paste" => sessionless_front_paste_event(
             verb,
-            rest,
-            scope,
-            proxy,
-            sock_dir,
-            active_term.as_ref(),
-            typist,
+            || control_input::paste_text(rest),
+            selector,
+            false,
+            principal,
         )
-        .warned(warning.as_deref()),
+        .map(|route| route.map_err(String::from)),
+        "key" => sessionless_front_key_event(rest, selector, false, principal)
+            .map(|route| route.map_err(String::from)),
+        "resize" => sessionless_front_window_resize(verb, rest, selector, false, principal),
+        "image" if cx.scope.is_owner_class() && rest.split_whitespace().next() != Some("read") => {
+            return Some(control_media::cmd_image(cx.proxy, rest, cx.sock_dir, None));
+        }
+        _ => None,
+    }?;
+    Some(
+        match route {
+            Ok(event) => control_input::input_reply_to_str(post_input_reply(cx.proxy, vec![event])),
+            Err(error) => error,
+        }
+        .into(),
     )
 }
 
-/// Resolve only an explicit non-self selector, independent of front content,
-/// and refuse an id that names two places.
-///
-/// `Ok(None)` is an ordinary miss; the caller words it. `Err(refusal)` is
-/// [`ambiguous_sid_refusal`]'s line: the id resolves here and a live foreign
-/// instance also publishes it.
-///
-/// The check lives in the resolver because several seams resolve selectors
-/// without going through [`handle`] (binary `post`, `feed-bin`/`paste-bin` at
-/// both fence and effect, `subscribe` targets), and those write input or
-/// stream output. A `Result` cannot be ignored.
-fn resolve_explicit(store: &Store, selector: &Selector) -> Result<Option<Target>, String> {
-    /// The registry lookup without the ambiguity gate, nested so no seam can
-    /// call it directly.
-    fn look_up(store: &Store, selector: &Selector) -> Option<Target> {
-        match selector {
-            Selector::SelfTok => None,
-            Selector::Local(id) => {
-                let guard = store.read().unwrap_or_else(|p| p.into_inner());
-                let handle = guard.by_local(*id)?;
-                Some((
-                    handle.term.clone(),
-                    handle.master,
-                    handle.local_id,
-                    handle.ctx.clone(),
-                ))
-            }
-            Selector::Sid(id) => {
-                let guard = store.read().unwrap_or_else(|p| p.into_inner());
-                let handle = guard.by_sid(id)?;
-                Some((
-                    handle.term.clone(),
-                    handle.master,
-                    handle.local_id,
-                    handle.ctx.clone(),
-                ))
-            }
-        }
-    }
+/// What a request's selector names, looked up once per request
+/// ([`resolve`]).
+enum Resolution {
+    /// No selector or `@.`: the connection's own session, which the caller
+    /// takes from the front.
+    SelfTok,
+    /// A session this instance hosts.
+    Hosted(Target),
+    /// No session here answers to it: an unknown number or id, or a spelling
+    /// that names no session.
+    Missing,
+    /// The id resolves here and a live foreign instance also publishes it:
+    /// [`ambiguous_sid_refusal`]'s line is the answer.
+    Ambiguous(String),
+}
 
-    let found = look_up(store, selector);
+/// Resolve a selector, independent of front content, and refuse an id that
+/// names two places.
+///
+/// The ambiguity check lives in the resolver because several seams resolve
+/// selectors without going through [`dispatch_request`] (binary `post`,
+/// `feed-bin`/`paste-bin` at both fence and effect, `subscribe` targets), and
+/// those write input or stream output; none can reach a hosted target without
+/// passing it.
+fn resolve(store: &Store, selector: &Selector<'_>) -> Resolution {
+    if selector.is_self() {
+        return Resolution::SelfTok;
+    }
+    // Cloned out before the guard drops, so the registry lock is never held
+    // across a `Terminal` lock or the ambiguity probe's read.
+    let found = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_selector(selector)
+        .map(|h| (h.term.clone(), h.master, h.local_id, h.ctx.clone()));
     // A miss that names the warm spare taints it (`crate::spare`); a hit on a
     // session before its start record is counted against its rc generation.
     match (&found, selector) {
-        (None, Selector::Sid(id)) => crate::spare::control_refusal(Some(id), None),
+        (None, Selector::Sid(id)) => {
+            crate::spare::control_refusal(Some(&SessionId::new(id.as_str())), None);
+        }
         (None, Selector::Local(id)) => crate::spare::control_refusal(None, Some(*id)),
         (Some((_, _, _, ctx)), _) => crate::spare::note_control(&ctx.witness),
-        (None, Selector::SelfTok) => {}
+        (None, Selector::SelfTok | Selector::Invalid(_)) => {}
     }
+    let Some(target) = found else {
+        return Resolution::Missing;
+    };
     // Only a hosted id can be ambiguous, so probe only on a hit (a miss costs
     // nothing). `live_holder` reads `graph/<sid>` for a live foreign pid and is
     // gated on ids this process adopted; minted ids are answered from a
     // register.
-    if found.is_some()
-        && let Some(refusal) = ambiguous_sid_refusal(selector)
-    {
-        return Err(refusal);
+    match ambiguous_sid_refusal(selector) {
+        Some(refusal) => Resolution::Ambiguous(refusal),
+        None => Resolution::Hosted(target),
     }
-    Ok(found)
 }
 
 /// A session-class request's route: the front terminal and the classifier's
@@ -6231,25 +6326,18 @@ struct SessionRoute {
 }
 
 fn session_route(
-    selector: &Option<Selector>,
+    selector: Option<&Selector<'_>>,
+    resolution: &Resolution,
     active: &ActiveHandle,
-    store: &Store,
     scope: Scope,
 ) -> SessionRoute {
     let active_target = resolve_active(active);
-    let explicit = matches!(selector, Some(Selector::Local(_) | Selector::Sid(_)));
-    let explicit_live = selector
-        .as_ref()
-        .is_some_and(|selector| selector_is_live(store, selector));
-    let principal = if scope.is_owner_class() {
-        NativeControlPrincipal::Owner
-    } else {
-        NativeControlPrincipal::Edge
-    };
+    let explicit = selector.is_some_and(|selector| !selector.is_self());
+    let explicit_live = matches!(resolution, Resolution::Hosted(_) | Resolution::Ambiguous(_));
     let decision = native_control_decision(
         active_target.is_some(),
         explicit_live,
-        principal,
+        scope.principal(),
         if explicit {
             NativeControlTarget::ExplicitSession
         } else {
@@ -6270,95 +6358,9 @@ pub(crate) fn session_route_decision(
     store: &Store,
     scope: Scope,
 ) -> NativeControlDecision {
-    session_route(&request_head(line).0, active, store, scope).decision
-}
-
-/// Full request dispatch. Classification precedes terminal resolution, so
-/// native-only windows stay controllable without a fabricated ActiveSession.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_request(
-    line: &str,
-    active: &ActiveHandle,
-    store: &Store,
-    subscribers: &Subscribers,
-    scope: Scope,
-    proxy: &EventLoopProxy<Wake>,
-    queue: &ImageQueue,
-    sock_dir: &std::path::Path,
-) -> ControlReply {
-    // Parsed ONCE; every stage below reads this same head.
-    let (selector, verb, rest) = request_head(line);
-    if let Some(response) = dispatch_before_session(
-        &selector,
-        verb,
-        rest,
-        active,
-        store,
-        subscribers,
-        scope,
-        proxy,
-        queue,
-        sock_dir,
-    ) {
-        return response;
-    }
-
-    let SessionRoute {
-        active_target,
-        decision,
-    } = session_route(&selector, active, store, scope);
-    match decision {
-        NativeControlDecision::ResolveSession => {}
-        NativeControlDecision::Denied => return "ERR denied\n".into(),
-        NativeControlDecision::NoActiveTerminal => return NO_ACTIVE_TERMINAL.into(),
-        NativeControlDecision::NoSuchSession => {
-            return closed_session_reply(selector.as_ref(), verb, rest, store, scope).into();
-        }
-        NativeControlDecision::WithoutSession => {
-            return "ERR invalid control target\n".into();
-        }
-    }
-    // Capture the front tab's id before `active_target` is consumed: an explicit
-    // `@<sid>` naming it goes through the App input seam (`front_routed_input`).
-    let front_active_session = active_target.as_ref().map(|(_, _, session, _)| *session);
-    let target = match selector.as_ref() {
-        Some(selector @ (Selector::Local(_) | Selector::Sid(_))) => {
-            match resolve_explicit(store, selector) {
-                Ok(target) => target,
-                // Two instances answer to this id: refuse, do not pick one.
-                Err(refusal) => return refusal.into(),
-            }
-        }
-        None | Some(Selector::SelfTok) => active_target,
-    };
-    let Some((term, master, session, ctx)) = target else {
-        return if matches!(selector, Some(Selector::Local(_) | Selector::Sid(_))) {
-            // It closed between the route and the resolve.
-            closed_session_reply(selector.as_ref(), verb, rest, store, scope)
-        } else {
-            NO_ACTIVE_TERMINAL.to_string()
-        }
-        .into();
-    };
-    let mut tail = ReplyTail::default();
-    let body = handle(
-        &selector,
-        verb,
-        rest,
-        &term,
-        master,
-        session,
-        &ctx,
-        store,
-        scope,
-        proxy,
-        queue,
-        sock_dir,
-        subscribers,
-        front_active_session,
-        &mut tail,
-    );
-    ControlReply::with_tail(body, tail)
+    let selector = control_request::head(line).selector;
+    let resolution = selector.map_or(Resolution::SelfTok, |s| resolve(store, &s));
+    session_route(selector.as_ref(), &resolution, active, scope).decision
 }
 
 /// `log` and `brief` naming a session that has closed in this process: the
@@ -6374,7 +6376,7 @@ fn dispatch_request(
 /// learns nothing of a session it could not read. An id a live foreign
 /// instance also serves is refused as a live one is
 /// ([`ambiguous_sid_refusal`]), and `brief all` stays Owner-only
-/// ([`escalated_op`]).
+/// ([`argument_escalation`]).
 fn closed_session_reply(
     selector: Option<&Selector>,
     verb: &str,
@@ -6414,8 +6416,8 @@ fn closed_session_reply_with(
         let index = guard.closed_logs();
         match selector {
             Some(Selector::Local(id)) => index.by_local(*id),
-            Some(Selector::Sid(sid)) => index.by_sid(sid),
-            None | Some(Selector::SelfTok) => None,
+            Some(Selector::Sid(sid)) => index.by_sid(&SessionId::new(sid.as_str())),
+            None | Some(Selector::SelfTok | Selector::Invalid(_)) => None,
         }
         .map(crate::session_log::ClosedLog::read)
     };
@@ -6435,7 +6437,7 @@ fn closed_session_reply_with(
     if let Some(refusal) = ambiguous_sid_refusal(selector) {
         return refusal;
     }
-    if escalated_op(verb, rest) == Some(Escalation::OwnerOnly) && !scope.is_owner_class() {
+    if argument_escalation(verb, rest) == Some(Need::OwnerOnly) && !scope.is_owner_class() {
         log_denial(
             AUDIT_SUBSYSTEM,
             &format!("closed {verb} -> {sid}"),
@@ -6453,7 +6455,8 @@ fn closed_session_reply_with(
 /// `log @<sid>` and `brief @<sid>` of a session from an EARLIER process
 /// (phase 2B), answered from the disk journal on this control worker
 /// (`session_log_journal::read`): Owner-class reads of a sid only, and only
-/// while this launch keeps a journal (off by default: nothing is read and
+/// while this launch keeps a journal (on by default since D3; with
+/// `journal = false`, or on a desk that keeps none, nothing is read and
 /// nothing created). `None` is the caller's `ERR no such session`, the same
 /// bytes for an edge, a local id, a journal that is off, and a sid it does
 /// not hold. An id a live foreign instance serves is refused as a live one
@@ -6513,18 +6516,91 @@ fn journal_session_reply_with(
 /// client disconnects or a write fails (`control_lanes.rs`).
 ///
 /// PUSH-ONLY (P1.3): a `subscribe` verb FLIPS the connection to server-push by
-/// handing it to the reserved subscription pool. [`run_subscribe_socket`] there
+/// handing it to a subscription lane. [`run_subscribe_socket`] there
 /// never reads another request line — the client thereafter only reads
 /// `DELTA`/`EVENT`/`GAP` frames — while the ordinary lane returns at once.
 enum ServeDisposition {
     Close,
-    Subscribe { line: String, scope: Scope },
+    /// The request, parsed, goes with the connection: the push handler reads
+    /// its head ([`run_subscribe_with_peer_probe`]), never the line again.
+    Subscribe {
+        request: Request,
+        scope: Scope,
+    },
 }
 
-struct PendingArtifactAck {
-    retention: ReplyRetention,
+/// An artifact reply's handoff, carried by its connection's outbox
+/// (`control_lanes.rs`) from the moment the answer is queued until it is over:
+/// a write-only permit until the last byte is out, or a guard until one line
+/// after the challenge decides. Whatever ends the connection first drops it —
+/// the deadline, a failed write, the peer's hang-up, a lane's unwind, the
+/// parker's stop — and the drop fails closed: a guard not yet classified goes
+/// to quarantine ([`AwaitedAck`]), never released.
+enum PendingHandoff {
+    WriteOnly {
+        deadline: std::time::Instant,
+        _permit: WriteOnlyRetention,
+    },
+    Acknowledged(AwaitedAck),
+}
+
+impl PendingHandoff {
+    /// When the handoff fails if it has not finished: the write, and for a
+    /// guarded reply its acknowledgement too.
+    fn deadline(&self) -> std::time::Instant {
+        match self {
+            Self::WriteOnly { deadline, .. } => *deadline,
+            Self::Acknowledged(ack) => ack.deadline,
+        }
+    }
+}
+
+/// A guarded reply's guard, and the challenge its peer must echo. Dropped
+/// before [`Self::acknowledged`], it quarantines the guard: a write that did
+/// not finish is `WriteFailed` (path bytes may be visible), a frame that is
+/// out but was not acknowledged is `AcknowledgeFailed`.
+struct AwaitedAck {
+    /// `None` once classified.
+    retention: Option<ReplyRetention>,
     nonce: String,
     deadline: std::time::Instant,
+    /// The whole frame, challenge included, is on the wire: one line decides.
+    on_wire: bool,
+}
+
+impl AwaitedAck {
+    /// The body and its challenge are written and flushed.
+    fn mark_on_wire(&mut self) {
+        artifact_reply_write_wire_anchor();
+        self.on_wire = true;
+    }
+
+    /// The peer echoed the challenge: the guard is released at once, after the
+    /// write half is shut (nothing more is sent on this connection).
+    fn acknowledged(mut self, stream: &CtlStream) {
+        if let Some(mut retention) = self.retention.take() {
+            retention.acknowledge_peer_anchor();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            drop(retention);
+        }
+    }
+}
+
+impl Drop for AwaitedAck {
+    fn drop(&mut self) {
+        let Some(mut retention) = self.retention.take() else {
+            return;
+        };
+        if self.on_wire {
+            retention.acknowledge_failed_anchor();
+        } else {
+            retention.write_failed_anchor();
+        }
+        quarantine_artifact_reply_until(
+            retention,
+            std::time::Instant::now() + ARTIFACT_FAILURE_QUARANTINE,
+        );
+    }
 }
 
 /// Time a guarded response gets to finish its client handoff. A valid nonce ACK
@@ -6633,8 +6709,8 @@ impl ArtifactReplyQuarantine {
 }
 
 /// The quarantine reaper's scheduling role: `Background`, not `Housekeeping`
-/// (2026-09-30). A quarantined reply holds a production handoff permit and its
-/// capture lease, so later captures are refused, or wait out
+/// (2026-09-30). A quarantined reply holds its descriptor chain and its
+/// capture lease, so later path captures are refused, or wait out
 /// `CAPTURE_NAMESPACE_WAIT` and fail busy, until the reaper drops it. That is
 /// cleanup something else waits on, which `qos::Role::Housekeeping` rules out:
 /// at QOS_CLASS_BACKGROUND the reaper did not run within 60 s in 8 of 20 runs
@@ -6708,7 +6784,10 @@ fn sweep_artifact_quarantine_for_test() {
     drop(expired);
 }
 
-fn quarantine_artifact_reply_until(retention: ReplyRetention, until: std::time::Instant) {
+fn quarantine_artifact_reply_until(mut retention: ReplyRetention, until: std::time::Instant) {
+    // The handoff's outcome is judged: its place in flight goes back now, and
+    // the quarantine keeps the guard and its descriptor chain.
+    drop(retention.in_flight.take());
     let quarantine = artifact_reply_quarantine();
     let mut entries = quarantine
         .entries
@@ -6723,14 +6802,6 @@ fn quarantine_artifact_reply_until(retention: ReplyRetention, until: std::time::
     quarantine.changed.notify_one();
 }
 
-#[cfg(test)]
-fn write_control_reply(
-    writer: &mut impl Write,
-    reply: ControlReply,
-) -> std::io::Result<Option<PendingArtifactAck>> {
-    write_control_reply_with_timeout_arm(writer, reply, ARTIFACT_HANDOFF_TIMEOUT, |_| Ok(()))
-}
-
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -6741,213 +6812,70 @@ fn write_control_reply(
 )]
 fn artifact_reply_write_wire_anchor() {}
 
-/// Write `reply` where the connection's answers go: `writer`, a lane's outbox
-/// (delivered as the peer takes it, never waited for on the lane) or the
-/// bridge's socket. A GUARDED reply goes straight to `stream` instead, under its
-/// handoff deadline, its ERR fallback included: it must be on the wire before
-/// its ACK is awaited, and a lane's outbox holds nothing then (each answer is
-/// delivered before the next request is read).
-fn write_control_reply_to_stream(
-    stream: &CtlStream,
-    writer: &mut impl Write,
-    reply: ControlReply,
-) -> std::io::Result<Option<PendingArtifactAck>> {
-    if reply.retention.is_none() {
-        return write_control_reply_with_timeout_arm(
-            writer,
-            reply,
-            ARTIFACT_HANDOFF_TIMEOUT,
-            |_| Ok(()),
-        );
-    }
-    let mut direct = stream;
-    write_control_reply_with_timeout_arm(&mut direct, reply, ARTIFACT_HANDOFF_TIMEOUT, |timeout| {
-        stream.set_write_timeout(timeout)
-    })
-}
+/// The bytes of an artifact reply's acknowledgement nonce (`hex_token`), so
+/// its challenge and echo carry twice as many hex digits.
+const ARTIFACT_ACK_NONCE_BYTES: usize = 16;
 
-fn write_control_reply_with_timeout_arm(
-    writer: &mut impl Write,
-    mut reply: ControlReply,
-    handoff_timeout: std::time::Duration,
-    mut set_write_timeout: impl FnMut(Option<std::time::Duration>) -> std::io::Result<()>,
-) -> std::io::Result<Option<PendingArtifactAck>> {
-    let handoff_deadline = reply
-        .retention
-        .is_some()
-        .then(|| std::time::Instant::now() + handoff_timeout);
-    let requires_ack = matches!(
-        reply.retention.as_ref(),
-        Some(ReplyHandoff::Acknowledged(_))
-    );
-    // Mint the challenge before fallible wire preparation: video preparation can
-    // publish its durable marker, so entropy failure must stay an abortable ERR.
-    let mut nonce = if requires_ack {
-        match aterm_uds::rand::hex_token::<16>() {
-            Ok(nonce) => Some(nonce),
-            // The ERR keeps the handoff deadline: written straight to the
-            // socket, it must not wait on its peer without one.
-            Err(error) => {
-                reply.body = format!("ERR artifact acknowledgement setup failed: {error}\n");
-                reply.retention = None;
-                None
-            }
-        }
-    } else {
-        None
-    };
-    if let Some(retention) = reply.retention.as_mut()
-        && let Err(error) = retention.prepare_write()
-    {
-        // The OK's identity can no longer be certified: abort the publication
-        // before writing a path-free ERR.
-        retention.prepare_failed_anchor();
-        reply.body = format!("ERR artifact reply validation failed: {error}\n");
-        reply.retention = None;
-        nonce = None;
-    }
-    // `reply` remains in scope through the complete write + flush; guarded
-    // retention is then returned to the explicit ACK waiter.
-    let mut write_timeout_armed = false;
-    let write = if let Some(deadline) = handoff_deadline {
-        let mut arm_write_timeout = |remaining| {
-            set_write_timeout(Some(remaining))?;
-            write_timeout_armed = true;
-            Ok(())
-        };
-        (|| {
-            write_all_until(
-                writer,
-                reply.body.as_bytes(),
+/// The most a peer may send after an artifact's challenge before its first
+/// line ends: `ACK <nonce>`, the `\r` every request line may carry, and the
+/// line feed. One line decides, so nothing past it is ever judged.
+const ACK_LINE_MAX: usize = aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX.len()
+    + 2 * ARTIFACT_ACK_NONCE_BYTES
+    + "\r\n".len();
+
+impl ControlReply {
+    /// This reply as the bytes its connection sends, the handoff that spans
+    /// them, and the latch their last byte releases. An artifact's guard is
+    /// revalidated (`prepare_write`) before any byte exists, so no OK byte can
+    /// certify an identity the barrier then refuses: a failure answers a
+    /// path-free ERR instead and the guard is aborted. A guarded body is
+    /// followed, in the same buffer, by an unpredictable
+    /// `ACK-CHALLENGE <nonce>`. A write-only body carries its permit. Both
+    /// handoffs fail at `now + handoff_timeout` if not over by then.
+    fn into_wire(
+        mut self,
+        handoff_timeout: std::time::Duration,
+    ) -> (Vec<u8>, Option<PendingHandoff>, Option<ReplyWritten>) {
+        let deadline = std::time::Instant::now() + handoff_timeout;
+        let handoff = match self.retention.take() {
+            None => None,
+            Some(ReplyHandoff::WriteOnly(permit)) => Some(PendingHandoff::WriteOnly {
                 deadline,
-                &mut arm_write_timeout,
-            )?;
-            if let Some(nonce) = nonce.as_deref() {
-                write_all_until(
-                    writer,
-                    aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX.as_bytes(),
-                    deadline,
-                    &mut arm_write_timeout,
-                )?;
-                write_all_until(writer, nonce.as_bytes(), deadline, &mut arm_write_timeout)?;
-                write_all_until(writer, b"\n", deadline, &mut arm_write_timeout)?;
-            }
-            flush_until(writer, deadline, &mut arm_write_timeout)
-        })()
-    } else {
-        (|| {
-            writer.write_all(reply.body.as_bytes())?;
-            writer.flush()
-        })()
-    };
-    // Free the (possibly large) inline body before releasing or quarantining any
-    // handoff, so new requests never overlap unaccounted reply memory.
-    drop(std::mem::take(&mut reply.body));
-    // The reply is on the wire (or never will be): release waiters such as a
-    // seamless update's Commit ([`ReplyWire`]), before the longer ACK wait.
-    drop(reply.written.take());
-    if let Err(error) = write {
-        match reply.retention.take() {
+                _permit: permit,
+            }),
+            // Mint the challenge before fallible wire preparation: video
+            // preparation can publish its durable marker, so entropy failure
+            // must stay an abortable ERR.
             Some(ReplyHandoff::Acknowledged(mut retention)) => {
-                retention.write_failed_anchor();
-                quarantine_artifact_reply_until(
-                    retention,
-                    std::time::Instant::now() + ARTIFACT_FAILURE_QUARANTINE,
-                );
+                match aterm_uds::rand::hex_token::<ARTIFACT_ACK_NONCE_BYTES>() {
+                    Err(error) => {
+                        self.body = format!("ERR artifact acknowledgement setup failed: {error}\n");
+                        None
+                    }
+                    Ok(nonce) => match retention.prepare_write() {
+                        Err(error) => {
+                            retention.prepare_failed_anchor();
+                            self.body = format!("ERR artifact reply validation failed: {error}\n");
+                            None
+                        }
+                        Ok(()) => {
+                            self.body.push_str(
+                                aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX,
+                            );
+                            self.body.push_str(&nonce);
+                            self.body.push('\n');
+                            Some(PendingHandoff::Acknowledged(AwaitedAck {
+                                retention: Some(retention),
+                                nonce,
+                                deadline,
+                                on_wire: false,
+                            }))
+                        }
+                    },
+                }
             }
-            Some(ReplyHandoff::WriteOnly(retention)) => drop(retention),
-            None => {}
-        }
-        return Err(error);
-    }
-    let pending = match (reply.retention.take(), nonce) {
-        (Some(ReplyHandoff::Acknowledged(retention)), Some(nonce)) => {
-            // Guarded body and challenge are written and flushed; plain and
-            // write-only replies skip the acknowledgement state machine.
-            artifact_reply_write_wire_anchor();
-            Some(PendingArtifactAck {
-                retention,
-                nonce,
-                deadline: handoff_deadline.expect("guarded reply owns its handoff deadline"),
-            })
-        }
-        (Some(ReplyHandoff::WriteOnly(retention)), None) => {
-            drop(retention);
-            None
-        }
-        (None, None) => None,
-        _ => unreachable!("reply handoff and acknowledgement nonce stay paired"),
-    };
-    if pending.is_none() && write_timeout_armed {
-        // Write-only replies keep the connection; clear their handoff deadline
-        // for later responses.
-        set_write_timeout(None)?;
-    }
-    Ok(pending)
-}
-
-fn remaining_artifact_io_budget(
-    deadline: std::time::Instant,
-) -> std::io::Result<std::time::Duration> {
-    let now = std::time::Instant::now();
-    if now >= deadline {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "artifact handoff deadline expired",
-        ));
-    }
-    Ok(deadline
-        .saturating_duration_since(now)
-        .max(MIN_ARTIFACT_IO_TIMEOUT))
-}
-
-fn write_all_until(
-    writer: &mut impl Write,
-    mut bytes: &[u8],
-    deadline: std::time::Instant,
-    arm_write_timeout: &mut impl FnMut(std::time::Duration) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    while !bytes.is_empty() {
-        arm_write_timeout(remaining_artifact_io_budget(deadline)?)?;
-        match writer.write(bytes) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write guarded artifact reply",
-                ));
-            }
-            Ok(written) => bytes = &bytes[written..],
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::WouldBlock
-                ) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn flush_until(
-    writer: &mut impl Write,
-    deadline: std::time::Instant,
-    arm_write_timeout: &mut impl FnMut(std::time::Duration) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    loop {
-        arm_write_timeout(remaining_artifact_io_budget(deadline)?)?;
-        match writer.flush() {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::WouldBlock
-                ) => {}
-            Err(error) => return Err(error),
-        }
+        };
+        (self.body.into_bytes(), handoff, self.written)
     }
 }
 
@@ -6966,49 +6894,58 @@ enum ArtifactAckOutcome {
     AcknowledgementQuarantined,
 }
 
-fn await_guarded_reply_close(
-    stream: &CtlStream,
-    reader: &mut impl BufRead,
-    pending: PendingArtifactAck,
-) -> ArtifactAckOutcome {
-    await_guarded_reply_close_with_quarantine(stream, reader, pending, ARTIFACT_FAILURE_QUARANTINE)
+/// What the bytes a peer `sent` after an artifact's challenge say, once they
+/// say anything: `Some(true)` when its first line is exactly `ACK <nonce>` (a
+/// trailing `\r` is no part of a line), `Some(false)` for any other first line
+/// or for [`ACK_LINE_MAX`] bytes with no line end, `None` while neither. EXACTLY
+/// one line decides — the challenge is one-shot, so a line that is not the ACK
+/// is a failure and never a re-read: reading on would let a peer keep guessing
+/// the nonce inside one deadline. Once the peer has `ended` (EOF), what it sent
+/// is its line, as the request grammar reads a last line with no newline.
+fn ack_verdict(sent: &[u8], nonce: &str, ended: bool) -> Option<bool> {
+    let window = &sent[..sent.len().min(ACK_LINE_MAX)];
+    let line = match window.iter().position(|byte| *byte == b'\n') {
+        Some(end) => &window[..end],
+        None if sent.len() >= ACK_LINE_MAX => return Some(false),
+        None if ended => window,
+        None => return None,
+    };
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    Some(
+        line.strip_prefix(aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX.as_bytes())
+            == Some(nonce.as_bytes()),
+    )
 }
 
-fn await_guarded_reply_close_with_quarantine(
+/// The acknowledgement line after an artifact's challenge, read waiting —
+/// where no parker reads it (`control_lanes.rs`'s fallback, the bridge) —
+/// under the handoff's absolute deadline, re-armed before every refill
+/// ([`DeadlineRead`]), so a dribbling peer buys nothing. Expiry, EOF and I/O
+/// failure are a failed acknowledgement ([`ack_verdict`]).
+fn read_ack_until(
     stream: &CtlStream,
     reader: &mut impl BufRead,
-    pending: PendingArtifactAck,
-    failure_quarantine: std::time::Duration,
-) -> ArtifactAckOutcome {
-    let PendingArtifactAck {
-        mut retention,
-        nonce,
-        deadline,
-    } = pending;
-    let expected = format!(
-        "{}{nonce}",
-        aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX
-    );
-    // EXACTLY one line decides the outcome — the challenge is one-shot, so a
-    // line that is not the ACK is a failure and never a re-read: reading again
-    // would let a peer keep guessing the nonce inside one deadline. The read
-    // absolute deadline is recomputed before every byte read, and
-    // `read_request_line_until` folds expiry, EOF, I/O failure and an over-long
-    // line into `None`; the ACK is no request, so that line is answered nothing.
-    match read_request_line_until(stream, reader, &mut std::io::sink(), deadline) {
-        Some(line) if line == expected => {
-            retention.acknowledge_peer_anchor();
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            drop(retention);
-            ArtifactAckOutcome::PeerAcknowledged
+    nonce: &str,
+    deadline: std::time::Instant,
+) -> bool {
+    let mut bound = DeadlineRead::new(stream, deadline);
+    let mut sent = Vec::with_capacity(ACK_LINE_MAX);
+    loop {
+        if bound.arm().is_err() {
+            return false;
         }
-        Some(_) | None => {
-            retention.acknowledge_failed_anchor();
-            quarantine_artifact_reply_until(
-                retention,
-                std::time::Instant::now() + failure_quarantine,
-            );
-            ArtifactAckOutcome::AcknowledgementQuarantined
+        match reader.fill_buf() {
+            Ok([]) => return ack_verdict(&sent, nonce, true) == Some(true),
+            Ok(available) => {
+                let taken = available.len().min(ACK_LINE_MAX - sent.len());
+                sent.extend_from_slice(&available[..taken]);
+                reader.consume(taken);
+                if let Some(verdict) = ack_verdict(&sent, nonce, false) {
+                    return verdict;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
         }
     }
 }
@@ -7401,18 +7338,12 @@ struct ConnectionScope<'a> {
     id: u64,
     _serving: ServingFd,
     store: &'a Store,
-    subscribers: &'a Subscribers,
     proxy: &'a EventLoopProxy<Wake>,
 }
 
 #[cfg(unix)]
 impl<'a> ConnectionScope<'a> {
-    fn enter(
-        store: &'a Store,
-        subscribers: &'a Subscribers,
-        proxy: &'a EventLoopProxy<Wake>,
-        stream: &CtlStream,
-    ) -> Self {
+    fn enter(store: &'a Store, proxy: &'a EventLoopProxy<Wake>, stream: &CtlStream) -> Self {
         let id = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
         SERVING_CONNECTION.with(|serving| serving.set(Some(id)));
         CONNECTION_CLAIMED.with(|claimed| claimed.set(false));
@@ -7420,7 +7351,6 @@ impl<'a> ConnectionScope<'a> {
             id,
             _serving: ServingFd::enter(stream),
             store,
-            subscribers,
             proxy,
         }
     }
@@ -7433,7 +7363,7 @@ impl Drop for ConnectionScope<'_> {
         if !CONNECTION_CLAIMED.with(|claimed| claimed.replace(false)) {
             return;
         }
-        release_connection_claims(self.store, self.subscribers, Some(self.proxy), self.id);
+        release_connection_claims(self.store, Some(self.proxy), self.id);
     }
 }
 
@@ -7572,16 +7502,12 @@ mod connection_claim_tests {
 }
 
 /// Release every supervisor claim bound to connection `conn`, with `meta
-/// unset`'s fan-out (tab chrome wake, `events` notify), and every drive lease
-/// it took `here` ([`control_session::release_connection_lease`], with
-/// `lease release`'s). The registry snapshot is cloned first so no meta lock
-/// is taken under the registry lock.
-fn release_connection_claims(
-    store: &Store,
-    subscribers: &Subscribers,
-    proxy: Option<&EventLoopProxy<Wake>>,
-    conn: u64,
-) {
+/// unset`'s fan-out (the tab chrome's wake; the release's `meta-change` record
+/// wakes the session's watchers), and every drive lease it took `here`
+/// ([`control_session::release_connection_lease`], with `lease release`'s). The
+/// registry snapshot is cloned first so no meta lock is taken under the
+/// registry lock.
+fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>, conn: u64) {
     let handles = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
     let now = crate::metrics::now_us();
     for handle in handles {
@@ -7596,12 +7522,6 @@ fn release_connection_claims(
                 session: handle.local_id,
             });
         }
-        if subscribers.any() {
-            subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(handle.local_id);
-        }
     }
 }
 
@@ -7615,40 +7535,52 @@ fn serve_preresolved(
     scope: Scope,
     active: &ActiveHandle,
     store: &Store,
-    subscribers: &Subscribers,
     proxy: &EventLoopProxy<Wake>,
-    queue: &ImageQueue,
     sock_dir: &std::path::Path,
+    recovery_count_admission: &crate::keeper_link::RecoveryCountAdmission,
 ) -> ServeDisposition {
     // Claims bound to this connection end with it, however it ends.
-    let _connection = ConnectionScope::enter(store, subscribers, proxy, stream);
+    let _connection = ConnectionScope::enter(store, proxy, stream);
     // The fd is the authority; no token was presented.
     let _principal = ServingPrincipal::enter(Principal::Instance);
     if arm_authenticated_read_poll(stream).is_err() {
         return ServeDisposition::Close;
     }
-    let mut reader = control_lanes::lane_reader(stream, Vec::new());
-    let mut writer = stream;
+    let mut unread = control_lanes::Unread::default();
+    let mut reader = control_lanes::LaneReader::new(stream, &mut unread);
+    let mut out = control_lanes::Outbox::default();
     let mut served = 0usize;
-    while let Some(line) = read_authenticated_request_line(&mut reader, &mut writer) {
-        // Written straight to the stream and flushed before this returns: owed
-        // until then ([`FinalReplies`]).
+    loop {
+        // A line too long for any request is refused, its answer delivered,
+        // and the connection closed: nothing past it is read.
+        let Some(line) = read_authenticated_request_line(&mut reader, &mut out) else {
+            let _ = out.finish_waiting(stream, &mut reader);
+            return ServeDisposition::Close;
+        };
+        let request = Request::parse(line);
+        // Delivered by `finish_waiting` below before the next line is read:
+        // owed until then ([`FinalReplies`]).
         let _final_reply = FINAL_REPLIES
-            .enter(&line)
-            .or_else(|| owed_input_reply(store, &line));
-        if let Some(disposition) = serve_request_line(
-            line,
+            .enter(&request.head())
+            .or_else(|| owed_input_reply(store, &request));
+        let disposition = serve_request_line(
+            request,
             scope,
             stream,
             &mut reader,
-            &mut writer,
+            &mut out,
             active,
             store,
-            subscribers,
             proxy,
-            queue,
             sock_dir,
-        ) {
+            recovery_count_admission,
+        );
+        // This thread is the bridge's or a fleet peer's alone: it delivers each
+        // answer, and sees a guarded one's acknowledgement through, waiting.
+        if out.finish_waiting(stream, &mut reader).is_err() || out.closes() {
+            return ServeDisposition::Close;
+        }
+        if let Some(disposition) = disposition {
             return disposition;
         }
         served += 1;
@@ -7656,7 +7588,6 @@ fn serve_preresolved(
             return ServeDisposition::Close;
         }
     }
-    ServeDisposition::Close
 }
 
 /// The most requests one fleet connection is served before it is closed: a
@@ -7719,7 +7650,7 @@ fn authenticate_connection(
     };
     // Once authenticated, a connection may idle indefinitely and follows the
     // active tab per request. Idle connections park off their lane
-    // (`control_lanes.rs`); otherwise on macOS the reader waits for readability
+    // (`control_lanes.rs`); otherwise on unix the reader waits for readability
     // or hangup before each refill. The short recv timeout is a backstop, not
     // an idle deadline. Push subscriptions move to their own pool.
     arm_authenticated_read_poll(stream).ok()?;
@@ -7728,68 +7659,42 @@ fn authenticate_connection(
 
 /// Whether a request belongs on a wait lane (`control_lanes.rs`): it mostly
 /// waits for an event, or hands the connection to a relay. Only decides which
-/// lane's time it takes; an unlisted waiting verb costs a request lane, and a
-/// missed relay holds one for as long as the relay lives. So a line
-/// [`proxy_forward_plan`] relays is a wait here: its scope and selector tests,
-/// without its resolution (no graph read or connect probe per request).
-fn is_wait_request(line: &str, scope: Scope, store: &Store) -> bool {
-    let (selector, verb, rest) = request_head(line);
-    // Only an Owner-class connection is relayed; an Edge's line naming another
-    // instance's session is refused here, at once.
-    let relayed = |sid: &SessionId| {
-        scope.is_owner_class()
-            && store
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .by_sid(sid)
-                .is_none()
-    };
-    // A session this instance does not host: `@<sid>` forwards the connection to
-    // the child or sibling that does, and the relay then owns it — except a
-    // worker's spawn frame, refused where it is (`worker_frame_refusal`).
-    if let Some(Selector::Sid(sid)) = &selector
-        && relayed(sid)
-        && spawn_frame_len(line).is_none()
+/// lane's time it takes; a waiting form the table leaves on `Lane::Rpc` costs a
+/// request lane, and a missed relay holds one for as long as the relay lives. So a
+/// line [`proxy_forward_plan`] relays is a wait here: its [`relay_candidate`]
+/// test, without its resolution (no graph read or connect per request).
+fn is_wait_request(request: &Request, scope: Scope, store: &Store) -> bool {
+    use aterm_types::control_verbs::Lane;
+    let head = request.head();
+    // A session this instance does not host: `@<sid>` (or a `subscribe`'s one
+    // session) forwards the connection to the instance that does, and the
+    // relay then owns it — except a worker's spawn frame, refused where it is
+    // ([`worker_frame_refusal`]). Only an Owner-class connection is relayed;
+    // an Edge's line naming another instance's session is refused here, at
+    // once.
+    if let Some(sid) = relay_candidate(request, scope)
+        && spawn_frame_len(&head).is_none()
+        && store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_selector(&Selector::Sid(sid))
+            .is_none()
     {
         return true;
     }
-    match verb {
-        // `subscribe` carries its selector second: one session this instance
-        // does not host is relayed for the whole subscription. Self, a local
-        // id, a list or `@*` flips to push here at once: request-lane work.
-        "subscribe" if selector.is_none() => {
-            subscribe_session(rest).is_some_and(|(sid, _)| relayed(&sid))
-        }
-        // Parks on an event, a settle, a prompt, or the bridge's landing.
-        "await" | "ready" | "wait" | "turn" | "post" | "edit" => true,
-        // Parks for the owner to answer the sudo password sheet (up to 300 s),
-        // so it holds a wait lane, not one of the RPC lanes.
-        "askpass" => true,
-        // `inbox get @<off>` parks for the bridge's next drain; the listing and
-        // the other forms answer at once.
-        "inbox" => {
-            let mut words = rest.split_whitespace();
-            words.next() == Some("get") && words.next().is_some_and(|w| w.starts_with('@'))
-        }
-        // `cast drift` settles 60 ms, then replays the recording through fresh
-        // engines: seconds of lane time on a long recording.
-        "cast" => rest.split_whitespace().next() == Some("drift"),
-        // Under OpenConsole it waits, up to 2 s, for the console host to forward
-        // its leave of a dead app's screen (`alt_screen_resync`).
-        "mainscreen" => true,
-        // A paste into a session not on screen waits, bounded, for its bytes to
-        // reach the program (`background_input`); a request lane must never wait
-        // on a program. A `paste` waits so only into another session: a flagless
-        // one goes to the App (`front_routed_input`, `cmd_paste`). A `paste-bin`
-        // takes the hidden arm whenever its target is not on screen, flagless too
-        // (a scoped caller's own background tab, a tab switch that raced it). Its
-        // target may be the tab on screen, whose paste answers at once; a wait
-        // lane serves that as well.
-        "paste" => selector
-            .as_ref()
-            .is_some_and(|s| !matches!(s, Selector::SelfTok)),
-        "paste-bin" => true,
-        _ => false,
+    match head.verb {
+        // `subscribe` carries its selector second. Self, a local id, a list, `@*`
+        // or a hosted session flips to push here at once: request-lane work.
+        "subscribe" if head.selector.is_none() => false,
+        // Every other line costs the lane its table form names (`Lane`): a wait
+        // for what parks on an event, a settle, a prompt, the owner, the
+        // network or the bridge's landing; a `paste` only when an explicit
+        // selector aims it at another session, whose program it waits on.
+        _ => match request.form().map(|form| form.lane) {
+            Some(Lane::Wait) => true,
+            Some(Lane::WaitWhenAimed) => head.selector.is_some_and(|s| !s.is_self()),
+            Some(Lane::Rpc) | None => false,
+        },
     }
 }
 
@@ -7802,16 +7707,20 @@ fn is_wait_request(line: &str, scope: Scope, store: &Store) -> bool {
 /// nothing is forwarded over the sibling hop, so a fleet read reaches this
 /// instance and no other. No frame is served, whatever its verb. `None` for every
 /// other scope, and for a line the fleet may run.
-fn fleet_refusal(line: &str, scope: Scope) -> Option<String> {
+fn fleet_refusal(request: &Request, scope: Scope) -> Option<String> {
     #[cfg(any(unix, test))]
     if matches!(scope, Scope::Fleet { .. }) {
-        let (selector, verb, _) = request_head(line);
+        let head = request.head();
+        let (selector, verb) = (head.selector, head.verb);
         let (refused, reply) = if selector.is_some() {
             (
                 "an @ selector",
                 "ERR denied: the fleet serves no selector; nothing is forwarded\n".to_string(),
             )
-        } else if binary_frame_verb(line).is_some() || post_frame_len(line).is_some() {
+        } else if request.frame().is_some()
+            || request.post_frame().is_some()
+            || spawn_frame_len(&head).is_some()
+        {
             (
                 "a frame",
                 "ERR denied: the fleet serves no frame\n".to_string(),
@@ -7832,7 +7741,7 @@ fn fleet_refusal(line: &str, scope: Scope) -> Option<String> {
         audit_fleet_refusal(verb, refused);
         return Some(reply);
     }
-    let _ = (line, scope);
+    let _ = (request, scope);
     None
 }
 
@@ -7905,8 +7814,9 @@ enum DriveLine {
 }
 
 /// THE DRIVE GATE OF A DRIVE CONNECTION'S LINE (the step-in,
-/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1), applied first on
-/// that connection: a fleet verb goes on to the fleet gate as any fleet
+/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1), applied first
+/// after the recovery-count gate ([`recovery_count_refusal`]) on that
+/// connection: a fleet verb goes on to the fleet gate as any fleet
 /// peer's; an act of the allowlist goes on as an Owner line — `scope`
 /// becomes [`Scope::Owner`] for it alone, the node named on the thread
 /// ([`crate::fabric::DrivingAs`]) for the hold slot and the typed-by stamp —
@@ -7916,10 +7826,10 @@ enum DriveLine {
 /// [`Scope::Fleet`] whose `drive` is set on a thread that names its node:
 /// either alone is a fleet peer.
 fn drive_admission(
-    line: String,
+    request: Request,
     scope: Scope,
     store: &Store,
-) -> Result<(String, Scope, Option<DriveAct>), String> {
+) -> Result<(Request, Scope, Option<DriveAct>), String> {
     #[cfg(any(unix, test))]
     if matches!(scope, Scope::Fleet { drive: true, .. })
         && let Some(driver) = crate::fabric::serving_driver()
@@ -7932,8 +7842,8 @@ fn drive_admission(
                 .is_some()
         };
         let spawned = |sid: &SessionId| drive_spawned_by(sid).as_deref() == Some(&*driver.node);
-        return match drive_gate(&line, &hosts, &spawned) {
-            Ok(DriveLine::Fleet) => Ok((line, scope, None)),
+        return match drive_gate(request.line(), &hosts, &spawned) {
+            Ok(DriveLine::Fleet) => Ok((request, scope, None)),
             Ok(DriveLine::Act { line, mut write }) => {
                 if let Some(DriveAct {
                     sid: Some(sid),
@@ -7943,17 +7853,25 @@ fn drive_admission(
                 {
                     ask.held = remote_held_by(store, sid, &driver.node);
                 }
-                Ok((line, Scope::Owner, write))
+                // A spawn's line gains `raise=false`: read again as it goes on.
+                let request = if line == request.line() {
+                    request
+                } else {
+                    Request::parse(line)
+                };
+                Ok((request, Scope::Owner, write))
             }
             Err(refused) => {
-                let (_, verb, _) = request_head(&line);
-                audit_fleet_refusal(verb, &format!("{} driving: {refused}", driver.host));
+                audit_fleet_refusal(
+                    request.head().verb,
+                    &format!("{} driving: {refused}", driver.host),
+                );
                 Err(format!("ERR denied: {refused}\n"))
             }
         };
     }
     let _ = store;
-    Ok((line, scope, None))
+    Ok((request, scope, None))
 }
 
 /// A drive's close of a session this aterm does not know the node spawned:
@@ -7988,10 +7906,15 @@ fn drive_gate(
     spawned: &dyn Fn(&SessionId) -> bool,
 ) -> Result<DriveLine, String> {
     const SID: &str = "a drive names a session this Mac hosts by its sid (@s-…)";
-    let (selector, verb, rest) = request_head(line);
-    if binary_frame_verb(line).is_some() || post_frame_len(line).is_some() {
+    let request = Request::parse(line.to_owned());
+    if request.frame().is_some() || request.post_frame().is_some() {
         return Err("a drive serves no frame but a worker's task".to_owned());
     }
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = request.head();
     let hosted = |sid: &str| {
         let sid = SessionId::new(sid);
         (sid.as_str().starts_with("s-") && hosts(&sid)).then_some(sid)
@@ -8093,8 +8016,8 @@ fn drive_gate(
 #[cfg(any(unix, test))]
 fn drive_turn(rest: &str) -> Result<(), String> {
     use aterm_types::control_verbs::DRIVE_TURN_MAX_MS;
-    let (_, rest) = control_input::take_leading_options("turn", rest);
-    match control_session::turn_options(&rest) {
+    let (_, rest) = control_input::take_leading_options(input_of("turn"), rest);
+    match control_session::turn_options(rest) {
         Ok(turn) if turn.timeout_ms > DRIVE_TURN_MAX_MS => Err(format!(
             "a drive's turn names a timeout= of at most {DRIVE_TURN_MAX_MS} ms (its \
              connection lasts 30 s): say settle=submitted and wait with `await task \
@@ -8269,88 +8192,88 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
     }
 }
 
+/// The one line every request, and every frame's header, is refused with
+/// while an old journal the keeper may still offer has no accepted successor
+/// ([`crate::keeper_link::RecoveryCountAdmission`]); `None` once it has.
+fn recovery_count_refusal(
+    admission: &crate::keeper_link::RecoveryCountAdmission,
+) -> Option<&'static str> {
+    (!admission.ready()).then_some("ERR recovery-count-custody unconfirmed\n")
+}
+
 /// Handle one authenticated request, folded into the `TOKEN` line or on its own
-/// line: the fleet gate, the empty-selector gate, proxy forward, subscribe
-/// flip, binary frame, then dispatch and reply. `None` means keep polling;
-/// `Some(disposition)` ends this lane.
+/// line: the recovery-count gate ([`recovery_count_refusal`]), the drive and
+/// fleet gates, the empty-selector gate, the askpass relay,
+/// proxy forward, subscribe flip, binary frame, then dispatch, its answer queued
+/// in `out` for the connection to deliver. `None` means keep polling;
+/// `Some(disposition)` ends this lane once `out` is delivered.
 #[allow(clippy::too_many_arguments)]
 fn serve_request_line(
-    line: String,
+    request: Request,
     scope: Scope,
     stream: &CtlStream,
     reader: &mut control_lanes::LaneReader<'_>,
-    writer: &mut impl Write,
+    out: &mut control_lanes::Outbox,
     active: &ActiveHandle,
     store: &Store,
-    subscribers: &Subscribers,
     proxy: &EventLoopProxy<Wake>,
-    queue: &ImageQueue,
     sock_dir: &std::path::Path,
+    recovery_count_admission: &crate::keeper_link::RecoveryCountAdmission,
 ) -> Option<ServeDisposition> {
-    // THE DRIVE GATE, first on a drive connection: an admitted act goes on
-    // as an Owner line; a refused line reaches no path below. One ERR line,
-    // then the connection closes.
-    let (line, scope, driven) = match drive_admission(line, scope, store) {
+    // Before drive attribution, forwarding, subscribe, askpass, frames or dispatch:
+    // no ID or history/since anchor can escape while an old journal is offerable.
+    if let Some(refusal) = recovery_count_refusal(recovery_count_admission) {
+        out.extend_from_slice(refusal.as_bytes());
+        return Some(ServeDisposition::Close);
+    }
+    // THE DRIVE GATE, first after the recovery-count gate on a drive
+    // connection: an admitted act goes on as an Owner line; a refused line
+    // reaches no path below. One ERR line, then the connection closes.
+    let (request, scope, driven) = match drive_admission(request, scope, store) {
         Ok(admitted) => admitted,
         Err(refusal) => {
-            let _ = writer
-                .write_all(refusal.as_bytes())
-                .and_then(|()| writer.flush());
+            out.push_owned(refusal.into_bytes());
             return Some(ServeDisposition::Close);
         }
     };
     // THE FLEET GATE: a fleet peer's refused line reaches no path below.
     // One ERR line, then the connection closes.
-    if let Some(refusal) = fleet_refusal(&line, scope) {
-        let _ = writer
-            .write_all(refusal.as_bytes())
-            .and_then(|()| writer.flush());
+    if let Some(refusal) = fleet_refusal(&request, scope) {
+        out.push_owned(refusal.into_bytes());
         return Some(ServeDisposition::Close);
     }
     // THE EMPTY-SELECTOR GATE: a leading `@` that names nothing reaches no
     // path below. The connection closes after the one ERR line, as a frame's
     // body (`@ feed-bin <n>`, `@ spawn … len=<n>`) may follow it unread.
-    if let Some(refusal) = empty_selector_refusal(&line) {
-        let _ = writer
-            .write_all(refusal.as_bytes())
-            .and_then(|()| writer.flush());
+    if let Some(refusal) = empty_selector_refusal(&request) {
+        out.push_owned(refusal.into_bytes());
         return Some(ServeDisposition::Close);
     }
+    let head = request.head();
     // The `sudo` askpass relay. Intercepted here, the one layer holding the
-    // stream, so it reads the peer once, gates on `Scope::Owner` EXACTLY, and
-    // returns the (secret-bearing) reply. The reply reaches the peer through
-    // `writer` like any other — on a pooled lane that is the `Outbox` buffer
-    // (`serve_line`'s `out`), which `Outbox::scrub` zeroes with `write_volatile`
-    // once delivered and on drop, so the plaintext does not linger. Never
-    // logged. A selector is refused: the request names no session (the server
-    // attributes it by ancestry).
-    {
-        let (selector, verb, _rest) = request_head(&line);
-        if verb == "askpass" {
-            let response = if selector.is_some() {
-                crate::control_askpass::public_reply("ERR askpass refused takes no @<sid>\n")
-            } else {
-                crate::control_askpass::serve(stream, scope, proxy, store)
-            };
-            if writer.write_all(response.as_bytes()).is_err() || writer.flush().is_err() {
-                return Some(ServeDisposition::Close);
-            }
-            return None;
-        }
+    // stream, so it reads the peer once and gates on `Scope::Owner` EXACTLY.
+    // Its (secret-bearing) reply goes to the outbox in its own guarded buffer,
+    // moved, never copied, scrubbed as it drops, and never logged. A selector
+    // is refused: the request names no session (the server attributes it by
+    // ancestry).
+    if head.verb == "askpass" {
+        let response = if head.selector.is_some() {
+            crate::control_askpass::public_reply("ERR askpass refused takes no @<sid>\n")
+        } else {
+            crate::control_askpass::serve(stream, scope, proxy, store)
+        };
+        out.push_secret(response);
+        return None;
     }
-    // Tokenized once: the generic binary-frame lane below reuses it (`line` is
-    // not changed in between).
-    let bin_verb = binary_frame_verb(&line);
     // A worker's spawn frame aimed at a session another process hosts is
     // never relayed ([`worker_frame_refusal`]); its task is unsent.
-    if let Some(refusal) = worker_frame_refusal(&line, store) {
-        let _ = writer.write_all(refusal.as_bytes());
-        let _ = writer.flush();
+    if let Some(refusal) = worker_frame_refusal(&head, store) {
+        out.push_owned(refusal.into_bytes());
         return Some(ServeDisposition::Close);
     }
-    // Cross-process forward (Item 5b): relay a `@<child-sid>` we spawned but
-    // don't host to the child's socket; the relay then owns the connection.
-    if try_proxy_forward(&line, scope, store, sock_dir, stream, reader) {
+    // Cross-process forward: relay a `@<sid>` another instance hosts to that
+    // instance's socket; the relay then owns the connection.
+    if try_proxy_forward(&request, scope, store, sock_dir, stream, reader) {
         return Some(ServeDisposition::Close);
     }
     // PUSH FLIP: `subscribe` authorizes its targets EXACTLY like a read verb,
@@ -8359,23 +8282,14 @@ fn serve_request_line(
     // and we close the connection (a half-subscribed connection is meaningless).
     // Transferred to the reserved push pool so a quiet subscriber never consumes
     // an ordinary RPC worker.
-    if is_subscribe_line(&line) {
-        return Some(ServeDisposition::Subscribe { line, scope });
+    if head.verb == "subscribe" && head.selector.is_none() {
+        return Some(ServeDisposition::Subscribe { request, scope });
     }
     // `post … len=<n>` reads the next N raw bytes as the message body. A valid
     // length is always consumed (even on refusal) to keep framing; a length the
     // server will not read closes the connection.
-    if let Some(len) = post_frame_len(&line) {
-        if !run_post_bin(
-            &line,
-            len,
-            reader,
-            active,
-            store,
-            subscribers,
-            scope,
-            writer,
-        ) {
+    if let Some(len) = request.post_frame() {
+        if !run_post_bin(&request, len, reader, active, store, scope, out) {
             return Some(ServeDisposition::Close);
         }
         return None;
@@ -8383,7 +8297,7 @@ fn serve_request_line(
     // `feed-bin`/`paste-bin <n>` read N raw bytes from the same stream into the
     // target's PTY (`feed-bin` raw, `paste-bin` with paste semantics), authorized
     // like `feed` inside `run_feed_bin`.
-    if let Some(bin_verb) = bin_verb {
+    if let Some(frame) = request.frame() {
         let mut dispatch_front_input =
             |event, session, completion: Option<crate::control_input_ack::InputCompletion>| {
                 post_input_reply_to_observed(
@@ -8393,20 +8307,17 @@ fn serve_request_line(
                     completion.map(|c| c.into_mark()),
                 )
             };
-        let mut clear_license = |session| front_routed_license_clear(proxy, session, false);
         if !run_feed_bin_routed_observed(
-            &line,
-            bin_verb,
+            &request,
+            frame,
             reader,
             FeedBinRoute {
                 active,
                 store,
                 scope,
-                subscribers: Some(subscribers),
             },
             &mut dispatch_front_input,
-            &mut clear_license,
-            writer,
+            out,
         ) {
             return Some(ServeDisposition::Close);
         }
@@ -8419,11 +8330,10 @@ fn serve_request_line(
     // framing, and one the server will not read is answered and closes. The
     // client sends the task only once its line is answered `GO <n>`
     // ([`read_worker_task`]).
-    let task = match spawn_frame_len(&line) {
+    let task = match spawn_frame_len(&head) {
         None => None,
         Some(Err(reply)) => {
-            let _ = writer.write_all(reply.as_bytes());
-            let _ = writer.flush();
+            out.push_owned(reply.into_bytes());
             return Some(ServeDisposition::Close);
         }
         Some(Ok(n)) => match read_worker_task(stream, reader, n) {
@@ -8433,14 +8343,14 @@ fn serve_request_line(
     };
     let _task = crate::task_launch::CarriedTask::enter(task);
     let resp = dispatch_request(
-        &line,
-        active,
-        store,
-        subscribers,
-        scope,
-        proxy,
-        queue,
-        sock_dir,
+        &request,
+        &DispatchCx {
+            active,
+            store,
+            scope,
+            proxy,
+            sock_dir,
+        },
     );
     #[cfg(any(unix, test))]
     if let Some(act) = &driven {
@@ -8448,15 +8358,11 @@ fn serve_request_line(
     }
     #[cfg(not(any(unix, test)))]
     let _ = driven;
-    // A dead client (broken pipe) must not crash the app — just drop it.
-    match write_control_reply_to_stream(stream, writer, resp) {
-        Ok(Some(retention)) => {
-            await_guarded_reply_close(stream, reader, retention);
-            Some(ServeDisposition::Close)
-        }
-        Ok(None) => None,
-        Err(_) => Some(ServeDisposition::Close),
-    }
+    // The outbox carries the answer and any artifact handoff it holds: the
+    // lane delivers it, never waiting on the peer, and the parker takes the
+    // rest — the guarded reply's acknowledgement included.
+    out.attach(resp);
+    None
 }
 
 /// The replies this instance owes for requests whose own action can END the
@@ -8531,12 +8437,19 @@ pub(crate) struct InputRepliesFence<'a> {
 }
 
 impl InputReplies {
-    /// [`FinalReplies::enter`] on this count. A final Commit holds admission
-    /// closed through its write, so a later request waits before dispatch.
-    pub(crate) fn enter(&self, line: &str) -> Option<FinalReply> {
-        self.0.admit(line).then(|| FinalReply {
+    /// [`FinalReplies::enter`] on this count, for a request read by the request
+    /// grammar ([`Request::head`]). A final Commit holds admission closed through
+    /// its write, so a later request waits before dispatch.
+    pub(crate) fn enter_head(&self, head: &Head<'_>) -> Option<FinalReply> {
+        self.0.admit(head).then(|| FinalReply {
             replies: Counted::Registry(Arc::clone(&self.0)),
         })
+    }
+
+    /// [`Self::enter_head`] of a request line: the tests' door.
+    #[cfg(test)]
+    pub(crate) fn enter(&self, line: &str) -> Option<FinalReply> {
+        self.enter_head(&control_request::head(line))
     }
 
     /// Whether a reply is still owed: an update's Commit does not `_exit` while
@@ -8569,7 +8482,7 @@ impl InputReplies {
     }
 }
 
-/// The reply `line` owes for input it writes into one of `store`'s sessions
+/// The reply `request` owes for input it writes into one of `store`'s sessions
 /// ([`InputReplies`]), counted from before its dispatch. Classified before any
 /// lock, so a request that writes no input (`version`, the forward's connect
 /// probe, say) never waits on the store. Not counted when its `@<sid>` names a
@@ -8578,9 +8491,9 @@ impl InputReplies {
 /// and a relay keeps its connection for the connection's whole life, so a count
 /// held across it would stand every update Commit down until the client hangs
 /// up.
-fn owed_input_reply(store: &Store, line: &str) -> Option<FinalReply> {
-    let (selector, verb, rest) = request_head(line);
-    if !writes_input(verb, rest) {
+fn owed_input_reply(store: &Store, request: &Request) -> Option<FinalReply> {
+    let head = request.head();
+    if !writes_input(head.verb, head.rest) {
         return None;
     }
     // The final Commit may hold admission closed. Never wait on that mutex
@@ -8589,14 +8502,14 @@ fn owed_input_reply(store: &Store, line: &str) -> Option<FinalReply> {
         let store = store
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(Selector::Sid(sid)) = &selector
-            && store.by_sid(sid).is_none()
+        if let Some(selector @ Selector::Sid(_)) = head.selector
+            && store.by_selector(&selector).is_none()
         {
             return None;
         }
         store.input_replies()
     };
-    replies.enter(line)
+    replies.enter_head(&head)
 }
 
 /// `store`'s [`InputReplies`].
@@ -8620,19 +8533,19 @@ impl FinalReplies {
         }
     }
 
-    /// Count `line`'s reply as owed when this count owes its verb; `None`
-    /// otherwise. Taken BEFORE the dispatch (the action may end the process),
-    /// dropped once the reply is delivered or its connection is gone.
-    pub(super) fn enter(&'static self, line: &str) -> Option<FinalReply> {
-        self.admit(line).then(|| FinalReply {
+    /// Count a request's reply as owed when this count owes its verb (`head`,
+    /// the request grammar's reading of it); `None` otherwise. Taken BEFORE the
+    /// dispatch (the action may end the process), dropped once the reply is
+    /// delivered or its connection is gone.
+    pub(super) fn enter(&'static self, head: &Head<'_>) -> Option<FinalReply> {
+        self.admit(head).then(|| FinalReply {
             replies: Counted::Instance(self),
         })
     }
 
-    /// Count `line`'s reply when this count owes its verb: whether it did.
-    fn admit(&self, line: &str) -> bool {
-        let (_, verb, rest) = request_head(line);
-        let owes = (self.owes)(verb, rest);
+    /// Count a request's reply when this count owes its verb: whether it did.
+    fn admit(&self, head: &Head<'_>) -> bool {
+        let owes = (self.owes)(head.verb, head.rest);
         if owes {
             *self
                 .owed
@@ -8713,6 +8626,7 @@ pub(crate) fn settle_final_replies(bound: std::time::Duration, input: &InputRepl
 #[cfg(test)]
 mod final_reply_tests {
     use super::FinalReplies;
+    use aterm_types::control_request::head;
     use std::time::Duration;
 
     /// Only a request whose own action can end the process is owed at exit, and
@@ -8728,13 +8642,13 @@ mod final_reply_tests {
             "invoke Quit",
             "confirm yes",
         ] {
-            let guard = REPLIES.enter(line);
+            let guard = REPLIES.enter(&head(line));
             assert!(guard.is_some(), "{line:?} can end the process");
             assert_eq!(REPLIES.owed(), 1, "{line:?}");
             drop(guard);
             assert_eq!(REPLIES.owed(), 0, "{line:?} delivered");
         }
-        let close = REPLIES.enter("close").expect("close is owed");
+        let close = REPLIES.enter(&head("close")).expect("close is owed");
         assert_eq!(REPLIES.owed(), 1);
         for line in [
             "version",
@@ -8745,7 +8659,7 @@ mod final_reply_tests {
             "closed",
             "await seq 3",
         ] {
-            assert!(REPLIES.enter(line).is_none(), "{line:?}");
+            assert!(REPLIES.enter(&head(line)).is_none(), "{line:?}");
             assert_eq!(REPLIES.owed(), 1, "{line:?} cannot deliver close's reply");
         }
         drop(close);
@@ -8758,7 +8672,7 @@ mod final_reply_tests {
     fn the_exit_waits_for_an_owed_reply_and_only_to_its_bound() {
         static REPLIES: FinalReplies = FinalReplies::new();
         assert!(REPLIES.settle(Duration::ZERO), "nothing owed: no wait");
-        let guard = REPLIES.enter("close").expect("close is owed");
+        let guard = REPLIES.enter(&head("close")).expect("close is owed");
         assert!(
             !REPLIES.settle(Duration::from_millis(20)),
             "owed: the wait ends at its bound"
@@ -8839,7 +8753,7 @@ mod final_reply_tests {
     #[test]
     #[cfg(unix)]
     fn a_lane_owes_an_input_reply_until_it_is_delivered() {
-        use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes};
+        use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes, Outbox};
         use std::io::{BufRead as _, Write as _};
         use std::sync::{Arc, Mutex};
 
@@ -8849,8 +8763,8 @@ mod final_reply_tests {
             seen: Mutex<Vec<(String, bool)>>,
         }
         impl LaneService for Service {
-            fn owed_input_reply(&self, line: &str) -> Option<super::FinalReply> {
-                self.replies.enter(line)
+            fn owed_input_reply(&self, request: &super::Request) -> Option<super::FinalReply> {
+                self.replies.enter_head(&request.head())
             }
             fn authenticate(
                 &self,
@@ -8865,12 +8779,13 @@ mod final_reply_tests {
             }
             fn serve_line(
                 &self,
-                line: String,
+                request: super::Request,
                 _scope: super::Scope,
                 _stream: &aterm_uds::CtlStream,
                 _reader: &mut LaneReader<'_>,
-                out: &mut Vec<u8>,
+                out: &mut Outbox,
             ) -> Option<super::ServeDisposition> {
+                let line = request.line().to_string();
                 out.extend_from_slice(format!("OK {line}\n").as_bytes());
                 let owed = self.replies.owed();
                 self.seen
@@ -8879,12 +8794,12 @@ mod final_reply_tests {
                     .push((line, owed));
                 None
             }
-            fn is_wait(&self, _line: &str, _scope: super::Scope) -> bool {
+            fn is_wait(&self, _request: &super::Request, _scope: super::Scope) -> bool {
                 false
             }
             fn subscribe(
                 &self,
-                _line: String,
+                _request: super::Request,
                 _scope: super::Scope,
                 _stream: aterm_uds::CtlStream,
             ) {
@@ -8900,8 +8815,9 @@ mod final_reply_tests {
             wait: 1,
             inline: 1,
             open: 4,
+            subscriptions: 1,
         });
-        lanes.start();
+        let _ = lanes.start();
         let service = Arc::new(Service::default());
         lanes.publish(service.clone());
         let (client, server) = aterm_uds::CtlStream::pair().expect("socket pair");
@@ -8959,7 +8875,7 @@ mod final_reply_tests {
             (format!("@{} send ls", elsewhere.as_str()), false),
             (format!("@{} paste hi", elsewhere.as_str()), false),
         ] {
-            let guard = super::owed_input_reply(&store, &line);
+            let guard = super::owed_input_reply(&store, &super::Request::parse(line.clone()));
             assert_eq!(guard.is_some(), counted, "{line:?}");
             assert_eq!(replies.owed(), counted, "{line:?}");
             drop(guard);
@@ -8985,7 +8901,8 @@ mod final_reply_tests {
         let asker = {
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
-                let _ = answer_tx.send(super::owed_input_reply(&store, "version").is_none());
+                let version = super::Request::parse("version".to_string());
+                let _ = answer_tx.send(super::owed_input_reply(&store, &version).is_none());
             })
         };
         let answered = answer_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
@@ -9010,39 +8927,75 @@ fn read_request_line(reader: &mut impl BufRead) -> Option<String> {
 }
 
 /// Read one line under one monotonic deadline, re-armed before every buffer
-/// refill, so a peer cannot hold a lane by dribbling bytes: the handshake's
-/// first line, and the ACK that releases a guarded artifact.
-///
-/// A detached peer's queued bytes are still read: the one-shot `aterm ctl`
-/// writes `ACK <nonce>` and exits, and on Darwin `SO_RCVTIMEO` then fails with
-/// EINVAL while `recv` still returns the queued bytes (see
-/// [`enter_detached_peer_drain`]). An over-long line's refusal goes to
-/// `refusal`.
+/// refill ([`DeadlineRead`]), so a peer cannot hold a lane by dribbling bytes:
+/// the handshake's first line. An over-long line's refusal goes to `refusal`.
 fn read_request_line_until(
     stream: &CtlStream,
     reader: &mut impl BufRead,
     refusal: &mut impl Write,
     deadline: std::time::Instant,
 ) -> Option<String> {
-    // Latched, not re-tested per refill: once Darwin has refused the bound for
-    // a detached peer, another failing syscall buys nothing.
-    let mut draining_detached_peer = false;
-    read_request_line_with_policy(reader, refusal, false, || {
+    let mut bound = DeadlineRead::new(stream, deadline);
+    read_request_line_with_policy(reader, refusal, false, || bound.arm())
+}
+
+/// The time left until `deadline` for one blocking socket call (at least a
+/// millisecond: a zero timeout means none), or `TimedOut` once it has passed.
+fn remaining_artifact_io_budget(
+    deadline: std::time::Instant,
+) -> std::io::Result<std::time::Duration> {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "artifact handoff deadline expired",
+        ));
+    }
+    Ok(deadline
+        .saturating_duration_since(now)
+        .max(MIN_ARTIFACT_IO_TIMEOUT))
+}
+
+/// The bound a deadline-bound read re-arms before every refill: the time left
+/// until one absolute deadline, as `SO_RCVTIMEO`.
+///
+/// A detached peer's queued bytes are still read: the one-shot `aterm ctl`
+/// writes `ACK <nonce>` and exits, and on Darwin `SO_RCVTIMEO` then fails with
+/// EINVAL while `recv` still returns the queued bytes (see
+/// [`enter_detached_peer_drain`]).
+struct DeadlineRead<'a> {
+    stream: &'a CtlStream,
+    deadline: std::time::Instant,
+    /// Latched, not re-tested per refill: once Darwin has refused the bound
+    /// for a detached peer, another failing syscall buys nothing.
+    draining_detached_peer: bool,
+}
+
+impl<'a> DeadlineRead<'a> {
+    fn new(stream: &'a CtlStream, deadline: std::time::Instant) -> Self {
+        Self {
+            stream,
+            deadline,
+            draining_detached_peer: false,
+        }
+    }
+
+    fn arm(&mut self) -> std::io::Result<()> {
         // The absolute deadline still governs, drain or not: it is the one
         // bound a peer cannot influence.
-        let budget = remaining_artifact_io_budget(deadline)?;
-        if draining_detached_peer {
+        let budget = remaining_artifact_io_budget(self.deadline)?;
+        if self.draining_detached_peer {
             return Ok(());
         }
-        match stream.set_read_timeout(Some(budget)) {
+        match self.stream.set_read_timeout(Some(budget)) {
             Ok(()) => Ok(()),
             Err(refused) => {
-                enter_detached_peer_drain(stream, refused)?;
-                draining_detached_peer = true;
+                enter_detached_peer_drain(self.stream, refused)?;
+                self.draining_detached_peer = true;
                 Ok(())
             }
         }
-    })
+    }
 }
 
 /// Recover from Darwin's detached-peer `EINVAL` by switching to non-blocking
@@ -9063,16 +9016,16 @@ fn enter_detached_peer_drain(_stream: &CtlStream, refused: std::io::Error) -> st
 }
 
 /// Read one authenticated request without imposing an application idle deadline.
-/// On macOS, a level-triggered socket wait parks the lane until data or EOF;
-/// the existing recv timeout remains a backstop for a spurious readiness event.
-/// A coalesced next line already in `BufReader` must bypass the socket wait:
-/// its bytes are no longer visible to `poll` and waiting would deadlock. An
-/// over-long line's refusal goes to `refusal`.
+/// On unix, a level-triggered socket wait parks the lane until data or EOF; the
+/// recv timeout remains a backstop for a spurious readiness event.
+/// A coalesced next line already in the reader's buffer must bypass the socket
+/// wait: its bytes are no longer visible to `poll` and waiting would deadlock.
+/// An over-long line's refusal goes to `refusal`.
 fn read_authenticated_request_line(
     reader: &mut control_lanes::LaneReader<'_>,
     refusal: &mut impl Write,
 ) -> Option<String> {
-    let stream = reader.get_ref().stream();
+    let stream = reader.stream();
     let mut buffered_first_refill = !reader.buffer().is_empty();
     read_request_line_with_policy(reader, refusal, true, || {
         if std::mem::take(&mut buffered_first_refill) {
@@ -9084,10 +9037,12 @@ fn read_authenticated_request_line(
     })
 }
 
-/// On Darwin `poll(POLLIN)` reports a write-half close as readable plus hangup
-/// even when `recvfrom` would sleep; wait on it so idle reads do not wake every
-/// 250 ms. Polls the borrowed fd (a cloned AF_UNIX fd's close can stall).
-#[cfg(target_os = "macos")]
+/// Park until the socket is readable or hung up, so an idle authenticated
+/// connection (the fabric bridge, a lane with no parker) does not wake on every
+/// [`AUTHENTICATED_READ_POLL`] tick. On Darwin `poll(POLLIN)` also reports a
+/// write-half close as readable plus hangup even when `recvfrom` would sleep.
+/// Polls the borrowed fd (a cloned AF_UNIX fd's close can stall).
+#[cfg(unix)]
 fn wait_authenticated_readable(stream: &CtlStream) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -9117,7 +9072,7 @@ fn wait_authenticated_readable(stream: &CtlStream) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn authenticated_poll_event(revents: libc::c_short) -> std::io::Result<()> {
     if revents & libc::POLLNVAL != 0 {
         return Err(std::io::Error::from_raw_os_error(libc::EBADF));
@@ -9132,7 +9087,9 @@ fn authenticated_poll_event(revents: libc::c_short) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(not(target_os = "macos"))]
+/// No readiness wait: the [`AUTHENTICATED_READ_POLL`] receive timeout is the
+/// wait.
+#[cfg(not(unix))]
 fn wait_authenticated_readable(_stream: &CtlStream) -> std::io::Result<()> {
     Ok(())
 }
@@ -9198,21 +9155,6 @@ fn read_request_line_with_policy(
     }
 }
 
-/// Move an authenticated push subscription to its own bounded pool; saturation
-/// returns an explicit error and the RPC worker is reusable at once.
-fn handoff_subscription(
-    subscriptions: &SubscriptionDispatch,
-    line: String,
-    scope: Scope,
-    stream: CtlStream,
-) {
-    if let Err(mut stream) = subscriptions.try_submit(line, scope, stream) {
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
-        let _ = stream.write_all(b"ERR subscription capacity busy; retry\n");
-        let _ = stream.flush();
-    }
-}
-
 /// Upper bound on one control request line (`feed-bin` payloads are bounded
 /// separately); a longer line is refused and the connection closed. The
 /// client refuses one before sending it, from the same constant.
@@ -9225,8 +9167,12 @@ const MAX_REQUEST_LINE: usize = aterm_types::control_verbs::MAX_REQUEST_LINE;
 /// under it, from its pick-up.
 const AUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Receive timeout backstop for authenticated sockets (the liveness cadence
-/// off macOS). Timed-out reads are retried forever.
+/// Receive timeout for authenticated sockets, armed on every platform. On unix
+/// a request line's read follows a readiness wait, so it fires there only on a
+/// spurious readiness event; elsewhere it is that wait. A frame body is read
+/// without one, so a stalled body wakes on it and
+/// [`read_exact_authenticated_until`] checks its deadline. A timed-out read is
+/// retried, never taken for EOF.
 const AUTHENTICATED_READ_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn arm_authenticated_read_poll(stream: &CtlStream) -> std::io::Result<()> {
@@ -9244,11 +9190,10 @@ fn decode_request_line(mut buf: Vec<u8>) -> String {
     String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-/// Whether a request line's first token is `subscribe`, which [`serve`] diverts
-/// to push mode before per-verb dispatch.
-fn is_subscribe_line(line: &str) -> bool {
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    matches!(line.split_whitespace().next(), Some("subscribe"))
+/// [`decode_request_line`] of a line still in its buffer (its `\n` not
+/// included), borrowed: a valid UTF-8 line costs no copy.
+fn request_line_text(line: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(line))
 }
 
 /// Maximum `feed-bin` payload per frame (256 KiB).
@@ -9259,54 +9204,26 @@ const MAX_FEED_BIN: usize = 256 * 1024;
 /// also de-duplicated by session.
 pub(crate) const MAX_SUBSCRIBE_TARGETS: usize = 256;
 
-/// Whether a request line is a binary-frame verb (optionally `@<sel>`-prefixed)
-/// whose length-prefixed payload [`serve`] reads before dispatch: `feed-bin`
-/// (raw) or `paste-bin` (paste seam). Named so the serve-loop sync test finds
-/// each in the VERBS table.
-fn binary_frame_verb(line: &str) -> Option<&'static str> {
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    let mut it = line.split_whitespace();
-    // An optional leading `@<selector>` (cross-session) precedes the verb.
-    let tok = match it.next() {
-        Some(t) if t.starts_with('@') => it.next(),
-        other => other,
-    };
-    match tok {
-        Some("feed-bin") => Some("feed-bin"),
-        Some("paste-bin") => Some("paste-bin"),
-        _ => None,
-    }
-}
-
-/// Whether this line is a length-prefixed `post`, whose body (up to
-/// [`crate::fabric::BODY_MAX`]) travels on the stream so model text never
-/// passes through argv. `Some(Ok(n))` announces n bytes; `Some(Err(reply))` is
-/// a `len=` the server will not read ([`crate::fabric::post_len`]), which
-/// desyncs the stream and closes the connection.
+/// A length-prefixed `post`'s body (up to [`crate::fabric::BODY_MAX`]) travels
+/// on the stream so model text never passes through argv; `rest` is the line
+/// after the verb. `Some(Ok(n))` announces n bytes; `Some(Err(reply))` is a
+/// `len=` the server will not read ([`crate::fabric::post_len`]), which desyncs
+/// the stream and closes the connection; `None` is an inline `post`.
 ///
 /// The scan follows `cmd_post`'s own rule — OPTIONS LEAD, the first token that is
 /// not one (or the first after `--`) begins the inline text — so a `post … hello len=3` whose `len=` sits in
 /// the BODY is not a frame, and the two parsers cannot disagree about where the
 /// text starts. That symmetry is load-bearing: a detector that saw a frame the
 /// handler did not would leave n bytes of body to be read as control verbs.
-fn post_frame_len(line: &str) -> Option<Result<usize, String>> {
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    let mut it = line.split_whitespace();
-    let tok = match it.next() {
-        Some(t) if t.starts_with('@') => it.next(),
-        other => other,
-    };
-    if tok != Some("post") {
-        return None;
-    }
+fn post_frame_len(rest: &str) -> Option<Result<usize, String>> {
     // The option vocabulary `cmd_post` accepts before the body begins, and its
     // `--` end of options — the SAME reading the handler uses, not a copy of it.
-    crate::fabric::post_options(it)
+    crate::fabric::post_options(rest.split_whitespace())
         .find_map(|tok| tok.strip_prefix("len="))
         .map(crate::fabric::post_len)
 }
 
-/// Whether this line is a WORKER's spawn (`spawn … agent=claude len=<n>`),
+/// Whether this request is a WORKER's spawn (`spawn … agent=claude len=<n>`),
 /// whose task — at most [`crate::task_launch::TASK_MAX`] raw bytes — travels
 /// on the stream after the line (`task_launch`). `Some(Ok(n))` announces n
 /// bytes; `Some(Err(reply))` is a `len=` the server will not read
@@ -9318,11 +9235,11 @@ fn post_frame_len(line: &str) -> Option<Result<usize, String>> {
 /// refuses (an unterminated quote) is read word by word instead, and any
 /// `len=` there is a frame: its bytes are consumed and the handler answers
 /// the usage line, so a task — text a model wrote — is never read as verbs.
-fn spawn_frame_len(line: &str) -> Option<Result<usize, String>> {
-    let (_, verb, rest) = request_head(line);
-    if verb != "spawn" {
+fn spawn_frame_len(head: &Head<'_>) -> Option<Result<usize, String>> {
+    if head.verb != "spawn" {
         return None;
     }
+    let rest = head.rest;
     let tokens = control_media::split_quoted_tokens(rest)
         .unwrap_or_else(|| rest.split_whitespace().map(str::to_string).collect());
     tokens
@@ -9360,15 +9277,15 @@ fn read_worker_task(
 /// cannot answer for another (one that predates the frame would serve the task
 /// as requests). So it is refused, the task unsent, and the connection closes:
 /// the client asks the instance its own session lives on.
-fn worker_frame_refusal(line: &str, store: &Store) -> Option<String> {
-    spawn_frame_len(line)?.ok()?;
-    let (Some(Selector::Sid(sid)), _, _) = request_head(line) else {
+fn worker_frame_refusal(head: &Head<'_>, store: &Store) -> Option<String> {
+    spawn_frame_len(head)?.ok()?;
+    let Some(selector @ Selector::Sid(sid)) = head.selector else {
         return None;
     };
     let hosted = store
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .by_sid(&sid)
+        .by_selector(&selector)
         .is_some();
     (!hosted).then(|| {
         format!(
@@ -9379,84 +9296,65 @@ fn worker_frame_refusal(line: &str, store: &Store) -> Option<String> {
     })
 }
 
-/// The bytes of body a request `line` announces: what [`serve_request_line`]
-/// reads after the line before it answers — a `post … len=<n>`, a worker's
-/// `spawn … len=<n>`, `feed-bin <n>` or
-/// `paste-bin <n>` with a length it will read.
-/// Zero for every other line, and for a length it refuses unread (it answers
-/// and closes instead). The lanes serve a request only once this much has
-/// followed its line (`control_lanes::held`), so a lane never waits for a body.
-fn announced_body(line: &str) -> usize {
-    if let Some(len) = post_frame_len(line).or_else(|| spawn_frame_len(line)) {
+/// The bytes of body a request announces: what [`serve_request_line`] reads
+/// after the line before it answers — a `post … len=<n>`, `feed-bin <n>` or
+/// `paste-bin <n>` (by its row's [`Body`]), or a worker's `spawn … len=<n>`
+/// ([`spawn_frame_len`]), with a length it will read. Zero for every other
+/// line, and for a length it refuses unread (it answers and closes instead).
+/// The lanes serve a request only once this much has followed its line
+/// (`control_lanes::held`), so a lane never waits for a body.
+fn announced_body(head: &Head<'_>, form: Option<Resolved>) -> usize {
+    if let Some(len) = spawn_frame_len(head) {
         return len.unwrap_or(0);
     }
-    binary_frame_verb(line).map_or(0, |verb| match parse_feed_bin(line, verb) {
-        FeedBinFrame::Ok(_, n, _) => n,
-        FeedBinFrame::Malformed | FeedBinFrame::TooLarge => 0,
-    })
-}
-
-/// Resolve only the target-bearing prefix of a binary input header, independent
-/// of the length parser: once a client names a write verb and target, even a
-/// malformed or over-cap attempt is a new input boundary for that target's
-/// cursor licence. Unknown verbs return `None`; authorization is checked
-/// separately.
-fn binary_frame_attempt_selector(line: &str, verb: &str) -> Option<Option<Selector>> {
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    let mut it = line.split_whitespace();
-    let first = it.next()?;
-    if let Some(body) = first.strip_prefix('@') {
-        let selector = Selector::parse(body)?;
-        (it.next()? == verb).then_some(Some(selector))
-    } else {
-        (first == verb).then_some(None)
+    match form.map_or(Body::None, |form| form.row.body) {
+        Body::None => 0,
+        Body::PostLen => post_frame_len(head.rest).map_or(0, |len| len.unwrap_or(0)),
+        Body::Counted { keyed } => match parse_frame_header(head.rest, keyed) {
+            FeedBinFrame::Ok(n, _) => n,
+            FeedBinFrame::Malformed | FeedBinFrame::TooLarge => 0,
+        },
     }
 }
 
-/// Outcome of parsing `[@<sel>] feed-bin <n>`. Because the payload is pipelined
-/// on the same stream, the failures need opposite handling:
+/// [`announced_body`] of a line still in a connection's buffer, before it is a
+/// [`Request`]: the lanes' test of whether a request is whole
+/// (`control_lanes::held`), which reads it in place.
+fn announced_body_of(line: &str) -> usize {
+    let head = control_request::head(line);
+    announced_body(
+        &head,
+        aterm_types::control_verbs::spec_for(head.verb, head.rest),
+    )
+}
+
+/// Outcome of parsing a counted frame's header, `[@<sel>] feed-bin <n>`. Because
+/// the payload is pipelined on the same stream, the failures need opposite
+/// handling:
 /// - [`Malformed`](FeedBinFrame::Malformed): no length announced, so reply
 ///   `ERR` and stay framed.
 /// - [`TooLarge`](FeedBinFrame::TooLarge): a length past [`MAX_FEED_BIN`]; the
 ///   client already sent bytes we will not read, so the caller must close the
 ///   connection rather than execute them as verbs.
-enum FeedBinFrame {
-    /// Not a well-formed feed-bin line (missing / non-numeric length).
+#[derive(Debug, PartialEq, Eq)]
+enum FeedBinFrame<'a> {
+    /// Not a well-formed header (missing / non-numeric length, a stray token).
     Malformed,
     /// Well-formed but the declared length exceeds [`MAX_FEED_BIN`].
     TooLarge,
-    /// A valid frame: optional selector, length (`<= MAX_FEED_BIN`) and the
-    /// optional idempotency key, carried in the header so a refused key still
-    /// consumes the payload.
-    Ok(Option<Selector>, usize, Option<String>),
+    /// A valid frame: the length (`<= MAX_FEED_BIN`) and the optional
+    /// idempotency key, carried in the header so a refused key still consumes
+    /// the payload.
+    Ok(usize, Option<&'a str>),
 }
 
-/// Parse `[@<sel>] feed-bin <n>`. Pure; see [`FeedBinFrame`] for why oversize
-/// and malformed differ.
-fn parse_feed_bin(line: &str, verb: &str) -> FeedBinFrame {
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    let mut it = line.split_whitespace();
-    let Some(first) = it.next() else {
+/// Parse a counted frame's header after its verb (`rest`): `<n>`, then an
+/// `id=<key>` when the row is `keyed` (`feed-bin`). Pure; see [`FeedBinFrame`]
+/// for why oversize and malformed differ.
+fn parse_frame_header(rest: &str, keyed: bool) -> FeedBinFrame<'_> {
+    let mut it = rest.split_whitespace();
+    let Some(len_tok) = it.next() else {
         return FeedBinFrame::Malformed;
-    };
-    let (selector, len_tok) = if let Some(body) = first.strip_prefix('@') {
-        // `@<sel> <verb> <n>`: next token must be the verb, then the length.
-        match (it.next(), it.next()) {
-            (Some(v), Some(tok)) if v == verb => match Selector::parse(body) {
-                Some(selector) => (Some(selector), tok),
-                None => return FeedBinFrame::Malformed,
-            },
-            _ => return FeedBinFrame::Malformed,
-        }
-    } else {
-        // `<verb> <n>`
-        if first != verb {
-            return FeedBinFrame::Malformed;
-        }
-        match it.next() {
-            Some(tok) => (None, tok),
-            None => return FeedBinFrame::Malformed,
-        }
     };
     // One optional trailing token, `feed-bin` only: the idempotency key
     // `id=<epoch>:<producer>:<seq>`. `paste-bin` takes none.
@@ -9466,8 +9364,8 @@ fn parse_feed_bin(line: &str, verb: &str) -> FeedBinFrame {
     // is not malformed here: the payload is read and the key parser refuses it.
     let idem = match it.next() {
         None => None,
-        Some(tok) if verb == "feed-bin" => match tok.strip_prefix("id=") {
-            Some(key) => Some(key.to_string()),
+        Some(tok) if keyed => match tok.strip_prefix("id=") {
+            Some(key) => Some(key),
             None => return FeedBinFrame::Malformed,
         },
         Some(_) => return FeedBinFrame::Malformed,
@@ -9481,7 +9379,7 @@ fn parse_feed_bin(line: &str, verb: &str) -> FeedBinFrame {
     if n > MAX_FEED_BIN {
         return FeedBinFrame::TooLarge;
     }
-    FeedBinFrame::Ok(selector, n, idem)
+    FeedBinFrame::Ok(n, idem)
 }
 
 /// Handle `[@<sel>] feed-bin <n>\n<bytes>`: read the n raw bytes from the same
@@ -9494,7 +9392,6 @@ fn parse_feed_bin(line: &str, verb: &str) -> FeedBinFrame {
 #[cfg(all(test, unix))]
 fn run_feed_bin<W: Write>(
     line: &str,
-    verb: &str,
     reader: &mut impl BufRead,
     active: &ActiveHandle,
     store: &Store,
@@ -9519,113 +9416,66 @@ fn run_feed_bin<W: Write>(
             }
             Ok(InputOutcome::Ok)
         };
-    let mut clear_license = |_session| "OK\n".to_string();
+    let request = Request::parse(line.to_string());
+    let frame = request.frame().expect("a counted frame's header");
     run_feed_bin_routed_observed(
-        line,
-        verb,
+        &request,
+        frame,
         reader,
         FeedBinRoute {
             active,
             store,
             scope,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut clear_license,
         writer,
     )
 }
 
-/// THE `mark` ARM (design §7.4, phase 3A): a claim written to session `session`'s
+/// THE `mark` ARM (design §7.4, phase 3A): a claim written to session `ctx`'s
 /// log, attributed to the connection ([`control_session::log_actor`]), and the
 /// session's watchers woken once it is in. Its whole job is these calls: a mark
 /// is a record, and this path names no input, signal or session write — the
 /// `slog-inert` census guard holds this function to exactly this list, and the
 /// functional negative control (`a_mark_act_on_an_open_approval_writes_no_byte`)
 /// proves no byte reaches the PTY.
-fn dispatch_mark(
-    ctx: &SessionCtx,
-    scope: Scope,
-    session: u64,
-    rest: &str,
-    subscribers: &Subscribers,
-) -> String {
+fn dispatch_mark(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     let reads = scope.is_owner_class() || cross_session_authorized(scope, "text", ctx);
     let (reply, owed) =
         crate::session_log::cmd_mark(ctx, control_session::log_actor(scope, ctx), reads, rest);
     if owed {
-        wake_watchers(subscribers, session);
+        ctx.watchers.ring_watchers();
     }
     reply
 }
 
-/// WAKE SESSION `local`'s SUBSCRIBERS so a timeline row just recorded drains
-/// NOW, not on the push loop's 250 ms tick — `meta`'s rule. The fabric verbs
-/// whose row the bridge acts on (`post`, `topic`, `inbox seen`, a parked
-/// `inbox get @<off>`) all wake through this, because the bridge's push lane
-/// is one of those subscribers and has no idle poll of its own.
-fn wake_watchers(subscribers: &Subscribers, local: u64) {
-    if subscribers.any() {
-        subscribers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .notify(local);
-    }
-}
-
-/// [`wake_watchers`] for the session whose stable id is `sid`, as a fabric
+/// RING THE WATCHERS of the session whose stable id is `sid`, as a fabric
 /// verb names it once its fabric lock is released (the session log's `mail`,
-/// `mail-landed` and `hold` marks): its local id is the registry's, read
+/// `mail-landed` and `hold` marks): its watchers are the registry's, read
 /// with no other lock held.
-pub(crate) fn wake_sid_watchers(
-    store: &Store,
-    subscribers: &Subscribers,
-    sid: &aterm_session::SessionId,
-) {
-    if !subscribers.any() {
-        return;
-    }
-    let local = store
+pub(crate) fn wake_sid_watchers(store: &Store, sid: &aterm_session::SessionId) {
+    let watchers = store
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .by_sid(sid)
-        .map(|h| h.local_id);
-    if let Some(local) = local {
-        wake_watchers(subscribers, local);
+        .map(|h| Arc::clone(&h.ctx.watchers));
+    if let Some(watchers) = watchers {
+        watchers.ring_watchers();
     }
 }
 
-/// `post` (both forms) for session `local` via
-/// [`crate::fabric::cmd_post_waking`], waking that session's `events`
-/// subscribers so the `post` record drains now (the bridge drains the outbox on
-/// `EVENT <sid> post`).
-fn post_waking_watchers(
-    ctx: &SessionCtx,
-    local: u64,
-    rest: &str,
-    body: Option<Vec<u8>>,
-    subscribers: &Subscribers,
-) -> String {
-    crate::fabric::cmd_post_waking(ctx, rest, body, &|| wake_watchers(subscribers, local))
-}
-
 /// Serve a length-prefixed `post`: read the body, then hand it to
-/// [`post_waking_watchers`]. Returns `false` to close only when the stream is
-/// desynced (a refused length or a short read).
+/// [`crate::fabric::cmd_post`]. Returns `false` to close only when the stream
+/// is desynced (a refused length or a short read).
 ///
 /// An Edge connection is refused outright (see [`post_scope_denied`]); the
 /// refusal still consumes the body.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the framed post reads its body off the stream and wakes the target's subscribers"
-)]
 fn run_post_bin<W: Write>(
-    line: &str,
+    request: &Request,
     len: Result<usize, String>,
     reader: &mut impl BufRead,
     active: &ActiveHandle,
     store: &Store,
-    subscribers: &Subscribers,
     scope: Scope,
     writer: &mut W,
 ) -> bool {
@@ -9641,17 +9491,19 @@ fn run_post_bin<W: Write>(
     if read_exact_authenticated(reader, &mut body).is_err() {
         return false;
     }
-    let (selector, verb, rest) = request_head(line);
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = request.head();
     debug_assert_eq!(verb, "post");
-    let target = match selector.as_ref() {
-        None | Some(Selector::SelfTok) => Ok(resolve_active(active)),
-        Some(sel) => resolve_explicit(store, sel),
-    };
-    let target = match target {
-        Ok(target) => target,
+    let target = match selector.map_or(Resolution::SelfTok, |s| resolve(store, &s)) {
+        Resolution::SelfTok => resolve_active(active),
+        Resolution::Hosted(target) => Some(target),
+        Resolution::Missing => None,
         // The body is already read, so the stream stays framed: answer the
         // refusal and keep the connection.
-        Err(refusal) => {
+        Resolution::Ambiguous(refusal) => {
             if writer.write_all(refusal.as_bytes()).is_err() {
                 return false;
             }
@@ -9660,12 +9512,8 @@ fn run_post_bin<W: Write>(
     };
     let response = match target {
         _ if post_scope_denied(scope) => "ERR denied\n".to_string(),
-        Some((_, _, local, ctx)) => {
-            post_waking_watchers(&ctx, local, rest, Some(body), subscribers)
-        }
-        None if matches!(selector, Some(Selector::Local(_) | Selector::Sid(_))) => {
-            "ERR no such session\n".to_string()
-        }
+        Some((_, _, _, ctx)) => crate::fabric::cmd_post(&ctx, rest, Some(body)),
+        None if selector.is_some_and(|s| !s.is_self()) => "ERR no such session\n".to_string(),
         None => NO_ACTIVE_TERMINAL.to_string(),
     };
     if writer.write_all(response.as_bytes()).is_err() {
@@ -9678,60 +9526,38 @@ fn run_post_bin<W: Write>(
 /// for its target, acted on before the payload is waited for. Resolve and
 /// authorize the header prefix first, so a slowly trickled frame cannot let
 /// unrelated child output borrow the old key-hint licence: an authorized
-/// target's licence is fenced here. A lane runs it as soon as the header is
-/// whole (`LaneService::frame_header`) and again when the whole frame is served
-/// ([`run_feed_bin_routed`]): the second fence is one more of the kind the
-/// payload gets anyway at its effect boundary, before egress.
-/// `false`: refused before the payload (an ambiguous target, a failed fence),
-/// the answer in `writer`; the stream is desynced, so the connection closes.
-fn feed_bin_header<W: Write, C>(
-    line: &str,
-    verb: &str,
+/// target's licence is fenced here ([`crate::licence_fence`]). A lane runs it as
+/// soon as the header is whole (`LaneService::frame_header`) and again when the
+/// whole frame is served ([`run_feed_bin_routed`]): the second fence is one more
+/// of the kind the payload gets anyway at its effect boundary, before egress.
+/// `false`: refused before the payload (an ambiguous target), the answer in
+/// `writer`; the stream is desynced, so the connection closes.
+fn feed_bin_header<W: Write>(
+    selector: Option<&Selector<'_>>,
     route: FeedBinRoute<'_>,
-    clear_license: &mut C,
     writer: &mut W,
-) -> bool
-where
-    C: FnMut(u64) -> String,
-{
-    // Malformed and over-cap attempts follow the same rule; unknown or
-    // unauthorized targets never mutate UI state.
-    let attempt_selector = binary_frame_attempt_selector(line, verb);
-    let header_active_target = resolve_active(route.active);
-    // An ambiguous id must not clear another instance's licence either; refuse
-    // before the payload.
-    let mut header_refusal = None;
-    let header_target = attempt_selector
-        .as_ref()
-        .and_then(|selector| match selector {
-            None | Some(Selector::SelfTok) => header_active_target.clone(),
-            Some(sel) => match resolve_explicit(route.store, sel) {
-                Ok(target) => target,
-                Err(refusal) => {
-                    header_refusal = Some(refusal);
-                    None
-                }
-            },
-        });
-    if let Some(refusal) = header_refusal {
-        // The payload is unread, so the stream is desynced: answer and close.
-        let _ = writer.write_all(refusal.as_bytes());
-        let _ = writer.flush();
-        return false;
-    }
-    let header_authorized = header_target.as_ref().is_some_and(|(_, _, _, ctx)| {
-        route.scope.is_owner_class() || cross_session_authorized(route.scope, "feed", ctx)
-    });
-    if header_authorized && let Some((_, _, session, _)) = header_target.as_ref() {
-        let response = clear_license(*session);
-        if !response.starts_with("OK") {
-            // The main-thread fence failed; do not wait for the payload.
-            let _ = writer.write_all(response.as_bytes());
+) -> bool {
+    // Malformed and over-cap attempts follow the same rule (the target is the
+    // header's, whatever its length says); unknown or unauthorized targets never
+    // mutate UI state.
+    let header_target = match selector.map_or(Resolution::SelfTok, |s| resolve(route.store, s)) {
+        Resolution::SelfTok => resolve_active(route.active),
+        Resolution::Hosted(target) => Some(target),
+        Resolution::Missing => None,
+        // An ambiguous id must not clear another instance's licence either:
+        // refuse before the payload. It is unread, so the stream is desynced:
+        // answer and close.
+        Resolution::Ambiguous(refusal) => {
+            let _ = writer.write_all(refusal.as_bytes());
             let _ = writer.flush();
             return false;
         }
+    };
+    if let Some((_, _, _, ctx)) = header_target.as_ref()
+        && (route.scope.is_owner_class() || cross_session_authorized(route.scope, "feed", ctx))
+    {
+        ctx.licence.fence(false);
     }
-
     true
 }
 
@@ -9740,45 +9566,37 @@ struct FeedBinRoute<'a> {
     active: &'a ActiveHandle,
     store: &'a Store,
     scope: Scope,
-    /// The watchers to wake once the frame's input is in the session log
-    /// (phase 3A); `None` where none can be watching (the header's check,
-    /// the tests' direct route).
-    subscribers: Option<&'a Subscribers>,
 }
 
+/// [`run_feed_bin_routed_observed`] for a front dispatch that takes no
+/// completion: the tests' stand-in seam.
 #[cfg(all(test, unix))]
-fn run_feed_bin_routed<W: Write, F, C>(
-    line: &str,
-    verb: &str,
+fn run_feed_bin_routed<W: Write, F>(
+    request: &Request,
+    frame: FeedBinFrame<'_>,
     reader: &mut impl BufRead,
     route: FeedBinRoute<'_>,
     dispatch_front_input: &mut F,
-    clear_license: &mut C,
     writer: &mut W,
 ) -> bool
 where
     F: FnMut(InputEvent, Option<u64>) -> Result<InputOutcome, String>,
-    C: FnMut(u64) -> String,
 {
     let mut observed = |event, target, _completion| dispatch_front_input(event, target);
-    run_feed_bin_routed_observed(
-        line,
-        verb,
-        reader,
-        route,
-        &mut observed,
-        clear_license,
-        writer,
-    )
+    run_feed_bin_routed_observed(request, frame, reader, route, &mut observed, writer)
 }
 
-fn run_feed_bin_routed_observed<W: Write, F, C>(
-    line: &str,
-    verb: &str,
+/// Serve a `[@<sel>] feed-bin|paste-bin <n>` frame whose header `frame` was
+/// read: its payload, its admission and its write, the answer in `writer`.
+/// `false` closes the connection (the stream is desynced). An accepted write
+/// is noted in the session log by its author once the seam's receipt says it
+/// landed (`control_input_ack`): the front dispatch carries the completion.
+fn run_feed_bin_routed_observed<W: Write, F>(
+    request: &Request,
+    frame: FeedBinFrame<'_>,
     reader: &mut impl BufRead,
     route: FeedBinRoute<'_>,
     dispatch_front_input: &mut F,
-    clear_license: &mut C,
     writer: &mut W,
 ) -> bool
 where
@@ -9787,16 +9605,19 @@ where
         Option<u64>,
         Option<crate::control_input_ack::InputCompletion>,
     ) -> Result<InputOutcome, String>,
-    C: FnMut(u64) -> String,
 {
+    let Head { selector, verb, .. } = request.head();
+    let class = request
+        .form()
+        .map_or(Input::NONE, |form| form.row.input_class());
     // `paste-bin` goes through the paste seam (bracketing, sanitize, LF→CR under
     // the target's lock); `feed-bin` writes raw. Everything else is shared.
     let paste = verb == "paste-bin";
-    if !feed_bin_header(line, verb, route, clear_license, writer) {
+    if !feed_bin_header(selector.as_ref(), route, writer) {
         return false;
     }
-    let (selector, n, idem_key) = match parse_feed_bin(line, verb) {
-        FeedBinFrame::Ok(selector, n, idem) => (selector, n, idem),
+    let (n, idem_key) = match frame {
+        FeedBinFrame::Ok(n, idem) => (n, idem),
         FeedBinFrame::Malformed => {
             // No parseable length ⇒ no payload was announced; a client that merely
             // typo'd the verb stays framed. No payload read.
@@ -9826,15 +9647,13 @@ where
     // capability at the effect boundary (tab switch, replacement, revocation).
     let active_target = resolve_active(route.active);
     let front_terminal_session = active_target.as_ref().map(|(_, _, session, _)| *session);
-    let target = match selector.as_ref() {
-        None | Some(Selector::SelfTok) => Ok(active_target.clone()),
-        Some(sel) => resolve_explicit(route.store, sel),
-    };
-    // Re-check ambiguity at the effect boundary too; the payload is consumed, so
-    // reply and stay framed.
-    let target = match target {
-        Ok(target) => target,
-        Err(refusal) => {
+    let target = match selector.map_or(Resolution::SelfTok, |s| resolve(route.store, &s)) {
+        Resolution::SelfTok => active_target.clone(),
+        Resolution::Hosted(target) => Some(target),
+        Resolution::Missing => None,
+        // Re-check ambiguity at the effect boundary too; the payload is
+        // consumed, so reply and stay framed.
+        Resolution::Ambiguous(refusal) => {
             if writer.write_all(refusal.as_bytes()).is_err() {
                 return false;
             }
@@ -9877,7 +9696,7 @@ where
     // every path replies and stays framed. Both verbs use the target terminal
     // tuple (`paste-bin` formats under its lock).
     let Some((term, _, target_session, ctx)) = target else {
-        let error = if matches!(&selector, None | Some(Selector::SelfTok)) {
+        let error = if selector.is_none_or(|s| s.is_self()) {
             NO_ACTIVE_TERMINAL
         } else {
             "ERR no such session\n"
@@ -9904,77 +9723,58 @@ where
 
     // The self target can move while the payload is in flight, and new local
     // input can stamp a licence; fence the post-payload target before egress.
-    let cleared = clear_license(target_session);
-    if !cleared.starts_with("OK") {
-        let _ = writer.write_all(cleared.as_bytes());
-        let _ = writer.flush();
-        return false;
-    }
+    ctx.licence.fence(false);
 
-    // Fleet halt against the resolved target: binary frames bypass `handle()`'s
-    // halt gate. The payload is consumed, so the stream stays framed.
-    if let Some(refusal) = crate::fabric::halt_refusal(&ctx, verb) {
-        let _ = writer.write_all(refusal.as_bytes());
-        let _ = writer.flush();
-        return true;
-    }
-    // …and the unread-input gate, for the same reason (`input_stall`): a
-    // refusal only on an established stall or a stopped job; a slow read is
-    // written and warned on the `OK <n> bytes`.
-    let warning = match crate::input_stall::admission(&ctx, verb, "", false) {
-        crate::input_stall::Admission::Refuse(refusal) => {
+    // The input admission every input request passes (`admit`), in its one order:
+    // the halt, the self-feed floor (a self-targeted frame), turn arbitration, the edit
+    // hold, then the unread-input gate, which judges the body itself (a lone `^C` into
+    // a cbreak program is a signal, not input behind the unread). A frame's malformed
+    // header was answered before its body. The payload is consumed, so a refusal keeps
+    // the stream framed.
+    let is_cross = selector.is_some_and(|s| !s.is_self());
+    let warning = match admit(InputAdmission {
+        class,
+        verb,
+        ctx: &ctx,
+        session: target_session,
+        is_cross,
+        args: &payload,
+        unread_ok: false,
+        usage: None,
+    }) {
+        Ok(warning) => warning,
+        Err(refusal) => {
             let _ = writer.write_all(refusal.as_bytes());
             let _ = writer.flush();
             return true;
         }
-        crate::input_stall::Admission::Warn(warning) => Some(warning),
-        crate::input_stall::Admission::Open => None,
     };
 
-    // Turn lease: binary frames bypass the verb-dispatch refusal of write verbs
-    // while a turn or another connection's hard drive lease holds the session;
-    // refuse identically so raw bytes cannot corrupt a turn's output.
-    if let Some(held) = ctx
-        .turn_lease
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .and_then(|l| l.write_block(crate::metrics::now_us(), serving_connection()))
-    {
-        let _ = writer.write_all(format!("ERR busy {held}\n").as_bytes());
-        let _ = writer.flush();
-        return true;
-    }
-
-    // Self-feed floor: binary frames bypass the verb-dispatch floor, so apply
-    // the same per-session injection bucket on the self path (the cross path is
-    // gated by the edge above).
-    if matches!(&selector, None | Some(Selector::SelfTok))
-        && !crate::inject_floor::allow(target_session, payload.len().max(1))
-    {
-        let _ = writer.write_all(RATE_REFUSAL.as_bytes());
-        let _ = writer.flush();
-        return true;
-    }
-
-    // A visible terminal tab gets the same App input side effects as a human
-    // paste (cursor-movement provenance, viewport snap, selection clearing,
-    // blink reset), including an explicit selector naming it. The exact session
-    // is passed so a racing tab switch degrades to hidden-session delivery.
     // The idempotency gate wraps only the write, so every earlier refusal leaves
     // the key's sequence unconsumed; a frame without `id=` runs unguarded. A
     // keyed zero-length frame is refused before the claim.
-    if let Some(refusal) =
-        crate::pty_idem::empty_payload_refusal(idem_key.as_deref(), payload.is_empty())
-    {
+    if let Some(refusal) = crate::pty_idem::empty_payload_refusal(idem_key, payload.is_empty()) {
         let _ = writer.write_all(refusal.as_bytes());
         let _ = writer.flush();
         return true;
     }
+    // A frame delivers by the route a `send` takes (`Input::PINNED`): the App seam
+    // pinned to its session when that session is on screen, an explicit selector
+    // naming it included, so a visible tab gets a human paste's side effects; the
+    // background route otherwise, which answers from the write's receipt (a short or
+    // failed write is `ERR write failed`, never a false `OK` an `id=` retry would
+    // read as `dup=1`) and never parks this lane on the program.
+    let input_route = InputRoute::of(
+        class,
+        is_cross,
+        front_terminal_session == Some(target_session),
+        target_session,
+    );
+    // An accepted write is noted in the session log by its author
+    // (`control_input_ack`); an `in-doubt` mark wakes the log's readers.
     let mark = crate::session_log::InputVerb::of(verb).map(|input| {
         crate::control_input_ack::InputMark::at_epoch(
             &ctx,
-            route.subscribers,
             target_session,
             control_session::log_actor(route.scope, &ctx),
             input,
@@ -9983,55 +9783,28 @@ where
         )
         .typed_by(&ctx, serving_caller(route.scope, &ctx))
     });
-    let completion = || mark.as_ref().map(|mark| mark.completion());
-    // An `in-doubt` mark wakes the session log's readers.
-    let wake = || {
-        if let Some(subscribers) = route.subscribers {
-            wake_watchers(subscribers, target_session);
-        }
+    let completion = || {
+        mark.as_ref()
+            .map(crate::control_input_ack::InputMark::completion)
     };
-    let idem = idem_key.as_deref();
-    let response = crate::pty_idem::guarded_waking(&ctx, route.scope, verb, idem, &wake, || {
-        if front_terminal_session == Some(target_session) {
+    let wake = || ctx.watchers.ring_watchers();
+    let response =
+        crate::pty_idem::guarded_waking(&ctx, route.scope, verb, idem_key, &wake, || {
             let event = if paste {
+                // AtDrain frames the paste by the mode at its write, as `paste` does.
                 InputEvent::Paste(
                     String::from_utf8_lossy(&payload).into_owned(),
                     PasteFraming::AtDrain,
                 )
             } else {
-                // Raw input is not the user's fingers, but it still goes through
-                // App::input so older licences close first. The direct route
-                // below fences the session explicitly, since another window may
-                // present it.
-                InputEvent::KeySequence(payload.clone())
+                InputEvent::KeySequence(payload)
             };
-            return control_input::bytes_reply(
-                dispatch_front_input(event, Some(target_session), completion()),
+            let front = |ev, pin, completion| dispatch_front_input(ev, pin, completion);
+            control_input::bytes_reply(
+                deliver(input_route, class, front, &term, &ctx, event, completion()),
                 n,
-            );
-        }
-
-        crate::metrics::note_input();
-        crate::note_unseamed_control_bytes(&payload);
-        let event = if paste {
-            // AtDrain preserves the old direct route's mode-at-write framing.
-            InputEvent::Paste(
-                String::from_utf8_lossy(&payload).into_owned(),
-                PasteFraming::AtDrain,
             )
-        } else {
-            InputEvent::KeySequence(payload)
-        };
-        // The hidden arm answers from the same receipt as the front arm: a short
-        // or failed write is `ERR write failed`, never a false `OK` (which under
-        // `id=` would make a retry a `dup=1`). It never parks this lane on the
-        // program, and a paste also waits, bounded, for its bytes to leave the
-        // spill (see `background_input`).
-        control_input::bytes_reply(
-            background_input_observed(&term, &ctx, &event, PASTE_RECEIPT_WAIT, completion()),
-            n,
-        )
-    });
+        });
     let response = crate::input_stall::with_warning(response, warning.as_deref());
     if writer.write_all(response.as_bytes()).is_err() {
         return false;
@@ -10072,7 +9845,7 @@ fn write_err<W: Write>(writer: &mut W, msg: &[u8]) {
 
 /// TEST-ONLY, for in-memory writers: its peer never goes, so a push loop it
 /// starts ends only on a failed write. A test with a real socket serves it with
-/// [`run_subscribe_socket`], whose read-side probe sees the client hang up even
+/// [`run_subscribe_socket`], whose read side sees the client hang up even
 /// while a sibling test's fork holds a copy of the client's end — a write then
 /// still succeeds, and a loop waiting for one to fail never ends.
 #[cfg(test)]
@@ -10080,11 +9853,11 @@ fn run_subscribe<W: Write>(
     line: &str,
     active: &ActiveHandle,
     store: &Store,
-    subscribers: &Subscribers,
     scope: Scope,
     writer: &mut W,
 ) {
-    run_subscribe_with_peer_probe(line, active, store, subscribers, scope, writer, || false);
+    let head = control_request::head(line);
+    run_subscribe_with_peer_probe(head, active, store, scope, writer, || false);
 }
 
 /// Run a production socket subscription with read-side disconnect detection,
@@ -10093,17 +9866,10 @@ fn run_subscribe<W: Write>(
 ///
 /// The protocol becomes push-only after the subscribe acknowledgement. Its client
 /// MUST keep the write/send half open and send no more bytes; EOF, an unexpected
-/// byte, or a read error therefore all mean the peer is gone.
-/// [`subscription_peer_gone`] asks that before EVERY pass, without waiting —
-/// see it for why a bounded wait there was a cost on every pushed frame.
-///
-/// The probe gets its own handle only because the loop holds `writer`
-/// mutably for its lifetime. Nothing is configured on it: a clone is the same
-/// socket (a Unix `dup` shares the open file description, a Windows clone the
-/// `Arc`), so a receive timeout or `O_NONBLOCK` set on it would be set on the
-/// writer too. That is why the probe's no-wait is a PER-CALL flag and never a
-/// non-blocking socket: a non-blocking writer would turn a slow reader's full
-/// buffer into a write error, and a stream that ended on it.
+/// byte, or a read error therefore all mean the peer is gone. On unix the peer
+/// watch ([`crate::peer_watch`]) polls the stream for exactly that and wakes the
+/// push loop, which then needs no timer to notice; where it does not run, the
+/// loop asks [`subscription_peer_gone`] at least every 250 ms.
 ///
 /// A client that half-closed (`printf 'subscribe …\n' | nc -U`) is gone to the
 /// protocol but still reading. The hang-up shuts each half on its own
@@ -10112,61 +9878,112 @@ fn run_subscribe<W: Write>(
 /// client read its end-of-file only when the last copy of this end closed — and
 /// a child any thread forked holds one until it execs.
 fn run_subscribe_socket(
-    line: &str,
+    head: Head<'_>,
     active: &ActiveHandle,
     store: &Store,
-    subscribers: &Subscribers,
     scope: Scope,
     writer: &mut CtlStream,
 ) {
-    if let Ok(probe) = writer.try_clone() {
-        run_subscribe_with_peer_probe(line, active, store, subscribers, scope, writer, move || {
-            subscription_peer_gone(&probe)
-        });
+    // The push loop writes through a shared borrow, which the peer watch's
+    // guard also holds: the guard has let go of the descriptor before the
+    // caller can drop the stream.
+    let stream: &CtlStream = writer;
+    let mut out = PushWriter(stream);
+    #[cfg(unix)]
+    match crate::peer_watch::watch_push(stream) {
+        Some(guard) => run_subscribe_with_peer_probe(
+            head,
+            active,
+            store,
+            scope,
+            &mut out,
+            WatchedPeer { guard, stream },
+        ),
+        None => run_subscribe_with_peer_probe(head, active, store, scope, &mut out, || {
+            subscription_peer_gone(stream)
+        }),
     }
-    aterm_uds::hangup::hang_up(writer);
+    // No peer watch off unix: the push loop asks the stream itself, without
+    // waiting ([`subscription_peer_gone`]).
+    #[cfg(not(unix))]
+    run_subscribe_with_peer_probe(head, active, store, scope, &mut out, || {
+        subscription_peer_gone(stream)
+    });
+    aterm_uds::hangup::hang_up(stream);
 }
 
-/// Whether a push-only subscriber is gone, asked WITHOUT WAITING: any byte, EOF
-/// or read error is gone (its client sends nothing after `subscribe`, so even a
-/// write-half close is a disconnect), and a quiet open socket is there.
+/// The push stream's writer. Its gather is [`aterm_uds::fdpass::send_vectored`],
+/// not std's `write_vectored`, a bare `writev` that raises SIGPIPE at a client
+/// that hung up whenever SIGPIPE is not ignored, as between
+/// `Command::exec`'s reset and the `execve` of a cold-lane update: one push
+/// thread meeting a gone client there would end every tab. Its `write` is the
+/// stream's own, which sends with `MSG_NOSIGNAL`.
+struct PushWriter<'a>(&'a CtlStream);
+
+impl Write for PushWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        aterm_uds::fdpass::send_vectored(self.0, bufs)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A push stream's liveness from the peer watch, and from the read-side probe
+/// once the watch has handed the stream back ([`crate::peer_watch::Peer::Unwatched`]).
+#[cfg(unix)]
+struct WatchedPeer<'a> {
+    guard: crate::peer_watch::PeerGuard<'a>,
+    stream: &'a CtlStream,
+}
+
+#[cfg(unix)]
+impl subscribe::PeerLiveness for WatchedPeer<'_> {
+    fn gone(&mut self) -> bool {
+        match self.guard.peer() {
+            crate::peer_watch::Peer::Watching => false,
+            crate::peer_watch::Peer::Gone => true,
+            crate::peer_watch::Peer::Unwatched => subscription_peer_gone(self.stream),
+        }
+    }
+
+    fn rings(&self) -> Option<&Arc<crate::session_watch::Watchers>> {
+        (self.guard.peer() == crate::peer_watch::Peer::Watching).then(|| self.guard.wakes())
+    }
+}
+
+/// Whether a push-only subscriber is gone, asked of the stream itself and
+/// WITHOUT WAITING: any byte, EOF or read error is gone (its client sends
+/// nothing after `subscribe`, so even a write-half close is a disconnect), and a
+/// quiet open socket is there. Asked where the peer watch does not run, or once
+/// it has handed the stream back ([`WatchedPeer`]).
 ///
-/// THE PROBE RUNS BEFORE EVERY PASS, the real wakes included, so a probe that
-/// waits is a wait on every frame pushed. It used to be a `read` under a 1 ms
-/// receive timeout, and a quiet subscriber — every live one — made it sleep the
-/// whole timeout out: every `EVENT` and `DELTA` to every subscriber, the fabric
-/// bridge's `EVENT post` on the post → visible path included, left about
-/// 1.1 ms late. Measured 2026-10-16, interleaved, load 43–63: a notify until
-/// the subscriber has read the whole DELTA, p50 1.15 ms → 0.020 ms (n = 800
-/// each). The fabric bench's post → visible gained that one hop and no more,
-/// on the tree this probe landed on: re-measured by review with arms that
-/// differ only in this probe (f35f017e56 → df40e5055b), 13 runs of 100 posts a
-/// side, the Strict-publish yardstick ≈ 4.2 ms in both, the median of the
-/// runs' p50s went 6.79 → 5.64 ms. Its runs fall in two modes by post →
-/// durable (≈ 5.1 or ≈ 4.2 ms), and an earlier 6.51 → 4.54 ms quoted here was
-/// the faster mode's, not twice this hop. On main as of ffd191e439 the hop no
-/// longer shows in that bench: with the sleep, without it, and with the push
-/// loop's pass budget, 4 interleaved runs each (load 5–17), the medians of
-/// the runs' p50s are 5.49, 5.27 and 5.02 ms, inside the same two-mode spread.
+/// A probe that waits is a wait on every pass it is asked before. It used to be
+/// a `read` under a 1 ms receive timeout, and a quiet subscriber — every live
+/// one — made it sleep the whole timeout out: every `EVENT` and `DELTA` to every
+/// subscriber, the fabric bridge's `EVENT post` on the post → visible path
+/// included, left about 1.1 ms late. Measured 2026-10-16, interleaved, load
+/// 43–63: a notify until the subscriber has read the whole DELTA, p50 1.15 ms →
+/// 0.020 ms (n = 800 each). The answer the bound waited for is already in the
+/// socket — a queued byte or EOF is there to see at once.
 ///
-/// The answer the bound waited for is already in the socket — a queued byte
-/// or EOF is there to see at once — but the wait did one other job: it was
-/// the push loop's only coalescing window, so a flood of output wakes was
-/// folded into at most one pass a millisecond. That job is the push loop's
-/// own now, done without delaying a wake that has room
-/// ([`crate::subscribe`]'s pass budget, `Pacer`, has the flood's numbers).
-///
-/// The no-wait is guarded twice: the push thread's tally judges this probe's
-/// one read by its flags (`push_probe_tally`), and a test counts the
-/// kernel's own syscalls to hold the whole probe to that one entry, so a wait
+/// The no-wait is guarded twice: a quiet-peer probe on a socket with no
+/// receive timeout answers under a hang detector, and a test counts the
+/// kernel's own syscalls to hold the whole probe to its one `recv`, so a wait
 /// put beside the read is caught too.
 ///
-/// Unix peeks with the per-call flag pair `MSG_PEEK | MSG_DONTWAIT`: nothing
-/// consumed, no blocking mode set on a socket the writer shares
-/// ([`run_subscribe_socket`] says why that matters). Windows has no per-call
-/// flag and needs none — its socket is already non-blocking — so it takes one
-/// `recv` without the park its `read` adds; that consumes a byte, which ends
-/// this stream anyway.
+/// Unix peeks on the borrowed descriptor with the per-call flag pair
+/// `MSG_PEEK | MSG_DONTWAIT`: nothing consumed, no copy of the descriptor, and
+/// no blocking mode set on a socket the writer shares (a non-blocking writer
+/// would turn a slow reader's full buffer into a write error, and a stream that
+/// ended on it). Windows has no per-call flag and needs none — its socket is
+/// already non-blocking — so it takes one `recv` without the park its `read`
+/// adds; that consumes a byte, which ends this stream anyway.
 fn subscription_peer_gone(stream: &CtlStream) -> bool {
     match peek_push_peer(stream) {
         Ok(_) => true,
@@ -10195,11 +10012,7 @@ fn peek_push_peer(stream: &CtlStream) -> std::io::Result<usize> {
     // is one owned byte, and `MSG_PEEK | MSG_DONTWAIT` neither consumes nor
     // blocks.
     let n = unsafe { libc::recv(fd, (&raw mut byte).cast(), 1, PUSH_PROBE_FLAGS) };
-    // Read errno before the tally's own syscall can overwrite it.
-    let answer = usize::try_from(n).map_err(|_| std::io::Error::last_os_error());
-    #[cfg(test)]
-    push_probe_tally::record(fd, PUSH_PROBE_FLAGS);
-    answer
+    usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
 }
 
 #[cfg(not(unix))]
@@ -10208,73 +10021,22 @@ fn peek_push_peer(stream: &CtlStream) -> std::io::Result<usize> {
     stream.read_nonblocking(&mut byte)
 }
 
-/// TEST-ONLY: what the push probe asked the kernel on THIS thread — a push
-/// loop runs on the thread that serves its subscription, so a test reads its
-/// own loop's tally whatever sibling tests' loops do. A probe read is PARKING
-/// when the kernel may sleep in it: its flags lack `MSG_DONTWAIT` and the
-/// descriptor is blocking (`O_NONBLOCK` clear), whatever receive timeout
-/// bounds the sleep. Judged from the call's own flags and the descriptor's
-/// state at the call, so a probe that dropped `MSG_DONTWAIT`, or ran on a
-/// blocking socket under a timeout as it once did, counts.
-///
-/// IT SEES ONLY THE READ IT IS ATTACHED TO, and is told that read's flags by
-/// the read's own constant: a wait added BESIDE the read — a bounded `poll`
-/// before the peek, a timed `read` next to it — tallies nothing here. That
-/// half is counted by the kernel, not by this: `the_push_probe_enters_the_kernel_once`
-/// holds the whole probe to one kernel entry, the read this judges.
-#[cfg(all(test, unix))]
-pub(crate) mod push_probe_tally {
-    use std::cell::Cell;
+/// `subscribe`'s usage as one line: the reply on a connection that stays open
+/// (`@<sid> subscribe …` through dispatch), where a failure is one `ERR` line and
+/// a second would be read as the next request's reply.
+const SUBSCRIBE_USAGE: &str = "ERR usage: subscribe [@<sel>[,<sel>]|@*] <streams> \
+                               [since=<seq>] [since-turn=<id>] [since-block=<id>] \
+                               [since-log=<seq> log-ep=<e>] [every-frame]\n";
 
-    /// Probe reads on this thread, and how many of them could park.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub(crate) struct Tally {
-        pub(crate) reads: u64,
-        pub(crate) parking: u64,
-    }
-
-    thread_local! {
-        static TALLY: Cell<Tally> = const { Cell::new(Tally { reads: 0, parking: 0 }) };
-    }
-
-    /// Count one probe read made on `fd` with `flags`.
-    ///
-    /// A read flagged `MSG_DONTWAIT` cannot park whatever the descriptor's
-    /// state, so only a read without it asks the descriptor — which keeps the
-    /// production probe's kernel entries, which
-    /// `the_push_probe_enters_the_kernel_once` counts, to its `recv` alone in a
-    /// test build too.
-    pub(crate) fn record(fd: std::os::fd::RawFd, flags: libc::c_int) {
-        let parks = flags & libc::MSG_DONTWAIT == 0 && {
-            // SAFETY: `F_GETFL` reads the descriptor's status flags and writes
-            // nothing; the caller's descriptor is open for the call.
-            let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            status >= 0 && status & libc::O_NONBLOCK == 0
-        };
-        TALLY.with(|tally| {
-            let mut now = tally.get();
-            now.reads += 1;
-            now.parking += u64::from(parks);
-            tally.set(now);
-        });
-    }
-
-    /// This thread's tally since its last `take`, reset to zero.
-    pub(crate) fn take() -> Tally {
-        TALLY.with(|tally| tally.replace(Tally::default()))
-    }
-}
-
-/// The `subscribe` usage refusal, built from
+/// The serve loop's `subscribe` refusal, which closes the connection after it:
+/// [`SUBSCRIBE_USAGE`] and the streams, built from
 /// [`aterm_types::control_verbs::SUBSCRIBE_STREAMS`] so every refusal path lists
 /// the same streams.
 fn subscribe_usage_bytes() -> Vec<u8> {
     format!(
-        "ERR usage: subscribe [@<sel>[,<sel>]|@*] <streams> [since=<seq>] [since-turn=<id>] \
-         [since-block=<id>] [since-log=<seq> log-ep=<e>] [every-frame]\n  <streams>: a subset \
-         of {} and must name at least one frame source; mail takes mail:kinds=<k,..>, \
-         mail:from=<class|principal> and/or mail:topic=<t>; log takes \
-         log:lvl=<session|run|turn|step> and/or log:class=turn\n",
+        "{SUBSCRIBE_USAGE}  <streams>: a subset of {} and must name at least one frame \
+         source; mail takes mail:kinds=<k,..>, mail:from=<class|principal> and/or \
+         mail:topic=<t>; log takes log:lvl=<session|run|turn|step> and/or log:class=turn\n",
         aterm_types::control_verbs::SUBSCRIBE_STREAMS.join(",")
     )
     .into_bytes()
@@ -10284,39 +10046,40 @@ fn subscribe_usage_bytes() -> Vec<u8> {
 /// mode (the push loop never returns to request polling).
 ///
 /// Grammar: `subscribe [@<sel>[,<sel>...]|@*] <streams> [since=<seq>]
-/// [since-turn=<id>] [since-block=<id>] [every-frame]`, where `<streams>` is one
+/// [since-turn=<id>] [since-block=<id>] [since-log=<seq> log-ep=<e>]
+/// [every-frame]`, where `<streams>` is one
 /// comma-separated token from `aterm_types::control_verbs::SUBSCRIBE_STREAMS`
-/// plus the `timestamps`/`ts` and `trim` modifiers.
+/// plus the `timestamps`/`ts` and `trim` modifiers. `head` is the request
+/// grammar's reading of the line ([`control_request::head`]), the one its lane,
+/// relay and push flip read, and the words of its rest split where theirs do
+/// ([`control_request::words`]), so a spelling they class a subscribe is served
+/// as one and the `@<sid>` the relay reads first is the one resolved here.
 ///
 /// Per-target streams are gated per `@<sel>` like a read verb (`ReadScreen` via
-/// [`resolve_explicit`] and [`cross_session_authorized`]); the instance-scoped
+/// [`resolve`] and [`cross_session_authorized`]); the instance-scoped
 /// `sessions` stream and `@*` are Owner-only. Any failure writes one `ERR ...`
 /// and closes without a partial subscription; on success the socket and the
 /// `OK subscribe <n>` ack go to [`subscribe::push_loop_with_peer_probe`].
-pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
-    line: &str,
+pub(crate) fn run_subscribe_with_peer_probe<W: Write, L: subscribe::PeerLiveness>(
+    head: Head<'_>,
     active: &ActiveHandle,
     store: &Store,
-    subscribers: &Subscribers,
     scope: Scope,
     writer: &mut W,
-    peer_gone: P,
+    liveness: L,
 ) {
-    let line = line.strip_suffix('\r').unwrap_or(line);
     // One usage text for every refusal: the selector list (or `@*`) is optional
     // and the trailing args are exactly what the parser accepts.
     let usage = subscribe_usage_bytes();
     let usage = usage.as_slice();
-    // Strip the verb; the remainder is `[@<sel>[,<sel>...]] <streams> [args]`.
-    let rest = match line.split_once(' ') {
-        Some(("subscribe", r)) => r.trim(),
-        _ => {
-            let _ = writer.write_all(usage);
-            let _ = writer.flush();
-            return;
-        }
-    };
-    let mut it = rest.split_whitespace();
+    // A selectorless `subscribe`, as the push flip admits; its rest is
+    // `[@<sel>[,<sel>...]] <streams> [args]`.
+    if head.verb != "subscribe" || head.selector.is_some() {
+        let _ = writer.write_all(usage);
+        let _ = writer.flush();
+        return;
+    }
+    let mut it = control_request::words(head.rest);
     let Some(first) = it.next() else {
         let _ = writer.write_all(usage);
         let _ = writer.flush();
@@ -10341,8 +10104,8 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         return;
     };
     // Trailing args: `since=<seq>` (content_seq resume), `since-turn=<id>` /
-    // `since-block=<id>` (events resume), `every-frame` (re-emit `cells` every
-    // wake).
+    // `since-block=<id>` (events resume), `every-frame` (re-read `cells` every
+    // wake, sending a changed body).
     let mut since: Option<u64> = None;
     let mut since_turn: Option<u64> = None;
     let mut since_block: Option<u64> = None;
@@ -10417,8 +10180,8 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
 
     // `@*`: the live instance target set, including sessions created later, which
     // the push loop adopts and acks with `sub <local> <sid>`. One connection
-    // follows every tab instead of one subscription per tab, which would exhaust
-    // `CONTROL_SUBSCRIPTION_WORKERS`.
+    // follows every tab instead of one subscription per tab, each holding a
+    // subscription lane (`control_subscriptions_cap`).
     //
     // Owner-only like the `sessions` stream (it reveals siblings), refused hard.
     // `AdoptScope::authorize` enforces the same rule at the type level.
@@ -10499,28 +10262,30 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
             let _ = writer.flush();
             return;
         };
-        let Some(sel) = Selector::parse(body) else {
+        // A list element that names nothing is refused like a bare `@`
+        // ([`empty_selector_refusal`]), never read as the active tab.
+        if !aterm_types::control_verbs::selector_body_names_something(body) {
             let refusal = format!("{}\n", aterm_types::control_verbs::EMPTY_SELECTOR);
             let _ = writer.write_all(refusal.as_bytes());
             let _ = writer.flush();
             return;
-        };
-        let target = match &sel {
-            Selector::SelfTok => Ok(resolve_active(active)),
-            Selector::Local(_) | Selector::Sid(_) => resolve_explicit(store, &sel),
-        };
-        // A subscribe is a READ, and an ambiguous one streams a pane's output
-        // to a caller who asked for a different instance's pane. Refuse.
-        let target = match target {
-            Ok(target) => target,
-            Err(refusal) => {
+        }
+        let sel = Selector::parse(body);
+        let target = match resolve(store, &sel) {
+            Resolution::SelfTok => resolve_active(active),
+            Resolution::Hosted(target) => Some(target),
+            Resolution::Missing => None,
+            // A subscribe is a READ, and an ambiguous one streams a pane's
+            // output to a caller who asked for a different instance's pane.
+            // Refuse.
+            Resolution::Ambiguous(refusal) => {
                 let _ = writer.write_all(refusal.as_bytes());
                 let _ = writer.flush();
                 return;
             }
         };
         let Some((term, _master, local_id, ctx)) = target else {
-            let error = if matches!(sel, Selector::SelfTok) {
+            let error = if sel.is_self() {
                 NO_ACTIVE_TERMINAL
             } else {
                 "ERR no such session\n"
@@ -10545,18 +10310,18 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         }
         // De-dup by session: a repeated selector (`@.,@.`) or two selectors that
         // resolve to the same session must not install a second fanout slot.
-        if targets.iter().any(|(id, _, _, _, _, _)| *id == local_id) {
+        if targets.iter().any(|t| t.local_id == local_id) {
             continue;
         }
         sub_map.push((local_id, ctx.self_id.as_str().to_string()));
-        targets.push((
+        // The leaves only: `ctx` drops at the end of this iteration, so the
+        // subscription holds nothing that keeps the session's master open
+        // (`subscribe::WatchSource`).
+        targets.push(subscribe::ResolvedTarget {
             local_id,
             term,
-            ctx.byte_fanout.clone(),
-            ctx.turns.clone(),
-            ctx.timeline.clone(),
-            ctx.fabric.clone(),
-        ));
+            src: subscribe::WatchSource::of(&ctx),
+        });
     }
     // An empty set is an error for an explicit list but normal for `@*`.
     if targets.is_empty() && !adopt_all {
@@ -10585,7 +10350,6 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         ack.push_str(&format!("sub {local_id} {sid}\n"));
     }
     subscribe::push_loop_with_peer_probe(
-        subscribers,
         store,
         &targets,
         PushScopes {
@@ -10606,7 +10370,7 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         },
         &ack,
         writer,
-        peer_gone,
+        liveness,
     );
 }
 
@@ -10616,53 +10380,23 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
 /// `Terminal` lock.
 type Target = (Arc<Mutex<Terminal>>, i32, u64, Arc<SessionCtx>);
 
-/// A parsed `@<selector>`. `SelfTok` (`@.`) names the connection's own session;
-/// `Local`/`Sid` name a specific one. An unknown id resolves to `None` (`ERR no
-/// such session`), never to a wrong session, and a bare `@` parses to nothing
-/// at all ([`Selector::parse`]).
-enum Selector {
-    /// `@.` — the connection's own session (explicit self; degenerates to the
-    /// verbatim self path).
-    SelfTok,
-    /// `@<u64>` — by the process-local `Session.id`.
-    Local(u64),
-    /// `@s-<hex>` / `@<sid>` — by stable `SessionId`.
-    Sid(SessionId),
-}
-
-impl Selector {
-    /// Parse the body after the leading `@`: `.` is self, all digits is a local id,
-    /// anything else is taken verbatim as a `SessionId` string (the `s-<hex>` wire
-    /// id `whoami`/`sessions` report). `None` for a body that names nothing (empty
-    /// or blank, [`aterm_types::control_verbs::selector_body_names_something`]):
-    /// a bare `@` is what `@$W` becomes when `$W` is empty, and read as self it
-    /// would act on the front tab; every caller refuses it
-    /// ([`empty_selector_refusal`]).
-    fn parse(body: &str) -> Option<Selector> {
-        if body == "." {
-            Some(Selector::SelfTok)
-        } else if !aterm_types::control_verbs::selector_body_names_something(body) {
-            None
-        } else if let Ok(n) = body.parse::<u64>() {
-            Some(Selector::Local(n))
-        } else {
-            Some(Selector::Sid(SessionId::new(body)))
-        }
-    }
-}
-
-/// THE EMPTY-SELECTOR GATE: the refusal a line whose leading `@` names nothing
-/// earns ([`aterm_types::control_verbs::EMPTY_SELECTOR`], its newline added),
-/// decided before any other path of [`serve_request_line`] but the fleet gate
-/// reads it — the askpass relay, the proxy, the push flip, every frame — so a
-/// client that sends `@ turn …` over the wire is refused like `aterm ctl`
-/// refuses it before sending. `subscribe`'s selector-second list and `await
-/// task`'s list refuse their own empty elements where they parse them.
-fn empty_selector_refusal(line: &str) -> Option<String> {
-    let first = line.split_whitespace().next()?;
-    let body = first.strip_prefix('@')?;
-    Selector::parse(body)
-        .is_none()
+/// THE EMPTY-SELECTOR GATE: the refusal a request whose leading `@` names
+/// nothing earns ([`aterm_types::control_verbs::EMPTY_SELECTOR`], its newline
+/// added), decided before any other path of [`serve_request_line`] but the
+/// recovery-count gate ([`recovery_count_refusal`], which a frame's header
+/// meets first too) and the drive and fleet gates reads it — the askpass
+/// relay, the proxy, the push flip, every frame — so a client that sends
+/// `@ turn …` over the wire is refused like `aterm ctl` refuses it before
+/// sending. A bare `@` is what `@$W`
+/// becomes when `$W` is empty, and read as self it would act on the front tab.
+/// `subscribe`'s selector-second list and `await task`'s list refuse their own
+/// empty elements where they parse them. The line's first word is read, not
+/// its parsed selector: the grammar reads a bare `@` as the verb.
+fn empty_selector_refusal(request: &Request) -> Option<String> {
+    let body = control_request::words(request.line().trim_end_matches('\r'))
+        .next()?
+        .strip_prefix('@')?;
+    (!aterm_types::control_verbs::selector_body_names_something(body))
         .then(|| format!("{}\n", aterm_types::control_verbs::EMPTY_SELECTOR))
 }
 
@@ -10697,11 +10431,11 @@ fn empty_selector_refusal(line: &str) -> Option<String> {
         project = "aterm_gui::identity_claim::project_handoff_address_owner"
     )
 )]
-fn ambiguous_sid_refusal(sel: &Selector) -> Option<String> {
+fn ambiguous_sid_refusal(sel: &Selector<'_>) -> Option<String> {
     let Selector::Sid(sid) = sel else {
         return None;
     };
-    let pid = crate::identity_claim::live_holder(sid)?;
+    let pid = crate::identity_claim::live_holder(&SessionId::new(sid.as_str()))?;
     Some(format!(
         "ERR ambiguous session id {} also served by pid {pid}; use aterm ctl --pid {pid}\n",
         sid.as_str()
@@ -10733,26 +10467,21 @@ pub(crate) fn cross_session_authorized(scope: Scope, verb: &str, target_ctx: &Se
 }
 
 /// The dispatch-gate authority for the whole `verb rest` line against `target_ctx`:
-/// like [`cross_session_authorized`] but on the effective op, the base op escalated by
-/// its argument for the indirect seams (`invoke <clipboard/config action>`,
-/// `open prefs|settings`; see [`escalated_op`]). The escalated op replaces the base op,
-/// so an edge granted the fine op (ClipboardWrite/ConfigWrite) passes while a plain
-/// WriteInput edge cannot tunnel through. An [`Escalation`] may demand Owner-only (the
-/// palette gateway, update-apply twins), which no Edge satisfies. Owner reaches self and
-/// siblings; a `None` effective op (unknown verb) is denied.
-fn dispatch_authorized(scope: Scope, verb: &str, rest: &str, target_ctx: &SessionCtx) -> bool {
-    match escalated_op(verb, rest) {
-        // OwnerOnly admits only the Owner class; a fine-op escalation is decided by
-        // `scope_holds_op` like the base gate (Owner short-circuits there).
-        Some(Escalation::OwnerOnly) => scope.is_owner_class(),
-        Some(Escalation::Op(need)) => scope_holds_op(scope, need, target_ctx),
-        // No escalation: fall back to the verb's base required op (None => unknown verb,
-        // default-DENY).
-        None => match required_op(verb) {
-            Some(need) => scope_holds_op(scope, need, target_ctx),
-            None => false,
-        },
-    }
+/// like [`cross_session_authorized`] but on what the request needs ([`need_of`]): its
+/// table form's op, or the [`argument_escalation`] of an indirect seam (`invoke
+/// <clipboard/config action>`, `open prefs|settings`). That need replaces the verb's
+/// base op, so an edge granted the fine op (ClipboardWrite/ConfigWrite) passes while a
+/// plain WriteInput edge cannot tunnel through. A [`Need::OwnerOnly`] (the palette
+/// gateway, update-apply twins) admits no Edge. Owner reaches self and siblings; a
+/// row no op gate admits is denied. `form` is the request's table form.
+fn dispatch_authorized(
+    scope: Scope,
+    form: &Resolved,
+    verb: &str,
+    rest: &str,
+    target_ctx: &SessionCtx,
+) -> bool {
+    need_of(form, verb, rest).is_some_and(|need| scope_holds_need(scope, need, target_ctx))
 }
 
 /// The reply a scoped EDGE gets for the framebuffer `image` (every form but
@@ -10778,16 +10507,6 @@ fn image_frame_refusal(target_ctx: &SessionCtx) -> String {
         .to_string()
 }
 
-/// PART B — the input-injection verbs that reach the FRONT window through the proxy →
-/// `App::input` seam and can therefore be SWALLOWED by (i.e. DRIVE) an open modal overlay
-/// or native Settings tab, plus the direct-sink writers, fenced as a set for defense in
-/// depth. `key`/`ctrl`/
-/// `mouse`/`paste`/`focus` post a `Wake::Input` that `App::input` routes into the overlay
-/// while one is modal; `send`/`feed`/`turn` write the PTY sink directly (they drive the
-/// shell, not the overlay) but are refused too so a scoped edge cannot race input while a
-/// human is mid-overlay. (`feed-bin` also writes the sink directly and is intercepted
-/// before this dispatch WITHOUT a proxy, so it takes no overlay hop — it cannot drive the
-/// overlay, only the shell.)
 /// The session a `turn` is credited to ([`crate::Lease::Turn::driver`],
 /// [`control_session::TurnIo::driver`]): for an edge-scoped connection, the source its
 /// token was granted to in the resolved target's table (the lookup
@@ -10809,20 +10528,8 @@ fn turn_driver(scope: Scope, ctx: &SessionCtx) -> Option<SessionId> {
     }
 }
 
-/// Input verbs fenced while a modal overlay or native Settings tab is front:
-/// `key`/`ctrl`/`mouse`/`paste`/`focus` reach it through `App::input`, and the
-/// direct-sink writers `send`/`feed`/`turn` are fenced too so a scoped edge cannot race
-/// input while a human is in the overlay. (`feed-bin` is intercepted earlier without a
-/// proxy and can only drive the shell.)
-fn is_front_driving_verb(verb: &str) -> bool {
-    matches!(
-        verb,
-        "key" | "ctrl" | "mouse" | "paste" | "focus" | "send" | "feed" | "turn"
-    )
-}
-
 /// What a scoped caller's front-surface observation hop came back with: the
-/// surface, or the whole reply `handle` sends instead. A failed hop is an
+/// surface, or the whole reply `serve_session_verb` sends instead. A failed hop is an
 /// authorization failure, never "no surface" (fail closed): it is audited
 /// with `log_denial` and answered `ERR denied`. The one exception is a
 /// stalled main thread's refusal (`ERR main thread stalled <N>s;
@@ -10851,11 +10558,12 @@ fn front_surface_authority(
     }
 }
 
-/// Given the caller's `scope`, input `verb` and the front main-thread surface, the
-/// escalation that replaces the verb's base WriteInput requirement: every overlay is
-/// Owner-only (some bind clipboard/external-process actions), native Settings needs the
-/// durable-config fine op, and Settings ▸ Harness is Owner-only (its session buttons
-/// write Autopilot words). Owner skips the observation and satisfies either.
+/// Given the caller's `scope`, the verb's input `class` and the front main-thread
+/// surface, the escalation that replaces the verb's base WriteInput requirement for
+/// a verb that can drive the front (`Input::FRONT_DRIVING`): every overlay is
+/// Owner-only (some bind clipboard/external-process actions), native Settings needs
+/// the durable-config fine op, and Settings ▸ Harness is Owner-only (its session
+/// buttons write Autopilot words). Owner skips the observation and satisfies either.
 ///
 /// The Harness fence is the whole page, not the keys that would press a session
 /// button: which key presses one depends on the page's focus and a click's hit,
@@ -10865,17 +10573,17 @@ fn front_surface_authority(
 /// Pure for unit testing; a failed hop is denied by the caller, never read as `None`.
 fn front_drive_escalation(
     scope: Scope,
-    verb: &str,
+    class: Input,
     surface: FrontControlSurface,
-) -> Option<Escalation> {
-    if scope.is_owner_class() || !is_front_driving_verb(verb) {
+) -> Option<Need> {
+    if scope.is_owner_class() || !class.contains(Input::FRONT_DRIVING) {
         return None;
     }
     match surface {
         FrontControlSurface::Overlay(_) | FrontControlSurface::HarnessSettings => {
-            Some(Escalation::OwnerOnly)
+            Some(Need::OwnerOnly)
         }
-        FrontControlSurface::NativeSettings => Some(Escalation::Op(Op::ConfigWrite)),
+        FrontControlSurface::NativeSettings => Some(Need::Op(Op::ConfigWrite)),
         FrontControlSurface::None | FrontControlSurface::OtherNative => None,
     }
 }
@@ -10912,85 +10620,13 @@ fn front_drive_denial(surface: FrontControlSurface) -> String {
     }
 }
 
-// ── Cross-session input arms ───────────────────────────────────────────────
+// ── Background input ────────────────────────────────────────────────────────
 //
-// These run on the control thread against a resolved `@<selector>` target, not the
-// active tab, so there is no App UI/gesture/window state and no `Wake::Input`. They use
-// the source-blind tracked seam and the engine's viewport/geometry APIs directly, with
-// `(term, &ctx.sink)` resolved as `send`/`feed` do, after `cross_session_authorized`.
-
-/// Cross-session `key`/`ctrl`/`paste`/`focus`: feed a pre-built [`InputEvent`] to the
-/// source-blind seam on the target `(term, sink)`. The seam reads the target's modes
-/// once and writes the encoded bytes to its sink (nothing under a suppressing mode, e.g.
-/// focus reporting off), byte-identical to the active-tab seam for the same event.
-/// `None` (a malformed line) maps to `err`.
-///
-/// The reply is [`background_input_observed`]'s: the write's receipt, like the front-session
-/// arms and [`cross_mouse_apply`] (a short or failed write, a dead peer, is `ERR write
-/// failed`), and a paste's `OK` also means every byte left the process-local spill for
-/// the kernel.
-fn cross_input(
-    term: &Arc<Mutex<Terminal>>,
-    ctx: &SessionCtx,
-    ev: Option<InputEvent>,
-    err: &str,
-) -> String {
-    cross_input_observed(term, ctx, ev, err, None)
-}
-
-fn cross_input_observed(
-    term: &Arc<Mutex<Terminal>>,
-    ctx: &SessionCtx,
-    ev: Option<InputEvent>,
-    err: &str,
-    completion: Option<crate::control_input_ack::InputCompletion>,
-) -> String {
-    match ev {
-        Some(ev) => {
-            // This bypasses the App input seam, so an in-flight `video ... keys`
-            // recording cannot log it; count the attempts so the recording can say so.
-            // `focus` is not an attempt and contributes nothing.
-            crate::note_unseamed_control_input(&ev);
-            control_input::input_reply_to_str(background_input_observed(
-                term,
-                ctx,
-                &ev,
-                PASTE_RECEIPT_WAIT,
-                completion,
-            ))
-        }
-        None => err.to_string(),
-    }
-}
-
-/// Raw `send`/`feed` bytes are terminal input: keep their unlogged-input/latency
-/// accounting while routing the frame through the per-session echo receipt. Returns
-/// [`background_input_observed`]'s verdict, so the reply can say `ERR write failed`.
-#[cfg(all(test, unix))]
-fn cross_raw_input(
-    term: &Arc<Mutex<Terminal>>,
-    ctx: &SessionCtx,
-    bytes: Vec<u8>,
-) -> Result<InputOutcome, String> {
-    cross_raw_input_observed(term, ctx, bytes, None)
-}
-
-fn cross_raw_input_observed(
-    term: &Arc<Mutex<Terminal>>,
-    ctx: &SessionCtx,
-    bytes: Vec<u8>,
-    completion: Option<crate::control_input_ack::InputCompletion>,
-) -> Result<InputOutcome, String> {
-    crate::metrics::note_input();
-    crate::note_unseamed_control_bytes(&bytes);
-    background_input_observed(
-        term,
-        ctx,
-        &InputEvent::KeySequence(bytes),
-        PASTE_RECEIPT_WAIT,
-        completion,
-    )
-}
+// These run on the control thread against a resolved `@<selector>` target not on
+// screen (`InputRoute::Background`), so there is no App UI/gesture/window state and no
+// `Wake::Input`. They use the source-blind tracked seam and the engine's
+// viewport/geometry APIs directly on the resolved `(term, &ctx.sink)`, after
+// authorization.
 
 /// How long a background paste's reply waits for its bytes to reach the program
 /// before answering [`PASTE_UNREAD`]: the wait family's default
@@ -11135,22 +10771,33 @@ enum Waited {
 
 /// Wait, at most `bound` and only while the caller is there, for the write a lane
 /// handed to the session's ordered writer
-/// ([`crate::app_input::paste_order::Written`]).
+/// ([`crate::app_input::paste_order::Written`]), in the one park every blocking
+/// control verb waits in ([`crate::park::park`]), as [`background_reply`] waits
+/// for the same write's kernel receipt.
 fn await_written(
     written: &crate::app_input::paste_order::Written,
     bound: std::time::Duration,
 ) -> Waited {
     let now = std::time::Instant::now();
     let deadline = now.checked_add(bound).unwrap_or(now);
-    loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        match written.wait(hangup_park(left)) {
-            Ok(receipt) => return Waited::Wrote(receipt),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Waited::Unrun,
-            Err(_) if caller_hung_up() => return Waited::HungUp,
-            Err(_) if left.is_zero() => return Waited::Queued,
-            Err(_) => {}
-        }
+    let mut got = None;
+    let woke = crate::park::park(
+        |slice| {
+            got = match written.wait(slice) {
+                Ok(receipt) => Some(Waited::Wrote(receipt)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(Waited::Unrun),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            };
+            got.is_some()
+        },
+        deadline,
+        crate::park::Lane::SERVED,
+        &|| false,
+    );
+    match got {
+        Some(waited) => waited,
+        None if woke == crate::park::Woke::HungUp => Waited::HungUp,
+        None => Waited::Queued,
     }
 }
 
@@ -11185,15 +10832,21 @@ fn background_reply(
     }
     let now = std::time::Instant::now();
     let deadline = now.checked_add(limit).unwrap_or(now);
-    loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        match sink.wait_egress_drained_to_kernel_for(hangup_park(left)) {
-            Some(true) if sink.discards() == discards => return Ok(InputOutcome::Ok),
-            Some(_) => return Ok(InputOutcome::WriteFailed),
-            None if caller_hung_up() => return Err(HUNG_UP_REPLY.to_string()),
-            None if left.is_zero() => return Err(PASTE_UNREAD.to_string()),
-            None => {}
-        }
+    let mut drained = None;
+    let woke = crate::park::park(
+        |bound| {
+            drained = sink.wait_egress_drained_to_kernel_for(bound);
+            drained.is_some()
+        },
+        deadline,
+        crate::park::Lane::SERVED,
+        &|| false,
+    );
+    match drained {
+        Some(true) if sink.discards() == discards => Ok(InputOutcome::Ok),
+        Some(_) => Ok(InputOutcome::WriteFailed),
+        None if woke == crate::park::Woke::HungUp => Err(HUNG_UP_REPLY.to_string()),
+        None => Err(PASTE_UNREAD.to_string()),
     }
 }
 
@@ -11237,126 +10890,87 @@ const fn front_routed(
     }
 }
 
-/// Execution seam for the two input phases of the composite `turn` verb, one decision
-/// so paste and Return cannot take different paths when a selector names the visible
-/// tab.
+/// Where an input verb's events go, chosen once per request ([`InputRoute::of`]):
+/// every event of a `turn`, and the one of every other input verb, takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TurnInputRoute {
-    Front,
+enum InputRoute {
+    /// The App input seam on the event loop (`Wake::Input`), with its side effects
+    /// (blink reset, viewport snap, selection clear, the typing-momentum hints, the
+    /// `video ... keys` ledger): pinned to the session the request was authorized
+    /// against, or (`None`) to whatever the event loop finds in front.
+    Seam { pin: Option<u64> },
+    /// A session not on screen: the control thread writes it directly, round-trip
+    /// free ([`background_input_observed`]).
     Background,
-    Local,
 }
 
-const fn turn_input_route(is_cross: bool, targets_front: bool) -> TurnInputRoute {
-    if targets_front {
-        TurnInputRoute::Front
-    } else if is_cross {
-        TurnInputRoute::Background
-    } else {
-        TurnInputRoute::Local
-    }
-}
-
-/// The front-routed twin of [`cross_input`]: an explicit `@<sid>` resolved to the tab on
-/// screen goes through the App input seam (`Wake::Input` carrying the session) rather
-/// than straight to the sink, so it behaves like a flagless drive (blink reset,
-/// viewport snap, selection clear, typing-momentum hints, `video ... keys` ledger).
-/// Authority is unchanged (the cross-session gate already ran). The event loop
-/// re-resolves the session, so a racing tab switch lands on the hidden path for the
-/// named session rather than typing into whatever tab won.
-fn front_routed_input(
-    proxy: &EventLoopProxy<Wake>,
-    session: u64,
-    ev: Option<InputEvent>,
-    err: &str,
-) -> String {
-    front_routed_input_observed(proxy, session, ev, err, None)
-}
-
-fn front_routed_input_observed(
-    proxy: &EventLoopProxy<Wake>,
-    session: u64,
-    ev: Option<InputEvent>,
-    err: &str,
-    completion: Option<crate::control_input_ack::InputCompletion>,
-) -> String {
-    match ev {
-        Some(ev) => control_input::input_reply_to_str(post_input_reply_to_observed(
-            proxy,
-            vec![ev],
-            Some(session),
-            completion.map(|c| c.into_mark()),
-        )),
-        None => err.to_string(),
-    }
-}
-
-fn local_input_observed(
-    proxy: &EventLoopProxy<Wake>,
-    ev: Option<InputEvent>,
-    err: &str,
-    completion: Option<crate::control_input_ack::InputCompletion>,
-) -> String {
-    match ev {
-        Some(ev) => control_input::input_reply_to_str(post_input_reply_to_observed(
-            proxy,
-            vec![ev],
-            None,
-            completion.map(|c| c.into_mark()),
-        )),
-        None => err.to_string(),
-    }
-}
-
-/// Close the cursor-move licence before a visible-front control operation that does not
-/// pass through `App::input`. The main-thread wake expires only the two key-hint stamps
-/// (unlike an empty synthetic key, it cannot heat cadence/rain, stamp input latency or
-/// write a PTY frame), and completes before the direct operation, so a signal cannot
-/// trigger output that borrows the older licence.
-fn front_routed_license_clear(
-    proxy: &EventLoopProxy<Wake>,
-    session: u64,
-    keep_hand: bool,
-) -> String {
-    license_clear_reply(control_media::call_main(proxy, |reply| {
-        Wake::CursorMoveLicenseClear {
-            session,
-            keep_hand,
-            reply,
+impl InputRoute {
+    /// The route for a `class` request on `session`. A request pinned on screen
+    /// ([`front_routed`]: an explicit selector naming the front tab, or a scoped
+    /// caller's flagless one) takes the seam pinned; any other explicit selector
+    /// writes in the background. An Owner's flagless request takes the seam: pinned
+    /// for a write of the program's own bytes (`Input::PINNED`), following the front
+    /// for a gesture, which an overlay in front may take instead.
+    const fn of(class: Input, is_cross: bool, targets_front: bool, session: u64) -> Self {
+        if targets_front || (!is_cross && class.contains(Input::PINNED)) {
+            Self::Seam { pin: Some(session) }
+        } else if is_cross {
+            Self::Background
+        } else {
+            Self::Seam { pin: None }
         }
-    }))
-}
-
-fn license_clear_reply(result: Result<bool, control_media::MainHopError>) -> String {
-    match result {
-        // `false` is a safe tab-switch race: the target is no longer visible and holds no
-        // licence, and the authorized direct operation still proceeds.
-        Ok(_) => "OK\n".to_string(),
-        Err(error) => format!("ERR input dispatch failed: {error}\n"),
     }
 }
 
+/// Deliver one input event of a `class` verb by `route`: through `front` (the App
+/// seam: `Wake::Input`, or a test's stand-in) or straight to the background
+/// session, whose write is counted for the `video ... keys` ledger the seam would
+/// have kept, and, for the program's own bytes (`Input::PINNED`), stamps the
+/// input-arrival instant as a raw write does. `completion` notes the write in the
+/// session log once its receipt says it was accepted (`control_input_ack`),
+/// whichever route takes it.
+fn deliver(
+    route: InputRoute,
+    class: Input,
+    front: impl FnOnce(
+        InputEvent,
+        Option<u64>,
+        Option<crate::control_input_ack::InputCompletion>,
+    ) -> Result<InputOutcome, String>,
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    ev: InputEvent,
+    completion: Option<crate::control_input_ack::InputCompletion>,
+) -> Result<InputOutcome, String> {
+    match route {
+        InputRoute::Seam { pin } => front(ev, pin, completion),
+        InputRoute::Background => {
+            if class.contains(Input::PINNED) {
+                crate::metrics::note_input();
+                crate::input_hint::arm();
+            }
+            crate::note_unseamed_control_input(&ev);
+            background_input_observed(term, ctx, &ev, PASTE_RECEIPT_WAIT, completion)
+        }
+    }
+}
+
+/// A pinned `resize` (the tab on screen, `InputRoute::Seam` with a pin): the px or
+/// cell form posted through the App seam for `session`, its outcome the reply.
 fn front_routed_resize(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
-    if let Some(event) = control_input::parse_resize_px(rest) {
-        return match event {
-            Err(usage) => usage,
-            Ok(event) => front_routed_input(proxy, session, Some(event), "ERR\n"),
-        };
-    }
-    let (rows, cols) = match control_input::parse_resize(rest) {
-        Ok(size) => size,
-        Err(error) => return error,
+    let event = match control_input::parse_resize_px(rest) {
+        Some(Err(usage)) => return usage,
+        Some(Ok(event)) => event,
+        None => match control_input::parse_resize(rest) {
+            Ok((rows, cols)) => InputEvent::Resize {
+                rows,
+                cols,
+                echo_to_window: true,
+            },
+            Err(error) => return error,
+        },
     };
-    front_routed_input(
-        proxy,
-        session,
-        Some(InputEvent::Resize {
-            rows,
-            cols,
-            echo_to_window: true,
-        }),
-        "ERR\n",
-    )
+    control_input::input_reply_to_str(post_input_reply_to(proxy, vec![event], Some(session)))
 }
 
 fn parse_scroll_intent(rest: &str) -> Result<ScrollIntent, String> {
@@ -11640,182 +11254,222 @@ fn apply_scroll_intent(t: &mut Terminal, intent: ScrollIntent) {
     }
 }
 
-/// Dispatch one request to its handler, returning the full response (including any
-/// trailing data rows).
+/// One input request as the admission stage reads it ([`admit`]).
+struct InputAdmission<'a> {
+    /// The verb's input class: which gates ask it.
+    class: Input,
+    verb: &'a str,
+    ctx: &'a SessionCtx,
+    /// The session's local id, the self-feed floor's key.
+    session: u64,
+    /// The request names its session: a cross write cannot self-loop, so the
+    /// self-feed floor does not ask it.
+    is_cross: bool,
+    /// What the request writes: a text verb's argument tail after its leading
+    /// options, a frame's body.
+    args: &'a [u8],
+    /// `unread=ok`: write behind unread input anyway.
+    unread_ok: bool,
+    /// A malformed leading option, answered here so a halted session says
+    /// `ERR halted` whatever the rest of the line looks like.
+    usage: Option<String>,
+}
+
+/// [`admit_with`] for a request with no words of its own past its leading
+/// options (a key, a `feed-bin`/`paste-bin` frame): `Ok` carries the unread-input
+/// gate's warning for the reply, `Err` the refusal that is the whole reply.
+fn admit(a: InputAdmission<'_>) -> Result<Option<String>, String> {
+    admit_with(a, || Ok(())).map(|((), warning)| warning)
+}
+
+/// THE INPUT ADMISSION, one order for every input request — a text verb or a
+/// `feed-bin`/`paste-bin` frame — each gate asked as the verb's class says, the
+/// request's own `words` (`send`'s and `turn`'s [`input_words`]) at the usage
+/// step. `Ok` carries what `words` answered and the unread-input gate's warning
+/// for the reply, `Err` the refusal that is the whole reply.
 ///
-/// `(selector, verb, rest)` is the line's [`request_head`] (the optional leading
-/// `@<selector>` parsed before the verb split), and [`dispatch_request`] has already
-/// resolved the target into `self_*`: the connection's own session for a flagless or
-/// `@.` line, else the named session, whose access is gated here via
-/// `cross_session_authorized`.
-#[allow(clippy::too_many_arguments)]
-fn handle(
-    selector: &Option<Selector>,
+/// 1. The fleet halt (`Input::PTY`): `ERR halted <reason>`, a transient class
+///    beside `ERR busy`, from every scope, Owner and Bridge included (the fleet
+///    hold sits behind `Scope::Bridge` so the halted party cannot lift it). `post`,
+///    `inbox seen`, `meta set`, `lease` and every read stay answerable.
+/// 2. The self-feed floor (`Input::FLOORED`, self-targeted only): a per-session
+///    token bucket, so a raw client cannot drive an output→observe→write storm on
+///    its own session (`SelfGovernor` binds only drivers linking `aterm-agent`;
+///    this binds everyone). A cross write cannot self-loop.
+/// 3. Turn arbitration (`Input::LEASED`): while a `turn` or another connection's
+///    hard drive lease holds the session, `ERR busy <holder>`; `cmd_turn` re-checks
+///    under the lease lock, so this is the fast fail. `signal` is exempt.
+/// 4. The edit hold (amacs §6.7): while the session's program waits on an `edit`
+///    ticket, the verbs that type into it ([`crate::control_edit::hold::holds_verb`])
+///    answer `ERR busy editing ticket=<t> view=<v>`, for every principal. `signal`
+///    and every read stay answerable; the App verbs that type are asked against the
+///    terminal on screen ([`dispatch_app`]).
+/// 5. The request's own usage refusal (a malformed leading option), then its own
+///    `words` (a `cause=`'s authority and what it names, a `turn`'s options),
+///    after the halt: a halted session says `ERR halted` whatever the rest of the
+///    line is, and `words` is not asked.
+/// 6. The unread-input gate (`input_stall`, `Input::WRITES`): refused only where a
+///    write is known to be harmful (a published stall, a stopped job); a slow read
+///    is written and warned on the reply (owner, 2026-09-29). Below the usage
+///    step, so a malformed request into a program that is not reading is told
+///    what is wrong with it.
+///
+/// After authorization, so an unauthorized caller learns nothing of the target's
+/// state, and after the licence fence, so a refused attempt is still a newer
+/// input boundary. Before the `if=` guard and the idempotency claim, so a refusal
+/// evaluates no guard and consumes no `id=` sequence. The keyboard never passes
+/// this seam: a halt and a stall refuse drivers, never the person at the glass.
+fn admit_with<T>(
+    a: InputAdmission<'_>,
+    words: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<String>), String> {
+    if a.class.contains(Input::PTY)
+        && let Some(refusal) = crate::fabric::hold_refusal(a.ctx)
+    {
+        return Err(refusal);
+    }
+    if !a.is_cross
+        && a.class.contains(Input::FLOORED)
+        && !crate::inject_floor::allow(a.session, a.args.len().max(1))
+    {
+        return Err(RATE_REFUSAL.to_string());
+    }
+    if a.class.contains(Input::LEASED)
+        && let Some(held) = a
+            .ctx
+            .turn_lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|l| l.write_block(crate::metrics::now_us(), serving_connection()))
+    {
+        return Err(format!("ERR busy {held}\n"));
+    }
+    if let Some(refusal) = crate::control_edit::hold::refusal(a.verb, "", Some(a.session), None) {
+        return Err(refusal);
+    }
+    if let Some(usage) = a.usage {
+        return Err(usage);
+    }
+    let words = words()?;
+    match crate::input_stall::gate(a.ctx, a.class, a.verb, a.args, a.unread_ok) {
+        crate::input_stall::Admission::Refuse(refusal) => Err(refusal),
+        crate::input_stall::Admission::Warn(warning) => Ok((words, Some(warning))),
+        crate::input_stall::Admission::Open => Ok((words, None)),
+    }
+}
+
+/// What a `send`'s or `turn`'s own words say, past its leading options
+/// ([`input_words`]).
+struct InputWords {
+    /// The session log's epoch, read before the cause was validated
+    /// ([`crate::control_input_ack::InputMark::within_epoch`]); `None` for a verb
+    /// the log does not record as input.
+    epoch: Option<u32>,
+    /// The record or mail the input says it acted on.
+    cause: Option<aterm_slog::ShortId>,
+}
+
+/// THE REQUEST'S OWN WORDS, asked at the input admission's usage step
+/// ([`admit_with`]), before the exactly-once claim, so a refusal consumes no
+/// `id=`: a leading `cause=@<off>|<seq>` (phase 3A, rulings R6 and R7), checked
+/// against what THIS session holds ([`cause_of`]), and `turn`'s own option
+/// grammar and patterns with a `cause=` among its options (R6's any-position
+/// form), checked as a leading one is and taken once (both is
+/// [`crate::session_log::CAUSE_USAGE`]). A refusal decided inside the turn would
+/// come after the claim and burn the `id=`: the corrected retry would answer `ERR
+/// in-doubt` though nothing was typed (`control_session::turn_preflight`).
+fn input_words(
+    scope: Scope,
     verb: &str,
     rest: &str,
-    self_term: &Arc<Mutex<Terminal>>,
-    self_master: i32,
-    self_session: u64,
-    self_ctx: &Arc<SessionCtx>,
-    store: &Store,
+    leading: Option<crate::session_log::CauseRef>,
+    ctx: &SessionCtx,
+) -> Result<InputWords, String> {
+    let epoch = crate::session_log::InputVerb::of(verb).map(|_| {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slog()
+            .log()
+            .ep()
+    });
+    let cause = leading
+        .map(|raw| cause_of(scope, verb, raw, ctx))
+        .transpose()?;
+    if verb != "turn" {
+        return Ok(InputWords { epoch, cause });
+    }
+    let cause = match control_session::turn_preflight(rest)? {
+        None => cause,
+        Some(_) if cause.is_some() => return Err(crate::session_log::CAUSE_USAGE.to_string()),
+        Some(raw) => Some(cause_of(scope, verb, raw, ctx)?),
+    };
+    Ok(InputWords { epoch, cause })
+}
+
+/// What a `cause=` names, checked: an edge needs read authority on the target
+/// first, since the check's answer would otherwise be an oracle on its mail
+/// offsets, then the cause must name what this session holds
+/// ([`crate::session_log::validate_cause`]).
+fn cause_of(
     scope: Scope,
-    proxy: &EventLoopProxy<Wake>,
-    queue: &ImageQueue,
-    sock_dir: &std::path::Path,
-    subscribers: &Subscribers,
+    verb: &str,
+    raw: crate::session_log::CauseRef,
+    ctx: &SessionCtx,
+) -> Result<aterm_slog::ShortId, String> {
+    if !scope.is_owner_class() && !cross_session_authorized(scope, "text", ctx) {
+        log_denial(
+            AUDIT_SUBSYSTEM,
+            &format!("{verb} cause= -> {}", ctx.self_id.as_str()),
+            aterm_containment::mode_or_containment(),
+            "cause= reads what the target holds; edge lacks read",
+        );
+        return Err("ERR denied\n".to_string());
+    }
+    crate::session_log::validate_cause(ctx, raw)
+}
+
+/// Serve one session verb on its resolved target, returning the full response
+/// (including any trailing data rows): the op-scope gate, then the input gates,
+/// then the verb's arm.
+///
+/// [`dispatch_session`] has resolved `target`: the connection's own session for a
+/// flagless or `@.` line, else the named session, whose access is gated here via
+/// `cross_session_authorized`.
+fn serve_session_verb(
+    head: &Head<'_>,
+    form: &Resolved,
+    target: &Target,
     // The session id of the tab on screen, if any (already resolved by the caller),
     // so an explicit `@<sid>` for that tab takes the App input seam
-    // (see `front_routed_input`).
+    // (see `InputRoute`).
     front_active_session: Option<u64>,
+    cx: &DispatchCx<'_>,
     // Artifact verbs park their handoff here, since it must outlive this `String` body
     // through the bounded socket write. Published paths also wait for the client's
     // ACK; in-memory bytes release after flush.
     reply_retention: &mut ReplyTail,
 ) -> String {
-    // Build and meta verbs (`version`/`update`/`help`/`verbs`): non-sensitive global
-    // provenance answered for any authenticated scope before target resolution (a
-    // selector is ignored). Membership is the table's `Access::AnyScopeMeta`
-    // (`is_any_scope_meta`).
-    if aterm_types::control_verbs::is_any_scope_meta(verb) {
-        return match verb {
-            // Global build provenance (version/commit/build-time/binary signature); see
-            // crate::build_info (also shown in the macOS About panel).
-            "version" => {
-                refuse_stray_args(verb, rest).unwrap_or_else(crate::build_info::control_line)
-            }
-            // The in-app updater's state (enabled, running build, any staged build's
-            // version and changes). `update check` forces one synchronous check, which
-            // may block for tens of seconds.
-            "update" => cmd_update(rest, scope, proxy),
-            // The self-describing protocol catalog (`verbs` is an alias); `rest` picks the
-            // short catalog, one verb's full entry, or the complete catalog.
-            "help" | "verbs" => cmd_help(rest),
-            // The macOS consent posture behind EPERM: Full Disk Access, the signing
-            // identity a grant is keyed to, and one row per live session. Instance-wide,
-            // so a selector is refused.
-            "privacy" => match selector {
-                None | Some(Selector::SelfTok) => {
-                    crate::control_privacy::cmd_privacy(rest, scope, proxy)
-                }
-                Some(_) => crate::control_privacy::no_selector_error().to_string(),
-            },
-            _ => no_handler(verb),
-        };
-    }
-
-    // Owner-only, self-scoped verbs (`sessions`/`who`/`whoami`/`grant`/`revoke`),
-    // per the table's `Access::OwnerOnly` (`is_owner_only`); op-class and
-    // scope gate are orthogonal (`who` is `Read`-op yet Owner-gated). They act on the
-    // connection's own ctx/registry and reject a target selector, so they cannot be
-    // redirected to another session's table.
-    if aterm_types::control_verbs::is_owner_only(verb) {
-        // `hold` is answered in `dispatch_before_session` in production; this covers a
-        // caller reaching `handle` directly, through the same decision function and
-        // before the generic gate, so refusals are the audited ones, not a silent
-        // `ERR denied`.
-        if verb == "hold" {
-            return dispatch_hold_verb(rest, selector.as_ref(), scope, store, subscribers);
-        }
-        // `topic` and `story` take a session selector like any session verb (see
-        // `dispatch_before_session`); the bare form lands here with the connection's
-        // own session.
-        if verb == "topic" {
-            return dispatch_topic_verb(
-                rest,
-                selector.as_ref(),
-                scope,
-                store,
-                subscribers,
-                Some(self_session),
-            );
-        }
-        if verb == "story" {
-            return dispatch_story_verb(
-                rest,
-                selector.as_ref(),
-                scope,
-                store,
-                Some(self_session),
-                proxy,
-            );
-        }
-        if verb == "rekey" {
-            return dispatch_rekey_verb(rest, selector.as_ref(), scope, store);
-        }
-        if let Some(reply) = fleet_survey(verb, rest, scope, store) {
-            return reply;
-        }
-        if let Some(refusal) = owner_only_refusal(verb, selector.as_ref(), scope) {
-            return refusal;
-        }
-        return match verb {
-            "sessions" => match rest.trim() {
-                "bridge" => control_session::cmd_sessions_bridge(store),
-                "status" => control_session::cmd_sessions_status(proxy),
-                _ => refuse_stray_args(verb, rest)
-                    .unwrap_or_else(|| control_session::cmd_sessions(self_ctx, store, Some(proxy))),
-            },
-            "survey" => crate::survey::cmd_survey(
-                store,
-                rest,
-                crate::survey::SurveyLevel::Content,
-                usize::MAX,
-                &crate::survey::Here::now(),
-            ),
-            "who" => refuse_stray_args(verb, rest)
-                .unwrap_or_else(|| control_session::cmd_who(store, subscribers)),
-            // `exits`: the roster journal's `Exited` rows — `sessions`' past.
-            "exits" => control_session::cmd_exits(store, rest),
-            // `identities`: the on-disk identity roster and its `forget`.
-            "identities" => crate::agent_identity::cmd_identities(store, rest),
-            // The op-level authority primitives and their connection-grain twins share
-            // the repaint poke: a successful act moves the tab marks, which no funnel
-            // epoch would otherwise notice.
-            "grant" => {
-                poke_connections_on_ok(proxy, control_session::cmd_grant(self_ctx, scope, rest))
-            }
-            "revoke" => poke_connections_on_ok(
-                proxy,
-                control_session::cmd_revoke_with_closed(self_ctx, store, scope, rest),
-            ),
-            // `connect`/`disconnect`: the declarative session-connection verbs. Self-scoped
-            // like `grant` (endpoints ride as `dst=`/`src=`); they take the store to
-            // resolve both endpoints and act on the destination's table.
-            "connect" => {
-                poke_connections_on_ok(proxy, control_session::cmd_connect(store, scope, rest))
-            }
-            "disconnect" => {
-                poke_connections_on_ok(proxy, control_session::cmd_disconnect(store, scope, rest))
-            }
-            // `flows`: the aggregated connection graph (pure read, no poke).
-            "flows" => control_session::cmd_flows(store, scope, rest),
-            // `raise <sid>`: raise the hosting window + select the tab (a
-            // main-thread hop; window/tab state is App-owned).
-            "raise" => control_session::cmd_raise(proxy, store, scope, rest),
-            "whoami" => refuse_stray_args(verb, rest)
-                .unwrap_or_else(|| control_session::cmd_whoami(self_ctx, scope)),
-            "appnotice" => control_query::cmd_appnotice(proxy, rest),
-            "notice" => control_query::cmd_notice(proxy, rest),
-            "devtools" => control_query::cmd_devtools(proxy, rest),
-            "fabric" => dispatch_fabric_verb(rest, selector.as_ref(), scope, store),
-            _ => no_handler(verb),
-        };
-    }
-
-    // The bridge plane. Production answers `deliver`/`hold` in `dispatch_before_session`
-    // (no session needed, and the bridge may be the only connection); this covers a
-    // caller reaching `handle` directly, via the same decision function.
-    if let Some(response) =
-        dispatch_bridge_verb(verb, rest, selector.as_ref(), scope, store, subscribers)
-    {
-        return response;
-    }
-
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = *head;
+    let DispatchCx {
+        store,
+        scope,
+        proxy,
+        sock_dir,
+        ..
+    } = *cx;
     // The dispatch target as the caller resolved it: no selector (or `@.`) is the self
     // tuple; otherwise the named session, with its miss and ambiguity already answered.
     let is_cross = !matches!(selector, None | Some(Selector::SelfTok));
-    let (term, master, session) = (self_term, self_master, self_session);
+    let (term, master, session, self_ctx) = (&target.0, target.1, target.2, &target.3);
     let ctx: &SessionCtx = self_ctx;
+    // What the verb does to the session's input, which decides the input gates below.
+    let class = form.row.input_class();
     // Is this request's input PINNED to `session` on the App seam? An explicit
     // selector is when it names the tab ON SCREEN (the caller already resolved
     // the front tab, so this is a plain id compare — no extra round trip); a
@@ -11828,6 +11482,13 @@ fn handle(
         front_active_session,
         session,
     );
+    // Where this request's input goes, chosen once: every event it delivers takes it.
+    let route = InputRoute::of(class, is_cross, targets_front, session);
+    // The App seam, for a route that takes it, carrying the write's completion
+    // for the session log (`control_input_ack`).
+    let front = |ev, pin, completion: Option<crate::control_input_ack::InputCompletion>| {
+        post_input_reply_to_observed(proxy, vec![ev], pin, completion.map(|c| c.into_mark()))
+    };
 
     // Observe a scoped caller's front input consumer before the op gate. A native
     // Settings tab has no modal `OverlayKind`, yet its reducer consumes key/mouse/paste
@@ -11838,18 +11499,19 @@ fn handle(
     // native reducer. Owner and cross-session requests skip this hop. A failed hop is
     // an authorization failure (fail closed), except a stalled main thread's refusal
     // (`front_surface_authority`).
-    let front_surface = if !is_cross && !scope.is_owner_class() && is_front_driving_verb(verb) {
-        match front_surface_authority(
-            verb,
-            control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }),
-        ) {
-            Ok(surface) => surface,
-            Err(reply) => return reply,
-        }
-    } else {
-        FrontControlSurface::None
-    };
-    let front_escalation = front_drive_escalation(scope, verb, front_surface);
+    let front_surface =
+        if !is_cross && !scope.is_owner_class() && class.contains(Input::FRONT_DRIVING) {
+            match front_surface_authority(
+                verb,
+                control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }),
+            ) {
+                Ok(surface) => surface,
+                Err(reply) => return reply,
+            }
+        } else {
+            FrontControlSurface::None
+        };
+    let front_escalation = front_drive_escalation(scope, class, front_surface);
 
     // Op-scope gate, exhaustive and fail-closed, on the effective op
     // (`dispatch_authorized`): the base op escalated by the argument for the indirect
@@ -11865,7 +11527,7 @@ fn handle(
     // domain) and a scoped Edge needs a `decide_edge`-permitted token against the
     // target's table (default deny).
     if is_cross {
-        if !dispatch_authorized(scope, verb, rest, ctx) {
+        if !dispatch_authorized(scope, form, verb, rest, ctx) {
             log_denial(
                 AUDIT_SUBSYSTEM,
                 &format!("cross-session {verb} -> {}", ctx.self_id.as_str()),
@@ -11876,8 +11538,8 @@ fn handle(
         }
     } else if !scope.is_owner_class()
         && !front_escalation.map_or_else(
-            || dispatch_authorized(scope, verb, rest, ctx),
-            |need| scope_holds_escalation(scope, need, ctx),
+            || dispatch_authorized(scope, form, verb, rest, ctx),
+            |need| scope_holds_need(scope, need, ctx),
         )
     {
         // Self path, Edge scope: re-verify the token against the session active now,
@@ -11900,56 +11562,52 @@ fn handle(
     }
     // The `aterm-control` verbs take a host, not a term, built here from the resolved
     // tuple (borrowed, zero-cost). The fleet handles are this dispatcher's registry and
-    // the target's own sink, so roster/resolve/write_input answer for the real process;
-    // `session` binds the host, so a sid from elsewhere is refused.
-    let host = GuiHost::with_fleet(session, term, Some(proxy), subscribers, store, ctx);
+    // the target's own context, so roster and resolve answer for the real process and
+    // `session_ended` for the target; `session` binds the host, so a sid from elsewhere
+    // is refused.
+    let host = GuiHost::with_fleet(session, term, Some(proxy), store, ctx);
 
-    // `--json` read mode: the flag is parsed off `rest` here and routed to the matching
-    // `*_json` emitter, then stripped so the text fall-through never sees it. A read
-    // verb with no json form answers an ERR (see [`json_unsupported`] for the
-    // allowlist); other verbs, and json-capable verbs without the flag, are untouched.
-    // The op-scope gate above already authorized `verb`.
-    if rest.contains("json")
-        && let (true, body) = take_json_flag(rest)
-    {
-        let json = match verb {
-            // `text --json [trim] [tail=<n>|rows=<a>-<b>]`: the tail is parsed; an unknown
-            // token is the `TEXT_USAGE` line (a span naming no row, `ERR bad rows`), as in
-            // the text form.
-            "text" => Some(match control_query::text_args(&body) {
-                Ok(args) => control_query::cmd_text_json_looked(term, ctx, args),
-                Err(err) => err,
-            }),
-            // `screen` is ALWAYS styled JSON; accept `screen --json` for symmetry.
-            "screen" => Some(control_query::cmd_screen_styled_json(term, &body)),
-            "cursor" => Some(control_query::cmd_cursor_json(term)),
-            "dims" => Some(control_query::cmd_dims_json(term, session, proxy)),
-            "metrics" => Some(control_query::cmd_metrics_json(Some(term), &body)),
-            "blocks" => Some(control_selection::cmd_blocks_json(&host, session, &body)),
-            "edges" | "grants" => Some(control_session::cmd_edges_json(ctx)),
-            // `log --json [<node>] [since= ep=] …`: one object per record.
-            "log" => Some(control_session::cmd_log_json(ctx, &body)),
-            _ => None,
-        };
-        if let Some(out) = json {
-            return out;
-        }
-        if let Some(err) = json_unsupported(verb) {
-            return err;
+    // `--json` read mode (`json_ask`, from the table's `json` column): a JSON-emitting
+    // row's flag is taken off `rest` and the request goes to its `*_json` emitter, so
+    // the text fall-through never sees it; a row with no JSON form refuses the flag;
+    // every other row reads the token as an ordinary argument. The op-scope gate above
+    // already authorized `verb`.
+    match json_ask(form, verb, rest) {
+        JsonAsk::No => {}
+        JsonAsk::Refuse(refusal) => return refusal,
+        JsonAsk::Emit(body) => {
+            return match verb {
+                // `text --json [trim] [tail=<n>|rows=<a>-<b>]`: the tail is parsed; an
+                // unknown token is the `TEXT_USAGE` line (a span naming no row, `ERR bad
+                // rows`), as in the text form.
+                "text" => match control_query::text_args(&body) {
+                    Ok(args) => control_query::cmd_text_json_looked(term, ctx, args),
+                    Err(err) => err,
+                },
+                // `screen` is ALWAYS styled JSON; accept `screen --json` for symmetry.
+                "screen" => control_query::cmd_screen_styled_json(term, &ctx.frame, &body),
+                "cursor" => control_query::cmd_cursor_json(term),
+                "dims" => control_query::cmd_dims_json(term, session, proxy),
+                "blocks" => control_selection::cmd_blocks_json(&host, session, &body),
+                "edges" | "grants" => control_session::cmd_edges_json(ctx),
+                // `log --json [<node>] [since= ep=] …`: one object per record.
+                "log" => control_session::cmd_log_json(ctx, &body),
+                // A JSON-emitting row this dispatch has no emitter for answers one
+                // `ERR` line, which reads the same under any framing.
+                _ => no_handler(verb),
+            };
         }
     }
 
-    // Take a leading `id=<key>` off the verbs that accept one
-    // (`crate::pty_idem::KEYED_VERBS`) and a leading `if=<re>` guard off those that
-    // accept one (`control_input::GUARDED_VERBS`), in either order, so every arm parses
-    // its usual tail. Done after the op-scope gate (which reads the raw `rest` for
-    // `invoke`/`open` escalation) and before the halt gate, self-feed floor and turn
-    // arbitration, which must refuse without consuming the key's sequence or
-    // evaluating the guard. A malformed option is carried (`leading.refusal`) and
-    // answered below the halt gate.
-    let (leading, rest) = control_input::take_leading_options(verb, rest);
+    // Take a leading `id=<key>` off the verbs that accept one (`Input::KEYED`) and a
+    // leading `if=<re>` guard off those that accept one (`Input::GUARDED`), in either
+    // order, so every arm parses its usual tail. Done after the op-scope gate (which
+    // reads the raw `rest` for `invoke`/`open` escalation) and before the halt gate,
+    // self-feed floor and turn arbitration, which must refuse without consuming the
+    // key's sequence or evaluating the guard. A malformed option is carried
+    // (`leading.refusal`) and answered below the halt gate.
+    let (leading, rest) = control_input::take_leading_options(class, rest);
     let idem_key = leading.idem;
-    let rest: &str = &rest;
     // `if-supervisor=<holder>` (the self-claim contract, §2): a verb's whole
     // write is made under it, and each phase of a `turn` ([`under_fence`]).
     let if_supervisor = leading.if_supervisor.as_deref();
@@ -11963,177 +11621,47 @@ fn handle(
     // here. What the fence does (nothing for a key that arms its own licence at the
     // seam, a release or a bare modifier; keeping the glow on its row for a line edit
     // or paste) is `control_input::control_fence`, the seam's own `press_fence`, so a
-    // driven key is fenced like the same physical key.
+    // driven key is fenced like the same physical key. The fence is recorded on the
+    // session, not hopped to the main thread: every window presenting it applies it
+    // before it judges the output this write causes (`crate::licence_fence`), so a
+    // write to a background session, or under a dialog, is never refused for it.
     let fenced_write = leading.guard.is_some()
         || leading.if_gen.is_some()
         || leading.if_fp.is_some()
         || leading.if_human.is_some();
-    if let Some(keep_hand) = control_input::control_fence(verb, rest, fenced_write) {
-        let cleared = front_routed_license_clear(proxy, session, keep_hand);
-        if !cleared.starts_with("OK") {
-            return cleared;
-        }
+    if let Some(keep_hand) = control_input::control_fence(class, verb, rest, fenced_write) {
+        ctx.licence.fence(keep_hand);
     }
 
-    // The fleet halt: every PTY-reaching verb resolving to a held session answers
-    // `ERR halted <reason>`, a transient class beside `ERR busy`, so drivers back off.
-    //
-    // It applies to every scope, Owner and Bridge included: the fleet `hold` sits
-    // behind `Scope::Bridge` so the halted party cannot lift it (the local hold is the
-    // owner's own). Placed after authorization, so an unauthorized caller learns
-    // nothing of the target's state, beside the self-feed floor as another per-session
-    // refusal every socket-driven PTY write passes. `feed-bin`/`paste-bin` repeat it in
-    // `run_feed_bin_routed`. The verb list is `fabric::is_pty_reaching`: `post`,
-    // `inbox seen`, `meta set`, `lease` and every read verb stay answerable, so a
-    // halted agent can ask why.
-    if let Some(refusal) = crate::fabric::halt_refusal(ctx, verb) {
-        return refusal;
-    }
-
-    // The App-lane halt again, for an aimed App verb (`@<sid> tab …`). [`aimed_app_lane`]
-    // routes those past `dispatch_before_session`'s App-lane gate so the selector
-    // reaches the resolver, but they drive the whole hosting window
-    // (`cmd_tab_aimed` → `hosting_window(session)`, `App::apply_tab_cmd_in`), so
-    // `tab close N` retires whatever session tab N hosts. The gate above only asks
-    // about the aimed session; under a partial halt (`fabric::bridge_lost` holds only
-    // `LINK.touched` sids) that would let `@<unheld> tab close N` retire a held
-    // window-mate.
-    //
-    // So re-ask the App-lane question here, keyed on [`is_aimed_app_verb`] and on
-    // `is_pty_reaching` inside `app_halt_refusal`: an aimed verb outside the halt set
-    // (`spawn`) is untouched, and one added to the lane later is covered.
-    if is_aimed_app_verb(verb)
-        && let Some(refusal) = crate::fabric::app_halt_refusal(store, verb)
-    {
-        return refusal;
-    }
-    // …and `@<sid> open <gateway>`, which opens the card on the instance
-    // (`fabric::open_halt_refusal`).
-    if let Some(refusal) = crate::fabric::open_halt_refusal(store, verb, rest) {
-        return refusal;
-    }
-
-    // The self-feed floor: every self-targeted input-injection verb passes a
-    // per-session token bucket first, so a raw client cannot drive an
-    // output→observe→write storm by looping `feed @.` (nothing on the client's
-    // side binds it; this binds everyone). The cap is generous. Cross
-    // writes cannot self-loop and are gated by the target's edge token. `feed-bin` is
-    // intercepted earlier and passes the same floor in `run_feed_bin`.
-    if !is_cross
-        && matches!(
+    // The input admission (`admit_with`): the fleet halt, the self-feed floor, turn
+    // arbitration, the edit hold, a malformed leading option, the request's own
+    // words (a `cause=` on `send`/`turn`, a `turn`'s options: `input_words`), then
+    // the unread-input gate, each as the verb's class asks, in the one order every
+    // input request passes. The `if=<re>` guard is compiled next, outside the
+    // terminal lock and bounded like `await match`'s: below the halt (a halted
+    // session says `ERR halted`, never `ERR badregex` or `OK skipped`) and above the
+    // idempotency claim, so neither a refusal nor a bad pattern consumes an `id=`
+    // sequence.
+    let (words, warning) = match admit_with(
+        InputAdmission {
+            class,
             verb,
-            "send" | "key" | "ctrl" | "feed" | "mouse" | "paste" | "turn"
-        )
-    {
-        let nbytes = rest.len().max(1);
-        if !crate::inject_floor::allow(self_session, nbytes) {
-            return RATE_REFUSAL.to_string();
-        }
-    }
-
-    // Turn arbitration: while a `turn` holds this session's lease, or another
-    // connection holds a hard drive lease (`lease acquire … hard`), other connections'
-    // write verbs are refused naming the holder, so an orchestrator can wait and retry.
-    // `cmd_turn` re-checks under the lease lock (this is the fast fail). `signal` stays
-    // exempt, and keyboard input never passes this seam.
-    if matches!(
-        verb,
-        "send" | "key" | "ctrl" | "feed" | "mouse" | "paste" | "turn"
+            ctx,
+            session,
+            is_cross,
+            args: rest.as_bytes(),
+            unread_ok: leading.unread_ok,
+            usage: leading.refusal,
+        },
+        || input_words(scope, verb, rest, leading.cause, ctx),
     ) {
-        let held = ctx
-            .turn_lease
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .and_then(|l| l.write_block(crate::metrics::now_us(), serving_connection()));
-        if let Some(held) = held {
-            return format!("ERR busy {held}\n");
-        }
-    }
-
-    // A malformed leading option, then the `if=<re>` guard itself, are answered here:
-    // below the halt gate (a halted session says `ERR halted`, never `ERR badregex` or
-    // `OK skipped`) and above the idempotency claim, so a bad pattern never consumes an
-    // `id=` sequence. The regex is compiled outside the terminal lock, bounded like
-    // `await match`'s.
-    if let Some(refusal) = leading.refusal {
-        return refusal;
-    }
-    // `cause=@<off>|<seq>` on `send`/`turn` (phase 3A, rulings R6 and R7): what this
-    // input says it acted on, checked against what THIS session holds before any byte
-    // moves or any `id=` is consumed. An edge also needs read authority on the target:
-    // the check's answer would otherwise be an oracle on its mail offsets. A `turn`
-    // takes one among its own options too (`cmd_turn`, which refuses a second).
-    let input_log_epoch = crate::session_log::InputVerb::of(verb).map(|_| {
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .slog()
-            .log()
-            .ep()
-    });
-    let cause = match leading.cause {
-        Some(raw) => {
-            if !scope.is_owner_class() && !cross_session_authorized(scope, "text", ctx) {
-                log_denial(
-                    AUDIT_SUBSYSTEM,
-                    &format!("{verb} cause= -> {}", ctx.self_id.as_str()),
-                    aterm_containment::mode_or_containment(),
-                    "cause= reads what the target holds; edge lacks read",
-                );
-                return "ERR denied\n".to_string();
-            }
-            match crate::session_log::validate_cause(ctx, raw) {
-                Ok(id) => Some(id),
-                Err(refusal) => return refusal,
-            }
-        }
-        None => None,
+        Ok(admitted) => admitted,
+        Err(refusal) => return refusal,
     };
-    // `turn`'s OWN WORDS, refused here, before the exactly-once claim below: its
-    // whole option grammar, its patterns, and a `cause=` among its options
-    // (ruling R6's any-position form), checked as a leading one is — authority,
-    // then what this session holds — and taken once (both is the usage). A
-    // refusal decided inside the turn would come after the claim and burn the
-    // `id=`: the corrected retry would answer `ERR in-doubt` though nothing
-    // was typed (`control_session::turn_preflight`).
-    let cause = if verb == "turn" {
-        match control_session::turn_preflight(rest) {
-            Err(refusal) => return refusal,
-            Ok(None) => cause,
-            Ok(Some(_)) if cause.is_some() => {
-                return crate::session_log::CAUSE_USAGE.to_string();
-            }
-            Ok(Some(raw)) => {
-                if !scope.is_owner_class() && !cross_session_authorized(scope, "text", ctx) {
-                    log_denial(
-                        AUDIT_SUBSYSTEM,
-                        &format!("turn cause= -> {}", ctx.self_id.as_str()),
-                        aterm_containment::mode_or_containment(),
-                        "cause= reads what the target holds; edge lacks read",
-                    );
-                    return "ERR denied\n".to_string();
-                }
-                match crate::session_log::validate_cause(ctx, raw) {
-                    Ok(id) => Some(id),
-                    Err(refusal) => return refusal,
-                }
-            }
-        }
-    } else {
-        cause
-    };
-    // The unread-input gate (`input_stall`): a program published as not reading (or a
-    // stopped job) has earlier input unread, so a key written now would be read later
-    // against a screen the program never drew. Refused only then; a slow read is
-    // written and warned on the reply. Below the halt and usage refusals, above the
-    // guard and the idempotency claim, so a refusal consumes no `id=` sequence
-    // (owner, 2026-09-29).
-    let warning = match crate::input_stall::admission(ctx, verb, rest, leading.unread_ok) {
-        crate::input_stall::Admission::Refuse(refusal) => return refusal,
-        crate::input_stall::Admission::Warn(warning) => Some(warning),
-        crate::input_stall::Admission::Open => None,
-    };
+    let InputWords {
+        epoch: input_log_epoch,
+        cause,
+    } = words;
     let guard = match control_input::compile_guard(leading.guard.as_deref()) {
         Ok(guard) => guard,
         Err(reply) => return reply,
@@ -12188,7 +11716,6 @@ fn handle(
         .map(|input| {
             crate::control_input_ack::InputMark::at_epoch(
                 ctx,
-                Some(subscribers),
                 session,
                 control_session::log_actor(scope, ctx),
                 input,
@@ -12201,19 +11728,19 @@ fn handle(
         });
     let completion = || input_mark.as_ref().map(|mark| mark.completion());
     // An `in-doubt` mark wakes the session log's readers.
-    let log_wake = || wake_watchers(subscribers, session);
+    let log_wake = || ctx.watchers.ring_watchers();
     let idem = idem_key.as_deref();
     let resp = crate::pty_idem::guarded_waking(ctx, scope, verb, idem, &log_wake, || match verb {
         // `text [trim] [tail=<n>|rows=<a>-<b>]`: the arm parses its tail, so an unknown
         // modifier is `ERR usage` rather than a silent full grid.
         "text" => match control_query::text_args(rest) {
-            Ok(args) => control_query::cmd_text_opt(term, args),
+            Ok(args) => control_query::cmd_text_opt(term, &ctx.frame, args),
             Err(err) => err,
         },
         // The LOSSLESS styled-screen read (keystone): full per-cell colour +
         // resolved decorations + cursor + dims + seq as one JSON frame. Always
         // styled-JSON (no plaintext variant) — `--json` is implied.
-        "screen" => control_query::cmd_screen_styled_json(term, rest),
+        "screen" => control_query::cmd_screen_styled_json(term, &ctx.frame, rest),
         "cursor" => control_query::cmd_cursor(term),
         "cell" => control_query::cmd_cell(term, rest),
         "search" => control_query::cmd_search(term, rest, &ctx.rewrap_gauge),
@@ -12223,12 +11750,10 @@ fn handle(
         "edges" | "grants" => control_session::cmd_edges(ctx),
         // `inbox`: the session's fabric mailbox: the bare listing (`Lines`),
         // `inbox get <id>` (a byte body) and `inbox seen <id>` (a status line). `Read`
-        // class, with `seen` escalated to `WriteInput` by `escalated_op`, so a read-only
+        // class, with `seen` needing `WriteInput` (its own table row), so a read-only
         // edge can read mail but not mark it handled. `seen` and a parked `get @<off>`
-        // record a row the bridge acts on, so they wake `session`'s watchers.
-        "inbox" => {
-            crate::fabric::cmd_inbox_verb(ctx, rest, &|| wake_watchers(subscribers, session))
-        }
+        // record a row the bridge acts on, and the record wakes the session's watchers.
+        "inbox" => crate::fabric::cmd_inbox_verb(ctx, rest),
         // `post`: queue one outbound fabric message. The handler refuses edge-token
         // connections (a write-input edge over S must not speak as S on the bus; a
         // sender is attested by the Owner). Exempt from `hold`, so a halted agent can
@@ -12244,7 +11769,7 @@ fn handle(
                 );
                 return "ERR denied\n".to_string();
             }
-            post_waking_watchers(ctx, session, rest, None, subscribers)
+            crate::fabric::cmd_post(ctx, rest, None)
         }
         // `lease`: the explicit cooperative drive lease for raw (non-`turn`) drivers.
         // Write-class (cross-session needs a write edge) but outside the
@@ -12272,16 +11797,19 @@ fn handle(
         // `ready [timeout_ms]`: block until the target is alive and idle (at an OSC-133
         // prompt, or after the kernel idle-settle window), so an agent can chain
         // sessions without polling.
-        "ready" => control_session::cmd_ready(term, store, session, ctx, rest, subscribers),
+        "ready" => control_session::cmd_ready(term, store, session, ctx, rest),
         // `await <idle|seq|match|gone|block>`: block until the Observation Kernel
         // latches the predicate. Unlike `wait` (OSC-133-only), `idle`/`match`/`gone`/`seq`
         // work for alt-screen agent TUIs. It registers a subscriber, so it wakes on
         // output and at the idle deadline without polling.
         // `await consent` reads the instance's consent posture, not this terminal, so it
-        // takes the main-thread posture hop instead of a `WatcherSpec`; split here so
-        // the kernel path keeps its grammar and `term`-only inputs.
+        // parks on the consent state's publications instead of a `WatcherSpec`; split
+        // here so the kernel path keeps its grammar and `term`-only inputs. It ends with
+        // the session as every other `await` does.
         "await" if rest.split_whitespace().next() == Some("consent") => {
-            crate::control_privacy::cmd_await_consent(proxy, scope, session, rest)
+            let exited = control_session::exit_probe(store, session);
+            let exited = || exited(store);
+            crate::control_privacy::cmd_await_consent(proxy, scope, session, ctx, &exited, rest)
         }
         // `await sys <free…|disk=…>` reads the MACHINE (the disk board the
         // disk watch publishes), not this terminal: a latched wait that may
@@ -12294,18 +11822,18 @@ fn handle(
         // kernel's `MomentumBelow` timer.
         "await" if rest.split_whitespace().next() == Some("momentum") => {
             let read = || typing_momentum_reading(proxy, session);
-            control_session::cmd_await_momentum(term, store, session, rest, subscribers, &read)
+            control_session::cmd_await_momentum(term, store, session, ctx, rest, &read)
         }
         "await" if rest.split_whitespace().next() == Some("edit") => {
             crate::control_edit::await_edit(proxy, scope, rest)
         }
-        "await" => control_session::cmd_await(term, store, session, ctx, rest, subscribers),
+        "await" => control_session::cmd_await(term, store, session, ctx, rest),
         // `task` / `task mark …`: the session's task record (a worker's), read
-        // off the timeline leaf; the mark is Owner-only (`escalated_op`).
-        "task" => crate::task_record::cmd_task(ctx, session, scope, rest, subscribers),
+        // off the timeline leaf; the mark is Owner-only (its table form).
+        "task" => crate::task_record::cmd_task(ctx, session, scope, rest),
         // `result [full]`: the worker's result, the snapshot its record names
         // (`task_record::cmd_result`).
-        "result" => crate::task_record::cmd_result(ctx, session, rest, subscribers),
+        "result" => crate::task_record::cmd_result(ctx, session, rest),
         // `turn`: one complete human turn: type text (paste semantics), verified
         // submit (content_seq must advance, else re-press), settle, and return the
         // settled screen. It writes input and reads the screen, so a scoped caller
@@ -12338,7 +11866,6 @@ fn handle(
             let actor = control_session::log_actor(scope, ctx);
             let mark = crate::control_input_ack::InputMark::at_epoch(
                 ctx,
-                Some(subscribers),
                 session,
                 actor,
                 crate::session_log::InputVerb::Turn,
@@ -12347,180 +11874,46 @@ fn handle(
             )
             .within_epoch(input_log_epoch)
             .typed_by(ctx, serving_caller(scope, ctx));
-            if turn_input_route(is_cross, targets_front) == TurnInputRoute::Front {
-                // An explicit selector naming the visible tab is a visible App drive:
-                // both phases go through the targeted event-loop seam like plain
-                // paste/key, keeping movement provenance, ordering and host side effects.
-                let paste = |text: &str| {
-                    fenced_phase(&|| {
-                        front_routed_input_observed(
-                            proxy,
-                            session,
-                            Some(InputEvent::Paste(
-                                control_input::paste_text(text),
-                                PasteFraming::AtDrain,
-                            )),
-                            "ERR\n",
-                            Some(mark.completion()),
+            // Both phases and every typed key take the request's one route, so paste and
+            // Return cannot take different paths when a selector names the visible tab.
+            // Each is written under the supervisor fence ([`under_fence`]) and noted in
+            // the session log once its receipt says it was accepted.
+            let applied = |ev: InputEvent| {
+                let ev = std::cell::Cell::new(Some(ev));
+                fenced_phase(&|| {
+                    ev.take().is_some_and(|ev| {
+                        matches!(
+                            deliver(route, class, front, term, ctx, ev, Some(mark.completion())),
+                            Ok(InputOutcome::Ok)
                         )
-                        .starts_with("OK")
                     })
-                };
-                let press = |name: &str| {
-                    fenced_phase(&|| {
-                        front_routed_input_observed(
-                            proxy,
-                            session,
-                            parse_key(name),
-                            "ERR\n",
-                            Some(mark.completion()),
-                        )
-                        .starts_with("OK")
-                    })
-                };
-                let key = |ev: InputEvent| {
-                    let ev = std::cell::Cell::new(Some(ev));
-                    fenced_phase(&|| {
-                        front_routed_input_observed(
-                            proxy,
-                            session,
-                            ev.take(),
-                            "ERR\n",
-                            Some(mark.completion()),
-                        )
-                        .starts_with("OK")
-                    })
-                };
-                control_session::cmd_turn(
-                    term,
-                    store,
-                    session,
-                    rest,
-                    subscribers,
-                    ctx,
-                    &control_session::TurnIo {
-                        paste: &paste,
-                        press: &press,
-                        key: &key,
-                        momentum: &momentum,
-                        driver: driver.clone(),
-                        by: by.clone(),
-                        actor,
-                        cause,
-                        mark: Some(&mark),
-                    },
-                )
-            } else if turn_input_route(is_cross, targets_front) == TurnInputRoute::Background {
-                let paste = |text: &str| {
-                    fenced_phase(&|| {
-                        cross_input_observed(
-                            term,
-                            ctx,
-                            Some(InputEvent::Paste(
-                                control_input::paste_text(text),
-                                PasteFraming::AtDrain,
-                            )),
-                            "ERR\n",
-                            Some(mark.completion()),
-                        )
-                        .starts_with("OK")
-                    })
-                };
-                let press = |name: &str| {
-                    fenced_phase(&|| {
-                        cross_input_observed(
-                            term,
-                            ctx,
-                            parse_key(name),
-                            "ERR\n",
-                            Some(mark.completion()),
-                        )
-                        .starts_with("OK")
-                    })
-                };
-                let key = |ev: InputEvent| {
-                    let ev = std::cell::Cell::new(Some(ev));
-                    fenced_phase(&|| {
-                        cross_input_observed(term, ctx, ev.take(), "ERR\n", Some(mark.completion()))
-                            .starts_with("OK")
-                    })
-                };
-                control_session::cmd_turn(
-                    term,
-                    store,
-                    session,
-                    rest,
-                    subscribers,
-                    ctx,
-                    &control_session::TurnIo {
-                        paste: &paste,
-                        press: &press,
-                        key: &key,
-                        momentum: &momentum,
-                        driver: driver.clone(),
-                        by: by.clone(),
-                        actor,
-                        cause,
-                        mark: Some(&mark),
-                    },
-                )
-            } else {
-                let paste = |text: &str| {
-                    fenced_phase(&|| {
-                        local_input_observed(
-                            proxy,
-                            Some(control_input::paste_event(text)),
-                            "ERR\n",
-                            Some(mark.completion()),
-                        )
-                        .starts_with("OK")
-                    })
-                };
-                let press = |name: &str| {
-                    fenced_phase(&|| {
-                        local_input_observed(
-                            proxy,
-                            parse_key(name),
-                            control_input::KEY_USAGE,
-                            Some(mark.completion()),
-                        )
-                        .starts_with("OK")
-                    })
-                };
-                let key = |ev: InputEvent| {
-                    let ev = std::cell::Cell::new(Some(ev));
-                    fenced_phase(&|| {
-                        ev.take().is_some_and(|ev| {
-                            control_input::input_reply_to_str(post_input_reply_to_observed(
-                                proxy,
-                                vec![ev],
-                                None,
-                                Some(mark.clone()),
-                            ))
-                            .starts_with("OK")
-                        })
-                    })
-                };
-                control_session::cmd_turn(
-                    term,
-                    store,
-                    session,
-                    rest,
-                    subscribers,
-                    ctx,
-                    &control_session::TurnIo {
-                        paste: &paste,
-                        press: &press,
-                        key: &key,
-                        momentum: &momentum,
-                        driver: driver.clone(),
-                        by: by.clone(),
-                        actor,
-                        cause,
-                        mark: Some(&mark),
-                    },
-                )
-            }
+                })
+            };
+            let paste = |text: &str| {
+                applied(InputEvent::Paste(
+                    control_input::paste_text(text),
+                    PasteFraming::AtDrain,
+                ))
+            };
+            let press = |name: &str| parse_key(name).is_some_and(applied);
+            control_session::cmd_turn(
+                term,
+                store,
+                session,
+                rest,
+                ctx,
+                &control_session::TurnIo {
+                    paste: &paste,
+                    press: &press,
+                    key: &applied,
+                    momentum: &momentum,
+                    driver,
+                    by,
+                    actor,
+                    cause,
+                    mark: Some(&mark),
+                },
+            )
         }
         // `key if=<re> <name>` / `send if=<re> <text>`: atomic check-and-press. The guard
         // is tested against the visible rows and the bytes written under one hold of
@@ -12543,107 +11936,60 @@ fn handle(
                 control_input::cmd_send_fenced_observed(term, ctx, &fence, rest, completion())
             }
         }
-        "send" if !is_cross || targets_front => front_routed_input_observed(
-            proxy,
-            session,
-            Some(InputEvent::KeySequence(control_input::send_bytes(rest))),
-            "ERR\n",
-            completion(),
-        ),
-        "send" => control_input::input_reply_to_str(cross_raw_input_observed(
+        // The input verbs build their event with the verb's own parser and deliver it by
+        // the request's route (`InputRoute`): the source-blind `App::input` seam on the
+        // event loop for the tab on screen or the Owner's flagless request, so bytes
+        // match human input and the seam's side effects (blink reset, viewport snap,
+        // selection clear, the typing-momentum hints, the `video ... keys` ledger) run
+        // for it; or, for a session not on screen, the tracked egress straight to the
+        // resolved `(term, &ctx.sink)` on the control thread, which has no App UI to
+        // touch. One arm per verb, so a malformed body answers one usage line whatever
+        // the route: a cross-session drive is not a second grammar.
+        // Each write carries its completion, so the session log notes it by its
+        // author once its receipt says it was accepted (`control_input_ack`).
+        "send" => control_input::input_reply_to_str(deliver(
+            route,
+            class,
+            front,
             term,
             ctx,
-            control_input::send_bytes(rest),
+            InputEvent::KeySequence(control_input::send_bytes(rest)),
             completion(),
         )),
-        // The self (active-tab) path sends `key`/`ctrl`/`mouse`/`paste`/`focus`/`resize`/
-        // `scroll` through the source-blind `App::input` seam on the event loop
-        // (`Wake::Input` / a reply-bearing resize), so bytes match human input and the
-        // renderer/window/gesture side effects (snap-to-bottom, selection gesture,
-        // `request_inner_size`) run for the visible tab. Only these arms touch the
-        // active UI.
-        //
-        // P1.2 follow-up: the CROSS-session (`@other`) path no longer fails closed. A
-        // background target is NOT the active tab, so there is no App UI/gesture/window
-        // state to touch — and the tracked egress seam is source-blind and session-
-        // agnostic (it reads the modes from the GIVEN term and writes the GIVEN sink).
-        // So a cross arm resolves `(target_term, target_sink) = (term, &ctx.sink)` the
-        // SAME way `send`/`feed` already do, builds the IDENTICAL `InputEvent` via the
-        // shared `parse_*` helpers, and calls tracked egress DIRECTLY on the control
-        // thread (no `Wake::Input`). Op-scope is already `WriteInput`-gated above
-        // (`cross_session_authorized`), so these run only after the edge/owner check.
-        // An explicit `@<sid>` that resolved to the tab ON SCREEN is not a
-        // background target: route it through the App seam so a named-session
-        // drive is indistinguishable from a flagless one (see
-        // [`front_routed_input`]). Genuinely background targets keep the direct,
-        // round-trip-free egress below. A SCOPED caller's flagless drive takes
-        // the same pinned arm (`targets_front`, see [`front_routed`]): only the
-        // Owner's bare form follows the front.
-        // A malformed name answers the SAME usage line the flagless and the
-        // guarded arms do: a cross-session drive is not a second grammar.
-        "key" if targets_front => front_routed_input_observed(
-            proxy,
-            session,
-            parse_key(rest),
-            control_input::KEY_USAGE,
-            completion(),
-        ),
-        "key" if is_cross => cross_input_observed(
-            term,
-            ctx,
-            parse_key(rest),
-            control_input::KEY_USAGE,
-            completion(),
-        ),
-        "key" => local_input_observed(
-            proxy,
-            parse_key(rest),
-            control_input::KEY_USAGE,
-            completion(),
-        ),
-        "ctrl" if targets_front => front_routed_input_observed(
-            proxy,
-            session,
-            parse_ctrl(rest),
-            "ERR usage: ctrl <single-letter>\n",
-            completion(),
-        ),
-        "ctrl" if is_cross => cross_input_observed(
-            term,
-            ctx,
-            parse_ctrl(rest),
-            "ERR usage: ctrl <single-letter>\n",
-            completion(),
-        ),
-        "ctrl" => local_input_observed(
-            proxy,
-            parse_ctrl(rest),
-            "ERR usage: ctrl <single-letter>\n",
-            completion(),
-        ),
-        "feed" if !is_cross || targets_front => match control_input::feed_bytes(rest) {
-            Ok(bytes) => {
-                let n = bytes.len();
-                let response = front_routed_input_observed(
-                    proxy,
-                    session,
-                    Some(InputEvent::KeySequence(bytes)),
-                    "ERR\n",
+        "key" => parse_key(rest).map_or_else(
+            || control_input::KEY_USAGE.to_string(),
+            |ev| {
+                control_input::input_reply_to_str(deliver(
+                    route,
+                    class,
+                    front,
+                    term,
+                    ctx,
+                    ev,
                     completion(),
-                );
-                if response.starts_with("OK") {
-                    format!("OK {n} bytes\n")
-                } else {
-                    response
-                }
-            }
-            Err(error) => error.to_string(),
-        },
+                ))
+            },
+        ),
+        "ctrl" => parse_ctrl(rest).map_or_else(
+            || control_input::CTRL_USAGE.to_string(),
+            |ev| {
+                control_input::input_reply_to_str(deliver(
+                    route,
+                    class,
+                    front,
+                    term,
+                    ctx,
+                    ev,
+                    completion(),
+                ))
+            },
+        ),
         "feed" => match control_input::feed_bytes(rest) {
             Ok(bytes) => {
                 let n = bytes.len();
+                let ev = InputEvent::KeySequence(bytes);
                 control_input::bytes_reply(
-                    cross_raw_input_observed(term, ctx, bytes, completion()),
+                    deliver(route, class, front, term, ctx, ev, completion()),
                     n,
                 )
             }
@@ -12666,76 +12012,53 @@ fn handle(
                 .unwrap_or_else(|p| p.into_inner())
                 .slog_take_wake()
             {
-                wake_watchers(subscribers, session);
+                ctx.watchers.ring_watchers();
             }
             reply
         }
-        // The parser's refusal is the reply, as it is for the self verb
-        // (`cmd_mouse`) and the background cross arm (`cross_mouse`): a bad
-        // modifier answers `ERR bad modifier …` naming what a report can carry,
-        // not the generic usage line. Until 2026-09-21 this arm `.ok()`'d the
-        // Result and handed `front_routed_input` the usage line for every
-        // refusal, so the one drive whose target is the on-screen tab was the
-        // one that could not say why it refused — a divergence the `mods=`
-        // refusal of 367d85b9e made visible and the key arms above never had.
-        //
-        // A pinned gesture keeps the self verb's copy-on-select fence: a scoped
-        // caller's release never auto-copies (`apply_copy_on_select_policy`, a
-        // no-op for Owner).
-        "mouse" if targets_front => match control_input::parse_mouse(rest) {
-            Ok(ev) => front_routed_input(
-                proxy,
-                session,
-                Some(control_input::apply_copy_on_select_policy(scope, ev)),
-                control_input::MOUSE_USAGE,
-            ),
+        // The parser's refusal is the reply on every route: a bad modifier answers
+        // `ERR bad modifier …` naming what a report can carry, not the generic usage
+        // line. A background target with tracking off has no selection UI, so its
+        // wheel moves the target's viewport instead (`cross_mouse`). On the seam a
+        // gesture keeps the copy-on-select fence: a scoped caller's release never
+        // auto-copies (`apply_copy_on_select_policy`, a no-op for Owner).
+        "mouse" if route == InputRoute::Background => cross_mouse(term, ctx, session, proxy, rest),
+        "mouse" => match control_input::parse_mouse(rest) {
+            Ok(ev) => {
+                let ev = control_input::apply_copy_on_select_policy(scope, ev);
+                control_input::input_reply_to_str(deliver(
+                    route,
+                    class,
+                    front,
+                    term,
+                    ctx,
+                    ev,
+                    completion(),
+                ))
+            }
             Err(refusal) => refusal,
         },
-        "mouse" if is_cross => cross_mouse(term, ctx, session, proxy, rest),
-        // Self mouse: `scope` is passed so a non-Owner gesture has its copy-on-select
-        // clipboard effect suppressed (the exfil fence), stamped on the injected event
-        // rather than branching on `Source` in the byte seam.
-        "mouse" => control_input::cmd_mouse(proxy, scope, rest),
-        "paste" if targets_front => front_routed_input_observed(
-            proxy,
-            session,
-            Some(InputEvent::Paste(
-                control_input::paste_text(rest),
-                PasteFraming::AtDrain,
-            )),
-            "ERR\n",
-            completion(),
-        ),
-        "paste" if is_cross => cross_input_observed(
+        "paste" => control_input::input_reply_to_str(deliver(
+            route,
+            class,
+            front,
             term,
             ctx,
-            Some(InputEvent::Paste(
-                control_input::paste_text(rest),
-                PasteFraming::AtDrain,
+            control_input::paste_event(rest),
+            completion(),
+        )),
+        "focus" => match control_input::parse_focus(rest) {
+            Some(focused) => control_input::input_reply_to_str(deliver(
+                route,
+                class,
+                front,
+                term,
+                ctx,
+                InputEvent::Focus(focused),
+                completion(),
             )),
-            "ERR\n",
-            completion(),
-        ),
-        "paste" => local_input_observed(
-            proxy,
-            Some(control_input::paste_event(rest)),
-            "ERR\n",
-            completion(),
-        ),
-        "focus" if targets_front => match control_input::parse_focus(rest) {
-            Some(focused) => front_routed_input(
-                proxy,
-                session,
-                Some(InputEvent::Focus(focused)),
-                "ERR usage: focus <in|out>\n",
-            ),
             None => "ERR usage: focus <in|out>\n".to_string(),
         },
-        "focus" if is_cross => match control_input::parse_focus(rest) {
-            Some(focused) => cross_input(term, ctx, Some(InputEvent::Focus(focused)), "ERR\n"),
-            None => "ERR usage: focus <in|out>\n".to_string(),
-        },
-        "focus" => control_input::cmd_focus(proxy, rest),
         // `image read [...]` reads the structured inline-image payloads from the target
         // terminal model (headless-safe, cross-session correct), so it is matched before
         // the framebuffer arm; `term` is already the resolved target.
@@ -12752,91 +12075,8 @@ fn handle(
         // the resolved session, so a scoped edge is refused it
         // ([`image_frame_refusal`]); `image read` above is its pixel verb.
         "image" if !scope.is_owner_class() => image_frame_refusal(ctx),
-        "image" => {
-            control_media::cmd_image(proxy, queue, rest, sock_dir, is_cross.then_some(session))
-                .into_body_retaining(reply_retention)
-        }
-        // `window` captures a full front-window artifact (platform chrome around the
-        // submitted client destination) to a PNG; no compositor visibility or scanout
-        // claim. App-level verbs: the selector chooses where it runs (`@<sid>` routes to
-        // the instance, cross-instance via the client relay), and the verb acts on that
-        // instance's front window, so `@peer window` screenshots the peer's window
-        // (`image` is the per-session pixel verb). Auth is enforced upstream.
-        "window" => {
-            control_media::cmd_window(proxy, rest, sock_dir).into_body_retaining(reply_retention)
-        }
-        // `video <seconds> [full] [keys] [pace]`: record the front window's submitted
-        // swapchain-destination frames to a PNG sequence + index.json, so an AI can
-        // inspect smoothness/flashes and correlate input attempts with frames. It does
-        // not observe compositor selection or scanout. `keys` is owner-only (enforced
-        // inside); its samples are not PTY-delivery or glyph receipts.
-        "video" => control_media::cmd_video(proxy, rest, sock_dir, scope.is_owner_class())
+        "image" => control_media::cmd_image(proxy, rest, sock_dir, is_cross.then_some(session))
             .into_body_retaining(reply_retention),
-        // `chrome`: the resolved instance's front window native UI (app-level; `@<sid>`
-        // routes to the instance, per the rule above — `@peer chrome` reads the peer's).
-        "chrome" => control_media::cmd_chrome(proxy),
-        // `panes`: the active tab's split layout (cell rects, focus, zoom). Cross-session
-        // uses `image`'s routing (the window whose active tab shows the session), so
-        // `@<sid> panes` and `@<sid> image` describe the same window.
-        "panes" => control_media::cmd_panes(proxy, is_cross.then_some(session)),
-        // `controls <target>` dumps an own-rendered app surface's controls as text (like
-        // `chrome`), built on the main thread from the pure surface model, so it works
-        // headless. App-level; `@<sid>` routes to the instance.
-        "controls" => control_media::cmd_controls(proxy, rest),
-        // `open <target>`: app-level UI on the resolved instance (`@<sid>` routes).
-        "open" => control_media::cmd_open(proxy, rest),
-        // `invoke <action>`: fire a menu action by name (enabled-gated, single sink).
-        // App-level, so `@peer invoke NewTab` opens a tab in the peer. The caller is the
-        // ledger's `by=` for a session the action retires (`invoke CloseTab`), as for
-        // `close` and `tab`, and an action that types (`Paste`) is credited to it where
-        // its paste lands (S9, `App::invoke_typist`).
-        "invoke" => control_media::cmd_invoke(
-            proxy,
-            rest,
-            control_session::caller_actor(scope, ctx),
-            crate::input_stall::is_input_writing(verb, rest)
-                .then(|| serving_caller(scope, ctx))
-                .flatten(),
-        ),
-        // `confirm yes|no`: answer the close/quit question a control client raised
-        // (`close_confirm`, Windows). App-level: one question per instance.
-        "confirm" => control_media::cmd_confirm(proxy, rest),
-        // `rain [status|on|off|toggle]`: the per-session matrix-rain override on the
-        // focused window's front session. App-level.
-        "rain" => control_media::cmd_rain(proxy, rest),
-        // `theme [status|list|preview|revert|commit|set]`: the live theme and
-        // its transient preview lane. App-level; the class rises by sub-form
-        // (`escalated_op`). The session-scoped forms (`theme session …`,
-        // `theme palette session`) act on the target: this tab, or `@<sid>`.
-        "theme" => control_media::cmd_theme(proxy, rest, Some(session)),
-        // `fx [status|celebrate …]`: arm a one-shot rainbow-kitty celebration on the
-        // focused window's front session (or read the arm). App-level; write-class
-        // because the session's next named edge (keyed, or its codex's `done`)
-        // spends it.
-        "fx" => control_media::cmd_fx(proxy, rest),
-        // `tone [status]`: the front window's tone-of-typing mood and every classifier
-        // gate. Read-only and App-level.
-        "tone" => control_media::cmd_tone(proxy, rest),
-        // `streak [status]`: the front window's prism wake state, every gate between
-        // program output and a comet. Read-only and App-level.
-        "streak" => control_media::cmd_streak(proxy, rest),
-        // `trail [status|<n>]`: the focused window's cursor-trail diagnostics. `<n>`
-        // prints the last n spawn-seam verdicts from the engine's ring (licensed or
-        // declined + reason: no-fresh-hint / no-credits / off-shape / program-row, plus
-        // origin/target); `status` prints one line of standing engine state (style,
-        // every gate, the licensed/declined tally, live ribbon). Read-only, App-level;
-        // the command face of the ATERM_TRACE_SPAWN sensor.
-        "trail" => control_media::cmd_trail(proxy, rest),
-        "kitty" => control_media::cmd_kitty(proxy, rest),
-        // `spawn`: mint one new tab session and reply `OK <sid>`, addressable at once
-        // (`@<sid> turn …`). Cross-session (`@<sid> spawn`) places it in the window
-        // hosting the resolved session on any tab (`App::window_of_session`), wider than
-        // `@<sid> image`, which needs the session on an active tab; where both answer
-        // they name the same window. An aimed spawn does not raise the window by default
-        // (`raise=` wins). Only an Owner reaches this arm with a selector
-        // (`aimed_app_lane`).
-        "spawn" => control_media::cmd_spawn(proxy, rest, is_cross.then_some(session)),
-        "edit" => crate::control_edit::cmd_edit(proxy, scope, Some(session), rest),
         // `@<sid> close`: retire the resolved session (self with no selector). The caller
         // is the exit ledger's `by=`: an edge-scoped connection is the session its token
         // was granted to; an owner-token connection is named by kind (`by=ctl`,
@@ -12853,58 +12093,38 @@ fn handle(
             ),
             Err(usage) => usage,
         },
-        // `settings [open|close|toggle]` drives the native Settings tab (`open settings`
-        // is an alias), so a driver can open it and read its route with
-        // `controls settings` or capture it with `image` on any platform. App-level UI
-        // on the main thread (write-class); `@<sid>` routes to the instance.
-        "settings" => control_media::cmd_settings_overlay(proxy, rest),
-        // `tab`: cross-session (`@<sid> tab …`) drives the tabs of the window hosting the
-        // resolved session, the same aim as `@<sid> spawn`, so an agent in a background
-        // window can walk its own tabs; flagless stays the front window. The caller is
-        // the ledger's `by=` for a `tab close`, as for `close`.
-        "tab" if is_cross => control_media::cmd_tab_aimed(
-            proxy,
-            rest,
-            session,
-            control_session::caller_actor(scope, ctx),
-        ),
-        "tab" => control_input::cmd_tab(proxy, rest, control_session::caller_actor(scope, ctx)),
-        // Toggle the drop-target highlight on the front window (automation of the
-        // drag-and-drop affordance; a real drag drives the same flag). A `@<sel>` is
-        // meaningless here.
-        "hover" => control_input::cmd_hover(proxy, rest),
-        // Cross-session `resize` does NOT go through the seam: `seam_egress` emits no
+        // A background `resize` does NOT go through the seam: `seam_egress` emits no
         // bytes for `Resize`, and `App::input`'s Resize arm resizes the WINDOW (every
         // tab + the GPU swapchain). A background target has no window to echo to, so we
         // replicate ONLY the term+PTY pair (`echo_to_window: false` semantics) on the
-        // TARGET, never the active window/framebuffer.
-        "resize" if targets_front => front_routed_resize(proxy, session, rest),
-        // The px form names the WINDOW and a driven px resize only ever reaches
-        // the FRONT one, so a background target is refused by name
-        // ([`control_input::RESIZE_PX_FRONT_ONLY`]) instead of falling into the
-        // cell parser's `ERR bad args`; the cell form goes on to the engine + PTY.
-        "resize" if is_cross => match control_input::cross_resize_px_refusal(rest) {
-            Some(refusal) => refusal,
-            None => cross_resize(term, master, ctx, session, Some(proxy), rest),
+        // TARGET, never the active window/framebuffer. The px form names the WINDOW and
+        // a driven px resize only ever reaches the FRONT one, so a background target is
+        // refused by name ([`control_input::RESIZE_PX_FRONT_ONLY`]) instead of falling
+        // into the cell parser's `ERR bad args`.
+        "resize" => match route {
+            InputRoute::Seam { pin: Some(_) } => front_routed_resize(proxy, session, rest),
+            InputRoute::Seam { pin: None } => control_input::cmd_resize(proxy, rest),
+            InputRoute::Background => match control_input::cross_resize_px_refusal(rest) {
+                Some(refusal) => refusal,
+                None => cross_resize(term, master, ctx, session, Some(proxy), rest),
+            },
         },
-        "resize" => control_input::cmd_resize(proxy, rest),
-        // Cross-session `scroll` also bypasses the seam (`ScrollView` emits no bytes;
-        // the viewport move lives in `App::input`). It applies the `ScrollIntent`
-        // DIRECTLY to the TARGET term's viewport and reports `OK <offset> <max>` — the
-        // SAME wire shape as the self path's `cmd_scroll`. `select` is already
-        // cross-correct (mutates the target term + fires a repaint keyed by target id).
-        "scroll" if targets_front => front_routed_scroll(term, proxy, session, rest),
-        "scroll" if is_cross => cross_scroll(term, rest),
-        "scroll" => control_input::cmd_scroll(term, proxy, rest),
+        // A background `scroll` also bypasses the seam (`ScrollView` emits no bytes; the
+        // viewport move lives in `App::input`). It applies the `ScrollIntent` DIRECTLY to
+        // the TARGET term's viewport and reports `OK <offset> <max>` — the SAME wire
+        // shape as the seam's. `select` is already cross-correct (mutates the target
+        // term + fires a repaint keyed by target id).
+        "scroll" => match route {
+            InputRoute::Seam { pin: Some(_) } => front_routed_scroll(term, proxy, session, rest),
+            InputRoute::Seam { pin: None } => control_input::cmd_scroll(term, proxy, rest),
+            InputRoute::Background => cross_scroll(term, rest),
+        },
         "dims" => control_query::cmd_dims(term, session, proxy),
-        // `metrics`: live render/latency counters (process-global; the active tab's grid
-        // supplies rows/cols), so a driver can measure responsiveness directly.
-        "metrics" => control_query::cmd_metrics(Some(term), rest),
         "lines" => control_query::cmd_lines(term),
         // `offscreen`: rows an alt-screen app scrolled off its top (Claude Code repaints
         // in place, so `lines` stays 0). Reads the target's own archive, so it is
         // cross-session correct.
-        "offscreen" => control_query::cmd_offscreen(term, rest),
+        "offscreen" => control_query::cmd_offscreen(term, &ctx.frame, rest),
         // `mainscreen`: force the target's primary screen when a killed app left the
         // alternate one up (its last frame goes to `offscreen` first). Host-based on the
         // resolved sid like `select`. It takes no argument; a tail is not consent to
@@ -12919,20 +12139,14 @@ fn handle(
         // `custody` -> WHO last took the reading position or the highlight, by name.
         // Read-side: it reports the engine's own custody record and no screen content.
         "custody" => control_query::cmd_custody(term),
-        // `appstatus`: what aterm is doing on its own initiative (a toolchain install,
-        // an update download): live status-bar rows plus finished ones still in the
-        // ring. Session-independent App state.
-        "appstatus" => control_query::cmd_appstatus(proxy),
-        // `messages` -> the message log (see `dispatch_app_verb`); App state.
-        "messages" => control_query::cmd_messages(proxy, rest),
         "title" => control_query::cmd_title(term),
         "cwd" => control_query::cmd_cwd(term),
         "blocks" => control_selection::cmd_blocks(&host, session, rest),
-        // `blocktext <id> [trim]`: the arm's helper checks the grammar and passes only
-        // `<id>` to the shared emitter; `trim` drops trailing blank rows as `text trim`
-        // does.
-        "blocktext" => control_query::cmd_blocktext_args(rest, |id| {
-            control_selection::cmd_blocktext(&host, session, id)
+        // `blocktext <id> [trim]`: the arm's helper checks the grammar and passes the
+        // id and `trim` to the shared emitter, which frames the reply after the
+        // terminal is released; `trim` drops trailing blank rows as `text trim` does.
+        "blocktext" => control_query::cmd_blocktext_args(rest, |id, trim| {
+            control_selection::blocktext(&host, session, id, trim)
         }),
         "wait" => control_selection::cmd_wait(&host, session, rest),
         "colors" => control_query::cmd_colors(term),
@@ -12942,14 +12156,22 @@ fn handle(
         // `cast` reads the target session's own asciicast recorder, not the shared
         // renderer, so it is correct cross-session (no `is_cross` guard). `cast frames
         // [count=N]` expands the recording into keyframe screens (line-framed like
-        // `text`); bare `cast` is the byte-framed asciicast.
+        // `text`), replayed under the target's seam policy; bare `cast` is the
+        // byte-framed asciicast.
         "cast" if rest.split_whitespace().next() == Some("frames") => {
-            control_session::cmd_cast_frames(ctx, rest.strip_prefix("frames").unwrap_or("").trim())
+            let policy = crate::app_render::pty_resize_policy(master);
+            control_session::cmd_cast_frames(
+                ctx,
+                policy,
+                rest.strip_prefix("frames").unwrap_or("").trim(),
+            )
         }
         // `cast drift [max_runs=<k>] [rows=<n>] [seed=…]` replays the target's recording
         // against the target's engine (line-framed); both locks are the target's, so it
-        // is cross-session correct. The host posture is asked before either lock. A
-        // wait-lane verb (`is_wait_request`): it settles 60 ms and folds the recording.
+        // is cross-session correct. The host posture (its seam policy, and whether
+        // its console host forwards an alternate-screen leave) is asked before either
+        // lock. A wait-lane verb (its table form): it settles 60 ms and folds the
+        // recording.
         "cast" if rest.split_whitespace().next() == Some("drift") => {
             let posture = aterm_control::cast_drift::Posture {
                 policy: crate::app_render::pty_resize_policy(master),
@@ -12959,12 +12181,13 @@ fn handle(
             };
             control_session::cmd_cast_drift(
                 term,
+                &ctx.frame,
                 &ctx.cast,
                 posture,
                 rest.trim_start().strip_prefix("drift").unwrap_or("").trim(),
             )
         }
-        "cast" => control_session::cmd_cast(ctx),
+        "cast" => control_session::cmd_cast(&ctx.cast),
         // `temporal [tick]` reconstructs the target's screen at a past instant from its
         // own temporal recorder, cross-session correct like `cast`. It also reads the
         // target's engine (its own lock, never nested with the recorder's) for resizes
@@ -12974,26 +12197,33 @@ fn handle(
         // what settled). Named `history` so it never collides with the `turn` driver.
         "history" => control_session::cmd_history(ctx, rest),
         // `meta`: read/write the target session's user metadata (title, description,
-        // icon). Write sub-forms were escalated to WriteInput by `escalated_op`. On an
+        // icon). The write sub-forms need WriteInput (the table's `meta` form). On an
         // actual change the arm (not the headless-testable handler) posts
-        // `Wake::MetaChanged` so tab labels repaint, and notifies subscribers so an
-        // `events` watcher drains `EVENT <sid> meta …` at once.
+        // [`meta_change_wakes`] through [`serve_meta_wired`], the code the wire test
+        // runs: `Wake::MetaChanged` so tab labels repaint, then the task face a proven
+        // self-claim's recorded act tells (`Wake::HarnessFact`); the change's
+        // `meta-change` record wakes an `events` watcher, which drains `EVENT <sid>
+        // meta …` at once.
         // `meta set|unset supervisor` is answered first: it is Owner-writable and may
         // bind to this connection, which only this seam knows. A non-Owner `questions`
         // or `autopilot` write is refused next (each decides whether the supervisor
-        // answers for the person); an Owner's falls through to `cmd_meta`'s closed set.
-        // An `autopilot` word that moved rings the window's host from the store write
-        // itself (`session_timeline::apply_meta_value`), and the `Wake::MetaChanged`
-        // below repaints the session's footer (its chip) with the rest.
-        "meta" => serve_meta(rest, term, master, session, ctx, store, scope, || {
-            let _ = proxy.send_event(Wake::MetaChanged { session });
-            if subscribers.any() {
-                subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(session);
-            }
-        }),
+        // answers for the person); an Owner's falls through to `cmd_meta`'s closed set
+        // ([`serve_meta`]). An `autopilot` word that moved rings the window's host from
+        // the store write itself (`session_timeline::apply_meta_value`), and the
+        // `Wake::MetaChanged` below repaints the session's footer (its chip) with the
+        // rest.
+        "meta" => serve_meta_wired(
+            rest,
+            term,
+            master,
+            session,
+            ctx,
+            store,
+            scope,
+            &mut |wake| {
+                let _ = proxy.send_event(wake);
+            },
+        ),
         // `timeline`: the target session's event timeline (the lifecycle twin of
         // `history`), a pure observer of the ctx ring, cross-session correct.
         "timeline" => control_session::cmd_timeline(ctx, rest),
@@ -13001,12 +12231,12 @@ fn handle(
         // a pure reader of the ctx's timeline lock like `timeline`.
         "log" => control_session::cmd_log(ctx, rest),
         // `brief`: the target session's token-budgeted rollup; `brief all` (the
-        // instance's) was escalated to Owner-only by `escalated_op`.
+        // instance's) was escalated to Owner-only by `argument_escalation`.
         "brief" => control_session::cmd_brief(ctx, store, rest),
         // `mark`: an attributed, rate-limited CLAIM in the target session's log
         // (design §7.4). Write-class, so an edge needs `WriteInput`; `by=` is the
         // connection's; it never acts ([`dispatch_mark`]).
-        "mark" => dispatch_mark(ctx, scope, session, rest, subscribers),
+        "mark" => dispatch_mark(ctx, scope, rest),
         // `resizes`: the target session's resize ledger (what re-gridded it, the runs,
         // and whether the app drew over displaced content), from its own engine and
         // timeline, cross-session correct.
@@ -13022,12 +12252,16 @@ fn handle(
                 .map_err(|e| e.to_string())
                 .and_then(|facts| facts)
         }),
-        // `sessions`/`grant`/`revoke`/`whoami` are handled self-scoped above.
-        _ => "ERR unknown verb (try: help)\n".to_string(),
+        // `subscribe` names its sessions after the verb, and the lane takes a
+        // selectorless one over before dispatch: a leading selector is its usage,
+        // one line, since this connection stays open.
+        "subscribe" => SUBSCRIBE_USAGE.to_string(),
+        // A session row with no arm here fails closed.
+        _ => no_handler(verb),
     });
     // A text the window harness typed with `send` and submitted with `key
     // enter` is a turn of the harness's in the ledger, as its `turn` is.
-    control_session::ledger_typed_input(term, ctx, scope, verb, rest, &resp, subscribers, session);
+    control_session::ledger_typed_input(term, ctx, scope, verb, rest, &resp);
     // Input observation is completed by the exact event's nonempty accepted
     // receipt, including ordered-writer completion; a reply is not byte evidence.
     // Stamp the `content_seq` baseline on a successful input-write reply so a driver
@@ -13035,17 +12269,16 @@ fn handle(
     // trailing newline; ERR untouched). A warned write then adds
     // ` warn=input-unread input_bytes=<n> input_wait_ms=<ms>` on the first line
     // (`input_stall::with_warning`).
-    crate::input_stall::with_warning(stamp_input_seq(verb, resp, term), warning.as_deref())
+    crate::input_stall::with_warning(stamp_input_seq(class, resp, term), warning.as_deref())
 }
 
 /// Append ` seq=<content_seq>` to a successful input-write reply. The seq is the target
 /// grid's content baseline right after the write is dispatched, so `await seq <n+1>`
-/// waits for the output it causes. Only input-write verbs with an `OK` reply are
-/// stamped, before the trailing newline so the reply stays one line.
-fn stamp_input_seq(verb: &str, resp: String, term: &Arc<Mutex<Terminal>>) -> String {
-    if !matches!(verb, "send" | "feed" | "key" | "ctrl" | "mouse" | "paste")
-        || !resp.starts_with("OK")
-    {
+/// waits for the output it causes. Only a verb whose `class` has `Input::STAMPS_SEQ`
+/// with an `OK` reply is stamped, before the trailing newline so the reply stays
+/// one line.
+fn stamp_input_seq(class: Input, resp: String, term: &Arc<Mutex<Terminal>>) -> String {
+    if !class.contains(Input::STAMPS_SEQ) || !resp.starts_with("OK") {
         return resp;
     }
     let seq = term_lock(term).content_seq();
@@ -13072,49 +12305,50 @@ pub(crate) fn cursor_style_name(style: CursorStyle) -> &'static str {
     }
 }
 
-/// Whether `rest` carries the `--json` / `json` flag, and `rest` without that token,
-/// so each verb's positional parse runs unchanged. Without the flag returns
-/// `(false, rest.to_string())`.
-pub(crate) fn take_json_flag(rest: &str) -> (bool, String) {
-    let mut json = false;
-    let mut kept: Vec<&str> = Vec::new();
-    for tok in rest.split_whitespace() {
-        if tok == "--json" || tok == "json" {
-            json = true;
-        } else {
-            kept.push(tok);
-        }
-    }
-    (json, kept.join(" "))
+/// What a request does with a `--json`/`json` token ([`json_ask`]).
+#[derive(Debug, PartialEq, Eq)]
+enum JsonAsk {
+    /// No JSON form is asked for: the token is absent, or the verb reads it as an
+    /// ordinary argument (`send --json`, `search json`, `meta set title json`).
+    No,
+    /// The verb has no JSON form: this `ERR` line is the whole reply.
+    Refuse(String),
+    /// The verb answers JSON: its arguments without the token, so each emitter's
+    /// positional parse runs as the text form's does.
+    Emit(String),
 }
 
-/// The reply for an explicit `--json`/`json` on a verb with no structured emitter:
-/// `Some("ERR json: not supported for <verb>\n")` for the allowlisted verbs below,
-/// `None` to fall through to the text emitters with the original `rest`.
-///
-/// Allowlist, fail-open: only verbs whose grammar can never carry a literal
-/// `json`/`--json` token as data are refused. Payload-bearing verbs (`send --json`,
-/// `turn … json`, `search json`, `await match json`) must receive the token verbatim.
-fn json_unsupported(verb: &str) -> Option<String> {
-    matches!(
-        verb,
-        "modes"
-            | "custody"
-            | "selection"
-            | "colors"
-            | "cell"
-            | "line"
-            | "lines"
-            | "offscreen"
-            | "title"
-            | "cwd"
-            | "history"
-            | "copy"
-            | "blocktext"
-            | "wait"
-            | "ready"
-    )
-    .then(|| format!("ERR json: not supported for {verb}\n"))
+/// What `verb rest` does with a `--json`/`json` token, read off the
+/// [`Json`](aterm_types::control_verbs::Json) column of its form's row — the column
+/// the client frames the reply by ([`aterm_types::control_verbs::framing_of`]), so
+/// the two cannot disagree. Only a `Refused` or `Emits` row reads the token as the
+/// flag: a payload verb's `json` is data and reaches its handler verbatim.
+fn json_ask(form: &Resolved, verb: &str, rest: &str) -> JsonAsk {
+    use aterm_types::control_verbs::{Json, json_flag};
+    if !json_flag(rest) {
+        return JsonAsk::No;
+    }
+    match form.row.json {
+        Json::None => JsonAsk::No,
+        Json::Refused => JsonAsk::Refuse(format!("ERR json: not supported for {verb}\n")),
+        Json::Emits => JsonAsk::Emit(take_json_flag(rest).1),
+    }
+}
+
+/// Whether `rest` carries the `--json` / `json` flag
+/// ([`aterm_types::control_verbs::json_flag`], the rule [`json_ask`] reads), and
+/// `rest` without that token, so each positional parse runs unchanged. Also for a
+/// reader handed a line the dispatch's [`json_ask`] did not see: a closed
+/// session's `log`, read from the closed-session index or the disk journal.
+pub(crate) fn take_json_flag(rest: &str) -> (bool, String) {
+    use aterm_types::control_verbs::json_flag;
+    // `json_flag` of one token is whether that token is the flag.
+    let kept = rest
+        .split_whitespace()
+        .filter(|token| !json_flag(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (json_flag(rest), kept)
 }
 
 /// Post a reply-bearing [`InputEvent`] and block on the seam's [`InputOutcome`] (an
@@ -13177,6 +12411,9 @@ fn typing_momentum_reading(
 mod tests;
 
 #[cfg(all(test, unix))]
+#[path = "control_handoff_tests.rs"]
+mod control_handoff_tests;
+#[cfg(all(test, unix))]
 #[path = "control_hangup_tests.rs"]
 mod control_hangup_tests;
 #[cfg(all(test, unix))]
@@ -13202,28 +12439,26 @@ mod publish_ordering_conformance;
 mod publish_when_committed_conformance;
 
 /// One `hold` request as a client's line carries it (`hold <sid> off`,
-/// `@<sid> hold off`), split by [`request_head`] and answered by
-/// [`dispatch_hold_verb`] from `scope`, as [`dispatch_before_session`]
+/// `@<sid> hold off`), read by the request grammar ([`control_request::head`])
+/// and answered by [`dispatch_hold_verb`] from `scope`, as [`dispatch_owner`]
 /// answers it: the seam another module's test runs a command it read off a
 /// record through. A line whose verb is not `hold` is answered `ERR`.
 #[cfg(test)]
 pub(crate) fn hold_line_for_test(store: &Store, line: &str, scope: Scope) -> String {
-    let (selector, verb, rest) = request_head(line);
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = control_request::head(line);
     if verb != "hold" {
         return format!("ERR not a hold line: {line:?}\n");
     }
-    dispatch_hold_verb(
-        rest,
-        selector.as_ref(),
-        scope,
-        store,
-        &crate::subscribe::new_registry(),
-    )
+    dispatch_hold_verb(rest, selector.as_ref(), scope, store)
 }
 
 /// One `meta <rest>` line as the dispatch answers it from the Owner token
 /// ([`serve_meta`], with no proxy to wake): the session's terminal, ctx and
-/// pool id, as `handle` resolved them; no wake is sent. Gated on `test`
+/// pool id, as [`dispatch_session`] resolved them; no wake is sent. Gated on `test`
 /// alone: [`serve_meta`] is built on every platform, so a test of the `meta`
 /// arm builds wherever the arm does.
 #[cfg(test)]
@@ -13235,6 +12470,40 @@ pub(crate) fn meta_line_for_test(
     rest: &str,
 ) -> String {
     serve_meta(rest, term, -1, session, ctx, store, Scope::Owner, || {})
+}
+
+/// [`meta_line_for_test`] served on connection `conn`, as the wire serves it
+/// (a claim bound to that connection records its acts without a kernel look),
+/// with the wakes the arm posts on a change, in order: the arm's own code
+/// ([`serve_meta_wired`]), its proxy a list.
+#[cfg(test)]
+pub(crate) fn meta_wakes_for_test(
+    store: &Store,
+    term: &Arc<Mutex<Terminal>>,
+    session: u64,
+    ctx: &SessionCtx,
+    rest: &str,
+    conn: Option<u64>,
+) -> (String, Vec<Wake>) {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERVING_CONNECTION.with(|s| s.set(self.0));
+        }
+    }
+    let _restore = Restore(SERVING_CONNECTION.with(|s| s.replace(conn)));
+    let mut wakes = Vec::new();
+    let reply = serve_meta_wired(
+        rest,
+        term,
+        -1,
+        session,
+        ctx,
+        store,
+        Scope::Owner,
+        &mut |wake| wakes.push(wake),
+    );
+    (reply, wakes)
 }
 
 /// `update check` under a dialog or a stalled main thread answers the main thread's

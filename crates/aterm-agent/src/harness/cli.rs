@@ -107,6 +107,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use aterm_json::{Map, Value};
+use aterm_phase::ResetKind;
+use aterm_phase::anchors::{Anchor, newer_than};
 
 use super::accounts::{self, Auth, Class, Roster};
 use super::align::Captured;
@@ -310,8 +312,11 @@ make it safe to remove, and `tier=` names the tier of the window's automatic pas
 would take it (below). For a build directory the witness is a build tool's own marker and
 a cargo profile idle past `disk.target_stale_days` (default 1 day: nothing a compile
 writes touched that long) with a non-empty `incremental/` and locks no build holds; or a
-version directory the live symlink does not point at, or a package build atpkg's own
-retention would collect (the live build and its rollback target are atpkg's to keep).
+Claude Code version that is not the live one (not the live symlink's target; on Windows
+not the version claude.exe is a byte-for-byte copy of) and that no Claude Code lock or
+running process holds (on Windows, none newer than the live one); or a package build
+atpkg's own retention would collect (the live build and its rollback target are atpkg's to
+keep).
 Removal needs BOTH `disk.apply = true` in aterm.toml AND an explicit `--apply <class>`; a
 refusal is written to the disk journal as a denial row rather than dropped. Nothing
 under the transcripts root is removable under any flag.
@@ -325,8 +330,9 @@ as the window does: this working directory and its worktree, $HOME's checkouts a
 git worktrees two levels down (a `target -> target.noindex` link resolved), x.py's
 bootstrap build directories (`build/<host>/stage<N>-<kind>`, never a sysroot, stage0 or
 llvm), aterm's Rust build cache and Claude Code's temp root (each session's scratchpad)
-— on this working directory's volume only, never into a mount point or (macOS)
-~/Desktop, ~/Documents or ~/Downloads. Under the rows it lists the largest build
+— on this working directory's volume only, never into a mount point, (macOS)
+~/Desktop, ~/Documents or ~/Downloads, or (Windows) AppData, a OneDrive folder or a
+folder a look would fetch from the cloud. Under the rows it lists the largest build
 directories it can NOT reclaim and what frees each.
 THE LINES, the same for this verb and the window (`watch:` prints them): the WARNING is
 the larger of `disk.warn_free_gib` (40 GiB unwritten, held to 20 % of a small volume),
@@ -431,7 +437,10 @@ approved, typed, skipped, escalated or deferred — with the rule and the comman
 it reads the session it runs in.
 ";
 
-/// `aterm harness accounts --help`.
+/// `aterm harness accounts --help`, down to its limit reset paragraph's
+/// account of the kinds of reset and of the builds its texts were read in,
+/// which [`help_reset`] composes from the code; [`HELP_ACCOUNTS_VERBS`] is
+/// the rest.
 const HELP_ACCOUNTS: &str = "\
 `accounts` LISTS THE CLAUDE CODE ACCOUNTS OF THIS MACHINE AND WHAT IS KNOWN OF EACH. The
 roster is `accounts.toml` beside aterm.toml: [[account]] rows of `label`, `class`
@@ -456,7 +465,7 @@ sign-in said so (any other login wall records nothing yet); `limited until <time
 limit stands; `low`: the session window at 90% or the week at 97%, until that window resets;
 `usable`; `unseen`:
 nothing observed yet), `active`,
-`active:unproven` or `pinned` (`-` for neither), the limit-reset offer last read (`offer: N left, use by <time>`, only once one was read), the sessions on
+`active:unproven` or `pinned` (`-` for neither), the limit-reset offer last read (`offer: 1 weekly reset left, use by <time>`, only once one was read; `offer: N left` for one an earlier build recorded), the sessions on
 it (`on: @s-…`, `(held: jobs)` for one that could not move) — then `next:`, the account
 a session at a limit would move to, or the time to wait until, and every other account's
 reason by name. The session and week percent, with their resets and when they were
@@ -491,20 +500,26 @@ rule=usage-probe@v1 /usage session=<p>% week=<p>%` (`?%` for a figure not read),
 `SKIPPED seq=<n> rule=usage-probe@v1 gate=<word>`.
 A LIMIT RESET is built and OFF BY DEFAULT (`[harness] limit_reset = true` turns it on).
 At Claude Code's usage-limit dialog a window's supervisor then takes the dialog's own
-reset row, matched by its exact label, and confirms only a confirmation it reads
-exactly — for the limit this session's own process hit, with the row's count and day;
-anything else it closes with the reset kept. It never types a command for a reset. Only
-on this machine's own login (the row with no dir), with no other account on record
-running within 25 hours — and under `accounts = \"off\"`, which records no session's
-login, only where the roster lists no other login; once per limit on the machine; and
-only where the limit stands more than a day, or the reset on offer ends within one. It
-needs no roster: with none listed the login is recorded as `main` — in the ledger
-(`ledger accounts`); this report lists no account without a roster. How it ended is read
-from the session's transcript, never the screen — `reset-used` (the account's limits are
-cleared for every session on it), `reset-kept` or `reset-failed` — and while it is being
+reset row, matched by its kind's whole wording, and confirms only a confirmation it
+reads exactly — that kind's, for the limit this session's own process hit, with the
+row's count and day; anything else it closes with the reset kept. It never types a
+command for a reset. Only on this machine's own login (the row with no dir), with no
+other account on record running within 25 hours — and under `accounts = \"off\"`, which
+records no session's login, only where the roster lists no other login; once per limit
+on the machine; and only where the limit stands more than a day, or the reset on offer
+ends within one. It needs no roster: with none listed the login is recorded as `main` —
+in the ledger (`ledger accounts`); this report lists no account without a roster. How it
+ended is read from the session's transcript, never the screen — `reset-used` (the limit
+it was taken for is cleared for every session on the account, unless the vendor's line
+says that limit still stands), `reset-kept` or `reset-failed` — and while it is being
 taken no session is moved off that account. The offer column shows what a confirmation,
-or a reset used or kept, last showed. NEVER RUN AGAINST A REAL WALL: every text of it was
-read in Claude Code 2.1.287's bundle and none was seen on a screen.
+or a reset used or kept, last showed, counted for its kind as Claude Code counts it
+(`offer: 1 weekly reset left`).
+";
+
+/// `aterm harness accounts --help` after [`help_reset`]'s lines: the
+/// `accounts` verbs.
+const HELP_ACCOUNTS_VERBS: &str = "\
 None of it has been observed with two real accounts: the report's last line says so.
 `accounts add <label> [--shared]` makes the login directory
 (<state>/accounts/logins/<label>, 0700), appends the row (creating the file) and prints
@@ -576,11 +591,22 @@ in only this way: `accounts login` refuses it. When a window's session on such a
 it with nothing renewed, its supervisor signs it in where it stands, as any lost login:
 /login once, the method picker answered with the method the login already is, you asked
 once to finish the sign-in in the browser, `Login successful` confirmed. Once renewed, the
-session is relaunched onto the renewed login instead; where that relaunch cannot be made
-(`relaunch` or `resume_limits` off, a draft in the composer) the tab is flagged with what
-still holds it on its old login, which no renewal reaches: the draft (send or clear it, and
-the tab moves by itself), or, where nothing relaunches it, the line `renew` printed (quit
-Claude Code and start it with that line).
+session is restarted on the renewed login instead; where that restart cannot be made
+(`relaunch` or `resume_limits` off, a Claude Code aterm cannot restart, a draft in the tab)
+the tab's notice says what still holds it on its old login, which no renewal reaches: the
+draft (send it, and the tab is restarted by itself), or, where nothing restarts it, a
+sign-in in the tab (sign in to the row's label: type /login there, as the notice says;
+another account makes two rows of the roster one account). A notice names an account by
+its label, never its email. A weekly usage limit more than six hours from its reset, with
+no account move to come, gets one notice too: its step is the next row's sign-in by name
+(`accounts renew|login <label>`), `accounts use <label>` where another row is ready but
+aterm does not move the tab by itself (it pins that account: every session moves to it,
+until `accounts use --auto` ends the pin), the `[harness]` lines of aterm.toml that let
+the tab switch where `accounts = \"off\"`, `relaunch = false` or `resume_limits = false`
+keep it on its account (every one that does, together), or, with no row to sign in,
+`aterm harness accounts`. It says whether aterm then switches the tab by itself or, where
+the roster holds the tab at that limit, names the next step; and it names the reset, after
+which aterm continues the tab by itself (`resume_limits`; off, it says aterm does not).
 aterm never deletes a keychain item: each renewal leaves the old one, which nothing reads.
 `accounts use <label>` is THE OWNER'S WORD: the account's recorded limits are cleared and
 it is the active account, pinned. A label that is not listed, not enrolled or signed out
@@ -994,11 +1020,10 @@ written.
 // ---------------------------------------------------------------------------
 
 /// The variable [`Env::from_process`] reads the owner's home from: the one the
-/// agents read theirs from. `HOME`, and on Windows `USERPROFILE`, which Node's
-/// `os.homedir()` (Claude Code's) and Rust's home lookup (Codex's) read there,
-/// and which every Windows process carries. A shell there sets no `HOME`, so
-/// reading it found no Claude Code directory: `usage` folded nothing.
-const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+/// agents read theirs from ([`accounts::HOMEDIR_ENV`]; `USERPROFILE` on
+/// Windows, where a shell sets no `HOME`, so reading `HOME` found no Claude
+/// Code directory: `usage` folded nothing).
+const HOME_VAR: &str = accounts::HOMEDIR_ENV;
 
 /// Everything the subcommands need from outside themselves, injected so every
 /// decision below is a pure function of its arguments.
@@ -1425,17 +1450,123 @@ pub enum HelpPage {
     Tap,
 }
 
+/// The limit reset's lines of `aterm harness accounts --help` that track the
+/// code: which of the kinds of reset Claude Code offers from 2.1.304 a row is
+/// taken for (each kind `takes` admits: [`ResetKind::takeable`]), and the
+/// builds whose bundles its texts were read in (the `since` of every `reset.`
+/// row of `anchors`, `aterm_phase::ANCHORS`), oldest first. Written by hand,
+/// the page went on naming 2.1.287 alone after 2.1.304's texts were read, and
+/// said nothing of the kinds or of the reset left to the owner.
+fn help_reset(takes: impl Fn(ResetKind) -> bool, anchors: &[Anchor]) -> String {
+    let (taken, left): (Vec<ResetKind>, Vec<ResetKind>) =
+        ResetKind::ALL.into_iter().partition(|kind| takes(*kind));
+    let some = |kinds: &[ResetKind]| {
+        listed(
+            &kinds
+                .iter()
+                .map(|kind| format!("a {}", kind.name()))
+                .collect::<Vec<_>>(),
+            "or",
+        )
+    };
+    let mut builds: Vec<&str> = Vec::new();
+    for anchor in anchors.iter().filter(|a| a.id.starts_with("reset.")) {
+        if !builds.contains(&anchor.since) {
+            builds.push(anchor.since);
+        }
+    }
+    builds.sort_by(|a, b| {
+        if newer_than(a, b) {
+            std::cmp::Ordering::Greater
+        } else if newer_than(b, a) {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    let mut text = String::from(
+        "FROM CLAUDE CODE 2.1.304 the dialog draws a row for each kind of reset on offer (`Use a\n\
+         <kind> (<n> left, until <day>)`).",
+    );
+    if taken.is_empty() {
+        text.push_str(" The supervisor takes no such row.");
+    } else {
+        text.push_str(
+            " By default the supervisor takes one only where it is\nthe ONE reset on offer and names ",
+        );
+        text.push_str(&some(&taken));
+        text.push('.');
+    }
+    if !left.is_empty() {
+        text.push_str("\nIt leaves ");
+        text.push_str(&some(&left));
+        text.push_str(" to you.");
+    }
+    if !taken.is_empty() {
+        let words: Vec<String> = taken
+            .iter()
+            .map(|kind| format!("\"{}\"", crate::supervise::config::reset_kind_word(*kind)))
+            .collect();
+        text.push_str(&format!(
+            "\nA dialog that offers several kinds gets its wait row, as with the key off, unless you\n\
+             name the kinds it may spend, first preferred: `[harness] limit_reset_kinds = [{}]`\n\
+             takes the row of the first listed kind on offer, whatever else is offered, and never\n\
+             an unlisted kind.",
+            words.join(", ")
+        ));
+    }
+    text.push_str(
+        " A row is entered only where the screen read after the arrow keys still\n\
+         shows it as the row the rule takes.\n\
+         NEVER RUN AGAINST A REAL WALL: none of it was seen on a screen; every text of it was read\n\
+         in Claude Code",
+    );
+    if builds.is_empty() {
+        text.push_str("'s bundle.\n");
+    } else {
+        let owned: Vec<String> = builds.iter().map(|b| format!("{b}'s")).collect();
+        text.push(' ');
+        text.push_str(&listed(&owned, "and"));
+        text.push_str(if builds.len() == 1 {
+            " bundle.\n"
+        } else {
+            " bundles.\n"
+        });
+    }
+    text
+}
+
+/// `items` as prose: `a`, `a <conj> b`, `a, b <conj> c`.
+fn listed(items: &[String], conj: &str) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} {conj} {last}", init.join(", ")),
+    }
+}
+
 /// The text of `page`: for a verb, its lines of [`USAGE`] and then its
 /// paragraphs.
 #[must_use]
 pub fn help_page(page: HelpPage) -> String {
+    let accounts: String;
+    let accounts_paras: [&str; 1];
     let (verb, status_only, paras): (&str, bool, &[&str]) = match page {
         HelpPage::Verbs => return USAGE.to_string(),
         HelpPage::Usage => ("usage", false, &[HELP_USAGE]),
         HelpPage::Limits => ("limits", false, &[HELP_LIMITS]),
         HelpPage::Disk => ("disk", false, &[HELP_DISK]),
         HelpPage::Ledger => ("ledger", false, &[HELP_LEDGER]),
-        HelpPage::Accounts => ("accounts", false, &[HELP_ACCOUNTS]),
+        HelpPage::Accounts => {
+            accounts = [
+                HELP_ACCOUNTS,
+                &help_reset(ResetKind::takeable, aterm_phase::ANCHORS),
+                HELP_ACCOUNTS_VERBS,
+            ]
+            .concat();
+            accounts_paras = [accounts.as_str()];
+            ("accounts", false, &accounts_paras)
+        }
         HelpPage::Upgrade => (
             "upgrade",
             false,
@@ -2807,20 +2938,15 @@ pub fn default_link_dirs(home: &Path) -> Vec<PathBuf> {
     disk::idle::link_dirs(home, &default_store_dir(home))
 }
 
+/// atpkg's store root for `home`: `<prefix>/store` under atpkg's OWN default
+/// prefix ([`atpkg::store::default_prefix`]) — `~/Library/Application
+/// Support/aterm/pkg` on macOS, `~/.local/share/aterm/pkg` on other Unix,
+/// `%LOCALAPPDATA%\aterm\pkg` on Windows. Asked of atpkg rather than spelled
+/// here: the Windows store was once spelled `~\.local\share\…`, a folder that
+/// is not there, so no atpkg-gc row was ever made and tier 3's clause 5 never
+/// read atpkg's `bin\` shims.
 fn default_store_dir(home: &Path) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home.join("Library")
-            .join("Application Support")
-            .join("aterm")
-            .join("pkg")
-            .join("store")
-    } else {
-        home.join(".local")
-            .join("share")
-            .join("aterm")
-            .join("pkg")
-            .join("store")
-    }
+    atpkg::store::default_prefix(home).join("store")
 }
 
 /// Where `disk` looks. Every path is derived HERE and handed to
@@ -2864,6 +2990,7 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
             agent_target_dirs: Vec::new(),
             claude_tmp: env.claude_tmp.clone(),
             device: disk::discover::device_of(&env.cwd),
+            volume: disk::target::VolumeGuid::of_path(&env.cwd, &table),
             mounts: table.points(),
             skip_home_children: false,
         };
@@ -2885,9 +3012,17 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
                 .join("claude")
                 .join("versions")
         }),
-        live_link: home
+        // `claude` (a symlink into `versions/`) on macOS and Linux;
+        // `claude.exe`, a COPY of the live version, on Windows.
+        live_link: home.as_ref().map(|h| {
+            h.join(".local")
+                .join("bin")
+                .join(format!("claude{}", std::env::consts::EXE_SUFFIX))
+        }),
+        version_locks: home
             .as_ref()
-            .map(|h| h.join(".local").join("bin").join("claude")),
+            .map(|h| h.join(".local").join("state").join("claude").join("locks")),
+        version_hashes: Some(env.state.join(disk::versions::HASH_FILE)),
         store_dir: home.as_ref().map(|h| default_store_dir(h)),
         targets: targets.to_vec(),
         transcripts: home.as_ref().map(|h| h.join(".claude").join("projects")),
@@ -2901,6 +3036,7 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
         // verb's own working directory is the session it knows of.
         idle_whole: targets.is_empty(),
         session_cwds: vec![env.cwd.clone()],
+        session_cwd_unknown: None,
         link_dirs: home.as_deref().map(default_link_dirs).unwrap_or_default(),
     }
 }
@@ -3392,6 +3528,10 @@ pub struct DiskLook<'a> {
     /// The working directory of every session of this instance, rostered or
     /// not: tier 3 never takes a build directory one of them works in.
     pub session_cwds: &'a [PathBuf],
+    /// Why the working directory of some session of this instance is not
+    /// known (on Windows a live tab that reported no absolute native one):
+    /// while it stands tier 3 takes nothing.
+    pub session_cwd_unknown: Option<&'a str>,
     /// The folders whose links tier 3 reads ([`disk::idle::link_dirs`]).
     pub link_dirs: &'a [PathBuf],
 }
@@ -3431,6 +3571,7 @@ pub fn disk_tick(
         table,
         demand,
         session_cwds,
+        session_cwd_unknown,
         link_dirs,
     } = *look;
     // The tiers the measured level admits ([`disk::pass_plan`]): from `low`,
@@ -3441,11 +3582,21 @@ pub fn disk_tick(
     if !admitted {
         return DiskTick::Plenty;
     }
+    // Every read of the tick sees a cloud placeholder as the reparse point it
+    // is (Windows; [`disk::discover::expose_placeholders`]). The search and
+    // every handle-relative call switch the thread themselves and refuse
+    // when they cannot; this covers the tick's other `std` reads.
+    let _exposed = disk::discover::expose_placeholders().ok();
     let found = discover.map_or_else(disk::discover::Discovered::default, |r| {
         disk::discover::discover(r, disk::discover::Budget::SHIPPED)
     });
     let unfinished = found.cut.clone();
     let paths: Vec<PathBuf> = found.found.iter().map(|f| f.path.clone()).collect();
+    // On Windows each volume is named by its GUID too ([`volume_id`]), off the
+    // look's mount table or, with none, one read now.
+    let fresh = (cfg!(windows) && table.is_none()).then(aterm_sysprobe::volumes::table);
+    let ids = table.or(fresh.as_ref());
+    let volume_id = |path: &Path| volume_id(path, ids);
     let here = on_volume(volume, &paths, &volume_id);
     let roots = disk::Roots {
         volume: Some(volume.to_path_buf()),
@@ -3471,6 +3622,7 @@ pub fn disk_tick(
         // for a demand.
         idle_whole: config.idle_whole_on() && (config.below_auto_floor(free) || demand.is_some()),
         session_cwds: session_cwds.to_vec(),
+        session_cwd_unknown: session_cwd_unknown.map(str::to_owned),
         link_dirs: link_dirs.to_vec(),
         ..disk::Roots::default()
     };
@@ -3518,7 +3670,90 @@ pub enum ReserveMove {
     /// Released at an emergency: its bytes unlinked.
     Released(u64),
     /// Something not ours in its place, or the file system refused: why.
+    /// Journalled and said once per reason ([`disk_reserve_look`]).
     Refused(String),
+    /// Refused again for the reason last journalled for this reserve:
+    /// nothing written to the ledger, nothing for the log.
+    StillRefused,
+}
+
+/// How long after a failed write of the reserve
+/// ([`disk::reserve::ReserveError::Unwritten`]) the watch writes it again:
+/// an hour. A write that fails partway (a quota, a failing disk) wrote up to
+/// [`disk::reserve::RESERVE_BYTES`] first, and the watch looks every minute,
+/// so tried at every look it cost hundreds of GiB of writes a day while
+/// keeping no reserve. A refusal that writes nothing (something not ours at
+/// the path, a folder that cannot be made) is judged again at every look.
+pub const RESERVE_REWRITE_AFTER_SECS: i64 = 3600;
+
+/// One reserve's last journalled refusal ([`RESERVE_REFUSED`]).
+struct ReserveRefused {
+    /// The reserve's path.
+    reserve: PathBuf,
+    /// The refusal's words, as journalled.
+    why: String,
+    /// When a write of it last failed (unix seconds), if the refusal is one.
+    unwritten_at: Option<i64>,
+}
+
+/// The refusal last journalled for each reserve path ([`disk_reserve_look`]).
+/// A refusal is a fault that holds (something not ours at the path, a folder
+/// that refuses writes) and the watch looks every minute: unremembered, it
+/// put a `refused` row in `disk.jsonl` and a line in the log at every look,
+/// unbounded while the disk is healthy (no pass runs then to cut the ledger)
+/// and crowding the pass's write-ahead rows out when one does. The reason is
+/// forgotten once the reserve is written, released or found in place, so a
+/// later refusal is journalled again.
+static RESERVE_REFUSED: std::sync::Mutex<Vec<ReserveRefused>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `why` is news for `reserve`: not the refusal last journalled for
+/// it ([`RESERVE_REFUSED`]), which it becomes, with `unwritten_at` (when a
+/// write of it failed, if one did). `None` forgets the reserve's refusal (the
+/// reserve was written, released or is in place).
+fn reserve_refusal_news(reserve: &Path, why: Option<&str>, unwritten_at: Option<i64>) -> bool {
+    let mut said = RESERVE_REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = said.iter().position(|r| r.reserve == reserve);
+    match (why, at) {
+        (None, Some(i)) => {
+            said.swap_remove(i);
+            false
+        }
+        (None, None) => false,
+        (Some(why), Some(i)) => {
+            let r = &mut said[i];
+            r.unwritten_at = unwritten_at;
+            if r.why == why {
+                false
+            } else {
+                why.clone_into(&mut r.why);
+                true
+            }
+        }
+        (Some(why), None) => {
+            said.push(ReserveRefused {
+                reserve: reserve.to_path_buf(),
+                why: why.to_owned(),
+                unwritten_at,
+            });
+            true
+        }
+    }
+}
+
+/// Whether a write of `reserve` failed less than
+/// [`RESERVE_REWRITE_AFTER_SECS`] before `now`: its last refusal
+/// ([`RESERVE_REFUSED`]) is a failed write, and the watch does not write it
+/// again yet.
+fn reserve_write_waits(reserve: &Path, now: i64) -> bool {
+    RESERVE_REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|r| r.reserve == reserve)
+        .and_then(|r| r.unwritten_at)
+        .is_some_and(|at| now < at.saturating_add(RESERVE_REWRITE_AFTER_SECS))
 }
 
 /// THE RESERVE'S MOVE on one look ([`disk::reserve`]): at
@@ -3530,7 +3765,10 @@ pub enum ReserveMove {
 /// Otherwise, with free space at least [`disk::reserve::RESERVE_BYTES`]
 /// above the pass's target, the reserve is written if it is not there, and
 /// that is journalled too. Below that, nothing is written: the reserve never
-/// takes space a pass would have to give back.
+/// takes space a pass would have to give back. A refusal is journalled once
+/// per reason ([`RESERVE_REFUSED`]); the same reason at a later look is
+/// [`ReserveMove::StillRefused`], and so is every look within
+/// [`RESERVE_REWRITE_AFTER_SECS`] of a failed write, which tries no write.
 pub fn disk_reserve_look(
     state: &Path,
     reserve: &Path,
@@ -3542,6 +3780,12 @@ pub fn disk_reserve_look(
     if level == disk::Level::Unknown {
         return ReserveMove::Kept;
     }
+    // As the tick ([`disk_tick`]): the reserve's "not ours" check reads a
+    // cloud placeholder in its place as the reparse point it is (Windows), so
+    // a synced file there is refused, never unlinked or overwritten. The
+    // window calls this outside the tick, so it holds its own guard.
+    let _exposed = disk::discover::expose_placeholders().ok();
+    let mut unwritten_at = None;
     let moved = if level == disk::Level::Emergency {
         match disk::reserve::release(reserve) {
             Ok(Some(bytes)) => ReserveMove::Released(bytes),
@@ -3554,14 +3798,35 @@ pub fn disk_reserve_look(
             .max(thresholds.floor)
             .saturating_add(disk::reserve::RESERVE_BYTES)
     }) {
+        if reserve_write_waits(reserve, now) {
+            return ReserveMove::StillRefused;
+        }
         match disk::reserve::ensure(reserve, disk::reserve::RESERVE_BYTES) {
             Ok(true) => ReserveMove::Written,
-            Ok(false) => return ReserveMove::Kept,
-            Err(e) => ReserveMove::Refused(e.to_string()),
+            Ok(false) => {
+                reserve_refusal_news(reserve, None, None);
+                return ReserveMove::Kept;
+            }
+            Err(e) => {
+                if matches!(e, disk::reserve::ReserveError::Unwritten(_)) {
+                    unwritten_at = Some(now);
+                }
+                ReserveMove::Refused(e.to_string())
+            }
         }
     } else {
         return ReserveMove::Kept;
     };
+    match &moved {
+        ReserveMove::Refused(why) => {
+            if !reserve_refusal_news(reserve, Some(why), unwritten_at) {
+                return ReserveMove::StillRefused;
+            }
+        }
+        _ => {
+            reserve_refusal_news(reserve, None, None);
+        }
+    }
     let row = match &moved {
         ReserveMove::Released(bytes) => disk::reserve_row(
             now,
@@ -3581,6 +3846,7 @@ pub fn disk_reserve_look(
         ),
         ReserveMove::Refused(why) => disk::reserve_row(now, "refused", None, why),
         ReserveMove::Kept => return ReserveMove::Kept,
+        ReserveMove::StillRefused => return ReserveMove::StillRefused,
     };
     let path = state.join(DISK_LEDGER);
     let mut sink = io::sink();
@@ -3714,14 +3980,21 @@ pub fn disk_watch_status(
     }
 }
 
-/// Journal one build directory of aterm's Rust build cache the pressure
-/// sweep (`atpkg::build_cache::reclaim_under_pressure`, the watch's pass
-/// with no session supervised) is about to remove (`removed` false: the
-/// write-ahead intent row) or removed, `bytes` in it, into
+/// Journal one build directory of aterm's Rust build cache the sweep
+/// (`atpkg::build_cache::reclaim_watched`, the watch's pass with no session
+/// supervised) is about to remove (`removed` false: the write-ahead intent
+/// row) or removed, `bytes` in it, and `why` it goes, into
 /// `<state>/disk.jsonl`. Answers whether the row is on record: the sweep
 /// keeps a directory whose intent row is not ([`disk::Refusal::Unjournalled`]'s
 /// rule — nothing is removed without a record).
-pub fn disk_sweep_journal(state: &Path, path: &Path, bytes: u64, removed: bool, now: i64) -> bool {
+pub fn disk_sweep_journal(
+    state: &Path,
+    path: &Path,
+    bytes: u64,
+    why: atpkg::build_cache::Unused,
+    removed: bool,
+    now: i64,
+) -> bool {
     let ledger = state.join(DISK_LEDGER);
     let mut sink = io::sink();
     if std::fs::create_dir_all(state).is_err() {
@@ -3729,10 +4002,11 @@ pub fn disk_sweep_journal(state: &Path, path: &Path, bytes: u64, removed: bool, 
     }
     let mut journal = Journal::open(Some(&ledger), None, &mut sink);
     let action = if removed { "removed" } else { "removing" };
-    journal.append_raw(&disk::sweep_row(now, path, action, bytes), &mut sink)
+    journal.append_raw(&disk::sweep_row(now, path, action, bytes, why), &mut sink)
 }
 
-/// The `targets` on the same volume as `volume`, by `id_of` (a device id): the
+/// The `targets` on the same volume as `volume`, by `id_of` (a device id; on
+/// Windows with the volume's GUID, [`volume_id`]): the
 /// free figure the tick acts on is that volume's, and a build directory on an
 /// external disk or a second APFS volume frees nothing there. A path whose
 /// volume cannot be read is left out, and so is every target when the
@@ -3753,24 +4027,44 @@ fn on_volume<V: PartialEq>(
         .collect()
 }
 
-/// A path's volume: its device id (`st_dev`).
-#[cfg(unix)]
-fn volume_id(path: &Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata(path).ok().map(|m| m.dev())
+/// A path's volume, a link followed: its device through the one identity
+/// export ([`aterm_sysprobe::volumes::file_id`]: `st_dev`; on Windows the
+/// volume serial, whatever spelling — `\\?\C:\x`, `c:\X`, a `subst` letter,
+/// a folder mount point — names the path) and, on Windows, the volume's own
+/// GUID, its mount's key in `table` ([`disk::target::VolumeGuid::of_path`]):
+/// a cloned volume shares its source's serial, never its GUID. `None`: one
+/// of them could not be read (on Windows, no table), and the path is
+/// surveyed on no volume. Elsewhere the device alone, `table` unread.
+fn volume_id(
+    path: &Path,
+    table: Option<&aterm_sysprobe::volumes::Table>,
+) -> Option<(u64, Option<disk::target::VolumeGuid>)> {
+    let dev = aterm_sysprobe::volumes::file_id(path, true)?.dev;
+    if cfg!(windows) {
+        let guid = disk::target::VolumeGuid::of_path(path, table?)?;
+        return Some((dev, Some(guid)));
+    }
+    Some((dev, None))
 }
 
-/// A path's volume where there is no `st_dev`: its drive or share prefix.
-#[cfg(not(unix))]
-fn volume_id(path: &Path) -> Option<std::ffi::OsString> {
-    match path.components().next()? {
-        std::path::Component::Prefix(prefix) => Some(prefix.as_os_str().to_os_string()),
-        _ => None,
-    }
+#[cfg(test)]
+thread_local! {
+    /// What [`run_disk`] read of its thread's error mode as it began
+    /// ([`aterm_sysprobe::errors_quiet`]): the test seam of its guard.
+    static DISK_ERRORS_QUIET: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// `aterm harness disk` (design §5.5). Report-only unless a class is named
 /// AND `disk.apply` is on; every refusal becomes a denial row.
+///
+/// The whole verb runs with the system's error boxes off
+/// ([`aterm_sysprobe::quiet_errors`], the caller's mode restored as it
+/// returns): it canonicalizes the roots it is named and every tab's working
+/// directory, places the volume and walks the build directories, and on
+/// Windows a query of an empty card reader or optical drive otherwise puts
+/// "There is no disk in the drive" on the person's desktop and parks the
+/// command until someone answers it.
 fn run_disk(
     env: &Env,
     targets: &[PathBuf],
@@ -3779,6 +4073,17 @@ fn run_disk(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let _quiet = aterm_sysprobe::quiet_errors();
+    #[cfg(test)]
+    DISK_ERRORS_QUIET.set(Some(aterm_sysprobe::errors_quiet()));
+    // As the tick ([`disk_tick`]): every read sees a cloud placeholder as one.
+    // Defence in depth: what decides here that a placeholder is foreign — the
+    // search and the handle-relative reclaim — switches the thread itself
+    // and is tested so; the verb's other `std` reads decide nothing by an
+    // attribute today, so nothing here observes this guard, and it stays for
+    // the read that someday does (the tick's twin is tested through its
+    // injected remover).
+    let _exposed = disk::discover::expose_placeholders().ok();
     let roots = disk_roots(env, targets);
     let DiskReading {
         config,
@@ -3835,18 +4140,29 @@ fn run_disk(
     // ones it SEARCHED for are on its working directory's volume only (the
     // search's own device filter). A pressure row carries the device it was
     // measured on, and free space is measured again (one `statfs`) before each.
+    // On Windows that row is held to the measured volume's own GUID too, read
+    // off the reading (a cloned volume shares its source's serial).
     let judge = disk::Judge {
         now: env.now,
         threshold_days: config.target_stale_days,
         device: None,
+        volume: reading
+            .as_ref()
+            .and_then(|r| disk::target::VolumeGuid::of_key(&r.key)),
     };
     let volume = roots.volume.clone();
+    // This verb's one session is itself: what it surveyed with is what stands
+    // at the removal ([`disk::remover`]'s clause 4a).
+    let sessions = disk::idle::Sessions {
+        cwds: roots.session_cwds.clone(),
+        unknown: roots.session_cwd_unknown.clone(),
+    };
     let done = class.map(|_| {
         disk::apply(
             &rep,
             survey.transcripts_root.as_deref(),
             class,
-            &mut disk::remover(judge),
+            &mut disk::remover(judge, || sessions.clone()),
             &mut || {
                 volume
                     .as_deref()
@@ -3964,8 +4280,10 @@ fn run_disk(
             "  under pressure: the least-recently-used rows go in the order listed, until free space is back or what they freed covers the shortfall; under_pressure_up_to= is the most they would free"
         );
     }
+    // Prose for a person: every path in it spelled plain ([`disk::shown`]); the
+    // `--json` form above keeps the operational spelling a tool reads.
     for note in &rep.notes {
-        let _ = writeln!(out, "  note: {note}");
+        let _ = writeln!(out, "  note: {}", disk::shown(note));
     }
     if rep.rows.is_empty() {
         let _ = writeln!(out, "  nothing to reclaim");
@@ -4014,21 +4332,26 @@ fn run_disk(
         Some(done) => {
             let _ = writeln!(out, "{}", done.headline());
             for (row, removed) in &done.removed {
-                let _ = writeln!(
-                    out,
+                let line = format!(
                     "  removed {} — {}; freed about {}",
                     row.path.display(),
                     row.witness.describe(),
                     disk::human_bytes(removed.bytes)
                 );
+                let _ = writeln!(out, "{}", disk::shown(&line));
                 for unit in &removed.units {
-                    let _ = writeln!(out, "    went: {}", unit.display());
+                    let _ = writeln!(
+                        out,
+                        "    went: {}",
+                        disk::shown(&unit.display().to_string())
+                    );
                 }
                 for (unit, why) in &removed.skipped {
-                    let _ = writeln!(out, "    kept: {} — {why}", unit.display());
+                    let line = format!("    kept: {} — {why}", unit.display());
+                    let _ = writeln!(out, "{}", disk::shown(&line));
                 }
                 for trouble in &removed.trouble {
-                    let _ = writeln!(out, "    trouble: {trouble}");
+                    let _ = writeln!(out, "    trouble: {}", disk::shown(trouble));
                 }
             }
             for refusal in &done.denials {
@@ -4037,10 +4360,10 @@ fn run_disk(
                 } else {
                     String::new()
                 };
-                let _ = writeln!(out, "  denied: {}{fix}", refusal.describe());
+                let _ = writeln!(out, "  denied: {}{fix}", disk::shown(&refusal.describe()));
             }
             if let Some(stop) = &done.stopped {
-                let _ = writeln!(out, "  stopped: {}", stop.describe());
+                let _ = writeln!(out, "  stopped: {}", disk::shown(&stop.describe()));
             }
         }
     }
@@ -5984,7 +6307,8 @@ fn usage_words(account: &accounts::Account, now: i64) -> String {
 /// The `accounts` report as text (design §8): the header, one row per
 /// account, `next:` with every non-candidate's reason, and
 /// [`ACCOUNTS_ROTATION`]. No usage figure is shown (the JSON keeps them). A
-/// limit-reset offer on record shows as `offer: N left[, use by <time>]`,
+/// limit-reset offer on record shows as `offer: <kindResets> left[, use by
+/// <time>]` (`offer: N left` where the record names no kind),
 /// and what the record says of the account's usage as [`usage_words`]. With
 /// no account listed, the machine's own row is shown where the record holds
 /// its usage (`[harness] usage_notes`).
@@ -6043,9 +6367,16 @@ fn accounts_text(
             .accounts
             .get(&row.label)
             .and_then(|account| account.offer.as_ref())
-            .map_or_else(String::new, |offer| match offer.use_by {
-                Some(by) => format!("offer: {} left, use by {}  ", offer.left, rfc3339_utc(by)),
-                None => format!("offer: {} left  ", offer.left),
+            .map_or_else(String::new, |offer| {
+                // A 2.1.304 count is its kind's (`1 weekly reset`), never the
+                // account's whole; a row an earlier build wrote names none.
+                let left = offer
+                    .kind
+                    .map_or_else(|| offer.left.to_string(), |kind| kind.resets(offer.left));
+                match offer.use_by {
+                    Some(by) => format!("offer: {left} left, use by {}  ", rfc3339_utc(by)),
+                    None => format!("offer: {left} left  "),
+                }
             });
         let usage = usage_words(&state.account(&row.label), now);
         text.push_str(&format!(
@@ -6293,6 +6624,12 @@ fn accounts_json(
                 "offer".to_owned(),
                 account.offer.as_ref().map_or(Value::Null, |offer| {
                     let mut f = Map::new();
+                    f.insert(
+                        "kind".to_owned(),
+                        offer
+                            .kind
+                            .map_or(Value::Null, |kind| Value::from(kind.word())),
+                    );
                     f.insert("left".to_owned(), Value::from(offer.left));
                     put_time(&mut f, "use_by", offer.use_by);
                     put_time(&mut f, "at", Some(offer.at));

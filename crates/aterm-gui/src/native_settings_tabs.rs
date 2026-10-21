@@ -19,7 +19,7 @@
 //!    CLI product name, live AI CLI status and duration, Autopilot mode, human
 //!    activity, and a `Show tab` button for local tabs.
 
-use super::harness_page::{CARD_GAP, CARD_PAD, metadata_cards, row_cards};
+use super::harness_page::{CARD_GAP, metadata_cards, row_cards};
 use super::*;
 use crate::harness_screen::{TabComputer, TabControlProjection, TabSpreadsheetRow};
 use crate::native_app::HarnessRequest;
@@ -118,6 +118,7 @@ pub(super) fn tabs_page(
     let maximum = PageLayout::Form.maximum(width);
     let page_width = settings_page_content_width(viewport.width, width, maximum);
     let (heading, heading_height) = pinned_heading(
+        state,
         width,
         viewport,
         gap,
@@ -149,16 +150,15 @@ fn tabs_cards(
     card_width: f32,
     room: f32,
 ) -> Vec<(UiNode, f32)> {
-    let inner = (card_width - 2.0 * CARD_PAD).max(0.0);
-    let label_width = about_metadata_label_width();
-    let value_width = (inner - label_width - ABOUT_METADATA_ROW_GAP).max(0.0);
+    let inner = card_text_width(card_width);
+    let label_width = fact_label_width(&tabs.summary_rows, inner);
     let mut cards = Vec::new();
     cards.extend(metadata_cards(
         "tabs/summary",
         ("FLEET & TAB SUMMARY", "SUMMARY"),
         &tabs.summary_rows,
-        inner,
-        (value_width, label_width),
+        card_width,
+        label_width,
     ));
     cards.push(tabs_actions(tabs, card_width));
     cards.extend(row_cards(
@@ -297,7 +297,7 @@ fn computer_rows(
     }
     let mut rows = vec![header_line(
         "tabs/computers/header",
-        "COMPUTER \u{b7} STATUS \u{b7} IPV4 & HOSTNAME \u{2014} HARDWARE SPECS \u{b7} OS & SSH \u{b7} SERVICES \u{b7} SESSIONS & AI CLIS",
+        "COMPUTER \u{b7} STATUS \u{b7} IPV4 & HOSTNAME \u{2014} LIVE SYSTEM VITALS (CPU / GPU / RAM / DISK / UPTIME / RTT) \u{2014} HARDWARE \u{b7} OS & SSH \u{b7} SESSIONS",
         inner,
     )];
     if tabs.computers.is_empty() {
@@ -318,7 +318,12 @@ fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
     let scale = settings_text_scale();
     let title_height = 22.0_f32.max(18.0 * scale);
     let detail_height = 18.0_f32.max(16.0 * scale);
-    let total_height = title_height + 4.0 + detail_height;
+    let has_vitals = !comp.vitals.is_empty();
+    let total_height = if has_vitals {
+        title_height + 4.0 + detail_height + 4.0 + detail_height
+    } else {
+        title_height + 4.0 + detail_height
+    };
     let key = format!("tabs/computer/{}", comp.id);
     let line1 = format!(
         "{} \u{b7} {} \u{b7} {}",
@@ -354,33 +359,33 @@ fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
             }
         )
     };
-    let full_label = format!("{line1} \u{2014} {line2}");
-    let node = UiNode::new(key.clone(), UiContent::Group(GroupSpec::new(full_label)))
-        .layout(
-            Layout::column()
-                .width(Length::Fill)
-                .height(Length::Fixed(total_height))
-                .gap(4.0),
+    let full_label = if has_vitals {
+        format!("{line1} \u{2014} {} \u{2014} {line2}", comp.vitals)
+    } else {
+        format!("{line1} \u{2014} {line2}")
+    };
+    let mut children = vec![
+        UiNode::new(
+            format!("{key}/title"),
+            UiContent::Text(TextSpec {
+                text: crate::native_ui::fit_native_text_label(&line1, inner),
+                role: SemanticRole::Text,
+                style: StyleRef::Primary,
+            }),
         )
-        .children(vec![
+        .layout(
+            Layout::default()
+                .width(Length::Fill)
+                .height(Length::Fixed(title_height)),
+        )
+        .paint_only(),
+    ];
+    if has_vitals {
+        children.push(
             UiNode::new(
-                format!("{key}/title"),
+                format!("{key}/vitals"),
                 UiContent::Text(TextSpec {
-                    text: crate::native_ui::fit_native_text_label(&line1, inner),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Primary,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(title_height)),
-            )
-            .paint_only(),
-            UiNode::new(
-                format!("{key}/detail"),
-                UiContent::Text(TextSpec {
-                    text: crate::native_ui::fit_native_status_label(&line2, inner),
+                    text: crate::native_ui::fit_native_status_label(&comp.vitals, inner),
                     role: SemanticRole::Status,
                     style: StyleRef::Quiet,
                 }),
@@ -391,7 +396,32 @@ fn computer_row(comp: &TabComputer, inner: f32) -> (UiNode, f32) {
                     .height(Length::Fixed(detail_height)),
             )
             .paint_only(),
-        ]);
+        );
+    }
+    children.push(
+        UiNode::new(
+            format!("{key}/detail"),
+            UiContent::Text(TextSpec {
+                text: crate::native_ui::fit_native_status_label(&line2, inner),
+                role: SemanticRole::Status,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fill)
+                .height(Length::Fixed(detail_height)),
+        )
+        .paint_only(),
+    );
+    let node = UiNode::new(key, UiContent::Group(GroupSpec::new(full_label)))
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(total_height))
+                .gap(4.0),
+        )
+        .children(children);
     (node, total_height)
 }
 
@@ -461,11 +491,14 @@ fn session_group_header_row(
     let dims = group_rows
         .iter()
         .find_map(|r| {
-            r.place.split(" \u{b7} ").find(|part| {
-                part.contains('\u{d7}') && part.chars().next().is_some_and(|c| c.is_ascii_digit())
-            })
+            r.place
+                .split(crate::native_ui::FACT_SEPARATOR)
+                .find(|part| {
+                    part.contains('\u{d7}')
+                        && part.chars().next().is_some_and(|c| c.is_ascii_digit())
+                })
         })
-        .map(|d| format!(" \u{b7} {d} grid"))
+        .map(|d| format!("{}{d} grid", crate::native_ui::FACT_SEPARATOR))
         .unwrap_or_default();
     let tab_count = group_rows.len();
     let ai_count = group_rows.iter().filter(|r| r.is_ai_cli).count();
@@ -568,14 +601,19 @@ fn spreadsheet_row(
         "{branch} {} \u{2014} \"{}\" \u{b7} {} \u{b7} {} ({})",
         row.place, row.title, row.program, row.state, row.sid
     );
+    let vitals_suffix = if row.vitals.is_empty() {
+        String::new()
+    } else {
+        format!(" \u{b7} vitals: {}", row.vitals)
+    };
     let line2 = if row.is_ai_cli {
         format!(
-            "{indent}AI CLI: {} \u{b7} autopilot: {} \u{b7} human: {}",
+            "{indent}AI CLI: {} \u{b7} autopilot: {} \u{b7} human: {}{vitals_suffix}",
             row.ai_status, row.autopilot, row.human
         )
     } else {
         format!(
-            "{indent}status: {} \u{b7} program: {} \u{b7} human: {}",
+            "{indent}status: {} \u{b7} program: {} \u{b7} human: {}{vitals_suffix}",
             row.state, row.program, row.human
         )
     };

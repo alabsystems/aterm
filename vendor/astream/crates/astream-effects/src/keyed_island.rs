@@ -11,8 +11,8 @@ clean {
     -- 1. Clean-Origin Rust Implementation Function (`clean_origin_mir` / I5)
     -- ========================================================================
 
-    def keyed_clamp_cutoff (at_or_before : UInt64) (tape_len : UInt64) : UInt64 :=
-      if at_or_before < tape_len then at_or_before else tape_len
+    def keyed_clamp_cutoff (seen : UInt64) (tape_len : UInt64) : UInt64 :=
+      if seen < tape_len then seen else tape_len
 
     -- ========================================================================
     -- 2. TLA+ Temporal Logic & State-Machine Kernel (Astream.Effects.TlaKeyedView)
@@ -128,6 +128,6 @@ clean {
     end Effects
     end Astream
 
-    def keyed_hit_within_cutoff_isl (pos : USize) (at_or_before : USize) : Bool :=
-      decide (pos ≤ at_or_before)
+    def keyed_hit_within_cutoff_isl (pos : USize) (seen : USize) : Bool :=
+      decide (pos < seen)
 }

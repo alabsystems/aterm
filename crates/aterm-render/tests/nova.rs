@@ -70,9 +70,16 @@ fn nova_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     let prev = term.cell_frame(6, 8);
     let mut cur = term.cell_frame(6, 8);
     let mut dirty = Vec::new();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -88,9 +95,16 @@ fn nova_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
         .push(quad_at(cw, ch, 2, 1, premul_rgb(0x00FF_5C3C, 200)));
     cur.nova_add
         .push(quad_at(cw, ch, 4, 1, premul_rgb(0x00FF_5C3C, 150)));
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(d.nova_changed, "changed nova must set nova_changed");

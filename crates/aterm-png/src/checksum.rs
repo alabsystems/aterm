@@ -5,98 +5,37 @@
 //! Adler-32 over the zlib stream the IDAT chunks concatenate into. A chunk
 //! whose CRC does not match is corruption a decoder must not act on.
 
-/// CRC-32/ISO-HDLC (the polynomial PNG specifies, reflected form `0xEDB8_8320`).
+use astream_wire::hash::crc32_ieee_update;
+
+/// CRC-32/ISO-HDLC (the polynomial PNG specifies, reflected form `0xEDB8_8320`)
+/// as a running value over astream-wire's `hash::crc32_ieee_update`.
 ///
-/// The table is built on first use rather than written out as 256 literals: the
-/// generator is the specification, a literal table is a transcription of it, and
-/// a transcription is the thing that can be wrong.
+/// This crate used to build its own slicing-by-8 tables behind a `OnceLock`.
+/// astream-wire's are the same eight tables built at COMPILE TIME from the
+/// polynomial (no first-use init, no probe per chunk), with every table index
+/// proved in bounds by its `u8` type and the result pinned to the `0xCBF4_3926`
+/// check value and a bitwise reference there. It is the CRC astream frames
+/// every record with and `aterm_codec::crc32` wraps for gzip, so aterm has one.
+///
+/// astream's running value is the FINISHED CRC of the bytes so far: it starts
+/// at `0` (the CRC of nothing) and inverts in and out on every call, so there
+/// is no seed to apply here and none to strip in [`Crc32::finish`].
 pub(crate) struct Crc32(u32);
 
-/// How many bytes one round of [`Crc32::update`] folds at a time, and so how
-/// many tables it needs. Eight is 8 KiB of tables against a 128 KiB L1.
-const SLICE: usize = 8;
-
-/// Reflected CRC-32 tables, filled from the polynomial once per process.
-///
-/// `T[0]` is the classic byte-at-a-time table; the other seven are DERIVED
-/// from it, each folding one more zero byte through the first:
-/// `T[k][i] = (T[k-1][i] >> 8) ^ T[0][T[k-1][i] & 0xFF]`.
-fn tables() -> &'static [[u32; 256]; SLICE] {
-    use std::sync::OnceLock;
-    static TABLES: OnceLock<[[u32; 256]; SLICE]> = OnceLock::new();
-    TABLES.get_or_init(|| {
-        let mut tables = [[0u32; 256]; SLICE];
-        let mut n = 0usize;
-        while n < 256 {
-            // `as u32` is exact: n < 256.
-            let mut c = n as u32;
-            let mut k = 0;
-            while k < 8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-                k += 1;
-            }
-            tables[0][n] = c;
-            n += 1;
-        }
-        let mut k = 1;
-        while k < SLICE {
-            let mut n = 0usize;
-            while n < 256 {
-                let prev = tables[k - 1][n];
-                // `as usize` is exact: masked to 8 bits.
-                tables[k][n] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
-                n += 1;
-            }
-            k += 1;
-        }
-        tables
-    })
-}
-
 impl Crc32 {
-    /// A fresh CRC state (the specified `0xFFFF_FFFF` seed).
+    /// A fresh CRC: the CRC of no bytes, `0`.
     pub(crate) fn new() -> Self {
-        Self(0xFFFF_FFFF)
+        Self(0)
     }
 
-    /// Fold `bytes` into the running CRC, eight at a time (slice-by-8).
-    ///
-    /// A byte-at-a-time loop is one serial chain of load-use latency: each
-    /// lookup's address depends on the previous result. Here the eight lookups
-    /// per round are independent, so they issue together and only their XOR
-    /// reduction is ordered.
+    /// Fold `bytes` into the running CRC (astream-wire's slicing-by-8 fold).
     pub(crate) fn update(&mut self, bytes: &[u8]) {
-        let tables = tables();
-        let mut c = self.0;
-        let mut rest = bytes;
-        while let Some((head, tail)) = rest.split_first_chunk::<SLICE>() {
-            c ^= u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-            // `as usize` is exact everywhere here: each index is masked to 8
-            // bits, or is a `u8` widened.
-            c = tables[7][(c & 0xFF) as usize]
-                ^ tables[6][((c >> 8) & 0xFF) as usize]
-                ^ tables[5][((c >> 16) & 0xFF) as usize]
-                ^ tables[4][(c >> 24) as usize]
-                ^ tables[3][usize::from(head[4])]
-                ^ tables[2][usize::from(head[5])]
-                ^ tables[1][usize::from(head[6])]
-                ^ tables[0][usize::from(head[7])];
-            rest = tail;
-        }
-        // The tail takes the one-byte step (`T[0]` alone).
-        for &b in rest {
-            c = tables[0][usize::from((c as u8) ^ b)] ^ (c >> 8);
-        }
-        self.0 = c;
+        self.0 = crc32_ieee_update(self.0, bytes);
     }
 
-    /// The finished CRC (the seed is inverted out again).
+    /// The finished CRC of everything folded so far.
     pub(crate) fn finish(self) -> u32 {
-        self.0 ^ 0xFFFF_FFFF
+        self.0
     }
 
     /// CRC of `parts` folded in order.
@@ -109,26 +48,55 @@ impl Crc32 {
     }
 }
 
-/// Adler-32 (RFC 1950 §9), the zlib stream's trailing checksum.
+/// Adler-32 (RFC 1950 §9), the zlib stream's trailing checksum, folded as the
+/// stream's input arrives.
 ///
 /// `65521` is the largest prime below 2^16, and the running sums are reduced
 /// every `NMAX` bytes — the largest run for which the unreduced `b` accumulator
-/// provably cannot overflow `u32`.
-pub(crate) fn adler32(data: &[u8]) -> u32 {
-    /// The RFC's own bound on how far the sums may run before reduction.
-    const NMAX: usize = 5552;
-    const BASE: u32 = 65521;
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for chunk in data.chunks(NMAX) {
-        for &byte in chunk {
-            a += u32::from(byte);
-            b += a;
-        }
-        a %= BASE;
-        b %= BASE;
+/// provably cannot overflow `u32`. Both sums are reduced at the end of every
+/// [`Adler32::update`], so a split anywhere folds to the same value.
+pub(crate) struct Adler32 {
+    a: u32,
+    b: u32,
+}
+
+/// The RFC's own bound on how far the sums may run before reduction.
+const NMAX: usize = 5552;
+/// The Adler-32 modulus.
+const BASE: u32 = 65521;
+
+impl Adler32 {
+    /// The checksum of no bytes (`1`, not `0`).
+    pub(crate) fn new() -> Self {
+        Self { a: 1, b: 0 }
     }
-    (b << 16) | a
+
+    /// Fold `data` into the running sums.
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        let (mut a, mut b) = (self.a, self.b);
+        for chunk in data.chunks(NMAX) {
+            for &byte in chunk {
+                a += u32::from(byte);
+                b += a;
+            }
+            a %= BASE;
+            b %= BASE;
+        }
+        (self.a, self.b) = (a, b);
+    }
+
+    /// The checksum of every byte folded so far.
+    pub(crate) fn finish(&self) -> u32 {
+        (self.b << 16) | self.a
+    }
+}
+
+/// Adler-32 of `data` in one fold.
+#[cfg(test)]
+pub(crate) fn adler32(data: &[u8]) -> u32 {
+    let mut sum = Adler32::new();
+    sum.update(data);
+    sum.finish()
 }
 
 #[cfg(test)]
@@ -147,8 +115,9 @@ mod tests {
         }
     }
 
-    /// Slice-by-8 against the bitwise definition at every length 0..=64, so at
-    /// every tail length mod 8. The reference shares nothing with the tables.
+    /// astream-wire's slice-by-8 against the bitwise definition at every
+    /// length 0..=64, so at every tail length mod 8, through this wrapper. The
+    /// reference shares nothing with the tables.
     #[test]
     fn slicing_agrees_with_the_byte_at_a_time_definition_at_every_alignment() {
         fn reference(bytes: &[u8]) -> u32 {
@@ -174,9 +143,27 @@ mod tests {
                 Crc32::of(&[&data[..len]]),
                 reference(&data[..len]),
                 "length {len} (tail of {} after the sliced rounds)",
-                len % SLICE,
+                len % 8,
             );
         }
+    }
+
+    /// The conformance check on the borrowed fold: the CRC-32 check value, the
+    /// empty CRC, and the CRC every PNG ends with (IEND's, over its type tag
+    /// alone: `AE 42 60 82`). `of` folds through `new`, `update` and `finish`,
+    /// so a wrapper that kept the old register convention (seed `0xFFFF_FFFF`,
+    /// `finish` XORing it back out) fails these. Negative control on the
+    /// assertions themselves: the same wrapper holding the register seed
+    /// finishes to another CRC, so the starting state is something they see.
+    #[test]
+    fn crc32_known_answers_and_the_seed_convention() {
+        assert_eq!(Crc32::of(&[b"123456789"]), 0xCBF4_3926);
+        assert_eq!(Crc32::of(&[]), 0);
+        assert_eq!(Crc32::of(&[b"IEND"]), 0xAE42_6082);
+        assert_eq!(Crc32::of(&[b"IE", b"", b"ND"]), 0xAE42_6082);
+        let mut register_seeded = Crc32(0xFFFF_FFFF);
+        register_seeded.update(b"IEND");
+        assert_ne!(register_seeded.finish(), 0xAE42_6082);
     }
 
     /// RFC 1950's own example plus the empty case (`1`, not `0`).
@@ -194,5 +181,25 @@ mod tests {
             b = (b + a) % 65521;
         }
         assert_eq!(u64::from(adler32(&long)), (b << 16) | a);
+    }
+
+    /// Folding in pieces equals folding in one go, at splits on both sides of
+    /// the NMAX reduction boundary — the property the streaming compressor
+    /// relies on when it folds one scanline at a time.
+    #[test]
+    fn adler32_is_associative_over_splits() {
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i * 7 % 256) as u8).collect();
+        let whole = adler32(&data);
+        for split in [0, 1, NMAX - 1, NMAX, NMAX + 1, 9_999, 20_000] {
+            let mut sum = Adler32::new();
+            sum.update(&data[..split]);
+            sum.update(&data[split..]);
+            assert_eq!(sum.finish(), whole, "split at {split}");
+        }
+        let mut bytewise = Adler32::new();
+        for byte in &data {
+            bytewise.update(std::slice::from_ref(byte));
+        }
+        assert_eq!(bytewise.finish(), whole, "one byte at a time");
     }
 }

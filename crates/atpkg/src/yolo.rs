@@ -6,12 +6,12 @@
 //! full access to do the work (owner ruling, 2026-10-19). Each vendor CLI spells
 //! that posture differently (claude and agy `--dangerously-skip-permissions`,
 //! codex `--dangerously-bypass-approvals-and-sandbox`, muse four switches), and
-//! claude and agy refuse the literal `--yolo` outright (measured 2026-10-19:
-//! claude 2.1.304 "unknown option '--yolo'", agy 1.4.2 "flags provided but not
-//! defined: -yolo"; codex 0.163 and muse 1.4.11 parse it natively). The policy
-//! is the vendor row's ([`Policy`], from
-//! [`crate::vendor_direct::VendorSpec::yolo_flags`] and its siblings), compiled,
-//! never taken from the index — the rule `shim_env` follows.
+//! claude and agy refuse the literal
+//! `--yolo` outright (measured 2026-10-19: claude 2.1.304 "unknown option
+//! '--yolo'", agy 1.4.2 "flags provided but not defined: -yolo"; codex 0.163
+//! and muse 1.4.11 parse it natively). The policy is the vendor row's
+//! ([`Policy`], from [`crate::vendor_direct::VendorSpec::yolo_flags`] and its
+//! siblings), compiled, never taken from the index — the rule `shim_env` follows.
 //!
 //! [`decide`] is the whole argv rule, ahead of a literal `--`:
 //!
@@ -19,16 +19,21 @@
 //!    A flag already present is never added twice — codex refuses its bypass flag
 //!    repeated (exit 2, measured 0.163).
 //! 2. Else, a launch whose posture is already decided — any of the row's markers
-//!    ([`Policy::markers`]: its permission-mode, sandbox and approval words) —
-//!    runs exactly as typed ([`Launch::AsTyped`]). That is what keeps the default
-//!    from silently upgrading a launch that chose a restriction, the harness's
-//!    own resume lines among them: claude's carry `--permission-mode`, codex's
-//!    its bypass or sandbox words, so they pass untouched.
+//!    ([`Policy::markers`]: its permission-mode, sandbox and approval words, in
+//!    every spelling its parser gives them, attached short forms and `=value`
+//!    forms included) — runs exactly as typed ([`Launch::AsTyped`]). That is
+//!    what keeps the default from silently upgrading a launch that chose a
+//!    restriction, the harness's own resume lines among them: claude's carry
+//!    `--permission-mode`, codex's its bypass, sandbox or config words, so they
+//!    pass untouched.
 //! 3. Else the flags are injected by default ([`Launch::Default`]): at the front,
 //!    behind a word in [`Policy::after`] (muse's `exec`/`resume` take its
-//!    switches only there), and never on a word in [`Policy::skip`] (muse's
-//!    non-session subcommands take none). A `--yolo` typed ahead of an
-//!    [`Policy::after`] word expands behind it for the same reason.
+//!    switches only there), and never on a word in [`Policy::skip`] (tool
+//!    subcommands take none; a resume's posture is the session's own). A
+//!    `--yolo` typed ahead of an [`Policy::after`] word expands behind it for
+//!    the same reason. Unknown leading option arity leaves the launch as typed;
+//!    a value must never be guessed to be a prompt or subcommand. The same
+//!    refusal applies to an explicit alias needing that behind-word placement.
 //!
 //! Every rewritten launch — by the flag or by default — prints the command as
 //! run once on stderr ([`echo_line`]/[`default_echo_line`], every word
@@ -47,10 +52,11 @@
 //!   <tool>` lane carries the default.
 //! * The process that runs never carries `--yolo` in its argv, so what the
 //!   harness reads back for a resume or a live upgrade is the vendor's own
-//!   flags — no other lane learns a new word.
+//!   flags; no other lane learns a new word.
 //!
-//! The accepted claim on the token: a bare `--yolo` anywhere ahead of a literal
-//! `--` is the alias — including where a prompt operand would be (`claude -p
+//! With any required behind-word position established, a bare `--yolo`
+//! anywhere ahead of a literal `--` is the alias — including where a prompt
+//! operand would be (`claude -p
 //! --yolo` asks for yolo mode with no prompt, not for the prompt "--yolo"; spell
 //! a literal one after `--`). The escape from the default is the vendor's own
 //! vocabulary: type the posture you want (`--permission-mode plan`, `--sandbox
@@ -60,7 +66,9 @@
 //!
 //! Scope: the managed copies only. A copy of the user's own ahead on `PATH`
 //! never runs through a twin and is never rewritten
-//! (`docs/DESIGN-which-copy-runs-2026-08-27.md` rule 1).
+//! (`docs/DESIGN-which-copy-runs-2026-08-27.md` rule 1). Gemini CLI is not
+//! covered: it is deprecated upstream, and Google's lane here is agy
+//! (Antigravity), a managed row.
 
 /// The word the alias claims, exactly as typed.
 pub const WORD: &str = "--yolo";
@@ -128,26 +136,103 @@ pub fn is_shell_safe_flag(f: &str) -> bool {
 }
 
 /// Whether `m` may be embedded in the block as a posture marker: a short flag
-/// (`-s`), a long flag, or either's `=` prefix spelling (`--sandbox=`).
+/// (`-s`), a long flag (either vendor case: `--allowedTools` is Claude's own
+/// spelling beside `--allowed-tools`), or either's `=` prefix spelling
+/// (`--sandbox=`).
 #[must_use]
 pub fn is_shell_safe_marker(m: &str) -> bool {
     let word = m.strip_suffix('=').unwrap_or(m);
     let bytes = word.as_bytes();
-    (bytes.len() == 2 && bytes[0] == b'-' && bytes[1].is_ascii_lowercase())
-        || is_shell_safe_flag(word)
+    if bytes.len() == 2 && bytes[0] == b'-' {
+        return bytes[1].is_ascii_alphabetic();
+    }
+    word.strip_prefix("--").is_some_and(|name| {
+        name.as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
 }
 
-/// Whether `token` is decided by `marker`: the token itself, or a `--word=`
-/// prefix entry the token starts with.
+/// Whether `token` is decided by `marker`, in every spelling the vendors'
+/// parsers give the same flag: a long flag also matches its `--flag=value`
+/// form, and a short flag also matches its attached forms (`-sread-only`,
+/// `-a=never`: clap takes the rest of the token as the value). Matching is by
+/// flag name, never by a prefix of a longer name (`--sandboxed` is not
+/// `--sandbox`).
 fn marker_matches(marker: &str, token: &str) -> bool {
-    match marker.strip_suffix('=') {
-        Some(word) => {
-            token.len() > word.len()
-                && token.starts_with(word)
-                && token[word.len()..].starts_with('=')
-        }
-        None => marker == token,
+    if let Some(word) = marker.strip_suffix('=') {
+        return token.len() > word.len()
+            && token.starts_with(word)
+            && token[word.len()..].starts_with('=');
     }
+    let bytes = marker.as_bytes();
+    if bytes.len() == 2 && bytes[0] == b'-' && bytes[1] != b'-' {
+        return token.starts_with(marker);
+    }
+    token == marker
+        || token
+            .strip_prefix(marker)
+            .is_some_and(|rest| rest.starts_with('='))
+}
+
+/// Leading options whose arity this word scan knows. Both `decide` and the
+/// shell renderer consume this classification; it is deliberately incomplete.
+/// Unknown (including variable) arity preserves the launch instead of guessing.
+/// Codex's single values follow its CLI's shared options; Muse's `--model`
+/// follows the existing `upgrade_muse` one-value reader. A posture marker still
+/// preserves the launch independently of whether its arity is known here.
+pub(crate) fn word_options(program: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    match program {
+        "codex" => (
+            &[
+                "--model",
+                "-m",
+                "--cd",
+                "-C",
+                "--add-dir",
+                "--local-provider",
+            ],
+            &[
+                "--oss",
+                "--worktree",
+                "--search",
+                "--no-alt-screen",
+                "--strict-config",
+                "--no-daemon",
+            ],
+        ),
+        "muse" => (&["--model"], &[]),
+        "claude" => (&[], &["-p", "--print"]),
+        _ => (&[], &[]),
+    }
+}
+
+/// The actual argument position of the first word, past known leading values.
+/// `Err` means that neither a word nor the absence of one is established.
+fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<usize>, ()> {
+    let (values, switches) = word_options(program);
+    let mut value = false;
+    for (i, arg) in head.iter().enumerate() {
+        if value {
+            value = false;
+        } else if arg == WORD
+            || policy.flags.contains(&arg.as_str())
+            || switches.contains(&arg.as_str())
+        {
+            continue;
+        } else if values.contains(&arg.as_str()) {
+            value = true;
+        } else if values.iter().any(|flag| marker_matches(flag, arg)) {
+            // A long `=value` or attached short value is already consumed.
+            continue;
+        } else if arg.starts_with('-') {
+            return Err(());
+        } else {
+            return Ok(Some(i));
+        }
+    }
+    if value { Err(()) } else { Ok(None) }
 }
 
 /// What a launch runs as, per the module doc's three rules.
@@ -173,13 +258,16 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     }
     let head_len = args.iter().take_while(|a| a.as_str() != "--").count();
     let head = &args[..head_len];
-    // The first word: the first token that does not start with `-` (a flag
-    // value spelled like a subcommand is taken for the word; the only rows
-    // with word lists are muse's, whose session flags' values are not its
-    // subcommand words in any measured launch).
-    let word = head.iter().position(|a| !a.starts_with('-'));
+    let word = first_word(program, &policy, head);
+    let explicit = head.iter().any(|a| a == WORD);
+    if word.is_err() && (!explicit || !policy.after.is_empty()) {
+        return Launch::AsTyped;
+    }
+    // An explicit in-place expansion needs no subcommand position. Muse's
+    // behind-word expansion does, so uncertainty above preserves that argv.
+    let word = word.ok().flatten();
     let after = word.is_some_and(|i| policy.after.contains(&head[i].as_str()));
-    if head.iter().any(|a| a == WORD) {
+    if explicit {
         // Replace each --yolo with the flags not already present (and not just
         // emitted); ahead of an `after` word, the flags wait behind it.
         let mut present: Vec<&str> = head.iter().map(String::as_str).collect();
@@ -296,6 +384,7 @@ mod tests {
         );
         assert_eq!(policy_of("muse").after, &["exec", "resume"]);
         assert!(policy_of("muse").skip.contains(&"skills"));
+        assert_eq!(policy_of("gemini"), Policy::NONE);
         for row in crate::vendor_direct::VENDORS {
             let p = policy_of(row.program);
             assert!(!p.flags.is_empty(), "{}", row.program);
@@ -315,11 +404,9 @@ mod tests {
                     row.program
                 );
             }
-            assert!(
-                p.after.iter().all(|w| !p.skip.contains(w)),
-                "{}",
-                row.program
-            );
+            // A word may sit in both lists (muse's `resume`): `after` says
+            // where an explicit `--yolo` expands, `skip` says the default
+            // never lands there — the session owns that launch's posture.
         }
         assert_eq!(policy_of("ay"), Policy::NONE);
         assert_eq!(policy_of("nosuch"), Policy::NONE);
@@ -336,13 +423,19 @@ mod tests {
         ] {
             assert!(!is_shell_safe_flag(bad), "{bad:?}");
         }
-        for good in ["-s", "-a", "--sandbox", "--sandbox=", "--permission-mode="] {
+        for good in [
+            "-s",
+            "-a",
+            "--sandbox",
+            "--sandbox=",
+            "--permission-mode=",
+            "--allowedTools",
+        ] {
             assert!(is_shell_safe_marker(good), "{good}");
         }
         for bad in [
             "",
             "-",
-            "-S",
             "-ss",
             "--sandbox==",
             "--sand box",
@@ -355,7 +448,15 @@ mod tests {
         assert!(!marker_matches("--sandbox=", "--sandbox"));
         assert!(!marker_matches("--sandbox=", "--sandboxed=1"));
         assert!(marker_matches("--sandbox", "--sandbox"));
-        assert!(!marker_matches("--sandbox", "--sandbox=read-only"));
+        assert!(marker_matches("--sandbox", "--sandbox=read-only"));
+        assert!(!marker_matches("--sandbox", "--sandboxed=1"));
+        // A short flag's attached spellings are the same flag to clap.
+        for token in ["-s", "-sread-only", "-s=read-only"] {
+            assert!(marker_matches("-s", token), "{token}");
+        }
+        for token in ["-a", "-anever", "-a=never"] {
+            assert!(marker_matches("-a", token), "{token}");
+        }
     }
 
     /// By the flag: in place, every occurrence, only ahead of `--`, never a
@@ -421,6 +522,35 @@ mod tests {
             decide("claude", &argv(&["--yolo", "--", "--yolo"])),
             Launch::Flag(argv(&["--dangerously-skip-permissions", "--", "--yolo"]))
         );
+        // A model value may itself be `exec`: only the actual word receives
+        // the switches, wherever the explicit alias preceded it.
+        for args in [
+            argv(&["--yolo", "--model", "exec", "exec", "x"]),
+            argv(&["--model", "exec", "--yolo", "exec", "x"]),
+        ] {
+            let mut expected = argv(&["--model", "exec", "exec"]);
+            expected.extend(flags_of("muse").iter().map(|f| (*f).to_string()));
+            expected.push("x".to_string());
+            assert_eq!(decide("muse", &args), Launch::Flag(expected));
+        }
+        // Without an established word position, an unknown Muse option
+        // cannot authorize moving the alias in front of a possible command.
+        assert_eq!(
+            decide(
+                "muse",
+                &argv(&["--new-option", "value", "--yolo", "exec", "x"])
+            ),
+            Launch::AsTyped
+        );
+        // Front/in-place-only policies still honor an explicit alias.
+        assert_eq!(
+            decide("codex", &argv(&["--new-option", "value", "--yolo"])),
+            Launch::Flag(argv(&[
+                "--new-option",
+                "value",
+                "--dangerously-bypass-approvals-and-sandbox"
+            ]))
+        );
     }
 
     /// By default: injected at the front (behind muse's session words), and
@@ -473,12 +603,65 @@ mod tests {
                 argv(&["--allow-dangerously-skip-permissions", "--resume", "x"]),
             ),
             ("claude", argv(&["--dangerously-skip-permissions"])),
+            ("claude", argv(&["--restricted"])),
+            ("claude", argv(&["--permission-prompts", "none"])),
+            ("claude", argv(&["--allowedTools", "Read"])),
+            ("claude", argv(&["--disallowed-tools=Bash"])),
+            ("claude", argv(&["--settings", "team.json"])),
+            ("claude", argv(&["--resume", "session-id"])),
             ("codex", argv(&["-s", "read-only"])),
+            ("codex", argv(&["-sread-only"])),
+            ("codex", argv(&["-s=workspace-write", "exec", "x"])),
             ("codex", argv(&["--sandbox=workspace-write", "exec", "x"])),
             ("codex", argv(&["-a", "on-request"])),
+            ("codex", argv(&["-a=never"])),
+            ("codex", argv(&["-c", "sandbox_mode=\"read-only\""])),
+            ("codex", argv(&["--config=approval_policy=\"never\""])),
+            ("codex", argv(&["--profile", "review"])),
+            ("codex", argv(&["resume", "thread-id"])),
+            ("codex", argv(&["fork", "thread-id"])),
+            ("codex", argv(&["--model", "opus", "resume", "thread-id"])),
+            ("codex", argv(&["--model=opus", "resume", "thread-id"])),
+            ("codex", argv(&["-m", "opus", "fork", "thread-id"])),
+            ("codex", argv(&["-mopus", "fork", "thread-id"])),
+            ("codex", argv(&["-m=opus", "resume", "thread-id"])),
+            ("codex", argv(&["--cd", "/owned/path", "fork", "thread-id"])),
+            ("codex", argv(&["--cd=/owned/path", "resume", "thread-id"])),
+            ("codex", argv(&["-C", "/owned/path", "resume", "thread-id"])),
+            ("codex", argv(&["-C/owned/path", "fork", "thread-id"])),
+            (
+                "codex",
+                argv(&[
+                    "--model",
+                    "opus",
+                    "--cd",
+                    "/owned/path",
+                    "resume",
+                    "thread-id",
+                ]),
+            ),
+            // Unknown/variable arity and missing values preserve the argv.
+            (
+                "codex",
+                argv(&["--new-option", "value", "resume", "thread-id"]),
+            ),
+            (
+                "codex",
+                argv(&["--new-option=value", "resume", "thread-id"]),
+            ),
+            (
+                "codex",
+                argv(&["--image", "one.png", "two.png", "resume", "thread-id"]),
+            ),
+            ("codex", argv(&["--model"])),
+            ("codex", argv(&["--model", "--", "resume", "thread-id"])),
             ("agy", argv(&["--mode", "plan"])),
             ("agy", argv(&["--sandbox"])),
             ("muse", argv(&["--approval-mode", "on-request"])),
+            ("muse", argv(&["--sandbox-network", "restricted"])),
+            ("muse", argv(&["--disable-write"])),
+            ("muse", argv(&["-c", "approval_mode=\"on-request\""])),
+            ("muse", argv(&["resume", "session-id"])),
             ("muse", argv(&["skills", "list"])),
             ("muse", argv(&["auth", "login"])),
             ("muse", argv(&["exec", "--disable-approval", "x"])),
@@ -495,6 +678,32 @@ mod tests {
                 "{program} {args:?}"
             );
         }
+        // A consumed model value is neither a resume nor a prompt, even if
+        // it spells one. A literal separator still protects the tail.
+        for args in [
+            argv(&["--model", "resume", "fix this"]),
+            argv(&["--model=resume", "fix this"]),
+            argv(&["--", "resume", "thread-id"]),
+            argv(&["explain resume and fork"]),
+        ] {
+            let mut expected = argv(&["--dangerously-bypass-approvals-and-sandbox"]);
+            expected.extend(args.iter().cloned());
+            assert_eq!(decide("codex", &args), Launch::Default(expected));
+        }
+        for args in [
+            argv(&["--model", "exec", "exec", "x"]),
+            argv(&["--model=exec", "exec", "x"]),
+        ] {
+            let word = args.len() - 2;
+            let mut expected = args[..=word].to_vec();
+            expected.extend(flags_of("muse").iter().map(|f| (*f).to_string()));
+            expected.push("x".to_string());
+            assert_eq!(decide("muse", &args), Launch::Default(expected));
+        }
+        assert_eq!(
+            decide("muse", &argv(&["--model", "opus", "resume", "session-id"])),
+            Launch::AsTyped
+        );
         assert_eq!(
             decide("muse", &argv(&["--yolo"])),
             Launch::Flag(argv(&[

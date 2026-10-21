@@ -152,17 +152,47 @@ fn pairs_are_symmetric_and_cross_appearance() {
     assert!(pairs > 0);
 }
 
-/// Every pack theme loads, declares the appearance its row says, and no
-/// built-in has its name.
+/// Every pack theme loads, declares the appearance its row says and is
+/// shown under its row's name, and no built-in has its id or that name.
 #[test]
 fn pack_ids_are_free_and_files_declare_their_row() {
     for theme in themes() {
         assert!(scheme::builtin_theme(theme.id).is_none(), "{}", theme.id);
+        assert!(
+            scheme::builtin_theme(theme.name).is_none(),
+            "{}",
+            theme.name
+        );
         let parsed = scheme::parse_theme_str(theme.text).expect("it parses");
         assert!(parsed.appearance_declared, "{}", theme.id);
         assert_eq!(parsed.scheme.appearance, theme.appearance, "{}", theme.id);
         assert_eq!(parsed.author.as_deref(), Some(theme.author), "{}", theme.id);
+        assert_eq!(parsed.scheme.name, theme.name, "{}", theme.id);
     }
+}
+
+/// A theme answers to its id and to the name the chooser shows it under,
+/// in any case, and both find the one theme. Negative control: a
+/// built-in's name, which no pack theme is, finds nothing.
+#[test]
+fn find_answers_the_id_then_the_name_shown() {
+    let renamed = themes()
+        .iter()
+        .find(|theme| theme.name != theme.id)
+        .expect("premise: a theme shown under another name");
+    for spelling in [
+        renamed.id.to_string(),
+        renamed.name.to_string(),
+        renamed.name.to_ascii_lowercase(),
+    ] {
+        assert_eq!(
+            find(&spelling).map(|theme| theme.id),
+            Some(renamed.id),
+            "{spelling}"
+        );
+    }
+    assert_eq!(find("Tokyo Night"), None);
+    assert!(scheme::builtin_theme("Tokyo Night").is_some(), "premise");
 }
 
 /// T5. An install round-trips in a scratch themes folder: it writes the
@@ -226,6 +256,75 @@ fn install_round_trips_in_a_scratch_folder() {
         Err(InstallError::Refused(_))
     ));
     assert!(!dir.join("nord.conf").exists());
+}
+
+/// A COPY AN EARLIER RELEASE INSTALLED IS INSTALLED: the same file but for
+/// the name it is shown under, which said the id (before the pack re-spelled
+/// it), reads Installed, an install keeps it, and only `replace` brings it up
+/// to the pack's bytes. Negative controls: a name line saying any other name
+/// is the owner's edit, and so is the earlier name with a color changed:
+/// Modified and kept unless replaced.
+#[test]
+fn an_earlier_copy_reads_installed_and_an_edit_does_not() {
+    let owned = scratch("earlier");
+    let dir = owned.path().to_path_buf();
+    let theme = themes()
+        .iter()
+        .find(|theme| theme.name != theme.id)
+        .expect("premise: a theme shown under another name");
+    let dest = dir.join(format!("{}.conf", theme.id));
+    let earlier = theme.text.replacen(
+        &format!("\nname = {}\n", theme.name),
+        &format!("\nname = {}\n", theme.id),
+        1,
+    );
+    assert_ne!(earlier, theme.text, "premise: the name line differs");
+    std::fs::write(&dest, &earlier).unwrap();
+    assert_eq!(state_in(&dir, theme), PackState::Installed);
+    assert_eq!(
+        install(theme, Some(&dir), false),
+        Ok(PackInstall::Unchanged(dest.clone()))
+    );
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), earlier);
+    assert_eq!(
+        install(theme, Some(&dir), true),
+        Ok(PackInstall::Wrote(dest.clone()))
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), theme.text.as_bytes());
+
+    // NEGATIVE CONTROL: a copy whose name line the owner changed to a name
+    // no release wrote is theirs, not an earlier copy.
+    let renamed = theme.text.replacen(
+        &format!("\nname = {}\n", theme.name),
+        "\nname = My own storm\n",
+        1,
+    );
+    assert_ne!(renamed, theme.text, "premise: the name line differs");
+    std::fs::write(&dest, &renamed).unwrap();
+    assert_eq!(state_in(&dir, theme), PackState::Modified);
+    assert_eq!(
+        install(theme, Some(&dir), false),
+        Err(InstallError::Exists(dest.clone()))
+    );
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), renamed);
+
+    let background = scheme::parse_theme_str(theme.text)
+        .expect("it parses")
+        .scheme
+        .background;
+    let line = format!(
+        "\nbackground = #{:02x}{:02x}{:02x}\n",
+        background.r, background.g, background.b
+    );
+    let edited = earlier.replacen(&line, "\nbackground = #123456\n", 1);
+    assert_ne!(edited, earlier, "premise: the control changed a color");
+    std::fs::write(&dest, &edited).unwrap();
+    assert_eq!(state_in(&dir, theme), PackState::Modified);
+    assert_eq!(
+        install(theme, Some(&dir), false),
+        Err(InstallError::Exists(dest.clone()))
+    );
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), edited);
 }
 
 /// A public caller can construct PackTheme; its id is still one file name,

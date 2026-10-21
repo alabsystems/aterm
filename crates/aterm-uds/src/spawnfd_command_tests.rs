@@ -305,11 +305,15 @@ fn staged_closed_stdio() {
     // A piped stdin, an inherited (closed) stdout: the pipe lands on 0 and
     // 1, and this process's end — the WRITE end — on 1. Handed to the child
     // as its stdout, the child would hold its own stdin open and never see
-    // its end: `cat` would wait forever.
+    // its end: `cat` would wait forever. Each stdio's type is read by `stat`
+    // with no operand (an `fstat` of its stdin), never by `[ -c /dev/fd/N ]`,
+    // a path lookup another process's lookup of the number can fail
+    // ([`super::descriptor_metadata`]).
     let mut child = command("/bin/sh")
         .args([
             "-c",
-            "[ -c /dev/fd/1 ] || { echo stdout=not-null >&2; exit 3; }; \
+            "{ t=$(/usr/bin/stat -f %HT <&9); } 9>&1; [ \"$t\" = 'Character Device' ] \
+             || { echo stdout=not-null >&2; exit 3; }; \
              cat >/dev/null; echo stdin-ended >&2",
         ])
         .stdin(Stdio::piped())
@@ -342,7 +346,7 @@ fn staged_closed_stdio() {
     let out = command("/bin/sh")
         .args([
             "-c",
-            "[ -c /dev/fd/0 ] && echo stdin=null || echo stdin=not-null",
+            "[ \"$(/usr/bin/stat -f %HT)\" = 'Character Device' ] && echo stdin=null || echo stdin=not-null",
         ])
         .stdin(Stdio::inherit())
         .output()
@@ -809,7 +813,8 @@ fn held_out_err(fd: RawFd) -> [String; 2] {
     [
         "-c".to_string(),
         format!(
-            "[ -e /dev/fd/{fd} ] && printf held || printf clear; printf ' out'; printf err >&2; exit 3"
+            "{} && printf held || printf clear; printf ' out'; printf err >&2; exit 3",
+            test_support::sh_held(fd)
         ),
     ]
 }
@@ -856,7 +861,7 @@ fn a_command_child_holds_its_stdio_and_its_pipes_and_nothing_else() {
     assert_eq!(String::from_utf8_lossy(&out.stderr), "err");
     assert_eq!(out.status.code(), Some(3));
 
-    let probe = format!("[ -e /dev/fd/{fd} ] && exit 3; exit 0");
+    let probe = test_support::held_probe(fd);
     let status = command("/bin/sh")
         .args(["-c", &probe])
         .status()
@@ -901,11 +906,8 @@ fn staged_pair_race() {
         })
     };
     let probe = format!(
-        "for f in {}; do [ -e /dev/fd/$f ] && exit 1; done; exit 0",
-        (3..=31)
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
+        "{} && exit 1; exit 0",
+        test_support::sh_held_any(&(3..=31).collect::<Vec<_>>())
     );
     let leaks = (0..PAIR_RACE_SPAWNS)
         .filter(|_| {
@@ -1645,7 +1647,10 @@ fn staged_exec() {
     let err = command("/bin/sh")
         .args([
             "-c",
-            &format!("[ -e /dev/fd/{fd} ] && echo 'STAGED exec held {fd}' && exit 3; echo 'STAGED exec ok'"),
+            &format!(
+                "{} && echo 'STAGED exec held {fd}' && exit 3; echo 'STAGED exec ok'",
+                test_support::sh_held(fd)
+            ),
         ])
         .exec();
     panic!("exec /bin/sh: {err}");
@@ -1711,8 +1716,13 @@ fn an_exec_hands_over_a_close_on_exec_source() {
         let err = command("/bin/sh")
             .args([
                 "-c",
-                "echo wrote; [ -e /dev/fd/2 ] && echo stderr-open; \
-                 for n in 5 6 7 8 9; do [ -e /dev/fd/$n ] && echo held:$n; done; exit 0",
+                &format!(
+                    "echo wrote; {} && echo stderr-open; {}exit 0",
+                    test_support::sh_held(2),
+                    [5, 6, 7, 8, 9]
+                        .map(|n| format!("{} && echo held:{n}; ", test_support::sh_held(n)))
+                        .concat()
+                ),
             ])
             .stdout(file)
             .exec();

@@ -7,3 +7,5 @@
 //!
 //! Run one file's tests with
 //! `targo --unverified test -p amacs-term --test amacs_term_suite -- <file>::`.
+
+mod decide_table;

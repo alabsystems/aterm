@@ -97,6 +97,113 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
     Key::Character(SmolStr::new(chars))
 }
 
+/// LOCAL PATCH (aterm), 2026-10-20 (ATERM-KI-1015-9): what a keyboard layout's key types, as
+/// `UCKeyTranslate` answers with dead keys off, so a dead key answers its own accent (German
+/// Option+N is `~`): one character, `None` for nothing or more.
+pub(crate) trait LayoutKeys {
+    /// The character `scancode` types with `mods`, Carbon's `UCKeyTranslate` modifier byte
+    /// ([`UC_SHIFT`], [`UC_OPTION`]).
+    fn typed(&self, scancode: u16, mods: u32) -> Option<char>;
+}
+
+/// `UCKeyTranslate`'s modifier byte: Carbon's `shiftKey` and `optionKey` (`EventModifiers`) >> 8.
+pub(crate) const UC_SHIFT: u32 = 0x02;
+pub(crate) const UC_OPTION: u32 = 0x08;
+
+/// The printable ASCII character the Option chord on `scancode` types (with Shift when `shift`)
+/// when no key of `keys` types it without Option, bare or with Shift: the only way to reach it
+/// on that layout (`platform::macos::option_only_character`). Every key code is asked, so a
+/// character a dead key puts down without Option (German `^`) counts as reachable.
+pub(crate) fn option_only_ascii(
+    keys: &impl LayoutKeys,
+    scancode: u16,
+    shift: bool,
+) -> Option<char> {
+    let typed = keys.typed(scancode, UC_OPTION | if shift { UC_SHIFT } else { 0 })?;
+    if !typed.is_ascii_graphic() {
+        return None;
+    }
+    let elsewhere = (0..128u16)
+        .any(|code| [0, UC_SHIFT].into_iter().any(|m| keys.typed(code, m) == Some(typed)));
+    (!elsewhere).then_some(typed)
+}
+
+/// The selected keyboard layout's key table, held while it is read.
+struct CurrentLayout {
+    source: ffi::TISInputSourceRef,
+    layout: *const ffi::UCKeyboardLayout,
+    keyboard_type: u32,
+}
+
+impl CurrentLayout {
+    /// The selected keyboard layout (`TISCopyCurrentKeyboardLayoutInputSource`), or `None`
+    /// when it has no Unicode key table.
+    fn copy() -> Option<CurrentLayout> {
+        // SAFETY: both calls take and return Carbon references: the source is +1 (released in
+        // `Drop`), and the layout data is owned by it, so it lives as long as `source` does.
+        unsafe {
+            let source = ffi::TISCopyCurrentKeyboardLayoutInputSource();
+            if source.is_null() {
+                return None;
+            }
+            let data =
+                ffi::TISGetInputSourceProperty(source, ffi::kTISPropertyUnicodeKeyLayoutData);
+            if data.is_null() {
+                CFRelease(source as *mut c_void);
+                return None;
+            }
+            let layout = CFDataGetBytePtr(data as CFDataRef) as *const ffi::UCKeyboardLayout;
+            let keyboard_type = u32::from(run_on_main(|_mt| ffi::LMGetKbdType()));
+            Some(CurrentLayout { source, layout, keyboard_type })
+        }
+    }
+}
+
+impl Drop for CurrentLayout {
+    fn drop(&mut self) {
+        // SAFETY: `source` is the +1 reference `copy` took.
+        unsafe { CFRelease(self.source as *mut c_void) }
+    }
+}
+
+impl LayoutKeys for CurrentLayout {
+    fn typed(&self, scancode: u16, mods: u32) -> Option<char> {
+        let mut string = [0; 4];
+        let mut len = 0;
+        let mut dead_keys = 0;
+        // SAFETY: `layout` is the live table `source` owns; the out-pointers name locals whose
+        // lengths are the ones passed.
+        let status = unsafe {
+            ffi::UCKeyTranslate(
+                self.layout,
+                scancode,
+                ffi::kUCKeyActionDown,
+                mods,
+                self.keyboard_type,
+                ffi::kUCKeyTranslateNoDeadKeysMask,
+                &mut dead_keys,
+                string.len() as ffi::UniCharCount,
+                &mut len,
+                string.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let mut chars = char::decode_utf16(string[..len as usize].iter().copied());
+        match (chars.next(), chars.next()) {
+            (Some(Ok(c)), None) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+/// [`option_only_ascii`] on the selected keyboard layout, for the key `key` names.
+pub(crate) fn option_only_character(key: PhysicalKey, shift: bool) -> Option<char> {
+    let scancode = (0..128u16).find(|&code| scancode_to_physicalkey(u32::from(code)) == key)?;
+    option_only_ascii(&CurrentLayout::copy()?, scancode, shift)
+}
+
 // Ignores all modifiers except for SHIFT (yes, even ALT is ignored).
 fn get_logical_key_char(ns_event: Id, modifierless_chars: &str) -> Key {
     // LOCAL PATCH (aterm): `-charactersIgnoringModifiers` answers a +0
@@ -592,5 +699,90 @@ mod option_is_alt_tests {
         for &(setting, flags, alt) in rows {
             assert_eq!(option_is_alt(setting, flags), alt, "{setting:?} flags {flags:#x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod option_only_tests {
+    use std::collections::HashMap;
+
+    use super::{option_only_ascii, LayoutKeys, UC_OPTION, UC_SHIFT};
+
+    /// A layout as a table of (key code, modifier byte) to character.
+    struct Table(HashMap<(u16, u32), char>);
+
+    impl LayoutKeys for Table {
+        fn typed(&self, scancode: u16, mods: u32) -> Option<char> {
+            self.0.get(&(scancode, mods)).copied()
+        }
+    }
+
+    const L: u16 = 37;
+    const N: u16 = 45;
+    const SIX: u16 = 22;
+    const GRAVE: u16 = 50;
+    const CIRCUMFLEX: u16 = 10;
+
+    /// The keys these rows press, as the U.S. layout has them (`UCKeyTranslate`, keyboard
+    /// type 91): no Option character is an ASCII one only Option reaches.
+    fn us() -> Table {
+        Table(HashMap::from([
+            ((L, 0), 'l'),
+            ((L, UC_SHIFT), 'L'),
+            ((L, UC_OPTION), '¬'),
+            ((N, 0), 'n'),
+            ((N, UC_OPTION), '˜'),
+            ((SIX, 0), '6'),
+            ((SIX, UC_SHIFT), '^'),
+            ((SIX, UC_OPTION), '§'),
+            ((GRAVE, 0), '`'),
+            ((GRAVE, UC_SHIFT), '~'),
+            // Option+` is the grave dead key, whose accent the ` key types bare.
+            ((GRAVE, UC_OPTION), '`'),
+        ]))
+    }
+
+    /// The same keys as the German layout has them.
+    fn german() -> Table {
+        Table(HashMap::from([
+            ((L, 0), 'l'),
+            ((L, UC_OPTION), '@'),
+            ((N, 0), 'n'),
+            // Option+N is the tilde dead key; no key types `~` without Option.
+            ((N, UC_OPTION), '~'),
+            ((SIX, 0), '6'),
+            ((SIX, UC_SHIFT), '&'),
+            ((SIX, UC_OPTION), ']'),
+            // Option+Shift+6 is the circumflex dead key, whose accent the ^ key types bare.
+            ((SIX, UC_OPTION | UC_SHIFT), '^'),
+            ((CIRCUMFLEX, 0), '^'),
+            ((GRAVE, 0), '<'),
+            ((GRAVE, UC_SHIFT), '>'),
+            ((GRAVE, UC_OPTION), '≤'),
+        ]))
+    }
+
+    #[test]
+    fn on_the_us_layout_no_option_chord_is_the_only_way_to_a_character() {
+        let us = us();
+        for (code, shift) in [(L, false), (N, false), (SIX, false), (GRAVE, false), (GRAVE, true)] {
+            assert_eq!(option_only_ascii(&us, code, shift), None, "key {code} shift {shift}");
+        }
+    }
+
+    #[test]
+    fn a_german_ascii_character_only_option_reaches_is_that_chords() {
+        let de = german();
+        assert_eq!(option_only_ascii(&de, L, false), Some('@'));
+        assert_eq!(option_only_ascii(&de, SIX, false), Some(']'));
+        assert_eq!(option_only_ascii(&de, N, false), Some('~'), "a dead key, by its accent");
+    }
+
+    #[test]
+    fn a_character_reached_without_option_or_not_ascii_is_none() {
+        let de = german();
+        assert_eq!(option_only_ascii(&de, SIX, true), None, "^ is the ^ key's, bare");
+        assert_eq!(option_only_ascii(&de, GRAVE, false), None, "≤ is not ASCII");
+        assert_eq!(option_only_ascii(&de, CIRCUMFLEX, false), None, "no Option character");
     }
 }

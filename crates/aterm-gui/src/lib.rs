@@ -10,7 +10,7 @@
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! `aterm-gui` — the native windowed aterm terminal.
 //!
@@ -29,7 +29,7 @@
     )
 )]
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 // Only the unix SIGUSR1 mask setup needs raw pointers.
 #[cfg(unix)]
 use std::ptr;
@@ -340,6 +340,9 @@ pub fn install_session_log() {
 pub fn configured_update_settings() -> Option<aterm_update::CheckSettings> {
     app_config::update_check_settings_setting()
 }
+/// Counted capacities given back on drop: the control lanes' connection slots
+/// and the artifact budgets.
+mod budget;
 mod cast;
 mod chrome_band;
 mod chrome_label;
@@ -348,6 +351,9 @@ mod chrome_label;
 mod claude_card;
 mod claude_footer;
 mod claude_lights;
+/// The registry rows the footer's resolver awaits, watched by push
+/// (`docs/DESIGN-card-engine-2026-10-19.md` §3.10).
+mod claude_registry;
 mod cli;
 /// The window's own frame where the window system draws none: the chrome band as
 /// the Wayland client-side header (LW.5). Only Linux draws one; elsewhere its
@@ -365,6 +371,9 @@ mod clipboard_win;
 #[cfg(target_os = "linux")]
 mod clipboard_x11;
 mod close_confirm;
+/// A window's start asks for the executable's code in one read (macOS).
+#[cfg(target_os = "macos")]
+mod code_readahead;
 mod command_registry;
 /// Config-directory marker files (`privacy-access-card-answered`, the
 /// debugger-access markers): the exclusive, bounded, never-written-through
@@ -401,6 +410,12 @@ mod consent_observer;
 /// app (design §3.7): owner-confirmed, off the event loop, re-checking every
 /// copy before it moves.
 mod consent_retire;
+/// The instance-owned consent state (design §3.3, §5.2): the probe slots every
+/// consent reader shares, the `[privacy]` mirror, the `status` consent fields,
+/// and the fence — every OS question this feature asks goes through injected
+/// function pointers with an inert headless/test arm (the `lock_modifiers` /
+/// `user_input_recent` pattern).
+mod consent_state;
 /// The macOS consent warm-up (design §3.5): the off-event-loop worker that lists
 /// each configured folder in sequence so macOS asks its question at a moment a
 /// human is at the screen — the Security panel's gesture, and the launch pass
@@ -456,14 +471,31 @@ pub fn footer_pass_cost(passes: usize) -> Vec<(&'static str, f64, f64, f64)> {
         .collect()
 }
 /// What the `c_cut_cost` bench measures: `corpus` through the parse stage's
-/// `batch`-byte batches and slices without the byte arm's C cut and with it
-/// (`holder_image::cut_cost`), as `(median MB/s without, with, cuts a pass)`
-/// over `runs` passes each. A `bench-support` door.
+/// `batch`-byte batches and locked slices without the byte arm and with it
+/// (`holder_image::cut_cost`), as `(median MB/s without, with, cuts a pass,
+/// image reads a pass)` over `runs` passes each; with `holder` > 0 the arm
+/// reads that process as it owes, every cut an accepted C. A `bench-support`
+/// door.
 #[cfg(feature = "bench-support")]
 #[doc(hidden)]
 #[must_use]
-pub fn c_cut_cost(corpus: &[u8], batch: usize, runs: usize) -> (f64, f64, usize) {
-    holder_image::cut_cost::c_cut_cost(corpus, batch, runs)
+pub fn c_cut_cost(
+    corpus: &[u8],
+    batch: usize,
+    runs: usize,
+    holder: i32,
+) -> (f64, f64, usize, usize) {
+    holder_image::cut_cost::c_cut_cost(corpus, batch, runs, holder)
+}
+/// What the `c_cut_cost` bench's read lines measure: the shipping holder
+/// image read (`holder_image::read`) of `pid`, `reads` times, afresh or (with
+/// `kept`) given its own last image, as `(p50, p95, p99)` microseconds and
+/// the image's `holder-image` payload. A `bench-support` door.
+#[cfg(feature = "bench-support")]
+#[doc(hidden)]
+#[must_use]
+pub fn holder_read_cost(pid: i32, reads: usize, kept: bool) -> (f64, f64, f64, String) {
+    holder_image::cut_cost::read_cost(pid, reads, kept)
 }
 /// The main-thread redraw conformance gate, for the `aterm-redraw-conformance`
 /// binary. Re-exported because a `[[bin]]` is its own crate and everything the gate
@@ -475,10 +507,6 @@ pub use control::control_redraw_conformance::run_redraw_conformance;
 /// (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.5).
 #[cfg(target_os = "macos")]
 mod askpass_sheet;
-/// `aterm ctl privacy` + `await consent`: the macOS consent posture, the
-/// instance-owned consent state, and the fence — every OS question this feature
-/// asks goes through injected function pointers with an inert headless/test arm
-/// (the `lock_modifiers` / `user_input_recent` pattern).
 mod control_askpass;
 mod control_auth;
 #[cfg(test)]
@@ -487,6 +515,8 @@ mod control_edit;
 /// The supervised control-socket accept loop: never parked in `accept`, and a
 /// listening socket whose queue stands still is rebound at the same path.
 mod control_listener;
+/// `aterm ctl privacy` + `await consent`: the verbs' grammar, their one
+/// main-thread hop each, and the wait.
 mod control_privacy;
 mod control_socket_identity;
 /// The `Administrator: ` badge an elevated window's caption wears (Windows).
@@ -532,6 +562,9 @@ mod ai_screen;
 #[cfg(unix)]
 mod descriptor_limit;
 mod exceptions_host;
+/// The kernel's `exec` edges, the PTY gather's half (card engine §3.3).
+#[cfg(unix)]
+mod exec_edges;
 #[cfg(windows)]
 mod explorer_win;
 /// The `IFileOpenDialog` behind `menu::choose_local_file` on Windows (File ▸ Open
@@ -569,6 +602,9 @@ mod harness_ab;
 /// the harness's state, written off the frame path, the others read and
 /// summed by local day.
 mod harness_ab_store;
+/// THE CARRIED END (§11.2.3, item 8): the row a seamless update carries of a
+/// supervised session's end and its task's work (`SessionRecord::autopilot_end`).
+mod harness_end_carry;
 /// THE HARNESS'S GLASS per session (§9.2, §9.4): the act the Autopilot chip
 /// lights for a moment, its trail, and the task's face the frame reads with no
 /// lock.
@@ -621,9 +657,21 @@ pub use jumplist_win::the_shell_keeps_what_a_commit_puts_in_a_test_identitys_jum
 /// The launch flags (`--cpu`/`--gpu`, `--font`, `--font-px`, `--scale`): parsed by
 /// `cli`, installed once.
 mod launch;
+/// The launch-fatal alert: the application object made as the event loop would
+/// make it, the alert's panel put in, and then the activation, so a launch that
+/// cannot start says so in front of the person.
+mod launch_alert;
+/// A stale LaunchServices record's renewal: a same-image handoff to a fresh
+/// LaunchServices launch of this build, at a quiet moment. macOS-only, along with
+/// LaunchServices.
+#[cfg(target_os = "macos")]
+mod launch_record_renewal;
 /// Where the person's gesture count stood when the shell signed a command start
 /// (`status launch=`): the causal witness a folder-trust dialog is answered on.
 mod launch_witness;
+/// The control socket's cursor-move licence fence: recorded per session off the
+/// main thread, applied by each window before it arms or judges a licence.
+mod licence_fence;
 /// `--lifeline-fd`: a harness's headless instance shuts down when the process
 /// that started it is gone (`aterm_uds::lifeline` carries both ends).
 #[cfg(unix)]
@@ -702,6 +750,9 @@ mod app_documents;
 mod app_edit;
 mod app_restore;
 mod closed_recovery;
+/// The event loop's deadline healer: the clamp on a producer that keeps
+/// re-arming the past.
+mod deadline_heal;
 mod diagnostics;
 /// The one theme listing (`aterm theme list`, `aterm list-themes`,
 /// `--list-themes`): the front door reaches it here, as it does `run_ship`.
@@ -739,12 +790,24 @@ mod fleet_listen;
 /// The foreground cut: where in the PTY stream the foreground process group
 /// changed, so the reader hands the terminal back there.
 mod foreground_handback;
+/// What the live screen a reader is served is a function of: the `screen`
+/// etag and the `subscribe` push gate read one key.
+mod frame_key;
+/// Each session's published screen text and styled frame, built once per
+/// change of the frame key for every reader of that session.
+mod frame_memo;
 pub(crate) use aterm_gui_tabs::front_content;
 /// The in-GUI harness host's reach over the sessions: which it answers for.
 mod harness_reach;
+/// The base64 of each inline image, encoded once per image for the styled
+/// frame and `image read`.
+mod image_payload_memo;
 /// D3: the un-bypassable self-feed floor (per-session injection token bucket).
 mod inject_floor;
 mod input;
+/// THRU-2's interactive-input-pending hint: a human is waiting, so the PTY
+/// reader keeps its term-lock holds fine.
+mod input_hint;
 /// The unread-input gate: socket input behind input a program has left unread is
 /// written with `warn=input-unread` on its reply, and refused
 /// `ERR busy input-unread` only into a program published stalled or a stopped job.
@@ -753,6 +816,8 @@ mod keybinding;
 mod keymap;
 /// The Kitty Log (§F4): durable kitty-sighting ledger + settings collection book.
 mod kitty_log;
+/// `label_enum!`: an enum, its dense index and its wire labels, declared once.
+mod label_enum;
 mod launch_kitty;
 /// The upgrade rim: the pulsing border while an update applies in place.
 mod level_up;
@@ -785,8 +850,9 @@ mod native_config_language;
 mod native_config_service;
 #[cfg(test)]
 mod native_control_conformance;
-mod native_document_host;
-mod native_document_io;
+pub(crate) use amacs_files::{host as native_document_host, io as native_document_io};
+#[cfg(test)]
+mod native_document_host_tests;
 mod native_document_journal;
 pub(crate) use aterm_gui_documents::native_editor;
 #[cfg(test)]
@@ -812,11 +878,21 @@ mod packages_screen;
 mod pane;
 mod pane_chrome;
 mod pane_header;
+/// One park for every blocking control verb: a slice that ends with no wake
+/// asks only after the caller.
+mod park;
 /// Test-only: a child forked while a lock is held and parked short of its
 /// exec — the fork→exec window a lock released by the close alone loses.
 #[cfg(all(test, unix))]
 mod parked_fork;
+/// A push stream's hang-up, delivered as a wake: one thread polls every
+/// subscription's socket.
+#[cfg(unix)]
+mod peer_watch;
 mod platform;
+/// The desktop's Settings portal over aterm-dbus: the Linux motion read.
+#[cfg(target_os = "linux")]
+mod portal_settings;
 #[cfg(test)]
 mod settings_page_scroll_conformance;
 mod settings_preview;
@@ -834,6 +910,8 @@ mod trail_audio;
 // Predictive local echo (mosh-style speculative typing) lives in the shared
 // `aterm-predict` crate so the web embedders drive the same state machine.
 pub(crate) use aterm_predict as predict;
+/// `card [seed=…]`: the harness card's constellation pin (a debug build's).
+mod card_verb;
 /// `harness policy`: a session's `[harness]` policy for an agent that answers for itself.
 mod harness_policy_verb;
 /// Kitty graphics animation playback on the loop's clock: one wake per frame,
@@ -849,6 +927,9 @@ mod needs;
 mod predict_seen;
 mod prefs;
 mod presence;
+/// The `privacy` report (design §5.1): the macOS consent posture joined once
+/// and rendered as lines or JSON.
+mod privacy_report;
 /// OSC 7501: the program's own state report, for display (`status program_state=`).
 mod program_state;
 mod proxy;
@@ -877,6 +958,9 @@ mod resize_ledger;
 /// its escalation, and the carrier that finishes an act a Commit cut.
 mod restart_act;
 mod restore;
+/// The chrome layered over a prepared frame, in one order for every route,
+/// present and capture alike (`App::compose_route_chrome`).
+mod route_chrome;
 mod scroll_motion;
 mod scrollbar;
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
@@ -911,7 +995,8 @@ mod session_edge_audit;
 /// THE SESSION LOG's host side: one `aterm_slog::Log` per session under the
 /// timeline's lock, its producers, its settle wakes and the `log`/`brief` reads.
 mod session_log;
-/// THE SESSION LOG's disk journal (phase 2B, off by default): the
+/// THE SESSION LOG's disk journal (phase 2B; on by default since D3, Phase
+/// 6, with `[session_log] journal = false` the opt-out): the
 /// `aterm-session-log` writer thread, its files and its reader.
 mod session_log_journal;
 /// THE SESSION LOG's bus mirror, GUI half (phase 4, off by default): the
@@ -927,6 +1012,8 @@ mod session_status;
 mod session_store;
 /// Per-session user metadata + event timeline (session-metadata stage 1).
 mod session_timeline;
+/// Each session's watcher list, and the wake its producers ring.
+mod session_watch;
 mod settings;
 /// The body pointer's host side: an adopted shell moved onto this build's
 /// integration at its next prompt, and `status integration_rev=`.
@@ -937,6 +1024,9 @@ mod shell_rekey;
 /// This Mac's other aterms, read for the status item: each one's `survey
 /// facts` (its published needs) and `raise <sid>`.
 mod sibling_scan;
+/// The code identity a TCC grant is keyed to, read once per process, and the
+/// other process-wide facts the consent readers take.
+mod signing_identity;
 mod snapshot_path;
 /// The warm spare shell a plain new tab adopts (`docs/DESIGN-warm-spare-2026-10-16.md`).
 mod spare;
@@ -955,6 +1045,12 @@ mod startup_token;
 /// The three stats bars, Global, aterm and Tab, drawn under the titlebar
 /// (`docs/DESIGN-system-awareness-2026-10-16.md` §12.2). On by default.
 mod stats_deck;
+/// The stats lens: the bars' summoned close-up with the focus wells.
+mod stats_lens;
+/// The stats surfaces' one painter: tiles, lanes, tanks and marks.
+mod stats_paint;
+/// The sill: the stats bars' compact form in the bottom pad, no terminal row.
+mod stats_sill;
 mod subscribe;
 /// Agents ▸ Summarize the Fleet in a New Tab: the briefs, the start block, and
 /// the one worker it starts (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4).
@@ -1018,6 +1114,8 @@ mod update_screen;
 mod video_key_analysis;
 /// The probe thread that reads the machine for the stats Deck.
 mod vitals_host;
+/// The vitals host's jobs pass: the stuck engine fed each reading's sweep.
+mod vitals_jobs;
 /// Wallpaper preparation shared by the terminal present and Settings'
 /// previews: cover-scale, dim, and per-cell text tint.
 mod wallpaper_present;
@@ -2049,6 +2147,43 @@ fn multi_click_window_is_the_system_double_click_time() {
 /// floods (the visual flash still re-arms on every bell).
 const BELL_BEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The system alert sound a bell plays once `App::on_bell`'s gates pass (the
+/// production `App::alert_sound`). Nothing off macOS and Windows.
+fn system_alert_sound() {
+    // The user's configured macOS alert sound. AppKit is already in-process
+    // (winit); safe to call from the main thread. `NSBeep` is a C function, not a
+    // message, so `appkit::beep` is a plain call with no receiver, no selector and
+    // no `unsafe` at this site — see its binding for why that is sound rather than
+    // merely tidy.
+    #[cfg(target_os = "macos")]
+    crate::appkit::beep();
+    // Windows twin: the default system sound (honours the user's sound scheme,
+    // including a muted one), behind the same rate-limit gate.
+    #[cfg(windows)]
+    win32::beep();
+}
+
+// Test-only count of the alert sounds the unit-test fixture's `App::alert_sound`
+// was asked for on this thread. Thread-local because the lib tests run in
+// parallel; a bell test reads it before and after driving `on_bell`.
+#[cfg(any(test, feature = "bench-support"))]
+thread_local! {
+    static ALERT_SOUNDS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The unit-test fixture's `App::alert_sound`: counts the request and plays
+/// nothing.
+#[cfg(any(test, feature = "bench-support"))]
+fn count_alert_sound_for_test() {
+    ALERT_SOUNDS_FOR_TEST.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// Alert sounds the fixture's `App::alert_sound` was asked for on this thread.
+#[cfg(test)]
+fn alert_sounds_on_this_thread() -> u64 {
+    ALERT_SOUNDS_FOR_TEST.with(std::cell::Cell::get)
+}
+
 /// Test fixture: feed `bytes` to `session`'s engine, the way its PTY reader
 /// would.
 #[cfg(test)]
@@ -2095,6 +2230,8 @@ pub(crate) fn geom_24x80_for_test() -> crate::cursor_glow::Geom {
 /// [`term_guard::WARN_AFTER`].
 #[track_caller]
 pub(crate) fn term_lock(term: &Mutex<Terminal>) -> TermGuard<'_> {
+    #[cfg(test)]
+    refuse_relock(term);
     let guard = term.lock().unwrap_or_else(|poisoned| {
         warn_terminal_mutex_poisoned();
         poisoned.into_inner()
@@ -2103,8 +2240,9 @@ pub(crate) fn term_lock(term: &Mutex<Terminal>) -> TermGuard<'_> {
     note_term_lock_acquired();
     TermGuard {
         guard,
+        frame: FrameHold::Unread,
         #[cfg(test)]
-        _held: TermHeldMark::new(),
+        _held: TermHeldMark::new(term),
         #[cfg(debug_assertions)]
         acquired: Instant::now(),
         #[cfg(debug_assertions)]
@@ -2129,8 +2267,9 @@ pub(crate) fn term_try_lock(term: &Mutex<Terminal>) -> Option<TermGuard<'_>> {
     note_term_lock_acquired();
     Some(TermGuard {
         guard,
+        frame: FrameHold::Unread,
         #[cfg(test)]
-        _held: TermHeldMark::new(),
+        _held: TermHeldMark::new(term),
         #[cfg(debug_assertions)]
         acquired: Instant::now(),
         #[cfg(debug_assertions)]
@@ -2204,12 +2343,23 @@ mod wake_census {
     }
 }
 
-// Test-only: how many terminal-mutex guards this thread holds right now. The
-// foreground handback's liveness probe must never run under the term lock; the
-// Tier-1 bind's scripted probe reads this on the reader thread.
+// Test-only: how many terminal-mutex guards this thread holds right now, and
+// which terminals the first `HELD_SLOTS` of them hold, each with the site that
+// took it. The foreground handback's liveness probe must never run under the
+// term lock (the Tier-1 bind's scripted probe reads the count on the reader
+// thread), and `term_lock` refuses a terminal in a slot. Fixed slots, so taking
+// the lock never allocates: the frame-cost proofs count allocations.
+#[cfg(test)]
+const HELD_SLOTS: usize = 8;
+
+#[cfg(test)]
+type HeldAt = Option<(usize, &'static std::panic::Location<'static>)>;
+
 #[cfg(test)]
 thread_local! {
     static TERM_LOCK_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static TERM_LOCK_HELD_AT: std::cell::Cell<[HeldAt; HELD_SLOTS]> =
+        const { std::cell::Cell::new([None; HELD_SLOTS]) };
 }
 
 /// Whether the calling thread holds a [`TermGuard`] right now (test builds).
@@ -2218,17 +2368,49 @@ pub(crate) fn term_lock_held_on_this_thread() -> bool {
     TERM_LOCK_HELD.with(std::cell::Cell::get) > 0
 }
 
-/// Counts one live [`TermGuard`] on its thread for
-/// [`term_lock_held_on_this_thread`]; its own `Drop` uncounts it, so the count
-/// is right in release test builds too, where `TermGuard` has no `Drop`.
+/// Panics when the calling thread already holds `term`: `std::sync::Mutex` is
+/// not reentrant, so the lock would never return, and a hung test says nothing
+/// about where. The usual hold is a guard temporary that lives to the end of
+/// its statement (`(term_lock(t).a(), term_lock(t).b())`).
 #[cfg(test)]
-struct TermHeldMark;
+#[track_caller]
+fn refuse_relock(term: &Mutex<Terminal>) {
+    let key = std::ptr::from_ref(term).addr();
+    let held = TERM_LOCK_HELD_AT.with(std::cell::Cell::get);
+    if let Some((_, since)) = held.into_iter().flatten().find(|(k, _)| *k == key) {
+        panic!(
+            "term_lock at {} relocks a terminal this thread has held since {since}: \
+             the lock is not reentrant and would never return",
+            std::panic::Location::caller()
+        );
+    }
+}
+
+/// Counts one live [`TermGuard`] on its thread for
+/// [`term_lock_held_on_this_thread`] and records its terminal for
+/// [`refuse_relock`] while a slot is free; its own `Drop` undoes both when the
+/// guard's fields drop, the lock with them.
+#[cfg(test)]
+struct TermHeldMark {
+    slot: Option<usize>,
+}
 
 #[cfg(test)]
 impl TermHeldMark {
-    fn new() -> Self {
+    #[track_caller]
+    fn new(term: &Mutex<Terminal>) -> Self {
         TERM_LOCK_HELD.with(|c| c.set(c.get().wrapping_add(1)));
-        Self
+        let hold = (
+            std::ptr::from_ref(term).addr(),
+            std::panic::Location::caller(),
+        );
+        let mut held = TERM_LOCK_HELD_AT.with(std::cell::Cell::get);
+        let slot = held.iter().position(Option::is_none);
+        if let Some(free) = slot.and_then(|i| held.get_mut(i)) {
+            *free = Some(hold);
+            TERM_LOCK_HELD_AT.with(|c| c.set(held));
+        }
+        Self { slot }
     }
 }
 
@@ -2236,6 +2418,61 @@ impl TermHeldMark {
 impl Drop for TermHeldMark {
     fn drop(&mut self) {
         TERM_LOCK_HELD.with(|c| c.set(c.get().wrapping_sub(1)));
+        let mut held = TERM_LOCK_HELD_AT.with(std::cell::Cell::get);
+        if let Some(mine) = self.slot.and_then(|i| held.get_mut(i)) {
+            *mine = None;
+            TERM_LOCK_HELD_AT.with(|c| c.set(held));
+        }
+    }
+}
+
+#[cfg(test)]
+mod term_relock_tests {
+    use super::*;
+
+    /// A second `term_lock` of a terminal its thread already holds panics at
+    /// once, naming the hold: `std::sync::Mutex` is not reentrant, so the lock
+    /// would never return, and a hung test names nothing (one sat asleep for a
+    /// day). The usual hold is a guard temporary that lives to the end of its
+    /// statement, as here. NEGATIVE CONTROL: without the check the relocking
+    /// thread sleeps and the minute (a hang detector) runs out.
+    #[test]
+    fn a_relock_on_the_holding_thread_panics_naming_the_hold() {
+        let term = Arc::new(Mutex::new(Terminal::new(2, 10)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Arc::clone(&term);
+        std::thread::spawn(move || {
+            let relock = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (term_lock(&t).content_seq(), term_lock(&t).content_seq())
+            }));
+            let message = relock.err().and_then(|e| e.downcast::<String>().ok());
+            let _ = tx.send(message.map(|m| *m));
+        });
+        let message = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the relock neither returned nor panicked")
+            .expect("the relock panics");
+        // Both sites are the test's own line (the hold, then the relock beside
+        // it), never the lock helper's.
+        let site = |after: &str, before: &str| {
+            let rest = message
+                .split_once(after)
+                .map(|(_, r)| r)
+                .unwrap_or_default();
+            let at = rest.split_once(before).map(|(a, _)| a).unwrap_or_default();
+            at.rsplit_once(':').map(|(line, _)| line.to_string())
+        };
+        let relock = site("term_lock at ", " relocks");
+        let hold = site("held since ", ": the lock");
+        assert!(
+            relock.as_deref().is_some_and(|l| l.starts_with(file!())) && relock == hold,
+            "names the hold at the relock's own line: {message}"
+        );
+        // A hold of one terminal leaves every other one free on the same thread.
+        let other = Mutex::new(Terminal::new(2, 10));
+        let next = Mutex::new(Terminal::new(2, 10));
+        let _a = term_lock(&other);
+        let _b = term_lock(&next);
     }
 }
 
@@ -2407,7 +2644,9 @@ mod ui_handoff_tests {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let waiting = Arc::new(AtomicU32::new(0));
         let site = metrics::TermWaitSite::Press;
-        let before = metrics::term_wait_distribution(site).count();
+        let before = metrics::METRICS.window.redraw.term_wait[site.index()]
+            .copy_out()
+            .n();
         // Free mutex: fast path, no registration.
         {
             let _g = term_lock_ui(&term, &waiting, site);
@@ -2440,7 +2679,10 @@ mod ui_handoff_tests {
         );
         assert_eq!(waiting.load(Ordering::Acquire), 0);
         assert!(
-            metrics::term_wait_distribution(site).count() >= before + 2,
+            metrics::METRICS.window.redraw.term_wait[site.index()]
+                .copy_out()
+                .n()
+                >= before + 2,
             "both acquisitions must book a sample (n counts every acquisition)"
         );
     }
@@ -2449,14 +2691,67 @@ mod ui_handoff_tests {
 /// RAII guard over the shared [`Terminal`] lock, returned by [`term_lock`]. Derefs
 /// to [`Terminal`]; in debug builds it records the acquire time and caller and warns
 /// on drop when held too long (see [`term_guard`]).
+///
+/// A HOLD THAT MOVES THE FRAME WAKES ITS FRAME WATCHERS. The PTY reader wakes a
+/// session's watchers after each burst; every other write into a session's
+/// engine (a selection, a config reload's colours, a Kitty frame, a resize) is
+/// made by a host under this guard, so the guard is where it rings. A raw
+/// `term.lock()` is kept to reading by the `term-write` census guard
+/// (`crates/aterm-census/src/guards/term_write.rs`). The first
+/// time a hold takes the terminal mutably while someone watches its frame
+/// ([`aterm_core::terminal::FrameWatchers`], attached by
+/// [`session_watch::Watchers::bind_frame`]), it reads the frame key
+/// ([`frame_key::FrameKey`]); its drop reads it again and rings the watchers if
+/// it moved, before the lock is released, so a woken reader waits for the
+/// hold and sees all of it. The key is what every content stream re-reads on,
+/// so a hold rings exactly when a screen, cursor or cells reader could see a
+/// change. A read-only hold, and any hold of a terminal nobody watches, reads
+/// nothing.
 pub(crate) struct TermGuard<'a> {
     guard: MutexGuard<'a, Terminal>,
+    frame: FrameHold,
     #[cfg(test)]
     _held: TermHeldMark,
     #[cfg(debug_assertions)]
     acquired: Instant,
     #[cfg(debug_assertions)]
     location: &'static std::panic::Location<'static>,
+}
+
+/// What a [`TermGuard`]'s drop does about the frame.
+enum FrameHold {
+    /// The hold has not taken the terminal mutably yet.
+    Unread,
+    /// Nothing: nobody watched the frame when the hold first took the terminal
+    /// mutably, or its holder rings ([`TermGuard::holder_rings`]).
+    Quiet,
+    /// Compare the frame key with the one read when the hold first took the
+    /// terminal mutably, and ring these watchers if it moved.
+    Watched(
+        Arc<dyn aterm_core::terminal::FrameWatchers>,
+        frame_key::FrameKey,
+    ),
+}
+
+impl FrameHold {
+    fn read(t: &Terminal) -> FrameHold {
+        match t.frame_watchers() {
+            Some(watchers) if watchers.watched() => {
+                FrameHold::Watched(Arc::clone(watchers), frame_key::FrameKey::read(t))
+            }
+            _ => FrameHold::Quiet,
+        }
+    }
+}
+
+impl TermGuard<'_> {
+    /// This hold's holder wakes the session's watchers itself once what the
+    /// hold wrote is readable: the PTY reader, after the burst's tee
+    /// (`spawn::publish_burst`), so a woken `bytes` watcher finds the burst.
+    /// The hold compares nothing.
+    pub(crate) fn holder_rings(&mut self) {
+        self.frame = FrameHold::Quiet;
+    }
 }
 
 impl std::ops::Deref for TermGuard<'_> {
@@ -2470,7 +2765,100 @@ impl std::ops::Deref for TermGuard<'_> {
 impl std::ops::DerefMut for TermGuard<'_> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Terminal {
+        if matches!(self.frame, FrameHold::Unread) {
+            self.frame = FrameHold::read(&self.guard);
+        }
         &mut self.guard
+    }
+}
+
+impl Drop for TermGuard<'_> {
+    fn drop(&mut self) {
+        // A panicking holder may have left the engine half-written: its frame
+        // is not read.
+        if let FrameHold::Watched(watchers, before) = &self.frame
+            && !std::thread::panicking()
+            && frame_key::FrameKey::read(&self.guard) != *before
+        {
+            watchers.frame_moved();
+        }
+        #[cfg(debug_assertions)]
+        self.warn_if_held_too_long();
+    }
+}
+
+#[cfg(test)]
+mod frame_hold_tests {
+    use super::*;
+    use crate::session_watch::{Subscription, Watchers};
+    use aterm_core::selection::{SelectionSide, SelectionType};
+
+    fn select_to(t: &mut Terminal, end_col: u16) {
+        let sel = t.text_selection_mut();
+        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(0, end_col, SelectionSide::Right);
+        sel.complete_selection();
+    }
+
+    /// A HOLD THAT MOVES THE FRAME RINGS THE SCREEN READERS AS IT ENDS, AND NO
+    /// OTHER HOLD DOES. A selection made under the lock rings the session's
+    /// frame watchers, and not a watcher that reads no screen. Negative
+    /// controls, each ringing nobody: a read-only hold, a mutable hold that
+    /// moves nothing the frame key folds (a viewport scroll), a hold whose
+    /// holder rings itself (the PTY reader's, whose same write rings when the
+    /// hold does not say so), and any hold while nobody reads the screen.
+    #[test]
+    fn a_hold_that_moves_the_frame_rings_its_frame_watchers() {
+        let term = Mutex::new(Terminal::new(4, 12));
+        for i in 0..12 {
+            term_lock(&term).process(format!("line {i}\r\n").as_bytes());
+        }
+        let watchers = Arc::<Watchers>::default();
+        watchers.bind_frame(&term);
+        let other = Subscription::single(&watchers);
+        select_to(&mut term_lock(&term), 3);
+        assert!(
+            !other.wait(Duration::ZERO),
+            "nobody reads the screen: a selection rings nobody"
+        );
+
+        let mut screen = Subscription::new();
+        let flag = screen.watch_frame(&watchers);
+        flag.store(false, Ordering::Release);
+        let rang = || {
+            let woke = screen.wait(Duration::ZERO);
+            assert_eq!(
+                woke,
+                flag.swap(false, Ordering::AcqRel),
+                "a frame ring sets the registration's flag"
+            );
+            woke
+        };
+
+        let seq = term_lock(&term).content_seq();
+        assert!(!rang(), "a read-only hold rings nobody");
+        term_lock(&term).scroll_display(2);
+        assert_ne!(term_lock(&term).grid().display_offset(), 0, "the premise");
+        assert!(!rang(), "a viewport scroll moves no frame");
+        select_to(&mut term_lock(&term), 5);
+        assert_eq!(term_lock(&term).content_seq(), seq, "the premise");
+        assert!(rang(), "a selection rings the screen readers");
+        assert!(!other.wait(Duration::ZERO), "and only them");
+        {
+            let mut t = term_lock(&term);
+            t.holder_rings();
+            t.process(b"more\r\n");
+        }
+        assert!(!rang(), "a holder that rings itself is left to");
+        term_lock(&term).process(b"more\r\n");
+        assert!(rang(), "the same write rings when its holder does not");
+
+        drop(screen);
+        select_to(&mut term_lock(&term), 7);
+        assert!(
+            !other.wait(Duration::ZERO),
+            "the screen reader gone, a selection rings nobody"
+        );
     }
 }
 
@@ -2488,8 +2876,8 @@ pub(crate) mod term_guard {
 }
 
 #[cfg(debug_assertions)]
-impl Drop for TermGuard<'_> {
-    fn drop(&mut self) {
+impl TermGuard<'_> {
+    fn warn_if_held_too_long(&self) {
         let held = self.acquired.elapsed();
         if held > term_guard::WARN_AFTER {
             aterm_log::warn!(
@@ -2535,15 +2923,17 @@ mod launch_alert_tests {
 
 /// Report a fatal launch failure and exit 1 through
 /// [`exit_without_process_teardown`] (the backend thread may be inside the GPU
-/// driver). Also raises a native alert unless `--headless` or stderr is a tty;
-/// off the main thread it falls back to `/usr/bin/osascript`.
+/// driver). Also raises a native alert unless `--headless` or stderr is a tty,
+/// in front of the person even before `NSApplication` exists
+/// ([`launch_alert::show`]); off the main thread it falls back to
+/// `/usr/bin/osascript`.
 fn fatal_launch_error(headless: bool, detail: &str) -> ! {
     crate::logging::stderr_line!("aterm-gui: {detail}");
     if launch_alert_wanted(
         headless,
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
     ) {
-        menu::notify("aterm could not start", detail);
+        launch_alert::show(headless, "aterm could not start", detail);
         // LOCAL PATCH (aterm): `aterm_objc::MainThread::new` replaces objc2's
         // `MainThreadMarker::new`, used here only as a main-thread check
         // (`pthread_main_np()` underneath, like `+[NSThread isMainThread]`).
@@ -3433,6 +3823,12 @@ struct RepaintKey {
     /// border and the pill, folded from the view's seed. `0` on a quiet window;
     /// no clock is read.
     presence_fp: u64,
+    /// The questions standing over this window (`App::question_key`): the
+    /// multi-line paste confirmation's serial and the close/quit confirm's,
+    /// `0` for none. Either paints whole rows over the grid and dirties no
+    /// engine cell, so without this a question posted or answered while
+    /// nothing else moved was proved unchanged and never reached the glass.
+    question: (u64, u64),
     /// Whether the OS appearance is dark (`App::os_appearance`). The overlay card
     /// theme follows the live appearance, but with a plain theme a flip changes no
     /// other key term, so without this bit the stale card would stay composited.
@@ -3656,18 +4052,30 @@ enum AppNoticeTaken {
 /// (`Wake::HarnessFact`, `docs/DESIGN-harness-autopilot-2026-10-15.md`
 /// §9.2.3, §9.4.4, §10.5.3): an act the harness just took, the task's face
 /// under Land, or the short streak's back-off — `None` when nobody knows it
-/// (a loop's run ended, its worker went) or it is over. A fact only: no
+/// (a loop's run ended, its worker went) or it is over — or the face a
+/// proven self-claim's own acts tell (FOREVER LAND §10.4). A fact only: no
 /// authority crosses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HarnessFact {
     /// An act the loop took ([`aterm_agent::supervise::IdleHost::act_taken`]).
     Act(aterm_agent::harness::acts::Act),
     /// The task's face ([`aterm_agent::supervise::IdleHost::task_face`]), or
-    /// the host's "unknown".
+    /// the host's "unknown". Dropped while the session's live claim is a
+    /// PROVEN self-claim: the hosted loop then only watches beside it, and
+    /// the face is the self-claim's ([`Self::SelfTask`]).
     Task(Option<aterm_agent::harness::acts::TaskFace>),
+    /// THE FACE A PROVEN SELF-CLAIM TELLS (FOREVER LAND §10.4): `landed` at
+    /// its holder's `meta set harness_act landed@v1` (codex-alab's landing,
+    /// never typed), `open` at any other act it records, and `open` again at
+    /// the first turn anyone begins after its landing (the window's own read,
+    /// `App::reopen_self_claim_landing`). Applied only while the live claim is
+    /// a proven self-claim (`crate::harness_task::self_claim_act_face`), and
+    /// `landed` only while the session runs under Land: nothing ends a Cruise
+    /// task (`App::self_claim_may_land`).
+    SelfTask(aterm_agent::harness::acts::TaskFace),
     /// The task's face a loop's start restated from the journal — a landing
-    /// or a done a loop before it read — and the wall time (unix ms) the
-    /// journal noted that end at
+    /// a loop before it landed — and the wall time (unix ms) the journal
+    /// noted that landing at
     /// ([`aterm_agent::supervise::IdleHost::task_face_noted`]): the face's
     /// time where the window held none of its own (§10.2.7).
     TaskNoted(aterm_agent::harness::acts::TaskFace, i64),
@@ -3691,7 +4099,7 @@ pub(crate) struct PausePlan {
 }
 
 /// Wake the UI when the PTY produced output, exited, a screen snapshot was
-/// requested (SIGUSR1), or the control socket needs the renderer (`Control`) —
+/// requested (SIGUSR1), or the control socket needs the renderer (`Image`) —
 /// the latter two render the live screen to a PNG + a .txt for introspection.
 // Not `Clone`/`Copy`: `Wake::Input` carries a `Vec<InputEvent>` and an
 // `Option<Sender>`. Every variant is moved into `send_event` and matched by value.
@@ -3735,11 +4143,10 @@ enum Wake {
     /// transcript's steps that armed the turn tracker's settle, whose tick
     /// the loop keeps, or moved the log while `[session_log] clause` is on,
     /// so the tab's chrome may follow the clause; or the render path moved it
-    /// (the launch card's amend, addendum A28), whose watchers are woken here,
-    /// after the frame (`notify`). Otherwise the poster already woke them;
-    /// the arm notes the settle and refreshes the chrome
-    /// (`App::on_session_log_moved`).
-    SessionLogMoved { session: u64, notify: bool },
+    /// (the launch card's amend, addendum A28). The move rang the session's
+    /// watchers where it took the owed wake; the arm notes the settle and
+    /// refreshes the chrome (`App::on_session_log_moved`).
+    SessionLogMoved { session: u64 },
     /// A process-name lookup changed the current foreground group's name.
     /// The worker posts only on an applied change, so a late answer after
     /// the observer's one follow-up still gets a status observation.
@@ -3813,10 +4220,11 @@ enum Wake {
         window: WindowId,
         op: aterm_types::WindowOperation,
     },
-    /// The control thread queued one or more `ImageReq`s and needs the main
-    /// thread (which owns the renderer) to render; the PNG encode + write + the
-    /// dims reply then happen on the encode worker (post-write, FIFO).
-    Control,
+    /// The control thread's `image` request: the main thread (which owns the
+    /// renderer) renders it; the PNG encode + write + the dims reply then happen
+    /// on the encode worker (post-write, FIFO). Boxed, so the request's size
+    /// does not set every `Wake`'s.
+    Image(Box<control::ImageReq>),
     /// Video introspection (`video` verb): record the frontmost window's presented
     /// frames for `dur_ms` into `dir` as a PNG sequence + index.json. `keys` adds the
     /// keystroke log (owner connections only), `pace` keeps redraws flowing, `fps`
@@ -3876,16 +4284,23 @@ enum Wake {
         session: Option<u64>,
         reply: std::sync::mpsc::Sender<Vec<String>>,
     },
-    /// `privacy` (and `await consent`): the macOS consent posture, joining
-    /// main-thread `App` state (sessions, adoption records, shell-integration cwd)
-    /// with the injected consent probes, whose inert arm keeps a headless instance
-    /// off `tccd`. Same round trip as [`Wake::ReadPanes`].
+    /// `privacy`'s one hop: the facts only `App` holds (the sessions, their
+    /// adoption records and shell-integration cwd, the warm-up rows, the
+    /// access card) and a handle on the consent state. Nothing is probed on
+    /// the event loop: the control worker reads the probe slots and makes
+    /// every OS call. Same round trip as [`Wake::ReadPanes`].
     ReadPrivacy {
-        form: control_privacy::PrivacyForm,
         /// The asking connection's scope: an edge is shown only the sessions
         /// it may read, never the roster `sessions` withholds from it.
         scope: control::Scope,
-        reply: std::sync::mpsc::Sender<control_privacy::PrivacyRead>,
+        reply: std::sync::mpsc::Sender<privacy_report::PrivacyAppFacts>,
+    },
+    /// `await consent`'s one hop, at arm: a handle on the consent state, which
+    /// the waiting control worker reads from then on, and `session`'s adoption
+    /// record. Nothing is probed on the event loop.
+    ArmConsentWait {
+        session: u64,
+        reply: std::sync::mpsc::Sender<control_privacy::ConsentArm>,
     },
     /// A consent warm-up worker (`consent_warmup`) queued results for the panel's
     /// rows. Payload-free: only the poke to drain the worker's bounded channel.
@@ -3895,14 +4310,23 @@ enum Wake {
     /// its report. Payload-free: the report is in the worker's slot.
     ClaimantRetired,
     /// The tccd consent observer (`consent_observer`, design §3.6) queued parsed log
-    /// events for its correlation table. Payload-free like [`Wake::WarmupResult`]:
-    /// events travel on the worker's bounded, droppable channel. The worker blocks
-    /// reading a child's stdout and reaps that child itself; a lost poke is
-    /// survivable, and the channel's disconnect edge ends the stream.
+    /// events for its correlation table. A NUDGE ONLY: events travel on the
+    /// worker's bounded, droppable channel, and the park that follows drains it
+    /// (`App::poll_consent_observer`), so a wake an uncommitted incoming handoff
+    /// drops loses nothing. One wake per drain however many events a burst
+    /// queues (`StreamSink::poke_once`). The worker blocks reading a child's
+    /// stdout and reaps that child itself; the channel's disconnect edge ends
+    /// the stream.
     ConsentObserver,
     /// A prompt-free access probe completed off the UI thread. Its result is
     /// held in this instance's cache; this event carries no permission grant.
     ConsentProbeReady,
+    /// The claimant census completed on its worker; the answer is in
+    /// `ConsentState`'s census slot. A NUDGE ONLY: the park that follows
+    /// republishes the Security page from the slot, equality-gated. Separate
+    /// from [`Wake::ConsentProbeReady`] so a census answer never ticks the Full
+    /// Disk Access card.
+    ConsentCensusReady,
     /// The debugger-rule probe (`DevToolsSecurity -status`) completed; the answer is
     /// in `ConsentState`'s debugger slot. Separate from [`Wake::ConsentProbeReady`]
     /// so it never ticks the Full Disk Access card.
@@ -4200,6 +4624,13 @@ enum Wake {
         set: Option<Option<f32>>,
         reply: std::sync::mpsc::Sender<String>,
     },
+    /// `card [seed=<u64>|seed=off]` (control socket; the pin a debug or test
+    /// build's only): read or pin the harness card's constellation
+    /// ([`card_verb`]).
+    CardSeed {
+        asked: card_verb::Asked,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
     /// `login-notice <code>|end` (control socket, a development build only):
     /// raise or end a harness login notice for the first window's first tab through the
     /// host's own path ([`login_notice_verb`]).
@@ -4236,8 +4667,8 @@ enum Wake {
     UpdateLaunchUnregistered { attempt_id: u64, pid: i32 },
     /// This process's own measure of LaunchServices' record of it, taken once a few
     /// seconds into a windowed launch ([`app_launch_successor::own_launch_record`]):
-    /// a stale one opens the digest's entry, a sound one ends it
-    /// (`App::note_own_launch_record`).
+    /// a stale one is renewed by a handoff to a fresh launch, or opens the digest's entry
+    /// where nothing renews it; a sound one ends the entry (`App::note_own_launch_record`).
     #[cfg(target_os = "macos")]
     OwnLaunchRecord(app_launch_successor::OwnLaunchRecord),
     /// A controller (`aterm-ctl update apply`) or the update-ready nudge asked to
@@ -4517,16 +4948,6 @@ enum Wake {
         line: String,
         reply: std::sync::mpsc::Sender<Result<&'static str, String>>,
     },
-    /// Reply-bearing cursor-license fence for a control operation (e.g. `signal`)
-    /// that acts on a visible session without an [`InputEvent`]: expires the key-hint
-    /// stamps in every window presenting it, nothing else. `keep_hand` is
-    /// `control_input::control_fence`'s answer (line edits and pastes keep the glow's
-    /// hand on its row).
-    CursorMoveLicenseClear {
-        session: u64,
-        keep_hand: bool,
-        reply: std::sync::mpsc::Sender<bool>,
-    },
     /// Reply-bearing lookup of the frontmost window's AppKit `windowNumber` for the
     /// `hwkey` injector, which posts real `NSEvent`s from the control thread but must
     /// read the number on the main thread, and whether that window is the key window
@@ -4766,7 +5187,7 @@ enum Wake {
     /// window's tabs. Unlike [`Wake::SelectTab`], only the main thread can resolve
     /// the front window, and the verb replies `(active_index, tab_count)` for
     /// `OK <active> <count>`, so the control thread posts this with a one-shot
-    /// reply channel and blocks, like `Wake::Control`/`Wake::ReadChrome`.
+    /// reply channel and blocks, like `Wake::Image`/`Wake::ReadChrome`.
     TabCmd {
         action: TabAction,
         /// Who asked — the exit ledger's `by=` for a session a `close` retires
@@ -5472,7 +5893,15 @@ fn project_visible_pad_crop(
 /// Translate the effect streams whose coordinates are already window-absolute.
 /// Grid-relative streams follow the renderer's compensated `grid_top`; these do not,
 /// so the GPU source shift is applied before encode and reversed right after.
-/// Returns `false` without mutation when any coordinate would leave `u16`; the
+///
+/// The fx layers (design §4.4) move the same way: a Window-space layer's offset and
+/// clip, and every occluder (occluders are window pixels for both spaces); a Grid-space
+/// layer follows `grid_top` and is left alone. Their coordinates are `i32`, so they need
+/// no `u16` preflight, only the guard that keeps `+delta` then `-delta` exact: a bounded
+/// edge must stay bounded ([`aterm_core::render::PxRect::translate`] saturates short of
+/// the unbounded sentinels).
+///
+/// Returns `false` without mutation when any coordinate would leave its range; the
 /// decorative effect then draws unshifted.
 fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> bool {
     let translated = |value: u16| {
@@ -5480,6 +5909,21 @@ fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> b
             .checked_add(delta)
             .and_then(|value| u16::try_from(value).ok())
     };
+    // A bounded edge moved by `delta` stays strictly inside `i32` (an unbounded
+    // one does not move), so the reverse shift restores it exactly.
+    let edge_ok = |edge: i32| {
+        let moved = i64::from(edge) + i64::from(delta);
+        edge == i32::MIN
+            || edge == i32::MAX
+            || (i64::from(i32::MIN) < moved && moved < i64::from(i32::MAX))
+    };
+    let rect_ok = |r: &aterm_core::render::PxRect| edge_ok(r.y0) && edge_ok(r.y1);
+    let fx_valid = input
+        .fx_layers
+        .iter()
+        .filter(|layer| layer.space == aterm_core::render::FxSpace::Window)
+        .all(|layer| layer.offset.1.checked_add(delta).is_some() && rect_ok(&layer.clip))
+        && input.fx_occluders.iter().all(rect_ok);
     let valid = input
         .cursor_glow_add
         .iter()
@@ -5493,7 +5937,7 @@ fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> b
             .fire_patch
             .iter()
             .all(|patch| translated(patch.y).is_some() && translated(patch.base_y).is_some());
-    if !valid {
+    if !(valid && fx_valid) {
         return false;
     }
     let shift = |value: &mut u16| {
@@ -5513,6 +5957,15 @@ fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> b
     for patch in &mut input.fire_patch {
         shift(&mut patch.y);
         shift(&mut patch.base_y);
+    }
+    for layer in &mut input.fx_layers {
+        if layer.space == aterm_core::render::FxSpace::Window {
+            layer.offset.1 += delta;
+            layer.clip = layer.clip.translate(0, delta);
+        }
+    }
+    for occluder in &mut input.fx_occluders {
+        *occluder = occluder.translate(0, delta);
     }
     true
 }
@@ -7141,6 +7594,8 @@ pub(crate) struct SessionCtx {
     /// submitted text, timing, submit/settle verdict, settled-screen hash). Read by
     /// the `turns` verb and scanned by the `subscribe … events` digest; the control
     /// thread writes it and the subscribe loop reads it through a cloned handle.
+    /// A leaf whose one nested lock is [`Self::watchers`]' slot list, which a
+    /// record rings.
     pub turns: Arc<std::sync::Mutex<crate::turn_ledger::TurnLedger>>,
     /// Temporal recorder: the `aterm-buffer` event-log spine (keyframe +
     /// `RawIn`/`Reply`/`Resize` events) that makes the session hydratable at any
@@ -7168,10 +7623,13 @@ pub(crate) struct SessionCtx {
     /// take nothing under it. A STRICT
     /// leaf: nothing may lock anything else while holding it (a caller may
     /// hold [`Self::meta`] — `session_timeline`'s two meta recorders — or
-    /// `fabric` WHEN TAKING it, and neither order is ever reversed).
+    /// `fabric` WHEN TAKING it, and neither order is ever reversed). The one
+    /// lock taken under it is the terminal leaf [`Self::watchers`]' slot list,
+    /// which every record rings.
     pub timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
     /// This session's fabric endpoint (inbox ring, outbound posts, watermarks, hold
-    /// gate). A leaf lock with one nesting, fabric → [`Self::timeline`]. An `Arc` so
+    /// gate). A leaf lock with one nesting, fabric → [`Self::timeline`] (and the
+    /// timeline's one leaf, [`Self::watchers`]' slot list). An `Arc` so
     /// `subscribe … mail` holds only this per target.
     pub(crate) fabric: std::sync::Arc<crate::fabric::SessionFabric>,
     /// A6: the per-producer high-water marks that make the PTY seam
@@ -7199,10 +7657,30 @@ pub(crate) struct SessionCtx {
     /// is recorded in stream order. A leaf lock, taken only for a non-blocking
     /// `try_send` or an install/remove.
     pub(crate) reset_lane: Arc<manual_reset::ResetLane>,
-    /// The PTY reader is parked for a seamless update, so output silence is not the
-    /// program's: idle watchers hold their clock and a `turn`'s submit window neither
-    /// closes nor re-presses Enter while it stands.
-    pub(crate) update_parked: std::sync::atomic::AtomicBool,
+    /// The PTY reader is parked for a seamless update, or its successor has not yet
+    /// parsed what queued meanwhile ([`spawn::UpdatePark`]), so neither output silence
+    /// nor the last prompt is the program's: idle watchers hold their clock, `ready`
+    /// reads no prompt, and a `turn`'s submit window neither closes nor re-presses
+    /// Enter while it stands. Shared with the reader, which ends it.
+    pub(crate) update_parked: Arc<spawn::UpdatePark>,
+    /// This session's WATCHERS ([`crate::session_watch::Watchers`]): every
+    /// subscription and parked verb on it, woken by the writes that change what
+    /// they read (the PTY reader's burst, a timeline or turn record). The same
+    /// list `timeline` and `turns` ring: every context is built from one
+    /// [`crate::session_watch::Observed`]. An `Arc` leaf, so a subscription
+    /// holds it without the context.
+    pub(crate) watchers: Arc<crate::session_watch::Watchers>,
+    /// This session's PUBLISHED FRAME ([`crate::frame_memo::FrameSlot`]): the
+    /// screen text and styled frame built once per change and served to every
+    /// reader. An `Arc` leaf, so a subscribe watch holds it without the context.
+    /// Its mutex never nests with the terminal lock.
+    pub(crate) frame: Arc<crate::frame_memo::FrameSlot>,
+    /// The control socket's cursor-move licence fences for this session
+    /// ([`licence_fence`]): recorded by a control worker before a driven write,
+    /// applied by every window presenting the session before it arms or judges a
+    /// licence. An `Arc` so a window that turns to another tab still answers for
+    /// the fences of the session it presented.
+    pub(crate) licence: Arc<licence_fence::LicenceFence>,
     /// The `if-supervisor=` writes in flight, which a proven claim's
     /// replacement waits for ([`crate::session_timeline::FencedWrites`]).
     /// Counted under [`Self::meta`], waited on with it.
@@ -7306,9 +7784,20 @@ struct Session {
     /// carried by the handoff record across an update and the restore leaf across a
     /// quit.
     identity: Option<String>,
+    /// The shell's admission under `identity`
+    /// ([`crate::agent_identity::Admission`]), held for the session's life and
+    /// given back as it drops: while it stands `identities forget` refuses that
+    /// identity, so the folder the shell's agent homes name stays. It is given
+    /// back before the shell is reaped (in the background, [`Drop`]), so a
+    /// process that outlives the session holds nothing. An adopted shell's is
+    /// taken from its label at adoption without waiting or failing
+    /// (`agent_identity::hold_adopted`), since the process that admitted it may
+    /// have exited. `None` with no identity, for a label a forget was taking at
+    /// adoption, and for stubs.
+    _identity_admission: Option<crate::agent_identity::Admission>,
     ctx: Arc<SessionCtx>,
-    /// The provisioned child aterm's proxy-table registration and 0600 edge-token
-    /// file, both retired on `Drop`. `None` for `-e` sessions and adopted shells.
+    /// The provisioned child aterm's 0600 edge-token file, removed on `Drop`.
+    /// `None` for `-e` sessions and adopted shells.
     child_proxy: Option<crate::proxy::ChildProxy>,
     /// `Wake::Output` coalescing flag shared with the PTY reader: it posts only on the
     /// false->true edge and the handler clears it first, so a flood costs one wake per
@@ -7443,9 +7932,8 @@ impl Drop for Session {
         // relaxed load when the keeper is off). The hang-up below stays the primary
         // teardown.
         crate::keeper_link::release(self.id);
-        // (0) Retire the capability over the child we spawned and the edge-token file
-        // we wrote for it: dropping the `ChildProxy` deregisters one and removes the
-        // other.
+        // (0) Retire the edge-token file we wrote for the child we spawned:
+        // dropping the `ChildProxy` removes it.
         drop(self.child_proxy.take());
         // (0a) The session ended: a control verb parked on it (`await inbox`, `wait`)
         // answers `ERR exited` now and lets go of its `SessionCtx`, whose sink owns
@@ -7980,34 +8468,86 @@ fn raw_present_capture_guard(
     }
 }
 
-/// Full-window capture is incomplete only when this window really uses the GPU
-/// swapchain whose alpha the compositor blends; a translucent opacity on the CPU
-/// fallback stays solid and is not rejected.
-fn window_capture_translucency_guard(
-    background_opacity: f32,
-    platform_blends_client: bool,
-    backend_is_gpu: bool,
-    has_gpu_surface: bool,
-) -> Result<(), &'static str> {
-    raw_present_capture_guard(
-        background_opacity,
-        platform_blends_client && backend_is_gpu && has_gpu_surface,
-    )
-}
-
 const MATERIAL_CAPTURE_ERROR: &str = "window capture cannot include the compositor-owned \
 Mica/Acrylic backdrop; use `image` for raw application-rendered pixels or set \
 background_material = \"none\"";
 
-/// Fail closed when a platform's window-local capture API omits a configured
-/// compositor material (Windows `PrintWindow` cannot photograph DWM's Mica/Acrylic).
-/// Platforms whose capture includes materials pass
-/// `captures_compositor_material = true`.
-fn window_capture_material_guard(
-    background_material: app_config::BackgroundMaterial,
+/// What a platform's windowed captures (`window`, a windowed snapshot) cannot
+/// show when they copy the presented client layer. The rows are not cfg-gated,
+/// so every platform's routing is tested on every host; [`HOST_CAPTURE`] is
+/// this build's row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlatformCaptureTraits {
+    /// The OS compositor blends the client layer's alpha with what is behind
+    /// the window, so a raw copy of a translucent GPU client omits the backdrop.
+    compositor_blends_client: bool,
+    /// The platform photograph includes a configured compositor material.
+    /// Windows `PrintWindow` cannot photograph DWM's Mica/Acrylic.
     captures_compositor_material: bool,
+}
+
+/// macOS: WindowServer blends the translucent swapchain; CoreGraphics
+/// photographs the vibrancy material with the window.
+const MAC_CAPTURE: PlatformCaptureTraits = PlatformCaptureTraits {
+    compositor_blends_client: true,
+    captures_compositor_material: true,
+};
+
+/// Windows: the translucency guard is not asked, as for `video`; `PrintWindow`
+/// omits the Mica/Acrylic backdrop.
+const WIN_CAPTURE: PlatformCaptureTraits = PlatformCaptureTraits {
+    compositor_blends_client: false,
+    captures_compositor_material: false,
+};
+
+/// Linux: the translucency guard is not asked, as for `video`, and a configured
+/// material is inert (no compositor material is installed).
+const LINUX_CAPTURE: PlatformCaptureTraits = PlatformCaptureTraits {
+    compositor_blends_client: false,
+    captures_compositor_material: true,
+};
+
+const HOST_CAPTURE: PlatformCaptureTraits = if cfg!(target_os = "macos") {
+    MAC_CAPTURE
+} else if cfg!(windows) {
+    WIN_CAPTURE
+} else {
+    LINUX_CAPTURE
+};
+
+/// Whether a window presents a translucent client layer: a translucent
+/// `background_opacity` on a window that really presents through the GPU
+/// swapchain (a translucent opacity on the CPU fallback stays solid). On every
+/// platform that swapchain holds the layer before anything is put behind its
+/// alpha, so a copy of it is not what the window shows; the guards refuse
+/// that copy only where the compositor blends it ([`platform_capture_guards`]).
+fn translucent_gpu_client(
+    knobs: &app_config::RenderKnobs,
+    backend_is_gpu: bool,
+    has_gpu_surface: bool,
+) -> bool {
+    backend_is_gpu
+        && has_gpu_surface
+        && aterm_render::vibrancy::is_translucent(knobs.background_opacity)
+}
+
+/// Fail closed when a windowed capture would copy a client layer the platform
+/// does not show as it is: a translucent GPU client the compositor blends
+/// ([`translucent_gpu_client`]), then a configured material the platform
+/// photograph omits.
+fn platform_capture_guards(
+    traits: PlatformCaptureTraits,
+    knobs: &app_config::RenderKnobs,
+    backend_is_gpu: bool,
+    has_gpu_surface: bool,
 ) -> Result<(), &'static str> {
-    if background_material != app_config::BackgroundMaterial::None && !captures_compositor_material
+    if traits.compositor_blends_client
+        && translucent_gpu_client(knobs, backend_is_gpu, has_gpu_surface)
+    {
+        return Err(TRANSLUCENT_CAPTURE_ERROR);
+    }
+    if knobs.background_material != app_config::BackgroundMaterial::None
+        && !traits.captures_compositor_material
     {
         Err(MATERIAL_CAPTURE_ERROR)
     } else {
@@ -8569,27 +9109,9 @@ pub(crate) fn video_attempt_count(ev: &InputEvent) -> u64 {
     samples
 }
 
-/// [`video_attempt_count`] for a raw-byte egress (`send`/`feed`/`feed-bin` aimed at
-/// a background session, written straight to its PTY), counted as a front-routed
-/// [`InputEvent::KeySequence`] would be — decoded in place, no allocation.
-pub(crate) fn video_attempt_count_bytes(data: &[u8]) -> u64 {
-    let mut samples = 0u64;
-    visit_utf8_lossy_chars(data, |_| {
-        samples += 1;
-        true
-    });
-    samples
-}
-
 /// Add one control-thread input event's attempts to [`UNSEAMED_CONTROL_INPUTS`].
 pub(crate) fn note_unseamed_control_input(ev: &InputEvent) {
     note_unseamed_control_attempts(video_attempt_count(ev));
-}
-
-/// Add one control-thread raw-byte egress's attempts to
-/// [`UNSEAMED_CONTROL_INPUTS`].
-pub(crate) fn note_unseamed_control_bytes(data: &[u8]) {
-    note_unseamed_control_attempts(video_attempt_count_bytes(data));
 }
 
 fn note_unseamed_control_attempts(samples: u64) {
@@ -8695,17 +9217,6 @@ enum PresentTarget {
     },
 }
 
-/// One exact client-area frame captured from the same surface transaction as a
-/// `window` barrier: straight RGBA8 at raw surface size, after every present-only
-/// pass. Unlike [`aterm_render::Frame`] (what `image` reads), this is the layer
-/// `window` splices under OS chrome.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PresentedClientFrame {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) rgba: Vec<u8>,
-}
-
 /// The rasterized overlay card (Settings, About or Palette) for one window: the
 /// straight-alpha RGBA8 buffer, its offset, and the model fingerprint and geometry
 /// key it was built from. Composited at present and capture (`App::composite_tray`).
@@ -8721,6 +9232,10 @@ pub(crate) struct SettingsCard {
     /// (a live font edit with the overlay open) would keep a stale raster while the
     /// hit-test uses the new metrics.
     pub geom: u64,
+    /// The card's `raster-fingerprint` (`SettingsCard::raster_fingerprint`),
+    /// hashed the first time an `image --meta` reads the card. A card's pixels
+    /// change only by building a new card, which starts without one.
+    pub raster_fingerprint_once: std::sync::OnceLock<u64>,
     /// The smoke layer laid over the window behind the card (`OverlayModel::scrim`,
     /// the palette's on Windows): a colour the backend fills the target with
     /// before compositing `rgba` ([`aterm_gpu::TrayScrim`]), so the raster stays
@@ -8779,6 +9294,10 @@ struct NativeLeafRaster {
     last_work: NativeRasterWork,
     full_rasters: u64,
     regional_rasters: u64,
+    /// The raster's `raster-fingerprint` (`NativeLeafRaster::raster_fingerprint`),
+    /// hashed the first time an `image --meta` reads it. A regional pass that
+    /// patches `rgba` in place takes it; a full pass builds a new raster.
+    raster_fingerprint_once: std::sync::OnceLock<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8837,6 +9356,21 @@ enum DividerDrag {
 const PRESENT_RETRY_BASE: Duration = Duration::from_millis(16);
 const PRESENT_RETRY_CAP: u8 = 5;
 
+/// Whether a dropped present retries on its own deadline. The rest (occlusion,
+/// validation, a target mismatch, a virtual surface) park until an external
+/// surface or window stimulus.
+#[must_use]
+const fn autonomous_retry(reason: metrics::PresentDropReason) -> bool {
+    matches!(
+        reason,
+        metrics::PresentDropReason::GpuReconfigured
+            | metrics::PresentDropReason::GpuTimeout
+            | metrics::PresentDropReason::CpuResize
+            | metrics::PresentDropReason::CpuAcquire
+            | metrics::PresentDropReason::CpuCommit
+    )
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PresentRetry {
     autonomous_retries: u8,
@@ -8887,7 +9421,7 @@ impl PresentRetry {
             && *self == Self::default();
         self.deadline = None;
         self.recovery_redraw_outstanding = false;
-        if (reason.autonomous_retry() || bootstrap_occluded)
+        if (autonomous_retry(reason) || bootstrap_occluded)
             && self.autonomous_retries < PRESENT_RETRY_CAP
         {
             let shift = u32::from(self.autonomous_retries);
@@ -9474,6 +10008,10 @@ struct WindowState {
     /// The footer splice's per-frame lists, kept for their buffers
     /// (`claude_footer::SpliceLists`): empty between splices.
     claude_footer_lists: claude_footer::SpliceLists,
+    /// Fx arts queued for GPU residency ahead of the frame that draws them
+    /// (`App::queue_fx_prefetch`), handed to the next present that reaches
+    /// the renderer as `RenderInput::fx_prefetch` (`hand_fx_prefetch`).
+    fx_prefetch_pending: Vec<std::sync::Arc<aterm_core::render::FxArt>>,
     /// The cells the host's chrome splices (the footer's write, the Autopilot
     /// menu) painted over the focused pane on the last frame, pane-local: what
     /// the resident pet takes as occupied (`pet_chrome`).
@@ -9602,6 +10140,10 @@ struct WindowState {
     /// epoch without noting a blink. Set by `sync_window`, consumed at the probe
     /// sites.
     blink_reseed: bool,
+    /// The control socket's licence fences this window has applied
+    /// ([`licence_fence::owed`], through `App::reconcile_licence`). `None` until
+    /// its first look.
+    licence_seen: Option<licence_fence::LicenceSeen>,
     /// Heterogeneous output-streak stream staged by the current `Advance` frame;
     /// capture authority only at the successful-present seam.
     heterogeneous_output_streak_staged: Vec<aterm_render::GlowQuad>,
@@ -9738,14 +10280,21 @@ struct WindowState {
     /// [`Self::capture_present_serial`], success-committed like
     /// `capture_present_invert`.
     capture_present_overlay: Option<crate::app_render::OverlayGlow>,
-    /// One-shot request armed only by the full-OS `window` verb. The CPU presenter
+    /// Size of the frame the present authorized by
+    /// [`Self::capture_present_serial`] placed in its surface, written only by
+    /// a present that succeeded. A destination tapped from that present is cut
+    /// back to this frame at [`aterm_render::frame_placement`].
+    capture_present_frame: Option<(u32, u32)>,
+    /// One-shot request armed by a capture that taps the presented destination
+    /// (`window`, a windowed snapshot or `image`). The CPU presenter
     /// copies its final raw softbuffer while this is true; the GPU uses a one-shot
     /// destination tap on [`aterm_gpu::WindowGpu`]. Ordinary presents pay one branch.
     capture_client_requested: bool,
     /// Exact CPU destination produced by the most recent requested successful surface
-    /// transaction. Cleared before every capture attempt; failures never publish
-    /// staged bytes. GPU captures drain the per-window tap instead.
-    capture_present_client: Option<PresentedClientFrame>,
+    /// transaction: a copy of its softbuffer at raw surface size, after every
+    /// present-only pass. Cleared before every capture attempt; failures never
+    /// publish staged bytes. GPU captures drain the per-window tap instead.
+    capture_present_client: Option<app_introspect::CapturePixels>,
     /// Per-visible-terminal engine snapshot sequence numbers that fed the staged
     /// `input_scratch`, in paint order. A windowed capture reads this only after its
     /// present serial advances, so it describes that successful frame.
@@ -9791,11 +10340,18 @@ struct WindowState {
     /// present-pacing deadline), a plain stamp: the cursor effects' typed wake
     /// ([`Self::cursor_fx_typed_wake`]) reads it.
     last_key_at: Option<std::time::Instant>,
-    /// The oldest keystroke typed into this window still waiting on its content
-    /// present — the input→present metric's per-window stamp. Closed only by this
-    /// window's present, so another window's output cannot be booked as its echo
-    /// (`metrics::PendingInputStamp`).
-    pending_input: crate::metrics::PendingInputStamp,
+    /// This window's present-side metrics state (`metrics::WindowPresentState`):
+    /// the keystrokes typed into it still waiting on its content present — closed
+    /// only by this window's present, so another window's output cannot be booked
+    /// as their echo — the keystrokes a native page in it took, still waiting on
+    /// a present of the page revision their dispatch made (the native ring,
+    /// never closed by terminal output or another revision), and when it last
+    /// presented, the gap its worst present latency is witnessed against.
+    present_metrics: crate::metrics::WindowPresentState,
+    /// Successful native reducer dispatches, used only to distinguish a
+    /// handled input from the PTY boundary swallowing an unsupported key.
+    /// Saturation stops admitting new samples rather than reusing a receipt.
+    native_dispatch_serial: u64,
     /// This window's monitor refresh period, re-sampled whenever the window lands on
     /// a different monitor (`None` falls back to the primary-monitor default in
     /// `App::frame_interval`). A window on a 120 Hz panel coalesces at 8.3 ms even
@@ -10199,6 +10755,16 @@ struct WindowState {
     /// `RepaintKey` lays the Deck out only when what it reads moved
     /// (`App::stats_deck_fp`).
     deck_memo: std::cell::Cell<(u64, u64)>,
+    /// The stats card's hit regions from its last layout (card pixels), so a
+    /// pointer over an instrument arms the lens and a sill press stays off
+    /// the pane (`crate::stats_paint::Hit`).
+    stats_hits: std::cell::RefCell<Vec<crate::stats_paint::Hit>>,
+    /// The open stats lens's raster (paint-only, folded with the stats card
+    /// by `App::fold_stats_deck`; `crate::stats_lens`). `None` when closed.
+    lens_card: Option<SettingsCard>,
+    /// The stats lens's state: open or not, an armed pointer rest, a hover
+    /// lens's leave, its hit regions.
+    stats_lens: crate::stats_lens::LensSlot,
     /// Set by Cmd-W; the loop closes this window after the handler returns.
     pending_close: bool,
     /// Exit attribution captured when a last-tab close was deferred, re-entered
@@ -11371,11 +11937,13 @@ impl WindowState {
             blink_epoch_seen: 0,
             last_blink_at: None,
             blink_reseed: false,
+            licence_seen: None,
             predictor: crate::predict::Predictor::new(crate::predict::PredictMode::Off),
             predict_key_row: crate::predict_seen::KeyRow::default(),
             pred_shown: false,
             claude_footer_undo: claude_footer::FooterUndo::default(),
             claude_footer_lists: claude_footer::SpliceLists::default(),
+            fx_prefetch_pending: Vec::new(),
             pet_chrome: pet_chrome::PetChrome::default(),
             claude_card: claude_card::WindowCards::default(),
             claude_footer_texts: std::cell::RefCell::default(),
@@ -11420,6 +11988,7 @@ impl WindowState {
             capture_present_serial: 0,
             capture_present_invert: false,
             capture_present_overlay: None,
+            capture_present_frame: None,
             capture_client_requested: false,
             capture_present_client: None,
             capture_leaf_snapshot_seqs: Vec::new(),
@@ -11434,7 +12003,8 @@ impl WindowState {
             input_hot_until: None,
             last_registration_ns: None,
             last_key_at: None,
-            pending_input: crate::metrics::PendingInputStamp::default(),
+            present_metrics: crate::metrics::WindowPresentState::default(),
+            native_dispatch_serial: 0,
             frame_interval: None,
             monitor: None,
             last_edr_query: None,
@@ -11533,6 +12103,9 @@ impl WindowState {
             deck_card: None,
             deck_fold: None,
             deck_memo: std::cell::Cell::new((0, 0)),
+            stats_hits: std::cell::RefCell::new(Vec::new()),
+            lens_card: None,
+            stats_lens: crate::stats_lens::LensSlot::default(),
             pending_close: false,
             pending_close_attribution: None,
             wallpaper_scaled: None,
@@ -12899,9 +13472,9 @@ struct PendingUpdateHandoff {
     child_pid: Option<u32>,
     mode: native_updater_service::ApplyMode,
     apply_attempt: Option<native_updater_service::ApplyAttemptTicket>,
-    /// Which ticket-less authority this attempt ran under, if any — today only the QA
-    /// seam. Carried so the completion reduction reads the seam from the attempt rather
-    /// than inferring it from an absent ticket.
+    /// Which ticket-less authority this attempt ran under, if any: the QA seam or a
+    /// launch-record renewal. Carried so the completion reduction reads it from the attempt
+    /// rather than inferring it from an absent ticket.
     same_image: Option<app_update_handoff::SameImageHandoff>,
     target_build: u64,
     target_commit: String,
@@ -13571,6 +14144,12 @@ struct App {
     /// begin a frame the drain gate never saw.
     #[cfg(all(test, unix))]
     handoff_before_egress_fence: Option<Box<dyn FnOnce() + Send>>,
+    /// What the Commit's claim answers cost, taken once in place of the time
+    /// `App::answer_at_commit_claim` measured, for a test to choose a claim held
+    /// through one more fence (`HANDOFF_INPUT_DRAIN_YIELD` or more) or one written
+    /// in its own pass, never by how fast this machine ran.
+    #[cfg(all(test, unix))]
+    handoff_commit_answers_took: Option<Duration>,
     /// Run once at a successor's Commit right before its supervisor host
     /// resumes (`App::take_over_supervision_at_commit`), for a test to read
     /// what already stands on the host then.
@@ -13604,10 +14183,6 @@ struct App {
     /// `u64` id for cross-session `@<selector>` verbs. A pure index; `pool` stays the
     /// UI-side truth. Cloned into the control thread.
     store: session_store::Store,
-    /// Subscriber registry for `subscribe` connections and parked `await`/`ready`
-    /// verbs, notified in O(1) on output or exit via a non-blocking `try_send`, so a
-    /// slow subscriber never blocks this thread. Cloned into the control thread.
-    subscribers: subscribe::Subscribers,
     /// The single resident renderer (see [`Backend`]). Windowed cold launches start
     /// [`BackendSlot::Pending`] and join once in [`Self::finalize_backend`]; headless
     /// constructs it `Ready`.
@@ -13896,6 +14471,9 @@ struct App {
     /// spawning, locking application state, or depending on a UI Wake.
     handoff_reader_gate: Option<crate::spawn::DeferredReaderGate>,
     handoff_control_preparation: Option<control::ControlPreparation>,
+    /// Read by the unix handoff's Commit facts alone (`collect_handoff_commit_facts`).
+    #[cfg(unix)]
+    recovery_count_admission: Arc<keeper_link::RecoveryCountAdmission>,
     /// Incoming overlap child is readerless and must not structurally mutate or
     /// quit between ProofReady and Commit. Cleared only by legacy success or the
     /// exact v2 Commit activation Wake.
@@ -13960,9 +14538,9 @@ struct App {
     /// When Windows' end-session snapshot is taken again
     /// ([`crash_journal::EndSessionCadence`]; [`App::end_session_snapshot`]).
     end_session: crash_journal::EndSessionCadence,
-    /// The session log's disk journal (`session_log_journal`): off by default
-    /// (`[session_log] journal`), then a writer thread of its own. Inert in
-    /// unit tests.
+    /// The session log's disk journal (`session_log_journal`): on by default
+    /// where the desk is kept (`[session_log] journal = false` opts out), a
+    /// writer thread of its own. Inert in unit tests.
     session_log_journal: session_log_journal::Lane,
     /// The journal writer's word the owner last saw (its change count).
     session_log_journal_seen: u32,
@@ -14007,7 +14585,7 @@ struct App {
     winit_to_window: HashMap<WinitWindowId, WindowId>,
     /// When set (`--headless`), no window/surface is ever created: the
     /// engine, control socket, and offscreen rendering (`image`/snapshot via
-    /// [`Wake::Control`]) all run, but nothing is presented on screen.
+    /// [`Wake::Image`]) all run, but nothing is presented on screen.
     headless: bool,
     /// What this instance keeps of its desk across launches ([`desk::Desk`]):
     /// a window's, none headless, or a window's under the lab's headless seam.
@@ -14036,6 +14614,10 @@ struct App {
     /// Audible bell gate: one beep per [`BELL_BEEP_INTERVAL`] (the engine
     /// already throttles BEL callbacks to 10/s; this slows the sound further).
     bell_beep: BellRateLimiter,
+    /// What a bell that passes `on_bell`'s gates plays: [`system_alert_sound`],
+    /// or in the unit-test fixture a counter (`count_alert_sound_for_test`), so
+    /// a broken gate fails its test without a sound from the person's speakers.
+    alert_sound: fn(),
     /// Trail sound output (`trail_audio.rs`); the device opens on the first cue.
     trail_audio: trail_audio::TrailAudio,
     /// Dedupe latch for the typing-sound audition: the voice last previewed, so the
@@ -14050,6 +14632,10 @@ struct App {
     /// (`platform::user_input_source`): a HID idle read windowed, the inert arm
     /// headless and in tests (same reason as `lock_modifiers`).
     user_input_recent: fn(std::time::Duration) -> bool,
+    /// The character an Option chord types in Meta mode when its layout reaches it only
+    /// with Option (`platform::option_only_source`): the selected layout's windowed on
+    /// macOS, the inert arm headless and in tests (same reason as `lock_modifiers`).
+    option_only: platform::OptionOnly,
     /// Menu-bar reader behind `chrome`'s `menu …` lines (macOS):
     /// [`app_menu_bar::reader`], AppKit's windowed and `menu (none)` headless and in
     /// unit tests. The AppKit read starts with `+[NSApplication sharedApplication]`,
@@ -14058,9 +14644,9 @@ struct App {
     #[cfg(target_os = "macos")]
     app_menu_bar: app_menu_bar::MenuBarReader,
     /// macOS consent state: injected probes plus the Full Disk Access cache
-    /// (`control_privacy::ConsentState`); inert arms headless and in tests.
+    /// (`consent_state::ConsentState`); inert arms headless and in tests.
     /// Instance-owned, so a successor starts with an empty cache.
-    consent: control_privacy::ConsentState,
+    consent: consent_state::ConsentState,
     /// macOS consent warm-up state (rows, worker queue, apply hold). Injected like
     /// `consent`, so tests never raise a system dialog.
     consent_warmup: consent_warmup::WarmupState,
@@ -14102,18 +14688,19 @@ struct App {
     /// The owner's recent declines of the Security block's alerts, armed into
     /// every Settings view so a view opened after a decline is just as quiet.
     owner_quiet: native_settings::SharedOwnerQuiet,
-    /// The tccd consent observer, off unless `[privacy] observer`. Injected like
-    /// `consent`; its worker is detached and reaps its own child.
+    /// The tccd consent observer, a sentinel unless `[privacy] observer` says
+    /// otherwise (`App::reconcile_consent_observer`). Injected like `consent`;
+    /// its worker is detached and reaps its own child.
     consent_observer: consent_observer::ObserverState,
     /// The EPERM-driven attention gate (design §3.6, last bullet): the
     /// rate-limit that makes a denial storm one notification and a posture
     /// transition the thing that re-arms it. Pure state; the acting is done by
     /// `App::note_consent_attention`.
     consent_attention: consent_observer::AttentionGate,
-    /// Whether an observer start has already been attempted, so a spawn failure
-    /// is not retried on every park. A config that simply says no does not set
-    /// it, so turning `[privacy] observer` on takes effect at the next park.
-    consent_observer_started: bool,
+    /// Whether the park has run the observer's first reconcile. Later ones run
+    /// where the wish can change: an admitted config generation and a cold
+    /// `exec` that returned.
+    consent_observer_reconciled: bool,
     /// The macOS access card's lifecycle (`consent_card`): launch one-shot, notice-slot
     /// wait and grant watch, driven by `App::tick_macos_access_card`.
     consent_card: consent_card::CardState,
@@ -14127,22 +14714,24 @@ struct App {
     /// into the developer's real config directory (the same reason
     /// `headless_for_test` points the update ledger at a scratch root).
     consent_card_config: Option<std::path::PathBuf>,
-    /// Shared queue of control-socket `image` requests, drained on
-    /// [`Wake::Control`] (the control thread cannot touch the renderer).
-    image_queue: control::ImageQueue,
     /// Owned control captures waiting for one surface's drawable completion.
     /// Capacity is bounded; original cancellation/retention permits travel with it.
     deferred_gpu_captures: std::collections::VecDeque<app_introspect::DeferredGpuCapture>,
     replaying_gpu_capture: Option<WindowId>,
+    /// The window whose presents a capture's barrier is forcing right now
+    /// (`App::present_before_capture`); its presents book their latency to the
+    /// tainted ledger (`metrics::record_present`).
+    capture_barrier: Option<WindowId>,
     capture_present_budget: app_introspect::CapturePresentBudget,
     /// Bounded sender to the single PNG encode/write worker
     /// ([`app_introspect::EncodeJob`]), spawned on the first capture. One worker keeps
     /// replies in FIFO order, replying only after the write; saturation is rejected
     /// rather than blocking. `None` until first use.
     encode_tx: Option<std::sync::mpsc::SyncSender<app_introspect::EncodeWork>>,
-    /// Framebuffer bytes held by captures between the event loop's decision to
-    /// photograph and the encode worker's finish ([`app_introspect::CapturePermit`]),
-    /// checked against the byte budget before a capture is taken.
+    /// Bytes held by captures between the event loop's decision to photograph
+    /// and the encode worker's finish, each its pixels plus its encode's working
+    /// set ([`app_introspect::CapturePermit`]), checked against the byte budget
+    /// before a capture is taken.
     capture_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// The permit an admitted capture holds while its body runs; its
     /// `submit_encode_job` moves it onto the job, and the admitting wrapper
@@ -14156,6 +14745,18 @@ struct App {
     /// The lost-wake watchdog's memory between `about_to_wait` passes (the
     /// previous pass's drained-through stamp, the wakes already booked late).
     output_wake_watch: crate::spawn::OutputWakeWatch,
+    /// Which slot of the `wakes_by_variant` ledger each delivered `Wake`
+    /// variant counts in (`user_event`): this thread's map, so a delivery
+    /// takes no lock.
+    wake_census: crate::metrics::wakes::WakeCensus,
+    /// What `about_to_wait` arms when a producer keeps re-arming the past
+    /// (`crate::deadline_heal`): this thread's state, which `metrics reset`
+    /// cannot reach.
+    deadline_healer: crate::deadline_heal::DeadlineHealer,
+    /// The process-wide present-side metrics state (`metrics::PresentObserver`):
+    /// the open slow-present episode and the previous present of any window.
+    /// This thread's state, which `metrics reset` cannot reach.
+    present_observer: crate::metrics::PresentObserver,
     /// Notification suppression set for the `notify` thread: the focused-pane session
     /// of every focused window's active tab, rebuilt by `recompute_notify_suppress`. A
     /// notification from a session in the set is suppressed.
@@ -14348,6 +14949,12 @@ struct App {
     /// publication here takes it (`App::adopt_status_carry`). Empty unless
     /// this process is a seamless successor.
     status_carry: std::collections::HashMap<String, status_item::StatusCarry>,
+    /// A SEAMLESS UPDATE'S CARRIED END (§11.2.3, item 8): each adopted
+    /// session's Autopilot end and its task's work as the outgoing process
+    /// held them, by sid (`SessionRecord::autopilot_end`), until that
+    /// session's first publication here spends it (`App::adopt_end_carry`).
+    /// Empty unless this process is a seamless successor.
+    end_carry: std::collections::HashMap<String, harness_end_carry::EndCarry>,
     /// A seamless successor's fleet notices: the fleet needs the outgoing
     /// herald had told (`SessionHandoff::fleet_told`), by herald key, which
     /// its first fresh fleet read takes as told where it finds the same word
@@ -14617,6 +15224,17 @@ struct App {
     /// The center's revision the last published projection was built at:
     /// a publish is due only once the center has moved past it.
     messages_published_revision: u64,
+    /// How long after the last publish a time word it says first reads
+    /// otherwise (`3 min ago` becoming `4 min ago`, `Today` becoming
+    /// `Yesterday`; `MessagesState::words_change_at`): when a quiet Messages
+    /// page is owed a publish for its clock. `None` when it says no time (an
+    /// empty log) or nothing is published yet: no tick.
+    messages_words_change_in: Option<std::time::Duration>,
+    /// The zone's offset from UTC the last publish read its time words on
+    /// (`MessagesState::utc_offset_s`): a zone that reads otherwise at a turn
+    /// (a time zone set by hand, a Mac carried into another zone) owes a page
+    /// that says time its publish.
+    messages_words_offset_s: i64,
     /// How many door demotions `aterm.log` has already said, so the exceptions
     /// host names a builder once per change (`exceptions_host::digest_moved`).
     demotions_logged: u32,
@@ -14880,6 +15498,10 @@ struct App {
     /// (`App::note_own_launch_record`): a returned attempt leaves a stale one's entry.
     #[cfg(target_os = "macos")]
     own_launch_record: Option<app_launch_successor::OwnLaunchRecord>,
+    /// The renewal of a stale record by a handoff to a fresh launch of this build
+    /// (`launch_record_renewal`), and whose renewal this process is.
+    #[cfg(target_os = "macos")]
+    launch_record_renewal: launch_record_renewal::LaunchRecordRenewal,
     /// This process keeps the image it was launched with: a macOS window no parent handed
     /// off to, or a seamless successor LaunchServices launched
     /// (`aterm_update::ImageReplacement`). Its admission refuses the cold lane, which execs
@@ -14941,6 +15563,14 @@ struct App {
     /// Autopilot's armed timers (`crate::autopilot_timers`): when to look at a
     /// session's stored `land_at`, never what to write.
     autopilot_timers: autopilot_timers::AutopilotTimers,
+    /// THE AUTOPILOT WRITES RECORDED, by local id
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.3, item 3): the
+    /// `SessionMeta::autopilot_revision` of the last move of the session's
+    /// pair the message log has a record of — the window's own write, the
+    /// timer's fire, or one over the wire (`App::record_wire_autopilot`) —
+    /// so a wake for any other field records nothing. An entry goes with its
+    /// session (`retire_session_registration`).
+    autopilot_recorded: std::collections::HashMap<u64, u64>,
     /// The open Autopilot menu (`crate::autopilot_menu`): one at a time, in
     /// one window; `None` at rest.
     autopilot_menu: Option<autopilot_menu::AutopilotMenu>,
@@ -14967,8 +15597,16 @@ struct App {
     cold_lane_layout_debt: app_update_handoff::ColdLaneLayoutDebt,
     /// Event-loop-owned retry deadline used when a deadline-missed reader,
     /// temporal writer, or fallible reader attach is not yet live during handoff
-    /// rollback. No helper-thread spawn is needed to make rollback progress.
+    /// rollback, or a handed PTY's parked size is still owed
+    /// (`owed_parked_winsizes`). No helper-thread spawn is needed to make
+    /// rollback progress.
     deferred_reader_resume_at: Option<Instant>,
+    /// The handed PTYs a rolled-back handoff still owes their parked size,
+    /// `(session, master)`: each one whose engine another thread held when the
+    /// rollback came, put back on the reader resume's retry rather than waited
+    /// for on the event loop (`App::reassert_owed_winsizes`).
+    #[cfg(unix)]
+    owed_parked_winsizes: Vec<(u64, i32)>,
     /// Post-update realized ⬆️: `Some(spawn instant)` in a [`JUST_UPDATED`] run until
     /// [`relaunch_notice::REALIZED_ARROW_TTL`]; the version-menu title keeps the arrow
     /// and the palette shows "↑ Updated to aterm v<new>". Cleared by `about_to_wait`.
@@ -15219,7 +15857,8 @@ impl App {
 
     /// The wake `user_event` handles now, or `None` when an incoming overlap
     /// handoff holds it: kept for the Commit wake when this successor has
-    /// committed ([`Self::defers_wake_until_activation`]), else swallowed
+    /// committed, or when it is the update facts this successor asked for
+    /// ([`Self::defers_wake_until_activation`]), else swallowed
     /// ([`Self::drops_wake_before_commit`]). Factored out of `user_event` so a
     /// test drives it without an event loop.
     fn admit_wake_before_commit(&mut self, ev: Wake) -> Option<Wake> {
@@ -15245,6 +15884,16 @@ impl App {
     /// waits like the rest: run before the replay, it closed its pane and the
     /// keys typed into that pane went to the one that took focus. Past
     /// [`MAX_COMMITTED_DEFERRED_WAKES`] a wake is handled as before this hold.
+    ///
+    /// THE UPDATE FACTS THIS SUCCESSOR ASKED FOR wait from its first wake, not
+    /// only once it has committed (round eight of the update audit, U14). The
+    /// facts worker answers the boot's Startup read, or the Refresh a restored
+    /// Settings tab asks for, well inside the overlap, and nothing asks again
+    /// after the Commit: swallowed, the answer left a restored Software Update
+    /// page on the pristine "You're up to date." over a ledger that says
+    /// updates are failing, until the next check. Held, it is reduced once
+    /// this process is no longer a candidate, so nothing it arms (a newer
+    /// stage's automatic apply) runs in one.
     fn defers_wake_until_activation(&self, ev: &Wake) -> bool {
         // The Commit wake that runs what is held is a unix-only wake, and so is
         // the overlap handoff.
@@ -15255,23 +15904,25 @@ impl App {
         }
         #[cfg(unix)]
         {
+            let committed = self
+                .handoff_reader_gate
+                .as_ref()
+                .is_some_and(crate::spawn::DeferredReaderGate::is_released);
             self.incoming_handoff_pending
-                && self
-                    .handoff_reader_gate
-                    .as_ref()
-                    .is_some_and(crate::spawn::DeferredReaderGate::is_released)
                 && self.handoff_committed_wakes.len() < MAX_COMMITTED_DEFERRED_WAKES
-                && !matches!(
-                    ev,
-                    Wake::ActivateCommittedHandoff { .. }
-                        | Wake::GpuSurfaceReady { .. }
-                        | Wake::ControlPrepared
-                        | Wake::ProgramResolved { .. }
-                        | Wake::Ready { .. }
-                        | Wake::Output { .. }
-                        | Wake::QueuedKeyDelivered { .. }
-                        | Wake::Bell { .. }
-                )
+                && (matches!(ev, Wake::NativeUpdateReconcileFinished { .. })
+                    || (committed
+                        && !matches!(
+                            ev,
+                            Wake::ActivateCommittedHandoff { .. }
+                                | Wake::GpuSurfaceReady { .. }
+                                | Wake::ControlPrepared
+                                | Wake::ProgramResolved { .. }
+                                | Wake::Ready { .. }
+                                | Wake::Output { .. }
+                                | Wake::QueuedKeyDelivered { .. }
+                                | Wake::Bell { .. }
+                        )))
         }
     }
 
@@ -15604,7 +16255,8 @@ impl App {
 
     /// A *Move to Trash* worker stored its report: what is on disk changed, so
     /// the next read takes a fresh census, and the next park republishes the
-    /// report and its status row to every Security view.
+    /// report and its status row to every Security view, equality-gated, which
+    /// repaints the views whose block changed.
     pub(crate) fn on_claimant_retired(&mut self) {
         if self.claimant_retire.take_arrival() {
             // A move that ends supersedes a refusal recorded while it ran
@@ -15612,7 +16264,6 @@ impl App {
             self.claimant_retire_refusal = None;
             self.consent.invalidate_census();
         }
-        self.request_redraw_all_windows();
     }
 
     /// The Security panel's *Move to Trash*, for the copies the owner was
@@ -15628,7 +16279,7 @@ impl App {
         if !self.config.privacy_enabled() {
             return Err("aterm's privacy checks are switched off in aterm.toml");
         }
-        let Some(bundle_id) = control_privacy::running_bundle_id_if_warm() else {
+        let Some(bundle_id) = signing_identity::running_bundle_id_if_warm() else {
             return Err("aterm has not read its own bundle identity yet");
         };
         if plan.is_empty() {
@@ -15861,8 +16512,10 @@ impl App {
     /// re-read, which reads the result slot whether or not the worker's wake
     /// arrived and starts a records read once it is due; the Developer
     /// Tools hand-over's next turn ([`Self::next_devtools_hand_over_deadline`]);
-    /// and, while an aterm window is focused, the launch warm-up's and the
-    /// debugger-access launch ask's next looks.
+    /// the tccd observer's next threshold crossing
+    /// ([`Self::next_consent_observer_deadline`]); and, while an aterm window is
+    /// focused, the launch warm-up's and the debugger-access launch ask's next
+    /// looks.
     fn fold_consent_lane_deadlines(
         &self,
         now: Instant,
@@ -15886,6 +16539,14 @@ impl App {
                 owner,
                 wake,
                 metrics::DeadlineOwner::DevToolsHandOver,
+            );
+        }
+        if let Some(wake) = self.next_consent_observer_deadline() {
+            fold_owned_deadline(
+                deadline,
+                owner,
+                wake,
+                metrics::DeadlineOwner::ConsentObserver,
             );
         }
         // The launch warm-up's look for its quiet moment, only while an aterm
@@ -16277,7 +16938,7 @@ impl App {
     }
 
     /// Give the hand-over lane a completed reading.
-    fn note_devtools_reading(&mut self, row: &control_privacy::DevToolsRow) {
+    fn note_devtools_reading(&mut self, row: &consent_state::DevToolsRow) {
         let reading = devtools_helper::Reading {
             grant: row.grant(),
             list: row.list(),
@@ -16572,12 +17233,40 @@ impl App {
         // and drop a Mac the kernel names.
         let ended = self.debugger_launch.host_read_ended();
         if let Some(host) = self.debugger_launch.warm_host() {
-            let asked = if self.debugger_launch.asked(config, host) {
-                HostAsked::Asked
-            } else {
-                HostAsked::NotAsked
+            // The record beside `aterm.toml`, read once, off the event loop: it
+            // lives in the home folder, which can sit on a volume that stopped
+            // answering (`debugger_access::RecordRead::Thread`).
+            if let Some((slot, read)) = self.debugger_launch.start_record_read(host) {
+                let config = config.to_path_buf();
+                let answer = move || {
+                    let _ = slot.set(debugger_access::read_asked(&config, host));
+                };
+                match read {
+                    debugger_access::RecordRead::Thread => {
+                        let wake = self.devtools_hand_over_wake();
+                        let spawned = crate::qos::spawn_lane_thread(
+                            "aterm-launch-asked",
+                            crate::qos::Role::Background,
+                            move || {
+                                answer();
+                                wake();
+                            },
+                        );
+                        if spawned.is_err() {
+                            // No thread to read it on: fail toward not asking, as
+                            // a record that cannot be read does (the ask drops).
+                            return (HostAsked::Asked, Some(host));
+                        }
+                    }
+                    #[cfg(test)]
+                    debugger_access::RecordRead::Inline => answer(),
+                }
+            }
+            return match self.debugger_launch.asked(host) {
+                Some(true) => (HostAsked::Asked, Some(host)),
+                Some(false) => (HostAsked::NotAsked, Some(host)),
+                None => (HostAsked::Cold, None),
             };
-            return (asked, Some(host));
         }
         if ended {
             return (HostAsked::Unnamed, None);
@@ -16818,7 +17507,7 @@ impl App {
     fn fda_opened_key() -> String {
         let version = aterm_types::version::app_version();
         match (
-            control_privacy::running_bundle_id_if_warm(),
+            signing_identity::running_bundle_id_if_warm(),
             aterm_containment::consent::host_uuid_if_warm(),
         ) {
             (Some(id), Some(here)) => format!("{version}@{id}@{here}"),
@@ -16905,7 +17594,7 @@ impl App {
             origin,
             reading: devtools_helper::Reading::UNREAD,
             listed: None,
-            bundle: (reach.drag_bundle)(control_privacy::running_bundle_id_if_warm()),
+            bundle: (reach.drag_bundle)(signing_identity::running_bundle_id_if_warm()),
             skips: false,
         };
         let wake = self.devtools_hand_over_wake();
@@ -17120,15 +17809,15 @@ impl App {
         // worker; with that question switched off nothing else reads it at launch. A
         // cold identity is "not yet", never an unstable build.
         if bundle_id.is_none()
-            && control_privacy::running_from_bundle()
-            && !control_privacy::signing_identity_is_warm()
+            && signing_identity::running_from_bundle()
+            && !signing_identity::signing_identity_is_warm()
         {
             if self.consent_launch.ask_identity() {
                 let wake = self.devtools_hand_over_wake();
                 let spawned = std::thread::Builder::new()
                     .name("aterm-launch-identity".to_owned())
                     .spawn(move || {
-                        let _ = control_privacy::signing_identity();
+                        let _ = signing_identity::signing_identity();
                         wake();
                     })
                     .is_ok();
@@ -17778,7 +18467,7 @@ impl App {
                 let Some(here) = aterm_containment::consent::host_uuid() else {
                     return;
                 };
-                let Some(bundle_id) = control_privacy::running_bundle_id() else {
+                let Some(bundle_id) = signing_identity::running_bundle_id() else {
                     return;
                 };
                 if let Err(error) =
@@ -17809,15 +18498,12 @@ impl App {
         }
     }
 
-    /// The `access_card` line of `aterm ctl privacy`.
-    pub(crate) fn access_card_report(
-        &self,
-        fda: aterm_containment::consent::FdaState,
-    ) -> control_privacy::AccessCardReport {
+    /// What the `access_card` line of `aterm ctl privacy` reads from the card
+    /// host; the report judges its state against the verdict it read.
+    pub(crate) fn access_card_inputs(&self) -> privacy_report::AccessCardInputs {
         let host = &self.consent_card_host;
-        let now_secs = consent_card::now_unix_secs();
-        control_privacy::AccessCardReport {
-            state: consent_card::report_state(host.marker, &host.record, fda, now_secs),
+        privacy_report::AccessCardInputs {
+            marker: host.marker,
             record: host.record,
             needs: host.needs,
         }
@@ -18172,16 +18858,18 @@ impl App {
     // -----------------------------------------------------------------------
 
     /// The observer mode this instance actually runs. The config's tri-state
-    /// (`ObserverMode`) with two facts applied: the SENTINEL exists to feed the
-    /// access card (and to record which tab drew any other dialog it can name,
-    /// so with `notice` off no such record is kept), so it needs the card's
-    /// own switches on and a
+    /// (`ObserverMode`) with the master switch and two facts applied:
+    /// `[privacy] enabled = false` means aterm stopped looking, so every mode
+    /// is off; the SENTINEL exists to feed the access card (and to record
+    /// which tab drew any other dialog it can name, so with `notice` off no
+    /// such record is kept), so it needs the card's own switches on and a
     /// windowed macOS instance (a headless one holds the inert arm and has no
     /// card; off macOS there is no `tccd`); `Full` is an explicit opt-in and
     /// runs wherever it is asked for (headless gets the inert arm, other
-    /// platforms say `unsupported-platform`).
+    /// platforms say `unsupported-platform`). The EPERM path's tab mark and
+    /// banner read the same answer ([`Self::note_consent_attention`]).
     pub(crate) fn effective_observer_mode(&self) -> consent_observer::ObserverMode {
-        self.effective_observer_mode_for(control_privacy::running_from_bundle())
+        self.effective_observer_mode_for(signing_identity::running_from_bundle())
     }
 
     /// [`Self::effective_observer_mode`] with the bundle fact given. An
@@ -18192,6 +18880,7 @@ impl App {
     fn effective_observer_mode_for(&self, bundled: bool) -> consent_observer::ObserverMode {
         use consent_observer::ObserverMode;
         match self.config.privacy_observer_mode() {
+            ObserverMode::Full if !self.config.privacy_enabled() => ObserverMode::Off,
             ObserverMode::Sentinel
                 if !cfg!(target_os = "macos")
                     || !bundled
@@ -18205,49 +18894,64 @@ impl App {
         }
     }
 
-    /// Start the consent observer ONCE, if `[privacy] observer` asks for it
-    /// (absent asks for the sentinel).
+    /// Bring the consent observer to the mode `[privacy]` asks for now (absent
+    /// asks for the sentinel). Run at the events that can change the wish: the
+    /// first park, an admitted config generation and a cold `exec` that
+    /// returned. An unchanged wish changes nothing, so a stream that ended by
+    /// itself or a spawn that failed is not retried by an unrelated reload. A
+    /// changed one stops the running stream (a signal by pid, never a join)
+    /// and starts the new mode; `None` when nothing changed.
     ///
     /// Config only. There is no environment variable and no control verb: a
     /// program inside a session must not be able to turn on a consent surface,
     /// which is the same rule that fences the warm-up (§3.5) and `tccutil
     /// reset` (§3.7). A headless instance holds the inert arm, so even an
     /// enabled config spawns nothing there.
-    ///
-    /// Idempotent and cheap: the latch means a park costs one `bool` test.
-    pub(crate) fn start_consent_observer(&mut self) -> consent_observer::StartOutcome {
+    pub(crate) fn reconcile_consent_observer(&mut self) -> Option<consent_observer::StartOutcome> {
         let proxy = self.proxy.clone();
         let mode = self.effective_observer_mode();
-        let outcome = self.consent_observer.start(mode, move || {
+        self.consent_observer.reconcile(mode, move || {
             if let Some(proxy) = &proxy {
                 let _ = proxy.send_event(Wake::ConsentObserver);
             }
-        });
-        // The latch records that an attempt HAPPENED, so a spawn failure is not
-        // retried in a loop. A refusal is deliberately NOT latched: turning the
-        // key on in the config file takes effect on the next park, with no
-        // further gesture asked of anyone.
-        self.consent_observer_started =
-            !matches!(outcome, consent_observer::StartOutcome::Disabled);
-        outcome
+        })
     }
 
     /// Fold what the observer queued and act on it: drain the stream's events
     /// (`try_recv` until empty; nothing here blocks), turn every observed
     /// dialog FOR THIS APP into a need for the access card, and — in Full mode
-    /// only — announce it (tab mark, OS banner). Called from the observer's
-    /// wake AND from the per-park block: an uncommitted incoming handoff drops
-    /// every wake but Commit, and a wake swallowed there must not delay a need
-    /// until an unrelated line arrives.
+    /// only — announce it (tab mark, OS banner). Called from the park alone:
+    /// the observer's wake is a nudge whose park lands here, and an
+    /// uncommitted incoming handoff that swallows the wake still parks.
+    ///
+    /// Nothing is drained while no stream is requested, and the announcement
+    /// follows the stream that is running, not the config: only a Full stream
+    /// fills the table it reads.
     pub(crate) fn poll_consent_observer(&mut self, now: Instant) {
-        if !self.consent_observer_started {
+        if self.consent_observer.requested() == consent_observer::ObserverMode::Off {
             return;
         }
         self.consent_observer.drain(now);
-        self.note_observed_prompts(control_privacy::running_bundle_id_if_warm(), now);
-        if self.effective_observer_mode() == consent_observer::ObserverMode::Full {
-            self.announce_observed_consent_prompts();
+        self.note_observed_prompts(signing_identity::running_bundle_id_if_warm(), now);
+        if self.announces_observed_prompts() {
+            self.announce_observed_consent_prompts(now);
         }
+    }
+
+    /// Whether the park announces observed prompts: only a running Full
+    /// stream fills the table the announcement reads.
+    fn announces_observed_prompts(&self) -> bool {
+        self.consent_observer.running() == consent_observer::ObserverMode::Full
+    }
+
+    /// The park's deadline for the announcement: the instant the next open
+    /// request reaches the prompt threshold, while a Full stream runs. Without
+    /// it a crossing on an idle loop would wait for an unrelated wake.
+    fn next_consent_observer_deadline(&self) -> Option<Instant> {
+        if !self.announces_observed_prompts() {
+            return None;
+        }
+        self.consent_observer.verdict_deadline()
     }
 
     /// Every dialog the sentinel saw for THIS app's bundle id, once each. Only
@@ -18320,16 +19024,20 @@ impl App {
     /// to answer, and §1.4 proves neither of them ever times out. A quiet
     /// stream announces NOTHING — this is the direct-observation path, and
     /// silence is not evidence.
-    fn announce_observed_consent_prompts(&mut self) {
-        let now = Instant::now();
-        let sessions: Vec<(u64, i32)> = self
-            .pool
-            .iter()
-            .map(|session| (session.id, session.pid))
-            .collect();
-        let fresh = self
-            .consent_observer
-            .take_new_verdicts_for_instance(now, &sessions);
+    ///
+    /// The observer judges only when an answer can have changed, against the
+    /// pool's insert generation: only a session that joined can own a prompt
+    /// nobody owned. An idle park builds no roster and asks the OS nothing;
+    /// the process-group reads go through the observer's injected probe.
+    fn announce_observed_consent_prompts(&mut self, now: Instant) {
+        let pool = &self.pool;
+        let fresh =
+            self.consent_observer
+                .take_new_verdicts_for_instance(now, pool.insert_epoch(), || {
+                    pool.iter()
+                        .map(|session| (session.id, session.pid))
+                        .collect()
+                });
         if fresh.is_empty() {
             return;
         }
@@ -18371,9 +19079,10 @@ impl App {
     // -----------------------------------------------------------------------
 
     /// Fold one observed consent fact through the rate-limiting gate and ACT on
-    /// what it decides. In FULL mode (`[privacy] observer = true`): raise the
-    /// tab mark, post AT MOST ONE native notification through `notify.rs`'s
-    /// existing bounded queue, and re-render the menu-bar glance. In every
+    /// what it decides. In FULL mode (`[privacy] observer = true` under the
+    /// master switch, [`Self::effective_observer_mode`]): raise the tab mark,
+    /// post AT MOST ONE native notification through `notify.rs`'s existing
+    /// bounded queue, and re-render the menu-bar glance. In every
     /// other mode only the menu-bar refresh: the tab mark and the banner
     /// repeat what the access card's one question says, and a banner that
     /// repeats what is on screen is the non-actionable alert the owner ruled
@@ -18386,7 +19095,7 @@ impl App {
         let outcome = self
             .consent_attention
             .note(event)
-            .for_mode(self.config.privacy_observer_mode());
+            .for_mode(self.effective_observer_mode());
         if let Some(session) = outcome.raise_tab {
             self.raise_consent_tab_attention(session);
         }
@@ -18417,8 +19126,8 @@ impl App {
     /// Only a path under a configured protected root is a consent fact — anything
     /// else is an ordinary refusal this path has no business announcing.
     pub(crate) fn note_protected_read(&mut self, session: u64, path: &std::path::Path) {
-        let roots = self.config.privacy_protected_roots();
-        if aterm_containment::consent::is_under_protected_root(path, &roots) {
+        let policy = self.consent.policy();
+        if aterm_containment::consent::is_under_protected_root(path, policy.protected_roots()) {
             self.note_protected_eperm(Some(session));
         }
     }
@@ -19432,8 +20141,17 @@ impl App {
     /// the pane reported and whether another program holds it, for a spawn that
     /// runs the check off the event loop (`tab_spawn`).
     fn focused_pane_folder(&self, wid: WindowId) -> Option<spawn_folder::PaneFolder> {
+        self.session_by_id(self.focused_session_id(wid)?)
+            .and_then(Self::session_folder)
+    }
+
+    /// The folder session `s` hands a spawn ([`spawn_folder::PaneFolder`]):
+    /// the one reader every spawn that starts in a pane's folder takes (a New
+    /// Tab or split from the focused pane, a connected spawn from its origin),
+    /// so none reads the engine's cwd raw. `None` when the pane reported no
+    /// folder (or an empty one).
+    fn session_folder(s: &Session) -> Option<spawn_folder::PaneFolder> {
         use crate::cwd_native::ReportedCwd as _;
-        let s = self.session_by_id(self.focused_session_id(wid)?)?;
         // Native form, not the engine's RFC 8089 URI path: this string becomes
         // `Command::current_dir`, and on Windows `/C:/Users//x` names a directory
         // `C:` under the current drive's root, so the spawn would fail (or land
@@ -19441,6 +20159,7 @@ impl App {
         let site = metrics::TermWaitSite::Press;
         let reported = term_lock_ui(&s.term, &s.ctx.ui_waiting, site)
             .native_working_directory()
+            .filter(|cwd| !cwd.is_empty())
             .map(|cwd| cwd.into_owned())?;
         Some(spawn_folder::PaneFolder {
             reported,
@@ -19588,7 +20307,9 @@ impl App {
         if front_changed {
             // Park the outgoing session's learned link estimate and install the incoming
             // one. `take_link_estimate` clears the predictor as `reset_session` would;
-            // only the RTT/latch knowledge follows the session.
+            // only the RTT/latch knowledge follows the session, with the bindings its
+            // line editor taught (Home, End, Ctrl-A, Ctrl-E, Delete), which the
+            // estimate carries.
             if let Some(front_content::FrontContent::Terminal { session, .. }) = previous_front {
                 link_estimates.insert(session, ws.predictor.take_link_estimate());
             } else {
@@ -19802,6 +20523,7 @@ impl App {
         // live state the same way.
         self.publish_front_hold(front);
         menu::set_needs_in_windows(self.presence_rim_on());
+        menu::set_stats_bars_form(self.stats_bars_form());
         let next_active = focused_session.and_then(|session| {
             self.pool.get(session).map(|live| control::ActiveSession {
                 term: live.term.clone(),
@@ -19884,7 +20606,7 @@ impl App {
     /// `Session::drop` is a no-op — no real PTY), `frontmost = WindowId(0)`,
     /// `next_window_id = 1`, `next_session_id = 1`, `headless = true`, `proxy = None`
     /// (no event loop in a unit test). Every other field is the cheapest REAL value
-    /// (a real CPU backend, registry, subscriber + image queues), so the tested seams
+    /// (a real CPU backend, session registry, subscriber registry), so the tested seams
     /// — `insert_logical_window` / `install_window_state` / `close_window_logical` —
     /// exercise the genuine windows/pool/frontmost/`CloseOutcome` logic. It NEVER
     /// touches `proxy`/`session_factory` (no spawn), so `None`/an empty factory is
@@ -19939,8 +20661,6 @@ impl App {
 
         let store = session_store::new_store();
         App::register_session(&store, &session0, None);
-        let subscribers = subscribe::new_registry();
-        let image_queue: control::ImageQueue = Arc::new(Mutex::new(VecDeque::new()));
 
         let active_handle: control::ActiveHandle =
             Arc::new(Mutex::new(Some(control::ActiveSession {
@@ -20003,9 +20723,13 @@ impl App {
             fg_gone: crate::foreground_handback::group_gone,
             program_probe: crate::quit_safety::shell_runs_program_since,
             lone_leader: |_| None,
+            handed_terminal: |_| false,
             edge_image: crate::holder_image::unread,
             edge_inbox: crate::holder_image::EdgeInbox::default(),
             byte_arm: cfg!(unix),
+            #[cfg(unix)]
+            proc_watch: |_| None,
+            card_probe: false,
             rekey_deferred: None,
             spare: None,
             #[cfg(windows)]
@@ -20140,6 +20864,8 @@ impl App {
             #[cfg(all(test, unix))]
             handoff_before_egress_fence: None,
             #[cfg(all(test, unix))]
+            handoff_commit_answers_took: None,
+            #[cfg(all(test, unix))]
             handoff_before_host_resume: None,
             #[cfg(all(test, target_os = "macos"))]
             handoff_activations: Vec::new(),
@@ -20148,7 +20874,6 @@ impl App {
             video_reply_wires: Vec::new(),
             active_handle,
             store,
-            subscribers,
             backend,
             introspect_gpu: aterm_gpu::WindowGpu::new(),
             font_px: FONT_PX,
@@ -20261,6 +20986,8 @@ impl App {
             handoff_commit: None,
             handoff_reader_gate: None,
             handoff_control_preparation: None,
+            #[cfg(unix)]
+            recovery_count_admission: Arc::default(),
             incoming_handoff_pending: false,
             nudges: app_nudge::NudgeHost::new(aterm_core::terminal::repaint_nudge::Mode::Off),
             nudge_wake_ms: None,
@@ -20297,13 +21024,15 @@ impl App {
             close_confirm: app_window::CloseConfirm::Interactive,
             frame_interval: MIN_FRAME_INTERVAL,
             bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
+            alert_sound: count_alert_sound_for_test,
             trail_audio: trail_audio::TrailAudio::new(false),
             typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice::default(),
             lock_modifiers: keymap::no_lock_modifiers,
             user_input_recent: platform::no_recent_user_input_event,
+            option_only: platform::no_option_only,
             #[cfg(target_os = "macos")]
             app_menu_bar: app_menu_bar::no_app_menu_bar,
-            consent: control_privacy::ConsentState::inert(),
+            consent: consent_state::ConsentState::inert(),
             consent_warmup: consent_warmup::WarmupState::inert(),
             consent_launch: consent_launch::LaunchConsent::new(true),
             claimant_retire: consent_retire::RetireState::new(true),
@@ -20316,13 +21045,13 @@ impl App {
             owner_quiet: native_settings::SharedOwnerQuiet::default(),
             consent_observer: consent_observer::ObserverState::inert(),
             consent_attention: consent_observer::AttentionGate::new(),
-            consent_observer_started: false,
+            consent_observer_reconciled: false,
             consent_card: consent_card::CardState::new(),
             consent_card_host: consent_card::CardHost::default(),
             consent_card_config: None,
-            image_queue,
             deferred_gpu_captures: std::collections::VecDeque::new(),
             replaying_gpu_capture: None,
+            capture_barrier: None,
             capture_present_budget: app_introspect::CapturePresentBudget::default(),
             encode_tx: None,
             capture_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -20330,6 +21059,9 @@ impl App {
             trace_latency: false,
             lat_epoch: Instant::now(),
             output_wake_watch: crate::spawn::OutputWakeWatch::default(),
+            wake_census: crate::metrics::wakes::WakeCensus::default(),
+            deadline_healer: crate::deadline_heal::DeadlineHealer::default(),
+            present_observer: crate::metrics::PresentObserver::default(),
             notify_suppress,
             notify_silent,
             notify_own_alerts,
@@ -20349,6 +21081,7 @@ impl App {
             fleet_glance: None,
             fleet_heralded: std::collections::HashMap::new(),
             status_carry: std::collections::HashMap::new(),
+            end_carry: std::collections::HashMap::new(),
             fleet_adopt: None,
             pending_deminiaturize_focus: None,
             _toolbars: BTreeMap::new(),
@@ -20386,6 +21119,8 @@ impl App {
             messages_log: None,
             messages_last_publish: None,
             messages_published_revision: 0,
+            messages_words_change_in: None,
+            messages_words_offset_s: 0,
             demotions_logged: 0,
             ripening: Vec::new(),
             host_noted: std::collections::BTreeSet::new(),
@@ -20486,6 +21221,8 @@ impl App {
             update_handoff_prelaunch: None,
             #[cfg(target_os = "macos")]
             own_launch_record: None,
+            #[cfg(target_os = "macos")]
+            launch_record_renewal: launch_record_renewal::LaunchRecordRenewal::new(None),
             #[cfg(unix)]
             launch_image_kept: false,
             #[cfg(target_os = "macos")]
@@ -20500,6 +21237,7 @@ impl App {
             status_dirty: false,
             harness_glass: std::collections::HashMap::new(),
             autopilot_timers: autopilot_timers::AutopilotTimers::default(),
+            autopilot_recorded: std::collections::HashMap::new(),
             autopilot_menu: None,
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
@@ -20509,6 +21247,8 @@ impl App {
             #[cfg(unix)]
             cold_lane_layout_debt: app_update_handoff::ColdLaneLayoutDebt::default(),
             deferred_reader_resume_at: None,
+            #[cfg(unix)]
+            owed_parked_winsizes: Vec::new(),
             upgrade_realized: None,
             realized_bucket_seen: 0,
             present_cost_ema_ns: None,
@@ -21014,7 +21754,10 @@ impl App {
         // window's own writer keeps, `App::autopilot_pair_written`): the
         // Settings ▸ Harness publish reads the index (`App::harness_state`,
         // its rows' glass), and indexed after it, the page's row lagged the
-        // chip's `∞ ⤓04:22` until the next publish.
+        // chip's `∞ ⤓04:22` until the next publish. The timer the write
+        // dropped is read before that, as the window's own writer reads it
+        // (`App::autopilot_pair_written`): the record below names it.
+        let dropped = self.autopilot_timers.glass(session);
         self.index_autopilot_timer(session, None);
         // The footer's Autopilot chip and the harness card read the
         // session's word and whether this host's claim is live: a
@@ -21032,6 +21775,11 @@ impl App {
         // the crash journal carries it at once, never after the write
         // interval (`App::journal_owner_words`; any other field owes nothing).
         self.journal_owner_words(session);
+        // …and leaves the keyed record a window write leaves, naming who set
+        // it (`over aterm ctl`, design §11.7.3, item 3): only where the pair
+        // moved since the last record, so a wake for any other field records
+        // nothing.
+        self.record_wire_autopilot(session, dropped);
     }
 
     /// The `Wake::Output` arm: session `session` produced output (its reader
@@ -21083,15 +21831,6 @@ impl App {
         // Bulk scrollback maintenance never runs here; only the OS-pressure arm does
         // (`scrollback_maintenance_lane`).
         self.route_bulk_scrollback_maintenance(ScrollbackMaintenanceEvent::OrdinaryOutput, false);
-        // Wake every subscriber of this session (single-slot `try_send`, never blocking
-        // this thread). Unconditional, after status publication; skips the mutex with
-        // one atomic load when nobody subscribes.
-        if self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(session);
-        }
         // A partial scroll above a protected footer renumbers rows piecewise, so refresh
         // an active search before presenting (visible sessions only).
         if session_visible {
@@ -21376,6 +22115,8 @@ impl App {
             // one is modal over pointer and keyboard. Here because `close_tab_menu`
             // needs the whole `App`.
             self.close_tab_menu(wid);
+            // Any stats lens closes on focus loss (§12.2).
+            self.close_stats_lens(wid);
         }
         // Read before borrowing the window (`pre_commit_focus_loss_reorders_queue`).
         let reorders_pre_commit_queue = !focused && self.pre_commit_focus_loss_reorders_queue(wid);
@@ -21610,31 +22351,36 @@ impl App {
     /// BEL reached a tab's engine: beep (rate-limited), flash, and request urgent
     /// attention when the window is unfocused or the bell came from a background tab.
     /// `bell_sound` gates only the beep; flash, phosphor alert and attention stay.
-    fn on_bell(&mut self, window: WindowId, session: u64) {
+    /// A headless instance never beeps. `now` is the bell's arrival (the
+    /// dispatcher's `Instant::now()`), passed in so a test drives the rate-limit
+    /// gate at a known instant.
+    fn on_bell(&mut self, window: WindowId, session: u64, now: Instant) {
         // The `Wake::Bell` spawn stamp `window` may be stale (a migrate/detach moved
         // the session's tab to another window), so we do not trust it for the flash.
         let _ = window;
-        let now = Instant::now();
         // Gate order matters: `BellRateLimiter::try_fire` consumes a token, so the
-        // serious-mode and `bell_sound` checks run first and a silenced bell never
-        // burns it. Config is read live per bell.
-        if self
-            .serious_mode_policy()
-            .allows(crate::motion::SeriousEffect::TerminalSound)
+        // headless, serious-mode and `bell_sound` checks run first and a silenced
+        // bell never burns it. Config is read live per bell.
+        //
+        // HEADLESS NEVER BEEPS. A `--headless` instance has no window, so nobody is
+        // looking at the terminal the bell rang in, and the alert sound came out of
+        // the Mac's speakers with nothing on screen to say why. The trail synth
+        // stays closed headless for the same reason (`trail_audio.replace(!headless)`),
+        // as DESIGN-host-boundary §5 invariant 14 keeps the moved effects code off
+        // AppKit in a headless-constructible App.
+        // Measured 2026-10-20 from systemsoundserverd's own log (one `Incoming
+        // Request` per alert sound, naming the client pid), over the 18.5 h the log
+        // held (2026-10-19 14:49 to 2026-10-20 09:20): of the 71 alert sounds aterm
+        // played, 70 came from headless dev instances (labs, live tests, checks)
+        // whose programs rang BEL, one from the person's app.
+        if !self.headless
+            && self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::TerminalSound)
             && self.config.bell_sound_or_default()
             && self.bell_beep.try_fire(now)
         {
-            // The user's configured macOS alert sound. AppKit is already
-            // in-process (winit); safe to call from the main thread. `NSBeep`
-            // is a C function, not a message, so `appkit::beep` is a plain
-            // call with no receiver, no selector and no `unsafe` at this site —
-            // see its binding for why that is sound rather than merely tidy.
-            #[cfg(target_os = "macos")]
-            crate::appkit::beep();
-            // Windows twin: the default system sound (honours the user's sound
-            // scheme, including a muted one), behind the same rate-limit gate.
-            #[cfg(windows)]
-            win32::beep();
+            (self.alert_sound)();
         }
         // Background iff this session is not in a visible pane of any window's
         // active tab (the focused pane OR a split sibling) — the generalized
@@ -22764,6 +23510,7 @@ impl App {
                         crate::recovery_census::record(
                             aterm_update::recovery_ledger::LaunchKind::Successor,
                             None,
+                            crate::keeper_link::at_commit(),
                         );
                     }
                     // The PTY keeper (P3, opt-in): the successor registers
@@ -22871,10 +23618,16 @@ impl App {
     }
 
     /// Resume handoff-parked readers without ever joining a still-running handle
-    /// on the event loop. The retry is owned by winit's existing `WaitUntil`
-    /// deadline, so thread-spawn/resource failure cannot strand a parked PTY.
+    /// on the event loop, each owed PTY size put back first without ever waiting
+    /// on an engine. The retry is owned by winit's existing `WaitUntil`
+    /// deadline, so thread-spawn/resource failure or a busy engine cannot strand
+    /// a parked PTY.
     fn resume_deferred_readers_nonblocking(&mut self) {
-        if self.attach_deferred_readers() {
+        #[cfg(unix)]
+        let sized = self.reassert_owed_winsizes();
+        #[cfg(not(unix))]
+        let sized = true;
+        if self.attach_deferred_readers() && sized {
             self.deferred_reader_resume_at = None;
             return;
         }
@@ -23027,19 +23780,27 @@ impl App {
         // Timeline record first (see the order contract above). Deduped per
         // actual cwd change inside `record_cwd_change`, so a title-only drift
         // records nothing and the ring fills at `cd` rate.
-        let (cwd_changed, log_owed) = {
+        let cwd_changed = {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let before = timeline.high_id();
             timeline.record_cwd_change(live_cwd.as_deref());
             // The session log's `title` mark (phase 3B), in the same hold: the
             // informative title as the tab shows it (Git Bash's home read
-            // `~`), a spinner frame's move aside.
+            // `~`), a spinner frame's move aside. An owed wake rings the
+            // session's watchers under this lock (`slog_take_wake`).
             let at = timeline.slog().now();
             let shown = crate::tab_label::informative(&live_title).to_string();
             timeline.slog_mut().observe_title(&shown, at);
-            (timeline.high_id() != before, timeline.slog_take_wake())
+            let _ = timeline.slog_take_wake();
+            timeline.high_id() != before
         };
-        self.wake_log_watchers(session, log_owed);
+        // A new directory spelled with 8.3 short names is spelled long off
+        // this thread, so `status disk=` places the tab with no watch's look
+        // (`harness_host::disk_cwd_reported`: a pure test here, and for such
+        // a spelling a queue push; no file system is asked on this thread).
+        if cwd_changed {
+            crate::harness_host::disk_cwd_reported(session, live_cwd.as_deref());
+        }
         let force_chrome_refresh = self.session_chrome_retry.remove(&session);
         // Strip/chrome refresh for every window where this session is the
         // focused pane (the strip label) of some tab and the window's cached
@@ -23241,8 +24002,9 @@ impl ApplicationHandler<Wake> for App {
         let _root = (!matches!(cause, StartCause::Init))
             .then(|| crate::watchdog::enter(crate::watchdog::Breadcrumb::NewEvents));
         // First in the turn, before any handler can read or write one: the
-        // automatic-update deadlines count the time the Mac slept since the last.
-        self.count_sleep_toward_update_deadlines(Instant::now(), std::time::SystemTime::now());
+        // automatic-update deadlines and the Messages page's clock count the
+        // time the Mac slept since the last.
+        self.count_sleep_since_last_turn(Instant::now(), std::time::SystemTime::now());
         // A contained NSException since the last turn is an event: whatever the
         // contained method was answering, it answered "nothing", so re-request.
         #[cfg(target_os = "macos")]
@@ -23273,6 +24035,8 @@ impl ApplicationHandler<Wake> for App {
         // The stats Deck's reading, a level too: a due one is asked for and a
         // snapshot the probe thread left is taken, whichever cause woke the loop.
         self.service_vitals(Instant::now());
+        // The stats lens's rest and leave, a level too.
+        self.service_stats_lens(Instant::now());
         let present_now = Instant::now();
         let app_frame_interval = self.frame_interval;
         for ws in self.windows.values_mut() {
@@ -23517,24 +24281,32 @@ impl ApplicationHandler<Wake> for App {
         self.drain_message_inbox();
         // A document nothing holds any more leaves memory (§5.10).
         self.release_documents_at_park();
-        // THE CONSENT OBSERVER'S ONE-SHOT START (design §3.6). Off unless
-        // `[privacy] observer` says otherwise, so on every shipping config this
-        // is one `bool` test and nothing else — and the latch makes it exactly
-        // one attempt per process either way. Placed here rather than at window
-        // attach because the observer is an instance fact, not a window one.
-        if !self.consent_observer_started
-            && self.effective_observer_mode() != consent_observer::ObserverMode::Off
-        {
-            let _ = self.start_consent_observer();
+        // THE CONSENT OBSERVER'S FIRST RECONCILE (design §3.6): once per
+        // process, whatever it decides; after it a park costs one `bool` test.
+        // Placed here rather than at window attach because the observer is an
+        // instance fact, not a window one.
+        if !self.consent_observer_reconciled {
+            self.consent_observer_reconciled = true;
+            let _ = self.reconcile_consent_observer();
         }
-        // Whatever the observer queued since the last wake: one `try_recv`
-        // loop, and a need's arrival must not wait on an unrelated line.
+        // Whatever the observer queued since the last park: one `try_recv`
+        // loop. The observer's own wake is a nudge that lands here, and a
+        // verdict pass runs only when the queue, the roster or the threshold
+        // deadline moved.
         let mut park_now = Instant::now();
         self.poll_consent_observer(park_now);
         // THE macOS ACCESS CARD (design §3.4, amended 2026-09-07) and the
         // debugger-access change lane: settled, each is one compare per park;
         // headless and off-macOS they are nothing at all.
         self.tick_consent_lanes(park_now);
+        // The coding-agent primer's pass the launch took, held off the launch's
+        // path until its first frame is on glass (`spawn::release_held_prime`;
+        // a headless instance has no glass, so its first park). Before the
+        // restore pass, so it is under way before the restore forks the tabs
+        // whose agents the host relaunches. One load once released.
+        if self.headless || self.desk.on_glass(self.first_present_done) {
+            spawn::release_held_prime();
+        }
         // Deferred session restore, once window 0 has painted: rebuild extra
         // tabs/panes/windows and place any leftover adopted shells, then repaint.
         // A cold launch's runs a slice per park until drained; the rest once.
@@ -23710,6 +24482,12 @@ impl ApplicationHandler<Wake> for App {
             aterm_update::set_automatic_apply(lands_by_itself);
             self.update_lands_by_itself_reported = lands_by_itself;
         }
+        // On the ON→off edge a launch-record renewal ends too: it replaces this process
+        // only while the automatic lane may, so one in flight stands down before its park.
+        #[cfg(target_os = "macos")]
+        if !auto_apply_on && self.auto_apply_was_on {
+            self.end_launch_record_renewal_for_updates_off();
+        }
         self.auto_apply_was_on = auto_apply_on;
         // A person's Install held for the candidate's pre-park read runs once
         // that read ends (`App::run_held_person_apply`), ahead of the automatic
@@ -23722,6 +24500,12 @@ impl ApplicationHandler<Wake> for App {
             .is_some_and(|intent| park_now >= intent.retry_at)
         {
             self.try_pending_native_auto_apply(false);
+        }
+        // A stale LaunchServices record's renewal looks after the automatic lane, so an
+        // update armed in this same turn wins. Its wake is folded below (`AutoApply`).
+        #[cfg(target_os = "macos")]
+        if self.launch_record_renewal.due(park_now) {
+            self.poll_launch_record_renewal(park_now);
         }
         // The update checker's watchdog: a stale heartbeat is logged, warned once and
         // replaced. Its wake is folded below (`UpdateChecker`).
@@ -23770,8 +24554,8 @@ impl ApplicationHandler<Wake> for App {
         // armed (the load-shed latch does not affect functional motion).
         self.settle_reduced_scroll_motion(now);
         // Tick a glide/bounce that came due during this turn's redraw before the fold,
-        // so no past instant is armed (`record_deadline` clamps owners that arm the
-        // past).
+        // so no past instant is armed (the deadline healer clamps owners that arm
+        // the past).
         self.service_due_scroll_motion(now);
         // Output holds (`spawn::OUTPUT_CADENCE_NS`): a due one's pass runs before the
         // folds, so the redraw and status deadlines it moves are folded this turn. A
@@ -24297,6 +25081,16 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::AutoApply,
             );
         }
+        // An armed launch-record renewal's next look.
+        #[cfg(target_os = "macos")]
+        if let Some(d) = self.launch_record_renewal.wake_at() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                d,
+                metrics::DeadlineOwner::AutoApply,
+            );
+        }
         // A person's held Install looks at its read again soon, and never later
         // than its window's end (`App::held_person_apply_deadline`).
         #[cfg(unix)]
@@ -24687,13 +25481,24 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::RenderEpoch,
             );
         }
-        // The stats Deck's next reading: none while no window shows the Deck.
+        // The stats Deck's next reading; with no window showing the Deck, the
+        // jobs engine's own while a suspect agent call stands, else none.
         if let Some(vitals_wake) = self.vitals_deadline() {
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,
                 vitals_wake,
                 metrics::DeadlineOwner::SystemVitals,
+            );
+        }
+        // The stats lens's rest and leave: none unless the pointer rests on an
+        // instrument or a hover lens's pointer has left it.
+        if let Some(lens_wake) = self.stats_lens_deadline() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                lens_wake,
+                metrics::DeadlineOwner::StatsLens,
             );
         }
         // …and the soonest settle still owed, under its own owner: none while no
@@ -24712,8 +25517,8 @@ impl ApplicationHandler<Wake> for App {
             crate::tab_spawn::held_status_wake(self.session_status.next_wake(), status_held)
         {
             // Its own owner label, so spins are attributed to the right producer
-            // (it once shared slot 30's, `Retired30`, and the 2026-08 spin was
-            // charged to the wrong module).
+            // (it once shared the retired `title_summary` owner's, and the
+            // 2026-08 spin was charged to the wrong module).
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,
@@ -24721,9 +25526,12 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::SessionStatus,
             );
         }
-        // Arm the instant `record_deadline` returns: it clamps a stale same-owner arm to
+        // Arm the instant the healer returns: it clamps a stale same-owner arm to
         // `now + STALE_ARM_HEAL_FLOOR`, and only this fold decides what the loop waits on.
-        let deadline = metrics::record_deadline(deadline_owner, deadline, Instant::now());
+        let now = Instant::now();
+        let heal = self.deadline_healer.heal(deadline_owner, deadline, now);
+        metrics::note_deadline(deadline_owner, deadline, now, heal);
+        let deadline = heal.armed;
         match deadline {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -24773,7 +25581,7 @@ impl ApplicationHandler<Wake> for App {
         // Headless: run the engine + control socket + offscreen rendering, but
         // never open a window. The front window keeps `os_window: None`/`present:
         // None`, so `redraw()` is a no-op, and the winit run loop still delivers
-        // `user_event` (Wake::Control for `image`, Wake::Snapshot, Wake::Exit)
+        // `user_event` (Wake::Image for `image`, Wake::Snapshot, Wake::Exit)
         // with no window present.
         if self.headless {
             return;
@@ -24895,9 +25703,12 @@ impl ApplicationHandler<Wake> for App {
             }
         }
 
-        // Overlap handoff: the window was created hidden, and macOS does not reliably
-        // send `RedrawRequested` to hidden windows, so drive the first present directly;
-        // the post-present hook reveals it, or the retry/fallback path takes over.
+        // Overlap handoff: the window was created hidden. `aterm-window` queues
+        // `RedrawRequested` for a hidden window as for any other (`queue_redraw`), so
+        // every window the restore pass rebuilds presents on its redraw request
+        // (measured, round eight's U22); window 0's first present is driven directly
+        // only so it does not wait a run-loop turn for its request. The post-present
+        // hook reveals it, or the retry/fallback path takes over.
         if self.handoff_ready.is_some()
             && self
                 .windows
@@ -24976,10 +25787,17 @@ impl App {
         // `settings set` write), and a hop answered later is not a hop that
         // waits on this thread. Everything below sees the request itself.
         let ev = crate::control::control_media::take_hop(ev);
-        crate::metrics::note_user_wake(&ev);
-        // Any wake but the surface-ready one (which follows every frame) may move a
-        // title, folder or layout for the crash journal's next capture.
-        if !matches!(ev, Wake::GpuSurfaceReady { .. }) {
+        self.wake_census.note(&ev);
+        // Any wake but the surface-ready one (which follows every frame), a
+        // vitals reading or the disk watch's beat (neither moves anything the
+        // journal holds) may move a title, folder or layout for the crash
+        // journal's next capture.
+        if !matches!(
+            ev,
+            Wake::GpuSurfaceReady { .. }
+                | Wake::Vitals
+                | Wake::HostNote(harness_host::HostNote::DiskLooked)
+        ) {
             self.crash_journal.note_activity();
         }
         match update_handoff_wake_class(&ev) {
@@ -25035,8 +25853,8 @@ impl App {
             Wake::ClaudeFooter { session } => {
                 self.on_claude_footer_changed(session);
             }
-            Wake::SessionLogMoved { session, notify } => {
-                self.on_session_log_moved(session, notify);
+            Wake::SessionLogMoved { session } => {
+                self.on_session_log_moved(session);
             }
             Wake::ProtectedRead { session, path } => {
                 self.note_protected_read(session, &path);
@@ -25137,7 +25955,7 @@ impl App {
             // BEL on any tab flashes the (shared) window — the standard
             // "bell on activity" affordance; a background tab's bell additionally
             // requests user attention so off-screen activity still surfaces.
-            Wake::Bell { session, window } => self.on_bell(window, session),
+            Wake::Bell { session, window } => self.on_bell(window, session, Instant::now()),
             // XTWINOPS: apply an engine-authorized window manipulation on the
             // thread that owns the winit windows. Pre-vetted in-core (capability
             // gate, move denial, resize clamps) — see the variant's doc.
@@ -25196,7 +26014,7 @@ impl App {
                         video_capture_translucency_guard(
                             mode,
                             self.render_knobs.background_opacity,
-                            cfg!(target_os = "macos"),
+                            HOST_CAPTURE.compositor_blends_client,
                         )
                     });
                     let began: Result<VideoMode, String> = match mode {
@@ -25353,22 +26171,14 @@ impl App {
                 };
                 let _ = reply.send(line);
             }
-            Wake::Control => {
-                // Drain off-lock, then render each request; encode, write and reply happen
-                // on the single FIFO encode worker. A dead client's send failure is ignored.
-                // Recover a poisoned queue as `term_lock` does.
-                let reqs: Vec<control::ImageReq> = self
-                    .image_queue
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .drain(..)
-                    .collect();
-                for req in reqs {
-                    // Announced to the watchdog; headless, the first capture also redeems
-                    // the pixel backend inside it (which announces its own phase).
-                    let _phase = crate::watchdog::phase(crate::watchdog::Phase::ImageCapture);
-                    self.render_image(req);
-                }
+            // Render the request; encode, write and reply happen on the single FIFO
+            // encode worker, in the order winit delivered the wakes. A dead client's
+            // send failure is ignored.
+            Wake::Image(req) => {
+                // Announced to the watchdog; headless, the first capture also redeems
+                // the pixel backend inside it (which announces its own phase).
+                let _phase = crate::watchdog::phase(crate::watchdog::Phase::ImageCapture);
+                self.render_image(*req);
             }
             // The `chrome` verb wants the frontmost window's native UI (NSToolbar
             // + app menu bar). Only the main thread may touch AppKit, so we read it
@@ -25395,19 +26205,21 @@ impl App {
                 let lines = self.read_pane_layout(session);
                 let _ = reply.send(lines);
             }
-            // The consent posture: main-thread `App` state joined with the
-            // injected probes. A dropped receiver (dead client) just makes
-            // send() fail; ignore.
-            Wake::ReadPrivacy { form, scope, reply } => {
-                let lines = self.read_privacy(form, scope);
-                let _ = reply.send(lines);
+            // The consent posture's App-owned facts; the control worker joins
+            // them with the probe slots. A dropped receiver (dead client) just
+            // makes send() fail; ignore.
+            Wake::ReadPrivacy { scope, reply } => {
+                let _ = reply.send(self.privacy_facts(scope));
             }
-            // Fold warm-up results into the rows and repaint so a just-answered folder
-            // stops reading `asking…`. `drain` only `try_recv`s.
+            Wake::ArmConsentWait { session, reply } => {
+                let _ = reply.send(self.arm_consent_wait(session));
+            }
+            // Fold warm-up results into the rows. `drain` only `try_recv`s. The
+            // park that follows republishes the rows to every Security view,
+            // equality-gated, which repaints a view whose block changed and no
+            // other window.
             Wake::WarmupResult => {
-                if self.consent_warmup.drain() > 0 {
-                    self.request_redraw_all_windows();
-                }
+                self.consent_warmup.drain();
                 // A warm-up folder that came back `EPERM(1)` IS aterm's own
                 // file work denied under a protected root — the observed fact
                 // the attention path (§3.6) exists to surface. Rate-limited to
@@ -25417,10 +26229,9 @@ impl App {
             }
             // A *Move to Trash* finished; the next read takes a fresh census.
             Wake::ClaimantRetired => self.on_claimant_retired(),
-            // The observer queued parsed log events. Fold them; the verdicts
-            // are read on demand by whoever reports `blocked_on=`. Never joins,
-            // never blocks — `drain` is `try_recv` until the queue is empty.
-            Wake::ConsentObserver => self.poll_consent_observer(Instant::now()),
+            // The observer queued parsed log events: a nudge, since the park
+            // this wake ends in drains them.
+            Wake::ConsentObserver => {}
             Wake::GpuSurfaceReady { window, surface } => {
                 let captures_waiting = self.has_deferred_gpu_capture(window);
                 let mut redraw_hidden = false;
@@ -25474,14 +26285,13 @@ impl App {
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             // A nudge only: the park re-reads the hand-over lane's slot.
             Wake::DevToolsHandOver => self.tick_devtools_hand_over(Instant::now()),
-            Wake::ConsentProbeReady => {
-                self.tick_macos_access_card(Instant::now());
-                // Card changes request their own repaint. Ordinary cached
-                // refreshes only need paint when the access panel is visible.
-                if self.native_settings_view_target().is_some() {
-                    self.request_redraw_all_windows();
-                }
-            }
+            // The Full Disk Access answer is in its slot: the card acts on it
+            // here, and the park's `sync_settings_consent_posture` republishes
+            // the Security page, equality-gated.
+            Wake::ConsentProbeReady => self.tick_macos_access_card(Instant::now()),
+            // A nudge only: the census answer is in its slot, and the park's
+            // `sync_settings_consent_posture` republishes the Security page.
+            Wake::ConsentCensusReady => {}
             // The access card's worker finished: decide, on this thread, against
             // the cached probe. Every reason not to show is logged by name so a
             // quiet launch is explicable (`consent_card::NotDue`).
@@ -25820,6 +26630,9 @@ impl App {
             Wake::ActivateCommittedHandoff { mut expected } => {
                 self.incoming_handoff_pending = false;
                 crate::config_watcher::repost_after_commit();
+                // A restored Settings ▸ Harness reads now, as it could not
+                // before the Commit.
+                self.settle_harness_reading_at_commit();
                 // THE PARENT'S LAYOUT IS THIS RUN'S (round seven of the update
                 // audit, findings 5 and 27): the parent is gone through a clean
                 // `_exit` that left its crash journal, and this process had
@@ -26014,6 +26827,9 @@ impl App {
             }
             Wake::LoginNotice { asked, reply } => {
                 let _ = reply.send(self.note_login_notice(&asked));
+            }
+            Wake::CardSeed { asked, reply } => {
+                let _ = reply.send(self.control_card_seed(asked));
             }
             Wake::ControlSecurityPosture { asked, reply } => {
                 let _ = reply.send(self.control_security_posture(&asked));
@@ -26378,9 +27194,13 @@ impl App {
             Wake::AgentUpgrade { rows, kept } => self.apply_host_upgrades(rows, kept),
             Wake::AgentUpgradeWord { ask, result } => self.apply_upgrade_word(&ask, result),
             Wake::HostNote(note) => {
+                // The disk watch's minute beat moves nothing a page shows.
+                let moved = note != harness_host::HostNote::DiskLooked;
                 self.note_harness_host(note);
                 // Settings ▸ Harness, while a view shows it.
-                self.harness_screen_moved();
+                if moved {
+                    self.harness_screen_moved();
+                }
             }
             Wake::HarnessWait { sid, plan } => self.apply_harness_wait(&sid, plan),
             Wake::HarnessFact { sid, fact } => self.apply_harness_fact(&sid, fact),
@@ -26645,14 +27465,6 @@ impl App {
             // An accessibility adapter event (initial-tree request / OS action / deactivate).
             #[cfg(a11y_tree)]
             Wake::Accessibility(event) => self.on_accessibility_event(event),
-            Wake::CursorMoveLicenseClear {
-                session,
-                keep_hand,
-                reply,
-            } => {
-                let canceled = self.clear_move_license_for_session(session, keep_hand);
-                let _ = reply.send(canceled);
-            }
             // Read-only: resolve the frontmost window's AppKit `windowNumber` for
             // the `hwkey` injector, or refuse while a gateway card is open there.
             // Touches no state, writes no bytes, and requests no redraw — a
@@ -26687,6 +27499,10 @@ impl App {
                 let Some(wid) = self.frontmost_window else {
                     return;
                 };
+                // The control fences this window owes, ahead of the whole batch as the
+                // hop had them: `on_focus` below feeds the glow its focus edge without
+                // passing the input seam, which applies them for every other event.
+                self.reconcile_licence(wid);
                 // A fenced batch is applied only while its holder still holds
                 // the claim of the session it lands on, counted until it is.
                 let fenced_ctx = fence.as_ref().and_then(|_| {
@@ -26772,7 +27588,7 @@ impl App {
                 // after the input batch; finish that transaction here.
                 self.escalate_pending_close(el);
                 if let Some(tx) = reply {
-                    let _ = tx.send(outcome); // mirrors the Wake::Control reply
+                    let _ = tx.send(outcome); // a caller that gave up is no error
                 }
             }
             // The X11 paste worker finished a foreign-owner read: deliver through the same
@@ -26989,6 +27805,10 @@ impl App {
         let Some(event) = self.defer_tab_spawn_input(wid, id, event) else {
             return;
         };
+        // The control fences this window owes, before any handler below arms a
+        // licence stamp: one armed first would be wiped by the next frame's look,
+        // though the person's key came after the driven write.
+        self.reconcile_licence(wid);
         // Let this window's native accessibility adapter observe the event (it tracks the window's
         // bounds and focus) before aterm handles it. `&event` borrows; the
         // `match event` below moves it afterward.
@@ -27063,7 +27883,7 @@ impl App {
                     crate::metrics::note_key_arrival_queued(queued_ns);
                     // Arm the typing-hot signal at hardware arrival, before `on_key` takes
                     // the terminal mutex, so those acquisitions already benefit.
-                    crate::metrics::note_typing_hot();
+                    crate::input_hint::arm();
                     // Video keys log: stamp before routing on the frame clock, backdated
                     // the same way, classified by `video_sample_for_key` and routed through
                     // `note_video_ledger_sample` (same window check as the socket path).
@@ -27348,14 +28168,16 @@ mod cg_display {
 
 /// Minimal CoreGraphics FFI for the `window` verb's full-window capture (no
 /// `core-graphics` crate in the workspace). AppKit already links these frameworks.
-/// Pointer types stay opaque (`*mut c_void`) and only pass between CG calls.
+/// Pointer types stay opaque (`*mut c_void`) and only pass between CG calls. The
+/// `CGImage` accessors are `aterm_cg`'s, which its `cg_sdk` test holds to the SDK.
 #[cfg(target_os = "macos")]
 mod cg_capture {
     use std::ffi::c_void;
 
+    pub(crate) use aterm_cg::{CGImageGetHeight, CGImageGetWidth, CGImageRef, CGImageRelease};
+
     /// Opaque CoreGraphics object pointers (we never deref them in Rust — they are
     /// handed back to CG or released).
-    pub(crate) type CGImageRef = *mut c_void;
     pub(crate) type CGContextRef = *mut c_void;
     pub(crate) type CGColorSpaceRef = *mut c_void;
 
@@ -27427,10 +28249,6 @@ mod cg_capture {
             image_option: u32,
         ) -> CGImageRef;
 
-        pub(crate) fn CGImageGetWidth(image: CGImageRef) -> usize;
-        pub(crate) fn CGImageGetHeight(image: CGImageRef) -> usize;
-        pub(crate) fn CGImageRelease(image: CGImageRef);
-
         /// Create the explicitly named destination colour space
         /// (`kCGColorSpaceSRGB` for canonical full-window capture).
         //
@@ -27461,9 +28279,11 @@ mod cg_capture {
         pub(crate) fn CGContextDrawImage(context: CGContextRef, rect: CGRect, image: CGImageRef);
     }
 
-    // The captured CGImage is drawn into an RGBA8 `CGBitmapContext` we own and its packed
-    // buffer read (see `capture_window_pixels`), normalizing any source format, so no
-    // `CFData`/data-provider bindings are needed.
+    // The window photograph is drawn into an RGBA8 `CGBitmapContext` we own and its
+    // packed buffer read (see `capture_window_pixels`), normalizing any source format.
+    // The AppKit chrome bitmap is already sRGB, so its own bytes are copied out of a
+    // `CFData` when their layout is one the encode worker reads (`chrome_pixels_of`,
+    // through `aterm_cg`).
 }
 
 /// The `atpkg` binary co-located with our own executable (`…/Contents/MacOS/atpkg` in the
@@ -30682,19 +31502,105 @@ mod live_switch_tests {
 /// first-run row and its first update without a window. Any value turns it on.
 const HEADLESS_PKG_LANE_SEAM: &str = "ATERM_DEBUG_HEADLESS_PKG_LANE";
 
+/// The development seam that runs the coding-agent primer (`spawn::prime_agents_if_due`)
+/// in a headless instance too, so a live measurement can time a launch whose pass runs
+/// without a window. Any value turns it on, under [`headless_agent_prime_runs`].
+const HEADLESS_AGENT_PRIME_SEAM: &str = "ATERM_DEBUG_HEADLESS_AGENT_PRIME";
+
+/// Whether this headless instance runs the coding-agent primer: only under
+/// [`HEADLESS_AGENT_PRIME_SEAM`] and [`headless_seam_admits`], and with a `$XDG_CONFIG_HOME`
+/// that keeps the primer off the person's files ([`xdg_config_is_scratch`]): the primer
+/// writes an agent's `.config/` row under that folder (Muse Code's `AGENTS.md`), so a
+/// scratch `$HOME` beside the person's own `XDG_CONFIG_HOME` would still write theirs.
+fn headless_agent_prime_runs() -> bool {
+    headless_seam_admits(aterm_types::dev_seam!(HEADLESS_AGENT_PRIME_SEAM).is_some())
+        && xdg_config_is_scratch(
+            std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+            aterm_types::dirs::home_dir().as_deref(),
+            atpkg::platform::account_home().as_deref(),
+        )
+}
+
+/// Whether `xdg` (`$XDG_CONFIG_HOME`; `None` when unset or empty, as the primer reads it)
+/// keeps the primer's `.config/` rows off the account's files: unset, so they resolve under
+/// the scratch `home`; or a folder that exists and, all three resolved, lies outside the
+/// `account` home, or inside a `home` that lies inside the account's (a scratch home in
+/// the account's tree; one above the account's own holds its files too). A folder that
+/// does not resolve, or an account home that does not, is refused.
+fn xdg_config_is_scratch(
+    xdg: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    account: Option<&std::path::Path>,
+) -> bool {
+    let Some(xdg) = xdg else {
+        return true;
+    };
+    let resolved = |path: Option<&std::path::Path>| path.and_then(|p| p.canonicalize().ok());
+    let (Some(xdg), Some(account)) = (resolved(Some(xdg)), resolved(account)) else {
+        return false;
+    };
+    !xdg.starts_with(&account)
+        || resolved(home).is_some_and(|home| {
+            home != account && home.starts_with(&account) && xdg.starts_with(home)
+        })
+}
+
 /// Whether this instance runs the package lane: a window always, a headless instance only
-/// under [`HEADLESS_PKG_LANE_SEAM`], a private state root
-/// ([`aterm_types::dirs::runs_under_private_state_root`], so its passes leave the machine's
-/// `[machine]` settings alone) and a scratch `$HOME` ([`home_is_scratch`]), so no headless
-/// instance ever runs a pass against the person's own store.
+/// under [`HEADLESS_PKG_LANE_SEAM`] and [`headless_seam_admits`].
+///
+/// ON WINDOWS a scratch home does not move the store: atpkg's prefix is
+/// `%LOCALAPPDATA%\aterm\pkg` ([`atpkg::store::default_prefix`]) or a configured
+/// `[packages].prefix`, neither of which a scratch `USERPROFILE` touches, so there the store
+/// the passes would run against ([`atpkg::store::resolve_configured`], which the co-located
+/// `atpkg` child resolves alike from the same environment) must itself lie inside the
+/// scratch home ([`store_is_under`]).
 fn pkg_lane_runs(headless: bool) -> bool {
     !headless
-        || (aterm_types::dev_seam!(HEADLESS_PKG_LANE_SEAM).is_some()
-            && aterm_types::dirs::runs_under_private_state_root()
-            && home_is_scratch(
-                aterm_types::dirs::home_dir().as_deref(),
-                atpkg::platform::account_home().as_deref(),
-            ))
+        || (headless_seam_admits(aterm_types::dev_seam!(HEADLESS_PKG_LANE_SEAM).is_some())
+            && (!cfg!(windows)
+                || aterm_types::dirs::home_dir()
+                    .zip(atpkg::store::resolve_configured())
+                    .is_some_and(|(home, layout)| store_is_under(&layout.prefix, &home))))
+}
+
+/// Whether a headless development seam that is `set` reaches this instance: only under a
+/// private state root ([`aterm_types::dirs::runs_under_private_state_root`], so a package
+/// pass leaves the machine's `[machine]` settings alone) and a scratch `$HOME`
+/// ([`home_is_scratch`]), so no headless instance ever writes the person's own store or
+/// the agents' files in their home (the primer's seam also asks for a scratch
+/// `$XDG_CONFIG_HOME`, [`headless_agent_prime_runs`]).
+fn headless_seam_admits(set: bool) -> bool {
+    set && aterm_types::dirs::runs_under_private_state_root()
+        && home_is_scratch(
+            aterm_types::dirs::home_dir().as_deref(),
+            atpkg::platform::account_home().as_deref(),
+        )
+}
+
+/// Whether the package store at `store` lies inside the existing physical `home`, both
+/// resolved: `store` through its nearest existing ancestor (a store not made yet is placed
+/// by where it would be made, and a link on the way is followed), the rest of it plain
+/// names. A home that cannot be resolved, or a rest that is not plain names (`..`), proves
+/// nothing.
+fn store_is_under(store: &std::path::Path, home: &std::path::Path) -> bool {
+    use std::path::Component;
+    let Ok(home) = home.canonicalize() else {
+        return false;
+    };
+    for at in store.ancestors() {
+        let Ok(placed) = at.canonicalize() else {
+            continue;
+        };
+        let Ok(rest) = store.strip_prefix(at) else {
+            return false;
+        };
+        return rest.components().all(|c| matches!(c, Component::Normal(_)))
+            && placed.starts_with(&home);
+    }
+    false
 }
 
 /// Whether the existing physical `home` (`$HOME`, which the package store resolves under)
@@ -30740,6 +31646,104 @@ mod headless_pkg_lane_tests {
         assert!(!home_is_scratch(Some(&scratch), Some(&missing)));
         assert!(!home_is_scratch(Some(&scratch), None));
         assert!(!home_is_scratch(None, Some(&account)));
+    }
+
+    /// THE PRIMER'S SEAM NEEDS A SCRATCH `$XDG_CONFIG_HOME` TOO: unset, beside the scratch
+    /// home, or inside a scratch home in the account's tree. NEGATIVE CONTROLS — each the
+    /// person's own config folder under a scratch home: the account's `.config`, the same
+    /// reached through a link, one inside a "scratch" home that holds the account's home,
+    /// a folder that is not there, and an account home that is not.
+    #[test]
+    fn the_primers_headless_seam_needs_a_scratch_config_folder() {
+        use super::xdg_config_is_scratch as admits;
+        let dir = aterm_tempfile::TempDir::new().expect("owned homes");
+        let root = dir.path().join("users");
+        let account = root.join("account");
+        let beside = dir.path().join("scratch");
+        let inside = account.join("tmp/scratch");
+        for folder in [
+            account.join(".config"),
+            beside.join("home"),
+            beside.join("cfg"),
+            inside.join("home/.config"),
+        ] {
+            std::fs::create_dir_all(folder).expect("folders");
+        }
+        let own = account.join(".config");
+        let home = beside.join("home");
+        assert!(admits(None, Some(&home), Some(&account)), "unset");
+        assert!(admits(
+            Some(&beside.join("cfg")),
+            Some(&home),
+            Some(&account)
+        ));
+        assert!(admits(
+            Some(&inside.join("home/.config")),
+            Some(&inside.join("home")),
+            Some(&account)
+        ));
+        assert!(!admits(Some(&own), Some(&home), Some(&account)));
+        assert!(!admits(
+            Some(&own),
+            Some(&inside.join("home")),
+            Some(&account)
+        ));
+        assert!(
+            !admits(Some(&own), Some(&root), Some(&account)),
+            "a home above the account's holds its files"
+        );
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("config-alias");
+            std::os::unix::fs::symlink(&own, &alias).expect("config alias");
+            assert!(!admits(Some(&alias), Some(&home), Some(&account)));
+        }
+        assert!(!admits(
+            Some(&beside.join("missing")),
+            Some(&home),
+            Some(&account)
+        ));
+        assert!(!admits(Some(&beside.join("cfg")), Some(&home), None));
+        assert!(!admits(
+            Some(&beside.join("cfg")),
+            Some(&home),
+            Some(&root.join("missing"))
+        ));
+    }
+
+    /// THE STORE ITSELF MUST LIE INSIDE THE SCRATCH HOME (Windows' gate): a store not
+    /// made yet inside it is placed by where it would be made. NEGATIVE CONTROLS — each
+    /// the person's own store under a scratch home, as on Windows, where atpkg's store
+    /// follows `%LOCALAPPDATA%`, not the home: a store beside the home, one spelled into
+    /// the home and out again with `..`, one reached through a link (a junction on Windows)
+    /// inside the home that leads out, and a home that is not there.
+    #[test]
+    fn a_headless_lane_runs_only_over_a_store_inside_its_scratch_home() {
+        use super::store_is_under;
+        let dir = aterm_tempfile::TempDir::new().expect("owned homes");
+        let scratch = dir.path().join("scratch");
+        let real = dir.path().join("LocalAppData");
+        std::fs::create_dir(&scratch).expect("scratch");
+        std::fs::create_dir(&real).expect("the person's own local app data");
+        let pkg = |base: &std::path::Path| base.join("aterm").join("pkg");
+        assert!(store_is_under(
+            &pkg(&scratch.join("AppData").join("Local")),
+            &scratch
+        ));
+        assert!(store_is_under(&scratch, &scratch));
+        assert!(!store_is_under(&pkg(&real), &scratch));
+        assert!(!store_is_under(
+            &pkg(&scratch.join("..").join("LocalAppData")),
+            &scratch
+        ));
+        assert!(!store_is_under(
+            &scratch.join("not-made").join("..").join("..").join("x"),
+            &scratch
+        ));
+        let out = scratch.join("out");
+        atpkg::platform::atomic_symlink(&real, &out).expect("a link leading out");
+        assert!(!store_is_under(&pkg(&out), &scratch));
+        assert!(!store_is_under(&pkg(&scratch), &dir.path().join("missing")));
     }
 }
 
@@ -31088,14 +32092,14 @@ fn post_macos_access_card_facts(
     std::thread::Builder::new()
         .name("aterm-macos-access-card".into())
         .spawn(move || {
-            let _ = control_privacy::signing_identity();
+            let _ = signing_identity::signing_identity();
             let marker = consent_card::read_marker(config.as_deref());
             let record = consent_card::read_record(config.as_deref());
             let here = aterm_containment::consent::host_uuid();
             let verified_here = consent_card::verified_here(
                 config.as_deref(),
                 here.as_deref(),
-                control_privacy::running_bundle_id(),
+                signing_identity::running_bundle_id(),
             );
             let _ = proxy.send_event(Wake::MacosAccessCardDecided {
                 marker,
@@ -31482,7 +32486,7 @@ fn linux_launch_without_a_window(headless: bool) -> bool {
         // (round eight of the update audit, the review of #82).
         aterm_update::linux_capture_executable();
         // Only a windowed launch asks the display server.
-        match linux_trial_start(headless, !headless && a_display_server_answers()) {
+        match linux_trial_start(headless, !headless && display_answered()) {
             LinuxTrialStart::Window => false,
             LinuxTrialStart::Session => {
                 let _ = aterm_update::linux_session_started(
@@ -31663,10 +32667,12 @@ fn display_endpoint_answers(endpoint: &DisplayEndpoint) -> bool {
         }
         #[cfg(not(target_os = "linux"))]
         DisplayEndpoint::AbstractX11(_) => false,
+        // Read from the descriptor itself, never a path of its number (`/proc/self/fd`
+        // names nothing off Linux, and Darwin's `/dev/fd` reads an open descriptor as
+        // closed while anything else looks the number up).
         DisplayEndpoint::Inherited(fd) => {
             use std::os::unix::fs::FileTypeExt as _;
-            std::fs::metadata(format!("/proc/self/fd/{fd}"))
-                .is_ok_and(|md| md.file_type().is_socket())
+            aterm_uds::spawnfd::descriptor_metadata(*fd).is_ok_and(|md| md.file_type().is_socket())
         }
         DisplayEndpoint::Remote => false,
     }
@@ -31675,7 +32681,8 @@ fn display_endpoint_answers(endpoint: &DisplayEndpoint) -> bool {
 /// Whether a display server ANSWERS where the window will connect
 /// ([`display_endpoints_from`], [`display_endpoint_answers`]): what decides whether a
 /// windowed launch is counted as a window start of a Linux trial at the boot apply
-/// ([`linux_trial_start`]), or only once its display has opened.
+/// ([`linux_trial_start`]), or only once its display has opened, and whether session 0
+/// forks before the event loop's build ([`loop_before_session0`]).
 ///
 /// Round six counted a windowed launch as a start whenever a display VARIABLE was set
 /// (`display_is_reachable_from`), and the boot apply counts it before the event loop
@@ -32536,6 +33543,8 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
             bloom: aurora && config.cursor_trail_bloom_or_default(),
             hdr_glow: aurora && config.hdr_glow_or_default(),
             sdr_glow: aurora && config.cursor_glow_sdr_boost_or_default() > 0.0,
+            // The Claude card draws on fx layers (Exact) when it is on.
+            fx: config.claude_footer_card(),
         };
         let _ = crate::qos::spawn_lane_thread(
             "aterm-metal-warm",
@@ -33068,13 +34077,26 @@ fn warm_prologue(
             )
         })
         .and_then(|dir| dir.to_str().map(str::to_owned));
-    if let Some(path_pair) = spawn::reroute_path_env(
+    let path_pair = spawn::reroute_path_env(
         reroute_dir.as_deref(),
         agents_dir.as_deref(),
         bundle_dir.as_deref(),
         inherited_path.as_deref(),
         bin_dir.as_deref(),
-    ) {
+    );
+    // CLI selection may point at an installed dev app while this release window
+    // stays open. Keep the physical bundle above for askpass and other helpers.
+    let path_pair = aterm_types::cli_path::selected_path(
+        aterm_types::dirs::home_dir().as_deref(),
+        reroute_dir.as_deref(),
+        agents_dir.as_deref(),
+        path_pair
+            .as_ref()
+            .map(|(_, value)| value.as_str())
+            .or(inherited_path.as_deref()),
+    )
+    .or(path_pair);
+    if let Some(path_pair) = path_pair {
         env_add.push(path_pair);
     }
     if let Some(dir) = &reroute_dir {
@@ -33228,12 +34250,21 @@ fn launch_image_replacement(
 
 /// Whether this launch builds its event loop before session 0 ([`main_entry`]). Where the
 /// build opens a display (a free-unix window, or a headless run with a display named) it
-/// fails where none answers, and a launch that fails there must have taken nothing: the
-/// last quit's layout and a crashed window's journals are single-use, and no shell should
-/// start for a window that never opens. Everywhere else the build cannot fail that way,
-/// so session 0's shell starts first, ahead of a macOS window's `NSApplication` and its
-/// WindowServer connection (28.6 and 60.2 ms from `loop_build` to `event_loop` in the two
-/// launches the owner's log stamped).
+/// fails where none answers, and a launch that fails there must have taken nothing: a
+/// crashed window's journals are single-use, the last quit's layout comes back after a
+/// launch's crash but not after its diagnosed exit ([`restore::take_for_launch`]), and no
+/// shell should start for a window that never opens. So there the loop goes first unless
+/// a display server has already answered where winit will connect ([`display_answered`],
+/// Linux): then session 0's shell runs its startup files while the display connects,
+/// 9.3-9.9 ms on X11 and 1.6-1.8 ms on Wayland in the Linux lane, where its prompt came
+/// that much sooner (docs/measured/linux-launch-order-2026-10-20.md, which states the
+/// risk kept: a server that accepts the connection and then refuses this client fails the
+/// build after the take). Everywhere else the build
+/// cannot fail that way, so session 0's shell starts first, ahead of a macOS window's
+/// `NSApplication` and its WindowServer connection (28.6 and 60.2 ms from `loop_build` to
+/// `event_loop` in the two launches the owner's log stamped). Dev seam
+/// `$ATERM_DEBUG_LOOP_FIRST` (any value, `aterm_types::dev_seam!`) builds the loop first on
+/// every launch, the order before LAG-11, so one build can time a window's launch both ways.
 fn loop_before_session0(headless: bool) -> bool {
     #[cfg(all(
         unix,
@@ -33248,7 +34279,33 @@ fn loop_before_session0(headless: bool) -> bool {
         let _ = headless;
         false
     };
-    opens_a_display
+    loop_goes_first(
+        opens_a_display,
+        display_answered,
+        aterm_types::dev_seam!("ATERM_DEBUG_LOOP_FIRST").is_some(),
+    )
+}
+
+/// [`loop_before_session0`]'s rule: the dev seam puts the loop first; otherwise a build
+/// that opens a display goes first unless a display server `answered` where it will
+/// connect, asked only of such a build.
+fn loop_goes_first(opens_a_display: bool, answered: impl FnOnce() -> bool, seam: bool) -> bool {
+    seam || (opens_a_display && !answered())
+}
+
+/// Whether a display server answers where this launch's window will connect
+/// ([`a_display_server_answers`]), asked once per launch: the boot apply's count of a
+/// Linux trial start ([`linux_trial_start`]) and the launch order
+/// ([`loop_before_session0`]) read one answer. `false` off Linux: the probe reads Linux's
+/// abstract X11 socket and `/proc/self/fd`, so the BSDs keep the loop first.
+fn display_answered() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static ANSWERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ANSWERED.get_or_init(a_display_server_answers)
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
 }
 
 /// The event loop [`main_entry`] runs, built by [`build_event_loop`].
@@ -33376,6 +34433,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Compatibility-stable GUI-entry clock. The one-binary router separately
     // anchors its broader Rust-main boundary before dispatch.
     metrics::mark_process_start();
+    // This process is the window or the headless engine (the front door answered every
+    // verb, `--help` and `--version`) and will run most of its code: ask for all of it in
+    // one read now, not a page fault at a time as each first call reaches it
+    // (`code_readahead`). First, so the read overlaps everything below.
+    #[cfg(target_os = "macos")]
+    code_readahead::read_ahead_own_code();
     // This process's start in unix seconds: the access card compares it with
     // when the owner opened Settings, so an owner who acted is not asked again
     // about a window older than the act (`consent_card::NotDue::OwnerActed`).
@@ -33387,6 +34450,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // single-threaded; everything below reads `handoff_env`, so the claim's position does
     // not affect env soundness (`handoff_env::HandoffName` fences the rest).
     let mut handoff_env = handoff_env::HandoffEnv::capture();
+    // A descriptor limit named on a launch that is no update's is a stray an older
+    // successor left in a shell: dropped before the boot apply's re-exec, which names
+    // `ATERM_UPDATED_FROM` itself, could carry it on as an update's.
+    #[cfg(unix)]
+    descriptor_limit::forget_stray_limits(
+        &mut handoff_env,
+        std::env::var_os("ATERM_UPDATED_FROM").is_some(),
+    );
     // The launcher's startup-notification token, read and cleared the same way and for
     // the same reason: it is this process's, and no shell or helper may inherit it.
     #[cfg(target_os = "linux")]
@@ -33471,11 +34542,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     }
     // Diagnostics first, before any thread spawns. The crash marker is armed too; only the
     // installed app running windowed (past Commit, if it came through a handoff) reports an
-    // empty marker as "aterm was killed" (`crash_signal::Arming`).
+    // empty marker as "aterm was killed" (`crash_signal::Arming`), and a lab desk
+    // (`desk::Desk::LabHeadless`, under its private state root) reads its own for its census.
     let launch_arming = crash_signal::Arming::for_launch(
         aterm_update::which_copy::running_kind() == aterm_update::which_copy::Running::InstalledApp,
         headless_flag,
         incoming_exec_fds.parent_pid().is_some(),
+        desk::Desk::of(headless_flag) == desk::Desk::LabHeadless,
     );
     logging::init(launch_arming);
     // atpkg's unasked notices (a config it cannot read, a prefix it will not use, a lay
@@ -33704,6 +34777,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // the boot apply, whose re-exec and crash-loop revert must inherit it, and
     // before any session spawns, so no shell or window opened from one does.
     let relaunch_of_running = aterm_log::env::take(aterm_update::RELAUNCH_OF_RUNNING_ENV).is_some();
+    // …and whose launch-record renewal this run is (`launch_record_renewal`), taken for
+    // the same reasons: a renewal's successor never renews again. A malformed value reads
+    // as none, and a value can only stop a renewal, never grant one.
+    #[cfg(target_os = "macos")]
+    let launch_record_renewed_from = aterm_log::env::take(launch_record_renewal::RENEWED_FROM_ENV)
+        .and_then(|value| value.to_str()?.parse::<u32>().ok());
     // …and what a cold-lane parent's update-health warnings had said, for the
     // landing to record their healing (round eight of the update audit, finding
     // 79) — taken here for the same reasons, kept only for a real landing.
@@ -33748,10 +34827,26 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Process-wide, before anything could raise a modal or any session
     // spawns: a headless process presents no OS UI (`menu::os_ui_refused`),
     // whatever path asks, and never runs the agent primer against the `$HOME`
-    // it inherited.
+    // it inherited (a scratch one primes under [`headless_agent_prime_runs`]).
     if headless {
         menu::mark_process_headless();
-        spawn::mark_headless_instance();
+        if !headless_agent_prime_runs() {
+            spawn::mark_headless_instance();
+        }
+    }
+    // …and, before any launch fatal can run, whether this launch is an update's
+    // handoff candidate, which never asks to activate at launch: a fatal's alert
+    // takes the launch's own posture (`launch_alert`). Read from the names the
+    // launch carries; the warm prologue can fail before the dial claims them.
+    #[cfg(target_os = "macos")]
+    let names_a_rendezvous = handoff_rendezvous::rendezvous_present(&handoff_env);
+    #[cfg(not(target_os = "macos"))]
+    let names_a_rendezvous = false;
+    if names_a_rendezvous
+        || handoff_env.present(seamless::ENV_READY_FD)
+        || handoff_env.present(seamless::ENV_COMMIT_FD)
+    {
+        launch_alert::mark_handoff_candidate();
     }
     // Block SIGUSR1 process-wide before any thread spawns (threads inherit the mask): its
     // default action terminates, and the snapshot thread `sigwait()`s it. Unix only; Windows
@@ -34035,6 +35130,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // What the outgoing status item knew of each adopted session
     // (`App::adopt_status_carry`): read at each one's first publication.
     let seamless_status_seen = incoming_handoff.status_seen;
+    // Each adopted session's Autopilot end and task work, by sid, as the
+    // intake read them (`seamless::end_carry_of`; `App::adopt_end_carry`):
+    // spent at each one's first publication.
+    let seamless_end_carry = incoming_handoff.end_carry;
     // The fleet needs the outgoing herald had told (`App::herald_fleet`):
     // read at this process's first fresh fleet read.
     let seamless_fleet_told = incoming_handoff.fleet_told;
@@ -34382,6 +35481,25 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let lane_sink = LaneSink::new();
     let package_update_loop_running =
         pkg_lane_runs(headless) && spawn_pkg_update_check(&config, lane_sink.clone());
+    // The coding-agent primer in THIS build's words, the human's and, at the first launch
+    // of a build, every agent identity's, asked for before session 0 is spawned or adopted
+    // (`spawn::PrimeCue::Launch`): a seamless update's successor adopts every tab and an
+    // adopted spawn asks for no pass, so without this their agents read the block the
+    // build before wrote until a new tab opened. Taken here and HELD until the first frame
+    // is on glass (`spawn::release_held_prime`, from the first park after it), so its
+    // thread, its config read and the home's disk stay off the launch's path. Detached,
+    // throttled (session 0's fresh spawn finds it taken) and gated as at a spawn: headless,
+    // a dev bundle and `agents_auto_prime = false` write nothing. A handoff candidate
+    // (flagged above) writes nothing before its Commit: the outgoing process may still
+    // reject it and keep every session, under a build that never rolls a newer block back,
+    // so the pass waits on its thread for the Commit, as the other boot lanes do. ORDER:
+    // the harness relaunches nothing before the Commit resumes its host, and a relaunched
+    // agent reads its context file only once its line is typed and its program has
+    // started, while this pass of a few small files, released by then (a successor's
+    // readiness proof is its first frame), starts within one 50 ms poll of the Commit;
+    // were it still running, the agent would read the previous block whole (every write
+    // is a rename).
+    spawn::prime_agents_if_due(spawn::PrimeCue::Launch);
     // Initial terminal grid: `--columns`/`--lines` > config > 24×80, clamped; the window
     // adds `tab_strip_rows` for the strip. On a handoff boot the authenticated carry
     // (`carry_frame`) outranks the flags, since the successor inherits the parent's launch
@@ -34462,11 +35580,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // (SIGUSR1 is already blocked process-wide near the top of main(), before any
     // thread spawn, so the sigwait() snapshot thread is the sole SIGUSR1 recipient.)
 
-    // GUI preparation's cuts (`metrics::startup_prepare_fields_text`), one per
-    // stretch below: the warm's end, the journal claim, session 0 (`Adopt0`), the
-    // event loop's build, the services, the control socket, the config-runtime join
-    // and the `App`. Where the build opens a display it comes first, ahead of the
-    // journal claim (`loop_before_session0`).
+    // GUI preparation's cuts (`metrics::startup::Startup::emit_startup_prepare`),
+    // one per stretch below: the warm's end, the journal claim, session 0
+    // (`Adopt0`), the event loop's build, the services, the control socket, the
+    // config-runtime join and the `App`. Where the build opens a display no server
+    // has answered yet it comes first, ahead of the journal claim
+    // (`loop_before_session0`).
     crate::metrics::stamp_claim(crate::metrics::ClaimStamp::Warmed);
     let early_loop = loop_before_session0(headless)
         .then(|| build_event_loop(headless, handoff_commit.is_some()));
@@ -34553,12 +35672,24 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .then(|| Arc::new(crate::shell_rekey::Deferred::holding())),
         // A citation's shell in front: alone in its group, by the kernel's name.
         lone_leader: crate::path_link::lone_leader,
+        // A bare Ctrl-R/Ctrl-S under an agent: the editor it handed the
+        // terminal to, in its own group, reading the agent's own input.
+        handed_terminal: crate::app_input::agent_handed_terminal,
         // The holder's image at each foreground edge (card engine §3.4), the
-        // App's edged inbox (§3.5) and the byte-driven arm (§3.6), on every
-        // unix until lane A2's kqueue edges.
+        // App's edged inbox (§3.5), the byte-driven arm (§3.6) on every unix,
+        // and the kernel's exec edges (§3.3) where there is a kqueue: a reader
+        // with a watch runs the arm's initial read alone.
         edge_image: crate::holder_image::read,
         edge_inbox: crate::holder_image::EdgeInbox::default(),
         byte_arm: cfg!(unix),
+        #[cfg(unix)]
+        proc_watch: if crate::exec_edges::watch_wanted() {
+            crate::exec_edges::shipping_watch
+        } else {
+            |_| None
+        },
+        // The dev `card-seen` probe, only where a lead measurement asks.
+        card_probe: crate::holder_image::card_probe_requested(),
         spare: None,
         #[cfg(windows)]
         shell_appearance: None,
@@ -34581,13 +35712,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         headless,
         session_factory.terminal_config.as_ref(),
     );
+    let recovery_count_admission = Arc::clone(&keeper_recovery.count_admission);
     let keeper_recovered_shells = keeper_recovery.shells.clone();
-    // The recovery census's `restored=`, `restore_lost=` and `restore_why=`: how the crash
-    // restore brought the recovered sessions' screens back and what it lost, when any were
-    // recovered.
+    // The recovery census's `restored=` and the words beside it: how the crash restore
+    // brought the recovered sessions' screens back, what it lost and how many offers were
+    // refused, when a keeper offered any; and its `keeper=`, the link as the boot left it.
     #[cfg(unix)]
-    let keeper_recovery_restores =
-        (!keeper_recovery.shells.is_empty()).then(|| keeper_recovery.restores.ledger());
+    let keeper_census = (keeper_recovery.ledger(), keeper_recovery.keeper);
     let keeper_recovering = !seamless_adopting && !keeper_recovery.adopted.is_empty();
     if !seamless_adopting {
         seamless_adopt.extend(keeper_recovery.adopted);
@@ -34602,9 +35733,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
              desk as a window does (quit layout with its agents, crash journal, restore, relaunch)"
         );
     }
-    // Consume the layout manifest (single-use, so a crash mid-restore cannot loop), for both
-    // seamless adopt and cold restore; never headless (the cold restore: never without a
-    // desk). Its first leaf seeds session 0's cwd or names its shell. The crash-journal claim
+    // Consume the layout manifest, for both seamless adopt and cold restore; never headless
+    // (the cold restore: never without a desk). The cold take holds what it took until this
+    // run keeps its desk (`restore::take_for_launch`): a run that dies before then — inside
+    // a macOS window's `NSApplication` build, which comes after this — leaves it to the next
+    // launch once, so a crash mid-restore cannot loop. Its first leaf seeds session 0's cwd
+    // or names its shell. The crash-journal claim
     // runs on the same launches: journals whose writer is gone are taken, and without a quit
     // layout those whose writer ended uncleanly (per crash evidence read before it is
     // consumed below) are reopened.
@@ -34621,26 +35755,30 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     } else if desk.kept() && config.restore_session_or_default() {
         // The quit's `session.toml`, its run, the runs of the other instances' desks it kept,
         // and its time: a journal left by a quit cut short is set aside so the desk opens
-        // once (for an older build's quit, only journals no newer than the layout).
-        let (quit_layout, quit_run, quit_also, quit_written) =
-            restore::take().map_or((None, None, Vec::new(), None), |taken| {
-                (
-                    Some(taken.manifest).filter(|manifest| !manifest.is_empty()),
-                    taken
-                        .run
-                        .as_deref()
-                        .and_then(crash_journal::JournalId::parse_stem),
-                    taken.also,
-                    taken.written_unix_ms,
-                )
-            });
+        // once (for an older build's quit, only journals no newer than the layout). How a
+        // run that left a layout or a journal ended is read from the same evidence.
+        let logs = logging::log_dir();
+        let evidence = crash_journal::Evidence {
+            log_dir: logs.as_deref(),
+            #[cfg(unix)]
+            swept: crash_signal::markers::swept_at_install(),
+        };
+        let (quit_layout, quit_run, quit_also, quit_written) = restore::take_for_launch(
+            crash_journal::JournalId::of_this_run(std::process::id()),
+            &evidence,
+        )
+        .map_or((None, None, Vec::new(), None), |taken| {
+            (
+                Some(taken.manifest).filter(|manifest| !manifest.is_empty()),
+                taken
+                    .run
+                    .as_deref()
+                    .and_then(crash_journal::JournalId::parse_stem),
+                taken.also,
+                taken.written_unix_ms,
+            )
+        });
         if let Some(dir) = crash_journal::journal_dir() {
-            let logs = logging::log_dir();
-            let evidence = crash_journal::Evidence {
-                log_dir: logs.as_deref(),
-                #[cfg(unix)]
-                swept: crash_signal::markers::swept_at_install(),
-            };
             journal_claim = crash_journal::claim_at_boot(
                 &dir,
                 &evidence,
@@ -34700,10 +35838,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     if let Some(reopened) = journal_claim.reopened.as_ref() {
         crash_journal.begin_probation(Instant::now(), reopened.second_chance);
     }
-    // THE SESSION LOG'S JOURNAL (phase 2B): off unless `[session_log] journal`
-    // asks, then a desk-keeping launch's. Made before any session so every log
-    // installs its wake; its thread starts once the store exists, and an update
-    // candidate's writes nothing before its Commit.
+    // THE SESSION LOG'S JOURNAL (phase 2B; on by default, D3): a desk-keeping
+    // launch's unless `[session_log] journal = false`. Made before any session
+    // so every log installs its wake; its thread starts once the store exists,
+    // and an update candidate's writes nothing before its Commit.
     let mut session_log_journal = session_log_journal::Lane::new(
         session_log_journal::gate(&config, desk)
             .then(aterm_types::dirs::logs_dir)
@@ -34737,6 +35875,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         ),
         _ => (rows, cols),
     };
+    // THE EPOCHS THE LAYOUT'S LEAVES RECORDED (session log phase 6, 6A-2,
+    // ruling U1), noted before any session starts: every log this process
+    // starts, fresh or uncarried, takes an epoch above the one its sid's
+    // predecessor was at when the layout was saved.
+    if let Some(layout) = restore_manifest.as_ref() {
+        session_log::Epochs::process().note_leaves(layout);
+    }
     // Session 0 on the adopt path is the shell of window 0's bootstrap leaf
     // (`bootstrap_local_id`), removed from the adoption pool; with no terminal leaf, session
     // 0 is a fresh bootstrap (`app_restore::take_session0_shell`). Keeper shells go only to
@@ -35269,11 +36414,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         g.mirror().set_adopting(slog_mirror_adopting);
     }
     App::register_session(&store, &session0, None);
-    // The process-wide subscriber registry. A `subscribe` connection
-    // registers here; the GUI's `Wake::Output` hook notifies it. Created before
-    // the control thread so a subscribe is serviceable from the first request.
-    let subscribers = subscribe::new_registry();
-    let image_queue: control::ImageQueue = Arc::new(Mutex::new(VecDeque::new()));
     // Set to `true` by `control::spawn` only after its listener binds. Gates the
     // graceful-exit cleanup below so an instance that refused a live socket (or
     // failed to bind) on a shared explicit `--control-sock` never deletes the
@@ -35318,9 +36458,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             let preparation = control::spawn(
                 active_handle.clone(),
                 store.clone(),
-                subscribers.clone(),
                 event_loop.create_proxy(),
-                image_queue.clone(),
                 plan.clone(),
                 config.clone(),
                 // Publish the root graph entry from inside spawn, after bind, so it
@@ -35328,6 +36466,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 Some((session0.ctx.self_id.clone(), session0.ctx.nonce)),
                 sock_bound.clone(),
                 control_endpoint.clone(),
+                Arc::clone(&recovery_count_admission),
                 // A fixed endpoint stays with the parent until exact Commit.
                 // Share the admitted reader gate and the parent's bound-endpoint witness.
                 control_handoff,
@@ -35414,7 +36553,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let harness = sock_plan.as_ref().map(|plan| {
         let host = harness_host::start_default(
             store.clone(),
-            subscribers.clone(),
             plan.sock_path.clone(),
             config.harness.policy.clone(),
             headless,
@@ -35457,6 +36595,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     if !headless {
         harness_host::sweep_legacy_hooks();
     }
+    // The tombstones `identities forget` could not empty, left by aterms no
+    // longer running, still hold a forgotten identity's agent files: they go
+    // now, off-thread, and nothing else in the identities folder is touched.
+    // A headless instance sweeps too: the folder is under aterm's own state
+    // root, not the user's settings, a headless instance spawns and forgets
+    // identities there like any other, and its own next forget would sweep the
+    // same tombstones by the same rule.
+    agent_identity::sweep_tombstones_at_launch();
 
     // Recursion discovery (Item 5b): the root session's graph entry is published
     // by `control::spawn` after it binds (so it never races the stale sweep — see
@@ -35611,17 +36757,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .map(|evidence| evidence.path.clone())
             .or_else(|| killed.as_ref().map(|evidence| evidence.log.clone()))
             .or_else(|| logging::log_dir().map(|dir| dir.join("aterm.log")));
-        // The recovery census reads what those scans renamed, on its own thread. Only the
-        // cold start writes a row here; a successor writes at Commit
-        // (`crash_signal::adopt_app_identity`).
-        #[cfg(unix)]
-        if launch_arming == crash_signal::Arming::App {
-            // The keeper recovery's screens, when it recovered any (the crash restore).
-            recovery_census::record(
-                aterm_update::recovery_ledger::LaunchKind::Cold,
-                keeper_recovery_restores,
-            );
-        }
         // The keeper's recovery takes the slot; its row (queued below, headless too) carries
         // the replaced row's crash or kill evidence.
         if !keeper_recovered_shells.is_empty() {
@@ -35657,18 +36792,49 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                         .is_some_and(|agent| host.relaunches_restored_of(agent))
                 })
             });
-            // Panes whose folder no shell can start in are counted, by the spawn's own check.
-            let folders =
-                reopened.panes_without_folder(|dir| spawn_folder::folder_fault(dir).is_some());
-            message_inbox::queue_message(message_reporters::journal_reopened_message(
-                &told,
-                crash.as_ref(),
-                killed.as_ref(),
-                log.as_deref(),
-                relaunching,
-                folders,
-                quit_windows,
-            ));
+            // Panes whose folder no shell can start in are counted, by the spawn's own
+            // check, off the launch's thread: a folder on a network volume that stopped
+            // answering waits out the check's budget, and the first frame waited with it
+            // (1012 ms for four folders on one hung NFS share, in a macOS 27 guest,
+            // 2026-10-20). The row is queued once the count ends (one budget per silent
+            // share, `spawn_folder::beside_silent`) and shown at the park after that, as
+            // every row queued off the event loop is. A thread that cannot start counts
+            // here, as before.
+            let layout = reopened.clone();
+            let lane = message_inbox::current_lane();
+            let row = Arc::new(Mutex::new(Some(move || {
+                let folders =
+                    layout.panes_without_folder(|dir| spawn_folder::folder_fault(dir).is_some());
+                message_inbox::queue_message_in(
+                    lane,
+                    message_reporters::journal_reopened_message(
+                        &told,
+                        crash.as_ref(),
+                        killed.as_ref(),
+                        log.as_deref(),
+                        relaunching,
+                        folders,
+                        quit_windows,
+                    ),
+                );
+            })));
+            let counted = Arc::clone(&row);
+            let spawned = crate::qos::spawn_lane_thread(
+                "aterm-journal-folders",
+                crate::qos::Role::Background,
+                move || {
+                    let count = counted.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    if let Some(count) = count {
+                        count();
+                    }
+                },
+            );
+            if spawned.is_err() {
+                let count = row.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(count) = count {
+                    count();
+                }
+            }
         } else if let Some(evidence) = crash {
             crate::logging::stderr_line!("aterm-gui: {}", evidence.sentence());
             message_inbox::queue_message(message_reporters::crash_message(&evidence));
@@ -35686,6 +36852,20 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             ));
         }
     }
+    // A lab desk's own kill scan (session log 6C-4): the dead `lab` marker its previous run
+    // left in the private root's log directory, consumed for the census below; a headless
+    // desk posts no row.
+    #[cfg(unix)]
+    if launch_arming == crash_signal::Arming::Lab {
+        logging::take_lab_kill_evidence();
+    }
+    // The recovery census reads what those scans renamed, on its own thread. Only the
+    // installed app's cold windowed start and a lab desk's write a row in their own log
+    // directory (a successor writes at Commit, `crash_signal::adopt_app_identity`), or a
+    // launch under the census's development seam, into the seam's folder
+    // (`recovery_census::cold_census`).
+    #[cfg(unix)]
+    recovery_census::record_cold(launch_arming, keeper_census.0, keeper_census.1);
     // The keeper's recovery row, headless included (it consumes nothing); `End sessions`
     // hangs up the reattached shells.
     if !keeper_recovered_shells.is_empty() {
@@ -35826,6 +37006,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         #[cfg(all(test, unix))]
         handoff_before_egress_fence: None,
         #[cfg(all(test, unix))]
+        handoff_commit_answers_took: None,
+        #[cfg(all(test, unix))]
         handoff_before_host_resume: None,
         #[cfg(all(test, target_os = "macos"))]
         handoff_activations: Vec::new(),
@@ -35834,7 +37016,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         video_reply_wires: Vec::new(),
         active_handle,
         store,
-        subscribers,
         backend: backend_slot,
         introspect_gpu: aterm_gpu::WindowGpu::new(),
         font_px,
@@ -35965,6 +37146,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_commit,
         handoff_reader_gate,
         handoff_control_preparation,
+        #[cfg(unix)]
+        recovery_count_admission,
         incoming_handoff_pending: overlap_channels_present && seamless_adopting,
         nudges: app_nudge::NudgeHost::new(config.repaint_nudge_mode()),
         nudge_wake_ms: None,
@@ -36004,14 +37187,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         close_confirm: app_window::CloseConfirm::Interactive,
         frame_interval: MIN_FRAME_INTERVAL,
         bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
+        alert_sound: system_alert_sound,
         // Setting `serious_mode` in a scratch config gives zero audio threads.
         trail_audio: trail_audio::TrailAudio::new(!headless && !config.serious_mode_or_default()),
         typing_sound_auditioned: config.trail_sound_voice(),
         lock_modifiers: keymap::lock_modifier_source(headless),
         user_input_recent: platform::user_input_source(headless),
+        option_only: platform::option_only_source(headless),
         #[cfg(target_os = "macos")]
         app_menu_bar: app_menu_bar::reader(windowed),
-        consent: control_privacy::ConsentState::new(headless),
+        consent: consent_state::ConsentState::new(
+            headless,
+            consent_state::ConsentPolicy::from_config(&config),
+        ),
         consent_warmup: consent_warmup::WarmupState::new(headless),
         consent_launch: consent_launch::LaunchConsent::new(headless),
         claimant_retire: consent_retire::RetireState::new(headless),
@@ -36038,7 +37226,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         owner_quiet: native_settings::SharedOwnerQuiet::default(),
         consent_observer: consent_observer::ObserverState::new(headless),
         consent_attention: consent_observer::AttentionGate::new(),
-        consent_observer_started: false,
+        consent_observer_reconciled: false,
         consent_card: consent_card::CardState::new(),
         consent_card_host: consent_card::CardHost::default(),
         consent_card_config: if headless {
@@ -36046,9 +37234,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         } else {
             app_config::config_path()
         },
-        image_queue,
         deferred_gpu_captures: std::collections::VecDeque::new(),
         replaying_gpu_capture: None,
+        capture_barrier: None,
         capture_present_budget: app_introspect::CapturePresentBudget::default(),
         // The PNG encode worker is spawned on the first `image`/`window` capture.
         encode_tx: None,
@@ -36057,6 +37245,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         trace_latency,
         lat_epoch,
         output_wake_watch: crate::spawn::OutputWakeWatch::default(),
+        wake_census: crate::metrics::wakes::WakeCensus::default(),
+        deadline_healer: crate::deadline_heal::DeadlineHealer::default(),
+        present_observer: crate::metrics::PresentObserver::default(),
         notify_suppress,
         notify_silent,
         notify_own_alerts,
@@ -36084,6 +37275,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .iter()
             .map(|(sid, row)| (sid.clone(), status_item::StatusCarry::parse(row)))
             .collect(),
+        end_carry: seamless_end_carry,
         fleet_adopt: seamless_adopting.then(|| fleet_glance::parse_told(&seamless_fleet_told)),
         pending_deminiaturize_focus: None,
         // Native window toolbars, keyed per window; installed in `attach_os_window`.
@@ -36143,6 +37335,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         messages_log,
         messages_last_publish: None,
         messages_published_revision: 0,
+        messages_words_change_in: None,
+        messages_words_offset_s: 0,
         demotions_logged: 0,
         ripening: Vec::new(),
         host_noted: std::collections::BTreeSet::new(),
@@ -36247,6 +37441,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         update_handoff_prelaunch: None,
         #[cfg(target_os = "macos")]
         own_launch_record: None,
+        #[cfg(target_os = "macos")]
+        launch_record_renewal: launch_record_renewal::LaunchRecordRenewal::new(
+            launch_record_renewed_from,
+        ),
         #[cfg(unix)]
         launch_image_kept: image != aterm_update::ImageReplacement::Replaceable,
         #[cfg(target_os = "macos")]
@@ -36267,6 +37465,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         status_dirty: false,
         harness_glass: std::collections::HashMap::new(),
         autopilot_timers: autopilot_timers::AutopilotTimers::default(),
+        autopilot_recorded: std::collections::HashMap::new(),
         autopilot_menu: None,
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
@@ -36276,6 +37475,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         #[cfg(unix)]
         cold_lane_layout_debt: app_update_handoff::ColdLaneLayoutDebt::default(),
         deferred_reader_resume_at: None,
+        #[cfg(unix)]
+        owed_parked_winsizes: Vec::new(),
         upgrade_realized: None,
         realized_bucket_seen: 0,
         present_cost_ema_ns: None,
@@ -36336,8 +37537,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // image (`ImageReplacement::WindowKeepsImage`) did not exec at boot; one whose boot
     // still execs does: a window with an explicit `--control-sock` and the cold lane's
     // relaunch of a running window (both `Replaceable`), a window's left-stage escape,
-    // and a crash-loop revert. This process's own measure, a few seconds on, opens the
-    // entry again if its own record is stale (`App::note_own_launch_record`).
+    // and a crash-loop revert. This process's own measure, a few seconds on, renews its
+    // own record if that is stale, by a handoff to a fresh launch, or opens the entry again
+    // where nothing renews it (`App::note_own_launch_record`).
     #[cfg(target_os = "macos")]
     if !headless && incoming_exec_fds.parent_pid().is_none() {
         app.except_clear(&update_words::launch_unregistered_entry(0).key());
@@ -36387,10 +37589,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         });
         // WHETHER LAUNCHSERVICES KNOWS THIS PROCESS, measured once the launch has settled
         // (an `execve` after a LaunchServices launch loses the pid about a second later
-        // and for good): the digest's entry for a stale record opens or ends on the
-        // answer, whoever launched this process and whatever its parent saw. A handoff
-        // candidate measures only after its Commit, which drops wakes before it and
-        // adopts the parent's entries at it.
+        // and for good, short of a fresh launch): a stale record is renewed by a handoff
+        // to one, or the digest's entry for it opens, and a sound one ends the entry,
+        // whoever launched this process and whatever its parent saw. A handoff candidate
+        // measures only after its Commit, which drops wakes before it and adopts the
+        // parent's entries at it.
         if !headless {
             let record_proxy = event_loop.create_proxy();
             let spawned = std::thread::Builder::new()
@@ -36430,17 +37633,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     #[cfg(unix)]
     crate::proxy::start_edge_sweeper();
     let consent_proxy = proxy.clone();
-    app.consent.set_completion_wake(Arc::new(move || {
-        let _ = consent_proxy.send_event(Wake::ConsentProbeReady);
-    }));
-    let debugger_proxy = proxy.clone();
-    app.consent.set_debugger_wake(Arc::new(move || {
-        let _ = debugger_proxy.send_event(Wake::DebuggerProbeReady);
-    }));
-    let devtools_proxy = proxy.clone();
-    app.consent.set_devtools_wake(Arc::new(move || {
-        let _ = devtools_proxy.send_event(Wake::DevToolsProbeReady);
-    }));
+    app.consent
+        .set_slot_wake(Arc::new(move |kind: consent_state::SlotKind| {
+            let _ = consent_proxy.send_event(kind.wake());
+        }));
     metrics::mark_gui_ready_for_winit();
     // The UI thread is on the keystroke path: request interactive QoS
     // (macOS `QOS_CLASS_USER_INTERACTIVE`, Windows `HIGH_PRIORITY_CLASS`,
@@ -36487,7 +37683,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // one is refused at its sender rather than queued for a shell that is about
     // to be hung up below (`fabric_launch::bye_at_quit`, bounded).
     #[cfg(unix)]
-    crate::fabric_launch::bye_at_quit(&app.store, &app.subscribers);
+    crate::fabric_launch::bye_at_quit(&app.store);
     // The A/B book's last write: this process's own file, whole, once the
     // loop is gone (§10.5.3 C.2; one small write). A seamless update's
     // outgoing process `_exit`s at its Commit and never comes here.
@@ -36557,6 +37753,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     app.settle_owed_layout_take_back_at_quit(quit_wrote_its_desk);
     #[cfg(not(unix))]
     let _ = quit_wrote_its_desk;
+    // A clean quit leaves no take of its launch for the next one: the quit's own layout
+    // holds this desk, or the person kept none (`restore::settle_take`).
+    restore::settle_take();
     // Retire the crash journal after the quit's layout is on disk. A journal that failed to
     // be removed still reads as a clean end (the crash marker goes) and is set aside.
     if let Err(error) = app.crash_journal.retire(std::time::Duration::from_secs(2)) {
@@ -36682,7 +37881,19 @@ fn stub_session(id: u64) -> Session {
 #[cfg(any(test, feature = "bench-support"))]
 fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
     prime_test_timing();
-    ptyless_session(id, SessionId::generate(), Terminal::new(24, 80), sink)
+    let session = ptyless_session(id, SessionId::generate(), Terminal::new(24, 80), sink);
+    // A unit test's stub reads `ep=1`: its log is the test constructor's
+    // (ruling U46), never a build-wide pin.
+    #[cfg(test)]
+    {
+        *session
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slog_mut() = crate::session_log::SessionLog::for_test();
+    }
+    session
 }
 
 /// A document store whose write capability comes from a test-local root
@@ -36769,6 +37980,8 @@ pub(crate) fn held_pane_history(
 fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWriter>) -> Session {
     let (rows, cols) = (term.rows(), term.cols());
     let term = Arc::new(Mutex::new(term));
+    let observed = crate::session_watch::Observed::default();
+    observed.watchers.bind_frame(&term);
     let ctx = Arc::new(SessionCtx {
         sink,
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
@@ -36785,22 +37998,21 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
             crate::temporal::TemporalRecorder::new(),
         )),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
-        turns: Arc::new(std::sync::Mutex::new(
-            crate::turn_ledger::TurnLedger::default(),
-        )),
+        turns: observed.turns,
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-        timeline: Arc::new(std::sync::Mutex::new(
-            crate::session_timeline::SessionTimeline::default(),
-        )),
+        timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        licence: Default::default(),
         launch: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
         update_parked: Default::default(),
+        watchers: observed.watchers,
+        frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
     });
@@ -36823,6 +38035,7 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
         body_loader: false,
         integration_frozen: false,
         identity: None,
+        _identity_admission: None,
         ctx,
         child_proxy: None,
         output_wake_pending: Arc::new(AtomicU64::new(0)),
@@ -37243,7 +38456,18 @@ pub(crate) mod scripted_redraw_fixture {
     /// readable — with every decorative effect off (serious mode), so two
     /// frames of the same content are the same pixels whenever they are drawn.
     pub(crate) fn scripted_app() -> App {
-        let mut app = App::headless_for_test();
+        scripted_app_with_sink(std::sync::Arc::new(aterm_session::sink::SinkWriter::new(
+            -1,
+        )))
+    }
+
+    /// [`scripted_app`] whose session writes to `sink`
+    /// ([`App::headless_for_test_with_sink`]), so input through the seam
+    /// reaches a PTY a test holds.
+    pub(crate) fn scripted_app_with_sink(
+        sink: std::sync::Arc<aterm_session::sink::SinkWriter>,
+    ) -> App {
+        let mut app = App::headless_for_test_with_sink(sink);
         app.config.serious_mode = Some(true);
         app.config.cursor_trail = Some(false);
         app.config.cursor_trail_style = Some("off".into());
@@ -37276,6 +38500,20 @@ pub(crate) mod scripted_redraw_fixture {
     pub(crate) fn glass(app: &mut App) -> ((usize, usize), Vec<u32>) {
         let s = surface(app);
         (s.size(), s.glass().to_vec())
+    }
+
+    /// Run `capture` without the window's surface: with nothing to present
+    /// to, a capture rasterizes its own frame instead of binding to a present.
+    pub(crate) fn headless<R>(app: &mut App, capture: impl FnOnce(&mut App) -> R) -> R {
+        let target = app
+            .windows
+            .get_mut(&WindowId(0))
+            .and_then(|ws| ws.present.take());
+        let out = capture(app);
+        if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
+            ws.present = target;
+        }
+        out
     }
 
     pub(crate) fn feed(app: &App, bytes: &[u8]) {
@@ -37898,6 +39136,7 @@ mod recursion_provision_tests {
         assert!(!is_valid_session_id("s-xyz"));
         assert!(!is_valid_session_id("s-")); // no hex
         assert!(!is_valid_session_id(&format!("s-{}", "g".repeat(20)))); // non-hex
+        assert!(!is_valid_session_id(&format!("s-{}", "A".repeat(20)))); // not minted
     }
 
     /// Identity adoption fails closed: both a valid id and a parseable nonce are required,
@@ -37934,7 +39173,7 @@ mod recursion_provision_tests {
         let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone());
 
         // The child adopts the injected identity and installs the parent's edges. Edge-token
-        // secrets travel via the 0600 file / ProxyEntry, not env.
+        // secrets travel via the 0600 file, not env.
         let (child_sid, child_nonce) = parse_injected_identity(
             get("ATERM_SESSION_ID").as_deref(),
             get("ATERM_LAUNCH_NONCE").as_deref(),
@@ -38572,7 +39811,7 @@ mod macos_access_refresh_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod macos_access_lifetime_tests {
     use super::consent_card::{CardPhase, Marker, Verdict, WATCH_FOR};
-    use super::control_privacy::ConsentState;
+    use super::consent_state::ConsentState;
     use super::macos_access_refresh_tests::{access_row, grant_recorded, windowed};
     use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
     use std::time::Instant;

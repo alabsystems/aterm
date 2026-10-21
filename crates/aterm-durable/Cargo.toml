@@ -26,7 +26,10 @@ workspace = true
 
 [features]
 # The counting seam (`seam`) in an optimized build. A test or debug build of this
-# crate has it anyway; a dependent whose tests reach it (the recording, or the
-# test arm's `durable_fsync`) turns this on from its dev-dependencies, so its
-# `--release` test targets build too, and nothing a shipped binary links does.
+# crate has it anyway, so no manifest turns this on: a dev-dependency row that did
+# would fork this crate and every dependent between `targo --unverified test
+# --workspace` and `build -p aterm --profile test` (41 units recompiled). A
+# `--release` test run of a dependent whose tests reach the seam (the recording,
+# or the test arm's `durable_fsync`) names it: `--features
+# aterm-durable/test-support`. `--profile opt-test` needs nothing.
 test-support = []

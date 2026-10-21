@@ -64,10 +64,12 @@
 // at one newer statement, `App::on_pill_act` (app_presence.rs, 49f7582226,
 // the pill's `+N`) running `aterm_messages`' provided
 // `Desk::next_need_after` at `&App`. It reads the table through `Desk`'s
-// getters and is handed no `&mut`, so `cell`'s `trusts` names it; the build
-// with that entry was not measured here (this Mac's two build slots stayed
-// held by other lanes), so re-run the full-build dry run before citing
-// "the seals hold" on this tree.
+// getters and is handed no `&mut`, so `cell`'s `trusts` names it. Measured
+// 2026-10-20 on aterm `7a5a5183b4`, which carries that entry, with the same
+// stage-1 trustc (built 2026-10-19 from trust `a597e0d6d9`, whose compiler
+// sources `269edd02c3` leaves as they were): the full build holds all three,
+// the entry answering for `Desk::next_need_after` at `App` (69,496 bodies,
+// 311,070 instances read; 9m 28s).
 //
 // WHAT IT DOES NOT SAY: that `config.harness`, the mirror Settings reads, is
 // written nowhere else (`adopt_harness_policy` and the config lane copy the

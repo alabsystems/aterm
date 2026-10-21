@@ -12,5 +12,11 @@ description = "aterm's system-awareness model: what the machine, aterm and each 
 # None: a pure model. The host (aterm-gui's vitals_host) reads the machine
 # through aterm-sysprobe and hands this crate plain numbers.
 
+[dev-dependencies]
+# The stuck verdict's Tier-1 conformance (tests/conformance_stuck_verdict.rs)
+# replays the engine against its model.
+aterm-models-misc.workspace = true
+aterm-spec.workspace = true
+
 [lints]
 workspace = true

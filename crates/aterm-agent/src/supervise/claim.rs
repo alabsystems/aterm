@@ -249,12 +249,16 @@ impl<C: Ctl> Session<'_, C> {
             }
             return;
         }
+        if let Some(line) = self.try_claim() {
+            say_claim(&line, review);
+        }
+    }
+
+    /// Ask for the claim once: what the answer says to say, if anything. A
+    /// request not served leaves it pending, due at the next request.
+    fn try_claim(&mut self) -> Option<String> {
         match self.set_claim() {
-            Some(r) => {
-                if let Some(line) = self.claim_from(&r) {
-                    say_claim(&line, review);
-                }
-            }
+            Some(r) => self.claim_from(&r),
             None => {
                 self.claim = Claim::Pending {
                     tried: self
@@ -263,7 +267,26 @@ impl<C: Ctl> Session<'_, C> {
                         .checked_sub(self.setup.claim_renew)
                         .unwrap_or_else(|| self.fx.mono()),
                 };
+                None
             }
+        }
+    }
+
+    /// CLAIM AT NAMING (card engine §8, lane A4): the hosted loop's claim,
+    /// asked for as its first request — before it opens its journal, reads
+    /// its ledger or looks at the screen — so the claim stands by the time
+    /// the agent it was started for paints (the harness card wraps a pane
+    /// only under a live claim, `aterm-gui`'s `claude_card`). What the take
+    /// found is said at the loop's start, where [`Self::take_claim`] says it
+    /// ([`Self::claim_said`]). Beside a proven self-claim nothing is taken
+    /// here: the start's take says so once.
+    pub(super) fn claim_at_naming(&mut self) {
+        if self.setup.beside.is_some() {
+            return;
+        }
+        self.claimed_at_naming = true;
+        if let Some(line) = self.try_claim() {
+            self.claim_said.push(line);
         }
     }
 

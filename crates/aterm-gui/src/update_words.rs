@@ -1986,16 +1986,20 @@ pub(crate) fn dev_build_entry(writes: DevSharedWrites) -> Entry {
 /// TCC attributes it to the bundle it first saw. The mark an `execve` after the
 /// launch leaves, which no successor this build launches through LaunchServices makes
 /// any more (its parent swaps first); an older build's successor, or a cause not yet
-/// measured, can still leave it. Only a quit and a fresh open give macOS a new record,
-/// and nothing breaks meanwhile, so it is an ENTRY of the digest (a fact for later),
-/// never a row on the glass. Booked by the outgoing window, it crosses to the successor
-/// at Commit and ends if the attempt returns (`App::book_launch_unregistered`) or when a
+/// measured, can still leave it. Only a fresh launch gives macOS a new record, and
+/// nothing breaks meanwhile, so it is an ENTRY of the digest (a fact for later), never a
+/// row on the glass. Booked by the outgoing window, it crosses to the successor at
+/// Commit and ends if the attempt returns (`App::book_launch_unregistered`) or when a
 /// window starts that no parent handed off to (`main_entry`). Every windowed process
-/// then measures its own record and books or ends the same entry on that
-/// ([`own_launch_record_stale_entry`]). Its key holds no pid.
+/// then measures its own record: a stale one renews itself by a handoff to a fresh
+/// launch of its build where nothing rules that out (`launch_record_renewal`), withdrawing
+/// this entry while that renewal is armed, and the same entry is booked only where nothing
+/// renews it ([`own_launch_record_stale_entry`]); a sound one ends it. Its key holds no
+/// pid.
 #[cfg(target_os = "macos")]
 pub(crate) fn launch_unregistered_entry(pid: i32) -> Entry {
     stale_launch_record_entry(
+        Why::OnlyYou(Reason::new(STALE_RECORD_REASON)),
         format!("LaunchServices answered the update's launch of pid {pid} with no pid"),
         format!("update: LaunchServices keeps a stale record of the successor (pid {pid})"),
     )
@@ -2004,25 +2008,70 @@ pub(crate) fn launch_unregistered_entry(pid: i32) -> Entry {
 /// The same entry from this process's own measure (`App::note_own_launch_record`):
 /// LaunchServices lists this app with no pid, and no entry is this process (`pid`).
 /// It also sees what no parent reported: a successor an older build launched, which
-/// swapped and re-exec'd itself, and a cold launch whose boot apply did.
+/// swapped and re-exec'd itself, and a cold launch whose boot apply did. Booked where no
+/// renewal runs (`launch_record_renewal::NoRenewal`); with a staged update, as a claim
+/// that ripens only if that update's handoff never renews the record.
 #[cfg(target_os = "macos")]
 pub(crate) fn own_launch_record_stale_entry(pid: u32) -> Entry {
     stale_launch_record_entry(
+        Why::OnlyYou(Reason::new(STALE_RECORD_REASON)),
         format!("LaunchServices lists aterm with no pid, and none of its entries is pid {pid}"),
         format!("launch record: LaunchServices keeps a stale record of this process (pid {pid})"),
     )
 }
 
+/// The same entry from a renewal's successor (`pid`, launched by pid `from`) that measured
+/// its own record stale too: the fresh launch did not renew it, and a renewal's successor
+/// never renews again.
 #[cfg(target_os = "macos")]
-fn stale_launch_record_entry(evidence: String, log_line: String) -> Entry {
+pub(crate) fn own_launch_record_renewed_stale_entry(pid: u32, from: u32) -> Entry {
+    stale_launch_record_entry(
+        Why::Spent {
+            tried: Reason::new("reloaded itself in place to renew it"),
+            reason: Reason::new(STALE_RECORD_REASON),
+        },
+        format!(
+            "a fresh launch (pid {pid}) from pid {from}: LaunchServices still lists aterm with \
+             no pid"
+        ),
+        format!(
+            "launch record: LaunchServices keeps a stale record of this process (pid {pid}), a \
+             fresh launch from pid {from}"
+        ),
+    )
+}
+
+/// The same entry once every renewal attempt (`attempts`) this process made ended without
+/// a successor taking over.
+#[cfg(target_os = "macos")]
+pub(crate) fn own_launch_record_renewal_spent_entry(pid: u32, attempts: u8) -> Entry {
+    stale_launch_record_entry(
+        Why::Spent {
+            tried: Reason::new(format!("tried {attempts} times to reload itself in place")),
+            reason: Reason::new(STALE_RECORD_REASON),
+        },
+        format!("LaunchServices lists aterm with no pid, and none of its entries is pid {pid}"),
+        format!(
+            "launch record: LaunchServices keeps a stale record of this process (pid {pid}); \
+             {attempts} renewal attempts did not finish"
+        ),
+    )
+}
+
+/// Why the person, and not aterm, ends a stale record: once aterm's own renewal has not
+/// run or not worked, only their fresh open gives macOS a new record.
+#[cfg(target_os = "macos")]
+const STALE_RECORD_REASON: &str =
+    "only quitting aterm and opening it again gives macOS a new record of it";
+
+#[cfg(target_os = "macos")]
+fn stale_launch_record_entry(why: Why, evidence: String, log_line: String) -> Entry {
     Entry::new(
         Family::Update,
         "launch-registration",
         "stale",
         "macOS lost track of updated aterm",
-        Why::OnlyYou(Reason::new(
-            "only quitting aterm and opening it again gives macOS a new record of it",
-        )),
+        why,
         Then::step("quit aterm with \u{2318}Q, then open it again"),
     )
     .severity(Severity::Warn)

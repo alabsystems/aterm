@@ -10,34 +10,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// This account's real home directory from Open Directory (`getpwuid_r(getuid())`),
-/// independent of `$HOME`.
-fn account_home() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    // SAFETY: `pw` and `buf` are valid stack buffers passed to the POSIX reentrant
-    // `getpwuid_r`. `pw_dir` is read only when `rc == 0` and `!out.is_null()`.
-    unsafe {
-        let mut pw: libc::passwd = std::mem::zeroed();
-        let mut buf = [0u8; 4096];
-        let mut out: *mut libc::passwd = std::ptr::null_mut();
-        let rc = libc::getpwuid_r(
-            libc::getuid(),
-            &mut pw,
-            buf.as_mut_ptr().cast::<libc::c_char>(),
-            buf.len(),
-            &mut out,
-        );
-        if rc != 0 || out.is_null() || pw.pw_dir.is_null() {
-            return None;
-        }
-        let bytes = std::ffi::CStr::from_ptr(pw.pw_dir).to_bytes();
-        if bytes.is_empty() {
-            return None;
-        }
-        Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
-    }
-}
-
 /// Whether this process runs in the account's own home (not a test harness's synthetic
 /// `$HOME` or private `ATERM_STATE_HOME`): only then does aterm read its tabs or retire the
 /// LaunchAgent earlier builds installed (`cli::retire_lan_agent`).
@@ -49,7 +21,7 @@ pub fn is_live_account() -> bool {
     let Some(env_home) = aterm_types::dirs::home_dir() else {
         return false;
     };
-    let Some(pw_home) = account_home() else {
+    let Some(pw_home) = aterm_uds::account::home() else {
         return false;
     };
     env_home == pw_home
@@ -144,7 +116,7 @@ pub fn parse_aterm_roster_line(
 #[must_use]
 pub fn shorten_home(path: &str) -> String {
     let trimmed = path.trim();
-    if let Some(home) = account_home().or_else(aterm_types::dirs::home_dir)
+    if let Some(home) = aterm_uds::account::home().or_else(aterm_types::dirs::home_dir)
         && let Some(h) = home.to_str().filter(|h| !h.is_empty())
     {
         if trimmed == h {
@@ -352,7 +324,7 @@ pub fn scan_local_aterm_sessions() -> Vec<crate::protocol::HostedSession> {
     if let Some(d) = aterm_uds::control_socket_dir() {
         dirs.push(d);
     }
-    if let Some(home) = account_home().or_else(aterm_types::dirs::home_dir) {
+    if let Some(home) = aterm_uds::account::home().or_else(aterm_types::dirs::home_dir) {
         let app_support = home.join("Library/Application Support/aterm");
         if !dirs.contains(&app_support) {
             dirs.push(app_support);

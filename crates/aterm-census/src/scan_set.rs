@@ -115,7 +115,7 @@ pub struct ReviewedFork {
 /// `path`, `census.mode = "scanned"` or a non-empty `census.namespace` is an
 /// error naming it. Other keys are forge's, which refuses unknown ones.
 pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
-    let text = match std::fs::read_to_string(root.join(FORK_LEDGER)) {
+    let text = match crate::tree::read_to_string(&root.join(FORK_LEDGER)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("cannot read {FORK_LEDGER}: {e} (fail-closed)")),
@@ -306,10 +306,11 @@ fn redistribution_evidence(root: &std::path::Path, path: &str) -> Option<String>
 
 /// The first upstream license file (`LICENSE*`, `COPYING*`) in `path`'s root.
 fn retained_license(root: &std::path::Path, path: &str) -> Option<String> {
-    let mut names: Vec<String> = std::fs::read_dir(root.join(path))
+    let mut names: Vec<String> = crate::tree::read_dir(&root.join(path))
         .ok()?
+        .into_iter()
         .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .filter(|n| {
             let upper = n.to_uppercase();
             upper.starts_with("LICENSE") || upper.starts_with("COPYING")
@@ -321,7 +322,7 @@ fn retained_license(root: &std::path::Path, path: &str) -> Option<String> {
 
 /// Does the top-level NOTICE name `path`?
 fn notice_names(root: &std::path::Path, path: &str) -> bool {
-    std::fs::read_to_string(root.join("NOTICE"))
+    crate::tree::read_to_string(&root.join("NOTICE"))
         .unwrap_or_default()
         .contains(path)
 }
@@ -813,7 +814,7 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
 fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
     let file_rel = format!("{dir}/Cargo.toml");
     let path = root.join(&file_rel);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+    let text = crate::tree::read_to_string(&path).map_err(|e| {
         format!(
             "cannot read {file_rel}: {e} — a path dependency must have a manifest \
              (fail-closed; is the dependency graph broken?)"
@@ -988,7 +989,7 @@ pub(crate) struct LockPackage {
 /// closure they cannot see.
 pub(crate) fn read_lock(root: &Path) -> Result<Vec<LockPackage>, String> {
     let file = "Cargo.lock";
-    let text = std::fs::read_to_string(root.join(file))
+    let text = crate::tree::read_to_string(&root.join(file))
         .map_err(|e| format!("cannot read {file}: {e} (fail-closed)"))?;
     let doc = parse_doc(&text, file)?;
     let mut out = Vec::new();
@@ -1155,7 +1156,7 @@ fn patch_row(key: &str, value: &Value) -> (String, Value) {
 
 fn load_root_tables(root: &Path) -> Result<RootTables, String> {
     let file_rel = "Cargo.toml";
-    let text = std::fs::read_to_string(root.join(file_rel))
+    let text = crate::tree::read_to_string(&root.join(file_rel))
         .map_err(|e| format!("cannot read the workspace root {file_rel}: {e} (fail-closed)"))?;
     let doc = parse_doc(&text, file_rel)?;
     let mut out = RootTables {
@@ -1453,7 +1454,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
 
     // ---- Drift guard: the walker must be able to scan every derived crate.
     for sd in &scan_dirs {
-        if !root.join(sd).is_dir() {
+        if !crate::tree::is_dir(&root.join(sd)) {
             return Err(format!(
                 "derived closure crate `{sd}` has no src/ directory on disk — the scan \
                  set and the scannable tree have drifted (fail-closed; fix the crate \
@@ -1487,7 +1488,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
                      provenance claim is as wrong as a missing one)"
                 ));
             }
-            if !root.join(path).join("Cargo.toml").is_file() {
+            if !crate::tree::is_file(&root.join(path).join("Cargo.toml")) {
                 return Err(format!(
                     "[patch] entry `{pkg}` points at {what} `{path}`, which has no \
                      Cargo.toml on disk — cargo cannot resolve this workspace at all \
@@ -1535,7 +1536,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
             ));
         }
         let scan_dir = format!("{path}/src");
-        if !root.join(&scan_dir).is_dir() {
+        if !crate::tree::is_dir(&root.join(&scan_dir)) {
             return Err(format!(
                 "scanned vendored crate `{pkg}` has no `{scan_dir}` directory on disk — \
                  the review and the tree have drifted (fail-closed)"
@@ -1558,7 +1559,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
                 r.package
             ));
         }
-        if !root.join(&r.path).join("Cargo.toml").is_file() {
+        if !crate::tree::is_file(&root.join(&r.path).join("Cargo.toml")) {
             return Err(format!(
                 "{FORK_LEDGER}'s `[[fork]] {}` points at `{}`, which has no Cargo.toml on \
                  disk — the review is STALE (fail-closed)",
@@ -1574,7 +1575,7 @@ pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<Scan
         if absorbed.iter().any(|(_, p)| p == row.path) {
             continue;
         }
-        let member = root.join(row.path).join("Cargo.toml").is_file();
+        let member = crate::tree::is_file(&root.join(row.path).join("Cargo.toml"));
         if !(member && retained_license(root, row.path).is_some() && notice_names(root, row.path)) {
             return Err(format!(
                 "ABSORBED_CRATES entry `{}` (`{}`) is neither an absorbed [patch] target nor an \
@@ -1630,7 +1631,7 @@ fn scan_absorbed(
 ) -> Result<ScannedVendored, String> {
     for slice in row.platform_slices {
         for p in slice.paths {
-            if !root.join(row.path).join(p).exists() {
+            if !crate::tree::exists(&root.join(row.path).join(p)) {
                 return Err(format!(
                     "ABSORBED_CRATES entry `{}` registers platform slice `{}` path `{p}`, \
                      which no longer exists under `{}` — the row is STALE (fail-closed)",
@@ -1751,6 +1752,7 @@ pub(crate) mod test_fixtures {
     use std::path::{Path, PathBuf};
 
     use super::{ABSORBED_CRATES, AbsorbedCrate, FORK_LEDGER};
+    pub(crate) use crate::tree::memory::Tree;
 
     /// The vendored fork every fixture reviews: (package, path, namespace).
     pub(crate) const FIXTURE_FORK: (&str, &str, &str) = ("indexmap", "vendor/indexmap", "indexmap");
@@ -1779,11 +1781,19 @@ pub(crate) mod test_fixtures {
             .to_path_buf()
     }
 
+    /// A checkout of `files` (relative path, contents) held in memory, which
+    /// every census that reads through [`crate::tree`] walks as it walks the
+    /// disk; it is gone when dropped.
+    pub(crate) fn synth_tree(prefix: &str, name: &str, files: &[(String, String)]) -> Tree {
+        Tree::new(&format!("{prefix}-{name}"), files)
+    }
+
     /// Write `files` (relative path, contents) under a fresh temp dir named for
     /// `prefix`, `name` and this process, and return it; the caller removes it.
-    /// Each module keeps its own `prefix`, so concurrent tests in different
-    /// modules never share a dir.
-    pub(crate) fn synth_tree(prefix: &str, name: &str, files: &[(String, String)]) -> PathBuf {
+    /// For the guards, which read the disk themselves. Each module keeps its
+    /// own `prefix`, so concurrent tests in different modules never share a
+    /// dir.
+    pub(crate) fn disk_tree(prefix: &str, name: &str, files: &[(String, String)]) -> PathBuf {
         let root = std::env::temp_dir().join(format!("{prefix}-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for (rel, contents) in files {
@@ -1902,10 +1912,7 @@ mod tests {
     }
 
     fn derive(name: &str, files: Vec<(String, String)>) -> Result<ScanSet, String> {
-        let root = synth_tree("aterm-scan-set", name, &files);
-        let out = derive_gui_scan_set(&root);
-        let _ = std::fs::remove_dir_all(&root);
-        out
+        derive_gui_scan_set(&synth_tree("aterm-scan-set", name, &files))
     }
 
     #[test]
@@ -2157,10 +2164,8 @@ mod tests {
         );
         let license = classify_patch_target("fork", "crates/aterm-fork", &root);
         let notice = classify_patch_target("noticed", "crates/aterm-noticed", &root);
-        std::fs::write(root.join("crates/aterm-noticed/LICENSE"), "upstream\n")
-            .expect("write license");
+        root.write("crates/aterm-noticed/LICENSE", "upstream\n");
         let both = classify_patch_target("noticed", "crates/aterm-noticed", &root);
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(both, Ok(PatchTargetKind::Absorbed));
         let license = license.expect_err("a retained license is a redistribution");
         assert!(
@@ -2191,7 +2196,6 @@ mod tests {
         );
         let evidence = redistribution_evidence(&root, "crates/aterm-own");
         let kind = classify_patch_target("own", "crates/aterm-own", &root);
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(evidence, None);
         assert_eq!(kind, Ok(PatchTargetKind::FirstParty));
     }
@@ -2527,14 +2531,11 @@ mod tests {
             );
         }
         let read = |name: &str, ledger: &str| {
-            let root = synth_tree(
+            reviewed_forks(&synth_tree(
                 "aterm-scan-set",
                 name,
                 &[(FORK_LEDGER.to_string(), ledger.to_string())],
-            );
-            let out = reviewed_forks(&root);
-            let _ = std::fs::remove_dir_all(&root);
-            out
+            ))
         };
         let table = "[[fork]]\nname = \"a\"\npath = \"vendor/a\"\n\
                      [fork.census]\nmode = \"scanned\"\nnamespace = \"a_ns\"\n";
@@ -2569,7 +2570,6 @@ mod tests {
         }
         let root = synth_tree("aterm-scan-set", "ledger-absent", &[]);
         assert_eq!(reviewed_forks(&root), Ok(Vec::new()));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

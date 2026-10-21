@@ -65,26 +65,62 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
 }
 
 /// The task file is the task, its last line ended, a blank line, then the
-/// one line of fact: it names the starter without requiring an output marker.
+/// one line of fact: it names the starter and the worker's Autopilot, and the
+/// `Nothing left:` defense that ends a Land worker's work, without the retired
+/// token. NEGATIVE CONTROL: a Cruise worker's fact names no defense (no
+/// report ends Cruise).
 #[test]
 fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
-    let fact = fact_line("s-ab12");
+    let fact = fact_line("s-ab12", Autopilot::Land);
     assert!(!fact.contains('\n'), "one line: {fact}");
     assert!(fact.contains("`s-ab12`"), "names the starter: {fact}");
     assert!(
-        !fact.contains(aterm_agent::supervise::policy::turn_end::FINISHED),
-        "requires no output marker: {fact}"
+        fact.contains("Autopilot Land"),
+        "names its Autopilot: {fact}"
+    );
+    assert!(
+        fact.contains("`Nothing left:`"),
+        "Land ends on the defense: {fact}"
+    );
+    assert!(fact.contains("`NEEDS YOU:`"), "a need goes on: {fact}");
+    let cruise = fact_line("s-ab12", Autopilot::Cruise);
+    assert!(cruise.contains("Autopilot Cruise"), "{cruise}");
+    assert!(
+        !cruise.contains("Nothing left:"),
+        "CONTROL: Cruise never ends: {cruise}"
+    );
+    for fact in [&fact, &cruise] {
+        assert!(
+            !fact.contains(aterm_agent::supervise::policy::turn_end::FINISHED),
+            "requires no output marker: {fact}"
+        );
+    }
+    assert_eq!(
+        task_text(b"do it", Some("ctl"), Autopilot::Land),
+        format!("do it\n\n{}\n", fact_line("ctl", Autopilot::Land)).into_bytes()
     );
     assert_eq!(
-        task_text(b"do it", Some("ctl")),
-        format!("do it\n\n{}\n", fact_line("ctl")).into_bytes()
-    );
-    assert_eq!(
-        task_text(b"two\nlines\n", Some("ctl")),
-        format!("two\nlines\n\n{}\n", fact_line("ctl")).into_bytes()
+        task_text(b"two\nlines\n", Some("ctl"), Autopilot::Cruise),
+        format!("two\nlines\n\n{}\n", fact_line("ctl", Autopilot::Cruise)).into_bytes()
     );
     // With no starter to name, the task alone, its last line ended.
-    assert_eq!(task_text(b"do it", None), b"do it\n");
+    assert_eq!(task_text(b"do it", None, Autopilot::Land), b"do it\n");
+}
+
+/// A worker's order is under Land unless the spawn said otherwise
+/// ([`WORKER_AUTOPILOT`], [`TaskOrder::under`]). NEGATIVE CONTROL: a spawn's
+/// `autopilot=cruise` is kept.
+#[test]
+fn a_worker_is_under_land_unless_its_spawn_says_cruise() {
+    assert_eq!(WORKER_AUTOPILOT, Autopilot::Land);
+    let order = TaskOrder::of_frame(Some(b"t".to_vec()), None, None, None).expect("an order");
+    assert_eq!(order.autopilot, Autopilot::Land);
+    assert_eq!(order.clone().under(None).autopilot, Autopilot::Land);
+    assert_eq!(
+        order.under(Some(Autopilot::Cruise)).autopilot,
+        Autopilot::Cruise,
+        "CONTROL: the spawn's word"
+    );
 }
 
 /// The task file is written 0600 in a 0700 directory, under the sid that
@@ -385,20 +421,14 @@ fn a_quit_removes_its_workers_task_files_and_no_other() {
         .expect("scratch dir");
     let dir = scratch.path().join("tasks");
     let store = crate::session_store::new_store();
-    let subscribers = crate::subscribe::new_registry();
     let (worker, shell) = (
         crate::session_store::test_handle(1),
         crate::session_store::test_handle(2),
     );
     store.write().unwrap().register(worker.clone());
     store.write().unwrap().register(shell.clone());
-    crate::task_record::mark_session_task(
-        &worker.ctx,
-        1,
-        &TaskMark::new(TaskState::Working),
-        &subscribers,
-    )
-    .expect("unfenced");
+    crate::task_record::mark_session_task(&worker.ctx, 1, &TaskMark::new(TaskState::Working))
+        .expect("unfenced");
     let write = |sid: &SessionId| {
         TaskSeed::new(b"t".to_vec())
             .write_in(&dir, sid)

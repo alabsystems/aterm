@@ -122,9 +122,16 @@ fn free_dirty_gate_settled_hits_moved_marks_row_union() {
     let mut dirty = Vec::new();
 
     // Settled: equal non-empty sprites + same atlas ⇒ gate hit, nothing marked.
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, CELL_H, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -142,9 +149,16 @@ fn free_dirty_gate_settled_hits_moved_marks_row_union() {
 
     // Moved: y 20 → 36 (bands 2..=4) ⇒ prev∪cur marks exactly [1, 2, 3, 4].
     cur.free_sprites = vec![free(4, 36, 16, 40)];
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, CELL_H, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(d.free_changed, "a moved sprite must set free_changed");
@@ -158,9 +172,16 @@ fn free_dirty_gate_settled_hits_moved_marks_row_union() {
     // Same-rect z flip: a real content change the gate must not swallow.
     cur.free_sprites = settled.clone();
     cur.free_sprites[0].z = FreeZ::OverText;
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, CELL_H, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(d.free_changed, "a same-rect z flip must set free_changed");
@@ -174,9 +195,16 @@ fn free_dirty_gate_settled_hits_moved_marks_row_union() {
     // A new atlas with byte-equal sprites: a rebake must repaint.
     cur.free_sprites = settled;
     cur.free_atlas = Some(Arc::new(patterned_atlas(64, 64, 2)));
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, CELL_H, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(

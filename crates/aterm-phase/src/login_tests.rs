@@ -67,3 +67,65 @@ fn esc_out_of_the_dialog_is_read_as_the_login_interrupted() {
         assert!(!login_interrupted(&screen(text)));
     }
 }
+
+/// The `/login` a dialog or its `Login interrupted` hangs from is read as
+/// typed at a lost login where the wall's row stands right above it — the
+/// hand-off, the picker, an error, the success state, an Esc out of it, and
+/// a second loss's dialog under an earlier `/login` left — and with the
+/// `/login`s left at the same wall before it said. NEGATIVE CONTROLS: the
+/// same dialogs and interrupt typed after a person's own Esc (no lost login
+/// above them), and screens with neither.
+#[test]
+fn a_login_typed_at_a_lost_login_is_read_as_the_walls() {
+    let at_wall = |rows: &[String]| login_at_wall(rows);
+    for text in [
+        LOGIN_PICKER_WARNED,
+        LOGIN_OPENING,
+        LOGIN_HANDOFF,
+        LOGIN_ERROR,
+        LOGIN_SUCCESS,
+        LOGIN_RELOOPED,
+    ] {
+        let got = at_wall(&screen(text)).unwrap_or_else(|| panic!("{text}"));
+        assert!(got.message.contains("Not logged in"), "{got:?}");
+        assert!(!got.left_before, "{text}");
+    }
+    // Esc out of the hand-off at the wall, then a person's own `/login`
+    // after it: both are the wall's, the second after one left.
+    let handoff = screen(LOGIN_HANDOFF);
+    let typed = handoff
+        .iter()
+        .position(|r| r.trim_end() == "❯ /login")
+        .expect("the /login row");
+    let mut left: Vec<String> = handoff[..=typed].to_vec();
+    left.extend(
+        [
+            "  ⎿  Login interrupted",
+            "",
+            &"─".repeat(144),
+            "❯ ",
+            &"─".repeat(144),
+        ]
+        .map(str::to_string),
+    );
+    assert_eq!(
+        at_wall(&left).map(|w| w.left_before),
+        Some(false),
+        "{left:#?}"
+    );
+    let mut again: Vec<String> = handoff[..=typed].to_vec();
+    again.push("  ⎿  Login interrupted".to_string());
+    again.push(String::new());
+    again.extend(handoff[typed..].iter().cloned());
+    assert_eq!(at_wall(&again).map(|w| w.left_before), Some(true));
+    // NEGATIVE CONTROLS.
+    for text in [
+        LOGIN_INTERRUPTED,
+        LOGIN_PICKER,
+        LOGIN_CONSOLE_MENU,
+        LOGIN_PICKER_CONSOLE,
+        LOGIN_EXPIRED,
+    ] {
+        assert_eq!(at_wall(&screen(text)), None, "{text}");
+    }
+}

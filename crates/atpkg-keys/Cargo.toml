@@ -31,7 +31,8 @@ test = false
 ring = { workspace = true, features = ["default"] }
 # Encode the 32-byte raw public keys of the paper master and the machine keys (the pins.rs
 # anchor, the roster entries).
-# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# Standard padded Base64 — first-party; its one dependency is astream-wire
+# (dependency-free, vendor/astream). `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
@@ -52,9 +53,6 @@ libc = { workspace = true }
 aterm-durable = { workspace = true }
 
 [dev-dependencies]
-# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
-# build too.
-aterm-durable = { workspace = true, features = ["test-support"] }
 # Prove the producer↔client contract: sign here, verify + INSTALL with the ACTUAL client.
 atpkg = { path = "../atpkg" }
 # Tier-1 binds the real roster pair redo/snapshot-CAS filesystem transaction to

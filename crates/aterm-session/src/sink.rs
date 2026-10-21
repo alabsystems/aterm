@@ -1828,7 +1828,13 @@ impl SinkWriter {
         };
 
         // Keep both guards through the syscall, so a normal writer cannot see an
-        // empty spill and then race this frame for the fd.
+        // empty spill and then race this frame for the fd. The ledger bracket
+        // closes as the syscall returns, before the rest is queued and while
+        // the spill mutex is still held: a discard waiting on that mutex then
+        // marks the ledger at the prefix the kernel took. Closed after the
+        // poke, the bracket would still count the whole frame in flight when
+        // such a discard marked it, and every later byte would be under-counted
+        // by the queued rest (`a_discard_behind_a_guarded_write_marks_what_the_kernel_took`).
         let mut spill_guard = spill_guard;
         let mut poke = false;
         let result = match self.shared.ledgered_nonparking(self.master, bytes, false) {

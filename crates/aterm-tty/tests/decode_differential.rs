@@ -1010,6 +1010,25 @@ fn paste_is_capped_at_the_document_limit_on_a_character_boundary() {
 /// A mixed stream: every split into two reads, and one byte per read, decodes as the
 /// whole burst does.
 #[test]
+fn a_broken_character_reads_as_from_utf8_lossy_reads_it() {
+    // Table 3-7 at each position: a second byte outside the lead's range (an overlong
+    // form, a surrogate, past U+10FFFF), then a third or fourth byte that is not a
+    // trailing byte, which may itself be a lead.
+    for bytes in [
+        &b"\xe0\x9f\x80x"[..],
+        b"\xed\xa0\x80x",
+        b"\xf4\x90\x80\x80x",
+        b"\xe4\xb8(",
+        b"\xf0\x9f\x98(",
+        b"\xf0\x9f\xc0(",
+        b"\xe1\x80\xe4\xb8\xadx",
+    ] {
+        let want: Vec<Event> = String::from_utf8_lossy(bytes).chars().map(typed).collect();
+        assert_eq!(decode_all(bytes), want, "{bytes:02x?}");
+    }
+}
+
+#[test]
 fn chunk_boundary_invariance() {
     // (bytes, what they decode to on their own and inside the stream)
     let mut segments: Vec<(Vec<u8>, Vec<Event>)> = vec![

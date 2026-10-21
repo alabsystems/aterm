@@ -79,6 +79,156 @@ fn glass_row(app: &App, wid: WindowId, row: usize) -> String {
     read_glass(&ws.input_scratch.cells[strip + row])
 }
 
+/// Account changes invalidate the real splice's cache, paint the new subscription in one
+/// row, and leave the vendor mode row untouched. Settled subscription text costs nothing.
+#[test]
+fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
+    let (mut app, wid, session) = probe_glass();
+    let rule = AT_REST.bottom();
+    let mode = glass_row(&app, wid, rule + 1);
+    let selected = |email: &str, plan: &str, weekly: Option<&str>| FooterFacts {
+        subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+            email: Some(email.into()),
+            plan: Some(plan.into()),
+            weekly: weekly.map(str::to_owned),
+        }),
+        ..facts()
+    };
+    publish(
+        &app,
+        session,
+        selected("first@example.com", "Max 5x", Some("weekly 29% left")),
+    );
+    assert_eq!(cost(&mut app, wid).composed, 1);
+    let first = glass_row(&app, wid, rule);
+    assert!(first.contains("first@example.com"), "{first:?}");
+    assert!(first.contains("Max 5x"), "{first:?}");
+    assert!(first.contains("weekly 29% left"), "{first:?}");
+    assert_eq!(glass_row(&app, wid, rule + 1), mode);
+    assert_eq!(cost(&mut app, wid), Cost::default());
+
+    publish(&app, session, selected("second@example.com", "Pro", None));
+    assert_eq!(cost(&mut app, wid).composed, 1);
+    let second = glass_row(&app, wid, rule);
+    assert!(second.contains("second@example.com"), "{second:?}");
+    assert!(second.contains("Pro"), "{second:?}");
+    assert!(second.contains("weekly unavailable"), "{second:?}");
+    assert!(
+        !second.contains("first@example.com") && !second.contains("29%"),
+        "{second:?}"
+    );
+    assert_eq!(glass_row(&app, wid, rule + 1), mode);
+    assert_eq!(cost(&mut app, wid), Cost::default());
+}
+
+#[test]
+fn unicode_subscription_text_survives_the_native_splice_and_rests_without_allocations() {
+    for email in [
+        "jose\u{0301}@example.com",
+        "x\u{0301}\u{0323}@example.com",
+        "使用者-jose\u{0301}-x\u{0301}\u{0323}-\u{1f469}\u{200d}\u{1f4bb}@example.com",
+    ] {
+        let facts = FooterFacts {
+            subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                email: Some(email.into()),
+                plan: Some("Pro".into()),
+                weekly: Some("weekly 29% left".into()),
+            }),
+            ..FooterFacts::default()
+        };
+        let (mut app, wid, _) = glass_with(&AT_REST, facts);
+        let reading = |app: &App| {
+            let ws = &app.windows[&wid];
+            let input = &ws.input_scratch;
+            let row = input.cells.len() - usize::from(ws.rows) + AT_REST.bottom();
+            let mut text = String::new();
+            for (col, cell) in input.cells[row].iter().enumerate() {
+                if cell.wide || cell.ch.is_whitespace() {
+                    continue;
+                }
+                if let Some(cluster) = input.cluster_at(row, col) {
+                    text.push_str(cluster);
+                } else {
+                    text.push(cell.ch);
+                    if let Some(marks) = input.combining_at(row, col) {
+                        text.extend(marks);
+                    }
+                }
+            }
+            text
+        };
+        assert!(
+            reading(&app).contains(email),
+            "{email:?}: {:?}",
+            reading(&app)
+        );
+        // Source -> native splice -> actual bundled-font pixels. Metadata alone
+        // would miss a renderer that still drops the small combining overlay.
+        if email.contains('\u{0301}') {
+            let input = &app.windows[&wid].input_scratch;
+            let mut renderer = aterm_render::Renderer::from_bytes(
+                aterm_render::embedded_font(),
+                24.0,
+                aterm_render::Theme::default(),
+            )
+            .expect("bundled font");
+            renderer.debug_block_on_lazy_fallbacks();
+            let marked = renderer.render_input(input);
+            let mut bare = input.clone();
+            let row = bare.cells.len() - usize::from(app.windows[&wid].rows) + AT_REST.bottom();
+            bare.combining[row].clear();
+            assert_ne!(
+                marked.pixels,
+                renderer.render_input(&bare).pixels,
+                "{email:?}: the accent paints ink"
+            );
+            if email.contains('👩') {
+                let at = input.cells[row]
+                    .iter()
+                    .position(|cell| cell.ch == '@')
+                    .unwrap();
+                let mut without_at = input.clone();
+                without_at.cells[row][at].ch = ' ';
+                let without = renderer.render_input(&without_at);
+                let differences = |a: &aterm_render::Frame, b: &aterm_render::Frame| {
+                    a.pixels
+                        .iter()
+                        .zip(&b.pixels)
+                        .enumerate()
+                        .filter_map(|(index, (a, b))| (a != b).then_some(index))
+                        .collect::<Vec<_>>()
+                };
+                let actual = differences(&marked, &without);
+                let mut isolated = without_at;
+                for cell in &mut isolated.cells[row] {
+                    cell.ch = ' ';
+                    cell.wide = false;
+                }
+                isolated.clusters[row].clear();
+                isolated.combining[row].clear();
+                let empty = renderer.render_input(&isolated);
+                isolated.cells[row][at] = input.cells[row][at];
+                isolated.cells[row][at].script = aterm_core::terminal::Script::Sub { nudge: 0 };
+                let reference = renderer.render_input(&isolated);
+                let expected = differences(&reference, &empty);
+                assert!(!expected.is_empty(), "the isolated @ paints ink");
+                assert_eq!(
+                    actual, expected,
+                    "the emoji must leave every native-position @ pixel visible"
+                );
+            }
+        }
+        for frame in 0..3 {
+            assert_eq!(
+                cost(&mut app, wid),
+                Cost::default(),
+                "{email:?}, frame {frame}"
+            );
+            assert!(reading(&app).contains(email), "{email:?}, frame {frame}");
+        }
+    }
+}
+
 /// THE FOOTER AT REST COSTS NOTHING: a frame on a Claude Code pane whose
 /// screen and facts did not move — model, effort, path, branch and usage
 /// shown — allocates nothing in the footer's pass, frame after frame: no
@@ -169,11 +319,11 @@ fn a_frame_at_rest_costs_the_footer_nothing() {
 }
 
 /// A HOVERED CHIP COSTS A FRAME NOTHING (design §9.2.1: the title is built
-/// when a hover starts, never per frame): with the pointer resting on a
-/// harness chip, a frame whose screen and facts did not move lays the
-/// chip's title from what the reading built — Autopilot's, whole and short,
-/// built once when the hover began (`App::claude_lights_block`); `⚙`'s
-/// static — and does nothing else the footer counts: no allocation, no
+/// when a hover starts, never per frame): with the pointer resting on the
+/// Autopilot chip, a frame whose screen and facts did not move lays the
+/// chip's title from what the reading built — whole and short, built once
+/// when the hover began (`App::claude_lights_block`) — and does nothing
+/// else the footer counts: no allocation, no
 /// reading, no fit, no composition (the rule's cells are the last frame's).
 /// At this pane's width, beside these facts, Autopilot's is a LEANER form
 /// (v1's words, the menu's line given up: §9.2.1), laid from slices of the
@@ -200,32 +350,27 @@ fn a_hovered_chip_costs_its_title_alone() {
         Cost::default(),
         "CONTROL: chips at rest"
     );
-    for chip in [Chip::Autopilot, Chip::Settings] {
-        app.hover_claude_chip(wid, Some((session, chip)));
-        let first = cost(&mut app, wid);
-        assert!(
-            first.allocations > 0,
-            "CONTROL {chip:?}: the hover's first frame lays its title ({first:?})"
+    app.hover_claude_chip(wid, Some((session, Chip::Autopilot)));
+    let first = cost(&mut app, wid);
+    assert!(
+        first.allocations > 0,
+        "CONTROL: the hover's first frame lays its title ({first:?})"
+    );
+    for _ in 0..2 {
+        let _ = pass(&mut app, wid);
+    }
+    let hovered = glass_row(&app, wid, rule);
+    assert!(
+        hovered.contains("autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land ")
+            && !hovered.contains("right-click"),
+        "CONTROL: a leaner form is the one laid: {hovered:?}"
+    );
+    for i in 0..12 {
+        assert_eq!(
+            cost(&mut app, wid),
+            Cost::default(),
+            "Autopilot hovered, frame {i}"
         );
-        for _ in 0..2 {
-            let _ = pass(&mut app, wid);
-        }
-        if chip == Chip::Autopilot {
-            let hovered = glass_row(&app, wid, rule);
-            assert!(
-                hovered.contains(
-                    "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land "
-                ) && !hovered.contains("right-click"),
-                "CONTROL: a leaner form is the one laid: {hovered:?}"
-            );
-        }
-        for i in 0..12 {
-            assert_eq!(
-                cost(&mut app, wid),
-                Cost::default(),
-                "{chip:?} hovered, frame {i}"
-            );
-        }
     }
     app.hover_claude_chip(wid, None);
     for _ in 0..2 {
@@ -413,6 +558,8 @@ fn each_reading_follows_its_rows() {
         "CONTROL: no card, no model: {:?}",
         glass_row(&app, wid, rule)
     );
+    // Its cards are the drawer's own: painted after its cut.
+    drawer(&app, session, 4242, "claude", "2.1.283");
     for model in ["Opus 5.5", "Sonnet 4.5"] {
         feed(&app, session, &card(model));
         refill(&mut app, wid);
@@ -427,6 +574,72 @@ fn each_reading_follows_its_rows() {
             cost(&mut app, wid),
             Cost::default(),
             "{model}: the card's reading kept, at rest"
+        );
+    }
+}
+
+/// A CARD THE GATE REFUSES COSTS A SETTLED FRAME NOTHING (card engine §3.8,
+/// §3.12): while the facts leave the model open, a launch card on the pane
+/// that is not the drawer's — on a Claude Code with no drawer image (one run
+/// by `node`, an npm install), or there before the drawer's cut — is judged
+/// before anything is copied or locked: each settled pass takes the
+/// splice's one timeline lock and allocates nothing, and the footer names no
+/// model from that card (a Claude Code that is no drawer names its model once
+/// its transcript does). CONTROL: the drawer's own card is kept, its model on
+/// the rule, for the same cost at rest. Mutation-checked: the card copied and
+/// a second lock taken before the verdict costs three allocations and two
+/// locks a settled pass.
+#[test]
+fn a_refused_card_costs_a_settled_frame_nothing() {
+    let rule = AT_REST.bottom();
+    let banner = aterm_phase::anchor_text("launch.banner");
+    let card = || -> Vec<String> {
+        let mut rows = screen(&AT_REST);
+        rows[1] =
+            format!(" \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {banner}2.1.283");
+        rows[2] = "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 \u{b7} Claude Max".to_owned();
+        rows[3] = " \u{259D}\u{259D}   \u{259D}\u{259D}   ~/aterm".to_owned();
+        for row in &mut rows[4..AT_REST.bottom() - 4] {
+            row.clear();
+        }
+        rows
+    };
+    let open = FooterFacts {
+        model: None,
+        effort: None,
+        model_open: true,
+        ..facts()
+    };
+    for (case, own) in [
+        ("no drawer", None),
+        ("before its cut", Some(false)),
+        ("its own", Some(true)),
+    ] {
+        let (mut app, wid, session) = glass_with(&AT_REST, open.clone());
+        if own == Some(true) {
+            drawer(&app, session, 4242, "claude", "2.1.283");
+        }
+        feed(&app, session, &card());
+        if own == Some(false) {
+            drawer(&app, session, 4242, "claude", "2.1.283");
+        }
+        refill(&mut app, wid);
+        let _ = cost(&mut app, wid);
+        for i in 0..3 {
+            let _ = crate::work_counts::take_footer_timeline_locks();
+            let settled = cost(&mut app, wid);
+            let locks = crate::work_counts::take_footer_timeline_locks();
+            assert_eq!(
+                (settled.allocations, settled.cards, locks),
+                (0, 0, 1),
+                "{case}, pass {i}: no copy, no reading, one lock: {settled:?}"
+            );
+        }
+        assert_eq!(
+            glass_row(&app, wid, rule).contains("Opus 5.5"),
+            own == Some(true),
+            "{case}: {:?}",
+            glass_row(&app, wid, rule)
         );
     }
 }

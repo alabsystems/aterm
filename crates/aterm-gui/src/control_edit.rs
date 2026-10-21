@@ -6,21 +6,23 @@
 //!
 //! `@s-<sid> edit <file-uri> …` asks the window hosting `<sid>` for a fresh
 //! Editor view of the file beside `<sid>`'s tab; `await edit ticket=<t>` waits
-//! until that view is gone. Both run on a wait lane and park on a one-shot
-//! channel the main thread answers (`App::begin_edit`, `App::await_edit` in
-//! `app_edit`), in [`crate::control::hangup_park`] slices so a killed client
-//! frees the lane within [`crate::control::HANGUP_POLL`], as `askpass` does
-//! (`control_askpass`). Every exit of `await edit` withdraws its waiter, and
-//! an `edit` that stops waiting cancels its ticket, so a late admission is
-//! dropped rather than opening a view nobody asked for any more.
+//! until that view is gone. Both run on a wait lane and post their request as
+//! a counted main-thread hop ([`MainPost::ask`]), so one the main thread has
+//! not taken is seen by the next verb's stall refusal. They park on its
+//! one-shot channel, which the main thread answers (`App::begin_edit`,
+//! `App::await_edit` in `app_edit`), in [`crate::control::hangup_park`] slices
+//! so a killed client frees the lane within [`crate::control::HANGUP_POLL`], as
+//! `askpass` does (`control_askpass`). Every exit of `await edit` withdraws its
+//! waiter, and an `edit` that stops waiting cancels its ticket, so a late
+//! admission is dropped rather than opening a view nobody asked for any more.
 //!
 //! The lane also resolves the file's realpath spelling (`/tmp` is
 //! `/private/tmp` on macOS), as an admission's grant names it: that reads the
 //! file system, which may wait on a network volume, so it happens here and not
 //! on the main thread.
 //!
-//! The lane logic is written against injected `post`/`hung_up` closures: no
-//! event-loop proxy can be built in a unit test.
+//! The lane logic is written against an injected [`MainPost`] and `hung_up`
+//! closure: no event-loop proxy can be built in a unit test.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -31,6 +33,7 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 use crate::control::Scope;
+use crate::control::control_media::MainPost;
 
 pub(crate) mod hold;
 
@@ -93,7 +96,7 @@ fn mint_waiter() -> WaiterId {
     WaiterId(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// `@<sid> edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>]`.
+/// `@<sid> edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`.
 /// `session` is the resolved `@<sid>`; `None` on the bare App lane, which has
 /// no tab to open beside.
 pub(crate) fn cmd_edit(
@@ -109,20 +112,20 @@ pub(crate) fn cmd_edit(
         scope,
         session,
         rest,
-        &mut |wake| proxy.send_event(wake).is_ok(),
+        &mut MainPost::new(proxy),
         &mut crate::control::caller_hung_up,
         EDIT_ADMISSION_DEADLINE,
         crate::control::hangup_park,
     )
 }
 
-/// [`cmd_edit`]'s lane logic. `post` hands a `Wake` to the main thread and
-/// says whether it was taken; `park` bounds one wait slice.
+/// [`cmd_edit`]'s lane logic, past the main-thread refusal [`cmd_edit`] asks
+/// first. `post` reaches the main thread; `park` bounds one wait slice.
 pub(crate) fn serve_edit(
     scope: Scope,
     session: Option<u64>,
     rest: &str,
-    post: &mut dyn FnMut(Wake) -> bool,
+    post: &mut MainPost<'_>,
     hung_up: &mut dyn FnMut() -> bool,
     deadline: Duration,
     park: fn(Duration) -> Duration,
@@ -146,28 +149,35 @@ pub(crate) fn serve_edit(
         return format!("ERR refused bad-uri ({error})\n");
     }
     let ticket = mint_ticket();
-    let (reply, answer) = std::sync::mpsc::channel();
+    // `wait=0`: nobody will wait on the ticket, so its view opens holding
+    // nothing. The mark stands until this lane has its answer, which the main
+    // thread sends after the view has opened.
+    let _unwaited = (!request.wait).then(|| hold::Unwaited::mark(ticket));
     let real_uri = real_file_uri(&request.uri);
-    let call = EditCall {
-        ticket,
-        session,
-        request,
-        real_uri,
-        reply,
+    // Counted from the post until the main thread takes the request or this
+    // lane returns, whichever is first.
+    let (answer, _hop) = match post.ask(|reply| {
+        Wake::EditRequest(Box::new(EditCall {
+            ticket,
+            session,
+            request,
+            real_uri,
+            reply,
+        }))
+    }) {
+        Ok(posted) => posted,
+        Err(error) => return format!("ERR {error}\n"),
     };
-    if !post(Wake::EditRequest(Box::new(call))) {
-        return "ERR event loop gone\n".to_string();
-    }
     let started = Instant::now();
     let waited = park_for_answer(&answer, started + deadline, hung_up, park);
     match waited {
         Waited::Answer(line) => line,
         Waited::HungUp => {
-            post(Wake::EditCancel { ticket });
+            post.tell(Wake::EditCancel { ticket });
             crate::control::HUNG_UP_REPLY.to_string()
         }
         Waited::Deadline => {
-            post(Wake::EditCancel { ticket });
+            post.tell(Wake::EditCancel { ticket });
             format!("ERR timeout ticket={ticket}\n")
         }
         Waited::Dropped => format!("ERR edit ticket={ticket} was dropped\n"),
@@ -175,12 +185,15 @@ pub(crate) fn serve_edit(
 }
 
 /// `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]` (`rest` starts at
-/// `edit`).
+/// `edit`). No main-thread refusal: its client ends the wait on any `ERR` but
+/// the few that say the server is going or busy (`aterm-ctl`'s
+/// `edit::await_reply`), and a standing dialog or a stall leaves the view it
+/// waits on open.
 pub(crate) fn await_edit(proxy: &EventLoopProxy<Wake>, scope: Scope, rest: &str) -> String {
     serve_await_edit(
         scope,
         rest,
-        &mut |wake| proxy.send_event(wake).is_ok(),
+        &mut MainPost::new(proxy),
         &mut crate::control::caller_hung_up,
         crate::control::hangup_park,
     )
@@ -190,7 +203,7 @@ pub(crate) fn await_edit(proxy: &EventLoopProxy<Wake>, scope: Scope, rest: &str)
 pub(crate) fn serve_await_edit(
     scope: Scope,
     rest: &str,
-    post: &mut dyn FnMut(Wake) -> bool,
+    post: &mut MainPost<'_>,
     hung_up: &mut dyn FnMut() -> bool,
     park: fn(Duration) -> Duration,
 ) -> String {
@@ -212,20 +225,21 @@ pub(crate) fn serve_await_edit(
         wait.timeout_ms,
     ));
     let waiter = mint_waiter();
-    let (reply, answer) = std::sync::mpsc::channel();
-    let call = AwaitCall {
-        waiter,
-        key: wait.key,
-        real_uri,
-        reply,
+    let (answer, _hop) = match post.ask(|reply| {
+        Wake::EditAwait(Box::new(AwaitCall {
+            waiter,
+            key: wait.key,
+            real_uri,
+            reply,
+        }))
+    }) {
+        Ok(posted) => posted,
+        Err(error) => return format!("ERR {error}\n"),
     };
-    if !post(Wake::EditAwait(Box::new(call))) {
-        return "ERR event loop gone\n".to_string();
-    }
     let waited = park_for_answer(&answer, Instant::now() + timeout, hung_up, park);
     // Every exit withdraws: an answered waiter is already gone, and a timed-out
     // or hung-up one starts its ticket's orphan clock.
-    post(Wake::EditAwaitWithdraw { waiter });
+    post.tell(Wake::EditAwaitWithdraw { waiter });
     match waited {
         Waited::Answer(line) => line,
         Waited::HungUp => crate::control::HUNG_UP_REPLY.to_string(),
@@ -271,6 +285,7 @@ fn park_for_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::control_media::{Hops, take_hop};
 
     /// One park slice of at most 5 ms: these tests never wait out a real bound.
     fn short(left: Duration) -> Duration {
@@ -279,6 +294,17 @@ mod tests {
 
     fn never() -> bool {
         false
+    }
+
+    /// A count of hops of the calling test's own.
+    fn fresh_hops() -> &'static Hops {
+        Box::leak(Box::new(Hops::new()))
+    }
+
+    /// A main thread made of `serve`, which is handed each wake as
+    /// `user_event` is, its hop taken first.
+    fn main_thread<'a>(mut serve: impl FnMut(Wake) -> bool + 'a) -> MainPost<'a> {
+        MainPost::injected(move |wake| serve(take_hop(wake)), fresh_hops())
     }
 
     #[test]
@@ -294,7 +320,7 @@ mod tests {
                 scope,
                 session,
                 rest,
-                post,
+                &mut main_thread(post),
                 &mut never,
                 Duration::ZERO,
                 short,
@@ -329,7 +355,7 @@ mod tests {
             Scope::Owner,
             Some(9),
             "file:///tmp/x.txt line=3",
-            &mut post,
+            &mut main_thread(&mut post),
             &mut never,
             Duration::from_secs(60),
             short,
@@ -356,7 +382,7 @@ mod tests {
             Scope::Owner,
             Some(1),
             "file:///tmp/x.txt",
-            &mut post,
+            &mut main_thread(&mut post),
             &mut never,
             Duration::from_millis(20),
             short,
@@ -364,6 +390,124 @@ mod tests {
         let ticket = held.expect("posted").ticket;
         assert_eq!(line, format!("ERR timeout ticket={ticket}\n"));
         assert_eq!(cancelled, Some(ticket));
+    }
+
+    /// `edit` and `await edit` post their requests as counted main-thread
+    /// hops ([`MainPost::ask`]): each is counted while the main thread has not
+    /// taken it, so the next verb's stall refusal sees a lane parked behind a
+    /// main thread that does not take it, and is counted out once taken or
+    /// once its lane returns. The cancel and the withdrawal wait for nothing
+    /// and are posted uncounted. Negative control: the same request posted
+    /// raw leaves the count empty, so what the count sees is the hop.
+    #[test]
+    fn edit_requests_are_counted_hops_until_taken() {
+        let hops = fresh_hops();
+        let (reply, _answer) = std::sync::mpsc::channel();
+        let raw = Wake::EditRequest(Box::new(EditCall {
+            ticket: mint_ticket(),
+            session: 1,
+            request: EditRequest::parse("file:///tmp/x.txt").expect("a request"),
+            real_uri: None,
+            reply,
+        }));
+        assert!(MainPost::injected(|_| true, hops).tell(raw));
+        assert_eq!(hops.since_ns(), None, "a raw post is not counted");
+
+        // Never taken: counted for the whole wait, out once the lane returns.
+        let mut posted = Vec::new();
+        let mut counted = Vec::new();
+        let line = serve_edit(
+            Scope::Owner,
+            Some(1),
+            "file:///tmp/x.txt",
+            &mut MainPost::injected(
+                |wake| {
+                    posted.push(wake);
+                    true
+                },
+                hops,
+            ),
+            &mut || {
+                counted.push(hops.since_ns().is_some());
+                false
+            },
+            Duration::from_millis(20),
+            short,
+        );
+        assert!(line.starts_with("ERR timeout ticket="), "{line}");
+        assert!(
+            !counted.is_empty() && counted.iter().all(|&c| c),
+            "{counted:?}"
+        );
+        assert_eq!(hops.since_ns(), None, "the lane returned");
+        match posted.as_slice() {
+            [Wake::Hop { wake, .. }, Wake::EditCancel { .. }]
+                if matches!(**wake, Wake::EditRequest(_)) => {}
+            other => panic!("the request counted, its cancel not: {other:?}"),
+        }
+
+        let mut posted = Vec::new();
+        let mut counted = Vec::new();
+        let line = serve_await_edit(
+            Scope::Owner,
+            "edit ticket=5 timeout=10",
+            &mut MainPost::injected(
+                |wake| {
+                    posted.push(wake);
+                    true
+                },
+                hops,
+            ),
+            &mut || {
+                counted.push(hops.since_ns().is_some());
+                false
+            },
+            short,
+        );
+        assert_eq!(line, "OK timeout\n");
+        assert!(
+            !counted.is_empty() && counted.iter().all(|&c| c),
+            "{counted:?}"
+        );
+        assert_eq!(hops.since_ns(), None, "the lane returned");
+        match posted.as_slice() {
+            [Wake::Hop { wake, .. }, Wake::EditAwaitWithdraw { .. }]
+                if matches!(**wake, Wake::EditAwait(_)) => {}
+            other => panic!("the wait counted, its withdrawal not: {other:?}"),
+        }
+
+        // Taken at once, as `user_event` takes every wake: out of the count
+        // while the lane still parks for the answer.
+        let mut taken = Vec::new();
+        let mut counted = Vec::new();
+        let line = serve_await_edit(
+            Scope::Owner,
+            "edit ticket=5 timeout=10",
+            &mut MainPost::injected(
+                |wake| {
+                    taken.push(take_hop(wake));
+                    true
+                },
+                hops,
+            ),
+            &mut || {
+                counted.push(hops.since_ns().is_some());
+                false
+            },
+            short,
+        );
+        assert_eq!(line, "OK timeout\n");
+        assert!(
+            !counted.is_empty() && counted.iter().all(|&c| !c),
+            "{counted:?}"
+        );
+        assert!(
+            matches!(
+                taken.as_slice(),
+                [Wake::EditAwait(_), Wake::EditAwaitWithdraw { .. }]
+            ),
+            "{taken:?}"
+        );
     }
 
     #[test]
@@ -387,7 +531,7 @@ mod tests {
             Scope::Owner,
             Some(1),
             "file:///tmp/x.txt",
-            &mut post,
+            &mut main_thread(&mut post),
             &mut hung,
             Duration::from_secs(60),
             short,
@@ -413,7 +557,13 @@ mod tests {
             }
             true
         };
-        let line = serve_await_edit(Scope::Owner, "edit ticket=5", &mut post, &mut never, short);
+        let line = serve_await_edit(
+            Scope::Owner,
+            "edit ticket=5",
+            &mut main_thread(&mut post),
+            &mut never,
+            short,
+        );
         assert_eq!(line, "OK edit done result=closed saved=1 seq=2\n");
         // Timed out (the channel stays open, unanswered).
         let mut parked = Vec::new();
@@ -428,7 +578,7 @@ mod tests {
         let line = serve_await_edit(
             Scope::Owner,
             "edit uri=file:///tmp/x.txt timeout=10",
-            &mut post_timeout,
+            &mut main_thread(&mut post_timeout),
             &mut never,
             short,
         );
@@ -445,7 +595,7 @@ mod tests {
         let line = serve_await_edit(
             Scope::Owner,
             "edit ticket=5",
-            &mut post_hung,
+            &mut main_thread(&mut post_hung),
             &mut || true,
             short,
         );
@@ -462,7 +612,7 @@ mod tests {
             serve_await_edit(
                 Scope::Owner,
                 "edit ticket=x",
-                &mut nothing,
+                &mut main_thread(&mut nothing),
                 &mut never,
                 short
             )
@@ -470,7 +620,13 @@ mod tests {
         );
         let edge = Scope::Edge(aterm_session::EdgeToken::from_bytes([7; 32]));
         assert_eq!(
-            serve_await_edit(edge, "edit ticket=5", &mut nothing, &mut never, short),
+            serve_await_edit(
+                edge,
+                "edit ticket=5",
+                &mut main_thread(&mut nothing),
+                &mut never,
+                short
+            ),
             "ERR scope\n"
         );
     }
@@ -509,7 +665,13 @@ mod tests {
             true
         };
         let rest = format!("edit uri={spelled} timeout=1");
-        serve_await_edit(Scope::Owner, &rest, &mut post, &mut never, short);
+        serve_await_edit(
+            Scope::Owner,
+            &rest,
+            &mut main_thread(&mut post),
+            &mut never,
+            short,
+        );
         let parked = parked.expect("posted");
         assert_eq!(
             parked.key,
@@ -531,7 +693,7 @@ mod tests {
             Scope::Owner,
             Some(1),
             &spelled,
-            &mut post,
+            &mut main_thread(&mut post),
             &mut never,
             Duration::ZERO,
             short,

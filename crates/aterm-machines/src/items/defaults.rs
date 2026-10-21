@@ -1609,7 +1609,7 @@ scope = "user"
     fn the_live_tool_reads_a_missing_system_domain_as_absent_and_a_real_one_as_known() {
         // Read only: `defaults export` of system domains, as whoever runs the tests.
         if !Path::new(DEFAULTS).exists() {
-            return;
+            aterm_uds::host::could_not_run(format!("no {DEFAULTS} here (macOS ships it)"));
         }
         let live = crate::port::Live::new();
         let none = Target::system("com.aterm.machines.no-such-domain", "Key");
@@ -1629,8 +1629,15 @@ scope = "user"
             std::fs::File::open(path),
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied
         );
-        if !Path::new(DEFAULTS).exists() || live.euid() == 0 || !denied {
-            return;
+        if !Path::new(DEFAULTS).exists() {
+            aterm_uds::host::could_not_run(format!("no {DEFAULTS} here (macOS ships it)"));
+        }
+        aterm_uds::host::could_not_run_as_root("a root-only (0600) system plist");
+        if !denied {
+            aterm_uds::host::could_not_run(format!(
+                "{} is not refused to this user here, so no domain stands in as unreadable",
+                path.display()
+            ));
         }
         let read = Target::system("com.apple.apsd", "Anything").read(&live);
         assert!(matches!(read, Read::Unusable(_)), "{read:?}");

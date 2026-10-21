@@ -326,7 +326,7 @@ fn serious_mode_and_acts_off_light_nothing_and_keep_the_trail() {
             } else {
                 Autopilot::Cruise
             };
-            assert!(app.set_session_autopilot(0, Some(word)));
+            assert!(app.set_session_autopilot(0, Some(word), crate::autopilot::Surface::Chip));
         }),
     ];
     for (i, (what, withhold)) in withheld.into_iter().enumerate() {
@@ -548,7 +548,7 @@ fn the_task_face_is_kept_for_the_frame() {
     assert!(on_task(&mut app, 7, None, 1_792_249_260_000));
     assert!(app.harness_glass.is_empty(), "unknown keeps no entry");
     assert_eq!(app.chip_glass(7), ChipGlass::default());
-    on_task(&mut app, 8, Some(TaskFace::Spent), 0);
+    on_task(&mut app, 8, Some(TaskFace::Theirs), 0);
     app.forget_harness_glass(8);
     assert!(app.harness_glass.is_empty());
     assert_eq!(app.harness_acts_deadline(), None);
@@ -828,5 +828,25 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
     assert_eq!(
         format!("{}{}", v1.0, v1.1),
         "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land"
+    );
+}
+
+/// A STAMP'S MINUTE READS BACK AS ITS INSTANT (`Stamp::unix_ms`, `Stamp::at`'s
+/// inverse to the minute): the wall time the menu bar's Done for you row
+/// ages from where the timeline no longer holds an end's instant names the
+/// very clock and day the end showed. NEGATIVE CONTROL: a minute off reads
+/// another clock.
+#[test]
+fn a_stamps_minute_reads_back_as_its_instant() {
+    let Some(stamp) = crate::harness_glass::Stamp::at(1_760_978_545) else {
+        aterm_spec::host::could_not_run("the platform cannot say the zone: no clock to read back");
+    };
+    let ms = stamp.unix_ms().expect("the zone reads");
+    assert_eq!(ms % 60_000, 0, "the minute's start");
+    assert_eq!(crate::harness_glass::Stamp::at(ms / 1000), Some(stamp));
+    assert_ne!(
+        crate::harness_glass::Stamp::at(ms / 1000 + 60),
+        Some(stamp),
+        "CONTROL: the next minute is another clock"
     );
 }

@@ -584,30 +584,68 @@ const ORPHAN_BOUND_SECS: u64 = 600;
 /// edge is the shell that launched it, and it stands down once that shell exits; a
 /// cron job's parent is cron's own child or the `sh` it runs, not init.) The shape is
 /// DETERMINISTIC, not a race on the spawner's exit: a throwaway `sh` forks a subshell
-/// that sleeps and exits at once; the subshell (the pid `$!` names) is re-parented
-/// while it sleeps and only THEN execs the waiter, so the parent at the dispatch edge
-/// is already init (or the subreaper). Both pipes reach this process through the
-/// inherited fds.
+/// (the pid `$!` names) that waits on a FIFO gate, and exits; this test reaps that `sh`
+/// — the kernel re-parents a process's children as it exits, before its parent can
+/// reap it — and only then opens the gate, so the subshell execs the waiter with its
+/// parent already init (or the subreaper), however loaded the machine is. (Before
+/// 2026-10-20 the subshell slept a second instead: an `sh` still alive then was
+/// recorded as the spawner, and the waiter stood down once it went.) Both pipes reach
+/// this process through the inherited fds.
 #[test]
 fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
+    use std::io::Write as _;
     let fx = Fixture::new("init-parent");
     let _guard = fx.hold();
     let bound = atpkg::lock::WAIT_ANNOUNCE_GRACE + Duration::from_secs(1);
+    // The gate, held open read-write here, so the subshell's open of it never waits for
+    // a writer and the line written below waits in the pipe until it reads.
+    let gate_path = fx.home.with_file_name("gate");
+    let gate_c = {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::ffi::CString::new(gate_path.as_os_str().as_bytes()).expect("a path with no NUL")
+    };
+    // SAFETY: `gate_c` is a NUL-terminated path that outlives the call.
+    let made = unsafe { libc::mkfifo(gate_c.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    let mut gate = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&gate_path)
+        .expect("hold the gate");
     let sh = fx
         .command("/bin/sh")
         .arg("-c")
-        .arg(r#"( sleep 1; exec "$1" seed --wait-lock "$2" ) & echo "waiter=$!""#)
+        .arg(r#"( read _ <"$3"; exec "$1" seed --wait-lock "$2" ) & echo "waiter=$!""#)
         .arg("sh")
         .arg(env!("CARGO_BIN_EXE_atpkg"))
         .arg(bound.as_secs().to_string())
+        .arg(&gate_path)
         .spawn()
         .expect("spawn the throwaway parent");
     let sh_pid = sh.id();
-    let started = Instant::now();
-    let streamed = stream(sh);
+    let mut streamed = stream(sh);
+    // The throwaway parent exits at once (a hang detector, not a budget); once it is
+    // reaped, the subshell's parent is init (or the subreaper), and the gate opens.
+    let reaped = Instant::now();
+    let exited = loop {
+        if let Some(status) = streamed
+            .child
+            .try_wait()
+            .expect("poll the throwaway parent")
+        {
+            break status;
+        }
+        assert!(
+            reaped.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the throwaway parent (pid {sh_pid}) never exited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(exited.success(), "the throwaway parent itself: {exited}");
+    gate.write_all(b"go\n").expect("open the gate");
     // The announcement is the proof it did NOT stand down: it is printed only
     // after the grace and only while the waiter still wants the lock.
-    let deadline = started + Duration::from_secs(1) + ANNOUNCE_WITHIN;
+    let deadline = Instant::now() + ANNOUNCE_WITHIN;
     while !streamed.stdout_has(&waiting_line()) {
         assert!(
             Instant::now() < deadline,
@@ -626,7 +664,7 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
                 .and_then(|p| p.trim().parse::<u32>().ok())
         })
         .expect("the waiter's pid line");
-    // The shape held: the announcing waiter's parent is not the (dead) `sh`.
+    // The shape held: the announcing waiter's parent is not the (reaped) `sh`.
     let ppid = Command::new("ps")
         .args(["-o", "ppid=", "-p", &pid.to_string()])
         .output()
@@ -644,8 +682,7 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
         .args(["-KILL", &pid.to_string()])
         .status();
     // Both pipes reach EOF once the waiter is gone.
-    let (status, _, _, _) = streamed.finish(Duration::from_secs(60));
-    assert!(status.success(), "the throwaway parent itself: {status}");
+    let _ = streamed.finish(Duration::from_secs(60));
 }
 
 /// No contention, no marker: the flag changes nothing about an uncontended pass.

@@ -24,12 +24,40 @@ fn dispatch(lab: &mut Lab, event: AppEvent) {
     lab.dispatch(event);
 }
 
+/// Page Down, each press drawn at `width`×`height` as the window draws
+/// between presses, until a press moves the list no further: its last
+/// screen, as the 40 presses these tests made before reached it after its
+/// few screens (test-run speed: the presses past the end were most of their
+/// layouts). That frame.
+fn to_the_last_screen(lab: &mut Lab, width: f32, height: f32) -> crate::native_ui::CompiledUi {
+    let shown = |lab: &Lab| {
+        (
+            lab.state().page_scroll,
+            lab.state().scroll_shown().map(|(_, view)| view),
+        )
+    };
+    // The first screen, drawn before the first press.
+    let _ = lab.compile(width, height);
+    for _ in 0..40 {
+        let at = shown(lab);
+        dispatch(lab, AppEvent::ScrollPage(1));
+        let compiled = lab.compile(width, height);
+        if shown(lab) == at {
+            return compiled;
+        }
+    }
+    panic!("forty presses of Page Down never reached the list's end")
+}
+
 /// A wide window whose Security list scrolls: the shipped 1074×684 where the
 /// page holds This Mac's Universal Control and Secure Keyboard Entry (macOS's
-/// rows, `native_advanced_effect`), a shorter one where its six other rows
-/// fit 684 whole.
+/// rows: `row_available_here`, the platform half of a row's admission), a
+/// shorter one where its six other rows fit 684 whole.
 fn wide_scrolling_security() -> (f32, f32) {
-    let macos_rows = native_advanced_key(prefs::EDIT_MACHINE_UNIVERSAL_CONTROL);
+    let macos_rows = row_available_here(
+        prefs::EDIT_MACHINE_UNIVERSAL_CONTROL,
+        SettingsAvailability::runtime(true),
+    );
     (1_074.0, if macos_rows { 684.0 } else { 560.0 })
 }
 
@@ -850,9 +878,9 @@ fn timing_is_plain_words_and_says_nothing_when_live() {
     let compiled = lab.compile(1_074.0, 900.0);
     let key = prefs::EDIT_MACHINE_UNIVERSAL_CONTROL;
     // Universal Control is a Security row only where it actuates (macOS's
-    // `defaults`, `native_advanced_effect`); elsewhere it lives in Modified,
-    // which says the same timing (`settings_modified_tests`).
-    if native_advanced_key(key) {
+    // `defaults`, `row_available_here`); elsewhere it is listed only once
+    // written, saying it has no effect (`settings_modified_tests`).
+    if row_available_here(key, SettingsAvailability::for_state(lab.state())) {
         assert!(
             painted_text(&compiled, &format!("settings/detail/{key}/"))
                 .contains("Applies at the next ALab tools check"),
@@ -926,16 +954,41 @@ fn the_draft_bar_is_one_row_where_its_words_fit_beside_its_buttons() {
         }
     }
 
-    // A refused draft's longer sentence does not fit beside Review in
-    // Modified and Discard in a narrower window: the buttons go under it.
+    // A refused draft's longer sentence does not fit beside its buttons in a
+    // window too narrow for it: the buttons go under it. Too narrow is
+    // measured in this host's UI face, so the check holds in any face: a bar
+    // whose row could not hold the sentence even with no button beside it
+    // (its 16pt edges and the 8pt gap before the buttons), while the column
+    // under it (8pt edges) holds the sentence whole.
     let mut lab = Lab::new("");
     lab.state_mut().navigate(SettingsRoute::Terminal);
     let _ = lab.invoke(
         &format!("settings/set/{}", prefs::EDIT_SEARCH_HISTORY_LINES),
         Some(SemanticInput::Text("lots".to_string())),
     );
-    let compiled = lab.compile(600.0, height);
+    let sentence = painted_text(
+        &lab.compile(1_074.0, 684.0),
+        "settings/draft-recovery/status/visual",
+    );
+    assert!(sentence.ends_with("or discard it."), "{sentence}");
+    let fits = |room: f32| crate::native_ui::fit_native_status_label(&sentence, room) == sentence;
+    let need = crate::tray_raster::ui_text_width_for(
+        crate::widget::TextFace::Ui,
+        &sentence,
+        crate::native_ui::native_type_px(crate::type_scale::TypeStep::Caption).get(),
+    );
+    // The bar spans the page beside the sidebar: a first compile says how
+    // much of the window that is at this narrow a width.
+    let mut narrow = (need + 28.0).ceil();
+    let beside = narrow - rect_of(&lab.compile(narrow, height), "settings/feedback").width;
+    narrow += beside;
+    let compiled = lab.compile(narrow, height);
     let bar = rect_of(&compiled, "settings/feedback");
+    assert!(
+        !fits(bar.width - 16.0 - 16.0 - 8.0) && fits(bar.width - 16.0),
+        "{narrow}pt: a {}pt bar fits the {need}pt sentence only under its buttons",
+        bar.width
+    );
     let status = rect_of(&compiled, "settings/draft-recovery/status");
     let discard = rect_of(&compiled, "settings/drafts/discard-all");
     assert!(bar.height > scaled_control_height(), "{bar:?}");
@@ -1893,6 +1946,113 @@ fn a_setting_name_wraps_and_is_never_cut_off() {
     });
 }
 
+/// THE THEME CARD'S ROWS KEEP THE ROW RULE, at every width and text scale:
+/// each row's name is painted whole, wrapped between its words, never cut —
+/// a row stacks its control under the name where both cannot share a line,
+/// and seats its Reset (or the place it keeps) as every stacked row does —
+/// and no control, nor the words drawn in it, runs out of its box. On
+/// Appearance, Top Settings and Modified, over one theme, a pair, and a pair
+/// of aterm's own (the Follow system row's Reset). (The Follow system row
+/// kept its name beside the switch and Reset's place whatever the column: at
+/// 22 columns its name got 40pt, broken inside "system", and 8pt at 2×; and
+/// Top's Window appearance kept its three segments on one line, "A…", "Li…",
+/// "D…".)
+#[test]
+fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
+    const ROWS: [(&str, &str); 6] = [
+        ("theme-mode", "Follow system"),
+        ("theme-slot/dark", "Dark theme"),
+        ("theme-slot/light", "Light theme"),
+        ("theme-preview-side", "Preview"),
+        ("theme-browse", "More themes"),
+        // The card's other row: Top's short name at large text is "Window".
+        ("window_theme", "Window"),
+    ];
+    const OWN: [&str; 11] = [
+        "key=\"settings/control/window_theme\"",
+        "key=\"settings/segment/window_theme/",
+        "key=\"settings/label/theme-",
+        "key=\"settings/label-line/theme-",
+        "key=\"settings/theme-mode\"",
+        "key=\"settings/theme-slot/",
+        "key=\"settings/theme-slot-reset/",
+        "key=\"settings/theme-preview-side\"",
+        "key=\"settings/reset/theme\"",
+        "key=\"settings/reset-slot/theme-",
+        "key=\"settings/themes/browse-row\"",
+    ];
+    at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "theme rows", |scale| {
+        for source in [
+            "theme = \"GitHub Light\"\n",
+            "theme = \"dark:Nord,light:GitHub Light\"\n",
+            "theme = \"dark:Default,light:Default Light\"\n",
+        ] {
+            for route in [
+                SettingsRoute::Appearance,
+                SettingsRoute::Home,
+                SettingsRoute::Modified,
+            ] {
+                // 22, 26 and 34 columns of the 12px cell, then wider.
+                for (width, height) in [
+                    (178.0, 420.0),
+                    (206.0, 420.0),
+                    (262.0, 420.0),
+                    (318.0, 294.0),
+                    (444.0, 350.0),
+                    (584.0, 348.0),
+                    (760.0, 446.0),
+                ] {
+                    let service = VersionedConfigService::new(source.to_string()).expect("fixture");
+                    let (mut runtime, instance, view) = setup();
+                    {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        else {
+                            unreachable!();
+                        };
+                        **state =
+                            SettingsViewState::from_snapshot(&service.snapshot()).expect("state");
+                        state.navigate(route);
+                    }
+                    each_screen(
+                        &mut runtime,
+                        instance,
+                        view,
+                        &view_cx_at(width, height),
+                        |compiled, top| {
+                            let context = format!(
+                                "{} {width}×{height} at {scale}× screen {top} over {source:?}",
+                                route.label()
+                            );
+                            for (key, name) in ROWS {
+                                let Some(painted) = painted_row_label(compiled, key) else {
+                                    continue;
+                                };
+                                if !row_label_shown_whole(compiled, key) {
+                                    continue;
+                                }
+                                let words = |text: &str| {
+                                    text.split_whitespace().collect::<Vec<_>>().join(" ")
+                                };
+                                assert!(
+                                    !painted.contains('\u{2026}')
+                                        && words(&painted).starts_with(name),
+                                    "{context}: {key} paints its whole name {name:?}: {painted:?}"
+                                );
+                            }
+                            let cut: Vec<String> = compiled
+                                .fit_failures()
+                                .into_iter()
+                                .filter(|line| OWN.iter().any(|key| line.contains(key)))
+                                .collect();
+                            assert!(cut.is_empty(), "{context}:\n{}", cut.join("\n"));
+                        },
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// A ROW'S LAYOUT NEVER DEPENDS ON ITS STATE: writing a row (Changed comes)
 /// or typing into it (a draft) neither makes it taller nor moves its control
 /// or anything under it, at every width a row is laid out in — the tags are
@@ -2601,7 +2761,11 @@ fn a_one_line_row_leaves_its_name_room_beside_everything_on_its_line() {
 /// drawn in the strip under the room is a fading picture, never one the
 /// screen showed. Judged from what is drawn, on the field pages at 80×24 and
 /// the shipped 102×29, until the last screen (which fills itself from the
-/// stops before it).
+/// stops before it). A line of the note that the room's edge cuts away
+/// entirely is not drawn at all, so the note's block is judged whole too: in
+/// Noto Sans, Security's notifications row keeps a blank line for its tags
+/// and has its words on the line under it, which the 80×24 room's edge cuts
+/// away whole.
 #[test]
 fn page_down_never_repeats_a_row_it_showed_whole() {
     let whole_rows = |compiled: &crate::native_ui::CompiledUi, list: LogicalRect, room: f32| {
@@ -2620,8 +2784,15 @@ fn page_down_never_repeats_a_row_it_showed_whole() {
                 let below = rows
                     .get(index + 1)
                     .map_or(f32::INFINITY, |next| next.rect.y);
+                let key = row.key.as_str().rsplit('/').next().unwrap_or_default();
+                let note = format!("settings/detail/{key}");
                 in_room(row.rect, row.clip)
                     && compiled.semantic(&row.key).is_some()
+                    && compiled
+                        .paint
+                        .iter()
+                        .filter(|node| node.key.as_str() == note)
+                        .all(|block| in_room(block.rect, block.clip))
                     && compiled.paint.iter().all(|node| {
                         !matches!(node.content, UiContent::Text(_))
                             || node.rect.x < row.rect.x - 0.5
@@ -2776,6 +2947,357 @@ fn a_press_never_moves_a_whole_control_and_brings_a_cut_one_whole() {
     );
 }
 
+/// A PRESS ON A CONTROL AN EDGE OF THE ROOM CUTS KEEPS IT UNDER THE POINTER
+/// (lead-known-open #31), as a platform list scrolls a clicked row into view
+/// by its hidden part: pressed anywhere it shows, the switch turns once,
+/// lands whole in the room, and the point it was pressed at is on it still —
+/// one the room's bottom edge cuts on a first screen, and one cut at the top
+/// of a last screen. A stop's worth of scroll (the least whole stop, 48pt or
+/// more) carried a bottom one out from under the pointer: at 150×48 Window's
+/// last switch went from 592 to 526 under a pointer at 597, its hover left
+/// behind; a top one came down past a pointer near its cut.
+#[test]
+fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
+    let mut pressed = [0, 0];
+    for route in [
+        SettingsRoute::Terminal,
+        SettingsRoute::Security,
+        SettingsRoute::KeyboardInput,
+        SettingsRoute::WindowTabs,
+        SettingsRoute::Sound,
+        SettingsRoute::Harness,
+        SettingsRoute::TextFonts,
+    ] {
+        for (width, height) in [
+            (584.0, 348.0),
+            (738.0, 418.0),
+            (1_074.0, 684.0),
+            (1_193.0, 516.0),
+            (1_564.0, 854.0),
+        ] {
+            // The first screen (its bottom edge) and the last (its top).
+            for last in [false, true] {
+                let mut lab = Lab::new("");
+                lab.state_mut().navigate(route);
+                let before = if last {
+                    to_the_last_screen(&mut lab, width, height)
+                } else {
+                    lab.compile(width, height)
+                };
+                let (plan, _) = lab.state().scroll_shown().expect("a list");
+                let (list, room) = compiled_list(&before, &plan).expect("the list");
+                let edge = list.y + room;
+                let cut = before.paint.iter().find_map(|node| {
+                    let UiContent::Switch(_) = node.content else {
+                        return None;
+                    };
+                    let key = node.key.as_str().strip_prefix("settings/control/")?;
+                    let shows = if last {
+                        node.clip.y > node.rect.y + 0.5 && node.clip.height > 4.0
+                    } else {
+                        node.rect.y < edge - 4.0 && node.rect.bottom() > edge + 0.5
+                    };
+                    let control = UiKey::new(node.key.as_str());
+                    let live = before.semantic(&control).is_some_and(|semantic| {
+                        matches!(semantic.value, crate::native_ui::SemanticValue::Bool(_))
+                    });
+                    (shows && live).then(|| {
+                        let (top, bottom) = if last {
+                            (node.clip.y, node.rect.bottom())
+                        } else {
+                            (node.rect.y, edge)
+                        };
+                        (key.to_string(), top, bottom)
+                    })
+                });
+                let Some((key, shown_top, shown_bottom)) = cut else {
+                    continue;
+                };
+                let control = UiKey::new(format!("settings/control/{key}"));
+                // The press names its control, not a point (a commit with
+                // the switch focused), so one press answers for a pointer
+                // anywhere on what shows.
+                let Some(crate::native_ui::SemanticValue::Bool(on)) =
+                    before.semantic(&control).map(|node| node.value.clone())
+                else {
+                    panic!("{key} is live");
+                };
+                lab.state_mut().common.last_focus = Some(control.clone());
+                lab.commit(
+                    &format!("settings/set/{key}"),
+                    Some(SemanticInput::Bool(!on)),
+                );
+                let after = lab.compile(width, height);
+                let now = rect_of(&after, control.as_str());
+                let (plan, _) = lab.state().scroll_shown().expect("a list");
+                let (list, room) = compiled_list(&after, &plan).expect("the list");
+                // Pressed at the top, the middle and the bottom of what shows.
+                for at in [
+                    shown_top + 1.0,
+                    (shown_top + shown_bottom) / 2.0,
+                    shown_bottom - 1.0,
+                ] {
+                    let context =
+                        format!("{route:?} {width}×{height} last={last} {key} pressed at {at}");
+                    assert!(
+                        now.y >= list.y - 0.5 && now.bottom() <= list.y + room + 0.5,
+                        "{context}: {now:?} whole in the room"
+                    );
+                    assert!(
+                        now.y <= at && at <= now.bottom(),
+                        "{context}: {now:?} still under the pointer"
+                    );
+                    assert_eq!(
+                        after.semantic(&control).map(|node| node.value.clone()),
+                        Some(crate::native_ui::SemanticValue::Bool(!on)),
+                        "{context}: turned once"
+                    );
+                    pressed[usize::from(last)] += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        pressed.iter().all(|count| *count > 0),
+        "some screens cut a switch at each edge: {pressed:?}"
+    );
+}
+
+/// THE NUDGE A PRESS GAVE THE LIST STANDS UNTIL THE LIST SCROLLS: after a
+/// press scrolled a cut switch whole by its hidden part — up at a first
+/// screen's bottom edge, down at a last screen's top — a press on another
+/// switch the screen shows whole, and the keyboard moving to a control it
+/// shows whole, move nothing, as a platform list holds the place a click
+/// scrolled it to; and a scroll puts the list back on its stops, at an end of
+/// the list too (the wheel up at its top shows the top again, down at its end
+/// the end). The nudge was the pressed control's alone: at 150×48 Window, a
+/// press on Tab status badge after Mark connected sessions on tabs had nudged
+/// the list sent the list back down 20pt, the switch out from under a
+/// pointer at its top and the first one cut again.
+#[test]
+fn a_press_nudge_stands_until_the_list_scrolls() {
+    let mut checked = [0, 0];
+    // The keyboard's moves that held the nudge, at each edge, and those that
+    // showed a stop the nudged screen cut.
+    let mut held = [0, 0];
+    let mut revealed_whole = 0;
+    for route in [
+        SettingsRoute::Terminal,
+        SettingsRoute::Security,
+        SettingsRoute::KeyboardInput,
+        SettingsRoute::WindowTabs,
+        SettingsRoute::Sound,
+        SettingsRoute::Harness,
+        SettingsRoute::TextFonts,
+    ] {
+        for (width, height) in [
+            (584.0, 348.0),
+            (738.0, 418.0),
+            (1_074.0, 684.0),
+            (1_193.0, 516.0),
+            (1_564.0, 854.0),
+        ] {
+            for last in [false, true] {
+                let switches = |compiled: &crate::native_ui::CompiledUi| {
+                    compiled
+                        .paint
+                        .iter()
+                        .filter(|node| matches!(node.content, UiContent::Switch(_)))
+                        .filter_map(|node| {
+                            let key = node.key.as_str().strip_prefix("settings/control/")?;
+                            let control = UiKey::new(node.key.as_str());
+                            let on =
+                                compiled
+                                    .semantic(&control)
+                                    .and_then(|semantic| match semantic.value {
+                                        crate::native_ui::SemanticValue::Bool(on) => Some(on),
+                                        _ => None,
+                                    })?;
+                            Some((key.to_string(), node.rect, node.clip, on))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                // The first press: a switch an edge of the room cuts.
+                let nudged = |lab: &mut Lab| {
+                    lab.state_mut().navigate(route);
+                    let before = if last {
+                        to_the_last_screen(lab, width, height)
+                    } else {
+                        lab.compile(width, height)
+                    };
+                    let (plan, _) = lab.state().scroll_shown().expect("a list");
+                    let (list, room) = compiled_list(&before, &plan).expect("the list");
+                    let edge = list.y + room;
+                    let (key, rect, _, on) =
+                        switches(&before).into_iter().find(|(_, rect, clip, _)| {
+                            if last {
+                                clip.y > rect.y + 0.5 && clip.height > 4.0
+                            } else {
+                                rect.y < edge - 4.0 && rect.bottom() > edge + 0.5
+                            }
+                        })?;
+                    let control = format!("settings/control/{key}");
+                    lab.state_mut().common.last_focus = Some(UiKey::new(control.as_str()));
+                    lab.commit(
+                        &format!("settings/set/{key}"),
+                        Some(SemanticInput::Bool(!on)),
+                    );
+                    let after = lab.compile(width, height);
+                    let moved = rect_of(&after, &control).y - rect.y;
+                    // Nudged by its hidden part, not seated a stop further on.
+                    let nudged = if last {
+                        moved > 0.5 && moved < rect.height
+                    } else {
+                        moved < -0.5 && moved > -rect.height
+                    };
+                    nudged.then_some((before, after, control, list, edge))
+                };
+                let mut lab = Lab::new("");
+                let Some((_, after, first, list, edge)) = nudged(&mut lab) else {
+                    continue;
+                };
+                // Shown whole as the keyboard reads it — the switch and its
+                // stop's words ([`Reveal::Keep`]) — so its move to it has
+                // nothing to bring into view: a nudge back at a last screen's
+                // top cuts what ended flush at its bottom.
+                let (shown, view) = lab.state().scroll_shown().expect("a list");
+                let whole = switches(&after)
+                    .into_iter()
+                    .filter(|(key, rect, clip, _)| {
+                        let control = format!("settings/control/{key}");
+                        control != first
+                            && rect == clip
+                            && rect.y >= list.y - 0.5
+                            && rect.bottom() <= edge + 0.5
+                            && shown
+                                .stop_of(&UiKey::new(control.as_str()))
+                                .is_some_and(|index| shown.shows_for_keyboard(index, view.start))
+                    })
+                    .collect::<Vec<_>>();
+                let Some((second, _, _, on)) = whole.last().cloned() else {
+                    continue;
+                };
+                // The keyboard shows a control's whole stop, its words too
+                // (`Reveal::Keep`), so the control it moves to here is the
+                // last the nudged screen shows whole with its row and the
+                // lines under it.
+                let stop_whole = |key: &str| {
+                    after
+                        .paint
+                        .iter()
+                        .filter(|node| {
+                            let at = node.key.as_str();
+                            at == format!("settings/detail/{key}")
+                                || at == format!("settings/row-detail/{key}")
+                                || (at.starts_with("settings/row/")
+                                    && at.ends_with(&format!("/{key}")))
+                        })
+                        .all(|node| node.rect == node.clip)
+                };
+                let keyboard = whole
+                    .iter()
+                    .rev()
+                    .find(|(key, ..)| stop_whole(key))
+                    .map(|(key, ..)| format!("settings/control/{key}"));
+                let context =
+                    format!("{route:?} {width}×{height} last={last} {first} then {second}");
+                let second = format!("settings/control/{second}");
+                let place = |compiled: &crate::native_ui::CompiledUi| {
+                    (rect_of(compiled, &first), rect_of(compiled, &second))
+                };
+                // A press on another switch the nudged screen shows whole, the
+                // keyboard moved to it by the pointer's press first.
+                lab.state_mut().common.last_focus = Some(UiKey::new(second.as_str()));
+                lab.commit(
+                    &format!(
+                        "settings/set/{}",
+                        second.trim_start_matches("settings/control/")
+                    ),
+                    Some(SemanticInput::Bool(!on)),
+                );
+                // (What it turned may retell the rows around it, so only the
+                // pressed switch is held to its place.)
+                let pressed = lab.compile(width, height);
+                assert_eq!(
+                    rect_of(&pressed, &second),
+                    rect_of(&after, &second),
+                    "{context}: the second press moved the list"
+                );
+                assert_eq!(
+                    pressed
+                        .semantic(&UiKey::new(second.as_str()))
+                        .map(|node| node.value.clone()),
+                    Some(crate::native_ui::SemanticValue::Bool(!on)),
+                    "{context}: the second switch turned"
+                );
+                // The keyboard moving to a control it shows whole, words too,
+                // moves nothing. Where the nudged screen shows no control's
+                // whole stop (the edge cuts the words under the last whole
+                // switch), the keyboard's move to that switch shows its whole
+                // stop, as the keyboard always does.
+                let mut lab = Lab::new("");
+                let (before, after, ..) = nudged(&mut lab).expect("nudged as before");
+                if let Some(keyboard) = &keyboard {
+                    dispatch(
+                        &mut lab,
+                        AppEvent::FocusChanged(Some(UiKey::new(keyboard.as_str()))),
+                    );
+                    assert_eq!(
+                        place(&lab.compile(width, height)),
+                        place(&after),
+                        "{context}: the keyboard's move to {keyboard} moved the list"
+                    );
+                    held[usize::from(last)] += 1;
+                } else {
+                    dispatch(
+                        &mut lab,
+                        AppEvent::FocusChanged(Some(UiKey::new(second.as_str()))),
+                    );
+                    let revealed = lab.compile(width, height);
+                    let stop = revealed
+                        .paint
+                        .iter()
+                        .filter(|node| {
+                            let at = node.key.as_str();
+                            let key = second.trim_start_matches("settings/control/");
+                            at == second
+                                || at == format!("settings/detail/{key}")
+                                || at == format!("settings/row-detail/{key}")
+                                || (at.starts_with("settings/row/")
+                                    && at.ends_with(&format!("/{key}")))
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(
+                        stop.len() > 1 && stop.iter().all(|node| node.rect == node.clip),
+                        "{context}: the keyboard's move to {second} shows its whole stop: {:?}",
+                        stop.iter()
+                            .map(|node| (node.key.as_str(), node.rect, node.clip))
+                            .collect::<Vec<_>>()
+                    );
+                    revealed_whole += 1;
+                }
+                // A scroll past the end it is at puts the list back on its
+                // stops: the wheel up at its top, down at its end.
+                dispatch(&mut lab, AppEvent::ScrollLines(if last { 1 } else { -1 }));
+                assert_eq!(
+                    place(&lab.compile(width, height)),
+                    place(&before),
+                    "{context}: the wheel kept the nudge"
+                );
+                checked[usize::from(last)] += 1;
+            }
+        }
+    }
+    assert!(
+        checked.iter().all(|count| *count > 0),
+        "some screens nudge a cut switch at each edge: {checked:?}"
+    );
+    assert!(
+        held.iter().all(|count| *count > 0),
+        "the keyboard held some nudge at each edge: {held:?} ({revealed_whole} showed a cut stop)"
+    );
+}
+
 /// A STYLE CHOSEN STAYS UNDER THE POINTER: on the Cursor Styles landing and
 /// the screen after it, every style row a person can press, saved or not,
 /// whole in the list's room keeps its place when pressed — the bar the
@@ -2912,16 +3434,34 @@ fn a_change_moves_nothing_at_any_compact_size() {
                 lab.state_mut().common.last_focus = Some(control.clone());
                 let before = lab.compile(width, height);
                 let room = lab.state().scroll_plan().map(|plan| plan.room());
+                // Whether the list fitted whole in its room and the strip the
+                // page keeps for a bar (`scroll::seat_room`: only words and
+                // padding in the strip), and so took both.
+                let whole_before = lab
+                    .state()
+                    .scroll_plan()
+                    .is_some_and(|plan| plan.limit() == 0 && plan.view(0).end == plan.len());
                 let list = rect_of(&before, "settings/list");
+                // The page's own anchors. A title the compact toolbar carries gives
+                // its place to a status the toolbar docks, as Search does; the
+                // page under the toolbar keeps its place.
                 let fixed = |compiled: &crate::native_ui::CompiledUi| {
+                    let toolbar = compiled
+                        .semantic(&UiKey::new("settings/compact-toolbar"))
+                        .map(|node| node.rect);
                     compiled
                         .semantics
                         .iter()
                         .filter(|node| {
                             let key = node.key.as_str();
-                            key == "settings/compact-toolbar"
-                                || key.starts_with("settings/page-heading/")
-                                || key.starts_with("settings/preview/")
+                            let in_toolbar = toolbar.is_some_and(|toolbar| {
+                                key != "settings/compact-toolbar"
+                                    && node.rect.bottom() <= toolbar.bottom() + 0.5
+                            });
+                            !in_toolbar
+                                && (key == "settings/compact-toolbar"
+                                    || key.starts_with("settings/page-heading/")
+                                    || key.starts_with("settings/preview/"))
                         })
                         .map(|node| (node.key.clone(), node.rect))
                         .collect::<Vec<_>>()
@@ -2953,11 +3493,19 @@ fn a_change_moves_nothing_at_any_compact_size() {
                     "{context}: the change's status offers Undo"
                 );
                 assert_eq!(fixed_before, fixed(&after), "{context}: the page moved");
-                assert_eq!(
-                    lab.state().scroll_plan().map(|plan| plan.room()),
-                    room,
-                    "{context}: the list's room changed"
-                );
+                let room_after = lab.state().scroll_plan().map(|plan| plan.room());
+                if room_after != room {
+                    // A list that took the strip as well gives the bar that
+                    // comes exactly the strip, and nothing it showed moves.
+                    let bar = rect_of(&after, "settings/feedback").height;
+                    assert!(
+                        whole_before
+                            && room.zip(room_after).is_some_and(|(before, after)| {
+                                (before - after - bar).abs() < 0.5
+                            }),
+                        "{context}: the list's room changed: {room:?} to {room_after:?}"
+                    );
+                }
                 assert_eq!(rect_of(&after, "settings/list").y, list.y, "{context}");
                 // The rows over the changed one: its own row may take a line
                 // for the tag the change gives it, and move what is under it.
@@ -3323,4 +3871,198 @@ fn reset_all_names_what_it_turns_back_on() {
             .any(|node| node.key.as_str().starts_with("settings/status/reach")),
         "a reset of the window's own looks reaches nothing beyond it"
     );
+}
+
+/// THE COLOR THEME ROW HOLDS EVERYTHING ON ITS LINE, at every window width
+/// and text scale: on the screen that shows it whole (its picker live over
+/// all of it), its name is whole and its picker and Reset lie inside the
+/// row, none cut by an edge. (With Browse themes… beside them, the row
+/// overran its 488pt at 80 columns of a 15px font: Reset cut to 56 of its
+/// 72pt.)
+#[test]
+fn the_color_theme_row_holds_its_picker_and_reset_at_every_width() {
+    const OWN: [&str; 4] = [
+        "key=\"settings/control/theme\"",
+        "key=\"settings/reset/theme\"",
+        "key=\"settings/label/theme\"",
+        "key=\"settings/reset-slot/theme\"",
+    ];
+    let picker = UiKey::new("settings/control/theme");
+    at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "color theme row", |scale| {
+        for route in [SettingsRoute::Appearance, SettingsRoute::Modified] {
+            // 22 columns of the 12px cell up to a wide window, in steps
+            // finer than any control.
+            let mut width = 178.0;
+            while width <= 1_480.0 {
+                let height = 760.0;
+                let service = VersionedConfigService::new("theme = \"GitHub Light\"\n".to_string())
+                    .expect("fixture");
+                let (mut runtime, instance, view) = setup();
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("state");
+                    state.navigate(route);
+                }
+                let mut seen = false;
+                each_screen(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, height),
+                    |compiled, top| {
+                        let context = format!(
+                            "{} {width}×{height} at {scale}× screen {top}",
+                            route.label()
+                        );
+                        let Some(row) = compiled.paint.iter().find(|node| {
+                            let key = node.key.as_str();
+                            key.starts_with("settings/row/") && key.ends_with("/theme")
+                        }) else {
+                            return;
+                        };
+                        let control = compiled.paint.iter().find(|node| node.key == picker);
+                        let live = compiled.hits.iter().find(|hit| hit.key == picker);
+                        let whole =
+                            |rect: crate::native_ui::LogicalRect,
+                             shown: crate::native_ui::LogicalRect| {
+                                shown.y <= rect.y + 0.5 && shown.bottom() + 0.5 >= rect.bottom()
+                            };
+                        let (Some(control), Some(live)) = (control, live) else {
+                            return;
+                        };
+                        if !whole(row.rect, row.clip) || !whole(control.rect, live.rect) {
+                            return;
+                        }
+                        seen = true;
+                        if let Some(painted) = painted_row_label(compiled, "theme") {
+                            assert!(
+                                !painted.contains('\u{2026}')
+                                    && painted
+                                        .split_whitespace()
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                        .starts_with("Color theme"),
+                                "{context}: the row paints its whole name: {painted:?}"
+                            );
+                        }
+                        // Beside the picker, the name keeps its floor on its
+                        // line; where it cannot, the row stacks the picker
+                        // under it.
+                        let label = compiled
+                            .paint
+                            .iter()
+                            .find(|node| node.key.as_str() == "settings/label/theme")
+                            .expect("the row's name");
+                        if control.rect.y + 0.5 < label.rect.bottom() {
+                            assert!(
+                                label.rect.width + 0.5 >= one_line_name_floor("Color theme"),
+                                "{context}: the name beside the picker has {:?}",
+                                label.rect
+                            );
+                        }
+                        for key in ["settings/control/theme", "settings/reset/theme"] {
+                            if let Some(node) =
+                                compiled.paint.iter().find(|node| node.key.as_str() == key)
+                            {
+                                assert!(
+                                    node.rect.x + 0.5 >= row.rect.x
+                                        && node.rect.right() <= row.rect.right() + 0.5
+                                        && node.clip.width + 0.5 >= node.rect.width,
+                                    "{context}: {key} {:?} (shown {:?}) inside the row {:?}",
+                                    node.rect,
+                                    node.clip,
+                                    row.rect
+                                );
+                            }
+                        }
+                        let cut: Vec<String> = compiled
+                            .fit_failures()
+                            .into_iter()
+                            .filter(|line| OWN.iter().any(|key| line.contains(key)))
+                            .collect();
+                        assert!(cut.is_empty(), "{context}:\n{}", cut.join("\n"));
+                    },
+                );
+                assert!(
+                    seen,
+                    "{} {width} at {scale}×: some screen shows the row whole",
+                    route.label()
+                );
+                width += 26.0;
+            }
+        }
+    });
+}
+
+/// EVERY ONE-LINE ROW LEAVES ITS NAME ITS FLOOR beside everything on its
+/// line ([`one_line_name_floor`]), on every page, at every window width and
+/// text scale: where the control cannot give up enough width, the row
+/// stacks it under the name. (Harness' Question priority kept its three
+/// segments and Reset beside a 44pt name at 760pt, broken inside the word
+/// "Question"; Music effects on a phone-width Sound page at 1.25× was
+/// measured without the place Reset keeps, its name 80 of its 96pt.)
+#[test]
+fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
+    at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "one-line rows", |scale| {
+        let mut short = std::collections::BTreeSet::new();
+        for route in SettingsRoute::ALL {
+            let mut width = 300.0;
+            while width <= 1_480.0 {
+                let (mut runtime, instance, view) = setup();
+                {
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!();
+                    };
+                    state.navigate(route);
+                }
+                each_screen(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, 760.0),
+                    |compiled, _| {
+                        for label in &compiled.paint {
+                            let Some(key) = label.key.as_str().strip_prefix("settings/label/")
+                            else {
+                                continue;
+                            };
+                            if key.contains('/') {
+                                continue;
+                            }
+                            let Some(semantic) = compiled.semantic(&label.key) else {
+                                continue;
+                            };
+                            // The name, without the tags after it.
+                            let name = semantic.label.split(" \u{b7} ").next().unwrap_or_default();
+                            let control = format!("settings/control/{key}");
+                            let segments = format!("settings/segments/{key}");
+                            let Some(control) = compiled.paint.iter().find(|node| {
+                                node.key.as_str() == control || node.key.as_str() == segments
+                            }) else {
+                                continue;
+                            };
+                            let beside = control.rect.y + 0.5 < label.rect.bottom()
+                                && control.rect.x > label.rect.x;
+                            let floor = one_line_name_floor(name);
+                            if beside && label.rect.width + 0.5 < floor {
+                                short.insert(format!(
+                                    "{} {width}: {key} {name:?} has {:.0} of its {floor:.0}pt",
+                                    route.label(),
+                                    label.rect.width
+                                ));
+                            }
+                        }
+                    },
+                );
+                width += 40.0;
+            }
+        }
+        assert!(
+            short.is_empty(),
+            "at {scale}×:\n{}",
+            short.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    });
 }

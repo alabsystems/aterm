@@ -116,7 +116,7 @@ fn own_pid() -> i32 {
 /// The worker's job for one attempt, built by the shipping `prelaunch_out_of_band_handoff`:
 /// an apply ticket (none for the same-image seam), the seam, whether the worker verifies the
 /// candidate again, and an installed activation.
-fn launched_job(
+pub(super) fn launched_job(
     ticket: bool,
     seam: bool,
     verify_staged_candidate: bool,
@@ -408,6 +408,7 @@ fn through_the_dial_wait(
             code,
             Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             &cancel_rx,
+            &Default::default(),
         );
         drop(answered);
         (ended, watcher.join().expect("the watcher"))

@@ -112,10 +112,72 @@ impl std::error::Error for EncodeError {}
 /// Returns [`EncodeError::InputTooLarge`] if `input` is longer than
 /// [`crate::MAX_INPUT_LEN`].
 pub fn encode(input: &[u8]) -> Result<String, EncodeError> {
-    if input.len() > crate::MAX_INPUT_LEN {
-        return Err(EncodeError::InputTooLarge(input.len()));
+    let mut out = String::new();
+    encode_into(&mut out, input)?;
+    Ok(out)
+}
+
+/// Length of the padded encoding of `input_len` bytes, `4 * ceil(input_len / 3)`;
+/// `None` above [`crate::MAX_INPUT_LEN`], exactly the lengths [`encode_into`]
+/// refuses.
+#[must_use]
+pub fn encoded_len(input_len: usize) -> Option<usize> {
+    if input_len > crate::MAX_INPUT_LEN {
+        return None;
     }
-    Ok(encode_padded(input))
+    // Plain arithmetic under the guard, not `div_ceil`: the verifier sees no
+    // std body, so it could not bound the multiply on its result. Here the
+    // guard bounds both steps (at most `2^26 + 2`, then `< 2^27`).
+    #[expect(
+        clippy::manual_div_ceil,
+        reason = "the verifier bounds this arithmetic from the guard; div_ceil's result is opaque to it"
+    )]
+    let len = (input_len + 2) / 3 * 4;
+    Some(len)
+}
+
+/// The longest encoding, [`encoded_len`] of [`crate::MAX_INPUT_LEN`] (`< 2^27`).
+const MAX_ENCODED_LEN: usize = crate::MAX_INPUT_LEN.div_ceil(3) * 4;
+
+/// [`encode`] appending to `out`, a byte-level fill with no buffer of its own.
+/// It reserves [`encoded_len`] first, so a destination already sized for the
+/// encoding never reallocates.
+///
+/// # Errors
+///
+/// Returns [`EncodeError::InputTooLarge`], with `out` untouched, if `input` is
+/// longer than [`crate::MAX_INPUT_LEN`].
+pub fn encode_into(out: &mut String, input: &[u8]) -> Result<(), EncodeError> {
+    let Some(len) = encoded_len(input.len()) else {
+        return Err(EncodeError::InputTooLarge(input.len()));
+    };
+    // The verifier sees no callee's result bound, so a bare `reserve(len)` is an
+    // unbounded allocation to it; `.min` restates `encoded_len`'s bound here and
+    // never lowers `len`.
+    out.reserve(len.min(MAX_ENCODED_LEN));
+    // SAFETY: every byte appended is a `STANDARD_ALPHABET` entry or `b'='`, all
+    // ASCII (`aterm-spec-models/proofs/ay/a2_codec/encoder_output_ascii.smt2`),
+    // so `out` stays UTF-8 after every push.
+    let bytes = unsafe { out.as_mut_vec() };
+
+    // `as_chunks` yields `&[u8; 3]`, so chunk indices are compile-time bounded.
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        bytes.extend_from_slice(&sextets(n));
+    }
+    match *rem {
+        [r0] => {
+            let [s0, s1, _, _] = sextets(u32::from(r0) << 16);
+            bytes.extend_from_slice(&[s0, s1, b'=', b'=']);
+        }
+        [r0, r1] => {
+            let [s0, s1, s2, _] = sextets((u32::from(r0) << 16) | (u32::from(r1) << 8));
+            bytes.extend_from_slice(&[s0, s1, s2, b'=']);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Decode standard Base64 (with or without padding).
@@ -152,53 +214,16 @@ pub fn decode_strict(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
 
 // ── Internal ────────────────────────────────────────────────────────────────
 
-fn encode_padded(input: &[u8]) -> String {
+/// The four alphabet symbols of the 24-bit group `n`, high sextet first.
+#[inline]
+fn sextets(n: u32) -> [u8; 4] {
     let alphabet = STANDARD_ALPHABET;
-    // Makes the `encoded_len` allocation bound locally provable; `encode`
-    // already rejects larger input, so this only fails safe for other callers.
-    if input.len() > crate::MAX_INPUT_LEN {
-        return String::new();
-    }
-    if input.is_empty() {
-        return String::new();
-    }
-
-    // Branch-free over-estimate `(n / 3 + 1) * 4 < 2^28` the verifier can
-    // bound; the pushes below produce the exact length.
-    let cap = input.len() / 3 * 4 + 4;
-    let mut out = Vec::with_capacity(cap);
-
-    // `as_chunks` yields `&[u8; 3]`, so chunk indices are compile-time bounded.
-    let (chunks, rem) = input.as_chunks::<3>();
-    for chunk in chunks {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
-        out.push(alphabet[((n >> 18) & 0x3F) as usize]);
-        out.push(alphabet[((n >> 12) & 0x3F) as usize]);
-        out.push(alphabet[((n >> 6) & 0x3F) as usize]);
-        out.push(alphabet[(n & 0x3F) as usize]);
-    }
-
-    // Process remainder
-    match rem.len() {
-        1 => {
-            let n = u32::from(rem[0]) << 16;
-            out.push(alphabet[((n >> 18) & 0x3F) as usize]);
-            out.push(alphabet[((n >> 12) & 0x3F) as usize]);
-            out.push(b'=');
-            out.push(b'=');
-        }
-        2 => {
-            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
-            out.push(alphabet[((n >> 18) & 0x3F) as usize]);
-            out.push(alphabet[((n >> 12) & 0x3F) as usize]);
-            out.push(alphabet[((n >> 6) & 0x3F) as usize]);
-            out.push(b'=');
-        }
-        _ => {}
-    }
-
-    // SAFETY: all output bytes are ASCII from the alphabet or '='
-    unsafe { String::from_utf8_unchecked(out) }
+    [
+        alphabet[((n >> 18) & 0x3F) as usize],
+        alphabet[((n >> 12) & 0x3F) as usize],
+        alphabet[((n >> 6) & 0x3F) as usize],
+        alphabet[(n & 0x3F) as usize],
+    ]
 }
 
 fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeError> {

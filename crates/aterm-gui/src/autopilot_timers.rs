@@ -849,8 +849,8 @@ impl App {
                 continue;
             };
             match crate::session_timeline::fire_land_at(&ctx, entry.land_at_ms, wall_ms) {
-                crate::session_timeline::Fired::Landed => {
-                    self.autopilot_timer_landed(local_id, entry, wall_ms);
+                crate::session_timeline::Fired::Landed { revision } => {
+                    self.autopilot_timer_landed(local_id, entry, revision);
                 }
                 // The wall is short of it (set back, or the monotonic due ran
                 // early): indexed again from the remainder.
@@ -885,9 +885,11 @@ impl App {
     /// The fan-out after a fire stored `land` (the same as a click's): the
     /// tab chrome and the session's `events` watchers, the footer, the A/B
     /// arm, the page, and the message log's record — which says what the
-    /// fire found ([`Self::autopilot_fire_over`]), read at the fire's wall
-    /// (`wall_ms`).
-    fn autopilot_timer_landed(&mut self, local_id: u64, entry: TimerEntry, wall_ms: i64) {
+    /// fire found ([`Self::autopilot_fire_over`]), and who set it: the timer
+    /// (§11.7.1, `set at the 18:00 timer`). The fire's `revision` is noted as
+    /// recorded (`App::record_wire_autopilot`).
+    fn autopilot_timer_landed(&mut self, local_id: u64, entry: TimerEntry, revision: u64) {
+        self.autopilot_recorded.insert(local_id, revision);
         // `land` is the person's word, written for them at the instant they
         // chose: the crash journal carries it on this turn — the fire runs
         // after the park's own capture, and nothing else may wake the loop,
@@ -895,11 +897,8 @@ impl App {
         // `App::crash_journal_wake`).
         self.journal_owner_words(local_id);
         self.refresh_meta_dependent_chrome(local_id);
-        if self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(local_id);
+        if let Some(session) = self.pool.get(local_id) {
+            session.ctx.watchers.ring_watchers();
         }
         crate::claude_footer::post_changed(local_id);
         // An open menu for it checks `⤓ Land now` and drops its cancel.
@@ -920,13 +919,21 @@ impl App {
                 crate::message_reporters::FireOver::NoAgent { .. } => self.pane_place(&sid).0,
                 _ => self.session_place(&sid),
             };
+            // Who set it: the timer the fire stored as the setter, named by
+            // its own clock — not the fire's, which a sleeping Mac or a
+            // restore makes later (§11.7.1).
+            let clock = entry.glass.as_ref().map(|g| g.clock.as_str());
+            let set_by = clock.map_or_else(
+                || "set by its timer".to_string(),
+                |c| format!("set at the {c} timer"),
+            );
             self.record_message(crate::message_reporters::autopilot_timer_ended(
                 &sid,
                 &place,
-                entry.glass.as_ref().map(|g| g.clock.as_str()),
+                clock,
                 entry.passed_while,
                 over,
-                crate::harness_glass::local_day_at(wall_ms.div_euclid(1000)),
+                Some(&set_by),
             ));
         }
     }
@@ -935,14 +942,12 @@ impl App {
     /// for its record: the window's harness off (no host, the master
     /// switch), no agent in the pane (and whether its tab holds other
     /// panes, [`Self::pane_place`]: the line then says `this pane`, since
-    /// another may run an agent), the agent's own switch off, a task already
-    /// done or landed (with its stamp), else work the harness wraps up. In
-    /// that order: a switch that supervises nothing outranks what the pane
-    /// runs.
+    /// another may run an agent), the agent's own switch off, else work the
+    /// harness lands. In that order: a switch that supervises nothing
+    /// outranks what the pane runs.
     fn autopilot_fire_over(&self, local_id: u64, sid: &str) -> crate::message_reporters::FireOver {
         use crate::autopilot::HarnessPosture;
         use crate::message_reporters::FireOver;
-        use aterm_agent::harness::acts::TaskFace;
         let posture = self.harness_posture();
         match posture {
             HarnessPosture::Unhosted => return FireOver::Unhosted,
@@ -959,12 +964,7 @@ impl App {
         if let HarnessPosture::AgentOff(agent) = posture.for_agent(Some(agent)) {
             return FireOver::AgentOff(agent);
         }
-        let glass = self.chip_glass(local_id);
-        match glass.task {
-            Some(TaskFace::Done) => FireOver::Done(glass.task_at),
-            Some(TaskFace::Landed) => FireOver::Landed(glass.task_at),
-            Some(TaskFace::Open | TaskFace::Spent | TaskFace::Theirs) | None => FireOver::Work,
-        }
+        FireOver::Work
     }
 
     /// The instant a timed choice from the window arms for session
@@ -986,24 +986,35 @@ impl App {
     }
 
     /// Settings ▸ Harness's timer press (`AppEffect::HarnessTimer`): the
-    /// session's choice written ([`Self::choose_autopilot_timer`]), and the
-    /// page republished either way so it converges on what is stored.
+    /// session's choice written ([`Self::choose_autopilot_timer`]) from the
+    /// page, and the page republished either way so it converges on what is
+    /// stored.
     pub(crate) fn execute_harness_timer(
         &mut self,
         request: crate::native_app::HarnessTimerRequest,
     ) {
-        self.choose_autopilot_timer(request.session, request.choice);
+        self.choose_autopilot_timer(
+            request.session,
+            request.choice,
+            crate::autopilot::Surface::Settings,
+        );
         self.harness_screen_moved();
     }
 
     /// A timer choice from the window (the menu, Settings ▸ Harness's
     /// disclosure): a timed Cruise written through the window's one writer
     /// ([`Self::set_session_autopilot_timed`]) with its instant, or the
-    /// cancel of whatever timer is armed ([`Self::cancel_autopilot_timer`]).
-    /// Writes nothing where the harness runs no mode here, or the choice
-    /// names no instant. Whether the pair moved.
-    pub(crate) fn choose_autopilot_timer(&mut self, local_id: u64, choice: TimerChoice) -> bool {
-        self.choose_autopilot_timer_naming(local_id, choice, None)
+    /// cancel of whatever timer is armed ([`Self::cancel_autopilot_timer`]),
+    /// from `surface` (its setter, §11.7.3, item 2). Writes nothing where the
+    /// harness runs no mode here, or the choice names no instant. Whether the
+    /// pair moved.
+    pub(crate) fn choose_autopilot_timer(
+        &mut self,
+        local_id: u64,
+        choice: TimerChoice,
+        surface: crate::autopilot::Surface,
+    ) -> bool {
+        self.choose_autopilot_timer_naming(local_id, choice, None, surface)
     }
 
     /// [`Self::choose_autopilot_timer`] from a row that named the instant
@@ -1015,6 +1026,7 @@ impl App {
         local_id: u64,
         choice: TimerChoice,
         cancels: Option<i64>,
+        surface: crate::autopilot::Surface,
     ) -> bool {
         if self
             .session_harness_posture(local_id)
@@ -1024,12 +1036,12 @@ impl App {
             return false;
         }
         if choice == TimerChoice::Cancel {
-            return self.cancel_autopilot_timer(local_id, cancels);
+            return self.cancel_autopilot_timer(local_id, cancels, surface);
         }
         let Some(land_at) = self.resolve_timer_choice(choice) else {
             return false;
         };
-        self.set_session_autopilot_timed(local_id, Some(Autopilot::Cruise), Some(land_at))
+        self.set_session_autopilot_timed(local_id, Some(Autopilot::Cruise), Some(land_at), surface)
     }
 
     /// "Cancel landing" (the menu's row, Settings' `Cancel`): session
@@ -1039,14 +1051,19 @@ impl App {
     /// instant `expected` names, where the row named one). A cancel from a
     /// page or a menu that went stale never writes `cruise` over a hand-
     /// written word or the timer's own `land`. Fanned out as the window's
-    /// writer fans out a write ([`Self::autopilot_pair_written`]). Whether
-    /// the pair moved.
-    pub(crate) fn cancel_autopilot_timer(&mut self, local_id: u64, expected: Option<i64>) -> bool {
+    /// writer fans out a write ([`Self::autopilot_pair_written`]), its
+    /// setter the person at `surface`. Whether the pair moved.
+    pub(crate) fn cancel_autopilot_timer(
+        &mut self,
+        local_id: u64,
+        expected: Option<i64>,
+        surface: crate::autopilot::Surface,
+    ) -> bool {
         let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
             return false;
         };
-        let write = crate::session_timeline::cancel_land_at(&ctx, expected);
-        self.autopilot_pair_written(local_id, write.moved, true)
+        let write = crate::session_timeline::cancel_land_at(&ctx, expected, surface);
+        self.autopilot_pair_written(local_id, write)
     }
 }
 

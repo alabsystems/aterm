@@ -72,7 +72,9 @@ impl Terminal {
     /// modifyOtherKeys are off (conhost cannot turn CSI-u or `CSI 27 ; m ; c ~` reports into
     /// console key records); any other session gets
     /// the reverse. Sets both bits either way, so a checkpoint carrying another host's bits
-    /// does not outlive it. A live session and every replay (`cast drift`) call this.
+    /// does not outlive it. A live session calls this with the policy it resizes under; every
+    /// replay of one (`cast drift`, `cast frames`, `temporal`) gets it from
+    /// `aterm_control::replay::ReplayEngine`, built with that same policy.
     pub fn set_console_host_posture(&mut self, policy: ResizePolicy) {
         let console_host = policy == ResizePolicy::ConPty;
         self.modes.win32_input_enabled = console_host;

@@ -9,7 +9,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use atpkg_publish::channel::mirror::{self, MirrorOptions, MirrorReport};
 use atpkg_publish::error::Result;
@@ -33,11 +32,7 @@ fn staging() -> Slug {
 }
 
 fn opts(dry_run: bool) -> MirrorOptions {
-    MirrorOptions {
-        dry_run,
-        confirm_attempts: 2,
-        confirm_pause: Duration::ZERO,
-    }
+    MirrorOptions { dry_run }
 }
 
 /// Index 7 pinning ay 8256 (with `doc`'s overlays), the pack signed on staging.

@@ -427,8 +427,16 @@ fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
 
     // The renderer's row damage between the two frames: the band row, nothing else.
     let mut dirty = Vec::new();
-    let decision =
-        aterm_render::compute_dirty_rows(&before, &after, false, None, false, None, 24, &mut dirty);
+    let decision = aterm_render::compute_dirty_rows(
+        &before,
+        &after,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 24),
+        &mut dirty,
+    );
     let rows_dirty: Vec<usize> = match decision {
         aterm_render::DirtyDecision::Rows(_) => dirty
             .iter()
@@ -443,7 +451,14 @@ fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
     // frame is no more damage than a blink.
     let mut blink = Vec::new();
     let blink_rows = match aterm_render::compute_dirty_rows(
-        &before, &before, true, None, false, None, 24, &mut blink,
+        &before,
+        &before,
+        true,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 24),
+        &mut blink,
     ) {
         aterm_render::DirtyDecision::Rows(_) => blink.iter().filter(|d| **d).count(),
         aterm_render::DirtyDecision::FullRepaint => usize::MAX,

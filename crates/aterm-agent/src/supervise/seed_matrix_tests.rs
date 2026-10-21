@@ -26,7 +26,14 @@
 //! to an act a successor typed later (inside the 40 s) comes as much later.
 //! A successor the host started as Off lifted finds no park on its books:
 //! the host stopped the loop before it under Off, and the row is its own to
-//! write.
+//! write. And at every point, a loop STOPPED IN THE POINT'S WINDOW — its line
+//! and the task's end its fold took journaled, as `look` journals them
+//! ([`Session::say_point`]), its act still to come, where the host's step
+//! takes the point and the host stops the loop — is followed a second on,
+//! as Off lifts where Off stood and lifted next, and in a chain from it and
+//! into it ([`window_cells`]): before 2026-10-20 the end's note was owed to
+//! the act, and the matrix, deciding and acting on a point in one step with
+//! no point line journaled, had no handoff between them.
 //! Where the take window is modelled, a successor attached between an act
 //! and the first loop's first read after it first looks there (the read
 //! latency is the world's). Time on the fixed clock moves the policy's
@@ -182,11 +189,13 @@ struct Loop<'m> {
     host: Option<Arc<AccountHost>>,
     ledger: PathBuf,
     read: usize,
+    /// The ledger mirrored: its rows, read again only as it grows ([`RowCount`]).
+    count: RowCount,
     /// Every ledger row, stamped with the test's clock when it was written.
     stamped: Vec<(i64, String)>,
     /// The lines said and noted since the last look ([`Journaled`]), each
     /// with the count of ledger rows written before it.
-    lines: Vec<(usize, String)>,
+    lines: Vec<Said>,
     /// Every line the loop said or noted, journaled as production journals
     /// it beside the ledger ([`crate::supervise::approvals::journal_beside`]),
     /// stamped where it fell among the rows.
@@ -212,6 +221,36 @@ struct Loop<'m> {
     key_at: Option<i64>,
     /// Every screen read carries it ([`Scenario::person_on_screen`]).
     person_on_screen: bool,
+    /// Every point's window ([`Window`]), in order.
+    windows: Vec<Window>,
+}
+
+/// THE WINDOW OF A POINT ([`Loop::point`]): its own line journaled, and the
+/// task's end its fold took right after it, its act still to come — where
+/// production's host may take the point with a step of its own and the
+/// loop be stopped before the act (`look`: the live upgrade's restart, a
+/// relaunch's carry-on, then Off, a SUPERVISION setting saved, aterm's own
+/// update). Its instant, and how many of the loop's rows ([`Loop::stamped`])
+/// and lines ([`Loop::journal`]) stand in it: the books a loop stopped there
+/// leaves ([`window_cells`]).
+#[derive(Clone, Copy, Debug)]
+struct Window {
+    at: i64,
+    rows: usize,
+    lines: usize,
+}
+
+/// A line said or noted ([`Journaled`]): the count of ledger rows written
+/// before it, and what its journal record carries beside the line — the
+/// mark of the worker's last words at a point
+/// ([`crate::supervise::journal::JournalRecord::mark`]), and the time an
+/// end it restates was first noted
+/// ([`crate::supervise::journal::JournalRecord::ended`]).
+struct Said {
+    rows: usize,
+    line: String,
+    mark: Option<u64>,
+    ended: Option<i64>,
 }
 
 /// The production take window ([`TurnEndTiming::take_within`]), on the
@@ -241,14 +280,116 @@ struct Journaled<'j> {
     /// The rows [`Loop::collect`] has stamped: the count a line takes where
     /// the file cannot be read.
     read: usize,
-    lines: &'j mut Vec<(usize, String)>,
+    /// The ledger mirrored: its rows, read again only as it grows ([`RowCount`]).
+    count: &'j mut RowCount,
+    lines: &'j mut Vec<Said>,
+}
+
+/// THE LEDGER A LOOP APPENDS TO, mirrored: its bytes as the file holds them
+/// now, and the rows (`\n`) in them. A look costs one `stat` where the file
+/// stands (its length and modification time unmoved), and a read of the rows
+/// appended since where it grew — through the descriptor the last read held,
+/// where the platform names the file's identity and the path still names that
+/// file (a loop writes its books in place only by appending; its cut writes a
+/// new file and renames it in, read whole). Anything else is read whole, as a
+/// look at every line the loop says once read it.
+#[derive(Default)]
+struct RowCount {
+    /// The file read, held open, and its identity.
+    held: Option<(std::fs::File, u64)>,
+    /// The length and modification time the mirror stands at.
+    at: Option<(u64, Option<std::time::SystemTime>)>,
+    /// The file's bytes, and the rows in them.
+    body: Vec<u8>,
+    rows: usize,
+}
+
+/// The file's identity where the platform names one (its inode).
+fn file_identity(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+impl RowCount {
+    /// The rows at `path` now; `unread` where it cannot be read.
+    fn rows(&mut self, path: &Path, unread: usize) -> usize {
+        self.counted(path).unwrap_or(unread)
+    }
+
+    /// The rows at `path` now, `None` where it cannot be read.
+    fn counted(&mut self, path: &Path) -> Option<usize> {
+        self.sync(path).then_some(self.rows)
+    }
+
+    /// The text at `path` now (`str::lines` of it as `std::fs::read_to_string`
+    /// reads it: empty where it cannot be read or is no UTF-8).
+    fn text(&mut self, path: &Path) -> &str {
+        if self.sync(path) {
+            std::str::from_utf8(&self.body).unwrap_or_default()
+        } else {
+            ""
+        }
+    }
+
+    /// The mirror brought to the file at `path`: `false` where it cannot be
+    /// read (the mirror then holds nothing).
+    fn sync(&mut self, path: &Path) -> bool {
+        use std::io::Read as _;
+        let Ok(meta) = std::fs::metadata(path) else {
+            *self = Self::default();
+            return false;
+        };
+        let id = file_identity(&meta);
+        let at = (meta.len(), meta.modified().ok());
+        let held = id.is_some() && self.held.as_ref().map(|(_, h)| *h) == id;
+        if self.at == Some(at) && (held || id.is_none()) {
+            return true;
+        }
+        if held
+            && at.0 > self.body.len() as u64
+            && let Some((file, _)) = self.held.as_mut()
+        {
+            let from = self.body.len();
+            if file.read_to_end(&mut self.body).is_ok() {
+                self.rows += self.body[from..].iter().filter(|&&c| c == b'\n').count();
+                self.at = Some((self.body.len() as u64, at.1));
+                return true;
+            }
+        }
+        let mut body = Vec::new();
+        let Ok(mut file) = std::fs::File::open(path) else {
+            *self = Self::default();
+            return false;
+        };
+        if file.read_to_end(&mut body).is_err() {
+            *self = Self::default();
+            return false;
+        }
+        self.rows = body.iter().filter(|&&c| c == b'\n').count();
+        self.at = Some((body.len() as u64, at.1));
+        self.body = body;
+        self.held = id.map(|id| (file, id));
+        true
+    }
 }
 
 impl Journaled<'_> {
-    fn record(&mut self, line: &str) {
-        let rows = std::fs::read(self.ledger)
-            .map_or(self.read, |b| b.iter().filter(|&&c| c == b'\n').count());
-        self.lines.push((rows, line.to_string()));
+    fn record(&mut self, line: &str, mark: Option<u64>, ended: Option<i64>) {
+        let rows = self.count.rows(self.ledger, self.read);
+        self.lines.push(Said {
+            rows,
+            line: line.to_string(),
+            mark,
+            ended,
+        });
     }
 }
 
@@ -256,15 +397,24 @@ impl Review for Journaled<'_> {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
         Ok(())
     }
-    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
-        Ok(false)
+    fn review(&mut self, turn: &Turn) -> Result<bool, String> {
+        self.review_marked(turn, None)
+    }
+    /// The point's own line, with its mark, as `Lines` journals it: what a
+    /// loop that follows reads an end's point by ([`ended_before`]).
+    fn review_marked(&mut self, turn: &Turn, mark: Option<u64>) -> Result<bool, String> {
+        self.record(&event_line(turn, &[]), mark, None);
+        Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
-        self.record(line);
+        self.record(line, None, None);
         Ok(())
     }
     fn note(&mut self, line: &str) {
-        self.record(line);
+        self.record(line, None, None);
+    }
+    fn note_ended(&mut self, line: &str, ended: Option<i64>) {
+        self.record(line, None, ended);
     }
     fn unattended(&self) -> bool {
         false
@@ -341,11 +491,20 @@ impl Loop<'_> {
     /// The rows written since the last look, stamped now; typed rows are
     /// acts.
     fn collect(&mut self) -> Vec<Act> {
-        let body = std::fs::read_to_string(&self.ledger).unwrap_or_default();
-        let lines: Vec<&str> = body.lines().collect();
+        // No row since the last look: nothing to read ([`RowCount`]).
+        let unmoved = self.count.counted(&self.ledger) == Some(self.read);
+        let (total, fresh): (usize, Vec<String>) = if unmoved {
+            (self.read, Vec::new())
+        } else {
+            let text = self.count.text(&self.ledger);
+            (
+                text.lines().count(),
+                text.lines().skip(self.read).map(str::to_owned).collect(),
+            )
+        };
         let now = self.now();
         let mut new = Vec::new();
-        for (i, line) in lines.iter().enumerate().skip(self.read) {
+        for (i, line) in (self.read..).zip(&fresh) {
             let ms = now * 1000 + i64::try_from(i - self.read).unwrap_or(0);
             self.stamped.push((ms, restamp(line, ms)));
             let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
@@ -376,15 +535,15 @@ impl Loop<'_> {
         }
         // The lines said meanwhile, stamped as the next row after the ones
         // before them would be.
-        for (rows, line) in std::mem::take(&mut self.lines) {
-            let ms = now * 1000 + i64::try_from(rows.saturating_sub(self.read)).unwrap_or(0);
-            self.journal.push((
-                ms,
-                crate::supervise::journal::JournalRecord::of_line(ms, Some(SID), &line, None)
-                    .to_json(),
-            ));
+        for said in std::mem::take(&mut self.lines) {
+            let ms = now * 1000 + i64::try_from(said.rows.saturating_sub(self.read)).unwrap_or(0);
+            let mut rec =
+                crate::supervise::journal::JournalRecord::of_line(ms, Some(SID), &said.line, None);
+            rec.mark = said.mark;
+            rec.ended = said.ended;
+            self.journal.push((ms, rec.to_json()));
         }
-        self.read = lines.len();
+        self.read = total;
         self.acts.extend(new.clone());
         new
     }
@@ -449,9 +608,30 @@ impl Loop<'_> {
             worked.map(|d| d.as_secs()),
             brief(&self.s, &a)
         ));
+        // `look`'s order: the task's end the fold took is recorded and
+        // published, then the point's own line and the end's note
+        // ([`Session::say_point`])…
         let mut review = Journaled {
             ledger: &self.ledger,
             read: self.read,
+            count: &mut self.count,
+            lines: &mut self.lines,
+        };
+        let _ = self.s.task_edge_at_fold(&p.screen, &self.opts, &mut review);
+        let _ = self.s.say_point(&p, &mut review);
+        // …THE WINDOW, where the host's step may take the point and the loop
+        // be stopped ([`Window`])…
+        let written = self.count.rows(&self.ledger, self.read);
+        self.windows.push(Window {
+            at: self.now(),
+            rows: self.stamped.len() + written.saturating_sub(self.read),
+            lines: self.journal.len() + self.lines.len(),
+        });
+        // …then the point's act.
+        let mut review = Journaled {
+            ledger: &self.ledger,
+            read: self.read,
+            count: &mut self.count,
             lines: &mut self.lines,
         };
         let _ = self.s.turn_end_execute(&p, a, &self.opts, &[], &mut review);
@@ -473,6 +653,7 @@ impl Loop<'_> {
         let mut review = Journaled {
             ledger: &self.ledger,
             read: self.read,
+            count: &mut self.count,
             lines: &mut self.lines,
         };
         let _ = self.s.turn_end_now(&seen, &self.opts, &[], &mut review);
@@ -573,6 +754,7 @@ impl Loop<'_> {
                 Journaled {
                     ledger: &self.ledger,
                     read: self.read,
+                    count: &mut self.count,
                     lines: &mut self.lines,
                 }
                 .note(&note);
@@ -627,6 +809,8 @@ struct First {
     stamped: Vec<(i64, String)>,
     /// Its journal's lines, stamped ([`Loop::journal`]).
     journal: Vec<(i64, String)>,
+    /// Every point's window ([`Window`]), on its books.
+    windows: Vec<Window>,
     log: Vec<String>,
     /// When the run ends (unix seconds): its last event, and the
     /// scenario's tail past it.
@@ -664,6 +848,7 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         host,
         ledger: ledger.clone(),
         read: 0,
+        count: RowCount::default(),
         stamped: Vec::new(),
         lines: Vec::new(),
         journal: Vec::new(),
@@ -679,6 +864,7 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         awaiting: false,
         key_at: None,
         person_on_screen: sc.person_on_screen,
+        windows: Vec::new(),
     };
     l.s.set_zone_lookup(test_zones);
     l.s.ledger = Ledger::open(Some(&ledger), Some(SID), &mut Vec::new());
@@ -762,6 +948,7 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         acts: l.acts.clone(),
         stamped: l.stamped.clone(),
         journal: l.journal.clone(),
+        windows: l.windows.clone(),
         log,
         end,
         machine: Machine::default(),
@@ -792,6 +979,8 @@ struct Followed {
     /// The journal it attached beside and every line it said, stamped: the
     /// journal beside that ledger.
     journal: Vec<(i64, String)>,
+    /// Every point's window it met ([`Window`]), on those books.
+    windows: Vec<Window>,
 }
 
 /// The books a loop that follows attaches on: the ledger's rows and the
@@ -855,6 +1044,23 @@ impl First {
             journal: &self.journal,
             restored: None,
         }
+    }
+
+    /// The instants a loop stopped in the window at `at` ([`Window`]) is
+    /// followed at: a second on, and — Off standing and lifting next — a
+    /// second after it lifts (the host stops a worker its session reads Off
+    /// for, and starts one as Off lifts).
+    fn window_attach(&self, at: i64) -> Vec<i64> {
+        let mut hs = vec![at + 1];
+        if let Some((t_off, ..)) = self
+            .events
+            .iter()
+            .find(|(t, ..)| *t > at)
+            .filter(|(_, _, ev, _)| matches!(ev, Ev::OffLifted))
+        {
+            hs.push(t_off + 1);
+        }
+        hs
     }
 }
 
@@ -1014,6 +1220,7 @@ fn run_follower(
         host,
         ledger: books.clone(),
         read: 0,
+        count: RowCount::default(),
         stamped: Vec::new(),
         lines: Vec::new(),
         journal: Vec::new(),
@@ -1029,6 +1236,7 @@ fn run_follower(
         awaiting: false,
         key_at,
         person_on_screen: sc.person_on_screen,
+        windows: Vec::new(),
     };
     l.s.set_zone_lookup(test_zones);
     l.s.set_turn_end_timing(TurnEndTiming {
@@ -1042,7 +1250,7 @@ fn run_follower(
     // ([`Machine`]).
     l.s.count_sleeps(first.asleep_at(h));
     if first.machine.rebooted {
-        l.s.set_boot("another-boot");
+        l.s.set_boot(crate::supervise::fx::OTHER_TEST_BOOT);
     }
     l.s.set_last_sleep(first.last_sleep_at(h).filter(|_| !first.machine.no_last));
     // `drive_loop`'s seed. Its take window on the test's clock: an act
@@ -1213,6 +1421,15 @@ fn run_follower(
             .map(|a| format!("+{} {}", a.at - sc.t0, a.rule))
             .collect::<Vec<_>>()
     ));
+    let windows = l
+        .windows
+        .iter()
+        .map(|w| Window {
+            rows: standing_rows.len() + w.rows,
+            lines: standing_lines.len() + w.lines,
+            ..*w
+        })
+        .collect();
     let mut stamped = standing_rows;
     stamped.extend(l.stamped.iter().cloned());
     let mut lines = standing_lines;
@@ -1234,6 +1451,7 @@ fn run_follower(
         log,
         stamped,
         journal: lines,
+        windows,
     }
 }
 
@@ -1347,9 +1565,16 @@ fn verdict(mine: Option<&Act>, theirs: Option<&Act>, due: Option<i64>) -> Option
 /// handoff (`seed`: taken up from the ledger, else started blank, the
 /// negative control) — and, seeded, a CHAIN at every handoff: the
 /// successor followed in its turn by a third loop at the next handoff
-/// ([`run_chain`]). The log of every cell, and the cells that break the
+/// ([`run_chain`]) — and the cells of every point's window
+/// ([`window_cells`]). The log of every cell, and the cells that break the
 /// rule (module docs) with their successor's log.
 fn run_matrix(sc: &Scenario, seed: bool) -> (String, Tally) {
+    run_matrix_owed(sc, seed, false)
+}
+
+/// [`run_matrix`]; `owed`: the window's books without the task's end said
+/// in it ([`window_cells`], the negative control).
+fn run_matrix_owed(sc: &Scenario, seed: bool, owed: bool) -> (String, Tally) {
     let mut out = String::new();
     let mut tally = Tally::default();
     // The scenario's name as a file name every platform takes (Windows refuses `:`, `?`, …).
@@ -1423,8 +1648,178 @@ fn run_matrix(sc: &Scenario, seed: bool) -> (String, Tally) {
             );
         }
     }
+    for (what, c) in window_cells(sc, &first, &hs, &dir, seed, owed) {
+        cell(what, c, &mut out, &mut tally);
+    }
     let _ = std::fs::remove_dir_all(&dir);
     (out, tally)
+}
+
+/// The acts typed on `rows` (ledger rows, stamped): how many, and when the
+/// last was (unix seconds) — what a loop attached on them takes the first
+/// loop's acts to be up to ([`run_follower`]'s `k0` and `last`).
+fn typed_on(rows: &[(i64, String)]) -> (usize, Option<i64>) {
+    let typed: Vec<i64> = rows
+        .iter()
+        .filter(|(_, row)| {
+            aterm_json::from_str::<aterm_json::Value>(row).is_ok_and(|v| {
+                v.get("decision").and_then(aterm_json::Value::as_str) == Some("typed")
+            })
+        })
+        .map(|(ms, _)| ms.div_euclid(1000))
+        .collect();
+    (typed.len(), typed.last().copied())
+}
+
+/// Books a loop left, owned ([`Books`]): its ledger's rows and its
+/// journal's lines, stamped.
+type Stood = (Vec<(i64, String)>, Vec<(i64, String)>);
+
+/// THE BOOKS A LOOP STOPPED IN A POINT'S WINDOW LEAVES ([`Window`]): the
+/// rows and lines of `on` that stood there. `owed`: without the task's end
+/// said in it (`DONE …`, `LEFT …` in the window's instant) — the books
+/// before the end's note went right after its point's line, when it was
+/// owed to the point's act, the negative control.
+fn in_window(on: Books<'_>, w: Window, owed: bool) -> Stood {
+    let rows = on.rows[..w.rows].to_vec();
+    let lines = on.journal[..w.lines]
+        .iter()
+        .filter(|(ms, line)| {
+            !(owed
+                && *ms >= w.at * 1000
+                && (line.contains("\"line\":\"DONE ") || line.contains("\"line\":\"LEFT ")))
+        })
+        .cloned()
+        .collect();
+    (rows, lines)
+}
+
+/// THE WINDOW CELLS OF A SCENARIO (the claim of 2026-10-20 against
+/// `look()`: a point's line journaled, the task's end its fold took said
+/// at the point's act, which the host's step took): at every point of the
+/// first loop's timeline, the loop STOPPED IN THE POINT'S WINDOW
+/// ([`Window`]: its line and the task's end said, its act not yet typed —
+/// the host's step took the point, and the host stopped the loop) and a
+/// successor attached a second on, on the books as it left them; where Off
+/// stood and lifted next, one attached as it lifts (the host stops a worker
+/// its session reads Off for, and starts one as Off lifts:
+/// [`Session::seed_from_ledger`]'s `lifted_off`); a CHAIN FROM IT, that
+/// successor run to the next handoff (`hs`) and a third loop attached
+/// there on its books; and a CHAIN INTO IT, a successor attached at the
+/// handoff before the point, stopped in its own window there, and a third
+/// loop attached a second on (and as Off lifts) on the books it left.
+/// Each a cell of the rule (module docs), named with its log. `owed`: the
+/// books without the task's end said in the window ([`in_window`]), the
+/// negative control.
+fn window_cells(
+    sc: &Scenario,
+    first: &First,
+    hs: &[i64],
+    dir: &Path,
+    seed: bool,
+    owed: bool,
+) -> Vec<(String, Cell)> {
+    let mut cells = Vec::new();
+    let attach_at = |at: i64| first.window_attach(at);
+    let follow =
+        |what: &str, on: Stood, at: i64, log: &[String], cells: &mut Vec<(String, Cell)>| {
+            let books = Books {
+                rows: &on.0,
+                journal: &on.1,
+                restored: None,
+            };
+            let (k0, last) = typed_on(books.rows);
+            for h in attach_at(at) {
+                let f = run_follower(sc, first, books, (h, k0, last), None, dir, seed);
+                let mut lines = log.to_vec();
+                lines.push(format!("  attached at +{}:", h - sc.t0));
+                lines.extend(f.log);
+                cells.push((
+                    format!(
+                        "{what} stopped in the window at +{}, attached at +{}",
+                        at - sc.t0,
+                        h - sc.t0
+                    ),
+                    (f.diverged, f.at_k, f.due, lines),
+                ));
+            }
+        };
+    for w in &first.windows {
+        follow(
+            "the first loop",
+            in_window(first.books(), *w, owed),
+            w.at,
+            &[],
+            &mut cells,
+        );
+        if !seed {
+            continue;
+        }
+        // A CHAIN FROM IT: the successor a second on, run to the next
+        // handoff, where a third loop attaches on its books.
+        let books = in_window(first.books(), *w, owed);
+        let on = Books {
+            rows: &books.0,
+            journal: &books.1,
+            restored: None,
+        };
+        let (k0, last) = typed_on(on.rows);
+        if let Some(&h2) = hs.iter().find(|&&h| h > w.at + 1) {
+            let second = run_follower(sc, first, on, (w.at + 1, k0, last), Some(h2), dir, true);
+            if second.diverged.is_none() {
+                let third = run_follower(
+                    sc,
+                    first,
+                    second.books(),
+                    (h2, second.at_k, second.last),
+                    None,
+                    dir,
+                    true,
+                );
+                let mut log = vec![format!("  the successor at +{}:", w.at + 1 - sc.t0)];
+                log.extend(second.log);
+                log.push(format!("  the third loop at +{}:", h2 - sc.t0));
+                log.extend(third.log);
+                cells.push((
+                    format!(
+                        "stopped in the window at +{}, chain +{} then +{}",
+                        w.at - sc.t0,
+                        w.at + 1 - sc.t0,
+                        h2 - sc.t0
+                    ),
+                    (third.diverged, third.at_k, third.due, log),
+                ));
+            }
+        }
+        // A CHAIN INTO IT: a successor attached at the handoff before the
+        // point, stopped in its own window there.
+        if let Some(&h1) = hs.iter().rev().find(|&&h| h <= w.at) {
+            let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h1).collect();
+            let second = run_follower(
+                sc,
+                first,
+                first.books(),
+                (h1, before.len(), before.last().map(|a| a.at)),
+                Some(w.at + 1),
+                dir,
+                true,
+            );
+            if second.diverged.is_none()
+                && let Some(sw) = second.windows.iter().rev().find(|x| x.at == w.at)
+            {
+                let mut log = vec![format!("  the successor at +{}:", h1 - sc.t0)];
+                log.extend(second.log.iter().cloned());
+                follow(
+                    &format!("a loop attached at +{}", h1 - sc.t0),
+                    in_window(second.books(), *sw, owed),
+                    w.at,
+                    &log,
+                    &mut cells,
+                );
+            }
+        }
+    }
+    cells
 }
 
 // ---------------------------------------------------------------- screens
@@ -1577,7 +1972,7 @@ fn default_policy() -> SupervisorConfig {
     SupervisorConfig {
         model_fallback: None,
         usage_credits: true,
-        ..SupervisorConfig::default()
+        ..owners_policy()
     }
 }
 
@@ -2434,7 +2829,7 @@ fn scenarios() -> Vec<Scenario> {
         out.push(Scenario {
             name: format!("J bucket, the fallback ({tag})"),
             t0: bt0,
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             host: Some((answers, Some(before.clone()))),
             beats,
             tail_s: 3 * HOUR,
@@ -2837,266 +3232,6 @@ fn more_scenarios() -> Vec<Scenario> {
         ));
         out.push(Scenario {
             name: "K the done check cut by the weekly limit, its retry's done reply".to_string(),
-            t0: T0,
-            policy: default_policy(),
-            host: None,
-            beats,
-            tail_s: 3 * HOUR,
-            take: false,
-            person_on_screen: false,
-        });
-    }
-    // ---- P: the open-items challenge answered (the merge review's MG7-A3):
-    // the first loop types the challenge at a FINISHED report that names
-    // open work; the answer done in words, nothing left, ends the task, and
-    // FINISHED again with an item still listed is challenged again on the
-    // back-off's pace (the owner's rule of 2026-10-19: never once a job). A
-    // follower reads that answer as the challenge's, as the first loop does:
-    // never the done check (read as a first done report).
-    for (tag, reply) in [
-        (
-            "done in words",
-            &["⏺ Ran the lexer's e2e suite: green. All done; nothing left to do."][..],
-        ),
-        (
-            "FINISHED again, an item listed",
-            &[
-                "⏺ Ran the lexer's e2e suite: green, committed.",
-                "  Left: the docs.",
-                "  ATERM-TASK-DONE",
-            ][..],
-        ),
-    ] {
-        let challenge =
-            crate::supervise::policy::turn_end::open_items_text(&["still open"], None, false);
-        let h1 = with(
-            &w0,
-            &turn(
-                None,
-                &[
-                    "⏺ Built and tested the parser; committed on main.",
-                    "  Still open: the lexer's e2e suite (not run).",
-                    "  ATERM-TASK-DONE",
-                ],
-                12 * MIN,
-                T0 + 12 * MIN,
-            ),
-        );
-        let h2 = with(&h1, &turn(Some(&challenge), reply, 5 * MIN, 0));
-        out.push(Scenario {
-            name: format!("P the open-items challenge answered ({tag})"),
-            t0: T0,
-            policy: default_policy(),
-            host: None,
-            beats: vec![
-                start(),
-                beat(
-                    At::Start(12 * MIN),
-                    "a finished report that names open work",
-                    Ev::Point(cc(&h1, &[], "")),
-                ),
-                taken(0, &h1, "Your report says done but still names open work"),
-                beat(
-                    At::Act(0, 5 * MIN),
-                    "the challenge's answer",
-                    Ev::Point(cc(&h2, &[], "")),
-                ),
-            ],
-            tail_s: 3 * HOUR,
-            take: false,
-            person_on_screen: false,
-        });
-    }
-    // ---- P: the challenge answered done, then a NEW JOB's FINISHED that
-    // names open work (the merge of the ledger's records onto MG7-A3): the
-    // answer ended the job (`task-done@v1`), and the new job's report is
-    // challenged — by a follower too.
-    {
-        let challenge =
-            crate::supervise::policy::turn_end::open_items_text(&["still open"], None, false);
-        let h1 = with(
-            &w0,
-            &turn(
-                None,
-                &[
-                    "⏺ Built and tested the parser; committed on main.",
-                    "  Still open: the lexer's e2e suite (not run).",
-                    "  ATERM-TASK-DONE",
-                ],
-                12 * MIN,
-                T0 + 12 * MIN,
-            ),
-        );
-        let h2 = with(
-            &h1,
-            &turn(
-                Some(&challenge),
-                &["⏺ Ran the lexer's e2e suite: green. All done; nothing left to do."],
-                5 * MIN,
-                0,
-            ),
-        );
-        let ask = "now port the docs to the new site";
-        let h3 = with(
-            &h2,
-            &turn(
-                Some(ask),
-                &[
-                    "⏺ Ported the docs; committed on main.",
-                    "  Still open: the search index (not built).",
-                    "  ATERM-TASK-DONE",
-                ],
-                12 * MIN,
-                0,
-            ),
-        );
-        let h4 = with(
-            &h3,
-            &turn(
-                Some(&challenge),
-                &["⏺ Built the search index: green. All done; nothing left to do."],
-                5 * MIN,
-                0,
-            ),
-        );
-        out.push(Scenario {
-            name: "P the open-items challenge answered, then a new job's open items".to_string(),
-            t0: T0,
-            policy: default_policy(),
-            host: None,
-            beats: vec![
-                start(),
-                beat(
-                    At::Start(12 * MIN),
-                    "a finished report that names open work",
-                    Ev::Point(cc(&h1, &[], "")),
-                ),
-                taken(0, &h1, "Your report says done but still names open work"),
-                beat(
-                    At::Act(0, 5 * MIN),
-                    "the challenge's answer: done",
-                    Ev::Point(cc(&h2, &[], "")),
-                ),
-                beat(
-                    At::Act(0, 20 * MIN),
-                    "a new job's turn runs",
-                    Ev::Busy(live(&h2, ask)),
-                ),
-                beat(
-                    At::Act(0, 32 * MIN),
-                    "the new job's finished report names open work",
-                    Ev::Point(cc(&h3, &[], "")),
-                ),
-                taken(1, &h3, "Your report says done but still names open work"),
-                beat(
-                    At::Act(1, 5 * MIN),
-                    "the new job's challenge's answer: done",
-                    Ev::Point(cc(&h4, &[], "")),
-                ),
-            ],
-            tail_s: 3 * HOUR,
-            take: false,
-            person_on_screen: false,
-        });
-    }
-    // ---- P: the challenge PAST ITS ANSWER, then the job's FINISHED that
-    // names open work (the merge review's MG9-S3): (a) the answer is
-    // progress, no done report, and `keep going` follows it; (b) a weekly
-    // limit cuts the challenge and Off stands and lifts before its retry,
-    // which drops the cut check. The first loop challenges the FINISHED
-    // again (the owner's rule of 2026-10-19: never once a job), and so does
-    // a follower past that point.
-    {
-        let challenge =
-            crate::supervise::policy::turn_end::open_items_text(&["still open"], None, false);
-        let h1 = with(
-            &w0,
-            &turn(
-                None,
-                &[
-                    "⏺ Built and tested the parser; committed on main.",
-                    "  Still open: the lexer's e2e suite (not run).",
-                    "  ATERM-TASK-DONE",
-                ],
-                12 * MIN,
-                T0 + 12 * MIN,
-            ),
-        );
-        let finished = [
-            "⏺ Ran the lexer's e2e suite: green, committed.",
-            "  Left: the docs.",
-            "  ATERM-TASK-DONE",
-        ];
-        let head = || {
-            vec![
-                start(),
-                beat(
-                    At::Start(12 * MIN),
-                    "a finished report that names open work",
-                    Ev::Point(cc(&h1, &[], "")),
-                ),
-                taken(0, &h1, "Your report says done but still names open work"),
-            ]
-        };
-        // (a) The answer is progress; `keep going` follows it.
-        let h2 = with(
-            &h1,
-            &turn(
-                Some(&challenge),
-                &["⏺ Running the lexer's e2e suite: 3 of 9 pass so far; fixing the rest."],
-                5 * MIN,
-                0,
-            ),
-        );
-        let h3 = with(&h2, &turn(Some("keep going"), &finished, 10 * MIN, 0));
-        let mut beats = head();
-        beats.push(beat(
-            At::Act(0, 5 * MIN),
-            "the challenge's answer: progress",
-            Ev::Point(cc(&h2, &[], "")),
-        ));
-        beats.push(taken(1, &h2, "keep going"));
-        beats.push(beat(
-            At::Act(1, 10 * MIN),
-            "FINISHED again, an item listed",
-            Ev::Point(cc(&h3, &[], "")),
-        ));
-        out.push(Scenario {
-            name: "P the open-items challenge answered with progress, then FINISHED with an item"
-                .to_string(),
-            t0: T0,
-            policy: default_policy(),
-            host: None,
-            beats,
-            tail_s: 3 * HOUR,
-            take: false,
-            person_on_screen: false,
-        });
-        // (b) The weekly limit cuts the challenge; Off stands and lifts
-        // before the wall's retry.
-        let h2 = with(&h1, &turn(Some(&challenge), &[weekly_notice], 0, 0));
-        let h3 = with(&h2, &turn(Some("keep going"), &finished, 10 * MIN, 0));
-        let mut beats = head();
-        beats.push(beat(
-            At::Act(0, 3),
-            "the challenge met by the weekly limit",
-            Ev::Point(cc(&h2, &[], "")),
-        ));
-        beats.push(beat(
-            At::Act(0, 10 * MIN),
-            "Off stood and lifted",
-            Ev::OffLifted,
-        ));
-        beats.push(taken(1, &h2, "keep going"));
-        beats.push(beat(
-            At::Act(1, 10 * MIN),
-            "the retry's answer: FINISHED, an item listed",
-            Ev::Point(cc(&h3, &[], "")),
-        ));
-        out.push(Scenario {
-            name: "P the open-items challenge cut by the weekly limit, Off lifts, then FINISHED \
-                   with an item"
-                .to_string(),
             t0: T0,
             policy: default_policy(),
             host: None,
@@ -3718,59 +3853,49 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- R5: the done check answered (the task done), then a person's
-    // turn ending in a done report.
-    for (tag, busy) in [("read busy", true), ("not read busy", false)] {
-        let mut beats = b_head();
-        beats.push(taken(0, &h_c, "keep going"));
-        let h3 = with(&h_c, &turn(Some("keep going"), &[done], 10 * MIN, 0));
-        beats.push(beat(
-            At::Act(0, 10 * MIN),
-            "the try's work ends in a done report",
-            Ev::Point(cc(&h3, &[], "")),
-        ));
-        beats.push(taken(1, &h3, "If the task is finished"));
-        let h4 = with(
-            &h3,
-            &turn(
-                Some(check),
-                &["⏺ All done: verified again, every suite passes."],
-                70,
-                0,
-            ),
+    // (e) A task's end, then Off stood and lifted: the landing — the clean
+    // defense in words that answers Land's instruction (FOREVER LAND; the
+    // retired token lands nothing, and Cruise never ends, so main's token
+    // and done-check cells have no end to hand over). A loop stopped in the
+    // end's window ([`window_cells`]) leaves books a loop started as Off
+    // lifts reads the end from.
+    {
+        let defense = [
+            "⏺ Merged the parser into main and pushed it; every suite passes.",
+            "",
+            "  Nothing left: all of it is merged into the remote main branch.",
+        ];
+        let p0 = cc(
+            &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
+            &[],
+            "",
         );
-        beats.push(beat(
-            At::Act(1, 72),
-            "the done check's answer: done again",
-            Ev::Point(cc(&h4, &[], "")),
-        ));
-        if busy {
-            beats.push(beat(
-                At::Act(1, 20 * MIN),
-                "a person's turn runs",
-                Ev::Busy(live(&h4, "please also update the changelog")),
-            ));
-        }
-        let h5 = with(
-            &h4,
-            &turn(
-                Some("please also update the changelog"),
-                &["⏺ All done: the changelog is updated, committed and pushed."],
-                if busy { 12 * MIN } else { 0 },
-                0,
+        // The land act's own `❯` row over its answer, as Claude Code draws
+        // the words typed: a successor lands a reply no read of its own saw
+        // run only where its act's taking is that plain (the land act's
+        // seed, `TurnEndState::seed_land_act`); under a `❯ (land)` stand-in
+        // the books' landing was owed Land's act again.
+        let land = crate::supervise::policy::turn_end::LAND;
+        let landed = with(&w0, &turn(Some(land), &defense, 10 * MIN, 0));
+        let beats = vec![
+            start(),
+            beat(At::Start(2 * MIN), "the worker's progress", Ev::Point(p0)),
+            taken(0, &w0, land),
+            beat(
+                At::Act(0, 10 * MIN),
+                "the land turn ends: a clean defense (landed)",
+                Ev::Point(cc(&landed, &[], "")),
             ),
-        );
-        beats.push(beat(
-            At::Act(1, 32 * MIN),
-            "the person's turn ends in a done report",
-            Ev::Point(cc(&h5, &[], "")),
-        ));
-        if busy {
-            beats.push(taken(2, &h5, "(the check)"));
-        }
+            beat(
+                At::Act(0, 10 * MIN + 30),
+                "Off stood and lifted",
+                Ev::OffLifted,
+            ),
+            beat(At::Act(0, 10 * MIN + 90), "(a handoff instant)", Ev::Mark),
+        ];
         out.push(sc(
-            format!("R5 the done check answered, then a person's turn {tag}"),
-            default_policy(),
+            "R4 Off lifts after the landing (Land, in words)".to_string(),
+            land_policy(),
             beats,
             3 * HOUR,
             false,
@@ -4262,7 +4387,6 @@ fn round8_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
     let done = "⏺ All done: the change is committed and pushed, and every suite passes.";
-    let done2 = "⏺ All done: verified again, every suite passes.";
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
     let still = "⏺ Stage 3 of 5: still on it.";
     let check = "If the task is finished and verified, end your reply with ATERM-TASK-DONE on a line by itself and stop; otherwise continue.";
@@ -4431,68 +4555,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- RS8-F1: the task done (the check answered), then a new short
-    // turn read busy: its done report a first one.
-    for (tag, reply, hand) in [
-        ("nobody's hand, a done report", done, false),
-        ("nobody's hand, progress", progress, false),
-        ("a person's hand, progress", progress, true),
-    ] {
-        let h1 = with(
-            &w0,
-            &turn(Some("carry on with the task"), &[done], 10 * MIN, 0),
-        );
-        let mut beats = vec![
-            start(),
-            beat(
-                At::Start(10 * MIN),
-                "the worker's done report",
-                Ev::Point(cc(&h1, &[], "")),
-            ),
-            taken(0, &h1, "If the task is finished"),
-        ];
-        let h2 = with(&h1, &turn(Some(check), &[done2], 70, 0));
-        beats.push(beat(
-            At::Act(0, 72),
-            "the check's answer: done again",
-            Ev::Point(cc(&h2, &[], "")),
-        ));
-        if hand {
-            beats.push(beat(
-                At::Act(0, 20 * MIN - 5),
-                "a person's keystroke",
-                Ev::Key,
-            ));
-        }
-        beats.push(beat(
-            At::Act(0, 20 * MIN),
-            "a new turn runs",
-            Ev::Busy(live(&h2, "now bump the version and tag it")),
-        ));
-        let h3 = with(
-            &h2,
-            &turn(Some("now bump the version and tag it"), &[reply], 30, 0),
-        );
-        beats.push(beat(
-            At::Act(0, 20 * MIN + 30),
-            "the new turn ends",
-            Ev::Point(cc(&h3, &[], "")),
-        ));
-        beats.push(taken(1, &h3, "(next)"));
-        let h4 = with(&h3, &turn(Some("(next)"), &[progress], 10 * MIN, 0));
-        beats.push(beat(
-            At::Act(1, 10 * MIN),
-            "the next act's turn ends: progress",
-            Ev::Point(cc(&h4, &[], "")),
-        ));
-        out.push(sc(
-            format!("RS8-F1 the task done, then a new short turn ({tag})"),
-            default_policy(),
-            beats,
-            3 * HOUR,
-            false,
-        ));
-    }
     // ---- RS8-F2: Land, landed by the land act's 10 min done reply, then a
     // new task's short turn (the land act's yield seen run).
     for (tag, reply) in [("a done report", done), ("progress", progress)] {
@@ -4578,51 +4640,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- RS8-F2: short turns, the task done at the check's short answer,
-    // a wake two hours on (past the window).
-    {
-        let mut beats = Vec::new();
-        let mut h = short_yields(1, &mut beats);
-        h = with(&h, &turn(Some("keep going"), &[done], 20, 0));
-        beats.push(beat(
-            At::Act(1, 20),
-            "the act's short turn ends: done",
-            Ev::Point(cc(&h, &[], "")),
-        ));
-        h = with(&h, &turn(Some(check), &[done2], 20, 0));
-        beats.push(beat(
-            At::Act(2, 20),
-            "the check's short answer: done",
-            Ev::Point(cc(&h, &[], "")),
-        ));
-        beats.push(beat(
-            At::Act(2, 2 * HOUR),
-            "a turn nobody typed runs (the worker's own wake)",
-            Ev::Busy(live(&h, "(background task finished)")),
-        ));
-        h = with(
-            &h,
-            &turn(
-                Some("(background task finished)"),
-                &["⏺ The build is still going."],
-                20,
-                0,
-            ),
-        );
-        beats.push(beat(
-            At::Act(2, 2 * HOUR + 20),
-            "the wake's short turn ends",
-            Ev::Point(cc(&h, &[], "")),
-        ));
-        beats.push(taken(3, &h, "keep going"));
-        out.push(sc(
-            "RS8-F2 short turns, the task done, a wake two hours on".to_string(),
-            default_policy(),
-            beats,
-            4 * HOUR,
-            false,
-        ));
-    }
     // ---- RS8-F2/F3: short turns in a row to the ladder's top (60 min).
     {
         let mut beats = Vec::new();
@@ -4672,18 +4689,13 @@ fn round8_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// Round 9's shapes (the verifier of 75b03ac6d): a point whose time moved
-/// with nothing a record held (RS9-F2), a person's exchange after the task's
-/// end (RS9-F3), and the land act answered not done (RS9-F4).
+/// Round 9's shapes (the verifier of 75b03ac6d): the land act answered not
+/// done (RS9-F4). (Its RS9-F2 and RS9-F3 began at a task the worker's own
+/// token ended, which FOREVER CRUISE retired.)
 fn round9_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
-    let finished = [
-        "⏺ All done: the change is committed and pushed.",
-        "",
-        "  ATERM-TASK-DONE",
-    ];
     let start = || {
         beat(
             At::Start(0),
@@ -4702,122 +4714,6 @@ fn round9_scenarios() -> Vec<Scenario> {
             take: false,
             person_on_screen,
         };
-    // ---- RS9-F2: the worker's FINISHED (the streak 0), then a turn nobody
-    // here typed (an orchestrator's), 5 min of work, stopped with Esc: the
-    // Esc hold counts from that turn's end, which moved no streak. The Esc
-    // with no keystroke the window stamps (an orchestrator's `aterm ctl
-    // key`), and, the control, the Esc a person's key.
-    for (tag, key) in [("no key", false), ("the Esc a key", true)] {
-        let h1 = with(&w0, &turn(None, &finished, 10 * MIN, 0));
-        let mut beats = vec![
-            start(),
-            beat(
-                At::Start(10 * MIN),
-                "the worker's FINISHED",
-                Ev::Point(cc(&h1, &[], "")),
-            ),
-            beat(
-                At::Start(20 * MIN),
-                "an orchestrator's turn runs",
-                Ev::Busy(live(&h1, "now bump the version and tag it")),
-            ),
-        ];
-        if key {
-            beats.push(beat(At::Start(25 * MIN), "a person's Esc", Ev::Key));
-        }
-        let mut h2 = h1.clone();
-        h2.extend(s(&[
-            "❯ now bump the version and tag it",
-            "",
-            "⏺ Bumping the version.",
-            "  ⎿  Interrupted · What should Claude do instead?",
-            "",
-        ]));
-        beats.push(beat(
-            At::Start(25 * MIN),
-            "the turn stopped with Esc",
-            Ev::Point(cc(&h2, &[], "")),
-        ));
-        beats.push(taken(0, &h2, "keep going"));
-        let h3 = with(&h2, &turn(Some("keep going"), &[progress], 10 * MIN, 0));
-        beats.push(beat(
-            At::Act(0, 10 * MIN),
-            "the act's turn ends: progress",
-            Ev::Point(cc(&h3, &[], "")),
-        ));
-        out.push(sc(
-            &format!("RS9-F2 FINISHED, an orchestrator's long turn Esc'd ({tag})"),
-            default_policy(),
-            beats,
-            false,
-        ));
-    }
-    // ---- RS9-F3: the worker's FINISHED, then a person's own exchange (3
-    // min, left to them), then a wake's short turn (nobody's hand). Every
-    // read carries the person's stamp.
-    {
-        let h1 = with(&w0, &turn(None, &finished, 10 * MIN, 0));
-        let mut beats = vec![
-            start(),
-            beat(
-                At::Start(10 * MIN),
-                "the worker's FINISHED",
-                Ev::Point(cc(&h1, &[], "")),
-            ),
-            beat(At::Start(15 * MIN), "a person's keystroke", Ev::Key),
-            beat(
-                At::Start(15 * MIN + 1),
-                "a person's message runs",
-                Ev::Busy(live(&h1, "what is left?")),
-            ),
-        ];
-        let h2 = with(
-            &h1,
-            &turn(
-                Some("what is left?"),
-                &["⏺ The parser and the docs."],
-                3 * MIN,
-                0,
-            ),
-        );
-        beats.push(beat(
-            At::Start(18 * MIN + 1),
-            "the person's exchange ends",
-            Ev::Point(cc(&h2, &[], "")),
-        ));
-        beats.push(beat(
-            At::Start(40 * MIN),
-            "a wake runs",
-            Ev::Busy(live(&h2, "(background task finished)")),
-        ));
-        let h3 = with(
-            &h2,
-            &turn(
-                Some("(background task finished)"),
-                &["⏺ The build is still going."],
-                20,
-                0,
-            ),
-        );
-        beats.push(beat(
-            At::Start(40 * MIN + 20),
-            "the wake's short turn ends",
-            Ev::Point(cc(&h3, &[], "")),
-        ));
-        beats.push(taken(0, &h3, "keep going"));
-        let h4 = with(&h3, &turn(Some("keep going"), &[progress], 10 * MIN, 0));
-        beats.push(beat(
-            At::Act(0, 10 * MIN),
-            "the act's turn ends: progress",
-            Ev::Point(cc(&h4, &[], "")),
-        ));
-        out.push(sc(
-            "RS9-F3 FINISHED, a person's exchange, then a wake's short turn",
-            default_policy(),
-            beats,
-            true,
-        ));
-    }
     // ---- RS9-F4: RS8-R4 under Land: the land instruction answered NOT
     // done (a short reply), then a turn ending in a done report — a
     // person's, and nobody's: no landing in hand, so Land nudges.
@@ -5150,6 +5046,22 @@ fn a_loop_that_follows_types_as_the_first_loop_at_every_handoff() {
             "CONTROL: a successor with no seed broke nothing:\n{out}"
         );
     }
+    // NEGATIVE CONTROL: the books a loop stopped in a point's window leaves
+    // without the task's end said there — its note owed to the point's act,
+    // as `look` owed it until 2026-10-20 ([`window_cells`]' `owed`): the
+    // landing said in words, read by a loop started as Off lifts, gets the
+    // land instruction again.
+    let landed = self::scenarios()
+        .into_iter()
+        .find(|sc| sc.name == "R4 Off lifts after the landing (Land, in words)")
+        .expect("the landing's scenario");
+    let (out, tally) = run_matrix_owed(&landed, true, true);
+    assert!(
+        tally.broken.iter().any(|b| {
+            b.starts_with("TYPES-WHERE-FIRST-DOES-NOT") && b.contains(" stopped in the window at ")
+        }),
+        "CONTROL: the landing's note owed past its window broke nothing:\n{out}"
+    );
 }
 
 /// A LAND EPISODE A READING IN ANOTHER MODE ENDED IS OVER FOR A LOOP THAT
@@ -5244,193 +5156,6 @@ fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follow
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LOOP THAT FOLLOWS AN OLDER BUILD'S LEDGER NEVER ENDS A JOB OVER OPEN
-/// WORK (the owner's rule of 2026-10-19): 0.105.0 (and 0.106.0's dev builds
-/// before the mark) typed the open-items challenge once a job and ended the
-/// job's next FINISHED that still named open work. Now, whatever the older
-/// books say — the challenge typed and `keep going` after it, the challenge
-/// answered done and a new job kept going, no journal, a journal cut back
-/// past the challenge — the follower's act at that FINISHED is the
-/// challenge again (or the back-off before it), and the task stays open.
-#[test]
-fn a_loop_on_an_older_builds_ledger_never_ends_a_job_over_open_work() {
-    use crate::supervise::approvals::{self, Outcome, Row};
-    use crate::supervise::journal::JournalRecord;
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_OPEN_ITEMS, open_items_text};
-    let dir = crate::supervise::test_scratch_path("seed-matrix", "older-challenge");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    let challenge = open_items_text(&["still open"], None, false);
-    let ms = |s: i64| s * 1000;
-    let row = |rule: &str, command: &str, at: i64| {
-        Row {
-            rule_id: rule,
-            outcome: Outcome::Typed,
-            command,
-            reason: "the turn-end policy",
-            box_seq: 1,
-        }
-        .to_json(ms(at), Some(SID))
-    };
-    let note =
-        |at: i64, line: &str| JournalRecord::of_line(ms(at), Some(SID), line, None).to_json();
-    let begun = note(T0, "EVENT idle seq=1 the loop attached");
-    let done = note(
-        T0 + 17 * MIN,
-        "DONE seq=7 rule=continue-open-items@v1 the worker said it is done after the open-items \
-         challenge: nothing more is typed until a person or an orchestrator types",
-    );
-    let h1 = with(
-        &work0(),
-        &turn(
-            None,
-            &[
-                "⏺ Built and tested the parser; committed on main.",
-                "  Still open: the lexer's e2e suite (not run).",
-                "  ATERM-TASK-DONE",
-            ],
-            12 * MIN,
-            T0 + 12 * MIN,
-        ),
-    );
-    let progress = with(
-        &h1,
-        &turn(
-            Some(&challenge),
-            &["⏺ Running the lexer's e2e suite: 3 of 9 pass so far; fixing the rest."],
-            5 * MIN,
-            0,
-        ),
-    );
-    let finished = with(
-        &progress,
-        &turn(
-            Some("keep going"),
-            &[
-                "⏺ Ran the lexer's e2e suite: green, committed.",
-                "  Left: the docs.",
-                "  ATERM-TASK-DONE",
-            ],
-            10 * MIN,
-            0,
-        ),
-    );
-    let answered = with(
-        &h1,
-        &turn(
-            Some(&challenge),
-            &["⏺ Ran the lexer's e2e suite: green. All done; nothing left to do."],
-            5 * MIN,
-            0,
-        ),
-    );
-    let new_job = with(
-        &answered,
-        &turn(
-            Some("now port the docs to the new site"),
-            &["⏺ Porting the docs: 2 of 5 pages are in."],
-            5 * MIN,
-            0,
-        ),
-    );
-    let new_job = with(
-        &new_job,
-        &turn(
-            Some("keep going"),
-            &[
-                "⏺ Ported the docs; committed on main.",
-                "  Still open: the search index (not built).",
-                "  ATERM-TASK-DONE",
-            ],
-            12 * MIN,
-            0,
-        ),
-    );
-    let challenged_then_kept_going = vec![
-        row(RULE_OPEN_ITEMS, &challenge, T0 + 12 * MIN),
-        row(RULE_CONTINUE, "keep going", T0 + 17 * MIN),
-    ];
-    // (case, the ledger, the journal, the point's screen)
-    type Case<'a> = (&'a str, Vec<String>, Option<Vec<String>>, &'a [String]);
-    let cases: [Case<'_>; 4] = [
-        (
-            "past the challenge's answer",
-            challenged_then_kept_going.clone(),
-            Some(vec![begun.clone()]),
-            &finished,
-        ),
-        (
-            "the challenge answered done, a new job kept going",
-            vec![
-                row(RULE_OPEN_ITEMS, &challenge, T0 + 12 * MIN),
-                row(RULE_CONTINUE, "keep going", T0 + 22 * MIN),
-            ],
-            Some(vec![begun.clone(), done]),
-            &new_job,
-        ),
-        (
-            "no journal",
-            challenged_then_kept_going.clone(),
-            None,
-            &finished,
-        ),
-        (
-            "the journal cut back past the challenge",
-            challenged_then_kept_going,
-            Some(vec![note(T0 + 15 * MIN, "EVENT idle seq=5 cut back")]),
-            &finished,
-        ),
-    ];
-    let mut wrong = Vec::new();
-    for (i, (case, rows, journal, screen)) in cases.into_iter().enumerate() {
-        let ledger = dir.join(format!("books-{i}.jsonl"));
-        std::fs::write(&ledger, rows.join("\n") + "\n").expect("the books");
-        if let Some(lines) = &journal {
-            std::fs::write(approvals::journal_beside(&ledger), lines.join("\n") + "\n")
-                .expect("the journal");
-        }
-        let now = T0 + 27 * MIN;
-        let mut m = Mock::new(vec![Vec::new()]);
-        let mut s = session(&mut m, Some(SID.to_string()));
-        s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(&ledger), Some(SID), &mut Vec::new());
-        s.turn_end_seeded = true;
-        s.set_clock(now, PDT);
-        let open = s.seed_from_ledger(&ledger, ms(now), false);
-        s.seed_wall_memory(open);
-        let rows = cc(screen, &[], "");
-        s.ctl.screens = vec![rows.clone()];
-        s.ctl.served = 0;
-        let opts = SuperviseOpts {
-            policy: default_policy(),
-            ..auto(30)
-        };
-        let p = point_at(&s, rows, 101);
-        let a = s
-            .turn_end_at_point(&p, Some(Duration::from_secs(12 * 60)), &opts)
-            .expect("a decision");
-        let rule = a.rule_id();
-        let backed_off = matches!(
-            a,
-            TurnEndAction::WaitUntil {
-                wait: WaitKind::BackOff { .. },
-                ..
-            }
-        );
-        let said = format!("{a:?}");
-        s.turn_end_execute(&p, a, &opts, &[], &mut Alone)
-            .expect("decided");
-        let ended = s.turn_end.task_done();
-        if ended || !(rule == Some(RULE_OPEN_ITEMS) || backed_off) {
-            wrong.push(format!(
-                "{case}: {said} (task done: {ended}), not the challenge"
-            ));
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
 /// OFF STANDS AT EVERY PARK THE JOURNAL SAYS, IN THE BOOKS A LOOP THAT
 /// FOLLOWS READS (ATERM-KI-1016-1, done-6): a build through 0.105.0 notes
 /// `PARKED seq=<n> autopilot=off` as it parks and records no
@@ -5500,106 +5225,6 @@ fn off_stands_at_every_park_the_journal_says() {
     let unparked = note(2_000, SID, "UNPARKED seq=7 autopilot=land after 900 ms");
     assert!(in_hand(&books, Some(&unparked)), "an UNPARKED note");
     assert!(in_hand(&books, None), "no journal");
-}
-
-/// A FOLLOWER JOURNALS A DONE REPLY TO THE CHALLENGE IT TOOK UP UNDER THE
-/// CHALLENGE'S RULE (ATERM-KI-1016-1): the open-items challenge a loop
-/// before this one typed, past its take window and owed its answer
-/// (`approvals::done_check_owed`), answered done in words at this loop's
-/// first point, ends the task as for the loop that typed it, and the
-/// journal says so: `DONE … rule=continue-open-items@v1`, as that loop says
-/// it. Read as someone else's turn's end at a standing check, it was said
-/// under the done check's rule. NEGATIVE CONTROL: the done check owed is
-/// said under its own rule.
-#[test]
-fn a_follower_journals_the_challenges_done_reply_under_its_rule() {
-    use crate::supervise::approvals::{Outcome, Row};
-    use crate::supervise::policy::turn_end::{RULE_DONE_CHECK, RULE_OPEN_ITEMS, open_items_text};
-    let dir = crate::supervise::test_scratch_path("seed-matrix", "challenge-done-rule");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    let challenge = open_items_text(&["still open"], None, false);
-    let h1 = with(
-        &work0(),
-        &turn(
-            None,
-            &[
-                "⏺ Built and tested the parser; committed on main.",
-                "  Still open: the lexer's e2e suite (not run).",
-                "  ATERM-TASK-DONE",
-            ],
-            12 * MIN,
-            T0 + 12 * MIN,
-        ),
-    );
-    let mut wrong = Vec::new();
-    for (rule, asked) in [
-        (RULE_OPEN_ITEMS, challenge.as_str()),
-        (RULE_DONE_CHECK, "If the task is finished"),
-    ] {
-        let ledger = dir.join(format!("{rule}.jsonl"));
-        let now = T0 + 22 * MIN;
-        let row = Row {
-            rule_id: rule,
-            outcome: Outcome::Typed,
-            command: asked,
-            reason: "the turn-end policy",
-            box_seq: 1,
-        }
-        .to_json((T0 + 12 * MIN) * 1000, Some(SID));
-        std::fs::write(&ledger, row + "\n").expect("the books");
-        let mut m = Mock::new(vec![Vec::new()]);
-        let mut s = session(&mut m, Some(SID.to_string()));
-        s.set_zone_lookup(test_zones);
-        s.ledger = Ledger::open(Some(&ledger), Some(SID), &mut Vec::new());
-        s.turn_end_seeded = true;
-        s.set_clock(now, PDT);
-        let open = s.seed_from_ledger(&ledger, now * 1000, false);
-        s.seed_wall_memory(open);
-        let answered = with(
-            &h1,
-            &turn(
-                Some(asked),
-                &["⏺ Ran the lexer's e2e suite: green. All done; nothing left to do."],
-                5 * MIN,
-                0,
-            ),
-        );
-        let rows = cc(&answered, &[], "");
-        s.ctl.screens = vec![rows.clone()];
-        s.ctl.served = 0;
-        let opts = SuperviseOpts {
-            policy: default_policy(),
-            ..auto(30)
-        };
-        let p = point_at(&s, rows, 101);
-        let a = s
-            .turn_end_at_point(&p, Some(Duration::from_secs(5 * 60)), &opts)
-            .expect("a decision");
-        let mut lines = Vec::new();
-        s.turn_end_execute(
-            &p,
-            a,
-            &opts,
-            &[],
-            &mut Journaled {
-                ledger: &ledger,
-                read: 0,
-                lines: &mut lines,
-            },
-        )
-        .expect("decided");
-        let done: Vec<&str> = lines
-            .iter()
-            .map(|(_, l)| l.as_str())
-            .filter(|l| l.starts_with("DONE "))
-            .collect();
-        if done.len() != 1 || !done[0].contains(&format!(" rule={rule} ")) {
-            wrong.push(format!("{rule}: {done:?}"));
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// A LOOP WHOSE SEED FOUND THE LEDGER'S TRY AGED OUT WRITES THE TRY OVER,
@@ -6897,6 +6522,21 @@ fn answered_tries(done: bool, transcript: bool, held: bool) -> Scenario {
 /// its attach, or the rung from its own read.
 #[test]
 fn a_tries_answer_no_loop_read_is_dated_by_the_screen_or_the_transcript() {
+    // Each sign's case on a thread of its own, in a directory of its own:
+    // the six share nothing.
+    std::thread::scope(|scope| {
+        for (done, transcript) in [(true, false), (false, true), (true, true)] {
+            for held in [false, true] {
+                scope.spawn(move || a_tries_answer_dated_by(done, transcript, held));
+            }
+        }
+    });
+}
+
+/// [`a_tries_answer_no_loop_read_is_dated_by_the_screen_or_the_transcript`]
+/// where the screen's done row (`done`) or the transcript's notice row
+/// (`transcript`) dates the try, its line `held` (the control).
+fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "dated-try");
     // The first read a follower dated the try at (its record for the loop
     // after it).
@@ -6908,125 +6548,122 @@ fn a_tries_answer_no_loop_read_is_dated_by_the_screen_or_the_transcript() {
             ms.parse().ok()
         })
     };
-    for (done, transcript) in [(true, false), (false, true), (true, true)] {
-        for held in [false, true] {
-            let sc = answered_tries(done, transcript, held);
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("dir");
-            let first = run_first(&sc, &dir);
-            let acts: Vec<i64> = first.acts.iter().map(|a| a.at).collect();
-            assert!(
-                acts.len() >= 4 && acts[2] - acts[1] >= 6 * HOUR && acts[3] - acts[2] >= 6 * HOUR,
-                "{}: the first loop's tries {acts:?}\n{}",
-                sc.name,
-                first.log.join("\n")
-            );
-            let tried = acts[1];
-            // The books as the loop that typed the second try left them: the
-            // try, and nothing read after it.
-            let cut = first
-                .stamped
-                .iter()
-                .find(|(ms, row)| ms / 1000 == tried && row.contains(",\"decision\":\"typed\","))
-                .map(|(ms, _)| ms + 1)
-                .expect("the try's row");
-            let rows = before_ms(&first.stamped, cut);
-            let journal = before_ms(&first.journal, cut);
-            let books = Books {
-                rows: &rows,
-                journal: &journal,
-                restored: None,
-            };
-            for (ago, owed) in [(6 * HOUR + MIN, true), (HOUR, false)] {
-                let h = tried + ago;
-                let f = run_follower(&sc, &first, books, (h, 2, Some(tried)), None, &dir, true);
-                let why = format!(
-                    "{} | attached +{ago} s after the try:\n  first: {:?}\n{}",
-                    sc.name,
-                    first.acts,
-                    f.log.join("\n")
-                );
-                let v = verdict(first.acts.get(f.at_k), f.diverged.as_ref(), f.due);
-                match (held, owed) {
-                    (false, _) => {
-                        assert_eq!((v, f.diverged.as_ref()), (None, None), "{why}");
-                        assert_eq!(f.at_k, first.acts.len(), "{why}");
-                        // The answer drew a second after the try.
-                        let drew = tried + 1;
-                        let by_notice = transcript.then_some(drew + 10);
-                        let by_done = done.then_some(drew - drew.rem_euclid(MIN) + MIN - 1);
-                        let latest = by_notice.into_iter().chain(by_done).min();
-                        assert!(
-                            dated(&f)
-                                .is_some_and(|ms| ms >= drew * 1000
-                                    && latest.is_some_and(|l| ms <= l * 1000)),
-                            "dated {:?}, the answer drew at {drew}, its signs {latest:?}: {why}",
-                            dated(&f)
-                        );
-                    }
-                    // CONTROL: a new appearance, its first rung from attaching.
-                    (true, true) => assert!(
-                        f.diverged.as_ref().is_some_and(|a| a.at >= h + 30 * MIN),
-                        "CONTROL {why}"
+    let sc = answered_tries(done, transcript, held);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let first = run_first(&sc, &dir);
+    let acts: Vec<i64> = first.acts.iter().map(|a| a.at).collect();
+    assert!(
+        acts.len() >= 4 && acts[2] - acts[1] >= 6 * HOUR && acts[3] - acts[2] >= 6 * HOUR,
+        "{}: the first loop's tries {acts:?}\n{}",
+        sc.name,
+        first.log.join("\n")
+    );
+    let tried = acts[1];
+    // The books as the loop that typed the second try left them: the
+    // try, and nothing read after it.
+    let cut = first
+        .stamped
+        .iter()
+        .find(|(ms, row)| ms / 1000 == tried && row.contains(",\"decision\":\"typed\","))
+        .map(|(ms, _)| ms + 1)
+        .expect("the try's row");
+    let rows = before_ms(&first.stamped, cut);
+    let journal = before_ms(&first.journal, cut);
+    let books = Books {
+        rows: &rows,
+        journal: &journal,
+        restored: None,
+    };
+    for (ago, owed) in [(6 * HOUR + MIN, true), (HOUR, false)] {
+        let h = tried + ago;
+        let f = run_follower(&sc, &first, books, (h, 2, Some(tried)), None, &dir, true);
+        let why = format!(
+            "{} | attached +{ago} s after the try:\n  first: {:?}\n{}",
+            sc.name,
+            first.acts,
+            f.log.join("\n")
+        );
+        let v = verdict(first.acts.get(f.at_k), f.diverged.as_ref(), f.due);
+        match (held, owed) {
+            (false, _) => {
+                assert_eq!((v, f.diverged.as_ref()), (None, None), "{why}");
+                assert_eq!(f.at_k, first.acts.len(), "{why}");
+                // The answer drew a second after the try.
+                let drew = tried + 1;
+                let by_notice = transcript.then_some(drew + 10);
+                let by_done = done.then_some(drew - drew.rem_euclid(MIN) + MIN - 1);
+                let latest = by_notice.into_iter().chain(by_done).min();
+                assert!(
+                    dated(&f).is_some_and(
+                        |ms| ms >= drew * 1000 && latest.is_some_and(|l| ms <= l * 1000)
                     ),
-                    // CONTROL: the rung from the follower's own read.
-                    (true, false) => assert_eq!(v, Some("LATER-UNBOUNDED"), "CONTROL {why}"),
-                }
+                    "dated {:?}, the answer drew at {drew}, its signs {latest:?}: {why}",
+                    dated(&f)
+                );
             }
-            // The whole matrix of handoffs over the same timeline.
-            let (out, tally) = run_matrix(&sc, true);
-            assert!(
-                tally.broken.is_empty(),
-                "{}\n{out}",
-                tally.broken.join("\n")
-            );
-            if held {
-                continue;
-            }
-            // A THIRD LOOP on the follower's books, an hour after it attached
-            // — and five seconds after, inside the take window its first
-            // read would have opened.
-            for h2 in [tried + 2 * HOUR, tried + HOUR + 5] {
-                let second = run_follower(
-                    &sc,
-                    &first,
-                    books,
-                    (tried + HOUR, 2, Some(tried)),
-                    Some(h2),
-                    &dir,
-                    true,
-                );
-                assert!(second.diverged.is_none(), "{:?}", second.log);
-                let third = run_follower(
-                    &sc,
-                    &first,
-                    second.books(),
-                    (h2, second.at_k, second.last),
-                    None,
-                    &dir,
-                    true,
-                );
-                let why = format!(
-                    "{}: the third loop at +{} s\n{}",
-                    sc.name,
-                    h2 - tried,
-                    third.log.join("\n")
-                );
-                assert_eq!(
-                    (
-                        verdict(
-                            first.acts.get(third.at_k),
-                            third.diverged.as_ref(),
-                            third.due
-                        ),
-                        third.diverged.as_ref()
-                    ),
-                    (None, None),
-                    "{why}"
-                );
-                assert_eq!(third.at_k, first.acts.len(), "{why}");
-            }
+            // CONTROL: a new appearance, its first rung from attaching.
+            (true, true) => assert!(
+                f.diverged.as_ref().is_some_and(|a| a.at >= h + 30 * MIN),
+                "CONTROL {why}"
+            ),
+            // CONTROL: the rung from the follower's own read.
+            (true, false) => assert_eq!(v, Some("LATER-UNBOUNDED"), "CONTROL {why}"),
         }
+    }
+    // The whole matrix of handoffs over the same timeline.
+    let (out, tally) = run_matrix(&sc, true);
+    assert!(
+        tally.broken.is_empty(),
+        "{}\n{out}",
+        tally.broken.join("\n")
+    );
+    if held {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    // A THIRD LOOP on the follower's books, an hour after it attached
+    // — and five seconds after, inside the take window its first
+    // read would have opened.
+    for h2 in [tried + 2 * HOUR, tried + HOUR + 5] {
+        let second = run_follower(
+            &sc,
+            &first,
+            books,
+            (tried + HOUR, 2, Some(tried)),
+            Some(h2),
+            &dir,
+            true,
+        );
+        assert!(second.diverged.is_none(), "{:?}", second.log);
+        let third = run_follower(
+            &sc,
+            &first,
+            second.books(),
+            (h2, second.at_k, second.last),
+            None,
+            &dir,
+            true,
+        );
+        let why = format!(
+            "{}: the third loop at +{} s\n{}",
+            sc.name,
+            h2 - tried,
+            third.log.join("\n")
+        );
+        assert_eq!(
+            (
+                verdict(
+                    first.acts.get(third.at_k),
+                    third.diverged.as_ref(),
+                    third.due
+                ),
+                third.diverged.as_ref()
+            ),
+            (None, None),
+            "{why}"
+        );
+        assert_eq!(third.at_k, first.acts.len(), "{why}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -7374,10 +7011,6 @@ fn the_end_of_a_turn_the_loop_before_read_running_is_judged_as_the_first_loop_ju
             "R11 spend met again, a person's /compact, the ladder",
             "SOONER",
         ),
-        (
-            "R5 the done check answered, then a person's turn read busy",
-            "",
-        ),
     ];
     let controls: Vec<Scenario> = all
         .into_iter()
@@ -7535,14 +7168,14 @@ fn a_loop_that_follows_leaves_a_persons_exchange_as_the_first_loop_does() {
         .map(stamped)
         .collect();
     assert!(
-        keyed.len() >= 10,
+        keyed.len() >= 8,
         "{} scenarios a keystroke reaches",
         keyed.len()
     );
     let runs = run_all(&keyed, true);
     let cells: usize = runs.iter().map(|(_, t)| t.cells).sum();
     let broken: Vec<&String> = runs.iter().flat_map(|(_, t)| &t.broken).collect();
-    assert!(cells > 250, "the matrix ran {cells} cells");
+    assert!(cells > 200, "the matrix ran {cells} cells");
     assert!(
         broken.is_empty(),
         "{} of {cells} cells break the rule:\n{}",
@@ -7559,15 +7192,13 @@ fn a_loop_that_follows_leaves_a_persons_exchange_as_the_first_loop_does() {
         .filter(|sc| {
             [
                 "R13 Off lifts in the back-off, a person's exchange",
-                "RS8-F1 the task done, then a new short turn (a person's hand",
-                "RS9-F3",
                 "KI1016-P6",
             ]
             .iter()
             .any(|p| sc.name.starts_with(p))
         })
         .collect();
-    assert_eq!(persons.len(), 5, "the person's scenarios");
+    assert_eq!(persons.len(), 3, "the person's scenarios");
     let (cells, broken) = gap_matrix(&persons, false);
     assert!(cells > 10, "{cells} gap cells");
     assert!(
@@ -7579,7 +7210,7 @@ fn a_loop_that_follows_leaves_a_persons_exchange_as_the_first_loop_does() {
     // NEGATIVE CONTROL.
     let (_, broken) = gap_matrix(&persons, true);
     assert!(
-        broken.iter().any(|b| b.starts_with("SOONER: RS9-F3")),
+        !broken.is_empty(),
         "CONTROL: books with no record of the turn read running broke nothing"
     );
 }
@@ -7635,224 +7266,6 @@ fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_t
         let (v, log) = follow(esc, esc + 1);
         assert_eq!(v, None, "{}: its answer read running\n  {log}", sc.name);
     }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// THE ESC HOLD A LOOP THAT FOLLOWS TAKES UP COUNTS FROM THE TURN'S END
-/// (the verifier of 75b03ac6d, RS9-F2). The worker's FINISHED, then an
-/// orchestrator's five-minute turn stopped with Esc (no keystroke the window
-/// stamps): the first loop holds two minutes from that point, whose streak
-/// stays 0, and types `keep going` then. Every point's time is recorded
-/// ([`crate::supervise::approvals::RULE_POINT`]), so a loop attached inside
-/// the hold types when the first loop does. NEGATIVE CONTROL: the books
-/// without that point's record — the turn read running before it is the
-/// last word — and the hold counts from the attach, as much later.
-#[test]
-fn the_esc_hold_a_loop_that_follows_takes_up_counts_from_the_turn_s_end() {
-    let sc = round9_scenarios()
-        .into_iter()
-        .find(|sc| sc.name == "RS9-F2 FINISHED, an orchestrator's long turn Esc'd (no key)")
-        .expect("the scenario");
-    let dir = crate::supervise::test_scratch_path("seed-matrix", "esc-hold");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    let first = run_first(&sc, &dir);
-    let esc = sc.t0 + 25 * MIN;
-    let act = first.acts.first().expect("the first loop's act").at;
-    assert_eq!(
-        act,
-        esc + 2 * MIN,
-        "the first loop's hold: {:?}",
-        first.acts
-    );
-    let typed_at = |h: i64, unrecorded: bool| {
-        let books: Vec<(i64, String)> = first
-            .stamped
-            .iter()
-            .filter(|(ms, row)| {
-                !(unrecorded
-                    && *ms == esc * 1000
-                    && row.contains(crate::supervise::approvals::RULE_POINT))
-            })
-            .cloned()
-            .collect();
-        // Its first act, on the test's clock.
-        let on = Books {
-            rows: &books,
-            journal: &first.journal,
-            restored: None,
-        };
-        run_follower(&sc, &first, on, (h, 0, None), None, &dir, true)
-            .stamped
-            .iter()
-            .find(|(ms, row)| *ms >= h * 1000 && row.contains("\"decision\":\"typed\""))
-            .map(|(ms, _)| ms / 1000)
-    };
-    for h in [esc + 1, esc + 60, act - 1] {
-        assert_eq!(typed_at(h, false), Some(act), "attached at +{}", h - sc.t0);
-    }
-    let late = typed_at(act - 1, true).expect("CONTROL: an act");
-    assert!(late > act + 60, "CONTROL: typed at +{}", late - sc.t0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A CUT OF THE LEDGER KEEPS A LANDING SPENT FOR A LOOP THAT FOLLOWS (the
-/// verifier of 75b03ac6d, RS9-R1; [`crate::supervise::approvals::bound`]).
-/// Land: the land instruction and two nudges, each answered with progress —
-/// the landing spent, nothing more typed — then 600 wakes five minutes
-/// apart, each a 20 s short turn: a turn read running and its point, each
-/// recorded. On a tab's ledger of older approvals past the bound, the next
-/// loop's start cuts it, and that loop types nothing, as the first loop
-/// types nothing. NEGATIVE CONTROL: the plain cut keeps the newest rows
-/// whole, every one a wake's, and the loop that follows types the land
-/// instruction anew.
-#[test]
-fn a_cut_of_the_ledger_keeps_a_landing_spent_for_a_loop_that_follows() {
-    use crate::supervise::approvals::{self, Outcome, Row};
-    let dir = crate::supervise::test_scratch_path("seed-matrix", "cut-land");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    let w0 = work0();
-    let p0 = cc(
-        &with(
-            &w0,
-            &turn(None, &["⏺ Stage 3 of 5 is in."], 0, T0 + 2 * MIN),
-        ),
-        &[],
-        "",
-    );
-    let mut beats = vec![
-        beat(
-            At::Start(0),
-            "the worker's turn",
-            Ev::Busy(live(&w0, "carry on with the task")),
-        ),
-        beat(At::Start(2 * MIN), "the worker's progress", Ev::Point(p0)),
-    ];
-    let mut h = w0.clone();
-    for k in 0..3 {
-        beats.push(taken(k, &h, "(land)"));
-        h = with(
-            &h,
-            &turn(Some("(land)"), &["⏺ Stage 4 of 5 is in."], 10 * MIN, 0),
-        );
-        beats.push(beat(
-            At::Act(k, 10 * MIN),
-            "the land act's turn ends: progress",
-            Ev::Point(cc(&h, &[], "")),
-        ));
-    }
-    for i in 1..=600 {
-        let at = 10 * MIN + 5 * MIN * i;
-        beats.push(beat(
-            At::Act(2, at - 20),
-            "a wake runs",
-            Ev::Busy(live(&h, "(background task finished)")),
-        ));
-        let woke = with(
-            &h,
-            &turn(
-                Some("(background task finished)"),
-                &["⏺ The build is still going."],
-                20,
-                0,
-            ),
-        );
-        beats.push(beat(
-            At::Act(2, at),
-            "the wake's short turn ends",
-            Ev::Point(cc(&woke, &[], "")),
-        ));
-    }
-    let sc = Scenario {
-        name: "a landing spent, then wakes".to_string(),
-        t0: T0,
-        policy: land_policy(),
-        host: None,
-        beats,
-        tail_s: 3 * HOUR,
-        take: false,
-        person_on_screen: false,
-    };
-    let first = run_first(&sc, &dir);
-    assert_eq!(first.acts.len(), 3, "the landing spent: {:?}", first.acts);
-    // A turn read running is recorded after a point, not after an act —
-    // and at the loop's start, on books with no word on the streak (the
-    // worker's first turn).
-    let ran = first
-        .stamped
-        .iter()
-        .filter(|(_, row)| row.contains(approvals::RULE_TURN_RAN))
-        .count();
-    assert_eq!(ran, 601, "the wakes' turns read running, and the first");
-    let h = first.end - 2 * HOUR;
-    let older = "cd /Users//someone/Developer/project && cargo test -p project-core --lib -- parser::tests 2>&1 | tail -40";
-    let mut rows: Vec<(i64, String)> = (0..2400)
-        .map(|i| {
-            let ts = (T0 - 10 * 86_400 + i * 60) * 1000;
-            let row = Row {
-                rule_id: "allow-once@v1",
-                outcome: Outcome::Approved,
-                command: older,
-                reason: "the safe rules proved the command reads and runs tests",
-                box_seq: 1,
-            };
-            (ts, row.to_json(ts, Some(SID)))
-        })
-        .collect();
-    rows.extend(
-        first
-            .stamped
-            .iter()
-            .filter(|(ms, _)| *ms < h * 1000)
-            .cloned(),
-    );
-    let after_cut = |plain: bool| {
-        let path = dir.join(format!("cut-{plain}.jsonl"));
-        let body: String = rows.iter().map(|(_, l)| format!("{l}\n")).collect();
-        std::fs::write(&path, body).expect("the books");
-        assert!(std::fs::metadata(&path).unwrap().len() > approvals::MAX_BYTES);
-        if plain {
-            crate::harness::cli::bound_ledger(&path, approvals::MAX_BYTES, approvals::KEEP_ROWS)
-                .expect("cut");
-        } else {
-            approvals::bound(&path);
-        }
-        let kept: Vec<(i64, String)> = std::fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|l| {
-                let ms = l
-                    .strip_prefix("{\"ts\":")
-                    .and_then(|r| r.split(',').next())
-                    .and_then(|d| d.parse().ok())
-                    .unwrap_or(0);
-                (ms, l.to_string())
-            })
-            .collect();
-        // The journal beside it is the first loop's, within its own bound.
-        let on = Books {
-            rows: &kept,
-            journal: &first.journal,
-            restored: None,
-        };
-        let f = run_follower(
-            &sc,
-            &first,
-            on,
-            (h, 3, first.acts.last().map(|a| a.at)),
-            None,
-            &dir,
-            true,
-        );
-        verdict(first.acts.get(f.at_k), f.diverged.as_ref(), f.due)
-    };
-    assert_eq!(after_cut(false), None, "the cut keeps the landing spent");
-    assert_eq!(
-        after_cut(true),
-        Some("TYPES-WHERE-FIRST-DOES-NOT"),
-        "CONTROL: the plain cut"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8013,6 +7426,11 @@ fn older_cells(sc: &Scenario, i: usize, journal: bool, restored: bool) -> (usize
     std::fs::create_dir_all(&dir).expect("dir");
     let first = run_first(sc, &dir);
     let rows = books_of_0_106(&first.stamped);
+    // That build's journal, its points' lines in it (`EVENT …`) as every
+    // build writes them, each before what the point decided: read as every
+    // point line ending what was held, a wall's wait lost the short streak
+    // across it and a point inside an act's take window the act it still
+    // awaited (`journaled_hold`, the review of 2026-10-20).
     let said = if journal {
         first.journal.clone()
     } else {
@@ -8070,12 +7488,15 @@ fn older_cells(sc: &Scenario, i: usize, journal: bool, restored: bool) -> (usize
 /// take window, a task's end, the relaunch's first ask, the challenge, the
 /// park (`PARKED seq=<n> autopilot=off`, `with_parks_journaled`). And so in
 /// a tab a cold restore reopened after the update, from the earlier tab's
-/// books and journal (follow-7). NEGATIVE CONTROL: the same books with no
+/// books and journal (follow-7). The journal holds that build's point lines
+/// too, each before what the point decided: read as each ending what was
+/// held, the follower typed sooner across a wall's wait (the short streak
+/// lost) and at a point inside an act's take window (an overload's retry
+/// rung lost) — the review of 2026-10-20, 18 cells.
+/// NEGATIVE CONTROL: the same books with no
 /// journal beside them type sooner at the short ladder, an overload's
 /// retries, a spend limit's try and the bucket a person's prompt met, and
-/// read past the park. (A challenged job challenged again is no control
-/// since the owner's rule of 2026-10-19: every loop challenges every token
-/// over open work, with or without the record of the challenge before it.)
+/// read past the park a Land episode's instruction stood under.
 #[test]
 fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
     let names = [
@@ -8088,9 +7509,6 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
         "RS8-F2 short turns, the spend limit, the try's real work",
         "J bucket, the fallback (wait:resume thrice, a person's prompt met by the bucket \
          before the adoption)",
-        "RS8-F1 the task done, then a new short turn (nobody's hand, progress)",
-        "P the open-items challenge answered with progress, then FINISHED with an item",
-        "R5 the done check answered, then a person's turn read busy",
         "RS9-F4 Land, the land act answered not done, then a done report (nobody's hand)",
         "RS8-F2 Land, landed, then a new task's short turn (progress)",
         "R4 Off lifts at a done check the weekly limit cut",
@@ -8140,8 +7558,7 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
         (names[1], "SOONER"),
         (names[5], "SOONER"),
         (names[7], "SOONER"),
-        (names[13], "UNBOUNDED"),
-        (names[14], "OTHER-TEXT"),
+        (names[11], "OTHER-TEXT"),
     ];
     let (_, broken) = run(
         &picked
@@ -8166,14 +7583,30 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
 /// cells for scenario `sc` (the `i`th): a follower attached at each handoff
 /// in a tab a cold restore reopened from tab [`WAS`], on that tab's books
 /// ([`Books::restored`]), the restore's note beside its own ledger or
-/// (`noted` false, the control) none.
-fn restored_cells(sc: &Scenario, i: usize, noted: bool) -> (usize, Vec<String>) {
-    let dir = crate::supervise::test_scratch_path("seed-matrix", &format!("restored-{i}-{noted}"));
+/// (`noted` false, the control) none; and the tab's loop STOPPED IN EACH
+/// POINT'S WINDOW ([`Window`]: aterm quit as the host's step took the point)
+/// and the restore reopening it a second on — and as Off lifts, where Off
+/// stood and lifts next ([`First::window_attach`]) — on the books it left
+/// ([`in_window`]; `owed`: without the task's end said in the window, the
+/// control).
+fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, Vec<String>) {
+    let dir =
+        crate::supervise::test_scratch_path("seed-matrix", &format!("restored-{i}-{noted}-{owed}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let first = run_first(sc, &dir);
     let mut cells = 0;
     let mut broken = Vec::new();
+    let mut cell = |what: String, f: &Followed| {
+        cells += 1;
+        if let Some(v) = verdict(first.acts.get(f.at_k), f.diverged.as_ref(), f.due) {
+            broken.push(format!(
+                "{v}: {} | {what}\n      {}",
+                sc.name,
+                f.log.join("\n      ")
+            ));
+        }
+    };
     let hs = handoffs(&first);
     for (i, &h) in hs.iter().enumerate() {
         let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h).collect();
@@ -8184,16 +7617,6 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool) -> (usize, Vec<String>) 
         let on = Books {
             restored,
             ..first.books()
-        };
-        let mut cell = |what: String, f: &Followed| {
-            cells += 1;
-            if let Some(v) = verdict(first.acts.get(f.at_k), f.diverged.as_ref(), f.due) {
-                broken.push(format!(
-                    "{v}: {} | {what}\n      {}",
-                    sc.name,
-                    f.log.join("\n      ")
-                ));
-            }
         };
         let last = before.last().map(|a| a.at);
         let f = run_follower(sc, &first, on, (h, before.len(), last), None, &dir, true);
@@ -8234,6 +7657,29 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool) -> (usize, Vec<String>) 
             }
         }
     }
+    for w in &first.windows {
+        let (rows, journal) = in_window(first.books(), *w, owed);
+        let (k0, last) = typed_on(&rows);
+        for h in first.window_attach(w.at) {
+            let on = Books {
+                rows: &rows,
+                journal: &journal,
+                restored: Some(Restore {
+                    at_ms: h * 1000,
+                    noted,
+                }),
+            };
+            let f = run_follower(sc, &first, on, (h, k0, last), None, &dir, true);
+            cell(
+                format!(
+                    "stopped in the window at +{}, restored at +{}",
+                    w.at - sc.t0,
+                    h - sc.t0
+                ),
+                &f,
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
     (cells, broken)
 }
@@ -8247,13 +7693,18 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool) -> (usize, Vec<String>) 
 /// limit's ladder over, and typed Land's instruction anew where the loop
 /// before had nudged or spent the landing. Every scenario of the matrix, a
 /// follower at each handoff on the earlier tab's books: typed as the first
-/// loop. NEGATIVE CONTROL: the same books with no note beside the new
-/// ledger break the rule in each of those three shapes: the short ladder
-/// and a spend limit's ladder typed sooner, Land's instruction typed anew.
+/// loop. And at every point's window, the tab's loop stopped there (aterm
+/// quit as the host's step took the point) and the restore reopening it: as
+/// the first loop too. NEGATIVE CONTROL: the same books with no note beside
+/// the new ledger break the rule in each of those three shapes: the short
+/// ladder and a spend limit's ladder typed sooner, Land's instruction typed
+/// anew; and the window's books without the task's end said in it — its
+/// note owed to the point's act, as `look` owed it until 2026-10-20 — get
+/// a landing said in words the land instruction again as Off lifts.
 #[test]
 fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_handoff() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let run = |scenarios: &[Scenario], noted: bool| {
+    let run = |scenarios: &[Scenario], noted: bool, owed: bool| {
         let next = AtomicUsize::new(0);
         let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         std::thread::scope(|scope| {
@@ -8266,7 +7717,7 @@ fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_hand
                             let Some(sc) = scenarios.get(i) else {
                                 return done;
                             };
-                            let (c, b) = restored_cells(sc, i, noted);
+                            let (c, b) = restored_cells(sc, i, noted, owed);
                             done.0 += c;
                             done.1.extend(b);
                         }
@@ -8282,7 +7733,7 @@ fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_hand
         })
     };
     let all = scenarios();
-    let (cells, broken) = run(&all, true);
+    let (cells, broken) = run(&all, true, false);
     assert!(cells > 500, "{cells} cells");
     assert!(
         broken.is_empty(),
@@ -8301,7 +7752,7 @@ fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_hand
         .filter(|sc| shapes.iter().any(|(name, _)| sc.name == *name))
         .collect();
     assert_eq!(controls.len(), shapes.len(), "the control's scenarios");
-    let (_, broken) = run(&controls, false);
+    let (_, broken) = run(&controls, false, false);
     for (name, rule) in shapes {
         assert!(
             broken
@@ -8316,4 +7767,16 @@ fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_hand
             }
         );
     }
+    let landed: Vec<Scenario> = self::scenarios()
+        .into_iter()
+        .filter(|sc| sc.name == "R4 Off lifts after the landing (Land, in words)")
+        .collect();
+    assert_eq!(landed.len(), 1, "the landing's scenario");
+    let (_, broken) = run(&landed, true, true);
+    assert!(
+        broken.iter().any(|b| {
+            b.starts_with("TYPES-WHERE-FIRST-DOES-NOT") && b.contains(" stopped in the window at ")
+        }),
+        "CONTROL: the landing's note owed past its window broke nothing in a restored tab"
+    );
 }

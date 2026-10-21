@@ -1699,6 +1699,15 @@ pub fn native_recovery_interaction_model() -> Model {
 /// active mark, minibuffer typing leaks into the document mutation lane, and the
 /// search clamp is off by one, so the caret lands one past the document end and
 /// a mark set there pins an anchor past it.
+///
+/// Mode 5 is a command's PROMPT (`kill-buffer`'s buffer name, an
+/// `Invocation`'s next argument): its answer is the command's to use once
+/// accepted, and while it is open no keystroke reaches the document, so the
+/// document stays at the revision it had when the prompt opened
+/// (`prompt_base`, `PromptNeverEditsDocument`). `Buggy=2` (PromptEditsDoc) is
+/// a prompt whose typing commits to the document through the authorized lane,
+/// which `MinibufferCannotEditDocument` cannot see and only the prompt law
+/// catches.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_editor_modal_model() -> Model {
@@ -1718,6 +1727,8 @@ pub fn native_editor_modal_model() -> Model {
             // 0 = no exit/accepted, 1 = cancelled; disambiguates Enter from C-g
             // in Tier-1 traces even when both close an otherwise empty modal.
             var last_exit = 0;
+            // The document revision a prompt opened at.
+            var prompt_base = 0;
             action SetMark when (mode == 0) {
                 anchor = caret;
                 mark_origin = caret;
@@ -1765,6 +1776,12 @@ pub fn native_editor_modal_model() -> Model {
                 mark_active = 0;
                 last_exit = 0;
             }
+            action OpenPrompt when (mode == 0) {
+                mode = 5;
+                query = 0;
+                prompt_base = document_edits;
+                last_exit = 0;
+            }
             action MinibufferType when (
                 mode > 0 && query <= Cap - 1 && document_edits <= Cap - 1
             ) {
@@ -1782,8 +1799,15 @@ pub fn native_editor_modal_model() -> Model {
                 };
                 document_edits = if Buggy == 1 {
                     document_edits + 1
+                } else if Buggy == 2 && mode == 5 {
+                    document_edits + 1
                 } else {
                     document_edits
+                };
+                authorized_edits = if Buggy == 2 && mode == 5 {
+                    authorized_edits + 1
+                } else {
+                    authorized_edits
                 };
             }
             action MinibufferBackspace when (mode > 0 && query > 0) {
@@ -1834,13 +1858,28 @@ pub fn native_editor_modal_model() -> Model {
                 mark_active = 0;
                 last_exit = 1;
             }
-            bound ModeBounded: mode <= 4;
+            // The last answer runs the command, which may edit only after
+            // the prompt has closed.
+            action SubmitPrompt when (mode == 5) {
+                mode = 0;
+                query = 0;
+                last_exit = 0;
+            }
+            action AbortPrompt when (mode == 5) {
+                mode = 0;
+                query = 0;
+                mark_active = 0;
+                last_exit = 1;
+            }
+            bound ModeBounded: mode <= 5;
             bound QueryBounded: query <= Cap;
             invariant CaretBounded: caret <= Cap;
             invariant AnchorBounded: anchor <= Cap;
             invariant MarkPinned:
                 if mark_active == 1 { anchor == mark_origin } else { anchor <= Cap };
             invariant MinibufferCannotEditDocument: document_edits == authorized_edits;
+            invariant PromptNeverEditsDocument:
+                if mode == 5 { document_edits == prompt_base } else { prompt_base <= Cap };
             bound DocumentEditsBounded: document_edits <= Cap;
             bound ExitKindBounded: last_exit <= 1;
         }

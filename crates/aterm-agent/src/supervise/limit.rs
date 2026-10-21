@@ -177,6 +177,36 @@ impl ResetClock {
             ResetSpec::In(_) => None,
         }
     }
+
+    /// The reset as a person reads it, as the vendor's notice names it less
+    /// its zone (the zone the notice is drawn in): `on Oct 23 at 9am`, `on
+    /// Oct 23 at 9:30pm`, or `at 9am` for a clock that names no date — what
+    /// a usage limit's notice tells the owner the tab continues after
+    /// ([`super::policy::notice::NoticeText::expect_reset`]).
+    #[must_use]
+    pub fn words(&self) -> String {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let meridian = if self.hour < 12 { "am" } else { "pm" };
+        let hour = match self.hour % 12 {
+            0 => 12,
+            h => h,
+        };
+        let clock = if self.minute == 0 {
+            format!("{hour}{meridian}")
+        } else {
+            format!("{hour}:{:02}{meridian}", self.minute)
+        };
+        let month = self
+            .date
+            .and_then(|(m, _)| usize::try_from(m).ok()?.checked_sub(1))
+            .and_then(|m| MONTHS.get(m));
+        match (self.date, month) {
+            (Some((_, day)), Some(month)) => format!("on {month} {day} at {clock}"),
+            _ => format!("at {clock}"),
+        }
+    }
 }
 
 /// Whether the notice says Claude Code goes on by itself — `continuing
@@ -570,7 +600,9 @@ pub fn unix_now_ms() -> i64 {
 /// on Windows a `date` on `PATH` (Git for Windows, MSYS) is a console image, and
 /// from the window's harness host, which has no console, it would flash one.
 pub fn tz_offset_s() -> i64 {
-    let out = aterm_uds::spawnfd::command("date").arg("+%z").output().ok();
+    let mut cmd = aterm_uds::spawnfd::command("date");
+    cmd.arg("+%z");
+    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(10)).ok();
     let text = out
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -639,11 +671,8 @@ fn date_offset(zone: DateZone<'_>, unix: i64) -> Option<i64> {
     } else {
         date.arg("-d").arg(format!("@{unix}"));
     }
-    let out = date
-        .arg("+%z")
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .output()
+    date.arg("+%z");
+    let out = aterm_uds::deadline::output_within(&mut date, Duration::from_secs(10))
         .ok()
         .filter(|o| o.status.success())?;
     parse_zone(String::from_utf8_lossy(&out.stdout).trim())
@@ -726,6 +755,25 @@ mod tests {
 
     fn at(text: &str) -> i64 {
         reset_at(&parse_reset(text).expect(text), NOW, PDT, zones)
+    }
+
+    /// A RESET READS AS ITS NOTICE SAID IT, less the zone: the date and the
+    /// clock where the notice names both, the clock alone where it names no
+    /// date, midnight and noon on the twelve. NEGATIVE CONTROL: a span names
+    /// no clock, so it has no words to say.
+    #[test]
+    fn a_reset_clock_reads_as_its_notice_said_it() {
+        let words = |text: &str| ResetClock::of(Some(text)).map(|c| c.words());
+        for (text, said) in [
+            ("Oct 23 at 9am (America/Los_Angeles)", "on Oct 23 at 9am"),
+            ("Sep 30 at 12:30pm (UTC)", "on Sep 30 at 12:30pm"),
+            ("Jan 2, 2027 at 12am (UTC)", "on Jan 2 at 12am"),
+            ("10:38am (America/Los_Angeles)", "at 10:38am"),
+            ("23:05", "at 11:05pm"),
+        ] {
+            assert_eq!(words(text).as_deref(), Some(said), "{text}");
+        }
+        assert_eq!(words("in 3h"), None);
     }
 
     /// A reset in the next calendar year names the year (2.1.283's formatter

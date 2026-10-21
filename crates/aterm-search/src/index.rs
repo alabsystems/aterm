@@ -5,6 +5,7 @@
 //! Core trigram search index with bloom filter acceleration.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 use aterm_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use aterm_types::text_shaping::AmbiguousWidth;
@@ -46,35 +47,9 @@ pub const MAX_SEARCH_MATCHES: usize = 100_000;
 /// Eviction low-water mark as a fraction `NUM/DEN` of `max_cached_lines`: once over
 /// capacity, [`SearchIndex::index_line`] drops the cache to `NUM/DEN · max`, keeping
 /// the newest lines (hysteresis, so eviction does not re-trigger every line).
-/// `evict_oldest_lines`, [`final_evicted_prefix`] and its inverse
-/// [`max_cached_for_retained`] read it.
+/// `evict_oldest_lines` and [`max_cached_for_retained`] read it.
 pub(crate) const EVICTION_RETAIN_NUM: usize = 3;
 pub(crate) const EVICTION_RETAIN_DEN: usize = 4;
-
-/// Number of oldest rows absent after indexing `total_lines` distinct ascending line
-/// numbers into an index with `max_cached_lines`.
-///
-/// The budgeted builder skips verifying rows the finished index will evict. That is
-/// required, not just faster: reaching the global match cap in those doomed rows
-/// would omit newer matches the one-shot index still sees. Derived from the same
-/// low-water constants as `SearchIndex::evict_oldest_lines`.
-pub(crate) fn final_evicted_prefix(total_lines: usize, max_cached_lines: usize) -> usize {
-    let max_cached_lines = max_cached_lines.max(1);
-    if total_lines <= max_cached_lines {
-        return 0;
-    }
-
-    let target = max_cached_lines.saturating_mul(EVICTION_RETAIN_NUM) / EVICTION_RETAIN_DEN;
-    // Each eviction occurs immediately after the cache grows to max + 1 and
-    // removes exactly this many distinct ascending rows.  The subtraction is
-    // strictly positive on this branch (including the max=1/target=0 edge).
-    let rows_per_eviction = max_cached_lines.saturating_add(1).saturating_sub(target);
-    let rows_after_first = total_lines.saturating_sub(max_cached_lines.saturating_add(1));
-    let eviction_count = 1usize.saturating_add(rows_after_first / rows_per_eviction);
-    eviction_count
-        .saturating_mul(rows_per_eviction)
-        .min(total_lines)
-}
 
 /// The smallest `max_cached_lines` that keeps the newest `retained` lines safe from
 /// eviction: eviction drops to the 3/4 low-water mark, so this is the smallest `max`
@@ -118,7 +93,11 @@ fn count_case_insensitive_lowered_line() {
 /// Search index using trigrams with bloom filter acceleration: a bloom filter for
 /// negative lookups, trigram posting lists for candidate lines, and a line cache
 /// (with capacity-based eviction) for match verification.
-#[derive(Debug)]
+///
+/// `Clone` copies the whole index: aterm-core clones one only when a refresh finds
+/// it still shared with a query reading it, off the terminal's lock, in place of
+/// re-reading every row.
+#[derive(Clone, Debug)]
 pub struct SearchIndex {
     /// Bloom filter for fast negative lookups.
     bloom: BloomFilter,
@@ -158,6 +137,11 @@ pub struct SearchIndex {
     eviction_occurred: bool,
     /// Guards the one-time `aterm_log` warning emitted on first eviction.
     first_eviction_warned: bool,
+    /// Cached lines whose text stops short of the line's end
+    /// ([`LineCells::is_truncated`]): every batch result counts them in
+    /// [`SearchResults::cut_short_lines`]. Ordered, so a drop of every line below a
+    /// floor drops their entries with one split.
+    truncated_lines: BTreeSet<usize>,
     /// How wide the grid draws an East Asian Ambiguous character in the lines
     /// indexed here (the terminal's `ambiguous_width` policy): every column a
     /// match reports is measured under it.
@@ -423,6 +407,7 @@ impl SearchIndex {
             lowest_retained_line: 0,
             eviction_occurred: false,
             first_eviction_warned: false,
+            truncated_lines: BTreeSet::new(),
             ambiguous_width: AmbiguousWidth::Single,
         }
     }
@@ -476,6 +461,7 @@ impl SearchIndex {
             lowest_retained_line: 0,
             eviction_occurred: false,
             first_eviction_warned: false,
+            truncated_lines: BTreeSet::new(),
             ambiguous_width: AmbiguousWidth::Single,
         }
     }
@@ -542,11 +528,12 @@ impl SearchIndex {
         // a redraw pairs them), so a row read with its cells takes its new
         // map.
         if self.lines.get(&line_num).is_some_and(|old| old == text_ref) {
-            if cells.is_some() {
+            if let Some(cells) = cells {
                 let column_map = column_map();
                 if self.column_maps.get(&line_num) != Some(&column_map) {
                     self.column_maps.insert(line_num, column_map);
                 }
+                self.set_truncated(line_num, cells.is_truncated());
             }
             return;
         }
@@ -602,6 +589,7 @@ impl SearchIndex {
         let column_map = column_map();
         self.lines.insert(line_num, text.into_owned());
         self.column_maps.insert(line_num, column_map);
+        self.set_truncated(line_num, cells.is_some_and(LineCells::is_truncated));
         self.first_cached_line = self.first_cached_line.min(line_num);
         self.line_count = self.line_count.max(line_num.saturating_add(1));
         self.next_line = self.next_line.max(line_num.saturating_add(1));
@@ -624,6 +612,37 @@ impl SearchIndex {
         let line_num = self.next_line;
         self.index_line(line_num, text);
         line_num
+    }
+
+    /// Record whether cached line `line`'s text stops short of the line's end.
+    fn set_truncated(&mut self, line: usize, truncated: bool) {
+        if truncated {
+            self.truncated_lines.insert(line);
+        } else if !self.truncated_lines.is_empty() {
+            self.truncated_lines.remove(&line);
+        }
+    }
+
+    /// Forget the truncated lines below `floor`, every one of which has just left
+    /// the cache.
+    fn drop_truncated_below(&mut self, floor: usize) {
+        if !self.truncated_lines.is_empty() {
+            self.truncated_lines = self.truncated_lines.split_off(&floor);
+        }
+    }
+
+    /// `results` counting every cached line whose text stops short of its end in
+    /// [`SearchResults::cut_short_lines`]: the query did not search it to its end
+    /// either. A line `results` already counts (its regex scan stopped too) is
+    /// left out of that count by the scan, so each line counts once.
+    fn with_truncated_lines(&self, results: SearchResults) -> SearchResults {
+        if self.truncated_lines.is_empty() {
+            return results;
+        }
+        let cut_short = results
+            .cut_short_lines
+            .saturating_add(self.truncated_lines.len());
+        results.with_cut_short_lines(cut_short)
     }
 
     /// The posting key of `line`: its offset from
@@ -762,6 +781,7 @@ impl SearchIndex {
         });
         if self.lines.len() != before {
             self.column_maps.retain(|&line, _| line >= floor);
+            self.drop_truncated_below(floor);
             // Keys are still from the old base here.
             let watermark = self.posting_key(floor);
             self.trigrams.retain(|_, bitmap| {
@@ -928,6 +948,7 @@ impl SearchIndex {
             .unwrap_or(self.next_line);
         self.first_cached_line = self.lowest_retained_line;
         self.eviction_occurred = true;
+        self.drop_truncated_below(self.lowest_retained_line);
 
         // Trim every posting list to the watermark in one front-drain and prune the
         // emptied ones: every row below it was evicted, so this drops exactly their
@@ -1124,6 +1145,7 @@ impl SearchIndex {
         self.lowest_retained_line = 0;
         self.eviction_occurred = false;
         self.first_eviction_warned = false;
+        self.truncated_lines.clear();
     }
 
     /// Release the index's backing allocations, not just its contents.
@@ -1147,6 +1169,7 @@ impl SearchIndex {
         self.lowest_retained_line = 0;
         self.eviction_occurred = false;
         self.first_eviction_warned = false;
+        self.truncated_lines = BTreeSet::new();
     }
 
     /// Set the maximum number of cached lines before eviction, clamped to at least 1.
@@ -1168,9 +1191,9 @@ impl SearchIndex {
     /// dropped text is gone, but a bulk builder re-establishes the contents from the
     /// source on every build, so once the history is back under the cap a latched
     /// flag would print `N+` over an exact count. Only a caller that has just indexed
-    /// every retained source row may pass `None`; the GUI bulk builder feeds at most
-    /// the `max_cached_lines` it builds the index with, so internal cap eviction never
-    /// fires under it.
+    /// every retained source row may pass `None`; aterm-core's bulk builder feeds at
+    /// most the `max_cached_lines` it builds the index with, so internal cap eviction
+    /// never fires under it.
     ///
     /// `first_eviction_warned` is not reset: it guards a once-per-index log line, not
     /// result state.
@@ -1213,6 +1236,7 @@ impl SearchIndex {
             self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
+        self.drop_truncated_below(first_retained_line);
         // One posting front-drain to the boundary (see `evict_oldest_lines`): every
         // removed row is below it.
         let watermark = self.posting_key(first_retained_line);
@@ -1258,6 +1282,7 @@ impl SearchIndex {
             self.lines.remove(&line);
             self.column_maps.remove(&line);
         }
+        self.drop_truncated_below(first_retained_line);
         // One posting front-drain; only the eviction bookkeeping differs from
         // `retain_history_from`.
         let watermark = self.posting_key(first_retained_line);
@@ -1425,7 +1450,7 @@ pub(crate) const REGEX_LINE_STEP_CEILING: u64 = 1 << 26;
 /// The scan budget for one line of `len` bytes: `REGEX_STEP_PER_BYTE · len`, at least
 /// [`REGEX_STEP_LIMIT`] and at most [`REGEX_LINE_STEP_CEILING`].
 ///
-/// Find joins each soft-wrap run into one line (`join_wrapped_rows` in aterm-gui), so
+/// Find joins each soft-wrap run into one line (`join_wrapped_rows` in aterm-core), so
 /// a minified bundle or single-line JSON reply makes a multi-megabyte line that a
 /// one-row budget would cut short for every pattern. The floor keeps every row's
 /// budget, the per-byte rate keeps a long line's worst case per byte no worse than a
@@ -1617,7 +1642,10 @@ impl SearchIndex {
     /// [`MAX_SEARCH_MATCHES`] exist, forward search retains the oldest matches
     /// and backward search the newest. A regex line the scan could not finish
     /// within its budget is counted in [`SearchResults::cut_short_lines`],
-    /// which marks the results incomplete; every other line's matches stand.
+    /// which marks the results incomplete; every other line's matches stand. So
+    /// is every cached line whose text stops short of its end
+    /// ([`LineCells::is_truncated`]), in every mode, and a line both apply to
+    /// counts once.
     pub fn search_results_opts_direction(
         &self,
         query: &str,
@@ -1630,16 +1658,19 @@ impl SearchIndex {
         // A full result set means the cap was hit: report it as `incomplete`, as
         // eviction is (over-reporting a query with exactly that many matches).
         let capped = matches.len() >= MAX_SEARCH_MATCHES;
-        Ok(SearchResults::new(
-            matches,
-            self.results_may_be_incomplete() || capped,
-            self.lowest_retained_line(),
-        )
-        .with_cut_short_lines(cut_short))
+        Ok(self.with_truncated_lines(
+            SearchResults::new(
+                matches,
+                self.results_may_be_incomplete() || capped,
+                self.lowest_retained_line(),
+            )
+            .with_cut_short_lines(cut_short),
+        ))
     }
 
     /// Regex search across all cached lines: the matches, and how many lines
-    /// the scan could not finish within their budget ([`scan_line`]).
+    /// the scan could not finish within their budget ([`scan_line`]), a line
+    /// whose text stops short of its end left out (it is counted as such).
     fn search_regex(
         &self,
         query: &str,
@@ -1688,7 +1719,7 @@ impl SearchIndex {
                             break 'lines;
                         }
                     }
-                    if scan.step_limit_exceeded() {
+                    if scan.step_limit_exceeded() && !self.truncated_lines.contains(&line_num) {
                         cut_short = cut_short.saturating_add(1);
                     }
                 }
@@ -1706,7 +1737,7 @@ impl SearchIndex {
                             line_matches.push(SearchMatch::new(line_num, start_col, end_col));
                         }
                     }
-                    if scan.step_limit_exceeded() {
+                    if scan.step_limit_exceeded() && !self.truncated_lines.contains(&line_num) {
                         cut_short = cut_short.saturating_add(1);
                     }
                     for found in line_matches.into_iter().rev() {
@@ -1875,11 +1906,11 @@ impl SearchIndex {
         if query.is_empty() {
             // Batch parity: no matches, and the index's own eviction signal.
             return NarrowedSearch {
-                results: SearchResults::new(
+                results: self.with_truncated_lines(SearchResults::new(
                     Vec::new(),
                     self.results_may_be_incomplete(),
                     self.lowest_retained_line(),
-                ),
+                )),
                 occurrence_lines: None,
             };
         }
@@ -1991,11 +2022,11 @@ impl SearchIndex {
         // Cap detection as in `search_results_opts_direction`.
         let capped = capped || matches.len() >= MAX_SEARCH_MATCHES;
         NarrowedSearch {
-            results: SearchResults::new(
+            results: self.with_truncated_lines(SearchResults::new(
                 matches,
                 self.results_may_be_incomplete() || capped,
                 self.lowest_retained_line(),
-            ),
+            )),
             occurrence_lines: (!capped).then_some(occurrence_lines),
         }
     }
@@ -2370,6 +2401,83 @@ mod regex_scan_budget_tests {
             Err(SearchOptionsError::ScanCutShort),
             "no match found, but the wide line's rest is unread: not \"no match\""
         );
+    }
+
+    /// A line whose text stops short of its end (its reader stopped at a byte bound) is
+    /// counted cut short by every batch query, literal or regex, narrowed or not, and
+    /// once when its regex scan stops too. It stops counting when it is indexed again
+    /// read whole, and when it leaves the index.
+    #[test]
+    fn a_line_read_short_of_its_end_is_counted_cut_short() {
+        let wide = "x".repeat(4096);
+        let mut cut = LineCells::identity(wide.len());
+        cut.mark_truncated();
+        let queries = [
+            ("ordinary", true, false),
+            ("ORDINARY", false, false),
+            ("ordin[a-z]+", true, true),
+            (EXPENSIVE, true, true),
+        ];
+        let mut index = index_with_a_wide_line();
+        // NEGATIVE CONTROL: read whole, the wide line counts only where the scan
+        // cannot finish it.
+        let whole: Vec<usize> = queries
+            .iter()
+            .map(|&(q, cs, rx)| {
+                index
+                    .search_results_opts(q, cs, rx)
+                    .unwrap()
+                    .cut_short_lines
+            })
+            .collect();
+        assert_eq!(whole, [0, 0, 0, 1]);
+
+        index.index_line_cow(1, Cow::Borrowed(&wide), Some(&cut));
+        for &(query, case_sensitive, is_regex) in &queries {
+            let got = index
+                .search_results_opts(query, case_sensitive, is_regex)
+                .expect("searched");
+            assert_eq!(got.cut_short_lines, 1, "{query:?}: {got:?}");
+            assert!(got.incomplete, "{query:?}");
+        }
+        for case_sensitive in [true, false] {
+            assert_eq!(
+                index
+                    .search_literal_narrowed("ordinary", case_sensitive, None)
+                    .results,
+                index
+                    .search_results_opts("ordinary", case_sensitive, false)
+                    .unwrap(),
+                "narrowed equals batch"
+            );
+        }
+
+        // The same text read whole: no longer cut short.
+        index.index_line_cow(
+            1,
+            Cow::Borrowed(&wide),
+            Some(&LineCells::identity(wide.len())),
+        );
+        let got = index.search_results_opts("ordinary", true, false).unwrap();
+        assert_eq!((got.cut_short_lines, got.incomplete), (0, false));
+
+        // Gone from the index, by a history drop or by eviction.
+        index.index_line_cow(1, Cow::Borrowed(&wide), Some(&cut));
+        index.drop_history_below(2);
+        let got = index.search_results_opts("ordinary", true, false).unwrap();
+        assert_eq!((got.cut_short_lines, got.incomplete), (0, false));
+        let mut evicting = SearchIndex::with_max_cached_lines(4);
+        let mut cut_ordinary = LineCells::identity("ordinary".len());
+        cut_ordinary.mark_truncated();
+        evicting.index_line_cow(0, Cow::Borrowed("ordinary"), Some(&cut_ordinary));
+        for line in 1..=4 {
+            evicting.index_line(line, "ordinary");
+        }
+        assert!(evicting.lowest_retained_line() > 0, "line 0 was evicted");
+        let got = evicting
+            .search_results_opts("ordinary", true, false)
+            .unwrap();
+        assert_eq!(got.cut_short_lines, 0, "{got:?}");
     }
 
     /// The per-line budget: a row up to full width keeps `REGEX_STEP_LIMIT`, a longer

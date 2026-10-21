@@ -55,13 +55,13 @@ pub use models_program_resolution::program_resolution_retry_model;
 pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
 pub use models_supervise::{
     supervisor_box_ask_model, supervisor_break_offer_model, supervisor_claim_model,
-    supervisor_credits_hold_liveness, supervisor_credits_hold_model, supervisor_decline_keys_model,
-    supervisor_done_check_model, supervisor_focus_choice_model, supervisor_host_turn_end_model,
-    supervisor_model_switch_liveness, supervisor_model_switch_model, supervisor_network_wall_model,
-    supervisor_question_answer_model, supervisor_question_text_model,
-    supervisor_stall_remedy_model, supervisor_survey_press_model, supervisor_turn_end_model,
-    supervisor_usage_wall_liveness, supervisor_usage_wall_model, upgrade_attended_turn_end_model,
-    upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
+    supervisor_credits_hold_liveness, supervisor_credits_hold_model, supervisor_cruise_model,
+    supervisor_decline_keys_model, supervisor_focus_choice_model, supervisor_host_turn_end_model,
+    supervisor_land_liveness, supervisor_land_model, supervisor_model_switch_liveness,
+    supervisor_model_switch_model, supervisor_network_wall_model, supervisor_question_answer_model,
+    supervisor_question_text_model, supervisor_stall_remedy_model, supervisor_survey_press_model,
+    supervisor_turn_end_model, supervisor_usage_wall_liveness, supervisor_usage_wall_model,
+    upgrade_attended_turn_end_model, upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
 };
 pub use models_supervise_accounts::{
     supervisor_account_rotation_liveness, supervisor_account_rotation_model,

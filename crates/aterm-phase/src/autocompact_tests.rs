@@ -62,10 +62,10 @@ fn the_keep_first_offer_is_read_whole_with_the_focus_on_keep() {
     );
     let o = p.autocompact_offer().expect("read whole");
     assert_eq!(
-        (o.keep, o.accept, o.size, o.focused, o.compacts_next),
-        (0, 1, 400, OfferFocus::Keep, false)
+        (o.keep, o.accept, o.tokens, o.focused),
+        (0, 1, 400_000, OfferFocus::Keep)
     );
-    assert_eq!(o.current, "auto (1m tokens)");
+    assert_eq!(p.options[o.keep].label, "Keep auto (1m tokens)");
     assert_eq!(p.options[o.accept].label, "Autocompact at ‹ 400k › tokens");
     assert_eq!(
         rows[p.options[o.keep].row].trim(),
@@ -88,10 +88,17 @@ fn the_keep_first_offer_is_read_whole_with_the_focus_on_keep() {
 #[test]
 fn the_lower_first_offer_reads_its_focus_and_its_description() {
     let rows = screen(AUTOCOMPACT_LOWER_FIRST);
-    let o = offer(&rows).expect("the offer");
+    let p = parse_prompt_v2(&rows).expect("the box");
+    let o = p.autocompact_offer().expect("the offer");
     assert_eq!(
-        (o.accept, o.keep, o.size, o.focused, o.compacts_next),
-        (0, 1, 400, OfferFocus::Accept, true)
+        (o.accept, o.keep, o.tokens, o.focused),
+        (0, 1, 400_000, OfferFocus::Accept)
+    );
+    // The accept row's description, read as the box's second paragraph.
+    let (_, described) = p.description.split_once('\n').expect("a description");
+    assert!(
+        described.starts_with("This conversation is at "),
+        "{described}"
     );
 }
 
@@ -99,14 +106,14 @@ fn the_lower_first_offer_reads_its_focus_and_its_description() {
 fn a_narrow_offer_with_the_stepper_moved_reads_its_size() {
     let rows = screen(AUTOCOMPACT_80COL_500K);
     let o = offer(&rows).expect("the offer");
-    assert_eq!((o.size, o.focused), (500, OfferFocus::Accept));
+    assert_eq!((o.tokens, o.focused), (500_000, OfferFocus::Accept));
 }
 
 #[test]
 fn the_fullscreen_panel_and_the_more_text_warning_are_read() {
     let rows = screen(AUTOCOMPACT_FULLSCREEN);
     let o = offer(&rows).expect("the offer");
-    assert_eq!((o.size, o.focused), (400, OfferFocus::Keep));
+    assert_eq!((o.tokens, o.focused), (400_000, OfferFocus::Keep));
 }
 
 /// The reader names the box: authoritative prompt, so the supervisor's
@@ -165,7 +172,7 @@ fn every_condition_is_needed() {
             ),
         ),
         (
-            "a size off the ladder",
+            "a size in words the vendor never draws",
             edit(&rows, accept, "Autocompact at ‹ 1000k › tokens"),
         ),
         (
@@ -257,21 +264,85 @@ fn a_position_label_and_an_inline_description_are_read() {
         "Autocompact at ‹ 400k › tokens  This conversation is at 401k, so it will be summarized \
          on your next message.",
     );
-    let o = offer(&inline).expect("inline description");
-    assert!(o.compacts_next);
+    let p = parse_prompt_v2(&inline).expect("inline description");
+    assert!(p.autocompact_offer().is_some());
+    assert!(
+        p.description
+            .split_once('\n')
+            .is_some_and(|(_, d)| d.starts_with("This conversation is at 401k")),
+        "{}",
+        p.description
+    );
 }
 
+/// THE SIZE IS READ IN THE VENDOR'S WORDS, ANY SIZE IT CAN DRAW (a served
+/// list holds sizes off [`LADDER`]): `250k`, `350.5k`, `1m` beside the
+/// ladder's own, each drawn back the same by [`size_words`]. CONTROLS: a
+/// leading zero, a `.0` the vendor drops, two decimals, four digits, no
+/// unit, the screen-reader label, a trailing stop.
 #[test]
-fn accept_size_reads_the_ladder_only() {
-    assert_eq!(accept_size("Autocompact at ‹ 300k › tokens"), Some(300));
-    assert_eq!(accept_size("Autocompact at ‹ 900k › tokens"), Some(900));
+fn accept_size_reads_every_size_the_vendor_draws() {
+    for (words, tokens) in [
+        ("300k", 300_000),
+        ("900k", 900_000),
+        ("250k", 250_000),
+        ("350k", 350_000),
+        ("350.5k", 350_500),
+        ("1m", 1_000_000),
+    ] {
+        let label = format!("Autocompact at ‹ {words} › tokens");
+        assert_eq!(accept_size(&label), Some(tokens), "{label}");
+        assert_eq!(size_words(tokens), words);
+    }
     for bad in [
-        "Autocompact at ‹ 250k › tokens",
         "Autocompact at ‹ 0400k › tokens",
+        "Autocompact at ‹ 400.0k › tokens",
+        "Autocompact at ‹ 350.25k › tokens",
+        "Autocompact at ‹ 1000k › tokens",
+        "Autocompact at ‹ 1.5m › tokens",
+        "Autocompact at ‹ k › tokens",
         "Autocompact at ‹ 400 › tokens",
         "Autocompact at 400k tokens",
         "Autocompact at ‹ 400k › tokens.",
     ] {
         assert_eq!(accept_size(bad), None, "{bad}");
+    }
+}
+
+/// A SERVED SIZE OFF THE LADDER (350k, 450k, 250k: the 80-column screen
+/// with its stepper at 500k redrawn at each) is read whole, an
+/// authoritative prompt with its size — the dialog a ladder-only reader
+/// left unread, its walk stalled. CONTROL: the body asking another size than
+/// the accept row's is still no offer.
+#[test]
+fn a_served_size_off_the_ladder_is_read() {
+    let rows = screen(AUTOCOMPACT_80COL_500K);
+    assert_eq!(offer(&rows).map(|o| o.tokens), Some(500_000));
+    for (words, tokens) in [("350k", 350_000), ("450k", 450_000), ("250k", 250_000)] {
+        let at: Vec<String> = rows.iter().map(|r| r.replace("500k", words)).collect();
+        assert_ne!(at, rows, "{words}");
+        let r = crate::reader::read(None, &at, None);
+        assert_eq!(
+            (r.phase, r.phase_authoritative),
+            (Phase::Prompt, true),
+            "{words}"
+        );
+        let o = r.prompt.and_then(|p| p.autocompact_offer()).expect(words);
+        assert_eq!(
+            (o.tokens, o.focused),
+            (tokens, OfferFocus::Accept),
+            "{words}"
+        );
+        let asked_other: Vec<String> = at
+            .iter()
+            .map(|r| {
+                if r.contains("Want to autocompact at") {
+                    r.replace(words, "400k")
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        assert!(!is_offer(&asked_other), "{words}: the body asks 400k");
     }
 }

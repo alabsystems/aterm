@@ -67,7 +67,7 @@ pub(super) fn flags(fd: RawFd) -> i32 {
 /// A child reading fd 3 and echoing it to fd 4, with what it finds at `probe`.
 fn echo_command(probe: Option<RawFd>) -> LaneCommand {
     let check = probe.map_or(String::new(), |fd| {
-        format!("[ -e /dev/fd/{fd} ] && s=held || s=clear; ")
+        format!("{} && s=held || s=clear; ", test_support::sh_held(fd))
     });
     let mut cmd = LaneCommand::new("/bin/sh");
     cmd.arg("-c")
@@ -655,13 +655,13 @@ fn a_helper_spawned_without_lanes_holds_its_stdio_and_nothing_else() {
     );
     let (mut out, child_out) = UnixStream::pair().expect("socketpair");
     test_support::bound_read(&out).expect("bound the read");
+    let probe = [3, 4, fd]
+        .map(|f| format!("{} && printf 'held:{f} '; ", test_support::sh_held(f)))
+        .concat();
     let mut cmd = LaneCommand::new("/bin/sh");
-    cmd.args([
-        "-c",
-        &format!("for f in 3 4 {fd}; do [ -e /dev/fd/$f ] && printf 'held:%s ' $f; done; echo end"),
-    ])
-    .stdin(ChildStdio::Null)
-    .stdout(ChildStdio::Fd(child_out.into()));
+    cmd.args(["-c", &(probe + "echo end")])
+        .stdin(ChildStdio::Null)
+        .stdout(ChildStdio::Fd(child_out.into()));
     let mut child = spawn(cmd).expect("spawn sh");
     let mut got = String::new();
     out.read_to_string(&mut got).expect("read stdout");
@@ -694,7 +694,7 @@ fn above_old_cap() -> Option<RawFd> {
 /// [`test_support::leaky_status`]; not `std`'s `Command`, whose child Trust's
 /// std hands nothing above stdio since SP-1).
 fn sh_holds(fd: RawFd, lane: bool) -> bool {
-    let probe = format!("[ -e /dev/fd/{fd} ] && exit 3; exit 0");
+    let probe = test_support::held_probe(fd);
     let status = if lane {
         let (a, b) = lanes();
         let mut cmd = LaneCommand::new("/bin/sh");
@@ -709,7 +709,7 @@ fn sh_holds(fd: RawFd, lane: bool) -> bool {
     held(status)
 }
 
-/// A `/dev/fd` probe's answer: exit 3 is "held", exit 0 is "clear", and
+/// A [`test_support::held_probe`]'s answer: exit 3 is "held", exit 0 is "clear", and
 /// anything else is a probe that never ran, which must not read as either.
 fn held(status: ExitStatus) -> bool {
     match status.code() {
@@ -725,7 +725,7 @@ fn held(status: ExitStatus) -> bool {
 /// child itself since SP-1, which would keep the descriptor out with or
 /// without this strip.
 fn stripped_sh_holds(fd: RawFd) -> bool {
-    let probe = format!("[ -e /dev/fd/{fd} ] && exit 3; exit 0");
+    let probe = test_support::held_probe(fd);
     held(test_support::stripped_status("/bin/sh", &["-c", &probe]).expect("stripped spawn"))
 }
 
@@ -805,22 +805,23 @@ fn race(stop: &std::sync::atomic::AtomicBool, high_soft: u64, high: Option<RawFd
 }
 
 /// The shell probe a raced child runs: bit 1 for a racer descriptor in the low
-/// range, bit 2 at `high` (above the old cap, when staged), bit 4 for a
-/// missing lane.
+/// range, bit 2 at `high` (above the old cap, when staged), bit 4 for a missing
+/// lane, each read from the child's own table ([`test_support::sh_held_any`]). Not
+/// by `[ -e /dev/fd/N ]`, a path lookup that answered "absent" for a held lane
+/// whenever another process looked up `/dev/fd/3` or `/dev/fd/4` at that instant
+/// (`lost-lane=1` in 1 of 500 spawns, at load 75).
 fn race_probe(high: Option<RawFd>) -> String {
     let above = high.map_or(String::new(), |hi| {
         format!(
-            "for f in {hi} {hi1}; do [ -e /dev/fd/$f ] && c=$((c|2)); done; ",
-            hi1 = hi + 1
+            "{} && c=$((c|2)); ",
+            test_support::sh_held_any(&[hi, hi + 1])
         )
     });
     format!(
-        "c=0; for f in {lo} {lo1} {lo2} {lo3}; do [ -e /dev/fd/$f ] && c=$((c|1)); done; \
-         {above}[ -e /dev/fd/3 ] && [ -e /dev/fd/4 ] || c=$((c|4)); exit $c",
-        lo = RACE_LOW,
-        lo1 = RACE_LOW + 1,
-        lo2 = RACE_LOW + 2,
-        lo3 = RACE_LOW + 3,
+        "c=0; {} && c=$((c|1)); {above}{} && {} || c=$((c|4)); exit $c",
+        test_support::sh_held_any(&[RACE_LOW, RACE_LOW + 1, RACE_LOW + 2, RACE_LOW + 3]),
+        test_support::sh_held(BRIDGE_VERB_FD),
+        test_support::sh_held(BRIDGE_PUSH_FD),
     )
 }
 
@@ -1133,6 +1134,205 @@ fn adoption_takes_an_exclusively_owned_inherited_socket() {
     let mut byte = [0u8; 1];
     far.read_exact(&mut byte).expect("the far end reads it");
     assert_eq!(&byte, b"x");
+}
+
+/// The number [`an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere`]
+/// adopts at, round after round: one no other test holds or looks up.
+#[cfg(target_vendor = "apple")]
+const CONTENDED: RawFd = 1500;
+
+/// **AN OPEN SOCKET IS ADOPTED WHILE ANOTHER THREAD LOOKS ITS NUMBER UP.** The bridge's
+/// adoption of its lanes once read them by `/dev/fd` path, which on Darwin answers `EBADF`
+/// for an open descriptor when another lookup of the same number lands mid-call
+/// ([`descriptor_metadata`]): `aterm link serve` refused the lane it was handed whenever
+/// anything else looked up `/dev/fd/3` at that instant. Each round makes an inheritable
+/// socket at one number and adopts it while another thread looks that number up
+/// ([`test_support::racing_lookups`], whose path `stat`s failing are the negative control);
+/// every adoption must take its socket. On the path-reading adoption, 50 of 50 runs here
+/// were refused (`descriptor 1500 is not open (Bad file descriptor)`).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere() {
+    const F_DUPFD: i32 = 0;
+    let mut refused = Vec::new();
+    let rounds = test_support::racing_lookups(CONTENDED, 20, |looker| {
+        let (near, _far) = UnixStream::pair().expect("socketpair");
+        // SAFETY: `F_DUPFD` returns a fresh, inheritable descriptor or -1.
+        let fd = unsafe { fcntl(near.as_raw_fd(), F_DUPFD, CONTENDED) };
+        assert_eq!(
+            fd, CONTENDED,
+            "fd {CONTENDED} is held elsewhere in this process"
+        );
+        drop(near);
+        looker.probe();
+        // SAFETY: `fd` was just made here and has no other owner; nothing else
+        // in this process names it.
+        match unsafe { adopt_inherited_socket(fd) } {
+            Ok(adopted) => drop(adopted),
+            Err(e) => {
+                refused.push(e.to_string());
+                // SAFETY: a refusal leaves `fd` open and still ours alone.
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    });
+    assert!(
+        refused.is_empty(),
+        "{} of {rounds} adoptions refused an open socket: {:?}",
+        refused.len(),
+        refused.first()
+    );
+}
+
+/// The numbers [`the_shell_probe_reads_a_contended_number_exactly`] holds in its staged
+/// child: one the probe duplicates (below 10) and one it finds in the `/dev/fd` listing.
+/// No other test looks them up there.
+#[cfg(target_vendor = "apple")]
+const SHELL_PROBED: [RawFd; 2] = [7, 1700];
+
+/// **THE SHELL PROBE READS A CONTENDED NUMBER EXACTLY.** [`crate::host::sh_held_any`] is
+/// every crate's shell read of what a child holds. A path lookup in its place
+/// (`[ -e /dev/fd/N ]`) reads a held descriptor as absent while another process or thread
+/// looks the number up ([`descriptor_metadata`] has Darwin's reasons), which failed tests
+/// that expected a descriptor held and passed tests whose descriptor had leaked. Staged, so
+/// the numbers are this test's alone: each round a shell holding [`SHELL_PROBED`]'s number,
+/// and not the one above it, reads both 50 times, while another thread looks the held
+/// number up ([`test_support::racing_lookups`], whose path `stat`s failing are the
+/// negative control); every read must be right. Measured 2026-10-20 with
+/// `[ -e /dev/fd/N ]` as the probe: 20 of 20 runs failed at fd 7, most of their shells
+/// misreading it, and 20 of 20 at fd 1700 with that probe for the listed numbers alone;
+/// with this probe, 0 of 20.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_shell_probe_reads_a_contended_number_exactly() {
+    const NAME: &str = "spawnfd::tests::the_shell_probe_reads_a_contended_number_exactly";
+    if std::env::var(STAGE_ENV).is_ok() {
+        staged_shell_probe();
+        return;
+    }
+    run_staged(NAME, "shell-probe");
+}
+
+/// The staged half of [`the_shell_probe_reads_a_contended_number_exactly`].
+#[cfg(target_vendor = "apple")]
+fn staged_shell_probe() {
+    unsafe extern "C" {
+        fn dup2(old: RawFd, new: RawFd) -> RawFd;
+    }
+    const PER_ROUND: usize = 50;
+    for held in SHELL_PROBED {
+        let absent = held + 1;
+        require_soft_limit(u64::try_from(absent).unwrap() + 1, absent);
+        assert_eq!(flags(absent), -1, "fd {absent} is open in the staged child");
+        let (near, _far) = UnixStream::pair().expect("socketpair");
+        // SAFETY: `dup2` onto a number this staged child does not hold (its table is
+        // stdio alone) makes a fresh, inheritable descriptor there.
+        assert_eq!(
+            unsafe { dup2(near.as_raw_fd(), held) },
+            held,
+            "dup2 to {held}"
+        );
+        // SAFETY: just made here; nothing else owns it.
+        let _held = unsafe { OwnedFd::from_raw_fd(held) };
+        let script = format!(
+            "m=0; i=0; while [ $i -lt {PER_ROUND} ]; do {} || m=$((m+1)); {} && m=$((m+1)); \
+             i=$((i+1)); done; exit $m",
+            crate::host::sh_held(held),
+            crate::host::sh_held(absent),
+        );
+        let mut misread = Vec::new();
+        let rounds = test_support::racing_lookups(held, 20, |looker| {
+            for _ in 0..PER_ROUND {
+                looker.probe();
+            }
+            let status =
+                test_support::leaky_status("/bin/sh", &["-c", &script]).expect("run the probe");
+            if status.code() != Some(0) {
+                misread.push(status.code());
+            }
+        });
+        assert!(
+            misread.is_empty(),
+            "fd {held}: {} of {rounds} shells misread (exit: how many of their \
+             2 × {PER_ROUND} reads were wrong): {misread:?}",
+            misread.len()
+        );
+    }
+}
+
+// Darwin's descriptor guards (`<sys/guarded.h>`; libSystem exports the call).
+#[cfg(target_vendor = "apple")]
+unsafe extern "C" {
+    fn change_fdguard_np(
+        fd: RawFd,
+        guard: *const u64,
+        guardflags: u32,
+        nguard: *const u64,
+        nguardflags: u32,
+        fdflagsp: *mut i32,
+    ) -> i32;
+}
+
+/// **A DESCRIPTOR GUARDED AGAINST COPIES IS READ, NEVER COPIED.** Darwin kills a process
+/// that duplicates a descriptor guarded with `GUARD_DUP` (`EXC_GUARD`: SIGKILL, measured),
+/// and a guard is always the process's own (guarding forces close-on-exec), set by
+/// whatever opened it, a system library among them. [`descriptor_metadata`] once read
+/// through a copy, so the lifeline sweep, which reads every number the process holds, and
+/// the bridge's lane adoption killed a process holding one. Staged, so a kill is the
+/// stage's failure: with a socket guarded against copies and closing held, the adoption
+/// refuses it untouched (close-on-exec) and the sweep closes exactly the lifeline's copy.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_descriptor_guarded_against_copies_is_read_never_copied() {
+    const NAME: &str = "spawnfd::tests::a_descriptor_guarded_against_copies_is_read_never_copied";
+    if std::env::var(STAGE_ENV).is_ok() {
+        staged_guarded();
+        return;
+    }
+    let out = run_staged(NAME, "guarded");
+    assert!(out.contains("STAGED guarded ok"), "{out}");
+}
+
+#[cfg(target_vendor = "apple")]
+fn staged_guarded() {
+    const GUARD_CLOSE: u32 = 1 << 0;
+    const GUARD_DUP: u32 = 1 << 1;
+    const GUARD_ID: u64 = 0x5350_4157_4e46_4401;
+    let (near, _far) = UnixStream::pair().expect("socketpair");
+    let guarded = std::os::fd::IntoRawFd::into_raw_fd(near);
+    let mut fdflags = 0;
+    // SAFETY: guards a descriptor this stage made and alone names (its owner given up
+    // above, so nothing closes it); every pointer is a live local.
+    let rc = unsafe {
+        change_fdguard_np(
+            guarded,
+            std::ptr::null(),
+            0,
+            &GUARD_ID,
+            GUARD_CLOSE | GUARD_DUP,
+            &mut fdflags,
+        )
+    };
+    assert_eq!(rc, 0, "guard fd {guarded}: {}", io::Error::last_os_error());
+    // SAFETY: nothing else in this process names `guarded`, and a refusal leaves it as
+    // it is (taking it would close it: `GUARD_CLOSE` would end this stage).
+    let refused = unsafe { adopt_inherited_socket(guarded) }
+        .expect_err("a guarded socket is close-on-exec, never an inherited lane");
+    assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{refused}");
+
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-uds-guarded.")
+        .tempdir()
+        .expect("scratch");
+    let (lifeline, far) = crate::lifeline::Lifeline::open(scratch.path()).expect("a lifeline");
+    // Its held end is a copy of the same node too: not this stage's.
+    drop(lifeline);
+    let far = OwnedFd::from(far);
+    let copy = std::os::fd::IntoRawFd::into_raw_fd(far.try_clone().expect("copy"));
+    let closed = crate::lifeline::close_inherited_copies(&far).expect("sweep");
+    assert_eq!(closed, [copy], "the sweep closes the lifeline's copy alone");
+    assert_ne!(flags(guarded), -1, "the guarded socket is still held");
+    println!("STAGED guarded ok");
 }
 
 /// THE LANE SPAWN TRIES A PROGRAM STILL OPEN FOR WRITING AGAIN, as [`Command`] does

@@ -156,7 +156,9 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     );
     std::fs::write(&twin, body).unwrap();
     std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let argv = [OsString::from("--probe")];
+    // A known print option establishes the launch shape. An invented leading
+    // --probe has unknown arity and intentionally preserves today's argv.
+    let argv = [OsString::from("-p"), OsString::from("probe")];
     let out = fx.run(&twin, &argv);
     assert_eq!(out.status.code(), Some(7), "{out:?}");
     // The forward execs today's `bin/claude`, whose yolo-by-default block leads
@@ -164,12 +166,12 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     // itself — at once, no wait, no other word — is what this pins.
     assert_eq!(
         text(&out.stdout),
-        "fake: --dangerously-skip-permissions --probe\n"
+        "fake: --dangerously-skip-permissions -p probe\n"
     );
     assert_eq!(
         text(&out.stderr),
         "aterm: yolo (default): running 'claude' '--dangerously-skip-permissions' \
-         '--probe'\n"
+         '-p' 'probe'\n"
     );
 }
 

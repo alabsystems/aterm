@@ -154,10 +154,7 @@ fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
     // An unreadable executable makes `codesign` answer `Permission denied`: a
     // failed read with no requirement text, not an unsigned copy. (Root reads
     // it anyway.)
-    // SAFETY: `geteuid` has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        return;
-    }
+    aterm_uds::host::could_not_run_as_root("an unreadable (mode 0) executable");
     use std::os::unix::fs::PermissionsExt as _;
     let exe = contents.join("MacOS/aterm");
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o000)).expect("lock exe");

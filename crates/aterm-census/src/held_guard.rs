@@ -83,7 +83,7 @@ pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
     let mut files = Vec::new();
     for dir in HELD_GUARD_SCOPE {
         let abs = root.join(dir);
-        if !abs.is_dir() {
+        if !crate::tree::is_dir(&abs) {
             return Err(format!("the scan set lost `{dir}` (no such directory)"));
         }
         crate::collect_rs_files(&abs, &mut files)
@@ -101,7 +101,7 @@ pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
         findings: Vec::new(),
     };
     for file in &files {
-        let text = std::fs::read_to_string(file)
+        let text = crate::tree::read_to_string(file)
             .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
         let rel = file
             .strip_prefix(root)
@@ -1031,5 +1031,30 @@ fn cold_len(term: &Mutex<Terminal>) -> usize {
         let (hits, acquires) = scan_source(MUST_FIRE[14].1);
         assert_eq!(hits, vec![5], "the wrapped chain's `.resize(` line");
         assert_eq!(acquires, 1);
+    }
+
+    /// The walk fails closed: a part of the scan set it cannot read refuses
+    /// the scan, never a clean scan of what it could read, in a scope
+    /// directory (an entry its listing cannot read) and in a split-out
+    /// library (a source directory it may not list). Negative control: the
+    /// same tree read whole is scanned.
+    #[test]
+    fn a_scan_set_it_cannot_read_whole_refuses_the_scan() {
+        let files = [
+            "crates/aterm-gui/src/main.rs",
+            "crates/aterm-gui/src/pane/mod.rs",
+            "crates/aterm-control/src/lib.rs",
+            "crates/aterm-gui-term/src/lib.rs",
+        ]
+        .map(|rel| (rel.to_string(), String::new()));
+        let scan = |fault: fn(&crate::tree::memory::Tree)| {
+            let root =
+                crate::scan_set::test_fixtures::synth_tree("aterm-census-held", "unread", &files);
+            fault(&root);
+            scan_tree(&root).map(|scan| scan.files)
+        };
+        assert_eq!(scan(|_| {}), Ok(4));
+        assert!(scan(|root| root.unreadable("crates/aterm-gui/src/pane/mod.rs")).is_err());
+        assert!(scan(|root| root.unlistable("crates/aterm-gui-term/src")).is_err());
     }
 }

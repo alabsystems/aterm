@@ -86,11 +86,14 @@ fn restored(r: Recovery) -> Restored {
 }
 
 /// The visible state a person sees: the restored checkpoint, rebuilt and projected
-/// without history.
+/// without history. A replayed tail leaves its lineage's seed uncertainty
+/// (`HolderRepr::seed_untrusted`, which the host's adoption reads), and a live engine
+/// never has it: no state a person sees.
 fn visible(c: &TerminalCheckpoint) -> TerminalCheckpoint {
     Terminal::from_checkpoint(c)
         .checkpoint_journal(0)
         .expect("ground")
+        .without_seed_lineage()
 }
 
 /// A session restored from its region is the live session: the keyframe plus the
@@ -107,6 +110,10 @@ fn a_restore_is_the_live_session() {
     let r = restored(live.recover(true));
     assert!(r.exact, "{:?}", r.losses);
     assert_eq!(r.replayed_records, 2);
+    assert!(
+        r.checkpoint.holder.seed_untrusted,
+        "the replayed tail leaves its seed uncertainty to the host's adoption"
+    );
     assert_eq!(r.slot, 0, "the second keyframe, seq 2");
     assert_eq!(
         visible(&r.checkpoint),
@@ -127,6 +134,7 @@ fn a_restore_is_the_live_session() {
     let r = restored(small.recover(true));
     assert!(r.exact, "{:?}", r.losses);
     assert_eq!(r.replayed_records, 3);
+    assert!(r.checkpoint.holder.seed_untrusted);
     assert_eq!(
         visible(&r.checkpoint),
         visible(&small.term.checkpoint_journal(0).expect("g"))
@@ -771,6 +779,11 @@ fn no_header_or_no_keyframe_is_the_meta_rung() {
     dead.write(OFF_SID, b"s 1\x07\xc3\xa9x\0tail")
         .expect("the id");
     assert_eq!(read_header(&dead).map(|h| h.sid), Ok("s1x".to_owned()));
+    // The window's control count is a header fact: 0 until stored, then what was stored,
+    // whatever the control slot holds.
+    assert_eq!(read_header(&dead).map(|h| h.ctl_count), Ok(0));
+    crate::writer::store_ctl_count(&dead, 5_101).expect("the count");
+    assert_eq!(read_header(&dead).map(|h| h.ctl_count), Ok(5_101));
 }
 
 /// The history ring's run comes back across its wrap, in order, under its identity; its

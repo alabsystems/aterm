@@ -10,11 +10,121 @@ fn mins(n: u64) -> Duration {
     Duration::from_secs(n * 60)
 }
 
-fn stamp(asleep: Duration, boot: Option<&str>) -> SleepStamp {
+/// Two boots of one machine.
+const BOOT_A: [u8; 16] = [
+    0x4D, 0x5A, 0x1B, 0x2C, 0x3E, 0x4F, 0x50, 0x61, 0x72, 0x83, 0x94, 0xA5, 0xB6, 0xC7, 0xD8, 0xE9,
+];
+const BOOT_B: [u8; 16] = [
+    0x4D, 0x5A, 0x1B, 0x2C, 0x3E, 0x4F, 0x50, 0x61, 0x72, 0x83, 0x94, 0xA5, 0xB6, 0xC7, 0xD8, 0xEA,
+];
+
+fn stamp(asleep: Duration, boot: Option<[u8; 16]>) -> SleepStamp {
     SleepStamp {
         asleep,
-        boot: boot.map(str::to_string),
+        boot: boot.map(Boot::kernel),
     }
+}
+
+/// A BOOT IS ITS 16 BYTES, HOWEVER A ROW SPELLED IT, AND IS WRITTEN AS IT
+/// WAS READ: the kernel's text in either case (macOS's `kern.bootsessionuuid`
+/// upper-case, Linux's `boot_id` lower-case) reads as the same boot, so a
+/// count a row of either case carries compares with this loop's, and each is
+/// written back in its own case — this host's boot in this host's kernel's
+/// ([`Boot::kernel`]). NEGATIVE CONTROL: the all-zero id a damaged answer
+/// reads as, a digit short, a stray character and the name a test once used
+/// are no boot at all — two counts both read from the all-zero text compare
+/// as no boot, where comparing the text would have called them one and
+/// counted the sleep between them.
+#[test]
+fn a_boot_is_its_bytes_however_a_row_spelled_it() {
+    let upper = "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9";
+    let lower = "4d5a1b2c-3e4f-5061-7283-94a5b6c7d8e9";
+    for text in [upper, lower] {
+        let boot = Boot::of(text).expect(text);
+        assert_eq!(boot.id(), BOOT_A, "{text}");
+        assert_eq!(boot.text(), text, "written as read");
+        assert_eq!(boot, Boot::kernel(BOOT_A), "{text}: one boot, either case");
+    }
+    let kernel = if cfg!(any(target_os = "linux", target_os = "android")) {
+        lower
+    } else {
+        upper
+    };
+    assert_eq!(
+        Boot::kernel(BOOT_A).text(),
+        kernel,
+        "this kernel's spelling"
+    );
+    for id in [BOOT_A, BOOT_B, [0xFF; 16], {
+        let mut one = [0; 16];
+        one[15] = 1;
+        one
+    }] {
+        let boot = Boot::kernel(id);
+        assert_eq!(Boot::of(&boot.text()).map(|b| b.id()), Some(id), "{id:x?}");
+        assert_eq!(Boot::of(&boot.text()).map(|b| b.text()), Some(boot.text()));
+    }
+    let then = SleepStamp {
+        asleep: mins(100),
+        boot: Boot::of(lower),
+    };
+    let now = SleepStamp {
+        asleep: mins(130),
+        boot: Boot::of(upper),
+    };
+    assert_eq!(now.since(&then), Some(mins(30)), "either case, one boot");
+    assert_eq!(
+        stamp(mins(130), Some(BOOT_B)).since(&then),
+        None,
+        "another boot"
+    );
+
+    let zero = "00000000-0000-0000-0000-000000000000";
+    for bad in [
+        zero,
+        "",
+        "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E",
+        "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8EG",
+        "test-boot",
+    ] {
+        assert_eq!(Boot::of(bad), None, "CONTROL {bad:?}");
+    }
+    let (a, b) = (
+        SleepStamp {
+            asleep: mins(100),
+            boot: Boot::of(zero),
+        },
+        SleepStamp {
+            asleep: mins(130),
+            boot: Boot::of(zero),
+        },
+    );
+    assert_eq!(b.since(&a), None, "CONTROL: a damaged answer names no boot");
+}
+
+/// THIS HOST'S BOOT IS WRITTEN AS ITS KERNEL SPELLS IT: astream's reading
+/// (`astream_sys::boot_session`), spelled by [`Boot::kernel`], is the text
+/// the kernel itself gives — read here NOT through astream, as the builds
+/// that wrote the kernel's text into a row read it (`sysctl -n
+/// kern.bootsessionuuid` on macOS, `/proc/sys/kernel/random/boot_id` on
+/// Linux) — so such a build, which compares the text, matches a row this one
+/// writes. The wait is a hang detector.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn this_hosts_boot_is_written_as_its_kernel_spells_it() {
+    let kernel_text = if cfg!(target_vendor = "apple") {
+        let mut sysctl = aterm_uds::spawnfd::command("/usr/sbin/sysctl");
+        sysctl.args(["-n", "kern.bootsessionuuid"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let out = aterm_uds::deadline::output_until(&mut sysctl, deadline).expect("sysctl");
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").expect("boot_id");
+        text.trim().to_string()
+    };
+    let boot = astream_sys::boot_session().expect("this host's kernel names its boot");
+    assert_eq!(Boot::kernel(boot).text(), kernel_text);
 }
 
 /// A SLEEP PLACED EXACTLY IS WHOLLY INSIDE A SPAN OR NONE OF IT: a turn
@@ -191,13 +301,13 @@ fn a_turn_holds_at_least_the_sleep_that_must_lie_inside_it() {
 fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
     let act = T;
     let look = T + 60 * MIN;
-    let then = stamp(mins(100), Some("boot-a"));
+    let then = stamp(mins(100), Some(BOOT_A));
     // One sleep since the act, 30 minutes, the system's last.
     let mut one = SleepBook::default();
     let last = Some((T + 5 * MIN, T + 35 * MIN));
     let took = one.take_up(
         look,
-        Some(&stamp(mins(130), Some("boot-a"))),
+        Some(&stamp(mins(130), Some(BOOT_A))),
         Some((act, Some(&then))),
         last,
     );
@@ -215,7 +325,7 @@ fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
     let mut two = SleepBook::default();
     two.take_up(
         look,
-        Some(&stamp(mins(140), Some("boot-a"))),
+        Some(&stamp(mins(140), Some(BOOT_A))),
         Some((act, Some(&then))),
         last,
     );
@@ -238,7 +348,7 @@ fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
     let mut counted = SleepBook::default();
     counted.take_up(
         look,
-        Some(&stamp(mins(130), Some("boot-a"))),
+        Some(&stamp(mins(130), Some(BOOT_A))),
         Some((act, Some(&then))),
         None,
     );
@@ -263,13 +373,13 @@ fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
 fn a_take_up_with_nothing_to_say_keeps_the_reading_as_it_was() {
     let act = T;
     let look = T + 60 * MIN;
-    let then = stamp(mins(100), Some("boot-a"));
-    let now = stamp(mins(130), Some("boot-a"));
+    let then = stamp(mins(100), Some(BOOT_A));
+    let now = stamp(mins(130), Some(BOOT_A));
     let cases = [
         (Some((act, None)), Some(&now), SinceAct::Uncounted),
         (
             Some((act, Some(&then))),
-            Some(&stamp(mins(130), Some("boot-b"))),
+            Some(&stamp(mins(130), Some(BOOT_B))),
             SinceAct::OtherBoot,
         ),
         (

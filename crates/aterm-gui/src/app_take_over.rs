@@ -902,9 +902,8 @@ impl App {
             .get(session)
             .map(|s| s.ctx.clone())
             .ok_or_else(|| "no such session".to_string())?;
-        // The `hold` mark wakes the session log's readers.
-        let outcome =
-            crate::fabric::person_hold(&ctx, on, &|| self.wake_log_watchers(session, true));
+        // The `hold` mark rings the session's watchers where it is recorded.
+        let outcome = crate::fabric::person_hold(&ctx, on, &|| {});
         if outcome == PersonHoldOutcome::Busy {
             self.post_message(crate::message_reporters::hold_refused(
                 on,
@@ -2324,6 +2323,7 @@ mod tests {
         let result = |path| crate::status_item::ResultRef {
             session: 0,
             entered: 7,
+            end_serial: None,
             path,
             label: "lint".to_string(),
         };
@@ -2468,7 +2468,7 @@ mod tests {
             from: Some(manager_ctx.self_id.as_str().to_string()),
             ..TaskMark::new(TaskState::Working)
         };
-        mark_session_task(&worker_ctx, worker, &mark, &app.subscribers).expect("unfenced");
+        mark_session_task(&worker_ctx, worker, &mark).expect("unfenced");
         app.on_task_changed(worker); // the wake's arm rebuilds the team table
         let of_worker = app.agent_menu_facts(worker);
         assert_eq!(
@@ -2523,7 +2523,7 @@ mod tests {
                 from: Some(manager_ctx.self_id.as_str().to_string()),
                 ..TaskMark::new(TaskState::Working)
             };
-            mark_session_task(&ctx, w, &mark, &app.subscribers).expect("unfenced");
+            mark_session_task(&ctx, w, &mark).expect("unfenced");
             app.on_task_changed(w);
         }
         let registry = |session: u64| {
@@ -2630,7 +2630,7 @@ mod tests {
             from: Some(manager_ctx.self_id.as_str().to_string()),
             ..TaskMark::new(TaskState::Working)
         };
-        mark_session_task(&worker_ctx, worker, &mark, &app.subscribers).expect("unfenced");
+        mark_session_task(&worker_ctx, worker, &mark).expect("unfenced");
         app.on_task_changed(worker);
         assert_ne!(
             app.windows[&wid].tab_set.active_index(),

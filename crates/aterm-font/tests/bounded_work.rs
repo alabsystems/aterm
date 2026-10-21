@@ -261,3 +261,160 @@ fn cff_work_is_shared_across_subroutine_calls() {
 fn cff2_work_is_shared_across_subroutine_calls() {
     refuses_expansion(&charstring_face(true), GlyphId(1));
 }
+
+/// A `GSUB` 1.0 whose one `DFLT` script's default language names feature
+/// `liga`, which names lookups `0..lookups`. Every lookup offset names one
+/// type-1 lookup of `subtables` subtables, and every subtable offset names one
+/// single substitution (format 1, delta +1) covering glyph 0. Well-formed
+/// fonts never alias offsets like this; a crafted one can, and each aliased
+/// pair costs the shaper a subtable parse: `lookups` x `subtables` of them.
+fn aliased_gsub(lookups: usize, subtables: usize) -> Vec<u8> {
+    let be16 = |v: usize| u16::try_from(v).unwrap().to_be_bytes();
+    // Header (offsets patched below), then the ScriptList at 10: DFLT at +8,
+    // its default LangSys at +4 naming feature 0.
+    let mut g = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let script_list = g.len();
+    g.extend([0, 1, b'D', b'F', b'L', b'T', 0, 8, 0, 4, 0, 0]);
+    g.extend([0, 0, 0xFF, 0xFF, 0, 1, 0, 0]);
+    // FeatureList: `liga` at +8, naming lookups 0..lookups.
+    let feature_list = g.len();
+    g.extend([0, 1, b'l', b'i', b'g', b'a', 0, 8, 0, 0]);
+    g.extend(be16(lookups));
+    (0..lookups).for_each(|i| g.extend(be16(i)));
+    // LookupList: every offset names the one lookup after the array.
+    let lookup_list = g.len();
+    g.extend(be16(lookups));
+    (0..lookups).for_each(|_| g.extend(be16(2 + 2 * lookups)));
+    // The lookup: type 1, no flags, every subtable offset aliasing one.
+    g.extend([0, 1, 0, 0]);
+    g.extend(be16(subtables));
+    (0..subtables).for_each(|_| g.extend(be16(6 + 2 * subtables)));
+    // Single substitution format 1 (coverage at +6, delta +1), then its
+    // coverage, format 1: glyph 0.
+    g.extend([0, 1, 0, 6, 0, 1, 0, 1, 0, 1, 0, 0]);
+    g[4..6].copy_from_slice(&be16(script_list));
+    g[6..8].copy_from_slice(&be16(feature_list));
+    g[8..10].copy_from_slice(&be16(lookup_list));
+    g
+}
+
+/// The glyphs two characters shape to on `gsub`'s face, whose cmap-less
+/// characters are glyph 0 until a substitution moves them.
+fn shaped(gsub: &[u8]) -> Vec<u32> {
+    use aterm_font::Tag;
+    use aterm_font::shape::{Feature, ShapeFace, UnicodeBuffer, shape};
+    let bytes = crate::never_panic::sfnt(2, &[(b"GSUB", gsub)]);
+    let face = ShapeFace::new(Face::parse(&bytes, 0).expect("the synthetic face parses"));
+    let mut buffer = UnicodeBuffer::new();
+    buffer.push_str("ab");
+    let liga = [Feature::new(Tag::from_bytes(b"liga"), 1)];
+    shape(&face, &liga, buffer)
+        .glyph_infos()
+        .iter()
+        .map(|info| info.glyph_id)
+        .collect()
+}
+
+/// Aliased `GSUB` offsets cannot multiply the shaper's parsing. A lookup
+/// list whose 1,000 offsets name one lookup of 1,000 subtables that all name
+/// one substitution asks for a million subtable parses from a 6 KB table
+/// (32,000 x 32,000, 192 KB, took 27 s for one two-character shape before the
+/// budget, measured 2026-10-19). The shaper spends at most aterm's own
+/// budget, 8 units per byte of the table (`LayoutWork`), and drops the face's
+/// `GSUB` once a parse runs past it, as HarfBuzz drops a table that fails its
+/// sanitizer. The same structure at 10 x 10 is within the budget and
+/// substitutes as before.
+#[test]
+fn aliased_gsub_lookups_are_parsed_within_a_budget() {
+    assert_eq!(shaped(&aliased_gsub(10, 10)), [1, 1], "within the budget");
+    assert_eq!(
+        shaped(&aliased_gsub(1_000, 1_000)),
+        [0, 0],
+        "past the budget, GSUB is refused"
+    );
+}
+
+/// A `GSUB` 1.0 whose `liga` names lookups 0 and 1, and whose lookup 2 no
+/// feature names. Lookup 0 substitutes glyph 0 with glyph 1 (single, delta
+/// +1). Lookup 1 is a context (format 3) over glyphs {0, 1} that applies
+/// lookup 2 at its one position. Lookup 2 has `subtables` offsets aliasing
+/// one single substitution (delta 0, so it changes nothing) whose coverage
+/// lists glyphs `1..=coverage`: past the budget, it is only a nested lookup
+/// that the shaper's parse refuses.
+fn nested_gsub(subtables: usize, coverage: usize) -> Vec<u8> {
+    let be16 = |v: usize| u16::try_from(v).unwrap().to_be_bytes();
+    let mut g = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let script_list = g.len();
+    g.extend([0, 1, b'D', b'F', b'L', b'T', 0, 8, 0, 4, 0, 0]);
+    g.extend([0, 0, 0xFF, 0xFF, 0, 1, 0, 0]);
+    // FeatureList: `liga` at +8, naming lookups 0 and 1.
+    let feature_list = g.len();
+    g.extend([0, 1, b'l', b'i', b'g', b'a', 0, 8, 0, 0, 0, 2, 0, 0, 0, 1]);
+    // LookupList: lookup 0 at +8, 1 at +28, 2 at +56.
+    let lookup_list = g.len();
+    g.extend([0, 3, 0, 8, 0, 28, 0, 56]);
+    // Lookup 0: one single substitution (coverage at +6, delta +1), its
+    // coverage glyph 0.
+    g.extend([0, 1, 0, 0, 0, 1, 0, 8]);
+    g.extend([0, 1, 0, 6, 0, 1]);
+    g.extend([0, 1, 0, 1, 0, 0]);
+    // Lookup 1: a context format 3 of one position (coverage at +12), whose
+    // one record applies lookup 2 at position 0; its coverage glyphs 0, 1.
+    g.extend([0, 5, 0, 0, 0, 1, 0, 8]);
+    g.extend([0, 3, 0, 1, 0, 1, 0, 12, 0, 0, 0, 2]);
+    g.extend([0, 1, 0, 2, 0, 0, 0, 1]);
+    assert_eq!(g.len() - lookup_list, 56, "lookup 2's offset");
+    // Lookup 2: every subtable offset aliasing one single substitution
+    // (coverage at +6, delta 0), its coverage glyphs 1..=coverage.
+    g.extend([0, 1, 0, 0]);
+    g.extend(be16(subtables));
+    (0..subtables).for_each(|_| g.extend(be16(6 + 2 * subtables)));
+    g.extend([0, 1, 0, 6, 0, 0]);
+    g.extend([0, 1]);
+    g.extend(be16(coverage));
+    (1..=coverage).for_each(|gid| g.extend(be16(gid)));
+    g[4..6].copy_from_slice(&be16(script_list));
+    g[6..8].copy_from_slice(&be16(feature_list));
+    g[8..10].copy_from_slice(&be16(lookup_list));
+    g
+}
+
+/// What one character shapes to, twice, on one face of `gsub`.
+fn shaped_twice(gsub: &[u8]) -> [Vec<u32>; 2] {
+    use aterm_font::Tag;
+    use aterm_font::shape::{Feature, ShapeFace, UnicodeBuffer, shape};
+    let bytes = crate::never_panic::sfnt(2, &[(b"GSUB", gsub)]);
+    let face = ShapeFace::new(Face::parse(&bytes, 0).expect("the synthetic face parses"));
+    let liga = [Feature::new(Tag::from_bytes(b"liga"), 1)];
+    let once = || {
+        let mut buffer = UnicodeBuffer::new();
+        buffer.push_str("a");
+        shape(&face, &liga, buffer)
+            .glyph_infos()
+            .iter()
+            .map(|info| info.glyph_id)
+            .collect()
+    };
+    [once(), once()]
+}
+
+/// A refused `GSUB` is refused before any of it applies, whichever lookup
+/// runs past the budget, so a face shapes the same text the same way every
+/// time. Lookup 2 of a 6 KB table names 2,000 x 1,000 entries; no feature
+/// names it, so parsing only the lookups a plan names would refuse it in the
+/// middle of the first shape, after lookup 0 had applied (glyph 1), and
+/// every shape after it would get no `GSUB` (glyph 0). At 2 x 4 the same
+/// table is within the budget and substitutes every time.
+#[test]
+fn a_gsub_refused_through_a_nested_lookup_applies_none_of_it() {
+    assert_eq!(
+        shaped_twice(&nested_gsub(2, 4)),
+        [[1], [1]],
+        "within the budget"
+    );
+    assert_eq!(
+        shaped_twice(&nested_gsub(2_000, 1_000)),
+        [[0], [0]],
+        "past the budget, through a nested lookup: GSUB is refused from the first shape"
+    );
+}

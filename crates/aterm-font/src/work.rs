@@ -28,6 +28,61 @@ impl OutlineWork {
     }
 }
 
+/// One `GSUB` table's walk budget, shared by every lookup the walks of one
+/// reader reach (the shaper's lookup parses, the autohinter's style and
+/// cluster walks), one unit per lookup, subtable or entry visited: per
+/// traversal of the table the reader may make, 8 units per byte of the table
+/// and at least 16,384. The budget is aterm's own. HarfBuzz's sanitizer
+/// charges bytes rather than entries, 64 operations per byte of the table
+/// (`HB_SANITIZE_MAX_OPS_FACTOR`, at least 16,384) with each range it checks
+/// spending its length (`check_range`, src/hb-sanitize.hh at c7ef6a2ed5), so
+/// it allows a two-byte entry 32 checks per byte of the table where this
+/// allows 8. A well-formed table spends about half a unit per byte in one
+/// traversal, since each lookup, subtable and entry sits in bytes of its own
+/// (at least two); the most on this Mac (2026-10-19, 523 faces with `GSUB`)
+/// is 6.02% of the shaper's one traversal (SFIndia) and 0.26 traversals of
+/// the autohinter's eight (Hiragino Sans W3). Offsets may alias, though:
+/// every lookup of a list can name one lookup and every subtable offset of
+/// it one subtable, so a 192 KB table names 32,000 x 32,000 subtables (27 s
+/// for one two-character shape, 16 s to build the autohinter's styles,
+/// measured 2026-10-19). Once the budget is spent the walk refuses the
+/// table, as HarfBuzz drops a table that fails its sanitizer.
+pub(crate) struct LayoutWork {
+    left: core::cell::Cell<u64>,
+    refused: core::cell::Cell<bool>,
+}
+
+impl LayoutWork {
+    /// The budget for `traversals` traversals of a table of `len` bytes.
+    pub(crate) fn for_table(len: usize, traversals: u64) -> Self {
+        let one = (len as u64).saturating_mul(8).max(16_384);
+        Self {
+            left: core::cell::Cell::new(one.saturating_mul(traversals)),
+            refused: core::cell::Cell::new(false),
+        }
+    }
+
+    /// Spends `units`; `None`, and refused from then on, when they are not
+    /// left.
+    pub(crate) fn spend(&self, units: u64) -> Option<()> {
+        match self.left.get().checked_sub(units) {
+            Some(left) if !self.refused.get() => {
+                self.left.set(left);
+                Some(())
+            }
+            _ => {
+                self.refused.set(true);
+                None
+            }
+        }
+    }
+
+    /// Whether a walk ran past the budget.
+    pub(crate) fn refused(&self) -> bool {
+        self.refused.get()
+    }
+}
+
 /// What this thread's outline queries and `COLR` paint walks have spent
 /// since the last [`take_spent`]: how close a real face comes to the two
 /// work budgets, the 65,536 outline steps of [`OutlineWork`] and the 2^16

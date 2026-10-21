@@ -5,11 +5,12 @@
 //! Embed the community theme pack (`contrib/themes/pack/`).
 //!
 //! Reads `manifest.tsv`, refuses a row whose licence the policy does not
-//! admit, whose id the themes folder could not hold, or whose upstream or
-//! licence file is missing, and writes `$OUT_DIR/pack.rs`: the rows as
-//! `PackTheme`s (sorted by id, ignoring ASCII case), every licence text the
-//! rows, the collection and the built-in ports name, and the collection's
-//! identity. A built-in port's licence file is derived from its source
+//! admit, whose id the themes folder could not hold, whose id or name
+//! another row answers to, or whose upstream or licence file is missing,
+//! and writes `$OUT_DIR/pack.rs`: the rows as `PackTheme`s (sorted by id,
+//! ignoring ASCII case), the withdrawn ids with the theme standing for each,
+//! every licence text the rows, the collection and the built-in ports name,
+//! and the collection's identity. A built-in port's licence file is derived from its source
 //! (`LICENSES/<spdx>-<repo>.txt`, [`port_licence_file`]), so no second list
 //! names them; and a file in the pack folder that nothing names refuses the
 //! build (TP-FOLDER, TP-PORTS). File text is pulled in with `include_str!`, so the compiler
@@ -29,7 +30,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The manifest's header row, column for column.
-const HEADER: [&str; 9] = [
+const HEADER: [&str; 10] = [
     "id",
     "upstream",
     "appearance",
@@ -39,6 +40,7 @@ const HEADER: [&str; 9] = [
     "project_url",
     "licence",
     "licence_files",
+    "name",
 ];
 
 struct Row {
@@ -109,6 +111,7 @@ fn main() {
     let at = |line: usize| format!("{}:{line}", manifest_path.display());
 
     let mut collection: Option<(String, String, String)> = None;
+    let mut withdrawn: Vec<(usize, String, String)> = Vec::new();
     let mut header_seen = false;
     let mut rows: Vec<Row> = Vec::new();
     for (index, raw) in manifest.lines().enumerate() {
@@ -122,6 +125,7 @@ fn main() {
                 ("collection", 4) if collection.is_none() => {
                     collection = Some((cols[1].clone(), cols[2].clone(), cols[3].clone()));
                 }
+                ("withdrawn", 3) => withdrawn.push((line, cols[1].clone(), cols[2].clone())),
                 _ => panic!("{}: unknown or malformed directive {raw:?}", at(line)),
             }
             continue;
@@ -201,6 +205,7 @@ fn main() {
         licence(&file, 0);
         ports.push((source.project.to_string(), file));
     }
+    // What `find` answers to: every id, and every name the chooser shows.
     let mut ids = BTreeSet::new();
     for row in &rows {
         let c = &row.cols;
@@ -213,6 +218,37 @@ fn main() {
             "{}: {id:?} is listed twice",
             at(line)
         );
+    }
+    for row in &rows {
+        let c = &row.cols;
+        let (id, name, line) = (&c[0], &c[9], row.line);
+        assert!(
+            !name.trim().is_empty(),
+            "{}: name is a name or '-'",
+            at(line)
+        );
+        assert!(
+            name == "-" || (name != id && ids.insert(name.to_ascii_lowercase())),
+            "{}: {id:?}'s name {name:?} is its id (write '-') or another row's",
+            at(line)
+        );
+    }
+    for (line, id, theme) in &withdrawn {
+        assert!(
+            !ids.contains(&id.to_ascii_lowercase()),
+            "{}: withdrawn {id:?} is still a row's id or name",
+            at(*line)
+        );
+        assert!(
+            rows.iter().any(|row| row.cols[0] == *theme)
+                || aterm_types::scheme::builtin_theme(theme).is_some(),
+            "{}: {theme:?}, standing for withdrawn {id:?}, is no pack id or built-in",
+            at(*line)
+        );
+    }
+    for row in &rows {
+        let c = &row.cols;
+        let (id, line) = (&c[0], row.line);
         assert!(
             matches!(c[2].as_str(), "dark" | "light"),
             "{}: appearance is dark or light, not {:?}",
@@ -284,9 +320,10 @@ fn main() {
             format!("Some({:?})", c[3])
         };
         let files: Vec<String> = c[8].split(';').map(|f| format!("{f:?}")).collect();
+        let name = if c[9] == "-" { &c[0] } else { &c[9] };
         let _ = writeln!(
             out,
-            "    PackTheme {{ id: {:?}, text: {text}, upstream: {:?}, \
+            "    PackTheme {{ id: {:?}, name: {name:?}, text: {text}, upstream: {:?}, \
              appearance: aterm_types::Appearance::{appearance}, pair: {pair}, author: {:?}, \
              project: {:?}, project_url: {:?}, licence: {:?}, licence_files: &[{}] }},",
             c[0],
@@ -297,6 +334,10 @@ fn main() {
             c[7],
             files.join(", ")
         );
+    }
+    out.push_str("];\n\nstatic WITHDRAWN: &[(&str, &str)] = &[\n");
+    for (_, id, theme) in &withdrawn {
+        let _ = writeln!(out, "    ({id:?}, {theme:?}),");
     }
     out.push_str("];\n\nstatic LICENCES: &[(&str, &str)] = &[\n");
     for file in &licence_files {

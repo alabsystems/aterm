@@ -629,11 +629,57 @@ impl EndFold {
 /// A notice row (`isApiErrorMessage`) read as the harness reads it, its
 /// classes and wall kept and its text dropped.
 fn notice_of(line: &str) -> (Option<WallKind>, u8) {
-    let Ok(v) = transcript::conversation(line) else {
-        return (None, 0);
-    };
+    notice_read(line).map_or((None, 0), |n| {
+        let classes = CLASSES
+            .iter()
+            .zip(n.confirms)
+            .filter(|(_, confirms)| *confirms)
+            .fold(0, |c, (&k, _)| c | bit(wall_confirm::class(k)));
+        (n.wall, classes)
+    })
+}
+
+/// WHAT THE HARNESS READS OF ONE NOTICE ROW: Claude Code's own notice (an
+/// `isApiErrorMessage` row), or a `system` `local_command` row whose output
+/// reads as a full context (a failed `/compact`), as the wall check reads
+/// it (`supervise/wall_confirm.rs`'s `row_of`): its words, the typed fields
+/// it carries, and what the harness makes of them — the wall it is once its
+/// turn is closed, the screen walls it confirms and the limit it names. A
+/// reader of the rows' closed words reads a notice through it
+/// (`aterm-lab reduce`'s readings, session log ruling U7: a reduction keeps
+/// the words this reads).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoticeRead {
+    /// Its words: every text part joined, or the command's output in its
+    /// tags.
+    pub text: String,
+    /// Its `error` word.
+    pub error: Option<String>,
+    /// Its typed `apiError` (since 2.1.295).
+    pub api_error: Option<String>,
+    /// The status it answered (`apiErrorStatus`).
+    pub status: Option<u16>,
+    /// Which of the account's limits it was written for
+    /// (`quotaLimits.rateLimitType`).
+    pub limit: Option<String>,
+    /// The wall it is once its turn is closed (`transcript_wall`).
+    pub wall: Option<WallKind>,
+    /// Whether it confirms a screen wall of each class, in the order of a
+    /// usage limit, a full context, the lost login, an API error and the
+    /// memory wall (`confirms`, which reads the screen's class alone).
+    pub confirms: [bool; 5],
+    /// Which limit it names (`limit_named`: by its words, else by its
+    /// `rateLimitType`).
+    pub named: Option<WallKind>,
+}
+
+/// [`NoticeRead`] of one transcript line; `None` for a line that is no
+/// notice, and one that is no JSON.
+#[must_use]
+pub fn notice_read(line: &str) -> Option<NoticeRead> {
+    let v = transcript::conversation(line).ok()?;
     let Some(Row::Entry(entry @ Entry::Notice { .. })) = wall_confirm::row_of(&v) else {
-        return (None, 0);
+        return None;
     };
     // Closed, so `transcript_wall` names the wall the notice is; the
     // classes `confirms` answers do not look at `closed`.
@@ -645,11 +691,28 @@ fn notice_of(line: &str) -> (Option<WallKind>, u8) {
         prompted: false,
     };
     let wall = wall_confirm::transcript_wall(&end);
-    let classes = CLASSES
-        .iter()
-        .filter(|&&k| wall_confirm::confirms(k, &end))
-        .fold(0, |c, &k| c | bit(wall_confirm::class(k)));
-    (wall, classes)
+    let confirms = CLASSES.map(|k| wall_confirm::confirms(k, &end));
+    let Entry::Notice {
+        text,
+        error,
+        api_error,
+        status,
+        limit,
+    } = end.last
+    else {
+        return None;
+    };
+    let named = wall_confirm::limit_named(&text, limit.as_deref());
+    Some(NoticeRead {
+        text,
+        error,
+        api_error,
+        status,
+        limit,
+        wall,
+        confirms,
+        named,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -66,9 +66,10 @@ pub const TAKE_MAX: usize = 64;
 /// any offset needs at most this many earlier bodies of the session.
 pub const SNAP_EVERY: u64 = 64;
 
-/// One ring entry's size: the record, its encoded bytes and its `ms`. What
-/// the instance's heap charge counts per record ([`Log::footprint`]); phase 4
-/// grew it by exactly the 8 bytes of `ms`, mirror on or off.
+/// One ring entry's size: the shared record's pointer, its encoded bytes and
+/// its `ms`. What the instance's heap charge counts per record beside the
+/// shared record itself ([`Log::footprint`]); phase 4 grew it by exactly the 8
+/// bytes of `ms`, mirror on or off.
 pub const ENTRY_BYTES: usize = std::mem::size_of::<Entry>();
 
 /// What phase 4 added to every [`Log`]'s own size, mirror on or off: the
@@ -206,7 +207,7 @@ struct SnapFacts {
 #[derive(Clone, Debug)]
 enum Item {
     Rec {
-        rec: Rec,
+        rec: std::sync::Arc<Rec>,
         ms: u64,
     },
     Cover {
@@ -603,7 +604,7 @@ impl Log {
                 let rec_at = BusCursor::new(space, e.rec.seq, e.ms);
                 items.push((
                     Item::Rec {
-                        rec: e.rec.clone(),
+                        rec: std::sync::Arc::clone(&e.rec),
                         ms: e.ms,
                     },
                     rec_at,

@@ -109,7 +109,9 @@ pub struct CastDriftJob<'a> {
 }
 
 /// How long the client lets the server's recorder catch up before it reads the
-/// screen — the server verb's own settle (`CAST_DRIFT_SETTLE`, 60 ms).
+/// screen. The server's own verb waits on its recording's watermark instead
+/// (`CastRecorder::snapshot_at`); over the wire there is none to wait on, so the
+/// client keeps the 60 ms settle that verb used before.
 const SETTLE: Duration = Duration::from_millis(60);
 
 /// Consistent-cut attempts before the client proceeds with `cut=racy`.
@@ -600,6 +602,9 @@ fn live_with(
     if let Probe::Answered(code) = probe(path, origin, &request, deadline)? {
         return Ok(code);
     }
+    // This instance took the request: a read that finds it gone is the call's
+    // failure, never a stale entry to move past.
+    let origin = origin.settled();
     let Some(analyze) = local.cast_drift else {
         return Err(no_analyzer_error(
             "this aterm predates `cast drift` (it answered the bare cast)",

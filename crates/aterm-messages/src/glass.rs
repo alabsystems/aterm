@@ -23,8 +23,12 @@
 //!    yet or not. The slot keeps one width for the row's life, so load words arriving,
 //!    changing or leaving never re-lay a moving row. Over budget, in turn: the implicit
 //!    `Details ›` goes, where that alone fits (the row body opens Details); every
-//!    capsule takes its short form (one with none goes); the title elides down to
-//!    [`TITLE_MIN`]; then (cols < ~24) the degenerate step: `A` goes whole, the title
+//!    capsule takes its short form (one with none goes); the title gives way to its
+//!    short form ([`RowSpec::title_short`], two or three words that say what happened)
+//!    and the head is fitted again around it from the top (`Details ›` where it fits,
+//!    the long capsules), the short title cut only where its own short capsules leave
+//!    it too few cells, and a title with none elides; never below [`TITLE_MIN`]; then
+//!    (cols < ~24) the degenerate step: `A` goes whole, the title
 //!    takes what is left, the implicit `Details ›` goes, and the capsules stand from
 //!    column 0 for the painter to clip. Rows are always exactly `cols` cells, never a
 //!    panic, and authored capsules are never dropped.
@@ -35,6 +39,19 @@
 //!    (`3 + min(width, DETAIL_FLOOR)`), so the short capsules and the title's elision
 //!    pay for it; it goes only when the title at [`TITLE_MIN`] still cannot, before the
 //!    degenerate step. Its row's load slot is then an extra after the excerpt.
+//!
+//!    An ask's one step (a now ask whose `detail[0]` is its step, [`RowSpec::step`]) is
+//!    an action excerpt reserved WHOLE (`3 + width`): the implicit `Details ›`, the short
+//!    capsules and the title — its short form, whole and then cut — down to
+//!    [`TITLE_MIN`] pay for all of it, and only then is it cut, to the cells that title
+//!    leaves and never below [`DETAIL_FLOOR`] (the review of the owner's notices,
+//!    2026-10-20: a narrow band showed the title and `Show tab 1`, and dropped the one
+//!    thing to do). A step with a short form ([`RowSpec::step_short`]) takes it there
+//!    instead, and the head is fitted again around the short form from the top —
+//!    `Details ›`, the long capsules, the title (the whole title where the row has no
+//!    short one; else the short title, which never gives the whole one back) — so the
+//!    cells the whole step would have taken are not left blank. A step's cut always ends
+//!    in `…`: its lead clause alone would read as the whole instruction.
 //! 2. `room = budget − fixed`, `fixed` measured with the long capsules whatever they
 //!    became, so the cells the short forms free never re-buy an extra a wider row gave
 //!    up and every extra is monotone as the row narrows. The extras, in allocation
@@ -42,21 +59,27 @@
 //!    determinate row asks for one; (b) the excerpt (`detail[0]`): whole if
 //!    `3 + width ≤ room`, else shaped to `room − 3` cells if `room ≥ 3 + DETAIL_FLOOR`,
 //!    else its whole lead clause where it fits and the floor's cut begins with it
-//!    (`behind for 7 h` of `behind for 7 h: its turn…`; [`crate::text::lead_clause`]),
-//!    else dropped, never a stub; (b′) an action excerpt's row's load slot, `2 +` its
-//!    widest load words, beside a whole excerpt when it fits; (c) stats if `2 + len`
+//!    (`behind for 7 h` of `behind for 7 h: its turn…`; [`crate::text::lead_clause`];
+//!    never an ask's step's, which keeps its mark), else dropped, never a stub;
+//!    (b′) an action excerpt's row's load slot, `2 +` its widest load words,
+//!    beside a whole excerpt when it fits; (c) stats if `2 + len`
 //!    fits, else their short form ([`short_stats`]: `3 of 10 programs` →
 //!    `3/10 programs`, never a bare `3/10`), beside a whole excerpt or none. An extra
 //!    asked for that does not fit starves every extra after it.
 //!
 //! Sacrifice order as the row narrows: stats (short, then gone) → excerpt (shaped, then
 //! its lead clause, then dropped) → ETA (long, then short) → the implicit `Details ›` →
-//! capsule short forms → title elision → the activity words with the load words. On a
-//! row with an ETA, how long outranks the load words: where no ETA fits, the load
-//! slot's cells buy the short one. On an action excerpt's row: stats → load slot →
-//! excerpt shaped → ETA → capsule short forms → title elision → the excerpt → the
-//! activity words. What is gone at one width is gone at every narrower one; the meter
-//! is never on the list.
+//! capsule short forms → the short title (whole, then cut; else the title's elision) →
+//! the activity words with the load words. On a row with an ETA, how long outranks the
+//! load words: where no ETA fits, the load slot's cells buy the short one. On an action
+//! excerpt's row: stats → load slot → excerpt shaped → ETA → capsule short forms → the
+//! short title, whole then cut (else the title's elision) → (an ask's step cut to its
+//! floor →) the excerpt → the activity words. The title reads whole, as its short form whole, or as its short
+//! form cut: never as a cut of the whole title where the row has a short one. What is
+//! gone at one width is gone at every narrower one — save at the widths where a title
+//! or an ask's step gives way to its short form, whose head is fitted anew around the
+//! shorter words (the capsules' long words and `Details ›` come back there; the title's
+//! whole words and the whole step never do); the meter is never on the list.
 //!
 //! Cells on a row: `glyph title · excerpt ␠␠pct|␠elapsed ␠eta ␠␠stats … load ␠␠capsules`,
 //! all over the meter. The percent is right-aligned in its four cells and the time words
@@ -588,8 +611,27 @@ pub(crate) struct RowSpec<'a> {
     pub glyph: char,
     /// The full title.
     pub title: &'a str,
+    /// The title's short form ([`crate::Message`]'s `short_title`): what the row
+    /// paints in the title's place where the whole title does not fit, whole
+    /// wherever it fits (module doc, step 1). `None`: the title elides. The
+    /// spoken text ([`RowLayout::full_title`]) keeps the whole title.
+    pub title_short: Option<&'a str>,
     /// `detail[0]`, when any.
     pub detail0: Option<&'a str>,
+    /// `detail0` IS THE ONE STEP the row asks for: a [`crate::need::Need::Now`]
+    /// ask whose first detail line is its step's own words
+    /// ([`crate::need::Then::words`]). It is the one thing on the row the
+    /// person must read, so it is an action excerpt whatever the row's
+    /// activity, and it is reserved WHOLE in the fixed head: the implicit
+    /// `Details ›`, the capsules' short forms and the title's elision pay for
+    /// it before it is cut (module doc, step 1).
+    pub step: bool,
+    /// The step's short form ([`crate::need::Then::short`]): what the row
+    /// shows in the step's place where the step does not stand whole beside
+    /// the title at [`TITLE_MIN`] — a step that must not be cut (a command)
+    /// is whole or replaced, never cut; a band too narrow for the short form
+    /// whole cuts it, a sentence. `None`: the step is cut there.
+    pub step_short: Option<&'a str>,
     /// `(fill_permille, stats)` when metered; a `None` fill draws no meter
     /// and no pct (its stats alone — or, with `busy`, the track).
     pub meter: Option<(Option<u16>, &'a str)>,
@@ -668,7 +710,10 @@ pub(crate) fn overflow_spec(hidden: usize, words: &str) -> RowSpec<'_> {
         live: false,
         glyph: OVERFLOW_GLYPH,
         title: words,
+        title_short: None,
         detail0: None,
+        step: false,
+        step_short: None,
         meter: None,
         busy: false,
         animated: false,
@@ -850,6 +895,28 @@ struct Fit {
     /// The row's excerpt is an action excerpt (whether or not its floor
     /// survived): the load slot is then an extra after it.
     action_excerpt: bool,
+    /// Whose words the excerpt shows: the step's, or its short form's where
+    /// the step gave way to it ([`RowSpec::step_short`]).
+    words: ExcerptWords,
+}
+
+/// Whose words a row's excerpt shows ([`Fit::words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExcerptWords {
+    /// The row's own first detail line, the ask's step for an ask.
+    Detail,
+    /// The ask's step's short form ([`RowSpec::step_short`]).
+    Short,
+}
+
+impl ExcerptWords {
+    /// The words of `spec` this names.
+    fn of<'a>(self, spec: &RowSpec<'a>) -> Option<&'a str> {
+        match self {
+            Self::Detail => spec.detail0,
+            Self::Short => spec.step_short,
+        }
+    }
 }
 
 /// The load slot's width: the widest words among the loads the row reserves
@@ -884,52 +951,120 @@ fn load_cells(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> us
 }
 
 /// Whether the row's excerpt is an action excerpt: a painted `detail[0]` on
-/// a moving row. The host paints a moving row's excerpt only when it changes
-/// what the person does, so it is the one thing on the row the person must
-/// read: it outranks the load slot and is paid for by the capsules' short
-/// forms and the title's elision, never dropped while they can pay.
+/// a moving row, or an ask's one step ([`RowSpec::step`]). The host paints a
+/// moving row's excerpt only when it changes what the person does, so it is
+/// the one thing on the row the person must read: it outranks the load slot
+/// and is paid for by the capsules' short forms and the title's elision,
+/// never dropped while they can pay.
 fn action_excerpt(spec: &RowSpec<'_>, activity: Activity) -> bool {
-    matches!(activity, Activity::LiveBar | Activity::LiveBusy)
+    (spec.step || matches!(activity, Activity::LiveBar | Activity::LiveBusy))
         && spec.detail0.is_some_and(|d| !d.is_empty())
 }
 
 /// The cells an action excerpt reserves in the fixed head: its joint and
-/// its first [`DETAIL_FLOOR`] cells (the whole excerpt when shorter).
+/// its first [`DETAIL_FLOOR`] cells (the whole excerpt when shorter) — an
+/// ask's step its whole width ([`RowSpec::step`]), which [`fit_fixed`] cuts
+/// to the cells the title at [`TITLE_MIN`] leaves, never below the floor.
 fn excerpt_floor(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> usize) -> usize {
     match spec.detail0 {
+        Some(d) if action_excerpt(spec, activity) && spec.step => 3 + width(d),
         Some(d) if action_excerpt(spec, activity) => 3 + width(d).min(DETAIL_FLOOR),
         _ => 0,
     }
 }
 
-/// Step 1: capsules long → short, then the title, then the degenerate step.
-fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> Fit {
-    let budget = cols.saturating_sub(2 * MARGIN);
-    let (overflow_title, glyph) = match spec.kind {
-        RowKind::Overflow { hidden } => {
-            let (words, glyph) = overflow_fit(hidden, spec.title, budget, width);
-            (Some(words), glyph)
-        }
-        RowKind::Message(_) | RowKind::Echo(_) => (None, spec.glyph),
+/// The fixed head fitted around an excerpt reserved `ex` cells: step 1's
+/// sacrifices before the excerpt's own, in order — the implicit `Details ›`
+/// where that alone fits, the capsules' short forms, the title: its short
+/// form where the row has one, the head fitted again around it
+/// ([`fit_head`]), else its elision down to [`TITLE_MIN`].
+struct Head {
+    title: String,
+    /// The capsules' cells, and the clearance before them.
+    caps: usize,
+    before: usize,
+    short: bool,
+    details_dropped: bool,
+    /// What the head takes of the budget, the excerpt's `ex` included.
+    fixed: usize,
+}
+
+/// The title's forms a row may paint: the whole title, and its short form
+/// ([`RowSpec::title_short`]) where the row has one narrower than it.
+#[derive(Clone, Copy)]
+struct Titles<'t> {
+    full: &'t str,
+    short: Option<&'t str>,
+}
+
+impl<'t> Titles<'t> {
+    /// `spec`'s forms, its whole title `full` (an overflow row's words have
+    /// no short form).
+    fn of(spec: &RowSpec<'t>, full: &'t str, width: &dyn Fn(&str) -> usize) -> Self {
+        let short = spec
+            .title_short
+            .filter(|_| matches!(spec.kind, RowKind::Message(_) | RowKind::Echo(_)))
+            .filter(|s| !s.is_empty() && width(s) < width(full));
+        Self { full, short }
+    }
+}
+
+/// [`Head`] for `spec` within `budget`: its `titles`, `a` cells of activity
+/// and an excerpt reserved `ex` cells, the title never cut below
+/// [`TITLE_MIN`].
+///
+/// WHERE THE WHOLE TITLE CANNOT STAND even beside the short capsules, a row
+/// with a short title fits its head again around it from the top —
+/// `Details ›` where it fits, the capsules' long words — so the cells the
+/// whole title's other words took are not left blank (the review of the
+/// band, 2026-10-20: `Login expired · Finish signing in in your browser.`
+/// stood beside 17 blank cells and `Tab 1`, as a step's short form had in
+/// ox4-3). The short title is cut only where even its own head's short
+/// capsules leave it too few cells; a row with none elides its whole title.
+fn fit_head(
+    spec: &RowSpec<'_>,
+    titles: Titles<'_>,
+    budget: usize,
+    a: usize,
+    ex: usize,
+    width: &dyn Fn(&str) -> usize,
+) -> Head {
+    let head = head_around(spec, titles.full, budget, a, ex, width);
+    if head.fixed <= budget {
+        return head;
+    }
+    let (title, mut head) = match titles.short {
+        Some(short) => (short, head_around(spec, short, budget, a, ex, width)),
+        None => (titles.full, head),
     };
-    let full_title = overflow_title.as_deref().unwrap_or(spec.title);
-    let mut title = full_title.to_string();
-    let mut activity = spec.activity();
-    let action_excerpt = action_excerpt(spec, activity);
-    let mut a = activity.cells() + load_cells(spec, activity, width);
-    // An action excerpt's floor is part of the fixed head: the capsules'
-    // short forms and the title's elision pay for it before it drops.
-    let mut ex = excerpt_floor(spec, activity, width);
+    if head.fixed > budget {
+        head.title = elide(
+            title,
+            budget.saturating_sub(2 + a + ex + head.before + head.caps),
+            width,
+        );
+        head.fixed = 2 + width(&head.title) + a + ex + head.before + head.caps;
+    }
+    head
+}
+
+/// The head around `title` whole: the implicit `Details ›` dropped where
+/// that alone fits it in `budget`, else the capsules' short forms.
+fn head_around(
+    spec: &RowSpec<'_>,
+    title: &str,
+    budget: usize,
+    a: usize,
+    ex: usize,
+    width: &dyn Fn(&str) -> usize,
+) -> Head {
+    let title = title.to_string();
     let mut short = false;
     let mut caps = capsules_width(&spec.capsules, false, width);
     // The clearance before the first capsule exists for a capsule: a row
     // with none keeps the two cells for its excerpt.
     let mut before = clearance(&spec.capsules, false);
     let mut fixed = 2 + width(&title) + a + ex + before + caps;
-    // The extras' room is measured against the long capsules: the short
-    // forms and the elided title fit the head only, and the cells they free
-    // never re-buy an excerpt a wider row already gave up.
-    let room = budget.saturating_sub(fixed);
     let mut details_dropped = false;
     // The implicit `Details ›` goes first: the row body opens Details at
     // every width, so the link's cells are spent before an authored capsule
@@ -956,26 +1091,104 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         before = clearance(&spec.capsules, true);
         fixed = 2 + width(&title) + a + ex + before + caps;
     }
-    let elide = |title: &str, ex: usize| {
-        let allowed = budget
-            .saturating_sub(2 + a + ex + before + caps)
-            .max(TITLE_MIN);
-        if allowed < width(title) {
-            fit_width(title, allowed, width)
-        } else {
-            title.to_string()
-        }
-    };
-    if fixed > budget {
-        title = elide(&title, ex);
-        fixed = 2 + width(&title) + a + ex + before + caps;
+    Head {
+        title,
+        caps,
+        before,
+        short,
+        details_dropped,
+        fixed,
     }
+}
+
+/// `title` elided to the `allowed` cells, never below [`TITLE_MIN`].
+fn elide(title: &str, allowed: usize, width: &dyn Fn(&str) -> usize) -> String {
+    let allowed = allowed.max(TITLE_MIN);
+    if allowed < width(title) {
+        fit_width(title, allowed, width)
+    } else {
+        title.to_string()
+    }
+}
+
+/// Step 1: capsules long → short, then the title, then the degenerate step.
+fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> Fit {
+    let budget = cols.saturating_sub(2 * MARGIN);
+    let (overflow_title, glyph) = match spec.kind {
+        RowKind::Overflow { hidden } => {
+            let (words, glyph) = overflow_fit(hidden, spec.title, budget, width);
+            (Some(words), glyph)
+        }
+        RowKind::Message(_) | RowKind::Echo(_) => (None, spec.glyph),
+    };
+    let full_title = overflow_title.as_deref().unwrap_or(spec.title);
+    let titles = Titles::of(spec, full_title, width);
+    let mut activity = spec.activity();
+    let action_excerpt = action_excerpt(spec, activity);
+    let mut a = activity.cells() + load_cells(spec, activity, width);
+    // An action excerpt's floor is part of the fixed head: the capsules'
+    // short forms and the title's elision pay for it before it drops.
+    let mut ex = excerpt_floor(spec, activity, width);
+    // The extras' room is measured against the long capsules: the short
+    // forms and the elided title fit the head only, and the cells they free
+    // never re-buy an excerpt a wider row already gave up.
+    let room = budget.saturating_sub(
+        2 + width(full_title)
+            + a
+            + ex
+            + clearance(&spec.capsules, false)
+            + capsules_width(&spec.capsules, false, width),
+    );
+    let mut head = fit_head(spec, titles, budget, a, ex, width);
+    let mut words = ExcerptWords::Detail;
+    if head.fixed > budget && spec.step && ex > 3 + DETAIL_FLOOR {
+        // An ask's step that the title at its floor still cannot pay for
+        // whole gives way to its short form where it has one (a command is
+        // whole or replaced, never cut: the short form, a sentence, is what
+        // a narrower band cuts). The head is fitted again around the short
+        // form, so the cells the whole step would have taken are the row's
+        // again: the `Details ›` the short form sends the reader to where it
+        // fits, the capsules' long forms, the title's words (the review of
+        // the band, ox4-3: `Claude usag… · Run the command under Details.`
+        // stood beside 25 blank cells and no `Details ›`). A row with a short
+        // title keeps it there: the whole title went at a wider width, so it
+        // never comes back at a narrower one, and the short form's link to
+        // Details outranks its words.
+        if let Some(short) = spec.step_short {
+            words = ExcerptWords::Short;
+            ex = 3 + width(short);
+            let kept = Titles {
+                full: titles.short.unwrap_or(titles.full),
+                short: None,
+            };
+            head = fit_head(spec, kept, budget, a, ex, width);
+        }
+        // What still does not fit takes the cells left beside the title at
+        // its floor, cut, down to the excerpt's floor: the step outranks the
+        // rest of the title.
+        let left = budget.saturating_sub(2 + width(&head.title) + a + head.before + head.caps);
+        ex = left.max(3 + DETAIL_FLOOR).min(ex);
+        head.fixed = 2 + width(&head.title) + a + ex + head.before + head.caps;
+    }
+    let Head {
+        mut title,
+        mut caps,
+        before,
+        short,
+        mut details_dropped,
+        mut fixed,
+    } = head;
     if fixed > budget && ex > 0 {
         // Even the elided title cannot pay for the action excerpt: it goes
         // (for good: every narrower row is shorter still), and the title
-        // takes back what it can of the cells.
+        // takes back what it can of the cells — the short title's, where the
+        // row has one: the whole title went at a wider width.
         ex = 0;
-        title = elide(full_title, 0);
+        title = elide(
+            titles.short.unwrap_or(full_title),
+            budget.saturating_sub(2 + a + before + caps),
+            width,
+        );
         fixed = 2 + width(&title) + a + before + caps;
     }
     if fixed > budget {
@@ -1003,6 +1216,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         room,
         excerpt_floor: ex,
         action_excerpt,
+        words,
     }
 }
 
@@ -1044,7 +1258,19 @@ fn floor_clause(detail0: &str, width: &dyn Fn(&str) -> usize) -> Option<String> 
 /// no word past it: `behind for 26 h`, never `behind for 26 h:…`), else,
 /// under the floor where a cut would be a stub, its whole lead clause
 /// ([`floor_clause`]), else nothing.
-fn excerpt_cut(detail0: &str, cells: usize, width: &dyn Fn(&str) -> usize) -> Option<String> {
+///
+/// AN ASK'S STEP (`step`) IS AN INSTRUCTION, NOT A STATEMENT: its lead clause
+/// alone reads as the whole of what to do (`Sign in to main` of `Sign in to
+/// main: clear the draft, then type /login.`), so a cut of it always keeps
+/// its mark (`Sign in to main:…`), and it is never offered alone under the
+/// floor (the review of the band, ox4-8: the band showed a complete-looking
+/// sign-in step with the draft and `/login` gone).
+fn excerpt_cut(
+    detail0: &str,
+    cells: usize,
+    step: bool,
+    width: &dyn Fn(&str) -> usize,
+) -> Option<String> {
     if cells >= 3 + DETAIL_FLOOR
         && let Some(shaped) = shape_to_cells(detail0, cells - 3, width)
     {
@@ -1054,11 +1280,11 @@ fn excerpt_cut(detail0: &str, cells: usize, width: &dyn Fn(&str) -> usize) -> Op
             .trim_end_matches([':', '\u{00b7}'])
             .trim_end();
         return Some(match lead_clause(detail0) {
-            Some(lead) if said == lead => lead,
+            Some(lead) if said == lead && !step => lead,
             _ => shaped,
         });
     }
-    floor_clause(detail0, width).filter(|lead| 3 + width(lead) <= cells)
+    floor_clause(detail0, width).filter(|lead| !step && 3 + width(lead) <= cells)
 }
 
 /// What the extras won, in cells, before placement.
@@ -1172,7 +1398,8 @@ fn allocate_extras(
     let excerpt = if fit.action_excerpt {
         let own = if starved { 0 } else { room };
         room -= own;
-        spec.detail0
+        fit.words
+            .of(spec)
             .filter(|_| fit.excerpt_floor > 0)
             .map(|d| (d, own + fit.excerpt_floor))
     } else {
@@ -1186,7 +1413,7 @@ fn allocate_extras(
         if detail_whole {
             detail = Some(d.to_string());
             cells -= 3 + dw;
-        } else if let Some(cut) = excerpt_cut(d, cells, width) {
+        } else if let Some(cut) = excerpt_cut(d, cells, spec.step, width) {
             cells -= 3 + width(&cut);
             detail = Some(cut);
         }
@@ -1570,7 +1797,10 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{26a0}',
                     title: "aterm closed unexpectedly last time",
+                    title_short: None,
                     detail0: Some(CRASH_DETAIL),
+                    step: false,
+                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1588,7 +1818,10 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{2139}',
                     title: "File access not confirmed",
+                    title_short: None,
                     detail0: Some("Full Disk Access may already be enabled"),
+                    step: false,
+                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1613,7 +1846,10 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{2713}',
                     title: "aterm v0.91.0 is ready",
+                    title_short: None,
                     detail0: Some(STAGED_MANUAL),
+                    step: false,
+                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1631,7 +1867,10 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{2713}',
                     title: "aterm v0.91.0 is ready",
+                    title_short: None,
                     detail0: Some(STAGED_AUTO),
+                    step: false,
+                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1649,7 +1888,10 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{26a0}',
                     title: "3 keybindings in aterm.toml were skipped",
+                    title_short: None,
                     detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
+                    step: false,
+                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -1667,7 +1909,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
+                    title_short: None,
                     detail0: Some("trust \u{00b7} extracting"),
+                    step: false,
+                    step_short: None,
                     meter: Some((Some(420), "512 MB / 1.2 GB")),
                     animated: true,
                     busy: false,
@@ -1695,7 +1940,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21bb}',
                     title: "Downloading aterm v0.92.0",
+                    title_short: None,
                     detail0: None,
+                    step: false,
+                    step_short: None,
                     meter: Some((Some(420), "31 MB / 74 MB")),
                     animated: true,
                     busy: false,
@@ -1713,7 +1961,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
+                    title_short: None,
                     detail0: None,
+                    step: false,
+                    step_short: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
                     busy: false,
@@ -1733,7 +1984,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
+                    title_short: None,
                     detail0: None,
+                    step: false,
+                    step_short: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
                     busy: false,
@@ -1753,7 +2007,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing Command Line Tools and Homebrew",
+                    title_short: None,
                     detail0: Some("enter your password in the macOS dialog"),
+                    step: false,
+                    step_short: None,
                     meter: Some((None, "")),
                     animated: true,
                     busy: true,
@@ -1771,7 +2028,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{2191}',
                     title: "Finishing aterm v0.92.0",
+                    title_short: None,
                     detail0: Some("keys typed now arrive in a moment"),
+                    step: false,
+                    step_short: None,
                     meter: Some((None, "")),
                     animated: true,
                     busy: true,
@@ -1789,7 +2049,10 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{26a0}',
                     title: "ALab tools",
+                    title_short: None,
                     detail0: Some("trust \u{2014} extracting 120 MB / 900 MB"),
+                    step: false,
+                    step_short: None,
                     meter: Some((Some(430), "3 of 10")),
                     animated: false,
                     busy: false,
@@ -1830,7 +2093,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{26a0}',
                     title,
+                    title_short: None,
                     detail0: Some(detail0),
+                    step: false,
+                    step_short: None,
                     meter: None,
                     animated: false,
                     busy: false,
@@ -2282,7 +2548,10 @@ pub(crate) mod tests {
             live: true,
             glyph: '\u{21bb}',
             title: "Installing aterm v0.92.0",
+            title_short: None,
             detail0: Some("installs within a minute \u{2014} keep working"),
+            step: false,
+            step_short: None,
             meter: Some((None, "")),
             busy: true,
             animated: false,
@@ -2292,12 +2561,18 @@ pub(crate) mod tests {
             capsules: caps(&[]),
         };
         let with_stats = RowSpec {
+            title_short: None,
             detail0: Some("downloading"),
+            step: false,
+            step_short: None,
             meter: Some((None, "45 MB")),
             ..flow.clone()
         };
         let bare = RowSpec {
+            title_short: None,
             detail0: None,
+            step: false,
+            step_short: None,
             ..with_stats.clone()
         };
         for spec in [&flow, &with_stats, &bare] {
@@ -2427,7 +2702,10 @@ pub(crate) mod tests {
             live: false,
             glyph: '\u{2139}',
             title: "Installing",
+            title_short: None,
             detail0: Some(&detail),
+            step: false,
+            step_short: None,
             meter: None,
             animated: false,
             busy: false,
@@ -2474,7 +2752,10 @@ pub(crate) mod tests {
                 live: animated,
                 glyph: '\u{21e3}',
                 title: "Installing ALab tools",
+                title_short: None,
                 detail0: Some("trust \u{00b7} extracting 120 MB of 900 MB"),
+                step: false,
+                step_short: None,
                 meter: Some((fill, "")),
                 busy: false,
                 animated,
@@ -2590,7 +2871,10 @@ pub(crate) mod tests {
             live: true,
             glyph: '\u{2139}',
             title: "Building aterm and tools",
+            title_short: None,
             detail0: None,
+            step: false,
+            step_short: None,
             meter: Some((None, "3 of 10 targets")),
             animated: false,
             busy: true,
@@ -2632,7 +2916,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
+                    title_short: None,
                     detail0: None,
+                    step: false,
+                    step_short: None,
                     meter: Some((Some(420), "3 of 10 programs")),
                     animated: true,
                     busy: false,
@@ -2718,7 +3005,10 @@ pub(crate) mod tests {
             live: true,
             glyph: '\u{2193}',
             title: "Updating ALab tools",
+            title_short: None,
             detail0: None,
+            step: false,
+            step_short: None,
             meter: Some((Some(660), "1 of 2 programs")),
             animated: true,
             busy: false,
@@ -2781,7 +3071,10 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
+                    title_short: None,
                     detail0: None,
+                    step: false,
+                    step_short: None,
                     meter: Some((None, "10 programs \u{b7} ~3 GB")),
                     animated: false,
                     busy: true,

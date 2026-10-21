@@ -669,8 +669,8 @@ impl Terminal {
             // Scrolled-back row: its pictures live on the history line.
             //
             // Kitty Unicode placeholder cells are not resolved for a history row
-            // (as in the batch fill): `placeholder_image_ref` reads the live
-            // grid's `resolved_char`, which is not this row's.
+            // (as in the batch fill): `placeholder_image_ref` decodes a live
+            // screen cell, which is not this row's.
             push_history_images(grid, visible_row, out);
             // Stable: a cell's layers keep their draw order.
             out.sort_by_key(|&(col, _)| col);
@@ -692,7 +692,7 @@ impl Terminal {
             return;
         }
         // `placeholder_image_ref` begins with `kitty_images.get(&image_id)?`, so with no stored
-        // image it is `None` for every cell: skip its `resolved_char` probe.
+        // image it is `None` for every cell: skip its live-cell probe.
         let has_kitty = !self.transient.kitty_images.is_empty();
         for col in 0..grid.cols() {
             let Some(extra) = grid.cell_extra(screen_row, col) else {
@@ -724,7 +724,7 @@ impl Terminal {
     /// map: the allocating frame-level twin of
     /// [`images_row`](Self::images_row), with the same rows, column order and
     /// `ImageRef`s as calling it for every row. Used for off-frame
-    /// whole-screen reads (the control socket's styled frame); the windowed
+    /// whole-viewport reads (the control socket's `image read`); the windowed
     /// frontend uses [`cell_frame_into`](Self::cell_frame_into).
     #[must_use]
     pub fn images_frame(&self, rows: usize) -> Vec<Vec<(usize, aterm_grid::ImageRef)>> {
@@ -733,32 +733,59 @@ impl Terminal {
         images
     }
 
+    /// The live screen's inline-image placements, row `r` being live screen
+    /// row `r` whatever the viewport shows: [`images_frame`](Self::images_frame)
+    /// at a display offset of zero. Off-frame readers that describe the live
+    /// cells (the control socket's styled frame) take their pictures from
+    /// here, so a scrolled-back viewport cannot pair a live row's cells with
+    /// another row's images.
+    #[must_use]
+    pub fn live_images_frame(&self, rows: usize) -> Vec<Vec<(usize, aterm_grid::ImageRef)>> {
+        let mut images = Vec::new();
+        self.images_frame_of(&mut images, rows, ImageRows::Live);
+        images
+    }
+
     /// Batch equivalent of [`images_row_into`](Self::images_row_into) for every
-    /// row in `0..rows`, driven by one pass over the extras map instead of
-    /// `rows x cols` probes, so the cost is proportional to the extras present.
+    /// row in `0..rows` of the current viewport.
+    fn images_frame_into(&self, images: &mut Vec<Vec<(usize, aterm_grid::ImageRef)>>, rows: usize) {
+        self.images_frame_of(images, rows, ImageRows::Viewport);
+    }
+
+    /// The image placements of rows `0..rows` of `frame`, driven by one pass
+    /// over the extras map instead of `rows x cols` probes, so the cost is
+    /// proportional to the extras present.
     ///
-    /// Output matches the per-row accessor: entries outside the current grid
-    /// (stale after a shrink) are dropped, and each row is stably sorted by
-    /// column (map iteration order is arbitrary; each cell's layers stay
-    /// bottom first).
+    /// Output matches the per-row accessor read against that frame: entries
+    /// outside the current grid (stale after a shrink) are dropped, and each
+    /// row is stably sorted by column (map iteration order is arbitrary; each
+    /// cell's layers stay bottom first).
     ///
     /// The outer Vec is resized keeping existing inner Vecs, and each inner Vec
     /// is cleared in place so its capacity survives across frames.
-    fn images_frame_into(&self, images: &mut Vec<Vec<(usize, aterm_grid::ImageRef)>>, rows: usize) {
+    fn images_frame_of(
+        &self,
+        images: &mut Vec<Vec<(usize, aterm_grid::ImageRef)>>,
+        rows: usize,
+        frame: ImageRows,
+    ) {
         images.resize_with(rows, Vec::new);
         for row in images.iter_mut() {
             row.clear();
         }
         let grid = self.grid();
-        let offset = grid.display_offset();
-        // Scrolled-back rows first: viewport rows `0..display_offset` are
-        // history, whose pictures ride the history lines' image spans rather
-        // than the live extras map. Each row's materialization is memoized
+        let offset = match frame {
+            ImageRows::Viewport => grid.display_offset(),
+            ImageRows::Live => 0,
+        };
+        // Scrolled-back rows first: viewport rows `0..offset` are history,
+        // whose pictures ride the history lines' image spans rather than the
+        // live extras map. Each row's materialization is memoized
         // (`viewport_row_cache`).
         //
         // Kitty Unicode placeholder cells are not resolved here:
-        // `placeholder_image_ref` reads the live grid's `resolved_char`, not the
-        // history row's. Direct placements (OSC 1337, sixel) are restored.
+        // `placeholder_image_ref` decodes a live screen cell, not the history
+        // row's. Direct placements (OSC 1337, sixel) are restored.
         for (r, images_row) in images.iter_mut().enumerate().take(rows.min(offset)) {
             let Ok(visible_row) = u16::try_from(r) else {
                 break;
@@ -777,10 +804,10 @@ impl Terminal {
         }
         // `iter()` yields external coordinates with stale entries filtered;
         // clamp the screen row to the grid and the viewport row to `rows` (they
-        // differ during a resize and by `display_offset` while scrolled back).
+        // differ during a resize and by `offset` while scrolled back).
         let max_screen_row = usize::from(grid.rows());
-        // As in `images_row_into`: with no stored Kitty image the placeholder branch (a
-        // `resolved_char` probe per non-image extra: every hyperlink, combining mark and
+        // As in `images_row_into`: with no stored Kitty image the placeholder branch (a live
+        // row lookup + cell read per non-image extra: every hyperlink, combining mark and
         // underline colour on screen) is dead work.
         let has_kitty = !self.transient.kitty_images.is_empty();
         if !self.transient.kitty_floating.is_empty() {
@@ -796,7 +823,7 @@ impl Terminal {
             #[cfg(test)]
             image_probe_meter::charge();
             // The map is keyed by screen row; at a scrolled viewport a live row
-            // sits `display_offset` slots lower (identity at 0).
+            // sits `offset` slots lower (identity at 0 and on the live frame).
             let Some(r) = usize::from(coord.row).checked_add(offset) else {
                 continue;
             };
@@ -1633,6 +1660,17 @@ fn pack_rgb(c: aterm_types::Rgb) -> u32 {
     u32::from_be_bytes([0, c.r, c.g, c.b])
 }
 
+/// Which rows an image-placement fill describes.
+#[derive(Clone, Copy)]
+enum ImageRows {
+    /// The viewport: rows `0..display_offset` are history (read through the
+    /// grid's own viewport) and live screen row `s` is row `s + display_offset`.
+    Viewport,
+    /// The live screen: row `s` is live screen row `s`, whatever the viewport
+    /// shows.
+    Live,
+}
+
 /// A scrolled-back viewport row's direct image placements, in `extras_iter`
 /// order (callers sort), expanded from the history line's image spans. A
 /// no-op for a row that is not history.
@@ -2058,6 +2096,95 @@ mod tests {
         assert!(
             assert_images_parity(&term, usize::from(term.grid().rows()), "scrolled back") > 0,
             "the scrolled-back footprint is present in both readers"
+        );
+    }
+
+    /// The live reader keys its rows by live screen row whatever the viewport
+    /// shows. An OSC 1337 image on live row 3 and a Kitty Unicode placeholder
+    /// at live (4, 14), with the viewport scrolled back by 2, stay on rows 3
+    /// and 4 of `live_images_frame`, while `images_frame` and `images_row`, the
+    /// viewport readers, show them on rows 5 and 6 (the negative control: a
+    /// live reader that followed the viewport could not tell the two apart).
+    /// The placeholder is decoded off its live row: the viewport row 4 the
+    /// scroll brings over it is plain text, so a decode that followed the
+    /// viewport would drop it from every reader.
+    #[test]
+    fn live_images_frame_ignores_the_viewport() {
+        use super::super::kitty_placeholder::PLACEHOLDER;
+        let mut term = Terminal::new(8, 20);
+        term.set_cell_pixel_size(10, 20);
+        for i in 0..12 {
+            term.process(format!("h{i}\r\n").as_bytes());
+        }
+        let b64 = aterm_codec::base64::encode(b"not-a-real-png").expect("encode");
+        let mut seq = b"\x1b[4;1H\x1b]1337;File=inline=1;width=3;height=1:".to_vec();
+        seq.extend_from_slice(b64.as_bytes());
+        seq.extend_from_slice(b"\x1b\\");
+        term.process(&seq);
+        // A stored Kitty image (a=t, id 5) shown by a placeholder cell.
+        let raw = vec![0u8; 10 * 20 * 4];
+        let mut apc = b"\x1b_Ga=t,f=32,s=10,v=20,q=2,i=5;".to_vec();
+        apc.extend_from_slice(
+            aterm_codec::base64::encode(&raw)
+                .expect("encode")
+                .as_bytes(),
+        );
+        apc.extend_from_slice(b"\x1b\\");
+        term.process(&apc);
+        let mut ph = b"\x1b[5;15H\x1b[38;5;5m".to_vec();
+        let mut buf = [0u8; 4];
+        for c in [PLACEHOLDER, '\u{0305}', '\u{0305}'] {
+            ph.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+        ph.extend_from_slice(b"\x1b[0m");
+        term.process(&ph);
+        let rows = usize::from(term.grid().rows());
+        // Each placement as the (row, col) it lands on.
+        let placed = |frame: Vec<Vec<(usize, aterm_grid::ImageRef)>>| -> Vec<(usize, usize)> {
+            frame
+                .iter()
+                .enumerate()
+                .flat_map(|(r, row)| row.iter().map(move |&(c, _)| (r, c)))
+                .collect()
+        };
+        let live = placed(term.live_images_frame(rows));
+        assert_eq!(
+            live,
+            vec![(3, 0), (3, 1), (3, 2), (4, 14)],
+            "the premise: the image sits on live row 3 and the placeholder at live (4, 14)"
+        );
+        assert_eq!(
+            placed(term.images_frame(rows)),
+            live,
+            "at the live viewport the two readers agree"
+        );
+
+        term.scroll_display(2);
+        assert_eq!(
+            term.grid().display_offset(),
+            2,
+            "the premise: the viewport moved"
+        );
+        assert_ne!(
+            term.grid().resolved_char(4, 14),
+            Some(PLACEHOLDER),
+            "the premise: the viewport row over live row 4 holds no placeholder"
+        );
+        assert_eq!(
+            placed(term.live_images_frame(rows)),
+            live,
+            "the live frame does not follow the viewport"
+        );
+        let viewport = vec![(5, 0), (5, 1), (5, 2), (6, 14)];
+        assert_eq!(
+            placed(term.images_frame(rows)),
+            viewport,
+            "the viewport frame does"
+        );
+        assert_eq!(
+            placed((0..rows).map(|r| term.images_row(r)).collect()),
+            viewport,
+            "and so does the per-row viewport reader"
         );
     }
 

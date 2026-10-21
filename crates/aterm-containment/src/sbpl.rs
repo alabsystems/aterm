@@ -957,8 +957,9 @@ mod tests {
                 .ok()
                 .filter(|t| admitted_user_temp(t).is_some())
             else {
-                eprintln!("$TMPDIR is not a per-user /private/var/folders/…/T here");
-                return;
+                aterm_spec::host::could_not_run(
+                    "$TMPDIR is not a per-user /private/var/folders/…/T here",
+                );
             };
             let per_user = temp.parent().unwrap();
             for sibling in ["C", "0"] {
@@ -1108,23 +1109,23 @@ mod tests {
     #[test]
     fn secret_paths_are_canonicalized_not_raw() {
         // A home reached via /tmp canonicalizes to /private/tmp; the generator
-        // must emit the canonical prefix. Skipped if /tmp is not a symlink.
+        // must emit the canonical prefix. COULD NOT RUN where /tmp is not a symlink.
         let raw = std::path::Path::new("/tmp");
-        if let Ok(canon) = std::fs::canonicalize(raw) {
-            if canon != raw {
-                let profile = profile_for_home(raw.to_str(), None, FsCapability::TmpOnly);
-                let canon_marker = format!("(subpath \"{}/.ssh\")", canon.display());
-                let raw_marker = "(subpath \"/tmp/.ssh\")";
-                assert!(
-                    profile.contains(&canon_marker),
-                    "must emit CANONICAL secret path {canon_marker}; got {profile}"
-                );
-                assert!(
-                    !profile.contains(raw_marker),
-                    "must NOT emit the non-canonical raw path (Seatbelt would not match it); got {profile}"
-                );
-            }
+        let canon = std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf());
+        if canon == raw {
+            aterm_spec::host::could_not_run("/tmp is no symlink here to canonicalize");
         }
+        let profile = profile_for_home(raw.to_str(), None, FsCapability::TmpOnly);
+        let canon_marker = format!("(subpath \"{}/.ssh\")", canon.display());
+        let raw_marker = "(subpath \"/tmp/.ssh\")";
+        assert!(
+            profile.contains(&canon_marker),
+            "must emit CANONICAL secret path {canon_marker}; got {profile}"
+        );
+        assert!(
+            !profile.contains(raw_marker),
+            "must NOT emit the non-canonical raw path (Seatbelt would not match it); got {profile}"
+        );
     }
 
     #[cfg(unix)]

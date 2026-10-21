@@ -208,6 +208,53 @@ fn a_multiline_or_tabbed_paste_is_an_insert_of_unknown_width() {
     assert_eq!(spawns, 0, "…and an echo past the cap is not");
 }
 
+/// One line and the one line break after it (a link copied with its line
+/// ending) is priced as the line, `InsertWidth::Line`, whichever break ends it;
+/// a bare break, two breaks or a break inside the body stay the unknown class
+/// (`a_line_pasted_with_its_line_break_lays_the_line_on_its_own_row` in
+/// aterm-effects judges the break's own echo).
+#[test]
+fn a_line_and_its_line_break_is_priced_as_the_line() {
+    let url = "https://claude.ai/artifact/XB78QX8U9sp935PNjq8FpB";
+    for end in ["\n", "\r\n", "\r"] {
+        assert_eq!(
+            super::paste_insert_width(&format!("{url}{end}"), false),
+            InsertWidth::Line(49),
+            "{end:?}"
+        );
+    }
+    assert_eq!(
+        super::paste_insert_width(url, false),
+        InsertWidth::Cells(49)
+    );
+    for text in [
+        "\n",
+        "\r\n",
+        "a\n\n",
+        "a\nb",
+        "a\nb\n",
+        "a\tb\n",
+        "\u{0301}\n",
+    ] {
+        assert_eq!(
+            super::paste_insert_width(text, false),
+            InsertWidth::Unknown,
+            "{text:?}"
+        );
+    }
+}
+
+/// The line's same-row echo through the real paste lane (a host that swallowed
+/// the break): the FIFO writer's receipt carries `Line(n)`, and the hop of the
+/// line's width is the insert's.
+#[cfg(unix)]
+#[test]
+fn a_line_pasted_with_its_line_break_rides_the_receipt_as_the_line() {
+    let (spawns, licence, width) = delivered_paste_then_hop("check this\n", 10, true);
+    assert_eq!(width, Some(InsertWidth::Line(10)));
+    assert_eq!((spawns, licence), (1, "insert"));
+}
+
 /// A queued key's receipt re-stamps only the window that typed it: the dispatch
 /// banks the press credit on the dispatching window's engine alone, so the
 /// ticket's typed half names that window and is applied there only; window B,
@@ -293,15 +340,11 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                 app.windows[&wid_a].fx.cursor().glow.move_licensed(now),
                 "{style} queued={queued}: window A holds the key's licence"
             );
-            if style == "comet" {
-                // The trail's typed twin, re-stamped at delivery on the
-                // dispatching window (its tick is disabled under rainbow
-                // kitty, where it clears its hints every frame).
-                assert!(
-                    app.windows[&wid_a].fx.cursor().trail.move_licensed(now),
-                    "{style} queued={queued}: window A's classic trail holds the key's typed twin"
-                );
-            }
+            // The cadence comet's typed twin is not read here: a native
+            // window runs no cadence comet under any presentation (the
+            // comet's tail is its streak, `comet_tail_is_its_streak`; the
+            // rainbow kitty never ran one), and its disabled tick clears its
+            // hints every frame. The streak's licence above is the witness.
             // The one-shot classes are the dispatching window's too: an
             // Enter typed in A behind a paste re-licenses A, never B.
             let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));

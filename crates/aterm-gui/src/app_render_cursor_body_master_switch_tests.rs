@@ -155,7 +155,7 @@ fn a_master_off_window_typed_into_fast_lights_no_momentum_glow() {
 #[test]
 fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
     let t0 = Instant::now();
-    let before = crate::metrics::snapshot().fx_under_frames;
+    let before = crate::metrics::METRICS.window.redraw.fx_under_frames.get();
     let (app, wid, _) = ribbon_witness_take("rainbow kitty", t0);
     let window = &app.windows[&wid];
     assert!(
@@ -163,7 +163,7 @@ fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
         "fixture: the rainbow kitty band is on the frame"
     );
     assert!(
-        crate::metrics::snapshot().fx_under_frames > before,
+        crate::metrics::METRICS.window.redraw.fx_under_frames.get() > before,
         "a tick that composed the band books an under frame"
     );
 

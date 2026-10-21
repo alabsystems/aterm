@@ -13,12 +13,17 @@
 //! encode session commits (Submit A, Submit B, inline staging copies) hangs an
 //! `addCompletedHandler:` that reads `-[MTLCommandBuffer GPUStartTime]` and
 //! `GPUEndTime`; wgpu timestamps each timed render pass. The frame's GPU
-//! time is the SUM of its parts' spans: work on
-//! one queue executes in commit order, so the sum is device busy time and
-//! leaves out the idle gaps a first-start-to-last-end span would count. The
-//! presentation-only command buffer (`presentDrawable:`) carries no draws and
-//! is not a part. GL reports nothing: it has no completion clock that does not
-//! stall the context.
+//! time is the SUM of its parts' spans: a frame's Metal command buffers share
+//! its textures, so the device runs them one after another in commit order
+//! (measured: Submit B starts after Submit A ends), and the sum is device busy
+//! time without the idle gaps a first-start-to-last-end span would count. A
+//! wgpu readback reports its passes as one held part counting one part per
+//! pass ([`FrameToken::complete_parts`]) whose span is the UNION of their
+//! intervals: a tiled GPU starts a pass's vertex work under the previous
+//! pass's fragment work, so the passes overlap and their sum would count the
+//! overlap twice (`crate::wgpu_timer`). The presentation-only command buffer
+//! (`presentDrawable:`) carries no draws and is not a part. GL reports
+//! nothing: it has no completion clock that does not stall the context.
 //!
 //! # Zero cost at rest, no wait on the present path
 //!
@@ -127,8 +132,11 @@ impl Slot {
 /// instances of the same ring so eviction never crosses fixture boundaries.
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 #[derive(Debug)]
-struct FrameRing {
+pub(crate) struct FrameRing {
     sink: OnceLock<GpuTimeSink>,
+    /// [`set_paused`]: open no frame, as with no sink (a development seam).
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    paused: AtomicBool,
     next_serial: AtomicU64,
     delivered: AtomicU64,
     dropped: AtomicU64,
@@ -141,6 +149,8 @@ impl FrameRing {
     const fn new() -> Self {
         Self {
             sink: OnceLock::new(),
+            #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+            paused: AtomicBool::new(false),
             next_serial: AtomicU64::new(1),
             delivered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -152,6 +162,33 @@ impl FrameRing {
     fn slot(&self, serial: u64) -> &Slot {
         &self.slots[usize::try_from(serial % RING as u64).unwrap_or(0)]
     }
+
+    /// A present found no room to time it outside the ring (every wgpu
+    /// readback slot still in flight): counted with the ring's own skips.
+    #[cfg(wgpu_arm)]
+    pub(crate) fn note_skipped(&self) {
+        #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+        if self.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A test's own ring, listening (a no-op sink), so frames open.
+    #[cfg(test)]
+    pub(crate) fn listening() -> Self {
+        fn sink(_: GpuFrameTime) {}
+        let ring = Self::new();
+        assert!(ring.sink.set(sink).is_ok());
+        ring
+    }
+}
+
+/// The process's ring, for an arm that opens frames through its own
+/// readback machinery (`crate::wgpu_timer`).
+#[cfg(wgpu_arm)]
+pub(crate) fn frames() -> &'static FrameRing {
+    &FRAMES
 }
 
 /// Install the process's one sink. First install wins; `false` when a sink was
@@ -166,6 +203,19 @@ pub fn install_sink(sink: GpuTimeSink) -> bool {
         let _ = sink;
         false
     }
+}
+
+/// Pause the clock (a development seam a shipped binary never has): while
+/// paused a present opens no frame, exactly as with no sink, so it registers
+/// no completion handler, opens no readback and counts nothing. The effects
+/// harness prices the clock with it: the same frame presented timed and
+/// paused.
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+pub fn set_paused(paused: bool) {
+    #[cfg(any(target_os = "macos", wgpu_arm, test))]
+    FRAMES.paused.store(paused, Ordering::Relaxed);
+    #[cfg(not(any(target_os = "macos", wgpu_arm, test)))]
+    let _ = paused;
 }
 
 /// Whether a sink is installed — presents open frames only then.
@@ -220,12 +270,6 @@ pub fn skipped() -> u64 {
     }
 }
 
-/// A wgpu present found every readback slot occupied.
-#[cfg(wgpu_arm)]
-pub(crate) fn note_skipped() {
-    FRAMES.skipped.fetch_add(1, Ordering::Relaxed);
-}
-
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 /// One open frame: the handle every part of it reports through. `Copy` so a
 /// completion handler can capture it without allocating.
@@ -235,17 +279,22 @@ pub(crate) struct FrameToken<'a> {
     ring: &'a FrameRing,
 }
 
-#[cfg(any(target_os = "macos", wgpu_arm))]
+#[cfg(target_os = "macos")]
 /// Open a frame for the present about to run, or `None` when nothing listens
-/// (no sink: zero cost at rest) or its ring slot is still in flight.
+/// (no sink: zero cost at rest) or its ring slot is still in flight. Metal's
+/// encoder asks it; the wgpu timer opens frames on its own ring.
 pub(crate) fn open_frame() -> Option<FrameToken<'static>> {
     FRAMES.open_frame()
 }
 
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 impl FrameRing {
-    fn open_frame(&self) -> Option<FrameToken<'_>> {
+    pub(crate) fn open_frame(&self) -> Option<FrameToken<'_>> {
         self.sink.get()?;
+        #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+        if self.paused.load(Ordering::Relaxed) {
+            return None;
+        }
         let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
         let s = self.slot(serial);
         if s.pending
@@ -286,6 +335,13 @@ impl FrameToken<'_> {
     /// A held part finished: `Some(ns)` is its GPU span, `None` a failure or
     /// a missing clock (the frame is then dropped), as is an overflowing sum.
     pub(crate) fn complete(self, span_ns: Option<u64>) {
+        self.complete_parts(span_ns, 1);
+    }
+
+    /// A held part that timed `parts` pieces of the frame's work as one span
+    /// finished (a wgpu readback: the union of its passes' intervals), so the
+    /// frame counts `parts` parts for it. As [`Self::complete`] otherwise.
+    pub(crate) fn complete_parts(self, span_ns: Option<u64>, parts: u32) {
         let s = self.ring.slot(self.serial);
         match span_ns {
             Some(ns) => {
@@ -297,7 +353,7 @@ impl FrameToken<'_> {
                 {
                     s.failed.store(true, Ordering::SeqCst);
                 }
-                s.parts.fetch_add(1, Ordering::SeqCst);
+                s.parts.fetch_add(parts, Ordering::SeqCst);
             }
             None => s.failed.store(true, Ordering::SeqCst),
         }
@@ -386,7 +442,7 @@ pub fn settled(serial: u64) -> Option<Settled> {
 
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 impl FrameRing {
-    fn settled(&self, serial: u64) -> Option<Settled> {
+    pub(crate) fn settled(&self, serial: u64) -> Option<Settled> {
         if serial == 0 {
             return None;
         }
@@ -437,10 +493,7 @@ mod tests {
     use super::{FrameRing, Settled, span_ns};
 
     fn listening() -> FrameRing {
-        fn sink(_: super::GpuFrameTime) {}
-        let ring = FrameRing::new();
-        assert!(ring.sink.set(sink).is_ok());
-        ring
+        FrameRing::listening()
     }
 
     /// A zero, non-finite or reversed reading is no clock; a real one is its
@@ -566,6 +619,22 @@ mod tests {
             ring.settled(held.serial()),
             Some(Settled::Timed(t)) if t.gpu_ns == 7
         ));
+    }
+
+    /// A paused ring opens nothing and counts nothing; resumed, it times again.
+    #[test]
+    fn a_paused_clock_opens_no_frame() {
+        let ring = listening();
+        ring.paused.store(true, super::Ordering::Relaxed);
+        let skipped = ring.skipped.load(super::Ordering::Relaxed);
+        #[cfg(wgpu_arm)]
+        ring.note_skipped();
+        assert!(ring.open_frame().is_none(), "a paused clock opens no frame");
+        assert_eq!(ring.skipped.load(super::Ordering::Relaxed), skipped);
+        ring.paused.store(false, super::Ordering::Relaxed);
+        let f = ring.open_frame().expect("resumed, it times again");
+        f.seal();
+        assert_eq!(ring.settled(f.serial()), Some(Settled::Untimed));
     }
 
     /// Serial 0 and serials never opened read as nothing.

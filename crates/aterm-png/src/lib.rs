@@ -48,7 +48,10 @@
 //!
 //! Encoding covers what aterm writes: 8-bit Grayscale/RGB/RGBA/Indexed with
 //! optional `PLTE`/`tRNS`/`sRGB`. See [`deflate`] for the compressor's
-//! deliberate ratio trade.
+//! deliberate ratio trade. It streams: [`Writer::write_rows`] takes one
+//! scanline at a time and writes `IDAT` chunks as the compressor fills them,
+//! so an encode holds its input, its output (at most [`max_encoded_len`]) and
+//! [`encoder_scratch_len`] — never a filtered or compressed copy of the image.
 //!
 //! ## Tests
 //!
@@ -64,7 +67,7 @@ mod encode;
 mod rgba;
 
 pub use decode::{Decoder, Reader};
-pub use encode::{Encoder, Writer};
+pub use encode::{Encoder, Writer, encoder_scratch_len, max_encoded_len};
 pub use rgba::decode_rgba8;
 
 /// How samples are laid out per pixel. The discriminants are PNG's own IHDR
@@ -373,7 +376,9 @@ pub enum EncodingError {
     /// colour-type/bit-depth pair the format forbids, an indexed image with no
     /// palette, …).
     Parameter(&'static str),
-    /// The pixel buffer's length does not match the declared geometry.
+    /// The pixel buffer's length does not match the declared geometry: the
+    /// whole image's ([`Writer::write_image_data`]) or one row's
+    /// ([`Writer::write_rows`]).
     WrongDataSize {
         /// Bytes the geometry requires.
         expected: usize,

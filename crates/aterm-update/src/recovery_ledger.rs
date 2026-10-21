@@ -307,7 +307,7 @@ impl LaunchKind {
 
 /// How a launch's keeper recovery brought its screens back (the crash restore,
 /// `aterm-gui`'s `crash_restore`), with the same fields `status` reports for each recovered
-/// session, summed: written only by a launch that recovered at least one session, so the
+/// session, summed: written only by a launch a keeper offered at least one session, so the
 /// ledger answers whether real kills restore exactly and, when they do not, what was lost.
 /// The crash-restore plan starts its follow-up work only when the ledger shows the loss it
 /// would close (a gather-stage tail when `in_flight_lost` is common, a disk tier when
@@ -329,6 +329,14 @@ impl LaunchKind {
 /// * `restore_history=<lines>:<sessions>`: the scrollback lines the restores could not bring
 ///   back (each session's first `status history_lost=`), and how many sessions lost any —
 ///   the loss a disk tier for the history would close.
+///
+/// And a fifth since the soak gate (`crate::restore_soak`), optional the same way and written
+/// only when it is not 0:
+///
+/// * `restore_refused=<n>`: the sessions a keeper offered that this launch refused and released
+///   (a tag it cannot read, no session id, a reused pid, a descriptor that is not a tty), so
+///   the keeper closed them: lost, and on no rung. A recovery that refused every offer writes
+///   `restored=0:0:0` beside it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Restores {
     /// Sessions whose screen came back exactly.
@@ -351,9 +359,19 @@ pub struct Restores {
     pub history_short: u32,
     /// How many sessions each `restore_why` word named, by word (no `-`).
     pub whys: Vec<(String, u32)>,
+    /// Sessions a keeper offered that the launch refused and released: lost, on no rung.
+    pub refused: u32,
 }
 
 impl Restores {
+    /// The sessions the recovery admitted, on any rung (the refused ones are not).
+    #[must_use]
+    pub fn recovered(&self) -> u32 {
+        self.exact
+            .saturating_add(self.screen)
+            .saturating_add(self.meta)
+    }
+
     fn token(&self) -> String {
         format!("{}:{}:{}", self.exact, self.screen, self.meta)
     }
@@ -432,6 +450,64 @@ impl Restores {
     }
 }
 
+/// Whether the launch that wrote a row kept its terminals with a PTY keeper (`keeper=`):
+/// the state of its keeper link (`aterm-gui`'s `keeper_link`) when the row was written.
+/// The crash restore's soak ([`crate::restore_soak`]) reads it, because a ledger of
+/// recoveries alone cannot tell a run with no keeper from one whose keeper took its
+/// terminals and then failed to give them back, nor say how long the keeper has been on.
+/// Optional on the row like [`Restores`]: an older row has none and still parses, and a
+/// word this build cannot read refuses the row rather than misread it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeeperAtLaunch {
+    /// The link is off: `[keeper] enabled` is absent or false, or the build has no code
+    /// identity to check a keeper by (it fails closed). Nothing was registered.
+    #[default]
+    Off,
+    /// The link is on and no keeper answered the boot HELLO (none running, or one that
+    /// is not this build's): terminals are registered once one answers. The link polls
+    /// (`aterm_keeper::client::LINK_POLL`, backing off to 5 s), so a keeper started
+    /// while the run lives (`aterm keeper start` in one of its tabs) holds every terminal
+    /// within seconds: such a run's kill is one its keeper held.
+    Absent,
+    /// The link is on and a keeper answered the boot HELLO: every terminal is registered
+    /// with it.
+    On,
+    /// The link is on, in an update's successor, which says no boot HELLO and registers
+    /// what it adopted at its Commit, with whichever keeper answers then.
+    Armed,
+}
+
+impl KeeperAtLaunch {
+    /// The row word (`off`, `absent`, `on`, `armed`).
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Absent => "absent",
+            Self::On => "on",
+            Self::Armed => "armed",
+        }
+    }
+
+    /// The inverse of [`Self::token`].
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        Some(match token {
+            "off" => Self::Off,
+            "absent" => Self::Absent,
+            "on" => Self::On,
+            "armed" => Self::Armed,
+            _ => return None,
+        })
+    }
+
+    /// Whether the link was on (whatever answered it).
+    #[must_use]
+    pub fn link_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// One ledger row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
@@ -454,6 +530,9 @@ pub struct Row {
     pub launch: LaunchKind,
     /// The run before it.
     pub prev: PrevRun,
+    /// The launch's keeper link ([`KeeperAtLaunch`]); `None` on a row an older build
+    /// wrote.
+    pub keeper: Option<KeeperAtLaunch>,
     /// How this launch's keeper recovery brought its screens back, when it recovered
     /// any ([`Restores`]).
     pub restores: Option<Restores>,
@@ -512,9 +591,17 @@ impl Row {
         let started_us = self
             .started_us
             .map_or_else(String::new, |us| format!(" started_us={us}"));
+        let keeper = self
+            .keeper
+            .map_or_else(String::new, |k| format!(" keeper={}", k.token()));
         let restored = self.restores.as_ref().map_or_else(String::new, |r| {
+            let refused = if r.refused == 0 {
+                String::new()
+            } else {
+                format!(" restore_refused={}", r.refused)
+            };
             format!(
-                " restored={} restore_lost={} restore_why={} restore_history={}",
+                " restored={} restore_lost={} restore_why={} restore_history={}{refused}",
                 r.token(),
                 r.lost_token(),
                 r.why_token(),
@@ -524,7 +611,7 @@ impl Row {
         format!(
             "v={ROW_VERSION} at={} pid={} started={}{started_us} build={} version={} launch={} \
              prev={} prev_pid={} prev_build={} prev_version={} prev_uptime={uptime} \
-             prev_stall={} prev_pressure={} prev_trial={}{restored}",
+             prev_stall={} prev_pressure={} prev_trial={}{keeper}{restored}",
             self.at,
             self.pid,
             self.started,
@@ -593,6 +680,11 @@ impl Row {
                 trial: get("prev_trial")?.parse().ok()?,
             },
             // Optional (an older row has none); one this build cannot read refuses the row.
+            keeper: match get("keeper") {
+                None => None,
+                Some(token) => Some(KeeperAtLaunch::parse(token)?),
+            },
+            // Optional (an older row has none); one this build cannot read refuses the row.
             restores: match get("restored") {
                 None => None,
                 Some(token) => {
@@ -605,6 +697,9 @@ impl Row {
                     }
                     if let Some(history) = get("restore_history") {
                         restores.parse_history(history)?;
+                    }
+                    if let Some(refused) = get("restore_refused") {
+                        restores.refused = refused.parse().ok()?;
                     }
                     Some(restores)
                 }
@@ -942,8 +1037,44 @@ mod tests {
             version: "0.93.0".into(),
             launch: LaunchKind::Cold,
             prev,
+            keeper: None,
             restores: None,
         }
+    }
+
+    /// A launch records its keeper link (`keeper=`) before any restores; a row without it
+    /// (every older row) still parses, and a word this build cannot read refuses the row.
+    #[test]
+    fn a_launch_s_keeper_link_rides_the_row() {
+        for keeper in [
+            KeeperAtLaunch::Off,
+            KeeperAtLaunch::Absent,
+            KeeperAtLaunch::On,
+            KeeperAtLaunch::Armed,
+        ] {
+            let mut r = row(1_790_500_000, 88, prev(EndClass::Killed));
+            r.keeper = Some(keeper);
+            r.restores = Some(Restores {
+                exact: 1,
+                ..Restores::default()
+            });
+            let line = r.to_line();
+            let word = format!(" keeper={} restored=1:0:0", keeper.token());
+            assert!(line.contains(&word), "{line}");
+            assert_eq!(Row::parse(&line), Some(r.clone()), "{line}");
+            assert_eq!(KeeperAtLaunch::parse(keeper.token()), Some(keeper));
+            let older = line.replace(&format!(" keeper={}", keeper.token()), "");
+            assert_eq!(
+                Row::parse(&older).map(|row| row.keeper),
+                Some(None),
+                "an older row"
+            );
+            let unknown = line.replace(&format!("keeper={}", keeper.token()), "keeper=maybe");
+            assert_eq!(Row::parse(&unknown), None, "{unknown}");
+        }
+        assert!(!KeeperAtLaunch::Off.link_on());
+        assert!(KeeperAtLaunch::Absent.link_on());
+        assert!(KeeperAtLaunch::Armed.link_on());
     }
 
     fn prev(class: EndClass) -> PrevRun {
@@ -1046,6 +1177,7 @@ mod tests {
                 ("no-region".into(), 1),
                 ("tail-overflow".into(), 1),
             ],
+            refused: 0,
         });
         let line = r.to_line();
         let tokens = " restored=3:2:1 restore_lost=4096:1:2:0 \
@@ -1125,6 +1257,48 @@ mod tests {
             assert_ne!(bad_line, line, "{key}={bad}");
             assert_eq!(Row::parse(&bad_line), None, "{bad_line}");
         }
+    }
+
+    /// The sessions a keeper offered and the launch refused ride the row
+    /// (`restore_refused=`), a recovery that refused every offer included; a row without the
+    /// word (every older row, and one that refused none) reads 0, and one this build cannot
+    /// read refuses the row.
+    #[test]
+    fn a_recovery_s_refusals_ride_the_row() {
+        let mut r = row(1_790_500_000, 77, prev(EndClass::Killed));
+        r.restores = Some(Restores {
+            exact: 3,
+            refused: 1,
+            ..Restores::default()
+        });
+        let line = r.to_line();
+        assert!(
+            line.ends_with(" restored=3:0:0 restore_lost=0:0:0:0 restore_why=- restore_history=0:0 restore_refused=1"),
+            "{line}"
+        );
+        assert_eq!(Row::parse(&line), Some(r.clone()));
+        assert_eq!(r.restores.as_ref().map(Restores::recovered), Some(3));
+
+        let mut all_refused = r.clone();
+        all_refused.restores = Some(Restores {
+            refused: 4,
+            ..Restores::default()
+        });
+        let all_line = all_refused.to_line();
+        assert!(all_line.contains(" restored=0:0:0 "), "{all_line}");
+        assert_eq!(Row::parse(&all_line), Some(all_refused));
+
+        let older = line.replace(" restore_refused=1", "");
+        assert_eq!(
+            Row::parse(&older).and_then(|row| row.restores),
+            Some(Restores {
+                exact: 3,
+                ..Restores::default()
+            }),
+            "a row from before the word"
+        );
+        let bad = line.replace("restore_refused=1", "restore_refused=x");
+        assert_eq!(Row::parse(&bad), None, "{bad}");
     }
 
     #[test]

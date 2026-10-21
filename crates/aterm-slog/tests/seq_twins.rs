@@ -306,10 +306,11 @@ pub const TURN_TWINS: &[Twin] = &[
 use crate::transcript_replays as xr;
 
 /// The hand sequences of `transcript_replays.rs` the corpus holds, against
-/// its files. Not held, and why: `a_turn_end_closes_the_turn_and_then_amends_its_numbers`
-/// (it writes a mail mark into the log by hand, no host call),
-/// `a_closed_run_takes_no_transcript_row` (the run's close, no host call),
-/// `the_worst_tracker_line_fits_a_carry_line` (no sequence; kept, T5).
+/// its files. Not held, and why: `the_worst_tracker_line_fits_a_carry_line`
+/// (no sequence: one carry line read and written back, no rig; kept, T5).
+/// The mail mark one writes by hand and the run's close another makes are
+/// the corpus's `turn-mail` and `close-run` (6A-6): records of the log
+/// alone, no host call on either path.
 pub const TX_TWINS: &[Twin] = &[
     Twin {
         name: "a_prompt_confirms_the_screens_turn_in_its_window",
@@ -533,6 +534,18 @@ pub const TX_TWINS: &[Twin] = &[
         tail: None,
     },
     Twin {
+        name: "a_turn_end_closes_the_turn_and_then_amends_its_numbers",
+        rust: xr::a_turn_end_closes_the_turn_and_then_amends_its_numbers,
+        files: &["tx-twin-a-turn-end-closes-the-turn-and-amends.seq"],
+        tail: None,
+    },
+    Twin {
+        name: "a_closed_run_takes_no_transcript_row",
+        rust: xr::a_closed_run_takes_no_transcript_row,
+        files: &["tx-twin-a-closed-run-takes-no-row.seq"],
+        tail: None,
+    },
+    Twin {
         name: "the_carry_keeps_the_join_and_the_successor_rebuilds_its_steps",
         rust: xr::the_carry_keeps_the_join_and_the_successor_rebuilds_its_steps,
         files: &["tx-twin-the-carry-keeps-the-join.seq"],
@@ -542,14 +555,15 @@ pub const TX_TWINS: &[Twin] = &[
 
 /// Every ported hand sequence takes its Rust twin's path, step for step,
 /// and ends in its window: every `turn_replays` sequence (14 tests, 15
-/// rigs) and 33 of `transcript_replays`' 36 tests (44 rigs).
+/// rigs) and 35 of `transcript_replays`' 36 tests (46 rigs; the 36th is no
+/// sequence).
 #[test]
 fn each_ported_sequence_folds_as_its_rust_twin() {
     let all = corpus();
     let screen = check_twins(TURN_TWINS, &all).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!((TURN_TWINS.len(), screen.len()), (14, 15), "{screen:?}");
     let tx = check_twins(TX_TWINS, &all).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!((TX_TWINS.len(), tx.len()), (33, 44), "{tx:?}");
+    assert_eq!((TX_TWINS.len(), tx.len()), (35, 46), "{tx:?}");
     for f in screen.iter().chain(&tx) {
         let seq = all.iter().find(|s| s.name == *f).expect("held");
         let rig = if f.starts_with("tx-") {
@@ -563,7 +577,8 @@ fn each_ported_sequence_folds_as_its_rust_twin() {
 
 /// NEGATIVE CONTROLS: a ported file with one step altered, or its last
 /// step dropped, no longer takes its twin's path; nor does a file against
-/// another test's twin.
+/// another test's twin; nor a file ported through a log-only line (6A-6)
+/// with that line gone.
 #[test]
 fn an_altered_step_fails_its_twin() {
     use crate::seq_replay::Ev;
@@ -632,6 +647,50 @@ fn an_altered_step_fails_its_twin() {
         seq_path(&moved).and_then(|p| same(&p, &txr, true)).is_err(),
         "a row read at another time"
     );
+    // 6A-6: the twins ported through a log-only line (`turn-mail`,
+    // `close-run`). With that line gone (its file's expects with it, so
+    // only the twin judges), or with the last step dropped, the file no
+    // longer takes its twin's path.
+    for name in [
+        "a_turn_end_closes_the_turn_and_then_amends_its_numbers",
+        "a_closed_run_takes_no_transcript_row",
+    ] {
+        let twin = TX_TWINS.iter().find(|t| t.name == name).expect("the twin");
+        let [rust] = <[Path; 1]>::try_from(record(twin.rust)).expect("one rig");
+        let seq = all
+            .iter()
+            .find(|s| s.name == twin.files[0])
+            .expect("its file");
+        same(&seq_path(seq).expect("replays"), &rust, true).expect("the shipping twin");
+        let log_only = |ev: &Ev| matches!(ev, Ev::TurnMail | Ev::CloseRun(_));
+        assert_eq!(
+            seq.lines.iter().filter(|l| log_only(&l.ev)).count(),
+            1,
+            "{name}: one log-only line"
+        );
+        let mut without = seq.clone();
+        without
+            .lines
+            .retain(|l| !log_only(&l.ev) && !matches!(l.ev, Ev::Expect(_)));
+        let path = seq_path(&without).expect("replays without it");
+        assert!(
+            same(&path, &rust, true).is_err(),
+            "{name} without its log-only line"
+        );
+        let mut short = seq.clone();
+        let i = short
+            .lines
+            .iter()
+            .rposition(|l| !matches!(l.ev, Ev::Expect(_) | Ev::Nothing))
+            .expect("a step");
+        short.lines.truncate(i);
+        assert!(
+            seq_path(&short)
+                .and_then(|p| same(&p, &rust, true))
+                .is_err(),
+            "{name}: its last step dropped"
+        );
+    }
     // Paths recorded with nothing on them are no twins.
     let empty = Path {
         steps: Vec::new(),

@@ -1,23 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor's persistent transport: [`RelayCtl`], the [`Ctl`] seam over one persistent
-//! control connection ([`RelayClient`] underneath). The other [`Ctl`] is the
-//! `aterm-ctl`-per-request [`crate::CtlClient`].
+//! The supervisor's persistent transport: [`RelayCtl`], the [`Ctl`] seam over
+//! persistent control connections (a [`RelayClient`] on each). The other
+//! [`Ctl`] is the `aterm-ctl`-per-request [`crate::CtlClient`].
 //!
-//! A held socket avoids forking `aterm` per request, and an in-GUI host has no binary to fork.
-//! [`RelayCtl`] renders every reply as `aterm-ctl` prints it
-//! ([`aterm_types::control_verbs::framing_of`], `ERR …` on stderr at exit 1, timeouts at exit
-//! 124, counted rows on stdout), so every judgment in the loop ([`CtlReply::lost`], `timed_out`,
-//! `unknown_form`, `skipped`) reads the same either way. A lost connection is reported in
-//! `aterm-ctl`'s words, and the next request dials again, re-resolving the socket when none was
-//! named (following the `latest` alias after a self-update's handoff).
+//! A held socket avoids forking the `aterm` binary per request, and an in-GUI
+//! host has no binary to fork. [`RelayCtl`] renders every reply as `aterm-ctl`
+//! prints it (the framing table
+//! [`aterm_types::control_verbs::framing_of`], `ERR …` on stderr at exit 1,
+//! timeouts at exit 124, counted rows on stdout), so every judgment in the
+//! loop ([`CtlReply::lost`], `timed_out`, `unknown_form`, `skipped`) reads the
+//! same either way.
+//!
+//! A lost connection is reported in `aterm-ctl`'s own words, so the loop rides
+//! it out the same way, and the next request dials again, re-resolving the
+//! socket when none was named (following the `latest` alias after a
+//! self-update's handoff) and re-reading a session's graph entry (following
+//! its host's successor).
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use aterm_types::control_request::Sid;
 use aterm_types::control_verbs::{Framing, artifact_reply_requires_ack, framing_of};
 use aterm_uds::CtlStream;
 
@@ -30,25 +38,50 @@ const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(60);
 /// connection is judged hung.
 const AWAIT_MARGIN: Duration = Duration::from_secs(5);
 
-/// Where [`RelayCtl`] dials: a named socket, or the one `aterm-ctl` would
-/// resolve (re-resolved at every dial).
+/// Where [`RelayCtl`] sends what no session's host answers: a named socket,
+/// or the one `aterm-ctl` would resolve (re-resolved at every dial).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
-    /// This socket, always (`--socket`, the host's own).
+    /// This socket (`--socket`, the host's own).
     Socket(String),
     /// Whatever `aterm_ctl::resolve_sock_for(self_sid)` names at the dial.
     Resolved { self_sid: Option<String> },
 }
 
-/// One persistent, authenticated control connection behind the [`Ctl`] seam.
+/// Persistent, authenticated control connections behind the [`Ctl`] seam,
+/// one per instance that answers its requests.
+///
+/// A server that relays a request to the instance hosting its session hands
+/// that instance the rest of the connection. One connection that carried a
+/// relayed request carried every later one there too: a request naming
+/// another session went on through a chain of relays, and one naming none
+/// (`who`, `inbox`) was answered by the far instance. So a connection carries
+/// only requests one instance answers:
+///
+/// * a request naming a session ([`aterm_ctl::target_sid`]) goes to the
+///   instance that session's graph entry names ([`aterm_ctl::hosting_sock`]),
+///   which answers it itself. When no entry names one, or nothing listens
+///   there, it goes to the [`Endpoint`] on a connection of that session's
+///   own, since the endpoint may relay it;
+/// * every other request goes to the endpoint, which answers it itself.
 pub struct RelayCtl {
     endpoint: Endpoint,
-    /// A token given up front (the host's own); `None` reads the one beside the
-    /// socket at every dial, once that dial's connect succeeded.
+    /// A token given up front (the host's own) for the endpoint's socket;
+    /// `None` reads the one beside the socket at every dial, once that dial's
+    /// connect succeeded, as every dial to a session's host does.
     token: Option<String>,
-    conn: Option<RelayClient<CtlStream>>,
-    /// A second handle on the live connection, for the interrupter.
-    shut: Arc<Mutex<Option<CtlStream>>>,
+    /// The rendezvous dir whose graph entries name each session's host
+    /// ([`aterm_uds::control_socket_dir`]); `None` sends every request to the
+    /// endpoint.
+    rendezvous: Option<PathBuf>,
+    /// The socket [`Endpoint::Resolved`] named at its last resolution, which
+    /// stands while a connection dialled there lives.
+    resolved: Option<String>,
+    conns: Vec<Conn>,
+    next_id: u64,
+    /// A second handle on each live connection, by [`Conn::id`], for the
+    /// interrupter.
+    shut: Arc<Mutex<Vec<(u64, CtlStream)>>>,
     /// Set by the interrupter: every request from then on fails.
     cut: Arc<AtomicBool>,
     /// The token given up front is one a listener may refuse (the in-GUI
@@ -58,13 +91,72 @@ pub struct RelayCtl {
     beside_on_refusal: bool,
 }
 
+/// One connection [`RelayCtl`] holds.
+struct Conn {
+    id: u64,
+    /// The socket it was dialled at.
+    sock: String,
+    carries: Carries,
+    client: RelayClient<CtlStream>,
+}
+
+/// Which requests ride a [`Conn`].
+enum Carries {
+    /// Those the instance at its socket answers itself: requests naming no
+    /// session, and those naming one of `hosted`, the sessions whose graph
+    /// entries named that socket.
+    Own { hosted: Vec<String> },
+    /// Only requests about this session, which the endpoint was not found to
+    /// host and may relay: after it does, the connection is the host's.
+    Relayed(String),
+}
+
+impl Carries {
+    fn hosts(&self, sid: &str) -> bool {
+        matches!(self, Carries::Own { hosted } if hosted.iter().any(|h| h == sid))
+    }
+}
+
+/// Which connection a request rides ([`RelayCtl::conn_for`]).
+enum Route<'a> {
+    /// It names no session and is aimed at none: the endpoint answers it.
+    Endpoint,
+    /// It names this session ([`aterm_ctl::target_sid`]).
+    Names(Sid<'a>),
+    /// It names none, but asks the instance hosting this one
+    /// ([`Ctl::call_at_host_of`]).
+    HostOf(Sid<'a>),
+}
+
+/// Why a dial gave no connection.
+enum DialError {
+    /// Nothing listens at the socket (`ENOENT`, `ECONNREFUSED`). At a graph
+    /// entry's socket that is a stale entry, not the request's failure: the
+    /// request goes where an unhosted session's does, as `aterm ctl`'s does.
+    NoHost(String),
+    /// Anything else, the request's failure.
+    Failed(String),
+}
+
+impl DialError {
+    fn words(self) -> String {
+        match self {
+            DialError::NoHost(w) | DialError::Failed(w) => w,
+        }
+    }
+}
+
 impl RelayCtl {
-    /// A transport that dials `endpoint` on its first request.
+    /// A transport that dials on its first request, reading each session's
+    /// host from the rendezvous dir.
     pub fn new(endpoint: Endpoint, token: Option<String>) -> Self {
         Self {
             endpoint,
             token,
-            conn: None,
+            rendezvous: aterm_uds::control_socket_dir(),
+            resolved: None,
+            conns: Vec::new(),
+            next_id: 0,
             shut: Arc::default(),
             cut: Arc::default(),
             beside_on_refusal: false,
@@ -84,45 +176,239 @@ impl RelayCtl {
         }
     }
 
-    /// Dial now, so a caller can fall back when nothing answers.
+    /// [`Self::new`]'s transport reading the session graph in `dir` instead
+    /// (the tests' scratch rendezvous dirs).
+    #[cfg(all(test, unix))]
+    fn in_rendezvous(mut self, dir: &std::path::Path) -> Self {
+        self.rendezvous = Some(dir.to_path_buf());
+        self
+    }
+
+    /// Dial the endpoint now rather than at the first request that rides its
+    /// connection, so a socket that cannot be reached is told here.
     ///
     /// # Errors
     /// The socket could not be resolved, reached, or its token read.
     pub fn connect(&mut self) -> Result<(), String> {
-        self.dial().map(|_| ())
+        self.conn_for(Route::Endpoint).map(|_| ())
     }
 
-    fn sock(&self) -> Result<String, String> {
+    /// The endpoint's socket: the named one, or the one resolved for a live
+    /// connection, else resolved afresh.
+    fn endpoint_sock(&mut self) -> Result<String, String> {
+        let self_sid = match &self.endpoint {
+            Endpoint::Socket(s) => return Ok(s.clone()),
+            Endpoint::Resolved { self_sid } => self_sid,
+        };
+        if let Some(s) = &self.resolved
+            && self.conns.iter().any(|c| &c.sock == s)
+        {
+            return Ok(s.clone());
+        }
+        let s = aterm_ctl::resolve_sock_for(self_sid.as_deref())
+            .map_err(|e| format!("cannot resolve the control socket: {e}"))?;
+        self.resolved = Some(s.clone());
+        Ok(s)
+    }
+
+    /// Whether `sock` is the endpoint's, the one socket the given token is for.
+    fn is_endpoint(&self, sock: &str) -> bool {
         match &self.endpoint {
-            Endpoint::Socket(s) => Ok(s.clone()),
-            Endpoint::Resolved { self_sid } => aterm_ctl::resolve_sock_for(self_sid.as_deref())
-                .map_err(|e| format!("cannot resolve the control socket: {e}")),
+            Endpoint::Socket(s) => s == sock,
+            Endpoint::Resolved { .. } => self.resolved.as_deref() == Some(sock),
         }
     }
 
-    /// The live connection, dialled when there is none.
-    fn dial(&mut self) -> Result<&mut RelayClient<CtlStream>, String> {
-        if self.conn.is_none() {
-            let sock = self.sock()?;
-            // The token beside the socket is read after this dial's connect succeeded, so it is
-            // the listener's that took it, never one for a socket a successor has since rebound.
-            let client = match &self.token {
-                Some(t) => RelayClient::connect_local(&sock, t.trim()),
-                None => RelayClient::connect_local_beside(&sock),
+    /// A connection to `sock`, authenticated: with the given token on the
+    /// endpoint's socket, else with the token beside `sock`, read once this
+    /// dial's connect succeeded, so it is the listener's that took it — never
+    /// one read for a socket an update's successor has since rebound.
+    fn dial(&self, sock: &str) -> Result<RelayClient<CtlStream>, DialError> {
+        let connect_failed = |e: &io::Error| {
+            let words = format!("connect {sock}: {e}");
+            match e.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                    DialError::NoHost(words)
+                }
+                _ => DialError::Failed(words),
             }
-            .map_err(|e| format!("connect {sock}: {e}"))?;
-            *self.shut.lock().unwrap_or_else(PoisonError::into_inner) =
-                client.transport().try_clone().ok();
-            self.conn = Some(client);
-        }
-        self.conn
-            .as_mut()
-            .ok_or_else(|| "no control connection".to_string())
+        };
+        let given = self.token.as_deref().filter(|_| self.is_endpoint(sock));
+        let (stream, token) = match given {
+            Some(t) => (
+                CtlStream::connect(sock).map_err(|e| connect_failed(&e))?,
+                t.trim().to_string(),
+            ),
+            None => {
+                let (stream, token) =
+                    aterm_ctl::connect_then_read_token(sock).map_err(|e| connect_failed(&e))?;
+                let token =
+                    token.map_err(|e| DialError::Failed(format!("connect {sock}: token: {e}")))?;
+                (stream, token)
+            }
+        };
+        RelayClient::authenticated(stream, &token)
+            .map_err(|e| DialError::Failed(format!("connect {sock}: {e}")))
     }
 
-    fn drop_conn(&mut self) {
-        self.conn = None;
-        *self.shut.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    /// Hold `client`, dialled at `sock`, for the requests `carries` names.
+    fn hold(&mut self, sock: String, carries: Carries, client: RelayClient<CtlStream>) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        if let Ok(handle) = client.transport().try_clone() {
+            self.shut
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((id, handle));
+        }
+        self.conns.push(Conn {
+            id,
+            sock,
+            carries,
+            client,
+        });
+        self.conns.len() - 1
+    }
+
+    /// The endpoint's own connection, dialled when there is none.
+    fn endpoint_conn(&mut self) -> Result<usize, String> {
+        let sock = self.endpoint_sock()?;
+        let own = |c: &Conn| c.sock == sock && matches!(c.carries, Carries::Own { .. });
+        if let Some(at) = self.conns.iter().position(own) {
+            return Ok(at);
+        }
+        let client = self.dial(&sock).map_err(DialError::words)?;
+        Ok(self.hold(sock, Carries::Own { hosted: Vec::new() }, client))
+    }
+
+    /// The index of the connection `route` rides, dialled when none does.
+    ///
+    /// A session's route is decided once per connection: the connection of
+    /// the instance its graph entry named, else its own connection to the
+    /// endpoint. It is decided again, from the graph entry, only once that
+    /// connection is lost.
+    fn conn_for(&mut self, route: Route<'_>) -> Result<usize, String> {
+        let (sid, named) = match route {
+            Route::Endpoint => return self.endpoint_conn(),
+            Route::Names(sid) => (sid, true),
+            Route::HostOf(sid) => (sid, false),
+        };
+        let s = sid.as_str();
+        if let Some(at) = self.conns.iter().position(|c| c.carries.hosts(s)) {
+            return Ok(at);
+        }
+        // A request aimed at the session's host rides its relayed connection
+        // too: the host answers it once the endpoint relayed, and until then
+        // the endpoint does, as on its own connection.
+        let relayed = |c: &Conn| matches!(&c.carries, Carries::Relayed(r) if r == s);
+        if let Some(at) = self.conns.iter().position(relayed) {
+            return Ok(at);
+        }
+        if let Some(host) = self
+            .rendezvous
+            .as_deref()
+            .and_then(|dir| aterm_ctl::hosting_sock(dir, sid))
+        {
+            let own = |c: &Conn| c.sock == host && matches!(c.carries, Carries::Own { .. });
+            if let Some(at) = self.conns.iter().position(own) {
+                if let Carries::Own { hosted } = &mut self.conns[at].carries {
+                    hosted.push(s.to_string());
+                }
+                return Ok(at);
+            }
+            match self.dial(&host) {
+                Ok(client) => {
+                    let hosted = vec![s.to_string()];
+                    return Ok(self.hold(host, Carries::Own { hosted }, client));
+                }
+                Err(DialError::NoHost(_)) => {}
+                Err(DialError::Failed(why)) => return Err(why),
+            }
+        }
+        if !named {
+            return self.endpoint_conn();
+        }
+        let sock = self.endpoint_sock()?;
+        let client = self.dial(&sock).map_err(DialError::words)?;
+        Ok(self.hold(sock, Carries::Relayed(s.to_string()), client))
+    }
+
+    /// Let the connection at `at` go: a request that failed mid-exchange left
+    /// its stream at an unknown place, and the routes it carried are decided
+    /// again by the next request.
+    fn drop_conn(&mut self, at: usize) {
+        let conn = self.conns.swap_remove(at);
+        self.shut
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(id, _)| *id != conn.id);
+    }
+
+    /// One request: on the connection its route names ([`Self::conn_for`]),
+    /// rendered as `aterm-ctl` prints the reply.
+    fn exchange(&mut self, args: &[&str], host_of: Option<&str>) -> Result<CtlReply, String> {
+        if self.cut.load(Ordering::SeqCst) {
+            return Err("the supervisor was stopped".to_string());
+        }
+        let verb = args
+            .iter()
+            .find(|a| !a.starts_with('@'))
+            .copied()
+            .unwrap_or("");
+        let line = args.join(" ");
+        let framing = framing_of(verb, &line);
+        if matches!(framing, Framing::Push) || artifact_reply_requires_ack(verb, &line) {
+            return Ok(client_failure(&format!(
+                "{verb}: not served over the supervisor's persistent connection"
+            )));
+        }
+        let route = match (aterm_ctl::target_sid(&line), host_of.and_then(Sid::parse)) {
+            (Some(sid), _) => Route::Names(sid),
+            (None, Some(sid)) => Route::HostOf(sid),
+            (None, None) => Route::Endpoint,
+        };
+        let wait = reply_wait(args);
+        let at = match self.conn_for(route) {
+            Ok(at) => at,
+            Err(e) => return Ok(client_failure(&e)),
+        };
+        // A cut that came before the connection's handle was registered hung
+        // up none of it.
+        if self.cut.load(Ordering::SeqCst) {
+            return Err("the supervisor was stopped".to_string());
+        }
+        // Whether this connection authenticated with the token given up front
+        // ([`Self::dial`]): only that token is dropped on a refusal.
+        let given_token = self.token.is_some() && self.is_endpoint(&self.conns[at].sock);
+        let conn = &mut self.conns[at].client;
+        let _ = conn.transport().set_read_timeout(Some(wait));
+        let got = match framing {
+            Framing::Lines => conn
+                .request_counted(&line)
+                .map(|(h, b)| (h, b.into_bytes())),
+            Framing::Bytes => conn.request_bytes(&line),
+            _ => conn.request_line(&line).map(|h| (h, Vec::new())),
+        };
+        match got {
+            Ok((header, _)) if header == "ERR auth" && self.beside_on_refusal && given_token => {
+                // The token given up front was refused: from now on, the
+                // one beside the socket. The listener closes a refused
+                // connection, and ran nothing on it.
+                self.beside_on_refusal = false;
+                self.token = None;
+                self.drop_conn(at);
+                self.exchange(args, host_of)
+            }
+            Ok((header, body)) => Ok(render(verb, framing, &header, body)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(client_failure(&e.to_string())),
+            Err(e) => {
+                self.drop_conn(at);
+                if self.cut.load(Ordering::SeqCst) {
+                    return Err("the supervisor was stopped".to_string());
+                }
+                Ok(client_failure(&io_words(&e)))
+            }
+        }
     }
 }
 
@@ -235,56 +521,11 @@ pub(super) fn render(
 
 impl Ctl for RelayCtl {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
-        if self.cut.load(Ordering::SeqCst) {
-            return Err("the supervisor was stopped".to_string());
-        }
-        let verb = args
-            .iter()
-            .find(|a| !a.starts_with('@'))
-            .copied()
-            .unwrap_or("");
-        let line = args.join(" ");
-        let framing = framing_of(verb, &line);
-        if matches!(framing, Framing::Push) || artifact_reply_requires_ack(verb, &line) {
-            return Ok(client_failure(&format!(
-                "{verb}: not served over the supervisor's persistent connection"
-            )));
-        }
-        let wait = reply_wait(args);
-        let conn = match self.dial() {
-            Ok(c) => c,
-            Err(e) => return Ok(client_failure(&e)),
-        };
-        let _ = conn.transport().set_read_timeout(Some(wait));
-        let got = match framing {
-            Framing::Lines => conn
-                .request_counted(&line)
-                .map(|(h, b)| (h, b.into_bytes())),
-            Framing::Bytes => conn.request_bytes(&line),
-            _ => conn.request_line(&line).map(|h| (h, Vec::new())),
-        };
-        match got {
-            Ok((header, _)) if header == "ERR auth" && self.beside_on_refusal => {
-                // The token given up front was refused: from now on, the
-                // one beside the socket. The listener closes a refused
-                // connection, and ran nothing on it.
-                self.beside_on_refusal = false;
-                self.token = None;
-                self.drop_conn();
-                self.call(args)
-            }
-            Ok((header, body)) => Ok(render(verb, framing, &header, body)),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(client_failure(&e.to_string())),
-            Err(e) => {
-                // A request that failed mid-exchange leaves the stream at an
-                // unknown place: the next request dials afresh.
-                self.drop_conn();
-                if self.cut.load(Ordering::SeqCst) {
-                    return Err("the supervisor was stopped".to_string());
-                }
-                Ok(client_failure(&io_words(&e)))
-            }
-        }
+        self.exchange(args, None)
+    }
+
+    fn call_at_host_of(&mut self, sid: &str, args: &[&str]) -> Result<CtlReply, String> {
+        self.exchange(args, Some(sid))
     }
 
     fn interrupter(&self) -> Option<Interrupter> {
@@ -292,9 +533,12 @@ impl Ctl for RelayCtl {
         let shut = Arc::clone(&self.shut);
         Some(Box::new(move || {
             cut.store(true, Ordering::SeqCst);
-            // Each half on its own ([`aterm_uds::hangup::hang_up`]): Darwin refuses a both-ways
-            // `shutdown` of a socket whose server half-closed toward us, shutting nothing.
-            if let Some(s) = shut.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            // Each half on its own ([`aterm_uds::hangup::hang_up`]): a server
+            // that half-closed toward this client (a relay whose child ended)
+            // has shut its read half, and Darwin refuses a both-ways
+            // `shutdown` of it, shutting nothing — the server then read no
+            // EOF while this transport held the connection.
+            for (_, s) in shut.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 aterm_uds::hangup::hang_up(s);
             }
         }))
@@ -600,6 +844,309 @@ mod tests {
              {end:?}"
         );
         drop(c);
+    }
+
+    /// How a stand-in instance answers ([`instance`]).
+    struct Stand {
+        /// Who answers: each request `OK <name>`, a `who` a roster of the one
+        /// row `<name>`.
+        name: &'static str,
+        /// A session the instance relays, as a server forwards one it does not
+        /// host: the rest of a connection that carried a request naming it is
+        /// the host's, which answers as `<sid>-host`.
+        relays: Option<&'static str>,
+        /// How many requests a connection is answered before the instance
+        /// hangs it up.
+        answers: usize,
+    }
+
+    /// A stand-in instance on a socket of a scratch rendezvous dir.
+    struct Instance {
+        sock: String,
+        /// Each connection's lines, its `AUTH` line first, in accept order.
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+        /// A connection's number as it closes.
+        ended: std::sync::mpsc::Receiver<usize>,
+        stop: Arc<AtomicBool>,
+        accept: std::thread::JoinHandle<()>,
+    }
+
+    impl Instance {
+        /// Stop accepting, wait for every connection to close, and give back
+        /// the lines each carried.
+        fn finish(self) -> Vec<Vec<String>> {
+            self.stop.store(true, Ordering::SeqCst);
+            drop(std::os::unix::net::UnixStream::connect(&self.sock));
+            self.accept.join().expect("accept loop");
+            let seen = self.seen.lock().expect("seen");
+            seen.clone()
+        }
+    }
+
+    /// Serve `stand` on `sock`, each connection on its own thread, as a
+    /// server parks every connection a client holds.
+    fn instance(sock: std::path::PathBuf, stand: Stand) -> Instance {
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let stop: Arc<AtomicBool> = Arc::default();
+        let (tx, ended) = std::sync::mpsc::channel();
+        let stand = Arc::new(stand);
+        let accept = {
+            let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut serving = Vec::new();
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let n = {
+                        let mut seen = seen.lock().expect("seen");
+                        seen.push(Vec::new());
+                        seen.len() - 1
+                    };
+                    let (seen, stand, tx) = (Arc::clone(&seen), Arc::clone(&stand), tx.clone());
+                    serving.push(std::thread::spawn(move || {
+                        serve_connection(stream, n, &stand, &seen);
+                        let _ = tx.send(n);
+                    }));
+                }
+                for conn in serving {
+                    conn.join().expect("connection");
+                }
+            })
+        };
+        Instance {
+            sock: sock.to_string_lossy().into_owned(),
+            seen,
+            ended,
+            stop,
+            accept,
+        }
+    }
+
+    fn serve_connection(
+        stream: std::os::unix::net::UnixStream,
+        n: usize,
+        stand: &Stand,
+        seen: &Mutex<Vec<Vec<String>>>,
+    ) {
+        let mut w = stream.try_clone().expect("clone");
+        let (mut answered, mut relayed) = (0, false);
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            seen.lock().expect("seen")[n].push(line.clone());
+            if line.starts_with("AUTH ") {
+                continue;
+            }
+            if answered == stand.answers {
+                break;
+            }
+            answered += 1;
+            let names = aterm_ctl::target_sid(&line).map(|sid| sid.as_str().to_string());
+            relayed |= stand.relays.is_some() && names.as_deref() == stand.relays;
+            let by = match stand.relays {
+                Some(sid) if relayed => format!("{sid}-host"),
+                _ => stand.name.to_string(),
+            };
+            let reply = if line.split_whitespace().any(|w| w == "who") {
+                format!("OK 1\n{by}\n")
+            } else {
+                format!("OK {by}\n")
+            };
+            if w.write_all(reply.as_bytes()).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Publish `sid`'s graph entry in the rendezvous dir `dir`, naming `sock`.
+    fn publish(dir: &std::path::Path, sid: &str, sock: &str) {
+        let graph = dir.join("graph");
+        std::fs::create_dir_all(&graph).expect("graph dir");
+        std::fs::write(graph.join(sid), format!("sock {sock}\nnonce 00\npid 1\n"))
+            .expect("graph entry");
+    }
+
+    fn stdout(reply: Result<CtlReply, String>) -> String {
+        reply.expect("reply").stdout
+    }
+
+    /// A WORKER ON ANOTHER INSTANCE GETS ITS OWN CONNECTION: a request naming
+    /// the session goes to the instance its graph entry names, on that
+    /// instance's one connection, authenticated with the token beside its
+    /// socket (the given token is the endpoint's alone), and so does a request
+    /// aimed at the session's host ([`Ctl::call_at_host_of`]).
+    ///
+    /// NEGATIVE CONTROL: a request naming no session goes to the endpoint on
+    /// the endpoint's connection, also after the session's requests. The
+    /// endpoint here relays the session as a server does, handing the host the
+    /// rest of a connection that carried it: one endpoint connection for every
+    /// request (run by hand) has the session answered through that relay
+    /// (`OK s-ab-host`), and every request after it too.
+    #[test]
+    fn a_worker_on_another_instance_gets_its_own_connection() {
+        let dir = crate::supervise::ScratchDir::new("relayctl", "hosts");
+        let endpoint = instance(
+            dir.join("aterm-1.sock"),
+            Stand {
+                name: "endpoint",
+                relays: Some("s-ab"),
+                answers: usize::MAX,
+            },
+        );
+        let host = instance(
+            dir.join("aterm-2.sock"),
+            Stand {
+                name: "host",
+                relays: None,
+                answers: usize::MAX,
+            },
+        );
+        std::fs::write(dir.join("aterm-2.token"), "hosttok\n").expect("token");
+        publish(&dir, "s-ab", &host.sock);
+        let mut c = RelayCtl::new(
+            Endpoint::Socket(endpoint.sock.clone()),
+            Some("tok".to_string()),
+        )
+        .in_rendezvous(&dir);
+        assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK host\n");
+        assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
+        assert_eq!(stdout(c.call_at_host_of("s-ab", &["who"])), "host\n");
+        assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK host\n");
+        assert_eq!(stdout(c.call(&["who"])), "endpoint\n");
+        drop(c);
+        assert_eq!(endpoint.finish(), [vec!["AUTH tok", "meta", "who"]]);
+        assert_eq!(
+            host.finish(),
+            [vec!["AUTH hosttok", "@s-ab meta", "who", "@s-ab meta"]]
+        );
+    }
+
+    /// A SESSION NO HOST ANSWERS FOR RIDES A CONNECTION OF ITS OWN to the
+    /// endpoint, which may relay it: a graph entry naming a socket nothing
+    /// listens on (a crashed host), one naming a removed socket, and no entry.
+    /// A session's requests share its connection, and a request aimed at its
+    /// host rides it too, reaching the host the endpoint relayed to.
+    ///
+    /// NEGATIVE CONTROL: the endpoint's own connection answers for the
+    /// endpoint after the endpoint relayed `s-cd`. Sending that session's
+    /// requests on it (run by hand) answers that `meta` `OK s-cd-host`.
+    #[test]
+    fn a_session_no_host_answers_for_rides_a_connection_of_its_own() {
+        let dir = crate::supervise::ScratchDir::new("relayctl", "nohost");
+        let endpoint = instance(
+            dir.join("aterm-1.sock"),
+            Stand {
+                name: "endpoint",
+                relays: Some("s-cd"),
+                answers: usize::MAX,
+            },
+        );
+        let crashed = dir.join("aterm-3.sock");
+        drop(UnixListener::bind(&crashed).expect("bind"));
+        publish(&dir, "s-cd", &crashed.to_string_lossy());
+        publish(&dir, "s-ce", &dir.join("aterm-4.sock").to_string_lossy());
+        let mut c = RelayCtl::new(
+            Endpoint::Socket(endpoint.sock.clone()),
+            Some("tok".to_string()),
+        )
+        .in_rendezvous(&dir);
+        assert_eq!(stdout(c.call(&["@s-cd", "meta"])), "OK s-cd-host\n");
+        assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
+        assert_eq!(stdout(c.call(&["@s-cd", "meta"])), "OK s-cd-host\n");
+        assert_eq!(stdout(c.call_at_host_of("s-cd", &["who"])), "s-cd-host\n");
+        assert_eq!(stdout(c.call(&["@s-ce", "meta"])), "OK endpoint\n");
+        assert_eq!(stdout(c.call(&["@s-cf", "meta"])), "OK endpoint\n");
+        drop(c);
+        assert_eq!(
+            endpoint.finish(),
+            [
+                vec!["AUTH tok", "@s-cd meta", "@s-cd meta", "who"],
+                vec!["AUTH tok", "meta"],
+                vec!["AUTH tok", "@s-ce meta"],
+                vec!["AUTH tok", "@s-cf meta"],
+            ]
+        );
+    }
+
+    /// A HOST THAT HANGS UP IS FOUND AGAIN BY ITS GRAPH ENTRY: the request it
+    /// dropped is lost, in `aterm-ctl`'s words, and the next one reads the
+    /// entry again and reaches the successor it names now (a self-update's),
+    /// with that successor's token. Nothing reaches the endpoint.
+    ///
+    /// NEGATIVE CONTROL: the old host still accepts, so a transport that
+    /// dialled the socket it routed to before instead of reading the entry
+    /// again is answered `OK old`.
+    #[test]
+    fn a_host_that_hangs_up_is_found_again_by_its_graph_entry() {
+        let dir = crate::supervise::ScratchDir::new("relayctl", "successor");
+        let stand = |name, answers| Stand {
+            name,
+            relays: None,
+            answers,
+        };
+        let endpoint = instance(dir.join("aterm-1.sock"), stand("endpoint", usize::MAX));
+        let old = instance(dir.join("aterm-2.sock"), stand("old", 1));
+        let new = instance(dir.join("aterm-5.sock"), stand("new", usize::MAX));
+        std::fs::write(dir.join("aterm-2.token"), "oldtok\n").expect("token");
+        std::fs::write(dir.join("aterm-5.token"), "newtok\n").expect("token");
+        publish(&dir, "s-ab", &old.sock);
+        let mut c =
+            RelayCtl::new(Endpoint::Socket(endpoint.sock.clone()), None).in_rendezvous(&dir);
+        assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK old\n");
+        publish(&dir, "s-ab", &new.sock);
+        let dropped = c.call(&["@s-ab", "meta"]).expect("reply");
+        assert!(dropped.lost(), "{dropped:?}");
+        assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK new\n");
+        drop(c);
+        assert_eq!(endpoint.finish(), Vec::<Vec<String>>::new());
+        assert_eq!(
+            old.finish(),
+            [vec!["AUTH oldtok", "@s-ab meta", "@s-ab meta"]]
+        );
+        assert_eq!(new.finish(), [vec!["AUTH newtok", "@s-ab meta"]]);
+    }
+
+    /// THE CUT HANGS UP EVERY CONNECTION the transport holds, the endpoint's
+    /// and each host's, while it still holds them, and every request after it
+    /// fails, whichever connection it would ride.
+    ///
+    /// NEGATIVE CONTROL (run by hand): hanging up only the connection dialled
+    /// last, the one handle the transport kept before, leaves the endpoint's
+    /// connection open and its end is never read.
+    #[test]
+    fn the_interrupter_hangs_up_every_connection() {
+        let dir = crate::supervise::ScratchDir::new("relayctl", "cut-all");
+        let stand = |name| Stand {
+            name,
+            relays: None,
+            answers: usize::MAX,
+        };
+        let endpoint = instance(dir.join("aterm-1.sock"), stand("endpoint"));
+        let host = instance(dir.join("aterm-2.sock"), stand("host"));
+        std::fs::write(dir.join("aterm-2.token"), "hosttok\n").expect("token");
+        publish(&dir, "s-ab", &host.sock);
+        let mut c = RelayCtl::new(
+            Endpoint::Socket(endpoint.sock.clone()),
+            Some("tok".to_string()),
+        )
+        .in_rendezvous(&dir);
+        assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
+        assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK host\n");
+        let cut = c.interrupter().expect("interrupter");
+        cut();
+        // Each must end; the bound is a minute's hang detector (AGENTS.md).
+        for (name, at) in [("endpoint", &endpoint), ("host", &host)] {
+            at.ended
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap_or_else(|e| panic!("the {name} read no end of the cut connection: {e}"));
+        }
+        assert!(c.call(&["meta"]).is_err(), "after the cut");
+        assert!(c.call(&["@s-ab", "meta"]).is_err(), "after the cut");
+        drop(c);
+        assert_eq!(endpoint.finish(), [vec!["AUTH tok", "meta"]]);
+        assert_eq!(host.finish(), [vec!["AUTH hosttok", "@s-ab meta"]]);
     }
 
     #[test]

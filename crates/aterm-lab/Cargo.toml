@@ -7,7 +7,7 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-description = "The real-Claude lab: the real Claude Code TUI (and Codex, Gemini CLI, agy, Muse Code) in a private, jailed headless aterm against a local stub of the API; and private aterm instances for checking a change (instance, presence-flap, codex-alab-proof, fleet-sim)"
+description = "The real-Claude lab: the real Claude Code TUI (and Codex, Gemini CLI, agy, Muse Code) in a private, jailed headless aterm against a local stub of the API; and private aterm instances for checking a change (instance, trail-gallery, presence-flap, codex-alab-proof, fleet-sim)"
 
 # Dev-only: never packed or shipped (the workspace's atpkg expose/bundle lists
 # name `aterm` alone). Run it as `targo --unverified lab <verb>` (the
@@ -40,9 +40,13 @@ aterm-toml = { workspace = true }
 aterm-http = { workspace = true }
 # The regex of `catch` (the workspace's own engine; `await match` waits use the server's).
 aterm-regex = { workspace = true }
-# The Linux baseline's frames (`linux_baseline`), decoded to read the drop
-# highlight.
+# The workspace's PNG decoder: the Linux baseline's frames (`linux_baseline`),
+# decoded to read the drop highlight, and the frames `trail-contrast` reads
+# (every colour type and depth, never a hand-written decoder).
 aterm-png = { workspace = true }
+# The terminal grid's own width table: how many cells a glyph of a frame's
+# screen text takes (`trail-contrast`). Already in the graph through aterm-agent.
+aterm-grapheme = { workspace = true }
 # `fleet-sim` dials a member's fleet port as a reader does (the mutual proof,
 # the key file) and speaks the wire for the reflected-tag conformance probe.
 aterm-net = { workspace = true }
@@ -67,8 +71,7 @@ aterm-durable = { workspace = true }
 # here.
 aterm-link = { path = "../aterm-link" }
 
-[dev-dependencies]
-# Private, exclusively created directories for counterfeit API fixtures.
+# Private, exclusively created directories for lab runs and counterfeit API fixtures.
 aterm-tempfile = { workspace = true }
 
 [lints]

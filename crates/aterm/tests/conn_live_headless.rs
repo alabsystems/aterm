@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use aterm_control::wire::pct_decode;
 
-use crate::{headless_boot, launch_isolation};
+use crate::{ctl_accept, headless_boot, launch_isolation};
 
 use headless_boot::Instance;
 
@@ -39,8 +39,17 @@ const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
 
 /// Run one `aterm <args…>` client call with the hermetic environment plus `extra_env`, bounded
 /// by [`CLIENT_EXIT_DEADLINE`]: drain threads keep the pipes flowing, so a hung client is a
-/// panic, never a hung harness.
+/// panic, never a hung harness. A call the instance has not yet accepted, or answered busy, is
+/// asked again, a fresh client each time ([`ctl_accept::until_served`]): the client's own 10 s
+/// accept budget is a person's, and a loaded machine can miss it. An `aterm conn` call goes
+/// through here too: it talks with no accept probe (`converse`, its own 60 s deadline), so it
+/// never says "so none was sent", and only a busy answer is asked again.
 fn run_client(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    ctl_accept::until_served(|| run_client_once(inst, args, extra_env))
+}
+
+/// One attempt of [`run_client`].
+fn run_client_once(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     cmd.args(args)
         .stdin(Stdio::null())

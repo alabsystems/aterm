@@ -457,25 +457,29 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("usage limit reset", Tag::NotAWall),
     ("usage limit available again", Tag::NotAWall),
     ("continuing automatically", Tag::NotAWall),
-    // The weekly session reset's own texts (READ in the 2.1.287 bundle,
-    // never seen on a screen): its answer `Session limit reset · next reset
-    // available {date} · …` says the limit is GONE, and its row's label, its
-    // footer notice (`/limit-reset to reset your session limit now · …`),
-    // its failure (`Couldn't reset your session limit right now · …`), its
-    // pending line (`Resetting your session limit…`) and its in-flight
-    // answer (`Your session limit is already being reset · one moment`, READ
-    // in the 2.1.304 bundle) name the limit beside the verb `reset` without
-    // being a notice of one. Ahead of `session limit`, which with that verb
-    // is a standing session wall.
+    // The weekly session reset's own texts (READ in the 2.1.287 and 2.1.304
+    // bundles, never seen on a screen): its answer `Session limit reset ·
+    // next reset available {date} · …` says the limit is GONE, and its row's
+    // label, its footer notice (`/limit-reset to reset your session limit
+    // now · …`), its failure (`Couldn't reset your session limit right now ·
+    // …`) and its pending line (`Resetting your session limit…`) name the
+    // limit beside the verb `reset` without being a notice of one; so does
+    // the 5-hour grant's answer (2.1.304), `Session limit reset · … ·
+    // {kindResets} left`, and its in-flight answer, `Your session limit is
+    // already being reset · one moment` (READ in the 2.1.303 and 2.1.304
+    // bundles, `Ir`'s). Ahead of `session limit`, which with that verb is a
+    // standing session wall.
     ("session limit reset", Tag::NotAWall),
     ("reset your session limit", Tag::NotAWall),
     ("resetting your session limit", Tag::NotAWall),
     ("session limit is already being reset", Tag::NotAWall),
-    // A weekly reset spent (2.1.304, READ in its bundle, never seen: `Mt()`'s
-    // head of the answer `Weekly limits reset · your weekly reset day stays
-    // {week} · {kindResets} left`): the weekly limit is GONE. Ahead of
-    // `weekly limit`, which with the verb `reset` reads as a standing weekly
-    // wall — and an account whose limit a reset refilled was waited out.
+    // A weekly grant's answer (READ in the 2.1.304 bundle, `Mt()`
+    // @244629627, never seen on a screen): `Weekly limits reset · your weekly
+    // reset day stays {week} · {kindResets} left` says the week's limit is
+    // GONE, but opens with the words of a weekly limit and the verb `reset`,
+    // which read it as a weekly wall still standing. Ahead of `weekly limit`.
+    // The full grant's `Limits reset · …` and the Fable grant's `Fable reset
+    // used · …` name no limit in their heads.
     ("weekly limits reset", Tag::NotAWall),
     ("context limit reached", Tag::Context),
     ("prompt is too long", Tag::Context),

@@ -332,27 +332,21 @@ pub fn active_handle_model() -> Model {
 }
 
 /// The cross-process `@<sid>` proxy forward is acyclic and terminates (`control.rs`
-/// `proxy_forward_plan` / `try_proxy_forward`). There is no hop counter; each hop kind ends at
-/// its target:
-///
-/// * a child hop (a session this aterm spawned): the parent rewrites the selector to `@.`, so
-///   the child resolves the verb locally and never re-enters `try_proxy_forward`;
-/// * a sibling hop (a same-uid aterm opened separately) keeps `@<sid>` and ends because the
-///   discovery entry it followed was published by the instance at that socket: the sid is
-///   hosted there, or the entry is stale and names the sibling's own socket, which the self-dial
-///   guard refuses.
+/// `proxy_forward_plan` / `try_proxy_forward`). There is no hop counter; a hop ends at its
+/// target: the forward keeps `@<sid>` and presents the hosting instance's own token, and the
+/// discovery entry it followed was published by the instance at that socket, so the sid is
+/// hosted there, or the entry is stale and names the host's own socket, which the self-dial
+/// guard refuses. A nested child is such a host too.
 ///
 /// So a chain is at most one cross-process hop and no A→B→A ping-pong can form. `Buggy=1` is a
 /// target that forwards on, refuted on `OneHopNoCycle`.
 ///
-/// Tier-1 is one test per hop kind in aterm-gui's `control_tests.rs`: each takes the real first
-/// line the forward presents (`proxy_forward_plan`'s verb with the token the forward takes once
-/// connected), strips its handshake, asks the real router with Owner scope whether the target
-/// would forward on, and validates the hop as `Forward`, which `Buggy = 1` must reject.
-/// `proxy_forward_plan_conforms_to_proxy_forward_one_hop` asks in the forwarding process, where
-/// the child's sid is forwardable, so only the `@.` rewrite ends the chain;
-/// `sibling_forward_plan_conforms_to_proxy_forward_one_hop` asks in the sibling's context for a
-/// sid it hosts and for a stale entry.
+/// Tier-1 is aterm-gui's `control_tests.rs::sibling_forward_plan_conforms_to_proxy_forward_one_hop`,
+/// on every platform: it takes the real first line the forward presents (`proxy_forward_plan`'s
+/// socket and the line, with the token beside that socket), strips its handshake, asks the real
+/// router in the host's context (its own socket as self, its own store) with Owner scope whether
+/// it would forward on, for a sid the host serves and for a stale entry, and validates the hop as
+/// `Forward`, which `Buggy = 1` must reject.
 // Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]

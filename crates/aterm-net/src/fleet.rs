@@ -3417,9 +3417,7 @@ mod tests {
         use crate::slots::tests::{IdleSockets, dual_stack_listener, until_turned_away};
         use std::net::{Ipv4Addr, Ipv6Addr};
         let test = "idle_sockets_from_one_address_never_turn_away_a_member_from_another";
-        let Some((listener, port)) = dual_stack_listener(test) else {
-            return;
-        };
+        let (listener, port) = dual_stack_listener(test);
         let slots = 16;
         let served = Serving::start(listener, listening(slots, HANG));
         let attacker = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -3505,9 +3503,7 @@ mod tests {
         use crate::slots::tests::{IdleSockets, dual_stack_listener, until_turned_away};
         use std::net::{Ipv4Addr, Ipv6Addr};
         let test = "a_slow_handshake_is_never_cut_for_a_heavier_address";
-        let Some((listener, port)) = dual_stack_listener(test) else {
-            return;
-        };
+        let (listener, port) = dual_stack_listener(test);
         let served = Serving::start(listener, listening(MAX_SLOTS, HANG));
         let attacker = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let member = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
@@ -3578,9 +3574,7 @@ mod tests {
         use crate::slots::tests::dual_stack_listener;
         use std::net::{Ipv4Addr, Ipv6Addr};
         let test = "one_address_holds_at_most_its_share_of_proved_connections";
-        let Some((listener, port)) = dual_stack_listener(test) else {
-            return;
-        };
+        let (listener, port) = dual_stack_listener(test);
         let slots = 8;
         let served = Serving::start(
             listener,

@@ -62,6 +62,15 @@ pub fn is_minted_sid(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
 }
 
+/// A map keyed by `SessionId` is looked up with the id's text, so a parsed wire
+/// selector finds its session without minting an owned id. The derived `Hash` and
+/// `Eq` read the one `String`, which hashes and compares as its `str`.
+impl std::borrow::Borrow<str> for SessionId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)

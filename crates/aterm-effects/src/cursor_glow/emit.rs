@@ -12,8 +12,26 @@ impl CursorGlow {
     /// Emit the live lightning bolts: each frozen jagged channel draws as a
     /// wide same-hue corona under a hot core (branches thinner, dimmer, no
     /// white mix), through the shared [`comet_beam`] so strikes stay smooth at
-    /// any angle with CPU/GPU parity. Brightness runs a strobe envelope (sharp
-    /// attack, dip, restrike, collapse) so it reads as lightning.
+    /// any angle with CPU/GPU parity.
+    ///
+    /// One flash per bolt ([`bolt_flash`]: born at full strength, then a
+    /// monotone burn-out while the channel retracts from its root), so every
+    /// pixel a bolt lights rises once and falls once; how often bolts are born
+    /// is the flash limiter's ([`Self::admit_bolt`]). A typing crackle crosses
+    /// the newest letters, so on a dark ground it spends the streak's over-ink
+    /// budget ([`Self::over_ink_ceiling`] of its own core-plus-corona stack);
+    /// a jump strike keeps its full white-hot punch over air, and where its
+    /// channel crosses a line of text the frame shows ([`TextView::covers_cell`]:
+    /// an Enter at the bottom strikes up through the lines it just printed) it
+    /// is held to that same ceiling in its own hue, so those letters keep
+    /// 4.5:1.
+    ///
+    /// On a light ground additive light cannot show, so the same geometry is
+    /// painted source-over ([`comet_beam_over`]) with no white-hot core, into
+    /// the under-ink stream the caller hands the light arm: a strike across a
+    /// line passes beneath the letters and leaves their strokes intact. So
+    /// nothing it darkens is ink, and it takes the vivid ink of that role
+    /// ([`InkRole::Leading`]) at most [`Self::LIGHT_BOLT_ALPHA_CAP`] opaque.
     pub(super) fn emit_bolts(
         &self,
         now: Instant,
@@ -21,105 +39,166 @@ impl CursorGlow {
         geom: Geom,
         out: &mut Vec<GlowQuad>,
         verts: &mut Vec<BeamVertex>,
+        channel: &mut Vec<(f32, f32, f32, bool)>,
     ) {
         if !matches!(cfg.style, GlowStyle::Laser) || self.bolts.is_empty() {
             return;
         }
         let ch = geom.ch as f32;
+        let dark = cfg.dark_theme;
+        // The vivid ink holds one weight across the hues, the weight the
+        // opacity cap is measured at; a black trail colour carries no hue to
+        // weigh and would come back black, so it strikes in the bar's neutral
+        // grey, as any achromatic colour does.
+        let light_ink = match InkRole::Leading.ink(cfg.color) {
+            0 => InkRole::Leading.ink(0x00FF_FFFF),
+            ink => ink,
+        };
+        let alpha_cap = Self::LIGHT_BOLT_ALPHA_CAP;
+        // The crackle's over-ink ceiling, solved once per frame on first use:
+        // its core and its corona (a third of the core's coverage) overlap on
+        // the axis, in the bolt's own hue.
+        let mut crackle_cap: Option<f32> = None;
+        let lift_cap = || {
+            let lift = [16u32, 8, 0]
+                .map(|sh| ((cfg.color >> sh) & 0xff) as f32 * (1.0 + 1.0 / 3.0) / 255.0);
+            Self::over_ink_ceiling(lift)
+        };
+        // A strike's hold over the text it crosses (dark only; a light
+        // ground's bolt is ink under the letters).
+        let text = self.text_view();
+        let over_text = |x: f32, y: f32| {
+            let row = ((y - f32::from(geom.origin_y)) / ch).floor() as i32;
+            let col = ((x - f32::from(geom.origin_x)) / geom.cw as f32).floor() as i32;
+            text.covers_cell(row, col)
+        };
+        let hold_over_text = dark && !self.streak_unbudgeted();
+        // Each channel resampled at most half a cell apart, so its hold over
+        // text eases in and out within half a cell of a letter's edge.
+        let step = (geom.cw as f32 * 0.5).max(1.0);
         // Newest strikes first, so a saturated budget sheds the oldest light.
         for b in self.bolts.iter().rev() {
             if out.len() >= Self::MAX_QUADS {
                 return;
             }
             let u = (now.saturating_duration_since(b.born).as_secs_f32() / b.life).clamp(0.0, 1.0);
-            // Double-strike strobe (attack → dip → restrike → burn-out) with a
-            // per-bolt shimmer so parallel strikes never sync. The final phase
-            // dims gently; the spatial retraction below extinguishes it.
-            let base = if u < 0.32 {
-                1.0 - 0.55 * (u / 0.32)
-            } else if u < 0.42 {
-                0.30
-            } else if u < 0.55 {
-                0.95
-            } else {
-                0.95 * (1.0 - 0.45 * (u - 0.55) / 0.45)
-            };
-            let env = base * (0.88 + 0.12 * (u * 34.0 + b.seed * 40.0).sin());
-            let cov_f = 255.0 * env * cfg.intensity * if b.branch { 0.72 } else { 1.0 };
+            let env = bolt_flash(u);
+            let mut cov_f = 255.0 * env * cfg.intensity * if b.branch { 0.72 } else { 1.0 };
+            if b.crackle && dark && !self.streak_unbudgeted() {
+                let cap = *crackle_cap.get_or_insert_with(lift_cap);
+                cov_f = cov_f.min(cap);
+            }
+            if !dark {
+                // On white the coverage is the stroke's opacity, capped so a
+                // letter the strike crosses keeps its strokes.
+                cov_f = cov_f.min(alpha_cap);
+            }
             if cov_f < 1.0 {
                 continue;
             }
             let cov = cov_f.min(255.0) as u8;
-            // Burn-out: past the restrike the channel retracts from its origin
-            // toward the tip with a glowing edge (20% of length), withdrawing
-            // into where it landed.
-            let k_burn = if u > 0.55 { (u - 0.55) / 0.45 } else { 0.0 };
+            // Burn-out: the channel retracts from its origin toward the tip
+            // with a glowing edge (20% of length), withdrawing into where it
+            // landed.
+            let k_burn = if u > BOLT_BURN_START {
+                (u - BOLT_BURN_START) / (1.0 - BOLT_BURN_START)
+            } else {
+                0.0
+            };
             let n1 = (b.pts.len() - 1).max(1) as f32;
-            let burn = |i: usize, c: u8| -> u8 {
-                let p = i as f32 / n1;
+            let burn = |p: f32, c: u8| -> u8 {
                 ((c as f32) * ((p - k_burn) / 0.20).clamp(0.0, 1.0)) as u8
             };
-            // A light ground cannot show additive light, so each pass is
-            // rasterized in white (every channel is its coverage) and re-inked
-            // as source-over in the strike's hue ([`reink_over`]).
-            let light = !cfg.dark_theme;
-            // Corona: the electric field around the channel, pure style hue.
+            // The channel's points `(x, y, p, over text)`, `p` its place
+            // origin → tip as the burn reads it.
+            channel.clear();
+            let held = hold_over_text && !b.crackle;
+            let resample = dark && !b.crackle;
+            for (i, w) in b.pts.windows(2).enumerate() {
+                let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+                let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+                let n = if resample {
+                    (len / step).ceil().max(1.0) as usize
+                } else {
+                    1
+                };
+                for k in 0..n {
+                    let f = k as f32 / n as f32;
+                    let (x, y) = (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f);
+                    channel.push((x, y, (i as f32 + f) / n1, held && over_text(x, y)));
+                }
+            }
+            if let Some(&(x, y)) = b.pts.last() {
+                channel.push((x, y, 1.0, held && over_text(x, y)));
+            }
+            let text_cap = if channel.iter().any(|c| c.3) {
+                *crackle_cap.get_or_insert_with(lift_cap)
+            } else {
+                255.0
+            };
+            let mut stroke = |out: &mut Vec<GlowQuad>,
+                              color: &dyn Fn(bool) -> u32,
+                              cov: u8,
+                              share: f32,
+                              thick: f32,
+                              step| {
+                verts.clear();
+                for &(x, y, p, over) in channel.iter() {
+                    let c = if over {
+                        (text_cap * share).min(f32::from(cov)) as u8
+                    } else {
+                        cov
+                    };
+                    verts.push(BeamVertex {
+                        x,
+                        y,
+                        color: color(over),
+                        cov: burn(p, c),
+                    });
+                }
+                if dark {
+                    comet_beam(out, geom.beam_clip(), verts, thick, step, 0.0);
+                } else {
+                    comet_beam_over(out, geom.beam_clip(), verts, thick, step, 0.0);
+                }
+            };
+            // Corona: the electric field around the channel, pure style hue
+            // (its ink on a light ground).
             let corona_th = ch * if b.branch { 0.30 } else { 0.55 };
-            verts.clear();
-            for (i, &(x, y)) in b.pts.iter().enumerate() {
-                verts.push(BeamVertex {
-                    x,
-                    y,
-                    color: if light { 0x00FF_FFFF } else { cfg.color },
-                    cov: burn(i, (cov / 3).max(1)),
-                });
-            }
-            let start = out.len();
-            comet_beam(out, geom.beam_clip(), verts, corona_th, 2, 0.0);
-            if light {
-                reink_over(&mut out[start..], InkRole::Leading.ink(cfg.color), 90);
-            }
+            let corona = if dark { cfg.color } else { light_ink };
+            stroke(out, &|_| corona, (cov / 3).max(1), 1.0 / 3.0, corona_th, 2);
             if out.len() >= Self::MAX_QUADS {
                 return;
             }
-            // Core: white-hot on main strikes (0.62 white ceiling keeps it in
-            // the beam's hue family), pure hue on branches.
-            let core_color = if light {
-                0x00FF_FFFF
+            // Core: white-hot on dark main strikes (0.62 white ceiling keeps
+            // it in the beam's hue family), pure hue on branches; on a light
+            // ground a white core would read as a pale smear, so the core is
+            // the ink.
+            // Over text the core is the hue alone, the light the ceiling is
+            // solved for.
+            let core_color = if !dark {
+                light_ink
             } else if b.branch {
                 cfg.color
             } else {
                 lerp_rgb(cfg.color, 0x00FF_FFFF, 0.62 * env)
             };
             let core_th = (ch * if b.branch { 0.10 } else { 0.18 }).max(1.5);
-            verts.clear();
-            for (i, &(x, y)) in b.pts.iter().enumerate() {
-                verts.push(BeamVertex {
-                    x,
-                    y,
-                    color: core_color,
-                    cov: burn(i, cov),
-                });
-            }
-            let start = out.len();
-            comet_beam(out, geom.beam_clip(), verts, core_th, 1, 0.0);
-            if light {
-                reink_over(
-                    &mut out[start..],
-                    InkRole::OverText.ink(cfg.color),
-                    LIGHT_INK_ALPHA_CAP as u8,
-                );
-            }
+            let core = |over: bool| if over { cfg.color } else { core_color };
+            stroke(out, &core, cov, 1.0, core_th, 1);
         }
     }
 
     /// Emit the vapor (steam, smoke and erase poofs) as growing, thinning
     /// radial halos. Steam: pale blue-white, born small and bright, swelling
-    /// ~3× as its coverage collapses. Smoke: warm grey, swelling on a gentle
+    /// ~3× as its coverage collapses; the live cloud shares one stacking
+    /// budget ([`Self::STEAM_STACK`]) and a puff thins as it climbs out of its
+    /// row ([`Self::STEAM_ABOVE_DIM`]). Smoke: warm grey, swelling on a gentle
     /// waft, lingering. Poof: neutral grey and brief, the erase puff any style
-    /// may shed.
+    /// may shed. Under fire on a dark ground every puff over a line of text
+    /// spends the over-ink account ([`InkLedger`]).
     pub(super) fn emit_vapor(
-        &self,
+        &mut self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
@@ -132,6 +211,42 @@ impl CursorGlow {
         // it; the style-agnostic erase poof renders everywhere.
         let fire = matches!(cfg.style, GlowStyle::Fire);
         let cell = geom.ch as f32;
+        let oy = f32::from(geom.origin_y);
+        // Steam's stacking budget: a held backspace keeps a few puffs per key
+        // alive at once, and their saturating sum whited out the line above.
+        // The live cloud's light (each puff's own `(1 − t)²` fade) shares
+        // `STEAM_STACK` fresh puffs' worth, however many keys fed it: a
+        // single delete still hisses at full strength, a run grows the cloud
+        // wider, not brighter.
+        let budgeted = !self.streak_unbudgeted();
+        let steam_share = if fire && budgeted {
+            let live: f32 = self
+                .vapor
+                .iter()
+                .filter(|v| v.kind == VaporKind::Steam)
+                .map(|v| {
+                    let t = (now.saturating_duration_since(v.born).as_secs_f32() / v.life)
+                        .clamp(0.0, 1.0);
+                    (1.0 - t) * (1.0 - t)
+                })
+                .sum();
+            (Self::STEAM_STACK / live.max(f32::EPSILON)).min(1.0)
+        } else {
+            1.0
+        };
+        let text = TextView::new(
+            if fire {
+                self.probed_text_spans()
+            } else {
+                TextSpans::default()
+            },
+            Some(&self.frame_text),
+        );
+        let covers_text = |x: f32, y: f32| {
+            let row = ((y - oy) / cell).floor() as i32;
+            let col = ((x - f32::from(geom.origin_x)) / geom.cw as f32).floor() as i32;
+            text.covers_cell(row, col)
+        };
         for v in self.vapor.iter().rev() {
             if !fire && v.kind != VaporKind::Poof {
                 continue;
@@ -145,30 +260,50 @@ impl CursorGlow {
                     * 0.22
                     * t;
             let y = v.y0 + v.vy * age + 0.5 * v.gy * age * age;
+            // Smoke keeps off a line of text the frame shows (a prompt bar
+            // or a status line above the burning row): its warm grey over
+            // letters read as khaki blots on them.
+            if v.kind == VaporKind::Smoke && budgeted && covers_text(x, y) {
+                continue;
+            }
             // Light themes: additive vapor cannot brighten white, so puffs are
             // source-over veils (straight RGB, falloff as alpha): steam a cool
             // pale mist, smoke a warm grey.
             let (r0, grow, color, peak) = match v.kind {
-                VaporKind::Steam => (
-                    cell * 0.26,
-                    1.0 + 3.4 * t,
-                    if cfg.dark_theme {
-                        0x00C9_D6DE
+                VaporKind::Steam => {
+                    // A puff thins as it rises out of the doused row into the
+                    // line above (a fade over its first 0.6 cell of climb past
+                    // the row's top), so the cloud hangs over the deleted text
+                    // and the line above keeps its letters.
+                    let row_top = oy + ((v.y0 - oy) / cell).floor() * cell;
+                    let climb = ((row_top - y) / (0.6 * cell)).clamp(0.0, 1.0);
+                    let rise_fade = if budgeted {
+                        1.0 - Self::STEAM_ABOVE_DIM * climb * climb * (3.0 - 2.0 * climb)
                     } else {
-                        0x00AB_BCC6
-                    },
-                    (150.0 * (1.0 - t) * (1.0 - t)) * cfg.intensity,
-                ),
+                        1.0
+                    };
+                    (
+                        cell * 0.26,
+                        1.0 + 3.4 * t,
+                        if cfg.dark_theme {
+                            0x00C9_D6DE
+                        } else {
+                            0x00AB_BCC6
+                        },
+                        (150.0 * (1.0 - t) * (1.0 - t)) * cfg.intensity * steam_share * rise_fade,
+                    )
+                }
                 VaporKind::Smoke => (
                     cell * 0.15,
                     1.0 + 2.4 * t,
                     if cfg.dark_theme {
-                        // Ember light glows through young smoke, greying as it climbs.
-                        lerp_rgb(0x0074_665A, 0x0044_403C, t)
+                        // A grey wisp: a warm puff read as a khaki blot
+                        // over the dark.
+                        lerp_rgb(0x005E_5E60, 0x0042_4246, t)
                     } else {
                         lerp_rgb(0x0060_544A, 0x0084_7E78, t)
                     },
-                    (52.0 * (1.0 - t)) * cfg.intensity,
+                    (if cfg.dark_theme { 34.0 } else { 52.0 }) * (1.0 - t) * cfg.intensity,
                 ),
                 // The erase poof: neutral grey (text going up in smoke, not
                 // fire). On light themes a mid-grey source-over veil with
@@ -195,14 +330,31 @@ impl CursorGlow {
                     (140.0 * (1.0 - t) * (1.0 - t)) * cfg.intensity,
                 ),
             };
-            let peak = peak as u8;
-            if peak == 0 {
+            if peak < 1.0 {
                 continue;
             }
             let r = r0 * grow;
             if cfg.dark_theme {
+                // Under fire, vapor over a line of text spends the over-ink
+                // ledger like every other fire light (the erase poof of the
+                // other styles keeps its own stacking budget).
+                let share = if matches!(cfg.style, GlowStyle::Fire) {
+                    self.ink_ledger.admit_halo(
+                        (x, y),
+                        (r * 1.35, r),
+                        premul_rgb(color, peak as u8),
+                        InkLedger::FLOOR,
+                    )
+                } else {
+                    1.0
+                };
+                let peak = (peak * share) as u8;
+                if peak == 0 {
+                    continue;
+                }
                 push_halo(halos, geom, x, y, r * 1.35, r, premul_rgb(color, peak));
             } else {
+                let peak = peak as u8;
                 push_halo_over(halos, geom, x, y, r * 1.35, r, color, peak);
             }
         }
@@ -248,7 +400,64 @@ impl CursorGlow {
         let mut runs_len = 0usize;
         self.comet_run.clear();
         let mut prev: Option<(u16, u16)> = None;
-        let mut head_cov = 0u8;
+        // The head sample's coverage before Fire's caps: the bridge onto the
+        // empty caret cell is the one place its streak runs at it.
+        let mut head_full = 0u8;
+        let stack = streak_layers(cfg.style);
+        // Beam power-down: the tube's thickness follows the newest spark's
+        // power envelope, holding full girth while live and thinning toward a
+        // hairline as it dims.
+        let beam_pw = if matches!(cfg.style, GlowStyle::Beam) {
+            self.sparks
+                .last()
+                .map(|s| {
+                    let age = now.saturating_duration_since(s.born).as_secs_f32();
+                    beam_power((age / s.life).clamp(0.0, 1.0))
+                })
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        // On a dark ground the beam family's streak lies under the letters
+        // ([`Self::emit_dark_bed`]): its samples keep their whole coverage,
+        // which lays the bed under text and the beam over air.
+        let bed = if cfg.dark_theme && !self.streak_unbudgeted() {
+            BedShape::of(cfg.style, beam_pw).map(|shape| {
+                // Sparkle's tail is its rail, laid by distance from the head:
+                // after a jump (a paste, a completion, a leap) `Length`
+                // stretches it from the shipped four cells; while typing it
+                // keeps them, as every style's typing tail does.
+                let leapt = self.sparks.last().is_some_and(|s| !s.typing);
+                if matches!(cfg.style, GlowStyle::Sparkle) && leapt {
+                    let k = cfg.length as f32 / GLOW_LENGTH_DEFAULT as f32;
+                    BedShape {
+                        wedge: (shape.wedge * k).clamp(1.0, 4.0 * shape.wedge),
+                        ..shape
+                    }
+                } else {
+                    shape
+                }
+            })
+        } else {
+            None
+        };
+        // Fire's per-unit lift on each band of a cell, memoized by colour and
+        // `pos` (consecutive samples of a typing run share both); its core
+        // thickness is `core_thick`'s Fire arm below.
+        let mut fire_lift_memo: Option<((u32, u32), BandLifts)> = None;
+        let fire_core = (chf * (0.13 + 0.09 * self.fire_t())).max(2.0);
+        // A dark fire's streak lays no light over a line of text: there it
+        // read as a warm smear through the letters' x-height, and the flames
+        // above the line are the fire. It lights only air (the caret's cell).
+        let fire_text = if matches!(cfg.style, GlowStyle::Fire)
+            && cfg.dark_theme
+            && !self.streak_unbudgeted()
+        {
+            let spans = self.probed_text_spans();
+            Some(TextView::new(spans, Some(&self.frame_text)))
+        } else {
+            None
+        };
         for s in &self.sparks {
             let age = now.saturating_duration_since(s.born).as_secs_f32();
             // Typing sparks hold full brightness for 55% of life then
@@ -304,36 +513,6 @@ impl CursorGlow {
             } else {
                 1.0 - frac
             };
-            let mut cov_f = (s.born_cov as f32) * tf * cfg.intensity;
-            // Fire legibility cap: the fire comet rides the typed line, and its
-            // head stacked with halos and bloom would saturate glyphs to white.
-            // Cap the streak's coverage over the occupied glyph cells to the
-            // phaser's text-safety ceiling; the bridge onto the empty cursor
-            // cell keeps full punch below (FIRE_HEAD_COV_CAP).
-            if matches!(cfg.style, GlowStyle::Fire) {
-                cov_f = cov_f.min(Self::FIRE_STREAK_COV_CAP);
-            }
-            // Phaser text-safety ceiling: PHASER_LAYERS overlap to 1.45× in the
-            // full-height core, so capping per-sample coverage at 112 keeps the
-            // stacked sum (≈162) under saturation and a same-hue glyph visible.
-            // Only overdriven configs reach it (default intensity 0.7 stays
-            // below).
-            if matches!(cfg.style, GlowStyle::Phaser) {
-                cov_f = cov_f.min(112.0);
-            }
-            // Laser scintillation: a ±14% energy ripple travelling head-ward,
-            // deterministic in (pos, age). It modulates around full power, so it
-            // reads as surging, never flicker toward dark.
-            if matches!(cfg.style, GlowStyle::Laser) {
-                cov_f *= 0.86 + 0.14 * (s.pos * 9.0 - age * 26.0).sin();
-            }
-            let cov = cov_f as u8;
-            let here = (s.row, s.col);
-            if cov == 0 {
-                prev = Some(here); // keep continuity so the next cell isn't a false split
-                continue;
-            }
-            let (x, y) = center(s.row, s.col);
             // Phaser samples carry the cell's laid hue as an offset from the
             // live sweep phase (`comet_color` adds `self.hue` back), so each
             // cell keeps the colour it was laid in. Other styles use the
@@ -343,16 +522,90 @@ impl CursorGlow {
             } else {
                 s.pos
             };
+            // The sample's peak, before its time envelope `tf`. On a dark
+            // ground the beam family keeps it whole: over the letters it
+            // lays the bed (its share of the peak is the bed's opacity, so
+            // the bed fades as the light would), and over air it is light.
+            let peak_f = (s.born_cov as f32) * cfg.intensity;
+            // On paper a laser's leap is its lightning's, out with the
+            // strike: the fired beam laid under the lines the leap crosses
+            // stood through their letters as a struck-through rule.
+            let tf = if !cfg.dark_theme && matches!(cfg.style, GlowStyle::Laser) && !s.typing {
+                0.0
+            } else {
+                tf
+            };
+            let mut cov_f = peak_f * tf;
+            let mut full_f = cov_f;
+            if matches!(cfg.style, GlowStyle::Fire) {
+                // Fire keeps its own caps: the fire comet rides the typed line,
+                // and its head stacked with halos and bloom would saturate
+                // glyphs to white. The streak is held to FIRE_STREAK_COV_CAP;
+                // the bridge onto the empty cursor cell keeps full punch below
+                // (FIRE_HEAD_COV_CAP).
+                cov_f = cov_f.min(Self::FIRE_STREAK_COV_CAP);
+                full_f = cov_f;
+                // On a dark ground the streak is the first light the over-ink
+                // ledger charges: over a text cell a sample keeps the coverage
+                // at which the layers of its stack reaching each band of the
+                // cell, in its own colour, still leave the reference stroke
+                // the steady lights' share of the contrast
+                // (`InkLedger::STEADY_FLOOR`); the crown, forge, embers and
+                // steam that follow spend what is left.
+                if fire_text
+                    .as_ref()
+                    .is_some_and(|text| text.over_text(i32::from(s.row), i32::from(s.col)))
+                {
+                    cov_f = 0.0;
+                } else if cfg.dark_theme {
+                    let color = self.comet_color(cfg, pos);
+                    let key = (color, pos.to_bits());
+                    let lifts = match fire_lift_memo {
+                        Some((k, l)) if k == key => l,
+                        _ => {
+                            let l = fire_band_lifts(stack, color, pos, fire_core, chf);
+                            fire_lift_memo = Some((key, l));
+                            l
+                        }
+                    };
+                    cov_f = self.ink_ledger.admit_axis((s.row, s.col), &lifts, cov_f);
+                }
+            }
+            // Laser scintillation: a ±14% energy ripple travelling head-ward,
+            // deterministic in (pos, age). It modulates around full power, so it
+            // reads as surging, never flicker toward dark. Applied to the
+            // whole sample, so the bed under the letters surges with the light
+            // over air (the factor never exceeds 1). One
+            // swell per cycle, at [`Self::LASER_RIPPLE_OMEGA`]: under the
+            // flash bound.
+            if matches!(cfg.style, GlowStyle::Laser) {
+                let ripple = 0.86 + 0.14 * (s.pos * 9.0 - age * Self::LASER_RIPPLE_OMEGA).sin();
+                cov_f *= ripple;
+                full_f *= ripple;
+            }
+            let cov = cov_f as u8;
+            let here = (s.row, s.col);
+            if cov == 0 {
+                prev = Some(here); // keep continuity so the next cell isn't a false split
+                continue;
+            }
+            let (x, y) = center(s.row, s.col);
             let sample = CometSample { x, y, cov, pos };
             let (runs, run) = (&mut self.comet_runs, &mut self.comet_run);
             chain_comet_sample(runs, run, &mut runs_len, prev, here, sample);
             prev = Some(here);
-            head_cov = cov;
+            head_full = full_f.min(255.0) as u8;
         }
         publish_comet_run(&mut self.comet_runs, &mut self.comet_run, &mut runs_len);
         if runs_len == 0 {
             return;
         }
+        // The dark bridge, drawn as its own knee→caret segment after the head
+        // run (see below).
+        let mut bridge: Option<[CometSample; 2]> = None;
+        // Whether the head run ends on the caret's own cell (the bed's
+        // bridge, which is air).
+        let mut caret_sample = false;
         // Connect the head run to the live cursor cell (no trailing gap), but
         // only while the cursor is adjacent to the run's head; after a line
         // change or leap a bridge would draw a stray diagonal from the old text.
@@ -372,56 +625,142 @@ impl CursorGlow {
             // real window and the adjacency test breaks.
             let x = oxf + (cc as f32 + cfg.head_dx) * cwf;
             if (x - head.x).abs() <= cwf * 1.5 && (y - head.y).abs() <= chf * 1.5 {
-                // Fire keeps full punch over the empty cursor cell: swept sparks
-                // are capped over glyph cells (FIRE_STREAK_COV_CAP), but the
-                // bridge has no glyph to bury, so the head returns to
-                // FIRE_HEAD_COV_CAP. `comet_beam` ramps 108→168 across the
-                // bridge, so the last glyph is not re-washed.
-                let bridge_cov = if matches!(cfg.style, GlowStyle::Fire) {
-                    (head_cov as f32 * Self::FIRE_HEAD_COV_CAP / Self::FIRE_STREAK_COV_CAP)
-                        .min(Self::FIRE_HEAD_COV_CAP) as u8
+                // Phaser: the bridge is being laid now, so it leads at the live
+                // sweep phase (offset 0.5, a fresh spark's hue). Other styles:
+                // the head of the path ramp.
+                let pos = if matches!(cfg.style, GlowStyle::Phaser) {
+                    0.5
                 } else {
-                    head_cov
+                    1.0
                 };
-                last.push(CometSample {
-                    x,
-                    y,
-                    cov: bridge_cov,
-                    // Phaser: the bridge is being laid now, so it leads at the
-                    // live sweep phase (offset 0.5, a fresh spark's hue). Other
-                    // styles: the head of the path ramp.
-                    pos: if matches!(cfg.style, GlowStyle::Phaser) {
-                        0.5
+                let fire = matches!(cfg.style, GlowStyle::Fire);
+                if bed.is_some() {
+                    // The bed runs on under the caret, and the caret's cell
+                    // is air the beam may light at full strength; the split
+                    // below ends the beam's run over the head's letter.
+                    last.push(CometSample {
+                        x,
+                        y,
+                        cov: head_full.max(head.cov),
+                        pos,
+                    });
+                    caret_sample = true;
+                } else if cfg.dark_theme {
+                    // Fire keeps full punch over the empty cursor cell: its
+                    // swept samples are capped (FIRE_STREAK_COV_CAP) and spend
+                    // the ledger over the glyphs, but the bridge has no glyph to
+                    // bury, so the head returns to FIRE_HEAD_COV_CAP.
+                    let full = if fire {
+                        (head_full as f32 * Self::FIRE_HEAD_COV_CAP / Self::FIRE_STREAK_COV_CAP)
+                            .min(Self::FIRE_HEAD_COV_CAP) as u8
                     } else {
-                        1.0
-                    },
-                });
+                        head_full
+                    };
+                    // The bridge is the one sample off the glyphs, so it runs at
+                    // the head's full coverage. `comet_beam` interpolates
+                    // coverage along a segment (and RDP keeps only a straight
+                    // run's ends), so a bridge inside the run would ramp from the
+                    // budget back up to full across the glyphs and re-wash them.
+                    // The run instead ends at a KNEE where the segment leaves
+                    // the head's cell, at the budget, and the knee→bridge
+                    // segment is drawn on its own below: the ramp to full
+                    // happens over the caret cell alone. A bridge still inside
+                    // the head's cell (a caret that did not leave it) is over
+                    // that glyph and keeps the budget.
+                    let (dx, dy) = (x - head.x, y - head.y);
+                    let exit = |d: f32, half: f32| {
+                        if d.abs() > 1e-3 {
+                            half / d.abs()
+                        } else {
+                            f32::INFINITY
+                        }
+                    };
+                    let t = exit(dx, cwf * 0.5).min(exit(dy, chf * 0.5));
+                    if t < 1.0 {
+                        let knee = CometSample {
+                            x: head.x + dx * t,
+                            y: head.y + dy * t,
+                            cov: head.cov,
+                            pos,
+                        };
+                        last.push(knee);
+                        bridge = Some([
+                            knee,
+                            CometSample {
+                                x,
+                                y,
+                                cov: full.max(head.cov),
+                                pos,
+                            },
+                        ]);
+                    } else {
+                        last.push(CometSample {
+                            x,
+                            y,
+                            cov: head.cov,
+                            pos,
+                        });
+                    }
+                } else {
+                    // Light ground: no budget applied, the bridge is one more
+                    // body sample, at the head's coverage.
+                    last.push(CometSample {
+                        x,
+                        y,
+                        cov: head.cov,
+                        pos,
+                    });
+                }
             }
         }
 
         // Light themes: additive light cannot brighten white, and saturating
         // add over fresh glyphs would lift their ink toward the ground. The
         // beam family draws as ink UNDER the letters instead
-        // ([`Self::emit_comet_light`]), one shape per style.
+        // ([`Self::emit_comet_light`]), one shape per style. Only the newest
+        // sample in a cell draws: an older one whose cell a newer sample
+        // already claimed is zeroed, so a revisited cell (a backspace and
+        // retype) never stacks two source-over bodies.
         if !cfg.dark_theme {
-            let _ = halos;
+            if self.water_seen.len() == Self::WATER_OWNER_SLOTS {
+                self.water_seen.fill(0);
+            } else {
+                self.water_seen.clear();
+                self.water_seen.resize(Self::WATER_OWNER_SLOTS, 0);
+            }
+            let (oxi, oyi) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+            for run in self.comet_runs[..runs_len].iter_mut().rev() {
+                for s in run.iter_mut().rev() {
+                    let (col, row) = (
+                        ((s.x - oxi as f32) / cwf).floor() as i32,
+                        ((s.y - oyi as f32) / chf).floor() as i32,
+                    );
+                    if col < 0 || row < 0 || col >= geom.cols as i32 || row >= geom.rows as i32 {
+                        continue;
+                    }
+                    if !Self::claim_water_cell(&mut self.water_seen, row as u16, col as u16) {
+                        s.cov = 0;
+                    }
+                }
+            }
             self.emit_comet_light(now, cfg, geom, runs_len, under);
             return;
         }
 
-        // Beam power-down: the tube's thickness follows the newest spark's
-        // power envelope, holding full girth while live and thinning toward a
-        // hairline as it dims.
-        let beam_pw = if matches!(cfg.style, GlowStyle::Beam) {
-            self.sparks
-                .last()
-                .map(|s| {
-                    let age = now.saturating_duration_since(s.born).as_secs_f32();
-                    beam_power((age / s.life).clamp(0.0, 1.0))
-                })
-                .unwrap_or(1.0)
+        // The dark bed: the swept runs lie under the letters as the style's
+        // bed, and the beam is drawn only over air (and onto the caret).
+        let runs_len = if let Some(shape) = bed {
+            self.emit_dark_bed(
+                cfg,
+                geom,
+                runs_len,
+                shape,
+                &|g: &CursorGlow, pos| g.comet_color(cfg, pos),
+                under,
+            );
+            self.split_air_runs(geom, runs_len, caret_sample)
         } else {
-            1.0
+            runs_len
         };
         // Phaser runs a fat core; with its tight PHASER_LAYERS halo it reads as
         // a solid bar of spectrum behind the cursor.
@@ -431,16 +770,18 @@ impl CursorGlow {
             GlowStyle::Phaser => (chf * 0.66).max(8.0),
             // Fire's core swells with the eased temperature (slim vein at a
             // smolder, a rope at full blaze), thin enough not to bury glyphs.
-            GlowStyle::Fire => (chf * (0.13 + 0.09 * self.fire_t())).max(2.0),
+            GlowStyle::Fire => fire_core,
             // FAT charged conductor (~2× the shared core): the lightning strikes
             // fork off a thick high-voltage cable of light, not a hairline.
             GlowStyle::Laser => (chf * 0.26).max(3.5),
             // The BEAM tube: a solid rod (~1/3 cell) at full power, collapsing
             // toward a hairline as the light powers down (`beam_pw` above).
             GlowStyle::Beam => (chf * (0.08 + 0.26 * beam_pw)).max(2.0),
-            // Sparkle pours a wide rainbow ribbon (~0.45 cell) for the
+            // Sparkle lays a wide ribbon (~0.45 cell, SPARKLE_LAYERS) for the
             // celestial shapes to fall out of; cap-height and descender bands
-            // stay clear.
+            // stay clear. While typing it is one rolling hue (every typing
+            // spark sits at `pos` 1.0, and the hue steps each key); a
+            // multi-cell move sweeps half the wheel tail to head.
             GlowStyle::Sparkle => (chf * 0.45).max(5.0),
             _ => (chf * 0.13).max(2.0), // crisp thin core
         };
@@ -448,11 +789,51 @@ impl CursorGlow {
         // is a clean diagonal, not a stair-stepped polyline of cell centres.
         let straighten = cwf.max(chf) * 0.8;
 
-        // The laser arm's filament polyline scratch, taken with `mem::take`
+        // The layered rasterizer's working buffers, taken with `mem::take`
         // (the loop calls `self.comet_color`, a whole-`self` borrow) after
         // every early return and restored right after the loop.
-        let mut comet_verts = std::mem::take(&mut self.comet_verts);
-        for r in &self.comet_runs[..runs_len] {
+        let mut beam_scratch = std::mem::take(&mut self.beam_scratch);
+        let aura_from = halos.len();
+        let color_at = |pos: f32| self.comet_color(cfg, pos);
+        let runs = if bed.is_some() {
+            &self.air_runs[..runs_len]
+        } else {
+            &self.comet_runs[..runs_len]
+        };
+        for (i, r) in runs.iter().enumerate() {
+            // A one-row run (a typed run) is collinear, so straightening would
+            // only drop its interior samples: the run would be drawn as one
+            // chord whose coverage ramps from its fading tail to its head, and
+            // each time that tail expired the next sample (at full light)
+            // would become the chord's end, so every cell inside the run would
+            // dim with each key and jump back as the tail went (a re-flare at
+            // the typing rate, `the_typing_streak_flashes_no_pixel_more_than_three_times_a_second`).
+            // Keeping every sample draws each cell at its own coverage and
+            // laid hue, as the phaser (whose runs are always one row) does;
+            // geometry is identical. A leap across rows still
+            // straightens into a clean diagonal. Only the flash test's control
+            // flag is forked, so that test reads the shipped expression.
+            #[cfg(not(test))]
+            let chords_rows = false;
+            #[cfg(test)]
+            let chords_rows = self.streak_chords_rows;
+            let one_row = !chords_rows && r.iter().all(|s| s.y == r[0].y);
+            let tol = if one_row || matches!(cfg.style, GlowStyle::Phaser) {
+                0.0
+            } else {
+                straighten
+            };
+            // The head run's knee→caret bridge: drawn after the run on its own
+            // (unsimplified), and the knee is geometry, not a sample, so it
+            // lays no laser aura.
+            let bridge = bridge.filter(|_| i + 1 == runs_len);
+            // Over the bed, the head's bridge over the caret's own cell is
+            // the caret's light: kept inside that cell, so the beam's halo
+            // does not stand above and below the caret as a stub.
+            let stub = (bed.is_some() && caret_sample && i + 1 == runs_len && Self::is_bridge(r))
+                .then(|| cur.map(|(cr, cc)| Self::caret_box(geom, cr, cc)))
+                .flatten();
+            let from = out.len();
             if r.len() < 2 {
                 // A lone swept cell (e.g. a single move with the cursor hidden): a
                 // small soft dot, not a full blocky cell.
@@ -470,91 +851,65 @@ impl CursorGlow {
                 continue;
             }
             // The layered-bloom looks live once in `aterm_render`, shared with
-            // the render demos. Laser has its own stack (a razor filament in a
-            // wide smooth same-hue halo, fine strides); the phaser's
-            // near-cell-height core needs the tight PHASER_LAYERS halo.
-            match cfg.style {
-                GlowStyle::Laser => {
-                    // Filament and tight body: the inner laser layers only
-                    // (thickness×core ≤ 2.9, ≤ ~0.75 cell) at 1 px strides.
-                    // Tuple: (thickness×, coverage×, white-mix base, white-mix ×pos).
-                    const LASER_CORE: [(f32, f32, f32, f32); 3] = [
-                        (2.9, 0.60, 0.0, 0.0),   // inner glow (pure hue)
-                        (1.5, 0.95, 0.10, 0.0),  // beam body
-                        (0.6, 1.00, 0.26, 0.42), // white-hot filament, hotter to the head
-                    ];
-                    // `comet_verts` is cleared at each layer pass and
-                    // `comet_beam` reads only the filled prefix.
-                    for &(tmul, cmul, mbase, mpos) in &LASER_CORE {
-                        comet_verts.clear();
-                        for s in r {
-                            let style = self.comet_color(cfg, s.pos);
-                            let color = if mbase > 0.0 || mpos > 0.0 {
-                                lerp_rgb(style, 0x00FF_FFFF, (mbase + mpos * s.pos).min(1.0))
-                            } else {
-                                style
-                            };
-                            comet_verts.push(BeamVertex {
-                                x: s.x,
-                                y: s.y,
-                                color,
-                                cov: (s.cov as f32 * cmul) as u8,
-                            });
-                        }
-                        comet_beam(
-                            out,
-                            geom.beam_clip(),
-                            &comet_verts,
-                            core_thick * tmul,
-                            1,
-                            straighten,
-                        );
+            // the render demos: each style's stack is `streak_layers`, the same
+            // one its over-ink budget was charged against.
+            layered_beam_quads_with(
+                &mut beam_scratch,
+                out,
+                geom.beam_clip(),
+                r,
+                core_thick,
+                tol,
+                &color_at,
+                stack,
+            );
+            if let Some(cell) = stub {
+                clip_quads_to(out, from, cell);
+            }
+            if let Some(pair) = bridge.as_ref() {
+                layered_beam_quads_with(
+                    &mut beam_scratch,
+                    out,
+                    geom.beam_clip(),
+                    pair,
+                    core_thick,
+                    0.0,
+                    &color_at,
+                    stack,
+                );
+            }
+            if matches!(cfg.style, GlowStyle::Laser) {
+                // The laser's wide aura is radial halos, never per-row quad
+                // slabs, which would posterize into bands and drop a detached
+                // quad below the cursor. One halo per swept sample (the bridge
+                // at its full punch, never the knee); neighbours merge into one
+                // tube in the pure beam hue.
+                let samples = &r[..r.len() - usize::from(bridge.is_some())];
+                for s in samples.iter().chain(bridge.as_ref().map(|p| &p[1])) {
+                    let peak = (s.cov as f32 * Self::LASER_AURA_COV).min(150.0) as u8;
+                    if peak == 0 {
+                        continue;
                     }
-                    // The wide aura is radial halos, never per-row quad slabs,
-                    // which would posterize into bands and drop a detached quad
-                    // below the cursor. One halo per swept sample; neighbours
-                    // merge into one tube in the pure beam hue.
-                    for s in r {
-                        let peak = (s.cov as f32 * 0.42).min(150.0) as u8;
-                        if peak == 0 {
-                            continue;
-                        }
-                        push_halo(
-                            halos,
-                            geom,
-                            s.x,
-                            s.y,
-                            cwf * 1.35,
-                            chf * 1.05,
-                            premul_rgb(cfg.color, peak),
-                        );
-                    }
-                }
-                GlowStyle::Phaser => {
-                    // No RDP straightening for the phaser: its runs are same-row,
-                    // so simplification would only drop interior samples and
-                    // their laid hues, collapsing the spectrum to one lerped
-                    // colour. Keeping every sample renders each cell in its laid
-                    // hue; geometry is identical (collinear samples).
-                    phaser_streak_quads(out, geom.beam_clip(), r, core_thick, 0.0, &|pos| {
-                        self.comet_color(cfg, pos)
-                    });
-                }
-                GlowStyle::Beam => {
-                    beam_glow_quads(out, geom.beam_clip(), r, core_thick, straighten, &|pos| {
-                        self.comet_color(cfg, pos)
-                    });
-                }
-                _ => {
-                    comet_glow_quads(out, geom.beam_clip(), r, core_thick, straighten, &|pos| {
-                        self.comet_color(cfg, pos)
-                    });
+                    push_halo(
+                        halos,
+                        geom,
+                        s.x,
+                        s.y,
+                        cwf * 1.35,
+                        chf * 1.05,
+                        premul_rgb(cfg.color, peak),
+                    );
                 }
             }
         }
-        // Restore the filament scratch UNCONDITIONALLY (no exit path lies between
-        // the take and here), so its capacity survives to the next frame.
-        self.comet_verts = comet_verts;
+        // Restore the scratch UNCONDITIONALLY (no exit path lies between the
+        // take and here), so its capacity survives to the next frame.
+        self.beam_scratch = beam_scratch;
+        // Over the bed, whatever of the laser's aura reaches a letter spends
+        // the over-ink account as the crown's head light does (an idle
+        // account admits it whole).
+        self.ink_ledger
+            .admit_halos_masked(halos, aura_from, InkLedger::HEAD_FLOOR);
     }
 
     /// THE BEAM FAMILY ON A LIGHT GROUND: each style's body as ink under the
@@ -563,16 +918,25 @@ impl CursorGlow {
     /// the swept row, so the lines above and below stay clean. Each style
     /// keeps the shape its name promises, so no two read alike:
     ///
-    /// * Comet: a tail tapering in girth from a hairline three cells back to
-    ///   full height at the caret, its ink holding its weight, joined to the
-    ///   round head the comet nucleus inks (`cursor_comet`) and its crown;
+    /// * Comet: a wedge from a hairline tail to a full head at the caret,
+    ///   held inside the caret's cell, with a dense round nucleus where the
+    ///   caret meets the newest letter;
     /// * Beam: an even tube around the letters, one colour with no darker
     ///   core, fading as it powers down — never a line through them;
-    /// * Laser: a hard thin line in its own hue (the bolts and sparks ink in
-    ///   their own emitters);
+    /// * Laser: a hard thin line in its own hue over a faint sheath (the
+    ///   bolts and sparks ink in their own emitters, and a crackle laid on
+    ///   top keeps the stack under the body cap's legibility);
     /// * Phaser: the band of spectrum it sweeps through;
-    /// * Sparkle, Fire, Lumen: no body here (their stars, flames and glow are
-    ///   their identity, drawn by their own emitters).
+    /// * Sparkle: the light twin of its dark ribbon, at the beam's quiet
+    ///   alpha, in the hue it rolls through;
+    /// * Lumen: a quiet tracer behind the caret (its glow is its crown,
+    ///   [`Self::emit_crown`]);
+    /// * Fire: no body here (fire is carried by its ink flames, meteors and
+    ///   embers).
+    ///
+    /// Every pass composites to at most [`LIGHT_BODY_ALPHA_CAP`] at any
+    /// pixel, in the light body's ink ([`LightGround::body_ink`]), solved so
+    /// that even opaque it keeps the theme's text at the bar over it.
     fn emit_comet_light(
         &mut self,
         now: Instant,
@@ -584,11 +948,17 @@ impl CursorGlow {
         use aterm_render::{GlowBlend, RibbonVertex, ribbon_beam};
         if !matches!(
             cfg.style,
-            GlowStyle::Comet | GlowStyle::Beam | GlowStyle::Laser | GlowStyle::Phaser
+            GlowStyle::Comet
+                | GlowStyle::Beam
+                | GlowStyle::Laser
+                | GlowStyle::Phaser
+                | GlowStyle::Sparkle
+                | GlowStyle::Lumen
         ) {
             return;
         }
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+        let body_cap = LIGHT_BODY_ALPHA_CAP;
         // The tube's girth follows the newest spark's power envelope, as on
         // a dark ground.
         let beam_pw = if matches!(cfg.style, GlowStyle::Beam) {
@@ -600,7 +970,7 @@ impl CursorGlow {
             1.0
         };
         // Under the letters: the ink is solved against the theme's own text.
-        let ground = LightGround::of(cfg);
+        let ground = self.light_ground(cfg);
         let ink = |rgb: u32| ground.body_ink(rgb);
         let clip = geom.beam_clip();
         // Eighth-cell slabs: a slab carries one coverage, so a wider one
@@ -609,12 +979,13 @@ impl CursorGlow {
         let budget = under.len().saturating_add(Self::MAX_QUADS);
         let mut verts = std::mem::take(&mut self.light_verts);
         // One pass of one shape: `layer` maps a sample to its spine offset,
-        // half-height (reach), alpha and colour; `core` is the share of the
-        // reach drawn at full strength before the edge melts.
+        // half-height (reach), alpha and colour.
+        // `feather` starts a run of two or more samples from nothing half a
+        // cell behind its oldest sample, so it does not begin square.
         let pass = |under: &mut Vec<GlowQuad>,
                     verts: &mut Vec<RibbonVertex>,
                     run: &[CometSample],
-                    core: f32,
+                    feather: bool,
                     layer: &dyn Fn(&CometSample) -> (f32, f32, f32, u32)| {
             verts.clear();
             let mut push = |x: f32, s: &CometSample| {
@@ -627,10 +998,10 @@ impl CursorGlow {
                     spine: s.y + dy,
                     up: reach,
                     dn: reach,
-                    core_up: reach * core,
-                    core_dn: reach * core,
+                    core_up: reach * 0.5,
+                    core_dn: reach * 0.5,
                     color,
-                    cov: alpha.clamp(0.0, LIGHT_BODY_ALPHA_CAP),
+                    cov: alpha.clamp(0.0, body_cap),
                     lift: 0.0,
                     lift_span: 0.0,
                 });
@@ -640,16 +1011,99 @@ impl CursorGlow {
                 push(lone.x - cwf * 0.45, lone);
                 push(lone.x + cwf * 0.45, lone);
             } else {
+                if feather && let [first, second, ..] = run {
+                    let dir = if second.x < first.x { -1.0 } else { 1.0 };
+                    push(first.x - dir * cwf * 0.5, &CometSample { cov: 0, ..*first });
+                }
                 for s in run {
                     push(s.x, s);
                 }
             }
             ribbon_beam(under, clip, verts, 1.0, stride, budget, GlowBlend::Over);
         };
+        let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+        let row_of = |s: &CometSample| ((s.y - oyf) / chf).floor() as i32;
+        let cell_of = |s: &CometSample| (row_of(s), ((s.x - oxf) / cwf).floor() as i32);
+        // The host's newest probe of the caret's row (`'\0'` at a wide
+        // glyph's continuation): which swept cells hold a wide glyph (CJK,
+        // emoji). A band fills a wide glyph's whole box, gaps between its
+        // strokes included, where a Latin letter keeps the paper above and
+        // below its x-height, so over wide glyphs a band keeps its shape and
+        // hue at a lighter opacity ([`LIGHT_WIDE_BED_KEEP`]).
+        let probe = self
+            .row_cur_meta
+            .as_ref()
+            .map(|m| (m.row, &self.row_cur))
+            .or_else(|| self.row_prev_meta.as_ref().map(|m| (m.row, &self.row_prev)));
+        let wide = |s: &CometSample| {
+            let (row, col) = cell_of(s);
+            probe.is_some_and(|(probed, chars)| {
+                i32::from(probed) == row
+                    && usize::try_from(col).is_ok_and(|col| {
+                        chars.get(col) == Some(&'\0') || chars.get(col + 1) == Some(&'\0')
+                    })
+            })
+        };
+        let after_wide = |s: &CometSample| {
+            let (row, col) = cell_of(s);
+            probe.is_some_and(|(probed, chars)| {
+                i32::from(probed) == row
+                    && usize::try_from(col - 1).is_ok_and(|prev| chars.get(prev) == Some(&'\0'))
+            })
+        };
+        // A band body's run in one pass (so a wide stretch joins the narrow
+        // ones on either side with no seam), rising from nothing over its
+        // oldest [`Self::LIGHT_BAND_TAIL_CELLS`] (a leap's tail fades out
+        // instead of ending in a cut), the opacity over a wide glyph held to
+        // what leaves the theme's text [`LIGHT_WIDE_BED_KEEP`] of its contrast
+        // in that cell's ink.
+        let (fg, bg) = (cfg.theme_fg, cfg.theme_bg);
+        let banded = |under: &mut Vec<GlowQuad>,
+                      verts: &mut Vec<RibbonVertex>,
+                      run: &[CometSample],
+                      band: &dyn Fn(&CometSample) -> (f32, f32, f32, u32)| {
+            // The feather's zero knot, half a cell behind the oldest sample.
+            let tail = match run {
+                [first, second, ..] => {
+                    let dir = if second.x < first.x { -1.0 } else { 1.0 };
+                    Some((first.x - dir * cwf * 0.5, dir))
+                }
+                _ => None,
+            };
+            pass(under, verts, run, true, &|s| {
+                let (dy, reach, alpha, color) = band(s);
+                let alpha = tail.map_or(alpha, |(x0, dir)| {
+                    let k =
+                        ((s.x - x0) * dir / (cwf * Self::LIGHT_BAND_TAIL_CELLS)).clamp(0.0, 1.0);
+                    alpha * k * k * (3.0 - 2.0 * k)
+                });
+                // The cell just past a wide glyph (the caret's, as one is
+                // typed) is held too: the band's opacity ramps between its
+                // samples, and the ramp up to a full caret cell crossed the
+                // newest glyph's right half.
+                if wide(s) || after_wide(s) {
+                    let held = light_alpha_keeping(color, fg, bg, LIGHT_WIDE_BED_KEEP);
+                    (dy, reach, alpha.min(held), color)
+                } else {
+                    (dy, reach, alpha, color)
+                }
+            });
+        };
         for run in &self.comet_runs[..runs_len] {
-            if run.is_empty() {
+            let Some(head) = run.last() else {
                 continue;
-            }
+            };
+            // A band is ink under the letters of the row it lies in, so a run
+            // that leaps rows (Enter, a jump) draws only its stretch on the
+            // head's row: laid across the rows it crossed, it would stripe
+            // the text there (the output an Enter just printed) for a frame.
+            // The laser's strike is a hairline, so it keeps its whole path.
+            let head_row = row_of(head);
+            let last_off_row = run.iter().rposition(|s| row_of(s) != head_row);
+            let run = match (cfg.style, last_off_row) {
+                (GlowStyle::Laser, _) | (_, None) => &run[..],
+                (_, Some(last_off)) => &run[last_off + 1..],
+            };
             match cfg.style {
                 GlowStyle::Comet => {
                     // The comet's silhouette: a full head at the caret and a
@@ -661,44 +1115,218 @@ impl CursorGlow {
                     let color = ink(cfg.color);
                     let head = run[run.len() - 1];
                     let from = run.len().checked_sub(2).map(|i| run[i]);
-                    if let Some(prev) = from.filter(|prev| (prev.y - head.y).abs() > chf * 0.5) {
-                        // A leap across rows: the swept samples themselves.
-                        let _ = prev;
-                        pass(under, &mut verts, run, 0.75, &|s| {
-                            (
-                                chf * 0.04,
-                                chf * (0.08 + 0.38 * s.pos),
-                                f32::from(s.cov) * 2.6 * (0.55 + 0.45 * s.pos),
-                                color,
-                            )
-                        });
-                        continue;
-                    }
                     let back = match from {
                         Some(prev) if prev.x > head.x => 1.0,
                         _ => -1.0,
                     };
-                    const KNOTS: usize = 12;
-                    // Three whole cells behind the caret's cell, measured
-                    // from its centre.
+                    // The tail tapers over three and a half cells to the
+                    // head under the caret, and the head is round: the same
+                    // ink carries on past the caret's centre into a soft cap
+                    // (the coma, in one pass with the tail, so the two never
+                    // stack).
+                    const KNOTS: usize = 14;
+                    const CAP_KNOTS: usize = 5;
                     let tail = cwf * 3.5;
-                    let mut wedge = [head; KNOTS + 1];
+                    // The head's cell edge ahead of it: the cap ends there,
+                    // under the caret, so no rim of it stands past the
+                    // caret's edge as a nub.
+                    let ox = f32::from(geom.origin_x);
+                    let col = ((head.x - ox) / cwf).floor();
+                    let (lead_edge, trail_edge) = if back < 0.0 {
+                        (ox + (col + 1.0) * cwf, ox + col * cwf)
+                    } else {
+                        (ox + col * cwf, ox + (col + 1.0) * cwf)
+                    };
+                    let cap = (lead_edge - head.x).abs().min(cwf * 0.65);
+                    let mut wedge = [head; KNOTS + CAP_KNOTS + 1];
                     for (k, knot) in wedge.iter_mut().enumerate() {
-                        // `k = 0` is the tail's tip, `KNOTS` the head.
-                        let toward_head = k as f32 / KNOTS as f32;
-                        knot.x = head.x + back * tail * (1.0 - toward_head);
-                        knot.pos = toward_head;
+                        if k <= KNOTS {
+                            // `k = 0` is the tail's tip, `KNOTS` the head.
+                            let toward_head = k as f32 / KNOTS as f32;
+                            knot.x = head.x + back * tail * (1.0 - toward_head);
+                            knot.pos = toward_head;
+                        } else {
+                            // The cap ahead of the head, `pos` past 1.
+                            let ahead = (k - KNOTS) as f32 / CAP_KNOTS as f32;
+                            knot.x = head.x - back * cap * ahead;
+                            knot.pos = 1.0 + ahead;
+                        }
                     }
-                    // It tapers once, in girth: its ink holds most of its
-                    // weight down the tail and its solid core spans most of
-                    // its height, so the tail reads as the comet's body, not
-                    // a smear that fades twice.
-                    pass(under, &mut verts, &wedge, 0.75, &|s| {
+                    let q0 = under.len();
+                    pass(under, &mut verts, &wedge, false, &|s| {
+                        let (round, along) = if s.pos > 1.0 {
+                            let a = s.pos - 1.0;
+                            ((1.0 - a * a).max(0.0).sqrt(), 1.0)
+                        } else {
+                            (1.0, s.pos)
+                        };
                         (
                             chf * 0.04,
-                            chf * (0.10 + 0.36 * s.pos),
-                            (f32::from(s.cov) * 4.0).min(LIGHT_BODY_ALPHA_CAP)
-                                * (0.55 + 0.45 * s.pos),
+                            chf * (0.06 + 0.40 * along) * round,
+                            (f32::from(s.cov) * 4.0).min(body_cap) * along.sqrt() * round * round,
+                            color,
+                        )
+                    });
+                    // Held inside the caret's cell's leading edge and the
+                    // row (the pass keeps its reach inside the row; the
+                    // nucleus below is held here).
+                    let lead = lead_edge.round() as i32;
+                    let oy = i32::from(geom.origin_y);
+                    let row_top = oy
+                        + ((head.y - f32::from(geom.origin_y)) / chf).floor() as i32
+                            * geom.ch as i32;
+                    let hold = if back < 0.0 {
+                        (i32::MIN, row_top, lead, row_top + geom.ch as i32)
+                    } else {
+                        (lead, row_top, i32::MAX, row_top + geom.ch as i32)
+                    };
+                    clip_quads_to(under, q0, hold);
+                    // The nucleus: a dense round head where the caret's
+                    // trailing edge meets the newest letter (the block caret
+                    // covers the head's own cell), the comet's ink laid over
+                    // the tail as deep as the body cap. The ink is solved so
+                    // that even opaque it keeps the theme's text at the bar
+                    // ([`LightGround::body_ink`]), so the nucleus is the
+                    // source-over remainder that takes the tail's own alpha
+                    // at the head, `t`, to the cap: `(cap − t) / (1 − t/255)`,
+                    // nothing where the tail is already opaque.
+                    let fresh = (f32::from(head.cov) / 255.0 * 4.0).min(1.0);
+                    let t = (f32::from(head.cov) * 4.0).min(LIGHT_BODY_ALPHA_CAP);
+                    let remainder = if t >= 255.0 {
+                        0.0
+                    } else {
+                        ((LIGHT_BODY_ALPHA_CAP - t) / (1.0 - t / 255.0)).max(0.0)
+                    };
+                    let peak = remainder.min(LIGHT_BODY_ALPHA_CAP) * fresh;
+                    if peak >= 1.0 {
+                        let q1 = under.len();
+                        let budget = under.len().saturating_add(Self::MAX_QUADS);
+                        push_ink_ellipse(
+                            under,
+                            geom,
+                            (trail_edge + back * cwf * 0.22, head.y + chf * 0.04),
+                            (cwf * 0.62, cwf * 0.62),
+                            chf * 0.36,
+                            color,
+                            peak,
+                            budget,
+                        );
+                        clip_quads_to(under, q1, hold);
+                    }
+                    // The comet's head on paper, which neither Beam's tube nor
+                    // Lumen's tracer has: a round coma around the caret,
+                    // ringed in a deeper rim, as tall as the row, riding the
+                    // head's freshness.
+                    if fresh > 0.02 {
+                        let budget = under.len().saturating_add(Self::MAX_QUADS);
+                        push_ink_ring(
+                            under,
+                            geom,
+                            (head.x, head.y),
+                            chf * Self::COMET_LIGHT_COMA_R,
+                            (chf * Self::COMET_LIGHT_COMA_RIM).max(1.5),
+                            color,
+                            (body_cap * 0.28 * fresh, body_cap * 0.92 * fresh),
+                            budget,
+                        );
+                    }
+                    // The comet's own cue on paper, which Lumen's quiet tracer
+                    // has not: ice crystals glinting along its tail, small
+                    // four-point stars of its ink in the row's leading, off
+                    // every letter's ink: above the ascenders' tops, or below
+                    // the baseline where the letter there has no descender,
+                    // each twinkling on its own phase and riding the head's
+                    // freshness. Flat stars (a long horizontal arm, a short
+                    // vertical one), so they fit the leading.
+                    let born = self.sparks.last().map_or(now, |s| s.born);
+                    let age = now.saturating_duration_since(born).as_secs_f32();
+                    let arm = chf * Self::COMET_LIGHT_GLINT_ARM;
+                    let thin = (chf * 0.045).max(1.0);
+                    let row_top = f32::from(geom.origin_y)
+                        + ((head.y - f32::from(geom.origin_y)) / chf).floor() * chf;
+                    let descends = |x: f32| {
+                        let col = ((x - f32::from(geom.origin_x)) / cwf).floor() as i32;
+                        probe.is_some_and(|(probed, chars)| {
+                            i32::from(probed) == row_of(&head)
+                                && usize::try_from(col).is_ok_and(|col| {
+                                    chars.get(col).is_some_and(|c| {
+                                        "gjpqyQ,;_|()[]{}@$".contains(*c) || !c.is_ascii()
+                                    })
+                                })
+                        })
+                    };
+                    #[cfg(test)]
+                    self.light_glints.clear();
+                    for (k, &(behind, high)) in Self::COMET_LIGHT_GLINTS.iter().enumerate() {
+                        let twinkle = twinkle_env(age, k as f32 * 2.1 + head.x * 0.013);
+                        let peak = LIGHT_BODY_ALPHA_CAP * 0.85 * fresh * twinkle;
+                        if peak < 1.0 {
+                            continue;
+                        }
+                        let x = head.x + back * cwf * behind;
+                        let low = !high && !descends(x);
+                        let centre = (
+                            x,
+                            row_top
+                                + chf
+                                    * if low {
+                                        Self::COMET_LIGHT_GLINT_LOW
+                                    } else {
+                                        Self::COMET_LIGHT_GLINT_HIGH
+                                    },
+                        );
+                        let rise = chf
+                            * if low {
+                                Self::COMET_LIGHT_GLINT_RISE.1
+                            } else {
+                                Self::COMET_LIGHT_GLINT_RISE.0
+                            };
+                        // A wide glyph fills its whole box, its leading
+                        // included, so a glint there would lie in its
+                        // strokes: it gives way.
+                        if wide(&CometSample {
+                            x: centre.0,
+                            y: head.y,
+                            ..head
+                        }) {
+                            continue;
+                        }
+                        let budget = under.len().saturating_add(Self::MAX_QUADS);
+                        let q2 = under.len();
+                        push_ink_ellipse(
+                            under,
+                            geom,
+                            centre,
+                            (arm, arm),
+                            thin,
+                            color,
+                            peak,
+                            budget,
+                        );
+                        push_ink_ellipse(
+                            under,
+                            geom,
+                            centre,
+                            (thin, thin),
+                            rise,
+                            color,
+                            peak,
+                            budget,
+                        );
+                        clip_quads_to(under, q2, hold);
+                        #[cfg(test)]
+                        self.light_glints.push(centre);
+                    }
+                }
+                GlowStyle::Lumen => {
+                    // A quiet tracer behind the caret in the cursor's ink,
+                    // through the x-height, fading with each cell's light.
+                    let color = ink(cfg.color);
+                    pass(under, &mut verts, run, true, &|s| {
+                        (
+                            chf * 0.04,
+                            chf * 0.16,
+                            (f32::from(s.cov) * 1.2).min(body_cap * 0.85),
                             color,
                         )
                     });
@@ -710,27 +1338,53 @@ impl CursorGlow {
                     // band on the row's centre line reads as a line struck
                     // through what was just typed.
                     let body = ink(cfg.color);
-                    pass(under, &mut verts, run, 0.5, &|s| {
+                    banded(under, &mut verts, run, &|s| {
                         (0.0, chf * 0.40, f32::from(s.cov) * 0.55 * beam_pw, body)
                     });
                 }
                 GlowStyle::Laser => {
-                    // A soft sheath, then the hard line.
+                    // A soft sheath, then the hard line. Composited they stay
+                    // under about 113, so a crackle at
+                    // `LIGHT_BOLT_ALPHA_CAP` laid on top keeps the stack
+                    // within about 200 (4.59:1 at the worst hue on Default
+                    // Light).
                     let color = ink(cfg.color);
-                    pass(under, &mut verts, run, 0.5, &|s| {
-                        (chf * 0.08, chf * 0.20, f32::from(s.cov) * 0.30, color)
+                    pass(under, &mut verts, run, false, &|s| {
+                        (
+                            chf * 0.08,
+                            chf * 0.20,
+                            (f32::from(s.cov) * 0.12).min(28.0),
+                            color,
+                        )
                     });
-                    pass(under, &mut verts, run, 0.5, &|s| {
-                        (chf * 0.08, chf * 0.07, f32::from(s.cov) * 0.95, color)
+                    pass(under, &mut verts, run, false, &|s| {
+                        (
+                            chf * 0.08,
+                            chf * 0.07,
+                            (f32::from(s.cov) * 0.45).min(96.0),
+                            color,
+                        )
                     });
                 }
                 GlowStyle::Phaser => {
                     // The spectrum band, each cell in the hue it was laid in.
-                    pass(under, &mut verts, run, 0.5, &|s| {
+                    banded(under, &mut verts, run, &|s| {
                         (
                             0.0,
                             chf * 0.40,
                             f32::from(s.cov) * 1.6,
+                            ink(self.comet_color(cfg, s.pos)),
+                        )
+                    });
+                }
+                GlowStyle::Sparkle => {
+                    // The light twin of its 0.45-cell dark ribbon, at the
+                    // beam's quiet alpha, in the hue it rolls through.
+                    banded(under, &mut verts, run, &|s| {
+                        (
+                            0.0,
+                            chf * 0.40,
+                            f32::from(s.cov) * 0.55,
                             ink(self.comet_color(cfg, s.pos)),
                         )
                     });
@@ -741,14 +1395,24 @@ impl CursorGlow {
         self.light_verts = verts;
     }
 
-    /// Per-pixel fire: each hot cell of the envelope emits [`FirePatch`]es
-    /// (split per row band, sharing root and phase so the field is seamless)
-    /// that both backends evaluate per device pixel through the shared integer
-    /// field. Dark themes composite additively; light themes get the ink-fire
-    /// ([`FireMode::Over`]). The per-cell engulfment, derived analytically from
-    /// the same envelope, feeds the contrast-halo strengths (`halo_cells`), a
-    /// colour-free legibility stream (ink is never recoloured).
-    #[allow(clippy::too_many_arguments)] // the cool-veil halo sink crossed the arity line
+    /// Per-pixel fire on a dark ground: each hot cell of the envelope emits
+    /// [`FirePatch`]es that both backends evaluate per device pixel through
+    /// the shared integer field, composited additively. The patches are cut
+    /// in narrow columns ([`Self::FIRE_SUBCOLS`] a cell) whose height is the
+    /// envelope smoothed across the cells ([`flame_heat`]), so a flame rises
+    /// and falls off along the line instead of standing as a one-cell slab
+    /// with square sides, and in short slices whose ceiling thins toward the
+    /// tips, so the light dies upward instead of ending in a flat lid. Over
+    /// a row the frame shows blank the ceiling is the air's, brighter than
+    /// the translucent tint a line of text keeps. The per-cell engulfment,
+    /// derived from the same envelope, feeds the contrast-halo strengths
+    /// (`halo_cells`), a colour-free legibility stream (ink is never
+    /// recoloured). On a light ground the fire is ink tongues beneath the
+    /// letters instead ([`Self::emit_flames_light`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "clock, config, geometry and the five streams the fire can land in"
+    )]
     pub(super) fn emit_flames(
         &self,
         now: Instant,
@@ -759,7 +1423,7 @@ impl CursorGlow {
         _charred: &mut Vec<CharFg>,
         halo_cells: &mut Vec<FireHaloCell>,
         engulf: &mut Vec<(u16, u16, f32)>,
-        _halos: &mut Vec<RainHalo>,
+        under: &mut Vec<GlowQuad>,
     ) {
         engulf.clear();
         if !matches!(cfg.style, GlowStyle::Fire) || self.sparks.is_empty() {
@@ -767,27 +1431,12 @@ impl CursorGlow {
         }
         let ch = geom.ch as f32;
         let t = self.fire_t();
-        let mode = if cfg.dark_theme {
-            FireMode::Add
-        } else {
-            FireMode::Over
-        };
-        // Coverage ceiling, per ground:
-        // * dark: additive light over the letters' ground washes white glyphs
-        //   out, so the field stays a translucent tint the glyph shows
-        //   through, even at the white-hot head; the drama comes from height,
-        //   motion and the wall above the line, not opacity;
-        // * light: the field is ink UNDER the letters, so the only limit is
-        //   the theme's text over its darkest flame
-        //   ([`light_fire_cov_ceiling`]); a lone peck shows at under half of
-        //   it and a full blaze reaches it.
-        let cov_cap = match mode {
-            FireMode::Add => (22.0 + 12.0 * t).min(255.0) as u8,
-            FireMode::Over => {
-                (f32::from(light_fire_cov_ceiling(cfg.theme_fg, cfg.theme_bg)) * (0.45 + 0.55 * t))
-                    as u8
-            }
-        };
+        // Legibility-first coverage ceiling. On a dark ground the additive
+        // field crosses live text and lifts the ground behind it, so it stays a
+        // translucent tint the glyph shows through, even at the white-hot head:
+        // the drama comes from height, motion and the wall above the line, not
+        // opacity over the letters.
+        let cov_cap = (22.0 + 12.0 * t).min(255.0);
         // Per-cell heat envelope: the strongest spark per cell wins, newest
         // first. 12 cells at full strength plus a 4-cell fading tail, so the
         // oldest burning cell dissolves instead of vanishing in one frame.
@@ -808,7 +1457,18 @@ impl CursorGlow {
             }
             let age = now.saturating_duration_since(s.born).as_secs_f32();
             let u = (age / s.life).clamp(0.0, 1.0);
-            let env = if s.typing {
+            let env = if s.typing && !cfg.dark_theme {
+                // On paper a flame is ink, not light, so one cell's lick is a
+                // smudge: each typed cell keeps burning through the first
+                // third of its life and burns down after, so the last few
+                // letters carry a row of tongues falling away behind the
+                // caret.
+                if u < 0.30 {
+                    1.0
+                } else {
+                    0.5 * (1.0 + (std::f32::consts::PI * (u - 0.30) / 0.70).cos())
+                }
+            } else if s.typing {
                 const EMBER: f32 = 0.38;
                 if u < 0.10 {
                     1.0
@@ -822,8 +1482,13 @@ impl CursorGlow {
                 1.0 - u
             };
             // Steep head→tail falloff: flames at the head, embers a few cells
-            // back, darkness at the tail.
-            let strength = env * (0.16 + 0.84 * s.pos.powf(1.4));
+            // back, darkness at the tail (on paper a gentler one, so the
+            // tongues behind the head stand as a row).
+            let strength = if cfg.dark_theme {
+                env * (0.16 + 0.84 * s.pos.powf(1.4))
+            } else {
+                env * (0.40 + 0.60 * s.pos)
+            };
             if strength < 0.02 {
                 continue;
             }
@@ -838,112 +1503,343 @@ impl CursorGlow {
         if n_cells == 0 {
             return;
         }
+        // Tail dissolve: the first 12 cells keep full strength; the tail
+        // fades linearly so the oldest cell drops below the height cull as a
+        // whisper.
+        for (rank, c) in cells[..n_cells].iter_mut().enumerate().skip(12) {
+            c.2 *= ((16 - rank.min(16)) as f32 / (16 - 11) as f32).min(1.0);
+        }
+        let cells = &cells[..n_cells];
+        if !cfg.dark_theme {
+            self.emit_flames_light(cfg, geom, cells, t, under);
+            return;
+        }
         // One quantized phase per frame: both backends see the identical time.
         let phase = (self.flame_phase * 1024.0) as u32;
-        let temp = (t * 255.0) as u8;
         // Tongues drag BEHIND rightward typing: lean/4 px at full rise.
         let lean_q = (-(ch * 0.30 * t) * 4.0).clamp(-127.0, 127.0) as i8;
         // EFFECTS-BOX horizontal clamp (identity-exact at head 0: the box IS the
         // grid box, matching the historical grid-relative clamps).
         let (fx_l, fx_r) = (geom.fx_left(), geom.fx_right());
-        for (rank, &(row, col, strength)) in cells[..n_cells].iter().enumerate() {
-            // Tail dissolve: the first 12 cells keep full strength; the tail
-            // fades linearly so the oldest cell drops below the `peak < 1.5`
-            // cull as a whisper.
-            let strength = if rank < 12 {
-                strength
-            } else {
-                strength * ((cells.len() - rank) as f32 / (cells.len() - 11) as f32).min(1.0)
-            };
-            // Height ramps quadratically in the eased temperature: a lone peck
-            // is a sixth-of-a-cell lick, sustained key-repeat cadence
-            // (inter-key ≤ HEAT_GAP_FULL) builds toward a ~6-cell wall. cov_cap
-            // keeps even the wall translucent over text.
-            let peak = ch * (0.16 + 5.80 * t * t) * strength;
-            if peak < 1.5 {
+        let chi = geom.ch as i32;
+        let cwi = geom.cw as i32;
+        // Root the flame in the cell's ascender band
+        // ([`Self::FIRE_DARK_ROOT`]) so it rises into the inter-line space
+        // and the row above, keeping the typed line's letters clear. Both clamps
+        // are grid-relative, relaxed by `geom.head` (the chrome band), then
+        // translated by origin, never window-clamped, so head == 0 matches
+        // the pad-relative math. With head == 0 the root clamps at least
+        // one cell down; with head ≥ ch row-0 flames climb into the chrome
+        // band, and `fire_field::fire_top_fade` dissolves them at the edge.
+        let head = i32::from(geom.head);
+        let oy = geom.origin_y as i32;
+        let ox = geom.origin_x as i32;
+        let root_floor = (chi - head).max(2);
+        // Shift the sampling window in the lean direction rather than
+        // widening it both ways. The field shears internally
+        // (`shear = lean·vn/4`) and is a function of absolute x, so
+        // overlapping windows would add into a bright seam at every cell
+        // boundary; a uniform shift makes adjacent patches tile exactly.
+        let lean_px = (lean_q as i32).abs() / 4 + 1;
+        let shift = if lean_q > 0 { lean_px } else { -lean_px };
+        let sub = Self::FIRE_SUBCOLS;
+        // Over a blank row the flame is light with no letter to bury: it
+        // burns at the air's ceiling, easing down to the text's over a
+        // shoulder on the air's side of a line of text, so the letters keep
+        // the translucent tint and the flames above them their colour. A row
+        // the frame does not show is text.
+        let text = self.text_view();
+        let air_cap = Self::FIRE_DARK_AIR_CAP_COLD + Self::FIRE_DARK_AIR_CAP_HEAT * t;
+        let shoulder = (ch * 0.35).max(1.0);
+        let smooth = |k: f32| {
+            let k = k.clamp(0.0, 1.0);
+            k * k * (3.0 - 2.0 * k)
+        };
+        let mut seen_rows = [0u16; 16];
+        let mut n_rows = 0usize;
+        for &(row, _, _) in cells {
+            if seen_rows[..n_rows].contains(&row) {
                 continue;
             }
-            // Root the flame at the cell top so it rises into the inter-line
-            // space and the row above, keeping the typed line clear. Both clamps
-            // are grid-relative, relaxed by `geom.head` (the chrome band), then
-            // translated by origin, never window-clamped, so head == 0 matches
-            // the pad-relative math. With head == 0 the root clamps at least
-            // one cell down; with head ≥ ch row-0 flames climb into the chrome
-            // band, and `fire_field::fire_top_fade` dissolves them at the edge.
-            let head = i32::from(geom.head);
-            let oy = geom.origin_y as i32;
-            let root_floor = (geom.ch as i32 - head).max(2);
-            let base_y = oy + ((row as f32 * ch + 2.0) as i32).max(root_floor);
-            // Rise ceiling: the grid top relaxed by the head band — at head 0
-            // this is the grid top exactly (the historical clamp).
-            let top_y = (base_y - peak as i32 - 2).max(oy - head);
-            if top_y >= base_y {
-                continue;
+            seen_rows[n_rows] = row;
+            n_rows += 1;
+            // The flame roots on the burning row's top edge and the newest
+            // few typed letters each burn a tongue falling away behind the
+            // head ([`Self::FIRE_DARK_AIR_RANKS`]), riding the head's own
+            // strength so they die with it. Every row but the grid's first
+            // burns this way, a line of text above or not: over that line's
+            // letters the flame keeps the text's tint (the ceiling below), so
+            // it burns bright in the line's gaps and past its end and never
+            // crosses a letter at more than a tint; under open air the
+            // tongues stand about a row tall with hot cores however cool
+            // the fire still is.
+            let air = row > 0;
+            let mut burning = [(0u16, 0u16, 0.0f32); 16];
+            let mut n_burning = 0usize;
+            for c in cells.iter().filter(|c| c.0 == row) {
+                burning[n_burning] = *c;
+                n_burning += 1;
             }
-            // Shift the sampling window in the lean direction rather than
-            // widening it both ways. The field shears internally
-            // (`shear = lean·vn/4`) and is a function of absolute x, so
-            // overlapping windows would add into a bright seam at every cell
-            // boundary; a uniform shift makes adjacent patches tile exactly.
-            let lean_px = (lean_q as i32).abs() / 4 + 1;
-            let shift = if lean_q > 0 { lean_px } else { -lean_px };
-            let ox = geom.origin_x as i32;
-            let x0 = (ox + (col as i32) * geom.cw as i32 + shift).max(fx_l);
-            let x1 = (ox + ((col as i32) + 1) * geom.cw as i32 + shift).min(fx_r);
-            if x1 <= x0 {
-                continue;
-            }
-            // Split per row band (the dirty gate stays exact); bands share
-            // base_y/phase/params, so the field is seamless. Above-grid bands
-            // come out negative and emit with damage-hint row 0, so fire in the
-            // chrome band still presents.
-            let chi = geom.ch as i32;
-            // Root skirt: the field dissolves (mirrored, 5x compressed) below
-            // the root through the glyph row's top, so emit those bands too,
-            // clipped to the effects box. Under-ink: letters paint over it.
-            // (`chi.min(3)` keeps the clamp well-formed on 1 px cells.)
-            let skirt_end = (base_y + (peak as i32 / 4).clamp(chi.min(3), chi)).min(geom.fx_bot());
-            let mut yy = top_y;
-            while yy < skirt_end {
-                if patches.len() >= Self::MAX_QUADS {
-                    return;
+            if air && n_burning > 0 {
+                // The letters behind the head, back along the way the run
+                // came, each raised to its rank's share of the head (a letter
+                // whose spark already died still burns while the head does).
+                let (head_col, head_strength) = (i32::from(burning[0].1), burning[0].2);
+                let back = if n_burning > 1 && i32::from(burning[1].1) > head_col {
+                    1
+                } else {
+                    -1
+                };
+                // Ahead of the head, over the caret, the flame tapers off
+                // instead of standing cut at the newest letter's edge.
+                let ahead = head_col - back;
+                if ahead >= 0
+                    && ahead < geom.cols as i32
+                    && n_burning < burning.len()
+                    && !burning[..n_burning].iter().any(|c| i32::from(c.1) == ahead)
+                {
+                    burning[n_burning] =
+                        (row, ahead as u16, Self::FIRE_DARK_AIR_LEAD * head_strength);
+                    n_burning += 1;
                 }
-                let band = (yy - oy).div_euclid(chi);
-                let band_end = (oy + (band + 1) * chi).min(skirt_end);
-                if band < geom.rows as i32 {
-                    patches.push(FirePatch {
-                        row: band.max(0) as u16,
-                        x: x0 as u16,
-                        y: yy as u16,
-                        w: (x1 - x0) as u16,
-                        h: (band_end - yy) as u16,
-                        base_y: base_y as u16,
-                        peak_h: (peak as u16).max(1),
-                        phase,
-                        temp,
-                        strength: (strength * 255.0) as u8,
-                        lean: lean_q,
-                        cov_cap,
-                        cell_h: geom.ch as u16,
-                        mode,
-                    });
-                    // Engulfment: how much of this band the flame body covers
-                    // (band-height share × envelope × density). Only for
-                    // `band >= 0`: above-grid bands have no glyph, and a negative
-                    // band must never reach `band as u16`.
-                    if band >= 0 {
-                        let band_frac = (band_end - yy) as f32 / ch;
-                        let rise_frac =
-                            1.0 - ((base_y - band_end) as f32 / peak).clamp(0.0, 1.0) * 0.55;
-                        let wgt = strength * band_frac * rise_frac * (0.35 + 0.55 * t);
-                        let key = (band as u16, col);
-                        match engulf.iter_mut().find(|e| (e.0, e.1) == key) {
-                            Some(e) => e.2 += wgt,
-                            None => engulf.push((key.0, key.1, wgt)),
+                // Behind a typed head only: a jump's cells (a completion, a
+                // paste) burn at their own strengths, laid along its
+                // `Length`, as the knob law says a jump reads it.
+                let typed_head = self
+                    .sparks
+                    .iter()
+                    .rev()
+                    .find(|s| s.row == row)
+                    .is_some_and(|s| s.typing);
+                let ranks = if typed_head {
+                    &Self::FIRE_DARK_AIR_RANKS[..]
+                } else {
+                    &Self::FIRE_DARK_AIR_RANKS[..1]
+                };
+                for (rank, share) in ranks.iter().enumerate().skip(1) {
+                    let col = head_col + back * rank as i32;
+                    if col < 0 || col >= geom.cols as i32 || !text.covers_cell(i32::from(row), col)
+                    {
+                        break;
+                    }
+                    let floor = share * head_strength;
+                    let col = col as u16;
+                    match burning[..n_burning].iter().position(|c| c.1 == col) {
+                        Some(i) => burning[i].2 = burning[i].2.max(floor),
+                        None if n_burning < burning.len() => {
+                            burning[n_burning] = (row, col, floor);
+                            n_burning += 1;
                         }
+                        None => {}
                     }
                 }
-                yy = band_end;
+            }
+            let burning = &burning[..n_burning];
+            let on_row = || burning.iter();
+            let (cmin, cmax) = on_row().fold((i32::MAX, i32::MIN), |(lo, hi), c| {
+                (lo.min(i32::from(c.1)), hi.max(i32::from(c.1)))
+            });
+            // Under open air (a blank row above) a cool fire still stands a
+            // row tall with hot cores; under a line of text the tongues keep
+            // the fire's own heat, so a sustained blaze still reads hotter
+            // than a cold start there.
+            let open_air = air && text.row_is_blank(i32::from(row) - 1);
+            let (row_t, peak_floor) = if open_air {
+                (t.max(Self::FIRE_DARK_AIR_TEMP), Self::FIRE_DARK_AIR_PEAK)
+            } else {
+                (t, 0.0)
+            };
+            let row_temp = (row_t * 255.0) as u8;
+            let air_cap = if air {
+                air_cap.max(Self::FIRE_DARK_AIR_TONGUE_CAP)
+            } else {
+                air_cap
+            };
+            // Over a blank row the flame roots on the burning row's top edge
+            // and burns wholly in the air above it, its foot fading in over
+            // [`Self::FIRE_DARK_AIR_FOOT`] of a row: a root inside the
+            // letters' ascender band stood a dim slab over them, and the
+            // ceiling easing down to it a dark seam above it.
+            let base_y = if air {
+                oy + (row as f32 * ch) as i32
+            } else {
+                oy + ((row as f32 * ch + (ch * Self::FIRE_DARK_ROOT).max(2.0)) as i32)
+                    .max(root_floor)
+            };
+            let foot = (ch * Self::FIRE_DARK_AIR_FOOT).max(1.0);
+            // Over a blank row the tongues are not a comb: each cell's own
+            // height, from its hash, eased across the cells.
+            let hash01 = |c: i32| {
+                let h = aterm_render::fire_field::fire_hash(c as u32, u32::from(row), 0x7A3C_91E5);
+                (h >> 8) as f32 / (1u32 << 24) as f32
+            };
+            // The tallest tongue over column position `u` (cells) and how
+            // far inside it `u` stands (1 on its axis, 0 at its side).
+            let teardrop = |u: f32| -> (f32, f32) {
+                let mut best = (0.0f32, 0.0f32);
+                for &(_, c, s) in burning {
+                    let half = Self::FIRE_DARK_TONGUE_HALF_W * (0.8 + 0.2 * s);
+                    let d = ((u - (f32::from(c) + 0.5)) / half).abs();
+                    if d >= 1.0 {
+                        continue;
+                    }
+                    let size = 1.0 - Self::FIRE_DARK_AIR_SIZES * hash01(i32::from(c));
+                    let h = s * size * (1.0 - d).powf(0.75);
+                    if h > best.0 {
+                        best = (h, 1.0 - d);
+                    }
+                }
+                best
+            };
+            for col in (cmin - 1).max(0)..=(cmax + 1).min(geom.cols as i32 - 1) {
+                for k in 0..sub {
+                    // The envelope at this column: the burning cells'
+                    // strengths smoothed along the line.
+                    let u = col as f32 + (k as f32 + 0.5) / sub as f32;
+                    let strength = flame_heat(on_row(), u);
+                    // Height ramps quadratically in the eased temperature: a
+                    // lone peck is a sixth-of-a-cell lick, sustained key-repeat
+                    // cadence (inter-key ≤ HEAT_GAP_FULL) builds toward a
+                    // ~6-cell wall. cov_cap keeps even the wall translucent
+                    // over text.
+                    // Over a blank row each burning letter raises its own
+                    // tongue, a teardrop: tallest over the letter's middle,
+                    // falling to a point at its tip and away to nothing at
+                    // its sides, each a little shorter or taller by its
+                    // cell's hash. Neighbours merge at their feet and part
+                    // above them, so the run reads as flames, not as bars of
+                    // a meter on one bright base.
+                    let (tongue, side) = if air { teardrop(u) } else { (strength, 1.0) };
+                    let rise_px = ch * (0.16 + 5.80 * t * t).max(peak_floor) * tongue;
+                    if rise_px < 1.5 {
+                        continue;
+                    }
+                    // A tongue's foot curls up from its sides, so the line
+                    // of feet is scalloped rather than one flat base.
+                    #[cfg(not(test))]
+                    let curl = Self::FIRE_DARK_FOOT_CURL;
+                    #[cfg(test)]
+                    let curl = if self.fire_flat_feet {
+                        0.0
+                    } else {
+                        Self::FIRE_DARK_FOOT_CURL
+                    };
+                    let base_y = base_y - (ch * curl * (1.0 - side)) as i32;
+                    let scallop = if air { smooth(side / 0.5) } else { 1.0 };
+                    // Rise ceiling: the grid top relaxed by the head band — at
+                    // head 0 this is the grid top exactly (the historical clamp).
+                    let top_y = (base_y - rise_px as i32 - 2).max(oy - head);
+                    if top_y >= base_y {
+                        continue;
+                    }
+                    let left = ox + col * cwi + shift;
+                    let x0 = (left + k * cwi / sub).max(fx_l);
+                    let x1 = (left + (k + 1) * cwi / sub).min(fx_r);
+                    if x1 <= x0 {
+                        continue;
+                    }
+                    // The flame ends at its root: the field's root lift fades
+                    // it in over a few pixels inside the burning row's
+                    // ascender band, so no unlit line stands between the
+                    // letters and the flame (a mirrored skirt below the root
+                    // left one at the root itself).
+                    let flame_end = base_y.min(geom.fx_bot());
+                    // The cells the patch's pixels lie over (the lean shifts
+                    // it off its sampling column).
+                    let (ca, cb) = ((x0 - ox).div_euclid(cwi), (x1 - 1 - ox).div_euclid(cwi));
+                    let on_text =
+                        |b: i32| b >= 0 && (text.over_text(b, ca) || text.over_text(b, cb));
+                    // The slice ceiling at window y `mid` of band `band`: the
+                    // text's tint over a line of text, the air's over a blank
+                    // row, eased between them over a shoulder.
+                    let ceiling_at = |band: i32, mid: f32| {
+                        // Over a blank row the foot fades in from nothing at
+                        // the root (the burning row's top edge).
+                        let foot_in = if air {
+                            smooth((base_y as f32 - mid) / foot)
+                        } else {
+                            1.0
+                        };
+                        if on_text(band) {
+                            cov_cap * foot_in
+                        } else {
+                            let top = (oy + band * chi) as f32;
+                            let mut k = 1.0f32;
+                            // The burning row under a flame rooted on its
+                            // top edge takes none of it: no shoulder there.
+                            if band + 1 < geom.rows as i32
+                                && !(air && band + 1 == i32::from(row))
+                                && on_text(band + 1)
+                            {
+                                k = k.min((top + ch - mid) / shoulder);
+                            }
+                            if on_text(band - 1) {
+                                k = k.min((mid - top) / shoulder);
+                            }
+                            (cov_cap + (air_cap - cov_cap) * smooth(k)) * foot_in
+                        }
+                    };
+                    let mut yy = top_y;
+                    while yy < flame_end {
+                        if patches.len() >= Self::MAX_QUADS {
+                            return;
+                        }
+                        // Split per row band (the dirty gate stays exact) and
+                        // per slice; every piece shares base_y/phase/params, so
+                        // the field is seamless and only its ceiling steps,
+                        // finely, toward the tips. Where the ceiling eases
+                        // between the air's and the text's the slices are a
+                        // pixel, so the ease never shows as stairs.
+                        let band = (yy - oy).div_euclid(chi);
+                        let band_end = (oy + (band + 1) * chi).min(flame_end);
+                        let coarse = (yy + Self::FIRE_SLICE_PX).min(band_end);
+                        let steep = (ceiling_at(band, yy as f32 + 0.5)
+                            - ceiling_at(band, coarse as f32 - 0.5))
+                        .abs()
+                            > 3.0;
+                        let end = if steep { yy + 1 } else { coarse };
+                        if band < geom.rows as i32 {
+                            let mid = 0.5 * (yy + end) as f32;
+                            let rise = ((base_y as f32 - mid) / rise_px.max(1.0)).clamp(0.0, 1.0);
+                            let ceiling = ceiling_at(band, mid);
+                            patches.push(FirePatch {
+                                row: band.max(0) as u16,
+                                x: x0 as u16,
+                                y: yy as u16,
+                                w: (x1 - x0) as u16,
+                                h: (end - yy) as u16,
+                                base_y: base_y as u16,
+                                peak_h: (rise_px as u16).max(1),
+                                phase,
+                                temp: row_temp,
+                                strength: 255,
+                                lean: lean_q,
+                                cov_cap: (ceiling * flame_tip_fade(rise) * scallop) as u8,
+                                cell_h: geom.ch as u16,
+                                mode: FireMode::Add,
+                            });
+                            // Engulfment: how much of this band the flame body
+                            // covers (height share × envelope × density), a
+                            // quarter column's share of its cell. Only for
+                            // `band >= 0`: above-grid bands have no glyph, and
+                            // a negative band must never reach `band as u16`.
+                            if band >= 0 {
+                                let frac = (end - yy) as f32 / ch;
+                                let rise_frac = 1.0
+                                    - ((base_y - end) as f32 / rise_px.max(1.0)).clamp(0.0, 1.0)
+                                        * 0.55;
+                                let wgt =
+                                    strength * frac * rise_frac * (0.35 + 0.55 * t) / sub as f32;
+                                let key = (band as u16, col as u16);
+                                match engulf.iter_mut().find(|e| (e.0, e.1) == key) {
+                                    Some(e) => e.2 += wgt,
+                                    None => engulf.push((key.0, key.1, wgt)),
+                                }
+                            }
+                        }
+                        yy = end;
+                    }
+                }
             }
         }
         // No char, no veil: ink never changes colour (a letter that dims and
@@ -951,15 +1847,10 @@ impl CursorGlow {
         // halo, a colour-free strength per engulfed cell driving the dark
         // dilation ring the renderers stamp around glyph strokes (over the
         // flame, under the ink), so letters separate from a bright blaze. It
-        // applies on every row the flame covers.
-        //
-        // Dark theme only: on a light theme text is dark and the ink-fire is a
-        // deep veil, so a dark ring would sink glyphs further; legibility there
-        // comes from keeping the veil translucent.
+        // applies on every row the flame covers, around letters lighter than
+        // their ground: around a dark letter on a bright ground (a prompt's
+        // coloured segment) a dark ring would only smear the stroke.
         for &(er, ec, e) in engulf.iter() {
-            if !matches!(mode, FireMode::Add) {
-                break;
-            }
             // Smooth ramp, not a hard gate: a hard cutoff would snap the ring on
             // and flicker it as the envelope breathes around the threshold. A
             // smoothstep over a low toe fades it in from zero.
@@ -968,6 +1859,12 @@ impl CursorGlow {
             let s = s * s * (3.0 - 2.0 * s);
             let strength = (s * 255.0) as u8;
             if strength == 0 {
+                continue;
+            }
+            if let Some((Some(ink), ground)) = self.frame_text.pair(i32::from(er), i32::from(ec))
+                && crate::color_math::relative_luminance(ink)
+                    <= crate::color_math::relative_luminance(ground)
+            {
                 continue;
             }
             halo_cells.push(FireHaloCell {
@@ -979,6 +1876,356 @@ impl CursorGlow {
         // The renderer's FireHaloCell invariant: per-row col-sorted, unique
         // cells. Accumulation merges duplicates; sort here.
         halo_cells.sort_unstable_by_key(|c| (c.row, c.col));
+    }
+
+    /// THE INK-FIRE ON A LIGHT GROUND: additive light cannot show on paper,
+    /// so the fire is ink beneath the letters, source-over in the under-ink
+    /// stream: a row of separate tongues rising from the burning cells' own
+    /// row, each rooted at the foot of the letters' x-height in a warm
+    /// orange and standing up out of the line, going amber and yellow as it
+    /// climbs and melting to nothing at its tip, feathered at its sides,
+    /// leaning back against the typing and flickering slowly in height. The
+    /// row's heat is smoothed across its cells ([`flame_kernel`]), so the
+    /// flames rise and fall off along the line with no square end. A
+    /// temperature makes them taller, never more than about three rows.
+    /// Over every letter they reach the paint is held to the
+    /// opacity at which that letter keeps 4.5:1 (or its own contrast, if
+    /// less) in the colours its cell is drawn in ([`Self::flame_light_cap`]),
+    /// eased across cell edges so a held letter is a soft thinning, never a
+    /// box.
+    fn emit_flames_light(
+        &self,
+        cfg: &GlowConfig,
+        geom: Geom,
+        cells: &[(u16, u16, f32)],
+        t: f32,
+        under: &mut Vec<GlowQuad>,
+    ) {
+        const MAX_TONGUES: usize = 64;
+        let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+        let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+        let text = self.text_view();
+        // Every ramp stop, interpolated tongue colour and weighted mixture
+        // lies in this channel envelope. A cell may have a dark ground and
+        // light ink even when the page is light.
+        let paints = flame_light_paint_bounds();
+        let tall = chf * (Self::FIRE_LIGHT_RISE_COLD + Self::FIRE_LIGHT_RISE_HOT * t);
+        let spacing = Self::FIRE_LIGHT_SPACING;
+        // The tongues lean back against rightward typing as they rise.
+        let lean = -cwf * 0.35 * t;
+        let phase = self.flame_phase;
+        let hash01 = |i: i32, salt: u32| {
+            let h = aterm_render::fire_field::fire_hash(i as u32, salt, 0x51F0_A3B7);
+            (h >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let mut seen_rows = [0u16; 16];
+        let mut n_rows = 0usize;
+        for &(row, _, _) in cells {
+            if seen_rows[..n_rows].contains(&row) {
+                continue;
+            }
+            seen_rows[n_rows] = row;
+            n_rows += 1;
+            let on_row = || cells.iter().filter(move |c| c.0 == row);
+            let (cmin, cmax) = on_row().fold((i32::MAX, i32::MIN), |(lo, hi), c| {
+                (lo.min(i32::from(c.1)), hi.max(i32::from(c.1)))
+            });
+            let envelope = |u: f32| flame_heat(on_row(), u);
+            let root = oyf + (f32::from(row) + Self::FIRE_LIGHT_ROOT) * chf;
+            // The tongues: anchored to the grid (index `i` sits at
+            // `i · spacing` cells, jittered by its own hash), so a growing
+            // run adds tongues and never slides the old ones.
+            let (u_lo, u_hi) = (cmin as f32 - 0.8, cmax as f32 + 1.8);
+            let mut tongues = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_TONGUES];
+            let mut n = 0usize;
+            let first = (u_lo / spacing).floor() as i32;
+            let last = (u_hi / spacing).ceil() as i32;
+            for i in first..=last {
+                if n == MAX_TONGUES {
+                    break;
+                }
+                let u = (i as f32 + 0.5 + (hash01(i, 1) - 0.5) * 0.5) * spacing;
+                let e = envelope(u);
+                if e < 0.03 {
+                    continue;
+                }
+                // A slow flicker in height, its own rate and phase per
+                // tongue, well under the flash bound.
+                let rate = 0.45 + 0.35 * hash01(i, 2);
+                let flick =
+                    0.5 + 0.5 * (std::f32::consts::TAU * (phase * rate + hash01(i, 3))).sin();
+                let h = tall * e * (0.70 + 0.30 * hash01(i, 4)) * (0.72 + 0.28 * flick);
+                let half = cwf * Self::FIRE_LIGHT_HALF_W * (0.75 + 0.25 * e);
+                // A tongue never climbs into another line's letters: under
+                // a line of text above it, it stands only as tall as reaches
+                // that line's foot (a shorter tongue, but always one).
+                let h = h.min(Self::flame_light_headroom(
+                    &text,
+                    row,
+                    (u, half / cwf),
+                    root,
+                    (chf, oyf),
+                ));
+                if h < 2.0 {
+                    continue;
+                }
+                tongues[n] = (oxf + u * cwf, h, half, e);
+                n += 1;
+            }
+            let tongues = &tongues[..n];
+            if tongues.is_empty() {
+                continue;
+            }
+            let peak_h = tongues.iter().map(|tg| tg.1).fold(0.0f32, f32::max);
+            // Each cell's opacity ceiling for the rows the flames reach,
+            // from the root's row up.
+            let rows_up = ((peak_h - (root - (oyf + f32::from(row) * chf))) / chf)
+                .ceil()
+                .max(0.0) as i32;
+            let (c_lo, c_hi) = (u_lo.floor() as i32 - 1, u_hi.ceil() as i32 + 1);
+            let caps = |r: i32, c: i32| -> f32 {
+                if r < 0 || c < 0 || r >= geom.rows as i32 || c >= geom.cols as i32 {
+                    return Self::FIRE_LIGHT_ALPHA;
+                }
+                self.flame_light_cap(cfg, &text, r, c, paints)
+            };
+            let mut grid = [[0.0f32; 40]; 4];
+            let span = ((c_hi - c_lo + 1) as usize).min(40);
+            for (dr, line) in grid
+                .iter_mut()
+                .enumerate()
+                .take((rows_up as usize + 1).min(4))
+            {
+                for (dc, slot) in line.iter_mut().enumerate().take(span) {
+                    *slot = caps(i32::from(row) - dr as i32, c_lo + dc as i32);
+                }
+            }
+            let cap_cell = |x: f32, y: f32| {
+                let r = ((y - oyf) / chf).floor() as i32;
+                let c = ((x - oxf) / cwf).floor() as i32;
+                let dr = i32::from(row) - r;
+                let dc = c - c_lo;
+                if (0..4).contains(&dr) && dc >= 0 && (dc as usize) < span {
+                    grid[dr as usize][dc as usize]
+                } else {
+                    caps(r, c)
+                }
+            };
+            // Eased across cell edges: the least ceiling within a third of
+            // a cell across and a few pixels up and down.
+            let ease_x = cwf * 0.34;
+            let cap_at = |x: f32, y: f32| {
+                cap_cell(x - ease_x, y)
+                    .min(cap_cell(x + ease_x, y))
+                    .min(cap_cell(x, y - 3.0))
+                    .min(cap_cell(x, y + 3.0))
+            };
+            // One tongue's paint at `(x, y)`: its opacity and colour.
+            let paint = |tg: &(f32, f32, f32, f32), x: f32, y: f32| -> (f32, u32) {
+                let (xc, h, half, _) = *tg;
+                let rise = (root - y) / h;
+                if !(0.0..1.0).contains(&rise) {
+                    return (0.0, 0);
+                }
+                let xc = xc + lean * rise * rise;
+                // A teardrop: a little narrower at the root, widest a fifth
+                // of the way up, tapering to a point.
+                let base = {
+                    let k = (rise / 0.2).clamp(0.0, 1.0);
+                    0.62 + 0.38 * k * k * (3.0 - 2.0 * k)
+                };
+                let hw = half * base * (1.0 - rise).powf(0.7);
+                if hw < 0.3 {
+                    return (0.0, 0);
+                }
+                let d = ((x - xc) / hw).abs();
+                if d >= 1.0 {
+                    return (0.0, 0);
+                }
+                // Feathered sides: the paint thins over the tongue's outer
+                // half to nothing at its edge.
+                let side = (1.0 - d * d).powf(1.6);
+                let root_in = {
+                    let k = (rise / 0.14).clamp(0.0, 1.0);
+                    k * k * (3.0 - 2.0 * k)
+                };
+                let tip = (1.0 - rise).powf(0.55);
+                (
+                    Self::FIRE_LIGHT_ALPHA * side * root_in * tip,
+                    flame_light_ramp(rise),
+                )
+            };
+            let x_lo = (oxf + u_lo * cwf).max(geom.fx_left() as f32);
+            let x_hi = (oxf + u_hi * cwf).min(geom.fx_right() as f32);
+            let knot = Self::FIRE_LIGHT_KNOT_PX;
+            let knots = (((x_hi - x_lo) / knot).ceil() as usize).max(1);
+            let slab = Self::FIRE_LIGHT_SLAB_PX;
+            let mut y = (root - peak_h).floor().max(geom.fx_top() as f32);
+            while y < root {
+                if under.len() >= Self::MAX_QUADS {
+                    return;
+                }
+                let h = slab.min(root - y);
+                let ym = y + 0.5 * h;
+                // The union of the tongues at a knot: the most opaque, in
+                // the colour of the paint there weighted by its opacity, under
+                // the cell's ceiling.
+                let at = |x: f32| -> (u8, u32) {
+                    let (mut a, mut sum, mut rgb) = (0.0f32, 0.0f32, [0.0f32; 3]);
+                    for tg in tongues {
+                        let (ta, c) = paint(tg, x, ym);
+                        if ta <= 0.0 {
+                            continue;
+                        }
+                        a = a.max(ta);
+                        sum += ta;
+                        for (k, v) in rgb.iter_mut().enumerate() {
+                            *v += ta * ((c >> (16 - 8 * k)) & 0xff) as f32;
+                        }
+                    }
+                    if a < 1.0 {
+                        return (0, 0);
+                    }
+                    let a = a.min(cap_at(x, ym));
+                    if a < 1.0 {
+                        return (0, 0);
+                    }
+                    let ch = |k: usize| ((rgb[k] / sum).round() as u32).min(255);
+                    ((a as u8).max(1), (ch(0) << 16) | (ch(1) << 8) | ch(2))
+                };
+                let mut prev = (x_lo, at(x_lo));
+                for k in 1..=knots {
+                    let x = (x_lo + k as f32 * knot).min(x_hi);
+                    let here = at(x);
+                    let (x0, (a0, c0)) = prev;
+                    let (a1, c1) = here;
+                    if a0 > 1 || a1 > 1 {
+                        let (xi0, xi1) = (x0.round() as i32, x.round() as i32);
+                        // A ramp to nothing ends in the colour it ramps from.
+                        let (c0, c1) = (if a0 > 0 { c0 } else { c1 }, if a1 > 0 { c1 } else { c0 });
+                        crate::effect_util::push_fx_ramp(
+                            under,
+                            geom,
+                            xi0,
+                            y as i32,
+                            xi1 - xi0,
+                            (y + h) as i32 - y as i32,
+                            (premul_rgb(c0, a0.max(1)), a0.max(1)),
+                            (premul_rgb(c1, a1.max(1)), a1.max(1)),
+                        );
+                    }
+                    prev = (x, here);
+                }
+                y += h;
+            }
+        }
+    }
+
+    /// How tall a light tongue over column position `u` (cells) of half-width
+    /// `half` (cells), rooted at window y `root` on `row`, may stand: up to
+    /// the foot of the nearest line of text above its row over its span,
+    /// less [`Self::FIRE_LIGHT_HEADROOM`] (its tip feathers out before the
+    /// letters); unbounded under air.
+    fn flame_light_headroom(
+        text: &TextView<'_>,
+        row: u16,
+        (u, half): (f32, f32),
+        root: f32,
+        (chf, oyf): (f32, f32),
+    ) -> f32 {
+        let (c0, c1) = ((u - half).floor() as i32, (u + half).ceil() as i32 - 1);
+        for r in (0..i32::from(row)).rev().take(4) {
+            if (c0..=c1).any(|c| text.covers_cell(r, c)) {
+                let foot = oyf + (r + 1) as f32 * chf;
+                return (root - foot - Self::FIRE_LIGHT_HEADROOM * chf).max(0.0);
+            }
+        }
+        f32::INFINITY
+    }
+
+    /// The most opacity any light ink-fire paint in `paints` may lay over
+    /// cell `(row, col)`: over a letter (the probe's lines and the frame's
+    /// cells, [`TextView`]), the opacity at which the letter keeps 4.5:1, or
+    /// the contrast it has on its own ground if that is less, in the ink and
+    /// on the ground its cell is drawn in (the theme's pair for a line the
+    /// frame did not hand over); over a row nobody read, the least of that
+    /// for the theme's ink and for a coloured letter held to 3:1
+    /// ([`Self::FIRE_LIGHT_REF_RED`]), since earlier output may stand there;
+    /// over air, [`Self::FIRE_LIGHT_ALPHA`].
+    fn flame_light_cap(
+        &self,
+        cfg: &GlowConfig,
+        text: &TextView<'_>,
+        row: i32,
+        col: i32,
+        paints: (u32, u32),
+    ) -> f32 {
+        let (fg, bg) = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
+        if (text.knows_row(row) && !text.covers_cell(row, col)) || self.light_body_unsolved() {
+            // Air; or a test's control, every ceiling off.
+            return Self::FIRE_LIGHT_ALPHA;
+        }
+        let hold = |ink: u32, ground: u32, bar: f32| -> f32 {
+            let bar = bar.min(crate::color_math::contrast_ratio(ink, ground));
+            let ink_luma = crate::color_math::relative_luminance(ink);
+            let ground_luma = crate::color_math::relative_luminance(ground);
+            // At every opacity up to `a`, each channel stays between its
+            // original ground and the envelope's end at `a`. The interval
+            // only expands as `a` grows, unlike contrast across a colour
+            // that can pass the ink and become contrasting again.
+            let holds = |a: f32| {
+                if a < 1.0 {
+                    return true;
+                }
+                let low = aterm_render::over_rgb(ground, paints.0, a as u8);
+                let high = aterm_render::over_rgb(ground, paints.1, a as u8);
+                // Four byte levels cover premultiplication, a clipped ramp,
+                // the pixel-centre ramp and the final integer blend. Keep
+                // that rounding room on the unsafe side of each channel.
+                let dark_ink = ink_luma <= ground_luma;
+                let extreme = if dark_ink {
+                    chan_min(ground, low)
+                } else {
+                    chan_max(ground, high)
+                };
+                let bound = |sh: u32| {
+                    let c = (extreme >> sh) & 0xff;
+                    if dark_ink {
+                        c.saturating_sub(4)
+                    } else {
+                        (c + 4).min(255)
+                    }
+                };
+                let rgb = (bound(16) << 16) | (bound(8) << 8) | bound(0);
+                let luma = crate::color_math::relative_luminance(rgb);
+                if ink_luma <= ground_luma {
+                    luma + 0.05 >= bar * (ink_luma + 0.05)
+                } else {
+                    ink_luma + 0.05 >= bar * (luma + 0.05)
+                }
+            };
+            if holds(Self::FIRE_LIGHT_ALPHA) {
+                return Self::FIRE_LIGHT_ALPHA;
+            }
+            let (mut lo, mut hi) = (0.0f32, Self::FIRE_LIGHT_ALPHA);
+            for _ in 0..8 {
+                let mid = 0.5 * (lo + hi);
+                if holds(mid) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        if !text.knows_row(row) {
+            return hold(fg, bg, 4.5).min(hold(Self::FIRE_LIGHT_REF_RED, bg, 3.0));
+        }
+        match self.frame_text.pair(row, col) {
+            Some((Some(ink), ground)) => hold(ink, ground, 4.5),
+            Some((None, ground)) => hold(fg, ground, 4.5),
+            None => hold(fg, bg, 4.5),
+        }
     }
 
     /// Claim one water cell for this frame's newest-visible-owner pass.
@@ -1010,11 +2257,9 @@ impl CursorGlow {
     /// samples form a curved two-layer wave, a dim deep-blue undertow under a
     /// thin cyan crest. A repaint-heavy TUI may revisit one cell many times, so
     /// only its newest visible owner is emitted. Jump reflections turn into
-    /// sparse falling beads as they fade; the mark is under glyph ink.
-    ///
-    /// Light themes: the wake is additive light, invisible on a light ground,
-    /// so it is laid instead as darkened source-over veils along the row's
-    /// lower edge (the beam family's light law), keeping the glyph band clear.
+    /// sparse falling beads as they fade; the mark is under glyph ink. On a
+    /// light ground the same wave is ink beneath the letters
+    /// ([`Self::emit_water_light`]).
     pub(super) fn emit_water(
         &mut self,
         now: Instant,
@@ -1022,7 +2267,6 @@ impl CursorGlow {
         geom: Geom,
         cur: Option<(u16, u16)>,
         out: &mut Vec<GlowQuad>,
-        halos: &mut Vec<RainHalo>,
     ) {
         // Render scratch describes this frame even when the pool just reached
         // idle zero.
@@ -1032,9 +2276,6 @@ impl CursorGlow {
         }
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let heat = self.heat.clamp(0.0, 1.0);
-        // Per-cell ceiling: saturated ocean stops carry less luminance than
-        // pale cyan, and newest-owner dedup keeps claims from stacking past it.
-        const WAKE_COV_CAP: f32 = 88.0;
 
         if self.water_seen.len() == Self::WATER_OWNER_SLOTS {
             self.water_seen.fill(0);
@@ -1060,7 +2301,8 @@ impl CursorGlow {
             let u = (age / s.life).clamp(0.0, 1.0);
             // Ease the old tail away faster than the foam at the head.
             let env = (1.0 - u) * (1.0 - 0.45 * u);
-            let base_cov = (f32::from(s.born_cov) * env * cfg.intensity * 0.85).min(WAKE_COV_CAP);
+            let base_cov =
+                (f32::from(s.born_cov) * env * cfg.intensity * 0.85).min(Self::WATER_WAKE_COV_CAP);
 
             // A stable per-cell deal turns about a third of a jump's old crest
             // into falling beads, derived from age (no stored particles, RNG or
@@ -1096,16 +2338,21 @@ impl CursorGlow {
             // Rolling swell: visibly undulating even at rest, churning into surf
             // with heat.
             let phase = s.col as f32 * 0.82 + s.row as f32 * 0.41 - age * (6.0 + 6.0 * heat);
-            let wave = phase.sin() * ch * (0.10 + 0.16 * heat);
+            let amp = ch * (Self::WATER_SWELL.0 + Self::WATER_SWELL.1 * heat);
+            let wave = phase.sin() * amp;
             let (sx, sy) = geom.cell_center(s.row, s.col);
+            let line_y = sy + ch * Self::WATER_LINE_DY;
             let drift = (f32::from((seed >> 24) as u8) / 255.0 - 0.5) * cw * 0.36;
             let sample = WaterSample {
                 surface: BeamVertex {
                     x: sx,
-                    y: sy + wave,
-                    color: water_ramp(0.58 + 0.30 * s.pos + 0.12 * heat),
+                    y: line_y + wave,
+                    color: Self::water_crest_color(s.pos, heat),
                     cov: surface_cov,
                 },
+                phase,
+                amp,
+                line_y,
                 row: s.row,
                 col: s.col,
                 drip_cov,
@@ -1131,14 +2378,19 @@ impl CursorGlow {
             && (col as usize) < geom.cols
         {
             let phase = col as f32 * 0.82 + row as f32 * 0.41 - age * (6.0 + 6.0 * heat);
+            let amp = ch * (Self::WATER_SWELL.0 + Self::WATER_SWELL.1 * heat);
             let (hx, hy) = geom.cell_center(row, col);
+            let line_y = hy + ch * Self::WATER_LINE_DY;
             self.water_samples.push(WaterSample {
                 surface: BeamVertex {
                     x: hx,
-                    y: hy + phase.sin() * ch * (0.10 + 0.16 * heat),
+                    y: line_y + phase.sin() * amp,
                     color: water_ramp(0.80 + 0.12 * heat),
                     cov,
                 },
+                phase,
+                amp,
+                line_y,
                 row,
                 col,
                 drip_cov: 0,
@@ -1148,9 +2400,28 @@ impl CursorGlow {
             });
         }
 
+        // A heavy liquid body: a massive undertow and a fuller crest, both
+        // scaling with cell height; the leaner crest and under-ink composition
+        // avoid a cyan-white slab over repainting prompts.
+        let under_thickness = ch * (0.28 + 0.13 * heat);
+        let crest_thickness = ch * (0.10 + 0.09 * heat);
         if !cfg.dark_theme {
-            self.emit_water_light(cfg, geom, WAKE_COV_CAP, out, halos);
+            self.emit_water_light(cfg, geom, (under_thickness, crest_thickness), out);
             return;
+        }
+        // The wake lies under the letters: the over-ink account charges the
+        // lights laid after it against the wake's own light on each cell, the
+        // crest over the undertow on the page, as they add.
+        let page = Self::bed_pair(cfg).1;
+        for w in &self.water_samples {
+            let v = w.surface;
+            let undertow = premul_rgb(water_ramp(0.34), ((v.cov as f32) * 0.34) as u8);
+            let lit = aterm_render::add_sat(
+                aterm_render::add_sat(page, premul_rgb(v.color, v.cov)),
+                undertow,
+            );
+            self.ink_ledger
+                .lay_under((i32::from(w.row), i32::from(w.col)), lit);
         }
 
         if self.water_samples.len() == 1 && self.water_samples[0].surface.cov > 0 {
@@ -1170,46 +2441,59 @@ impl CursorGlow {
             );
         }
 
-        // A heavy liquid body: a massive undertow and a fuller crest, both
-        // scaling with cell height; the leaner crest and under-ink composition
-        // avoid a cyan-white slab over repainting prompts.
-        let under_thickness = ch * (0.28 + 0.13 * heat);
-        let crest_thickness = ch * (0.10 + 0.09 * heat);
-        // Draw newest segments first, so a pathological geometry sheds the old
-        // tail rather than the responsive head when it reaches the upload budget.
-        for segment in self.water_samples.windows(2).rev() {
-            if out.len() >= Self::MAX_QUADS {
-                out.truncate(Self::MAX_QUADS);
-                return;
-            }
-            // Never bridge a hole left by a faded sample with a long chord: only
-            // adjacent cell samples belong to one run.
-            if segment[0].row.abs_diff(segment[1].row) > 1
-                || segment[0].col.abs_diff(segment[1].col) > 1
-            {
+        // Runs of adjacent samples, newest first, so a pathological geometry
+        // sheds the old tail rather than the responsive head when it reaches
+        // the upload budget; each run is one curve per layer.
+        let mut curve = std::mem::take(&mut self.water_run);
+        let n = self.water_samples.len();
+        let mut end = n;
+        while end > 1 {
+            let start = Self::water_run_start(&self.water_samples, end);
+            let run = &self.water_samples[start..end];
+            end = start;
+            if run.len() < 2 || run.iter().all(|s| s.surface.cov == 0) {
                 continue;
             }
-            let surface = [segment[0].surface, segment[1].surface];
-            if surface.iter().all(|v| v.cov == 0) {
-                continue;
-            }
-            let undertow = surface.map(|v| BeamVertex {
-                color: water_ramp(0.34),
-                cov: ((v.cov as f32) * 0.34) as u8,
-                ..v
-            });
-            comet_beam(out, geom.beam_clip(), &undertow, under_thickness, 1, 0.0);
             if out.len() >= Self::MAX_QUADS {
-                out.truncate(Self::MAX_QUADS);
-                return;
+                break;
             }
-            comet_beam(out, geom.beam_clip(), &surface, crest_thickness, 1, 0.0);
+            Self::water_curve(run, &mut curve);
+            let surface_n = curve.len();
+            curve.extend_from_within(..surface_n);
+            for v in &mut curve[surface_n..] {
+                v.cov = ((v.cov as f32) * 0.34) as u8;
+                v.color = water_ramp(0.34);
+            }
+            comet_beam(
+                out,
+                geom.beam_clip(),
+                &curve[surface_n..],
+                under_thickness,
+                1,
+                0.0,
+            );
+            if out.len() >= Self::MAX_QUADS {
+                break;
+            }
+            comet_beam(
+                out,
+                geom.beam_clip(),
+                &curve[..surface_n],
+                crest_thickness,
+                1,
+                0.0,
+            );
+        }
+        self.water_run = curve;
+        if out.len() >= Self::MAX_QUADS {
+            out.truncate(Self::MAX_QUADS);
+            return;
         }
 
-        // The old reflection leaves as individual gravity-driven beads. Newest
-        // first for load shedding; one small rect per dealt cell (`push_rect`
-        // splits a bead at row boundaries).
-        let drip_w = (cw * 0.22).round().max(1.0) as i32;
+        // The old reflection leaves as individual gravity-driven beads, newest
+        // first for load shedding: one soft round bead per dealt cell, drawn
+        // out as it falls, never a hard-edged chip.
+        let drip_r = (cw * 0.16).max(1.25);
         for sample in self.water_samples.iter().rev() {
             if sample.drip_cov == 0 {
                 continue;
@@ -1218,123 +2502,178 @@ impl CursorGlow {
                 out.truncate(Self::MAX_QUADS);
                 return;
             }
-            let drip_h = sample.drip_h.round().max(1.0) as i32;
-            push_rect(
+            crate::effect_util::push_soft_disc(
                 out,
                 geom,
-                sample.drip_x.round() as i32 - drip_w / 2,
-                sample.drip_y.round() as i32 - drip_h / 2,
-                drip_w,
-                drip_h,
-                premul_rgb(water_ramp(0.88), sample.drip_cov),
+                (sample.drip_x, sample.drip_y),
+                (
+                    drip_r * Self::WATER_DROP_SOFT,
+                    (sample.drip_h * 0.5).max(drip_r) * Self::WATER_DROP_SOFT,
+                ),
+                water_ramp(0.88),
+                f32::from(sample.drip_cov),
             );
         }
         out.truncate(Self::MAX_QUADS);
     }
 
-    /// Water's wake on a LIGHT GROUND: its own shape in ink. The undertow and
-    /// the crest ride the same swell as on a dark ground (the same
-    /// `water_samples` spine and thicknesses), rasterized in white and
-    /// re-inked under the letters (`out` is the under-ink stream here): the
-    /// undertow in the deep palette's ink, the crest in each sample's own,
-    /// solved against the theme's text, the wake's coverage mapped onto the
-    /// body ceiling. The falling beads are conservative ink drops over the
-    /// text (they fall through the rows below).
-    fn emit_water_light(
-        &self,
-        cfg: &GlowConfig,
-        geom: Geom,
-        wake_cap: f32,
-        under: &mut Vec<GlowQuad>,
-        halos: &mut Vec<RainHalo>,
-    ) {
-        let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        let heat = self.heat.clamp(0.0, 1.0);
-        let ground = LightGround::of(cfg);
-        let gain = LIGHT_BODY_ALPHA_CAP / wake_cap;
-        let lift = |cov: u8| (f32::from(cov) * gain).min(LIGHT_BODY_ALPHA_CAP) as u8;
-        let under_thickness = ch * (0.28 + 0.13 * heat);
-        let crest_thickness = ch * (0.10 + 0.09 * heat);
-        let deep = ground.body_ink(water_ramp(0.34));
-        let cap = LIGHT_BODY_ALPHA_CAP as u8;
-        if let [lone] = self.water_samples.as_slice()
-            && lone.surface.cov > 0
-        {
-            // A lone drop on the line: a short bead of the crest's ink.
-            let v = lone.surface;
-            let from = under.len();
-            push_rect(
-                under,
-                geom,
-                (v.x - cw * 0.3).round() as i32,
-                (v.y - ch * 0.06).round() as i32,
-                (cw * 0.6).round().max(2.0) as i32,
-                (ch * 0.12).round().max(1.0) as i32,
-                premul_rgb(0x00FF_FFFF, lift(v.cov)),
-            );
-            let ink = ground.body_ink(v.color);
-            reink_quads(&mut under[from..], cap, |_| ink);
-        }
-        for segment in self.water_samples.windows(2).rev() {
-            if under.len() >= Self::MAX_QUADS {
+    /// The water's crest colour at path position `pos` (tail 0, head 1) and
+    /// heat `heat`: a clear cyan, deeper toward the tail (a slate at the
+    /// ramp's middle read as dull grey water).
+    pub(super) fn water_crest_color(pos: f32, heat: f32) -> u32 {
+        water_ramp(0.66 + 0.24 * pos + 0.10 * heat)
+    }
+
+    /// The first sample of the run of adjacent samples that ends just
+    /// before `end` in `samples`.
+    fn water_run_start(samples: &[WaterSample], end: usize) -> usize {
+        let mut start = end - 1;
+        while start > 0 {
+            let (a, b) = (&samples[start - 1], &samples[start]);
+            if a.row.abs_diff(b.row) > 1 || a.col.abs_diff(b.col) > 1 {
                 break;
             }
-            if segment[0].row.abs_diff(segment[1].row) > 1
-                || segment[0].col.abs_diff(segment[1].col) > 1
-            {
-                continue;
-            }
-            let surface = [segment[0].surface, segment[1].surface];
-            if surface.iter().all(|v| v.cov == 0) {
-                continue;
-            }
-            let white = |v: BeamVertex, k: f32| BeamVertex {
-                color: 0x00FF_FFFF,
-                cov: lift(((v.cov as f32) * k) as u8),
-                ..v
-            };
-            let from = under.len();
-            comet_beam(
-                under,
-                geom.beam_clip(),
-                &surface.map(|v| white(v, 0.55)),
-                under_thickness,
-                1,
-                0.0,
-            );
-            reink_quads(&mut under[from..], cap, |_| deep);
-            let crest = ground.body_ink(lerp_rgb(surface[0].color, surface[1].color, 0.5));
-            let from = under.len();
-            comet_beam(
-                under,
-                geom.beam_clip(),
-                &surface.map(|v| white(v, 1.0)),
-                crest_thickness,
-                1,
-                0.0,
-            );
-            reink_quads(&mut under[from..], cap, |_| crest);
+            start -= 1;
         }
-        // The old reflection's beads, falling through the rows below.
+        start
+    }
+
+    /// One run's surface as a curve into `curve` (cleared first): along one
+    /// row, the swell itself between each two samples ([`Self::WATER_KNOTS`]
+    /// knots a cell, phase and height eased between theirs), so its crests
+    /// are rounded, never a chord's corner; across rows (a leap), the
+    /// straight line from its first sample to its last, so the cells' stair
+    /// draws no zigzag through the lines it crosses.
+    pub(super) fn water_curve(run: &[WaterSample], curve: &mut Vec<BeamVertex>) {
+        curve.clear();
+        let (Some(first), Some(last)) = (run.first(), run.last()) else {
+            return;
+        };
+        let one_row = run.iter().all(|s| s.row == first.row);
+        let n = run.len();
+        for (i, pair) in run.windows(2).enumerate() {
+            let (a, b) = (&pair[0], &pair[1]);
+            for k in 0..Self::WATER_KNOTS {
+                let t = k as f32 / Self::WATER_KNOTS as f32;
+                let x = a.surface.x + (b.surface.x - a.surface.x) * t;
+                let y = if one_row {
+                    let line = a.line_y + (b.line_y - a.line_y) * t;
+                    let phase = a.phase + (b.phase - a.phase) * t;
+                    line + phase.sin() * (a.amp + (b.amp - a.amp) * t)
+                } else {
+                    let u = (i as f32 + t) / (n - 1) as f32;
+                    first.line_y + (last.line_y - first.line_y) * u
+                };
+                let cov = f32::from(a.surface.cov)
+                    + (f32::from(b.surface.cov) - f32::from(a.surface.cov)) * t;
+                curve.push(BeamVertex {
+                    x,
+                    y,
+                    color: if t < 0.5 {
+                        a.surface.color
+                    } else {
+                        b.surface.color
+                    },
+                    cov: cov.round() as u8,
+                });
+            }
+        }
+        curve.push(BeamVertex {
+            y: if one_row { last.surface.y } else { last.line_y },
+            ..last.surface
+        });
+    }
+
+    /// Water on a light ground: the same newest-owner samples, painted
+    /// source-over beneath the glyph ink (the caller's stream is
+    /// `glow_under`), since additive light cannot brighten white.
+    ///
+    /// The two-layer wave keeps its shape: the undertow and the crest are
+    /// drawn as one [`comet_beam_over`] polyline per run of adjacent samples
+    /// (so a run's straight joins never paint a seam twice; a diagonal
+    /// staircase's corners do, as the dark wake lights them twice), in the
+    /// dark ramp's own stops. The undertow and the crest lie under the
+    /// letters, so their ink is the light body's, solved against the theme's
+    /// text ([`LightGround::body_ink`]); the beads and the lone droplet are
+    /// small marks in the vivid ink of the role that never touches text
+    /// ([`InkRole::Leading`]). A sample's coverage becomes opacity, scaled so
+    /// a fresh crest reaches [`Self::LIGHT_WATER_ALPHA_CAP`] and the undertow
+    /// keeps its 0.34 share; the beads and the lone droplet are source-over at
+    /// the crest's opacity.
+    fn emit_water_light(
+        &mut self,
+        cfg: &GlowConfig,
+        geom: Geom,
+        (under_th, crest_th): (f32, f32),
+        out: &mut Vec<GlowQuad>,
+    ) {
+        let (cw, ch) = (geom.cw as f32, geom.ch as f32);
+        let ink = InkRole::Leading;
+        let ground = self.light_ground(cfg);
+        let opacity = |cov: u8| -> u8 {
+            (f32::from(cov) * Self::LIGHT_WATER_ALPHA_CAP / Self::WATER_WAKE_COV_CAP)
+                .min(Self::LIGHT_WATER_ALPHA_CAP) as u8
+        };
+        let undertow_ink = ground.body_ink(water_ramp(0.34));
+        if self.water_samples.len() == 1 && self.water_samples[0].surface.cov > 0 {
+            let v = self.water_samples[0].surface;
+            let a = opacity(v.cov);
+            let tw = (cw * 0.4).round().max(2.0) as i32;
+            let th = (ch * 0.08).round().max(1.0) as i32;
+            let (x, y) = (v.x.round() as i32 - tw / 2, v.y.round() as i32);
+            push_fx_quad(out, geom, x, y, tw, th, premul_rgb(ink.ink(v.color), a), a);
+        }
+        // Runs of adjacent samples, newest first so a saturated budget sheds
+        // the old tail; each run is one polyline per layer.
+        let mut curve = std::mem::take(&mut self.water_run);
+        let n = self.water_samples.len();
+        let mut end = n;
+        while end > 1 {
+            let start = Self::water_run_start(&self.water_samples, end);
+            let run = &self.water_samples[start..end];
+            end = start;
+            if run.len() < 2 || run.iter().all(|s| s.surface.cov == 0) {
+                continue;
+            }
+            if out.len() >= Self::MAX_QUADS {
+                break;
+            }
+            Self::water_curve(run, &mut curve);
+            for v in &mut curve {
+                v.color = undertow_ink;
+                v.cov = (f32::from(opacity(v.cov)) * 0.34) as u8;
+            }
+            comet_beam_over(out, geom.beam_clip(), &curve, under_th, 1, 0.0);
+            Self::water_curve(run, &mut curve);
+            for v in &mut curve {
+                v.color = ground.body_ink(v.color);
+                v.cov = opacity(v.cov);
+            }
+            comet_beam_over(out, geom.beam_clip(), &curve, crest_th, 1, 0.0);
+        }
+        self.water_run = curve;
+        // The beads: a bead's coverage tops out at 0.54 of its crest's, so it
+        // is priced back up to read as the water it was.
+        // Each a round bead of clear water blue, a deeper rim round it.
+        let drip_r = (cw * 0.16).max(1.25);
         for sample in self.water_samples.iter().rev() {
             if sample.drip_cov == 0 {
                 continue;
             }
-            let alpha = (f32::from(sample.drip_cov) * 1.8).min(LIGHT_INK_ALPHA_CAP) as u32;
-            if alpha < 24 {
-                continue;
+            if out.len() >= Self::MAX_QUADS {
+                break;
             }
-            let ink = (InkRole::OverText.ink(water_ramp(0.6)) & 0x00FF_FFFF) | (alpha << 24);
-            let r = (cw * 0.16).max(1.5);
-            push_halo_rows(
-                halos,
+            let a = opacity((f32::from(sample.drip_cov) / 0.54).min(255.0) as u8);
+            push_paper_bead(
+                out,
                 geom,
                 (sample.drip_x, sample.drip_y),
-                (r, (sample.drip_h * 0.6).max(r)),
-                ink,
-                HaloMode::Over,
+                drip_r.max(sample.drip_h * 0.3),
+                Self::LIGHT_WATER_DROP_INKS,
+                a,
             );
         }
+        out.truncate(Self::MAX_QUADS);
     }
 
     /// Emit the fire meteors: each is one straight anti-aliased streak of fire
@@ -1343,6 +2682,13 @@ impl CursorGlow {
     /// over its life. Rasterized through the shared `comet_beam`, smooth at any
     /// angle with CPU/GPU parity. Two passes per meteor: a wide dim aura and a
     /// hot tapered core.
+    ///
+    /// On a light ground additive light cannot show, so the same geometry is
+    /// painted source-over ([`comet_beam_over`]) into the under-ink stream the
+    /// caller hands over: a deep-ember streak, red at the tail to burnt orange
+    /// at the head (never the white-hot head, which a white page swallows),
+    /// beneath the letters it crosses and at most
+    /// [`Self::LIGHT_METEOR_ALPHA_CAP`] opaque.
     pub(super) fn emit_fire_meteors(
         &self,
         now: Instant,
@@ -1354,10 +2700,27 @@ impl CursorGlow {
             return;
         }
         let chf = geom.ch as f32;
+        let dark = cfg.dark_theme;
+        let beam = if dark { comet_beam } else { comet_beam_over };
+        // A ramp position on the light ground: the dark ground's span folded
+        // into the deep end, where every colour holds a dark letter at the cap.
+        let ramp_at = |r: f32| {
+            if dark {
+                r
+            } else {
+                Self::LIGHT_METEOR_RAMP.0
+                    + (Self::LIGHT_METEOR_RAMP.1 - Self::LIGHT_METEOR_RAMP.0) * r
+            }
+        };
         // Text-safety ceiling: bright enough to read as a meteor streak, still
         // under a wash; it crosses glyphs for ~0.3 s and the contrast rim keeps
-        // them readable.
+        // them readable. On white the coverage is the paint's opacity.
         const METEOR_COV_CAP: f32 = 185.0;
+        let cov_cap = if dark {
+            METEOR_COV_CAP
+        } else {
+            Self::LIGHT_METEOR_ALPHA_CAP
+        };
         for m in &self.fire_meteors {
             let age = now.saturating_duration_since(m.born).as_secs_f32();
             let u = (age / m.life).clamp(0.0, 1.0);
@@ -1383,7 +2746,7 @@ impl CursorGlow {
             if (dx * dx + dy * dy).sqrt() < 1.0 {
                 continue;
             }
-            let head_cov = (METEOR_COV_CAP * fade * cfg.intensity).clamp(0.0, 255.0);
+            let head_cov = (cov_cap * fade * cfg.intensity).clamp(0.0, 255.0);
             if head_cov < 1.0 {
                 continue;
             }
@@ -1395,17 +2758,17 @@ impl CursorGlow {
                 BeamVertex {
                     x: tx,
                     y: ty,
-                    color: fire_ramp(0.18),
+                    color: fire_ramp(ramp_at(0.18)),
                     cov: (head_cov * 0.06) as u8,
                 },
                 BeamVertex {
                     x: m.x1,
                     y: m.y1,
-                    color: fire_ramp(0.35),
+                    color: fire_ramp(ramp_at(0.35)),
                     cov: (head_cov * 0.16) as u8,
                 },
             ];
-            comet_beam(out, geom.beam_clip(), &aura, core_t * 1.5, 2, 0.0);
+            beam(out, geom.beam_clip(), &aura, core_t * 1.5, 2, 0.0);
             if out.len() >= Self::MAX_QUADS {
                 out.truncate(Self::MAX_QUADS);
                 return;
@@ -1431,17 +2794,17 @@ impl CursorGlow {
                     BeamVertex {
                         x: tx + dx * t0,
                         y: ty + dy * t0,
-                        color: fire_ramp(ramp * 0.8),
+                        color: fire_ramp(ramp_at(ramp * 0.8)),
                         cov: c0,
                     },
                     BeamVertex {
                         x: tx + dx * t1,
                         y: ty + dy * t1,
-                        color: fire_ramp(ramp),
+                        color: fire_ramp(ramp_at(ramp)),
                         cov: c1,
                     },
                 ];
-                comet_beam(
+                beam(
                     out,
                     geom.beam_clip(),
                     &verts,
@@ -1493,10 +2856,10 @@ impl CursorGlow {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "clock + config + geometry + cursor + the two output streams; a param struct would obscure the single internal call site"
+        reason = "clock, config, geometry, cursor, and the halo and under-ink streams; a param struct would obscure the single internal call site"
     )]
     pub(super) fn emit_crown(
-        &self,
+        &mut self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
@@ -1536,6 +2899,39 @@ impl CursorGlow {
         // `Glow size` sizes every crown: the shipped default draws the
         // crown at its authored size, and the knob scales it from there.
         let size = cfg.radius / GLOW_RADIUS_DEFAULT;
+        // A LIGHT GROUND: the crown is light added around the caret, which
+        // white paper cannot show and which would lift fresh ink toward the
+        // ground. Lumen, whose glow IS the style, wears it as soft ink under
+        // the letters behind the caret; Fire's ink tongues
+        // ([`Self::emit_flames_light`]) already carry the fire, so its mouth
+        // is dropped there; every other style draws no crown on paper.
+        // (Classic's own engine inks its crown, `ClassicWake::emit_light_crown`.)
+        if !cfg.dark_theme {
+            if matches!(cfg.style, GlowStyle::Lumen) {
+                // A glow is the style itself, so it shows at a relaxed cadence
+                // and deepens as typing warms. A cell and a half back over
+                // the letters just typed and only to the caret's own edge
+                // ahead, so it reads as the tracer's head rather than a lamp
+                // in front of the caret; its ink solved against the theme's
+                // text, so any strength keeps the letters on it legible.
+                let warmth = 0.6 + 0.4 * self.typing_boost().min(1.0);
+                let cap = LIGHT_BODY_ALPHA_CAP;
+                let peak = (cap * (0.55 + 0.45 * fade) * cfg.intensity * warmth).min(cap);
+                let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
+                let budget = under.len().saturating_add(Self::MAX_QUADS);
+                push_ink_ellipse(
+                    under,
+                    geom,
+                    geom.cell_center(cr, cc),
+                    (cwf * 1.6 * size, cwf * 0.5 * size),
+                    chf * 0.46 * size,
+                    self.light_ground(cfg).body_ink(cfg.color),
+                    peak,
+                    budget,
+                );
+            }
+            return;
+        }
         let cw = geom.cw as i32;
         let ch = geom.ch as i32;
         let cx = geom.origin_x as i32 + cc as i32 * cw;
@@ -1562,8 +2958,10 @@ impl CursorGlow {
                 fire_ramp(0.55 + 0.30 * self.fire_t()),
             ),
             GlowStyle::Water => (28.0, water_ramp(0.74)),
-            GlowStyle::Phaser | GlowStyle::Sparkle => (50.0, hsv2rgb(self.hue, 0.9, 1.0)),
-            // Exhaustiveness only: the classic wake draws its own box crown in
+            GlowStyle::Phaser => (50.0, hsv2rgb(self.hue, 0.9, 1.0)),
+            // Sparkle's head is its gold ([`Self::comet_color`]).
+            GlowStyle::Sparkle => (50.0, Self::sparkle_gold(cfg)),
+            // Exhaustiveness only: the classic wake draws its own crown in
             // `classic_wake::ClassicWake::emit_crown`.
             GlowStyle::Classic => (50.0, hsv2rgb(self.hue, 0.9, 1.0)),
             // Exhaustiveness only: v2 owns the rainbow kitty's head and this
@@ -1586,14 +2984,6 @@ impl CursorGlow {
         } else {
             self.typing_boost()
         };
-        // A LIGHT GROUND: the crown is light added around the caret, which
-        // white paper cannot show and which would lift fresh ink toward the
-        // ground. Every style wears it instead as soft ink under the letters,
-        // inside the caret's row, in the shape and size its dark crown has.
-        if !cfg.dark_theme {
-            self.emit_crown_light(cfg, geom, (cr, cc), (base_cov, color), fade, boost, under);
-            return;
-        }
         // Fire: the mouth of the fire is two breathing radial halos (a wide
         // soft skirt under a tight hot heart) on the cursor.
         if matches!(cfg.style, GlowStyle::Fire) {
@@ -1602,25 +2992,30 @@ impl CursorGlow {
             let (ccx, ccy) = (cx as f32 + cw as f32 * 0.5, cy as f32 - ch as f32 * 0.10);
             let reach = r as f32 + ch as f32 * 0.55;
             let peak = (base_cov * fade * cfg.intensity * boost).min(255.0);
+            // Two additive halos, each spending the over-ink ledger where it
+            // reaches the letters beside the caret.
             if peak >= 1.0 {
-                push_halo(
-                    halos,
-                    geom,
-                    ccx,
-                    ccy,
-                    reach * 1.9,
-                    reach * 1.45,
-                    premul_rgb(color, (peak * 0.34) as u8),
-                );
-                push_halo(
-                    halos,
-                    geom,
-                    ccx,
-                    ccy,
-                    reach * 1.05,
-                    reach * 0.85,
-                    premul_rgb(fire_ramp(0.62 + 0.23 * self.fire_t()), (peak * 0.82) as u8),
-                );
+                let heart = fire_ramp(0.62 + 0.23 * self.fire_t());
+                for (radii, rgb, cov) in [
+                    ((reach * 1.9, reach * 1.45), color, peak * 0.34),
+                    ((reach * 1.05, reach * 0.85), heart, peak * 0.82),
+                ] {
+                    let share = self.ink_ledger.admit_halo(
+                        (ccx, ccy),
+                        radii,
+                        premul_rgb(rgb, cov as u8),
+                        InkLedger::STEADY_FLOOR,
+                    );
+                    push_halo(
+                        halos,
+                        geom,
+                        ccx,
+                        ccy,
+                        radii.0,
+                        radii.1,
+                        premul_rgb(rgb, (cov * share) as u8),
+                    );
+                }
             }
             // The forge dressing does not live here: this function returns on
             // the ~350 ms last-move window, which would black it out while the
@@ -1628,15 +3023,19 @@ impl CursorGlow {
             // `emit_forge_cursor`; the ambience halos above stay crown-gated.
             return;
         }
-        // Every remaining style (phaser, sparkle, laser, water, beam, lumen,
-        // comet): a compact radial bloom on the cursor cell, full punch over
-        // the empty cell and near zero at the neighbouring glyphs' centres at
-        // the default size, so the newest letter keeps contrast. Not
-        // concentric rectangles, which read as debug geometry and saturate the
-        // newest glyph.
+        // Every remaining style (phaser, sparkle, laser, water, lumen, comet):
+        // a compact radial bloom on the cursor cell, full punch over the empty
+        // cell and near zero at the neighbouring glyphs' centres at the
+        // default size, so the newest letter keeps contrast. Not concentric
+        // rectangles, which read as debug geometry and saturate the newest
+        // glyph.
         let (ccx, ccy) = (cx as f32 + cw as f32 * 0.5, cy as f32 + ch as f32 * 0.5);
         let peak = (base_cov * 1.9 * fade * cfg.intensity * boost).min(210.0);
         if peak >= 1.0 {
+            // Over the dark bed, whatever of the crown reaches the letters
+            // beside the caret spends the over-ink account first of the
+            // lights laid after the streak (an idle account admits it whole).
+            let from = halos.len();
             let (core_rx, core_ry) = (cw as f32 * 1.25 * size, ch as f32 * 0.85 * size);
             push_halo(
                 halos,
@@ -1660,89 +3059,8 @@ impl CursorGlow {
                     premul_rgb(color, (peak * 0.9).min(230.0) as u8),
                 );
             }
-        }
-    }
-
-    /// The crown on a LIGHT GROUND: the same bloom as ink under the letters,
-    /// held inside the caret's row ([`push_ink_ellipse`]), its ink solved
-    /// against the theme's text. Lumen's glow is the style itself, so it
-    /// shows at a relaxed cadence and deepens as typing warms; every other
-    /// style's crown keeps its dark-ground strength law (faint at rest, full
-    /// under sustained typing) mapped onto the body ceiling, and its size
-    /// (`Glow size`).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the crown's resolved facts (cell, colour, fade, heat) handed over from emit_crown"
-    )]
-    fn emit_crown_light(
-        &self,
-        cfg: &GlowConfig,
-        geom: Geom,
-        (row, col): (u16, u16),
-        (base_cov, color): (f32, u32),
-        fade: f32,
-        boost: f32,
-        under: &mut Vec<GlowQuad>,
-    ) {
-        let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
-        let size = cfg.radius / GLOW_RADIUS_DEFAULT;
-        let ink = LightGround::of(cfg).body_ink(color);
-        let budget = under.len().saturating_add(Self::MAX_QUADS);
-        let (cx, cy) = geom.cell_center(row, col);
-        // The dark crown's peak, as a share of its ceiling, onto the body's.
-        let light_peak = |dark_peak: f32| LIGHT_BODY_ALPHA_CAP * (dark_peak / 210.0).min(1.0);
-        match cfg.style {
-            GlowStyle::Lumen => {
-                // A glow is the style itself, so it shows at a relaxed cadence
-                // and deepens as typing warms.
-                let warmth = 0.6 + 0.4 * boost.min(1.0);
-                let peak = LIGHT_BODY_ALPHA_CAP * (0.55 + 0.45 * fade) * cfg.intensity * warmth;
-                push_ink_ellipse(
-                    under,
-                    geom,
-                    (cx, cy),
-                    cwf * 1.6 * size,
-                    chf * 0.46 * size,
-                    ink,
-                    peak,
-                    budget,
-                );
-            }
-            GlowStyle::Fire => {
-                // The mouth of the fire, wide as its dark skirt, lit with the
-                // blaze; the heat-rise offset would leave the row, so it sits
-                // on the caret's.
-                let r = cfg.radius * chf * (1.1 + 0.7 * self.fire_t());
-                let reach = r + chf * 0.55;
-                let peak = light_peak((base_cov * fade * cfg.intensity * boost * 1.9).min(255.0));
-                push_ink_ellipse(under, geom, (cx, cy), reach, reach, ink, peak, budget);
-            }
-            _ => {
-                let peak = light_peak(base_cov * 1.9 * fade * cfg.intensity * boost);
-                push_ink_ellipse(
-                    under,
-                    geom,
-                    (cx, cy),
-                    cwf * 1.25 * size,
-                    chf * 0.85 * size,
-                    ink,
-                    peak,
-                    budget,
-                );
-                // Laser's impact heart, tight and hot inside its bloom.
-                if matches!(cfg.style, GlowStyle::Laser) {
-                    push_ink_ellipse(
-                        under,
-                        geom,
-                        (cx, cy),
-                        cwf * 0.7 * size,
-                        chf * 0.55 * size,
-                        ink,
-                        peak * 0.9,
-                        budget,
-                    );
-                }
-            }
+            self.ink_ledger
+                .admit_halos_masked(halos, from, InkLedger::HEAD_FLOOR);
         }
     }
 
@@ -1751,15 +3069,20 @@ impl CursorGlow {
     /// `emit_crown`: the metal cools on `TEMP_RELEASE_TAU` (1.4 s), far slower
     /// than the ~350 ms crown window. Emits every frame the metal is warm
     /// (`is_active` keeps the timer armed) and nothing below `FORGE_MIN_TEMP`.
+    ///
+    /// Dark ground only. All three are additive light, which cannot show on a
+    /// light ground: there the block caret covers the cell, and the crawl
+    /// would only lift the neighbouring glyph toward the page. The forge fill
+    /// itself carries the heat on a light page.
     pub(super) fn emit_forge_cursor(
-        &self,
+        &mut self,
         cfg: &GlowConfig,
         geom: Geom,
         cur: Option<(u16, u16)>,
         out: &mut Vec<GlowQuad>,
         halos: &mut Vec<RainHalo>,
     ) {
-        if !matches!(cfg.style, GlowStyle::Fire) {
+        if !matches!(cfg.style, GlowStyle::Fire) || !cfg.dark_theme {
             return;
         }
         let temp = self.cursor_temp;
@@ -1778,19 +3101,36 @@ impl CursorGlow {
         let (ccx, ccy) = (cx as f32 + cw as f32 * 0.5, cy as f32 - ch as f32 * 0.10);
         let tn = ((temp - Self::FORGE_MIN_TEMP) / (1.0 - Self::FORGE_MIN_TEMP)).clamp(0.0, 1.0);
         let phase = self.flame_phase;
+        // The core and the crawl spend the over-ink ledger where they reach
+        // the letters beside the caret; the rim stays on the caret's own cell.
+        //
         // 1) MOLTEN CORE: a small white-hot pool riding just above centre (heat
         //    rises), swelling and pulsing with the metal.
         let pulse = 0.85 + 0.15 * (phase * 2.3).sin();
         let core_cov = (150.0 * tn * pulse * cfg.intensity).min(255.0);
         if core_cov >= 2.0 {
+            let (centre, radii) = (
+                (ccx, ccy - ch as f32 * 0.12),
+                (
+                    cw as f32 * (0.30 + 0.14 * tn),
+                    ch as f32 * (0.20 + 0.10 * tn),
+                ),
+            );
+            let rgb = fire_ramp((0.72 + 0.20 * tn).min(0.92));
+            let share = self.ink_ledger.admit_halo(
+                centre,
+                radii,
+                premul_rgb(rgb, core_cov as u8),
+                InkLedger::STEADY_FLOOR,
+            );
             push_halo(
                 halos,
                 geom,
-                ccx,
-                ccy - ch as f32 * 0.12,
-                cw as f32 * (0.30 + 0.14 * tn),
-                ch as f32 * (0.20 + 0.10 * tn),
-                premul_rgb(fire_ramp((0.72 + 0.20 * tn).min(0.92)), core_cov as u8),
+                centre.0,
+                centre.1,
+                radii.0,
+                radii.1,
+                premul_rgb(rgb, (core_cov * share) as u8),
             );
         }
         // 2) HOT TOP RIM: the block's top edge glows hottest — a thin bright
@@ -1832,6 +3172,13 @@ impl CursorGlow {
                 };
                 let crawl_cov = (130.0 * (temp - 0.5) * 2.0 * cfg.intensity).min(200.0);
                 if crawl_cov >= 2.0 {
+                    let rgb = fire_ramp(0.85);
+                    let share = self.ink_ledger.admit_halo(
+                        (ex, ey),
+                        (3.5, 3.5),
+                        premul_rgb(rgb, crawl_cov as u8),
+                        InkLedger::STEADY_FLOOR,
+                    );
                     push_halo(
                         halos,
                         geom,
@@ -1839,7 +3186,7 @@ impl CursorGlow {
                         ey,
                         3.5,
                         3.5,
-                        premul_rgb(fire_ramp(0.85), crawl_cov as u8),
+                        premul_rgb(rgb, (crawl_cov * share) as u8),
                     );
                 }
             }
@@ -1881,29 +3228,24 @@ impl CursorGlow {
         }
         // Fire: the impact is a round expanding flash (white-hot cooling to
         // ember) with a dimmer aftershock behind it.
+        // Every round bloom below is fitted inside the effects box, so a
+        // landing at the grid's edge fades out before it instead of standing
+        // cut by it ([`fit_glow_in_box`]).
+        let bloom = |halos: &mut Vec<RainHalo>, radii: (f32, f32), premul: u32| {
+            let ((cx, cy), (rx, ry)) = fit_glow_in_box(geom, (ring.cx, ring.cy), radii);
+            push_halo(halos, geom, cx, cy, rx, ry, premul);
+        };
         if matches!(cfg.style, GlowStyle::Fire) {
             let grow = (0.55 + 1.25 * t) * geom.ch as f32 * rf;
-            push_halo(
-                halos,
-                geom,
-                ring.cx,
-                ring.cy,
-                grow * 1.5,
-                grow * 1.1,
-                premul_rgb(color, cov),
-            );
+            bloom(halos, (grow * 1.5, grow * 1.1), premul_rgb(color, cov));
             if t > 0.30 {
                 let t2 = (t - 0.30) / 0.70;
                 let cov2 = (150.0 * (1.0 - t2) * cfg.intensity) as u8;
                 if cov2 > 0 {
                     let g2 = (0.55 + 1.25 * t2) * geom.ch as f32 * rf;
-                    push_halo(
+                    bloom(
                         halos,
-                        geom,
-                        ring.cx,
-                        ring.cy,
-                        g2 * 1.5,
-                        g2 * 1.1,
+                        (g2 * 1.5, g2 * 1.1),
                         premul_rgb(fire_ramp(0.45), cov2),
                     );
                 }
@@ -1935,33 +3277,24 @@ impl CursorGlow {
             }
             return;
         }
-        let premul = premul_rgb(color, cov);
-        // Expanding square outline: half-size grows from ~0.6 to ~1.6 cells,
-        // emitted as four ~2 px bars (push_rect splits verticals per row).
-        let s = ((0.6 + 1.0 * t) * geom.ch as f32 * rf) as i32;
-        let th = 2i32;
-        let cx = ring.cx as i32;
-        let cy = ring.cy as i32;
-        // top + bottom
-        push_rect(out, geom, cx - s, cy - s, 2 * s, th, premul);
-        push_rect(out, geom, cx - s, cy + s - th, 2 * s, th, premul);
-        // Left and right bars are inset by the bar thickness so the four bars
-        // partition the outline; the stream is additive, so a corner covered
-        // twice would read as a bright rivet. `2s − 2th > 0` always
-        // (s ≥ 0.6·ch ≥ 19, th = 2).
-        push_rect(out, geom, cx - s, cy - s + th, th, 2 * s - 2 * th, premul);
-        push_rect(
-            out,
-            geom,
-            cx + s - th,
-            cy - s + th,
-            th,
-            2 * s - 2 * th,
-            premul,
+        // Every other dark style: the light arm's soft round shape as light,
+        // an expanding radial bloom fading with the ring's life. A thin
+        // square outline here read as a stray rectangle left on the page
+        // (its side cut off by the pad when the landing sat near the edge);
+        // the classic wake keeps its own square ring. A single ring: fire's
+        // aftershock and water's ripple train returned above.
+        let grow = (0.7 + 1.0 * t) * geom.ch as f32 * rf;
+        bloom(
+            halos,
+            (grow, grow * 0.85),
+            premul_rgb(color, (f32::from(cov) * Self::DARK_RING_SHARE) as u8),
         );
-        // A single ring: fire's aftershock and water's ripple train returned
-        // above.
     }
+
+    /// The dark ring's bloom peak as a share of the ring's coverage: a
+    /// filled bloom carries far more light than the 2 px outline it replaced
+    /// at the same coverage.
+    const DARK_RING_SHARE: f32 = 0.45;
 
     /// The landing ring on a LIGHT GROUND, where an additive shockwave is
     /// invisible. Water lands as its ripple train, rasterized in white and
@@ -2020,21 +3353,83 @@ impl CursorGlow {
             return;
         }
         let grow = (0.7 + 1.0 * t) * geom.ch as f32 * rf;
-        let veil = InkRole::OverText.ink(color);
-        let cap = ((cov as u32) / 2).clamp(1, 120);
-        let veil_capped = (veil & 0x00FF_FFFF) | (cap << 24);
-        push_halo_over(
+        // Fire's landing is the warmth of its flames, a soft orange glow,
+        // not the grey a white-hot flash inks to on paper (it read as a
+        // stain). Its cap keeps any letter under it legible.
+        // Every other style's veil wears its own colour at the vivid ink's
+        // weight ([`Self::light_veil_ink`]): the conservative over-text ink
+        // is the colour darkened, which a veil thinned to a grey halo round
+        // the caret.
+        let veil = if matches!(cfg.style, GlowStyle::Fire) {
+            Self::FIRE_LIGHT_LANDING
+        } else {
+            Self::light_veil_ink(color)
+        };
+        // The vivid ink is light enough that a deeper veil keeps a letter
+        // under it at the light bar; the fire's warm veil keeps its cap.
+        let cap = if matches!(cfg.style, GlowStyle::Fire) {
+            ((cov as u32) / 2).clamp(1, 120) as u8
+        } else {
+            ((cov as u32) * 3 / 4).clamp(1, 160) as u8
+        };
+        // A veil falling off from its centre: one capped veil is a flat
+        // disc that reads on paper as a stain.
+        push_soft_veil(
             halos,
             geom,
-            ring.cx,
-            ring.cy,
-            grow,
-            grow * 0.85,
-            veil_capped,
-            255,
+            (ring.cx, ring.cy),
+            (grow, grow * 0.85),
+            veil,
+            cap,
         );
     }
 
+    /// A light landing veil's ink for `rgb`: its hue (a gold or yellow bent
+    /// to amber) at its own saturation (raised to [`Self::LIGHT_VEIL_SAT`] at
+    /// least, so a pale colour still tints), at full value, darkened only as
+    /// far as the vivid ink's luma ([`LIGHT_INK_BOLD_MAX_LUMA`]): a colour,
+    /// never the grey (or the olive) a darker ink thins to.
+    pub(super) fn light_veil_ink(rgb: u32) -> u32 {
+        let (h, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+        // A gold or a yellow darkened to the vivid ink's weight is an olive:
+        // the warm band bends to amber, and the yellow-greens past it cross
+        // to leaf green in a few degrees.
+        let h = if (30.0..80.0).contains(&h) {
+            30.0 + (h - 30.0) * 0.2
+        } else if (80.0..95.0).contains(&h) {
+            40.0 + (h - 80.0) * (55.0 / 15.0)
+        } else {
+            h
+        };
+        let full = crate::color_math::hsv2rgb(h, s.max(Self::LIGHT_VEIL_SAT), 1.0);
+        let y = luma709(full);
+        if y <= LIGHT_INK_BOLD_MAX_LUMA {
+            return full;
+        }
+        let k = LIGHT_INK_BOLD_MAX_LUMA / y;
+        let ch = |sh: u32| ((((full >> sh) & 0xff) as f32 * k) + 0.5) as u32;
+        (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    }
+
+    /// Emit the flying particles, style by style.
+    ///
+    /// THE PARTICLE LAW (every arm but Fire, which keeps its own ember
+    /// discipline): a grain's body is round, its one accent is the dealt plus,
+    /// and it keeps off the text. "The text" is a line of text the frame
+    /// shows, from its first glyph to its last, the gaps between words
+    /// included ([`TextView`]: the probed rows, and the frame's own cells for
+    /// the rows its light can reach, so the lines an Enter just printed above
+    /// the caret count). On a dark ground a grain dims hard there
+    /// ([`Self::GRAIN_OVER_GLYPH_DIM`], the embers' discipline), so the
+    /// comet's debris, which hangs on the typed row, reads as neither a dotted
+    /// leader through the letters nor a hyphen between them (water's droplets
+    /// keep their own lower coverage). Sparkle's shower and Beam's stardust
+    /// are not drawn over the text on either ground: a moon or a speck over a
+    /// line reads as a smudge or as punctuation. On a light ground additive
+    /// light cannot show, so every grain is source-over ink
+    /// ([`push_light_mote`], the light star twin, the source-over dash and
+    /// crescent; sparkle's in saturated golds, [`push_paper_bead`]), and a
+    /// grain over the text is not drawn at all: text first.
     pub(super) fn emit_particles(
         &mut self,
         now: Instant,
@@ -2046,6 +3441,65 @@ impl CursorGlow {
     ) {
         let sz = (geom.ch as f32 * 0.18).max(2.0) as i32;
         let water = matches!(cfg.style, GlowStyle::Water);
+        let dark = cfg.dark_theme;
+        // Fire keeps its own ember discipline; every other arm follows the
+        // particle law. Fire's light-ground embers keep off the text too (its
+        // arm below), and Beam's stardust keeps off it whole.
+        let beam = matches!(cfg.style, GlowStyle::Beam);
+        let lawful = !matches!(cfg.style, GlowStyle::Fire | GlowStyle::Beam);
+        let light_fire = !dark && matches!(cfg.style, GlowStyle::Fire);
+        let ch = geom.ch as f32;
+        // Read the frame's text once a frame, and only when a grain that
+        // keeps off it flies.
+        let fire = matches!(cfg.style, GlowStyle::Fire);
+        let text = TextView::new(
+            if (lawful || fire || beam) && !self.particles.is_empty() {
+                self.probed_text_spans()
+            } else {
+                TextSpans::default()
+            },
+            Some(&self.frame_text),
+        );
+        let covers = |x: f32, y: f32| {
+            let row = ((y - f32::from(geom.origin_y)) / ch).floor() as i32;
+            let col = ((x - f32::from(geom.origin_x)) / geom.cw as f32).floor() as i32;
+            text.covers_cell(row, col)
+        };
+        // A mark's reach past its centre: a grain whose centre sits just off
+        // a line still laid its rim over the letters' tops.
+        let margin = ch * 0.14;
+        let near_text = |x: f32, y: f32| {
+            covers(x, y)
+                || covers(x, y - margin)
+                || covers(x, y + margin)
+                || covers(x - margin, y)
+                || covers(x + margin, y)
+        };
+        // The glyph band of a row holding text (from above its ascenders to
+        // its descenders' feet): its top's window y when `y` lies in it.
+        let oyf = f32::from(geom.origin_y);
+        let glyph_band = |y: f32| -> Option<(i32, f32)> {
+            let row = ((y - oyf) / ch).floor() as i32;
+            let top = oyf + row as f32 * ch;
+            let k = (y - top) / ch;
+            ((Self::GLYPH_BAND.0..Self::GLYPH_BAND.1).contains(&k)
+                && text.knows_row(row)
+                && !text.row_is_blank(row))
+            .then_some((row, top))
+        };
+        let caret_row = self.last.map(|(r, _)| i32::from(r));
+        // The caret's cell grown by a grain's reach: the block caret covers
+        // its cell, so a grain whose mark reaches into it is cut in half.
+        let caret = self.last.map(|(r, c)| Self::caret_box(geom, r, c));
+        let reach = ch * 0.30;
+        let on_caret = |x: f32, y: f32| {
+            caret.is_some_and(|(x0, y0, x1, y1)| {
+                x > x0 as f32 - reach
+                    && x < x1 as f32 + reach
+                    && y > y0 as f32 - reach
+                    && y < y1 as f32 + reach
+            })
+        };
         'flying: for p in self.particles.iter().rev() {
             if out.len() >= Self::MAX_QUADS {
                 break 'flying;
@@ -2056,6 +3510,69 @@ impl CursorGlow {
             // Analytic ballistic position.
             let x = p.x0 + p.vx * age;
             let y = p.y0 + p.vy * age + 0.5 * p.gy * age * age;
+            // Comet dust on a dark ground hangs in a text row's leading, above
+            // its ascenders or under its letters, never at their x-height,
+            // where a grain between two words reads as a typed interpunct
+            // (and a cluster after a line's last letter as a dash).
+            let leading = dark
+                && matches!(cfg.style, GlowStyle::Comet)
+                && !self.streak_unbudgeted()
+                && glyph_band(y).is_some();
+            // A leading is a thin band: only some of the dust fits there, each
+            // grain at its own height in it (a row of them on one line read as
+            // a dotted rule).
+            let seat = (p.hue * 977.0).fract();
+            if leading && seat >= Self::COMET_DARK_DUST_SHARE {
+                continue;
+            }
+            let y = match glyph_band(y) {
+                Some((_, top)) if leading => {
+                    let k = seat / Self::COMET_DARK_DUST_SHARE;
+                    let jitter = ((p.hue * 4513.0).fract() - 0.5) * Self::COMET_DARK_DUST_JITTER;
+                    top + ch
+                        * (jitter
+                            + if k < 0.5 {
+                                Self::COMET_DARK_DUST_HIGH
+                            } else {
+                                Self::COMET_DARK_DUST_LOW
+                            })
+                }
+                _ => y,
+            };
+            // Text first: on a light ground a grain over the text is not
+            // drawn; on a dark one it dims to a faint glint (water's droplets
+            // excepted, already at their lower coverage below).
+            let sparkle = matches!(cfg.style, GlowStyle::Sparkle);
+            let over_text = (lawful || beam) && covers(x, y);
+            if over_text && (!dark || sparkle || beam) {
+                continue;
+            }
+            // Sparkle's shower and Beam's stardust keep their rims off the
+            // letters too, and, on a printed line the caret is not on, off
+            // its glyph band within two cells of its letters (an Enter's
+            // leap otherwise leaves a grain standing after the line's last
+            // letter, read as a stray glyph).
+            if (sparkle || beam)
+                && (near_text(x, y)
+                    || glyph_band(y).is_some_and(|(row, _)| {
+                        let col = ((x - f32::from(geom.origin_x)) / geom.cw as f32).floor() as i32;
+                        Some(row) != caret_row && (-2..=2).any(|d| text.covers_cell(row, col + d))
+                    }))
+            {
+                continue;
+            }
+            // Nor on a light ground where the block caret would cut it: half
+            // a grain standing off the caret's edge reads as a nub on it.
+            // Sparkle's shower keeps the rule on a dark ground too, where a
+            // grain the block half hides leaves a sliver of light on its edge.
+            if (!dark || sparkle) && (lawful || light_fire) && on_caret(x, y) {
+                continue;
+            }
+            let text_dim = if over_text && !water && !leading {
+                Self::GRAIN_OVER_GLYPH_DIM
+            } else {
+                1.0
+            };
             // Sparkles rotate hue over the flight; embers and droplets keep the
             // birth seed. The ramp (`style_particle_color`, shared with the
             // settings demo) is evaluated lazily: the rainbow kitty, fire and
@@ -2074,115 +3591,56 @@ impl CursorGlow {
             let base_cov = if water { 112.0 } else { 230.0 };
             // `cov_scale` divides a point-stacked burst's punch (laser:
             // 1/√burst; exactly 1.0 elsewhere).
-            let cov = (base_cov * p.cov_scale * fade * cfg.intensity) as u8;
+            let cov = (base_cov * p.cov_scale * fade * cfg.intensity * text_dim) as u8;
             if cov == 0 {
                 continue;
             }
-            // A LIGHT GROUND: additive light cannot show on white, so every
-            // grain becomes ink there. The beam's stardust and the comet's
-            // debris are dust the trail sheds, not marks over what was typed
-            // (8570e153e took grey dust off typed text), so they settle as
-            // motes of the body's ink UNDER the letters; the sparkles, the
-            // laser's sparks, the fire's embers and the water's droplets are
-            // each their style's look and stay source-over ink marks that
-            // scatter, rise or fall where the dark ground's light would.
-            if !cfg.dark_theme && matches!(cfg.style, GlowStyle::Beam | GlowStyle::Comet) {
-                let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
-                let alpha = (f32::from(cov) * twinkle * 0.6).min(LIGHT_INK_ALPHA_CAP);
-                if alpha < 24.0 || under.len() >= Self::MAX_QUADS {
-                    continue;
-                }
-                let d = ((geom.ch as f32 * (0.07 + 0.09 * p.hue)) as i32).max(1);
-                let from = under.len();
-                push_rect(
-                    under,
-                    geom,
-                    x as i32 - d / 2,
-                    y as i32 - d / 2,
-                    d,
-                    d,
-                    premul_rgb(0x00FF_FFFF, alpha as u8),
-                );
-                let ink = LightGround::of(cfg).body_ink(particle_color());
-                reink_quads(&mut under[from..], LIGHT_INK_ALPHA_CAP as u8, |_| ink);
-                continue;
-            }
-            if !cfg.dark_theme {
-                let twinkle = if matches!(cfg.style, GlowStyle::Laser | GlowStyle::Water) {
-                    1.0
-                } else {
-                    twinkle_env(age, p.hue * std::f32::consts::TAU)
-                };
-                let alpha = (f32::from(cov) * twinkle).min(LIGHT_INK_ALPHA_CAP) as u32;
-                if alpha < 24 {
-                    continue;
-                }
-                let ink = (InkRole::OverText.ink(particle_color()) & 0x00FF_FFFF) | (alpha << 24);
-                let cell = geom.ch as f32;
-                let seed = (p.hue * 4096.0) as u32;
-                match cfg.style {
-                    GlowStyle::Laser => {
-                        // A spark: a dash drawn out along its live velocity.
-                        let vy = p.vy + p.gy * age;
-                        let r = (cell * 0.07).max(1.0);
-                        let rx = r * (1.0 + (p.vx.abs() / cell).min(2.0) * 1.5);
-                        let ry = r * (1.0 + (vy.abs() / cell).min(2.0) * 1.5);
-                        push_halo_rows(halos, geom, (x, y), (rx, ry), ink, HaloMode::Over);
-                    }
-                    GlowStyle::Sparkle if seed.is_multiple_of(3) => {
-                        // A four-point star: a nucleus and two crossed arms.
-                        let arm = (cell * (0.16 + 0.10 * p.hue) * (0.6 + 0.4 * fade)).max(2.0);
-                        let waist = (arm * 0.22).max(1.0);
-                        push_halo_rows(
-                            halos,
-                            geom,
-                            (x, y),
-                            (waist * 1.6, waist * 1.6),
-                            ink,
-                            HaloMode::Over,
-                        );
-                        push_halo_rows(halos, geom, (x, y), (arm, waist), ink, HaloMode::Over);
-                        push_halo_rows(halos, geom, (x, y), (waist, arm), ink, HaloMode::Over);
-                    }
-                    GlowStyle::Water => {
-                        // A droplet: a bead stretched by its fall speed.
-                        let base = (cell * (0.055 + 0.065 * p.hue)).max(1.0) * 1.3;
-                        let v_down = p.vy + p.gy * age;
-                        let stretch = (v_down / cell).clamp(0.0, 1.6);
-                        push_halo_rows(
-                            halos,
-                            geom,
-                            (x, y),
-                            (base, base * (1.0 + stretch)),
-                            ink,
-                            HaloMode::Over,
-                        );
-                    }
-                    _ => {
-                        // A mote.
-                        let r = (dust_r(cell, p.hue) * 1.3 * (0.6 + 0.4 * fade)).max(1.0);
-                        push_halo_rows(halos, geom, (x, y), (r, r), ink, HaloMode::Over);
-                    }
-                }
+            // A light grain's opacity for a dark coverage request: source-over
+            // ink reads at less, so a fresh grain reaches the may-touch-text
+            // ceiling (capped inside the light pushers).
+            let ink_alpha =
+                |c: u8| (f32::from(c) * Self::LIGHT_GRAIN_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8;
+            // Beam's stardust is additive light with no light twin: on a
+            // light ground it could only lift the strokes it crosses, so it
+            // is not drawn there (the tube under the letters is the look).
+            if !dark && matches!(cfg.style, GlowStyle::Beam) {
                 continue;
             }
             match cfg.style {
                 // Laser: ablation sparks draw as velocity-aligned streaks (white
-                // tip cooling to the beam hue) via the shared AA beam.
+                // tip cooling to the beam hue) via the shared AA beam; on a
+                // light ground, the same streak in the beam's ink.
                 GlowStyle::Laser => {
-                    push_velocity_dash(
-                        out,
-                        geom,
-                        x,
-                        y,
-                        p.vx,
-                        p.vy + p.gy * age, // live velocity, not birth velocity
-                        0.05,              // seconds of motion the dash trails
-                        (geom.ch as f32 * 0.11).max(1.5),
-                        cfg.color,
-                        particle_color(),
-                        cov,
-                    );
+                    let thick = (ch * 0.11).max(1.5);
+                    let vy = p.vy + p.gy * age; // live velocity, not birth velocity
+                    if dark {
+                        push_velocity_dash(
+                            out,
+                            geom,
+                            x,
+                            y,
+                            p.vx,
+                            vy,
+                            0.05, // seconds of motion the dash trails
+                            thick,
+                            cfg.color,
+                            particle_color(),
+                            cov,
+                        );
+                    } else {
+                        push_velocity_dash_over(
+                            out,
+                            geom,
+                            x,
+                            y,
+                            p.vx,
+                            vy,
+                            0.05,
+                            thick,
+                            InkRole::OverText.ink(cfg.color),
+                            ink_alpha(cov),
+                        );
+                    }
                     continue;
                 }
                 // Beam stardust: tiny twinkling 4-point stars, mostly white, some
@@ -2204,11 +3662,11 @@ impl CursorGlow {
                         // ([`push_dust_halo`]) so the body matches the accent's
                         // brightness.
                         if !star_accent((p.hue * 4096.0) as u32) {
-                            let r = dust_r(geom.ch as f32, p.hue) * (0.6 + 0.4 * fade);
+                            let r = dust_r(ch, p.hue) * (0.6 + 0.4 * fade);
                             push_dust_halo(halos, geom, x, y, r, tint, scov);
                             continue;
                         }
-                        let arm = star_arm_px(star_arm(geom.ch as f32, STAR_ARM_FINE));
+                        let arm = star_arm_px(star_arm(ch, STAR_ARM_FINE));
                         let (ix, iy) = (x as i32, y as i32);
                         if !push_twinkle_star(
                             out,
@@ -2226,9 +3684,14 @@ impl CursorGlow {
                     }
                     continue;
                 }
-                // Comet debris: each grain twinkles on its own seeded phase,
-                // size riding the hue seed; a dealt grain throws a tiny 4-point
-                // glint at its twinkle peak.
+                // Comet debris: round grains of shed ice, each twinkling on its
+                // own seeded phase, size riding the hue seed; a dealt 1-in-16
+                // grain throws a tiny 4-point glint at its twinkle peak. The
+                // grains hang on the typed row, so over the text they dim
+                // (dark) or drop (light). On a light ground the debris is dust
+                // the trail sheds, so it settles as round motes of the body's
+                // ink UNDER the letters (`under`), where a row the host did
+                // not probe cannot have a grain over its strokes.
                 GlowStyle::Comet => {
                     // One twinkle rate for the family; only the size seed varies.
                     let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
@@ -2236,65 +3699,68 @@ impl CursorGlow {
                     if gcov == 0 {
                         continue;
                     }
-                    let d = ((geom.ch as f32 * (0.07 + 0.09 * p.hue)) as i32).max(1);
-                    let (ix, iy) = (x as i32, y as i32);
-                    push_rect(
+                    // Only a dealt grain throws the glint, at its twinkle peak;
+                    // the rest shimmer as dust (owner, 2026-08-09).
+                    let glint = star_accent((p.hue * 4096.0) as u32) && twinkle_peak(twinkle);
+                    // The glint's coverage: a highlight on a grain of ice is
+                    // dimmer than the grain, and is laid OVER the grain's
+                    // body, never in place of it, so a grain keeps its round
+                    // shape through every twinkle (the stardust rule: no grain
+                    // changes shape mid-flight) and its peak is its brightest
+                    // instant, not a dip.
+                    let glint_cov = (f32::from(gcov) * COMET_GLINT_COV) as u8;
+                    let r = dust_r(ch, p.hue) * (0.6 + 0.4 * fade);
+                    let rgb = particle_color();
+                    if !dark {
+                        if under.len() >= Self::MAX_QUADS {
+                            continue;
+                        }
+                        let mote = r * STAR_ARM_INK;
+                        let budget = under.len().saturating_add(Self::MAX_QUADS);
+                        push_ink_ellipse(
+                            under,
+                            geom,
+                            (x, y),
+                            (mote, mote),
+                            mote,
+                            self.light_ground(cfg).body_ink(rgb),
+                            f32::from(ink_alpha(gcov)),
+                            budget,
+                        );
+                        continue;
+                    }
+                    // The body is a round mote priced at the plus's composited
+                    // centre ([`push_dust_halo`]), so every grain, dealt or
+                    // not, reads equally bright off its peak.
+                    push_dust_halo(halos, geom, x, y, r, rgb, gcov);
+                    if !glint {
+                        continue;
+                    }
+                    if !push_twinkle_star(
                         out,
                         geom,
-                        ix - d / 2,
-                        iy - d / 2,
-                        d,
-                        d,
-                        premul_rgb(particle_color(), gcov),
-                    );
-                    // Off-peak the grain is just the grain: no glint fired here
-                    // before the deal and none is owed now.
-                    if !twinkle_peak(twinkle) {
-                        continue;
-                    }
-                    // The glint's coverage, shared by the cross and its
-                    // compensation.
-                    let glint_cov = (f32::from(gcov) * COMET_GLINT_COV) as u8;
-                    if out.len() >= Self::MAX_QUADS {
+                        x as i32,
+                        y as i32,
+                        star_arm_px(star_arm(ch, STAR_ARM_FINE)),
+                        glint_cov,
+                        false,
+                        0x00FF_FFFF,
+                        Self::MAX_QUADS,
+                    ) {
                         break 'flying;
                     }
-                    // Only a dealt 1-in-16 grain throws the glint at its twinkle
-                    // peak; the rest shimmer as dust (owner, 2026-08-09).
-                    if star_accent((p.hue * 4096.0) as u32) {
-                        // The shared star mark.
-                        if !push_twinkle_star(
-                            out,
-                            geom,
-                            ix,
-                            iy,
-                            star_arm_px(star_arm(geom.ch as f32, STAR_ARM_FINE)),
-                            glint_cov,
-                            false,
-                            0x00FF_FFFF,
-                            Self::MAX_QUADS,
-                        ) {
-                            break 'flying;
-                        }
-                        continue;
-                    }
-                    // The undealt grain is paid the glint's light:
-                    // [`push_twinkle_star`] lays three coincident additive marks,
-                    // putting `STAR_STACK_ADD · glint_cov` of white on the
-                    // centre. Pay that as a hot white core over the square, sized
-                    // like [`push_dust_mote`]'s, so fewer crosses do not mean
-                    // dimmer grains.
-                    let c = ((d + 1) / 2).max(1);
-                    let core = premul_rgb(
-                        0x00FF_FFFF,
-                        (f32::from(glint_cov) * STAR_STACK_ADD).min(255.0) as u8,
-                    );
-                    push_rect(out, geom, ix - c / 2, iy - c / 2, c, c, core);
                     continue;
                 }
                 // Fire: a glowing point of light flickering on a seeded phase,
                 // wafting on turbulence and shrinking as it cools. The hue seed
                 // doubles as temperature and size (pops big and white-hot,
                 // smolder motes small and deep red).
+                //
+                // On a light ground a point of light cannot show and an
+                // additive ember only lifts the letters toward the page, so an
+                // ember is a deep round mote of source-over ink (an ember's
+                // dull red, never its white-hot core) in the air, and is not
+                // drawn over a probed line of text: text first.
                 GlowStyle::Fire => {
                     // One radial halo supplies core and skirt. Velocity stretch
                     // elongates the ellipse, so a fast riser streaks and a
@@ -2305,51 +3771,97 @@ impl CursorGlow {
                         * geom.cw as f32
                         * 0.6
                         * t;
-                    // Ember-stack ceiling: dozens of ember halos overlap along a
-                    // hot run and their saturating sum whites out the text;
-                    // scaled down, the pile keeps an amber ceiling.
-                    let mut ccov_f = (cov as f32) * flicker * 0.62;
-                    // Occupied-cell discipline: fresh near-white embers cluster
-                    // over the freshest glyphs. An ember over a cell the row probe
-                    // shows as a glyph dims hard; over the blank cursor cell and
-                    // the airspace above it keeps full punch. The probe lives in
-                    // the prev slot at emit time.
-                    if self.own_row_glyph_at_px(geom, x, y) {
-                        ccov_f *= 0.30;
+                    if light_fire {
+                        if covers(x + waft, y) {
+                            continue;
+                        }
+                        // A spark on paper: a small round bead of ember
+                        // ink, a dull red rim round a burnt-orange core
+                        // (a fleck of a pixel or two read as a square).
+                        let alpha = ((cov as f32) * flicker * 0.95).min(235.0) as u8;
+                        let r = (ch * (0.06 + 0.06 * p.hue)).max(1.8) * (0.7 + 0.3 * fade);
+                        push_paper_bead(out, geom, (x + waft, y), r, Self::LIGHT_EMBER_INKS, alpha);
+                        continue;
                     }
-                    let ccov = ccov_f as u8;
-                    if ccov == 0 {
+                    // A spark is a point of light, never a blob: a small hot
+                    // core in the fire's own orange to amber, cooling toward
+                    // red as it dies (a wide dim halo of the same light read
+                    // as a tan smudge over the dark).
+                    let ccov_f = (cov as f32) * flicker * Self::FIRE_EMBER_COV;
+                    if ccov_f < 1.0 {
                         continue;
                     }
                     let cell = geom.ch as f32;
-                    // Full radii: overlapping ember halos glue the streak
-                    // together; the 0.62 ceiling above keeps it amber.
-                    let base = (cell * (0.10 + 0.15 * p.hue)).max(2.0) * (0.55 + 0.45 * fade);
+                    let base = (cell * (Self::FIRE_EMBER_R + Self::FIRE_EMBER_R_HOT * p.hue))
+                        .max(1.2)
+                        * (0.6 + 0.4 * fade);
                     let vx = p.vx;
                     let vy = p.vy + p.gy * age; // live velocity
-                    let rx = base * (1.0 + (vx.abs() / cell).min(1.4) * 0.9);
-                    let ry = base * (1.0 + (vy.abs() / cell).min(1.4) * 0.9);
-                    let core_color = fire_ramp((0.5 + 0.35 * fade + 0.3 * p.hue).min(1.0));
+                    let rx = base * (1.0 + (vx.abs() / cell).min(1.4) * 0.6);
+                    let ry = base * (1.0 + (vy.abs() / cell).min(1.4) * 0.6);
+                    let core_color = fire_ramp((0.42 + 0.30 * fade + 0.18 * p.hue).min(0.92));
+                    let (centre, radii) = ((x + waft, y), (rx * 1.6, ry * 1.6));
+                    // Text first: a spark never lands on a line of text the
+                    // frame shows, nor on the caret's edge (the block would
+                    // cut it to a sliver). Light over a letter is a smear on
+                    // it, and an Enter carries the run's sparks onto the line
+                    // it just printed.
+                    let reach = radii.0.max(radii.1);
+                    let near = |dx: f32, dy: f32| covers(centre.0 + dx, centre.1 + dy);
+                    if !self.streak_unbudgeted()
+                        && (near(0.0, 0.0)
+                            || near(-reach, 0.0)
+                            || near(reach, 0.0)
+                            || near(0.0, -reach)
+                            || near(0.0, reach)
+                            || on_caret(centre.0, centre.1))
+                    {
+                        continue;
+                    }
+                    // Whatever of its glow still reaches a letter spends the
+                    // over-ink ledger, newest embers first.
+                    let share = self.ink_ledger.admit_halo(
+                        centre,
+                        radii,
+                        premul_rgb(core_color, ccov_f as u8),
+                        InkLedger::FLOOR,
+                    );
+                    let ccov = (ccov_f * share) as u8;
+                    if ccov == 0 {
+                        continue;
+                    }
                     push_halo(
                         halos,
                         geom,
-                        x + waft,
-                        y,
-                        rx * 1.9,
-                        ry * 1.9,
+                        centre.0,
+                        centre.1,
+                        radii.0,
+                        radii.1,
                         premul_rgb(core_color, ccov),
                     );
                     continue;
                 }
                 // Sparkle: every grain is a night-sky shape chosen by a stable
                 // per-particle seed (the birth hue, quantized so the rolling tint
-                // never flips it): mostly four-point stars that twinkle and glint
-                // at their peak, plain glitter, the odd pale moon crescent, and
-                // the occasional rainbow mini-comet. A small constant per grain,
-                // bounded by [`Self::MAX_QUADS`].
+                // never flips it): round stardust that twinkles, plain glitter,
+                // the dealt four-point star (the one cross), the odd pale
+                // crescent moon, and the occasional rainbow mini-comet. A small
+                // constant per grain, bounded by [`Self::MAX_QUADS`].
                 GlowStyle::Sparkle => {
                     let seed = (p.hue * 4096.0) as u32;
                     let (ix, iy) = (x as i32, y as i32);
+                    // On a dark ground the shower is the gold comet's: its
+                    // round grains a third brighter and larger than the
+                    // family's starfield grain, so they read as sparks
+                    // rather than dim grey specks, and its plain glitter
+                    // in the comet's gold. A grain over a letter still
+                    // spends the over-ink account where it lands.
+                    let (lift, grow) = if dark {
+                        (Self::SPARKLE_DARK_LIFT, Self::SPARKLE_DARK_GROW)
+                    } else {
+                        (1.0, 1.0)
+                    };
+                    let cov = (f32::from(cov) * lift).min(255.0) as u8;
                     match seed % 8 {
                         // The star bucket is re-dealt through the family's
                         // [`star_accent`]: `seed % 16 == 0` is a strict subset of
@@ -2363,10 +3875,28 @@ impl CursorGlow {
                             if scov > 0 {
                                 // Size rides the seed between the starfield grain
                                 // at rest and the family default.
-                                let arm = star_arm_px(star_arm(
-                                    geom.ch as f32,
-                                    STAR_ARM_FINE + (STAR_ARM_STD - STAR_ARM_FINE) * p.hue,
-                                ));
+                                let ratio = STAR_ARM_FINE + (STAR_ARM_STD - STAR_ARM_FINE) * p.hue;
+                                if !dark {
+                                    // The family's light star, the same mark on
+                                    // white, taxed by the ink ratio, in the
+                                    // may-touch-text ink of its hue.
+                                    rk::stardust::push_twinkle_over_twin(
+                                        halos,
+                                        geom,
+                                        Self::MAX_HALOS,
+                                        rk::stardust::LightStar {
+                                            centre: (ix, iy),
+                                            // Its size rides the seed, not a clock.
+                                            mass: star_arm(ch, ratio) * STAR_ARM_INK,
+                                            step: 0,
+                                            rgb: Self::SPARKLE_PAPER_STAR,
+                                            gold: false,
+                                            cov: Self::paper_gold_alpha(scov),
+                                        },
+                                    );
+                                    continue;
+                                }
+                                let arm = star_arm_px(star_arm(ch, ratio));
                                 // Arms via the shared star; Sparkle's glint stays
                                 // local (white, only at the twinkle peak).
                                 if !push_twinkle_star(
@@ -2409,70 +3939,138 @@ impl CursorGlow {
                             let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                             let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                             if scov > 0 {
-                                let r = dust_r(geom.ch as f32, p.hue) * (0.6 + 0.4 * fade);
-                                push_dust_halo(halos, geom, x, y, r, particle_color(), scov);
+                                let r = dust_r(ch, p.hue) * (0.6 + 0.4 * fade) * grow;
+                                if dark {
+                                    push_dust_halo(halos, geom, x, y, r, particle_color(), scov);
+                                } else {
+                                    push_paper_bead(
+                                        out,
+                                        geom,
+                                        (x, y),
+                                        r * Self::SPARKLE_PAPER_BEAD,
+                                        (Self::SPARKLE_PAPER_RIM, Self::SPARKLE_PAPER_CORE),
+                                        Self::paper_gold_alpha(scov),
+                                    );
+                                }
                             }
                             continue;
                         }
                         4 | 5 => {
-                            // Plain glitter grain — the old square, kept as the
-                            // texture between the set pieces.
-                            push_rect(
-                                out,
-                                geom,
-                                ix - sz / 2,
-                                iy - sz / 2,
-                                sz,
-                                sz,
-                                premul_rgb(particle_color(), cov),
-                            );
+                            // Plain glitter: the texture between the set pieces,
+                            // one soft round grain (no hot core, so it stays
+                            // quieter than the dust it sits among).
+                            let r = (sz as f32 * 0.5).max(1.3);
+                            if dark {
+                                push_halo(
+                                    halos,
+                                    geom,
+                                    x,
+                                    y,
+                                    r * grow,
+                                    r * grow,
+                                    premul_rgb(Self::sparkle_gold(cfg), cov),
+                                );
+                            } else {
+                                push_paper_bead(
+                                    out,
+                                    geom,
+                                    (x, y),
+                                    r * Self::SPARKLE_PAPER_BEAD,
+                                    (Self::SPARKLE_PAPER_RIM, Self::SPARKLE_PAPER_CORE),
+                                    Self::paper_gold_alpha(cov),
+                                );
+                            }
                             continue;
                         }
                         6 => {
-                            // The moon: a pale silver crescent — western limb plus
-                            // top and bottom horns opening east.
-                            let m = premul_rgb(0x00E6_E6F2, cov);
-                            let r = ((geom.ch as f32 * 0.11) as i32).max(2);
-                            push_rect(out, geom, ix - r, iy - r, r, 1, m);
-                            if out.len() >= Self::MAX_QUADS {
-                                break 'flying;
+                            // The moon: a pale silver crescent ([`push_crescent`]),
+                            // a western limb tapering into horns opening east,
+                            // well under a glyph's height. On white it keeps its
+                            // size (a solid mark needs no ink tax) in the silver's
+                            // ink. A moon is a shape, not a glint: dimmed over a
+                            // line of text it is only a grey smudge between the
+                            // words, so it keeps off the text on a dark ground too.
+                            if over_text {
+                                continue;
                             }
-                            push_rect(out, geom, ix - r, iy - r + 1, 1, 2 * r - 1, m);
-                            if out.len() >= Self::MAX_QUADS {
-                                break 'flying;
+                            let r = (Self::MOON_DUST_RATIO * dust_r(ch, p.hue)).max(2.5);
+                            // A moon fades slowly, so it reads gold, not ash,
+                            // until it is nearly gone.
+                            let moon = (230.0
+                                * p.cov_scale
+                                * fade.powf(Self::MOON_FADE_POW)
+                                * cfg.intensity
+                                * lift)
+                                .min(255.0) as u8;
+                            if dark {
+                                push_crescent(out, geom, (x, y), r, Self::MOON_GOLD, moon, false);
+                            } else {
+                                push_crescent(
+                                    out,
+                                    geom,
+                                    (x, y),
+                                    r,
+                                    Self::SPARKLE_PAPER_MOON,
+                                    Self::paper_gold_alpha(moon),
+                                    true,
+                                );
                             }
-                            push_rect(out, geom, ix - r, iy + r, r, 1, m);
                             continue;
                         }
                         _ => {
                             // Mini-comet: a short rainbow streak along the
                             // grain's motion; one hue at both ends.
                             let dash = particle_color();
-                            push_velocity_dash(
-                                out,
-                                geom,
-                                x,
-                                y,
-                                p.vx,
-                                p.vy + p.gy * age,
-                                0.08,
-                                (geom.ch as f32 * 0.09).max(1.2),
-                                dash,
-                                dash,
-                                cov,
-                            );
+                            // On paper the dash is a stroke of ink, which
+                            // needs a little more girth than a line of
+                            // light to register.
+                            let girth = if dark {
+                                (ch * 0.09).max(1.2)
+                            } else {
+                                (ch * 0.13).max(2.0)
+                            };
+                            let (thick, vy) = (girth, p.vy + p.gy * age);
+                            if dark {
+                                push_velocity_dash(
+                                    out, geom, x, y, p.vx, vy, 0.08, thick, dash, dash, cov,
+                                );
+                            } else {
+                                push_velocity_dash_over(
+                                    out,
+                                    geom,
+                                    x,
+                                    y,
+                                    p.vx,
+                                    vy,
+                                    0.08,
+                                    thick,
+                                    Self::SPARKLE_PAPER_RIM,
+                                    Self::paper_gold_alpha(cov),
+                                );
+                                // Its head a gold bead, so a slow one still
+                                // reads as a mark, not a smear.
+                                push_paper_bead(
+                                    out,
+                                    geom,
+                                    (x, y),
+                                    thick * 1.2,
+                                    (Self::SPARKLE_PAPER_RIM, Self::SPARKLE_PAPER_CORE),
+                                    Self::paper_gold_alpha(cov),
+                                );
+                            }
                             continue;
                         }
                     }
                 }
                 // Water: per-droplet size from the hue seed and a vertical
                 // stretch with fall speed (a fast drop streaks); rising bubbles
-                // stay small round beads.
+                // stay small round beads. On a light ground, the drop is a
+                // round source-over bead in the water's ink.
                 _ => {
                     let (w, h) = if water {
-                        let base = (geom.ch as f32 * (0.055 + 0.065 * p.hue)).max(1.0);
+                        let base = (ch * (0.055 + 0.065 * p.hue)).max(1.0);
                         let v_down = p.vy + p.gy * age;
-                        let stretch = (v_down / geom.ch as f32).clamp(0.0, 1.6);
+                        let stretch = (v_down / ch).clamp(0.0, 1.6);
                         (
                             base.round() as i32,
                             (base * (1.0 + stretch)).round().max(1.0) as i32,
@@ -2480,6 +4078,41 @@ impl CursorGlow {
                     } else {
                         (sz, sz)
                     };
+                    if !dark && water {
+                        // A drop of clear water blue on paper, round, its rim
+                        // a deeper blue (a slate mote read as grit).
+                        let r = (w.max(h) as f32 * 0.5).max(1.0) * STAR_ARM_INK;
+                        push_paper_bead(
+                            out,
+                            geom,
+                            (x, y),
+                            r,
+                            Self::LIGHT_WATER_DROP_INKS,
+                            ink_alpha(cov),
+                        );
+                        continue;
+                    }
+                    if !dark && lawful {
+                        let r = (w.max(h) as f32 * 0.5).max(1.0) * STAR_ARM_INK;
+                        push_light_mote(halos, geom, (x, y), r, particle_color(), ink_alpha(cov));
+                        continue;
+                    }
+                    // A water droplet on a dark ground is a soft round bead of
+                    // light drawn out as it falls, never a hard-edged chip.
+                    if water {
+                        let r = (w as f32 * 0.5 + 0.75).max(1.25);
+                        let ry = (h as f32 * 0.5 + 0.75).max(r);
+                        push_halo(
+                            halos,
+                            geom,
+                            x,
+                            y,
+                            r * Self::WATER_DROP_SOFT,
+                            ry * Self::WATER_DROP_SOFT,
+                            premul_rgb(particle_color(), cov),
+                        );
+                        continue;
+                    }
                     push_rect(
                         out,
                         geom,
@@ -2496,8 +4129,119 @@ impl CursorGlow {
 
     // ----- helpers -----
 
+    /// The light ground a body under the letters solves its ink against
+    /// ([`LightGround::of`]). Its ink is unsolved (the bare vivid ink, never
+    /// lifted for the theme's text) only when a test asks: the negative
+    /// control of the light-body legibility tests.
+    pub(super) fn light_ground(&self, cfg: &GlowConfig) -> LightGround {
+        let ground = LightGround::of(cfg);
+        #[cfg(test)]
+        let ground = LightGround {
+            unsolved: self.light_body_unsolved,
+            ..ground
+        };
+        ground
+    }
+
+    /// Whether a test asked for the light bodies' inks and ceilings unsolved
+    /// ([`Self::light_ground`]); never in a build.
+    #[cfg(test)]
+    pub(super) fn light_body_unsolved(&self) -> bool {
+        self.light_body_unsolved
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn light_body_unsolved(&self) -> bool {
+        false
+    }
+
+    /// Whether the dark bed is laid at each stop's full value rather than
+    /// solved to the bar: never in a build, and only when a test asks (the
+    /// bed's bar test's negative control).
+    #[cfg(test)]
+    pub(super) fn bed_unsolved(&self) -> bool {
+        self.bed_unsolved
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn bed_unsolved(&self) -> bool {
+        false
+    }
+
+    /// Whether the frame keeps its dark bed but no over-ink account: never
+    /// in a build, and only when a test asks (the account's negative
+    /// control).
+    #[cfg(test)]
+    pub(super) fn over_ink_idle(&self) -> bool {
+        self.over_ink_idle
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn over_ink_idle(&self) -> bool {
+        false
+    }
+
+    /// Whether the dark streak skips its over-ink budget (and fire its
+    /// over-ink ledger and its steam's stacking budget): never in a build,
+    /// and only when a test asks (the contrast tests' negative control).
+    #[cfg(test)]
+    pub(super) fn streak_unbudgeted(&self) -> bool {
+        self.streak_unbudgeted
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn streak_unbudgeted(&self) -> bool {
+        false
+    }
+
+    /// The highest coverage at which a light whose axis lifts each channel by
+    /// `lift` per unit coverage (a laser crackle across a letter) still
+    /// leaves the reference stroke [`Self::STREAK_INK_FLOOR`] of contrast
+    /// (`0..=255`; 255 when even full coverage holds it). Ink and ground are lifted together and clip at
+    /// 255, as `add_sat` composites them; the floor is found by bisection,
+    /// since the clip makes the ratio piecewise.
+    fn over_ink_ceiling(lift: [f32; 3]) -> f32 {
+        let table = crate::color_math::relative_luminance_table();
+        let lifted = |base: u32, cov: f32| {
+            let ch = |sh: u32, l: f32| (((base >> sh) & 0xff) as f32 + cov * l).min(255.0) as u32;
+            crate::color_math::relative_luminance_with(
+                table,
+                (ch(16, lift[0]) << 16) | (ch(8, lift[1]) << 8) | ch(0, lift[2]),
+            )
+        };
+        let holds = |cov: f32| {
+            let (ink, ground) = (
+                lifted(Self::STREAK_REF_INK, cov),
+                lifted(Self::STREAK_REF_GROUND, cov),
+            );
+            ink.max(ground) + 0.05 >= Self::STREAK_INK_FLOOR * (ink.min(ground) + 0.05)
+        };
+        if holds(255.0) {
+            return 255.0;
+        }
+        // Ten halvings resolve the ceiling well inside one coverage level.
+        let (mut lo, mut hi) = (0.0f32, 255.0f32);
+        for _ in 0..10 {
+            let mid = 0.5 * (lo + hi);
+            if holds(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// The comet colour at path position `pos` (0 tail .. 1 head) for the style.
     pub(super) fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
+        // Sparkle is a gold comet on either ground: its head, the bridge onto
+        // the caret, the rail, every typed cell and a leap's whole tail burn
+        // in the gold family (on paper, the band under the newest letters in
+        // its ink), its gold at the head a shade deeper toward the tail;
+        // only its grains are dealt from the wheel.
+        if matches!(cfg.style, GlowStyle::Sparkle) {
+            return Self::sparkle_gold_at(cfg, pos);
+        }
         let base = style_comet_color(cfg.style, cfg.color, cfg.accent, self.hue, pos);
         // Torpedo crest: sustained fast typing churns the head toward white
         // foam. Live animator only; the settings demo stays calm.
@@ -2511,7 +4255,148 @@ impl CursorGlow {
         if matches!(cfg.style, GlowStyle::Fire) {
             return fire_ramp((pos * (0.50 + 0.45 * self.fire_t())).min(0.92));
         }
+        // The phaser's spectrum on paper steps over the hues that can only
+        // read there as khaki or olive ([`crate::color_math::light_spectrum_hue`]).
+        if matches!(cfg.style, GlowStyle::Phaser) && !cfg.dark_theme {
+            return hsv2rgb(
+                crate::color_math::light_spectrum_hue((self.hue + pos).fract()),
+                0.95,
+                1.0,
+            );
+        }
         base
+    }
+
+    /// Sparkle's gold on a dark ground: its configured colour (starlight
+    /// gold by default) at a warm gold's chroma, so the comet reads gold, not
+    /// cream.
+    pub(super) fn sparkle_gold(cfg: &GlowConfig) -> u32 {
+        crate::spectrum::spectrum_with_min_saturation(cfg.color & 0x00FF_FFFF, 0.72)
+    }
+
+    /// Sparkle's gold along its tail, `pos` 0 (tail) to 1 (head): its gold
+    /// at the head, a shade deeper at the tail, never leaving the gold
+    /// family (a warmer tail fading over the dark read as rust and brown).
+    pub(super) fn sparkle_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
+        let gold = Self::sparkle_gold(cfg);
+        let (h, s, v) = crate::color_math::rgb2hsv(gold);
+        let k = 1.0 - pos.clamp(0.0, 1.0);
+        let k = k * k * (3.0 - 2.0 * k);
+        crate::color_math::hsv2rgb(h - 4.0 * k, (s + 0.05 * k).min(1.0), v * (1.0 - 0.08 * k))
+    }
+
+    /// A sparkle mark's opacity on paper for a dark coverage request: a
+    /// fresh mark is all but opaque (it is never laid over the text, so it
+    /// needs no may-touch-text ceiling), and a fading one thins with it.
+    pub(super) fn paper_gold_alpha(cov: u8) -> u8 {
+        (f32::from(cov) * 1.25).min(240.0) as u8
+    }
+}
+
+/// The fire's heat smoothed along its line: a burning cell's share at `d`
+/// cells from its centre, a raised cosine to nothing a cell out. The shares
+/// of cells a cell apart sum to one, so the heat between two burning cells
+/// runs smoothly from one's to the other's and a run's ends fall off over a
+/// cell, never standing square on a cell edge ([`flame_heat`]).
+fn flame_kernel(d: f32) -> f32 {
+    let d = d.abs();
+    if d >= 1.0 {
+        0.0
+    } else {
+        0.5 * (1.0 + (std::f32::consts::PI * d).cos())
+    }
+}
+
+/// The fire's heat at column position `u` (cells, from the grid's left
+/// edge) along the burning `cells` of one row ([`flame_kernel`]).
+fn flame_heat<'a>(cells: impl Iterator<Item = &'a (u16, u16, f32)>, u: f32) -> f32 {
+    cells
+        .map(|c| c.2 * flame_kernel(u - (f32::from(c.1) + 0.5)))
+        .sum::<f32>()
+        .min(1.0)
+}
+
+/// The dark flame field's ceiling as a share of its whole, at `rise` (0 at
+/// the root, 1 at the tallest tongue's tip): whole over the lower third,
+/// thinning to a quarter at the tips, so the light dies upward.
+fn flame_tip_fade(rise: f32) -> f32 {
+    const HOLD: f32 = 0.33;
+    if rise <= HOLD {
+        1.0
+    } else {
+        1.0 - 0.75 * ((rise - HOLD) / (1.0 - HOLD)).clamp(0.0, 1.0)
+    }
+}
+
+/// The light ink-fire's warm root through its gold tip: one source for
+/// the colour lookup and the admission envelope.
+const FLAME_LIGHT_STOPS: [(f32, u32); 4] = [
+    (0.0, 0x00FF_6F0A),
+    (0.32, 0x00FF_8C14),
+    (0.62, 0x00FF_A820),
+    (1.0, 0x00FF_C848),
+];
+
+/// Channel bounds of the actual ramp stops: interpolation and the tongues'
+/// opacity-weighted colour mixture stay in the same box. Derived from the
+/// ramp itself, so a different or nonmonotone palette keeps the admission.
+fn flame_light_paint_bounds() -> (u32, u32) {
+    FLAME_LIGHT_STOPS
+        .iter()
+        .fold((0x00FF_FFFF, 0), |(lo, hi), &(_, rgb)| {
+            (chan_min(lo, rgb), chan_max(hi, rgb))
+        })
+}
+
+/// The light ink-fire's colour at `rise` (0 at the root, 1 at a tongue's
+/// tip), interpolated within the same stops the cap's envelope reads: a
+/// warm orange root going amber and gold toward the tip (a pale yellow tip
+/// vanished on white, so the tongue read a row shorter than it stood).
+fn flame_light_ramp(rise: f32) -> u32 {
+    let rise = rise.clamp(0.0, 1.0);
+    let i = FLAME_LIGHT_STOPS
+        .iter()
+        .rposition(|s| s.0 <= rise)
+        .unwrap_or(0)
+        .min(FLAME_LIGHT_STOPS.len() - 2);
+    let (a, b) = (FLAME_LIGHT_STOPS[i], FLAME_LIGHT_STOPS[i + 1]);
+    lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
+}
+
+/// Fire's streak lift per unit coverage on each band of a cell
+/// ([`InkLedger::BANDS`]), its axis on the cell's middle row: each band takes
+/// the layers of `stack` (at `core` px of core) whose half-thickness, plus a
+/// pixel of anti-aliasing, reaches the band's nearest point, in `color` mixed
+/// as the rasterizer mixes it at `pos` (`aterm_render::layer_stack_lift`).
+fn fire_band_lifts(
+    stack: &[(f32, f32, u32, f32, f32, usize)],
+    color: u32,
+    pos: f32,
+    core: f32,
+    ch: f32,
+) -> BandLifts {
+    std::array::from_fn(|band| {
+        let reach = InkLedger::band_reach(ch, band);
+        let mut lift = [0.0f32; 3];
+        for layer in stack.iter().filter(|l| 0.5 * l.0 * core + 1.0 >= reach) {
+            let one = layer_stack_lift(std::slice::from_ref(layer), color, pos);
+            for (l, o) in lift.iter_mut().zip(one) {
+                *l += o;
+            }
+        }
+        lift
+    })
+}
+
+/// The bloom-layer stack `style` draws its streak with (and charges its
+/// over-ink budget against): each beam style's own, the comet's for the rest.
+fn streak_layers(style: GlowStyle) -> &'static [(f32, f32, u32, f32, f32, usize)] {
+    match style {
+        GlowStyle::Phaser => &PHASER_LAYERS,
+        GlowStyle::Beam => &BEAM_LAYERS,
+        GlowStyle::Laser => &LASER_LAYERS,
+        GlowStyle::Sparkle => &SPARKLE_LAYERS,
+        _ => &COMET_LAYERS,
     }
 }
 
@@ -2555,25 +4440,4 @@ fn publish_comet_run(
     }
     std::mem::swap(&mut runs[*runs_len], run);
     *runs_len += 1;
-}
-
-/// Re-ink additive quads rasterized in WHITE — so each channel is the
-/// coverage that lit it — as source-over `ink` at that coverage, capped at
-/// `cap`: the light-ground form of any additive beam, with the beam's own
-/// anti-aliasing intact.
-fn reink_over(quads: &mut [GlowQuad], ink: u32, cap: u8) {
-    for q in quads {
-        let a = ((q.color & 0xff) as u8).min(cap);
-        let a2 = ((q.color2 & 0xff) as u8).min(cap);
-        // A quad is additive at both ends or source-over at both ends.
-        let (a, a2) = if a == 0 && a2 == 0 {
-            (0, 0)
-        } else {
-            (a.max(1), a2.max(1))
-        };
-        q.color = premul_rgb(ink, a);
-        q.color2 = premul_rgb(ink, a2);
-        q.alpha = a;
-        q.alpha2 = a2;
-    }
 }

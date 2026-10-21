@@ -1,32 +1,90 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Whether the far end of a connected control stream has gone away entirely.
+//! Whether the far end of a connected control stream is still there, and what it left queued.
 //!
-//! A control lane parked in a blocking verb (`await`, `turn`, `wait`, `ready`, a relay) would
-//! otherwise hold its worker until its own timeout after its client dies. It must notice the
-//! hangup without reading, since bytes a live client pipelined behind the request are the
-//! next request.
+//! A control lane parked in a blocking verb (`await`, `turn`, `wait`, `ready`, `inbox get @<off>`,
+//! a relay) would otherwise hold its worker until its own timeout after its client dies. It must
+//! notice the hangup without reading, since bytes a live client pipelined behind the request are
+//! the next request.
 //!
-//! The question is whether any byte written can still be delivered, i.e. the
-//! write side's end-of-file, and `poll(POLLOUT)` answers it on Darwin and
-//! Linux without mistaking a half-close for a hangup:
+//! [`peer_state`] is the one probe: it never blocks, consumes nothing and writes nothing, and
+//! answers a [`PeerState`]. Two policies read it:
 //!
-//! * a peer that only shut its write half (`printf … | nc -U`) leaves our
-//!   write side open: `POLLOUT`, no `POLLHUP`; it still wants the answer;
+//! * a request, whose client waits for its answer: only [`PeerState::Gone`] is hung up
+//!   ([`peer_closed`]). A client that shut its write half (`printf … | nc -U`, `nc -N`, a relayed
+//!   one-shot) still reads the answer, and bytes it queued are its next request;
+//! * a push stream, whose client keeps its write half open and sends nothing after the
+//!   acknowledgement: anything but [`PeerState::Idle`] means it is gone.
+//!
+//! Gone is decided first, by whether any byte written can still be delivered, i.e. by the write
+//! side's end-of-file. `poll(POLLOUT)` answers that on Darwin and Linux without mistaking a
+//! half-close for a hangup:
+//!
+//! * a peer that only shut its write half leaves our write side open: `POLLOUT`, no `POLLHUP`;
+//!   it still wants the answer;
 //! * a peer that closed (or was SIGKILLed) takes both halves: `POLLHUP`.
 //!
 //! `POLLIN` would be wrong on Darwin, which reports a half-close as `POLLIN|POLLHUP`; with
-//! `POLLOUT` an open or half-closed peer reads `0x4` and a closed one `0x10`.
+//! `POLLOUT` an open or half-closed peer reads `0x4` and a closed one `0x10`. A peer still there
+//! is then told apart by one `recv(MSG_PEEK | MSG_DONTWAIT)`. Not by a zero-length `send`: on
+//! Darwin `send` ignores `MSG_DONTWAIT` on an `AF_UNIX` socket.
 //!
 //! The other direction, ending a connection so its peer reads the hangup, is [`hang_up`].
 
 use crate::CtlStream;
 
-/// `true` when the peer of `stream` has closed its end completely, so nothing
-/// written to it can ever be read. Never blocks. A half-closed peer (its write
-/// side only) is not hung up. Always `false` on Windows (afunix has no
-/// equivalent readiness report), where a lane runs to its own timeout.
+/// What [`peer_state`] finds at the far end of a connected stream, from one look that never
+/// blocks, consumes nothing and writes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerState {
+    /// Open both ways, with nothing queued to read.
+    Idle,
+    /// A read would return at once with bytes (the peer may have shut its write half behind
+    /// them) or with an error other than end-of-file. The peer still reads what is written.
+    Readable,
+    /// The peer shut its write half and nothing is queued: a read returns end-of-file. The peer
+    /// still reads what is written.
+    HalfClosed,
+    /// The peer closed both halves (every descriptor of its end closed, or it died): nothing
+    /// written can ever be read, whatever is still queued.
+    Gone,
+}
+
+/// The far end of `stream` (see [`PeerState`]). Never blocks.
+#[must_use]
+#[cfg(unix)]
+pub fn peer_state(stream: &CtlStream) -> PeerState {
+    use std::os::fd::AsRawFd;
+    fd_peer_state(stream.as_raw_fd())
+}
+
+/// [`peer_state`] for a borrowed raw descriptor. The caller guarantees `fd` is open for the
+/// call. Gone is exactly [`fd_peer_closed`]; only a peer still there is peeked.
+#[must_use]
+#[cfg(unix)]
+pub fn fd_peer_state(fd: std::os::fd::RawFd) -> PeerState {
+    if fd_peer_closed(fd) {
+        return PeerState::Gone;
+    }
+    still_there(fd_peek(fd))
+}
+
+/// What one peek of a peer [`fd_peer_closed`] found still there means. `WouldBlock`, or an
+/// `Interrupted` that saw nothing, is nothing queued yet.
+#[cfg(unix)]
+fn still_there(peek: Result<usize, std::io::ErrorKind>) -> PeerState {
+    match peek {
+        Ok(0) => PeerState::HalfClosed,
+        Err(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => PeerState::Idle,
+        Ok(_) | Err(_) => PeerState::Readable,
+    }
+}
+
+/// The request policy: `true` when the peer of `stream` has closed its end completely
+/// ([`PeerState::Gone`]), so nothing written to it can ever be read. Never blocks. A peer that
+/// only half-closed, or has bytes queued, is not hung up. Always `false` on Windows (afunix has
+/// no equivalent readiness report), where a lane runs to its own timeout.
 #[must_use]
 pub fn peer_closed(stream: &CtlStream) -> bool {
     #[cfg(unix)]
@@ -98,9 +156,10 @@ impl<S: Halves + ?Sized> Halves for &S {
     }
 }
 
-/// [`peer_closed`] for a borrowed raw descriptor: for a caller that recorded
-/// the fd of the connection it is serving (a thread-local) rather than a
-/// reference to the stream. The caller guarantees `fd` is open for the call.
+/// [`peer_closed`] for a borrowed raw descriptor: for a caller that recorded the fd of the
+/// connection it is serving (a thread-local) rather than a reference to the stream. The caller
+/// guarantees `fd` is open for the call. It is [`fd_peer_state`]'s first step, so it holds
+/// exactly when `fd_peer_state(fd)` is [`PeerState::Gone`], and costs one `poll` and no peek.
 #[must_use]
 #[cfg(unix)]
 pub fn fd_peer_closed(fd: std::os::fd::RawFd) -> bool {
@@ -149,9 +208,34 @@ fn poll_now(fd: std::os::fd::RawFd, events: i16) -> i16 {
     if ready > 0 { probe.revents } else { 0 }
 }
 
+/// One `recv(MSG_PEEK | MSG_DONTWAIT)` of a byte from `fd`: `Ok(0)` its end-of-file, `Ok(1)` a
+/// byte, left queued, or the kind of error the call failed with. Never blocks, whatever the
+/// descriptor's mode.
+#[cfg(unix)]
+// Skip: one `recv(2)` call (FFI, unverifiable body).
+#[cfg_attr(trust_verify, trust::skip)]
+fn fd_peek(fd: std::os::fd::RawFd) -> Result<usize, std::io::ErrorKind> {
+    use core::ffi::{c_int, c_void};
+    unsafe extern "C" {
+        fn recv(socket: c_int, buffer: *mut c_void, length: usize, flags: c_int) -> isize;
+    }
+    // `MSG_PEEK` is 0x2 everywhere; `MSG_DONTWAIT` is 0x40 on Linux and Android, 0x80 on
+    // Darwin and the BSDs.
+    const MSG_PEEK: c_int = 0x2;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const MSG_DONTWAIT: c_int = 0x40;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const MSG_DONTWAIT: c_int = 0x80;
+    let mut byte = 0_u8;
+    // SAFETY: the buffer is one owned byte that outlives the call, and `MSG_PEEK |
+    // MSG_DONTWAIT` neither consumes nor parks. A bad fd is an error return, not UB.
+    let read = unsafe { recv(fd, (&raw mut byte).cast(), 1, MSG_PEEK | MSG_DONTWAIT) };
+    usize::try_from(read).map_err(|_| std::io::Error::last_os_error().kind())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{hang_up, peer_closed};
+    use super::{PeerState, hang_up, peer_closed, peer_state};
     use std::io::{ErrorKind, Read, Write};
 
     /// What one non-blocking read of `stream` finds: `Ok(0)` is its
@@ -264,30 +348,82 @@ mod tests {
         drop(peer);
     }
 
-    /// A peer that is open, one that half-closed (still waiting for its
-    /// answer), and one that is gone: only the last is a hangup.
+    /// Waits for `server`'s peer to read as gone, as a hang detector and never a budget: a
+    /// socket closes with its LAST descriptor, and a sibling test's fork that lands between the
+    /// pair and the drop hands its child a copy that keeps the peer open until that child execs.
+    fn until_gone(server: &crate::CtlStream, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while peer_state(server) != PeerState::Gone {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} must read as gone"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(peer_closed(server), "{what} is hung up to a request");
+    }
+
+    /// The four answers, with the request policy beside each: only Gone is a hangup. The probe
+    /// consumes nothing and writes nothing. Negative control: a peer that queued a request and
+    /// then closed is Gone, not Readable; a peek alone read its queued bytes as still there,
+    /// and a parked blocking verb held its lane to its own timeout.
     #[test]
-    fn only_a_full_close_is_a_hangup() {
+    fn the_probe_tells_idle_readable_half_closed_and_gone_apart() {
         let (server, client) = crate::CtlStream::pair().expect("pair");
-        (&client).write_all(b"await idle 50\n").expect("request");
+        assert_eq!(peer_state(&server), PeerState::Idle, "nothing sent yet");
         assert!(!peer_closed(&server), "an open peer is not hung up");
+
+        (&client).write_all(b"await idle 50\n").expect("request");
+        assert_eq!(peer_state(&server), PeerState::Readable, "a queued request");
+        assert!(!peer_closed(&server), "nor is one with a request queued");
+        let mut request = [0_u8; 14];
+        (&server)
+            .read_exact(&mut request)
+            .expect("the request is still queued");
+        assert_eq!(&request, b"await idle 50\n");
 
         client
             .shutdown(std::net::Shutdown::Write)
             .expect("half-close");
+        assert_eq!(
+            peer_state(&server),
+            PeerState::HalfClosed,
+            "its request read, its end-of-file is next"
+        );
         assert!(
             !peer_closed(&server),
             "a half-closed peer still reads its answer: NOT a hangup"
         );
-
+        (&server).write_all(b"OK\n").expect("answer");
+        let mut answer = [0_u8; 3];
+        (&client)
+            .read_exact(&mut answer)
+            .expect("the peer reads the answer");
+        assert_eq!(&answer, b"OK\n", "and the probe wrote nothing before it");
         drop(client);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !peer_closed(&server) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a closed peer must read as hung up"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        until_gone(&server, "a closed peer");
+
+        let (server, client) = crate::CtlStream::pair().expect("pair");
+        let queued: &[u8] = b"await inbox since=4\n";
+        (&client).write_all(queued).expect("request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        assert_eq!(
+            peer_state(&server),
+            PeerState::Readable,
+            "a request queued ahead of the end-of-file"
+        );
+        drop(client);
+        until_gone(&server, "a peer that queued a request and closed");
+        let mut request = vec![0_u8; queued.len()];
+        (&server)
+            .read_exact(&mut request)
+            .expect("the queued request is still read");
+        assert_eq!(request, queued);
+
+        let (server, client) = crate::CtlStream::pair().expect("pair");
+        drop(client);
+        until_gone(&server, "a peer closed without a half-close");
     }
 }

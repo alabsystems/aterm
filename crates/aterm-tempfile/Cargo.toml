@@ -14,7 +14,8 @@ workspace = true
 
 [features]
 # `stand_in` in an optimized build. A test or debug build of this crate has it
-# anyway; a dependent whose tests lay stand-ins turns this on from its
-# dev-dependencies, so its `--release` test targets build too, and nothing a
-# shipped binary links ever does.
+# anyway, so no manifest turns this on (a dev-dependency row that did would fork
+# the test build from `build -p aterm --profile test`). A `--release` test run of
+# a dependent whose tests lay stand-ins names it: `--features
+# aterm-tempfile/test-support`. `--profile opt-test` needs nothing.
 test-support = []

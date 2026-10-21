@@ -306,14 +306,14 @@ impl AgyKernel for LiveKernel {
         if self.knobs.table_unread {
             return None;
         }
-        let mut table = vec![(TUI, SHELL, "agy".to_string())];
+        let mut table = vec![(TUI, SHELL, "agy".into())];
         if let Some(name) = self.knobs.child
             && AgyKernel::alive(self, TUI)
         {
-            table.push((CHILD, TUI, name.to_string()));
+            table.push((CHILD, TUI, name.into()));
         }
         if self.between(Between::Child) && AgyKernel::alive(self, TUI) {
-            table.push((CHILD, TUI, "zsh".to_string()));
+            table.push((CHILD, TUI, "zsh".into()));
         }
         descendants_in(&table, pid)
     }
@@ -911,13 +911,16 @@ fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
 /// not found`): `refused:started-fresh`, nothing typed but the line.
 #[test]
 fn a_relaunch_that_never_holds_the_lock_started_fresh() {
-    let rig = LiveRig::new(
+    let mut rig = LiveRig::new(
         "lockless",
         Knobs {
             lockless: true,
             ..Knobs::default()
         },
     );
+    // A lock that is never taken is waited out to the bound: 50 ms of it
+    // decides as the test clock's second did.
+    rig.opts.timings.agy_lock = Duration::from_millis(50);
     let r = rig.visit();
     assert_eq!(r.step, "refused:started-fresh", "{r:?}");
     assert_eq!(rig.asked("turn").len(), 1);
@@ -1381,14 +1384,15 @@ fn the_tab_is_due_while_its_build_is_behind() {
 
 // ---------------------------------------------------------------- the live database
 
-/// THE SUMMARY DATABASE IS READ ONLY, LIVE, IN BOTH OF ITS STATES (macOS:
-/// Apple's `/usr/bin/sqlite3`), over a database laid as agy lays its own (WAL
-/// mode, the table's columns): CLOSED — no `-wal`, no `-shm`, as agy leaves
-/// it some 30 s after its last write — it is read as an immutable file, and
-/// the read leaves neither file behind; OPEN — another connection holding it
-/// with rows still in its `-wal` — by SQLite's read-only open, which sees
-/// them. NEGATIVE CONTROLS: a `-wal` with no `-shm` beside it (a moment of a
-/// close) is no answer, and neither is a conversation that is no UUIDv4.
+/// THE SUMMARY DATABASE IS READ LIVE, WITH NO LOCK, IN BOTH OF ITS STATES
+/// (macOS: Apple's `/usr/bin/sqlite3`), over a database laid as agy lays its
+/// own (WAL mode, the table's columns): CLOSED — no `-wal`, no `-shm`, as agy
+/// leaves it some 30 s after its last write — it is read as an immutable
+/// file, and the read leaves neither file behind; OPEN — another connection
+/// holding it with rows still in its `-wal` — from a private copy of the file
+/// and its `-wal`, which holds them once the holder has committed. NEGATIVE
+/// CONTROLS: a rollback journal with something in it beside the file (a write
+/// under way) is no answer, and neither is a conversation that is no UUIDv4.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_summary_database_is_read_only_open_or_closed() {
@@ -1406,14 +1410,16 @@ fn the_summary_database_is_read_only_open_or_closed() {
             "INSERT OR REPLACE INTO conversation_summaries VALUES ('{id}','{status}',{nfi},'{parent}');"
         )
     };
-    let made = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
-        .arg(&db)
-        .arg(format!(
-            "{schema}{} PRAGMA wal_checkpoint(TRUNCATE);",
-            row(C1, "CASCADE_RUN_STATUS_RUNNING", 1, "")
-        ))
-        .output()
-        .expect("sqlite3");
+    let made = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            .arg(&db)
+            .arg(format!(
+                "{schema}{} PRAGMA wal_checkpoint(TRUNCATE);",
+                row(C1, "CASCADE_RUN_STATUS_RUNNING", 1, "")
+            )),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("sqlite3 within the hang detector: {e}"));
     assert!(made.status.success(), "{made:?}");
     // Closed as agy closes it: every write checkpointed into the file, and
     // the `-wal` and `-shm` gone (Apple's `sqlite3` keeps them; agy's own
@@ -1426,47 +1432,187 @@ fn the_summary_database_is_read_only_open_or_closed() {
         !side("wal").exists() && !side("shm").exists(),
         "the read writes nothing"
     );
-    // Open: a connection holds it, its last write still in the `-wal`.
+    // Open: a connection holds it, its last write still in the `-wal`. The
+    // holder reads its row back once its INSERT is done, and the database is
+    // read only then. (Read through SQLite's own open while the holder's first
+    // transaction ran, a reader that found the WAL index not yet built took
+    // its write lock to build it, and the shell, which sets no busy timeout,
+    // failed the INSERT `database is locked` and lost it: fc50504bd3, and the
+    // reason the read now takes no lock.)
     let mut holder = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
         .arg(&db)
         .stdin(aterm_uds::spawnfd::Stdio::piped())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .expect("holder");
+    let mut stdin = holder.stdin.take().expect("its stdin");
+    let stdout = holder.stdout.take().expect("its stdout");
+    // What it printed, up to the row it read back or its end.
+    let (tell, heard) = std::sync::mpsc::channel();
+    let listener = std::thread::spawn(move || {
+        let mut said = String::new();
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+        while let Some(Ok(line)) = lines.next() {
+            said.push_str(&line);
+            said.push('\n');
+            if line.starts_with("holder reads ") {
+                break;
+            }
+        }
+        let _ = tell.send(said);
+    });
+    writeln!(
+        stdin,
+        "PRAGMA wal_autocheckpoint=0; {} SELECT 'holder reads ' || status FROM \
+         conversation_summaries WHERE conversation_id = '{C1}';",
+        row(C1, STATUS_IDLE, 0, "")
+    )
+    .expect("write");
+    stdin.flush().expect("flush");
+    // A hang detector: the holder reads its row back within a minute.
+    let said = heard
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_default();
+    if !said.contains("holder reads ") {
+        let _ = holder.kill();
+    }
+    let _ = listener.join();
+    assert_eq!(
+        said,
+        format!("0\nholder reads {STATUS_IDLE}\n"),
+        "the holder's write is committed"
+    );
+    assert!(
+        side("wal").exists() && side("shm").exists(),
+        "the holder keeps the database open"
+    );
+    assert_eq!(
+        live::read_summaries(&config, C1).as_deref().map(str::trim),
+        Ok(format!("{C1}|{STATUS_IDLE}|0|").as_str()),
+        "the open database's own rows"
+    );
+    drop(stdin);
+    let _ = holder.wait();
+    // A rollback journal with something in it: a write under way, no answer.
+    std::fs::write(side("journal"), b"\xd9\xd5\x05\xf9").expect("journal");
+    assert_eq!(live::read_summaries(&config, C1), Err(()));
+    std::fs::remove_file(side("journal")).expect("no journal");
+    assert!(
+        live::read_summaries(&config, C1).is_ok(),
+        "and with none, an answer"
+    );
+    assert_eq!(live::read_summaries(&config, "not-a-uuid"), Err(()));
+    let _ = std::fs::remove_dir_all(&*dir);
+}
+
+/// THE SUMMARY READ NEVER LOCKS OUT A WRITER (macOS: Apple's `/usr/bin/sqlite3`),
+/// over the database as a holder that died leaves it — rows still in a large
+/// `-wal`, the `-shm` beside it, no connection: the state in which a reader
+/// through SQLite, the first to open it, empties the WAL index and rebuilds it
+/// holding the index's write and recover locks (agy's own open makes the same
+/// unbuilt index for a moment). The witness (`aterm_uds::foreign_db::witness`)
+/// watches the recover lock for the whole read; had the read held it, it froze
+/// the reader there and ran a writer with NO busy timeout (the shell, as
+/// fc50504bd3's holder): measured with the read through SQLite's read-only
+/// open, its INSERT failed `database is locked` and the row was lost. The read
+/// holds none, answers the `-wal`'s row (from its private copy), and the
+/// writer's row lands.
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[test]
+fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
+    use std::io::Write as _;
+    let dir = scratch("summaries-writer");
+    let config = std::fs::canonicalize(&*dir).expect("canonical");
+    let db = config.join(live::SUMMARIES);
+    let side = |ext: &str| config.join(format!("{}-{ext}", live::SUMMARIES));
+    let row = |status: &str, nfi: u8| {
+        format!(
+            "INSERT OR REPLACE INTO conversation_summaries VALUES ('{C1}','{status}',{nfi},'');"
+        )
+    };
+    // The holder: the table, eight thousand pages more (their recovery is
+    // what a reader would hold the lock through), the conversation's row; and
+    // then it is killed, as a crash ends agy, its writes still in the `-wal`.
+    let mut holder = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        .arg(&db)
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("holder");
     let mut stdin = holder.stdin.take().expect("its stdin");
     writeln!(
         stdin,
-        "PRAGMA wal_autocheckpoint=0; {}",
-        row(C1, STATUS_IDLE, 0, "")
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE \
+         conversation_summaries (conversation_id text PRIMARY KEY, status text NOT NULL \
+         DEFAULT '', not_fully_idle numeric NOT NULL DEFAULT false, parent_conversation_id \
+         text NOT NULL DEFAULT ''); CREATE TABLE pad (b); WITH RECURSIVE n(i) AS (SELECT 1 \
+         UNION ALL SELECT i + 1 FROM n WHERE i < 8000) INSERT INTO pad SELECT randomblob(4000) \
+         FROM n; {} SELECT 'holder wrote';",
+        row("CASCADE_RUN_STATUS_RUNNING", 1)
     )
     .expect("write");
     stdin.flush().expect("flush");
-    // A hang detector: the holder's write lands within a minute.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let mut seen = None;
-    while std::time::Instant::now() < deadline {
-        if side("wal").exists()
-            && side("shm").exists()
-            && let Ok(out) = live::read_summaries(&config, C1)
-            && out.contains(STATUS_IDLE)
-        {
-            seen = Some(out);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(
-        seen.as_deref().map(str::trim),
-        Some(format!("{C1}|{STATUS_IDLE}|0|").as_str()),
-        "the open database's own rows"
-    );
-    drop(stdin);
+    // A hang detector: the holder says it wrote, or ends.
+    let said: Vec<String> =
+        std::io::BufRead::lines(std::io::BufReader::new(holder.stdout.take().expect("out")))
+            .map_while(Result::ok)
+            .take_while(|l| l != "holder wrote")
+            .collect();
+    assert_eq!(said, ["wal", "0"], "the holder wrote");
+    holder.kill().expect("killed, as a crash ends it");
     let _ = holder.wait();
-    // A `-wal` with no `-shm`: no answer.
-    std::fs::write(side("wal"), b"").expect("wal");
-    let _ = std::fs::remove_file(side("shm"));
-    assert_eq!(live::read_summaries(&config, C1), Err(()));
-    assert_eq!(live::read_summaries(&config, "not-a-uuid"), Err(()));
+    drop(stdin);
+    assert!(side("wal").exists() && side("shm").exists(), "left behind");
+    let writer = || {
+        aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+                .arg(&db)
+                .arg(row(STATUS_IDLE, 0)),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_or_else(|e| panic!("the writer within the hang detector: {e}"))
+    };
+    // The index's recover lock (byte 122 of the `-shm`): held, with its write
+    // lock, from the moment a reader has the index's first page laid until the
+    // index is rebuilt, when a writer that opens meets it at once (a writer
+    // that came sooner retries for some 10 s by itself).
+    let (read, caught) = aterm_uds::foreign_db::witness::while_read(
+        &side("shm"),
+        122,
+        1,
+        || live::read_summaries(&config, C1),
+        writer,
+    );
+    assert!(
+        caught.is_none(),
+        "the read held the WAL index's lock; a writer with no busy timeout met it: {:?}",
+        caught.map(|(pid, out)| (
+            pid,
+            out.status,
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        ))
+    );
+    assert_eq!(
+        read.as_deref().map(str::trim),
+        Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|1|").as_str()),
+        "the `-wal`'s row"
+    );
+    let wrote = writer();
+    assert!(wrote.status.success(), "{wrote:?}");
+    let back = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            .arg(&db)
+            .arg(format!(
+                "SELECT status FROM conversation_summaries WHERE conversation_id = '{C1}';"
+            )),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("the read back within the hang detector: {e}"));
+    assert_eq!(
+        String::from_utf8_lossy(&back.stdout).trim(),
+        STATUS_IDLE,
+        "the writer's row landed"
+    );
     let _ = std::fs::remove_dir_all(&*dir);
 }
 
@@ -1615,12 +1761,12 @@ fn real_restarts(s: &State, rigs: &(LiveRig, LiveRig)) -> bool {
     let (running, target) = versions(s["landed"]);
     let rows = state_rows(s);
     let status = format!("OK schema=1 hold={} hand=- integration=on", s["held"]);
-    let mut table = vec![(TUI, SHELL, "agy".to_string())];
+    let mut table = vec![(TUI, SHELL, "agy".into())];
     if s["task"] == 1 {
-        table.push((CHILD, TUI, "zsh".to_string()));
+        table.push((CHILD, TUI, "zsh".into()));
     }
     if s["daemon"] == 1 {
-        table.push((CHILD + 1, TUI, "sleep".to_string()));
+        table.push((CHILD + 1, TUI, "sleep".into()));
     }
     let now = 1_792_349_400_000;
     let messages = if s["wake"] == 1 {

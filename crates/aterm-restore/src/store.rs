@@ -430,6 +430,26 @@ impl<S: RegionView> Touched<S> {
         })
     }
 
+    /// The byte ranges of the pages a store has reached, in address order, each clipped to
+    /// the region: what an erase zeroes ([`crate::writer::erase_region`]) without making
+    /// resident a page nothing wrote.
+    pub fn written_pages(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let len = self.inner.len();
+        (0..len.div_ceil(PAGE))
+            .filter(move |&page| {
+                self.bits
+                    .get(page / 64)
+                    .is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (page % 64)) != 0)
+            })
+            .map(move |page| page * PAGE..((page + 1) * PAGE).min(len))
+    }
+
+    /// The region whose pages this counts.
+    #[must_use]
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
     /// Count the pages `[at, at + len)` spans (a store there just succeeded).
     fn touch(&self, at: usize, len: usize) {
         if len == 0 {

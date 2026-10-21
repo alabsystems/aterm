@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 //! Installing: dependency resolution, relocation-free bottle staging,
 //! linking and owned-version removal
-//! (design §3). Anything the data cannot express returns
-//! [`InstallError::PassThrough`] and the caller delegates to real
-//! brew with a notice (decision 3A).
+//! (design §3). Non-native recipes return [`InstallError::PassThrough`]
+//! before successful native progress; later refusals remain local failures
+//! rather than replaying completed work through real brew (decision 3A).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -26,21 +26,33 @@ pub(super) fn keg_version(f: &Formula) -> String {
 fn preflight(prefix: &Prefix, f: &Formula, opts: &InstallOpts) -> Result<(), InstallError> {
     let version = keg_version(f);
     if !super::valid_component(&f.name)
-        || !super::valid_component(&version)
+        || !super::valid_cask_version(&version)
         || f.full_name != f.name
     {
         return Err(InstallError::PassThrough(
             "unsupported formula name/version".to_string(),
         ));
     }
+    let mut same_keg_reinstall = false;
     if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
-        if opts.force || version_cmp(&inst.version, &version) == std::cmp::Ordering::Less {
+        let older = version_cmp(&inst.version, &version) == std::cmp::Ordering::Less;
+        same_keg_reinstall = opts.reinstall && inst.version == version;
+        let admitted_replacement = if older {
+            opts.upgrade || opts.reinstall
+        } else {
+            opts.reinstall && inst.version == version
+        };
+        if !admitted_replacement && (opts.force || older) {
             return Err(InstallError::PassThrough(format!(
                 "replacement of {} is handled by brew",
                 f.name
             )));
         }
-        return Ok(());
+        if !admitted_replacement {
+            return Ok(());
+        }
+        // An admitted replacement still needs the NEW bottle to qualify
+        // natively; fall through to the checks below.
     }
     let native = f
         .bottle_for(&bottle_tags())
@@ -51,7 +63,67 @@ fn preflight(prefix: &Prefix, f: &Formula, opts: &InstallOpts) -> Result<(), Ins
             f.name
         )));
     }
-    if std::fs::symlink_metadata(prefix.keg(&f.name, &version)).is_ok() {
+    // Data-evaluable requirements and conflicts, enforced here so the
+    // pre-lock pass and the locked install agree.
+    if let Some(short) = prefix.installed_conflict(&f.conflicts)? {
+        return Err(InstallError::Failed(format!(
+            "abrew: {} conflicts with installed {short}",
+            f.name
+        )));
+    }
+    if f.pour_requires_clt && !std::path::Path::new("/Library/Developer/CommandLineTools").is_dir()
+    {
+        return Err(InstallError::PassThrough(format!(
+            "{} pours only with the Command Line Tools installed",
+            f.name
+        )));
+    }
+    for requirement in &f.requirements {
+        let (met, what) = match requirement {
+            super::formula::Requirement::MacosMin(floor) => {
+                let met = super::formula::macos_version().is_some_and(|v| {
+                    floor
+                        .as_deref()
+                        .is_none_or(|floor| version_cmp(&v, floor) != std::cmp::Ordering::Less)
+                });
+                (met, "a newer macOS")
+            }
+            super::formula::Requirement::MacosMax(ceiling) => {
+                let met = super::formula::macos_version()
+                    .is_some_and(|v| version_cmp(&v, ceiling) != std::cmp::Ordering::Greater);
+                (met, "an older macOS")
+            }
+            super::formula::Requirement::Arch(want) => {
+                let here = match std::env::consts::ARCH {
+                    "aarch64" => "arm64",
+                    other => other,
+                };
+                (want == here, "another architecture")
+            }
+            super::formula::Requirement::XcodeMin(floor) => {
+                let met = super::formula::xcode_version().is_some_and(|v| {
+                    floor
+                        .as_deref()
+                        .is_none_or(|floor| version_cmp(&v, floor) != std::cmp::Ordering::Less)
+                });
+                (
+                    met,
+                    if floor.is_some() {
+                        "a newer Xcode"
+                    } else {
+                        "Xcode"
+                    },
+                )
+            }
+        };
+        if !met {
+            return Err(InstallError::PassThrough(format!(
+                "{} needs {what}",
+                f.name
+            )));
+        }
+    }
+    if !same_keg_reinstall && std::fs::symlink_metadata(prefix.keg(&f.name, &version)).is_ok() {
         return Err(InstallError::Failed(format!(
             "abrew: unrecognized keg already exists for {}",
             f.name
@@ -80,6 +152,18 @@ pub struct InstallOpts {
     pub dry_run: bool,
     pub force: bool,
     pub quiet: bool,
+    /// This install is an upgrade: replacing an older owned keg with a
+    /// newer native bottle is admitted (plain installs still delegate
+    /// replacements).
+    pub upgrade: bool,
+    /// This install is a reinstall: replacing the SAME version's owned
+    /// keg is admitted (old keg set aside, restored on any failure,
+    /// deleted only after the new keg is receipted and linked).
+    pub reinstall: bool,
+    /// This formula is being installed as another package's
+    /// dependency (a cask's `depends_on formula:`), so its receipt
+    /// records `installed_on_request=false` like brew's.
+    pub as_dependency: bool,
 }
 
 /// Resolve `name`'s full install plan: the formula and every runtime
@@ -91,6 +175,32 @@ pub fn plan(
     name: &str,
     opts: &InstallOpts,
 ) -> Result<Vec<Formula>, InstallError> {
+    dependency_plan(
+        name,
+        opts.ignore_dependencies,
+        |n| api.formula(n).map_err(InstallError::from),
+        |n| prefix.installed_one(Kind::Formula, n).is_some(),
+    )
+}
+
+/// Fetch needs the complete runtime closure even when a dependency is installed:
+/// an installed keg does not mean its bottle is present in the download cache.
+pub(super) fn fetch_plan(api: &Api, name: &str) -> Result<Vec<Formula>, InstallError> {
+    dependency_plan(
+        name,
+        false,
+        |n| api.formula(n).map_err(InstallError::from),
+        |_| false,
+    )
+}
+
+/// One walk, with the caller deciding which non-root dependencies can be skipped.
+fn dependency_plan(
+    name: &str,
+    ignore_dependencies: bool,
+    mut read: impl FnMut(&str) -> Result<Formula, InstallError>,
+    mut skip: impl FnMut(&str) -> bool,
+) -> Result<Vec<Formula>, InstallError> {
     /// The recursion's mutable state, one argument.
     struct PlanState {
         out: Vec<Formula>,
@@ -98,13 +208,16 @@ pub fn plan(
         seen: BTreeSet<String>,
     }
     fn walk(
-        api: &Api,
-        prefix: &Prefix,
         name: &str,
-        opts: &InstallOpts,
+        ignore_dependencies: bool,
+        read: &mut impl FnMut(&str) -> Result<Formula, InstallError>,
+        skip: &mut impl FnMut(&str) -> bool,
         state: &mut PlanState,
         top: bool,
     ) -> Result<(), InstallError> {
+        // homebrew/core/<f> is the API's own name with its home tap
+        // spelled out; any other qualification needs its tap recipe.
+        let name = name.strip_prefix("homebrew/core/").unwrap_or(name);
         if !super::valid_component(name) {
             return Err(InstallError::PassThrough(format!(
                 "qualified dependency {name} needs its tap recipe"
@@ -121,19 +234,19 @@ pub fn plan(
             return Ok(());
         }
         state.seen.insert(short.clone());
-        if !top && prefix.installed_one(Kind::Formula, &short).is_some() {
+        if !top && skip(&short) {
             return Ok(());
         }
-        let f = api.formula(&short)?;
+        let f = read(&short)?;
         if f.disable {
             return Err(InstallError::Failed(format!(
                 "abrew: {short} is disabled upstream"
             )));
         }
-        if !opts.ignore_dependencies {
+        if !ignore_dependencies {
             state.visiting.push(short.clone());
             for d in &f.dependencies {
-                walk(api, prefix, d, opts, state, false)?;
+                walk(d, ignore_dependencies, read, skip, state, false)?;
             }
             state.visiting.pop();
         }
@@ -145,7 +258,14 @@ pub fn plan(
         visiting: Vec::new(),
         seen: BTreeSet::new(),
     };
-    walk(api, prefix, name, opts, &mut state, true)?;
+    walk(
+        name,
+        ignore_dependencies,
+        &mut read,
+        &mut skip,
+        &mut state,
+        true,
+    )?;
     Ok(state.out)
 }
 
@@ -177,41 +297,55 @@ pub fn install(
     for f in &planned {
         preflight(prefix, f, opts)?;
     }
+    // Capture the standing packages before any pour. Request uncertainty must
+    // not become false, and rollback must never uninstall an earlier version.
+    let prior = prior_requests(prefix, planned.iter().map(|f| f.name.as_str()))?;
     if !opts.dry_run {
         prefix.ensure()?;
     }
     let mut last = String::new();
     let mut installed_now: Vec<String> = Vec::new();
+    let mut completed = false;
     for f in &planned {
         let version = keg_version(f);
-        if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name)
-            && !opts.force
-            && version_cmp(&inst.version, &version) != std::cmp::Ordering::Less
-        {
-            if !opts.quiet {
-                println!("abrew: {} {} already installed", f.name, inst.version);
+        let mut replacing = ReplaceMode::None;
+        if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
+            if !opts.force && version_cmp(&inst.version, &version) != std::cmp::Ordering::Less {
+                if !opts.quiet {
+                    println!("abrew: {} {} already installed", f.name, inst.version);
+                }
+                last = inst.version;
+                continue;
             }
-            last = inst.version;
-            continue;
+            replacing = if inst.version == version {
+                ReplaceMode::SameKeg
+            } else {
+                ReplaceMode::NewKeg
+            };
         }
         if opts.dry_run {
             println!("Would install {} {version}", f.name);
         } else {
-            match install_one(prefix, f, f.name == Formula::short_name(name)) {
+            let on_request = (!opts.as_dependency && f.name == Formula::short_name(name))
+                || prior.get(&f.name).copied().unwrap_or(false);
+            match install_one(prefix, f, on_request, replacing) {
                 Ok(()) => {
-                    installed_now.push(f.name.clone());
+                    completed = true;
+                    if !prior.contains_key(&f.name) {
+                        installed_now.push(f.name.clone());
+                    }
                     if !opts.quiet {
                         println!("🍺  {}/{version}: installed", f.name);
                     }
                 }
                 Err(e) => {
-                    // Roll this run back: dependencies poured for a plan
-                    // that failed do not stay behind as orphans.
+                    // Remove only packages absent before this plan. Completed
+                    // upgrades retain their old and new versions on later failure.
                     for done in installed_now.iter().rev() {
                         eprintln!("abrew: rolling back {done} (installed for this failed plan)");
                         let _ = uninstall(api, prefix, done, true, false);
                     }
-                    return Err(e);
+                    return Err(super::after_native_progress(e, completed));
                 }
             }
         }
@@ -219,8 +353,46 @@ pub fn install(
     }
     if !opts.dry_run {
         prefix.rebuild_state()?;
+        if completed {
+            note_bin_not_on_path(prefix, opts.quiet);
+        }
     }
     Ok(last)
+}
+
+/// One caveat line when the prefix bin is not on PATH: the install
+/// landed, but bare command names will not resolve until shellenv is
+/// evaluated (found live: an aterm session's PATH carries pkg/bin,
+/// not abrew's prefix bin).
+pub(super) fn note_bin_not_on_path(prefix: &Prefix, quiet: bool) {
+    if quiet {
+        return;
+    }
+    let bin = prefix.bin();
+    let on_path =
+        std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
+    if !on_path {
+        println!(
+            "abrew: note: {} is not on PATH — run: eval \"$(abrew shellenv)\"",
+            bin.display()
+        );
+    }
+}
+
+fn prior_requests<'a>(
+    prefix: &Prefix,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<BTreeMap<String, bool>, InstallError> {
+    let names: BTreeSet<_> = names.collect();
+    prefix
+        .installed_checked(Kind::Formula)?
+        .into_iter()
+        .filter(|installed| names.contains(installed.name.as_str()))
+        .map(|installed| {
+            let requested = super::commands::requested(prefix, &installed)?;
+            Ok((installed.name, requested))
+        })
+        .collect()
 }
 
 /// Build-prefix references left in a staged keg: placeholders in text
@@ -276,7 +448,24 @@ fn linkage_leftovers(staged: &Path) -> Vec<String> {
     out
 }
 
-fn install_one(prefix: &Prefix, f: &Formula, on_request: bool) -> Result<(), InstallError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplaceMode {
+    /// First install: every destination must be new.
+    None,
+    /// Upgrade (or outdated reinstall): publish a NEW keg directory,
+    /// swapping the same package's own links.
+    NewKeg,
+    /// Same-version reinstall: set the live keg aside, publish in its
+    /// place, restore it on any failure.
+    SameKeg,
+}
+
+fn install_one(
+    prefix: &Prefix,
+    f: &Formula,
+    on_request: bool,
+    replace: ReplaceMode,
+) -> Result<(), InstallError> {
     let version = keg_version(f);
     let keg = prefix.keg(&f.name, &version);
     let work =
@@ -301,6 +490,12 @@ fn install_one(prefix: &Prefix, f: &Formula, on_request: bool) -> Result<(), Ins
                 "installed_on_request",
                 if on_request { "true" } else { "false" },
             ),
+            // Recorded so doctor can tell an unlinked keg from a
+            // keg-only one offline, from receipt authority alone.
+            ("keg_only", if f.keg_only { "true" } else { "false" }),
+            // The tap-qualified identity for `list --full-name`
+            // (equals the short name for homebrew/core API rows).
+            ("full_name", &f.full_name),
         ],
     )?;
     let mut links = Vec::new();
@@ -312,7 +507,12 @@ fn install_one(prefix: &Prefix, f: &Formula, on_request: bool) -> Result<(), Ins
         destination: prefix.opt(&f.name),
         directory: true,
     });
-    publish_payload(prefix, &poured, &keg, &links)
+    let keg_base = prefix.cellar().join(&f.name);
+    match replace {
+        ReplaceMode::None => publish_payload(prefix, &poured, &keg, &links),
+        ReplaceMode::NewKeg => publish_payload_replacing(prefix, &poured, &keg, &links, &keg_base),
+        ReplaceMode::SameKeg => publish_payload_reinstall(prefix, &poured, &keg, &links, &keg_base),
+    }
 }
 
 /// A link in a new payload's activation plan. Destinations are exclusively created.
@@ -404,7 +604,7 @@ pub(super) fn publish_payload(
     live: &Path,
     links: &[InstallLink],
 ) -> Result<(), InstallError> {
-    publish_payload_with(prefix, staged, live, links, |link| {
+    publish_payload_with(prefix, staged, live, links, None, None, |link| {
         if link.directory {
             symlink_dir(&link.source, &link.destination)
         } else {
@@ -413,23 +613,151 @@ pub(super) fn publish_payload(
     })
 }
 
+/// Publish replacing the same package's own live links (an upgrade):
+/// only links into receipt-owned versions under `replace_root` may be swapped.
+pub(super) fn publish_payload_replacing(
+    prefix: &Prefix,
+    staged: &Path,
+    live: &Path,
+    links: &[InstallLink],
+    replace_root: &Path,
+) -> Result<(), InstallError> {
+    publish_payload_with(
+        prefix,
+        staged,
+        live,
+        links,
+        Some(replace_root),
+        None,
+        |link| {
+            if link.directory {
+                symlink_dir(&link.source, &link.destination)
+            } else {
+                symlink_file(&link.source, &link.destination)
+            }
+        },
+    )
+}
+
+pub(super) fn publish_payload_reinstall(
+    prefix: &Prefix,
+    staged: &Path,
+    live: &Path,
+    links: &[InstallLink],
+    root: &Path,
+) -> Result<(), InstallError> {
+    reinstall_payload_with(prefix, staged, live, links, root, |link| {
+        symlink_file(&link.source, &link.destination)
+    })
+}
+
+struct RelocatedKeg {
+    live: PathBuf,
+    aside: PathBuf,
+    identity: std::fs::Metadata,
+}
+
+fn reinstall_payload_with(
+    prefix: &Prefix,
+    staged: &Path,
+    live: &Path,
+    links: &[InstallLink],
+    root: &Path,
+    place: impl FnMut(&InstallLink) -> Result<(), String>,
+) -> Result<(), InstallError> {
+    // Establish receipt authority before moving the live version. Keep the
+    // aside on restore failure: a temporary-directory Drop must not delete it.
+    if !replacement_target_owned(prefix, live, live, root) {
+        return Err("abrew: reinstall requires an owned physical keg"
+            .to_string()
+            .into());
+    }
+    for link in links {
+        if std::fs::symlink_metadata(&link.destination).is_ok()
+            && !std::fs::read_link(&link.destination).is_ok_and(|target| {
+                replacement_target_owned(prefix, &link.destination, &target, root)
+            })
+        {
+            return Err(format!(
+                "abrew: refusing existing artifact {}",
+                link.destination.display()
+            )
+            .into());
+        }
+    }
+    let identity = std::fs::symlink_metadata(live).map_err(|e| format!("abrew: {e}"))?;
+    let reserved = aterm_tempfile::TempDir::new_in(
+        root.parent()
+            .ok_or_else(|| "abrew: package root has no parent".to_string())?,
+    )
+    .map_err(|e| format!("abrew: {e}"))?
+    .keep();
+    let old = RelocatedKeg {
+        live: live.to_path_buf(),
+        aside: reserved.join("payload"),
+        identity,
+    };
+    let result = (|| {
+        check_directory(root, &prefix.root)?;
+        if !same_path_identity(live, &old.identity)
+            || !replacement_target_owned(prefix, live, live, root)
+        {
+            return Err("abrew: reinstall keg changed".to_string().into());
+        }
+        super::prefix::publish_directory(live, &old.aside, false)
+            .map_err(|e| format!("abrew: cannot preserve old keg: {e}"))?;
+        publish_payload_with(prefix, staged, live, links, Some(root), Some(&old), place)
+    })();
+    if result.is_ok() {
+        if check_directory(&reserved, &prefix.root).is_ok()
+            && same_path_identity(&old.aside, &old.identity)
+            && let Err(e) = std::fs::remove_dir_all(&old.aside)
+        {
+            eprintln!("abrew: old keg kept at {}: {e}", old.aside.display());
+        }
+    } else if check_directory(root, &prefix.root).is_ok()
+        && same_path_identity(&old.aside, &old.identity)
+        && std::fs::symlink_metadata(live).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        && let Err(e) = super::prefix::publish_directory(&old.aside, live, false)
+    {
+        eprintln!("abrew: old keg kept at {}: {e}", old.aside.display());
+    }
+    // Only an empty reservation is removed; an unrestored keg is retained.
+    let _ = std::fs::remove_dir(&reserved);
+    result
+}
+
 fn publish_payload_with(
     prefix: &Prefix,
     staged: &Path,
     live: &Path,
     links: &[InstallLink],
+    replace_root: Option<&Path>,
+    relocated: Option<&RelocatedKeg>,
     mut place: impl FnMut(&InstallLink) -> Result<(), String>,
 ) -> Result<(), InstallError> {
     let parent = live
         .parent()
         .ok_or_else(|| "abrew: payload has no parent".to_string())?;
     check_directory(parent, &prefix.root)?;
+    // Record both identity and target before granting replacement authority.
+    let mut replaced: Vec<(&InstallLink, PathBuf, std::fs::Metadata)> = Vec::new();
     for link in links {
-        if std::fs::symlink_metadata(&link.destination).is_ok() {
-            return Err(InstallError::Failed(format!(
-                "abrew: refusing existing artifact {}",
-                link.destination.display()
-            )));
+        if let Ok(identity) = std::fs::symlink_metadata(&link.destination) {
+            let swap = replace_root.and_then(|root| {
+                let target = std::fs::read_link(&link.destination).ok()?;
+                replacement_target_owned_at(prefix, &link.destination, &target, root, relocated)
+                    .then_some(target)
+            });
+            match swap {
+                Some(old_target) => replaced.push((link, old_target, identity)),
+                None => {
+                    return Err(InstallError::Failed(format!(
+                        "abrew: refusing existing artifact {}",
+                        link.destination.display()
+                    )));
+                }
+            }
         }
         if let Some(parent) = link.destination.parent() {
             check_directory(parent, &prefix.root)?;
@@ -455,14 +783,41 @@ fn publish_payload_with(
     ensure_directory(parent)?;
     super::prefix::publish_directory(staged, live, false)
         .map_err(|e| format!("abrew: cannot publish payload: {e}"))?;
-    let mut placed: Vec<&InstallLink> = Vec::new();
+    let mut placed: Vec<(&InstallLink, std::fs::Metadata)> = Vec::new();
+    let mut removed = Vec::new();
     let result = (|| {
         for link in links {
             if let Some(parent) = link.destination.parent() {
                 ensure_directory(parent)?;
+                check_directory(parent, &prefix.root)?;
+            }
+            if let Some((_, old_target, expected)) = replaced
+                .iter()
+                .find(|(l, _, _)| l.destination == link.destination)
+            {
+                if !same_path_identity(&link.destination, expected)
+                    || !std::fs::read_link(&link.destination).is_ok_and(|now| now == *old_target)
+                    || !replace_root.is_some_and(|root| {
+                        replacement_target_owned_at(
+                            prefix,
+                            &link.destination,
+                            old_target,
+                            root,
+                            relocated,
+                        )
+                    })
+                {
+                    return Err(
+                        format!("abrew: artifact changed: {}", link.destination.display()).into(),
+                    );
+                }
+                std::fs::remove_file(&link.destination).map_err(|e| format!("abrew: {e}"))?;
+                removed.push((link, old_target));
             }
             place(link)?;
-            placed.push(link);
+            let identity =
+                std::fs::symlink_metadata(&link.destination).map_err(|e| format!("abrew: {e}"))?;
+            placed.push((link, identity));
         }
         // Hard-link creation refuses an unexpected destination atomically.
         std::fs::hard_link(&prepared_receipt, live.join(receipt_name))
@@ -470,9 +825,27 @@ fn publish_payload_with(
         Ok(())
     })();
     if result.is_err() {
-        for link in placed.into_iter().rev() {
-            if std::fs::read_link(&link.destination).is_ok_and(|target| target == link.source) {
+        for (link, identity) in placed.into_iter().rev() {
+            if link
+                .destination
+                .parent()
+                .is_some_and(|parent| check_directory(parent, &prefix.root).is_ok())
+                && same_path_identity(&link.destination, &identity)
+                && std::fs::read_link(&link.destination).is_ok_and(|target| target == link.source)
+            {
                 let _ = std::fs::remove_file(&link.destination);
+            }
+        }
+        // Restore swapped-out links of the previous version exactly.
+        for (link, old_target) in removed.into_iter().rev() {
+            if link
+                .destination
+                .parent()
+                .is_some_and(|parent| check_directory(parent, &prefix.root).is_ok())
+                && std::fs::symlink_metadata(&link.destination)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                let _ = symlink_file(old_target, &link.destination);
             }
         }
         #[cfg(unix)]
@@ -517,29 +890,93 @@ pub(super) fn link_points_into(link: &Path, root: &Path) -> bool {
 
 /// Classify an already-read link target without a second filesystem lookup.
 pub(super) fn link_target_points_into(link: &Path, target: &Path, root: &Path) -> bool {
-    fn normalize(path: &Path) -> Option<PathBuf> {
-        let mut out = PathBuf::new();
-        for part in path.components() {
-            match part {
-                std::path::Component::ParentDir => {
-                    if !out.pop() {
-                        return None;
-                    }
+    resolved_link_target(link, target)
+        .zip(normalize_link_path(root))
+        .is_some_and(|(target, root)| target.starts_with(root))
+}
+
+fn normalize_link_path(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
                 }
-                std::path::Component::CurDir => {}
-                other => out.push(other.as_os_str()),
             }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
         }
-        Some(out)
     }
+    Some(out)
+}
+
+fn resolved_link_target(link: &Path, target: &Path) -> Option<PathBuf> {
     let target = if target.is_absolute() {
         target.to_path_buf()
     } else {
         link.parent().unwrap_or(Path::new(".")).join(target)
     };
-    normalize(&target)
-        .zip(normalize(root))
-        .is_some_and(|(target, root)| target.starts_with(root))
+    normalize_link_path(&target)
+}
+
+/// Lexical containment alone never authorizes replacing a personal version.
+pub(super) fn replacement_target_owned(
+    prefix: &Prefix,
+    link: &Path,
+    target: &Path,
+    root: &Path,
+) -> bool {
+    replacement_target_owned_at(prefix, link, target, root, None)
+}
+
+fn replacement_target_owned_at(
+    prefix: &Prefix,
+    link: &Path,
+    target: &Path,
+    root: &Path,
+    relocated: Option<&RelocatedKeg>,
+) -> bool {
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !super::valid_component(name) {
+        return false;
+    }
+    let kind = if root == prefix.cellar().join(name) {
+        Kind::Formula
+    } else if root == prefix.caskroom().join(name) {
+        Kind::Cask
+    } else {
+        return false;
+    };
+    let Some(target) = resolved_link_target(link, target) else {
+        return false;
+    };
+    let Ok(relative) = target.strip_prefix(root) else {
+        return false;
+    };
+    let Some(std::path::Component::Normal(version)) = relative.components().next() else {
+        return false;
+    };
+    let Some(version) = version.to_str().filter(|version| match kind {
+        Kind::Formula => super::valid_component(version),
+        Kind::Cask => super::valid_cask_version(version),
+    }) else {
+        return false;
+    };
+    let version_dir = root.join(version);
+    let receipt_dir = match relocated.filter(|old| old.live == version_dir) {
+        Some(old) if same_path_identity(&old.aside, &old.identity) => &old.aside,
+        Some(_) => return false,
+        None => &version_dir,
+    };
+    check_directory(receipt_dir, &prefix.root).is_ok()
+        && check_directory(&version_dir, &prefix.root).is_ok()
+        && target
+            .parent()
+            .is_some_and(|parent| check_directory(parent, &prefix.root).is_ok())
+        && super::prefix::owned_receipt(receipt_dir, kind, name, version)
 }
 
 /// Point `opt/<name>` at the newest admitted keg and link its files unless keg-only.
@@ -630,7 +1067,7 @@ fn admit_keg(prefix: &Prefix, keg: &Path) -> Result<(), InstallError> {
         return Err("abrew: invalid keg name or version".to_string().into());
     };
     if !super::valid_component(name)
-        || !super::valid_component(version)
+        || !super::valid_cask_version(version)
         || prefix.keg(name, version).as_os_str() != keg.as_os_str()
         || !prefix
             .installed_one(Kind::Formula, name)
@@ -713,7 +1150,7 @@ fn activate_keg_with(
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .ok_or_else(|| "abrew: invalid keg name".to_string())?;
-        for path in owned_keg_links(prefix, name)? {
+        for path in owned_keg_links(prefix, name, true)? {
             changes.insert(
                 path,
                 Change {
@@ -745,8 +1182,10 @@ fn activate_keg_with(
             if let Some(parent) = path.parent() {
                 check_directory(parent, &prefix.root)?;
             }
-            if let Some((_, identity)) = &change.before {
-                if !same_path_identity(path, identity) {
+            if let Some((target, identity)) = &change.before {
+                if !(same_path_identity(path, identity)
+                    && std::fs::read_link(path).is_ok_and(|actual| &actual == target))
+                {
                     return Err(format!(
                         "abrew: link changed before activation: {}",
                         path.display()
@@ -794,7 +1233,10 @@ fn activate_keg_with(
                     Ok(_)
                         if placed
                             .as_ref()
-                            .is_some_and(|identity| same_path_identity(path, identity)) =>
+                            .is_some_and(|identity| same_path_identity(path, identity))
+                            && change.after.is_some_and(|link| {
+                                std::fs::read_link(path).is_ok_and(|actual| actual == link.source)
+                            }) =>
                     {
                         std::fs::remove_file(path).map_err(|e| format!("abrew: {e}"))?;
                     }
@@ -824,12 +1266,20 @@ fn activate_keg_with(
     Ok(())
 }
 
+/// Whether `path` is still the entry `expected` was read from: the same device, inode
+/// and kind. The kind is part of it because a Linux file system hands a freed inode
+/// number straight to the next entry made (ext4 does, between an unlink and the next
+/// create), so a file put where a link was can carry the link's number. A link cannot
+/// be retargeted in place, so a caller that holds one's target compares it too.
 pub(super) fn same_path_identity(path: &Path, expected: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path)
-            .is_ok_and(|actual| actual.dev() == expected.dev() && actual.ino() == expected.ino())
+        std::fs::symlink_metadata(path).is_ok_and(|actual| {
+            actual.dev() == expected.dev()
+                && actual.ino() == expected.ino()
+                && actual.file_type() == expected.file_type()
+        })
     }
     #[cfg(not(unix))]
     {
@@ -839,14 +1289,37 @@ pub(super) fn same_path_identity(path: &Path, expected: &std::fs::Metadata) -> b
 }
 
 /// Remove every prefix symlink pointing into `keg`.
-pub fn unlink_keg(prefix: &Prefix, name: &str) -> Result<(), String> {
-    for link in owned_keg_links(prefix, name)? {
+/// Remove every prefix link owned by `name`'s kegs; returns how
+/// many were removed (a hand-deleted keg leaves dangling owned
+/// links that only this can clear).
+/// Remove a keg's file links. The `opt/` pointer stays: in brew
+/// it is the version record independent of linking (keg-only
+/// formulae hold one without ever being linked), and `list
+/// --json`'s optlinked_version reads it. Uninstall removes it
+/// separately via [`remove_owned_opt_link`].
+pub fn unlink_keg(prefix: &Prefix, name: &str) -> Result<usize, String> {
+    let links = owned_keg_links(prefix, name, false)?;
+    let removed = links.len();
+    for link in links {
         std::fs::remove_file(link).map_err(|e| format!("abrew: {e}"))?;
+    }
+    Ok(removed)
+}
+
+/// Remove `opt/<name>` when it is abrew's own pointer into the
+/// name's kegs (uninstall's last link step).
+pub fn remove_owned_opt_link(prefix: &Prefix, name: &str) -> Result<(), String> {
+    if !super::valid_component(name) {
+        return Err("abrew: invalid formula name".to_string());
+    }
+    let opt = prefix.opt(name);
+    if prefix_owned_target(&opt, &prefix.cellar().join(name)) {
+        std::fs::remove_file(&opt).map_err(|e| format!("abrew: {e}"))?;
     }
     Ok(())
 }
 
-fn owned_keg_links(prefix: &Prefix, name: &str) -> Result<Vec<PathBuf>, String> {
+fn owned_keg_links(prefix: &Prefix, name: &str, include_opt: bool) -> Result<Vec<PathBuf>, String> {
     if !super::valid_component(name) {
         return Err("abrew: invalid formula name".to_string());
     }
@@ -858,9 +1331,11 @@ fn owned_keg_links(prefix: &Prefix, name: &str) -> Result<Vec<PathBuf>, String> 
     for sub in ["bin", "sbin", "lib", "include", "share", "etc"] {
         owned_links(&prefix.root.join(sub), &cellar, &mut links)?;
     }
-    let opt = prefix.opt(name);
-    if prefix_owned_target(&opt, &cellar) {
-        links.push(opt);
+    if include_opt {
+        let opt = prefix.opt(name);
+        if prefix_owned_target(&opt, &cellar) {
+            links.push(opt);
+        }
     }
     Ok(links)
 }
@@ -904,6 +1379,49 @@ fn prefix_owned_target(link: &Path, package: &Path) -> bool {
         })
 }
 
+/// Remove DANGLING prefix links that spell into `name`'s missing
+/// kegs — the recovery path for a hand-deleted keg, whose links
+/// the receipt-proven [`unlink_keg`] can no longer claim (the
+/// receipt died with the keg) and which make `install` refuse the
+/// name. Only links whose target does not exist are removed, and
+/// only when Cellar/<name> is a real layout (a linked Cellar
+/// could spell into a foreign tree). The explicit `unlink <name>`
+/// command is the user's consent; uninstall never comes here.
+pub fn remove_dangling_links(prefix: &Prefix, name: &str) -> Result<usize, String> {
+    if !super::valid_component(name) {
+        return Err("abrew: invalid formula name".to_string());
+    }
+    let cellar_name = prefix.cellar().join(name);
+    let linked = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if linked(&prefix.cellar()) || linked(&cellar_name) {
+        return Ok(0);
+    }
+    fn walk(dir: &Path, cellar_name: &Path, removed: &mut usize) -> Result<(), String> {
+        if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir()) {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("abrew: {e}"))? {
+            let entry = entry.map_err(|e| format!("abrew: {e}"))?;
+            let p = entry.path();
+            let kind = entry.file_type().map_err(|e| format!("abrew: {e}"))?;
+            if kind.is_symlink() {
+                if link_points_into(&p, cellar_name) && !p.exists() {
+                    std::fs::remove_file(&p).map_err(|e| format!("abrew: {e}"))?;
+                    *removed += 1;
+                }
+            } else if kind.is_dir() {
+                walk(&p, cellar_name, removed)?;
+            }
+        }
+        Ok(())
+    }
+    let mut removed = 0;
+    for sub in ["bin", "sbin", "lib", "include", "share", "etc", "opt"] {
+        walk(&prefix.root.join(sub), &cellar_name, &mut removed)?;
+    }
+    Ok(removed)
+}
+
 /// Download, verify and safely extract a bottle into private staging.
 fn pour_bottle(prefix: &Prefix, f: &Formula, staging: &Path) -> Result<PathBuf, InstallError> {
     let tags = bottle_tags();
@@ -940,7 +1458,7 @@ fn selected_bottle_payload(
     name: &str,
     version: &str,
 ) -> Result<PathBuf, InstallError> {
-    if !super::valid_component(name) || !super::valid_component(version) {
+    if !super::valid_component(name) || !super::valid_cask_version(version) {
         return Err("abrew: invalid bottle subtree".to_string().into());
     }
     let inner = staging.join(name).join(version);
@@ -1022,6 +1540,7 @@ pub fn uninstall(
         return Ok(());
     }
     unlink_keg(prefix, short)?;
+    remove_owned_opt_link(prefix, short)?;
     let base = prefix.cellar().join(short);
     if prefix.pinned_version(short).is_some() {
         prefix.unpin(short)?;
@@ -1037,7 +1556,7 @@ pub fn uninstall(
 /// `abrew fetch`: download (and verify) the bottle or source tarball
 /// into the cache without installing.
 pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<(), InstallError> {
-    if !super::valid_component(&f.name) || !super::valid_component(&keg_version(f)) {
+    if !super::valid_component(&f.name) || !super::valid_cask_version(&keg_version(f)) {
         return Err(InstallError::PassThrough(
             "unsupported formula name/version".to_string(),
         ));
@@ -1081,7 +1600,7 @@ pub(super) fn dependency_books(
         if formula.name != i.name {
             return Err(format!("abrew: dependency metadata does not name {}", i.name));
         }
-        if !super::valid_component(&formula.version) {
+        if !super::valid_cask_version(&formula.version) {
             return Err("abrew: invalid formula version".to_string());
         }
         let version = keg_version(&formula);
@@ -1116,6 +1635,117 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::extract::fixtures::{gzip_bytes, tar_bytes};
+
+    #[test]
+    fn a_fetch_plan_keeps_installed_dependencies_and_their_descendants() {
+        let read = |name: &str| -> Result<Formula, InstallError> {
+            let dependencies = match name {
+                "app" => vec!["dep", "shared"],
+                "dep" => vec!["leaf", "shared"],
+                "leaf" | "shared" => vec![],
+                _ => return Err(InstallError::Failed("captured unknown".into())),
+            };
+            Ok(Formula {
+                name: name.into(),
+                dependencies: dependencies.into_iter().map(str::to_string).collect(),
+                ..Formula::default()
+            })
+        };
+        let names = |plan: Vec<Formula>| plan.into_iter().map(|f| f.name).collect::<Vec<_>>();
+        let mut install_reads = Vec::new();
+        let install = dependency_plan(
+            "app",
+            false,
+            |n| {
+                install_reads.push(n.to_string());
+                read(n)
+            },
+            |n| n == "dep",
+        )
+        .unwrap();
+        assert_eq!(names(install), ["shared", "app"]);
+        assert_eq!(install_reads, ["app", "shared"]);
+        let mut fetch_reads = Vec::new();
+        let fetch = dependency_plan(
+            "homebrew/core/app",
+            false,
+            |n| {
+                fetch_reads.push(n.to_string());
+                read(n)
+            },
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(names(fetch), ["leaf", "shared", "dep", "app"]);
+        assert_eq!(fetch_reads, ["app", "dep", "leaf", "shared"]);
+        assert_eq!(
+            names(dependency_plan("app", true, read, |_| false).unwrap()),
+            ["app"]
+        );
+        assert!(
+            dependency_plan(
+                "other/tap/app",
+                false,
+                |_| panic!("qualified name must be refused before reading"),
+                |_| false
+            )
+            .is_err()
+        );
+        let cycle = |n: &str| {
+            Ok(Formula {
+                name: n.into(),
+                dependencies: vec!["app".into()],
+                ..Formula::default()
+            })
+        };
+        assert!(
+            matches!(dependency_plan("app", false, cycle, |_| false), Err(InstallError::Failed(message)) if message.contains("dependency cycle"))
+        );
+        assert!(
+            matches!(dependency_plan("app", false, |_| Ok(Formula { disable: true, ..Formula::default() }), |_| false), Err(InstallError::Failed(message)) if message.contains("disabled"))
+        );
+        assert_eq!(
+            dependency_plan(
+                "app",
+                false,
+                |_| Err(InstallError::Failed("captured read failure".into())),
+                |_| false
+            ),
+            Err(InstallError::Failed("captured read failure".into()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlink_keeps_the_opt_pointer_and_its_removal_is_separate() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let p = Prefix::at(&tmp.path().join("prefix"));
+        p.ensure().unwrap();
+        let keg = p.keg("demo", "1.0");
+        std::fs::create_dir_all(keg.join("bin")).unwrap();
+        std::fs::write(keg.join("bin/tool"), b"1.0").unwrap();
+        p.write_receipt(
+            &keg,
+            &[
+                ("name", "demo"),
+                ("version", "1.0"),
+                ("installed_by", "abrew"),
+            ],
+        )
+        .unwrap();
+        point_opt(&p, "demo", "1.0").unwrap();
+        link_keg(&p, &keg, false).unwrap();
+        assert!(std::fs::symlink_metadata(p.bin().join("tool")).is_ok());
+
+        unlink_keg(&p, "demo").unwrap();
+        // File links go; the opt version pointer stays, as in brew.
+        assert!(std::fs::symlink_metadata(p.bin().join("tool")).is_err());
+        assert_eq!(std::fs::read_link(p.opt("demo")).unwrap(), keg);
+        assert_eq!(p.optlinked_version("demo").as_deref(), Some("1.0"));
+
+        remove_owned_opt_link(&p, "demo").unwrap();
+        assert!(std::fs::symlink_metadata(p.opt("demo")).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1238,28 +1868,79 @@ mod tests {
                 assert_eq!(output.stdout, b"0.9\n");
             }
         }
-        let (keg, links) = activation_links(&p, "demo", "1.0", false).unwrap();
-        let mut first = None;
-        let error = activate_keg_with(&p, &keg, &links, true, |link| {
-            if let Some(path) = &first {
-                std::fs::remove_file(path).unwrap();
-                std::fs::write(path, b"foreign replacement").unwrap();
-                return Err("injected replacement".to_string());
+        // A foreign file or link put where a placed link was survives the rollback, even
+        // when the file system hands it the placed link's inode number (ext4 does).
+        let foreign_target = tmp.path().join("foreign-target");
+        for foreign_link in [false, true] {
+            let (keg, links) = activation_links(&p, "demo", "1.0", false).unwrap();
+            let mut first: Option<PathBuf> = None;
+            let error = activate_keg_with(&p, &keg, &links, true, |link| {
+                if let Some(path) = &first {
+                    std::fs::remove_file(path).unwrap();
+                    if foreign_link {
+                        symlink_file(&foreign_target, path).unwrap();
+                    } else {
+                        std::fs::write(path, b"foreign replacement").unwrap();
+                    }
+                    return Err("injected replacement".to_string());
+                }
+                symlink_dir(&link.source, &link.destination)?;
+                first = Some(link.destination.clone());
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, InstallError::Failed(ref message) if message.contains("could not restore aliases")),
+                "foreign_link={foreign_link}: {error:?}"
+            );
+            let path = first.unwrap();
+            if foreign_link {
+                assert_eq!(std::fs::read_link(&path).unwrap(), foreign_target);
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
             }
-            symlink_dir(&link.source, &link.destination)?;
-            first = Some(link.destination.clone());
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(
-            matches!(error, InstallError::Failed(ref message) if message.contains("could not restore aliases"))
-        );
-        let path = first.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
-        assert_eq!(std::fs::read_link(p.opt("demo")).unwrap(), old);
-        std::fs::remove_file(&path).unwrap();
-        let old_target = old.join("bin").join(path.file_name().unwrap());
-        symlink_file(&old_target, &path).unwrap();
+            assert_eq!(std::fs::read_link(p.opt("demo")).unwrap(), old);
+            std::fs::remove_file(&path).unwrap();
+            let old_target = old.join("bin").join(path.file_name().unwrap());
+            symlink_file(&old_target, &path).unwrap();
+        }
+        // A foreign file or link put where an admitted link was, after the snapshot and
+        // before activation reaches it, is refused and survives, even on the admitted
+        // link's inode number. The rollback puts back what activation had replaced.
+        let (run, tool) = (p.bin().join("run"), p.bin().join("tool"));
+        for foreign_link in [false, true] {
+            let (keg, links) = activation_links(&p, "demo", "1.0", false).unwrap();
+            let error = activate_keg_with(&p, &keg, &links, false, |link| {
+                symlink_dir(&link.source, &link.destination)?;
+                if link.destination == run {
+                    std::fs::remove_file(&tool).unwrap();
+                    if foreign_link {
+                        symlink_file(&foreign_target, &tool).unwrap();
+                    } else {
+                        std::fs::write(&tool, b"foreign replacement").unwrap();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(
+                error,
+                InstallError::Failed(format!(
+                    "abrew: link changed before activation: {}",
+                    tool.display()
+                )),
+                "foreign_link={foreign_link}"
+            );
+            if foreign_link {
+                assert_eq!(std::fs::read_link(&tool).unwrap(), foreign_target);
+            } else {
+                assert_eq!(std::fs::read(&tool).unwrap(), b"foreign replacement");
+            }
+            assert_eq!(std::fs::read_link(&run).unwrap(), old.join("bin/run"));
+            assert_eq!(std::fs::read_link(p.opt("demo")).unwrap(), old);
+            std::fs::remove_file(&tool).unwrap();
+            symlink_file(&old.join("bin/tool"), &tool).unwrap();
+        }
         point_opt(&p, "demo", "1.0").unwrap();
         assert_eq!(std::fs::read_link(p.opt("demo")).unwrap(), new);
         std::fs::remove_file(p.opt("demo")).unwrap();
@@ -1315,11 +1996,57 @@ mod tests {
             assert!(link_keg(&p, &bad, true).is_err(), "{bad:?}");
         }
         assert!(unlink_keg(&p, "..").is_err());
+        // Dangling-link recovery: a dead link into a missing keg
+        // is removed; a live link and a foreign dangling link stay.
+        let dead = p.bin().join("deadtool");
+        symlink_dir(&p.keg("gone", "1.0").join("bin/deadtool"), &dead).unwrap();
+        let foreign = p.bin().join("foreigntool");
+        symlink_dir(Path::new("/nonexistent/foreigntool"), &foreign).unwrap();
+        assert_eq!(remove_dangling_links(&p, "gone").unwrap(), 1);
+        assert!(std::fs::symlink_metadata(&dead).is_err());
+        assert!(std::fs::symlink_metadata(&foreign).is_ok());
+        assert_eq!(remove_dangling_links(&p, "gone").unwrap(), 0);
+        assert!(remove_dangling_links(&p, "..").is_err());
         let alias = p.keg("alias", "1.0");
         std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
         symlink_dir(&new, &alias).unwrap();
         assert!(link_keg(&p, &alias, true).is_err());
         assert_eq!(std::fs::read(p.bin().join("tool")).unwrap(), b"1.0");
+    }
+
+    /// An entry of another kind is never the entry an identity was read from, even
+    /// on that entry's inode number, which ext4 hands to the next entry made: a file
+    /// where an admitted link was, or a link where a cask's directory was, is a
+    /// change for every caller (cask's parents and payloads, the prefix's ancestor
+    /// chain), whether or not the caller also compares a link's target.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_of_another_kind_is_not_the_same_path_identity() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let path = tmp.path().join("entry");
+        let make = |kind: &str| match kind {
+            "link" => symlink_dir(&target, &path).unwrap(),
+            "file" => std::fs::write(&path, b"foreign bytes").unwrap(),
+            _ => std::fs::create_dir(&path).unwrap(),
+        };
+        let remove = |kind: &str| match kind {
+            "directory" => std::fs::remove_dir(&path).unwrap(),
+            _ => std::fs::remove_file(&path).unwrap(),
+        };
+        for (was, now) in [("link", "file"), ("directory", "link"), ("file", "link")] {
+            make(was);
+            let identity = std::fs::symlink_metadata(&path).unwrap();
+            assert!(same_path_identity(&path, &identity), "an untouched {was}");
+            remove(was);
+            make(now);
+            assert!(
+                !same_path_identity(&path, &identity),
+                "a {now} where a {was} was"
+            );
+            remove(now);
+        }
     }
 
     fn cache_formula(
@@ -1381,7 +2108,21 @@ mod tests {
         );
 
         // Replacement refuses before touching the working keg or links.
-        cache_formula(&prefix, 3, &url, &sha, ":any_skip_relocation", &[]);
+        let archive3 = tmp.path().join("demo3.tar.gz");
+        std::fs::write(
+            &archive3,
+            gzip_bytes(&tar_bytes(&[(
+                "demo/1.0_3/bin/demo",
+                b'0',
+                "",
+                b"#!/bin/sh\nprintf 'ready3\\n'\n",
+                0o755,
+            )])),
+        )
+        .unwrap();
+        let url3 = format!("file://{}", archive3.display());
+        let sha3 = fetch::sha256_file(&archive3).unwrap();
+        cache_formula(&prefix, 3, &url3, &sha3, ":any_skip_relocation", &[]);
         assert!(matches!(
             install(&api, &prefix, "demo", &InstallOpts::default()),
             Err(InstallError::PassThrough(_))
@@ -1405,6 +2146,60 @@ mod tests {
                 .stdout,
             b"ready\n"
         );
+        // The same replacement IS admitted as an upgrade.
+        assert_eq!(
+            install(
+                &api,
+                &prefix,
+                "demo",
+                &InstallOpts {
+                    upgrade: true,
+                    ..InstallOpts::default()
+                }
+            )
+            .unwrap(),
+            "1.0_3"
+        );
+        assert_eq!(
+            prefix.installed_one(Kind::Formula, "demo").unwrap().version,
+            "1.0_3"
+        );
+        assert_eq!(
+            aterm_uds::spawnfd::command(prefix.bin().join("demo"))
+                .output()
+                .unwrap()
+                .stdout,
+            b"ready3\n"
+        );
+        // A same-version reinstall swaps the keg in place and leaves
+        // no aside behind; a plain forced install still delegates.
+        assert_eq!(
+            install(
+                &api,
+                &prefix,
+                "demo",
+                &InstallOpts {
+                    force: true,
+                    reinstall: true,
+                    ..InstallOpts::default()
+                }
+            )
+            .unwrap(),
+            "1.0_3"
+        );
+        assert_eq!(
+            aterm_uds::spawnfd::command(prefix.bin().join("demo"))
+                .output()
+                .unwrap()
+                .stdout,
+            b"ready3\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(prefix.cellar().join(".abrew-reinstall-demo-1.0_3")).is_err()
+        );
+        // Restore the 1.0_2 working keg's link expectations below by
+        // pointing the census back: the foreign-link checks use 1.0_2,
+        // which still exists beside 1.0_3.
 
         let foreign = prefix.keg("demo", "personal");
         std::fs::create_dir_all(&foreign).unwrap();
@@ -1492,7 +2287,7 @@ mod tests {
         std::fs::remove_file(&links[1].destination).unwrap();
 
         let mut calls = 0;
-        let error = publish_payload_with(&prefix, &staged, &live, &links, |link| {
+        let error = publish_payload_with(&prefix, &staged, &live, &links, None, None, |link| {
             calls += 1;
             assert!(
                 prefix.installed(Kind::Formula).is_empty(),
@@ -1525,6 +2320,219 @@ mod tests {
             "1"
         );
         assert_eq!(std::fs::read(&links[0].destination).unwrap(), b"a");
+
+        let next = prefix.keg("demo", "2");
+        let upgrade = tmp.path().join("upgrade");
+        std::fs::create_dir(&upgrade).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(upgrade.join(name), b"new").unwrap();
+        }
+        let next_receipt = [
+            ("name", "demo"),
+            ("version", "2"),
+            ("installed_by", "abrew"),
+        ];
+        prefix.write_receipt(&upgrade, &next_receipt).unwrap();
+        let next_links: Vec<_> = links
+            .iter()
+            .map(|link| InstallLink {
+                source: next.join(link.source.file_name().unwrap()),
+                destination: link.destination.clone(),
+                directory: false,
+            })
+            .collect();
+        let root = prefix.cellar().join("demo");
+        let personal = root.join("personal");
+        std::fs::create_dir(&personal).unwrap();
+        std::fs::write(personal.join("b"), b"personal").unwrap();
+        std::fs::remove_file(&links[1].destination).unwrap();
+        symlink_file(&personal.join("b"), &links[1].destination).unwrap();
+        assert!(publish_payload_replacing(&prefix, &upgrade, &next, &next_links, &root).is_err());
+        assert!(!next.exists());
+        assert_eq!(std::fs::read(&links[1].destination).unwrap(), b"personal");
+        std::fs::remove_file(&links[1].destination).unwrap();
+        symlink_file(&links[1].source, &links[1].destination).unwrap();
+
+        // A later destination changes after admission, while its original inode
+        // stays alive at another name. Refuse it and restore only our own edit.
+        let saved = tmp.path().join("saved-link");
+        let mut calls = 0;
+        assert!(
+            publish_payload_with(
+                &prefix,
+                &upgrade,
+                &next,
+                &next_links,
+                Some(&root),
+                None,
+                |link| {
+                    calls += 1;
+                    symlink_file(&link.source, &link.destination)?;
+                    if calls == 1 {
+                        std::fs::rename(&links[1].destination, &saved).unwrap();
+                        std::fs::write(&links[1].destination, b"replacement owner").unwrap();
+                    }
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            std::fs::read(&links[1].destination).unwrap(),
+            b"replacement owner"
+        );
+        assert_eq!(
+            std::fs::read_link(&links[0].destination).unwrap(),
+            links[0].source
+        );
+        assert!(live.exists());
+        assert!(!next.exists());
+        std::fs::remove_file(&links[1].destination).unwrap();
+        std::fs::rename(saved, &links[1].destination).unwrap();
+        prefix.write_receipt(&upgrade, &next_receipt).unwrap();
+        publish_payload_replacing(&prefix, &upgrade, &next, &next_links, &root).unwrap();
+        assert_eq!(std::fs::read(&links[0].destination).unwrap(), b"new");
+        assert!(live.exists(), "upgrades retain the preceding version");
+        assert_eq!(
+            prefix.installed_one(Kind::Formula, "demo").unwrap().version,
+            "2"
+        );
+
+        let reinstall = tmp.path().join("reinstall");
+        std::fs::create_dir(&reinstall).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(reinstall.join(name), b"reinstalled").unwrap();
+        }
+        prefix.write_receipt(&reinstall, &next_receipt).unwrap();
+        let saved_receipt = std::fs::read(next.join("INSTALL_RECEIPT.json")).unwrap();
+        let mut calls = 0;
+        assert!(
+            reinstall_payload_with(&prefix, &reinstall, &next, &next_links, &root, |link| {
+                calls += 1;
+                if calls == 2 {
+                    return Err("injected reinstall refusal".to_string());
+                }
+                symlink_file(&link.source, &link.destination)
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            std::fs::read(next.join("INSTALL_RECEIPT.json")).unwrap(),
+            saved_receipt
+        );
+        for link in &next_links {
+            assert_eq!(std::fs::read_link(&link.destination).unwrap(), link.source);
+            assert_eq!(std::fs::read(&link.destination).unwrap(), b"new");
+        }
+        prefix.write_receipt(&reinstall, &next_receipt).unwrap();
+        reinstall_payload_with(&prefix, &reinstall, &next, &next_links, &root, |link| {
+            symlink_file(&link.source, &link.destination)
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&next_links[0].destination).unwrap(),
+            b"reinstalled"
+        );
+        assert!(live.exists());
+        assert_eq!(std::fs::read(personal.join("b")).unwrap(), b"personal");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_cask_versions_with_commas_reinstall_through_the_saved_receipt() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let prefix = Prefix::at(tmp.path());
+        prefix.ensure().unwrap();
+        let version = "4.2.1,20260531.1";
+        let live = prefix.cask_dir("demo", version);
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("tool"), b"old cask").unwrap();
+        let receipt = [
+            ("token", "demo"),
+            ("version", version),
+            ("installed_by", "abrew"),
+        ];
+        prefix.write_receipt(&live, &receipt).unwrap();
+        let links = [InstallLink {
+            source: live.join("tool"),
+            destination: prefix.bin().join("demo"),
+            directory: false,
+        }];
+        symlink_file(&links[0].source, &links[0].destination).unwrap();
+        let root = prefix.caskroom().join("demo");
+        assert!(replacement_target_owned(
+            &prefix,
+            &links[0].destination,
+            &links[0].source,
+            &root
+        ));
+        let stage = tmp.path().join("stage");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("tool"), b"new cask").unwrap();
+        prefix.write_receipt(&stage, &receipt).unwrap();
+        publish_payload_reinstall(&prefix, &stage, &live, &links, &root).unwrap();
+        assert_eq!(std::fs::read(&links[0].destination).unwrap(), b"new cask");
+        assert!(super::super::prefix::owned_receipt(
+            &live,
+            Kind::Cask,
+            "demo",
+            version
+        ));
+    }
+
+    #[test]
+    fn upgrade_request_inputs_preserve_roots_and_refuse_unknown_status() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let prefix = Prefix::at(tmp.path());
+        for (name, requested) in [("app", "true"), ("dep", "false")] {
+            let keg = prefix.keg(name, "1");
+            std::fs::create_dir_all(&keg).unwrap();
+            prefix
+                .write_receipt(
+                    &keg,
+                    &[
+                        ("name", name),
+                        ("version", "1"),
+                        ("installed_by", "abrew"),
+                        ("installed_on_request", requested),
+                    ],
+                )
+                .unwrap();
+        }
+        let prior = prior_requests(&prefix, ["app", "dep", "new"].into_iter()).unwrap();
+        assert_eq!(prior.get("app"), Some(&true));
+        assert_eq!(prior.get("dep"), Some(&false));
+        assert!(!prior.contains_key("new"));
+        let old = prefix.keg("dep", "0");
+        std::fs::create_dir(&old).unwrap();
+        prefix
+            .write_receipt(
+                &old,
+                &[
+                    ("name", "dep"),
+                    ("version", "0"),
+                    ("installed_by", "abrew"),
+                    ("installed_on_request", "true"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            prior_requests(&prefix, ["dep"].into_iter())
+                .unwrap()
+                .get("dep"),
+            Some(&true)
+        );
+        prefix
+            .write_receipt(
+                &old,
+                &[("name", "dep"), ("version", "0"), ("installed_by", "abrew")],
+            )
+            .unwrap();
+        assert!(prior_requests(&prefix, ["dep"].into_iter()).is_err());
+        assert!(prefix.keg("dep", "1").exists());
+        assert!(old.exists());
     }
 
     #[test]

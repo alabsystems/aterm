@@ -10,10 +10,13 @@
 //! went out under text that stayed, which must be `0`. Each family sweeps a grid at
 //! the host seam of `tests/trail_host/mod.rs`; a debug build runs its spine.
 //!
+//! A scroll's own frame feeds its rows to the follow pass and the hand's seam alone
+//! (`CursorGlow::scroll_rows`), so a box redrawn under a scroll keeps its band on
+//! the frame it is drawn, the scroll's carry below where the scroll put its light
+//! (`Witness::scroll_carry`) included.
+//!
 //! Stated limits (`trail_host::holds_but`):
 //!
-//! * a frame that scrolls samples nothing, so a box redrawn under a scroll on every
-//!   frame is never seen standing;
 //! * a line the hand left moved two rows is followed only when that row is sampled
 //!   (`a_waiting_key_s_arming_rows_have_slots_of_their_own` in `rainbow_kitty/mod.rs`);
 //! * a line the hand left is on its retract, and a band that followed its text
@@ -1583,7 +1586,7 @@ mod b3 {
         }
         for frame_ms in [16u64, 8] {
             for every in [1u32, 2, 3] {
-                for d in [1usize, 2] {
+                for d in [1usize, 2, 3, 4] {
                     case(
                         v,
                         format!("b3.h4.midscreen_streaming/fr{frame_ms}/every{every}/dr{d}"),
@@ -2230,16 +2233,17 @@ fn a_multi_line_inline_box_pushed_by_streamed_rows_follows() {
 }
 
 /// An inline box at the screen's bottom re-laid under one or two streamed rows
-/// every one to three frames, and one mid-screen pushed down one or two rows. Limit:
-/// the bottom box streamed under on every frame, where every frame scrolls and so
-/// samples nothing, and the box is never seen standing.
+/// every one to three frames, and one mid-screen pushed down one to four rows. The
+/// bottom box streamed under on every frame is followed on every frame: each
+/// scroll's frame feeds the follow pass (`CursorGlow::scroll_rows`), which finds
+/// the box the scroll's rows below where the scroll put its light. A push of three
+/// or four rows is past the follow offsets, and the caret that moved with the box
+/// says how far (`Witness::carry_caret`).
 #[test]
 fn a_box_under_streaming_output_keeps_its_band() {
-    holds_but(
-        all_cases(),
-        |id| id.starts_with("b3.h3.") || id.starts_with("b3.h4."),
-        |id| id.starts_with("b3.h3.") && id.contains("/every1/"),
-    );
+    holds_where(all_cases(), |id| {
+        id.starts_with("b3.h3.") || id.starts_with("b3.h4.")
+    });
 }
 
 /// An unbracketed program draws a line's new row one to three sampled frames before
@@ -2305,15 +2309,14 @@ fn a_tall_lit_prompt_moved_carries_every_line_it_can() {
 /// `git status`, `make test` typed under the identical previous command (directly
 /// above, or two rows above with output between), pushed down one to three rows by a
 /// job notice. With the twin directly above, the whole text stands one row up and is
-/// refused (none of it arrived): a twin testifies only about its own row. Limit: a
-/// three-row push lands past the follow offsets (`±1`, `±2`).
+/// refused (none of it arrived): a twin testifies only about its own row. A three-row
+/// push, past the follow offsets (`±1`, `±2`), follows the caret that moved with the
+/// line (`Witness::carry_caret`).
 #[test]
 fn a_line_under_an_identical_command_pushed_down_by_a_notice_follows() {
-    holds_but(
-        all_cases(),
-        |id| id.starts_with("d4.t6b.") || id.starts_with("d4.t6."),
-        |id| id.contains("/rows3/"),
-    );
+    holds_where(all_cases(), |id| {
+        id.starts_with("d4.t6b.") || id.starts_with("d4.t6.")
+    });
 }
 
 /// The tear, in ms, of `id`'s `/torn<n>` segment.
@@ -2332,22 +2335,17 @@ fn scroll_tear_read_as_copy(id: &str) -> u64 {
 /// newline at the bottom, the line redrawn on the new last row in the same write,
 /// the scrolled original erased then or 8–100 ms later. Past `TWIN_MIN` it is the
 /// re-echoed command line of `tests/copies_are_not_moves.rs`'s
-/// `L3.copy.copy_on_new_last_row_by_scroll`, which must not follow. Limits: tears
-/// from [`scroll_tear_read_as_copy`] on the flat trains and the pet's pacing; and the
-/// one-write relocation under the no-pet pacing, where the scroll's frame samples
-/// nothing and no frame comes within the 40 ms the case waits.
+/// `L3.copy.copy_on_new_last_row_by_scroll`, which must not follow. The one-write
+/// relocation follows on the scroll's own frame, whose rows feed the follow pass
+/// (`CursorGlow::scroll_rows`), so it follows under the no-pet pacing too, where no
+/// later frame comes within the 40 ms the case waits. Limits: tears from
+/// [`scroll_tear_read_as_copy`] on the flat trains and the pet's pacing.
 #[test]
 fn a_line_relocated_by_a_scroll_follows_until_its_new_row_has_stood_twin_min() {
     holds_but(
         all_cases(),
         |id| id.starts_with("d4.t3."),
-        |id| {
-            if id.contains("/paced/") {
-                torn_of(id) == 0
-            } else {
-                torn_of(id) >= scroll_tear_read_as_copy(id)
-            }
-        },
+        |id| !id.contains("/paced/") && torn_of(id) >= scroll_tear_read_as_copy(id),
     );
 }
 
@@ -2365,7 +2363,8 @@ fn tear_read_as_copy(id: &str) -> u64 {
 /// stood `TWIN_MIN` on two sampled frames is a twin, as with fzf's late list
 /// (`tests/copies_are_not_moves.rs`), and the move melts. A one-row relocation, or
 /// two rows onto the caret's row, melts from [`tear_read_as_copy`]; after a 200 ms
-/// pause under the no-pet pacing (idle frames 110–130 ms apart) from 120 ms. A
+/// pause under the GUI's pacing (idle frames 110–130 ms apart), with the pet or
+/// without it (a pet at rest asks for no frames), from 120 ms. A
 /// two-row relocation onto an unnamed row is never sampled between and follows.
 /// Claude Code and Codex bracket their frames and never tear; live torn reads last
 /// 2–30 ms.
@@ -2381,7 +2380,9 @@ fn the_limit_a_torn_relocation_whose_new_row_stood_twin_min_is_a_copy() {
         |id| {
             let seen_between =
                 id.contains("/10-9/") || id.contains("/10-11/") || id.starts_with("d4.t1c.");
-            let threshold = if id.starts_with("d4.t1.torn_move/paced/") {
+            let threshold = if id.starts_with("d4.t1.torn_move/paced/")
+                || id.starts_with("d4.t1.torn_move/pet/")
+            {
                 120
             } else {
                 tear_read_as_copy(id)
@@ -2412,15 +2413,17 @@ fn stand_of(id: &str) -> u64 {
 /// The limit: a move onto a row a copy stood on for `TWIN_MIN` melts, because a twin
 /// is sticky (`Seen::twin`). `hello world` on row 10; a copy on row 11 erased `stand`
 /// ms later; 200 ms on, the line relocated onto row 11 in one write. Melts from
-/// [`tear_read_as_copy`] on the flat trains and the pet's pacing, from
-/// [`STICKY_PACED`] under the no-pet pacing.
+/// [`tear_read_as_copy`] on the flat trains, from [`STICKY_PACED`] under the
+/// GUI's pacing, with the pet or without it: the pet has come to rest beside
+/// the line by then and asks for no frames. (Until 2026-10-20 the pet was still
+/// on its feet and the pet's pacing melted from [`tear_read_as_copy`].)
 #[test]
 fn the_limit_a_move_onto_a_row_a_copy_stood_on_for_twin_min_melts() {
     holds_but(
         all_cases(),
         |id| id.starts_with("d4.t8."),
         |id| {
-            let threshold = if id.contains("/paced/") {
+            let threshold = if id.contains("/paced/") || id.contains("/pet/") {
                 STICKY_PACED
             } else {
                 tear_read_as_copy(id)
@@ -2430,6 +2433,6 @@ fn the_limit_a_move_onto_a_row_a_copy_stood_on_for_twin_min_melts() {
     );
 }
 
-/// The sticky-twin limit's threshold under the no-pet pacing: idle frames 110–130 ms
+/// The sticky-twin limit's threshold under the GUI's pacing: idle frames 110–130 ms
 /// apart, so a 100 ms stand follows and a 130 ms one melts.
 const STICKY_PACED: u64 = 130;

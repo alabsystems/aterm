@@ -18,9 +18,13 @@ workspace = true
 # (no feature gate), so a consumer's feature selection cannot change this crate.
 aterm-core = { workspace = true }
 # The wire's percent escape (`wire::pct_*` re-export it): its one copy lives in
-# this dependency-free leaf so clients that cannot link this crate share it.
+# this leaf (std plus the dependency-free astream-wire, no platform code) so
+# clients that cannot link this crate share it.
 # Already in the graph through aterm-core.
 aterm-codec = { workspace = true }
+# The request grammar (`control_request`): a roster id is addressable exactly
+# when the wire reads it as a stable id. Already in the graph through aterm-core.
+aterm-types = { workspace = true }
 # `hangup`: whether the client of the connection a lane serves has closed it
 # (a zero-timeout poll). Dependency-free, and already in the GUI's graph.
 aterm-uds = { workspace = true }
@@ -30,3 +34,6 @@ aterm-uds = { workspace = true }
 # escaped cwd decodes to the bytes the program sent). Workspace crate; serde is
 # its one dependency, already in the graph.
 aterm-json = { workspace = true }
+# The hang detector `park`'s tests wait under. Already a dev-dependency of the
+# crates above this one.
+aterm-spec = { workspace = true }

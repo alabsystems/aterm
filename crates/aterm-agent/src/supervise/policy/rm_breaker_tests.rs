@@ -1080,48 +1080,41 @@ fn an_unknown_word_forgets_only_where_it_can_name_a_variable() {
 }
 
 /// SHELL_NAMES keeps every name whose assignment does not read back: in zsh
-/// and bash, where installed, each name the shell reports
-/// (`${(k)parameters}`, `compgen -v`) is assigned `/x/y` in a subshell and
-/// read back.
+/// and bash, each name the shell reports (`${(k)parameters}`, `compgen -v`) is
+/// assigned `/x/y` in a subshell and read back. Each lane that runs must find
+/// its own shell's such names (zsh 5.9 reports 70, bash 3.2 reports 19), so a
+/// probe that measures nothing in one shell fails in that lane, whatever the
+/// other found. A shell not installed ends the test COULD NOT RUN once the
+/// other has run ([`Lanes`]).
 #[cfg(unix)]
 #[test]
 fn every_name_whose_assignment_does_not_read_back_is_kept() {
-    let probes = [
+    let mut lanes = Lanes::default();
+    for (shell, probe, floor) in [
         (
             "/bin/zsh",
             "for n in ${(k)parameters}; do [[ $n =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]] || continue; \
              ( eval \"$n=/x/y\" 2>/dev/null; [[ ${(P)n} == /x/y ]] ) 2>/dev/null || print -r -- $n; \
              done",
+            20,
         ),
         (
             "/bin/bash",
             "for n in $(compgen -v); do ( eval \"$n=/x/y\" 2>/dev/null; \
              [ \"${!n}\" = /x/y ] ) 2>/dev/null || echo \"$n\"; done",
+            10,
         ),
-    ];
-    let mut measured = 0;
-    for (shell, probe) in probes {
-        if !Path::new(shell).exists() {
+    ] {
+        let Some((out, _)) = lanes.run(shell, probe) else {
             continue;
-        }
-        let out = aterm_uds::spawnfd::command(shell)
-            .args(no_startup(shell, probe))
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .expect("the shell runs");
-        let kept: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .filter(|n| !shell_name(n))
-            .collect();
+        };
+        let names: Vec<&str> = out.lines().collect();
+        let kept: Vec<&str> = names.iter().copied().filter(|n| !shell_name(n)).collect();
         assert!(kept.is_empty(), "{shell}: not in SHELL_NAMES: {kept:?}");
-        measured += String::from_utf8_lossy(&out.stdout).lines().count();
-    }
-    if Path::new("/bin/zsh").exists() {
         assert!(
-            measured > 20,
-            "the probe found the shell's own names ({measured})"
+            names.len() > floor,
+            "{shell}: the probe found the shell's own names ({})",
+            names.len()
         );
     }
 }
@@ -1137,22 +1130,62 @@ fn no_startup<'a>(shell: &str, line: &'a str) -> Vec<&'a str> {
     }
 }
 
-/// `line` in `shell` when it is installed, in a temp dir of the test's own,
-/// no startup file read, stdin closed: its stdout, trimmed.
-fn in_shell(shell: &str, line: &str) -> Option<String> {
-    if !Path::new(shell).exists() {
-        return None;
+/// `line` in installed `shell`, in `dir`, no startup file read, stdin closed,
+/// under the one-minute hang detector.
+fn run_shell(shell: &str, line: &str, dir: &Path) -> std::process::Output {
+    aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command(shell)
+            .args(no_startup(shell, line))
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin"),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("{shell} within the hang detector: {e}"))
+}
+
+/// `line` in `shell`, in a temp dir of the test's own, no startup file read,
+/// stdin closed: its stdout, trimmed. For a test whose one shell this is: where
+/// `shell` is not installed the test ends COULD NOT RUN here. A test that reads
+/// a line in both shells asks [`Lanes`].
+fn in_shell(shell: &str, line: &str) -> String {
+    let (out, _) = in_shell_both(shell, line);
+    out.trim().to_string()
+}
+
+/// The shells a test reads its lines in, and the ones this host lacks: each lane
+/// the host has runs, and the test then ends COULD NOT RUN naming the missing one
+/// (the rule of every multi-shell test, `aterm_spec::host::could_not_run_without`'s),
+/// so a bash defect still FAILS on a host without zsh. The end is in `Drop`, so no
+/// test that asks here can forget it; a test already failing keeps its own message.
+#[derive(Default)]
+struct Lanes {
+    absent: Vec<&'static str>,
+}
+
+impl Lanes {
+    /// `line` in `shell` as [`in_shell_both`] runs it, or `None`, noted, where
+    /// `shell` is not installed.
+    fn run(&mut self, shell: &'static str, line: &str) -> Option<(String, String)> {
+        if Path::new(shell).exists() {
+            return Some(in_shell_both(shell, line));
+        }
+        if !self.absent.contains(&shell) {
+            self.absent.push(shell);
+        }
+        None
     }
-    let t = TempTree::new("shell");
-    let out = aterm_uds::spawnfd::command(shell)
-        .args(no_startup(shell, line))
-        .current_dir(t.0.path())
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+impl Drop for Lanes {
+    fn drop(&mut self) {
+        if !self.absent.is_empty() && !std::thread::panicking() {
+            aterm_spec::host::could_not_run(format!(
+                "no {} here, so that lane did not run",
+                self.absent.join(" or ")
+            ));
+        }
+    }
 }
 
 /// A [`PLAIN_CONSUMERS`] command assigns no variable, so its words name nothing
@@ -1233,6 +1266,7 @@ fn a_command_that_can_assign_what_it_names_is_no_plain_consumer() {
     // Each builtin member, handed words a builtin could take as a name, an
     // option's name or arithmetic, leaves `S` as it was. External members
     // cannot touch the shell's variables; they are not run.
+    let mut lanes = Lanes::default();
     for member in PLAIN_CONSUMERS {
         let zsh = format!(
             "S=/x/y; if [[ $(whence -w -- '{member}') == *': builtin' ]]; then \
@@ -1243,8 +1277,8 @@ fn a_command_that_can_assign_what_it_names_is_no_plain_consumer() {
              '{member}' S -v S -A S S=5 -t 'a[S=5]' >/dev/null 2>&1; fi; echo \"$S\""
         );
         for (sh, line) in [("/bin/zsh", zsh), ("/bin/bash", bash)] {
-            if let Some(out) = in_shell(sh, &line) {
-                assert_eq!(out, "/x/y", "{sh}: {member}");
+            if let Some((out, _)) = lanes.run(sh, &line) {
+                assert_eq!(out.trim(), "/x/y", "{sh}: {member}");
             }
         }
     }
@@ -1280,16 +1314,15 @@ fn a_value_zsh_arithmetic_reads_is_read_too() {
     ] {
         assert_eq!(resolve(cmd), Ok(vec!["/tmp/w/a/x".to_string()]), "{cmd}");
     }
-    if let Some(out) = in_shell(
+    let out = in_shell(
         "/bin/zsh",
         "A=S=5; S=/tmp/w/a; printf %d A >/dev/null 2>&1; B=S=6; printf %d /B >/dev/null \
          2>&1; echo \"$S\"",
-    ) {
-        assert_eq!(
-            out, "5",
-            "zsh reads A's value as arithmetic, and /B not at all"
-        );
-    }
+    );
+    assert_eq!(
+        out, "5",
+        "zsh reads A's value as arithmetic, and /B not at all"
+    );
 }
 
 /// A line with a builtin that changes how later words read, or zsh's `integer`/`float`
@@ -1334,20 +1367,19 @@ fn every_zsh_modifier_letter_is_not_text() {
         .chars()
         .map(|m| format!("(print -r -- \"{m} $S:{m}\") 2>/dev/null; "))
         .collect();
-    if let Some(out) = in_shell("/bin/zsh", &format!("S=/tmp/w/a.b; {probe}")) {
-        let differ: Vec<char> = out
-            .lines()
-            .filter_map(|l| {
-                let (m, v) = l.split_once(' ')?;
-                let m = m.chars().next()?;
-                (v != format!("/tmp/w/a.b:{m}")).then_some(m)
-            })
-            .collect();
-        assert!(differ.len() >= 10, "zsh reads the modifiers: {differ:?}");
-        for m in differ {
-            let cmd = format!("S=/tmp/w/a.b; rm -rf \"$S:{m}\"");
-            assert!(escalates(&cmd).contains("zsh computes"), "{cmd}");
-        }
+    let out = in_shell("/bin/zsh", &format!("S=/tmp/w/a.b; {probe}"));
+    let differ: Vec<char> = out
+        .lines()
+        .filter_map(|l| {
+            let (m, v) = l.split_once(' ')?;
+            let m = m.chars().next()?;
+            (v != format!("/tmp/w/a.b:{m}")).then_some(m)
+        })
+        .collect();
+    assert!(differ.len() >= 10, "zsh reads the modifiers: {differ:?}");
+    for m in differ {
+        let cmd = format!("S=/tmp/w/a.b; rm -rf \"$S:{m}\"");
+        assert!(escalates(&cmd).contains("zsh computes"), "{cmd}");
     }
 }
 
@@ -1470,22 +1502,20 @@ fn a_printf_format_with_no_numeric_conversion_reads_no_arithmetic() {
                  printf 'S=%s' x >/dev/null; printf S=5 >/dev/null; print -r -- \"$S\"; \
                  (printf '%*s' S=5 x >/dev/null 2>&1; print -r -- \"$S\"); \
                  (printf '%.*s' S=6 x >/dev/null 2>&1; print -r -- \"$S\")";
-    if let Some(out) = in_shell("/bin/zsh", probe) {
-        assert_eq!(
-            out, "1\n5\n6",
-            "zsh's printf reads arithmetic only where it says"
-        );
-    }
+    let out = in_shell("/bin/zsh", probe);
+    assert_eq!(
+        out, "1\n5\n6",
+        "zsh's printf reads arithmetic only where it says"
+    );
     let probe = "S=1; printf - %d S=5 >/dev/null 2>&1; print -r -- \"$S\"; \
                  printf -%d S=2 >/dev/null 2>&1; print -r -- \"$S\"; \
                  printf -x%d S=3 >/dev/null 2>&1; print -r -- \"$S\"; \
                  printf -v T -%d S=4 >/dev/null 2>&1; print -r -- \"$S $T\"";
-    if let Some(out) = in_shell("/bin/zsh", probe) {
-        assert_eq!(
-            out, "1\n2\n3\n4 -4",
-            "zsh's printf takes a `-` word other than `-v` as its format"
-        );
-    }
+    let out = in_shell("/bin/zsh", probe);
+    assert_eq!(
+        out, "1\n2\n3\n4 -4",
+        "zsh's printf takes a `-` word other than `-v` as its format"
+    );
 }
 
 /// A program run from disk cannot assign the shell's variables: the classifier's read-only
@@ -1561,18 +1591,17 @@ fn a_named_descriptor_redirect_assigns_its_name() {
     ]);
     let probe = "S=/x; T=/y; U=/z; V=/v; echo hi {S}>/dev/null; ls {T}>/dev/null; \
                  echo '{U}'>/dev/null; echo hi {V} >/dev/null; print -r -- \"$S $T $U $V\"";
-    if let Some(out) = in_shell("/bin/zsh", probe) {
-        // The descriptor is a new one: `echo` still prints to stdout.
-        let f: Vec<&str> = out.lines().last().unwrap_or("").split(' ').collect();
-        assert!(
-            f.len() == 4
-                && [f[0], f[3]]
-                    .iter()
-                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                && f[1..3] == ["/y", "/z"],
-            "zsh stores a builtin's descriptor in S and V, not an external's in T: {out}"
-        );
-    }
+    let out = in_shell("/bin/zsh", probe);
+    // The descriptor is a new one: `echo` still prints to stdout.
+    let f: Vec<&str> = out.lines().last().unwrap_or("").split(' ').collect();
+    assert!(
+        f.len() == 4
+            && [f[0], f[3]]
+                .iter()
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            && f[1..3] == ["/y", "/z"],
+        "zsh stores a builtin's descriptor in S and V, not an external's in T: {out}"
+    );
 }
 
 /// Brace expansion moves the words the rule reads: zsh expands `A=S=5; printf {%d,A}` to
@@ -1605,12 +1634,21 @@ fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
     let probe = "S=1; A=S=5; printf {%d,A} >/dev/null; print -r -- \"$S\"; \
                  S=1; A=S=6; [ {-t,A} ]; print -r -- \"$S\"; \
                  S=1; printf '%s' S={7,8} >/dev/null; print -r -- \"$S\"";
-    if let Some(out) = in_shell("/bin/zsh", probe) {
-        assert_eq!(out, "5\n6\n1", "zsh reads the words brace expansion made");
+    let mut lanes = Lanes::default();
+    if let Some((out, _)) = lanes.run("/bin/zsh", probe) {
+        assert_eq!(
+            out.trim(),
+            "5\n6\n1",
+            "zsh reads the words brace expansion made"
+        );
     }
     let probe = "S=1; printf {-vS,%s} /etc; echo \"$S\"; T=1; printf -{vT,-} /x; echo \"$T\"";
-    if let Some(out) = in_shell("/bin/bash", probe) {
-        assert_eq!(out, "/etc\n/x", "bash's printf -v made by brace expansion");
+    if let Some((out, _)) = lanes.run("/bin/bash", probe) {
+        assert_eq!(
+            out.trim(),
+            "/etc\n/x",
+            "bash's printf -v made by brace expansion"
+        );
     }
 }
 
@@ -1670,11 +1708,16 @@ fn a_dash_format_with_no_numeric_conversion_reads_no_arithmetic() {
     forgets(&["printf '--- %d ---\\n' S=5"]);
     let probe = "S=1; printf '--- %s ---' S=5 >/dev/null 2>&1; printf -%s S=6 >/dev/null 2>&1; \
                  printf '--- %d ---' S=7 >/dev/null 2>&1; echo \"$S\"";
-    if let Some(out) = in_shell("/bin/zsh", probe) {
-        assert_eq!(out, "7", "zsh evaluates only the numeric `-` format");
+    let mut lanes = Lanes::default();
+    if let Some((out, _)) = lanes.run("/bin/zsh", probe) {
+        assert_eq!(out.trim(), "7", "zsh evaluates only the numeric `-` format");
     }
-    if let Some(out) = in_shell("/bin/bash", probe) {
-        assert_eq!(out, "1", "bash assigns nothing for an unknown option");
+    if let Some((out, _)) = lanes.run("/bin/bash", probe) {
+        assert_eq!(
+            out.trim(),
+            "1",
+            "bash assigns nothing for an unknown option"
+        );
     }
 }
 
@@ -1828,12 +1871,13 @@ fn a_quoted_test_operand_names_nothing() {
         "test \"$x\" = \"$y\"",
         "[ -n \"$1\" ]",
     ];
+    let mut lanes = Lanes::default();
     for x in values {
         for y in [values[0], x] {
             for form in forms {
                 let line = format!("S=/x/y; x='{x}'; y='{y}'; set -- '{x}'; {form}; echo \"$S\"");
                 for sh in ["/bin/zsh", "/bin/bash"] {
-                    if let Some((out, err)) = in_shell_both(sh, &line) {
+                    if let Some((out, err)) = lanes.run(sh, &line) {
                         assert_eq!(out.trim(), "/x/y", "{sh}: {line}");
                         assert!(!err.contains("RAN_42"), "{sh}: {line}");
                     }
@@ -1844,23 +1888,16 @@ fn a_quoted_test_operand_names_nothing() {
 }
 
 /// `line` in `shell` as [`in_shell`] runs it: its stdout and its stderr.
-fn in_shell_both(shell: &str, line: &str) -> Option<(String, String)> {
+fn in_shell_both(shell: &str, line: &str) -> (String, String) {
     if !Path::new(shell).exists() {
-        return None;
+        aterm_spec::host::could_not_run(format!("no {shell} here to read the line as it does"));
     }
     let t = TempTree::new("shell");
-    let out = aterm_uds::spawnfd::command(shell)
-        .args(no_startup(shell, line))
-        .current_dir(t.0.path())
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .ok()?;
-    Some((
+    let out = run_shell(shell, line, t.0.path());
+    (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+    )
 }
 
 /// zsh subscripts a special parameter like a name, as arithmetic: after `A=S=0`,

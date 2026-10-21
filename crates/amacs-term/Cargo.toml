@@ -11,7 +11,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Placeholder for the planned amacs client, terminal UI and machine protocol; no implementation yet. See docs/DESIGN-amacs-2026-10-19.md."
+description = "The amacs program: the face decision and the native client that hands a file to the aterm window hosting its tab and waits. The terminal UI and the machine protocol are planned in docs/DESIGN-amacs-2026-10-19.md."
+
+[dependencies]
+# The `edit` request and ticket replies, and the file-URI codec the window
+# decodes: one spelling on both ends.
+amacs = { workspace = true }
+# The `edit` and `await edit` exchanges with the window hosting the tab.
+aterm-ctl = { path = "../aterm-ctl" }
+# The parent process's executable (`for=`), and a verb's answer on stdout.
+aterm-uds = { workspace = true }
+
+[dev-dependencies]
+# Scratch directories for the realpath tests, removed on drop.
+aterm-tempfile = { workspace = true }
 
 [[test]]
 name = "amacs_term_suite"

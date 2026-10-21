@@ -246,7 +246,8 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
         ("RUSTDOC".into(), tc.bin.join("trustdoc").into()),
         (
             "CARGO_TARGET_DIR".into(),
-            out.join("targets").join(program).into(),
+            // Named `*.noindex`: Spotlight skips the build with all it holds.
+            out.join("targets.noindex").join(program).into(),
         ),
     ];
     Ok(Plan {

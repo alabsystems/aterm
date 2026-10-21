@@ -330,3 +330,22 @@ pub(crate) mod conformance;
               not an expect: rustc does not lint a fn the declarative anchors rebuild"
 )]
 fn speculative_sidecar_waivers() {}
+
+/// The speculation is the launched lane's, macOS's alone: elsewhere on unix
+/// [`speculate_layout`] is built only for tests, and its anchor with it, while
+/// [`seal_layout`] binds the machine's other actions. Without this a Linux build's
+/// registry left `Speculate` neither bound nor waived (aterm-models'
+/// `spec_xref_closure`, obligation 3, in the Linux lane on 2026-10-20).
+#[cfg(all(debug_assertions, not(test), unix, not(target_os = "macos")))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "native_update_speculative_sidecar",
+    action = "Speculate",
+    reason = "The speculative write is the launched lane's, macOS's alone; here no code \
+              writes the sidecar before the park, and `seal_layout` writes it at the park."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waiver above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn speculate_is_macos_only() {}

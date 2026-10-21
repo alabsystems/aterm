@@ -34,11 +34,6 @@ aterm-tempfile.workspace = true
 # missing tool) ends COULD NOT RUN, never a silent pass.
 aterm-spec = { workspace = true }
 
-# `libc::geteuid` in the unix bundle-walk test, which runs on Linux too, where
-# the library itself needs no libc.
-[target.'cfg(unix)'.dev-dependencies]
-libc = { workspace = true }
-
 [lints]
 workspace = true
 

@@ -18,6 +18,10 @@ autotests = false
 test = false
 doctest = false
 
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
 [dependencies]
 aterm-spec.workspace = true
 

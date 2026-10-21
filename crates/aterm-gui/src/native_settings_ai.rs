@@ -33,7 +33,7 @@
 //! again), Search and Modified behave as on every page; the preferred CLI's
 //! row opens the ordinary choice picker, which takes the page while open.
 
-use super::harness_page::{CARD_GAP, CARD_PAD, metadata_cards, row_cards};
+use super::harness_page::{CARD_GAP, metadata_cards, row_cards};
 use super::*;
 use crate::ai_screen::{AiAct, AiCliRow, AiProjection};
 use crate::native_app::HarnessRequest;
@@ -217,6 +217,7 @@ pub(super) fn ai_page(
     let maximum = PageLayout::Form.maximum(width);
     let page_width = settings_page_content_width(viewport.width, width, maximum);
     let (heading, heading_height) = pinned_heading(
+        state,
         width,
         viewport,
         gap,
@@ -256,7 +257,14 @@ fn ai_choice_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         }
     }
     let gap = settings_page_gap(state, width, cx.viewport);
-    let (mut out, _) = pinned_heading(width, cx.viewport, gap, SettingsRoute::Ai.label(), "");
+    let (mut out, _) = pinned_heading(
+        state,
+        width,
+        cx.viewport,
+        gap,
+        SettingsRoute::Ai.label(),
+        "",
+    );
     let picker = choice_picker_node(state, width, cx.viewport, &out);
     out.extend(picker);
     out
@@ -271,9 +279,9 @@ fn ai_cards(
     card_width: f32,
     room: f32,
 ) -> Vec<(UiNode, f32)> {
-    let inner = (card_width - 2.0 * CARD_PAD).max(0.0);
-    let label_width = about_metadata_label_width();
-    let value_width = (inner - label_width - ABOUT_METADATA_ROW_GAP).max(0.0);
+    let inner = card_text_width(card_width);
+    // Each fact card its own label column ([`fact_label_width`]).
+    let label_width = |rows: &[(String, String)]| fact_label_width(rows, inner);
     // What one row of a continued card may take: the room under its heading,
     // at the tight padding.
     let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
@@ -306,8 +314,8 @@ fn ai_cards(
         "ai/reviews",
         ("WHO REVIEWS", "WHO"),
         &ai.review_rows,
-        inner,
-        (value_width, label_width),
+        card_width,
+        label_width(&ai.review_rows),
     ));
     cards.push(open_config_button(
         AI_OPEN_REVIEWS,
@@ -325,8 +333,8 @@ fn ai_cards(
         "ai/fleet",
         ("WHAT IS HELD", "HELD"),
         &ai.fleet_rows,
-        inner,
-        (value_width, label_width),
+        card_width,
+        label_width(&ai.fleet_rows),
     ));
     cards.push(fleet_actions(ai, card_width));
     cards
@@ -448,24 +456,16 @@ fn cli_rows(
     rows
 }
 
-/// One quiet line of text, fitted to `width` (its node carries it whole).
+/// A quiet line of text, wrapped to `width` where one line cannot hold it,
+/// never cut ([`wrapped_words_node`]): "Claude Code, Codex CLI, Antigra…"
+/// was all a narrow page said of who needs you.
 fn quiet_line(key: &str, text: &str, width: f32) -> (UiNode, f32) {
-    let height = 22.0_f32.max(18.0 * settings_text_scale());
-    (
-        UiNode::new(
-            key,
-            UiContent::Text(TextSpec {
-                text: crate::native_ui::fit_native_text_label(text, width),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        ),
-        height,
+    wrapped_words_node(
+        key,
+        text,
+        (SemanticRole::Status, StyleRef::Quiet),
+        width,
+        22.0_f32.max(18.0 * settings_text_scale()),
     )
 }
 
@@ -544,20 +544,66 @@ fn cli_status_row(row: &AiCliRow, width: SettingsWidth, inner: f32) -> (UiNode, 
         )
         .paint_only()
     };
-    let title = text(
-        "title",
-        crate::native_ui::fit_native_text_label(&row.title, text_width),
-        SemanticRole::Text,
-        StyleRef::Primary,
-        title_height,
-    );
-    let detail = text(
-        "detail",
-        crate::native_ui::fit_native_status_label(&row.detail, text_width),
-        SemanticRole::Status,
-        StyleRef::Quiet,
-        detail_height,
-    );
+    // The name and version, and whether it is the preferred one: whole on
+    // one line where it fits; on a stacked row wrapped to the column; beside
+    // a button, the facts after the name dropped at a " · " joint before the
+    // name itself is cut ("Claude Code · p…").
+    let (title, title_height) = if compact {
+        wrapped_words_node(
+            &format!("{key}/title"),
+            &row.title,
+            (SemanticRole::Text, StyleRef::Primary),
+            text_width,
+            title_height,
+        )
+    } else {
+        let (px, face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+        let fits = |line: &str| {
+            crate::tray_raster::ui_text_width_for(face, line, px)
+                <= text_width + crate::native_ui::TEXT_FIT_SLACK
+        };
+        let parts = row.title.split(FACT_SEPARATOR).collect::<Vec<_>>();
+        let words = (1..=parts.len())
+            .rev()
+            .map(|kept| parts[..kept].join(FACT_SEPARATOR))
+            .find(|words| fits(words))
+            .unwrap_or_else(|| crate::native_ui::fit_native_text_label(&row.title, text_width));
+        (
+            text(
+                "title",
+                words,
+                SemanticRole::Text,
+                StyleRef::Primary,
+                title_height,
+            ),
+            title_height,
+        )
+    };
+    let title = title.paint_only();
+    // A stacked row's detail wraps to the column, whole, a path at its
+    // folders; a one-line row's is cut honestly ([`fit_keeping_path_tail`]).
+    let (detail, detail_height) = if compact {
+        let (node, height) = wrapped_words_node(
+            &format!("{key}/detail"),
+            &row.detail,
+            (SemanticRole::Status, StyleRef::Quiet),
+            text_width,
+            detail_height,
+        );
+        (node.paint_only(), height)
+    } else {
+        (
+            text(
+                "detail",
+                fit_keeping_path_tail(&row.detail, row.path.as_deref(), text_width),
+                SemanticRole::Status,
+                StyleRef::Quiet,
+                detail_height,
+            ),
+            detail_height,
+        )
+    };
     let label = format!("{}: {}", row.title, row.detail);
     if compact {
         let mut children = vec![title, detail];
@@ -610,6 +656,116 @@ fn cli_status_row(row: &AiCliRow, width: SettingsWidth, inner: f32) -> (UiNode, 
     )
 }
 
+/// A CLI'S DETAIL LINE, ONE LINE, CUT HONESTLY (item A5 of the round-9
+/// narrow sweep): `text` whole where it fits `width` in the quiet status type
+/// it paints in; else, where it names `path` (a copy aterm does not manage,
+/// [`crate::ai_screen::AiCli::path`]), the path cut in its middle, its tail
+/// kept — the binary's name and its folder (`/Users/…/bin/claude`, then
+/// `…/bin/claude`) — the words around it whole; else the words before the
+/// path cut at a word, then the path's tail; and never the path's last
+/// component cut. A line with no path is cut at a joint or a word. The row's
+/// accessible name says it whole. The end of the line used to go, the path's
+/// tail — the part that says where the copy is — first; and a path found by
+/// looking for the next space lost everything after "Application" of
+/// `~/Library/Application Support/…`, its binary included.
+pub(super) fn fit_keeping_path_tail(text: &str, path: Option<&str>, width: f32) -> String {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let fits = |line: &str| {
+        crate::tray_raster::ui_text_width_for(face, line, px)
+            <= width + crate::native_ui::TEXT_FIT_SLACK
+    };
+    if fits(text) {
+        return text.to_string();
+    }
+    let Some((start, path)) = path
+        .filter(|path| !path.is_empty())
+        .and_then(|path| text.find(path).map(|at| (at, path)))
+    else {
+        return cut_at_joint_or_word(text, width, &fits);
+    };
+    let (before, after) = (&text[..start], &text[start + path.len()..]);
+    let parts = path.split('/').collect::<Vec<_>>();
+    // The path's shorter forms, longest first: its head and its tail around
+    // an ellipsis, the tail never under two components (the folder and the
+    // binary) where it has them; then the tail alone.
+    let mut forms = Vec::new();
+    let least = 2.min(parts.len().saturating_sub(1)).max(1);
+    for tail in (least..parts.len()).rev() {
+        for head in (1..parts.len() - tail).rev() {
+            forms.push(format!(
+                "{}/\u{2026}/{}",
+                parts[..head].join("/"),
+                parts[parts.len() - tail..].join("/")
+            ));
+        }
+        forms.push(format!(
+            "\u{2026}/{}",
+            parts[parts.len() - tail..].join("/")
+        ));
+    }
+    let shortest = forms.last().cloned().unwrap_or_else(|| path.to_string());
+    if let Some(line) = forms
+        .iter()
+        .map(|form| format!("{before}{form}{after}"))
+        .find(|line| fits(line))
+    {
+        return line;
+    }
+    // The words before the path cut back a word at a time, and what follows
+    // it kept where it fits: a `)` that closes the path's sentence only where
+    // the words kept open it, and what the line says after that ("(not
+    // measured in this build)") before it is given up.
+    let words = before.split_whitespace().collect::<Vec<_>>();
+    let rest = after.strip_prefix(')').unwrap_or(after);
+    for kept in (1..words.len()).rev() {
+        let lead = words[..kept].join(" ");
+        let opened = lead.matches('(').count() > lead.matches(')').count();
+        let closes: [&str; 2] = if opened { [after, ")"] } else { [rest, ""] };
+        if let Some(line) = closes
+            .iter()
+            .map(|close| format!("{lead}\u{2026} {shortest}{close}"))
+            .find(|line| fits(line))
+        {
+            return line;
+        }
+    }
+    if fits(&shortest) {
+        return shortest;
+    }
+    // Not even the tail with its folder: the binary's name, whole.
+    parts.last().map_or(shortest, |name| (*name).to_string())
+}
+
+/// A line with no path cut honestly: back to its last ` · ` joint that fits
+/// with ` · …` after it, saying facts follow ("ok · signed in (Max) · …");
+/// else back to its last whole word with `…` after it; never inside a word
+/// where a word fits.
+fn cut_at_joint_or_word(text: &str, width: f32, fits: &dyn Fn(&str) -> bool) -> String {
+    let parts = text.split(FACT_SEPARATOR).collect::<Vec<_>>();
+    if let Some(line) = (1..parts.len())
+        .rev()
+        .map(|kept| {
+            format!(
+                "{}{FACT_SEPARATOR}\u{2026}",
+                parts[..kept].join(FACT_SEPARATOR)
+            )
+        })
+        .find(|line| fits(line))
+    {
+        return line;
+    }
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    (1..words.len())
+        .rev()
+        .map(|kept| {
+            let lead = words[..kept].join(" ");
+            let lead = lead.trim_end_matches(FACT_SEPARATOR.trim()).trim_end();
+            format!("{lead}\u{2026}")
+        })
+        .find(|line| fits(line))
+        .unwrap_or_else(|| crate::native_ui::fit_native_status_label(text, width))
+}
+
 /// The page's action under the THIS MACHINE card: Refresh, busy while a look
 /// runs and inert while the look is switched off.
 fn ai_actions(ai: &AiProjection, card_width: f32) -> (UiNode, f32) {
@@ -653,17 +809,28 @@ fn ai_actions(ai: &AiProjection, card_width: f32) -> (UiNode, f32) {
 
 /// The FLEET DOCUMENT card's actions: Fetch now (busy while a look runs,
 /// inert while the look is off or `[ai] fleet` names no URL) and Open
-/// aterm.toml at `[ai] fleet`.
+/// aterm.toml at `[ai] fleet` — side by side where the card holds both, else
+/// one over the other (they ran past a phone-width card at 2× text).
 fn fleet_actions(ai: &AiProjection, card_width: f32) -> (UiNode, f32) {
     let control_height = scaled_control_height();
     let label = "Fetch now";
-    let width = (crate::native_ui::native_button_label_width(label) + 40.0).min(card_width);
+    let need = crate::native_ui::native_button_label_width(label) + 40.0;
+    let (open, open_height) =
+        open_config_button(AI_OPEN_FLEET, "Open aterm.toml at [ai] fleet", card_width);
+    let open_width = match open.layout.width {
+        Length::Fixed(width) => width,
+        _ => card_width,
+    };
+    let beside = need + CARD_GAP + open_width <= card_width && open_height <= control_height;
+    let width = need.min(card_width);
+    let (visual, lines) = button_words(label, &[], width);
+    let fetch_height = crate::native_ui::native_button_height_for_lines(lines, control_height);
     let fetch = UiNode::new(
         AI_FLEET_FETCH,
         UiContent::Button(
             Control::new(
                 ButtonSpec::new("Fetch now")
-                    .visual_label(label)
+                    .visual_label(visual)
                     .description("Fetches the fleet document now"),
                 ActionId::new(AI_FLEET_FETCH),
             )
@@ -677,39 +844,41 @@ fn fleet_actions(ai: &AiProjection, card_width: f32) -> (UiNode, f32) {
     )
     .layout(
         Layout::default()
-            .width(Length::Fixed(width))
-            .height(Length::Fixed(control_height)),
+            .width(Length::Fixed(if lines > 1 { card_width } else { width }))
+            .height(Length::Fixed(fetch_height)),
     );
-    let (open, _) = open_config_button(AI_OPEN_FLEET, "Open aterm.toml at [ai] fleet", card_width);
+    let (layout, height) = if beside {
+        (Layout::row(), control_height)
+    } else {
+        (Layout::column(), fetch_height + CARD_GAP + open_height)
+    };
     (
         UiNode::new(
             "ai/fleet-actions",
             UiContent::Group(GroupSpec::new("Fleet document actions")),
         )
-        .layout(
-            Layout::row()
-                .height(Length::Fixed(control_height))
-                .gap(CARD_GAP),
-        )
+        .layout(layout.height(Length::Fixed(height)).gap(CARD_GAP))
         .children(vec![fetch, open]),
-        control_height,
+        height,
     )
 }
 
 /// An Open aterm.toml under a card, its spoken label naming the key it opens
-/// at, its visual label the short words.
+/// at, its visual label the short words, kept whole by the one rule page
+/// buttons keep ([`button_words`]): on as many lines as a narrow card needs
+/// ("Open aterm.t…" was all a 2× phone-width card painted).
 fn open_config_button(key: &str, spoken: &str, card_width: f32) -> (UiNode, f32) {
-    let height = scaled_control_height();
     let visual = "Open aterm.toml";
     let width = (crate::native_ui::native_button_label_width(visual) + 40.0).min(card_width);
+    let (words, lines) = button_words(visual, &[], width);
+    let width = if lines > 1 { card_width } else { width };
+    let height = crate::native_ui::native_button_height_for_lines(lines, scaled_control_height());
     (
         UiNode::new(
             key,
             UiContent::Button(
                 Control::new(
-                    ButtonSpec::new(spoken).visual_label(
-                        crate::native_ui::fit_native_button_label(visual, (width - 20.0).max(0.0)),
-                    ),
+                    ButtonSpec::new(spoken).visual_label(words),
                     ActionId::new(key),
                 )
                 .style(StyleRef::Secondary),

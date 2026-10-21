@@ -70,9 +70,10 @@ fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 /// One `aterm ctl` call against `inst`, under the same scratch world; asked again
-/// while the instance has not yet accepted ([`headless_boot::until_accepted`]).
+/// while the instance has not yet accepted it or answers it busy
+/// ([`headless_boot::until_served`]).
 fn ctl(inst: &headless_boot::Instance, args: &[&str]) -> Output {
-    headless_boot::until_accepted(|| {
+    headless_boot::until_served(|| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
         launch_isolation::apply(&mut cmd, &inst.tmp);
         cmd.arg("ctl")

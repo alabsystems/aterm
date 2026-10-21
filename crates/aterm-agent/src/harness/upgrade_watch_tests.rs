@@ -1175,7 +1175,7 @@ fn the_real_watch_is_the_derived_look() {
     // notice's line is planned and the read says what it would do.
     let shell = dead_pid();
     let mut t = table();
-    t.push((shell, 1, "zsh".to_string()));
+    t.push((shell, 1, "zsh".into()));
     let mut args = atpkg::caller_shell::process_args(one.agent.id()).expect("argv");
     args.argv = vec!["claude".to_string()];
     let read = |o: &Opts| {

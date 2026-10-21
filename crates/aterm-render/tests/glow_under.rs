@@ -63,7 +63,7 @@ fn compact_effect_damage_matches_exact_fallback_and_marks_vacated_rows() {
         None,
         false,
         None,
-        16,
+        aterm_render::RowBands::new(0, 16),
         &mut exact_dirty,
     );
 
@@ -104,7 +104,7 @@ fn compact_effect_damage_matches_exact_fallback_and_marks_vacated_rows() {
         None,
         false,
         None,
-        16,
+        aterm_render::RowBands::new(0, 16),
         &mut compact_dirty,
     );
 
@@ -331,9 +331,16 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
     let prev = frame(&settled_q, &settled_c);
     let cur = frame(&settled_q, &settled_c);
     let mut dirty = Vec::new();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -345,9 +352,16 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
 
     // The quad steps row 1 → row 4: prev and cur rows repaint, nothing else.
     let cur = frame(&[under(4, 0, 64, 8, 16, 0x0010_0803)], &settled_c);
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -371,9 +385,16 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
             fg: 0x0008_0402,
         }],
     );
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(

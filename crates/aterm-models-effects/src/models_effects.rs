@@ -2912,7 +2912,7 @@ pub fn rainbow_landing_pool_model() -> Model {
 ///
 /// Tier-1: aterm-gui's `spawn::capability_secrecy_conformance` drives
 /// `spawn::provision_child_proxy` with a private socket dir and with none, reads `published` off
-/// the env it produced against the secrets the proxy table registered, and validates the real
+/// the env it produced against the secrets minted for the child, and validates the real
 /// `Provision` (the file channel exactly when there is a private dir; with none, or a file it
 /// cannot write, provisioning fails closed). `SandboxedRead` follows from the channel by
 /// definition, so the channel is what is bound.
@@ -2961,16 +2961,18 @@ pub fn publish_ordering_model() -> Model {
     })
 }
 
-/// Reply fidelity: once a forwarded verb has been delivered to the child, a later relay-stage
+/// Reply fidelity: once a forwarded verb has been delivered to the host, a later relay-stage
 /// failure does not report `ERR` to the client (a false "didn't happen" for an op that did). A
-/// failure before delivery (the dial, a sibling's token unreadable once connected, the handshake
-/// write) is reported as `DialFail`, the honest `ERR forward`. `Buggy = 1` reports a relay failure
-/// after delivery. `NoErrorAfterDelivery`: never both delivered and error-reported.
+/// failure before delivery (the connect: nothing listening, or no token beside the host's socket
+/// once the connection exists, answered `ERR no such session`; the connect probe; the handshake
+/// write, `ERR forward`) is reported as `DialFail`. `Buggy = 1` reports a relay failure after
+/// delivery. `NoErrorAfterDelivery`: never both delivered and error-reported.
 ///
-/// Tier-1: aterm-gui's `reply_fidelity_conformance` drives `proxy::deliver_then_relay` against a
-/// real child socket (the real relay, a relay that fails after delivery, a dial with no listener,
-/// a child that never accepts, a sibling with no token), projecting `delivered` from what the
-/// child read and `reported_err` from the result the caller turns into `ERR forward`.
+/// Tier-1: aterm-gui's `reply_fidelity_conformance` drives `proxy::connect_hop` and
+/// `proxy::deliver_then_relay` against a real host socket (the real relay, a relay that fails
+/// after delivery, a dial with no listener, a host that never accepts, a host with no token),
+/// projecting `delivered` from what the host read and `reported_err` from the results the caller
+/// turns into an error reply.
 // Skip (T2 vcgen-budget lane): a model data constructor; `ty` checks the model it returns.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn reply_fidelity_model() -> Model {

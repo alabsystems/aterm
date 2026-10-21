@@ -159,8 +159,10 @@ fn the_bus_class_is_its_own_predicate_and_holds_the_turn_class() {
 fn ms_costs_eight_bytes_a_record_and_numbers_the_bus_class_densely() {
     assert_eq!(
         ENTRY_BYTES,
-        std::mem::size_of::<Rec>() + std::mem::size_of::<usize>() + std::mem::size_of::<u64>(),
-        "an entry is its record, its bytes and its ms"
+        std::mem::size_of::<std::sync::Arc<Rec>>()
+            + std::mem::size_of::<usize>()
+            + std::mem::size_of::<u64>(),
+        "an entry is its shared record, its bytes and its ms"
     );
     let mut log = Log::new(1);
     session(&mut log);
@@ -169,7 +171,11 @@ fn ms_costs_eight_bytes_a_record_and_numbers_the_bus_class_densely() {
         bell(&mut log, 1 + i);
     }
     let per = (log.footprint() - empty) / 10;
-    assert_eq!(per, ENTRY_BYTES, "a fieldless mark costs exactly one entry");
+    assert_eq!(
+        per,
+        ENTRY_BYTES + std::mem::size_of::<Rec>() + 2 * std::mem::size_of::<usize>(),
+        "a fieldless mark costs exactly one entry and its shared record (two counts)"
+    );
     let c = cmd(&mut log, 20, true);
     assert_eq!(log.ms_head(), 3, "the session's open and the command's two");
     let ms: Vec<(u64, u64)> = log
@@ -630,6 +636,87 @@ fn seen_lifts_failure_on_the_bus() {
     let (bus, _) = view.fold();
     assert!(bus.state().needs.iter().all(Option::is_none));
     assert_eq!(bus.bus_facts(&same), log.fold().bus_facts(&alias));
+}
+
+/// [`drain`], every slot of kind `k` left out of what `view` is offered
+/// (the slots still land): the bus as it would be without them.
+fn drain_without(log: &mut Log, view: &mut BusSpace, ms: u64, k: Kind) {
+    for _ in 0..10_000 {
+        let before = log.mirror_landed();
+        let take = log.bus_copy(32, at(ms)).encode(Tier::WireMeta, &alias);
+        for s in &take.slots {
+            let b = decode_bus(&s.body).expect("a bus body decodes");
+            if b.rec.k != k {
+                view.offer(b);
+            }
+        }
+        if let Some(last) = take.slots.last() {
+            log.land(last.at).expect("lands");
+        }
+        if take.slots.is_empty() || (log.mirror_settled() && before == log.mirror_landed()) {
+            return;
+        }
+    }
+    panic!("the take never settled");
+}
+
+/// THE HARNESS'S RELAUNCH LIFT IS THE BUS'S TOO (Phase 6 step 6C-1, ruling
+/// U3): the old run failed, the relaunched run is open, and the harness's
+/// act is followed by `mark - seen by=harness src=aterm conf=strong`. The
+/// `act` stays local, but the `seen` is bus class, so the mirror's fold
+/// lifts the need as the local one does and their facts agree. NEGATIVE
+/// CONTROL: with the `seen` left out of what the bus is offered, the bus
+/// keeps the need and the facts part.
+#[test]
+fn a_harness_seen_lifts_failure_on_the_bus() {
+    let build = || {
+        let mut log = Log::new(1);
+        session(&mut log);
+        cmd(&mut log, 10, false);
+        log.open(Open::new(Kind::Cmd, Src::Shell, Conf::Strong), at(20))
+            .expect("the relaunched run");
+        let act = Fields::new()
+            .word(Key::Word, "relaunch")
+            .and_then(|f| f.id(Key::Rule, "relaunch"))
+            .expect("the act's fields");
+        log.mark(
+            Mark::new(Kind::Act, Src::Aterm, Conf::Strong)
+                .by(Actor::Harness)
+                .fields(act),
+            at(30),
+        )
+        .expect("the act");
+        log.mark(
+            Mark::new(Kind::Seen, Src::Aterm, Conf::Strong).by(Actor::Harness),
+            at(30),
+        )
+        .expect("seen");
+        log
+    };
+    let mut log = build();
+    assert!(
+        log.state().needs.iter().all(Option::is_none),
+        "the local fold lifted it"
+    );
+    let mut view = BusSpace::new(1);
+    drain(&mut log, &mut view, 40);
+    let (bus, _) = view.fold();
+    assert!(bus.state().needs.iter().all(Option::is_none));
+    assert_eq!(bus.bus_facts(&same), log.fold().bus_facts(&alias));
+
+    let mut log = build();
+    let mut view = BusSpace::new(1);
+    drain_without(&mut log, &mut view, 40, Kind::Seen);
+    let (bus, _) = view.fold();
+    assert!(
+        bus.state()
+            .needs
+            .iter()
+            .flatten()
+            .any(|n| n.word == "failure"),
+        "NEGATIVE CONTROL: without the seen the bus keeps the need"
+    );
+    assert_ne!(bus.bus_facts(&same), log.fold().bus_facts(&alias));
 }
 
 /// The second wall: the mirror's encoder refuses a record of the local
@@ -1559,6 +1646,7 @@ fn a_late_snapshot_reports_omitted_needs_and_keeps_mark_claims_as_claims() {
         late.records(),
         None,
         fold.state(),
+        fold.mail_links(),
         512,
         at(30).wall_ms,
     )
@@ -1638,4 +1726,120 @@ fn an_out_refining_amend_and_a_confirmation_agree_on_host_and_bus() {
     assert_eq!(log.state().top_need().map(|n| n.src), Some(Src::Transcript));
     drain(&mut log, &mut view, 1800);
     agree(&log, &view, "after the confirmation");
+}
+
+/// AN EDGE'S RAW SID NEVER CROSSES BY `op_by=` (Phase 6 step 6C-2, ruling
+/// U6): a turn an edge opened and `ctl` closed restates its opener on the
+/// close as the host id `op_by=<sid>`; at `Tier::Wire` the close carries
+/// none, and no body the mirror takes holds the raw sid (the open's own
+/// `by=` crosses as the edge's alias). NEGATIVE CONTROL (scratch revert):
+/// `op_by=` marked wire tier puts the raw sid in the close's bus body.
+#[test]
+fn an_edges_raw_sid_never_crosses_by_the_restated_opener() {
+    let sid = ShortId::new("s-edge42").expect("a sid");
+    let mut log = Log::new(1);
+    session(&mut log);
+    let run = log
+        .open(Open::new(Kind::Agent, Src::Status, Conf::Strong), at(1))
+        .expect("run");
+    let t = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong)
+                .under(run)
+                .by(Actor::sid(sid)),
+            at(2),
+        )
+        .expect("the edge's turn");
+    let seq = log
+        .close(
+            t,
+            Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong).by(Actor::Ctl),
+            at(3),
+        )
+        .expect("ctl closes it");
+    let close = log.window().find(|r| r.seq == seq).expect("live").clone();
+    let host = aterm_slog::encode(&close, Tier::Host).expect("fits");
+    assert!(host.contains(" op_by=s-edge42 "), "PRECONDITION: {host}");
+    let take = log.bus_copy(32, at(10)).encode(Tier::WireMeta, &alias);
+    assert!(
+        take.slots.iter().any(|s| s
+            .body
+            .contains(&format!(" by={}", alias(&sid).expect("an alias")))),
+        "PRECONDITION: the open crossed by its alias"
+    );
+    for s in &take.slots {
+        assert!(!s.body.contains("s-edge42"), "{}", s.body);
+        assert!(!s.body.contains("op_by="), "{}", s.body);
+    }
+    let wire = aterm_slog::encode(&close, Tier::Wire).expect("fits");
+    assert!(
+        !wire.contains("op_by=") && !wire.contains("s-edge42"),
+        "{wire}"
+    );
+}
+
+/// THE BUS NEVER GUESSES A MAIL LINK (Phase 6 step 6C-3, ruling U5): the
+/// local log links a `ctl` turn to the one `kind=task` mail before it and
+/// its brief prints ` mail=@9~`; the mail mark is local class and its
+/// `off=` host tier, so a bus fold holds no link and the brief a peer folds
+/// from the bus (as `fabric brief` does, with that fold's links) prints no
+/// `mail=`. The same bus records briefed with the local fold's links print
+/// it, so the token's absence is the bus fold's. NEGATIVE CONTROL (scratch
+/// revert): the mail mark made bus class with `off=` at wire tier lets the
+/// bus fold link the turn (either wall alone still holds).
+#[test]
+fn a_bus_brief_names_no_mail_link() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mail = Fields::new()
+        .word(Key::Dir, "in")
+        .and_then(|f| f.word(Key::MailKind, "task"))
+        .and_then(|f| f.u(Key::Off, 9))
+        .expect("mail fields");
+    log.mark(
+        Mark::new(Kind::Mail, Src::Fabric, Conf::Exact)
+            .at(Node::SESSION)
+            .by(Actor::Bridge)
+            .fields(mail),
+        at(10),
+    )
+    .expect("the mail mark");
+    log.open(
+        Open::new(Kind::Turn, Src::Ctl, Conf::Strong)
+            .under(run)
+            .by(Actor::Ctl),
+        at(20),
+    )
+    .expect("the ctl turn");
+    let now = at(1000).wall_ms;
+    assert_eq!(log.fold().mail_links().len(), 1, "PRECONDITION: linked");
+    let local = log.brief("s-1", 4000, now).text;
+    assert!(local.contains(" mail=@9~"), "PRECONDITION: {local}");
+    let mut view = BusSpace::new(1);
+    drain(&mut log, &mut view, 30);
+    let (bus, _) = view.fold();
+    assert!(bus.mail_links().is_empty(), "the bus fold linked a turn");
+    let peer = aterm_slog::brief(
+        "s-1",
+        view.records(),
+        None,
+        bus.state(),
+        bus.mail_links(),
+        4000,
+        now,
+    )
+    .text;
+    assert!(peer.contains("\nt1 open "), "PRECONDITION: {peer}");
+    assert!(!peer.contains("mail="), "{peer}");
+    let given = aterm_slog::brief(
+        "s-1",
+        view.records(),
+        None,
+        bus.state(),
+        log.fold().mail_links(),
+        4000,
+        now,
+    )
+    .text;
+    assert!(given.contains(" mail=@9~"), "CONTROL: {given}");
 }

@@ -1126,11 +1126,11 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
     }
 
     impl Keys {
-        /// `None` only where there is no `/usr/bin/ssh-keygen` at all; any other failure
-        /// to set up is a test failure, never a silent pass.
-        fn new() -> Option<Self> {
+        /// Where there is no `/usr/bin/ssh-keygen` at all the test ends COULD NOT RUN; any
+        /// other failure to set up is a test failure, never a silent pass.
+        fn new() -> Self {
             if !Path::new(SSH_KEYGEN).exists() {
-                return None;
+                aterm_uds::host::could_not_run(format!("no {SSH_KEYGEN} here"));
             }
             let dir = aterm_tempfile::tempdir().expect("a temporary directory");
             let live = Live::new();
@@ -1155,8 +1155,12 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             }
             check_signers(&signers).unwrap();
             std::fs::write(dir.path().join("allowed_signers"), signers).unwrap();
-            std::fs::create_dir(dir.path().join("scratch")).unwrap();
-            Some(Self { dir })
+            // Owner-only whatever the umask, as the agent makes its stage: a plain
+            // `create_dir` is 0775 under a user-private-group login's umask 002, and
+            // `private_dir` rightly refuses a group-writable scratch directory.
+            live.create_dir_all(&dir.path().join("scratch"), 0o700)
+                .unwrap();
+            Self { dir }
         }
 
         fn key(&self, name: &str) -> PathBuf {
@@ -1197,9 +1201,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
 
     #[test]
     fn a_real_signature_opens_and_every_tampering_is_refused() {
-        let Some(keys) = Keys::new() else {
-            return; // No ssh-keygen here.
-        };
+        let keys = Keys::new();
         let now = Live::new().now();
         let e = envelope("UUID-1", 7, now);
         let wire = keys.seal(&e, "signing");
@@ -1267,9 +1269,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
 
     #[test]
     fn a_signature_in_another_namespace_is_refused() {
-        let Some(keys) = Keys::new() else {
-            return;
-        };
+        let keys = Keys::new();
         let now = Live::new().now();
         let body = body_text(&envelope("UUID-1", 1, now)).unwrap();
         let file = keys.scratch().join("other-ns");
@@ -1294,9 +1294,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
 
     #[test]
     fn a_passphrase_key_is_told_apart_from_an_open_one() {
-        let Some(keys) = Keys::new() else {
-            return;
-        };
+        let keys = Keys::new();
         let live = Live::new();
         assert_eq!(
             needs_passphrase(&live, &keys.key("signing")),
@@ -1314,9 +1312,7 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
 
     #[test]
     fn a_batch_signed_by_one_run_opens_envelope_by_envelope() {
-        let Some(keys) = Keys::new() else {
-            return;
-        };
+        let keys = Keys::new();
         let now = Live::new().now();
         let bodies: Vec<Envelope> = (1..=3)
             .map(|i| envelope(&format!("H{i}"), i, now))

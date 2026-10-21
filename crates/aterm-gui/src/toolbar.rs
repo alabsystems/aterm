@@ -71,13 +71,14 @@ pub(crate) use macos::{
     ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
     install_window_toolbar, native_selected_pill_rgb, read_tab_chrome, read_tab_menus,
     reflow_window_tabs, rename_editor_edit, rename_editor_text, set_active_tab_color,
-    set_strip_accent, set_strip_dark, set_window_pill, set_window_tabs,
+    set_chip_loads, set_strip_accent, set_strip_dark, set_window_pill, set_window_tabs,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) use non_macos::{
     ToolbarHandle, install_window_toolbar, native_selected_pill_rgb, read_tab_chrome,
-    read_tab_menus, set_active_tab_color, set_strip_accent, set_strip_dark, set_window_tabs,
+    read_tab_menus, set_active_tab_color, set_chip_loads, set_strip_accent, set_strip_dark,
+    set_window_tabs,
 };
 
 use crate::tab_bar::TabStripMetadata;
@@ -411,6 +412,7 @@ mod shared_tests {
             conn: Some(crate::tab_bar::TabConnRole::Both),
             closable: true,
             team: crate::tab_bar::TabTeam::NONE,
+            load: 0,
         };
         let line = format_tab_chrome(
             &["Settings".to_string()],
@@ -462,6 +464,7 @@ mod shared_tests {
             conn: None,
             closable: true,
             team: crate::tab_bar::TabTeam::NONE,
+            load: 0,
         };
         let stop = |cause| TabStripMetadata {
             attention: crate::tab_bar::ChipLevel::Stop(cause),
@@ -500,6 +503,7 @@ mod shared_tests {
             conn: None,
             closable: true,
             team: crate::tab_bar::TabTeam::NONE,
+            load: 0,
         };
         let clauses = |title, icon| tab_help(title, None, app(icon), 0).split(" · ").count();
         assert_eq!(
@@ -531,6 +535,7 @@ mod shared_tests {
             conn,
             closable: true,
             team: crate::tab_bar::TabTeam::NONE,
+            load: 0,
         };
         let line = format_tab_chrome(
             &["push-src".to_string(), "push-dst".to_string()],
@@ -850,6 +855,10 @@ mod non_macos {
     /// Off macOS there is no native strip; the in-grid strip draws the chrome
     /// accent from the tokens instead (`tab_bar::strip_colors`).
     pub(crate) fn set_strip_accent(_handle: &ToolbarHandle, _accent: Option<[u8; 3]>) {}
+
+    /// Off macOS the in-grid strip reads each chip's load step from its own
+    /// metadata (`App::stamp_presence_chips`) on the frame a reading asks for.
+    pub(crate) fn set_chip_loads(_handle: &ToolbarHandle, _loads: &[u8], _inks: [[u8; 3]; 2]) {}
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -873,6 +882,7 @@ mod non_macos_tests {
             conn: None,
             closable: true,
             team: crate::tab_bar::TabTeam::NONE,
+            load: 0,
         }
     }
 
@@ -2365,6 +2375,26 @@ mod macos {
                         );
                     }
                 }
+                // The tab's load meter (design §12.4): a capsule 2.5 pt above
+                // the pill's bottom, clear of the selected chip's keyline.
+                if let Some(len) = crate::tab_bar::chip_load_len_pt(
+                    pill.size.width as f32,
+                    ivars.metadata.get().load,
+                ) {
+                    let h = f64::from(crate::tab_bar::CHIP_LOAD_H_PT);
+                    let bar = rect(
+                        pill.origin.x + f64::from(crate::tab_bar::CHIP_LOAD_INSET_PT),
+                        pill.origin.y + f64::from(crate::tab_bar::CHIP_LOAD_LIFT_PT),
+                        f64::from(len),
+                        h,
+                    );
+                    // SAFETY: AppKit drawing primitives on the main thread inside
+                    // this draw cycle; the colour is +0 and used in this frame.
+                    unsafe {
+                        appkit::send_v(strip_load_color(ivars.active.get()), sel!(set));
+                        appkit::send_v(rounded_rect(bar, h * 0.5), sel!(fill));
+                    }
+                }
                 self.paint_identity();
             }
 
@@ -3476,10 +3506,43 @@ mod macos {
             if old == metadata {
                 return;
             }
+            // Only the load meter moved: it takes no slot, so a repaint.
+            let old_with_new_load = TabStripMetadata {
+                load: metadata.load,
+                ..old
+            };
+            if old_with_new_load == metadata {
+                mark_dirty(self.as_id());
+                return;
+            }
             // Ornament slots (and the whole solo group) move when an icon or status
             // appears or disappears.
             self.relayout();
             self.sync_semantics();
+        }
+
+        /// Take a new load step (design §12.4): a repaint when it, or the
+        /// meters' inks under a lit meter, moved; never a relayout, since the
+        /// meter takes no slot.
+        fn set_load(&self, load: u8, inks_moved: bool) {
+            let ivars = self.ivars();
+            let mut metadata = ivars.metadata.get();
+            let old = metadata.load;
+            metadata.load = load;
+            ivars.metadata.set(metadata);
+            // The pill `drawRect:` draws the meter in, and the meter's length
+            // there in whole points: a step that moves no point repaints
+            // nothing (a busy tab's step moves on almost every reading).
+            // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on
+            // this live view, on the main thread.
+            let bounds = unsafe { appkit::send_rect(self.as_id(), sel!(bounds)) };
+            let pill_w = ((bounds.size.width - 2.0 * TAB_PILL_INSET_X).max(0.0)) as f32;
+            let moved = crate::tab_bar::chip_load_len_pt(pill_w, old)
+                != crate::tab_bar::chip_load_len_pt(pill_w, load);
+            let lit = crate::tab_bar::chip_load_len_pt(pill_w, load).is_some();
+            if moved || (inks_moved && lit) {
+                mark_dirty(self.as_id());
+            }
         }
 
         /// Re-resolve this tab's label ink against the current selected-tab color
@@ -3866,6 +3929,60 @@ mod macos {
     /// system accent unless an accent is authored.
     static STRIP_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+    /// The load meters' inks (design §12.4), packed like [`STRIP_ACCENT`]: the
+    /// Tab ink the selected chip's meter takes and the aterm ink the others'
+    /// take at 70 %, solved on the band (`aterm_vitals::ink::vitals_inks`). `0`
+    /// until the first reading hands them over ([`set_chip_loads`]).
+    static STRIP_LOAD_TAB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static STRIP_LOAD_ATERM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// The colour a chip's load meter is drawn in: the Tab ink on the
+    /// selected chip, the aterm ink at 70 % on the others; the secondary
+    /// label ink before any are handed over.
+    ///
+    /// # Safety
+    /// Main thread, inside a draw cycle; the result is +0.
+    unsafe fn strip_load_color(active: bool) -> Id {
+        let (slot, alpha) = if active {
+            (&STRIP_LOAD_TAB, 1.0)
+        } else {
+            (&STRIP_LOAD_ATERM, 0.7)
+        };
+        match unpack(slot.load(std::sync::atomic::Ordering::Relaxed)) {
+            // SAFETY: a plain colour constructor on the main thread.
+            Some([r, g, b]) => unsafe {
+                srgb(
+                    f64::from(r) / 255.0,
+                    f64::from(g) / 255.0,
+                    f64::from(b) / 255.0,
+                    alpha,
+                )
+            },
+            // SAFETY: as above.
+            None => unsafe { with_alpha(ns_color(sel!(secondaryLabelColor)), alpha) },
+        }
+    }
+
+    /// Hand the strip its chips' load steps (`TabStripMetadata::load`, in tab
+    /// order) and the meters' inks (`[tab, aterm]`) after a vitals reading:
+    /// each chip whose step moved repaints, and nothing is laid out again. A
+    /// count that no longer matches the strip (a rebuild is on its way, and
+    /// carries the steps itself) changes nothing.
+    pub(crate) fn set_chip_loads(handle: &ToolbarHandle, loads: &[u8], inks: [[u8; 3]; 2]) {
+        let mut inks_moved = false;
+        for (slot, ink) in [(&STRIP_LOAD_TAB, inks[0]), (&STRIP_LOAD_ATERM, inks[1])] {
+            let packed = pack(Some(ink));
+            inks_moved |= slot.swap(packed, std::sync::atomic::Ordering::Relaxed) != packed;
+        }
+        let tabs = handle.tabs.borrow();
+        if tabs.len() != loads.len() {
+            return;
+        }
+        for (tab, &load) in tabs.iter().zip(loads) {
+            tab.set_load(load, inks_moved);
+        }
+    }
+
     /// The colour the strip's accent marks (the active keyline, the drop-target
     /// ring, the dirty dot) are drawn in: the pinned accent, else the system's.
     ///
@@ -4059,6 +4176,7 @@ mod macos {
                 conn: None,
                 closable: true,
                 team: crate::tab_bar::TabTeam::NONE,
+                load: 0,
             })
         };
         // A missing id (the caller always pairs `ids` with `titles`) falls back to the

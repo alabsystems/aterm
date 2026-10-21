@@ -3672,20 +3672,32 @@ fn a_workers_first_line_hands_the_task_over_as_one_argument() {
     if !cfg!(target_os = "macos") {
         shells.retain(|(_, sh)| Path::new(sh).exists());
     }
+    // Each run below is held to the one-minute hang detector (`output_until`
+    // kills the run's process group at it), so an exec the system strands is a
+    // named failure, not a test binary that never ends. The stand-in is a
+    // file this test just wrote: the system's assessment of its first exec,
+    // which can outlast that minute on a loaded host, is paid first, under
+    // its own hang detector (`first_exec`).
+    aterm_spec::wait::first_exec(&exe, &[]);
     // The stand-in's argv when `shell` runs `line` after `prelude`, on a line
     // of its own (an alias takes effect from the next line on).
     let run = |dialect: Dialect, shell: &str, prelude: &str, line: &str| {
-        let out = tmp.path().join(format!("argv-{}", dialect.hook_ext()));
-        let _ = std::fs::remove_file(&out);
-        let status = aterm_uds::spawnfd::command(shell)
-            .args(["-f", "-c", &format!("{prelude}\n{line}")])
-            .env("ATERM_TASK_FILE", &file)
-            .env("ARGV_OUT", &out)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .status()
-            .expect("run the shell");
-        assert!(status.success(), "{shell}: {line}");
-        std::fs::read(&out).expect("the stand-in ran")
+        let argv_out = tmp.path().join(format!("argv-{}", dialect.hook_ext()));
+        let _ = std::fs::remove_file(&argv_out);
+        let out = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(shell)
+                .args(["-f", "-c", &format!("{prelude}\n{line}")])
+                .env("ATERM_TASK_FILE", &file)
+                .env("ARGV_OUT", &argv_out),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_or_else(|e| panic!("{shell} within the hang detector: {e}"));
+        assert!(
+            out.status.success(),
+            "{shell}: {line}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read(&argv_out).expect("the stand-in ran")
     };
     for (dialect, shell) in shells {
         let line = task_launch_line(
@@ -3727,17 +3739,18 @@ fn a_workers_first_line_hands_the_task_over_as_one_argument() {
             "{shell}: the control's alias took the bare cat"
         );
     }
-    let evaluated = aterm_uds::spawnfd::command("/bin/sh")
-        .args([
-            "-c",
-            r#"eval "$(sed -n 3p "$ATERM_TASK_FILE")" 2>/dev/null; true"#,
-        ])
-        .env("ATERM_TASK_FILE", &file)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .status()
-        .expect("run sh");
+    let evaluated = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/bin/sh")
+            .args([
+                "-c",
+                r#"eval "$(sed -n 3p "$ATERM_TASK_FILE")" 2>/dev/null; true"#,
+            ])
+            .env("ATERM_TASK_FILE", &file),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("sh within the hang detector: {e}"));
     assert!(
-        evaluated.success() && ran.exists(),
+        evaluated.status.success() && ran.exists(),
         "the control ran the text"
     );
     // The task on the line instead: past the bound, refused.
@@ -3782,7 +3795,10 @@ fn a_workers_first_line_is_written_per_dialect_and_refuses_what_it_cannot_carry(
     // would name another directory under the worker's `cwd=`.
     let homed = task_launch_line(Dialect::Zsh, exe, None, None, Some("/homes/u"), None)
         .expect("a line carrying HOME");
-    assert!(homed.starts_with(" HOME="), "{homed}");
+    assert!(
+        homed.starts_with(&format!(" {}=", accounts::HOMEDIR_ENV)),
+        "{homed}"
+    );
     assert!(homed.contains("/homes/u"), "{homed}");
     assert!(task_launch_line(Dialect::Zsh, exe, None, Some("other/.claude"), None, None).is_err());
     assert!(task_launch_line(Dialect::Zsh, exe, None, Some(""), None, None).is_err());
@@ -4035,7 +4051,7 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
     use super::super::profile::Context;
     let home = Path::new("/captured/home");
     let records = home.join(".claude");
-    let standard = vec!["HOME=/captured/home".to_string()];
+    let standard = vec![format!("{}=/captured/home", accounts::HOMEDIR_ENV)];
     let mut custom = standard.clone();
     custom.push("CLAUDE_CODE_CUSTOM_OAUTH_URL=https://auth.example.invalid".to_string());
     let standard_context = Context::of_exec_env(home, &records, &standard).expect("standard");
@@ -4048,7 +4064,7 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
     assert_eq!(
         target.values,
         [
-            ("HOME", "/captured/home".to_string()),
+            (accounts::HOMEDIR_ENV, "/captured/home".to_string()),
             ("CLAUDE_CODE_CUSTOM_OAUTH_URL", String::new()),
         ]
     );
@@ -4128,13 +4144,17 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
     assert_eq!(absent_target.context, absent);
     assert_eq!(
         absent_target.unset,
-        ["HOME", accounts::HOME_ENV, accounts::LOGIN_ENV]
+        [
+            accounts::HOMEDIR_ENV,
+            accounts::HOME_ENV,
+            accounts::LOGIN_ENV
+        ]
     );
     let empty = Context::of_exec_env(
         home,
         Path::new("/captured/work"),
         &[
-            "HOME=".to_string(),
+            format!("{}=", accounts::HOMEDIR_ENV),
             format!("{}=", accounts::HOME_ENV),
             format!("{}=", accounts::LOGIN_ENV),
         ],
@@ -4158,7 +4178,7 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
         Some("named"),
     );
     let moved = vec![
-        "HOME=/captured/other".to_string(),
+        format!("{}=/captured/other", accounts::HOMEDIR_ENV),
         "CLAUDE_CONFIG_DIR=/captured/config".to_string(),
         format!("{}=named", accounts::LOGIN_ENV),
     ];
@@ -4295,4 +4315,61 @@ fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
             "no fallback drops required words"
         );
     }
+}
+
+/// EVERY LANE'S CARRY-ON ENDS ON THE CONTINUATION AND ITS NEEDS YOU
+/// SENTENCE (FOREVER CRUISE / FOREVER LAND): Claude Code's, Gemini CLI's,
+/// agy's and Muse Code's relaunch, for every cause, and the upgrade's own,
+/// end on [`upgrade::CARRY_ON`] — whose last sentence asks for a NEEDS YOU
+/// line ([`crate::supervise::policy::needs::NEEDS_HINT`]) and which names no
+/// retired token — so under Cruise [`upgrade::checking`] puts the Cruise
+/// prompt in its place for a done claim. NEGATIVE CONTROL: a text that does
+/// not end on the continuation is kept as it is.
+#[test]
+fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
+    use crate::supervise::policy::needs::NEEDS_HINT;
+    use crate::supervise::policy::turn_end::DONE_CHECK;
+    assert!(upgrade::CARRY_ON.ends_with(NEEDS_HINT));
+    assert!(!upgrade::CARRY_ON.contains("ATERM-TASK-DONE"));
+    let agents = [
+        "Claude Code",
+        upgrade::Agent::Gemini.product(),
+        upgrade::Agent::Agy.product(),
+        "Muse Code",
+    ];
+    let causes = [
+        CAUSE_EXIT,
+        CAUSE_MEMORY,
+        CAUSE_STALL,
+        CAUSE_ASKED,
+        CAUSE_HOST,
+        "model:claude-opus-5-5",
+        "model-back:",
+    ];
+    let mut texts: Vec<String> = agents
+        .iter()
+        .flat_map(|agent| {
+            causes
+                .iter()
+                .map(move |cause| resumed_prompt_as(agent, "2.1.300", cause))
+        })
+        .collect();
+    let (from, to) = (
+        upgrade::Version::parse("2.1.299").expect("a version"),
+        upgrade::Version::parse("2.1.300").expect("a version"),
+    );
+    texts.push(upgrade::continue_prompt(
+        &from,
+        &to,
+        Some("claude-opus-5-5"),
+    ));
+    for text in &texts {
+        assert!(text.ends_with(upgrade::CARRY_ON), "{text}");
+        let checked = upgrade::checking(text, false);
+        assert!(checked.ends_with(DONE_CHECK), "{checked}");
+        assert!(!checked.contains(upgrade::CARRY_ON), "{checked}");
+    }
+    // NEGATIVE CONTROL: a text not ending on the continuation.
+    let other = format!("{} Upgraded.", upgrade::HARNESS_MARK);
+    assert_eq!(upgrade::checking(&other, false), other);
 }

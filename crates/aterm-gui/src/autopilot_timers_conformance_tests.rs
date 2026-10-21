@@ -216,8 +216,12 @@ impl TimerDrive {
     fn set_cruise_until(&mut self) {
         self.step("SetCruiseUntil", |d| {
             let at = WALL0 + (d.wall + 2) * MINUTE;
-            d.app
-                .set_session_autopilot_timed(d.session, Some(Autopilot::Cruise), Some(at));
+            d.app.set_session_autopilot_timed(
+                d.session,
+                Some(Autopilot::Cruise),
+                Some(at),
+                crate::autopilot::Surface::Menu,
+            );
             d.hand = 0;
             d.fires = 0;
         });
@@ -297,6 +301,7 @@ impl TimerDrive {
         crate::restore::TerminalLeafRestore {
             sid: None,
             lineage: None,
+            log_ep: None,
             cwd: None,
             title: String::new(),
             profile: None,
@@ -309,6 +314,7 @@ impl TimerDrive {
             questions: None,
             autopilot: meta.autopilot,
             land_at: meta.land_at,
+            autopilot_by: None,
             identity: None,
             agent: None,
             supervised: None,
@@ -581,6 +587,7 @@ fn the_real_timer_conforms_to_its_model() {
         Some("land".into()),
         None,
         aterm_slog::Actor::Ctl,
+        None,
     );
     d.app.autopilot_timers.forget(d.session);
     let mut after = d.state();
@@ -612,9 +619,11 @@ fn the_real_timer_conforms_to_its_model() {
     let before = d.state();
     let ctx = d.ctx().unwrap();
     let entry = *d.app.autopilot_timers.entry(d.session).unwrap();
-    assert_eq!(
-        crate::session_timeline::fire_land_at(&ctx, entry.land_at_ms, i64::MAX),
-        crate::session_timeline::Fired::Landed,
+    assert!(
+        matches!(
+            crate::session_timeline::fire_land_at(&ctx, entry.land_at_ms, i64::MAX),
+            crate::session_timeline::Fired::Landed { .. }
+        ),
         "the defect: the wall unread"
     );
     d.app.autopilot_timers.forget(d.session);

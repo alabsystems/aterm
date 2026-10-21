@@ -83,7 +83,7 @@ fn agent_gate(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         if test_path(&file.rel) || agents_own(&file.rel, &words) || !file.mentions(&tails) {
             continue;
         }
-        let code = shipped_code(file);
+        let code = file.shipped_code();
         let mut last = 0;
         for (at, variant, form) in gates(&code, &variants) {
             let no = code[..at].matches('\n').count() + 1;
@@ -132,22 +132,6 @@ fn enum_variants(file: &SourceFile, name: &str) -> Option<Vec<String>> {
         }
     }
     None
-}
-
-/// The file's CODE view with every test-only line blanked, so an offset in it
-/// reads one line of the file.
-fn shipped_code(file: &SourceFile) -> String {
-    let mut shipped = file.shipped_lines().map(|l| l.no).peekable();
-    let mut code = String::with_capacity(file.raw.len());
-    for line in file.lines() {
-        if shipped.next_if_eq(&line.no).is_some() {
-            code.push_str(line.code);
-        } else {
-            code.extend(std::iter::repeat_n(' ', line.code.len()));
-        }
-        code.push('\n');
-    }
-    code
 }
 
 /// Each of `variants` `code` tests, in order: its offset, its name and the

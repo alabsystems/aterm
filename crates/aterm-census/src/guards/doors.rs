@@ -296,6 +296,66 @@ fn declared(code: &str) -> impl Iterator<Item = &str> {
 }
 
 // ---------------------------------------------------------------------------
+// boot-id-door: the macOS boot id (`kern.bootsessionuuid`) is read through a
+// sysctl FFI call in one place, astream's (`astream_sys::boot_session`,
+// vendor/astream, outside this corpus). The guard watches that call alone: a
+// read of Linux's `/proc/sys/kernel/random/boot_id` is a plain file read, and
+// the tree keeps two on purpose (aterm-update's steady clock, judged by
+// `astream_sys::parse_boot_id`; aterm-release's publisher fence).
+// ---------------------------------------------------------------------------
+
+/// The macOS boot id's sysctl name.
+const BOOT_ID_SYSCTL: &str = "kern.bootsessionuuid";
+/// The calls that read a sysctl by its name: the read itself, and the name's
+/// lookup a `sysctl(2)` by MIB reads it through.
+const SYSCTL_BY_NAME: &[&str] = &["sysctlbyname", "sysctlnametomib"];
+
+pub(super) const BOOT_ID_DOOR: Rule = Rule {
+    id: "boot-id-door",
+    why: "the macOS boot id has one sysctl reader, `astream_sys::boot_session` (16 bytes, \
+          read through `parse_boot_id`, which refuses the all-zero id a damaged answer reads \
+          as, so two damaged answers never pass as one boot); a `sysctlbyname` of \
+          kern.bootsessionuuid elsewhere is a second reader without that judge, and twice one \
+          came back (30ae1a1185, f6ae36dfb4) after D1 had moved the tree onto astream's",
+    scope: &[],
+    check: boot_id_door,
+};
+
+/// A file of the tree that reads a sysctl by name ([`SYSCTL_BY_NAME`], the
+/// call on the CODE view) and holds the boot id's name in a literal (the TEXT
+/// view, so a comment naming it is no read): each such literal, wherever the
+/// call takes its name from — inline, a `const`, a helper of the same file.
+/// The name in a literal of a file that makes no such call is left alone: a
+/// test's oracle that asks `sysctl -n kern.bootsessionuuid` (a process, not
+/// the FFI read) checks astream's reading from outside it.
+fn boot_id_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
+    for file in product(tree) {
+        if !file.mentions(&[BOOT_ID_SYSCTL]) || !file.mentions(SYSCTL_BY_NAME) {
+            continue;
+        }
+        let reads = file
+            .lines()
+            .any(|line| calls(line.code).iter().any(|c| SYSCTL_BY_NAME.contains(c)));
+        if !reads {
+            continue;
+        }
+        for line in file.lines() {
+            if has(line.text, BOOT_ID_SYSCTL, Bound::Sub) {
+                out.push(file.finding(
+                    BOOT_ID_DOOR.id,
+                    line.no,
+                    format!(
+                        "names `{BOOT_ID_SYSCTL}` in a file that reads a sysctl by name: read \
+                         the boot with `astream_sys::boot_session` (and its text with \
+                         `astream_sys::parse_boot_id`)"
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // handoff-name: the live upgrade's handoff variables are authority, read and
 // handed on only as `HandoffName`s (crates/aterm-gui/src/handoff_env.rs).
 // ---------------------------------------------------------------------------
@@ -743,6 +803,53 @@ mod tests {
                 "crates/aterm-gpu/src/probe.rs:1",
                 "crates/aterm-gui/src/launch.rs:1",
             ]
+        );
+    }
+
+    /// The boot id is read by name only in astream: the two shapes that came back
+    /// (30ae1a1185's inline call, its literal a line below the call; a `const` name), a
+    /// `sysctlnametomib` lookup and a test's own read are found. NEGATIVE CONTROL: a test's
+    /// oracle that spawns `sysctl -n kern.bootsessionuuid`, a file that reads other sysctls
+    /// and names the boot id only in comments, and this crate's own tables are not.
+    #[test]
+    fn the_boot_id_is_read_by_astream_alone() {
+        let inline = "pub fn boot_session() -> Option<String> {\n    let rc = unsafe {\n        \
+                      libc::sysctlbyname(\n            c\"kern.bootsessionuuid\".as_ptr(),\n            \
+                      buf.as_mut_ptr().cast(),\n        )\n    };\n}\n";
+        let by_const = "const BOOT: &CStr = c\"kern.bootsessionuuid\";\n\
+                        fn sysctl_text(name: &CStr) -> Option<String> {\n    \
+                        unsafe { sysctlbyname(name.as_ptr(), p, l, n, 0) };\n}\n\
+                        pub fn boot_id() -> Option<u128> { sysctl_text(BOOT)?.parse().ok() }\n";
+        let by_mib = "fn mib() { sysctlnametomib(c\"kern.bootsessionuuid\".as_ptr(), m, l); }\n";
+        let in_test = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
+                       unsafe { libc::sysctlbyname(c\"kern.bootsessionuuid\".as_ptr(), p, l, n, 0) };\n    \
+                       }\n}\n";
+        let oracle = "fn kernel_text() -> String {\n    let mut sysctl = command(\"sysctl\");\n    \
+                      sysctl.args([\"-n\", \"kern.bootsessionuuid\"]);\n    run(sysctl)\n}\n";
+        let prose = "// Not kern.bootsessionuuid: that is astream's (astream_sys::boot_session).\n\
+                     /// Unlike `kern.bootsessionuuid`, `kern.sleeptime` moves.\n\
+                     fn slept() { unsafe { sysctlbyname(c\"kern.sleeptime\".as_ptr(), p, l, n, 0) }; }\n";
+        let found = run(
+            &BOOT_ID_DOOR,
+            &[
+                ("crates/aterm-uds/src/process.rs", inline),
+                ("crates/aterm-caffeine/src/instance.rs", by_const),
+                ("crates/aterm-x/src/mib.rs", by_mib),
+                ("crates/aterm-y/src/probe.rs", in_test),
+                ("crates/aterm-link/src/durability.rs", oracle),
+                ("crates/aterm-z/src/sleep.rs", prose),
+                ("crates/aterm-census/src/guards/doors.rs", inline),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/aterm-caffeine/src/instance.rs:1",
+                "crates/aterm-uds/src/process.rs:4",
+                "crates/aterm-x/src/mib.rs:1",
+                "crates/aterm-y/src/probe.rs:5",
+            ],
+            "{found:#?}"
         );
     }
 

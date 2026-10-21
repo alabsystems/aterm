@@ -94,9 +94,10 @@ pub fn set_mode(path: &Path, mode: u32) {
     let _ = (path, mode);
 }
 
-/// `git -C <dir> <args…>` with a fixed identity; panics on failure.
+/// `git -C <dir> <args…>` ([`atpkg_publish::testkit::git`]) with a fixed identity; panics on
+/// failure.
 pub fn git(dir: &Path, args: &[&str]) -> String {
-    let out = aterm_uds::spawnfd::command("git")
+    let out = atpkg_publish::testkit::git()
         .arg("-C")
         .arg(dir)
         .args([
@@ -108,6 +109,10 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            // No template: a fixture repository carries no sample hooks, no description and
+            // no info/exclude, files every test lays down and removes and nothing reads.
+            "-c",
+            "init.templateDir=",
         ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")

@@ -12,10 +12,12 @@
 //! * A program outside `Program::supervisable` is read but never answered.
 //!   Decisions require the agent reader's authoritative prompt phase.
 //! * Usage-limit dialogs use [`limit_reset`] when explicitly enabled, else
-//!   [`limit_wait`]. The grant pick is not spending authority: the loop asks
-//!   the host before its first key and fences the confirmation separately
-//!   ([`super::reset`]). That policy supports legacy/Full allowances and records
-//!   success only for the claimed raw wall; partial kinds need a person.
+//!   [`limit_wait`]. The grant pick ([`aterm_phase::reset_row`]: the one
+//!   reset on offer, of a kind the step takes, or the first kind of the
+//!   owner's `limit_reset_kinds` on offer, never a Fable reset) is not
+//!   spending authority: the loop asks the host before its first key and
+//!   fences the confirmation separately ([`super::reset`]); success is
+//!   recorded only for the claimed raw wall.
 //! * Usage-credits consent uses [`credits_consent`] and the default-off
 //!   `usage_credits` grant. Without it, [`credits_decline`] cancels only a
 //!   recognized consent; purchases and re-enabling account credits stay refused.
@@ -146,10 +148,14 @@ pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
 /// continue automatically …` row, at every level, under
 /// [`ApprovalCtx::limit_wait`].
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
-/// The usage-limit dialog's grant row ([`limit_reset`]): `Use your reset now
+/// The usage-limit dialog's grant row ([`limit_reset`]): the one reset on
+/// offer, of a kind the step takes, or the first kind of the owner's list on
+/// offer ([`ApprovalCtx::reset_kinds`]), `Use a <5-hour|weekly|full> reset
 /// (<n> left, until <day>)`, at every level, only under
-/// [`ApprovalCtx::limit_reset`]. The one rule that may choose an option that
-/// spends a reset ([`never_spends`]).
+/// [`ApprovalCtx::limit_reset`]. The one
+/// rule that may choose an option that spends a reset ([`never_spends`]).
+/// The ledger's Enter on its confirmation names that kind's yes (`Yes, use
+/// my weekly reset`; an older build's `Yes, use my reset`).
 pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
 /// Claude Code's autocompact offer ([`autocompact_offer`]): `Autocompact at ‹
 /// <size> › tokens` at the size `[harness] autocompact_offer` names, at every
@@ -576,6 +582,10 @@ pub struct ApprovalCtx {
     /// it: with it off the dialog is the wait row's, as it was before a reset
     /// could be taken.
     pub limit_reset: bool,
+    /// The kinds of reset [`Self::limit_reset`] may spend, the owner's first
+    /// first (`[harness] limit_reset_kinds`); empty, the dialog's one reset
+    /// on offer ([`aterm_phase::reset_row`]).
+    pub reset_kinds: Vec<aterm_phase::ResetKind>,
     /// Whether full power takes a consent that carries the session onto
     /// usage credits ([`credits_consent`], `[harness] usage_credits`). Off,
     /// the default: such a box is cancelled with Esc where it reads one
@@ -593,6 +603,17 @@ pub struct ApprovalCtx {
     /// `false`: a person's own `/login`, whose picker is theirs whatever
     /// [`Self::login_method`] says.
     pub login_carry: bool,
+    /// THE `/login` METHOD PICKER OF THE LOOP'S OWN `/login`, ONCE THE LOGIN
+    /// CAME BACK IN ANOTHER TAB ([`super::login::PickerGate::Back`]): nothing
+    /// is left to sign in, so it is answered by nobody — a method chosen
+    /// would open a browser sign-in nobody needs — and the owner closes it.
+    pub login_back: bool,
+    /// THE `/login` METHOD PICKER OF THE LOOP'S OWN `/login`, ONCE A RENEWAL
+    /// THE TAB FOLLOWS BY ITSELF REPLACED THE LOGIN IT SIGNS IN
+    /// ([`super::login::PickerGate::Renewed`]): answered by nobody — a method
+    /// chosen would open a browser sign-in that brings back the replaced
+    /// login — and the owner closes it.
+    pub login_renewed: bool,
     /// THE METHOD THIS SESSION'S LOGIN ALREADY IS (`crate::supervise::IdleHost::login_method`),
     /// which the picker of the loop's own `/login` ([`Self::login_carry`]) is
     /// answered with ([`super::login::pick_method`],
@@ -736,9 +757,12 @@ impl ApprovalCtx {
             model_fallback: defaults.model_fallback.is_some(),
             limit_wait: defaults.limit_wait,
             limit_reset: defaults.limit_reset,
+            reset_kinds: defaults.limit_reset_kinds,
             usage_credits: defaults.usage_credits,
             autocompact_offer: defaults.autocompact_offer,
             login_carry: false,
+            login_back: false,
+            login_renewed: false,
             login_method: None,
             trust_roots: Vec::new(),
             trusted_cwd: None,
@@ -886,8 +910,9 @@ pub fn decide(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision
 /// rules, and the two checks every decision passes last ([`never_spends`],
 /// THE PRESS GATE), each named by the rule that decided where one did. The
 /// same function: `decide` is this one with no trace, so a trace tells of
-/// the very decision the loop makes. Diagnostic callers can keep a trace;
-/// the loop uses `NoTrace`, and no CLI reader is wired here.
+/// the very decision the loop makes. The loop uses `NoTrace`; its reader is
+/// `aterm drive replay --why` (`tape::explain`), which decides a recorded
+/// box again from its mark's facts with a trace kept.
 pub fn decide_traced(
     reading: &Reading,
     rows: &[String],
@@ -1190,6 +1215,12 @@ fn decide_box(
             aterm_phase::LoginScreen::Picker(picker) if ctx.login_carry => {
                 super::login::pick_method(prompt, &picker, ctx.login_method)
             }
+            aterm_phase::LoginScreen::Picker(_) if ctx.login_back => Decision::escalate(
+                "the login came back in another tab: press Esc in the tab to close this sign-in",
+            ),
+            aterm_phase::LoginScreen::Picker(_) if ctx.login_renewed => Decision::escalate(
+                "the login was renewed: press Esc in the tab to close this sign-in",
+            ),
             aterm_phase::LoginScreen::Picker(_) => {
                 Decision::escalate("a /login you opened: its sign-in method is yours to pick")
             }
@@ -2789,23 +2820,30 @@ fn opens_with(label: &str, words: &[&str]) -> bool {
 
 /// WHETHER CHOOSING AN OPTION LABELLED `label` SPENDS A LIMIT RESET — the ONE
 /// rule every pick and [`decide`]'s last check ask ([`buys`],
-/// [`never_spends`]): Claude Code's `Use your reset now (…)` and `Reset your
-/// session limit now` rows on the usage-limit dialog, and `Yes, use my reset`
-/// on the confirmation the first opens — 2.1.304's `Use a {kind} (…)` and
-/// `Yes, use my {kind}`, every kind it names and any it may add — by the
-/// reader's own rule ([`aterm_phase::spends_reset`]) and by the wider words of
-/// [`RESET_SPEND`]. READ in the 2.1.286, 2.1.287 and 2.1.304 bundles; no such
-/// box has been captured on a screen.
+/// [`never_spends`]): Claude Code 2.1.304's grant rows of every kind (`Use a
+/// weekly reset (…)`, the Fable one too) and its `Reset your session limit
+/// now` row on the usage-limit dialog, and each kind's `Yes, use my <kind>`
+/// on the confirmation a grant row opens, by the reader's own anchors
+/// ([`aterm_phase::spends_reset`]) and by their wide words
+/// ([`aterm_phase::uses_a_reset`]: `use` and a determiner, then a head that
+/// names a reset, so a kind the server adds or renames, however many words
+/// its name takes, still reads as a spend); and the
+/// 2.1.286–2.1.303 words the reader no longer reads (`Use your reset now
+/// (…)`, `Yes, use my reset`) by [`RESET_SPEND`], so an older build still
+/// running spends nothing either. READ in the 2.1.286, 2.1.287 and 2.1.304
+/// bundles; no such box has been captured on a screen.
 ///
 /// A reset is a counted allowance with a deadline, and the weekly one claims
 /// with no confirmation at all. A confirmation whose title row is off the
 /// screen would fall to [`allow_once`], whose first plain yes is `Yes, use my
-/// reset`; so such a box is pressed by no rule (it is not read whole,
+/// weekly reset`; so such a box is pressed by no rule (it is not read whole,
 /// [`head_unread`]), a box that offers one gets the option that waits (`No,
 /// keep it`, [`RULE_NO_SPEND`]), and the grant row is chosen by
 /// [`RULE_LIMIT_RESET`] alone.
 fn spends(label: &str) -> bool {
-    aterm_phase::spends_reset(label) || opens_with(label, RESET_SPEND)
+    aterm_phase::spends_reset(label)
+        || opens_with(label, RESET_SPEND)
+        || aterm_phase::uses_a_reset(label)
 }
 
 /// Whether choosing `opt` would buy something: its label spends a limit
@@ -3489,20 +3527,23 @@ fn judged_row(p: &PromptV2, rows: &[String]) -> usize {
 
 /// The usage-limit options dialog's GRANT ROW ([`RULE_LIMIT_RESET`]), decided
 /// in front of the wait row: `Some` only where `[harness] limit_reset` is on
-/// ([`ApprovalCtx::limit_reset`]), the dialog holds exactly one row that
-/// spends a reset, read by the grant's whole template — of no kind, or one
-/// kind of 2.1.304's but a Fable reset — and no weekly session reset's row
-/// ([`aterm_phase::reset_row`]: never by its place), its title is the
-/// dialog's and on the screen, and an option has the focus. The row is then
-/// reached and confirmed as the wait row is — arrows, and Enter once a fresh
-/// read shows the focus on that very label, under the title row's guard,
-/// never a digit. `None` — the wait row's rule, exactly as with the key off —
-/// in every other case. What follows the row is the loop's.
+/// ([`ApprovalCtx::limit_reset`]), the dialog's row taken is the ONE option
+/// that spends a reset, of a kind the step takes (5-hour, weekly, full; never
+/// a Fable row) — or, under the owner's `limit_reset_kinds`
+/// ([`ApprovalCtx::reset_kinds`]), the row of the first listed kind on offer
+/// — read by its whole template ([`aterm_phase::reset_row`]: never by its
+/// place; several on offer, with no list, are the owner's to choose), its title
+/// is the dialog's and on the screen, and an option has the focus. The row
+/// is then reached and confirmed as the wait row is — arrows, and Enter once
+/// a fresh read shows the focus on that very label and that label still the
+/// row the rule takes (`press_focused`), under the title row's guard, never
+/// a digit. `None` — the wait row's rule, exactly as with the key off — in
+/// every other case. What follows the row is the loop's.
 fn limit_reset(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Option<Decision> {
     if !ctx.limit_reset {
         return None;
     }
-    let row = aterm_phase::reset_row(prompt)?;
+    let row = aterm_phase::reset_row(prompt, &ctx.reset_kinds)?;
     let title = anchor("limit.title");
     if prompt.title != title {
         return None;
@@ -3626,7 +3667,10 @@ fn autocompact_offer(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> D
     };
     let steps = focus_steps(at, offer.accept);
     let label = prompt.options[offer.accept].label.clone();
-    let (choice, subject) = if offer.size == target {
+    // The target is a size of the ladder in kilo-tokens; the offer's size is
+    // the server's, in tokens as drawn (`350.5k`).
+    let target_tokens = target.saturating_mul(1000);
+    let (choice, subject) = if offer.tokens == target_tokens {
         (
             Choice::Focus {
                 steps,
@@ -3635,7 +3679,11 @@ fn autocompact_offer(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> D
             format!("{label} (autocompact at {target}k)"),
         )
     } else {
-        let key = if offer.size < target { "right" } else { "left" };
+        let key = if offer.tokens < target_tokens {
+            "right"
+        } else {
+            "left"
+        };
         (
             Choice::FocusKey {
                 steps,
@@ -3643,8 +3691,8 @@ fn autocompact_offer(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> D
                 key,
             },
             format!(
-                "{label}: one step {key}, from {}k toward {target}k",
-                offer.size
+                "{label}: one step {key}, from {} toward {target}k",
+                aterm_phase::autocompact::size_words(offer.tokens)
             ),
         )
     };

@@ -26,6 +26,15 @@
 //! * AT REST, NOTHING. Collecting is a clear and a few pushes into buffers
 //!   kept for their capacity, made only on a frame that runs anyway; no
 //!   clock, no lock, no wake.
+//! * THE MENU IS AN OVERLAY, NOT GROUND. The Autopilot menu opens and
+//!   closes under the hand; its card is noted apart ([`PetChrome::note_overlay`],
+//!   read by [`PetChrome::held_overlays`]). It protects its cells like the
+//!   rest, but the pet's rest seat is solved without it
+//!   (`aterm_effects::pet_world::PetWorld::observe_with_overlays`), so opening
+//!   the menu over the sleeping cat moves it no farther than any selection
+//!   does (a step aside within `HOME_REACH`, or it yields where it lies)
+//!   instead of sending it to sleep under the card, and closing the menu
+//!   puts it back where it was.
 //! * ONLY A PASS ENDS A PASS. A route that paints the menu with no footer
 //!   pass before it (a capture whose layout is not the window's, where
 //!   `splice_claude_footer` does not run) began nothing, so its commit keeps
@@ -45,6 +54,10 @@ pub(crate) struct PetChrome {
     held: Vec<PetRect>,
     /// This pass's, being gathered; swapped into `held` at its commit.
     next: Vec<PetRect>,
+    /// The transient overlays among them (the Autopilot menu's card), held
+    /// and gathered the same way ([`PetChrome::note_overlay`]).
+    held_overlays: Vec<PetRect>,
+    next_overlays: Vec<PetRect>,
     /// The focused pane of this pass in frame cells `(row, col, rows, cols)`:
     /// a write outside it is another pane's, which the pet does not live in.
     pane: Option<(usize, usize, usize, usize)>,
@@ -62,10 +75,18 @@ impl PetChrome {
         &self.held
     }
 
+    /// The transient overlays the pet takes as occupied, marked read the
+    /// same way: the Autopilot menu's card ([`PetChrome::note_overlay`]).
+    pub(crate) fn held_overlays(&self) -> &[PetRect] {
+        self.read.set(true);
+        &self.held_overlays
+    }
+
     /// Start a pass over the focused pane at `pane` (frame cells `(row, col,
     /// rows, cols)`; `None`: no focused terminal pane, so nothing is noted).
     pub(crate) fn begin(&mut self, pane: Option<(usize, usize, usize, usize)>) {
         self.next.clear();
+        self.next_overlays.clear();
         self.pane = pane;
         self.begun = true;
     }
@@ -73,20 +94,33 @@ impl PetChrome {
     /// A splice painted `cols` cells from frame cell `(row, col)` down `rows`
     /// rows: the part inside the focused pane, pane-local.
     pub(crate) fn note(&mut self, row: usize, col: usize, rows: usize, cols: usize) {
-        let Some((pr, pc, prows, pcols)) = self.pane else {
-            return;
-        };
+        if let Some(rect) = self.pane_local(row, col, rows, cols) {
+            self.next.push(rect);
+        }
+    }
+
+    /// As [`PetChrome::note`], for a TRANSIENT overlay (the Autopilot menu's
+    /// card): protected alike, but never ground the pet's rest seat is
+    /// solved on (module docs).
+    pub(crate) fn note_overlay(&mut self, row: usize, col: usize, rows: usize, cols: usize) {
+        if let Some(rect) = self.pane_local(row, col, rows, cols) {
+            self.next_overlays.push(rect);
+        }
+    }
+
+    /// The part of a write inside the focused pane, pane-local.
+    fn pane_local(&self, row: usize, col: usize, rows: usize, cols: usize) -> Option<PetRect> {
+        let (pr, pc, prows, pcols) = self.pane?;
         let (r0, r1) = (row.max(pr), (row + rows).min(pr + prows));
         let (c0, c1) = (col.max(pc), (col + cols).min(pc + pcols));
-        if r0 >= r1 || c0 >= c1 {
-            return;
-        }
-        self.next.push(PetRect::new(
-            (r0 - pr) as f32,
-            (c0 - pc) as f32,
-            (r1 - r0) as f32,
-            (c1 - c0) as f32,
-        ));
+        (r0 < r1 && c0 < c1).then(|| {
+            PetRect::new(
+                (r0 - pr) as f32,
+                (c0 - pc) as f32,
+                (r1 - r0) as f32,
+                (c1 - c0) as f32,
+            )
+        })
     }
 
     /// End the pass: what it gathered becomes what the pet reads. `true`
@@ -98,9 +132,10 @@ impl PetChrome {
         if !std::mem::take(&mut self.begun) {
             return false;
         }
-        let moved = self.next != self.held;
+        let moved = self.next != self.held || self.next_overlays != self.held_overlays;
         if moved {
             std::mem::swap(&mut self.next, &mut self.held);
+            std::mem::swap(&mut self.next_overlays, &mut self.held_overlays);
         }
         self.pane = None;
         moved && self.read.replace(false)
@@ -159,6 +194,42 @@ mod tests {
         quiet.begin(pane);
         quiet.note(47, 74, 1, 6);
         assert!(!quiet.commit(), "no pet read: nothing owed");
+    }
+
+    /// THE MENU IS AN OVERLAY, NOT GROUND: a card noted as an overlay is
+    /// held apart from the chrome ([`PetChrome::held_overlays`], never in
+    /// [`PetChrome::held`]), and a pass where only it moves (the menu opens
+    /// or closes over still chrome) owes a pet that read the old sets a
+    /// frame.
+    ///
+    /// NEGATIVE CONTROLS (as run, each failing this test): the card noted
+    /// as chrome (`note_overlay` pushing to `next`); a commit that compares
+    /// the chrome alone.
+    #[test]
+    fn a_menu_is_held_apart_from_the_chrome_and_its_move_owes_a_frame() {
+        let pane = Some((1, 0, 30, 100));
+        let mut chrome = PetChrome::default();
+        chrome.begin(pane);
+        chrome.note(28, 0, 1, 100);
+        let _ = chrome.commit();
+        let _ = chrome.held();
+        chrome.begin(pane);
+        chrome.note(28, 0, 1, 100);
+        chrome.note_overlay(10, 2, 11, 40);
+        assert!(
+            chrome.commit(),
+            "the menu opened under a pet that read the old sets"
+        );
+        assert_eq!(
+            chrome.held(),
+            [PetRect::new(27.0, 0.0, 1.0, 100.0)],
+            "the chrome alone"
+        );
+        assert_eq!(chrome.held_overlays(), [PetRect::new(9.0, 2.0, 11.0, 40.0)]);
+        chrome.begin(pane);
+        chrome.note(28, 0, 1, 100);
+        assert!(chrome.commit(), "the menu closed: owed again");
+        assert!(chrome.held_overlays().is_empty());
     }
 
     /// A COMMIT WITH NO PASS BEGUN KEEPS WHAT IS HELD (the capture routes

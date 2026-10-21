@@ -229,8 +229,9 @@ impl Run {
         if self.output.contains(ENOSPC_SENTENCE) {
             return Some(format!("the child ran out of disk ({ENOSPC_SENTENCE})"));
         }
-        // The row names what the machine lacks and its fix (`install node
-        // (brew install node)`), where its reader looks, not only in the log.
+        // The row names what the machine lacks and its provider's fix (no fish here:
+        // `targo --unverified verify provision` builds …), where its reader looks, not
+        // only in the log.
         crate::libtest::environment_refusals(&self.output)
             .map(|names| crate::libtest::refusal_reason("every failing test", &names, &self.output))
     }

@@ -38,6 +38,9 @@ mod clean;
 #[path = "../../src/cli.rs"]
 #[allow(dead_code)]
 mod cli;
+#[path = "../../src/credential_wait.rs"]
+#[allow(dead_code)]
+mod credential_wait;
 #[path = "../../src/cutter.rs"]
 #[allow(dead_code)]
 mod cutter;
@@ -138,3 +141,25 @@ mod signconf;
 mod site_sync;
 mod snapshot_take;
 mod trust_facts_model;
+
+/// This process's `PATH` with git's exec-path first, as git itself puts it for its own
+/// children, resolved once per process: handed to code under test that builds its own `git`
+/// from `PATH` (an env pair it takes), it finds the same git without a shim in front of it
+/// (macOS's `/usr/bin/git` is xcrun's, a second exec that doubles what each git process
+/// costs), and nothing but git's own commands moves ahead.
+fn git_first_path() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let o = aterm_uds::spawnfd::command("git")
+            .arg("--exec-path")
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git --exec-path: {o:?}");
+        let exec = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        match std::env::var("PATH") {
+            Ok(path) => format!("{exec}:{path}"),
+            Err(_) => exec,
+        }
+    })
+}

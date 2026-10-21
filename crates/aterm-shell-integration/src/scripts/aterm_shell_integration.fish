@@ -433,67 +433,34 @@ end
 
 # @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
 
+# Enable agy's fast prompt editor by default (including in adopted shells when
+# this body is live-reloaded at the next prompt) so U+202F narrow no-break
+# spaces in macOS screenshot filenames do not desynchronize Bubble Tea's
+# textarea visual cursor.
+if not set -q AGY_CLI_FAST_PROMPT_EDITOR
+    set -gx AGY_CLI_FAST_PROMPT_EDITOR true
+end
+
 # ─── AN OLDER SCRIPT'S `~/.aterm/bin`, taken off (2026-10-19) ───
 #
-# Every script before 613305828c (2026-10-16) put `$HOME/.aterm/bin` FIRST on
-# PATH when it loaded a shell fresh and that folder existed; none since does
-# (the loader's package block says why). Such a shell kept the entry through an
-# upgrade in place — this body sourced at a prompt by its older loader, or this
-# loader sourced over it — until it exited. So the body takes it off, once per
-# shell, where the shell PROVES that such a script put it there, and nowhere
-# else: v0.106.0 and every build from 613305828c up to this one put none there
-# and set no mark, so in their shells a `~/.aterm/bin` on PATH is the user's
-# own. The proof has two halves:
-#
-#  1. The script that loaded this shell fresh carried the prepend. That is the
-#     loader in `__aterm_si_dir` when its own load was the fresh one
-#     (`__aterm_fresh_load` 1), or, when this build's loader came in place, the
-#     one it noted there (`__aterm_bin_from`, the loader's block says how; `-`
-#     for a shell from before loaders, whose every script prepended). The
-#     folder is content-addressed, so its loader still holds the bytes that
-#     loaded the shell, and the prepend line is looked for in it, spelled here
-#     so that this file never holds it. A folder already collected, or a loader
-#     an intermediate build sourced in place, leaves nothing to prove it with:
-#     the entry stays.
-#  2. The folder was there at that load: it is older than the shell process —
-#     its positive birth, or its last change only when birth is unavailable,
-#     by more than the whole seconds `stat`, `date` and `ps -o etime=` count in.
-#     A usable birth takes precedence even if mtime was preserved or backdated.
-#     The clock is read before the shell's age; mtime without a usable birth
-#     remains a fallback reading, not an independent creation-time witness.
-#
-# One `sh` asks both (grep, stat, ps and date: once per shell, and only where
-# PATH holds the entry and the folder exists). Then one copy goes — the first
-# equal to `$HOME/.aterm/bin` — and nothing else moves: the folder stays on
-# PATH once for every copy the user's own startup put there. `contains -i`
-# compares strings, never patterns.
+# Once per shell, in a shell an older script loaded that this body reaches in
+# place (`__aterm_old_bin_off` unset; a fresh load settles it in the loader):
+# `aterm_shell_integration_old_bin.fish`, beside this file in its folder, says
+# what goes and when, and takes it off. Its own file (2026-10-20) because no
+# shell this build starts ever runs it, yet every one paid here to parse it:
+# about 0.45 M of the 165 M instructions to the first prompt (2026-10-20, fish
+# 4.9.3, a PTY, the captured aterm spawn env, interleaved, n=40).
+# The folder is `status dirname`'s less the vendor conf.d a fresh load comes
+# from (as `__aterm_si_dir`), each piece captured whole (the glue rule); a copy
+# with no such file beside it takes nothing off. Sourced only when it is this
+# user's (`test -O`), as THE BODY CHECK sources a body.
 if not set -q __aterm_old_bin_off
     set -g __aterm_old_bin_off 1
-    set -l __aterm_from ""
-    if set -q __aterm_bin_from
-        set __aterm_from "$__aterm_bin_from"
-    else if test "$__aterm_fresh_load" = 1; and test -n "$__aterm_si_dir"
-        set __aterm_from "$__aterm_si_dir/aterm_shell_integration.fish"
-    end
-    set -l __aterm_at (contains -i -- "$HOME/.aterm/bin" $PATH)
-    if test -n "$__aterm_from"; and test -n "$__aterm_at"; and test -d "$HOME/.aterm/bin"
-        if command sh -c '
-                    [ "$1" = - ] || grep -qF -e "$2" -- "$1" || exit 1
-                    t=$(stat -f "%B %m" -- "$3") || t=$(stat -c "%W %Y" -- "$3") || exit 1
-                    b=${t%% *}; m=${t##* }
-                    case $m in ""|*[!0-9]*) exit 1 ;; esac
-                    case $b in ""|*[!0-9]*|0) b=$m ;; esac
-                    n=$(date +%s) || exit 1
-                    e=$(ps -o etime= -p "$4") || exit 1
-                    e=${e##* }; d=0
-                    case $e in *-*) d=${e%%-*}; d=${d#0}; e=${e#*-} ;; esac
-                    case $d$e in ""|*[!0-9:]*) exit 1 ;; esac
-                    s=0; IFS=:
-                    for x in $e; do x=${x#0}; s=$((s * 60 + ${x:-0})); done
-                    [ $((b + ${d:-0} * 86400 + s + 1)) -lt "$n" ]
-                ' sh "$__aterm_from" "set -gx PATH \"\$HOME/.aterm/bin\" \$PATH" "$HOME/.aterm/bin" $fish_pid 2>/dev/null
-            set -e PATH[$__aterm_at]
-        end
+    set -l __aterm_here (status dirname)
+    set -l __aterm_dir (string replace -r '/fish-xdg/fish/vendor_conf\.d$' '' -- "$__aterm_here")
+    set -l __aterm_file "$__aterm_dir/aterm_shell_integration_old_bin.fish"
+    if test -f "$__aterm_file"; and test -O "$__aterm_file"
+        source "$__aterm_file"
     end
     set -e __aterm_bin_from
 end
@@ -895,12 +862,14 @@ function __aterm_report_cwd
     # file:// URL format. ONE double-quoted argument, interpolating the two
     # precomputed globals — never a string glued to a command substitution;
     # see the glue rule beside $__aterm_report_host above.
-    # SIGNED first, then plain (see the zsh script's __aterm_report_cwd).
+    # SIGNED first, then plain (see the zsh script's __aterm_report_cwd), the
+    # pair in one printf: no `__aterm_osc` call for either, at every prompt.
     set -l uri "file://$__aterm_report_host$cwd"
     if test -n "$__aterm_id_suffix_str"
-        __aterm_osc "633;P;AtermCwd=$uri$__aterm_id_suffix_str"
+        printf '\e]633;P;AtermCwd=%s%s\a\e]7;%s\a' "$uri" "$__aterm_id_suffix_str" "$uri"
+    else
+        __aterm_osc "7;$uri"
     end
-    __aterm_osc "7;$uri"
 end
 
 # Mark prompt start (OSC 133;A). Never from inside a user's prompt: a wrapper's
@@ -911,10 +880,19 @@ function __aterm_mark_prompt_start
     __aterm_osc "133;A$__aterm_id_suffix_str"
 end
 
-# Mark command line start (OSC 133;B), the same.
+# Mark command line start (OSC 133;B), the same. It ends the prompt fish draws
+# before the commandline, so it stands where the buffer starts, and a signed one
+# says so (`aterm_input=start`): aterm's typing prediction places Home, End,
+# Ctrl-A, Ctrl-E and Delete only on a line started at a mark that does
+# (`Terminal::input_region_start`; zsh's, sent after zle drew a pre-filled
+# line, says so only over an empty buffer).
 function __aterm_mark_command_start
     __aterm_prompt_inner; and return 0
-    __aterm_osc "133;B$__aterm_id_suffix_str"
+    if test -n "$__aterm_id_suffix_str"
+        __aterm_osc "133;B$__aterm_id_suffix_str;aterm_input=start"
+    else
+        __aterm_osc "133;B$__aterm_id_suffix_str"
+    end
 end
 
 # Mark command execution start (OSC 133;C)
@@ -1720,13 +1698,16 @@ if test "$__aterm_fresh_load" = 1
     __aterm_setup_keybindings
 end
 
-# Initial cwd report
-__aterm_report_cwd
-
 # An upgrade in place SIGNS its revision now, not at the next prompt — the zsh
 # script's twin, for the same reason: the typed line that upgrades a shell from
 # before loaders goes on to relaunch its agent, and until the shell's next
-# prompt the host would name it `integration_rev=frozen`.
+# prompt the host would name it `integration_rev=frozen` — and reports its cwd
+# with it. A fresh load does neither here: its first prompt does both, before
+# its 133;A, as every prompt does (`__aterm_body_prompt`), and zsh and bash
+# report the cwd only there. The report every load made here was that one's
+# twin a few milliseconds early (2026-10-20, fish 4.9.3, a PTY, the captured
+# aterm spawn env, n=40: about 0.8 M of the 163 M instructions to the prompt).
 if test "$__aterm_fresh_load" = 0
+    __aterm_report_cwd
     __aterm_mark_integration_rev
 end

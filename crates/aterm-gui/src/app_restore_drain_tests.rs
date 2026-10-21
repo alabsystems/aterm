@@ -19,6 +19,7 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
         restore::TerminalLeafRestore {
             sid: None,
             lineage: None,
+            log_ep: None,
             cwd: Some("/tmp".to_string()),
             title: title.to_string(),
             profile: None,
@@ -31,6 +32,7 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
             questions: None,
             autopilot: None,
             land_at: None,
+            autopilot_by: None,
             identity: None,
             theme: None,
             agent: None,

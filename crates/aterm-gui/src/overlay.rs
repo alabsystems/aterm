@@ -18,6 +18,7 @@
 
 use crate::chrome_band::ChromePalette;
 
+use crate::app_introspect::AuxTarget;
 use crate::overview::OverviewState;
 use crate::palette::PaletteState;
 use crate::session_picker::SessionPickerState;
@@ -150,15 +151,20 @@ pub(crate) enum OverlayKind {
 }
 
 impl OverlayKind {
-    /// The `controls front` `kind=` token — chosen so `kind=<x>` re-parses via
-    /// `AuxTarget::parse` to the SAME surface, letting a driver pipe `controls front`
-    /// -> `controls <kind>`. Palette maps to `"menu"` (its `AuxTarget`).
-    pub(crate) fn keyword(self) -> &'static str {
+    /// The `controls` target that reads this surface. Palette's is `Menu`.
+    pub(crate) const fn target(self) -> AuxTarget {
         match self {
-            OverlayKind::Palette => "menu",
-            OverlayKind::SessionPicker => "session-picker",
-            OverlayKind::Overview => "overview",
+            OverlayKind::Palette => AuxTarget::Menu,
+            OverlayKind::SessionPicker => AuxTarget::SessionPicker,
+            OverlayKind::Overview => AuxTarget::Overview,
         }
+    }
+
+    /// The `controls front` `kind=` token: its target's keyword, so `kind=<x>` re-parses
+    /// via `AuxTarget::parse` to the SAME surface, letting a driver pipe `controls front`
+    /// -> `controls <kind>`.
+    pub(crate) const fn keyword(self) -> &'static str {
+        self.target().keyword()
     }
 
     /// The variant tag [`Overlay::fingerprint`] seals the inner hash with. Distinct per
@@ -246,9 +252,7 @@ mod tests {
 
     /// `status_line()` (the `controls front` open case) reports `open=true`, the surface
     /// `kind=<keyword>`, the exact `Overlay::fingerprint()`, and a `scroll/total/visible`
-    /// extent — for every shipping variant. The `kind` keyword must re-parse
-    /// via `AuxTarget::parse` to the SAME surface, so a driver can pipe `controls front`
-    /// into `controls <kind>`.
+    /// extent — for every shipping variant.
     #[test]
     fn status_line_reports_open_kind_fp_and_extent() {
         let cases = [
@@ -275,12 +279,6 @@ mod tests {
             assert!(line.contains("scroll="), "extent scroll: {line}");
             assert!(line.contains("total="), "extent total: {line}");
             assert!(line.contains("visible="), "extent visible: {line}");
-            // The kind keyword must re-parse to a supported controls target (pipe-ability).
-            let kw = o.kind().keyword();
-            assert!(
-                crate::app_introspect::AuxTarget::parse(kw).is_some(),
-                "kind={kw} must re-parse via AuxTarget::parse"
-            );
         }
     }
 }

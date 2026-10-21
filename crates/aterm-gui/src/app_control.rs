@@ -265,14 +265,18 @@ impl App {
             );
         }
         let value = semantic_input(&node.role, &node.value, request.value.as_deref())?;
-        let result = self.dispatch_native_view_event(
-            wid,
-            request.view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new(request.action.clone()),
-                value,
-            }),
-        )?;
+        // `act` is a control client's gesture: an editor command it names
+        // runs only within that grant (`command_registry::editor_grant`).
+        let result = self.with_gesture_source(true, |app| {
+            app.dispatch_native_view_event(
+                wid,
+                request.view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(request.action.clone()),
+                    value,
+                }),
+            )
+        })?;
         if result != EventResult::Handled {
             return Err("native reducer did not handle the semantic action".to_string());
         }

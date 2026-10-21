@@ -26,6 +26,12 @@ fn connect() -> Option<(Connection, usize)> {
 }
 
 /// An unmapped 16x8 window on `screen`'s root, with PropertyChange events.
+///
+/// Override-redirect: a window manager (mutter on a desktop's Xwayland) takes
+/// a top-level window's MapWindow as a MapRequest and maps it when it gets to
+/// it, and GetImage of a window not yet viewable is BadMatch (8) for GetImage
+/// (73). A window no manager redirects is mapped by the server at once, as on a
+/// bare Xvfb.
 fn window(conn: &Connection, screen: usize) -> u32 {
     let s = &conn.setup().roots[screen];
     let wid = conn.generate_id().unwrap();
@@ -40,7 +46,9 @@ fn window(conn: &Connection, screen: usize) -> u32 {
         0,
         xproto::window_class::INPUT_OUTPUT,
         s.root_visual,
-        &ValueList::new().set(cw::EVENT_MASK, event_mask::PROPERTY_CHANGE),
+        &ValueList::new()
+            .set(cw::OVERRIDE_REDIRECT, 1)
+            .set(cw::EVENT_MASK, event_mask::PROPERTY_CHANGE),
     ))
     .unwrap()
     .check()

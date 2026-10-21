@@ -10,12 +10,15 @@
 //! shared. The frames must be byte-identical.
 //!
 //! Two oracles, one driver (Mesa: llvmpipe for GL, lavapipe for Vulkan, both
-//! gallivm):
+//! gallivm; or NVIDIA's for both, whose EGL gives wgpu's GL backend a desktop
+//! OpenGL 3.3 context):
 //!
 //! * wgpu's GL backend (`Backends::GL`), the downlevel format plan
 //!   (`srgb_offscreen` false): the GL arm runs the same plan. wgpu's GL backend
 //!   cannot build the glow row at all (naga refuses `@interpolate(linear)` for
-//!   every GLES target), so these fixtures leave the `GlowAdd` streams out.
+//!   every GLES target), so these fixtures leave the `GlowAdd` streams out; on
+//!   NVIDIA's 3.3 context it cannot build the fx rows either (no storage
+//!   buffer below GLSL 4.00), so the fx fixture is left out there.
 //! * wgpu's Vulkan backend (`Backends::VULKAN`), Linux's production renderer
 //!   before the GL flip, on the native plan: the GL arm emulates the
 //!   Unorm/sRGB view pair with `EXT_sRGB_write_control` and
@@ -218,6 +221,8 @@ impl GpuRenderer {
                         &src.rgba[..(src.width * src.height * 4) as usize],
                     )
                 }
+                // Replayed fresh below, with the palette.
+                DrawAtlas::Fx => continue,
                 DrawAtlas::Deco | DrawAtlas::Image => {
                     return Err(format!(
                         "the GL replay reached {a:?}; keep fixtures to the mono, colour and \
@@ -251,6 +256,31 @@ impl GpuRenderer {
             atlases[a as usize] = Some((tex, sampler));
         }
 
+        // The fx bind, fresh: both atlases replayed from the append log, the
+        // palette in one texture.
+        let mut fx_tex: [Option<fx_gpu::FxArmTex>; 2] = [None, None];
+        let mut fx_palette: Option<crate::gl::resources::GlTexture> = None;
+        let fx_sampler = if plan.iter().any(|i| i.atlas == Some(DrawAtlas::Fx)) {
+            for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
+                fx_gpu::sync_fx_tex(
+                    handle,
+                    &mut fx_tex[kind as usize],
+                    self.fx.atlas.side(kind),
+                    |_| true,
+                    || {},
+                )?;
+            }
+            gl_arm::write_fx_palette(dev, &mut fx_palette, &self.fx.palette)?;
+            let LayerSampler::Gl(sampler) =
+                handle.try_create_sampler("gl replay fx", SamplerKind::NearestClamp)?
+            else {
+                unreachable!("the GL handle mints GL samplers")
+            };
+            Some(sampler)
+        } else {
+            None
+        };
+
         let rig = GlFrameRig {
             offscreen: &offscreen,
             pipelines: std::array::from_fn(|i| pipelines[i].as_ref()),
@@ -258,6 +288,12 @@ impl GpuRenderer {
             uniform_binding: uniform_binding.unwrap_or(0),
             streams: std::array::from_fn(|i| streams[i].as_ref()),
             atlases: std::array::from_fn(|i| atlases[i].as_ref().map(|(t, s)| (t, s))),
+            fx: fx_sampler.as_ref().map(|sampler| GlFxBind {
+                r8: fx_tex[0].as_ref().expect("synced above").tex.gl(),
+                rgba: fx_tex[1].as_ref().expect("synced above").tex.gl(),
+                palette: fx_palette.as_ref().expect("written above"),
+                sampler,
+            }),
         };
 
         // --- the replay: ONE walker, the GL arm --------------------------
@@ -365,13 +401,10 @@ pub(crate) struct ReplayOpts<'a> {
 }
 
 /// A wgpu context on exactly `backends` (the oracle's driver choice), or why
-/// there is none.
+/// there is none: the instance and the lock [`GpuContext::new`] takes, so
+/// the oracles of tests running side by side meet as its contexts do.
 fn wgpu_ctx_on(backends: wgpu::Backends) -> Result<GpuContext, String> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    crate::block_on::block_on(GpuContext::from_instance(instance))
+    GpuContext::one_at_a_time(crate::instance_descriptor(backends))
 }
 
 /// The oracle renderer on `backends`, and the GL device; a machine without
@@ -766,6 +799,168 @@ fn image_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>
     )
 }
 
+/// The fx engine's five streams over text (docs/DESIGN-card-engine-2026-10-19.md
+/// §4.5): Exact layers at Under (an additive two-end rect and a ramps stack),
+/// Glow (an Index8 sprite, flipped, at an odd scale, over additive and
+/// source-over entries) and Over (a translucent rect and a Premul sprite with
+/// additive, clear, translucent and opaque texels), and Linear layers at Under
+/// and Over (a tinted Straight sprite, one flipped). Each arm uploads both
+/// atlases and the frame palette through its own residency; the replay
+/// rebuilds them from the atlas log.
+fn fx_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>) {
+    use aterm_core::render::{
+        FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace,
+        FxSprite, FxTexels, PxRect,
+    };
+    use aterm_core::terminal::Terminal;
+    let (cw, ch) = gpu.cell_size();
+    let (cw, ch) = (cw as i32, ch as i32);
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.process(b"$ fx over and under the text >_\r\n0123456789 abcdef\r\n");
+    let mut input = term.cell_frame(ROWS, COLS);
+    let layer = |id, items, palette, slot, blend| {
+        FxLayer::new(
+            id,
+            Arc::new(FxContent::new(items, palette)),
+            slot,
+            FxSpace::Window,
+            blend,
+        )
+    };
+    let index = Arc::new(
+        FxArt::new(
+            5,
+            3,
+            FxTexels::Index8,
+            vec![1, 0, 2, 3, 1, 2, 2, 0, 3, 1, 0, 1, 3, 2, 1],
+        )
+        .expect("sized"),
+    );
+    let premul: Vec<u8> = (0..12u32)
+        .flat_map(|i| match i % 4 {
+            0 => [0x30, 0x18, 0x40, 0],
+            1 => [0, 0, 0, 0],
+            2 => [(i * 9) as u8, 0x20, 0x50, 0x80],
+            _ => [0xd0, (i * 17) as u8, 0x30, 0xff],
+        })
+        .collect();
+    let premul = Arc::new(FxArt::new(4, 3, FxTexels::Rgba8Premul, premul).expect("sized"));
+    let straight: Vec<u8> = (0..9u32)
+        .flat_map(|i| {
+            [
+                (i * 29) as u8,
+                (200 - i * 11) as u8,
+                (i * 53) as u8,
+                [0u8, 255, 140][(i % 3) as usize],
+            ]
+        })
+        .collect();
+    let straight = Arc::new(FxArt::new(3, 3, FxTexels::Rgba8Straight, straight).expect("sized"));
+    let sprite = |(x, y): (i32, i32), (dw, dh): (i32, i32), flip_x, art: &Arc<FxArt>| {
+        FxItem::Sprite(FxSprite {
+            x,
+            y,
+            dw: dw as u16,
+            dh: dh as u16,
+            flip_x,
+            art: Arc::clone(art),
+            ink: 0,
+            clip: PxRect::EVERYWHERE,
+        })
+    };
+    input.fx_layers = vec![
+        layer(
+            1,
+            vec![
+                FxItem::Rect(FxRect {
+                    x: cw,
+                    y: ch / 2,
+                    w: (10 * cw) as u16,
+                    h: (2 * ch) as u16,
+                    ink: 0,
+                }),
+                FxItem::Ramps(FxRamps {
+                    x: 12 * cw,
+                    y: ch,
+                    w: (6 * cw) as u16,
+                    h: 3,
+                    ink: 2,
+                }),
+            ],
+            [
+                0x0018_2a30,
+                0x0030_1008,
+                0x0020_2020,
+                0x0008_3018,
+                0x0010_0820,
+                0x0028_2810,
+                0x0004_1830,
+                0x0030_3030,
+            ]
+            .map(FxInk::add)
+            .to_vec(),
+            FxSlot::Under,
+            FxBlend::Exact,
+        ),
+        layer(
+            2,
+            vec![sprite((3 * cw + 1, ch + 3), (37, 2 * ch + 5), true, &index)],
+            vec![
+                FxInk::add(0x0040_2010),
+                FxInk::over(0x0030_4020, 0xa0),
+                FxInk::over(0x0010_2030, 0xff),
+            ],
+            FxSlot::Glow,
+            FxBlend::Exact,
+        ),
+        layer(
+            3,
+            vec![
+                FxItem::Rect(FxRect {
+                    x: 2 * cw,
+                    y: 3 * ch,
+                    w: (7 * cw) as u16,
+                    h: (ch + 3) as u16,
+                    ink: 0,
+                }),
+                sprite((14 * cw, 2 * ch + 2), (29, 23), false, &premul),
+            ],
+            vec![
+                FxInk::over(0x0020_1030, 0x90),
+                FxInk::over(0x0050_2010, 0xe0),
+            ],
+            FxSlot::Over,
+            FxBlend::Exact,
+        ),
+        layer(
+            4,
+            vec![sprite((cw / 2, 4 * ch), (31, 19), false, &straight)],
+            vec![FxInk::over(0x00ff_ffff, 0xff)],
+            FxSlot::Under,
+            FxBlend::Linear,
+        ),
+        layer(
+            5,
+            vec![sprite((18 * cw, 3 * ch + 1), (23, 29), true, &straight)],
+            vec![FxInk::over(0x00c0_e0ff, 0xc0)],
+            FxSlot::Over,
+            FxBlend::Linear,
+        ),
+    ];
+    (
+        "fx",
+        input,
+        vec![
+            StreamId::FxUnder,
+            StreamId::FxGlow,
+            StreamId::FxOver,
+            StreamId::FxLinearUnder,
+            StreamId::FxLinearOver,
+            StreamId::Glyph,
+        ],
+    )
+}
+
 /// Every pixel equal, else a panic naming the first differing texel.
 fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
     assert_eq!(
@@ -777,16 +972,17 @@ fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
         return;
     }
     let (e, a) = (expected.rgba_bytes(), actual.rgba_bytes());
+    let (e, a) = (e.as_chunks::<4>().0, a.as_chunks::<4>().0);
     let mut diffs = 0usize;
     let mut first = None;
     let mut max_delta = 0u8;
-    for (i, (pe, pa)) in e.chunks_exact(4).zip(a.chunks_exact(4)).enumerate() {
+    for (i, (pe, pa)) in e.iter().zip(a).enumerate() {
         if pe != pa {
             diffs += 1;
             for (x, y) in pe.iter().zip(pa) {
                 max_delta = max_delta.max(x.abs_diff(*y));
             }
-            first.get_or_insert((i, pe.to_vec(), pa.to_vec()));
+            first.get_or_insert((i, *pe, *pa));
         }
     }
     let (i, pe, pa) = first.expect("pixels differ, so a texel differs");
@@ -794,7 +990,7 @@ fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
         "{name}: THE GL FRAME IS NOT BYTE-IDENTICAL TO wgpu: {diffs} of {} texels differ, max \
          byte delta {max_delta}; first at ({},{}): wgpu {pe:02x?} != gl {pa:02x?}. Measure the \
          cause (twin, blend, view, clear, sampler, copy); never loosen the comparison.",
-        e.len() / 4,
+        e.len(),
         i % expected.width,
         i / expected.width,
     );
@@ -806,6 +1002,20 @@ fn run_differential(backends: wgpu::Backends, glow_add: bool) -> Vec<String> {
     let (mut gpu, dev) = arms_on(backends);
     let mut win = WindowGpu::new();
     let mut fixtures = fixtures(&gpu, glow_add);
+    // wgpu reads the fx palette from a fragment storage buffer; a device that
+    // cannot build the fx rows stages no fx stream (`EffectPipelines::ensure`),
+    // so its plan has none to replay and the fixture's claims would fail on
+    // the oracle, not GL. Its limits cannot say so: NVIDIA's EGL gives wgpu's
+    // GL backend a desktop GL 3.3 context whose limits count
+    // `ARB_shader_storage_buffer_object`'s blocks, but naga writes GLSL 3.30
+    // and a storage buffer only from 4.00. The device's own answer decides.
+    let device = gpu.ctx.device.clone();
+    gpu.effects.ensure(&device, EffectPipeline::Fx);
+    gpu.effects.ensure(&device, EffectPipeline::FxLinear);
+    match gpu.effects.fx_layouts(&device).err().map(str::to_owned) {
+        None => fixtures.push(fx_fixture(&gpu)),
+        Some(why) => crate::stderr_line!("gl replay on {backends:?}: no fx fixture: {why}"),
+    }
     let mut lines = Vec::new();
     let mut run = |gpu: &mut GpuRenderer,
                    win: &mut WindowGpu,
@@ -971,6 +1181,7 @@ fn armed_gl_readbacks_match_the_wgpu_arm_byte_for_byte() {
     let (mut win_o, mut win_a) = (WindowGpu::new(), WindowGpu::new());
     let mut fixtures = fixtures(&oracle, true);
     fixtures.push(image_fixture(&oracle));
+    fixtures.push(fx_fixture(&oracle));
     for (name, input, drive) in fixtures {
         for pass in 0..3 {
             let expected = oracle
@@ -1119,18 +1330,21 @@ fn presented(
     assert!(ok, "the virtual present refused (see the arm's note)");
     let shot = gpu
         .virtual_presented_snapshot_current(win, win.resident_input_epoch(), 1)
+        .and_then(crate::video_tap::RawCapture::convert)
         .expect("the presented destination reads back");
     Frame {
         width: shot.w as usize,
         height: shot.h as usize,
         pixels: shot
             .rgba
-            .chunks_exact(4)
-            .map(|c| {
-                ((255 - u32::from(c[3])) << 24)
-                    | (u32::from(c[0]) << 16)
-                    | (u32::from(c[1]) << 8)
-                    | u32::from(c[2])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&[r, g, b, a]| {
+                ((255 - u32::from(a)) << 24)
+                    | (u32::from(r) << 16)
+                    | (u32::from(g) << 8)
+                    | u32::from(b)
             })
             .collect(),
     }
@@ -1172,6 +1386,7 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
     };
     let mut fixtures = fixtures(&oracle, true);
     fixtures.push(image_fixture(&oracle));
+    fixtures.push(fx_fixture(&oracle));
     fixtures.push(("heat", heat_input(&oracle), Vec::new()));
     // The layers the fixtures drive: the bloom halo and the SDR crown (cursor
     // glow), the shimmer (an additive fire patch), the sub-row glide (scroll).

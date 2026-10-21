@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use aterm_core::grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
 use aterm_core::terminal::{RowMatch, RowRange, Terminal, first_matching_row};
 use aterm_session::sink::SinkWriter;
+use aterm_types::control_verbs::Input;
 use aterm_window::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
@@ -306,9 +307,9 @@ fn named_key_from_token(body: &str) -> Option<aterm_types::keyboard::NamedKey> {
 }
 
 /// PURE parser for `key <name> [mods=<list>] [type=<t>] [base=<c>]` -> an
-/// [`InputEvent::Key`]. The additive grammar is
-/// unit-testable WITHOUT an `EventLoopProxy` (the verb can't run headless — it
-/// posts a `Wake::Input`). The SAME (Key, mods, base_layout, event_type) tuple a
+/// [`InputEvent::Key`]: the event the `key` verb delivers by its route
+/// (`control::InputRoute`), and pure, so the additive grammar is unit-testable
+/// WITHOUT an `EventLoopProxy`. The SAME (Key, mods, base_layout, event_type) tuple a
 /// human's named-key press builds, so the seam (the plain verb's encoder caller) yields
 /// byte-identical output incl. Kitty REPORT_ALTERNATE_KEYS. All trailing tokens
 /// are ADDITIVE — a bare `key up` still parses to empty mods / Press / no base.
@@ -381,28 +382,6 @@ fn take_inline_mods(body: &str) -> (aterm_types::keyboard::Modifiers, &str) {
     (m, rest)
 }
 
-/// Every AUTHORIZED control attempt that can inject bytes, signal the
-/// child, or mutate its cursor coordinate space — the verbs whose attempt
-/// is a newer input boundary for the glow's and the trail's move licence
-/// ([`control_fence`]).
-pub(crate) fn control_attempt_closes_cursor_license(verb: &str) -> bool {
-    matches!(
-        verb,
-        "send"
-            | "key"
-            | "ctrl"
-            | "feed"
-            | "signal"
-            | "restart"
-            | "mouse"
-            | "paste"
-            | "focus"
-            | "turn"
-            | "resize"
-            | "scroll"
-    )
-}
-
 /// The event a fencing verb's body delivers through the input seam, parsed
 /// with that verb's OWN parser — `key`'s [`parse_key`], `ctrl`'s
 /// [`parse_ctrl`], `paste`'s [`paste_event`] — so the control fence
@@ -417,19 +396,20 @@ pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
     }
 }
 
-/// THE CONTROL SOCKET'S LICENCE FENCE for one authorized attempt: `None`
-/// is no fence; `Some(keep_hand)` closes the move-licence cohort ahead of
-/// the verb, keeping the glow's hand on its row or taking it off.
+/// THE CONTROL SOCKET'S LICENCE FENCE for one authorized attempt of a verb
+/// whose input class is `class`: `None` is no fence; `Some(keep_hand)` closes
+/// the move-licence cohort ahead of the verb, keeping the glow's hand on its row
+/// or taking it off.
 ///
-/// Every attempt [`control_attempt_closes_cursor_license`] names is a newer
-/// input boundary — even a malformed one, which fences before its refusal
-/// so a swallowed key's licence cannot survive an ignored attempt, and
-/// takes the hand off its row (it delivers nothing a fence could keep the
-/// hand for). A body its verb's own parser reads ([`control_press`]) is
-/// fenced exactly as [`crate::app_input::press_fence`] fences that event at
-/// the seam's entry and ahead of a physical key: `ctrl w` and `key ctrl+w`
-/// are one Ctrl-W, a line edit that keeps the hand; a release and a bare
-/// modifier are not fenced at all, as a physical one never is; a plain
+/// Every attempt whose `class` has [`Input::FENCES`] is a newer input boundary —
+/// even a malformed one, which fences before its refusal so a swallowed key's
+/// licence cannot survive an ignored attempt, and takes the hand off its row (it
+/// delivers nothing a fence could keep the hand for). A body its verb's own
+/// parser reads ([`control_press`]) is fenced exactly as
+/// [`crate::app_input::press_fence`] fences that event at the seam's entry and
+/// ahead of a physical key: `ctrl w` and `key ctrl+w` are one Ctrl-W, a line
+/// edit that keeps the hand; a release and a bare modifier are not fenced at
+/// all, as a physical one never is; a plain
 /// typed glyph, plain Enter, a Tab and a bare ⌃V arm their own licence class
 /// at the seam, where pre-clearing them wiped the banked stamps of keys
 /// whose echoes were still in flight — every control-driven `key enter`
@@ -438,8 +418,13 @@ pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
 /// is delivered on the control thread, past the seam that would arm its
 /// class (see [`input_if_fenced_observed`]), so it always fences, keeping the hand
 /// only for what keeps it.
-pub(crate) fn control_fence(verb: &str, rest: &str, fenced_write: bool) -> Option<bool> {
-    if !control_attempt_closes_cursor_license(verb) {
+pub(crate) fn control_fence(
+    class: Input,
+    verb: &str,
+    rest: &str,
+    fenced_write: bool,
+) -> Option<bool> {
+    if !class.contains(Input::FENCES) {
         return None;
     }
     let Some(ev) = control_press(verb, rest) else {
@@ -465,17 +450,6 @@ pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>]
 // ---------------------------------------------------------------------------
 // `if=<re>` — the guarded press: ONE check-and-press under the terminal lock
 // ---------------------------------------------------------------------------
-
-/// The verbs that take a LEADING `if=<re>` guard: the two that carry the one
-/// keystroke-shaped write a driver answers a prompt with. `turn` is deliberately
-/// not one of them (its own `settle=` options own that slot), and the rest of the
-/// input verbs take no leading `if=`; of them only `feed-bin` takes a leading `id=`.
-pub(crate) const GUARDED_VERBS: &[&str] = &["send", "key"];
-
-/// Whether `verb` accepts a leading `if=<re>` guard.
-pub(crate) fn is_guarded_verb(verb: &str) -> bool {
-    GUARDED_VERBS.contains(&verb)
-}
 
 /// The leading `k=v` options a `send`/`key`/`turn` line may carry, taken off the
 /// argument tail at the dispatch so every arm parses the SAME tail it always did.
@@ -505,17 +479,17 @@ pub(crate) struct LeadingInputOptions {
     /// claim, read under the meta lock right before the write
     /// ([`crate::session_timeline::supervisor_fence`]). The window host's
     /// loop fences every write with its own holder, so no keystroke of its
-    /// lands after a proven self-claim replaced it. Taken on
-    /// [`SUPERVISOR_FENCED_VERBS`].
+    /// lands after a proven self-claim replaced it. Taken on the verbs whose
+    /// input class has [`Input::SUPERVISED`] (`send`, `key`, `paste`, `turn`).
     pub if_supervisor: Option<String>,
     /// `cause=@<off>|<seq>` (phase 3A, design §2.6): the mail or record this
-    /// input acted on, which the turn it opens names. Taken on
-    /// [`CAUSE_VERBS`]; checked against what the session holds before any
+    /// input acted on, which the turn it opens names. Taken on the verbs whose
+    /// input class has [`Input::CAUSE`] (`send`, `turn`); checked against what the session holds before any
     /// byte moves (`session_log::validate_cause`).
     pub cause: Option<crate::session_log::CauseRef>,
     /// `act=approve|deny|answer` (phase 5, ruling T1): what this input means
-    /// for the approval box or question it dismisses. Taken on
-    /// [`GUARDED_VERBS`] (`send`, `key`); the box's close reads it only from
+    /// for the approval box or question it dismisses. Taken on the
+    /// [`Input::GUARDED`] verbs (`send`, `key`); the box's close reads it only from
     /// a proven author ([`aterm_slog::Actor::is_proven`]).
     pub act: Option<aterm_slog::ActWord>,
     /// A leading option that was recognized but malformed (a guard with no
@@ -525,14 +499,23 @@ pub(crate) struct LeadingInputOptions {
     pub refusal: Option<String>,
 }
 
-/// The verbs that take a `cause=`: the input that opens a turn. (`turn` also
-/// takes one among its own options, `cmd_turn`.)
-pub(crate) const CAUSE_VERBS: &[&str] = &["send", "turn"];
-
-/// The verbs that take a leading `if-supervisor=<holder>` fence: every verb
-/// a supervisor types into its session with. On `paste` it is the ONE
-/// leading option (its body is raw: nothing else is taken off it).
-pub(crate) const SUPERVISOR_FENCED_VERBS: &[&str] = &["send", "key", "paste", "turn"];
+/// The App lane's `unread=ok` (round 18, day four, D9): `hwkey`, `pointer`
+/// and `invoke` (the `Input::APP_UNREAD` rows) take it as their FIRST token, lifting the unread-input gate
+/// for that one gesture — the way a person's own key reaches the window's
+/// paste queue, whose refusal row says what the gate would have. `ok` is the
+/// only value; any other token, or none, leaves the line as it was (the arm
+/// refuses what it cannot parse). Returns whether it was given and the rest.
+pub(crate) fn take_app_unread_ok(class: Input, rest: &str) -> (bool, &str) {
+    if !class.contains(Input::APP_UNREAD) {
+        return (false, rest);
+    }
+    let trimmed = rest.trim_start();
+    match trimmed.split_once(char::is_whitespace) {
+        Some(("unread=ok", tail)) => (true, tail.trim_start()),
+        None if trimmed == "unread=ok" => (true, ""),
+        _ => (false, rest),
+    }
+}
 
 /// The refusal for a malformed or repeated `act=`: nothing is written.
 pub(crate) const ACT_USAGE: &str =
@@ -561,10 +544,11 @@ fn take_if_supervisor(opts: &mut LeadingInputOptions, value: &str) {
 /// leading `--` ends option parsing and is dropped, so a caller that really must
 /// `send` text beginning with `id=` or `if=` writes `send -- if=…`.
 ///
-/// `id=` is scanned only on [`crate::pty_idem::KEYED_VERBS`] and `if=` only on
-/// [`GUARDED_VERBS`]; every other verb's tail is returned untouched, so an `id=`
-/// or `if=` token elsewhere stays argument data (a leading `if=` on `paste` is
-/// delivered as literal text, exactly like a leading `id=` on it).
+/// `id=` is scanned only on a verb whose `class` has [`Input::KEYED`] and `if=`
+/// only on one with [`Input::GUARDED`] (`send` and `key`; `turn`'s own `settle=`
+/// options own that slot); every other verb's tail is returned untouched, so an
+/// `id=` or `if=` token elsewhere stays argument data (a leading `if=` on `paste`
+/// is delivered as literal text, exactly like a leading `id=` on it).
 ///
 /// `if-gen=<epoch>.<seq>` and `if-fp=<hex16>` are the other two [`InputFence`]
 /// conditions, taken on the same two verbs and composing with `id=`/`if=` in any
@@ -580,6 +564,10 @@ fn take_if_supervisor(opts: &mut LeadingInputOptions, value: &str) {
 /// driver that means to queue behind input the program has not read can. `ok`
 /// is its only value; any other, or a second `unread=`, is a carried refusal.
 ///
+/// `if-supervisor=<holder>` is taken on a verb whose class has
+/// [`Input::SUPERVISED`] (on `paste`, whose body is raw, it is the one option
+/// taken), `cause=` on one with [`Input::CAUSE`], and `act=` on a guarded one.
+///
 /// The regex is ONE wire token: the control line is split on whitespace and
 /// nothing quotes, so a pattern with a space in it must be written with `.` in
 /// its place (`if=Do.you.want.to.proceed`). The client says so before sending
@@ -587,28 +575,11 @@ fn take_if_supervisor(opts: &mut LeadingInputOptions, value: &str) {
 ///
 /// Returns the options and the remaining tail. With no leading option the tail
 /// is `rest` byte for byte (leading whitespace included — `send` bodies are raw).
-/// The App lane's `unread=ok` (round 18, day four, D9): `hwkey`, `pointer`
-/// and `invoke` take it as their FIRST token, lifting the unread-input gate
-/// for that one gesture — the way a person's own key reaches the window's
-/// paste queue, whose refusal row says what the gate would have. `ok` is the
-/// only value; any other token, or none, leaves the line as it was (the arm
-/// refuses what it cannot parse). Returns whether it was given and the rest.
-pub(crate) fn take_app_unread_ok<'a>(verb: &str, rest: &'a str) -> (bool, &'a str) {
-    if !matches!(verb, "hwkey" | "pointer" | "invoke") {
-        return (false, rest);
-    }
-    let trimmed = rest.trim_start();
-    match trimmed.split_once(char::is_whitespace) {
-        Some(("unread=ok", tail)) => (true, tail.trim_start()),
-        None if trimmed == "unread=ok" => (true, ""),
-        _ => (false, rest),
-    }
-}
-
-pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptions, String) {
-    let keyed = crate::pty_idem::is_keyed_verb(verb);
-    let guarded = is_guarded_verb(verb);
-    let supervised = SUPERVISOR_FENCED_VERBS.contains(&verb);
+pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOptions, &str) {
+    let keyed = class.contains(Input::KEYED);
+    let guarded = class.contains(Input::GUARDED);
+    let supervised = class.contains(Input::SUPERVISED);
+    let caused = class.contains(Input::CAUSE);
     let mut opts = LeadingInputOptions::default();
     if !keyed && !guarded {
         // `paste`'s body is raw: only a leading `if-supervisor=<holder>` and
@@ -616,9 +587,9 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
         if supervised && let Some(after) = rest.strip_prefix("if-supervisor=") {
             let (value, body) = after.split_once(' ').unwrap_or((after, ""));
             take_if_supervisor(&mut opts, value);
-            return (opts, body.to_string());
+            return (opts, body);
         }
-        return (opts, rest.to_string());
+        return (opts, rest);
     }
     let mut cur = rest.trim_start();
     let mut consumed = false;
@@ -730,9 +701,7 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
             consumed = true;
             continue;
         }
-        if CAUSE_VERBS.contains(&verb)
-            && let Some(value) = head.strip_prefix("cause=")
-        {
+        if caused && let Some(value) = head.strip_prefix("cause=") {
             match crate::session_log::CauseRef::parse(value) {
                 Some(cause) if opts.cause.replace(cause).is_none() => {}
                 _ => opts.refusal = Some(crate::session_log::CAUSE_USAGE.to_string()),
@@ -761,8 +730,7 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
         }
         break;
     }
-    let tail = if consumed { cur } else { rest };
-    (opts, tail.to_string())
+    (opts, if consumed { cur } else { rest })
 }
 
 /// An `if-fp=` value: 1..=16 hex digits, the spelling `status hash=` prints
@@ -801,7 +769,7 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
 ///   `content_seq` is not enough for that: it is per grid, and a re-entered
 ///   alternate screen can show a new box at an old value.
 /// * `fp` (`if-fp=<hex16>`): FNV-1a-64 of the untrimmed visible screen (the
-///   `status hash=` / `turn hash=` value, [`crate::control::screen_stamp`])
+///   `status hash=` / `turn hash=` value, [`crate::frame_memo::ScreenText::fnv`])
 ///   still equals the caller's. A re-render of the same text keeps it, so a TUI
 ///   that repaints without changing (Claude Code's does) does not skip a press
 ///   the screen still vouches for.
@@ -856,22 +824,27 @@ impl InputFence<'_> {
             || self.entering_command
     }
 
-    /// Decide the fence against `terminal` (the caller holds its lock).
-    /// `generation` and `fp` are asked before the guard: a moved screen answers
-    /// [`GuardedInput::Changed`] even where the guard would also have missed,
-    /// because "the screen moved" is the more useful thing to tell a driver.
-    fn check(&self, terminal: &Terminal) -> Option<GuardedInput> {
+    /// Decide the fence against `terminal` (the caller holds its lock). `fp` is
+    /// read off the session's published text through `look`, taken before that
+    /// lock. `generation` and `fp` are asked before the guard: a moved screen
+    /// answers [`GuardedInput::Changed`] even where the guard would also have
+    /// missed, because "the screen moved" is the more useful thing to tell a
+    /// driver.
+    fn check(
+        &self,
+        terminal: &Terminal,
+        look: &mut crate::frame_memo::Look<'_>,
+    ) -> Option<GuardedInput> {
         if self
             .generation
             .is_some_and(|generation| crate::control::screen_gen(terminal) != generation)
         {
             return Some(GuardedInput::Changed);
         }
-        if let Some(fp) = self.fp {
-            let now = aterm_hash::fnv1a_64(crate::control::screen_text(terminal).as_bytes());
-            if now != fp {
-                return Some(GuardedInput::Changed);
-            }
+        if let Some(fp) = self.fp
+            && look.text(terminal).fnv() != fp
+        {
+            return Some(GuardedInput::Changed);
         }
         if self.entering_command
             && !matches!(
@@ -965,6 +938,7 @@ pub(crate) fn input_if_fenced_observed(
     fence: &InputFence<'_>,
     completion: Option<crate::control_input_ack::InputCompletion>,
 ) -> GuardedInput {
+    let mut look = ctx.frame.look_frame();
     let terminal = term_lock(term);
     // A person's hand since the caller's read: asked under the same hold as
     // the screen fences, ahead of them — "a person keyed" is the more useful
@@ -972,7 +946,7 @@ pub(crate) fn input_if_fenced_observed(
     if fence.human.is_some_and(|n| ctx.human_input.seq() != n) {
         return GuardedInput::Person;
     }
-    if let Some(declined) = fence.check(&terminal) {
+    if let Some(declined) = fence.check(&terminal, &mut look) {
         return declined;
     }
     // The encoder is read under the same lock as the guard: the keyboard mode is
@@ -1047,7 +1021,7 @@ pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
     }
 }
 
-/// `key if=<re> <name>`: the plain verb's guarded twin — the same [`parse_key`]
+/// `key if=<re> <name>`: the `key` verb's guarded twin — the same [`parse_key`]
 /// grammar, delivered by [`input_if_fenced_observed`] instead of the seam. A
 /// malformed name is the usage line BEFORE any lock is taken. The guard-only
 /// spelling of [`cmd_key_fenced`], which is what the dispatch calls.
@@ -1223,8 +1197,9 @@ pub(super) fn bytes_reply(r: Result<InputOutcome, String>, n: usize) -> String {
     }
 }
 
-/// PURE parser for `ctrl <letter>` -> a Control-modified character key.
-/// The seam encodes it (under the CURRENT keyboard mode) as a proper CSI-u sequence (Kitty/xterm) or the legacy
+/// PURE parser for `ctrl <letter>` -> a Control-modified character key, the event
+/// the `ctrl` verb delivers by its route, so it is unit-testable headless. The seam encodes it (under the
+/// CURRENT keyboard mode) as a proper CSI-u sequence (Kitty/xterm) or the legacy
 /// control byte, byte-identical to a human Ctrl chord. Returns `None` unless
 /// `rest` is exactly one (non-whitespace) char.
 pub(crate) fn parse_ctrl(rest: &str) -> Option<InputEvent> {
@@ -1241,6 +1216,9 @@ pub(crate) fn parse_ctrl(rest: &str) -> Option<InputEvent> {
         event_type: aterm_types::keyboard::KeyEventType::Press,
     })
 }
+
+/// The usage line every malformed `ctrl` body answers, whatever its route.
+pub(crate) const CTRL_USAGE: &str = "ERR usage: ctrl <single-letter>\n";
 
 /// `feed <hex>` -> write raw bytes (decoded from a hex string, whitespace
 /// allowed) straight to the PTY. The escape hatch for control/binary bytes the
@@ -1354,8 +1332,8 @@ pub(crate) fn cmd_signal(
     reply
 }
 
-/// THE `signal` VERB AS THE CONTROL DISPATCH RUNS IT ([`super::handle`]'s
-/// arm): [`cmd_signal`] on the session's own person stamp (`human_ms`, read
+/// THE `signal` VERB AS THE CONTROL DISPATCH RUNS IT
+/// ([`super::serve_session_verb`]'s arm): [`cmd_signal`] on the session's own person stamp (`human_ms`, read
 /// now). One function for the dispatch and for the tests that drive the real
 /// verb.
 pub(crate) fn signal_verb(master: i32, rest: &str, ctx: &SessionCtx) -> String {
@@ -1367,8 +1345,8 @@ pub(crate) fn signal_verb(master: i32, rest: &str, ctx: &SessionCtx) -> String {
     )
 }
 
-/// THE `restart` VERB AS THE CONTROL DISPATCH RUNS IT ([`super::handle`]'s
-/// arm): the explicit restart of the tab's agent in place
+/// THE `restart` VERB AS THE CONTROL DISPATCH RUNS IT
+/// ([`super::serve_session_verb`]'s arm): the explicit restart of the tab's agent in place
 /// ([`crate::restart_act`]). One wiring function, as [`signal_verb`] is, so
 /// the act the dispatch makes is the one its tests drive.
 pub(crate) fn restart_verb(master: i32, rest: &str, ctx: &std::sync::Arc<SessionCtx>) -> String {
@@ -1439,10 +1417,25 @@ pub(crate) const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheel
 /// bounded by `lines` alone), and the two ceilings must not drift apart.
 const MAX_WHEEL_LINES: i32 = crate::input::MAX_WHEEL_BURST;
 
-/// PURE parser for the `mouse` verb -> an engine-neutral mouse [`InputEvent`].
-/// Factored out of [`cmd_mouse`] so the additive `mods=`/`count=`/`side=`/`block=`
-/// grammar is unit-testable without an `EventLoopProxy`. Returns `Err(usage/err
-/// string)` for a malformed line, `Ok(event)` otherwise.
+/// PURE parser for the `mouse` verb -> an engine-neutral mouse [`InputEvent`], the
+/// event the verb delivers by its route, so the additive
+/// `mods=`/`count=`/`side=`/`block=` grammar is unit-testable without an
+/// `EventLoopProxy`. Returns `Err(usage/err string)` for a malformed line,
+/// `Ok(event)` otherwise.
+///
+/// Phase 0.5 CONTRACT CHANGE (divergences a/b/d/i): the old `OK (mouse off)`
+/// short-circuit is GONE — a tracking-OFF press/release now runs the SAME
+/// selection machinery as the human (not a no-op), and `mods`/`count`/`side`/
+/// `block` are carried as data instead of hard-coded. The verb is reply-bearing:
+/// `OK` once the seam has APPLIED the batch on the main thread, `ERR input
+/// dispatch failed: …` when there is no frontmost window (never a false OK).
+///
+/// DRAG CONVERGENCE (divergence c) — SCOPE: one `mouse move` verb line posts ONE
+/// `MouseMove`, so a controller that wants intermediate motion reports under a
+/// tracking app issues a `press` then N `move`s then a `release` as separate verb
+/// lines (the seam reports each, identical to the human's per-pixel `MouseMove`s).
+/// A single-line `press→N×move→release` BATCH grammar is deliberately deferred —
+/// the seam already supports a batched `Wake::Input` (A.2.3), so it is additive.
 ///
 /// Grammar: `mouse <action> <button> <row> <col> [mods=..] [count=N]
 /// [side=left|right] [block=0|1] [lines=N]`. `action` is `press|release|move|
@@ -1585,7 +1578,7 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
                     side,
                     block,
                     // parse_mouse is scope-BLIND: the copy-on-select suppression
-                    // policy is a control-authority decision applied by cmd_mouse
+                    // policy is a control-authority decision applied by the arm
                     // AFTER parsing (only for a non-Owner scope), so the pure parser
                     // output stays byte/struct-identical to the human builder.
                     suppress_copy_on_select: false,
@@ -1635,59 +1628,32 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
 /// emits the `encode_mouse_*` report (tracking ON) or runs the local selection
 /// gesture (tracking OFF).
 ///
-/// Phase 0.5 CONTRACT CHANGE (divergences a/b/d/i): the old `OK (mouse off)`
-/// short-circuit is GONE — a tracking-OFF press/release now runs the SAME
-/// selection machinery as the human (not a no-op), and `mods`/`count`/`side`/
-/// `block` are carried as data instead of hard-coded. The verb is reply-bearing:
-/// `OK` once the seam has APPLIED the batch on the main thread, `ERR input
-/// dispatch failed: …` when there is no frontmost window (never a false OK).
-///
-/// DRAG CONVERGENCE (divergence c) — SCOPE: one `mouse move` verb line posts ONE
-/// `MouseMove`, so a controller that wants intermediate motion reports under a
-/// tracking app issues a `press` then N `move`s then a `release` as separate verb
-/// lines (the seam reports each, identical to the human's per-pixel `MouseMove`s).
-/// A single-line `press→N×move→release` BATCH grammar is deliberately deferred —
-/// the seam already supports a batched `Wake::Input` (A.2.3), so it is additive
-/// and out of scope for this convergence commit.
-pub(crate) fn cmd_mouse(proxy: &EventLoopProxy<Wake>, scope: super::Scope, rest: &str) -> String {
-    match parse_mouse(rest) {
-        // Reply-bearing: OK means the seam ran (report emitted or local fallback
-        // applied), not merely enqueued. No window ⇒ ERR, not a false OK.
-        //
-        // COPY-ON-SELECT FENCE: a scoped (non-Owner) WriteInput edge can inject a
-        // select+release gesture that, on the active tab, would auto-copy the
-        // selected (attacker-chosen or on-screen) text to the SYSTEM clipboard —
-        // exfil past the `copy` → `ClipboardWrite` fence. We stamp the policy on the
-        // event HERE (the control-authority layer, the only place `Scope` is known)
-        // so `finish_selection` skips the pbcopy/PRIMARY side-effect for THIS
-        // gesture. The selection itself is still made (viewport nav is not exfil);
-        // only the automatic clipboard write is suppressed. Owner scope and a real
-        // human gesture leave the flag `false`, so their copy-on-select is
-        // unaffected. This is a clipboard SIDE-EFFECT, never a PTY byte, so it does
-        // NOT gate `seam_egress` or its human/controller byte equality.
-        Ok(ev) => {
-            let ev = apply_copy_on_select_policy(scope, ev);
-            input_reply_to_str(post_input_reply(proxy, vec![ev]))
-        }
-        Err(e) => e,
-    }
-}
-
 /// PURE control-authority decision: whether a `mouse`-verb gesture from `scope`
 /// must have its copy-on-select CLIPBOARD side-effect suppressed. Only a NON-OWNER
 /// (scoped-edge) gesture is suppressed; the Owner god token (in-session / owner
 /// automation) is exempt, matching the `front_drive_escalation` Owner
 /// carve-out. Split out pure so the policy is unit-testable without an event loop
-/// (mirrors `update_is_owner_only_subcmd` / `front_drive_escalation`).
+/// (mirrors `front_drive_escalation`).
 pub(crate) fn scope_suppresses_copy_on_select(scope: super::Scope) -> bool {
     !scope.is_owner_class()
 }
 
 /// Stamp the scoped-edge copy-on-select suppression onto a mouse `InputEvent` (a
 /// no-op for Owner scope, and for non-`MouseButton` events which never trigger the
-/// copy-on-select side-effect). Applied in [`cmd_mouse`] AFTER the scope-blind
+/// copy-on-select side-effect). Applied by the `mouse` arm AFTER the scope-blind
 /// [`parse_mouse`], so the pure parser output stays byte/struct-identical to human
 /// input and the suppression rides ONLY the release that settles the selection.
+///
+/// COPY-ON-SELECT FENCE: a scoped (non-Owner) WriteInput edge can inject a
+/// select+release gesture that, on the active tab, would auto-copy the selected
+/// (attacker-chosen or on-screen) text to the SYSTEM clipboard — exfil past the
+/// `copy` → `ClipboardWrite` fence. The policy is stamped on the event at the
+/// control-authority layer, the only place `Scope` is known, so
+/// `finish_selection` skips the pbcopy/PRIMARY side-effect for THIS gesture. The
+/// selection itself is still made (viewport nav is not exfil); only the automatic
+/// clipboard write is suppressed. Owner scope and a real human gesture leave the
+/// flag `false`. This is a clipboard SIDE-EFFECT, never a PTY byte, so it does NOT
+/// gate `seam_egress` / violate `bytes_human_eq_controller`.
 pub(crate) fn apply_copy_on_select_policy(scope: super::Scope, ev: InputEvent) -> InputEvent {
     if !scope_suppresses_copy_on_select(scope) {
         return ev;
@@ -1720,20 +1686,19 @@ pub(crate) fn apply_copy_on_select_policy(scope: super::Scope, ev: InputEvent) -
     }
 }
 
-/// `paste <text>` -> write `<text>` to the PTY exactly as if the user pasted
-/// it: [`Terminal::format_paste`] strips control bytes that could escape the
-/// guards (ESC, C1 controls), converts line breaks to CR, and wraps the body
-/// in the bracketed-paste guards `ESC[200~` ... `ESC[201~` when the app has
-/// enabled bracketed paste (DECSET 2004) AT THE MOMENT THE FRAME IS WRITTEN —
-/// the verb makes no gesture and is shown no confirmation, so it has no earlier
-/// answer to keep faith with ([`crate::input::PasteFraming::AtDrain`]; the human
-/// Cmd-V path captures its answer instead, see `App::deliver_paste`). The text is
-/// the rest of the line taken literally; a literal trailing `\n` (backslash + n)
-/// becomes a line break (sent as CR, like a real paste) so a paste can end in
-/// one. For raw unsanitized bytes use `feed`/`send` instead.
 /// The `paste` verb's event: its text ([`paste_text`]), framed at the drain.
 /// One builder for the verb and the fence that classifies it
 /// ([`control_press`]).
+///
+/// `paste <text>` writes `<text>` to the PTY exactly as if the user pasted it:
+/// [`Terminal::format_paste`] strips control bytes that could escape the guards
+/// (ESC, C1 controls), converts line breaks to CR, and wraps the body in the
+/// bracketed-paste guards `ESC[200~` ... `ESC[201~` when the app has enabled
+/// bracketed paste (DECSET 2004) AT THE MOMENT THE FRAME IS WRITTEN — the verb
+/// makes no gesture and is shown no confirmation, so it has no earlier answer to
+/// keep faith with ([`crate::input::PasteFraming::AtDrain`]; the human Cmd-V path
+/// captures its answer instead, see `App::deliver_paste`). For raw unsanitized
+/// bytes use `feed`/`send` instead.
 pub(crate) fn paste_event(rest: &str) -> InputEvent {
     InputEvent::Paste(paste_text(rest), crate::input::PasteFraming::AtDrain)
 }
@@ -1748,25 +1713,12 @@ pub(crate) fn paste_text(rest: &str) -> String {
     }
 }
 
-/// `focus <in|out>` -> drive DEC 1004 focus reporting (kills divergence j: a
-/// controller-only session can now satisfy a focus-tracking app's oracle). The
-/// seam emits ESC[I / ESC[O when the app enabled focus reporting, byte-identical
-/// to the human `on_focus` egress. `in`/`1`/`true` = focus-in. Reply-bearing like
-/// `key` (not fire-and-forget): `OK` means the seam ran `on_focus`; with no
-/// frontmost window the dropped reply sender yields `ERR`, so the self path never
-/// reports a false `OK` for focus that went nowhere.
-pub(crate) fn cmd_focus(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    match parse_focus(rest) {
-        Some(focused) => {
-            input_reply_to_str(post_input_reply(proxy, vec![InputEvent::Focus(focused)]))
-        }
-        None => "ERR usage: focus <in|out>\n".to_string(),
-    }
-}
-
-/// PURE parser for the `focus` verb's `in/out` argument, factored out of
-/// [`cmd_focus`] so the self (active-tab) and cross-session paths build the SAME
-/// [`InputEvent::Focus`] from the SAME grammar. `in`/`1`/`true`/`focus` => focus-in.
+/// PURE parser for the `focus` verb's `in/out` argument: the [`InputEvent::Focus`]
+/// it delivers by its route, one grammar for every route. `in`/`1`/`true`/`focus`
+/// => focus-in. `focus <in|out>` drives DEC 1004 focus reporting (kills
+/// divergence j: a controller-only session can satisfy a focus-tracking app's
+/// oracle): the seam emits ESC[I / ESC[O when the app enabled focus reporting,
+/// byte-identical to the human `on_focus` egress.
 pub(crate) fn parse_focus(rest: &str) -> Option<bool> {
     match rest.trim() {
         "in" | "1" | "true" | "focus" => Some(true),
@@ -2153,6 +2105,7 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             None => Ok(PointerAction::Click),
             Some(_) => Err("ERR usage: pointer click\n".to_string()),
         },
+        Some("wheel") => parse_pointer_wheel(it),
         Some("mods") => match (it.next(), it.next()) {
             (Some(list), None) => parse_pointer_mods(list)
                 .map(PointerAction::Mods)
@@ -2160,10 +2113,86 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             _ => Err(POINTER_MODS_USAGE.to_string()),
         },
         Some(_) => Err(
-            "ERR usage: pointer [move <r> <c>|move key=<ui-key>|move xy=<x>,<y>|click|leave|status|mods <list>]\n"
+            "ERR usage: pointer [move <r> <c>|move key=<ui-key>|move xy=<x>,<y>|click|wheel dy=<n>|leave|status|mods <list>]\n"
                 .to_string(),
         ),
     }
+}
+
+/// The `pointer wheel` usage line.
+const POINTER_WHEEL_USAGE: &str =
+    "ERR usage: pointer wheel dy=<n> [dx=<n>] [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]\n";
+
+/// The largest `pointer wheel` delta on either axis, in its unit: past any
+/// list's end in lines, about six hundred rows in points.
+const MAX_POINTER_WHEEL: f64 = 10_000.0;
+
+/// `pointer wheel dy=<n> [dx=<n>] [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]`:
+/// each field at most once, in any order; `dy` down and `dx` right (a
+/// fraction of a line banks as a free-spinning wheel's does); at least one
+/// non-zero, each within [`MAX_POINTER_WHEEL`]. `key=`/`xy=` aim at a native
+/// view's control or point as `pointer move` does.
+fn parse_pointer_wheel<'a>(
+    words: impl Iterator<Item = &'a str>,
+) -> Result<crate::app_mouse::PointerAction, String> {
+    use crate::app_mouse::{NativePointerTarget, PointerAction, WheelUnit};
+    let usage = || POINTER_WHEEL_USAGE.to_string();
+    let delta = |value: &str| {
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .ok_or_else(usage)
+            .and_then(|n| {
+                if n.abs() <= MAX_POINTER_WHEEL {
+                    Ok(n)
+                } else {
+                    Err("ERR out of range\n".to_string())
+                }
+            })
+    };
+    let (mut dx, mut dy, mut unit, mut aim) = (None, None, None, None);
+    for word in words {
+        let (field, value) = word.split_once('=').ok_or_else(usage)?;
+        let fresh = match field {
+            "dy" => dy.replace(delta(value)?).is_none(),
+            "dx" => dx.replace(delta(value)?).is_none(),
+            "unit" => unit
+                .replace(match value {
+                    "lines" => WheelUnit::Lines,
+                    "pt" => WheelUnit::Points,
+                    _ => return Err(usage()),
+                })
+                .is_none(),
+            "key" if !value.is_empty() => aim
+                .replace(NativePointerTarget::Key(value.to_string()))
+                .is_none(),
+            "xy" => {
+                let (x, y) = value.split_once(',').ok_or_else(usage)?;
+                let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) else {
+                    return Err(usage());
+                };
+                if !(x.is_finite() && y.is_finite()) {
+                    return Err(usage());
+                }
+                aim.replace(NativePointerTarget::Point(x, y)).is_none()
+            }
+            _ => return Err(usage()),
+        };
+        if !fresh {
+            return Err(usage());
+        }
+    }
+    let (dx, dy) = (dx.unwrap_or(0.0), dy.unwrap_or(0.0));
+    if dx == 0.0 && dy == 0.0 {
+        return Err(usage());
+    }
+    Ok(PointerAction::Wheel {
+        dx,
+        dy,
+        unit: unit.unwrap_or(WheelUnit::Lines),
+        aim,
+    })
 }
 
 /// The `pointer move` usage line: a cell, or a native view's control or point.
@@ -2174,13 +2203,15 @@ const POINTER_MOVE_USAGE: &str =
 /// the message band's rows together stay far below it.
 const MAX_CHROME_ROWS: u16 = 16;
 
-/// `pointer [move <r> <c>|click|leave|status|mods <list>]` -> put the front window's
-/// POINTER on a cell (a negative `r` is a chrome row above the grid), click
-/// where it is, or withdraw it, and reply where it actually is.
+/// `pointer [move <r> <c>|click|wheel dy=<n>|leave|status|mods <list>]` -> put the
+/// front window's POINTER on a cell (a negative `r` is a chrome row above the
+/// grid), click or turn the wheel where it is, or withdraw it, and reply where it
+/// actually is.
 ///
-/// This is the verb that makes hover states drivable: it goes through
+/// This is the verb that makes hover and wheel states drivable: it goes through
 /// [`crate::App::pointer_cmd`], whose arms are `on_cursor_moved` / `on_cursor_left`
-/// — the functions winit's own `CursorMoved`/`CursorLeft` call. `mouse move` cannot
+/// / `on_mouse_wheel_phased` — the functions winit's own
+/// `CursorMoved`/`CursorLeft`/`MouseWheel` call. `mouse move` cannot
 /// substitute: it posts an engine `InputEvent` and never touches the window pointer
 /// state a hover is resolved from.
 ///
@@ -2352,6 +2383,7 @@ pub(crate) fn cross_resize_px_refusal(rest: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_types::control_verbs::input_of;
 
     #[cfg(unix)]
     #[test]
@@ -2446,7 +2478,7 @@ mod tests {
     /// and `paste hello` fenced `Some(false)`.
     #[test]
     fn the_control_fence_is_the_seam_s_fence_of_the_parsed_body() {
-        let key = |body: &str| control_fence("key", body, false);
+        let key = |body: &str| control_fence(input_of("key"), "key", body, false);
         for body in [
             "enter",
             "tab",
@@ -2515,26 +2547,53 @@ mod tests {
         // `ctrl <c>` is `key ctrl+<c>`, whatever the letter.
         for c in ["w", "u", "a", "e", "b", "k", "r", "c", "v", "x"] {
             assert_eq!(
-                control_fence("ctrl", c, false),
+                control_fence(input_of("ctrl"), "ctrl", c, false),
                 key(&format!("ctrl+{c}")),
                 "`ctrl {c}` and `key ctrl+{c}` are one press"
             );
         }
-        assert_eq!(control_fence("ctrl", "ww", false), Some(false), "malformed");
-        assert_eq!(control_fence("paste", "hello", false), Some(true));
+        assert_eq!(
+            control_fence(input_of("ctrl"), "ctrl", "ww", false),
+            Some(false),
+            "malformed"
+        );
+        assert_eq!(
+            control_fence(input_of("paste"), "paste", "hello", false),
+            Some(true)
+        );
         // A fenced write fences whatever it is, keeping the hand for a line edit.
-        assert_eq!(control_fence("key", "a", true), Some(false));
-        assert_eq!(control_fence("key", "enter", true), Some(false));
-        assert_eq!(control_fence("key", "left", true), Some(true));
-        assert_eq!(control_fence("send", "ls", true), Some(false));
+        assert_eq!(
+            control_fence(input_of("key"), "key", "a", true),
+            Some(false)
+        );
+        assert_eq!(
+            control_fence(input_of("key"), "key", "enter", true),
+            Some(false)
+        );
+        assert_eq!(
+            control_fence(input_of("key"), "key", "left", true),
+            Some(true)
+        );
+        assert_eq!(
+            control_fence(input_of("send"), "send", "ls", true),
+            Some(false)
+        );
         // The other writers fence taking the hand off; the readers never fence.
         for verb in [
-            "send", "feed", "signal", "mouse", "focus", "turn", "resize", "scroll",
+            "send", "feed", "signal", "restart", "mouse", "focus", "turn", "resize", "scroll",
         ] {
-            assert_eq!(control_fence(verb, "", false), Some(false), "{verb}");
+            assert_eq!(
+                control_fence(input_of(verb), verb, "", false),
+                Some(false),
+                "{verb}"
+            );
         }
         for verb in ["text", "screen", "cursor", "image", "metrics"] {
-            assert_eq!(control_fence(verb, "left", false), None, "{verb}");
+            assert_eq!(
+                control_fence(input_of(verb), verb, "left", false),
+                None,
+                "{verb}"
+            );
         }
     }
 
@@ -2553,74 +2612,74 @@ mod tests {
             ..LeadingInputOptions::default()
         };
         assert_eq!(
-            take_leading_options("send", "id=a:b:c hello there"),
-            (opts(Some("a:b:c"), None), "hello there".to_string())
+            take_leading_options(input_of("send"), "id=a:b:c hello there"),
+            (opts(Some("a:b:c"), None), "hello there")
         );
         // NOT the first token ⇒ argument data, byte-identical to before.
         assert_eq!(
-            take_leading_options("send", "hello id=a:b:c"),
-            (opts(None, None), "hello id=a:b:c".to_string())
+            take_leading_options(input_of("send"), "hello id=a:b:c"),
+            (opts(None, None), "hello id=a:b:c")
         );
         // A body with no leading option is returned BYTE FOR BYTE — leading
         // whitespace included, because `send` bodies are raw.
         assert_eq!(
-            take_leading_options("send", "  two spaces"),
-            (opts(None, None), "  two spaces".to_string())
+            take_leading_options(input_of("send"), "  two spaces"),
+            (opts(None, None), "  two spaces")
         );
         // `--` is the escape hatch for text that really does start with an option.
         assert_eq!(
-            take_leading_options("send", "-- if=literal"),
-            (opts(None, None), "if=literal".to_string())
+            take_leading_options(input_of("send"), "-- if=literal"),
+            (opts(None, None), "if=literal")
         );
         // An unkeyed, unguarded verb is never scanned.
         assert_eq!(
-            take_leading_options("paste", "if=x id=a:b:c hi"),
-            (opts(None, None), "if=x id=a:b:c hi".to_string())
+            take_leading_options(input_of("paste"), "if=x id=a:b:c hi"),
+            (opts(None, None), "if=x id=a:b:c hi")
         );
         // A lone key with no tail is legal (`send id=…` types nothing).
         assert_eq!(
-            take_leading_options("turn", "id=a:b:c"),
-            (opts(Some("a:b:c"), None), String::new())
+            take_leading_options(input_of("turn"), "id=a:b:c"),
+            (opts(Some("a:b:c"), None), "")
         );
         // `if=` alone, and beside `id=` in EITHER order.
         assert_eq!(
-            take_leading_options("key", "if=Do.you.want.to.proceed 1"),
-            (opts(None, Some("Do.you.want.to.proceed")), "1".to_string())
+            take_leading_options(input_of("key"), "if=Do.you.want.to.proceed 1"),
+            (opts(None, Some("Do.you.want.to.proceed")), "1")
         );
         assert_eq!(
-            take_leading_options("key", "id=a:b:c if=Do.you.want 1"),
-            (opts(Some("a:b:c"), Some("Do.you.want")), "1".to_string())
+            take_leading_options(input_of("key"), "id=a:b:c if=Do.you.want 1"),
+            (opts(Some("a:b:c"), Some("Do.you.want")), "1")
         );
         assert_eq!(
-            take_leading_options("key", "if=Do.you.want id=a:b:c 1"),
-            (opts(Some("a:b:c"), Some("Do.you.want")), "1".to_string())
+            take_leading_options(input_of("key"), "if=Do.you.want id=a:b:c 1"),
+            (opts(Some("a:b:c"), Some("Do.you.want")), "1")
         );
         assert_eq!(
-            take_leading_options("send", "if=proceed id=a:b:c y\\n"),
-            (opts(Some("a:b:c"), Some("proceed")), "y\\n".to_string())
+            take_leading_options(input_of("send"), "if=proceed id=a:b:c y\\n"),
+            (opts(Some("a:b:c"), Some("proceed")), "y\\n")
         );
         // `turn` takes `id=` but NOT `if=`: the guard stays in its tail, where
         // its own option parser answers usage for it.
         assert_eq!(
-            take_leading_options("turn", "if=x id=a:b:c hello"),
-            (opts(None, None), "if=x id=a:b:c hello".to_string())
+            take_leading_options(input_of("turn"), "if=x id=a:b:c hello"),
+            (opts(None, None), "if=x id=a:b:c hello")
         );
         assert_eq!(
-            take_leading_options("turn", "id=a:b:c if=x hello"),
-            (opts(Some("a:b:c"), None), "if=x hello".to_string())
+            take_leading_options(input_of("turn"), "id=a:b:c if=x hello"),
+            (opts(Some("a:b:c"), None), "if=x hello")
         );
         // A guard with no pattern, or an option given twice, is a CARRIED refusal:
         // the tail is still taken so the dispatch answers it after the halt gate.
-        let (o, tail) = take_leading_options("key", "if= 1");
+        let (o, tail) = take_leading_options(input_of("key"), "if= 1");
         assert!(
             o.refusal
                 .as_deref()
                 .is_some_and(|r| r.starts_with("ERR usage: if="))
         );
         assert_eq!(tail, "1");
-        let (o, _) = take_leading_options("key", "if=a if=b 1");
+        let (o, _) = take_leading_options(input_of("key"), "if=a if=b 1");
         assert_eq!(o.refusal.as_deref(), Some("ERR usage: if= given twice\n"));
-        let (o, _) = take_leading_options("key", "id=a:b:c id=d:e:f 1");
+        let (o, _) = take_leading_options(input_of("key"), "id=a:b:c id=d:e:f 1");
         assert_eq!(o.refusal.as_deref(), Some("ERR usage: id= given twice\n"));
     }
 
@@ -2750,16 +2809,23 @@ mod tests {
         // SAFETY: `slave` is a fresh fd this function alone owns.
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
+        // A real interactive shell, so a hermetic one (§8.6 of the init design):
+        // a scratch home, and none of the person's start pointers.
+        let home = aterm_tempfile::tempdir().expect("scratch home");
         // std's Command on purpose: the PTY child needs `pre_exec` (setsid + TIOCSCTTY), which spawnfd lacks;
         // the strip first, so the shell holds its terminal and nothing else of this process.
         let mut shell = std::process::Command::new("/bin/zsh");
         shell
             .inherit_nothing()
             .args(["-f", "-i"])
+            .envs(aterm_spec::host::hermetic_env(home.path()))
             .env("TERM", "xterm")
             .stdin(stdio())
             .stdout(stdio())
             .stderr(stdio());
+        for key in aterm_spec::host::SHELL_START_POINTERS {
+            shell.env_remove(key);
+        }
         // SAFETY: runs in the forked child before exec, after stdio is in
         // place: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and
         // touch nothing of the parent's.
@@ -2772,7 +2838,8 @@ mod tests {
             });
         }
         /// Reaps the shell however the run ends, so a failed assertion leaves
-        /// no interactive shell behind (the job's own `sleep` ends by itself).
+        /// no interactive shell behind (a job the remedy did not end takes the
+        /// SIGHUP the shell's end sends its terminal's foreground group).
         struct Reap(std::process::Child);
         impl Drop for Reap {
             fn drop(&mut self) {
@@ -2827,10 +2894,20 @@ mod tests {
             assert_eq!(usize::try_from(n).ok(), Some(bytes.len()), "write(master)");
         };
 
-        // The frozen program: raw mode, never reading. Typed once the shell
-        // is at its prompt (bracketed paste on is its line editor starting).
+        // The frozen program: raw mode, never reading, and parked past the
+        // marker's hang detector (`PARKED_SECS`), so the shell's marker below
+        // is the remedy's doing. A `sleep 30` here ended by itself inside that
+        // minute, and a remedy that sent no signal passed. Typed once the
+        // shell is at its prompt (bracketed paste on is its line editor
+        // starting).
         wait_for("the prompt", &|| drawn("\x1b[?2004h"));
-        type_in(b"(stty raw -echo; exec sleep 30)\r");
+        type_in(
+            format!(
+                "(stty raw -echo; exec sleep {})\r",
+                aterm_spec::wait::PARKED_SECS
+            )
+            .as_bytes(),
+        );
         // The JOB's raw mode, not the line editor's: ISIG off (the editor
         // keeps it on), and the job in the foreground, not the shell.
         let shell_pgrp = libc::pid_t::try_from(shell.0.id()).expect("pid");
@@ -2935,25 +3012,28 @@ mod tests {
     fn the_app_lane_takes_a_leading_unread_ok_on_its_gesture_verbs() {
         use super::take_app_unread_ok;
         assert_eq!(
-            take_app_unread_ok("invoke", "unread=ok Paste"),
+            take_app_unread_ok(input_of("invoke"), "unread=ok Paste"),
             (true, "Paste")
         );
         assert_eq!(
-            take_app_unread_ok("hwkey", " unread=ok v mods=cmd"),
+            take_app_unread_ok(input_of("hwkey"), " unread=ok v mods=cmd"),
             (true, "v mods=cmd")
         );
-        assert_eq!(take_app_unread_ok("invoke", "Paste"), (false, "Paste"));
+        assert_eq!(
+            take_app_unread_ok(input_of("invoke"), "Paste"),
+            (false, "Paste")
+        );
         // Not leading, another value, another verb: the line is untouched.
         assert_eq!(
-            take_app_unread_ok("invoke", "Paste unread=ok"),
+            take_app_unread_ok(input_of("invoke"), "Paste unread=ok"),
             (false, "Paste unread=ok")
         );
         assert_eq!(
-            take_app_unread_ok("hwkey", "unread=yes v"),
+            take_app_unread_ok(input_of("hwkey"), "unread=yes v"),
             (false, "unread=yes v")
         );
         assert_eq!(
-            take_app_unread_ok("tab", "unread=ok close"),
+            take_app_unread_ok(input_of("tab"), "unread=ok close"),
             (false, "unread=ok close")
         );
     }
@@ -2964,24 +3044,24 @@ mod tests {
     /// halt gate still speaks first); and `send -- unread=ok` types the text.
     #[test]
     fn take_leading_options_takes_unread_ok_on_send_and_key_only() {
-        let (o, tail) = take_leading_options("key", "unread=ok down");
+        let (o, tail) = take_leading_options(input_of("key"), "unread=ok down");
         assert!(o.unread_ok);
         assert_eq!(o.refusal, None);
         assert_eq!(tail, "down");
-        let (o, tail) = take_leading_options("send", "id=a:b:c unread=ok if=x hi");
+        let (o, tail) = take_leading_options(input_of("send"), "id=a:b:c unread=ok if=x hi");
         assert!(o.unread_ok);
         assert_eq!(o.idem.as_deref(), Some("a:b:c"));
         assert_eq!(o.guard.as_deref(), Some("x"));
         assert_eq!(tail, "hi");
         // Given twice, or with any value but `ok`: refused, never typed.
-        let (o, tail) = take_leading_options("key", "unread=ok unread=ok down");
+        let (o, tail) = take_leading_options(input_of("key"), "unread=ok unread=ok down");
         assert_eq!(
             o.refusal.as_deref(),
             Some("ERR usage: unread= given twice\n")
         );
         assert_eq!(tail, "down");
         for bad in ["yes", "", "OK", "ok1"] {
-            let (o, _) = take_leading_options("key", &format!("unread={bad} down"));
+            let (o, _) = take_leading_options(input_of("key"), &format!("unread={bad} down"));
             assert_eq!(
                 o.refusal.as_deref(),
                 Some("ERR usage: unread=ok is the only value\n"),
@@ -2990,16 +3070,16 @@ mod tests {
             assert!(!o.unread_ok, "unread={bad:?} must not lift the gate");
         }
         // `--` ends options: the text is sent literally and the gate stands.
-        let (o, tail) = take_leading_options("send", "-- unread=ok");
+        let (o, tail) = take_leading_options(input_of("send"), "-- unread=ok");
         assert!(!o.unread_ok);
         assert_eq!(tail, "unread=ok");
         // A body token is body.
-        let (o, tail) = take_leading_options("send", "hello unread=ok");
+        let (o, tail) = take_leading_options(input_of("send"), "hello unread=ok");
         assert!(!o.unread_ok);
         assert_eq!(tail, "hello unread=ok");
         // `turn`, `paste`, `feed` take no override: their tail is untouched.
         for verb in ["turn", "paste", "feed", "ctrl"] {
-            let (o, tail) = take_leading_options(verb, "unread=ok x");
+            let (o, tail) = take_leading_options(input_of(verb), "unread=ok x");
             assert!(!o.unread_ok, "{verb}");
             assert_eq!(tail, "unread=ok x", "{verb}");
         }
@@ -3012,8 +3092,10 @@ mod tests {
     #[test]
     fn if_supervisor_is_the_claim_fence_on_every_typing_verb() {
         for verb in ["key", "send", "turn"] {
-            let (o, tail) =
-                take_leading_options(verb, "if-supervisor=aterm-harness@9 if-gen=3.15 1");
+            let (o, tail) = take_leading_options(
+                input_of(verb),
+                "if-supervisor=aterm-harness@9 if-gen=3.15 1",
+            );
             assert_eq!(
                 o.if_supervisor.as_deref(),
                 Some("aterm-harness@9"),
@@ -3023,22 +3105,19 @@ mod tests {
             let want = if verb == "turn" { "if-gen=3.15 1" } else { "1" };
             assert_eq!(tail, want, "{verb}");
         }
-        let (o, tail) = take_leading_options("paste", "if-supervisor=h@1  two spaces");
+        let (o, tail) = take_leading_options(input_of("paste"), "if-supervisor=h@1  two spaces");
         assert_eq!(o.if_supervisor.as_deref(), Some("h@1"));
         assert_eq!(tail, " two spaces", "only the separating space goes");
         // NEGATIVE CONTROLS: paste takes no other option, and an option that
         // does not lead is text.
-        let (o, tail) = take_leading_options("paste", "if=x if-supervisor=h@1 hi");
+        let (o, tail) = take_leading_options(input_of("paste"), "if=x if-supervisor=h@1 hi");
+        assert_eq!((o.if_supervisor, tail), (None, "if=x if-supervisor=h@1 hi"));
         assert_eq!(
-            (o.if_supervisor, tail.as_str()),
-            (None, "if=x if-supervisor=h@1 hi")
-        );
-        assert_eq!(
-            take_leading_options("send", "hello if-supervisor=h@1").1,
+            take_leading_options(input_of("send"), "hello if-supervisor=h@1").1,
             "hello if-supervisor=h@1"
         );
         assert_eq!(
-            take_leading_options("feed", "if-supervisor=h@1 0d").1,
+            take_leading_options(input_of("feed"), "if-supervisor=h@1 0d").1,
             "if-supervisor=h@1 0d"
         );
         for bad in [
@@ -3047,13 +3126,16 @@ mod tests {
             "if-supervisor=a\u{7f} 1",
         ] {
             assert_eq!(
-                take_leading_options("key", bad).0.refusal.as_deref(),
+                take_leading_options(input_of("key"), bad)
+                    .0
+                    .refusal
+                    .as_deref(),
                 Some(IF_SUPERVISOR_USAGE),
                 "{bad:?}"
             );
         }
         assert_eq!(
-            take_leading_options("key", "if-supervisor=a if-supervisor=a 1")
+            take_leading_options(input_of("key"), "if-supervisor=a if-supervisor=a 1")
                 .0
                 .refusal
                 .as_deref(),
@@ -3071,13 +3153,14 @@ mod tests {
     #[test]
     fn if_human_is_the_person_fence_on_key_and_send() {
         for verb in ["key", "send"] {
-            let (o, tail) = take_leading_options(verb, "if-human=7 if-gen=3.15 1");
+            let (o, tail) = take_leading_options(input_of(verb), "if-human=7 if-gen=3.15 1");
             assert_eq!(o.if_human, Some(7), "{verb}");
             assert_eq!(o.refusal, None, "{verb}");
             assert_eq!(tail, "1", "{verb}");
         }
         for bad in ["", "-1", "x", "1.5", "0x7"] {
-            let (o, tail) = take_leading_options("key", &format!("if-human={bad} 1"));
+            let line = format!("if-human={bad} 1");
+            let (o, tail) = take_leading_options(input_of("key"), &line);
             assert!(
                 o.refusal
                     .as_deref()
@@ -3086,7 +3169,7 @@ mod tests {
             );
             assert_eq!(tail, "1");
         }
-        let (o, _) = take_leading_options("key", "if-human=1 if-human=1 1");
+        let (o, _) = take_leading_options(input_of("key"), "if-human=1 if-human=1 1");
         assert_eq!(
             o.refusal.as_deref(),
             Some("ERR usage: if-human= given twice\n")
@@ -3094,11 +3177,11 @@ mod tests {
         // NEGATIVE CONTROL: a verb that is not guarded keeps it as body, and a
         // body token spelled like it is still body.
         assert_eq!(
-            take_leading_options("paste", "if-human=1 x").1,
+            take_leading_options(input_of("paste"), "if-human=1 x").1,
             "if-human=1 x"
         );
         assert_eq!(
-            take_leading_options("send", "hello if-human=1").1,
+            take_leading_options(input_of("send"), "hello if-human=1").1,
             "hello if-human=1"
         );
         // The fence alone routes to the fenced arm, and the usage line every
@@ -3120,14 +3203,14 @@ mod tests {
     #[test]
     fn if_gen_is_the_fence_and_if_seq_is_refused_not_typed() {
         use crate::control::ScreenGen;
-        let (o, tail) = take_leading_options("key", "if-gen=3.15 if-fp=00ff 1");
+        let (o, tail) = take_leading_options(input_of("key"), "if-gen=3.15 if-fp=00ff 1");
         assert_eq!(o.if_gen, Some(ScreenGen { epoch: 3, seq: 15 }));
         assert_eq!(o.if_fp, Some(0xff));
         assert_eq!(o.refusal, None);
         assert_eq!(tail, "1");
         assert_eq!(ScreenGen { epoch: 3, seq: 15 }.to_string(), "3.15");
         for bad in ["15", "3.", ".15", "3.15.1", "-3.15", "3.+15", "x.1", ""] {
-            let (o, _) = take_leading_options("key", &format!("if-gen={bad} 1"));
+            let (o, _) = take_leading_options(input_of("key"), &format!("if-gen={bad} 1"));
             assert!(
                 o.refusal
                     .as_deref()
@@ -3135,13 +3218,13 @@ mod tests {
                 "if-gen={bad:?} must be refused"
             );
         }
-        let (o, _) = take_leading_options("key", "if-gen=1.2 if-gen=1.2 1");
+        let (o, _) = take_leading_options(input_of("key"), "if-gen=1.2 if-gen=1.2 1");
         assert_eq!(
             o.refusal.as_deref(),
             Some("ERR usage: if-gen= given twice\n")
         );
         for verb in ["key", "send"] {
-            let (o, tail) = take_leading_options(verb, "if-seq=15 1");
+            let (o, tail) = take_leading_options(input_of(verb), "if-seq=15 1");
             assert!(
                 o.refusal
                     .as_deref()
@@ -3152,7 +3235,7 @@ mod tests {
         }
         // NEGATIVE CONTROL: a body token spelled like it is still body.
         assert_eq!(
-            take_leading_options("send", "hello if-seq=15").1,
+            take_leading_options(input_of("send"), "hello if-seq=15").1,
             "hello if-seq=15"
         );
     }
@@ -3382,6 +3465,69 @@ mod tests {
         assert!(parse_pointer("click right").is_err());
     }
 
+    /// `pointer wheel` takes its deltas, unit and aim as named fields in any
+    /// order, each once; `dy` down, lines unless `unit=pt`. A wheel that turns
+    /// nothing, a field twice, a delta past the cap or a stray word is refused,
+    /// never read as some other wheel.
+    #[test]
+    fn pointer_wheel_parses_its_deltas_unit_and_aim() {
+        use crate::app_mouse::{NativePointerTarget, PointerAction, WheelUnit};
+        let wheel = |dx: f64, dy: f64, unit, aim| PointerAction::Wheel { dx, dy, unit, aim };
+        assert_eq!(
+            parse_pointer("wheel dy=3"),
+            Ok(wheel(0.0, 3.0, WheelUnit::Lines, None))
+        );
+        assert_eq!(
+            parse_pointer("wheel unit=pt dx=-12.5 dy=40 key=settings/choice/Nord"),
+            Ok(wheel(
+                -12.5,
+                40.0,
+                WheelUnit::Points,
+                Some(NativePointerTarget::Key("settings/choice/Nord".into()))
+            ))
+        );
+        assert_eq!(
+            parse_pointer("wheel xy=300,120 dy=-0.5 unit=lines"),
+            Ok(wheel(
+                0.0,
+                -0.5,
+                WheelUnit::Lines,
+                Some(NativePointerTarget::Point(300.0, 120.0))
+            ))
+        );
+        assert_eq!(
+            parse_pointer(&format!("wheel dy={MAX_POINTER_WHEEL}")),
+            Ok(wheel(0.0, MAX_POINTER_WHEEL, WheelUnit::Lines, None))
+        );
+        assert_eq!(
+            parse_pointer("wheel dy=10001"),
+            Err("ERR out of range\n".to_string())
+        );
+        for junk in [
+            "wheel",
+            "wheel dy=0",
+            "wheel dy=0 dx=0",
+            "wheel 3",
+            "wheel dy=3 dy=4",
+            "wheel dy=nan",
+            "wheel dy=inf",
+            "wheel dy=x",
+            "wheel dy=3 unit=px",
+            "wheel dy=3 unit=pt unit=lines",
+            "wheel dy=3 key=",
+            "wheel dy=3 key=a xy=1,2",
+            "wheel dy=3 xy=1",
+            "wheel dy=3 xy=1,inf",
+            "wheel dy=3 down",
+        ] {
+            assert_eq!(
+                parse_pointer(junk),
+                Err(POINTER_WHEEL_USAGE.to_string()),
+                "pointer {junk:?}"
+            );
+        }
+    }
+
     /// `lines=N` reaches `InputEvent::Wheel.lines` for the wheel actions: absent it
     /// defaults to 1 (the pre-existing one-notch behaviour), an explicit count is
     /// carried through, and the magnitude is clamped to `1..=MAX_WHEEL_LINES` with a
@@ -3465,7 +3611,7 @@ mod video_keys_ledger_tests {
 
     /// `video … keys` claims to log "socket input driven through the ACTIVE-TAB
     /// verbs", and flagless `send`/`feed` ARE active-tab verbs: `control.rs`
-    /// routes both through `front_routed_input` as an `InputEvent::KeySequence`.
+    /// delivers both through the App seam as an `InputEvent::KeySequence`.
     /// The ledger's classifier had no `KeySequence` arm, so every take driven
     /// the documented way produced an EMPTY `inputs[]` — a measuring instrument
     /// reporting zero indistinguishably from one that measured zero.
@@ -3632,9 +3778,15 @@ mod video_keys_ledger_tests {
             "a cross-session paste of two chars IS two attempts this ledger missed"
         );
 
-        // The raw-byte arm agrees, per attempt, and an empty payload (a
-        // zero-length `feed`) is not an attempt at all.
-        assert_eq!(crate::video_attempt_count_bytes(b""), 0);
-        assert_eq!(crate::video_attempt_count_bytes(&send_bytes("hey")), 3);
+        // Raw bytes count per attempt, and an empty payload (a zero-length
+        // `feed`) is not an attempt at all.
+        assert_eq!(
+            crate::video_attempt_count(&InputEvent::KeySequence(Vec::new())),
+            0
+        );
+        assert_eq!(
+            crate::video_attempt_count(&InputEvent::KeySequence(send_bytes("hey"))),
+            3
+        );
     }
 }

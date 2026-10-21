@@ -198,7 +198,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
 
     let done = Arc::new(AtomicBool::new(false));
     let watchdog = park_witness(pipe[0], Arc::clone(&done));
-    let refused_before = crate::metrics::input_refused();
+    let refused_before = crate::metrics::METRICS.window.input.refused.get();
     let session = app
         .front_terminal_mirror(WindowId(0))
         .expect("terminal")
@@ -228,7 +228,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     );
     assert_eq!(second, InputOutcome::QueueFull);
     assert!(
-        crate::metrics::input_refused() >= refused_before + 2,
+        crate::metrics::METRICS.window.input.refused.get() >= refused_before + 2,
         "each refusal is counted"
     );
     assert_eq!(said(&app), 1, "and said once for the session");
@@ -572,7 +572,7 @@ fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
     let budget = aterm_session::sink::REPLY_BUDGET_BYTES;
     let mut queued = 0usize;
     let mut dropped = 0usize;
-    let counted_before = crate::metrics::reply_dropped();
+    let counted_before = crate::metrics::METRICS.window.input.reply_dropped.get();
     for _ in 0..256 {
         if replies.submit(Arc::clone(&reply)) {
             queued += 1;
@@ -590,7 +590,7 @@ fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
     );
     assert!(queued * reply.len() <= budget + reply.len());
     assert!(
-        crate::metrics::reply_dropped() >= counted_before + dropped as u64,
+        crate::metrics::METRICS.window.input.reply_dropped.get() >= counted_before + dropped as u64,
         "every dropped reply is counted (`reply_dropped` under `metrics percentiles`)"
     );
     // Teardown releases what the parked writer and the queue still hold.

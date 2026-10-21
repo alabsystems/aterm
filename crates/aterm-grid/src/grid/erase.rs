@@ -156,6 +156,9 @@ impl Grid {
                     bce = row.clear_range_with_orphan(cursor_col, right_bound, fill, fill);
                 }
             }
+            // Where the erase began: the span widened by a wide head left of it
+            // (read before the span goes to the fills below).
+            let erased_from = bce.start;
             if selective {
                 // DECSEL resets the unprotected cells it clears (and the halves of
                 // their pairs); their extras go with them, a protected cell keeps
@@ -176,9 +179,34 @@ impl Grid {
                 // the dense ring, so the ring must also cover the orphan column.
                 self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
             }
+            self.keep_len_over_marks(cursor_row, erased_from);
             self.storage.mark_content_row(cursor_row);
         }
         self.clear_wrap_into_next_row(cursor_row);
+    }
+
+    /// Keep `row`'s length over the last cell left of `before` that still
+    /// carries a combining mark. A mark on a printed blank is part of the line
+    /// (`Row::len`'s rule, which the mark's writer keeps with `update_len`), but
+    /// an erase recounts the row from its cells' bits alone, and the mark lives
+    /// with the extras: `$ ` with a mark on its space, a glyph typed after it and
+    /// rubbed out with `\b ESC[K`, lost the mark from every frame, copy and
+    /// search until the next glyph written after it grew the row back over it
+    /// (found by the predictive-echo safety theorem's sweep: the frame a guess
+    /// was shown in and the screen it settled to differed there). Costs nothing
+    /// unless the erase left the row shorter than `before` with extras about.
+    fn keep_len_over_marks(&mut self, row: u16, before: u16) {
+        let len = self.row(row).map_or(0, crate::Row::len);
+        if len >= before || self.storage.extras.is_empty() {
+            return;
+        }
+        let marked = (len..before).rev().find(|&col| {
+            self.cell_extra(row, col)
+                .is_some_and(|extra| !extra.combining().is_empty())
+        });
+        if let (Some(col), Some(r)) = (marked, self.row_mut(row)) {
+            r.update_len(col.saturating_add(1));
+        }
     }
 
     /// Break the soft wrap from `row` into the row below, as xterm `ClearRight`
@@ -2261,6 +2289,39 @@ mod tests {
     }
 
     // Wide-orphan colour: the BCE erases vs the rectangle ops
+
+    /// A combining mark on a printed blank keeps its cell in the row through an
+    /// erase to its right: `$ ` with a mark on its space (attached as the
+    /// terminal attaches one: the extra, and the row's length over it), a glyph
+    /// written after it and erased with EL 0. The row still reads the marked
+    /// space, and its length covers it. NEGATIVE CONTROL: with no mark the
+    /// same erase trims the plain space, as it always did.
+    #[test]
+    fn erase_to_end_of_line_keeps_a_marked_blank_in_the_row() {
+        for marked in [true, false] {
+            let mut grid = Grid::new(2, 10);
+            grid.write_char('$');
+            grid.write_char(' ');
+            if marked {
+                grid.cell_extra_mut(0, 1).add_combining('\u{301}');
+                if let Some(r) = grid.row_mut(0) {
+                    r.update_len(2);
+                }
+            }
+            grid.write_char('n');
+            grid.move_cursor_to(0, 2);
+            grid.erase_to_end_of_line();
+            let want = if marked { Some(2) } else { Some(1) };
+            assert_eq!(grid.row_len(0), want, "marked {marked}");
+            if marked {
+                assert!(
+                    grid.row_text(0).is_some_and(|t| t.contains(" \u{301}")),
+                    "the mark still reads: {:?}",
+                    grid.row_text(0)
+                );
+            }
+        }
+    }
 
     /// EL 0 that bisects a wide pair gives the orphaned half the BCE
     /// background, not default colours.

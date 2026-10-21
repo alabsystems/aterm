@@ -4,12 +4,14 @@
 //! The conditional `screen` read's promise, held over the host's changes as well as the
 //! program's: the etag moves whenever the frame would, or a poller is told `unchanged` about a
 //! stale picture. Output moves [`Terminal::screen_mutations`]; a config reload, a selection, a
-//! GUI scroll, a resize or a reset change the frame with no output and must reach the etag
-//! another way. So "frame moved ⇒ etag moved" is checked over a corpus whose every arm moves
-//! the frame, and over a seeded random walk in which two visited states may share an etag only
-//! if they share a frame.
+//! resize or a reset change the frame with no output and must reach the etag another way. A
+//! GUI scroll changes nothing the frame shows (the frame is the live screen), so it moves
+//! neither the frame nor the etag. So "frame moved ⇒ etag moved" is checked over a corpus whose
+//! every arm moves the frame, and over a seeded random walk in which two visited states may
+//! share an etag only if they share a frame.
 //!
-//! The negative control, `content_seq` alone, runs through the same corpus and must be caught.
+//! The negative control, `content_seq` alone, runs through the same corpus and walk and must be
+//! caught.
 //!
 //! A child of `control_query`, so it reads the private etag.
 
@@ -21,8 +23,11 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 
 use super::{
-    cmd_screen_styled_json, gather_styled_frame, screen_etag, screen_gen, serialize_styled_frame,
+    cmd_screen_styled_json, gather_styled_frame, line_size_name, screen_etag, screen_gen,
+    screen_hash, screen_text, serialize_styled_frame,
 };
+use crate::frame_key::FrameKey;
+use crate::frame_memo::{FrameSlot, Styled};
 
 /// The frame a full `screen` read serves, without its trailing etag key.
 fn frame(t: &Terminal) -> String {
@@ -121,8 +126,8 @@ fn glyph_at(r: &Rig, col: u16) -> String {
 type Step = (&'static str, fn(&mut Rig));
 
 /// Every arm must move the frame (checked per arm); the order builds the state later arms
-/// need. The host-only arms (config reload, selection, viewport scroll, resize, host reset)
-/// feed no output, so only what the etag reads of the terminal's state can see them.
+/// need. The host-only arms (config reload, selection, resize, host reset) feed no output, so
+/// only what the etag reads of the terminal's state can see them.
 fn corpus() -> Vec<Step> {
     let steps: &[Step] = &[
         // Host style policy, applied as a config reload does: resolved at render time, with no
@@ -251,10 +256,6 @@ fn corpus() -> Vec<Step> {
             r.t.process(&kitty_delete(7));
             r.t.process(&kitty_place(7, 0xff));
         }),
-        ("scroll the viewport back (an image on screen)", |r| {
-            r.t.scroll_display(2);
-        }),
-        ("scroll the viewport to live", |r| r.t.scroll_display(-2)),
         ("kitty image deleted (a=d)", |r| {
             r.t.process(&kitty_delete(7))
         }),
@@ -356,9 +357,13 @@ fn a_host_style_policy_reload_is_not_unchanged() {
             )
         };
         let (frame_0, counters_0) = (frame(&t), counters(&t));
-        let sig_0 = crate::subscribe::render_sig(&t);
+        let sig_0 = crate::frame_key::render_sig(&t);
         let term = Arc::new(Mutex::new(t));
-        let token = served_etag(&cmd_screen_styled_json(&term, ""));
+        let token = served_etag(&cmd_screen_styled_json(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            "",
+        ));
         change(&mut config);
         term.lock().expect("mutex").apply_config(&config);
         {
@@ -374,13 +379,17 @@ fn a_host_style_policy_reload_is_not_unchanged() {
                 "{name}: the premise: the reload re-resolves a cell's colour"
             );
             assert_ne!(
-                crate::subscribe::render_sig(&t),
+                crate::frame_key::render_sig(&t),
                 sig_0,
                 "{name}: render_sig carries the style policy (so `subscribe … cells` \
                  re-emits on the reload too)"
             );
         }
-        let reply = cmd_screen_styled_json(&term, &format!("since={token}"));
+        let reply = cmd_screen_styled_json(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            &format!("since={token}"),
+        );
         assert!(
             !reply.contains("\"unchanged\"") && reply.contains("\"glyph\""),
             "{name}: a style-policy reload was served as `unchanged`: {reply}"
@@ -443,6 +452,42 @@ struct Walk {
 /// different frame now. Host operations feed no output, so the walk revisits etags (a reload
 /// toggled back, a scroll undone), the comparisons that matter.
 fn walk(etag: Etag) -> Walk {
+    let mut seen: HashMap<u64, String> = HashMap::new();
+    let (mut moved, mut revisits) = (0usize, 0usize);
+    let mut collision = None;
+    let mut prev = frame(&rig().t);
+    walk_steps(|step, what, rig| {
+        let now = frame(&rig.t);
+        let e = etag(&rig.t);
+        if now != prev {
+            moved += 1;
+        }
+        if let Some(earlier) = seen.get(&e) {
+            revisits += 1;
+            if earlier != &now {
+                collision = Some(format!(
+                    "step {step} ({what}): a different frame under etag {e:016x}, \
+                     handed out earlier for another frame"
+                ));
+                return false;
+            }
+        } else {
+            seen.insert(e, now.clone());
+        }
+        prev = now;
+        true
+    });
+    Walk {
+        moved,
+        revisits,
+        distinct: seen.len(),
+        collision,
+    }
+}
+
+/// The seeded walk's 800 steps over a fresh [`rig`], each handed to `visit`
+/// with its index and name once taken; `visit` answers whether to go on.
+fn walk_steps(mut visit: impl FnMut(usize, &'static str, &Rig) -> bool) {
     let mut rig = rig();
     // xorshift64*: deterministic, no dependency, no clock.
     let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -452,11 +497,8 @@ fn walk(etag: Etag) -> Walk {
         state ^= state >> 27;
         (state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as usize % n
     };
-    let mut seen: HashMap<u64, String> = HashMap::new();
-    let (mut moved, mut revisits) = (0usize, 0usize);
-    let mut prev = frame(&rig.t);
     for step in 0..800 {
-        let what = match next(16) {
+        let what = match next(17) {
             0 => {
                 rig.t
                     .process(&kitty_place(3, u8::try_from(next(256)).unwrap_or(0)));
@@ -466,28 +508,36 @@ fn walk(etag: Etag) -> Walk {
                 rig.t.process(&kitty_delete(3));
                 "kitty delete"
             }
+            // Image 3 stored and named by a placeholder cell at the cursor:
+            // text whose picture a viewport-mapped decode would lose.
             2 => {
+                rig.t
+                    .process(&kitty_store(3, u8::try_from(next(256)).unwrap_or(0)));
+                rig.t.process(&kitty_placeholder(3));
+                "kitty placeholder"
+            }
+            3 => {
                 rig.t
                     .process(&osc1337_image(&[u8::try_from(next(256)).unwrap_or(0); 5]));
                 "OSC 1337 image"
             }
-            3 => {
+            4 => {
                 let rows = 4 + u16::try_from(next(4)).unwrap_or(0);
                 let cols = 12 + u16::try_from(next(8)).unwrap_or(0);
                 rig.t.resize(rows, cols);
                 "resize"
             }
-            4 | 5 => {
+            5 | 6 => {
                 rig.t.scroll_display(if next(2) == 0 { 2 } else { -2 });
                 "viewport scroll"
             }
-            6..=8 => {
+            7..=9 => {
                 rig.config.bold_is_bright = next(2) == 0;
                 rig.config.faint_opacity = if next(2) == 0 { 0.5 } else { 0.8 };
                 rig.t.apply_config(&rig.config);
                 "config reload (style policy)"
             }
-            9 | 10 => {
+            10 | 11 => {
                 let sel = rig.t.text_selection_mut();
                 if next(3) == 0 {
                     sel.clear();
@@ -505,7 +555,7 @@ fn walk(etag: Etag) -> Walk {
                 }
                 "selection"
             }
-            11 => match next(8) {
+            12 => match next(8) {
                 0 => {
                     rig.t.reset();
                     "host reset"
@@ -524,34 +574,9 @@ fn walk(etag: Etag) -> Walk {
                 "VT fragment"
             }
         };
-        let now = frame(&rig.t);
-        let e = etag(&rig.t);
-        if now != prev {
-            moved += 1;
+        if !visit(step, what, &rig) {
+            return;
         }
-        if let Some(earlier) = seen.get(&e) {
-            revisits += 1;
-            if earlier != &now {
-                return Walk {
-                    moved,
-                    revisits,
-                    distinct: seen.len(),
-                    collision: Some(format!(
-                        "step {step} ({what}): a different frame under etag {e:016x}, \
-                         handed out earlier for another frame"
-                    )),
-                };
-            }
-        } else {
-            seen.insert(e, now.clone());
-        }
-        prev = now;
-    }
-    Walk {
-        moved,
-        revisits,
-        distinct: seen.len(),
-        collision: None,
     }
 }
 
@@ -584,6 +609,79 @@ fn no_two_visited_states_share_an_etag_unless_they_share_a_frame() {
     );
 }
 
+/// THE PUBLISHED FRAME IS THE FRESH ONE. A session's slot, read over the
+/// seeded walk the way every reader reads it (a look, the keys compared under
+/// the hold, a miss built and published), serves at every step exactly what a
+/// fresh read of the same state builds: the text ([`screen_text`]), its hash
+/// ([`screen_hash`]), and the styled frame. A `cells` hold keeps the frame, as
+/// a `subscribe … cells` watch does. The walk must also HIT, on both halves,
+/// or nothing published was ever served. NEGATIVE CONTROL: a frame memo keyed
+/// on `content_seq` alone is caught serving a stale frame on the same walk (the
+/// text half's control is `frame_memo`'s alt re-entry test: over this walk the
+/// text never changes at an unchanged seq).
+#[test]
+fn the_published_frame_equals_a_fresh_read_over_the_walk() {
+    let slot = std::sync::Arc::new(FrameSlot::default());
+    let _cells = FrameSlot::hold_cells(&slot);
+    let (mut text_hits, mut frame_hits) = (0usize, 0usize);
+    let mut last_text = None;
+    // The negative control: (seq, frame) as of its last build.
+    let mut by_seq: Option<(u64, String)> = None;
+    let mut stale = None;
+    walk_steps(|step, what, rig| {
+        let t = &rig.t;
+        let mut look = slot.look_frame();
+        let text = look.text(t);
+        let key = FrameKey::read(t);
+        let styled = match look.styled(t, &key) {
+            Styled::Hit(frame) => {
+                frame_hits += 1;
+                frame
+            }
+            Styled::Miss(snap) => look.publish_styled(key, &snap),
+        };
+        drop(look);
+        if last_text
+            .as_ref()
+            .is_some_and(|last| std::sync::Arc::ptr_eq(last, &text))
+        {
+            text_hits += 1;
+        }
+        let (fresh_text, fresh_frame) = (screen_text(t), frame(t));
+        assert_eq!(text.whole(), fresh_text, "step {step} ({what}): the text");
+        assert_eq!(text.fnv(), screen_hash(t), "step {step} ({what}): the hash");
+        assert_eq!(
+            styled.body(),
+            fresh_frame,
+            "step {step} ({what}): the frame"
+        );
+        last_text = Some(text);
+
+        let seq = t.content_seq();
+        match &by_seq {
+            Some((at, served)) if *at == seq => {
+                if *served != fresh_frame {
+                    stale.get_or_insert(format!("step {step} ({what})"));
+                }
+            }
+            _ => by_seq = Some((seq, fresh_frame)),
+        }
+        true
+    });
+    assert!(
+        text_hits > 50,
+        "only {text_hits} steps were served a published text"
+    );
+    assert!(
+        frame_hits > 20,
+        "only {frame_hits} steps were served a published frame"
+    );
+    assert!(
+        stale.is_some(),
+        "a frame memo keyed on content_seq alone must be caught serving a stale frame"
+    );
+}
+
 /// The shipped etag over the corpus misses no arm, and the negative control
 /// (`content_seq` alone) is caught, so the corpus has teeth.
 #[test]
@@ -600,4 +698,112 @@ fn every_incomplete_etag_is_caught_missing_real_frame_changes() {
         "no arm showed `content_seq` alone a moved frame under an unmoved etag, \
          so the harness cannot tell it from the shipped one"
     );
+}
+
+/// What a VIEWPORT-relative read of the frame's rows would see: each row's DEC
+/// line size off the display-mapped grid, and each image placement off the
+/// viewport's image reader.
+fn viewport_view(t: &Terminal) -> (Vec<&'static str>, Vec<(usize, usize)>) {
+    let rows = t.rows();
+    let line_sizes = (0..rows)
+        .map(|r| {
+            line_size_name(
+                t.grid()
+                    .row(r)
+                    .map_or(aterm_core::grid::LineSize::SingleWidth, |row| {
+                        row.line_size()
+                    }),
+            )
+        })
+        .collect();
+    let images = t
+        .images_frame(usize::from(rows))
+        .iter()
+        .enumerate()
+        .flat_map(|(r, row)| row.iter().map(move |&(c, _)| (r, c)))
+        .collect();
+    (line_sizes, images)
+}
+
+/// A VIEWPORT SCROLL IS NOT A FRAME CHANGE. Every field of the frame is read
+/// off the live screen, so a person scrolling back through history moves
+/// neither the frame nor the etag, and a poller holding the etag is answered
+/// `unchanged`. The screen carries everything a viewport-relative read would
+/// move — an image on screen, a DEC double-width row, an image scrolled into
+/// history, a Kitty Unicode placeholder on the last row (whose viewport row,
+/// scrolled back, is history text, so a placeholder decoded through the
+/// viewport drops its image) — and the premises assert the viewport readers
+/// do see it move, so the frame standing still is the live read at work, not
+/// an empty screen.
+///
+/// NEGATIVE CONTROL: that premise, a viewport-relative read of the same
+/// screen ([`viewport_view`]), moves on every scroll; an etag folding the
+/// display offset cost every `screen since=` poller a full frame each time
+/// the person touched the wheel.
+#[test]
+fn a_viewport_scroll_moves_neither_the_frame_nor_the_etag() {
+    type Scroll = (&'static str, fn(&mut Terminal));
+    let scrolls: [Scroll; 2] = [
+        ("scroll back 2", |t| t.scroll_display(2)),
+        ("scroll to the top", Terminal::scroll_to_top),
+    ];
+    let kitty_b64 = format!(
+        "\"b64\":\"{}\"",
+        aterm_codec::base64::encode(&[0u8; 10 * 20 * 4]).expect("encode")
+    );
+    for (name, scroll) in scrolls {
+        let mut t = Terminal::new(6, 20);
+        // Kitty placeholders resolve against real cell metrics.
+        t.set_cell_pixel_size(10, 20);
+        t.process(&osc1337_image(b"scrolls-into-history"));
+        for i in 0..10 {
+            t.process(format!("history {i}\r\n").as_bytes());
+        }
+        t.process(b"\x1b[3;1H");
+        t.process(&osc1337_image(b"on-screen"));
+        t.process(b"\x1b[5;1HDOUBLE\x1b#6");
+        t.process(b"\x1b[6;15H");
+        t.process(&kitty_store(5, 0));
+        t.process(&kitty_placeholder(5));
+        let (frame_0, etag_0, view_0) = (frame(&t), screen_etag(&t), viewport_view(&t));
+        assert!(
+            frame_0.contains("\"double_width\"") && frame_0.contains("\"b64\":"),
+            "{name}: the premise: a double-width row and an image are on screen"
+        );
+        assert!(
+            frame_0.contains(&kitty_b64),
+            "{name}: the premise: the placeholder shows its Kitty image"
+        );
+        let term = Arc::new(Mutex::new(t));
+        let token = served_etag(&cmd_screen_styled_json(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            "",
+        ));
+        scroll(&mut term.lock().expect("mutex"));
+        {
+            let t = term.lock().expect("mutex");
+            assert_ne!(
+                t.grid().display_offset(),
+                0,
+                "{name}: the premise: the viewport moved"
+            );
+            assert_ne!(
+                viewport_view(&t),
+                view_0,
+                "{name}: the premise: a viewport-relative read sees the rows move"
+            );
+            assert_eq!(frame(&t), frame_0, "{name}: the frame is the live screen");
+            assert_eq!(screen_etag(&t), etag_0, "{name}: the etag stands");
+        }
+        let reply = cmd_screen_styled_json(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            &format!("since={token}"),
+        );
+        assert!(
+            reply.contains("\"unchanged\""),
+            "{name}: a viewport scroll was served a full frame: {reply}"
+        );
+    }
 }

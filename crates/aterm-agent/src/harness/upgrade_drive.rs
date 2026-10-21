@@ -509,9 +509,10 @@ pub struct Opts {
     pub agents_off: Vec<aterm_phase::Program>,
     /// THE TAB'S AUTOPILOT IS LAND (`docs/DESIGN-harness-autopilot-2026-10-15.md`
     /// §2.2): a relaunch's carry-on types no continuation of Cruise's — no
-    /// `keep going`, no done check — and leaves its point to the tab's loop,
-    /// whose land policy types the land instruction, a nudge, or nothing once
-    /// the landing is spent (`done:landing`; [`super::relaunch::resume`], F2).
+    /// `keep going`, no Cruise prompt — and leaves its point to the tab's
+    /// loop, whose land policy types the land instruction, a nudge, or
+    /// nothing once the task landed (`done:landing`;
+    /// [`super::relaunch::resume`], F2).
     /// The window's host sets it, for the one tab it carries on, from that
     /// session's effective Autopilot; `false` — the CLI's sweep, which
     /// carries no Autopilot of its own — reads the tab's own `status` at the
@@ -714,6 +715,15 @@ pub(super) fn at_second<R>(now: u64, f: impl FnOnce() -> R) -> R {
 }
 
 // ---------------------------------------------------------------- processes
+//
+// THE PROCESS TABLE, AS `ps` READS IT. macOS reads the kernel's records in
+// this process ([`aterm_sysprobe::kproc`]: `sysctl(KERN_PROC)`, the table `ps`
+// itself reads, and `KERN_PROCARGS2`): a `ps` child cost 0.02-0.4 s of a
+// loaded Mac's wall each, and the host's read of one tab's job took five of
+// them, several times a second, through every attach. Every other host runs
+// `ps`. The values are `ps`'s own, column for column (`upgrade_drive_kproc_tests.rs`
+// holds the two to each other on the live machine); a terminal is a word only
+// the walk compares ([`tty_word`]).
 
 /// `ps` in the C locale and UTC, the rendering Claude's `procStart` uses.
 ///
@@ -721,12 +731,11 @@ pub(super) fn at_second<R>(now: u64, f: impl FnOnce() -> R) -> R {
 /// they run only when such a tool is on `PATH` (Git for Windows, MSYS), a
 /// console image, and the sweep runs in the window's harness host, which has no
 /// console, so a bare one would flash a console window.
+#[cfg(any(not(target_os = "macos"), test))]
 fn ps(args: &[&str]) -> Option<String> {
-    let out = aterm_uds::spawnfd::command("ps")
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command("ps");
+    cmd.args(args).env("LC_ALL", "C").env("TZ", "UTC");
+    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
         .ok()?;
     out.status
         .success()
@@ -738,9 +747,31 @@ pub(super) fn squash(s: &str) -> String {
 }
 
 /// The kernel's start time of `pid`, rendered as Claude renders `procStart`.
+///
+/// On Windows that rendering is the raw creation `FILETIME` in decimal (100 ns
+/// ticks since 1601-01-01 UTC), the exact integer Claude Code writes as a
+/// session's `procStart` (measured: `134369042337562842`). It is read by
+/// syscall ([`aterm_uds::process::read_creation_filetime`]: `GetProcessTimes`),
+/// never `ps`: Git for Windows' MSYS `ps` takes Cygwin pids and has no `-o
+/// lstart`, so a `ps` here answers nothing and would flash a console window
+/// from the window's console-less harness host. On macOS the kernel's record
+/// ([`aterm_sysprobe::kproc::record`]); elsewhere `ps -o lstart=` in the C
+/// locale and UTC (whitespace-squashed), the spelling `procStart` carries there.
 pub(super) fn kernel_start(pid: u32) -> Option<String> {
-    let s = squash(&ps(&["-o", "lstart=", "-p", &pid.to_string()])?);
-    (!s.is_empty()).then_some(s)
+    #[cfg(windows)]
+    {
+        aterm_uds::process::read_creation_filetime(i32::try_from(pid).ok()?)
+            .map(|ticks| ticks.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        aterm_sysprobe::kproc::record(pid).map(|r| super::footer::lstart_utc(r.start_s))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let s = squash(&ps(&["-o", "lstart=", "-p", &pid.to_string()])?);
+        (!s.is_empty()).then_some(s)
+    }
 }
 
 /// Whether process `pid` lives (one we may not signal included). Pid 0 is no
@@ -770,13 +801,21 @@ pub(super) fn alive(pid: u32) -> bool {
 
 /// `(ppid, pgid, tpgid)` of `pid`.
 pub(super) fn ids(pid: u32) -> Option<(u32, i64, i64)> {
-    let out = ps(&["-o", "ppid=,pgid=,tpgid=", "-p", &pid.to_string()])?;
-    let mut it = out.split_whitespace();
-    Some((
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-    ))
+    #[cfg(target_os = "macos")]
+    {
+        let r = aterm_sysprobe::kproc::record(pid)?;
+        Some((r.ppid, i64::from(r.pgid), i64::from(r.tpgid)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let out = ps(&["-o", "ppid=,pgid=,tpgid=", "-p", &pid.to_string()])?;
+        let mut it = out.split_whitespace();
+        Some((
+            it.next()?.parse().ok()?,
+            it.next()?.parse().ok()?,
+            it.next()?.parse().ok()?,
+        ))
+    }
 }
 
 /// A cheap kernel group lookup before any process-table sweep. The focused
@@ -796,8 +835,122 @@ fn process_group(pid: u32) -> Option<i64> {
     }
 }
 
+/// One row of the process table: `(pid, ppid, command basename)`, the
+/// basename read when it is first asked for ([`Comm`]).
+pub(super) type ProcRow = (u32, u32, Comm);
+
+/// A process table row's command basename: the `comm` column `ps` prints,
+/// [`base_name`]d. Given whole where a row was parsed from `ps` (or written by
+/// a test); on macOS read from the row's kernel record the first time it is
+/// asked for ([`comm_name`]). Its `argv[0]` costs a `KERN_PROCARGS2` read and
+/// an escape per process, 14-16 ms of a table of 1 100 (measured 2026-10-20,
+/// a debug build, where the records alone took 1.2 ms), and nearly every
+/// reader names a few rows (an agent's descendants, a shell's own row), where
+/// every row once paid. A name read later than its row is the row's process's
+/// as the old table's was: each row's words were read one by one after the
+/// records, never with them.
+#[derive(Clone)]
+pub(super) struct Comm {
+    name: std::sync::OnceLock<String>,
+    #[cfg(target_os = "macos")]
+    record: Option<aterm_sysprobe::kproc::Record>,
+}
+
+impl Comm {
+    /// The basename `r`'s `argv[0]` gives ([`comm_name`]), read when first
+    /// asked for.
+    #[cfg(target_os = "macos")]
+    fn named_when_asked(r: aterm_sysprobe::kproc::Record) -> Self {
+        Self {
+            name: std::sync::OnceLock::new(),
+            record: Some(r),
+        }
+    }
+
+    /// The basename.
+    pub(super) fn as_str(&self) -> &str {
+        self.name.get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            if let Some(r) = &self.record {
+                return comm_name(r);
+            }
+            String::new()
+        })
+    }
+}
+
+impl From<String> for Comm {
+    fn from(name: String) -> Self {
+        Self {
+            name: std::sync::OnceLock::from(name),
+            #[cfg(target_os = "macos")]
+            record: None,
+        }
+    }
+}
+
+impl From<&str> for Comm {
+    fn from(name: &str) -> Self {
+        Self::from(name.to_string())
+    }
+}
+
+impl std::ops::Deref for Comm {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for Comm {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Comm {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq for Comm {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl std::fmt::Debug for Comm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for Comm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The whole table: `(pid, ppid, command basename)`.
-pub(super) fn table() -> Vec<(u32, u32, String)> {
+pub(super) fn table() -> Vec<ProcRow> {
+    #[cfg(target_os = "macos")]
+    {
+        aterm_sysprobe::kproc::records()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.pid, r.ppid, Comm::named_when_asked(r)))
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ps_table()
+    }
+}
+
+/// [`table`] from `ps -A -o pid=,ppid=,comm=`.
+#[cfg(any(not(target_os = "macos"), test))]
+fn ps_table() -> Vec<ProcRow> {
     let Some(out) = ps(&["-A", "-o", "pid=,ppid=,comm="]) else {
         return Vec::new();
     };
@@ -806,9 +959,33 @@ pub(super) fn table() -> Vec<(u32, u32, String)> {
             let mut it = l.split_whitespace();
             let pid = it.next()?.parse().ok()?;
             let ppid = it.next()?.parse().ok()?;
-            Some((pid, ppid, base_name(&it.collect::<Vec<_>>().join(" "))))
+            Some((
+                pid,
+                ppid,
+                base_name(&it.collect::<Vec<_>>().join(" ")).into(),
+            ))
         })
         .collect()
+}
+
+/// The basename of the `comm` column `ps` prints for `r` (its `argv[0]`,
+/// [`base_name`] of the whitespace-squashed word as the `ps` row's parse
+/// gives it).
+#[cfg(target_os = "macos")]
+fn comm_name(r: &aterm_sysprobe::kproc::Record) -> String {
+    base_name(&squash(&aterm_sysprobe::kproc::ps_comm(
+        r,
+        aterm_sysprobe::kproc::Locale::C,
+    )))
+}
+
+/// A controlling terminal as one word of a table row: `??` for none, as `ps`
+/// prints it, else its device number. The walk ([`terminal_owner`]) only asks
+/// whether two rows share a terminal and whether a row has one; `ps`'s NAME
+/// for a device costs a scan of `/dev`.
+#[cfg(target_os = "macos")]
+fn tty_word(tty: Option<i32>) -> String {
+    tty.map_or_else(|| "??".to_string(), |dev| format!("dev{dev}"))
 }
 
 /// Every descendant of `root` in the process table `table` (`(pid, ppid,
@@ -816,10 +993,7 @@ pub(super) fn table() -> Vec<(u32, u32, String)> {
 /// live machine is (`ps` itself is in it): unread, never "no child". The live
 /// upgrade's process rule of the lanes past Claude Code's (Muse Code's G-M3,
 /// agy's G-A2(d)): an idle agent of theirs has no child at all.
-pub(super) fn descendants_in(
-    table: &[(u32, u32, String)],
-    root: u32,
-) -> Option<Vec<(u32, String)>> {
+pub(super) fn descendants_in(table: &[ProcRow], root: u32) -> Option<Vec<(u32, String)>> {
     if table.is_empty() {
         return None;
     }
@@ -828,7 +1002,7 @@ pub(super) fn descendants_in(
     while let Some(parent) = frontier.pop() {
         for (pid, ppid, name) in table {
             if *ppid == parent && *pid != root && !found.iter().any(|(p, _)| p == pid) {
-                found.push((*pid, name.clone()));
+                found.push((*pid, name.to_string()));
                 frontier.push(*pid);
             }
         }
@@ -848,6 +1022,7 @@ fn base_name(comm: &str) -> String {
 /// The whole table with each process's controlling terminal:
 /// `(pid, ppid, tty, command basename)`, the tty `??` (macOS) or `?` (Linux)
 /// for none.
+#[cfg(any(not(target_os = "macos"), test))]
 fn tty_table() -> Vec<(u32, u32, String, String)> {
     let Some(out) = ps(&["-A", "-o", "pid=,ppid=,tty=,comm="]) else {
         return Vec::new();
@@ -886,12 +1061,49 @@ fn terminal_owner(pid: u32, t: &[(u32, u32, String, String)]) -> Option<(u32, &s
     None
 }
 
-/// [`Kernel::opener`] from one `ps` read of `agent` and `parent` alone: the
-/// walk [`terminal_owner`] makes stops at `parent` exactly when `agent` is on
-/// a terminal and `parent` is on none or another, which is all the job's
-/// read needs to know (a whole table costs some 20 ms on a busy Mac, and
+/// [`Kernel::terminal`] read now: the walk ([`terminal_owner`]) over the whole
+/// table. macOS reads the kernel's records once and names the owner alone
+/// ([`comm_name`]): the walk needs every row's parent and terminal, and no
+/// other row's name.
+fn live_terminal(pid: u32) -> Option<(u32, String)> {
+    #[cfg(target_os = "macos")]
+    {
+        let rows = aterm_sysprobe::kproc::records()?;
+        let walk: Vec<(u32, u32, String, String)> = rows
+            .iter()
+            .map(|r| (r.pid, r.ppid, tty_word(r.tty), String::new()))
+            .collect();
+        let (owner, _) = terminal_owner(pid, &walk)?;
+        let r = rows.iter().find(|r| r.pid == owner)?;
+        Some((owner, comm_name(r)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        terminal_owner(pid, &tty_table()).map(|(owner, name)| (owner, name.to_string()))
+    }
+}
+
+/// [`Kernel::opener`] from one read of `agent` and `parent` alone: the walk
+/// [`terminal_owner`] makes stops at `parent` exactly when `agent` is on a
+/// terminal and `parent` is on none or another, which is all the job's read
+/// needs to know (a whole table costs some 20 ms of `ps` on a busy Mac, and
 /// every look at the job pays this one).
 fn opener(agent: u32, parent: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let tty = aterm_sysprobe::kproc::record(agent)?.tty?;
+        let parent = aterm_sysprobe::kproc::record(parent)?;
+        (parent.tty != Some(tty)).then(|| comm_name(&parent))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ps_opener(agent, parent)
+    }
+}
+
+/// [`opener`] from `ps -o pid=,tty=,comm= -p <agent>,<parent>`.
+#[cfg(any(not(target_os = "macos"), test))]
+fn ps_opener(agent: u32, parent: u32) -> Option<String> {
     let out = ps(&["-o", "pid=,tty=,comm=", "-p", &format!("{agent},{parent}")])?;
     let rows: Vec<(u32, String, String)> = out
         .lines()
@@ -1122,7 +1334,8 @@ pub(super) trait Kernel {
     }
 }
 
-/// The kernel itself: `ps` and `kill(pid, 0)`.
+/// The kernel itself: its process table ([`ids`], [`live_terminal`], [`opener`]:
+/// `ps` off macOS) and `kill(pid, 0)`.
 pub(super) struct Live;
 
 impl Kernel for Live {
@@ -1134,7 +1347,7 @@ impl Kernel for Live {
     }
 
     fn terminal(&self, pid: u32) -> Option<(u32, String)> {
-        terminal_owner(pid, &tty_table()).map(|(owner, name)| (owner, name.to_string()))
+        live_terminal(pid)
     }
 
     fn opener(&self, agent: u32, parent: u32) -> Option<String> {
@@ -1172,7 +1385,7 @@ const OWN_KEEP_AWAKE: &str = "caffeinate";
 /// direct child), whose descendants are still walked. The one reading of
 /// "something runs under the agent" for every restart (the live upgrade's
 /// gate and last look, the model-only restart, a Codex embedded session).
-pub(super) fn background(pid: u32, t: &[(u32, u32, String)]) -> Vec<String> {
+pub(super) fn background(pid: u32, t: &[ProcRow]) -> Vec<String> {
     background_procs(pid, t)
         .into_iter()
         .map(|(_, name)| name)
@@ -1181,7 +1394,7 @@ pub(super) fn background(pid: u32, t: &[(u32, u32, String)]) -> Vec<String> {
 
 /// [`background`] with each process's pid: `(pid, basename)`, in the order
 /// the walk met them.
-pub(super) fn background_procs(pid: u32, t: &[(u32, u32, String)]) -> Vec<(u32, String)> {
+pub(super) fn background_procs(pid: u32, t: &[ProcRow]) -> Vec<(u32, String)> {
     let mut frontier = vec![pid];
     let mut found = Vec::new();
     let mut seen = 0;
@@ -1195,7 +1408,7 @@ pub(super) fn background_procs(pid: u32, t: &[(u32, u32, String)]) -> Vec<(u32, 
                 frontier.push(*c);
                 let own_keep_awake = p == pid && name == OWN_KEEP_AWAKE;
                 if BACKGROUND.contains(&name.as_str()) && !own_keep_awake {
-                    found.push((*c, name.clone()));
+                    found.push((*c, name.to_string()));
                 }
             }
         }
@@ -1216,7 +1429,7 @@ pub(super) fn live_background(pid: u32) -> Vec<String> {
 
 /// [`live_background`] over a table already read: an empty one reads as
 /// [`UNREADABLE_TABLE`].
-pub(super) fn background_or_unreadable(pid: u32, t: &[(u32, u32, String)]) -> Vec<String> {
+pub(super) fn background_or_unreadable(pid: u32, t: &[ProcRow]) -> Vec<String> {
     if t.is_empty() {
         return vec![UNREADABLE_TABLE.to_string()];
     }
@@ -1225,13 +1438,44 @@ pub(super) fn background_or_unreadable(pid: u32, t: &[(u32, u32, String)]) -> Ve
 
 /// What runs under the agent, named for the notice
 /// ([`upgrade::running_clause`], [`Kernel::describe`]): each of `procs` with
-/// its age from one `ps` read, plus its command when its parent is `agent`
-/// (the agent's own Bash-tool shell, [`upgrade::Held::command`]). Processes
-/// gone since the walk are left out; an unreadable read names nothing.
+/// its age, plus its command when its parent is `agent` (the agent's own
+/// Bash-tool shell, [`upgrade::Held::command`]), as `ps -o
+/// pid=,ppid=,etime=,args=` gives them in the C locale. Processes gone since
+/// the walk are left out; an unreadable read names nothing.
 pub(super) fn held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
     if procs.is_empty() {
         return Vec::new();
     }
+    #[cfg(target_os = "macos")]
+    {
+        use aterm_sysprobe::kproc;
+        let now = aterm_time::unix_secs().unwrap_or(0);
+        procs
+            .iter()
+            .filter_map(|(p, name)| {
+                let r = kproc::record(*p)?;
+                Some(upgrade::Held {
+                    pid: *p,
+                    name: name.clone(),
+                    age_s: now.saturating_sub(r.start_s),
+                    command: if r.ppid == agent {
+                        command_head(&squash(&kproc::ps_args(&r, kproc::Locale::C)))
+                    } else {
+                        String::new()
+                    },
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ps_held_of(agent, procs)
+    }
+}
+
+/// [`held_of`] from one `ps -o pid=,ppid=,etime=,args= -p <procs>` read.
+#[cfg(any(not(target_os = "macos"), test))]
+fn ps_held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
     let list = procs
         .iter()
         .map(|(p, _)| p.to_string())
@@ -1334,6 +1578,7 @@ pub(super) fn gave_up_words(agent: upgrade::Agent, held: &[upgrade::Held], quiet
 }
 
 /// `ps`'s `etime` (`[[dd-]hh:]mm:ss`) in seconds.
+#[cfg(any(not(target_os = "macos"), test))]
 pub(super) fn parse_etime(etime: &str) -> Option<u64> {
     let (days, clock) = match etime.split_once('-') {
         Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
@@ -1370,7 +1615,7 @@ pub(super) fn command_head(args: &str) -> String {
 
 /// Whether `pid` is this process or one of its ancestors: ending it would end
 /// the sweep that is driving it.
-pub(super) fn is_our_ancestor(pid: u32, t: &[(u32, u32, String)]) -> bool {
+pub(super) fn is_our_ancestor(pid: u32, t: &[ProcRow]) -> bool {
     let mut p = std::process::id();
     for _ in 0..64 {
         if p == pid {
@@ -1398,9 +1643,9 @@ pub(super) fn exe_of(pid: u32) -> Option<PathBuf> {
 /// lanes' read of a process's own locks (codex-alab's writer lock, a Muse
 /// Code's session lock, an agy's presence lock and crash file).
 pub(super) fn lsof_open_files(pid: u32) -> Option<Vec<PathBuf>> {
-    let out = aterm_uds::spawnfd::command("lsof")
-        .args(["-n", "-P", "-w", "-p", &pid.to_string(), "-Fn"])
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command("lsof");
+    cmd.args(["-n", "-P", "-w", "-p", &pid.to_string(), "-Fn"]);
+    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
         .ok()?;
     // lsof exits 1 for a pid it found nothing for: an unreadable answer.
     if !out.status.success() {
@@ -1414,14 +1659,31 @@ pub(super) fn lsof_open_files(pid: u32) -> Option<Vec<PathBuf>> {
     )
 }
 
+/// Every process holding `file` open through a descriptor, `None` when
+/// unreadable: the lanes' read of who holds a lock (codex-alab's writer lock, a
+/// Muse Code's session lock, an agy's presence lock) or an agy conversation's
+/// database before a line resumes it. On macOS the holder scan reads it in this
+/// process ([`aterm_uds::holders::scan_file_holders`]: 9-22 ms where `lsof -t`
+/// took 0.2-0.3 s of a loaded Mac), and a process whose table it could not read
+/// leaves the answer unknown; elsewhere [`lsof_holders`] reads it. The two name
+/// the same holders of a file held through a descriptor
+/// (`file_holders_are_lsof_s`); `lsof` alone also names a process whose working
+/// directory or a mapping is the file, which none of these files is to its
+/// holder.
+pub(super) fn file_holders(file: &Path) -> Option<Vec<u32>> {
+    match aterm_uds::holders::scan_file_holders(file, &[]) {
+        Ok(scan) => scan.unreadable.is_empty().then_some(scan.holders),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => lsof_holders(file),
+        Err(_) => None,
+    }
+}
+
 /// Every process holding `file` open (`lsof -t`), `None` when unreadable:
-/// the lanes' read of who holds a lock (codex-alab's writer lock, a Muse
-/// Code's session lock, an agy's presence lock) before a line resumes it.
+/// [`file_holders`] where the holder scan is unsupported, and its oracle.
 pub(super) fn lsof_holders(file: &Path) -> Option<Vec<u32>> {
-    let out = aterm_uds::spawnfd::command("lsof")
-        .args(["-n", "-P", "-t"])
-        .arg(file)
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command("lsof");
+    cmd.args(["-n", "-P", "-t"]).arg(file);
+    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
         .ok()?;
     lsof_holder_pids(&out)
 }
@@ -1535,10 +1797,16 @@ pub(super) fn line_status(c: &mut Client, tab: &str, block: Option<u64>) -> Opti
 }
 
 /// When `pid` started, unix milliseconds (to the second: `ps`'s elapsed
-/// time), while it runs (`MuseRun::started_ms`, `AgyRun::started_ms`).
+/// time, now's second less its start's), while it runs
+/// (`MuseRun::started_ms`, `AgyRun::started_ms`).
 pub(super) fn started_ms(pid: u32) -> Option<u64> {
-    let etime = ps(&["-o", "etime=", "-p", &pid.to_string()])?;
-    let age_s = parse_etime(etime.trim())?;
+    #[cfg(target_os = "macos")]
+    let age_s = {
+        let r = aterm_sysprobe::kproc::record(pid)?;
+        aterm_time::unix_secs()?.saturating_sub(r.start_s)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let age_s = parse_etime(ps(&["-o", "etime=", "-p", &pid.to_string()])?.trim())?;
     let now_ms = u64::try_from(aterm_time::since_epoch()?.as_millis()).ok()?;
     Some(now_ms.saturating_sub(age_s.saturating_mul(1000)))
 }
@@ -1556,7 +1824,7 @@ pub(super) fn shell_dialect_of(
             table()
                 .into_iter()
                 .find(|(p, _, _)| *p == shell)
-                .map(|(_, _, n)| n)
+                .map(|(_, _, n)| n.to_string())
         })
         .as_deref()
         .map(base_name)
@@ -2027,7 +2295,17 @@ pub(super) fn roster(c: &mut Client) -> Vec<String> {
 /// reads from outside the window. Bounded by [`CLAIMS_WAIT`]; `None` for no
 /// roster.
 pub(super) fn roster_aside(c: &mut Client, agents_off: &[aterm_phase::Program]) -> Option<Aside> {
-    c.transport().set_read_timeout(Some(CLAIMS_WAIT)).ok()?;
+    roster_aside_within(c, agents_off, CLAIMS_WAIT)
+}
+
+/// [`roster_aside`], an instance that has not answered within `wait` given up
+/// on (`None`).
+fn roster_aside_within(
+    c: &mut Client,
+    agents_off: &[aterm_phase::Program],
+    wait: Duration,
+) -> Option<Aside> {
+    c.transport().set_read_timeout(Some(wait)).ok()?;
     let (head, body) = c.request_counted("sessions").ok()?;
     if !crate::is_ok_reply(&head) {
         return None;
@@ -2542,7 +2820,18 @@ pub fn hand_give_back_request() -> String {
 /// that hangs the loop's connection up gives it back.
 #[must_use]
 pub fn hand_take_here_request() -> String {
-    format!("{} here", hand_take_request())
+    hand_take_here_request_as(&hand_name())
+}
+
+/// [`hand_take_here_request`] under the hand name `holder`: what a loop
+/// whose setup holds its holder takes the hand under (`supervise`'s
+/// `Session::type_under_hand`). The window's host names its loops by its
+/// hand name (`aterm-gui`'s `harness_host::holder`), so live it is the very
+/// request; a replay of that loop's tape, in a process of its own, asks it
+/// as the recorded run did rather than under its own pid.
+#[must_use]
+pub fn hand_take_here_request_as(holder: &str) -> String {
+    format!("lease acquire ttl={HAND_TTL_MS} holder={holder} hard here")
 }
 
 /// [`hand_give_back_request`] kept to the asking connection (`lease release
@@ -2550,7 +2839,14 @@ pub fn hand_take_here_request() -> String {
 /// under the same name, over another connection, is never freed by it.
 #[must_use]
 pub fn hand_give_back_here_request() -> String {
-    format!("{} here", hand_give_back_request())
+    hand_give_back_here_request_as(&hand_name())
+}
+
+/// [`hand_give_back_here_request`] under the hand name `holder`
+/// ([`hand_take_here_request_as`]'s pair).
+#[must_use]
+pub fn hand_give_back_here_request_as(holder: &str) -> String {
+    format!("lease release holder={holder} here")
 }
 
 /// Whether a claim's holder (percent-decoded) is a window's own host —
@@ -3356,11 +3652,15 @@ pub(super) fn tap_settings(
             .map(|value| format!("{key}={value}"))
     });
     let worker = |cowork: bool| {
-        let env = [format!("HOME={}", opts.home.display())]
-            .into_iter()
-            .chain(account.clone())
-            .chain(cowork.then(|| "CLAUDE_CODE_USE_COWORK_PLUGINS=1".to_string()))
-            .collect();
+        let env = [format!(
+            "{}={}",
+            super::accounts::HOMEDIR_ENV,
+            opts.home.display()
+        )]
+        .into_iter()
+        .chain(account.clone())
+        .chain(cowork.then(|| "CLAUDE_CODE_USE_COWORK_PLUGINS=1".to_string()))
+        .collect();
         WorkerEnv::new(atpkg::caller_shell::ProcArgs {
             argv: carried.clone(),
             env,
@@ -8140,12 +8440,13 @@ pub(super) fn profile_in(user_home: &Path, vars: HomeVars<'_>, dir: &Path) -> Pa
 
 /// WHAT A CLAUDE CODE'S EXEC ENVIRONMENT SAYS OF ITS HOME ([`Records::at`],
 /// [`claude_home_dir`]): its raw `CLAUDE_CONFIG_DIR` (`None`: unset) and its
-/// raw `HOME` (`None`: unset, or not read).
+/// raw `HOME`, `USERPROFILE` on Windows ([`super::accounts::HOMEDIR_ENV`];
+/// `None`: unset, or not read).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct HomeVars<'a> {
     /// The raw `CLAUDE_CONFIG_DIR`.
     pub(super) config: Option<&'a str>,
-    /// The raw `HOME`: Claude Code's `homedir()`.
+    /// The raw `HOME` (`USERPROFILE` on Windows): Claude Code's `homedir()`.
     pub(super) home: Option<&'a str>,
 }
 
@@ -8154,7 +8455,7 @@ impl<'a> HomeVars<'a> {
     pub(super) fn of(args: &'a atpkg::caller_shell::ProcArgs) -> Self {
         Self {
             config: args.env_var(super::accounts::HOME_ENV),
-            home: args.env_var("HOME"),
+            home: args.env_var(super::accounts::HOMEDIR_ENV),
         }
     }
 
@@ -8502,7 +8803,7 @@ impl Records {
     /// ([`LOOK_MEMOS`]), its first read starting [`FINISHED_ONCE_BYTES`]
     /// back as a restart's one read does ([`finished_where_written`]), and
     /// every later one reading on from where the last ended. A fresh
-    /// [`TAIL_BYTES`] read at every visit read a token with more than that
+    /// [`TAIL_BYTES`] read at every visit read a finish with more than that
     /// of Claude Code's wakes after it as open, and `upgrade_ask` typed its
     /// notice into the finished task.
     pub(super) fn finished(&self, session: &str, ours: &[approvals::Typed]) -> Option<bool> {
@@ -8579,8 +8880,8 @@ pub(super) const EARLIER_TABS: usize = 8;
 /// noted beside each tab's ledger read ([`note_earlier_tab`], followed tab
 /// to tab, at most [`EARLIER_TABS`] in all). A cold restore gives the
 /// reopened tab a new sid: read by the new tab's ledger alone, the old
-/// loop's `keep going` after the worker's token read as someone's prompt,
-/// and the relaunch typed its carry-on into a finished task (XREV-LC-1) —
+/// loop's act after the worker's finish read as someone's prompt, and the
+/// relaunch typed its carry-on into a finished task (XREV-LC-1) —
 /// or, where no relaunch was made (a held tab, an agent a person started
 /// there, a carried claim) and no record names the conversation, the loop
 /// that later took the resumed conversation continued its finished task
@@ -9118,8 +9419,8 @@ impl Tasked {
 /// before the transcript's end, on a line's start — only what follows the
 /// last finish can take it back — [`FINISHED_ONCE_BYTES`] back for the loop's
 /// memo ([`Self::of_snapshot`]: a new loop is a restart's read of a tab whose
-/// background tasks may have woken it for hours since its token), and every
-/// later read goes on from its offset, so a token folded once stays folded
+/// background tasks may have woken it for hours since its landing), and every
+/// later read goes on from its offset, so a finish folded once stays folded
 /// however long the wakes after it run (a fixed tail would lose it). Another
 /// conversation, or a transcript that shrank (rewritten), is read afresh the
 /// same way.
@@ -9151,7 +9452,7 @@ impl Finished {
     /// more was written since the last read than one read takes. Its first
     /// read starts [`FINISHED_ONCE_BYTES`] back, as a relaunch's one read
     /// does ([`finished_where_written`]): read from [`TAIL_BYTES`], a new loop
-    /// on a finished tab with more wakes than that after its token (a
+    /// on a finished tab with more wakes than that after its finish (a
     /// supervisor restart, a cold restore) read it open, and the next wake's
     /// end was continued.
     ///
@@ -9165,24 +9466,6 @@ impl Finished {
         ours: &[approvals::Typed],
     ) -> Option<bool> {
         self.of_snapshot_at(user_home, snap, ours, || live_cwd(snap))
-    }
-
-    /// What the done check's closed answer says by the record, as the last
-    /// read ([`Self::of_snapshot`]) left it
-    /// ([`upgrade::FinishedScan::check_answer`], the review's RR4-TE-1):
-    /// `None` where that read did not reach the transcript's end.
-    #[must_use]
-    pub fn check_answer(&self) -> Option<bool> {
-        self.at_end.then(|| self.scan.check_answer()).flatten()
-    }
-
-    /// Whether the finish the last read ([`Self::of_snapshot`]) found is a
-    /// done reply in words to the done check, not the worker's token
-    /// ([`upgrade::FinishedScan::finished_at_check`]): `false` where that
-    /// read did not reach the transcript's end, or found no finish.
-    #[must_use]
-    pub fn finished_at_check(&self) -> bool {
-        self.at_end && self.scan.finished_at_check()
     }
 
     /// The turn the conversation ends on, by its key, as the last read
@@ -9242,12 +9525,12 @@ impl Finished {
     /// itself, its first read starting `back` bytes before the transcript's
     /// end (at most [`TASK_READ_BYTES`], one read's worth) — and, where what
     /// that read holds SETTLES NOTHING ([`upgrade::FinishedScan::settled`]:
-    /// no prompt of someone's, no challenge, no answer that finishes, only
-    /// rows that leave the finish as it stood before them), read again from
-    /// twice as far back, until a read settles it or starts at the record's
-    /// head. A window of wakes alone cannot say whether the task was finished
-    /// before it: read from [`FINISHED_ONCE_BYTES`] back and no further, a
-    /// token behind more of its background tasks' wakes than that read open,
+    /// no prompt of someone's, no check or land act, no answer that lands,
+    /// only rows that leave the finish as it stood before them), read again
+    /// from twice as far back, until a read settles it or starts at the
+    /// record's head. A window of wakes alone cannot say whether the task was
+    /// finished before it: read from [`FINISHED_ONCE_BYTES`] back and no
+    /// further, a finish behind more of its background tasks' wakes than that read open,
     /// and a relaunch typed its carry-on into the finished task
     /// (ATERM-KI-1016-1). Later reads go on from where the last ended, one
     /// read's worth at a time. `ours` is read afresh at every ask, as
@@ -9555,7 +9838,7 @@ fn newest_row_at(path: &Path) -> Option<u64> {
 
 /// [`Records::finished`] read from further back ([`FINISHED_ONCE_BYTES`]),
 /// for a read made once a restart (its carry-on, its restore look): the
-/// token of a finished tab whose background tasks kept waking it for hours
+/// landing of a finished tab whose background tasks kept waking it for hours
 /// is still in the window — and read where the agent last wrote the
 /// conversation ([`finish_dir`]): what a relaunch's carry-on and its
 /// restore look end a finished task on.
@@ -9632,9 +9915,9 @@ impl<'a> WhereWritten<'a> {
     /// Whether the conversation's last words are a done report
     /// ([`upgrade::FinishedScan::said_done`]), and whether it names an
     /// irreversible act ([`upgrade::FinishedScan::said_irreversible`]), by the
-    /// one read: what a relaunch's carry-on asks the done check after (the
-    /// live lab's LIVE-RL-1), and how ([`upgrade::checking`], the review's
-    /// RR4-RL-3).
+    /// one read: what a relaunch's carry-on under Cruise types the Cruise
+    /// prompt after (the live lab's LIVE-RL-1), and how
+    /// ([`upgrade::checking`], the review's RR4-RL-3).
     pub(super) fn said_done(&self) -> Option<(bool, bool)> {
         self.scan()
             .map(|scan| (scan.said_done(), scan.said_irreversible()))
@@ -9875,8 +10158,8 @@ pub fn process_transcript_tail(
 
 /// [`process_transcript_tail`] with the file it read, and more of its end
 /// ([`super::result::TRANSCRIPT_READ_BYTES`]): what a tasked session's result
-/// is snapshotted from at the done edge — the done check's prompt and the
-/// report before it, past a check's reply that ran the suites again — the
+/// is snapshotted from at the done edge — the land act's prompt and the
+/// report before it, past a landing's replies that ran the suites again — the
 /// path kept for `result full` to read later
 /// (`supervise::IdleHost::transcript`).
 #[must_use]
@@ -9969,8 +10252,8 @@ fn snapshot_transcript_end(
     let home = aterm_types::dirs::home_dir();
     let (config_dir, home, started_in) = match &args {
         Some(args) => (
-            args.env_var("CLAUDE_CONFIG_DIR"),
-            args.env_var("HOME"),
+            args.env_var(super::accounts::HOME_ENV),
+            args.env_var(super::accounts::HOMEDIR_ENV),
             args.env_var("PWD"),
         ),
         None => (None, home.as_deref().and_then(Path::to_str), None),
@@ -11262,9 +11545,9 @@ pub fn typed(step: &str) -> bool {
 /// [`upgrade::restore_prompt`]), which asks only that what did not come back
 /// be restored and says nothing else is asked: its answer (`restored the
 /// monitor; nothing else`) is that line's, never the task's end. The
-/// carry-on that asks the done check in place of `keep going`
-/// (`continued:check`, [`upgrade::checking`]) is the check: its answer is
-/// read as the check's yield (the live lab's LIVE-RL-3). `None` where it
+/// carry-on that types the Cruise prompt in place of `keep going`
+/// (`continued:check`, [`upgrade::checking`]) is that prompt: its answer is
+/// read as the prompt's yield (the live lab's LIVE-RL-3). `None` where it
 /// typed nothing.
 #[must_use]
 pub fn host_turn(step: &str) -> Option<crate::supervise::policy::turn_end::HostTurn> {
@@ -11298,6 +11581,24 @@ pub fn moved(step: &str) -> bool {
             "adopted" | "relaunched" | "terminated" | "exited"
         )
         || matches!(step, "done:fresh" | "done:unconfirmed")
+}
+
+/// Whether one [`step`]'s word says a NEW AGENT PROCESS came up where the
+/// harness ended the old one: the relaunch line typed (`relaunched`), the
+/// relaunched process found and taken (`adopted`, the hosted lanes' word for
+/// a relaunch whose process registered), or a fresh start (`done:fresh`, and
+/// `done:unconfirmed` for one whose prompt never came up). A part of
+/// [`moved`]: a turn typed into the running agent ([`typed`]: a notice, a
+/// carry-on, a release) and a stop with no start yet (`terminated`,
+/// `exited`) brought no process up. The session log's relaunch lift reads it
+/// (`harness_host::log_act`, session log Phase 6 step 6C-1): only such a
+/// step can have replaced the agent run whose failure it lifts.
+#[must_use]
+pub fn started(step: &str) -> bool {
+    matches!(
+        step.split_once(':').map_or(step, |(head, _)| head),
+        "adopted" | "relaunched"
+    ) || matches!(step, "done:fresh" | "done:unconfirmed")
 }
 
 /// Holds the upgrade's clocks through a limit episode the window's loop saw:
@@ -12168,7 +12469,7 @@ pub(super) fn said(mut r: Report, step: impl Into<String>) -> Report {
 fn visit(
     opts: &Opts,
     sf: &SessionFile,
-    t: &[(u32, u32, String)],
+    t: &[ProcRow],
     targets: &Targets,
     k: &dyn Kernel,
 ) -> Report {
@@ -12183,7 +12484,7 @@ fn visit_with_claim(
     opts: &Opts,
     sf: &SessionFile,
     initial_files: Option<&[SessionFile]>,
-    t: &[(u32, u32, String)],
+    t: &[ProcRow],
     targets: &Targets,
     k: &dyn Kernel,
     prefetched_args: Option<&atpkg::caller_shell::ProcArgs>,
@@ -12303,7 +12604,7 @@ fn visit_models(
     opts: &Opts,
     sf: &SessionFile,
     initial_files: Option<&[SessionFile]>,
-    t: &[(u32, u32, String)],
+    t: &[ProcRow],
     targets: &Targets,
     k: &dyn Kernel,
     prefetched_args: Option<&atpkg::caller_shell::ProcArgs>,
@@ -13261,7 +13562,7 @@ fn look(
     st: &mut St,
     tab: &str,
     host_claim: Option<&HostClaim>,
-    t: &[(u32, u32, String)],
+    t: &[ProcRow],
     now: u64,
 ) -> Result<(Client, Facts, Option<String>, HandAt, String), &'static str> {
     let mut c = connect(opts, tab).map_err(|_| "no-socket")?;
@@ -13309,7 +13610,7 @@ pub(super) fn look_facts(
     st: &mut St,
     tab: &str,
     read: &TabRead<'_>,
-    t: &[(u32, u32, String)],
+    t: &[ProcRow],
     now: u64,
 ) -> (Facts, String) {
     let TabRead { scr, status, dim } = *read;
@@ -13765,7 +14066,7 @@ fn release_visit(
     sf: &SessionFile,
     mut st: St,
     tab: &str,
-    t: &[(u32, u32, String)],
+    t: &[ProcRow],
     k: &dyn Kernel,
     host_claim: Option<&HostClaim>,
 ) -> Report {
@@ -14926,7 +15227,7 @@ fn restart(
     c: &mut Client,
     tab: &str,
     sf: &SessionFile,
-    t: &[(u32, u32, String)],
+    t: &[ProcRow],
     k: &dyn Kernel,
     how: &Restarting<'_>,
 ) -> Report {
@@ -15246,3 +15547,28 @@ fn confirmations(opts: &Opts) -> Vec<Report> {
 #[cfg(all(test, unix))]
 #[path = "upgrade_drive_tests.rs"]
 mod tests;
+
+// On Windows the start time is read by syscall, not `ps`; its one behaviour is
+// checked here, where the Unix process-group tests cannot run.
+#[cfg(all(test, windows))]
+mod kernel_start_win_tests {
+    /// This process's start reads as the raw creation `FILETIME` decimal (what
+    /// Claude Code records as `procStart`) — all digits, equal to the aterm-uds
+    /// primitive, and never a `ps` rendering. A process that never existed
+    /// reads nothing, and pid 0 reads nothing (no `ps` is spawned either way).
+    #[test]
+    fn the_start_is_the_filetime_decimal_read_by_syscall() {
+        let me = std::process::id();
+        let start = super::kernel_start(me).expect("this process's start");
+        assert!(
+            start.chars().all(|c| c.is_ascii_digit()),
+            "a FILETIME decimal, not a `ps` lstart: {start:?}"
+        );
+        let ticks = aterm_uds::process::read_creation_filetime(i32::try_from(me).unwrap())
+            .expect("the raw creation time");
+        assert_eq!(start, ticks.to_string(), "the syscall's exact decimal");
+        // A pid that is almost certainly free, and pid 0, read nothing.
+        assert_eq!(super::kernel_start(0x7fff_fff0), None, "no such process");
+        assert_eq!(super::kernel_start(0), None, "never pid 0");
+    }
+}

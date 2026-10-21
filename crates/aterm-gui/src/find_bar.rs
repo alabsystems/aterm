@@ -2943,8 +2943,11 @@ mod tests {
     /// character, far wider than the face draws them.
     #[test]
     fn the_windows_bar_sets_its_words_in_the_ui_face() {
-        if !FIND_TOOLBAR || !with_ui_faces() {
+        if !FIND_TOOLBAR {
             return;
+        }
+        if !with_ui_faces() {
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let c = chrome_band::band_colors(Theme::default());
         let v = FindBarView {
@@ -3030,8 +3033,11 @@ mod tests {
     /// edge (the judge's chip spanned y25-47 under a y24 seam, square).
     #[test]
     fn the_box_and_the_toggles_are_inset_rounded_controls() {
-        if !FIND_TOOLBAR || !with_ui_faces() {
+        if !FIND_TOOLBAR {
             return;
+        }
+        if !with_ui_faces() {
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let c = chrome_band::band_colors(Theme::default());
         let rest = toggle_rest_fill(&c);
@@ -3097,8 +3103,11 @@ mod tests {
     #[test]
     fn an_on_toggle_is_drawn_in_the_accent() {
         use aterm_messages::ink::contrast;
-        if !FIND_TOOLBAR || !with_ui_faces() {
+        if !FIND_TOOLBAR {
             return;
+        }
+        if !with_ui_faces() {
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let light = Theme::from(&aterm_types::scheme::builtin("Default Light").expect("built-in"));
         for theme in [Theme::default(), light] {
@@ -3148,8 +3157,11 @@ mod tests {
     /// terminal cell, the cell well's mapping, puts the same click short.
     #[test]
     fn the_query_box_scrolls_and_hit_tests_in_its_own_face() {
-        if !FIND_TOOLBAR || !with_ui_faces() {
+        if !FIND_TOOLBAR {
             return;
+        }
+        if !with_ui_faces() {
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let px = X1.body().get();
         let caret_w = X1.caret_w();
@@ -3218,8 +3230,11 @@ mod tests {
     /// with no composition the box carries no underline.
     #[test]
     fn the_composition_is_underlined_under_its_own_characters() {
-        if !FIND_TOOLBAR || !with_ui_faces() {
+        if !FIND_TOOLBAR {
             return;
+        }
+        if !with_ui_faces() {
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let c = chrome_band::band_colors(Theme::default());
         let v = FindBarView {
@@ -3253,8 +3268,11 @@ mod tests {
     #[test]
     fn the_box_keeps_an_edge_under_a_forced_palette() {
         use aterm_messages::ink::contrast;
-        if !FIND_TOOLBAR || !with_ui_faces() {
+        if !FIND_TOOLBAR {
             return;
+        }
+        if !with_ui_faces() {
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         for (name, palette) in chrome_band::hc_fixtures::STOCK {
             chrome_band::hc_fixtures::with_forced(palette, || {

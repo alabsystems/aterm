@@ -1350,13 +1350,19 @@ mod tests {
     /// Two issues of one tab at once leave nothing standing: both are issued
     /// (the second settling the first), and once the waiting one is settled no
     /// file holds a key the engine would verify.
+    ///
+    /// Fifty rounds: with `ISSUING` taken out of `issue_upgrading_in`, 48 to
+    /// 94% of rounds left a file (alone, and beside a whole run of this
+    /// binary; the first such round was round 0 to 5), so fifty rounds miss
+    /// that race less than once in 10^14. The 400 rounds this ran before spent
+    /// 10.5 s of a loaded binary run on 800 thread spawns (2026-10-20).
     #[test]
     fn two_issues_at_once_leave_no_key_in_a_file() {
         use std::sync::{Arc, Barrier};
         let dir = scratch("rk-typed-race");
         let sid = sid(5);
         let (mut left, mut live) = (0, 0);
-        for _ in 0..400 {
+        for _ in 0..50 {
             let term = Arc::new(lost_nonce_engine());
             let together = Arc::new(Barrier::new(2));
             let issue = || {

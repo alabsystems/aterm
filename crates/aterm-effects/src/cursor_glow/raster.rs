@@ -8,9 +8,9 @@
 use super::*;
 
 /// The comet debris glint's coverage as a fraction of the grain's own (a
-/// highlight on a grain of ice is dimmer than the grain). Shared by the dealt
-/// grain that draws the glint and the undealt grain paid its light instead
-/// (the comet arm of `emit_particles`), so the two cannot drift.
+/// highlight on a grain of ice is dimmer than the grain): the dealt grain's
+/// plus at its twinkle peak, laid over its round body on either ground (the
+/// comet arm of `emit_particles`).
 pub(super) const COMET_GLINT_COV: f32 = 0.5;
 
 /// The seven names every point-mark of this family snaps to, red → violet
@@ -45,7 +45,10 @@ pub(super) const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = {
 //     per-channel headroom) the ground keeps climbing and contrast collapses.
 //
 // Each cap is derived against the 5.25:1 bar for its own stream, so caps are
-// not interchangeable across streams.
+// not interchangeable across streams. The beam family's streak on a dark
+// ground lies under the letters as its bed (`CursorGlow::emit_dark_bed`,
+// solved to the 4.5:1 bar), and the lights that still land on a letter there
+// spend one over-ink account per frame (`InkLedger`).
 
 /// The transient over-ink share (fresh-ink pop, crown, starfield, and via
 /// `crate::cursor_glow::OVER_INK_COV_CAP` the rainbow cursor's halo and
@@ -56,8 +59,9 @@ pub(super) const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = {
 pub(crate) const OVER_INK_COV_CAP: f32 = 47.0;
 
 /// The caret is the brightest thing in the effect: the least WCAG relative
-/// luminance the block cursor's fill may carry while the effect is live, on a
-/// `0..=255` scale.
+/// luminance the block cursor's fill may carry while the effect is live on a
+/// dark page, on a `0..=255` scale. A light page has no such floor: the page
+/// is the brightest thing there, so the caret keeps its saturated hue.
 ///
 /// A saturated violet is `Y = 32/255` and a white dot `255`, so neither side
 /// alone can win: the caret takes a floor and the sparkle field a ceiling
@@ -195,14 +199,17 @@ pub(super) fn luma709(rgb: u32) -> f32 {
 //   * [`light_ink_bold`], leading-only: marks that land in the inter-line
 //     leading and never composite over a glyph (the rail, the rail-riding
 //     streak, the meteor nucleus, the landing bloom, the fresh-ink bar's
-//     tint). Vivid, because nothing they darken is ink.
+//     tint), and marks drawn beneath the glyph ink (water's wake, light
+//     lightning, the beam family's light bodies and Lumen's light glow).
+//     Vivid, because nothing they darken is ink.
 //   * [`light_ink`], may-touch-text: every star, sparkle and dot
 //     ([`push_twinkle_over`] applies it internally), the erase-poof grains and
 //     the cursor cat's exit flourish. Conservative.
 //
 // Bold ink is about 1.8x the weight of conservative ink, so mixing them inside
-// one landing reads as half the event washed out. Pinned by
-// `one_light_ink_policy_per_compositing_role`.
+// one landing reads as half the event washed out. Each call site names its
+// role (`InkRole`); no test pins the split itself (the test this comment once
+// named was never written).
 //
 // The rule is for marks that can composite over a glyph. On a light ground
 // the harness card's marks never do: its trail, rim, stars, sparkles and
@@ -305,8 +312,12 @@ pub(super) fn light_ink(rgb: u32) -> u32 {
 /// over-alpha ceiling, so the two cannot disagree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InkRole {
-    /// Provably confined to the inter-line leading (the rail line): nothing it
-    /// darkens is ever a glyph, so it may be vivid and go to the rail's ceiling.
+    /// Provably confined to the inter-line leading (the rail line), or drawn
+    /// beneath the glyph ink (the under-ink stream: water's light wake, light
+    /// lightning, the beam family's light bodies and Lumen's light glow):
+    /// nothing it darkens is ever a glyph's stroke, so it may be
+    /// vivid. Its centre ceiling is the rail's; an under-ink emitter caps its
+    /// own opacity lower where its ground must keep a dark letter legible.
     Leading,
     /// Can composite over a letterform at any moment: the conservative ink and
     /// the shared legibility ceiling.
@@ -874,7 +885,7 @@ pub(super) fn fresh_ink_glyph_palette(fg: u32, bg: u32) -> Option<[u32; RAINBOW_
 // ---- the classic landing ring's grade ---------------------------------------
 //
 // The landing splash scales with distance travelled, for every non-kitty
-// style (fire flash, water ripple, light-theme veil, dark square outline)
+// style (fire flash, water ripple, light-theme veil, dark round bloom)
 // (owner, 2026-09-08):
 // `classic_ring_radius_factor` widens and `classic_ring_life` lengthens with
 // impact. An 8-cell hop (impact 1.0) is ungraded; a full-line jump (impact
@@ -932,10 +943,15 @@ pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, po
         // The live animator passes each cell's laid-hue offset (see
         // `emit_comet`); the settings preview passes its tail→head position.
         GlowStyle::Phaser => hsv2rgb((hue + pos).fract(), 0.95, 1.0),
-        // Classic keeps a half-turn sweep (the phaser lays a full turn). The
-        // live classic engine resolves its colour in `classic_wake`; this arm
-        // serves the settings preview and must agree with it.
-        GlowStyle::Classic => hsv2rgb((hue + pos * 0.5).fract(), 0.95, 1.0),
+        // Classic keeps a half-turn sweep (the phaser lays a full turn). No
+        // live path reaches this arm: `CursorGlow::tick` hands the frame to
+        // the classic engine first, and the settings preview drives that same
+        // engine. It answers with the engine's own colour rule so the two
+        // cannot drift, in the spectrum face: the mono face is chosen by the
+        // style's spelling (`GlowConfig::classic_mono`), which this
+        // signature does not carry, so a caller wanting it calls
+        // `crate::classic_wake::comet_color` with the flag.
+        GlowStyle::Classic => crate::classic_wake::comet_color(false, color, accent, hue, pos),
         GlowStyle::Sparkle => hsv2rgb((hue + pos * 0.5).fract(), 0.95, 1.0),
         // The ribbon and cursor share this same continuous seven-anchor field.
         // This arm serves the lone-cell fallback and settings preview.
@@ -977,8 +993,8 @@ pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -
         // into the tail's own hue.
         GlowStyle::Comet => lerp_rgb(color, 0x00FF_FFFF, 0.65 * fade),
         // Rainbow kitty debris snaps to a named stop, never the open wheel
-        // (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2.3.3: point-marks never
-        // sample the open gradient). The uniform random seed still
+        // (`docs/design/RAINBOW-KITTY-V2.md` §2.3 C1: point marks snap via
+        // `spectrum_snap`). The uniform random seed still
         // decorrelates grains but selects a band index, so a jump sheds only
         // the ribbon's seven anchors. The white core is a glint, not a hue.
         GlowStyle::RainbowKitty => {
@@ -1018,6 +1034,106 @@ pub(crate) fn push_halo_over(
     );
 }
 
+/// A round glow's centre and radii fitted inside the effects box, so its
+/// radial falloff fades to nothing before the box's edge instead of being cut
+/// there (a landing at the grid's left column once left a bloom sliced by a
+/// hard vertical edge): the centre moves inward by at most a cell on each
+/// axis, then both radii shrink together until the ellipse fits.
+pub(crate) fn fit_glow_in_box(
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    (rx, ry): (f32, f32),
+) -> ((f32, f32), (f32, f32)) {
+    let fit = |c: f32, r: f32, lo: f32, hi: f32, step: f32| {
+        let mut c = c;
+        if c - r < lo {
+            c = (c + step).min(lo + r).min(hi);
+        }
+        if c + r > hi {
+            c = (c - step).max(hi - r).max(lo);
+        }
+        (c, (c - lo).min(hi - c).max(0.0))
+    };
+    let (cx, room_x) = fit(
+        cx,
+        rx,
+        geom.fx_left() as f32,
+        geom.fx_right() as f32,
+        geom.cw as f32,
+    );
+    let (cy, room_y) = fit(
+        cy,
+        ry,
+        geom.fx_top() as f32,
+        geom.fx_bot() as f32,
+        geom.ch as f32,
+    );
+    let k = (room_x / rx.max(1e-3))
+        .min(room_y / ry.max(1e-3))
+        .clamp(0.0, 1.0);
+    ((cx, cy), (rx * k, ry * k))
+}
+
+/// How many nested veils a soft veil stacks ([`push_soft_veil`]).
+pub(crate) const SOFT_VEIL_LAYERS: usize = 10;
+
+/// A source-over veil that falls off radially from its centre to nothing at
+/// its rim, in `ink` with at most `cap` of opacity at the centre. One veil
+/// held under a ceiling is a flat disc out to half its radius (the renderer
+/// lays `min(falloff, cap)`), which reads on paper as a stain; this stacks
+/// [`SOFT_VEIL_LAYERS`] nested veils, each a share of the ceiling and a
+/// step smaller, so the opacity climbs toward the centre in soft steps. It
+/// is fitted inside the effects box first ([`fit_glow_in_box`]).
+pub(crate) fn push_soft_veil(
+    halos: &mut Vec<RainHalo>,
+    geom: Geom,
+    centre: (f32, f32),
+    radii: (f32, f32),
+    ink: u32,
+    cap: u8,
+) {
+    let ((cx, cy), (rx, ry)) = fit_glow_in_box(geom, centre, radii);
+    if rx < 1.0 || ry < 1.0 || cap == 0 {
+        return;
+    }
+    // Each layer's share of the centre's opacity, so the stack composites
+    // (source-over) to about `cap` there.
+    let a = f32::from(cap) / 255.0;
+    let layer = 1.0 - (1.0 - a).powf(1.0 / SOFT_VEIL_LAYERS as f32);
+    let layer_cap = ((layer * 255.0).round() as u32).clamp(1, u32::from(cap));
+    for k in 0..SOFT_VEIL_LAYERS {
+        let shrink = 1.0 - k as f32 / SOFT_VEIL_LAYERS as f32;
+        push_halo_rows(
+            halos,
+            geom,
+            (cx, cy),
+            (rx * shrink, ry * shrink),
+            (ink & 0x00FF_FFFF) | (layer_cap << 24),
+            HaloMode::Over,
+        );
+    }
+}
+
+// ---- light-theme bands over wide glyphs -----------------------------------
+//
+// The beam family's light bands (`CursorGlow::emit_comet_light`) are ink
+// under the letters, 0.8 of the row tall. Over a Latin letter that leaves
+// paper above and below the x-height; over a wide glyph (CJK, emoji) the band
+// fills the glyph's whole box, the gaps between its strokes included, so at
+// the Latin band's strength it took the newest CJK glyph on GitHub Light to
+// 6.5:1. Over wide glyphs the band carries on in the same shape and hue, its
+// soft falloff and all, at only the opacity that leaves the theme's text
+// [`LIGHT_WIDE_BED_KEEP`] of its contrast on the paper
+// ([`light_alpha_keeping`]). (Rails along the row's edges, which once stood
+// in for it, read as a hard-edged taupe frame boxing the glyphs.)
+
+/// The share of the theme's text contrast on its paper a light band keeps
+/// under a wide glyph: a wide glyph's counters lie wholly on the band, where
+/// a Latin letter's share its ground with the paper above and below it, so
+/// at 0.6 the newest CJK glyph measured 6.8:1 on GitHub Light against the
+/// Latin letter's 9; at this share the band still reads in its hue.
+pub(crate) const LIGHT_WIDE_BED_KEEP: f32 = 0.75;
+
 /// The one dash: a velocity-aligned two-vertex AA beam trailing `trail_s`
 /// seconds of a particle's live ballistic motion behind `(x, y)`, shared by
 /// the laser ablation spark, the rainbow kitty shooting-star body and the
@@ -1041,7 +1157,52 @@ pub(super) fn push_velocity_dash(
     head: u32,
     cov: u8,
 ) {
-    let verts = [
+    let verts = dash_verts(x, y, vx, vy, trail_s, tail, head, cov);
+    comet_beam(out, geom.beam_clip(), &verts, thick, 1, 0.0);
+}
+
+/// [`push_velocity_dash`] on a light ground: the same dash painted
+/// source-over ([`comet_beam_over`]) in `ink` at opacity `alpha` (its tail at
+/// a quarter of it), capped at the may-touch-text ceiling
+/// ([`LIGHT_INK_ALPHA_CAP`]). `ink` is already darkened by the caller.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dash's parameter set, with one ink in place of two tints"
+)]
+pub(super) fn push_velocity_dash_over(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    trail_s: f32,
+    thick: f32,
+    ink: u32,
+    alpha: u8,
+) {
+    let alpha = alpha.min(LIGHT_INK_ALPHA_CAP as u8);
+    let verts = dash_verts(x, y, vx, vy, trail_s, ink, ink, alpha);
+    comet_beam_over(out, geom.beam_clip(), &verts, thick, 1, 0.0);
+}
+
+/// The dash's two vertices: the tail `trail_s` seconds back along the live
+/// velocity at a quarter of `cov`, the head at `(x, y)` at full.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "position + live velocity + trail + the two tints + coverage"
+)]
+fn dash_verts(
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    trail_s: f32,
+    tail: u32,
+    head: u32,
+    cov: u8,
+) -> [BeamVertex; 2] {
+    [
         BeamVertex {
             x: x - vx * trail_s,
             y: y - vy * trail_s,
@@ -1054,8 +1215,163 @@ pub(super) fn push_velocity_dash(
             color: head,
             cov,
         },
-    ];
-    comet_beam(out, geom.beam_clip(), &verts, thick, 1, 0.0);
+    ]
+}
+
+/// A light-ground grain: one source-over mote of radius `r` at `(cx, cy)` in
+/// the may-touch-text ink ([`InkRole::OverText`] of `rgb`), its opacity
+/// `alpha` capped at that role's ceiling ([`LIGHT_INK_ALPHA_CAP`]) through
+/// the colour's high byte, so the falloff's opaque centre never reads above
+/// it. The light twin of [`push_dust_halo`] for every non-Fire particle arm
+/// (and any emitter that sheds round grains on white): source-over buys
+/// presence with area where additive light uses coverage, so callers pass
+/// the dark radius times [`crate::effect_util::STAR_ARM_INK`].
+pub(super) fn push_light_mote(
+    out: &mut Vec<RainHalo>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    r: f32,
+    rgb: u32,
+    alpha: u8,
+) {
+    let role = InkRole::OverText;
+    let cap = u32::from(alpha).min(role.alpha_cap() as u32);
+    // Under a few levels of opacity a mote changes no pixel by more than its
+    // rounding.
+    if cap < 4 {
+        return;
+    }
+    let color = (role.ink(rgb) & 0x00FF_FFFF) | (cap << 24);
+    push_halo_rows(out, geom, (cx, cy), (r, r), color, HaloMode::Over);
+}
+
+/// A bead of ink on paper at `(cx, cy)`: a round disc of radius `r` in the
+/// `rim` ink with a disc of the `core` ink inside it (three fifths of the
+/// radius), both anti-aliased at their edges and laid source-over at
+/// opacity `alpha`, one pixel row at a time. A soft halo of a bright ink at
+/// a may-touch-text opacity composites on white to a pale, greyed fleck; the
+/// deep rim gives the mark its edge on the page and the core its colour.
+/// Only for marks never laid over a letter.
+pub(super) fn push_paper_bead(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    r: f32,
+    (rim, core): (u32, u32),
+    alpha: u8,
+) {
+    if alpha < 4 || r < 0.75 {
+        return;
+    }
+    let mut disc = |rr: f32, rgb: u32| {
+        let (y0, y1) = ((cy - rr).floor() as i32, (cy + rr).ceil() as i32);
+        for y in y0..y1 {
+            // The row's chord through the disc, its ends anti-aliased by the
+            // pixel's share of the chord (and the row's share of the disc at
+            // its top and bottom).
+            let dy = y as f32 + 0.5 - cy;
+            let rest = rr * rr - dy * dy;
+            if rest <= 0.0 {
+                continue;
+            }
+            let half = rest.sqrt();
+            let rows = (rr - dy.abs() + 0.5).clamp(0.0, 1.0);
+            let (xl, xr) = (cx - half, cx + half);
+            let mut lay = |x: i32, w: i32, f: f32| {
+                let a = (f32::from(alpha) * (f * rows).clamp(0.0, 1.0)) as u8;
+                if a > 0 && w > 0 {
+                    push_fx_quad(out, geom, x, y, w, 1, premul_rgb(rgb, a), a);
+                }
+            };
+            let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
+            if pl == pr {
+                lay(pl, 1, xr - xl);
+                continue;
+            }
+            lay(pl, 1, (pl + 1) as f32 - xl);
+            if pr > pl + 1 {
+                lay(pl + 1, pr - pl - 1, 1.0);
+            }
+            lay(pr, 1, xr - pr as f32);
+        }
+    };
+    disc(r, rim);
+    disc(r * 0.6, core);
+}
+
+/// Where the crescent's shadow disc sits, as a share of the moon's radius
+/// from its centre: east and a little north, so the lit limb bulges to the
+/// lower left and the horns point up and to the right, the way a crescent
+/// moon is drawn (an upright, east-opening crescent is the letter `c`).
+pub(super) const CRESCENT_SHADOW_OFFSET: (f32, f32) = (0.42, -0.30);
+/// The crescent's shadow disc radius, as a share of the moon's.
+pub(super) const CRESCENT_SHADOW_R: f32 = 0.84;
+
+/// A crescent moon of radius `r` at `(cx, cy)`: the lit disc minus a shadow
+/// disc ([`CRESCENT_SHADOW_R`] of its radius, at [`CRESCENT_SHADOW_OFFSET`]
+/// from its centre), so a thick limb tapers into two horns. Laid one pixel
+/// row at a time: each row's lit chord minus the shadow's, so one or two
+/// spans, each with anti-aliased ends (at most six quads a row). `over`
+/// paints it source-over at opacity `cov` (a light ground; `rgb` already
+/// inked), else it is additive light of `rgb` at `cov`.
+pub(super) fn push_crescent(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    r: f32,
+    rgb: u32,
+    cov: u8,
+    over: bool,
+) {
+    if cov == 0 || r < 1.0 {
+        return;
+    }
+    let (sx, sy) = (
+        cx + CRESCENT_SHADOW_OFFSET.0 * r,
+        cy + CRESCENT_SHADOW_OFFSET.1 * r,
+    );
+    let sr = CRESCENT_SHADOW_R * r;
+    let mut span = |y: i32, xl: f32, xr: f32| {
+        if xr - xl < 0.05 {
+            return;
+        }
+        let mut lay = |x: i32, w: i32, f: f32| {
+            let a = (f32::from(cov) * f.clamp(0.0, 1.0)) as u8;
+            if a > 0 {
+                let alpha = if over { a } else { 0 };
+                push_fx_quad(out, geom, x, y, w, 1, premul_rgb(rgb, a), alpha);
+            }
+        };
+        let (pl, pr) = (xl.floor() as i32, (xr.ceil() as i32) - 1);
+        if pl == pr {
+            lay(pl, 1, xr - xl);
+            return;
+        }
+        lay(pl, 1, (pl + 1) as f32 - xl);
+        if pr > pl + 1 {
+            lay(pl + 1, pr - pl - 1, 1.0);
+        }
+        lay(pr, 1, xr - pr as f32);
+    };
+    let (y0, y1) = ((cy - r).floor() as i32, (cy + r).ceil() as i32);
+    for y in y0..y1 {
+        let yc = y as f32 + 0.5;
+        let dy = yc - cy;
+        if dy.abs() >= r {
+            continue;
+        }
+        let half = (r * r - dy * dy).sqrt();
+        let (xl, xr) = (cx - half, cx + half);
+        let ds = yc - sy;
+        if ds.abs() >= sr {
+            span(y, xl, xr);
+            continue;
+        }
+        let shalf = (sr * sr - ds * ds).sqrt();
+        let (sl, sr_x) = (sx - shalf, sx + shalf);
+        span(y, xl, xr.min(sl));
+        span(y, xl.max(sr_x), xr);
+    }
 }
 
 /// Push one radial halo of premultiplied peak light: its rect is clamped to
@@ -1137,11 +1453,10 @@ pub(crate) fn push_halo_rows(
 /// [`push_twinkle_star`] lays three coincident marks at the crossing (two arms
 /// at `cov`, the nucleus at [`crate::effect_util::STAR_CORE_ADD`]), so a plus
 /// centre carries [`crate::effect_util::STAR_STACK_ADD`] (2.35x) of `cov`. One
-/// `push_halo` at `cov` would be 2.35x darker. So, as
-/// [`crate::effect_util::push_dust_mote`] does: a skirt at `cov` plus a small
-/// hot core at [`STAR_CORE`] of the radius carrying the rest. That keeps the
-/// total light where the plus had it and keeps the soft edge. Every additive
-/// stardust site calls this.
+/// `push_halo` at `cov` would be 2.35x darker. So: a skirt at `cov` plus a
+/// small hot core at [`STAR_CORE`] of the radius carrying the rest. That keeps
+/// the total light where the plus had it and keeps the soft edge. Every
+/// additive stardust site calls this; [`push_light_mote`] is its light twin.
 pub(super) fn push_dust_halo(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1155,8 +1470,7 @@ pub(super) fn push_dust_halo(
         return;
     }
     push_halo(out, geom, cx, cy, r, r, premul_rgb(rgb, cov));
-    // Floored at 1 px so the smallest grain still has a lit centre — the same
-    // floor `push_dust_mote`'s `ceil(d/2).max(1)` core carries.
+    // Floored at 1 px so the smallest grain still has a lit centre.
     let core = (r * STAR_CORE).max(1.0);
     // Clamped at the byte; above `cov` 188 the skirt plus a 255 core already
     // saturates, as the plus does above `cov` 109.
@@ -1166,8 +1480,9 @@ pub(super) fn push_dust_halo(
 
 /// The water ripple ring (the water landing and the droplet cursor's
 /// waterline): a flattened elliptical annulus at `(cx, cy)` with outer radii
-/// `(rx, ry)` and a `thick` px rim, laid as left/right additive slabs about
-/// half `ry` tall (at least 2 px).
+/// `(rx, ry)` and a `thick` px rim, laid as left/right additive slabs one
+/// pixel row tall, so its curve steps a pixel at a time (slabs half `ry`
+/// tall stood its sides in visible stairs).
 pub(crate) fn push_ripple_ring(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -1176,7 +1491,7 @@ pub(crate) fn push_ripple_ring(
     thick: f32,
     premul: u32,
 ) {
-    let rslab = ((ry * 0.5) as i32).max(2);
+    let rslab = 1;
     let mut dy = -(ry as i32);
     while dy < ry as i32 {
         let h = rslab.min(ry as i32 - dy);
@@ -1203,6 +1518,28 @@ pub(crate) fn push_ripple_ring(
 pub(super) fn fract(x: f32) -> f32 {
     x - x.floor()
 }
+
+/// A lightning bolt's brightness at `u` (0 born → 1 dead) of its life: one
+/// flash. Born at full strength (the strike), held for the first
+/// [`BOLT_HOLD`] of its life, then a monotone ease down to
+/// `1 − BOLT_FADE`; the channel's spatial burn-out (`emit_bolts`, from
+/// [`BOLT_BURN_START`]) extinguishes it. Never rising again is the point: a
+/// pixel a bolt lights rises once and falls once, so lightning's flash count
+/// is its onset count (`CursorGlow::admit_bolt`).
+pub(super) fn bolt_flash(u: f32) -> f32 {
+    if u < BOLT_HOLD {
+        1.0
+    } else {
+        1.0 - BOLT_FADE * smoothstep01((u - BOLT_HOLD) / (1.0 - BOLT_HOLD))
+    }
+}
+
+/// How long a bolt holds its full strike, as a share of its life.
+pub(super) const BOLT_HOLD: f32 = 0.15;
+/// How far a bolt's brightness eases down across the rest of its life.
+pub(super) const BOLT_FADE: f32 = 0.60;
+/// Where in a bolt's life its channel starts retracting from its root.
+pub(super) const BOLT_BURN_START: f32 = 0.55;
 
 /// The beam power envelope: full power for the first 40% of a spark's life,
 /// then one cosine down to zero. Shared by the tube's brightness and its

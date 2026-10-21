@@ -443,7 +443,16 @@ pub(crate) enum StyleRef {
     Quiet,
     Accent,
     Success,
+    /// A warning: its words in the danger colour. As a Heading, the Title
+    /// step in bold.
     Danger,
+    /// A WARNING HEADING AT THE COMPACT HEADING STEP: the Body step in bold
+    /// (a [`Self::Plain`] heading's), in the danger colour — where a
+    /// [`Self::Danger`] heading's Title step does not fit its column, so the
+    /// warning keeps its colour as it gives up its size (Software Update's
+    /// "Can't update" on a phone-width page at large text). Elsewhere it is
+    /// [`Self::Danger`].
+    DangerCompact,
     Navigation,
     Setting,
     Code,
@@ -664,6 +673,9 @@ pub(crate) enum ButtonIcon {
     Reset,
     /// A cross: empty the field it sits in (Settings ▸ Themes' filter).
     Clear,
+    /// A magnifying glass: open the search field (Settings' compact toolbar,
+    /// where the bar is too narrow to hold a field that says "Search").
+    Search,
 }
 
 impl ButtonSpec {
@@ -789,8 +801,9 @@ pub(crate) const MESSAGES_RULE_AUDIT: &str = "settings.messages.rule";
 /// Settings ▸ Themes' row SLAB: a paint-only custom node whose value carries
 /// one theme's background, foreground and four hues
 /// ([`crate::settings_preview::theme_card::ShowcaseCard::slab_value`]). It
-/// draws a 44×20 chip of that theme — its background, "Aa" in its foreground
-/// and four dots — from panels and text alone. Decorative: the row's option
+/// draws a 56×20 chip of that theme (40×20 on a narrow chooser) — its
+/// background, "Aa" in its foreground and dots of its hues, as many as fit —
+/// from panels and text alone. Decorative: the row's option
 /// carries its name, appearance and contrast in words.
 pub(crate) const THEME_SLAB_AUDIT: &str = "settings.themes.slab";
 
@@ -828,6 +841,31 @@ pub(crate) const PAGE_SCROLL_AUDIT: &str = "settings.page.scroll";
 /// card): the label is the name, the value the face's id. A sample of the
 /// letterforms the switch beside it turns on.
 pub(crate) const DISPLAY_FACE_NAME_AUDIT: &str = "settings.text.display-face-name";
+
+/// About's WORDMARK, its label "aterm", in the hero's type — the Display
+/// step, bold — made smaller where its column cannot hold it whole
+/// ([`wordmark_typography`]), so it is never cut ("at…" at 2× text on a
+/// phone-width page, "ate…" on an 80 × 24 window). A Heading to assistive
+/// technology.
+pub(crate) const WORDMARK_AUDIT: &str = "settings.about.wordmark";
+
+/// The size and face a [`WORDMARK_AUDIT`] node paints `label` in, in a node
+/// `width` wide: the Display step in bold, scaled down to a hair under the
+/// width where it is wider than that.
+pub(crate) fn wordmark_typography(
+    label: &str,
+    width: f32,
+) -> (crate::type_scale::StepPx, crate::widget::TextFace) {
+    let face = crate::widget::TextFace::UiBold;
+    let size = native_type_px(TypeStep::Display);
+    let natural = crate::tray_raster::ui_text_width_for(face, label, size.get());
+    let fit = if natural > width && natural > 0.0 && width > 0.0 {
+        width * 0.99 / natural
+    } else {
+        1.0
+    };
+    (size.scaled(fit), face)
+}
 
 /// The [`crate::widget::TextFace`] and size a [`DISPLAY_FACE_NAME_AUDIT`]
 /// node paints its label in: the face its value names, at the title size,
@@ -930,7 +968,13 @@ pub(crate) fn snap_slider_value(value: f64, minimum: f64, maximum: f64, step: f6
 pub(crate) struct SliderGeometry {
     pub(crate) track_x: f32,
     pub(crate) track_right: f32,
+    /// The track's centre line.
+    pub(crate) track_y: f32,
+    /// Where the readout may start and where it ends (set flush right).
+    pub(crate) value_left: f32,
     pub(crate) value_right: f32,
+    /// The band the readout's line is centred in: `(top, height)`.
+    pub(crate) value_band: (f32, f32),
 }
 
 /// A slider readout's width in the mono face it paints in, never under a
@@ -947,11 +991,36 @@ pub(crate) fn slider_geometry(rect: LogicalRect) -> SliderGeometry {
     // about a dozen mono cells at the caption size the readout paints in,
     // so it grows with larger text — never more than half the control.
     let px = native_type_px(TypeStep::Caption).get();
-    let value_width = (px * 7.6).min(rect.width * 0.5).max(42.0);
+    let reserve = px * 7.6;
+    // A CONTROL TOO NARROW FOR THAT ROOM BESIDE A TRACK AS WIDE (a phone-width
+    // column at large text) SETS ITS READOUT OVER THE TRACK, where it is tall
+    // enough for both: the readout flush right on a line of its own, the
+    // track the control's whole width under it. Decided by the control's size
+    // and the text size, never by the value, so the track never changes
+    // length as the value does. Beside a 67pt track at 2×, "5000 ms" painted
+    // 95.5pt into a 57pt slot.
+    let line = (px * 1.3).ceil();
+    let stack = line + 4.0 + 6.0;
+    if reserve > rect.width * 0.5 && rect.height >= stack + 12.0 {
+        let top = rect.y + (rect.height - stack) / 2.0;
+        return SliderGeometry {
+            track_x: rect.x + 12.0,
+            track_right: (rect.right() - 12.0).max(rect.x + 12.0),
+            track_y: top + line + 4.0 + 3.0,
+            value_left: rect.x + 12.0,
+            value_right: rect.right() - 10.0,
+            value_band: (top, line),
+        };
+    }
+    let value_width = reserve.min(rect.width * 0.5).max(42.0);
+    let track_right = (rect.right() - value_width - 12.0).max(rect.x + 12.0);
     SliderGeometry {
         track_x: rect.x + 12.0,
-        track_right: (rect.right() - value_width - 12.0).max(rect.x + 12.0),
+        track_right,
+        track_y: rect.y + rect.height / 2.0,
+        value_left: track_right + 6.0,
         value_right: rect.right() - 10.0,
+        value_band: (rect.y, rect.height),
     }
 }
 
@@ -1001,7 +1070,8 @@ pub(crate) const TEXT_FIELD_END_BUTTON_GAP: f32 = 4.0;
 /// THE WORDS AN EMPTY FIELD SHOWS, FITTED TO ITS BOX: whole where they fit
 /// `room` (at `px` in `face`); else without a trailing " (default)" — the
 /// quiet tint already says the value is unset, and the semantic value keeps
-/// the words — else elided, never cut mid-glyph.
+/// the words — else a shorter form of them, else elided, never cut
+/// mid-glyph.
 fn fit_placeholder_to(
     placeholder: &str,
     room: f32,
@@ -1012,13 +1082,31 @@ fn fit_placeholder_to(
     if fits(placeholder) {
         return placeholder.to_string();
     }
+    // Its honest shorter forms, longest first: without its "(default)";
+    // without the aside in parentheses it ends in ("none (HH:MM)" reads
+    // "none"); its leading whole words with an ellipsis after them, saying
+    // more follows ("ai-fleet.toml…"); and only where not even its first word
+    // fits, elided inside it. A narrow field painted "ai-fleet.toml beside
+    // ater…", a word cut where whole ones fit.
     let plain = placeholder
         .strip_suffix(" (default)")
         .unwrap_or(placeholder);
-    if fits(plain) {
-        return plain.to_string();
+    let bare = plain
+        .strip_suffix(')')
+        .and_then(|open| open.rsplit_once(" ("))
+        .map_or(plain, |(bare, _)| bare);
+    if let Some(form) = [plain, bare]
+        .into_iter()
+        .find(|form| !form.is_empty() && fits(form))
+    {
+        return form.to_string();
     }
-    elide_text_label(plain, room, px, face)
+    let words = bare.split_whitespace().collect::<Vec<_>>();
+    (1..words.len())
+        .rev()
+        .map(|kept| format!("{}\u{2026}", words[..kept].join(" ")))
+        .find(|form| fits(form))
+        .unwrap_or_else(|| elide_text_label(bare, room, px, face))
 }
 
 /// A field's placeholder fitted to the text box its geometry gives it: the
@@ -2114,6 +2202,7 @@ impl UiContent {
         match self {
             Self::Button(control) => control.spec.description.clone(),
             Self::Switch(control) => control.spec.description.clone(),
+            Self::SettingsPreview(spec) => spec.semantic_description(),
             Self::Slider(control) => control.spec.description.clone(),
             Self::TextField(control) => control.spec.description.clone(),
             _ => None,
@@ -2190,13 +2279,17 @@ impl UiContent {
                 focusable: spec.selectable,
                 audit_id: None,
             },
+            // A looping preview is its own Pause/Play control (WCAG 2.2.2):
+            // the whole card is the target, so it stays a full-size control
+            // at every text scale, and a screen reader hears the motion state
+            // in the value and the gesture in the description.
             Self::SettingsPreview(spec) => SemanticProjection {
                 role: SemanticRole::Group,
                 label: spec.semantic_label(),
                 value: SemanticValue::Text(spec.semantic_value()),
                 state: None,
-                action: None,
-                focusable: false,
+                action: spec.pause_action(),
+                focusable: spec.pause_control(),
                 audit_id: None,
             },
             Self::Custom(spec) => SemanticProjection {
@@ -3591,6 +3684,18 @@ fn badge_reserve(spec: &ButtonSpec) -> f32 {
     if spec.badge { 16.0 } else { 0.0 }
 }
 
+/// The room an icon navigation row's arrow takes at its end, where it has
+/// one. The painter and [`text_fit_audit`] read this one number: the audit
+/// used to give the label the arrow's 34pt too, so a label the painter cut
+/// to "C…" was audited as fitting.
+fn navigation_trailing_reserve(spec: &ButtonSpec) -> f32 {
+    if spec.trailing_icon.is_some() {
+        34.0
+    } else {
+        0.0
+    }
+}
+
 /// Where a navigation destination's label starts in its row: the 6pt lead, the
 /// 28pt icon slot and a 6pt gap. It stops [`NAVIGATION_LABEL_END`] short of the
 /// row's end. The painter, the fit audit and the Settings rail's width read
@@ -3612,6 +3717,53 @@ fn button_end_reserve(spec: &ButtonSpec) -> f32 {
         } else {
             0.0
         }
+}
+
+/// THE LINES A TEXT BUTTON PAINTS ITS LABEL ON: the label's own lines, an
+/// author's `\n` between them ([`native_button_label_lines`]); one line for a
+/// label with none. Each is fitted to the button's room as a one-line label
+/// is, and they stand one under another, [`native_button_line_height`]
+/// apart, centred in the button.
+fn button_label_lines(label: &str) -> impl Iterator<Item = &str> {
+    label.split('\n')
+}
+
+/// How far apart a text button's label lines stand ([`button_label_lines`]):
+/// the label's size, and a quarter of it between lines.
+pub(crate) fn native_button_line_height() -> f32 {
+    (native_type_px(TypeStep::Secondary).get() * 1.25).ceil()
+}
+
+/// A BUTTON'S LABEL WRAPPED TO ITS ROOM, at its words: `label` on as many
+/// lines as a text button's label `room` wide needs, each as full as it holds
+/// — or `None` where a word of it is wider than the room on its own, which
+/// no line could hold whole. A button keeps its words in a narrow column at
+/// large text this way, its painted words still one phrase of its name.
+pub(crate) fn native_button_label_lines(label: &str, room: f32) -> Option<Vec<String>> {
+    let fits = |text: &str| native_button_label_width(text) <= room + TEXT_FIT_SLACK;
+    let mut lines: Vec<String> = Vec::new();
+    for word in label.split_whitespace() {
+        if !fits(word) {
+            return None;
+        }
+        match lines.last_mut() {
+            Some(line) if fits(&format!("{line} {word}")) => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    Some(lines)
+}
+
+/// The height a text button needs for `lines` lines of its label: its one
+/// line's `single` height, or the lines and the padding a one-line button
+/// keeps over and under its line, whichever is taller.
+pub(crate) fn native_button_height_for_lines(lines: usize, single: f32) -> f32 {
+    let line = native_button_line_height();
+    let padding = (single - line).max(0.0);
+    single.max(lines as f32 * line + padding)
 }
 
 /// The room for the label of a text button `width` wide (not a navigation
@@ -3708,7 +3860,10 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                             .as_ref()
                             .unwrap_or(&control.spec.label),
                         node.rect.x + NAVIGATION_LABEL_LEAD,
-                        node.rect.right() - NAVIGATION_LABEL_END - badge_reserve(&control.spec),
+                        node.rect.right()
+                            - NAVIGATION_LABEL_END
+                            - navigation_trailing_reserve(&control.spec)
+                            - badge_reserve(&control.spec),
                     )
                 } else {
                     return None;
@@ -3719,15 +3874,41 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     .visual_label
                     .as_ref()
                     .unwrap_or(&control.spec.label);
-                let text_x = if centres_its_label(control) {
-                    let width = crate::tray_raster::ui_text_width_for(face, label, size);
-                    node.rect.x + ((node.rect.width - width) / 2.0).max(0.0)
-                } else {
-                    node.rect.x + if navigation { 12.0 } else { BUTTON_LABEL_INSET }
-                };
                 let trailing_reserve =
                     text_button_trailing_reserve(&control.spec) + button_end_reserve(&control.spec);
-                (label, text_x, node.rect.right() - trailing_reserve)
+                // A label on more lines than one is audited line by line:
+                // painted is every line as the painter fits it, required the
+                // widest, the room the narrowest any line has.
+                let text_right = node.rect.right() - trailing_reserve;
+                let mut painted = Vec::new();
+                // The widest line's measure, and each room's slack over its
+                // own line: a centred short line starts late and has less
+                // room, which it does not need. The tightest slack is what
+                // the label has to spare.
+                let (mut required, mut authored_slack, mut slack) =
+                    (0.0_f32, f32::INFINITY, f32::INFINITY);
+                for line in button_label_lines(label) {
+                    let width = crate::tray_raster::ui_text_width_for(face, line, size);
+                    let text_x = if centres_its_label(control) {
+                        node.rect.x + ((node.rect.width - width) / 2.0).max(0.0)
+                    } else {
+                        node.rect.x + if navigation { 12.0 } else { BUTTON_LABEL_INSET }
+                    };
+                    let room = (text_right - text_x).max(0.0);
+                    painted.push(elide_text_label(line, room, size, face));
+                    required = required.max(width);
+                    authored_slack = authored_slack.min(room - width);
+                    slack = slack.min(effective_horizontal_width(node, text_x, text_right) - width);
+                }
+                return Some(finish_text_fit(
+                    node,
+                    "button",
+                    label,
+                    painted.join("\n"),
+                    required,
+                    (required + authored_slack).max(0.0),
+                    (required + slack).max(0.0),
+                ));
             };
             let authored_available = (text_right - text_x).max(0.0);
             let available = effective_horizontal_width(node, text_x, text_right);
@@ -3770,7 +3951,7 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
             let size = native_type_px(TypeStep::Caption).get();
             let geometry = slider_geometry(node.rect);
             let required = slider_readout_width(&control.spec.display_value, size);
-            let text_x = (geometry.value_right - required).max(geometry.track_right + 6.0);
+            let text_x = (geometry.value_right - required).max(geometry.value_left);
             let authored_available = (geometry.value_right - text_x).max(0.0);
             let available = effective_horizontal_width(node, text_x, geometry.value_right);
             Some(finish_text_fit(
@@ -3859,6 +4040,9 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
             let available = effective_horizontal_width(node, node.rect.x, node.rect.right());
             let required = if spec.audit_id == DISPLAY_FACE_NAME_AUDIT {
                 let (size, face) = display_face_name_typography(spec, node.rect.width);
+                crate::tray_raster::ui_text_width_for(face, &spec.label, size.get())
+            } else if spec.audit_id == WORDMARK_AUDIT {
+                let (size, face) = wordmark_typography(&spec.label, node.rect.width);
                 crate::tray_raster::ui_text_width_for(face, &spec.label, size.get())
             } else {
                 crate::tray_raster::ui_text_width(&spec.label, native_type_px(TypeStep::Body).get())
@@ -4270,7 +4454,9 @@ fn text_typography_for(role: SemanticRole, style: StyleRef) -> (TypeStep, crate:
         // Compact native pages use Plain for a large-type heading: Body-bold
         // remains visibly hierarchical at the platform maximum without
         // forcing route names to ellipsize in a 320-point host.
-        SemanticRole::Heading if style == StyleRef::Plain => (TypeStep::Body, TextFace::UiBold),
+        SemanticRole::Heading if matches!(style, StyleRef::Plain | StyleRef::DangerCompact) => {
+            (TypeStep::Body, TextFace::UiBold)
+        }
         SemanticRole::Heading => (TypeStep::Title, TextFace::UiBold),
         // Settings ▸ Messages' technical details (design ruling 262): small
         // monospace, secondary — a status-sized code line.
@@ -4322,6 +4508,7 @@ fn paint_compiled_node(
                         rect.width,
                         rect.height,
                         roles.surface,
+                        quiet_text(&roles),
                     );
                 }
             } else if spec.role == SemanticRole::Navigation {
@@ -4411,11 +4598,23 @@ fn paint_compiled_node(
                     readable_secondary(&roles)
                 }
                 SemanticRole::Heading if spec.style == StyleRef::Accent => roles.accent_ink,
+                // A warning heading is the warning's colour at every step: the
+                // Heading arm below used to take it, so "Can't update" and
+                // "Not applying" painted in the body's ink at every size.
+                SemanticRole::Heading
+                    if matches!(spec.style, StyleRef::Danger | StyleRef::DangerCompact) =>
+                {
+                    roles.danger
+                }
                 SemanticRole::Heading => roles.text_primary,
                 SemanticRole::Status if spec.style == StyleRef::Code => readable_secondary(&roles),
                 _ if spec.style == StyleRef::Code => roles.text_primary,
                 SemanticRole::Status if spec.style == StyleRef::Success => roles.success,
-                SemanticRole::Status if spec.style == StyleRef::Danger => roles.danger,
+                SemanticRole::Status
+                    if matches!(spec.style, StyleRef::Danger | StyleRef::DangerCompact) =>
+                {
+                    roles.danger
+                }
                 SemanticRole::Status if spec.style == StyleRef::Primary => roles.text_primary,
                 SemanticRole::Status => readable_secondary(&roles),
                 _ => style_text_color(spec.style, &roles),
@@ -4721,11 +4920,7 @@ fn paint_compiled_node(
                         .as_ref()
                         .unwrap_or(&control.spec.label);
                     // A row that goes somewhere ends in its arrow.
-                    let trailing_reserve = if control.spec.trailing_icon.is_some() {
-                        34.0
-                    } else {
-                        0.0
-                    };
+                    let trailing_reserve = navigation_trailing_reserve(&control.spec);
                     // Measured on the face it is PAINTED in: the semibold a
                     // selected row wears is a different font with different
                     // advances, so eliding against the regular metrics would
@@ -4786,20 +4981,31 @@ fn paint_compiled_node(
                     .visual_label
                     .as_ref()
                     .unwrap_or(&control.spec.label);
-                let text_x = if centres_its_label(control) {
-                    let width = crate::tray_raster::ui_text_width_for(nav_face, label, size.get());
-                    rect.x + ((rect.width - width) / 2.0).max(0.0)
-                } else {
-                    rect.x + if navigation { 12.0 } else { BUTTON_LABEL_INSET }
-                };
                 let trailing_reserve = text_button_trailing_reserve(&control.spec);
-                let painted_label = elide_text_label(
-                    label,
-                    (rect.right() - trailing_reserve - button_end_reserve(&control.spec) - text_x)
-                        .max(0.0),
-                    size.get(),
-                    nav_face,
-                );
+                // Each painted line of the label ([`button_label_lines`]):
+                // where it starts, and its words fitted to the room after it.
+                let painted_lines = button_label_lines(label)
+                    .map(|line| {
+                        let text_x = if centres_its_label(control) {
+                            let width =
+                                crate::tray_raster::ui_text_width_for(nav_face, line, size.get());
+                            rect.x + ((rect.width - width) / 2.0).max(0.0)
+                        } else {
+                            rect.x + if navigation { 12.0 } else { BUTTON_LABEL_INSET }
+                        };
+                        let painted = elide_text_label(
+                            line,
+                            (rect.right()
+                                - trailing_reserve
+                                - button_end_reserve(&control.spec)
+                                - text_x)
+                                .max(0.0),
+                            size.get(),
+                            nav_face,
+                        );
+                        (text_x, painted)
+                    })
+                    .collect::<Vec<_>>();
                 if control.spec.badge {
                     paint_badge(
                         prims,
@@ -4832,17 +5038,28 @@ fn paint_compiled_node(
                     );
                 }
                 // A colour strip takes the bottom of the row; the label is
-                // centred in what is left above it.
+                // centred in what is left above it, its lines one under
+                // another ([`native_button_line_height`]).
                 let strip = paint_button_swatches(prims, rect, &control.spec.swatches, roles);
-                prims.push(text_prim(
-                    text_x,
-                    row_baseline(rect.y, rect.height - strip, size.get()),
-                    painted_label,
-                    size,
-                    nav_weight,
-                    nav_face,
-                    rgba(color, 255),
-                ));
+                let line_height = if painted_lines.len() > 1 {
+                    native_button_line_height()
+                } else {
+                    rect.height - strip
+                };
+                let top = rect.y
+                    + ((rect.height - strip - line_height * painted_lines.len() as f32) / 2.0)
+                        .max(0.0);
+                for (index, (text_x, painted)) in painted_lines.into_iter().enumerate() {
+                    prims.push(text_prim(
+                        text_x,
+                        row_baseline(top + index as f32 * line_height, line_height, size.get()),
+                        painted,
+                        size,
+                        nav_weight,
+                        nav_face,
+                        rgba(color, 255),
+                    ));
+                }
                 if let Some(icon) = control.spec.trailing_icon {
                     let icon_rect = LogicalRect::new(
                         (rect.right() - 34.0).max(rect.x),
@@ -4993,7 +5210,7 @@ fn paint_compiled_node(
             };
             prims.push(DrawPrim::Capsule {
                 x: geometry.track_x,
-                y: rect.y + rect.height / 2.0 - 3.0,
+                y: geometry.track_y - 3.0,
                 w: (geometry.track_right - geometry.track_x).max(0.0),
                 h: 6.0,
                 frac: fraction,
@@ -5005,9 +5222,10 @@ fn paint_compiled_node(
             // turn playful.
             let size = native_type_px(TypeStep::Caption);
             let width = slider_readout_width(&control.spec.display_value, size.get());
+            let (band_top, band_height) = geometry.value_band;
             prims.push(text_prim(
-                (geometry.value_right - width).max(geometry.track_right + 6.0),
-                row_baseline(rect.y, rect.height, size.get()),
+                (geometry.value_right - width).max(geometry.value_left),
+                row_baseline(band_top, band_height, size.get()),
                 control.spec.display_value.clone(),
                 size,
                 TextWeight::Regular,
@@ -5349,6 +5567,19 @@ fn paint_compiled_node(
                 );
                 return;
             }
+            if spec.audit_id == WORDMARK_AUDIT {
+                let (size, face) = wordmark_typography(&spec.label, rect.width);
+                prims.push(text_prim(
+                    rect.x,
+                    row_baseline(rect.y, rect.height, size.get()),
+                    spec.label.clone(),
+                    size,
+                    TextWeight::Regular,
+                    face,
+                    rgba(roles.text_primary, 255),
+                ));
+                return;
+            }
             if spec.audit_id == DISPLAY_FACE_NAME_AUDIT {
                 let (size, face) = display_face_name_typography(spec, rect.width);
                 prims.push(text_prim(
@@ -5461,6 +5692,17 @@ fn visual_text_width(value: &str, px: f32, face: crate::widget::TextFace) -> f32
     }
 }
 
+/// How far a text may measure past the width it is fitted to and still be
+/// drawn whole: a hundredth of a point, far under a device pixel at any scale.
+///
+/// A width that comes back through a layout is not bit-exact: a control laid
+/// out at its label's measure plus its padding, then fitted to that width less
+/// the padding, gets `(w + pad) - pad`, which in `f32` can land a few
+/// millionths under `w`. Compared exactly, a label given its own measure was
+/// elided ("Refre…" on Harness at 220x60); this slack is what that rounding
+/// costs, never room for a visible overflow.
+pub(crate) const TEXT_FIT_SLACK: f32 = 0.01;
+
 pub(crate) fn elide_text_label(
     value: &str,
     max_width: f32,
@@ -5472,6 +5714,7 @@ pub(crate) fn elide_text_label(
     if max_width <= 0.0 {
         return String::new();
     }
+    let max_width = max_width + TEXT_FIT_SLACK;
     let mut capped_end = value.len();
     let mut elided = false;
     for (index, (offset, _)) in value.grapheme_indices().enumerate() {
@@ -5765,6 +6008,11 @@ fn paint_button_icon(
         ButtonIcon::Clear => {
             prims.push(segment(cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5));
             prims.push(segment(cx - 3.5, cy + 3.5, cx + 3.5, cy - 3.5));
+        }
+        ButtonIcon::Search => {
+            // The lens, and its handle out to the lower right.
+            prims.push(outline(cx - 6.0, cy - 6.0, 10.0, 10.0, 5.0));
+            prims.push(segment(cx + 2.6, cy + 2.6, cx + 6.5, cy + 6.5));
         }
         ButtonIcon::Reset => {
             // Most of a circle, open at the top right, and the arrowhead on
@@ -7588,7 +7836,7 @@ fn rainbow_banner_sky(roles: &crate::settings::Roles) -> ([u8; 3], [u8; 3]) {
     )
 }
 
-fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
+pub(crate) fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
     // Native apps carry more low-density prose than terminal chrome. Lift the
     // conditioned secondary role enough to stay effortless at 1× while keeping
     // a visible step below primary text.
@@ -7607,7 +7855,7 @@ fn style_text_color(style: StyleRef, roles: &crate::settings::Roles) -> [u8; 3] 
         StyleRef::Hero | StyleRef::Primary => roles.text_primary,
         StyleRef::Accent => roles.accent_ink,
         StyleRef::Success => roles.success,
-        StyleRef::Danger => roles.danger,
+        StyleRef::Danger | StyleRef::DangerCompact => roles.danger,
         StyleRef::Quiet => quiet_text(roles),
         StyleRef::Plain
         | StyleRef::Secondary
@@ -7642,6 +7890,22 @@ pub(crate) enum CompileError {
 /// cut it. An empty painted label (a card surface) or a glyph with no word
 /// in it (an arrow) carries no words to match.
 pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
+    // A label painted on lines ([`native_button_label_lines`]) is its words
+    // with spaces between; one broken inside a word ends its line in a `-` or
+    // after a `/`, which joins the word again — a hyphen the break added, or
+    // one the word has; and a code identifier broken with no mark (an
+    // aterm.toml key) is its lines joined as they are.
+    if visual.contains('\n') {
+        let joined = |hyphen: &str| {
+            visual
+                .replace("-\n", hyphen)
+                .replace("/\n", "/")
+                .replace('\n', " ")
+        };
+        return [joined(""), joined("-"), visual.replace('\n', "")]
+            .iter()
+            .any(|visual| visible_label_in_name(visual, name));
+    }
     let words = |text: &str| {
         text.split_whitespace()
             .collect::<Vec<_>>()
@@ -8117,6 +8381,66 @@ fn resolve_length(length: Length, available: f32) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// PAGE-CHROME TEXT ON THE AURORA READS. The heading, subtitle, pager and
+    /// empty line sit straight on the Settings aurora, so every tile holds the
+    /// quietest of those inks (and the heading's) at 4.5:1, on dark and light
+    /// chrome. The negative control is the wash's unheld pour, which the dark
+    /// default palette's yellow-green band fails.
+    #[test]
+    fn every_aurora_tile_holds_the_page_chrome_ink() {
+        use crate::native_appearance::{contrast_ratio, forced_chrome_theme};
+        use crate::settings::{AURORA_INK_FLOOR, aurora_tile_unheld};
+        let host = aterm_render::Theme::default();
+        let themes = [
+            ("default", host),
+            ("forced light", forced_chrome_theme(host, false)),
+            ("forced dark", forced_chrome_theme(host, true)),
+        ];
+        for (name, theme) in themes {
+            let roles = crate::settings::Roles::from_theme(theme);
+            let ink = quiet_text(&roles);
+            let mut prims = Vec::new();
+            crate::settings::paint_settings_aurora(
+                &mut prims,
+                0.0,
+                0.0,
+                1_120.0,
+                640.0,
+                roles.surface,
+                ink,
+            );
+            assert!(!prims.is_empty(), "{name}: the aurora paints");
+            let mut darkest = f32::INFINITY;
+            for prim in &prims {
+                let crate::widget::DrawPrim::Panel { fill, .. } = prim else {
+                    panic!("{name}: the aurora is tiles");
+                };
+                let tile = [fill[0], fill[1], fill[2]];
+                for (what, text) in [("quiet", ink), ("heading", roles.text_primary)] {
+                    let ratio = contrast_ratio(text, tile);
+                    darkest = darkest.min(ratio);
+                    assert!(
+                        ratio >= AURORA_INK_FLOOR,
+                        "{name}: {what} ink on tile {tile:?} is {ratio:.2}:1"
+                    );
+                }
+            }
+            assert!(darkest.is_finite());
+        }
+        let roles = crate::settings::Roles::from_theme(host);
+        let ink = quiet_text(&roles);
+        let failing = (0..64)
+            .flat_map(|j| (0..112).map(move |i| (i, j)))
+            .filter(|&(i, j)| {
+                contrast_ratio(ink, aurora_tile_unheld(roles.surface, i, j)) < AURORA_INK_FLOOR
+            })
+            .count();
+        assert!(
+            failing > 0,
+            "control: the unheld pour fails the quiet ink somewhere on the default palette"
+        );
+    }
 
     /// A CONTROL THAT CANNOT BE PRESSED IS NEVER PAINTED FOCUSED (s-25): a button
     /// that disabled itself under the keyboard (a pager's Older at its end) kept
@@ -8914,6 +9238,57 @@ pub(crate) mod tests {
             ),
             capped_expected
         );
+    }
+
+    /// A LABEL GIVEN ITS OWN WIDTH IS DRAWN WHOLE (Harness at 220x60 drew
+    /// "Refre…" and "Open aterm.to…" in buttons sized for them): a button is
+    /// laid out at its label's measure plus its padding, and its label is
+    /// fitted to that width less the padding, and in `f32` `(w + 40) - 40`
+    /// can land a few millionths under `w`. The fit compared that with `<=`
+    /// and elided a label that fits. Every label below lost its last letters
+    /// that way; the others are the control, and a label one pixel too wide is
+    /// still elided.
+    #[test]
+    fn a_label_fitted_to_its_own_measure_through_a_padded_width_is_whole() {
+        let face = crate::widget::TextFace::Ui;
+        // Every rung a larger text size gives the button face, too.
+        for px in [11.0_f32, 12.0, 13.0, 14.0, 15.0, 16.5, 18.0, 21.0] {
+            for label in ["Refresh", "Open aterm.toml", "Tab Control", "Show tab"] {
+                for pad in [24.0_f32, 28.0, 40.0, 56.0] {
+                    let width = visual_text_width(label, px, face) + pad;
+                    assert_eq!(
+                        elide_text_label(label, width - pad, px, face),
+                        label,
+                        "{label:?} at {px}px padded by {pad}"
+                    );
+                }
+            }
+        }
+        let px = native_type_px(TypeStep::Secondary).get();
+        for label in [
+            "Refresh",
+            "Open aterm.toml",
+            "AI CLIs",
+            "Tab Control",
+            "Show tab",
+            "Cancel",
+            "Reset All…",
+            "Open Developer Tools…",
+        ] {
+            for pad in [21.0_f32, 24.0, 26.0, 28.0, 40.0, 50.0, 56.0] {
+                let width = native_button_label_width(label) + pad;
+                assert_eq!(
+                    fit_native_button_label(label, width - pad),
+                    label,
+                    "{label:?} padded by {pad}"
+                );
+            }
+            let short = native_button_label_width(label) - 1.0;
+            assert!(
+                elide_text_label(label, short, px, face).ends_with('…'),
+                "{label:?} one pixel short"
+            );
+        }
     }
 
     /// An elided label ends on its last word: a cut that lands just past a
@@ -10041,6 +10416,27 @@ pub(crate) mod tests {
             fit_native_field_placeholder(placeholder, whole, true),
             placeholder
         );
+        // Its shorter forms keep whole words: the aside in parentheses goes
+        // first, then the words after the first that fit, an ellipsis saying
+        // more follows — never a word cut where whole ones fit (a narrow
+        // field painted "ai-fleet.toml beside ater…").
+        let field_for = |text: &str| {
+            visual_text_width(text, px, crate::widget::TextFace::Ui)
+                + 2.0 * TEXT_FIELD_HORIZONTAL_PADDING
+        };
+        assert_eq!(
+            fit_native_field_placeholder("none (HH:MM)", field_for("none") + 1.0, false),
+            "none"
+        );
+        let fleet = "ai-fleet.toml beside aterm.toml";
+        assert_eq!(
+            fit_native_field_placeholder(fleet, field_for("ai-fleet.toml beside\u{2026}"), false),
+            "ai-fleet.toml beside\u{2026}"
+        );
+        assert_eq!(
+            fit_native_field_placeholder(fleet, field_for("ai-fleet.toml beside a"), false),
+            "ai-fleet.toml beside\u{2026}"
+        );
     }
 
     /// The painter never cuts a placeholder mid-glyph: one nobody fitted is
@@ -10089,6 +10485,39 @@ pub(crate) mod tests {
             .expect("the field is audited");
         assert!(audit.contains("overflow=true"), "{audit}");
         assert!(audit.contains(&format!("painted={painted:?}")), "{audit}");
+    }
+
+    /// AN ICON ROW'S ARROW IS ITS AUDIT'S TOO: a navigation row with an icon
+    /// and an arrow paints its label in the room the arrow leaves, and the
+    /// fit audit measures that room. It gave the label the arrow's 34pt, so a
+    /// page result the painter cut was audited as fitting. CONTROL: the same
+    /// row without its arrow holds the label.
+    #[test]
+    fn an_icon_row_s_label_is_audited_in_the_room_its_arrow_leaves() {
+        let audit = |arrow: bool| {
+            let mut spec = ButtonSpec::new("Cursor Motion")
+                .visual_icon(ButtonIcon::Search)
+                .visual_label("Cursor Motion");
+            if arrow {
+                spec = spec.trailing_icon(ButtonIcon::Forward);
+            }
+            let control = Control::new(spec, ActionId::new("go")).style(StyleRef::Navigation);
+            let width = NAVIGATION_LABEL_LEAD
+                + NAVIGATION_LABEL_END
+                + native_button_label_width("Cursor Motion")
+                + 8.0;
+            UiTree::new(UiNode::new("go", UiContent::Button(control)))
+                .compile(LogicalRect::new(0.0, 0.0, width, 44.0))
+                .unwrap()
+                .paint_audit_lines()
+                .into_iter()
+                .find(|line| line.starts_with("paint-text key=\"go\""))
+                .expect("the row is audited")
+        };
+        let with_arrow = audit(true);
+        assert!(with_arrow.contains("overflow=true"), "{with_arrow}");
+        let without = audit(false);
+        assert!(without.contains("overflow=false"), "{without}");
     }
 
     #[test]

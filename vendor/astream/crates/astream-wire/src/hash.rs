@@ -10,9 +10,18 @@
 #[path = "hash_island.rs"]
 mod hash_island;
 #[cfg(not(clean_islands))]
-pub use crate::twins::crc_table_index_clamp;
+pub use crate::twins::{crc32_poly_select, crc_table_index_clamp, fnv1a_64_mul_prime};
 #[cfg(clean_islands)]
-pub use hash_island::crc_table_index_clamp;
+pub use hash_island::{crc32_poly_select, crc_table_index_clamp, fnv1a_64_mul_prime};
+
+/// The reflected IEEE 802.3 CRC-32 generator polynomial (`0xEDB8_8320`).
+pub const CRC32_IEEE_POLY: u32 = 0xEDB8_8320;
+
+/// The 64-bit FNV-1a offset basis (`0xcbf2_9ce4_8422_2325`).
+pub const FNV1A_64_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The 64-bit FNV-1a prime (`0x0000_0100_0000_01b3`).
+pub const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 contract_fn! {
     /// Whether a CRC-32 Slicing-by-8 table lookup index `idx` is within `[0, max_idx]`
@@ -27,19 +36,61 @@ contract_fn! {
     }
 }
 
-/// The 64-bit FNV-1a offset basis.
-pub const FNV1A_64_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+contract_fn! {
+    /// Whether an ongoing 64-bit FNV-1a hash state `h` equals `expected`
+    /// (for example [`FNV1A_64_INIT`] or [`FNV1A_64_PRIME`]).
+    ///
+    /// Verified against `Astream.Wire.TlaSlicingCrc32.fnv1a_64_state_matches_isl` by
+    /// `clean-kernel-defeq`.
+    pub const fn fnv1a_64_state_matches(h: u64, expected: u64) -> bool
+    clauses [ensures result == (h == expected)]
+    {
+        h == expected
+    }
+}
+
+/// Whether `poly` is the reflected IEEE 802.3 CRC-32 generator polynomial
+/// [`CRC32_IEEE_POLY`] (`0xEDB8_8320`).
+#[must_use]
+pub const fn crc32_is_ieee_poly(poly: u32) -> bool {
+    poly == CRC32_IEEE_POLY
+}
+
+/// Whether `h` is the published 64-bit FNV-1a offset basis [`FNV1A_64_INIT`]
+/// (`0xcbf2_9ce4_8422_2325`).
+#[must_use]
+pub const fn fnv1a_64_is_init(h: u64) -> bool {
+    fnv1a_64_state_matches(h, FNV1A_64_INIT)
+}
+
+/// Whether `p` is the published 64-bit FNV-1a prime [`FNV1A_64_PRIME`]
+/// (`0x0000_0100_0000_01b3`).
+#[must_use]
+pub const fn fnv1a_64_is_prime(p: u64) -> bool {
+    fnv1a_64_state_matches(p, FNV1A_64_PRIME)
+}
+
+/// Mix a 64-bit word `word` into an ongoing 64-bit FNV-1a hash state `h`:
+/// `(h ^ word).wrapping_mul(FNV1A_64_PRIME)` via the Clean-origin
+/// [`fnv1a_64_mul_prime`] kernel.
+#[must_use]
+pub const fn fnv1a_64_mix_u64(h: u64, word: u64) -> u64 {
+    fnv1a_64_mul_prime(h ^ word, FNV1A_64_PRIME)
+}
 
 /// Feed `bytes` into an ongoing 64-bit FNV-1a hash state `h` (started at
 /// [`FNV1A_64_INIT`]). Allows hashing multi-field length-prefixed tuples with
 /// zero heap allocation.
+///
+/// Functional refinement contract (`Astream.Wire.TlaSlicingCrc32.fnv1a_64_fold`):
+/// left fold of `fnv1a_64_mul_prime(h ^ (b as u64), FNV1A_64_PRIME)` over `bytes`,
+/// satisfying `fnv1a_64_update(fnv1a_64_update(h, a), b) == fnv1a_64_update(h, [a, b])`
+/// (`fnv1a_64_fold_append`).
 #[must_use]
 pub const fn fnv1a_64_update(mut h: u64, bytes: &[u8]) -> u64 {
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut rest = bytes;
     while let &[b, ref tail @ ..] = rest {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
+        h = fnv1a_64_mul_prime(h ^ (b as u64), FNV1A_64_PRIME);
         rest = tail;
     }
     h
@@ -61,14 +112,19 @@ const fn crc_table_at(row: &[u32; 256], idx: u8) -> u32 {
     row[idx as usize]
 }
 
-/// The reflected CRC-32/IEEE of the single byte `byte`: eight polynomial steps,
-/// the Sarwate table's entry.
+/// The reflected CRC-32/IEEE of the single byte `byte`: eight polynomial steps
+/// under `0xEDB8_8320`, the Sarwate table's entry. The explicit branch below
+/// selects the same zero-or-polynomial tap as [`crc32_poly_select`]; it does
+/// not call that helper (`Astream.Wire.TlaSlicingCrc32.crc32_row0_entry`).
 const fn crc32_entry(byte: u8) -> u32 {
     let mut crc = byte as u32;
     let mut step = 0usize;
     while step < 8 {
-        let mask = (crc & 1).wrapping_neg();
-        crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        if crc & 1 != 0 {
+            crc = (crc >> 1) ^ CRC32_IEEE_POLY;
+        } else {
+            crc >>= 1;
+        }
         step = step.saturating_add(1);
     }
     crc
@@ -305,5 +361,52 @@ mod tests {
         assert!(crc_table_index_in_bounds(0, 255));
         assert!(crc_table_index_in_bounds(255, 255));
         assert!(!crc_table_index_in_bounds(256, 255));
+        assert_eq!(crc32_poly_select(0, CRC32_IEEE_POLY), 0);
+        assert_eq!(crc32_poly_select(1, CRC32_IEEE_POLY), CRC32_IEEE_POLY);
+        assert_eq!(crc32_poly_select(2, CRC32_IEEE_POLY), 0);
+        assert_eq!(crc32_poly_select(3, CRC32_IEEE_POLY), CRC32_IEEE_POLY);
+        assert!(crc32_is_ieee_poly(CRC32_IEEE_POLY));
+        assert!(!crc32_is_ieee_poly(0));
+        assert!(fnv1a_64_is_init(FNV1A_64_INIT));
+        assert!(!fnv1a_64_is_init(0));
+        assert!(fnv1a_64_is_prime(FNV1A_64_PRIME));
+        assert!(!fnv1a_64_is_prime(0));
+        assert!(fnv1a_64_state_matches(FNV1A_64_INIT, FNV1A_64_INIT));
+        assert!(!fnv1a_64_state_matches(0, FNV1A_64_INIT));
+        assert_eq!(fnv1a_64_mul_prime(0, FNV1A_64_PRIME), 0);
+        assert_eq!(fnv1a_64_mul_prime(1, FNV1A_64_PRIME), FNV1A_64_PRIME);
+        assert_eq!(
+            fnv1a_64_mix_u64(FNV1A_64_INIT, 0x1234_5678_9abc_def0),
+            (FNV1A_64_INIT ^ 0x1234_5678_9abc_def0).wrapping_mul(FNV1A_64_PRIME)
+        );
+        // Verify row 0 matches 8 steps of Clean-origin `crc32_poly_select` for all 256 bytes,
+        // and row k matches the register after byte n followed by k zero bytes from register 0.
+        for b in 0u8..=255u8 {
+            let mut c = b as u32;
+            for _ in 0..8 {
+                c = (c >> 1) ^ crc32_poly_select(c, CRC32_IEEE_POLY);
+            }
+            assert_eq!(CRC32_TABLES[0][b as usize], c);
+            let mut zero_run = [0u8; 8];
+            zero_run[0] = b;
+            for k in 0..8usize {
+                // Register starting from 0 (which corresponds to pre-inverted crc = !0u32 = 0xFFFF_FFFF,
+                // i.e. `!crc32_ieee_update(!0u32, &zero_run[..=k])`).
+                let reg = !crc32_ieee_update(!0u32, &zero_run[..=k]);
+                assert_eq!(
+                    CRC32_TABLES[k][b as usize], reg,
+                    "table row {k} byte {b} mismatch against zero-run register"
+                );
+            }
+        }
+        // Verify split-invariance (homomorphism) of crc32_ieee_update and fnv1a_64_update.
+        let sample = b"astream-wire functional contracts for aterm-codec, aterm-png, aterm-hash";
+        let full_crc = crc32_ieee(sample);
+        let full_fnv = fnv1a_64(sample);
+        for split in 0..=sample.len() {
+            let (p, d) = sample.split_at(split);
+            assert_eq!(crc32_ieee_update(crc32_ieee(p), d), full_crc);
+            assert_eq!(fnv1a_64_update(fnv1a_64(p), d), full_fnv);
+        }
     }
 }

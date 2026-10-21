@@ -152,7 +152,9 @@ pub(crate) fn run_with_input(mut cmd: Command, args: &[&str], input: &[u8]) -> R
     })
 }
 
-/// Production runner: `git -C <repo> <args…>` with captured output.
+/// Production runner: `git -C <repo> <args…>` with captured output, stdin empty and
+/// no terminal prompt, a credential helper of its that waits for a person ended
+/// ([`crate::credential_wait`]).
 pub struct GitCli {
     repo: PathBuf,
 }
@@ -165,12 +167,25 @@ impl GitCli {
 
 impl GitRunner for GitCli {
     fn git(&self, args: &[&str]) -> Result<RunOut> {
-        let out = command("git")
+        use aterm_uds::spawnfd::Stdio;
+        // No prompt on the release's terminal or in an askpass either: once a
+        // helper that waited is ended, git fails in its own words instead.
+        let mut git = command("git");
+        let child = crate::credential_wait::ask_no_one(&mut git)
             .arg("-C")
             .arg(&self.repo)
             .args(args)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| Error::new(format!("failed to spawn git {}: {e}", args.join(" "))))?;
+        // A credential helper of its that waits for a person is ended.
+        let watch = crate::credential_wait::Watch::enter(child.id());
+        let out = child
+            .wait_with_output()
+            .map_err(|e| Error::new(format!("wait for git {}: {e}", args.join(" "))))?;
+        drop(watch);
         Ok(RunOut {
             // Signal death has no exit code; -1 keeps it a failure.
             status: out.status.code().unwrap_or(-1),
@@ -181,7 +196,9 @@ impl GitRunner for GitCli {
 
     fn git_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
         let mut cmd = command("git");
-        cmd.arg("-C").arg(&self.repo);
+        crate::credential_wait::ask_no_one(&mut cmd)
+            .arg("-C")
+            .arg(&self.repo);
         run_with_input(cmd, args, input)
     }
 }
@@ -206,11 +223,11 @@ pub fn object_git(repo: &Path) -> Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(repo)
         .stdin(aterm_uds::spawnfd::Stdio::null());
+    crate::credential_wait::ask_no_one(&mut cmd);
     cmd
 }
 

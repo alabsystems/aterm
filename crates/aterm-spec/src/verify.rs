@@ -2069,7 +2069,7 @@ pub fn dead_actions_agree(
 ///
 /// * **a violation step** — under some mutant dial, in some configuration, it
 ///   fires from a state where every law holds, and every such firing breaks
-///   one ([`interp::violation_step`]): the defect's own step, or the world's
+///   one ([`interp::violation_steps`]): the defect's own step, or the world's
 ///   answer to one, so its deadness is what the laws state;
 /// * **an isolated mutant** — in some configuration at some dial, the model
 ///   with every dead action removed holds every law (so no other branch of
@@ -2120,16 +2120,41 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
                 .map(|dial| interp::with_buggy(config, dial))
         })
         .collect();
+    // The violation steps, mutant by mutant in order, each walked once for every dead action no
+    // earlier mutant proved one: the walks asking one action at a time would make, minus the
+    // repeats ([`interp::violation_steps`]). Any verdict but `None` is a firing under that
+    // mutant, which is all the vacuity check below asks.
+    let mut stepped: BTreeSet<&'static str> = BTreeSet::new();
+    let mut fires_lawfully: BTreeSet<&'static str> = BTreeSet::new();
+    for mutant in &mutants {
+        let open: Vec<&'static str> = dead.difference(&stepped).copied().collect();
+        if open.is_empty() {
+            break;
+        }
+        for (d, verdict) in open.iter().zip(interp::violation_steps(mutant, &open)) {
+            match verdict {
+                Some(true) => stepped.insert(d),
+                Some(false) => fires_lawfully.insert(d),
+                None => false,
+            };
+        }
+    }
+    // What each mutant fires and whether its dead-free baseline holds: walked at most once
+    // per mutant, whichever dead action first asks.
+    let fired_under: Vec<std::cell::OnceCell<BTreeSet<&'static str>>> =
+        mutants.iter().map(|_| std::cell::OnceCell::new()).collect();
+    let baseline_of: Vec<std::cell::OnceCell<Result<usize, (interp::State, &'static str)>>> =
+        mutants.iter().map(|_| std::cell::OnceCell::new()).collect();
     for d in &dead {
-        if mutants
-            .iter()
-            .any(|mutant| interp::violation_step(mutant, d) == Some(true))
-        {
+        if stepped.contains(d) {
             continue;
         }
-        if !mutants
-            .iter()
-            .any(|mutant| interp::fired_actions(mutant).contains(d))
+        if !fires_lawfully.contains(d)
+            && !mutants.iter().zip(&fired_under).any(|(mutant, fired)| {
+                fired
+                    .get_or_init(|| interp::fired_actions(mutant))
+                    .contains(d)
+            })
         {
             return Err(format!(
                 "{}: action `{d}` is dead with no mutant on AND fires under no mutant dial \
@@ -2140,11 +2165,14 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
         }
         // The first counterexample a baseline gave, while none has held.
         let (mut unsafe_baseline, mut any_safe, mut fires_alone) = (None, false, false);
-        let isolated = mutants.iter().any(|mutant| {
-            let mut baseline = mutant.clone();
-            baseline.actions.retain(|a| !dead.contains(a.name));
-            if let Err(broken) = interp::bmc(&baseline) {
-                unsafe_baseline.get_or_insert(broken);
+        let isolated = mutants.iter().zip(&baseline_of).any(|(mutant, baseline)| {
+            let baseline = baseline.get_or_init(|| {
+                let mut baseline = mutant.clone();
+                baseline.actions.retain(|a| !dead.contains(a.name));
+                interp::bmc(&baseline)
+            });
+            if let Err(broken) = baseline {
+                unsafe_baseline.get_or_insert_with(|| broken.clone());
                 return false;
             }
             any_safe = true;
@@ -2152,8 +2180,10 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
             alone
                 .actions
                 .retain(|a| !dead.contains(a.name) || a.name == *d);
-            fires_alone |= interp::fired_actions(&alone).contains(d);
-            interp::bmc(&alone).is_err()
+            // Whether it fires matters only where nothing breaks, and there the walk was whole.
+            let (verdict, fired) = interp::bmc_fired(&alone);
+            fires_alone |= fired.contains(d);
+            verdict.is_err()
         });
         if isolated {
             continue;

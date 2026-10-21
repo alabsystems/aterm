@@ -39,10 +39,12 @@
 //!
 //! # `image` and `window` are disjoint
 //!
-//! * `image [path]` renders aterm's own client frame, including
-//!   compiled native-app surfaces: the current application-render artifact, a
-//!   re-render through the renderer and composition rules the application present
-//!   uses. It has no native OS chrome, works headless and never needs OS
+//! * `image [path]` captures aterm's own client frame, including
+//!   compiled native-app surfaces: the current application-render artifact. In an
+//!   opaque window it is the destination the window's own application present
+//!   submitted, cut to the frame; `image plain`, a translucent window and headless
+//!   get a re-render through the renderer and composition rules that present uses.
+//!   It has no native OS chrome, works headless and never needs OS
 //!   screen-capture permission.
 //! * `window [<target>] [path]` captures a full-window artifact with native
 //!   platform chrome: macOS photographs the composited window through
@@ -145,10 +147,13 @@ mod await_legs;
 /// `aterm ctl await task`: one wait over workers of every instance here.
 mod await_task;
 mod drift;
+/// The `amacs` client's `edit` and `await edit` exchanges with the window
+/// hosting its tab, the wait re-armed past every bound and every update.
+pub mod edit;
 mod graph_hygiene;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
-pub use redial::EXIT_REPLACED;
+pub use redial::{EXIT_REPLACED, target_sid};
 /// `aterm ctl --host <h> …`: this Mac driving another Mac's aterm over the
 /// fleet (the step-in).
 mod remote;
@@ -244,6 +249,8 @@ EXIT CODES:
          which may already be queued and carried to the successor under its
          id: re-post it only with the same `key=`, or after `outbox`.
          Never 0: a pipeline must not read an update as \"session over\".
+         A `turn` whose screen rows are cut after its verdict (on stderr)
+         exits 75 as well, whatever cut them: its text was typed.
 
 OUTPUT:
     To a pipe or a file, stdout and stderr carry the server's bytes exactly
@@ -405,7 +412,7 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   autopilot=<off|cruise|land|->
                   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
                   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>
-                  land_at=<unix-s|-> task=<open|landed|done|spent|theirs|->
+                  land_at=<unix-s|-> task=<open|landed|theirs|->
                   pause=<unix-s|-> task_state=<working|done|exited|stalled|->
                   task_rev=<n>[ *]
                   (* = the calling terminal's own session; window= is the
@@ -892,19 +899,21 @@ fn front_door_probe(path: &str) -> Option<String> {
 /// A ten-second deadline for each phase rather than the client's 900 s
 /// default: a hung forward is worse than a launch that opens its own window.
 ///
-/// A deadline or an unreadable reply once the request is written is marked
-/// [`front_door_delivered`] and worded for a person (`did not answer within
-/// 10s`): the running aterm may still act on it (its main-thread hop waits
-/// longer than this deadline), so the caller must not open a second window
-/// for it. A hang-up with no reply is not: it is a listener dropping a
-/// request it did not take.
+/// Once writing the request has begun, a failed write/flush or a missing or
+/// unreadable reply is marked [`front_door_delivered`]: the running aterm
+/// may have taken the complete request and may still act on it. An EOF or
+/// reset cannot prove otherwise. The caller must not open a second window
+/// for it. Connect-phase failure remains unmarked because no request went
+/// out; an explicit refusal read from the server remains its reply.
 pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
     front_door_send_within(path, request, FRONT_DOOR_DEADLINE, FRONT_DOOR_DEADLINE)
 }
 
 /// [`front_door_send`] with `accept` bounding the connect phase and the
-/// request's write, and `reply` the wait for the answer to the request.
-fn front_door_send_within(
+/// request's write, and `reply` the wait for the answer to the request: what
+/// any one-line exchange whose answer may take longer than the front door's
+/// ten seconds runs (the `amacs` client's [`edit`] exchanges).
+pub fn front_door_send_within(
     path: &str,
     request: &str,
     accept: std::time::Duration,
@@ -932,19 +941,32 @@ fn front_door_send_within(
         .write_all(request.as_bytes())
         .and_then(|()| (&stream).flush())
     {
-        if !is_peer_drop(&e) {
-            return Err(e);
+        if is_peer_drop(&e)
+            && let Some(line) = pending_status_line(&stream)
+        {
+            return Ok(line);
         }
-        return pending_status_line(&stream).ok_or(e);
+        // `write_all` may have written the complete line before a later
+        // write/flush failed. Its error does not prove the request stayed here.
+        return Err(delivered(
+            e.kind(),
+            format!("could not confirm the request's delivery ({e})"),
+        ));
     }
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     match read_status_line(&mut reader, &mut line) {
-        // A close with no reply is a listener dropping a request it did not
-        // take (the server answers every failure it takes with `ERR`).
-        Ok(0) => Err(io::ErrorKind::UnexpectedEof.into()),
+        // The request was written. A close before its reply is not proof
+        // that the server did not act (an update can cut an admitted reply).
+        Ok(0) => Err(delivered(
+            io::ErrorKind::UnexpectedEof,
+            "closed without answering the request".to_string(),
+        )),
         Ok(_) => Ok(line.trim_end_matches(['\r', '\n']).to_string()),
-        Err(e) if is_peer_drop(&e) => Err(e),
+        Err(e) if is_peer_drop(&e) => Err(delivered(
+            e.kind(),
+            format!("closed before its reply was read ({e})"),
+        )),
         Err(e) if is_timeout_error(&e) => Err(delivered(
             e.kind(),
             format!("did not answer within {}", deadline_words(reply)),
@@ -959,7 +981,7 @@ fn front_door_send_within(
 /// How long [`front_door_send`] waits for the running aterm, in each phase.
 const FRONT_DOOR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A [`front_door_send`] failure after the request was written.
+/// A [`front_door_send`] failure after request delivery became uncertain.
 #[derive(Debug)]
 struct Delivered(String);
 
@@ -975,8 +997,8 @@ fn delivered(kind: io::ErrorKind, words: String) -> io::Error {
     io::Error::new(kind, Delivered(words))
 }
 
-/// Whether a [`front_door_send`] error came after the request reached the
-/// running aterm, which may then still open what was asked.
+/// Whether a [`front_door_send`] error came after writing the request began,
+/// so the running aterm may have taken it and may still open what was asked.
 #[must_use]
 pub fn front_door_delivered(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Delivered>())
@@ -1057,8 +1079,10 @@ const SELF_SID_ENV: &str = "ATERM_PARENT_SESSION_ID";
 /// every session's graph entry there too, with the socket's absolute path, so
 /// an instance on an explicit `--control-sock` elsewhere is still found.
 ///
-/// `None` (fall back to the alias) outside a session, when the entry is
-/// missing, or when nothing is listening on the recorded socket.
+/// `None` outside a session or when the entry is missing. Nothing is dialled
+/// here: whether anything still listens there is for the connect that uses the
+/// socket to find ([`Targets`]), or for a caller that keeps one path, a probe
+/// ([`Targets::probed`]).
 fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
     self_instance_sock_in(&socket_dir()?, self_sid)
 }
@@ -1066,28 +1090,47 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 /// [`self_instance_sock`] in the rendezvous dir `dir` — also what a redial
 /// follows ([`redial::Follow::Flagless`]), against the dir the call resolved.
 fn self_instance_sock_in(dir: &Path, self_sid: Option<&str>) -> Option<String> {
-    let sid = self_sid?;
-    // The sid shape is server-generated (`s-<hex>`); refuse anything else so a
+    // Only a sid the wire's grammar reads as one (`s-<hex>`) is looked up, so a
     // weird env value can never path-traverse out of the graph dir.
-    let hex = sid.strip_prefix("s-")?;
-    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let body = std::fs::read_to_string(dir.join("graph").join(sid)).ok()?;
-    let sock = control_socket::graph_entry_sock(&body)?;
-    // Liveness probe, not existence: only a socket something accepts on counts.
-    if CtlStream::connect(&sock).is_ok() {
-        Some(sock)
-    } else {
-        None
-    }
+    graph_entry_sock_in(dir, aterm_types::control_request::Sid::parse(self_sid?)?)
+}
+
+/// The socket `<dir>/graph/<sid>` names ([`control_socket::graph_entry_sock`]),
+/// as written, with nothing dialled.
+fn graph_entry_sock_in(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -> Option<String> {
+    let body = std::fs::read_to_string(dir.join("graph").join(sid.as_str())).ok()?;
+    control_socket::graph_entry_sock(&body)
+}
+
+/// The socket of the instance hosting the session `sid`, from its graph entry
+/// in the rendezvous dir `dir`, when that socket lies directly in `dir`: the
+/// instance a request naming `@<sid>` is answered by, dialled here instead of
+/// being relayed there by whichever instance a flagless call reaches.
+///
+/// The entry is same-uid writable, so the socket is held to the reach the
+/// relay has (a server's `resolve_sibling` confines the entry it forwards to
+/// the same way): an absolute path, one file name below a parent that
+/// canonicalizes to `dir`'s canonical path, and no symlink there. A session
+/// whose instance listens anywhere else gets the relay's answer, `ERR no such
+/// session`, from the flagless target. Nothing is dialled: whether anything
+/// still listens there is for the connect that uses it to find ([`Targets`]).
+#[must_use]
+pub fn hosting_sock(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -> Option<String> {
+    let sock = graph_entry_sock_in(dir, sid)?;
+    let path = Path::new(&sock);
+    let canonical_dir = std::fs::canonicalize(dir).ok()?;
+    let in_dir = path.is_absolute()
+        && path.file_name().is_some()
+        && path.parent().and_then(|p| std::fs::canonicalize(p).ok()) == Some(canonical_dir)
+        && !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    in_dir.then_some(sock)
 }
 
 /// The flagless resolution as a library entry, for other clients in the
 /// binary (aterm-link's) that must find aterm the way `aterm ctl` does.
 ///
 /// The order is [`resolve_path`]'s: the instance hosting `self_sid` (its graph
-/// entry, probed for a listener, [`self_instance_sock`]), then the `latest`
+/// entry, probed for a listener, [`Targets::probed`]), then the `latest`
 /// alias `<dir>/aterm.sock`, and when that is dead the newest instance socket
 /// in the directory that accepts ([`flagless_target`]). Nothing is cached, so a
 /// caller that resolves each run follows a self-update's new socket.
@@ -1743,19 +1786,206 @@ enum TargetOrigin {
     /// socket died could be handed the human's window); like
     /// [`discovery_targets`], it points at `instances` and names no other.
     Pinned,
+    /// Nothing pinned a target and a graph entry named this socket: the
+    /// instance hosting the session the request names, or the caller's own,
+    /// dialled with no probe. Nothing listening there (`ENOENT`,
+    /// `ECONNREFUSED`) is no failure of the call but a stale entry: the connect
+    /// answers [`NoHost`], and [`Targets::run`] holds the conversation on the
+    /// next target. Any other connect error is the call's, and so is every
+    /// connect after one there was served ([`TargetOrigin::settled`]).
+    Hosting,
+}
+
+impl TargetOrigin {
+    /// The origin of a conversation's further connects once one connection on
+    /// its socket was served: a graph entry's socket is then the call's, as the
+    /// flagless rule's is, so a host that went away mid-conversation (a
+    /// self-update, a crash) fails the call instead of moving it to the next
+    /// target, which would be sent the request this instance already took.
+    fn settled(self) -> Self {
+        match self {
+            Self::Hosting => Self::Flagless,
+            origin => origin,
+        }
+    }
+}
+
+/// Where one call's connections go, in the order they are tried, each with
+/// where a successor of the server there may answer ([`redial::Follow`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Targets {
+    /// Graph-entry sockets ([`TargetOrigin::Hosting`]): the host of the
+    /// session the request names, then the caller's own. Empty when a flag
+    /// pins the socket.
+    hosting: Vec<Dial>,
+    /// The target when none of them answers.
+    last: LastTarget,
+}
+
+/// The target a call ends on ([`Targets`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LastTarget {
+    /// `--sock <path>`: that path alone, where a successor rebinds.
+    Sock(String),
+    /// `--pid <n>`: `<dir>/aterm-<n>.sock` alone; a successor is that one
+    /// process on a fresh listener ([`redial::Unfollowed::PidPin`]).
+    Pid(u32, String),
+    /// Nothing pinned: the `latest` alias in `dir`, else the newest instance
+    /// there that accepts ([`flagless_target`]), chosen only when reached.
+    Flagless {
+        dir: PathBuf,
+        /// `$ATERM_PARENT_SESSION_ID`: whose host a successor is looked for at.
+        self_sid: Option<String>,
+    },
+}
+
+/// One socket a call is held on ([`Targets::run`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Dial {
+    path: String,
+    origin: TargetOrigin,
+    /// Where a successor of the server reached at `path` may answer: the host
+    /// of the session whose entry named it, the path a flag pinned, or for the
+    /// flagless rule the caller's own session's host or the `latest` alias,
+    /// never [`flagless_target`]'s dead-alias fallback.
+    follow: redial::Follow,
+}
+
+/// What a conversation on a [`TargetOrigin::Hosting`] socket ends with when
+/// nothing listens there: no byte was sent, so [`Targets::run`] holds it on the
+/// next target. Its words are the connect's, should a caller wrap it.
+#[derive(Debug)]
+struct NoHost(String);
+
+impl std::fmt::Display for NoHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoHost {}
+
+/// Whether `e` is [`NoHost`]: the connect found nothing at a graph entry's
+/// socket.
+fn is_no_host(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<NoHost>())
+}
+
+impl Targets {
+    /// Hold a conversation on each target in turn, moving on only past a
+    /// graph-entry socket nothing listens on ([`NoHost`]: nothing was sent).
+    /// The first other outcome is the call's, so a request is answered by at
+    /// most one instance, and a graph entry's socket is dialled only by the
+    /// connect that carries the request. A conversation that connects again
+    /// once served (`cast drift`'s client-side reads) does so
+    /// [`settled`](TargetOrigin::settled), so only a connect before it was
+    /// served can find no host. The flagless fallback, with its own look at
+    /// the alias ([`flagless_target`]), is resolved only when reached.
+    fn run<T>(&self, mut converse: impl FnMut(Dial) -> io::Result<T>) -> io::Result<T> {
+        for target in &self.hosting {
+            match converse(target.clone()) {
+                Err(e) if is_no_host(&e) => {}
+                done => return done,
+            }
+        }
+        converse(self.last_target())
+    }
+
+    /// The one socket, for a caller that keeps a path and cannot move on when
+    /// its connect finds nothing ([`resolve_target`]): the first graph-entry
+    /// socket something accepts a connect on (a probe, closed at once), else
+    /// the last target.
+    fn probed(&self) -> (String, TargetOrigin) {
+        let dial = self.probed_dial();
+        (dial.path, dial.origin)
+    }
+
+    /// [`Self::probed`] with where a successor of the server there may answer
+    /// ([`Dial::follow`]), for a caller that keeps one path across its
+    /// connects (`await task`, a re-armed `await`). The probed socket is the
+    /// call's ([`TargetOrigin::settled`]).
+    fn probed_dial(&self) -> Dial {
+        match self
+            .hosting
+            .iter()
+            .find(|target| CtlStream::connect(&target.path).is_ok())
+        {
+            Some(target) => Dial {
+                origin: target.origin.settled(),
+                ..target.clone()
+            },
+            None => self.last_target(),
+        }
+    }
+
+    fn last_target(&self) -> Dial {
+        match &self.last {
+            LastTarget::Sock(sock) => Dial {
+                path: sock.clone(),
+                origin: TargetOrigin::Pinned,
+                follow: redial::Follow::Path(sock.clone()),
+            },
+            LastTarget::Pid(pid, sock) => Dial {
+                path: sock.clone(),
+                origin: TargetOrigin::Pinned,
+                follow: redial::Follow::Nothing(redial::Unfollowed::PidPin(*pid)),
+            },
+            LastTarget::Flagless { dir, self_sid } => {
+                let latest = dir.join(SOCK_FILE).to_string_lossy().into_owned();
+                Dial {
+                    path: flagless_target(dir, latest),
+                    origin: TargetOrigin::Flagless,
+                    follow: redial::Follow::Flagless {
+                        dir: dir.clone(),
+                        sid: self_sid.clone(),
+                    },
+                }
+            }
+        }
+    }
 }
 
 /// Resolve the socket path from the flags, and how it was chosen
-/// ([`TargetOrigin`]). `--sock` names the socket; `--pid` targets
-/// `<dir>/aterm-<pid>.sock`. With no flag, a caller inside an aterm session
-/// (`self_sid` = `$ATERM_PARENT_SESSION_ID`) resolves to the instance hosting
-/// its own terminal via the discovery graph. No environment variable selects a
-/// socket.
+/// ([`TargetOrigin`]), for a caller that keeps one path ([`Targets::probed`]).
+/// `--sock` names the socket; `--pid` targets `<dir>/aterm-<pid>.sock`. With no
+/// flag, a caller inside an aterm session (`self_sid` =
+/// `$ATERM_PARENT_SESSION_ID`) resolves to the instance hosting its own
+/// terminal via the discovery graph. No environment variable selects a socket.
 fn resolve_target(
     sock: Option<String>,
     pid: Option<u32>,
     self_sid: Option<String>,
 ) -> io::Result<(String, TargetOrigin)> {
+    Ok(targets(sock, pid, self_sid, None)?.probed())
+}
+
+/// The [`Targets`] of a call from its flags, the caller's session (`self_sid`)
+/// and the session its request names (`named`, [`redial::target_sid`]), in the
+/// default rendezvous dir ([`socket_dir`]).
+fn targets(
+    sock: Option<String>,
+    pid: Option<u32>,
+    self_sid: Option<String>,
+    named: Option<aterm_types::control_request::Sid<'_>>,
+) -> io::Result<Targets> {
+    targets_in(socket_dir(), sock, pid, self_sid, named)
+}
+
+/// [`targets`] against the rendezvous dir `dir` (`None`: no `$HOME` or
+/// `$XDG_RUNTIME_DIR`, so only `--sock` can name a socket).
+///
+/// A flag pins one socket. With none, the named session's host
+/// ([`hosting_sock`]: only a socket in `dir`, the relay's reach), then the
+/// caller's own ([`self_instance_sock_in`]: wherever its entry names, so an
+/// instance on an explicit `--control-sock` answers its own sessions), each
+/// as its graph entry names it, then the flagless rule.
+fn targets_in(
+    dir: Option<PathBuf>,
+    sock: Option<String>,
+    pid: Option<u32>,
+    self_sid: Option<String>,
+    named: Option<aterm_types::control_request::Sid<'_>>,
+) -> io::Result<Targets> {
     let no_dir = || {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -1768,56 +1998,47 @@ fn resolve_target(
             "--sock and --pid are mutually exclusive",
         ));
     }
+    let pinned = |last| Targets {
+        hosting: Vec::new(),
+        last,
+    };
     if let Some(pid) = pid {
-        let dir = socket_dir().ok_or_else(no_dir)?;
+        let dir = dir.ok_or_else(no_dir)?;
         let path = dir
             .join(control_socket::instance_sock_name(pid))
             .to_string_lossy()
             .into_owned();
-        return Ok((path, TargetOrigin::Pinned));
+        return Ok(pinned(LastTarget::Pid(pid, path)));
     }
     if let Some(s) = sock {
-        return Ok((s, TargetOrigin::Pinned));
+        return Ok(pinned(LastTarget::Sock(s)));
     }
-    // Flagless: the instance hosting this terminal, else the `latest` alias,
-    // else (alias dead) the newest listening instance.
-    match self_instance_sock(self_sid.as_deref()) {
-        Some(own) => Ok((own, TargetOrigin::Flagless)),
-        None => {
-            let dir = socket_dir().ok_or_else(no_dir)?;
-            let latest = dir.join(SOCK_FILE).to_string_lossy().into_owned();
-            Ok((flagless_target(&dir, latest), TargetOrigin::Flagless))
-        }
+    let dir = dir.ok_or_else(no_dir)?;
+    // Each followed to where that session's host republishes its entry.
+    let hosted = |path: String, sid: &str| Dial {
+        path,
+        origin: TargetOrigin::Hosting,
+        follow: redial::Follow::Flagless {
+            dir: dir.clone(),
+            sid: Some(sid.to_string()),
+        },
+    };
+    let mut hosting = Vec::new();
+    if let Some(sid) = named
+        && let Some(host) = hosting_sock(&dir, sid)
+    {
+        hosting.push(hosted(host, sid.as_str()));
     }
-}
-
-/// Where a successor of the server this call reaches may answer ([`redial`]),
-/// from [`resolve_target`]'s inputs: a `--pid` pin follows only its own process
-/// back onto a fresh listener, `--sock` follows its path, and the flagless rule
-/// follows the calling session's graph entry and the `latest` alias, never
-/// [`flagless_target`]'s dead-alias fallback.
-fn redial_follow(sock: Option<&str>, pid: Option<u32>, self_sid: Option<String>) -> redial::Follow {
-    redial_follow_in(socket_dir(), sock, pid, self_sid)
-}
-
-/// [`redial_follow`] against the rendezvous dir `dir` (`None`: no `$HOME` or
-/// `$XDG_RUNTIME_DIR`, so a flagless call has nothing to follow).
-fn redial_follow_in(
-    dir: Option<PathBuf>,
-    sock: Option<&str>,
-    pid: Option<u32>,
-    self_sid: Option<String>,
-) -> redial::Follow {
-    if let Some(pid) = pid {
-        return redial::Follow::Nothing(redial::Unfollowed::PidPin(pid));
+    if let Some(sid) = self_sid.as_deref()
+        && let Some(own) = self_instance_sock_in(&dir, Some(sid))
+        && !hosting.iter().any(|target| target.path == own)
+    {
+        hosting.push(hosted(own, sid));
     }
-    if let Some(sock) = sock {
-        return redial::Follow::Path(sock.to_string());
-    }
-    match dir {
-        Some(dir) => redial::Follow::Flagless { dir, self_sid },
-        None => redial::Follow::Nothing(redial::Unfollowed::NoRendezvousDir),
-    }
+    Ok(Targets {
+        hosting,
+        last: LastTarget::Flagless { dir, self_sid },
+    })
 }
 
 /// The dead-`latest` fallback: the flagless target when nothing pins one.
@@ -4629,15 +4850,18 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return Ok(code);
     }
 
-    // Where a successor may answer if an aterm self-update replaces the server
-    // mid-exchange: the same resolution inputs, minus the dead-alias fallback.
-    let redial = redial::Redial::new(redial_follow(
-        sock.as_deref(),
+    // Where the request goes: a pinned socket, else the instance hosting the
+    // session it names, then the caller's own, then the flagless rule, each
+    // with where a successor may answer if an aterm self-update replaces the
+    // server mid-exchange. Every request line below carries the same selector.
+    let pinned = sock.is_some() || pid.is_some();
+    let joined = request_parts.join(" ");
+    let targets = targets(
+        sock,
         pid,
         env::var(SELF_SID_ENV).ok(),
-    ));
-    let pinned = sock.is_some() || pid.is_some();
-    let (path, origin) = resolve_target(sock, pid, env::var(SELF_SID_ENV).ok())?;
+        redial::target_sid(&joined),
+    )?;
 
     // `await task` waits on workers wherever on this machine they run: the
     // client groups the targets by the instance hosting each, asks every one at
@@ -4645,25 +4869,30 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     // follows a self-update ([`await_task`]).
     if await_task::is_await_task(&request_parts) {
         validate_request_parts(&request_parts)?;
+        let dial = targets.probed_dial();
         return await_task::run_await_task(
             &request_parts,
             pinned,
-            &path,
-            &redial,
+            &dial.path,
+            &redial::Redial::new(dial.follow),
             timeout_explicit.then_some(deadline),
         );
     }
-    // `await inbox` and `await agent` are re-armed past the server's bound
-    // up to their own deadline (the verb's `timeout=`, else `--timeout`, else
-    // an hour), with the same `since=`: a listener's or a driver's background
-    // wait ends at news, never at the server's 30 s default ([`await_legs`]).
+    // `await inbox`, `await agent` and `await edit` are re-armed past the
+    // server's bound up to their own deadline (the verb's `timeout=`, else
+    // `--timeout`, else an hour), with the same `since=` (or ticket): a
+    // listener's or a driver's background wait ends at news, never at the
+    // server's 30 s default ([`await_legs`]).
     if await_legs::is_rearmed_await(&request_parts) {
         validate_request_parts(&request_parts)?;
+        // Each re-arm connects again: one socket for the whole wait, as a
+        // caller that keeps a path has ([`Targets::probed_dial`]).
+        let dial = targets.probed_dial();
         return await_legs::run_rearmed_await(
             &request_parts,
-            &path,
-            origin,
-            &redial,
+            &dial.path,
+            dial.origin,
+            &redial::Redial::new(dial.follow),
             timeout_explicit.then_some(deadline),
         );
     }
@@ -4682,13 +4911,8 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             return Err(feed_bin_inline_error());
         }
         let payload = read_stdin_payload()?;
-        return feed_bin_exchange(
-            &path,
-            origin,
-            &binary_frame_prefix(selector, "feed-bin"),
-            &payload,
-            deadline,
-        );
+        let prefix = binary_frame_prefix(selector, "feed-bin");
+        return targets.run(|t| feed_bin_exchange(&t.path, t.origin, &prefix, &payload, deadline));
     }
     if matches!(verb_tok, Some("send") | Some("paste"))
         && verb_args.len() == 1
@@ -4703,13 +4927,8 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         } else {
             "feed-bin"
         };
-        return feed_bin_exchange(
-            &path,
-            origin,
-            &binary_frame_prefix(selector, frame_verb),
-            &payload,
-            deadline,
-        );
+        let prefix = binary_frame_prefix(selector, frame_verb);
+        return targets.run(|t| feed_bin_exchange(&t.path, t.origin, &prefix, &payload, deadline));
     }
     // A WORKER: `spawn … agent=<a> … -` reads its task from stdin into the
     // spawn's own length-prefixed frame (`spawn … len=<n>`, then the n bytes),
@@ -4727,13 +4946,8 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             env::current_dir().ok().as_deref(),
         )?;
         let payload = read_task_payload()?;
-        return worker_exchange(
-            &path,
-            origin,
-            &format!("{head} len={}", payload.len()),
-            &payload,
-            deadline,
-        );
+        let head = format!("{head} len={}", payload.len());
+        return targets.run(|t| worker_exchange(&t.path, t.origin, &head, &payload, deadline));
     }
 
     // Reject line terminators before framing: the socket is newline-delimited,
@@ -4746,7 +4960,8 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     {
         let (selector, rest) = split_selector(&request_parts);
         if drift::is_cast_drift(rest) {
-            return drift::live(&path, origin, selector, &rest[2..], deadline, &local);
+            return targets
+                .run(|t| drift::live(&t.path, t.origin, selector, &rest[2..], deadline, &local));
         }
     }
     // `help <verb>` (and `<verb> --help`) asks the server, whose table is what it
@@ -4755,7 +4970,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         && help == "help"
         && aterm_types::control_verbs::spec(name).is_some()
     {
-        return help_with_fallback(&path, origin, name, deadline, &local);
+        return targets.run(|t| help_with_fallback(&t.path, t.origin, name, deadline, &local));
     }
 
     // The wire quotes nothing but a spawn's folder (see `split_pattern_note`):
@@ -4776,15 +4991,17 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     )?;
     request.push('\n');
 
-    let outcome = exchange(
-        &path,
-        origin,
-        &request,
-        &verb,
-        deadline,
-        timeout_explicit,
-        &redial,
-    );
+    let outcome = targets.run(|t| {
+        exchange(
+            &t.path,
+            t.origin,
+            &request,
+            &verb,
+            deadline,
+            timeout_explicit,
+            &redial::Redial::new(t.follow),
+        )
+    });
     // After the reply, so the caveat lands under the result it explains, and
     // silenced by the same ATERM_MUX_NOTICE=0 as the boundary notice. A failed
     // write is ignored.
@@ -5410,8 +5627,9 @@ fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
 /// The follow-up line count from a streaming verb's `OK <count>` header `tail`
 /// (everything after the first space). Only the FIRST whitespace token is the
 /// count: the server may append a free-form marker after it — `cmd_search`
-/// writes `OK <n> incomplete[ capped][ rewrapping][ long-line][ older]` when the
-/// list is not exhaustive (control_query.rs) —
+/// writes `OK <n>[ incomplete[ capped][ rewrapping][ long-line][ moving][ older]]
+/// screen_first=<row>`, the marker when the list is not exhaustive
+/// (control_query.rs) —
 /// and parsing the whole tail would reject that header and drop every match.
 /// Framing: first token = count, then n lines.
 ///
@@ -5449,10 +5667,10 @@ pub fn search_incomplete_note(tail: &str) -> Option<String> {
         let said = match cause {
             "capped" => LIMIT,
             "rewrapping" => "screen only: the history is rewrapping",
+            "long-line" => "a long line was not searched to its end",
+            "moving" => "the screen's rows moved during the search; search again",
+            // What an aterm whose search compared its whole snapshot names.
             "changed" => "the terminal changed while the search ran",
-            "long-line" => {
-                "a long line was not searched to its end: the regex ran out of scan budget there"
-            }
             "older" => DEPTH,
             word if word.starts_with("screen_first=") => continue,
             _ => "the server reported an unrecognized search completeness cause",
@@ -5532,12 +5750,23 @@ const EXCHANGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90
 /// its flag, a pinned one only how many, never a different instance to drive.
 /// Every other kind keeps the raw cause (a permission error is not "not
 /// running"). The fleet look-up happens only for those two kinds;
-/// [`connect_error_naming`] is the pure rendering.
+/// [`connect_error_naming`] is the pure rendering. On a graph entry's socket
+/// ([`TargetOrigin::Hosting`]) those two kinds are a stale entry, not the
+/// call's failure: [`NoHost`], with no remedy and no fleet look-up, which
+/// [`Targets::run`] answers by trying the next target.
 fn connect_error(path: &str, e: &io::Error, origin: TargetOrigin) -> io::Error {
-    let (dir, live) = if matches!(
+    let dead = matches!(
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-    ) {
+    );
+    if dead && origin == TargetOrigin::Hosting {
+        let mut msg = String::from("connect ");
+        msg.push_str(path);
+        msg.push_str(": ");
+        msg.push_str(&e.to_string());
+        return io::Error::new(e.kind(), NoHost(msg));
+    }
+    let (dir, live) = if dead {
         (socket_dir(), live_instances_besides(&[path]))
     } else {
         (None, Vec::new())
@@ -5595,7 +5824,8 @@ fn live_instances_besides(failed: &[&str]) -> Vec<(u32, String)> {
 ///   and that `aterm ctl instances` lists them, naming none and handing out no
 ///   flag, since the caller chose this socket.
 /// * `Flagless` ([`running_elsewhere_flags`]): each live instance as the flag
-///   that reaches it.
+///   that reaches it. Nothing pinned a `Hosting` socket either, though a dead
+///   one never gets a remedy ([`connect_error`] answers it with [`NoHost`]).
 fn running_elsewhere_hint(
     origin: TargetOrigin,
     dir: Option<&Path>,
@@ -5607,7 +5837,7 @@ fn running_elsewhere_hint(
             hint.push_str(&running_elsewhere_count(live.len()));
             hint
         }
-        TargetOrigin::Flagless => running_elsewhere_flags(dir, live),
+        TargetOrigin::Flagless | TargetOrigin::Hosting => running_elsewhere_flags(dir, live),
     }
 }
 
@@ -5697,7 +5927,7 @@ const LAUNCH_REMEDY: &str = "start aterm (`aterm`)";
 /// where the new pid is listed instead.
 fn not_running_hint(origin: TargetOrigin) -> String {
     match origin {
-        TargetOrigin::Flagless => format!(
+        TargetOrigin::Flagless | TargetOrigin::Hosting => format!(
             " — aterm isn't running (nothing is serving this control socket); \
              {LAUNCH_REMEDY} and retry"
         ),
@@ -5851,7 +6081,9 @@ fn collect_reply_lines(
     let mut lines = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
         let mut line = String::new();
-        if read_line(&mut line)? == 0 {
+        // A row without its newline is the server hanging up inside it: as early an
+        // end as a missing row, never a complete reply.
+        if read_line(&mut line)? == 0 || !line.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "server hung up before the complete line-framed response",
@@ -6366,7 +6598,8 @@ fn print_payload<R: BufRead>(reader: &mut R, count: usize) -> io::Result<()> {
     let mut bytes_left = MAX_BODY_BYTES;
     for _ in 0..count {
         let mut line = String::new();
-        if read_bounded_line(reader, &mut line)? == 0 {
+        // A row cut before its newline is an early end (see `collect_reply_lines`).
+        if read_bounded_line(reader, &mut line)? == 0 || !line.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "server hung up before the complete line-framed response",
@@ -6404,7 +6637,8 @@ fn read_guarded_payload<R: BufRead>(
     let mut lines = Vec::with_capacity(count);
     for _ in 0..count {
         let mut line = String::new();
-        if read_bounded_line(reader, &mut line)? == 0 {
+        // A row cut before its newline is an early end (see `collect_reply_lines`).
+        if read_bounded_line(reader, &mut line)? == 0 || !line.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "server hung up before the complete guarded artifact response",
@@ -6600,7 +6834,7 @@ fn exchange_on(
             // The host's successor, where it republishes the session — never
             // the relay, which only forwarded the request.
             Some((pid, sock)) => {
-                let host = redial.host(&sock, redial::target_sid(&request_parts));
+                let host = redial.host(&sock, redial::target_sid(request).map(|sid| sid.as_str()));
                 answer_replacement(
                     host.after_host_gone(&sock, pid, until),
                     Some(pid),
@@ -6769,7 +7003,8 @@ fn exchange_on(
         }
         // `turn` carries its verdict after the count (`turn submitted=… status=…
         // seq=…`): stdout stays screen rows, the verdict goes to stderr.
-        if tail.split_whitespace().nth(1) == Some("turn") {
+        let turn_verdict = tail.split_whitespace().nth(1) == Some("turn");
+        if turn_verdict {
             let verdict: Vec<&str> = tail.split_whitespace().skip(1).collect();
             stderr_line(&verdict.join(" "))?;
         }
@@ -6821,7 +7056,18 @@ fn exchange_on(
             msg.push_str(": no results)");
             stderr_line(&msg)?;
         }
-        print_payload(&mut reader, count)?;
+        match print_payload(&mut reader, count) {
+            // A `turn` whose verdict arrived was typed, and maybe submitted
+            // (`submitted=0 pressed=1` is an Enter that was written), so rows
+            // cut after it are never the refusal code a caller retries (1), nor
+            // a timeout (124): 75, with what to do instead, as for a `turn`
+            // cut before its reply (`redial::not_asked_again_note`).
+            Err(e) if turn_verdict && !is_stdout_closed(&e) => {
+                stderr_line(&turn_rows_cut_line(&e, &request_parts))?;
+                return Ok(ExitCode::from(redial::EXIT_REPLACED));
+            }
+            rows => rows?,
+        }
     } else {
         print_stdout_line(status_line)?;
     }
@@ -6916,6 +7162,18 @@ fn answer_replacement(
             }
         }
     }
+}
+
+/// The whole line for a `turn` whose screen rows failed after its verdict
+/// (`error`: the server hung up inside them, a stall past the deadline, a row
+/// past its bound): the verdict above stands, what to do instead
+/// ([`redial::not_asked_again_note`]), and the exit code.
+fn turn_rows_cut_line(error: &io::Error, request_parts: &[String]) -> String {
+    format!(
+        "the turn's screen rows were cut after its verdict ({error}); {} (exit {})",
+        redial::not_asked_again_note(request_parts),
+        redial::EXIT_REPLACED
+    )
 }
 
 /// The whole line for a request cut by a replacement and not asked of its

@@ -25,11 +25,13 @@
 //! A short star flare fires on upward crossings of [`MOMENTUM_FLARE_STEPS`]
 //! instead, as a pure clock function completing in [`TWINKLE_DUR`].
 //!
-//! Text safety: the fill goes through the renderer's `floor_cursor_fill`
-//! contrast floor, and the halo is additive [`GlowQuad`] light that never
-//! touches the glyph. The engine is a pure function of an injected `now`,
-//! settles to a stable fingerprint when idle, and emits the same premultiplied
-//! quads on the CPU and Metal backends.
+//! Text safety: the host floors the fill against the page
+//! (`crate::cursor_fx::floor_block_fill`) unless it wears a pinned cursor
+//! colour, and the renderer's `floor_cursor_fill` adds the user's
+//! `minimum_contrast` on top (off by default). The halo is additive
+//! [`GlowQuad`] light that never touches the glyph. The engine is a pure
+//! function of an injected `now`, settles to a stable fingerprint when idle,
+//! and emits the same premultiplied quads on the CPU and Metal backends.
 
 use std::time::Duration;
 
@@ -178,13 +180,15 @@ const TWINKLE_DOT_COV: f32 = 38.0;
 /// Scintillation cycles across one flare: a deterministic sine wobble over the
 /// pop envelope, phase-shifted per flare so consecutive twinkles differ.
 ///
-/// Photosensitivity bound: the flash rate is `TWINKLE_SCINT / TWINKLE_DUR` Hz;
-/// keep it `<= 3.2` (WCAG 2.3.1's general-flash threshold is 3 Hz), pinned at
-/// build time below so retuning either constant cannot reintroduce a strobe.
-const TWINKLE_SCINT: f32 = 0.5;
+/// Photosensitivity bound: the flash rate is `TWINKLE_SCINT / TWINKLE_DUR` Hz
+/// (2.81 Hz), kept at or under the crate's
+/// [`crate::effect_util::TWINKLE_FLASH_BOUND_HZ`] (WCAG 2.3.1: more than three
+/// flashes a second fails), pinned at build time below so retuning either
+/// constant cannot reintroduce a strobe.
+const TWINKLE_SCINT: f32 = 0.45;
 const _: () = assert!(
-    TWINKLE_SCINT / TWINKLE_DUR <= 3.2,
-    "twinkle scintillation over the 3 Hz general-flash bound"
+    TWINKLE_SCINT / TWINKLE_DUR <= crate::effect_util::TWINKLE_FLASH_BOUND_HZ,
+    "twinkle scintillation over the WCAG 2.3.1 general-flash bound"
 );
 const _: () = assert!(TWINKLE_SCINT > 0.0, "the flare must still scintillate");
 
@@ -314,8 +318,8 @@ pub struct RainbowConfig {
     pub flare_at: Option<Instant>,
 }
 
-/// What a tick produced: the block fill colour to hand the renderer (it floors it for
-/// contrast) and a fingerprint that changes on every visible step (0 when dormant).
+/// What a tick produced: the block fill colour to hand the renderer and a
+/// fingerprint that changes on every visible step (0 when dormant).
 #[derive(Clone, Copy, Debug)]
 pub struct RainbowFrame {
     /// The evolving block-fill colour `0x00RRGGBB`, or `None` when the rainbow cursor
@@ -762,9 +766,10 @@ impl CursorRainbow {
         let rainbow = shade(head_rgb, sat, val);
 
         // Block fill: tint from the base toward the rainbow with the paint. The
-        // renderer floors it against the cell background so the cut-out glyph
-        // stays sharp. The base is the cursor's own colour when the host
-        // resolved one; the theme-polar constants otherwise.
+        // host floors it against the page so the cut-out glyph stays sharp
+        // (unless the base is a pinned cursor colour). The base is the cursor's
+        // own colour when the host resolved one; the theme-polar constants
+        // otherwise.
         let base = cfg.base.unwrap_or(if dark_theme {
             BASE_DARK_THEME
         } else {
@@ -779,6 +784,12 @@ impl CursorRainbow {
         // a hue neither end has (a green cursor toward blue passes turquoise);
         // `caret_fill` below corrects the emitted byte.
         let mut fill = mix_rgb(base, rainbow, lerp(mix_idle, mix_max, paint));
+        // A pinned cursor colour is the settled block itself, with no whisper
+        // of the arc: the spectrum comes in only with the paint
+        // ([`crate::color_math::wear_pinned`]).
+        if let Some(pinned) = cfg.base {
+            fill = crate::color_math::wear_pinned(pinned, fill, paint, SETTLED_ENERGY);
+        }
         // The twinkle glint: toward star-white on a dark theme, toward the vivid
         // hue on a light one, where white would sink into the page.
         if pop > 0.0 {
@@ -1329,7 +1340,7 @@ const CARET_LIGHT_KNEE: f32 = 0.25;
 /// Lift a colour toward white until its relative luminance reaches `floor`.
 /// Toward white adds light without moving hue; only saturation drops.
 /// Bisected (twenty halvings) because the sRGB transfer is nonlinear.
-fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
+pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     let light = |c: u32| crate::color_math::relative_luminance(c) * 255.0;
     // A caller may ask above the displayable range (the raster backstop adds a
     // margin); white is the answer there.
@@ -2071,6 +2082,51 @@ mod tests {
                 g > r && g > b
             }),
             "the innermost rim must visibly carry the emitted head hue"
+        );
+    }
+
+    /// The caret's white lift (§8 d) is a dark page's law: on a light page a
+    /// full-paint block over a deep violet head keeps the head's hue, under
+    /// the lift's floor, for the host's page floor to hold. Negative control:
+    /// the same tick on a dark page is lifted onto that floor.
+    #[test]
+    fn a_light_page_caret_is_not_lifted_toward_white() {
+        let g = geom();
+        let c = RainbowConfig {
+            head_rgb: Some(0x0060_20C0),
+            ..cfg()
+        };
+        let fill = |dark: bool| {
+            let mut cr = CursorRainbow::default();
+            let mut out = Vec::new();
+            cr.tick(
+                Some((1, 1)),
+                Instant::now(),
+                1.0,
+                true,
+                dark,
+                g,
+                &c,
+                &mut out,
+            )
+            .fill
+            .expect("a painted rainbow fills the block")
+        };
+        let floor = RAINBOW_CARET_LIGHT_FLOOR / 255.0;
+        let lum = crate::color_math::relative_luminance;
+        let (on_dark, on_light) = (fill(true), fill(false));
+        assert!(
+            lum(on_dark) >= floor - 0.005,
+            "control: a dark page lifts the caret to the floor, got {on_dark:06x}"
+        );
+        assert!(
+            lum(on_light) < floor,
+            "a light page keeps the hue unlifted, got {on_light:06x}"
+        );
+        let (_, s, _) = crate::color_math::rgb2hsv(on_light);
+        assert!(
+            s > 0.7,
+            "the light caret stays saturated, got {on_light:06x}"
         );
     }
 

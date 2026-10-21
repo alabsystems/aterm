@@ -1089,7 +1089,7 @@ mod tests {
             tray_raster::prepare_ui_fonts_for_direct_view_test();
         }
         if !tray_raster::strip_band_ui_ready() {
-            return;
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let colors = with_split_chrome(SplitChrome::Fluent, || {
             header_colors(aterm_render::Theme::default())

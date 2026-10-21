@@ -3587,11 +3587,10 @@ pub struct FilePlan {
     /// The cargo home the lane's compiles resolve (`$HOME/.cargo`: the lane
     /// passes neither `CARGO_HOME` nor `TARGO_HOME`).
     pub cargo_home: Option<PathBuf>,
-    /// The slots' target root, whose dep-info must not name the ratchet.
+    /// The slots' target root, whose dep-info must not name the ratchet. The
+    /// lane empties its slots before its checks start, so every dep-info file
+    /// in them was written by this run.
     pub target_root: PathBuf,
-    /// The run's start, in seconds since the epoch: dep-info at least this new
-    /// was written by this run.
-    pub since: u64,
     pub host: String,
     pub load: String,
     pub jobs: String,
@@ -3690,7 +3689,6 @@ impl Plan {
                 }
                 "target-root" => file.target_root = v.into(),
                 "cargo-home" => file.cargo_home = (!v.is_empty()).then(|| v.into()),
-                "since" => file.since = v.parse().map_err(|_| bad())?,
                 "host" => file.host = v.into(),
                 "load" => file.load = v.into(),
                 "jobs" => file.jobs = v.into(),
@@ -3899,13 +3897,11 @@ fn env_dep_refusal(
 ///   ([`env_dep_refusal`]), a build script's `cargo:rustc-env` output (under
 ///   the slots' `build/*/output`) counting as one.
 ///
-/// And at least one `.d` must have been written by this run: no dep-info at
-/// all is no evidence.
-fn dep_info_check(
-    target_root: &Path,
-    since: u64,
-    lane: &LaneEnv,
-) -> std::result::Result<(), String> {
+/// And the slots must hold at least one `.d`: no dep-info at all is no
+/// evidence. The lane empties its slots before its checks start, so each one
+/// there was written by this run's compiles, whatever its file system's clock
+/// stamped it.
+fn dep_info_check(target_root: &Path, lane: &LaneEnv) -> std::result::Result<(), String> {
     let mut stack: Vec<PathBuf> = fs::read_dir(target_root)
         .into_iter()
         .flatten()
@@ -3917,7 +3913,7 @@ fn dep_info_check(
         })
         .map(|e| e.path())
         .collect();
-    let (mut fresh, mut named) = (0usize, None::<(PathBuf, &str)>);
+    let (mut found, mut named) = (0usize, None::<(PathBuf, &str)>);
     let mut reads: Vec<(String, PathBuf, Option<String>)> = Vec::new();
     let mut emitted: BTreeSet<String> = BTreeSet::new();
     while let Some(dir) = stack.pop() {
@@ -3946,13 +3942,7 @@ fn dep_info_check(
                     };
                     reads.push((name, p.clone(), value));
                 }
-                let new = e
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .is_some_and(|d| d.as_secs() >= since);
-                fresh += usize::from(new);
+                found += 1;
             } else if ft.is_file()
                 && e.file_name() == "output"
                 && p.parent()
@@ -3983,7 +3973,7 @@ fn dep_info_check(
             p.display()
         ));
     }
-    if fresh == 0 {
+    if found == 0 {
         return Err(format!(
             "no dep-info under {} was written by this run, so nothing shows which files its compiles read",
             target_root.display()
@@ -4123,15 +4113,16 @@ pub fn remeasured(base: &Facts, again: &Facts) -> std::result::Result<Facts, Str
 }
 
 /// Where the facts of a run that files go, or why they do not: every input the
-/// key does not cover checked ([`conclude`]).
+/// key does not cover checked ([`conclude`]). A key git cannot compute files
+/// nothing, and decides nothing about the verdict.
 fn filing(
     git: &dyn GitRunner,
     repo: &Path,
     plan: &Plan,
     file: &FilePlan,
-) -> Result<std::result::Result<Provenance, String>> {
+) -> std::result::Result<Provenance, String> {
     if !file.refused.is_empty() {
-        return Ok(Err(file.refused.clone()));
+        return Err(file.refused.clone());
     }
     // A PATH TARGO REFUSED is the host's (the module docs): a record keyed by the
     // code would carry it as the code's, so nothing this run measured is filed.
@@ -4145,37 +4136,35 @@ fn filing(
         }
     }
     if !names.is_empty() {
-        return Ok(Err(format!(
+        return Err(format!(
             "targo refused a path on this host ({}) for {} (REFUSED PATH above), which says nothing about the code",
             paths.into_iter().collect::<Vec<_>>().join(", "),
             names.join(" ")
-        )));
+        ));
     }
     if file.prover.is_empty() {
-        return Ok(Err(
-            "the prover could not be identified when the run started".into(),
-        ));
+        return Err("the prover could not be identified when the run started".into());
     }
     if file.lane_env.passed.is_empty() {
-        return Ok(Err(
+        return Err(
             "the lane's plan declares no environment of its own, so nothing shows its compiles ran in one"
                 .into(),
-        ));
+        );
     }
     if let Some(c) = outside_config(repo, file.cargo_home.as_deref()).first() {
-        return Ok(Err(format!(
+        return Err(format!(
             "cargo read {}, a config file outside the tree the key covers",
             c.display()
-        )));
+        ));
     }
     let (prover, root) = match prover_identity(&file.prover_bin) {
-        Err(why) => return Ok(Err(format!("the prover cannot be identified now ({why})"))),
+        Err(why) => return Err(format!("the prover cannot be identified now ({why})")),
         Ok((now, _)) if now != file.prover => {
-            return Ok(Err(format!(
+            return Err(format!(
                 "the prover changed during the run ({} -> {})",
                 short(&file.prover),
                 short(&now)
-            )));
+            ));
         }
         Ok(found) => found,
     };
@@ -4188,12 +4177,13 @@ fn filing(
         .iter()
         .any(|c| matches!(c.decision, Decision::Gate(_)));
     if (gated || !plan.remeasure)
-        && let Err(why) = dep_info_check(&file.target_root, file.since, &file.lane_env)
+        && let Err(why) = dep_info_check(&file.target_root, &file.lane_env)
     {
-        return Ok(Err(why));
+        return Err(why);
     }
-    let tsr = tree_sans_floors(git, &file.commit)?;
-    Ok(Ok(Provenance {
+    let tsr = tree_sans_floors(git, &file.commit)
+        .map_err(|e| format!("git could not list the tree the key covers ({e})"))?;
+    Ok(Provenance {
         key: facts_key(&tsr, &prover, LANE_WHOLE_TREE),
         tree_sans_floors: tsr,
         prover,
@@ -4207,7 +4197,7 @@ fn filing(
         jobs: file.jobs.clone(),
         date: file.date.clone(),
         remeasured: Vec::new(),
-    }))
+    })
 }
 
 /// THE LANE'S END: measure the logs, judge against the ratchet, write the
@@ -4225,8 +4215,11 @@ fn filing(
 /// record's. One that may not file, or finds no record to complete, judges
 /// what it measured alone, as a narrowed run.
 ///
+/// A record git cannot key (it could not list the tree) is not filed, and the
+/// verdict stands: the judge's answer never needed the key.
+///
 /// # Errors
-/// The ratchet could not be written, or git could not list the tree.
+/// The ratchet could not be written.
 pub fn conclude(
     git: &dyn GitRunner,
     repo: &Path,
@@ -4234,10 +4227,7 @@ pub fn conclude(
     update: Update<'_>,
 ) -> Result<Concluded> {
     plan.measure();
-    let filed = match &plan.file {
-        Some(file) => Some(filing(git, repo, plan, file)?),
-        None => None,
-    };
+    let filed = plan.file.as_ref().map(|file| filing(git, repo, plan, file));
     // What is judged and filed: this run's facts, or — measured again — the
     // stored record they complete.
     let mut facts = plan.facts.clone();
@@ -5711,7 +5701,7 @@ mod tests {
             format!(
                 "{PLAN_MAGIC}\ndriver {}/targo\ndriver-id {DRV}\ntrustd /tmp/t.sock\nonly \n\
                  logdir {}\nratchet {}\ncrate alpha\talpha@1.0.0\tgate\n\
-                 store {}\ncommit {head}\ntree x\nprover {}\nprover-bin {}\ntarget-root {}\nsince 0\n{LANE}{extra}",
+                 store {}\ncommit {head}\ntree x\nprover {}\nprover-bin {}\ntarget-root {}\n{LANE}{extra}",
                 a.bin.display(),
                 logs.display(),
                 w.work().join(RATCHET).display(),
@@ -5805,13 +5795,26 @@ mod tests {
             "the control files: {l}"
         );
         assert!(w.found(&a, "HEAD").is_ok(), "the control is found");
-        let mut late =
-            Plan::parse(&plan("file \n").replace("since 0", "since 99999999999")).unwrap();
-        let l = conclude(&w.cli(), &w.work(), &mut late, Update::NONE)
-            .unwrap()
-            .facts_line
-            .unwrap();
-        assert!(l.starts_with("FACTS: none"), "{l}");
+        // slots that hold no dep-info show nothing of what the compiles read
+        fs::remove_file(&dep).unwrap();
+        let l = facts_line("file \n");
+        assert!(
+            l.starts_with("FACTS: none") && l.contains("no dep-info"),
+            "{l}"
+        );
+        fs::write(&dep, plain).unwrap();
+        // a tree git cannot list (a commit it cannot name, or a git that did not
+        // answer) keys no record, and the verdict stands
+        let mut unlisted =
+            Plan::parse(&plan("file \n").replace(&format!("commit {head}"), "commit 0000"))
+                .unwrap();
+        let done = conclude(&w.cli(), &w.work(), &mut unlisted, Update::NONE).unwrap();
+        let l = done.facts_line.unwrap();
+        assert!(
+            l.starts_with("FACTS: none") && l.contains("git could not list"),
+            "{l}"
+        );
+        assert_eq!(done.verdict.word, "PASS");
         // a prover that changed during the run
         let mut moved =
             Plan::parse(&plan("file \n").replace(a.identity.as_ref().unwrap(), "0000")).unwrap();
@@ -7083,7 +7086,7 @@ mod tests {
         let plan = format!(
             "{PLAN_MAGIC}\ndriver {}/targo\ndriver-id {DRV}\ntrustd /tmp/t.sock\nonly \n\
              logdir {}\nratchet {}\ncrate alpha\talpha@1.0.0\tgate\n\
-             store {}\ncommit {head}\ntree x\nprover {}\nprover-bin {}\ntarget-root {}\nsince 0\n\
+             store {}\ncommit {head}\ntree x\nprover {}\nprover-bin {}\ntarget-root {}\n\
              lane-pin SOURCE_DATE_EPOCH=0\nlane-passed PATH\nlane-passed HOME\nlane-passed CARGO_TARGET_DIR\nfile \n",
             a.bin.display(),
             logs.display(),

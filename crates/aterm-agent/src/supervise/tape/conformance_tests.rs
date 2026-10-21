@@ -18,7 +18,10 @@
 //!   `Crash`, then `RotMagic` for a byte of the magic, `Rot` for a byte of a frame with a
 //!   whole frame after it, or `RotLast` for a byte of the last frame, then `Recover`. The
 //!   one-frame tape is the header alone, whose magic damaged is refused although no frame
-//!   follows it.
+//!   follows it;
+//! * every arrangement of its whole frames at most one frame longer than the tape that is
+//!   neither the tape nor a prefix of it (a prefix is `Crash` at a frame's end) — frames
+//!   repeated, dropped or moved: `Write` once per frame, `Crash`, `Misplace`, `Recover`.
 //!
 //! Each reading is projected ([`project`]) onto the variables the reading decides
 //! (`recovered`, `refused`, `said_torn`, `done`) and compared with the model's state after
@@ -28,11 +31,13 @@
 //! its own execution-evidence window, so the anchors on `TapeWriter::put` (`Write`) and
 //! `recover` (`Recover`) are witnessed by the steps they claim.
 //!
-//! The negative control is a reader that ignores xxh64 (the shipping reader's own body
-//! with its checksum test off): the bind rejects it — some readings disagree with the
+//! The negative controls are two readers, each the shipping reader's own body with one
+//! test off. One ignores xxh64: the bind rejects it — some readings disagree with the
 //! model, a damaged frame is read as written (`RotRefused` broken on the real reading),
 //! and those readings are what the `Buggy = 1` machine, the checksum-blind reader,
-//! predicts.
+//! predicts. The other ignores the place a sum names, as format 1's sums let a reader do:
+//! frames out of place are read as written (`MisplacedRefused`), as the `Buggy = 6`
+//! machine predicts, and only there.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -51,7 +56,7 @@ use super::codec::{ctl_reply, ctl_request};
 use super::ctl::is_act;
 use super::doors;
 use super::frame::{Hint, MAGIC, TapeWriter};
-use super::frame_tests::{HEADER, Memory, Said, mono, noise, screen_read};
+use super::frame_tests::{HEADER, Memory, Said, arranged, mono, noise, screen_read};
 use super::header::VERBATIM;
 use super::recover::{Check, Keep, Limits, Recovered, Tail, read, recover};
 use super::replay::ReplayCore;
@@ -184,6 +189,35 @@ fn cases(tape: &Tape) -> Vec<Case> {
             schedule,
         });
     }
+    // Every arrangement of the whole frames, at most one frame longer than the tape, that is
+    // neither the tape nor a prefix of it (a prefix is a crash between frames): whole frames
+    // repeated, dropped or moved at rest.
+    let n = tape.ends.len();
+    let mut of_len: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut orders = Vec::new();
+    for _ in 0..=n {
+        of_len = of_len
+            .iter()
+            .flat_map(|o| (0..n).map(move |i| [o.as_slice(), &[i]].concat()))
+            .collect();
+        orders.extend(of_len.iter().cloned());
+    }
+    for order in orders {
+        if order
+            .iter()
+            .enumerate()
+            .all(|(place, frame)| place == *frame)
+        {
+            continue;
+        }
+        let mut schedule = vec!["Write"; n];
+        schedule.extend(["Crash", "Misplace", "Recover"]);
+        out.push(Case {
+            what: format!("{n}-frame tape, frames {order:?}"),
+            bytes: arranged(&tape.bytes, &order),
+            schedule,
+        });
+    }
     // The last frame starts where the one before it ends; the header, the only frame of a
     // one-frame tape, starts after the magic its write carries.
     let last_start = match tape.ends.as_slice() {
@@ -272,9 +306,9 @@ fn bind(
     out
 }
 
-/// The shipping writer and reader refine `SuperviseTapeRecovery` on every truncation and
-/// every byte flipped under three masks of tapes of one, two and three frames, each step
-/// witnessed by its own anchor.
+/// The shipping writer and reader refine `SuperviseTapeRecovery` on every truncation, every
+/// byte flipped under three masks and every arrangement of the whole frames of tapes of one,
+/// two and three frames, each step witnessed by its own anchor.
 #[test]
 fn the_real_writer_and_reader_conform_to_the_model() {
     let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
@@ -282,6 +316,16 @@ fn the_real_writer_and_reader_conform_to_the_model() {
     for frames in 1..=3 {
         let tape = write_tape(&model, &mut ev, frames);
         assert_eq!(tape.ends.len() as u64, frames);
+        // n + n² + … + n^(n+1) arrangements, less the n that are the tape or a prefix of it.
+        let misplaced = cases(&tape)
+            .iter()
+            .filter(|c| c.schedule.contains(&"Misplace"))
+            .count();
+        assert_eq!(
+            misplaced,
+            [1, 12, 117][tape.ends.len() - 1],
+            "{frames}-frame tape"
+        );
         let wrong = bind(&model, &tape, &recover, Some(&mut ev));
         assert!(
             wrong.is_empty(),
@@ -340,25 +384,89 @@ fn a_reader_that_ignores_xxh64_is_rejected() {
     assert!(bind(&model, &tape, &recover, None).is_empty());
 }
 
-// -- model 2: a strict replay's cursor ---------------------------------------
+/// The second negative control: the shipping reader taking a whole frame at any place —
+/// what format 1's sums, which name none, let a reader do — is rejected by the bind: frames
+/// repeated, dropped or moved read as written break `MisplacedRefused` on the real reading,
+/// what it reads there is what the `Buggy = 6` machine predicts, and every disagreement is
+/// an arrangement (its checksum still refuses every flip).
+#[test]
+fn a_reader_that_ignores_places_is_rejected() {
+    let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
+    let unplaced_model = interp::with_buggy(&supervise_tape_recovery_model(), 6);
+    let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
+    let unplaced = |bytes: &[u8]| read(bytes, Keep::Refuse, Check::Unplaced, Limits::TAPE);
+    let wrong = bind(&model, &tape, &unplaced, None);
+    assert!(
+        wrong.iter().all(|d| d.schedule.contains(&"Misplace")),
+        "only arrangements: {:?}",
+        wrong.iter().find(|d| !d.schedule.contains(&"Misplace"))
+    );
+    let read_through: Vec<&Disagreement> = wrong
+        .iter()
+        .filter(|d| d.broken.contains(&"MisplacedRefused"))
+        .collect();
+    assert!(
+        !read_through.is_empty(),
+        "frames out of place are read as written: {:?}",
+        wrong.first()
+    );
+    let predicted = read_through.iter().any(|d| {
+        let unplaced_state = walk(&unplaced_model, &d.schedule);
+        ["recovered", "refused", "said_torn"]
+            .iter()
+            .all(|v| unplaced_state[v] == d.real[v])
+    });
+    assert!(predicted, "the Buggy = 6 machine predicts a read-through");
+}
+
+// -- model 2: a replay's cursor, both arms -----------------------------------
 //
 // Tier-1 of `SuperviseReplayCursor` (`aterm_models_harness::supervise_replay_cursor_model`,
-// the replay plan's §9 model 2, the strict arm): the real replay core, asked through its
-// replaying door (`Fx::exchange` in its replay mode, a live call that counts itself if it
-// is ever made), over a real four-record tape — `status` (a read), `key 1` (an act), `meta`
-// (a read), `key 2` (an act) — by schedules drawn from `aterm_spec::rng`, each request one
-// step window. After each step the core is projected onto the model's five variables and
-// compared with the model's state after the same schedule; the anchors on
-// `ReplayCore::step` (every move) and `ReplayCore::halt` (every move that diverges) are
-// witnessed by the steps they claim. The negative control is a cursor that resyncs a read
-// it does not hold forward to the next record that matches, across the act between — the
-// lenient synthesis the plan rejected — which the bind rejects and the `Buggy = 2` machine
-// predicts.
+// the replay plan's §9 model 2): the real replay core, asked through its replaying door
+// (`Fx::exchange` in its replay mode, a live call that counts itself if it is ever made), over
+// a real four-record tape — `status` (a read), `key 1` (an act), `meta` (a read), `key 2` (an
+// act) — by schedules drawn from `aterm_spec::rng`, each request one step window. After each
+// step the core is projected onto the model's six variables and compared with the model's
+// state after the same schedule. Two binds: the STRICT core (`ReplayCore::start`) against the
+// committed machine (`Acts = 0`), and the COUNTERFACTUAL core (`ReplayCore::start_acts`, the
+// acts cursor of `tape::acts`) against the acts scenario (`Acts = 1`). The anchors on
+// `ReplayCore::step` (every strict move), `ReplayCore::step_acts` (every acts move) and
+// `ReplayCore::halt` (every move that diverges) are witnessed by the steps they claim.
+//
+// `served_future` is read off what the core SERVED: each record's reply names its request, so
+// a reply from a record past the act the loop has not taken is a value from the future.
+//
+// The negative controls: a cursor that resyncs a read it does not hold forward to the next
+// record that matches, across the act between — the lenient synthesis the plan rejected — and,
+// for the acts arm, the acts cursor with no segment bound on its resync; each bind rejects its
+// own for passing an act, and where it resyncs it is the `Buggy = 2` machine of its arm.
 
 const CURSOR: &str = "SuperviseReplayCursor";
 
 /// The four records' requests, in order: read, act, read, act.
 const TAPE_WORDS: [&[&str]; 4] = [&["status"], &["key", "1"], &["meta"], &["key", "2"]];
+
+/// Every move of the machine, in both arms.
+const CURSOR_MOVES: [&str; 7] = [
+    "AskNext",
+    "AskOtherRead",
+    "AskRepeat",
+    "AskClosingAct",
+    "AskOtherAct",
+    "AskPastEnd",
+    "AskAfterDivergence",
+];
+
+/// The strict arm's moves before the acts arm joined it: what the lenient
+/// cursor's negative control draws from (it drops a read before an act as
+/// readily as the acts arm does, a rejection of its own kind).
+const STRICT_MOVES: [&str; 5] = [
+    "AskNext",
+    "AskOtherRead",
+    "AskOtherAct",
+    "AskPastEnd",
+    "AskAfterDivergence",
+];
 
 /// A control reply saying `OK <what>`.
 fn ok_reply(what: &str) -> Result<CtlReply, String> {
@@ -383,19 +491,36 @@ fn cursor_tape() -> Vec<EffectRecord> {
 
 /// What the move `action` asks at cursor `pos` (the model's).
 fn ask_for(action: &str, pos: i64) -> Vec<&'static str> {
-    let at = |p: i64| TAPE_WORDS[usize::try_from(p.min(3)).unwrap_or(0)].to_vec();
+    let at = |p: i64| TAPE_WORDS[usize::try_from(p.clamp(0, 3)).unwrap_or(0)].to_vec();
     match action {
         "AskNext" | "AskAfterDivergence" => at(pos),
-        // A read the record under the cursor does not hold: the read ahead
-        // of it, past the act, where there is one — what a lenient cursor
-        // would resync to.
+        // A read the segment does not hold: before its act, the read ahead
+        // of it past the act — what a lenient cursor would resync to;
+        // after, the read of the segment before.
         "AskOtherRead" if pos <= 1 => vec!["meta"],
-        "AskOtherRead" if pos == 2 => vec!["status"],
-        "AskOtherRead" => vec!["meta"],
+        "AskOtherRead" => vec!["status"],
+        // The read the segment served, its act next.
+        "AskRepeat" => at(pos - 1),
+        // The segment's act, its read unasked.
+        "AskClosingAct" => at(pos + 1),
         "AskOtherAct" => vec!["key", "9"],
         "AskPastEnd" => vec!["status"],
         other => panic!("no move {other}"),
     }
+}
+
+/// The record whose reply `reply` is, by its request.
+fn record_of(reply: &CtlReply) -> Option<usize> {
+    TAPE_WORDS
+        .iter()
+        .position(|w| reply.stdout == format!("OK {}\n", w.join(" ")))
+}
+
+/// The tape's act at or past `pos` (records 1 and 3), or past the tape.
+fn closing_at(pos: usize) -> usize {
+    (pos..TAPE_WORDS.len())
+        .find(|&p| is_act(TAPE_WORDS[p]))
+        .unwrap_or(TAPE_WORDS.len())
 }
 
 /// What a cursor did, as the model's variables see it.
@@ -406,6 +531,7 @@ pub(crate) struct CursorSeen {
     live: i64,
     skipped_act: i64,
     served_after: i64,
+    served_future: i64,
 }
 
 /// The variables a cursor decides, as it has them.
@@ -416,6 +542,7 @@ pub(crate) fn project_cursor(seen: &CursorSeen) -> BTreeMap<&'static str, i64> {
         ("live", seen.live),
         ("skipped_act", seen.skipped_act),
         ("served_after", seen.served_after),
+        ("served_future", seen.served_future),
     ])
 }
 
@@ -433,17 +560,24 @@ struct RealCursor {
     live: Cell<i64>,
     served_acts: i64,
     served_after: i64,
+    served_future: i64,
 }
 
 impl RealCursor {
-    fn new() -> Self {
-        let core = ReplayCore::start(cursor_tape(), VERBATIM, VERBATIM, "test", None);
+    /// The strict core, or with `acts` the counterfactual's.
+    fn new(acts: bool) -> Self {
+        let core = if acts {
+            ReplayCore::start_acts(cursor_tape(), Vec::new(), VERBATIM, VERBATIM, "test", None)
+        } else {
+            ReplayCore::start(cursor_tape(), VERBATIM, VERBATIM, "test", None)
+        };
         Self {
             fx: Fx::replay(Arc::clone(&core)),
             core,
             live: Cell::new(0),
             served_acts: 0,
             served_after: 0,
+            served_future: 0,
         }
     }
 }
@@ -451,6 +585,7 @@ impl RealCursor {
 impl Cursor for RealCursor {
     fn ask(&mut self, words: &[&str]) -> bool {
         let was_diverged = self.seen().diverged;
+        let closing = closing_at(self.core.consumed().0);
         let live = &self.live;
         let fx = &self.fx;
         let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -462,13 +597,15 @@ impl Cursor for RealCursor {
                     ok_reply("from the world")
                 },
             )
-        }))
-        .is_ok();
-        if served {
-            self.served_acts += i64::from(is_act(words));
-            self.served_after += i64::from(was_diverged);
-        }
-        served
+        }));
+        let Ok(reply) = served else {
+            return false;
+        };
+        self.served_acts += i64::from(is_act(words));
+        self.served_after += i64::from(was_diverged);
+        let from = reply.as_ref().ok().and_then(record_of);
+        self.served_future += i64::from(from.is_some_and(|r| r > closing));
+        true
     }
 
     fn seen(&self) -> CursorSeen {
@@ -480,18 +617,19 @@ impl Cursor for RealCursor {
             live: self.live.get(),
             skipped_act: i64::try_from(consumed_acts).unwrap_or(0) - self.served_acts,
             served_after: self.served_after,
+            served_future: self.served_future,
         }
     }
 }
 
-/// THE NEGATIVE CONTROL: a cursor that resyncs a request it does not hold to
-/// the next record that holds it, across whatever lies between — an act
-/// included.
+/// THE STRICT ARM'S NEGATIVE CONTROL: a cursor that resyncs a request it
+/// does not hold to the next record that holds it, across whatever lies
+/// between — an act included.
+#[derive(Default)]
 struct LenientCursor {
     pos: usize,
     diverged: bool,
     skipped_act: i64,
-    served_after: i64,
 }
 
 impl Cursor for LenientCursor {
@@ -522,28 +660,81 @@ impl Cursor for LenientCursor {
         CursorSeen {
             pos: i64::try_from(self.pos).unwrap_or(i64::MAX),
             diverged: self.diverged,
-            live: 0,
             skipped_act: self.skipped_act,
-            served_after: self.served_after,
+            ..CursorSeen::default()
         }
     }
 }
 
-/// A schedule of up to `len` moves, each drawn from those the committed
+/// THE ACTS ARM'S NEGATIVE CONTROL: the acts cursor with no segment bound —
+/// a read is served again from its segment and an act closes it, but a read
+/// the segment does not hold is resynced to wherever ahead the tape holds
+/// it, past an act included.
+#[derive(Default)]
+struct UnboundedActsCursor {
+    pos: usize,
+    seg_start: usize,
+    diverged: bool,
+    skipped_act: i64,
+}
+
+impl Cursor for UnboundedActsCursor {
+    fn ask(&mut self, words: &[&str]) -> bool {
+        if self.diverged {
+            return false;
+        }
+        let acts = |range: std::ops::Range<usize>| {
+            i64::try_from(TAPE_WORDS[range].iter().filter(|w| is_act(w)).count()).unwrap_or(0)
+        };
+        if is_act(words) {
+            let closing = closing_at(self.pos);
+            if closing < TAPE_WORDS.len() && TAPE_WORDS[closing] == words {
+                self.pos = closing + 1;
+                self.seg_start = self.pos;
+                return true;
+            }
+            self.diverged = true;
+            return false;
+        }
+        if let Some(found) = (self.pos..TAPE_WORDS.len()).find(|&p| TAPE_WORDS[p] == words) {
+            self.skipped_act += acts(self.pos..found);
+            self.pos = found + 1;
+            if self.skipped_act > 0 {
+                self.seg_start = self.pos;
+            }
+            return true;
+        }
+        if (self.seg_start..self.pos).any(|p| TAPE_WORDS[p] == words) {
+            return true;
+        }
+        self.diverged = true;
+        false
+    }
+
+    fn seen(&self) -> CursorSeen {
+        CursorSeen {
+            pos: i64::try_from(self.pos).unwrap_or(i64::MAX),
+            diverged: self.diverged,
+            skipped_act: self.skipped_act,
+            ..CursorSeen::default()
+        }
+    }
+}
+
+/// A schedule of up to `len` of `moves`, each drawn from those the committed
 /// model has enabled after the moves before it.
-fn cursor_schedule(model: &Model, rng: &mut XorShift, len: usize) -> Vec<&'static str> {
-    const MOVES: [&str; 5] = [
-        "AskNext",
-        "AskOtherRead",
-        "AskOtherAct",
-        "AskPastEnd",
-        "AskAfterDivergence",
-    ];
+fn cursor_schedule(
+    model: &Model,
+    moves: &[&'static str],
+    rng: &mut XorShift,
+    len: usize,
+) -> Vec<&'static str> {
     let mut state = model.init_state();
     let mut out = Vec::new();
     while out.len() < len {
-        let enabled: Vec<&'static str> = MOVES
-            .into_iter()
+        let enabled: Vec<&'static str> = moves
+            .iter()
+            .copied()
             .filter(|m| model.action_enabled(m, &state))
             .collect();
         let Some(&pick) = enabled.get(rng.below(enabled.len().max(1) as u64) as usize) else {
@@ -583,31 +774,37 @@ fn bind_cursor(
     None
 }
 
-/// The real replay core refines `SuperviseReplayCursor` over two hundred schedules,
-/// every move witnessed by its own anchors.
-#[test]
-fn the_real_replay_cursor_conforms_to_the_model() {
-    let model = interp::with_buggy(&supervise_replay_cursor_model(), 0);
+/// Model 2 in the arm `acts` (0: strict, 1: the acts scenario), mutant `buggy`.
+fn cursor_machine(acts: i64, buggy: i64) -> Model {
+    interp::with_consts(
+        &supervise_replay_cursor_model(),
+        &[("Acts", acts), ("Buggy", buggy)],
+    )
+}
+
+/// The real core of the arm `acts` bound to its machine over two hundred
+/// schedules, every move witnessed by its own anchors.
+fn conforms(acts: bool) {
+    let model = cursor_machine(i64::from(acts), 0);
     let mut ev = StepEvidence::new(CURSOR);
     let mut rng = XorShift::new(61);
-    for _ in 0..200 {
-        let schedule = cursor_schedule(&model, &mut rng, 8);
-        let mut real = RealCursor::new();
+    // The tape asked whole and then past its end, which a draw over seven
+    // moves rarely reaches, first; then the drawn schedules.
+    let whole: Vec<&'static str> = ["AskNext"; 4]
+        .into_iter()
+        .chain(["AskPastEnd", "AskAfterDivergence"])
+        .collect();
+    let drawn = (0..200).map(|_| cursor_schedule(&model, &CURSOR_MOVES, &mut rng, 8));
+    for schedule in std::iter::once(whole).chain(drawn) {
+        let mut real = RealCursor::new(acts);
         let wrong = bind_cursor(&model, &schedule, &mut real, Some(&mut ev));
-        assert!(wrong.is_none(), "{schedule:?}: {wrong:?}");
+        assert!(wrong.is_none(), "acts={acts} {schedule:?}: {wrong:?}");
         assert_eq!(real.live.get(), 0, "no live call, ever");
     }
     let audit = ev.audit();
-    assert_eq!(
-        audit.actions.iter().copied().collect::<Vec<_>>(),
-        [
-            "AskAfterDivergence",
-            "AskNext",
-            "AskOtherAct",
-            "AskOtherRead",
-            "AskPastEnd"
-        ]
-    );
+    let mut moves = CURSOR_MOVES.to_vec();
+    moves.sort_unstable();
+    assert_eq!(audit.actions.iter().copied().collect::<Vec<_>>(), moves);
     assert!(audit.uninstrumented.is_empty(), "{audit:?}");
     assert!(audit.ambiguous.is_empty(), "{audit:?}");
     assert!(audit.unanchored_steps.is_empty(), "{audit:?}");
@@ -617,54 +814,75 @@ fn the_real_replay_cursor_conforms_to_the_model() {
     assert!(audit.stray.is_empty(), "{audit:?}");
 }
 
-/// The negative control: a cursor that resyncs across an act is rejected by the
-/// bind — it passes the act between unasked (`NoActSkipped` broken on its
-/// projection) — and where it resyncs, it is the `Buggy = 2` machine.
+/// The real strict replay core refines `SuperviseReplayCursor` at `Acts = 0`
+/// over two hundred schedules, every move witnessed by its own anchors.
 #[test]
-fn a_cursor_that_resyncs_across_an_act_is_rejected() {
-    let model = interp::with_buggy(&supervise_replay_cursor_model(), 0);
-    let lenient_model = interp::with_buggy(&supervise_replay_cursor_model(), 2);
+fn the_real_replay_cursor_conforms_to_the_model() {
+    conforms(false);
+}
+
+/// The real COUNTERFACTUAL core (`tape::acts`) refines `SuperviseReplayCursor`
+/// at `Acts = 1` over two hundred schedules: a read served again in its
+/// segment, an act asked before its read taking the act and dropping the
+/// read, nothing across an act and nothing from the future, every move
+/// witnessed by its own anchors.
+#[test]
+fn the_real_acts_cursor_conforms_to_the_model() {
+    conforms(true);
+}
+
+/// Bind `make()`'s cursor to the arm `acts` over schedules of `moves`: every
+/// rejection breaks `NoActSkipped` on the cursor's projection, at least one
+/// happens, and where the cursor resyncs — a read the tape holds only past
+/// the act — it is that arm's `Buggy = 2` machine, variable for variable.
+fn rejected_for_passing_an_act<C: Cursor>(acts: i64, moves: &[&'static str], make: impl Fn() -> C) {
+    let model = cursor_machine(acts, 0);
+    let lenient_model = cursor_machine(acts, 2);
     let mut rng = XorShift::new(61);
     let mut rejected = 0;
     for _ in 0..200 {
-        let schedule = cursor_schedule(&model, &mut rng, 8);
-        let mut lenient = LenientCursor {
-            pos: 0,
-            diverged: false,
-            skipped_act: 0,
-            served_after: 0,
-        };
-        if let Some((_, _, real)) = bind_cursor(&model, &schedule, &mut lenient, None) {
+        let schedule = cursor_schedule(&model, moves, &mut rng, 8);
+        if let Some((_, _, real)) = bind_cursor(&model, &schedule, &mut make(), None) {
             rejected += 1;
             assert!(
                 !model.check_invariant("NoActSkipped", &real),
-                "rejected for passing an act: {real:?}"
+                "acts={acts}: rejected for passing an act: {real:?}"
             );
         }
     }
     assert!(
         rejected > 0,
-        "the bind rejects a cursor that resyncs across acts"
+        "acts={acts}: the bind rejects a cursor that resyncs across acts"
     );
-    // Where it resyncs — a read the tape holds only past the act — it is the
-    // lenient machine, variable for variable.
     for schedule in [["AskOtherRead"].as_slice(), &["AskNext", "AskOtherRead"]] {
-        let mut lenient = LenientCursor {
-            pos: 0,
-            diverged: false,
-            skipped_act: 0,
-            served_after: 0,
-        };
+        let mut cursor = make();
         let mut state = lenient_model.init_state();
         for action in schedule {
-            lenient.ask(&ask_for(action, state["pos"]));
+            cursor.ask(&ask_for(action, state["pos"]));
             assert!(lenient_model.fire(action, &mut state));
         }
         let mut real = state.clone();
-        real.extend(project_cursor(&lenient.seen()));
-        assert_eq!(real, state, "{schedule:?}");
+        real.extend(project_cursor(&cursor.seen()));
+        assert_eq!(real, state, "acts={acts}: {schedule:?}");
         assert_eq!(state["skipped_act"], 1);
     }
+}
+
+/// The negative control of the strict arm: a cursor that resyncs across an
+/// act is rejected by the bind — it passes the act between unasked
+/// (`NoActSkipped` broken on its projection) — and where it resyncs, it is
+/// the `Buggy = 2` machine.
+#[test]
+fn a_cursor_that_resyncs_across_an_act_is_rejected() {
+    rejected_for_passing_an_act(0, &STRICT_MOVES, LenientCursor::default);
+}
+
+/// The negative control of the acts arm: the acts cursor with no segment
+/// bound on its resync is rejected by the bind for passing an act, and where
+/// it resyncs it is the acts arm's `Buggy = 2` machine.
+#[test]
+fn an_acts_cursor_unbounded_by_its_segment_is_rejected() {
+    rejected_for_passing_an_act(1, &CURSOR_MOVES, UnboundedActsCursor::default);
 }
 
 // -- model 3: the stop flag's latch ------------------------------------------

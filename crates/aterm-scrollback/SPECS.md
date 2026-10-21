@@ -15,6 +15,26 @@
 > proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes
 > are deleted. Nothing has been proved or deleted yet. The 12 checks in §4 that sample no
 > spec can be deleted or moved to a bench now.
+>
+> **Tried 2026-10-19 on seal `150efe4a`: `link-ceiling-formula` and `threshold-bytes-bounds` are
+> blocked, not proved.** The crate is not refused by PM-1; the seal compiles it and reports a row for
+> each fn. Each fn was given `ensures result == <Clean spec def>(args)`, a Clean def stating the
+> row's formula for every input (saturation and the `usize::MAX` cap included). The island defs
+> kernel-check, but E6 mints no `trust_import_aterm_scrollback__line__line_codec_block__max_linked_record_bytes`
+> or `trust_import_aterm_scrollback__watermark__threshold_bytes` (a theorem naming either is refused with
+> `AutoBoundHeadOverApplied`). The seal names the reason (gap 3, E6 shapes): "E6 admission of
+> `…::max_linked_record_bytes` was refused by the FACET gate (Pure, Total, Deterministic and NoPanic
+> must all be established) … the construct outside the E6 fragment is the call to
+> `core::num::<impl usize>::saturating_mul` (E6 reads only the marker-authenticated
+> `wrapping_*`/signed `checked_*` core methods and a forwarding call to a Clean island definition)
+> (and 1 further construct(s) outside it)". For `threshold_bytes` the call is
+> `core::num::<impl u128>::saturating_mul`, with 7 further constructs (the `/ 100`, the `u128`
+> `min` and the casts). The native clause lane refuses the same specs written in Rust
+> (`unsupported contract predicate expression`), because it does not lower method calls or casts.
+> The code is unchanged, and the tests `the_link_ceiling_is_the_record_cap_plus_one_maximal_link_per_column`
+> and `thresholds_are_bounded_for_every_budget` stay. They are unblocked by an E6 reader (or
+> the proven-core route) for unsigned `saturating_add`/`saturating_mul`, `u128` division and `min`, and
+> widening and narrowing casts.
 
 Source: `crates/aterm-scrollback` (read only). I read every `#[test]` fn (341 in 29 files under
 `src/` and `tests/`) and the production code each one reaches. Nothing was compiled or run.

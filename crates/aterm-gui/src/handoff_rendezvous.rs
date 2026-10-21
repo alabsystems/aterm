@@ -116,9 +116,9 @@
 //!   an update candidate under a pinned team — a fresh cached pass, a worker
 //!   that verifies again, an installed activation — an aterm release's own
 //!   requirement (identifier `com.aterm.aterm` and a Developer ID of the team
-//!   every candidate was verified against); only for the same-image QA seam, or
-//!   with no team pinned, the designated requirement of the code the launch
-//!   named. It is checked BEFORE any descriptor leaves, and it is what keeps
+//!   every candidate was verified against); only for a same-image handoff (the QA
+//!   seam, a launch-record renewal), or with no team pinned, the designated
+//!   requirement of the code the launch named. It is checked BEFORE any descriptor leaves, and it is what keeps
 //!   out a same-uid process that copied the secret and dials with its own code.
 //!   Until 2026-10-02 the launched lane had only the secret before the grant,
 //!   and any same-uid process that read it could take every PTY master and both
@@ -1020,7 +1020,8 @@ impl DialerCode {
 
     /// The code at `path` (the bundle LaunchServices launches), by its own
     /// designated requirement, read at each check. For a successor no team pins
-    /// and for the same-image seam, whose successor re-runs this image.
+    /// and for a same-image handoff (the QA seam, a launch-record renewal), whose
+    /// successor re-runs this image.
     pub(crate) fn code_at(path: PathBuf) -> Self {
         Self {
             rule: DialerCodeRule::CodeAt(path),
@@ -2084,6 +2085,48 @@ impl ClaimedPeer {
         (&self.stream).flush().map_err(partial)?;
         Ok(())
     }
+}
+
+/// [`Rendezvous::bind`] under `nonce` for a test, so that the test RUNS: where
+/// production binds it, or, on the two refusals production takes the fork lane
+/// on (no usable control directory; a socket path too long for `sun_path`, as
+/// under a long `$TMPDIR` or `$HOME`), in a fresh private directory under
+/// `/tmp`, through the same [`Rendezvous::bind_in`], returned beside it for the
+/// caller to hold as long as the rendezvous. A test that cannot bind there
+/// either fails, naming both reasons. Before 2026-10-14 the tests returned
+/// instead, and 20 reported `ok` having asserted nothing under a 65-byte
+/// `$TMPDIR`.
+#[cfg(test)]
+pub(crate) fn bind_anywhere_for_test(nonce: &str) -> (Rendezvous, Option<aterm_tempfile::TempDir>) {
+    let refused = match Rendezvous::bind(nonce) {
+        Ok(rendezvous) => return (rendezvous, None),
+        Err(refused @ (RendezvousError::NoControlDir | RendezvousError::PathTooLong { .. })) => {
+            refused
+        }
+        Err(error) => panic!("bind: {error}"),
+    };
+    let short_dir = short_dir_for_test(&format!("the rendezvous production refused ({refused})"));
+    let rendezvous = Rendezvous::bind_in(short_dir.path(), nonce).unwrap_or_else(|error| {
+        panic!(
+            "production refused the rendezvous ({refused}), and it could not bind in {} \
+             either: {error}",
+            short_dir.path().display()
+        )
+    });
+    (rendezvous, Some(short_dir))
+}
+
+/// A fresh private (0700) directory under `/tmp` for a socket a test binds
+/// itself, removed when dropped: `/tmp/.tmpXXXXXX/<name>` fits `sun_path`
+/// whatever `$TMPDIR` or `$HOME` is. A stub parent's or a forked listener's
+/// socket under `std::env::temp_dir()` could not bind under a 206-byte
+/// `$TMPDIR`, and four tests failed there for the fixture, not the code. `for_what`
+/// names the socket when no directory can be made.
+#[cfg(test)]
+pub(crate) fn short_dir_for_test(for_what: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::TempDir::new_in("/tmp").unwrap_or_else(|error| {
+        panic!("no directory for {for_what} could be made under /tmp: {error}")
+    })
 }
 
 /// A test's dialer: connect to `path` and present `secret`, keeping the stream
@@ -4728,45 +4771,15 @@ mod tests {
         }
     }
 
-    /// Bind a rendezvous under a test-only nonce, so that the test RUNS: where
-    /// production binds it, or, on the two refusals production takes the fork
-    /// lane on (no usable control directory; a socket path too long for
-    /// `sun_path`, as under a long `$TMPDIR` or `$HOME`), in a fresh private
-    /// directory under `/tmp`, through the same [`Rendezvous::bind_in`]. A test
-    /// that cannot bind there either fails, naming both reasons. Before
-    /// 2026-10-14 it returned instead, and 20 tests reported `ok` having
-    /// asserted nothing under a 65-byte `$TMPDIR`.
+    /// Bind a rendezvous under a test-only nonce, so that the test RUNS
+    /// ([`super::bind_anywhere_for_test`]).
     fn bind_for_test() -> BoundForTest {
         let nonce = aterm_uds::rand::hex_token::<16>()
             .unwrap_or_else(|error| panic!("a rendezvous test cannot mint its nonce: {error}"));
-        let refused = match Rendezvous::bind(&nonce) {
-            Ok(rendezvous) => {
-                return BoundForTest {
-                    rendezvous,
-                    _short_dir: None,
-                };
-            }
-            Err(
-                refused @ (RendezvousError::NoControlDir | RendezvousError::PathTooLong { .. }),
-            ) => refused,
-            Err(error) => panic!("bind: {error}"),
-        };
-        let short_dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap_or_else(|error| {
-            panic!(
-                "production refused the rendezvous ({refused}), and no directory for it could \
-                 be made under /tmp: {error}"
-            )
-        });
-        let rendezvous = Rendezvous::bind_in(short_dir.path(), &nonce).unwrap_or_else(|error| {
-            panic!(
-                "production refused the rendezvous ({refused}), and it could not bind in {} \
-                 either: {error}",
-                short_dir.path().display()
-            )
-        });
+        let (rendezvous, _short_dir) = super::bind_anywhere_for_test(&nonce);
         BoundForTest {
             rendezvous,
-            _short_dir: Some(short_dir),
+            _short_dir,
         }
     }
 
@@ -5267,13 +5280,8 @@ mod tests {
     ) -> Result<(), RendezvousError> {
         use std::io::Read as _;
 
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-rz-stub-{}-{}",
-            std::process::id(),
-            aterm_uds::rand::hex_token::<4>().expect("a name")
-        ));
-        std::fs::create_dir_all(&dir).expect("a stub dir");
-        let path = dir.join("p.sock");
+        let dir = super::short_dir_for_test("a stub parent's socket");
+        let path = dir.path().join("p.sock");
         let listener = aterm_uds::CtlListener::bind(&path).expect("a stub listener");
         let secret = "c".repeat(CLAIM_HEX_LEN);
         let outcome = std::thread::scope(|scope| {
@@ -5309,7 +5317,7 @@ mod tests {
             drop(parent.join().expect("the stub parent"));
             outcome
         });
-        let _ = std::fs::remove_dir_all(&dir);
+        drop((listener, dir));
         outcome
     }
 
@@ -5655,21 +5663,14 @@ mod claim_presentation_conformance {
         pid: libc::pid_t,
         report: OwnedFd,
         path: PathBuf,
-        dir: PathBuf,
+        /// Removed once `Drop` has reaped the child (fields drop after it).
+        _dir: aterm_tempfile::TempDir,
     }
 
     impl ForkedListener {
         fn start() -> Self {
-            // Two fixtures in one test binary can start in the same clock tick,
-            // so the name carries a per-process sequence number as well.
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let unique =
-                aterm_time::since_epoch().expect("system clock").as_nanos() % 1_000_000_000;
-            let dir = std::env::temp_dir()
-                .join(format!("aterm-rzl-{}-{seq}-{unique}", std::process::id()));
-            std::fs::create_dir(&dir).expect("create the listener's scratch dir");
-            let path = dir.join("l.sock");
+            let dir = super::short_dir_for_test("a forked listener's socket");
+            let path = dir.path().join("l.sock");
             // SAFETY: an all-zero sockaddr_un is a valid empty address.
             let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
             let bytes = path.as_os_str().as_bytes();
@@ -5771,7 +5772,7 @@ mod claim_presentation_conformance {
                 pid,
                 report: read_end,
                 path,
-                dir,
+                _dir: dir,
             };
             assert_eq!(
                 listener.next_report(),
@@ -5808,7 +5809,6 @@ mod claim_presentation_conformance {
                 let mut status = 0;
                 libc::waitpid(self.pid, &mut status, 0);
             }
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 

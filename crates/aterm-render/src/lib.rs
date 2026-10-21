@@ -43,6 +43,54 @@ pub use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, ChromeRing, Ink
 // (the test module imports `Terminal` to build inputs).
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
 
+// A contracted fn is written once, through `trust_contract_fn!`: under Trust's
+// verifying session (`cfg(trust_verify)`) it carries its native `ensures`
+// clause, and every other compiler (stock rustc in the foreign cells) gets the
+// plain fn and never parses the clause. The cited theorem is stated over
+// `trust_import_aterm_render__<fn>` (`..__<module>__<fn>` inside a module),
+// the kernel definition Trust mints from the compiled body, so the proof is
+// about this code, not a copy of it. Defined before the `mod` items so every
+// module can use them: `macro_rules!` scope is textual.
+#[cfg(trust_verify)]
+macro_rules! trust_contract_fn {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis fn $name($($arg: $arg_ty),*) -> $ret
+            $($clauses)+
+        { $($body)* }
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! trust_contract_fn {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ident
+        clauses [$($clauses:tt)+]
+        { $($body:tt)* }
+    ) => {
+        $(#[$meta])*
+        $vis fn $name($($arg: $arg_ty),*) -> $ret { $($body)* }
+    };
+}
+
+#[cfg(trust_verify)]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {
+        $($tt)*
+    };
+}
+
+#[cfg(not(trust_verify))]
+macro_rules! verify_island {
+    ($($tt:tt)*) => {};
+}
+
 pub mod apron;
 pub mod band;
 pub mod bloom;
@@ -63,6 +111,10 @@ pub mod font_catalog;
 /// the module the U+276F tofu bug proved was missing (see its docs).
 pub mod font_chain;
 pub mod font_file;
+/// The art registry and CPU painting for fx layers (design §4.7).
+pub mod fx;
+/// The fx layers' damage: the bands a layer or occluder change repaints.
+mod fx_damage;
 /// The fx layers' CPU rasterizer: pixel law F, band slicing, occluders.
 mod fx_raster;
 pub mod hdr;
@@ -101,6 +153,14 @@ pub mod variation;
 pub mod vibrancy;
 
 pub use apron::ApronScratch;
+pub use fx_damage::RowBands;
+/// The fx engine's one slicer and its bloom source (`fx_raster`), shared with
+/// the GPU renderer so the band gate, the clips and the occluders are one
+/// statement on every backend.
+pub use fx_raster::{
+    FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, for_each_drawn_sprite, fx_bloom_quads,
+    slice_layers,
+};
 pub use spill::SpillBand;
 
 pub use deco::{
@@ -687,6 +747,8 @@ impl From<&aterm_types::scheme::ColorScheme> for Theme {
 
 #[cfg(test)]
 mod cell_geometry_memo_tests;
+#[cfg(all(test, feature = "embedded-font"))]
+mod combining_script_tests;
 #[cfg(test)]
 mod dark_nudge_grid_tests;
 #[cfg(test)]
@@ -8953,10 +9015,114 @@ pub fn band_offset_y(dst_px: usize, src_px: usize) -> i64 {
     }
 }
 
+/// One axis of a frame's placement inside a surface ([`frame_placement`]):
+/// the surface is `band_before + visible + band_after` pixels and the frame
+/// `crop_before + visible + crop_after`. A frame that fits has no crop; one
+/// that overflows (a transient resize, a degenerate tiny window) has no band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AxisPlacement {
+    /// Where the frame's leading edge sits in the surface; negative when the
+    /// frame overflows and is cropped.
+    pub origin: i64,
+    /// Surface pixels before the frame: the leading band.
+    pub band_before: usize,
+    /// Frame pixels on the surface, starting at surface pixel `band_before`
+    /// and frame pixel `crop_before`.
+    pub visible: usize,
+    /// Surface pixels after the frame: the trailing band.
+    pub band_after: usize,
+    /// Frame pixels cut before the visible run.
+    pub crop_before: usize,
+    /// Frame pixels cut after the visible run.
+    pub crop_after: usize,
+}
+
+impl AxisPlacement {
+    fn at(origin: i64, surface: usize, frame: usize) -> Self {
+        let surface_px = i64::try_from(surface).unwrap_or(i64::MAX);
+        let frame_px = i64::try_from(frame).unwrap_or(i64::MAX);
+        let end = origin.saturating_add(frame_px);
+        let start = origin.clamp(0, surface_px);
+        let stop = end.clamp(start, surface_px);
+        // Every clamped value lies in `0..=max(surface, frame)`, so it fits.
+        let px = |value: i64| usize::try_from(value).unwrap_or(0);
+        Self {
+            origin,
+            band_before: px(start),
+            visible: px(stop - start),
+            band_after: px(surface_px - stop),
+            crop_before: px(start - origin),
+            crop_after: px(end - stop),
+        }
+    }
+
+    /// The frame pixel shown at surface pixel `surface_px`; `None` in a band.
+    #[must_use]
+    pub fn source(&self, surface_px: usize) -> Option<usize> {
+        surface_px
+            .checked_sub(self.band_before)
+            .filter(|&run| run < self.visible)
+            .map(|run| run + self.crop_before)
+    }
+}
+
+/// Where a `src_w`×`src_h` frame lands in a `dst_w`×`dst_h` surface: centred
+/// horizontally ([`band_offset`]) and at the platform vertical policy
+/// ([`band_offset_y`]). THE placement law: the CPU present
+/// ([`place_frame_bands`] and its dirty-row copy), the GPU blit's
+/// `content_off`, the GUI's `dims` and the crop of a presented destination
+/// back to its frame all read it, so a pixel a capture takes from the glass
+/// is the pixel the present put there.
+#[must_use]
+pub fn frame_placement(dst_w: usize, dst_h: usize, src_w: usize, src_h: usize) -> FramePlacement {
+    FramePlacement {
+        x: AxisPlacement::at(band_offset(dst_w, src_w), dst_w, src_w),
+        y: AxisPlacement::at(band_offset_y(dst_h, src_h), dst_h, src_h),
+    }
+}
+
+/// A frame's placement in a surface, per axis ([`frame_placement`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramePlacement {
+    pub x: AxisPlacement,
+    pub y: AxisPlacement,
+}
+
+/// A rectangle of whole pixels: `width`×`height` at `(x, y)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl FramePlacement {
+    /// Where the frame's visible pixels are in the `surface_w`×`surface_h`
+    /// surface it was placed in: the `x.visible`×`y.visible` pixels at
+    /// `(x.band_before, y.band_before)`. `None` when this is not a placement in
+    /// that surface.
+    #[must_use]
+    pub fn visible_rect(&self, surface_w: usize, surface_h: usize) -> Option<PixelRect> {
+        let spans = |axis: &AxisPlacement| {
+            axis.band_before
+                .checked_add(axis.visible)?
+                .checked_add(axis.band_after)
+        };
+        (spans(&self.x)? == surface_w && spans(&self.y)? == surface_h).then_some(PixelRect {
+            x: self.x.band_before,
+            y: self.y.band_before,
+            width: self.x.visible,
+            height: self.y.visible,
+        })
+    }
+}
+
 /// W1: place the rendered frame (`src`, `src_w`×`src_h`, packed `0x00RRGGBB`)
-/// into a RAW-window-sized destination (`dst_w`×`dst_h`) at the centred
-/// [`band_offset`] horizontally and the platform [`band_offset_y`] vertically
-/// (top-pinned on Linux), painting the surrounding remainder bands `band_rgb` (the
+/// into a RAW-window-sized destination (`dst_w`×`dst_h`) at its
+/// [`frame_placement`] (the centred [`band_offset`] horizontally, the platform
+/// [`band_offset_y`] vertically: top-pinned on Linux), painting the surrounding
+/// remainder bands `band_rgb` (the
 /// caller-resolved live background) — the CPU/softbuffer twin of the GPU blit's
 /// band-aware `fs_blit`. `invert` XORs the CONTENT pixels (the visual-bell flash); the
 /// bands are chrome and never flash, matching the GPU shader's early-out.
@@ -8991,35 +9157,34 @@ pub fn place_frame_bands(
 ) {
     let band = band_rgb & 0x00ff_ffff;
     let xor = if invert { 0x00ff_ffff } else { 0 };
-    let off_x = band_offset(dst_w, src_w);
     // Vertical placement is the PLATFORM policy, not the centred split: pinned
     // to the top on Linux (slack to the bottom, under the chrome band), centred
     // elsewhere. See [`band_offset_y`].
-    let off_y = band_offset_y(dst_h, src_h);
-    // The content columns visible in dst: [x0, x1) in dst coords.
-    let x0 = off_x.max(0) as usize;
-    let x1 = (off_x + src_w as i64).clamp(0, dst_w as i64) as usize;
+    let place = frame_placement(dst_w, dst_h, src_w, src_h);
+    // The content columns visible in dst: [x0, x1) in dst coords, from source
+    // column sx0.
+    let x0 = place.x.band_before;
+    let x1 = x0 + place.x.visible;
+    let sx0 = place.x.crop_before;
     for y in 0..dst_h {
         let Some(row) = dst.get_mut(y * dst_w..y * dst_w + dst_w) else {
             break;
         };
-        let sy = y as i64 - off_y;
-        if sy < 0 || sy >= src_h as i64 {
+        let Some(sy) = place.y.source(y) else {
             row.fill(band);
             continue;
-        }
+        };
         // Beside a chrome row the bands continue its own edge pixels (the
-        // source row exists: `0 <= sy < src_h`, and `src_w > 0` is checked).
-        let (lo, hi) = if edge_rows.contains(&(sy as usize)) && src_w > 0 {
-            let base = sy as usize * src_w;
+        // source row exists: `sy < src_h`, and `src_w > 0` is checked).
+        let (lo, hi) = if edge_rows.contains(&sy) && src_w > 0 {
+            let base = sy * src_w;
             (src[base] & 0x00ff_ffff, src[base + src_w - 1] & 0x00ff_ffff)
         } else {
             (band, band)
         };
         row[..x0].fill(lo);
         row[x1..].fill(hi);
-        let sx0 = (x0 as i64 - off_x) as usize;
-        let srow = &src[sy as usize * src_w + sx0..sy as usize * src_w + sx0 + (x1 - x0)];
+        let srow = &src[sy * src_w + sx0..sy * src_w + sx0 + (x1 - x0)];
         if invert {
             for (d, &s) in row[x0..x1].iter_mut().zip(srow) {
                 *d = s ^ xor;
@@ -9027,6 +9192,44 @@ pub fn place_frame_bands(
         } else {
             row[x0..x1].copy_from_slice(srow);
         }
+    }
+}
+
+/// Continue the chrome rows' edge pixels through the remainder bands AGAIN,
+/// from the frame as it now stands on the surface: [`place_frame_bands`]
+/// continued the rendered frame's edges, and host chrome composited over the
+/// placed frame since (a tray card, such as the stats Deck in the head) can
+/// change a chrome row's edge pixel, the Deck's bottom rule among them. The
+/// GPU twin needs no second step: its tray composites over the present copy
+/// that the blit then samples. `dst` is `dst_w`×`dst_h` with a `src_w`×`src_h`
+/// frame placed in it by the same law as [`place_frame_bands`]; only band
+/// pixels beside the rows in `edge_rows` change, and with no side band (an
+/// exact fit or a crop) nothing does. Run it before the bell invert, which
+/// never flips a band.
+pub fn continue_chrome_edges(
+    dst: &mut [u32],
+    dst_w: usize,
+    dst_h: usize,
+    src_w: usize,
+    src_h: usize,
+    edge_rows: std::ops::Range<usize>,
+) {
+    let place = frame_placement(dst_w, dst_h, src_w, src_h);
+    let x0 = place.x.band_before;
+    let x1 = x0 + place.x.visible;
+    if x1 <= x0 || (x0 == 0 && x1 == dst_w) {
+        return;
+    }
+    for y in 0..dst_h {
+        if !place.y.source(y).is_some_and(|sy| edge_rows.contains(&sy)) {
+            continue;
+        }
+        let Some(row) = dst.get_mut(y * dst_w..y * dst_w + dst_w) else {
+            break;
+        };
+        let (lo, hi) = (row[x0] & 0x00ff_ffff, row[x1 - 1] & 0x00ff_ffff);
+        row[..x0].fill(lo);
+        row[x1..].fill(hi);
     }
 }
 
@@ -15284,6 +15487,18 @@ impl Renderer {
         self.glyph_key_styled_inner(ch, style, ScalarPresentation::Default)
     }
 
+    /// A combining overlay follows a small footer cell's script and weight.
+    /// Ordinary terminal marks retain their historical unstyled key exactly.
+    /// Nudge is applied after mark centring, not encoded in this reusable raster.
+    pub fn combining_mark_key(&mut self, mark: char, cell: &RenderCell) -> GlyphKey {
+        match cell.script {
+            aterm_core::terminal::Script::Normal => self.glyph_key(mark),
+            aterm_core::terminal::Script::Sub { .. } => {
+                self.glyph_key_styled(mark, cell_style(cell))
+            }
+        }
+    }
+
     /// Styled twin of [`Self::glyph_key_text`] for an explicit VS15 cell.
     pub fn glyph_key_text_styled(&mut self, ch: char, style: StyleBits) -> GlyphKey {
         self.glyph_key_styled_inner(ch, style, ScalarPresentation::Text)
@@ -17828,7 +18043,7 @@ impl Renderer {
                     c.cursor_style_override,
                     self.cursor_blink_phase,
                     self.cursor_style_override,
-                    self.cell_h,
+                    self.row_bands(),
                     &mut dirty,
                 );
                 // What the ordinary diff would cost, in rows: every row on a
@@ -17846,7 +18061,7 @@ impl Renderer {
                         c.cursor_style_override,
                         self.cursor_blink_phase,
                         self.cursor_style_override,
-                        self.cell_h,
+                        self.row_bands(),
                         // The CPU pixel move is a `memmove` of the cached grid
                         // band; a retained row that changed is re-rasterized over
                         // it rather than refusing the whole plan.
@@ -17885,9 +18100,12 @@ impl Renderer {
             // Rescued scroll blit: the flagged rows in `dirty` drive the SAME
             // damaged tail as ordinary row damage (pixels pre-shifted below).
             // `rows_only` on BOTH scroll arms, including the one that displaced a
-            // `Rows` verdict: the planner's own gate proved there is no overlay
-            // stream, no selection and no cursor change in either frame, so every
-            // flag the displaced verdict carried is false by construction — and
+            // `Rows` verdict: the planner's own gate proved there is no row-tagged
+            // overlay stream but the row-local ones (ink and in-band decorations,
+            // each compared row against source row and marked where it did not
+            // ride the blit), no selection and no cursor change in either frame,
+            // and marked every band the fx layers need, so every flag the
+            // displaced verdict carried is false or already in `dirty` — and
             // `any_dirty` is true, so the frame cannot be mistaken for a gate hit.
             DirtyDecision::FullRepaint => DirtyRows::rows_only(),
             DirtyDecision::Rows(_) if scroll_delta.is_some() => DirtyRows::rows_only(),
@@ -17959,7 +18177,7 @@ impl Renderer {
                 input,
                 self.cursor_blink_phase,
                 self.cursor_style_override,
-                self.cell_h,
+                self.row_bands(),
             ),
             "DirtyRows::is_gate_hit must agree with is_unchanged_frame"
         );
@@ -18000,6 +18218,41 @@ impl Renderer {
             base,
             Some(&dirty),
         );
+        // E7 overshoot aprons (BUG 1/2), steps 2 & 3 — a no-op on a non-scroll
+        // frame (`apron_rows` empty, no lower boundary flagged) and on scroll
+        // content with no glyph overshoot. They finish the GLYPH phase, so they
+        // run right after `composite_free` and BEFORE every post-pass: the full
+        // path draws a row's upward overshoot in phase C, under every light the
+        // post-passes add to the band above it. The fx layers are the post-pass
+        // stream that shares a frame with the blit (design §4.4), and a Glow or
+        // Over layer whose last band sits over a blitted row would otherwise have
+        // that row's accent drawn over its light. The cursor, the other one,
+        // follows anyway.
+        if scroll_delta.is_some() {
+            // Step 2: undo `composite_free`'s upward overshoot spill over the
+            // retained rows above each re-rastered retained row.
+            self.scroll_restore_upper_aprons(&mut cache.pixels, w, h, &apron_rows, &apron_saved);
+            // Step 3: composite the RETAINED row-below's upward overshoot into each
+            // re-rastered band whose lower neighbour was blitted (the top exposed
+            // strip's inner edge, and any interior shade-parity row) — the overshoot
+            // the blit could not carry because that band was rebuilt from scratch.
+            for r in 0..rows {
+                if dirty[r] && r + 1 < rows && !dirty[r + 1] {
+                    self.scroll_draw_lower_apron(
+                        &mut wc.image_cache,
+                        &mut cache.pixels,
+                        w,
+                        h,
+                        input,
+                        r,
+                        &mut apron_tmp,
+                    );
+                }
+            }
+        }
+        wc.scroll_apron_rows = apron_rows;
+        wc.scroll_apron_saved = apron_saved;
+        wc.scroll_apron_tmp = apron_tmp;
         // (The comet ember bed now draws INSIDE `composite_free` — phase B2b,
         // under the glyph ink — not as a post-pass here.)
         // LUMEN aurora (additive light) UNDER the cursor; damaged path → dirty rows.
@@ -18062,35 +18315,6 @@ impl Renderer {
             FxBlend::Linear,
             Some(&dirty),
         );
-        // E7 overshoot aprons (BUG 1/2), steps 2 & 3 — a no-op on a non-scroll
-        // frame (`apron_rows` empty, no lower boundary flagged) and on scroll
-        // content with no glyph overshoot. Run BEFORE `draw_cursor` so a static
-        // cursor lands over the finished text, exactly as the full path orders it.
-        if scroll_delta.is_some() {
-            // Step 2: undo `composite_free`'s upward overshoot spill over the
-            // retained rows above each re-rastered retained row.
-            self.scroll_restore_upper_aprons(&mut cache.pixels, w, h, &apron_rows, &apron_saved);
-            // Step 3: composite the RETAINED row-below's upward overshoot into each
-            // re-rastered band whose lower neighbour was blitted (the top exposed
-            // strip's inner edge, and any interior shade-parity row) — the overshoot
-            // the blit could not carry because that band was rebuilt from scratch.
-            for r in 0..rows {
-                if dirty[r] && r + 1 < rows && !dirty[r + 1] {
-                    self.scroll_draw_lower_apron(
-                        &mut wc.image_cache,
-                        &mut cache.pixels,
-                        w,
-                        h,
-                        input,
-                        r,
-                        &mut apron_tmp,
-                    );
-                }
-            }
-        }
-        wc.scroll_apron_rows = apron_rows;
-        wc.scroll_apron_saved = apron_saved;
-        wc.scroll_apron_tmp = apron_tmp;
         // Cursor overlay — the EXACT same code the full path runs.
         self.draw_cursor(&mut cache.pixels, w, h, input);
 
@@ -18219,6 +18443,14 @@ impl Renderer {
     pub fn row_pixel_band(&self, r: usize, rows: usize, h: usize) -> (usize, usize) {
         // One band rule for every consumer, the fx slicer included.
         fx_raster::band_px(r, rows, h, self.grid_top(), self.cell_h)
+    }
+
+    /// Where this renderer's cell-row bands lie in window pixels: the
+    /// geometry the shared damage seam ([`compute_dirty_rows`],
+    /// [`scroll_shift_plan`]) maps the fx layers and occluders to rows with.
+    #[must_use]
+    pub fn row_bands(&self) -> RowBands {
+        RowBands::new(self.grid_top(), self.cell_h)
     }
 
     /// This frame's effective default background: the host-resolved LIVE default-bg
@@ -19798,7 +20030,7 @@ impl Renderer {
                     // and never stacks it (see `MarkStack`).
                     let mut stack = MarkStack::default();
                     for &m in marks {
-                        let mk = self.glyph_key(m);
+                        let mk = self.combining_mark_key(m, cell);
                         // ONE cache probe for all four facts: the ink box is
                         // MEMOIZED in the entry (`CachedGlyph`), never scanned
                         // per mark per frame — it is a pure function of a raster
@@ -19827,7 +20059,8 @@ impl Renderer {
                         // where that is. On a uniform row `x == pad_x + c * cw`,
                         // so this is the old `mark_cell_x(c, cw, ..) + pad_x`
                         // term for term (same centring, same integer division).
-                        let cx = mark_cell_x_at(x as i32, cw, gw, xmin, scale);
+                        let cx = mark_cell_x_at(x as i32, cw, gw, xmin, scale)
+                            + mark_script_shift(cell.script, cw);
                         let dy = stack.dy(ink_h, ink_ymin, self.baseline, self.cell_h, scale.ys);
                         // Combining marks paint in the SAME effective fg as their
                         // base glyph — W5b floors (selection / min-contrast) applied
@@ -20561,6 +20794,22 @@ impl Renderer {
         }
     }
 
+    /// The frame the fx engine slices a `w`×`h` buffer of `rows` grid rows
+    /// against under this renderer's geometry: the Grid origin `(pad,
+    /// grid_top)` and the cell-row bands. The GPU renderer slices with the
+    /// same one, so both draw the same slices.
+    #[must_use]
+    pub fn fx_frame(&self, w: usize, h: usize, rows: usize) -> FxFrame {
+        FxFrame {
+            w,
+            h,
+            pad: self.pad,
+            grid_top: self.grid_top(),
+            cell_h: self.cell_h,
+            rows,
+        }
+    }
+
     /// Draw the fx layers of `slot` and `blend` ([`aterm_core::render::FxLayer`],
     /// design §4): pixel law F, sliced at the cell-row bands, minus every
     /// occluder. `dirty` is the row-repaint gate (`None` on the full path): a
@@ -20580,14 +20829,7 @@ impl Renderer {
         if input.fx_layers.is_empty() {
             return;
         }
-        let frame = fx_raster::FxFrame {
-            w,
-            h,
-            pad: self.pad,
-            grid_top: self.grid_top(),
-            cell_h: self.cell_h,
-            rows: input.rows,
-        };
+        let frame = self.fx_frame(w, h, input.rows);
         fx_raster::draw_layers(
             pixels,
             &frame,
@@ -21332,7 +21574,10 @@ impl Renderer {
             // host can lose OSC 12 / the configured `cursor_color` entirely. The
             // renderer cannot recover it (only the effect knows how its colour is
             // built), so the contract is the HOST's: an effect that owns the
-            // cursor BODY must derive its fill from the resolved cursor colour.
+            // cursor BODY must derive its fill from the resolved cursor colour,
+            // unless the style is its colour (the fire forge and the water
+            // droplet own theirs by design and report no base; the forge keeps
+            // its page contrast on its own ramp).
             let base_fill = match input.cursor_fill_override {
                 Some(fill) => fill,
                 None => self.frame_cursor(input),
@@ -23662,15 +23907,25 @@ pub struct DirtyRows {
     /// gate must NOT fire. Rows only — every halo lies in exactly one row band
     /// (the GlowQuad invariant). Both empty ⇒ false ⇒ gate-hit.
     pub rain_add_changed: bool,
+    /// Whether the FX LAYERS (`fx_layers`) differ from the prior frame by
+    /// identity, or the occluders (`fx_occluders`) differ while either frame
+    /// draws a layer. When set, the bands of every changed layer's previous
+    /// and current extent (and of each changed occluder where it meets a
+    /// layer) have been marked dirty, and the gate must NOT fire. SETTLED
+    /// layers — the same `Arc`s at the same place — leave this false, so a
+    /// resting card gate-hits at the cost of a pointer compare.
+    pub fx_changed: bool,
 }
 
 impl DirtyRows {
     /// A verdict carrying ONLY per-row content damage (the flags live in the
     /// caller-owned `dirty` scratch): every overlay/cursor/blink flag is clear.
     /// Used by the E7 scroll-blit, whose eligibility gate already proved there is
-    /// no overlay, no selection, and a static cursor — so the shifted frame's only
-    /// re-rasterized work is the flagged (exposed + cursor) rows. `any_dirty` is
-    /// `true` because a scroll always exposes at least one row (`|delta| < rows`).
+    /// no row-tagged overlay, no selection, and a static cursor — so the shifted
+    /// frame's only re-rasterized work is the flagged (exposed + cursor + fx
+    /// layer) rows; the fx layers never refuse the blit and their bands are in
+    /// the flagged set. `any_dirty` is `true` because a scroll always exposes at
+    /// least one row (`|delta| < rows`).
     #[must_use]
     pub(crate) fn rows_only() -> Self {
         Self {
@@ -23691,6 +23946,7 @@ impl DirtyRows {
             nova_changed: false,
             rain_changed: false,
             rain_add_changed: false,
+            fx_changed: false,
         }
     }
 
@@ -23716,6 +23972,7 @@ impl DirtyRows {
             && !self.nova_changed
             && !self.rain_changed
             && !self.rain_add_changed
+            && !self.fx_changed
     }
 }
 
@@ -23997,6 +24254,15 @@ pub fn chrome_ring_floor_cols(ring: &ChromeRing) -> std::ops::Range<usize> {
 /// and no active selection (a per-row span the blit would strand). The cursor is
 /// handled separately (it is a single relocatable overlay). Every stream is
 /// empty in the common history-scroll case, so this is a cheap `is_empty` fan.
+///
+/// ROW-LOCAL overlays do not refuse: the animated ink (per-cell fg overrides,
+/// drawn inside their row's band) and every sparkle-word decoration that sits
+/// in its own row's band (`dy == 0`). Their pixels are their row's, so the blit
+/// carries them with it; the planner compares each retained row's with its
+/// source row's ([`row_overlays_differ_shifted`]) like its cells, and a row
+/// whose ink or decoration did not move with it is rebuilt (`Diff`) or refuses
+/// the plan (`Rigid`). A jittered decoration (`dy != 0`) spills into a
+/// neighbour's band and still refuses.
 fn scroll_blittable_content(input: &RenderInput) -> bool {
     /// Was this stream absent from the frame `input` describes?
     ///
@@ -24022,8 +24288,7 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
         && absent(&input.glow_halo, &input.glow_halo_damage)
         && absent(&input.glow_under, &input.glow_under_damage)
         && absent(&input.fire_patch, &input.fire_patch_damage)
-        && input.word_decorations.is_empty()
-        && input.ink.is_empty()
+        && input.word_decorations.iter().all(|d| d.dy == 0)
         && input.char_fg.is_empty()
         && input.fire_halo.is_empty()
         && input.cat_quads.is_empty()
@@ -24031,10 +24296,40 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
         && input.nova_add.is_empty()
         && input.rain_quads.is_empty()
         && input.rain_add.is_empty()
-        // Fx layers refuse the blit until their rows are marked over the slid
-        // pixels (design §4.4, lane B2): fail closed to the full repaint.
-        && input.fx_layers.is_empty()
+        // Fx layers do NOT refuse the blit (design §4.4): `scroll_shift_plan`
+        // marks the bands their light was slid to and the bands it lands on,
+        // and the damaged tail rebuilds those over the slid pixels.
         && !input.any_selection()
+}
+
+/// Whether row `ra` of `a` and row `rb` of `b` carry different ROW-LOCAL
+/// overlays ([`scroll_blittable_content`]): the animated ink (column and
+/// colour, in the stream's sorted order) or the sparkle-word decorations on the
+/// row (every field but the row, in list order, which is their draw order).
+/// The shifted twin of [`row_differs_shifted`] for the two streams the row
+/// diff leaves to their own channel in [`compute_dirty_rows`]: equal cells
+/// with equal overlays rasterize to the same pixels a row apart.
+fn row_overlays_differ_shifted(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> bool {
+    let (ia, ib) = (sparse_row_slice(&a.ink, ra), sparse_row_slice(&b.ink, rb));
+    if ia.len() != ib.len()
+        || ia
+            .iter()
+            .zip(ib)
+            .any(|(x, y)| (x.col, x.color) != (y.col, y.color))
+    {
+        return true;
+    }
+    !row_decorations(a, ra).eq(row_decorations(b, rb))
+}
+
+/// The sparkle-word decorations on row `r`, in draw order, each with its row
+/// cleared (the field [`row_overlays_differ_shifted`] compares them without).
+fn row_decorations(input: &RenderInput, r: usize) -> impl Iterator<Item = WordDecoration> + '_ {
+    input
+        .word_decorations
+        .iter()
+        .filter(move |d| usize::from(d.row) == r)
+        .map(|d| WordDecoration { row: 0, ..*d })
 }
 
 /// E7 overshoot-apron reconciliation depth: how many RETAINED rows directly above
@@ -24093,7 +24388,7 @@ pub fn scroll_blit_plan(
     prev_cursor_style_override: Option<CursorStyle>,
     cur_blink_phase: bool,
     cur_cursor_style_override: Option<CursorStyle>,
-    cell_h: usize,
+    bands: RowBands,
     dirty: &mut Vec<bool>,
 ) -> Option<i32> {
     scroll_shift_plan(
@@ -24103,7 +24398,7 @@ pub fn scroll_blit_plan(
         prev_cursor_style_override,
         cur_blink_phase,
         cur_cursor_style_override,
-        cell_h,
+        bands,
         RetainedRows::Rigid,
         dirty,
     )
@@ -24168,10 +24463,11 @@ pub fn scroll_shift_plan(
     prev_cursor_style_override: Option<CursorStyle>,
     cur_blink_phase: bool,
     cur_cursor_style_override: Option<CursorStyle>,
-    cell_h: usize,
+    bands: RowBands,
     retained: RetainedRows,
     dirty: &mut Vec<bool>,
 ) -> Option<i32> {
+    let cell_h = bands.cell_h;
     let rows = input.rows;
     // The per-frame ANCHOR delta IS the integer row shift: viewport row r shows
     // absolute row (base_y − display_offset) + r, so `dst[r] ← src[r + da]`.
@@ -24238,7 +24534,8 @@ pub fn scroll_shift_plan(
         for r in 0..rows {
             let src = r as i64 + i64::from(da);
             if (0..rows as i64).contains(&src)
-                && row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
+                && (row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
+                    || row_overlays_differ_shifted(input, r, prev, src as usize))
             {
                 return None;
             }
@@ -24261,7 +24558,8 @@ pub fn scroll_shift_plan(
         if !(0..rows as i64).contains(&src) {
             *row_dirty = true; // no in-range source ⇒ newly exposed
         } else if retained == RetainedRows::Diff
-            && row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
+            && (row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
+                || row_overlays_differ_shifted(input, r, prev, src as usize))
         {
             // A STREAMING flood is exactly this shape: the anchor advances, every
             // retained row slides up byte-identically, and the one row the writer
@@ -24371,6 +24669,19 @@ pub fn scroll_shift_plan(
             dirty[ghost as usize] = true;
         }
     }
+    // FX LAYERS (design §4.4): the blit slid the previous frame's layer light
+    // with the grid band, so rebuild the bands it was slid to (and the edge
+    // rows holding its part in the padding, which the blit keeps in place),
+    // and every band the current layers draw, from the cached frame's own
+    // `Arc`s. Unchanged-content re-rasters like the cursor rows, so they are
+    // marked after the apron loop and take the upper-apron snapshot.
+    fx_damage::mark_fx_scroll(
+        dirty,
+        bands,
+        (&prev.fx_layers, &prev.fx_occluders),
+        (&input.fx_layers, &input.fx_occluders),
+        da,
+    );
     Some(da)
 }
 
@@ -24416,13 +24727,17 @@ fn row_has_y_phase_cell(input: &RenderInput, r: usize) -> bool {
 /// is left untouched (the caller repaints every row). Each present path keeps the
 /// scratch resident across frames so the dirty Vec is allocated at most once.
 ///
-/// `cell_h` is the renderer's cell height in pixels: the row→pixel mapping the
-/// FREE-sprite row-union needs (a free sprite has no row tag; its true pixel
-/// Y-extent decides which bands to mark). Keeping the mapping INSIDE this one
-/// shared function is what preserves the CPU==GPU single-source guarantee.
-/// Unused (any value) when both frames' `free_sprites` are empty.
+/// `bands` is where the renderer's cell-row bands lie ([`RowBands`]: the grid's
+/// top edge and the cell height): the row→pixel mapping the FREE-sprite
+/// row-union needs (a free sprite has no row tag; its true pixel Y-extent
+/// decides which bands to mark, from `cell_h` alone, in grid-interior pixels)
+/// and the fx arm needs (a window-space layer or occluder maps to rows through
+/// `grid_top` too). Keeping the mapping INSIDE this one shared function is what
+/// preserves the CPU==GPU single-source guarantee. A frame whose grid starts
+/// at its top edge (no pad, no head) is `RowBands::new(0, cell_h)`, spelled out
+/// where it is meant.
 // 8 args: the shared damage seam takes both frames' full cursor/blink state plus
-// the new `cell_h` (§3.3) — a params struct would just re-spell the seam.
+// the band geometry (§3.3) — a params struct would just re-spell the seam.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_dirty_rows(
     prev_input: &RenderInput,
@@ -24431,9 +24746,10 @@ pub fn compute_dirty_rows(
     prev_cursor_style_override: Option<CursorStyle>,
     cur_blink_phase: bool,
     cur_cursor_style_override: Option<CursorStyle>,
-    cell_h: usize,
+    bands: RowBands,
     dirty: &mut Vec<bool>,
 ) -> DirtyDecision {
+    let cell_h = bands.cell_h;
     let (rows, cols) = (input.rows, input.cols);
 
     // REUSABLE precheck — IDENTICAL to `render_input_cached`'s `reusable` and to
@@ -24476,8 +24792,7 @@ pub fn compute_dirty_rows(
         && prev_input.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
             == input.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
         && !any_double_height(prev_input)
-        && !any_double_height(input)
-        && fx_layers_settled(prev_input, input);
+        && !any_double_height(input);
     if !reusable {
         return DirtyDecision::FullRepaint;
     }
@@ -25002,6 +25317,22 @@ pub fn compute_dirty_rows(
         }
     }
 
+    // FX LAYERS (design §4.4): retained sprite/bitmap layers, invisible to
+    // `row_differs`. Matched by id and compared by IDENTITY (the content `Arc`,
+    // never its bytes): a settled layer is a pointer compare and marks nothing;
+    // a layer that moved, changed, appeared or vanished marks the bands of its
+    // previous and current extent (prev so the vacated light is rebuilt away,
+    // cur so the new light lands on a rebuilt band and never re-accumulates).
+    // An occluder change marks the bands where it meets a layer. Every slice of
+    // a layer is row-gated by the same `dirty` set on both renderers, so no
+    // scissor-band fill is needed for it.
+    let fx_changed = fx_damage::mark_fx_changes(
+        dirty,
+        bands,
+        (&prev_input.fx_layers, &prev_input.fx_occluders),
+        (&input.fx_layers, &input.fx_occluders),
+    );
+
     // UNCONDITIONAL-OVERLAY scissor-band fill (runs LAST — it reads the band
     // the arms above produced). The GPU builds the cat/rain/free sprite
     // streams UNGATED by row (a free sprite has no row tag; a settled cat's
@@ -25108,20 +25439,8 @@ pub fn compute_dirty_rows(
         nova_changed,
         rain_changed,
         rain_add_changed,
+        fx_changed,
     })
-}
-
-/// Whether the fx layers leave the per-row diff sound: identity-equal layers,
-/// and equal occluders whenever either frame draws a layer (an occluder only
-/// subtracts from layers, so with none on either side it changes no pixel).
-///
-/// Until the fx damage arm marks a changed layer's bands (design §4.4, lane
-/// B2), any other change FAILS CLOSED to a full repaint: correct, never a
-/// stale gate hit, at the cost of the repaint the arm will save.
-fn fx_layers_settled(prev: &RenderInput, cur: &RenderInput) -> bool {
-    prev.fx_layers == cur.fx_layers
-        && ((prev.fx_layers.is_empty() && cur.fx_layers.is_empty())
-            || prev.fx_occluders == cur.fx_occluders)
 }
 
 /// THE full-frame gate-hit predicate: is `input` (to be drawn at `cur_blink_phase`
@@ -25155,7 +25474,7 @@ pub fn is_unchanged_frame(
     input: &RenderInput,
     cur_blink_phase: bool,
     cur_cursor_style_override: Option<CursorStyle>,
-    cell_h: usize,
+    bands: RowBands,
 ) -> bool {
     // Delegate to the ONE shared dirty-row computation so this predicate and the
     // CPU/GPU dirty sets cannot diverge: the frame is unchanged iff it is reusable
@@ -25179,7 +25498,7 @@ pub fn is_unchanged_frame(
             prev_cursor_style_override,
             cur_blink_phase,
             cur_cursor_style_override,
-            cell_h,
+            bands,
             dirty,
         ) {
             DirtyDecision::FullRepaint => false,
@@ -25493,6 +25812,20 @@ pub fn mark_cell_x(c: usize, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> 
 pub fn mark_cell_x_at(cell_left: i32, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> i32 {
     let xs = scale.xs.max(1) as i32;
     cell_left + (rcw as i32 - gw as i32 * xs) / 2 - xmin * xs
+}
+
+/// The sideways script offset after a mark has been centred in its cell.
+/// `cell_width` is the on-screen advance, already including a DEC run's scale.
+/// Sharing this rounded device-pixel shift keeps CPU and GPU placement identical;
+/// putting the nudge in the glyph bearing alone would be cancelled by centring.
+#[must_use]
+pub fn mark_script_shift(script: aterm_core::terminal::Script, cell_width: usize) -> i32 {
+    match script {
+        aterm_core::terminal::Script::Normal => 0,
+        aterm_core::terminal::Script::Sub { nudge } => (f32::from(nudge) * cell_width as f32
+            / f32::from(aterm_core::terminal::Script::NUDGES_PER_CELL))
+        .round() as i32,
+    }
 }
 
 /// Running vertical placement of ONE cell's combining marks, so a second mark on
@@ -26122,7 +26455,8 @@ fn apply_synthetic_style(
 
 /// sRGB EOTF — gamma-encoded channel (0..1) → linear-light (0..1), the PROPER
 /// piecewise curve (not a bare `pow(2.2)`, which is visibly wrong near black
-/// where terminal text edges live). Also the GPU video tap's decode.
+/// where terminal text edges live). An 8-bit channel reads it from
+/// [`srgb8_to_linear`]'s table.
 #[must_use]
 pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.040_45 {
@@ -26147,6 +26481,15 @@ pub fn linear_to_srgb(l: f32) -> f32 {
 /// instead of a per-channel `powf`.
 static SRGB_TO_LINEAR_LUT: std::sync::LazyLock<[f32; 256]> =
     std::sync::LazyLock::new(|| std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0)));
+
+/// [`srgb_to_linear`] of the 8-bit channel `channel`, read from a table of its
+/// 256 values: the same function on the same inputs, so every value is exact.
+/// The GPU video tap's decode.
+#[must_use]
+#[inline]
+pub fn srgb8_to_linear(channel: u8) -> f32 {
+    SRGB_TO_LINEAR_LUT[usize::from(channel)]
+}
 
 /// Linear-light (0..1) → 8-bit sRGB, precomputed over a fine grid so the hot
 /// blend path re-encodes with a table lookup instead of a `powf`. `LIN2SRGB_N`
@@ -27719,12 +28062,15 @@ impl BeamClip {
 /// in window px), so the `row` tags stay grid-row DAMAGE HINTS; above-grid
 /// bands are NOT rejected — they emit with row tag 0 (which opens the top band
 /// on both presenters). [`BeamClip::grid`] is byte-identical to the historical
-/// grid-space emitter (the identity law). A zero-area / fully-clipped /
-/// zero-colour rect is a no-op. Used by [`comet_beam`]; mirrors the host's
-/// other glow emitters.
+/// grid-space emitter (the identity law). A zero-area / fully-clipped rect is
+/// a no-op, and so is a zero-colour rect of additive light; zero-colour PAINT
+/// (`alpha > 0`) is black ink at that opacity and is kept. Used by
+/// [`comet_beam`] and [`comet_beam_over`]; mirrors the host's other glow
+/// emitters.
 ///
 /// `alpha` is [`GlowQuad::alpha`] verbatim — `0` for the additive light every
-/// caller but the ribbon BED emits, the source-over opacity for the bed. It is
+/// caller but the source-over beam ([`comet_beam_over`]) emits, that run's
+/// opacity for it. It is
 /// stamped on every band the split produces, because the split is a GEOMETRIC
 /// one: the bands are disjoint pixel rows of one rect, so they carry the one
 /// rect's opacity unchanged (a band is not a second layer over the first).
@@ -27739,7 +28085,9 @@ fn push_glow_rect(
     premul: u32,
     alpha: u8,
 ) {
-    if w <= 0 || h <= 0 || premul == 0 || clip.cell_h <= 0 {
+    // Additive black adds nothing, but source-over black darkens what it
+    // covers: only light skips a zero colour.
+    if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) || clip.cell_h <= 0 {
         return;
     }
     let x0 = x.max(clip.x0);
@@ -27779,7 +28127,10 @@ fn push_glow_rect(
 /// edge); the interior is solid. `horizontal == true` ⇒ the minor axis is X (used
 /// for steep/near-vertical segments); `false` ⇒ the minor axis is Y. `cov` is the
 /// centreline coverage; [`premul_rgb`] is the single rounding point so CPU/GPU
-/// stay byte-identical.
+/// stay byte-identical. `over` picks the blend: additive light (`alpha: 0`), or
+/// source-over paint whose opacity is the slab's own AA coverage (the colour
+/// premultiplied by that same coverage, so `src + dst·(1 − a)` is correct
+/// premultiplied over).
 #[allow(clippy::too_many_arguments)]
 fn emit_aa_slab(
     out: &mut Vec<GlowQuad>,
@@ -27791,6 +28142,7 @@ fn emit_aa_slab(
     len: i32,
     color: u32,
     cov: u8,
+    over: bool,
 ) {
     let lo = c - half;
     let hi = c + half;
@@ -27809,12 +28161,14 @@ fn emit_aa_slab(
             return;
         }
         let premul = premul_rgb(color, aa);
-        // The AA slab is the COMET/laser beam's rasterizer, which is additive
-        // light on every one of its callers — `alpha: 0`.
+        // Additive light (`alpha: 0`) for every dark-ground beam; the
+        // light-ground twin ([`comet_beam_over`]) paints with the slab's own
+        // coverage as its opacity.
+        let alpha = if over { aa } else { 0 };
         if horizontal {
-            push_glow_rect(out, clip, a, p, width, len, premul, 0);
+            push_glow_rect(out, clip, a, p, width, len, premul, alpha);
         } else {
-            push_glow_rect(out, clip, p, a, len, width, premul, 0);
+            push_glow_rect(out, clip, p, a, len, width, premul, alpha);
         }
     };
     if ih - il <= 1 {
@@ -27887,18 +28241,42 @@ fn rdp_simplify(verts: &[BeamVertex], tol: f32) -> Vec<BeamVertex> {
 /// RDP path simplification over a [`CometSample`] run, returning the KEPT sample
 /// indices (ascending). Bit-identical to [`rdp_simplify`] applied to any
 /// `BeamVertex` slice sharing this run's `(x, y)` — the algorithm reads only the
-/// geometry, which is layer-invariant. This lets [`layered_beam_quads`] simplify
-/// the path ONCE instead of re-running RDP (and its allocations) for every bloom
-/// layer of a beam.
+/// geometry, which is layer-invariant. The allocating twin of
+/// [`rdp_keep_indices_into`], kept for the equivalence test.
+#[cfg(test)]
 fn rdp_keep_indices(run: &[CometSample], tol: f32) -> Vec<usize> {
+    let (mut keep, mut stack, mut kept) = (Vec::new(), Vec::new(), Vec::new());
+    rdp_keep_indices_into(run, tol, &mut keep, &mut stack, &mut kept);
+    kept
+}
+
+/// RDP path simplification over a [`CometSample`] run into caller-owned
+/// buffers: `keep` and `stack` are work space, `kept` receives the KEPT sample
+/// indices (ascending). All three are cleared first, so a warm
+/// [`BeamScratch`] simplifies without allocating. Bit-identical to
+/// [`rdp_simplify`] on any `BeamVertex` slice sharing this run's `(x, y)` (the
+/// algorithm reads only the geometry, which is layer-invariant), which lets
+/// [`layered_beam_quads_with`] simplify the path ONCE instead of re-running RDP
+/// for every bloom layer of a beam.
+fn rdp_keep_indices_into(
+    run: &[CometSample],
+    tol: f32,
+    keep: &mut Vec<bool>,
+    stack: &mut Vec<(usize, usize)>,
+    kept: &mut Vec<usize>,
+) {
+    kept.clear();
     let n = run.len();
     if n < 3 {
-        return (0..n).collect();
+        kept.extend(0..n);
+        return;
     }
-    let mut keep = vec![false; n];
+    keep.clear();
+    keep.resize(n, false);
     keep[0] = true;
     keep[n - 1] = true;
-    let mut stack = vec![(0usize, n - 1)];
+    stack.clear();
+    stack.push((0usize, n - 1));
     while let Some((s, e)) = stack.pop() {
         if e <= s + 1 {
             continue;
@@ -27920,7 +28298,45 @@ fn rdp_keep_indices(run: &[CometSample], tol: f32) -> Vec<usize> {
             stack.push((idx, e));
         }
     }
-    (0..n).filter(|&i| keep[i]).collect()
+    kept.extend((0..n).filter(|&i| keep[i]));
+}
+
+/// The caller-owned working buffers of the layered beam rasterizer
+/// ([`layered_beam_quads_with`]): the per-sample style colours, the RDP work
+/// space and kept indices, and the per-layer vertex list. Every buffer is
+/// cleared in place, so a scratch held across frames (the cursor engine owns
+/// one) grows to the longest run once and then allocates nothing. The
+/// convenience wrappers ([`comet_glow_quads`] and its siblings) build a fresh
+/// one per call.
+#[derive(Debug, Default)]
+pub struct BeamScratch {
+    styles: Vec<u32>,
+    keep: Vec<bool>,
+    stack: Vec<(usize, usize)>,
+    kept: Vec<usize>,
+    verts: Vec<BeamVertex>,
+}
+
+impl BeamScratch {
+    /// Simplify `run` ONCE (RDP at `straighten` px; `0.0` or a run of fewer
+    /// than three samples keeps every sample) into the kept sample indices,
+    /// ascending. Feeding [`comet_beam`] the kept samples with
+    /// `straighten = 0.0` is bit-identical to handing it the whole run with
+    /// `straighten`, so a stack of layers over one path simplifies once.
+    fn simplify(&mut self, run: &[CometSample], straighten: f32) {
+        if straighten > 0.0 && run.len() > 2 {
+            rdp_keep_indices_into(
+                run,
+                straighten,
+                &mut self.keep,
+                &mut self.stack,
+                &mut self.kept,
+            );
+        } else {
+            self.kept.clear();
+            self.kept.extend(0..run.len());
+        }
+    }
 }
 
 /// Rasterize a thick ANTI-ALIASED additive POLYLINE — the cursor "comet" beam —
@@ -27947,6 +28363,41 @@ pub fn comet_beam(
     thickness: f32,
     step: usize,
     straighten: f32,
+) {
+    beam_polyline(out, clip, verts, thickness, step, straighten, false);
+}
+
+/// [`comet_beam`]'s SOURCE-OVER twin, for a light ground where additive light
+/// cannot show: the same geometry, slabs and anti-aliasing, but each quad is
+/// paint whose opacity ([`GlowQuad::alpha`]) is that pixel run's coverage, so
+/// a vertex `cov` reads as the stroke's opacity and `color` as its straight
+/// ink. Within a segment the slabs abut, and the same-axis join de-cover keeps
+/// a monotone chain from double-painting its shared pixel; a genuine turn's
+/// corner overlap darkens once more, as it brightens once more in the additive
+/// beam. Quads composite in emission order (source-over does not commute), the
+/// order both presenters keep.
+pub fn comet_beam_over(
+    out: &mut Vec<GlowQuad>,
+    clip: BeamClip,
+    verts: &[BeamVertex],
+    thickness: f32,
+    step: usize,
+    straighten: f32,
+) {
+    beam_polyline(out, clip, verts, thickness, step, straighten, true);
+}
+
+/// The one beam rasterizer behind [`comet_beam`] (additive) and
+/// [`comet_beam_over`] (source-over, `over`).
+#[allow(clippy::too_many_arguments)]
+fn beam_polyline(
+    out: &mut Vec<GlowQuad>,
+    clip: BeamClip,
+    verts: &[BeamVertex],
+    thickness: f32,
+    step: usize,
+    straighten: f32,
+    over: bool,
 ) {
     if verts.len() < 2 || thickness <= 0.0 || clip.cell_h <= 0 {
         return;
@@ -28016,9 +28467,31 @@ pub fn comet_beam(
             if cov > 0 {
                 let color = lerp_rgb_f(a.color, b.color, t);
                 if horizontal {
-                    emit_aa_slab(out, clip, true, a.x + t * dx, half, p, len, color, cov);
+                    emit_aa_slab(
+                        out,
+                        clip,
+                        true,
+                        a.x + t * dx,
+                        half,
+                        p,
+                        len,
+                        color,
+                        cov,
+                        over,
+                    );
                 } else {
-                    emit_aa_slab(out, clip, false, a.y + t * dy, half, p, len, color, cov);
+                    emit_aa_slab(
+                        out,
+                        clip,
+                        false,
+                        a.y + t * dy,
+                        half,
+                        p,
+                        len,
+                        color,
+                        cov,
+                        over,
+                    );
                 }
             }
             p += len;
@@ -28030,9 +28503,8 @@ impl Eq for AdmittedFontBlob {}
 
 // ---- THE RIBBON BEAM -------------------------------------------------------
 //
-// `comet_beam` generalized, for migration step 11 of
-// `docs/design/RAINBOW-TRAIL-ONE-STORY.md`. Three things it does that a comet
-// cannot, and each of them is a defect the design names:
+// `comet_beam` generalized for the rainbow ribbon. Three things it does that a
+// comet cannot, and each of them is a defect the design names:
 //
 //   * PER-VERTEX ASYMMETRIC HALF-WIDTHS. A comet is a tube: one thickness,
 //     centred. The ribbon reaches a whole glyph band ABOVE its spine and a fifth
@@ -28799,7 +29271,7 @@ const MIX_WHITE: u32 = 0x00FF_FFFF;
 /// mix ×pos, major stride)` — a broad dim aura under a crisp white-hot core.
 /// SINGLE SOURCE for the comet look, shared by the live animator and the
 /// render demos.
-const COMET_LAYERS: [(f32, f32, u32, f32, f32, usize); 4] = [
+pub const COMET_LAYERS: [(f32, f32, u32, f32, f32, usize); 4] = [
     (5.5, 0.16, MIX_WHITE, 0.0, 0.0, 3),   // broad aura (style hue)
     (3.0, 0.30, MIX_WHITE, 0.0, 0.0, 2),   // glow
     (1.8, 0.55, MIX_WHITE, 0.12, 0.0, 2),  // inner glow
@@ -28816,11 +29288,59 @@ const COMET_LAYERS: [(f32, f32, u32, f32, f32, usize); 4] = [
 /// smear (the lone-key case rendered outright white). No ×pos term — phaser
 /// samples carry a HUE OFFSET in `pos` (each cell keeps its laid colour; see
 /// `cursor_glow::emit_comet`), so a positional white ramp would key off hue.
-const PHASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
+pub const PHASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
     (1.0, 0.95, MIX_WHITE, 0.06, 0.0, 1), // the fat spectrum band, laid-hue per cell
     (1.45, 0.36, MIX_WHITE, 0.0, 0.0, 2), // soft edge glow — the neon falloff off the bar
     (2.0, 0.14, MIX_WHITE, 0.0, 0.0, 3),  // faint outer haze
 ];
+
+/// The SPARKLE ribbon layers (same tuple shape as [`COMET_LAYERS`]). Sparkle's
+/// core is a wide ribbon (`core_px` near half the cell height) for its
+/// celestial shapes to fall out of, so, like the phaser's fat bar, its halo
+/// stays TIGHT (≤2.0×: at a 0.45-cell core the haze ends 0.45 cell off the
+/// axis, inside the row) where the comet's 5.5× aura would box the rows above
+/// and below. Core-first, so a saturated quad budget sheds haze, never the
+/// ribbon. The white mix is LOW and FLAT (0.10, no ×pos term): a typing run
+/// lays every cell at `pos` 1.0, so a positional ramp would bleach the whole
+/// fresh ribbon, not just its head. A touch more edge glow than the phaser's,
+/// so the ribbon keeps its sparkle.
+pub const SPARKLE_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
+    (1.0, 1.00, MIX_WHITE, 0.10, 0.0, 1), // the ribbon, a whisper of white
+    (1.45, 0.40, MIX_WHITE, 0.0, 0.0, 2), // soft edge glow
+    (2.0, 0.16, MIX_WHITE, 0.0, 0.0, 3),  // faint outer haze
+];
+
+/// The light a bloom-layer stack lays ON ITS OWN AXIS per unit of sample
+/// coverage, per channel `[r, g, b]`: every layer of the stack overlaps on the
+/// axis, so a sample of coverage `cov` lifts its axis pixel by about
+/// `cov · lift[c]` levels of channel `c` (before `add_sat` clips). Each layer
+/// contributes `coverage× · colour / 255`, its colour being `style` mixed
+/// toward the layer's target exactly as [`layered_beam_quads_with`] mixes it at
+/// path position `pos`.
+///
+/// A caller holding an over-ink contrast budget solves it against this to
+/// get the sample's coverage ceiling: a stack that overlaps more, or mixes
+/// whiter, reaches the budget at a lower coverage, so one budget fits every
+/// stack.
+#[must_use]
+pub fn layer_stack_lift(
+    layers: &[(f32, f32, u32, f32, f32, usize)],
+    style: u32,
+    pos: f32,
+) -> [f32; 3] {
+    let mut lift = [0.0f32; 3];
+    for &(_, cmul, target, mbase, mpos, _) in layers {
+        let color = if mbase > 0.0 || mpos > 0.0 {
+            lerp_rgb_f(style, target, (mbase + mpos * pos).min(1.0))
+        } else {
+            style
+        };
+        for (c, sh) in lift.iter_mut().zip([16u32, 8, 0]) {
+            *c += cmul * ((color >> sh) & 0xff) as f32 / 255.0;
+        }
+    }
+    lift
+}
 
 /// The deep-space NEBULA haze wrapped around the photon beam's outer layers
 /// (`0x00RRGGBB`) — indigo-violet, the colour of space in every starship shot.
@@ -28836,12 +29356,23 @@ pub const BEAM_SPACE_HAZE: u32 = 0x005A_3BD6;
 /// as one solid cylinder; the sleeve stays modest (≤5.5× vs the laser's 16×);
 /// fine strides (≤2 px) keep diagonals smooth; core-first so a saturated quad
 /// budget sheds space haze, never the photon core.
-const BEAM_LAYERS: [(f32, f32, u32, f32, f32, usize); 5] = [
+pub const BEAM_LAYERS: [(f32, f32, u32, f32, f32, usize); 5] = [
     (0.55, 1.00, MIX_WHITE, 0.55, 0.30, 1), // photon axis (hotter toward the head)
     (1.0, 0.95, MIX_WHITE, 0.20, 0.08, 1),  // solid tube body
     (1.6, 0.58, BEAM_SPACE_HAZE, 0.18, 0.0, 1), // sheen sliding into the haze
     (3.0, 0.30, BEAM_SPACE_HAZE, 0.55, 0.0, 2), // nebula sleeve
     (5.5, 0.13, BEAM_SPACE_HAZE, 0.85, 0.0, 2), // deep-space wash
+];
+
+/// The LASER filament layers (same tuple shape as [`COMET_LAYERS`]): only the
+/// inner layers (thickness×core ≤ 2.9, about three quarters of a cell at the
+/// laser's fat conductor) at 1 px strides, a razor white-hot filament inside a
+/// tight same-hue body. The laser's wide aura is NOT a layer: the engine draws
+/// it as radial halos, which never posterize into per-row slabs.
+pub const LASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
+    (2.9, 0.60, MIX_WHITE, 0.0, 0.0, 1),   // inner glow (pure hue)
+    (1.5, 0.95, MIX_WHITE, 0.10, 0.0, 1),  // beam body
+    (0.6, 1.00, MIX_WHITE, 0.26, 0.42, 1), // white-hot filament, hotter to the head
 ];
 
 /// Emit the full LAYERED-BLOOM comet beam for one contiguous run of swept-cell
@@ -28903,13 +29434,16 @@ pub fn beam_glow_quads(
 }
 
 /// Shared body of [`comet_glow_quads`] / [`phaser_streak_quads`] /
-/// [`beam_glow_quads`]: rasterize one bloom-layer
-/// stack over a sample run via [`comet_beam`]. The tuple carries the mix
-/// TARGET per layer so the beam's two-tone stack (white core, [`BEAM_SPACE_HAZE`]
-/// sleeve) shares this body — and its hoisted per-sample style eval + the
-/// simplify-once RDP — with the single-tone siblings.
+/// [`beam_glow_quads`], without the per-call scratch
+/// they build: rasterize one bloom-layer stack over a sample run via
+/// [`comet_beam`], reusing `scratch` for every intermediate buffer (a warm
+/// scratch allocates nothing). The tuple carries the mix TARGET per layer so
+/// the beam's two-tone stack (white core, [`BEAM_SPACE_HAZE`] sleeve) shares
+/// this body — and its hoisted per-sample style eval + the simplify-once RDP —
+/// with the single-tone siblings. Fewer than two samples is a no-op.
 #[allow(clippy::too_many_arguments)]
-fn layered_beam_quads(
+pub fn layered_beam_quads_with(
+    scratch: &mut BeamScratch,
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
     run: &[CometSample],
@@ -28926,23 +29460,24 @@ fn layered_beam_quads(
     // laser, 5×/4×/3× for beam/comet/phaser. Evaluate it ONCE per sample up
     // front; the layer loop then only does the cheap per-layer mix lerp.
     // Bit-identical.
-    let mut styles: Vec<u32> = Vec::with_capacity(run.len());
-    styles.extend(run.iter().map(|s| color_at(s.pos)));
+    scratch.styles.clear();
+    scratch.styles.extend(run.iter().map(|s| color_at(s.pos)));
     // The RDP path simplification reads only the GEOMETRY, which is identical
     // across every bloom layer — but `comet_beam` re-ran it (and its 3 allocs)
     // for each layer. Simplify the path ONCE here into kept sample indices, then
     // feed each layer a pre-simplified vertex list (`straighten = 0.0` ⇒
     // `comet_beam` skips its own RDP). Bit-identical: `comet_beam`'s per-layer
     // `rdp_simplify(verts, straighten)` keeps exactly these indices.
-    let kept: Vec<usize> = if straighten > 0.0 && run.len() > 2 {
-        rdp_keep_indices(run, straighten)
-    } else {
-        (0..run.len()).collect()
-    };
-    let mut verts: Vec<BeamVertex> = Vec::with_capacity(kept.len());
+    scratch.simplify(run, straighten);
+    let BeamScratch {
+        styles,
+        kept,
+        verts,
+        ..
+    } = scratch;
     for &(tmul, cmul, target, mbase, mpos, lstep) in layers {
         verts.clear();
-        for &i in &kept {
+        for &i in kept.iter() {
             let s = &run[i];
             let style = styles[i];
             let color = if mbase > 0.0 || mpos > 0.0 {
@@ -28957,8 +29492,32 @@ fn layered_beam_quads(
                 cov: (s.cov as f32 * cmul) as u8,
             });
         }
-        comet_beam(out, clip, &verts, core_px * tmul, lstep, 0.0);
+        comet_beam(out, clip, verts, core_px * tmul, lstep, 0.0);
     }
+}
+
+/// [`layered_beam_quads_with`] on a per-call scratch: the body the
+/// convenience wrappers share (each call allocates its buffers; a per-frame
+/// caller holds a [`BeamScratch`] and calls the `_with` form instead).
+fn layered_beam_quads(
+    out: &mut Vec<GlowQuad>,
+    clip: BeamClip,
+    run: &[CometSample],
+    core_px: f32,
+    straighten: f32,
+    color_at: &dyn Fn(f32) -> u32,
+    layers: &[(f32, f32, u32, f32, f32, usize)],
+) {
+    layered_beam_quads_with(
+        &mut BeamScratch::default(),
+        out,
+        clip,
+        run,
+        core_px,
+        straighten,
+        color_at,
+        layers,
+    );
 }
 
 /// Blend `fg` over `bg` by coverage `t` (0..=255), per channel, in LINEAR LIGHT —
@@ -30686,9 +31245,16 @@ mod tests {
         }];
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(d) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(d) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("identical-geometry frames must take the row-damage path, not FullRepaint");
         };
 
@@ -30735,9 +31301,16 @@ mod tests {
         cur.cursor_trail_color = 0x0050_FA7B;
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(d) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(d) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("identical-geometry frames must take the row-damage path, not FullRepaint");
         };
         assert!(
@@ -30779,7 +31352,7 @@ mod tests {
             None,
             false,
             None,
-            16,
+            RowBands::new(0, 16),
             &mut dirty2,
         ) {
             assert!(
@@ -30813,9 +31386,16 @@ mod tests {
         assert!(cur.selection_contains_cell(2, 3, false, false));
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(d) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(d) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("a map-only change takes the row-damage path");
         };
         assert!(dirty[2], "the reordered row repaints");
@@ -30848,9 +31428,16 @@ mod tests {
         cur.selection_clip = Some(SelectionClip::new(1, 3, 4, 8));
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(decision) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(decision) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("a clip-only selection move must use row damage");
         };
         assert!(
@@ -30891,9 +31478,16 @@ mod tests {
         );
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(decision) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(decision) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("a clip-only wide-selection change must use row damage");
         };
         assert!(
@@ -30981,9 +31575,16 @@ mod tests {
         );
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(decision) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(decision) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("a selection-only change must stay on the row-damage path");
         };
         assert!(dirty[1], "the dragged row must repaint");
@@ -31035,9 +31636,16 @@ mod tests {
         );
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(decision) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(decision) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("a selection recolour must stay on the row-damage path");
         };
         assert!(
@@ -31056,7 +31664,7 @@ mod tests {
             None,
             false,
             None,
-            16,
+            RowBands::new(0, 16),
             &mut dirty,
         ) else {
             panic!("an unchanged frame must stay on the row-damage path");
@@ -31080,9 +31688,16 @@ mod tests {
         cur.selection_fg = 0x00aa_bbcc;
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(d) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(d) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("selection-colour changes must stay on the row-damage path");
         };
         assert!(
@@ -31105,7 +31720,7 @@ mod tests {
             None,
             false,
             None,
-            16,
+            RowBands::new(0, 16),
             &mut empty_dirty,
         ) else {
             panic!("an unused selection colour is not a full-repaint event");
@@ -31134,9 +31749,16 @@ mod tests {
         cur.line_size_spans[2].push(LineSizeSpan::new(0, 4, LineSize::DoubleWidth));
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(decision) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(decision) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("double-width remains row-local and must use row damage");
         };
         assert!(decision.any_dirty);
@@ -31144,7 +31766,16 @@ mod tests {
 
         cur.line_size_spans[2][0].line_size = LineSize::DoubleHeightTop;
         assert_eq!(
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty),
+            compute_dirty_rows(
+                &prev,
+                &cur,
+                false,
+                None,
+                false,
+                None,
+                RowBands::new(0, 16),
+                &mut dirty
+            ),
             DirtyDecision::FullRepaint,
             "a pane-local DECDHL segment has the same cross-row hazard as a full row"
         );
@@ -31155,9 +31786,16 @@ mod tests {
         bg_prev.default_bg_spans[2].push(DefaultBgSpan::new(0, 4, 0x0011_2233));
         let mut bg_cur = bg_prev.clone();
         bg_cur.default_bg_spans[2][0].default_bg = 0x0044_5566;
-        let DirtyDecision::Rows(decision) =
-            compute_dirty_rows(&bg_prev, &bg_cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(decision) = compute_dirty_rows(
+            &bg_prev,
+            &bg_cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("pane-local default changes do not recolor the window padding");
         };
         assert!(decision.any_dirty);
@@ -31192,9 +31830,16 @@ mod tests {
             let mut cur = prev.clone();
             restyle(&mut cur);
             let mut dirty = Vec::new();
-            let DirtyDecision::Rows(d) =
-                compute_dirty_rows(&prev, &cur, true, None, true, None, 16, &mut dirty)
-            else {
+            let DirtyDecision::Rows(d) = compute_dirty_rows(
+                &prev,
+                &cur,
+                true,
+                None,
+                true,
+                None,
+                RowBands::new(0, 16),
+                &mut dirty,
+            ) else {
                 panic!("{name}: identical geometry must take the row-damage path");
             };
             assert!(d.cursor_changed, "{name}: the drawn cursor changed");
@@ -31221,9 +31866,16 @@ mod tests {
         cur.selection = wider;
 
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(_) =
-            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(_) = compute_dirty_rows(
+            &prev,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("block column growth must stay on the row-damage path");
         };
         assert!(
@@ -31406,7 +32058,7 @@ mod tests {
         let mut cur = template.clone();
         fill(&mut cur, &mk(payload.clone()));
         assert!(
-            is_unchanged_frame(&prev, false, None, &cur, false, None, 16),
+            is_unchanged_frame(&prev, false, None, &cur, false, None, RowBands::new(0, 16)),
             "a byte-identical re-transmit must still gate-hit"
         );
         // Same shape, one payload byte flipped: the covered rows must dirty.
@@ -31415,13 +32067,28 @@ mod tests {
         let mut changed = template.clone();
         fill(&mut changed, &mk(flipped));
         assert!(
-            !is_unchanged_frame(&prev, false, None, &changed, false, None, 16),
+            !is_unchanged_frame(
+                &prev,
+                false,
+                None,
+                &changed,
+                false,
+                None,
+                RowBands::new(0, 16)
+            ),
             "a genuine payload change must still repaint"
         );
         let mut dirty = Vec::new();
-        let DirtyDecision::Rows(d) =
-            compute_dirty_rows(&prev, &changed, false, None, false, None, 16, &mut dirty)
-        else {
+        let DirtyDecision::Rows(d) = compute_dirty_rows(
+            &prev,
+            &changed,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        ) else {
             panic!("an image payload change stays on the row-damage path");
         };
         assert!(d.any_dirty, "changed payload must mark rows dirty");
@@ -31539,7 +32206,16 @@ mod tests {
         let mut dirty = Vec::new();
         assert!(
             matches!(
-                compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty),
+                compute_dirty_rows(
+                    &prev,
+                    &cur,
+                    false,
+                    None,
+                    false,
+                    None,
+                    RowBands::new(0, 16),
+                    &mut dirty
+                ),
                 DirtyDecision::FullRepaint
             ),
             "attaching a wallpaper must force the full path"
@@ -31548,7 +32224,16 @@ mod tests {
         prev2.wallpaper = Some(std::sync::Arc::clone(&wallpaper));
         assert!(
             matches!(
-                compute_dirty_rows(&prev2, &cur, false, None, false, None, 16, &mut dirty),
+                compute_dirty_rows(
+                    &prev2,
+                    &cur,
+                    false,
+                    None,
+                    false,
+                    None,
+                    RowBands::new(0, 16),
+                    &mut dirty
+                ),
                 DirtyDecision::Rows(_)
             ),
             "the SAME published Arc must stay on the row-damage path"
@@ -31568,7 +32253,16 @@ mod tests {
         let mut dirty = Vec::new();
         assert!(
             matches!(
-                compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty),
+                compute_dirty_rows(
+                    &prev,
+                    &cur,
+                    false,
+                    None,
+                    false,
+                    None,
+                    RowBands::new(0, 16),
+                    &mut dirty
+                ),
                 DirtyDecision::FullRepaint
             ),
             "a default-bg change must take the full-repaint path so the padding re-clears"
@@ -31607,7 +32301,16 @@ mod tests {
         let mut cached = RenderInput::empty();
         cached.clone_damage_cache_from(&prev);
         let mut dirty = Vec::new();
-        let rescued = scroll_blit_plan(&cached, &cur, false, None, false, None, 16, &mut dirty);
+        let rescued = scroll_blit_plan(
+            &cached,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut dirty,
+        );
         assert!(
             rescued.is_some(),
             "a rigid scroll of two pure-grid frames must be rescued, or this \
@@ -31640,7 +32343,16 @@ mod tests {
             "the metadata is what remembers"
         );
         assert_eq!(
-            scroll_blit_plan(&cached, &cur, false, None, false, None, 16, &mut dirty),
+            scroll_blit_plan(
+                &cached,
+                &cur,
+                false,
+                None,
+                false,
+                None,
+                RowBands::new(0, 16),
+                &mut dirty
+            ),
             None,
             "a previous frame with a glow must not be blitted rigidly"
         );
@@ -42463,7 +43175,8 @@ mod ribbon_beam_tests {
 #[cfg(test)]
 mod comet_beam_tests {
     use super::{
-        BeamClip, BeamVertex, CometSample, GlowQuad, comet_beam, rdp_keep_indices, rdp_simplify,
+        BeamClip, BeamVertex, CometSample, GlowQuad, comet_beam, comet_beam_over, premul_rgb,
+        rdp_keep_indices, rdp_simplify,
     };
 
     fn v(x: f32, y: f32, cov: u8) -> BeamVertex {
@@ -42473,6 +43186,49 @@ mod comet_beam_tests {
             color: 0x0050_FA7B,
             cov,
         }
+    }
+
+    /// The source-over twin draws the additive beam's exact geometry, and every
+    /// quad is paint: opacity is that run's coverage and the colour is the ink
+    /// premultiplied by it. So the two can differ only in blend, never in
+    /// shape, and a light ground's stroke reads at the opacity its vertices ask.
+    #[test]
+    fn comet_beam_over_is_the_additive_beam_painted_source_over() {
+        let clip = BeamClip::grid(320, 96, 16);
+        let path = [v(4.0, 8.0, 40), v(90.0, 37.0, 200), v(140.0, 70.0, 120)];
+        for (thick, step, tol) in [(1.0, 1, 0.0), (5.5, 1, 0.0), (9.0, 2, 3.0)] {
+            let (mut add, mut over) = (Vec::new(), Vec::new());
+            comet_beam(&mut add, clip, &path, thick, step, tol);
+            comet_beam_over(&mut over, clip, &path, thick, step, tol);
+            assert!(!over.is_empty(), "the fixture paints");
+            assert_eq!(add.len(), over.len(), "one quad per additive quad");
+            for (a, o) in add.iter().zip(&over) {
+                assert_eq!(
+                    (a.row, a.x, a.y, a.w, a.h, a.color),
+                    (o.row, o.x, o.y, o.w, o.h, o.color),
+                    "same rect, same premultiplied colour"
+                );
+                assert_eq!(a.alpha, 0, "the additive beam stays light");
+                assert!(o.alpha > 0 && o.alpha2 == o.alpha, "paint, flat: {o:?}");
+                // Every vertex shares one colour, so that is every quad's ink.
+                assert_eq!(
+                    o.color,
+                    premul_rgb(path[0].color, o.alpha),
+                    "the colour is the ink premultiplied by the opacity: {o:?}"
+                );
+            }
+        }
+        // Black ink is paint too: additive black adds nothing and is skipped,
+        // but source-over black darkens what it covers at its opacity.
+        let black = path.map(|p| BeamVertex { color: 0, ..p });
+        let (mut add, mut over) = (Vec::new(), Vec::new());
+        comet_beam(&mut add, clip, &black, 5.5, 1, 0.0);
+        comet_beam_over(&mut over, clip, &black, 5.5, 1, 0.0);
+        assert!(add.is_empty(), "additive black lays no light");
+        assert!(
+            !over.is_empty() && over.iter().all(|o| o.color == 0 && o.alpha > 0),
+            "black ink paints source-over"
+        );
     }
 
     /// EQUIVALENCE (the layered_beam_quads pre-simplify safety net):

@@ -132,14 +132,9 @@ impl App {
             if aterm_types::scheme::builtin_theme(id).is_some() {
                 continue;
             }
-            let label = if meta.display_name == id {
-                id.to_string()
-            } else {
-                format!("{}  \u{b7}  {id}", meta.display_name)
-            };
             themes.push(PaletteTheme {
                 id: id.to_string(),
-                label,
+                label: crate::app_config::theme_file_label(id, meta),
                 appearance: meta.appearance,
                 current: id.eq_ignore_ascii_case(current),
             });
@@ -523,6 +518,7 @@ impl App {
             front_person_hold,
             front_remote_hold,
             needs_in_windows: self.presence_rim_on(),
+            stats_bars: Some(self.stats_bars_form()),
             agents: self.agents_live(),
             staged,
             staged_trouble,
@@ -583,6 +579,8 @@ impl App {
             kitty_favourited: self.kitty_log.is_favourite(promotable),
             front_tab_split: self.front_tab_split(),
         });
+        // View ▸ Stats Bars' radio: the applied form, whatever applied it.
+        crate::menu::set_stats_bars_form(self.stats_bars_form());
     }
 
     /// Re-resolve every OPEN palette against the live predicates and repaint — called on

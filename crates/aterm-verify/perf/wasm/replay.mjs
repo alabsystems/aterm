@@ -560,6 +560,72 @@ step('predict_overlay after', () => t.predict_overlay())
 step('predict_line_submit', () => t.predict_line_submit())
 step('predict_reset', () => t.predict_reset())
 frame('predicted', t)
+// Predictive editing, on a terminal of its own so no later answer of `t`
+// moves: a line whose glyphs echoed, `←` armed as an edit (no cell, its
+// cursor handed over) and retired by its echo, `→` back, and a Backspace at
+// the end of the line armed as an erase (its vacated cell a blank ghost).
+{
+  let e
+  step('new_registered edit', () => {
+    e = mod.AtermTerminal.new_registered(4, 20, 0, 13.5, ...THEME)
+    return e
+  })
+  step('edit set_predictive_echo', () => e.set_predictive_echo('always'))
+  step('edit prompt', () => e.process_str('$ '))
+  for (const ch of 'ab') {
+    step(`edit predict_char ${ch}`, () => e.predict_char(ch))
+    step(`edit echo ${ch}`, () => e.process_str(ch))
+    step(`edit predict_reconcile ${ch}`, () => e.predict_reconcile())
+  }
+  step('predict_edit_key unknown', () => e.predict_edit_key(0))
+  step('predict_edit_key left', () => e.predict_edit_key(1))
+  step('predict_overlay left', () => e.predict_overlay())
+  step('predict_overlay_cursor left', () => e.predict_overlay_cursor())
+  step('edit echo left', () => e.process_str('\b'))
+  step('edit predict_reconcile left', () => e.predict_reconcile())
+  step('predict_overlay retired', () => e.predict_overlay())
+  step('predict_overlay_cursor retired', () => e.predict_overlay_cursor())
+  step('predict_edit_key right', () => e.predict_edit_key(2))
+  step('edit echo right', () => e.process_str('\x1b[C'))
+  step('edit predict_reconcile right', () => e.predict_reconcile())
+  step('predict_edit_key backspace', () => e.predict_edit_key(3))
+  step('predict_overlay erase', () => e.predict_overlay())
+  step('predict_overlay_cursor erase', () => e.predict_overlay_cursor())
+  step('predict_backspace after an erase', () => e.predict_backspace())
+  step('edit predict_next_deadline_ms', () => e.predict_next_deadline_ms())
+  step('free edit', () => e.free())
+}
+
+// A SHIFT, on a terminal of its own: a line whose glyphs echoed, `←` twice,
+// each echoed, and a glyph typed inside the line: the overlay is the typed
+// glyph and the text it moved, each a triple, with the state's cursor; the echo
+// that writes the glyph, the shifted tail and steps back retires it.
+{
+  let s
+  step('new_registered shift', () => {
+    s = mod.AtermTerminal.new_registered(4, 20, 0, 13.5, ...THEME)
+    return s
+  })
+  step('shift set_predictive_echo', () => s.set_predictive_echo('always'))
+  step('shift prompt', () => s.process_str('$ '))
+  for (const ch of 'abc') {
+    step(`shift predict_char ${ch}`, () => s.predict_char(ch))
+    step(`shift echo ${ch}`, () => s.process_str(ch))
+    step(`shift predict_reconcile ${ch}`, () => s.predict_reconcile())
+  }
+  for (const n of [1, 2]) {
+    step(`shift predict_edit_key left ${n}`, () => s.predict_edit_key(1))
+    step(`shift echo left ${n}`, () => s.process_str('\b'))
+    step(`shift predict_reconcile left ${n}`, () => s.predict_reconcile())
+  }
+  step('shift predict_char x', () => s.predict_char('x'))
+  step('predict_overlay shift', () => s.predict_overlay())
+  step('predict_overlay_cursor shift', () => s.predict_overlay_cursor())
+  step('shift echo x', () => s.process_str('xbc\b\b'))
+  step('shift predict_reconcile x', () => s.predict_reconcile())
+  step('predict_overlay shift retired', () => s.predict_overlay())
+  step('free shift', () => s.free())
+}
 
 // look and chrome
 step('set_chrome', () => t.set_chrome(6, 18))
@@ -617,27 +683,31 @@ state('end', t)
 step('free', () => t.free())
 
 // --- check or record -------------------------------------------------------
+// The verdict is the exit code the process ends with by itself (`exitCode`),
+// never `process.exit()`: under node 26.3.0, `process.exit()` after this replay
+// hung 13 times in 60 runs against a planted answer (idle, its last line
+// written) and a natural exit 0 times in the 60 runs interleaved with them.
 if (mode === 'record') {
   // One answer per line, so a re-record reads as a diff of the calls it moved.
   writeFileSync(answersPath, `{"answers": [\n${answers.map((a) => JSON.stringify(a)).join(',\n')}\n]}\n`)
   console.error(`wasm-replay: recorded ${answers.length} answers (${flavor})`)
-  process.exit(0)
-}
-const want = JSON.parse(readFileSync(answersPath, 'utf8')).answers
-let failures = 0
-const n = Math.max(want.length, answers.length)
-for (let i = 0; i < n; i++) {
-  const got = JSON.stringify(answers[i])
-  const exp = JSON.stringify(want[i])
-  if (got !== exp) {
-    failures++
-    if (failures <= 10) {
-      console.error(`wasm-replay: FAIL ${flavor} #${i}: got ${got?.slice(0, 400)}`)
-      console.error(`wasm-replay:      want ${exp?.slice(0, 400)}`)
+} else {
+  const want = JSON.parse(readFileSync(answersPath, 'utf8')).answers
+  let failures = 0
+  const n = Math.max(want.length, answers.length)
+  for (let i = 0; i < n; i++) {
+    const got = JSON.stringify(answers[i])
+    const exp = JSON.stringify(want[i])
+    if (got !== exp) {
+      failures++
+      if (failures <= 10) {
+        console.error(`wasm-replay: FAIL ${flavor} #${i}: got ${got?.slice(0, 400)}`)
+        console.error(`wasm-replay:      want ${exp?.slice(0, 400)}`)
+      }
     }
   }
+  console.error(
+    `wasm-replay: ${flavor}: ${answers.length} answers, ${failures === 0 ? 'all as recorded' : `${failures} differ`}`
+  )
+  process.exitCode = failures === 0 ? 0 : 1
 }
-console.error(
-  `wasm-replay: ${flavor}: ${answers.length} answers, ${failures === 0 ? 'all as recorded' : `${failures} differ`}`
-)
-process.exit(failures === 0 ? 0 : 1)

@@ -632,6 +632,44 @@ pub(crate) fn steps_bare(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Steps<false>>(line).map(|v| v.0)
 }
 
+/// EVERY METADATA READ THE HARNESS MAKES OF ONE CLAUDE CODE TRANSCRIPT ROW:
+/// the row as each reader's shape above keeps it, in a fixed order (`None`
+/// where the line is no row that shape reads). Every reader here decides
+/// what it decides of a row from one of these (module docs: a row is never
+/// read whole), so two rows whose reads are equal read alike to each of
+/// them. What a reduction of a transcript is held to (`aterm-lab reduce`,
+/// session log ruling U7): a closed word one of these keeps is a word a
+/// committed reader reads, and is kept; a word none keeps is read by
+/// nothing here.
+#[must_use]
+pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
+    [
+        usage,
+        metadata,
+        command,
+        conversation,
+        excerpt,
+        exchange,
+        calls,
+        steps,
+        steps_bare,
+    ]
+    .iter()
+    .map(|read| read(line).ok())
+    .collect()
+}
+
+/// [`claude_reads`] for a Codex rollout's line: the spend fold's, the
+/// limits reader's (its first line and its `token_count`s) and the step
+/// fold's shapes.
+#[must_use]
+pub fn codex_reads(line: &str) -> Vec<Option<Value>> {
+    [codex_spend, codex_meta, codex_limits, codex_steps]
+        .iter()
+        .map(|read| read(line).ok())
+        .collect()
+}
+
 impl<'de> DeserializeSeed<'de> for Shape {
     type Value = Value;
 

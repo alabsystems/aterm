@@ -396,6 +396,57 @@ fn restore_leaf_reseeds_user_metadata_onto_the_respawned_session() {
     }
 }
 
+/// A RESTORED WORKER WITH NO WORD STAYS LAND (FOREVER LAND §1.4): an
+/// older build's worker, its task record carried, comes back with an
+/// identity that names no Autopilot word — the reseed of a respawned
+/// session and the graft onto a live one each store that none, and each is
+/// followed by the worker's keep, so it reads Land, never the table's
+/// default. NEGATIVE CONTROLS: a carried word (Cruise) stands, and a
+/// session with no task record keeps the none.
+#[test]
+fn a_restored_worker_with_no_word_stays_land() {
+    use aterm_agent::supervise::Autopilot;
+    let row = "rev=3 state=working from=s-0123456789abcdef0123 since=1789000000000 \
+               result_bytes=0 attention=0";
+    let word = |ctx: &crate::SessionCtx| ctx.meta.lock().unwrap().autopilot_word();
+    let titled = restore::TerminalLeafRestore {
+        local_id: Some(0),
+        user_title: Some("worker".to_string()),
+        ..bare_leaf()
+    };
+    // The reseed of a respawned session.
+    let session = crate::stub_session(9);
+    crate::task_record::seed_carried(&session.ctx, Some(row));
+    App::seed_restored_user_meta(&session, &titled);
+    assert_eq!(word(&session.ctx), Some(Autopilot::Land), "reseeded");
+    let cruise = restore::TerminalLeafRestore {
+        autopilot: Some("cruise".to_string()),
+        ..titled.clone()
+    };
+    App::seed_restored_user_meta(&session, &cruise);
+    assert_eq!(
+        word(&session.ctx),
+        Some(Autopilot::Cruise),
+        "NEGATIVE CONTROL: a carried word stands"
+    );
+    let plain = crate::stub_session(8);
+    App::seed_restored_user_meta(&plain, &titled);
+    assert_eq!(word(&plain.ctx), None, "NEGATIVE CONTROL: no task record");
+    // The graft onto a live session.
+    let mut app = App::headless_for_test();
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    crate::task_record::seed_carried(&ctx, Some(row));
+    assert_eq!(word(&ctx), Some(Autopilot::Land));
+    app.graft_restored_user_meta(0, &titled);
+    assert_eq!(word(&ctx), Some(Autopilot::Land), "grafted");
+    app.graft_restored_user_meta(0, &cruise);
+    assert_eq!(
+        word(&ctx),
+        Some(Autopilot::Cruise),
+        "NEGATIVE CONTROL: a carried word stands"
+    );
+}
+
 #[test]
 fn restored_and_legacy_raw_metadata_is_sanitized_before_chrome() {
     let family = "👨‍👩‍👧‍👦";
@@ -1148,6 +1199,56 @@ fn manual_settings_restore_is_the_manual_page_with_or_without_singleton() {
     }
 }
 
+/// A RESTORED SETTINGS ▸ HARNESS READS AS AN OPENED ONE (the post-landing
+/// check's behaviour-2, and its review): a cold restore that brings back a
+/// Settings tab on Harness asks for one off-loop reading of the ledgers and
+/// the other processes' A/B books, as the page's arrival does, so its Ends
+/// row shows the earlier process's done without a Refresh; a page on any
+/// other route reads nothing (Tab Control's fleet sweep reads at its first
+/// wake). An update's successor reads nothing before its Commit (which
+/// drops the reading's wake) and once at it, letting go of a reading begun
+/// before it. NEGATIVE CONTROLS: staging alone (main's) asks for none, and
+/// the Harness case fails; no reading at the Commit leaves the successor's
+/// page unread and a reading begun before the Commit holding off every
+/// later one. The overlap handoff, and so its Commit, is unix-only.
+#[cfg(unix)]
+#[test]
+fn a_restored_harness_page_reads_the_ledgers_once() {
+    let wid = WindowId(0);
+    // The route, whether an update's successor before its Commit, the
+    // readings asked at the restore, and in all (its Commit's too).
+    for (path, pending, asked, in_all) in [
+        ("/harness", false, 1, 1),
+        ("/monitor", false, 0, 0),
+        ("/about", false, 0, 0),
+        ("/harness", true, 0, 1),
+        ("/about", true, 0, 0),
+    ] {
+        let context = format!("{path} (an update's successor before Commit: {pending})");
+        let mut app = App::headless_for_test();
+        app.incoming_handoff_pending = pending;
+        let descriptor = restore::NativeLeafRestore::settings(path.to_string());
+        let (view, _, _) = app.restore_native_leaf(wid, &descriptor).unwrap();
+        assert_eq!(app.harness_screen.readings_asked, asked, "{context}");
+        if pending {
+            // A reading begun before the Commit, its wake dropped.
+            app.harness_screen.stats.collecting = true;
+            // `Wake::ActivateCommittedHandoff`'s first steps.
+            app.incoming_handoff_pending = false;
+            app.settle_harness_reading_at_commit();
+            assert!(
+                !app.harness_screen.stats.collecting,
+                "{context}: the reading begun before the Commit let go"
+            );
+        }
+        assert_eq!(
+            app.harness_screen.readings_asked, in_all,
+            "{context}: and at the Commit"
+        );
+        app.remove_view_link(view);
+    }
+}
+
 #[test]
 fn recursive_editor_restore_clamps_utf8_view_offsets() {
     let dir = std::env::temp_dir().join(format!(
@@ -1293,6 +1394,7 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
     restore::TerminalLeafRestore {
         sid: None,
         lineage: None,
+        log_ep: None,
         cwd: None,
         title: String::new(),
         profile: None,
@@ -1305,6 +1407,7 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         questions: None,
         autopilot: None,
         land_at: None,
+        autopilot_by: None,
         identity: None,
         theme: None,
         agent: None,
@@ -1452,7 +1555,9 @@ fn a_handoff_keeps_user_metadata_on_every_adopted_window_bootstrap() {
     // And the successor now carries exactly the layout the parent's Commit
     // compared — USER metadata included, which `commit_layout_topology`
     // deliberately keeps in that comparison. (A real adoption keeps the
-    // shell's sid; the stub one mints its own, so the sids are set apart.)
+    // shell's sid; the stub one mints its own, so the sids are set apart, and
+    // the successor's log takes an epoch of its own, `log_ep`, as every
+    // adoption does.)
     assert_eq!(
         sids_cleared(new.capture_restore_manifest()),
         sids_cleared(captured)
@@ -1467,7 +1572,10 @@ fn sids_cleared(mut manifest: restore::RestoreManifest) -> restore::RestoreManif
         match tree {
             restore::RestoredSplitTree::Leaf {
                 view: restore::RestoredView::Terminal(leaf),
-            } => leaf.sid = None,
+            } => {
+                leaf.sid = None;
+                leaf.log_ep = None;
+            }
             restore::RestoredSplitTree::Leaf { .. } => {}
             restore::RestoredSplitTree::Split { first, second, .. } => {
                 clear(first);
@@ -4365,6 +4473,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         log: Default::default(),
         journal_key: None,
         task: None,
+        autopilot_end: None,
     }
 }
 
@@ -5874,7 +5983,6 @@ fn await_log_on_a_restored_held_pane_answers_exited_at_once() {
                 session,
                 &held.ctx,
                 &format!("log {what} timeout=0"),
-                &new.subscribers,
             ),
             "ERR exited\n",
             "{what}: no close is coming"
@@ -6203,7 +6311,7 @@ fn a_graft_announces_every_field_it_moves_to_an_events_watcher() {
     let ctx = app.pool.get(0).expect("the bootstrap").ctx.clone();
     // Where a `subscribe … events` digest seeds its watermark.
     let watermark = ctx.timeline.lock().unwrap().high_id();
-    let watch = crate::subscribe::SubscriberSet::register(&app.subscribers, &[0]);
+    let watch = crate::session_watch::Subscription::single(&ctx.watchers);
     while watch.wait(std::time::Duration::ZERO) {}
 
     let mut leaf = bare_leaf();
@@ -6217,7 +6325,7 @@ fn a_graft_announces_every_field_it_moves_to_an_events_watcher() {
         .unwrap()
         .since(watermark)
         .filter(|event| event.kind == "meta-change")
-        .map(|event| event.payload.clone())
+        .map(|event| event.payload.to_string())
         .collect();
     assert_eq!(
         pushed,
@@ -6460,6 +6568,268 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
     crate::autopilot_timers::set_fake_clocks(None);
 }
 
+/// WHO SET IT RIDES EVERY RESTORE PATH (`docs/DESIGN-harness-autopilot-
+/// 2026-10-15.md` §11.7.3, item 5; §11.7.5, "The restore"): the capture
+/// writes the setter beside the word (`autopilot_by = "human:chip <ms>"`),
+/// it crosses the manifest's TOML, and the cold restore, a closed tab
+/// reopened and the live graft each store it beside the word with no
+/// revision step — so `meta` reads the old process's writer and its time,
+/// and the new process's first wake records nothing for a write it did not
+/// see. A leaf from before slice 7 (no field) reads `restored`. A driver's
+/// write on the new process wins for the word and its setter. NEGATIVE
+/// CONTROL: the carried setter stored over a driver's write fails the last
+/// assertion.
+#[cfg(unix)]
+#[test]
+fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
+    use crate::session_timeline::{MetaEdit, MetaField};
+    let wall = 1_792_177_200_000_i64;
+    crate::autopilot_timers::set_fake_clocks(Some((std::time::Instant::now(), wall)));
+    let by = |app: &App, session: u64| {
+        registry_meta(app, session)
+            .autopilot_set_by
+            .map(|set_by| set_by.carried())
+    };
+    let since = wall - 3_600_000;
+    let carried = format!("ctl {since}");
+    let set = |by: Option<&str>| restore::TerminalLeafRestore {
+        autopilot: Some("off".to_string()),
+        autopilot_by: by.map(str::to_owned),
+        local_id: Some(1),
+        ..bare_leaf()
+    };
+
+    // THE CAPTURE: the chip's write, carried through the manifest's TOML —
+    // the seamless update's capture, which is unix's alone.
+    #[cfg(unix)]
+    {
+        let mut parent = App::headless_for_test();
+        assert!(parent.set_session_autopilot(
+            0,
+            Some(aterm_agent::supervise::Autopilot::Off),
+            crate::autopilot::Surface::Chip
+        ));
+        let (layout, _) = handoff_layout_placed(&parent);
+        let leaf = match &layout.windows[0].restored_tabs[0].root {
+            restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } => leaf.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(leaf.autopilot.as_deref(), Some("off"));
+        assert_eq!(
+            leaf.autopilot_by.as_deref(),
+            Some(format!("human:chip {wall}").as_str())
+        );
+    }
+
+    // A COLD RESTORE: the second tab's own shell, seeded before it is
+    // registered.
+    let (mut app, host) = hosted_app();
+    let mut layout = single_leaf_window(bare_leaf());
+    layout.restored_tabs.push(restore::RestoredTab {
+        root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(set(Some(
+            &carried,
+        )))),
+        focused_path: Vec::new(),
+        zoomed: false,
+    });
+    app.restore_into_window(WindowId(0), layout);
+    let session = app
+        .pool
+        .iter()
+        .find_map(|s| (s.id != 0).then_some(s.id))
+        .expect("the second tab's shell");
+    assert_eq!(by(&app, session).as_deref(), Some(carried.as_str()));
+    assert_eq!(registry_meta(&app, session).autopilot_revision, 0);
+    let sid = app
+        .pool
+        .get(session)
+        .unwrap()
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    let recorded = |app: &App| {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key.as_deref() == Some(format!("harness.autopilot.{sid}").as_str()))
+            .count()
+    };
+    app.on_meta_changed(session);
+    assert_eq!(
+        recorded(&app),
+        0,
+        "the old process's write, not recorded here"
+    );
+    host.shutdown_and_join();
+
+    // A CLOSED TAB REOPENED, and a leaf from before slice 7.
+    for (leaf_by, want, word) in [
+        (Some(carried.as_str()), Some(carried.as_str()), "ctl"),
+        (None, None, "restored"),
+    ] {
+        let (mut app, host) = hosted_app();
+        let record = restore::RestoredTab {
+            root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(set(leaf_by))),
+            focused_path: Vec::new(),
+            zoomed: false,
+        };
+        app.restore_closed_tab_into_window(WindowId(0), &record, 1)
+            .expect("reopened");
+        let session = app
+            .pool
+            .iter()
+            .find_map(|s| (s.id != 0).then_some(s.id))
+            .expect("the reopened shell");
+        assert_eq!(by(&app, session).as_deref(), want);
+        assert_eq!(
+            crate::control::autopilot_by_fields(&registry_meta(&app, session)).0,
+            word
+        );
+        host.shutdown_and_join();
+    }
+
+    // THE LIVE GRAFT onto an adopted shell …
+    let (mut app, host) = hosted_app();
+    app.handoff_successor = true;
+    adopt_as(&mut app, 0, 0);
+    let mut graft = set(Some(&carried));
+    graft.local_id = Some(0);
+    app.restore_into_window(WindowId(0), single_leaf_window(graft.clone()));
+    assert_eq!(by(&app, 0).as_deref(), Some(carried.as_str()));
+    assert_eq!(registry_meta(&app, 0).autopilot_revision, 0);
+    host.shutdown_and_join();
+    // … unless a driver wrote the word here first: its setter stands.
+    let (mut app, host) = hosted_app();
+    app.handoff_successor = true;
+    adopt_as(&mut app, 0, 0);
+    crate::autopilot_timers::set_fake_clocks(Some((std::time::Instant::now(), wall + 1_000)));
+    driver_meta(&app, 0, MetaField::Autopilot, MetaEdit::Set("land"));
+    app.restore_into_window(WindowId(0), single_leaf_window(graft));
+    let meta = registry_meta(&app, 0);
+    assert_eq!(meta.autopilot.as_deref(), Some("land"), "the driver's word");
+    assert_eq!(
+        meta.autopilot_set_by.map(|set_by| set_by.carried()),
+        Some(format!("ctl {}", wall + 1_000)),
+        "and the driver's setter, not the carried one"
+    );
+    host.shutdown_and_join();
+    crate::autopilot_timers::set_fake_clocks(None);
+}
+
+/// A SETTER GOES ONLY WITH A WORD STORED (§11.7.3, item 5; the review of
+/// slice 7): a leaf whose word this build cannot read (`fly`) carries a
+/// setter that parses, and neither the cold restore's seed nor the live
+/// graft stores it — the word is dropped, so `meta` reads `-` and `-`, never
+/// a setter beside no word. A readable word beside it is stored with it.
+/// NEGATIVE CONTROLS: the seed's, and the graft's, setter stored without
+/// looking at the word stored fail their rows.
+#[test]
+fn a_setter_beside_a_word_this_build_cannot_read_is_not_stored() {
+    let since = 1_792_177_200_000_i64;
+    let leaf = |word: &str| restore::TerminalLeafRestore {
+        autopilot: Some(word.to_string()),
+        autopilot_by: Some(format!("ctl {since}")),
+        local_id: Some(1),
+        ..bare_leaf()
+    };
+    let fields = |app: &App, session: u64| {
+        let meta = registry_meta(app, session);
+        (
+            meta.autopilot.clone(),
+            meta.autopilot_set_by.map(|set_by| set_by.carried()),
+        )
+    };
+    for (word, want) in [
+        ("fly", (None, None)),
+        (
+            "land",
+            (Some("land".to_string()), Some(format!("ctl {since}"))),
+        ),
+    ] {
+        // THE COLD RESTORE: the second tab's shell, seeded.
+        let (mut app, host) = hosted_app();
+        let mut layout = single_leaf_window(bare_leaf());
+        layout.restored_tabs.push(restore::RestoredTab {
+            root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(leaf(word))),
+            focused_path: Vec::new(),
+            zoomed: false,
+        });
+        app.restore_into_window(WindowId(0), layout);
+        let session = app
+            .pool
+            .iter()
+            .find_map(|s| (s.id != 0).then_some(s.id))
+            .expect("the second tab's shell");
+        assert_eq!(fields(&app, session), want, "cold, {word}");
+        host.shutdown_and_join();
+
+        // THE LIVE GRAFT onto an adopted shell.
+        let (mut app, host) = hosted_app();
+        app.handoff_successor = true;
+        adopt_as(&mut app, 0, 0);
+        let mut graft = leaf(word);
+        graft.local_id = Some(0);
+        app.restore_into_window(WindowId(0), single_leaf_window(graft));
+        assert_eq!(fields(&app, 0), want, "graft, {word}");
+        host.shutdown_and_join();
+    }
+}
+
+/// A HAND-EDITED SETTER COSTS THE SETTER, NEVER THE WINDOW (§11.7.3, item 5;
+/// the review of slice 7): a manifest whose leaf's `autopilot_by` was edited
+/// by hand still reopens its window. The leaf's setter is written back in
+/// its one form (`ctl 0005` → `ctl 5`), dropped where it names no writer
+/// this build knows (`human:pad 1`), and dropped beside no word.
+/// NEGATIVE CONTROL: the leaf's sanitize leaving `autopilot_by` as written
+/// leaves the window out (an unbounded leaf), and the manifest reopens
+/// nothing.
+#[test]
+fn a_hand_edited_setter_costs_the_setter_never_the_window() {
+    let mut parent = App::headless_for_test();
+    assert!(parent.set_session_autopilot(
+        0,
+        Some(aterm_agent::supervise::Autopilot::Off),
+        crate::autopilot::Surface::Chip
+    ));
+    let wire = parent
+        .capture_restore_manifest()
+        .to_toml()
+        .expect("serialize");
+    let line = wire
+        .lines()
+        .find(|line| line.trim_start().starts_with("autopilot_by = "))
+        .unwrap_or_else(|| panic!("the setter is captured:\n{wire}"))
+        .to_string();
+    let edited = |by: &str, word: Option<&str>| {
+        let mut wire = wire.replace(&line, &format!("autopilot_by = \"{by}\""));
+        if word.is_none() {
+            wire = wire.replace("autopilot = \"off\"\n", "");
+        }
+        let manifest = restore::RestoreManifest::from_toml(&wire)
+            .unwrap_or_else(|| panic!("{by}: the manifest reads"));
+        assert_eq!(manifest.windows.len(), 1, "{by}: the window reopens");
+        let leaf = match &manifest.windows[0].restored_tabs[0].root {
+            restore::RestoredSplitTree::Leaf {
+                view: restore::RestoredView::Terminal(leaf),
+            } => leaf.clone(),
+            other => panic!("{other:?}"),
+        };
+        (leaf.autopilot, leaf.autopilot_by)
+    };
+    assert_eq!(
+        edited("ctl 0005", Some("off")),
+        (Some("off".to_string()), Some("ctl 5".to_string()))
+    );
+    assert_eq!(
+        edited("human:pad 1", Some("off")),
+        (Some("off".to_string()), None)
+    );
+    assert_eq!(edited("ctl 5", None), (None, None));
+}
+
 /// A TIMED CRUISE ACROSS A SEAMLESS UPDATE, END TO END (design §9.6.2,
 /// acceptance 2; review of slice B, finding 5): the parent arms its session
 /// four minutes out; its handoff capture carries the pair, across the wire,
@@ -6487,7 +6857,12 @@ fn a_timed_cruise_crosses_the_handoff_and_lands_once_after_the_commit() {
     };
     at(0);
     let mut parent = App::headless_for_test();
-    assert!(parent.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(wall + 240_000)));
+    assert!(parent.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(wall + 240_000),
+        crate::autopilot::Surface::Chip
+    ));
     let (layout, placed) = handoff_layout_placed(&parent);
     let carried = match &layout.windows[0].restored_tabs[0].root {
         restore::RestoredSplitTree::Leaf {
@@ -6937,7 +7312,12 @@ fn a_word_about_typing_reaches_windows_end_session_snapshot_at_once() {
     );
 
     // A TIMED CRUISE, and the timer landing it.
-    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(1_000)));
+    assert!(app.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(1_000),
+        crate::autopilot::Surface::Chip
+    ));
     assert_eq!(
         words(app.end_session_snapshot(inside())).0.as_deref(),
         Some("cruise"),
@@ -6951,7 +7331,7 @@ fn a_word_about_typing_reaches_windows_end_session_snapshot_at_once() {
     );
 
     // OFF from the window's writer.
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Off), crate::autopilot::Surface::Chip));
     assert_eq!(
         words(app.end_session_snapshot(inside())),
         (Some("off".to_string()), held),
@@ -7064,7 +7444,12 @@ fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopen
     assert_eq!(app.crash_journal.writes, 3, "the hold: handed over at once");
 
     // A TIMED CRUISE from the window's writer, and the timer landing it.
-    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(1_000)));
+    assert!(app.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(1_000),
+        crate::autopilot::Surface::Chip
+    ));
     park(&mut app);
     assert_eq!(app.crash_journal.writes, 4, "the timed Cruise: at once");
     // The timer fires on a later turn, after that turn's park…
@@ -7081,7 +7466,7 @@ fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopen
     assert_eq!(app.crash_journal.writes, 5, "the timer's Land: at once");
 
     // OFF from the window's writer (the chip, the menu, Settings).
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Off), crate::autopilot::Surface::Chip));
     park(&mut app);
     assert_eq!(app.crash_journal.writes, 6, "Off: handed over at once");
 

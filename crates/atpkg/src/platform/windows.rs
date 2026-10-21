@@ -51,11 +51,75 @@ pub fn default_prefix(home: &Path) -> PathBuf {
     }
 }
 
-/// `None`: there is no `getpwuid` and no per-host preference domain to protect. The
-/// `[machine]` settings are macOS-only and answer not-applicable before this is asked.
+// The account-home reader's calls, declared dependency-free like every Win32 call in this
+// file: `OpenProcessToken` is advapi32's and `GetUserProfileDirectoryW` userenv's, so each
+// names its import library; `GetCurrentProcess` is kernel32's (std links it), and the
+// token is closed with the `CloseHandle` declared below.
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+}
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(
+        process_handle: *mut core::ffi::c_void,
+        desired_access: u32,
+        token_handle: *mut *mut core::ffi::c_void,
+    ) -> i32;
+}
+#[link(name = "userenv")]
+unsafe extern "system" {
+    fn GetUserProfileDirectoryW(
+        token: *mut core::ffi::c_void,
+        profile_dir: *mut u16,
+        size: *mut u32,
+    ) -> i32;
+}
+
+/// This ACCOUNT's home directory, as the OS knows it — the profile directory of this
+/// process's token (`GetUserProfileDirectoryW`, which reads the account's
+/// `ProfileList\<SID>\ProfileImagePath`) — which is NOT `%USERPROFILE%`, exactly as the
+/// Unix twin's `getpwuid` home is not `$HOME`: a process given a scratch `USERPROFILE`
+/// (a lab instance, a test) still answers the real profile, so the callers that ask
+/// "is this the account's own home?" (the disk watch's owner rule, the headless package
+/// lane's scratch-home gate) can tell the two apart.
+///
+/// `None` when the token or its profile cannot be read; the caller treats that as
+/// "cannot prove this is the real home". The `[machine]` settings are macOS-only and
+/// answer not-applicable before this is asked.
 #[must_use]
 pub fn account_home() -> Option<PathBuf> {
-    None
+    use std::os::windows::ffi::OsStringExt as _;
+    const TOKEN_QUERY: u32 = 0x0008;
+    /// A profile path longer than the wide APIs' own bound is not a profile.
+    const MAX_UNITS: u32 = 32_768;
+    let mut token: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` takes nothing and returns this process's pseudo-handle,
+    // which needs no closing; `&mut token` is a valid out-param the call fills with a
+    // token handle on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        || token.is_null()
+    {
+        return None;
+    }
+    // Asked once with no buffer for the length (in UTF-16 units, the NUL included), then
+    // once more into a buffer of that length.
+    let mut units: u32 = 0;
+    // SAFETY: `token` is the live token opened above; a NULL buffer with a zero size is
+    // the documented way to ask for the size, which is written into `units`.
+    unsafe { GetUserProfileDirectoryW(token, std::ptr::null_mut(), &mut units) };
+    let read = (1..=MAX_UNITS).contains(&units).then(|| {
+        let mut buf = vec![0u16; units as usize];
+        // SAFETY: `buf` holds `units` writable UTF-16 units and outlives the call, which
+        // writes at most that many (the NUL included) and updates `units`.
+        let ok = unsafe { GetUserProfileDirectoryW(token, buf.as_mut_ptr(), &mut units) };
+        (ok != 0).then_some(buf)
+    });
+    // SAFETY: `token` is live and not closed anywhere else; closed exactly once.
+    unsafe { CloseHandle(token) };
+    let buf = read.flatten()?;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let home = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+    home.is_absolute().then_some(home)
 }
 
 /// No effective uid on Windows — privacy is the per-user profile ACL, not owner bits.
@@ -153,11 +217,8 @@ pub fn exclude_from_backup(_dir: &Path) {}
 
 /// Universal Control is a macOS feature; there is nothing to read here.
 #[must_use]
-pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
-    [
-        crate::machine::KeyRead::Absent,
-        crate::machine::KeyRead::Absent,
-    ]
+pub fn universal_control_state() -> [crate::machine::Read<bool>; 2] {
+    [crate::machine::Read::Absent, crate::machine::Read::Absent]
 }
 
 /// Universal Control is a macOS feature; nothing is written and nothing changed.
@@ -311,29 +372,6 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
         )
     };
     if rc == 0 { None } else { Some(free_to_caller) }
-}
-
-/// The free and total bytes of the volume holding `dir`; Windows reports no inode count.
-#[must_use]
-pub fn volume_stats(dir: &Path) -> Option<crate::freespace::VolumeStats> {
-    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
-    wide.push(0);
-    let mut free_to_caller: u64 = 0;
-    let mut total: u64 = 0;
-    // SAFETY: as `volume_free_bytes`, with the total-size out-param a valid writable `u64`.
-    let rc = unsafe {
-        GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut free_to_caller,
-            &mut total,
-            std::ptr::null_mut(),
-        )
-    };
-    (rc != 0).then_some(crate::freespace::VolumeStats {
-        free: free_to_caller,
-        total,
-        files_free: None,
-    })
 }
 
 /// `BY_HANDLE_FILE_INFORMATION`. Only the volume serial and the two file-index halves
@@ -596,6 +634,28 @@ pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     super::read_cmd_shim_target(shim)
 }
 
+/// [`resolve_shim`] for a reader that must tell "no shim" from "could not read": the
+/// program the `.cmd` at `shim` forwards to (`Ok(Some)`), `Ok(None)` for a file that is
+/// gone or holds no forward line (a tombstone, a stub, any other batch file, bytes that
+/// are not UTF-8), and `Err` when it is there but could not be read through the same
+/// bounded, reparse-refusing handle (over [`super::MAX_SHIM_BYTES`], a reparse point, a
+/// sharing refusal, changed mid-read). The disk watch counts a shim naming a program
+/// inside a build directory as an installed link into it, and one it could not read
+/// keeps every candidate.
+///
+/// # Errors
+///
+/// The read's, but `NotFound`.
+pub fn read_shim_target(shim: &Path) -> io::Result<Option<PathBuf>> {
+    match crate::metadata_io::read_bounded_regular(shim, super::MAX_SHIM_BYTES) {
+        Ok(bytes) => Ok(std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(super::parse_cmd_shim_target)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The environment the `.cmd` shim at `shim` sets before it forwards — its `@set` lines
 /// ([`super::read_cmd_shim_env`]; NONE for a tombstone, a stub, or anything unreadable).
 #[must_use]
@@ -703,4 +763,89 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
             .and_then(|code| u8::try_from(code & 0xff).ok())
             .unwrap_or(1),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE ACCOUNT'S PROFILE, MEASURED ON THE MACHINE RUNNING THE TEST: the token's
+    /// profile directory resolves, is absolute and exists, and is a loaded profile (its
+    /// `NTUSER.DAT` hive is there: a scratch `USERPROFILE` has none), the same twice.
+    /// A `None` here makes every Windows window's disk watch measure-only and the
+    /// headless package lane never run, with no other test failing.
+    #[test]
+    fn the_account_home_resolves_on_the_machine_running_this_test() {
+        let account =
+            account_home().expect("GetUserProfileDirectoryW must resolve this account's profile");
+        assert!(account.is_absolute(), "{}", account.display());
+        assert!(
+            account.is_dir(),
+            "the profile exists: {}",
+            account.display()
+        );
+        assert!(
+            std::fs::symlink_metadata(account.join("NTUSER.DAT")).is_ok(),
+            "a loaded profile holds its hive: {}",
+            account.display()
+        );
+        assert_eq!(account_home(), Some(account));
+    }
+
+    /// The scratch profile [`probe_the_account_home_under_a_scratch_profile`] runs under,
+    /// set only in the child of this test binary that runs it.
+    const SCRATCH_PROFILE_ENV: &str = "ATPKG_TEST_SCRATCH_PROFILE";
+    /// That probe's name, as `--exact` wants it.
+    const SCRATCH_PROFILE_PROBE: &str =
+        "platform::windows::tests::probe_the_account_home_under_a_scratch_profile";
+
+    /// THE ACCOUNT'S PROFILE IS NOT `%USERPROFILE%`: a process whose `USERPROFILE` and
+    /// `HOME` name a scratch folder (a lab instance, a worker) still answers the token's
+    /// own profile, with its hive. NEGATIVE CONTROL: an `account_home` that read
+    /// `USERPROFILE` would answer the scratch folder here, which holds no `NTUSER.DAT`.
+    /// The environment is process-wide, so the probe runs in a child of this test binary.
+    #[test]
+    fn the_account_home_is_not_the_userprofile_a_process_is_given() {
+        let scratch = crate::testdir::dir("atpkg-scratch-profile-");
+        let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", "--nocapture", SCRATCH_PROFILE_PROBE])
+            .env(SCRATCH_PROFILE_ENV, scratch.as_os_str())
+            .env("USERPROFILE", scratch.as_os_str())
+            .env("HOME", scratch.as_os_str())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .expect("run the probe");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the account home under a scratch USERPROFILE: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// [`the_account_home_is_not_the_userprofile_a_process_is_given`]'s child: under the
+    /// scratch profile its parent named, the account's home is another folder, and a
+    /// loaded profile. Passes vacuously in any other run.
+    #[test]
+    fn probe_the_account_home_under_a_scratch_profile() {
+        let Some(scratch) = std::env::var_os(SCRATCH_PROFILE_ENV) else {
+            return;
+        };
+        let scratch = PathBuf::from(scratch);
+        assert_eq!(
+            std::env::var_os("USERPROFILE").map(PathBuf::from).as_ref(),
+            Some(&scratch),
+            "the probe runs under the scratch profile"
+        );
+        let account = account_home().expect("the token's profile resolves");
+        let canon = |p: &Path| fs::canonicalize(p).expect("there");
+        assert_ne!(canon(&account), canon(&scratch), "not USERPROFILE");
+        assert!(
+            fs::symlink_metadata(account.join("NTUSER.DAT")).is_ok(),
+            "a loaded profile holds its hive: {}",
+            account.display()
+        );
+        assert!(fs::symlink_metadata(scratch.join("NTUSER.DAT")).is_err());
+    }
 }

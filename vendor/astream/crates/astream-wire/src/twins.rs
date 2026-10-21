@@ -70,6 +70,24 @@ pub const fn crc_table_index_clamp(idx: u64, max_idx: u64) -> u64 {
     }
 }
 
+/// `crc32_poly_select` as `hash_island.rs` defines it in Clean:
+/// `if (crc &&& 1) == 0 then 0 else poly`.
+#[must_use]
+pub const fn crc32_poly_select(crc: u32, poly: u32) -> u32 {
+    if (crc & 1) == 0 {
+        0
+    } else {
+        poly
+    }
+}
+
+/// `fnv1a_64_mul_prime` as `hash_island.rs` defines it in Clean:
+/// `xored * prime`.
+#[must_use]
+pub const fn fnv1a_64_mul_prime(xored: u64, prime: u64) -> u64 {
+    xored.wrapping_mul(prime)
+}
+
 /// `offset_advance_monotone` as `offset_island.rs` defines it in Clean:
 /// `if current < candidate then candidate else current`.
 #[must_use]
@@ -172,6 +190,20 @@ mod tests {
             want
         );
         assert_eq!(answers(|[a, b]| super::crc_table_index_clamp(a, b)), want);
+        let want = "000012021";
+        assert_eq!(
+            answers(|[a, b]| crate::hash::fnv1a_64_mul_prime(a, b)),
+            want
+        );
+        assert_eq!(answers(|[a, b]| super::fnv1a_64_mul_prime(a, b)), want);
+        for c in [0u32, 1, 2, 3, 0xEDB8_8320, u32::MAX] {
+            for poly in [0u32, 1, 0xEDB8_8320, u32::MAX] {
+                assert_eq!(
+                    crate::hash::crc32_poly_select(c, poly),
+                    super::crc32_poly_select(c, poly)
+                );
+            }
+        }
         let want = "012112222";
         assert_eq!(
             answers(|[a, b]| crate::offset::offset_advance_monotone(a, b)),

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LANDING'S ENDS in the window (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §9.4): the five faces on the chip under Land and none under Cruise or Off,
-//! the records of a landing landed or spent and of nothing else, and a
-//! person's own exchange typed through the App's input after a landing,
-//! read back as `status task=theirs`.
+//! THE LANDING in the window (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+//! §9.4, FOREVER LAND): the three faces on the chip under Land and none under
+//! Cruise or Off, the record of a landing and of nothing else, a proven
+//! self-claim's own landing and its reopening at anyone's later turn, and a
+//! person's own exchange typed through the App's input after a landing, read
+//! back as `status task=theirs`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,14 +55,13 @@ fn landing_records(app: &App, sid: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// UNDER LAND, A LANDING THAT LANDED OR WAS SPENT IS A RECORD, AND NOTHING
-/// ELSE IS (§9.4.1, §9.4.3): `Autopilot landed in tab 1` and `Autopilot quiet
-/// in tab 1`, each led by its tab and saying what the harness does now; the
-/// same face told again is no move and no second record; open, done, theirs
-/// and unknown are none. NEGATIVE CONTROLS: the same moves under Cruise and
-/// Off record nothing — the chip draws no face there either.
+/// UNDER LAND, A LANDING IS A RECORD, AND NOTHING ELSE IS (§9.4.1, FOREVER
+/// LAND): `Autopilot landed in tab 1`, led by its tab; the same face told
+/// again is no move and no second record; open, theirs and unknown are none.
+/// NEGATIVE CONTROLS: the same moves under Cruise and Off record nothing —
+/// the chip draws no face there either.
 #[test]
-fn a_landing_landed_or_spent_under_land_is_a_record_and_no_other_move_is() {
+fn a_landing_under_land_is_a_record_and_no_other_move_is() {
     let mut app = App::headless_for_test();
     let host = idle_host();
     app.harness = Some(host.clone());
@@ -73,22 +73,16 @@ fn a_landing_landed_or_spent_under_land_is_a_record_and_no_other_move_is() {
     assert!(landing_records(&app, &sid).is_empty(), "open is no end");
     tell(&mut app, Some(TaskFace::Landed));
     tell(&mut app, Some(TaskFace::Landed));
+    let records = landing_records(&app, &sid);
     assert_eq!(
-        landing_records(&app, &sid),
-        [(
-            "Autopilot landed in tab 1".to_string(),
-            vec![
-                "Tab 1: the agent finished after the land instruction; the harness types \
-                 nothing more until someone else's turn"
-                    .to_string()
-            ]
-        )],
+        records.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        ["Autopilot landed in tab 1"],
         "once: told again is no move"
     );
+    assert!(records[0].1[0].starts_with("Tab 1: "), "{:?}", records[0].1);
     for face in [
         Some(TaskFace::Open),
         Some(TaskFace::Theirs),
-        Some(TaskFace::Done),
         None,
         Some(TaskFace::Open),
     ] {
@@ -98,17 +92,6 @@ fn a_landing_landed_or_spent_under_land_is_a_record_and_no_other_move_is() {
         landing_records(&app, &sid).len(),
         1,
         "none of those is recorded"
-    );
-    tell(&mut app, Some(TaskFace::Spent));
-    let records = landing_records(&app, &sid);
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[1].0, "Autopilot quiet in tab 1");
-    assert_eq!(
-        records[1].1,
-        [
-            "Tab 1: no done reply after the land instruction and 2 nudges; the harness is \
-          quiet, but for a land answer to a question"
-        ]
     );
     for (title, _) in &records {
         assert_eq!(
@@ -126,7 +109,7 @@ fn a_landing_landed_or_spent_under_land_is_a_record_and_no_other_move_is() {
             TaskFace::Open,
             TaskFace::Landed,
             TaskFace::Open,
-            TaskFace::Spent,
+            TaskFace::Landed,
         ] {
             app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(face)));
         }
@@ -218,90 +201,86 @@ fn a_restarted_landing_is_restated_with_its_first_time_and_recorded_once() {
     host.shutdown_and_join();
 }
 
-/// THE WINDOW'S HALF OF A RESTARTED DONE (the review of 2026-10-17,
-/// owner-eye-4: the done clock was stamped again when the loop restarted): a
-/// contract of the window's alone, the faces told by hand. The host tells
-/// "unknown" as a loop ends, and the next loop of a done session starts DONE
-/// from its seed (`TurnEndState::seed_done`): the window gives the held face
-/// back with the time it first moved there — the timeline's, and the clock
-/// the chip's `done 17:42`, its title, Settings ▸ Harness and a fired timer's
-/// record (`FireOver::Done`) read — not the restart's. Under Cruise, where
-/// done is drawn, and under Land. NEGATIVE CONTROL: the seed withdrawn
-/// (unknown, then open, then done — the loop's tell where the first point
-/// read another reply's done, and a loop with no seed) is a new done,
-/// stamped at its own time. That the real loop, restarted by the real host,
-/// tells the window those faces — the fix itself, which this test cannot
-/// see taken out — is `harness_host`'s
-/// `a_real_supervision_restart_keeps_a_dones_first_time`.
+/// THE WINDOW'S HALF OF A RESTARTED LANDING (the review of 2026-10-17,
+/// owner-eye-4: the end's clock was stamped again when the loop restarted):
+/// a contract of the window's alone, the faces told by hand. The host tells
+/// "unknown" as a loop ends, and the next loop of a landed session starts
+/// LANDED from its seed (`TurnEndState::seed_landed`): the window gives the
+/// held face back with the time it first moved there — the timeline's, and
+/// the clock the chip's `landed 17:42`, its title and Settings ▸ Harness
+/// read — not the restart's, and records no second landing. NEGATIVE
+/// CONTROL: unknown, then open, then landed (a loop with no seed, a new
+/// task's landing) is a new landing, stamped at its own time and recorded.
 #[test]
-fn a_restarted_done_keeps_its_first_time() {
+fn a_restarted_landing_keeps_its_first_time() {
     let host = idle_host();
-    for word in ["cruise", "land"] {
-        let mut app = App::headless_for_test();
-        app.harness = Some(host.clone());
-        let sid = under(&mut app, word);
-        tell(&mut app, &sid, Some(TaskFace::Open));
-        tell(&mut app, &sid, Some(TaskFace::Done));
-        let ctx = app.pool.get(0).unwrap().ctx.clone();
-        let now = aterm_agent::supervise::journal::unix_ms();
-        // The done three hours back, so a restart's clock would show.
-        let old = now - 3 * 3_600_000;
-        {
-            let mut tl = ctx.timeline.lock().unwrap();
-            tl.set_task_face(Some(TaskFace::Open), old);
-            tl.set_task_face(Some(TaskFace::Done), old);
-        }
-        let face_at = || ctx.timeline.lock().unwrap().task_face();
-        let held = crate::harness_glass::Stamp::at(old.div_euclid(1000));
-        for restart in 0..3 {
-            tell(&mut app, &sid, None);
-            assert_eq!(face_at(), None, "{word} {restart}: unknown");
-            assert_eq!(app.chip_glass(0).task, None, "{word} {restart}");
-            tell(&mut app, &sid, Some(TaskFace::Done));
-            assert_eq!(
-                face_at(),
-                Some((TaskFace::Done, old)),
-                "{word} {restart}: the held time"
-            );
-            let glass = app.chip_glass(0);
-            assert_eq!(glass.task, Some(TaskFace::Done), "{word} {restart}");
-            assert_eq!(
-                glass.task_at, held,
-                "{word} {restart}: the chip's, the title's and the page's clock"
-            );
-        }
-        assert!(
-            landing_records(&app, &sid).is_empty(),
-            "{word}: a done is no landing"
-        );
-        // NEGATIVE CONTROL: the seed withdrawn — open, then a new done.
-        tell(&mut app, &sid, None);
-        tell(&mut app, &sid, Some(TaskFace::Open));
-        tell(&mut app, &sid, Some(TaskFace::Done));
-        let (face, at) = face_at().unwrap();
-        assert_eq!(face, TaskFace::Done);
-        assert!(
-            (now - at).abs() < 60_000,
-            "{word}: a new done, at its own time: {at} against {now}"
-        );
-        assert_ne!(app.chip_glass(0).task_at, held, "{word}");
+    let mut app = App::headless_for_test();
+    app.harness = Some(host.clone());
+    let sid = under(&mut app, "land");
+    tell(&mut app, &sid, Some(TaskFace::Open));
+    tell(&mut app, &sid, Some(TaskFace::Landed));
+    assert_eq!(landing_records(&app, &sid).len(), 1);
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    let now = aterm_agent::supervise::journal::unix_ms();
+    // The landing three hours back, so a restart's clock would show.
+    let old = now - 3 * 3_600_000;
+    {
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.set_task_face(Some(TaskFace::Open), old);
+        tl.set_task_face(Some(TaskFace::Landed), old);
     }
+    let face_at = || ctx.timeline.lock().unwrap().task_face();
+    let held = crate::harness_glass::Stamp::at(old.div_euclid(1000));
+    for restart in 0..3 {
+        tell(&mut app, &sid, None);
+        assert_eq!(face_at(), None, "{restart}: unknown");
+        assert_eq!(app.chip_glass(0).task, None, "{restart}");
+        tell(&mut app, &sid, Some(TaskFace::Landed));
+        assert_eq!(
+            face_at(),
+            Some((TaskFace::Landed, old)),
+            "{restart}: the held time"
+        );
+        let glass = app.chip_glass(0);
+        assert_eq!(glass.task, Some(TaskFace::Landed), "{restart}");
+        assert_eq!(
+            glass.task_at, held,
+            "{restart}: the chip's, the title's and the page's clock"
+        );
+    }
+    assert_eq!(
+        landing_records(&app, &sid).len(),
+        1,
+        "a restated landing is no new record"
+    );
+    // NEGATIVE CONTROL: open, then a new landing.
+    tell(&mut app, &sid, None);
+    tell(&mut app, &sid, Some(TaskFace::Open));
+    tell(&mut app, &sid, Some(TaskFace::Landed));
+    let (face, at) = face_at().unwrap();
+    assert_eq!(face, TaskFace::Landed);
+    assert!(
+        (now - at).abs() < 60_000,
+        "a new landing, at its own time: {at} against {now}"
+    );
+    assert_ne!(app.chip_glass(0).task_at, held);
+    assert_eq!(landing_records(&app, &sid).len(), 2, "a new landing");
     host.shutdown_and_join();
 }
 
-/// A FACE RESTATED FROM THE JOURNAL TAKES ITS NOTE'S TIME WHERE THE WINDOW
-/// HELD NONE (§10.2.7; the review of the done's seed: a seamless update's new
-/// window, which no face of the session crossed, stamped the restated done
-/// and landing with the update's clock): the loop's start tells a seeded end
-/// with the wall time the journal noted it at (`HarnessFact::TaskNoted`), and
-/// a window holding no face shows that time — the timeline's, and the chip's,
-/// title's and page's clock — under Cruise and under Land, a landing so
-/// restated recording nothing. A window that held the face over "unknown"
+/// A LANDING RESTATED FROM THE JOURNAL TAKES ITS NOTE'S TIME WHERE THE
+/// WINDOW HELD NONE (§10.2.7: a seamless update's new window, which no face
+/// of the session crossed, stamped the restated landing with the update's
+/// clock): the loop's start tells a seeded landing with the wall time the
+/// journal noted it at (`HarnessFact::TaskNoted`), and a window holding no
+/// face shows that time — the timeline's, and the chip's, title's and page's
+/// clock — recording nothing. A window that held the face over "unknown"
 /// keeps its own first time, and a note's time past now is taken as now.
-/// NEGATIVE CONTROL: the same face told plain to a fresh window
-/// (`HarnessFact::Task`) is stamped at the window's now.
+/// Beside a proven self-claim a hosted loop's restated face is dropped, as
+/// its plain faces are. NEGATIVE CONTROL: the same face told plain to a fresh
+/// window (`HarnessFact::Task`) is stamped at the window's now.
 #[test]
-fn a_restated_face_takes_its_notes_time_in_a_window_that_held_none() {
+fn a_restated_landing_takes_its_notes_time_in_a_window_that_held_none() {
     let host = idle_host();
     let now = aterm_agent::supervise::journal::unix_ms();
     let old = now - 3 * 3_600_000;
@@ -317,96 +296,56 @@ fn a_restated_face_takes_its_notes_time_in_a_window_that_held_none() {
             .task_face()
     };
     for word in ["cruise", "land"] {
-        for face in [TaskFace::Done, TaskFace::Landed] {
-            let mut fresh = App::headless_for_test();
-            fresh.harness = Some(host.clone());
-            let sid = under(&mut fresh, word);
-            fresh.apply_harness_fact(&sid, crate::HarnessFact::TaskNoted(face, old));
-            assert_eq!(face_at(&fresh), Some((face, old)), "{word} {face:?}");
-            let glass = fresh.chip_glass(0);
-            assert_eq!(glass.task, Some(face), "{word} {face:?}");
-            assert_eq!(glass.task_at, stamp(old), "{word} {face:?}: the clock");
-            assert!(
-                landing_records(&fresh, &sid).is_empty(),
-                "{word} {face:?}: restated, no record"
-            );
-            // NEGATIVE CONTROL: told plain, a fresh window stamps its now.
-            let mut plain = App::headless_for_test();
-            plain.harness = Some(host.clone());
-            let plain_sid = under(&mut plain, word);
-            plain.apply_harness_fact(&plain_sid, crate::HarnessFact::Task(Some(face)));
-            let (_, at) = face_at(&plain).unwrap();
-            assert!(
-                at >= now,
-                "{word} {face:?}: plain is now: {at} against {now}"
-            );
-        }
+        let face = TaskFace::Landed;
+        let mut fresh = App::headless_for_test();
+        fresh.harness = Some(host.clone());
+        let sid = under(&mut fresh, word);
+        fresh.apply_harness_fact(&sid, crate::HarnessFact::TaskNoted(face, old));
+        assert_eq!(face_at(&fresh), Some((face, old)), "{word}");
+        let glass = fresh.chip_glass(0);
+        assert_eq!(glass.task, Some(face), "{word}");
+        assert_eq!(glass.task_at, stamp(old), "{word}: the clock");
+        assert!(
+            landing_records(&fresh, &sid).is_empty(),
+            "{word}: restated, no record"
+        );
+        // NEGATIVE CONTROL: told plain, a fresh window stamps its now.
+        let mut plain = App::headless_for_test();
+        plain.harness = Some(host.clone());
+        let plain_sid = under(&mut plain, word);
+        plain.apply_harness_fact(&plain_sid, crate::HarnessFact::Task(Some(face)));
+        let (_, at) = face_at(&plain).unwrap();
+        assert!(at >= now, "{word}: plain is now: {at} against {now}");
     }
     // A window that held the face over "unknown" keeps its own first time.
     let mut app = App::headless_for_test();
     app.harness = Some(host.clone());
-    let sid = under(&mut app, "cruise");
+    let sid = under(&mut app, "land");
     let mine = old - 60_000;
     {
         let ctx = app.pool.get(0).unwrap().ctx.clone();
         let mut tl = ctx.timeline.lock().unwrap();
         tl.set_task_face(Some(TaskFace::Open), mine);
-        tl.set_task_face(Some(TaskFace::Done), mine);
+        tl.set_task_face(Some(TaskFace::Landed), mine);
     }
     app.apply_harness_fact(&sid, crate::HarnessFact::Task(None));
-    app.apply_harness_fact(&sid, crate::HarnessFact::TaskNoted(TaskFace::Done, old));
-    assert_eq!(face_at(&app), Some((TaskFace::Done, mine)), "the held time");
+    app.apply_harness_fact(&sid, crate::HarnessFact::TaskNoted(TaskFace::Landed, old));
+    assert_eq!(
+        face_at(&app),
+        Some((TaskFace::Landed, mine)),
+        "the held time"
+    );
     // A note's time past now is now, never a clock ahead.
     let mut ahead = App::headless_for_test();
     ahead.harness = Some(host.clone());
-    let ahead_sid = under(&mut ahead, "cruise");
+    let ahead_sid = under(&mut ahead, "land");
     let later = aterm_agent::supervise::journal::unix_ms() + 3 * 3_600_000;
     ahead.apply_harness_fact(
         &ahead_sid,
-        crate::HarnessFact::TaskNoted(TaskFace::Done, later),
+        crate::HarnessFact::TaskNoted(TaskFace::Landed, later),
     );
     let (_, at) = face_at(&ahead).unwrap();
     assert!(at < later && at >= now, "clamped to now: {at}");
-    host.shutdown_and_join();
-}
-
-/// A SPENT LANDING IS RECORDED ONCE AN EPISODE (the review of slice C): the
-/// engine tells a landing spent as a move from open where its last land
-/// act's turn ended with no done; after a person's own exchange (`theirs`)
-/// or a done task, someone else's turn reads spent again — the same spent
-/// landing, no second `Autopilot quiet` record. A landed task is never
-/// spent after it (the engine's side), and a move from landed straight to
-/// spent would be no record either. NEGATIVE CONTROL: a new loop — unknown,
-/// its start open, its own episode typed again — spent once more is a new
-/// record.
-#[test]
-fn a_spent_landing_is_recorded_once_an_episode() {
-    let mut app = App::headless_for_test();
-    let host = idle_host();
-    app.harness = Some(host.clone());
-    let sid = under(&mut app, "land");
-    let quiet = |app: &App| {
-        landing_records(app, &sid)
-            .iter()
-            .filter(|(t, _)| t.starts_with("Autopilot quiet"))
-            .count()
-    };
-    tell(&mut app, &sid, Some(TaskFace::Open));
-    tell(&mut app, &sid, Some(TaskFace::Spent));
-    assert_eq!(quiet(&app), 1);
-    for back_from in [TaskFace::Theirs, TaskFace::Done, TaskFace::Theirs] {
-        tell(&mut app, &sid, Some(back_from));
-        tell(&mut app, &sid, Some(TaskFace::Spent));
-        assert_eq!(quiet(&app), 1, "spent again after {back_from:?}");
-    }
-    tell(&mut app, &sid, Some(TaskFace::Landed));
-    tell(&mut app, &sid, Some(TaskFace::Spent));
-    assert_eq!(quiet(&app), 1, "landed is never spent after it");
-    // NEGATIVE CONTROL: a new loop's own episode.
-    tell(&mut app, &sid, None);
-    tell(&mut app, &sid, Some(TaskFace::Open));
-    tell(&mut app, &sid, Some(TaskFace::Spent));
-    assert_eq!(quiet(&app), 2, "a new episode");
     host.shutdown_and_join();
 }
 
@@ -421,12 +360,11 @@ fn ends(app: &App) -> crate::harness_ab::AbEnds {
 /// A LANDING IS COUNTED ONCE, HOWEVER OFTEN IT IS TOLD (§11.6.5 "Counted
 /// once"): under Land, open then landed is one landing in the A/B book and
 /// one `harness.landing.<sid>` record; unknown then landed again (a loop's
-/// restart restating it) leaves both at one; a spent landing is one quiet
-/// end, told again after a person's exchange none more. The count is the
-/// record's rule (`is_an_end`), so the two agree. Under Cruise nothing is
-/// counted here: Cruise's done is the one end's, slice 2a's. NEGATIVE
-/// CONTROL: the count fed without `is_an_end` makes the restated landing a
-/// second (the mutation run in the landing commit).
+/// restart restating it) leaves both at one; a person's exchange (`theirs`)
+/// counts nothing. The count is the record's rule (`is_an_end`), so the two
+/// agree. Under Cruise nothing is counted: FOREVER CRUISE ends nothing.
+/// NEGATIVE CONTROL: a new task's landing (open between) is a second count
+/// and a second record.
 #[test]
 fn a_landing_is_counted_once_however_often_it_is_told() {
     let mut app = App::headless_for_test();
@@ -437,28 +375,27 @@ fn a_landing_is_counted_once_however_often_it_is_told() {
     tell(&mut app, &sid, Some(TaskFace::Landed));
     assert_eq!(ends(&app).landed, 1);
     assert_eq!(landing_records(&app, &sid).len(), 1);
-    for face in [None, Some(TaskFace::Landed), None, Some(TaskFace::Landed)] {
+    for face in [
+        None,
+        Some(TaskFace::Landed),
+        None,
+        Some(TaskFace::Landed),
+        Some(TaskFace::Theirs),
+    ] {
         tell(&mut app, &sid, face);
     }
     assert_eq!(ends(&app).landed, 1, "restated, not counted again");
     assert_eq!(landing_records(&app, &sid).len(), 1, "nor recorded again");
+    // NEGATIVE CONTROL: a new task's landing.
     tell(&mut app, &sid, Some(TaskFace::Open));
-    tell(&mut app, &sid, Some(TaskFace::Spent));
-    tell(&mut app, &sid, Some(TaskFace::Theirs));
-    tell(&mut app, &sid, Some(TaskFace::Spent));
-    let counted = ends(&app);
-    assert_eq!((counted.landed, counted.quiet, counted.done), (1, 1, 0));
-    assert_eq!(landing_records(&app, &sid).len(), 2, "landed, quiet");
-    // Under Cruise: a landing's ends are no count here.
+    tell(&mut app, &sid, Some(TaskFace::Landed));
+    assert_eq!(ends(&app).landed, 2);
+    assert_eq!(landing_records(&app, &sid).len(), 2);
+    // Under Cruise: no count.
     let mut cruise = App::headless_for_test();
     cruise.harness = Some(host.clone());
     let sid = under(&mut cruise, "cruise");
-    for face in [
-        TaskFace::Open,
-        TaskFace::Landed,
-        TaskFace::Open,
-        TaskFace::Done,
-    ] {
+    for face in [TaskFace::Open, TaskFace::Landed, TaskFace::Open] {
         tell(&mut cruise, &sid, Some(face));
     }
     assert_eq!(ends(&cruise), crate::harness_ab::AbEnds::default());
@@ -528,7 +465,7 @@ fn the_time_from_land_to_landed_starts_where_the_mode_moved() {
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     claim(&mut app, &ctx, true);
     assert_eq!(app.harness_ab_arm(0), AbArm::Cruise);
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Chip));
     let from = app.harness_screen.ab.land_from(0);
     assert!(from.is_some(), "the press starts it");
     // The pure book case `the_start_follows_the_mode_never_the_claim` uses
@@ -580,6 +517,7 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
     let leaf = |word: &str| crate::restore::TerminalLeafRestore {
         sid: None,
         lineage: None,
+        log_ep: None,
         cwd: None,
         title: String::new(),
         profile: None,
@@ -592,6 +530,7 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
         questions: None,
         autopilot: Some(word.to_string()),
         land_at: None,
+        autopilot_by: None,
         identity: None,
         agent: None,
         supervised: None,
@@ -623,7 +562,7 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     under(&mut app, "cruise");
     claim(&mut app, &ctx, true);
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Chip));
     let from = app.harness_screen.ab.land_from(0);
     assert!(from.is_some());
     app.graft_restored_user_meta(0, &leaf("land"));
@@ -631,15 +570,15 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
     host.shutdown_and_join();
 }
 
-/// A QUIET LANDING THAT LANDS AFTER ALL IS ONE END (§11.6.7; `TaskFace::of`:
-/// a done reply to a question's land answer ends the quiet): open → spent →
-/// landed under Land reads `Land landed 1`, and both records stay (the quiet
-/// and the landing each happened). A quiet end followed by a new task that
-/// lands (open between) is two ends. NEGATIVE CONTROL: the landing counted
-/// alone (`AbBook::end` for spent → landed, the first build) reads `Land
-/// landed 1, quiet 1`.
+/// A NEW TASK'S LANDING IS ITS OWN END, TIMED FROM ITS OPENING (§11.2.3,
+/// item 2; §11.6.3, item 4): under Land first read as Land (no start), open
+/// → landed → open → landed counts two landings and two records, and the
+/// second is timed from the move that opened its task
+/// (`AbBook::task_opened` under Land starts the span), so the Ends row reads
+/// one sample. NEGATIVE CONTROL: one landing alone is counted with no span,
+/// as a mode first read as Land starts none.
 #[test]
-fn a_quiet_landing_that_lands_after_all_is_one_end() {
+fn a_new_tasks_landing_is_its_own_end_timed_from_its_opening() {
     let host = idle_host();
     let words = |faces: &[TaskFace]| {
         let mut app = App::headless_for_test();
@@ -656,21 +595,23 @@ fn a_quiet_landing_that_lands_after_all_is_one_end() {
                 .collect::<Vec<_>>(),
         )
     };
-    use TaskFace::{Landed, Open, Spent};
+    use TaskFace::{Landed, Open};
+    let landed = "Autopilot landed in tab 1".to_string();
     assert_eq!(
-        words(&[Open, Spent, Landed]),
+        words(&[Open, Landed, Open, Landed]),
         (
-            Some("Land landed 1".to_string()),
-            vec![
-                "Autopilot quiet in tab 1".to_string(),
-                "Autopilot landed in tab 1".to_string()
-            ]
-        )
+            Some(format!(
+                "Land landed 2{}Land to landed: not enough yet (1)",
+                crate::native_ui::FACT_SEPARATOR
+            )),
+            vec![landed.clone(), landed.clone()]
+        ),
+        "a new task's landing is its own end, timed from its opening"
     );
     assert_eq!(
-        words(&[Open, Spent, Open, Landed]).0.as_deref(),
-        Some("Land landed 1, quiet 1"),
-        "a new task's landing is its own end"
+        words(&[Open, Landed]),
+        (Some("Land landed 1".to_string()), vec![landed]),
+        "CONTROL: the first landing has no span"
     );
     host.shutdown_and_join();
 }
@@ -709,35 +650,29 @@ fn the_page_a_landing_publishes_counts_it() {
 }
 
 /// THE MOVES THAT ARE ENDS ([`is_an_end`]): landed from any face the window
-/// knew, spent from open alone; landed from unknown (a loop's start, the
-/// seed) and spent from anything else are none, and so is every other face.
+/// knew; landed from unknown (a loop's start, the seed) is none, and so is
+/// every other face.
 #[test]
 fn a_landings_end_is_judged_by_the_face_it_moved_from() {
     let faces = [
         None,
         Some(TaskFace::Open),
         Some(TaskFace::Landed),
-        Some(TaskFace::Done),
-        Some(TaskFace::Spent),
         Some(TaskFace::Theirs),
     ];
     for was in faces {
         for face in faces.into_iter().flatten() {
-            let want = match face {
-                TaskFace::Landed => was.is_some(),
-                TaskFace::Spent => was == Some(TaskFace::Open),
-                _ => false,
-            };
+            let want = face == TaskFace::Landed && was.is_some();
             assert_eq!(is_an_end(was, face), want, "{was:?} → {face:?}");
         }
     }
 }
 
 /// A record's title names its tab within the glass title rule, and a session
-/// no tab shows is named by nothing; every face but landed and spent is no
-/// record. THE PANE (§10.3.3, item 9) is in the LINE alone: a session in a tab
-/// that holds two agents leads its line with its pane, whole within the
-/// detail line's cap, its title the tab's. NEGATIVE CONTROL: the line's place
+/// no tab shows is named by nothing; every face but landed is no record.
+/// THE PANE (§10.3.3, item 9) is in the LINE alone: a session in a tab that
+/// holds two agents leads its line with its pane, whole within the detail
+/// line's cap, its title the tab's. NEGATIVE CONTROL: the line's place
 /// never reaches the title.
 #[test]
 fn a_records_title_names_its_tab_within_the_title_rule() {
@@ -750,7 +685,7 @@ fn a_records_title_names_its_tab_within_the_title_rule() {
         assert_eq!(m.title, title, "{place}");
         assert_eq!(aterm_messages::text::glass_title_fault(&m.title), None);
     }
-    for face in [TaskFace::Open, TaskFace::Done, TaskFace::Theirs] {
+    for face in [TaskFace::Open, TaskFace::Theirs] {
         assert!(
             task_record("s-1", "in tab 3", "in tab 3", face).is_none(),
             "{face:?}"
@@ -760,30 +695,26 @@ fn a_records_title_names_its_tab_within_the_title_rule() {
         ("in tab 3, left pane", "Tab 3, left pane: "),
         ("in window 2, tab 3, pane 3", "Window 2, tab 3, pane 3: "),
     ] {
-        for face in [TaskFace::Landed, TaskFace::Spent] {
-            let m = task_record("s-1", "in tab 3", line_place, face).expect("a record");
-            assert!(!m.title.contains("pane"), "{}", m.title);
-            let line = &m.detail[0];
-            assert!(line.starts_with(lead), "{line}");
-            assert!(
-                line.chars().count() <= aterm_messages::DETAIL_LINE_CAP
-                    && !line.ends_with('\u{2026}'),
-                "the line is whole: {line}"
-            );
-        }
+        let m = task_record("s-1", "in tab 3", line_place, TaskFace::Landed).expect("a record");
+        assert!(!m.title.contains("pane"), "{}", m.title);
+        let line = &m.detail[0];
+        assert!(line.starts_with(lead), "{line}");
+        assert!(
+            line.chars().count() <= aterm_messages::DETAIL_LINE_CAP && !line.ends_with('\u{2026}'),
+            "the line is whole: {line}"
+        );
     }
 }
 
-/// THE FIVE FACES UNDER LAND, THE TWO ENDS UNDER CRUISE, NONE UNDER OFF
-/// (§9.4.1, §10.2.1): each face the loop tells reaches the glass the frame
-/// reads, and the chip wears `⤓ land`, `✓ landed`, `✓ done`, `⤓ quiet` and
-/// `⤓ quiet` for open, landed, done, spent and theirs under Land; under
-/// Cruise `∞ ✓ landed` and `∞ ✓ done` for the two ends and `∞` for the rest;
-/// the card's line ends `✓ landed` or `✓ done` under both, the mode's own
-/// words for the rest. Unknown draws as open. NEGATIVE CONTROL: Off keeps
-/// v1's face and line whatever is told.
+/// THE THREE FACES UNDER LAND, NONE UNDER CRUISE OR OFF (§9.4.1, FOREVER
+/// CRUISE): each face the loop tells reaches the glass the frame reads, and
+/// the chip wears `⤓ land`, `✓ landed` and `⤓ quiet` for open, landed and
+/// theirs under Land, the card's line ending `✓ landed` for the landing and
+/// the mode's own words for the rest; Cruise takes nothing as the end and
+/// wears `∞` whatever is told. Unknown draws as open. NEGATIVE CONTROL: Off
+/// keeps v1's face and line whatever is told.
 #[test]
-fn the_faces_show_under_land_the_ends_under_cruise_and_none_under_off() {
+fn the_faces_show_under_land_and_none_under_cruise_or_off() {
     let host = idle_host();
     for (word, view) in [
         ("land", AutopilotView::Land),
@@ -797,8 +728,6 @@ fn the_faces_show_under_land_the_ends_under_cruise_and_none_under_off() {
         for (face, chip, end) in [
             (Some(TaskFace::Open), ChipFace::Land, LineEnd::Mode),
             (Some(TaskFace::Landed), ChipFace::Landed, LineEnd::Landed),
-            (Some(TaskFace::Done), ChipFace::Done, LineEnd::Done),
-            (Some(TaskFace::Spent), ChipFace::Spent, LineEnd::Mode),
             (Some(TaskFace::Theirs), ChipFace::Theirs, LineEnd::Mode),
             (None, ChipFace::Land, LineEnd::Mode),
         ] {
@@ -807,12 +736,6 @@ fn the_faces_show_under_land_the_ends_under_cruise_and_none_under_off() {
             assert_eq!(glass.task, face, "{word}: the glass holds what was told");
             let want = match (view, face) {
                 (AutopilotView::Land, _) => (chip, end),
-                (AutopilotView::Cruise, Some(TaskFace::Landed)) => {
-                    (ChipFace::CruiseLanded, LineEnd::Landed)
-                }
-                (AutopilotView::Cruise, Some(TaskFace::Done)) => {
-                    (ChipFace::CruiseDone, LineEnd::Done)
-                }
                 (AutopilotView::Cruise, _) => (ChipFace::Cruise, LineEnd::Mode),
                 _ => (ChipFace::Off, LineEnd::Mode),
             };
@@ -840,11 +763,15 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         resumes_by_itself: false,
         composer: Composer::Empty,
         said_tail: Some(said.to_string()),
+        said_cut: false,
+        turn_said: None,
+        opened_by: None,
         worked,
         rules: None,
         pending_input: false,
         interrupted: false,
         restartable: true,
+        relaunch_off: false,
         resume: None,
         upgrading: false,
         taskless: false,
@@ -862,8 +789,6 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         login_superseded: false,
         login_notice: None,
         finished_record: None,
-        finished_at_check: false,
-        check_record: None,
         left_record: false,
         left_work: None,
         notice_elsewhere: false,
@@ -876,8 +801,10 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         repo: None,
         login_screen: None,
         login_interrupted: false,
+        login_at_wall: None,
         login_method: None,
         login_shared: None,
+        roster: None,
     }
 }
 
@@ -916,8 +843,8 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
             crate::metrics::now_us(),
         )
         .unwrap();
-        // The loop, ten minutes back: the land instruction, and its done
-        // reply.
+        // The loop, ten minutes back: the land instruction, and its clean
+        // defense.
         let back = Instant::now() - Duration::from_secs(600);
         let mut st = TurnEndState::default();
         st.face_start();
@@ -928,7 +855,7 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
         let done = back + Duration::from_secs(120);
         st.observe(
             &reading(
-                "Committed it all.\nATERM-TASK-DONE",
+                "Nothing left: committed, merged and pushed it all to origin/main.",
                 Some(Duration::from_secs(120)),
                 None,
             ),
@@ -971,4 +898,328 @@ fn a_persons_own_exchange_typed_into_the_app_after_a_landing_reads_task_theirs()
     assert_eq!(run(true), "theirs");
     // NEGATIVE CONTROL: nobody's key.
     assert_eq!(run(false), "open");
+}
+
+/// THE FACE A PROVEN SELF-CLAIM'S ACT TELLS (FOREVER LAND §10.4): its landing
+/// `landed@v1` is `landed`, recorded by `meta set harness_act` alone; every
+/// other act it records — a continuation, a land act, an older build's
+/// `finished@v1` token act — reopens the work. NEGATIVE CONTROLS: an unset, a
+/// set with no act or two acts, and every other meta line tell no face.
+#[test]
+fn a_self_claims_landing_act_is_landed_and_every_other_act_is_open() {
+    use crate::harness_task::{SELF_CLAIM_LANDED, self_claim_act_face};
+    assert_eq!(self_claim_act_face(SELF_CLAIM_LANDED), TaskFace::Landed);
+    for act in [
+        "continue@v1",
+        "land@v1",
+        "finished@v1",
+        "landed@v2",
+        "landed",
+    ] {
+        assert_eq!(self_claim_act_face(act), TaskFace::Open, "{act}");
+    }
+    let face = crate::control::harness_act_face;
+    assert_eq!(face("set harness_act landed@v1"), Some(TaskFace::Landed));
+    assert_eq!(face("set  harness_act   continue@v1"), Some(TaskFace::Open));
+    for rest in [
+        "unset harness_act",
+        "set harness_act",
+        "set harness_act landed@v1 extra",
+        "set harness_acts landed@v1",
+        "set autopilot land",
+        "",
+    ] {
+        assert_eq!(face(rest), None, "NEGATIVE CONTROL: {rest:?}");
+    }
+}
+
+/// Paint Claude Code's screen as session `session`'s whole screen, 24 by
+/// 120: its spinner over the prompt while `busy`, else the prompt alone.
+fn paint_claude(app: &App, session: u64, busy: bool) {
+    let rule = "\u{2500}".repeat(120);
+    let mut rows = vec![String::new(); 24];
+    rows[0] = "\u{23fa} Working on it.".into();
+    if busy {
+        rows[19] = "\u{2736} Deliberating\u{2026} (3s \u{00b7} thinking)".into();
+    }
+    rows[20] = rule.clone();
+    rows[21] = "\u{276f} ".into();
+    rows[22] = rule;
+    rows[23] = if busy {
+        "  \u{23f5}\u{23f5} bypass permissions on \u{00b7} esc to interrupt".into()
+    } else {
+        "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)".into()
+    };
+    let pooled = app.pool.get(session).expect("pooled");
+    let mut term = crate::term_lock(&pooled.term);
+    if term.cols() != 120 {
+        term.resize(24, 120);
+    }
+    let mut bytes = String::from("\x1b[H\x1b[2J");
+    for (i, row) in rows.iter().enumerate() {
+        bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
+    }
+    term.process(bytes.as_bytes());
+}
+
+/// THE STATUS SWEEP REOPENS A PROVEN SELF-CLAIM'S LANDING (FOREVER LAND
+/// §10.4): after the claim's `landed@v1`, the sweep that reads Claude Code
+/// busy — someone's later turn — makes the face `open`, through the sweep
+/// itself. NEGATIVE CONTROL: sweeps over Claude Code idle at its prompt
+/// (nobody's turn) leave it `landed`.
+#[test]
+fn the_status_sweep_reopens_a_proven_self_claims_landing_at_a_later_turn() {
+    let mut app = App::headless_for_test();
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let session = app.next_session_id;
+    app.push_stub_tab(crate::WindowId(0), crate::stub_session(session));
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    ctx.meta
+        .lock()
+        .unwrap()
+        .set("autopilot", Some("land".into()));
+    let sid = ctx.self_id.as_str().to_string();
+    crate::session_timeline::claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(1),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof takes a free session");
+    assert!(app.beside_proven_self_claim(session));
+    let face = |app: &App| {
+        app.pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task_face()
+            .map(|(f, _)| f)
+    };
+    let mut t = Instant::now();
+    let mut sweep = |app: &mut App, busy: bool| {
+        for _ in 0..3 {
+            paint_claude(app, session, busy);
+            let _ = app.observe_session_statuses(t);
+            t += Duration::from_millis(300);
+        }
+    };
+    sweep(&mut app, false);
+    app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
+    assert_eq!(face(&app), Some(TaskFace::Landed));
+    // NEGATIVE CONTROL: nobody's turn — Claude Code idle at its prompt.
+    sweep(&mut app, false);
+    assert_eq!(face(&app), Some(TaskFace::Landed), "quiet: still landed");
+    sweep(&mut app, true);
+    assert_eq!(
+        ctx.timeline.lock().unwrap().agent().word,
+        "busy",
+        "the sweep read the turn"
+    );
+    assert_eq!(
+        face(&app),
+        Some(TaskFace::Open),
+        "the sweep's read of a later turn reopens it"
+    );
+    host.shutdown_and_join();
+}
+
+/// THE WIRE OF A PROVEN SELF-CLAIM'S ACT (FOREVER LAND §10.4): `meta set
+/// harness_act landed@v1` on the claim's own connection is recorded, the
+/// `meta` arm posts the face it tells, and — its wakes applied as the app
+/// loop applies them — `status task=` reads `landed`; the claim's next act
+/// (`continue@v1`) reads `open` again. NEGATIVE CONTROLS: the same landing
+/// from a connection the claim is not bound to (and no kernel proof) is
+/// refused and posts nothing, and another meta line posts no face.
+#[test]
+fn a_proven_self_claims_landed_act_on_the_wire_reads_task_landed_then_open() {
+    let mut app = App::headless_for_test();
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    under(&mut app, "land");
+    let (term, ctx) = {
+        let shell = app.pool.get(0).unwrap();
+        (Arc::clone(&shell.term), Arc::clone(&shell.ctx))
+    };
+    crate::session_timeline::claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(1),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof takes a free session");
+    assert!(app.beside_proven_self_claim(0));
+    let store = Arc::clone(&app.store);
+    let serve =
+        |rest: &str, conn| crate::control::meta_wakes_for_test(&store, &term, 0, &ctx, rest, conn);
+    // The app loop's arms for the wakes the `meta` arm posts; the faces told.
+    let apply = |app: &mut App, wakes: Vec<crate::Wake>| {
+        let mut faces = Vec::new();
+        for wake in wakes {
+            match wake {
+                crate::Wake::MetaChanged { session } => app.on_meta_changed(session),
+                crate::Wake::HarnessFact { sid, fact } => {
+                    if let crate::HarnessFact::SelfTask(face) = &fact {
+                        faces.push(*face);
+                    }
+                    app.apply_harness_fact(&sid, fact);
+                }
+                other => panic!("the meta arm posts no {other:?}"),
+            }
+        }
+        faces
+    };
+    let task = |app: &App| {
+        let record = app.session_status_record(0).expect("live session");
+        record
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("task="))
+            .unwrap_or("none")
+            .to_string()
+    };
+    // NEGATIVE CONTROL: another connection, no proof — refused, nothing posted.
+    let (reply, wakes) = serve("set harness_act landed@v1", Some(2));
+    assert_eq!(reply, "ERR denied\n");
+    assert!(wakes.is_empty(), "a refused act posts nothing: {wakes:?}");
+    assert_ne!(task(&app), "landed");
+    let (reply, wakes) = serve("set harness_act landed@v1", Some(1));
+    assert_eq!(reply, "OK\n");
+    assert_eq!(apply(&mut app, wakes), [TaskFace::Landed]);
+    assert_eq!(task(&app), "landed");
+    // NEGATIVE CONTROL: another meta line tells no face.
+    let (reply, wakes) = serve("set title building", Some(1));
+    assert_eq!(reply, "OK\n");
+    assert_eq!(apply(&mut app, wakes), []);
+    assert_eq!(task(&app), "landed", "a title is no act");
+    let (reply, wakes) = serve("set harness_act continue@v1", Some(1));
+    assert_eq!(reply, "OK\n");
+    assert_eq!(apply(&mut app, wakes), [TaskFace::Open]);
+    assert_eq!(task(&app), "open", "the claim's next act reopens it");
+    host.shutdown_and_join();
+}
+
+/// A PROVEN SELF-CLAIM'S OWN LANDING SHOWS, AND ANYONE'S LATER TURN REOPENS
+/// IT (FOREVER LAND §10.4): beside a proven self-claim the hosted loop tells
+/// no face (it only watches), the claim's `landed@v1` act makes the face
+/// `landed` — recorded once as a landing under Land — and its holder's quiet
+/// leaves it there; once someone else's turn begins (the agent reads busy)
+/// the status sweep's reopen makes it `open`. NEGATIVE CONTROLS: with no
+/// proven claim the act tells nothing, and a hosted loop's landing is never
+/// reopened by the sweep (its loop tells its own face).
+#[test]
+fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
+    let mut app = App::headless_for_test();
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    let sid = under(&mut app, "land");
+    let ctx = app.pool.get(0).unwrap().ctx.clone();
+    let face = |app: &App| app.chip_glass(0).task;
+    // NEGATIVE CONTROL: no proven claim — the act tells nothing.
+    app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
+    assert_eq!(face(&app), None, "no proven self-claim, no face");
+    crate::session_timeline::claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(1),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof takes a free session");
+    assert!(app.beside_proven_self_claim(0));
+    tell(&mut app, &sid, Some(TaskFace::Theirs));
+    assert_eq!(face(&app), None, "the hosted loop tells no face beside it");
+    app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
+    assert_eq!(face(&app), Some(TaskFace::Landed));
+    app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
+    assert_eq!(
+        landing_records(&app, &sid).len(),
+        1,
+        "a landing, recorded once"
+    );
+    // Its holder types nothing more: nobody's turn reopens nothing.
+    app.reopen_self_claim_landing(0);
+    assert_eq!(face(&app), Some(TaskFace::Landed), "quiet: still landed");
+    // Someone's later turn: the agent reads busy.
+    let publish = |word: &'static str| {
+        ctx.timeline.lock().unwrap().publish_agent(
+            word,
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            crate::session_timeline::AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        );
+    };
+    publish("busy");
+    app.reopen_self_claim_landing(0);
+    assert_eq!(face(&app), Some(TaskFace::Open), "anyone's turn reopens it");
+    // NEGATIVE CONTROL: a hosted loop's landing, no proven claim, stays.
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    tell(&mut app, &sid, Some(TaskFace::Landed));
+    assert_eq!(face(&app), Some(TaskFace::Landed));
+    app.reopen_self_claim_landing(0);
+    assert_eq!(
+        face(&app),
+        Some(TaskFace::Landed),
+        "the sweep reopens no hosted loop's landing"
+    );
+    host.shutdown_and_join();
+}
+
+/// A PROVEN SELF-CLAIM LANDS NOTHING UNDER CRUISE OR OFF (FOREVER CRUISE:
+/// nothing ends a Cruise task): its `landed@v1` act, told as
+/// `HarnessFact::SelfTask(Landed)` while the session runs under Cruise or
+/// Off, leaves the face as it was — no `task=landed`, no landing recorded —
+/// where a codex-alab that misbehaved would have set it. NEGATIVE CONTROL:
+/// the same act under Land lands the task, recorded once.
+#[test]
+fn a_proven_self_claims_landing_counts_only_under_land() {
+    for word in ["cruise", "off", "land"] {
+        let mut app = App::headless_for_test();
+        let host = idle_host();
+        app.harness = Some(host.clone());
+        let sid = under(&mut app, word);
+        let ctx = app.pool.get(0).unwrap().ctx.clone();
+        crate::session_timeline::claim_supervisor_as(
+            &ctx,
+            &format!("codex-alab@{}", std::process::id()),
+            Some(1),
+            None,
+            Some(crate::self_claim::stand_in::running()),
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("a proof takes a free session");
+        assert!(app.beside_proven_self_claim(0));
+        app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Open));
+        app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
+        let face = app.chip_glass(0).task;
+        let records = landing_records(&app, &sid).len();
+        if word == "land" {
+            assert_eq!(face, Some(TaskFace::Landed), "CONTROL: {word}");
+            assert_eq!(records, 1, "CONTROL: {word}");
+        } else {
+            assert_eq!(face, Some(TaskFace::Open), "{word}: no landing");
+            assert_eq!(records, 0, "{word}: nothing recorded");
+        }
+        host.shutdown_and_join();
+    }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{HandoffLaneFacts, app_bundle_root, launch_environment, out_of_band_lane_refusal};
+use super::{HandoffLaneFacts, app_bundle_root, launch_environment_over, out_of_band_lane_refusal};
 
 /// An attempt with nothing wrong with it.
 fn eligible() -> HandoffLaneFacts {
@@ -155,15 +155,19 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
 }
 
 /// The predicate behind that fact, against a real `Command`: removing something
-/// this process lacks is a no-op (the common case), and removing something it
+/// the launcher lacks is a no-op (the common case), and removing something it
 /// has cannot be expressed.
 #[test]
 fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
     // std on purpose: never spawned; the shipped `launch_environment` reads a std one.
     let mut command = std::process::Command::new("/bin/echo");
     command.env("ATERM_LANE_TEST_KEY", "value");
-    command.env_remove("ATERM_LANE_TEST_ABSENT_KEY_THAT_IS_NOT_SET");
-    let carried = launch_environment(&command).expect("a no-op removal is expressible");
+    command.env_remove("ATERM_LANE_TEST_ABSENT_KEY");
+    let launcher = |key: &std::ffi::OsStr| {
+        (key == "ATERM_LANE_TEST_PRESENT_KEY").then(|| std::ffi::OsString::from("set"))
+    };
+    let carried =
+        launch_environment_over(&command, launcher).expect("a no-op removal is expressible");
     assert_eq!(
         carried,
         vec![(
@@ -173,15 +177,50 @@ fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
         "only real assignments travel; a vacuous removal contributes nothing"
     );
 
-    // A removal of a variable this process carries, set under the lock-scoped env helper.
-    crate::test_env::scoped("ATERM_LANE_TEST_PRESENT_KEY", "set", || {
-        let mut command = std::process::Command::new("/bin/echo");
-        command.env_remove("ATERM_LANE_TEST_PRESENT_KEY");
-        assert!(
-            launch_environment(&command).is_none(),
-            "a merge cannot un-set a variable the launcher's own environment has"
-        );
-    });
+    command.env_remove("ATERM_LANE_TEST_PRESENT_KEY");
+    assert!(
+        launch_environment_over(&command, launcher).is_none(),
+        "a merge cannot un-set a variable the launcher's own environment has"
+    );
+}
+
+/// ROUND EIGHT'S LEAD U42: the successor's control directory is the launcher's
+/// by construction. The variables it is computed from travel explicitly from the
+/// launcher's own environment, whatever LaunchServices merges them over; one the
+/// `Command` sets wins, and one the launcher lacks is not invented.
+#[test]
+fn a_launched_successor_is_handed_the_launchers_control_directory() {
+    let launcher = |key: &std::ffi::OsStr| match key.to_str() {
+        Some("XDG_RUNTIME_DIR") => Some(std::ffi::OsString::from("/tmp/launcher-run")),
+        Some("HOME") => Some(std::ffi::OsString::from("/tmp/launcher-home")),
+        _ => None,
+    };
+    let pair = |key: &str, value: &str| {
+        (
+            std::ffi::OsString::from(key),
+            std::ffi::OsString::from(value),
+        )
+    };
+    let mut command = std::process::Command::new("/bin/echo");
+    command.env("ATERM_LANE_TEST_KEY", "value");
+    assert_eq!(
+        launch_environment_over(&command, launcher),
+        Some(vec![
+            pair("ATERM_LANE_TEST_KEY", "value"),
+            pair("XDG_RUNTIME_DIR", "/tmp/launcher-run"),
+            pair("HOME", "/tmp/launcher-home"),
+        ])
+    );
+    command.env("HOME", "/tmp/explicit-home");
+    assert_eq!(
+        launch_environment_over(&command, |key| (key == "HOME")
+            .then(|| std::ffi::OsString::from("/tmp/launcher-home"))),
+        Some(vec![
+            pair("ATERM_LANE_TEST_KEY", "value"),
+            pair("HOME", "/tmp/explicit-home"),
+        ]),
+        "the Command's own HOME wins, and an unset XDG_RUNTIME_DIR stays unset"
+    );
 }
 
 /// The bundle root is `<bundle>.app/Contents/MacOS/<bin>`, and the `.app` suffix is checked:

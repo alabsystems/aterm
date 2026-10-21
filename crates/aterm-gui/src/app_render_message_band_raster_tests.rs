@@ -153,7 +153,7 @@ fn a_capture_at_an_injected_instant_is_deterministic() {
 fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
     let theme = aterm_render::Theme::default();
     let Some(mut cpu) = aterm_render::Renderer::from_system(20.0, theme) else {
-        return;
+        aterm_spec::host::could_not_run("no system monospace font here");
     };
     let mut app = App::headless_for_test();
     let wid = WindowId(0);

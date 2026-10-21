@@ -20,7 +20,8 @@
 //!
 //! The models are authored, not derived from the code. Tier-1 for the probe and the reset is
 //! aterm-agent `supervise/run_engine_tests.rs`, over a scripted server. The vendor's side of both
-//! is read from the Claude Code 2.1.287 bundle, never seen on a screen.
+//! is read in its bundle, never seen on a screen: the probe's in Claude Code 2.1.287's, the reset's
+//! in 2.1.304's (2.1.287's until 2026-10-19).
 
 use aterm_spec::derive::{Liveness, Model};
 
@@ -1461,9 +1462,10 @@ pub fn supervisor_usage_probe_liveness() -> Liveness {
 /// `supervise/policy/reset.rs` `confirm_verdict`; `harness/accounts.rs` `claim_reset`,
 /// `reset_in_flight`, `reset_outcome`; `supervise/reset_loop.rs` `reset_take`,
 /// `reset_look`, `reset_run`; the readers of `aterm_phase::reset`): at a usage wall whose
-/// dialog offers the owner's limit reset, the loop takes the grant row, reads the
-/// confirmation that opens, and presses Enter on `Yes, use my reset`, or Escapes it. A
-/// reset is the owner's scarce purchase, so: one attempt a wall, on a claim made for it,
+/// dialog offers the owner's limit reset, the loop takes the grant row (the one reset on
+/// offer, of a kind it takes, Claude Code 2.1.304), reads the confirmation that opens, and
+/// presses Enter on its `Yes, use my <kind>`, or Escapes it. A reset is the owner's scarce
+/// purchase, so: one attempt a wall, on a claim made for it,
 /// never the weekly row that can stand in its slot; Enter only on the exact confirmation of
 /// the row this loop took, past the vendor's guard, focus on Yes, claim still in flight;
 /// nothing keyed under a person's hand; only the vendor's line says a reset was spent; a
@@ -1472,11 +1474,11 @@ pub fn supervisor_usage_probe_liveness() -> Liveness {
 ///
 /// State:
 /// * `dlg` — the vendor's box on session one's screen: 0 none, 1 the wall dialog with the
-///   grant row (`Use your reset now (…)`), 2 with the weekly row in that slot (`Reset your
-///   session limit now`, which claims at once), 3 the title over `Checking for a reset…`,
-///   4 the exact confirmation, 5 one the loop must keep (`confirm_verdict`: the early-use
-///   line, another limit, a count or day not the row's, a deadline that does not qualify),
-///   6 the title over `Resetting your limits…`.
+///   grant row (`Use a weekly reset (…)`, or another kind's), 2 with the weekly row in that
+///   slot (`Reset your session limit now`, which claims at once), 3 the title over
+///   `Checking for a reset…`, 4 the exact confirmation, 5 one the loop must keep
+///   (`confirm_verdict`: the early-use line, another kind or limit, a count or day not the
+///   row's, a deadline that does not qualify), 6 the title over `Resetting your limits…`.
 /// * `guard` — 1 inside the vendor's guard (confirm and cancel refused for 250 ms from
 ///   mount); `focus` — 1 on Yes, where it opens.
 /// * `claim` — the machine's one slot for this wall: 0 none, 1 session one's and in
@@ -1484,8 +1486,9 @@ pub fn supervisor_usage_probe_liveness() -> Liveness {
 /// * `ph` — the loop's memory, kept in the session ledger for a later loop: 0 idle, 1 row
 ///   taken, 2 Enter written, 3 Escape written. `own` — 1 while this loop took the row; a
 ///   restart ends it.
-/// * `line` — the vendor's transcript line: 0 none, 1 `Limits reset` (spent), 2 the limit
-///   lifted by itself, 3 `Reset kept`, 4 anything else (a failure).
+/// * `line` — the vendor's transcript line: 0 none, 1 a spent line (`Weekly limits reset ·
+///   …`, or the kind's own), 2 the limit lifted by itself, 3 `<Kind> kept`, 4 anything else
+///   (a failure).
 /// * `s2` — another session on the account: 0 working, 1 at the wall, 2 moved, 3 continued
 ///   in place.
 /// * `hand` — a person's keystroke within the grace; `hold` — the session halted (no step

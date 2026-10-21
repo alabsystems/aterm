@@ -713,9 +713,12 @@ pub(crate) fn plan_incarnation(
 /// Whether `dir` shares a device with the boot volume: the device that loses power
 /// only together with the kernel, so a page cache that has run throughout this boot
 /// still holds every write made to it. astream's weak tiers ask the same question of
-/// their log's directory (`astream-broker`'s `store.rs`, `on_boot_volume`). Off it, a
-/// removable or network disk can vanish while the kernel runs and take an unflushed
-/// write with it, so no lease written there is trusted.
+/// their log FILE's own device, never its directory's, so a log symlinked onto another
+/// volume is judged where it lives. That predicate is public
+/// (`astream_broker::on_boot_volume`, over an open `File`; a directory opened as one
+/// answers for the files written in it), and this copy is to give way to it. Off the
+/// boot volume, a removable or network disk can vanish while the kernel runs and take
+/// an unflushed write with it, so no lease written there is trusted.
 #[cfg(unix)]
 fn on_boot_volume(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -778,6 +781,9 @@ pub(crate) struct IncSeam {
 /// The bridge's state directory.
 pub struct StateDir {
     root: PathBuf,
+    /// THE DOOR every write of this dir goes through ([`crate::fx::Disk`]): the
+    /// filesystem as it always was, or a simulated device that can lose power.
+    disk: crate::fx::Disk,
     /// TEST-ONLY: what this dir's writers did to the filesystem ([`FileOps`]).
     #[cfg(test)]
     ops: std::sync::Mutex<FileOps>,
@@ -1082,15 +1088,30 @@ impl StateDir {
     ///
     /// If the directory cannot be created.
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::open_on(root, crate::fx::Disk::Os)
+    }
+
+    /// [`StateDir::open`], writing through `disk` (the bridge's door,
+    /// [`crate::fx::Fx::disk`]).
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be created.
+    pub(crate) fn open_on(root: impl Into<PathBuf>, disk: crate::fx::Disk) -> io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(root.join("seen"))?;
         std::fs::create_dir_all(root.join("sent"))?;
-        Ok(Self::at(root))
+        Ok(Self::at_on(root, disk))
     }
 
     fn at(root: PathBuf) -> Self {
+        Self::at_on(root, crate::fx::Disk::Os)
+    }
+
+    fn at_on(root: PathBuf, disk: crate::fx::Disk) -> Self {
         Self {
             root,
+            disk,
             #[cfg(test)]
             ops: std::sync::Mutex::default(),
             #[cfg(test)]
@@ -1136,7 +1157,17 @@ impl StateDir {
     /// Unlink `name`, counted ([`FileOps::unlinks`]).
     fn unlink(&self, name: &str) -> io::Result<()> {
         self.count(|ops| ops.unlinks += 1);
-        std::fs::remove_file(self.path(name))
+        self.remove_path(&self.path(name))
+    }
+
+    /// THE ONE UNLINK every file of this dir is removed by, through the dir's
+    /// door ([`crate::fx::Disk`]): `std::fs::remove_file`, its error as it is.
+    fn remove_path(&self, path: &Path) -> io::Result<()> {
+        let w = crate::fx::Write::Remove { path };
+        self.disk.before(w)?;
+        std::fs::remove_file(path)?;
+        self.disk.after(w);
+        Ok(())
     }
 
     /// A state directory to read, creating nothing: `aterm fabric`'s report must not
@@ -1433,6 +1464,13 @@ impl StateDir {
     fn replace_bytes(&self, name: &str, bytes: &[u8], durable: bool, mode: u32) -> io::Result<()> {
         let target = self.path(name);
         let parent = target.parent().unwrap_or(&self.root);
+        let w = crate::fx::Write::Replace {
+            path: &target,
+            bytes,
+            durable,
+            mode,
+        };
+        self.disk.before(w)?;
         std::fs::create_dir_all(parent)?;
         let (tmp, mut f) = crate::enable::create_temp_beside(&target, mode)?;
         self.count(|ops| {
@@ -1463,6 +1501,7 @@ impl StateDir {
                 sync_dir(parent)?;
             }
         }
+        self.disk.after(w);
         Ok(())
     }
 
@@ -1878,12 +1917,19 @@ impl StateDir {
     pub(crate) fn append_self_acked(&self, off: u64) -> io::Result<()> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         self.count(|ops| ops.appends += 1);
+        let path = self.path("acked");
+        let line = AckedLog::render(std::iter::once(off));
+        let w = crate::fx::Write::Append {
+            path: &path,
+            bytes: line.as_bytes(),
+        };
+        self.disk.before(w)?;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .mode(0o666)
             .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
-            .open(self.path("acked"))?;
+            .open(&path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || metadata.uid() != aterm_uds::peer::our_uid()
@@ -1894,7 +1940,9 @@ impl StateDir {
                 "the acked log is not an owned regular single-link file",
             ));
         }
-        file.write_all(AckedLog::render(std::iter::once(off)).as_bytes())
+        file.write_all(line.as_bytes())?;
+        self.disk.after(w);
+        Ok(())
     }
 
     /// Every record in flight onto this node's own lanes, by sequence: written before
@@ -1977,10 +2025,47 @@ impl StateDir {
         )
     }
 
-    /// Forget the in-flight record at `seq`: it landed and `acked` holds its offset,
-    /// or it provably did not land.
+    /// Forget the in-flight record at `seq`: it landed and `acked` holds its offset.
+    ///
+    /// Atomic only, as the entry itself is: an unlink a power cut rolls back brings
+    /// the entry back, and the next attach publishes it again at its sequence, which
+    /// the broker dedups to the offset it already has (or, where the cut took the
+    /// record too, lands the record the bridge had decided to publish, once). A
+    /// record that did NOT land is dropped durably ([`StateDir::drop_in_flight`]).
     pub(crate) fn clear_in_flight(&self, seq: u64) {
         let _ = self.unlink(&format!("inflight/{seq}"));
+    }
+
+    /// DROP the in-flight record at `seq` FOR GOOD: it provably did not land — the
+    /// broker refused it, another writer holds its sequence, it is not provably ours
+    /// — or it was decided on another log and is not published on this one. The
+    /// unlink is flushed (the `inflight/` directory), because what the bridge does
+    /// next says so to somebody: a post retired `off=-`, a receipt `unacked`, a
+    /// sender told its post did not go. Brought back by a power cut, the entry would
+    /// be published by the next attach after all — after the sender's later posts,
+    /// and on the lane of a session that may have left. One directory flush, spent
+    /// only on a refusal or a move of the log, never per message.
+    ///
+    /// # Errors
+    ///
+    /// The unlink's (other than a missing entry) or the flush's.
+    pub(crate) fn drop_in_flight(&self, seq: u64) -> io::Result<()> {
+        match self.unlink(&format!("inflight/{seq}")) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        self.flush_dir(&self.path("inflight"))
+    }
+
+    /// Flush the directory `dir` through the dir's door ([`crate::fx::Disk`]), so
+    /// every entry change in it (an unlink, a rename) survives a power loss.
+    fn flush_dir(&self, dir: &Path) -> io::Result<()> {
+        let w = crate::fx::Write::SyncDir { path: dir };
+        self.disk.before(w)?;
+        self.count(|ops| ops.fsyncs += 1);
+        sync_dir(dir)?;
+        self.disk.after(w);
+        Ok(())
     }
 
     /// The highest fleet-halt offset this node has published an `ack` for, so a
@@ -2037,7 +2122,7 @@ impl StateDir {
     ///
     /// Any I/O failure other than the file already being gone.
     pub fn clear_inbox_owed(&self) -> io::Result<()> {
-        match std::fs::remove_file(self.path("inbox-owed")) {
+        match self.remove_path(&self.path("inbox-owed")) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
@@ -2051,7 +2136,7 @@ impl StateDir {
     ///
     /// Any I/O failure other than the file already being gone.
     pub fn clear_halt_acked(&self) -> io::Result<()> {
-        match std::fs::remove_file(self.path("halt-acked")) {
+        match self.remove_path(&self.path("halt-acked")) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
@@ -2102,15 +2187,23 @@ impl StateDir {
     ///   position is no evidence about a publication on this log. Clamped: only
     ///   one at or above `f`;
     /// * an `inflight/*` record carrying a `re=` and witnessed on a different known
-    ///   log goes — clamped, only one whose `re=` is at or above `f`, and one below
-    ///   it is re-witnessed onto `log`, where the attach then replays it — returned as
-    ///   `(sequence, face)` for the attach to report. One with an unknown witness
-    ///   or no `re=` stays: absence is not proof that a pending body belongs to
-    ///   another log. That is a body this node DECIDED to publish and holds no
-    ///   proof of, so it is published on this log — which is why an entry ends in
-    ///   the step that writes its record's offset to `acked`, and never outlives
-    ///   the record's delivery: one kept past it would publish a delivered record
-    ///   here a second time.
+    ///   log goes — clamped, only one whose `re=` is at or above ITS OWN fork, and
+    ///   one below it is re-witnessed onto `log`, durably, where the attach then
+    ///   replays it — returned as `(sequence, face)` for the attach to report, and
+    ///   dropped durably ([`StateDir::drop_in_flight`]'s reason: the attach says
+    ///   so, and a receipt goes `unacked`). An entry's own fork is where `log`
+    ///   continues the log IT was witnessed on, read off `lineage`
+    ///   (`LogIdentity::continues`), and never above `f`: an entry a power cut
+    ///   rolled back to an older generation than the one `f` is measured from
+    ///   parts from this log at the LOWEST fork of the generations between, and
+    ///   `f` alone would keep a `re=` that names another record here. With no
+    ///   `lineage`, `f` is every entry's. One with an unknown witness or no `re=`
+    ///   stays: absence is not proof that a pending body belongs to another log.
+    ///   That is a body this node DECIDED to publish and holds no proof of, so it
+    ///   is published on this log — which is why an entry ends in the step that
+    ///   writes its record's offset to `acked`, and never outlives the record's
+    ///   delivery: one kept past it would publish a delivered record here a second
+    ///   time.
     ///
     /// Node-scoped facts stay (`node`, `inc`, `seq`, `pins`, `acks/`, and the
     /// sequences, identities and key ownership in `sent/` and `keys/`), and so do
@@ -2134,6 +2227,7 @@ impl StateDir {
         head: u64,
         log: Option<astream_broker::LogIdentity>,
         keep_below: Option<u64>,
+        lineage: Option<&astream_broker::Lineage>,
     ) -> io::Result<Vec<(u64, String)>> {
         // A fork above the head cannot be: the log grew from it. Held to the
         // head, so a cursor never resumes past what this log holds.
@@ -2226,7 +2320,7 @@ impl StateDir {
             .collect();
         let asked: Vec<Asked> = self.asked().into_iter().filter(|a| kept(a.off)).collect();
         for path in seen_removed.into_iter().chain(unhandled_removed) {
-            match std::fs::remove_file(path) {
+            match self.remove_path(&path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
@@ -2252,28 +2346,52 @@ impl StateDir {
         self.set_deadlines(&deadlines)?;
         self.set_asked(&asked)?;
         let mut dropped = Vec::new();
+        let mut moved = false;
         for (seq, entry) in in_flight {
-            let different_log = matches!((entry.log, log), (Some(was), Some(now)) if was != now);
+            let (Some(was), Some(now)) = (entry.log, log) else {
+                continue;
+            };
             let re = crate::body::Body::decode(&entry.body).0.re;
-            if !different_log || re.is_none() {
+            if was == now || re.is_none() {
                 continue;
             }
+            // THE ENTRY'S OWN FORK: where this log continues the one the entry
+            // was witnessed on. `f` is measured from the log the bridge last
+            // read; an entry from an older generation — a drop or a re-witness
+            // that a power cut rolled back — parts from this log at the lowest
+            // fork of every generation between, which `f` alone overstates.
+            let fork = match lineage {
+                Some(lineage) => keep_below.and_then(|f| Some(f.min(now.continues(was, lineage)?))),
+                None => keep_below,
+            };
             // A REPLY BELOW THE FORK IS RE-WITNESSED ONTO THIS LOG: its `re=`
             // names the same record here, and the journal's witness is what
             // the attach's replay goes by ([`crate::bridge`]'s
             // `settle_in_flight`, which replays a reference only on the log it
             // names). Kept under the old witness it would survive this clamp
-            // only to be dropped there, unpublished. Rewritten before the
-            // bridge's own witness moves, so a crash in between finds it
-            // already on this log and keeps it: the clamp stays idempotent.
-            if re.is_some_and(kept) {
-                self.set_in_flight(&InFlight { log, ..entry })?;
+            // only to be dropped there, unpublished. Rewritten durably before
+            // the bridge's own witness moves, so neither a crash nor a power
+            // cut in between finds it on the old log once the witness says the
+            // new one: the clamp stays idempotent.
+            if re.is_some_and(|off| fork.is_some_and(|f| off < f)) {
+                self.replace(
+                    &format!("inflight/{seq}"),
+                    &InFlight { log, ..entry }.render(),
+                    true,
+                    0o600,
+                )?;
                 continue;
             }
-            match std::fs::remove_file(self.path(&format!("inflight/{seq}"))) {
+            match self.remove_path(&self.path(&format!("inflight/{seq}"))) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-                _ => dropped.push((seq, entry.subject)),
+                _ => {
+                    moved = true;
+                    dropped.push((seq, entry.subject));
+                }
             }
+        }
+        if moved {
+            self.flush_dir(&self.path("inflight"))?;
         }
         Ok(dropped)
     }
@@ -2342,11 +2460,11 @@ impl StateDir {
     /// restart cannot find the old witness without its refusal.
     pub(crate) fn clear_rewound_log(&self, witness: &LogWitness) -> io::Result<()> {
         self.write_durable("bus-log", &witness.render())?;
-        match std::fs::remove_file(self.path("rewound-log")) {
+        match self.remove_path(&self.path("rewound-log")) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
         }
-        sync_dir(&self.root)
+        self.flush_dir(&self.root)
     }
 
     /// The fleet halts of `fleet` this node holds in force: `human → StandingHalt`.
@@ -2502,8 +2620,8 @@ impl StateDir {
     /// Forget the broadcast cursors of a session gone from the roster, and the
     /// refill floors that rest on them ([`Self::topic_floors`]).
     pub fn forget_topics(&self, sid: &str) {
-        let _ = std::fs::remove_file(self.path(&format!("topics/{sid}")));
-        let _ = std::fs::remove_file(self.path(&format!("unhandled/{sid}")));
+        let _ = self.remove_path(&self.path(&format!("topics/{sid}")));
+        let _ = self.remove_path(&self.path(&format!("unhandled/{sid}")));
     }
 
     /// One session's broadcast refill floors: per topic, the lowest offset of a
@@ -2601,7 +2719,7 @@ impl StateDir {
     pub fn set_topic_floors(&self, sid: &str, floors: &BTreeMap<String, u64>) -> io::Result<()> {
         let name = format!("unhandled/{sid}");
         if floors.is_empty() {
-            return match std::fs::remove_file(self.path(&name)) {
+            return match self.remove_path(&self.path(&name)) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
                 _ => Ok(()),
             };
@@ -2674,7 +2792,7 @@ impl StateDir {
     /// Forget a retired receipt's sequence. Called only after the endpoint has
     /// taken the retirement.
     pub fn clear_receipt_seq(&self, sid: &str, rid: u64) {
-        let _ = std::fs::remove_file(self.path(&format!("acks/{sid}.{rid}")));
+        let _ = self.remove_path(&self.path(&format!("acks/{sid}.{rid}")));
     }
 
     /// The producer sequence a session's `post key=<key>` reserved, if any post under
@@ -2981,7 +3099,8 @@ mod tests {
         );
 
         st.set_topic_floors("s-y", &floors).expect("write");
-        st.forget_log_offsets(100, None, None).expect("re-base");
+        st.forget_log_offsets(100, None, None, None)
+            .expect("re-base");
         assert!(
             st.topic_floors("s-y").unwrap().is_empty(),
             "a floor names a record of the old log"
@@ -3408,26 +3527,30 @@ mod tests {
         };
         st.set_in_flight(&note).unwrap();
         assert_eq!(
-            st.forget_log_offsets(100, Some(b), None).unwrap(),
+            st.forget_log_offsets(100, Some(b), None, None).unwrap(),
             vec![(1, face.to_string())]
         );
         let kept = vec![(2, entry(2, None)), (3, entry(3, Some(b))), (4, note)];
         assert_eq!(st.in_flight().unwrap(), kept);
         assert!(
-            st.forget_log_offsets(100, Some(b), None)
+            st.forget_log_offsets(100, Some(b), None, None)
                 .unwrap()
                 .is_empty(),
             "idempotent"
         );
         assert!(
-            st.forget_log_offsets(7, None, None).unwrap().is_empty(),
+            st.forget_log_offsets(7, None, None, None)
+                .unwrap()
+                .is_empty(),
             "no identity proves no mismatch"
         );
         assert_eq!(st.in_flight().unwrap(), kept, "uncertainty is retained");
         st.set_seen_off("s-b", 44).unwrap();
         st.write("inflight/5", "damaged").unwrap();
         assert_eq!(
-            st.forget_log_offsets(7, Some(b), None).unwrap_err().kind(),
+            st.forget_log_offsets(7, Some(b), None, None)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
         assert!(dir.join("inflight/5").exists(), "damage is kept for repair");
@@ -3521,7 +3644,7 @@ mod tests {
         let st = StateDir::open(&dir).unwrap();
         fill(&st);
         assert_eq!(
-            st.forget_log_offsets(12, Some(new), Some(5)).unwrap(),
+            st.forget_log_offsets(12, Some(new), Some(5), None).unwrap(),
             vec![answer(2)],
             "only the in-flight reply to a record the loss took goes"
         );
@@ -3567,7 +3690,7 @@ mod tests {
         };
         clamped(&st);
         assert!(
-            st.forget_log_offsets(12, Some(new), Some(5))
+            st.forget_log_offsets(12, Some(new), Some(5), None)
                 .unwrap()
                 .is_empty(),
             "idempotent"
@@ -3575,7 +3698,8 @@ mod tests {
         clamped(&st);
         // A fork above the head cannot be (the log grew from it): held to the head.
         st.set_topics("s-z", &cursors(&[("d", 30)])).unwrap();
-        st.forget_log_offsets(12, Some(new), Some(40)).unwrap();
+        st.forget_log_offsets(12, Some(new), Some(40), None)
+            .unwrap();
         assert_eq!(st.topics("s-z"), cursors(&[("d", 12)]));
 
         // NEGATIVE CONTROL: another log forgets every offset.
@@ -3583,7 +3707,7 @@ mod tests {
         let st = StateDir::open(&twin).unwrap();
         fill(&st);
         assert_eq!(
-            st.forget_log_offsets(12, Some(new), None).unwrap(),
+            st.forget_log_offsets(12, Some(new), None, None).unwrap(),
             vec![answer(1), answer(2)]
         );
         assert_eq!((st.seen_off("s-low"), st.seen_off("s-high")), (None, None));
@@ -3597,6 +3721,83 @@ mod tests {
             None
         );
         assert!(st.in_flight().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&twin);
+    }
+
+    /// AN IN-FLIGHT REPLY IS JUDGED AT ITS OWN LOG'S FORK. Generation 0 parted
+    /// from generation 1 at 41 and generation 1 from generation 2 at 138, so the
+    /// move onto generation 2 clamps at 138 — but a reply witnessed on
+    /// generation 0 (a drop or a re-witness at the first move that a power cut
+    /// rolled back, `crate::sim` seed 3113) names a record of generation 2 only
+    /// below 41. Judged at 138 alone, its `ack re=41` was carried onto
+    /// generation 2 and published there, naming whatever generation 1 put at 41.
+    #[test]
+    fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on() {
+        let log = |generation| astream_broker::LogIdentity {
+            id: [0x3c; 16],
+            generation,
+        };
+        let lineage =
+            crate::durability::lineage_of(&[(1, 41), (2, 138)]).expect("a lineage astream reads");
+        let entry = |seq: u64, re: u64, generation: u64| InFlight {
+            pin: PublishPin {
+                seq,
+                via_key: false,
+                identity: None,
+                original: None,
+                original_off: None,
+                owner: None,
+            },
+            subject: "/f/f/in/n-a/s-b/n-a/ack".into(),
+            body: format!("v=1 t=1 re={re}").into_bytes(),
+            log: Some(log(generation)),
+        };
+        let fill = |st: &StateDir| {
+            st.set_in_flight(&entry(1, 40, 0)).unwrap();
+            st.set_in_flight(&entry(2, 41, 0)).unwrap();
+            st.set_in_flight(&entry(3, 137, 1)).unwrap();
+            st.set_in_flight(&entry(4, 138, 1)).unwrap();
+        };
+        let ack = |seq: u64| (seq, "/f/f/in/n-a/s-b/n-a/ack".to_string());
+        let dir = scratch("own-fork");
+        let st = StateDir::open(&dir).unwrap();
+        fill(&st);
+        let keep_below = LogWitness {
+            high: 150,
+            id: Some(log(1)),
+        }
+        .continues(Some(log(2)), Some(&lineage));
+        assert_eq!(keep_below, Some(138), "the newest move's fork");
+        assert_eq!(
+            st.forget_log_offsets(150, Some(log(2)), keep_below, Some(&lineage))
+                .unwrap(),
+            vec![ack(2), ack(4)],
+            "generation 0's reply at 41 and generation 1's at 138 go"
+        );
+        let rewitnessed = |seq, re, generation| {
+            (
+                seq,
+                InFlight {
+                    log: Some(log(2)),
+                    ..entry(seq, re, generation)
+                },
+            )
+        };
+        assert_eq!(
+            st.in_flight().unwrap(),
+            vec![rewitnessed(1, 40, 0), rewitnessed(3, 137, 1)],
+            "each kept below its own fork, re-witnessed onto generation 2"
+        );
+        // No lineage: the one fork the caller judged is every entry's.
+        let twin = scratch("own-fork-none");
+        let st = StateDir::open(&twin).unwrap();
+        fill(&st);
+        assert_eq!(
+            st.forget_log_offsets(150, Some(log(2)), keep_below, None)
+                .unwrap(),
+            vec![ack(4)]
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&twin);
     }
@@ -3809,13 +4010,13 @@ mod tests {
             }
             std::os::unix::fs::symlink(dir.join("missing"), &area).unwrap();
             assert!(
-                st.forget_log_offsets(20, None, None).is_err(),
+                st.forget_log_offsets(20, None, None, None).is_err(),
                 "unreadable {blocked} was empty"
             );
             assert!(area.is_symlink(), "the unreadable directory entry stays");
             std::fs::remove_file(&area).unwrap();
             assert!(
-                st.forget_log_offsets(20, None, None).is_ok(),
+                st.forget_log_offsets(20, None, None, None).is_ok(),
                 "an absent directory is empty"
             );
             let _ = std::fs::remove_dir_all(&dir);
@@ -4347,26 +4548,36 @@ mod tests {
     /// the file every lease was flushed into (a copy of the dir is
     /// `a_copied_state_dir_flushes_its_own_inc_before_trusting_a_lease`'s), so the lease
     /// names the `inc` laid down.
+    ///
+    /// A file the state holds is written over in place and only one it does not hold is
+    /// removed: the bytes are the state's either way, at one call per file.
     fn lay_down(st: &StateDir, s: &aterm_spec::interp::State) {
         let v = |name: &str| u64::try_from(s[name]).expect("a model value is not negative");
-        for file in ["inc", "inc-lease", "seq"] {
-            let _ = std::fs::remove_file(st.path(file));
-        }
-        if v("c_inc") > 0 {
-            std::fs::write(st.path("inc"), v("c_inc").to_string()).expect("inc");
-        }
-        if v("c_lb") > 0 {
-            let lease = IncLease {
-                used: v("c_used"),
-                top: v("c_top"),
-                boot: Some(boot_id(u8::try_from(v("c_lb")).expect("a small boot"))),
-                file: st.inc_file(),
-            };
-            std::fs::write(st.path("inc-lease"), lease.render()).expect("inc-lease");
-        }
-        if v("c_seq") > 0 {
-            std::fs::write(st.path("seq"), ((v("c_seq") << 32) + 64).to_string()).expect("seq");
-        }
+        let put = |file: &str, held: Option<String>| match held {
+            Some(text) => std::fs::write(st.path(file), text).expect(file),
+            None => match std::fs::remove_file(st.path(file)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => panic!("{file}: {e}"),
+                _ => {}
+            },
+        };
+        put("inc", (v("c_inc") > 0).then(|| v("c_inc").to_string()));
+        // After `inc`: the lease names the `inc` laid down.
+        put(
+            "inc-lease",
+            (v("c_lb") > 0).then(|| {
+                IncLease {
+                    used: v("c_used"),
+                    top: v("c_top"),
+                    boot: Some(boot_id(u8::try_from(v("c_lb")).expect("a small boot"))),
+                    file: st.inc_file(),
+                }
+                .render()
+            }),
+        );
+        put(
+            "seq",
+            (v("c_seq") > 0).then(|| ((v("c_seq") << 32) + 64).to_string()),
+        );
     }
 
     /// The files read back as the model's page-cache variables
@@ -4387,14 +4598,16 @@ mod tests {
         ]
     }
 
-    /// Run the REAL take from every planned state `model` reaches, at each kill point,
-    /// with `mutant`'s defect, and name every one whose files are not the model's
-    /// successor (or whose answer is not the model's `pn`) — or only the first, when
-    /// `first` (a negative control asks only that one exists). A kill point the take
-    /// does not reach (a take that does not flush) must complete it as the model's
-    /// `Take` does; a state whose flush the model's bound cuts off is not compared.
+    /// Run the REAL take from every planned state of `states` (what `model` reaches), at
+    /// each kill point, with `mutant`'s defect, and name every one whose files are not
+    /// the model's successor (or whose answer is not the model's `pn`) — or only the
+    /// first, when `first` (a negative control asks only that one exists). A kill point
+    /// the take does not reach (a take that does not flush) must complete it as the
+    /// model's `Take` does; a state whose flush the model's bound cuts off is not
+    /// compared. Each call takes in a dir of its own, so calls run side by side.
     fn diverging_takes(
         model: &aterm_spec::derive::Model,
+        states: &[aterm_spec::interp::State],
         mutant: u8,
         first: bool,
     ) -> (usize, Vec<String>) {
@@ -4404,24 +4617,25 @@ mod tests {
             .find(|(name, _)| *name == "Span")
             .map(|(_, v)| u64::try_from(*v).expect("a positive span"))
             .expect("the model declares Span");
-        let dir = scratch(&format!("inclease-walk-{mutant}"));
+        let walk = if first { "control" } else { "walk" };
+        let dir = scratch(&format!("inclease-{walk}-{mutant}"));
         let st = StateDir::open(&dir).expect("open");
         let mut seen = std::collections::BTreeSet::new();
         let (mut compared, mut diverged) = (0, Vec::new());
-        for s in aterm_spec::interp::reachable_states(model) {
+        for s in states {
             let key = ["boot", "c_inc", "c_used", "c_top", "c_lb", "c_seq", "pc"].map(|k| s[k]);
             if s["pc"] != 1 || !seen.insert(key) {
                 continue;
             }
             let completed = ["Take", "TakeFlushed"]
                 .iter()
-                .find_map(|a| model.successors(a, &s).into_iter().next());
+                .find_map(|a| model.successors(a, s).into_iter().next());
             for (kill, action) in [
                 (None, None),
                 (Some(IncStep::Renamed), Some("KillRenamed")),
                 (Some(IncStep::Flushed), Some("KillFlushed")),
             ] {
-                let killed = action.and_then(|a| model.successors(a, &s).into_iter().next());
+                let killed = action.and_then(|a| model.successors(a, s).into_iter().next());
                 let (expect, dies) = match (killed, &completed) {
                     (Some(k), _) => (k, true),
                     (None, Some(c)) => (c.clone(), false),
@@ -4430,7 +4644,7 @@ mod tests {
                 if kill.is_some() && !dies && s["tr"] == 0 {
                     continue; // a flush the bound cut off is no kill point
                 }
-                lay_down(&st, &s);
+                lay_down(&st, s);
                 st.set_inc_seam(IncSeam {
                     boot: Some(Some(boot_id(u8::try_from(s["boot"]).expect("small")))),
                     kill_at: kill,
@@ -4485,19 +4699,50 @@ mod tests {
     /// the will only after `take_incarnation` returned.
     #[test]
     fn the_incarnation_lease_refines_its_model() {
+        use aterm_spec::interp::{reachable_states, with_consts};
         let committed = aterm_models_session::incarnation_lease_model();
-        for buggy in 0..=3u8 {
+        let walk = |buggy: u8| {
             // A defective machine keeps going past its first duplicate, so its space is
             // walked over one power loss (every Tier-0 counterexample needs one), the
             // committed machine's over the committed two.
             let model = match buggy {
                 0 => committed.clone(),
-                _ => aterm_spec::interp::with_consts(
-                    &committed,
-                    &[("Buggy", i64::from(buggy)), ("MaxBoot", 2)],
-                ),
+                _ => with_consts(&committed, &[("Buggy", i64::from(buggy)), ("MaxBoot", 2)]),
             };
-            let (compared, diverged) = diverging_takes(&model, buggy, false);
+            (
+                buggy,
+                diverging_takes(&model, &reachable_states(&model), buggy, false),
+            )
+        };
+        // Over one power loss and a higher bound: defect 2 shows only on the retry of a
+        // run-out lease, whose committed flush lands above the committed bound.
+        let roomier = with_consts(&committed, &[("MaxTop", 7), ("MaxBoot", 2)]);
+        let roomier_states = reachable_states(&roomier);
+        // The committed walk, the largest space and about half the test's time, on a
+        // thread of its own beside the rest: each walk takes in a dir of its own and
+        // mostly waits on its file system calls.
+        let (walks, controls) = std::thread::scope(|scope| {
+            let committed_walk = scope.spawn(|| walk(0));
+            let defective: Vec<_> = (1..=3u8).map(walk).collect();
+            let controls: Vec<_> = (1..=3u8)
+                .map(|mutant| {
+                    (
+                        mutant,
+                        diverging_takes(&roomier, &roomier_states, mutant, true),
+                    )
+                })
+                .collect();
+            let committed_walk = committed_walk
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (
+                std::iter::once(committed_walk)
+                    .chain(defective)
+                    .collect::<Vec<_>>(),
+                controls,
+            )
+        });
+        for (buggy, (compared, diverged)) in walks {
             eprintln!("IncarnationLease Buggy = {buggy}: {compared} takes held to the model");
             assert!(
                 compared > 100,
@@ -4510,11 +4755,7 @@ mod tests {
                 diverged.join("\n")
             );
         }
-        // Over one power loss and a higher bound: defect 2 shows only on the retry of a
-        // run-out lease, whose committed flush lands above the committed bound.
-        let roomier = aterm_spec::interp::with_consts(&committed, &[("MaxTop", 7), ("MaxBoot", 2)]);
-        for mutant in 1..=3u8 {
-            let (compared, diverged) = diverging_takes(&roomier, mutant, true);
+        for (mutant, (compared, diverged)) in controls {
             assert!(
                 !diverged.is_empty(),
                 "the take's defect {mutant} matched the committed model in all {compared} takes"
@@ -4562,7 +4803,7 @@ mod tests {
         let mut cursors = BTreeMap::new();
         cursors.insert("t".to_string(), TopicCursor { next: c });
         st.set_topics("s-r", &cursors).expect("write the cursor");
-        st.forget_log_offsets(h, Some(log(g)), keep_below)
+        st.forget_log_offsets(h, Some(log(g)), keep_below, Some(&lineage))
             .expect("forget or clamp");
         i64::try_from(st.topics("s-r")["t"].next).expect("an offset")
     }
@@ -4595,27 +4836,26 @@ mod tests {
             .expect("the model's Top");
         let dir = scratch("resume-tier1");
         let st = StateDir::open(&dir).expect("open");
-        let mut real: BTreeMap<[i64; 6], (i64, i64)> = BTreeMap::new();
-        // The (real, re-based) cursors for a state, each run once per distinct input.
+        let mut real: BTreeMap<[i64; 6], i64> = BTreeMap::new();
+        // The real reader's cursor for a state, run once per distinct input.
         let mut run = |s: &std::collections::BTreeMap<&'static str, i64>| {
             let key = ["g", "rg", "h", "c", "f1", "f2"].map(|v| s[v]);
-            *real.entry(key).or_insert_with(|| {
-                (
-                    resume_through(&st, s, top, false),
-                    resume_through(&st, s, top, true),
-                )
-            })
+            *real
+                .entry(key)
+                .or_insert_with(|| resume_through(&st, s, top, false))
         };
-        // Walk `model`'s reachable deciding states; answer (compared, real diverged, re-based
-        // diverged).
-        let mut walk = |model: &aterm_spec::derive::Model, laws: bool| {
-            let (mut compared, mut diverged, mut rebased) = (0, Vec::new(), 0);
+        // Walk `model`'s reachable deciding states; answer (compared, real diverged, whether
+        // the re-based reader was refused). The committed model is held to every one; a
+        // defective model needs only one divergence, and the re-based reader only one
+        // refusal, so each runs until it has it.
+        let mut walk = |model: &aterm_spec::derive::Model, committed: bool| {
+            let (mut compared, mut diverged, mut rebase_refused) = (0, Vec::new(), false);
             for state in interp::reachable_states(model) {
                 let deciding = state["pc"] == 0 && state["down"] == 0 && state["rg"] < state["g"];
                 if !deciding {
                     continue;
                 }
-                let (cursor, rebase) = run(&state);
+                let cursor = run(&state);
                 let decided = |r| {
                     let mut next = state.clone();
                     next.insert("r", r);
@@ -4631,7 +4871,7 @@ mod tests {
                     // one is held to them.
                     for law in ["NoSkipInWindow", "AnotherLogOutsideWindow"]
                         .into_iter()
-                        .filter(|_| laws)
+                        .filter(|_| committed)
                     {
                         assert!(
                             model.check_invariant(law, &resumed),
@@ -4641,15 +4881,20 @@ mod tests {
                     }
                 } else {
                     diverged.push(format!("{state:?}: real {cursor}"));
+                    if !committed {
+                        break;
+                    }
                 }
-                if interp::admits(model, &state, &decided(rebase)) != Some("Decide") {
-                    rebased += 1;
+                if committed && !rebase_refused {
+                    let rebase = resume_through(&st, &state, top, true);
+                    rebase_refused =
+                        interp::admits(model, &state, &decided(rebase)) != Some("Decide");
                 }
             }
-            (compared, diverged, rebased)
+            (compared, diverged, rebase_refused)
         };
 
-        let (compared, diverged, rebased) = walk(&committed, true);
+        let (compared, diverged, rebase_refused) = walk(&committed, true);
         eprintln!("FabricReaderResume: {compared} resumes held to the model");
         assert!(compared > 100, "only {compared} resumes compared");
         assert!(
@@ -4659,7 +4904,7 @@ mod tests {
             diverged.join("\n")
         );
         assert!(
-            rebased > 0,
+            rebase_refused,
             "NEGATIVE CONTROL: the reader that re-bases at the head matched the model in all \
              {compared} resumes"
         );
@@ -4689,14 +4934,14 @@ mod tests {
             &BTreeMap::from([("topic".to_string(), 1), ("gone".to_string(), 7)]),
         )
         .unwrap();
-        st.forget_log_offsets(9, None, Some(6)).unwrap();
+        st.forget_log_offsets(9, None, Some(6), None).unwrap();
         assert_eq!(
             st.topic_floors(sid).unwrap(),
             BTreeMap::from([("topic".into(), 1)])
         );
         assert_eq!(st.topics(sid)["topic"].next, 6);
         assert_eq!(st.seen_off(sid), Some(5));
-        st.forget_log_offsets(9, None, None).unwrap();
+        st.forget_log_offsets(9, None, None, None).unwrap();
         assert!(st.topic_floors(sid).unwrap().is_empty());
 
         let mut preserved = Vec::new();
@@ -4708,7 +4953,7 @@ mod tests {
                 std::fs::write(&floor, bytes).unwrap();
                 let before_topics = std::fs::read(dir.path().join("topics").join(sid)).unwrap();
                 let before_seen = std::fs::read(dir.path().join("seen").join(sid)).unwrap();
-                let result = st.forget_log_offsets(9, None, keep);
+                let result = st.forget_log_offsets(9, None, keep, None);
                 preserved.push(
                     result.is_err()
                         && std::fs::read(&floor).is_ok_and(|got| got == bytes)

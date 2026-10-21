@@ -50,7 +50,7 @@ fn fixture() -> (aterm_tempfile::TempDir, control_auth::SocketPlan) {
 /// Project one entry: is it on disk, and is the socket it names (or, before it
 /// exists, the one it will name) listening?
 fn project(sock_dir: &std::path::Path, sock_path: &str, sid: &SessionId) -> State {
-    let entry = crate::proxy::read_graph_entry(sock_dir, sid);
+    let entry = crate::proxy::read_graph_entry(sock_dir, crate::proxy::sid_of(sid));
     let named = entry
         .as_ref()
         .map_or(sock_path, |(named, _)| named.as_str());
@@ -173,7 +173,7 @@ fn discovery_entries_are_published_only_after_the_bind() {
     }
 
     // The real bind: every entry's socket becomes dialable.
-    let bound = bind_control_listener(&plan, None, || false, |_| false, None)
+    let bound = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .expect("bind the control socket");
     for e in &mut entries {
         e.observe(&sock_dir, &sock_path, "Bind");
@@ -239,7 +239,7 @@ fn the_snapshot_entries_are_written_with_the_store_let_go() {
     // SAFETY: a NUL-terminated path that outlives the call.
     assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo");
 
-    let bound = bind_control_listener(&plan, None, || false, |_| false, None)
+    let bound = bind_control_listener(&plan, None, |_| false, |_| false, None)
         .expect("bind the control socket");
     let publishing = Arc::clone(&store);
     let (published, done) = std::sync::mpsc::channel();
@@ -249,7 +249,7 @@ fn the_snapshot_entries_are_written_with_the_store_let_go() {
     let in_loop = aterm_spec::wait::within(
         aterm_spec::wait::MUST_HAPPEN,
         std::time::Duration::from_millis(1),
-        || crate::proxy::read_graph_entry(&sock_dir, &early.sid).map(|_| ()),
+        || crate::proxy::read_graph_entry(&sock_dir, crate::proxy::sid_of(&early.sid)).map(|_| ()),
     );
     assert!(in_loop.is_some(), "the early entry was written");
     let free = store.try_write().is_ok();
@@ -300,7 +300,7 @@ fn an_entry_published_before_the_bind_is_the_buggy_step_and_gets_swept() {
     // not listening.
     crate::proxy::sweep_stale_graph(&sock_dir);
     assert!(
-        crate::proxy::read_graph_entry(&sock_dir, &sid).is_none(),
+        crate::proxy::read_graph_entry(&sock_dir, crate::proxy::sid_of(&sid)).is_none(),
         "the sweep removes the entry that was published before its bind"
     );
 }

@@ -958,12 +958,22 @@ fn a_hovered_gap_thumb_leaves_the_ring_whole() {
                 bar.is_disjoint(&ring),
                 "{cw} focus_left={focus_left}: the ring stays whole"
             );
+            // The ring's pixels by row, so each bar pixel meets only its own
+            // row's (test-run speed: a scan of the whole ring per bar pixel
+            // was nine tenths of this test).
+            let mut ring_rows: std::collections::HashMap<u16, Vec<u16>> =
+                std::collections::HashMap::new();
+            for &(rx, ry) in &ring {
+                ring_rows.entry(ry).or_default().push(rx);
+            }
             let nearest = bar
                 .iter()
                 .flat_map(|&(bx, by)| {
-                    ring.iter()
-                        .filter(move |&&(_, ry)| ry == by)
-                        .map(move |&(rx, _)| u32::from(bx.abs_diff(rx)))
+                    ring_rows
+                        .get(&by)
+                        .into_iter()
+                        .flatten()
+                        .map(move |&rx| u32::from(bx.abs_diff(rx)))
                 })
                 .min()
                 .expect("the ring and the bar share rows");

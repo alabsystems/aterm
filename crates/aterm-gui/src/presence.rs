@@ -2455,11 +2455,18 @@ mod tests {
 
     /// The band's countdown places a reset with the offset that holds at the
     /// reset, not one process-wide offset: a dated reset on the far side of a
-    /// daylight-saving change counts down to the real instant. (A zone with no
-    /// daylight saving has nothing to measure, and says so.)
+    /// daylight-saving change counts down to the real instant. Run alone under
+    /// `TZ=America/New_York`, whose offset changes within every 90..240 days
+    /// ahead, so the host's own zone (one with no daylight saving has nothing
+    /// to measure) decides nothing; a host with no zone database ends COULD NOT
+    /// RUN.
     #[cfg(unix)]
     #[test]
     fn r44_hb5_the_reset_countdown_places_a_reset_with_the_offset_that_holds_then() {
+        if !crate::test_alone::in_child() {
+            crate::test_alone::run_alone_with(&[("TZ", std::ffi::OsStr::new("America/New_York"))]);
+            return;
+        }
         const MONTHS: [&str; 12] = [
             "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
         ];
@@ -2476,7 +2483,7 @@ mod tests {
             (usize::try_from(m).unwrap(), d)
         }
         let Some(now_offset) = local_offset_s() else {
-            return;
+            aterm_spec::host::could_not_run("no local offset reads here");
         };
         let now = limit::unix_now();
         let Some((probe, then_offset)) = [90i64, 120, 150, 180, 210, 240]
@@ -2488,8 +2495,9 @@ mod tests {
                     .map(|o| (t, o))
             })
         else {
-            eprintln!("this machine's zone keeps one offset: nothing to measure");
-            return;
+            aterm_spec::host::could_not_run(
+                "America/New_York keeps one offset here: no zone database to read it from",
+            );
         };
         let (m, d) = month_day((probe + then_offset).div_euclid(86_400));
         let reset = format!("{} {d} at 12pm", MONTHS[m - 1]);

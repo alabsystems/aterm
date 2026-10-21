@@ -48,6 +48,7 @@
 //! [`Program::supervisable`] is which programs the supervisor hosts.
 
 use crate::anchors::guard_regex;
+use crate::login::LoginScreen;
 use crate::phase::{
     Phase, busy_signal, composer_draft, context_left, has_composer_frame, has_shell_mode_frame,
     prompt_box_holds, worker_phase,
@@ -326,6 +327,61 @@ pub trait ScreenReader: Sync {
     fn said_tail(&self, _rows: &[String]) -> Option<String> {
         None
     }
+    /// WHETHER THE MESSAGE [`Self::said_tail`] READS IS WHOLE ON `rows`: what
+    /// bounds it above — its head, the message it answers — is one of them.
+    /// `false` for a message taller than the rows, its tail then the rows in
+    /// sight from the top (a need or an open item above them unread). Asked
+    /// only where [`Self::said_tail`] reads words; `true` by default, for a
+    /// program whose reader reads none.
+    fn said_whole(&self, _rows: &[String]) -> bool {
+        true
+    }
+    /// A row a read of the HISTORY ABOVE THE SCREEN stops at, for a message
+    /// [`Self::said_whole`] finds cut: the nearest row that opens in column
+    /// 0 with words — a message's head, a person's message, a tool's row —
+    /// bounds the message under it. agy's caret row does not
+    /// ([`crate::agy::said_history_stop`]).
+    fn said_history_stop(&self, row: &str) -> bool {
+        !row.is_empty() && !row.starts_with(char::is_whitespace)
+    }
+    /// THE AGENT'S OTHER WORDS IN THE TURN ITS LAST WORDS END
+    /// ([`Self::said_tail`]): every message of the same turn above its last,
+    /// the words it said before a tool call, say, oldest first and joined by
+    /// a blank line, each read as [`Self::said_tail`] reads one. Its own rows
+    /// and its tools' rows are passed over. `None` where the turn holds no
+    /// other message on `rows`, where there are no last words, and by
+    /// default, for a program whose reader reads none.
+    fn turn_said_before(&self, _rows: &[String]) -> Option<String> {
+        None
+    }
+    /// WHETHER THE TURN [`Self::said_tail`]'s MESSAGE ENDS IS WHOLE ON
+    /// `rows`: the message is ([`Self::said_whole`]), and so is the row that
+    /// opened the turn (the person's message, its band or its rule). `false`
+    /// where the turn reaches above the rows: an earlier message of the turn,
+    /// and a need said in it, may stand there. Asked only where
+    /// [`Self::said_tail`] reads words; [`Self::said_whole`] by default, for
+    /// a program whose reader reads no turn's other words
+    /// ([`Self::turn_said_before`]): its turn is as whole as its message.
+    fn turn_whole(&self, rows: &[String]) -> bool {
+        self.said_whole(rows)
+    }
+    /// A row a read of the HISTORY ABOVE THE SCREEN stops at, for a turn
+    /// [`Self::turn_whole`] finds cut: the row that opened the turn, read
+    /// walking up. [`Self::said_history_stop`] by default.
+    fn turn_history_stop(&self, row: &str) -> bool {
+        self.said_history_stop(row)
+    }
+    /// THE MESSAGE THAT OPENED THE TURN [`Self::said_tail`]'s MESSAGE ENDS,
+    /// as drawn on `rows`: the person's message over it (or a continuation
+    /// typed for them), its marker stripped and the rows it wrapped onto
+    /// joined by a space. What tells whether an act typed into the session
+    /// opened the turn whose reply stands on the screen. `None` where that
+    /// message is not on `rows`, where there are no last words, and by
+    /// default, for a program whose reader reads none (Claude Code's
+    /// answered prompt is read by its own grammar).
+    fn turn_opened_by(&self, _rows: &[String]) -> Option<String> {
+        None
+    }
     fn interrupted(&self, _rows: &[String]) -> bool {
         false
     }
@@ -562,6 +618,18 @@ impl ScreenReader for ClaudeReader {
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         said_tail(rows)
     }
+    fn said_whole(&self, rows: &[String]) -> bool {
+        crate::turn::said_whole(rows)
+    }
+    fn turn_said_before(&self, rows: &[String]) -> Option<String> {
+        crate::turn::turn_said_before(rows)
+    }
+    fn turn_whole(&self, rows: &[String]) -> bool {
+        crate::turn::turn_whole(rows)
+    }
+    fn turn_history_stop(&self, row: &str) -> bool {
+        crate::turn::turn_history_stop(row)
+    }
     fn interrupted(&self, rows: &[String]) -> bool {
         interrupted(rows)
     }
@@ -700,6 +768,24 @@ impl ScreenReader for AgyReader {
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         agy::said_tail(rows)
     }
+    fn said_whole(&self, rows: &[String]) -> bool {
+        agy::said_whole(rows)
+    }
+    fn said_history_stop(&self, row: &str) -> bool {
+        agy::said_history_stop(row)
+    }
+    fn turn_said_before(&self, rows: &[String]) -> Option<String> {
+        agy::turn_said_before(rows)
+    }
+    fn turn_whole(&self, rows: &[String]) -> bool {
+        agy::turn_whole(rows)
+    }
+    fn turn_history_stop(&self, row: &str) -> bool {
+        agy::turn_history_stop(row)
+    }
+    fn turn_opened_by(&self, rows: &[String]) -> Option<String> {
+        agy::turn_opened_by(rows)
+    }
     fn interrupted(&self, rows: &[String]) -> bool {
         agy::interrupted(rows)
     }
@@ -761,6 +847,21 @@ impl ScreenReader for MuseReader {
     }
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         muse::said_tail(rows)
+    }
+    fn said_whole(&self, rows: &[String]) -> bool {
+        muse::said_whole(rows)
+    }
+    fn turn_said_before(&self, rows: &[String]) -> Option<String> {
+        muse::turn_said_before(rows)
+    }
+    fn turn_whole(&self, rows: &[String]) -> bool {
+        muse::turn_whole(rows)
+    }
+    fn turn_history_stop(&self, row: &str) -> bool {
+        muse::turn_history_stop(row)
+    }
+    fn turn_opened_by(&self, rows: &[String]) -> Option<String> {
+        muse::turn_opened_by(rows)
     }
     fn interrupted(&self, rows: &[String]) -> bool {
         muse::interrupted(rows)
@@ -838,6 +939,21 @@ impl ScreenReader for GeminiReader {
     fn said_tail(&self, rows: &[String]) -> Option<String> {
         gemini::said_tail(rows)
     }
+    fn said_whole(&self, rows: &[String]) -> bool {
+        gemini::said_whole(rows)
+    }
+    fn turn_said_before(&self, rows: &[String]) -> Option<String> {
+        gemini::turn_said_before(rows)
+    }
+    fn turn_whole(&self, rows: &[String]) -> bool {
+        gemini::turn_whole(rows)
+    }
+    fn turn_history_stop(&self, row: &str) -> bool {
+        gemini::turn_history_stop(row)
+    }
+    fn turn_opened_by(&self, rows: &[String]) -> Option<String> {
+        gemini::turn_opened_by(rows)
+    }
     fn interrupted(&self, rows: &[String]) -> bool {
         gemini::interrupted(rows)
     }
@@ -910,8 +1026,8 @@ const NOT_AGENTS: &[&str] = &[
 /// draws, one of its boxes or its sign-in wall (`agy::is_agy_screen`) →
 /// Agy; Gemini CLI's composer band under its rule or one of its named boxes
 /// (`gemini::is_gemini_screen`; it runs as `node`, so its name is never
-/// `gemini` on the wire) → Gemini; Claude Code's composer frame or one of its boxes (the trust dialog
-/// replaces the frame) → Claude; else Generic. Codex is named by its name
+/// `gemini` on the wire) → Gemini; Claude Code's composer frame, one of its boxes (the trust dialog
+/// replaces the frame) or its `/login` dialog → Claude; else Generic. Codex is named by its name
 /// alone: aterm reads no Codex screen (its screen lane was retired on
 /// 2026-10-16), so a Codex with no name — a vendor `codex` npm started as
 /// `node` — reads Generic, and the window shows it by its own OSC 7501
@@ -942,11 +1058,23 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
         &AgyReader
     } else if gemini::is_gemini_screen(rows) {
         &GeminiReader
-    } else if has_composer_frame(rows) || parse_prompt_v2(rows).is_some_and(names_claude) {
+    } else if has_composer_frame(rows)
+        || parse_prompt_v2(rows).is_some_and(names_claude)
+        || names_login(rows)
+    {
         &ClaudeReader
     } else {
         &GenericReader
     }
+}
+
+/// Claude Code's `/login` dialog in one of the states its own words name
+/// ([`crate::login::login_screen`]: the method picker, Console's menu, the
+/// browser hand-off, the success) — drawn in the composer's place, so no frame
+/// names the program while it stands. A dialog titled `Login` this module
+/// reads no state of ([`LoginScreen::Failed`]) is any program's.
+fn names_login(rows: &[String]) -> bool {
+    crate::login::login_screen(rows).is_some_and(|s| !matches!(s, LoginScreen::Failed))
 }
 
 /// [`identify`], then that reader's [`ScreenReader::read`].
@@ -1157,7 +1285,8 @@ mod tests {
         API_ERROR_ENOTFOUND, API_RETRYING_DRAFT_MEASURED, API_RETRYING_MEASURED,
         API_RETRYING_QUEUED_80_MEASURED, API_RETRYING_QUEUED_DRAFT_MEASURED,
         API_RETRYING_QUEUED_MEASURED, BOX_BASH_TOUCH, END_529, GOAL_ACTIVE_SUGGESTION,
-        MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE, TRUST, bash_one_row, composer, rows, screen,
+        LOGIN_HANDOFF, LOGIN_PICKER_WARNED, LOGIN_SUCCESS, MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE,
+        TRUST, bash_one_row, composer, rows, screen,
     };
     use crate::wall::WallKind;
 
@@ -1280,6 +1409,28 @@ mod tests {
         assert_eq!(p(Some("node"), &framed), Program::Claude);
         assert_eq!(p(None, &screen(TRUST)), Program::Claude, "a box, no frame");
         assert_eq!(p(None, &screen(BOX_BASH_TOUCH)), Program::Claude);
+        // `/login`'s dialog stands in the frame's place: its own words name
+        // it, a successor loop's first read before `status` included.
+        for login in [LOGIN_HANDOFF, LOGIN_PICKER_WARNED, LOGIN_SUCCESS] {
+            assert_eq!(p(None, &screen(login)), Program::Claude, "{login}");
+        }
+        // NEGATIVE CONTROL: a dialog titled `Login` with no state this crate
+        // reads is any program's; a shell's name still wins.
+        let unknown: Vec<String> = [
+            "$ ./sign-in.sh",
+            "",
+            &"─".repeat(100),
+            "  Login",
+            "",
+            "  Enter your user name:",
+            "",
+            "  Esc to cancel",
+        ]
+        .iter()
+        .map(|r| (*r).to_string())
+        .collect();
+        assert_eq!(p(None, &unknown), Program::Generic);
+        assert_eq!(p(Some("bash"), &screen(LOGIN_HANDOFF)), Program::Generic);
         assert_eq!(p(None, &codex_0_155_trust()), Program::Generic);
         assert_eq!(p(Some("codex"), &codex_0_155_trust()), Program::Codex);
         assert_eq!(p(None, &shell_asking()), Program::Generic);

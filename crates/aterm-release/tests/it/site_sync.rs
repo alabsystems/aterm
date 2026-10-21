@@ -12,9 +12,11 @@
 //! calls the world saw.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aterm_uds::spawnfd::{Child, Command};
 use aterm_verify::wasm_glue::Flavor;
@@ -41,6 +43,23 @@ fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/site")
         .join(rel)
+}
+
+/// `case` over each of `cases`, all at once: the cases of one test that share nothing (each
+/// its own lab and world). The first case to fail fails the test with its own panic.
+fn at_once<T: Send>(cases: impl IntoIterator<Item = T>, case: impl Fn(T) + Sync) {
+    std::thread::scope(|scope| {
+        let case = &case;
+        let running: Vec<_> = cases
+            .into_iter()
+            .map(|each| scope.spawn(move || case(each)))
+            .collect();
+        for ran in running {
+            if let Err(panic) = ran.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
 }
 
 /// This checkout's `tools/install.sh`, which the fixture public commits carry.
@@ -467,6 +486,71 @@ struct Lab {
     live: PathBuf,
 }
 
+/// One entry of a [`Tree`].
+enum Node {
+    Dir,
+    File { bytes: Vec<u8>, mode: u32 },
+}
+
+/// A directory tree held in memory: each directory, and each file's bytes and mode, by its
+/// path under the root it was read from.
+struct Tree(Vec<(PathBuf, Node)>);
+
+impl Tree {
+    fn read(root: &Path) -> Self {
+        fn walk(root: &Path, rel: &Path, out: &mut Tree) {
+            use std::os::unix::fs::PermissionsExt as _;
+            for e in std::fs::read_dir(root.join(rel)).unwrap() {
+                let e = e.unwrap();
+                let rel = rel.join(e.file_name());
+                let meta = e.metadata().unwrap();
+                if meta.is_dir() {
+                    out.0.push((rel.clone(), Node::Dir));
+                    walk(root, &rel, out);
+                } else {
+                    let bytes = std::fs::read(e.path()).unwrap();
+                    let mode = meta.permissions().mode();
+                    out.0.push((rel, Node::File { bytes, mode }));
+                }
+            }
+        }
+        let mut tree = Self(Vec::new());
+        walk(root, Path::new(""), &mut tree);
+        tree
+    }
+
+    /// The tree under `root`, each git `config` that named `from` (the root it was read
+    /// from) naming `root` instead.
+    fn lay(&self, from: &Path, root: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (from, to) = (from.to_string_lossy(), root.to_string_lossy());
+        for (rel, node) in &self.0 {
+            let path = root.join(rel);
+            let Node::File { bytes, mode } = node else {
+                std::fs::create_dir_all(&path).unwrap();
+                continue;
+            };
+            if rel.file_name().is_some_and(|n| n == "config") {
+                let text = String::from_utf8_lossy(bytes).replace(&*from, &to);
+                std::fs::write(&path, text).unwrap();
+            } else {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(*mode)).unwrap();
+        }
+    }
+}
+
+/// A fresh lab's whole scratch dir, built once per process for each shape (in the scratch dir
+/// of the test that first asks, which then uses it) and laid down for every other test:
+/// building one takes fifteen git processes, a clone and a push among them.
+struct Built {
+    root: PathBuf,
+    tree: Tree,
+    public_sha: String,
+    generation: u32,
+}
+
 impl Lab {
     fn new() -> Self {
         Self::at("site-repo", true)
@@ -474,23 +558,81 @@ impl Lab {
 
     /// The site repo at `<scratch>/<site_root>`; the public tree with a CHANGELOG.md or not.
     fn at(site_root: &str, changelog: bool) -> Self {
+        type Shapes = BTreeMap<(String, bool), Arc<OnceLock<Built>>>;
+        static BUILT: Mutex<Shapes> = Mutex::new(BTreeMap::new());
+        let shape = BUILT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((site_root.to_string(), changelog))
+            .or_default()
+            .clone();
+        let mut fresh = None;
+        let built = shape.get_or_init(|| {
+            let lab = Self::build(site_root, changelog);
+            let built = Built {
+                tree: Tree::read(&lab.root),
+                root: lab.root.clone(),
+                public_sha: lab.public_sha.clone(),
+                generation: lab.generation,
+            };
+            fresh = Some(lab);
+            built
+        });
+        if let Some(lab) = fresh {
+            return lab;
+        }
+        let mut lab = Self::empty(site_root);
+        built.tree.lay(&built.root, &lab.root);
+        lab.public_sha = built.public_sha.clone();
+        lab.generation = built.generation;
+        lab
+    }
+
+    /// [`Lab::at`], built from nothing.
+    fn build(site_root: &str, changelog: bool) -> Self {
+        let mut lab = Self::empty(site_root);
+        std::fs::create_dir_all(lab.root.join("home")).unwrap();
+        lab.publish(changelog);
+        lab.make_site();
+        // One pack per repository, not a loose object (and its fan-out directory) per object:
+        // every other test lays this tree down and removes it.
+        let src = lab.root.join(format!("public-src-{}", lab.generation));
+        for repo in [&src, &lab.public_git, &lab.site_root, &lab.origin] {
+            lab.git
+                .ok(repo, &["repack", "-adq", "-n", "--no-write-bitmap-index"]);
+        }
+        lab
+    }
+
+    /// A scratch dir that holds nothing yet, and where each part of a lab goes in it.
+    fn empty(site_root: &str) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("aterm-site-sync-")
             .tempdir()
             .unwrap();
         let root = dir.path().canonicalize().unwrap();
         let home = root.join("home");
-        std::fs::create_dir_all(&home).unwrap();
         let git = Git {
             env: vec![
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
                 ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+                // No template: no repository here or cloned by the sync carries sample
+                // hooks, a description or info/exclude, which every test lays down and
+                // removes and nothing reads.
+                ("GIT_TEMPLATE_DIR".into(), String::new()),
+                // Nor does a commit, fetch, pull or push here or in the sync start a `git
+                // maintenance run --auto`, which does nothing in a repository this small
+                // (158 of this module's 2,178 git processes).
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "maintenance.auto".into()),
+                ("GIT_CONFIG_VALUE_0".into(), "false".into()),
+                ("PATH".into(), crate::git_first_path().into()),
             ],
         };
         let site_root = root.join(site_root);
-        let mut lab = Self {
+        Self {
             _dir: dir,
             git,
             public_git: root.join("public.git"),
@@ -501,10 +643,7 @@ impl Lab {
             live: root.join("live"),
             site_root,
             root,
-        };
-        lab.publish(changelog);
-        lab.make_site();
-        lab
+        }
     }
 
     /// A promote: a new public commit (CHANGELOG.md or not) carrying this checkout's
@@ -589,6 +728,9 @@ impl Lab {
                 &self.origin.to_string_lossy(),
             ],
         );
+        // A push's receive-pack reads no `GIT_CONFIG_COUNT` (git clears it for the remote
+        // side): the origin's own config keeps it from starting a maintenance run.
+        crate::ledger::testing::config(&self.origin, &[]);
         self.git.ok(
             &self.site_root,
             &["remote", "add", "origin", &self.origin.to_string_lossy()],
@@ -1152,57 +1294,63 @@ fn no_usable_site_checkout_touches_nothing() {
 /// cannot list projects either makes an unrecognised failure a login one.
 #[test]
 fn a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure() {
-    for (deploy, firebase_ok, want_failure) in [
-        (Deploy::AuthErr, true, false),
-        (Deploy::NoCli, true, false),
-        (Deploy::Fail, true, true),
-        (Deploy::OddFail, false, false),
-        (Deploy::OddFail, true, true),
-    ] {
-        let lab = Lab::new();
-        let mut world = lab.fake("releases-fat.json");
-        world.deploy = deploy;
-        world.firebase_ok = firebase_ok;
-        let (ended, out) = lab.run(&mut world);
-        if want_failure {
-            assert_eq!(failed_child(ended, &out).0, "deploy.sh", "{deploy:?}");
-            assert_eq!(
-                world.count(|c| *c
-                    == Call::Firebase {
-                        account: Some("owner@example.invalid".into())
-                    }),
-                1,
-                "{deploy:?}: the login was asked, with deploy.sh's account"
-            );
-        } else {
-            assert_eq!(ended, Ok(Outcome::NotDeployed), "{deploy:?}\n{out}");
-            assert_eq!(
-                out.lines().last(),
-                Some(
-                    format!(
-                        "SITE NOT DEPLOYED — committed and pushed; deploy later with: (cd {} && \
-                         ./deploy.sh)",
-                        lab.site.display()
-                    )
-                    .as_str()
-                )
-            );
-            assert!(
-                lab.owed_marker().is_file(),
-                "{deploy:?}: the commit stays owed"
-            );
-        }
+    at_once(
+        [
+            (Deploy::AuthErr, true, false),
+            (Deploy::NoCli, true, false),
+            (Deploy::Fail, true, true),
+            (Deploy::OddFail, false, false),
+            (Deploy::OddFail, true, true),
+        ],
+        a_missing_firebase_login_case,
+    );
+}
+
+/// One case of [`a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure`].
+fn a_missing_firebase_login_case((deploy, firebase_ok, want_failure): (Deploy, bool, bool)) {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    world.deploy = deploy;
+    world.firebase_ok = firebase_ok;
+    let (ended, out) = lab.run(&mut world);
+    if want_failure {
+        assert_eq!(failed_child(ended, &out).0, "deploy.sh", "{deploy:?}");
         assert_eq!(
-            lab.head(),
-            lab.origin_main(),
-            "{deploy:?}: pushed either way"
+            world.count(|c| *c
+                == Call::Firebase {
+                    account: Some("owner@example.invalid".into())
+                }),
+            1,
+            "{deploy:?}: the login was asked, with deploy.sh's account"
         );
+    } else {
+        assert_eq!(ended, Ok(Outcome::NotDeployed), "{deploy:?}\n{out}");
         assert_eq!(
-            world.count(|c| matches!(c, Call::Live(_))),
-            0,
-            "{deploy:?}: no live claim"
+            out.lines().last(),
+            Some(
+                format!(
+                    "SITE NOT DEPLOYED — committed and pushed; deploy later with: (cd {} && \
+                     ./deploy.sh)",
+                    lab.site.display()
+                )
+                .as_str()
+            )
+        );
+        assert!(
+            lab.owed_marker().is_file(),
+            "{deploy:?}: the commit stays owed"
         );
     }
+    assert_eq!(
+        lab.head(),
+        lab.origin_main(),
+        "{deploy:?}: pushed either way"
+    );
+    assert_eq!(
+        world.count(|c| matches!(c, Call::Live(_))),
+        0,
+        "{deploy:?}: no live claim"
+    );
 }
 
 /// `--no-deploy` (or SITE_NO_DEPLOY=1) commits and pushes only, and says so — never
@@ -1945,7 +2093,7 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
 /// leave it owed, and the next plain run deploys it.
 #[test]
 fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
-    for first in [Deploy::Ok, Deploy::AuthErr] {
+    at_once([Deploy::Ok, Deploy::AuthErr], |first| {
         let lab = Lab::new();
         let mut world = lab.fake("releases-fat.json");
         world.deploy = first;
@@ -1962,7 +2110,7 @@ fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
         deployed(&ended, &out);
         assert_eq!(world.deploys().len(), 1, "{first:?}");
         assert!(!lab.owed_marker().exists());
-    }
+    });
 }
 
 /// THE INTEL MARK: the chosen release's record of running its x86_64 slice, and how much

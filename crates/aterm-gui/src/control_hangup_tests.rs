@@ -13,27 +13,32 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::CtlStream;
 
-use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes};
+use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes, Outbox};
 use super::control_session::{TurnIo, cmd_await, cmd_turn};
 use super::{
-    HANGUP_POLL, HUNG_UP_REPLY, Scope, ServeDisposition, ServingFd, caller_hung_up, hangup_park,
+    HANGUP_POLL, HUNG_UP_REPLY, Request, Scope, ServeDisposition, ServingFd, caller_hung_up,
+    hangup_park,
 };
 
 /// Run `await <args>` on a fresh thread that is SERVING `server` (exactly what
-/// a control lane does for the length of a connection), and return its reply.
-/// The await registers on `registry` before its first hangup check, so a
-/// watched session there says it is parked.
+/// a control lane does for the length of a connection), and return its reply
+/// and its session's watchers. The await registers on them before its first
+/// hangup check, so a watcher there says it is parked.
 fn await_while_serving(
     server: CtlStream,
-    registry: crate::subscribe::Subscribers,
     args: &'static str,
-) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let handle = crate::session_store::test_handle(0);
+) -> (
+    std::thread::JoinHandle<String>,
+    Arc<crate::session_watch::Watchers>,
+) {
+    let handle = crate::session_store::test_handle(0);
+    let watchers = handle.ctx.watchers.clone();
+    let waiter = std::thread::spawn(move || {
         let store = crate::session_store::new_store();
         let _serving = ServingFd::enter(&server);
-        cmd_await(&handle.term, &store, 0, &handle.ctx, args, &registry)
-    })
+        cmd_await(&handle.term, &store, 0, &handle.ctx, args)
+    });
+    (waiter, watchers)
 }
 
 /// Wait for `seen` — the lane's view of its caller's hangup — with a HANG
@@ -74,19 +79,9 @@ fn join_await(waiter: std::thread::JoinHandle<String>, what: &str) -> String {
 #[test]
 fn a_hung_up_caller_releases_a_parked_await_within_a_poll() {
     let (client, server) = CtlStream::pair().expect("socket pair");
-    let registry = crate::subscribe::new_registry();
-    let waiter = await_while_serving(
-        server,
-        registry.clone(),
-        "match never-on-this-screen-xyzzy timeout=600000",
-    );
-    until_seen("the await to park on its session", || {
-        registry
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .watched_sessions()
-            == 1
-    });
+    let (waiter, watchers) =
+        await_while_serving(server, "match never-on-this-screen-xyzzy timeout=600000");
+    until_seen("the await to park on its session", || watchers.count() == 1);
     drop(client);
     let reply = join_await(waiter, "the parked await to see its caller hang up");
     assert_eq!(reply, HUNG_UP_REPLY, "the parked await must see the hangup");
@@ -103,11 +98,7 @@ fn a_half_closed_caller_still_gets_its_answer() {
     client
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close");
-    let waiter = await_while_serving(
-        server,
-        crate::subscribe::new_registry(),
-        "match never-on-this-screen-xyzzy timeout=250",
-    );
+    let (waiter, _) = await_while_serving(server, "match never-on-this-screen-xyzzy timeout=250");
     let reply = join_await(waiter, "the half-closed caller's await to time out");
     assert_eq!(
         reply, "OK timeout\n",
@@ -149,7 +140,6 @@ fn a_turn_whose_caller_hangs_up_after_typing_still_submits_through_the_main_thre
     let presses = AtomicUsize::new(0);
     let handle = crate::session_store::test_handle(0);
     let store = crate::session_store::new_store();
-    let registry = crate::subscribe::new_registry();
     let _serving = ServingFd::enter(&server);
     let paste = |_: &str| {
         if main_hop_refused_for_hangup() {
@@ -175,7 +165,6 @@ fn a_turn_whose_caller_hangs_up_after_typing_still_submits_through_the_main_thre
         &store,
         0,
         "idle=1 timeout=5000 submit_window=300 presses=1 hello",
-        &registry,
         &handle.ctx,
         &TurnIo {
             paste: &paste,
@@ -213,7 +202,6 @@ fn a_typed_turn_whose_caller_hangs_up_mid_typing_still_types_and_submits() {
     let presses = AtomicUsize::new(0);
     let handle = crate::session_store::test_handle(0);
     let store = crate::session_store::new_store();
-    let registry = crate::subscribe::new_registry();
     let _serving = ServingFd::enter(&server);
     let key = |_: crate::input::InputEvent| {
         if main_hop_refused_for_hangup() {
@@ -237,7 +225,6 @@ fn a_typed_turn_whose_caller_hangs_up_mid_typing_still_types_and_submits() {
         &store,
         0,
         "idle=1 timeout=20000 submit_window=300 presses=1 typed=1 cadence=1 hey",
-        &registry,
         &handle.ctx,
         &TurnIo {
             press: &press,
@@ -268,7 +255,6 @@ fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
     let pastes = AtomicUsize::new(0);
     let handle = crate::session_store::test_handle(0);
     let store = crate::session_store::new_store();
-    let registry = crate::subscribe::new_registry();
     let _serving = ServingFd::enter(&server);
     drop(client);
     until_seen("the hangup to become visible to the lane", caller_hung_up);
@@ -285,7 +271,6 @@ fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
         &store,
         0,
         "idle=1 timeout=5000 submit_window=300 presses=1 hello",
-        &registry,
         &handle.ctx,
         &TurnIo {
             paste: &paste,
@@ -309,7 +294,6 @@ fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
 fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
     let handle = crate::session_store::test_handle(0);
     let store = crate::session_store::new_store();
-    let registry = crate::subscribe::new_registry();
     let last_turn = || {
         let ledger = handle
             .ctx
@@ -319,7 +303,7 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
         ledger
             .records()
             .last()
-            .map(|r| (r.text.clone(), r.submitted, r.status))
+            .map(|r| (r.text.to_string(), r.submitted, r.status))
     };
     // The target echoes the text, and the Enter runs it: the press moves the
     // screen, so the submit verifies (`submitted=1`) and the settle runs.
@@ -346,7 +330,6 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
         &store,
         0,
         "idle=5000 timeout=20000 submit_window=2000 presses=1 gone-caller",
-        &registry,
         &handle.ctx,
         &TurnIo {
             paste: &paste,
@@ -378,7 +361,6 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
         &store,
         0,
         "idle=50 timeout=20000 submit_window=2000 presses=1 kept-caller",
-        &registry,
         &handle.ctx,
         &TurnIo {
             paste: &paste,
@@ -394,6 +376,76 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
         last_turn(),
         Some(("kept-caller".to_string(), true, "settled"))
     );
+}
+
+/// A WRITE HANDED TO THE SESSION'S ORDERED WRITER GIVES ITS LANE BACK WHEN ITS
+/// CALLER HANGS UP. [`super::await_written`] waits in the one park every
+/// blocking verb waits in: a write the writer never runs, waited on for ten
+/// minutes, answers `HungUp` once the serving connection's caller is gone, so
+/// only a seen hangup answers within the test's hang detector. Off a serving
+/// lane the writer's own answers are what they say: its receipt is the write's,
+/// and a write dropped unrun wrote nothing.
+///
+/// Negative control: a caller that only half-closed is still there, so the same
+/// wait, bounded just past one [`HANGUP_POLL`] slice, asks after it and runs to
+/// its bound: `Queued`.
+#[test]
+fn a_write_waited_on_gives_its_lane_back_when_its_caller_hangs_up() {
+    use super::{Waited, await_written};
+    use crate::app_input::paste_order::Written;
+    use crate::input::EgressReceipt;
+
+    let (client, server) = CtlStream::pair().expect("socket pair");
+    let (unrun, written) = Written::for_test();
+    let waiter = std::thread::spawn(move || {
+        let _serving = ServingFd::enter(&server);
+        matches!(
+            await_written(&written, Duration::from_secs(600)),
+            Waited::HungUp
+        )
+    });
+    drop(client);
+    until_seen("the write's wait to see its caller hang up", || {
+        waiter.is_finished()
+    });
+    assert!(waiter.join().expect("waiter"), "the hangup ends the wait");
+    drop(unrun);
+
+    let (client, server) = CtlStream::pair().expect("socket pair");
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    let (unrun, written) = Written::for_test();
+    let waiter = std::thread::spawn(move || {
+        let _serving = ServingFd::enter(&server);
+        matches!(
+            await_written(&written, HANGUP_POLL + Duration::from_millis(50)),
+            Waited::Queued
+        )
+    });
+    until_seen("the half-closed caller's wait to run to its bound", || {
+        waiter.is_finished()
+    });
+    assert!(
+        waiter.join().expect("waiter"),
+        "a half-closed caller is not a hangup"
+    );
+    drop((unrun, client));
+
+    let (writer, written) = Written::for_test();
+    writer
+        .send(EgressReceipt::deferred_full())
+        .expect("the writer answers");
+    assert!(matches!(
+        await_written(&written, aterm_spec::wait::MUST_HAPPEN),
+        Waited::Wrote(receipt) if receipt == EgressReceipt::deferred_full()
+    ));
+    let (writer, written) = Written::for_test();
+    drop(writer);
+    assert!(matches!(
+        await_written(&written, aterm_spec::wait::MUST_HAPPEN),
+        Waited::Unrun
+    ));
 }
 
 /// Off a serving lane (an in-process caller, a unit test) nothing is ever hung
@@ -444,12 +496,13 @@ impl LaneService for ParkingService {
 
     fn serve_line(
         &self,
-        line: String,
+        request: Request,
         _scope: Scope,
         _stream: &CtlStream,
         _reader: &mut LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut Outbox,
     ) -> Option<ServeDisposition> {
+        let line = request.line();
         let reply = if line == "park" {
             // Past the test's hang detector: only a seen hangup releases it.
             let deadline = Instant::now() + Duration::from_secs(600);
@@ -475,11 +528,11 @@ impl LaneService for ParkingService {
         None
     }
 
-    fn is_wait(&self, line: &str, _scope: Scope) -> bool {
-        line == "park"
+    fn is_wait(&self, request: &Request, _scope: Scope) -> bool {
+        request.line() == "park"
     }
 
-    fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
+    fn subscribe(&self, _request: Request, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
 
@@ -503,8 +556,9 @@ fn a_wait_lane_is_given_back_when_its_caller_hangs_up() {
         wait: 1,
         inline: 0,
         open: 8,
+        subscriptions: 1,
     });
-    assert_eq!(lanes.start(), 1, "the request lane starts");
+    assert_eq!(lanes.start().rpc, 1, "the request lane starts");
     lanes.publish(service.clone());
 
     let (mut client, server) = CtlStream::pair().expect("socket pair");

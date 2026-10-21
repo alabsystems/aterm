@@ -444,7 +444,6 @@ impl EventProcessor {
     pub fn window_target(window_target: &RootAEL) -> &ActiveEventLoop {
         match &window_target.p {
             PlatformActiveEventLoop::X(target) => target,
-            #[cfg(wayland_platform)]
             _ => unreachable!(),
         }
     }
@@ -453,7 +452,6 @@ impl EventProcessor {
     pub fn window_target_mut(window_target: &mut RootAEL) -> &mut ActiveEventLoop {
         match &mut window_target.p {
             PlatformActiveEventLoop::X(target) => target,
-            #[cfg(wayland_platform)]
             _ => unreachable!(),
         }
     }

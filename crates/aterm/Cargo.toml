@@ -141,9 +141,8 @@ dev-seams = [
 [dev-dependencies]
 # The live tests' raw process and descriptor calls (signals, waits, process groups, fd flags, rlimits).
 libc = { workspace = true }
-# Private scratch directories removed on drop, and `stand_in` programs (in an
-# optimized test build too).
-aterm-tempfile = { workspace = true, features = ["test-support"] }
+# Private scratch directories removed on drop, and `stand_in` programs.
+aterm-tempfile = { workspace = true }
 # The live tests' bounded polls (`aterm_spec::wait`): one hang-detector loop.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).

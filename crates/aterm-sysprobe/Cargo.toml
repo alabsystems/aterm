@@ -6,22 +6,48 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's in-process readers of another process (working directory, executable, process-group footprint), of the machine (per-core CPU ticks and the cluster layout, memory by page class, swap, pressure, the GPU's device-wide use) and of its volumes (the mount table, one volume's free space). Every platform cfg of those readers lives here; it holds no timer and no thread."
+description = "aterm's in-process readers of another process (working directory, executable, process-group footprint; on Windows its command line and environment block), of the machine (per-core CPU ticks and the cluster layout, memory by page class, commit, swap, pressure, throttling, cgroup capacity, the GPU's device-wide use, every network interface's counters, the process table's ceilings, the load average, and what this OS can report at all) and of its volumes (the mount table, one volume's free space, one file's identity), on macOS, Linux and Windows, and the one rule that places a path under a directory across Windows' spellings. Every platform cfg of those readers lives here; it holds no timer and no thread."
 
 # The macOS arm: libproc, `sysctlbyname`, Mach host and processor statistics
 # and `statfs` (declared in the first-party `libc`, each with its oracle row),
-# `getfsstat`, and the IORegistry through IOKit and CoreFoundation (declared in
-# `src/iokit.rs`, held to the SDK by `tests/iokit_sdk.rs`). The Linux arm reads
-# `/proc` and `/sys` through std (bounded reads; the page size from
-# `/proc/self/auxv`) and a volume's free space by `statvfs`.
+# `getfsstat`, `getloadavg`, the routing socket's interface list by `sysctl`
+# (its layouts declared in `src/iflist.rs`, held to the SDK by
+# `tests/iflist_sdk.rs`), and the IORegistry through IOKit and CoreFoundation
+# (declared in `src/iokit.rs`, held to the SDK by `tests/iokit_sdk.rs`). The
+# Linux arm reads `/proc` and `/sys` through std (bounded reads; the page size
+# from `/proc/self/auxv`), a volume's free space by `statvfs`, and
+# `getloadavg` and `getrlimit`.
+# The Windows arm (64-bit) declares its few kernel32 and ntdll calls itself
+# (`src/win.rs`, raw-dylib, no import library and no dependency); their buffers are decoded
+# by `src/windows.rs`, compiled and tested on every host. The volume, identity,
+# path-spelling and process-parameter readers' calls (the mount and object
+# managers, a volume's free space, a file's `FILE_ID_INFO`, another process's
+# image and environment block) are declared in `src/win_paths.rs`, which std
+# links, and every struct there has a layout test.
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = { workspace = true }
 
 # Scratch directories removed on drop: the Linux readers' fixture roots
-# (`src/tests.rs`) and the shared SDK probe's (`tests/iokit_sdk.rs`, through
-# aterm-objc's `sdk_consts`, mounted by path). Workspace crate, std-only.
+# (`src/tests.rs`), the Windows identity tests' files and junctions
+# (`src/volumes_tests.rs`; a junction is set by `FSCTL_SET_REPARSE_POINT`
+# from the crate's own FFI file, `win_paths::make_junction`, so no Windows
+# test starts a child) and the shared SDK probe's (`tests/iokit_sdk.rs`,
+# `tests/proc_info_sdk.rs` and `tests/iflist_sdk.rs`, through aterm-objc's
+# `sdk_consts`, mounted by path). Workspace crate, std-only.
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
+# The job probe's live tests start a `sleep` in a session of its own to read
+# its stopped and zombie states (`src/jobs/tests.rs`), and `src/kproc_tests.rs`
+# runs its fixtures and its oracles (`ps`, `lsof`): children are built by
+# `spawnfd::command` (the workspace's one child constructor). Workspace
+# crate. aterm-uds depends on this crate (`procargs`; on Windows its volume
+# and PEB readers too), so this is a dev-only cycle: cargo builds it, and
+# nothing but these tests and examples sees the second copy.
+aterm-uds = { workspace = true }
+# The stuck engine's live check (`examples/stuck_live.rs`) hands what the job
+# probe reads to the pure engine, as the host will. Workspace crate, no
+# dependencies.
+aterm-vitals = { workspace = true }
 
 [lints]
 workspace = true

@@ -15,7 +15,7 @@ use super::tests::{
 use super::*;
 use std::path::PathBuf;
 
-/// A `/dev/fd` probe's answer: exit 3 is "held", exit 0 is "clear", and
+/// A [`crate::host::held_probe`]'s answer: exit 3 is "held", exit 0 is "clear", and
 /// anything else is a probe that never ran, which must not read as either.
 fn answer(status: ExitStatus) -> bool {
     match status.code() {
@@ -27,10 +27,7 @@ fn answer(status: ExitStatus) -> bool {
 
 /// The shell that exits 3 when it holds `fd`, else 0.
 fn holds(fd: RawFd) -> [String; 2] {
-    [
-        "-c".to_string(),
-        format!("[ -e /dev/fd/{fd} ] && exit 3; exit 0"),
-    ]
+    ["-c".to_string(), test_support::held_probe(fd)]
 }
 
 /// **A TRANSPARENT CHILD HOLDS WHAT THIS PROCESS WOULD HAND ON; THE OTHER
@@ -253,16 +250,19 @@ fn staged_signals() {
     let out: PathBuf = dir.join("out");
     let exe = std::env::current_exe().expect("the test binary");
     let exe = exe.to_str().expect("a UTF-8 test binary path");
+    // Darwin reads each by its descriptor (`stat(1)` with no operand is an `fstat` of its
+    // stdin), never by `/dev/fd/N`, a path lookup another process's lookup of the number
+    // can fail there ([`super::descriptor_metadata`]); Linux's `/proc/self/fd` is per process.
     #[cfg(target_vendor = "apple")]
-    let stat = "stat -L -f %d:%i";
+    let stat = "{ for n in 7 8 9; do /usr/bin/stat -f %d:%i <&$n; done; }";
     #[cfg(not(target_vendor = "apple"))]
-    let stat = "stat -L -c %d:%i";
+    let stat = "stat -L -c %d:%i /dev/fd/7 /dev/fd/8 /dev/fd/9";
     let cases = [
         ("exit code", "exit 7".to_string()),
         ("death by signal", "kill -HUP $$".to_string()),
         (
             "stdio: the same three open files",
-            format!("exec 7<&0 8>&1 9>&2; {stat} /dev/fd/7 /dev/fd/8 /dev/fd/9 >\"$1\""),
+            format!("exec 7<&0 8>&1 9>&2; {stat} >\"$1\""),
         ),
         (
             "dispositions: SIGPIPE at its default, SIGUSR2 still ignored",

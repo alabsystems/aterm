@@ -108,9 +108,15 @@ fn the_agents_own_settings_chain_is_read_for_bare_ask_rules() {
             ("Edit(src/**)".to_string(), name(&user)),
         ]
     );
-    // The same Claude Code directory by `$HOME`, and a `--settings` given
+    // The same Claude Code directory by `$HOME` (`USERPROFILE` on Windows),
+    // and a `--settings` given
     // inline: its rules join the chain.
-    let by_home = WorkerEnv::from_env(vec![format!("HOME={}", s.display())]).launched_with(&[
+    let by_home = WorkerEnv::from_env(vec![format!(
+        "{}={}",
+        crate::harness::accounts::HOMEDIR_ENV,
+        s.display()
+    )])
+    .launched_with(&[
         "claude",
         r#"--settings={"permissions":{"ask":["NotebookEdit"]}}"#,
     ]);
@@ -600,19 +606,21 @@ fn the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home()
     let proj = home.join("Library/CloudStorage/SyncProvider-acct/proj");
     std::fs::create_dir_all(&proj).expect("proj");
     let done = base.join("done");
-    let out = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
-        .args([
-            "supervise::policy::claude_settings::tests::provider_home_stage",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env(PROVIDER_STAGE, &proj)
-        .env(PROVIDER_STAGE_DONE, &done)
-        .output()
-        .expect("the stage runs");
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+            .args([
+                "supervise::policy::claude_settings::tests::provider_home_stage",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env(PROVIDER_STAGE, &proj)
+            .env(PROVIDER_STAGE_DONE, &done),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("the stage within the hang detector: {e}"));
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

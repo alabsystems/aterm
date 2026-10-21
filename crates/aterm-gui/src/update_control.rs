@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Memory-only GUI facts for updater control requests. Durable stage reads and
-//! network work remain on the control worker; no ready marker is trusted here.
+//! Memory-only GUI facts for updater control requests, and the reducer's staged
+//! installed-bundle activation ([`published_activation`]). Durable stage reads
+//! and network work remain on the control worker; no ready marker is trusted
+//! here.
 
 use crate::native_update_auto_intent::ApplyPhase;
 use crate::native_updater_service::{StagedUpdate, UpdaterPhase};
 use crate::update_words::ApplyPosture;
 use crate::{App, Wake};
+use aterm_types::MutexExt as _;
 
 pub(crate) struct Snapshot {
     pub(crate) owner: Option<String>,
@@ -55,6 +58,11 @@ impl Snapshot {
                 .as_ref()
                 .is_some_and(|s| app.automatic_apply_retry_scheduled(s.build)),
         }
+    }
+
+    /// The reducer's stage as [`Self::capture`] read it.
+    pub(crate) fn staged(&self) -> Option<&StagedUpdate> {
+        self.staged.as_ref()
     }
 
     /// The automatic lane's ladder phase for the staged build (`apply_phase=` on
@@ -213,6 +221,46 @@ pub(crate) fn announce_stage(status: &aterm_update::UpdateStatus, send: impl FnO
     } else {
         send(Wake::UpdateCheckCompleted);
     }
+}
+
+/// The installed-bundle activation the updater reducer holds staged, as
+/// [`App::publish_native_update_state`] last published it. The ledger cannot see
+/// an activation (it has no `ready.toml`), so `update status` folds it in
+/// (`control::fold_installed_activation`): from the event loop's [`Snapshot`]
+/// when the loop answers, and from here when it cannot (a dialog stands, the
+/// thread stalled) and for `update apply`. The reducer's verdict, never a probe
+/// of the bundle: codesign and spctl run only on the updater facts worker, and a
+/// check of theirs that did not finish leaves the reducer's stage in place. A
+/// leaf lock, held for a clone or a store.
+static STAGED_ACTIVATION: std::sync::Mutex<Option<StagedUpdate>> = std::sync::Mutex::new(None);
+
+/// Publish the reducer's stage when it is an installed-bundle activation, and
+/// clear the record when it is a download or there is none.
+pub(crate) fn publish_staged_activation(staged: Option<&StagedUpdate>) {
+    *STAGED_ACTIVATION.lock_or_recover() = activation_to_publish(staged);
+}
+
+/// What [`publish_staged_activation`] records for the reducer's stage: an
+/// installed-bundle activation, and nothing for a download or no stage.
+fn activation_to_publish(staged: Option<&StagedUpdate>) -> Option<StagedUpdate> {
+    staged
+        .filter(|stage| stage.is_installed_activation())
+        .cloned()
+}
+
+/// The activation [`publish_staged_activation`] last published.
+pub(crate) fn published_activation() -> Option<StagedUpdate> {
+    STAGED_ACTIVATION.lock_or_recover().clone()
+}
+
+/// The reducer's stage `update status` folds: the event loop's own when it
+/// answered (`live`), even when that is no stage, and the `published`
+/// activation only when it did not.
+pub(crate) fn status_activation<'a>(
+    live: Option<&'a Snapshot>,
+    published: Option<&'a StagedUpdate>,
+) -> Option<&'a StagedUpdate> {
+    live.map_or(published, Snapshot::staged)
 }
 
 #[cfg(test)]
@@ -402,6 +450,60 @@ mod tests {
             crate::native_update_auto_intent::restored_hold_line(11, false, &mut said),
             None
         );
+    }
+
+    fn installed_activation(build: u64) -> StagedUpdate {
+        let commit = "a".repeat(40);
+        StagedUpdate {
+            build,
+            version: format!("build {build}"),
+            dmg_sha256: crate::native_updater_service::installed_activation_digest(build, &commit),
+            commit: Some(commit),
+            changelog: None,
+            generation: 1,
+        }
+    }
+
+    /// Only an installed-bundle activation is published; a download stage and no
+    /// stage clear the record, so a status read with the event loop away never
+    /// folds a download the ledger already names.
+    #[test]
+    fn only_an_activation_is_published() {
+        let activation = installed_activation(12);
+        assert_eq!(activation_to_publish(Some(&activation)), Some(activation));
+        let download = StagedUpdate {
+            dmg_sha256: "b".repeat(64),
+            ..installed_activation(12)
+        };
+        assert_eq!(activation_to_publish(Some(&download)), None);
+        assert_eq!(activation_to_publish(None), None);
+    }
+
+    /// The event loop's stage outranks the published one whenever the loop
+    /// answers, even with no stage: a published activation the reducer has
+    /// since retired is not folded. Only when the loop cannot answer does the
+    /// published activation fold (the negative control).
+    #[test]
+    fn the_live_stage_outranks_the_published_one() {
+        let live = |staged| Snapshot {
+            owner: None,
+            repo: None,
+            auto_apply: true,
+            staged,
+            posture: None,
+            phase: None,
+            restored_hold: false,
+            applying: false,
+            retry_scheduled: false,
+        };
+        let published = installed_activation(12);
+        assert_eq!(status_activation(Some(&live(None)), Some(&published)), None);
+        let current = live(Some(installed_activation(13)));
+        assert_eq!(
+            status_activation(Some(&current), Some(&published)),
+            current.staged.as_ref()
+        );
+        assert_eq!(status_activation(None, Some(&published)), Some(&published));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! {"t":<unix ms>,"sid":"<sid>"|null,
 //!  "kind":"event|approved|declined|dismissed|reconnect|timeout|exit|mail|extend|escalated|
 //!          cleared|continued|typed|restarted|waiting|skipped|unverified|limited|unproven|
-//!          dialog|chose|exception|probed|reset|probe",
+//!          dialog|chose|exception|probed|reset|probe|needs",
 //!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
 //!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
@@ -34,6 +34,7 @@
 //! the time the next loop restates the end with (`ended_before`), never printed.
 //!
 //! Some lines are journal-only, never printed (`Review::note`): `ESCALATED`, `CLEARED`,
+//! `NEEDS` (the worker's NEEDS YOU put on the person's screen: [`NEEDS`]),
 //! `WAITING`, `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
 //! safe rule proved the box), `DIALOG` (a question decision's rows joined by ` ⏎ `),
 //! `DECLINED`, `PROBED … /usage no sample (<word>)`, and every `RESET` but `used (<n> left)`.
@@ -82,6 +83,20 @@ pub const CLEARED_STALE: &str = "stale";
 /// have left under another owner's entry, unset unread at this loop's start
 /// (its `seq=` is `-`: no read was made).
 pub const CLEARED_HIDDEN: &str = "hidden";
+/// The line that puts THE WORKER'S NEEDS YOU on the person's screen
+/// (`escalate.rs`'s `sync_needs`, the `needs` owner's entry): `NEEDS
+/// seq=<n> count=<k> attention=<reply> <first need, clipped>`, once a set.
+/// No escalation: nothing is handed over and nothing waits, so the
+/// harness's stats count it as told ([`crate::harness::stats`]'s
+/// `needs_told`), never as a person's wait. A record of kind `needs`.
+pub const NEEDS: &str = "NEEDS";
+/// … `CLEARED seq=<n> needs attention=<reply> <why>`: the needs entry taken
+/// down (none stands now, an Off park, the loop's end, or — one a loop
+/// before this one left — no need stands at the loop's start). No badge of the
+/// loop's escalations ([`CLEARED_BADGES`] does not hold it): it closes no
+/// person's wait.
+pub const CLEARED_NEEDS: &str = "needs";
+
 /// Every word a `CLEARED` line names a badge by. A limit episode's names
 /// none: `CLEARED seq=<n> attention=<reply> <why>`.
 pub const CLEARED_BADGES: [&str; 6] = [
@@ -173,8 +188,8 @@ pub struct JournalRecord {
     pub mark: Option<u64>,
     /// THE TIME THE END THIS NOTE RESTATES WAS FIRST NOTED (unix ms), on a
     /// task end's note (`DONE …`) a restarted loop wrote for the end a loop
-    /// before it noted — a landing or a done seeded and taken up at its first
-    /// point (`policy::turn_end::TurnEndState::restated_noted_ms`) — carried
+    /// before it noted — a landing seeded and taken up at its first point
+    /// (`policy::turn_end::TurnEndState::restated_noted_ms`) — carried
     /// forward by every restatement, so the end's time survives any number
     /// of restarts and seamless updates (`run.rs`'s `ended_before`); `None`
     /// on every other line, and on a note of an end of its own.
@@ -267,7 +282,7 @@ impl JournalRecord {
             }
             "CONTINUED" | "TYPED" | "RESTARTED" | "WAITING" | "SKIPPED" | "UNVERIFIED"
             | "LIMITED" | "UNPROVEN" | "DIALOG" | "DECLINED" | "CHOSE" | "EXCEPTION" | "PROBED"
-            | "RESET" => {
+            | "RESET" | NEEDS => {
                 rec.kind = word.to_ascii_lowercase();
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
@@ -502,10 +517,15 @@ impl Journal {
     /// journal's intent rows).
     pub fn append_raw(&mut self, json: &str, warn: &mut dyn Write) -> bool {
         let res = match self.file.as_mut() {
-            Some(f) => f
-                .write_all(json.as_bytes())
-                .and_then(|()| f.write_all(b"\n"))
-                .and_then(|()| f.flush()),
+            // The row and its newline in one write call, as `record_with`
+            // writes its own: one syscall a row, not two, and no other
+            // appender's row can land between a row and its end.
+            Some(f) => {
+                let mut row = String::with_capacity(json.len() + 1);
+                row.push_str(json);
+                row.push('\n');
+                f.write_all(row.as_bytes()).and_then(|()| f.flush())
+            }
             None => return false,
         };
         if let Err(e) = res {
@@ -525,9 +545,9 @@ impl Journal {
                 .path
                 .as_deref()
                 .map_or_else(String::new, |p| p.display().to_string());
-            crate::harness::disk::poke::poke_now(crate::harness::disk::poke::Cause::Write(
-                format!("journal {path}: {e}"),
-            ));
+            crate::harness::disk::poke::poke(crate::harness::disk::poke::Cause::Write(format!(
+                "journal {path}: {e}"
+            )));
         }
         self.warn(&format!("{what}: {e}"), warn);
     }
@@ -841,15 +861,31 @@ mod tests {
 
     /// AN OUT-OF-SPACE WRITE ASKS THE DISK WATCH TO LOOK: a journal write
     /// that fails with `ENOSPC` or `EDQUOT` pokes the watch
-    /// ([`crate::harness::disk::poke`]) naming the journal; NEGATIVE CONTROL:
-    /// any other failure (a permission denied) pokes nothing. Each failure
-    /// is still said once.
+    /// ([`crate::harness::disk::poke`]) naming the journal, as the watch's
+    /// handler hears it; NEGATIVE CONTROL: any other failure (a permission
+    /// denied) pokes nothing. Each failure is still said once.
     #[test]
     fn a_journal_write_out_of_space_pokes_the_disk_watch() {
-        use crate::harness::disk::poke::{Cause, last};
+        use crate::harness::disk::poke::{Cause, set_handler};
         use std::io::{Error, ErrorKind};
+        use std::sync::{Arc, Mutex, PoisonError};
+        // The one handler, as the window's watch registers it; every poke of
+        // this test process reaches it, so each case is told by its tag.
+        static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        set_handler(Arc::new(|cause| {
+            if let Cause::Write(w) = cause {
+                HEARD
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(w.clone());
+            }
+        }));
         let named = |tag: &str| {
-            last().is_some_and(|(c, _)| matches!(c, Cause::Write(w) if w.contains(tag)))
+            HEARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|w| w.contains(tag))
         };
         let denied = format!("journal-denied-{}", std::process::id());
         let mut j = Journal::off();

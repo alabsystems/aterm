@@ -113,6 +113,7 @@ fn record() -> SessionRecord {
         journal_key: None,
         task: None,
         status_seen: None,
+        autopilot_end: None,
     }
 }
 

@@ -246,10 +246,123 @@ fn unix_now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
+/// The clocks a pass's writer reads: the monotonic one its write policy ages the last
+/// write by ([`maybe_write`]), and the unix seconds every write stamps. The system's in
+/// every build; a test hands the passes its thread opens a manual one it moves itself
+/// (`CLOCK_OVERRIDE`), so a heartbeat interval is a step of that clock, not seconds slept.
+#[derive(Clone)]
+enum PassClock {
+    /// [`Instant::now`] and [`unix_now`].
+    System,
+    /// TESTS ONLY: a clock that moves when its test moves it.
+    #[cfg(test)]
+    Manual(Arc<ManualPassClock>),
+}
+
+impl PassClock {
+    /// The clock a sink opened NOW runs on: the system's, unless a test set
+    /// `CLOCK_OVERRIDE` on this thread.
+    fn for_new_sink() -> Self {
+        #[cfg(test)]
+        {
+            if let Some(clock) = CLOCK_OVERRIDE.with(|clock| clock.borrow().clone()) {
+                return Self::Manual(clock);
+            }
+        }
+        Self::System
+    }
+
+    fn now(&self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            #[cfg(test)]
+            Self::Manual(clock) => clock.now(),
+        }
+    }
+
+    fn unix_now(&self) -> u64 {
+        match self {
+            Self::System => unix_now(),
+            #[cfg(test)]
+            Self::Manual(clock) => clock.unix_now(),
+        }
+    }
+}
+
+/// TESTS ONLY: a pass clock standing at the moment it was made until [`Self::advance`]
+/// moves it — both its instant and its unix seconds, together.
+#[cfg(test)]
+pub(crate) struct ManualPassClock {
+    origin: Instant,
+    origin_unix: u64,
+    moved: Mutex<Duration>,
+}
+
+#[cfg(test)]
+impl ManualPassClock {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: Instant::now(),
+            origin_unix: unix_now(),
+            moved: Mutex::new(Duration::ZERO),
+        })
+    }
+
+    fn moved(&self) -> Duration {
+        *self
+            .moved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        *self
+            .moved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += by;
+    }
+
+    fn now(&self) -> Instant {
+        self.origin + self.moved()
+    }
+
+    pub(crate) fn unix_now(&self) -> u64 {
+        self.origin_unix + self.moved().as_secs()
+    }
+
+    /// Every pass this thread opens from now on runs on this clock, until the guard drops.
+    pub(crate) fn drive_passes(self: &Arc<Self>) -> ClockOverride {
+        ClockOverride(CLOCK_OVERRIDE.with(|clock| clock.replace(Some(Arc::clone(self)))))
+    }
+}
+
+/// TESTS ONLY: restores the thread's previous pass clock on drop
+/// ([`ManualPassClock::drive_passes`]).
+#[cfg(test)]
+pub(crate) struct ClockOverride(Option<Arc<ManualPassClock>>);
+
+#[cfg(test)]
+impl Drop for ClockOverride {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CLOCK_OVERRIDE.with(|clock| *clock.borrow_mut() = previous);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TESTS ONLY: the clock [`PassClock::for_new_sink`] hands the sinks THIS thread
+    /// opens, read on it and moved into the sink, so no other test's passes see it.
+    static CLOCK_OVERRIDE: std::cell::RefCell<Option<Arc<ManualPassClock>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The writer's mutable state, behind the sink's one lock.
 struct SinkState {
     /// Where the snapshot lands. The GUI passes `<prefix>/progress.json`.
     path: PathBuf,
+    /// What the write policy ages writes by and what each write stamps.
+    clock: PassClock,
     /// The snapshot being built — serialized verbatim on every write.
     file: ProgressFile,
     /// Per-program DOWNLOAD credit `(done, total)` for the overall rollup — kept beside
@@ -309,9 +422,11 @@ impl ProgressSink {
     /// hold) or the initial write fails.
     #[must_use]
     pub fn create(path: &Path, pass: &str) -> Option<Self> {
-        let now = unix_now();
+        let clock = PassClock::for_new_sink();
+        let now = clock.unix_now();
         let state = SinkState {
             path: path.to_path_buf(),
+            clock,
             file: ProgressFile {
                 v: PROGRESS_VERSION,
                 pid: Some(std::process::id()),
@@ -552,7 +667,7 @@ impl ProgressSink {
     pub fn finish(&self) {
         if let Ok(mut s) = self.inner.lock() {
             s.file.pid = None;
-            s.file.ended_unix = Some(unix_now());
+            s.file.ended_unix = Some(s.clock.unix_now());
             s.dirty = true;
             write_now(&mut s);
         }
@@ -583,7 +698,9 @@ fn maybe_write(s: &mut SinkState) {
     if s.disabled {
         return;
     }
-    let age = s.last_write.map_or(Duration::MAX, |t| t.elapsed());
+    let age = s.last_write.map_or(Duration::MAX, |t| {
+        s.clock.now().saturating_duration_since(t)
+    });
     let change_due = s.dirty && age >= Duration::from_millis(WRITE_MIN_INTERVAL_MS);
     let heartbeat_due = age >= Duration::from_secs(HEARTBEAT_MIN_INTERVAL_SECS);
     if change_due || heartbeat_due {
@@ -605,7 +722,7 @@ fn write_now(s: &mut SinkState) -> bool {
         done = done.saturating_add(*d);
     }
     s.file.overall.bytes_done = done;
-    s.file.heartbeat_unix = unix_now();
+    s.file.heartbeat_unix = s.clock.unix_now();
     match std::fs::symlink_metadata(&s.path) {
         Ok(m) if !m.file_type().is_file() => {
             s.disabled = true;
@@ -620,7 +737,7 @@ fn write_now(s: &mut SinkState) -> bool {
         .path
         .with_file_name(format!("progress.json.tmp-{}", std::process::id()));
     if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &s.path).is_ok() {
-        s.last_write = Some(Instant::now());
+        s.last_write = Some(s.clock.now());
         s.dirty = false;
         true
     } else {
@@ -636,9 +753,9 @@ fn write_now(s: &mut SinkState) -> bool {
 // signatures shared with every caller and test in this workspace. The sink is
 // therefore process-global — which is also simply TRUE to the domain: at most one
 // process holds the store flock, and that process runs at most one pass at a time.
-// `GLOBAL_ENABLED` keeps the disabled path to one relaxed atomic load, so the
+// The slot's `enabled` flag keeps the disabled path to one relaxed atomic load, so the
 // extract loop's per-chunk tick costs nothing when no pass is live (a pipe with no
-// `--progress-file`, every existing test).
+// `--progress-file`, every test that begins none).
 // ---------------------------------------------------------------------------
 
 /// The wait BOTH pass-owned threads use between ticks: hold for `tick`, but
@@ -873,16 +990,83 @@ fn quiet_stdio(log: &Path) {
 #[cfg(not(unix))]
 fn quiet_stdio(_log: &Path) {}
 
-static GLOBAL_SINK: Mutex<Option<(ProgressSink, std::thread::ThreadId, PassHeartbeat)>> =
-    Mutex::new(None);
+/// A process's live pass: its sink, the thread that owns it and its heartbeat — at most
+/// one at a time ([`begin_pass`]) — and whether one is live, the one atomic load the
+/// flow hooks' idle path costs.
+struct PassSlot {
+    live: Mutex<Option<(ProgressSink, std::thread::ThreadId, PassHeartbeat)>>,
+    enabled: AtomicBool,
+}
 
-/// TESTS ONLY: the global sink is process-wide state with a thread owner, so any
-/// two tests that `begin_pass` concurrently see each other's refusal. Every such
-/// test takes this gate first (a poisoned gate is fine — the state it guards is
-/// reset by `begin_pass` itself).
+impl PassSlot {
+    const fn new() -> Self {
+        Self {
+            live: Mutex::new(None),
+            enabled: AtomicBool::new(false),
+        }
+    }
+}
+
+/// THE process's pass slot.
+static PROCESS_PASS: PassSlot = PassSlot::new();
+
+/// The pass slot this thread's calls answer to: [`PROCESS_PASS`], in every build. A test
+/// thread may hold one of its own (`own_pass_slot`), and lends it with its pass
+/// ([`lend`]), so tests that begin passes run side by side, each its own process's one
+/// pass, and none sees another's — the production rule, one slot per process, unbent.
+fn slot() -> &'static PassSlot {
+    #[cfg(test)]
+    {
+        if let Some(own) = TEST_SLOT.get() {
+            return own;
+        }
+    }
+    &PROCESS_PASS
+}
+
 #[cfg(test)]
-pub(crate) static PASS_TEST_GATE: Mutex<()> = Mutex::new(());
-static GLOBAL_ENABLED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// TESTS ONLY: the pass slot [`slot`] answers on this thread, when not the process's.
+    static TEST_SLOT: std::cell::Cell<Option<&'static PassSlot>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// TESTS ONLY: give this thread a pass slot of its own until the guard drops — a test
+/// that begins a pass sees no other test's, and none sees its. The slot is leaked (a few
+/// words per test); a pass a failing test left live is stopped on drop, its heartbeat
+/// joined, so no thread outlives the test.
+#[cfg(test)]
+pub(crate) fn own_pass_slot() -> OwnPassSlot {
+    let own: &'static PassSlot = Box::leak(Box::new(PassSlot::new()));
+    OwnPassSlot {
+        own,
+        previous: TEST_SLOT.replace(Some(own)),
+    }
+}
+
+/// TESTS ONLY: the guard [`own_pass_slot`] returns.
+#[cfg(test)]
+pub(crate) struct OwnPassSlot {
+    own: &'static PassSlot,
+    previous: Option<&'static PassSlot>,
+}
+
+#[cfg(test)]
+impl Drop for OwnPassSlot {
+    fn drop(&mut self) {
+        TEST_SLOT.set(self.previous);
+        let left = self
+            .own
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.own.enabled.store(false, Ordering::Release);
+        if let Some((_, _, heartbeat)) = left {
+            heartbeat.stop();
+        }
+    }
+}
 
 /// Install the process-global sink for one pass, OWNED BY THE CALLING THREAD.
 /// `false` (and no change) when a pass is already live or the file cannot be
@@ -896,7 +1080,8 @@ static GLOBAL_ENABLED: AtomicBool = AtomicBool::new(false);
 /// only those threads costs production nothing — and keeps a concurrently-running test's
 /// installs from crediting a pass they are not part of.
 pub fn begin_pass(path: &Path, pass: &str) -> bool {
-    let Ok(mut g) = GLOBAL_SINK.lock() else {
+    let slot = slot();
+    let Ok(mut g) = slot.live.lock() else {
         return false;
     };
     if g.is_some() {
@@ -909,21 +1094,22 @@ pub fn begin_pass(path: &Path, pass: &str) -> bool {
     // `active()`'s owner check — it is not the pass thread and must not be.
     let heartbeat = PassHeartbeat::spawn(sink.clone());
     *g = Some((sink, std::thread::current().id(), heartbeat));
-    GLOBAL_ENABLED.store(true, Ordering::Release);
+    slot.enabled.store(true, Ordering::Release);
     true
 }
 
 /// Write the terminal snapshot and retire the global sink. Safe to call without a
 /// live pass (no-op). Only the pass-owning thread ends it.
 pub fn end_pass() {
-    let Ok(mut g) = GLOBAL_SINK.lock() else {
+    let slot = slot();
+    let Ok(mut g) = slot.live.lock() else {
         return;
     };
     if g.as_ref()
         .is_some_and(|(_, owner, _)| *owner == std::thread::current().id())
         && let Some((sink, _, heartbeat)) = g.take()
     {
-        GLOBAL_ENABLED.store(false, Ordering::Release);
+        slot.enabled.store(false, Ordering::Release);
         // Stop the heartbeat FIRST: a tick landing after the terminal
         // snapshot would restamp a live heartbeat onto a pid-cleared file.
         heartbeat.stop();
@@ -936,10 +1122,11 @@ pub fn end_pass() {
 /// anywhere" for free.
 #[must_use]
 pub fn active() -> Option<ProgressSink> {
-    if !GLOBAL_ENABLED.load(Ordering::Acquire) {
+    let slot = slot();
+    if !slot.enabled.load(Ordering::Acquire) {
         return None;
     }
-    GLOBAL_SINK
+    slot.live
         .lock()
         .ok()
         .and_then(|g| {
@@ -962,12 +1149,22 @@ thread_local! {
 /// programs beside the owner's own, inside the pass and under its store lock. Empty when no
 /// pass is live, or off the owning thread.
 #[derive(Clone)]
-pub struct Lent(Option<ProgressSink>);
+pub struct Lent {
+    sink: Option<ProgressSink>,
+    /// TESTS ONLY: the lender's own pass slot (`own_pass_slot`), which the lane answers
+    /// to while it holds the pass — [`active`]'s first load is that slot's.
+    #[cfg(test)]
+    slot: Option<&'static PassSlot>,
+}
 
 /// On the pass-owning thread: the live pass, to lend a lane thread ([`Lent::adopt`]).
 #[must_use]
 pub fn lend() -> Lent {
-    Lent(active())
+    Lent {
+        sink: active(),
+        #[cfg(test)]
+        slot: TEST_SLOT.get(),
+    }
 }
 
 impl Lent {
@@ -976,17 +1173,29 @@ impl Lent {
     /// ([`active`]'s first load).
     #[must_use]
     pub fn adopt(self) -> Adopted {
-        LENT.with(|lent| *lent.borrow_mut() = self.0);
-        Adopted(())
+        LENT.with(|lent| *lent.borrow_mut() = self.sink);
+        Adopted {
+            _adopted: (),
+            #[cfg(test)]
+            slot_before: TEST_SLOT.replace(self.slot),
+        }
     }
 }
 
 /// Ends a lane thread's adoption of a lent pass on drop ([`Lent::adopt`]).
-pub struct Adopted(());
+pub struct Adopted {
+    /// Made only by [`Lent::adopt`].
+    _adopted: (),
+    /// TESTS ONLY: the pass slot this thread answered to before it adopted the pass.
+    #[cfg(test)]
+    slot_before: Option<&'static PassSlot>,
+}
 
 impl Drop for Adopted {
     fn drop(&mut self) {
         LENT.with(|lent| *lent.borrow_mut() = None);
+        #[cfg(test)]
+        TEST_SLOT.set(self.slot_before);
     }
 }
 
@@ -995,10 +1204,12 @@ impl Drop for Adopted {
 /// only: nothing reached through this can move the pass.
 #[must_use]
 pub fn live_snapshot() -> Option<ProgressFile> {
-    if !GLOBAL_ENABLED.load(Ordering::Acquire) {
+    let slot = slot();
+    if !slot.enabled.load(Ordering::Acquire) {
         return None;
     }
-    let sink = GLOBAL_SINK
+    let sink = slot
+        .live
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|(sink, _, _)| sink.clone()))?;
@@ -1032,7 +1243,7 @@ pub fn note_downloaded(program: &str, total: u64) {
 /// itself cannot name it). Called from `write_capped`'s 64 KiB loop — the one in-process
 /// byte loop — so the disabled path must stay one atomic load.
 pub fn extract_tick(n: u64) {
-    if !GLOBAL_ENABLED.load(Ordering::Relaxed) {
+    if !slot().enabled.load(Ordering::Relaxed) {
         return;
     }
     if let Some(sink) = active() {
@@ -1628,7 +1839,7 @@ mod writer_tests {
             ProgressSink::create(&unreachable, "net").is_none(),
             "a first write that cannot land must not yield a live sink"
         );
-        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _slot = own_pass_slot();
         let began = begin_pass(&unreachable, "net");
         if began {
             // Never leak a live pass into the next test when this assertion fails.
@@ -1832,7 +2043,6 @@ mod writer_tests {
     /// `end_pass` stops and joins the heartbeat before it writes that snapshot.
     #[test]
     fn stopping_a_pass_poller_does_not_wait_out_its_tick() {
-        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
         let l = layout("prompt-stop");
         let progress = l.progress_file();
         let asset = l.prefix.join("trust-1.tar.zst");
@@ -1846,6 +2056,7 @@ mod writer_tests {
         // The pass runs on a thread of its own (`end_pass` answers only its
         // owner), so this one can bound the whole of it.
         let pass = std::thread::spawn(move || {
+            let _slot = own_pass_slot();
             TICK_OVERRIDE.set(Some(Duration::from_secs(3600)));
             assert!(begin_pass(&progress, "net"));
             for _ in 0..4 {
@@ -1885,33 +2096,40 @@ mod writer_tests {
     /// phase), so those phases went red "stopped" under a live writer. Asserted
     /// on the heartbeat ADVANCING while the pass thread is deliberately asleep
     /// — a flow call from this thread would defeat the point of the test.
+    ///
+    /// The interval passes on the PASS'S clock ([`ManualPassClock`]), not in seconds
+    /// slept, and the heartbeat thread looks every millisecond ([`TICK_OVERRIDE`]): the
+    /// write policy under it is the production one, and decides
+    /// (`a_quiet_sink_refreshes_its_heartbeat_at_the_interval_and_not_before`).
     #[test]
     fn a_silent_phase_keeps_the_pass_heartbeat_live() {
-        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _slot = own_pass_slot();
+        let clock = ManualPassClock::new();
+        let _clock = clock.drive_passes();
         let l = layout("silent-heartbeat");
+        TICK_OVERRIDE.set(Some(Duration::from_millis(1)));
         assert!(begin_pass(&l.progress_file(), "net"));
+        TICK_OVERRIDE.set(None);
         let h0 = read_file(&l.progress_file()).heartbeat_unix;
+        clock.advance(Duration::from_secs(HEARTBEAT_MIN_INTERVAL_SECS));
         // With NO sink call from the pass thread, only the heartbeat thread can
-        // move the stamp, so wait for THAT: a thread that never ticks still
-        // fails at the deadline. It was one read at the minimum interval +
-        // 700 ms, and the due write lands 0-500 ms into that by tick phase, so
-        // five oversleeping 500 ms parks on a loaded run queue made a correct
-        // heartbeat read as dead (the load-sensitive test audit of 2026-09-27).
-        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        // move the stamp, so wait for THAT: a thread that never ticks fails at
+        // the hang detector.
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let file = loop {
             let file = read_file(&l.progress_file());
             if file.heartbeat_unix >= h0 + HEARTBEAT_MIN_INTERVAL_SECS {
                 break file;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "the pass heartbeat must advance with no flow calls ({h0} → {})",
                 file.heartbeat_unix
             );
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(1));
         };
         assert!(
-            snapshot_running(&file, unix_now()),
+            snapshot_running(&file, clock.unix_now()),
             "a silent-but-live pass reads as running"
         );
         end_pass();
@@ -1919,7 +2137,39 @@ mod writer_tests {
         // heartbeat thread before it, so no tick can restamp a pid-cleared file live.
         let ended = read_file(&l.progress_file());
         assert_eq!(ended.pid, None);
-        assert!(!snapshot_running(&ended, unix_now()));
+        assert!(!snapshot_running(&ended, clock.unix_now()));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// THE HEARTBEAT INTERVAL IS THE WRITE POLICY'S, TO THE MILLISECOND: a sink with
+    /// nothing new to say rewrites its file once [`HEARTBEAT_MIN_INTERVAL_SECS`] have
+    /// passed on its clock since its last write, and a tick a millisecond before writes
+    /// nothing — the stamp a reader's staleness window ([`HEARTBEAT_STALE_SECS`]) is
+    /// sized against.
+    #[test]
+    fn a_quiet_sink_refreshes_its_heartbeat_at_the_interval_and_not_before() {
+        let clock = ManualPassClock::new();
+        let _clock = clock.drive_passes();
+        let l = layout("heartbeat-interval");
+        let path = l.progress_file();
+        let sink = ProgressSink::create(&path, "net").expect("sink creates");
+        let h0 = read_file(&path).heartbeat_unix;
+        let interval = Duration::from_secs(HEARTBEAT_MIN_INTERVAL_SECS);
+        clock.advance(interval - Duration::from_millis(1));
+        sink.heartbeat();
+        assert_eq!(
+            read_file(&path).heartbeat_unix,
+            h0,
+            "a tick inside the interval writes nothing"
+        );
+        clock.advance(Duration::from_millis(1));
+        sink.heartbeat();
+        assert_eq!(
+            read_file(&path).heartbeat_unix,
+            h0 + HEARTBEAT_MIN_INTERVAL_SECS,
+            "the tick at the interval refreshes the stamp"
+        );
+        drop(sink);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1929,7 +2179,7 @@ mod writer_tests {
     /// both lanes' bytes to whichever began last.
     #[test]
     fn a_lent_pass_credits_its_lane_and_each_lane_extracts_into_its_own_row() {
-        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _slot = own_pass_slot();
         let l = layout("lent");
         assert!(begin_pass(&l.progress_file(), "net"));
         active()

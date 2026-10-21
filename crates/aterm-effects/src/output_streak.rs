@@ -667,6 +667,8 @@ impl OutputStreak {
             self.ribbon = None;
             self.pending = None;
             self.drawing = false;
+        } else {
+            self.retire_light_over_erased_ink();
         }
         self.note_output(
             token,
@@ -674,6 +676,39 @@ impl OutputStreak {
             now,
             input_hot,
         )
+    }
+
+    /// Retire every comet (and the flood ribbon) whose licensed ink is gone
+    /// from the rows just observed: a cleared screen (`Ctrl+L`, `clear`), an
+    /// erased line. Its light marks output that is no longer there, and left
+    /// to its sweep it would linger over the blank cells it was laid on, a
+    /// dim ghost of the old text for the rest of its life (critic #15: the
+    /// old prompt's `$` cell after `Ctrl+L`). A comet whose span still holds
+    /// any ink sweeps on. Removing a tint of at most [`ALPHA_CLAMP`] is no
+    /// flash.
+    fn retire_light_over_erased_ink(&mut self) {
+        let observed = &self.observed_rows;
+        let inked = |row: u16, from: i32, to: i32| {
+            observed.get(usize::from(row)).is_some_and(|cells| {
+                (from.max(0)..=to).any(|col| {
+                    usize::try_from(col)
+                        .ok()
+                        .and_then(|col| cells.get(col))
+                        .is_some_and(|glyph| glyph.has_ink())
+                })
+            })
+        };
+        for slot in &mut self.comets {
+            if slot.is_some_and(|c| !inked(c.row, c.from_col, c.to_col)) {
+                *slot = None;
+            }
+        }
+        if self
+            .ribbon
+            .is_some_and(|r| !inked(r.row, r.from_col, r.to_col))
+        {
+            self.ribbon = None;
+        }
     }
 
     /// Whether `now` sits inside the echo shadow of the last accepted input.
@@ -1282,6 +1317,49 @@ mod tests {
             (pending.row, pending.left, pending.right),
             (1, 6, 6),
             "unchanged ink and gaps stay outside the newly changed run"
+        );
+    }
+
+    /// A comet over output that a clear then erases retires with it (critic
+    /// #15's ghost: the old prompt's `$` cell kept a dim tint for the rest of
+    /// the comet's sweep after `Ctrl+L`). One row of output earns a comet;
+    /// the next observation has that row blank (the screen cleared, a new
+    /// prompt on row 0) and the next frame paints nothing on the old row.
+    /// Negative control: the same clear arriving with the old row's ink still
+    /// there (only row 0 changed) leaves the comet sweeping on that row.
+    #[test]
+    fn a_comet_retires_when_its_ink_is_cleared() {
+        let row_lit = |clear: bool| {
+            let t0 = Instant::now();
+            let mut e = OutputStreak::new(11);
+            let cfg = cfg_on();
+            let blank = vec![vec![aterm_core::terminal::RenderCell::default(); 8]; 3];
+            let mut cells = blank.clone();
+            assert!(!e.note_output_cells(&cells, (2, 0), (3, 8), 10, t0, false));
+            // `$ ` printed on row 1, the caret parked after it.
+            cells[1][0].ch = '$';
+            let t1 = t0 + Duration::from_millis(40);
+            assert!(e.note_output_cells(&cells, (1, 2), (3, 8), 11, t1, false));
+            let mut out = Vec::new();
+            e.tick(t1, geom(), &cfg, &mut out);
+            assert!(
+                out.iter().any(|q| q.row == 1),
+                "the output earns a comet on its row"
+            );
+            // `Ctrl+L`: the new prompt on row 0, row 1 cleared (or, for the
+            // control, left as it was).
+            let mut after = if clear { blank.clone() } else { cells.clone() };
+            after[0][0].ch = '$';
+            let t2 = t1 + Duration::from_millis(50);
+            e.note_output_cells(&after, (0, 2), (3, 8), 12, t2, false);
+            out.clear();
+            e.tick(t2, geom(), &cfg, &mut out);
+            out.iter().any(|q| q.row == 1)
+        };
+        assert!(!row_lit(true), "a cleared row keeps no ghost of its comet");
+        assert!(
+            row_lit(false),
+            "control: a comet over ink still there sweeps on"
         );
     }
 

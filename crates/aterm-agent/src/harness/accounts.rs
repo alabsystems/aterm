@@ -12,8 +12,10 @@
 //! it holds is a roster row's own `email` (owner ruling R-2, v2 design
 //! §4.5), read from the roster file to hint a renewal's sign-in and to be
 //! compared in memory with what that renewal answers ([`email_matches`]):
-//! no email, person or organization name is logged, printed or written
-//! anywhere else. A login is a directory NAME ([`Row::dir`]), carried
+//! this module logs and records labels only. The separate, explicitly requested
+//! on-screen subscription display (`profile::subscription_for`, 2026-10-20)
+//! reads its email from the selected profile, never from this roster. A login
+//! is a directory NAME ([`Row::dir`]), carried
 //! verbatim onto a relaunch line as [`LOGIN_ENV`]; the vendor hashes that
 //! string into its keychain item's name (READ in the 2.1.286 bundle, design
 //! §1), so this module never canonicalizes, trims or rewrites it — a
@@ -139,6 +141,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use aterm_json::{Map, Value};
+use aterm_phase::ResetKind;
 
 use super::one_line;
 
@@ -417,6 +420,21 @@ pub const WEEK_LIMIT: &str = "seven_day";
 /// bundle: set, it is the home, and — with [`LOGIN_ENV`] unset — the
 /// directory its keychain item is named by too.
 pub const HOME_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// THE VARIABLE A CLAUDE CODE'S `os.homedir()` READS, which it joins
+/// `.claude` to where [`HOME_ENV`] is unset: `HOME`, and on Windows
+/// `USERPROFILE`. MEASURED with `claude.exe` 2.1.304 (2026-10-20): started
+/// with the two naming different folders, it wrote `.claude.json` and
+/// `.claude\` under `USERPROFILE` and nothing under `HOME` (libuv's
+/// `uv_os_homedir` and Rust's `std::env::home_dir` read the same one there).
+/// A Windows shell need set no `HOME` (PowerShell's does not); every Windows
+/// process carries `USERPROFILE`. THE ONE RULE for every reader of a Claude
+/// Code's home from an environment — this process's own (`cli`'s `Env`) or
+/// another's exec record (the disk census, the footer, the relaunch
+/// snapshot's records, a worker's directory) — and for every line or launch
+/// that carries one ([`super::relaunch::required_env`]): on macOS and Linux
+/// it is `HOME`, as it always was.
+pub const HOMEDIR_ENV: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
 
 /// THE VARIABLES THAT GIVE A PROCESS A CREDENTIAL OR A PROVIDER OF ITS OWN,
 /// so that it does not authenticate by its stored login — beside the ones
@@ -2066,6 +2084,43 @@ pub fn note_served_login(logins: &mut Logins, label: &str, at: i64) -> bool {
     changed
 }
 
+/// A LOGIN SIGNED BACK IN WHERE IT STANDS, its first turn served at `at`
+/// after its row was recorded signed out (the owner's ruling of 2026-10-19:
+/// aterm types `/login` into a lost login and the owner signs it in in the
+/// tab; or the tab's carried `/login` after a strike): the row's word is `ok`
+/// again — a candidate for every session, its signed-out or due line gone —
+/// and a binding's forecast starts over from that sign-in, a fresh login whose
+/// old notice no longer holds (the review's acct-6: the row stayed signed out
+/// for good, rotation skipped the working account, and the due line asked
+/// for a renewal of a login that worked). The caller has checked the
+/// sign-in is the row's own account where the row names one
+/// (`profile::answers_to`). Nothing for a row not recorded signed out, and
+/// nothing older than its word on record. A row with no binding gets none.
+pub fn note_signed_back(
+    state: &mut State,
+    logins: &mut Logins,
+    label: &str,
+    at: i64,
+) -> Vec<Event> {
+    if state
+        .accounts
+        .get(label)
+        .is_none_or(|a| a.auth != Auth::SignedOut)
+    {
+        return Vec::new();
+    }
+    let out = note_auth(state, label, Auth::Ok, at);
+    if out.is_empty() {
+        return out;
+    }
+    if let Some(binding) = logins.labels.get_mut(label) {
+        binding.renewed_at = Some(at);
+        binding.notice_end = None;
+        binding.served_at = Some(binding.served_at.map_or(at, |held| held.max(at)));
+    }
+    out
+}
+
 /// A RENEWAL WHOSE CHECK ANSWERED THE ROW'S ACCOUNT: `label` is bound to
 /// `dir`, the staging directory its flow wrote, VERBATIM. The login it
 /// replaces (the binding's, else the row's own `own_dir`, `None` the default
@@ -2259,7 +2314,12 @@ impl Sample {
 /// A limit-reset offer last seen at a wall. An OBSERVATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
-    /// Resets left.
+    /// The kind `left` counts, where one was read: Claude Code 2.1.304
+    /// counts each kind apart (`1 weekly reset left`), so a count with a
+    /// kind is that kind's and never the account's whole. `None` on a row
+    /// an earlier build wrote.
+    pub kind: Option<ResetKind>,
+    /// Resets left (of `kind`, where one is named).
     pub left: u32,
     /// The grant's deadline, where one was read.
     pub use_by: Option<i64>,
@@ -2894,6 +2954,9 @@ fn sample_of(v: &Value, cap: i64) -> Option<Sample> {
 
 fn offer_json(o: &Offer) -> Value {
     let mut m = Map::new();
+    if let Some(kind) = o.kind {
+        m.insert("kind".to_owned(), Value::from(kind.word()));
+    }
     m.insert("left".to_owned(), Value::from(o.left));
     m.insert("use_by".to_owned(), Value::from(o.use_by));
     m.insert("at".to_owned(), Value::from(o.at));
@@ -2903,6 +2966,10 @@ fn offer_json(o: &Offer) -> Value {
 
 fn offer_of(v: &Value, cap: i64) -> Option<Offer> {
     Some(Offer {
+        kind: v
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(ResetKind::of_word),
         left: count(v.get("left"))?,
         use_by: int(v.get("use_by")),
         at: stamp(v.get("at"), cap)?,
@@ -3470,6 +3537,35 @@ pub fn signed_out(
         })
         .map(|row| row.label.clone())
         .collect()
+}
+
+/// THE ROW WHOSE SIGN-IN BY NAME WOULD GIVE A SESSION ON `me` AN ACCOUNT TO
+/// MOVE ONTO: the first other row, in ROSTER order, that is not signed in on
+/// this machine — never enrolled (`accounts sync` writes such a row for every
+/// account but the default) or signed out — with whether it signs in through
+/// `accounts renew` (a row with an email, which `login` refuses) or `accounts
+/// login`. What a session at a multi-day limit on a roster row is told to
+/// run, never `/login` in its tab (the review's acct-1, acct-4). `None`: every
+/// other row is signed in. PURE.
+#[must_use]
+pub fn sign_in_next(
+    roster: &Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    me: Option<&str>,
+    now: i64,
+) -> Option<(String, bool)> {
+    roster
+        .rows
+        .iter()
+        .filter(|row| me != Some(row.label.as_str()))
+        .find(|row| {
+            matches!(
+                condition(row, state, is_enrolled(row, enrolled), now),
+                Condition::NotEnrolled | Condition::SignedOut
+            )
+        })
+        .map(|row| (row.label.clone(), row.email.is_some()))
 }
 
 // ---------------------------------------------------------------------------
@@ -4966,7 +5062,8 @@ pub fn note_reading(state: &mut State, account: &str, sample: Sample, now: i64) 
 ///
 /// WHAT A CALLER HANDS IT IS AN OFFER THAT WAS READ AS ONE: the count and
 /// the deadline of a reset confirmation read exactly, or the count the
-/// vendor's own `reset` line names. The wall dialog's row is not one — it
+/// vendor's own `reset` line names — each with the `kind` it counts, where
+/// it names one ([`Offer::kind`]). The wall dialog's row is not one — it
 /// names a day, and a day is no deadline ([`OFFER_EXPIRING_S`] is asked of
 /// an instant).
 ///
@@ -4976,6 +5073,7 @@ pub fn note_reading(state: &mut State, account: &str, sample: Sample, now: i64) 
 pub fn note_offer(
     state: &mut State,
     account: &str,
+    kind: Option<ResetKind>,
     left: u32,
     use_by: Option<i64>,
     at: i64,
@@ -4989,6 +5087,7 @@ pub fn note_offer(
         return false;
     }
     record.offer = Some(Offer {
+        kind,
         left,
         use_by,
         at,
@@ -5368,8 +5467,20 @@ pub enum ResetDone<'a> {
     /// The vendor's own line said the limits were reset: a reset was SPENT.
     /// `left` is the count that line named, where it named one.
     Used {
-        /// Resets left after this one.
+        /// The kind spent.
+        kind: ResetKind,
+        /// Resets of that kind left after this one.
         left: Option<u32>,
+    },
+    /// The vendor's own line said a reset was SPENT and the walled limit
+    /// STILL STANDS (2.1.304's `<Kind> used · you're still at your …`, a
+    /// give-back grant at a wall it did not lift): recorded as spent, and
+    /// no wall ends.
+    Walled {
+        /// The kind spent.
+        kind: ResetKind,
+        /// Resets of that kind left after this one.
+        left: u32,
     },
     /// The vendor said the limit had lifted by itself: nothing was spent,
     /// and the wall is over all the same.
@@ -5385,7 +5496,7 @@ impl ResetDone<'_> {
     #[must_use]
     pub fn word(&self) -> &'static str {
         match self {
-            ResetDone::Used { .. } => "used",
+            ResetDone::Used { .. } | ResetDone::Walled { .. } => "used",
             ResetDone::Lifted => "lifted",
             ResetDone::Kept(_) => "kept",
             ResetDone::Failed(_) => "failed",
@@ -5408,8 +5519,9 @@ fn reset_reason(why: &str) -> String {
 
 /// RECORD HOW THE CLAIMED RESET ENDED, at the caller's clock `now`: the one
 /// ledger row of the attempt, with the session and one bounded reason — the
-/// count left, `lifted`, or the caller's word ([`reset_reason`]); never a
-/// path or a name.
+/// count of the kind spent left in the vendor's words (`1 weekly reset
+/// left`; `…, still walled` where the wall stands), `lifted`, or the
+/// caller's word ([`reset_reason`]); never a path or a name.
 ///
 /// NOTHING unless the slot is THIS claim — `account`, the wall's `until` and
 /// `sid` — with no outcome yet: an outcome is recorded once, by the session
@@ -5422,7 +5534,7 @@ fn reset_reason(why: &str) -> String {
 /// The claim keeps the outcome's word ([`ResetClaim::done`]) and stays, so
 /// the wall is not attempted again ([`claim_reset`]). The row:
 ///
-/// * `reset-used` for [`ResetDone::Used`];
+/// * `reset-used` for [`ResetDone::Used`] and [`ResetDone::Walled`];
 /// * `reset-kept` for [`ResetDone::Lifted`] (reason `lifted`) and for
 ///   [`ResetDone::Kept`];
 /// * `reset-failed` for [`ResetDone::Failed`].
@@ -5459,9 +5571,16 @@ pub fn reset_outcome(
     let window = claim.window.clone();
     let machine = state.machine.clone();
     let (kind, why) = match done {
-        ResetDone::Used { left } => (
+        ResetDone::Used { kind, left } => (
             Kind::ResetUsed,
-            left.map(|n| format!("{n} left")).unwrap_or_default(),
+            left.map_or_else(
+                || kind.name().to_owned(),
+                |n| format!("{} left", kind.resets(n)),
+            ),
+        ),
+        ResetDone::Walled { kind, left } => (
+            Kind::ResetUsed,
+            format!("{} left, still walled", kind.resets(*left)),
         ),
         ResetDone::Lifted => (Kind::ResetKept, ResetDone::Lifted.word().to_owned()),
         ResetDone::Kept(why) => (Kind::ResetKept, reset_reason(why)),
@@ -6014,6 +6133,10 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> 
 pub struct Store {
     /// The directory (0700).
     pub dir: PathBuf,
+    /// The bounded wait of the recorders' own takes of its lock
+    /// ([`record_wall`], [`record_usage`], [`record_gone`]): [`LOCK_LADDER`]
+    /// from [`Store::at`]; [`Store::bounded_by`] another.
+    ladder: &'static [std::time::Duration],
 }
 
 /// A held [`Store::acquire`], released by `LOCK_UN` when it drops rather than
@@ -6040,7 +6163,20 @@ impl Store {
     pub fn at(harness_state: &Path) -> Store {
         Store {
             dir: harness_state.join("accounts"),
+            ladder: &LOCK_LADDER,
         }
+    }
+
+    /// This store with the recorders' takes of its lock waiting `ladder`
+    /// instead of [`LOCK_LADDER`] ([`Store::acquire_within`]): for a caller
+    /// whose own hand holds the lock through the call, which any ladder
+    /// answers alike — [`LOCK_HELD`] — and the shortest at once. A test
+    /// seam (aterm-gui's held-lock tests): no product code shortens the wait.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bounded_by(self, ladder: &'static [std::time::Duration]) -> Store {
+        Store { ladder, ..self }
     }
 
     /// Make the directory, 0700, owned by this user and writable by nobody
@@ -6730,7 +6866,7 @@ pub fn record_wall(
     let mut changed = false;
     let mut cleared = false;
     let mut note = None;
-    let done = store.transact_within(&LOCK_LADDER, now, &mut note, |state| {
+    let done = store.transact_within(store.ladder, now, &mut note, |state| {
         let before = state.clone();
         // The session's row is rewritten only when it says something new:
         // a look that finds everything on record must write nothing.
@@ -6901,7 +7037,7 @@ pub fn record_usage(
     let sid = one_line(sid, WORD_MAX);
     let mut changed = false;
     let mut note = None;
-    let done = store.transact_within(&LOCK_LADDER, now, &mut note, |state| {
+    let done = store.transact_within(store.ladder, now, &mut note, |state| {
         let Some(record) = account_mut(state, account) else {
             return Ok(Vec::new());
         };
@@ -7073,7 +7209,7 @@ pub fn record_gone(store: &Store, sid: &str, now: i64) -> Result<bool, String> {
     let mut forgot = false;
     let mut held = false;
     let mut note = None;
-    store.transact_within(&LOCK_LADDER, now, &mut note, |state| {
+    store.transact_within(store.ladder, now, &mut note, |state| {
         let holding = state.canary_holds(now);
         forgot = forget_session(state, &sid);
         held = holding && !state.canary_holds(now);

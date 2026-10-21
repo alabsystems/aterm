@@ -127,6 +127,37 @@ fn mutation_path(
     Ok((path, update))
 }
 
+/// Whether a remote the user spelled names a LOCAL source (a path
+/// or file:// URL) rather than a network remote. Only then may the
+/// file transport be allowed: the user naming their own directory
+/// is the consent, and tap files are only ever read as data. Every
+/// other remote stays behind the https/ssh-only pin (which is what
+/// keeps ext::/fd:: transport execution out).
+fn is_local_remote(remote: &str) -> bool {
+    remote.starts_with('/')
+        || remote.starts_with("./")
+        || remote.starts_with("../")
+        || remote.starts_with("~/")
+        || remote.starts_with("file://")
+}
+
+/// The `-c protocol...` prefix for tap git invocations: deny all
+/// transports, then allow https/ssh — plus file for a local remote.
+fn git_protocol_args(local: bool) -> Vec<&'static str> {
+    let mut args = vec![
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.ssh.allow=always",
+    ];
+    if local {
+        args.extend(["-c", "protocol.file.allow=always"]);
+    }
+    args
+}
+
 /// Clone or update a tap. Default remote is GitHub
 /// (`<user>/homebrew-<repo>`), as brew's is.
 pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<Tap, String> {
@@ -149,22 +180,10 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<Tap, String
         let work = aterm_tempfile::TempDir::new_in(parent)
             .map_err(|e| format!("abrew: cannot create tap staging directory: {e}"))?;
         let staged = work.path().join("tap");
-        let code = fetch::run_inherit(
-            "git",
-            &[
-                "-c",
-                "protocol.allow=never",
-                "-c",
-                "protocol.https.allow=always",
-                "-c",
-                "protocol.ssh.allow=always",
-                "clone",
-                "--depth=1",
-                "--",
-                &remote,
-                &staged.to_string_lossy(),
-            ],
-        );
+        let staged_s = staged.to_string_lossy();
+        let mut git_args: Vec<&str> = git_protocol_args(is_local_remote(&remote));
+        git_args.extend(["clone", "--depth=1", "--", &remote, &staged_s]);
+        let code = fetch::run_inherit("git", &git_args);
         if code != 0 {
             return Err(format!(
                 "abrew: git clone failed for tap {user}/{repo} ({code})"
@@ -191,21 +210,17 @@ pub(super) fn update(prefix: &Prefix, tap: &Tap) -> Result<(), String> {
 
 fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
     println!("==> Updating tap {user}/{repo}");
-    let code = fetch::run_inherit(
+    // A tap cloned from a local path keeps a local origin: allow
+    // the file transport for exactly that recorded remote.
+    let local = fetch::run_capture(
         "git",
-        &[
-            "-c",
-            "protocol.allow=never",
-            "-c",
-            "protocol.https.allow=always",
-            "-c",
-            "protocol.ssh.allow=always",
-            "-C",
-            &path.to_string_lossy(),
-            "pull",
-            "--ff-only",
-        ],
-    );
+        &["-C", &path.to_string_lossy(), "remote", "get-url", "origin"],
+    )
+    .is_ok_and(|out| is_local_remote(String::from_utf8_lossy(&out.stdout).trim()));
+    let path_s = path.to_string_lossy();
+    let mut git_args: Vec<&str> = git_protocol_args(local);
+    git_args.extend(["-C", &path_s, "pull", "--ff-only"]);
+    let code = fetch::run_inherit("git", &git_args);
     if code != 0 {
         return Err(format!(
             "abrew: git pull failed for tap {user}/{repo} ({code})"
@@ -217,6 +232,9 @@ fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
 pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
     let (user, repo) = parse_tap_name(name)
         .ok_or_else(|| format!("abrew: tap name must be user/repo, got {name}"))?;
+    if tap_path(prefix, &user, &repo).is_ok_and(|p| std::fs::symlink_metadata(p).is_err()) {
+        return Err(format!("abrew: tap {user}/{repo} is not tapped"));
+    }
     let (path, _) = mutation_path(prefix, &user, &repo, false)?;
     std::fs::remove_dir_all(&path).map_err(|e| format!("abrew: {e}"))
 }
@@ -364,6 +382,30 @@ pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_remotes_are_the_only_file_transport() {
+        for local in ["/tmp/tap", "./tap", "../tap", "~/tap", "file:///tmp/tap"] {
+            assert!(is_local_remote(local), "{local}");
+            assert!(
+                git_protocol_args(true).contains(&"protocol.file.allow=always"),
+                "{local}"
+            );
+        }
+        for remote in [
+            "https://github.com/me/homebrew-tools.git",
+            "git@github.com:me/homebrew-tools.git",
+            "ssh://git@example.com/x.git",
+            "ext::sh -c true",
+            "fd::0",
+        ] {
+            assert!(!is_local_remote(remote), "{remote}");
+        }
+        assert!(
+            !git_protocol_args(false).contains(&"protocol.file.allow=always"),
+            "non-local remotes never allow the file transport"
+        );
+    }
 
     #[test]
     fn rb_parse_as_data() {

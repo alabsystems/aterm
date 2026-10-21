@@ -100,7 +100,9 @@ pub fn probe<T: Tty + ?Sized>(tty: &mut T, decoder: &mut Decoder) -> io::Result<
     while !done {
         match tty.read(&mut buf, Some(deadline))? {
             Readiness::Bytes(n) => {
-                for event in decoder.feed(&buf[..n], tty.now()) {
+                // A count past the buffer breaks the Tty contract; read what the buffer holds.
+                let read = buf.get(..n).unwrap_or(&buf);
+                for event in decoder.feed(read, tty.now()) {
                     match event {
                         Event::Reply(reply) if !done => done = probed.caps.read(reply),
                         other => probed.events.push(other),

@@ -217,11 +217,12 @@ fn state(t: &Terminal, resp: &[u8]) -> String {
             }
             // A complex cell's `char_data` is an overflow index (allocation
             // order, not content): show the cluster it resolves to instead.
-            let glyph = if cell.is_complex() {
-                g.complex_char_str_at(row, col).unwrap_or_default()
+            let mut glyph = String::new();
+            if cell.is_complex() {
+                g.push_complex_char_at(row, col, &mut glyph);
             } else {
-                cell.char().to_string()
-            };
+                glyph.push(cell.char());
+            }
             let _ = writeln!(
                 s,
                 "  {col}: {glyph:?} {:?} {:?} has_extras={} fg={:?} bg={:?} {extra:?}",

@@ -23,6 +23,7 @@ pub mod dev_seam;
 // The argv0 aliases of the one `aterm` binary: the list the bundle lays and every
 // Rust reader shares.
 pub mod argv0;
+pub mod cli_path;
 
 pub mod identity;
 // The need words (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2): what a
@@ -54,6 +55,9 @@ pub mod rust_lane;
 
 pub mod app_inspection;
 mod color_palette;
+// The request line's grammar (selector, verb, rest): the server's lanes, relay
+// and dispatch and every client's reply framing read a line through it.
+pub mod control_request;
 pub mod control_socket;
 pub mod control_verbs;
 // The fabric's word grammar (principal, topic, kind, verdict, `via=`): the

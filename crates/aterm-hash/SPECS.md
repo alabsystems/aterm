@@ -8,6 +8,19 @@
 > are deleted. The one test in §4 samples no spec and can be deleted now. The crate's floor today is
 > 50 of 86 obligation rows proved (`crates/aterm-release/trust/floors.tsv`).
 
+> Status 2026-10-20: `fnv1a_64_extend` no longer holds a loop. Its body is one call to
+> astream-wire's `hash::fnv1a_64_update` (a `while let` over a slice pattern), and `FNV64_OFFSET` is
+> astream-wire's `FNV1A_64_INIT`; `FNV64_PRIME` and `fnv_mix_u64` stay here, because astream keeps
+> its prime private and exports no word fold. `fnv1a_64_extend` went from 3 proved of 4 obligations
+> to 1 unknown (the call), measured by `ship trust run -p aterm-hash`. HASH-FNV-1 and HASH-FNV-2 now cite a refinement `ensures` on
+> `fnv1a_64_update` (`fnv1a_64_update(h, bs) = fnvRef(h, bs)`) that astream-wire DOES NOT HAVE: the
+> function is a plain `pub const fn`, of which Trust proves only the Level-0 obligations (astream's
+> `evidence/verify/trust-wire.md`). That contract, with the loop invariant this file used to state,
+> lands in astream first (astream's `docs/ROADMAP.md`, "Functional contracts aterm cites", astream e45b103); here the
+> two rows wait on it and on gap 12 to cite it. The new test
+> `the_word_fold_agrees_with_astreams_byte_loop` samples HASH-FNV-1 (§2). The counts in the header
+> and §3 were taken before.
+
 Source: `crates/aterm-hash` (read only). I read every `#[test]` (`src/fnv.rs` 2, `src/lib.rs` 4 = 6)
 and the code each one reaches. Nothing was compiled or run. The claims below come from reading the code.
 
@@ -45,8 +58,8 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secon
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
-HASH-FNV-1	refinement	fnv::fnv1a_64_extend, fnv::fnv1a_64, fnv::fnv_mix_u64	∀ h: u64, bs: &[u8]: fnv1a_64_extend(h, bs) = fnvRef(h, bs) and fnv1a_64(bs) = fnvRef(O, bs). ∀ h, w: u64: fnv_mix_u64(h, w) = (h ^ w) * P, so fnv_mix_u64(h, b as u64) = fnvRef(h, [b]). With the constant facts O = 0xcbf29ce484222325 and P = 2^40 + 0x1b3 (the published FNV-1a/64 parameters), this fixes the function to the published algorithm. The published vectors ("" → O, "a" → 0xaf63dc4c8601ec8c, "foobar" → 0x85944171f73967e8) become `decide`/`native_decide` corollaries and serve as the negative control: a wrong prime fails them. Loop invariant: 0 ≤ i ≤ bs.len() ∧ h = fnvRef(hash, take i bs); decreases bs.len() − i.	fnv::matches_the_published_vectors	EASY-MEDIUM: a const fn while loop over a slice index (invariant, decreases), &[u8] as a List model, u8→u64 cast, XOR, wrapping_mul	0,1,3,5,7,14
-HASH-FNV-2	other (homomorphism)	fnv::fnv1a_64_extend, fnv::fnv1a_64	∀ h: u64, a, b: &[u8]: fnv1a_64_extend(fnv1a_64_extend(h, a), b) = fnv1a_64_extend(h, a ++ b); in particular fnv1a_64_extend(fnv1a_64(a), b) = fnv1a_64(a ++ b), and fnv1a_64_extend(h, []) = h. Follows from HASH-FNV-1 by List.foldl_append, stated as a Clean theorem over the kernel imports.	fnv::a_stream_of_writes_is_the_hash_of_their_concatenation (second assert)	TRIVIAL given HASH-FNV-1: two slice binders, List append in the model, composition of callee ensures	0,1,3,4,5,7
+HASH-FNV-1	refinement	fnv::fnv1a_64_extend, fnv::fnv1a_64, fnv::fnv_mix_u64	∀ h: u64, bs: &[u8]: fnv1a_64_extend(h, bs) = fnvRef(h, bs) and fnv1a_64(bs) = fnvRef(O, bs). ∀ h, w: u64: fnv_mix_u64(h, w) = (h ^ w) * P, so fnv_mix_u64(h, b as u64) = fnvRef(h, [b]). With the constant facts O = 0xcbf29ce484222325 and P = 2^40 + 0x1b3 (the published FNV-1a/64 parameters), this fixes the function to the published algorithm. The published vectors ("" → O, "a" → 0xaf63dc4c8601ec8c, "foobar" → 0x85944171f73967e8) become `decide`/`native_decide` corollaries and serve as the negative control: a wrong prime fails them (through fnv_mix_u64; fnv1a_64 multiplies by astream-wire's own private prime). Since 2026-10-20, fnv1a_64_extend is one call to astream_wire::hash::fnv1a_64_update and O is its FNV1A_64_INIT, so the first clause is a cross-crate citation of a refinement ensures on fnv1a_64_update (= fnvRef(h, bs), with P its private prime) that does not exist yet. That contract is astream's to land first, with the loop invariant this row used to carry, restated for its `while let` over a slice pattern: rest is a suffix of bs ∧ h = fnvRef(hash, bs[..bs.len() − rest.len()]); decreases rest.len().	fnv::matches_the_published_vectors, fnv::the_word_fold_agrees_with_astreams_byte_loop	EASY-MEDIUM here (a cross-crate const fn call, &[u8] as a List model, u8→u64 cast, XOR, wrapping_mul); the loop itself is astream-wire's	0,1,3,5,12,14 + the astream-wire contract (whose loop needs gap 7 on that side)
+HASH-FNV-2	other (homomorphism)	fnv::fnv1a_64_extend, fnv::fnv1a_64	∀ h: u64, a, b: &[u8]: fnv1a_64_extend(fnv1a_64_extend(h, a), b) = fnv1a_64_extend(h, a ++ b); in particular fnv1a_64_extend(fnv1a_64(a), b) = fnv1a_64(a ++ b), and fnv1a_64_extend(h, []) = h. Follows from HASH-FNV-1 by List.foldl_append, stated as a Clean theorem over the kernel imports.	fnv::a_stream_of_writes_is_the_hash_of_their_concatenation (second assert)	TRIVIAL given HASH-FNV-1: two slice binders, List append in the model, composition of callee ensures	0,1,3,4,5,12 + the astream-wire contract (through HASH-FNV-1)
 HASH-FNV-3	invariant	fnv::Fnv1a64::{new, default, write, write_u8, finish}	Type invariant with ghost history W: List UInt8 (every byte written): self.0 = fnvRef(O, W). new() and default() establish it with W = []. write(bs) takes W to W ++ bs (two-state: self'.0 = fnv1a_64_extend(self.0, bs)). write_u8(b) takes W to W ++ [b] (self'.0 = fnv_mix_u64(self.0, b as u64)). finish() returns self.0. Hence for any sequence of writes w1..wn (slices or single bytes), finish() = fnv1a_64(w1 ++ … ++ wn).	fnv::a_stream_of_writes_is_the_hash_of_their_concatenation	EASY given HASH-FNV-1/2: &mut self two-state postconditions, &self view, newtype struct, Default impl, ghost history	0,1,2,3,4,5
 HASH-FX-1	refinement	FxHasher::{default, add_to_hash, write_u8, write_u16, write_u32, write_u64, write_usize, write_u128, finish}, FxBuildHasher::build_hasher	Bit-exact with rustc-hash 2.1 on integer writes. FxHasher::default().hash = 0 and FxBuildHasher.build_hasher() = FxHasher::default(). ∀ state h: add_to_hash(x) sets hash' = add(h, x); write_u8/u16/u32/usize(x) set hash' = add(h, x as usize); write_u64(x) sets hash' = add(h, x as usize); write_u128(x) sets hash' = add(add(h, lo64(x)), hi64(x)) (the body reads the words with read_u64_le over x.to_le_bytes() behind a `bs.len() >= 16` guard that always holds, so its else arm is dead); finish() = fin(hash). Hence for every unsigned n of type u8/u16/u32/u64/usize, hashOneFx(n) = fin(n·K); for every u128 n, hashOneFx(n) = fin((lo64(n)·K + hi64(n))·K); and for every signed n of width w, hashOneFx(n) = hashOneFx(n as u_w), because std's signed Hash impls forward through the unsigned write. 32-bit arm: the same with K32 and ROT = 15; write_u64 adds both 32-bit halves and write_u128 adds the four 32-bit little-endian words.	lib::test_fxhasher_unsigned_integers_match_rustc_hash, lib::test_fxhasher_signed_integers_match_rustc_hash	MEDIUM: &mut self two-state, Hasher/BuildHasher trait impls reached through std's generic Hash impls for primitives, truncating and sign casts, wrapping_add/mul, rotate_left, u128 to_le_bytes plus slice ranges, cfg(target_pointer_width) arms	0,1,2,3,4,5,11
 HASH-FX-2	equivalence	read_u32_le, read_u64_le, multiply_mix	∀ b: &[u8]: read_u32_le(b) = le32(b, 0) if b.len() ≥ 4, else 0; read_u64_le(b) = le64(b, 0) if b.len() ≥ 8, else 0; both are panic-free on every input. ∀ x, y: u64: multiply_mix(x, y) = mm(x, y), with the product taken in u128 (64-bit arm). The 32-bit arm equals the rustc-hash 2.1 32-bit formula (lx·hy) ^ rotr32(hx·ly).	lib::test_fxhasher_bytes_match_rustc_hash (shared), lib::test_fxhasher_unsigned_integers_match_rustc_hash (u128 rows, shared)	EASY: slice indexing and ranges, u8→u32/u64 casts, constant shifts, OR, u128 multiply, early return. multiply_mix alone is straight-line scalar code	0,1,3,5
@@ -72,8 +85,9 @@ HASH-FX-3	refinement	hash_bytes, FxHasher::write	∀ bs: &[u8]: hash_bytes(bs) =
 | 5 quantified clauses | 6 |
 | 4 callee-ensures composition | 4 |
 | 2 `&self`/`&mut self` views, two-state | 3 |
-| 7 loops | 3 |
+| 7 loops (HASH-FX-3; HASH-FNV-1's loop is astream-wire's since 2026-10-20) | 1 |
 | 11 generics (std's generic `Hash` impls) | 1 |
+| 12 cross-crate theorem citation (astream-wire's `fnv1a_64_update`, whose contract astream has yet to land) | 2 |
 | 14 Clean elaborator (`native_decide` corollaries) | 1 |
 
 No spec is blocked by gap 0 alone. The closest are two scalar clauses: `fnv_mix_u64` (in HASH-FNV-1)
@@ -86,13 +100,14 @@ HASH-FX-2 (`multiply_mix`, then the read helpers) → HASH-FX-3. HASH-FX-1 depen
 only through its u128 path. HASH-FX-1 and HASH-FX-3 compose for `FxHasher::write`. On the FNV side,
 HASH-FNV-1 → HASH-FNV-2 → HASH-FNV-3.
 
-## 2. Test → spec map (TSV; the 5 spec samples)
+## 2. Test → spec map (TSV; the 6 spec samples)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
 ```tsv
 file	test	primary	also
 src/fnv.rs	matches_the_published_vectors	HASH-FNV-1	
+src/fnv.rs	the_word_fold_agrees_with_astreams_byte_loop	HASH-FNV-1	
 src/fnv.rs	a_stream_of_writes_is_the_hash_of_their_concatenation	HASH-FNV-3	HASH-FNV-2, HASH-FNV-1 (the fnv_mix_u64 assert)
 src/lib.rs	test_fxhasher_unsigned_integers_match_rustc_hash	HASH-FX-1	HASH-FX-2 (u128 path through read_u64_le)
 src/lib.rs	test_fxhasher_signed_integers_match_rustc_hash	HASH-FX-1	
@@ -140,11 +155,14 @@ src/lib.rs	test_fxhasher_bytes_match_rustc_hash	HASH-FX-3	HASH-FX-2, HASH-FX-1 (
 1. **The scalar cores: `fnv_mix_u64` (HASH-FNV-1) and `multiply_mix` (HASH-FX-2).** These are
    straight-line, panic-free `u64`/`u128` arithmetic and the closest to "gap 0 only". After the seal,
    each needs only XOR, casts and a shift admitted for E6 import (gap 3). They are `bv_decide`/`omega`-class.
-2. **HASH-FNV-1 in full.** One const-fn loop with an obvious invariant. Its published vectors are a
+2. **HASH-FNV-1 in full.** Since 2026-10-20 its loop is astream-wire's `fnv1a_64_update`, so it
+   comes in two halves: astream lands the loop's refinement `ensures` first (one const-fn loop with
+   an obvious invariant, on that side), and then the row here is a cross-crate citation of it
+   (gap 12) plus `fnv_mix_u64`'s scalar clause and the constant facts. Its published vectors are a
    built-in negative control. It is the base for HASH-FNV-2 and -3.
 3. **HASH-FNV-2.** Free once HASH-FNV-1 holds (`List.foldl_append`).
-4. **HASH-FNV-3.** A newtype with a ghost history. Together with 2 and 3 it retires both FNV tests,
-   and it is a small first case for gap 2 (two-state `&mut self`).
+4. **HASH-FNV-3.** A newtype with a ghost history. Together with 2 and 3 it retires the three FNV
+   tests, and it is a small first case for gap 2 (two-state `&mut self`).
 5. **HASH-FX-2 read helpers** (`read_u32_le`, `read_u64_le`). Slice indexing with a length guard.
 6. **HASH-FX-3.** The stride-16 loop plus slice patterns, built on step 5. This is the hardest spec here.
 7. **HASH-FX-1.** Needs std's generic `Hash` impls for primitives modelled (gap 11) before the

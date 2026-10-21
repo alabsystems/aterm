@@ -3,7 +3,7 @@
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! The single PTY spawn and IO seam: every raw PTY primitive (Unix pty pair, `fork`,
 //! `execve`, `read`/`write`, `TIOCSWINSZ`, the queue probes [`input_queue_len`],
@@ -125,9 +125,23 @@ fn is_foreign_terminal_key(key: &std::ffi::OsStr) -> bool {
     false
 }
 
+/// Whether `key` hands the child a descriptor by number, which no child of aterm's
+/// has: `WAYLAND_SOCKET`, the compositor connection a launcher passes down, which
+/// libwayland takes as its connection without falling back to `WAYLAND_DISPLAY`.
+/// Every descriptor above stdio is close-on-exec in the child (`unix::InheritStrip`),
+/// so in the shell the number names nothing, or a file opened since, and every Wayland
+/// client run from it fails to connect. aterm's own connection takes the variable out
+/// of aterm's environment as it opens, but a Linux window whose display answers forks
+/// session 0 before that (LINUX-6), so no spawn passes it on.
+#[must_use]
+fn is_inherited_descriptor_key(key: &std::ffi::OsStr) -> bool {
+    key == "WAYLAND_SOCKET"
+}
+
 /// The child shell's environment: `inherited` minus every deny-listed key
 /// ([`aterm_types::domain::is_ai_env_key`]: AI-tool vars and the recursion-provisioning
-/// identity vars; case-insensitive on Windows only), then `env_add` on top, overriding or
+/// identity vars; case-insensitive on Windows only) and every descriptor handed down by
+/// number ([`is_inherited_descriptor_key`]), then `env_add` on top, overriding or
 /// appending. When `env_add` claims the terminal (it sets `TERM_PROGRAM`, as a window's
 /// spawn does), every other terminal's identity variable ([`is_foreign_terminal_key`])
 /// is dropped as well; without that claim the shell runs in the outer terminal and
@@ -151,6 +165,7 @@ fn build_child_env(
     let mut env_pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
     for (k, v) in inherited {
         if !aterm_types::domain::is_ai_env_key(&k)
+            && !is_inherited_descriptor_key(&k)
             && !(claims_terminal && is_foreign_terminal_key(&k))
         {
             env_pairs.push((k, v));
@@ -508,6 +523,19 @@ pub const fn decode_winsize_le(bytes: [u8; 8]) -> (u16, u16, u16, u16) {
     (cols, rows, xpixel, ypixel)
 }
 
+/// Declares the calling thread `QOS_CLASS_USER_INTERACTIVE` (macOS; a no-op elsewhere,
+/// Windows included), for a worker holding a lock the UI thread contends (the sink's spill
+/// drainer) or a harness that must run at the app's render QoS. A safe wrapper for
+/// `forbid(unsafe_code)` callers.
+pub fn declare_interactive_thread() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates no
+    // shared state, so there is nothing for another thread to observe.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
 // The console host a Windows pseudoconsole runs in (aterm.toml `conpty`): the
 // types on every platform, the no-op parity of the window's calls off Windows.
 mod console_host;
@@ -634,6 +662,36 @@ mod tests {
                 pair("KITTY_CONFIG_DIRECTORY", "/home/u/kitty"),
             ]
         );
+    }
+
+    /// aterm launched with its compositor connection handed down (`WAYLAND_SOCKET`): no
+    /// shell gets the variable, with or without the terminal claimed, since the
+    /// descriptor it names is closed in every child, and a Wayland client run from the
+    /// shell would take that number as its connection; `WAYLAND_DISPLAY` reaches it. A
+    /// Linux window whose display answers forks session 0 before its own connection
+    /// takes the variable out of aterm's environment (LINUX-6).
+    ///
+    /// NEGATIVE CONTROL: without the filter, the variable reaches both shells.
+    #[test]
+    fn build_child_env_drops_a_compositor_connection_handed_down_by_number() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        for env_add in [
+            vec![("TERM_PROGRAM".to_string(), "aterm".to_string())],
+            Vec::new(),
+        ] {
+            let inherited = vec![
+                (os("WAYLAND_SOCKET"), os("5")),
+                (os("WAYLAND_DISPLAY"), os("wayland-0")),
+                (os("PATH"), os("/usr/bin")),
+            ];
+            let keys: Vec<String> = build_child_env(inherited.into_iter(), &env_add)
+                .into_iter()
+                .map(|(k, _)| k.to_string_lossy().into_owned())
+                .filter(|k| k != "TERM_PROGRAM")
+                .collect();
+            assert_eq!(keys, ["WAYLAND_DISPLAY", "PATH"], "env_add {env_add:?}");
+        }
     }
 
     /// The passthrough session of an `aterm` typed at a prompt: its `env_add` holds the

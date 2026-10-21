@@ -130,7 +130,7 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     let target = running.saturating_add(3);
     read_in_flight(&mut app, target);
     let Some(spent) = Instant::now().checked_sub(Duration::from_millis(1)) else {
-        return;
+        aterm_spec::host::could_not_run("the monotonic clock here cannot reach back 1 ms");
     };
     app.preverify_read_waited = Some((target, spent));
     assert!(
@@ -161,7 +161,7 @@ fn the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock() {
         .checked_sub(aterm_update::HANDOFF_PREVERIFY_BOUND)
         .is_none()
     {
-        return;
+        aterm_spec::host::could_not_run("the monotonic clock here cannot reach back one bound");
     }
     let until = now + crate::HANDOFF_PREVERIFY_READ_MARGIN;
     let done = Arc::new(AtomicBool::new(false));

@@ -2412,6 +2412,19 @@ fn floor_snapshot(staging: &Staging) -> Result<crate::manifest::Floor, String> {
     })
 }
 
+/// What one check runs against besides the network: the folder the installed bundle sits
+/// in, the staging layout, the pointer transport, the roster anchor and the Team ID a
+/// staged bundle must be signed by. [`check_and_stage_inner`] resolves the shipping ones;
+/// the end-to-end test supplies a scratch world, so the whole lane runs over real curl
+/// against a channel signed by a scratch master.
+struct CheckWorld<'a> {
+    installed_parent: Option<&'a std::path::Path>,
+    staging: Staging,
+    head: HeadFetch<'a>,
+    master_pubkeys: &'a [&'a str],
+    team: &'a str,
+}
+
 fn check_and_stage_inner(
     current_build: u64,
     source: &Source,
@@ -2422,10 +2435,37 @@ fn check_and_stage_inner(
         return Ok(None);
     };
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
+    // The pointer transport, INJECTED rather than called directly, so the request cost
+    // is measurable in a test.
+    let mut head = aterm_update_core::head_no_redirect;
+    let world = CheckWorld {
+        installed_parent: installed.app_root.parent(),
+        staging,
+        head: &mut head,
+        master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        team: crate::effective_team_id(),
+    };
+    check_and_stage_in(world, current_build, source, asked)
+}
+
+/// [`check_and_stage_inner`] in `world`.
+fn check_and_stage_in(
+    world: CheckWorld<'_>,
+    current_build: u64,
+    source: &Source,
+    asked: Asked,
+) -> Result<Option<String>, String> {
+    let CheckWorld {
+        installed_parent,
+        staging,
+        head,
+        master_pubkeys,
+        team,
+    } = world;
     // Recursive copy cleanup runs in this checker worker. Both staging and
     // cross-volume apply leave isolated attempts on their destination volume.
     install::reap_abandoned_copy_attempts(&staging.staged_dir());
-    if let Some(parent) = installed.app_root.parent() {
+    if let Some(parent) = installed_parent {
         install::reap_abandoned_copy_attempts(parent);
     }
     crate::status::clear_check_note();
@@ -2447,10 +2487,7 @@ fn check_and_stage_inner(
     // announced on that read.
     let floor = floor_snapshot(&staging)?;
 
-    // The pointer transport, INJECTED rather than called directly, so the request cost
-    // is measurable in a test.
-    let mut head = aterm_update_core::head_no_redirect;
-    let authoritative = match acquire(&staging, current_build, source, &mut head)? {
+    let authoritative = match acquire(&staging, current_build, source, head)? {
         Acquisition::Proceed(candidate) => candidate,
         Acquisition::Ended => return Ok(None),
         Acquisition::UpToDate { tag } => {
@@ -2500,7 +2537,7 @@ fn check_and_stage_inner(
     // A re-read that failed keeps the snapshot: the max below only tightens.
     let floor_refresh = || crate::manifest::Floor::read(&floor_path).roster_seq;
     let roster_policy = RosterPolicy {
-        master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        master_pubkeys,
         floor_seq: floor.roster_seq,
         now_unix: aterm_update_core::roster::now_unix(),
         floor_refresh: Some(&floor_refresh),
@@ -2914,20 +2951,12 @@ fn check_and_stage_inner(
     // keyed on the MANIFEST digest, not this container's, so the two paths share one
     // retry budget for one candidate build.
     let staged = match artifact.container {
-        Container::Zip => install::stage_from_zip(
-            &staging,
-            &container_path,
-            &manifest,
-            crate::effective_team_id(),
-            &roster_read_at,
-        ),
-        Container::Dmg => install::stage_from_dmg(
-            &staging,
-            &container_path,
-            &manifest,
-            crate::effective_team_id(),
-            &roster_read_at,
-        ),
+        Container::Zip => {
+            install::stage_from_zip(&staging, &container_path, &manifest, team, &roster_read_at)
+        }
+        Container::Dmg => {
+            install::stage_from_dmg(&staging, &container_path, &manifest, team, &roster_read_at)
+        }
     };
     if let Err(e) = staged {
         let _ = std::fs::remove_file(&container_path);

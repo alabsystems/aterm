@@ -107,14 +107,15 @@
 //! Copied from `consent_warmup.rs` exactly: a named thread whose `JoinHandle`
 //! is DROPPED on the spot, so joining it on the event loop is structurally
 //! impossible; a bounded `sync_channel` the producer `try_send`s into and drops
-//! on `Full`; and a payload-free poke of the event loop. The child process is
+//! on `Full`; and a payload-free poke of the event loop, at most one per drain
+//! however many events a burst queues. The child process is
 //! signalled by pid (never joined) and is reaped by the worker that spawned it,
 //! so no `wait()` ever runs on the event loop.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The observer's binary, named ABSOLUTELY, from the one place it is spelled
@@ -574,13 +575,14 @@ pub(crate) enum PidSource {
 }
 
 /// A request that has been open long enough, and is complete enough, to be a
-/// DIRECT OBSERVATION of a prompt.
+/// DIRECT OBSERVATION of a prompt. Borrowed from the table, so a read clones
+/// nothing; the announcement copies the two strings it keeps.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PendingPrompt {
+pub(crate) struct PendingPrompt<'a> {
     /// The correlation key, kept so a caller can tell two prompts apart.
-    pub(crate) msg_id: String,
+    pub(crate) msg_id: &'a str,
     /// The TCC service, verbatim from the log.
-    pub(crate) service: String,
+    pub(crate) service: &'a str,
     /// The process that is parked in the syscall: the `accessing=` pid when the
     /// line carried one, else the `requesting=` pid (a self-request carries
     /// only that). NEVER the `responsible=` pid.
@@ -589,9 +591,29 @@ pub(crate) struct PendingPrompt {
     /// from a relayed one.
     pub(crate) pid_source: PidSource,
     /// The code identity the request names, when the subject line arrived.
-    pub(crate) subject: Option<String>,
+    pub(crate) subject: Option<&'a str>,
     /// How long it has been open.
     pub(crate) age: Duration,
+}
+
+impl PendingEntry {
+    /// The pid, its block and the service, when this request carries
+    /// everything a prompt needs: a known service, some pid (the accessing one
+    /// preferred) and no preflight bit. Age aside, this is the signature.
+    ///
+    /// A preflight is a capability question that raises no dialog, so folding
+    /// one in would manufacture a prompt out of a question nobody saw.
+    fn signature(&self) -> Option<(i32, PidSource, &str)> {
+        if self.preflight == Some(true) {
+            return None;
+        }
+        let (pid, source) = match (self.accessing_pid, self.requesting_pid) {
+            (Some(pid), _) => (pid, PidSource::Accessing),
+            (None, Some(pid)) => (pid, PidSource::Requesting),
+            (None, None) => return None,
+        };
+        Some((pid, source, self.service.as_deref()?))
+    }
 }
 
 /// The in-flight requests, keyed by `msgID`.
@@ -691,34 +713,45 @@ impl PendingTable {
     }
 
     /// THE SIGNATURE. Requests open for at least `threshold`, with a known
-    /// service and a known accessing pid, that are not preflights.
-    ///
-    /// A preflight is a capability question that raises no dialog, so folding
-    /// one in here would manufacture a prompt out of a question nobody saw.
-    pub(crate) fn pending_prompts(&self, now: Instant, threshold: Duration) -> Vec<PendingPrompt> {
+    /// service and a known accessing pid, that are not preflights
+    /// ([`PendingEntry::signature`]).
+    pub(crate) fn pending_prompts(
+        &self,
+        now: Instant,
+        threshold: Duration,
+    ) -> Vec<PendingPrompt<'_>> {
         self.entries
             .iter()
             .filter_map(|entry| {
                 let age = now.saturating_duration_since(entry.first_seen);
-                if age < threshold || entry.preflight == Some(true) {
+                if age < threshold {
                     return None;
                 }
-                let (accessing_pid, pid_source) = match (entry.accessing_pid, entry.requesting_pid)
-                {
-                    (Some(pid), _) => (pid, PidSource::Accessing),
-                    (None, Some(pid)) => (pid, PidSource::Requesting),
-                    (None, None) => return None,
-                };
+                let (accessing_pid, pid_source, service) = entry.signature()?;
                 Some(PendingPrompt {
-                    msg_id: entry.msg_id.clone(),
-                    service: entry.service.clone()?,
+                    msg_id: &entry.msg_id,
+                    service,
                     accessing_pid,
                     pid_source,
-                    subject: entry.subject.clone(),
+                    subject: entry.subject.as_deref(),
                     age,
                 })
             })
             .collect()
+    }
+
+    /// The earliest instant a request that is not `threshold` old yet, and
+    /// already carries the rest of the signature, becomes a pending prompt;
+    /// `None` when no request is on its way there. A request that gains the
+    /// rest later does so by a line, and a line is a drain the next verdict
+    /// pass reads anyway.
+    fn next_crossing(&self, now: Instant, threshold: Duration) -> Option<Instant> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.signature().is_some())
+            .filter_map(|entry| entry.first_seen.checked_add(threshold))
+            .filter(|crossing| *crossing > now)
+            .min()
     }
 
     /// Whether the stream is delivering `AUTHREQ_*` lines this parser does not
@@ -846,33 +879,51 @@ pub(crate) struct PromptNeed {
 pub(crate) struct StreamSink {
     tx: SyncSender<ObserverEvent>,
     poke: Arc<std::sync::Mutex<Box<dyn Fn() + Send>>>,
-    /// The child's pid while it lives, `0` otherwise. Written by the worker,
-    /// read by [`ObserverState::stop`] so a stop can SIGNAL the child without
-    /// ever holding its handle — the event loop must never own something it
-    /// could be tempted to `wait()` on. Only the macOS stream has a child.
+    /// Set by the post that pokes, cleared by [`ObserverState::drain`]
+    /// before it reads the queue: one wake per drain, however many events a
+    /// burst queues. Shared with the host's end of the channel.
+    poked: Arc<AtomicBool>,
+    /// The child's pid while it lives and the stop flag, shared with
+    /// [`ObserverState::stop`] so a stop can SIGNAL the child without ever
+    /// holding its handle — the event loop must never own something it could
+    /// be tempted to `wait()` on. The worker reads the flag between lines and
+    /// before each generation. Only the macOS stream has a child.
     #[cfg(target_os = "macos")]
-    child_pid: Arc<AtomicI32>,
-    /// Set by [`ObserverState::stop`]; the worker checks it between lines.
-    #[cfg(target_os = "macos")]
-    stop: Arc<AtomicBool>,
+    child: Arc<ChildSlot>,
     /// Lookups in flight ([`MAX_LOOKUPS`]).
     #[cfg(target_os = "macos")]
     lookups: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StreamSink {
-    /// Queue one message and poke the event loop.
+    /// Queue one message and poke the event loop unless a poke is already
+    /// owed.
     ///
-    /// `try_send` and DROP on `Full` — never block, never coalesce, exactly as
-    /// `notify.rs` and `consent_warmup.rs` do. The poke is issued either way:
-    /// the main thread's drain is what discovers both the message and, at the
-    /// end, the disconnect.
+    /// `try_send` and DROP on `Full` — never block, exactly as `notify.rs` and
+    /// `consent_warmup.rs` do; a message is never merged into another. The
+    /// poke is the latch's, issued whether or not the message fit: the main
+    /// thread's drain is what discovers both the message and, at the end, the
+    /// disconnect.
     fn post(&self, event: ObserverEvent) {
         match self.tx.try_send(event) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(dropped)) => {
                 aterm_log::debug!("consent observer dropped a full queue's message: {dropped:?}");
             }
+        }
+        self.poke_once();
+    }
+
+    /// Wake the event loop if no wake is owed since its last drain.
+    ///
+    /// The send happens BEFORE the latch and the drain clears the latch
+    /// BEFORE it reads, both as read-modify-writes, so no message is
+    /// stranded: a post whose swap finds the latch set is ordered before the
+    /// next drain's clear, which acquires it and so reads the message; a post
+    /// whose swap comes after the last clear finds it unset and pokes.
+    fn poke_once(&self) {
+        if self.poked.swap(true, Ordering::AcqRel) {
+            return;
         }
         let poke = self.poke.lock().unwrap_or_else(|p| p.into_inner());
         (poke)();
@@ -1057,19 +1108,18 @@ impl RotationPolicy {
 /// kill and reap the child HERE, on the worker that spawned it. The ONE place
 /// this module spawns a process and the ONE `wait()`.
 ///
-/// * `child_pid`: publishes the pid while the child lives, so
-///   [`ObserverState::stop`] can signal it by pid.
-/// * `stop`: checked between lines.
+/// * `slot`: the pid is published there while the child lives, so
+///   [`ObserverState::stop`] can signal it by pid ([`ChildSlot`]). Its stop
+///   flag is checked between lines, and a child published after a stop is
+///   reaped unread.
 /// * `kill_after`: a bounded run — a watchdog thread SIGKILLs the child by pid
-///   after this long. It cannot hit a reused pid: it kills only under a lock
-///   the worker takes, and sets, BEFORE it reaps.
+///   when it still stands unreaped this long after its spawn.
 ///
 /// `Err` only when the tool would not start.
 #[cfg(target_os = "macos")]
 fn run_log_tool(
     args: &[String],
-    child_pid: Option<&AtomicI32>,
-    stop: Option<&AtomicBool>,
+    slot: &Arc<ChildSlot>,
     kill_after: Option<Duration>,
     on_spawn: impl FnOnce(),
     mut on_line: impl FnMut(&str),
@@ -1094,54 +1144,33 @@ fn run_log_tool(
     let Ok(mut child) = aterm_uds::spawnfd::spawn(cmd) else {
         return Err(UnavailableReason::LogToolUnavailable);
     };
-    let pid = i32::try_from(child.id()).unwrap_or(0);
-    if let Some(slot) = child_pid {
-        slot.store(pid, Ordering::Release);
-    }
-    let reaped = Arc::new(std::sync::Mutex::new(false));
+    // A pid that did not fit is 0, which the slot never signals.
+    let reading = slot.publish(i32::try_from(child.id()).unwrap_or(0), send_signal);
     if let Some(limit) = kill_after {
-        let reaped = Arc::clone(&reaped);
+        let slot = Arc::clone(slot);
         let _ = std::thread::Builder::new()
             .name("consent-lookup-watchdog".into())
-            .spawn(move || {
-                let deadline = Instant::now() + limit;
-                while Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(50));
-                    if *reaped.lock().unwrap_or_else(|p| p.into_inner()) {
-                        return;
-                    }
-                }
-                let reaped = reaped.lock().unwrap_or_else(|p| p.into_inner());
-                // A pid that did not fit is 0, and `kill(0, …)` would signal
-                // aterm's own process group ([`signal_child`] refuses it too).
-                if !*reaped && pid > 0 {
-                    // SAFETY: a plain signal delivery to a child that is not
-                    // yet reaped (the worker sets the flag under this lock
-                    // before it waits), so the pid is still ours.
-                    unsafe {
-                        libc::kill(pid, libc::SIGKILL);
-                    }
-                }
-            });
+            .spawn(move || slot.kill_unless_retired_within(limit, send_signal));
     }
-    on_spawn();
-    for line in std::io::BufReader::new(stdout).lines() {
-        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
-            break;
+    if reading {
+        on_spawn();
+        for line in std::io::BufReader::new(stdout).lines() {
+            if slot.stopped() {
+                break;
+            }
+            let Ok(line) = line else { break };
+            on_line(&line);
         }
-        let Ok(line) = line else { break };
-        on_line(&line);
     }
-    // REAPED HERE, on the worker that spawned it. `kill` is idempotent enough
-    // for our purposes (an already-exited child just fails) and `wait` returns
+    // REAPED HERE, on the worker that spawned it. The pid is retired first,
+    // under the lock every signal is sent under, so nothing signals it once
+    // `wait` can free it for reuse. `kill` is idempotent enough for our
+    // purposes (an already-exited child just fails) and `wait` returns
     // promptly once the child is gone, which is why this is safe on a thread
     // nothing joins and would never be safe on the event loop.
-    *reaped.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    slot.retire();
     let _ = child.kill();
     let _ = child.wait();
-    if let Some(slot) = child_pid {
-        slot.store(0, Ordering::Release);
-    }
     Ok(())
 }
 
@@ -1189,8 +1218,7 @@ fn note_prompting(
             let mut output = String::new();
             let _ = run_log_tool(
                 &args,
-                None,
-                None,
+                &Arc::new(ChildSlot::default()),
                 Some(LOOKUP_TIMEOUT),
                 || {},
                 |line| {
@@ -1222,13 +1250,15 @@ fn live_run_stream(sink: &StreamSink, mode: ObserverMode) {
     }
     let mut policy = RotationPolicy::new();
     let mut started_posted = false;
-    loop {
+    // A stop spawns no further generation: it is read here, it ends the
+    // restart pause at once, and a stop that races the spawn meets the
+    // publication in the slot.
+    while !sink.child.stopped() {
         let generation = Instant::now();
         let generation_wall = std::time::SystemTime::now();
         let ran = run_log_tool(
             &stream_args(mode),
-            Some(&sink.child_pid),
-            Some(&sink.stop),
+            &sink.child,
             None,
             || {
                 if !started_posted {
@@ -1251,9 +1281,6 @@ fn live_run_stream(sink: &StreamSink, mode: ObserverMode) {
             sink.post(ObserverEvent::Unavailable(reason));
             return;
         }
-        if sink.stop.load(Ordering::Acquire) {
-            break;
-        }
         // How long the generation lived. The monotonic clock does not advance
         // while the Mac sleeps, but the child's `--timeout` may: a generation
         // that spanned a sleep would then end "early" by the monotonic count
@@ -1265,7 +1292,11 @@ fn live_run_stream(sink: &StreamSink, mode: ObserverMode) {
             .max(generation_wall.elapsed().unwrap_or_default());
         match policy.on_end(mode, ran_for, Instant::now()) {
             StreamEnd::Rotate => {}
-            StreamEnd::Restart => std::thread::sleep(Duration::from_secs(1)),
+            StreamEnd::Restart => {
+                if sink.child.pause_unless_stopped(Duration::from_secs(1)) {
+                    break;
+                }
+            }
             StreamEnd::GiveUp => break,
         }
     }
@@ -1290,8 +1321,7 @@ fn live_run_stream(sink: &StreamSink, _mode: ObserverMode) {
 pub(crate) enum StartOutcome {
     /// A worker was spawned.
     Started,
-    /// `[privacy] observer` is false — the shipping default. Nothing spawned,
-    /// nothing looked at.
+    /// The mode is [`ObserverMode::Off`]. Nothing spawned, nothing looked at.
     Disabled,
     /// A worker is already streaming; the call changed nothing.
     AlreadyLive,
@@ -1304,14 +1334,40 @@ pub(crate) enum StartOutcome {
 ///
 /// Instance-owned, with NO process-global anywhere in this module. An in-place
 /// apply builds a fresh `App` and therefore a fresh, empty observer — nothing
-/// claims anything about a request the previous process was correlating.
+/// claims anything about a request the previous process was correlating. A
+/// stream restarted within the process starts with an empty table for the
+/// same reason ([`Self::start`]).
 pub(crate) struct ObserverState {
     probe: ObserverProbe,
     availability: ObserverAvailability,
+    /// What the host last asked for: [`Self::start`] records its mode, `Off`
+    /// and a failed spawn included, and [`Self::stop`] records `Off`.
+    /// [`Self::reconcile`] compares against it, so a stream that ended by
+    /// itself (no log access, the early-restart budget spent) is not
+    /// respawned by a request for the mode it already had.
+    requested: ObserverMode,
+    /// The mode of the stream that is running: its worker's `Started` sets
+    /// it to `requested`, and [`Self::stop`] and the disconnect edge in
+    /// [`Self::drain`] return it to `Off`. A receiver is held only while
+    /// `requested` is the mode its worker was started with.
+    running: ObserverMode,
     rx: Option<Receiver<ObserverEvent>>,
-    stop: Arc<AtomicBool>,
-    child_pid: Arc<AtomicI32>,
+    /// The worker's child and stop flag ([`ChildSlot`]), new with each
+    /// channel.
+    child: Arc<ChildSlot>,
+    /// The worker's poke latch ([`StreamSink::poke_once`]), cleared by
+    /// [`Self::drain`].
+    poked: Arc<AtomicBool>,
     table: PendingTable,
+    /// Whether an event was folded since the last verdict pass
+    /// ([`Self::take_new_verdicts`]).
+    verdicts_dirty: bool,
+    /// The roster generation the last verdict pass judged against.
+    judged_roster: Option<u64>,
+    /// When the next request crosses [`PENDING_PROMPT_THRESHOLD`], as the last
+    /// verdict pass found it: the pass's deadline on a loop nothing else
+    /// wakes.
+    verdict_due: Option<Instant>,
     /// `msgID`s already announced to the human, so one observed prompt pages
     /// once. Bounded like everything else fed by the stream; an evicted id can
     /// at worst be announced a second time, long after the first.
@@ -1330,10 +1386,15 @@ impl ObserverState {
         Self {
             probe: ObserverProbe::for_instance(headless),
             availability: ObserverAvailability::Off,
+            requested: ObserverMode::Off,
+            running: ObserverMode::Off,
             rx: None,
-            stop: Arc::new(AtomicBool::new(false)),
-            child_pid: Arc::new(AtomicI32::new(0)),
+            child: Arc::new(ChildSlot::default()),
+            poked: Arc::new(AtomicBool::new(false)),
             table: PendingTable::new(),
+            verdicts_dirty: false,
+            judged_roster: None,
+            verdict_due: None,
             announced: VecDeque::new(),
             prompts: VecDeque::new(),
             prompt_seen: VecDeque::new(),
@@ -1362,6 +1423,16 @@ impl ObserverState {
         self.rx.is_some()
     }
 
+    /// The mode the host last asked for.
+    pub(crate) const fn requested(&self) -> ObserverMode {
+        self.requested
+    }
+
+    /// The mode of the stream that has started and not ended.
+    pub(crate) const fn running(&self) -> ObserverMode {
+        self.running
+    }
+
     /// In-flight correlations.
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
@@ -1375,30 +1446,33 @@ impl ObserverState {
     /// `poke` is the payload-free event-loop wake, abstracted exactly as the
     /// warm-up's is so the posting discipline is unit-testable without an event
     /// loop.
+    ///
+    /// `Off` stops a stream that is running, so nothing is ever looked at
+    /// under a request for nothing.
     pub(crate) fn start<P>(&mut self, mode: ObserverMode, poke: P) -> StartOutcome
     where
         P: Fn() + Send + 'static,
     {
         if mode == ObserverMode::Off {
+            if self.rx.is_some() {
+                self.stop();
+            }
+            self.requested = ObserverMode::Off;
             self.availability = ObserverAvailability::Off;
             return StartOutcome::Disabled;
         }
         if self.rx.is_some() {
             return StartOutcome::AlreadyLive;
         }
-        let (tx, rx) = std::sync::mpsc::sync_channel::<ObserverEvent>(EVENT_QUEUE_CAP);
-        self.stop = Arc::new(AtomicBool::new(false));
-        self.child_pid = Arc::new(AtomicI32::new(0));
-        let sink = StreamSink {
-            tx,
-            poke: Arc::new(std::sync::Mutex::new(Box::new(poke))),
-            #[cfg(target_os = "macos")]
-            child_pid: Arc::clone(&self.child_pid),
-            #[cfg(target_os = "macos")]
-            stop: Arc::clone(&self.stop),
-            #[cfg(target_os = "macos")]
-            lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        };
+        // Recorded before the spawn, so a failed one is retried only when the
+        // host asks for another mode.
+        self.requested = mode;
+        // A new stream has nothing in flight. A request an earlier stream was
+        // correlating can no longer see its result, so a dialog it stood for
+        // may have been answered while nothing was reading.
+        self.table = PendingTable::new();
+        self.verdict_due = None;
+        let (sink, rx) = self.channel(poke);
         let run = self.probe.run;
         let spawned = std::thread::Builder::new()
             .name("consent-observer".into())
@@ -1419,16 +1493,55 @@ impl ObserverState {
         StartOutcome::Started
     }
 
+    /// A fresh channel and the worker's end of it. The child slot (its stop
+    /// flag and pid) and the poke latch are new too, so nothing a stopped
+    /// worker still holds reaches the new stream.
+    fn channel<P>(&mut self, poke: P) -> (StreamSink, Receiver<ObserverEvent>)
+    where
+        P: Fn() + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ObserverEvent>(EVENT_QUEUE_CAP);
+        self.child = Arc::new(ChildSlot::default());
+        self.poked = Arc::new(AtomicBool::new(false));
+        let sink = StreamSink {
+            tx,
+            poke: Arc::new(std::sync::Mutex::new(Box::new(poke))),
+            poked: Arc::clone(&self.poked),
+            #[cfg(target_os = "macos")]
+            child: Arc::clone(&self.child),
+            #[cfg(target_os = "macos")]
+            lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        (sink, rx)
+    }
+
+    /// Bring the stream to `mode`, the host's resolved wish. A wish equal to
+    /// the last request changes nothing and returns `None`. Otherwise the
+    /// running stream, if any, is stopped and `mode` started: `Off` leaves the
+    /// availability `off`, not `unavailable(stream_ended)`.
+    pub(crate) fn reconcile<P>(&mut self, mode: ObserverMode, poke: P) -> Option<StartOutcome>
+    where
+        P: Fn() + Send + 'static,
+    {
+        if mode == self.requested {
+            return None;
+        }
+        self.stop();
+        Some(self.start(mode, poke))
+    }
+
     /// Stop the stream. NEVER JOINS ANYTHING.
     ///
-    /// Sets the stop flag, signals the child by pid (a non-blocking `kill`), and
-    /// drops the receiver. The worker notices the flag or the EOF, reaps its own
-    /// child, and exits; dropping the receiver also makes every further `post`
-    /// a no-op through `Disconnected`.
+    /// Sets the stop flag and signals the child by pid while its worker has not
+    /// reaped it (a non-blocking `kill`, [`ChildSlot::stop`]), and drops the
+    /// receiver. The worker notices the EOF, the flag or the end of its restart
+    /// pause, reaps its own child, and exits; dropping the receiver also makes
+    /// every further `post` a no-op through `Disconnected`.
     pub(crate) fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        signal_child(self.child_pid.load(Ordering::Acquire));
+        self.child.stop(send_signal);
         self.rx = None;
+        self.requested = ObserverMode::Off;
+        self.running = ObserverMode::Off;
         if self.availability.is_live() {
             self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
         }
@@ -1442,6 +1555,10 @@ impl ObserverState {
     /// availability always lands somewhere honest even if every message was
     /// lost.
     pub(crate) fn drain(&mut self, now: Instant) -> usize {
+        // The poke latch is cleared BEFORE the queue is read: a post that
+        // lands after the last `try_recv` then finds it clear and pokes again
+        // ([`StreamSink::poke_once`]).
+        self.poked.swap(false, Ordering::AcqRel);
         // The receiver is TAKEN for the pump and put back only if the stream is
         // still connected, so the disconnect edge retires it exactly once and
         // the fold below borrows `self` freely.
@@ -1467,8 +1584,12 @@ impl ObserverState {
             self.apply(event, now);
         }
         self.settle(now);
-        if disconnected && self.availability.is_live() {
-            self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
+        if disconnected {
+            self.running = ObserverMode::Off;
+            if self.availability.is_live() {
+                self.availability =
+                    ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
+            }
         }
         applied
     }
@@ -1499,9 +1620,13 @@ impl ObserverState {
         // Only a macOS stream line is timed; elsewhere nothing reads the clock.
         #[cfg(not(any(target_os = "macos", test)))]
         let _ = now;
+        self.verdicts_dirty = true;
         match event {
             #[cfg(any(target_os = "macos", test))]
-            ObserverEvent::Started => self.availability = ObserverAvailability::Ok,
+            ObserverEvent::Started => {
+                self.availability = ObserverAvailability::Ok;
+                self.running = self.requested;
+            }
             ObserverEvent::Unavailable(reason) => {
                 self.availability = ObserverAvailability::Unavailable(reason);
             }
@@ -1569,7 +1694,7 @@ impl ObserverState {
             if let Some(session) = owning_session(prompt.accessing_pid, pgid, sessions)
                 && !out.iter().any(|(existing, _)| *existing == session)
             {
-                out.push((session, blocked_on_token(&prompt.service)));
+                out.push((session, blocked_on_token(prompt.service)));
             }
         }
         out
@@ -1581,13 +1706,16 @@ impl ObserverState {
         session_of_pid(pid, sessions, self.probe.parent_of, self.probe.pgid_of)
     }
 
-    /// Full-mode announcements use the same instance-owned group observation.
+    /// [`Self::take_new_verdicts`] through this instance's own process-group
+    /// arm: full-mode announcements use the same instance-owned observation.
     pub(crate) fn take_new_verdicts_for_instance(
         &mut self,
         now: Instant,
-        sessions: &[(u64, i32)],
+        roster: u64,
+        sessions: impl FnOnce() -> Vec<(u64, i32)>,
     ) -> Vec<ObservedPrompt> {
-        self.take_new_verdicts(now, sessions, self.probe.pgid_of)
+        let pgid_of = self.probe.pgid_of;
+        self.take_new_verdicts(now, roster, sessions, pgid_of)
     }
 
     /// THE NEEDS. Every observed consent dialog that is FOR THIS APP (its
@@ -1615,22 +1743,52 @@ impl ObserverState {
     /// dialog itself, not a posture epoch, because two distinct dialogs are two
     /// distinct things a human has to answer. A quiet stream returns an empty
     /// vector and nobody is woken.
+    ///
+    /// PER STATE CHANGE, NOT PER CALL. A pass judges only when an answer can
+    /// differ from the last one: an event was folded since, `roster` (the
+    /// host's session-insert generation) moved, since only a new session can
+    /// make a prompt nobody owned attributable, or a request reached the
+    /// threshold ([`Self::verdict_deadline`], which the host arms as a park
+    /// deadline). Any other call returns at once and asks the OS nothing.
+    /// `sessions` (`(session id, shell pid)`) is built only when an
+    /// unannounced prompt stands, and `pgid_of` resolves a pid's process
+    /// group, passed in so the OS call belongs to the caller's fence.
     pub(crate) fn take_new_verdicts(
         &mut self,
         now: Instant,
-        sessions: &[(u64, i32)],
+        roster: u64,
+        sessions: impl FnOnce() -> Vec<(u64, i32)>,
         pgid_of: impl Fn(i32) -> Option<i32>,
     ) -> Vec<ObservedPrompt> {
+        let due = self.verdicts_dirty
+            || self.judged_roster != Some(roster)
+            || self.verdict_due.is_some_and(|due| now >= due);
+        if !due {
+            return Vec::new();
+        }
+        self.verdicts_dirty = false;
+        self.judged_roster = Some(roster);
+        // Strictly later than `now`, so a passed deadline is never armed
+        // again.
+        self.verdict_due = self.table.next_crossing(now, PENDING_PROMPT_THRESHOLD);
         if !self.availability.is_live() {
             return Vec::new();
         }
+        let announced = &self.announced;
+        let open: Vec<PendingPrompt<'_>> = self
+            .table
+            .pending_prompts(now, PENDING_PROMPT_THRESHOLD)
+            .into_iter()
+            .filter(|prompt| !announced.iter().any(|id| id == prompt.msg_id))
+            .collect();
+        if open.is_empty() {
+            return Vec::new();
+        }
+        let sessions = sessions();
         let mut fresh: Vec<ObservedPrompt> = Vec::new();
-        for prompt in self.table.pending_prompts(now, PENDING_PROMPT_THRESHOLD) {
-            if self.announced.contains(&prompt.msg_id) {
-                continue;
-            }
+        for prompt in open {
             let pgid = pgid_of(prompt.accessing_pid);
-            let Some(session) = owning_session(prompt.accessing_pid, pgid, sessions) else {
+            let Some(session) = owning_session(prompt.accessing_pid, pgid, &sessions) else {
                 // Not one of ours. Deliberately NOT marked announced: a prompt
                 // we cannot attribute is not a prompt we answered for.
                 continue;
@@ -1638,14 +1796,22 @@ impl ObserverState {
             if self.announced.len() >= ANNOUNCED_CAP {
                 self.announced.pop_front();
             }
-            self.announced.push_back(prompt.msg_id.clone());
+            self.announced.push_back(prompt.msg_id.to_owned());
             fresh.push(ObservedPrompt {
                 session,
-                blocked_on: blocked_on_token(&prompt.service),
-                service: prompt.service,
+                blocked_on: blocked_on_token(prompt.service),
+                service: prompt.service.to_owned(),
             });
         }
         fresh
+    }
+
+    /// When the next request crosses [`PENDING_PROMPT_THRESHOLD`], as the last
+    /// verdict pass found it: the instant [`Self::take_new_verdicts`] judges
+    /// again with nothing else moving. Later than the pass that set it; the
+    /// pass it wakes replaces it.
+    pub(crate) const fn verdict_deadline(&self) -> Option<Instant> {
+        self.verdict_due
     }
 }
 
@@ -1745,23 +1911,136 @@ impl std::fmt::Debug for ObserverState {
     }
 }
 
-/// Ask the streaming child to exit. NON-BLOCKING by construction: it signals
-/// and returns, and the worker that spawned the child is what reaps it.
-#[cfg(unix)]
-fn signal_child(pid: i32) {
-    if pid <= 0 {
-        return;
+/// A signal the observer sends a child it spawned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Signal {
+    /// [`ObserverState::stop`]'s request that the stream exit.
+    Term,
+    /// The lookup watchdog's, at [`LOOKUP_TIMEOUT`].
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    Kill,
+}
+
+/// What every thread that may signal a worker's child knows of it.
+#[derive(Debug, Default)]
+struct ChildCell {
+    /// The child's pid from its publication until its worker retires it to
+    /// reap, `0` otherwise.
+    pid: i32,
+    /// Set by [`ChildSlot::stop`], never cleared.
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    stopped: bool,
+}
+
+impl ChildCell {
+    /// Signal the child when one stands unreaped. Pid `0` is never signalled:
+    /// `kill(0, …)` reaches aterm's own process group.
+    fn signal_if_unreaped(&self, signal: Signal, kill: impl Fn(i32, Signal)) {
+        if self.pid > 0 {
+            kill(self.pid, signal);
+        }
     }
-    // SAFETY: `kill` with a positive pid and SIGTERM is a plain signal delivery
-    // with no memory effects. A stale pid fails with ESRCH, which is discarded.
+}
+
+/// One worker's child, shared by the worker that spawned it, the host's
+/// [`ObserverState::stop`] and a lookup's watchdog.
+///
+/// Every signal is sent under the lock, and only to a pid the worker has
+/// published and not retired. The worker retires the pid under the same lock
+/// before it reaps, so no signal reaches a pid `wait` has freed for reuse. A
+/// stop and a publication meet under the lock as well: whichever comes second
+/// signals the child, so a stop that lands while a child is being spawned, or
+/// between generations, still ends it.
+#[derive(Debug, Default)]
+struct ChildSlot {
+    cell: Mutex<ChildCell>,
+    /// Notified when the pid is retired and when a stop is asked.
+    changed: Condvar,
+}
+
+impl ChildSlot {
+    fn lock(&self) -> MutexGuard<'_, ChildCell> {
+        self.cell.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ask the worker to stop: set the flag, signal a child that stands
+    /// unreaped, and end a restart pause. Never waits on the child.
+    fn stop(&self, kill: impl Fn(i32, Signal)) {
+        let mut cell = self.lock();
+        cell.stopped = true;
+        cell.signal_if_unreaped(Signal::Term, kill);
+        drop(cell);
+        self.changed.notify_all();
+    }
+}
+
+/// The worker's side, which only the macOS arm runs.
+#[cfg(any(target_os = "macos", test))]
+impl ChildSlot {
+    /// Publish a spawned child's pid. `false` when a stop came first: the
+    /// child is signalled here, and the worker reaps it without reading.
+    fn publish(&self, pid: i32, kill: impl Fn(i32, Signal)) -> bool {
+        let mut cell = self.lock();
+        cell.pid = pid;
+        if cell.stopped {
+            cell.signal_if_unreaped(Signal::Term, kill);
+            return false;
+        }
+        true
+    }
+
+    /// Whether a stop was asked.
+    fn stopped(&self) -> bool {
+        self.lock().stopped
+    }
+
+    /// The worker is about to reap: no signal reaches this pid from here on.
+    fn retire(&self) {
+        self.lock().pid = 0;
+        self.changed.notify_all();
+    }
+
+    /// The lookup watchdog: wait until the worker retires the child or `limit`
+    /// passes, then SIGKILL it if it still stands unreaped.
+    fn kill_unless_retired_within(&self, limit: Duration, kill: impl Fn(i32, Signal)) {
+        let (cell, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), limit, |cell| cell.pid != 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        cell.signal_if_unreaped(Signal::Kill, kill);
+    }
+
+    /// The pause before an early restart: `pause` long, ended at once by a
+    /// stop. Whether a stop was asked.
+    fn pause_unless_stopped(&self, pause: Duration) -> bool {
+        let (cell, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), pause, |cell| !cell.stopped)
+            .unwrap_or_else(PoisonError::into_inner);
+        cell.stopped
+    }
+}
+
+/// Deliver `signal` to `pid`. NON-BLOCKING by construction: it signals and
+/// returns, and the worker that spawned the child is what reaps it. Only
+/// [`ChildSlot`] calls it, under its lock, with a pid not yet reaped.
+#[cfg(unix)]
+fn send_signal(pid: i32, signal: Signal) {
+    let signal = match signal {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: `kill` with a positive pid is a plain signal delivery with no
+    // memory effects. The pid is a child of ours its worker has not reaped (one
+    // that exited stays a zombie until then), so it names no other process.
     unsafe {
-        libc::kill(pid, libc::SIGTERM);
+        libc::kill(pid, signal);
     }
 }
 
 /// No child is ever spawned off unix, so there is never one to signal.
 #[cfg(not(unix))]
-fn signal_child(_pid: i32) {}
+fn send_signal(_pid: i32, _signal: Signal) {}
 
 /// The process group of `pid`, for the live correlation arm.
 ///
@@ -1932,6 +2211,30 @@ impl ObserverState {
     pub(crate) fn feed_for_test(&mut self, event: ObserverEvent, now: Instant) {
         self.apply(event, now);
         self.settle(now);
+    }
+
+    /// Swap in a test arm, so a host test can watch what its reconcile
+    /// starts and stops. Test seam only: production wires the arm once, in
+    /// [`Self::new`].
+    #[cfg_attr(not(unix), allow(dead_code))] // its tests are unix-only
+    pub(crate) fn set_arm_for_test(&mut self, run: fn(&StreamSink, ObserverMode)) {
+        self.probe = ObserverProbe {
+            run,
+            live: false,
+            ..ObserverProbe::inert()
+        };
+    }
+}
+
+#[cfg(test)]
+impl StreamSink {
+    /// Post as the worker does, and say whether the host still holds the
+    /// receiver: `false` once a stop dropped it. Test seam only.
+    #[cfg_attr(not(unix), allow(dead_code))] // its tests are unix-only
+    pub(crate) fn post_for_test(&self, event: ObserverEvent) -> bool {
+        let held = !matches!(self.tx.try_send(event), Err(TrySendError::Disconnected(_)));
+        self.poke_once();
+        held
     }
 }
 
@@ -2149,7 +2452,7 @@ mod tests {
         assert_eq!(prompts[0].accessing_pid, 18584);
         assert_eq!(prompts[0].pid_source, PidSource::Accessing);
         assert_eq!(prompts[0].service, "kTCCServiceSystemPolicyDocumentsFolder");
-        assert_eq!(prompts[0].subject.as_deref(), Some("/usr/bin/mdfind"));
+        assert_eq!(prompts[0].subject, Some("/usr/bin/mdfind"));
     }
 
     /// The RESULT closes it. This is the half the whole verdict rests on: with
@@ -2406,6 +2709,100 @@ mod tests {
         assert!(!observer.is_live());
     }
 
+    /// Reconcile acts on a CHANGED wish only. The inert arm's worker ends by
+    /// itself after its one message, the shape of a stream that lost its log
+    /// access: asking again for the mode it had respawns nothing, while a
+    /// different mode starts, and `Off` reads `off` rather than
+    /// `unavailable`.
+    #[test]
+    fn reconcile_restarts_only_on_a_changed_mode() {
+        let mut observer = ObserverState::inert();
+        assert_eq!(
+            observer.reconcile(ObserverMode::Off, || {}),
+            None,
+            "a fresh observer already has what Off asks for"
+        );
+        assert_eq!(
+            observer.reconcile(ObserverMode::Full, || {}),
+            Some(StartOutcome::Started)
+        );
+        assert_eq!(observer.requested(), ObserverMode::Full);
+        // A hang detector, not a budget: the detached worker's one message and
+        // its exit (this module owns no handle to join).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while observer.is_live() && Instant::now() < deadline {
+            observer.drain(Instant::now());
+            std::thread::yield_now();
+        }
+        assert!(!observer.is_live(), "the inert worker ended by itself");
+        assert_eq!(
+            observer.availability(),
+            ObserverAvailability::Unavailable(UnavailableReason::Inert)
+        );
+        assert_eq!(
+            observer.reconcile(ObserverMode::Full, || {}),
+            None,
+            "an ended stream is not respawned by the same wish"
+        );
+        assert!(!observer.is_live());
+        assert_eq!(
+            observer.reconcile(ObserverMode::Sentinel, || {}),
+            Some(StartOutcome::Started),
+            "a changed wish starts the new mode"
+        );
+        assert!(observer.is_live());
+        assert_eq!(
+            observer.reconcile(ObserverMode::Off, || {}),
+            Some(StartOutcome::Disabled)
+        );
+        assert!(!observer.is_live());
+        assert_eq!(observer.requested(), ObserverMode::Off);
+        assert_eq!(observer.availability(), ObserverAvailability::Off);
+    }
+
+    /// `Started` records the requested mode as the running one; the worker's
+    /// disconnect and a stop each return it to `Off`.
+    #[test]
+    fn the_running_mode_is_set_by_started_and_cleared_by_an_end_or_a_stop() {
+        let now = Instant::now();
+        let mut observer = ObserverState::inert();
+        assert_eq!(
+            observer.start(ObserverMode::Full, || {}),
+            StartOutcome::Started
+        );
+        assert_eq!(
+            observer.running(),
+            ObserverMode::Off,
+            "nothing runs until the worker says so"
+        );
+        observer.feed_for_test(ObserverEvent::Started, now);
+        assert_eq!(observer.running(), ObserverMode::Full);
+        // The inert worker exits after its one message: a hang detector for
+        // the disconnect edge.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while observer.is_live() && Instant::now() < deadline {
+            observer.drain(Instant::now());
+            std::thread::yield_now();
+        }
+        assert!(!observer.is_live());
+        assert_eq!(observer.running(), ObserverMode::Off, "the end clears it");
+        assert_eq!(
+            observer.requested(),
+            ObserverMode::Full,
+            "an end by itself keeps the request"
+        );
+
+        assert_eq!(
+            observer.start(ObserverMode::Sentinel, || {}),
+            StartOutcome::Started
+        );
+        observer.feed_for_test(ObserverEvent::Started, now);
+        assert_eq!(observer.running(), ObserverMode::Sentinel);
+        observer.stop();
+        assert_eq!(observer.running(), ObserverMode::Off, "a stop clears it");
+        assert_eq!(observer.requested(), ObserverMode::Off);
+    }
+
     /// A QUIET STREAM IS NOT A NEGATIVE. `tccd` is bursty and idle — a 12 s
     /// sample returned zero events on the spike machine and read as "streaming
     /// does not work" until a 25 s matched window refuted it. A live stream with
@@ -2478,7 +2875,7 @@ mod tests {
         assert_eq!(observer.session_for_pid(18585, sessions), None);
         assert!(
             observer
-                .take_new_verdicts_for_instance(later, sessions)
+                .take_new_verdicts_for_instance(later, 1, || sessions.to_vec())
                 .is_empty()
         );
         observer.probe.parent_of = parent;
@@ -2491,7 +2888,7 @@ mod tests {
             "ancestor"
         );
         assert_eq!(observer.session_for_pid(9999, sessions), None, "unrelated");
-        let fresh = observer.take_new_verdicts_for_instance(later, sessions);
+        let fresh = observer.take_new_verdicts_for_instance(later, 2, || sessions.to_vec());
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].session, 4);
     }
@@ -2509,10 +2906,10 @@ mod tests {
             observer.feed_for_test(ObserverEvent::Line(event), t0);
         }
         let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
-        let sessions = &[(4u64, 4711i32)];
+        let sessions = || vec![(4u64, 4711i32)];
         let pgid = |pid: i32| (pid == 18584).then_some(4711);
 
-        let first = observer.take_new_verdicts(later, sessions, pgid);
+        let first = observer.take_new_verdicts(later, 1, sessions, pgid);
         assert_eq!(first.len(), 1, "the observed dialog pages");
         assert_eq!(first[0].session, 4);
         assert_eq!(
@@ -2529,13 +2926,16 @@ mod tests {
         };
         assert!(!unknown.notice().body.contains("kTCCService"));
 
+        // A moved roster forces a pass, so the announced set is what answers.
         assert!(
-            observer.take_new_verdicts(later, sessions, pgid).is_empty(),
+            observer
+                .take_new_verdicts(later, 2, sessions, pgid)
+                .is_empty(),
             "the same dialog never pages twice"
         );
         // …but the non-consuming read still reports it, because the session IS
         // still blocked.
-        assert_eq!(observer.verdicts(later, sessions, pgid).len(), 1);
+        assert_eq!(observer.verdicts(later, &sessions(), pgid).len(), 1);
 
         // A SECOND, DISTINCT dialog pages again.
         for line in [
@@ -2548,7 +2948,7 @@ mod tests {
             observer.feed_for_test(ObserverEvent::Line(event), later);
         }
         let later2 = later + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
-        let second = observer.take_new_verdicts(later2, sessions, pgid);
+        let second = observer.take_new_verdicts(later2, 2, sessions, pgid);
         assert_eq!(second.len(), 1, "a distinct dialog is distinct news");
         assert_eq!(
             second[0].blocked_on,
@@ -2571,13 +2971,143 @@ mod tests {
         let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
         assert!(
             observer
-                .take_new_verdicts(later, &[(4, 9999)], |_| None)
+                .take_new_verdicts(later, 1, || vec![(4, 9999)], |_| None)
                 .is_empty(),
             "not ours"
         );
-        let ours =
-            observer.take_new_verdicts(later, &[(4, 4711)], |pid| (pid == 18584).then_some(4711));
+        // A session joined: the roster generation moved.
+        let ours = observer.take_new_verdicts(
+            later,
+            2,
+            || vec![(4, 4711)],
+            |pid| (pid == 18584).then_some(4711),
+        );
         assert_eq!(ours.len(), 1, "and once it IS ours, it pages");
+    }
+
+    /// PER STATE CHANGE, NOT PER PARK. A prompt nobody owns is judged once
+    /// for a roster: idle parks after it ask the OS nothing. A moved roster
+    /// judges it again (only a new session can own it), and so does a line
+    /// that adds to its request, since attribution ORs pids in.
+    #[test]
+    fn an_unattributable_prompt_is_judged_once_per_roster() {
+        let t0 = Instant::now();
+        let mut observer = ObserverState::inert();
+        observer.feed_for_test(ObserverEvent::Started, t0);
+        for line in [REC_CTX, REC_ATTRIBUTION] {
+            let event = parse_line(line).expect("recorded line parses");
+            observer.feed_for_test(ObserverEvent::Line(event), t0);
+        }
+        let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
+        let asked = std::cell::Cell::new(0usize);
+        let pgid = |_pid: i32| {
+            asked.set(asked.get() + 1);
+            None
+        };
+        let roster = || vec![(4u64, 9999i32)];
+        for park in 0..3 {
+            assert!(
+                observer
+                    .take_new_verdicts(later + Duration::from_secs(park), 1, roster, pgid)
+                    .is_empty()
+            );
+        }
+        assert_eq!(asked.get(), 1, "three parks over one roster judge once");
+        assert!(
+            observer
+                .take_new_verdicts(later, 2, roster, pgid)
+                .is_empty()
+        );
+        assert_eq!(asked.get(), 2, "a moved roster judges it again");
+        let event = parse_line(
+            "tccd: AUTHREQ_ATTRIBUTION: msgID=378.385, attribution={requesting={TCCDProcess: \
+             identifier=x, pid=4242}}",
+        )
+        .expect("line parses");
+        observer.feed_for_test(ObserverEvent::Line(event), later);
+        assert!(
+            observer
+                .take_new_verdicts(later, 2, roster, pgid)
+                .is_empty()
+        );
+        assert_eq!(asked.get(), 3, "a folded line judges it again");
+    }
+
+    /// THE THRESHOLD IS A DEADLINE. A request that crosses the threshold with
+    /// no line and no roster change after it is judged at the crossing: the
+    /// pass that saw it open stores the instant, a pass before it judges
+    /// nothing, and the pass at it announces. Then nothing is left to cross.
+    ///
+    /// An older request nobody owns stands throughout, past the threshold, so
+    /// every pass asks the OS for its process group: a call before the
+    /// crossing that ran a pass would show in the count.
+    #[test]
+    fn the_threshold_crossing_is_judged_at_its_deadline() {
+        let opened_before = Instant::now();
+        let t0 = opened_before + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
+        let mut observer = ObserverState::inert();
+        observer.feed_for_test(ObserverEvent::Started, opened_before);
+        for line in [
+            "tccd: AUTHREQ_CTX: msgID=378.400, service=kTCCServiceSystemPolicyDesktopFolder, \
+             preflight=no",
+            "tccd: AUTHREQ_ATTRIBUTION: msgID=378.400, attribution={accessing={TCCDProcess: \
+             identifier=x, pid=5150}}",
+        ] {
+            let event = parse_line(line).expect("line parses");
+            observer.feed_for_test(ObserverEvent::Line(event), opened_before);
+        }
+        for line in [REC_CTX, REC_ATTRIBUTION] {
+            let event = parse_line(line).expect("recorded line parses");
+            observer.feed_for_test(ObserverEvent::Line(event), t0);
+        }
+        let asked = std::cell::Cell::new(0usize);
+        let pgid = |pid: i32| {
+            asked.set(asked.get() + 1);
+            (pid == 18584).then_some(4711)
+        };
+        let sessions = || vec![(4u64, 4711i32)];
+        assert!(observer.take_new_verdicts(t0, 1, sessions, pgid).is_empty());
+        assert_eq!(asked.get(), 1, "the pass judges the request nobody owns");
+        let crossing = t0 + PENDING_PROMPT_THRESHOLD;
+        assert_eq!(observer.verdict_deadline(), Some(crossing));
+        assert!(
+            observer
+                .take_new_verdicts(crossing - Duration::from_millis(1), 1, sessions, pgid)
+                .is_empty(),
+            "nothing is judged before the crossing"
+        );
+        assert_eq!(asked.get(), 1, "and the OS is not asked");
+        let paged = observer.take_new_verdicts(crossing, 1, sessions, pgid);
+        assert_eq!(asked.get(), 3, "the crossing judges both requests");
+        assert_eq!(paged.len(), 1, "the crossing pages on its own");
+        assert_eq!(paged[0].session, 4);
+        assert_eq!(observer.verdict_deadline(), None, "nothing left to cross");
+    }
+
+    /// One wake per drain. Five posts before a drain poke once; the drain
+    /// clears the latch before it reads, so the next post pokes again (the
+    /// negative control: a latch that never re-arms would strand it).
+    #[test]
+    fn pokes_coalesce_until_the_queue_is_drained() {
+        let pokes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pokes);
+        let mut observer = ObserverState::inert();
+        let (sink, rx) = observer.channel(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        observer.rx = Some(rx);
+        for _ in 0..5 {
+            sink.post(ObserverEvent::Started);
+        }
+        assert_eq!(pokes.load(Ordering::Relaxed), 1, "a burst is one wake");
+        assert_eq!(observer.drain(Instant::now()), 5, "every message is kept");
+        sink.post(ObserverEvent::Started);
+        assert_eq!(
+            pokes.load(Ordering::Relaxed),
+            2,
+            "a post after the drain wakes again"
+        );
+        assert_eq!(observer.drain(Instant::now()), 1);
     }
 
     /// An UNAVAILABLE observer pages nobody. `unavailable` is not `false` and it
@@ -2598,7 +3128,12 @@ mod tests {
         let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
         assert!(
             observer
-                .take_new_verdicts(later, &[(4, 4711)], |pid| (pid == 18584).then_some(4711))
+                .take_new_verdicts(
+                    later,
+                    1,
+                    || vec![(4, 4711)],
+                    |pid| (pid == 18584).then_some(4711)
+                )
                 .is_empty()
         );
     }
@@ -2976,6 +3511,121 @@ mod tests {
             ),
             StreamEnd::Restart,
             "an hour later the first early ends have aged out"
+        );
+    }
+
+    /// A stop signals the stream's child only while its worker has not reaped
+    /// it: once for a standing child, never pid 0 (aterm's own process group),
+    /// and never a pid the worker retired, which `wait` may free for reuse.
+    #[test]
+    fn a_stop_signals_the_child_only_while_it_is_unreaped() {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let kill = |pid: i32, signal: Signal| sent.borrow_mut().push((pid, signal));
+
+        let standing = ChildSlot::default();
+        assert!(standing.publish(4101, kill), "nothing stopped it yet");
+        assert!(
+            sent.borrow().is_empty(),
+            "a publication alone signals nothing"
+        );
+        standing.stop(kill);
+        assert_eq!(
+            *sent.borrow(),
+            [(4101, Signal::Term)],
+            "a standing child is asked to exit, once"
+        );
+
+        sent.borrow_mut().clear();
+        let reaped = ChildSlot::default();
+        assert!(reaped.publish(4102, kill));
+        reaped.retire();
+        reaped.stop(kill);
+        assert!(sent.borrow().is_empty(), "a retired pid is never signalled");
+        assert!(reaped.stopped(), "the stop still stands for the worker");
+
+        ChildSlot::default().stop(kill);
+        assert!(sent.borrow().is_empty(), "no pid, no signal");
+    }
+
+    /// A stop that lands before the worker publishes its child's pid (the
+    /// spawn in flight, or the gap between generations) found pid 0 and
+    /// signalled nothing, so a sentinel child lived on until its next line or
+    /// its 15-minute timeout. The publication meets the stop under the slot's
+    /// lock and signals the child itself.
+    #[test]
+    fn a_stop_before_the_pid_is_published_signals_the_child_at_publication() {
+        let sent = std::cell::RefCell::new(Vec::new());
+        let kill = |pid: i32, signal: Signal| sent.borrow_mut().push((pid, signal));
+
+        let slot = ChildSlot::default();
+        slot.stop(kill);
+        assert!(sent.borrow().is_empty());
+        assert!(!slot.publish(4201, kill), "the worker reaps it unread");
+        assert_eq!(
+            *sent.borrow(),
+            [(4201, Signal::Term)],
+            "signalled exactly once, at its publication"
+        );
+
+        // Negative control: with no stop, a publication signals nothing.
+        sent.borrow_mut().clear();
+        assert!(ChildSlot::default().publish(4202, kill));
+        assert!(sent.borrow().is_empty());
+    }
+
+    /// The lookup watchdog returns when the worker retires its child on another
+    /// thread, and signals nothing. Its limit is longer than anything waits
+    /// here, so only the retirement can return it; the minute is a hang
+    /// detector.
+    #[test]
+    fn the_lookup_watchdog_kills_only_a_child_unreaped_at_its_limit() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let slot = Arc::new(ChildSlot::default());
+        assert!(slot.publish(4301, |_, _| {}));
+        let (done, returned) = std::sync::mpsc::channel();
+        let (watched, log) = (Arc::clone(&slot), Arc::clone(&sent));
+        std::thread::spawn(move || {
+            watched.kill_unless_retired_within(Duration::from_secs(60 * 60), |pid, signal| {
+                log.lock().unwrap().push((pid, signal));
+            });
+            let _ = done.send(());
+        });
+        slot.retire();
+        returned
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the watchdog returns when its child is retired");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "a retired child is never killed"
+        );
+
+        // Negative control: a child still unreaped at the limit is killed.
+        let stuck = ChildSlot::default();
+        assert!(stuck.publish(4302, |_, _| {}));
+        stuck.kill_unless_retired_within(Duration::ZERO, |pid, signal| {
+            sent.lock().unwrap().push((pid, signal));
+        });
+        assert_eq!(*sent.lock().unwrap(), [(4302, Signal::Kill)]);
+    }
+
+    /// A stop ends the pause before an early restart, so a stream stopped
+    /// there spawns no further generation. The pause asked for is longer than
+    /// anything waits here; the minute is a hang detector.
+    #[test]
+    fn a_stop_ends_the_restart_pause() {
+        let slot = Arc::new(ChildSlot::default());
+        // Negative control: unstopped, the pause runs out and says so.
+        assert!(!slot.pause_unless_stopped(Duration::ZERO));
+        let (done, returned) = std::sync::mpsc::channel();
+        let paused = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            let _ = done.send(paused.pause_unless_stopped(Duration::from_secs(60 * 60)));
+        });
+        slot.stop(|_, _| {});
+        assert_eq!(
+            returned.recv_timeout(Duration::from_secs(60)),
+            Ok(true),
+            "the stop ends the pause, and the worker reads it as a stop"
         );
     }
 

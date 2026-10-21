@@ -89,6 +89,7 @@ fn entry_at(id: u64, at_unix_ms: u64) -> MessageView {
     MessageView {
         id,
         at_unix_ms,
+        began_unix_ms: at_unix_ms,
         tag: "config".to_string(),
         severity: "warn",
         glyph: '\u{26a0}',
@@ -362,7 +363,17 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
         [("harness".to_string(), 1), ("system".to_string(), 1)],
         "counted once"
     );
-    // NEGATIVE CONTROL: replaced "back" by an earlier record: its own row.
+    // Each record told on names the entry standing for it now, a chain
+    // followed to its head, so a host keeps open what moved on.
+    assert_eq!(
+        page.told_on,
+        [(si2.raw(), ca.raw()), (si.raw(), ca.raw())],
+        "newest first, each to the story's row"
+    );
+    assert_eq!(page.standing_for(si.raw()), Some(ca.raw()));
+    assert_eq!(page.standing_for(other.raw()), None, "its own entry");
+    // A record of another tab, withdrawn: the replay control below names it
+    // replaced by an earlier record.
     let late = c
         .post(
             notice("Login expired in tab 2", "n.s-2.si", "Finish signing in"),
@@ -371,9 +382,6 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
         )
         .id;
     assert!(c.withdraw(late, now));
-    assert!(!c.supersede_record(late, other, now), "never told back");
-    let page = MessagesState::of(&c, &Desk::default());
-    assert!(page.entry(late.raw()).is_some(), "its own row");
     // NEGATIVE CONTROL: a replacement the ring no longer holds.
     let mut ring = MessageLog::empty();
     let mut head = c.log().get(si).expect("the record").clone();
@@ -397,6 +405,7 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
         .entry(si.raw())
         .expect("its successor is gone: its own row");
     assert_eq!(row.state_words(), "replaced");
+    assert!(page.told_on.is_empty(), "it stands for itself");
     // NEGATIVE CONTROL: a file that says a record was replaced by an EARLIER
     // one (no build of this center writes it; the page reads any file) keeps
     // both rows: the earlier record cannot stand for a later one.
@@ -421,6 +430,263 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
     let page = MessagesState::of(&back, &Desk::default());
     let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
     assert_eq!(ids, [late.raw(), other.raw()], "told back: both rows");
+}
+
+/// A FAILURE IS TOLD ON ONLY BY A FAILURE. A script's `sev=error key=build`
+/// row replaced while it still stood by a retry under its key, which then
+/// finished `ok`, stays its own row in Problems (`replaced`), as it would had
+/// its row folded first: whether a failure is listed never hangs on when the
+/// next word came. NEGATIVE CONTROLS: a failure told again in new words by a
+/// failure is one row, and stays one once that failure is fixed under `✓`
+/// (the successor was POSTED an error, whatever it shows now); a warning
+/// replaced by anything is one row.
+#[test]
+fn a_failure_is_told_on_only_by_a_failure() {
+    let now = Instant::now();
+    let mut c = center(now);
+    let row = |severity: Severity, title: &str, key: &str| {
+        Message::new(tags::SCRIPT, severity, title)
+            .line("linker error")
+            .key(key)
+            .hold(Hold::STANDING)
+    };
+    let failed = c
+        .post(
+            row(Severity::Error, "Build failed", "build"),
+            stamp(NOW - 3 * 60_000),
+            now,
+        )
+        .id;
+    let retry = c
+        .post(
+            row(Severity::Info, "Building again", "build"),
+            stamp(NOW - 2 * 60_000),
+            now,
+        )
+        .id;
+    assert_eq!(
+        c.log().get(failed).and_then(LogRecord::retired),
+        Some(&crate::Retired::Superseded { by: retry }),
+        "premise: the center's own keyed supersede"
+    );
+    assert!(c.resolve(retry, Outcome::Ok, now));
+    let page = MessagesState::of(&c, &Desk::default());
+    let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [retry.raw(), failed.raw()], "both rows");
+    let error = page.entry(failed.raw()).expect("the failure");
+    assert_eq!(
+        (error.severity, error.state_words().as_str()),
+        ("error", "replaced")
+    );
+    assert_eq!(page.severity_counts(None), (2, 1), "in Problems");
+    assert!(page.told_on.is_empty());
+
+    // NEGATIVE CONTROL: a failure told again by a failure, then fixed.
+    let mut c = center(now);
+    let first = c
+        .post(
+            row(Severity::Error, "Disk full", "disk"),
+            stamp(NOW - 3 * 60_000),
+            now,
+        )
+        .id;
+    let again = c
+        .post(
+            row(Severity::Error, "Disk still full", "disk").finished_as("Disk has room"),
+            stamp(NOW - 2 * 60_000),
+            now,
+        )
+        .id;
+    let page = MessagesState::of(&c, &Desk::default());
+    let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [again.raw()], "one failure, one row");
+    assert!(c.resolve(again, Outcome::Ok, now));
+    assert_eq!(
+        c.log().get(again).map(|r| r.severity),
+        Some(Severity::Success),
+        "premise: it reads fixed now"
+    );
+    let page = MessagesState::of(&c, &Desk::default());
+    let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [again.raw()], "still one row once fixed");
+    assert_eq!(page.standing_for(first.raw()), Some(again.raw()));
+    // ...and so after a relaunch: its `posted` line keeps how it was told.
+    let mut ring = MessageLog::empty();
+    ring.replay_all(
+        c.log()
+            .pending_lines()
+            .map(|line| LogLine::decode(&line.encode()).expect("a line")),
+    );
+    let relaunched = MessagesState::of(&MessageCenter::new(ring, now), &Desk::default());
+    let ids: Vec<u64> = relaunched.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [again.raw()], "replayed: one row");
+
+    // NEGATIVE CONTROL: a warning replaced by a retry is one row.
+    let mut c = center(now);
+    let _warned = c
+        .post(
+            row(Severity::Warn, "Build has warnings", "build"),
+            stamp(NOW - 3 * 60_000),
+            now,
+        )
+        .id;
+    let retry = c
+        .post(
+            row(Severity::Info, "Building again", "build"),
+            stamp(NOW - 2 * 60_000),
+            now,
+        )
+        .id;
+    let page = MessagesState::of(&c, &Desk::default());
+    let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [retry.raw()], "one row");
+
+    // A late-park boot missed both posts. The live successor was restated
+    // before capture: its current mark never replaces its original mark.
+    // A later row posted Info and restated Error is still no failure successor.
+    for (posted, current) in [
+        (Severity::Error, Severity::Warn),
+        (Severity::Error, Severity::Info),
+        (Severity::Info, Severity::Error),
+        (Severity::Error, Severity::Error),
+    ] {
+        let mut parent = center(now);
+        let first = parent
+            .post(
+                row(Severity::Error, "First failure", "handoff.failure"),
+                stamp(NOW - 3 * 60_000),
+                now,
+            )
+            .id;
+        let latest = parent
+            .post(
+                row(posted, "Latest reading", "handoff.failure"),
+                stamp(NOW - 2 * 60_000),
+                now,
+            )
+            .id;
+        assert!(parent.restate(
+            latest,
+            Restatement {
+                severity: Some(current),
+                ..Restatement::default()
+            },
+            now,
+        ));
+        parent.commit_rows(now, 3);
+        let before = MessagesState::of(&parent, &Desk::default());
+        let expected = if posted == Severity::Error {
+            vec![latest.raw()]
+        } else {
+            vec![latest.raw(), first.raw()]
+        };
+        let ids = |page: &MessagesState| page.entries.iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(&before), expected);
+        let carried = parent.carried();
+        let live = carried
+            .live
+            .iter()
+            .find(|m| m.id == latest.raw())
+            .expect("carried");
+        assert_eq!(live.severity, current.as_str());
+        assert_eq!(
+            live.posted_severity.as_deref(),
+            (posted != current).then_some(posted.as_str()),
+            "unchanged severity needs no extra wire field"
+        );
+        let mut disk = MessageLog::empty();
+        disk.replay_all(
+            parent
+                .log()
+                .pending_lines()
+                .map(|line| LogLine::decode(&line.encode()).expect("the original lines")),
+        );
+        for legacy in [false, true] {
+            let mut carry = carried.clone();
+            if legacy {
+                for m in &mut carry.live {
+                    m.posted_severity = None;
+                }
+            }
+            let mut child = center(now);
+            child.seed_carried(&carry, stamp(NOW), now);
+            let seeded = child.log().get(latest).expect("same carried id");
+            assert_eq!(seeded.severity, current);
+            assert_eq!(
+                seeded.posted_severity,
+                if legacy { current } else { posted }
+            );
+            child.merge_reloaded_log(&disk);
+            let loaded = child.log().get(latest).expect("same id after reload");
+            assert_eq!(loaded.stamp, parent.log().get(latest).unwrap().stamp);
+            assert_eq!(
+                loaded.severity, current,
+                "reload leaves its live mark alone"
+            );
+            assert_eq!(loaded.posted_severity, posted, "original post recovered");
+            let after = MessagesState::of(&child, &Desk::default());
+            assert_eq!(ids(&after), expected, "carry/reload preserves grouping");
+            assert_eq!(after.told_on, before.told_on, "same record identities");
+            assert_eq!(
+                after.standing_for(first.raw()),
+                (posted == Severity::Error).then_some(latest.raw())
+            );
+        }
+    }
+}
+
+/// A STORY'S ROW STARTS WHEN THE STORY DID: a lost login told as a sign-in,
+/// cancelled 40 minutes on and back 5 minutes after that is one row whose
+/// meta line reads the sign-in's clock and `took 45 min` (never the cancel's
+/// 5), while its lead column keeps its own stamp. NEGATIVE CONTROL: an
+/// unrelated record keeps its own start.
+#[test]
+fn a_story_told_on_starts_when_its_first_record_did() {
+    const MIN: u64 = 60_000;
+    let now = Instant::now();
+    let mut c = center(now);
+    let notice = |title: &str, key: &str| {
+        Message::new(tags::HARNESS, Severity::Warn, title)
+            .line("Finish signing in")
+            .key(key)
+            .hold(Hold::STANDING)
+    };
+    let start = NOW - 50 * MIN;
+    let other = c
+        .post(
+            Message::new(tags::SYSTEM, Severity::Info, "Font installed").hold(Hold::LogOnly),
+            stamp(start + 10 * MIN),
+            now,
+        )
+        .id;
+    let si = c
+        .post(notice("Login expired", "n.s-1.si"), stamp(start), now)
+        .id;
+    let ca = c
+        .post(
+            notice("Sign-in cancelled", "n.s-1.ca"),
+            stamp(start + 40 * MIN),
+            now,
+        )
+        .id;
+    assert!(c.supersede_record(si, ca, now));
+    assert!(c.withdraw(ca, now));
+    assert!(c.fix_record(ca, "Login back", stamp(start + 45 * MIN), now));
+    let page = MessagesState::of(&c, &Desk::default());
+    let row = page.entry(ca.raw()).expect("the story");
+    assert_eq!(
+        (row.at_unix_ms, row.began_unix_ms),
+        (start + 40 * MIN, start),
+        "its own stamp, its story's start"
+    );
+    assert_eq!(row.state_words(), "took 45 min");
+    assert_eq!(
+        row.meta_words(NOW, 0),
+        format!("{} \u{00b7} took 45 min", words::local_words(NOW, start, 0))
+    );
+    // NEGATIVE CONTROL: the unrelated record.
+    let own = page.entry(other.raw()).expect("its own row");
+    assert_eq!(own.began_unix_ms, own.at_unix_ms);
 }
 
 /// `Install now` is pressable only while the host says that build is still staged; an
@@ -892,6 +1158,7 @@ fn an_old_open_exception_keeps_its_own_day_header() {
         revision: 1,
         now_unix_ms: NOW,
         entries: vec![exception.clone(), record.clone()],
+        told_on: Vec::new(),
         tags: vec![("config".to_string(), 2)],
         log_folder: None,
         saved: false,
@@ -1290,6 +1557,7 @@ fn any_word_survives_the_page_lines() {
         revision: 7,
         now_unix_ms: NOW,
         entries: vec![entry.clone()],
+        told_on: Vec::new(),
         tags: vec![(hostile.to_string(), 1)],
         log_folder: Some(hostile.to_string()),
         saved: false,
@@ -1469,7 +1737,11 @@ fn an_open_exception_offers_dismiss_and_the_first_of_several_dismiss_all() {
             Why::OnlyYou(Reason::new("its own work holds the move")),
             Then::step("End that job in the tab"),
         )
-        .show(Intent::ShowTab { tab: 1, window: 1 })
+        .show(Intent::ShowSession {
+            tab: 1,
+            window: 1,
+            session: "s-01234567890123456789".into(),
+        })
         .message()
         .expect("the entry passes the rule")
     };
@@ -1529,7 +1801,8 @@ fn an_open_exception_offers_dismiss_and_the_first_of_several_dismiss_all() {
 
 /// An open exception stands above every other record whatever its age, reads the entry's
 /// current words (a restatement is never logged), offers its buttons, and moves the
-/// projection's revision.
+/// projection's revision; the page's subtitle says the open items lead (it said "newest
+/// first" over an older open row). NEGATIVE CONTROL: with none open it says newest first.
 #[test]
 fn an_open_exception_stands_first_in_its_current_words() {
     use crate::exceptions::{Entry, Family};
@@ -1545,7 +1818,11 @@ fn an_open_exception_stands_first_in_its_current_words() {
             Why::OnlyYou(Reason::new("its own work holds the move")),
             Then::step("End that job in the tab"),
         )
-        .show(Intent::ShowTab { tab: 1, window: 1 })
+        .show(Intent::ShowSession {
+            tab: 1,
+            window: 1,
+            session: "s-01234567890123456789".into(),
+        })
         .message()
         .expect("the entry passes the rule")
     };
@@ -1583,6 +1860,25 @@ fn an_open_exception_stands_first_in_its_current_words() {
     let after = MessagesState::of(&c, &Desk::default());
     assert_eq!(after.entries[0].title, "Claude in tab 1 is still behind");
     assert!(after.revision > before.revision);
+    // The page says the open items lead: the list is not newest first.
+    assert_eq!(after.subtitle(), crate::page::SUBTITLE_OPEN_FIRST);
+    let head = crate::page::wire_lines(&after, &MessagesFilter::default()).remove(0);
+    assert!(
+        head.contains(&format!(
+            "\tsubtitle={}\t",
+            crate::page::SUBTITLE_OPEN_FIRST
+        )),
+        "{head}"
+    );
+    // NEGATIVE CONTROL: with none open the list is newest first, and says so.
+    let mut plain = center(now);
+    plain.post(
+        Message::new(tags::UPDATE, Severity::Info, "Checked for updates").hold(Hold::LogOnly),
+        stamp(NOW),
+        now,
+    );
+    let plain = MessagesState::of(&plain, &Desk::default());
+    assert_eq!(plain.subtitle(), crate::page::SUBTITLE);
 }
 
 /// The page's Primary: the first offered intent while a press can perform it (a pressable
@@ -1714,6 +2010,7 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
         revision: 1,
         now_unix_ms: NOW,
         entries,
+        told_on: Vec::new(),
         tags: vec![("config".to_string(), 3)],
         log_folder: None,
         saved: true,
@@ -1775,6 +2072,7 @@ fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index(
                 ..entry_at(1, NOW - 120_000)
             },
         ],
+        told_on: Vec::new(),
         tags: vec![("config".to_string(), 2)],
         log_folder: None,
         saved: true,
@@ -1795,4 +2093,95 @@ fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index(
             "action\tid=1\tindex=2\tlabel=Software Update\tactionable=1\tbutton=Open Software Update\tprimary=1",
         ]
     );
+}
+
+/// A ZONE THAT MOVES ITS OFFSET MOVES THE PAGE'S WORDS THEN. The page is
+/// republished for its clock only when a time word moves
+/// ([`MessagesState::words_change_at`]), so that instant must never come late.
+/// Its words are read on the build's offset, and a zone that moves its offset
+/// (daylight saving) re-reads them all at that instant: an entry's local clock
+/// (`7:00 AM` becomes `8:00 AM`) and the midnight its day words turn at. A
+/// record from 2025-09-15 11:00 UTC says its weekday until Sep 22 00:00 at
+/// UTC-8; a zone that springs forward to UTC-7 at 03:30 UTC on Sep 22 owes
+/// the page its publish there, to the second, and one that moves after the
+/// midnight, or never, or cannot be read, keeps the midnight.
+#[test]
+fn a_zone_that_moves_its_offset_is_owed_a_publish_when_it_moves() {
+    const HOUR_S: i64 = 3_600;
+    let mut state = MessagesState::empty();
+    state.now_unix_ms = NOW;
+    state.utc_offset_s = -8 * HOUR_S;
+    // 6 d 4 h 53 min 20 s before NOW: its next spoken age (`7 days ago`) is
+    // after the midnight, so the midnight is the instant.
+    let at = NOW - 536_000_000;
+    state.entries = vec![entry_at(1, at)];
+    let midnight = NOW + 58_000_000;
+    assert_eq!(
+        Some(midnight),
+        Some(words::words_change_after(NOW, at, -8 * HOUR_S)),
+        "Sep 22 00:00 at UTC-8"
+    );
+    let zone =
+        |moves_at: u64| move |instant: u64| Some(HOUR_S * if instant < moves_at { -8 } else { -7 });
+    assert_eq!(state.words_change_at(|_| Some(-8 * HOUR_S)), Some(midnight));
+    assert_eq!(state.words_change_at(zone(midnight + 1)), Some(midnight));
+    assert_eq!(
+        state.words_change_at(|_| None),
+        Some(midnight),
+        "a zone it cannot read"
+    );
+    // Springing forward 4 h 30 min before the midnight.
+    let moves_at = midnight - 16_200_000 + 337;
+    let owed = state
+        .words_change_at(zone(moves_at))
+        .expect("a page with an entry says time");
+    assert!(
+        (moves_at..moves_at + 1_000).contains(&owed),
+        "the second the zone moves, not before and never later: {owed} against {moves_at}"
+    );
+    assert_ne!(
+        words::local_words(owed, at, -7 * HOUR_S),
+        words::local_words(owed - 1_000, at, -8 * HOUR_S),
+        "the entry's local clock reads otherwise there"
+    );
+    // A writer's clock far ahead of this one: the words themselves need not
+    // move for months. A pair of offset changes can end back at the build's
+    // offset before that word deadline, but its first change is still owed.
+    const DAY_MS: u64 = 86_400_000;
+    state.utc_offset_s = 0;
+    let future = NOW + 400 * DAY_MS;
+    state.entries = vec![entry_at(1, future)];
+    let word_deadline = words::words_change_after(NOW, future, 0);
+    let moves_at = NOW + 3_600_337;
+    let back_at = NOW + 2 * DAY_MS;
+    let paired_zone = |instant: u64| {
+        Some(if (moves_at..back_at).contains(&instant) {
+            HOUR_S
+        } else {
+            0
+        })
+    };
+    assert_eq!(paired_zone(word_deadline), Some(0));
+    let owed = state.words_change_at(paired_zone).unwrap();
+    assert!((moves_at..moves_at + 1_000).contains(&owed));
+    assert_ne!(
+        words::local_words(owed, future, HOUR_S),
+        words::local_words(NOW, future, 0),
+        "the first offset change changes the future entry's local clock too"
+    );
+    // No change in the first day: observe again then, rather than sleeping
+    // through a later pair just because their distant endpoint reads the same.
+    let later_zone = |instant: u64| {
+        Some(
+            if (NOW + 30 * DAY_MS..NOW + 210 * DAY_MS).contains(&instant) {
+                HOUR_S
+            } else {
+                0
+            },
+        )
+    };
+    assert_eq!(later_zone(word_deadline), Some(0));
+    assert_eq!(state.words_change_at(later_zone), Some(NOW + DAY_MS));
+    state.entries.clear();
+    assert_eq!(state.words_change_at(|_| Some(0)), None, "no time said");
 }

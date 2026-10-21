@@ -8,11 +8,11 @@
 //! [`allocations_during`] arms a flag on the calling thread, and the allocator
 //! counts only the allocations made on a thread whose flag is armed, into that
 //! thread's own tally. So the pins that assert a warmed hot path allocates
-//! nothing (`rainbow_kitty_v2_frame_cost`, `trick_flash_alloc`,
-//! `typed_tricks_alloc`, `word_reflow_identity`) share one process with each
-//! other and with every other test of the suite: none of them bleeds into
-//! another's count, which a process-global flag would allow (each used to need
-//! a binary of its own for that). [`assert_counter_is_per_thread`] holds both
+//! nothing (`rainbow_kitty_v2_frame_cost`, `streak_beam_alloc`,
+//! `trick_flash_alloc`, `typed_tricks_alloc`, `word_reflow_identity`) share
+//! one process with each other and with every other test of the suite: none
+//! of them bleeds into another's count, which a process-global flag would
+//! allow (each used to need a binary of its own for that). [`assert_counter_is_per_thread`] holds both
 //! halves of that claim.
 
 #![allow(dead_code, reason = "a binary that mounts this uses what it needs")]

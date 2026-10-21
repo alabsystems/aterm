@@ -33,10 +33,13 @@
 //! * [`reset`]: a limit reset's vocabulary between the loop and its host, and
 //!   the verdict on the confirmation its row opens ([`confirm_verdict`]).
 //! * [`trace`]: a decision's rule trace — the checks a policy consulted and what
-//!   came of each, which diagnostic callers can collect. The loop keeps
-//!   no steps, and these APIs have no current CLI reader.
+//!   came of each, which `aterm drive replay --why` collects from a tape
+//!   (`tape::explain`). The loop keeps no steps.
 //! * [`turn_end`]: the turn-end decider (continue, wait out a wall, switch a
 //!   model, compact, log in, or escalate).
+//! * [`needs`]: the report lines the turn-end decider reads by their head —
+//!   `NEEDS YOU:` (what only a person can give: loud, never blocking) and the
+//!   `Nothing left:` defense (Cruise's done claim, Land's landing when clean).
 //! * [`sleeps`]: the machine's sleeps a loop knows of, which a turn's done
 //!   row counts and its work does not.
 //! * [`exception`], [`outlook`]: the points only a person can answer, and what
@@ -50,6 +53,7 @@ pub mod exception;
 pub mod git_config;
 pub mod guard;
 pub mod login;
+pub mod needs;
 pub mod notice;
 pub mod outlook;
 pub mod probe;
@@ -82,8 +86,8 @@ pub use question::{
     answer_question, is_question_rule,
 };
 pub use reset::{
-    KeepWhy, RESET_CONTINUES_WAIT, ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
-    Verdict, confirm_verdict,
+    KeepWhy, RESET_CONTINUES_WAIT, ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOffer, ResetOutcome,
+    ResetWord, Verdict, confirm_verdict,
 };
 pub use shell_startup::ShellStartup;
 

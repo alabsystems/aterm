@@ -366,15 +366,46 @@ pub(crate) fn machine_id() -> MachineId {
     }
 }
 
+/// The tree a run measured, for its rows' sha column: see [`tree_label`].
 fn head_sha() -> String {
-    Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .current_dir(super::workspace_root())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    let git = |args: &[&str]| {
+        aterm_uds::spawnfd::command("git")
+            .args(args)
+            .current_dir(super::workspace_root())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(sha) = git(&["rev-parse", "--short=12", "HEAD"]) else {
+        return "unknown".to_string();
+    };
+    let status = git(&["status", "--porcelain", "--untracked-files=no"]);
+    tree_label(sha.trim(), status.as_deref())
+}
+
+/// The perf golden dir, relative to the workspace root: a `--record` rewrites its files
+/// before the trend rows are written, so its changes do not make the measured tree dirty.
+const GOLDEN_REL: &str = "crates/aterm-verify/perf/golden/";
+
+/// HEAD's short `sha`, with `+dirty` when `git status --porcelain` names a tracked file
+/// outside [`GOLDEN_REL`] that differs from HEAD (or could not be read), so a row measured
+/// on uncommitted code does not pass as HEAD's.
+pub(crate) fn tree_label(sha: &str, porcelain: Option<&str>) -> String {
+    let dirty = porcelain.is_none_or(|status| {
+        status.lines().filter(|l| !l.trim().is_empty()).any(|line| {
+            // `XY path`, or `XY from -> to` for a rename: judge every path it names.
+            line.get(3..)
+                .unwrap_or(line)
+                .split(" -> ")
+                .any(|path| !path.trim_matches('"').starts_with(GOLDEN_REL))
+        })
+    });
+    if dirty {
+        format!("{sha}+dirty")
+    } else {
+        sha.to_string()
+    }
 }
 
 fn now_unix_s() -> u64 {
@@ -1090,6 +1121,25 @@ mod tests {
             rows.trim_end().split('\t').nth(5),
             Some("trust"),
             "row: {rows:?}"
+        );
+    }
+
+    /// A row names the tree it measured: HEAD's sha alone only when nothing outside the golden
+    /// dir (which a record rewrites) differs from HEAD.
+    #[test]
+    fn a_row_measured_on_uncommitted_code_says_so() {
+        assert_eq!(tree_label("abc", Some("")), "abc");
+        let golden = " M crates/aterm-verify/perf/golden/perf-baseline-effects.json\n\
+                      M  crates/aterm-verify/perf/golden/perf-trend.tsv\n";
+        assert_eq!(tree_label("abc", Some(golden)), "abc");
+        let code = format!("{golden} M crates/aterm-gpu/src/renderer.rs\n");
+        assert_eq!(tree_label("abc", Some(&code)), "abc+dirty");
+        let renamed = "R  crates/aterm-verify/perf/golden/a.json -> crates/aterm-gpu/a.json\n";
+        assert_eq!(tree_label("abc", Some(renamed)), "abc+dirty");
+        assert_eq!(
+            tree_label("abc", None),
+            "abc+dirty",
+            "an unread status vouches nothing"
         );
     }
 

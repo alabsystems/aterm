@@ -2,13 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! A WORKER'S RESULT (`docs/DESIGN-sessions-as-subagents-2026-10-15.md`
-//! §2.3): what a Claude Code worker reported when its task ended, read from
+//! §2.3): what a Claude Code worker reported when its task LANDED, read from
 //! the conversation its process writes — the transcript the harness already
 //! reads for the model, the live upgrade's READY and the limit walls
 //! ([`super::footer`], [`super::upgrade`]) — and snapshotted ONCE, at the
 //! done edge, into `<state>/tasks/<gsid>-<rev>.result.md` ([`snapshot`]).
-//! A turn typed into a done worker (the live upgrade's READY, a person's
-//! question) cannot change it.
+//! A turn typed into a landed worker (the live upgrade's READY, a person's
+//! question) cannot change it. Only Autopilot Land ends a task (FOREVER
+//! CRUISE / FOREVER LAND): its done edge is the yield of a land act whose
+//! reply is a clean `Nothing left:` defense, and a later landing of the same
+//! session (someone else's turn opened it again) replaces the snapshot before
+//! it ([`prune_results`]).
 //!
 //! The done edge is the SCREEN's, and Claude Code writes the turn's last rows
 //! a moment after its screen shows the turn over (MEASURED, 2.1.301 on a real
@@ -27,49 +31,41 @@
 //! transcript as it then stands, up to that turn's end: its end row, or the
 //! next turn's start, a turn that wrote no end row included; past the
 //! bound it is read as it is, its miss said as ever. A miss of that kind
-//! (`no-reply`, `no-marker`, by either rule) keeps that turn's user row in
-//! its sidecar, and while the miss stands each `result` reads THAT turn
+//! (`no-reply`, or an older build's `no-marker`) keeps that turn's user row
+//! in its sidecar, and while the miss stands each `result` reads THAT turn
 //! again, once ([`reread`]) — never a later one; a reply found there becomes
 //! the result.
 //!
-//! Which rule ended the task is the turn-end policy's word ([`DoneBy`]: the
-//! act its done point followed), never this reader's guess — save that a
-//! newest turn the done check opened is read by the check's rule whatever
-//! the policy says: a loop that starts at a point another loop's check
-//! answered (another supervisor's hand-back, the harness's fault restart, a
-//! seamless update's successor) follows no act of its own
-//! there, and its policy calls the marker that answered the check the
-//! worker's own:
+//! The rule a result is read by is the conversation's own ([`DoneBy`]): the
+//! newest turn decides, never the reader's guess.
 //!
-//! * DONE THROUGH THE DONE CHECK — the conversation's newest turn is the one
-//!   the harness's done check opened, as it types it (with the standing
-//!   rules or without, [`is_done_check`]): the result is the worker's
-//!   REPORT, the final assistant message of the turn BEFORE that check,
-//!   then what the reply that answered the check says beyond its done, read
-//!   as the marker's rule reads a turn: its final message, marker-only lines
-//!   dropped, and where that is a bare done (the marker, `DONE`) the turn's
-//!   last earlier message with words. The check asks for "finished and
-//!   verified", and a worker that verifies or fixes inside the check's turn
-//!   writes its final word there (a report, a commit, a bare marker
-//!   included): the fact line every task carries promises the final message
-//!   before the marker, and the report before it keeps a short "Verified."
-//!   from standing alone. An earlier check answered with a done
-//!   ([`says_done`]: the reply the policy ends the task on, which a loop
-//!   started again asks again) is passed over for the turn before it, its
-//!   words beyond the done kept in order. The policy ends a task on a check
-//!   only where the reply says done, so a check turn whose final text is no
-//!   done — none yet, or a preamble before its tool calls, the reply not
-//!   written — is `no-reply`, the lag [`reread`] reads again.
-//! * DONE BY THE MARKER — the worker ended its own turn with
-//!   [`FINISHED`](crate::supervise::policy::turn_end::FINISHED): the final
-//!   assistant message of that newest turn, which must end with the marker
-//!   on a line of its own, its marker-only lines dropped ([`without_finished_lines`],
-//!   the survey's `said` too). A final message that is the marker alone (a
-//!   report, a check of the work, then the marker) gives the turn's last
-//!   earlier message with words.
+//! * THE LANDING — the conversation's newest turn is one a harness check
+//!   opened, as it types it (with its suffixes and the standing rules or
+//!   without): a land act (Land's instruction, a nudge, Land's answer to a
+//!   question, today's or an older build's words, [`is_land_act`]) or an
+//!   older build's done check ([`is_done_check`]). The result is the
+//!   worker's REPORT — the final assistant message of the turn BEFORE the
+//!   land acts of the episode (each of them passed over: their replies are
+//!   the landing's progress, and the defense says where it ended) — then
+//!   what the reply that landed says, read as a plain turn is read: its
+//!   final message, token-only lines dropped, and where that is a bare done
+//!   the turn's last earlier message with words. So a manager reads the task's
+//!   report and the defense that it is all on the remote main branch. An
+//!   older build's done check answered with a done is passed over for the
+//!   turn before it, its words beyond the done kept in order. A check turn
+//!   whose final text says no done — none yet, or a preamble before its tool
+//!   calls, the reply not written — is `no-reply`, the lag [`reread`] reads
+//!   again: the policy lands a task only on a defense, which says done.
+//! * A PLAIN TURN — any other newest turn (a wall's retry that delivered the
+//!   land act again, a loop that started on a landing another loop read):
+//!   its final assistant message, with no token required; lines that are the
+//!   retired [`FINISHED`](crate::supervise::policy::turn_end::FINISHED)
+//!   alone are dropped ([`without_finished_lines`], the survey's `said`
+//!   too), and a final message that is such a line alone gives the turn's
+//!   last earlier message with words.
 //!
 //! A turn the live upgrade's announcement opened ([`ANNOUNCE_HEAD`]: its
-//! READY, typed by the harness into a done worker) is the harness's and no
+//! READY, typed by the harness into a landed worker) is the harness's and no
 //! work of the worker's: the two rules read past it.
 //!
 //! The rows are read as the upgrade reads them: a subagent's
@@ -78,7 +74,7 @@
 //! words, and an assistant message written over several rows (Claude Code
 //! writes one per content block) is ONE message, merged by its `message.id`.
 //! A user row opens a turn when it holds typed words — a person's, a
-//! manager's, the harness's own `keep going` and done check; tool results and
+//! manager's, the harness's own continuation and land acts; tool results and
 //! Claude Code's tagged rows (`<command-name>`, `<local-command-stdout>`,
 //! `<bash-input>`, …) do not.
 //!
@@ -86,7 +82,7 @@
 //! sidecar's one line (`<gsid>-<rev>.result.src`, [`Source`]) says
 //! `source=transcript session=<id> uuid=<row>` and which transcript, or why
 //! there is no result. A shape this reader does not know is that word
-//! (`why=no-marker`, …), never a screen read that looks like an answer.
+//! (`why=no-reply`, …), never a screen read that looks like an answer.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -94,10 +90,8 @@ use std::time::{Duration, Instant};
 
 use aterm_json::Value;
 
-use super::upgrade::ANNOUNCE_HEAD;
-use crate::supervise::policy::turn_end::{
-    is_done_check, says_done, says_finished, without_finished_lines,
-};
+use super::upgrade::{ANNOUNCE_HEAD, is_land_act};
+use crate::supervise::policy::turn_end::{is_done_check, says_done, without_finished_lines};
 
 /// The most of a result one `result` reply prints, in characters; the rest
 /// is in the file its last line names. Claude Code's Bash tool shows about
@@ -133,7 +127,10 @@ pub const SETTLE_EVERY: Duration = Duration::from_millis(150);
 const END_READ_BYTES: u64 = 256 * 1024;
 
 /// The misses a reply Claude Code had not written yet explains: either rule
-/// found the newest turn's reply missing or unfinished ([`reread`]).
+/// found the newest turn's reply missing or unfinished ([`reread`]) —
+/// `no-reply`, the one this build writes, and `no-marker`, an older build's
+/// (its marker rule wanted the retired token), whose turn is read again by
+/// today's rules.
 const LAG_MISSES: [&str; 2] = ["no-reply", "no-marker"];
 
 /// A worker's report, as its transcript holds it ([`report`]).
@@ -158,6 +155,11 @@ enum Item {
         texts: Vec<String>,
         uuid: String,
         session: String,
+        /// The message's last content block is a tool's call: the turn goes
+        /// on past it (its result, then more of the model's words), so
+        /// whatever it said is no turn's last word ([`ends_in_call`]).
+        /// `None` where no row of it held a block.
+        calls: Option<bool>,
     },
 }
 
@@ -184,6 +186,31 @@ impl Item {
             uuid: uuid.clone(),
         })
     }
+}
+
+/// Whether a `message.content`'s last block is a tool's call (`tool_use`);
+/// `None` for a row that holds no block (the message's `calls` kept).
+fn last_block_calls(content: Option<&Value>) -> Option<bool> {
+    match content {
+        Some(Value::String(_)) => Some(false),
+        Some(Value::Array(parts)) => parts
+            .last()
+            .map(|p| p.get("type").and_then(Value::as_str) == Some("tool_use")),
+        _ => None,
+    }
+}
+
+/// Whether the last assistant message of `items` ends in a tool's call
+/// ([`Item::Said`]'s `calls`): its turn's reply is not written yet — the
+/// call's result and the words after it are still to come (Claude Code
+/// writes a turn's last rows a moment after its screen shows the turn
+/// over), so a preamble before the call (`Task is done; trying the result
+/// again`) is never taken for the turn's last word.
+fn ends_in_call(items: &[Item]) -> bool {
+    items.iter().rev().find_map(|i| match i {
+        Item::Said { calls, .. } => Some(*calls),
+        Item::Prompt(_) => None,
+    }) == Some(Some(true))
 }
 
 /// The text parts of a `message.content`: the whole content when it is a
@@ -257,6 +284,7 @@ fn item_of(line: &str) -> Option<Item> {
                 texts: texts_of(message.get("content")),
                 uuid: word("uuid"),
                 session: word("sessionId"),
+                calls: last_block_calls(message.get("content")),
             })
         }
         "user" => {
@@ -281,6 +309,7 @@ fn items(jsonl: &str) -> Vec<Item> {
             id: Some(id),
             texts,
             uuid,
+            calls,
             ..
         } = &item
         {
@@ -293,14 +322,19 @@ fn items(jsonl: &str) -> Vec<Item> {
                         id: Some(seen),
                         texts: kept,
                         uuid: kept_uuid,
+                        calls: kept_calls,
                         ..
-                    } if seen == id => Some((kept, kept_uuid)),
+                    } if seen == id => Some((kept, kept_uuid, kept_calls)),
                     _ => None,
                 });
-            if let Some((kept, kept_uuid)) = earlier {
+            if let Some((kept, kept_uuid, kept_calls)) = earlier {
                 if !texts.is_empty() {
                     kept.extend(texts.iter().cloned());
                     kept_uuid.clone_from(uuid);
+                }
+                // The message's last block is the latest row's that held any.
+                if calls.is_some() {
+                    *kept_calls = *calls;
                 }
                 continue;
             }
@@ -323,14 +357,20 @@ struct TurnRows<'a> {
 }
 
 impl TurnRows<'_> {
-    /// Whether the harness's done check opened this turn.
+    /// Whether a harness check opened this turn: a land act ([`Self::is_land`])
+    /// or an older build's done check.
     fn is_check(&self) -> bool {
-        self.prompt.is_some_and(is_done_check)
+        self.is_land() || self.prompt.is_some_and(is_done_check)
     }
 
-    /// Whether what this turn said is a done ([`says_done`]: the marker,
-    /// `DONE`, a done phrase — what the policy reads a check's answer by),
-    /// or nothing.
+    /// Whether one of Land's acts opened this turn ([`is_land_act`]).
+    fn is_land(&self) -> bool {
+        self.prompt.is_some_and(is_land_act)
+    }
+
+    /// Whether what this turn said is a done ([`says_done`]: a defense, a
+    /// done phrase, `DONE`, the retired token — what the policy reads a done
+    /// claim by), or nothing.
     fn answered_done(&self) -> bool {
         final_said(self.said).is_none_or(|r| says_done(Some(&r.text)))
     }
@@ -362,24 +402,38 @@ fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
     out
 }
 
-/// Which of the turn-end policy's rules ended the task: what its done point
-/// followed (`TurnEndState::followed`), handed to [`report`] by the loop.
+/// The rule a result is read by ([the module's](self)): a check's — the
+/// newest turn a land act opened, or an older build's done check — or a
+/// plain turn's. The task record's `why=` is `landed` either way (the task
+/// record's mark, `supervise::task_mark`); this is how its result was read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DoneBy {
-    /// The worker said it was done after the harness's done check.
+    /// The newest turn is a harness check's: the report before it, then what
+    /// its reply adds.
     Check,
-    /// The worker ended a turn with
-    /// [`FINISHED`](crate::supervise::policy::turn_end::FINISHED).
-    Marker,
+    /// The newest turn's final message, no token required.
+    Turn,
 }
 
 impl DoneBy {
-    /// The rule's word on the record's mark (`why=`).
+    /// The rule's word, as a tape keeps it.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
-            DoneBy::Check => "done-check",
-            DoneBy::Marker => "marker",
+            DoneBy::Check => "check",
+            DoneBy::Turn => "turn",
+        }
+    }
+
+    /// The rule a `word` names: this build's ([`Self::word`]), or an older
+    /// build's (`done-check`, `marker`: the record's `why=` words before Land
+    /// alone ended a task); `None` for any other.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        match word {
+            "check" | "done-check" => Some(DoneBy::Check),
+            "turn" | "marker" => Some(DoneBy::Turn),
+            _ => None,
         }
     }
 }
@@ -387,12 +441,11 @@ impl DoneBy {
 /// THE WORKER'S REPORT in the transcript tail `jsonl`, read at the done edge
 /// by [the module's](self) rule `by` — the check's wherever the newest turn
 /// is a check. `Err` is the word for a shape this reader does not know:
-/// `no-check` (done through the check, but the newest turn is no check),
+/// `no-check` (the check's rule asked, but the newest turn is no check),
 /// `no-report` (nothing before the check said anything, and its reply
 /// added no words), `no-reply` (the newest turn has no answer with text
-/// yet; by the check's rule, no final text that says done), `no-marker`
-/// (its answer does not end with the marker) or `empty` (the marker was all
-/// the turn said).
+/// yet; by the check's rule, no final text that says done) or `empty` (the
+/// retired token was all the turn said).
 ///
 /// # Errors
 /// The shape's word, as above.
@@ -431,7 +484,7 @@ fn read(jsonl: &str, by: DoneBy) -> Reading {
     let (by, report) = if by == DoneBy::Check || newest.is_check() {
         (DoneBy::Check, by_check(newest, before))
     } else {
-        (DoneBy::Marker, by_marker(newest))
+        (DoneBy::Turn, by_turn(newest))
     };
     let lagged = report.as_ref().is_err_and(|why| LAG_MISSES.contains(why));
     Reading {
@@ -444,31 +497,38 @@ fn read(jsonl: &str, by: DoneBy) -> Reading {
     }
 }
 
-/// DONE THROUGH THE DONE CHECK, `newest` the turn the check opened and
-/// `before` the turns before it ([the module's](self) rule): the REPORT —
-/// the final message of the turn before the check, earlier checks answered
-/// with a done passed over — then what each passed-over check's reply and
-/// `newest`'s say beyond the done ([`check_words`]), oldest first, a blank
-/// line apart. So a worker that verified or fixed inside the check's turn
-/// has its final word there returned too. The report names the row of its
-/// last text. `no-check`: `newest` is no check; `no-reply`: `newest`'s
-/// final text is no done ([`says_done`]) — none yet, or a preamble before
-/// its tool calls — where the policy ends a task on a check only on one, so
-/// its reply is one Claude Code had not written, which [`reread`] reads
-/// again; `no-report`: nothing before the check said anything and no reply
-/// added words.
+/// THE LANDING, `newest` the turn a harness check opened and `before` the
+/// turns before it ([the module's](self) rule): the REPORT — the final
+/// message of the turn before the check, the land acts of the episode
+/// passed over where `newest` is one (their replies are the landing's
+/// progress), and an older build's done checks answered with a done passed
+/// over — then what each passed-over done check's reply and `newest`'s say
+/// beyond the done ([`check_words`]), oldest first, a blank line apart. So
+/// a worker that verified or fixed inside the check's turn has its final
+/// word there returned too. The report names the row of its last text.
+/// `no-check`: `newest` is no check; `no-reply`: `newest`'s final text is no
+/// done ([`says_done`]: a `Nothing left:` defense is one), or its last
+/// message ends in a tool's call ([`ends_in_call`]) — none yet, or a
+/// preamble before its tool calls — where the policy lands a task only on a
+/// defense, so its reply is one Claude Code had not written, which
+/// [`reread`] reads again; `no-report`: nothing before the check said
+/// anything and no reply added words.
 fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'static str> {
     if !newest.is_check() {
         return Err("no-check");
     }
-    if !final_said(newest.said).is_some_and(|r| says_done(Some(&r.text))) {
+    if ends_in_call(newest.said)
+        || !final_said(newest.said).is_some_and(|r| says_done(Some(&r.text)))
+    {
         return Err("no-reply");
     }
+    let land = newest.is_land();
     let mut checks = vec![newest];
     let mut earlier = before.iter().rev();
     let reported = loop {
         match earlier.next() {
-            Some(t) if t.is_check() && t.answered_done() => checks.push(t),
+            Some(t) if land && t.is_land() => {}
+            Some(t) if t.is_check() && !t.is_land() && t.answered_done() => checks.push(t),
             other => break other,
         }
     };
@@ -489,13 +549,12 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
     })
 }
 
-/// What a check turn's reply says beyond the done it answered with, as the
-/// marker's rule reads a turn ([`by_marker`]): its last message with words
-/// once marker-only lines are dropped ([`without_finished_lines`]) and a
-/// bare `DONE` (the policy's other done word) is read as none — its final
-/// message, or where that is a bare done, the last earlier one with words
-/// (a report, then a commit, then the marker alone). `None` where no message
-/// of the turn has any.
+/// What a check turn's reply says beyond the done it answered with, as a
+/// plain turn is read ([`by_turn`]): its last message with words once lines
+/// that are the retired token alone are dropped ([`without_finished_lines`])
+/// and a bare `DONE` is read as none — its final message, or where that is a
+/// bare done, the last earlier one with words (a report, then a commit, then
+/// the token alone). `None` where no message of the turn has any.
 fn check_words(turn: &TurnRows<'_>) -> Option<Report> {
     turn.said
         .iter()
@@ -892,12 +951,18 @@ pub fn settled(
     )
 }
 
-/// The marker's rule on the newest turn ([`report`]).
-fn by_marker(newest: &TurnRows<'_>) -> Result<Report, &'static str> {
-    let said = final_said(newest.said).ok_or("no-reply")?;
-    if !says_finished(Some(&said.text)) {
-        return Err("no-marker");
+/// A PLAIN TURN's rule on the newest turn ([`report`]): its final message
+/// with words, no token required — the lines that are the retired token
+/// alone dropped ([`without_finished_lines`]), and where nothing is left of
+/// the final message, the turn's last earlier message with words.
+/// `no-reply`: the turn said nothing yet, or its last message ends in a
+/// tool's call ([`ends_in_call`]: the reply is not written yet, the lag
+/// [`reread`] reads again); `empty`: the token was all it said.
+fn by_turn(newest: &TurnRows<'_>) -> Result<Report, &'static str> {
+    if ends_in_call(newest.said) {
+        return Err("no-reply");
     }
+    let said = final_said(newest.said).ok_or("no-reply")?;
     std::iter::once(said)
         .chain(newest.said.iter().rev().filter_map(Item::said).skip(1))
         .find_map(|r| {
@@ -1053,8 +1118,45 @@ pub struct Snapshot {
     /// Why there is no result ([`report`]'s word, or `no-transcript`).
     pub unavailable: Option<&'static str>,
     /// The rule the result was read by: the one asked for, or the check's
-    /// where the newest turn is a check ([`report`]) — the mark's `why=`.
+    /// where the newest turn is a check ([`report`]).
     pub by: DoneBy,
+}
+
+/// THE PREVIOUS LANDING'S RESULT, PRUNED: beside the result of `stem`
+/// (`<gsid>-<rev>`, [`snapshot`]'s) just written under `tasks`, every other
+/// `<gsid>-<n>.result.md` and its sidecar (`.result.src`) of the same
+/// session is removed — a landing replaces the one before it, whose record
+/// was opened again first, so no record names it. A file that will not go
+/// stays; nothing else under `tasks` is touched. The count removed.
+pub fn prune_results(tasks: &Path, stem: &str) -> usize {
+    let Some((sid, rev)) = stem.rsplit_once('-') else {
+        return 0;
+    };
+    let Ok(dir) = std::fs::read_dir(tasks) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(n) = name
+            .strip_suffix(".result.md")
+            .or_else(|| name.strip_suffix(".result.src"))
+            .and_then(|s| s.strip_prefix(sid)?.strip_prefix('-'))
+        else {
+            continue;
+        };
+        if n != rev
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// SNAPSHOT THE RESULT, at the done edge: the report [`report`] reads by rule
@@ -1354,13 +1456,13 @@ impl Reread {
 
 /// A RESULT THE DONE EDGE MISSED, READ AGAIN — the backstop to [`settled`]:
 /// the snapshot at `path` whose sidecar says its turn's reply was missing or
-/// unfinished (`why=no-reply|no-marker`) and names the user row that started
-/// the done edge's turn (`turn=`: a prompt, the done check, or a
+/// unfinished (`why=no-reply`, or an older build's `no-marker`) and names the
+/// user row that started the done edge's turn (`turn=`: a prompt, a land act, or a
 /// `<task-notification>`) and the transcript, read again from that
 /// transcript's end ([`TRANSCRIPT_READ_BYTES`]) as the snapshot would have
 /// read it once that turn ended: up to that turn's end row — or the next
-/// prompt — by the rule that turn is read by (the check's where the check
-/// opened it, else the marker's). So a later turn's reply
+/// prompt — by the rule that turn is read by (the check's where a check
+/// opened it, else a plain turn's). So a later turn's reply
 /// is never taken, a notification's that woke the worker after it ended
 /// among them. `None`: no such miss, no transcript to read, the turn's row
 /// not in what was read, or its reply still no report.
@@ -1380,7 +1482,7 @@ pub fn reread(path: &Path) -> Option<Reread> {
     let (jsonl, _) = tail_of(&transcript, TRANSCRIPT_READ_BYTES)?;
     let end = end_of(&jsonl, &Opener::Row(turn));
     end.upto?;
-    let report = read(&upto(jsonl, end), DoneBy::Marker).report.ok()?;
+    let report = read(&upto(jsonl, end), DoneBy::Turn).report.ok()?;
     Some(Reread { report, transcript })
 }
 

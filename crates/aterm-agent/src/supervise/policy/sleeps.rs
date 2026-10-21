@@ -159,26 +159,119 @@ pub struct InTurn {
 
 /// THE MACHINE'S COUNT OF ITS SLEEP at a moment: how long it slept since it
 /// booted, and the boot it counts in (`aterm_uds::process::asleep_since_boot`,
-/// `boot_session`). Two counts compare only on the same named boot: the count
-/// starts over at a boot.
+/// `astream_sys::boot_session`). Two counts compare only on the same named
+/// boot: the count starts over at a boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SleepStamp {
     /// The sleep since boot.
     pub asleep: Duration,
-    /// The boot's name; `None` where the kernel names none, and then the
-    /// count compares with no other process's.
-    pub boot: Option<String>,
+    /// The boot ([`Boot`]: the kernel's boot id, `astream_sys::boot_session`,
+    /// the reading aterm-link's broker opens its log in); `None` where the
+    /// kernel names none, or names the all-zero id a damaged answer reads as,
+    /// and then the count compares with no other process's.
+    pub boot: Option<Boot>,
 }
 
 impl SleepStamp {
     /// How long the machine slept since `then`, read on this boot: `None`
-    /// on another boot, or a boot either does not name.
+    /// on another boot, or a boot either does not name. The boots compare
+    /// by their 16 bytes ([`Boot`]), so how a row or a tape spelled one never
+    /// decides it.
     #[must_use]
     pub fn since(&self, then: &SleepStamp) -> Option<Duration> {
         let same = matches!((&self.boot, &then.boot), (Some(a), Some(b)) if a == b);
         same.then(|| self.asleep.saturating_sub(then.asleep))
     }
 }
+
+/// A BOOT A COUNT OF THE MACHINE'S SLEEP IS ON: the kernel's boot id, its 16
+/// bytes (`astream_sys::boot_session`), and the case its text was spelled in,
+/// which an act's ledger row (`approvals::BOOT`) and a tape's count
+/// (`tape::core`) write it back in ([`Boot::text`]).
+///
+/// Two boots are one when their bytes are: the case never decides it (this
+/// type's `PartialEq` reads the id alone), so a row of either case counts
+/// with this loop's. The case is kept for the readers that compare the TEXT.
+/// A build from 30ae1a1185 up to this one's change (v0.107.0 among them) wrote
+/// the kernel's text as it came — macOS's `kern.bootsessionuuid` upper-case,
+/// Linux's `boot_id` lower-case — and compares it as text: a row this build
+/// wrote in the other case would read to that build, after a rollback or a
+/// downgrade, as another boot, and the sleep since the act would go
+/// uncounted. And a replay feeds a tape's recorded count back to the loop and
+/// compares the act's row the loop writes with the recorded one byte for byte:
+/// a boot written back in a case it was not read in would diverge at every
+/// act, a spelling reported as a change of behaviour. So this host's boot is
+/// written as this host's kernel spells it ([`Boot::kernel`]), and a boot read
+/// off a row or a tape as that text spelled it ([`Boot::of`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Boot {
+    /// The id's 16 bytes, as `astream_sys::parse_boot_id` reads them.
+    id: [u8; 16],
+    /// Spelled lower-case (Linux's `boot_id`); upper-case otherwise.
+    lower: bool,
+}
+
+/// Whether this host's kernel spells its boot id lower-case: Linux's and
+/// Android's `/proc/sys/kernel/random/boot_id` do, macOS's
+/// `kern.bootsessionuuid` does not. Upper-case where no kernel names a boot,
+/// which writes none (`astream_sys::boot_session` reads none there).
+const KERNEL_SPELLS_LOWER: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+impl Boot {
+    /// This host's boot, `id` as `astream_sys::boot_session` read it, spelled
+    /// as this host's kernel spells it.
+    #[must_use]
+    pub const fn kernel(id: [u8; 16]) -> Self {
+        Self {
+            id,
+            lower: KERNEL_SPELLS_LOWER,
+        }
+    }
+
+    /// The boot a row's or a tape's `text` names, by astream's reader of the
+    /// kernel's boot id text (`astream_sys::parse_boot_id`), its case kept
+    /// (lower-case if any hex letter is): the UUID in either case. `None` for
+    /// anything else, the all-zero id among them: a damaged answer must never
+    /// pass as a boot, or two equal damaged answers would read as one boot,
+    /// and the sleep between them as counted.
+    #[must_use]
+    pub fn of(text: &str) -> Option<Self> {
+        let id = astream_sys::parse_boot_id(text.as_bytes())?;
+        let lower = text.bytes().any(|b| matches!(b, b'a'..=b'f'));
+        Some(Self { id, lower })
+    }
+
+    /// The id's 16 bytes.
+    #[must_use]
+    pub const fn id(&self) -> [u8; 16] {
+        self.id
+    }
+
+    /// The text a row or a tape writes: the UUID's 32 hex digits hyphenated
+    /// 8-4-4-4-12, the kernel's own form, in the case this boot was read in.
+    #[must_use]
+    pub fn text(&self) -> String {
+        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = self.id;
+        let upper = format!(
+            "{a:02X}{b:02X}{c:02X}{d:02X}-{e:02X}{f:02X}-{g:02X}{h:02X}-{i:02X}{j:02X}-\
+             {k:02X}{l:02X}{m:02X}{n:02X}{o:02X}{p:02X}"
+        );
+        if self.lower {
+            upper.to_ascii_lowercase()
+        } else {
+            upper
+        }
+    }
+}
+
+/// One boot is its 16 bytes, however it was spelled ([`Boot`]).
+impl PartialEq for Boot {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Boot {}
 
 /// A LOOP'S FIRST LOOK AT THE MACHINE'S SLEEP: what a seed sets the
 /// ledger's last act against ([`SleepBook::count_since_act`]).

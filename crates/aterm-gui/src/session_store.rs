@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use aterm_core::terminal::{RenderDebt, Terminal};
 use aterm_session::{LaunchNonce, SessionId};
+use aterm_types::control_request::Selector;
 
 use crate::SessionCtx;
 
@@ -496,6 +497,31 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_row"
     )]
     pub status_seen: Option<String>,
+    /// THE AUTOPILOT'S END AND THE TASK'S WORK (additive, absent ⇒ none;
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8, slice
+    /// 2b): the end of the session's supervised task standing on the glass —
+    /// a landing, the wall time its face moved there, whether anyone looked
+    /// at it — and the agent's busy time since the task opened, as one row
+    /// (`harness_end_carry::EndCarry::row`: `end=landed@<unix ms>
+    /// seen=<0|1> worked=<ms>`, or `end=- worked=<ms>` with no end), stamped
+    /// by the park (`App::end_carry_rows`). The successor seeds the face's
+    /// time onto the timeline before registration
+    /// (`spawn::seed_adopted_end`), so the loop's restated face reads
+    /// `landed 17:42`, not the update's clock; and spends the row at the
+    /// session's first publication (`App::adopt_end_carry`): the tab's `•`
+    /// stands until someone looks, and a task 25 s into its work needs only
+    /// 5 s more for its end. The handoff's alone, as `lost` is: never on a
+    /// durable layout, so a crash image never has it. A plain string an older
+    /// reader skips; a value that does not read ([`lenient_row`],
+    /// `EndCarry::parse`) carries nothing — the end is lost and the clock
+    /// reads the restate time, as before the carry — never failing the
+    /// manifest. In neither proof digest.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub autopilot_end: Option<String>,
     /// THE SESSION LOG'S SEQ COUNT (additive, absent ⇒ 0; Phase 2A of the
     /// session log, design §2.2): the outgoing log's last seq plus its overlap
     /// reserve (`session_log::LOG_SEQ_RESERVE`). The successor's log starts
@@ -1106,11 +1132,20 @@ pub struct CarriedMessage {
     pub unix_ms: u64,
     /// The tag word.
     pub tag: String,
-    /// The severity word.
+    /// The current severity word.
     pub severity: String,
+    /// The original posted severity when different from the current mark. Older
+    /// parents omit it; the engine repairs that fallback at the log reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posted_severity: Option<String>,
     /// The glyph.
     pub glyph: char,
     pub title: String,
+    /// The title's short form for the band (`aterm_messages::Message::short_title`).
+    /// Absent — an older parent's row, or one that declared none — elides
+    /// the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detail: Vec<String>,
     /// Encoded intents (`Intent::encode`).
@@ -1201,8 +1236,10 @@ impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
             unix_ms: m.unix_ms,
             tag: m.tag.clone(),
             severity: m.severity.clone(),
+            posted_severity: m.posted_severity.clone(),
             glyph: m.glyph,
             title: m.title.clone(),
+            short_title: m.short_title.clone(),
             detail: m.detail.clone(),
             actions: m.actions.clone(),
             hold: m.hold.clone(),
@@ -1227,8 +1264,10 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
             unix_ms: m.unix_ms,
             tag: m.tag.clone(),
             severity: m.severity.clone(),
+            posted_severity: m.posted_severity.clone(),
             glyph: m.glyph,
             title: m.title.clone(),
+            short_title: m.short_title.clone(),
             detail: m.detail.clone(),
             actions: m.actions.clone(),
             hold: m.hold.clone(),
@@ -1797,6 +1836,9 @@ impl SessionHandoff {
                         // Stamped by the park from the App's status item
                         // (`app_update_handoff::stamp_status_seen`).
                         status_seen: None,
+                        // Stamped by the park from the harness's glass and the
+                        // A/B book (`app_update_handoff::stamp_autopilot_end`).
+                        autopilot_end: None,
                         log_seq,
                     }
                 })
@@ -2129,6 +2171,10 @@ pub(crate) struct SessionStore {
     /// Monotone source of journal seqs. Keeps counting past eviction, so a
     /// consumer's watermark stays meaningful even after the ring has rolled.
     roster_seq: u64,
+    /// The INSTANCE's watchers: a `subscribe` with the `sessions` stream or
+    /// `@*` registers here, and every journal append rings it, so a spawn or
+    /// an exit reaches the push loop at once rather than on its liveness pass.
+    instance_watchers: std::sync::Arc<crate::session_watch::Watchers>,
     /// Exit statuses noted by the shell-exit path (`Wake::Exit`), keyed by local
     /// id and CONSUMED by the deregister that follows. A side table rather than a
     /// handle field because the handle is cloned out per control request and its
@@ -2226,6 +2272,13 @@ impl SessionStore {
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            // The one place every session passes: a context whose timeline
+            // rings another list than `ctx.watchers` would leave every watcher
+            // registered on it unwoken by its records.
+            debug_assert!(
+                std::sync::Arc::ptr_eq(tl.watchers(), &handle.ctx.watchers),
+                "a session context not built from one session_watch::Observed"
+            );
             // THE BUS MIRROR's state this store shares with the session's
             // log (`session_log_mirror::Shared`): nothing is engaged by it
             // while the node does not mirror.
@@ -2290,6 +2343,14 @@ impl SessionStore {
         // The in-GUI supervisor host decides from membership: a session that
         // closed loses its worker at once (`harness_host`, which parks on this).
         crate::harness_host::ring();
+        self.instance_watchers.ring_watchers();
+    }
+
+    /// The instance's watcher list, which every roster journal append rings:
+    /// what a `sessions` or `@*` subscription registers on.
+    #[must_use]
+    pub(crate) fn instance_watchers(&self) -> std::sync::Arc<crate::session_watch::Watchers> {
+        self.instance_watchers.clone()
     }
 
     /// Ask this instance's bridge to retire the presence row of `sid` — a sid
@@ -2563,7 +2624,8 @@ impl SessionStore {
         let sid = self.by_local.remove(&local_id)?;
         // The death mark, written WHILE the handle is still registered: the
         // timeline is Arc-shared, so a holder that kept the ctx (pool teardown
-        // races, a live subscribe watch) reads the `closing` row and the final
+        // races) or the timeline alone (a live subscribe watch's
+        // `WatchSource`) reads the `closing` row and the final
         // `state-change` from the same object — and this write precedes the
         // index removal in program order, not merely inside the same lock hold,
         // so "before it is gone" is literally the code's order too.
@@ -2713,6 +2775,18 @@ impl SessionStore {
             .and_then(|sid| self.by_id.get(sid))
     }
 
+    /// The handle a wire `@<selector>` names: a local number or a stable id.
+    /// `None` for self (the connection's own session, which the registry does not
+    /// know), an invalid spelling, and an id or number no session has.
+    #[must_use]
+    pub(crate) fn by_selector(&self, selector: &Selector<'_>) -> Option<&SessionHandle> {
+        match selector {
+            Selector::Local(local_id) => self.by_local(*local_id),
+            Selector::Sid(sid) => self.by_id.get(sid.as_str()),
+            Selector::SelfTok | Selector::Invalid(_) => None,
+        }
+    }
+
     /// Number of registered sessions.
     #[cfg(test)]
     #[must_use]
@@ -2799,7 +2873,8 @@ impl SessionStore {
         self.roster.front().map(|r| r.seq)
     }
 
-    /// Journal records with `seq > after`, oldest-first.
+    /// Journal records with `seq > after`, oldest-first; double-ended, so a
+    /// reader after only the newest few walks from the back.
     ///
     /// Seqs are minted by one counter under the write lock and pushed to the
     /// back, so they are strictly increasing across the deque and
@@ -2808,7 +2883,10 @@ impl SessionStore {
     /// the retained low-water yields everything retained — callers must test
     /// [`roster_low_seq`](Self::roster_low_seq) first if they need to know that
     /// the prefix was lossy (see its doc).
-    pub(crate) fn roster_since(&self, after: u64) -> impl Iterator<Item = &RosterRecord> {
+    pub(crate) fn roster_since(
+        &self,
+        after: u64,
+    ) -> impl DoubleEndedIterator<Item = &RosterRecord> {
         let start = self.roster.partition_point(|r| r.seq <= after);
         self.roster.range(start..)
     }
@@ -3034,16 +3112,67 @@ pub(crate) fn test_handle_on(local_id: u64, master: i32) -> SessionHandle {
     handle_alive(local_id, None, master)
 }
 
+/// [`test_handle`] over a given engine, for a test that needs its own grid
+/// size or fills the engine before the handle exists. It locks `term` once,
+/// for the context's mode mirror.
+#[cfg(test)]
+pub(crate) fn test_handle_with(local_id: u64, term: Arc<Mutex<Terminal>>) -> SessionHandle {
+    handle_over(
+        local_id,
+        None,
+        term,
+        aterm_session::sink::SinkWriter::new(-1),
+    )
+}
+
+/// [`test_handle`] whose sink OWNS `master`, as a spawned session's sink owns
+/// its PTY master: the fd closes when the last clone of the context's sink
+/// drops, so a test sees from the other end what still holds the context.
+#[cfg(all(test, unix))]
+pub(crate) fn test_handle_owning(local_id: u64, master: std::os::fd::OwnedFd) -> SessionHandle {
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    handle_over(
+        local_id,
+        None,
+        term,
+        aterm_session::sink::SinkWriter::new_owned(master),
+    )
+}
+
 #[cfg(test)]
 fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> SessionHandle {
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    handle_over(
+        local_id,
+        parent,
+        term,
+        aterm_session::sink::SinkWriter::new(master),
+    )
+}
+
+#[cfg(test)]
+fn handle_over(
+    local_id: u64,
+    parent: Option<SessionId>,
+    term: Arc<Mutex<Terminal>>,
+    sink: aterm_session::sink::SinkWriter,
+) -> SessionHandle {
     use aterm_session::EdgeTable;
-    use aterm_session::sink::SinkWriter;
     crate::prime_test_timing();
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
-    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let master = sink.master();
+    let observed = crate::session_watch::Observed::default();
+    observed.watchers.bind_frame(&term);
+    // The test constructor's log (`ep=1`, ruling U46), in the timeline that
+    // rings this context's watchers.
+    *observed
+        .timeline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .slog_mut() = crate::session_log::SessionLog::for_test();
     let ctx = Arc::new(SessionCtx {
-        sink: Arc::new(SinkWriter::new(master)),
+        sink: Arc::new(sink),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
         modes: crate::mode_mirror_of(&term),
         ui_waiting: Arc::default(),
@@ -3054,22 +3183,21 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
         cast: Arc::new(Mutex::new(crate::cast::CastRecorder::new(80, 24))),
         temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
-        turns: Arc::new(std::sync::Mutex::new(
-            crate::turn_ledger::TurnLedger::default(),
-        )),
+        turns: observed.turns,
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-        timeline: Arc::new(std::sync::Mutex::new(
-            crate::session_timeline::SessionTimeline::default(),
-        )),
+        timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        licence: Default::default(),
         launch: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
         update_parked: Default::default(),
+        watchers: observed.watchers,
+        frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
     });
@@ -3090,6 +3218,42 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>, master: i32) -> Sessio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A SPAWN AND A CLOSE RING THE INSTANCE'S WATCHERS: a `sessions` or `@*`
+    /// subscription learns of them at once. NEGATIVE CONTROL: a replace (the
+    /// same sid registered again) is no membership change, journals nothing
+    /// and rings nobody.
+    #[test]
+    fn a_spawn_wakes_instance_watchers() {
+        use std::time::Duration;
+        let mut store = SessionStore::default();
+        let watcher = crate::session_watch::Subscription::single(&store.instance_watchers());
+        let h = test_handle(3);
+        store.register(h.clone());
+        assert!(watcher.wait(Duration::ZERO), "a spawn rings the instance");
+        store.register(h);
+        assert!(!watcher.wait(Duration::ZERO), "a replace rings nobody");
+        store.deregister_local_as(3, ExitReason::CtlClose, ExitActor::Unknown);
+        assert!(watcher.wait(Duration::ZERO), "a close rings the instance");
+    }
+
+    /// AN EXIT WAKES THE SESSION'S WATCHERS BY ITSELF: `set_state` records the
+    /// transition, and the record rings them, so a parked `await` reads
+    /// `Exited` with no notify of its own from the exit path. NEGATIVE
+    /// CONTROL: a re-mark of the same state records nothing and wakes nobody.
+    #[test]
+    fn a_state_change_wakes_the_sessions_watchers_and_a_re_mark_does_not() {
+        use std::time::Duration;
+        let mut store = SessionStore::default();
+        let h = test_handle(4);
+        let watcher = crate::session_watch::Subscription::single(&h.ctx.watchers);
+        store.register(h);
+        while watcher.wait(Duration::ZERO) {}
+        store.set_state(4, SessionState::Alive);
+        assert!(!watcher.wait(Duration::ZERO), "a re-mark rings nobody");
+        store.set_state(4, SessionState::Exited);
+        assert!(watcher.wait(Duration::ZERO), "the exit rings the session");
+    }
 
     /// A carried render debt round-trips, and a bad row is no debt: not two
     /// integers, zero, past a screen, or `i32::MIN` (whose `abs` overflows).
@@ -3680,7 +3844,7 @@ title = \"zsh\"
             .unwrap()
             .since(None)
             .filter(|e| e.kind == "meta-change")
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect();
         assert_eq!(
             seeded_rows,
@@ -4014,21 +4178,14 @@ title = \"zsh\"
             "and seeds nothing"
         );
 
-        let subscribers = crate::subscribe::new_registry();
         let mut store = SessionStore::default();
         store.register(handle(0, None));
         let worker = handle(1, None);
-        mark_session_task(
-            &worker.ctx,
-            1,
-            &TaskMark::new(TaskState::Working),
-            &subscribers,
-        )
-        .expect("unfenced");
+        mark_session_task(&worker.ctx, 1, &TaskMark::new(TaskState::Working)).expect("unfenced");
         let mut done = TaskMark::new(TaskState::Done);
         done.why = Some("marker");
         done.result_bytes = 5;
-        let (record, _) = mark_session_task(&worker.ctx, 1, &done, &subscribers).expect("unfenced");
+        let (record, _) = mark_session_task(&worker.ctx, 1, &done).expect("unfenced");
         store.register(worker.clone());
         let manifest = SessionHandoff::from_store(&store);
         assert_eq!(manifest.sessions[0].task, None);
@@ -4077,13 +4234,7 @@ title = \"zsh\"
         let seeded = unclaimed.ctx.timeline.lock().unwrap().task().cloned();
         assert!(!seeded.expect("seeded").attention, "no entry, no flag");
 
-        mark_session_task(
-            &worker.ctx,
-            1,
-            &TaskMark::new(TaskState::Stalled),
-            &subscribers,
-        )
-        .expect("unfenced");
+        mark_session_task(&worker.ctx, 1, &TaskMark::new(TaskState::Stalled)).expect("unfenced");
         assert_ne!(
             CarriedClaims::of_session(1, &worker.ctx, now, &holder),
             drawn,
@@ -4096,7 +4247,7 @@ title = \"zsh\"
         let _ = worker.ctx.fabric.fence_hold(false);
         let done = TaskMark::new(TaskState::Done);
         assert_eq!(
-            mark_session_task_within(&worker.ctx, 1, &done, &subscribers, Duration::ZERO),
+            mark_session_task_within(&worker.ctx, 1, &done, Duration::ZERO),
             Err(MarkFenced)
         );
         assert_eq!(
@@ -4104,7 +4255,7 @@ title = \"zsh\"
             fenced
         );
         worker.ctx.fabric.lift_hold_fence();
-        let landed = mark_session_task_within(&worker.ctx, 1, &done, &subscribers, Duration::ZERO);
+        let landed = mark_session_task_within(&worker.ctx, 1, &done, Duration::ZERO);
         assert!(landed.is_ok_and(|(_, moved)| moved), "lifted, it lands");
     }
 
@@ -4383,7 +4534,7 @@ title = \"zsh\"
         let tl = timeline.lock().unwrap();
         let got: Vec<(u64, &str, &str)> = tl
             .since(None)
-            .map(|e| (e.id, e.kind, e.payload.as_str()))
+            .map(|e| (e.id, e.kind, &*e.payload))
             .collect();
         assert_eq!(
             got,
@@ -4517,7 +4668,7 @@ title = \"zsh\"
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .since(None)
-            .map(|e| (e.kind, e.payload.clone()))
+            .map(|e| (e.kind, e.payload.to_string()))
             .collect()
     }
 

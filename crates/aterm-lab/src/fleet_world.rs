@@ -229,7 +229,8 @@ pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
     ]
 }
 
-/// Make the private directories of a world at `root` and its aterm.toml.
+/// Make the private directories of a world at `root` and its aterm.toml
+/// ([`CONFIG`], the audible bell off: [`crate::instance::bell_off`]).
 ///
 /// # Errors
 /// A directory or the config could not be made.
@@ -251,7 +252,10 @@ pub fn make_world(root: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    std::fs::write(root.join("cfg/aterm/aterm.toml"), CONFIG)
+    std::fs::write(
+        root.join("cfg/aterm/aterm.toml"),
+        crate::instance::bell_off(CONFIG),
+    )
 }
 
 /// N free loopback ports, held together while they are picked so none

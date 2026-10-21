@@ -73,8 +73,15 @@ fn open_pty_pair() -> (i32, i32) {
 /// terminal it is — a spawned tab's shape. Answers `(master, pid)`.
 /// Not waited here: the pid stays reserved until the test's `Session`
 /// drops, whose hang-up and reaper own it, exactly as a spawned tab's.
+///
+/// A leader is often a real interactive shell, so it is a hermetic one
+/// (§8.6 of the init design): `home` (the test's scratch) is its HOME and
+/// XDG base, and `HISTFILE` is `/dev/null`. With the environment cleared and
+/// no HOME, `/bin/sh -i` (bash) took its home from the password entry and
+/// saved each test's `exec /bin/sleep 30` into the person's own
+/// `~/.bash_history`: 461 of its 500 lines on 2026-10-20.
 #[allow(clippy::zombie_processes)]
-fn spawn_leader(argv: &[&str]) -> (i32, i32) {
+fn spawn_leader(argv: &[&str], home: &std::path::Path) -> (i32, i32) {
     let (master, slave) = open_pty_pair();
     // SAFETY: `slave` is an open fd the pair handed over; owned here.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
@@ -84,6 +91,8 @@ fn spawn_leader(argv: &[&str]) -> (i32, i32) {
     cmd.inherit_nothing()
         .args(&argv[1..])
         .env_clear()
+        .envs(aterm_spec::host::hermetic_env(home))
+        .env("HISTFILE", "/dev/null")
         .env("PATH", "/usr/bin:/bin")
         .env("PS1", "$ ")
         .env("TERM", "dumb")
@@ -103,6 +112,54 @@ fn spawn_leader(argv: &[&str]) -> (i32, i32) {
     let child = cmd.spawn().expect("spawn the session leader");
     let pid = i32::try_from(child.id()).expect("pid");
     (master, pid)
+}
+
+/// What `master` has printed once `want` is in it, read as it comes: a
+/// hang detector ([`wait_for`]), never a latency budget.
+#[track_caller]
+fn read_until(master: i32, want: &str) -> String {
+    let mut seen = Vec::new();
+    wait_for(want, || {
+        let mut ready = libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live `pollfd` this frame owns, for a bounded wait.
+        if unsafe { libc::poll(&raw mut ready, 1, 50) } > 0 {
+            let mut buf = [0u8; 4096];
+            // SAFETY: `master` is this test's open pty master; the buffer is
+            // live and its length is the one passed.
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if let Ok(n) = usize::try_from(n) {
+                seen.extend_from_slice(&buf[..n]);
+            }
+        }
+        String::from_utf8_lossy(&seen).contains(want)
+    });
+    String::from_utf8_lossy(&seen).into_owned()
+}
+
+/// A leader's shell sees its scratch HOME and saves no history: what it
+/// types lands in no one's home (§8.6 of the init design; [`spawn_leader`]
+/// says what it wrote before). RED before: `HOME=` and
+/// `HISTFILE=/Users/<you>/.bash_history`.
+#[test]
+fn a_leader_shell_has_a_scratch_home_and_saves_no_history() {
+    let home = aterm_tempfile::tempdir().expect("scratch home");
+    let (master, pid) = spawn_leader(&["/bin/sh", "-i"], home.path());
+    // Every way out of the test, a hang detector's panic included, kills it.
+    struct Leader(i32, i32);
+    impl Drop for Leader {
+        fn drop(&mut self) {
+            kill_all(&[self.1], &[self.0]);
+        }
+    }
+    let _leader = Leader(master, pid);
+    type_line(master, "printf '<%s|%s>\\n' \"$HOME\" \"$HISTFILE\"\n");
+    let want = format!("<{}|/dev/null>", home.path().display());
+    let seen = read_until(master, &want);
+    assert!(seen.contains(&want), "{seen:?}");
 }
 
 fn type_line(master: i32, line: &str) {
@@ -176,12 +233,13 @@ fn kill_all(pids: &[i32], masters: &[i32]) {
 /// name still says the shell (R1: unnamed).
 #[test]
 fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
+    let home = aterm_tempfile::tempdir().expect("scratch home");
     let mut app = App::headless_for_test();
-    let idle = spawn_leader(&["/bin/sh", "-i"]);
-    let fg = spawn_leader(&["/bin/sh", "-i"]);
-    let bg = spawn_leader(&["/bin/sh", "-i"]);
-    let exe = spawn_leader(&["/bin/sleep", "30"]);
-    let exec = spawn_leader(&["/bin/sh", "-i"]);
+    let idle = spawn_leader(&["/bin/sh", "-i"], home.path());
+    let fg = spawn_leader(&["/bin/sh", "-i"], home.path());
+    let bg = spawn_leader(&["/bin/sh", "-i"], home.path());
+    let exe = spawn_leader(&["/bin/sleep", "30"], home.path());
+    let exec = spawn_leader(&["/bin/sh", "-i"], home.path());
     for (id, pair) in [(1, idle), (2, fg), (3, bg), (4, exe), (5, exec)] {
         add_tab(&mut app, id, pair);
     }
@@ -309,9 +367,10 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
 /// keeps it.
 #[test]
 fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
+    let home = aterm_tempfile::tempdir().expect("scratch home");
     let mut app = App::headless_for_test();
-    let idle = spawn_leader(&["/bin/sh", "-i"]);
-    let held = spawn_leader(&["/bin/sh", "-i"]);
+    let idle = spawn_leader(&["/bin/sh", "-i"], home.path());
+    let held = spawn_leader(&["/bin/sh", "-i"], home.path());
     add_tab(&mut app, 1, idle);
     add_tab(&mut app, 2, held);
     wait_for("the idle shell's own group", || {
@@ -456,7 +515,8 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
 fn a_foreground_change_owes_the_journal_a_capture() {
     let mut app = App::headless_for_test();
     assert!(app.config.tab_status_or_default(), "the sweep must run");
-    let shell = spawn_leader(&["/bin/sh", "-i"]);
+    let home = aterm_tempfile::tempdir().expect("scratch home");
+    let shell = spawn_leader(&["/bin/sh", "-i"], home.path());
     add_tab(&mut app, 1, shell);
     wait_for("the shell's own group", || {
         crate::quit_safety::foreground_pgrp(shell.0) == shell.1

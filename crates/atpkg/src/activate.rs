@@ -680,6 +680,9 @@ fn sweep_agents(layout: &Layout) {
     let installed = crate::ops::active_builds(layout);
     for entry in entries.flatten() {
         let name = entry.file_name();
+        if crate::lay::in_flight_here(&name) {
+            continue;
+        }
         let keep = name
             .to_str()
             .and_then(ToolName::from_shim_file)
@@ -926,6 +929,9 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
+        if crate::lay::in_flight_here(&name) {
+            continue;
+        }
         let Some(name) = name.to_str() else { continue };
         // A `bin/` entry is a FILE name; `installed` holds LOGICAL names. Comparing the two
         // directly — which is what this guard did — is the identity on Unix and always false
@@ -1184,9 +1190,28 @@ mod tests {
         std::fs::write(layout.bin_dir().join("hand"), b"mine\n").unwrap();
         std::fs::write(refused_shim_path(&layout, "sudo"), b"mine\n").unwrap();
         install_tombstone_shim(&layout, &tool("tombstoned")).unwrap();
+        // A lay this process has in flight, staged and waiting for the turn to rename it: its
+        // temp resolves into build 18 like the stale `aylint`, and stays for its writer. The
+        // same temp of a process that is gone (pid 1 is init's, never a test's) goes.
+        let in_flight = crate::lay::staged_at(&shim_of(&layout, "aylint"), "aylint", u64::MAX);
+        let orphaned = layout.bin_dir().join(".aylint.lay-1-7");
+        for temp in [&in_flight, &orphaned] {
+            platform::install_shim_env(
+                &b18.join("bin"),
+                &tool("aylint"),
+                temp,
+                &crate::shim_env::ShimEnv::NONE,
+            )
+            .unwrap();
+        }
 
         prune_stale_shims(&layout, &b19, &[tool("ay")], Aliases::Alab);
 
+        assert!(
+            in_flight.exists(),
+            "an in-flight lay is its writer's to publish"
+        );
+        std::fs::remove_file(&in_flight).unwrap();
         let mut left: Vec<String> = std::fs::read_dir(layout.bin_dir())
             .unwrap()
             .flatten()
@@ -1854,7 +1879,20 @@ mod tests {
         // name that points OUTSIDE the store (nothing in bin/ vouches for it).
         std::fs::write(layout.agents_dir().join("mine"), b"#!/bin/sh\n").unwrap();
         std::os::unix::fs::symlink("/usr/bin/true", layout.agents_dir().join("codex")).unwrap();
+        // A twin lay this process has in flight stays for its writer to rename; the temp a
+        // process that is gone left (pid 1 is init's) is not an agent name, and goes.
+        let in_flight = crate::lay::staged_at(&twin, "claude", u64::MAX);
+        let orphaned = layout.agents_dir().join(".claude.lay-1-7");
+        for temp in [&in_flight, &orphaned] {
+            std::fs::write(temp, b"#!/bin/sh\n").unwrap();
+        }
         reconcile_agents(&layout);
+        assert!(
+            in_flight.exists(),
+            "an in-flight lay is its writer's to publish"
+        );
+        assert!(!orphaned.exists(), "another process's leftover temp");
+        std::fs::remove_file(&in_flight).unwrap();
         assert!(
             !layout.agents_dir().join("mine").exists(),
             "not an agent name"

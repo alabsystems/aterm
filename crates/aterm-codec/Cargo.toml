@@ -10,10 +10,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Base64 and hex encoding/decoding for aterm: zero external dependencies"
+description = "Base64, hex, the wire and terminal escapes, CRC-32 (astream-wire's) and DEFLATE for aterm: std and astream-wire only"
 
 [dependencies]
-# None — pure std
+# The CRC-32 is astream-wire's `hash::crc32_ieee_update` (compile-time
+# slicing-by-8, bounds proved there), the one aterm-png checks chunks with and
+# astream frames every record with. astream-wire has no dependencies and no
+# platform code; the macOS and Linux graphs already hold it (aterm-restore,
+# astream-broker); on Windows and wasm32 it arrives with aterm-hash and here.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 
 [dev-dependencies]
 # The generated-input tests' one generator (`aterm_spec::rng::XorShift`).

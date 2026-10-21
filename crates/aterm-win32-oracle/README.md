@@ -32,10 +32,17 @@ through each side must import the same symbol from the same DLL, and each of its
 eight `plant-*` features must be caught (six by conformance, two by the import).
 It is the same STOCK EXCEPTION and reads no harvest or `--upstream` source.
 
+`targo --unverified verify cells` runs `oracle` and `oracle-052` as rows of its
+own whenever it checks a Windows cell (`win` or `win-arm`, both in its default
+set), so neither needs a hand step; `verify cells --cell win` runs them alone with
+that one cell.
+
 Exit 0 means all requested checks passed; 1 means a finding; 2 is usage; 3 means
 the check could not run. A build, clean or inspection failure never counts as a
 caught mismatch. `--upstream` (or WINDOWS_SYS_SRC) selects the pinned registry
-source; `--stock` selects the rustup toolchain. `--target-dir` (or
+source; without either, the oracle reads Cargo's registry copy, and fetches it
+first (`targo fetch --locked` of win32-oracle/) on a host that has none, since no
+aterm build downloads it. `--stock` selects the rustup toolchain. `--target-dir` (or
 ORACLE_TARGET_DIR) owns the oracle build cache; NM selects its object inspector.
 The default cache is this checkout's win32-oracle/target (`oracle-052`:
 crates/aterm-windows-sys-052/tests/oracle/target). Before each build `oracle-052`

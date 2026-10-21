@@ -1,13 +1,26 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-codec: spec recovery from its 57 unit tests
+# aterm-codec: spec recovery from its 67 unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 19 tests it
 > deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
 > were taken before.
 
 > Audit amendment: The 2026-10-16 code audit corrected the error docs in §5.2/4 and removed render's unused last parameter/dead arm (§5.3); SafeStream::finish retains end-of-input handling. The dated inventory below records the earlier snapshot.
+
+> Status 2026-10-20: `src/crc32.rs` no longer holds a table. `Crc32` wraps astream-wire's
+> `hash::crc32_ieee_update` (compile-time slicing-by-8), and its state is the finished CRC,
+> starting at `0`. `crc32-reference` and `crc32-fold` now state the wrapper against the bitwise CRC
+> by citing a refinement `ensures` on `crc32_ieee_update` that astream-wire DOES NOT HAVE: the
+> function is a plain `pub const fn`. What Trust proves in astream-wire's `hash.rs` is the Level-0
+> obligations (every table index in bounds, the arithmetic; astream's
+> `evidence/verify/trust-wire.md`) and `crc_table_index_in_bounds`, which the fold never calls;
+> astream pins the CRC's value with tests (`wire.hash.crc32-table-equiv`). That contract, and the
+> slice-by-8 table-step lemma it rests on, land in astream first (astream's `docs/ROADMAP.md`,
+> "Functional contracts aterm cites", astream e45b103), so both rows wait on it as well as on the gaps they list.
+> The new test `the_state_is_the_finished_crc_and_the_register_seed_is_wrong` samples
+> `crc32-fold`.
 
 > Status 2026-10-15: this is the crate's migration worklist. Each spec below is proved through
 > Trust/Clean about the compiled Rust function, and then the tests it subsumes are deleted. No test
@@ -36,15 +49,15 @@
 > - Contract predicates that use `as` casts, a `char` literal compare or a Clean-def call
 >   (`result == nibble_spec(c)`) are reported "unsupported contract predicate expression".
 
-Source: `crates/aterm-codec` (read only). I read every `#[test]`: `src/base64.rs` 7, `src/crc32.rs` 3,
-`src/hex.rs` 2, `src/inflate.rs` 21, `src/json.rs` 3, `src/pct.rs` 2, `src/tty.rs` 5,
-`tests/base64.rs` 6 and `tests/inflate_stream.rs` 8, which makes 57. `tests/codec_suite.rs` has no
+Source: `crates/aterm-codec` (read only). I read every `#[test]`: `src/base64.rs` 7, `src/crc32.rs` 4,
+`src/fields.rs` 5, `src/hex.rs` 2, `src/inflate.rs` 21, `src/json.rs` 3, `src/pct.rs` 3, `src/tty.rs` 5,
+`tests/base64.rs` 9 and `tests/inflate_stream.rs` 8, which makes 67. `tests/codec_suite.rs` has no
 tests: it only declares `mod base64; mod inflate_stream;`. Its doc comment contains the text
-`#[test]`, which is why a line count gives 58. I also read the code each test reaches, including the
+`#[test]`, which is why a line count gives 68. I also read the code each test reaches, including the
 digit writers in `src/lib.rs` and `src/inflate/stream.rs` (which has no tests of its own). Nothing was
 compiled or run. The claims below come from reading the code.
 
-Result: **35 specs**, covering **all 57 tests**. **0 tests are non-spec samples** (§4).
+Result: **37 specs**, covering **all 67 tests**. **0 tests are non-spec samples** (§4).
 
 ## 0. Notation used in the statements
 
@@ -99,7 +112,7 @@ implied).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-b64-encode-padded	contract	base64::encode, base64::encode_padded	∀ x: |x| > MAX ⇒ encode(x) = Err(InputTooLarge(|x|)). |x| ≤ MAX ⇒ encode(x) = Ok(s) with s.as_bytes() = B64(x). So |s| = 4·⌈|x|/3⌉, s uses only the alphabet and '=', and s ends with exactly (3 − |x| mod 3) mod 3 '=' bytes. The from_utf8_unchecked call is sound because every pushed byte is ASCII.	tests/base64.rs::rfc4648_vectors, tests/base64.rs::ed25519_key_and_signature_shapes	&[u8] → String, as_chunks::<3> loop over fixed arrays, u32 shifts/masks, Vec push, match on rem.len(), unsafe String::from_utf8_unchecked (needs an ASCII invariant on out)	1,5,7,8
+b64-encode-padded	contract	base64::encode, base64::encode_into, base64::encoded_len, base64::sextets	∀ x: |x| > MAX ⇒ encode(x) = Err(InputTooLarge(|x|)) and encoded_len(|x|) = None. |x| ≤ MAX ⇒ encode(x) = Ok(s) with s.as_bytes() = B64(x). So |s| = 4·⌈|x|/3⌉ = encoded_len(|x|), s uses only the alphabet and '=', and s ends with exactly (3 − |x| mod 3) mod 3 '=' bytes. ∀ out: encode_into(out, x) appends exactly encode(x) to out (Err leaves out unchanged), and does not reallocate when out.capacity() ≥ |out| + encoded_len(|x|). The as_mut_vec append is sound because every pushed byte is ASCII.	tests/base64.rs::rfc4648_vectors, tests/base64.rs::ed25519_key_and_signature_shapes, tests/base64.rs::encode_into_appends_exactly_encode, tests/base64.rs::a_destination_sized_by_encoded_len_never_reallocates, tests/base64.rs::oversized_input_is_refused_and_appends_nothing	&[u8] → appended String, as_chunks::<3> loop over fixed arrays, u32 shifts/masks, Vec extend_from_slice, slice patterns on rem, String capacity reasoning (allocation model), unsafe String::as_mut_vec (needs an ASCII invariant on out)	1,5,7,8
 b64-roundtrip	round-trip	base64::{encode,decode,decode_strict,decode_with_table,decode_strict_with_table}	∀ x with |x| ≤ MAX: decode_strict(encode(x)?) = Ok(x) and decode(encode(x)?) = Ok(x). A corollary of b64-encode-padded with b64-lenient-decode and b64-strict-canonical. It can also be proved directly by induction over 3-byte groups: Pack(B64 group) = group.	tests/base64.rs::every_short_length_and_every_byte_value_round_trips, tests/base64.rs::fuzz_both_directions	Vec<u8>/String, as_chunks::<3>/<4> loops, Result ? propagation, u32 bit packing, saturating usize counters	1,4,5,7
 b64-strict-canonical	contract	base64::{decode_strict,decode_strict_with_table,decode_byte}	∀ t: decode_strict(t) = Ok(x) ⇔ |x| ≤ MAX ∧ B64(x) = t: strict accepts exactly the image of encode and inverts it. Errors: |t| > MAX ⇒ InputTooLarge(|t|); |t| mod 4 = 1 ⇒ InvalidLength(|t|); |t| mod 4 ∈ {2,3} ⇒ InvalidPadding(|t|); otherwise the first failing check, scanning quads left to right, decides: '=' outside the last one or two bytes of the final quad, or any non-alphabet byte ⇒ InvalidByte(pos, byte); nonzero discarded low bits of the final symbol (b & 0xF for XX==, c & 0x3 for XXX=) ⇒ InvalidLastSymbol(pos, byte). Test form: decode_strict(t).ok() = (from_utf8(t) ∧ decode(t) = Ok(x) ∧ encode(x) = t) ? Some(x) : None.	tests/base64.rs::exhaustive_short_strings_are_accepted_only_when_canonical, tests/base64.rs::non_canonical_spellings_are_refused	enumerate over as_chunks::<4>, last-quad branch, early-return Result, Vec push, bit masks	1,5,7
 b64-lenient-decode	contract	base64::{decode,decode_with_table,decode_byte}	∀ s: &str, t = s.as_bytes(): |t| > MAX ⇒ InputTooLarge(|t|). t = [] ⇒ Ok([]). Otherwise let p = the number of trailing '=' bytes; p > 2 ⇒ InvalidLength(|t|). Let body = t[..|t|−p]. |body| mod 4 = 1 ⇒ InvalidLength(|body|) (the stripped length). If some byte of body has no Sym, the result is InvalidByte(i, body[i]) for the least such i ('=' inside body counts as invalid). Otherwise Ok(Pack(body)). The padding count is not checked against the length, and the discarded bits are ignored.	-	&str as_bytes, rev().take_while().count(), get(..).unwrap_or, as_chunks::<4> loop with slice-pattern remainder, const-fn-built [u8;256] table (evaluate build_decode_table), Result ?	1,3,5,7
@@ -115,12 +128,13 @@ pct-roundtrip	round-trip	pct::{encode,decode}	∀ s: &str: decode(encode(s)) = s
 pct-word-line	round-trip	pct::{encode_word,join_words,split_words,decode}	∀ argv of non-empty words w1..wn: split_words(join_words(argv)) = argv. encode_word(w) escapes exactly '%', every char::is_whitespace char and every char::is_control char as uppercase %XX of each UTF-8 byte and keeps every other char, so it holds no whitespace and every '%' in it starts a well-formed escape that decode inverts; join_words joins the encoded words with one ' '. Corollary: a word with no '%', whitespace or control char is its own encoding, so join_words(argv) = argv.join(" ") for an argv of such words.	src/pct.rs::an_argv_line_keeps_every_word_whole	chars loop, encode_utf8, split_whitespace, composition with pct-decode-total	1,3,7
 json-escape-reference	equivalence	json::{escape,escape_into,push_u,utf8_len}	∀ s: &str, out: escape_into(out, s) leaves out' = out ++ JsonRef(s), and escape(s) = JsonRef(s). The fast path copies plain runs and decodes only lead bytes C2/D8/E2; it is correct because every is_active char ≥ 0x80 has one of those leads (C2 for U+0080–009F, D8 for U+061C, E2 for U+200E–2069). push_u's two-byte lowercase hex equals {:04x} because every active char is ≤ 0xFFFF.	src/json.rs::escape_spells_rfc_8259_and_the_active_class, src/json.rs::the_fast_path_is_the_reference	while-let over bytes.get(at) with a char-boundary invariant (start ≤ at, both on boundaries), s.get(a..b) str slicing, chars().next(), c.len_utf8(), &mut String	1,2,5,7
 json-escape-inert-and-invertible	round-trip	json::escape	∀ s: escape(s) contains no char c with tty::is_active(c), and reading escape(s) as an RFC 8259 string body (a spec-only JSON string decoder) gives back s. A corollary of json-escape-reference: JsonRef emits only non-active chars plus ASCII escapes, and each escape token decodes to its source char.	src/json.rs::the_output_holds_no_active_byte_and_decodes_back	String/char model; needs a Lean JSON-string-body decoder as the reference	1,4,5
+fields-sink-spellings	contract	fields::{TextSink,JsonSink,FlagWords::word,Decimal::write}, fields::FieldSink::{opt_count,opt_decimal,count_pairs}	∀ field sequences F of (key, kind, value): a TextSink::new(h, w) driven by F then finish() = h ++ concat_F (' ' ++ key ++ '=' ++ T(kind, value)), and a JsonSink::new() driven by F then finish() = '{' ++ join_F(',', '"' ++ JsonRef(key) ++ '":' ++ J(kind, value)) ++ '}'. T / J per kind: count n → decimal digits / the same; decimal(v, p) → format!("{v:.p$}") / the same, null when v is not finite; flag b → w's word for b / true|false; label v → pct::encode(v) / '"' ++ JsonRef(v) ++ '"'; absent(t) → t / null; pairs(P, e) → e when P = [], else join(',', K(k) ++ ':' ++ TC(c)) / '{' ++ join(',', '"' ++ JsonRef(k) ++ '":' ++ JC(c)) ++ '}', where K(k) = pct::encode(k) with each ',' written %2C and each ':' %3A, TC(Rec R) = join('/', TC over R's values) and JC(Rec R) is R as an object. opt_count/opt_decimal(Some v) = the plain kind, (None) = absent; count_pairs = pairs of Count cells. Corollary: every text value of a label or a pair key is ASCII-graphic, so one token, and no K(k) holds ',' or ':', so a non-empty text ledger splits on ',' then on the first ':' back into the pairs written, pct::decode recovering each k.	src/fields.rs::each_kind_spells_its_documented_bytes, src/fields.rs::fields_keep_their_call_order, src/fields.rs::the_text_flag_words_are_the_records_choice, src/fields.rs::labels_and_pair_keys_are_escaped_per_syntax, src/fields.rs::a_non_finite_decimal_is_null_in_json	&mut dyn trait dispatch, String push, fmt::Write of u64 and f64 (core float formatting needs a model), recursion over Cell::Rec, mem::take on a bool	1,2,5,7
 tty-active-class	table-property	tty::{is_active,needs_escape}	∀ c: char: is_active(c) ⇔ (c as u32) ∈ [0,0x1F] ∪ [0x7F,0x9F] ∪ {0x061C, 0x200E, 0x200F} ∪ [0x2028,0x202E] ∪ [0x2066,0x2069]. needs_escape(c) ⇔ is_active(c) ∧ c ∉ {'\n','\t'}.	src/tty.rs::the_active_class_is_controls_bidi_and_the_separators	const fn, char as u32 cast, boolean range comparisons, one call (needs_escape → is_active). Straight-line scalar	1,3
 tty-push-escape	contract	tty::{push_escape,push_byte_escape}	∀ out, c: push_escape(out, c) leaves out' = out ++ E(c). E('\n') = "\\n", E('\r') = "\\r", E('\t') = "\\t"; for other c < 0x20 and for DEL, E(c) = "\\x" ++ hex2(c); otherwise E(c) = format!("\\u{{{:04x}}}", c as u32) (lowercase, at least four digits, no zeros beyond four). push_byte_escape(out, b) appends "\\x" ++ hex2(b).	src/tty.rs::push_escape_spells_every_class	&mut String, match with guard, iter().skip over a [u32;6] shift array, char as u32	1,2,3,7
 tty-safe	contract	tty::{safe,render,SafeStream::{push,finish}}	∀ b: &[u8]: safe(b) = concat_{item ∈ Lossy(b)} R(item), R(Char c) = needs_escape(c) ? E(c) : c, R(Bad bs) = R(Cut bs) = concat_{x ∈ bs} "\\x" ++ hex2(x). safe(b) is Cow::Borrowed(b) exactly when b is valid UTF-8 with no needs_escape char. Corollary: no char of safe(b) satisfies needs_escape, and every printable char of b appears in order.	src/tty.rs::safe_spells_each_class_and_keeps_text	str::from_utf8 with Utf8Error valid_up_to/error_len (needs a std model), Cow, chars() loops, split_at, skip/take iterators	1,2,5,7
 tty-stream-split-invariance	equivalence	tty::{SafeStream::{new,push,finish,hold},render}	∀ pieces p1..pk (any k, any lengths, empty pieces included), out: new(); push(p1, out); …; push(pk, out); finish(out) leaves out' = out ++ safe(p1 ++ … ++ pk). Invariant between pushes: the held bytes (≤ 3) are exactly the Cut item of Lossy(prefix so far), and out holds the rendering of everything before it.	src/tty.rs::a_stream_cut_anywhere_renders_as_the_whole	&mut self struct with a [u8;3] carry, [u8;6] joint buffer copy_from_slice, slice re-borrowing, the render loop; needs a Lossy prefix/append lemma	1,2,5,7
-crc32-reference	equivalence	crc32::{Crc32::{new,update,finish,of},TABLE}	∀ d: Crc32::of(d) = CRC(d), the bitwise definition. TABLE[n] = 8 reflected shift-xor steps of n (const evaluation over 256 entries), and the table step entry ^ (crc >> 8) equals 8 bitwise steps on the byte. CRC("123456789") = 0xCBF43926 and CRC([]) = 0 are instances.	src/crc32.rs::check_vector	const-block-generated [u32;256], &mut self, for over &[u8], TABLE.get, u32 xor/shift	1,2,5,7
-crc32-fold	other (homomorphism)	crc32::Crc32::update	∀ states s, byte strings a, b: update(update(s, a), b) = update(s, a ++ b) and update(s, []) = s. Hence finish after any split of d equals of(d).	src/crc32.rs::folding_is_associative_over_every_split	&mut self two-state reasoning, a slice loop as a fold, List.foldl_append	1,2,7
+crc32-reference	equivalence	crc32::Crc32::{new,update,finish,of}	∀ d: Crc32::of(d) = CRC(d), the bitwise definition, and the same through new, update and finish. The proof cites a refinement ensures on astream-wire's hash::crc32_ieee_update, crc32_ieee_update(CRC(p), d) = CRC(p ++ d), which does not exist yet: astream-wire proves only that fold's index bounds and arithmetic, and pins its value by tests. It lands in astream first, with the slice-by-8 table-step lemma under it (see the 2026-10-20 status note). CRC("123456789") = 0xCBF43926, CRC([]) = 0 and CRC("hello") = 0x3610A686 are instances.	src/crc32.rs::check_vector	a cross-crate const fn call, &mut self, u32	1,2,3,5,12 + the astream-wire contract
+crc32-fold	other (homomorphism)	crc32::Crc32::{new,update,finish}	∀ states s, byte strings a, b: update(update(s, a), b) = update(s, a ++ b) and update(s, []) = s, where a state is the finished CRC of the bytes so far (new() = 0 = CRC([])). Hence finish after any split of d equals of(d). The split law is the same astream-wire ensures as crc32-reference's, which does not exist yet.	src/crc32.rs::folding_is_associative_over_every_split, src/crc32.rs::the_state_is_the_finished_crc_and_the_register_seed_is_wrong	&mut self two-state reasoning, the cross-crate fold's split law	1,2,3,12 + the astream-wire contract
 adler32-reference	equivalence	inflate::{Adler32::{new,update,finish},adler32}	∀ d: adler32(d) = ADLER(d). ∀ states with a, b < 65521 and all splits: update(update(s, x), y) = update(s, x ++ y), and a, b < 65521 holds after every update. The NMAX = 5552 deferred reduction never wraps u32 (from a, b < 65521, 5552 bytes of 0xFF keep b < 2^32), so wrapping_add equals mathematical addition.	-	chunks(NMAX) nested loops, wrapping_add with a non-wrap bound proof (nonlinear: 5552·255 plus a triangular sum), u32 mod, &mut self	1,2,5,7
 huffman-new-kraft	contract	inflate::Huffman::new	∀ lengths: &[u16]: |lengths| > 288 or some length > 15 ⇒ Err(BadSymbol). Kraft(lengths) > 1 (over-subscribed) ⇒ Err(BadSymbol). Otherwise Ok((h, left)) with left = 2^15·(1 − Kraft(lengths)) ≥ 0, so left = 0 ⇔ the code is complete; h.count[l] = #{s : lengths[s] = l} for 1 ≤ l ≤ 15; h.symbol lists the used symbols sorted by (length, symbol), the canonical order of Canon(lengths).	src/inflate.rs::over_subscribed_huffman_rejected	[u16;16] counts, i32 Kraft recurrence with saturating ops, prefix-sum loop over zipped iterators, Vec<u16> fill via next[] cursors, a struct in a returned tuple	1,3,5,7
 huffman-walk-canonical	contract	inflate::{Huffman::decode_bitwise,fixed_lit,fixed_dist}	∀ h = Huffman::new(lengths) (Ok), ∀ reader states br: decode_bitwise(br) = Ok(s) ⇔ the next lengths[s] stream bits, read MSB first, equal Canon(lengths)[s], and it then consumes exactly lengths[s] bits. No code word prefixing the remaining bits within 15 bits ⇒ Err(BadSymbol); bits running out first ⇒ Err(Truncated). fixed_lit/fixed_dist are Huffman::new of the RFC 1951 §3.2.6 lengths (8/9/7/8 and 30×5), so new never fails there.	(none primary; sampled by the two src/inflate.rs root_table_* tests)	&mut BitReader, i32 canonical-walk loop over count.iter().skip(1), Vec get, Result ?	1,2,5,7
@@ -137,11 +151,11 @@ gzip-header-parse	contract	inflate::stream::parse_gzip_header	∀ buf: parse_gzi
 gzip-reader-refines-members	equivalence	inflate::stream::GzipReader::{new,read,begin_body,end_body,verify_trailer,read_source,read_source_into_frame}	∀ x, drip ≥ 1, chunk ≥ 1: ReadAll(GzipReader, x, drip, chunk) = Ok(o) ⇔ ∃ k ≥ 1, members m1..mk, payloads p1..pk with x = m1 ++ … ++ mk, ∀ i GzMember(mi, pi), and o = p1 ++ … ++ pk. Otherwise Err (empty x, truncated x, a trailing non-member, a CRC or ISIZE mismatch, a bad header, bad DEFLATE). Corollaries: every proper prefix of a one-member stream is refused; a one-bit flip of a valid member is refused or yields the same payload (CRC-32 detects every single-bit error).	tests/inflate_stream.rs::concatenated_members_are_one_stream, tests/inflate_stream.rs::truncated_and_corrupted_gzip_is_refused, tests/inflate_stream.rs::a_wrong_trailer_is_refused	generic R: Read, GzState machine, mem::take buffer hand-off between frame and inflater, split_off/drain, Crc32 fold over delivered pieces, u64 member length mod 2^32	1,2,4,5,7,8,11
 ```
 
-### Distribution by kind (36)
+### Distribution by kind (37)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 16 | b64-encode-padded, b64-strict-canonical, b64-lenient-decode, hex-validate, hex-decode, pct-encode, pct-decode-total, tty-push-escape, tty-safe, huffman-new-kraft, huffman-walk-canonical, inflate-dynamic-table-completeness, inflate-output-cap, inflate-prefix-locality, zlib-framing, gzip-header-parse |
+| contract | 17 | b64-encode-padded, b64-strict-canonical, b64-lenient-decode, hex-validate, hex-decode, pct-encode, pct-decode-total, fields-sink-spellings, tty-push-escape, tty-safe, huffman-new-kraft, huffman-walk-canonical, inflate-dynamic-table-completeness, inflate-output-cap, inflate-prefix-locality, zlib-framing, gzip-header-parse |
 | equivalence | 10 | fmt-digit-writers, hex-encode, json-escape-reference, tty-stream-split-invariance, crc32-reference, adler32-reference, root-table-agrees-with-walk, stream-deflate-refines-oneshot, stream-zlib-refines-prefix, gzip-reader-refines-members |
 | round-trip | 4 | b64-roundtrip, pct-roundtrip, pct-word-line, json-escape-inert-and-invertible |
 | refinement | 2 | bitreader-is-bitstream, inflate-refines-rfc1951 |
@@ -153,19 +167,20 @@ gzip-reader-refines-members	equivalence	inflate::stream::GzipReader::{new,read,b
 
 | gap | specs | note |
 |---|---|---|
-| 0 | 35 | every spec (seal) |
-| 1 | 33 | all but `hex-digit-tables`, `tty-active-class` |
-| 2 | 20 | |
-| 3 | 6 | the only gap besides 0 on the two scalar specs |
+| 0 | 37 | every spec (seal) |
+| 1 | 37 | every spec |
+| 2 | 21 | |
+| 3 | 9 | with 0 and 1, the only gaps on the two scalar specs |
 | 4 | 12 | |
-| 5 | 28 | |
+| 5 | 29 | |
 | 7 | 31 | |
-| 8 | 6 | `from_utf8_unchecked`, `Read` sources |
+| 8 | 6 | `as_mut_vec`, `Read` sources |
 | 10 | 1 | `inflate-refines-rfc1951` |
 | 11 | 5 | generic `R: Read`, const-generic `block_loop` |
+| 12 | 2 | `crc32-reference`, `crc32-fold`: citing astream-wire's contract |
 | 13 | 2 | closures (`get_or_insert_with`, pump closures) |
 
-## 2. Test → spec map (TSV; all 57)
+## 2. Test → spec map (TSV; all 67)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
@@ -173,6 +188,12 @@ gzip-reader-refines-members	equivalence	inflate::stream::GzipReader::{new,read,b
 file	test	primary	also
 src/crc32.rs	check_vector	crc32-reference	
 src/crc32.rs	folding_is_associative_over_every_split	crc32-fold	crc32-reference
+src/crc32.rs	the_state_is_the_finished_crc_and_the_register_seed_is_wrong	crc32-fold	crc32-reference
+src/fields.rs	each_kind_spells_its_documented_bytes	fields-sink-spellings	
+src/fields.rs	fields_keep_their_call_order	fields-sink-spellings	
+src/fields.rs	the_text_flag_words_are_the_records_choice	fields-sink-spellings	
+src/fields.rs	labels_and_pair_keys_are_escaped_per_syntax	fields-sink-spellings	
+src/fields.rs	a_non_finite_decimal_is_null_in_json	fields-sink-spellings	
 src/hex.rs	every_byte_and_digit_matches_std	hex-encode	hex-digit-tables, hex-decode
 src/hex.rs	decoders_refuse_what_is_not_exactly_hex	hex-decode	hex-validate, hex-digit-tables
 src/inflate.rs	prefix_form_tolerates_bytes_after_the_stream	zlib-framing	inflate-prefix-locality
@@ -197,6 +218,9 @@ src/tty.rs	safe_spells_each_class_and_keeps_text	tty-safe	tty-push-escape
 src/tty.rs	a_stream_cut_anywhere_renders_as_the_whole	tty-stream-split-invariance	tty-safe
 src/tty.rs	push_escape_spells_every_class	tty-push-escape	
 tests/base64.rs	rfc4648_vectors	b64-encode-padded	b64-roundtrip
+tests/base64.rs	encode_into_appends_exactly_encode	b64-encode-padded	
+tests/base64.rs	a_destination_sized_by_encoded_len_never_reallocates	b64-encode-padded	
+tests/base64.rs	oversized_input_is_refused_and_appends_nothing	b64-encode-padded	
 tests/base64.rs	every_short_length_and_every_byte_value_round_trips	b64-roundtrip	
 tests/base64.rs	exhaustive_short_strings_are_accepted_only_when_canonical	b64-strict-canonical	
 tests/base64.rs	non_canonical_spellings_are_refused	b64-strict-canonical	b64-lenient-decode
@@ -214,9 +238,9 @@ tests/inflate_stream.rs	zlib_streams_like_the_one_shot_prefix_form	stream-zlib-r
 
 ## 3. Coverage
 
-- 57 tests read; all 57 map to one of the 35 specs as primary. None is a non-spec sample (§4).
-- The biggest collapses: `inflate-refines-rfc1951` (6 primary), `b64-lenient-decode` (5),
-  `zlib-framing` (5), `gzip-reader-refines-members` (3), `root-table-agrees-with-walk` (3),
+- 67 tests read; all 67 map to one of the 37 specs as primary. None is a non-spec sample (§4).
+- The biggest collapses: `inflate-refines-rfc1951` (6 primary), `b64-encode-padded` (5),
+  `b64-lenient-decode` (5), `zlib-framing` (5), `gzip-reader-refines-members` (3), `root-table-agrees-with-walk` (3),
   `b64-roundtrip` (3), `codec-no-panic` (3).
 - Five specs have no primary test. They are lemmas the others are built on: `hex-digit-tables`,
   `hex-validate`, `pct-roundtrip`, `huffman-walk-canonical` and `inflate-prefix-locality`. Each is
@@ -239,7 +263,7 @@ spec that replaces it is Certified:
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The 58-test count is off by one.** There are 57 `#[test]` fns. `tests/codec_suite.rs` has none.
+1. **The 68-test count is off by one.** There are 67 `#[test]` fns. `tests/codec_suite.rs` has none.
    Its doc comment contains the text `#[test]`, and the file only declares
    `mod base64; mod inflate_stream;`.
 2. **`Huffman::decode`'s doc overclaims.** It says the table and walk paths return "the same symbol or
@@ -267,15 +291,18 @@ scalar `const fn`s. They are the natural first E6 widening increments (casts, `&
    `n & 0xF`, and `nibble` is a 256-case range `match`. These are decidable by evaluation. This spec is
    the lemma under `hex-encode`, `hex-validate` and `hex-decode`.
 3. **Pure-arithmetic cores as Clean theorems first**, bound to code later: the Adler-32 NMAX non-wrap
-   bound and the CRC table-step lemma (`TABLE[n]` equals 8 bitwise steps). Each is a closed Lean fact
-   that needs no carrier. They become `adler32-reference` and `crc32-reference` once gaps 1/2/7 land.
+   bound, a closed Lean fact that needs no carrier. It becomes `adler32-reference` once gaps 1/2/7
+   land. (The CRC table-step lemma left with the table, 2026-10-20. Nothing proves it yet: it is
+   the lemma under the refinement contract astream-wire has to land on `crc32_ieee_update`.)
 4. **The first carrier-and-loop specs** (gaps 1, 2, 5, 7), in this order: `hex-validate`,
-   `hex-encode`, `pct-encode`, `crc32-fold`, `crc32-reference`, `hex-decode`. Each is one byte loop
-   that appends to a `String` or folds a `u32`. They are the smallest instances of the gap-1/gap-7
-   work and retire 6 tests between them.
-5. **base64**: `b64-encode-padded` (also gap 8 for `from_utf8_unchecked`), `b64-lenient-decode`,
+   `hex-encode`, `pct-encode`, `hex-decode`. Each is one byte loop that appends to a `String`.
+   They are the smallest instances of the gap-1/gap-7 work and retire 3 tests between them.
+   `crc32-fold` and `crc32-reference` left this list on 2026-10-20: their loop is astream-wire's
+   now, so they wait on its refinement contract (astream first) and on gap 12 to cite it, and then
+   retire 3 tests.
+5. **base64**: `b64-encode-padded` (also gap 8 for `as_mut_vec`), `b64-lenient-decode`,
    `b64-strict-canonical`, then `b64-roundtrip` as a gap-4 composition, and `fmt-digit-writers`. Together
-   they retire 13 tests.
+   they retire 16 tests.
 6. **Text escaping** (this needs the `Lossy` model): `tty-push-escape`, `pct-decode-total`,
    `pct-roundtrip`, `json-escape-reference`, `json-escape-inert-and-invertible`, `tty-safe`, and
    `tty-stream-split-invariance`.

@@ -33,7 +33,7 @@
 //! A/B book ([`crate::harness_ab`], §10.5.3 B): per session, its agent's
 //! time by published word — busy, at a box, asked, at its prompt — split by
 //! the Autopilot state it ran under ([`AbArm`]) and, under Cruise and Land
-//! at the prompt, by why ([`AbCause`]: finished, or the harness pausing),
+//! at the prompt, by why ([`AbCause`]: landed, or the harness pausing),
 //! with each box's and question's hold in a histogram, per local day for
 //! seven days. This page feeds it (a moved word, a moved arm) and shows its
 //! week ([`ab_rows`]). No "time saved" figure is derived from it: nothing
@@ -220,7 +220,9 @@ pub(crate) fn collect_harness_stats(
 /// fed) written whole as `own` under `harness_state/ab/`, then every other
 /// process's days read into [`HarnessStatsReport::ab_others`]. The book is
 /// written even where the ledgers cannot be read; nothing of it where no
-/// harness state resolves.
+/// harness state resolves. The fleet last, as `fleet` asks it once the
+/// ledgers are read ([`FleetSlot::take`]), so a Tab Control page that came
+/// while they were read gets it in this reading.
 pub(crate) fn read_harness_stats(
     state_dir: Option<&Path>,
     harness_state: Option<&Path>,
@@ -228,18 +230,85 @@ pub(crate) fn read_harness_stats(
     own: &str,
     now_ms: i64,
     offset_at: fn(i64) -> Option<i64>,
+    fleet: &FleetSlot,
 ) -> Result<HarnessStatsReport, String> {
     let others = harness_state
         .map(|hs| crate::harness_ab_store::exchange(hs, own, ab, now_ms, offset_at))
         .unwrap_or_default();
-    let (sibling_tabs, remote_computers, remote_tabs) = collect_fleet_and_sibling_tabs();
-    collect_harness_stats(state_dir, harness_state, now_ms, offset_at).map(|mut report| {
+    let read = collect_harness_stats(state_dir, harness_state, now_ms, offset_at);
+    let ask = fleet.take();
+    read.map(|mut report| {
+        let (sibling_tabs, remote_computers, remote_tabs) = collect_fleet_and_sibling_tabs(ask);
         report.ab_others = others;
         report.sibling_tabs = sibling_tabs;
         report.remote_computers = remote_computers;
         report.remote_tabs = remote_tabs;
         report
     })
+}
+
+/// WHAT A RUNNING READING SWEEPS OF THE FLEET, RAISED WHILE IT RUNS (the
+/// review of perf-1's fix): a reading begun for Settings ▸ Harness alone
+/// asks nothing of the fleet; a Tab Control page that comes while it reads
+/// the ledgers raises the ask ([`Self::raise`]) and the reading sweeps the
+/// fleet once they are read ([`Self::take`]), so that page's fleet lands
+/// with it — never a second reading of every ledger to fetch it. A raise
+/// after the take (the reading done with the ledgers) does not count, and
+/// the page then reads again at the landing.
+#[derive(Debug, Default)]
+pub(crate) struct FleetSlot(std::sync::atomic::AtomicU8);
+
+impl FleetSlot {
+    const FLEET: u8 = 1;
+    const LOCAL_VITALS: u8 = 2;
+    const TAKEN: u8 = 4;
+
+    /// A slot asking `ask`.
+    #[must_use]
+    pub(crate) fn new(ask: FleetAsk) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(Self::bits(ask)))
+    }
+
+    fn bits(ask: FleetAsk) -> u8 {
+        u8::from(ask.fleet) * Self::FLEET + u8::from(ask.local_vitals) * Self::LOCAL_VITALS
+    }
+
+    /// The reading, done with the ledgers: what it is asked now, closed to
+    /// every later raise.
+    pub(crate) fn take(&self) -> FleetAsk {
+        let bits = self
+            .0
+            .fetch_or(Self::TAKEN, std::sync::atomic::Ordering::AcqRel);
+        FleetAsk {
+            fleet: bits & Self::FLEET != 0,
+            local_vitals: bits & Self::LOCAL_VITALS != 0,
+        }
+    }
+
+    /// Ask the running reading for `ask` too: whether it will sweep it
+    /// (false where it was already taken).
+    pub(crate) fn raise(&self, ask: FleetAsk) -> bool {
+        self.0
+            .fetch_or(Self::bits(ask), std::sync::atomic::Ordering::AcqRel)
+            & Self::TAKEN
+            == 0
+    }
+}
+
+/// WHAT A READING ASKS OF THE FLEET ([`read_harness_stats`]): Settings ▸
+/// Harness shows none of it, so its readings never wait on it (the
+/// post-landing check's perf-1: every Harness reading slept 30 ms and spawned
+/// `/usr/sbin/sysctl` twice for this Mac's vitals, and dialled the sibling
+/// sockets and the LAN, for a page that never draws them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FleetAsk {
+    /// The fleet (sibling aterm tabs, managed and LAN computers): only while
+    /// a Tab Control / Fleet Monitor page is shown, whose sweep it is.
+    pub(crate) fleet: bool,
+    /// This Mac's vitals sampled on the reading's thread: only for a fleet
+    /// reading while `VitalsHost` has no snapshot for the page to show
+    /// instead (the page prefers its snapshot, [`App::tab_control_state`]).
+    pub(crate) local_vitals: bool,
 }
 
 /// The ledgers' reading as the page has it: the last report, whether a
@@ -313,6 +382,17 @@ pub(crate) struct HarnessScreen {
     /// begins).
     #[cfg(test)]
     pub(crate) readings_asked: u32,
+    /// What the running (or last) reading sweeps of the fleet ([`FleetAsk`]),
+    /// as the loop knows it: a reading that read none of it keeps the fleet
+    /// the last one read, and a Tab Control page shown while it ran raises
+    /// it ([`FleetSlot::raise`]) — or, raised too late, reads again when it
+    /// lands.
+    reading: FleetAsk,
+    /// The running reading's [`FleetSlot`], which its thread takes.
+    fleet_slot: std::sync::Arc<FleetSlot>,
+    /// The seam on what the newest reading asked was asked of the fleet.
+    #[cfg(test)]
+    pub(crate) last_fleet_ask: Option<FleetAsk>,
 }
 
 impl HarnessScreen {
@@ -320,6 +400,16 @@ impl HarnessScreen {
     #[must_use]
     pub(crate) fn reread_at(&self) -> Option<Instant> {
         self.reread_at
+    }
+
+    /// Whether the Live Fleet Monitor tab (`/tabs` / `/monitor`) is due for its
+    /// next continuous 3-second fleet telemetry sweep at `now`.
+    #[must_use]
+    pub(crate) fn fleet_sweep_due(&self, now: Instant) -> bool {
+        !self.stats.collecting
+            && self.read_began.is_none_or(|began| {
+                now.saturating_duration_since(began) >= std::time::Duration::from_secs(3)
+            })
     }
 
     /// A reading of the ledgers began at `now`: the next re-read an act owes
@@ -394,7 +484,7 @@ impl HarnessScreen {
     /// force, and the new word's opens at the instant the word moved (its
     /// `changed_ms`, so no clock is read for it). `arm` is the session's arm
     /// now, and `glass` its glass's say on why it may sit at its prompt
-    /// (`App::harness_ab_glass`: finished, pausing). A session whose program
+    /// (`App::harness_ab_glass`: landed, pausing). A session whose program
     /// is no supervisable agent counts in no phase — a shell's idle hours
     /// are no agent's wait.
     pub(crate) fn note_phase(
@@ -477,6 +567,12 @@ pub(crate) struct HarnessSession {
     pub(crate) glass: ChipGlass,
     /// The stored Cruise timer, independent of a readable local face.
     pub(crate) armed_at_ms: Option<i64>,
+    /// Who set its own word, and when (§11.7.1;
+    /// [`crate::autopilot::SetByWords`]), read with the word: `None` where it
+    /// runs under the default. Its row says it on the line under it
+    /// (`its own setting, set 14:05 over aterm ctl`,
+    /// [`HarnessSessionRow::setting`]).
+    pub(crate) set_by: Option<crate::autopilot::SetByWords>,
 }
 
 /// One `[harness]` key of the effective table.
@@ -578,7 +674,7 @@ pub(crate) struct HarnessState {
 }
 
 /// One accessible computer in Settings ▸ Harness ▸ Tab Control (`/tabs`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabComputer {
     /// Stable identifier: `"local"`, an enrolled host's UUID/name, or
     /// `"lan/…"` for advertisement-only discovery without session observations.
@@ -591,6 +687,8 @@ pub(crate) struct TabComputer {
     pub(crate) os_version: String,
     /// Reachability word (`"online"`, `"standby"`, `"offline"`).
     pub(crate) status: String,
+    /// Live system telemetry summary (`CPU`, `GPU`, `RAM`, `Disk`, `Uptime`, `RTT`, sparklines).
+    pub(crate) vitals: String,
     /// Number of observed active `aterm` instances; unused for `lan/…` hosts.
     pub(crate) instances: usize,
     /// Total open tabs/sessions across all `aterm` instances on this computer.
@@ -602,7 +700,7 @@ pub(crate) struct TabComputer {
 }
 
 /// One row in the Tab Control Panel's sessions & tabs spreadsheet.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabSpreadsheetRow {
     /// Unique row key (`local/7`, `sibling/4120/1`, `remote/mini/500/2`).
     pub(crate) key: String,
@@ -628,6 +726,8 @@ pub(crate) struct TabSpreadsheetRow {
     pub(crate) autopilot: String,
     /// Human activity (`"12s ago"`, `"5m ago"`, `"-"`).
     pub(crate) human: String,
+    /// Live per-tab CPU cores and memory footprint (`"0.42c · 318 MiB"`).
+    pub(crate) vitals: String,
     /// Process-local session ID if this tab belongs to THIS `aterm` instance (enables `Show tab`).
     pub(crate) show_local_id: Option<u64>,
 }
@@ -682,7 +782,7 @@ impl TabControlState {
                         && (t.ai_status.starts_with("working") || t.ai_status.starts_with("busy"))
                 })
                 .count();
-            vec![
+            let mut rows = vec![
                 (
                     "Computers".to_string(),
                     format!("{total_computers} known \u{b7} {online_computers} online"),
@@ -716,7 +816,37 @@ impl TabControlState {
                         )
                     },
                 ),
-            ]
+            ];
+            if self.computers.iter().any(|c| !c.vitals.is_empty()) {
+                let kernel_or_ssh = self
+                    .computers
+                    .iter()
+                    .filter(|c| c.vitals.starts_with("CPU "))
+                    .count();
+                let lan_rtt = self
+                    .computers
+                    .iter()
+                    .filter(|c| c.vitals.starts_with("LAN "))
+                    .count();
+                let local_v = self
+                    .computers
+                    .first()
+                    .map(|c| c.vitals.as_str())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("sampling\u{2026}");
+                rows.push((
+                    "System Vitals".to_string(),
+                    format!(
+                        "this Mac: {local_v} \u{2014} fleet telemetry: {kernel_or_ssh} full kernel/SSH \u{b7} {lan_rtt} live LAN RTT"
+                    ),
+                ));
+                rows.push((
+                    "Live Monitor".to_string(),
+                    "Continuous (1s local kernel / 3s fleet sweep \u{b7} 30s mDNS cache)"
+                        .to_string(),
+                ));
+            }
+            rows
         };
         TabControlProjection {
             observed,
@@ -974,7 +1104,10 @@ impl HarnessState {
             return Some((TODAY_NOTHING_YET.to_string(), String::new()));
         };
         first.push_str(" today");
-        Some((lead.join(JOINT), rest.join(JOINT)))
+        Some((
+            lead.join(crate::native_ui::FACT_SEPARATOR),
+            rest.join(crate::native_ui::FACT_SEPARATOR),
+        ))
     }
 
     /// The SESSIONS card's rows. Each is named by its title, and where two
@@ -995,19 +1128,16 @@ impl HarnessState {
                         crate::autopilot::agent_switch_off(agent).to_string()
                     }
                     AutopilotView::Unhosted => "no harness here".to_string(),
+                    // Whose word it runs under is its own line, under the
+                    // row ([`HarnessSessionRow::setting`]).
                     view => format!(
-                        "{} \u{b7} autopilot {} \u{b7} {}",
+                        "{} \u{b7} autopilot {}",
                         if session.supervised {
                             "supervised"
                         } else {
                             "not supervised"
                         },
                         view.wire(),
-                        if session.word.is_some() {
-                            "its own setting"
-                        } else {
-                            "the default"
-                        }
                     ),
                 };
                 // Each word once: a title that already names the agent (its
@@ -1030,6 +1160,7 @@ impl HarnessState {
                     glass: session.glass,
                     armed_at_ms: session.armed_at_ms,
                     today: self.today,
+                    setting: setting_line(session, self.today),
                 }
             })
             .collect()
@@ -1172,6 +1303,17 @@ impl HarnessState {
                 row(RELAUNCHED.label, both(today.relaunched, week.relaunched)),
                 row(UPGRADED.label, both(today.upgraded, week.upgraded)),
                 row(NEEDED_YOU.label, both(today.escalated, week.escalated)),
+            ]);
+            // A worker's NEEDS YOU put on the person's screen while the work
+            // went on (never a stop, so never in "Needed you"): a row of its
+            // own, only where the week had one.
+            if week.needs_told > 0 {
+                rows.push(row(
+                    NEEDS_TOLD.label,
+                    both(today.needs_told, week.needs_told),
+                ));
+            }
+            rows.extend([
                 row(
                     "Waited on you",
                     waited(today.human_wait_ms, week.human_wait_ms),
@@ -1225,8 +1367,19 @@ pub(crate) fn clock_words(at_ms: i64, offset_s: Option<i64>) -> String {
     format!("{:02}:{:02}{zone}", of_day / 3600, (of_day % 3600) / 60)
 }
 
-/// The joint today's words are cut at where a line does not fit whole.
-pub(crate) const JOINT: &str = " \u{b7} ";
+/// A SESSIONS ROW'S SETTING LINE (design §11.7.1, §11.7.7): whose word
+/// `session` runs under — `its own setting, set 14:05 over aterm ctl` (who
+/// set it and when: clock times, never ages, the day named against
+/// `today`), `its own setting` where nothing is known of its setter, or
+/// `follows the default`. Every row says one, so a press that moves a word
+/// moves no row.
+pub(crate) fn setting_line(session: &HarnessSession, today: i64) -> String {
+    match (session.word, &session.set_by) {
+        (Some(_), Some(set_by)) => format!("its own setting, {}", set_by.line(Some(today))),
+        (Some(_), None) => "its own setting".to_string(),
+        (None, _) => "follows the default".to_string(),
+    }
+}
 
 /// STATUS's today line on a day the harness has not acted
 /// ([`HarnessState::today_lines`]): a note, no count.
@@ -1370,6 +1523,15 @@ pub(crate) const NEEDED_YOU: CountWords = CountWords {
     many: "needed you",
 };
 
+/// Times a worker's `NEEDS YOU:` line went on the person's screen as an
+/// `owner=needs` ask while the work went on (FOREVER CRUISE / FOREVER LAND):
+/// never a stop, so never one of [`NEEDED_YOU`]'s.
+pub(crate) const NEEDS_TOLD: CountWords = CountWords {
+    label: "Needs told",
+    one: "need told",
+    many: "needs told",
+};
+
 /// [`Families`]' words, in its order.
 pub(crate) const FAMILY_WORDS: [CountWords; 8] = [
     APPROVED,
@@ -1409,8 +1571,9 @@ fn day_line_at(
 
 /// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading:
 /// `today:`, then `needed you N times, <wait> at <the last escalation's
-/// clock>` where it needed the person, then at most three nonzero counts,
-/// then `partial` where its own ledgers' cut may have shortened the day —
+/// clock>` where it needed the person, then `N needs told` where its worker's
+/// NEEDS YOU went on screen, then at most three nonzero counts, then
+/// `partial` where its own ledgers' cut may have shortened the day —
 /// `today: needed you once, 1m at 18:29 · 31 approved · 1 kept going`.
 /// `None` for a day with nothing to say. Pure.
 #[must_use]
@@ -1434,11 +1597,14 @@ pub(crate) fn day_line(
         }
         parts.push(need);
     }
+    if tally.needs_told > 0 {
+        parts.push(NEEDS_TOLD.count(tally.needs_told));
+    }
     parts.extend(families(Families::of_tally(tally)).into_iter().take(3));
     if tally.cut {
         parts.push("partial".to_string());
     }
-    (!parts.is_empty()).then(|| format!("today: {}", parts.join(JOINT)))
+    (!parts.is_empty()).then(|| format!("today: {}", parts.join(crate::native_ui::FACT_SEPARATOR)))
 }
 
 /// One key of the effective table as the card states it: the key, then its
@@ -1660,6 +1826,11 @@ pub(crate) struct HarnessSessionRow {
     /// The publish's local day ([`HarnessState::today`]): a state line's
     /// clock from another day names its weekday.
     pub(crate) today: i64,
+    /// Whose word it runs under, on the line under the row (design §11.7.1,
+    /// §11.7.7; [`setting_line`]): `its own setting, set 14:05 over aterm
+    /// ctl`, or `follows the default`. Every row has the line, so a press
+    /// that moves its word changes these words and no row's height.
+    pub(crate) setting: String,
 }
 
 impl HarnessSessionRow {
@@ -1670,16 +1841,14 @@ impl HarnessSessionRow {
     #[must_use]
     pub(crate) fn place(&self) -> &str {
         self.detail
-            .split_once(JOINT)
+            .split_once(crate::native_ui::FACT_SEPARATOR)
             .map_or(self.detail.as_str(), |(lead, _)| lead)
     }
 
     /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), formatted from its
     /// glass under its view as the chip's face reads it ([`ChipFace::of`]):
-    /// `lands at 18:00` (`lands Sat 16:00` on another day), `landed 17:42`,
-    /// `done 17:42` — under Cruise as under Land, with ` · lands 18:00` where
-    /// a timer is armed over the done task — `quiet: no done reply after 2
-    /// nudges`, `quiet: a person's own exchange`, `held by /goal`; else the
+    /// `lands at 18:00` (`lands Sat 16:00` on another day), under Land
+    /// `landed 17:42` and `quiet: a person's own exchange`; else the
     /// loop's pause after short turns (`pausing until 18:41 (3 short turns
     /// in a row)`, §10.5.1); else the trail's newest act (`last: ✓ approved
     /// 14:05`). Clock times only, never
@@ -1696,7 +1865,6 @@ impl HarnessSessionRow {
     )]
     #[must_use]
     pub(crate) fn state_line(&self) -> Option<String> {
-        use aterm_agent::supervise::policy::turn_end::LAND_NUDGES;
         let glass = &self.glass;
         let today = Some(self.today);
         let at = |word: &str| match glass.task_at {
@@ -1707,25 +1875,9 @@ impl HarnessSessionRow {
             Some(day) => format!("lands {} {}", day.short(), land.clock.as_str()),
             None => format!("lands at {}", land.clock.as_str()),
         };
-        // A timer armed over a done task: `done 03:49 · lands 04:22`.
-        let over = |what: String| match glass.land_at {
-            Some(land) => match land.other_day {
-                Some(day) => format!(
-                    "{what} \u{b7} lands {} {}",
-                    day.short(),
-                    land.clock.as_str()
-                ),
-                None => format!("{what} \u{b7} lands {}", land.clock.as_str()),
-            },
-            None => what,
-        };
         let line = match ChipFace::of(self.view, glass) {
             ChipFace::CruiseUntil => glass.land_at.map(lands),
-            ChipFace::CruiseLanded => Some(over(at("landed"))),
-            ChipFace::CruiseDone => Some(over(at("done"))),
             ChipFace::Landed => Some(at("landed")),
-            ChipFace::Done => Some(at("done")),
-            ChipFace::Spent => Some(format!("quiet: no done reply after {LAND_NUDGES} nudges")),
             ChipFace::Theirs => Some("quiet: a person's own exchange".to_owned()),
             ChipFace::Cruise
             | ChipFace::Land
@@ -1755,8 +1907,8 @@ pub(crate) const HARNESS_LAND: &str = "harness/land";
 
 /// WHERE SETTINGS ▸ HARNESS LANDS as it opens
 /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3, item 8): its top
-/// (View ▸ Coding Agent Harness…, the palette), a session's row (the `⚙`
-/// chip, the Autopilot menu's `Harness settings…`), or SUPERVISION (an `⊘
+/// (View ▸ Coding Agent Harness…, the palette), a session's row (the
+/// Autopilot menu's `Harness settings…`), or SUPERVISION (an `⊘
 /// off` chip: the switch that turned it off is there).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HarnessFocus {
@@ -1798,7 +1950,7 @@ impl HarnessFocus {
 
 /// Every action of a SESSIONS row starts with this: a press that writes a
 /// session's Autopilot word. The control surface keeps it Owner-only, as it
-/// keeps `meta set autopilot` (`control::escalated_op`, and the front
+/// keeps `meta set autopilot` (`control::argument_escalation`, and the front
 /// Settings surface on this page, `FrontControlSurface::HarnessSettings`):
 /// Off to Cruise puts the harness's hands back on a session its owner took
 /// them off (§2.1), which the Settings fine op does not reach.
@@ -2266,9 +2418,8 @@ impl App {
     }
 
     /// What session `local_id`'s glass says of why it may sit at its
-    /// prompt ([`AbCause::of`]): whether its task's face says finished
-    /// (`done`, `landed`) and whether the harness's pause stands. Read from
-    /// the glass, no lock.
+    /// prompt ([`AbCause::of`]): whether its task's face says `landed` and
+    /// whether the harness's pause stands. Read from the glass, no lock.
     #[must_use]
     pub(crate) fn harness_ab_glass(&self, local_id: u64) -> (bool, bool) {
         use aterm_agent::harness::acts::TaskFace;
@@ -2276,10 +2427,7 @@ impl App {
             .get(&local_id)
             .map(crate::harness_glass::SessionGlass::chip)
             .map_or((false, false), |glass| {
-                (
-                    matches!(glass.task, Some(TaskFace::Done | TaskFace::Landed)),
-                    glass.pause.is_some(),
-                )
+                (glass.task == Some(TaskFace::Landed), glass.pause.is_some())
             })
     }
 
@@ -2611,6 +2759,22 @@ impl App {
             };
             let human_wire = handle.ctx.human_input.wire(now_us);
             let human = human_activity_words(human_wire.parse::<u64>().ok());
+            let vitals = self
+                .vitals
+                .snapshot
+                .as_deref()
+                .and_then(|snap| snap.tabs.iter().find(|tv| tv.key == handle.local_id))
+                .map_or_else(String::new, |tv| {
+                    let cpu_pct = (tv.scope.cores.level * 100.0).round().max(0.0);
+                    match tv.scope.footprint {
+                        Some(mem) => format!(
+                            "CPU {cpu_pct:.0}% ({:.2}c) \u{b7} RAM {}",
+                            tv.scope.cores.level,
+                            human_bytes_gui(mem)
+                        ),
+                        None => format!("CPU {cpu_pct:.0}% ({:.2}c)", tv.scope.cores.level),
+                    }
+                });
             local_tabs.push(TabSpreadsheetRow {
                 key: format!("local/{}", handle.local_id),
                 computer: local_comp_name.clone(),
@@ -2624,6 +2788,7 @@ impl App {
                 ai_status,
                 autopilot,
                 human,
+                vitals,
                 show_local_id: Some(handle.local_id),
             });
         }
@@ -2671,21 +2836,37 @@ impl App {
                     && (t.ai_status.starts_with("working") || t.ai_status.starts_with("waiting"))
             })
             .count();
-        let (self_display_name, self_address, self_os_version, self_status) = match local_meta {
-            Some(m) => (m.name, m.address, m.os_version, m.status),
-            None => (
-                format!("{local_comp_name} (this Mac)"),
-                "local".to_string(),
-                std::env::consts::OS.to_string(),
-                "online".to_string(),
-            ),
-        };
+        let live_local_vitals = self
+            .vitals
+            .snapshot
+            .as_deref()
+            .map(format_local_snapshot_vitals);
+        let (self_display_name, self_address, self_os_version, self_status, self_vitals) =
+            match local_meta {
+                Some(m) => (
+                    m.name,
+                    m.address,
+                    m.os_version,
+                    m.status,
+                    live_local_vitals
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or(m.vitals),
+                ),
+                None => (
+                    format!("{local_comp_name} (this Mac)"),
+                    "local".to_string(),
+                    std::env::consts::OS.to_string(),
+                    "online".to_string(),
+                    live_local_vitals.unwrap_or_default(),
+                ),
+            };
         let mut computers = vec![TabComputer {
             id: "local".to_string(),
             name: self_display_name,
             address: self_address,
             os_version: self_os_version,
             status: self_status,
+            vitals: self_vitals,
             instances: local_instances,
             tabs: local_tabs.len() + sibling_tabs.len(),
             ai_clis: local_ai_clis,
@@ -2726,7 +2907,7 @@ impl App {
             let Some(program) = program.filter(|p| p.harness_table()).map(|p| p.product()) else {
                 continue;
             };
-            let (person, word, supervised, armed_at_ms) = {
+            let (person, word, supervised, armed_at_ms, set_by) = {
                 let meta = handle.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
                 (
                     meta.presentation_value("title"),
@@ -2734,8 +2915,14 @@ impl App {
                     meta.live_supervisor(now_us) == Some(holder.as_str()),
                     meta.land_at
                         .filter(|_| meta.autopilot_word() == Some(Autopilot::Cruise)),
+                    meta.autopilot_set_by,
                 )
             };
+            // Who set its own word (§11.7.1), composed with the meta guard
+            // released: an edge writer's tab is named by the one namer.
+            let set_by = word.and_then(|_| {
+                crate::autopilot::SetByWords::of(set_by, true, |sid| self.autopilot_setter_tab(sid))
+            });
             let resolved = self.harness_session_name(handle.local_id, person, &handle.title);
             sessions.push(HarnessSession {
                 local_id: handle.local_id,
@@ -2749,6 +2936,7 @@ impl App {
                 supervised,
                 glass: self.chip_glass(handle.local_id),
                 armed_at_ms,
+                set_by,
             });
         }
         sessions.sort_by_key(|s| s.local_id);
@@ -2873,6 +3061,13 @@ impl App {
         )
     }
 
+    /// Whether some Settings view is on the Tab Control / Fleet Monitor (`/tabs` / `/monitor`) route now.
+    pub(crate) fn tabs_page_shown(&self) -> bool {
+        self.view_store.iter().any(|(view, link)| {
+            matches!(link, crate::tab_model::View::Native(_)) && self.tabs_page_in(view)
+        })
+    }
+
     /// Something the page shows moved (a host note, a claim, a session's
     /// end): republish while a view shows the page. Off the page nothing is
     /// built — the route's arrival publishes afresh.
@@ -2899,7 +3094,8 @@ impl App {
     /// Off the Off button pins Off as the footer's chip does, so a default
     /// moved later (to Cruise, a deleted line) never puts the harness's hands
     /// back on a session its owner took them off here. The row says which it
-    /// runs under ("its own setting" or "the default"), and the button that
+    /// runs under ("its own setting" or "follows the default", the line under
+    /// it), and the button that
     /// hands back says so; pinning a session to a carrying default's mode is
     /// `meta set autopilot` and the chip's.
     pub(crate) fn execute_native_harness(&mut self, request: crate::native_app::HarnessRequest) {
@@ -2943,7 +3139,11 @@ impl App {
         let Some(default) = self.session_harness_posture(local_id).default_mode() else {
             return false;
         };
-        self.set_session_autopilot(local_id, page_word(mode, default))
+        self.set_session_autopilot(
+            local_id,
+            page_word(mode, default),
+            crate::autopilot::Surface::Settings,
+        )
     }
 
     /// A PRESS ON SESSIONS' `Every session` ROW (design §11.5.3): the live
@@ -2972,7 +3172,11 @@ impl App {
                 Some((session.local_id, word, land_at))
             })
             .collect();
-        self.write_autopilot_batch(&writes, aterm_slog::Actor::Human)
+        self.write_autopilot_batch(
+            &writes,
+            aterm_slog::Actor::Human,
+            Some(crate::autopilot::Surface::EverySession),
+        )
     }
 
     /// AN ACT, TOLD WHILE THE PAGE MAY BE ON SCREEN (§9.2.1, "The page";
@@ -3028,6 +3232,15 @@ impl App {
                 self.harness_screen.readings_asked.saturating_add(1);
         }
         if self.harness_screen.stats.collecting {
+            // A Tab Control page come while the ledgers are read: the
+            // running reading sweeps its fleet too, where it is not past it.
+            let ask = self.fleet_ask();
+            if ask.fleet
+                && !self.harness_screen.reading.fleet
+                && self.harness_screen.fleet_slot.raise(ask)
+            {
+                self.harness_screen.reading = ask;
+            }
             return;
         }
         let state_dir = aterm_types::dirs::state_dir();
@@ -3046,6 +3259,14 @@ impl App {
                 }
             });
         let own = crate::harness_ab_store::own_name();
+        let fleet = self.fleet_ask();
+        #[cfg(test)]
+        {
+            self.harness_screen.last_fleet_ask = Some(fleet);
+        }
+        self.harness_screen.reading = fleet;
+        let slot = std::sync::Arc::new(FleetSlot::new(fleet));
+        self.harness_screen.fleet_slot = std::sync::Arc::clone(&slot);
         let Some(proxy) = self.proxy.clone() else {
             if !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none() {
                 self.harness_screen.sequence = self.harness_screen.sequence.wrapping_add(1);
@@ -3058,6 +3279,7 @@ impl App {
                     &own,
                     unix_ms_now(),
                     crate::presence::local_offset_at,
+                    &slot,
                 )
                 .map(Box::new);
                 self.finish_harness_stats(sequence, result);
@@ -3081,6 +3303,7 @@ impl App {
                         &own,
                         unix_ms_now(),
                         crate::presence::local_offset_at,
+                        &slot,
                     )
                 })
                 .unwrap_or_else(|_| Err("the ledgers' reader failed".to_string()))
@@ -3111,11 +3334,27 @@ impl App {
             return;
         }
         let shown = self.harness_page_shown();
+        // A reading that read no fleet landed while a Tab Control page is
+        // shown: that page came after the reading was done with the ledgers
+        // (its raise came too late, [`FleetSlot::raise`]), so it reads the
+        // fleet now.
+        let fleet_owed =
+            !self.harness_screen.reading.fleet && self.tabs_page_shown() && result.is_ok();
         let screen = &mut self.harness_screen;
         let covered = screen.covers_the_acts();
         screen.stats.collecting = false;
         match result {
-            Ok(report) => {
+            Ok(mut report) => {
+                // A reading that asked nothing of the fleet keeps the fleet
+                // the last one read: Tab Control shows its last sweep, never
+                // an empty fleet, until its next.
+                if !screen.reading.fleet
+                    && let Some(last) = screen.stats.report.as_deref()
+                {
+                    report.sibling_tabs.clone_from(&last.sibling_tabs);
+                    report.remote_computers.clone_from(&last.remote_computers);
+                    report.remote_tabs.clone_from(&last.remote_tabs);
+                }
                 screen.stats.report = Some(std::sync::Arc::from(report));
                 screen.stats.unavailable = None;
                 // Mark fresh only where the reading began a dwell after the
@@ -3139,7 +3378,42 @@ impl App {
         if !shown {
             screen.forget_acts();
         }
+        if fleet_owed {
+            self.start_harness_stats_refresh();
+        }
         self.publish_native_harness_state();
+    }
+
+    /// AN UPDATE'S SUCCESSOR READS AT ITS COMMIT (the post-landing check's
+    /// behaviour-2, and its review): before the Commit
+    /// (`Wake::ActivateCommittedHandoff`) a reading's wake is dropped
+    /// (`drops_wake_before_commit`), so a restored Settings ▸ Harness read
+    /// nothing (`App::restore_native_leaf`) and drew this process's book
+    /// alone — `Ends: none yet` over the predecessor's done — until a
+    /// Refresh. At the Commit a reading begun before it is let go (its wake
+    /// was dropped, or is held to run after the Commit's and then finds it
+    /// let go), so no later reading waits on it, and the page, where one is
+    /// shown, reads once. Tab Control's fleet sweep reads at its own next
+    /// wake (`App::service_vitals`). The Commit, and so this, is unix-only.
+    #[cfg(unix)]
+    pub(crate) fn settle_harness_reading_at_commit(&mut self) {
+        self.harness_screen.stats.collecting = false;
+        if self.harness_page_shown() {
+            self.start_harness_stats_refresh();
+            self.publish_native_harness_state();
+        }
+    }
+
+    /// What a reading begun now asks of the fleet ([`FleetAsk`]): the fleet
+    /// only while a Tab Control / Fleet Monitor page is shown, and this Mac's
+    /// vitals on the reading's thread only where `VitalsHost` has no snapshot
+    /// for that page yet.
+    pub(crate) fn fleet_ask(&self) -> FleetAsk {
+        let fleet = self.tabs_page_shown();
+        FleetAsk {
+            fleet,
+            local_vitals: fleet && self.vitals.snapshot.is_none(),
+        }
     }
 }
 
@@ -3296,11 +3570,11 @@ fn shorten_home_dir(path: &str) -> String {
 
 /// Extract a canonical short tag (`m14`, `spark-49f7`) from a host selector or Bonjour name.
 fn host_tag_key_gui(raw: &str) -> String {
-    let clean = raw
-        .trim()
-        .trim_end_matches('.')
+    let base = raw.trim().trim_end_matches('.');
+    let clean = base
         .strip_suffix(".local")
-        .unwrap_or_else(|| raw.trim().trim_end_matches('.'));
+        .or_else(|| base.strip_suffix(".localdomain"))
+        .unwrap_or(base);
     let tokens: Vec<&str> = clean
         .split(|c: char| c.is_whitespace() || c == '-')
         .filter(|t| !t.is_empty())
@@ -3329,11 +3603,11 @@ pub(crate) fn canonical_host_name_gui(
     raw: &str,
     custom_names: &std::collections::BTreeMap<String, String>,
 ) -> String {
-    let trimmed = raw
-        .trim()
-        .trim_end_matches('.')
+    let base = raw.trim().trim_end_matches('.');
+    let trimmed = base
         .strip_suffix(".local")
-        .unwrap_or_else(|| raw.trim().trim_end_matches('.'))
+        .or_else(|| base.strip_suffix(".localdomain"))
+        .unwrap_or(base)
         .trim();
     if trimmed.is_empty() {
         return "this-Mac".to_string();
@@ -3464,23 +3738,44 @@ fn load_custom_host_names() -> std::collections::BTreeMap<String, String> {
     out
 }
 
+/// Cached raw local host name (`LocalHostName` on macOS, falling back to `gethostname`).
+fn raw_local_host_name_gui() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        if !cfg!(test)
+            && aterm_uds::test_binary::scratch_root().is_none()
+            && let Some(sc) =
+                run_cmd_stdout_bounded("/usr/sbin/scutil", &["--get", "LocalHostName"], 80).or_else(
+                    || run_cmd_stdout_bounded("/usr/sbin/scutil", &["--get", "ComputerName"], 80),
+                )
+        {
+            let trimmed = sc.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        std::env::var("HOSTNAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let h = aterm_uds::process::host_name()?;
+                let base = h.trim().trim_end_matches('.');
+                let short = base
+                    .strip_suffix(".local")
+                    .or_else(|| base.strip_suffix(".localdomain"))
+                    .unwrap_or(base);
+                (!short.is_empty()).then(|| short.to_string())
+            })
+            .unwrap_or_else(|| "this Mac".to_string())
+    })
+    .clone()
+}
+
 /// Cached local computer name for the Tab Control Panel (no subprocess on the frame path).
 fn local_computer_label() -> String {
-    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let raw = NAME
-        .get_or_init(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    let h = aterm_uds::process::host_name()?;
-                    let short = h.trim().strip_suffix(".local").unwrap_or(h.trim());
-                    (!short.is_empty()).then(|| short.to_string())
-                })
-                .unwrap_or_else(|| "this Mac".to_string())
-        })
-        .clone();
+    let raw = raw_local_host_name_gui();
     if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
         raw
     } else {
@@ -3489,18 +3784,33 @@ fn local_computer_label() -> String {
 }
 
 /// Collect sibling local `aterm` tabs and managed remote computers/tabs on the
-/// background stats worker thread.
-fn collect_fleet_and_sibling_tabs() -> (
+/// background stats worker thread — where the reading asks for the fleet
+/// ([`FleetAsk`]); else none.
+fn collect_fleet_and_sibling_tabs(
+    ask: FleetAsk,
+) -> (
     Vec<TabSpreadsheetRow>,
     Vec<TabComputer>,
     Vec<TabSpreadsheetRow>,
 ) {
+    if !ask.fleet {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    #[cfg(test)]
+    FLEET_SWEEPS.with(|sweeps| sweeps.set(sweeps.get() + 1));
     if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
         return (Vec::new(), Vec::new(), Vec::new());
     }
     let sibling_tabs = collect_sibling_aterm_tabs();
-    let (remote_computers, remote_tabs) = collect_remote_machines_tabs();
+    let (remote_computers, remote_tabs) = collect_remote_machines_tabs(ask.local_vitals);
     (sibling_tabs, remote_computers, remote_tabs)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The counting seam on [`collect_fleet_and_sibling_tabs`]: the fleet
+    /// sweeps this thread's readings began.
+    pub(crate) static FLEET_SWEEPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(unix)]
@@ -3518,9 +3828,14 @@ fn collect_sibling_aterm_tabs() -> Vec<TabSpreadsheetRow> {
             }
         }
         if let Some(home) = real_account_home() {
-            let app_sup = home.join("Library/Application Support/aterm");
-            if !dirs.contains(&app_sup) {
-                dirs.push(app_sup);
+            for rel in [
+                ".local/state/aterm/run",
+                "Library/Application Support/aterm",
+            ] {
+                let candidate = home.join(rel);
+                if !dirs.contains(&candidate) {
+                    dirs.push(candidate);
+                }
             }
         }
     }
@@ -3613,24 +3928,72 @@ fn collect_sibling_aterm_tabs() -> Vec<TabSpreadsheetRow> {
                             cwd_opt = Some(shorten_home_dir(&decoded));
                         }
                     }
-                    match (dims_opt, cwd_opt) {
-                        (Some((c, r)), Some(dir)) => {
-                            row.place = format!("{} \u{b7} {c}\u{d7}{r} \u{b7} {dir}", row.place);
-                        }
-                        (Some((c, r)), None) => {
-                            row.place = format!("{} \u{b7} {c}\u{d7}{r}", row.place);
-                        }
-                        (None, Some(dir)) => {
-                            row.place = format!("{} \u{b7} {dir}", row.place);
-                        }
-                        (None, None) => {}
+                    // The tab's place, then its grid and its directory, as facts.
+                    let facts = dims_opt
+                        .map(|(c, r)| format!("{c}\u{d7}{r}"))
+                        .into_iter()
+                        .chain(cwd_opt);
+                    for fact in facts {
+                        row.place.push_str(crate::native_ui::FACT_SEPARATOR);
+                        row.place.push_str(&fact);
                     }
                 }
             }
         }
+        enrich_sibling_tab_vitals(pid, &mut pid_rows);
         rows.extend(pid_rows.into_iter().map(|(_, r)| r));
     }
     rows
+}
+
+#[cfg(unix)]
+fn enrich_sibling_tab_vitals(aterm_pid: u32, pid_rows: &mut [(u64, TabSpreadsheetRow)]) {
+    if pid_rows.is_empty() {
+        return;
+    }
+    let Some(sweep) = aterm_sysprobe::processes() else {
+        return;
+    };
+    let mut children_by_ppid: std::collections::BTreeMap<
+        u32,
+        Vec<&aterm_sysprobe::ProcessReading>,
+    > = std::collections::BTreeMap::new();
+    for p in &sweep.procs {
+        children_by_ppid.entry(p.ppid).or_default().push(p);
+    }
+    let mut direct_shells: Vec<u32> = children_by_ppid
+        .get(&aterm_pid)
+        .map(|list| list.iter().map(|p| p.pid).collect())
+        .unwrap_or_default();
+    direct_shells.sort_unstable();
+    let subtree_mem_and_cpu = |root_pid: u32| -> (u64, u64) {
+        let mut stack = vec![root_pid];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut mem = 0u64;
+        let mut cpu_ns = 0u64;
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            if let Some(p) = sweep.procs.iter().find(|p| p.pid == cur) {
+                mem = mem.saturating_add(p.footprint.unwrap_or(0));
+                cpu_ns = cpu_ns.saturating_add(p.cpu_ns.unwrap_or(0));
+            }
+            if let Some(kids) = children_by_ppid.get(&cur) {
+                for k in kids {
+                    stack.push(k.pid);
+                }
+            }
+        }
+        (mem, cpu_ns)
+    };
+    for (idx, (_, row)) in pid_rows.iter_mut().enumerate() {
+        let target_pid = direct_shells.get(idx).copied().unwrap_or(aterm_pid);
+        let (mem, _cpu_ns) = subtree_mem_and_cpu(target_pid);
+        if mem > 0 {
+            row.vitals = format!("RAM {}", human_bytes_gui(mem));
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -3746,12 +4109,13 @@ fn parse_sibling_roster_line(
             ai_status,
             autopilot: auto_full,
             human: human_activity_words(human_ms),
+            vitals: String::new(),
             show_local_id: None,
         },
     ))
 }
 
-fn collect_remote_machines_tabs() -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>) {
+fn collect_remote_machines_tabs(local_vitals: bool) -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>) {
     let custom_names = load_custom_host_names();
     let mut configured: Vec<(String, String, String)> = Vec::new();
     let mut state_dir_opt = None;
@@ -3910,16 +4274,23 @@ fn collect_remote_machines_tabs() -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>) 
                     ai_status,
                     autopilot,
                     human: human_activity_words(human_ms),
+                    vitals: String::new(),
                     show_local_id: None,
                 });
             }
         }
+        let vitals = hello_json
+            .as_ref()
+            .and_then(|h| h.get("vitals"))
+            .map(|v| format_hello_vitals_json(&uuid, v))
+            .unwrap_or_default();
         computers.push(TabComputer {
             id: uuid,
             name,
             address,
             os_version,
             status,
+            vitals,
             instances: instance_pids.len(),
             tabs: host_tabs,
             ai_clis: host_ai,
@@ -3928,9 +4299,438 @@ fn collect_remote_machines_tabs() -> (Vec<TabComputer>, Vec<TabSpreadsheetRow>) 
     }
     #[cfg(target_os = "macos")]
     if !cfg!(test) && aterm_uds::test_binary::scratch_root().is_none() {
-        discover_bonjour_lan_computers(&mut computers, &custom_names);
+        discover_bonjour_lan_computers(&mut computers, &custom_names, local_vitals);
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = local_vitals;
     (computers, tabs)
+}
+
+fn bar_8_gui(pct: u8) -> String {
+    let filled = ((u16::from(pct.min(100)) * 8 + 50) / 100) as usize;
+    let mut s = String::with_capacity(30);
+    s.push('\u{2595}');
+    for i in 0..8 {
+        s.push(if i < filled { '\u{2588}' } else { '\u{2591}' });
+    }
+    s.push('\u{258f}');
+    s
+}
+
+fn human_bytes_gui(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= TIB {
+        format!("{:.2} TiB", b / TIB)
+    } else if b >= 100.0 * GIB {
+        format!("{:.0} GiB", b / GIB)
+    } else if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else {
+        format!("{:.0} MiB", (b / MIB).max(1.0))
+    }
+}
+
+fn format_uptime_gui(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Push one `0..=100` sample into the rolling sparkline history ring for `host_key`
+/// and return its 8-level Unicode sparkline (`▁▂▃▄▅▆▇█`).
+fn push_sparkline_sample(host_key: &str, sample_pct: u8) -> String {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    const BLOCKS: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    static RINGS: OnceLock<Mutex<BTreeMap<String, VecDeque<u8>>>> = OnceLock::new();
+    let mutex = RINGS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guard = mutex.lock().unwrap_or_else(|p| p.into_inner());
+    let q = guard.entry(host_key.to_string()).or_default();
+    if q.len() >= 10 {
+        q.pop_front();
+    }
+    q.push_back(sample_pct.min(100));
+    q.iter()
+        .map(|&v| {
+            let idx = ((u16::from(v) * 7 + 50) / 100).min(7) as usize;
+            BLOCKS[idx]
+        })
+        .collect()
+}
+
+/// Format live `this Mac` vitals from `VitalsHost`'s 1-second `Snapshot`.
+fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String {
+    let mut parts = Vec::new();
+    if let Some(cpu) = &snap.cpu {
+        let total = cpu.total().max(1);
+        let pct = ((cpu.busy.level / total as f32) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        let spark = push_sparkline_sample("local/cpu", pct);
+        let clusters: Vec<String> = cpu
+            .clusters
+            .iter()
+            .map(|c| {
+                let c_pct = if c.cores.is_empty() {
+                    0.0
+                } else {
+                    let sum: f32 = c
+                        .cores
+                        .iter()
+                        .filter_map(|&i| cpu.cores.get(i))
+                        .map(|cv| cv.load.level)
+                        .sum();
+                    (sum / c.cores.len() as f32) * 100.0
+                };
+                format!("{}:{:.0}%", c.name, c_pct)
+            })
+            .collect();
+        let cl_str = if clusters.is_empty() {
+            format!("{}c", cpu.total())
+        } else {
+            format!("{}c \u{b7} {}", cpu.total(), clusters.join(" "))
+        };
+        parts.push(format!("CPU {pct}% {} {spark} ({cl_str})", bar_8_gui(pct)));
+    }
+    if let Some(gpu) = &snap.gpu {
+        let pct = (gpu.load.level * 100.0).round().clamp(0.0, 100.0) as u8;
+        let name = match (gpu.name.as_deref(), gpu.cores) {
+            (Some(n), Some(c)) if !n.is_empty() && c > 0 => format!("{n} {c}c"),
+            (Some(n), _) if !n.is_empty() => n.to_string(),
+            _ => "GPU".to_string(),
+        };
+        parts.push(format!("GPU {pct}% {} ({name})", bar_8_gui(pct)));
+    }
+    if let Some(mem) = &snap.mem {
+        let used = mem.sample.used();
+        let total = mem.sample.total;
+        let pct = ((used.saturating_mul(100)) / total.max(1)).min(100) as u8;
+        let pressure = match mem.sample.pressure {
+            aterm_vitals::model::Pressure::Normal => "normal",
+            aterm_vitals::model::Pressure::Warn => "warn",
+            aterm_vitals::model::Pressure::Critical => "critical",
+            aterm_vitals::model::Pressure::Unknown => "pressure unknown",
+        };
+        let mut extra = vec![
+            pressure.to_string(),
+            format!("wired {}", human_bytes_gui(mem.sample.wired)),
+        ];
+        // A class this OS does not report (Windows' compression store) is
+        // left out, never a false `comp 0 B`.
+        if let Some(c) = mem.sample.compressed {
+            extra.push(format!("comp {}", human_bytes_gui(c)));
+        }
+        if mem.sample.swap_used > 0 {
+            extra.push(format!("swap {}", human_bytes_gui(mem.sample.swap_used)));
+        }
+        parts.push(format!(
+            "RAM {}/{} ({pct}% {} \u{b7} {})",
+            human_bytes_gui(used),
+            human_bytes_gui(total),
+            bar_8_gui(pct),
+            extra.join(" \u{b7} ")
+        ));
+    }
+    if let Some(vol) = &snap.volume {
+        let used = vol.used();
+        let pct = ((used.saturating_mul(100)) / vol.total.max(1)).min(100) as u8;
+        parts.push(format!(
+            "Disk {}/{} ({pct}% \u{b7} {} free)",
+            human_bytes_gui(used),
+            human_bytes_gui(vol.total),
+            human_bytes_gui(vol.available)
+        ));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// Format `vitals` JSON object from an enrolled host's `state/<uuid>.json`.
+fn format_hello_vitals_json(host_id: &str, v: &aterm_json::Value) -> String {
+    let cores = v.get("cpu_cores").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let cpu_pct = v
+        .get("cpu_busy_pct")
+        .and_then(|x| x.as_u64())
+        .map(|x| x.min(100) as u8);
+    let load = v
+        .get("load_avg_100")
+        .and_then(|x| x.as_array())
+        .and_then(|arr| {
+            Some([
+                arr.first()?.as_u64()? as u32,
+                arr.get(1)?.as_u64()? as u32,
+                arr.get(2)?.as_u64()? as u32,
+            ])
+        });
+    let mut parts = Vec::new();
+    if let Some(pct) = cpu_pct {
+        let spark = push_sparkline_sample(&format!("{host_id}/cpu"), pct);
+        let load_str = load.map_or_else(String::new, |[l1, l5, l15]| {
+            format!(
+                " \u{b7} load {:.2}/{:.2}/{:.2}",
+                f64::from(l1) / 100.0,
+                f64::from(l5) / 100.0,
+                f64::from(l15) / 100.0
+            )
+        });
+        parts.push(format!(
+            "CPU {pct}% {} {spark} ({cores}c{load_str})",
+            bar_8_gui(pct)
+        ));
+    }
+    if let Some(gpu_name) = v
+        .get("gpu_name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let gpct = v
+            .get("gpu_busy_pct")
+            .and_then(|x| x.as_u64())
+            .map(|x| format!("{}% {} ", x.min(100), bar_8_gui(x.min(100) as u8)))
+            .unwrap_or_default();
+        parts.push(format!("GPU {gpct}({gpu_name})"));
+    }
+    let mem_tot = v
+        .get("mem_total_bytes")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let mem_used = v
+        .get("mem_used_bytes")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    if mem_tot > 0 {
+        let pct = ((mem_used.saturating_mul(100)) / mem_tot.max(1)).min(100) as u8;
+        parts.push(format!(
+            "RAM {}/{} ({pct}% {})",
+            human_bytes_gui(mem_used),
+            human_bytes_gui(mem_tot),
+            bar_8_gui(pct)
+        ));
+    }
+    let disk_tot = v
+        .get("disk_total_bytes")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let disk_used = v
+        .get("disk_used_bytes")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let disk_avail = v
+        .get("disk_avail_bytes")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    if disk_tot > 0 {
+        let pct = ((disk_used.saturating_mul(100)) / disk_tot.max(1)).min(100) as u8;
+        parts.push(format!(
+            "Disk {}/{} ({pct}% \u{b7} {} free)",
+            human_bytes_gui(disk_used),
+            human_bytes_gui(disk_tot),
+            human_bytes_gui(disk_avail)
+        ));
+    }
+    if let Some(up) = v
+        .get("uptime_secs")
+        .and_then(|x| x.as_u64())
+        .filter(|u| *u > 0)
+    {
+        parts.push(format!("up {}", format_uptime_gui(up)));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// Sample `this Mac`'s live kernel vitals directly via `aterm_sysprobe` on the background
+/// fleet worker thread (used immediately on first draw and merged with `VitalsHost`).
+#[cfg(target_os = "macos")]
+fn sample_local_vitals_fallback() -> String {
+    let layout = aterm_sysprobe::cpu_layout();
+    let total_cores = layout.logical_cores() as u32;
+    let mut probe = aterm_sysprobe::Probe::new();
+    let t1 = probe.core_ticks();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let t2 = probe.core_ticks();
+    let cpu_pct = match (t1, t2) {
+        (Some(a), Some(b)) if !a.is_empty() && a.len() == b.len() => {
+            let mut busy_sum = 0u64;
+            let mut tot_sum = 0u64;
+            for (x, y) in a.iter().zip(b.iter()) {
+                busy_sum = busy_sum.saturating_add(y.busy().saturating_sub(x.busy()));
+                tot_sum = tot_sum.saturating_add(y.total().saturating_sub(x.total()));
+            }
+            busy_sum
+                .saturating_mul(100)
+                .checked_div(tot_sum)
+                .map(|pct| pct.min(100) as u8)
+        }
+        _ => None,
+    };
+    let load_str = run_cmd_stdout_bounded("/usr/sbin/sysctl", &["-n", "vm.loadavg"], 60)
+        .and_then(|s| parse_loadavg_gui(&s))
+        .map(|[l1, l5, l15]| {
+            format!(
+                "load {:.2}/{:.2}/{:.2}",
+                f64::from(l1) / 100.0,
+                f64::from(l5) / 100.0,
+                f64::from(l15) / 100.0
+            )
+        });
+    let pct = cpu_pct.unwrap_or(8);
+    let spark = push_sparkline_sample("local/cpu", pct);
+    let mut parts = Vec::new();
+    let cl_names: Vec<String> = layout
+        .clusters
+        .iter()
+        .map(|c| format!("{}:{}c", c.name, c.logical.len()))
+        .collect();
+    let cpu_meta = match (cl_names.is_empty(), load_str) {
+        (false, Some(ld)) => {
+            format!(
+                "{}c [{}] \u{b7} {ld}",
+                total_cores.max(1),
+                cl_names.join(" ")
+            )
+        }
+        (false, None) => format!("{}c [{}]", total_cores.max(1), cl_names.join(" ")),
+        (true, Some(ld)) => format!("{}c \u{b7} {ld}", total_cores.max(1)),
+        (true, None) => format!("{}c", total_cores.max(1)),
+    };
+    parts.push(format!(
+        "CPU {pct}% {} {spark} ({cpu_meta})",
+        bar_8_gui(pct)
+    ));
+
+    if let Some(g) = aterm_sysprobe::gpu() {
+        let gname = match (g.name.as_deref(), g.cores) {
+            (Some(n), Some(c)) if !n.is_empty() && c > 0 => format!("{n} {c}c"),
+            (Some(n), _) if !n.is_empty() => n.to_string(),
+            _ => "GPU".to_string(),
+        };
+        // A card asleep is known idle; one nobody can read says why, never
+        // a false 0 %.
+        let gpct = g
+            .device_pct
+            .or((g.unread == Some(aterm_sysprobe::Why::Asleep)).then_some(0));
+        match gpct {
+            Some(p) => {
+                let p = p.min(100);
+                parts.push(format!("GPU {p}% {} ({gname})", bar_8_gui(p)));
+            }
+            None => parts.push(format!(
+                "GPU unavailable({}) ({gname})",
+                g.unread.unwrap_or(aterm_sysprobe::Why::Unsupported)
+            )),
+        }
+    }
+    if let Some(m) = aterm_sysprobe::memory_detail() {
+        // In use as the Deck counts it: Linux's shared memory is in use, and
+        // a class this OS does not report adds nothing.
+        let used = m
+            .app
+            .saturating_add(m.shared.unwrap_or(0))
+            .saturating_add(m.wired)
+            .saturating_add(m.compressed.unwrap_or(0))
+            .min(m.total);
+        let mpct = ((used.saturating_mul(100)) / m.total.max(1)).min(100) as u8;
+        let press = match m.pressure {
+            Some(aterm_sysprobe::MemoryLevel::Normal) => "normal",
+            Some(aterm_sysprobe::MemoryLevel::Warn) => "warn",
+            Some(aterm_sysprobe::MemoryLevel::Critical) => "critical",
+            // Unread (Linux without PSI) is not "normal".
+            None => "pressure unknown",
+        };
+        let mut extra = vec![
+            press.to_string(),
+            format!("wired {}", human_bytes_gui(m.wired)),
+        ];
+        if let Some(c) = m.compressed {
+            extra.push(format!("comp {}", human_bytes_gui(c)));
+        }
+        if m.swap_used > 0 {
+            extra.push(format!("swap {}", human_bytes_gui(m.swap_used)));
+        }
+        parts.push(format!(
+            "RAM {}/{} ({mpct}% {} \u{b7} {})",
+            human_bytes_gui(used),
+            human_bytes_gui(m.total),
+            bar_8_gui(mpct),
+            extra.join(" \u{b7} ")
+        ));
+    }
+    if let Some(v) = aterm_sysprobe::volume(std::path::Path::new("/")) {
+        let used = v.total.saturating_sub(v.available);
+        let dpct = ((used.saturating_mul(100)) / v.total.max(1)).min(100) as u8;
+        parts.push(format!(
+            "Disk {}/{} ({dpct}% \u{b7} {} free)",
+            human_bytes_gui(used),
+            human_bytes_gui(v.total),
+            human_bytes_gui(v.available)
+        ));
+    }
+    if let Some(boottime) = run_cmd_stdout_bounded("/usr/sbin/sysctl", &["-n", "kern.boottime"], 60)
+        .and_then(|s| {
+            s.split_once("sec =")?
+                .1
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    {
+        let now_s = (unix_ms_now() / 1000).max(0) as u64;
+        if now_s > boottime {
+            parts.push(format!("up {}", format_uptime_gui(now_s - boottime)));
+        }
+    }
+    parts.join(" \u{b7} ")
+}
+
+#[cfg(target_os = "macos")]
+fn run_cmd_stdout_bounded(prog: &str, args: &[&str], wait_ms: u64) -> Option<String> {
+    use std::io::Read;
+    let (reader, writer) = std::io::pipe().ok()?;
+    let mut cmd = aterm_uds::spawnfd::command(prog);
+    cmd.args(args)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::from(writer))
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    drop(cmd);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        let _ = done_rx.recv_timeout(std::time::Duration::from_millis(wait_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+    let mut out = String::new();
+    let _ = reader.take(32 * 1024).read_to_string(&mut out);
+    let _ = done_tx.send(());
+    let _ = watcher.join();
+    (!out.trim().is_empty()).then_some(out)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_loadavg_gui(text: &str) -> Option<[u32; 3]> {
+    let mut vals = text
+        .split(|c: char| c.is_whitespace() || matches!(c, '{' | '}'))
+        .filter(|tok| !tok.is_empty())
+        .filter_map(|tok| tok.parse::<f64>().ok());
+    let l1 = (vals.next()?.max(0.0) * 100.0).round() as u32;
+    let l5 = (vals.next()?.max(0.0) * 100.0).round() as u32;
+    let l15 = (vals.next()?.max(0.0) * 100.0).round() as u32;
+    Some([l1, l5, l15])
 }
 
 #[cfg(target_os = "macos")]
@@ -4021,27 +4821,40 @@ fn describe_gui_hardware(model_id: Option<&str>) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_host_ipv4_and_banner(hostname: &str, port: u16) -> (Option<String>, Option<String>) {
+fn resolve_host_ipv4_banner_and_rtt(
+    hostname: &str,
+    port: u16,
+) -> (Option<String>, Option<String>, Option<u64>) {
     use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     let ipv4 = (hostname, port).to_socket_addrs().ok().and_then(|addrs| {
-        addrs.into_iter().find_map(|a| match a {
-            SocketAddr::V4(v4) => Some(v4.ip().to_string()),
-            SocketAddr::V6(_) => None,
-        })
+        let v4s: Vec<std::net::Ipv4Addr> = addrs
+            .filter_map(|a| match a {
+                SocketAddr::V4(v4) => Some(*v4.ip()),
+                SocketAddr::V6(_) => None,
+            })
+            .collect();
+        v4s.iter()
+            .copied()
+            .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .or_else(|| v4s.first().copied())
+            .map(|ip| ip.to_string())
     });
+    let mut rtt_us = None;
     let banner = ipv4
         .as_deref()
         .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
         .and_then(|ip| {
             let addr = SocketAddr::from((ip, port));
+            let t0 = Instant::now();
             let stream =
                 TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(120)).ok()?;
+            rtt_us = u64::try_from(t0.elapsed().as_micros().max(1)).ok();
             read_ssh_banner(
                 &stream,
                 Instant::now() + std::time::Duration::from_millis(120),
             )
         });
-    (ipv4, banner)
+    (ipv4, banner, rtt_us)
 }
 
 #[cfg(target_os = "macos")]
@@ -4146,10 +4959,36 @@ fn parse_bonjour_device_txt(text: &str) -> (Option<String>, Option<u32>) {
 }
 
 #[cfg(target_os = "macos")]
-fn discover_bonjour_lan_computers(
-    computers: &mut Vec<TabComputer>,
-    custom_names: &std::collections::BTreeMap<String, String>,
-) {
+type BonjourResolvedEntry = (String, u16, Option<String>, Option<u32>);
+
+#[cfg(target_os = "macos")]
+type BonjourResolvedMap = std::collections::BTreeMap<String, BonjourResolvedEntry>;
+
+#[cfg(target_os = "macos")]
+struct CachedBonjourBrowse {
+    at: Instant,
+    lan_names: Vec<String>,
+    sftp_names: Vec<String>,
+    rfb_names: Vec<String>,
+    resolved: BonjourResolvedMap,
+}
+
+#[cfg(target_os = "macos")]
+fn cached_bonjour_browse() -> (Vec<String>, Vec<String>, Vec<String>, BonjourResolvedMap) {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedBonjourBrowse>>> =
+        std::sync::OnceLock::new();
+    let mutex = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = mutex.lock()
+        && let Some(c) = guard.as_ref()
+        && c.at.elapsed() < std::time::Duration::from_secs(30)
+    {
+        return (
+            c.lan_names.clone(),
+            c.sftp_names.clone(),
+            c.rfb_names.clone(),
+            c.resolved.clone(),
+        );
+    }
     let (ssh_txt, sftp_txt, rfb_txt) = std::thread::scope(|s| {
         let h1 = s.spawn(|| run_dns_sd_bounded(&["-B", "_ssh._tcp", "local."], 140, None));
         let h2 = s.spawn(|| run_dns_sd_bounded(&["-B", "_sftp-ssh._tcp", "local."], 140, None));
@@ -4164,25 +5003,67 @@ fn discover_bonjour_lan_computers(
     let sftp_names = parse_bonjour_service_instances(&sftp_txt, "_sftp-ssh._tcp.");
     let rfb_names = parse_bonjour_service_instances(&rfb_txt, "_rfb._tcp.");
     lan_names.sort_by_key(|n| natural_lan_sort_key(n));
+    let resolved_pairs: Vec<(String, BonjourResolvedEntry)> = std::thread::scope(|s| {
+        let handles: Vec<_> = lan_names
+            .iter()
+            .map(|inst_name| {
+                s.spawn(move || {
+                    let resolve_out = run_dns_sd_bounded(
+                        &["-L", inst_name, "_ssh._tcp", "local."],
+                        100,
+                        Some("can be reached at"),
+                    );
+                    let (dot_local, port) = bonjour_ssh_target(&resolve_out)?;
+                    let txt_q = format!("{inst_name}._device-info._tcp.local.");
+                    let txt_out = run_dns_sd_bounded(&["-Q", &txt_q, "TXT"], 80, Some("bytes:"));
+                    let (model_id, osxvers) = parse_bonjour_device_txt(&txt_out);
+                    Some((inst_name.clone(), (dot_local, port, model_id, osxvers)))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .collect()
+    });
+    let resolved: std::collections::BTreeMap<_, _> = resolved_pairs.into_iter().collect();
+    if let Ok(mut guard) = mutex.lock() {
+        *guard = Some(CachedBonjourBrowse {
+            at: Instant::now(),
+            lan_names: lan_names.clone(),
+            sftp_names: sftp_names.clone(),
+            rfb_names: rfb_names.clone(),
+            resolved: resolved.clone(),
+        });
+    }
+    (lan_names, sftp_names, rfb_names, resolved)
+}
 
-    let raw_local = aterm_uds::process::host_name()
-        .map(|h| {
-            h.trim()
-                .strip_suffix(".local")
-                .unwrap_or(h.trim())
-                .to_string()
-        })
-        .unwrap_or_else(|| "this-Mac".to_string());
+#[cfg(target_os = "macos")]
+fn discover_bonjour_lan_computers(
+    computers: &mut Vec<TabComputer>,
+    custom_names: &std::collections::BTreeMap<String, String>,
+    local_vitals: bool,
+) {
+    let (lan_names, sftp_names, rfb_names, resolved_map) = cached_bonjour_browse();
+
+    let raw_local = raw_local_host_name_gui();
     let local_canonical = canonical_host_name_gui(&raw_local, custom_names);
     let local_dot = format!("{raw_local}.local");
-    let (local_ip, local_ssh) = resolve_host_ipv4_and_banner(&local_dot, 22);
+    let (local_ip, local_ssh, _) = resolve_host_ipv4_banner_and_rtt(&local_dot, 22);
     let local_addr = match local_ip {
         Some(ip) => format!("{ip} \u{b7} {local_dot}"),
         None => local_dot.clone(),
     };
-    let local_txt_q = format!("{}._device-info._tcp.local.", raw_local.replace('-', " "));
-    let local_txt = run_dns_sd_bounded(&["-Q", &local_txt_q, "TXT"], 80, Some("bytes:"));
-    let (local_model, local_osx) = parse_bonjour_device_txt(&local_txt);
+    let (local_model, local_osx) = resolved_map
+        .get(&raw_local.replace('-', " "))
+        .or_else(|| resolved_map.get(&raw_local))
+        .map(|(_, _, m, o)| (m.clone(), *o))
+        .unwrap_or_else(|| {
+            let local_txt_q = format!("{}._device-info._tcp.local.", raw_local.replace('-', " "));
+            let local_txt = run_dns_sd_bounded(&["-Q", &local_txt_q, "TXT"], 80, Some("bytes:"));
+            parse_bonjour_device_txt(&local_txt)
+        });
     let local_hw = describe_gui_hardware(local_model.as_deref());
     let local_os_str = match local_osx {
         Some(d) => format!("macOS (Darwin {d})"),
@@ -4220,6 +5101,13 @@ fn discover_bonjour_lan_computers(
             "{local_hw} \u{b7} {local_os_str} \u{b7} {local_ssh_str} \u{b7} advertised services: {local_services}"
         ),
         status: "online (local)".to_string(),
+        // `VitalsHost`'s snapshot is what the page shows where it has one:
+        // no 30 ms sample and no `sysctl` spawns for words it would drop.
+        vitals: if local_vitals {
+            sample_local_vitals_fallback()
+        } else {
+            String::new()
+        },
         instances: 0,
         tabs: 0,
         ai_clis: 0,
@@ -4247,18 +5135,13 @@ fn discover_bonjour_lan_computers(
             .map(|inst_name| {
                 let sftp_ref = &sftp_names;
                 let rfb_ref = &rfb_names;
+                let resolved_ref = &resolved_map;
                 s.spawn(move || {
                     let canonical = canonical_host_name_gui(inst_name, custom_names);
-                    let resolve_out = run_dns_sd_bounded(
-                        &["-L", inst_name, "_ssh._tcp", "local."],
-                        100,
-                        Some("can be reached at"),
-                    );
-                    let (dot_local, port) = bonjour_ssh_target(&resolve_out)?;
-                    let txt_q = format!("{inst_name}._device-info._tcp.local.");
-                    let txt_out = run_dns_sd_bounded(&["-Q", &txt_q, "TXT"], 80, Some("bytes:"));
-                    let (model_id, osxvers) = parse_bonjour_device_txt(&txt_out);
-                    let (ipv4, ssh_banner) = resolve_host_ipv4_and_banner(&dot_local, port);
+                    let (dot_local, port, model_id, osxvers) =
+                        resolved_ref.get(inst_name)?.clone();
+                    let (ipv4, ssh_banner, rtt_us) =
+                        resolve_host_ipv4_banner_and_rtt(&dot_local, port);
                     let addr_display = match ipv4 {
                         Some(ip) => format!("{ip} \u{b7} {dot_local}"),
                         None => dot_local.clone(),
@@ -4273,7 +5156,10 @@ fn discover_bonjour_lan_computers(
                         svcs.push("screen-sharing");
                     }
                     let hw_display = describe_gui_hardware(model_id.as_deref());
-                    let os_str = osxvers.map_or_else(|| "OS version unknown".to_string(), |d| format!("Darwin {d}"));
+                    let os_str = osxvers.map_or_else(
+                        || "OS version unknown".to_string(),
+                        |d| format!("Darwin {d}"),
+                    );
                     let ssh_short = ssh_banner
                         .as_deref()
                         .and_then(|b| b.split_whitespace().next())
@@ -4282,16 +5168,34 @@ fn discover_bonjour_lan_computers(
                         "{hw_display} \u{b7} {os_str} \u{b7} {ssh_short} \u{b7} advertised services: {}",
                         svcs.join(", ")
                     );
+                    let vitals = if ssh_banner.is_some()
+                        && let Some(us) = rtt_us
+                    {
+                        let rtt_pct = ((us / 500).min(100)) as u8;
+                        let rtt_spark =
+                            push_sparkline_sample(&format!("lan/{canonical}/rtt"), rtt_pct);
+                        format!(
+                            "LAN SSH RTT {:.1}ms {rtt_spark} \u{b7} system vitals unobserved (enroll in aterm machines for CPU/GPU/RAM/Disk)",
+                            us as f64 / 1_000.0
+                        )
+                    } else {
+                        String::new()
+                    };
                     Some(TabComputer {
-                            id: format!("lan/{canonical}"),
-                            name: canonical,
-                            address: addr_display,
-                            os_version: os_full,
-                            status: if ssh_banner.is_some() { "reachable (ssh)".into() } else { "advertised (lan)".into() },
-                            instances: 0,
-                            tabs: 0,
-                            ai_clis: 0,
-                            active_ai: 0,
+                        id: format!("lan/{canonical}"),
+                        name: canonical,
+                        address: addr_display,
+                        os_version: os_full,
+                        status: if ssh_banner.is_some() {
+                            "reachable (ssh)".into()
+                        } else {
+                            "advertised (lan)".into()
+                        },
+                        vitals,
+                        instances: 0,
+                        tabs: 0,
+                        ai_clis: 0,
+                        active_ai: 0,
                     })
                 })
             })

@@ -33,15 +33,17 @@
 //!   reads it over (measured: the screen idle at …674.6, the row `RUNNING`
 //!   until …675.4), so at a turn's end the row says the turn is still open
 //!   (`wait:turn-open`), the point the restart then owns
-//!   (`upgrade_drive::log_settles`). The database is READ ONLY, live: with
-//!   agy's connection open (its `-wal` and `-shm` beside it) through SQLite's
-//!   own read-only open; with it closed — agy closes it some 30 s after its
-//!   last write, deleting both, so an idle agy's is closed most of the time —
-//!   as an immutable file whose identity is the same before and after the read
-//!   with no `-wal` made meanwhile (the drive's). 2 179 live read-only reads
-//!   over 881 s of turns, tasks, a timer, subagents, kills, a cron and a
-//!   resume left agy's own logs without a database error and every one of its
-//!   writes in place.
+//!   (`upgrade_drive::log_settles`). The database is read live WITH NO LOCK ON
+//!   IT (the drive's, `aterm_uds::foreign_db::read`): with agy's connection
+//!   open (its `-wal` beside it) from a private copy of the file and its
+//!   `-wal`; with it closed — agy closes it some 30 s after its last write,
+//!   deleting both, so an idle agy's is closed most of the time — as an
+//!   immutable file; either kept only where the files are the same before and
+//!   after the read. SQLite's own read-only open of the live file, the read
+//!   this replaced, can take the WAL index's write lock to build it, which
+//!   agy's writes wait on for up to their 5 s busy timeout and are dropped
+//!   past it (measured 2026-10-20: an 8 s hold cost agy that turn's row
+//!   update; 136 389 such reads in a tight loop over 24 turns cost none).
 //! * **No running work is interrupted, G-A2.** agy's background work — a
 //!   `run_command` past its `WaitMsBeforeAsync` (a daemon one too), a
 //!   `schedule` timer or cron, an `invoke_subagent` subagent — runs on after

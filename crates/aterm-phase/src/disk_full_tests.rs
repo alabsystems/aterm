@@ -1,14 +1,107 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the disk-full notice reader. The notices are built from the
-//! anchors (the drift canary holds those to the store binary), never typed
-//! here as prose; the screens around them are synthetic — where the
-//! notification is drawn was not measured (the module's docs).
+//! Tests for the disk-full notice reader. The notification's place and its
+//! glyph are read off the screen MEASURED on 2.1.304
+//! ([`TRANSCRIPT_DEGRADED_EACCES_2_1_304`], whose code is `EACCES`: the
+//! mapped words are swapped for each code the bundle maps); the other
+//! notices are built from the anchors (the drift canary holds those to the
+//! store binary), never typed here as prose, on synthetic screens.
 
 use super::*;
 use crate::anchors::anchor_text;
-use crate::prompt::fixtures::{composer, rows};
+use crate::prompt::fixtures::{TRANSCRIPT_DEGRADED_EACCES_2_1_304, composer, rows, screen};
+
+/// The measured words the vendor maps `EACCES` to, in the measured row.
+const MEASURED_CODE: &str = "permission denied — EACCES";
+
+/// The measured screen with the notice's mapped words `mapped` in place of
+/// [`MEASURED_CODE`]: the row as Claude Code draws it for that code (2.1.304
+/// maps each code to its words in the one template), and the row it is on.
+fn measured_with(mapped: &str) -> (Vec<String>, usize) {
+    let r: Vec<String> = screen(TRANSCRIPT_DEGRADED_EACCES_2_1_304)
+        .into_iter()
+        .map(|r| r.replace(MEASURED_CODE, mapped))
+        .collect();
+    let at = r
+        .iter()
+        .position(|row| row.contains(anchor_text("wall.disk_full")))
+        .expect("the measured notice row");
+    (r, at)
+}
+
+/// THE NOTICE AS CLAUDE CODE DRAWS IT (2.1.304, MEASURED): under the
+/// composer's bottom rule, over the mode row, two columns in, after the
+/// vendor's `⚠` and one space — read with its code, its message from the
+/// anchor on; the glyph's emoji form (U+FE0F after it) the same. The
+/// measured screen itself names `EACCES`, no full disk: not read.
+#[test]
+fn the_measured_notice_reads_after_the_vendors_glyph() {
+    let measured = screen(TRANSCRIPT_DEGRADED_EACCES_2_1_304);
+    let (full, at) = measured_with("disk full — ENOSPC");
+    assert!(full[at].starts_with("  ⚠ "), "{:?}", full[at]);
+    assert!(
+        crate::phase::composer_frame(&full).is_some_and(|f| f.bottom < at),
+        "under the composer"
+    );
+    assert_eq!(disk_full(&measured), None, "EACCES is no full disk");
+    let d = disk_full(&full).expect("the vendor's row");
+    assert_eq!(
+        (d.code, d.source, d.row),
+        (Code::Enospc, Source::Notification, at)
+    );
+    assert!(
+        d.message.starts_with(anchor_text("wall.disk_full")),
+        "{:?}",
+        d.message
+    );
+    let (quota, _) = measured_with("disk quota exceeded — EDQUOT");
+    assert_eq!(disk_full(&quota).map(|d| d.code), Some(Code::Edquot));
+    let emoji: Vec<String> = full
+        .iter()
+        .map(|r| r.replacen("⚠ ", "⚠\u{FE0F} ", 1))
+        .collect();
+    assert_ne!(emoji, full);
+    assert_eq!(disk_full(&emoji).map(|d| d.row), Some(at));
+}
+
+/// NEGATIVE CONTROLS, each the vendor's row, glyph and all, from the
+/// measured screen: typed as a draft into the composer, queued by a person
+/// under a running turn, behind any other text than the glyph alone (a
+/// label, a quote, a second glyph, a glyph with no space) — none is the
+/// notice. CONTROL: the row as drawn is.
+#[test]
+fn the_glyphs_row_anywhere_else_is_not_the_notice() {
+    let (full, at) = measured_with("disk full — ENOSPC");
+    assert!(disk_full(&full).is_some(), "the screen the controls edit");
+    let drawn = full[at].trim_start().to_string();
+    let mut draft = full.clone();
+    draft.remove(at);
+    let caret = draft
+        .iter()
+        .rposition(|r| r == "❯")
+        .expect("the measured composer's caret row");
+    draft[caret] = format!("❯ {drawn}");
+    assert_eq!(disk_full(&draft), None, "a draft");
+    let queued = format!("❯ {drawn}");
+    assert_eq!(
+        disk_full(&busy(&["", &queued], "", "  ? for shortcuts")),
+        None,
+        "a queued message"
+    );
+    let words = drawn.strip_prefix("⚠ ").expect("the glyph and one space");
+    for row in [
+        format!("  note: {drawn}"),
+        format!("  \"{drawn}\""),
+        format!("  ⚠ ⚠ {words}"),
+        format!("  ⚠{words}"),
+        format!("  ! {words}"),
+    ] {
+        let mut edited = full.clone();
+        edited[at] = row.clone();
+        assert_eq!(disk_full(&edited), None, "{row:?}");
+    }
+}
 
 /// The notification as 2.1.302 composes it for `code`'s mapping.
 fn notice(mapped: &str) -> String {

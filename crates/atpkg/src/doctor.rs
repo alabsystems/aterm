@@ -23,6 +23,9 @@ use aterm_primer::{
     claude_efforts_set_by_hand, claude_survey_rate_set_by_hand,
 };
 
+use aterm_converge::{Class, ItemReport, Outcome, Remedy};
+
+use crate::converge::{self as c, Finding};
 use crate::store::Layout;
 
 const GIB: u64 = 1 << 30;
@@ -575,38 +578,65 @@ fn probe_trust_chain(layout: &Layout) -> Option<TrustChainProbe> {
     }
 }
 
-/// (5f)'s line for a directory `targo trust` refuses on trust build `build`'s chain. Doctor
-/// never chmods: the line names the one command that clears a writable component of the
+/// (5f)'s row for a directory `targo trust` refuses on trust build `build`'s chain. Doctor
+/// never chmods: the row names the one command that clears a writable component of the
 /// user's own, and for one of root's (`/tmp`'s `1777`, which must stay as it is) names a
 /// prefix of theirs instead, as `tools/install.sh`'s `check_install_path` does.
-fn trust_chain_line(p: &str, build: u64, refusal: &ChainRefusal) -> String {
+fn trust_chain_finding(build: u64, refusal: &ChainRefusal) -> Finding {
     let dir = refusal.dir.display();
     let quoted = crate::platform::sh_quote_str(&refusal.dir.to_string_lossy());
-    let lead = format!("{p}: warn — trust build {build}: `targo trust` refuses this toolchain");
-    match refusal.why {
-        ChainWhy::Writable { mode, yours: true } => format!(
-            "{lead} — {dir} is group- or world-writable (mode {mode:o}), and targo runs no \
-             verified check whose compiler or runtime libraries sit below a directory another \
-             user could change; fix: run `chmod go-w {quoted}`"
+    let lead = format!("trust build {build}: `targo trust` refuses this toolchain");
+    let person = |how: &str| Remedy::Person {
+        pane: String::from("[packages].prefix"),
+        how: how.to_owned(),
+    };
+    let (text, remedy) = match refusal.why {
+        ChainWhy::Writable { mode, yours: true } => (
+            format!(
+                "{lead} — {dir} is group- or world-writable (mode {mode:o}), and targo runs no \
+                 verified check whose compiler or runtime libraries sit below a directory \
+                 another user could change; fix: chmod go-w {quoted}"
+            ),
+            Remedy::Command(format!("chmod go-w {quoted}")),
         ),
-        ChainWhy::Writable { mode, yours: false } => format!(
-            "{lead} — {dir} is group- or world-writable (mode {mode:o}) and root's, not yours \
-             to change, and targo runs no verified check whose compiler or runtime libraries \
-             sit below a directory another user could change; fix: set [packages].prefix, or \
-             HOME, under directories only you can write"
+        ChainWhy::Writable { mode, yours: false } => (
+            format!(
+                "{lead} — {dir} is group- or world-writable (mode {mode:o}) and root's, not \
+                 yours to change, and targo runs no verified check whose compiler or runtime \
+                 libraries sit below a directory another user could change; fix: set \
+                 [packages].prefix, or HOME, under directories only you can write"
+            ),
+            person("set [packages].prefix, or HOME, under directories only you can write"),
         ),
-        ChainWhy::Foreign { owner, ours } => format!(
-            "{lead} — {dir} is owned by uid {owner}, neither root nor you (uid {ours}), and \
-             targo runs no verified check whose compiler or runtime libraries sit below a \
-             directory another user owns; fix: set [packages].prefix under directories root \
-             or you own"
+        ChainWhy::Foreign { owner, ours } => (
+            format!(
+                "{lead} — {dir} is owned by uid {owner}, neither root nor you (uid {ours}), and \
+                 targo runs no verified check whose compiler or runtime libraries sit below a \
+                 directory another user owns; fix: set [packages].prefix under directories \
+                 root or you own"
+            ),
+            person("set [packages].prefix under directories root or you own"),
         ),
-        ChainWhy::Redirected => format!(
-            "{lead} — {dir} is not a plain directory, and targo loads a verified toolchain's \
-             runtime libraries through no link below its sysroot; the bundle's fix: \
-             {TRUST_LIB_FIX}"
+        ChainWhy::Redirected => (
+            format!(
+                "{lead} — {dir} is not a plain directory, and targo loads a verified \
+                 toolchain's runtime libraries through no link below its sysroot; the bundle's \
+                 fix: {TRUST_LIB_FIX}"
+            ),
+            Remedy::Person {
+                pane: String::from("the trust bundle"),
+                how: TRUST_LIB_FIX.to_owned(),
+            },
         ),
-    }
+    };
+    Finding::change(
+        c::of(c::TRUST_CHAIN, refusal.dir.display()),
+        Class::Person,
+        "a directory on the trust build's chain",
+        text,
+        "a directory only root or you can change",
+        remedy,
+    )
 }
 
 /// The fix a (5f)(g) [`ChainWhy::Redirected`] line names: the bundle's layout, which no
@@ -1195,11 +1225,13 @@ pub enum Detail {
     Everything,
 }
 
-/// Run the health surface, printing the report ([`present`]). Returns `true` iff there were
-/// no structural problems (`main` maps `false` to exit 1). Reads the real environment: home,
-/// PATH, the clock, and the `[packages]` config.
+/// Run the health surface over the real environment (home, PATH, the clock, the
+/// `[packages]` config) and print it: the text rendered from the rows ([`render`]), or with
+/// `json` the rows themselves in the one schema every `--json` surface prints
+/// ([`aterm_converge::Report`], mode `check`). Returns `true` iff the rows pass
+/// ([`crate::converge::passes`]: no structural problem; `main` maps `false` to exit 1).
 #[must_use]
-pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
+pub fn run(layout: &Layout, prefix: &str, detail: Detail, json: bool) -> bool {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
@@ -1221,51 +1253,75 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         devtools: crate::devtools::facts(),
         trust_chain: probe_trust_chain(layout),
     };
-    let mut report = Vec::new();
-    let mut faults = Vec::new();
-    let healthy = run_with(
+    let rows = report_with(
         layout,
         home.as_deref(),
         path.as_deref(),
         crate::flow::now_unix(),
         cfg_account.as_deref(),
-        prefix,
         &probes,
-        &mut report,
-        &mut faults,
     );
-    let shown = present(
-        &String::from_utf8_lossy(&report),
-        &String::from_utf8_lossy(&faults),
+    emit(
+        rows,
         prefix,
         detail,
-    );
-    // The verdict first, then the structural faults (on stderr), then the rest. Errors
-    // ignored: a reader that closed the pipe (`doctor | head`) costs an `EPIPE` nobody
-    // sees, never a panic.
-    use std::io::Write as _;
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(shown.verdict.as_bytes());
-    let _ = stdout.flush();
-    let _ = std::io::stderr().write_all(shown.faults.as_bytes());
-    let _ = stdout.write_all(shown.rest.as_bytes());
-    let _ = stdout.flush();
-    healthy
+        json,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
 }
 
-/// The longest line the default report prints — a row, its next step included.
+/// Print the rows and say whether they pass ([`crate::converge::passes`]): with `json` the
+/// one [`aterm_converge::Report`] (mode `check`, `complete` the exit rule) on one line of
+/// `out`; else the text [`render`] lays out — the verdict and the rest to `out`, the
+/// structural faults to `err`. Write errors are ignored: a reader that closed the pipe
+/// (`doctor | head`) costs an `EPIPE` nobody sees, never a panic.
+pub(crate) fn emit(
+    rows: Vec<ItemReport>,
+    prefix: &str,
+    detail: Detail,
+    json: bool,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> bool {
+    let passes = crate::converge::passes(&rows);
+    if json {
+        let report = aterm_converge::Report::new(aterm_converge::ReportMode::Check, passes, rows);
+        return match aterm_json::to_string(&report) {
+            Ok(text) => {
+                let _ = writeln!(out, "{text}");
+                let _ = out.flush();
+                passes
+            }
+            Err(why) => {
+                let _ = writeln!(err, "{prefix}: cannot encode the report: {why}");
+                false
+            }
+        };
+    }
+    // The verdict first, then the structural faults, then the rest.
+    let shown = render(&rows, prefix, detail);
+    let _ = out.write_all(shown.verdict.as_bytes());
+    let _ = out.flush();
+    let _ = err.write_all(shown.faults.as_bytes());
+    let _ = out.write_all(shown.rest.as_bytes());
+    let _ = out.flush();
+    passes
+}
+
+/// The longest line the default report prints — a row, its remedy included.
 pub const SHORT_ROW: usize = 160;
 
-/// The head of the line a declined store's report carries — said by default too
-/// ([`present`]): it is why nothing is installed.
+/// The head of the toolset row of a declined store — said by default too ([`render`]): it
+/// is why nothing is installed.
 const DECLINED_LINE: &str = "the ALab toolset was removed on this machine";
 
 /// The (8) row for a store no index update pass has completed on, whether or not a failed
 /// one left a `status.toml` — followed by the vendor programs that update without one.
-const NEVER_CHECKED: &str = "warn — no index update pass has completed yet — run: aterm pkg update";
+const NEVER_CHECKED: &str = "no index update pass has completed yet — run: aterm pkg update";
 
-/// The report as [`present`] lays it out, in the order it is printed: the verdict, the
-/// structural faults ([`run_with`]'s stderr lines, which stay on stderr), then the rest.
+/// The report as [`render`] lays it out, in the order it is printed: the verdict, the
+/// structural faults (stderr), then the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presented {
     pub verdict: String,
@@ -1282,159 +1338,141 @@ impl Presented {
     }
 }
 
-/// The report as a person reads it: the verdict first, then by default
-/// ([`Detail::Problems`]) only what needs attention, each `warn`/`FAIL`/`PROBLEM` row in one
-/// line of at most [`SHORT_ROW`] characters (the fact, and its next step when the row names
-/// one), then the one next act and where the rest is. `healthy` is said only when nothing
-/// was flagged; warnings without a fault read "working", with a count. [`Detail::Everything`]
-/// prints the verdict and then every line the checks wrote. Pure over the full report's text
-/// (`report` its stdout, `faults` its stderr), so the exit code and every check stay
-/// [`run_with`]'s.
-#[must_use]
-pub fn present(report: &str, faults: &str, p: &str, detail: Detail) -> Presented {
-    let head = format!("{p}: ");
-    let mut problems: Vec<String> = Vec::new();
-    let mut body: Vec<&str> = Vec::new();
-    let mut verdict: Option<&str> = None;
-    let mut next: Option<&str> = None;
-    let mut active: Option<&str> = None;
-    let mut elided = false;
-    // A row as the default report prints it, and whether that dropped anything: a
-    // `warn`/`FAIL`/`PROBLEM` row in its short form, any other line cut to fit.
-    let shorten = |line: &str| -> (String, bool) {
-        let rest = line.strip_prefix(&head).unwrap_or(line);
-        let level = ["warn", "FAIL", "PROBLEM"]
-            .into_iter()
-            .find(|l| rest.starts_with(&format!("{l} \u{2014} ")));
-        let row = match level {
-            Some(level) => short_row(p, level, &rest[level.len() + " \u{2014} ".len()..]),
-            None if line.chars().count() > SHORT_ROW => {
-                let mut row: String = line.chars().take(SHORT_ROW - 1).collect();
-                row.push('\u{2026}');
-                row
-            }
-            None => line.to_string(),
-        };
-        let cut = row != line;
-        (row, cut)
-    };
-    for line in report.lines() {
-        let rest = line.strip_prefix(&head).unwrap_or(line);
-        if rest == "healthy"
-            || rest.starts_with("not healthy \u{2014} ")
-            || (rest.starts_with("found ") && rest.ends_with(" problem(s)"))
-        {
-            verdict = Some(rest);
-            continue;
-        }
-        if rest.starts_with("next \u{2014} ") {
-            next = Some(line);
-            continue;
-        }
-        body.push(line);
-        if let Some(count) = rest.strip_suffix(" program(s) active")
-            && count.chars().all(|c| c.is_ascii_digit())
-        {
-            active = Some(count);
-        }
-        let flagged_row = ["warn", "FAIL", "PROBLEM"]
-            .iter()
-            .any(|l| rest.starts_with(&format!("{l} \u{2014} ")));
-        // The recorded problems a `PROBLEM` verdict lists, indented under it, and the one
-        // plain fact that explains an empty store: it was removed on purpose.
-        if flagged_row || rest.starts_with("  ") || rest.starts_with(DECLINED_LINE) {
-            let (row, cut) = shorten(line);
-            elided |= cut;
-            problems.push(row);
-        } else {
-            elided = true;
+/// A row's mark in the text report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// As it should be.
+    Ok,
+    /// A fact: does not apply, or waits for something that ends by itself.
+    Note,
+    /// Advisory: something to look at, never a failure.
+    Warn,
+    /// A structural fault (stderr): the report fails.
+    Fail,
+    /// The toolset, or a dev link, is not what the machine wants: the report fails.
+    Problem,
+}
+
+impl Mark {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Note => "note",
+            Self::Warn => "warn",
+            Self::Fail => "FAIL",
+            Self::Problem => "PROBLEM",
         }
     }
-    // The structural faults, one row each, whole under `--verbose`.
-    let mut fault_rows: Vec<String> = Vec::new();
-    for line in faults.lines() {
-        match detail {
-            Detail::Everything => fault_rows.push(line.to_string()),
-            Detail::Problems => {
-                let (row, cut) = shorten(line);
-                elided |= cut;
-                fault_rows.push(row);
-            }
-        }
-    }
-    let flagged = fault_rows.len()
-        + problems
-            .iter()
-            .filter(|r| {
-                let rest = r.strip_prefix(&head).unwrap_or(r);
-                !rest.starts_with("  ") && !rest.starts_with(DECLINED_LINE)
-            })
-            .count();
-    // Not "ALab program(s)": the count includes the vendor-direct agents ([`run_with`]).
-    let programs = active.map_or_else(String::new, |n| format!("{n} program(s) installed"));
-    let verdict_line = match verdict {
-        Some("healthy") if flagged == 0 => match programs.as_str() {
-            "" => format!("{p}: healthy"),
-            programs => format!("{p}: healthy \u{2014} {programs} and working"),
-        },
-        Some("healthy") => match programs.as_str() {
-            "" => format!("{p}: working \u{2014} {flagged} thing(s) to look at"),
-            programs => {
-                format!("{p}: working \u{2014} {programs}; {flagged} thing(s) to look at")
-            }
-        },
-        Some(said) => format!("{p}: {said}"),
-        None => format!("{p}: {flagged} thing(s) to look at"),
-    };
-    let mut rest = String::new();
-    let rows: Vec<&str> = match detail {
-        Detail::Everything => body,
-        Detail::Problems => problems.iter().map(String::as_str).collect(),
-    };
-    for row in rows {
-        rest.push_str(row);
-        rest.push('\n');
-    }
-    if let Some(next) = next {
-        rest.push_str(next);
-        rest.push('\n');
-    }
-    if detail == Detail::Problems && elided {
-        rest.push_str(&format!("{p}: the full report: aterm pkg {p} --verbose\n"));
-    }
-    let mut faults = String::new();
-    for row in fault_rows {
-        faults.push_str(&row);
-        faults.push('\n');
-    }
-    Presented {
-        verdict: format!("{verdict_line}\n"),
-        faults,
-        rest,
+
+    const fn flagged(self) -> bool {
+        matches!(self, Self::Warn | Self::Fail | Self::Problem)
     }
 }
 
-/// One problem row in at most [`SHORT_ROW`] characters: the row as written when it fits,
-/// else its first clause (the fact, up to the first ` — `, `; ` or sentence end) and the
-/// next step the row names ([`next_step`]), the fact cut short with a visible `…` if the two
-/// still do not fit.
-fn short_row(p: &str, level: &str, text: &str) -> String {
-    let whole = format!("{p}: {level} \u{2014} {text}");
+/// A row's mark, from its outcome and whether it fails the report; `None` for a recorded
+/// problem the toolset row lists, which prints indented under it.
+fn mark(row: &ItemReport) -> Option<Mark> {
+    if c::is(&row.id, c::TOOLSET_MEMBER) {
+        return None;
+    }
+    Some(match row.outcome {
+        Outcome::Ok | Outcome::Changed => Mark::Ok,
+        Outcome::NotApplicable | Outcome::Deferred => Mark::Note,
+        _ if row.fails_surface() => {
+            if c::is(&row.id, c::TOOLSET) || c::is(&row.id, c::DEV_LINK) {
+                Mark::Problem
+            } else {
+                Mark::Fail
+            }
+        }
+        _ => Mark::Warn,
+    })
+}
+
+/// A row's sentence: the value an `ok` row holds, else its explanation.
+fn sentence(row: &ItemReport) -> &str {
+    match row.outcome {
+        Outcome::Ok | Outcome::Changed => row.to.as_deref(),
+        _ => row
+            .explain
+            .as_ref()
+            .map(|e| e.why.as_str())
+            .or(row.why.as_deref()),
+    }
+    .unwrap_or(&row.title)
+}
+
+/// A row as `--verbose` prints it, whole.
+fn line_of(row: &ItemReport, p: &str) -> String {
+    match mark(row) {
+        Some(mark) => format!("{p}: {} \u{2014} {}", mark.word(), sentence(row)),
+        None => format!("{p}:   {}", sentence(row)),
+    }
+}
+
+/// Whether the default report prints the row: what needs attention, the recorded problems
+/// under the toolset row, and the toolset row whenever it is not ok (a declined store's
+/// says why nothing is installed).
+fn said_by_default(row: &ItemReport) -> bool {
+    mark(row).is_none_or(Mark::flagged) || (row.id == c::TOOLSET && row.outcome != Outcome::Ok)
+}
+
+/// The words a short row ends with for its remedy, when it has one a person can act on. A
+/// remedy whose sentence goes on after its act (`run '…/atpkg' repair — it moves this file
+/// aside …`) keeps the act.
+fn remedy_words(remedy: &Remedy) -> Option<String> {
+    let act = |text: &str| {
+        text.split(" \u{2014} ")
+            .next()
+            .unwrap_or(text)
+            .trim()
+            .to_owned()
+    };
+    let words = match remedy {
+        Remedy::Command(command) => format!("fix: {}", act(command)),
+        Remedy::Repair => String::from("fix: aterm pkg repair"),
+        Remedy::Init { only } => format!("fix: aterm init --only {only}"),
+        Remedy::Develop => String::from("fix: aterm init --develop"),
+        Remedy::Provision { args } => format!("fix: targo --unverified verify provision {args}")
+            .trim_end()
+            .to_owned(),
+        Remedy::Person { how, .. } => format!("fix: {}", act(how)),
+        Remedy::Network => String::from("the next pass, once online"),
+        Remedy::None => return None,
+    };
+    (words.chars().count() <= 110).then_some(words)
+}
+
+/// One row in at most [`SHORT_ROW`] characters: the row whole when it fits; a flagged row
+/// cut to its first clause (the fact) and its remedy ([`remedy_words`]), the fact cut short
+/// with a visible `…` if the two still do not fit; any other row cut to fit.
+fn short_line(row: &ItemReport, p: &str) -> String {
+    let whole = line_of(row, p);
     if whole.chars().count() <= SHORT_ROW {
         return whole;
     }
-    let fact = text[..first_clause_end(text)]
+    let Some(mark) = mark(row).filter(|m| m.flagged()) else {
+        let mut cut: String = whole.chars().take(SHORT_ROW - 1).collect();
+        cut.push('\u{2026}');
+        return cut;
+    };
+    let text = sentence(row);
+    let fact = text[..c::first_clause_end(text)]
         .trim_end()
         .trim_end_matches('.');
-    let lead = format!("{p}: {level} \u{2014} ");
-    // The step is what a person acts on, so the fact yields room to it, never the reverse.
-    let tail = next_step(text).map_or_else(String::new, |step| format!(" \u{2014} {step}"));
+    let lead = format!("{p}: {} \u{2014} ", mark.word());
+    // The remedy is what a person acts on, so the fact yields room to it, never the reverse.
+    let tail = row
+        .explain
+        .as_ref()
+        .and_then(|e| remedy_words(&e.remedy))
+        .map_or_else(String::new, |words| format!(" \u{2014} {words}"));
     let room = SHORT_ROW
         .saturating_sub(lead.chars().count() + tail.chars().count())
         .max(20);
     let fact: String = if fact.chars().count() > room {
         let mut cut: String = fact.chars().take(room - 1).collect();
-        cut.push('…');
+        cut.push('\u{2026}');
         cut
     } else {
         fact.to_string()
@@ -1442,65 +1480,130 @@ fn short_row(p: &str, level: &str, text: &str) -> String {
     format!("{lead}{fact}{tail}")
 }
 
-/// Where a row's first clause ends: at its first ` — `, `; ` or `. ` outside parentheses
-/// and backticks (a parenthetical's `;` is not the end of the fact), else the whole row.
-fn first_clause_end(text: &str) -> usize {
-    let mut depth = 0usize;
-    let mut quoted = false;
-    for (at, c) in text.char_indices() {
-        match c {
-            '`' => quoted = !quoted,
-            '(' if !quoted => depth += 1,
-            ')' if !quoted => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        if depth == 0
-            && !quoted
-            && [" \u{2014} ", "; ", ". "]
-                .iter()
-                .any(|sep| text[at..].starts_with(sep))
-        {
-            return at;
+/// The verdict: `found N problem(s)` when rows fail the report; else `not healthy` while a
+/// managed tool cannot run or cannot be shown to (its warn carries the remedy); else
+/// `healthy` when nothing is flagged, `working` with a count when something is.
+fn verdict(rows: &[ItemReport], p: &str) -> String {
+    let fails = rows.iter().filter(|r| r.fails_surface()).count();
+    if fails > 0 {
+        return format!("{p}: found {fails} problem(s)");
+    }
+    let claims = |claim: &str| {
+        rows.iter()
+            .filter(|r| r.detail.as_deref() == Some(claim))
+            .count()
+    };
+    let (cannot, unproven) = (claims(c::CANNOT_RUN), claims(c::UNPROVEN));
+    if cannot + unproven > 0 {
+        return format!(
+            "{p}: not healthy \u{2014} {} (see below)",
+            withheld_summary(cannot, unproven)
+        );
+    }
+    let flagged = rows
+        .iter()
+        .filter(|r| mark(r).is_some_and(Mark::flagged))
+        .count();
+    // Not "ALab program(s)": the count includes the vendor-direct agents.
+    let programs = rows
+        .iter()
+        .find(|r| r.id == c::TOOLSET && r.outcome == Outcome::Ok)
+        .and_then(|r| r.detail.as_deref())
+        .map(|n| format!("{n} program(s) installed"));
+    match (flagged, programs) {
+        (0, None) => format!("{p}: healthy"),
+        (0, Some(programs)) => format!("{p}: healthy \u{2014} {programs} and working"),
+        (n, None) => format!("{p}: working \u{2014} {n} thing(s) to look at"),
+        (n, Some(programs)) => {
+            format!("{p}: working \u{2014} {programs}; {n} thing(s) to look at")
         }
     }
-    text.len()
 }
 
-/// The one next step a row names: its `fix:`, `now:` or `or add:` clause (a PATH line to
-/// paste), else the first `aterm …` command it quotes in backticks. `None` when the row
-/// names none, or only one too long to leave room for the fact beside it.
-fn next_step(text: &str) -> Option<String> {
-    let clause = |word: &str| {
-        text.find(word).map(|at| {
-            let rest = &text[at + word.len()..];
-            rest.split(" \u{2014} ")
-                .next()
-                .unwrap_or(rest)
-                .split(" (")
-                .next()
-                .unwrap_or(rest)
-                .trim()
-                .trim_end_matches(['.', ';'])
-                .to_string()
-        })
+/// The one next act of a failing report: a single command, never a menu (a pile of
+/// problems and three suggestions teaches a first-hour user to close the terminal). It is
+/// the explicit door ([`Remedy::Command`]) of the first failing row in this order: the C
+/// toolchain (no amount of updating installs a compiler), the workspace (a publish), the
+/// toolset (its own door: the whole set, a held member's, `--retry` or `update`), a live
+/// build (`update` re-flips every diverged shim), one program's store tree. A failing C
+/// toolchain outranks the rest even without a door: one that refuses with no one act to
+/// name (macOS: it is installed, and its own stderr is the cause) has its remedy inline, so
+/// there is no next line. A fault whose remedy is said inline (a stray `.sh`: remove it)
+/// adds none either.
+fn next_act(rows: &[ItemReport]) -> Option<String> {
+    let failing = |id: &'static str| {
+        rows.iter()
+            .filter(move |r| r.fails_surface() && c::is(&r.id, id))
     };
-    let step = clause("fix: ")
-        .or_else(|| clause("Fix: "))
-        .map(|fix| format!("fix: {fix}"))
-        .or_else(|| clause("now: ").map(|now| format!("run {now}")))
-        .or_else(|| clause("or add: ").map(|line| format!("add: {line}")))
-        .or_else(|| {
-            let at = text.find("`aterm ")?;
-            let cmd = &text[at + 1..];
-            let end = cmd.find('`')?;
-            Some(format!("run `{}`", &cmd[..end]))
-        })?;
-    (step.chars().count() <= 110 && !step.is_empty()).then_some(step)
+    let door = |row: &ItemReport| match row.explain.as_ref().map(|e| &e.remedy) {
+        Some(Remedy::Command(command)) => Some(command.clone()),
+        _ => None,
+    };
+    if let Some(compiler) = failing(c::CLT).next() {
+        return door(compiler);
+    }
+    [c::WORKSPACE, c::TOOLSET, c::LIVE, c::STORE]
+        .into_iter()
+        .find_map(|id| failing(id).find_map(door))
 }
 
-/// The testable core: `home`, the `PATH` value, `now` and the `[packages].account`
-/// config override are injected so the surface can be exercised against a synthetic
-/// environment without mutating the process env.
+/// The report as a person reads it, rendered from the rows: the verdict first, then by
+/// default ([`Detail::Problems`]) only what needs attention, each row in one line of at
+/// most [`SHORT_ROW`] characters (the fact, and its remedy when the row names one), then
+/// the one next act and where the rest is. `healthy` is said only when nothing was flagged;
+/// warnings without a fault read "working", with a count. [`Detail::Everything`] prints
+/// the verdict and then every row whole. The structural faults (`FAIL`) are `faults`,
+/// which [`run`] prints on stderr.
+#[must_use]
+pub fn render(rows: &[ItemReport], p: &str, detail: Detail) -> Presented {
+    let mut faults = String::new();
+    let mut rest = String::new();
+    let mut elided = false;
+    for row in rows {
+        let whole = line_of(row, p);
+        let shown = match detail {
+            Detail::Everything => whole.clone(),
+            Detail::Problems if said_by_default(row) => short_line(row, p),
+            Detail::Problems => {
+                elided = true;
+                continue;
+            }
+        };
+        elided |= shown != whole;
+        let into = if mark(row) == Some(Mark::Fail) {
+            &mut faults
+        } else {
+            &mut rest
+        };
+        into.push_str(&shown);
+        into.push('\n');
+    }
+    if !crate::converge::passes(rows)
+        && let Some(act) = next_act(rows)
+    {
+        rest.push_str(&format!("{p}: next \u{2014} {act}\n"));
+    }
+    if detail == Detail::Problems && elided {
+        rest.push_str(&format!("{p}: the full report: aterm pkg {p} --verbose\n"));
+    }
+    Presented {
+        verdict: format!("{}\n", verdict(rows, p)),
+        faults,
+        rest,
+    }
+}
+
+/// A typed row's words as the doctor prints them: `<level> — <text>`.
+#[must_use]
+pub fn spelled(row: &Row) -> String {
+    format!("{} \u{2014} {}", level_word(row.level), row.text)
+}
+
+/// The testable core: `home`, the `PATH` value, `now` and the `[packages].account` config
+/// override are injected so the surface can be exercised against a synthetic environment
+/// without mutating the process env. Prints the report as [`render`] lays it out for
+/// `detail` — the verdict and the rest to `out`, the structural faults to `err` — and
+/// returns whether it passes.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // the injected environment, plus the speaker and its streams
 pub fn run_with(
@@ -1511,87 +1614,170 @@ pub fn run_with(
     cfg_account: Option<&str>,
     prefix: &str,
     probes: &Probes,
+    detail: Detail,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> bool {
-    // The speaker is the verb the user typed (`status` is an alias for this report), so a
-    // script keying on the prefix keys on the verb it ran.
-    let p = prefix;
-    let mut fails = 0usize;
+    let rows = report_with(layout, home, path_var, now, cfg_account, probes);
+    emit(rows, prefix, detail, false, out, err)
+}
+
+/// The rows of the report over an injected environment ([`run_with`]): every finding of
+/// [`read`] as an item, planned by the engine and never applied.
+#[must_use]
+pub fn report_with(
+    layout: &Layout,
+    home: Option<&Path>,
+    path_var: Option<&OsStr>,
+    now: i64,
+    cfg_account: Option<&str>,
+    probes: &Probes,
+) -> Vec<ItemReport> {
+    crate::converge::report(read(layout, home, path_var, now, cfg_account, probes))
+}
+
+/// Read the machine once: checks (0)–(11), in order, each leaving a [`Finding`] per thing it
+/// found ([`crate::converge`]). Reads only: no write, no network.
+#[must_use]
+#[allow(clippy::too_many_lines)] // one read pass, in the order the report prints it
+pub(crate) fn read(
+    layout: &Layout,
+    home: Option<&Path>,
+    path_var: Option<&OsStr>,
+    now: i64,
+    cfg_account: Option<&str>,
+    probes: &Probes,
+) -> Vec<Finding> {
+    let mut f: Vec<Finding> = Vec::new();
 
     // (0) Which atpkg is speaking. A machine can carry several (the app's, a dev `dist/`, a
     // `target/release`), and a stale one misreports the store, whose natural next step is
     // reinstalling something that was never broken.
-    let _ = writeln!(
-        out,
-        "{p}: this atpkg is {} at {}",
-        aterm_types::version::app_version(),
-        std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<unknown path>".to_string())
-    );
+    f.push(Finding::ok(
+        c::ATPKG,
+        Class::Install,
+        "the atpkg speaking",
+        format!(
+            "this atpkg is {} at {}",
+            aterm_types::version::app_version(),
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown path>".to_string())
+        ),
+    ));
     let app_dirs: Vec<PathBuf> = std::iter::once(PathBuf::from("/Applications"))
         .chain(home.map(|h| h.join("Applications")))
         .collect();
-    report_aterm_posture(
+    if let Some(row) = report_aterm_posture(
         layout,
         &app_dirs,
         aterm_update_core::settings::update_auto_apply(),
-        p,
-        out,
-    );
+    ) {
+        // A downloaded build waits for a window: a state that ends by itself.
+        f.push(match row.level {
+            Level::Note => {
+                Finding::waits(c::APP, Class::Install, "the aterm app's update", row.text)
+            }
+            _ => Finding::of_row(
+                c::APP,
+                Class::Install,
+                "the aterm app's update",
+                row,
+                "",
+                Remedy::None,
+            ),
+        });
+    }
 
     // (1) Trust root and index source.
-    let _ = writeln!(
-        out,
-        "{p}: index source github.com/{}",
-        crate::resolve_account(cfg_account).slug()
-    );
+    f.push(Finding::ok(
+        c::INDEX_SOURCE,
+        Class::Person,
+        "the index source",
+        format!(
+            "index source github.com/{}",
+            crate::resolve_account(cfg_account).slug()
+        ),
+    ));
     if crate::manager_enabled() {
         // The root is the paper master, the anchor the app updater uses, not a
         // package-specific key: naming it answers "which trust root is this build on?"
         // without reading source.
-        let _ = writeln!(
-            out,
-            "{p}: ok — paper master pinned (fingerprint {}, {} key(s))",
-            crate::root_key_fingerprint(),
-            crate::PKG_TRUST_ANCHORS.len()
-        );
+        f.push(Finding::ok(
+            c::TRUST_ROOT,
+            Class::Person,
+            "the trust root",
+            format!(
+                "paper master pinned (fingerprint {}, {} key(s))",
+                crate::root_key_fingerprint(),
+                crate::PKG_TRUST_ANCHORS.len()
+            ),
+        ));
     } else {
-        let _ = writeln!(
-            out,
-            "{p}: warn — disabled/inert (no paper master compiled in: \
-             pins::PAPER_MASTER_PUBKEYS is empty) — this build installs nothing"
-        );
+        f.push(Finding::change(
+            c::TRUST_ROOT,
+            Class::Person,
+            "the trust root",
+            "disabled/inert (no paper master compiled in: pins::PAPER_MASTER_PUBKEYS is empty) \
+             — this build installs nothing",
+            "the paper master, compiled in",
+            Remedy::None,
+        ));
     }
     // The table's own spelling: a retired key to rename or remove. Notes, never failures —
     // every one of them is still honoured or harmlessly ignored.
     for note in &probes.config_notes {
-        let _ = writeln!(out, "{p}: note — {note}");
+        f.push(Finding::note(
+            c::CONFIG,
+            Class::Person,
+            "the [packages] table",
+            note.clone(),
+        ));
     }
     if let Some(ignored) = probes.ignored_prefix.as_deref() {
-        let _ = writeln!(
-            out,
-            "{p}: warn — {}",
-            crate::config::ignored_prefix_note(ignored)
-        );
+        f.push(Finding::change(
+            c::of(c::CONFIG, "prefix"),
+            Class::Person,
+            "the [packages] prefix",
+            crate::config::ignored_prefix_note(ignored),
+            "a prefix atpkg honours",
+            Remedy::None,
+        ));
     }
     for (name, setting) in &probes.retired_env {
-        let _ = writeln!(
-            out,
-            "{p}: warn — ${name} is exported but does nothing — delete it and use {setting}"
-        );
+        f.push(Finding::change(
+            c::of(c::RETIRED_ENV, name),
+            Class::Person,
+            format!("${name}"),
+            format!("${name} is exported but does nothing — delete it and use {setting}"),
+            "unset",
+            Remedy::Person {
+                pane: String::from("the shell's startup files"),
+                how: format!("delete ${name} and use {setting}"),
+            },
+        ));
     }
 
     // (2) Prefix and store.
     if layout.prefix.is_dir() {
-        let _ = writeln!(out, "{p}: ok — prefix {}", layout.prefix.display());
+        f.push(Finding::ok(
+            c::PREFIX,
+            Class::Install,
+            "the prefix",
+            format!("prefix {}", layout.prefix.display()),
+        ));
     } else {
-        let _ = writeln!(
-            out,
-            "{p}: warn — prefix {} does not exist yet (nothing installed)",
-            layout.prefix.display()
-        );
+        f.push(Finding::change(
+            c::PREFIX,
+            Class::Install,
+            "the prefix",
+            format!(
+                "prefix {} does not exist yet (nothing installed)",
+                layout.prefix.display()
+            ),
+            "laid by an install",
+            Remedy::Command(String::from("aterm pkg install --default-set")),
+        ));
     }
 
     // (3) PATH wiring.
@@ -1600,15 +1786,24 @@ pub fn run_with(
         .map(|p| std::env::split_paths(p).any(|d| d == bin_dir))
         .unwrap_or(false);
     if on_path {
-        let _ = writeln!(out, "{p}: ok — managed bin/ is on PATH");
+        f.push(Finding::ok(
+            c::PATH,
+            Class::Person,
+            "the managed bin/ on PATH",
+            "managed bin/ is on PATH",
+        ));
     } else {
         // The path appears once, in the pasteable export. An aterm shell, and any rc file
         // carrying atpkg's block, sources ~/.aterm/shell.d, which appends it.
-        let _ = writeln!(
-            out,
-            "{p}: warn — managed bin/ is not on PATH here; a new aterm shell adds it, or add: {}",
-            manual_path_hint(&bin_dir)
-        );
+        let hint = manual_path_hint(&bin_dir);
+        f.push(Finding::change(
+            c::PATH,
+            Class::Person,
+            "the managed bin/ on PATH",
+            format!("managed bin/ is not on PATH here; a new aterm shell adds it, or add: {hint}"),
+            "on PATH",
+            Remedy::Command(hint),
+        ));
     }
 
     // (3b) Reroute (`crate::reroute`): each stub's state, then PATH order, not presence: a
@@ -1623,76 +1818,105 @@ pub fn run_with(
         .into_iter()
         .map(|name| (name, crate::reroute::stub_state(layout, name)));
     for (name, state) in crate::reroute::states(layout).into_iter().chain(agent_rows) {
-        match state {
+        let id = c::of(c::STUBS, name);
+        let title = format!("the reroute stub {name}");
+        f.push(match state {
             crate::reroute::StubState::Laid => {
-                let _ = writeln!(out, "{p}: ok — reroute stub {name} laid");
+                Finding::ok(id, Class::Relay, title, format!("reroute stub {name} laid"))
             }
-            crate::reroute::StubState::Missing if cfg!(windows) => {
-                let _ = writeln!(
-                    out,
-                    "{p}: note — reroute stub {name} not laid: Windows lays no reroute stubs yet (TARGET)"
-                );
-            }
+            crate::reroute::StubState::Missing if cfg!(windows) => Finding::note(
+                id,
+                Class::Relay,
+                title,
+                format!("reroute stub {name} not laid: Windows lays no reroute stubs yet (TARGET)"),
+            ),
             // A recorded decline lays none — nothing will, so it is a state, not a warning.
-            crate::reroute::StubState::Missing if layout.declined().is_file() => {
-                let _ = writeln!(
-                    out,
-                    "{p}: note — reroute stub {name} not laid: {DECLINED_LINE}"
-                );
-            }
-            crate::reroute::StubState::Missing => {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — reroute stub {name} missing; the next aterm session lays it \
-                     — now: aterm pkg repair"
-                );
-            }
-            crate::reroute::StubState::Foreign => {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — {} is not ours (foreign file; never touched)",
+            crate::reroute::StubState::Missing if layout.declined().is_file() => Finding::note(
+                id,
+                Class::Relay,
+                title,
+                format!("reroute stub {name} not laid: {DECLINED_LINE}"),
+            ),
+            crate::reroute::StubState::Missing => Finding::change(
+                id,
+                Class::Relay,
+                title,
+                format!(
+                    "reroute stub {name} missing; the next aterm session lays it — now: aterm \
+                     pkg repair"
+                ),
+                "laid",
+                Remedy::Repair,
+            ),
+            crate::reroute::StubState::Foreign => Finding::change(
+                id,
+                Class::Person,
+                title,
+                format!(
+                    "{} is not ours (foreign file; never touched)",
                     crate::reroute::stub_path(layout, name).display()
-                );
-            }
-        }
+                ),
+                "atpkg's stub",
+                Remedy::None,
+            ),
+        });
     }
     // abrew's `brew` stub rides the same directory under its own marker
     // (docs/DESIGN-abrew-2026-10-19.md §6): one row beside the reroute rows.
     if !cfg!(windows) {
-        let _ = writeln!(out, "{p}: {}", crate::abrew::stub::doctor_line(layout));
+        // A foreign file at the stub's path is the person's: never touched, so no remedy.
+        let (row, class) = crate::abrew::stub::doctor_row(layout);
+        let remedy = if class == Class::Relay {
+            Remedy::Repair
+        } else {
+            Remedy::None
+        };
+        f.push(Finding::of_row(
+            c::of(c::STUBS, "brew"),
+            class,
+            "the reroute stub brew (abrew)",
+            row,
+            "laid",
+            remedy,
+        ));
     }
     let path_entries: Vec<std::path::PathBuf> = path_var
         .map(|p| std::env::split_paths(p).collect())
         .unwrap_or_default();
     let reroute_at = path_entries.iter().position(|d| *d == reroute_dir);
     let upstream_at = upstream_index_on_path(&path_entries, &layout.prefix, "cargo");
-    match (reroute_at, upstream_at) {
-        (None, _) => {
-            let _ = writeln!(
-                out,
-                "{p}: note — reroute dir not on this PATH (expected outside an aterm session)"
-            );
-        }
-        (Some(i), Some(j)) if i < j => {
-            let _ = writeln!(
-                out,
-                "{p}: ok — reroute dir precedes upstream cargo (PATH[{i}] < PATH[{j}])"
-            );
-        }
-        (Some(i), Some(j)) => {
-            let _ = writeln!(
-                out,
-                "{p}: warn — upstream cargo (PATH[{j}]) is ahead of the reroute dir \
-                 (PATH[{i}]) in this shell; a new aterm tab puts the reroute dir first"
-            );
-        }
-        (Some(i), None) => {
-            let _ = writeln!(
-                out,
-                "{p}: ok — reroute dir on PATH (PATH[{i}]); no upstream cargo on this PATH"
-            );
-        }
-    }
+    let title = "the reroute dir on PATH";
+    f.push(match (reroute_at, upstream_at) {
+        (None, _) => Finding::note(
+            c::REROUTE,
+            Class::Person,
+            title,
+            "reroute dir not on this PATH (expected outside an aterm session)",
+        ),
+        (Some(i), Some(j)) if i < j => Finding::ok(
+            c::REROUTE,
+            Class::Person,
+            title,
+            format!("reroute dir precedes upstream cargo (PATH[{i}] < PATH[{j}])"),
+        ),
+        (Some(i), Some(j)) => Finding::change(
+            c::REROUTE,
+            Class::Person,
+            title,
+            format!(
+                "upstream cargo (PATH[{j}]) is ahead of the reroute dir (PATH[{i}]) in this \
+                 shell; a new aterm tab puts the reroute dir first"
+            ),
+            "ahead of upstream cargo",
+            Remedy::None,
+        ),
+        (Some(i), None) => Finding::ok(
+            c::REROUTE,
+            Class::Person,
+            title,
+            format!("reroute dir on PATH (PATH[{i}]); no upstream cargo on this PATH"),
+        ),
+    });
 
     // (4) Broken shim scan of bin/: a shim whose forward target is gone (a dangling symlink,
     // or on Windows a `.cmd` forwarding to a missing exe); a tombstone has no target and is
@@ -1705,46 +1929,71 @@ pub fn run_with(
             let Some(target) = crate::platform::resolve_shim(&shim) else {
                 continue;
             };
+            let name = e.file_name().to_string_lossy().into_owned();
+            let id = c::of(c::SHIMS, &name);
+            let title = format!("the bin/ shim {name}");
             match crate::store::presence(&target) {
                 crate::store::Presence::Present => {}
-                crate::store::Presence::Absent => {
-                    fails += 1;
-                    let _ = writeln!(err, "{p}: FAIL — broken bin shim {}", shim.display());
-                }
-                crate::store::Presence::Unknown(why) => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: warn — bin shim {} could not be checked: its target {} is \
-                         unreadable ({why}) — not a broken shim",
+                crate::store::Presence::Absent => f.push(
+                    Finding::change(
+                        id,
+                        Class::Relay,
+                        title,
+                        format!("broken bin shim {}", shim.display()),
+                        "forwarding to a build in the store",
+                        Remedy::Repair,
+                    )
+                    .essential(),
+                ),
+                crate::store::Presence::Unknown(why) => f.push(Finding::unread(
+                    id,
+                    Class::Relay,
+                    title,
+                    format!(
+                        "bin shim {} could not be checked: its target {} is unreadable ({why}) \
+                         — not a broken shim",
                         shim.display(),
                         target.display()
-                    );
-                }
+                    ),
+                )),
             }
         }
     }
 
-    // (5) Active-build store integrity.
+    // (5) Active-build store integrity. Each program whose store tree is missing or
+    // incomplete is its own row, whose remedy is its one structural repair (`install
+    // <program>`), so the next act names one instead of a menu. No count here: (11) says
+    // how many programs are active, from the tally that also counts a dev-linked program.
     let active = crate::ops::active_builds(layout);
-    // The first program whose store tree is missing or incomplete, so the verdict tail can
-    // name one structural repair (`install <program>`) instead of a menu.
-    let mut next_install_program: Option<String> = None;
+    let mut store_broken = false;
     for (program, build) in &active {
         let bd = layout.build_dir(program, *build);
         if !bd.is_dir() || !crate::store::build_is_complete(&bd) {
-            fails += 1;
-            let _ = writeln!(
-                err,
-                "{p}: FAIL — active {} store missing/incomplete",
-                crate::vendor_direct::display_build(program, *build)
+            store_broken = true;
+            f.push(
+                Finding::change(
+                    c::of(c::STORE, program),
+                    Class::Install,
+                    format!("{program}'s active store tree"),
+                    format!(
+                        "active {} store missing/incomplete",
+                        crate::vendor_direct::display_build(program, *build)
+                    ),
+                    "complete",
+                    Remedy::Command(format!("aterm pkg install {program}")),
+                )
+                .essential(),
             );
-            if next_install_program.is_none() {
-                next_install_program = Some(program.clone());
-            }
         }
     }
-    // No count here: (11) says how many programs are active, from the tally that also counts
-    // a dev-linked program.
+    if !store_broken && !active.is_empty() {
+        f.push(Finding::ok(
+            c::STORE,
+            Class::Install,
+            "the active builds' store trees",
+            "every active build's store tree is complete",
+        ));
+    }
 
     // (5c) Solvers the `trust` bundle pins privately. trustc resolves its SMT solver as a
     // sibling of its own executable (trust's `trust_verify.rs`): an explicit `AY_PATH` wins,
@@ -1782,12 +2031,16 @@ pub fn run_with(
                 continue;
             }
             // No `AY_PATH` hint: it could point at an older solver than the bundle's.
-            let _ = writeln!(
-                out,
-                "{p}: note — Trust builds use the {program} pinned inside the trust bundle \
-                 ({pinned_version}), not the managed {program} {managed_version} \
-                 (build {managed_build})"
-            );
+            f.push(Finding::note(
+                c::of(c::SOLVER, program),
+                Class::Install,
+                format!("the {program} Trust builds use"),
+                format!(
+                    "Trust builds use the {program} pinned inside the trust bundle \
+                     ({pinned_version}), not the managed {program} {managed_version} (build \
+                     {managed_build})"
+                ),
+            ));
         }
     }
 
@@ -1815,11 +2068,9 @@ pub fn run_with(
     //     nor us, group/other-writable, or a link below the sysroot) is a warn: `chmod go-w`
     //     for a writable one of ours, a prefix of ours for root's, the bundle's fix for a link.
     //
-    // Warns other than (d) withhold "healthy". "Cannot run" counts in `tools_cannot_run`,
-    // "may not run" or "cannot tell" in `tools_unproven`, so the closing line never claims a
-    // tool cannot run where its line only failed to show that it can.
-    let mut tools_cannot_run = 0usize;
-    let mut tools_unproven = 0usize;
+    // Warns other than (d) withhold "healthy". "Cannot run" rows carry [`c::CANNOT_RUN`],
+    // "may not run" or "cannot tell" ones [`c::UNPROVEN`], so the verdict never claims a
+    // tool cannot run where its row only failed to show that it can.
     if let Some(trust_build) = active.get("trust").copied() {
         let bin = layout.build_dir("trust", trust_build).join("bin");
         let trustc = bin.join("trustc");
@@ -1833,40 +2084,74 @@ pub fn run_with(
         if let Some(what) = refused
             && bin.join("tippy").is_file()
         {
-            tools_cannot_run += 1;
-            let _ = writeln!(
-                out,
-                "{p}: warn — trust build {trust_build}: tippy cannot run — {} is {what}, and \
-                 tippy requires the selected compiler trustc to be a plain file, so every tippy \
-                 run stops at a setup error (the bundle's fix: {TRUST_COMPILER_FIX})",
-                trustc.display()
+            f.push(
+                Finding::change(
+                    c::TRUST_COMPILER,
+                    Class::Person,
+                    "the trust bundle's compiler, as tippy needs it",
+                    format!(
+                        "trust build {trust_build}: tippy cannot run — {} is {what}, and tippy \
+                         requires the selected compiler trustc to be a plain file, so every \
+                         tippy run stops at a setup error (the bundle's fix: \
+                         {TRUST_COMPILER_FIX})",
+                        trustc.display()
+                    ),
+                    "a plain file",
+                    Remedy::Person {
+                        pane: String::from("the trust bundle"),
+                        how: TRUST_COMPILER_FIX.to_owned(),
+                    },
+                )
+                .detail(c::CANNOT_RUN),
             );
         }
-        view_stock_names_check(out, p, layout, Some(bin.clone()), &mut tools_cannot_run);
-        // (g) One tool that cannot run, a line per refused directory.
+        view_stock_names_check(&mut f, layout, Some(bin.clone()));
+        // (g) One tool that cannot run, a row per refused directory.
         if let Some(chain) = probes.trust_chain.as_ref()
             && chain.build == trust_build
-            && !chain.refused.is_empty()
         {
-            tools_cannot_run += 1;
-            for refusal in &chain.refused {
-                let _ = writeln!(out, "{}", trust_chain_line(p, trust_build, refusal));
+            for (n, refusal) in chain.refused.iter().enumerate() {
+                let row = trust_chain_finding(trust_build, refusal);
+                f.push(if n == 0 {
+                    row.detail(c::CANNOT_RUN)
+                } else {
+                    row
+                });
             }
         }
         match crate::compat::inspect(layout, trust_build) {
             Some(Ok(inspection)) => {
-                let (line, claim) = exec_root_line(p, trust_build, &inspection);
-                match claim {
-                    ToolClaim::Runs => {}
-                    ToolClaim::CannotRun => tools_cannot_run += 1,
-                    ToolClaim::Unproven => tools_unproven += 1,
-                }
-                let _ = writeln!(out, "{line}");
+                let (row, claim, remedy) = exec_root_line(trust_build, &inspection);
+                // A root `repair` cannot lay (a link or file in its place) is the person's.
+                let class = if matches!(remedy, Remedy::Person { .. }) {
+                    Class::Person
+                } else {
+                    Class::Relay
+                };
+                let found = Finding::of_row(
+                    c::EXEC_ROOTS,
+                    class,
+                    "the trust build's exec root",
+                    row,
+                    "every trust shim routed through a matching exec root",
+                    remedy,
+                );
+                f.push(match claim {
+                    ToolClaim::Runs => found,
+                    ToolClaim::CannotRun => found.detail(c::CANNOT_RUN),
+                    ToolClaim::Unproven => found.detail(c::UNPROVEN),
+                });
             }
-            Some(Err(why)) => {
-                tools_unproven += 1;
-                let _ = writeln!(out, "{}", exec_root_unread_line(p, trust_build, &why));
-            }
+            Some(Err(why)) => f.push(
+                Finding::unread(
+                    c::EXEC_ROOTS,
+                    Class::Relay,
+                    "the trust build's exec root",
+                    exec_root_unread_line(trust_build, &why),
+                )
+                .remedy(Remedy::Command(String::from("aterm pkg verify trust")))
+                .detail(c::UNPROVEN),
+            ),
             None => {}
         }
     }
@@ -1887,101 +2172,140 @@ pub fn run_with(
             })
             .map(|build| build.join("bin"))
             .filter(|bin| bin.is_dir());
-        view_stock_names_check(out, p, layout, store_bin, &mut tools_cannot_run);
+        view_stock_names_check(&mut f, layout, store_bin);
     }
     for (path, why) in crate::compat::strays(layout) {
-        let _ = writeln!(out, "{}", stray_root_line(p, &path, why));
+        f.push(Finding::change(
+            c::of(c::EXEC_ROOT_STRAY, path.display()),
+            Class::Asked,
+            "an exec root no build needs",
+            stray_root_line(&path, why),
+            "removed",
+            Remedy::Command(String::from("aterm pkg gc")),
+        ));
     }
 
     // (5d) The workspace the operator is in against the installed Trust. atpkg keeps the
     // toolchain current with what is published; it cannot stop a repository depending on a
     // Trust build never published, whose symptom is targo refusing the workspace with an
     // "unknown field" error that looks like a manifest typo. The installed targo decides,
-    // and the line names what is behind: the publisher's toolchain, not this machine. The
+    // and the row names what is behind: the publisher's toolchain, not this machine. The
     // other way round, a workspace still naming a key the installed Trust retired is
     // refused with the setting that replaced it, and the workspace is what is behind.
-    let mut next_publish = false;
     if let Some(ws) = &probes.workspace {
         let trust_build = active
             .iter()
             .find(|(p, _)| p.as_str() == "trust")
             .map(|(_, b)| b.to_string())
             .unwrap_or_else(|| "?".to_string());
-        match &ws.policy {
-            WorkspacePolicy::Accepted => {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — workspace {} declares a [trust] policy the installed trust \
-                     build {trust_build} accepts",
+        let title = "the workspace's [trust] policy";
+        let accepted = "accepted by the installed targo";
+        f.push(match &ws.policy {
+            WorkspacePolicy::Accepted => Finding::ok(
+                c::WORKSPACE,
+                Class::Install,
+                title,
+                format!(
+                    "workspace {} declares a [trust] policy the installed trust build \
+                     {trust_build} accepts",
                     ws.workspace.display()
-                );
-            }
-            WorkspacePolicy::UnknownField { field } => {
-                fails += 1;
-                next_publish = true;
-                let _ = writeln!(
-                    err,
-                    "{p}: FAIL — workspace {} declares a [trust] policy key the installed \
-                     trust build {trust_build} does not know: `{field}`. Whoever committed \
-                     it built on a NEWER Trust seal that atpkg has not published, so this \
-                     workspace does not open with targo on any atpkg-managed machine. Cure \
-                     (a rostered publisher, on the machine holding that seal): \
-                     {PUBLISH_RUSTC_GROUP}; then here: aterm pkg update trust",
+                ),
+            )
+            .essential(),
+            WorkspacePolicy::UnknownField { field } => Finding::change(
+                c::WORKSPACE,
+                Class::Install,
+                title,
+                format!(
+                    "workspace {} declares a [trust] policy key the installed trust build \
+                     {trust_build} does not know: `{field}`. Whoever committed it built on a \
+                     NEWER Trust seal that atpkg has not published, so this workspace does not \
+                     open with targo on any atpkg-managed machine. Cure (a rostered publisher, \
+                     on the machine holding that seal): {PUBLISH_RUSTC_GROUP}; then here: aterm \
+                     pkg update trust",
                     ws.workspace.display()
-                );
-            }
-            WorkspacePolicy::RetiredKey { key, replacement } => {
-                fails += 1;
-                let _ = writeln!(
-                    err,
-                    "{p}: FAIL — workspace {} declares a [trust] policy key the installed \
-                     trust build {trust_build} has retired: `{key}` was {replacement}. The \
-                     workspace is older than this toolchain, so targo refuses it here. Cure \
-                     (in the workspace's Cargo.toml, not on this machine): edit its [trust] \
-                     table as that says",
+                ),
+                accepted,
+                Remedy::Command(format!(
+                    "publish the newer Trust coherence group ({PUBLISH_RUSTC_GROUP} on a \
+                     rostered machine holding the seal), then aterm pkg update trust"
+                )),
+            )
+            .essential(),
+            WorkspacePolicy::RetiredKey { key, replacement } => Finding::change(
+                c::WORKSPACE,
+                Class::Person,
+                title,
+                format!(
+                    "workspace {} declares a [trust] policy key the installed trust build \
+                     {trust_build} has retired: `{key}` was {replacement}. The workspace is \
+                     older than this toolchain, so targo refuses it here. Cure (in the \
+                     workspace's Cargo.toml, not on this machine): edit its [trust] table as \
+                     that says",
                     ws.workspace.display()
-                );
-            }
-            WorkspacePolicy::ProbeFailed { why } => {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — could not ask the installed targo about workspace {} \
-                     ({why})",
+                ),
+                accepted,
+                Remedy::Person {
+                    pane: ws.workspace.join("Cargo.toml").display().to_string(),
+                    how: format!("edit its [trust] table: `{key}` was {replacement}"),
+                },
+            )
+            .essential(),
+            WorkspacePolicy::ProbeFailed { why } => Finding::unread(
+                c::WORKSPACE,
+                Class::Install,
+                title,
+                format!(
+                    "could not ask the installed targo about workspace {} ({why})",
                     ws.workspace.display()
-                );
-            }
-        }
+                ),
+            ),
+        });
     }
 
     // (5e) A local toolchain behind rustup's `trust` channel. Newer than the store's (or of
-    // unknown age), it is the user's to keep: the line says which compiler `cargo +trust`
-    // gets and the one re-point that hands it back (the only line about this entry; (9)
+    // unknown age), it is the user's to keep: the row says which compiler `cargo +trust`
+    // gets and the one re-point that hands it back (the only row about this entry; (9)
     // stays silent on it). Older or gone, it is stale and `repair` re-points the channel at
     // the store, as the next unattended pass does by itself for an older live build tree
     // ([`crate::seam::live_build_tree`]); `repair` is named because it acts now. Where no
     // Trust is published for this target and the store holds none, the local toolchain is
     // the only Trust there is: a note ([`trust_unserved_here`]).
     if let Some(seal) = &probes.local_seal {
-        let _ = match &seal.stale {
-            Some(crate::seam::Stale::Dangling) => writeln!(
-                out,
-                "{p}: warn — rustup's trust channel names {}, which no longer exists, so \
-                 `cargo +trust` and every repo pinning `channel = \"trust\"` fail with \
-                 `'rustc' is not installed for the custom toolchain 'trust'`; fix: `aterm pkg \
-                 repair` re-points it at the store",
-                seal.link_target.display()
+        let title = "rustup's trust channel";
+        let seam = "the managed seam";
+        f.push(match &seal.stale {
+            Some(crate::seam::Stale::Dangling) => Finding::change(
+                c::RUSTUP_LOCAL,
+                Class::Relay,
+                title,
+                format!(
+                    "rustup's trust channel names {}, which no longer exists, so `cargo +trust` \
+                     and every repo pinning `channel = \"trust\"` fail with `'rustc' is not \
+                     installed for the custom toolchain 'trust'`; fix: `aterm pkg repair` \
+                     re-points it at the store",
+                    seal.link_target.display()
+                ),
+                seam,
+                Remedy::Repair,
             ),
-            Some(crate::seam::Stale::Older { its, store }) => writeln!(
-                out,
-                "{p}: warn — rustup's trust channel resolves to a LOCAL toolchain OLDER than \
-                 the atpkg store's: {} (trustc {}, {}; the store's is {}), so `cargo +trust` \
-                 and every repo pinning `channel = \"trust\"` compile with a stale Trust; fix: \
-                 `aterm pkg repair` re-points it at the store (the old toolchain is left \
-                 where it is)",
-                seal.link_target.display(),
-                seal.trustc,
-                its,
-                store
+            Some(crate::seam::Stale::Older { its, store }) => Finding::change(
+                c::RUSTUP_LOCAL,
+                Class::Asked,
+                title,
+                format!(
+                    "rustup's trust channel resolves to a LOCAL toolchain OLDER than the atpkg \
+                     store's: {} (trustc {}, {}; the store's is {}), so `cargo +trust` and \
+                     every repo pinning `channel = \"trust\"` compile with a stale Trust; fix: \
+                     `aterm pkg repair` re-points it at the store (the old toolchain is left \
+                     where it is)",
+                    seal.link_target.display(),
+                    seal.trustc,
+                    its,
+                    store
+                ),
+                seam,
+                Remedy::Repair,
             ),
             None => {
                 // `None` also covers no store build and a dev-linked trust, where the
@@ -1993,18 +2317,22 @@ pub fn run_with(
                     // trust's own row reads `unavailable on <target>`), a local toolchain
                     // is the only Trust this machine can have, and the route
                     // docs/LINUX-LOCAL-TOOLCHAIN.md gives: a fact, not a thing to look at.
-                    writeln!(
-                        out,
-                        "{p}: note — rustup `trust` names a local toolchain: {} (trustc {}); \
-                         no managed Trust is published for this target, so `cargo +trust` \
-                         and projects pinning `channel = \"trust\"` build with it{}",
-                        seal.link_target.display(),
-                        seal.trustc,
-                        if cfg!(target_os = "linux") {
-                            " (docs/LINUX-LOCAL-TOOLCHAIN.md)"
-                        } else {
-                            ""
-                        }
+                    Finding::note(
+                        c::RUSTUP_LOCAL,
+                        Class::Person,
+                        title,
+                        format!(
+                            "rustup `trust` names a local toolchain: {} (trustc {}); no managed \
+                             Trust is published for this target, so `cargo +trust` and projects \
+                             pinning `channel = \"trust\"` build with it{}",
+                            seal.link_target.display(),
+                            seal.trustc,
+                            if cfg!(target_os = "linux") {
+                                " (docs/LINUX-LOCAL-TOOLCHAIN.md)"
+                            } else {
+                                ""
+                            }
+                        ),
                     )
                 } else {
                     let what = if exists {
@@ -2022,85 +2350,104 @@ pub fn run_with(
                             seal.link_target.display()
                         )
                     };
-                    let fix = if managed {
-                        format!(
-                            " — to use the managed one: {}",
-                            repoint_fix(layout, &seal.link)
+                    let (fix, remedy) = if managed {
+                        let repoint = repoint_fix(layout, &seal.link);
+                        (
+                            format!(" — to use the managed one: {repoint}"),
+                            Remedy::Command(repoint),
                         )
                     } else {
-                        String::new()
+                        (String::new(), Remedy::None)
                     };
-                    writeln!(out, "{p}: warn — rustup `trust` {what}{fix}")
+                    Finding::change(
+                        c::RUSTUP_LOCAL,
+                        Class::Person,
+                        title,
+                        format!("rustup `trust` {what}{fix}"),
+                        seam,
+                        remedy,
+                    )
                 }
             }
-        };
+        });
     }
 
     // The toolchain update that waits, and the runs holding builds: states, never failures.
     // An unattended pass that found the Trust toolchain in use staged the new one and holds
     // its flip for quiet ([`crate::quiet`]); a release cut or an `aterm pkg lease` command
-    // holds a lease on the build it resolved ([`crate::lease`]), which gc keeps. Each line
+    // holds a lease on the build it resolved ([`crate::lease`]), which gc keeps. Each row
     // says what, on whom, until when, and the one command that ends the wait.
-    for line in hold_lines(layout, now) {
-        let _ = writeln!(out, "{p}: {line}");
-    }
+    f.extend(hold_findings(layout, now));
 
     // (5b) Live-build witness. `gc` reclaims a program's superseded builds only when the
     // `store/<program>/current` symlink and the derived `bin/` shim view name the same build;
     // otherwise it abstains rather than guess (a guess can delete a live tree) and builds
     // accumulate silently, so this makes it visible. A genuine disagreement is structural
-    // (some tool on PATH runs a build activation does not select); an absent witness warns.
+    // (some tool on PATH runs a build activation does not select), and its repair is a
+    // re-run of `update`, which re-flips every diverged shim; an absent witness warns.
     let live = crate::gc::live_builds(layout);
-    // A shim/link divergence's repair is a re-run of `update` — remembered for the
-    // verdict tail's single `next` act.
-    let mut next_update_divergence = false;
     for d in live.diverged() {
-        match &d.reason {
+        let id = c::of(c::LIVE, &d.program);
+        let title = format!("{}'s live build", d.program);
+        let want = "one build, recorded current and run";
+        let update = Remedy::Command(String::from("aterm pkg update"));
+        f.push(match &d.reason {
             crate::gc::Diverged::LinkShimMismatch {
                 link_says,
                 shims_say,
-            } => {
-                fails += 1;
-                next_update_divergence = true;
-                let _ = writeln!(
-                    err,
-                    "{p}: FAIL — {}: its `current` link selects {} but its bin/ shims run {} — fix: \
-                     aterm pkg update {}",
+            } => Finding::change(
+                id,
+                Class::Install,
+                title,
+                format!(
+                    "{}: its `current` link selects {} but its bin/ shims run {} — fix: aterm \
+                     pkg update {}",
                     d.program,
                     crate::vendor_direct::build_words(*link_says),
                     crate::vendor_direct::build_words(*shims_say),
                     d.program
-                );
-            }
-            crate::gc::Diverged::ShimsDisagree { builds } => {
-                fails += 1;
-                next_update_divergence = true;
-                let _ = writeln!(
-                    err,
-                    "{p}: FAIL — {}: its bin/ shims are split across builds {} — fix: aterm \
-                     pkg repair, then aterm pkg update {}",
+                ),
+                want,
+                update,
+            )
+            .essential(),
+            crate::gc::Diverged::ShimsDisagree { builds } => Finding::change(
+                id,
+                Class::Install,
+                title,
+                format!(
+                    "{}: its bin/ shims are split across builds {} — fix: aterm pkg repair, \
+                     then aterm pkg update {}",
                     d.program,
                     build_list(builds),
                     d.program
-                );
-            }
-            crate::gc::Diverged::NoLiveWitness { shims_say } => {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — {}: {} runs but is not recorded as current, so its older \
-                     builds are never removed — fix: aterm pkg update {}",
+                ),
+                want,
+                update,
+            )
+            .essential(),
+            crate::gc::Diverged::NoLiveWitness { shims_say } => Finding::change(
+                id,
+                Class::Install,
+                title,
+                format!(
+                    "{}: {} runs but is not recorded as current, so its older builds are never \
+                     removed — fix: aterm pkg update {}",
                     d.program,
                     crate::vendor_direct::build_words(*shims_say),
                     d.program
-                );
-            }
-        }
+                ),
+                want,
+                Remedy::Command(format!("aterm pkg update {}", d.program)),
+            ),
+        });
     }
-    let _ = writeln!(
-        out,
-        "{p}: ok — {} program(s) with a proven live build",
-        live.len()
-    );
+    f.push(Finding::ok(
+        c::LIVE,
+        Class::Install,
+        "the live builds",
+        format!("{} program(s) with a proven live build", live.len()),
+    ));
 
     // (6) Shell hooks and fish safety.
     if let Some(home) = home {
@@ -2110,27 +2457,45 @@ pub fn run_with(
         // Windows, `.zsh` elsewhere. An install writes the whole set, so a native hook means
         // PATH wiring is in place.
         let native_hook = format!("{}.{}", crate::hooks::HOOK_BASENAME, native_hook_ext());
-        if shell_d.join(&native_hook).is_file() {
-            let _ = writeln!(out, "{p}: ok — shell.d hooks present");
+        f.push(if shell_d.join(&native_hook).is_file() {
+            Finding::ok(
+                c::HOOKS,
+                Class::Relay,
+                "the shell.d hooks",
+                "shell.d hooks present",
+            )
         } else {
-            let _ = writeln!(
-                out,
-                "{p}: warn — shell.d hooks not generated yet (an install writes them)"
-            );
-        }
+            Finding::change(
+                c::HOOKS,
+                Class::Relay,
+                "the shell.d hooks",
+                "shell.d hooks not generated yet (an install writes them)",
+                "present",
+                Remedy::Repair,
+            )
+        });
         if let Ok(entries) = std::fs::read_dir(&shell_d) {
             for e in entries.flatten() {
-                if e.file_name().to_string_lossy().ends_with(".sh") {
-                    fails += 1;
-                    let _ = writeln!(
-                        err,
-                        "{p}: FAIL — shell.d/{}: a POSIX .sh breaks fish — remove it",
-                        e.file_name().to_string_lossy()
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".sh") {
+                    f.push(
+                        Finding::change(
+                            c::of(c::FISH_SAFE, &name),
+                            Class::Person,
+                            format!("shell.d/{name}"),
+                            format!("shell.d/{name}: a POSIX .sh breaks fish — remove it"),
+                            "absent",
+                            Remedy::Command(format!(
+                                "rm {}",
+                                crate::platform::sh_quote_str(&e.path().to_string_lossy())
+                            )),
+                        )
+                        .essential(),
                     );
                 }
             }
         }
-        // (6b) rc wiring: one line per rc file that exists (atpkg never creates one), telling
+        // (6b) rc wiring: one row per rc file that exists (atpkg never creates one), telling
         // wired, opted out and consent-fenced apart. `rc_wiring` reads six named files, among
         // them install.sh's two bash login profiles (`hooks::INSTALL_SH_PROFILES`), so a Mac
         // wired by install.sh is not called unwired; when none sources shell.d the note names
@@ -2147,63 +2512,85 @@ pub fn run_with(
             };
             let wired = names(crate::hooks::RcState::Wired);
             let elsewhere = names(crate::hooks::RcState::SourcedElsewhere);
+            let title = "the rc files' shell.d wiring";
             if !wired.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — {} sources ~/.aterm/shell.d (atpkg's block; delete it to opt \
-                     out — `aterm pkg repair` puts it back)",
-                    wired.join(", ")
-                );
+                f.push(Finding::ok(
+                    c::RC,
+                    Class::Relay,
+                    title,
+                    format!(
+                        "{} sources ~/.aterm/shell.d (atpkg's block; delete it to opt out — \
+                         `aterm pkg repair` puts it back)",
+                        wired.join(", ")
+                    ),
+                ));
             }
             if !elsewhere.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — {} sources ~/.aterm/shell.d via a line that is not atpkg's \
-                     block (tools/install.sh's, or your own)",
-                    elsewhere.join(", ")
-                );
+                f.push(Finding::ok(
+                    format!("{}.elsewhere", c::RC),
+                    Class::Person,
+                    title,
+                    format!(
+                        "{} sources ~/.aterm/shell.d via a line that is not atpkg's block \
+                         (tools/install.sh's, or your own)",
+                        elsewhere.join(", ")
+                    ),
+                ));
             }
             for (rc, state) in &wiring {
+                let id = c::of(c::RC, rc);
+                let title = format!("~/{rc}");
                 match state {
                     crate::hooks::RcState::Wired | crate::hooks::RcState::SourcedElsewhere => {}
-                    crate::hooks::RcState::OptedOut => {
-                        let _ = writeln!(
-                            out,
-                            "{p}: note — ~/{rc}: atpkg's block was deleted — opted out, \
-                             left alone by every install and update pass (`aterm pkg \
-                             repair` lays it again)"
-                        );
-                    }
-                    crate::hooks::RcState::ConsentFenced => {
-                        let _ = writeln!(
-                            out,
-                            "{p}: note — ~/{rc} resolves under a folder macOS guards with \
-                             a consent dialog, so no atpkg pass opens it — it is left \
-                             unwired; source ~/.aterm/shell.d from it yourself, or reach \
-                             the tools with `aterm <tool>`"
-                        );
-                    }
-                    crate::hooks::RcState::Unwired => {
-                        let _ = writeln!(
-                            out,
-                            "{p}: warn — ~/{rc} does not source ~/.aterm/shell.d (an \
-                             install pass or `aterm pkg repair` appends atpkg's block)"
-                        );
-                    }
+                    crate::hooks::RcState::OptedOut => f.push(Finding::note(
+                        id,
+                        Class::Asked,
+                        title,
+                        format!(
+                            "~/{rc}: atpkg's block was deleted — opted out, left alone by \
+                             every install and update pass (`aterm pkg repair` lays it again)"
+                        ),
+                    )),
+                    crate::hooks::RcState::ConsentFenced => f.push(Finding::note(
+                        id,
+                        Class::Person,
+                        title,
+                        format!(
+                            "~/{rc} resolves under a folder macOS guards with a consent \
+                             dialog, so no atpkg pass opens it — it is left unwired; source \
+                             ~/.aterm/shell.d from it yourself, or reach the tools with `aterm \
+                             <tool>`"
+                        ),
+                    )),
+                    crate::hooks::RcState::Unwired => f.push(Finding::change(
+                        id,
+                        Class::Relay,
+                        title,
+                        format!(
+                            "~/{rc} does not source ~/.aterm/shell.d (an install pass or `aterm \
+                             pkg repair` appends atpkg's block)"
+                        ),
+                        "sources ~/.aterm/shell.d",
+                        Remedy::Repair,
+                    )),
                 }
             }
             if wired.is_empty() && elsewhere.is_empty() {
                 let checked: Vec<String> = crate::hooks::rc_files_read()
                     .map(|rc| format!("~/{rc}"))
                     .collect();
-                let _ = writeln!(
-                    out,
-                    "{p}: note — none of {} sources ~/.aterm/shell.d, so a shell outside \
-                     aterm that starts from only those files does not reach the managed \
-                     tools; use `aterm <tool>` there, or: {}",
-                    checked.join(", "),
-                    manual_path_hint(&bin_dir)
-                );
+                f.push(Finding::note(
+                    format!("{}.none", c::RC),
+                    Class::Relay,
+                    title,
+                    format!(
+                        "none of {} sources ~/.aterm/shell.d, so a shell outside aterm that \
+                         starts from only those files does not reach the managed tools; use \
+                         `aterm <tool>` there, or: {}",
+                        checked.join(", "),
+                        manual_path_hint(&bin_dir)
+                    ),
+                ));
             }
         }
         // (6c) A file at a command path: a copy never updates, and either way it runs
@@ -2212,13 +2599,23 @@ pub fn run_with(
         // app's own `atpkg repair` — `aterm` may be the very copy named here.
         #[cfg(unix)]
         for path in crate::hooks::copied_command_links(home) {
-            let _ = writeln!(
-                out,
-                "{p}: warn — {} is a file, not a link to the installed aterm, and it runs \
-                 instead of it (a copy that never updates, or a build of your own) — fix: {}",
-                path.display(),
-                crate::hooks::copied_command_remedy(&path)
-            );
+            let remedy = crate::hooks::copied_command_remedy(&path);
+            f.push(Finding::change(
+                c::of(c::COPIED_COMMANDS, path.display()),
+                Class::Asked,
+                format!("{}", path.display()),
+                format!(
+                    "{} is a file, not a link to the installed aterm, and it runs instead \
+                         of it (a copy that never updates, or a build of your own) — fix: \
+                         {remedy}",
+                    path.display()
+                ),
+                "a link to the installed aterm",
+                Remedy::Person {
+                    pane: path.display().to_string(),
+                    how: remedy,
+                },
+            ));
         }
         // Privacy of the login-sourced dirs (read-only: doctor never chmods).
         for dir in [&aterm, &shell_d] {
@@ -2226,51 +2623,87 @@ pub fn run_with(
                 && m.file_type().is_dir()
                 && !crate::platform::dir_meta_is_private(&m)
             {
-                fails += 1;
-                let _ = writeln!(
-                    err,
-                    "{p}: FAIL — {} is group/other-writable (login shells source it)",
-                    dir.display()
+                f.push(
+                    Finding::change(
+                        c::of(c::PRIVATE, dir.display()),
+                        Class::Person,
+                        format!("{}", dir.display()),
+                        format!(
+                            "{} is group/other-writable (login shells source it)",
+                            dir.display()
+                        ),
+                        "writable by you alone",
+                        Remedy::Command(format!(
+                            "chmod go-w {}",
+                            crate::platform::sh_quote_str(&dir.to_string_lossy())
+                        )),
+                    )
+                    .essential(),
                 );
             }
         }
     }
 
     // (7) Disk headroom.
-    match crate::freespace::available_bytes(&layout.prefix) {
-        Some(free) if free < 5 * GIB => {
-            let _ = writeln!(
-                out,
-                "{p}: warn — only {} free (a toolchain update needs ~2.5x its artifact size)",
+    let title = "free space under the prefix";
+    f.push(match crate::freespace::available_bytes(&layout.prefix) {
+        Some(free) if free < 5 * GIB => Finding::change(
+            c::DISK,
+            Class::Person,
+            title,
+            format!(
+                "only {} free (a toolchain update needs ~2.5x its artifact size)",
                 crate::cost::human_bytes(free)
-            );
-        }
-        Some(free) => {
-            let _ = writeln!(out, "{p}: ok — {} free", crate::cost::human_bytes(free));
-        }
-        None => {
-            let _ = writeln!(out, "{p}: warn — could not query free space");
-        }
-    }
+            ),
+            "5 GiB free",
+            Remedy::None,
+        ),
+        Some(free) => Finding::ok(
+            c::DISK,
+            Class::Person,
+            title,
+            format!("{} free", crate::cost::human_bytes(free)),
+        ),
+        None => Finding::unread(c::DISK, Class::Person, title, "could not query free space"),
+    });
 
     // (7b) The Developer Tools list ([`crate::devtools`], macOS): a warning when aterm is not
-    // on it, never a problem. A report that does not read the machine says nothing.
+    // on it, never a problem — only a person switches it, in System Settings. A report that
+    // does not read the machine says nothing.
     if let Some(row) = probes.devtools.as_ref().and_then(crate::devtools::row) {
-        let _ = writeln!(
-            out,
-            "{p}: {} — devtools: {}",
-            level_word(row.level),
-            row.text
-        );
+        let title = "aterm on the Developer Tools list";
+        let text = format!("devtools: {}", row.text);
+        f.push(match row.level {
+            Level::Ok => Finding::ok(c::DEVTOOLS, Class::Person, title, text),
+            Level::Note => Finding::note(c::DEVTOOLS, Class::Person, title, text),
+            Level::Warn => Finding::person(
+                c::DEVTOOLS,
+                title,
+                text,
+                Remedy::Person {
+                    pane: String::from("Privacy & Security \u{25b8} Developer Tools"),
+                    how: String::from(
+                        "switch aterm on in Privacy & Security \u{25b8} Developer Tools",
+                    ),
+                },
+            ),
+        });
     }
 
     // (7c) Universal Control (macOS): the machine setting the pass applies, read through
-    // `defaults -currentHost` and never written here; the line carries the revert when it is
+    // `defaults -currentHost` and never written here; the row carries the revert when it is
     // off and the opt-out when it is about to be.
     if cfg!(target_os = "macos") {
         let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
         let policy = crate::config::cached_machine().universal_control();
-        let _ = writeln!(out, "{p}: {}", state.doctor_line(policy));
+        f.push(Finding::of_row(
+            c::UNIVERSAL_CONTROL,
+            Class::Preference,
+            "Universal Control",
+            state.doctor_row(policy),
+            "disabled",
+            Remedy::Command(String::from("aterm pkg machine apply")),
+        ));
     }
 
     // (8) Index freeze and age, from atpkg's own records. The clock is `last_success_at`,
@@ -2279,51 +2712,84 @@ pub fn run_with(
     // "Never checked" is said only here; the vendor programs kept at their vendors' heads
     // update without an index pass.
     let vendors = vendor_update_clause(layout, probes);
+    let age_title = "the last completed update pass";
+    let update = || Remedy::Command(String::from("aterm pkg update"));
+    let never_checked = || {
+        Finding::change(
+            c::INDEX_AGE,
+            Class::Install,
+            age_title,
+            format!("{NEVER_CHECKED}{vendors}"),
+            "a completed update pass",
+            update(),
+        )
+    };
     if let Some(status) = crate::status::read(layout) {
         if status.last_success_at.trim().is_empty() {
-            let _ = writeln!(out, "{p}: {NEVER_CHECKED}{vendors}");
+            f.push(never_checked());
         } else {
-            match index_age_days(&status.last_success_at, now) {
-                Some(days) if days > 30 => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: warn — {days} day(s) since the last completed update pass ({}) — \
-                         this machine has been off, or the app has not run",
+            f.push(match index_age_days(&status.last_success_at, now) {
+                Some(days) if days > 30 => Finding::change(
+                    c::INDEX_AGE,
+                    Class::Install,
+                    age_title,
+                    format!(
+                        "{days} day(s) since the last completed update pass ({}) — this machine \
+                         has been off, or the app has not run",
                         status.last_success_at
-                    );
-                }
-                Some(days) => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: ok — {days} day(s) since the last completed update pass"
-                    );
-                }
-                None => {
-                    let _ = writeln!(out, "{p}: warn — could not parse the last-success time");
-                }
-            }
+                    ),
+                    "within 30 days",
+                    update(),
+                ),
+                Some(days) => Finding::ok(
+                    c::INDEX_AGE,
+                    Class::Install,
+                    age_title,
+                    format!("{days} day(s) since the last completed update pass"),
+                ),
+                None => Finding::unread(
+                    c::INDEX_AGE,
+                    Class::Install,
+                    age_title,
+                    "could not parse the last-success time",
+                ),
+            });
             // Has the index been reached lately: a pass recorded failed or offline after the
             // last success (`last_pass` / `last_pass_at`) means every pass since ran on the
             // cached index. Read by the schedulers' own reader (`Stamps::last_failed`), so
-            // doctor and the failure ladder agree on which pass failed.
+            // doctor and the failure ladder agree on which pass failed. Only a pass that found
+            // no host (`PassOutcome::Offline`) waits on the network: the retry ladder's, never
+            // a failure, a note whose remedy is the next pass once online (design §3.3). A
+            // pass that reached a host and failed (a refused signature, a failed resolve) is
+            // no wait: a warn whose one act is `aterm pkg update`, which says why.
             let reached_days = index_age_days(&status.last_success_at, now);
-            let unreached =
-                aterm_update_core::pkg_check::Stamps::parse(&status.to_toml().unwrap_or_default())
-                    .last_failed();
+            let stamps =
+                aterm_update_core::pkg_check::Stamps::parse(&status.to_toml().unwrap_or_default());
             match reached_days {
-                Some(days) if unreached && days > INDEX_UNREACHED_WARN_DAYS => {
-                    let _ = match unreached_cause(&status.outcome) {
-                        Some(why) => writeln!(
-                            out,
-                            "{p}: warn — the signed index has not been reached for {days} \
-                             day(s): {why} — now: aterm pkg update"
-                        ),
-                        None => writeln!(
-                            out,
-                            "{p}: warn — the signed index has not been reached for {days} \
-                             day(s) — `aterm pkg update` says why"
-                        ),
+                Some(days) if stamps.last_failed() && days > INDEX_UNREACHED_WARN_DAYS => {
+                    let lead = format!("the signed index has not been reached for {days} day(s)");
+                    let why = match unreached_cause(&status.outcome) {
+                        Some(why) => format!("{lead}: {why} \u{2014} now: aterm pkg update"),
+                        None => format!("{lead} \u{2014} `aterm pkg update` says why"),
                     };
+                    let title = "the signed index, reached lately";
+                    f.push(
+                        if stamps.last_outcome
+                            == Some(aterm_update_core::pkg_check::PassOutcome::Offline)
+                        {
+                            Finding::waits(c::INDEX_REACHED, Class::Install, title, why)
+                                .remedy(Remedy::Network)
+                        } else {
+                            Finding::change(
+                                c::INDEX_REACHED,
+                                Class::Install,
+                                title,
+                                why,
+                                format!("reached within {INDEX_UNREACHED_WARN_DAYS} day(s)"),
+                                Remedy::Command(String::from("aterm pkg update")),
+                            )
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -2332,16 +2798,22 @@ pub fn run_with(
                 && days > INDEX_FROZEN_WARN_DAYS
                 && reached_days.is_some_and(|d| d <= INDEX_UNREACHED_WARN_DAYS)
             {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — index build {} has not changed in {days} day(s) while the \
-                     index was reachable — publishing looks frozen upstream",
-                    status.last_index_build
-                );
+                f.push(Finding::change(
+                    c::INDEX_FROZEN,
+                    Class::Install,
+                    "publishing upstream",
+                    format!(
+                        "index build {} has not changed in {days} day(s) while the index \
+                             was reachable — publishing looks frozen upstream",
+                        status.last_index_build
+                    ),
+                    "moving",
+                    Remedy::None,
+                ));
             }
         }
     } else {
-        let _ = writeln!(out, "{p}: {NEVER_CHECKED}{vendors}");
+        f.push(never_checked());
     }
     // The build floor is printed with the generation that recorded it, because that pair is
     // the gate: a floor stamped with an older generation is re-based by the next
@@ -2352,17 +2824,33 @@ pub fn run_with(
     };
     // A floor of 0 is no floor (`Floor::current` reads a missing file as 0): no index, or no
     // generation, has been accepted, and the row says that rather than an acceptance of 0.
+    let floor_title = "the accepted index";
     let named = match (build_floor.index_build, build_floor.roster_seq) {
         (0, _) => {
-            let _ = writeln!(out, "{p}: no index accepted yet");
+            f.push(Finding::note(
+                c::INDEX_FLOOR,
+                Class::Install,
+                floor_title,
+                "no index accepted yet",
+            ));
             None
         }
         (build, 0) => {
-            let _ = writeln!(out, "{p}: index {build} accepted");
+            f.push(Finding::ok(
+                c::INDEX_FLOOR,
+                Class::Install,
+                floor_title,
+                format!("index {build} accepted"),
+            ));
             None
         }
         (build, seq) => {
-            let _ = writeln!(out, "{p}: index {build} accepted (roster generation {seq})");
+            f.push(Finding::ok(
+                c::INDEX_FLOOR,
+                Class::Install,
+                floor_title,
+                format!("index {build} accepted (roster generation {seq})"),
+            ));
             Some(seq)
         }
     };
@@ -2370,17 +2858,24 @@ pub fn run_with(
     // machine roster this store has accepted. A roster floor stuck while machines have been
     // minted or revoked means this store has not seen a publish since. Said only when it is
     // not the generation the row above already names.
+    let roster_title = "the accepted roster generation";
     match (
         crate::sig::Floor::new(layout.roster_floor()).current(),
         named,
     ) {
         (0, None) => {}
-        (0, Some(_)) => {
-            let _ = writeln!(out, "{p}: no roster generation recorded");
-        }
-        (roster, named) if Some(roster) != named => {
-            let _ = writeln!(out, "{p}: roster generation {roster} accepted");
-        }
+        (0, Some(_)) => f.push(Finding::note(
+            c::ROSTER_FLOOR,
+            Class::Install,
+            roster_title,
+            "no roster generation recorded",
+        )),
+        (roster, named) if Some(roster) != named => f.push(Finding::ok(
+            c::ROSTER_FLOOR,
+            Class::Install,
+            roster_title,
+            format!("roster generation {roster} accepted"),
+        )),
         _ => {}
     }
     // Whether the accepted index is still the newest: the channel-head probe writes its last
@@ -2391,19 +2886,31 @@ pub fn run_with(
                 .and_then(|s| crate::flow::rfc3339_to_unix(&s.last_success_at)),
             held: crate::index_probe::held_index_builds(layout),
         };
-        index_head_line(
-            &crate::index_probe::cached_answer(layout),
-            &last_pass,
-            now,
-            p,
-            out,
-        );
+        let (row, remedy) =
+            index_head_line(&crate::index_probe::cached_answer(layout), &last_pass, now);
+        f.push(Finding::of_row(
+            c::INDEX_HEAD,
+            Class::Install,
+            "the newest index",
+            row,
+            "the newest index, accepted",
+            remedy,
+        ));
     }
     // (8c) Who watches the vendor heads: an aterm window, or with no window open one
     // terminal session, or nobody, and then a new Claude Code or Codex release waits for the
     // next update pass. Said for a vendor program kept at its vendor's head on a machine
     // whose packages update on their own.
-    head_watch_line(layout, probes, p, out);
+    if let Some(row) = head_watch_line(layout, probes) {
+        f.push(Finding::of_row(
+            c::VENDOR_WATCH,
+            Class::Install,
+            "who watches the vendor heads",
+            row,
+            "",
+            Remedy::None,
+        ));
+    }
 
     // (9) Rustup and relocatability, two questions kept apart: is there a rustup at all
     // (PATH, then `$CARGO_HOME/bin`, then `~/.cargo/bin`, which an app-spawned pass may not
@@ -2414,31 +2921,38 @@ pub fn run_with(
     if rustup.is_none() {
         // A note, not a warn: the managed Trust toolchain runs as `targo`/`trustc` from the
         // store, so a missing rustup is a fact about this machine, never something to fix.
-        let _ = writeln!(
-            out,
-            "{p}: note — no rustup on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin; the \
-             managed toolchain runs without it (`targo`, `trustc`)"
-        );
+        f.push(Finding::note(
+            c::RUSTUP,
+            Class::Person,
+            "rustup",
+            "no rustup on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin; the managed toolchain \
+             runs without it (`targo`, `trustc`)",
+        ));
     } else if !rustup_answers {
-        let _ = writeln!(
-            out,
-            "{p}: warn — rustup at {} did not answer `--version` within {} s (a wedged shim, \
-             or a toolchain fetch in flight); rustup `trust` is checked below without it",
-            rustup
-                .as_deref()
-                .map_or_else(String::new, |r| r.display().to_string()),
-            PROBE_TIMEOUT.as_secs()
-        );
+        f.push(Finding::unread(
+            c::RUSTUP,
+            Class::Person,
+            "rustup",
+            format!(
+                "rustup at {} did not answer `--version` within {} s (a wedged shim, or a \
+                 toolchain fetch in flight); rustup `trust` is checked below without it",
+                rustup
+                    .as_deref()
+                    .map_or_else(String::new, |r| r.display().to_string()),
+                PROBE_TIMEOUT.as_secs()
+            ),
+        ));
     }
-    // A link (5e) named has its line and its fix there: neither the re-point below nor
-    // the unlinked-channel line — a link to nothing does not resolve either — says it a
+    // A link (5e) named has its row and its fix there: neither the re-point below nor
+    // the unlinked-channel row — a link to nothing does not resolve either — says it a
     // second time with another fix.
     let local_said = probes.local_seal.is_some();
+    let seam_title = "rustup's trust entry";
     if !local_said
         && let Some(rustup_home) =
             crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)
         && layout.program_current("trust").join("bin").is_dir()
-        && let Some(line) = seam_line(
+        && let Some((row, remedy)) = seam_line(
             &crate::seam::status(layout, &rustup_home, crate::seam::DEFAULT_SEAM),
             layout,
         )
@@ -2446,8 +2960,21 @@ pub fn run_with(
         // The entry exists and is not ours: the link resolves, so the check below would call
         // it healthy while every `cargo +trust` ignores the managed build. Doctor names the
         // one command and re-points nothing: an entry under `~/.rustup` that aterm did not
-        // lay is the user's (the seam module's rule).
-        let _ = writeln!(out, "{p}: {line}");
+        // lay is the user's (the seam module's rule): only the link into the store that
+        // `repair` re-points is a pass's own.
+        let class = if remedy == Remedy::Repair {
+            Class::Relay
+        } else {
+            Class::Person
+        };
+        f.push(Finding::of_row(
+            c::RUSTUP_SEAM,
+            class,
+            seam_title,
+            row,
+            "the managed seam",
+            remedy,
+        ));
     } else if !local_said
         && rustup_answers
         && layout.program_current("trust").join("bin").is_dir()
@@ -2458,27 +2985,41 @@ pub fn run_with(
         // lays the entry or rebuilds the view (a hand `rustup toolchain link` at the store
         // would not do: it ships only Trust's names); without `<rustup_home>/toolchains` it
         // lays nothing, so the fix creates that first.
-        let fix =
+        let (fix, remedy) =
             match crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home) {
-                Some(rh) if !crate::seam::toolchains_dir(&rh).is_dir() => format!(
-                    "mkdir -p '{}' && aterm pkg repair",
-                    crate::seam::toolchains_dir(&rh).display()
-                ),
-                _ => "aterm pkg repair".to_owned(),
+                Some(rh) if !crate::seam::toolchains_dir(&rh).is_dir() => {
+                    let fix = format!(
+                        "mkdir -p '{}' && aterm pkg repair",
+                        crate::seam::toolchains_dir(&rh).display()
+                    );
+                    (fix.clone(), Remedy::Command(fix))
+                }
+                _ => ("aterm pkg repair".to_owned(), Remedy::Repair),
             };
-        let _ = writeln!(
-            out,
-            "{p}: warn — rustup has no working `trust` toolchain, so `cargo +trust` and \
-             projects pinning `channel = \"trust\"` fail here (`targo` and `trustc` still \
-             work) — fix: {fix}"
-        );
+        f.push(Finding::change(
+            c::RUSTUP_SEAM,
+            Class::Relay,
+            seam_title,
+            format!(
+                "rustup has no working `trust` toolchain, so `cargo +trust` and projects \
+                 pinning `channel = \"trust\"` fail here (`targo` and `trustc` still work) — \
+                 fix: {fix}"
+            ),
+            "the managed seam",
+            remedy,
+        ));
     }
     // A stale link the machine replaced on its own ([`replaced_seam_line`]).
     if let Some(rustup_home) =
         crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)
         && let Some(line) = replaced_seam_line(layout, &rustup_home)
     {
-        let _ = writeln!(out, "{p}: {line}");
+        f.push(Finding::note(
+            c::RUSTUP_REPLACED,
+            Class::Relay,
+            "a rustup trust link the machine replaced",
+            line,
+        ));
     }
 
     // (10) The question a user came here with: do I have the toolchain? Everything above
@@ -2494,38 +3035,55 @@ pub fn run_with(
         .map(|s| s.programs.keys().filter(|k| k.starts_with('-')).collect())
         .unwrap_or_default();
     for stray in &strays {
-        let _ = writeln!(
-            out,
-            "{p}: warn — the record holds a stray row for {stray:?}, which cannot be a \
-             program name (it is a command-line flag, left by a mistyped `atpkg install`). \
-             No program is missing because of it; the next successful `aterm pkg update` \
-             clears it"
-        );
+        f.push(Finding::change(
+            c::of(c::RECORD_STRAY, stray),
+            Class::Install,
+            "a record row",
+            format!(
+                "the record holds a stray row for {stray:?}, which cannot be a program name \
+                     (it is a command-line flag, left by a mistyped `atpkg install`). No program \
+                     is missing because of it; the next successful `aterm pkg update` clears it"
+            ),
+            "cleared",
+            update(),
+        ));
     }
     // (10a) System-satisfied members. A member the signed index marks `system = "<bin>"`
     // that the pass found on PATH outside the prefix is not managed here (its row says
     // `system: <path> — not managed by aterm`) and is neither missing nor a fault. The
-    // recorded path is re-checked: a binary since gone is worth a line, because the next
+    // recorded path is re-checked: a binary since gone is worth a row, because the next
     // pass installs the member through its artifact.
     if let Some(s) = status.as_ref() {
         for (program, row) in &s.programs {
             let Some(path) = crate::state::system_path(&row.state) else {
                 continue;
             };
-            if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — {program}: {} (remove that copy to have atpkg manage {program})",
-                    row.state
-                );
+            let id = c::of(c::SYSTEM, program);
+            let title = format!("{program}, satisfied by the system");
+            f.push(if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+                Finding::ok(
+                    id,
+                    Class::Person,
+                    title,
+                    format!(
+                        "{program}: {} (remove that copy to have atpkg manage {program})",
+                        row.state
+                    ),
+                )
             } else {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — {program}: recorded as `{}`, but that copy is gone — the \
-                     next `aterm pkg update` reinstalls the managed copy",
-                    row.state
-                );
-            }
+                Finding::change(
+                    id,
+                    Class::Install,
+                    title,
+                    format!(
+                        "{program}: recorded as `{}`, but that copy is gone — the next `aterm \
+                         pkg update` reinstalls the managed copy",
+                        row.state
+                    ),
+                    "the managed copy",
+                    update(),
+                )
+            });
         }
     }
     // (10g) Members held on their current build ([`crate::state::held_unpublished`]): the
@@ -2539,12 +3097,16 @@ pub fn run_with(
             if row.state.starts_with(crate::state::HELD_PREFIX)
                 && !row.state.starts_with(crate::state::HELD_FAILED_PREFIX)
             {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — {program}: {} (nothing to do here; the next pass moves the \
-                     group once the index publishes for this target)",
-                    row.state
-                );
+                f.push(Finding::ok(
+                    c::of(c::HELD, program),
+                    Class::Install,
+                    format!("{program}, held on its build"),
+                    format!(
+                        "{program}: {} (nothing to do here; the next pass moves the group once \
+                         the index publishes for this target)",
+                        row.state
+                    ),
+                ));
             }
         }
     }
@@ -2556,6 +3118,9 @@ pub fn run_with(
         if crate::linkmode::is_linked(layout, program) {
             continue;
         }
+        let id = c::of(c::SHADOW, program);
+        let title = format!("what PATH runs for {program}");
+        let managed_first = "the managed copy, first on PATH";
         // An agent program's reroute stub decides at exec time: with `reroute/<name>` first
         // on this PATH, what runs is the stub's choice, either the managed twin inside aterm
         // (no shadow however stale this shell's PATH is; said below as an `ok` naming the
@@ -2571,7 +3136,12 @@ pub fn run_with(
             && let Some(row) =
                 crate::cli::agent_routed_row(layout, program, *build, path_var, probes.stub_env)
         {
-            let _ = writeln!(out, "{p}: ok — {program}: {row}");
+            f.push(Finding::ok(
+                id,
+                Class::Person,
+                title,
+                format!("{program}: {row}"),
+            ));
             continue;
         }
         if let Some((tool, path)) = shadow {
@@ -2585,7 +3155,12 @@ pub fn run_with(
                 path_var,
                 probes.stub_env,
             ) {
-                let _ = writeln!(out, "{p}: note — {program}: {row}");
+                f.push(Finding::note(
+                    id,
+                    Class::Person,
+                    title,
+                    format!("{program}: {row}"),
+                ));
                 continue;
             }
             // An agent program whose `agents/` twin is laid and current: every tab runs
@@ -2595,7 +3170,14 @@ pub fn run_with(
             if let Some(row) =
                 crate::cli::agent_shell_shadow(layout, program, *build, &path, path_var)
             {
-                let _ = writeln!(out, "{p}: warn — {program}: {row}");
+                f.push(Finding::change(
+                    id,
+                    Class::Person,
+                    title,
+                    format!("{program}: {row}"),
+                    managed_first,
+                    Remedy::None,
+                ));
                 continue;
             }
             // The canonical state, then, when `alab-<tool>` is laid, one trailing sentence
@@ -2611,12 +3193,21 @@ pub fn run_with(
                 Some(s) => format!("the copy aterm updates from {}", s.vendor),
                 None => String::from("the pinned build"),
             };
-            let _ = writeln!(
-                out,
-                "{p}: warn — {program}: {} (not {managed}; atpkg never edits PATH — remove or \
-                 reorder that copy if you want the managed one){fix}",
-                crate::state::shadowed(*build, &path)
-            );
+            f.push(Finding::change(
+                id,
+                Class::Person,
+                title,
+                format!(
+                    "{program}: {} (not {managed}; atpkg never edits PATH — remove or reorder \
+                     that copy if you want the managed one){fix}",
+                    crate::state::shadowed(*build, &path)
+                ),
+                managed_first,
+                Remedy::Person {
+                    pane: path.display().to_string(),
+                    how: String::from("remove or reorder that copy if you want the managed one"),
+                },
+            ));
         }
     }
     // (10f) Managed members whose shim exports an environment (`shim_env`, e.g. the vendor's
@@ -2628,6 +3219,8 @@ pub fn run_with(
         if crate::linkmode::is_linked(layout, program) {
             continue;
         }
+        let id = c::of(c::SHIM_ENV, program);
+        let title = format!("{program}'s shim environment");
         let tools = crate::ops::active_tools(layout, program, *build);
         if let Some(drift) =
             crate::activate::shim_env_drift(layout, &layout.build_dir(program, *build), &tools)
@@ -2635,7 +3228,14 @@ pub fn run_with(
         {
             let have = crate::platform::shim_env_of(shim);
             let line = env_drift_line(program, *build, shim, &have, &drift.declared);
-            let _ = writeln!(out, "{p}: warn — {program}: {line}");
+            f.push(Finding::change(
+                id,
+                Class::Relay,
+                title,
+                format!("{program}: {line}"),
+                "what its build declares",
+                Remedy::Repair,
+            ));
             continue;
         }
         let Some(fix) = tools
@@ -2672,7 +3272,12 @@ pub fn run_with(
                 format!("{state} — {fix} (updates arrive with the ALab index)")
             }
         };
-        let _ = writeln!(out, "{p}: ok — {program}: {line}");
+        f.push(Finding::ok(
+            id,
+            Class::Relay,
+            title,
+            format!("{program}: {line}"),
+        ));
     }
     // (10h) Claude Code's defaults (top-effort mode, `xhigh` effort, surveys off, the drafts
     // card quiet, autocompaction at 400k tokens). An aterm window adds each where unset
@@ -2682,15 +3287,21 @@ pub fn run_with(
     if installed.iter().any(|(program, _)| *program == "claude")
         && let Some(states) = &probes.claude_defaults
     {
+        let title = "Claude Code's defaults";
         let states = match states {
             Ok(states) => states.as_slice(),
             Err(why) => {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — claude: ~/.claude/settings.json cannot take aterm's defaults \
-                     ({why}) — an aterm window leaves the file exactly as it is and adds none \
-                     of them"
-                );
+                f.push(Finding::change(
+                    c::CLAUDE_DEFAULTS,
+                    Class::Person,
+                    title,
+                    format!(
+                        "claude: ~/.claude/settings.json cannot take aterm's defaults ({why}) — \
+                         an aterm window leaves the file exactly as it is and adds none of them"
+                    ),
+                    "aterm's defaults, where unset",
+                    Remedy::None,
+                ));
                 &[]
             }
         };
@@ -2713,19 +3324,25 @@ pub fn run_with(
                     key => key,
                 })
                 .collect();
-            let _ = writeln!(
-                out,
-                "{p}: ok — claude: {} set to aterm's {} ({}) in ~/.claude/settings.json",
-                defaults.join(", "),
-                if defaults.len() == 1 {
-                    "default"
-                } else {
-                    "defaults"
-                },
-                meaning.join(", ")
-            );
+            f.push(Finding::ok(
+                c::CLAUDE_DEFAULTS,
+                Class::Preference,
+                title,
+                format!(
+                    "claude: {} set to aterm's {} ({}) in ~/.claude/settings.json",
+                    defaults.join(", "),
+                    if defaults.len() == 1 {
+                        "default"
+                    } else {
+                        "defaults"
+                    },
+                    meaning.join(", ")
+                ),
+            ));
         }
         for (key, state) in states {
+            let id = c::of(c::CLAUDE_DEFAULTS, key);
+            let title = format!("Claude Code's {key}");
             match state {
                 DefaultState::Default => {}
                 DefaultState::Manual(value) => {
@@ -2733,63 +3350,85 @@ pub fn run_with(
                     // surveys on: kept, and said, with what an aterm-supervised session
                     // then does about them.
                     let on = if *key == CLAUDE_SURVEY_SWITCH {
-                        " — Claude Code reads only 1, true, yes or on as off, so it will \
-                         still show its rating surveys (an aterm-supervised session dismisses \
-                         each with a 0 unless [harness] dismiss_surveys is false)"
+                        " — Claude Code reads only 1, true, yes or on as off, so it will still \
+                         show its rating surveys (an aterm-supervised session dismisses each \
+                         with a 0 unless [harness] dismiss_surveys is false)"
                     } else {
                         ""
                     };
-                    let _ = writeln!(
-                        out,
-                        "{p}: ok — claude: {key} is {value}, set by hand — kept (aterm adds \
-                         its default only where a key is unset){on}"
-                    );
+                    f.push(Finding::ok(
+                        id,
+                        Class::Person,
+                        title,
+                        format!(
+                            "claude: {key} is {value}, set by hand — kept (aterm adds its \
+                             default only where a key is unset){on}"
+                        ),
+                    ));
                 }
-                DefaultState::HeldForEffort(effort) => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: ok — claude: {key} is unset and stays so — an effort is set by \
-                         hand ({effort}), and aterm adds {CLAUDE_TOP_EFFORT_KEY} and xhigh \
-                         effort only where no other effort was chosen"
-                    );
-                }
-                DefaultState::HeldForRate(rate) => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: ok — claude: {key} is unset and stays so — feedbackSurveyRate is \
-                         set by hand ({rate}), and aterm adds the switch that turns EVERY rating \
-                         survey off only where that probability is unset or 0"
-                    );
-                }
-                DefaultState::HeldForOffer(why) => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: ok — claude: {key} is unset and stays so — {why}, and aterm adds \
-                         its 400k window only where no Keep answer stands (/autocompact in \
-                         Claude Code sets a window for a model)"
-                    );
-                }
-                DefaultState::OverridesEffort(effort) => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: warn — claude: \"{key}\": true in ~/.claude/settings.json \
-                         overrides the effort set by hand ({effort}) — Claude Code runs xhigh \
-                         while it stands — fix: remove \"{key}\" from ~/.claude/settings.json \
-                         to use that effort (a ~/.claude/settings.json.bak-<unix> may hold \
-                         the file from before)"
-                    );
-                }
+                DefaultState::HeldForEffort(effort) => f.push(Finding::ok(
+                    id,
+                    Class::Person,
+                    title,
+                    format!(
+                        "claude: {key} is unset and stays so — an effort is set by hand \
+                         ({effort}), and aterm adds {CLAUDE_TOP_EFFORT_KEY} and xhigh effort \
+                         only where no other effort was chosen"
+                    ),
+                )),
+                DefaultState::HeldForRate(rate) => f.push(Finding::ok(
+                    id,
+                    Class::Person,
+                    title,
+                    format!(
+                        "claude: {key} is unset and stays so — feedbackSurveyRate is set by \
+                         hand ({rate}), and aterm adds the switch that turns EVERY rating survey \
+                         off only where that probability is unset or 0"
+                    ),
+                )),
+                DefaultState::HeldForOffer(why) => f.push(Finding::ok(
+                    id,
+                    Class::Person,
+                    title,
+                    format!(
+                        "claude: {key} is unset and stays so — {why}, and aterm adds its 400k \
+                         window only where no Keep answer stands (/autocompact in Claude Code \
+                         sets a window for a model)"
+                    ),
+                )),
+                DefaultState::OverridesEffort(effort) => f.push(Finding::change(
+                    id,
+                    Class::Person,
+                    title,
+                    format!(
+                        "claude: \"{key}\": true in ~/.claude/settings.json overrides the effort \
+                         set by hand ({effort}) — Claude Code runs xhigh while it stands — fix: \
+                         remove \"{key}\" from ~/.claude/settings.json to use that effort (a \
+                         ~/.claude/settings.json.bak-<unix> may hold the file from before)"
+                    ),
+                    "unset",
+                    Remedy::Person {
+                        pane: String::from("~/.claude/settings.json"),
+                        how: format!("remove \"{key}\" from ~/.claude/settings.json"),
+                    },
+                )),
                 DefaultState::Unset => {
                     let want = CLAUDE_DEFAULTS
                         .iter()
                         .find(|(k, _)| k == key)
                         .map_or(String::new(), |(_, v)| v.json_text());
                     let line = default_line(key, &want);
-                    let _ = writeln!(
-                        out,
-                        "{p}: warn — claude: {key} is unset in ~/.claude/settings.json — an \
-                         aterm window adds {line} at its next start"
-                    );
+                    f.push(Finding::change(
+                        id,
+                        Class::Preference,
+                        title,
+                        format!(
+                            "claude: {key} is unset in ~/.claude/settings.json — an aterm \
+                             window adds {line} at its next start"
+                        ),
+                        line,
+                        Remedy::None,
+                    ));
                 }
             }
         }
@@ -2815,10 +3454,19 @@ pub fn run_with(
     // Only the index knows what should be here. Offline and best-effort (`cached_index`):
     // an unreachable index never invents a missing program.
     let (dev_linked, link_problems) = live_dev_links(layout);
-    for why in &link_problems {
-        let _ = writeln!(out, "{p}: PROBLEM — {why}");
+    for why in link_problems {
+        f.push(
+            Finding::change(
+                c::DEV_LINK,
+                Class::Person,
+                "a dev link",
+                why,
+                "a dev link that runs",
+                Remedy::None,
+            )
+            .essential(),
+        );
     }
-    fails += link_problems.len();
     let active_count = installed
         .keys()
         .chain(dev_linked.iter())
@@ -2829,12 +3477,11 @@ pub fn run_with(
     // (11b) An unserved member is explained by its own row, not missing without a reason
     // (`drop_unserved`; identity on macOS).
     let missing_unexplained = drop_unserved(missing_unexplained, toolset_unserved.as_deref());
-    let mut toolset_problem = false;
     if let Some(unserved) = &toolset_unserved {
         // Said once, as what it is: a fact about the index and this target, which no
         // install on this machine changes — the state, and no act. The members it names
         // are the ones whose own rows say so; the served members (the agents) are
-        // reported like any other — their per-program lines print ABOVE this note (the
+        // reported like any other — their per-program rows print ABOVE this note (the
         // program loop runs first), so the note does not point "below". On Linux the one
         // local route is a dev link of a locally built program (`aterm pkg link`,
         // docs/LINUX-LOCAL-TOOLCHAIN.md), so the note names it instead of "nothing".
@@ -2850,34 +3497,68 @@ pub fn run_with(
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let _ = writeln!(
-            out,
-            "{p}: note — the ALab toolset is unavailable on this platform: no build is \
-             published for this target{}{}; {}",
-            if alab.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", named(&alab))
-            },
-            if vendors.is_empty() {
-                String::new()
-            } else {
-                format!(", and {} publishes none for it either", named(&vendors))
-            },
-            if cfg!(target_os = "linux") {
-                "a local build links in with `aterm pkg link <program> <checkout>` \
-                 (docs/LINUX-LOCAL-TOOLCHAIN.md)"
-            } else {
-                "nothing on this machine changes that"
-            }
-        );
+        f.push(Finding::note(
+            c::TOOLSET_PLATFORM,
+            Class::Install,
+            "the ALab toolset on this platform",
+            format!(
+                "the ALab toolset is unavailable on this platform: no build is published for \
+                 this target{}{}; {}",
+                if alab.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", named(&alab))
+                },
+                if vendors.is_empty() {
+                    String::new()
+                } else {
+                    format!(", and {} publishes none for it either", named(&vendors))
+                },
+                if cfg!(target_os = "linux") {
+                    "a local build links in with `aterm pkg link <program> <checkout>` \
+                     (docs/LINUX-LOCAL-TOOLCHAIN.md)"
+                } else {
+                    "nothing on this machine changes that"
+                }
+            ),
+        ));
     }
-    if declined {
+    // The toolset row, essential: the one item whose door is the next act of an empty store.
+    let toolset = "the ALab toolset";
+    let want = "the ALab default set, installed";
+    // The whole-set install cannot serve an unserved platform (the note above); there the
+    // door is the explicit one of the served member the verdict is about — unless the
+    // verdict is toolset-wide (an unreachable index), which the ordinary door answers
+    // exactly as it does elsewhere.
+    let unserved_door = if active_count == 0 && toolset_unserved.is_some() {
+        unserved_platform_next(&recorded_problems, &missing_unexplained)
+    } else {
+        None
+    };
+    let door = toolset_door(
+        &ToolsetFacts {
+            unserved_door,
+            empty_store: active_count == 0,
+            recorded_problems: &recorded_problems,
+            declined,
+            missing: !missing_unexplained.is_empty(),
+            removed_on_purpose: !missing_on_purpose.is_empty(),
+        },
+        |program| in_coherence_group(layout, program),
+    );
+    let problem =
+        |why: String| Finding::change(c::TOOLSET, Class::Install, toolset, why, want, door.clone());
+    let row = if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
-        let _ = writeln!(
-            out,
-            "{p}: {DECLINED_LINE} (`aterm pkg install --default-set` reinstalls it)"
-        );
+        Finding::note(
+            c::TOOLSET,
+            Class::Install,
+            toolset,
+            format!("{DECLINED_LINE} (`aterm pkg install --default-set` reinstalls it)"),
+        )
+        .remedy(Remedy::Command(String::from(
+            "aterm pkg install --default-set",
+        )))
     } else if active_count == 0
         && unserved_store_is_quiet(
             toolset_unserved.is_some(),
@@ -2888,17 +3569,15 @@ pub fn run_with(
         // Nothing active because nothing published for this target is missing: the note
         // above is the whole story, not a problem to count or exit 1 for. A served member
         // that failed, is held, or is missing without a row takes the branch below.
-        let _ = writeln!(
-            out,
-            "{p}: 0 program(s) active — none is published for this platform, so none is \
-             missing"
-        );
+        Finding::ok(
+            c::TOOLSET,
+            Class::Install,
+            toolset,
+            "0 program(s) active — none is published for this platform, so none is missing",
+        )
     } else if active_count == 0 {
-        toolset_problem = true;
         match recorded_problems.first() {
-            Some(why) => {
-                let _ = writeln!(out, "{p}: PROBLEM — no ALab programs are installed ({why})");
-            }
+            Some(why) => problem(format!("no ALab programs are installed ({why})")),
             // An environmental failure (an unreachable index) leaves no per-program row, so
             // the aggregate outcome is the only place the reason lives; preferring it to the
             // generic hint keeps "why did nothing arrive?" answerable offline.
@@ -2907,47 +3586,45 @@ pub fn run_with(
                 .map(|s| s.outcome.as_str())
                 .filter(|o| !o.is_empty())
             {
-                Some(outcome) => {
-                    let _ = writeln!(
-                        out,
-                        "{p}: PROBLEM — no ALab programs are installed (last attempt: {outcome})"
-                    );
-                }
-                // The fix is the tail's one `next` act (`aterm pkg install --default-set`),
-                // said there and not twice.
-                None => {
-                    let _ = writeln!(out, "{p}: PROBLEM — no ALab programs are installed");
-                }
+                Some(outcome) => problem(format!(
+                    "no ALab programs are installed (last attempt: {outcome})"
+                )),
+                // The fix is the row's door, the next act (`aterm pkg install
+                // --default-set`), said there and not twice.
+                None => problem(String::from("no ALab programs are installed")),
             },
         }
     } else if !recorded_problems.is_empty() {
         // Something is installed, but the record carries live failures: a partial first run,
         // a blocked disk, a member with no build for this triple, an aborted coherence-group
-        // transaction.
-        toolset_problem = true;
-        // No count here: the tail's "found N problem(s)" counts differently (structural
-        // failures plus the toolset condition as one), and two Ns would contradict.
-        let _ = writeln!(
-            out,
-            "{p}: PROBLEM — the toolset is incomplete; {} program(s) active",
-            active_count
-        );
+        // transaction. No count here: the verdict's "found N problem(s)" counts the rows
+        // that fail, and two Ns would contradict.
+        problem(format!(
+            "the toolset is incomplete; {active_count} program(s) active"
+        ))
     } else if !missing_unexplained.is_empty() {
         // The machine wants these, does not have them, and nothing recorded a reason; the
         // branch above reports failures the record names.
-        toolset_problem = true;
-        let _ = writeln!(
-            out,
-            "{p}: PROBLEM — the toolset is incomplete: {} of {} program(s) the signed \
-             index serves are not installed ({})",
+        problem(format!(
+            "the toolset is incomplete: {} of {} program(s) the signed index serves are not \
+             installed ({})",
             missing_unexplained.len(),
             active_count + missing_unexplained.len() + missing_on_purpose.len(),
             missing_unexplained.join(", ")
-        );
+        ))
     } else {
         // Not "ALab program(s)": the count includes the vendor-direct agents.
-        let _ = writeln!(out, "{p}: {active_count} program(s) active");
-    }
+        Finding::ok(
+            c::TOOLSET,
+            Class::Install,
+            toolset,
+            format!("{active_count} program(s) active"),
+        )
+        .detail(active_count.to_string())
+    };
+    // Essential in every state, as an item is: a reader of `--json` sees the row that decides
+    // the exit whether or not it fails it now (a declined store's note and an `ok` never do).
+    f.push(row.essential());
     // A dev link and a deliberate removal are not faults, but they must be visible: the
     // removal ledger is a file no user reads, and its effect (no stub, no unattended
     // reinstall, a coherence group that never activates) looks like the program never
@@ -2956,160 +3633,127 @@ pub fn run_with(
         let from = crate::linkmode::linked_checkout(layout, program)
             .map(|c| c.display().to_string())
             .unwrap_or_else(|| "a checkout".to_string());
-        let _ = writeln!(
-            out,
-            "{p}: ok — {program}: dev-linked from {from} (not the index build; `aterm pkg unlink \
-             {program}` returns it to the index)"
-        );
+        f.push(Finding::ok(
+            c::of(c::DEV_LINK, program),
+            Class::Person,
+            format!("{program}'s dev link"),
+            format!(
+                "{program}: dev-linked from {from} (not the index build; `aterm pkg unlink \
+                 {program}` returns it to the index)"
+            ),
+        ));
     }
     for program in &missing_on_purpose {
-        let _ = writeln!(
-            out,
-            "{p}: ok — {program}: removed on purpose — no unattended pass reinstalls it \
-             (aterm pkg install {program} brings it back)"
-        );
+        f.push(Finding::ok(
+            c::of(c::REMOVED, program),
+            Class::Person,
+            format!("{program}, removed on purpose"),
+            format!(
+                "{program}: removed on purpose — no unattended pass reinstalls it (aterm pkg \
+                 install {program} brings it back)"
+            ),
+        ));
     }
     if let Some(start) = problem_listing_start(declined, active_count == 0, recorded_problems.len())
     {
         for why in recorded_problems.iter().skip(start) {
-            let _ = writeln!(out, "{p}:   {why}");
+            // `<program>: <state>`, as `recorded_problems` writes each.
+            let program = why.split(": ").next().unwrap_or(why);
+            f.push(Finding::change(
+                c::of(c::TOOLSET_MEMBER, program),
+                Class::Install,
+                format!("{program}, a recorded problem"),
+                why.clone(),
+                "installed",
+                Remedy::None,
+            ));
         }
     }
 
     // (11) The C toolchain, a prerequisite probed and never shipped (`crate::prereq`), only
     // where a toolset is installed (that is what it stops from building). An answer (no
-    // toolchain, or one that refuses) is a FAIL: "healthy" over a machine whose first
+    // toolchain, or one that refuses) fails the report: "healthy" over a machine whose first
     // `targo build` dies in a build script is the vacuous pass (10) guards against. An
-    // unknown is a warn; a target it does not apply to, a note.
-    let mut next_prereq = false;
+    // unknown is said; a target it does not apply to, a note.
     if active_count > 0
         && let Some(verdict) = probes.cc.as_ref()
     {
+        let title = "the C toolchain";
         let line = verdict.line();
-        match verdict {
+        f.push(match verdict {
             crate::prereq::CcVerdict::Ready { .. } => {
-                let _ = writeln!(out, "{p}: ok — {line}");
+                Finding::ok(c::CLT, Class::Elevate, title, line).essential()
             }
             crate::prereq::CcVerdict::NotProbed => {
-                let _ = writeln!(out, "{p}: note — {line}");
+                Finding::note(c::CLT, Class::Elevate, title, line).essential()
             }
             crate::prereq::CcVerdict::Unanswered { .. }
             | crate::prereq::CcVerdict::Unproven { .. } => {
-                let _ = writeln!(out, "{p}: warn — {line}");
+                Finding::unread(c::CLT, Class::Elevate, title, line)
             }
-            _ => {
-                fails += 1;
-                next_prereq = true;
-                let _ = writeln!(err, "{p}: FAIL — {line}");
-            }
-        }
+            // A compiler that refuses with no one act to name (macOS: it is installed, and
+            // its own stderr is the cause) has its remedy inline: no door.
+            _ => Finding::change(
+                c::CLT,
+                Class::Elevate,
+                title,
+                line,
+                "a C toolchain that builds",
+                verdict
+                    .fix()
+                    .map_or(Remedy::None, |fix| Remedy::Command(fix.to_owned())),
+            )
+            .essential(),
+        });
     }
-
-    if fails == 0 && !toolset_problem && tools_cannot_run == 0 && tools_unproven == 0 {
-        let _ = writeln!(out, "{p}: healthy");
-        true
-    } else if fails == 0 && !toolset_problem {
-        // Nothing structural, but a managed tool that cannot run, or that doctor cannot show
-        // to run, is not health. The warn above carries its own remedy, so no `next` line.
-        let _ = writeln!(
-            out,
-            "{p}: not healthy — {} (see below)",
-            withheld_summary(tools_cannot_run, tools_unproven)
-        );
-        true
-    } else {
-        let total = fails + usize::from(toolset_problem);
-        let _ = writeln!(out, "{p}: found {total} problem(s)");
-        // The whole-set install cannot serve an unserved platform (the note above); there
-        // the act is the explicit door of the served member the verdict is about — unless
-        // the verdict is toolset-wide (an unreachable index), which the ordinary act
-        // answers exactly as it does elsewhere.
-        let unserved_door = if toolset_problem && active_count == 0 && toolset_unserved.is_some() {
-            unserved_platform_next(&recorded_problems, &missing_unexplained)
-        } else {
-            None
-        };
-        let next = next_act(
-            &NextFacts {
-                unserved_door,
-                toolset_problem,
-                empty_store: active_count == 0,
-                recorded_problems: &recorded_problems,
-                prereq_failed: next_prereq,
-                prereq_fix: probes.cc.as_ref().and_then(crate::prereq::CcVerdict::fix),
-                publish: next_publish,
-                declined,
-                update_divergence: next_update_divergence,
-                install_program: next_install_program.as_deref(),
-            },
-            |program| in_coherence_group(layout, program),
-        );
-        if let Some(act) = next {
-            let _ = writeln!(out, "{p}: next — {act}");
-        }
-        false
-    }
+    f
 }
 
-/// What doctor's one next act is chosen from ([`next_act`]): facts the report has read.
+/// What the toolset row's door is chosen from ([`toolset_door`]): facts the report has read.
 #[derive(Debug, Default)]
-struct NextFacts<'a> {
+struct ToolsetFacts<'a> {
     /// The served member's door on an unserved platform ([`unserved_platform_next`]).
     unserved_door: Option<String>,
-    /// A toolset-wide verdict is a problem.
-    toolset_problem: bool,
     /// No managed program is active.
     empty_store: bool,
     /// `"<program>: <state>"` for each recorded problem.
     recorded_problems: &'a [String],
-    /// The C toolchain prerequisite failed (11).
-    prereq_failed: bool,
-    /// Its one act, when it has one ([`crate::prereq::CcVerdict::fix`]).
-    prereq_fix: Option<&'static str>,
-    /// The newer Trust coherence group has to be published first.
-    publish: bool,
     /// The owner declined the toolset.
     declined: bool,
-    /// A managed shim diverged from the build its store names.
-    update_divergence: bool,
-    /// The one program whose structural repair is the act.
-    install_program: Option<&'a str>,
+    /// Members the signed index serves are missing with no recorded reason.
+    missing: bool,
+    /// A member was removed on purpose (the removed ledger).
+    removed_on_purpose: bool,
 }
 
-/// The one next act: a single command, never a menu (a pile of problems and three
-/// suggestions teaches a first-hour user to close the terminal). Priority: an unserved
-/// platform's member door; the missing set (an empty store has exactly one fix); the C
-/// toolchain; a publish; a held member's door; `update` (a successful pass rewrites every
-/// recorded fault row and re-flips diverged shims); then one program's structural repair.
-/// Failures with their remedy inline (a stray .sh: "remove it") add no line. `grouped`
+/// The toolset row's one door, the report's next act when the toolset fails it
+/// ([`next_act`]): an unserved platform's member door; for an empty store the whole-set
+/// install, or a held member's door (the whole-set pass honours the hold and repeats it,
+/// `skip_held_member`); a held member's door, or `--retry` beside other problems (a plain
+/// `update` repeats a hold); `update`, which rewrites every recorded fault row; for members
+/// missing with no recorded reason the whole-set install, the explicit door whatever
+/// `[packages]` consent says (design §3.2), and no pass waits on the network for them.
+/// [`Remedy::None`] when no one door fits: beside a member removed on purpose, which the
+/// whole-set install would bring back (its own row names `install <program>`). `grouped`
 /// says whether a program is in a coherence group, which decides a held member's door
 /// ([`held_door`]).
-fn next_act(f: &NextFacts<'_>, grouped: impl Fn(&str) -> bool) -> Option<String> {
+fn toolset_door(f: &ToolsetFacts<'_>, grouped: impl Fn(&str) -> bool) -> Remedy {
+    toolset_command(f, grouped).map_or(Remedy::None, Remedy::Command)
+}
+
+/// [`toolset_door`]'s command, `None` where it names none.
+fn toolset_command(f: &ToolsetFacts<'_>, grouped: impl Fn(&str) -> bool) -> Option<String> {
     let door = |program: &str| held_door(program, grouped(program));
     if f.unserved_door.is_some() {
         f.unserved_door.clone()
-    } else if f.toolset_problem && f.empty_store {
-        // Never over a held member: the whole-set pass honours the hold and repeats it
-        // (`skip_held_member`), so the act is that member's explicit door, which forgets its
-        // memo before it stages.
+    } else if f.empty_store {
         Some(
             first_held_member(f.recorded_problems)
                 .map_or_else(|| String::from("aterm pkg install --default-set"), door),
         )
-    } else if f.prereq_failed {
-        // No amount of updating installs a C compiler: the prerequisite outranks it. A
-        // compiler that refuses with no one act to name (macOS: it is installed, and its own
-        // stderr is the cause) has its remedy inline: no `next` line.
-        f.prereq_fix.map(String::from)
-    } else if f.publish {
-        Some(format!(
-            "publish the newer Trust coherence group ({PUBLISH_RUSTC_GROUP} on a rostered \
-             machine holding the seal), then aterm pkg update trust"
-        ))
-    } else if !f.declined && f.recorded_problems.iter().any(|why| is_held_problem(why)) {
-        // A held member is the one recorded problem a plain `update` cannot move: the pass
-        // honours the hold and repeats it. Alone, the act is that member's own door; with
-        // other problems, `--retry` is the one pass that answers every recorded fault.
+    } else if f.declined {
+        None
+    } else if f.recorded_problems.iter().any(|why| is_held_problem(why)) {
         Some(
             match (
                 f.recorded_problems.len(),
@@ -3119,11 +3763,12 @@ fn next_act(f: &NextFacts<'_>, grouped: impl Fn(&str) -> bool) -> Option<String>
                 _ => String::from("aterm pkg update --retry"),
             },
         )
-    } else if (!f.recorded_problems.is_empty() && !f.declined) || f.update_divergence {
+    } else if !f.recorded_problems.is_empty() {
         Some(String::from("aterm pkg update"))
+    } else if f.missing && !f.removed_on_purpose {
+        Some(String::from("aterm pkg install --default-set"))
     } else {
-        f.install_program
-            .map(|program| format!("aterm pkg install {program}"))
+        None
     }
 }
 
@@ -3223,46 +3868,63 @@ fn env_drift_line(
     )
 }
 
-/// [`run_with`]'s lines for the toolchain flip held for quiet and the live build leases,
-/// each after its level: `note — …`, or `warn — …` when the leases cannot be read (then
-/// gc keeps every build it would reclaim, and the held flip waits, until they can).
-fn hold_lines(layout: &Layout, now: i64) -> Vec<String> {
-    let mut lines = Vec::new();
+/// [`read`]'s rows for the toolchain flip held for quiet and the live build leases: each a
+/// wait, or a warn when the leases cannot be read (then gc keeps every build it would
+/// reclaim, and the held flip waits, until they can).
+fn hold_findings(layout: &Layout, now: i64) -> Vec<Finding> {
+    let mut rows = Vec::new();
+    let held = "the held toolchain update";
     // Only a record that still describes a wait is said as one; one that outlived every
     // build it moves off is said as that, and left for a door that writes to end
     // ([`crate::quiet::held`] — doctor changes nothing).
     match crate::quiet::held(layout) {
         crate::quiet::Held::Nothing => {}
-        crate::quiet::Held::Waits(deferral) => lines.push(format!(
-            "note \u{2014} {}",
-            deferral.sentence(now, &crate::vendor_direct::watch::watcher(layout))
+        crate::quiet::Held::Waits(deferral) => rows.push(Finding::waits(
+            c::HELD_UPDATE,
+            Class::Install,
+            held,
+            deferral.sentence(now, &crate::vendor_direct::watch::watcher(layout)),
         )),
-        crate::quiet::Held::Outlived(record) => lines.push(format!(
-            "note \u{2014} the record of a held Trust toolchain update ({}) outlived every \
-             build it moves off, so nothing waits for it; `aterm pkg repair` ends it, as the \
-             next update pass does",
-            record.moves(),
-        )),
+        crate::quiet::Held::Outlived(record) => rows.push(
+            Finding::note(
+                c::HELD_UPDATE,
+                Class::Relay,
+                held,
+                format!(
+                    "the record of a held Trust toolchain update ({}) outlived every build it \
+                     moves off, so nothing waits for it; `aterm pkg repair` ends it, as the next \
+                     update pass does",
+                    record.moves(),
+                ),
+            )
+            .remedy(Remedy::Repair),
+        ),
     }
+    let leases = "a build lease";
     match crate::lease::live(&layout.prefix) {
-        Ok(leases) => {
-            lines.extend(
-                leases
-                    .iter()
-                    .filter_map(|(subject, holders)| lease_line(subject, holders)),
+        Ok(live) => {
+            rows.extend(
+                live.iter()
+                    .filter_map(|(subject, holders)| lease_line(subject, holders))
+                    .map(|line| Finding::waits(c::LEASES, Class::Person, leases, line)),
             );
         }
-        Err(e) => lines.push(format!(
-            "warn \u{2014} the build leases under {} cannot be read ({e}): gc keeps every \
-             build it would reclaim, and a held toolchain update waits, until they can",
-            crate::lease::dir(&layout.prefix).display()
+        Err(e) => rows.push(Finding::unread(
+            c::LEASES,
+            Class::Person,
+            leases,
+            format!(
+                "the build leases under {} cannot be read ({e}): gc keeps every build it would \
+                 reclaim, and a held toolchain update waits, until they can",
+                crate::lease::dir(&layout.prefix).display()
+            ),
         )),
     }
-    lines
+    rows
 }
 
-/// The note for one leased subject, or `None` for a free one. gc keeps a leased build and
-/// the seam leaves a leased view as it stands, so the line says it stays as it is, in the
+/// The words for one leased subject, or `None` for a free one. gc keeps a leased build and
+/// the seam leaves a leased view as it stands, so the row says it stays as it is, in the
 /// words the held-flip row uses ([`crate::lease::Subject::describe`],
 /// [`crate::lease::Holders::clause`]), until the holder's run ends or, with no holder
 /// known, until its lease can be read.
@@ -3273,19 +3935,19 @@ fn lease_line(subject: &crate::lease::Subject, holders: &crate::lease::Holders) 
         crate::lease::Holders::Free => return None,
     };
     Some(format!(
-        "note \u{2014} {} is {}; it stays as it is until {until}",
+        "{} is {}; it stays as it is until {until}",
         subject.describe(),
         holders.clause()
     ))
 }
 
-/// The (5f)(c) line for an active trust build that [`crate::compat::needs_root`], and what it
-/// claims ([`ToolClaim`]). An absent root, or unrouted shims, run the store path, where tippy
-/// cannot run; through a root that differs from the build it may not. Behind a blocked
-/// `compat` ([`crate::compat::Blocked`], which `repair` also refuses) it cannot run with no
-/// shim routed and may not with one routed earlier. A matching root with every shim routed
-/// is the note.
-fn exec_root_line(p: &str, build: u64, i: &crate::compat::Inspection) -> (String, ToolClaim) {
+/// The (5f)(c) row for an active trust build that [`crate::compat::needs_root`], what it
+/// claims ([`ToolClaim`]), and its remedy. An absent root, or unrouted shims, run the store
+/// path, where tippy cannot run; through a root that differs from the build it may not.
+/// Behind a blocked `compat` ([`crate::compat::Blocked`], which `repair` also refuses) it
+/// cannot run with no shim routed and may not with one routed earlier. A matching root
+/// with every shim routed is the note.
+fn exec_root_line(build: u64, i: &crate::compat::Inspection) -> (Row, ToolClaim, Remedy) {
     use crate::compat::RootState;
     let root = i.root.display();
     let copy = format!(
@@ -3293,11 +3955,15 @@ fn exec_root_line(p: &str, build: u64, i: &crate::compat::Inspection) -> (String
         i.rustc_ino, i.trustc_ino, i.differing
     );
     let n = i.shims.len();
+    let warn = |text: String| Row {
+        level: Level::Warn,
+        text,
+    };
     match (&i.state, i.unrouted.is_empty()) {
         (RootState::Blocked(blocked), _) => (
-            format!(
-                "{p}: warn — trust build {build}: PATH tippy {} run — {copy}, which this \
-                 build's tippy refuses, and {}; fix: {}",
+            warn(format!(
+                "trust build {build}: PATH tippy {} run — {copy}, which this build's tippy \
+                 refuses, and {}; fix: {}",
                 if i.unrouted.len() == n {
                     "cannot"
                 } else {
@@ -3305,37 +3971,47 @@ fn exec_root_line(p: &str, build: u64, i: &crate::compat::Inspection) -> (String
                 },
                 blocked.what(),
                 blocked.fix()
-            ),
+            )),
             if i.unrouted.len() == n {
                 ToolClaim::CannotRun
             } else {
                 ToolClaim::Unproven
             },
+            Remedy::Person {
+                pane: i.root.display().to_string(),
+                how: blocked.fix().to_owned(),
+            },
         ),
         (RootState::Matches, true) => (
-            format!(
-                "{p}: note — trust build {build}: {copy}, which its tippy refuses; its {n} trust \
-                 shim(s) run each tool from {root}, where rustc holds trustc's bytes (a \
-                 copy-on-write clone; the store is untouched) — removed with the build"
-            ),
+            Row {
+                level: Level::Note,
+                text: format!(
+                    "trust build {build}: {copy}, which its tippy refuses; its {n} trust shim(s) \
+                     run each tool from {root}, where rustc holds trustc's bytes (a \
+                     copy-on-write clone; the store is untouched) — removed with the build"
+                ),
+            },
             ToolClaim::Runs,
+            Remedy::None,
         ),
         (RootState::Absent, _) => (
-            format!(
-                "{p}: warn — trust build {build}: PATH tippy cannot run — {copy}, which this \
-                 build's tippy refuses, and no exec root stands at {root}; fix: {EXEC_ROOT_FIX}"
-            ),
+            warn(format!(
+                "trust build {build}: PATH tippy cannot run — {copy}, which this build's tippy \
+                 refuses, and no exec root stands at {root}; fix: {EXEC_ROOT_FIX}"
+            )),
             ToolClaim::CannotRun,
+            Remedy::Repair,
         ),
         (RootState::Differs(at), _) => (
-            format!(
-                "{p}: warn — trust build {build}: PATH tippy may not run — {copy}, which this \
-                 build's tippy refuses, and the exec root {root} is not the store build {} \
-                 file for file (first difference: {}); fix: {EXEC_ROOT_FIX}",
+            warn(format!(
+                "trust build {build}: PATH tippy may not run — {copy}, which this build's tippy \
+                 refuses, and the exec root {root} is not the store build {} file for file \
+                 (first difference: {}); fix: {EXEC_ROOT_FIX}",
                 i.build_dir.display(),
                 at.display()
-            ),
+            )),
             ToolClaim::Unproven,
+            Remedy::Repair,
         ),
         (RootState::Matches, false) => {
             let example = i
@@ -3344,36 +4020,36 @@ fn exec_root_line(p: &str, build: u64, i: &crate::compat::Inspection) -> (String
                 .find(|name| name.as_str() == "tippy")
                 .unwrap_or(&i.unrouted[0]);
             (
-                format!(
-                    "{p}: warn — trust build {build}: PATH tippy cannot run through {} of {n} \
-                     trust shim(s) (e.g. {example}) — {copy}, which this build's tippy refuses, \
-                     and those shims do not route through the exec root {root}; fix: \
-                     {EXEC_ROOT_FIX}",
+                warn(format!(
+                    "trust build {build}: PATH tippy cannot run through {} of {n} trust shim(s) \
+                     (e.g. {example}) — {copy}, which this build's tippy refuses, and those \
+                     shims do not route through the exec root {root}; fix: {EXEC_ROOT_FIX}",
                     i.unrouted.len()
-                ),
+                )),
                 ToolClaim::CannotRun,
+                Remedy::Repair,
             )
         }
     }
 }
 
-/// The (5f)(f) line for an active trust build whose need for an exec root could not be
-/// read ([`crate::compat::inspect`]'s `Err`, which names the path and the error): a warn
-/// that withholds "healthy". No re-lay makes a store file readable, so `repair` is not
-/// offered; the line points at `aterm pkg verify trust`, which checks every file of the
-/// build against its signed tree.
-fn exec_root_unread_line(p: &str, build: u64, why: &str) -> String {
+/// The (5f)(f) words for an active trust build whose need for an exec root could not be
+/// read ([`crate::compat::inspect`]'s `Err`, which names the path and the error): a row that
+/// withholds "healthy". No re-lay makes a store file readable, so `repair` is not offered;
+/// the row points at `aterm pkg verify trust`, which checks every file of the build against
+/// its signed tree.
+fn exec_root_unread_line(build: u64, why: &str) -> String {
     format!(
-        "{p}: warn — trust build {build}: cannot tell whether PATH tippy can run — {why}; any \
-         exec root standing for the build is left as it is; fix: make that store file readable \
-         again (`aterm pkg verify trust` checks the build against its signed tree)"
+        "trust build {build}: cannot tell whether PATH tippy can run — {why}; any exec root \
+         standing for the build is left as it is; fix: make that store file readable again \
+         (`aterm pkg verify trust` checks the build against its signed tree)"
     )
 }
 
-/// The (5f)(d) line for an entry under `<prefix>/compat/trust` that no build needs — an
+/// The (5f)(d) words for an entry under `<prefix>/compat/trust` that no build needs — an
 /// advisory warn: the next `gc` removes it ([`crate::compat::sweep`] takes exactly what
 /// [`crate::compat::strays`] classifies), and no tool fails over it.
-fn stray_root_line(p: &str, path: &Path, why: crate::compat::Stray) -> String {
+fn stray_root_line(path: &Path, why: crate::compat::Stray) -> String {
     use crate::compat::Stray;
     let at = path.display();
     let what = match why {
@@ -3389,7 +4065,7 @@ fn stray_root_line(p: &str, path: &Path, why: crate::compat::Stray) -> String {
             "{at} is not a directory, and atpkg lays only exec root directories under that name"
         ),
     };
-    format!("{p}: warn — {what}; fix: `aterm pkg gc` removes it")
+    format!("{what}; fix: `aterm pkg gc` removes it")
 }
 
 /// Whether the view file `at` presents the store's Trust tool `store`: a clone of it
@@ -3440,9 +4116,7 @@ fn index_head_line(
     cached: &crate::index_probe::CachedProbe,
     last: &LastPass,
     now: i64,
-    p: &str,
-    out: &mut dyn std::io::Write,
-) {
+) -> (Row, Remedy) {
     use crate::index_probe::RangeAnswer;
     let floor = cached.floor;
     let age = |written: std::time::SystemTime| -> i64 {
@@ -3466,73 +4140,90 @@ fn index_head_line(
         .as_ref()
         .and_then(|builds| builds.iter().copied().filter(|b| *b > floor).max())
     {
-        let _ = writeln!(
-            out,
-            "{p}: warn — index {floor} is not the newest: index {held} was downloaded but \
-             not accepted — its signatures did not verify here, or its pass stopped early; \
-             if `aterm pkg update` still ends on index {floor}, the release needs fixing, \
-             not this machine"
+        return (
+            Row {
+                level: Level::Warn,
+                text: format!(
+                    "index {floor} is not the newest: index {held} was downloaded but not \
+                     accepted — its signatures did not verify here, or its pass stopped early; \
+                     if `aterm pkg update` still ends on index {floor}, the release needs \
+                     fixing, not this machine"
+                ),
+            },
+            Remedy::None,
         );
-        return;
     }
+    let note = |text: String| {
+        (
+            Row {
+                level: Level::Note,
+                text,
+            },
+            Remedy::None,
+        )
+    };
+    let update = || Remedy::Command(String::from("aterm pkg update"));
     match cached.near {
         Some((RangeAnswer::Published, seen)) => {
-            if last.reached_index_at.is_some() && last.held.is_some() {
+            let text = if last.reached_index_at.is_some() && last.held.is_some() {
                 // The last pass reached the channel and held nothing above the floor: then
                 // it had no complete signed release newer than it.
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — index {floor} is not the newest: the index probe found a \
-                     newer ALab index (seen {} ago; an unverified hint), but {pass} and \
-                     found no complete signed release newer than {floor} there — if the new \
-                     one was up by then, its signed files are not all uploaded and no update \
-                     can land it yet; otherwise run: aterm pkg update",
+                format!(
+                    "index {floor} is not the newest: the index probe found a newer ALab index \
+                     (seen {} ago; an unverified hint), but {pass} and found no complete \
+                     signed release newer than {floor} there — if the new one was up by then, \
+                     its signed files are not all uploaded and no update can land it yet; \
+                     otherwise run: aterm pkg update",
                     ago(age(seen))
-                );
+                )
             } else {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — index {floor} is not the newest: the index probe found a \
-                     newer ALab index (seen {} ago; an unverified hint — no signed pass has \
-                     landed it on this machine) — run: aterm pkg update",
+                format!(
+                    "index {floor} is not the newest: the index probe found a newer ALab index \
+                     (seen {} ago; an unverified hint — no signed pass has landed it on this \
+                     machine) — run: aterm pkg update",
                     ago(age(seen))
-                );
-            }
+                )
+            };
+            (
+                Row {
+                    level: Level::Warn,
+                    text,
+                },
+                update(),
+            )
         }
         Some((RangeAnswer::Missing, checked)) => {
             // Said as what was checked, and when: the probe's own rule is that absence is
             // never authority. Only a running window re-asks, so a stale answer says so.
             let checked = age(checked);
             if checked <= INDEX_HEAD_FRESH_SECS {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — no index newer than {floor} is published (checked {} ago)",
-                    ago(checked)
-                );
+                (
+                    Row {
+                        level: Level::Ok,
+                        text: format!(
+                            "no index newer than {floor} is published (checked {} ago)",
+                            ago(checked)
+                        ),
+                    },
+                    Remedy::None,
+                )
             } else {
-                let _ = writeln!(
-                    out,
-                    "{p}: note — no index newer than {floor} was published when last checked, \
-                     {} ago (an aterm window re-checks while open); {pass}",
+                note(format!(
+                    "no index newer than {floor} was published when last checked, {} ago (an \
+                     aterm window re-checks while open); {pass}",
                     ago(checked)
-                );
+                ))
             }
         }
-        Some((RangeAnswer::Failed, when)) => {
-            let _ = writeln!(
-                out,
-                "{p}: note — the last check for an index newer than {floor} got no usable \
-                 answer ({} ago), so whether one is published is unknown here; {pass}",
-                ago(age(when))
-            );
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "{p}: note — no check for an index newer than {floor} is recorded on this \
-                 machine (an aterm window checks while open); {pass}"
-            );
-        }
+        Some((RangeAnswer::Failed, when)) => note(format!(
+            "the last check for an index newer than {floor} got no usable answer ({} ago), so \
+             whether one is published is unknown here; {pass}",
+            ago(age(when))
+        )),
+        None => note(format!(
+            "no check for an index newer than {floor} is recorded on this machine (an aterm \
+             window checks while open); {pass}"
+        )),
     }
 }
 
@@ -3594,34 +4285,46 @@ fn vendor_followers(layout: &Layout, probes: &Probes) -> Vec<&'static str> {
 /// that update without an index pass ([`vendor_followers`]); nothing when there are none.
 /// Nobody watching is a `note`, not a fault: the next update pass still finds the release,
 /// hours later rather than minutes.
-fn head_watch_line(layout: &Layout, probes: &Probes, p: &str, out: &mut dyn std::io::Write) {
+fn head_watch_line(layout: &Layout, probes: &Probes) -> Option<Row> {
     use crate::vendor_direct::watch::Watcher;
     let names = vendor_followers(layout, probes);
     if names.is_empty() {
-        return;
+        return None;
     }
     let names = names.join(" and ");
-    let line = match crate::vendor_direct::watch::watcher(layout) {
-        Watcher::Window => format!(
-            "ok — an aterm window watches the vendor heads: a new {names} release is found \
-             within minutes"
+    let (level, text) = match crate::vendor_direct::watch::watcher(layout) {
+        Watcher::Window => (
+            Level::Ok,
+            format!(
+                "an aterm window watches the vendor heads: a new {names} release is found \
+                 within minutes"
+            ),
         ),
-        Watcher::Session(pid) => format!(
-            "ok — a terminal session{} watches the vendor heads, no aterm window being open: \
-             a new {names} release is found within minutes",
-            pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+        Watcher::Session(pid) => (
+            Level::Ok,
+            format!(
+                "a terminal session{} watches the vendor heads, no aterm window being open: a \
+                 new {names} release is found within minutes",
+                pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+            ),
         ),
-        Watcher::Nobody => format!(
-            "note — nothing watches the vendor heads now (no aterm window, and no terminal \
-             session running aterm, is open): a new {names} release is found by the next \
-             update pass instead of within minutes"
+        Watcher::Nobody => (
+            Level::Note,
+            format!(
+                "nothing watches the vendor heads now (no aterm window, and no terminal session \
+                 running aterm, is open): a new {names} release is found by the next update \
+                 pass instead of within minutes"
+            ),
         ),
-        Watcher::Unknown(why) => format!(
-            "note — could not tell whether anything watches the vendor heads ({why}): a new \
-             {names} release may wait for the next update pass"
+        Watcher::Unknown(why) => (
+            Level::Note,
+            format!(
+                "could not tell whether anything watches the vendor heads ({why}): a new \
+                 {names} release may wait for the next update pass"
+            ),
         ),
     };
-    let _ = writeln!(out, "{p}: {line}");
+    Some(Row { level, text })
 }
 
 /// Whole days since `updated_at` (RFC3339), or `None` if it cannot be parsed.
@@ -3649,22 +4352,18 @@ fn unreached_cause(outcome: &str) -> Option<&str> {
 /// is exec stubs there, so the stub's target is read). `store_bin` is the active (else
 /// `current`) store build's `bin/`, `None` when there is none. A mismatch is a tool that
 /// cannot run: `repair` rebuilds the view, except under a dev-link the seam refuses.
-fn view_stock_names_check(
-    out: &mut dyn std::io::Write,
-    p: &str,
-    layout: &Layout,
-    store_bin: Option<PathBuf>,
-    tools_cannot_run: &mut usize,
-) {
+fn view_stock_names_check(f: &mut Vec<Finding>, layout: &Layout, store_bin: Option<PathBuf>) {
+    let unlink = || Remedy::Command(String::from("aterm pkg unlink trust"));
     let source = crate::seam::view_source(layout);
     const STORE_WHAT: &str = "a clone of the store's";
     const STORE_WRONG: &str = "absent, other bytes, or the hard link a view held before clones";
-    let (presented, presented_what, wrong, fix) = match (&source, store_bin) {
+    let (presented, presented_what, wrong, fix, remedy) = match (&source, store_bin) {
         (crate::seam::ViewSource::Linked(checkout), _) => (
             checkout.join("bin"),
             "the dev-linked checkout's",
             "absent, or a separate file",
             "`aterm pkg repair` rebuilds the view",
+            Remedy::Repair,
         ),
         (crate::seam::ViewSource::LinkedNoSysroot(_), Some(bin)) => (
             bin,
@@ -3672,31 +4371,48 @@ fn view_stock_names_check(
             STORE_WRONG,
             "`aterm pkg unlink trust` — atpkg cannot present a dev-link whose checkout is not a \
              sysroot, so `repair` cannot rebuild the view until the link goes",
+            unlink(),
         ),
         (crate::seam::ViewSource::Store, Some(bin)) => (
             bin,
             STORE_WHAT,
             STORE_WRONG,
             "`aterm pkg repair` rebuilds the view",
+            Remedy::Repair,
         ),
         // A refused dev-link with no store build behind the view: nothing the view
         // could be checked against, and nothing it could correctly present — whatever
         // it last presented is what `rustup run trust` runs. Said, with the one fix.
         (crate::seam::ViewSource::LinkedNoSysroot(checkout), None) => {
             for name in crate::seam::recorded_names(layout) {
-                *tools_cannot_run += 1;
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — rustup `{name}`: trust is dev-linked to {}, which atpkg cannot \
-                     present (no bin/ and lib/, or a tree inside its own prefix), and no \
-                     installed build stands behind the view, so `rustc +{name}` runs whatever \
-                     the view last presented, or nothing; fix: `aterm pkg unlink trust`",
-                    checkout.display()
+                f.push(
+                    Finding::change(
+                        c::of(c::RUSTUP_VIEW, &name),
+                        Class::Person,
+                        format!("rustup `{name}`'s view"),
+                        format!(
+                            "rustup `{name}`: trust is dev-linked to {}, which atpkg cannot \
+                             present (no bin/ and lib/, or a tree inside its own prefix), and no \
+                             installed build stands behind the view, so `rustc +{name}` runs \
+                             whatever the view last presented, or nothing; fix: `aterm pkg \
+                             unlink trust`",
+                            checkout.display()
+                        ),
+                        "the managed tools",
+                        unlink(),
+                    )
+                    .detail(c::CANNOT_RUN),
                 );
             }
             return;
         }
         (crate::seam::ViewSource::Store, None) => return,
+    };
+    // `repair` rebuilds a view; a dev-link it refuses is the person's to unlink.
+    let class = if remedy == Remedy::Repair {
+        Class::Relay
+    } else {
+        Class::Person
     };
     for name in crate::seam::recorded_names(layout) {
         let view_bin = crate::seam::view_dir(layout, &name).join("bin");
@@ -3715,14 +4431,22 @@ fn view_stock_names_check(
                 _ => presents(&tool, &view_tool),
             };
             if !presented_ok {
-                *tools_cannot_run += 1;
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — rustup `{name}`: {} is not {presented_what} {} ({wrong}), so \
-                     `{public} +{name}` runs something other than the managed {trust}, or \
-                     nothing; fix: {fix}",
-                    view_tool.display(),
-                    tool.display()
+                f.push(
+                    Finding::change(
+                        c::of(c::RUSTUP_VIEW, format!("{name}.{public}")),
+                        class,
+                        format!("`{public}` in rustup `{name}`'s view"),
+                        format!(
+                            "rustup `{name}`: {} is not {presented_what} {} ({wrong}), so \
+                             `{public} +{name}` runs something other than the managed {trust}, \
+                             or nothing; fix: {fix}",
+                            view_tool.display(),
+                            tool.display()
+                        ),
+                        format!("the managed {trust}"),
+                        remedy.clone(),
+                    )
+                    .detail(c::CANNOT_RUN),
                 );
             }
         }
@@ -3750,38 +4474,66 @@ fn repoint_fix(layout: &Layout, link: &Path) -> String {
 /// cannot be re-pointed over (`ln -sfn` onto a directory lays the link inside it), so that
 /// shape gets [`crate::seam::DETACH_FIX`]. A link into the store (`current`, or a numbered
 /// build) is a note, not a warn: `repair` re-points it to the view by itself.
-fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
+fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<(Row, Remedy)> {
     use crate::seam::Entry;
     let target = crate::seam::seam_target(layout, "trust");
+    let row = |level, text| Row { level, text };
     match &st.entry {
-        Ok(Entry::Link(raw)) if !st.in_prefix => Some(format!(
-            "warn — rustup `trust` -> {} is NOT the managed store ({}): `cargo +trust`, \
+        Ok(Entry::Link(raw)) if !st.in_prefix => Some((
+            row(
+                Level::Warn,
+                format!(
+                    "rustup `trust` -> {} is NOT the managed store ({}): `cargo +trust`, \
              `rustup run trust` and every repo pinning `channel = \"trust\"` build with THAT \
              copy, not the one `aterm pkg update` keeps current. re-point it: {}; revert \
              by re-linking the old target the same way",
-            raw.display(),
-            target.display(),
-            repoint_fix(layout, &st.path)
+                    raw.display(),
+                    target.display(),
+                    repoint_fix(layout, &st.path)
+                ),
+            ),
+            Remedy::Command(repoint_fix(layout, &st.path)),
         )),
-        Ok(Entry::Link(_)) if !st.targets_view => Some(format!(
-            "note — rustup `trust` -> {} is inside the store, not the view atpkg lays \
+        Ok(Entry::Link(_)) if !st.targets_view => Some((
+            row(
+                Level::Note,
+                format!(
+                    "rustup `trust` -> {} is inside the store, not the view atpkg lays \
              ({}); `aterm pkg repair` re-points it so the stock names rustup resolves are \
              the managed tools and updates move the channel",
-            st.target.as_deref().unwrap_or(&st.path).display(),
-            target.display()
+                    st.target.as_deref().unwrap_or(&st.path).display(),
+                    target.display()
+                ),
+            ),
+            Remedy::Repair,
         )),
-        Ok(entry @ (Entry::Dir | Entry::File | Entry::Other)) => Some(format!(
-            "warn — rustup `trust` at {} is {} — not a link into the managed store ({}), so \
+        Ok(entry @ (Entry::Dir | Entry::File | Entry::Other)) => Some((
+            row(
+                Level::Warn,
+                format!(
+                    "rustup `trust` at {} is {} — not a link into the managed store ({}), so \
              `cargo +trust` builds with whatever that holds; {}",
-            st.path.display(),
-            entry.describe(layout),
-            target.display(),
-            crate::seam::DETACH_FIX
+                    st.path.display(),
+                    entry.describe(layout),
+                    target.display(),
+                    crate::seam::DETACH_FIX
+                ),
+            ),
+            Remedy::Person {
+                pane: st.path.display().to_string(),
+                how: crate::seam::DETACH_FIX.to_owned(),
+            },
         )),
         Ok(Entry::Link(_) | Entry::Absent) => None,
-        Err(e) => Some(format!(
-            "warn — rustup `trust` at {} could not be inspected ({e})",
-            st.path.display()
+        Err(e) => Some((
+            row(
+                Level::Warn,
+                format!(
+                    "rustup `trust` at {} could not be inspected ({e})",
+                    st.path.display()
+                ),
+            ),
+            Remedy::None,
         )),
     }
 }
@@ -3792,8 +4544,7 @@ fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
 /// note, since the channel works either way. `None` when nothing was replaced or the entry
 /// has since changed.
 fn replaced_seam_line(layout: &Layout, rustup_home: &Path) -> Option<String> {
-    let line = crate::seam::replaced_note(layout, rustup_home, crate::seam::DEFAULT_SEAM)?;
-    Some(format!("note — {line}"))
+    crate::seam::replaced_note(layout, rustup_home, crate::seam::DEFAULT_SEAM)
 }
 
 /// Where `rustup` is: the first executable `rustup` on `PATH`, else
@@ -4133,12 +4884,8 @@ fn report_aterm_posture(
     layout: &crate::store::Layout,
     app_dirs: &[PathBuf],
     installs_by_itself: bool,
-    p: &str,
-    out: &mut dyn std::io::Write,
-) {
-    let Some(support) = layout.prefix.parent() else {
-        return;
-    };
+) -> Option<Row> {
+    let support = layout.prefix.parent()?;
     let running = running_bundle_plist();
     let bundle_build = running.as_deref().and_then(plist_bundle_version);
     // (build, version) off every bundle readable here: the running one, then each app
@@ -4159,9 +4906,7 @@ fn report_aterm_posture(
         bundle_build,
         &versions,
         installs_by_itself,
-        p,
-        out,
-    );
+    )
 }
 
 /// [`report_aterm_posture`] over an explicit updater ledger dir, the sealed build of the
@@ -4174,17 +4919,19 @@ fn report_aterm_posture_at(
     bundle_build: Option<u64>,
     versions: &[(u64, String)],
     installs_by_itself: bool,
-    p: &str,
-    out: &mut dyn std::io::Write,
-) {
+) -> Option<Row> {
     let field = |file: &str, key: &str| -> Option<String> {
         let text = std::fs::read_to_string(updates.join(file)).ok()?;
         text.lines()
             .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == key))
             .map(|(_, v)| v.trim().trim_matches('"').to_string())
     };
-    let Some(receipt) = field("installed.toml", "build_number") else {
-        return;
+    let receipt = field("installed.toml", "build_number")?;
+    let note = |text: String| {
+        Some(Row {
+            level: Level::Note,
+            text,
+        })
     };
     let installed = match (receipt.parse::<u64>().ok(), bundle_build) {
         (Some(r), Some(b)) => r.max(b).to_string(),
@@ -4235,23 +4982,20 @@ fn report_aterm_posture_at(
                 } else {
                     format!("{n} tries")
                 };
-                let _ = writeln!(
-                    out,
-                    "{p}: note — aterm {staged} is downloaded (running {current}) but \
-                     didn\u{2019}t install ({tries})"
-                );
+                note(format!(
+                    "aterm {staged} is downloaded (running {current}) but didn\u{2019}t install \
+                     ({tries})"
+                ))
             } else if installs_by_itself {
-                let _ = writeln!(
-                    out,
-                    "{p}: note — aterm {staged} is downloaded (running {current}) and installs \
-                     within a minute while an aterm window is open — your shells keep running; \
-                     with no window open: aterm --window"
-                );
+                note(format!(
+                    "aterm {staged} is downloaded (running {current}) and installs within a \
+                     minute while an aterm window is open — your shells keep running; with no \
+                     window open: aterm --window"
+                ))
             } else {
-                let _ = writeln!(
-                    out,
-                    "{p}: note — aterm {staged} is downloaded (running {current}) — {by_hand}"
-                );
+                note(format!(
+                    "aterm {staged} is downloaded (running {current}) — {by_hand}"
+                ))
             }
         }
         (Some(current), _) if newer_on_disk => {
@@ -4259,31 +5003,28 @@ fn report_aterm_posture_at(
             // in-session lane — and, as above, only the window.
             let (installed, current) = pair(&installed, &current);
             if installs_by_itself {
-                let _ = writeln!(
-                    out,
-                    "{p}: note — aterm {installed} is on disk (running {current}) and an aterm \
-                     window switches to it in place — your shells keep running; with no window \
-                     open: aterm --window"
-                );
+                note(format!(
+                    "aterm {installed} is on disk (running {current}) and an aterm window \
+                     switches to it in place — your shells keep running; with no window open: \
+                     aterm --window"
+                ))
             } else {
-                let _ = writeln!(
-                    out,
-                    "{p}: note — aterm {installed} is on disk (running {current}) — {by_hand}"
-                );
+                note(format!(
+                    "aterm {installed} is on disk (running {current}) — {by_hand}"
+                ))
             }
         }
         _ => {
             // The version a person recognises, read off whichever bundle's sealed build is
             // the installed one; with none readable the row stays build-only, so it never
             // names a version it did not read off that build.
-            match versions.iter().find(|(b, _)| b.to_string() == installed) {
-                Some((_, v)) => {
-                    let _ = writeln!(out, "{p}: ok — aterm {v} (build {installed}) installed");
-                }
-                None => {
-                    let _ = writeln!(out, "{p}: ok — aterm build {installed} installed");
-                }
-            }
+            Some(Row {
+                level: Level::Ok,
+                text: match versions.iter().find(|(b, _)| b.to_string() == installed) {
+                    Some((_, v)) => format!("aterm {v} (build {installed}) installed"),
+                    None => format!("aterm build {installed} installed"),
+                },
+            })
         }
     }
 }

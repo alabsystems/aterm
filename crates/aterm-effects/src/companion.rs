@@ -448,9 +448,11 @@ pub struct ContrastFallback {
 
 // ── the owner ───────────────────────────────────────────────────────────────
 
-/// The trail owner's verdict as the host resolved it. On the web
-/// `style_raw_names_pet` comes from `GlowStyle::style_names_any_pet` over the raw
-/// spelling, since the parsed enum cannot tell `rainbow kitty` from `rainbow kitty pet`.
+/// The trail owner's verdict as the host resolved it: trail master on, parsed
+/// style, and whether the resolved trail is in pet mode (native: from the trail
+/// presentation; web: `GlowSpelling::pet_of` over the page's spelling, since
+/// the parsed enum cannot tell `rainbow kitty pet` from `rainbow kitty
+/// flying`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GlowOwnership {
     pub enabled: bool,
@@ -481,6 +483,12 @@ pub struct SessionRoom {
     pub turn: (u64, bool),
     /// The inbox as the pet sees it.
     pub inbox: RoomInbox,
+    /// The serial of the session's task end (§11.2's end: Land's landing)
+    /// that no pet has cheered yet; `None` when none stands or it was cheered
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3). The host's
+    /// glass keeps the once; the first pet that sees it takes it
+    /// ([`PetTick::landed_seen`]).
+    pub landed: Option<u32>,
 }
 
 /// One frame's inputs to [`CompanionOwner::prepare`].
@@ -518,12 +526,37 @@ pub struct PetTick {
     shed_active: bool,
     /// The painted caret: the one a companion may claim a cell at.
     painted_caret: Option<(u16, u16)>,
+    /// The caret the cursor companions escort this frame ([`Self::escort_caret`]).
+    escort_caret: Option<(u16, u16)>,
     origin: (i32, i32),
     /// The glass a body drawn this frame stands on.
     glass: PetGlass,
     /// `(exit code, exec duration ms)`, `Some` exactly once per completion, never
     /// on a session switch or a capture.
     pub completion: Option<(i32, Option<u64>)>,
+    /// `(session, serial)`: the task end the room named
+    /// ([`SessionRoom::landed`]) was on screen in this pane this frame — a
+    /// present to a focused, unobscured, live surface — so the host marks it
+    /// cheered and no frame, here or in another window, hands it again. The
+    /// pet cheered it where it owns the glass; with no pet (another trail
+    /// style, serious mode) it is spent unplayed, so turning the pet on later
+    /// replays nothing. `None` on a capture and while nobody can see the pane.
+    pub landed_seen: Option<(u64, u32)>,
+}
+
+impl PetTick {
+    /// The caret the cursor companions escort this frame, hidden or not: the
+    /// terminal's, except on a frame the program has not finished, where a
+    /// hidden cursor is its write position and this is the last finished
+    /// present's caret (`None` before one, or off the live viewport). The pet
+    /// chases the same reading, so a host that draws the flying head (or any
+    /// companion at the caret) from it puts both bodies on one caret; the raw
+    /// cursor took the head up the transcript to wherever a torn repaint
+    /// stopped writing.
+    #[must_use]
+    pub fn escort_caret(&self) -> Option<(u16, u16)> {
+        self.escort_caret
+    }
 }
 
 #[cfg(test)]
@@ -580,9 +613,36 @@ struct Latches {
     /// `(session, wrap_serial)`: the wrap-fact latch, compared with `!=` (see
     /// [`wrap_fact_edge`]).
     wrap_serial: Option<(u64, u64)>,
-    /// `(session, (caret, painted))` as of the last present the program had
-    /// finished: what a torn frame's hidden write cursor is read as.
-    finished_caret: Option<(u64, CaretReading)>,
+    /// `(session, grid, (caret, painted))` as of the last present the program
+    /// had finished: what a torn frame's hidden write cursor is read as. The
+    /// grid (`(rows, cols)`) keys it with the session: a caret read before a
+    /// resize is a cell of another grid.
+    finished_caret: Option<(u64, (u16, u16), CaretReading)>,
+    /// The session whose program has bracketed a frame (DEC 2026): its
+    /// finished frames' hidden cursor is the caret, the torn ones its write
+    /// position.
+    synced: Option<u64>,
+    /// A hidden cursor's move, not yet taken ([`HIDDEN_REST`]).
+    hidden_rest: Option<HiddenRest>,
+}
+
+/// A program that does not bracket its frames moves its hidden cursor through
+/// every repaint (the spinner's row, the status line) and back to the caret.
+/// A present between can catch it anywhere, and the companions took that cell
+/// as the caret: the flying head went seventeen rows up the transcript and
+/// back, one present each way (2026-10-20). A hidden cursor's move is taken
+/// once the cursor has rested at the cell this long; a repaint's write
+/// position never does.
+const HIDDEN_REST: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// [`Latches::hidden_rest`]: the caret taken, and the cell the hidden cursor
+/// has stood at since when, on one session's grid.
+#[derive(Clone, Copy, Debug)]
+struct HiddenRest {
+    session: u64,
+    grid: (u16, u16),
+    taken: Option<(u16, u16)>,
+    seen: (Option<(u16, u16)>, Instant),
 }
 
 /// A caret as the pet senses it: the cell, and whether it is painted.
@@ -641,6 +701,12 @@ pub struct CompanionOwner {
     /// drawn. Consumed by every tick, so a host that offers nothing spends no
     /// ghost off its own surface.
     resight_offered: bool,
+    /// `(session, serial)`: the task end this pet last cheered
+    /// ([`SessionRoom::landed`]), so a serial handed again (the host's mark
+    /// not yet read back) latches nothing. Compared for equality only and
+    /// never re-baselined at a switch, unlike [`Latches`]: a switch onto the
+    /// landed tab IS the sighting (§11.3.3, item 3).
+    landed_taken: Option<(u64, u32)>,
 }
 
 /// At most this many own glasses at once ([`CompanionOwner::own_glass`]):
@@ -690,6 +756,7 @@ impl Default for CompanionOwner {
             own_glass: [None; OWN_GLASS_MAX],
             glass_key: 0,
             resight_offered: false,
+            landed_taken: None,
         }
     }
 }
@@ -748,8 +815,8 @@ impl CompanionOwner {
     }
 
     /// Classify the cell plane being presented, minus the host's late overlays
-    /// (`exclusions`: a preedit row, the find bar). Advances no animation or input
-    /// seq; returns the cells classified.
+    /// (`exclusions`, all protected). Advances no animation or input seq;
+    /// returns the cells classified.
     pub fn observe_console(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -757,9 +824,88 @@ impl CompanionOwner {
         pane: crate::pet_world::PetPane,
         exclusions: &[crate::pet_world::PetRect],
     ) -> usize {
+        self.observe_console_with_overlays(input, facts, pane, exclusions, &[])
+    }
+
+    /// [`Self::observe_console`], with the host's chrome spliced over the
+    /// grid (`exclusions`: the footer's rules and chips, the harness card's
+    /// glass) apart from its transient overlays (`overlays`: the find bar, the
+    /// Autopilot menu). Both protect their cells; an overlay, like a live
+    /// selection, never moves where the pet rests
+    /// ([`crate::kitty_pet::PetBrain::observe_console_with_overlays`]).
+    pub fn observe_console_with_overlays(
+        &mut self,
+        input: &aterm_core::render::RenderInput,
+        facts: &crate::pet_world::PetWorldFacts,
+        pane: crate::pet_world::PetPane,
+        exclusions: &[crate::pet_world::PetRect],
+        overlays: &[crate::pet_world::PetRect],
+    ) -> usize {
+        self.observe_console_reserved(
+            input,
+            facts,
+            pane,
+            crate::pet_world::PetReserve {
+                protected: exclusions,
+                overlays,
+                ink: &[],
+            },
+        )
+    }
+
+    /// [`Self::observe_console_with_overlays`], with the person's typed
+    /// glyphs (the predicted echo, the IME preedit) reserved as ink
+    /// ([`crate::pet_world::PetReserve`]): what the native host observes.
+    pub fn observe_console_reserved(
+        &mut self,
+        input: &aterm_core::render::RenderInput,
+        facts: &crate::pet_world::PetWorldFacts,
+        pane: crate::pet_world::PetPane,
+        reserve: crate::pet_world::PetReserve<'_>,
+    ) -> usize {
         self.pet
-            .observe_console_with_exclusions(input, facts, pane, exclusions);
+            .observe_console_with_reserve(input, facts, pane, reserve);
         self.pet.observed_cells()
+    }
+
+    /// The caret of a finished frame, as the companions take it: the cursor
+    /// itself, except a hidden one in a program that does not bracket its
+    /// frames, which is taken at a new cell only once it has rested there
+    /// [`HIDDEN_REST`] ([`Latches::hidden_rest`]); until then the caret taken
+    /// before stands. The first reading on a session's grid is taken at once.
+    /// A capture reads the state and moves none of it.
+    fn rested_caret(
+        &mut self,
+        facts: &TerminalFacts,
+        grid: (u16, u16),
+        now: Instant,
+        present: bool,
+    ) -> Option<(u16, u16)> {
+        let unsynced = self.latches.synced != Some(facts.session);
+        let held = self
+            .latches
+            .hidden_rest
+            .filter(|r| r.session == facts.session && r.grid == grid);
+        let rest = match held {
+            Some(mut rest) if !facts.cursor_visible && unsynced => {
+                if rest.taken == facts.caret || rest.seen.0 != facts.caret {
+                    rest.seen = (facts.caret, now);
+                } else if now.saturating_duration_since(rest.seen.1) >= HIDDEN_REST {
+                    rest.taken = facts.caret;
+                }
+                rest
+            }
+            _ => HiddenRest {
+                session: facts.session,
+                grid,
+                taken: facts.caret,
+                seen: (facts.caret, now),
+            },
+        };
+        if present {
+            self.latches.hidden_rest = Some(rest);
+        }
+        rest.taken
     }
 
     /// The frame's notes, everything before the tick, in native order:
@@ -801,15 +947,24 @@ impl CompanionOwner {
         // would have shown. `None` would not do: a hidden caret the console cannot
         // hold fades the pet.
         let write_cursor = facts.frame_unfinished && !facts.cursor_visible;
+        let grid = (host.geometry.rows, host.geometry.cols);
+        if present && facts.frame_unfinished {
+            self.latches.synced = Some(facts.session);
+        }
         let (caret, caret_painted) = if write_cursor {
             self.latches
                 .finished_caret
-                .filter(|&(session, _)| session == facts.session && facts.live_viewport)
-                .map_or((None, false), |(_, reading)| reading)
+                .filter(|&(session, at, _)| {
+                    session == facts.session && at == grid && facts.live_viewport
+                })
+                .map_or((None, false), |(_, _, reading)| reading)
         } else {
-            let reading = (facts.caret, facts.cursor_visible);
+            let reading = (
+                self.rested_caret(facts, grid, now, present),
+                facts.cursor_visible,
+            );
             if present {
-                self.latches.finished_caret = Some((facts.session, reading));
+                self.latches.finished_caret = Some((facts.session, grid, reading));
             }
             reading
         };
@@ -823,13 +978,13 @@ impl CompanionOwner {
             && resident_pet_owner_present(pet_mode, trail_master, glow.style);
         // Focus and visibility decide presentability; load only coarsens cadence.
         // Reading owns a certified content surface, never a fabricated caret.
-        let visible = owned
-            && resident_pet_surface_presentable(
-                focused,
-                host.visibility != Visibility::Hidden && !obscured,
-                facts.live_viewport,
-                self.pet.has_reading_interest(),
-            );
+        let presentable = resident_pet_surface_presentable(
+            focused,
+            host.visibility != Visibility::Hidden && !obscured,
+            facts.live_viewport,
+            self.pet.has_reading_interest(),
+        );
+        let visible = owned && presentable;
         // Retire an unowned pet outright rather than let it fade: a fading brain
         // keeps `needs_frames()` true through `FADE_OUT` and every mote, keeping
         // the surface presenting at 60 fps.
@@ -837,6 +992,7 @@ impl CompanionOwner {
             self.pet.retire_unowned();
         }
         let mut completion = None;
+        let mut landed_seen = None;
         let mut burst = false;
         let mut wrapped = false;
         let mut pointer = None;
@@ -866,6 +1022,8 @@ impl CompanionOwner {
                         self.pet.note_room_lease(session.lease);
                         self.pet.note_room_turn(now, session.turn.0, session.turn.1);
                         self.pet.note_room_inbox(now, session.inbox);
+                        landed_seen =
+                            self.take_landed(facts.session, session.landed, presentable, owned);
                     }
                 }
             }
@@ -915,6 +1073,7 @@ impl CompanionOwner {
         // A ghost born from this body carries this surface key, so an arriver
         // adopting it resumes its palette only on its own ground.
         self.pet.note_surface((facts.session, facts.alt_screen));
+        self.pet.note_repainting(write_cursor);
         self.feed_ink(decos, pane);
         // Only the motion policy pins the resident; the shed changes its cadence.
         let reduced_motion = host.reduced_motion;
@@ -947,6 +1106,7 @@ impl CompanionOwner {
             shed_envelope: host.shed_envelope,
             shed_active: host.shed_active,
             painted_caret: facts.caret.filter(|_| facts.cursor_visible),
+            escort_caret: caret,
             origin: host.geometry.origin_px,
             glass: PetGlass {
                 session: facts.session,
@@ -955,7 +1115,35 @@ impl CompanionOwner {
                 rows: geom.rows,
             },
             completion,
+            landed_seen,
         }
+    }
+
+    /// THE KITTY CHEERS THE LANDING, WHEN YOU ARE THERE TO SEE IT
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3): the room names
+    /// a task end no pet has cheered (`landed`, its serial). While nobody can
+    /// see this pane (`presentable` false: the window unfocused or hidden, an
+    /// app surface over the grid, the viewport in history) it waits, and every
+    /// frame of a background tab never names it at all, so across many tabs
+    /// each cheers on its first look. Seen, it is handed back to be marked
+    /// cheered; the pet, where it `owns` the glass, latches the big cheer
+    /// ([`PetBrain::note_room_landed`]) once per `(session, serial)`.
+    fn take_landed(
+        &mut self,
+        session: u64,
+        landed: Option<u32>,
+        presentable: bool,
+        owned: bool,
+    ) -> Option<(u64, u32)> {
+        let key = (session, landed?);
+        if !presentable {
+            return None;
+        }
+        if owned && self.landed_taken != Some(key) {
+            self.landed_taken = Some(key);
+            self.pet.note_room_landed();
+        }
+        Some(key)
     }
 
     /// The host's terminal panes on glass this frame, offered before [`Self::tick`]:
@@ -1199,6 +1387,7 @@ impl CompanionOwner {
             coat,
             iris,
             pet: t.pet,
+            page: (!aterm_render::theme_is_dark(fallback.bg)).then_some(fallback.bg),
         };
         if let Some(pet_fp) = decos.pet_cursor(frame, free) {
             fp ^= pet_fp.rotate_left(29);
@@ -2464,6 +2653,150 @@ mod owner_tests {
         assert_eq!(t.sense.caret, None, "no finished caret in this session");
     }
 
+    /// The escort caret is the pet's caret reading for whichever companion the
+    /// glass has, the flying head (no pet owned, so the sense carries none)
+    /// included: a torn frame's hidden cursor reads as the last finished
+    /// present's caret, a finished frame's hidden caret is itself, and a torn
+    /// frame with no finished caret of its session reads none.
+    #[test]
+    fn the_escort_caret_is_the_finished_caret_for_every_companion() {
+        for pet_mode in [true, false] {
+            let mut decos = WordDecorations::default();
+            let mut owner = an_enabled_owner();
+            let now = Instant::now();
+            let glow = GlowOwnership {
+                style_raw_names_pet: pet_mode,
+                ..pet_glow()
+            };
+            let mut prep = |facts: &TerminalFacts, ms: u64| {
+                let host = host_at(now + Duration::from_millis(ms));
+                let t = owner.prepare(
+                    PetFacts {
+                        glow,
+                        ..pet_facts(facts, &host)
+                    },
+                    &mut decos,
+                );
+                let escort = t.escort_caret();
+                let sensed = t.sense.caret;
+                let _ = owner.tick(t);
+                (escort, sensed)
+            };
+            let finished = facts_with(Some((20, 7)));
+            assert_eq!(prep(&finished, 16).0, Some((20, 7)), "pet {pet_mode}");
+            let mut torn = facts_with(Some((2, 0)));
+            torn.cursor_visible = false;
+            torn.frame_unfinished = true;
+            let (escort, sensed) = prep(&torn, 32);
+            assert_eq!(escort, Some((20, 7)), "pet {pet_mode}: no write cursor");
+            assert_eq!(sensed.is_some(), pet_mode, "only an owned pet senses it");
+            let mut hidden = facts_with(Some((5, 9)));
+            hidden.cursor_visible = false;
+            assert_eq!(prep(&hidden, 48).0, Some((5, 9)), "pet {pet_mode}");
+            let mut other = torn;
+            other.session = 2;
+            assert_eq!(prep(&other, 64).0, None, "pet {pet_mode}");
+        }
+    }
+
+    /// A program that never brackets its frames moves its hidden cursor through
+    /// a repaint and back. A present that caught it at the write position, or
+    /// two 16 ms apart, does not move the escort caret; a hidden cursor that
+    /// rests at its new cell [`HIDDEN_REST`] is taken (typing on), and once the
+    /// program brackets a frame its finished frames' hidden cursor is taken at
+    /// once. Negative control: a visible cursor is taken at once wherever it
+    /// goes.
+    #[test]
+    fn an_unbracketed_repaint_s_write_position_is_no_caret() {
+        let mut decos = WordDecorations::default();
+        let mut owner = an_enabled_owner();
+        let now = Instant::now();
+        let mut prep = |facts: &TerminalFacts, ms: u64| {
+            let t = prepared(
+                &mut owner,
+                &mut decos,
+                facts,
+                &host_at(now + Duration::from_millis(ms)),
+                false,
+            );
+            let reading = (t.escort_caret(), t.sense.caret);
+            let _ = owner.tick(t);
+            reading
+        };
+        let hidden = |caret| {
+            let mut f = facts_with(Some(caret));
+            f.cursor_visible = false;
+            f
+        };
+        assert_eq!(prep(&hidden((20, 10)), 16).0, Some((20, 10)), "first sight");
+        // The spinner's repaint caught mid-write, on one present and on two.
+        assert_eq!(prep(&hidden((3, 60)), 32), (Some((20, 10)), Some((20, 10))));
+        assert_eq!(prep(&hidden((20, 10)), 48).0, Some((20, 10)));
+        assert_eq!(prep(&hidden((3, 60)), 64).0, Some((20, 10)));
+        assert_eq!(
+            prep(&hidden((3, 60)), 80).0,
+            Some((20, 10)),
+            "16 ms is no rest"
+        );
+        assert_eq!(prep(&hidden((20, 10)), 96).0, Some((20, 10)));
+        // A key's echo: the hidden cursor steps on and stays.
+        assert_eq!(prep(&hidden((20, 11)), 112).0, Some((20, 10)));
+        assert_eq!(prep(&hidden((20, 11)), 128).0, Some((20, 10)));
+        assert_eq!(
+            prep(&hidden((20, 11)), 144).0,
+            Some((20, 11)),
+            "rested 32 ms"
+        );
+        // A visible cursor is the caret wherever it goes.
+        let mut shown = facts_with(Some((3, 60)));
+        shown.cursor_visible = true;
+        assert_eq!(prep(&shown, 160).0, Some((3, 60)), "negative control");
+        // Once the program brackets a frame, a finished hidden cursor is taken.
+        let mut torn = hidden((3, 0));
+        torn.frame_unfinished = true;
+        assert_eq!(
+            prep(&torn, 176).0,
+            Some((3, 60)),
+            "a torn frame reads the last finished"
+        );
+        assert_eq!(
+            prep(&hidden((9, 9)), 192).0,
+            Some((9, 9)),
+            "a synced program's caret"
+        );
+    }
+
+    /// The finished caret is a cell of the grid it was read on: a torn frame
+    /// after a resize reads none rather than the old grid's cell.
+    #[test]
+    fn a_torn_frame_after_a_resize_reads_no_old_caret() {
+        let mut decos = WordDecorations::default();
+        let mut owner = an_enabled_owner();
+        let now = materialize(&mut owner, &mut decos);
+        let finished = facts_with(Some((20, 7)));
+        let t = prepared(&mut owner, &mut decos, &finished, &host_at(now), false);
+        let _ = owner.tick(t);
+        let mut torn = facts_with(Some((2, 0)));
+        torn.cursor_visible = false;
+        torn.frame_unfinished = true;
+        let mut host = host_at(now + Duration::from_millis(16));
+        let t = prepared(&mut owner, &mut decos, &torn, &host, false);
+        assert_eq!(
+            t.escort_caret(),
+            Some((20, 7)),
+            "fixture: same grid, the latch"
+        );
+        let _ = owner.tick(t);
+        host.now += Duration::from_millis(16);
+        host.geometry.rows += 4;
+        let t = prepared(&mut owner, &mut decos, &torn, &host, false);
+        assert_eq!(
+            t.escort_caret(),
+            None,
+            "a caret read before the resize is a cell of another grid"
+        );
+    }
+
     /// A capture reads and spends none of the present-owned diffs (completion,
     /// burst, wrap) and sees no pointer, so the next present finds every edge.
     #[test]
@@ -2481,6 +2814,11 @@ mod owner_tests {
             facts.cmd_done = Some((1, 1, Some(40)));
             facts.content_seq = 9;
             facts.wrap_serial = 3;
+            // A capture of a torn repaint must not teach the owner that this
+            // session brackets its live frames.
+            facts.frame_unfinished = true;
+            facts.cursor_visible = false;
+            facts.caret = Some((2, 0));
             let mut host = host_at(now + Duration::from_millis(16));
             host.capture = capture;
             host.pointer_px = Some((55.0, 85.0));
@@ -2497,7 +2835,14 @@ mod owner_tests {
             // …so the next present reads every edge the capture left.
             host.capture = CaptureMode::Present;
             host.now += Duration::from_millis(16);
+            facts.frame_unfinished = false;
+            facts.caret = Some((4, 13));
             let t = prepared(&mut owner, &mut decos, &facts, &host, false);
+            assert_eq!(
+                t.escort_caret(),
+                Some((4, 12)),
+                "{capture:?}: the new hidden caret still waits for a live rest"
+            );
             assert_eq!(t.completion, Some((1, Some(40))), "{capture:?}");
             assert!(t.sense.output_burst && t.sense.wrapped, "{capture:?}");
             assert!(owner.grieving(), "{capture:?}: the failure is felt now");
@@ -2545,6 +2890,252 @@ mod owner_tests {
             Some((1, None)),
             "its None -> Some edge is a real first completion"
         );
+    }
+
+    /// One present in session 1 whose room names the task end `landed`
+    /// (`SessionRoom::landed`), with the frame's fields shaped by `shape`; the
+    /// end handed back, and the frame drawn.
+    fn landed_frame(
+        owner: &mut CompanionOwner,
+        decos: &mut WordDecorations,
+        now: Instant,
+        landed: Option<u32>,
+        shape: impl FnOnce(PetFacts<'_>) -> PetFacts<'_>,
+    ) -> (Option<(u64, u32)>, CompanionFrame) {
+        let facts = facts_with(Some((4, 12)));
+        let host = host_at(now);
+        let room = RoomFacts {
+            session: Some(SessionRoom {
+                landed,
+                ..SessionRoom::default()
+            }),
+            ..RoomFacts::default()
+        };
+        let t = owner.prepare(
+            shape(PetFacts {
+                room: Some(room),
+                ..pet_facts(&facts, &host)
+            }),
+            decos,
+        );
+        let seen = t.landed_seen;
+        (seen, owner.tick(t))
+    }
+
+    /// THE KITTY CHEERS THE LANDING, WHEN YOU ARE THERE TO SEE IT
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3.5): while the
+    /// window is unfocused, or an app surface covers the grid, the end waits —
+    /// no frame hands it back and the pet latches nothing; the first frame
+    /// that shows the pane takes it (handed back for the glass to mark) and
+    /// the pet cheers. A serial handed again — the host's mark not yet read
+    /// back, frame after frame — does nothing: the one cheer plays (three ♪/♥
+    /// at most on glass) and the pet settles, owing nothing. A second end is
+    /// news again. NEGATIVE CONTROLS (run by hand, files restored): a pet
+    /// that latches at every restatement (`take_landed` without its
+    /// `landed_taken` check) keeps owing the cheer and claiming frames; an end
+    /// taken whether or not anyone can see the pane (`take_landed` without its
+    /// `presentable` gate) is handed back by the unfocused frames.
+    #[test]
+    fn a_landing_is_cheered_once_by_the_first_frame_that_shows_it() {
+        let mut decos = WordDecorations::default();
+        let mut owner = an_enabled_owner();
+        let now = materialize(&mut owner, &mut decos);
+        let mut now = settle(&mut owner, &mut decos, now);
+        let c0 = owner.brain().content();
+        for (why, focused, obscured) in [("unfocused", false, false), ("covered", true, true)] {
+            for _ in 0..30 {
+                now += Duration::from_millis(16);
+                let (seen, _) = landed_frame(&mut owner, &mut decos, now, Some(1), |f| PetFacts {
+                    focused,
+                    obscured,
+                    ..f
+                });
+                assert_eq!(seen, None, "{why}: nobody can see the pane, the end waits");
+                assert!(!owner.brain().cheer_owed(), "{why}: no cheer latched");
+            }
+        }
+        assert!(
+            owner.brain().content() < c0 + 0.1,
+            "no ledger moved while it waited"
+        );
+        now += Duration::from_millis(16);
+        let (seen, _) = landed_frame(&mut owner, &mut decos, now, Some(1), |f| f);
+        assert_eq!(seen, Some((1, 1)), "the first frame that shows it takes it");
+        assert!(owner.brain().cheer_owed(), "and the pet latched the cheer");
+        let mut most = 0;
+        for _ in 0..400 {
+            now += Duration::from_millis(16);
+            let (seen, frame) = landed_frame(&mut owner, &mut decos, now, Some(1), |f| f);
+            assert_eq!(seen, Some((1, 1)), "handed back while the room names it");
+            let cheer = frame
+                .pet
+                .motes
+                .iter()
+                .flatten()
+                .filter(|m| {
+                    matches!(
+                        m.kind,
+                        crate::kitty_pet::PetMoteKind::Note | crate::kitty_pet::PetMoteKind::Heart
+                    )
+                })
+                .count();
+            most = most.max(cheer);
+        }
+        assert!(
+            (1..=3).contains(&most),
+            "one cheer's ♪/♥ on glass, not a cheer per restatement: {most}"
+        );
+        assert!(
+            !owner.brain().cheer_owed(),
+            "nothing owed: the serial again is nothing"
+        );
+        assert!(!owner.needs_frames(), "and the pet settled");
+        now += Duration::from_millis(16);
+        let (seen, _) = landed_frame(&mut owner, &mut decos, now, Some(2), |f| f);
+        assert_eq!(seen, Some((1, 2)));
+        assert!(owner.brain().cheer_owed(), "a second end is news again");
+    }
+
+    /// NO CHEER WITHOUT THE PET (§11.3.1): under another trail style, or in
+    /// serious mode, the first frame that shows the pane still takes the end
+    /// — spent unplayed, so turning the pet on later replays nothing — and the
+    /// brain latches nothing. NEGATIVE CONTROL (run by hand, files restored):
+    /// `take_landed` handing back only an owned pet's end leaves it standing
+    /// for a later pet.
+    #[test]
+    fn without_the_pet_a_landing_is_spent_unplayed() {
+        for (why, glow, serious) in [
+            (
+                "another trail style",
+                GlowOwnership {
+                    style_raw_names_pet: false,
+                    ..pet_glow()
+                },
+                false,
+            ),
+            ("serious mode", pet_glow(), true),
+        ] {
+            let mut decos = WordDecorations::default();
+            let mut owner = an_enabled_owner();
+            let now = materialize(&mut owner, &mut decos);
+            let now = settle(&mut owner, &mut decos, now) + Duration::from_millis(16);
+            let facts = facts_with(Some((4, 12)));
+            let mut host = host_at(now);
+            host.serious = serious;
+            let room = RoomFacts {
+                session: Some(SessionRoom {
+                    landed: Some(1),
+                    ..SessionRoom::default()
+                }),
+                ..RoomFacts::default()
+            };
+            let t = owner.prepare(
+                PetFacts {
+                    glow,
+                    room: Some(room),
+                    ..pet_facts(&facts, &host)
+                },
+                &mut decos,
+            );
+            assert_eq!(t.landed_seen, Some((1, 1)), "{why}: seen, so spent");
+            assert!(!owner.brain().cheer_owed(), "{why}: no cheer");
+            let _ = owner.tick(t);
+        }
+    }
+
+    /// THE PAPER LAW, AS THE OWNER WIRES IT (§11.3.7 of
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md`): `emit` hands the pet's
+    /// emitter the page it draws on, the terminal ground where no dark theme
+    /// is (`aterm_render::theme_is_dark`), so on white (Aterm Day) and cream
+    /// (Linen) paper each ♪ and ♥ in the air takes the point mark's ink
+    /// (`paper_mark_ink`: 4.5:1 against the page, its hue kept), and on a
+    /// dark ground it keeps its own colour. NEGATIVE CONTROLS (as run, each
+    /// failing this test): `page: None` in `emit_on`, the gold note reads
+    /// 1.6:1 on white; the polarity flipped (`theme_is_dark(bg)`), the dark
+    /// ground's motes are re-inked and the paper's are not.
+    #[test]
+    fn the_owner_inks_a_cheers_motes_for_the_page_it_draws_on() {
+        use crate::kitty_pet::{PetMoteKind, PetMoteSprite};
+        let mut decos = WordDecorations::default();
+        let mut owner = an_enabled_owner();
+        let now = materialize(&mut owner, &mut decos);
+        let mut t = frame(
+            &mut owner,
+            &mut decos,
+            now + Duration::from_millis(16),
+            Some((4, 12)),
+        );
+        assert!(t.on_glass, "fixture: the pet is on glass");
+        // The cheer's gold ♪ and pink ♥, stamped at birth as a lit ribbon's
+        // offered colour would be, so the expected ink is exact.
+        let air = [
+            (PetMoteKind::Note, 0x00FF_C24Du32),
+            (PetMoteKind::Heart, 0x00FF_6B9A),
+            (PetMoteKind::Note, 0x00FF_C24D),
+        ];
+        for (k, (kind, rgb)) in air.into_iter().enumerate() {
+            t.pet.motes[k] = Some(PetMoteSprite {
+                kind,
+                col: t.pet.col + 2.0 + k as f32,
+                row: (t.pet.row - 2.0).max(0.5),
+                scale: 1.0,
+                rot: 0.4,
+                alpha: 255,
+                rgb: Some(rgb),
+            });
+        }
+        let mut tints = |bg: u32| {
+            let theme = ContrastFallback {
+                bg,
+                cursor: 0x0080_8080,
+                accent: 0x0040_80FF,
+            };
+            let mut free = Vec::new();
+            // A frame's bake budget takes one new tile family at a time: the
+            // third frame draws every mote from warm tiles.
+            for _ in 0..3 {
+                free.clear();
+                decos.begin_host_frame();
+                let _ = owner.emit(&t, &[], theme, &mut decos, &mut free);
+            }
+            free.iter()
+                .map(|s| s.tint)
+                .filter(|&tint| {
+                    air.iter().any(|&(_, rgb)| {
+                        tint == rgb || tint == crate::rainbow_kitty::ribbon::paper_mark_ink(rgb, bg)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let contrast = |a: u32, b: u32| {
+            let (ya, yb) = (
+                crate::color_math::relative_luminance(a),
+                crate::color_math::relative_luminance(b),
+            );
+            (ya.max(yb) + 0.05) / (ya.min(yb) + 0.05)
+        };
+        let dark = tints(0x0010_1010);
+        assert_eq!(
+            dark,
+            air.map(|(_, rgb)| rgb).to_vec(),
+            "a dark ground keeps each ♪/♥ its own colour"
+        );
+        for (name, bg) in [("white", 0x00F8_FAFDu32), ("cream", 0x00F9_F3E6)] {
+            let paper = tints(bg);
+            assert_eq!(
+                paper,
+                air.map(|(_, rgb)| crate::rainbow_kitty::ribbon::paper_mark_ink(rgb, bg))
+                    .to_vec(),
+                "{name}: each ♪/♥ takes the mark's ink for the page"
+            );
+            for &ink in &paper {
+                assert!(
+                    contrast(ink, bg) >= 4.5 - 1e-3,
+                    "{name}: {ink:06x} on {bg:06x} reads at {:.2}:1",
+                    contrast(ink, bg)
+                );
+            }
+        }
     }
 
     /// An app surface over the grid keeps the resident owned but not presented.
@@ -3101,13 +3692,15 @@ mod owner_tests {
             let observed = shed_state(3, [smooth, gait, train, paced, rig.coarse[0]]);
             step(&mut state, "Settle", observed).expect("settled under the shed");
 
-            // Phase 4: the latch clears and a key puts the resident back on the train.
+            // Phase 4: the latch clears and keys put the resident back on the
+            // train. The run left the cat out ahead, where it waits for the
+            // writing (`PetBrain::lead` keeps the lead it took), so a burst
+            // brings the caret up to it, and then it must move.
             let clear_at = rig.now;
             let mut train = false;
-            for i in 0..8 {
+            for _ in 0..8 {
                 let rise = (rig.now + FRAME - clear_at).as_secs_f32() / 0.25;
-                let key = (i == 0).then_some(b'!');
-                let (_, ok) = rig.present(FRAME, key, false, rise.min(1.0));
+                let (_, ok) = rig.present(FRAME, Some(b'!'), false, rise.min(1.0));
                 smooth &= ok;
                 train |= rig.owner.needs_frames();
             }

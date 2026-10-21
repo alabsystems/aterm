@@ -72,6 +72,15 @@ pub(crate) struct PendingPaste {
     /// a program on the other end can flip the mode while the banner stands: the
     /// paste must reach the PTY framed the way the banner said it would be.
     framing: crate::input::PasteFraming,
+    /// This question's serial, unique in the process and never `0`: the
+    /// repaint key's term for it (`App::question_key`).
+    serial: u64,
+}
+
+/// The next question serial (shared with `close_confirm`), never `0`.
+pub(crate) fn next_question_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl PendingPaste {
@@ -92,7 +101,13 @@ impl PendingPaste {
             text,
             source,
             framing,
+            serial: next_question_serial(),
         }
+    }
+
+    /// This question's serial (never `0`).
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Surrender the parked paste for CONFIRMED delivery: the window, the owning

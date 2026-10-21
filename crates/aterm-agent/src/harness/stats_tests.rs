@@ -1463,6 +1463,7 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
         sum.land_prompts += t.land_prompts;
         sum.resumed += t.resumed;
         sum.escalated += t.escalated;
+        sum.needs_told += t.needs_told;
         sum.human_wait_ms += t.human_wait_ms;
         sum.limit_wait_ms += t.limit_wait_ms;
         sum.relaunched += t.relaunched;
@@ -1478,6 +1479,7 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
         land_prompts: acc.land_prompts,
         resumed: acc.resumed,
         escalated: acc.escalated,
+        needs_told: acc.needs_told,
         human_wait_ms: acc.human_wait_ms,
         limit_wait_ms: acc.limit_wait_ms,
         relaunched: acc.relaunched,
@@ -1697,7 +1699,7 @@ fn the_join_lists_each_choice_made_in_the_persons_name() {
                 20_500,
                 "Should I add a CLI or packaging next?",
                 false,
-                "the land answer: finish cleanly soonest, start nothing new",
+                "the land answer: land all of the work on the remote main soonest, start nothing new",
                 None,
                 1
             ),
@@ -2531,4 +2533,35 @@ fn a_burst_stays_separate_across_the_whole_timestamp_domain() {
     let rows: Vec<(i64, u32)> = decided.rows.iter().map(|d| (d.t_ms, d.times)).collect();
     assert_eq!(decided.total, 2);
     assert_eq!(rows, [(i64::MIN, 2), (i64::MAX, 1)]);
+}
+
+/// THE WORKER'S NEEDS ON THE PERSON'S SCREEN ARE COUNTED APART (FOREVER
+/// CRUISE / FOREVER LAND): a `NEEDS` line whose entry went up
+/// (`attention=OK`) is a need told ([`HarnessStats::needs_told`]) — never an
+/// escalation, never a person's wait — and its `CLEARED … needs` closes no
+/// badge's wait. NEGATIVE CONTROLS: a refused set (`attention=ERR …`) and a
+/// line before the window count nothing; an escalation's wait runs on past a
+/// `CLEARED … needs` to its own badge's clear.
+#[test]
+fn a_need_told_is_counted_apart_from_escalations_and_waits() {
+    let recs = journal(
+        "
+        1000 s-1 ESCALATED seq=10 attention=OK mail=skipped: no fabric
+        2000 s-1 NEEDS seq=11 count=1 attention=OK the App Store signing credential
+        3000 s-1 CLEARED seq=12 needs attention=OK none stands now
+        3500 s-1 NEEDS seq=13 count=2 attention=ERR attention too long (max 10 bytes) x
+        4000 s-1 CLEARED seq=14 box attention=OK
+        5000 s-2 NEEDS seq=3 count=1 attention=OK a decision on the launch date
+    ",
+    );
+    let mut acc = HarnessStats::new(0);
+    fold_journal(&mut acc, &recs);
+    assert_eq!(acc.needs_told, 2, "{acc:#?}");
+    assert_eq!((acc.escalated, acc.human_wait_ms), (1, 3_000), "{acc:#?}");
+    let mut acc = HarnessStats::new(2_500);
+    fold_journal(&mut acc, &recs);
+    assert_eq!(
+        acc.needs_told, 1,
+        "only the one inside the window: {acc:#?}"
+    );
 }

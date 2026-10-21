@@ -113,27 +113,32 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "doctor",
         tier: Tier::Daily,
-        usage: "aterm pkg doctor [--verbose]  (alias: status) — what needs attention; \
-                --verbose: every check",
+        usage: "aterm pkg doctor [--verbose] [--json]  (alias: status) — what needs \
+                attention; --verbose: every check; --json: every row, in the one report schema",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
         applies_machine: false,
         // `status` is an alias, the name other package managers use. `--verbose` (or `-v`)
-        // is the one thing either takes ([`crate::doctor::present`]).
-        run: |rest| doctor_detail(rest, "doctor").map_or_else(|code| code, |d| doctor("doctor", d)),
+        // and `--json` are what either takes ([`crate::doctor::render`],
+        // [`aterm_converge::Report`]).
+        run: |rest| {
+            doctor_args(rest, "doctor").map_or_else(|code| code, |(d, j)| doctor("doctor", d, j))
+        },
     },
     Verb {
         name: "status",
         tier: Tier::Daily,
-        usage: "aterm pkg status [--verbose]  (alias of doctor) — what needs attention; \
-                --verbose: every check",
+        usage: "aterm pkg status [--verbose] [--json]  (alias of doctor) — what needs \
+                attention; --verbose: every check; --json: every row, in the one report schema",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
         applies_machine: false,
         // The same report, prefixed with the verb the user typed.
-        run: |rest| doctor_detail(rest, "status").map_or_else(|code| code, |d| doctor("status", d)),
+        run: |rest| {
+            doctor_args(rest, "status").map_or_else(|code| code, |(d, j)| doctor("status", d, j))
+        },
     },
     Verb {
         name: "which",
@@ -3489,21 +3494,28 @@ fn layout() -> Option<crate::store::Layout> {
     }
 }
 
-/// The doctor's one argument, `--verbose` (or `-v`): the detail asked for, or the usage
-/// refusal (exit 2) for anything else — the swallowed-argument rule [`zero_arity`] keeps.
-fn doctor_detail(rest: &[String], verb: &str) -> Result<crate::doctor::Detail, ExitCode> {
-    match rest {
-        [] => Ok(crate::doctor::Detail::Problems),
-        [flag] if flag == "--verbose" || flag == "-v" => Ok(crate::doctor::Detail::Everything),
-        _ => {
-            let stray = rest
-                .iter()
-                .find(|a| *a != "--verbose" && *a != "-v")
-                .unwrap_or(&rest[0]);
-            let problem = format!("unknown argument {stray:?} — the one it takes is --verbose");
-            Err(usage_error(verb, Some(&problem)))
+/// The doctor's arguments, each at most once: `--verbose` (or `-v`), the detail asked for,
+/// and `--json`, the rows in the one report schema instead of the text. Anything else is
+/// the usage refusal (exit 2) — the swallowed-argument rule [`zero_arity`] keeps.
+fn doctor_args(rest: &[String], verb: &str) -> Result<(crate::doctor::Detail, bool), ExitCode> {
+    let mut detail = None;
+    let mut json = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--verbose" | "-v" if detail.is_none() => {
+                detail = Some(crate::doctor::Detail::Everything);
+            }
+            "--json" if !json => json = true,
+            _ => {
+                let problem = format!(
+                    "unknown or repeated argument {arg:?} — it takes --verbose and --json, \
+                     each once"
+                );
+                return Err(usage_error(verb, Some(&problem)));
+            }
         }
     }
+    Ok((detail.unwrap_or(crate::doctor::Detail::Problems), json))
 }
 
 /// Refuse any argument to a verb that takes none — `Some(usage error)` when one
@@ -3866,14 +3878,14 @@ fn bare_lines(counts: Option<(usize, usize)>) -> Vec<String> {
 /// scan, active-build store integrity, shell.d hooks + fish-safety, disk headroom, index
 /// freshness, and rustup state. No network, no mutation. Structural breakage exits
 /// nonzero; advisory warnings stay exit-0.
-fn doctor(prefix: &str, detail: crate::doctor::Detail) -> ExitCode {
-    // The doctor prints the `[packages]` table's spelling notes as its own `note` lines
+fn doctor(prefix: &str, detail: crate::doctor::Detail, json: bool) -> ExitCode {
+    // The doctor prints the `[packages]` table's spelling notes as its own `note` rows
     // (`Probes::config_notes`); the load-time copies would say each one again.
     crate::notice::spelling_reported_here();
     let Some(layout) = layout() else {
         return ExitCode::from(1); // HOME unset is itself structural
     };
-    if crate::doctor::run(&layout, prefix, detail) {
+    if crate::doctor::run(&layout, prefix, detail, json) {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -4353,19 +4365,23 @@ fn foreign_copies_line(foreign: &[std::path::PathBuf]) -> String {
 /// RUNS: `foreign copies on this shell's PATH: …` — every copy, the running one included.
 const FOREIGN_ON_THIS_SHELL: &str = "foreign copies on this shell's PATH";
 
+/// `p` as the `which` lines spell it: `~/…` under the home directory, the full path elsewhere.
+fn home_abbreviated(p: &std::path::Path) -> String {
+    aterm_types::dirs::home_dir()
+        .as_deref()
+        .and_then(|h| p.strip_prefix(h).ok())
+        .map_or_else(
+            || p.display().to_string(),
+            |rest| format!("~/{}", rest.display()),
+        )
+}
+
 /// [`foreign_copies_line`] under `label`.
 fn foreign_copies_line_with(label: &str, foreign: &[std::path::PathBuf]) -> String {
-    let home = aterm_types::dirs::home_dir();
     let rendered: Vec<String> = foreign
         .iter()
         .map(|p| {
-            let shown = home
-                .as_deref()
-                .and_then(|h| p.strip_prefix(h).ok())
-                .map_or_else(
-                    || p.display().to_string(),
-                    |rest| format!("~/{}", rest.display()),
-                );
+            let shown = home_abbreviated(p);
             match version_from_path(p) {
                 Some(v) => format!("{shown} ({v})"),
                 None => shown,
@@ -6858,6 +6874,16 @@ fn write_program_row(
     state: crate::ProgramStatus,
     outcome: Option<String>,
 ) {
+    write_program_rows(layout, [(program.to_string(), state)], outcome);
+}
+
+/// [`write_program_row`] for several rows in one write: one fsync, rename and directory sync
+/// for all of them.
+fn write_program_rows(
+    layout: &crate::store::Layout,
+    rows: impl IntoIterator<Item = (String, crate::ProgramStatus)>,
+    outcome: Option<String>,
+) {
     // Seed the per-program map (and the seam record) from the EXISTING record so
     // updating ONE program does not clobber every OTHER program's last-known state.
     // The silent update loop calls this once per program, and status.toml is the
@@ -6873,7 +6899,7 @@ fn write_program_row(
     let Some(mut status) = status_seed_for_rewrite(layout) else {
         return;
     };
-    status.programs.insert(program.to_string(), state);
+    status.programs.extend(rows);
     // Every other field — the seams, the stamps, and the keys another build wrote
     // (`Status::extra`) — rides through as read.
     status.schema = 1;
@@ -7441,20 +7467,42 @@ fn satisfy_by_system(
 /// writes nothing and says nothing. The aggregate outcome is carried over untouched (the
 /// row is a per-program fact, not the pass's verdict). Returns whether a row was written.
 fn record_state_if_changed(layout: &crate::store::Layout, program: &str, state: String) -> bool {
+    record_states_if_changed(layout, [(program, state)])
+}
+
+/// [`record_state_if_changed`] for several rows, in one write: a first run's four agent rows
+/// took a write each — its fsync, rename and directory sync, 4 ms apiece — on the way to the
+/// set's announcement. Returns whether any row was written.
+fn record_states_if_changed<'p>(
+    layout: &crate::store::Layout,
+    rows: impl IntoIterator<Item = (&'p str, String)>,
+) -> bool {
     let recorded = crate::status::read(layout);
-    let same = recorded
-        .as_ref()
-        .and_then(|s| s.programs.get(program))
-        .is_some_and(|r| r.state == state);
-    if same {
+    let changed: Vec<(String, crate::ProgramStatus)> = rows
+        .into_iter()
+        .filter(|(program, state)| {
+            !recorded
+                .as_ref()
+                .and_then(|s| s.programs.get(*program))
+                .is_some_and(|r| r.state == *state)
+        })
+        .map(|(program, state)| {
+            println!("atpkg: {program}: {state}");
+            let row = crate::ProgramStatus {
+                installed_build: None,
+                state,
+                tree_root: String::new(),
+            };
+            (program.to_string(), row)
+        })
+        .collect();
+    if changed.is_empty() {
         return false;
     }
-    println!("atpkg: {program}: {state}");
-    record_unbuilt(
+    write_program_rows(
         layout,
-        program,
-        state,
-        recorded.map(|s| s.outcome).unwrap_or_default(),
+        changed,
+        Some(recorded.map(|s| s.outcome).unwrap_or_default()),
     );
     true
 }
@@ -9096,8 +9144,44 @@ pub const SEED_BUSY_MARKER: &str = "seed-busy: ";
 pub(crate) mod announcement {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    static OPENED: AtomicBool = AtomicBool::new(false);
-    static ANSWERED: AtomicBool = AtomicBool::new(false);
+    /// What the process announced, and whether it answered.
+    pub(crate) struct Ledger {
+        opened: AtomicBool,
+        answered: AtomicBool,
+    }
+
+    impl Ledger {
+        const fn new() -> Self {
+            Self {
+                opened: AtomicBool::new(false),
+                answered: AtomicBool::new(false),
+            }
+        }
+    }
+
+    /// THE process's ledger.
+    static PROCESS: Ledger = Ledger::new();
+
+    /// The ledger this thread's calls answer to: [`PROCESS`], in every build. A test
+    /// thread may hold one of its own ([`own_ledger`]), so a test that reads the ledger
+    /// sees no other test's pass, and the production rule (one ledger per process)
+    /// stays unbent.
+    fn ledger() -> &'static Ledger {
+        #[cfg(test)]
+        {
+            if let Some(own) = TEST_LEDGER.get() {
+                return own;
+            }
+        }
+        &PROCESS
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// TESTS ONLY: the ledger [`ledger`] answers on this thread, when not the process's.
+        static TEST_LEDGER: std::cell::Cell<Option<&'static Ledger>> =
+            const { std::cell::Cell::new(None) };
+    }
 
     /// Every marker in the stdout contract, and whether it OPENS an announcement
     /// rather than answering one. The GUI's `parse_seed_line` matches the same set;
@@ -9129,9 +9213,9 @@ pub(crate) mod announcement {
         for (marker, opens) in MARKERS {
             if rest.starts_with(marker) {
                 if *opens {
-                    OPENED.store(true, Ordering::Release);
+                    ledger().opened.store(true, Ordering::Release);
                 } else {
-                    ANSWERED.store(true, Ordering::Release);
+                    ledger().answered.store(true, Ordering::Release);
                 }
                 return;
             }
@@ -9140,15 +9224,33 @@ pub(crate) mod announcement {
 
     /// Whether this process announced a pass and has not yet answered it.
     pub(crate) fn is_open() -> bool {
-        OPENED.load(Ordering::Acquire) && !ANSWERED.load(Ordering::Acquire)
+        let ledger = ledger();
+        ledger.opened.load(Ordering::Acquire) && !ledger.answered.load(Ordering::Acquire)
     }
 
-    /// Test seam: a process-global ledger would otherwise carry one test's
-    /// announcement into the next.
+    /// TESTS ONLY: give this thread an empty ledger of its own until the guard drops.
+    /// The process's ledger is shared by every test whose pass prints a marker, so a
+    /// test that reads it beside them would read their announcements. The ledger is
+    /// leaked (two words per test).
     #[cfg(all(test, unix))]
-    pub(crate) fn reset() {
-        OPENED.store(false, Ordering::Release);
-        ANSWERED.store(false, Ordering::Release);
+    pub(crate) fn own_ledger() -> OwnLedger {
+        let own: &'static Ledger = Box::leak(Box::new(Ledger::new()));
+        OwnLedger {
+            previous: TEST_LEDGER.replace(Some(own)),
+        }
+    }
+
+    /// TESTS ONLY: the guard [`own_ledger`] returns.
+    #[cfg(all(test, unix))]
+    pub(crate) struct OwnLedger {
+        previous: Option<&'static Ledger>,
+    }
+
+    #[cfg(all(test, unix))]
+    impl Drop for OwnLedger {
+        fn drop(&mut self) {
+            TEST_LEDGER.set(self.previous);
+        }
     }
 }
 
@@ -11178,6 +11280,11 @@ struct PassSeams<'a> {
     flip_policy: fn() -> crate::quiet::FlipPolicy,
     /// The process table the flip gate reads ([`crate::gc::process_table`]).
     running: &'a dyn Fn() -> Option<Vec<std::path::PathBuf>>,
+    /// How long a first run's vendor plan waits for a read still out ([`VENDOR_READ_GRACE`]).
+    vendor_read_grace: std::time::Duration,
+    /// Told the program each vendor read ahead is in for, on the thread that read it
+    /// ([`read_vendors_ahead`]).
+    read_ahead_in: &'a (dyn Fn(&str) + Sync),
 }
 
 impl PassSeams<'static> {
@@ -11195,9 +11302,14 @@ impl PassSeams<'static> {
             translated: running_translated,
             flip_policy,
             running: &crate::gc::process_table,
+            vendor_read_grace: VENDOR_READ_GRACE,
+            read_ahead_in: &no_read_ahead_note,
         }
     }
 }
+
+/// [`PassSeams::read_ahead_in`] for a pass that needs no word of its reads.
+fn no_read_ahead_note(_: &str) {}
 
 /// [`crate::hooks::refresh`] as a pass runs it: best-effort, its report unsaid.
 fn refresh_shell_hooks(layout: &crate::store::Layout) {
@@ -11419,25 +11531,50 @@ fn run_update_pass_in<'scope, 'env>(
     // a moment past the index lands after the set instead ([`VENDOR_READ_GRACE`]); every
     // other pass lands its installed vendors first and waits for them all.
     let first_run = complete_the_set && installed.is_empty() && matches!(resolved, Some(Ok(_)));
-    let (mut vendor, mut fresh) = vendor_plan_reading(
-        layout,
-        fetcher,
-        cfg,
-        installed,
-        VendorLanes {
-            update_installed: true,
-            complete_the_set,
-        },
-        match &resolved {
-            Some(Ok(index)) => Some(index),
-            _ => None,
-        },
-        seams,
-        reading.then(|| ReadsAhead {
-            reads,
-            until: first_run.then(|| std::time::Instant::now() + VENDOR_READ_GRACE),
-        }),
-    );
+    // A first run's set manifests go out while the plan waits ([`prefetch_set_manifests`]),
+    // joined with it, on a fetcher a pass may share. Only a first run's: its set completion
+    // comes straight after the plan, where any other pass's apply lane comes first, and
+    // joining the manifests there would hold an update's flip behind them.
+    let set_index = match &resolved {
+        Some(Ok(index)) if first_run => Some(index),
+        _ => None,
+    };
+    let (mut vendor, mut fresh) = std::thread::scope(|beside| {
+        if let (Some(index), Some(shared)) = (set_index, fetcher.shared()) {
+            // A thread the system refuses leaves the manifests to the prescan's own prefetch.
+            let _ = std::thread::Builder::new()
+                .name("atpkg-set-manifests".into())
+                .spawn_scoped(beside, move || {
+                    prefetch_set_manifests(layout, shared, cfg, installed, index);
+                });
+        }
+        let plan = vendor_plan_reading(
+            layout,
+            fetcher,
+            cfg,
+            installed,
+            VendorLanes {
+                update_installed: true,
+                complete_the_set,
+            },
+            match &resolved {
+                Some(Ok(index)) => Some(index),
+                _ => None,
+            },
+            seams,
+            reading.then(|| ReadsAhead {
+                reads,
+                until: first_run.then(|| std::time::Instant::now() + seams.vendor_read_grace),
+            }),
+        );
+        // A first run's floor advance while the manifests are still out: its three durable
+        // writes (17 ms) stood between the last manifest and the announcement. The set
+        // completion runs next on a first run, and its own advance then has nothing to write.
+        if let Some(index) = set_index {
+            advance_floors(layout, index.index_build, index.roster_seq());
+        }
+        plan
+    });
     let late = std::mem::take(&mut fresh.late);
     // AN EMPTY STORE'S FRESH VENDORS RIDE ITS SET COMPLETION, not ahead of it. On a first
     // run every agent and the whole ALab set arrive in one pass, and landing the four agents
@@ -12296,20 +12433,12 @@ fn install_default_set_inner(
         .map(String::as_str)
         .collect();
     let mut unserved: Vec<String> = Vec::new();
-    let prescan: Vec<(&crate::Group, Vec<String>)> = groups
-        .iter()
-        .filter(|group| {
-            !group
-                .members
-                .iter()
-                .any(|m| linked_members.contains(m.as_str()))
-        })
-        .map(|group| (group, absent_members(group, &wanted, &installed)))
-        .filter(|(_, missing)| !missing.is_empty())
-        .collect();
+    let prescan = prescan_units(&groups, &wanted, &installed, &linked_members);
     // Every manifest the prescan reads — and the size sums and the disk check after it —
     // fetched AT ONCE: one at a time they were twenty GETs, four seconds before the
-    // announcement. Bytes only: each read below still verifies what it is handed.
+    // announcement. Bytes only: each read below still verifies what it is handed. A first
+    // run's update pass asked for them beside its vendor plan ([`prefetch_set_manifests`]):
+    // this finds them held and asks the network for none.
     crate::flow::prefetch_pinned(
         fetcher,
         index,
@@ -12409,21 +12538,23 @@ fn install_default_set_inner(
     // and stands: painting it `installing` would hide the fault from doctor and Settings
     // and rewrite the row twice every pass.
     let recorded = crate::status::read(layout);
-    for name in wanted
-        .iter()
-        .filter(|n| crate::stub::is_agent_program(n) && !installed.contains_key(n.as_str()))
-    {
-        let lane_fault = crate::vendor_direct::is_vendor(name)
-            && recorded
-                .as_ref()
-                .and_then(|r| r.programs.get(name.as_str()))
-                .is_some_and(|r| {
-                    r.state.starts_with("error:") || r.state.starts_with("tombstoned:")
-                });
-        if !lane_fault {
-            record_state_if_changed(layout, name, crate::state::agent_installing());
-        }
-    }
+    record_states_if_changed(
+        layout,
+        wanted
+            .iter()
+            .filter(|n| crate::stub::is_agent_program(n) && !installed.contains_key(n.as_str()))
+            .filter(|name| {
+                let lane_fault = crate::vendor_direct::is_vendor(name)
+                    && recorded
+                        .as_ref()
+                        .and_then(|r| r.programs.get(name.as_str()))
+                        .is_some_and(|r| {
+                            r.state.starts_with("error:") || r.state.starts_with("tombstoned:")
+                        });
+                !lane_fault
+            })
+            .map(|name| (name.as_str(), crate::state::agent_installing())),
+    );
     // A coherence tuple with a member NARROWED OUT — a `[packages]` include/exclude,
     // or a member removed on purpose — cannot install whole, and the group arm
     // below refuses it. Deciding that only AT the arm would let one pass announce,
@@ -13022,6 +13153,72 @@ fn resort_bumped(remaining: &mut [(usize, Vec<String>)], bump: &[String]) {
             .unwrap_or(usize::MAX)
     };
     remaining.sort_by_key(|(_, missing)| rank_of(missing));
+}
+
+/// The units the set completion's prescan reads: every group with no dev-linked member, and
+/// its members wanted here and not installed — a group with none left out.
+fn prescan_units<'g>(
+    groups: &'g [crate::Group],
+    wanted: &std::collections::BTreeSet<String>,
+    installed: &std::collections::BTreeMap<String, u64>,
+    linked: &std::collections::BTreeSet<&str>,
+) -> Vec<(&'g crate::Group, Vec<String>)> {
+    groups
+        .iter()
+        .filter(|group| !group.members.iter().any(|m| linked.contains(m.as_str())))
+        .map(|group| (group, absent_members(group, wanted, installed)))
+        .filter(|(_, missing)| !missing.is_empty())
+        .collect()
+}
+
+/// A first run's set-completion manifest prefetch, asked the moment the update pass's index
+/// is in rather than once its vendor plan is: a first run's plan waits for a vendor's read
+/// still out past the index ([`VENDOR_READ_GRACE`]), and a held vendor host held the set's
+/// manifests, its announcement and its first byte behind that wait. The units are the
+/// prescan's ([`prescan_units`]) over the wanted set as the pass first knows it, before
+/// system satisfaction narrows it (a member satisfied by the system costs its pair in the
+/// same wave); a manifest the prescan wants that this did not ask for, or that did not arrive
+/// whole, its own prefetch fetches. Bytes into the fetcher's memo only; every read still
+/// verifies them.
+fn prefetch_set_manifests(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    cfg: &crate::config::PackagesConfig,
+    installed: &std::collections::BTreeMap<String, u64>,
+    index: &crate::TrustedIndex,
+) {
+    let triple = current_triple();
+    let Some(ch) = index.channel_for(crate::config::CHANNEL, triple) else {
+        return;
+    };
+    let groups = crate::apply::plan_groups_here(layout, index, &ch, triple);
+    let mut wanted = wanted_programs(index, cfg);
+    for spec in crate::vendor_direct::VENDORS {
+        if spec.serves(triple)
+            && vendor_wanted(cfg, &std::collections::BTreeSet::new(), spec.program)
+        {
+            wanted.insert(spec.program.to_string());
+        }
+    }
+    for p in removed_programs(layout) {
+        wanted.remove(&p);
+    }
+    let linked: std::collections::BTreeSet<&str> = groups
+        .iter()
+        .flat_map(|group| group.members.iter())
+        .filter(|m| crate::linkmode::is_linked(layout, m))
+        .map(String::as_str)
+        .collect();
+    let units = prescan_units(&groups, &wanted, installed, &linked);
+    crate::flow::prefetch_pinned(
+        fetcher,
+        index,
+        &ch,
+        units
+            .iter()
+            .flat_map(|(group, missing)| prescan_probe(group, missing))
+            .map(String::as_str),
+    );
 }
 
 /// `group`'s members that are wanted here and not installed — what a pass would fetch
@@ -15377,7 +15574,7 @@ fn read_vendors_ahead<'scope, 'env>(
         return false;
     };
     let removed = removed_programs(layout);
-    let (trust, now) = (seams.trust, (seams.now)());
+    let (trust, now, read_in) = (seams.trust, (seams.now)(), seams.read_ahead_in);
     for spec in crate::vendor_direct::VENDORS {
         let program = spec.program;
         let planned = installed.contains_key(program)
@@ -15397,10 +15594,12 @@ fn read_vendors_ahead<'scope, 'env>(
                             now,
                         )
                     });
+                    read_in(program);
                 })
                 .is_ok();
         if !spawned {
             reads.read(program, || None);
+            read_in(program);
         }
     }
     true

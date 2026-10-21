@@ -23,14 +23,19 @@
 //!   full): "<condition>"` (`wall.disk_full.goal` is the template's head,
 //!   its label `disk full` this cause's).
 //!
-//! Where the notification is drawn was NOT measured (the bundle's minified
-//! names are scope-local): it is read where Claude Code draws a notification
-//! or a banner — under the composer's bottom rule (the footer and its
-//! notifications) or in the live zone between the status row and the
-//! composer's top rule — never inside the composer (a draft can quote it)
-//! and never in a message a person queued. A tool's row is read only as the
-//! vendor's `⎿` row at column two, and the goal's notice only where a
-//! vendor row or the footer stands.
+//! Where the notification is drawn was MEASURED on 2.1.304 (the lab,
+//! 2026-10-20, `prompt::fixtures::TRANSCRIPT_DEGRADED_EACCES_2_1_304`): under
+//! the composer's bottom rule, over the footer's mode row, two columns in,
+//! and opened by the vendor's warning glyph — `  ⚠ Transcript writes are
+//! failing (…` — as every pinned notice is (the bundle's notice row draws
+//! `⚠`, one space, then the notice). It is read there and in the live zone
+//! between the status row and the composer's top rule, where Claude Code
+//! draws its other banners: the anchor opening a segment of the row, or
+//! following the glyph and ONE space at a segment's head (`after_glyph`),
+//! never after any other text — never inside the composer (a draft can
+//! quote it) and never in a message a person queued. A tool's row is read
+//! only as the vendor's `⎿` row at column two, and the goal's notice only
+//! where a vendor row or the footer stands.
 //!
 //! WHAT A READING IS FOR: a request to MEASURE. aterm's disk watch reads the
 //! volume's free space when this says so; nothing is removed on a screen's
@@ -75,7 +80,8 @@ pub struct DiskFull {
     pub source: Source,
     /// The row it opens on.
     pub row: usize,
-    /// The notice as drawn on that row, from its anchor on.
+    /// The notice as drawn on that row, from its anchor on (the vendor's
+    /// glyph before it left off).
     pub message: String,
 }
 
@@ -147,23 +153,40 @@ fn segments(row: &str) -> impl Iterator<Item = &str> {
     starts.into_iter()
 }
 
-/// The pinned notification on row `i`: a segment that opens with the anchor
-/// and names `— ENOSPC)` or `— EDQUOT)` (a code alone when the vendor maps
-/// none: `(ENOSPC)`).
+/// The pinned notification on row `i`: a segment that opens with the anchor,
+/// or with the vendor's glyph and the anchor ([`after_glyph`]), and names
+/// `— ENOSPC)` or `— EDQUOT)` (a code alone when the vendor maps none:
+/// `(ENOSPC)`).
 fn notification(rows: &[String], i: usize) -> Option<DiskFull> {
     let anchor = const { crate::anchors::anchor_text("wall.disk_full") };
     let row = crate::text::trim_end(&rows[i]);
     segments(row).find_map(|seg| {
-        let rest = seg.strip_prefix(anchor)?;
+        let words = after_glyph(seg);
+        let rest = words.strip_prefix(anchor)?;
         let inside = rest.split(')').next()?;
         let code = code_in(inside)?;
         Some(DiskFull {
             code,
             source: Source::Notification,
             row: i,
-            message: seg.to_string(),
+            message: words.to_string(),
         })
     })
+}
+
+/// The warning glyph Claude Code draws before a pinned notice's words
+/// (2.1.304's notice row: `⚠`, then one space; MEASURED, the module's
+/// fixture), U+26A0 with or without the emoji selector U+FE0F.
+const GLYPH: char = '\u{26A0}';
+
+/// `seg` less the vendor's glyph and the ONE space after it, where it opens
+/// with them; `seg` itself otherwise. Nothing else before the words is
+/// taken off: a draft, a quote or a label in front of them is no notice.
+fn after_glyph(seg: &str) -> &str {
+    seg.strip_prefix(GLYPH)
+        .map(|r| r.strip_prefix('\u{FE0F}').unwrap_or(r))
+        .and_then(|r| r.strip_prefix(' '))
+        .unwrap_or(seg)
 }
 
 /// The code a notice's words name: the last word of `text`, or `None` when

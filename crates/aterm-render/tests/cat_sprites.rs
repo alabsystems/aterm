@@ -246,9 +246,16 @@ fn cat_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     cur.cat_atlas = Some(atlas_v1.clone());
     cur.cat_quads = settled.clone();
     let mut dirty = Vec::new();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -263,9 +270,16 @@ fn cat_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
 
     // Changed: the cat moves row 1 → row 3 ⇒ exactly rows {1, 3}, no gate.
     cur.cat_quads = vec![quad(3, [0, 60, 16, 16], [0, 0, 16, 16])];
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(d.cat_changed, "moved quads must set cat_changed");
@@ -284,9 +298,16 @@ fn cat_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     // Atlas-version bump with equal quads: a rebake must repaint.
     cur.cat_quads = settled;
     cur.cat_atlas = Some(Arc::new(patterned_atlas(16, 16, 2)));
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(

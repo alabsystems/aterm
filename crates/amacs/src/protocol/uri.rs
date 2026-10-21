@@ -151,23 +151,82 @@ pub fn path_to_file_uri(path: &Path) -> Result<String, UriError> {
     if cfg!(windows) && !normalized.starts_with('/') {
         normalized.insert(0, '/');
     }
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut uri = String::from("file://");
     for byte in normalized.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~' | b':') {
+        if file_uri_keeps(byte) {
             uri.push(char::from(byte));
         } else {
-            uri.push('%');
-            uri.push(char::from(HEX[usize::from(byte >> 4)]));
-            uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            push_percent_escape(&mut uri, byte);
         }
     }
     Ok(uri)
 }
 
+/// Append `byte` as `%XY`, two upper-case hex digits. Kept apart from the
+/// escape decision so each digit's index into `HEX` is provably below 16
+/// whatever the caller's branch was.
+fn push_percent_escape(uri: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    uri.push('%');
+    uri.push(char::from(HEX[usize::from(byte >> 4)]));
+    uri.push(char::from(HEX[usize::from(byte & 0x0f)]));
+}
+
+trust_contract_fn! {
+    /// Whether [`path_to_file_uri`] writes `byte` as itself: an ASCII letter
+    /// or digit, or one of `/ - _ . ~ :`. Every other byte, a space and `%`
+    /// among them, is percent-encoded, so the URI is one whitespace-free wire
+    /// token that decodes back to exactly the path.
+    #[expect(
+        clippy::manual_range_contains,
+        reason = "Trust kernel-imports a bool tree of comparisons, not a call to `RangeInclusive::contains` (E6 refuses calls)"
+    )]
+    fn file_uri_keeps(byte: u8) -> bool
+    clauses [ensures result == ((byte >= 48 && byte <= 57)
+        || ((byte >= 65 && byte <= 90)
+        || ((byte >= 97 && byte <= 122)
+        || (byte == 47 || (byte == 45 || (byte == 95 || (byte == 46 || (byte == 126 || byte == 58))))))))
+        by file_uri_keeps_exactly_the_unescaped_set]
+    {
+        (byte >= b'0' && byte <= b'9')
+            || (byte >= b'A' && byte <= b'Z')
+            || (byte >= b'a' && byte <= b'z')
+            || byte == b'/'
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+            || byte == b':'
+    }
+}
+
+// Spec `file-uri-unescaped-set` (SPECS.md), kernel-checked against the
+// compiled body: the set is the clause, byte for byte.
+verify_island! {
+    clean {
+        theorem file_uri_keeps_exactly_the_unescaped_set (byte : UInt8) :
+            trust_import_amacs__protocol__uri__file_uri_keeps byte =
+              ((decide (48 <= byte) && decide (byte <= 57))
+                || ((decide (65 <= byte) && decide (byte <= 90))
+                || ((decide (97 <= byte) && decide (byte <= 122))
+                || (decide (byte = 47) || (decide (byte = 45) || (decide (byte = 95)
+                || (decide (byte = 46) || (decide (byte = 126) || decide (byte = 58))))))))) := by
+          simp only [trust_import_amacs__protocol__uri__file_uri_keeps]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_uri_keeps_the_set_it_replaced() {
+        for byte in u8::MIN..=u8::MAX {
+            let before = byte.is_ascii_alphanumeric()
+                || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~' | b':');
+            assert_eq!(file_uri_keeps(byte), before, "byte {byte:#04x}");
+        }
+    }
 
     /// An absolute path in this host's spelling.
     fn absolute(tail: &str) -> PathBuf {

@@ -82,9 +82,8 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
 
     // The manager's wait over both workers, armed past each one's rev 1.
     let list = format!("@{a}:1,@{b}:1");
-    let waiter = client_command(&inst, &["await", "task", &list, "all", HANG_MS])
-        .spawn()
-        .expect("spawn the waiting client");
+    let mut waiting = client_command(&inst, &["await", "task", &list, "all", HANG_MS]);
+    let waiter = waiting.spawn().expect("spawn the waiting client");
     ctl_ok(
         &inst,
         &[
@@ -92,17 +91,26 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
             "task",
             "mark",
             "done",
-            "why=marker",
+            "why=landed",
             "result_bytes=11",
         ],
     );
+    // An older build's done word, as a record carried from it marks it:
+    // still read.
     ctl_ok(
         &inst,
         &[&format!("@{b}"), "task", "mark", "done", "why=done-check"],
     );
-    let out =
-        child_output::wait_and_read(waiter, Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE)
-            .expect("the waiting client exits");
+    // A waiter the instance never accepted, or answered busy, is asked again: it is armed past each
+    // worker's rev 1, so one armed after the marks answers them at once.
+    let mut first = Some(waiter);
+    let out = headless_boot::until_served(|| {
+        let child = first
+            .take()
+            .unwrap_or_else(|| waiting.spawn().expect("spawn the waiting client"));
+        child_output::wait_and_read(child, Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE)
+            .expect("the waiting client exits")
+    });
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
@@ -208,7 +216,7 @@ fn a_workers_result_is_read_and_a_turn_opens_it_again() {
             "task",
             "mark",
             "done",
-            "why=marker",
+            "why=landed",
             "result_bytes=28",
             &path,
         ],

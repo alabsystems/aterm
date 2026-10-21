@@ -13,13 +13,15 @@ description = "aterm — the PTY keeper: a per-login holder of a custody copy of
 # The cordoned unsafe crate the keeper's OS half is built on (descriptors, peers, process
 # birth, exit watch, spawn, holder scan).
 aterm-uds = { workspace = true }
-# The workspace's one FNV-1a/64, for a dev keeper's per-path label. Dependency-free.
+# The workspace's one FNV-1a/64, for a dev keeper's per-path label. Its one
+# dependency is astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
 aterm-hash = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
+aterm-tempfile = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }

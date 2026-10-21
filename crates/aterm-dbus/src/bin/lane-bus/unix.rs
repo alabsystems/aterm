@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use aterm_dbus::{Connection, Message, Value, address};
+use aterm_dbus::{Connection, Message, Type, Value, address};
 
 /// One call's deadline.
 const CALL: Duration = Duration::from_secs(10);
@@ -42,6 +42,9 @@ const BUS: &str = "org.freedesktop.DBus";
 const RD: &str = "org.gnome.Mutter.RemoteDesktop";
 const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
 const RD_SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
+const SC: &str = "org.gnome.Mutter.ScreenCast";
+const SC_PATH: &str = "/org/gnome/Mutter/ScreenCast";
+const SC_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
 
 /// The AT-SPI 2 roles, by number (at-spi2-core's `AtspiRole`).
 const ROLES: [&str; 130] = [
@@ -268,26 +271,26 @@ pub(crate) fn main() -> ExitCode {
                 "seat <mutter-pid> <app> <app-pid> <step>...".into(),
             )),
         },
+        Some("xseat") => match (args.get(1), args.get(2).map(|p| p.parse::<u32>())) {
+            (Some(app), Some(Ok(pid))) => parse_steps(args.get(3..).unwrap_or_default())
+                .map_err(Fail::Usage)
+                .and_then(|steps| xseat(app, pid, &steps)),
+            _ => Err(Fail::Usage("xseat <app> <app-pid> <step>...".into())),
+        },
         Some("xdnd") => match (args.get(1).map(|w| parse_window(w)), args.get(2), args.get(3)) {
             (Some(Some(window)), Some(uri), Some(marks)) if args.len() == 4 => {
-                crate::xdnd::run(window, uri, Path::new(marks)).map_err(|e| match e {
-                    crate::xdnd::Error::NoServer(why) => Fail::NotHere(why),
-                    crate::xdnd::Error::Fault(why) => Fail::Fault(why),
-                })
+                crate::xdnd::run(window, uri, Path::new(marks)).map_err(x_fail)
             }
             _ => Err(Fail::Usage("xdnd <window> <uri> <marks-dir>".into())),
         },
         Some("xgrab") => match (args.get(1).map(|w| parse_window(w)), args.get(2)) {
             (Some(Some(window)), Some(out)) if args.len() == 3 => {
-                crate::xgrab::run(window, Path::new(out)).map_err(|e| match e {
-                    crate::xdnd::Error::NoServer(why) => Fail::NotHere(why),
-                    crate::xdnd::Error::Fault(why) => Fail::Fault(why),
-                })
+                crate::xgrab::run(window, Path::new(out)).map_err(x_fail)
             }
             _ => Err(Fail::Usage("xgrab <window> <out>".into())),
         },
         _ => Err(Fail::Usage(
-            "lane-bus atspi-walk <app> <pid> | atspi-listen <app> <out> <stop> | seat <mutter-pid> <app> <app-pid> <step>... | xdnd <window> <uri> <marks-dir> | xgrab <window> <out>"
+            "lane-bus atspi-walk <app> <pid> | atspi-listen <app> <out> <stop> | seat <mutter-pid> <app> <app-pid> <step>... | xseat <app> <app-pid> <step>... | xdnd <window> <uri> <marks-dir> | xgrab <window> <out>"
                 .into(),
         )),
     };
@@ -305,6 +308,15 @@ pub(crate) fn main() -> ExitCode {
             eprintln!("lane-bus: usage: {why}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// An X client's failure: no server (or no extension) to speak to is "not
+/// here", anything else a fault.
+fn x_fail(e: crate::xdnd::Error) -> Fail {
+    match e {
+        crate::xdnd::Error::NoServer(why) => Fail::NotHere(why),
+        crate::xdnd::Error::Fault(why) => Fail::Fault(why),
     }
 }
 
@@ -885,6 +897,12 @@ enum Step {
     },
     /// Move the pointer by the `DX DY` this file holds when the step runs.
     MotionFrom(String),
+    /// A finger (touch slot 0) put down at a point of the screen.
+    FingerDown(Point),
+    /// The finger moved to a point of the screen.
+    FingerMove(Point),
+    /// The finger lifted.
+    FingerUp,
     /// Hold for this many milliseconds: a stimulus (a key held down), never a
     /// wait for something to happen.
     Sleep(u64),
@@ -895,6 +913,16 @@ enum Step {
     Wait(String),
 }
 
+/// Where a finger goes: a point of the screen in its pixels (the
+/// monitor's, which a screencast stream of it shares: logical pixels times
+/// the monitor's scale), given, or read as `X Y` from a file when the step
+/// runs (so the lab can aim from what the window reports).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Point {
+    At(i32, i32),
+    From(String),
+}
+
 impl Step {
     /// Whether the step drives the pointer (Mutter makes the seat's pointer
     /// with the session's first such event).
@@ -902,6 +930,16 @@ impl Step {
         matches!(
             self,
             Step::Button { .. } | Step::Motion { .. } | Step::MotionFrom(_)
+        )
+    }
+
+    /// Whether the step drives the touchscreen: RemoteDesktop places a
+    /// finger only in a screencast stream's space, so such a session records
+    /// the monitor ([`seat`]).
+    fn drives_touch(&self) -> bool {
+        matches!(
+            self,
+            Step::FingerDown(_) | Step::FingerMove(_) | Step::FingerUp
         )
     }
 }
@@ -916,10 +954,13 @@ const PARK: Step = Step::Motion {
 };
 
 /// The keysyms `seat` names, beside `0x…`.
-const KEYSYMS: [(&str, u32); 12] = [
+const KEYSYMS: [(&str, u32); 15] = [
     ("Shift_L", 0xffe1),
     ("Control_L", 0xffe3),
     ("Alt_L", 0xffe9),
+    ("Super_L", 0xffeb),
+    ("Left", 0xff51),
+    ("dead_acute", 0xfe51),
     ("Return", 0xff0d),
     ("Escape", 0xff1b),
     ("BackSpace", 0xff08),
@@ -1027,6 +1068,24 @@ fn parse_steps(words: &[String]) -> Result<Vec<Step>, String> {
                     steps.push(Step::Motion { dx, dy });
                 }
             },
+            "finger-down" | "finger-move" => {
+                let point = match arg.strip_prefix('@') {
+                    Some(path) if path.starts_with('/') => Point::From(path.to_string()),
+                    Some(_) => {
+                        return Err(format!("seat step '{w}': an absolute path after '@'"));
+                    }
+                    None => motion(arg)
+                        .map(|(x, y)| Point::At(x, y))
+                        .ok_or_else(|| format!("seat step '{w}': {verb}:X,Y in pixels"))?,
+                };
+                steps.push(if verb == "finger-down" {
+                    Step::FingerDown(point)
+                } else {
+                    Step::FingerMove(point)
+                });
+            }
+            "finger-up" if arg.is_empty() => steps.push(Step::FingerUp),
+            "finger-up" => return Err(format!("seat step '{w}': finger-up: takes nothing")),
             "sleep" => steps.push(Step::Sleep(
                 arg.parse()
                     .map_err(|_| format!("seat step '{w}': milliseconds"))?,
@@ -1039,8 +1098,8 @@ fn parse_steps(words: &[String]) -> Result<Vec<Step>, String> {
             "touch" | "wait" => return Err(format!("seat step '{w}': an absolute path")),
             _ => {
                 return Err(format!(
-                    "seat step '{w}': tap, down, up, chord, button, press, release, move, sleep, \
-                     touch or wait"
+                    "seat step '{w}': tap, down, up, chord, button, press, release, move, \
+                     finger-down, finger-move, finger-up, sleep, touch or wait"
                 ));
             }
         }
@@ -1185,9 +1244,27 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
             )));
         }
     };
+    let stream = if steps.iter().any(Step::drives_touch) {
+        Some(record_monitor(&mut conn, rd, &session)?)
+    } else {
+        None
+    };
     call(&mut conn, rd, &session, RD_SESSION, "Start", Vec::new()).map_err(Fail::Fault)?;
+    let run = |conn: &mut Connection, steps: &[Step]| {
+        run_steps(conn, rd, &session, stream.as_deref(), steps)
+    };
     if a11y.is_some() && steps.iter().any(Step::drives_pointer) {
-        run_steps(&mut conn, rd, &session, &[PARK])?;
+        run(&mut conn, &[PARK])?;
+    }
+    // Mutter makes the touchscreen with the session's first touch, which no
+    // client hears (none has bound it yet, as with the keyboard): a tap in
+    // the top-left corner. A step that must reach a client waits until the
+    // client has bound it (the lab reads its wire log).
+    if stream.is_some() {
+        run(
+            &mut conn,
+            &[Step::FingerDown(Point::At(0, 0)), Step::FingerUp],
+        )?;
     }
     // Mutter gives the seat its keyboard with the session's first key event,
     // which no client hears (it binds the keyboard only then), and the
@@ -1202,12 +1279,12 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
             pressed: false,
         },
     ];
-    run_steps(&mut conn, rd, &session, &prime)?;
+    run(&mut conn, &prime)?;
     let focused = match a11y.as_mut() {
         Some(a11y) => await_focus(a11y, app, pid, true),
         None => Ok(()),
     };
-    let done = focused.and_then(|()| run_steps(&mut conn, rd, &session, steps));
+    let done = focused.and_then(|()| run(&mut conn, steps));
     let _ = call(&mut conn, rd, &session, RD_SESSION, "Stop", Vec::new());
     done?;
     // The session ends once the window has lost the keyboard's focus: what
@@ -1217,6 +1294,79 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     }
     println!("ok seat {} steps", steps.len());
     Ok(())
+}
+
+/// The `DX DY` the file `path` holds now (a `move:@PATH` step's).
+fn motion_from(path: &str) -> Result<(i32, i32), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    motion(&text).ok_or_else(|| format!("{path}: not `DX DY` ({text:?})"))
+}
+
+/// `xseat <app> <app-pid> <step>...`: `seat`'s steps faked through XTEST on
+/// the X display `DISPLAY` names ([`crate::xtest`]), the input of weston's x11
+/// backend nested in it: weston's seat reads its X window, which covers the X
+/// screen. That seat's keyboard and pointer live as long as weston does, so
+/// unlike [`seat`] nothing is made and no key primes them, and the frame keeps
+/// the keyboard's focus when the steps end. What an earlier session left
+/// pressed (one stopped mid-drag) stays pressed in the X server, so a session
+/// first lets go of every button and key held down. The steps start once `app`'s frame
+/// is `active` (the window has the keyboard's focus; an `app` of `-` awaits
+/// none), and a session that drives the pointer first parks it in the
+/// screen's top-left corner, as [`seat`]'s does, so its steps aim from there.
+/// A finger step is refused: XTEST fakes no touchscreen.
+fn xseat(app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
+    if steps.iter().any(Step::drives_touch) {
+        return Err(Fail::Usage(
+            "xseat: a finger step (XTEST fakes no touchscreen)".into(),
+        ));
+    }
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    let mut x = crate::xtest::Xtest::connect(&display).map_err(x_fail)?;
+    let (buttons, keys) = x.let_go().map_err(x_fail)?;
+    if !buttons.is_empty() || !keys.is_empty() {
+        println!("let go of buttons {buttons:?} and keycodes {keys:?} an earlier session held");
+    }
+    if steps.iter().any(Step::drives_pointer) {
+        x.park().map_err(x_fail)?;
+    }
+    if app != NO_APP {
+        let mut a11y = a11y_bus()?;
+        await_focus(&mut a11y, app, pid, true)?;
+    }
+    for step in steps {
+        let done = match step {
+            Step::Touch(path) => std::fs::File::create(path)
+                .map(drop)
+                .map_err(|e| e.to_string()),
+            Step::Wait(path) => {
+                await_file(path, LISTEN_LIMIT)?;
+                Ok(())
+            }
+            Step::Sleep(ms) => {
+                std::thread::sleep(Duration::from_millis(*ms));
+                Ok(())
+            }
+            Step::Key { keysym, pressed } => x.key(*keysym, *pressed).map_err(x_why),
+            Step::Button { code, pressed } => x.button(*code, *pressed).map_err(x_why),
+            Step::Motion { dx, dy } => x.motion(*dx, *dy).map_err(x_why),
+            Step::MotionFrom(path) => {
+                motion_from(path).and_then(|(dx, dy)| x.motion(dx, dy).map_err(x_why))
+            }
+            Step::FingerDown(_) | Step::FingerMove(_) | Step::FingerUp => {
+                Err("XTEST fakes no touchscreen".into())
+            }
+        };
+        done.map_err(|e| Fail::Fault(format!("{step:?}: {e}")))?;
+    }
+    println!("ok xseat {} steps", steps.len());
+    Ok(())
+}
+
+/// An X client's failure as a step's text.
+fn x_why(e: crate::xdnd::Error) -> String {
+    match e {
+        crate::xdnd::Error::NoServer(why) | crate::xdnd::Error::Fault(why) => why,
+    }
 }
 
 /// The seat's pointer moved by `(dx, dy)` logical pixels.
@@ -1238,8 +1388,89 @@ fn relative_motion(
     .map(drop)
 }
 
-/// The steps of one `seat` session, in order.
-fn run_steps(conn: &mut Connection, rd: &str, session: &str, steps: &[Step]) -> Result<(), Fail> {
+/// A screencast of the primary monitor, tied to the RemoteDesktop session
+/// `session` (it starts and stops with it): the stream a finger's position
+/// is given in. Its object path.
+fn record_monitor(conn: &mut Connection, rd: &str, session: &str) -> Result<String, Fail> {
+    let id = property(conn, rd, session, RD_SESSION, "SessionId").map_err(Fail::Fault)?;
+    let id = id
+        .as_str()
+        .ok_or_else(|| Fail::Fault(format!("SessionId is {}", render(&id))))?
+        .to_owned();
+    let tied = Value::dict(
+        Type::Str,
+        Type::Variant,
+        vec![(
+            "remote-desktop-session-id".into(),
+            Value::variant(id.into()),
+        )],
+    )
+    .map_err(Fail::fault)?;
+    let body = call(conn, rd, SC_PATH, SC, "CreateSession", vec![tied])
+        .map_err(|e| Fail::NotHere(format!("no screencast here (pipewire): CreateSession: {e}")))?;
+    let screencast = match body.first() {
+        Some(Value::Path(p)) => p.as_str().to_owned(),
+        other => {
+            return Err(Fail::Fault(format!(
+                "ScreenCast.CreateSession answered {}",
+                other.map_or_else(|| "nothing".into(), render)
+            )));
+        }
+    };
+    // The primary monitor (an empty connector), with no properties.
+    let none = Value::dict(Type::Str, Type::Variant, Vec::new()).map_err(Fail::fault)?;
+    let body = call(
+        conn,
+        rd,
+        &screencast,
+        SC_SESSION,
+        "RecordMonitor",
+        vec!["".into(), none],
+    )
+    .map_err(Fail::Fault)?;
+    match body.first() {
+        Some(Value::Path(p)) => Ok(p.as_str().to_owned()),
+        other => Err(Fail::Fault(format!(
+            "RecordMonitor answered {}",
+            other.map_or_else(|| "nothing".into(), render)
+        ))),
+    }
+}
+
+/// Where a finger goes, read now: `(x, y)` in the stream's pixels.
+fn point(at: &Point) -> Result<(f64, f64), String> {
+    let (x, y) = match at {
+        Point::At(x, y) => (*x, *y),
+        Point::From(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("{path}: {e}"))
+            .and_then(|text| {
+                motion(&text).ok_or_else(|| format!("{path}: not `X Y` ({text:?})"))
+            })?,
+    };
+    Ok((f64::from(x), f64::from(y)))
+}
+
+/// The steps of one `seat` session, in order; `stream` is the screencast a
+/// finger's position is given in, when the session has one.
+fn run_steps(
+    conn: &mut Connection,
+    rd: &str,
+    session: &str,
+    stream: Option<&str>,
+    steps: &[Step],
+) -> Result<(), Fail> {
+    let finger = |conn: &mut Connection, member: &str, at: &Point| -> Result<(), String> {
+        let stream = stream.ok_or("a finger step in a session without a screencast")?;
+        let (x, y) = point(at)?;
+        // Mutter 46 takes the stream's object path as a string (`(sudd)`).
+        let body = vec![
+            Value::Str(stream.to_owned()),
+            Value::U32(0),
+            Value::F64(x),
+            Value::F64(y),
+        ];
+        call(conn, rd, session, RD_SESSION, member, body).map(drop)
+    };
     for step in steps {
         let done = match step {
             Step::Touch(path) => std::fs::File::create(path)
@@ -1268,12 +1499,20 @@ fn run_steps(conn: &mut Connection, rd: &str, session: &str, steps: &[Step]) -> 
             )
             .map(drop),
             Step::Motion { dx, dy } => relative_motion(conn, rd, session, *dx, *dy),
-            Step::MotionFrom(path) => std::fs::read_to_string(path)
-                .map_err(|e| format!("{path}: {e}"))
-                .and_then(|text| {
-                    motion(&text).ok_or_else(|| format!("{path}: not `DX DY` ({text:?})"))
-                })
-                .and_then(|(dx, dy)| relative_motion(conn, rd, session, dx, dy)),
+            Step::MotionFrom(path) => {
+                motion_from(path).and_then(|(dx, dy)| relative_motion(conn, rd, session, dx, dy))
+            }
+            Step::FingerDown(at) => finger(conn, "NotifyTouchDown", at),
+            Step::FingerMove(at) => finger(conn, "NotifyTouchMotion", at),
+            Step::FingerUp => call(
+                conn,
+                rd,
+                session,
+                RD_SESSION,
+                "NotifyTouchUp",
+                vec![Value::U32(0)],
+            )
+            .map(drop),
             Step::Sleep(ms) => {
                 std::thread::sleep(Duration::from_millis(*ms));
                 Ok(())
@@ -1439,6 +1678,29 @@ mod tests {
         assert!(parse_steps(&w(&["move:1,x"])).is_err());
         assert!(parse_steps(&w(&["move:200000,0"])).is_err());
         assert!(parse_steps(&w(&["press:nosuchbutton"])).is_err());
+        // A finger: put down, moved and lifted, at points of the screen.
+        assert_eq!(
+            parse_steps(&w(&[
+                "finger-down:640,400",
+                "finger-move:@/tmp/a/to",
+                "finger-up:",
+                "tap:dead_acute",
+                "chord:Super_L+Left"
+            ]))
+            .expect("parses")[..4],
+            [
+                Step::FingerDown(Point::At(640, 400)),
+                Step::FingerMove(Point::From("/tmp/a/to".into())),
+                Step::FingerUp,
+                Step::Key {
+                    keysym: 0xfe51,
+                    pressed: true
+                },
+            ]
+        );
+        assert!(parse_steps(&w(&["finger-up:0"])).is_err());
+        assert!(parse_steps(&w(&["finger-down:@relative"])).is_err());
+        assert!(parse_steps(&w(&["finger-move:1"])).is_err());
     }
 
     #[test]
@@ -1460,5 +1722,15 @@ mod tests {
             "wait:/tmp/a/go"
         ]));
         assert!(PARK.drives_pointer());
+        let touches = |v: &[&str]| {
+            parse_steps(&w(v))
+                .expect("parses")
+                .iter()
+                .any(Step::drives_touch)
+        };
+        assert!(touches(&["move:1,1", "finger-down:3,4"]));
+        assert!(touches(&["finger-up:"]));
+        assert!(!touches(&["move:1,1", "touch:/tmp/a/ready"]));
+        assert!(!drives(&["finger-down:3,4"]));
     }
 }

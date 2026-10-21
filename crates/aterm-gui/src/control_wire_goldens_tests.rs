@@ -167,13 +167,12 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
         &wake,
     );
     assert_eq!(reply, "OK 1\n", "the delivery");
-    let reply = crate::fabric::cmd_inbox_seen_waking(&ctx, "1 handled", &|| {});
+    let reply = crate::fabric::cmd_inbox_seen(&ctx, "1 handled");
     assert!(reply.starts_with("OK seen=1"), "{reply}");
-    let reply = crate::fabric::cmd_post_waking(
+    let reply = crate::fabric::cmd_post(
         &ctx,
         "to=@s-b kind=answer re=1 --wait=0 SENTINEL-ANSWER",
         None,
-        &|| {},
     );
     // Queued (post id 1) whether or not a bridge is up: `OK 1`, or an `ERR`
     // naming it (`fabric absent id=1`, `timeout id=1`).

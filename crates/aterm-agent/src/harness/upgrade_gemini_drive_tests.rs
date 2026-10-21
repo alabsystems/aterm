@@ -210,7 +210,9 @@ struct After {
 
 /// What the stand-in serves, and what it does as the relaunch line is typed.
 struct World {
-    blocks2: String,
+    /// The shell's blocks after the exit ([`blocks`]), which a reset rig
+    /// ([`Rig::reset`]) serves anew.
+    blocks2: Arc<Mutex<String>>,
     after_exit: String,
     after_relaunch: String,
     status: String,
@@ -263,7 +265,10 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                 "OK 2\nkey  key [if-gen=<epoch>.<seq>] [if=<re>] <name>\n     FENCES".to_string()
             }
             "help" => "OK 1\nturn [if-gen=<epoch>.<seq>] <text>".to_string(),
-            "blocks" => format!("OK {}", served(&after.blocks, &w.blocks2)),
+            "blocks" => format!(
+                "OK {}",
+                served(&after.blocks, &w.blocks2.lock().expect("blocks"))
+            ),
             "blocktext" => "OK 0".to_string(),
             "line" => "OK % ".to_string(),
             "lease" => "ERR unscripted".to_string(),
@@ -509,6 +514,7 @@ struct Rig {
     chats: PathBuf,
     project: String,
     hash: String,
+    blocks2: Arc<Mutex<String>>,
     after: Arc<Mutex<After>>,
     new_session: Arc<Mutex<Option<String>>>,
     header_after: Arc<AtomicU64>,
@@ -543,8 +549,9 @@ impl Rig {
         let after = Arc::new(Mutex::new(After::default()));
         let new_session = Arc::new(Mutex::new(Some(S1.to_string())));
         let header_after = Arc::new(AtomicU64::new(500));
+        let blocks2 = Arc::new(Mutex::new(blocks(status, word, later)));
         let w = World {
-            blocks2: blocks(status, word, later),
+            blocks2: Arc::clone(&blocks2),
             after_exit: shell_after(),
             after_relaunch: gemini_idle(),
             status: "OK schema=1 hold=0 hand=- integration=on".to_string(),
@@ -587,6 +594,7 @@ impl Rig {
                 orphan_looks: AtomicUsize::new(0),
             },
             asked,
+            blocks2,
             after,
             home,
             chats,
@@ -597,6 +605,40 @@ impl Rig {
             opts,
             dir,
         }
+    }
+
+    /// The rig [`Rig::new`] makes for `status`, `word`, `later` and `files`, on
+    /// this rig's scratch tree and stand-in: the project's session files
+    /// written afresh around a parent started a minute ago, the state and
+    /// home directories gone, the stand-in serving the exit's blocks and
+    /// nothing after the line, its log empty, and the kernel's parent
+    /// exited, nothing relaunched and no knob turned. A walk over many
+    /// worlds resets one rig per world instead of making and removing one:
+    /// the scratch tree and the stand-in's socket and thread were most of
+    /// its time.
+    fn reset(&mut self, status: i64, word: bool, later: bool, files: Files) {
+        for dir in [&self.opts.state, &self.opts.home, &self.chats] {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("{}: {e}", dir.display()),
+            }
+        }
+        std::fs::create_dir_all(&self.chats).expect("chats");
+        let started_ms = now_ms() - 60_000;
+        write_files(&self.chats, &self.hash, started_ms, files);
+        *self.blocks2.lock().expect("blocks") = blocks(status, word, later);
+        *self.after.lock().expect("after") = After::default();
+        *self.new_session.lock().expect("new") = Some(S1.to_string());
+        self.header_after.store(500, Ordering::SeqCst);
+        self.asked.lock().expect("log").clear();
+        let k = &mut self.kernel;
+        k.exited.store(true, Ordering::SeqCst);
+        k.relaunched.store(false, Ordering::SeqCst);
+        k.relaunched_ms.store(0, Ordering::SeqCst);
+        k.started_ms = started_ms;
+        k.knobs = Knobs::default();
+        k.orphan_looks.store(0, Ordering::SeqCst);
     }
 
     /// The snapshot the host took of the Gemini CLI while it ran: launched
@@ -646,9 +688,27 @@ impl Rig {
         after_exit_onto(&self.opts, snap, left, cause, &self.kernel)
     }
 
+    /// [`exit_record`] over the real look at this rig's exit. Nothing a look
+    /// asks moves the stand-in or the kernel, so the world stands still while
+    /// it is looked at: the second look is real and must read what the first
+    /// did, and every later one is the first's again. `exit_record`'s loop runs
+    /// whole over them (its waits and their count are `relaunch_tests`'), but
+    /// an undecided exit's 81 looks are two connects to the stand-in, not 81.
     fn look(&self, snap: &Snapshot) -> ExitRecord {
+        let (mut first, mut looks) = (None, 0);
         exit_record(
-            || Some(look_at_exit(&self.opts, snap, &self.kernel)),
+            || {
+                looks += 1;
+                if looks <= 2 {
+                    let now = look_at_exit(&self.opts, snap, &self.kernel);
+                    assert_eq!(
+                        *first.get_or_insert_with(|| now.clone()),
+                        now,
+                        "a look moved"
+                    );
+                }
+                first.clone()
+            },
             |_| true,
         )
     }
@@ -1058,8 +1118,10 @@ fn another_launchs_late_header_is_never_resumed_as_its_own() {
 /// NEVER TYPED (`refused:history-unsafe`): after two resumes with no turn
 /// between, the newest of the session's files is an empty duplicate, which
 /// `--resume` would load under the same id. A session that took no turn is
-/// told there is nothing to resume (`refused:no-turn`). NEGATIVE CONTROL: the
-/// resume that bumped the turn-holding file loads every turn and is typed.
+/// told there is nothing to resume (`refused:no-turn`), and either is told at
+/// the exit, before the attempt takes the tab: nothing is recorded of a
+/// relaunch. NEGATIVE CONTROL: the resume that bumped the turn-holding file
+/// loads every turn and is typed.
 #[test]
 fn a_resume_the_precheck_refuses_is_told_never_typed() {
     for (name, files, want) in [
@@ -1093,6 +1155,8 @@ fn a_resume_the_precheck_refuses_is_told_never_typed() {
         assert_eq!(r.step, want, "{name}: {r:?}");
         if want != "continued" {
             assert_eq!(rig.lines(), 0, "{name}: {:#?}", rig.typed());
+            let kept = load(&rig.opts, &key(TAB));
+            assert!(kept.is_none(), "{name}: {kept:#?}");
         }
     }
     for step in ["refused:history-unsafe", "refused:no-turn"] {
@@ -1952,7 +2016,9 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let m = aterm_models_harness::harness_gemini_exit_witness_model();
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let draw = |name: String, exit: i64, word: bool, later: bool, rule: i64, dup: bool| {
+    // One rig, reset to each world in turn ([`Rig::reset`]).
+    let mut rig = Rig::new("tier1", 0, true, false, Files::default());
+    let draw = |rig: &mut Rig, exit: i64, word: bool, later: bool, rule: i64, dup: bool| {
         let status = match exit {
             1 => 1,
             2 => 0,
@@ -1960,8 +2026,7 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
             4 => 143,
             _ => 137,
         };
-        Rig::new(
-            &name,
+        rig.reset(
             status,
             word,
             later,
@@ -2022,7 +2087,7 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
             let look = if word && !later { "Look" } else { "LookGone" };
             let mut after = st.clone();
             assert!(m.fire(look, &mut after), "{look} at {st:?}");
-            let rig = draw(format!("look-{looks}"), st["exit"], word, later, rule, dup);
+            draw(&mut rig, st["exit"], word, later, rule, dup);
             let left = rig.look(&snapped(&rig, rule));
             assert_eq!(left, kept(after["kept"]), "the look at {st:?}");
             for mutant in ["LookAsClaude", "RefusalAsCrash", "ChildDeathAsRefusal"] {
@@ -2040,14 +2105,7 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
         attempts += 1;
         let mut after = st.clone();
         assert!(m.fire("Decide", &mut after), "Decide at {st:?}");
-        let rig = draw(
-            format!("attempt-{attempts}"),
-            st["exit"],
-            word,
-            later,
-            rule,
-            dup,
-        );
+        draw(&mut rig, st["exit"], word, later, rule, dup);
         let r = rig.attempt(&snapped(&rig, rule), &kept(st["kept"]), ExitCause::Exit);
         let relaunched = r.step == "continued";
         assert_eq!(

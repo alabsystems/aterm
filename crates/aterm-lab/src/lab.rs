@@ -392,13 +392,124 @@ fn need_sandbox() -> Result<(), String> {
     }
 }
 
+/// The lab's own program, copied into the run directory at `up`
+/// (`bin/aterm-lab`): the egress witness and the stub start from it, the
+/// shim's `security` and `open` lead to it, and the relay is a copy of it.
+const BIN: &str = "bin/aterm-lab";
+
+/// Written beside [`BIN`] once a program started from it showed it ran: the
+/// stub's ready byte, which code running from that file writes. Until then
+/// macOS may still be assessing the copy's first exec ([`copies_may_go`]).
+const BIN_RAN: &str = "bin/ran";
+
+/// Written in `relay/` once the relay copied there showed it ran (it made
+/// its log, `relay.log`, which each launch behind it removes first).
+const RELAY_RAN: &str = "relay/ran";
+
+/// Whether a directory of copies of the lab's program may be removed: one
+/// started from it showed it ran (`ran`), or the directory is older than the
+/// first-exec hang at `now` ([`aterm_uds::deadline::FIRST_EXEC_HANG`]), so no
+/// assessment of a copy in it is still going. A copy is a new file macOS
+/// assesses at its first exec, after the exec, while the process waits at
+/// `_dyld_start`; killing the process does not end it, and removing the file
+/// before it ends crashes `syspolicyd`, which strands every launch on the
+/// host. A directory that is not there may go.
+fn copies_may_go(dir: &Path, ran: bool, now: std::time::SystemTime) -> bool {
+    let Ok(made) = fs::symlink_metadata(dir).and_then(|m| m.modified()) else {
+        return true;
+    };
+    ran || now
+        .duration_since(made)
+        .is_ok_and(|age| age >= aterm_uds::deadline::FIRST_EXEC_HANG)
+}
+
+/// The words for a directory of copies kept because none was shown to run:
+/// `{LAB} <verb> <tag>` removes it once it may go.
+fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
+    format!(
+        "KEPT {}: the lab's program copied there was started and never showed it ran, so macOS \
+         may still be assessing its first exec; {LAB} {verb} {tag} removes it once {} minutes \
+         have passed",
+        dir.display(),
+        aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
+    )
+}
+
+/// Remove the directories of copies of the lab's program in `run_dir`
+/// (`relay/`, `bin/`) that may go at `now` ([`copies_may_go`]); the ones
+/// kept. `relay_ran`: the relay copied there showed it ran
+/// ([`relay_shown_running`]).
+fn sweep_copies(run_dir: &Path, relay_ran: bool, now: std::time::SystemTime) -> Vec<PathBuf> {
+    let mut kept = Vec::new();
+    for (d, ran) in [
+        ("relay", relay_ran),
+        ("bin", run_dir.join(BIN_RAN).exists()),
+    ] {
+        let dir = run_dir.join(d);
+        if copies_may_go(&dir, ran, now) {
+            let _ = fs::remove_dir_all(&dir);
+        } else {
+            kept.push(dir);
+        }
+    }
+    kept
+}
+
+/// The end of `down`, once its scratch is gone: the copies that may go
+/// ([`sweep_copies`]), the run directory's own files, then the directory. A
+/// run directory that keeps a copy keeps its `env.sh` with it, so it is still
+/// a lab: `ps` lists it, `up` refuses it, and a later `down` finishes the job
+/// once the copy may go.
+fn clear_run_dir(run_dir: &Path, relay_ran: bool, tag: &str, now: std::time::SystemTime) {
+    let kept = sweep_copies(run_dir, relay_ran, now);
+    for dir in &kept {
+        eprintln!("aterm-lab: {}", kept_copies(dir, "down", tag));
+    }
+    if let Ok(rd) = fs::read_dir(run_dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name == "env.sh" && !kept.is_empty() {
+                continue;
+            }
+            let ext = Path::new(&name)
+                .extension()
+                .map(|x| x.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if ["log", "out", "pid", "pids", "port", "sh", "sb", "txt"].contains(&ext.as_str())
+                || name == ".seen"
+                || name == ".now"
+            {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir(run_dir);
+}
+
+/// Whether `up` started a program from the lab's copy of its own program
+/// ([`BIN`]: the witness or the stub) that has not shown it ran
+/// ([`BIN_RAN`]).
+fn bin_unproven(run: &Run) -> bool {
+    (run.sampler_pid > 0 || run.stub_pid > 0) && !run.run.join(BIN_RAN).exists()
+}
+
 /// Undo a half-made lab (its pids, everything in its jail, its socket dir and
-/// run directory); the failure to return.
+/// run directory); the failure to return. A lab that started a program from
+/// its copy of the lab's program ([`BIN`]) which never showed it ran keeps its
+/// run directory, `env.sh` and all, its processes SIGKILLed (a SIGTERM does
+/// not end one still waiting at `_dyld_start`): `down` removes it once the
+/// copy may go ([`copies_may_go`]).
 fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
+    let unproven = bin_unproven(run);
+    let sig = if unproven {
+        libc::SIGKILL
+    } else {
+        libc::SIGTERM
+    };
     for &p in pids {
         for q in descendants(p).into_iter().chain([p]) {
             if alive(q) {
-                let _ = crate::sys::kill(q, libc::SIGTERM);
+                let _ = crate::sys::kill(q, sig);
             }
         }
     }
@@ -406,13 +517,17 @@ fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
         && let Ok(in_jail) = crate::sys::jail_pids(&run.mark)
     {
         for q in in_jail {
-            let _ = crate::sys::kill(q, libc::SIGTERM);
+            let _ = crate::sys::kill(q, sig);
         }
     }
     if run.sockdir.starts_with("/tmp/at.") {
         let _ = fs::remove_dir_all(&run.sockdir);
     }
-    let _ = fs::remove_dir_all(&run.run);
+    if unproven {
+        eprintln!("aterm-lab: {}", kept_copies(&run.run, "down", &run.tag));
+    } else {
+        let _ = fs::remove_dir_all(&run.run);
+    }
     Fail::die(msg)
 }
 
@@ -441,7 +556,9 @@ fn lifeline_flag() -> Vec<String> {
 }
 
 /// How long a jailed child the lab started may take to say it is ready (its
-/// `--ready-fd` byte): a hang detector, never a latency budget.
+/// `--ready-fd` byte): a hang detector, never a latency budget. The stub, the
+/// first exec of the lab's fresh copy of its own program, waits
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] instead.
 const READY_HANG: Duration = Duration::from_secs(60);
 
 /// `sandbox-exec -f <jail> env -i <vars> <program…>`, in a session of its
@@ -457,16 +574,17 @@ const READY_HANG: Duration = Duration::from_secs(60);
 ///
 /// # Errors
 /// The launch failed, or the child closed its signal with nothing said (it
-/// exited, or it has nothing to offer), said nothing within [`READY_HANG`],
-/// or the run was interrupted (`interrupted`). `pid` is set to the child's
-/// as soon as it is spawned, so a caller's cleanup ends it.
+/// exited, or it has nothing to offer), said nothing within `hang` (the hang
+/// detector: [`READY_HANG`], or the first-exec hang for a fresh copy), or the
+/// run was interrupted (`interrupted`). `pid` is set to the child's as soon
+/// as it is spawned, so a caller's cleanup ends it.
 pub(crate) fn launch_ready(
     run: &Run,
     vars: &[(String, String)],
     program: &[String],
     out: &Path,
     stdin: Option<fs::File>,
-    pid: &mut i32,
+    (pid, hang): (&mut i32, Duration),
 ) -> Result<(), String> {
     use aterm_uds::spawnfd::InheritNothing as _;
     let (o, e) = append_to_std(out).map_err(|e| e.to_string())?;
@@ -500,13 +618,13 @@ pub(crate) fn launch_ready(
     let said = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = std::sync::Arc::clone(&said);
     std::thread::spawn(move || {
-        let got = ready.wait(READY_HANG);
+        let got = ready.wait(hang);
         *slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(got);
         stop::ring();
     });
-    stop::wait_until(READY_HANG + Duration::from_secs(1), || {
+    stop::wait_until(hang + Duration::from_secs(1), || {
         said.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
@@ -594,8 +712,9 @@ fn lab_sets(name: &str) -> bool {
 /// starts gets them. Two kinds of name only: `TMPDIR` (an absolute path: with
 /// a PTY keeper run outside the jail, `TMPDIR=/tmp` puts the keeper's socket
 /// in the lab's socket dir, where both find it, `aterm_keeper::job::keeper_dir`)
-/// and a dev seam `ATERM_DEBUG_<NAME>` (a person's Paste fed from a lab file,
-/// `ATERM_DEBUG_PASTE_FILE`, …) — and never one the lab sets itself
+/// and a dev seam `ATERM_DEBUG_<NAME>` or `ATERM_DEV_<NAME>` (a person's Paste
+/// fed from a lab file, `ATERM_DEBUG_PASTE_FILE`; the card engine's `card-seen`
+/// probe, `ATERM_DEV_CARD_PROBE`; …) — and never one the lab sets itself
 /// ([`lab_sets`]: `ATERM_DEBUG_HEADLESS_RESTORE` is `LAB_RESTORE=1`'s). A
 /// value has no space and no control character.
 ///
@@ -610,15 +729,17 @@ pub fn instance_env(spec: &str) -> Result<Vec<(String, String)>, String> {
         let Some((name, value)) = word.split_once('=') else {
             return refuse(format!("'{word}' is no NAME=VALUE"));
         };
-        let seam = name.strip_prefix("ATERM_DEBUG_").is_some_and(|rest| {
-            !rest.is_empty()
-                && rest
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        let seam = ["ATERM_DEBUG_", "ATERM_DEV_"].iter().any(|stem| {
+            name.strip_prefix(stem).is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            })
         });
         if !(name == "TMPDIR" || seam) || lab_sets(name) {
             return refuse(format!(
-                "{name} is not a variable the lab hands its instance (TMPDIR, or an ATERM_DEBUG_* seam the lab does not set itself)"
+                "{name} is not a variable the lab hands its instance (TMPDIR, or an ATERM_DEBUG_* or ATERM_DEV_* seam the lab does not set itself)"
             ));
         }
         if value.is_empty() || value.chars().any(char::is_control) {
@@ -694,7 +815,7 @@ pub fn start_instance(run: &mut Run, scale: Option<&str>, armed: bool) -> Result
     // Ready is the instance's own word that its control socket listens (`--ready-fd`), never a poll of the socket.
     let out = run.run.join("aterm.out");
     let mut pid = 0;
-    let launched = launch_ready(run, &vars, &prog, &out, stdin, &mut pid);
+    let launched = launch_ready(run, &vars, &prog, &out, stdin, (&mut pid, READY_HANG));
     run.instance_pid = pid;
     run.save();
     launched.map_err(|e| {
@@ -738,6 +859,33 @@ pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
     }
 }
 
+/// Whether `up` may make the lab `run` names at `now`: no lab of its tag is
+/// up (no `env.sh`), and no copy of the lab's program an earlier lab of the
+/// tag left is still unproven. Such copies (an aterm-lab before this one's
+/// `down` dropped `env.sh` while keeping them) go once they may
+/// ([`sweep_copies`]); until then the tag waits. So `up` never lays its copy
+/// over a file whose first exec macOS may still be assessing, and never
+/// hands the new lab an older lab's relay.
+///
+/// # Errors
+/// Why the tag cannot come up now.
+fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
+    let tag = &run.tag;
+    if run.run.join("env.sh").exists() {
+        return Err(Fail::die(format!(
+            "lab '{tag}' is already up ({}): {LAB} down {tag} first ({LAB} ps lists what is running)",
+            run.run.display()
+        )));
+    }
+    match sweep_copies(&run.run, relay_shown_running(run), now).first() {
+        Some(dir) => Err(Fail::die(format!(
+            "lab '{tag}' cannot come up yet: {}",
+            kept_copies(dir, "up", tag)
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Bring a lab up (nothing printed); the record of it.
 ///
 /// # Errors
@@ -752,12 +900,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     }
     let p = paths();
     let mut run = Run::new(tag);
-    if run.run.join("env.sh").exists() {
-        return Err(Fail::die(format!(
-            "lab '{tag}' is already up ({}): {LAB} down {tag} first ({LAB} ps lists what is running)",
-            run.run.display()
-        )));
-    }
+    room_for(&run, std::time::SystemTime::now())?;
     // what the instance is handed beyond the lab's own, checked before anything is made and recorded, so each
     // relaunch hands it the same (never what a later caller's environment says)
     run.instance_env = instance_env(&o.instance_env)
@@ -846,7 +989,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     // runs the build the lab tests, never an installed release, and reaches this lab's instance. A session the
     // instance spawns (a worker) gets the PATH its login shell rebuilds, the shim LAST: there an `aterm` earlier
     // on that PATH would answer.
-    let bin = run.run.join("bin/aterm-lab");
+    let bin = run.run.join(BIN);
     let made = fs::create_dir_all(run.run.join("bin"))
         .and_then(|()| fs::copy(&p.exe, &bin).map(|_| ()))
         .and_then(|()| fs::create_dir_all(run.run.join("shim")))
@@ -951,7 +1094,9 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     } else {
         stub_prog
     };
-    // Ready is the stub's own word, written once both its port files are (`--ready-fd`).
+    // Ready is the stub's own word, written once both its port files are (`--ready-fd`). The stub is the first
+    // exec of the lab's fresh copy of its program (the witness's started just before it), so it waits the
+    // first-exec hang, and its word is the copy's proof that it ran: until then an abort keeps the copy.
     let mut pid = 0;
     let launched = launch_ready(
         &run,
@@ -959,10 +1104,13 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
         &stub_prog,
         &run.run.join("stub.out"),
         stdin,
-        &mut pid,
+        (&mut pid, aterm_uds::deadline::FIRST_EXEC_HANG),
     );
     run.stub_pid = pid;
     run.save();
+    if launched.is_ok() {
+        let _ = fs::write(run.run.join(BIN_RAN), "");
+    }
     let started = [run.sampler_pid, run.stub_pid];
     if let Err(e) = launched {
         if e == "interrupted" {
@@ -1011,12 +1159,10 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     };
     put("home/.claude/settings.json", &settings);
     put("home/.claude/.claude.json", &claude_json);
-    // LAB_ATERM_TOML leads, so its root keys (font_family, font_px) stay at the root, ahead of every table
-    let toml = format!(
-        "{}\n[update]\nenabled = false\n[packages]\nenabled = false\n[harness]\nprobe_api = false\n{}\n",
-        o.aterm_toml, o.harness_keys
+    put(
+        "cfg/aterm/aterm.toml",
+        &scratch_aterm_toml(&o.aterm_toml, &o.harness_keys),
     );
-    put("cfg/aterm/aterm.toml", &toml);
     put("home/.zshrc", "PROMPT='lab$ '\n");
 
     // ---- the private headless instance (jailed)
@@ -1072,6 +1218,17 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     }
     run.save();
     Ok(run)
+}
+
+/// A lab's scratch `aterm.toml`: `LAB_ATERM_TOML` (`aterm_toml`) leads, so
+/// its root keys (`font_family`, `font_px`) stay at the root, ahead of every
+/// table; the update and package lanes off; `LAB_HARNESS_KEYS`
+/// (`harness_keys`) under `[harness]`; and the audible bell off unless
+/// `LAB_ATERM_TOML` sets `bell_sound` ([`crate::instance::bell_off`]).
+fn scratch_aterm_toml(aterm_toml: &str, harness_keys: &str) -> String {
+    crate::instance::bell_off(&format!(
+        "{aterm_toml}\n[update]\nenabled = false\n[packages]\nenabled = false\n[harness]\nprobe_api = false\n{harness_keys}\n"
+    ))
 }
 
 /// The scratch `settings.json` and `.claude.json` texts.
@@ -1175,7 +1332,7 @@ pub fn cmd_up(args: &[String]) -> Res {
             "gemini",
             &run.gemini_bin,
             &run.gemini_ver,
-            "Homebrew's gemini-cli, or LAB_GEMINI",
+            "LAB_GEMINI names one; aterm installs none",
         ),
         (
             "agy",
@@ -1323,6 +1480,8 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     ] {
         keep_file(&r.run.join(f), &keep.join(f));
     }
+    // the relay's log is its proof that it ran ([`RELAY_RAN`]): read before the scratch goes
+    let relay_ran = relay_shown_running(&r);
     // the scratch's files through the one reader that follows no link (the jail may have put one in their place)
     for f in ["stub.log", "relay.log", "open.log"] {
         if let Ok(Some(b)) = crate::sys::scratch_read(&r.w.join(f)) {
@@ -1389,27 +1548,12 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     if r.sockdir.starts_with("/tmp/at.") {
         let _ = fs::remove_dir_all(&r.sockdir);
     }
-    for d in [
-        "scratch", "relay", "bin", "shim", "gbin", "twin-src", "clock",
-    ] {
+    for d in ["scratch", "shim", "gbin", "twin-src", "clock"] {
         let _ = fs::remove_dir_all(r.run.join(d));
     }
-    if let Ok(rd) = fs::read_dir(&r.run) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let ext = Path::new(&name)
-                .extension()
-                .map(|x| x.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if ["log", "out", "pid", "pids", "port", "sh", "sb", "txt"].contains(&ext.as_str())
-                || name == ".seen"
-                || name == ".now"
-            {
-                let _ = fs::remove_file(e.path());
-            }
-        }
-    }
-    let _ = fs::remove_dir(&r.run);
+    // the copies of the lab's program go once one of them showed it ran, or once no assessment of them can still be
+    // going; else they stay, named, and the run directory with them, env.sh and all
+    clear_run_dir(&r.run, relay_ran, tag, std::time::SystemTime::now());
     Ok(keep)
 }
 
@@ -1617,6 +1761,47 @@ pub fn launcher(run: &Run, l: &Launch) -> String {
     s
 }
 
+/// Whether the relay copied into the lab's run directory ran: an earlier
+/// launch recorded it ([`RELAY_RAN`]), or the relay made its log, which each
+/// launch behind it removes first (`relay.log`, read through no link).
+fn relay_shown_running(run: &Run) -> bool {
+    run.run.join(RELAY_RAN).exists()
+        || crate::sys::scratch_read(&run.w.join("relay.log")).is_ok_and(|b| b.is_some())
+}
+
+/// Lay the relay for a launch behind it: this program under the name `node`,
+/// copied where jailed code cannot write (`relay/node`), ONCE per lab. The
+/// copy is the same file at every launch (the lab's program does not change
+/// while it is up), and a later launch never replaces it: an earlier launch's
+/// relay may still be starting from it, its first exec under assessment, and
+/// a file renamed over or removed then crashes `syspolicyd`. A relay that
+/// made its log ran, which is recorded before the log goes ([`RELAY_RAN`]).
+///
+/// # Errors
+/// The copy could not be made.
+fn lay_relay(run: &Run) -> Result<(), Fail> {
+    let dir = run.run.join("relay");
+    if relay_shown_running(run) && dir.join("node").is_file() {
+        let _ = fs::write(run.run.join(RELAY_RAN), "");
+    }
+    let node = dir.join("node");
+    if !node.is_file() {
+        // `node.new` is never started (the launcher names `node`), so a half-made one is replaced.
+        let new = dir.join("node.new");
+        fs::create_dir_all(&dir)
+            .and_then(|()| fs::copy(run.run.join(BIN), &new).map(|_| ()))
+            .and_then(|()| fs::rename(&new, &node))
+            .map_err(|e| {
+                Fail::die(format!(
+                    "claude --relay: could not lay the relay in {}: {e}",
+                    dir.display()
+                ))
+            })?;
+    }
+    let _ = fs::remove_file(run.w.join("relay.log"));
+    Ok(())
+}
+
 /// Type the launch line of the managed Claude Code into the lab's first tab;
 /// the `launched: …` line that says what was launched.
 ///
@@ -1629,20 +1814,7 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     run.save();
     let run = &run;
     if l.relay {
-        // The relay is this program under the name `node`, copied where jailed code cannot write.
-        let dir = run.run.join("relay");
-        fs::create_dir_all(&dir)
-            .and_then(|()| {
-                fs::copy(run.run.join("bin/aterm-lab"), dir.join("node.new")).map(|_| ())
-            })
-            .and_then(|()| fs::rename(dir.join("node.new"), dir.join("node")))
-            .map_err(|e| {
-                Fail::die(format!(
-                    "claude --relay: could not lay the relay in {}: {e}",
-                    dir.display()
-                ))
-            })?;
-        let _ = fs::remove_file(run.w.join("relay.log"));
+        lay_relay(run)?;
     }
     if l.subscriber {
         // The key helper comes out of the settings, so the fake OAuth login is the one Claude Code uses.
@@ -1693,6 +1865,39 @@ pub fn cmd_claude(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `lab up`'s scratch `aterm.toml` starts with the audible bell off, and
+    /// `LAB_ATERM_TOML` can turn it back on (`bell_sound = true`, the one key
+    /// the file then holds). Its other lines keep their places: the root key
+    /// it leads with stays at the root, the harness keys under `[harness]`.
+    #[test]
+    fn a_lab_up_config_starts_with_the_audible_bell_off() {
+        let read =
+            |text: &str| aterm_toml::from_str::<aterm_toml::Value>(text).expect("one document");
+        let bell =
+            |doc: &aterm_toml::Value| doc.get("bell_sound").and_then(aterm_toml::Value::as_bool);
+
+        let plain = read(&scratch_aterm_toml("font_px = 13", "usage_tap = true"));
+        assert_eq!(bell(&plain), Some(false));
+        assert_eq!(
+            plain.get("font_px").and_then(aterm_toml::Value::as_integer),
+            Some(13)
+        );
+        assert_eq!(
+            plain
+                .get("harness")
+                .and_then(|t| t.get("usage_tap"))
+                .and_then(aterm_toml::Value::as_bool),
+            Some(true),
+        );
+
+        let asked = read(&scratch_aterm_toml("bell_sound = true", ""));
+        assert_eq!(
+            bell(&asked),
+            Some(true),
+            "LAB_ATERM_TOML's bell is the file's"
+        );
+    }
 
     /// `ps <tag>` AND `down <tag>` OF A LAB THAT IS DOWN NAME THAT TAG
     /// (ATERM-KI-1016-1): each refuses with the lab `<tag>` is not up, never
@@ -1852,6 +2057,10 @@ mod tests {
             instance_env("ATERM_DEBUG_CLIPBOARD_FILE=/s/c=d"),
             Ok(pairs(&[("ATERM_DEBUG_CLIPBOARD_FILE", "/s/c=d")]))
         );
+        assert_eq!(
+            instance_env("ATERM_DEV_CARD_PROBE=1"),
+            Ok(pairs(&[("ATERM_DEV_CARD_PROBE", "1")]))
+        );
         for bad in [
             "HOME=/x",
             "PATH=/x",
@@ -1863,6 +2072,9 @@ mod tests {
             "TMP=/x",
             "ATERM_DEBUG_=1",
             "ATERM_DEBUG_paste=1",
+            "ATERM_DEV_=1",
+            "ATERM_DEV_card=1",
+            "ATERM_DEVX=1",
             "TMPDIR",
             "=x",
             "TMPDIR=",
@@ -2032,5 +2244,202 @@ mod tests {
             ..elsewhere
         };
         assert!(names_this_lab(&ours, me), "{line}");
+    }
+
+    /// A run directory under a private scratch dir, its scratch made, its
+    /// copy of the lab's program a plain file (nothing is started from it).
+    /// The scratch dir by its physical path: the lab reads the scratch through
+    /// no link, and the temporary directory's `/var` is one.
+    fn half_made(root: &Path) -> Run {
+        let root = fs::canonicalize(root).unwrap();
+        let run = Run {
+            tag: "abort-t".into(),
+            run: root.join("runs/abort-t"),
+            w: root.join("runs/abort-t/scratch"),
+            ..Run::default()
+        };
+        fs::create_dir_all(&run.w).unwrap();
+        fs::create_dir_all(run.run.join("bin")).unwrap();
+        fs::write(run.run.join(BIN), "a copy").unwrap();
+        run
+    }
+
+    /// AN ABORTED `up` KEEPS A COPY NOTHING SHOWED RAN (r4g-1): a lab that
+    /// started its witness or stub from its fresh copy of the lab's program,
+    /// and was aborted before the stub's ready byte proved that copy ran,
+    /// keeps its run directory (macOS may still be assessing the copy's
+    /// first exec); once the stub said it ran, the abort removes it.
+    /// NEGATIVE CONTROLS: the proven lab's directory goes, and so does one
+    /// that never started anything from its copy. No signal reaches any
+    /// process: no pids are handed in, and the lab has no jail mark.
+    #[test]
+    fn an_aborted_up_keeps_a_copy_nothing_showed_ran() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let none = i32::MAX; // no such process: only "started" is read from it
+        for (what, sampler, stub, ran, kept) in [
+            (
+                "the witness started, the stub never ready",
+                none,
+                0,
+                false,
+                true,
+            ),
+            ("both started, no ready byte", none, none, false, true),
+            ("the stub said it ran", none, none, true, false),
+            ("nothing started from the copy", 0, 0, false, false),
+        ] {
+            let mut run = half_made(root.path());
+            run.sampler_pid = sampler;
+            run.stub_pid = stub;
+            if ran {
+                fs::write(run.run.join(BIN_RAN), "").unwrap();
+            }
+            let failed = abort(&run, &[], "x");
+            assert_eq!(failed.msg.as_deref(), Some("x"), "{what}");
+            assert_eq!(run.run.join(BIN).is_file(), kept, "{what}");
+            let _ = fs::remove_dir_all(root.path().join("runs"));
+        }
+    }
+
+    /// A directory of copies may go once one of them showed it ran, or once
+    /// it is older than the first-exec hang; a missing one may go.
+    /// NEGATIVE CONTROL: unproven, a minute short of the hang, it stays.
+    #[test]
+    fn copies_go_once_shown_to_run_or_past_the_first_exec_hang() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = root.path().join("bin");
+        fs::create_dir_all(&dir).unwrap();
+        let made = fs::metadata(&dir).unwrap().modified().unwrap();
+        let hang = aterm_uds::deadline::FIRST_EXEC_HANG;
+        let minute = Duration::from_secs(60);
+        assert!(!copies_may_go(&dir, false, made), "just made, unproven");
+        assert!(!copies_may_go(&dir, false, made + hang - minute));
+        assert!(copies_may_go(&dir, true, made), "shown to run");
+        assert!(copies_may_go(&dir, false, made + hang), "past the hang");
+        assert!(copies_may_go(&root.path().join("gone"), false, made));
+    }
+
+    /// A run directory as `down` leaves it for its last step: the scratch
+    /// gone, its own files (`env.sh` among them) there, its copy of the lab's
+    /// program shown to run or not, and a relay laid beside it or not; when
+    /// its copies were made.
+    fn torn_down(root: &Path, bin_ran: bool, relay: bool) -> (Run, std::time::SystemTime) {
+        let run = half_made(root);
+        fs::remove_dir_all(&run.w).unwrap();
+        for f in ["env.sh", "jail.sb", "stub.out"] {
+            fs::write(run.run.join(f), "").unwrap();
+        }
+        if bin_ran {
+            fs::write(run.run.join(BIN_RAN), "").unwrap();
+        }
+        let made = fs::metadata(run.run.join("bin")).unwrap().modified();
+        if relay {
+            fs::create_dir_all(run.run.join("relay")).unwrap();
+            fs::write(run.run.join("relay/node"), "a copy").unwrap();
+        }
+        (run, made.unwrap())
+    }
+
+    /// Past the first-exec hang for copies made at `made` or within a minute
+    /// after it.
+    fn past_the_hang(made: std::time::SystemTime) -> std::time::SystemTime {
+        made + aterm_uds::deadline::FIRST_EXEC_HANG + Duration::from_secs(60)
+    }
+
+    /// A DOWN THAT KEEPS A COPY KEEPS ITS LAB (r5u-1): a run directory whose
+    /// copy of the lab's program (the stub's or the relay's) nothing showed
+    /// ran keeps its `env.sh` beside that copy, so `ps` still lists the lab
+    /// and a later `down`, the first-exec hang past, removes the copy and the
+    /// directory. NEGATIVE CONTROLS: copies that showed they ran go at the
+    /// first `down`, `env.sh` and the directory with them.
+    #[test]
+    fn a_down_that_keeps_a_copy_keeps_its_lab_for_a_later_down() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        // (what, the stub's copy ran, a relay laid, the relay ran, kept)
+        for (what, bin_ran, relay, relay_ran, kept) in [
+            ("stub's copy unproven", false, false, false, true),
+            ("relay's copy unproven", true, true, false, true),
+            ("both copies ran", true, true, true, false),
+            ("stub's copy ran, no relay", true, false, false, false),
+        ] {
+            let (run, made) = torn_down(root.path(), bin_ran, relay);
+            let state = run.run.parent().and_then(Path::parent).unwrap();
+            clear_run_dir(&run.run, relay_ran, &run.tag, made);
+            assert!(!run.run.join("jail.sb").exists(), "{what}");
+            assert_eq!(run.run.join("env.sh").is_file(), kept, "{what}");
+            let listed = if kept { vec![run.tag.clone()] } else { vec![] };
+            assert_eq!(all_runs(state), listed, "{what}");
+            if kept {
+                // the later `down`, once nothing can still be assessing either copy
+                clear_run_dir(&run.run, relay_ran, &run.tag, past_the_hang(made));
+            }
+            assert!(!run.run.exists(), "{what}: the later down finished");
+        }
+    }
+
+    /// AN UP NEVER LAYS ITS COPY OVER AN UNPROVEN ONE (r5u-1): a tag whose
+    /// run directory holds no `env.sh` but a copy an earlier lab left that
+    /// nothing showed ran waits, that copy in place, until the first-exec
+    /// hang has passed; then the copies go, so `up` copies onto a fresh path
+    /// and lays a fresh relay. A tag with an `env.sh` is up already: nothing
+    /// of it is touched, the hang past or not. NEGATIVE CONTROL: copies that
+    /// showed they ran go at once.
+    #[test]
+    fn an_up_waits_out_a_copy_an_earlier_lab_left_unproven() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let runs = root.path().join("runs");
+        let gone = |run: &Run| !run.run.join("bin").exists() && !run.run.join("relay").exists();
+        let (up, made) = torn_down(root.path(), false, false);
+        assert!(room_for(&up, past_the_hang(made)).is_err(), "up already");
+        assert!(up.run.join(BIN).is_file(), "an up lab's copy stays");
+        fs::remove_dir_all(&runs).unwrap();
+        // (what, the stub's copy ran, the relay ran, the unproven copy)
+        for (what, bin_ran, relay_ran, unproven) in [
+            ("stub's copy unproven", false, true, BIN),
+            ("relay's copy unproven", true, false, "relay/node"),
+        ] {
+            let (left, made) = torn_down(root.path(), bin_ran, true);
+            fs::remove_file(left.run.join("env.sh")).unwrap();
+            if relay_ran {
+                fs::write(left.run.join(RELAY_RAN), "").unwrap();
+            }
+            assert!(room_for(&left, made).is_err(), "{what}: the tag waits");
+            assert!(left.run.join(unproven).is_file(), "{what}: in place");
+            assert!(room_for(&left, past_the_hang(made)).is_ok(), "{what}");
+            assert!(gone(&left), "{what}: the hang past, the copies went");
+            fs::remove_dir_all(&runs).unwrap();
+        }
+        let (proven, made) = torn_down(root.path(), true, true);
+        fs::remove_file(proven.run.join("env.sh")).unwrap();
+        fs::write(proven.run.join(RELAY_RAN), "").unwrap();
+        assert!(room_for(&proven, made).is_ok(), "both ran: room at once");
+        assert!(gone(&proven));
+    }
+
+    /// THE RELAY'S COPY IS LAID ONCE AND NEVER REPLACED (r4g-1): a second
+    /// launch behind the relay keeps the file the first one started from
+    /// (the same inode), and records that relay ran once it made its log,
+    /// before that log goes. NEGATIVE CONTROL: a launch whose earlier relay
+    /// made no log records nothing.
+    #[test]
+    fn the_relay_is_laid_once_and_its_run_recorded() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let run = half_made(root.path());
+        let node = run.run.join("relay/node");
+        lay_relay(&run).unwrap();
+        let first = fs::metadata(&node).unwrap().ino();
+        assert!(!relay_shown_running(&run), "nothing ran yet");
+        lay_relay(&run).unwrap();
+        assert_eq!(fs::metadata(&node).unwrap().ino(), first, "kept");
+        assert!(!run.run.join(RELAY_RAN).exists(), "no log, no record");
+        // the relay made its log: the next launch records it and removes the log
+        fs::write(run.w.join("relay.log"), "").unwrap();
+        assert!(relay_shown_running(&run));
+        lay_relay(&run).unwrap();
+        assert!(run.run.join(RELAY_RAN).exists(), "recorded");
+        assert!(!run.w.join("relay.log").exists(), "its log went");
+        assert_eq!(fs::metadata(&node).unwrap().ino(), first, "still kept");
+        assert!(relay_shown_running(&run), "the record stands");
     }
 }

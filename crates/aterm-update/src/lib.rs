@@ -2,8 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+// under them (crates/aterm-spec-anchor/anchor_rules.rs). This crate's anchors sit in
+// the macOS updater (`install`, `github`, `manifest`) and on
+// `reconcile_status_outcome`, which tests compile everywhere: the feature is declared
+// in exactly those builds.
+#![cfg_attr(
+    all(anchor_rules, any(test, all(debug_assertions, target_os = "macos"))),
+    feature(macro_attr)
+)]
 
 //! `aterm-update`: silent, signature-pinned in-app self-update for the macOS
 //! `aterm.app` (and, through [`linux`], an enrolled Linux executable).
@@ -150,6 +156,9 @@ pub fn binary_identity_json(
 /// launch; `aterm doctor` reads them. Portable: a platform with no crash marker
 /// has no rows.
 pub mod recovery_ledger;
+/// Whether the crash restore has soaked on this machine's daily driver: keeper P4's
+/// precondition, judged from the recovery ledger (`targo --unverified verify soak`).
+pub mod restore_soak;
 // Not macOS-only: every platform relaunches aterm (see the module's own doc).
 mod relaunch;
 #[cfg(target_os = "macos")]
@@ -178,6 +187,11 @@ pub use manifest::failed_mark_suppression_projection;
 // `#[refines]` anchors on the swap's stage gates and the check's roster observation.
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 pub use github::roster_freshness_projection;
+
+// The explicit mounted-volume acceptance of the no-zip lane and install.sh's image path
+// (debug builds only), which the `dmg_acceptance` bench runs.
+#[cfg(all(target_os = "macos", debug_assertions))]
+pub use install::dmg_acceptance;
 
 /// The plain `exec` that puts SIGPIPE back when it fails (`exec_plain`): the GUI's
 /// cold-lane replacement continues as the window after a refused exec.
@@ -1393,24 +1407,14 @@ pub struct InstalledUpdateFacts {
     pub yanked: bool,
 }
 
-/// Collect installed provenance and the trial marker. This may spawn PlistBuddy and
-/// read a ledger, so GUI callers must invoke it only on their updater facts worker.
-/// `None` both when there is no installed bundle and when it could not be PROVEN
-/// this pass; a reader that must tell those apart reads
-/// [`installed_update_facts_checked`].
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
-    installed_update_facts_checked().ok().flatten()
-}
-
-/// [`installed_update_facts`], with WHY nothing is reported: `Ok(None)` when there
-/// is no installed bundle layout, `Err` with the refusal when one is there and its
-/// verification or sealed plist read did not pass. A refusal carrying
-/// [`PASSING_REFUSAL_KEY`] says the check did not FINISH — `spctl` past its 30 s
-/// ceiling on a captive-portal network, a `codesign` killed or out of its budget —
-/// and so says nothing about the bundle: absence of proof is not
-/// proof the installed bundle changed.
+/// Collect installed provenance and the trial marker. This spawns codesign, spctl
+/// and PlistBuddy and reads a ledger, so GUI callers invoke it only on their
+/// updater facts worker. `Ok(None)` when there is no installed bundle layout,
+/// `Err` with the refusal when one is there and its verification or sealed plist
+/// read did not pass. A refusal carrying [`PASSING_REFUSAL_KEY`] says the check
+/// did not FINISH — `spctl` past its 30 s ceiling on a captive-portal network, a
+/// `codesign` killed or out of its budget — and so says nothing about the bundle:
+/// absence of proof is not proof the installed bundle changed.
 #[cfg(target_os = "macos")]
 pub fn installed_update_facts_checked() -> Result<Option<InstalledUpdateFacts>, String> {
     // Pure observation — a dev-marked build's provenance is no less true, so report
@@ -1634,8 +1638,9 @@ pub fn wait_while_uncommitted_handoff_candidate(bound: std::time::Duration) -> b
     waited
 }
 
-/// The bound on [`wait_while_uncommitted_handoff_candidate`] for the two
-/// background lanes a successor starts at boot: longer than the successor's own
+/// The bound on [`wait_while_uncommitted_handoff_candidate`] for the
+/// background lanes a successor starts at boot (its package and update checks,
+/// its launch record, its coding-agent primer): longer than the successor's own
 /// grant-hold budget, so the lanes start only after Commit or after the
 /// candidate has already been told to exit.
 pub const UNCOMMITTED_CANDIDATE_HOLD_BOUND: std::time::Duration =
@@ -1735,6 +1740,16 @@ pub fn stamp_trial_launch(stamp: &std::path::Path) -> std::io::Result<()> {
     install::stamp_trial_launch(stamp)
 }
 
+/// The launch the stamp at `stamp` names ([`stamp_trial_launch`]): its pid and
+/// kernel birth stamp, or `None` for no stamp, one that is not a regular file, or
+/// one that is not exactly one name. Never followed or waited on. The parent of
+/// an attempt that ended before its successor's dial names that successor by it.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn read_launch_stamp(stamp: &std::path::Path) -> Option<aterm_update_core::LaunchName> {
+    install::read_trial_launch_stamp(stamp)
+}
+
 /// Gives back the counted launch of `target_build` that the launched successor
 /// named in its stamp at `stamp` ([`stamp_trial_launch`]): the successor
 /// LaunchServices reported terminated before it checked in, with no pid. The
@@ -1759,13 +1774,6 @@ pub fn preverify_installed_for_handoff(
     _expected_commit: &str,
 ) -> Result<HandoffCandidateFacts, String> {
     Err("installed-bundle activation is macOS-only".to_string())
-}
-
-/// Non-macOS has neither an installed bundle nor a self-update receipt.
-#[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
-    None
 }
 
 /// Non-macOS has no installed bundle to prove.
@@ -3184,6 +3192,8 @@ pub fn spawn_background_check_with_source(
         staging: std::sync::Arc::new(paths::Staging::resolve),
         checker_lock_wait: checker_watch::CHECKER_LOCK_WAIT,
         checker_ungated_after: checker_watch::CHECKER_UNGATED_AFTER,
+        lane: check_lane(),
+        gate: std::sync::Arc::new(checker_gate),
         check: std::sync::Arc::new(github::check_and_stage),
         pause: None,
         wake: &cadence::SYSTEM_WOKE,
@@ -3261,6 +3271,15 @@ struct CheckerArgs {
     /// holder's side: its beat writes the lock every quarter of it, and a sibling
     /// reads a write within half of it as progress ([`holder_fresh`]).
     checker_ungated_after: u64,
+    /// The check lane a cycle takes: this process's one ([`check_lane`]), which every
+    /// manual check shares, in the shipping loop; a test passes a lane of its own, so the
+    /// loops of one test binary never queue on each other.
+    lane: &'static check_lane::Lane,
+    /// How a cycle asks for `checker.lock`, with [`Self::checker_lock_wait`]:
+    /// [`checker_gate`], the real bounded wait, in the shipping loop; a test whose
+    /// holder's beat lands during the wait passes one that answers as the wait would
+    /// have ended, without spending it.
+    gate: std::sync::Arc<GateFn>,
     /// The network check and stage: [`github::check_and_stage`] in the shipping
     /// loop, a counting stand-in in a test (which never reaches the network).
     check: std::sync::Arc<CheckFn>,
@@ -3308,6 +3327,11 @@ impl CheckerArgs {
 /// ([`github::check_and_stage`]'s shape).
 #[cfg(target_os = "macos")]
 type CheckFn = dyn Fn(u64, &Source) -> Result<Option<String>, String> + Send + Sync;
+
+/// One cycle's ask for the machine-wide checker lock at a path, waiting at most the
+/// given bound ([`checker_gate`]'s shape).
+#[cfg(target_os = "macos")]
+type GateFn = dyn Fn(&std::path::Path, std::time::Duration) -> CheckerGate + Send + Sync;
 
 /// The arguments the process's checker was started with — what
 /// [`respawn_stalled_checker`] starts a replacement on.
@@ -3506,6 +3530,10 @@ fn holder_fresh(lock_wait: std::time::Duration) -> std::time::Duration {
 struct HolderBeat {
     stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// TESTS ONLY: the beats this thread has finished — asked `alive` and, if it said
+    /// yes, written the lock — so a test reads a beat that wrote nothing as one that ran.
+    #[cfg(test)]
+    beats: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -3532,6 +3560,10 @@ impl HolderBeat {
     ) -> Self {
         let stop = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let flag = std::sync::Arc::clone(&stop);
+        #[cfg(test)]
+        let beats = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let counted = std::sync::Arc::clone(&beats);
         let thread = std::thread::Builder::new()
             .name("aterm-update-lock-beat".into())
             .spawn(move || {
@@ -3548,10 +3580,17 @@ impl HolderBeat {
                     if alive() {
                         note_checker_lock_holder(&path);
                     }
+                    #[cfg(test)]
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             })
             .ok();
-        Self { stop, thread }
+        Self {
+            stop,
+            thread,
+            #[cfg(test)]
+            beats,
+        }
     }
 }
 
@@ -3939,7 +3978,7 @@ fn run_checker(
                     }
                 }
             }
-            match check_lane().try_lock() {
+            match args.lane.try_lock() {
                 Some(mut lane) => {
                     // A retired generation that woke here leaves without marking
                     // the lane as its own.
@@ -3982,7 +4021,7 @@ fn run_checker(
                         .map(|s| s.status.with_file_name("checker.lock"));
                     let gate = checker_lock
                         .as_deref()
-                        .map(|path| checker_gate(path, args.checker_lock_wait));
+                        .map(|path| (args.gate)(path, args.checker_lock_wait));
                     if !watch.is_current(generation) {
                         return Cycle::Superseded(CheckerPhase::LockWait);
                     }
@@ -4190,7 +4229,7 @@ fn run_checker(
                             AfterWakeScope::enter(cadence::after_wake(woke_at, check_began));
                         (args.check)(current_build, &source)
                     };
-                    check_lane().complete(&mut lane, current_build, &source);
+                    args.lane.complete(&mut lane, current_build, &source);
                     // A check that outlived its generation has already written what
                     // it found to the ledger and `status.toml`; its replacement's
                     // next cycle reads them and announces anything staged, so the
@@ -6063,7 +6102,9 @@ mod installed_build_tests {
             |bits| std::fs::set_permissions(staging.floor(), std::fs::Permissions::from_mode(bits));
         mode(0o000).unwrap();
         if std::fs::File::open(staging.floor()).is_ok() {
-            return; // root reads through any mode: nothing to stand in with
+            aterm_uds::host::could_not_run(
+                "a mode-0 file opened anyway: root, or a file system that ignores modes",
+            );
         }
         let unreadable = super::installed_build_yanked(Some(&staging), 520);
         let reported = facts(520);

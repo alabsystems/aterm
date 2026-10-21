@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The CoreGraphics display services aterm calls: which displays are active,
-//! and each one's bounds, size, model number and current mode.
+//! and each one's bounds, size, model number and current mode; and the reads
+//! of a `CGImage`'s byte layout that the GUI's `window` capture copies an
+//! AppKit bitmap by.
 //!
 //! Declarations under Apple's names, plus [`CGDisplay`], whose methods keep
 //! the names the `core-graphics` crate gave them so the winit fork's call
@@ -13,10 +15,11 @@
 //! holds every declaration here to the headers with clang, both arches.
 //!
 //! Its own crate, not a feature of `aterm-objc`: CoreGraphics is a GUI
-//! framework, and only the windowing backend (crates/aterm-window, the one
-//! dependent) should make a binary load it. A feature would have been unified
-//! into every binary of a build that also compiled winit, and forked
-//! aterm-objc between `-p` and `--workspace` selections.
+//! framework, and only the windowing backend (crates/aterm-window) and the
+//! GUI (crates/aterm-gui, the `window` capture's `CGImage` reads) should make
+//! a binary load it. A feature would have been unified into every binary of a
+//! build that also compiled winit, and forked aterm-objc between `-p` and
+//! `--workspace` selections.
 //!
 //! It replaces the `core-graphics`, `core-graphics-types` and `foreign-types`
 //! crates in the vendored winit fork (`docs/AUDIT-third-party-2026-10-15.md`,
@@ -29,13 +32,22 @@ use std::ptr;
 
 use aterm_objc::CGRect;
 
-aterm_objc::opaque! { CGDisplayMode }
+aterm_objc::opaque! { CGDisplayMode, CGImage, CGColorSpace, CGDataProvider }
 
 pub type CGError = i32;
 pub type CGDirectDisplayID = u32;
 pub type CGDisplayModeRef = *mut CGDisplayMode;
+pub type CGImageRef = *mut CGImage;
+pub type CGColorSpaceRef = *mut CGColorSpace;
+pub type CGDataProviderRef = *mut CGDataProvider;
+pub type CGBitmapInfo = u32;
+pub type CGColorSpaceModel = i32;
+/// `aterm_objc::cf`'s, which `CGDataProviderCopyData` returns; named here so
+/// `tests/cg_sdk.rs` spells it as the SDK typedef.
+pub type CFDataRef = aterm_objc::cf::CFDataRef;
 
 pub const kCGErrorSuccess: CGError = 0;
+pub const kCGColorSpaceModelRGB: CGColorSpaceModel = 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -50,6 +62,18 @@ unsafe extern "C" {
     pub fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
     pub fn CGDisplayModelNumber(display: CGDirectDisplayID) -> u32;
     pub fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
+
+    pub fn CGImageGetWidth(image: CGImageRef) -> usize;
+    pub fn CGImageGetHeight(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitsPerComponent(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitsPerPixel(image: CGImageRef) -> usize;
+    pub fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
+    pub fn CGImageGetBitmapInfo(image: CGImageRef) -> CGBitmapInfo;
+    pub fn CGImageGetColorSpace(image: CGImageRef) -> CGColorSpaceRef;
+    pub fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
+    pub fn CGImageRelease(image: CGImageRef);
+    pub fn CGColorSpaceGetModel(space: CGColorSpaceRef) -> CGColorSpaceModel;
+    pub fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
 }
 
 fn check(error: CGError) -> Result<(), CGError> {

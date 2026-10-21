@@ -197,7 +197,7 @@ fn run_mock<H: IdleHost + 'static>(
         policy: SupervisorConfig {
             answer_questions: false,
             continue_policy: continuing,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -1044,7 +1044,7 @@ fn hosted_by(host: &Arc<TranscriptHost>) -> SuperviseOpts {
         policy: SupervisorConfig {
             answer_questions: false,
             continue_policy: false,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     }
@@ -2029,13 +2029,22 @@ fn a_wall_whose_call_scrolled_off_is_judged_with_the_history_above() {
                 wrong.push(format!("{name} (no host: {none}): {acts:?} {said:?}"));
             }
             // Read up to the owner's row, and no further; on the alternate
-            // screen, from the archive.
+            // screen, from the archive. (The turn the refused wall leaves a
+            // point of is read up to the row that opened it after that,
+            // a walk of its own: the wall's walk is the first.)
             let owner = above
                 .iter()
                 .rposition(|r| !r.is_empty() && !r.starts_with(' '))
                 .expect("an owner");
-            let read = |n: usize| m.requests.iter().any(|r| r.ends_with(&format!("line {n}")));
-            if !alt && evicted == 0 && (!read(owner) || read(owner - 1)) {
+            let line = |n: usize| format!("line {n}");
+            let read = |n: usize| m.requests.iter().any(|r| r.ends_with(&line(n)));
+            let past_owner = m
+                .requests
+                .iter()
+                .position(|r| r.ends_with(&line(owner)))
+                .and_then(|at| m.requests.get(at + 1))
+                .is_some_and(|next| next.ends_with(&line(owner - 1)));
+            if !alt && evicted == 0 && (!read(owner) || past_owner) {
                 wrong.push(format!("{name}: the history not read up to its owner"));
             }
             let archived = m
@@ -2256,7 +2265,7 @@ fn a_whole_read_that_fails_or_reads_another_wall_counts_as_under_a_call() {
         policy: SupervisorConfig {
             answer_questions: false,
             continue_policy: false,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -2772,7 +2781,7 @@ fn a_persons_turn_the_transcript_holds_ends_a_left_limits_wait() {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             policy: SupervisorConfig {
                 answer_questions: false,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..auto(30)
         };
@@ -2858,7 +2867,7 @@ fn a_cancelled_limit_answers_the_act_only_by_a_notice_written_since_it() {
             idle_host: host.map(|h| h as Arc<dyn IdleHost>),
             policy: SupervisorConfig {
                 answer_questions: false,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..auto(30)
         };
@@ -2999,7 +3008,7 @@ fn transcript_run(
         idle_host: Some(host as Arc<dyn IdleHost>),
         policy: SupervisorConfig {
             answer_questions: false,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -3251,7 +3260,7 @@ fn a_left_limits_wait_ends_on_its_own_rows_alone() {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             policy: SupervisorConfig {
                 answer_questions: false,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..auto(30)
         };
@@ -3372,7 +3381,7 @@ fn a_resumed_conversations_notice_with_this_limits_clock_ends_no_wait_in_the_loo
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             policy: SupervisorConfig {
                 answer_questions: false,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..auto(30)
         };
@@ -3439,7 +3448,7 @@ fn a_cold_restores_first_read_of_a_countdown_its_agent_never_held_is_nobodys() {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             policy: SupervisorConfig {
                 answer_questions: false,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..auto(30)
         };
@@ -3552,7 +3561,7 @@ fn a_seeded_loop_reads_the_limits_end_in_the_transcript_by_its_reset() {
             idle_host: Some(host as Arc<dyn IdleHost>),
             policy: SupervisorConfig {
                 answer_questions: false,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..auto(30)
         };
@@ -3713,7 +3722,8 @@ fn replied_under_a_shell(reply: &str, fired_row: bool) -> Vec<String> {
 /// THE ACT, with no transcript to read: the words under the remembered wall,
 /// its notice drawn no more, are the worker's since the limit — a done
 /// report gets the done check, one naming an irreversible act the
-/// reversible clause, and the worker's [`FINISHED`] ends the task. Measured
+/// reversible clause, and the retired [`FINISHED`] token the check too, the
+/// task open (FOREVER CRUISE). Measured
 /// before, for every one of them: the wait stood and `keep going` went under
 /// `usage-resume@v1` into the done report. Both screen shapes (the vendor's
 /// row kept, or only the footer's notification). NEGATIVE CONTROLS: a reply
@@ -3744,7 +3754,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
         .map(|r| r.replace(stub, done))
         .collect::<Vec<_>>()
         .join("\n");
-    let policy = SupervisorConfig::default();
+    let policy = owners_policy();
     let mut wrong = Vec::new();
     for fired_row in [true, false] {
         // A loop that took the wait over from its predecessor's ledger row
@@ -3856,7 +3866,15 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
                 },
                 false,
             ),
-            ("All done.\nATERM-TASK-DONE", TurnEndAction::Nothing, true),
+            // The retired token: a done claim, the check, the task open.
+            (
+                "All done.\nATERM-TASK-DONE",
+                TurnEndAction::Type {
+                    text: DONE_CHECK.to_string(),
+                    rule_id: RULE_DONE_CHECK,
+                },
+                false,
+            ),
             // NEGATIVE CONTROL: no done report.
             (
                 "Stage 2 of 5 is in; stage 3 is next.",

@@ -175,50 +175,80 @@ fn env_push(rival: &Path, env: Env, k: usize) {
     git(rival, &["push", "-q", "origin", "main"]);
 }
 
-/// A tree, projected: how many peer commits' code it carries, its ledger's record
-/// count and tail ordinal, and whether its changelog carries the version's section.
+/// A commit, projected: its parents, how many peer commits' code its tree carries, its
+/// ledger's record count and tail ordinal, and whether its changelog carries the version's
+/// section.
 #[derive(Debug, Clone)]
 struct View {
     commit: String,
+    parents: Vec<String>,
     code: i64,
     lines: i64,
     tail: i64,
     section: i64,
 }
 
-fn view(repo: &Path, rev: &str) -> View {
-    let commit = git(repo, &["rev-parse", rev]);
-    let code = git(
-        repo,
-        &["ls-tree", "-r", "--name-only", &commit, "--", PEERS],
-    )
-    .lines()
-    .filter(|line| !line.is_empty())
-    .count();
-    let records = ledger::parse(&git(
-        repo,
-        &["show", &format!("{commit}:{}", ledger::LEDGER_FILE)],
-    ))
-    .unwrap();
-    let text = git(
-        repo,
-        &["show", &format!("{commit}:{}", changelog::CHANGELOG_FILE)],
+/// The objects `specs` name, as one `git cat-file --batch` in `repo` reads them: each one's
+/// header (`<id> <type> <size>`) and bytes.
+fn objects<const N: usize>(repo: &Path, specs: [String; N]) -> [(String, Vec<u8>); N] {
+    let input: String = specs.iter().map(|spec| format!("{spec}\n")).collect();
+    let out = Git::new(repo)
+        .git_input(&["cat-file", "--batch"], input.as_bytes())
+        .unwrap();
+    assert_eq!(
+        out.status,
+        0,
+        "git cat-file --batch in {}: {}",
+        repo.display(),
+        String::from_utf8_lossy(&out.stderr)
     );
+    let mut rest = out.stdout.as_slice();
+    specs.map(|spec| {
+        let eol = rest.iter().position(|&b| b == b'\n').unwrap();
+        let header = String::from_utf8(rest[..eol].to_vec()).unwrap();
+        let size: usize = match header.rsplit_once(' ') {
+            Some((_, size)) if !header.ends_with(" missing") => size.parse().unwrap(),
+            _ => panic!("{spec} in {}: {header}", repo.display()),
+        };
+        let bytes = rest[eol + 1..eol + 1 + size].to_vec();
+        rest = &rest[eol + 1 + size + 1..];
+        (header, bytes)
+    })
+}
+
+/// `rev`'s commit, its two files and its peers' code: one `cat-file --batch` and one
+/// `ls-tree`.
+fn view(repo: &Path, rev: &str) -> View {
+    let [(header, commit), (_, ledger_text), (_, changelog_text)] = objects(
+        repo,
+        [
+            format!("{rev}^{{commit}}"),
+            format!("{rev}:{}", ledger::LEDGER_FILE),
+            format!("{rev}:{}", changelog::CHANGELOG_FILE),
+        ],
+    );
+    let id = header.split(' ').next().unwrap().to_string();
+    let parents = String::from_utf8(commit)
+        .unwrap()
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix("parent "))
+        .map(str::to_string)
+        .collect();
+    let code = git(repo, &["ls-tree", "-r", "--name-only", &id, "--", PEERS])
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count();
+    let records = ledger::parse(&String::from_utf8(ledger_text).unwrap()).unwrap();
+    let text = String::from_utf8(changelog_text).unwrap();
     View {
+        parents,
         code: i64::try_from(code).unwrap(),
         lines: i64::try_from(records.len()).unwrap(),
         tail: ordinal(records.last().unwrap().build),
         section: i64::from(changelog::has_section(&text, VERSION)),
-        commit,
+        commit: id,
     }
-}
-
-fn parents(repo: &Path, commit: &str) -> Vec<String> {
-    git(repo, &["rev-list", "--parents", "-n", "1", commit])
-        .split_whitespace()
-        .skip(1)
-        .map(str::to_string)
-        .collect()
 }
 
 // --- the hooked runner: records each push attempt, lands the environment's at the first ---
@@ -269,6 +299,8 @@ struct Harness {
     state: State,
     /// The published commit — P.
     source: String,
+    /// P's changelog, which the reader is handed as the checkout's.
+    source_changelog: String,
     /// origin/main's tips in push order: `seq` is an index here.
     tips: Vec<String>,
     pushes: usize,
@@ -279,6 +311,10 @@ impl Harness {
     fn new(label: &str) -> Self {
         let fix = Fixture::new(label);
         let source = git(&fix.origin, &["rev-parse", "main"]);
+        let source_changelog = git(
+            &fix.origin,
+            &["show", &format!("{source}:{}", changelog::CHANGELOG_FILE)],
+        );
         let model = release_claim_landing_model();
         let state = model.init_state();
         let harness = Harness {
@@ -287,6 +323,7 @@ impl Harness {
             state,
             tips: vec![source.clone()],
             source,
+            source_changelog,
             pushes: 0,
             steps: 0,
         };
@@ -377,15 +414,13 @@ impl Harness {
 
     /// The real reader over `main_changelog`, as the transition it makes.
     fn classification(&self, main_changelog: &str) -> (&'static str, State) {
-        let source = git(
-            &self.fix.origin,
-            &[
-                "show",
-                &format!("{}:{}", self.source, changelog::CHANGELOG_FILE),
-            ],
-        );
         let published = self.state["published"] == 1;
-        match publish::real_cut_version(&source, main_changelog, VERSION, &mut |_| Ok(published)) {
+        match publish::real_cut_version(
+            &self.source_changelog,
+            main_changelog,
+            VERSION,
+            &mut |_| Ok(published),
+        ) {
             Ok((version, recut)) => {
                 assert_eq!(version, VERSION);
                 (
@@ -427,14 +462,7 @@ impl Harness {
     /// Negative control: main's section read from the checkout, i.e. the published commit's
     /// changelog.
     fn replay_the_checkout_reader(&mut self) {
-        let checkout = git(
-            &self.fix.origin,
-            &[
-                "show",
-                &format!("{}:{}", self.source, changelog::CHANGELOG_FILE),
-            ],
-        );
-        let (action, next) = self.classification(&checkout);
+        let (action, next) = self.classification(&self.source_changelog);
         assert_eq!(action, "ClassifyFresh", "the checkout never carries it");
         self.refuses(action, &next);
     }
@@ -481,13 +509,12 @@ impl Harness {
         for event in hooked.events.into_inner() {
             match event {
                 Event::Attempt(landed) => {
-                    let parents = parents(&self.fix.work, &landed);
-                    let (read, release) = match parents.as_slice() {
+                    let landing = view(&self.fix.work, &landed);
+                    let (read, release) = match landing.parents.as_slice() {
                         [tip, release] => (tip.clone(), release.clone()),
                         [published] => (published.clone(), landed.clone()),
                         other => panic!("a landing with parents {other:?}"),
                     };
-                    let landing = view(&self.fix.work, &landed);
                     let next = if attempts == 0 {
                         self.with(&[
                             ("phase", 2),
@@ -518,7 +545,7 @@ impl Harness {
             Ok(claim) => {
                 let main = view(&self.fix.origin, "main");
                 assert_eq!(main.commit, claim.landed, "main is the landing");
-                let before = parents(&self.fix.work, &claim.landed)[0].clone();
+                let before = main.parents[0].clone();
                 // The structural laws, read off git: R is the published commit plus the claim
                 // files, and main moved by exactly those files.
                 for (from, to) in [(&self.source, &claim.commit), (&before, &claim.landed)] {

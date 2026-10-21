@@ -79,8 +79,16 @@ fn from_checkpoint_hydration_continues_the_mirror() {
     let mut viewer = Terminal::from_checkpoint(&snapshot);
     feed(&mut viewer, &SESSION[AT..], clock);
 
+    // The viewer is a restore the tail reached before any host adopted it: its
+    // checkpoint carries that lineage's seed uncertainty
+    // (`HolderRepr::seed_untrusted`), which the live host never has.
+    let reattached = viewer.checkpoint();
+    assert!(
+        reattached.holder.seed_untrusted,
+        "a restore output reached before adoption carries its lineage"
+    );
     assert_eq!(
-        viewer.checkpoint(),
+        reattached.without_seed_lineage(),
         live.checkpoint(),
         "reattach (hydrate at offset {AT} + tail the rest) must reach the live state"
     );

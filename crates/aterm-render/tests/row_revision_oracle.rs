@@ -280,7 +280,16 @@ fn reference(prev: &RenderInput, cur: &RenderInput, dirty: &mut Vec<bool>) -> Di
     let mut c = cur.clone();
     p.invalidate_row_revisions();
     c.invalidate_row_revisions();
-    compute_dirty_rows(&p, &c, false, None, false, None, CELL_H, dirty)
+    compute_dirty_rows(
+        &p,
+        &c,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        dirty,
+    )
 }
 
 #[test]
@@ -322,7 +331,7 @@ fn stamped_dirty_rows_match_the_brute_force_oracle_over_a_mutation_corpus() {
                 None,
                 false,
                 None,
-                CELL_H,
+                aterm_render::RowBands::new(0, CELL_H),
                 &mut stamped_dirty,
             );
             let want = reference(&presented, &scratch, &mut reference_dirty);
@@ -438,7 +447,14 @@ fn a_second_write_to_an_already_damaged_row_changes_its_revision() {
 
     let mut dirty = Vec::new();
     let d = compute_dirty_rows(
-        &first, &second, false, None, false, None, CELL_H, &mut dirty,
+        &first,
+        &second,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
     );
     assert!(
         matches!(d, DirtyDecision::Rows(_)),
@@ -488,7 +504,14 @@ fn a_foreign_take_damage_between_extracts_cannot_lose_a_row() {
     );
     let mut dirty = Vec::new();
     let d = compute_dirty_rows(
-        &presented, &scratch, false, None, false, None, CELL_H, &mut dirty,
+        &presented,
+        &scratch,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
     );
     assert!(matches!(d, DirtyDecision::Rows(_)));
     assert!(
@@ -523,7 +546,14 @@ fn an_idle_frame_after_a_typed_row_reports_no_dirty_rows() {
     );
     let mut dirty = Vec::new();
     let d = compute_dirty_rows(
-        &presented, &scratch, false, None, false, None, CELL_H, &mut dirty,
+        &presented,
+        &scratch,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
     );
     assert!(matches!(d, DirtyDecision::Rows(_)));
     assert!(
@@ -553,7 +583,16 @@ fn two_terminals_never_share_a_revision_lane() {
         "distinct terminals must not share a comparable revision lane"
     );
     let mut dirty = Vec::new();
-    let d = compute_dirty_rows(&fa, &fb, false, None, false, None, CELL_H, &mut dirty);
+    let d = compute_dirty_rows(
+        &fa,
+        &fb,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    );
     assert!(matches!(d, DirtyDecision::Rows(_)));
     assert!(dirty[0], "row 0 differs in content and must be dirty");
 }

@@ -908,11 +908,15 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
          too.\n",
         aterm_codec::tty::one_line(&joined.issuer.host, 80),
         joined.peers,
+        // An issuer from before node keys mints its key at `aterm fleet
+        // init` alone (an update mints none), so a join before then binds
+        // nothing: the menu's degrade line says the same.
         if issuer_key.is_some() {
             ", and proved its node key, which this machine binds it to"
         } else {
-            "; it proved no node key (an older aterm): its node is its claim until it updates \
-             and this machine joins again"
+            "; it proved no node key, so its node is its claim here: join again here once it \
+             has one (`aterm fleet init` there mints it, after an update if its aterm is \
+             older; a join before then binds nothing)"
         },
     ));
     Ok(out)

@@ -227,6 +227,7 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
         &crate::cursor_droplet::DropletConfig {
             enabled: true,
             intensity: 1.0,
+            ground: None,
         },
         &mut halo,
     );
@@ -245,6 +246,7 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
             dark_theme: true,
             theme_fg: 0x00C8_D3F5,
             theme_bg: 0x001A_1B26,
+            pinned: false,
         },
         &mut halo,
         &mut Vec::new(),
@@ -262,6 +264,7 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
             dark_theme: true,
             theme_fg: 0x00C8_D3F5,
             theme_bg: 0x001A_1B26,
+            pinned: false,
         },
         &mut halo,
         &mut Vec::new(),

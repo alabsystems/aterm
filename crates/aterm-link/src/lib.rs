@@ -86,6 +86,9 @@ macro_rules! println {
 pub mod body;
 pub mod bridge;
 mod broker_args;
+/// What a serving broker watches in itself: the poisoned log it exits over
+/// for its supervisor to reopen — see [`broker_health::poisoned_line`].
+pub mod broker_health;
 /// The bridge command line, as a library entry - see [`cli::dispatch`].
 pub mod cli;
 pub mod ctl;
@@ -98,6 +101,10 @@ pub mod enable;
 /// `aterm fabric` — the fabric's state on one screen, and its traffic live.
 pub mod fabric;
 pub mod fabric_brief;
+/// The bridge's doors: its clocks, park, broker dials and readers, verb lane,
+/// jitter and state-dir writes, in one place a simulation can stand in for —
+/// see [`fx`]'s module doc.
+mod fx;
 pub mod glance;
 pub mod mailbox;
 pub mod mirror;
@@ -114,6 +121,10 @@ pub mod presence;
 /// [`presence_view::PresenceView`].
 pub mod presence_view;
 pub mod render;
+/// The deterministic fabric simulation (test builds): one real bridge, its
+/// doors answered by a seeded world — see its module doc.
+#[cfg(test)]
+mod sim;
 pub mod state;
 pub mod subject;
 pub mod transport;

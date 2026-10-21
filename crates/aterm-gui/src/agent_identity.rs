@@ -43,6 +43,21 @@
 //! ([`restorable`]). A downgrade to a build without the field keeps the
 //! shell's env and drops the label (`sessions` says `identity=-`).
 //!
+//! A spawn holds the identity it is admitted under ([`Admission`]) from before
+//! it sights the folder until it fails or the session that wears it drops, and
+//! `identities forget` refuses an identity a spawn holds. A confirmed forget
+//! holds it in turn from its checks to its rename ([`Forgetting`]), and no spawn
+//! is admitted under it meanwhile. So no shell this process spawns starts, or
+//! runs while its session lives, with agent homes in a folder a forget in this
+//! process removed. A process that outlives its session is not covered: the
+//! session gives its hold back as it drops, which only hangs the shell up and
+//! leaves its reap to a background thread, so an agent still writing its exit
+//! state, a child that ignores the hang-up, or a disowned job can name the
+//! folder after a forget's `OK`. A shell adopted across an update holds the
+//! identity its record labels from its adoption on ([`hold_adopted`]), unless
+//! a forget was already taking it; one adopted from a build without the label
+//! holds nothing.
+//!
 //! Names fold to lowercase at parse ([`parse_name`]), since case-insensitive
 //! APFS would make `Worker` and `worker` one directory with two labels. Grammar
 //! after folding: `[a-z0-9][a-z0-9._-]{0,63}`; `-` (the wire's absent mark) and
@@ -108,13 +123,57 @@ pub(crate) fn dir_for(name: &str) -> Option<PathBuf> {
 /// identity counts ([`identity_dir`]: a real directory, never a symlink);
 /// anything else is `NotFound` and nothing is touched.
 pub(crate) fn ensure(name: &str, create: bool) -> io::Result<PathBuf> {
-    let root = aterm_types::dirs::identities_dir().ok_or_else(|| {
+    let root = answering_root()?;
+    ensure_in(&root, name, create)
+}
+
+/// The identities folder ([`aterm_types::dirs::identities_dir`]) once its
+/// volume answered ([`crate::spawn_folder::volume_answers`]). Every read of
+/// the roster or of an identity starts here, on a thread someone waits on:
+/// the spawner, ahead of every tab asked after this one; the event loop, for
+/// the identity picker and a restored pane; a control lane, for the
+/// `identities` verb. On a network volume that stopped answering each read
+/// held its thread for the mount's whole timeout — the spawner's later tabs,
+/// and for the picker every window, until the server came back (measured in a
+/// macOS 27 guest, 2026-10-20) — where now it is refused after the folder
+/// check's budget, and at once after that.
+fn answering_root() -> io::Result<PathBuf> {
+    answering(
+        aterm_types::dirs::identities_dir(),
+        crate::spawn_folder::volume_answers,
+    )
+}
+
+/// This instance's identities dir ([`aterm_types::dirs::identities_dir`]), or
+/// why there is none, with no look at its volume: for [`hold_adopted`], which
+/// reads nothing from disk.
+fn identities_root() -> io::Result<PathBuf> {
+    aterm_types::dirs::identities_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no state root resolves (HOME is unset)",
+        )
+    })
+}
+
+/// [`answering_root`], PURE over the root and its volume's answer: a root
+/// whose volume did not answer is refused by name (`TimedOut`) before
+/// anything under it is looked at.
+fn answering(root: Option<PathBuf>, answers: impl FnOnce(&Path) -> bool) -> io::Result<PathBuf> {
+    let root = root.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "no state root resolves (HOME is unset)",
         )
     })?;
-    ensure_in(&root, name, create)
+    if answers(&root) {
+        Ok(root)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{} did not answer", root.display()),
+        ))
+    }
 }
 
 /// [`ensure`] with its root injected: `root` is the identities dir.
@@ -145,12 +204,16 @@ fn no_such_identity(name: &str) -> io::Error {
 /// rename lands every later create fails, the identity stays forgotten, and its
 /// rows say why nothing more was written. `auto_prime_identity`, not
 /// `auto_prime`, which follows the human's `$XDG_CONFIG_HOME` for the
-/// `.config/` row and would write into the human's tree.
-fn prime_dir(name: &str, dir: &Path) {
+/// `.config/` row and would write into the human's tree. `true` when no agent's
+/// row failed.
+fn prime_dir(name: &str, dir: &Path) -> bool {
     let pass = aterm_primer::auto_prime_identity(dir);
+    let mut clean = true;
     for (agent, err) in pass.errors() {
         aterm_log::warn!("identity {name}: primer: {agent}: {err}");
+        clean = false;
     }
+    clean
 }
 
 /// The folders half of [`ensure_in`] with `create`: `<root>/<name>/` and each
@@ -209,8 +272,12 @@ fn make_private_dir(dir: &Path) -> io::Result<()> {
 /// which must still be there ([`make_private_dir`]): that is an identity made
 /// before its agent's row joined [`aterm_primer::agent_homes`], which a row
 /// does once its variable is measured (the table's `var` column), so a
-/// missing subdir is made rather than refused. A dir already private costs
-/// one `stat`. So an `identities forget` whose rename lands anywhere in here
+/// missing subdir is made rather than refused; an agent subdir that is a
+/// symlink to nothing is refused as what it is, never as a missing identity
+/// (`harden_private_dir` says `NotADirectory`). A dir already private costs
+/// one `stat`. This process's `identities forget` cannot take the folder from
+/// under an admission, which holds it ([`Admission`]); a folder that goes
+/// anyway (removed by hand, or by another process's forget) anywhere in here
 /// leaves the spawn refused as [`no_such_identity`], and nothing comes back.
 /// Until 2026-10-17 this was `ensure_private_dir` throughout, whose
 /// `create_dir_all` made an inherited identity again behind a forget's `OK`.
@@ -265,14 +332,11 @@ pub(crate) enum SpawnAdmit {
 /// thread ([`reprime_detached`], throttled per name, but always for an
 /// identity this admission made): the shell's env names only the folders, and
 /// a primer write that is lost or late is made again by the next spawn's
-/// prime, so the spawn's reply waits for no file write.
-pub(crate) fn check_for_spawn(name: &str, admit: SpawnAdmit) -> io::Result<PathBuf> {
-    let root = aterm_types::dirs::identities_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "no state root resolves (HOME is unset)",
-        )
-    })?;
+/// prime, so the spawn's reply waits for no file write. `Ok` is the spawn's
+/// [`Admission`], which the spawner keeps until the session has its own
+/// ([`admit_existing`]); an `Err` holds nothing.
+pub(crate) fn check_for_spawn(name: &str, admit: SpawnAdmit) -> io::Result<Admission> {
+    let root = answering_root()?;
     check_for_spawn_in(&root, name, admit, reprime_detached)
 }
 
@@ -287,21 +351,25 @@ pub(crate) fn check_for_spawn_in(
     name: &str,
     admit: SpawnAdmit,
     reprime: impl FnOnce(&Path, bool),
-) -> io::Result<PathBuf> {
+) -> io::Result<Admission> {
     check_for_spawn_at(root, name, admit, |_| {}, reprime)
 }
 
 /// [`check_for_spawn_in`] with its moment between sighting the identity's
-/// folder and hardening it injected: `sighted` hears the folder. Tests land an
-/// `identities forget` there.
+/// folder and hardening it injected: `sighted` hears the folder. Tests take
+/// the folder away there.
 fn check_for_spawn_at(
     root: &Path,
     name: &str,
     admit: SpawnAdmit,
     sighted: impl FnOnce(&Path),
     reprime: impl FnOnce(&Path, bool),
-) -> io::Result<PathBuf> {
+) -> io::Result<Admission> {
     let name = parse_name(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // Admitted before anything is sighted: a forget holding the identity now
+    // is waited out, and one that comes later is refused while this stands, so
+    // the folder sighted below is the one the child's agent homes name.
+    let admission = Admission::begin(&root.join(&name));
     let made = match admit {
         SpawnAdmit::Named => make_identity_dir(root, &name)?,
         SpawnAdmit::Inherited => false,
@@ -314,7 +382,210 @@ fn check_for_spawn_at(
     // or refused before the background handoff and the child's spawn.
     harden_identity(root, &dir, &name)?;
     reprime(&dir, made);
-    Ok(dir)
+    Ok(admission)
+}
+
+/// The shell's own check of the identity `name` it is spawned under
+/// ([`crate::spawn::spawn_session`]), as the [`Admission`] its session keeps:
+/// `name` must be an identity ([`identity_dir`]) that no forget is taking.
+/// It never waits, since a restore spawns in an event-loop turn: a forget
+/// holding the identity is on its way to removing it, so that is
+/// [`no_such_identity`] too. A spawner's admission ([`check_for_spawn`]) held
+/// across the spawn keeps every forget out until this one stands.
+pub(crate) fn admit_existing(name: &str) -> io::Result<Admission> {
+    admit_existing_in(&answering_root()?, name)
+}
+
+/// [`admit_existing`] with its root injected.
+fn admit_existing_in(root: &Path, name: &str) -> io::Result<Admission> {
+    let name = parse_name(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let admission = Admission::begin_unless_forgotten(&root.join(&name))
+        .ok_or_else(|| no_such_identity(&name))?;
+    identity_dir(root, &name).ok_or_else(|| no_such_identity(&name))?;
+    Ok(admission)
+}
+
+/// The [`Admission`] an adopted shell's session keeps under the identity
+/// `name` its record labels ([`crate::spawn::spawn_session`] on adoption). The
+/// process that admitted the shell may have exited with a committed update,
+/// and the registry counts the label only once the tab is installed, so this
+/// holds the identity from the adoption on. It never waits and never fails
+/// the adoption, whose env is what it was whatever is on disk: `None` when no
+/// state root resolves, the label is no name, or a forget holds the identity,
+/// which is then on its way out. Nothing is read from disk.
+pub(crate) fn hold_adopted(name: &str) -> Option<Admission> {
+    hold_adopted_in(&identities_root().ok()?, name)
+}
+
+/// [`hold_adopted`] with its root injected.
+fn hold_adopted_in(root: &Path, name: &str) -> Option<Admission> {
+    let name = parse_name(name).ok()?;
+    Admission::begin_unless_forgotten(&root.join(name))
+}
+
+/// What holds one identity's folder now ([`HOLDS`]): the [`Admission`]s under
+/// it that have not dropped (`spawns`; a spawn holds two while its shell's own
+/// check stands, its spawner's and its shell's, and a session still dropping
+/// holds its own), and the confirmed forgets between their checks and their
+/// rename ([`Forgetting`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Holds {
+    spawns: usize,
+    forgets: usize,
+    /// The admissions waiting a forget out now ([`Admission::begin`]), counted
+    /// in tests only: a test holds its forget until one waits
+    /// ([`ADMISSION_WAITS`]).
+    #[cfg(test)]
+    waiting: usize,
+}
+
+/// Every identity folder something holds, by its path (`<root>/<name>`, so two
+/// roots never share an entry).
+type HoldsByDir = std::collections::BTreeMap<PathBuf, Holds>;
+
+/// [`HoldsByDir`] for the process. A leaf lock: held only to read or change
+/// the counts, never across a file operation or another lock.
+static HOLDS: std::sync::Mutex<HoldsByDir> = std::sync::Mutex::new(HoldsByDir::new());
+
+/// Signalled as a forget's hold ends, for the admissions waiting it out
+/// ([`Admission::begin`]).
+static FORGET_ENDED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Signalled, in tests, as an admission starts waiting a forget out
+/// ([`Holds::waiting`]).
+#[cfg(test)]
+static ADMISSION_WAITS: std::sync::Condvar = std::sync::Condvar::new();
+
+fn identity_holds() -> std::sync::MutexGuard<'static, HoldsByDir> {
+    HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether a forget holds the identity at `dir`.
+fn forgotten(holds: &HoldsByDir, dir: &Path) -> bool {
+    holds.get(dir).is_some_and(|held| held.forgets > 0)
+}
+
+/// Give back one of `dir`'s holds (`give` takes it off the counts), dropping
+/// the entry once nothing holds the folder.
+fn release(dir: &Path, give: impl FnOnce(&mut Holds)) {
+    let mut holds = identity_holds();
+    if let Some(held) = holds.get_mut(dir) {
+        give(held);
+        if *held == Holds::default() {
+            holds.remove(dir);
+        }
+    }
+}
+
+/// A spawn's admission under the identity at its folder, from before the spawn
+/// sights the folder until this drops: with the spawn when it fails, or with
+/// the session that wears it (`spawn_session` keeps the shell's own,
+/// [`admit_existing`], or an adopted shell's, [`hold_adopted`], on the
+/// `Session`). While one stands, a confirmed `identities forget` of the
+/// identity is refused as in use (`spawning=<k>`, `k` the admissions
+/// standing), so no forget in this process takes the folder from the spawn's
+/// admission until it fails or its session drops. The session drops before
+/// its processes are gone (its shell is hung up and reaped in the background),
+/// and a process that outlives it is held by nothing. The registry counts a
+/// session as a user only once the main thread installs its tab; this counts
+/// the spawn from its admission, through the spawner's readying and fork,
+/// until the session is gone.
+#[derive(Debug)]
+#[must_use = "an admission holds its identity only while it is kept"]
+pub(crate) struct Admission {
+    dir: PathBuf,
+}
+
+impl Admission {
+    /// Admit a spawn under the identity at `dir` (`<root>/<name>`), before the
+    /// folder is sighted. A forget holding it is waited out, so the spawn then
+    /// sights the folder as that forget's rename left it. The spawner's: the
+    /// wait lasts as long as that one rename, and the forget holding it waits
+    /// on nothing else. Only when no spawner thread could start does a turn
+    /// run this, with the rest of the spawn's folder work.
+    fn begin(dir: &Path) -> Self {
+        let mut holds = identity_holds();
+        if forgotten(&holds, dir) {
+            // Counted under the lock the wait gives up, so a test that sees
+            // the count knows this admission is parked in the wait.
+            #[cfg(test)]
+            {
+                holds.entry(dir.to_path_buf()).or_default().waiting += 1;
+                ADMISSION_WAITS.notify_all();
+            }
+            holds = FORGET_ENDED
+                .wait_while(holds, |holds| forgotten(holds, dir))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            if let Some(held) = holds.get_mut(dir) {
+                held.waiting -= 1;
+            }
+        }
+        Self::count(holds, dir)
+    }
+
+    /// [`Self::begin`] that never waits: `None` while a forget holds the
+    /// identity, which is then on its way out.
+    fn begin_unless_forgotten(dir: &Path) -> Option<Self> {
+        let holds = identity_holds();
+        if forgotten(&holds, dir) {
+            return None;
+        }
+        Some(Self::count(holds, dir))
+    }
+
+    fn count(mut holds: std::sync::MutexGuard<'_, HoldsByDir>, dir: &Path) -> Self {
+        holds.entry(dir.to_path_buf()).or_default().spawns += 1;
+        Self {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// The identity's folder, the one the shell's agent homes are named under
+    /// ([`env`]).
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        release(&self.dir, |held| held.spawns -= 1);
+    }
+}
+
+/// A confirmed `identities forget`'s hold on the identity at its folder, from
+/// its checks until its rename returns ([`forget_reply`]): while it stands no
+/// spawn is admitted under the identity ([`Admission`]), so none sights the
+/// folder the rename is taking. Dropped, it wakes the admissions waiting it
+/// out.
+struct Forgetting {
+    dir: PathBuf,
+}
+
+impl Forgetting {
+    /// Hold the identity at `dir` for a forget, or `Err(k)` while `k`
+    /// admissions under it stand ([`Holds`]), and then nothing is held.
+    fn begin(dir: &Path) -> Result<Self, usize> {
+        let mut holds = identity_holds();
+        let held = holds.entry(dir.to_path_buf()).or_default();
+        if held.spawns > 0 {
+            return Err(held.spawns);
+        }
+        held.forgets += 1;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for Forgetting {
+    fn drop(&mut self) {
+        release(&self.dir, |held| held.forgets -= 1);
+        FORGET_ENDED.notify_all();
+    }
 }
 
 /// How often one process re-primes the same inherited identity, at most: a
@@ -348,9 +619,10 @@ fn reprime_due(
     due
 }
 
-/// The re-prime passes running now ([`reprime_detached`]): counted from the
-/// admission that hands one off, before its spawn replies, until its thread is
-/// done writing. `metrics` prints it as `identity_primes_running=`, so a reader
+/// The re-prime passes running now ([`reprime_detached`], and the launch's
+/// [`reprime_roster`] while it writes): a spawn's counted from the admission
+/// that hands it off, before its spawn replies, until its thread is done
+/// writing. `metrics` prints it as `identity_primes_running=`, so a reader
 /// that sees 0 after a spawn's reply knows no primer is writing into an
 /// identity's folder.
 static PRIMES_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -372,23 +644,13 @@ impl Drop for PrimeRunning {
     }
 }
 
-/// The summary line's primer fragment, leading space included:
-/// ` identity_primes_running=<n>` ([`PRIMES_RUNNING`]).
-#[must_use]
-pub(crate) fn metrics_fields_text() -> String {
-    format!(
-        " identity_primes_running={}",
-        PRIMES_RUNNING.load(std::sync::atomic::Ordering::Acquire)
-    )
-}
-
-/// Field-for-field JSON twin of [`metrics_fields_text`], with a leading comma.
-#[must_use]
-pub(crate) fn metrics_fields_json() -> String {
-    format!(
-        ",\"identity_primes_running\":{}",
-        PRIMES_RUNNING.load(std::sync::atomic::Ordering::Acquire)
-    )
+/// The summary's primer field, `identity_primes_running` ([`PRIMES_RUNNING`]),
+/// through the one emitter both forms read.
+pub(crate) fn emit_metrics(s: &mut dyn crate::metrics::wire::FieldSink) {
+    s.count(
+        "identity_primes_running",
+        PRIMES_RUNNING.load(std::sync::atomic::Ordering::Acquire) as u64,
+    );
 }
 
 /// Prime the existing identity at `dir` again, the primer's files only
@@ -434,11 +696,43 @@ fn reprime_detached(dir: &Path, made: bool) {
 
 /// The detached re-prime's pass ([`reprime_detached`]): `name` under `root`,
 /// while it is still an identity, gets the primer's files ([`prime_dir`]); a
-/// forgotten one gets nothing.
-fn reprime_existing(root: &Path, name: &str) {
-    if let Some(dir) = identity_dir(root, name) {
-        prime_dir(name, &dir);
+/// forgotten one gets nothing. `false` only when a row of its pass failed.
+fn reprime_existing(root: &Path, name: &str) -> bool {
+    identity_dir(root, name).is_none_or(|dir| prime_dir(name, &dir))
+}
+
+/// Prime every identity on disk again, the primer's files only, on the
+/// calling thread: the window launch's pass (`spawn::PrimeCue::Launch`) at
+/// the first launch of each build, already detached and gated. A tab under an
+/// identity reads its agent's primer from the identity's folder, which only a
+/// spawner's admission under it primes ([`check_for_spawn`]). A shell a
+/// seamless update adopts ([`hold_adopted`]), or one a cold restore forks
+/// there ([`restorable`], then the shell's own [`admit_existing`]), holds the
+/// identity but primes nothing there, so without this its agent, and one the
+/// harness relaunches there with `--resume`, read the block the build before
+/// wrote. Counted in [`PRIMES_RUNNING`] while it writes. A forgotten identity
+/// gets nothing ([`reprime_existing`]), and a missing root is an empty roster.
+/// `true` when every identity on the roster was primed whole: `false` when a
+/// row failed, the root could not be read, or its volume did not answer, so
+/// the launch records no build and the next one tries again
+/// (`spawn::prime_identities_once_per_build`).
+pub(crate) fn reprime_roster() -> bool {
+    answering_root().is_ok_and(|root| reprime_roster_in(&root))
+}
+
+/// [`reprime_roster`] with its root injected: `root` is the identities dir.
+/// Every identity is primed, a failed one included, before it answers (`&=`
+/// does not short-circuit).
+pub(crate) fn reprime_roster_in(root: &Path) -> bool {
+    let _running = PrimeRunning::begin();
+    let Ok(names) = list_names(root) else {
+        return false;
+    };
+    let mut whole = true;
+    for name in &names {
+        whole &= reprime_existing(root, name);
     }
+    whole
 }
 
 /// The env additions for a session under the identity at `dir`: one pair per
@@ -489,25 +783,36 @@ const IDENTITIES_USAGE: &str = "ERR usage: identities [<name>|forget <name> [con
 /// | `identities <name>` | `OK <1+agents>`: that row, then `agent=<prog> var=<VAR> home=<pct> files=present\|absent` per agent |
 /// | `identities forget <name>` | `ERR confirm: identities forget <name> confirm=<name> removes <pct>` — nothing touched |
 /// | `… confirm=<name>`, a live session carries it | `ERR identity in use sessions=<sid>,…` — nothing touched |
+/// | `… confirm=<name>`, `k` admissions under it stand ([`Admission`]) | `ERR identity in use spawning=<k>` — nothing touched |
 /// | `… confirm=<name>` | `OK removed=<pct> left=keychain` |
 /// | `… confirm=<name>`, the tombstone would not go | `OK removed=<pct> left=keychain tombstone=<pct> why=<pct>` |
 /// | unknown name | `ERR no such identity <name>` |
 /// | anything else | `ERR usage: identities [<name>\|forget <name> [confirm=<name>]]` |
 ///
 /// `present` means the agent's subdirectory has at least one entry (a name
-/// listing; nothing is opened). `forget` removes the tree and the agents'
-/// file credentials with it; a keychain login stays (`left=keychain`, always),
-/// so sign out in the agent first. The live count is the registry's: a shell
-/// adopted from a build without the label is not counted. The in-use check and
-/// the removal are two steps; a racing `spawn identity=` makes a new, empty
-/// identity, or, when the rename lands inside its admission, is refused as
-/// `no such identity` ([`harden_identity`]). The removal is one rename to a
-/// tombstone, then the tombstone's removal ([`forget_reply`]), so a primer
-/// pass still writing under the old name makes nothing. A tombstone that will
-/// not go is named in the reply; it is no identity to any reader, and the next
-/// forget sweeps it. A name the grammar refuses is usage and is never joined
-/// to a path. Only real directories are identities; a symlink or file in the
-/// root is ignored.
+/// listing; nothing is opened). `forget` removes the tree and the agents' file
+/// credentials with it; a keychain login stays (`left=keychain`, always), so
+/// sign out in the agent first. The live count is the registry's: a shell
+/// adopted from a build without the label is not counted. A spawn admitted
+/// under the identity holds it from its admission until it fails or its session
+/// drops ([`Admission`]), and an adopted shell with the label from its adoption
+/// ([`hold_adopted`]), so a session the registry does not list yet (the spawner
+/// readying the folder and forking, the tab not yet installed) refuses the
+/// forget as `spawning=<k>`. `k` counts the admissions standing, not spawns: a
+/// spawn holds two while its shell's own check stands, and a session still
+/// dropping, or installed after the registry was read, counts too. A process
+/// that outlives its session (an agent still exiting, a disowned job) holds
+/// nothing. A confirmed forget holds the identity in turn from its checks to
+/// its rename ([`Forgetting`]): a spawn arriving meanwhile is admitted after
+/// the rename (a named one makes a new, empty identity) or, from a check that
+/// cannot wait, refused as `no such identity`. The removal is one rename to a
+/// tombstone, then the tombstone's removal ([`forget_reply`]), so a primer pass
+/// still writing under the old name makes nothing. A tombstone that will not go
+/// is named in the reply; it is no identity to any reader, and the next forget
+/// in its aterm, or once that aterm has exited any aterm's next forget or
+/// launch ([`sweep_abandoned_tombstones`]), sweeps it. A name the grammar
+/// refuses is usage and is never joined to a path. Only real directories are
+/// identities; a symlink or file in the root is ignored.
 pub(crate) fn cmd_identities(store: &crate::session_store::Store, rest: &str) -> String {
     // The live users, from the registry snapshot: `(identity, sid)` in local-id
     // order. Cloned out under a short read guard, never held across the
@@ -523,10 +828,10 @@ pub(crate) fn cmd_identities(store: &crate::session_store::Store, rest: &str) ->
             })
             .collect()
     };
-    let Some(root) = aterm_types::dirs::identities_dir() else {
-        return "ERR identities: no state root resolves (HOME is unset)\n".to_string();
-    };
-    identities_reply(&root, &live, rest)
+    match answering_root() {
+        Ok(root) => identities_reply(&root, &live, rest),
+        Err(error) => format!("ERR identities: {error}\n"),
+    }
 }
 
 /// The pure half of [`cmd_identities`]: `root` is the identities dir, `live`
@@ -556,9 +861,11 @@ fn identity_dir(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Every identity on disk, by name — the `identities` verb's roster, for the
-/// identity picker. A missing or unreadable root is an empty roster.
+/// identity picker. A missing or unreadable root is an empty roster, and so is
+/// one whose volume did not answer ([`answering_root`]).
 pub(crate) fn roster() -> Vec<String> {
-    aterm_types::dirs::identities_dir()
+    answering_root()
+        .ok()
         .and_then(|root| list_names(&root).ok())
         .unwrap_or_default()
 }
@@ -687,11 +994,70 @@ fn tombstone_for(root: &Path, name: &str) -> PathBuf {
     ))
 }
 
-/// Remove the tombstones earlier forgets could not ([`TOMBSTONE_PREFIX`]),
-/// best effort: each one's reply already named it. Swept here, not at start:
-/// nothing at start reads the identities folder, which can sit on a slow
-/// volume, and a tombstone is no identity to any reader meanwhile.
-fn sweep_tombstones(root: &Path) {
+/// The `<pid>` in a tombstone's name ([`tombstone_for`]:
+/// `.forgotten-<name>-<pid>-<k>`, `<name>` a folded identity name), when the
+/// name is one.
+fn tombstone_pid(file_name: &str) -> Option<u32> {
+    let mut tail = file_name.strip_prefix(TOMBSTONE_PREFIX)?.rsplitn(3, '-');
+    let (count, pid, name) = (tail.next()?, tail.next()?, tail.next()?);
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(count) || !digits(pid) || parse_name(name).ok().as_deref() != Some(name) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// The tombstones this process's forgets are emptying now, each from before
+/// its rename until its forget replies ([`Emptying`]). No sweep in this
+/// process takes one, so a forget never answers `tombstone=` for a tree
+/// another forget is still removing. A leaf lock like [`HOLDS`]: held only to
+/// read or change the set, never across a file operation or another lock.
+static EMPTYING: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn emptying() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<PathBuf>> {
+    EMPTYING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A forget's tombstone in [`EMPTYING`], given back as it drops.
+struct Emptying {
+    tombstone: PathBuf,
+}
+
+impl Emptying {
+    fn begin(tombstone: &Path) -> Self {
+        emptying().insert(tombstone.to_path_buf());
+        Self {
+            tombstone: tombstone.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for Emptying {
+    fn drop(&mut self) {
+        emptying().remove(&self.tombstone);
+    }
+}
+
+/// Whether the entry `file_name` in `root` is a tombstone no forget may still
+/// be emptying: its name is a tombstone's ([`tombstone_pid`]), and its `<pid>`
+/// is this process's with no forget of ours emptying it now ([`EMPTYING`]), or
+/// is not `alive`. A live aterm's forget may be emptying its own, so another
+/// aterm's tombstone stays until that aterm has exited; a reused pid only
+/// keeps a dead one's until a later sweep.
+fn abandoned(root: &Path, file_name: &str, alive: impl Fn(u32) -> bool) -> bool {
+    match tombstone_pid(file_name) {
+        Some(pid) if pid == std::process::id() => !emptying().contains(&root.join(file_name)),
+        Some(pid) => !alive(pid),
+        None => false,
+    }
+}
+
+/// Remove the tombstones in `root` ([`TOMBSTONE_PREFIX`]) whose names `sweeps`
+/// picks, best effort: each one's reply already named it.
+fn sweep_tombstones(root: &Path, sweeps: impl Fn(&str) -> bool) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -699,10 +1065,39 @@ fn sweep_tombstones(root: &Path) {
         if entry
             .file_name()
             .to_str()
-            .is_some_and(|n| n.starts_with(TOMBSTONE_PREFIX))
+            .is_some_and(|n| n.starts_with(TOMBSTONE_PREFIX) && sweeps(n))
         {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// Sweep `root` of the tombstones no forget may still be emptying
+/// ([`abandoned`]), `alive` injected: a forget's sweep after its rename
+/// ([`forget_reply`]) and the launch's ([`sweep_tombstones_at_launch`]) are
+/// this one pass.
+fn sweep_abandoned_tombstones(root: &Path, alive: impl Fn(u32) -> bool) {
+    sweep_tombstones(root, |name| abandoned(root, name, &alive));
+}
+
+/// Sweep the identities folder once at launch, on a detached housekeeping
+/// thread, of the abandoned tombstones ([`sweep_abandoned_tombstones`]): their
+/// trees still hold a forgotten identity's agent files, a login an agent keeps
+/// as a file among them, and the next forget, which sweeps them too, may
+/// never come. Nothing waits on the thread, so a slow volume costs the launch
+/// nothing. It removes only `.forgotten-<name>-<pid>-<k>` entries directly in
+/// the folder ([`tombstone_pid`]), and none a forget may still be emptying.
+pub(crate) fn sweep_tombstones_at_launch() {
+    let Some(root) = aterm_types::dirs::identities_dir() else {
+        return;
+    };
+    let spawned = crate::qos::spawn_lane_thread(
+        "aterm-identity-sweep",
+        crate::qos::Role::Housekeeping,
+        move || sweep_abandoned_tombstones(&root, crate::control_auth::pid_alive),
+    );
+    if let Err(e) = spawned {
+        aterm_log::warn!("identity tombstones: could not start the launch sweep: {e}");
     }
 }
 
@@ -711,26 +1106,31 @@ fn sweep_tombstones(root: &Path) {
 /// then on it is gone for every reader and writer that names it by path, so a
 /// primer pass's late write fails instead of making it again
 /// ([`reprime_detached`]), and nothing lands in the tree being removed, so the
-/// removal never meets a folder filling up under it. The reply says the
-/// identity is gone once the rename is done; a tombstone the removal left is
-/// named in it, with why.
+/// removal never meets a folder filling up under it. Unused means no live
+/// session carries it and no spawn holds it ([`Admission`]); the forget holds
+/// it from that check until its rename returns ([`Forgetting`]), so no spawn
+/// sights the folder the rename is taking. The reply says the identity is
+/// gone once the rename is done; a tombstone the removal left is named in it,
+/// with why.
 fn forget_reply(
     root: &Path,
     live: &[(String, String)],
     raw: &str,
     confirm: Option<&str>,
 ) -> String {
-    forget_reply_in(root, live, raw, confirm, |_| {})
+    forget_reply_in(root, live, raw, confirm, |_| {}, |_| {})
 }
 
-/// [`forget_reply`] with its moment between the rename and the removal
-/// injected: `buried` hears the tombstone. Tests land a primer's late write
-/// there.
+/// [`forget_reply`] with two moments injected: `held` hears the folder once
+/// the forget holds it, before the rename, and `buried` hears the tombstone
+/// between the rename and the removal. Tests land a spawn's admission at the
+/// first and a primer's late write at the second.
 fn forget_reply_in(
     root: &Path,
     live: &[(String, String)],
     raw: &str,
     confirm: Option<&str>,
+    held: impl FnOnce(&Path),
     buried: impl FnOnce(&Path),
 ) -> String {
     let Ok(name) = parse_name(raw) else {
@@ -754,11 +1154,26 @@ fn forget_reply_in(
     if !users.is_empty() {
         return format!("ERR identity in use sessions={}\n", users.join(","));
     }
-    sweep_tombstones(root);
+    let hold = match Forgetting::begin(&dir) {
+        Ok(hold) => hold,
+        Err(spawning) => return format!("ERR identity in use spawning={spawning}\n"),
+    };
+    held(&dir);
     let tombstone = tombstone_for(root, &name);
-    if let Err(e) = std::fs::rename(&dir, &tombstone) {
-        return format!("ERR identity {name}: {e}\n");
+    // Counted before the rename, so no sweep in this process, another forget's
+    // or the launch's, takes the tombstone while this one empties it.
+    let _emptying = Emptying::begin(&tombstone);
+    let renamed = std::fs::rename(&dir, &tombstone);
+    drop(hold);
+    match renamed {
+        Ok(()) => {}
+        // Gone before the rename (another forget's, or by hand): no identity.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return format!("ERR no such identity {name}\n");
+        }
+        Err(e) => return format!("ERR identity {name}: {e}\n"),
     }
+    sweep_abandoned_tombstones(root, crate::control_auth::pid_alive);
     buried(&tombstone);
     match std::fs::remove_dir_all(&tombstone) {
         Err(e) if std::fs::symlink_metadata(&tombstone).is_ok() => format!(
@@ -774,6 +1189,24 @@ fn forget_reply_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Block until an admission under `dir` waits a forget out
+    /// ([`Holds::waiting`]), for at most a minute: a hang detector, never a
+    /// latency budget. The count is read under the lock the admission's wait
+    /// gives up, so once this returns that admission is parked in its wait.
+    fn until_an_admission_waits(dir: &Path) {
+        let (_holds, waited) = ADMISSION_WAITS
+            .wait_timeout_while(
+                identity_holds(),
+                std::time::Duration::from_secs(60),
+                |holds| holds.get(dir).is_none_or(|held| held.waiting == 0),
+            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !waited.timed_out(),
+            "no admission waited the forget out (a one-minute hang detector)"
+        );
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -878,8 +1311,9 @@ mod tests {
                 assert!(!made, "an inherited admission makes nothing");
                 handed_off += 1;
             })
-            .expect("valid identity"),
-            dir
+            .expect("valid identity")
+            .dir(),
+            dir.as_path()
         );
         assert_eq!(handed_off, 1);
         assert_eq!(
@@ -899,8 +1333,9 @@ mod tests {
                     }
                     handed_off = true;
                 })
-                .expect("our drifted directory can be hardened"),
-                dir
+                .expect("our drifted directory can be hardened")
+                .dir(),
+                dir.as_path()
             );
             assert!(handed_off);
             for path in &dirs {
@@ -962,8 +1397,10 @@ mod tests {
                 handed.push((got.to_path_buf(), made));
             })
         };
-        assert_eq!(admit("Worker").expect("a new named identity is made"), dir);
-        assert_eq!(admit("worker").expect("and admitted again"), dir);
+        let first = admit("Worker").expect("a new named identity is made");
+        assert_eq!(first.dir(), dir.as_path());
+        let again = admit("worker").expect("and admitted again");
+        assert_eq!(again.dir(), dir.as_path());
         assert_eq!(
             handed,
             [(dir.clone(), true), (dir.clone(), false)],
@@ -1011,34 +1448,39 @@ mod tests {
         assert!(!root.exists(), "admission creates no identity tree");
     }
 
-    /// An inherited identity's admission makes nothing at or above its folder:
-    /// an `identities forget` whose rename lands between the admission's
-    /// sighting of the folder and its hardening refuses the spawn in the words
-    /// a missing identity gets, hands off no prime, and leaves the root empty.
-    /// NEGATIVE CONTROL: the hardening this replaced
-    /// (`control_auth::ensure_private_dir` on the folder and each agent subdir)
-    /// at the same point brings the identity back, and the admission then
-    /// admits it and hands its prime off.
+    /// An inherited identity's admission makes nothing at or above its folder.
+    /// This process's `identities forget` cannot take the folder from under
+    /// it: the admission holds the identity, so a forget there is refused as
+    /// in use and the folder stays. A folder that goes anyway between the
+    /// admission's sighting and its hardening (removed by hand, or by another
+    /// aterm's forget) refuses the spawn in the words a missing identity gets,
+    /// hands off no prime, and leaves the root empty. NEGATIVE CONTROL: the
+    /// hardening this replaced (`control_auth::ensure_private_dir` on the
+    /// folder and each agent subdir) at the same point brings the identity
+    /// back, and the admission then admits it and hands its prime off.
     #[test]
-    fn an_inherited_admission_a_forget_overtakes_refuses_and_makes_nothing() {
+    fn an_inherited_admission_whose_folder_goes_refuses_and_makes_nothing() {
         let scratch = aterm_tempfile::tempdir().expect("scratch");
         let root = scratch.path().join("identities");
         let (dir, _) = make_dirs_in(&root, "worker").expect("an identity");
-        let forget = || {
+        let take = || {
             assert_eq!(
                 identities_reply(&root, &[], "forget worker confirm=worker"),
-                format!("OK removed={} left=keychain\n", pct_path(&dir))
+                "ERR identity in use spawning=1\n",
+                "this process's forget is held off"
             );
+            assert!(dir.join(".claude").is_dir(), "and touches nothing");
+            std::fs::remove_dir_all(&dir).expect("taken from outside the process");
         };
         let mut handed_off = false;
         let refused = check_for_spawn_at(
             &root,
             "worker",
             SpawnAdmit::Inherited,
-            |_| forget(),
+            |_| take(),
             |_, _| handed_off = true,
         )
-        .expect_err("forgotten under the admission");
+        .expect_err("its folder went under the admission");
         assert_eq!(refused.kind(), io::ErrorKind::NotFound);
         assert_eq!(refused.to_string(), "no such identity worker");
         assert!(!handed_off, "a refusal hands off no prime");
@@ -1053,7 +1495,7 @@ mod tests {
             "worker",
             SpawnAdmit::Inherited,
             |dir| {
-                forget();
+                take();
                 crate::control_auth::ensure_private_dir(dir).expect("the old hardening");
                 for row in aterm_primer::agent_homes() {
                     crate::control_auth::ensure_private_dir(&dir.join(row.sub))
@@ -1062,11 +1504,14 @@ mod tests {
             },
             |_, _| handed_off = true,
         );
-        assert_eq!(admitted.expect("the old hardening admits it"), dir);
+        assert_eq!(
+            admitted.expect("the old hardening admits it").dir(),
+            dir.as_path()
+        );
         assert!(handed_off, "and hands its prime off");
         assert!(
             dir.join(".claude").is_dir(),
-            "the creating hardening brings the identity back behind the OK"
+            "the creating hardening brings the identity back after it went"
         );
     }
 
@@ -1084,14 +1529,54 @@ mod tests {
         std::fs::remove_dir(dir.join(row.sub)).expect("an empty agent subdir");
         assert_eq!(
             check_for_spawn_in(&root, "worker", SpawnAdmit::Inherited, |_, _| {})
-                .expect("admitted"),
-            dir
+                .expect("admitted")
+                .dir(),
+            dir.as_path()
         );
         let mode = std::fs::metadata(dir.join(row.sub))
             .expect("made")
             .permissions()
             .mode();
         assert_eq!(mode & 0o7777, 0o700, "{}", row.sub);
+    }
+
+    /// An agent subdir that is a symlink to nothing refuses the spawn for what
+    /// it is, not as an identity a forget took: the identity is there, its
+    /// agent folder is no folder. The link is left as it was and nothing is
+    /// made where it points. NEGATIVE CONTROL: a followed `stat` alone, which
+    /// `harden_private_dir` read until 2026-10-18, says `NotFound` for it, the
+    /// word the admission reads as a forgotten identity.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_subdir_linked_to_nothing_is_refused_as_what_it_is() {
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("identities");
+        let (dir, _) = make_dirs_in(&root, "worker").expect("an identity");
+        let row = aterm_primer::agent_homes().next().expect("an agent row");
+        let sub = dir.join(row.sub);
+        let nowhere = scratch.path().join("nowhere");
+        std::fs::remove_dir(&sub).expect("an empty agent subdir");
+        std::os::unix::fs::symlink(&nowhere, &sub).expect("a link to nothing");
+        let mut handed_off = false;
+        let refused = check_for_spawn_in(&root, "worker", SpawnAdmit::Inherited, |_, _| {
+            handed_off = true;
+        })
+        .expect_err("refused");
+        assert_eq!(refused.kind(), io::ErrorKind::NotADirectory);
+        assert_eq!(
+            refused.to_string(),
+            format!("{}: a symlink to nothing", sub.display())
+        );
+        assert!(!handed_off, "a refusal hands off no prime");
+        assert!(
+            std::fs::symlink_metadata(&sub).is_ok_and(|m| m.file_type().is_symlink()),
+            "the link is left as it was"
+        );
+        assert!(!nowhere.exists(), "and nothing is made where it points");
+        assert_eq!(
+            std::fs::metadata(&sub).map(drop).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     /// A named admission's `made` is its own create's answer: a new name is
@@ -1107,6 +1592,8 @@ mod tests {
         let mut admit = || {
             check_for_spawn_in(&root, "worker", SpawnAdmit::Named, |_, m| made.push(m))
                 .expect("admitted")
+                .dir()
+                .to_path_buf()
         };
         let dir = admit();
         admit();
@@ -1119,6 +1606,121 @@ mod tests {
         assert_eq!(made, [true, false, true]);
         assert!(!old_made, "the look before the forget said not made");
         assert!(dir.join(".claude").is_dir(), "and the folder is there");
+    }
+
+    /// A spawn admitted under an identity holds it until its admission drops,
+    /// with the spawn's failure or the session that wears it: a confirmed
+    /// forget meanwhile is refused as in use, counting every such spawn, and
+    /// leaves the folder the child's agent homes name. That holds whichever
+    /// door admitted it: the spawner's, named or inherited, the shell's own
+    /// check ([`admit_existing_in`]), or an adopted shell's label
+    /// ([`hold_adopted_in`]). Once the last one drops the forget goes through.
+    /// NEGATIVE CONTROL: a path handed on without its admission, as the
+    /// admission returned it until 2026-10-18, holds nothing: the same forget
+    /// answers `OK` and the path names nothing.
+    #[test]
+    fn a_spawn_admitted_under_an_identity_holds_off_its_forget() {
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("identities");
+        let forget = || identities_reply(&root, &[], "forget worker confirm=worker");
+        let named = check_for_spawn_in(&root, "worker", SpawnAdmit::Named, |_, _| {})
+            .expect("made and admitted");
+        let dir = named.dir().to_path_buf();
+        let inherited = check_for_spawn_in(&root, "worker", SpawnAdmit::Inherited, |_, _| {})
+            .expect("admitted");
+        let shell = admit_existing_in(&root, "Worker").expect("admitted");
+        assert_eq!(shell.dir(), dir.as_path(), "the name folds");
+        let adopted = hold_adopted_in(&root, "worker").expect("held");
+        assert_eq!(adopted.dir(), dir.as_path());
+        assert_eq!(forget(), "ERR identity in use spawning=4\n");
+        drop(named);
+        drop(inherited);
+        drop(adopted);
+        assert_eq!(forget(), "ERR identity in use spawning=1\n");
+        assert!(dir.join(".claude").is_dir(), "its agent homes stay");
+        drop(shell);
+        assert_eq!(
+            forget(),
+            format!("OK removed={} left=keychain\n", pct_path(&dir))
+        );
+
+        let handed = check_for_spawn_in(&root, "worker", SpawnAdmit::Named, |_, _| {})
+            .expect("made again")
+            .dir()
+            .to_path_buf();
+        assert_eq!(
+            forget(),
+            format!("OK removed={} left=keychain\n", pct_path(&handed))
+        );
+        assert!(!handed.join(".claude").exists(), "it names nothing");
+    }
+
+    /// A confirmed forget holds the identity from its checks until its rename,
+    /// so no spawn arriving in between sights the folder the rename is taking.
+    /// The shell's own check, which never waits, is refused at once as `no such
+    /// identity` while the folder is still there, and an adopted shell's label
+    /// is held by nothing. The spawner's admission, started while the forget
+    /// holds the identity, waits: the forget renames only once that admission
+    /// is parked in its wait ([`until_an_admission_waits`]), and the admission
+    /// then makes the identity anew, empty, and says it made it. One-minute
+    /// hang detectors bound both waits. NEGATIVE CONTROLS: with
+    /// `Admission::begin` counting at once instead of waiting, no admission
+    /// ever waits and the first detector fails the test; and the shell's same
+    /// check once the forget is done is admitted, so its refusal was the
+    /// hold's.
+    #[test]
+    fn a_forget_holds_off_a_spawn_until_its_rename() {
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("identities");
+        let dir = ensure_in(&root, "worker", true).expect("a primed identity");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = forget_reply_in(
+            &root,
+            &[],
+            "worker",
+            Some("worker"),
+            |held| {
+                assert_eq!(held, dir.as_path());
+                assert!(held.join(".claude").is_dir(), "not renamed yet");
+                let refused = admit_existing_in(&root, "worker").expect_err("held");
+                assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+                assert_eq!(refused.to_string(), "no such identity worker");
+                assert!(
+                    hold_adopted_in(&root, "worker").is_none(),
+                    "an adoption holds nothing a forget is taking"
+                );
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut made = None;
+                    let named = check_for_spawn_in(&root, "worker", SpawnAdmit::Named, |_, m| {
+                        made = Some(m);
+                    });
+                    let named = named.map(|admission| admission.dir().to_path_buf());
+                    let _ = tx.send((named.map_err(|e| e.to_string()), made));
+                });
+                until_an_admission_waits(held);
+            },
+            |_| {},
+        );
+        assert_eq!(
+            reply,
+            format!("OK removed={} left=keychain\n", pct_path(&dir))
+        );
+        let (named, made) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the spawner's admission ends (a one-minute hang detector)");
+        assert_eq!(
+            named.as_deref(),
+            Ok(dir.as_path()),
+            "admitted after the rename"
+        );
+        assert_eq!(made, Some(true), "and made anew");
+        assert!(dir.join(".claude").is_dir());
+        assert!(
+            !dir.join(".claude/CLAUDE.md").exists(),
+            "empty: nothing of the forgotten identity came back"
+        );
+        assert!(admit_existing_in(&root, "worker").is_ok(), "unheld again");
     }
 
     #[test]
@@ -1396,15 +1998,22 @@ mod tests {
         let dir = ensure_in(&root, "worker", true).expect("a primed identity");
         let ok = format!("OK removed={} left=keychain\n", pct_path(&dir));
         let mut buried_at = None;
-        let reply = forget_reply_in(&root, &[], "worker", Some("worker"), |tombstone| {
-            assert!(!dir.exists(), "gone by its name once buried");
-            assert!(
-                tombstone.join(".claude/CLAUDE.md").is_file(),
-                "the tombstone holds what the pass wrote before"
-            );
-            prime_dir("worker", &dir);
-            buried_at = Some(tombstone.to_path_buf());
-        });
+        let reply = forget_reply_in(
+            &root,
+            &[],
+            "worker",
+            Some("worker"),
+            |_| {},
+            |tombstone| {
+                assert!(!dir.exists(), "gone by its name once buried");
+                assert!(
+                    tombstone.join(".claude/CLAUDE.md").is_file(),
+                    "the tombstone holds what the pass wrote before"
+                );
+                prime_dir("worker", &dir);
+                buried_at = Some(tombstone.to_path_buf());
+            },
+        );
         assert_eq!(reply, ok);
         assert!(!dir.exists(), "the late writes made nothing");
         assert!(!buried_at.expect("buried").exists(), "the tombstone went");
@@ -1414,9 +2023,16 @@ mod tests {
         );
 
         let dir = ensure_in(&root, "worker", true).expect("made again");
-        let reply = forget_reply_in(&root, &[], "worker", Some("worker"), |_| {
-            ensure_in(&root, "worker", true).expect("the old pass makes its folders");
-        });
+        let reply = forget_reply_in(
+            &root,
+            &[],
+            "worker",
+            Some("worker"),
+            |_| {},
+            |_| {
+                ensure_in(&root, "worker", true).expect("the old pass makes its folders");
+            },
+        );
         assert_eq!(reply, ok);
         assert!(
             dir.join(".claude/CLAUDE.md").is_file(),
@@ -1453,18 +2069,16 @@ mod tests {
 
     /// A tombstone the removal cannot take leaves the identity gone all the
     /// same: the reply says so and names the tombstone and why it stayed, and
-    /// no reader sees an identity there (it is no name). The next forget, of
-    /// any identity, sweeps it. The fixture is a folder whose own mode lacks
-    /// write, so its entries cannot be unlinked, except by root, which the
-    /// mode does not stop: as root there is no fixture and nothing to check.
+    /// no reader sees an identity there (it is no name). The next forget in
+    /// this process, of any identity, sweeps it. The fixture is a folder whose
+    /// own mode lacks write, so its entries cannot be unlinked, except by root,
+    /// which the mode does not stop: as root there is no fixture, and the test
+    /// ends COULD NOT RUN.
     #[cfg(unix)]
     #[test]
     fn a_tombstone_forget_cannot_remove_is_named_and_swept_by_the_next_forget() {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: `geteuid` has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
+        aterm_uds::host::could_not_run_as_root("a folder whose mode lacks write");
         let scratch = aterm_tempfile::tempdir().expect("scratch");
         let root = scratch.path().join("identities");
         let dir = ensure_in(&root, "worker", true).expect("a primed identity");
@@ -1513,6 +2127,56 @@ mod tests {
             std::fs::read_dir(&root).unwrap().next().is_none(),
             "the next forget swept the tombstone"
         );
+    }
+
+    /// A sweep, a forget's or the launch's, takes only the tombstones no forget
+    /// may still be emptying: one a forget of this process left, once no forget
+    /// is emptying it, and a dead process's. One a forget of this process is
+    /// emptying, a live process's (its forget may be emptying it), a dot-name
+    /// that is no tombstone of a forget's, and an identity all stay. The pid is
+    /// read from the name the forget gives ([`tombstone_for`]), a name with
+    /// dashes included. NEGATIVE CONTROL: a forget's sweep until 2026-10-18,
+    /// every tombstone but its own, takes the one another forget is emptying,
+    /// the live one's and the dot-name too, and still no identity.
+    #[test]
+    fn a_sweep_takes_only_tombstones_no_forget_may_be_emptying() {
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let root = scratch.path().join("identities");
+        let (worker, _) = make_dirs_in(&root, "worker").expect("an identity");
+        let own = std::process::id();
+        let (live, dead) = (own.wrapping_add(1), own.wrapping_add(2));
+        let named = tombstone_for(&root, "my-worker.2");
+        let named = named.file_name().and_then(|n| n.to_str()).expect("a name");
+        assert_eq!(tombstone_pid(named), Some(own));
+        let tombstone = |name: String| {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.join(".claude")).expect("a tombstone");
+            std::fs::write(path.join(".claude/.credentials.json"), b"{}").expect("a login");
+            path
+        };
+        let left = tombstone(format!(".forgotten-worker-{own}-0"));
+        let ours = tombstone(format!(".forgotten-worker-{own}-1"));
+        let theirs = tombstone(format!(".forgotten-worker-{live}-0"));
+        let gone = tombstone(format!(".forgotten-old-name-{dead}-7"));
+        let odd = tombstone(".forgotten-notes".to_string());
+        let emptying = Emptying::begin(&ours);
+        sweep_abandoned_tombstones(&root, |pid| pid == live);
+        assert!(!left.exists(), "one a forget of ours left goes");
+        assert!(!gone.exists(), "a dead process's goes");
+        for stays in [&ours, &theirs, &odd, &worker] {
+            assert!(stays.exists(), "{} stays", stays.display());
+        }
+        drop(emptying);
+        sweep_abandoned_tombstones(&root, |pid| pid == live);
+        assert!(!ours.exists(), "once its forget is done with it, it goes");
+        assert!(theirs.exists() && odd.exists());
+
+        let ours = tombstone(format!(".forgotten-worker-{own}-2"));
+        let _emptying = Emptying::begin(&ours);
+        let its_own = tombstone_for(&root, "other");
+        sweep_tombstones(&root, |n| root.join(n) != its_own);
+        assert!(!ours.exists() && !theirs.exists() && !odd.exists());
+        assert!(worker.join(".claude").is_dir(), "nor an identity");
     }
 
     /// Junk is usage, and so is a name the grammar refuses, so `..` and a path
@@ -1622,6 +2286,38 @@ mod tests {
         let real = ensure_in(&root, "real", true).unwrap();
         assert!(identities_reply(&root, &[], "real").starts_with("OK 3\nreal dir="));
         assert_eq!(ensure_in(&root, "real", false).unwrap(), real);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// THE IDENTITIES' FOLDER IS READ ONLY ONCE ITS VOLUME ANSWERED: a root
+    /// whose volume did not answer is refused by name (`TimedOut`, "did not
+    /// answer"), and the volume is all that is asked of it — nothing under it
+    /// is looked at, made or listed — so a spawn's admission, a restore's
+    /// check, the picker's roster and the `identities` verb end at once
+    /// instead of waiting on it. A root that answered is the root; none at all
+    /// is still `NotFound`. NEGATIVE CONTROL: a gate that does not ask the
+    /// volume hands the silent root on.
+    #[test]
+    fn an_identities_folder_whose_volume_did_not_answer_is_refused_by_name() {
+        let root = scratch("silent").join("identities");
+        let asked = std::cell::Cell::new(None);
+        let refused = answering(Some(root.clone()), |at| {
+            asked.set(Some(at.to_path_buf()));
+            false
+        })
+        .expect_err("a silent volume is refused");
+        assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            refused.to_string(),
+            format!("{} did not answer", root.display())
+        );
+        assert_eq!(asked.take(), Some(root.clone()), "the volume was asked");
+        assert!(!root.exists(), "nothing under it was made");
+        assert_eq!(answering(Some(root.clone()), |_| true).unwrap(), root);
+        assert_eq!(
+            answering(None, |_| true).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }

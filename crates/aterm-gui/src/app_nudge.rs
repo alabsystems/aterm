@@ -886,18 +886,14 @@ impl NudgeWorld for AppWorld<'_> {
         let Ok(term) = s.term.try_lock() else { return };
         let probe = crate::resize_ledger::EngineProbe::sample(&term);
         drop(term);
-        let moved = s
+        // A verdict that moved is recorded, and the record wakes the session's
+        // watchers.
+        let _ = s
             .ctx
             .timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .evaluate_resizes(probe, crate::turn_ledger::now_ms());
-        if moved && app.subscribers.any() {
-            app.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(session);
-        }
     }
 
     fn give_up(&mut self, session: u64, epoch: u64, why: GiveUp) {

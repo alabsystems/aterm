@@ -43,6 +43,22 @@ pub const TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 /// The reader. `-readonly` so a probe can never write the database.
 pub const SQLITE3: &str = "/usr/bin/sqlite3";
 
+/// The database as the reader opens it: [`TCC_DB`] as an IMMUTABLE URI
+/// (`aterm_uds::foreign_db::immutable_uri`), so sqlite3 takes no lock on tccd's live file.
+/// tccd writes it in rollback-journal mode with no busy timeout, and a reader's `SHARED`
+/// lock that its `COMMIT` meets fails that `COMMIT` and loses the write (measured,
+/// `docs/measured/real-claude-lab-2026-10-15.md`, 2026-10-20). One command over SSH has no
+/// look at the file before and after it (the guard of the local read,
+/// `aterm_uds::foreign_db::read`), so a read that meets one of tccd's writes (a single row,
+/// rare) can answer rows of either side of it or fail (`Unusable`); the probe is one look the
+/// controller takes again, and either answer leaves the step to the person or done. A session
+/// without Full Disk Access is refused it as it is the path (`... authorization denied`, exit
+/// 1, measured).
+#[must_use]
+pub fn tcc_target() -> String {
+    aterm_uds::foreign_db::immutable_uri(std::path::Path::new(TCC_DB))
+}
+
 /// launchd's control tool.
 pub const LAUNCHCTL: &str = "/bin/launchctl";
 
@@ -355,7 +371,7 @@ pub const SQLITE3_OPTIONS: [&str; 11] = [
 pub fn tcc_cmd(clients: &[&str]) -> Cmd {
     Cmd::new(SQLITE3)
         .args(SQLITE3_OPTIONS)
-        .arg(TCC_DB)
+        .arg(tcc_target())
         .arg(tcc_query(clients))
         .budget(READ_BUDGET)
 }
@@ -365,7 +381,7 @@ pub fn tcc_cmd(clients: &[&str]) -> Cmd {
 pub fn tcc_open_cmd() -> Cmd {
     Cmd::new(SQLITE3)
         .args(SQLITE3_OPTIONS)
-        .args([TCC_DB, "select count(*) from access"])
+        .args([tcc_target().as_str(), "select count(*) from access"])
         .budget(READ_BUDGET)
 }
 
@@ -378,8 +394,8 @@ pub fn print_disabled_cmd() -> Cmd {
 }
 
 /// Why the database did not answer: [`NEEDS_REMOTE_FDA`] when TCC refused this session
-/// (`Error: unable to open database "…": authorization denied`, exit 1), else what the tool
-/// said. Only `authorization denied` is that refusal: every open failure starts `unable to
+/// (`Error: unable to open database "file:…?immutable=1": authorization denied`, exit 1), else
+/// what the tool said. Only `authorization denied` is that refusal: every open failure starts `unable to
 /// open database`, and a missing or unreadable file (`…: unable to open database file`,
 /// measured on a path that does not exist) says nothing about the switch.
 fn tcc_refusal(ran: &Ran) -> String {
@@ -682,7 +698,7 @@ mod tests {
 
     /// sqlite3's refusal from a session without Full Disk Access (measured on a Mac whose
     /// terminal lacks it), exit 1.
-    const TCC_DENIED: &str = "Error: unable to open database \"/Library/Application Support/com.apple.TCC/TCC.db\": authorization denied\n";
+    const TCC_DENIED: &str = "Error: unable to open database \"file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1\": authorization denied\n";
 
     fn ctx() -> Ctx {
         Ctx {
@@ -721,9 +737,81 @@ mod tests {
         assert_eq!(
             key(&["com.aterm.aterm"]),
             "/usr/bin/sqlite3 -init /dev/null -readonly -safe -nofollow -batch -bail -noheader \
-             -list -separator '|' '/Library/Application Support/com.apple.TCC/TCC.db' \
+             -list -separator '|' \
+             'file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1' \
              'select client,service,auth_value from access where client in ('\\''com.aterm.aterm'\\'')'"
         );
+        assert_eq!(
+            tcc_open_cmd().display(),
+            "/usr/bin/sqlite3 -init /dev/null -readonly -safe -nofollow -batch -bail -noheader \
+             -list -separator '|' \
+             'file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1' \
+             'select count(*) from access'"
+        );
+    }
+
+    /// THE READ TAKES NO LOCK ON tccd's FILE (macOS: Apple's `/usr/bin/sqlite3`): the
+    /// options every TCC read passes, over a scratch database's immutable URI, answer its rows
+    /// while the lock a committing writer holds is taken (`EXCLUSIVE`: `PENDING_BYTE` and
+    /// the 511 bytes after it). NEGATIVE CONTROL: the same options over the file's path meet
+    /// that lock (`database is locked`): that reader held `SHARED`, the lock that fails the
+    /// `COMMIT` of a writer with no busy timeout, as tccd is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_tcc_read_takes_no_lock_a_writer_would_meet() {
+        use std::os::fd::AsRawFd as _;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let db = std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join("TCC.db");
+        let sqlite = |target: &str, sql: &str| {
+            aterm_uds::spawnfd::command(SQLITE3)
+                .args(SQLITE3_OPTIONS)
+                .arg(target)
+                .arg(sql)
+                .output()
+                .expect("sqlite3")
+        };
+        let made = aterm_uds::spawnfd::command(SQLITE3)
+            .arg(&db)
+            .arg(
+                "CREATE TABLE access (service TEXT, client TEXT, auth_value INTEGER); \
+                 INSERT INTO access VALUES ('kTCCServiceDeveloperTool', 'com.aterm.aterm', 2);",
+            )
+            .output()
+            .expect("made");
+        assert!(made.status.success(), "{made:?}");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db)
+            .expect("open to lock");
+        // SAFETY: a zeroed `flock` is a valid value of the plain C struct.
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = libc::F_WRLCK as _;
+        fl.l_whence = libc::SEEK_SET as _;
+        fl.l_start = 0x4000_0000;
+        fl.l_len = 512;
+        // SAFETY: `fl` is valid for the call and the descriptor is open.
+        let rc = unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETLK, &raw const fl) };
+        assert_eq!(rc, 0, "the writer's lock is taken");
+        let query = tcc_query(&["com.aterm.aterm"]);
+        let control = sqlite(&db.to_string_lossy(), &query);
+        assert!(
+            String::from_utf8_lossy(&control.stderr).contains("database is locked"),
+            "{control:?}"
+        );
+        let read = sqlite(&aterm_uds::foreign_db::immutable_uri(&db), &query);
+        assert!(read.status.success(), "{read:?}");
+        assert_eq!(
+            parse_tcc(&String::from_utf8_lossy(&read.stdout)),
+            Ok(vec![TccRow {
+                client: "com.aterm.aterm".into(),
+                service: "kTCCServiceDeveloperTool".into(),
+                auth_value: 2,
+            }])
+        );
+        drop(held);
     }
 
     #[test]
@@ -732,7 +820,7 @@ mod tests {
         // refuse anything, so the switch is unmeasured.
         let gone = Ran::exit(
             1,
-            "Error: unable to open database \"/Library/Application Support/com.apple.TCC/TCC.db\": unable to open database file\n",
+            "Error: unable to open database \"file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1\": unable to open database file\n",
         );
         let sys = Fake::root();
         sys.on(&tcc_open_cmd().display(), gone.clone());

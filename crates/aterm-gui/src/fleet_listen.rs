@@ -57,9 +57,13 @@
 //! serving — every connection cut, the old secret's included — and the
 //! generation reads it again and binds once it is usable: a machine that
 //! left the fleet, or rotated its secret after a member was lost, serves the
-//! old secret no longer than that. So is the node key the listener proves to
-//! each dialer (`<state>/fleet-node-key`, which `aterm fleet init|join`
-//! mint): one that came, changed or went is proved from the next binding.
+//! old secret no longer than that. So is the node the listener proves to
+//! each dialer — its id (`<state>/fleet-node`) and its key
+//! (`<state>/fleet-node-key`), which `aterm fleet init|join` mint: one that
+//! came, changed or went is proved from the next binding. The id too, since
+//! a survey's header names the node file as it is now, and a reader refuses
+//! a reply whose header names another node than the one its connection
+//! proved (`aterm_net::fleet_member::Unreached::Misnamed`).
 //!
 //! `status` says which of these holds ([`fleet_status_word`]).
 
@@ -80,6 +84,25 @@ use crate::app_config::FleetConfig;
 /// How often a bind refused `EADDRINUSE` or `EADDRNOTAVAIL`, or a key that
 /// cannot be used, is tried again, and how often a served key is read again.
 pub(crate) const RETRY: Duration = Duration::from_secs(2);
+
+/// The development seam that sets [`retry`] in milliseconds.
+const RETRY_SEAM: &str = "ATERM_DEBUG_FLEET_RETRY_MS";
+
+/// [`RETRY`] as this process runs it, read once: the constant, unless a
+/// development build (`aterm_types::dev_seam!`, which a shipped binary never
+/// compiles) starts with [`RETRY_SEAM`] set to a positive whole number of
+/// milliseconds. For the live suite (`crates/aterm/tests/fleet_live_headless.rs`),
+/// whose port and key changes are about what the listener does at its next
+/// try, not how long it waits for it: each waited out up to a whole 2 s.
+fn retry() -> Duration {
+    static EVERY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        aterm_types::dev_seam!(RETRY_SEAM)
+            .and_then(|v| v.to_str()?.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map_or(RETRY, Duration::from_millis)
+    })
+}
 
 /// The most fleet connections in flight at once, handshaking or served: at
 /// most [`aterm_net::fleet::MAX_SLOTS`] (16; a fleet of thirty reads a machine
@@ -381,8 +404,8 @@ fn serve_fleet_port(
                     generation,
                     Standing::Refused(error.word()),
                     &format!(
-                        "fleet listener not started: {error}; read again every {}s",
-                        RETRY.as_secs()
+                        "fleet listener not started: {error}; read again every {:?}",
+                        retry()
                     ),
                 );
                 if wait_fleet_unchanged(generation) {
@@ -408,8 +431,8 @@ fn serve_fleet_port(
                     generation,
                     Standing::Retrying,
                     &format!(
-                        "fleet listener: {addr} {why}; tried again every {}s",
-                        RETRY.as_secs()
+                        "fleet listener: {addr} {why}; tried again every {:?}",
+                        retry()
                     ),
                 );
                 if wait_fleet_unchanged(generation) {
@@ -436,8 +459,10 @@ fn serve_fleet_port(
             .spawn({
                 let (running, rekeyed, secret) =
                     (Arc::clone(&running), Arc::clone(&rekeyed), secret.clone());
-                let node_key = node.as_ref().map(aterm_net::fleet::NodeIdentity::key);
-                move || watch_fleet_key(generation, &running, &rekeyed, (&secret, node_key))
+                let proved = node
+                    .as_ref()
+                    .map(|node| (node.node().to_owned(), node.key()));
+                move || watch_fleet_key(generation, &running, &rekeyed, (&secret, proved))
             });
         if let Err(error) = watching {
             // Fail closed: a key nobody watches could outlive its removal.
@@ -806,32 +831,33 @@ fn read_node_key() -> Option<aterm_net::fleet::NodeIdentity> {
     }
 }
 
-/// While `generation` serves `secret` and proves the node key `node_key`,
-/// read both again every [`RETRY`]: a fleet key that changed, went or is no
-/// longer private, or a node key that came, changed or went, sets `rekeyed`
-/// and clears `running`, which stops the serving and cuts its connections.
-/// Ends when the generation is no longer current or `running` is cleared.
+/// While `generation` serves `secret` and proves the node `proved` (its id
+/// and key), read them again every [`RETRY`]: a fleet key that changed, went
+/// or is no longer private, or a node id or key that came, changed or went,
+/// sets `rekeyed` and clears `running`, which stops the serving and cuts its
+/// connections. Ends when the generation is no longer current or `running`
+/// is cleared.
 #[cfg(unix)]
 fn watch_fleet_key(
     generation: u64,
     running: &AtomicBool,
     rekeyed: &AtomicBool,
-    (secret, node_key): (
+    (secret, proved): (
         &aterm_net::fleet::FleetSecret,
-        Option<aterm_net::fleet::NodeKey>,
+        Option<(String, aterm_net::fleet::NodeKey)>,
     ),
 ) {
     use aterm_net::fleet::KEY_FILE;
-    use aterm_net::fleet_member::{NODE_KEY_FILE, read_node_identity};
-    let node_key_now = || {
+    use aterm_net::fleet_member::{NODE_FILE, NODE_KEY_FILE, read_node_identity};
+    let node_now = || {
         aterm_types::dirs::state_dir()
             .and_then(|dir| read_node_identity(&dir).ok().flatten())
-            .map(|node| node.key())
+            .map(|node| (node.node().to_owned(), node.key()))
     };
     while wait_fleet_unchanged(generation) && running.load(Ordering::Acquire) {
         let why = match read_fleet_key() {
-            Ok(now) if now == *secret && node_key_now() == node_key => continue,
-            Ok(now) if now == *secret => format!("{NODE_KEY_FILE} changed"),
+            Ok(now) if now == *secret && node_now() == proved => continue,
+            Ok(now) if now == *secret => format!("{NODE_FILE} or {NODE_KEY_FILE} changed"),
             Ok(_) => format!("{KEY_FILE} changed"),
             Err(error) => error.to_string(),
         };
@@ -845,11 +871,11 @@ fn watch_fleet_key(
     }
 }
 
-/// Wait out one [`RETRY`]; `true` when `generation` is still the current one.
+/// Wait out one [`retry`]; `true` when `generation` is still the current one.
 fn wait_fleet_unchanged(generation: u64) -> bool {
     let desk = FLEET_DESK.lock_or_recover();
     let (desk, _) = FLEET_CHANGED
-        .wait_timeout_while(desk, RETRY, |desk| desk.generation == generation)
+        .wait_timeout_while(desk, retry(), |desk| desk.generation == generation)
         .unwrap_or_else(PoisonError::into_inner);
     desk.generation == generation
 }

@@ -32,7 +32,14 @@
 //! lane exec's the new build in place, keeping the pid and birth; its row records the
 //! image it replaced as handed off, never the run before a second time. Test, dev,
 //! headless and translocated starts share the log directory and are SIGKILLed by
-//! harnesses routinely; they write nothing.
+//! harnesses routinely; they write nothing there (a development build under
+//! [`LEDGER_SEAM`] writes its cold start's row into the seam's own folder, for a live
+//! test to read). A LAB DESK ([`crate::crash_signal::Arming::Lab`]: a headless instance
+//! under the lab's desk seam, under a private state root) writes in its own log
+//! directory, which is that root's, and tells its node log, so `prev_end=` is real end
+//! to end (session log Phase 6, step 6C-4, ruling U9); its markers are
+//! [`crate::crash_signal::MarkerOwner::Lab`]'s, news to its own root's scan alone
+//! ([`cold_census`]).
 //!
 //! Blind spots: a run whose marker was never created (no private log dir) reads as
 //! clean, as does a killed run whose consumed marker the crash scans pruned before an
@@ -48,8 +55,8 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use aterm_update::recovery_ledger::{
-    EndClass, LaunchKind, Pressure, PrevRun, Restores, Row, Tri, Uptime, append_row, ledger_path,
-    read_rows,
+    EndClass, KeeperAtLaunch, LaunchKind, Pressure, PrevRun, Restores, Row, Tri, Uptime,
+    append_row, ledger_path, read_rows,
 };
 
 /// The final exit's log line (lib.rs `main_entry`), which dates a clean quit.
@@ -141,25 +148,102 @@ fn now_secs() -> u64 {
 /// to [`MAX_LOG_BYTES`], and nothing on the launch path waits for it. Call after the
 /// crash scans, whose renames it reads. A no-op without a private log directory.
 /// `restores`: how this launch's keeper recovery brought its screens back, when it
-/// recovered any (the crash restore's rungs), recorded on the row.
-pub(crate) fn record(launch: LaunchKind, restores: Option<Restores>) {
+/// recovered any (the crash restore's rungs), recorded on the row. `keeper`: the launch's keeper
+/// link (`keeper=`), which the crash restore's soak reads (`aterm_update::restore_soak`).
+pub(crate) fn record(launch: LaunchKind, restores: Option<Restores>, keeper: KeeperAtLaunch) {
     record_into(
-        crate::session_log_node::node_log(),
+        Some(crate::session_log_node::node_log()),
         crate::logging::log_dir,
         launch,
         restores,
+        keeper,
     );
 }
 
-/// [`record`], reading the ledger in the directory `dir` names (on the
-/// census thread) and telling `node` how the previous run ended: the node
-/// log's `start prev_end=` (session log 5J-2), amended as soon as the class
-/// is known, whether or not the row then appends.
-fn record_into(
+/// The census's development seam ([`aterm_types::dev_seam!`]): a folder in which a launch
+/// that writes no row of its own (a dev or test build, a headless instance) writes the row
+/// its cold start would, with nothing else of the census's (the node log is not told). A
+/// live test reads it there: the boot's `keeper=` and the recovery's `restored=`, which
+/// `main_entry` hands the census and no unit test reaches.
+pub(crate) const LEDGER_SEAM: &str = "ATERM_DEBUG_RECOVERY_LEDGER";
+
+/// Where a cold start's census row goes ([`cold_census`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ColdCensus {
+    /// The launch's own log directory, the node log told (`start prev_end=`): the
+    /// installed app's windowed start, and a lab desk's, whose log directory is its
+    /// private state root's.
+    Own,
+    /// The [`LEDGER_SEAM`]'s folder alone, the node log not told.
+    Seam(PathBuf),
+    /// No row: a test, dev or plain headless start, whose log directory is the daily
+    /// driver's to read (it keeps `prev_end=-`), and an update candidate, which writes
+    /// at its Commit.
+    Off,
+}
+
+/// THE CENSUS GATE of a cold start armed as `arming`: [`ColdCensus::Own`] for the
+/// installed app ([`Arming::App`](crate::crash_signal::Arming::App)) and a lab desk
+/// ([`Arming::Lab`](crate::crash_signal::Arming::Lab), session log 6C-4); else the
+/// development seam's folder when `seam` names one; else [`ColdCensus::Off`].
+pub(crate) fn cold_census(
+    arming: crate::crash_signal::Arming,
+    seam: Option<&std::ffi::OsStr>,
+) -> ColdCensus {
+    use crate::crash_signal::Arming;
+    match arming {
+        Arming::App | Arming::Lab => ColdCensus::Own,
+        Arming::Other | Arming::AppAfterCommit => match seam.filter(|dir| !dir.is_empty()) {
+            Some(dir) => ColdCensus::Seam(PathBuf::from(dir)),
+            None => ColdCensus::Off,
+        },
+    }
+}
+
+/// A cold start's row, as [`cold_census`] gates a launch armed as `arming`.
+pub(crate) fn record_cold(
+    arming: crate::crash_signal::Arming,
+    restores: Option<Restores>,
+    keeper: KeeperAtLaunch,
+) {
+    record_cold_into(
+        crate::session_log_node::node_log(),
+        crate::logging::log_dir,
+        &cold_census(arming, aterm_types::dev_seam!(LEDGER_SEAM).as_deref()),
+        restores,
+        keeper,
+    );
+}
+
+/// [`record_cold`] with the node log and the log directory given: `census` says
+/// which ledger, if any, takes the row.
+fn record_cold_into(
     node: &'static crate::session_log_node::NodeLogHost,
+    own_dir: impl FnOnce() -> Option<PathBuf> + Send + 'static,
+    census: &ColdCensus,
+    restores: Option<Restores>,
+    keeper: KeeperAtLaunch,
+) {
+    match census {
+        ColdCensus::Own => record_into(Some(node), own_dir, LaunchKind::Cold, restores, keeper),
+        ColdCensus::Seam(dir) => {
+            let dir = dir.clone();
+            record_into(None, move || Some(dir), LaunchKind::Cold, restores, keeper);
+        }
+        ColdCensus::Off => {}
+    }
+}
+
+/// [`record`], reading the ledger in the directory `dir` names (on the
+/// census thread) and telling `node`, when given, how the previous run ended:
+/// the node log's `start prev_end=` (session log 5J-2), amended as soon as the
+/// class is known, whether or not the row then appends.
+fn record_into(
+    node: Option<&'static crate::session_log_node::NodeLogHost>,
     dir: impl FnOnce() -> Option<PathBuf> + Send + 'static,
     launch: LaunchKind,
     restores: Option<Restores>,
+    keeper: KeeperAtLaunch,
 ) {
     let spawned = crate::qos::spawn_lane_thread(
         "aterm-recovery-census",
@@ -170,7 +254,10 @@ fn record_into(
                 return;
             };
             let mut row = census_row(&dir, &Me::current(), launch, now_secs(), &System);
-            node.note_prev_end(row.prev.class);
+            if let Some(node) = node {
+                node.note_prev_end(row.prev.class);
+            }
+            row.keeper = Some(keeper);
             row.restores = restores;
             let path = ledger_path(&dir);
             match append_row(&path, &row) {
@@ -224,6 +311,7 @@ pub(crate) fn census_row(
         version: me.version.clone(),
         launch,
         prev,
+        keeper: None,
         restores: None,
     }
 }
@@ -679,6 +767,7 @@ mod tests {
             version: "0.93.0".into(),
             launch: LaunchKind::Cold,
             prev: PrevRun::none(),
+            keeper: None,
             restores: None,
         };
         append_row(&ledger_path(s.0.path()), &previous).expect("seed the ledger");
@@ -704,7 +793,13 @@ mod tests {
             crate::session_log_node::NodeLogHost::started(7, clock),
         ));
         let dir = s.0.path().to_path_buf();
-        record_into(node, move || Some(dir), LaunchKind::Cold, None);
+        record_into(
+            Some(node),
+            move || Some(dir),
+            LaunchKind::Cold,
+            None,
+            KeeperAtLaunch::On,
+        );
         let amended = aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the census's prev_end in the node log",
@@ -718,10 +813,180 @@ mod tests {
             amended.starts_with("2 amend n start prev_end=none by=aterm src=aterm conf=exact "),
             "{amended}"
         );
-        // The row follows: the scratch dir outlives the thread's write.
-        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the census's row", || {
-            (read_rows(&ledger_path(s.0.path())).len() == 1).then_some(())
-        });
+        // The row follows, with the launch's keeper link: the scratch dir outlives the
+        // thread's write.
+        let rows = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the census's row",
+            || Some(read_rows(&ledger_path(s.0.path()))).filter(|rows| rows.len() == 1),
+        );
+        assert_eq!(rows[0].keeper, Some(KeeperAtLaunch::On));
+    }
+
+    /// A dead, empty marker of `owner` for the run the ledger names (pid 4242, born at
+    /// [`BORN`], whose lines say it started and never that it quit), swept by a launch
+    /// whose own marker is `scan`'s and, for a lab desk, consumed by its kill scan, as
+    /// the launch runs both before its census. Answers whether the marker was left for
+    /// the census, and the census's row.
+    fn swept_then_counted(
+        owner: crate::crash_signal::MarkerOwner,
+        scan: crate::crash_signal::MarkerOwner,
+    ) -> (bool, Row) {
+        use crate::crash_signal::{MarkerOwner, markers};
+        let s = Scratch::new("lab-desk");
+        with_previous(&s);
+        s.log(&[
+            (BORN + 1, 4242, "watchdog armed"),
+            (BORN + 70, 4242, "idle"),
+        ]);
+        let marker = s.file(
+            &markers::file_name(4242, u128::from(BORN) * 1_000_000_000 + 7, owner),
+            "",
+        );
+        let swept = markers::sweep(s.0.path(), 5000, scan);
+        let kept = marker.exists();
+        assert_eq!(swept.is_empty(), kept, "the sweep answers what it removed");
+        assert!(
+            markers::dead_app_markers(s.0.path(), 5000).is_empty(),
+            "no windowed launch's kill scan ever reports it"
+        );
+        if scan == MarkerOwner::Lab {
+            let consumed =
+                crate::logging::consume_dead_markers(s.0.path(), 5000, None, MarkerOwner::Lab);
+            assert_eq!(consumed.is_some(), kept, "the lab desk's kill scan");
+        }
+        let row = census_row(
+            s.0.path(),
+            &me(5000),
+            LaunchKind::Cold,
+            BORN + 5000,
+            &NOBODY,
+        );
+        (kept, row)
+    }
+
+    /// THE LAB DESK'S CENSUS (session log Phase 6, step 6C-4, ruling U9), in process
+    /// over an injected marker directory: a dead `lab` marker under a lab desk's sweep
+    /// is left for the census, and the run reads `killed`; the same marker under the
+    /// installed app's sweep, or a plain start's, is not news and goes, as a dead
+    /// `other` marker under a lab desk's sweep does (the control: a test's start does
+    /// not fool the census), and each of those runs reads `clean`, bounded by its last
+    /// line. NEGATIVE CONTROL (scratch revert): `MarkerOwner::is_news_to` reading a
+    /// `lab` marker as an `other` one sweeps it, and the lab case reads `clean`.
+    #[test]
+    fn a_lab_desks_census_reads_its_killed_run_and_no_other_start_fools_it() {
+        use crate::crash_signal::MarkerOwner::{App, Lab, Other};
+        for (owner, scan, kept, class) in [
+            (Lab, Lab, true, EndClass::Killed),
+            (Other, Lab, false, EndClass::Clean),
+            (Lab, App, false, EndClass::Clean),
+            (Lab, Other, false, EndClass::Clean),
+        ] {
+            let (left, row) = swept_then_counted(owner, scan);
+            assert_eq!(left, kept, "{owner:?} under a {scan:?} sweep");
+            assert_eq!(
+                row.prev.class, class,
+                "{owner:?} under a {scan:?} sweep: {row:?}"
+            );
+            assert_eq!(row.prev.pid, Some(4242));
+        }
+    }
+
+    /// THE CENSUS GATE (6C-4): on for the installed app and for a lab desk, which read
+    /// and append their own log directory's ledger and tell the node log; off for a
+    /// plain headless start (its log directory is the daily driver's), whose node log
+    /// keeps `prev_end=-`; the seam's folder alone for a dev start under the ledger
+    /// seam. A lab desk's census amends its node log's start with the killed run its
+    /// kill scan consumed (a one-minute hang detector), and appends its row.
+    /// NEGATIVE CONTROL (scratch revert): the gate flipped, a lab desk `Off`, fails the
+    /// first assertion.
+    #[test]
+    fn the_census_gate_is_on_for_a_lab_desk_and_off_for_a_plain_headless_one() {
+        use crate::crash_signal::{Arming, MarkerOwner, markers};
+        let lab = Arming::for_launch(false, true, false, true);
+        let plain = Arming::for_launch(false, true, false, false);
+        assert_eq!(cold_census(lab, None), ColdCensus::Own, "a lab desk");
+        assert_eq!(cold_census(plain, None), ColdCensus::Off, "plain headless");
+        assert_eq!((lab, plain), (Arming::Lab, Arming::Other));
+        assert_eq!(cold_census(Arming::App, None), ColdCensus::Own);
+        assert_eq!(cold_census(Arming::AppAfterCommit, None), ColdCensus::Off);
+        assert_eq!(
+            cold_census(plain, Some(std::ffi::OsStr::new("/private/tmp/x"))),
+            ColdCensus::Seam(PathBuf::from("/private/tmp/x"))
+        );
+        assert_eq!(
+            cold_census(plain, Some(std::ffi::OsStr::new(""))),
+            ColdCensus::Off
+        );
+
+        let s = Scratch::new("gate");
+        with_previous(&s);
+        s.log(&[(BORN + 1, 4242, "watchdog armed")]);
+        s.file(
+            &markers::file_name(4242, u128::from(BORN) * 1_000_000_000 + 7, MarkerOwner::Lab),
+            "",
+        );
+        let started = |ep| -> &'static crate::session_log_node::NodeLogHost {
+            let clock =
+                crate::session_log::Clock::reading(|| aterm_slog::Stamp::new(1_760_000_000_000, 5));
+            Box::leak(Box::new(crate::session_log_node::NodeLogHost::started(
+                ep, clock,
+            )))
+        };
+        // The plain headless desk: no census at all (no thread to wait for), so
+        // its start stays `prev_end=-` and the ledger is untouched.
+        let plain_node = started(8);
+        let dir = s.0.path().to_path_buf();
+        record_cold_into(
+            plain_node,
+            move || Some(dir),
+            &cold_census(plain, None),
+            None,
+            KeeperAtLaunch::Off,
+        );
+        let lines = plain_node.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("1 open n start prev_end=- "),
+            "{lines:?}"
+        );
+        assert_eq!(read_rows(&ledger_path(s.0.path())).len(), 1);
+
+        // The lab desk: its kill scan consumes the marker, and its census tells the
+        // node log that the run before it was killed.
+        assert!(
+            crate::logging::consume_dead_markers(s.0.path(), 5000, None, MarkerOwner::Lab)
+                .is_some()
+        );
+        let lab_node = started(9);
+        let dir = s.0.path().to_path_buf();
+        record_cold_into(
+            lab_node,
+            move || Some(dir),
+            &cold_census(lab, None),
+            None,
+            KeeperAtLaunch::Off,
+        );
+        let amended = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the lab census's prev_end in the node log",
+            || {
+                lab_node
+                    .lines()
+                    .into_iter()
+                    .find(|l| l.contains(" amend n start "))
+            },
+        );
+        assert!(
+            amended.starts_with("2 amend n start prev_end=killed by=aterm "),
+            "{amended}"
+        );
+        let rows = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the lab census's row",
+            || Some(read_rows(&ledger_path(s.0.path()))).filter(|rows| rows.len() == 2),
+        );
+        assert_eq!(rows[1].prev.class, EndClass::Killed);
     }
 
     #[test]

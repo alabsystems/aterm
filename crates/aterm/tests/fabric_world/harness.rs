@@ -24,11 +24,36 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use astream_broker::{Broker, BrokerHandle, Client, Durability};
+use astream_broker::{Broker, BrokerHandle, Client, OpenOptions, Prepared};
 use aterm_link::ctl::{Ctl, Reply};
 
-/// The mint secret every test's broker is guarded with.
-pub const SECRET: &[u8] = b"a3-bridge-e2e-secret";
+/// The mint secret every test's broker is guarded with. Thirty-two bytes, a
+/// mint secret's floor (`aterm_link::enable::SECRET_LEN`), so a world may also
+/// run its broker as a real `aterm link broker --secret-file` process
+/// (`broker_poison`'s), which refuses a shorter one, under the same caps.
+pub const SECRET: &[u8] = b"a3-bridge-e2e-secret-of-32-bytes";
+
+/// THE OPTIONS A TEST BROKER OPENS WITH: exactly aterm's own for `tier`
+/// ([`aterm_link::durability::Durability::options`]: astream's tier and, on
+/// a weak one, aterm's escalation table), guarded by [`SECRET`] as every
+/// broker `aterm fabric on` runs is. A test or the bench that measures a
+/// horizon of its own sets `durability` after this, keeping the table.
+#[must_use]
+pub fn broker_opts(tier: aterm_link::durability::Durability) -> OpenOptions {
+    let mut opts = tier.options();
+    opts.guard = Some(SECRET.to_vec());
+    opts
+}
+
+/// Open a guarded broker on `log` with `opts` ([`broker_opts`]).
+///
+/// # Panics
+///
+/// The open failed.
+#[must_use]
+pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
+    Broker::open_opts(log, opts.clone(), || Ok(Prepared::Nothing)).expect("guarded broker")
+}
 
 /// The fleet every test runs in.
 pub const FLEET: &str = "f1";
@@ -574,10 +599,16 @@ pub struct World {
     pub node: String,
     pub state: PathBuf,
     pub gui_log: PathBuf,
-    /// The tier this world's own broker acks at: Strict, as aterm opens it,
-    /// for every world but the fabric bench's ceiling arm
-    /// ([`World::boot_durable`]). A restarted broker keeps it.
-    pub durability: Durability,
+    /// How this world's own broker opens ([`broker_opts`]): Strict for every
+    /// world but the ordered suite's and the fabric bench's weak arms
+    /// ([`World::boot_opts`]). NOT the tier aterm opens its guarded broker at
+    /// by default — ordered, at a 100 ms horizon, since the 2026-10-20 re-gate
+    /// (`aterm_link::durability::default_for`) — so these worlds prove the
+    /// bridge over strict acks, and the ordered tier's own behaviour (the
+    /// barrier, the horizon's flush, the escalation table's held head, the
+    /// notifier's wait) is the ordered suite's (`ordered.rs`, `notify.rs`)
+    /// and the bench's default arm's. A restarted broker keeps it.
+    pub opts: OpenOptions,
     /// The read connection every polled broker read shares ([`World::read`]).
     watch: std::sync::Mutex<Option<Client>>,
 }
@@ -672,7 +703,7 @@ impl World {
             broker_at,
             &[],
             None,
-            Durability::Strict,
+            broker_opts(aterm_link::durability::Durability::Strict),
         )
     }
 
@@ -686,7 +717,7 @@ impl World {
             None,
             extra_serve_flags,
             None,
-            Durability::Strict,
+            broker_opts(aterm_link::durability::Durability::Strict),
         )
     }
 
@@ -701,31 +732,40 @@ impl World {
             None,
             extra_serve_flags,
             None,
-            Durability::Strict,
+            broker_opts(aterm_link::durability::Durability::Strict),
         )
     }
 
-    /// [`World::boot`] with this world's broker acking at `durability` instead
-    /// of Strict — through the same guarded open (`Broker::open_guarded_with`:
-    /// the same capability checks, only what an ack promises changes). The
-    /// fabric bench's ceiling arm (`FABRIC_BENCH durability=relaxed`) is its
-    /// caller; every test world stays Strict, as aterm opens its broker.
-    pub fn boot_durable(tag: &str, durability: Durability) -> Self {
-        Self::boot_full(tag, &[], &[], None, &[], None, durability)
+    /// [`World::boot`] with this world's broker opened with `opts` instead of
+    /// aterm's Strict options — the same guard ([`broker_opts`]), only what an
+    /// ack promises changes. The ordered suite (`ordered.rs`) and the fabric
+    /// bench's ordered (its default) and relaxed arms are its callers; every
+    /// other test world stays Strict, which is not what aterm opens its
+    /// guarded broker at by default (ordered: [`World::opts`]).
+    pub fn boot_opts(tag: &str, opts: OpenOptions) -> Self {
+        Self::boot_full(tag, &[], &[], None, &[], None, opts)
     }
 
-    /// [`World::boot_durable`] with extra environment for the bridge child: the
+    /// [`World::boot_opts`] with extra environment for the bridge child: the
     /// fabric bench's ping-pong arm turns the bridge's wait tally on
     /// (`aterm_link::wait_tally::SEAM`) in a world of its own, so no other
     /// world's bridge runs with it.
-    pub fn boot_durable_with(tag: &str, durability: Durability, env: &[(&str, &str)]) -> Self {
-        Self::boot_full(tag, &[], env, None, &[], None, durability)
+    pub fn boot_opts_with(tag: &str, opts: OpenOptions, env: &[(&str, &str)]) -> Self {
+        Self::boot_full(tag, &[], env, None, &[], None, opts)
     }
 
     /// [`World::boot`] with the node's cap file holding `grants(node)` instead
     /// of the whole node ring — a bridge whose cap is short of something.
     pub fn boot_with_grants(tag: &str, grants: GrantsFor<'_>) -> Self {
-        Self::boot_full(tag, &[], &[], None, &[], Some(grants), Durability::Strict)
+        Self::boot_full(
+            tag,
+            &[],
+            &[],
+            None,
+            &[],
+            Some(grants),
+            broker_opts(aterm_link::durability::Durability::Strict),
+        )
     }
 
     fn boot_full(
@@ -735,7 +775,7 @@ impl World {
         broker_at: Option<&str>,
         extra_serve_flags: &[&str],
         grants: Option<GrantsFor<'_>>,
-        durability: Durability,
+        opts: OpenOptions,
     ) -> Self {
         // ONE PERMIT PER STACK COMING UP (see [`boot_permit`]). Dropped when this
         // function returns, which is after the control socket answers — so the
@@ -773,8 +813,7 @@ impl World {
         let (broker, handle) = if broker_at.is_some() {
             (None, None)
         } else {
-            let broker = Broker::open_guarded_with(&broker_log, SECRET.to_vec(), durability)
-                .expect("guarded broker");
+            let broker = open_broker(&broker_log, &opts);
             let handle = broker.serve(&broker_sock).expect("serve the broker");
             (Some(broker), Some(handle))
         };
@@ -835,7 +874,7 @@ impl World {
             node,
             state,
             gui_log,
-            durability,
+            opts,
             watch: std::sync::Mutex::new(None),
         };
         let gui = world.gui.as_mut().expect("the gui just spawned");
@@ -952,8 +991,7 @@ impl World {
     /// waits for can only be the new attach's.
     pub fn start_broker(&mut self) {
         let _ = std::fs::remove_file(&self.broker_sock);
-        let broker = Broker::open_guarded_with(&self.broker_log, SECRET.to_vec(), self.durability)
-            .expect("reopen the guarded broker");
+        let broker = open_broker(&self.broker_log, &self.opts);
         let handle = broker
             .serve(&self.broker_sock)
             .expect("serve the broker again");
@@ -1327,7 +1365,8 @@ pub type Record = (u64, u64, String, Vec<u8>);
 /// answer each one's `(offset, deduped)` in that order — with the acks read
 /// BEHIND the sends (astream's pipelined publish), never one round trip each.
 ///
-/// WHY. Every test world's broker is `open_guarded`, which is `Durability::Strict`:
+/// WHY. Every test world's broker but the ordered suite's is Strict
+/// ([`broker_opts`], [`World::opts`]):
 /// an ack is an fsync, and a test that seeds a backlog one blocking `publish`
 /// at a time pays one fsync per record: `x2`'s 560 fillers took 5.9 s of its
 /// 7.2 s alone (10.5 ms a record), and the world suite seeds 2,806 records that
@@ -1706,17 +1745,19 @@ impl Drop for Fleet {
 impl Fleet {
     /// Boot the broker under exclusive scratch ownership. The short fixed prefix
     /// keeps every node's control socket below Unix sockaddr path limits.
-    pub fn boot(_tag: &str) -> Self {
+    pub fn boot(tag: &str) -> Self {
+        Self::boot_opts(tag, broker_opts(aterm_link::durability::Durability::Strict))
+    }
+
+    /// [`Fleet::boot`] with the broker opened with `opts` ([`broker_opts`])
+    /// instead of aterm's Strict options: the ordered suite's.
+    pub fn boot_opts(_tag: &str, opts: OpenOptions) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix("a5-")
             .tempdir_in("/tmp")
             .expect("exclusive fleet scratch");
         let tmp = scratch.path().to_path_buf();
-        let broker = Broker::open_guarded(
-            tmp.join("b.log").to_string_lossy().as_ref(),
-            SECRET.to_vec(),
-        )
-        .expect("guarded broker");
+        let broker = open_broker(tmp.join("b.log"), &opts);
         let sock = tmp.join("b.sock").to_string_lossy().into_owned();
         assert!(
             sock.len() < MAX_SOCK_PATH,
@@ -1732,6 +1773,13 @@ impl Fleet {
             watch: std::sync::Mutex::new(None),
             scratch: Some(scratch),
         }
+    }
+
+    /// The broker this fleet serves, in this process: what a test reads the
+    /// durable head off, and asks for a full flush.
+    #[must_use]
+    pub fn broker(&self) -> &Broker {
+        self.broker.as_ref().expect("the fleet serves its broker")
     }
 
     /// A god-cap client on the socket the nodes use.

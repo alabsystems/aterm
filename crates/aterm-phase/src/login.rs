@@ -230,10 +230,76 @@ pub fn login_interrupted(rows: &[String]) -> bool {
         return false;
     };
     let out = trim(last);
-    out.strip_prefix('⎿')
+    interrupted_row(out) && said.len() >= 2 && trim_end(said[said.len() - 2]) == LOGIN_ROW
+}
+
+/// The row a typed `/login` leaves in the conversation.
+const LOGIN_ROW: &str = "❯ /login";
+
+/// Whether `row` is `⎿  Login interrupted`.
+fn interrupted_row(row: &str) -> bool {
+    trim(row)
+        .strip_prefix('⎿')
         .is_some_and(|rest| trim(rest) == anchor_text("login.interrupted"))
-        && said.len() >= 2
-        && trim_end(said[said.len() - 2]) == "❯ /login"
+}
+
+/// The nearest row above `i` that is not blank.
+fn said_above(rows: &[String], i: usize) -> Option<usize> {
+    rows[..i].iter().rposition(|r| !trim(r).is_empty())
+}
+
+/// THE `/login` THE SCREEN SHOWS, TYPED AT A LOST LOGIN
+/// ([`login_at_wall`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginAtWall {
+    /// The lost login's words, as its row says them.
+    pub message: String,
+    /// A `/login` typed at the same lost login before this one was left:
+    /// `❯ /login` over `⎿  Login interrupted` between the wall's row and it.
+    pub left_before: bool,
+}
+
+/// WHETHER THE `/login` THE SCREEN SHOWS WAS TYPED AT A LOST LOGIN: the one
+/// whose dialog stands ([`login_screen`]), or whose `⎿  Login interrupted`
+/// is the last thing said ([`login_interrupted`]). Neither draws the wall's
+/// row as the last thing said — the dialog is drawn under it, and the
+/// interrupt is said after it — so the screen is read as it stood when that
+/// `/login` was typed: the rows above its `❯ /login` (past any `/login` left
+/// at the same wall before it) over an empty composer, read for a wall
+/// ([`crate::wall::wall`]) that is a lost login. `None` for every other
+/// screen: no dialog and no interrupt, or a `/login` typed anywhere but at a
+/// lost login (a person's on a working session, after their own Esc).
+#[must_use]
+pub fn login_at_wall(rows: &[String]) -> Option<LoginAtWall> {
+    let from = if login_screen(rows).is_some() {
+        rows.iter().rposition(|r| rule(r))?
+    } else if login_interrupted(rows) {
+        rows.iter().rposition(|r| interrupted_row(r))?
+    } else {
+        return None;
+    };
+    let mut at = said_above(rows, from).filter(|&i| trim_end(&rows[i]) == LOGIN_ROW)?;
+    let mut left_before = false;
+    while let Some(out) = said_above(rows, at).filter(|&i| interrupted_row(&rows[i]))
+        && let Some(typed) = said_above(rows, out).filter(|&i| trim_end(&rows[i]) == LOGIN_ROW)
+    {
+        at = typed;
+        left_before = true;
+    }
+    let width = rows
+        .iter()
+        .map(|r| trim_end(r).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(20);
+    let bar = "─".repeat(width);
+    let mut then: Vec<String> = rows[..at].to_vec();
+    then.extend([bar.clone(), "❯ ".to_string(), bar]);
+    let wall = crate::wall::wall(&then)?;
+    (wall.kind == crate::wall::WallKind::Auth).then_some(LoginAtWall {
+        message: wall.message,
+        left_before,
+    })
 }
 
 #[cfg(test)]

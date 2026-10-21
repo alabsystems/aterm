@@ -1691,12 +1691,9 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
             .map(|l| (*l).to_string())
     };
     for (running, other) in [("relaxed", "strict"), ("strict", "relaxed")] {
-        let extra: &[&str] = if running == "relaxed" {
-            &["--durability", "relaxed"]
-        } else {
-            &[]
-        };
-        let broker = Broker::spawn_with(&s, extra);
+        // Named, both: a bare hand-run broker runs the build's default, which
+        // is ordered for a guarded broker (served strict off macOS).
+        let broker = Broker::spawn_with(&s, &["--durability", running]);
         let (_, out, err) = s.fabric(&["on", "--service", "none"]);
         assert!(
             step(&out, "broker")

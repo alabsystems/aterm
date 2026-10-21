@@ -360,13 +360,14 @@ pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant 
     panic!("no {receipts} delivery receipt(s) past serial {after}");
 }
 
-/// The reply-bearing control `signal` fence is not an empty synthetic key:
-/// it clears only the two movement candidates (no PTY bytes, typing heat,
-/// rain scheduling or latency-hot stamp). A tab-switch race returns `false`
-/// without touching the newly-front window.
+/// A control fence (`signal`'s, say) recorded on a session is not an empty
+/// synthetic key: the next look of every window presenting the session clears
+/// only the two movement candidates (no PTY bytes, typing heat, rain
+/// scheduling or latency-hot stamp). Negative control: a look with no fence
+/// recorded since leaves both licences standing.
 #[cfg(unix)]
 #[test]
-fn session_candidate_cancel_is_side_effect_free_and_tab_switch_safe() {
+fn a_session_fence_clears_only_the_licence_in_every_window_presenting_it() {
     use crate::cursor_glow::{Geom, GlowStyle};
     use crate::cursor_trail::TrailConfig;
 
@@ -381,6 +382,9 @@ fn session_candidate_cancel_is_side_effect_free_and_tab_switch_safe() {
     // points at B; the fence must still retire A and B together.
     assert_eq!(app.frontmost_window, Some(second));
     assert_eq!(app.pool.views(session), Some(2));
+    // Each window's first look, as its first event or frame takes it.
+    app.reconcile_licence(wid);
+    app.reconcile_licence(second);
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("lumen".to_string());
     let glow_cfg = app.glow_config();
@@ -432,8 +436,23 @@ fn session_candidate_cancel_is_side_effect_free_and_tab_switch_safe() {
         )
     };
 
-    assert!(app.clear_move_license_for_session(session, false));
     for candidate in [wid, second] {
+        app.reconcile_licence(candidate);
+        let ws = &app.windows[&candidate];
+        assert!(ws.fx.cursor().glow.move_licensed(now), "no fence, no clear");
+        assert!(
+            ws.fx.cursor().trail.move_licensed(now),
+            "no fence, no clear"
+        );
+    }
+    app.pool
+        .get(session)
+        .expect("the shared session")
+        .ctx
+        .licence
+        .fence(false);
+    for candidate in [wid, second] {
+        app.reconcile_licence(candidate);
         let ws = &app.windows[&candidate];
         assert!(!ws.fx.cursor().glow.move_licensed(now));
         assert!(!ws.fx.cursor().trail.move_licensed(now));
@@ -445,11 +464,6 @@ fn session_candidate_cancel_is_side_effect_free_and_tab_switch_safe() {
     assert!(
         drain(pipe).is_empty(),
         "candidate fence writes no PTY bytes"
-    );
-
-    assert!(
-        !app.clear_move_license_for_session(session.wrapping_add(1), false),
-        "a session that is no longer front has no visible candidate to clear"
     );
     drop(app);
     drop(sink);
@@ -838,21 +852,12 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
                     app.windows[&wid].fx.cursor().glow.move_licensed(now),
                     "{style} {label} queued={queued}: the key's one-shot licence stands after the prelude"
                 );
-                // The classic trail's twin is re-stamped beside it; under
-                // the rainbow kitty presentation the trail's tick is
-                // disabled and clears its hints every frame, so it is read
-                // under `comet` only, and only for the classes it stamps.
-                if style == "comet"
-                    && matches!(
-                        class,
-                        DeliveredClass::Return | DeliveredClass::Nav | DeliveredClass::Gesture
-                    )
-                {
-                    assert!(
-                        app.windows[&wid].fx.cursor().trail.move_licensed(now),
-                        "{style} {label} queued={queued}: the classic trail's twin stands after the prelude"
-                    );
-                }
+                // The cadence comet's twin is not read here: a native window
+                // runs no cadence comet under any presentation (the comet's
+                // tail is its streak, `comet_tail_is_its_streak`; the rainbow
+                // kitty never ran one), and its disabled tick clears its
+                // hints every frame. The streak's licence above is the
+                // witness.
                 drop(app);
                 drop(sink);
                 unsafe {

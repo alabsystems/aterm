@@ -72,15 +72,11 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// [`ensure_private_dir`] for a directory that must already be there: the same
 /// owner check and DACL, but nothing is created. A missing `dir` is `NotFound`
-/// and something there that is no directory is `NotADirectory`; the Unix twin
-/// says why a session identity's admission needs this.
+/// and something there that is no directory, a symlink to nothing included, is
+/// `NotADirectory` (`super::require_dir`); the Unix twin says why a session
+/// identity's admission needs this.
 pub(crate) fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
-    if !std::fs::metadata(dir)?.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            format!("{}: not a directory", dir.display()),
-        ));
-    }
+    super::require_dir(dir)?;
     acl::verify_owner_and_harden(dir)
 }
 

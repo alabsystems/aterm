@@ -77,30 +77,13 @@ pub(crate) fn archive_url(platform: &str) -> String {
     )
 }
 
-/// The cache the pinned browser is unpacked into: on macOS
-/// `~/Library/Caches/aterm/browser.noindex` (Spotlight skips `.noindex`),
-/// elsewhere `$XDG_CACHE_HOME/aterm/browser`, else `~/.cache/aterm/browser`.
-pub(crate) fn cache_root(
-    os: &str,
-    home: Option<&Path>,
-    xdg_cache: Option<&Path>,
-) -> Option<PathBuf> {
-    if os == "macos" {
-        return home.map(|h| h.join("Library/Caches/aterm/browser.noindex"));
-    }
-    xdg_cache
-        .filter(|p| p.is_absolute())
-        .map(Path::to_path_buf)
-        .or_else(|| home.map(|h| h.join(".cache")))
-        .map(|c| c.join("aterm/browser"))
-}
-
-/// This host's browser cache ([`cache_root`]); the lane's Firefox is
-/// unpacked beside the Chromium.
+/// The cache the pinned browser is unpacked into, aterm's `browser` in this
+/// host's user cache ([`crate::user_cache`]): on macOS
+/// `~/Library/Caches/aterm/browser.noindex`, elsewhere
+/// `$XDG_CACHE_HOME/aterm/browser`, else `~/.cache/aterm/browser`. The lane's
+/// Firefox is unpacked beside the Chromium.
 pub(crate) fn host_cache_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let xdg = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from);
-    cache_root(std::env::consts::OS, home.as_deref(), xdg.as_deref())
+    crate::host_user_cache("browser")
 }
 
 /// The unpacked pin's directory under `root`. It exists only complete: the
@@ -417,9 +400,24 @@ pub(crate) fn angle_backends() -> &'static [Angle] {
     }
 }
 
+/// Whether the lane runs Chromium without its sandbox on `os`: on Linux.
+/// Ubuntu 23.10 and later let no unconfined program make the user namespace
+/// Chromium's sandbox needs (AppArmor's
+/// `kernel.apparmor_restrict_unprivileged_userns`), and a chrome-headless-shell
+/// unpacked into a user cache has neither an AppArmor profile nor a setuid
+/// helper, so it aborts at start ("No usable sandbox!", measured with the
+/// linux64 pin in the Linux lane's Ubuntu 24.04 guest). The lane's browser
+/// opens only the pages its own loopback server serves, the same trust
+/// `--enable-unsafe-swiftshader` already places in them. On macOS the
+/// sandbox stays on.
+pub(crate) fn sandbox_off(os: &str) -> bool {
+    os == "linux"
+}
+
 /// The browser's arguments: headless, a private profile under `profile`,
-/// DevTools on fds 3 and 4, WebGL2 on `angle`, and nothing that throttles a
-/// page the lane is waiting on. Every session takes
+/// DevTools on fds 3 and 4, WebGL2 on `angle`, without the sandbox where
+/// [`sandbox_off`], and nothing that throttles a page the lane is waiting
+/// on. Every session takes
 /// `--enable-unsafe-swiftshader`, Chromium's opt-in to software WebGL for
 /// trusted content. Under SwiftShader it silences the deprecation the
 /// software path logs without it; under Metal it lets a GPU process that
@@ -455,6 +453,9 @@ pub(crate) fn launch_args(
     ] {
         v.push(a.into());
     }
+    if sandbox_off(std::env::consts::OS) {
+        v.push("--no-sandbox".into());
+    }
     v.push(format!("--use-angle={}", angle.name()).into());
     v.push("about:blank".into());
     v
@@ -481,25 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_follows_each_platform_convention() {
-        let home = Path::new("/h");
-        assert_eq!(
-            cache_root("macos", Some(home), Some(Path::new("/x"))),
-            Some(PathBuf::from("/h/Library/Caches/aterm/browser.noindex"))
-        );
-        assert_eq!(
-            cache_root("linux", Some(home), Some(Path::new("/x"))),
-            Some(PathBuf::from("/x/aterm/browser"))
-        );
-        // A relative XDG_CACHE_HOME is ignored, as the spec says.
-        assert_eq!(
-            cache_root("linux", Some(home), Some(Path::new("rel"))),
-            Some(PathBuf::from("/h/.cache/aterm/browser"))
-        );
-        assert_eq!(cache_root("linux", None, None), None);
-    }
-
-    #[test]
     fn a_full_browser_is_asked_for_headless_and_the_shell_is_not() {
         let profile = Path::new("/p");
         let shell = Browser {
@@ -519,6 +501,11 @@ mod tests {
         }
         assert!(is_shell(Path::new("/x/chrome-headless-shell")));
         assert!(!is_shell(Path::new("/x/Google Chrome")));
+        assert!(sandbox_off("linux") && !sandbox_off("macos"));
+        assert_eq!(
+            has(&shell, "--no-sandbox"),
+            sandbox_off(std::env::consts::OS)
+        );
     }
 
     /// Each backend asks for itself, and a session is held to the adapter
@@ -539,8 +526,12 @@ mod tests {
         let metal = "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version) (Gl)";
         let swiftshader = "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) \
                            (0x0000C0DE)), SwiftShader driver) (Gl)";
+        // The linux64 pin's SwiftShader JITs with Subzero, not LLVM.
+        let subzero = "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) \
+                       (0x0000C0DE)), SwiftShader driver) (Gl)";
         assert!(Angle::Metal.drew(metal) && !Angle::Metal.drew(swiftshader));
         assert!(Angle::SwiftShader.drew(swiftshader) && !Angle::SwiftShader.drew(metal));
+        assert!(Angle::SwiftShader.drew(subzero) && !Angle::Metal.drew(subzero));
         assert_eq!(angle_backends().last(), Some(&Angle::SwiftShader));
     }
 }

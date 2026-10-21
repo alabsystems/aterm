@@ -54,11 +54,6 @@ use aterm_session::LaunchNonce;
 
 use crate::SessionCtx;
 
-/// The verbs that accept `id=<key>`. Each can put bytes on the PTY, so a mark is
-/// consumed only by something that can type and, through
-/// [`empty_payload_refusal`], only by an attempt that carries bytes.
-pub(crate) const KEYED_VERBS: &[&str] = &["send", "key", "feed-bin", "turn"];
-
 /// The namespace a mark lives in: the authority half of the key, which the caller
 /// does not type.
 ///
@@ -105,11 +100,6 @@ impl Realm {
             crate::control::Scope::Fleet { .. } => Self::Local,
         }
     }
-}
-
-/// Whether `verb` accepts an `id=` idempotency key.
-pub(crate) fn is_keyed_verb(verb: &str) -> bool {
-    KEYED_VERBS.contains(&verb)
 }
 
 /// How many producers one session remembers marks for, per [`Realm`]; headroom
@@ -549,7 +539,6 @@ pub(crate) fn record_in_doubt(ctx: &SessionCtx, verb: &str, key: Key, reply: &st
 
 #[cfg(test)]
 mod tests {
-
     /// Only a keyed attempt with nothing to type is refused; an unkeyed empty
     /// write and a keyed non-empty one both pass through to the claim.
     #[test]

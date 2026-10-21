@@ -23,7 +23,12 @@
 //! - a drag from the held button: the drag enters this client's surface with
 //!   the source's types, is accepted, moves, drops, and its offer is taken
 //!   over from the device, its bytes read and the drop finished, which the
-//!   source hears.
+//!   source hears;
+//! - a finger: the session's touchscreen (Mutter places it in a screencast
+//!   stream of the monitor, which `lane-bus seat` records; its first tap
+//!   makes the device and no client hears it) goes down on the surface,
+//!   moves and lifts, and the touch hears down, motion and up, each in a
+//!   frame, with one id.
 //!
 //! Then the session ends and the seat's capabilities go, the devices
 //! released with no protocol error. The seats, the devices and the sources
@@ -47,7 +52,7 @@ use aterm_wayland::protocols::wayland::{
 };
 use aterm_wayland::protocols::xdg_shell::xdg_toplevel;
 use aterm_wayland::proxy::{OwnedDisplay, Proxy, Queue};
-use aterm_wayland::seat::{Input, KeyboardEvent, Seats};
+use aterm_wayland::seat::{Input, KeyboardEvent, Seats, TouchEvent};
 use aterm_wayland::selection::{
     Device, DragEvent, Kind, Manager, Source, SourceEvent, read_limited, write_detached,
 };
@@ -63,6 +68,8 @@ const BTN_LEFT: u32 = 0x110;
 const KEY_A: u32 = 30;
 const KEY_B: u32 = 48;
 const KEY_C: u32 = 46;
+/// `wl_seat.capability`'s touch bit.
+const CAP_TOUCH: u32 = 4;
 
 struct Lane {
     display: CString,
@@ -345,6 +352,11 @@ fn a_real_seat_reaches_the_helpers() {
         "move:6,6".into(),
         "release:left".into(),
         format!("touch:{}", file("released")),
+        // A finger, in the monitor's pixels, on the maximized surface.
+        format!("wait:{}", file("touchable")),
+        "finger-down:100,100".into(),
+        "finger-move:120,130".into(),
+        "finger-up:".into(),
         format!("wait:{}", file("done")),
     ];
     let mut child = aterm_uds::spawnfd::command(&lane.bus)
@@ -638,6 +650,68 @@ fn a_real_seat_reaches_the_helpers() {
     eprintln!("drag source heard: {heard:?}");
     assert!(heard.iter().any(|e| e == "DropPerformed"), "{heard:?}");
 
+    // The finger: the touchscreen came with the session's first tap.
+    pump(&a.queue, "the seat's touch", || {
+        log.extend(ears.input());
+        seats
+            .infos()
+            .iter()
+            .any(|s| s.id == seat && s.capabilities & CAP_TOUCH != 0)
+    });
+    touch(pace.path(), "touchable");
+    let touches = |log: &[Input]| -> Vec<TouchEvent> {
+        log.iter()
+            .filter_map(|i| match i {
+                Input::Touch { event, .. } => Some(*event),
+                _ => None,
+            })
+            .collect()
+    };
+    pump(&a.queue, "the finger's up", || {
+        log.extend(ears.input());
+        touches(&log)
+            .iter()
+            .any(|e| matches!(e, TouchEvent::Up { .. }))
+    });
+    // The up's frame, when the compositor sends one.
+    a.queue.roundtrip().unwrap();
+    log.extend(ears.input());
+    let finger = touches(&log);
+    eprintln!("touch: {finger:?}");
+    let [
+        TouchEvent::Down {
+            surface: on,
+            id,
+            x: x0,
+            y: y0,
+            ..
+        },
+        TouchEvent::Frame,
+        rest @ ..,
+    ] = finger.as_slice()
+    else {
+        panic!("a down, in a frame of its own, first: {finger:?}");
+    };
+    assert_eq!(*on, Some(surface), "the finger went down on the surface");
+    let moved: Vec<(f64, f64)> = rest
+        .iter()
+        .filter_map(|e| match e {
+            TouchEvent::Motion { id: m, x, y, .. } if m == id => Some((*x, *y)),
+            _ => None,
+        })
+        .collect();
+    let (x1, y1) = *moved.last().expect("a motion of the same finger");
+    assert!(x1 > *x0 && y1 > *y0, "({x0}, {y0}) then ({x1}, {y1})");
+    assert!(
+        rest.iter()
+            .any(|e| matches!(e, TouchEvent::Up { id: u, .. } if u == id)),
+        "the same finger lifted: {finger:?}"
+    );
+    assert!(
+        !rest.iter().any(|e| matches!(e, TouchEvent::Cancel)),
+        "{finger:?}"
+    );
+
     // The session ends: its devices go, and the seat's helpers release theirs.
     touch(pace.path(), "done");
     let t0 = Instant::now();
@@ -650,6 +724,7 @@ fn a_real_seat_reaches_the_helpers() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(status.success(), "lane-bus seat: {status:?}");
+    // The touch's capability goes with the rest.
     pump(&a.queue, "the seat without devices", || {
         log.extend(ears.input());
         seats.infos().iter().all(|s| s.capabilities == 0)

@@ -5,15 +5,16 @@
 // `TaskFace::of` over the policy's memory, the face the loop tells as the
 // memory moves (`TurnEndState::face_moved`), someone else's live turn
 // (`TurnEndState::took`), and the landing a loop before this one landed
-// (`TurnEndState::seed_landed`, §9.4.5). Included from `turn_end_tests.rs`
-// (`mod face`), so its readings and acts are in scope. Each behaviour has
-// its negative control.
+// (`TurnEndState::seed_landed`, §9.4.5). Three faces: open, landed, theirs —
+// FOREVER CRUISE has no done face, and FOREVER LAND no spent one. Included
+// from `turn_end_tests.rs` (`mod face`), so its readings and acts are in
+// scope. Each behaviour has its negative control.
 
 use crate::harness::acts::TaskFace;
 
-/// The worker's own token, as Land's instruction asks for it.
-const TOKEN_REPLY: &str =
-    "Committed and pushed the parser and its tests; nothing is left.\nATERM-TASK-DONE";
+/// The landing's own reply: a clean defense ([`clean_defense`]).
+const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.
+Nothing left: all of                              it is merged into the remote main branch.";
 /// A reply that says no done.
 const PROGRESS: &str = "Committing the parser now; the lexer is next.";
 
@@ -25,120 +26,39 @@ fn state(set: impl FnOnce(&mut TurnEndState)) -> TurnEndState {
 }
 
 /// THE FACE TABLE, line by line of §9.4.2, each line's state set by hand:
-/// someone else's turn read live (open, or spent when the landing ended
-/// quiet), a person's own exchange (theirs, before a landing's end), landed
-/// (or a landing seeded for the first point), done, a spent landing whose
-/// last act was answered with no done, and open. A spent landing whose last nudge is still
-/// awaited, or owed again behind a wall, reads open; a quiet one whose
-/// question's land answer is awaited stays spent. NEGATIVE CONTROLS in the
-/// table itself: a done task is never landed, a landed one under someone
-/// else's live turn is never landed, and a landing that landed at its LAST
-/// nudge is never spent — not under someone else's turn, not once that turn
-/// ended with no done (the agent did reply done; spent's words say it did
-/// not).
+/// someone else's turn read live (open), a person's own exchange (theirs),
+/// landed (or a landing seeded for the first point), and open — a done claim
+/// owed its act, a land episode however many nudges deep. NEGATIVE CONTROLS
+/// in the table itself: a person's exchange is never landed, and a landed
+/// task under someone else's live turn is never landed.
 #[test]
 fn the_face_is_a_function_of_the_policys_memory_in_the_designs_order() {
-    let nudged_out = |st: &mut TurnEndState| {
-        st.land.typed = true;
-        st.land.nudges = LAND_NUDGES;
-    };
-    let spent = |st: &mut TurnEndState| {
-        nudged_out(st);
-        st.land.quiet = true;
-    };
     let landed = |st: &mut TurnEndState| {
         st.done = 2;
         st.landed = true;
     };
+    let theirs = |st: &mut TurnEndState| {
+        st.done = 2;
+        st.exchange = true;
+    };
     let rows: Vec<(&str, TurnEndState, bool, TaskFace)> = vec![
         ("fresh", TurnEndState::default(), false, TaskFace::Open),
+        ("a done claim", state(|s| s.done = 1), false, TaskFace::Open),
         (
-            "one done report",
-            state(|s| s.done = 1),
+            "a land episode five nudges deep",
+            state(|s| {
+                s.land.typed = true;
+                s.land.nudges = 5;
+            }),
             false,
             TaskFace::Open,
         ),
         ("landed", state(landed), false, TaskFace::Landed),
-        ("done", state(|s| s.done = 2), false, TaskFace::Done),
-        (
-            "finished by the worker",
-            state(|s| {
-                s.done = 2;
-                s.finished = true;
-            }),
-            false,
-            TaskFace::Done,
-        ),
         (
             "a person's own exchange",
-            state(|s| {
-                s.done = 2;
-                s.exchange = true;
-            }),
+            state(theirs),
             false,
             TaskFace::Theirs,
-        ),
-        (
-            "a person's own exchange over a spent landing",
-            state(|s| {
-                spent(s);
-                s.done = 2;
-                s.exchange = true;
-            }),
-            false,
-            TaskFace::Theirs,
-        ),
-        ("spent", state(spent), false, TaskFace::Spent),
-        (
-            "spent, its last nudge awaited",
-            state(|s| {
-                nudged_out(s);
-                s.landing = true;
-            }),
-            false,
-            TaskFace::Open,
-        ),
-        (
-            "spent, its last nudge cut by a wall",
-            state(|s| {
-                nudged_out(s);
-                s.cut_land = true;
-            }),
-            false,
-            TaskFace::Open,
-        ),
-        (
-            "quiet, a question's land answer awaited",
-            state(|s| {
-                spent(s);
-                s.landing = true;
-            }),
-            false,
-            TaskFace::Spent,
-        ),
-        (
-            "landed at its last nudge",
-            state(|s| {
-                nudged_out(s);
-                landed(s);
-            }),
-            false,
-            TaskFace::Landed,
-        ),
-        (
-            "someone else's turn after a landing at its last nudge",
-            state(|s| {
-                nudged_out(s);
-                landed(s);
-            }),
-            true,
-            TaskFace::Open,
-        ),
-        (
-            "that turn ended with no done, the nudges spent",
-            state(nudged_out),
-            false,
-            TaskFace::Open,
         ),
         (
             "a landing seeded for the first point",
@@ -147,52 +67,16 @@ fn the_face_is_a_function_of_the_policys_memory_in_the_designs_order() {
             TaskFace::Landed,
         ),
         (
-            "a done seeded for the first point",
-            state(|s| s.done_seed = Some(None)),
-            false,
-            TaskFace::Done,
-        ),
-        (
-            "a landing and a done seeded: the landing",
-            state(|s| {
-                s.landed_seed = Some(true);
-                s.done_seed = Some(None);
-            }),
-            false,
-            TaskFace::Landed,
-        ),
-        (
-            "someone else's turn over a seeded done",
-            state(|s| s.done_seed = Some(None)),
-            true,
-            TaskFace::Open,
-        ),
-        (
             "someone else's turn after landed",
             state(landed),
             true,
             TaskFace::Open,
         ),
         (
-            "someone else's turn after done",
-            state(|s| s.done = 2),
-            true,
-            TaskFace::Open,
-        ),
-        (
             "someone else's turn after theirs",
-            state(|s| {
-                s.done = 2;
-                s.exchange = true;
-            }),
+            state(theirs),
             true,
             TaskFace::Open,
-        ),
-        (
-            "someone else's turn after spent",
-            state(spent),
-            true,
-            TaskFace::Spent,
         ),
     ];
     for (case, st, other, want) in &rows {
@@ -200,28 +84,21 @@ fn the_face_is_a_function_of_the_policys_memory_in_the_designs_order() {
     }
     // NEGATIVE CONTROLS: what a reader of `task_done()` alone, or one that
     // never looks at someone else's turn, would say instead.
-    let done = state(|s| s.done = 2);
-    assert!(done.task_done() && TaskFace::of(&done, false) != TaskFace::Landed);
-    let theirs = state(|s| {
-        s.done = 2;
-        s.exchange = true;
-    });
+    let theirs = state(theirs);
     assert!(theirs.task_done() && TaskFace::of(&theirs, false) != TaskFace::Landed);
     let after = state(landed);
     assert_ne!(TaskFace::of(&after, true), TaskFace::of(&after, false));
 }
 
 /// THE FACE MOVES WITH THE POLICY'S OWN POINTS, told once each
-/// ([`TurnEndState::face_moved`]): the land instruction's done reply lands
-/// the task (and a person's quick turn after it is theirs); the worker's
-/// own token under Cruise is done; the done check's second done report is
-/// done; a landing whose instruction and two nudges ended with no done is
-/// spent ONLY ONCE THE SECOND NUDGE'S TURN ENDED — typed, its reply may
-/// still land it. A face read again is no move. NEGATIVE CONTROL: the second
-/// nudge's done reply lands the task, never spent.
+/// ([`TurnEndState::face_moved`]): the land act's clean defense lands the
+/// task (and a person's quick turn after it is theirs). A face read again is
+/// no move. NEGATIVE CONTROLS: under Cruise no done claim moves the face —
+/// the retired token, the check's second done report — and under Land
+/// nudge after nudge answered with work leaves it open.
 #[test]
 fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
-    // Land: instruction, done reply — landed.
+    // Land: instruction, clean defense — landed.
     let mut now = t0();
     let mut st = TurnEndState::default();
     assert_eq!(st.face_start(), TaskFace::Open);
@@ -231,10 +108,10 @@ fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
     );
     assert_eq!(st.face_moved(), None, "an act moves no face");
     now += 2 * MIN;
-    at(&mut st, &land(idle(TOKEN_REPLY, Some(2 * MIN))), now);
+    at(&mut st, &land(idle(LANDING_REPLY, Some(2 * MIN))), now);
     assert_eq!(st.face_moved(), Some(TaskFace::Landed));
     assert_eq!(st.face_moved(), None, "told once");
-    at(&mut st, &land(idle(TOKEN_REPLY, None)), now + MIN);
+    at(&mut st, &land(idle(LANDING_REPLY, None)), now + MIN);
     assert_eq!(st.face_moved(), None, "the same point read again");
     // …and a person's quick turn after it is theirs.
     now += 5 * MIN;
@@ -245,179 +122,58 @@ fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
     at(&mut st, &thanks, now);
     assert_eq!(st.face_moved(), Some(TaskFace::Theirs));
 
-    // Cruise: the worker's own token — done, never landed.
+    // NEGATIVE CONTROL, Cruise: the retired token moves nothing.
     let mut st = TurnEndState::default();
     st.face_start();
     act(&mut st, &idle("Stage 1 done.", Some(3 * MIN)), t0());
-    at(&mut st, &idle(TOKEN_REPLY, Some(2 * MIN)), t0() + 3 * MIN);
-    assert_eq!(st.face_moved(), Some(TaskFace::Done));
-
-    // Cruise: a token over a report that names open work is no end — the
-    // challenge is typed, the face stays open, and its token reply is done.
-    let mut st = TurnEndState::default();
-    st.face_start();
-    act(&mut st, &idle("Stage 1 done.", Some(3 * MIN)), t0());
-    let open = idle(
-        "Committed the parser.\nStill open: the lexer.\nATERM-TASK-DONE",
-        Some(2 * MIN),
+    at(
+        &mut st,
+        &idle(
+            "All in.
+ATERM-TASK-DONE",
+            Some(2 * MIN),
+        ),
+        t0() + 3 * MIN,
     );
-    // The challenge waits the back-off a done report earns.
-    let (a, came) = until_acted(&mut st, &open, t0() + 3 * MIN);
-    assert!(
-        matches!(a, TurnEndAction::Type { rule_id, .. } if rule_id == RULE_OPEN_ITEMS),
-        "{a:?}"
-    );
-    assert_eq!(st.face_moved(), None, "challenged, not done");
-    at(&mut st, &idle(TOKEN_REPLY, Some(2 * MIN)), came + 3 * MIN);
-    assert_eq!(st.face_moved(), Some(TaskFace::Done));
+    assert_eq!(st.face_moved(), None);
+    assert_eq!(st.face(), TaskFace::Open);
 
-    // Cruise: the done check's second done report — done.
-    let mut now = t0();
-    let mut st = TurnEndState::default();
+    // NEGATIVE CONTROL, Cruise: the done check's second done report.
+    let (mut st, now) = checked_at(t0());
     st.face_start();
-    st.observe(&idle("All done.", Some(3 * MIN)), now);
-    assert_eq!(st.face_moved(), None, "one done report is no end");
-    now += st.short_wait().unwrap_or_default();
-    assert_eq!(act(&mut st, &idle("All done.", None), now), checked());
-    now += MIN;
-    at(&mut st, &idle("All done.", Some(MIN)), now);
-    assert_eq!(st.face_moved(), Some(TaskFace::Done));
+    at(&mut st, &idle("All done.", Some(MIN)), now + MIN);
+    assert_eq!(st.face_moved(), None);
 
-    // Land spent: the instruction and two nudges, each answered with work.
-    let spend = |last: &str| {
-        let mut now = t0();
-        let mut st = TurnEndState::default();
-        st.face_start();
-        act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
-        for _ in 0..LAND_NUDGES {
-            now += 3 * MIN;
-            assert_eq!(
-                act(&mut st, &land(idle(PROGRESS, Some(3 * MIN))), now),
-                land_nudged()
-            );
-        }
-        // The second nudge typed spends the episode, but its turn has not
-        // ended: the face is open still, and nothing is told.
-        assert_eq!(st.land_episode(), (true, LAND_NUDGES));
-        assert_eq!(st.face(), TaskFace::Open, "its turn has not ended");
-        assert_eq!(st.face_moved(), None);
-        st.took();
-        assert_eq!(st.face_moved(), None, "its own turn read live");
-        now += 3 * MIN;
-        at(&mut st, &land(idle(last, Some(3 * MIN))), now);
-        (st.face_moved(), st)
-    };
-    assert_eq!(spend(PROGRESS).0, Some(TaskFace::Spent));
-    // NEGATIVE CONTROL: the second nudge's done reply lands it.
-    assert_eq!(spend(TOKEN_REPLY).0, Some(TaskFace::Landed));
-}
-
-/// The land episode spent to its last nudge, `last` its reply: what that
-/// point tells, the state after it, and the time.
-fn nudged_out(last: &str) -> (Option<TaskFace>, TurnEndState, Instant) {
+    // NEGATIVE CONTROL, Land: nudge after nudge answered with work.
     let mut now = t0();
     let mut st = TurnEndState::default();
     st.face_start();
     act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
-    for _ in 0..LAND_NUDGES {
+    for _ in 0..4 {
         now += 3 * MIN;
         assert_eq!(
             act(&mut st, &land(idle(PROGRESS, Some(3 * MIN))), now),
             land_nudged()
         );
+        assert_eq!(st.face_moved(), None);
     }
+    st.took();
+    assert_eq!(st.face_moved(), None, "its own turn read live");
     now += 3 * MIN;
-    at(&mut st, &land(idle(last, Some(3 * MIN))), now);
-    (st.face_moved(), st, now)
-}
-
-/// A LANDING THAT LANDED AT ITS LAST NUDGE IS NEVER SPENT (the review of
-/// slice C): the agent did reply done, and spent's words — the chip's title,
-/// the window's record — say no done reply came. Someone else's turn after
-/// it reads open at its first live read and stays open at its end with no
-/// done; nothing is typed there, as before (the episode's nudges are spent:
-/// what the policy types is unchanged). NEGATIVE CONTROL: the same turn
-/// after a landing that ended QUIET (no done reply) stays spent throughout.
-#[test]
-fn a_landing_at_its_last_nudge_is_never_spent_after_it() {
-    let after = |last: &str| {
-        let (told, mut st, now) = nudged_out(last);
-        let mut faces = vec![told];
-        st.took();
-        faces.push(st.face_moved());
-        let ended = land(idle(PROGRESS, Some(12 * MIN)));
-        let a = at(&mut st, &ended, now + 15 * MIN);
-        assert_eq!(a, TurnEndAction::Nothing, "{last}: nothing typed of it");
-        faces.push(st.face_moved());
-        assert_eq!(st.land_episode(), (true, LAND_NUDGES), "{last}");
-        (faces, st.face())
-    };
+    at(&mut st, &land(idle(LANDING_REPLY, Some(3 * MIN))), now);
     assert_eq!(
-        after(TOKEN_REPLY),
-        (
-            vec![Some(TaskFace::Landed), Some(TaskFace::Open), None],
-            TaskFace::Open
-        )
+        st.face_moved(),
+        Some(TaskFace::Landed),
+        "the fourth nudge's defense"
     );
-    // NEGATIVE CONTROL: the landing ended quiet.
-    assert_eq!(
-        after(PROGRESS),
-        (vec![Some(TaskFace::Spent), None, None], TaskFace::Spent)
-    );
-}
-
-/// A QUIET LANDING IS SPENT ONCE (the review of slice C): a question after
-/// it gets the land answer, and while that answer's turn runs the face stays
-/// spent — no move, so the window, which records a spent landing only on its
-/// move from open, writes no second record of the same episode. The
-/// answer's done reply LANDS the task (the quiet is over), and someone
-/// else's turn after that is open. NEGATIVE CONTROL: the answer's reply with
-/// no done leaves it spent, told nothing.
-#[test]
-fn a_quiet_landing_stays_spent_through_its_land_answer_until_a_done_reply_lands_it() {
-    let answer = |reply: &str| {
-        let (told, mut st, mut now) = nudged_out(PROGRESS);
-        assert_eq!(told, Some(TaskFace::Spent));
-        let mut faces = Vec::new();
-        // Someone's turn that ends on a question: the land answer.
-        st.took();
-        faces.push(st.face_moved());
-        now += 5 * MIN;
-        let asked = land(idle("Did the suite pass on your machine?", Some(4 * MIN)));
-        assert_eq!(act(&mut st, &asked, now), land_answered());
-        faces.push(st.face_moved());
-        // The answer's own turn, read live.
-        st.took();
-        assert!(!st.other_turn(), "the policy's own act");
-        faces.push(st.face_moved());
-        now += 2 * MIN;
-        at(&mut st, &land(idle(reply, Some(2 * MIN))), now);
-        faces.push(st.face_moved());
-        // Someone else's turn after it.
-        st.took();
-        faces.push(st.face_moved());
-        faces
-    };
-    assert_eq!(
-        answer("All done. Nothing left to do."),
-        [
-            None,
-            None,
-            None,
-            Some(TaskFace::Landed),
-            Some(TaskFace::Open)
-        ]
-    );
-    // NEGATIVE CONTROL: no done reply — spent throughout.
-    assert_eq!(answer(PROGRESS), [None, None, None, None, None]);
 }
 
 /// SOMEONE ELSE'S LIVE TURN ([`TurnEndState::took`] with no act of the
-/// policy's awaited): after landed, done or theirs the face is open again at
-/// its first live read — told once, the same turn read again is no move —
-/// and after spent it stays spent. A live read of a turn the policy's own act
-/// started — a continuation, the host's line — moves nothing. The next point
-/// ends it. NEGATIVE CONTROL: the same reads with the act awaited.
+/// policy's awaited): after landed or theirs the face is open again at its
+/// first live read — told once, the same turn read again is no move. A live
+/// read of a turn the policy's own act started — a continuation, the host's
+/// line — moves nothing. The next point ends it. NEGATIVE CONTROL: the same
+/// reads with the act awaited.
 #[test]
 fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
     let landed = || {
@@ -426,7 +182,7 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
         st.face_start();
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
         now += 2 * MIN;
-        at(&mut st, &land(idle(TOKEN_REPLY, Some(2 * MIN))), now);
+        at(&mut st, &land(idle(LANDING_REPLY, Some(2 * MIN))), now);
         assert_eq!(st.face_moved(), Some(TaskFace::Landed));
         (st, now)
     };
@@ -445,49 +201,20 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
     assert!(!st.other_turn(), "the point ends it");
     assert_eq!(st.face(), TaskFace::Open);
 
-    // Done and theirs open the same way.
-    for closing in [
-        idle(TOKEN_REPLY, Some(2 * MIN)),
-        TurnEndReading {
-            person: Some(Duration::from_secs(8)),
-            ..idle(
-                "Hi! What would you like me to work on?",
-                Some(Duration::from_secs(5)),
-            )
-        },
-    ] {
-        let mut st = TurnEndState::default();
-        st.face_start();
-        act(&mut st, &idle("Stage 1 done.", Some(3 * MIN)), t0());
-        if closing.person.is_some() {
-            // A task the policy is not carrying: the person's greeting is
-            // theirs (the carry ends with the done task first).
-            at(&mut st, &idle(TOKEN_REPLY, Some(2 * MIN)), t0() + 3 * MIN);
-            st.face_moved();
-        }
-        at(&mut st, &closing, t0() + 10 * MIN);
-        let face = st.face_moved();
-        assert!(
-            matches!(face, Some(TaskFace::Done | TaskFace::Theirs)),
-            "{face:?}"
-        );
-        st.took();
-        assert_eq!(st.face_moved(), Some(TaskFace::Open), "{face:?}");
-    }
-
-    // Spent stays spent.
-    let mut now = t0();
+    // Theirs opens the same way.
     let mut st = TurnEndState::default();
     st.face_start();
-    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
-    for _ in 0..=LAND_NUDGES {
-        now += 3 * MIN;
-        act(&mut st, &land(idle(PROGRESS, Some(3 * MIN))), now);
-    }
-    assert_eq!(st.face_moved(), Some(TaskFace::Spent));
+    let greeting = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        ..idle(
+            "Hi! What would you like me to work on?",
+            Some(Duration::from_secs(5)),
+        )
+    };
+    at(&mut st, &greeting, t0());
+    assert_eq!(st.face_moved(), Some(TaskFace::Theirs));
     st.took();
-    assert!(st.other_turn());
-    assert_eq!(st.face_moved(), None, "nothing new after spent");
+    assert_eq!(st.face_moved(), Some(TaskFace::Open));
 
     // NEGATIVE CONTROLS: the policy's own act awaited — a continuation after
     // landed (the task reopened by a person's report), the host's line.
@@ -505,17 +232,20 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
 }
 
 /// THE LANDING A LOOP BEFORE THIS ONE LANDED (§9.4.5): seeded, it holds at a
-/// first point no live read came before whose reply still says done — the
-/// task landed, the episode's instruction typed, the face landed, and
-/// NOTHING TYPED, now or later. It is dropped by a live read before that
-/// point and by a reply that no longer says done, and the point is then
-/// decided as any first point is. A loop started as Off lifted keeps the
-/// done task done, its episode over; under Cruise the episode is none of its
-/// own. NEGATIVE CONTROL: with no seed the same first point gets the land
-/// instruction after its back-off — the instruction typed into finished work
-/// after every restart.
+/// first point no live read came before whose reply is still a clean
+/// defense ([`clean_defense`], as every landing's is) — the task landed, the
+/// episode's instruction typed, the face landed, and NOTHING TYPED, now or
+/// later. It is dropped by a live read before that point and by a reply
+/// that is no clean defense — a done in words, the retired token an older
+/// build's journal noted a `land@v1` landing at (the review of 2026-10-20) —
+/// and the point is then decided as any first point is. A loop started as Off lifted keeps the
+/// landed task landed, its episode over; under Cruise the seed is dropped and
+/// the done claim owed Cruise's prompt (Cruise takes nothing as the end).
+/// NEGATIVE CONTROL: with no seed the same first point gets the land
+/// instruction after its back-off — the instruction typed into landed work
+/// after every restart; the retired token ends nothing there either.
 #[test]
-fn a_seeded_landing_holds_only_at_a_first_point_that_still_says_done() {
+fn a_seeded_landing_holds_only_at_a_first_point_still_a_clean_defense() {
     let first = |st: &mut TurnEndState, said: &str| {
         let now = t0();
         let start = st.face_start();
@@ -529,7 +259,8 @@ fn a_seeded_landing_holds_only_at_a_first_point_that_still_says_done() {
         let later = now + st.short_wait().unwrap_or_default();
         (a, decide_turn_end(st, &r, &cfg(), later))
     };
-    for said in [TOKEN_REPLY, "All done. Nothing left to do."] {
+    let other = "All of it is in.\nNothing left: merged into the remote main branch.";
+    for said in [LANDING_REPLY, other] {
         let mut st = TurnEndState::default();
         st.seed_landed(None);
         assert!(st.landed_seed_armed());
@@ -544,19 +275,25 @@ fn a_seeded_landing_holds_only_at_a_first_point_that_still_says_done() {
             None,
             "{said}: told landed at the start, the point restates it"
         );
-        // NEGATIVE CONTROL: no seed — a done reply gets the land instruction
-        // typed into finished work; the worker's own token ends the task,
-        // but as one nobody asked to land (`✓ done`, never `✓ landed`).
+        // NEGATIVE CONTROL: no seed — a done reply, a defense included,
+        // gets the land instruction typed into landed work.
         let mut st = TurnEndState::default();
         let (_, later) = first(&mut st, said);
-        if said == TOKEN_REPLY {
-            assert_eq!(later, TurnEndAction::Nothing);
-            assert!(st.finished_by_worker() && !st.landed());
-            assert_eq!(st.face_moved(), Some(TaskFace::Done));
-        } else {
-            assert_eq!(later, land_instruction(), "{said}");
-            assert_eq!(st.face_moved(), None, "{said}");
-        }
+        assert_eq!(later, land_instruction(), "{said}");
+        assert!(!st.landed(), "{said}");
+        assert_eq!(st.face_moved(), None, "{said}");
+    }
+    let mut st = TurnEndState::default();
+    let (_, later) = first(&mut st, "All in.\nATERM-TASK-DONE");
+    assert_eq!(later, land_instruction(), "the retired token");
+    // Dropped by a done that is no defense — in words, or the retired token
+    // an older build's journal landed on: the instruction owed.
+    for said in ["All done. Nothing left to do.", "All in.\nATERM-TASK-DONE"] {
+        let mut st = TurnEndState::default();
+        st.seed_landed(None);
+        let (a, later) = first(&mut st, said);
+        assert!(!st.landed() && !st.landed_seed_armed(), "{said}: {a:?}");
+        assert_eq!(later, land_instruction(), "{said}");
     }
     // Dropped by a live read before the first point.
     let mut st = TurnEndState::default();
@@ -574,24 +311,22 @@ fn a_seeded_landing_holds_only_at_a_first_point_that_still_says_done() {
     assert!(!st.landed() && !st.landed_seed_armed());
     assert_eq!(st.face_moved(), Some(TaskFace::Open));
     assert_eq!(later, land_instruction());
-    // Started as Off lifted: done stays done, the episode is over.
+    // Started as Off lifted: landed stays landed, the episode is over.
     let mut st = TurnEndState::default();
     st.seed_landed(None);
     st.start_lifted_off();
-    let (a, _) = first(&mut st, TOKEN_REPLY);
+    let (a, _) = first(&mut st, LANDING_REPLY);
     assert_eq!(a, TurnEndAction::Nothing);
     assert!(st.landed());
     assert_eq!(st.land_episode(), (false, 0));
-    // Under Cruise: landed, nothing typed, no episode of Land's.
+    // Under Cruise: dropped, the done claim owed Cruise's prompt.
     let mut st = TurnEndState::default();
     st.seed_landed(None);
-    st.observe(&idle(TOKEN_REPLY, None), t0());
-    assert!(st.landed());
+    st.observe(&idle(LANDING_REPLY, None), t0());
+    assert!(!st.landed() && !st.task_done());
     assert_eq!(st.land_episode(), (false, 0));
-    assert_eq!(
-        decide_turn_end(&st, &idle(TOKEN_REPLY, None), &cfg(), t0() + 60 * MIN),
-        TurnEndAction::Nothing
-    );
+    let a = decide_turn_end(&st, &idle(LANDING_REPLY, None), &cfg(), t0() + 60 * MIN);
+    assert_eq!(a.rule_id(), Some(RULE_DONE_CHECK), "{a:?}");
     // A wall over the reply: dropped.
     let mut st = TurnEndState::default();
     st.seed_landed(None);
@@ -599,7 +334,7 @@ fn a_seeded_landing_holds_only_at_a_first_point_that_still_says_done() {
         &land(TurnEndReading {
             wall: Some(WallKind::Overloaded),
             wall_message: "API Error: 529 Overloaded.".to_string(),
-            ..idle(TOKEN_REPLY, None)
+            ..idle(LANDING_REPLY, None)
         }),
         t0(),
     );
@@ -610,17 +345,17 @@ fn a_seeded_landing_holds_only_at_a_first_point_that_still_says_done() {
 /// OWN ([`said_mark`], kept by the journal at the landing's point): the same
 /// words take it up — wrapped onto other rows too (a resize, a relaunched
 /// agent's conversation drawn again) — and another reply drops it, though it
-/// ends on the worker's token as well. That reply is a turn no loop watched
-/// (typed while Off had stopped the loop: the review of Together D3,
-/// 2026-10-17): its token is THEIR task's end, read `done`, never `landed`,
-/// and nothing is typed; a done said in words alone there is a first done
-/// report, which Land asks to wrap up once. NEGATIVE CONTROLS: a seed with
-/// no words (a journal a build before the mark wrote) holds over that reply
-/// as before; and this test with the words' check taken out of
-/// [`TurnEndState::observe`] fails at the first `!st.landed()`.
+/// claims done as well. That reply is a turn no loop watched (typed while
+/// Off had stopped the loop: the review of Together D3, 2026-10-17): never
+/// `landed`, and its done claim — the retired token, a done said in words —
+/// is a first one, which Land asks to land. NEGATIVE CONTROLS: a seed with
+/// no words (a journal a build before the mark wrote) holds over another
+/// clean defense, though not over the token reply, which is none; and this
+/// test with the words' check taken out of [`TurnEndState::observe`] fails
+/// at the first `!st.landed()`.
 #[test]
 fn a_seeded_landing_holds_only_where_the_last_words_are_the_landings_own() {
-    let landing = said_mark(Some(TOKEN_REPLY));
+    let landing = said_mark(Some(LANDING_REPLY));
     assert!(landing.is_some());
     let first = |words: Option<u64>, said: &str| {
         let mut st = TurnEndState::default();
@@ -634,111 +369,41 @@ fn a_seeded_landing_holds_only_where_the_last_words_are_the_landings_own() {
         (st, a, later)
     };
     // The landing's own words, as drawn and wrapped at another width.
-    let rewrapped =
-        "Committed and pushed the parser\nand its tests; nothing\nis left.\nATERM-TASK-DONE";
+    let rewrapped = "Committed and pushed the parser\nand its tests.\nNothing left: all of it is \
+                     merged\ninto the remote main branch.";
     assert_eq!(said_mark(Some(rewrapped)), landing);
-    for said in [TOKEN_REPLY, rewrapped] {
+    for said in [LANDING_REPLY, rewrapped] {
         let (mut st, a, later) = first(landing, said);
         assert_eq!((a, later), (TurnEndAction::Nothing, TurnEndAction::Nothing));
         assert!(st.landed(), "{said}");
         assert_eq!(st.face_moved(), None, "{said}: landed from the start");
     }
-    // ANOTHER REPLY ON THE TOKEN: their task done, never landed.
+    // ANOTHER REPLY ON THE TOKEN: never landed, Land's instruction owed.
     let theirs = "Added the module docstring and committed it.\nATERM-TASK-DONE";
     assert_ne!(said_mark(Some(theirs)), landing);
-    let (mut st, a, later) = first(landing, theirs);
-    assert!(!st.landed(), "their reply is no landing");
-    assert!(st.finished_by_worker() && st.task_done());
-    assert_eq!((a, later), (TurnEndAction::Nothing, TurnEndAction::Nothing));
-    assert_eq!(st.face_moved(), Some(TaskFace::Done));
+    let (mut st, _, later) = first(landing, theirs);
+    assert!(!st.landed() && !st.task_done(), "their reply is no landing");
+    assert_eq!(later, land_instruction());
+    assert_eq!(st.face_moved(), Some(TaskFace::Open));
     // …and a done in words alone: a first done report, Land's instruction
     // typed once after the back-off, as at any first point.
     let (st, _, later) = first(landing, "All done. Nothing left to do.");
     assert!(!st.landed() && !st.landed_seed_armed());
     assert_eq!(later, land_instruction());
-    // NEGATIVE CONTROL: no words kept, no words compared.
-    let (st, a, _) = first(None, theirs);
+    // NEGATIVE CONTROL: no words kept, no words compared — another clean
+    // defense holds it; the token reply, no defense, does not.
+    let defended = "Added the module docstring.\nNothing left: it is merged into the remote main \
+                    branch.";
+    assert_ne!(said_mark(Some(defended)), landing);
+    let (st, a, _) = first(None, defended);
     assert!(st.landed());
     assert_eq!(a, TurnEndAction::Nothing);
+    let (st, _, later) = first(None, theirs);
+    assert!(!st.landed());
+    assert_eq!(later, land_instruction());
     // No words at all mark nothing.
     assert_eq!(said_mark(None), None);
     assert_eq!(said_mark(Some(" ⏺ … ")), None);
-}
-
-/// A SEEDED DONE IS RESTATED AT THE START AND RESOLVED AT THE FIRST POINT
-/// ([`TurnEndState::seed_done`]; owner-eye-4 / behaviour-5 of the
-/// post-landing check of Autopilot v3 wave 1: a restarted loop told `open`,
-/// then the same done again, so the window stamped `done 13:27` for work
-/// finished at 13:04). ARMED, the start face is `done`; the first point
-/// over the done's own words — as drawn, or wrapped at another width —
-/// reads it again and tells NOTHING (no move: the window gives back the
-/// first time). The seed is the face's alone: every decision at the point
-/// and after its back-off is the unseeded state's. DROPPED: by a live read
-/// before the point (someone else's turn, `open`); by a reply that no
-/// longer says done (`open`, told); and WITHDRAWN where the last words are
-/// another reply's that also ends on the token (a turn no loop watched):
-/// `open` then `done` — the new done told as a move, so it is stamped anew.
-/// A seed with no words (a journal a build before the mark wrote) holds
-/// over any reply. NEGATIVE CONTROL: unseeded, the start is `open` and the
-/// first point's done is a move (`[Open, Done]`, the restart's new stamp).
-#[test]
-fn a_seeded_done_is_restated_at_the_start_and_resolved_at_the_first_point() {
-    let mark = said_mark(Some(TOKEN_REPLY));
-    assert!(mark.is_some());
-    // The faces told over the loop's start and its first point (the order
-    // `TurnEndLoop::tell_face` tells them in), and both decisions.
-    let now = t0();
-    let run = |seed: Option<Option<u64>>, said: &str, live_first: bool| {
-        let mut st = TurnEndState::default();
-        if let Some(words) = seed {
-            st.seed_done(words);
-            assert!(st.done_seed_armed());
-        }
-        let mut told = vec![st.face_start()];
-        if live_first {
-            st.took();
-            assert!(!st.done_seed_armed(), "a live read drops it");
-            told.extend(st.face_withdrawn().into_iter().chain(st.face_moved()));
-        }
-        let r = idle(said, None);
-        let a = at(&mut st, &r, now);
-        assert!(!st.done_seed_armed(), "the first point resolves it: {said}");
-        told.extend(st.face_withdrawn().into_iter().chain(st.face_moved()));
-        let later = now + st.short_wait().unwrap_or_default();
-        let later = decide_turn_end(&st, &r, &cfg(), later);
-        (told, a, later)
-    };
-    let rewrapped =
-        "Committed and pushed the parser\nand its tests; nothing\nis left.\nATERM-TASK-DONE";
-    assert_eq!(said_mark(Some(rewrapped)), mark);
-    let theirs = "Added the module docstring and committed it.\nATERM-TASK-DONE";
-    assert_ne!(said_mark(Some(theirs)), mark);
-    for (said, want) in [
-        // ARMED AND KEPT: restated, nothing more told.
-        (TOKEN_REPLY, vec![TaskFace::Done]),
-        (rewrapped, vec![TaskFace::Done]),
-        // WITHDRAWN: another reply's token, a new done.
-        (theirs, vec![TaskFace::Done, TaskFace::Open, TaskFace::Done]),
-        // DROPPED: the reply no longer says done.
-        (PROGRESS, vec![TaskFace::Done, TaskFace::Open]),
-    ] {
-        let (told, a, later) = run(Some(mark), said, false);
-        assert_eq!(told, want, "{said}");
-        // The seed is the face's alone: the decisions are the unseeded
-        // state's.
-        let (_, a0, later0) = run(None, said, false);
-        assert_eq!((a, later), (a0, later0), "{said}: no decision reads it");
-    }
-    // Dropped by someone else's turn read live before the point.
-    let (told, _, _) = run(Some(mark), TOKEN_REPLY, true);
-    assert_eq!(told, [TaskFace::Done, TaskFace::Open, TaskFace::Done]);
-    // No words kept: no words compared.
-    let (told, _, _) = run(Some(None), theirs, false);
-    assert_eq!(told, [TaskFace::Done]);
-    // NEGATIVE CONTROL: unseeded, the done is a move from open.
-    let (told, a, _) = run(None, TOKEN_REPLY, false);
-    assert_eq!(told, [TaskFace::Open, TaskFace::Done]);
-    assert_eq!(a, TurnEndAction::Nothing);
 }
 
 /// THE LAST REPLY SAID DONE ([`TurnEndState::said_done`]: under Land the
@@ -751,9 +416,9 @@ fn a_seeded_done_is_restated_at_the_start_and_resolved_at_the_first_point() {
 /// mid-landing, and the relaunch's carry-on is owed it (the review of
 /// 2026-10-16: read as done, its carry-on was settled with nothing typed,
 /// its ledger row said "its last reply said done", and a land nudge was
-/// typed in the carry-on's place). NEGATIVE CONTROLS: the first done report itself says
-/// done, and the landing's done reply in the banner's place lands the task,
-/// which says done.
+/// typed in the carry-on's place). NEGATIVE CONTROLS: the first done report
+/// itself says done, and the landing's clean defense in the banner's place
+/// lands the task, which says done.
 #[test]
 fn a_reply_a_wall_cut_never_said_done_though_the_done_report_before_it_stands() {
     let t = t0();
@@ -792,9 +457,13 @@ fn a_reply_a_wall_cut_never_said_done_though_the_done_report_before_it_stands() 
     // The relaunched agent's first point, no read having seen it run.
     st.observe(&land(idle(PROGRESS, None)), t + s(500));
     assert!(!st.said_done(), "mid-landing: the carry-on is owed");
-    // NEGATIVE CONTROL: the landing's done reply in the banner's place.
+    // NEGATIVE CONTROL: the landing's defense in the banner's place.
     let mut st = reported();
-    act(&mut st, &land(idle(done, Some(s(300)))), t + s(400));
+    act(
+        &mut st,
+        &land(idle(LANDING_REPLY, Some(s(300)))),
+        t + s(400),
+    );
     assert!(st.landed());
     assert!(st.said_done());
 }

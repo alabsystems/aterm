@@ -1299,6 +1299,36 @@ pub fn recovery_redraw_model() -> Model {
 /// `Submit`: `EditVisibleNeedsClassProof` and `ClassProofRidesOnGlyphProof` refute
 /// each. `aterm-predict`'s `an_edit_displays_only_after_its_class_is_proven` binds
 /// it to the code.
+///
+/// THE LINE EDGE (`class = 2`, `witness`, `learned`). Home, End, Ctrl-A, Ctrl-E and
+/// Delete are placed only on a WITNESSED line, one the predictor started at the
+/// cell the shell's authenticated OSC 133 `B` names as its buffer's start
+/// (`Witness`, which needs the glyph proof that started it), and shown only once
+/// the key's binding is LEARNED in the editor context (`ConfirmLineEdge`, the
+/// credited echo that teaches it: the code needs two, which the model folds into
+/// one step as `ConfirmSlow` folds two slow samples). Until then `KeyLineEdge` is
+/// a probe, pending and dark. `Contradict` is a divergence or an expiry the op
+/// heads: the binding is unlearned and the chain flushed, owed, the proof void.
+/// The witness goes with every boundary (a line ends with its epoch), and the
+/// binding with the session: a session nothing is known about has learned
+/// nothing (`FreshContextHasNoBinding`). At `Buggy=1` a line-edge key displays on
+/// the glyph proof alone and a switch keeps the binding:
+/// `LineEdgeNeedsWitnessAndBinding` and `FreshContextHasNoBinding` refute each.
+/// `aterm-predict`'s `a_line_edge_key_displays_only_when_learned_at_a_witnessed_prompt`
+/// binds it to the code.
+///
+/// THE FIRST KEY (`gate`, `first`, `witness_first`). The `B` vouches for the buffer
+/// it found empty, which only the first key typed after it meets: a line is
+/// witnessed only where the run that started it was the first key typed since a
+/// line terminator pressed at an authenticated prompt (`SubmitAtPrompt`, the
+/// code's `note_line_submit_at` with a prompt, opens the gate; every key, and every
+/// other boundary but one, shuts it). The one is `RowsMoved`, the rows moving
+/// under the screen (a scroll, the code's `observe_coordinates`): it flushes and
+/// owes as `Submit` does, and lets no key past, so it keeps the gate as it stood.
+/// `Key` records whether it was that first key
+/// (`first`), and `Witness` needs it. At `Buggy=1` any run is witnessed:
+/// `WitnessIsTheFirstKey` refutes it. The same conformance test binds it, with
+/// `Rule::WitnessFirstKey` off as its negative control.
 pub fn predictive_echo_visibility_model() -> Model {
     aterm_spec::ty_model! {
         PredictiveEchoVisibility {
@@ -1323,6 +1353,17 @@ pub fn predictive_echo_visibility_model() -> Model {
             var class = 0;
             // That class has a credited echo this epoch.
             var edit_proven = 0;
+            // The known line was started at the shell's authenticated buffer start.
+            var witness = 0;
+            // The line-edge key's binding is learned in this editor context.
+            var learned = 0;
+            // THE FIRST KEY's gate: no key since a line terminator pressed at an
+            // authenticated prompt.
+            var gate = 0;
+            // The newest key was the first typed at its prompt.
+            var first = 0;
+            // The witnessed line was started by the first key typed at its prompt.
+            var witness_first = 0;
 
             action ConfirmFast when (app_owned == 0 && pending == 0 && (owed == 0 || Buggy == 1)) {
                 fast_streak = if fast_streak <= Hide - 1 { fast_streak + 1 } else { Hide };
@@ -1360,6 +1401,9 @@ pub fn predictive_echo_visibility_model() -> Model {
             action Key when (pending == 0) {
                 pending = if app_owned == 1 && Buggy == 0 { 0 } else { 1 };
                 class = 0;
+                // The first key typed at its prompt, if the gate was open; a key shuts it.
+                first = gate;
+                gate = 0;
                 visible = if Buggy == 1 {
                     confirmed
                 } else if app_owned == 0 && confirmed == 1 && slow == 1 {
@@ -1374,6 +1418,7 @@ pub fn predictive_echo_visibility_model() -> Model {
             // any guess, displayed only on the glyph proof, the benefit AND the
             // class proof (`Buggy`: on the glyph proof alone).
             action KeyEdit when (pending == 0) {
+                gate = 0;
                 pending = if app_owned == 1 && Buggy == 0 { 0 } else { 1 };
                 class = if app_owned == 1 && Buggy == 0 { 0 } else { 1 };
                 visible = if Buggy == 1 {
@@ -1400,6 +1445,62 @@ pub fn predictive_echo_visibility_model() -> Model {
                 erased = 0;
                 retracted = 0;
             }
+            // The glyph proof started a line at the shell's authenticated buffer
+            // start: a witnessed line, where a line-edge key may be placed. Only a
+            // run the prompt's first key started meets the buffer the `B` found
+            // empty (`Buggy`: any run).
+            action Witness when (
+                witness == 0 && confirmed == 1 && app_owned == 0 && (first == 1 || Buggy == 1)
+            ) {
+                witness = 1;
+                witness_first = first;
+            }
+            // A line-edge key (Home, End, Ctrl-A, Ctrl-E, Delete) on the witnessed
+            // line: pending like any op, displayed only on the glyph proof, the
+            // benefit, the witness AND a learned binding (`Buggy`: on the glyph
+            // proof alone). Unlearned, it is a dark probe.
+            action KeyLineEdge when (pending == 0 && witness == 1) {
+                gate = 0;
+                pending = if app_owned == 1 && Buggy == 0 { 0 } else { 1 };
+                class = if app_owned == 1 && Buggy == 0 { 0 } else { 2 };
+                visible = if Buggy == 1 {
+                    confirmed
+                } else if app_owned == 0 && confirmed == 1 && slow == 1 && learned == 1 {
+                    1
+                } else {
+                    0
+                };
+                erased = 0;
+                retracted = 0;
+            }
+            // Its credited echo, the key's canonical effect, teaches the binding:
+            // only on the glyph proof with no owed echo that could be the screen's
+            // state instead, in a session that has measured its link.
+            action ConfirmLineEdge when (
+                pending == 1 && class == 2 && app_owned == 0
+                    && (owed == 0 || Buggy == 1) && (confirmed == 1 || Buggy == 1)
+            ) {
+                learned = 1;
+                pending = 0;
+                class = 0;
+                visible = 0;
+                erased = 0;
+                retracted = 0;
+            }
+            // A divergence or an expiry the line-edge op heads: the binding is
+            // unlearned, and the chain flushed: owed, the proof and the line gone.
+            action Contradict when (pending == 1 && class == 2) {
+                learned = 0;
+                pending = 0;
+                class = 0;
+                erased = visible;
+                visible = 0;
+                retracted = 0;
+                owed = 1;
+                confirmed = 0;
+                edit_proven = 0;
+                witness = 0;
+            }
             // The expired guess's key was sent: its echo is owed, and it lands on
             // the proven cell when it comes, so the proof goes with the guess.
             // `Buggy` keeps the proof (the expiry that popped and nothing else).
@@ -1412,6 +1513,8 @@ pub fn predictive_echo_visibility_model() -> Model {
                 confirmed = if Buggy == 1 { confirmed } else { 0 };
                 class = 0;
                 edit_proven = if Buggy == 1 { edit_proven } else { 0 };
+                // The proof is void, and with it the line it witnessed.
+                witness = if Buggy == 1 { witness } else { 0 };
             }
             action Echo when (pending == 1) {
                 pending = 0;
@@ -1427,6 +1530,7 @@ pub fn predictive_echo_visibility_model() -> Model {
                 confirmed = if Buggy == 1 { confirmed } else { 0 };
                 class = if Buggy == 1 { class } else { 0 };
                 edit_proven = if Buggy == 1 { edit_proven } else { 0 };
+                witness = if Buggy == 1 { witness } else { 0 };
                 erased = 0;
                 retracted = 0;
             }
@@ -1437,6 +1541,7 @@ pub fn predictive_echo_visibility_model() -> Model {
                 confirmed = 0;
                 class = 0;
                 edit_proven = if Buggy == 1 { edit_proven } else { 0 };
+                witness = 0;
                 erased = 0;
                 retracted = 0;
             }
@@ -1448,6 +1553,48 @@ pub fn predictive_echo_visibility_model() -> Model {
                 // The class proof is the epoch's: `Buggy` carries it into the next
                 // line (a motion proven at the shell, shown in the `cat` Enter starts).
                 edit_proven = if Buggy == 1 { edit_proven } else { 0 };
+                // …and the witness is the line's, which ends with its epoch.
+                witness = if Buggy == 1 { witness } else { 0 };
+                // A boundary that is no line terminator at a prompt (a key not
+                // modelled, a terminator where none was in front) shuts the gate.
+                gate = 0;
+                first = 0;
+                erased = 0;
+                retracted = 0;
+                owed = 1;
+            }
+            // `Submit` by a line terminator pressed at an authenticated prompt
+            // (`note_line_submit_at` with a prompt): the next key is the first
+            // typed at whatever prompt follows, and the gate opens for it.
+            action SubmitAtPrompt {
+                pending = 0;
+                visible = 0;
+                confirmed = 0;
+                class = 0;
+                edit_proven = if Buggy == 1 { edit_proven } else { 0 };
+                witness = if Buggy == 1 { witness } else { 0 };
+                gate = 1;
+                first = 0;
+                erased = 0;
+                retracted = 0;
+                owed = 1;
+            }
+            // Rows moved under the screen (`aterm-predict`'s `observe_coordinates`:
+            // the content-coordinate generation changed): every guess goes as at
+            // `Submit`, owed, the proof and the line with them, but THE FIRST
+            // KEY's gate and whether the newest key was the first stand as they
+            // stood. A scroll lets no key past the predictor, so the next key it
+            // is handed is still the first since the terminator that opened the
+            // gate: a shell on the bottom row scrolls the screen with every
+            // Enter's own output, before the next prompt's first key. (A host
+            // reset may have let keys past, and is `Submit`.)
+            action RowsMoved {
+                pending = 0;
+                visible = 0;
+                confirmed = 0;
+                class = 0;
+                edit_proven = if Buggy == 1 { edit_proven } else { 0 };
+                witness = if Buggy == 1 { witness } else { 0 };
                 erased = 0;
                 retracted = 0;
                 owed = 1;
@@ -1466,6 +1613,13 @@ pub fn predictive_echo_visibility_model() -> Model {
                 pending = 0;
                 class = 0;
                 edit_proven = if Buggy == 1 { edit_proven } else { 0 };
+                // A session nothing is known about has learned no binding (`Buggy`
+                // keeps the last session's: its line editor taught it, not this one's).
+                learned = if Buggy == 1 { learned } else { 0 };
+                witness = 0;
+                // What was typed at the session just left says nothing of this one.
+                gate = 0;
+                first = 0;
                 visible = 0;
                 erased = 0;
                 // Dropping the estimate is not a RETRACTION: nothing was measured
@@ -1484,8 +1638,9 @@ pub fn predictive_echo_visibility_model() -> Model {
             bound Bounds:
                 app_owned <= 1 && slow <= 1 && confirmed <= 1 &&
                 pending <= 1 && visible <= 1 && erased <= 1 && fresh <= 1 &&
-                fast_streak <= Hide && retracted <= 1 && owed <= 1 && class <= 1 &&
-                edit_proven <= 1;
+                fast_streak <= Hide && retracted <= 1 && owed <= 1 && class <= 2 &&
+                edit_proven <= 1 && witness <= 1 && learned <= 1 && gate <= 1 && first <= 1 &&
+                witness_first <= 1;
             invariant AppOwnedHasNoPrediction:
                 if app_owned == 1 { pending == 0 && visible == 0 } else { 1 == 1 };
             invariant FastAdaptiveNeverPaints:
@@ -1524,6 +1679,19 @@ pub fn predictive_echo_visibility_model() -> Model {
             // ends the other.
             invariant ClassProofRidesOnGlyphProof:
                 if edit_proven == 1 { confirmed == 1 } else { 1 == 1 };
+            // A line-edge key displays only on a witnessed line, its binding learned.
+            invariant LineEdgeNeedsWitnessAndBinding:
+                if visible == 1 {
+                    if class == 2 { learned == 1 && witness == 1 } else { 1 == 1 }
+                } else {
+                    1 == 1
+                };
+            // A session nothing is known about has learned nothing.
+            invariant FreshContextHasNoBinding:
+                if fresh == 1 { learned == 0 } else { 1 == 1 };
+            // A witnessed line was started by the first key typed at its prompt.
+            invariant WitnessIsTheFirstKey:
+                if witness == 1 { witness_first == 1 } else { 1 == 1 };
         }
     }
 }

@@ -1,14 +1,14 @@
-# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (the rows' labels `Ug.label` N:L343317@14097 and `fableAtWeeklySuffix` (`Kvt` N:L363373@13847), the kinds `X()` N:L363373@9597, their order `Xe` N:L363373@9476 (the walled limit's own kind first, a Fable reset at a weekly wall last), the rows' order N:L371456@33701; N is a `strings -n 8` dump of the 2.1.304 executable, not kept in the tree; crates/aterm-phase/src/reset.rs's module doc cites the same positions), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; same Dialog component), the values are invented · OPEN: replace with a capture (SPEC §6) · the usage-limit dialog at a weekly limit with THREE kinds of reset on offer: a weekly, a full and a Fable reset, second to fourth
+# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (byte offsets into the store's 2.1.304 binary, docs/SPEC-claude-accounts-resets-2026-10-02.md §0: the grant rows' label `Ug.label` @225876351 filled by `Kg` @225879482, the kinds' names `X()` @244629154; the dialog's rows `so()` @257500437: the stop row, one row per kind on offer @257504167 (the wall's own kind first, `Xe` @244629033), the wait row, the credits row), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; the same Dialog component in 2.1.304), the values are invented · OPEN: replace with a capture (SPEC §6) · the usage-limit dialog at a five-hour limit with three kinds on offer, in the vendor's order: the 5-hour reset, the weekly reset, the full reset
 ⏺ Suites are running; I'll report the number when it lands.
 
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
    What do you want to do?
 
    ❯ 1. Stop and wait for limit to reset
-     2. Use a weekly reset (1 left, until Oct 7)
-     3. Use a full reset (2 left, until Oct 5)
-     4. Use a Fable reset (1 left, until Oct 6) · frees up only what Fable used this week
-     5. Wait here, then continue automatically at Oct 9 at 5am
+     2. Use a 5-hour reset (2 left, until Oct 5)
+     3. Use a weekly reset (1 left, until Oct 9)
+     4. Use a full reset (1 left, until Oct 5)
+     5. Wait here, then continue automatically at 3pm
      6. Switch to usage credits
 
    Enter to confirm · Esc to cancel

@@ -151,7 +151,9 @@ fn running() -> String {
 
 /// What the stand-in serves, and what it saw.
 struct World {
-    blocks2: String,
+    /// The shell's blocks after the exit ([`blocks`]), which a reset rig
+    /// ([`Rig::reset`]) serves anew.
+    blocks2: Arc<Mutex<String>>,
     after_exit: String,
     after_relaunch: String,
     status: String,
@@ -193,7 +195,7 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                 "OK {}",
                 match &after.running {
                     Some(now) if !relaunched => now.clone(),
-                    _ => served(&after.blocks, &w.blocks2),
+                    _ => served(&after.blocks, &w.blocks2.lock().expect("blocks")),
                 }
             ),
             "blocktext" => "OK 0".to_string(),
@@ -459,6 +461,7 @@ struct Rig {
     crash: PathBuf,
     exe: PathBuf,
     twin: PathBuf,
+    blocks2: Arc<Mutex<String>>,
     after: Arc<Mutex<After>>,
 }
 
@@ -504,8 +507,9 @@ impl Rig {
         let exited = Arc::new(AtomicBool::new(true));
         let relaunched = Arc::new(AtomicBool::new(false));
         let after = Arc::new(Mutex::new(After::default()));
+        let blocks2 = Arc::new(Mutex::new(blocks(status, word, later)));
         let w = World {
-            blocks2: blocks(status, word, later),
+            blocks2: Arc::clone(&blocks2),
             after_exit: shell_after(),
             after_relaunch: agy_idle(),
             status: "OK schema=1 hold=0 hand=- integration=on".to_string(),
@@ -552,9 +556,47 @@ impl Rig {
             crash,
             exe,
             twin,
+            blocks2,
             opts,
             dir,
         }
+    }
+
+    /// The rig [`Rig::new`] makes for `status`, `word`, `later` and
+    /// `crash_left`, on this rig's scratch tree, store build and stand-in:
+    /// agy's config made afresh (the conversation's presence lock, the dead
+    /// pid's crash file where it is left, nothing else), the state and home
+    /// directories gone, the stand-in serving the exit's blocks and nothing
+    /// after the line, its log empty, and the kernel's agy exited, not
+    /// stopped, nothing relaunched, no other holder and no knob turned. A
+    /// walk over many worlds resets one rig per world instead of making and
+    /// removing one: the scratch tree and the stand-in's socket and thread
+    /// were most of its time.
+    fn reset(&mut self, status: i64, word: bool, later: bool, crash_left: bool) {
+        for dir in [&self.opts.state, &self.opts.home, &self.config] {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("{}: {e}", dir.display()),
+            }
+        }
+        std::fs::create_dir_all(self.config.join(ag::PRESENCE)).expect("presence");
+        std::fs::create_dir_all(self.config.join(ag::CRASHES)).expect("crashes");
+        std::fs::write(&self.lock, "").expect("lock");
+        if crash_left {
+            std::fs::write(&self.crash, "").expect("crash file");
+        }
+        *self.blocks2.lock().expect("blocks") = blocks(status, word, later);
+        *self.after.lock().expect("after") = After::default();
+        self.asked.lock().expect("log").clear();
+        let k = &mut self.kernel;
+        k.exited.store(true, Ordering::SeqCst);
+        k.stopped.store(false, Ordering::SeqCst);
+        k.relaunched.store(false, Ordering::SeqCst);
+        k.holder = false;
+        k.knobs = Knobs::default();
+        k.lock_reads.store(0, Ordering::SeqCst);
+        k.opener_reads.store(0, Ordering::SeqCst);
     }
 
     /// The snapshot the host took of the agy while it ran: launched by its
@@ -616,9 +658,27 @@ impl Rig {
         )
     }
 
+    /// [`exit_record`] over the real look at this rig's exit. Nothing a look
+    /// asks moves the stand-in or the kernel, so the world stands still while
+    /// it is looked at: the second look is real and must read what the first
+    /// did, and every later one is the first's again. `exit_record`'s loop runs
+    /// whole over them (its waits and their count are `relaunch_tests`'), but
+    /// an undecided exit's 81 looks are two connects to the stand-in, not 81.
     fn look(&self, snap: &Snapshot) -> ExitRecord {
+        let (mut first, mut looks) = (None, 0);
         exit_record(
-            || Some(look_at_exit(&self.opts, snap, &self.kernel)),
+            || {
+                looks += 1;
+                if looks <= 2 {
+                    let now = look_at_exit(&self.opts, snap, &self.kernel);
+                    assert_eq!(
+                        *first.get_or_insert_with(|| now.clone()),
+                        now,
+                        "a look moved"
+                    );
+                }
+                first.clone()
+            },
             |_| true,
         )
     }
@@ -2024,7 +2084,9 @@ fn tier1_the_real_agy_exit_read_conforms_to_the_model() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let m = aterm_models_harness::harness_agy_exit_witness_model();
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    let draw = |name: String, exit: i64, word: bool, later: bool, swept: bool| {
+    // One rig, reset to each world in turn ([`Rig::reset`]).
+    let mut rig = Rig::new("tier1", 0, true, false, false);
+    let draw = |rig: &mut Rig, exit: i64, word: bool, later: bool, swept: bool| {
         let status = match exit {
             1 => 137,
             2 => 0,
@@ -2032,9 +2094,8 @@ fn tier1_the_real_agy_exit_read_conforms_to_the_model() {
             _ => 2,
         };
         let crash_left = matches!(exit, 1 | 3 | 5) && !swept;
-        let rig = Rig::new(&name, status, word, later, crash_left);
+        rig.reset(status, word, later, crash_left);
         rig.kernel.stopped.store(exit == 3, Ordering::SeqCst);
-        rig
     };
     let kept = |kept: i64| match kept {
         1 => ExitRecord::Crashed,
@@ -2071,7 +2132,7 @@ fn tier1_the_real_agy_exit_read_conforms_to_the_model() {
             };
             let mut after = st.clone();
             assert!(m.fire(look, &mut after), "{look} at {st:?}");
-            let rig = draw(format!("look-{looks}"), st["exit"], word, later, swept);
+            draw(&mut rig, st["exit"], word, later, swept);
             let left = rig.look(&rig.snap(witness));
             assert_eq!(left, kept(after["kept"]), "the look at {st:?}");
             for mutant in ["LookAsClaude", "RefusalAsCrash", "CrashFileIgnored"] {
@@ -2096,13 +2157,7 @@ fn tier1_the_real_agy_exit_read_conforms_to_the_model() {
         attempts += 1;
         let mut after = st.clone();
         assert!(m.fire("Decide", &mut after), "Decide at {st:?}");
-        let rig = draw(
-            format!("attempt-{attempts}"),
-            st["exit"],
-            word,
-            later,
-            swept,
-        );
+        draw(&mut rig, st["exit"], word, later, swept);
         let r = rig.attempt(&rig.snap(witness), &kept(st["kept"]), ExitCause::Exit);
         let relaunched = r.step == "continued";
         assert_eq!(

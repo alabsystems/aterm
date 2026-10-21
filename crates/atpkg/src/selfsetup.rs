@@ -191,12 +191,6 @@ impl ShellEnv {
             .map_or("", |s| s.rsplit('/').next().unwrap_or(s))
     }
 
-    fn path_has(&self, dir: &Path) -> bool {
-        self.path
-            .as_ref()
-            .is_some_and(|p| std::env::split_paths(p).any(|entry| entry == dir))
-    }
-
     /// The first `name` on `$PATH` that is a file.
     fn on_path(&self, name: &str) -> Option<PathBuf> {
         let path = self.path.as_ref()?;
@@ -511,27 +505,36 @@ const CAFFEINE_FILES: [&str; 4] = [
     "caffeine.lock",
 ];
 
+/// The line a self-uninstall adds to the toolset decline its own sweep recorded but left for an
+/// aterm it kept: the run that removes that aterm then knows the decline for the sweep's, not
+/// the person's.
+const SWEPT_DECLINE_TAG: &str = "# Recorded by aterm pkg self-uninstall for an aterm it kept.";
+
 /// The prefix of every launchd label `aterm caffeine` makes, its login plists' names.
 const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.caffeine";
 
 /// Retire the going builds' startup jobs and the running mug through their own command.
-/// Shared files go only after every admitted step succeeded and the existing mug lock is
-/// acquired for the whole cleanup. A refusal, unsupported helper, or unknown/busy lock keeps
-/// them. The lock rendezvous itself stays: unlinking a held lock would let another serve
-/// create a different inode while this cleanup still holds the old one.
-fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) {
+/// Shared files go only after every admitted step succeeded and the mug lock is acquired for
+/// the whole cleanup. A refusal, unsupported helper, or unknown/busy lock keeps them. The
+/// lock rendezvous itself stays: unlinking a held lock would let another serve create a
+/// different inode while this cleanup still holds the old one. Returns the bundles whose
+/// step failed: each is kept, as its `aterm caffeine` is what that step needs again.
+fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let support = p.support();
-    let files: Vec<PathBuf> = CAFFEINE_FILES
-        .iter()
-        .map(|name| support.join(name))
-        .filter(|path| present(path))
-        .collect();
+    let listed = || -> Vec<PathBuf> {
+        CAFFEINE_FILES
+            .iter()
+            .map(|name| support.join(name))
+            .filter(|path| present(path))
+            .collect()
+    };
+    let files = listed();
     let login_plist = sorted_entries(&p.home.join("Library/LaunchAgents"))
         .iter()
         .filter_map(|plist| plist.file_name().and_then(|n| n.to_str()))
         .any(|name| name.starts_with(CAFFEINE_LABEL_PREFIX) && name.ends_with(".plist"));
     if files.is_empty() && !login_plist {
-        return;
+        return Vec::new();
     }
     let steps: &[&[&str]] = if s.outsider.is_some() {
         &[&["caffeine", "startup", "off"]]
@@ -539,7 +542,7 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) {
         &[&["caffeine", "startup", "off"], &["caffeine", "quit"]]
     };
     let mut supported = false;
-    let mut failed = false;
+    let mut failed = Vec::new();
     for dir in app_dirs {
         let app = dir.join("aterm.app");
         let aterm = app.join("Contents/MacOS/aterm");
@@ -565,10 +568,16 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) {
             match run_quietly(&aterm, args) {
                 0 => s.say(&format!("ran {line}")),
                 rc => {
-                    failed = true;
+                    if !failed.contains(&app) {
+                        failed.push(app.clone());
+                    }
                     s.skip(
                         &line,
-                        &format!("it failed (exit {rc}) — run it by hand to see why"),
+                        &format!(
+                            "it failed (exit {rc}) — run it by hand to see why; {} is kept \
+                             for it",
+                            app.display()
+                        ),
                     );
                 }
             }
@@ -578,21 +587,24 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) {
         for path in files {
             s.rm_shared(&path, "Caffeine file");
         }
-        return;
+        return failed;
     }
     if s.dry {
         s.say("Caffeine file removal requires an acquired idle lock; the lock itself stays");
-        return;
+        return failed;
     }
+    // Listed again: `caffeine quit` removes the ended mug's copy itself, and an older build's
+    // may have written a state file the first look did not see.
+    let files = listed();
     if files.is_empty() {
-        return;
+        return failed;
     }
-    if !supported || failed {
+    if !supported || !failed.is_empty() {
         s.skip(
             &support.display().to_string(),
             "Caffeine stop was not confirmed; its files are kept",
         );
-        return;
+        return failed;
     }
     let lock = support.join("caffeine.lock");
     let Some(_hold) = caffeine_cleanup_hold(&lock) else {
@@ -600,8 +612,10 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) {
             &lock.display().to_string(),
             "Caffeine lock is busy or could not be acquired; its files are kept",
         );
-        return;
+        return failed;
     };
+    // Listed once more, the lock with them: the hold makes it where no mug ever did.
+    let files = listed();
     for path in files {
         if path == lock {
             s.say(&format!(
@@ -613,14 +627,19 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) {
             s.rm_shared(&path, "Caffeine file");
         }
     }
+    failed
 }
 
-/// Hold the existing, physical, owned regular rendezvous without waiting. Missing/error is
-/// unknown; a temporary probe would not preserve custody through the removals.
+/// Hold the physical, owned regular rendezvous without waiting, made (`0600`) when no mug
+/// ever made it: a `serve` starting meanwhile opens the same file and finds it held. An
+/// error is unknown; a temporary probe would not preserve custody through the removals.
 fn caffeine_cleanup_hold(path: &Path) -> Option<crate::lock::Flock> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
@@ -675,7 +694,10 @@ pub fn self_uninstall(
     };
     let support = p.support();
     let decline = support.join("pkg/declined");
-    let decline_before = present(&decline);
+    // A decline here before this run is the person's, unless a sweep tagged it as its own.
+    let decline_tagged = std::fs::read_to_string(&decline)
+        .is_ok_and(|text| text.lines().any(|line| line == SWEPT_DECLINE_TAG));
+    let decline_before = present(&decline) && !decline_tagged;
     let app_dirs = p.app_dirs();
 
     // 0. THE TOOLCHAIN STORE, BEFORE THE BUNDLE THAT OWNS IT: the bundle's atpkg is the
@@ -751,8 +773,9 @@ pub fn self_uninstall(
         (None, _) => {}
     }
 
-    // 0b. THE CAFFEINE MUG, BEFORE THE BUNDLE IT RUNS FROM: see `sweep_caffeine`.
-    sweep_caffeine(&mut s, p, &app_dirs);
+    // 0b. THE CAFFEINE MUG, BEFORE THE BUNDLE IT RUNS FROM: see `sweep_caffeine`. A bundle
+    //     whose step failed is kept: its `aterm caffeine` is the remedy.
+    let caffeine_kept = sweep_caffeine(&mut s, p, &app_dirs);
 
     // 1. App bundles — every candidate dir (the scope alone, when set), aterm's only. The
     //    updater's apply leaves the outgoing bundle at `aterm.app.rollback`.
@@ -768,6 +791,12 @@ pub fn self_uninstall(
                     "kept: its atpkg is what removes the ALab toolchain store, and that removal \
                      did not finish (above)",
                 );
+            } else if caffeine_kept.contains(&app) {
+                s.skip(
+                    &app.display().to_string(),
+                    "kept: its `aterm caffeine` is what stops the Caffeine mug, and that did \
+                     not finish (above)",
+                );
             } else if bundle_is_ours(&app) {
                 s.rm(&app, "app bundle");
             } else {
@@ -782,14 +811,27 @@ pub fn self_uninstall(
 
     // 1b. THE DECLINE THIS RUN'S SWEEP RECORDED: `uninstall --all` writes it for an aterm
     //     that stays; left once that aterm is gone, it would turn off the toolset half of
-    //     every later install. A decline here before this run is the person's and stays.
-    if swept && !dry && !decline_before && decline.is_file() {
+    //     every later install. A decline here before this run is the person's and stays. One
+    //     an aterm kept above still needs is tagged, so the run that removes it removes the
+    //     decline too.
+    if (swept || decline_tagged) && !dry && !decline_before && decline.is_file() {
         let app_left = app_dirs.iter().any(|d| {
             let app = d.join("aterm.app");
             app.is_dir() && bundle_is_ours(&app)
         });
         if !app_left {
             let _ = std::fs::remove_file(&decline);
+        } else if !decline_tagged {
+            let tagged = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&decline)
+                .and_then(|mut file| writeln!(file, "{SWEPT_DECLINE_TAG}"));
+            if let Err(e) = tagged {
+                s.say(&format!(
+                    "could not mark {} as this uninstall's: {e}",
+                    decline.display()
+                ));
+            }
         }
     }
 
@@ -1248,7 +1290,7 @@ fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
              instead",
             env.shell.as_deref().unwrap_or("<unset>")
         ),
-        Some(rc) if std::fs::read_to_string(&rc).is_ok_and(|t| t.contains(PATH_BLOCK_START)) => {
+        Some(rc) if std::fs::read_to_string(&rc).is_ok_and(|t| t.contains(&path_block(p, env))) => {
             format!(
                 "PATH: already wired — {} carries the managed block; no edit",
                 rc.display()
@@ -1257,17 +1299,81 @@ fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
         Some(_) if !(coming || hook_of(p, env.shell_name()).is_file()) => {
             "PATH: no edit — no ALab toolset to put on PATH".to_string()
         }
-        Some(rc) => format!(
-            "PATH: appends ONE marker-fenced block to {} — the toolset hook + {}",
-            rc.display(),
-            p.bin_dir.display()
-        ),
+        Some(rc) => {
+            let verb = if std::fs::read_to_string(&rc).is_ok_and(|t| t.contains(PATH_BLOCK_START)) {
+                "updates the"
+            } else {
+                "appends ONE"
+            };
+            format!(
+                "PATH: {verb} marker-fenced block to {} — the toolset hook + {}",
+                rc.display(),
+                p.bin_dir.display()
+            )
+        }
     };
     let _ = writeln!(out, "atpkg: {line}");
 }
 
-/// Append the managed block to the shell's profile: the toolset hook, sourced when it is
-/// there, and the bin dir when PATH lacks it — the ONE block the sweep's marker pair undoes.
+/// The CLI link directory leads an inherited bundle. Source the package hook AFTER
+/// that move so reroute/agents retain first priority and the managed package bin stays
+/// appended. The runtime move also fixes a directory already present later on PATH.
+fn path_block(p: &Places, env: &ShellEnv) -> String {
+    let hook = hook_of(p, env.shell_name());
+    let body = if env.shell_name() == "fish" {
+        let bin = crate::hooks::fish_quote(&p.bin_dir);
+        let hook = crate::hooks::fish_quote(&hook);
+        format!(
+            "set -l __aterm_cli_bin \"{bin}\"\n\
+             set -l __aterm_cli_rest\n\
+             for __aterm_cli_entry in $PATH; if test \"$__aterm_cli_entry\" != \"$__aterm_cli_bin\"; set __aterm_cli_rest $__aterm_cli_rest \"$__aterm_cli_entry\"; end; end\n\
+             set -gx PATH \"$__aterm_cli_bin\" $__aterm_cli_rest\n\
+             if test -f \"{hook}\"; source \"{hook}\"; end\n"
+        )
+    } else {
+        let bin = crate::hooks::sh_quote(&p.bin_dir);
+        let hook = crate::hooks::sh_quote(&hook);
+        format!(
+            "__aterm_cli_bin=\"{bin}\"\n\
+             __aterm_cli_path=\":$PATH:\"\n\
+             while :; do __aterm_cli_next=\"${{__aterm_cli_path//\":$__aterm_cli_bin:\"/:}}\"; [ \"$__aterm_cli_next\" = \"$__aterm_cli_path\" ] && break; __aterm_cli_path=\"$__aterm_cli_next\"; done\n\
+             case \"$__aterm_cli_path\" in :) export PATH=\"$__aterm_cli_bin\" ;; *) __aterm_cli_path=\"${{__aterm_cli_path#:}}\"; __aterm_cli_path=\"${{__aterm_cli_path%:}}\"; export PATH=\"$__aterm_cli_bin:$__aterm_cli_path\" ;; esac\n\
+             unset __aterm_cli_bin __aterm_cli_path __aterm_cli_next\n\
+             if [ -f \"{hook}\" ]; then . \"{hook}\"; fi\n"
+        )
+    };
+    format!("{PATH_BLOCK_START}\n{body}{PATH_BLOCK_END}\n")
+}
+
+/// Replace only the exact managed section, preserving every byte around it.
+fn profile_with_path_block(text: &str, block: &str) -> Result<String, &'static str> {
+    let (mut start, mut end, mut offset) = (None, None, 0);
+    for line in text.split_inclusive('\n') {
+        match line.trim_end_matches(['\r', '\n']) {
+            PATH_BLOCK_START if start.is_none() && end.is_none() => start = Some(offset),
+            PATH_BLOCK_END if start.is_some() && end.is_none() => end = Some(offset + line.len()),
+            PATH_BLOCK_START | PATH_BLOCK_END => {
+                return Err("the profile has ambiguous PATH block markers");
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    match (start, end) {
+        (Some(start), Some(end)) => Ok(format!("{}{block}{}", &text[..start], &text[end..])),
+        (None, None) => {
+            let separator = if text.is_empty() || text.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            };
+            Ok(format!("{text}{separator}{block}"))
+        }
+        _ => Err("the profile has an incomplete PATH block"),
+    }
+}
+
+/// Append or upgrade only the managed profile block, keeping the user's other text.
 /// `true` when a block stands in the profile afterwards.
 fn wire_path(
     p: &Places,
@@ -1294,7 +1400,23 @@ fn wire_path(
         let _ = writeln!(out, "atpkg: PATH: no edit — no ALab toolset to put on PATH");
         return false;
     }
-    if std::fs::read_to_string(&rc).is_ok_and(|t| t.contains(PATH_BLOCK_START)) {
+    let text = match std::fs::read_to_string(&rc) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            let _ = writeln!(err, "atpkg: cannot read {}: {e}", rc.display());
+            return false;
+        }
+    };
+    let block = path_block(p, env);
+    let updated = match profile_with_path_block(&text, &block) {
+        Ok(updated) => updated,
+        Err(why) => {
+            let _ = writeln!(err, "atpkg: {}: {why}; no edit", rc.display());
+            return false;
+        }
+    };
+    if updated == text {
         let _ = writeln!(
             out,
             "atpkg: ALab toolset already on PATH via {}",
@@ -1302,60 +1424,56 @@ fn wire_path(
         );
         return true;
     }
-    // `if` rather than `[ -f … ] && .`: as a profile's LAST statement the && form leaves a
-    // status of 1 whenever the hook is absent.
-    let hook_s = hook.display();
-    let line = if shell == "fish" {
-        format!("if test -f \"{hook_s}\"; source \"{hook_s}\"; end")
-    } else {
-        format!("if [ -f \"{hook_s}\" ]; then . \"{hook_s}\"; fi")
-    };
     let bin = p.bin_dir.display();
-    let path_line = (!env.path_has(&p.bin_dir)).then(|| {
-        if shell == "fish" {
-            format!("if not contains -- \"{bin}\" $PATH; set -gx PATH $PATH \"{bin}\"; end")
-        } else {
-            format!("case \":$PATH:\" in *\":{bin}:\"*) ;; *) export PATH=\"$PATH:{bin}\" ;; esac")
+    // Follow an existing profile symlink without replacing the link itself.
+    let destination = if rc.is_symlink() {
+        match rc.canonicalize() {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = writeln!(err, "atpkg: cannot resolve {}: {e}", rc.display());
+                return false;
+            }
         }
-    });
-    let mut block = format!("\n{PATH_BLOCK_START}\n{line}\n");
-    if let Some(pl) = &path_line {
-        block.push_str(pl);
-        block.push('\n');
-    }
-    block.push_str(PATH_BLOCK_END);
-    block.push('\n');
-    if let Some(parent) = rc.parent() {
+    } else {
+        rc.clone()
+    };
+    if let Some(parent) = destination.parent() {
         let _ = made_dir(parent);
     }
-    let wrote = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rc)
-        .and_then(|mut f| f.write_all(block.as_bytes()));
+    let tmp = destination.with_file_name(format!(".aterm-profile.{}", std::process::id()));
+    let wrote = (|| {
+        let mode = destination
+            .metadata()
+            .map(|m| m.mode() & 0o777)
+            .unwrap_or(0o600);
+        let mut file = crate::platform::open_create_new_write(&tmp, mode)?;
+        let written = file
+            .write_all(updated.as_bytes())
+            .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)));
+        drop(file);
+        written
+            .and_then(|()| std::fs::rename(&tmp, &destination))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+    })();
     if wrote.is_err() {
         let _ = writeln!(
             err,
             "atpkg: NOTE: could not write {} — add this line yourself for the ALab toolset on \
-             PATH:\n  {line}",
+             PATH:\n{block}",
             rc.display()
         );
         return false;
     }
     let rc_s = rc.display();
-    let said = match (path_line.is_some(), hook.is_file()) {
-        (true, true) => {
-            format!("added the ALab toolset and {bin} to PATH in {rc_s} — open a new shell")
-        }
-        (true, false) => format!(
+    let said = if hook.is_file() {
+        format!("added the ALab toolset and {bin} to PATH in {rc_s} — open a new shell")
+    } else {
+        format!(
             "added {bin} to PATH in {rc_s} — open a new shell; the ALab toolset joins it after \
              aterm's first launch"
-        ),
-        (false, true) => format!("added the ALab toolset to PATH in {rc_s} — open a new shell"),
-        (false, false) => format!(
-            "added the ALab toolset to PATH in {rc_s} — active in new shells after aterm's \
-             first launch"
-        ),
+        )
     };
     let _ = writeln!(out, "atpkg: {said}");
     true

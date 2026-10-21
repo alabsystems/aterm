@@ -51,6 +51,15 @@ use aterm_spec::derive::Model;
 /// * `swept` — the UI thread's status sweep has observed the reclaimed shell.
 /// * `hij` — 1 when the job's modes include an input-hijacking one (`Launch`; its writes arm
 ///   bracketed paste too), 0 for display modes only (`OneShot`: `tput smcup` / `tput civis`).
+/// * The kernel edges (card engine §3.3): `img` — the job has `exec`'d its new image (atpkg's shim
+///   becoming the store build); `kq` — that `exec`'s `NOTE_EXEC` is pending in the session's
+///   process watch, unheard; `qx` — how many of the queued job bytes are the new image's (the
+///   last `qx` of `qj`, FIFO). The cutter's clean point is the offset of the last poll that found
+///   the watch quiet; `xo`/`xn` — the old/new image's bytes in the open batch after it, `nc` — a
+///   new image's byte before it (a quiet poll after the `exec`, or a batch that ended holding one
+///   unheard). `xedge` — the open batch carries an Exec edge. `early` — history: an Exec edge cut
+///   with a new image's byte before the cut; `mixed` — one laid with an old image's byte read
+///   before the event inside the new image's run.
 ///
 /// Actions: `Launch` (zle turns 2004 off, the job gets the terminal), its display-only twin
 /// `OneShot`, or `Adopt` (the reader attached mid-job: its first sample is the job and the job's
@@ -64,13 +73,38 @@ use aterm_spec::derive::Model;
 /// sample: unchanged moves the cut forward, changed sets `edge` and delivers); `Deliver` (the
 /// batch-end sample); `Parse` (side 1, the handback at the cut iff there is evidence, side 2);
 /// `Sweep` (the UI thread's status sweep sees the shell back in front, unordered against the byte
-/// stream and blind to whether the job left dead or stopped).
+/// stream and blind to whether the job left dead or stopped). `Exec` (the job holding the terminal
+/// `exec`s; its knote fires) and `ObserveExec` (`FgCutter::proc_seen`: a poll the gather already
+/// makes hears the watch, at batch start or in a park, and `tcgetpgrp` read there decides the
+/// kind: the job in front of a cutter still at the shell is a Group edge cut at the last sample,
+/// like `Park`'s; the job in front of a cutter already at it is an Exec edge, cut at the clean
+/// point and laid where it was heard, and the batch delivers; the shell in front folds the
+/// event). A poll that finds the watch readable reports it before the master (`ReadJob` and
+/// `ReadShell` after a park wait for `ObserveExec`). `Deliver` hears a sampled edge's own leader's
+/// queued `exec` with it (`ExecEdges::absorb`) and takes no batch-end sample after an Exec edge.
+/// `Deliver` is never taken with an unheard `exec` whose new image's bytes the batch holds
+/// (R2x): the gather ends no batch past an `exec` the watch could hear. A batch under one tty
+/// queue ends at a poll of the watch and the master, a park's quiet wait proves the batch, and
+/// any other batch end asks the watch once more and hears it there (aterm-pty's
+/// `no_batch_ends_past_an_exec_the_watch_could_hear`, and the blocking fallback's
+/// `the_blocking_fallback_hears_the_watch_at_each_chunk`, each with negative controls). It was
+/// an assumption until A2's review; the guard is now the code's. An `exec` heard while the open
+/// batch carries an edge waits (`ObserveExec` needs `edge == 0 && xedge == 0`): unless
+/// `Deliver` absorbs it as the sampled edge's own leader's, it is observed after the batch, at
+/// `rd == 0` and before any read (`ReadJob` after a park waits for it), which is the gather's
+/// byte-free replay at the next batch's start (`ExecEdges::replay`). The model has one `exec`;
+/// the kernel coalesces a process's `exec`s between two drains into one event (`EV_CLEAR`). An
+/// old image's bytes still queued when the `exec` is heard (R1x, as R1) are read into the new
+/// image's run.
 ///
 /// Invariants: `PromptNotHijacked` — once the shell's output is parsed, no program mode is in
 /// force unless R1's tail put it back, the job is alive (`life == 5`), or they are a one-shot's
 /// display modes (`hij == 0`). `OneShotKeepsItsModes` — a display-only job's parsed modes stay in
 /// force. `ShellKeepsItsOwnModes` — once the shell's output is parsed, its `2004h` is in force.
 /// `JobKeepsItsModesWhileAlive` — the job's parsed modes stay in force while it exists.
+/// `ExecCutBlind` — an Exec edge's cut has no byte of the new image before it: the cutter was
+/// still blind to the `exec` there. `ExecSpanClean` — the new image's run holds no old byte read
+/// before the event was heard.
 ///
 /// Constants: `Buggy = 1` restores modes from the status sweep instead of in-stream: a sweep after
 /// the prompt switches the shell's `2004h` off (`ShellKeepsItsOwnModes`), one not yet run leaves
@@ -82,13 +116,22 @@ use aterm_spec::derive::Model;
 /// (`JobKeepsItsModesWhileAlive`). `Carry = 0` seeds a restarted reader with a fresh probe, so a
 /// job that died while the readers were parked leaves no edge (`PromptNotHijacked`).
 /// `Display = 1` counts display modes alone as orphaned, so `tput smcup` is reverted when `tput`
-/// exits (`OneShotKeepsItsModes`).
+/// exits (`OneShotKeepsItsModes`). `Buggy = 2` cuts an Exec edge at the offset of the poll that
+/// heard it, so the new image's first bytes read in the spin before that poll land in the old
+/// image's run (`ExecCutBlind`). `Buggy = 3` lays the new image's run at the cut, so the old
+/// image's last bytes read after the clean point land in it (`ExecSpanClean`). Dropping the
+/// watch's place before the master in a poll, or `Deliver`'s R2x guard, breaks the committed
+/// model's cleanliness at `Buggy = 0` (the guard's removal fails the exec conformance walk's
+/// `the committed model is clean`, run 2026-10-20).
 ///
 /// Tier-1 (`aterm-gui/src/foreground_handback_conformance.rs`) drives the real PTY reader (gather
 /// and parse threads) with a scripted foreground probe through the killed-holder, adopted,
 /// stop/`fg`, parked-reader and holder-hands-to-child schedules, projects `fg`, `life`, `leak`,
 /// `paste` and `prompt` at every checkpoint, and replays the killed holder with no probe and the
-/// parked schedule with no carry as negative controls.
+/// parked schedule with no carry as negative controls. Its `foreground_handback_exec_*` tests
+/// drive `FgCutter` and `FgCutter::proc_seen` through the model's `exec` schedules and project
+/// `early` and `mixed` from the real edge's `at` and `lay`, with the `Buggy = 2` and `Buggy = 3`
+/// edges replayed as the negative controls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn foreground_handback_model() -> Model {
@@ -125,11 +168,25 @@ pub fn foreground_handback_model() -> Model {
             var swept = 0;
             var armed = 0;
             var hij = 1;
+            var img = 0;
+            var kq = 0;
+            var qx = 0;
+            var xo = 0;
+            var xn = 0;
+            var nc = 0;
+            var xedge = 0;
+            var early = 0;
+            var mixed = 0;
 
             action Launch when (life == 0) { life = 1; fg = 1; paste = 0; }
             action OneShot when (life == 0) { life = 1; fg = 1; paste = 0; hij = 0; }
             action Adopt when (life == 0) { life = 1; fg = 1; run = 1; leak = 1; armed = 1; }
-            action JobWrite when (life == 1 && wj <= 1) { wj = wj + 1; qj = qj + 1; }
+            action JobWrite when (life == 1 && wj <= 1) {
+                wj = wj + 1;
+                qj = qj + 1;
+                qx = if kq == 1 { qx + 1 } else { qx };
+            }
+            action Exec when (life == 1 && img == 0) { img = 1; kq = 1; }
             action Die when (life == 1 && (run == 1 || qj > 0 || armed == 0)) { life = 2; }
             action Stop when (life == 1) { life = 4; }
             action Reclaim when ((life == 2 || life == 4) && rd == 0) {
@@ -145,11 +202,30 @@ pub fn foreground_handback_model() -> Model {
                 prompt = 0;
                 paste = 0;
             }
-            action Restart when (rd == 0 && full == 0 && bj1 + bj2 + bs1 + bs2 == 0) {
+            action Restart when (rd == 0 && full == 0 && bj1 + bj2 + bs1 + bs2 + edge + xedge == 0) {
                 run = if Carry == 1 { run } else { fg };
+                kq = 0;
+                qx = 0;
             }
-            action ReadJob when (qj > 0 && edge == 0) { qj = qj - 1; bj2 = 1; rd = 1; }
-            action ReadShell when (qs == 1 && qj == 0 && edge == 0) { qs = 0; bs2 = 1; rd = 1; }
+            action ReadJob when (qj > 0 && edge == 0 && xedge == 0 && (rd == 1 || kq == 0)) {
+                qj = qj - 1;
+                qx = if kq == 1 && qj <= qx { qx - 1 } else { qx };
+                nc = if rd == 0 && xn == 1 { 1 } else { nc };
+                xo = if (img == 0 || kq == 1) && qj > qx { 1 } else {
+                    if rd == 0 || (img == 1 && kq == 0) { 0 } else { xo }
+                };
+                xn = if kq == 1 && qj <= qx { 1 } else { if rd == 0 { 0 } else { xn } };
+                bj2 = 1;
+                rd = 1;
+            }
+            action ReadShell when (qs == 1 && qj == 0 && edge == 0 && xedge == 0 && (rd == 1 || kq == 0)) {
+                qs = 0;
+                nc = if rd == 0 && xn == 1 { 1 } else { nc };
+                xo = if rd == 0 { 0 } else { xo };
+                xn = if rd == 0 { 0 } else { xn };
+                bs2 = 1;
+                rd = 1;
+            }
             action Park when (rd == 1) {
                 rd = 0;
                 bj1 = if Split == 1 && fg == run && bj2 == 1 { 1 } else { bj1 };
@@ -159,30 +235,63 @@ pub fn foreground_handback_model() -> Model {
                 edge = if Split == 1 { if fg == run { 0 } else { 1 } } else { edge };
                 run = if Split == 1 { fg } else { run };
             }
-            action Deliver when (rd == 0 && full == 0 && bj1 + bj2 + bs1 + bs2 > 0) {
-                dj1 = if edge == 0 && fg == run { if bj1 + bj2 > 0 { 1 } else { 0 } } else { bj1 };
-                dj2 = if edge == 0 && fg == run { 0 } else { bj2 };
-                ds1 = if edge == 0 && fg == run { if bs1 + bs2 > 0 { 1 } else { 0 } } else { bs1 };
-                ds2 = if edge == 0 && fg == run { 0 } else { bs2 };
-                dedge = if edge == 1 { 1 } else { if fg == run { 0 } else { 1 } };
-                run = if edge == 1 { run } else { fg };
+            action ObserveExec when (rd == 0 && kq == 1 && edge == 0 && xedge == 0) {
+                kq = 0;
+                qx = 0;
+                edge = if fg == 1 && run == 0 { 1 } else { 0 };
+                run = if fg == 1 { 1 } else { run };
+                xedge = if fg == 1 && run == 1 { 1 } else { 0 };
+                early = if fg == 1 && run == 1 && (nc == 1 || (Buggy == 2 && xn == 1)) { 1 } else {
+                    early
+                };
+                mixed = if fg == 1 && run == 1 && Buggy == 3 && xo == 1 { 1 } else { mixed };
+                xo = 0;
+                xn = 0;
+                nc = 0;
+            }
+            action Deliver when (rd == 0 && full == 0 && bj1 + bj2 + bs1 + bs2 + edge + xedge > 0
+                && (kq == 0 || xn == 0 || edge == 1 || fg + run == 1)) {
+                dj1 = if edge == 0 && (fg == run || xedge == 1) {
+                    if bj1 + bj2 > 0 { 1 } else { 0 }
+                } else { bj1 };
+                dj2 = if edge == 0 && (fg == run || xedge == 1) { 0 } else { bj2 };
+                ds1 = if edge == 0 && (fg == run || xedge == 1) {
+                    if bs1 + bs2 > 0 { 1 } else { 0 }
+                } else { bs1 };
+                ds2 = if edge == 0 && (fg == run || xedge == 1) { 0 } else { bs2 };
+                dedge = if edge == 1 { 1 } else { if fg == run || xedge == 1 { 0 } else { 1 } };
+                run = if edge == 1 || xedge == 1 { run } else { fg };
+                kq = if (edge == 1 && run == 1) || (edge == 0 && xedge == 0 && fg + run == 1 && fg == 1) {
+                    0
+                } else { kq };
+                qx = if (edge == 1 && run == 1) || (edge == 0 && xedge == 0 && fg + run == 1 && fg == 1) {
+                    0
+                } else { qx };
                 bj1 = 0;
                 bj2 = 0;
                 bs1 = 0;
                 bs2 = 0;
                 edge = 0;
+                xedge = 0;
+                xo = 0;
+                xn = 0;
+                nc = if kq == 1 && xn == 1 {
+                    if (edge == 1 && run == 1) || (edge == 0 && xedge == 0 && fg + run == 1 && fg == 1) {
+                        0
+                    } else { 1 }
+                } else { 0 };
                 full = 1;
             }
             action Parse when (full == 1) {
                 leak = if dj2 == 1 { 1 } else {
-                    if dedge == 1 && Buggy == 0 && (dj1 == 1 || leak == 1)
+                    if dedge == 1 && (Buggy == 0 || Buggy > 1) && (dj1 == 1 || leak == 1)
                         && (Alive == 0 || life == 2 || life == 3)
                         && (Display == 1 || hij == 1) { 0 } else {
                         if dj1 == 1 { 1 } else { leak }
                     }
                 };
                 paste = if ds2 == 1 || (dj2 == 1 && hij == 1) { 1 } else {
-                    if dedge == 1 && Buggy == 0 && (dj1 == 1 || leak == 1)
+                    if dedge == 1 && (Buggy == 0 || Buggy > 1) && (dj1 == 1 || leak == 1)
                         && (Alive == 0 || life == 2 || life == 3)
                         && (Display == 1 || hij == 1) { 0 } else {
                         if ds1 == 1 || (dj1 == 1 && hij == 1) { 1 } else { paste }
@@ -210,6 +319,8 @@ pub fn foreground_handback_model() -> Model {
             invariant JobKeepsItsModesWhileAlive:
                 armed == 0 || leak == 1 || life == 2 || life == 3;
             invariant OneShotKeepsItsModes: hij == 1 || armed == 0 || leak == 1;
+            invariant ExecCutBlind: early == 0;
+            invariant ExecSpanClean: mixed == 0;
         }
     }
 }

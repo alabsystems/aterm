@@ -34,6 +34,9 @@
 
 /// The magic's first four bytes; byte 4 is the layout version, bytes 5..8 are zero.
 pub const MAGIC: [u8; 4] = *b"ATRJ";
+/// A privacy-erased v1 region: only its turn-id count remains meaningful. Ordinary
+/// header/screen/control readers refuse this marker, including readers before it existed.
+pub const ERASED_COUNT_V1: u64 = u64::from_le_bytes(*b"ATRC\x01\0\0\0");
 /// The layout this build writes and the newest it reads.
 pub const LAYOUT_VERSION: u8 = 1;
 /// The page every region size is a multiple of (macOS rounds a shm size up to it).
@@ -135,10 +138,19 @@ pub const OFF_HIST_END_ROW: usize = 472;
 /// The ring's identity: `renumber_epoch`, `clear_gen`, `reveal_gen`, `cols`
 /// (`aterm_grid::HistoryFence`'s identity half), four words.
 pub const OFF_HIST_IDENTITY: usize = 480;
-/// `ctl_commit`, `ctl_len` (increment 7).
+/// `ctl_commit` (increment 7): the sequence number of the control record the slot holds, 0
+/// when it is empty or being written ([`crate::writer::ControlWriter`]). The journal
+/// worker's, on a line of its own.
 pub const OFF_CTL_COMMIT: usize = 512;
-/// The control slot's record length.
+/// `ctl_len`: the control slot's record length.
 pub const OFF_CTL_LEN: usize = 520;
+/// `ctl_count` (increment 7): a count the window only ever raises beside its control carry,
+/// opaque here (`aterm-gui`: the process's turn-id count, stored as each id is minted). No
+/// control write touches it, so a restore reads it whether the slot holds a record, is
+/// empty, or was torn by a death inside a write. 0: never stored (and in a region an older
+/// build wrote: a field grown into the reserved words). The minting threads', on a line of
+/// its own.
+pub const OFF_CTL_COUNT: usize = 576;
 
 /// The header word holding slot `slot`'s commit word (`slot` is 0 or 1).
 #[must_use]
@@ -407,6 +419,7 @@ mod tests {
             OFF_HIST_IDENTITY + 24,
             OFF_CTL_COMMIT,
             OFF_CTL_LEN,
+            OFF_CTL_COUNT,
         ] {
             assert_eq!(word % 8, 0, "{word} is aligned");
             assert!(word + 8 <= HEADER_LEN, "{word} is inside the header");
@@ -418,6 +431,7 @@ mod tests {
         assert_ne!(OFF_STREAM_GATHERED / 64, OFF_HIST_HI / 64);
         assert_ne!(OFF_TAIL_COMMIT / 64, OFF_HIST_HI / 64);
         assert_ne!(OFF_HIST_HI / 64, OFF_CTL_COMMIT / 64);
+        assert_ne!(OFF_CTL_COMMIT / 64, OFF_CTL_COUNT / 64);
     }
 
     /// A cell size round-trips through its word; none, a zero axis and bits this build

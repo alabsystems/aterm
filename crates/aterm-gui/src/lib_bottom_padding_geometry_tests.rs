@@ -309,3 +309,158 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
         "preflight rejects without partial mutation"
     );
 }
+
+/// An fx layer of one rect, the ramp `c0 → c1` across it.
+fn fx_rect_layer(
+    id: u64,
+    (x, y, w, h): (i32, i32, u16, u16),
+    space: aterm_core::render::FxSpace,
+) -> aterm_core::render::FxLayer {
+    use aterm_core::render::{FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot};
+    FxLayer::new(
+        id,
+        std::sync::Arc::new(FxContent::new(
+            vec![FxItem::Rect(FxRect { x, y, w, h, ink: 0 })],
+            vec![
+                FxInk::over(0x0040_2010, 0x90),
+                FxInk::over(0x0010_3040, 0x40),
+            ],
+        )),
+        FxSlot::Over,
+        space,
+        FxBlend::Exact,
+    )
+}
+
+/// THE TRANSPORT SHIFT MOVES THE FX THAT ARE WINDOW PIXELS (design §4.4): a
+/// Window-space layer's offset and clip and every occluder move by the GPU
+/// source shift, unbounded edges stay unbounded, a Grid-space layer (which
+/// follows `grid_top`) stays put, and `+crop` then `-crop` restores every
+/// byte. A shift that would push a bounded edge onto an unbounded sentinel
+/// (and so not reverse exactly) is refused before any mutation, the u16
+/// streams included.
+#[test]
+fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
+    use aterm_core::render::{FxSpace, PxRect};
+    let mut input = RenderInput::empty();
+    input.cursor_glow_add = vec![GlowQuad {
+        y: 20,
+        alpha: 0,
+        ..GlowQuad::default()
+    }];
+    let mut window = fx_rect_layer(1, (0, 0, 30, 9), FxSpace::Window);
+    window.offset = (3, 5);
+    window.clip = PxRect::new(0, 10, 100, 60);
+    let open = fx_rect_layer(2, (4, 4, 10, 10), FxSpace::Window);
+    let mut grid = fx_rect_layer(3, (0, 0, 30, 9), FxSpace::Grid);
+    grid.offset = (1, 2);
+    grid.clip = PxRect::new(0, 0, 50, 40);
+    input.fx_layers = vec![window, open, grid];
+    input.fx_occluders = vec![
+        PxRect::new(0, 8, 40, 20),
+        PxRect::new(i32::MIN, i32::MIN, i32::MAX, 30),
+    ];
+    let original = input.clone();
+
+    assert!(try_shift_window_absolute_effects_y(&mut input, 7));
+    assert_eq!(input.fx_layers[0].offset, (3, 12));
+    assert_eq!(input.fx_layers[0].clip, PxRect::new(0, 17, 100, 67));
+    assert_eq!(input.fx_layers[1].offset, (0, 7));
+    assert_eq!(
+        input.fx_layers[1].clip,
+        PxRect::EVERYWHERE,
+        "unbounded stays unbounded"
+    );
+    assert_eq!(
+        input.fx_layers[2], original.fx_layers[2],
+        "Grid follows grid_top"
+    );
+    assert_eq!(
+        input.fx_occluders,
+        vec![
+            PxRect::new(0, 15, 40, 27),
+            PxRect::new(i32::MIN, i32::MIN, i32::MAX, 37),
+        ]
+    );
+    assert!(try_shift_window_absolute_effects_y(&mut input, -7));
+    assert_eq!(input, original, "+crop/-crop must restore every byte");
+
+    // A bounded edge that would saturate cannot reverse: refused, unmoved.
+    let mut edge = original.clone();
+    edge.fx_occluders[0].y1 = i32::MAX - 3;
+    let before = edge.clone();
+    assert!(!try_shift_window_absolute_effects_y(&mut edge, 5));
+    assert_eq!(edge, before, "preflight rejects without partial mutation");
+}
+
+/// THE TRANSPORT KEEPS WINDOW FX REGISTERED WITH GRID FX under a pad crop:
+/// the CPU renderer in the raw geometry `configure_visible_y` gives the GPU
+/// (`pad_top` raised by the crop, so the grid sits `crop` rows lower), a
+/// Window-space layer authored in visible pixels over the same grid pixels as
+/// a Grid-space one, and an occluder authored in visible pixels cutting both:
+/// after the transport shift the two frames are byte-identical.
+///
+/// CONTROLS: without the shift the Window layer lands `crop` rows high, and
+/// an occluder left unshifted cuts other pixels of the Grid layer.
+#[test]
+fn gpu_transport_keeps_window_fx_registered_with_grid_fx() {
+    use aterm_core::render::{FxSpace, PxRect};
+    let mut r = aterm_render::Renderer::from_bytes(
+        aterm_render::embedded_font(),
+        14.0,
+        aterm_render::Theme::default(),
+    )
+    .expect("bundled font");
+    let (pad, visible_top, crop, head) = (12usize, 4usize, 5usize, 9usize);
+    r.set_pad(pad);
+    r.set_head(head);
+    r.set_pad_top(visible_top + crop);
+    assert_eq!(r.grid_top(), visible_top + crop + head, "the raw geometry");
+    let (cw, ch) = r.cell_size();
+    let (cwi, chi) = (cw as i32, ch as i32);
+    let mut t = aterm_core::terminal::Terminal::new(4, 12);
+    t.process(b"\x1b[?25lfx over text\r\nsecond row");
+    let base = t.cell_frame(4, 12);
+    // The visible frame's grid origin, where the host authors window pixels.
+    let (gx, gy) = (pad as i32, (visible_top + head) as i32);
+    let item = (0, 0, (6 * cw) as u16, (2 * ch) as u16);
+    let mut grid = fx_rect_layer(1, item, FxSpace::Grid);
+    grid.offset = (cwi, chi / 2);
+    grid.clip = PxRect::new(0, 0, 5 * cwi, 3 * chi);
+    let mut window = fx_rect_layer(1, item, FxSpace::Window);
+    window.offset = (gx + cwi, gy + chi / 2);
+    window.clip = grid.clip.translate(gx, gy);
+    let occluder = PxRect::new(gx + 2 * cwi, gy + chi, gx + 4 * cwi, gy + 2 * chi);
+    let render =
+        |r: &mut aterm_render::Renderer, layer: &aterm_core::render::FxLayer, shift: bool| {
+            let mut input = base.clone();
+            input.fx_layers = vec![layer.clone()];
+            input.fx_occluders = vec![occluder];
+            let original = input.clone();
+            if shift {
+                assert!(try_shift_window_absolute_effects_y(&mut input, crop as i32));
+            }
+            let pixels = r.render_input(&input).pixels;
+            if shift {
+                assert!(try_shift_window_absolute_effects_y(
+                    &mut input,
+                    -(crop as i32)
+                ));
+                assert_eq!(input, original, "the shift reverses exactly");
+            }
+            pixels
+        };
+    let from_grid = render(&mut r, &grid, true);
+    assert!(
+        from_grid == render(&mut r, &window, true),
+        "the shifted Window layer registers with the Grid layer"
+    );
+    assert!(
+        from_grid != render(&mut r, &window, false),
+        "CONTROL: unshifted, the Window layer lands crop rows high"
+    );
+    assert!(
+        from_grid != render(&mut r, &grid, false),
+        "CONTROL: an unshifted occluder cuts other pixels"
+    );
+}

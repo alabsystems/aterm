@@ -889,6 +889,32 @@ fn audit_credits_a_violation_step_and_not_a_step_after_one() {
     );
 }
 
+/// A dead action that fires only after another dead one has (`Fire` needs `Arm`'s state,
+/// and only from where `Arm` already broke a law) is no violation step and, added alone to
+/// the baseline, never fires: it is no negative control of its own, and is named as one
+/// that fires only beside another.
+#[test]
+fn audit_rejects_a_mutant_that_fires_only_beside_another() {
+    let beside = ty_model! {
+        FiresOnlyBeside {
+            const Buggy = 0;
+            var armed = 0;
+            var fired = 0;
+            var ticked = 0;
+            action Tick when (ticked == 0) { ticked = 1; }
+            action Arm when (Buggy == 1 && armed == 0) { armed = 1; }
+            action Fire when (armed == 1 && fired == 0) { fired = 1; }
+            invariant NeverArmed: armed == 0;
+        }
+    };
+    let r = audit_dead_negative_controls(&[beside]);
+    assert!(
+        r.as_ref()
+            .is_err_and(|e| e.contains("`Fire`") && e.contains("fires only beside another")),
+        "{r:?}"
+    );
+}
+
 /// An action only a declared scenario reaches is not dead: it fires in a
 /// configuration the real code runs under. Without the scenario it is.
 #[test]

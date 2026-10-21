@@ -1002,8 +1002,10 @@ impl App {
     /// THE QA SEAM ENTERS HERE, AND THAT IS THE WHOLE POINT. Under
     /// `ATERM_DEBUG_SEAMLESS_REEXEC` the handoff runs with no
     /// `ApplyAttemptTicket` (`App::apply_staged_update_now` refuses a `None` ticket
-    /// in every other case), so a failed debug handoff describes a SIMULATED apply
-    /// of the running binary — not a staged build that could not be made to run.
+    /// in every other case but a launch-record renewal, which never reaches here: its
+    /// return goes to `App::reduce_returned_launch_record_renewal`), so a failed debug
+    /// handoff describes a SIMULATED apply of the running binary — not a staged build
+    /// that could not be made to run.
     /// Routing it through [`Self::surface_update_apply_outcome`] recorded it as a
     /// genuine `apply`-class failure, and that streak is cleared only by a
     /// successful apply ([`Health::record_apply_success`]) — never by a healthy

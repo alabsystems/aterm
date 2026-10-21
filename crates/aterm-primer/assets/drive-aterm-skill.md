@@ -106,13 +106,15 @@ aterm ctl subscribe "@$SID" log          # every new record, live
   read only what came after that reply; `log t16` is one node's subtree.
 - Text sits behind pointers, read under each verb's own permission and only when acting
   needs it: `blk=<id>` a shell block (`blocktext <id>`), `ledger=<id>` a `turn`'s record
-  (`history`), `off=<n>` or `cause=@<n>` mail (`inbox get @<n>`).
+  (`history`), `off=<n>` or `cause=@<n>` mail (`inbox get @<n>`). `mail=@<n>~` on a turn's
+  `brief` line is the task mail it probably answered: the `~` says it is a guess, not a cause.
 - A `gap` line is a fact to report: records went by that you will never read. Silence is
   never a need: no `need=` means nothing asked, not that the session is stuck.
 - `brief all` is every session of this instance in one budget (owner only); `aterm ctl
   survey` reads every instance. `aterm fabric brief` folds what the fabric's log mirror
-  publishes, and the mirror is off by default (`[fabric] log = "off"`). With `[session_log]
-  journal = true` (off by default), `log @<sid>` and `brief @<sid>` also answer a session
+  publishes, and the mirror is off by default (`[fabric] log = "off"`). The session journal
+  is on by default on macOS and Linux (`[session_log] journal = false` turns it off; a
+  headless instance keeps none), so `log @<sid>` and `brief @<sid>` also answer a session
   of an earlier aterm process.
 - `status` carries `log_seq=` and `log_ep=`: pass them as `since=` and `ep=` so a wait
   starts from what you read, and re-arm from each reply's `seq=`/`ep=`. `await log need`

@@ -29,10 +29,14 @@
 //! newest closed one, read by [`super::Fold::mail_link`]. It crosses a
 //! seamless update in the local carry only, as `ml`-prefixed tokens on the
 //! turn's own `fold open` / `fold last` line (`mloff=<off> mlconf=<conf>`),
-//! which a reader that does not know them skips (the R13 skip rule); the
-//! waiting mails do not cross, so a mail delivered before an update links no
-//! turn after it. No wire reader: `brief`, `log`, the bus and the ledger do
-//! not print it.
+//! which a reader that does not know them skips (the R13 skip rule). Since
+//! Phase 6 (step 6C-5, ruling U19) the waiting mails and the mail latch cross
+//! with it, on the totals line (`mlw=`, `mlh=`), so a task mail delivered
+//! before an update still links the successor's next turn. One reader prints
+//! the link: the local `brief`, as ` mail=@<off>~` on the turn's line, never
+//! without the `~` (Phase 6 step
+//! 6C-3, ruling U5). `log`, the bus and the ledger do not print it, and a
+//! bus fold has none to print.
 
 use crate::field::{Key, Val};
 use crate::rec::Rec;

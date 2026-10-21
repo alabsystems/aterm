@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! RFC 1951 (DEFLATE) + RFC 1950 (zlib) decompression, zero dependencies.
+//! RFC 1951 (DEFLATE) + RFC 1950 (zlib) decompression on std alone (the gzip
+//! reader's CRC-32, [`crate::crc32`], is astream-wire's).
 //!
 //! A panic-free `inflate` for attacker-supplied streams (the Kitty graphics
 //! `o=z` transport). Every decode is bounded by a caller-supplied `max_output`,

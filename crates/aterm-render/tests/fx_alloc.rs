@@ -258,7 +258,8 @@ fn steady_allocs(
 /// ZERO COST AT REST, AND NO ALLOCATION IN MOTION: once warm, the CPU fx path
 /// allocates nothing, whether no layer is live, settled layers are sliced on
 /// `Rows` frames, or every frame hands new content `Arc`s and moved layers
-/// (full repaints until lane B2's damage arm).
+/// (`Rows` frames too: the fx damage arm marks their bands without a
+/// fingerprint or a payload clone).
 ///
 /// The negative control is a mutation (run by hand, recorded in the design's
 /// §7 note): rebuilding the occluder pieces in a fresh `Vec` per item, not the
@@ -296,7 +297,7 @@ fn the_fx_path_allocates_nothing_once_warm() {
 
     let (a, b) = (layers(cw, ch, 0), layers(cw, ch, 3));
     let moving = frames(&mut t, rows, cols, [&a, &b], &occluders);
-    let in_motion = steady_allocs(&mut renderer, &mut window, &moving, DamageOutcome::Full);
+    let in_motion = steady_allocs(&mut renderer, &mut window, &moving, DamageOutcome::Rows);
     assert_eq!(
         in_motion, 0,
         "changing layers must allocate nothing once warm"

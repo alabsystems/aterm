@@ -44,6 +44,12 @@ const TAIL_ALPHA_IGNITED: u32 = 44;
 /// capping it (~27%) keeps typed text legible even when a fast burst covers a
 /// run of fresh cells. Pinned by a unit test for every intensity.
 const READABLE_ALPHA_CAP: u8 = 70;
+
+/// The most coverage any bed cell is born with ([`READABLE_ALPHA_CAP`]): the
+/// peak a host scales when it holds the bed to a contrast budget
+/// (`cursor_fx`'s bed legibility share), so the whole bed keeps its fade
+/// shape under the cap.
+pub const BED_PEAK_ALPHA: u8 = READABLE_ALPHA_CAP;
 /// At full ignition a spark lives this many times longer than the configured fade,
 /// so a fast sustained burst leaves a LONGER visible comet (more overlapping live
 /// sparks) while a lone keystroke fades in the base time.
@@ -286,9 +292,11 @@ pub struct TrailConfig {
     /// Maximum comet length in cells: on a long jump only the brightest `max_len`
     /// cells nearest the cursor are kept (config `cursor_trail_length`).
     pub max_len: usize,
-    /// Fully-resolved trail colour `0x00RRGGBB` (config `cursor_trail_color`, else
-    /// the theme cursor colour). The host heats this toward the comet-core tint as
-    /// `intensity` rises (see [`ignite`]).
+    /// Fully-resolved trail colour `0x00RRGGBB` (native: config
+    /// `cursor_trail_color`, else the comet's glacial hue unless a cursor colour
+    /// is pinned — `crate::cursor_fx::automatic_glow_color`; a page: its own
+    /// colour, else the live cursor). Ignition heats this toward the comet's ice
+    /// white as `intensity` rises (see [`ignite`]).
     pub color: u32,
     /// Ignition intensity in `0.0..=1.0` from the host's typing cadence
     /// ([`TypingCadence`]): `0.0` is a gentle, short, dim wake; `1.0` ignites
@@ -1108,12 +1116,19 @@ impl TypingCadence {
     }
 }
 
-/// Blend `base` toward the comet-core hot tint by `q` (`0` = base, `1` = the
-/// max blend): a warm white-amber, partial so the trail keeps the theme's
-/// identity and never becomes pure white.
+/// Blend `base` toward the comet's ice white by `q` (`0` = base, `1` = the
+/// max blend), partial so the trail keeps its own hue and never becomes pure
+/// white.
+///
+/// One target for every host: the native comet body and a page's opaque
+/// trail (`set_cursor_trail`, documented as the native comet look) both heat
+/// toward [`crate::cursor_comet::ICE_WHITE`], the near-white the comet's
+/// nucleus freezes toward, so the bed and the head of one comet never
+/// disagree in temperature. (The warm amber target predated the icy comet
+/// and was never retuned with it.)
 fn heat_color(base: u32, q: f32) -> u32 {
-    /// The comet-core tint an ignited trail heats toward (warm white-amber).
-    const HOT: u32 = 0x00FF_E6B0;
+    /// The tint an ignited trail heats toward: the comet's own ice white.
+    const HOT: u32 = crate::cursor_comet::ICE_WHITE;
     /// Even at full ignition the colour is only this far toward [`HOT`] — tasteful,
     /// and it keeps enough of the base hue that the wake still "matches the theme".
     const HEAT_COLOR_MAX: f32 = 0.5;
@@ -1127,7 +1142,7 @@ fn heat_color(base: u32, q: f32) -> u32 {
 }
 
 /// Stamp the current typing-cadence `intensity` and sub-ignition `warmth` onto a
-/// resolved [`TrailConfig`] and heat its colour toward the comet core. The host
+/// resolved [`TrailConfig`] and heat its colour toward the comet's ice white. The host
 /// calls this each frame just before the trail tick with
 /// [`TypingCadence::intensity`]/[`TypingCadence::warmth`]: fast sustained typing
 /// ignites the comet, while normal cadence only chains spark lifetimes. Pure
@@ -2252,11 +2267,17 @@ mod tests {
         assert_eq!(c.intensity, 1.0);
         assert_eq!(c.warmth, 1.0);
         assert_ne!(c.color, base, "ignited colour is heated");
-        // Heated toward warm white-amber: red channel rises above the cool base.
-        assert!(
-            (c.color >> 16) & 0xff > (base >> 16) & 0xff,
-            "red channel warmed"
-        );
+        // Heated toward the comet's own ice white (the nucleus's target, so
+        // the bed and the head agree): every channel closes on it.
+        let ice = crate::cursor_comet::ICE_WHITE;
+        let gap = |rgb: u32, sh: u32| ((rgb >> sh & 0xff) as i32 - (ice >> sh & 0xff) as i32).abs();
+        for sh in [16, 8, 0] {
+            assert!(
+                gap(c.color, sh) <= gap(base, sh),
+                "channel >>{sh} moved away from the ice white: {:06x} from {base:06x}",
+                c.color
+            );
+        }
     }
 
     /// The probe-table merge in `tick` emits byte-identically (contents and

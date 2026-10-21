@@ -378,6 +378,15 @@ pub(super) struct ShellIntegrationState {
     /// binding runs one with no `C`). Kept across `reset()` (host knowledge);
     /// never carried, as the host sets it before the bytes it feeds.
     pub(super) foreground_job: bool,
+    /// The prompt in front's `B` said it stands where the line editor's
+    /// buffer STARTS (`133;B;…;aterm_input=start`): bash and fish draw it at
+    /// the end of the prompt, before any buffer, and zsh's, sent from
+    /// zle-line-init after zle drew the buffer, says so only when that buffer
+    /// is empty (a line pre-filled from zsh's buffer stack is drawn first, and
+    /// the `B` lands after it). Set by an accepted `B`, cleared by an accepted
+    /// `A` and by `reset()`. Never carried: a restored engine vouches for no
+    /// buffer start until its shell's next prompt.
+    pub(super) input_start_attested: bool,
     /// The cwd a program's first report replaced at the shell's prompt
     /// ([`Self::foreground_job`], [`Self::program_probe`]), as a report:
     /// restored once the host says no such program runs, as the shell never
@@ -436,6 +445,7 @@ impl ShellIntegrationState {
             unmarked_run: false,
             phase_stale: false,
             foreground_job: false,
+            input_start_attested: false,
             cwd_before_job: None,
             program_probe: None,
             cwd_host: None,
@@ -454,6 +464,7 @@ impl ShellIntegrationState {
         self.current_block = None;
         self.held_cwd = None;
         self.phase_stale = false;
+        self.input_start_attested = false;
         // next_block_id, completed_seq and started_seq are not reset: block
         // ids stay unique and the counters monotonic across resets. Nor is
         // last_finished: the command it records did finish. Nor is cwd_host:

@@ -21,10 +21,17 @@ pub struct CarriedMessage {
     pub tag: String,
     /// The severity word; an unknown one drops the row on seed.
     pub severity: String,
+    /// The original posted severity when different from the current mark.
+    /// An older parent's carry has none; until the authoritative log is
+    /// reloaded, the seed uses the current severity as its fallback.
+    pub posted_severity: Option<String>,
     /// The glyph; outside the closed set it becomes the fallback.
     pub glyph: char,
     /// The title.
     pub title: String,
+    /// The title's short form for the band (`Message::short_title`); an
+    /// older parent's rows carry none, and elide their title.
+    pub short_title: Option<String>,
     /// The detail lines.
     pub detail: Vec<String>,
     /// Encoded intents; an unknown one is dropped silently.

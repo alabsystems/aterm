@@ -65,6 +65,26 @@ const EMACS_CHORDS: &[ChordRow] = &[
     (&["M-x"], EditorCommand::ExecuteCommand),
     (&["C-s"], EditorCommand::IncrementalSearch),
     (&["C-g"], EditorCommand::Abort),
+    // `M-<` and `M->` are Shift chords: a terminal decoder names the shifted
+    // glyph (`M-<`), a GUI the unshifted key with Shift held (`M-S-,`, on a
+    // US layout).
+    (&["M-<", "M-S-,"], EditorCommand::BeginningOfBuffer),
+    (&["M->", "M-S-."], EditorCommand::EndOfBuffer),
+    (&["C-l"], EditorCommand::RecenterTopBottom),
+    (&["M-d"], EditorCommand::KillWord),
+    (&["M-backspace"], EditorCommand::BackwardKillWord),
+    (&["M-w"], EditorCommand::KillRingSave),
+    (&["C-o"], EditorCommand::OpenLine),
+    (&["C-t"], EditorCommand::TransposeChars),
+    (&["M-q"], EditorCommand::FillParagraph),
+    // `C-?` is Emacs's redo; a GUI spells it Ctrl+Shift+/ on a US layout.
+    (&["C-?", "C-S-/"], EditorCommand::Redo),
+    (
+        &[
+            "M-0", "M-1", "M-2", "M-3", "M-4", "M-5", "M-6", "M-7", "M-8", "M-9",
+        ],
+        EditorCommand::DigitArgument,
+    ),
 ];
 
 /// The built-in key sequences, each one space-separated string. They are the
@@ -77,6 +97,15 @@ const EMACS_SEQUENCES: &[(&str, EditorCommand)] = &[
     ("C-x )", EditorCommand::EndMacro),
     ("C-x e", EditorCommand::PlayMacro),
     ("M-g g", EditorCommand::GotoLine),
+    ("C-x k", EditorCommand::KillBuffer),
+    ("C-x C-c", EditorCommand::SaveBuffersKillTerminal),
+    ("C-x C-x", EditorCommand::ExchangePointAndMark),
+    ("C-x h", EditorCommand::MarkWholeBuffer),
+    // The edit-ticket keys: with-editor's `C-c C-c` and `C-c C-k`, and
+    // emacsclient's `C-x #`.
+    ("C-c C-c", EditorCommand::FinishEdit),
+    ("C-x #", EditorCommand::FinishEdit),
+    ("C-c C-k", EditorCommand::AbortEdit),
 ];
 
 /// Off macOS, C-left/C-right are the PLATFORM word-motion spelling (the
@@ -85,12 +114,13 @@ const EMACS_SEQUENCES: &[(&str, EditorCommand)] = &[
 /// contradicted. The C-letter rows are untouched: C-b/C-f stay by-character,
 /// exactly as the audit scoped it (named keys only). macOS keeps the table
 /// as-is: ⌥ is its word modifier and Ctrl+arrow belongs to Mission Control
-/// there. C-Backspace is NOT seeded — the editor has no word-delete
-/// `EditorCommand` to bind it to, and inventing one is capability growth, not
-/// a keymap alias.
+/// there. C-Backspace is the same platform convention for deleting a word
+/// back, and Emacs binds it to `backward-kill-word` as well; macOS spells
+/// that ⌥⌫ (`M-backspace`, in every profile).
 const OFF_MAC_CHORDS: &[ChordRow] = &[
     (&["C-left"], EditorCommand::MoveWordBackward),
     (&["C-right"], EditorCommand::MoveWordForward),
+    (&["C-backspace"], EditorCommand::BackwardKillWord),
 ];
 
 /// WINDOWS: Ctrl+S SAVES (audit I9). This is not a preference — it is the one
@@ -197,14 +227,15 @@ impl Profile {
         matches!(self, Self::Gui(_))
     }
 
-    /// Whether Escape quits before it arms ESC as Meta for the next key. A
-    /// GUI's Escape has always quit (`keyboard-quit`: the region and a `C-u`
-    /// argument go, and the status says Quit), and still does, so Escape,
-    /// then typing, never leaves a region or an argument behind. The
-    /// terminal face's ESC is Emacs's alone: it only arms Meta, so `C-u ESC
-    /// x` keeps its argument, and ESC ESC quits.
-    pub const fn escape_quits(self) -> bool {
-        matches!(self, Self::Gui(_))
+    /// Whether ESC is Meta for the next key, as in Emacs (`ESC x` is
+    /// `M-x`): in the terminal face only, where Alt often types characters
+    /// and ESC is how a terminal sends Meta anyway, so `C-u ESC x` keeps its
+    /// argument and ESC ESC quits. A GUI's Escape is a key of its own, which
+    /// quits (`keyboard-quit`: the region and a `C-u` argument go, and the
+    /// status says Quit), and the key after it is typed as itself; its Meta
+    /// is the Alt (⌥) key.
+    pub const fn escape_is_meta(self) -> bool {
+        matches!(self, Self::Terminal)
     }
 }
 
@@ -275,6 +306,27 @@ impl Keymap {
             node = node.children.entry(chord).or_default();
         }
         node.command = Some(command);
+    }
+
+    /// Every binding, as its key sequence and command, in key order.
+    pub fn bindings(&self) -> Vec<(Vec<KeyChord>, EditorCommand)> {
+        fn walk(
+            node: &KeyNode,
+            path: &mut Vec<KeyChord>,
+            out: &mut Vec<(Vec<KeyChord>, EditorCommand)>,
+        ) {
+            if let Some(command) = node.command {
+                out.push((path.clone(), command));
+            }
+            for (chord, child) in &node.children {
+                path.push(chord.clone());
+                walk(child, path, out);
+                path.pop();
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut Vec::new(), &mut out);
+        out
     }
 
     pub fn resolve(&self, sequence: &[KeyChord]) -> KeyResolution {

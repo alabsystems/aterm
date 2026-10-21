@@ -87,6 +87,7 @@ fn every_field_moved(dir: &Path) -> SessionSetup {
         box_settle: d(47),
         autocompact_settle: d(48),
         background_settle: d(49),
+        wait_step: d(58),
         box_call_step: d(56),
         stuck_after: d(50),
         person_hold_wait: Some(d(52)),
@@ -249,4 +250,34 @@ fn a_stand_in_workers_environment_is_never_written() {
         back.setup.approval_env.worker,
         WorkerSource::Fixed(Err(WORKER_NOT_TAPED.to_string()))
     );
+}
+
+/// AN OLDER TAPE'S STEP: before the setup held the step of the loop's waits
+/// (`wait_step`), the loop read it live, from the same settle the header's
+/// `background_settle` was read from once. Read back without its key, the
+/// step is this build's rule ([`next_wait_step`]: [`WAIT_STEP`], never longer
+/// than the settle) applied to the settle the TAPE recorded — a run under a
+/// 2 s settle seam waited in 2 s steps — never this process's, and it is
+/// named as supplied. A tape that carries the key is read at its own word.
+#[test]
+fn an_older_tape_waits_in_the_step_its_recorded_settle_gave() {
+    let mut setup = SessionSetup::new(None);
+    // The session's own worker: a stand-in comes back known by its digest
+    // only ([`a_stand_in_workers_environment_is_never_written`]).
+    setup.approval_env.worker = WorkerSource::Session;
+    setup.background_settle = Duration::from_secs(2);
+    setup.wait_step = Duration::from_secs(2);
+    let text = Header::capture("t", Entry::Watch, None, &setup, &SuperviseOpts::default()).encode();
+    assert!(text.lines().any(|l| l == "wait_step=2s"), "{text}");
+    let back = Header::decode(&text).expect("this build's tape");
+    assert_eq!(back.setup, setup);
+    assert!(back.supplied.is_empty(), "{:?}", back.supplied);
+    let older: String = text
+        .lines()
+        .filter(|l| !l.starts_with("wait_step="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let back = Header::decode(&older).expect("an older build's tape");
+    assert_eq!(back.setup, setup, "the step the recorded settle gave");
+    assert_eq!(back.supplied, ["[setup] wait_step"]);
 }

@@ -1228,9 +1228,7 @@ pub(crate) fn sh_yolo_prelude(
          (aterm help pkg).\n",
     );
     s.push_str("__atpkg_yolo=0\n__atpkg_posture=0\n");
-    if words {
-        s.push_str("__atpkg_have_word=0\n__atpkg_word=\n");
-    }
+    s.push_str("__atpkg_have_word=0\n__atpkg_word=\n__atpkg_word_at=0\n__atpkg_word_ok=1\n");
     for i in 0..flags.len() {
         s.push_str("__atpkg_p");
         s.push_str(&i.to_string());
@@ -1249,32 +1247,82 @@ pub(crate) fn sh_yolo_prelude(
         s.push_str(&i.to_string());
         s.push_str("=1; __atpkg_posture=1 ;;\n");
     }
+    // The patterns `yolo::marker_matches` keeps, in `case` spelling: a `--word=`
+    // entry and a short flag are prefixes (their attached forms are the same
+    // flag to the vendor's parser), a long flag is itself or its `=value` form.
+    let marker_pattern = |m: &str| {
+        if m.ends_with('=') || (m.len() == 2 && m.starts_with('-') && !m.starts_with("--")) {
+            let mut p = sh_quote_str(m);
+            p.push('*');
+            p
+        } else {
+            let mut p = sh_quote_str(m);
+            p.push('|');
+            p.push_str(&sh_quote_str(&format!("{m}=")));
+            p.push('*');
+            p
+        }
+    };
     let rest: Vec<String> = markers
         .iter()
         .filter(|m| !flags.contains(m))
-        .map(|m| {
-            if let Some(word) = m.strip_suffix('=') {
-                let mut p = sh_quote_str(&format!("{word}="));
-                p.push('*');
-                p
-            } else {
-                sh_quote_str(m)
-            }
-        })
+        .map(|m| marker_pattern(m))
         .collect();
     if !rest.is_empty() {
         s.push_str("    ");
         s.push_str(&rest.join("|"));
         s.push_str(") __atpkg_posture=1 ;;\n");
     }
-    if words {
-        s.push_str(
-            "    -*) ;;\n    \
-             *) if [ \"$__atpkg_have_word\" = 0 ]; then __atpkg_have_word=1; \
-             __atpkg_word=$__atpkg_a; fi ;;\n",
-        );
-    }
     s.push_str("  esac\ndone\n");
+    // Discover the original argument position separately from the posture
+    // scan: a known value can itself spell a subcommand or posture word.
+    let (values, switches) = crate::yolo::word_options(program);
+    let standalone: Vec<&str> = std::iter::once(crate::yolo::WORD)
+        .chain(flags.iter().copied())
+        .chain(switches.iter().copied())
+        .collect();
+    s.push_str(
+        "__atpkg_at=0\n__atpkg_value=0\n\
+         for __atpkg_a in \"$@\"; do\n  \
+         __atpkg_at=$((__atpkg_at + 1))\n  \
+         if [ \"$__atpkg_a\" = \"--\" ]; then break; fi\n  \
+         if [ \"$__atpkg_value\" = 1 ]; then __atpkg_value=0; continue; fi\n  \
+         case \"$__atpkg_a\" in\n    ",
+    );
+    s.push_str(
+        &standalone
+            .iter()
+            .map(|f| sh_quote_str(f))
+            .collect::<Vec<_>>()
+            .join("|"),
+    );
+    s.push_str(") ;;\n");
+    if !values.is_empty() {
+        s.push_str("    ");
+        s.push_str(
+            &values
+                .iter()
+                .map(|f| sh_quote_str(f))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+        s.push_str(") __atpkg_value=1 ;;\n    ");
+        s.push_str(
+            &values
+                .iter()
+                .map(|f| marker_pattern(f))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+        s.push_str(") ;;\n");
+    }
+    s.push_str(
+        "    -*) __atpkg_word_ok=0; break ;;\n    \
+         *) __atpkg_have_word=1; __atpkg_word=$__atpkg_a; \
+         __atpkg_word_at=$__atpkg_at; break ;;\n  \
+         esac\ndone\n\
+         if [ \"$__atpkg_value\" = 1 ]; then __atpkg_word_ok=0; fi\n",
+    );
     if !after.is_empty() {
         s.push_str(
             "__atpkg_after=0\n\
@@ -1290,19 +1338,24 @@ pub(crate) fn sh_yolo_prelude(
         );
         s.push_str(") __atpkg_after=1 ;;\n  esac\nfi\n");
     }
-    s.push_str("__atpkg_say=\nif [ \"$__atpkg_yolo\" = 1 ]; then\n  __atpkg_say=");
+    s.push_str("__atpkg_say=\nif [ \"$__atpkg_yolo\" = 1 ]");
+    if !after.is_empty() {
+        s.push_str(" && [ \"$__atpkg_word_ok\" = 1 ]");
+    }
+    s.push_str("; then\n  __atpkg_say=");
     s.push_str(&say(crate::yolo::ECHO_PREFIX));
     s.push_str(
         "\n  \
-         __atpkg_stop=0\n",
+         __atpkg_stop=0\n  __atpkg_at=0\n",
     );
     if !after.is_empty() {
-        s.push_str("  __atpkg_pending=0\n  __atpkg_seen=0\n");
+        s.push_str("  __atpkg_pending=0\n");
     }
     s.push_str(
         "  __atpkg_n=$#\n  \
          while [ \"$__atpkg_n\" -gt 0 ]; do\n    \
          __atpkg_n=$((__atpkg_n - 1))\n    \
+         __atpkg_at=$((__atpkg_at + 1))\n    \
          if [ \"$__atpkg_stop\" = 0 ] && [ \"$1\" = \"--yolo\" ]; then\n      \
          shift\n",
     );
@@ -1310,7 +1363,7 @@ pub(crate) fn sh_yolo_prelude(
         s.push_str(&fresh("      "));
     } else {
         s.push_str(
-            "      if [ \"$__atpkg_after\" = 1 ] && [ \"$__atpkg_seen\" = 0 ]; then\n        \
+            "      if [ \"$__atpkg_after\" = 1 ] && [ \"$__atpkg_at\" -lt \"$__atpkg_word_at\" ]; then\n        \
              __atpkg_pending=1\n      \
              else\n",
         );
@@ -1328,21 +1381,17 @@ pub(crate) fn sh_yolo_prelude(
         );
     } else {
         s.push_str(
-            "      __atpkg_is_word=0\n      \
-             if [ \"$__atpkg_stop\" = 0 ] && [ \"$__atpkg_seen\" = 0 ]; then\n        \
-             case \"$1\" in -*) ;; *) __atpkg_is_word=1 ;; esac\n      \
-             fi\n      \
-             set -- \"$@\" \"$1\"\n      \
+            "      set -- \"$@\" \"$1\"\n      \
              shift\n      \
-             if [ \"$__atpkg_is_word\" = 1 ]; then\n        \
-             __atpkg_seen=1\n        \
-             if [ \"$__atpkg_pending\" = 1 ]; then\n          \
+             if [ \"$__atpkg_pending\" = 1 ] && [ \"$__atpkg_at\" = \"$__atpkg_word_at\" ]; then\n        \
              __atpkg_pending=0\n",
         );
         s.push_str(&fresh("          "));
-        s.push_str("        fi\n      fi\n");
+        s.push_str("      fi\n");
     }
-    s.push_str("    fi\n  done\nelif [ \"$__atpkg_posture\" = 0 ]; then\n");
+    s.push_str(
+        "    fi\n  done\nelif [ \"$__atpkg_posture\" = 0 ] && [ \"$__atpkg_word_ok\" = 1 ]; then\n",
+    );
     if !words {
         s.push_str("  __atpkg_say=");
         s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
@@ -1385,12 +1434,12 @@ pub(crate) fn sh_yolo_prelude(
                 " \"$@\"\n  \
                  elif [ -n \"$__atpkg_say\" ]; then\n    \
                  __atpkg_n=$#\n    \
-                 __atpkg_done=0\n    \
+                 __atpkg_at=0\n    \
                  while [ \"$__atpkg_n\" -gt 0 ]; do\n      \
                  __atpkg_n=$((__atpkg_n - 1))\n      \
+                 __atpkg_at=$((__atpkg_at + 1))\n      \
                  set -- \"$@\" \"$1\"\n      \
-                 if [ \"$__atpkg_done\" = 0 ] && [ \"$1\" = \"$__atpkg_word\" ]; then\n        \
-                 __atpkg_done=1\n        \
+                 if [ \"$__atpkg_at\" = \"$__atpkg_word_at\" ]; then\n        \
                  set -- \"$@\" ",
             );
             s.push_str(&spelled);
@@ -2792,6 +2841,22 @@ mod sh_shim_tests {
             run(&claude, &["--permission-mode", "plan"]).0,
             "<--permission-mode><plan>\n"
         );
+        // Attached and config spellings are the same decided posture in the
+        // generated shell as in `decide`: no injection and no echo.
+        let codex = lay("codex");
+        for args in [
+            &["-sread-only", "exec", "x"][..],
+            &["-a=never", "exec", "x"][..],
+            &["-c", "sandbox_mode=\"read-only\"", "exec", "x"][..],
+            &["resume", "thread-id"][..],
+        ] {
+            let (stdout, stderr) = run(&codex, args);
+            assert_eq!(stderr, "", "{args:?}");
+            assert!(
+                !stdout.contains("--dangerously-bypass-approvals-and-sandbox"),
+                "{args:?}: {stdout}"
+            );
+        }
         // By the flag: in place, the flag's echo. A prompt with quote/$/backtick.
         let (stdout, stderr) = run(
             &claude,
@@ -2854,6 +2919,54 @@ mod sh_shim_tests {
                 )
             )
         );
+        // Leading option values cannot hide a resume/fork from the default,
+        // and an unknown arity cannot authorize guessing one.
+        for args in [
+            &["--model", "opus", "resume", "thread-id"][..],
+            &["-m", "opus", "fork", "thread-id"][..],
+            &["--model=opus", "resume", "thread-id"][..],
+            &["-mopus", "fork", "thread-id"][..],
+            &["--cd", "/owned/path", "resume", "thread-id"][..],
+            &["--new-option", "value", "resume", "thread-id"][..],
+            &["--image", "one.png", "two.png", "resume", "thread-id"][..],
+        ] {
+            assert_eq!(
+                run(&codex, args),
+                (
+                    format!(
+                        "{}\n",
+                        args.iter().map(|a| format!("<{a}>")).collect::<String>()
+                    ),
+                    String::new()
+                ),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            run(&codex, &["--model", "resume", "fix this"]).0,
+            "<--dangerously-bypass-approvals-and-sandbox><--model><resume><fix this>\n"
+        );
+        // The model's value spells the command too: insertion uses the
+        // original argument position, never the first equal string.
+        for args in [
+            &["--model", "exec", "exec", "x"][..],
+            &["--yolo", "--model", "exec", "exec", "x"][..],
+            &["--model", "exec", "--yolo", "exec", "x"][..],
+        ] {
+            assert_eq!(
+                run(&muse, args).0,
+                "<--model><exec><exec><--disable-approval><--disable-sandbox>\
+                 <--trust-workspace><--disable-request-user-input><x>\n",
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            run(&muse, &["--new-option", "value", "--yolo", "exec", "x"]),
+            (
+                "<--new-option><value><--yolo><exec><x>\n".into(),
+                String::new()
+            )
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2865,8 +2978,7 @@ mod sh_shim_tests {
         let ok = Policy {
             flags: &["--ok"],
             markers: &["--ok"],
-            after: &[],
-            skip: &[],
+            ..Policy::NONE
         };
         assert_eq!(sh_yolo_prelude("claude", &Policy::NONE, &[]), "");
         assert_eq!(

@@ -15,6 +15,7 @@
 //! screen) and a byte-identity oracle (every rescued frame equals a fresh full
 //! repaint, since a row marked clean is a row whose pixels were moved).
 
+use aterm_core::render::{DecoBlend, DecoGlyph, InkCell, WordDecoration};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu};
 
@@ -238,7 +239,7 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
         None,
         false,
         None,
-        16,
+        aterm_render::RowBands::new(0, 16),
         &mut rigid_rows,
     );
     let diff = scroll_shift_plan(
@@ -248,7 +249,7 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
         None,
         false,
         None,
-        16,
+        aterm_render::RowBands::new(0, 16),
         RetainedRows::Diff,
         &mut diff_rows,
     );
@@ -280,7 +281,7 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
             None,
             false,
             None,
-            16,
+            aterm_render::RowBands::new(0, 16),
             &mut rigid_rows,
         ),
         None,
@@ -293,7 +294,7 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
         None,
         false,
         None,
-        16,
+        aterm_render::RowBands::new(0, 16),
         RetainedRows::Diff,
         &mut diff_rows,
     );
@@ -302,5 +303,192 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
     assert!(
         marked <= 5,
         "a one-line flood must mark the exposed strip + apron, not {marked} of {rows} rows"
+    );
+}
+
+/// How a case lays the card line's ink and star for the frame `k` lines into
+/// the flood: the line's row then, and the row and column the overlays sit on.
+type Overlay = fn(usize, usize) -> (Vec<InkCell>, Vec<WordDecoration>);
+
+/// The ink of an 8-cell word starting at column 2 of `row` (a gradient), in
+/// colour family `tone`.
+fn word_ink(row: usize, tone: u8) -> Vec<InkCell> {
+    (0..8)
+        .map(|i| InkCell {
+            row: row as u16,
+            col: 2 + i,
+            color: [0x40 + tone, 0x30 + 0x18 * i as u8, 0xf0 - tone],
+        })
+        .collect()
+}
+
+/// The star leading the line on `row`, its sprite in the row's own band
+/// (`dy` 0) unless `dy` says otherwise.
+fn star(row: usize, col: u16, dy: i8) -> WordDecoration {
+    WordDecoration {
+        row: row as u16,
+        col,
+        dx: 0,
+        dy,
+        glyph: DecoGlyph::Star4,
+        blend: DecoBlend::Add,
+        color: 0x0060_5030,
+        alpha: 220,
+    }
+}
+
+/// ROW-LOCAL OVERLAYS RIDE THE FLOOD (B3, the inline card's line): a line's
+/// animated ink and its in-band star (`dy` 0), laid a row higher with every
+/// streamed line as the card host lays them, keep the shift-aware rescue and
+/// are slid with their row, not rebuilt. Overlays that do not move with their
+/// line are rebuilt on the rows they leave and reach: ink held on its row,
+/// ink recoloured, ink gone, a star moved along its row. Every frame equals a
+/// full repaint, at the overshoot-hazard sizes. A jittered star (`dy` ≠ 0)
+/// spills into the row above and still refuses the rescue.
+///
+/// The negative controls are mutations (run by hand, recorded in the lane
+/// report): dropping `row_overlays_differ_shifted` from the `Diff` arm of
+/// `scroll_shift_plan` fails "held" (the slid ink where the frame draws none),
+/// and dropping its decoration half fails "star moves".
+#[test]
+fn ink_and_an_in_band_star_ride_the_flood() {
+    let cases: [(&str, bool, Overlay); 6] = [
+        ("rides", true, |line, _| {
+            (word_ink(line, 0), vec![star(line, 0, 0)])
+        }),
+        ("held", false, |_, _| {
+            (word_ink(12, 0), vec![star(12, 0, 0)])
+        }),
+        ("recoloured", false, |line, k| {
+            (word_ink(line, 8 * k as u8), vec![star(line, 0, 0)])
+        }),
+        ("gone", false, |line, k| {
+            if k % 2 == 0 {
+                (word_ink(line, 0), vec![star(line, 0, 0)])
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        }),
+        ("star moves", false, |line, k| {
+            (word_ink(line, 0), vec![star(line, k as u16 % 3, 0)])
+        }),
+        ("jittered", false, |line, _| {
+            (word_ink(line, 0), vec![star(line, 0, -3)])
+        }),
+    ];
+    for px in [13.0f32, 14.0, 16.0] {
+        let mut warm = renderer_px(px);
+        let mut fresh = renderer_px(px);
+        for (name, slides, lay) in cases {
+            let (rows, cols) = (20usize, 30usize);
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            for i in 0..60 {
+                term.process(format!("line {i} \u{c9}\u{c1} text\r\n").as_bytes());
+            }
+            // The card's line, five rows up from the bottom, and the line
+            // the writer is filling.
+            term.process(b"\xe2\x9c\xa6 the card line \xc3\x89\r\n");
+            for i in 0..4 {
+                term.process(format!("after {i} \u{c5} text\r\n").as_bytes());
+            }
+            let mut wc = WindowCpu::new();
+            let frame = |term: &mut Terminal, k: usize| {
+                let mut input = term.cell_frame(rows, cols);
+                let (ink, decos) = lay(rows - 6 - k, k);
+                input.ink = ink;
+                input.word_decorations = decos;
+                input
+            };
+            let first = frame(&mut term, 0);
+            let _ = warm.render_input_cached(&mut wc, &first);
+            for k in 1..=6 {
+                term.process(format!("flood {k} \u{c9} text\r\n").as_bytes());
+                let input = frame(&mut term, k);
+                let cached = warm.render_input_cached(&mut wc, &input).pixels().to_vec();
+                let damage = wc.last_damage();
+                let what = format!("px {px}, {name}, line {k}");
+                assert_eq!(
+                    cached,
+                    fresh.render_input(&input).pixels,
+                    "{what}: the frame equals a full repaint ({damage:?})"
+                );
+                if name == "jittered" {
+                    assert!(
+                        !matches!(damage, DamageOutcome::Scroll { .. }),
+                        "{what}: a jittered star refuses the rescue ({damage:?})"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    damage,
+                    DamageOutcome::Scroll { delta_rows: 1 },
+                    "{what}: the overlays keep the rescue"
+                );
+                let line = rows - 6 - k;
+                let dirty = wc.dirty_rows();
+                if slides {
+                    assert!(!dirty[line], "{what}: the line's row is slid: {dirty:?}");
+                } else {
+                    assert!(
+                        dirty[line] || dirty[12] || dirty[line + 1],
+                        "{what}: the overlays' rows are rebuilt: {dirty:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The RIGID plan (the GPU's history-scroll rescue) holds overlays to the
+/// same rule: a wheel scroll whose ink and star moved with their line plans
+/// the blit, and one whose ink stayed on its row refuses it (a retained row
+/// changed), as does one whose star stayed.
+///
+/// The negative control is a mutation (run by hand, recorded in the lane
+/// report): dropping `row_overlays_differ_shifted` from the `Rigid` check of
+/// `scroll_shift_plan` plans the held case.
+#[test]
+fn the_rigid_plan_refuses_overlays_that_stay_on_their_row() {
+    use aterm_render::{RowBands, scroll_blit_plan};
+
+    let (rows, cols) = (24usize, 40usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    for i in 0..200 {
+        term.process(format!("line {i} some output text\r\n").as_bytes());
+    }
+    let mut before = term.cell_frame(rows, cols);
+    before.ink = word_ink(10, 0);
+    before.word_decorations = vec![star(10, 0, 0)];
+    term.scroll_display(3);
+    let after = term.cell_frame(rows, cols);
+    let plan = |ink: Vec<InkCell>, decos: Vec<WordDecoration>| {
+        let mut cur = after.clone();
+        cur.ink = ink;
+        cur.word_decorations = decos;
+        scroll_blit_plan(
+            &before,
+            &cur,
+            false,
+            None,
+            false,
+            None,
+            RowBands::new(0, 16),
+            &mut Vec::new(),
+        )
+    };
+    assert_eq!(
+        plan(word_ink(13, 0), vec![star(13, 0, 0)]),
+        Some(-3),
+        "overlays that rode the scroll keep the rigid plan"
+    );
+    assert_eq!(
+        plan(word_ink(10, 0), vec![star(13, 0, 0)]),
+        None,
+        "ink left on its row refuses it"
+    );
+    assert_eq!(
+        plan(word_ink(13, 0), vec![star(10, 0, 0)]),
+        None,
+        "a star left on its row refuses it"
     );
 }

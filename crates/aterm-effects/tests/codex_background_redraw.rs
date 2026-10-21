@@ -326,6 +326,148 @@ fn a_park_and_its_real_echo_move_together_when_output_scrolls_the_grid() {
     assert_eq!(h.glow.in_flight_tally().park_returns, 1);
 }
 
+/// [`a_park_and_its_real_echo_move_together_when_output_scrolls_the_grid`] with the echo drawn
+/// in the scroll's own frame: the grid scrolls a row while the footer park is held, and the same
+/// update returns the caret to the composer, carried a row up, with the key's glyph. The park
+/// rode the scroll with its row, so its source is read where the scroll carried it on that frame
+/// and the return is paid. Negative control: deferring the park's source check past a scroll's
+/// frame (the `!scroll_frame` guard the check carried) leaves the echo dark, no park returned.
+#[test]
+fn a_park_s_echo_drawn_in_the_scroll_s_own_frame_is_paid() {
+    let mut h = Host::new();
+    for b in b"abcdefgh" {
+        h.key(*b);
+    }
+    h.now += Duration::from_millis(90);
+    h.glow.note_typed_cells(h.now, 1);
+    h.program(b"\x1b[22;30H.");
+    h.glow.note_scroll(1);
+    h.program(b"\x1b[S\x1b[20;11Hi");
+    assert!(h.live(20).is_empty(), "nothing left on the pre-scroll row");
+    assert_eq!(
+        h.live(19),
+        (2..11).collect::<Vec<_>>(),
+        "the composer's band, the echo with it"
+    );
+    assert_eq!(h.glow.in_flight_tally().park_returns, 1);
+}
+
+/// A footer repainted two or three rows below the composer (Claude Code's and agy's footers sit
+/// under the box's border, not on the row under the input) parks the cursor there while a key's
+/// echo is late. The park is held up to three rows away, where the footer's print ended at the
+/// caret, and its return pays the echo, and the footer stays dark. With a cross-row park held one row away only (before 6a47b6b5dd, and again
+/// in 157b71169c), the three-rows-below take left `i` dark and lit the footer's cell 29.
+#[test]
+fn a_delayed_echo_survives_a_footer_repainted_rows_below_the_composer() {
+    for footer in [23_u16, 24] {
+        let mut h = Host::new();
+        for b in b"abcdefgh" {
+            h.key(*b);
+        }
+        h.now += Duration::from_millis(90);
+        h.glow.note_typed_cells(h.now, 1);
+        h.program(format!("\x1b[{footer};30H.").as_bytes());
+        for i in 0..40 {
+            let col = if i % 2 == 0 { 32 } else { 30 };
+            h.program(format!("\x1b[{footer};{col}H.").as_bytes());
+        }
+        h.program(b"\x1b[?25l");
+        h.program(b"\x1b[21;11Hi\x1b[?25h");
+        assert_eq!(
+            h.live(20),
+            (2..11).collect::<Vec<_>>(),
+            "footer at CUP {footer}: the echo is paid"
+        );
+        assert!(
+            h.live(footer - 1).is_empty(),
+            "footer at CUP {footer}: the footer stays dark"
+        );
+        assert_eq!(
+            h.glow.in_flight_tally().park_returns,
+            1,
+            "footer at CUP {footer}"
+        );
+    }
+}
+
+/// A press in flight and a caret that went four or more rows away with the row it left intact
+/// (vim's `G` or `gg`, a printable press with no echo) is judged on its own frame: no park is held
+/// for a return that never comes. The negative control is the footer three rows below, which the
+/// same press holds as a park (no verdict on the frame). With the park held at any distance
+/// (6a47b6b5dd) the far jump waited with no verdict.
+#[test]
+fn a_far_jump_with_a_press_in_flight_is_judged_at_once() {
+    for (to_row, held) in [(4_u16, false), (16, false), (23, true)] {
+        let mut h = Host::new();
+        for b in b"abcdefgh" {
+            h.key(*b);
+        }
+        h.now += Duration::from_millis(90);
+        h.glow.note_typed_cells(h.now, 1);
+        let before = h.glow.admission_tally();
+        h.program(format!("\x1b[{};30H.", to_row + 1).as_bytes());
+        let after = h.glow.admission_tally();
+        let judged = (after.licensed + after.declined) - (before.licensed + before.declined);
+        assert_eq!(
+            judged,
+            u64::from(!held),
+            "a caret moved from row 20 to row {to_row}: judged on its frame unless a footer park"
+        );
+    }
+}
+
+/// A bare jump of two or three rows, up or down, with a press in flight and the row it left
+/// intact (vim's `}` or `{` over a short paragraph, `2j`, `3k`, `L` in a small pane: a printable
+/// motion key that moves the caret and prints nothing where it lands) is judged on its own frame,
+/// on the normal and the alternate screen, as it was when a cross-row park stood on the adjacent
+/// row only. A footer park two or three rows away is held because the program's print ended
+/// where the caret stands ([`a_delayed_echo_survives_a_footer_repainted_rows_below_the_composer`]).
+/// Negative controls: the same jumps ending a print are held (no verdict on the frame), and a bare
+/// move to the adjacent row is held as before. Before the print gate the bare two- and three-row
+/// jumps were held for the press's whole ten-second patience.
+#[test]
+fn a_two_or_three_row_motion_with_a_press_in_flight_is_judged_at_once() {
+    for alt in [false, true] {
+        for (to_row, print, held) in [
+            (22_u16, false, false),
+            (23, false, false),
+            (18, false, false),
+            (17, false, false),
+            (22, true, true),
+            (23, true, true),
+            (18, true, true),
+            (17, true, true),
+            (21, false, true),
+            (19, false, true),
+        ] {
+            let mut h = Host::new();
+            if alt {
+                h.program(b"\x1b[?1049h\x1b[21;3H");
+            }
+            for b in b"abcdefgh" {
+                h.key(*b);
+            }
+            h.now += Duration::from_millis(90);
+            h.glow.note_typed_cells(h.now, 1);
+            let before = h.glow.admission_tally();
+            let jump = if print {
+                format!("\x1b[{};29H.", to_row + 1)
+            } else {
+                format!("\x1b[{};30H", to_row + 1)
+            };
+            h.program(jump.as_bytes());
+            let after = h.glow.admission_tally();
+            let judged = (after.licensed + after.declined) - (before.licensed + before.declined);
+            assert_eq!(
+                judged,
+                u64::from(!held),
+                "alt {alt}: a caret moved from row 20 to row {to_row}, print {print}: judged on \
+                 its frame unless held as a park"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_partial_restore_cannot_recover_the_clock_but_the_complete_original_can() {
     let mut h = Host::new();

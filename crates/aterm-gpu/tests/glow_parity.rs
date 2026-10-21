@@ -294,6 +294,104 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
     );
 }
 
+/// The bloom fades out on a light page: on white the halo adds nothing,
+/// so dark letters beside a bright comet keep their pixels exactly; on a
+/// light-grey page it adds less than on a mid-grey one, which keeps nearly the
+/// configured bloom (negative control: the same comet does bloom there). The
+/// CPU twin, given the page's share
+/// ([`aterm_render::hdr::light_page_bloom_share`]), adds the same light as the
+/// readback composite and the live present.
+#[test]
+fn bloom_fades_out_on_a_light_page() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let (cpu, mut gpu) = backends(px, theme);
+    let (rows, cols) = (6usize, 24usize);
+    let (cw, ch) = cpu.cell_size();
+    let params = aterm_render::bloom::BloomParams::default();
+    gpu.set_bloom_params(params.strength, params.radius);
+    let bloom_delta = |gpu: &mut aterm_gpu::GpuRenderer, page: u32| -> u64 {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(
+            format!("\x1b]11;#{page:06x}\x07\x1b]10;#000000\x07\x1b[4;12HWORDS\x1b[3;12HHERE")
+                .as_bytes(),
+        );
+        let mut input = term.cell_frame(rows, cols);
+        input.cursor_visible = false; // isolate the glow
+        // A bright comet across the middle row, ending beside the letters.
+        for c in 4..11usize {
+            input.cursor_glow_add.push(GlowQuad::flat(
+                3,
+                (c * cw) as u16,
+                (3 * ch) as u16,
+                cw as u16,
+                ch as u16,
+                premul_rgb(0x0050_FA7B, 220),
+                // ADDITIVE light (see `GlowQuad::alpha`).
+                0,
+            ));
+        }
+        let mut win = aterm_gpu::WindowGpu::new();
+        gpu.set_bloom(true);
+        let on = gpu.render_input(&mut win, &input, None);
+        gpu.set_bloom(false);
+        let off = gpu.render_input(&mut win, &input, None);
+        assert_eq!((on.width, on.height), (off.width, off.height));
+        // The twin blooms the GPU's own bloom-off frame, so the bound judges
+        // the light each law adds and nothing else. Base glyph parity is the
+        // glyph suites' (<=8): a blend unit at the target's 8-bit precision
+        // (NVIDIA, Vulkan and GL alike) leaves dark ink on a light page up to
+        // 7 codes from the CPU's with no bloom at all.
+        let mut twin = off.clone();
+        aterm_render::bloom::apply(
+            &mut twin,
+            &input.cursor_glow_add,
+            rows,
+            aterm_render::bloom::BloomParams {
+                strength: params.strength * aterm_render::hdr::light_page_bloom_share(page),
+                ..params
+            },
+        )
+        .unwrap();
+        let worst = max_channel_delta(&twin.pixels, &on.pixels);
+        assert!(
+            worst <= 2,
+            "page {page:06x}: the CPU twin fades alike: {worst}"
+        );
+        // The live present writes its own bloom uniform: the same light.
+        gpu.set_bloom(true);
+        let presented = gpu.present_input_readback(&mut aterm_gpu::WindowGpu::new(), &input);
+        gpu.set_bloom(false);
+        let worst = max_channel_delta(&twin.pixels, &presented.pixels);
+        assert!(
+            worst <= 2,
+            "page {page:06x}: the present fades as the twin does: {worst}"
+        );
+        on.pixels
+            .iter()
+            .zip(&off.pixels)
+            .map(|(a, b)| {
+                [16u32, 8, 0]
+                    .iter()
+                    .map(|sh| u64::from(((a >> sh) & 0xff).abs_diff((b >> sh) & 0xff)))
+                    .sum::<u64>()
+            })
+            .sum()
+    };
+    let mid = bloom_delta(&mut gpu, 0x0080_8080);
+    let light = bloom_delta(&mut gpu, 0x00C0_C0C0);
+    let white = bloom_delta(&mut gpu, 0x00FF_FFFF);
+    eprintln!("bloom delta: mid-grey {mid}, light-grey {light}, white {white}");
+    assert!(
+        mid > light && light > 0,
+        "control: the bloom runs, and fades as the page lightens ({mid} > {light} > 0)"
+    );
+    assert_eq!(
+        white, 0,
+        "on a white page the bloom must add nothing over the letters and caret"
+    );
+}
+
 /// Head band: with a chrome head band and interior padding on both backends, the
 /// window-absolute streams (a real `comet_beam` rising into the band, a `glow_halo` and a
 /// `glow_under` quad in the band) and a grid-space `nova_add` quad render byte-exact CPU==GPU,

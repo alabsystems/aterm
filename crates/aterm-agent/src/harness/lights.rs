@@ -17,16 +17,16 @@
 //! and Claude's own rows are whole. Hover a drawn light to read its title;
 //! click it to toggle.
 //!
-//! THE OVERRIDE, FOR TWO MARKS THAT ARE NOT LIGHTS (owner, 2026-10-15: "i
-//! want a small icon that allows me to toggle it on and off and another icon
-//! that takes me to the settings page for the claude code harness", "I need
+//! THE OVERRIDE, FOR A MARK THAT IS NOT A LIGHT (owner, 2026-10-15: "I need
 //! some visual indicator that the claude code session is being wrapped and a
 //! way to toggle on and off to show the improvement";
 //! `docs/DESIGN-harness-autopilot-2026-10-15.md` §2.3). The host draws the
-//! session's Autopilot chip and a `⚙` beside the light AT REST, whenever its
-//! footer draws and a harness host exists. They are aterm's own state, read
-//! from nothing Claude Code draws, so they are the host's chips and never a
-//! [`Light`]; the permission-mode light STAYS DEVIATIONS ONLY.
+//! session's Autopilot chip beside the light AT REST, whenever its footer
+//! draws and a harness host exists; no settings button stands beside it
+//! (owner, 2026-10-20: "remove the harness settings button in the UX"). It is
+//! aterm's own state, read from nothing Claude Code draws, so it is the
+//! host's chip and never a [`Light`]; the permission-mode light STAYS
+//! DEVIATIONS ONLY.
 //!
 //! One permission-mode light: auto-approve (`bypass permissions`) and auto mode
 //! are two positions of Claude Code's one permission mode, and the owner

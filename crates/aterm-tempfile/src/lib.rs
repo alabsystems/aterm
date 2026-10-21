@@ -6,8 +6,8 @@
 //! A drop-in for the parts of the `tempfile` crate aterm uses: `TempDir`,
 //! `Builder`, and the free function `tempdir()`. Tests that run a stand-in
 //! script also get `stand_in`: in test and debug builds, and in any build with
-//! the `test-support` feature, which dependents enable from their
-//! dev-dependencies so their optimized test targets build.
+//! the `test-support` feature, which a `--release` test run of a dependent names
+//! on its command line (`--features aterm-tempfile/test-support`).
 
 // Register the `trust` tool namespace so the FFI/CSPRNG wrappers below can
 // carry `#[cfg_attr(trust_verify, trust::skip)]`; inert off-Trust.

@@ -10,22 +10,25 @@
 //! bundle reads it there). Programs that cannot import a Rust constant keep hand copies, and
 //! a change here is made in each of them too:
 //!
-//! - `tools/install.sh`: `STORE_ALIASES` (line 2401) and the loop that links it (3736);
-//! - `apps/aterm-win/build.ps1:213` and `apps/aterm-win/install.ps1:89`, spelled with
+//! - `tools/install.sh`: `STORE_ALIASES` (line 2403) and the loop that links it (3738);
+//! - `apps/aterm-win/build.ps1:217` and `apps/aterm-win/install.ps1:91`, spelled with
 //!   `.exe`; Windows lays the CLI names only, so `aterm-askpass` and `aterm-gui` (there the
 //!   windowed image, a file of its own) are not in them;
-//! - the `Get-Process` lists at `apps/aterm-win/install.ps1:222` and
-//!   `apps/aterm-win/uninstall.ps1:144`;
+//! - the `Get-Process` lists at `apps/aterm-win/install.ps1:225` and
+//!   `apps/aterm-win/uninstall.ps1:146`;
 //! - the prose in `apps/aterm-win/build.ps1`: the dist layout's `argv0 alias` rows in its
-//!   header (lines 33-38) and the README it writes into the dist (460-464);
+//!   header (lines 33-40) and the README it writes into the dist (462-470);
 //! - the symlink sentence at `README.md:174`.
+//!
+//! The lists among them (`STORE_ALIASES`, both `$aliases`, both `Get-Process` lists and the
+//! README sentence) each carry a comment naming this constant.
 
 /// The argv0 aliases every bundle carries in `Contents/MacOS`, each a symlink onto the
 /// one `aterm` binary, which dispatches on the name it is run as. `aterm-link` is spawned
 /// BY NAME out of `[fabric] command`, so a shipped install must carry it too.
 ///
 /// Plain names: no directory and no `.exe` (a Windows reader appends it).
-pub const ALIASES: [&str; 10] = [
+pub const ALIASES: [&str; 11] = [
     "aterm-cli",
     "aterm-ctl",
     "atpkg",
@@ -41,6 +44,9 @@ pub const ALIASES: [&str; 10] = [
     "aterm-askpass",
     "aterm-link",
     "aterm-gui",
+    // amacs, aterm's editor (`aterm edit`, `docs/DESIGN-amacs-2026-10-19.md` §8.1): an
+    // argv0 alias because `$EDITOR` names one executable, run with the file and no verb.
+    "amacs",
 ];
 
 #[cfg(test)]

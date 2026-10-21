@@ -256,9 +256,11 @@ impl BlockFillOwner {
             // the cursor's own colour warmed: at rest the caret is the user's /
             // OSC-12 colour.
             Self::Rainbow | Self::Phaser | Self::Momentum => BlockFillBase::CursorColor,
-            // Built from the resolved trail colour, which follows the cursor
-            // colour unless `cursor_trail_color` is pinned; the laser is exempt
-            // (lightning is electric yellow by design).
+            // Built from the resolved trail colour: an explicit
+            // `cursor_trail_color`, else the one colour law
+            // (`cursor_fx::automatic_glow_color`) — laser storm violet always,
+            // beam/comet/sparkle their canonical hue until a cursor colour is
+            // pinned, every other style the live cursor colour.
             Self::Comet | Self::Bolt | Self::BeamRod => BlockFillBase::TrailColor,
             // The style is its colour (a fire cursor is orange, a water cursor
             // aqua): no base at all, by design.
@@ -273,8 +275,10 @@ pub enum BlockFillBase {
     /// The terminal's resolved cursor colour (OSC 12, else the theme's
     /// `cursor_color`, else the live OSC 10 foreground), tinted by the effect.
     CursorColor,
-    /// The resolved trail colour (`GlowConfig::color`): the cursor colour unless
-    /// an explicit `cursor_trail_color` (or the laser's exemption) replaced it.
+    /// The resolved trail colour (`GlowConfig::color`): an explicit
+    /// `cursor_trail_color`, else `cursor_fx::automatic_glow_color` — the
+    /// style's canonical hue (laser always; beam, comet and sparkle until a
+    /// cursor colour is pinned) or the live cursor colour.
     TrailColor,
     /// The style's own identity colour. The cursor colour DELIBERATELY does
     /// not reach the caret here.
@@ -311,7 +315,9 @@ pub struct BlockFill {
     /// The effect that set `cursor_fill_override` this frame.
     pub owner: BlockFillOwner,
     /// The colour `0x00RRGGBB` that override carried — literally the caret's
-    /// body on the glass (the renderer floors it for glyph contrast).
+    /// body on the glass, already held to the page floor
+    /// (`cursor_fx::floor_block_fill`); the renderer's `minimum_contrast`
+    /// floor, off by default, can still lift it.
     pub fill: u32,
     /// The base colour `0x00RRGGBB` the host handed this owner: the resolved
     /// cursor or trail colour, per [`BlockFillOwner::base_from`]. `None` for
@@ -347,8 +353,14 @@ pub struct TrailStatus<'a> {
     /// The `cursor_trail_style` config string VERBATIM, before resolution —
     /// so a typo that silently fell back to the default is visible as itself.
     pub style_raw: &'a str,
-    /// What that string resolved to.
-    pub style: GlowStyle,
+    /// What that string resolved to: `None` when it draws no trail (`off`),
+    /// printed `resolved=off`, never the placeholder enum a disabled
+    /// `GlowConfig` carries. A spelling naming nothing drawable resolves to
+    /// the default style it falls back to, and [`Self::unknown`] says so.
+    pub style: Option<GlowStyle>,
+    /// The spelling was not recognised, so the default style draws in its
+    /// place: the row's `issue=unknown` (`issue=none` when it was honoured).
+    pub unknown: bool,
     /// A trail is drawn: the configured style is not Off.
     pub config_enabled: bool,
     /// The resolved `GlowConfig::enabled` this frame — config AND serious mode.
@@ -381,7 +393,8 @@ pub struct TrailStatus<'a> {
     /// The ribbon's dark-theme presentation as the raw spelling resolves it:
     /// `"underline"` (the explicit highlighter-plus-strip hybrid) or `"tall"`
     /// (the default smooth body, from ordinary rainbow spellings and the
-    /// explicit `… tall` aliases).
+    /// explicit `… tall` aliases); `"none"` when the resolved style is not
+    /// rainbow kitty, which draws no ribbon.
     pub ribbon_look: &'static str,
     /// The cumulative admission scoreboard.
     pub tally: AdmissionTally,
@@ -399,7 +412,7 @@ pub struct TrailStatus<'a> {
     /// Milliseconds left in a falling curtain ([`CursorGlow::curtain_left_ms`]),
     /// `None` when none is falling: why a drawn band is under the claim floor.
     pub ribbon_curtain_ms: Option<u32>,
-    /// The one field (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2.1): the
+    /// The one field (`docs/design/RAINBOW-KITTY-V2.md` §2.3, C2): the
     /// spectrum position the caret is about to lay
     /// ([`CursorGlow::rainbow_field`]), `0` red … `1` violet. Every layer of the
     /// mark reads it, so if ribbon, wake and caret disagree on screen this shows
@@ -468,6 +481,15 @@ pub struct TrailStatus<'a> {
     /// banked because the tty would not echo them
     /// ([`CursorGlow::in_flight_tally`]).
     pub in_flight: InFlightTally,
+    /// The comet's opaque cell bed on the last tick
+    /// (`crate::cursor_fx::CursorFx::trail_scratch`): how many cells it laid,
+    /// and the brightest one's coverage byte (`0..=255`, after the shed
+    /// envelope, the brightness dial and the bed's legibility share
+    /// (`crate::cursor_fx::bed_legible_share`) — what the renderer blends at). The
+    /// bed is no aurora light, so `glow_active=false` beside `comet_cells>0`
+    /// is a bed still fading on the glass.
+    pub comet_cells: usize,
+    pub comet_alpha_max: u8,
 }
 
 impl TrailStatus<'_> {
@@ -483,6 +505,13 @@ impl TrailStatus<'_> {
         // `ribbon_drawn` reaching 0 marks the end.
         (self.ribbon_segments >= 2 && self.ribbon_hue_bands >= 2)
             || (self.ribbon_curtain_ms.is_some() && self.ribbon_drawn >= 2)
+    }
+
+    /// The `resolved=` token: the resolved style's label (a fallback's is the
+    /// default it draws; `issue=` says why), else `off`.
+    #[must_use]
+    pub fn resolved_label(&self) -> &'static str {
+        self.style.map_or("off", GlowStyle::label)
     }
 
     /// The wire tail after `OK ` — one line, `key=value` pairs in a fixed
@@ -510,9 +539,10 @@ impl TrailStatus<'_> {
              pet_focus={} pet_reason={} pet_anchor={} pet_event_seq={} pet_pose={} \
              inserts_delivered={} inserts_lit={} inserts_retracted={} last_insert_cells={} \
              inflight_licensed={} inflight_forgotten={} credits={} swallowed_no_echo={} \
-             park_returns={} park_flushed={}",
+             park_returns={} park_flushed={} \
+             issue={} comet_cells={} comet_alpha_max={}",
             self.style_raw,
-            self.style.label(),
+            self.resolved_label(),
             self.config_enabled,
             self.effective,
             self.focused,
@@ -581,6 +611,11 @@ impl TrailStatus<'_> {
             self.in_flight.swallowed_no_echo,
             self.in_flight.park_returns,
             self.in_flight.park_flushed,
+            // Appended after the established prefix, so every existing reader
+            // still parses it unchanged.
+            if self.unknown { "unknown" } else { "none" },
+            self.comet_cells,
+            self.comet_alpha_max,
         )
     }
 
@@ -811,11 +846,14 @@ impl CursorGlow {
         0
     }
 
-    /// Total live sparks (ribbon + jump/comet cells), so `trail status` can tell
-    /// "no light at all" from "light, but not the typed band".
+    /// Total live sparks (ribbon + jump/comet cells, and the classic wake's
+    /// swept cells), so `trail status` can tell "no light at all" from "light,
+    /// but not the typed band". The two engines never both hold sparks: any
+    /// tick of another style resets the classic one, and the classic branch
+    /// settles this one before it draws.
     #[must_use]
     pub fn live_sparks(&self) -> usize {
-        self.sparks.len()
+        self.sparks.len() + self.classic.live_sparks()
     }
 
     /// The eased momentum spine the ribbon's width, wave and brightness read
@@ -831,20 +869,39 @@ impl CursorGlow {
         0.0
     }
 
-    /// Whether window-pixel `(x, y)` sits over a probed glyph cell of the
-    /// cursor's own row. Reads the prev probe slot (this frame's presented truth
-    /// at emit time; see [`Self::probed_cell_glyph`]) and answers `false` off-row,
-    /// left of the grid, or past the captured width. Own-row flying transients
-    /// (fire embers, pack dots) key their dimming on it. Narrower than
-    /// `probed_cell_glyph`: neighbour-row probes are not consulted.
-    pub(super) fn own_row_glyph_at_px(&self, geom: Geom, x: f32, y: f32) -> bool {
-        let prow = ((y - geom.origin_y as f32) / geom.ch as f32).floor() as i32;
-        let pcol = ((x - geom.origin_x as f32) / geom.cw as f32).floor() as i32;
-        pcol >= 0
-            && self.row_prev_meta.is_some_and(|m| {
-                i32::from(m.row) == prow
-                    && self.row_prev.get(pcol as usize).is_some_and(|&g| g != ' ')
-            })
+    /// The text lines the host's row probe shows this frame: the cursor's row
+    /// and each probed row flanking it ([`Self::observe_neighbor_rows`]), as
+    /// the column span from the row's first glyph to one past its last. Reads
+    /// the prev probe slot (this frame's presented truth at emit time); a row
+    /// the host did not capture, or a blank one, has no span. The particle law
+    /// keys on it ([`TextSpans::covers`]).
+    pub(super) fn probed_text_spans(&self) -> TextSpans {
+        let mut spans = TextSpans::default();
+        let Some(m) = self.row_prev_meta.as_ref() else {
+            return spans;
+        };
+        let row = i32::from(m.row);
+        let rows: [(i32, Option<&[char]>); 3] = [
+            (
+                row - 1,
+                (m.above == NbrProbe::Probed).then_some(&self.row_above_prev[..]),
+            ),
+            (row, Some(&self.row_prev[..])),
+            (
+                row + 1,
+                (m.below == NbrProbe::Probed).then_some(&self.row_below_prev[..]),
+            ),
+        ];
+        for ((slot, read), (r, cols)) in spans.rows.iter_mut().zip(&mut spans.read).zip(rows) {
+            let Some(cols) = cols else { continue };
+            *read = Some(r);
+            let first = cols.iter().position(|&g| g != ' ');
+            let last = cols.iter().rposition(|&g| g != ' ');
+            if let (Some(first), Some(last)) = (first, last) {
+                *slot = Some((r, first as i32, last as i32 + 1));
+            }
+        }
+        spans
     }
 
     /// This frame's radial light (see `halo_out`), for the host to splice
@@ -922,17 +979,13 @@ impl CursorGlow {
     }
 
     /// The colour of a seated caret stop (`v2_stop`), spelled as
-    /// `rk::ribbon::Ribbon::head_rgb` spells the live one: the authored stop at
-    /// the reflected walk on dark, that stop's caret ink on the page on light.
-    /// The two agree to the byte on every seat frame
+    /// `rk::ribbon::Ribbon::head_rgb` spells the live one, through the same
+    /// `rk::ribbon::caret_ink`: the authored stop at the reflected walk on
+    /// dark, that stop's caret ink on the page on light. The two agree to the
+    /// byte on every seat frame
     /// (`the_caret_settles_on_its_own_stop_without_a_pop`).
     pub(super) fn v2_caret_stop_rgb(t: f32, cfg: &rk::Config) -> u32 {
-        let arc = crate::spectrum::spectrum(rk::ribbon::walk_arc(t));
-        if cfg.dark_theme {
-            arc
-        } else {
-            rk::ribbon::paper_caret_ink(arc, cfg.theme_bg)
-        }
+        rk::ribbon::caret_ink(crate::spectrum::spectrum(rk::ribbon::walk_arc(t)), cfg)
     }
 
     /// Source RGB selected by the typing ribbon HEAD's BODY, before additive
@@ -1017,5 +1070,152 @@ impl CursorGlow {
     /// [`Self::halo_cells`]). Same previous-frame caveat as [`Self::swap_halos`].
     pub fn swap_halo_cells(&mut self, dst: &mut Vec<FireHaloCell>) {
         std::mem::swap(dst, &mut self.fire_halo_out);
+    }
+}
+
+/// The probed text lines of one frame ([`CursorGlow::probed_text_spans`]): up
+/// to three rows, each `(row, first column, one past the last)`, and which
+/// rows the probe read at all (blank or not).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TextSpans {
+    rows: [Option<(i32, i32, i32)>; 3],
+    read: [Option<i32>; 3],
+}
+
+impl TextSpans {
+    /// Whether grid cell `(row, col)` lies on a probed line of text: a
+    /// glyph, or a blank between two of a line's glyphs (a mark in the gap
+    /// between words reads as punctuation, a hyphen or a middle dot, as
+    /// surely as one over a letter reads as noise).
+    pub(super) fn covers_cell(&self, row: i32, col: i32) -> bool {
+        self.rows
+            .iter()
+            .flatten()
+            .any(|&(r, first, end)| r == row && (first..end).contains(&col))
+    }
+
+    /// Each probed line of text as `(row, first, end)`: the column span from
+    /// its first glyph to one past its last.
+    pub(super) fn lines(&self) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
+        self.rows.iter().flatten().copied()
+    }
+
+    /// Whether the probe read grid row `row` this frame, so a cell of it off
+    /// every line ([`Self::covers_cell`]) is known blank rather than unknown.
+    pub(super) fn reads_row(&self, row: i32) -> bool {
+        self.read.contains(&Some(row))
+    }
+}
+
+/// The text of the rows the frame presents where the streak may run, read
+/// from the frame's own cells ([`CursorGlow::observe_frame_text`]): rows
+/// `lo..lo + rows.len()`, each the column span from its first glyph to one
+/// past its last (`None` for a blank row), for the frame stamped `at`.
+#[derive(Default)]
+pub(crate) struct FrameText {
+    pub(super) at: Option<Instant>,
+    pub(super) lo: i32,
+    pub(super) rows: Vec<Option<(i32, i32)>>,
+    /// Each read row's cells' ink and ground (`0x00RRGGBB`; no ink for a
+    /// blank cell; `None` for a column the row does not carry), `cols` a
+    /// row, row-major as `rows`: what a letter there is drawn in and on.
+    pub(super) pairs: Vec<Option<(Option<u32>, u32)>>,
+    pub(super) cols: usize,
+}
+
+impl FrameText {
+    /// The ink (`None` for a blank cell) and ground of cell `(row, col)` in
+    /// the frame's own cells, or `None` for a cell the frame did not read.
+    pub(crate) fn pair(&self, row: i32, col: i32) -> Option<(Option<u32>, u32)> {
+        let i = row - self.lo;
+        if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
+            return None;
+        }
+        self.pairs
+            .get(i as usize * self.cols + col as usize)
+            .copied()
+            .flatten()
+    }
+}
+
+/// What a frame shows of text where the streak runs: the row probe's lines,
+/// and for a row the probe did not read, that row's text in the frame's own
+/// cells ([`FrameText`]). A row neither one read is unknown.
+#[derive(Clone, Copy)]
+pub(crate) struct TextView<'a> {
+    pub(crate) spans: TextSpans,
+    frame: &'a [Option<(i32, i32)>],
+    lo: i32,
+}
+
+impl<'a> TextView<'a> {
+    /// The probe's lines and the frame's rows `frame` (`None` for a frame
+    /// that handed none).
+    pub(crate) fn new(spans: TextSpans, frame: Option<&'a FrameText>) -> Self {
+        match frame {
+            Some(f) => Self {
+                spans,
+                frame: &f.rows,
+                lo: f.lo,
+            },
+            None => Self {
+                spans,
+                frame: &[],
+                lo: 0,
+            },
+        }
+    }
+
+    /// The frame's own read of `row`: `Some(span)` for a row it read
+    /// (`span` `None` when blank), `None` for a row it did not.
+    fn frame_row(&self, row: i32) -> Option<Option<(i32, i32)>> {
+        let i = row - self.lo;
+        (i >= 0)
+            .then(|| self.frame.get(i as usize).copied())
+            .flatten()
+    }
+
+    /// Whether the frame says what row `row` holds (the probe or the cells).
+    pub(crate) fn knows_row(&self, row: i32) -> bool {
+        self.spans.reads_row(row) || self.frame_row(row).is_some()
+    }
+
+    /// The text line of a row the probe did not read but the frame's cells
+    /// did: `Some(Some((first, end)))` for a row with glyphs, `Some(None)`
+    /// for a blank one, `None` where neither read it.
+    pub(crate) fn frame_line(&self, row: i32) -> Option<Option<(i32, i32)>> {
+        if self.spans.reads_row(row) {
+            return None;
+        }
+        self.frame_row(row)
+    }
+
+    /// Whether grid cell `(row, col)` lies on a line of text the frame
+    /// shows (a glyph, or a blank between two of a line's glyphs).
+    pub(crate) fn covers_cell(&self, row: i32, col: i32) -> bool {
+        if self.spans.reads_row(row) {
+            return self.spans.covers_cell(row, col);
+        }
+        self.frame_row(row)
+            .flatten()
+            .is_some_and(|(first, end)| (first..end).contains(&col))
+    }
+
+    /// Whether the frame shows grid row `row` blank: read (by the probe or
+    /// the frame's own cells) and holding no glyph. A row nobody read is
+    /// not known blank.
+    pub(crate) fn row_is_blank(&self, row: i32) -> bool {
+        if self.spans.reads_row(row) {
+            !self.spans.lines().any(|line| line.0 == row)
+        } else {
+            self.frame_row(row) == Some(None)
+        }
+    }
+
+    /// Whether the dark streak treats cell `(row, col)` as text: a cell on
+    /// a line of text, or one on a row nobody read (so the full beam lands
+    /// only where the frame showed air).
+    pub(crate) fn over_text(&self, row: i32, col: i32) -> bool {
+        !self.knows_row(row) || self.covers_cell(row, col)
     }
 }

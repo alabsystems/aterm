@@ -319,6 +319,9 @@ pub struct Terminal {
     /// the session's input seam, so key presses need not take this terminal's mutex.
     /// Refreshed after every `process()` batch and by every host mutator of an input.
     pub(super) mode_mirror: std::sync::Arc<super::ModeMirror>,
+    /// The host's watchers of this terminal's frame ([`super::FrameWatchers`]): the
+    /// host's lock wrapper asks them at the end of a hold, the engine never does.
+    pub(super) frame_watchers: Option<std::sync::Arc<dyn super::FrameWatchers>>,
     /// Grouped Sixel graphics processing state.
     pub(super) sixel: SixelState,
     /// Window operations callback for CSI t (XTWINOPS).
@@ -389,15 +392,15 @@ pub struct Terminal {
     /// tracker's bits undercount the rows changed since the fill). Starts at 1 so a
     /// never-filled scratch (gen 0) fails.
     pub(super) extract_gen: u64,
-    /// Cached full-content search index ([`Terminal::indexed_search`]).
-    pub(super) search_index: Option<super::search_index::CachedSearchIndex>,
+    /// The full-history search index and what it was built for
+    /// ([`Terminal::search_plan`], [`Terminal::indexed_search`]).
+    pub(super) search_slot: Option<super::search_index::SearchSlot>,
     /// The budgeted resumable search, if any ([`Terminal::search_budgeted`]).
     pub(super) budgeted_search: Option<super::search_budgeted::BudgetedSearchState>,
-    /// Search-index cache misses in [`Terminal::indexed_search`]
-    /// ([`Terminal::search_index_rebuilds`]).
+    /// Search-index builds finished ([`Terminal::finish_search`],
+    /// [`Terminal::search_index_rebuilds`]).
     pub(super) search_index_rebuilds: u64,
-    /// Incremental refreshes in [`Terminal::indexed_search`], each also counted in
-    /// `search_index_rebuilds`.
+    /// Incremental refreshes among them, each also counted in `search_index_rebuilds`.
     pub(super) search_index_refreshes: u64,
     /// Monotonic revision of top-anchored protected-footer row insertions (a top-anchored
     /// partial scroll inserting rows before a protected footer): hosts caching absolute
@@ -406,6 +409,10 @@ pub struct Terminal {
     /// Which main-screen rows each drawer wrote while it held the terminal
     /// ([`super::holder_fence`]); its anchors live in the main grid.
     pub(super) holder_fence: super::HolderFence,
+    /// [`screen_mutations`](Self::screen_mutations) when a checkpoint's fence
+    /// was installed: equal at the adoption, no byte came between, so the
+    /// carried current mark still speaks for the screen.
+    pub(super) holder_carried_at: Option<u64>,
     /// Monotonic repaint-blink epoch: bumped on each DECTCEM hide (`CSI ?25l`) inside DEC
     /// 2026 synchronized output, the per-keystroke repaint of full-redraw TUIs (vim/less
     /// and ConPTY hide without sync). Read-only for hosts' cursor-effect classifiers.

@@ -6,10 +6,11 @@
 
 use crate::logid::{Lineage, LogIdentity};
 use crate::proto::{
-    append_frame, append_publish_frame, decode_response, encode_request, foreign_protocol,
-    read_frame, Request, Response, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT,
-    ERR_PROTOCOL, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED,
-    LOG_POISONED_PREFIX, PROTO_VERSION,
+    append_frame, append_publish_frame, append_retire_frame, decode_response, encode_request,
+    foreign_protocol, read_frame, Request, Response, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
+    ERR_BAD_SUBJECT, ERR_PROTOCOL, ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED,
+    ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED, LOG_POISONED_PREFIX, PROTO_VERSION, RETIRE_CHARGED_PREFIX,
+    RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
 };
 use crate::proto::{NonceExt, ServedInfo};
 use astream_wire::{Frame, FrameError};
@@ -254,6 +255,27 @@ const MAX_PIPELINE_WINDOW: usize = 512;
 /// the request before it. Reconnect. A broker REFUSAL is a whole reply and leaves the
 /// client in step ([`BrokerRefusal`]). A broker in ANOTHER protocol is neither: its
 /// reply is a [`ProtocolMismatch`], and it latches the client like any other failure.
+///
+/// The client also keeps itself in step with the acks it OWES ITSELF. A pipelined
+/// publish ([`send_publish`](Client::send_publish), [`send_retire`](Client::send_retire))
+/// leaves its ack on the stream for a later [`recv_publish_ack`](Client::recv_publish_ack),
+/// and the broker answers a connection's requests in the order it read them, so the
+/// next frame belongs to the oldest owed publish, not to whatever request is sent
+/// after it. A request that reads its own reply — a blocking publish, a commit, a
+/// fetch, a `Hello`, a subscribe: every verb but the pipelined pair — would take that
+/// ack as its answer: a commit would return the publish's offset, a fetch would fail
+/// on a reply of the wrong kind, and a REFUSED publish's `Error` would come back as
+/// the later request's own refusal. So the client counts the acks owed
+/// ([`owed_acks`](Client::owed_acks)) and, while any are, refuses every such request
+/// with [`AcksOwed`], writing nothing and reading nothing: the connection stays in
+/// step, and the request goes through once `recv_publish_ack` has read them all.
+/// The three verbs that CONSUME the client — [`subscribe`](Client::subscribe),
+/// [`subscribe_group`](Client::subscribe_group) and
+/// [`fork_subscribe`](Client::fork_subscribe) — are refused the same way, with nothing
+/// sent, but the client was moved into the call, so the refusal drops it: the
+/// connection closes with the owed acks unread, and a will registered on it fires. A
+/// caller that pipelines reads [`owed_acks`](Client::owed_acks) down to zero before it
+/// subscribes.
 #[cfg(unix)]
 pub struct Client<S = UnixStream> {
     stream: S,
@@ -271,6 +293,14 @@ pub struct Client<S = UnixStream> {
     /// The durable head the newest `Mark` this connection read carried
     /// ([`seen_durable`](Client::seen_durable)).
     durable: Option<u64>,
+    /// Pipelined publishes written whose acks have not been read
+    /// ([`owed_acks`](Client::owed_acks)).
+    owed: u64,
+    /// The negative control of the owed-ack guard: a client that does not refuse a
+    /// request while acks are owed, as every client did before it. Only this module's
+    /// own unit tests set it.
+    #[cfg(test)]
+    unguarded: bool,
 }
 
 /// A connection to a broker over a byte stream. Windows twin: std has no
@@ -293,6 +323,12 @@ pub struct Client<S = TcpStream> {
     /// The durable head the newest `Mark` this connection read carried
     /// ([`seen_durable`](Client::seen_durable)).
     durable: Option<u64>,
+    /// Pipelined publishes written whose acks have not been read
+    /// ([`owed_acks`](Client::owed_acks)).
+    owed: u64,
+    /// The negative control of the owed-ack guard (see the Unix definition).
+    #[cfg(test)]
+    unguarded: bool,
 }
 
 #[cfg(unix)]
@@ -489,20 +525,50 @@ impl<S: Read + Write> Client<S> {
             sent_at: Instant::now(),
             keepalive_unknown: false,
             durable: None,
+            owed: 0,
+            #[cfg(test)]
+            unguarded: false,
         }
     }
 
     /// Give the underlying byte stream back (e.g. to box it behind a `dyn` trait so
     /// one code path serves every transport). The connection stays open. A client
-    /// that was out of step hands back a stream that still is.
+    /// that was out of step hands back a stream that still is, and one that owed
+    /// itself acks ([`owed_acks`](Self::owed_acks)) hands back a stream they will
+    /// still arrive on, first, with nothing left to count them: read them before
+    /// giving the stream up.
     pub fn into_stream(self) -> S {
         self.stream
+    }
+
+    /// How many pipelined acks this connection owes itself: publishes (and retires)
+    /// written by [`send_publish`](Self::send_publish) and
+    /// [`send_retire`](Self::send_retire) whose acks [`recv_publish_ack`](Self::recv_publish_ack)
+    /// has not read yet. While it is above zero every request that reads its own reply
+    /// is refused with [`AcksOwed`] (see [`Client`]).
+    ///
+    /// A latched client owes NOTHING, so this is zero once any failure has put the
+    /// client out of step: a pipelined write that failed is not counted, and a read
+    /// that fails part-way through the acks (a close, a timeout, a reply that does not
+    /// decode or is not an ack) zeroes what was left, because nothing is read on the
+    /// connection again and no ack still on the way can be paid. What those publishes
+    /// did is then unknown; re-sending them under the same producer id dedups the ones
+    /// that landed. So a loop that reads acks while this is above zero ends, on the
+    /// failure, rather than spinning on `BrokenPipe`.
+    pub const fn owed_acks(&self) -> u64 {
+        self.owed
     }
 
     /// Ask the broker for this connection's NONCE — the value an [`attach`](Self::attach)
     /// proof is computed over. Answered by a guarded and an unguarded broker alike, so
     /// one client works against either. The log identity the answer carries is kept
     /// ([`seen_log_identity`](Self::seen_log_identity)).
+    ///
+    /// The broker answers a `Hello` after the connection's pending acks, so while
+    /// pipelined acks are owed ([`owed_acks`](Self::owed_acks)) it is refused with
+    /// [`AcksOwed`] and nothing is sent — and so are [`hello_identity`](Self::hello_identity),
+    /// [`log_identity`](Self::log_identity), the attaches, and every other request that
+    /// reads its own reply ([`Client`]).
     pub fn hello(&mut self) -> io::Result<[u8; 32]> {
         let (nonce, _) = self.hello_identity()?;
         Ok(nonce)
@@ -573,6 +639,24 @@ impl<S: Read + Write> Client<S> {
     /// predates the extension block.
     pub const fn served_durability(&self) -> Option<ServedInfo> {
         self.ext.durability
+    }
+
+    /// Whether the latest `Hello` answer announced support for the conditional
+    /// [`Request::Retire`] verb (`DESIGN-aterm-fabric` §5.2).
+    /// `false` before any `Hello`, or against an older broker that predates the verb.
+    pub const fn supports_retire(&self) -> bool {
+        self.ext.supports_retire()
+    }
+
+    /// The log's health as the latest `Hello` answer told it
+    /// ([`HelloHealth`](crate::HelloHealth)): whether it is POISONED — it refuses every
+    /// write until it is reopened — and why, and the flushes it has issued since it
+    /// opened. Read from the broker itself, so a status line never calls a broker whose
+    /// log takes no write `connected`. `None` before any `Hello`, or from a broker that
+    /// predates the entry. A fresh `Hello` ([`log_identity`](Self::log_identity)) asks
+    /// again.
+    pub const fn broker_health(&self) -> Option<&crate::proto::HelloHealth> {
+        self.ext.health.as_ref()
     }
 
     /// The broker's DURABLE head as the newest `Mark` this connection read told it —
@@ -739,6 +823,9 @@ impl<S: Read + Write> Client<S> {
     /// Publish `body` to `subject`, deduped by `(producer_id, producer_seq)`. Blocks
     /// for the ack; returns `(offset, deduped)` — `deduped` true means a re-send
     /// returning the original offset.
+    ///
+    /// Refused with [`AcksOwed`], sending nothing, while pipelined acks are owed
+    /// ([`owed_acks`](Self::owed_acks)): the ack it read would be theirs.
     pub fn publish(
         &mut self,
         producer_id: u64,
@@ -746,20 +833,27 @@ impl<S: Read + Write> Client<S> {
         subject: &str,
         body: &[u8],
     ) -> io::Result<(u64, bool)> {
+        self.owes_nothing()?;
         self.send_publish(producer_id, producer_seq, subject, body)?;
         self.recv_publish_ack()
     }
 
-    /// Durably retire `subject` from the broker's last-value index (`Last`) and
-    /// decrement `producer_id`'s distinct-subject count (`MAX_SUBJECTS_PER_PRODUCER`),
-    /// sending a [`crate::store::RETIRE_SUBJECT`] (`/a/retire`) request over the wire.
+    /// Durably retire an exact [`astream_wire::Subject`] from the broker's last-value
+    /// index (`Last`) and decrement its charged producer's distinct-subject count
+    /// (`MAX_SUBJECTS_PER_PRODUCER`), sending a [`crate::store::RETIRE_SUBJECT`]
+    /// (`/a/retire`) request over the wire (`DESIGN-aterm-fabric` §5.2).
     ///
     /// Returns `(offset, already_absent)`: `already_absent` is `false` when `subject`
     /// was in `Last` and a `/a/retire` record was appended at `offset`, or `true` when
-    /// `subject` was already absent (idempotent no-op). Refuses if `subject` is owned
-    /// in `Last` by a different producer or if the connection's capability keyring does
-    /// not grant read-write publish authority on `subject` for `producer_id`.
+    /// `subject` was already absent (idempotent no-op). Refuses on a replica or a
+    /// retention-cut log (`base > 0`), when `subject` is not an exact `Subject`
+    /// (including wildcards), when `subject` is charged in `Last` to a producer other
+    /// than `producer_id`, while a will that can still append targets `subject`, or if
+    /// the connection's capability keyring does not grant read-write publish authority
+    /// on `subject` for `producer_id`. Refused with [`AcksOwed`], sending nothing, while
+    /// pipelined acks are owed.
     pub fn retire_subject(&mut self, producer_id: u64, subject: &str) -> io::Result<(u64, bool)> {
+        self.owes_nothing()?;
         self.send_publish(
             producer_id,
             0,
@@ -769,12 +863,61 @@ impl<S: Read + Write> Client<S> {
         self.recv_publish_ack()
     }
 
+    /// Conditional subject retirement (`DESIGN-aterm-fabric` §5.2): remove `subject` from
+    /// the broker's last-value index (`Last`) and credit `producer_id`'s distinct-subject
+    /// budget by one if and only if `subject`'s current entry in `Last` is at `offset` on
+    /// `log`.
+    ///
+    /// Returns `(offset, deduped)`:
+    /// - `(r, false)` when `subject` was in `Last` at `offset` on `log` and a marked
+    ///   `/a/retire` record was appended at `r`.
+    /// - `(o_or_head, true)` when `subject` was already absent from `Last` (with
+    ///   `offset < head`) or its entry in `Last` was already superseded by a newer record
+    ///   at `o > offset` (moot: nothing appended).
+    /// - `Err` on refusal (`BrokerRefusal::is_retire_charged`, `is_retire_will`,
+    ///   `is_retire_log`, `is_retire_cut`, reserved `/a/...`, malformed subject, replica,
+    ///   or unauthorized), or [`AcksOwed`], sending nothing, while pipelined acks are
+    ///   owed.
+    pub fn retire(
+        &mut self,
+        producer_id: u64,
+        subject: &str,
+        offset: u64,
+        log: LogIdentity,
+    ) -> io::Result<(u64, bool)> {
+        self.owes_nothing()?;
+        self.send_retire(producer_id, subject, offset, log)?;
+        self.recv_publish_ack()
+    }
+
+    /// PIPELINED conditional retire (send side): write a [`Request::Retire`] without
+    /// waiting for its ack. Pair with [`recv_publish_ack`](Self::recv_publish_ack) in
+    /// request order; until then its ack is owed ([`owed_acks`](Self::owed_acks)).
+    pub fn send_retire(
+        &mut self,
+        producer_id: u64,
+        subject: &str,
+        offset: u64,
+        log: LogIdentity,
+    ) -> io::Result<()> {
+        self.in_step()?;
+        let mut out = Vec::new();
+        append_retire_frame(&mut out, producer_id, subject, offset, log)?;
+        self.write_owed(&out)
+    }
+
     /// PIPELINED publish (send side): write a publish WITHOUT waiting for its ack, so a
     /// single connection can keep many in flight (they coalesce into one group-commit
     /// fsync at the broker). Pair each `send_publish` with a later
     /// [`recv_publish_ack`](Self::recv_publish_ack) in the SAME order — the broker
     /// streams acks back in request order. Interleave sends and receives within a
     /// bounded window to avoid filling the socket buffers.
+    ///
+    /// Each one WRITTEN adds an owed ack ([`owed_acks`](Self::owed_acks)), and until
+    /// `recv_publish_ack` has read them all, every request that reads its own reply is
+    /// refused with [`AcksOwed`]. A publish refused before a byte is written (a frame
+    /// over the cap) owes nothing and leaves the client in step; a write that failed
+    /// latches it out of step.
     pub fn send_publish(
         &mut self,
         producer_id: u64,
@@ -785,16 +928,53 @@ impl<S: Read + Write> Client<S> {
         self.in_step()?;
         let mut out = Vec::new();
         append_publish_frame(&mut out, producer_id, producer_seq, subject, body)?;
-        if let Err(e) = self.stream.write_all(&out) {
+        self.write_owed(&out)
+    }
+
+    /// Write one pipelined request whose ack the caller reads later, and count that ack
+    /// as owed — only once the whole frame is written: a failed write latches the
+    /// client, and nothing it is owed is read again.
+    fn write_owed(&mut self, frame: &[u8]) -> io::Result<()> {
+        if let Err(e) = self.stream.write_all(frame) {
             return Err(self.lose(e));
         }
         self.sent_at = Instant::now();
+        self.owed = self.owed.saturating_add(1);
         Ok(())
     }
 
     /// PIPELINED publish (receive side): read the next ack in order, returning
-    /// `(offset, deduped)`. See [`send_publish`](Self::send_publish).
+    /// `(offset, deduped)`, and count it paid. See [`send_publish`](Self::send_publish).
+    ///
+    /// A refused publish is the broker's [`BrokerRefusal`] here, and it pays its ack
+    /// too: a refusal is a whole reply, so the client stays in step for the next one.
+    ///
+    /// # Errors
+    /// The owed publish's refusal; a transport failure (which latches the client); or,
+    /// when NO ack is owed ([`owed_acks`](Self::owed_acks) is zero), `InvalidInput`
+    /// before anything is read — there is no ack on the way for it to read, so a read
+    /// would park until the broker hung up, or take a reply that is nobody's.
     pub fn recv_publish_ack(&mut self) -> io::Result<(u64, bool)> {
+        self.in_step()?;
+        if self.owed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no pipelined ack is owed on this connection: recv_publish_ack reads the ack \
+                 of an earlier send_publish or send_retire",
+            ));
+        }
+        let resp = self.read_response()?;
+        self.owed = self.owed.saturating_sub(1);
+        match resp {
+            Response::PublishAck { offset, deduped } => Ok((offset, deduped)),
+            other => Err(self.reply_error(other)),
+        }
+    }
+
+    /// Read the `PublishAck` a blocking write request is answered with — a `Commit`'s or
+    /// a `ProcessAndProduce`'s, which the broker answers like a publish
+    /// (`broker.rs` `emit_op`). Its own reply, read at once: never an owed ack.
+    fn read_publish_ack(&mut self) -> io::Result<(u64, bool)> {
         match self.read_response()? {
             Response::PublishAck { offset, deduped } => Ok((offset, deduped)),
             other => Err(self.reply_error(other)),
@@ -820,6 +1000,11 @@ impl<S: Read + Write> Client<S> {
     /// publishes already in flight have been read, so the connection stays in step
     /// for the next call. Those publishes may have landed; re-sending the same bodies
     /// under the same `producer_id` dedups them.
+    ///
+    /// It reads every ack it is owed before it returns, so it owes the caller none
+    /// afterwards; and it is refused with [`AcksOwed`], sending nothing, while acks of
+    /// the caller's own [`send_publish`](Self::send_publish)es are owed, whose acks it
+    /// would read as its first ones.
     pub fn publish_pipelined(
         &mut self,
         producer_id: u64,
@@ -827,7 +1012,7 @@ impl<S: Read + Write> Client<S> {
         bodies: &[&[u8]],
         window: usize,
     ) -> io::Result<Vec<(u64, bool)>> {
-        self.in_step()?;
+        self.owes_nothing()?;
         let window = window.clamp(1, MAX_PIPELINE_WINDOW);
         let mut credit = CreditWindow::new(window as u64);
         let mut acks = Vec::new();
@@ -922,6 +1107,28 @@ impl<S: Read + Write> Client<S> {
     /// id does not suppress this will. For the same reason a `producer_seq` in the
     /// reserved half is REFUSED here — the fence could not protect a will that lives
     /// where it does not look.
+    ///
+    /// THE FENCE RESTS ON YOUR OBLIGATION, and the broker cannot check it: a will is a
+    /// hidden record no read returns, and which incarnation a sequence belongs to is
+    /// yours to count. Two things are owed.
+    /// - A new incarnation's sequences sit ABOVE every sequence of any incarnation you
+    ///   ever presented to a broker, whether you registered a will under it or
+    ///   published under it.
+    /// - The incarnation is FLUSHED to your stable storage before you register its
+    ///   will. After a power loss only your disk can say the incarnation was used,
+    ///   because a will that was registered before the first publish landed leaves
+    ///   nothing a read returns.
+    ///
+    /// Reuse an incarnation and nothing fences it. Its two wills share one key, so
+    /// whichever connection ends first fires its will and the other dedups away. When
+    /// that is the old, half-open connection, its goodbye lands over the new
+    /// incarnation's records while you are alive.
+    ///
+    /// [`will_seq`](crate::will_seq) is the layout that keeps the first half by
+    /// construction: `producer_seq = will_seq(inc)`, the incarnation's ordinary
+    /// publishes strictly between [`incarnation_base`](crate::incarnation_base)`(inc)`
+    /// and it, `inc` at most [`INC_MAX`](crate::INC_MAX). The second half, and the
+    /// counter that yields `inc`, stay yours.
     pub fn will(
         &mut self,
         producer_id: u64,
@@ -963,11 +1170,13 @@ impl<S: Read + Write> Client<S> {
     /// on it.
     ///
     /// PRECONDITION, as for [`fetch`](Self::fetch): no pipelined publish is un-acked on
-    /// this connection.
+    /// this connection. The client holds it: while acks are owed the keepalive is
+    /// refused with [`AcksOwed`] and nothing is sent.
     ///
     /// # Errors
     /// The socket; on a guarded broker, `ERR_UNAUTHORIZED` while no capability is
-    /// attached (a keepalive grants nothing, but its answer names the log's head).
+    /// attached (a keepalive grants nothing, but its answer names the log's head);
+    /// [`AcksOwed`].
     pub fn keepalive(&mut self) -> io::Result<bool> {
         self.send(&Request::Keepalive)?;
         match self.read_mark() {
@@ -992,7 +1201,9 @@ impl<S: Read + Write> Client<S> {
     /// broker's side, which counts only the time it spends waiting to read.
     ///
     /// # Errors
-    /// As [`keepalive`](Self::keepalive).
+    /// As [`keepalive`](Self::keepalive): a connection idle with acks still owed is
+    /// refused [`AcksOwed`] — its caller wrote publishes and has not read their acks,
+    /// and a keepalive would read one as its answer.
     pub fn keepalive_if_idle(&mut self, interval: Duration) -> io::Result<bool> {
         if self.keepalive_unknown || self.sent_at.elapsed() < interval {
             return Ok(false);
@@ -1014,12 +1225,13 @@ impl<S: Read + Write> Client<S> {
     /// request"), a whole reply, so this client is in step — and cannot say.
     ///
     /// PRECONDITION, as for [`fetch`](Self::fetch): no pipelined publish is un-acked on
-    /// this connection.
+    /// this connection. The client holds it: while acks are owed the request is
+    /// refused with [`AcksOwed`] and nothing is sent.
     ///
     /// # Errors
     /// The socket; on a guarded broker, `ERR_UNAUTHORIZED` unless the ring holds a
     /// genuine, unexpired read-write grant that publishes as `producer_id` (bound to
-    /// it, or unbound).
+    /// it, or unbound); [`AcksOwed`].
     pub fn subject_budget(&mut self, producer_id: u64) -> io::Result<Option<SubjectBudget>> {
         self.send(&Request::Budget { producer_id })?;
         match self.read_response()? {
@@ -1046,7 +1258,8 @@ impl<S: Read + Write> Client<S> {
     /// This request arms no deadline and appends no record. A guarded broker
     /// requires an attached capability because the acknowledgement names the head.
     ///
-    /// As for `fetch`, no pipelined publish may be awaiting its acknowledgement.
+    /// As for `fetch`, no pipelined publish may be awaiting its acknowledgement: while
+    /// one is, the request is refused with [`AcksOwed`] and nothing is sent.
     pub fn idle_marks(&mut self) -> io::Result<bool> {
         self.send(&Request::IdleMarks)?;
         match self.read_mark() {
@@ -1079,6 +1292,14 @@ impl<S: Read + Write> Client<S> {
     ///
     /// Non-terminal: the connection is fully usable afterwards (this is the one read
     /// verb that does NOT consume the client).
+    ///
+    /// PRECONDITION: no pipelined publish is un-acked on this connection. The broker
+    /// answers a connection's requests in order, so an owed ack
+    /// ([`owed_acks`](Self::owed_acks)) would arrive where the page should; the client
+    /// holds the precondition itself, refusing the request with [`AcksOwed`] and sending
+    /// nothing until [`recv_publish_ack`](Self::recv_publish_ack) has read them. The
+    /// same holds for [`last_page`](Self::last_page), [`last_walk`](Self::last_walk) and
+    /// [`last_all`](Self::last_all).
     pub fn last(&mut self, filter: &str, after: &str, max: u32) -> io::Result<Page> {
         let (page, mark, _) = self.last_page(filter, after, max)?;
         Ok((page, mark))
@@ -1267,6 +1488,13 @@ impl<S: Read + Write> Client<S> {
     ///
     /// Non-terminal: unlike `subscribe` it never tails and does not consume the
     /// client — the connection is fully usable afterwards.
+    ///
+    /// PRECONDITION: no pipelined publish is un-acked on this connection. The broker
+    /// flushes a connection's pending acks BEFORE the page, so an owed ack
+    /// ([`owed_acks`](Self::owed_acks)) would arrive where the page should. The client
+    /// holds the precondition itself: while an ack is owed the fetch is refused with
+    /// [`AcksOwed`] — never an empty page — and nothing is sent, until
+    /// [`recv_publish_ack`](Self::recv_publish_ack) has read them.
     pub fn fetch(&mut self, from: u64, filter: &str, max: u32) -> io::Result<Page> {
         self.send(&Request::Fetch {
             from_offset: from,
@@ -1286,7 +1514,8 @@ impl<S: Read + Write> Client<S> {
     ///
     /// PRECONDITION: no pipelined publish is un-acked on this connection. The broker
     /// flushes pending acks BEFORE the page (they arrive first, in order), so a caller
-    /// that owes itself acks must drain them first; the blocking `publish` never does.
+    /// that owes itself acks must drain them first; [`send`](Self::send) refuses the
+    /// request that would have read past them ([`AcksOwed`]).
     fn read_page_resumable(&mut self, max: u32) -> io::Result<(Vec<Record>, (u64, u64), String)> {
         let mut page = Vec::new();
         loop {
@@ -1322,6 +1551,20 @@ impl<S: Read + Write> Client<S> {
     /// [`idle_marks`](Self::idle_marks) first, falling back to an older broker's
     /// existing tail behavior. The acknowledgement is consumed before any
     /// subscription event, so only a tail's own mark arms `recv_live`.
+    ///
+    /// Refused with [`AcksOwed`], sending nothing, while pipelined acks are owed: the
+    /// broker flushes them ahead of the stream, where the subscription would read them
+    /// as a reply of the wrong kind. The same holds for
+    /// [`subscribe_group`](Self::subscribe_group) and
+    /// [`fork_subscribe`](Self::fork_subscribe).
+    ///
+    /// Unlike every other refused request, this one ENDS the connection: the client
+    /// was moved into the call, and the refusal drops it. The acks it owed go with it,
+    /// unread — whether those publishes landed can no longer be read on this
+    /// connection (re-sending them under the same producer id dedups the ones that
+    /// did) — and a will registered on it fires, as for any closed connection. So a
+    /// caller that pipelines reads its acks first, until
+    /// [`owed_acks`](Self::owed_acks) is zero, and subscribes after.
     pub fn subscribe(mut self, from_offset: u64, filter: &str) -> io::Result<Subscription<S>> {
         self.idle_marks()?;
         self.into_subscription(&Request::Subscribe {
@@ -1332,18 +1575,26 @@ impl<S: Read + Write> Client<S> {
 
     /// Durably advance consumer `group`'s committed offset to `upto` (a pure commit).
     /// Blocks for the ack; returns the commit record's offset.
+    ///
+    /// The broker answers a commit with a `PublishAck`, the same reply a publish gets,
+    /// so an owed pipelined ack would pass for the commit's own: the commit would
+    /// return the publish's offset, with no error, and the commit's ack would be left
+    /// for the next read. While acks are owed it is refused with [`AcksOwed`] and
+    /// nothing is sent.
     pub fn commit(&mut self, group: &str, upto: u64) -> io::Result<u64> {
         self.send(&Request::Commit {
             group: group.to_string(),
             upto,
         })?;
-        let (offset, _) = self.recv_publish_ack()?;
+        let (offset, _) = self.read_publish_ack()?;
         Ok(offset)
     }
 
     /// The read-process-write TRANSACTION: append `out_body` to `out_subject` AND
     /// commit `group` to `upto` atomically (one durable record), deduped by
-    /// `(producer_id, producer_seq)`. Returns `(offset, deduped)`.
+    /// `(producer_id, producer_seq)`. Returns `(offset, deduped)`. Refused with
+    /// [`AcksOwed`], sending nothing, while pipelined acks are owed (it is answered
+    /// with a `PublishAck`, as [`commit`](Self::commit) is).
     #[allow(clippy::too_many_arguments)]
     pub fn process_and_produce(
         &mut self,
@@ -1362,13 +1613,16 @@ impl<S: Read + Write> Client<S> {
             group: group.to_string(),
             upto,
         })?;
-        self.recv_publish_ack()
+        self.read_publish_ack()
     }
 
     /// Subscribe as consumer `group`: the broker resumes delivery from the group's
     /// DURABLE committed offset (no client-tracked cursor), then tails live.
     /// Negotiates [`idle_marks`](Self::idle_marks) as [`subscribe`](Self::subscribe)
     /// does; an older broker keeps its existing tail behavior.
+    ///
+    /// Refused with [`AcksOwed`] while pipelined acks are owed, and the refusal ends
+    /// the connection, the acks unread, as [`subscribe`](Self::subscribe)'s does.
     pub fn subscribe_group(mut self, group: &str, filter: &str) -> io::Result<Subscription<S>> {
         self.idle_marks()?;
         self.into_subscription(&Request::SubscribeGroup {
@@ -1381,6 +1635,9 @@ impl<S: Read + Write> Client<S> {
     /// forking the topic at `fork_at` and swapping that record for
     /// `(replacement_subject, replacement_body)`, filtered by `filter`. The live log
     /// is unchanged; the snapshot is delivered then the stream ends (`recv` → `None`).
+    ///
+    /// Refused with [`AcksOwed`] while pipelined acks are owed, and the refusal ends
+    /// the connection, the acks unread, as [`subscribe`](Self::subscribe)'s does.
     pub fn fork_subscribe(
         self,
         fork_at: u64,
@@ -1399,8 +1656,13 @@ impl<S: Read + Write> Client<S> {
     /// Write one request frame. A request that cannot be FRAMED (over the frame cap)
     /// is refused before a byte is written, so the client stays in step; a failed
     /// WRITE may have sent part of a frame, so it latches the client out of step.
+    ///
+    /// Every request this writes reads its OWN reply next (or hands the stream to a
+    /// subscription, which reads every frame after it), so each is refused with
+    /// [`AcksOwed`] while a pipelined ack is owed: the next frame is that ack's. The
+    /// pipelined pair writes through [`write_owed`](Self::write_owed) instead.
     fn send(&mut self, req: &Request) -> io::Result<()> {
-        self.in_step()?;
+        self.owes_nothing()?;
         let mut out = Vec::new();
         append_frame(&mut out, &encode_request(req))?;
         if let Err(e) = self.stream.write_all(&out) {
@@ -1459,11 +1721,36 @@ impl<S: Read + Write> Client<S> {
 
     /// Latch this client out of step with its replies because of `e`, and hand `e`
     /// back. The first cause is the one kept.
+    ///
+    /// A latched client owes nothing: nothing is read on it again, so no ack it was
+    /// owed can be paid, and the count ([`owed_acks`](Self::owed_acks)) goes to zero
+    /// with the latch. A caller that reads acks while the count is above zero stops
+    /// on the failure, rather than reading `BrokenPipe` for an ack that never comes.
     fn lose(&mut self, e: io::Error) -> io::Error {
         if self.lost.is_none() {
             self.lost = Some(e.to_string());
         }
+        self.owed = 0;
         e
+    }
+
+    /// `Ok` when the next frame on the stream is the reply to the NEXT request: the
+    /// client is in step ([`in_step`](Self::in_step), whose `BrokenPipe` comes first —
+    /// a latched client owes nothing it can read) and owes no pipelined ack; else the
+    /// [`AcksOwed`] that request is refused with. Asked before a byte of a request that
+    /// reads its own reply is written, so a refusal leaves the client exactly as it was
+    /// — unless the verb consumed the client ([`subscribe`](Self::subscribe) and its
+    /// two siblings), whose refusal drops it and so ends the connection.
+    fn owes_nothing(&self) -> io::Result<()> {
+        self.in_step()?;
+        #[cfg(test)]
+        if self.unguarded {
+            return Ok(());
+        }
+        match self.owed {
+            0 => Ok(()),
+            owed => Err(AcksOwed { owed }.into()),
+        }
     }
 
     /// `Ok` while the client is in step with its replies; once it is not, the
@@ -1563,6 +1850,71 @@ impl From<ProtocolMismatch> for io::Error {
 /// The protocol mismatch `e` carries, if it is one: `Some` exactly when a broker's reply
 /// said it speaks another astream protocol (see [`ProtocolMismatch`]).
 pub fn protocol_mismatch(e: &io::Error) -> Option<&ProtocolMismatch> {
+    e.get_ref()?.downcast_ref()
+}
+
+/// A request the CLIENT refused, before writing a byte of it, because the connection
+/// still owes itself `owed` pipelined acks ([`Client::owed_acks`]).
+///
+/// The broker answers a connection's requests in the order it read them, so after a
+/// [`Client::send_publish`] (or [`Client::send_retire`]) the next frame on the stream
+/// is that publish's ack, and a request that reads its own reply would take it for
+/// its own: a commit or a blocking publish would return the PUBLISH's offset with no
+/// error, a fetch or a `Last` would fail on a reply of the wrong kind, and a refused
+/// publish's `Error` would come back as the later request's refusal. Nothing on the
+/// wire can tell one ack from another, so the rule is the client's to keep, and this
+/// is it kept: read the owed acks with [`Client::recv_publish_ack`], then send.
+///
+/// The client is NOT out of step: nothing was written and nothing read, the owed acks
+/// are still owed and still in order, and the request goes through once they are
+/// read. There is no drain that reads them for the caller, because each ack carries
+/// its own answer — the offset, whether it was a dup, or the publish's refusal — and
+/// only the caller that sent the publish knows what to do with it.
+///
+/// Except for the three verbs that CONSUME the client: [`Client::subscribe`],
+/// [`Client::subscribe_group`] and [`Client::fork_subscribe`] are refused the same way,
+/// with nothing sent, but the client was moved into the call and the refusal drops
+/// it. The connection closes with the owed acks unread (what those publishes did can
+/// no longer be read on it), and a will registered on it fires. A caller that
+/// pipelines reads [`Client::owed_acks`] down to zero before it subscribes.
+///
+/// It reaches the caller inside an `io::Error` of kind `ResourceBusy`, a kind no other
+/// request/reply failure of this client uses (a refusal is `Other`, an out-of-step
+/// client `BrokenPipe`). Read it back with [`acks_owed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcksOwed {
+    /// The acks owed when the request was refused.
+    pub owed: u64,
+}
+
+impl std::fmt::Display for AcksOwed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} pipelined publish ack{} still owed on this connection: read {} with \
+             recv_publish_ack before a request that reads its own reply (nothing was \
+             sent; a subscribe refused this way consumed its client and closed the \
+             connection with {} unread)",
+            self.owed,
+            if self.owed == 1 { " is" } else { "s are" },
+            if self.owed == 1 { "it" } else { "them" },
+            if self.owed == 1 { "it" } else { "them" },
+        )
+    }
+}
+
+impl std::error::Error for AcksOwed {}
+
+impl From<AcksOwed> for io::Error {
+    /// `ErrorKind::ResourceBusy`, the count inside.
+    fn from(a: AcksOwed) -> io::Error {
+        io::Error::new(io::ErrorKind::ResourceBusy, a)
+    }
+}
+
+/// The owed-ack refusal `e` carries, if it is one: `Some` exactly when the client
+/// refused a request because pipelined acks were still owed (see [`AcksOwed`]).
+pub fn acks_owed(e: &io::Error) -> Option<&AcksOwed> {
     e.get_ref()?.downcast_ref()
 }
 
@@ -1678,6 +2030,40 @@ impl BrokerRefusal {
     pub fn is_poisoned(&self) -> bool {
         self.code == ERR_REFUSED && self.msg.starts_with(LOG_POISONED_PREFIX)
     }
+
+    /// Whether the refusal is a conditional or state-guarded `Retire` refusal
+    /// ([`ERR_RETIRE_REFUSED`]): charged to another producer, targeted by a live or
+    /// durable will that can still append, or (for the §5.2 `Retire` verb) a mismatched
+    /// `LogIdentity`.
+    pub const fn is_retire_refused(&self) -> bool {
+        self.code == ERR_RETIRE_REFUSED
+    }
+
+    /// Whether `Retire` was refused because the subject is charged to a different
+    /// producer (`ERR_RETIRE_REFUSED` starting with [`RETIRE_CHARGED_PREFIX`]).
+    pub fn is_retire_charged(&self) -> bool {
+        self.code == ERR_RETIRE_REFUSED && self.msg.starts_with(RETIRE_CHARGED_PREFIX)
+    }
+
+    /// Whether `Retire` was refused because a live or durable will that can still
+    /// append targets the subject (`ERR_RETIRE_REFUSED` starting with
+    /// [`RETIRE_WILL_PREFIX`]).
+    pub fn is_retire_will(&self) -> bool {
+        self.code == ERR_RETIRE_REFUSED && self.msg.starts_with(RETIRE_WILL_PREFIX)
+    }
+
+    /// Whether `Retire` was refused because the request's `LogIdentity` did not match
+    /// the broker's current log identity (`ERR_RETIRE_REFUSED` starting with
+    /// [`RETIRE_LOG_PREFIX`]).
+    pub fn is_retire_log(&self) -> bool {
+        self.code == ERR_RETIRE_REFUSED && self.msg.starts_with(RETIRE_LOG_PREFIX)
+    }
+
+    /// Whether `Retire` was refused because retention has cut the log (`base > 0`,
+    /// `ERR_RECORD_REFUSED` starting with [`RETIRE_CUT_PREFIX`]).
+    pub fn is_retire_cut(&self) -> bool {
+        self.code == ERR_RECORD_REFUSED && self.msg.starts_with(RETIRE_CUT_PREFIX)
+    }
 }
 
 impl std::fmt::Display for BrokerRefusal {
@@ -1783,6 +2169,13 @@ pub fn take<S: Read + Write>(sub: &mut Subscription<S>, max: usize) -> io::Resul
 /// `drain` returns: a caller that must PROCESS before committing (at-least-once into
 /// an idempotent sink) calls [`take`] and commits itself.
 ///
+/// The committer is asked BEFORE the take: one that owes itself pipelined acks
+/// ([`Client::owed_acks`]) refuses the drain with [`AcksOwed`], and one out of step
+/// refuses it with `BrokenPipe`, with nothing taken from `sub`. Its commit would be
+/// refused the same way after the take, and the records taken would then be in
+/// nobody's hands: a retry on the same `sub` — read the acks, drain again — would take
+/// the records after them and commit the group past both.
+///
 /// A broker reaps a connection that sends no request within its first-frame timeout
 /// ([`FIRST_FRAME_TIMEOUT`](crate::broker::FIRST_FRAME_TIMEOUT) by default), so a
 /// FRESH `committer` whose first request is this commit fails if the take runs
@@ -1797,6 +2190,7 @@ pub fn drain<S: Read + Write, C: Read + Write>(
     group: &str,
     max: usize,
 ) -> io::Result<Vec<Record>> {
+    committer.owes_nothing()?;
     let records = take(sub, max)?;
     if let Some((last, _, _)) = records.last() {
         committer.commit(group, *last)?;
@@ -2205,13 +2599,18 @@ impl<S: Read + Write> Subscription<S> {
     /// [`recv_event`](Self::recv_event)), but a caller that set this deadline means
     /// "the link is gone": drop the subscription and resubscribe.
     ///
+    /// A broker that sent a `Mark` and hung up before the re-arm leaves nothing to arm
+    /// ([`Closer::set_read_timeout`]): the call goes on to read what the broker sent,
+    /// then its close (`Ok(None)`).
+    ///
     /// # Errors
-    /// As `recv`; the timeout above; the `setsockopt` that arms it.
+    /// As `recv`; the timeout above; the `setsockopt` that arms it, but for a socket the
+    /// broker already hung up.
     pub fn recv_live(&mut self, closer: &Closer, deadline: Duration) -> io::Result<Option<Record>> {
         loop {
-            match self.recv_event()? {
+            match self.recv_live_event(closer, deadline)? {
                 None => return Ok(None),
-                Some(Event::Mark { .. }) => closer.set_read_timeout(Some(deadline))?,
+                Some(Event::Mark { .. }) => {}
                 Some(Event::Delivery {
                     offset,
                     subject,
@@ -2219,6 +2618,28 @@ impl<S: Read + Write> Subscription<S> {
                 }) => return Ok(Some((offset, subject, body))),
             }
         }
+    }
+
+    /// [`recv_live`](Self::recv_live)'s rule, event by event: the next event, a delivery
+    /// OR a `Mark`, where every `Mark` arms (re-arms) the read `deadline` through
+    /// `closer` before it is returned. For a reader that needs what a mark says as well
+    /// as the liveness bound — the DURABLE head a durable mark carries (a notifier that
+    /// pages only what is on stable media), or its `next` (a view that is exact up to
+    /// it) — so it keeps astream's liveness rule instead of re-implementing it over
+    /// [`recv_event`](Self::recv_event). `recv_live` is this with the marks skipped.
+    ///
+    /// # Errors
+    /// As [`recv_live`](Self::recv_live).
+    pub fn recv_live_event(
+        &mut self,
+        closer: &Closer,
+        deadline: Duration,
+    ) -> io::Result<Option<Event>> {
+        let event = self.recv_event()?;
+        if matches!(event, Some(Event::Mark { .. })) {
+            closer.set_read_timeout(Some(deadline))?;
+        }
+        Ok(event)
     }
 }
 
@@ -2232,15 +2653,22 @@ impl Subscription<UnixStream> {
     /// is not a desync: the partial frame stays on the subscription and the next
     /// `recv` finishes it (see [`recv_event`](Self::recv_event)), so the same `sub`
     /// is safe to drain from again.
+    ///
+    /// On a socket the broker already hung up there is nothing to bound, and that is
+    /// no error (see [`Closer::set_read_timeout`]).
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        self.stream.set_read_timeout(d)
+        unless_hung_up(self.stream.set_read_timeout(d), || {
+            socket_hung_up(&self.stream)
+        })
     }
 }
 
 impl Subscription<TcpStream> {
     /// The TCP twin of [`Subscription::set_read_timeout`].
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        self.stream.set_read_timeout(d)
+        unless_hung_up(self.stream.set_read_timeout(d), || {
+            socket_hung_up(&self.stream)
+        })
     }
 
     /// The TCP twin of [`Subscription::closer`]: a [`Closer`] on a duplicate of this
@@ -2263,7 +2691,9 @@ impl Subscription<astream_aead::SealedStream<TcpStream>> {
     /// counter (`astream_aead`'s `read_record`), and [`recv_event`](Self::recv_event)
     /// keeps the partial frame.
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        self.stream.get_ref().set_read_timeout(d)
+        unless_hung_up(self.stream.get_ref().set_read_timeout(d), || {
+            socket_hung_up(self.stream.get_ref())
+        })
     }
 
     /// The SEALED twin of [`Subscription::closer`]. The duplicate is of the TCP
@@ -2283,7 +2713,9 @@ impl Subscription<astream_aead::SealedStream<TcpStream>> {
 pub trait AnyStream: Read + Write + Send {}
 impl<T: Read + Write + Send> AnyStream for T {}
 
-/// A [`Client`] whose transport has been erased — what [`connect`] returns.
+/// A [`Client`] whose transport has been erased — what [`connect`] returns. It IS a
+/// `Client`, so it keeps the same in-step rules: the latch, and the owed-ack count
+/// ([`Client::owed_acks`], [`AcksOwed`]).
 pub type AnyClient = Client<Box<dyn AnyStream>>;
 
 /// A [`Subscription`] whose transport has been erased — what an [`AnyClient`]'s
@@ -2408,14 +2840,30 @@ impl Closer {
     /// without being sent (see [`Client`]). Reconnect. That is what turns a broker that
     /// accepts and never answers from a caller parked forever into an error.
     ///
+    /// A connection the broker ALREADY hung up — it answered and closed, refused a
+    /// subscription, or marked a tail and went away — has nothing left to bound, and
+    /// setting the bound there is no error when Apple positively observes both socket
+    /// directions ended: its reads return buffered bytes, then end of stream. macOS
+    /// can refuse socket options in that state with `EINVAL`; the errno alone does
+    /// not establish hangup. If a zero-wait socket poll cannot establish both ends,
+    /// the original refusal is returned.
+    ///
     /// # Errors
-    /// The `setsockopt`; a zero duration is `InvalidInput` (std's own refusal).
+    /// The `setsockopt`, but for that refusal; a zero duration is `InvalidInput` (std's
+    /// own refusal, which carries no OS error).
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        match &self.socket {
-            #[cfg(unix)]
-            Socket::Unix(s) => s.set_read_timeout(d),
-            Socket::Tcp(s) => s.set_read_timeout(d),
-        }
+        unless_hung_up(
+            match &self.socket {
+                #[cfg(unix)]
+                Socket::Unix(s) => s.set_read_timeout(d),
+                Socket::Tcp(s) => s.set_read_timeout(d),
+            },
+            || match &self.socket {
+                #[cfg(unix)]
+                Socket::Unix(s) => socket_hung_up(s),
+                Socket::Tcp(s) => socket_hung_up(s),
+            },
+        )
     }
 
     /// Bound how long a write on this connection parks on a full send buffer (a broker
@@ -2423,16 +2871,58 @@ impl Closer {
     /// that times out may have sent PART of a frame, so the connection is no longer
     /// framed: a client refuses every later request on it (`BrokenPipe`); reconnect.
     ///
+    /// On a connection the broker already hung up there is nothing to bound, and that
+    /// is no error when both ends are positively observed closed (see
+    /// [`set_read_timeout`](Self::set_read_timeout)): a write there fails instead of
+    /// waiting for buffer space.
+    ///
     /// # Errors
-    /// The `setsockopt`; a zero duration is `InvalidInput` (std's own refusal).
+    /// The `setsockopt`, but for that refusal; a zero duration is `InvalidInput` (std's
+    /// own refusal, which carries no OS error).
     pub fn set_write_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        match &self.socket {
-            #[cfg(unix)]
-            Socket::Unix(s) => s.set_write_timeout(d),
-            Socket::Tcp(s) => s.set_write_timeout(d),
-        }
+        unless_hung_up(
+            match &self.socket {
+                #[cfg(unix)]
+                Socket::Unix(s) => s.set_write_timeout(d),
+                Socket::Tcp(s) => s.set_write_timeout(d),
+            },
+            || match &self.socket {
+                #[cfg(unix)]
+                Socket::Unix(s) => socket_hung_up(s),
+                Socket::Tcp(s) => socket_hung_up(s),
+            },
+        )
     }
 }
+
+/// Preserve a timeout refusal unless Apple positively observes that BOTH socket
+/// directions have ended. `EINVAL` alone is not evidence: a socket filter can refuse
+/// a valid timeout before the option is applied, including on a live connection
+/// whose previous timeout was `None`. An uncertain/failed poll keeps that error.
+/// The probe is lazy: success, zero-duration validation, and other errors never poll.
+fn unless_hung_up(set: io::Result<()>, hung_up: impl FnOnce() -> bool) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    if matches!(&set, Err(e) if e.raw_os_error() == Some(XNU_EINVAL)) && hung_up() {
+        return Ok(());
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = hung_up;
+    set
+}
+
+#[cfg(target_vendor = "apple")]
+fn socket_hung_up(socket: &impl std::os::fd::AsFd) -> bool {
+    astream_sys::socket_hung_up(socket.as_fd())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn socket_hung_up<S>(_socket: &S) -> bool {
+    false
+}
+
+/// `EINVAL` in XNU's `<sys/errno.h>` (this crate takes no `libc`).
+#[cfg(target_vendor = "apple")]
+const XNU_EINVAL: i32 = 22;
 
 /// Open ONE connection to `endpoint` over `transport` — a socket path for
 /// [`Transport::Unix`], `host:port` for the rest — and return it with its transport
@@ -2660,6 +3150,53 @@ mod tests {
     /// a frame cut short (`UnexpectedEof`).
     #[test]
     fn a_close_mid_frame_is_classified_like_read_frame() {
+        // A captured timeout refusal is still an error on a live or half-closed
+        // socket. Only the actual both-directions hangup may suppress Apple EINVAL.
+        #[cfg(target_vendor = "apple")]
+        {
+            use super::{socket_hung_up, unless_hung_up, XNU_EINVAL};
+            use std::net::Shutdown;
+            use std::os::unix::net::UnixStream;
+
+            let (ours, peer) = UnixStream::pair().unwrap();
+            let refused = || Err(io::Error::from_raw_os_error(XNU_EINVAL));
+            assert!(!socket_hung_up(&ours));
+            assert_eq!(
+                unless_hung_up(refused(), || socket_hung_up(&ours))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(XNU_EINVAL)
+            );
+            peer.shutdown(Shutdown::Write).unwrap();
+            assert!(!socket_hung_up(&ours), "read EOF is not write shutdown");
+            assert_eq!(
+                unless_hung_up(refused(), || socket_hung_up(&ours))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(XNU_EINVAL)
+            );
+            drop(peer);
+            assert!(socket_hung_up(&ours));
+            unless_hung_up(refused(), || socket_hung_up(&ours)).unwrap();
+            unless_hung_up(Ok(()), || panic!("success does not poll")).unwrap();
+            for error in [
+                io::Error::new(io::ErrorKind::InvalidInput, "zero timeout"),
+                io::Error::from_raw_os_error(5),
+            ] {
+                let kind = error.kind();
+                let errno = error.raw_os_error();
+                let got = unless_hung_up(Err(error), || panic!("another error does not poll"))
+                    .unwrap_err();
+                assert_eq!((got.kind(), got.raw_os_error()), (kind, errno));
+            }
+            assert_eq!(
+                unless_hung_up(refused(), || false)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(XNU_EINVAL),
+                "negative or uncertain evidence preserves the original error"
+            );
+        }
         let bytes = framed(&[b"payload".to_vec()]);
         for cut in 0..bytes.len() {
             let mut s = Scripted::new(bytes[..cut].to_vec(), vec![Some(usize::MAX)]);
@@ -2829,5 +3366,515 @@ mod tests {
         assert_eq!(cw.next_send(), 5);
         assert_eq!(cw.record_ack(99), 5);
         assert_eq!(cw.in_flight(), 0);
+    }
+}
+
+/// THE OWED-ACK GUARD. A pipelined publish leaves its ack on the stream, and the broker
+/// answers a connection's requests in order, so until that ack is read every request
+/// that reads its own reply would read it instead. The client counts what it owes and
+/// refuses such a request with [`AcksOwed`], writing nothing and reading nothing.
+///
+/// Two halves. Against a REAL broker: a commit sent behind an owed publish is refused
+/// and appends nothing, and goes through once the ack is read — and, the NEGATIVE
+/// CONTROL, with the guard switched off (`unguarded`, which only these tests set) the
+/// same commit returns the publish's offset as its own, and a commit behind a REFUSED
+/// publish returns that publish's refusal as its own. Against a scripted stream that
+/// records every byte written: every verb that reads its own reply is refused with the
+/// count while acks are owed, with not one byte written and not one read, and the
+/// count follows what was written and read — a frame refused before it is written owes
+/// nothing, a write that failed owes nothing (it latched the client), a read that
+/// failed zeroes what was left (it latched the client too), a refused publish's
+/// `Error` pays its ack, a pipelined retire owes its ack as a publish does, and a
+/// `recv_publish_ack` with nothing owed reads nothing. And [`drain`](super::drain),
+/// against a real broker, asks its committer before it takes, so a drain refused for
+/// an owed ack leaves its records on the subscription.
+#[cfg(test)]
+mod owed_acks {
+    use super::{acks_owed, broker_refusal, AcksOwed, Client, Walk};
+    use crate::logid::LogIdentity;
+    use crate::proto::{decode_request, encode_response, read_frame, Request, Response};
+    use astream_wire::{Frame, MAX_PAYLOAD_LEN};
+    use std::io::{self, Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// The refusal a request behind `owed` unread acks must get: typed, of its own
+    /// kind, and not a broker refusal.
+    fn assert_refused_owing(what: &str, e: &io::Error, owed: u64) {
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy, "{what}: {e}");
+        assert_eq!(acks_owed(e), Some(&AcksOwed { owed }), "{what}: {e:?}");
+        assert!(broker_refusal(e).is_none(), "{what}: not the broker's");
+    }
+
+    /// A served broker, and the scratch directory its log and socket (`sock`) live in.
+    #[cfg(unix)]
+    type Served = (
+        crate::test_scratch::Scratch,
+        crate::Broker,
+        crate::BrokerHandle,
+    );
+
+    /// A real broker over a Unix socket in its own scratch directory.
+    #[cfg(unix)]
+    fn broker(tag: &str) -> Served {
+        let root = crate::test_scratch::Scratch::new(tag);
+        let b = crate::Broker::open(root.path().join("log")).unwrap();
+        let h = b.serve(root.path().join("sock")).unwrap();
+        (root, b, h)
+    }
+
+    /// `send_publish`, then `commit`: the commit is refused, typed, and the next frame
+    /// is still the publish's ack. Read it, and the same commit goes through and
+    /// returns its OWN record's offset, the one after the publish; a head query on the
+    /// same connection — answered only after every request written before it — then
+    /// counts exactly the publish and one commit, so the refused commit was never sent.
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_behind_an_owed_ack_is_refused_and_sends_nothing() {
+        let (root, _b, _h) = broker("owed-commit");
+        let mut c = Client::connect(root.path().join("sock")).unwrap();
+        c.send_publish(1, 1, "/o/a", b"owed").unwrap();
+        assert_eq!(c.owed_acks(), 1);
+
+        let e = c.commit("g", 1).unwrap_err();
+        assert_refused_owing("commit", &e, 1);
+        assert_eq!(c.owed_acks(), 1, "a refusal pays nothing");
+
+        assert_eq!(
+            c.recv_publish_ack().unwrap(),
+            (0, false),
+            "the publish's ack"
+        );
+        assert_eq!(c.owed_acks(), 0);
+        assert_eq!(c.commit("g", 1).unwrap(), 1, "the commit's own record");
+        let (rows, (next, head)) = c.fetch(0, "/o/>", 0).unwrap();
+        assert_eq!(
+            (rows.len(), next, head),
+            (0, 0, 2),
+            "one publish and one commit: the refused commit appended nothing"
+        );
+    }
+
+    /// The same behind a publish the broker REFUSES: the commit is refused for the
+    /// owed ack, the publish's refusal comes back where it belongs — from
+    /// `recv_publish_ack`, paying the ack — and the commit then goes through.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_owed_publish_is_answered_to_its_own_ack() {
+        let (root, _b, _h) = broker("owed-refused");
+        let mut c = Client::connect(root.path().join("sock")).unwrap();
+        c.send_publish(1, 1, "no-slash", b"refused").unwrap();
+        assert_refused_owing("commit", &c.commit("g", 0).unwrap_err(), 1);
+        let e = c.recv_publish_ack().unwrap_err();
+        let r = broker_refusal(&e).expect("the publish's own refusal");
+        assert!(r.msg.contains("bad subject"), "{r}");
+        assert_eq!(
+            c.owed_acks(),
+            0,
+            "a refusal is a whole reply: it pays its ack"
+        );
+        assert_eq!(c.commit("g", 0).unwrap(), 0, "the commit's own record");
+    }
+
+    /// NEGATIVE CONTROL: the guard switched off, as every client was before it. The
+    /// commit sent behind the owed publish reads the publish's ack and returns ITS
+    /// offset, with no error; the commit's own ack is left for the next read. Behind a
+    /// refused publish, the commit returns the publish's refusal as its own.
+    #[cfg(unix)]
+    #[test]
+    fn without_the_guard_a_commit_takes_the_owed_publishs_answer() {
+        let (root, _b, _h) = broker("owed-unguarded");
+        let mut c = Client::connect(root.path().join("sock")).unwrap();
+        c.unguarded = true;
+        c.send_publish(1, 1, "/o/a", b"owed").unwrap();
+        assert_eq!(
+            c.commit("g", 1).unwrap(),
+            0,
+            "the PUBLISH's offset, taken for the commit's"
+        );
+        assert_eq!(
+            c.recv_publish_ack().unwrap(),
+            (1, false),
+            "the commit's own ack, read as the publish's"
+        );
+
+        c.send_publish(1, 2, "no-slash", b"refused").unwrap();
+        let e = c.commit("g", 2).unwrap_err();
+        let r = broker_refusal(&e).expect("a refusal, but the publish's");
+        assert!(r.msg.contains("bad subject"), "{r}");
+    }
+
+    /// One end of an in-memory connection: reads play `replies` (bytes the test queued),
+    /// then EOF; every byte written lands in `written`, which the test keeps a handle
+    /// on because a subscribing verb consumes the client. `fail_writes` fails every
+    /// write, having written nothing.
+    struct Recorder {
+        replies: Vec<u8>,
+        written: Arc<Mutex<Vec<u8>>>,
+        fail_writes: bool,
+    }
+
+    impl Read for Recorder {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.replies.len());
+            buf[..n].copy_from_slice(&self.replies[..n]);
+            self.replies.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_writes {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "scripted"));
+            }
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn frame(r: &Response) -> Vec<u8> {
+        Frame::new(encode_response(r)).encode().unwrap()
+    }
+
+    fn ack(offset: u64) -> Vec<u8> {
+        frame(&Response::PublishAck {
+            offset,
+            deduped: false,
+        })
+    }
+
+    /// Every request a [`Recorder`] was sent, decoded.
+    fn requests(written: &Mutex<Vec<u8>>) -> Vec<Request> {
+        let bytes = written.lock().unwrap().clone();
+        let mut at = &bytes[..];
+        let mut out = Vec::new();
+        while let Some(p) = read_frame(&mut at).unwrap() {
+            out.push(decode_request(&p).expect("a request this client wrote"));
+        }
+        out
+    }
+
+    /// A client on a [`Recorder`] that has pipelined two publishes and reads nothing
+    /// yet: what is queued for it is their two acks, then `then`.
+    fn owing_two(then: &[u8]) -> (Client<Recorder>, Arc<Mutex<Vec<u8>>>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut replies = [ack(0), ack(1)].concat();
+        replies.extend_from_slice(then);
+        let mut c = Client::from_stream(Recorder {
+            replies,
+            written: Arc::clone(&written),
+            fail_writes: false,
+        });
+        c.send_publish(1, 1, "/o/a", b"one").unwrap();
+        c.send_publish(1, 2, "/o/a", b"two").unwrap();
+        assert_eq!(c.owed_acks(), 2);
+        (c, written)
+    }
+
+    /// EVERY request that reads its own reply is refused with the count while two acks
+    /// are owed, writing nothing and reading nothing: afterwards the stream holds just
+    /// the two publishes, and the two acks queued for them are read by the two
+    /// `recv_publish_ack`s, in order. The client was never latched: a commit then goes
+    /// through, answered by the reply queued after the acks.
+    #[test]
+    fn every_request_that_reads_its_own_reply_is_refused_while_acks_are_owed() {
+        let log = LogIdentity {
+            id: [7; 16],
+            generation: 0,
+        };
+        type Verb = Box<dyn Fn(&mut Client<Recorder>) -> io::Result<()>>;
+        let mut verbs: Vec<(&str, Verb)> = vec![
+            ("hello", Box::new(|c| c.hello().map(drop))),
+            ("hello_identity", Box::new(|c| c.hello_identity().map(drop))),
+            ("log_identity", Box::new(|c| c.log_identity().map(drop))),
+            (
+                "attach_with_proof",
+                Box::new(|c| c.attach_with_proof("ro:/o/>", &[0; 32]).map(drop)),
+            ),
+            (
+                "publish",
+                Box::new(|c| c.publish(1, 3, "/o/a", b"x").map(drop)),
+            ),
+            (
+                "publish_pipelined",
+                Box::new(|c| c.publish_pipelined(1, "/o/a", &[b"x"], 4).map(drop)),
+            ),
+            (
+                "retire_subject",
+                Box::new(|c| c.retire_subject(1, "/o/a").map(drop)),
+            ),
+            (
+                "retire",
+                Box::new(move |c| c.retire(1, "/o/a", 0, log).map(drop)),
+            ),
+            ("commit", Box::new(|c| c.commit("g", 0).map(drop))),
+            (
+                "process_and_produce",
+                Box::new(|c| c.process_and_produce(1, 3, "/o/b", b"x", "g", 0).map(drop)),
+            ),
+            (
+                "ack",
+                Box::new(|c| super::ack(c, 1, "g", 0, "/o/b", b"x").map(drop)),
+            ),
+            ("will", Box::new(|c| c.will(1, 3, "/o/w", b"x").map(drop))),
+            ("keepalive", Box::new(|c| c.keepalive().map(drop))),
+            (
+                "keepalive_if_idle",
+                Box::new(|c| c.keepalive_if_idle(Duration::ZERO).map(drop)),
+            ),
+            ("idle_marks", Box::new(|c| c.idle_marks().map(drop))),
+            (
+                "subject_budget",
+                Box::new(|c| c.subject_budget(1).map(drop)),
+            ),
+            ("fetch", Box::new(|c| c.fetch(0, "/o/>", 8).map(drop))),
+            ("fetch head", Box::new(|c| c.fetch(0, "/o/>", 0).map(drop))),
+            ("last", Box::new(|c| c.last("/o/>", "", 8).map(drop))),
+            (
+                "last_page",
+                Box::new(|c| c.last_page("/o/>", "", 8).map(drop)),
+            ),
+            (
+                "last_walk",
+                Box::new(|c| c.last_walk("/o/>", "", 8, |_| Ok(Walk::Continue)).map(drop)),
+            ),
+            ("last_all", Box::new(|c| c.last_all("/o/>").map(drop))),
+        ];
+        #[cfg(feature = "cap")]
+        {
+            verbs.push((
+                "attach",
+                Box::new(|c| c.attach("ro:/o/>", &[0; 32]).map(drop)),
+            ));
+            verbs.push((
+                "attach_all",
+                Box::new(|c| c.attach_all([("ro:/o/>", &[0u8; 32][..])]).map(drop)),
+            ));
+        }
+        let (mut c, written) = owing_two(&ack(2));
+        let sent = written.lock().unwrap().len();
+        for (what, verb) in &verbs {
+            let e = verb(&mut c).expect_err(what);
+            assert_refused_owing(what, &e, 2);
+            assert_eq!(
+                written.lock().unwrap().len(),
+                sent,
+                "{what}: nothing written"
+            );
+            assert_eq!(c.owed_acks(), 2, "{what}: nothing paid");
+        }
+        verbs.clear();
+
+        assert_eq!(c.recv_publish_ack().unwrap(), (0, false));
+        assert_eq!(c.recv_publish_ack().unwrap(), (1, false));
+        assert_eq!(c.owed_acks(), 0);
+        assert_eq!(c.commit("g", 2).unwrap(), 2, "in step: its own reply");
+        let reqs = requests(&written);
+        assert_eq!(reqs.len(), 3, "two publishes and the commit: {reqs:?}");
+        assert!(matches!(reqs[2], Request::Commit { .. }), "{reqs:?}");
+    }
+
+    /// The verbs that CONSUME the client: each is refused the same way, and the stream
+    /// it would have taken over carries nothing but the two publishes. The refusal
+    /// drops the client, so the stream is gone with it — closed, the two acks unread:
+    /// the test's handle on what was written is the last one left.
+    #[test]
+    fn a_subscription_is_refused_while_acks_are_owed() {
+        type Subscribe = fn(Client<Recorder>) -> io::Result<super::Subscription<Recorder>>;
+        let verbs: [(&str, Subscribe); 3] = [
+            ("subscribe", |c| c.subscribe(0, "/o/>")),
+            ("subscribe_group", |c| c.subscribe_group("g", "/o/>")),
+            ("fork_subscribe", |c| {
+                c.fork_subscribe(0, "/o/a", b"x", "/o/>")
+            }),
+        ];
+        for (what, verb) in verbs {
+            let (c, written) = owing_two(&[]);
+            let Err(e) = verb(c) else {
+                panic!("{what}: subscribed past two owed acks");
+            };
+            assert_refused_owing(what, &e, 2);
+            assert_eq!(requests(&written).len(), 2, "{what}: the publishes alone");
+            assert_eq!(
+                Arc::strong_count(&written),
+                1,
+                "{what}: the refusal dropped the client and its stream"
+            );
+        }
+    }
+
+    /// The count follows what was WRITTEN and READ. A publish too large to frame is
+    /// refused before a byte is written and owes nothing, and the client stays in step.
+    /// A `recv_publish_ack` with nothing owed is `InvalidInput` and reads nothing: the
+    /// reply queued behind it is still there for the request it belongs to. A publish
+    /// whose write fails owes nothing — it latched the client, so the next request and
+    /// the next `recv_publish_ack` alike are `BrokenPipe`, never `AcksOwed`.
+    #[test]
+    fn the_count_follows_what_was_written_and_read() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut c = Client::from_stream(Recorder {
+            replies: ack(5),
+            written: Arc::clone(&written),
+            fail_writes: false,
+        });
+        let huge = vec![0u8; MAX_PAYLOAD_LEN + 1];
+        let e = c.send_publish(1, 1, "/o/a", &huge).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        assert_eq!(c.owed_acks(), 0, "an unframeable publish owes nothing");
+        assert!(written.lock().unwrap().is_empty());
+
+        let e = c.recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        assert!(acks_owed(&e).is_none());
+        assert_eq!(
+            c.commit("g", 5).unwrap(),
+            5,
+            "the queued reply was not read"
+        );
+
+        let mut c = Client::from_stream(Recorder {
+            replies: ack(0),
+            written: Arc::new(Mutex::new(Vec::new())),
+            fail_writes: true,
+        });
+        let e = c.send_publish(1, 1, "/o/a", b"lost").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert_eq!(c.owed_acks(), 0, "a failed write owes nothing");
+        for e in [
+            c.commit("g", 0).unwrap_err(),
+            c.recv_publish_ack().unwrap_err(),
+        ] {
+            assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
+            assert!(acks_owed(&e).is_none());
+        }
+    }
+
+    /// A LATCHED client owes nothing: once a read fails part-way through the acks it
+    /// was owed (here the broker closes after the first of two), nothing is read on it
+    /// again, so nothing it was owed can be paid, and the count is zero. A caller that
+    /// reads acks while `owed_acks()` is above zero therefore stops, where a count
+    /// that stayed at one would spin on a `BrokenPipe` that pays nothing. The same for
+    /// a blocking `publish` whose own ack read fails, on a client that never pipelined.
+    #[test]
+    fn a_latched_client_owes_nothing() {
+        let mut c = Client::from_stream(Recorder {
+            replies: ack(0),
+            written: Arc::new(Mutex::new(Vec::new())),
+            fail_writes: false,
+        });
+        c.send_publish(1, 1, "/o/a", b"one").unwrap();
+        c.send_publish(1, 2, "/o/a", b"two").unwrap();
+        let mut answers = Vec::new();
+        while c.owed_acks() > 0 {
+            assert!(answers.len() < 2, "two acks owed, read: {answers:?}");
+            answers.push(c.recv_publish_ack().map_err(|e| e.kind()));
+        }
+        assert_eq!(
+            answers,
+            [Ok((0, false)), Err(io::ErrorKind::UnexpectedEof)],
+            "the first ack, then the close that latched the client"
+        );
+        let e = c.recv_publish_ack().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
+        assert_eq!(c.owed_acks(), 0);
+
+        let mut c = Client::from_stream(Recorder {
+            replies: Vec::new(),
+            written: Arc::new(Mutex::new(Vec::new())),
+            fail_writes: false,
+        });
+        let e = c.publish(1, 1, "/o/a", b"x").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+        assert_eq!(c.owed_acks(), 0, "a blocking publish whose ack read failed");
+    }
+
+    /// A pipelined RETIRE owes its ack as a pipelined publish does. `retire` reads the
+    /// one ack its own `send_retire` wrote and owes nothing afterwards. A
+    /// `send_retire` adds one owed ack: a commit behind it is refused, with nothing
+    /// written, until `recv_publish_ack` reads the retire's ack, and the commit then
+    /// reads its own reply rather than the retire's.
+    #[test]
+    fn a_pipelined_retire_owes_its_ack() {
+        let log = LogIdentity {
+            id: [7; 16],
+            generation: 0,
+        };
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut c = Client::from_stream(Recorder {
+            replies: [ack(4), ack(5), ack(6)].concat(),
+            written: Arc::clone(&written),
+            fail_writes: false,
+        });
+        assert_eq!(
+            c.retire(1, "/o/a", 0, log).unwrap(),
+            (4, false),
+            "retire reads its own ack"
+        );
+        assert_eq!(c.owed_acks(), 0);
+
+        c.send_retire(1, "/o/a", 0, log).unwrap();
+        assert_eq!(c.owed_acks(), 1);
+        let sent = written.lock().unwrap().len();
+        assert_refused_owing("commit", &c.commit("g", 0).unwrap_err(), 1);
+        assert_eq!(written.lock().unwrap().len(), sent, "nothing written");
+        assert_eq!(
+            c.recv_publish_ack().unwrap(),
+            (5, false),
+            "the retire's ack"
+        );
+        assert_eq!(c.owed_acks(), 0);
+        assert_eq!(c.commit("g", 0).unwrap(), 6, "the commit's own reply");
+        let reqs = requests(&written);
+        assert!(
+            matches!(
+                reqs[..],
+                [
+                    Request::Retire { .. },
+                    Request::Retire { .. },
+                    Request::Commit { .. }
+                ]
+            ),
+            "{reqs:?}"
+        );
+    }
+
+    /// [`drain`](super::drain) asks its committer BEFORE it takes. A commit refused
+    /// for an owed ack after the take would leave the taken records in nobody's
+    /// hands, and the retry the refusal calls for (read the ack, drain again) would
+    /// take the records after them and commit past both. So the drain is refused with
+    /// nothing taken, and once the ack is read the same drain on the same
+    /// subscription hands over the same two records.
+    #[cfg(unix)]
+    #[test]
+    fn a_drain_whose_committer_owes_an_ack_takes_nothing() {
+        let (root, _b, _h) = broker("owed-drain");
+        let sock = root.path().join("sock");
+        let mut p = Client::connect(&sock).unwrap();
+        assert_eq!(p.publish(1, 1, "/o/a", b"zero").unwrap(), (0, false));
+        assert_eq!(p.publish(1, 2, "/o/a", b"one").unwrap(), (1, false));
+        let mut sub = Client::connect(&sock)
+            .unwrap()
+            .subscribe_group("g", "/o/a")
+            .unwrap();
+        // A hang detector: both records are on the log, so the take ends on them.
+        sub.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+
+        let mut c = Client::connect(&sock).unwrap();
+        c.send_publish(2, 1, "/o/b", b"owed").unwrap();
+        let e = super::drain(&mut sub, &mut c, "g", 2).unwrap_err();
+        assert_refused_owing("drain", &e, 1);
+        assert_eq!(c.recv_publish_ack().unwrap(), (2, false));
+
+        let got = super::drain(&mut sub, &mut c, "g", 2).unwrap();
+        let offsets: Vec<u64> = got.iter().map(|r| r.0).collect();
+        assert_eq!(
+            offsets,
+            [0, 1],
+            "the records the refused drain left on the subscription"
+        );
     }
 }

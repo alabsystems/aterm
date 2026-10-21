@@ -11,9 +11,12 @@
 //! a missing facility into `ERR unsupported`. This crate has no winit
 //! dependency.
 
+pub mod asciicast;
 pub mod cast_drift;
 pub mod hangup;
 pub mod host;
+pub mod park;
+pub mod replay;
 pub mod selection;
 pub mod wire;
 

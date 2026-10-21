@@ -185,10 +185,10 @@ impl Adapter {
                 root_window_bounds,
                 action_handler,
             } => {
-                let semantics = Semantics::with_wrapped_action_handler(
+                let semantics = first_tree(
                     self.id,
-                    self.link.app(),
-                    Callback::new(self.link.clone(), *epoch),
+                    &self.link,
+                    *epoch,
                     update_factory(),
                     *is_window_focused,
                     *root_window_bounds,
@@ -220,6 +220,41 @@ impl Drop for Adapter {
     }
 }
 
+/// A window's first tree, published on the `epoch`th accessibility bus.
+///
+/// The window's focus is applied as a change once the tree is registered,
+/// not built into it: an AT that has just been shown the window then hears it
+/// activated (`window:activate`, `state-changed:active`, the root's
+/// `active-descendant-changed`) and its focus, the events it hears when the
+/// focus comes after the tree. Built in, as accesskit_unix 0.22.0 builds it,
+/// the focus was announced alone, and Orca named no window: it spoke a
+/// terminal's text with no frame when aterm-gui had the keyboard focus before
+/// its first tree reached the bus (the Linux lane's Orca row, x86_64,
+/// 2026-10-19).
+fn first_tree(
+    id: usize,
+    link: &Link,
+    epoch: u64,
+    tree: TreeUpdate,
+    is_window_focused: bool,
+    bounds: WindowBounds,
+    handler: Arc<dyn ActionHandlerNoMut + Send + Sync>,
+) -> Semantics {
+    let mut semantics = Semantics::with_wrapped_action_handler(
+        id,
+        link.app(),
+        Callback::new(link.clone(), epoch),
+        tree,
+        false,
+        bounds,
+        handler,
+    );
+    if is_window_focused {
+        semantics.update_window_focus_state(true);
+    }
+    semantics
+}
+
 /// The publisher thread's record of one adapter.
 pub(crate) struct Entry {
     pub(crate) id: usize,
@@ -249,14 +284,8 @@ impl Entry {
             Arc::clone(action_handler),
         );
         *state = match self.activation_handler.request_initial_tree() {
-            Some(initial) => AdapterState::Active(Semantics::with_wrapped_action_handler(
-                self.id,
-                link.app(),
-                Callback::new(link.clone(), epoch),
-                initial,
-                focused,
-                bounds,
-                handler,
+            Some(initial) => AdapterState::Active(first_tree(
+                self.id, link, epoch, initial, focused, bounds, handler,
             )),
             None => AdapterState::Pending {
                 epoch,

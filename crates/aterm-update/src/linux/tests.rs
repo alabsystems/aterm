@@ -2342,7 +2342,9 @@ fn a_start_that_waited_on_the_lock_rolls_no_healthy_build_back() {
 
 /// The steady clock names its boot (boot id and time namespace) and never runs back; a
 /// boot with no name to read gives no steady stamp, and that start is judged on the wall
-/// clock alone.
+/// clock alone. A name is a boot id astream's reader takes (`astream_sys::parse_boot_id`):
+/// not the all-zero id a damaged answer reads as, nor text that is no UUID. NEGATIVE
+/// CONTROL: the same id upper-case names the clock, kept as the kernel spelled it.
 #[test]
 fn the_steady_clock_names_its_boot_and_never_runs_back() {
     let f = Fixture::new();
@@ -2367,6 +2369,20 @@ fn the_steady_clock_names_its_boot_and_never_runs_back() {
     );
     fs::write(&boot, "\n").unwrap();
     assert_eq!(steady_clock(&boot, &namespace), None, "an empty boot id");
+    for damaged in [
+        "00000000-0000-0000-0000-000000000000\n",
+        "boot-a\n",
+        "0f5a1c6e-3b0e-4c55-9d4e-6c1f2a7b9e1\n",
+    ] {
+        fs::write(&boot, damaged).unwrap();
+        assert_eq!(steady_clock(&boot, &namespace), None, "{damaged:?}");
+    }
+    fs::write(&boot, "0F5A1C6E-3B0E-4C55-9D4E-6C1F2A7B9E10").unwrap();
+    assert_eq!(
+        steady_clock(&boot, &namespace).map(|s| s.clock),
+        Some("0F5A1C6E-3B0E-4C55-9D4E-6C1F2A7B9E10 time:[4026531834]".to_string()),
+        "CONTROL"
+    );
     assert_eq!(
         steady_clock(&f.root.join("absent"), &namespace),
         None,

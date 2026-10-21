@@ -64,6 +64,9 @@ pub struct FirstFrameKnobs {
     pub hdr_glow: bool,
     /// The aurora's crown on an SDR screen (`cursor_glow_sdr_boost` above 0).
     pub sdr_glow: bool,
+    /// An fx layer on the first frames (the Claude card, `[claude_footer]
+    /// card`): its Exact row.
+    pub fx: bool,
 }
 
 /// What a first window builds over its first frames under `knobs`, in the
@@ -71,9 +74,9 @@ pub struct FirstFrameKnobs {
 /// (the colour-glyph row for a prompt that carries an emoji), the present
 /// blit at both swapchain formats (which one a window gets depends on its
 /// screen's EDR potential, which only the attach can read), then what the
-/// first prompt's aurora binds: its additive glow, the bloom and the crown. A
-/// frame row's format is inert (it resolves its own target), as
-/// `MetalArmLive::pso` passes it.
+/// first prompt's aurora binds: its additive glow, the bloom and the crown,
+/// then the fx Exact row a card's layers bind. A frame row's format is inert
+/// (it resolves its own target), as `MetalArmLive::pso` passes it.
 pub(crate) fn first_frame_rows(knobs: FirstFrameKnobs) -> Vec<(Pipeline, PixelFormat)> {
     use PixelFormat::{Bgra8Unorm, Rgba16Float};
     let mut rows = vec![
@@ -94,6 +97,9 @@ pub(crate) fn first_frame_rows(knobs: FirstFrameKnobs) -> Vec<(Pipeline, PixelFo
         if knobs.sdr_glow {
             rows.push((Pipeline::SdrGlow, Bgra8Unorm));
         }
+    }
+    if knobs.fx {
+        rows.push((Pipeline::Fx, Bgra8Unorm));
     }
     rows
 }
@@ -435,12 +441,13 @@ impl Drop for FirstFrameWarm {
 static BENCH_LATCH: WarmLatch = WarmLatch::new(DEADLINE);
 
 /// The launch's default knobs (`aterm-gui`'s config defaults on macOS): the
-/// aurora on, with its bloom and both crowns.
+/// aurora on, with its bloom and both crowns, and the Claude card's fx row.
 const BENCH_KNOBS: FirstFrameKnobs = FirstFrameKnobs {
     aurora: true,
     bloom: true,
     hdr_glow: true,
     sdr_glow: true,
+    fx: true,
 };
 
 /// The measurement's compile: the shipped source plus a per-run `nonce`

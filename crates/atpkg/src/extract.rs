@@ -2801,11 +2801,12 @@ mod tests {
     /// Structure and content are two allowances of the signed size, never one counter: a
     /// tree of small files carries more structure than content (a 512-byte header and the
     /// padding to the next block per file), and the packers signed `disk_installed` as the
-    /// content's apparent size. 700 files of 760 bytes are 532 kB of content and 544 kB of
-    /// structure: against `install::size_cap`'s 2 x 532 kB (just past its 1 MiB floor)
-    /// each fits and their sum does not — the shape of `/usr/share/terminfo` (2.9 MB of
-    /// content, 6.4 MB stream, 5.9 MB cap), which one shared counter refused at every
-    /// install.
+    /// content's apparent size. 16 files of 760 bytes are 12 kB of content and 13 kB of
+    /// structure: against a cap of 2 x the content (`install::size_cap`'s rule) each fits
+    /// and their sum does not — the shape of `/usr/share/terminfo` (2.9 MB of content,
+    /// 6.4 MB stream, 5.9 MB cap), which one shared counter refused at every install. The
+    /// extractor takes the cap as given; `size_cap`'s 1 MiB floor, which a real tree this
+    /// small sits under, is install's, and clearing it took 700 files laid three times.
     ///
     /// Pinned by count: a cap equal to the structure admits the whole tree (its content,
     /// smaller, fits its own allowance; one counter would need the sum), and one byte less
@@ -2813,7 +2814,7 @@ mod tests {
     #[test]
     fn a_small_file_tree_spends_structure_and_content_apart() {
         let d = dest("small-files");
-        let (files, size) = (700usize, 760usize);
+        let (files, size) = (16usize, 760usize);
         let mut tar = Vec::new();
         for i in 0..files {
             tar.extend_from_slice(&raw_header(&format!("share/{i:05}"), b'0', "", size));
@@ -2830,7 +2831,7 @@ mod tests {
         );
         let archive = d.join("small.tar.zst");
         std::fs::write(&archive, zstd_bytes(&tar)).unwrap();
-        let signed_cap = (2 * content).max(1 << 20);
+        let signed_cap = 2 * content;
         assert!(
             content + structure > signed_cap,
             "one shared counter must refuse what two allowances admit: {content} + \
@@ -2852,7 +2853,7 @@ mod tests {
             tree.map(|_| ())
         );
         assert_eq!(
-            std::fs::read(root.join("share/00699")).unwrap(),
+            std::fs::read(root.join(format!("share/{:05}", files - 1))).unwrap(),
             vec![b'x'; size]
         );
         let at = |cap: u64| {
@@ -4096,8 +4097,9 @@ mod tests {
         let got = extract_tar_zst(&archive, &root, 10_000_000, 10_000);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let Err(err) = got else {
-            // Running as root, where the mode bits do not apply: nothing to assert.
-            return;
+            aterm_uds::host::could_not_run(
+                "a lay under a mode-0500 root succeeded: root, or a file system that ignores modes",
+            );
         };
         let ExtractError::Io { path, .. } = &err else {
             panic!("want Io, got {err:?}");

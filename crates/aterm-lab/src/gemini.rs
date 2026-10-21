@@ -118,7 +118,9 @@ pub fn need(run: &Run, agent: Agent) -> Result<(), Fail> {
     let bin = agent.bin(run);
     if bin.is_empty() || !crate::sys::executable(bin) {
         let how = match agent {
-            Agent::Gemini => "brew install gemini-cli, or LAB_GEMINI=/path/to/gemini at up",
+            // No provider: aterm installs no Gemini CLI, so the lab runs only the one it is
+            // named (docs/DESIGN-init-system-2026-10-20.md §6.1 row 32).
+            Agent::Gemini => "LAB_GEMINI=/path/to/gemini at up names one; aterm installs none",
             Agent::Agy => "aterm pkg install agy, or LAB_AGY=/path/to/agy at up",
         };
         return Err(Fail::die(format!(

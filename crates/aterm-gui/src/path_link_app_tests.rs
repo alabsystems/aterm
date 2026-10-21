@@ -10,7 +10,8 @@ use std::time::Instant;
 use crate::native_app::AppViewState;
 use crate::{App, WindowId, term_lock};
 
-fn link_modifier() -> aterm_window::keyboard::ModifiersState {
+/// The platform's "open link" modifier, as `link_modifier_held` reads it.
+pub(super) fn link_modifier() -> aterm_window::keyboard::ModifiersState {
     #[cfg(target_os = "macos")]
     {
         aterm_window::keyboard::ModifiersState::SUPER
@@ -63,7 +64,7 @@ fn sweep_sees_cwd(app: &App, wid: WindowId, pgid: i32) {
         .timeline
         .lock()
         .unwrap()
-        .witness_cwd_report(seq, pgid, pgid);
+        .witness_cwd_report(seq, pgid);
 }
 
 /// `dir` as the path of an OSC 7 `file://` URI, as a shell reports it: the
@@ -98,7 +99,7 @@ fn app_with(row: &str) -> (App, WindowId, aterm_tempfile::TempDir, std::path::Pa
 }
 
 /// Hover window cell `(row, col)` through the real motion path; the hand.
-fn hover(app: &mut App, wid: WindowId, row: u16, col: u16) -> bool {
+pub(super) fn hover(app: &mut App, wid: WindowId, row: u16, col: u16) -> bool {
     let (cw, ch) = app.win_cell_size(wid);
     let strip_px = f64::from(app.tab_strip_rows) * ch as f64;
     let x = app.win_pad(wid) as f64 + cw as f64 * (f64::from(col) + 0.5);
@@ -208,6 +209,27 @@ fn cmd_click_on_a_citation_opens_aterms_editor_at_its_line() {
         .head;
     assert_eq!(caret, "one\ntwo\nt".len(), "line 3, column 2");
     assert_eq!(editor.status.as_deref(), Some("Line 3"));
+}
+
+/// On a DEC double-width line grid column `c` is painted at cells `2c` and
+/// `2c + 1`: the press reads the citation painted under the pointer, as the
+/// hand does, not the grid column the painted cell's number names.
+#[test]
+fn a_citation_on_a_double_width_line_opens_from_where_it_is_painted() {
+    let (mut app, wid, _dir, root) = app_with("\x1b#6src/foo.rs:3 x");
+    // `src/foo.rs:3` is grid columns 0..=11, painted 0..=23; cell 16 shows
+    // the `r` of `rs` (grid 8), and grid column 16 is past the text.
+    assert!(
+        hover(&mut app, wid, 0, 16),
+        "the hand over the painted citation"
+    );
+    let target = app
+        .path_link_under_pointer(wid)
+        .expect("the press reads the citation painted there");
+    assert_eq!(
+        (target.path, target.line),
+        (root.join("src/foo.rs"), Some(3))
+    );
 }
 
 /// The canonical file the standing caption names, if it names a citation.

@@ -60,13 +60,13 @@ fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
 
     // Alive: the wakeless poll times out, and a wake wins over the watch.
     assert!(matches!(
-        read_or_wake(master_rd, &mut buf, -1, exit.as_raw_fd()),
+        read_or_wake(master_rd, &mut buf, -1, exit.as_raw_fd(), -1),
         ReadOutcome::Idle
     ));
     let (wake_rd, wake_wr) = make_wake_pipe().expect("wake pipe");
     wake(wake_wr);
     assert!(matches!(
-        read_or_wake(master_rd, &mut buf, wake_rd, exit.as_raw_fd()),
+        read_or_wake(master_rd, &mut buf, wake_rd, exit.as_raw_fd(), -1),
         ReadOutcome::Wake
     ));
     close_fd(wake_wr);
@@ -78,11 +78,11 @@ fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
     let reader = std::thread::spawn(move || {
         let mut buf = [0u8; 16];
         let parked = matches!(
-            read_or_wake(master_rd, &mut buf, wake_rd, watch),
+            read_or_wake(master_rd, &mut buf, wake_rd, watch, -1),
             ReadOutcome::Exited
         );
         let wakeless = matches!(
-            read_or_wake(master_rd, &mut buf, -1, watch),
+            read_or_wake(master_rd, &mut buf, -1, watch, -1),
             ReadOutcome::Exited
         );
         tx.send((parked, wakeless)).unwrap();
@@ -127,7 +127,7 @@ fn drain_more_nonblocking_delivers_interactive_burst_on_first_quiet_read() {
     assert_eq!(n, 1);
     let polls_before = super::BRIDGE_POLLS.with(std::cell::Cell::get);
     let mut gaps = 0u32;
-    let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, None, never_hot, &mut |_| {
+    let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, -1, None, never_hot, &mut |_, _| {
         gaps += 1;
         false
     });
@@ -201,10 +201,11 @@ fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
             &mut buf,
             n as usize,
             -1,
+            -1,
             Some(&busy),
             interactive_pending,
             IDLE_POLL_DEFAULT_US,
-            |_| {
+            |_, _| {
                 gaps += 1;
                 // SAFETY: a one-byte write to this test's live pipe end; the
                 // gather drains it, so the 64 KiB pipe never fills.
@@ -257,9 +258,16 @@ fn drain_more_nonblocking_gathers_saturated_burst_and_survives_eof() {
     let mut buf = [0u8; 65_536];
     let n = read(rd, &mut buf[..1024]);
     assert!(n > 0);
-    let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, None, never_hot, &mut |_| {
-        false
-    });
+    let filled = drain_more_nonblocking(
+        rd,
+        &mut buf,
+        n as usize,
+        -1,
+        -1,
+        None,
+        never_hot,
+        &mut |_, _| false,
+    );
     assert_eq!(
         filled,
         payload.len(),
@@ -308,10 +316,11 @@ fn drain_more_nonblocking_parks_yield_to_wake_and_leave_the_byte() {
             &mut buf,
             n as usize,
             wake_rd,
+            -1,
             Some(&in_flight),
             never_hot,
             IDLE_WAIT_US,
-            |_| {
+            |_, _| {
                 gaps += 1;
                 false
             },
@@ -368,10 +377,11 @@ fn drain_more_nonblocking_fence_delivers_before_a_park() {
             &mut buf,
             n as usize,
             -1,
+            -1,
             Some(&busy),
             never_hot,
             0,
-            |f| {
+            |f, _| {
                 gaps += 1;
                 seen_at.push(f);
                 if gaps == 1 {
@@ -411,6 +421,303 @@ fn drain_more_nonblocking_fence_delivers_before_a_park() {
     assert!(gaps >= 1);
     assert!(after < 0, "nothing left behind (EAGAIN)");
     super::BUDGET_FOR_TEST.with(|b| b.set(None));
+}
+
+/// The process watch (card engine §3.3) is the fourth descriptor of the reader's poll and
+/// joins both parks: readable, it is heard BEFORE the master, so the host drains it before
+/// any byte read after it. `read_or_wake` answers `Proc` with data waiting; a park it ends
+/// asks the fence again at the same offset (`at_gap(f, true)`), and the gather reads on
+/// unless the fence delivers. Both parks: the bridge poll (parser busy) and the idle wait
+/// (parser idle, armed past the hang detector so only a descriptor can end it).
+#[test]
+fn the_process_watch_is_heard_before_the_master_in_every_poll() {
+    use std::sync::atomic::AtomicUsize;
+    let pipe = || {
+        let mut m = [0i32; 2];
+        // SAFETY: valid 2-int out-array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+        set_nonblocking(m[0], true).expect("nonblock read end");
+        (m[0], m[1])
+    };
+    let put = |fd: i32, bytes: &[u8]| {
+        // SAFETY: bounded write to this test's live pipe end.
+        assert_eq!(
+            unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) },
+            bytes.len() as isize
+        );
+    };
+    let take = |fd: i32| {
+        let mut sink = [0u8; 64];
+        read(fd, &mut sink)
+    };
+
+    // read_or_wake: the master and the watch both readable answers Proc, then Data.
+    let (master, master_wr) = pipe();
+    let (watch, watch_wr) = pipe();
+    let (wake_rd, wake_wr) = make_wake_pipe().expect("wake pipe");
+    put(master_wr, b"bytes");
+    put(watch_wr, b"!");
+    let mut buf = [0u8; 64];
+    for wake in [wake_rd, -1] {
+        assert!(matches!(
+            read_or_wake(master, &mut buf, wake, -1, watch),
+            ReadOutcome::Proc
+        ));
+    }
+    assert_eq!(take(watch), 1);
+    assert!(matches!(
+        read_or_wake(master, &mut buf, wake_rd, -1, watch),
+        ReadOutcome::Data(5)
+    ));
+    for fd in [master, master_wr, watch, watch_wr, wake_rd, wake_wr] {
+        close_fd(fd);
+    }
+
+    super::BUDGET_FOR_TEST.with(|b| b.set(Some(HANG_DETECTOR)));
+    let chunk = [0xC3u8; 2048];
+    // (filled, the fence's calls, bytes a follow-up read of the master finds).
+    let run = |park: &str, deliver_at_watch: bool| -> (usize, Vec<(usize, bool)>, isize) {
+        let (rd, wr) = pipe();
+        let (watch, watch_wr) = pipe();
+        put(wr, &chunk);
+        let busy = AtomicUsize::new(usize::from(park == "bridge"));
+        let idle_wait_us = if park == "bridge" { 0 } else { u32::MAX };
+        let mut buf = [0u8; 65_536];
+        let n = read(rd, &mut buf[..1024]);
+        assert!(n > 0);
+        let mut calls = Vec::new();
+        let filled = drain_more_nonblocking_with_idle_wait_after_gap(
+            rd,
+            &mut buf,
+            n as usize,
+            -1,
+            watch,
+            Some(&busy),
+            never_hot,
+            idle_wait_us,
+            |f, proc| {
+                calls.push((f, proc));
+                if proc {
+                    assert_eq!(take(watch), 1, "{park}: the host drains the watch");
+                    return deliver_at_watch;
+                }
+                if calls.len() > 1 {
+                    return true; // the next dry gap: nothing more is coming
+                }
+                // A refill and an event, both before the park.
+                put(wr, &chunk);
+                put(watch_wr, b"!");
+                false
+            },
+        );
+        let mut rest = [0u8; 4096];
+        let after = read(rd, &mut rest);
+        for fd in [rd, wr, watch, watch_wr] {
+            close_fd(fd);
+        }
+        (filled, calls, after)
+    };
+    for park in ["bridge", "idle"] {
+        let (filled, calls, after) = run(park, true);
+        assert_eq!(
+            calls,
+            [(chunk.len(), false), (chunk.len(), true)],
+            "{park}: the watch is heard at the park's offset, before the refill"
+        );
+        assert_eq!(
+            filled,
+            chunk.len(),
+            "{park}: the fence delivered at the watch"
+        );
+        assert_eq!(
+            after,
+            chunk.len() as isize,
+            "{park}: the refill is still unread"
+        );
+
+        let (filled, calls, _) = run(park, false);
+        assert_eq!(
+            calls,
+            [
+                (chunk.len(), false),
+                (chunk.len(), true),
+                (2 * chunk.len(), false)
+            ]
+        );
+        assert_eq!(filled, 2 * chunk.len(), "{park}: the gather reads on");
+    }
+    super::BUDGET_FOR_TEST.with(|b| b.set(None));
+}
+
+/// R2x CLOSED: with a process watch, no batch ends past an `exec` the watch could hear.
+/// * A batch under one outq ends at a poll of the watch and the master that stands in for
+///   its dry `read`: a readable watch is heard there, at the batch's offset, before the
+///   master's next bytes are read; a quiet one ends the batch with no system call of its
+///   own.
+/// * A batch that ends unparked past its last poll (its budget, a full buffer) asks the
+///   watch once more (one `poll(2)`) and hears it at its end.
+/// * A park whose wait runs out quiet proves the batch: no check of its own.
+///
+/// The checks are counted ([`super::WATCH_CHECKS`]), not timed.
+#[test]
+fn no_batch_ends_past_an_exec_the_watch_could_hear() {
+    let pipe = || {
+        let mut m = [0i32; 2];
+        // SAFETY: valid 2-int out-array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+        set_nonblocking(m[0], true).expect("nonblock read end");
+        (m[0], m[1])
+    };
+    let put = |fd: i32, bytes: &[u8]| {
+        // SAFETY: bounded write to this test's live pipe end.
+        assert_eq!(
+            unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) },
+            bytes.len() as isize
+        );
+    };
+    let checks = || super::WATCH_CHECKS.with(std::cell::Cell::get);
+    // (filled, the fence's calls, the batch-end checks it made).
+    let drain = |rd: i32, watch: i32, buf: &mut [u8], first: usize, budget| {
+        super::BUDGET_FOR_TEST.with(|b| b.set(Some(budget)));
+        let n = read(rd, &mut buf[..first]);
+        assert!(n > 0);
+        let before = checks();
+        let mut calls = Vec::new();
+        let busy = std::sync::atomic::AtomicUsize::new(1);
+        let filled = drain_more_nonblocking_with_idle_wait_after_gap(
+            rd,
+            buf,
+            n as usize,
+            -1,
+            watch,
+            Some(&busy),
+            never_hot,
+            0,
+            |f, heard| {
+                calls.push((f, heard));
+                if heard {
+                    let mut sink = [0u8; 8];
+                    assert_eq!(read(watch, &mut sink), 1, "the host drains the watch");
+                }
+                heard
+            },
+        );
+        super::BUDGET_FOR_TEST.with(|b| b.set(None));
+        (filled, calls, checks() - before)
+    };
+
+    // An interactive batch: the watch is heard in place of the dry read, before the
+    // master's next bytes; quiet, the batch ends with no check of its own.
+    let (rd, wr) = pipe();
+    let (watch, watch_wr) = pipe();
+    let mut buf = [0u8; 4096];
+    put(wr, b"old");
+    put(watch_wr, b"!");
+    put(wr, b"new");
+    let (filled, calls, own) = drain(rd, watch, &mut buf, 3, HANG_DETECTOR);
+    assert_eq!(
+        (filled, calls, own),
+        (3, vec![(3, true)], 0),
+        "heard at the small batch's end, before its next bytes"
+    );
+    let (filled, calls, own) = drain(rd, watch, &mut buf, 3, HANG_DETECTOR);
+    assert_eq!(
+        (filled, calls, own),
+        (3, vec![], 0),
+        "quiet: the batch ends at the poll"
+    );
+    for fd in [rd, wr, watch, watch_wr] {
+        close_fd(fd);
+    }
+
+    // A batch its budget ends unparked, and one its buffer ends: asked once, heard at
+    // the end.
+    for (bytes, cap, budget) in [
+        (2048, 4096, std::time::Duration::ZERO),
+        (4096, 2048, HANG_DETECTOR),
+    ] {
+        let (rd, wr) = pipe();
+        let (watch, watch_wr) = pipe();
+        put(wr, &vec![b'x'; bytes]);
+        put(watch_wr, b"!");
+        let mut buf = vec![0u8; cap];
+        let (filled, calls, own) = drain(rd, watch, &mut buf, 1024, budget);
+        let end = bytes.min(cap);
+        assert_eq!(
+            (filled, calls, own),
+            (end, vec![(end, true)], 1),
+            "{bytes} bytes into {cap}: heard at the batch's end"
+        );
+        for fd in [rd, wr, watch, watch_wr] {
+            close_fd(fd);
+        }
+    }
+
+    // A parked batch whose wait runs out quiet is proven by the park: no check.
+    let (rd, wr) = pipe();
+    let (watch, watch_wr) = pipe();
+    put(wr, &[b'y'; 2048]);
+    let mut buf = [0u8; 4096];
+    let (filled, calls, own) = drain(rd, watch, &mut buf, 1024, HANG_DETECTOR);
+    assert_eq!(
+        (filled, own),
+        (2048, 0),
+        "the park's quiet proves the batch"
+    );
+    assert_eq!(calls, [(2048, false)], "one park, its sample only");
+    for fd in [rd, wr, watch, watch_wr] {
+        close_fd(fd);
+    }
+}
+
+/// The blocking fallback ([`drain_more_watched`]) hears the watch in each per-chunk poll,
+/// at that chunk's offset and before its bytes; a batch that ends with no poll after its
+/// last bytes (here, handed in full) asks the watch once more and hears it at its end.
+#[test]
+fn the_blocking_fallback_hears_the_watch_at_each_chunk() {
+    let pipe = || {
+        let mut m = [0i32; 2];
+        // SAFETY: valid 2-int out-array for pipe(2).
+        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+        (m[0], m[1])
+    };
+    let put = |fd: i32, bytes: &[u8]| {
+        // SAFETY: bounded write to this test's live pipe end.
+        assert_eq!(
+            unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) },
+            bytes.len() as isize
+        );
+    };
+    let (rd, wr) = pipe();
+    let (watch, watch_wr) = pipe();
+    let hear = |heard: &mut Vec<usize>, f: usize| {
+        heard.push(f);
+        let mut sink = [0u8; 8];
+        assert_eq!(read(watch, &mut sink), 1, "the host drains the watch");
+        true
+    };
+    put(wr, b"old");
+    let mut buf = [0u8; 4096];
+    assert_eq!(read(rd, &mut buf), 3);
+    put(watch_wr, b"!");
+    put(wr, b"new");
+    let mut heard = Vec::new();
+    let filled = drain_more_watched(rd, &mut buf, 3, watch, &mut |f| hear(&mut heard, f));
+    assert_eq!((filled, heard), (3, vec![3]), "heard before the next bytes");
+
+    let mut full = [0u8; 3];
+    assert_eq!(read(rd, &mut full), 3);
+    put(watch_wr, b"!");
+    let mut heard = Vec::new();
+    let filled = drain_more_watched(rd, &mut full, 3, watch, &mut |f| hear(&mut heard, f));
+    assert_eq!(
+        (filled, heard),
+        (3, vec![3]),
+        "a full batch is asked at its end"
+    );
+    for fd in [rd, wr, watch, watch_wr] {
+        close_fd(fd);
+    }
 }
 
 /// Parser-idle hysteresis: an armed idle wait parks an idle parser's dry gap (the µs
@@ -460,10 +767,11 @@ fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
         &mut buf,
         n as usize,
         -1,
+        -1,
         Some(&idle),
         never_hot,
         IDLE_WAIT_US,
-        |_| {
+        |_, _| {
             gaps += 1;
             if gaps == 1 {
                 release.send(()).expect("the writer waits for its release");
@@ -619,10 +927,11 @@ fn a_signal_does_not_end_an_armed_idle_wait() {
         &mut buf,
         n as usize,
         -1,
+        -1,
         Some(&idle),
         never_hot,
         IDLE_WAIT_US,
-        |_| {
+        |_, _| {
             gaps += 1;
             if gaps == 1 {
                 signaller
@@ -829,19 +1138,25 @@ fn an_unrelated_exec_inherits_no_end_of_a_live_pty_or_status_channel() {
     // SAFETY: `slave` is live; `dup` returns a new fd onto the same pty.
     let leaked = unsafe { libc::dup(slave) };
     assert!(leaked >= 0, "dup(slave) failed");
+    // Each number is read from the shell's own table ([`aterm_spec::host::sh_held`]),
+    // never by a path lookup of `/dev/fd/<n>`, which on Darwin reads a held descriptor as
+    // absent while anything else looks the number up. The probes run BEFORE any
+    // redirection, so no descriptor the shell opens for one outlives it at a probed
+    // number; then one `exec` (which keeps no saved copies) points its stdio at
+    // `/dev/null`, the report file and `/dev/null`, so nothing it prints is pty traffic.
+    // The marks are OPENS of `/dev/fd/<n>`, which that race does not touch (it is in
+    // `stat`'s read-back of the type; 0 of 200 000 opens failed under contention that
+    // failed 2% of `stat`s), never `>&<n>`: POSIX promises only fds 0-9 in a redirection,
+    // and dash (Debian's /bin/sh) aborts the script on `>&10` ("Bad fd number").
     let probed: String = [master, slave, status_rd, status_wr, leaked]
         .iter()
-        .map(|fd| format!(" {fd}"))
+        .map(|&fd| {
+            let held = aterm_spec::host::sh_held(fd);
+            format!("{held} && got=\"$got got:{fd}\"; ")
+        })
         .collect();
-    // The `/dev/fd` probes run BEFORE any redirection, so no descriptor the
-    // shell opens for one can sit at a probed number; then one `exec` (which
-    // keeps no saved copies) points its stdio at `/dev/null`, the report
-    // file and `/dev/null`, so nothing it prints is pty traffic. The marks go
-    // through `/dev/fd/<n>`, never `>&<n>`: POSIX promises only fds 0-9 in a
-    // redirection, and dash (Debian's /bin/sh) aborts the script on `>&10`
-    // ("Bad fd number").
     let script = format!(
-        "got=; for f in{probed}; do [ -e /dev/fd/$f ] && got=\"$got got:$f\"; done; \
+        "got=; {probed}\
          exec </dev/null >\"$1\" 2>/dev/null; \
          {{ printf 'LEAKMARK' >/dev/fd/{leaked}; }} 2>/dev/null; \
          {{ printf 'SLAVEMARK' >/dev/fd/{slave}; }} 2>/dev/null; \
@@ -1114,20 +1429,26 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
         0,
         "PRECONDITION: fd {parked} is inheritable in the parent"
     );
-    // `[ -e /dev/fd/N ]`, as the unrelated-exec probe asks, never a `>&N`
-    // redirection: dash, /bin/sh on Debian and Ubuntu, reads only one digit
-    // after `>&`, refuses the whole line as a syntax error and printed
-    // nothing here (the Linux lane, 2026-10-16).
+    // Read from the shell's own table ([`aterm_spec::host::sh_held`]), as the
+    // unrelated-exec probe reads, never by `[ -e /dev/fd/N ]` (on Darwin a held number
+    // reads absent while anything else looks it up, which would pass a leak) and never
+    // by a `>&N` redirection: dash, /bin/sh on Debian and Ubuntu, reads only one digit
+    // after `>&`, refuses the whole line as a syntax error and printed nothing here (the
+    // Linux lane, 2026-10-16).
+    let parked_held = aterm_spec::host::sh_held(parked);
     let others: String = absent
         .unwrap_or_default()
         .iter()
-        .map(|fd| format!(" {fd}"))
+        .map(|&fd| {
+            let held = aterm_spec::host::sh_held(fd);
+            format!("{held} && p=\"$p+{fd}\"; ")
+        })
         .collect();
     let script = format!(
         "s=n; [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && s=y; \
          c=n; {{ : < /dev/tty; }} 2>/dev/null && c=y; \
-         p=closed; [ -e /dev/fd/{parked} ] && p=open; \
-         for f in{others}; do [ -e /dev/fd/$f ] && p=\"$p+$f\"; done; \
+         p=closed; {parked_held} && p=open; \
+         {others}\
          printf 'PROBE stdio=%s ctty=%s size=[%s] tty=[%s] parked=%s\\n' \
            \"$s\" \"$c\" \"$(stty size)\" \"$(tty)\" \"$p\"; \
          exec sleep 30"

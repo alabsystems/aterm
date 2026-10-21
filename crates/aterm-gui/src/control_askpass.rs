@@ -6,10 +6,10 @@
 //! reads the peer once and gates on `Scope::Owner` EXACTLY (not owner-class, so
 //! a bridge is refused like an edge). It attests the peer is aterm's own binary
 //! under Apple's `/usr/bin/sudo`, reads what to show from the kernel, hands the
-//! request to the window (`Wake::Askpass`), and parks for the owner's answer —
-//! returning the one reply, which reaches the peer through the lane's reply
-//! buffer (`Outbox`) like any other and is zeroed there by `Outbox::scrub`
-//! (`write_volatile`, once delivered and on drop), and never logging the secret.
+//! request to the window (`Wake::Askpass`), and parks for the owner's answer.
+//! The one reply goes to the connection's outbox in its own guarded buffer
+//! (`Outbox::push_secret`): moved, never copied into an ordinary buffer,
+//! scrubbed as it drops, and never logged.
 
 #[cfg(target_os = "macos")]
 use std::time::Instant;

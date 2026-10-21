@@ -332,7 +332,7 @@ fn visit_at(
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, session), st.to_json()).expect("write");
     let shell = dead_pid();
-    let table = vec![(shell, 1, "zsh".to_string())];
+    let table = vec![(shell, 1, "zsh".into())];
     let args = atpkg::caller_shell::process_args(agent.id()).expect("argv");
     let files = session_files(&opts.home);
     let r = visit_with_claim(

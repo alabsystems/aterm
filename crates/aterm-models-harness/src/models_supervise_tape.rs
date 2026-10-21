@@ -6,15 +6,17 @@
 //! by a crash, or damaged at rest.
 //!
 //! A harness tape (`aterm-agent/src/supervise/tape/`) is a file of frames,
-//! each written by ONE `write(2)` and checked by its own xxh64. The writer
-//! never fsyncs between frames (a tape is a diagnostic record, as the journal
-//! is), so a crash can leave a frame half on disk, and the disk can damage a
-//! byte of a frame long after it was written. Recovery is a pure function of
-//! the bytes, with astream-engine's store classification: a short or damaged
-//! frame with nothing whole after it is the TORN TAIL a crash leaves —
-//! dropped, and said — and one with a whole frame after it is a FAULT, which a
-//! plain read refuses with its offset rather than truncating away frames that
-//! were written whole.
+//! each written by ONE `write(2)` and checked by its own xxh64, which also
+//! names the frame's place (frame format 2). The writer never fsyncs between
+//! frames (a tape is a diagnostic record, as the journal is), so a crash can
+//! leave a frame half on disk, and the disk can damage a byte of a frame long
+//! after it was written, or repeat, drop or move whole frames. Recovery is a
+//! pure function of the bytes, with astream-engine's store classification: a
+//! short or damaged frame with nothing whole after it is the TORN TAIL a crash
+//! leaves — dropped, and said — and one with a whole frame after it is a
+//! FAULT, which a plain read refuses with its offset rather than truncating
+//! away frames that were written whole; a whole frame out of its place is a
+//! fault wherever it stands.
 
 use aterm_spec::derive::Model;
 
@@ -25,10 +27,12 @@ use aterm_spec::derive::Model;
 /// first); `torn`, a frame after them that is not (half-written, or the
 /// damaged last one); `rot`, a damaged byte in a frame with a whole, intact
 /// frame after it; `magic_rot`, a damaged byte of the file's magic;
-/// `flipped`, the tape already took its one damage; `crashed`, the writer is
-/// gone (a crash, or the run's end), so the bytes are at rest; then the
-/// reading — `done`, `recovered` (the frames it returned), `refused` (it
-/// refused the tape: a fault) and `said_torn` (it reported a torn tail).
+/// `misplaced`, whole frames on disk that are not the writer's in its order
+/// (one repeated, dropped or moved); `flipped`, the tape already took its one
+/// damage; `crashed`, the writer is gone (a crash, or the run's end), so the
+/// bytes are at rest; then the reading — `done`, `recovered` (the frames it
+/// returned), `refused` (it refused the tape: a fault) and `said_torn` (it
+/// reported a torn tail).
 ///
 /// The moves: `Write` (a frame closed by the writer: one whole frame more;
 /// the first write is the magic and the header frame together), `Tear` (the
@@ -41,19 +45,25 @@ use aterm_spec::derive::Model;
 /// byte of the magic is: the reader checks the magic before any frame, and a
 /// file that does not start with it cannot be told from a file that is no
 /// tape, so it is refused whatever follows — also when the header is the
-/// last whole frame), and `Recover` (the plain read).
+/// last whole frame), `Misplace` (whole frames are repeated, dropped or moved
+/// at rest, every frame still whole: each frame's sum names its place, so the
+/// first out of place is refused wherever it stands, the last frame's place
+/// included — no crash writes a whole frame at the wrong place; the frames
+/// cut short at a boundary are `Crash`, which no frame can tell, and not this
+/// move), and `Recover` (the plain read).
 ///
 /// Invariants: `RecoveredIsPrefix` — the reader never returns more than the
 /// whole frames (a torn frame is never taken). `NoSilentLoss` — every whole,
 /// intact frame comes back unless the tape is refused. `RotRefused` — damage
 /// with a whole frame after it, or to the magic, refuses the tape: it is never
-/// read through, skipped, or truncated away. `TornSaid` — a tape that is not
-/// refused is said torn exactly when it is.
+/// read through, skipped, or truncated away. `MisplacedRefused` — whole frames
+/// out of place refuse the tape: never read back as written. `TornSaid` — a
+/// tape that is not refused is said torn exactly when it is.
 ///
-/// One damage per tape: the Tier-1 bind flips one byte. Two would let a
-/// later damage hide an earlier one's witness (`Rot` in frame 0, then
-/// `RotLast` taking the only whole frame after it), which the reader then
-/// rightly calls torn.
+/// One damage per tape: the Tier-1 bind flips one byte, or arranges the whole
+/// frames once. Two would let a later damage hide an earlier one's witness
+/// (`Rot` in frame 0, then `RotLast` taking the only whole frame after it),
+/// which the reader then rightly calls torn.
 ///
 /// The mutants, each a reader that is wrong in one way: `Buggy = 1` ignores
 /// the checksum and reads a damaged frame as written (`RotRefused`);
@@ -61,7 +71,9 @@ use aterm_spec::derive::Model;
 /// `Buggy = 3` drops a damaged frame and reads on (`NoSilentLoss`,
 /// `RotRefused`); `Buggy = 4` reports a torn tail clean (`TornSaid`);
 /// `Buggy = 5` never checks the magic and reads the frames after a damaged one
-/// as a tape's (`RotRefused`).
+/// as a tape's (`RotRefused`); `Buggy = 6` takes a whole frame at any place —
+/// format 1's sums, which name none — and reads frames repeated, dropped or
+/// moved as written (`MisplacedRefused`).
 ///
 /// What the model does not hold: the reader's own bounds on bytes no writer
 /// leaves (`recover.rs`'s `HELD_MAX`, and its search's), which refuse a tape
@@ -70,11 +82,14 @@ use aterm_spec::derive::Model;
 ///
 /// Tier-1 (`aterm-agent/src/supervise/tape/conformance_tests.rs`) writes
 /// tapes of one, two and three frames with the real writer, then reads, with
-/// the real reader, every byte-offset truncation of each and every byte of
+/// the real reader, every byte-offset truncation of each, every byte of
 /// each flipped under three masks (0x01, 0x80 and 0xff: the low bit, the high
-/// bit, every bit), projecting each reading onto `recovered`, `refused` and
-/// `said_torn` beside the model's own run of the same schedule; the negative
-/// control is a reader that ignores xxh64, which the bind rejects.
+/// bit, every bit), and every arrangement of each one's whole frames at most
+/// one frame longer that is neither the tape nor a prefix of it, projecting
+/// each reading onto `recovered`, `refused` and `said_torn` beside the model's
+/// own run of the same schedule; the negative controls are a reader that
+/// ignores xxh64 and one that ignores the place a sum names, which the bind
+/// rejects.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervise_tape_recovery_model() -> Model {
@@ -86,6 +101,7 @@ pub fn supervise_tape_recovery_model() -> Model {
             var torn = 0;
             var rot = 0;
             var magic_rot = 0;
+            var misplaced = 0;
             var flipped = 0;
             var crashed = 0;
             var done = 0;
@@ -116,11 +132,19 @@ pub fn supervise_tape_recovery_model() -> Model {
                 magic_rot = 1;
                 flipped = 1;
             }
+            action Misplace when (crashed == 1 && done == 0 && flipped == 0 && torn == 0 && written > 0) {
+                misplaced = 1;
+                flipped = 1;
+            }
             action Recover when (crashed == 1 && done == 0) {
                 done = 1;
                 refused = if magic_rot == 1 && Buggy == 5 {
                     0
                 } else if magic_rot == 1 {
+                    1
+                } else if misplaced == 1 && Buggy == 6 {
+                    0
+                } else if misplaced == 1 {
                     1
                 } else if rot == 1 && (Buggy == 1 || Buggy == 3) {
                     0
@@ -130,6 +154,10 @@ pub fn supervise_tape_recovery_model() -> Model {
                 recovered = if magic_rot == 1 && Buggy == 5 {
                     written
                 } else if magic_rot == 1 {
+                    0
+                } else if misplaced == 1 && Buggy == 6 {
+                    written
+                } else if misplaced == 1 {
                     0
                 } else if rot == 1 && Buggy == 1 {
                     written
@@ -146,6 +174,8 @@ pub fn supervise_tape_recovery_model() -> Model {
                     torn
                 } else if magic_rot == 1 {
                     0
+                } else if misplaced == 1 {
+                    0
                 } else if Buggy == 4 {
                     0
                 } else if rot == 1 && (Buggy == 1 || Buggy == 3) {
@@ -160,53 +190,89 @@ pub fn supervise_tape_recovery_model() -> Model {
             invariant RecoveredIsPrefix: recovered <= written;
             invariant NoSilentLoss: done == 0 || refused == 1 || recovered == written;
             invariant RotRefused: done == 0 || (rot == 0 && magic_rot == 0) || refused == 1;
+            invariant MisplacedRefused: done == 0 || misplaced == 0 || refused == 1;
             invariant TornSaid: done == 0 || refused == 1 || said_torn == torn;
         }
     }
 }
 
-/// A STRICT REPLAY'S CURSOR (the replay plan's §5.2 and its model 2, the
-/// strict arm): what a replay of a harness tape serves the loop it re-runs,
-/// and when it stops serving.
+/// A REPLAY'S CURSOR (the replay plan's §5.2 and its model 2, both arms):
+/// what a replay of a harness tape serves the loop it re-runs, and when it
+/// stops serving.
 ///
-/// A strict replay (`aterm-agent/src/supervise/tape/replay.rs`) holds the
-/// tape's records in order and a cursor into them. The replayed loop asks its
-/// doors one value at a time; the record under the cursor answers exactly the
-/// request it recorded — anything else is the first divergence, after which
-/// nothing more is served, and a request past the tape's end is a divergence
-/// too, never a question put to the live world (there is none: a replay holds
-/// no socket, no clock, no file). An ACT on the tape — a key, a send, a post,
-/// a badge, a signal, a restart — is never skipped: a cursor that resynced
+/// A replay (`aterm-agent/src/supervise/tape/replay.rs`) holds the tape's
+/// records in order and a cursor into them. The replayed loop asks its doors
+/// one value at a time. An ACT on the tape — a key, a send, a post, a badge, a
+/// signal, a restart, a host's act — is never skipped: a cursor that resynced
 /// past one would replay a run in which the act was taken without the loop
-/// having taken it.
+/// having taken it. Nothing is ever answered from the world (a replay holds no
+/// socket, no clock, no file), nothing is served after the first divergence,
+/// and nothing is served from past the act the loop has not yet taken.
+///
+/// * **The strict arm** (`Acts = 0`, `aterm drive replay FILE`): the record
+///   under the cursor answers exactly the request it recorded — anything else
+///   is the first divergence, and a request past the tape's end is one too.
+/// * **The acts arm** (`Acts = 1`, the scenario: a counterfactual replay,
+///   `aterm drive replay FILE --set …|--policy …`, `tape::acts`): the tape is
+///   cut into SEGMENTS by its acts. A control-lane read is served from the
+///   loop's own segment alone — the first unconsumed record that holds it,
+///   the reads skipped on the way dropped, else one the segment already
+///   served, repeated — and an act must be the segment's closing act, which
+///   moves the cursor to the next segment. Neither ever crosses an act: a
+///   control-lane read the segment does not hold is STALE, a divergence
+///   like any other.
+///
+///   What this machine leaves out: two kinds of request the real cursor
+///   answers from BEFORE the cursor, across an act already taken — a derived
+///   probe (`probe.*`, by astream-effects' keyed rule) and housekeeping (the
+///   claim's renewal and release, never compared) — and a wait for what the
+///   recorded run waited for only past the segment's act, which it refuses
+///   as that act skipped. None moves the cursor or reads past it, so none
+///   can break `NoActSkipped` or `NothingFromTheFuture`; the Tier-1 bind
+///   drives control-lane reads and acts only, and `tape::acts`' own tests
+///   hold those paths (a probe from the segment before, a release past the
+///   act never served, a wait past the act refused).
 ///
 /// The tape is four records, `R0 read · R1 act · R2 read · R3 act`
-/// (`Records = 4`; record `p` is an act exactly when `p` is 1 or 3). State: `pos`,
-/// the cursor (records consumed); `diverged`, the first divergence latched;
+/// (`Records = 4`; record `p` is an act exactly when `p` is 1 or 3), two
+/// segments of one read and its act. State: `pos`, the cursor (records
+/// consumed); `diverged`, the first divergence latched (a STALE one too);
 /// `live`, a value answered from the world; `skipped_act`, an act the cursor
 /// passed without the loop asking it; `served_after`, a value served after the
-/// divergence.
+/// divergence; `served_future`, a value served from past the act the loop has
+/// not taken.
 ///
 /// The moves, each one request of the loop's: `AskNext` (the very request the
 /// record under the cursor holds: served, the cursor steps), `AskOtherRead` (a
-/// read the record does not hold), `AskOtherAct` (an act it does not hold),
-/// `AskPastEnd` (any request once the tape is spent) and `AskAfterDivergence`
-/// (any request once the first divergence is latched).
+/// control-lane read the loop's segment does not hold: one held only past its
+/// act, or only in a segment before it), `AskRepeat` (the read the segment already served,
+/// asked again with the act next: strict diverges, acts serves it repeated),
+/// `AskClosingAct` (the segment's act asked with its read unasked: strict
+/// diverges, acts drops the read and takes the act), `AskOtherAct` (an act the
+/// segment does not close with), `AskPastEnd` (any request once the tape is
+/// spent) and `AskAfterDivergence` (any request once the first divergence is
+/// latched).
 ///
 /// Invariants: `NoLiveEffect` — nothing is ever answered from the world;
-/// `NoActSkipped` — no act is passed unasked; `NothingServedAfterDivergence`.
+/// `NoActSkipped` — no act is passed unasked; `NothingServedAfterDivergence`;
+/// `NothingFromTheFuture` — no read is answered from past an act not taken.
 ///
-/// The mutants: `Buggy = 1` answers past the tape's end from the world
-/// (`NoLiveEffect`); `Buggy = 2` resyncs a read it does not hold forward to the
-/// next read that matches, across the act between (`NoActSkipped`) — the
-/// lenient synthesis the plan rejected (its D1-3); `Buggy = 3` keeps serving
-/// after the divergence (`NothingServedAfterDivergence`).
+/// The mutants, in both arms: `Buggy = 1` answers past the tape's end from the
+/// world (`NoLiveEffect`); `Buggy = 2` resyncs a read it does not hold forward
+/// to the next read that matches, across the act between (`NoActSkipped`) —
+/// the lenient synthesis the plan rejected (its D1-3), and in the acts arm a
+/// resync with no segment bound; `Buggy = 3` keeps serving after the
+/// divergence (`NothingServedAfterDivergence`); `Buggy = 4` answers that read
+/// from the record past the act that holds it, the cursor standing where it
+/// was (`NothingFromTheFuture`) — serving the loop its future without skipping
+/// anything.
 ///
 /// Tier-1 (`aterm-agent/src/supervise/tape/conformance_tests.rs`) drives the
 /// real replay core through its replaying door over a real four-record tape
 /// with schedules drawn from `aterm_spec::rng`, each request one step,
-/// projecting the core onto the five variables; the negative control is a
-/// cursor that resyncs across acts, which the bind rejects and the
+/// projecting the core onto the six variables — the strict core against
+/// `Acts = 0`, the acts core against `Acts = 1`; the negative control is a
+/// cursor that resyncs across acts, which both binds reject and the
 /// `Buggy = 2` machine predicts.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -214,20 +280,32 @@ pub fn supervise_replay_cursor_model() -> Model {
     aterm_spec::ty_model! {
         SuperviseReplayCursor {
             const Buggy = 0;
+            const Acts = 0;
+            // The counterfactual replay's arm, which the code also runs.
+            scenario Acts = 1;
             const Records = 4;
             var pos = 0;
             var diverged = 0;
             var live = 0;
             var skipped_act = 0;
             var served_after = 0;
+            var served_future = 0;
 
             action AskNext when (diverged == 0 && pos <= Records - 1) {
                 pos = pos + 1;
             }
             action AskOtherRead when (diverged == 0 && pos <= Records - 1) {
-                skipped_act = if Buggy == 2 && (pos == 0 || pos == 1) { 1 } else { skipped_act };
-                pos = if Buggy == 2 && (pos == 0 || pos == 1) { 3 } else { pos };
-                diverged = if Buggy == 2 && (pos == 0 || pos == 1) { 0 } else { 1 };
+                skipped_act = if Buggy == 2 && pos <= 1 { 1 } else { skipped_act };
+                served_future = if Buggy == 4 && pos <= 1 { 1 } else { served_future };
+                pos = if Buggy == 2 && pos <= 1 { 3 } else { pos };
+                diverged = if (Buggy == 2 || Buggy == 4) && pos <= 1 { 0 } else { 1 };
+            }
+            action AskRepeat when (diverged == 0 && (pos == 1 || pos == 3)) {
+                diverged = if Acts == 1 { 0 } else { 1 };
+            }
+            action AskClosingAct when (diverged == 0 && (pos == 0 || pos == 2)) {
+                pos = if Acts == 1 { pos + 2 } else { pos };
+                diverged = if Acts == 1 { 0 } else { 1 };
             }
             action AskOtherAct when (diverged == 0 && pos <= Records - 1) {
                 diverged = 1;
@@ -243,6 +321,7 @@ pub fn supervise_replay_cursor_model() -> Model {
             invariant NoLiveEffect: live == 0;
             invariant NoActSkipped: skipped_act == 0;
             invariant NothingServedAfterDivergence: served_after == 0;
+            invariant NothingFromTheFuture: served_future == 0;
         }
     }
 }

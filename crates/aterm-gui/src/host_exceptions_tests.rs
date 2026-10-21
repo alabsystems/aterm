@@ -76,6 +76,21 @@ fn roster() -> Vec<Entry> {
         ] {
             all.push(mr::render_unrepaired_entry("s-3e79", &spot, why));
         }
+        for source in [
+            atpkg::image::ImageSource::Store,
+            atpkg::image::ImageSource::Native,
+        ] {
+            all.push(mr::claude_build_drift_entry(
+                "s-3e79b5bde172ad0088ad",
+                &spot,
+                &crate::session_timeline::RegistryDrift {
+                    pgid: 4242,
+                    image: "2.1.304".into(),
+                    source,
+                    reported: "2.1.303".into(),
+                },
+            ));
+        }
     }
     all.push(mr::disk_low_entry(7, 20, &[]));
     // The settings a removed feature left, at a line and with none.
@@ -990,11 +1005,11 @@ fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
         "a fact is not on the glass"
     );
     let full = || HostNote::DiskFull {
-        free: 1 << 20,
-        volume: std::path::PathBuf::from("/Users//x"),
+        free: Some(1 << 20),
         freed: 31 << 30,
         hogs: vec!["$HOME/trust/build 94.0 GiB (x.py bootstrap)".into()],
-        why: "nothing more is safe".into(),
+        cause: crate::message_reporters::DiskFullCause::Spent,
+        thresholds: aterm_agent::harness::disk::Config::default().thresholds(None),
     };
     app.note_harness_host(full());
     app.note_harness_host(full());
@@ -1612,6 +1627,37 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(
         step(&mut app, HostNote::Accounts(AccountsSaid::Refused)),
         std::slice::from_ref(&refused)
+    );
+    assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
+    assert!(step(&mut app, HostNote::Accounts(AccountsSaid::Nothing)).is_empty());
+
+    // THIS MACHINE'S LOGINS UNREAD (r3h-7: `logins.json` torn beside a
+    // roster that admits) take the signed-out line's place under a line of
+    // their own, never the roster's refusal, which named accounts.toml; and
+    // a roster read whole again gives the signed-out line back. NEGATIVE
+    // CONTROL: the roster refused is the refusal's line alone, the logins'
+    // gone.
+    let keys = |lines: Vec<(String, String)>| -> Vec<String> {
+        lines.into_iter().map(|(key, _)| key).collect()
+    };
+    assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
+    assert_eq!(
+        keys(step(
+            &mut app,
+            HostNote::Accounts(AccountsSaid::LoginsUnread)
+        )),
+        [mr::ACCOUNTS_LOGINS_UNREAD_KEY]
+    );
+    assert_eq!(
+        keys(step(&mut app, HostNote::Accounts(AccountsSaid::Refused))),
+        [mr::ACCOUNTS_REFUSED_KEY]
+    );
+    assert_eq!(
+        keys(step(
+            &mut app,
+            HostNote::Accounts(AccountsSaid::LoginsUnread)
+        )),
+        [mr::ACCOUNTS_LOGINS_UNREAD_KEY]
     );
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
     assert!(step(&mut app, HostNote::Accounts(AccountsSaid::Nothing)).is_empty());
@@ -2462,8 +2508,8 @@ fn stuck_login_exception() -> Exception {
 /// (the alert rule: the owner is needed now, aterm cannot settle it, and one
 /// step changes it): a tab's lost login carried to the owner's sign-in is ONE
 /// standing row, `harness.resume-ask.<tab>.<code>`, `Now`-class, in the
-/// owner's four parts — what happened, the one step, what aterm did, what
-/// follows — and NO line of the digest beside it: Settings > Messages lists
+/// owner's four parts — the one step first, then what happened, what aterm
+/// did and what follows — and NO line of the digest beside it: Settings > Messages lists
 /// the ask once (the review's messages-double). Told
 /// again in the same words it is the same row; ANOTHER notice of the tab's
 /// takes its place (one row, the old replaced); its end (`None`: the login
@@ -2521,12 +2567,12 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     assert_eq!(
         row.msg.detail,
         [
-            e.why.clone(),
             e.action.clone(),
+            e.why.clone(),
             n.did.clone(),
             n.expect.clone()
         ],
-        "what happened, the step, what aterm did, what follows"
+        "the step, what happened, what aterm did, what follows"
     );
     assert!(
         app.messages.digest().is_empty(),
@@ -2612,7 +2658,7 @@ fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_
         Exception::of_notice(
             text,
             Some("main"),
-            Some(notice::WHY_DRAFT),
+            text.whys.first().copied(),
             "the agent working",
         )
     };
@@ -2642,14 +2688,15 @@ fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_
             .map(|row| row.msg.key.clone().unwrap_or_default())
             .collect()
     };
-    let step_of = |text: &notice::NoticeText| text.fill(Some("main"), Some(notice::WHY_DRAFT)).todo;
+    let step_of =
+        |text: &notice::NoticeText| text.fill(Some("main"), text.whys.first().copied()).todo;
 
     told(&mut app, "s-1", Some(notice(&notice::LOGIN_SIGN_IN)));
     told(&mut app, "s-1", Some(notice(&notice::LOGIN_CHOOSE)));
     let row = rows(&app, "s-1");
     assert_eq!(row.len(), 1, "{row:?}");
     assert_eq!(
-        row[0].detail[1],
+        row[0].detail[0],
         step_of(&notice::LOGIN_CHOOSE),
         "its latest words"
     );
@@ -2681,15 +2728,16 @@ fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_
     let row = rows(&app, "s-1");
     assert_eq!(row.len(), 1, "{row:?}");
     assert_eq!(row[0].state, "live");
+    let cancelled_words = notice::LOGIN_CANCELLED.fill(Some("main"), None);
     assert_eq!(
         row[0].detail,
         [
-            notice::LOGIN_CANCELLED.happened,
-            notice::LOGIN_CANCELLED.todo,
-            notice::LOGIN_CANCELLED.did,
-            notice::LOGIN_CANCELLED.expect
+            cancelled_words.todo,
+            cancelled_words.happened,
+            cancelled_words.did,
+            cancelled_words.expect
         ],
-        "what happened, the step, what aterm did, what follows"
+        "the step, what happened, what aterm did, what follows"
     );
     let cancelled = row[0].title.clone();
     // The agent works again, then the loop says the login is back: fixed.
@@ -2742,7 +2790,7 @@ fn tell_notice(app: &mut App, sid: &str, text: Option<&notice::NoticeText>) {
             Exception::of_notice(
                 text,
                 Some("main"),
-                Some(notice::WHY_DRAFT),
+                text.whys.first().copied(),
                 "the agent working",
             )
         }),
@@ -2879,6 +2927,97 @@ fn a_loss_with_no_word_for_its_span_is_not_swallowed_by_the_next() {
     let rows = notice_rows(&app, "s-2");
     assert_eq!(rows.len(), 1, "one story: {rows:?}");
     assert_ne!(rows[0], first[0], "in its latest words");
+}
+
+/// ANOTHER EXCEPTION OF THE TAB'S IS NO WORD OF ITS LOSS: a stall told a day
+/// after a loss whose end no loop told (its ask long withdrawn) does not keep
+/// that loss's story open, so the tab's next loss is a row of its own beside
+/// it, as with no tell at all. NEGATIVE CONTROL: the same stall told while
+/// the loss's ask still stood ENDS that ask, which is the story's word: the
+/// next notice tells it on, one row.
+#[test]
+fn another_exception_of_the_tab_keeps_no_loss_open() {
+    use crate::exceptions_host::NOTICE_STORY_SPAN;
+    let span = u64::try_from(NOTICE_STORY_SPAN.as_millis()).unwrap();
+    for ask_stood in [false, true] {
+        let mut app = App::headless_for_test();
+        tell_notice(&mut app, "s-1", Some(&notice::RENEWED_DRAFT));
+        if !ask_stood {
+            tell_notice(&mut app, "s-1", None);
+        }
+        let story = app.resume_stories.get_mut("s-1").expect("its story");
+        story.last = story.last.saturating_sub(span);
+        app.note_harness_host(HostNote::ResumeException {
+            sid: "s-1".to_string(),
+            agent: Program::Claude,
+            standing: Some(Exception::stalled()),
+        });
+        tell_notice(&mut app, "s-1", Some(&notice::LOGIN_SIGN_IN));
+        let rows = notice_rows(&app, "s-1");
+        if ask_stood {
+            assert_eq!(rows.len(), 1, "the ask's end was its word: {rows:?}");
+        } else {
+            assert_eq!(rows.len(), 2, "a stall is no word of the loss: {rows:?}");
+        }
+    }
+}
+
+/// A LOSS AN EARLIER PROCESS CARRIED HERE CLOSES FIXED WHEN THIS ONE SEES THE
+/// LOGIN BACK: a seamless update carries a tab's standing notice, and the
+/// successor's own loop tells the same notice in the same words (a duplicate
+/// of the carried row, so the story is told in it), then its end, then the
+/// login back: the carried row's record reads `✓` in the notice's fix words.
+/// NEGATIVE CONTROL: with no login back it stays withdrawn, `⚠`.
+#[test]
+fn a_carried_notice_told_again_closes_fixed_when_the_login_is_back() {
+    for back in [true, false] {
+        let mut parent = App::headless_for_test();
+        tell_notice(&mut parent, "s-1", Some(&notice::LOGIN_SIGN_IN));
+        let _ = parent
+            .messages
+            .settle(Instant::now() + aterm_messages::PROGRESS_GRACE, true);
+        let carry = parent.messages.carried();
+        let mut app = App::headless_for_test();
+        app.messages.seed_carried(
+            &carry,
+            crate::messages_host::wall_stamp_now(),
+            Instant::now(),
+        );
+        let key = mr::notice_ask_key("s-1", Some("si"));
+        let carried = app.messages.live_by_key(&key).expect("carried").id;
+        tell_notice(&mut app, "s-1", Some(&notice::LOGIN_SIGN_IN));
+        assert_eq!(
+            app.messages.live_by_key(&key).map(|row| row.id),
+            Some(carried),
+            "premise: the same notice is the carried row"
+        );
+        tell_notice(&mut app, "s-1", None);
+        if back {
+            app.note_harness_host(HostNote::LoginBack {
+                sid: "s-1".to_string(),
+            });
+        }
+        let rec = app.messages.log().get(carried).expect("its record");
+        if back {
+            assert_eq!(
+                rec.retired(),
+                Some(&aterm_messages::Retired::Resolved(
+                    aterm_messages::Outcome::Ok
+                )),
+                "{rec:?}"
+            );
+            assert!(rec.title.starts_with(notice::BACK), "{:?}", rec.title);
+        } else {
+            assert_eq!(
+                (rec.retired(), rec.severity),
+                (
+                    Some(&aterm_messages::Retired::Withdrawn),
+                    aterm_messages::Severity::Warn
+                ),
+                "its end alone claims no fix"
+            );
+        }
+    }
 }
 
 /// A LINE AN EARLIER PROCESS LEFT OPEN for a resume exception no loop of this
@@ -3120,6 +3259,61 @@ fn a_stall_on_an_agents_own_work_names_that_agent_and_reads_no_title() {
         .find(|e| e.key == "harness.resume.s-3.stalled")
         .expect("the tab's line");
     assert!(line.title.starts_with("Muse Code"), "{}", line.title);
+}
+
+/// A STALL ON A BACKGROUND CALL THAT MADE NO PROGRESS speaks of that call (the
+/// hung-call design's R1: the canary said "a screen this build does not
+/// recognise" over a test asleep on its own mutex for 26 h). The second
+/// rung's record, `StallSeen::NoProgress`, names the call's pid and quiet age
+/// under the stall's one key and claims no unread screen; the third rung's
+/// line, `Exception::no_progress`, passes the digest's door (one action, a
+/// reason that leans on no wait) with the call's fact as its why.
+#[test]
+fn a_stall_on_a_call_that_made_no_progress_names_its_pid_and_passes_the_door() {
+    use aterm_agent::supervise::BackgroundCall;
+    let mut app = App::headless_for_test();
+    app.note_harness_host(HostNote::ResumeUnread {
+        sid: "s-1".to_string(),
+        agent: Program::Claude,
+        stall: Some(StallSeen::NoProgress {
+            minutes: 31,
+            pid: 27098,
+        }),
+    });
+    let r = app
+        .messages
+        .log()
+        .records()
+        .find(|r| r.key.as_deref() == Some("harness.host.stalled.s-1"))
+        .expect("the record");
+    let detail = r.detail.join(" ");
+    assert!(r.title.starts_with("Claude has stalled"), "{}", r.title);
+    assert!(
+        detail.contains("pid 27098") && detail.contains("31 min"),
+        "{detail}"
+    );
+    let call = BackgroundCall {
+        pid: 27098,
+        pgid: 27090,
+        exe: "aterm_gui-e0964a".to_string(),
+        task: Some("bplle5dxj".to_string()),
+        quiet_ms: 61 * 60_000,
+        wait: None,
+    };
+    let spot = mr::UpgradeSpot {
+        place: "in tab 2".to_string(),
+        nav: None,
+    };
+    let entries = mr::resume_exceptions(&[(
+        "s-2".to_string(),
+        Exception::no_progress(&call),
+        Program::Claude,
+        spot,
+    )]);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key(), "harness.resume.s-2.stalled");
+    let line = entries[0].message().expect("passes the door");
+    assert_eq!(line.title, "Claude in tab 2 has stalled");
 }
 
 /// A PALETTE SET THE OWNER'S CONFIG REFUSED is one digest line for every tab,

@@ -39,8 +39,17 @@ pub use policy::{ADMITTED_LICENCES, admitted};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackTheme {
     /// The theme's id: its file stem in the themes folder, what
-    /// `theme = "<id>"` names. The collection's own name for it.
+    /// `theme = "<id>"` names and `aterm theme install` takes. Kept from
+    /// release to release: a config, a dotfile or an installed file names
+    /// it, so a re-spelling goes in [`Self::name`] and a theme that leaves
+    /// the pack is [`withdrawn`].
     pub id: &'static str,
+    /// What the chooser shows (the file's `name =`): the id, or the
+    /// collection's name spelled as aterm's own themes spell its family
+    /// (`Tokyo Night Storm`, beside the built-in Tokyo Night) and never
+    /// abbreviated (`Everforest Dark Medium`), so one family reads as one in
+    /// the chooser and its filter.
+    pub name: &'static str,
     /// The theme file the pack installs, byte for byte.
     pub text: &'static str,
     /// The file it was converted from: `upstream/<upstream>` in the pack,
@@ -84,12 +93,31 @@ pub fn themes() -> &'static [PackTheme] {
     THEMES
 }
 
-/// The pack theme `id` names, ignoring ASCII case (as the catalog does).
+/// The pack theme `id` names, ignoring ASCII case (as the catalog does):
+/// by its id, else by the name the chooser shows it under (no id or name
+/// answers for two themes; the build refuses that).
 #[must_use]
 #[allow(clippy::manual_find)]
 pub fn find(id: &str) -> Option<&'static PackTheme> {
     for theme in THEMES {
         if theme.id.eq_ignore_ascii_case(id) {
+            return Some(theme);
+        }
+    }
+    for theme in THEMES {
+        if theme.name.eq_ignore_ascii_case(id) {
+            return Some(theme);
+        }
+    }
+    None
+}
+
+/// For an id a release shipped that has left the pack, the theme standing
+/// for it now (a pack id or a built-in), ignoring ASCII case.
+#[must_use]
+pub fn withdrawn(id: &str) -> Option<&'static str> {
+    for &(gone, theme) in WITHDRAWN {
+        if gone.eq_ignore_ascii_case(id) {
             return Some(theme);
         }
     }
@@ -258,7 +286,7 @@ pub fn derive(
         Ok(r) => r,
         Err(error) => return Err(format!("{}: {error}", theme.upstream)),
     };
-    report.scheme.name = theme.id.to_string();
+    report.scheme.name = theme.name.to_string();
     report.author = Some(theme.author.to_string());
     report.description = Some(format!(
         "{} from {} ({}), via iTerm2-Color-Schemes",
@@ -368,7 +396,9 @@ pub fn carries_notice(text: &str, spdx: &str, licence: &str) -> bool {
 pub enum PackState {
     /// No `<id>.conf`.
     Absent,
-    /// `<id>.conf` is the pack's file, byte for byte.
+    /// `<id>.conf` is the pack's file, byte for byte, or the copy a release
+    /// before the pack re-spelled [`PackTheme::name`] wrote, which differs
+    /// only in its `name =` line saying the theme's id.
     Installed,
     /// `<id>.conf` is there but differs (edited, or another theme by that
     /// name), or is not a regular file.
@@ -381,18 +411,49 @@ pub enum PackState {
 /// Where `theme` stands in the themes folder `dir`.
 #[must_use]
 pub fn state_in(dir: &Path, theme: &PackTheme) -> PackState {
+    standing(dir, theme).0
+}
+
+/// [`state_in`], and whether `<id>.conf` is the pack's file byte for byte.
+fn standing(dir: &Path, theme: &PackTheme) -> (PackState, bool) {
     if let Some(other) = scheme_install::case_variant(dir, theme.id) {
-        return PackState::CaseVariant(other);
+        return (PackState::CaseVariant(other), false);
     }
     let path = dir.join(format!("{}.conf", theme.id));
     match std::fs::symlink_metadata(&path) {
-        Err(_) => PackState::Absent,
-        Ok(meta) if !meta.is_file() => PackState::Modified,
+        Err(_) => (PackState::Absent, false),
+        Ok(meta) if !meta.is_file() => (PackState::Modified, false),
         Ok(_) => match scheme_install::read_bounded(&path) {
-            Ok(bytes) if bytes == theme.text.as_bytes() => PackState::Installed,
-            _ => PackState::Modified,
+            Ok(bytes) if bytes == theme.text.as_bytes() => (PackState::Installed, true),
+            Ok(bytes) if earlier_copy(&bytes, theme) => (PackState::Installed, false),
+            _ => (PackState::Modified, false),
         },
     }
+}
+
+/// Whether `bytes` are `theme`'s file byte for byte but for its `name =`
+/// line, which says `name = <id>`: the copy an earlier release installed
+/// before the pack re-spelled [`PackTheme::name`] (0.106 and 0.107 wrote
+/// every pack theme's name line as its id, so their `TokyoNight Storm.conf`
+/// says `name = TokyoNight Storm`). Any other difference, another name or a
+/// comment too, is an edit.
+fn earlier_copy(bytes: &[u8], theme: &PackTheme) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if theme.name == theme.id {
+        return false;
+    }
+    let shown = format!("\nname = {}\n", theme.name);
+    let Some(at) = theme.text.find(&shown) else {
+        return false;
+    };
+    // The pack's text through the newline before its name line, and from
+    // the newline after it.
+    let (head, tail) = (&theme.text[..=at], &theme.text[at + shown.len() - 1..]);
+    text.strip_prefix(head)
+        .and_then(|rest| rest.strip_suffix(tail))
+        .is_some_and(|line| line == format!("name = {}", theme.id))
 }
 
 /// What [`install`] did.
@@ -415,7 +476,8 @@ impl PartialEq for PackInstall {
 
 /// Copy `theme`'s file into the themes folder `dir` (`None`: none could be
 /// found) as `<id>.conf`. An existing different file is kept unless
-/// `replace`.
+/// `replace`; an earlier copy of the pack's file counts as installed, and
+/// `replace` brings it up to the pack's bytes.
 ///
 /// # Errors
 /// [`InstallError::Failed`] with no folder, a same-name file in another
@@ -448,14 +510,16 @@ pub fn install(
         }
     }
     let dest = dir.join(format!("{}.conf", theme.id));
-    match state_in(dir, theme) {
-        PackState::CaseVariant(other) => {
+    match standing(dir, theme) {
+        (PackState::CaseVariant(other), _) => {
             return Err(InstallError::Failed(
                 scheme_install::case_collision_message(&other, theme.id),
             ));
         }
-        PackState::Installed => return Ok(PackInstall::Unchanged(dest)),
-        PackState::Absent | PackState::Modified => {}
+        (PackState::Installed, exact) if exact || !replace => {
+            return Ok(PackInstall::Unchanged(dest));
+        }
+        (PackState::Installed | PackState::Absent | PackState::Modified, _) => {}
     }
     if scheme::parse_theme_str(theme.text).is_err() {
         return Err(InstallError::Failed(format!(

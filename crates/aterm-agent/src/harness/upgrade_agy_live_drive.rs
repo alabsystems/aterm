@@ -321,23 +321,8 @@ fn summary_query(conversation: &str) -> String {
     )
 }
 
-/// `db` as an IMMUTABLE file URI (`file:<path>?immutable=1`), every byte but
-/// the path's plain ones percent-encoded: SQLite reads it with no lock, no
-/// `-shm` and no `-wal`, and writes nothing.
-fn immutable_uri(db: &Path) -> String {
-    let mut uri = String::from("file:");
-    for b in db.to_string_lossy().bytes() {
-        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
-            uri.push(char::from(b));
-        } else {
-            uri.push_str(&format!("%{b:02X}"));
-        }
-    }
-    uri.push_str("?immutable=1");
-    uri
-}
-
-/// One run of the reader over `target` (a path, or an immutable URI):
+/// One run of the reader over `target` (a private copy's path, or an
+/// immutable URI: [`aterm_uds::foreign_db::read`]):
 /// `-readonly`, no `~/.sqliterc` (`-init /dev/null`), `-safe` (no command that
 /// touches another file), `-nofollow`, one `|`-separated line per row, no
 /// header.
@@ -361,61 +346,32 @@ fn run_reader(target: &str, sql: &str) -> Option<String> {
     bounded_output(Path::new(SQLITE3), &args, SUMMARY_WAIT, 1 << 16)
 }
 
-/// What identifies a file's content: its device, inode, length and
-/// modification time.
-fn identity(p: &Path) -> Option<(u64, u64, u64, std::time::SystemTime)> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let m = std::fs::metadata(p).ok()?;
-        Some((m.dev(), m.ino(), m.len(), m.modified().ok()?))
-    }
-    #[cfg(not(unix))]
-    {
-        let m = std::fs::metadata(p).ok()?;
-        Some((0, 0, m.len(), m.modified().ok()?))
-    }
-}
-
-/// THE CONVERSATION'S SUMMARY ROWS, READ ONLY FROM THE LIVE DATABASE
-/// (`<config>/conversation_summaries.db`, measured): while agy holds it open
-/// (its `-wal` and `-shm` beside it) by SQLite's own read-only open, which
-/// takes a reader's mark and never checkpoints; while agy has it closed —
-/// some 30 s after its last write it closes it, deleting both, and a
-/// read-only open then cannot start (`unable to open database file`,
-/// measured) — as an IMMUTABLE file, trusted only where its identity is the
-/// same after the read as before and no `-wal` appeared meanwhile (agy's
-/// next write, which goes to a new `-wal` and leaves the file as it was).
-/// Twice at most (a close or an open between the look at the files and the
-/// read); `Err` where neither read holds — fail closed.
+/// THE CONVERSATION'S SUMMARY ROWS, READ FROM THE LIVE DATABASE WITH NO LOCK
+/// ON IT (`<config>/conversation_summaries.db`, [`aterm_uds::foreign_db::read`]):
+/// while agy holds it open (its `-wal` beside it), from a private copy of the
+/// file and its `-wal`; while agy has it closed — some 30 s after its last
+/// write it closes it, deleting both — as an immutable file. Never through
+/// SQLite's own open of the live file, which joins agy's locking: a reader
+/// that finds the WAL index unbuilt (its `-shm` just made by agy's open) takes
+/// the index's write lock to build it, and agy, whose busy timeout is 5 s,
+/// logs `summary store: sync upsert failed: ... database is locked` past it
+/// and drops that write for good (measured, 2026-10-20). An answer is kept
+/// only where the files are the same after the read as before; twice at most
+/// (a write, a close or an open between the look at the files and the read);
+/// `Err` where neither read holds — fail closed.
 pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String, ()> {
     if !ag::is_conversation_uuid(conversation) {
         return Err(());
     }
     let db = config.join(SUMMARIES);
-    let side = |ext: &str| config.join(format!("{SUMMARIES}-{ext}"));
     let sql = summary_query(conversation);
-    for _ in 0..2 {
-        match (side("wal").exists(), side("shm").exists()) {
-            (true, true) => {
-                if let Some(out) = run_reader(&db.to_string_lossy(), &sql) {
-                    return Ok(out);
-                }
-            }
-            (false, false) => {
-                let before = identity(&db);
-                let out = run_reader(&immutable_uri(&db), &sql);
-                let same = before.is_some()
-                    && identity(&db) == before
-                    && !side("wal").exists()
-                    && !side("shm").exists();
-                if let (Some(out), true) = (out, same) {
-                    return Ok(out);
-                }
-            }
-            _ => {}
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        if let Ok(out) = aterm_uds::foreign_db::read(&db, |target| run_reader(target, &sql)) {
+            return Ok(out);
+        }
     }
     Err(())
 }

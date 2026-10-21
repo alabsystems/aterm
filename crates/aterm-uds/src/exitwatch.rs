@@ -35,8 +35,9 @@ pub struct ExitWatch {
     seen: std::sync::OnceLock<i32>,
 }
 
+// The kqueue FFI, shared with `procwatch`'s exec edges.
 #[cfg(target_vendor = "apple")]
-mod kq {
+pub(crate) mod kq {
     /// `struct kevent` (sys/event.h), 32 bytes on both Apple ABIs.
     #[repr(C)]
     pub struct Kevent {

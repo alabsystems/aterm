@@ -642,3 +642,127 @@ fn a_host_the_tape_never_answered_diverges_at_its_first_call() {
     );
     assert!(report.requests.is_empty(), "nothing asked past it");
 }
+
+/// THE APPROVAL POLICY'S HOME IS A VALUE, AND ITS LOOKS THERE ARE THE TAPE'S
+/// (`tape::header`'s module docs). A run approves a Read of a file under the
+/// owner's home, drawn as an absolute path and proven by a `~/proj` trust
+/// root, after looking at the disk there — where the path's links lead and
+/// whether a folder on its way holds a hidden twin — each look taped with
+/// its path under the header's `home` root. The home is then removed and the
+/// tape replayed from its remapped header: REPRODUCED, so no look reached the
+/// machine (a live one would find no file there and hand the box over).
+///
+/// The negative control is the remap the header does not make: the same tape
+/// with the policy's home moved under a replay's base, as each file's root
+/// is, DIVERGES at the decision. The `~/proj` root then names a directory the
+/// screen's path is not under, so the Read is no longer proven: the home is
+/// compared with what the screen draws, and a replay must judge the box by
+/// the recorded one.
+#[cfg(unix)]
+#[test]
+fn the_policys_home_is_a_value_and_its_looks_there_are_the_tapes() {
+    let dir = crate::supervise::ScratchDir::new("replay", "home");
+    // Every link resolved, as the probe's resolver sees it (macOS's `/tmp` is
+    // `/private/tmp`): a path the live looks prove.
+    let home = crate::supervise::test_canonical(&dir).join("owner");
+    let file = home.join("proj").join("notes.md");
+    std::fs::create_dir_all(home.join("proj")).expect("proj");
+    std::fs::write(&file, "notes\n").expect("notes");
+    let shown = file.to_str().expect("a UTF-8 scratch path").to_string();
+    let read: Vec<String> = read_box()
+        .into_iter()
+        .map(|r| {
+            if r == "   ~/.ssh/config" {
+                format!("   {shown}")
+            } else {
+                r
+            }
+        })
+        .collect();
+    let mut m = fenced(vec![busy_screen(), read, busy_screen(), idle_screen()]);
+    m.vanish_after = Some(3);
+    let mut opts = auto(30);
+    opts.policy.set("approve", "safe").expect("approve");
+    opts.policy
+        .set("trust_roots", "~/proj")
+        .expect("trust_roots");
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_env(ApprovalEnv {
+            home: Some(home.clone()),
+            uid: 502,
+            tmpdir: None,
+            worker: WorkerSource::Fixed(Ok(crate::supervise::policy::WorkerEnv::hermetic(None))),
+        });
+    });
+    assert!(
+        run.lines
+            .iter()
+            .any(|l| l.starts_with("APPROVED ") && l.ends_with(&shown)),
+        "the live looks prove the Read: {:?}",
+        run.lines
+    );
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    // Each look is asked by the path under the home's root.
+    for door in [doors::PROBE_REAL_COMPONENTS, doors::PROBE_HIDDEN_TWIN] {
+        let asked: Vec<&[u8]> = items
+            .iter()
+            .filter_map(|i| match i.record() {
+                Some(EffectRecord::Exchange {
+                    door: d, request, ..
+                }) if d == door => Some(request.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(!asked.is_empty(), "{door} was looked at");
+        assert!(
+            asked.iter().all(|r| *r == b"@home/proj/notes.md"),
+            "{door}: {:?}",
+            asked
+                .iter()
+                .map(|r| String::from_utf8_lossy(r))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    drop(dir);
+    assert!(!home.exists(), "the home is gone before the replay");
+    let report = replayed(&header, &items);
+    assert_eq!(
+        report.verdict,
+        Verdict::Reproduced,
+        "replayed from the tape alone:\n{}",
+        report.render()
+    );
+
+    // The negative control: the policy's home where a remap puts a root.
+    let base = Path::new("/nonexistent/aterm-replay-home/absent");
+    let moved = crate::supervise::tape::header::Header::decode_remapped(&header, base)
+        .expect("decodes remapped")
+        .roots
+        .iter()
+        .find(|(id, _)| *id == "home")
+        .map(|(_, dir)| dir.to_path_buf())
+        .expect("a home root");
+    let mut section = String::new();
+    let remapped_home: String = header
+        .lines()
+        .map(|l| {
+            if l.starts_with('[') {
+                section = l.to_string();
+            }
+            if section == "[env]" && l.starts_with("home=") {
+                format!("home={}\n", moved.display())
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    assert_ne!(remapped_home, header);
+    let report = replayed(&remapped_home, &items);
+    // The moved home proves nothing lexically, so the replay decides with no
+    // look where the recorded run looked first.
+    let d = diverged(&report);
+    assert_eq!(d.class, Class::Decision, "{d:?}");
+    assert_eq!(d.door.as_deref(), Some(doors::DECIDE_APPROVAL), "{d:?}");
+}

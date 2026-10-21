@@ -234,7 +234,23 @@ pub fn brewfile_dump(prefix: &Prefix) -> String {
         out.push_str(&format!("tap \"{}\"\n", t.name()));
     }
     for i in prefix.installed(Kind::Formula) {
-        out.push_str(&format!("brew \"{}\"\n", i.name));
+        let keg = prefix.keg(&i.name, &i.version);
+        // Like brew, dump only what was installed on request:
+        // dependencies ride along implicitly on reinstall, and
+        // dumping them would promote them to on-request (changing
+        // leaves/autoremove semantics on round-trip). A receipt
+        // that does not say "false" counts as requested — losing a
+        // package from the dump is worse than keeping one extra.
+        if super::prefix::receipt_word(&keg, "installed_on_request").as_deref() == Some("false") {
+            continue;
+        }
+        // Tap formulae keep their qualified identity so the
+        // round-trip reinstalls from the same tap, not core.
+        let shown = match super::prefix::receipt_word(&keg, "full_name") {
+            Some(full) if full.contains('/') => full,
+            _ => i.name.clone(),
+        };
+        out.push_str(&format!("brew \"{shown}\"\n"));
     }
     for i in prefix.installed(Kind::Cask) {
         out.push_str(&format!("cask \"{}\"\n", i.name));
@@ -304,6 +320,42 @@ pub fn read_brewfile(path: Option<&Path>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn dump_keeps_on_request_and_qualified_names_only() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        let mk = |name: &str, version: &str, fields: &[(&str, &str)]| {
+            let dir = p.keg(name, version);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut all: Vec<(&str, &str)> = vec![
+                ("installed_by", "abrew"),
+                ("name", name),
+                ("version", version),
+            ];
+            all.extend_from_slice(fields);
+            p.write_receipt(&dir, &all).unwrap();
+        };
+        mk("wget", "1.25", &[("installed_on_request", "true")]);
+        mk("dep", "2.0", &[("installed_on_request", "false")]);
+        mk(
+            "taptool",
+            "1.0",
+            &[
+                ("installed_on_request", "true"),
+                ("full_name", "someone/tap/taptool"),
+            ],
+        );
+        // A legacy receipt without the field still dumps.
+        mk("legacy", "0.9", &[]);
+        let text = brewfile_dump(&p);
+        assert!(text.contains("brew \"wget\"\n"), "{text}");
+        assert!(text.contains("brew \"someone/tap/taptool\"\n"), "{text}");
+        assert!(text.contains("brew \"legacy\"\n"), "{text}");
+        assert!(!text.contains("dep"), "dependency leaked into dump: {text}");
+    }
 
     #[test]
     fn brewfile_parse() {

@@ -1,0 +1,38 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_turn_end_closes_the_turn_and_then_amends_its_numbers (S2, A3):
+# the vendor turn's end closes the turn no screen step holds, out=done
+# with its rollup; the worst rollup (every counter but lost=) keeps tools=
+# on the close, and vdur_ms tok_in tok_out come by an amend after it.
+bind 0
+see busy
+tx prompt v1
+expect amend t1 turn vref=v1
+pass 10
+see prompt bash:not-read-only
+pass 10
+see busy
+tx tool c0
+tx result c0
+pass 10
+see prompt question
+pass 10
+see busy
+tx tool c1
+tx result c1 error
+pass 10
+see wall:overloaded
+pass 10
+see busy
+tx tool c2
+tx result c2
+pass 10
+see wall:unresponsive
+pass 10
+see busy
+tx tool c3
+tx result c3
+turn-mail
+pass 100
+tx end
+expect close t1 turn out=done steps=8 appr=1 qs=1 walls=1 stalls=1 mail=1 errs=1 tools=shell:4 src=transcript conf=exact
+expect amend t1 turn vdur_ms=4200 tok_in=900 tok_out=120

@@ -165,28 +165,37 @@ fn run_exports_what_the_build_declares_over_a_shim_laid_plain() {
     let fx = Fixture::new("drifted");
     fx.install_claude(&[]);
     fx.declare("DISABLE_AUTOUPDATER=1");
-    let control = fx.run(&fx.shim(), &["--version"]);
-    // The drift this names is the missing export; the shim's own yolo default
-    // (`crate::yolo`) leads its argv as on any managed launch.
-    assert_eq!(
-        fake_line(&control),
-        "fake: [unset] --dangerously-skip-permissions --version",
-        "control: the drifted shim"
-    );
-    let out = fx.atpkg_run(&["--version"]);
-    // Yolo by default on the managed name (`crate::yolo`): the run lane injects
-    // the posture the twin's block would, so the flags lead the fake's argv.
-    assert_eq!(
-        fake_line(&out),
-        "fake: [1] --dangerously-skip-permissions --version",
-        "{}",
-        describe(&out)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("aterm: yolo (default): running"),
-        "{}",
-        describe(&out)
-    );
+    // The missing export is independent of posture. Unknown leading option
+    // arity (including --version) stays as typed; a known print launch gets
+    // the managed default. Both paths still honor the build's declaration.
+    for (args, forwarded, defaulted) in [
+        (&["--version"][..], "--version", false),
+        (
+            &["-p", "probe"][..],
+            "--dangerously-skip-permissions -p probe",
+            true,
+        ),
+    ] {
+        let control = fx.run(&fx.shim(), args);
+        assert_eq!(
+            fake_line(&control),
+            format!("fake: [unset] {forwarded}"),
+            "control: the drifted shim"
+        );
+        let out = fx.atpkg_run(args);
+        assert_eq!(
+            fake_line(&out),
+            format!("fake: [1] {forwarded}"),
+            "{}",
+            describe(&out)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).contains("aterm: yolo (default): running"),
+            defaulted,
+            "{}",
+            describe(&out)
+        );
+    }
 }
 
 /// THE TWIN'S SELF-UPDATE BLOCK: `aterm claude install stable` is answered by the

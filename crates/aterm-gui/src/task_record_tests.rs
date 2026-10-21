@@ -92,7 +92,7 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
     let path = tasks().join(format!("{SID}-1.txt"));
     let encoded = crate::control::pct_encode(&path.to_string_lossy());
     let mark = parse(&format!(
-        " done from={SID} why=marker exit=0 result_bytes=12 result_path={encoded}"
+        " done from={SID} why=landed exit=0 result_bytes=12 result_path={encoded}"
     ))
     .expect("every fact");
     assert_eq!(
@@ -100,13 +100,22 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
         TaskMark {
             state: TaskState::Done,
             from: Some(SID.to_string()),
-            why: Some("marker"),
+            why: Some("landed"),
             exit: Some(0),
             result_bytes: 12,
             result_path: Some(path),
         }
     );
     assert_eq!(parse("stalled").unwrap(), TaskMark::new(TaskState::Stalled));
+    // An older build's done words still parse (a record a seamless update or
+    // a rollback carried); no harness of this build writes them.
+    for old in ["marker", "done-check"] {
+        assert_eq!(
+            parse(&format!("done why={old}")).unwrap().why,
+            Some(old),
+            "{old}"
+        );
+    }
     // A path with a space travels pct-encoded.
     let spaced = tasks().join("a b.txt");
     assert_eq!(
@@ -123,7 +132,7 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
         "",
         "finished",
         "done extra",
-        "done why=marker why=marker",
+        "done why=landed why=landed",
         "done exit=x",
         "done result_bytes=-1",
         "done color=red",
@@ -138,7 +147,7 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
     assert!(
         parse("done why=because")
             .unwrap_err()
-            .contains("why= is one of marker|done-check|exit|shell|startup|held|turn")
+            .contains("why= is one of landed|marker|done-check|exit|shell|startup|held|turn")
     );
     // NEGATIVE CONTROLS for the path: outside the dir, the dir itself, a
     // climb out, a relative path, a control character, no state dir at all.
@@ -214,7 +223,7 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
     assert!(!moved && kept.from == SID);
 
     let mut done = TaskMark::new(TaskState::Done);
-    done.why = Some("marker");
+    done.why = Some("landed");
     done.result_bytes = 42;
     let (finished, moved) = done.apply(Some(&first), false, t0 + Duration::from_secs(2), 3_000);
     assert!(moved);
@@ -338,7 +347,7 @@ fn the_reply_event_and_status_spellings() {
         rev: 3,
         state: TaskState::Done,
         from: "ctl".into(),
-        why: Some("done-check"),
+        why: Some("landed"),
         exit: None,
         result_bytes: 120,
         result_path: None,
@@ -352,13 +361,10 @@ fn the_reply_event_and_status_spellings() {
         fields.starts_with("rev=3 state=done from=ctl since_ms="),
         "{fields}"
     );
-    assert!(
-        fields.ends_with(" result_bytes=120 why=done-check"),
-        "{fields}"
-    );
+    assert!(fields.ends_with(" result_bytes=120 why=landed"), "{fields}");
     assert_eq!(
         record.event_payload(),
-        "rev=3 state=done attention=0 why=done-check"
+        "rev=3 state=done attention=0 why=landed"
     );
     assert_eq!(status_tokens(Some(&record)), "task_state=done task_rev=3");
     assert_eq!(status_tokens(None), "task_state=- task_rev=0");
@@ -470,7 +476,6 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
 
     let handle = crate::session_store::test_handle(4);
-    let subscribers = crate::subscribe::new_registry();
     let owner = crate::harness_host::ATTENTION_OWNER;
     // No task: the supervisor's attention gives the session no record.
     write_attention_owned(
@@ -495,24 +500,14 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
             .unwrap()
             .since(None)
             .filter(|e| e.kind == "task-change")
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect()
     };
-    let (record, moved) = mark_session_task(
-        &handle.ctx,
-        4,
-        &TaskMark::new(TaskState::Working),
-        &subscribers,
-    )
-    .expect("unfenced");
+    let (record, moved) =
+        mark_session_task(&handle.ctx, 4, &TaskMark::new(TaskState::Working)).expect("unfenced");
     assert!(moved && record.rev == 1 && !record.attention);
-    let (_, moved) = mark_session_task(
-        &handle.ctx,
-        4,
-        &TaskMark::new(TaskState::Working),
-        &subscribers,
-    )
-    .expect("unfenced");
+    let (_, moved) =
+        mark_session_task(&handle.ctx, 4, &TaskMark::new(TaskState::Working)).expect("unfenced");
     assert!(!moved);
     assert_eq!(rows(&handle.ctx), ["rev=1 state=working attention=0"]);
     assert_eq!(
@@ -564,14 +559,59 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
         aterm_slog::Actor::Harness,
     )
     .unwrap();
-    let (record, _) = mark_session_task(
-        &handle.ctx,
-        4,
-        &TaskMark::new(TaskState::Stalled),
-        &subscribers,
-    )
-    .expect("unfenced");
+    let (record, _) =
+        mark_session_task(&handle.ctx, 4, &TaskMark::new(TaskState::Stalled)).expect("unfenced");
     assert_eq!((record.rev, record.attention), (5, true));
+}
+
+/// A WORKER'S NEEDS YOU ENTRY IS ITS TASK RECORD'S NEWS (FOREVER LAND: "be
+/// LOUDER ABOUT IT ... but NEVER let that block you"): an `owner=needs` entry
+/// raises a tasked session's attention and moves its rev as the supervisor's
+/// own does, its clear lowers it, and the flag stands while either entry
+/// does. NEGATIVE CONTROL: a person's own entry moves nothing.
+#[test]
+fn a_workers_needs_you_entry_raises_the_task_records_attention() {
+    use crate::session_timeline::{MetaEdit, write_attention_kind};
+    let handle = crate::session_store::test_handle(4);
+    let ctx = &handle.ctx;
+    let needs = crate::harness_host::NEEDS_ATTENTION_OWNER;
+    let supervisor = crate::harness_host::ATTENTION_OWNER;
+    let ask = Some(aterm_types::needs::AttentionKind::Ask);
+    let write = |owner: &str, edit: MetaEdit<'_>| {
+        write_attention_kind(ctx, owner, edit, ask, aterm_slog::Actor::Harness).unwrap();
+    };
+    let flag = || {
+        let r = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .cloned()
+            .expect("a task");
+        (r.rev, r.attention)
+    };
+    assert!(crate::task_record::owner_moves_task(needs));
+    assert!(!crate::task_record::owner_moves_task("human"));
+    mark_session_task(ctx, 4, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    assert_eq!(flag(), (1, false));
+    write(needs, MetaEdit::Set("a release credential"));
+    assert_eq!(flag(), (2, true), "NEEDS YOU raises it");
+    write(supervisor, MetaEdit::Set("a dialog"));
+    write(needs, MetaEdit::Clear);
+    assert!(flag().1, "the supervisor's entry still stands");
+    write(supervisor, MetaEdit::Clear);
+    assert!(!flag().1, "both cleared");
+    // NEGATIVE CONTROL: a person's own entry.
+    let before = flag();
+    write_attention_kind(
+        ctx,
+        "human",
+        MetaEdit::Set("lunch"),
+        None,
+        aterm_slog::Actor::Human,
+    )
+    .unwrap();
+    assert_eq!(flag(), before, "a person's entry is not the task's news");
 }
 
 /// `task` reads the record with the session's agent word and attention;
@@ -580,41 +620,19 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
 #[test]
 fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
     let handle = crate::session_store::test_handle(5);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
-    assert_eq!(
-        cmd_task(ctx, 5, Scope::Owner, "", &subscribers),
-        "OK task -\n"
-    );
-    assert_eq!(
-        cmd_task(ctx, 5, Scope::Owner, "mark", &subscribers),
-        TASK_USAGE
-    );
-    assert_eq!(
-        cmd_task(ctx, 5, Scope::Owner, "status", &subscribers),
-        TASK_USAGE
-    );
-    assert_eq!(
-        cmd_task(ctx, 5, Scope::Owner, "marked done", &subscribers),
-        TASK_USAGE
-    );
+    assert_eq!(cmd_task(ctx, 5, Scope::Owner, ""), "OK task -\n");
+    assert_eq!(cmd_task(ctx, 5, Scope::Owner, "mark"), TASK_USAGE);
+    assert_eq!(cmd_task(ctx, 5, Scope::Owner, "status"), TASK_USAGE);
+    assert_eq!(cmd_task(ctx, 5, Scope::Owner, "marked done"), TASK_USAGE);
     let edge = Scope::Edge(aterm_session::EdgeToken::generate());
-    assert_eq!(
-        cmd_task(ctx, 5, edge, "mark done", &subscribers),
-        "ERR denied\n"
-    );
+    assert_eq!(cmd_task(ctx, 5, edge, "mark done"), "ERR denied\n");
     assert!(
         ctx.timeline.lock().unwrap().task().is_none(),
         "the edge marked nothing"
     );
 
-    let marked = cmd_task(
-        ctx,
-        5,
-        Scope::Owner,
-        &format!("mark working from={SID}"),
-        &subscribers,
-    );
+    let marked = cmd_task(ctx, 5, Scope::Owner, &format!("mark working from={SID}"));
     assert!(
         marked.starts_with(&format!("OK task rev=1 state=working from={SID} since_ms=")),
         "{marked}"
@@ -623,7 +641,7 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
         marked.ends_with(" result_bytes=0 agent=- attention=- changed=1\n"),
         "{marked}"
     );
-    let again = cmd_task(ctx, 5, Scope::Owner, "mark working", &subscribers);
+    let again = cmd_task(ctx, 5, Scope::Owner, "mark working");
     assert!(
         again.contains(" rev=1 ") && again.ends_with(" changed=0\n"),
         "{again}"
@@ -632,18 +650,12 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
         .lock()
         .unwrap()
         .set("attention", Some("stuck on CI".into()));
-    let done = cmd_task(
-        ctx,
-        5,
-        Scope::Owner,
-        "mark done why=marker result_bytes=7",
-        &subscribers,
-    );
+    let done = cmd_task(ctx, 5, Scope::Owner, "mark done why=landed result_bytes=7");
     assert!(done.contains(" rev=2 state=done "), "{done}");
-    let read = cmd_task(ctx, 5, edge, "", &subscribers);
+    let read = cmd_task(ctx, 5, edge, "");
     assert!(read.starts_with("OK task rev=2 state=done from="), "{read}");
     assert!(
-        read.ends_with(" result_bytes=7 why=marker agent=- attention=stuck%20on%20CI\n"),
+        read.ends_with(" result_bytes=7 why=landed agent=- attention=stuck%20on%20CI\n"),
         "{read}"
     );
 }
@@ -660,7 +672,6 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
 #[test]
 fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
     let handle = crate::session_store::test_handle(6);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
     let stalled_held = TaskMark {
         why: Some("held"),
@@ -672,7 +683,6 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
             6,
             Some(&stalled_held),
             AttentionEdit::Raise(text),
-            &subscribers,
             Duration::ZERO,
             |_, _| true,
         )
@@ -686,13 +696,7 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
     );
     let stall = raise(&held);
     assert!(stall.attention);
-    let done = cmd_task(
-        ctx,
-        6,
-        Scope::Owner,
-        "mark done why=marker result_bytes=7",
-        &subscribers,
-    );
+    let done = cmd_task(ctx, 6, Scope::Owner, "mark done why=landed result_bytes=7");
     assert!(
         done.contains(&format!(" rev={} state=done ", stall.rev + 1)),
         "{done}"
@@ -711,7 +715,6 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
         6,
         None,
         AttentionEdit::TakeDown(crate::harness_host::deadline_attention_stands),
-        &subscribers,
         Duration::ZERO,
         |_, _| true,
     )
@@ -721,7 +724,7 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
 
     // NEGATIVE CONTROL: the deadline's own stall, marked over the wire.
     let stall = raise(&held);
-    let again = cmd_task(ctx, 6, Scope::Owner, "mark stalled why=held", &subscribers);
+    let again = cmd_task(ctx, 6, Scope::Owner, "mark stalled why=held");
     assert!(
         again.contains(&format!(" attention={}", crate::control::pct_encode(&held))),
         "{again}"
@@ -732,7 +735,7 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
     );
     // NEGATIVE CONTROL: another text of the supervisor's stays.
     raise("a usage limit until 5pm");
-    let done = cmd_task(ctx, 6, Scope::Owner, "mark done why=marker", &subscribers);
+    let done = cmd_task(ctx, 6, Scope::Owner, "mark done why=landed");
     assert!(done.contains(" attention=a%20usage%20limit"), "{done}");
 }
 
@@ -802,30 +805,29 @@ fn a_windows_result_path_is_judged_under_its_state_dir() {
 #[test]
 fn the_result_verb_answers_the_snapshot_the_record_names() {
     let handle = crate::session_store::test_handle(6);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
-    assert_eq!(cmd_result(ctx, 6, "", &subscribers), "ERR no task\n");
+    assert_eq!(cmd_result(ctx, 6, ""), "ERR no task\n");
     let mark = |mark: TaskMark| {
-        mark_session_task(ctx, 6, &mark, &subscribers).expect("unfenced");
+        mark_session_task(ctx, 6, &mark).expect("unfenced");
     };
     mark(TaskMark::new(TaskState::Working));
     assert_eq!(
-        cmd_result(ctx, 6, "", &subscribers),
+        cmd_result(ctx, 6, ""),
         "ERR result unavailable why=working\n"
     );
     assert_eq!(
-        cmd_result(ctx, 6, "full", &subscribers),
+        cmd_result(ctx, 6, "full"),
         "ERR result unavailable why=working\n"
     );
-    assert_eq!(cmd_result(ctx, 6, "everything", &subscribers), RESULT_USAGE);
+    assert_eq!(cmd_result(ctx, 6, "everything"), RESULT_USAGE);
     mark(TaskMark::new(TaskState::Stalled));
     assert_eq!(
-        cmd_result(ctx, 6, "", &subscribers),
+        cmd_result(ctx, 6, ""),
         "ERR result unavailable why=stalled\n"
     );
     mark(TaskMark::new(TaskState::Done));
     assert_eq!(
-        cmd_result(ctx, 6, "", &subscribers),
+        cmd_result(ctx, 6, ""),
         "ERR result unavailable why=no-snapshot\n"
     );
 
@@ -834,23 +836,23 @@ fn the_result_verb_answers_the_snapshot_the_record_names() {
         .tempdir()
         .expect("scratch");
     let transcript = dir.path().join("t.jsonl");
-    let row = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser.\nATERM-TASK-DONE"}]}}"#;
+    let row = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser."}]}}"#;
     let snap = aterm_agent::harness::result::snapshot(
         &dir.path().join("tasks"),
         "s-6-1",
         Some((&transcript, &format!("{row}\n"))),
-        aterm_agent::harness::result::DoneBy::Marker,
+        aterm_agent::harness::result::DoneBy::Turn,
     )
     .expect("written");
     let done = TaskMark {
-        why: Some("marker"),
+        why: Some("landed"),
         result_bytes: snap.bytes,
         result_path: Some(snap.path.clone()),
         ..TaskMark::new(TaskState::Done)
     };
     mark(done.clone());
     let answer = "OK 1 source=transcript session=0b22 uuid=a-1 bytes=17\nFixed the parser.\n";
-    assert_eq!(cmd_result(ctx, 6, "", &subscribers), answer);
+    assert_eq!(cmd_result(ctx, 6, ""), answer);
     // The agent gone, its result kept.
     mark(TaskMark {
         state: TaskState::Exited,
@@ -858,10 +860,10 @@ fn the_result_verb_answers_the_snapshot_the_record_names() {
         exit: Some(0),
         ..done
     });
-    assert_eq!(cmd_result(ctx, 6, "", &subscribers), answer);
+    assert_eq!(cmd_result(ctx, 6, ""), answer);
     mark(TaskMark::new(TaskState::Exited));
     assert_eq!(
-        cmd_result(ctx, 6, "", &subscribers),
+        cmd_result(ctx, 6, ""),
         "ERR result unavailable why=exited\n"
     );
 }
@@ -876,7 +878,6 @@ fn the_result_verb_answers_the_snapshot_the_record_names() {
 #[test]
 fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
     let handle = crate::session_store::test_handle(6);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-task-reread-")
@@ -884,7 +885,7 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
         .expect("scratch");
     let transcript = dir.path().join("t.jsonl");
     let prompt = r#"{"type":"user","isSidechain":false,"uuid":"u-1","sessionId":"0b22","message":{"role":"user","content":"Fix the parser."}}"#;
-    let reply = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser.\nATERM-TASK-DONE"}]}}"#;
+    let reply = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Fixed the parser."}]}}"#;
     let later = r#"{"type":"user","isSidechain":false,"uuid":"u-2","sessionId":"0b22","message":{"role":"user","content":"and the docs?"}}"#;
     let run = |stem: &str, on_disk: &str| {
         std::fs::write(&transcript, format!("{prompt}\n")).expect("transcript");
@@ -892,19 +893,19 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
             &dir.path().join("tasks"),
             stem,
             Some((&transcript, &format!("{prompt}\n"))),
-            aterm_agent::harness::result::DoneBy::Marker,
+            aterm_agent::harness::result::DoneBy::Turn,
         )
         .expect("written");
         assert_eq!(snap.unavailable, Some("no-reply"));
         let done = TaskMark {
-            why: Some("marker"),
+            why: Some("landed"),
             result_bytes: 0,
             result_path: Some(snap.path.clone()),
             ..TaskMark::new(TaskState::Done)
         };
-        let (marked, _) = mark_session_task(ctx, 6, &done, &subscribers).expect("unfenced");
+        let (marked, _) = mark_session_task(ctx, 6, &done).expect("unfenced");
         assert_eq!(
-            cmd_result(ctx, 6, "", &subscribers),
+            cmd_result(ctx, 6, ""),
             "ERR result unavailable why=no-reply\n",
             "nothing written yet"
         );
@@ -918,13 +919,13 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
     };
     let (path, rev) = run("s-6-1", &format!("{prompt}\n{reply}\n"));
     let answer = "OK 1 source=transcript session=0b22 uuid=a-1 bytes=17\nFixed the parser.\n";
-    assert_eq!(cmd_result(ctx, 6, "", &subscribers), answer);
+    assert_eq!(cmd_result(ctx, 6, ""), answer);
     assert_eq!(rev_and_bytes(), (rev + 1, 17), "the record says it");
     assert_eq!(
         std::fs::read_to_string(&path).expect("snapshot"),
         "Fixed the parser."
     );
-    assert_eq!(cmd_result(ctx, 6, "", &subscribers), answer);
+    assert_eq!(cmd_result(ctx, 6, ""), answer);
     assert_eq!(rev_and_bytes(), (rev + 1, 17), "read again no more");
     // NEGATIVE CONTROL: only a later turn has a reply.
     let (path, rev) = run(
@@ -932,7 +933,7 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
         &format!("{prompt}\n{later}\n{}\n", reply.replace("a-1", "a-2")),
     );
     assert_eq!(
-        cmd_result(ctx, 6, "", &subscribers),
+        cmd_result(ctx, 6, ""),
         "ERR result unavailable why=no-reply\n"
     );
     assert_eq!(rev_and_bytes(), (rev, 0));
@@ -952,7 +953,6 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
 #[test]
 fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
     let handle = crate::session_store::test_handle(7);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
     let state = || {
         ctx.timeline
@@ -963,45 +963,45 @@ fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
     };
     // What an Enter finds: the entry into the state the record stands in.
     let found = || ctx.timeline.lock().unwrap().task().map(|r| r.entered);
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found(), &subscribers);
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found());
     assert_eq!(state(), None, "no task: none made");
     let done = |why| TaskMark {
         why: Some(why),
         ..TaskMark::new(TaskState::Done)
     };
-    mark_session_task(ctx, 7, &done("marker"), &subscribers).expect("unfenced");
-    reopen_at_turn(ctx, 7, &TurnBy::Harness, found(), &subscribers);
-    assert_eq!(state(), Some((1, TaskState::Done, Some("marker"))));
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found(), &subscribers);
+    mark_session_task(ctx, 7, &done("landed")).expect("unfenced");
+    reopen_at_turn(ctx, 7, &TurnBy::Harness, found());
+    assert_eq!(state(), Some((1, TaskState::Done, Some("landed"))));
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found());
     assert_eq!(state(), Some((2, TaskState::Working, Some("turn"))));
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found(), &subscribers);
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found());
     assert_eq!(state(), Some((2, TaskState::Working, Some("turn"))));
     for by in [
         TurnBy::Bridge,
         TurnBy::Sid(SID.to_string()),
         TurnBy::Unknown,
     ] {
-        mark_session_task(ctx, 7, &done("done-check"), &subscribers).expect("unfenced");
-        reopen_at_turn(ctx, 7, &by, found(), &subscribers);
+        mark_session_task(ctx, 7, &done("done-check")).expect("unfenced");
+        reopen_at_turn(ctx, 7, &by, found());
         assert_eq!(state().map(|s| s.1), Some(TaskState::Working), "{by:?}");
     }
     // The Enter found a done; the harness's working and done for the turn
     // land before its submit is verified: that done stands.
-    mark_session_task(ctx, 7, &done("marker"), &subscribers).expect("unfenced");
+    mark_session_task(ctx, 7, &done("landed")).expect("unfenced");
     let entered = found();
     let mut turn = TaskMark::new(TaskState::Working);
     turn.why = Some("turn");
-    mark_session_task(ctx, 7, &turn, &subscribers).expect("unfenced");
-    mark_session_task(ctx, 7, &done("marker"), &subscribers).expect("unfenced");
+    mark_session_task(ctx, 7, &turn).expect("unfenced");
+    mark_session_task(ctx, 7, &done("landed")).expect("unfenced");
     let published = state();
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, entered, &subscribers);
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, entered);
     assert_eq!(state(), published, "the done the Enter did not find stands");
     // NEGATIVE CONTROL: the done it found opens.
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found(), &subscribers);
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found());
     assert_eq!(state().map(|s| s.1), Some(TaskState::Working));
-    mark_session_task(ctx, 7, &TaskMark::new(TaskState::Stalled), &subscribers).expect("unfenced");
+    mark_session_task(ctx, 7, &TaskMark::new(TaskState::Stalled)).expect("unfenced");
     let before = state();
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found(), &subscribers);
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, found());
     assert_eq!(state(), before, "only a done task is opened again");
 }
 
@@ -1019,7 +1019,6 @@ fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
 #[test]
 fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
     let handle = crate::session_store::test_handle(7);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
     let record = || {
         ctx.timeline
@@ -1030,11 +1029,11 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
             .expect("a task")
     };
     let done = TaskMark {
-        why: Some("marker"),
+        why: Some("landed"),
         ..TaskMark::new(TaskState::Done)
     };
-    mark_session_task(ctx, 7, &TaskMark::new(TaskState::Working), &subscribers).expect("unfenced");
-    mark_session_task(ctx, 7, &done, &subscribers).expect("unfenced");
+    mark_session_task(ctx, 7, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    mark_session_task(ctx, 7, &done).expect("unfenced");
     // The Enter: its verdict will name rev n.
     let at_enter = record();
     let n = at_enter.rev;
@@ -1044,8 +1043,7 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
         ..done.clone()
     };
     let same = |now: Option<&TaskRecord>| now.is_some_and(|now| now.rev == n);
-    let marked = mark_session_task_if(ctx, 7, &repaired, &subscribers, Duration::ZERO, same)
-        .expect("unfenced");
+    let marked = mark_session_task_if(ctx, 7, &repaired, Duration::ZERO, same).expect("unfenced");
     assert_eq!(marked.map(|(r, moved)| (r.rev, moved)), Some((n + 1, true)));
     crate::session_timeline::write_attention_owned(
         ctx,
@@ -1063,20 +1061,14 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
     // A waiter past n would answer at once on this: news.
     assert!(remarked.rev > n && remarked.has_news());
     // NEGATIVE CONTROL: another entry than the one the Enter found.
-    reopen_at_turn(
-        ctx,
-        7,
-        &TurnBy::Ctl,
-        Some(at_enter.entered - 1),
-        &subscribers,
-    );
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(at_enter.entered - 1));
     assert_eq!(
         record(),
         remarked,
         "an entry the Enter did not find opens nothing"
     );
     // The verified submit opens the done its Enter found.
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(at_enter.entered), &subscribers);
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(at_enter.entered));
     let opened = record();
     assert_eq!(
         (opened.rev, opened.state, opened.why),
@@ -1096,7 +1088,7 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
         !record().has_news(),
         "working, nothing raised: no news past n"
     );
-    mark_session_task(ctx, 7, &done, &subscribers).expect("unfenced");
+    mark_session_task(ctx, 7, &done).expect("unfenced");
     let own = record();
     assert!(own.rev > n && own.state == TaskState::Done && own.entered > at_enter.entered);
 }
@@ -1109,7 +1101,6 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
 #[test]
 fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
     let handle = crate::session_store::test_handle(7);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
     let is_done = |r: Option<&TaskRecord>| r.is_some_and(|r| r.state == TaskState::Done);
     let working = TaskMark {
@@ -1120,9 +1111,8 @@ fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
         why: Some("exit"),
         ..TaskMark::new(TaskState::Exited)
     };
-    mark_session_task(ctx, 7, &exited, &subscribers).expect("unfenced");
-    let landed = mark_session_task_if(ctx, 7, &working, &subscribers, Duration::ZERO, is_done)
-        .expect("unfenced");
+    mark_session_task(ctx, 7, &exited).expect("unfenced");
+    let landed = mark_session_task_if(ctx, 7, &working, Duration::ZERO, is_done).expect("unfenced");
     assert_eq!(landed, None);
     let state = || {
         ctx.timeline
@@ -1133,9 +1123,8 @@ fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
     };
     assert_eq!(state(), Some((1, TaskState::Exited)), "the exit stands");
     // NEGATIVE CONTROL: still `done`.
-    mark_session_task(ctx, 7, &TaskMark::new(TaskState::Done), &subscribers).expect("unfenced");
-    let landed = mark_session_task_if(ctx, 7, &working, &subscribers, Duration::ZERO, is_done)
-        .expect("unfenced");
+    mark_session_task(ctx, 7, &TaskMark::new(TaskState::Done)).expect("unfenced");
+    let landed = mark_session_task_if(ctx, 7, &working, Duration::ZERO, is_done).expect("unfenced");
     assert_eq!(
         landed.map(|(r, changed)| (r.state, changed)),
         Some((TaskState::Working, true))
@@ -1153,16 +1142,15 @@ fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
 #[test]
 fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
     let handle = crate::session_store::test_handle(7);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
     let rings = crate::harness_host::rings_here;
     let rung = |mark: &TaskMark| {
         let before = rings();
-        mark_session_task(ctx, 7, mark, &subscribers).expect("unfenced");
+        mark_session_task(ctx, 7, mark).expect("unfenced");
         rings() - before
     };
     let done = TaskMark {
-        why: Some("marker"),
+        why: Some("landed"),
         ..TaskMark::new(TaskState::Done)
     };
     assert_eq!(rung(&TaskMark::new(TaskState::Working)), 1, "a new record");
@@ -1180,15 +1168,15 @@ fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
         why: Some("turn"),
         ..TaskMark::new(TaskState::Working)
     };
-    let landed = mark_session_task_if(ctx, 7, &reopened, &subscribers, Duration::ZERO, not_done)
-        .expect("unfenced");
+    let landed =
+        mark_session_task_if(ctx, 7, &reopened, Duration::ZERO, not_done).expect("unfenced");
     assert_eq!(
         (landed, rings() - before),
         (None, 0),
         "a mark that did not land"
     );
     // The follow-up's reopen enters `working` again: rung.
-    reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(2), &subscribers);
+    reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(2));
     assert_eq!(
         rings() - before,
         1,
@@ -1206,11 +1194,10 @@ fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
 #[test]
 fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
     let handle = crate::session_store::test_handle(9);
-    let subscribers = crate::subscribe::new_registry();
     let ctx = &handle.ctx;
     let _ = crate::presence::take_task_wakes();
     let mark = |m: &TaskMark| {
-        mark_session_task(ctx, 9, m, &subscribers).expect("unfenced");
+        mark_session_task(ctx, 9, m).expect("unfenced");
         crate::presence::take_task_wakes()
     };
     let stalled = TaskMark {
@@ -1228,7 +1215,7 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
     // as a `human` after-mail mark written on a try-lock does), taken by the
     // same mark again: the session's waiters wake for it, but the record did
     // not move, so no need verdict is posted.
-    let waiter = crate::subscribe::SubscriberSet::register(&subscribers, &[9]);
+    let waiter = crate::session_watch::Subscription::single(&ctx.watchers);
     {
         let mut g = ctx.timeline.lock().unwrap();
         let at = g.slog().now();
@@ -1251,7 +1238,6 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
         9,
         None,
         AttentionEdit::Raise("the worker never started: a login"),
-        &subscribers,
         Duration::ZERO,
         |_, _| true,
     )
@@ -1264,7 +1250,6 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
         ctx,
         9,
         &TaskMark::new(TaskState::Working),
-        &subscribers,
         Duration::ZERO,
         |_| false,
     )
@@ -1279,7 +1264,6 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
             &fenced.ctx,
             10,
             &TaskMark::new(TaskState::Working),
-            &subscribers,
             Duration::ZERO,
         )
         .is_err()

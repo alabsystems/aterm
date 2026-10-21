@@ -8,16 +8,15 @@
 //! border, a pixel-art aterm kitty riding a rainbow trail with stars, and the
 //! line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise` (an armed
 //! timer's time after it, `∞ cruise ⤓18:00`; Land: `· autopilot ⤓ land`, in a
-//! sunset; a landing's end, `· autopilot ✓ landed` or `· autopilot ✓ done` —
-//! [`LineEnd`]). Off, the master switch off and a
-//! window with no host show the vendor's card bare. Owner, 2026-10-15: "I'd
-//! like for a rainbow border and a similar pixel art with an aterm kitty and
-//! fancy rainbows and star power to show off the power of the harness and a
-//! line to show that claude code is being enhanced by what version of the
-//! claude code harness".
+//! sunset; a landing's end, `· autopilot ✓ landed` — [`LineEnd`]). Off, the
+//! master switch off and a window with no host show the vendor's card bare.
+//! Owner, 2026-10-15: "I'd like for a rainbow border and a similar pixel art
+//! with an aterm kitty and fancy rainbows and star power to show off the
+//! power of the harness and a line to show that claude code is being
+//! enhanced by what version of the claude code harness".
 //!
 //! * WHAT DRAWS IT. `aterm_effects::harness_card` is the pure emitter (the
-//!   border, trail, kitty and stars as [`GlowQuad`]s, the line's ink); this
+//!   border, trail, kitty and stars as two fx contents, the line's ink); this
 //!   module finds the card, lays it out on the pane and puts the emitter's
 //!   output on the glass. The card is FOUND by its geometry
 //!   (`aterm_phase::launch_card_scan`, never spelled here),
@@ -40,19 +39,35 @@
 //!   on, [`crate::app_config::Config::claude_footer_card`]); a live viewport
 //!   (`display_offset == 0` — a scrolled-back frame draws none); the session's
 //!   effective Autopilot Cruise or Land AND its live claim this host's
-//!   ([`App::session_autopilot`]); and the located card's build equal to the
-//!   running process's (`FooterFacts::version`, the rule
-//!   `SessionTimeline::note_claude_card` keeps a card by), so a dead process's
-//!   card left on the screen after a relaunch stays bare. That build is read
-//!   from the registry row Claude Code writes a moment after it takes the
-//!   foreground, and the footer's resolver reads a new process again every
-//!   `claude_footer::FIRST_ROW_STEP` until a read finds the row (its
-//!   first-row ladder), so the facts, and with them the decoration and the
-//!   kitty's ride-in, come at most a step after the row: on the card's first
-//!   frame where the row leads the card by more than that (measured on the
-//!   fullscreen renderer), a frame or a few into it where it does not (the
-//!   inline renderer writes the row after it draws the card). On the 2 s
-//!   follow-up read alone they came 1.3-1.7 s after the card.
+//!   ([`App::session_autopilot`]; the hosted loop asks for the claim as its
+//!   first request, `aterm_agent`'s `claim_at_naming`); and THE GATE
+//!   (`docs/DESIGN-card-engine-2026-10-19.md` §3.8, [`admit`]): the card is
+//!   the CURRENT drawer's own. The drawer is the session's published holder
+//!   image while its group is the one in front
+//!   (`SessionTimeline::card_gate`, read under the splice's one timeline lock
+//!   a pane, facts or none — no registry row is waited on), and the card is
+//!   judged by integer compares, cheapest first: the frame's fence names the
+//!   drawer's token (`RenderInput::holder`, the engine's holder fence read
+//!   under the extraction lock with the cells); the card is the drawer's
+//!   reader's (`rows_kind`); its rows lie in one span the drawer laid and no
+//!   taint stands (main), or the alternate screen was cleared while it was
+//!   current (alt); and its banner passes the drawer's build policy — the
+//!   image's source × its program's `aterm_phase::BannerBuild` (Claude Code:
+//!   Exact, the image's own build, or for an image of unknown build the build
+//!   its own registry row reports; agy and Muse Code: ProvenanceOnly, the
+//!   fence alone). Each check fails closed. One verdict a pane a frame
+//!   ([`GateCheck`]) serves the card and the footer's kept card
+//!   (`SessionTimeline::note_claude_card`) alike. So a predecessor's card, a
+//!   `cat`'d card, a card under a stale cursor and another build's card stay
+//!   bare, and the drawer's own card is decorated on its first frame.
+//! * THE RE-SHOW BOUND ([`RESHOW_MS`], §3.9). A card hidden by its identity
+//!   or its fence (its drawer left, or the gate refused it) shows again no
+//!   sooner than [`RESHOW_MS`] after its previous show began, its wake armed
+//!   for that instant ([`CardEntry::due`]); a viewport hide (scroll-back, a
+//!   tab, a menu) and a new drawer's first show are never held. So a
+//!   flapping identity shows one card at most `1000 / RESHOW_MS` times a
+//!   second, under WCAG 2.3.1's three
+//!   ([`aterm_effects::TWINKLE_FLASH_BOUND_HZ`]).
 //! * THE LAYOUT ([`layout`]). The box holds the card's three rows, and the
 //!   line's row under them when that row is blank across the line's span (the
 //!   line goes there at the card's text column); otherwise the line goes on
@@ -75,15 +90,16 @@
 //!   Claude, over one of Claude's notices, at the pane's last row.
 //!   The air moves the border and nothing else: the kitty, its trail and
 //!   the stars stay where they were.
-//! * THE STREAMS. The border and the trail (the emitter's `under`) go to
-//!   `RenderInput::glow_under` — WINDOW-ABSOLUTE pixels, drawn beneath the
-//!   glyph ink; the kitty and the stars (`over`) to `RenderInput::nova_add` —
-//!   GRID-INTERIOR pixels, which both renderers offset by `(pad, grid_top)`
-//!   (CPU `draw_nova`, GPU `nova_add` instances). One scene is emitted in
-//!   window space and the `over` quads are translated into the nova stream's
-//!   space (`x − pad`, `y − grid_top`); in both streams, at splice time (the
-//!   strip already prepended), a quad's `row` is its FRAME row — the
-//!   renderers' row gate, which is the frame's `cells` index. The line is
+//! * THE LAYERS (`docs/DESIGN-card-engine-2026-10-19.md` §4.8). A card is
+//!   two fx layers in `RenderInput::fx_layers`, named by its session
+//!   (`harness_card::card_layer_id`): the border and the trail (the
+//!   emitter's `under`) in the Under slot, WINDOW space, drawn beneath the
+//!   glyph ink; the kitty, its rim and the stars (`over`) in the Over slot,
+//!   GRID space, which the renderers offset by `(pad, grid_top)`. One scene
+//!   is emitted in window pixels, card-local, and laid at the card's origin
+//!   ([`aterm_effects::harness_card::CardFrame::layers`]), each layer
+//!   clipped to the pane; the renderers cut the layers at the row bands, so
+//!   nothing here splits or tags a row. The line is
 //!   written into the frame's cells through the footer's own undoable write
 //!   (one `FooterUndo` slot), coloured by `RenderInput::ink` (kept sorted and
 //!   unique; another producer's ink keeps its cells) and led by a drawn
@@ -95,8 +111,8 @@
 //!   capture after a live present: `cell_frame_into` never writes them) never
 //!   doubles the light.
 //! * EPISODES, THEN STILLNESS. An episode (`harness_card::EPISODE_MS`) is armed
-//!   when a card is first decorated for a process (its group and its card's
-//!   build), when the session's Autopilot changes (into Cruise or Land), and
+//!   when a card is first decorated for a drawer (its snapshot token, which
+//!   also seeds its stars), when the session's Autopilot changes (into Cruise or Land), and
 //!   when the window regains focus ([`App::rearm_claude_cards`]); the kitty
 //!   rides in on the first only, and once the card has been on the glass at
 //!   rest it plays every later one in its seat (`harness_card`'s `Ride`). A
@@ -114,20 +130,26 @@
 //!   and an unfocused window get the static frame from the start; serious
 //!   mode drops the kitty, trail and stars.
 //! * UNDER THE TAB MENU. The tab context menu is painted after the card and
-//!   hangs from the first grid row, where a fresh card sits: it cuts the
-//!   card's light, ink and star out of its rectangle ([`cut_out`]), keeping
-//!   the rest of the card on the glass.
+//!   hangs from the first grid row, where a fresh card sits: its rectangle
+//!   joins the frame's fx occluders (`app_render::scrub_overlay_card`), which
+//!   cut the card's layers there, and the card's ink and star are cut out of
+//!   it ([`cut_out`]), keeping the rest of the card on the glass.
 //! * THE KITTY wears the launch kitty's look (`App::launch_kitty`, the
 //!   process's base cat): its coat and iris stops resolved through the cat
 //!   baker's own `ResolvedFills::from_indices` for the pane's polarity (a black
 //!   coat lifted on a dark ground, as the cursor cat's is).
 //! * WHAT A FRAME COSTS (owner, 2026-10-15: "the user experince must be
 //!   extremely smooth and zero latency!"). A card at rest is REPLAYED: its
-//!   settled frame is kept beside it (`harness_card::SettledFrame`) and put
-//!   on the glass from there while the card stays still on the same scene —
-//!   its kitty and stars kept moved into the nova stream's pixels
-//!   ([`CardEntry::nova`]) — never drawn again, and a frame that is drawn
-//!   makes no fingerprint (`HarnessCard::draw_kept`); its reading is kept while no row it reads changes — the card's
+//!   settled frame is kept beside it (`harness_card::CardFrames`) and put
+//!   on the glass from there — the same two content `Arc`s, which the
+//!   renderer compares by pointer and builds nothing for — while the card
+//!   stays still on a scene of the same shape (an inline scroll under it is
+//!   the same frame at a new origin), never drawn again; an episode's frames
+//!   refill a ring of contents in place when their prior contents are not
+//!   retained elsewhere. Arts are built at the first admitted ask for a cell
+//!   height, which may be a draw; publication and metric changes can queue
+//!   them ahead ([`App::prefetch_card_arts`]). Its reading is kept while no row
+//!   it reads changes — the card's
 //!   three, and below them only a row that now draws a banner
 //!   ([`CardReading::holds`]); its layout while the cells the layout read
 //!   say what they said — known without a look while the pane's text is the
@@ -144,8 +166,8 @@
 //!   compose, each a rebuild of the pane's text, read no card and lay none
 //!   out. Nothing is allocated for it once its buffers are grown, the
 //!   window's repaint key and wake judges read no clock for it, the splice
-//!   takes no lock for it (the process comes from the footer's own timeline
-//!   lock), and a window with no card on its glass reads no clock, no motion
+//!   takes no lock for it (the gate comes from the footer's own timeline
+//!   lock, one a pane a frame, facts or none), and a window with no card on its glass reads no clock, no motion
 //!   policy and no geometry at all. The clock is read where an episode is
 //!   live — its frames, the arm that starts it — and nowhere else, through
 //!   [`card_now`] (`work_counts`, asserted by `claude_card_tests`'
@@ -155,10 +177,12 @@
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use aterm_core::render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, RenderInput, WordDecoration};
+use aterm_core::render::{
+    DecoBlend, DecoGlyph, FxLayer, InkCell, PxRect, RenderInput, WordDecoration,
+};
 use aterm_core::terminal::RenderCell;
 use aterm_effects::harness_card::{
-    CardPalette, CardScene, FRAME_MS, HarnessCard, SettledFrame, kitty_cols,
+    CardArts, CardFrames, CardPalette, CardScene, FRAME_MS, HarnessCard, kitty_cols,
 };
 use aterm_phase::CardPlace;
 
@@ -178,6 +202,18 @@ const TRAIL_MAX: usize = 20;
 const KITTY_MARGIN: usize = 4;
 /// The `✦` and the space after it, ahead of the line's words.
 const LINE_LEAD: usize = 2;
+/// THE RE-SHOW BOUND (card engine §3.9, photosensitivity): a card hidden by
+/// its identity or its fence (`Bare::bounds_reshow`) shows again no sooner
+/// than this after its previous show BEGAN — a drawer flapping between two
+/// holders, or a fence cut and laid again, flashes the card at most
+/// `1000 / RESHOW_MS` times a second. A show held back is shown on time by
+/// the card's own wake (`DeadlineOwner::ClaudeCard`, [`CardEntry::due`]),
+/// never left bare at rest. A viewport hide (scroll-back, a tab switch, a
+/// menu) is the person's and is exempt, and a card's first show is never
+/// held back. `⌈1000 / 3.0⌉`: the design's 313 ms is 3.19 shows a second,
+/// over WCAG 2.3.1's bound the crate certifies every flash rate under.
+pub(crate) const RESHOW_MS: u64 = 334;
+const _: () = assert!(RESHOW_MS as f32 >= 1000.0 / aterm_effects::TWINKLE_FLASH_BOUND_HZ);
 /// What the card reads off a pane's rows: where the newest launch card sits
 /// ([`CardPlace`]) and the build its banner names. Read at most once per
 /// rebuild of the pane's text (`claude_footer::PaneTextCache::launch_card`),
@@ -187,6 +223,13 @@ const LINE_LEAD: usize = 2;
 pub(crate) struct CardRead {
     pub(crate) place: CardPlace,
     pub(crate) version: Box<str>,
+    /// The reader that placed it (`3` Claude Code, `4` agy, `1` Muse Code:
+    /// [`CardReading::rows_kind`]), which the gate holds to the drawer's.
+    pub(crate) kind: usize,
+    /// `version` as a build, parsed once when the card is read: the gate's
+    /// build policy compares integers per frame (card engine §3.8). `None`
+    /// where it is no version `atpkg` spells.
+    pub(crate) build: Option<atpkg::vendor_direct::Version>,
     /// The card's words at its place (`aterm_phase::launch_card_words`), its
     /// three rows' joined by `\n`: what the next reading HOLDS the card by on
     /// rows the reader does not place it on ([`read_card`]).
@@ -304,6 +347,7 @@ pub(crate) fn read_card(session: u64, rows: &[String], before: Option<CardBefore
     crate::reader_guard::read_or_none(session, "harness card", rows, || {
         let scan = aterm_phase::launch_card_scan(rows);
         if let Some(CardBefore { card, last: true }) = &before
+            && card.kind == 3
             && card.place.rows == 3
             && aterm_phase::launch_card_held(rows, scan, &card.place, card.words())
         {
@@ -336,13 +380,18 @@ pub(crate) fn read_card(session: u64, rows: &[String], before: Option<CardBefore
             };
             Some(match before {
                 Some(CardBefore { card: was, .. })
-                    if was.place == place && *was.version == *version && was.words() == words =>
+                    if was.kind == rows_kind
+                        && was.place == place
+                        && *was.version == *version
+                        && was.words() == words =>
                 {
                     was
                 }
                 _ => Arc::new(CardRead {
                     place,
                     version: version.into(),
+                    kind: rows_kind,
+                    build: atpkg::vendor_direct::Version::parse(version),
                     words: words.join("\n").into(),
                 }),
             })
@@ -396,11 +445,24 @@ pub(crate) struct CardLeaf {
     /// [`App::compose_claude_cards`].
     end: LineEnd,
     /// The card to decorate — the pane cache's reading, shared — the
-    /// process it belongs to (its group) and the number of the CURRENT
-    /// rebuild of the pane's text, which names this frame's cells (the
-    /// reading itself may be kept from an earlier rebuild,
-    /// [`CardReading::holds`]): `Some` only where every gate holds.
-    card: Option<(Arc<CardRead>, i32, u64)>,
+    /// drawer's token (its holder image's, `HolderImage::token`) and the
+    /// number of the CURRENT rebuild of the pane's text, which names this
+    /// frame's cells (the reading itself may be kept from an earlier
+    /// rebuild, [`CardReading::holds`]): `Some` only where every gate holds.
+    card: Option<(Arc<CardRead>, u64, u64)>,
+    /// Why the card is bare this frame (`None` with a card).
+    bare: Option<Bare>,
+    /// The current drawer's token (`0` with no drawer).
+    token: u64,
+    /// The absolute row of the pane's top visible line (the dev rows').
+    row_base: i64,
+    /// The absolute row of the banner of the card the gate refused this
+    /// frame (`None` where no card was read): the dev rows' `card-bare
+    /// row=`, which tells a predecessor's card refused from the drawer's own.
+    bare_row: Option<i64>,
+    /// The leaf only carries a hide: its pane holds no drawer and no facts
+    /// ([`drawerless_leaf`]); its Autopilot was not read.
+    drawerless: bool,
 }
 
 /// The line under one card, kept on its card ([`CardEntry::line`]) and
@@ -507,9 +569,11 @@ struct CardEntry {
     /// along ([`App::compose_claude_cards`]).
     leaf_index: usize,
     session: u64,
-    /// The process the card was first decorated for: its group and its card's
-    /// build. Another is a new card, and a new episode.
-    identity: (i32, Box<str>),
+    /// The drawer the card was first decorated for: its holder image's token
+    /// (`HolderImage::token`, card engine §3.9). Another is a new card, and a
+    /// new episode: an `exec` in place, a relaunch; Ctrl-Z/`fg` and `/clear`
+    /// keep it.
+    identity: u64,
     card: HarnessCard,
     /// The Autopilot the pane showed last: a move into Cruise or Land arms.
     view: AutopilotView,
@@ -522,6 +586,18 @@ struct CardEntry {
     /// Ticked by the latest splice of this window: only a card on show keys
     /// the repaint or arms a wake.
     shown: bool,
+    /// [`Self::shown`] as the splice before the latest left it
+    /// ([`WindowCards::hide_all`]): a card shown now and not then STARTS a
+    /// show.
+    was_shown: bool,
+    /// When the card's latest show began ([`RESHOW_MS`]).
+    shown_since: Instant,
+    /// Since the latest show began, the card was hidden by its identity or
+    /// its fence (`Bare::bounds_reshow`): its next show is bounded.
+    gate_hid: bool,
+    /// A show held back by the re-show bound, due at this instant
+    /// (`DeadlineOwner::ClaudeCard` wakes for it: [`Self::due`]).
+    deferred: Option<Instant>,
     /// The frame this card is due — an episode frame or the settled frame
     /// it owes — has been asked for, or its episode wants no frame at any
     /// later instant ([`App::claude_cards_due`]); no further wake is armed
@@ -530,16 +606,17 @@ struct CardEntry {
     asked: bool,
     /// The pane rows and columns the last frame laid the card on.
     place: (usize, usize, u16, u16),
-    /// The card's last settled frame, replayed while it rests.
-    kept: SettledFrame,
-    /// The last frame's kitty and stars in the nova stream's grid-interior
-    /// pixels ([`nova_of`]), and the `(pad, grid_top)` they were moved by:
-    /// while the card is replayed from `kept` they are `kept`'s, moved —
-    /// every tick sets them anew from what it drew, and a replay draws
-    /// `kept`, which only a tick fills — so a frame at rest appends them as
-    /// they are.
-    nova: Vec<GlowQuad>,
-    nova_at: Option<(u16, u16)>,
+    /// The cells the card's glass stands over on the last frame it was shown,
+    /// in frame cells `(row, col, rows, cols)`: the box's rows with its air
+    /// (the border stands half a row into each air row) and its columns up to
+    /// and including the border's. The border, the trail, the kitty and the
+    /// stars are glass, not cells, so the resident pet's world cannot see
+    /// them; the footer's splice reserves this rect for it
+    /// (`crate::pet_chrome`, [`WindowCards::glass_boxes`]).
+    glass_box: (usize, usize, usize, usize),
+    /// The card's frames: its settled frame, replayed while it rests, the
+    /// ring its episode's frames are built in, and its cell height's arts.
+    frames: CardFrames,
     /// The last layout and scene, and what they were made from: kept while
     /// the key holds and the cells the layout read do (`None` inside: the
     /// card did not fit).
@@ -557,10 +634,10 @@ struct CardEntry {
 
 impl CardEntry {
     /// Start an episode at `now`, the stars seeded by the session and its
-    /// process, so a re-arm keeps the same constellation.
+    /// drawer's token, so a re-arm keeps the same constellation.
     fn arm(&mut self, now: Instant) {
-        let pgid = u64::from(self.identity.0.cast_unsigned());
-        self.card.arm(now, mix(self.session ^ pgid.rotate_left(32)));
+        let seed = pinned_seed().unwrap_or_else(|| mix(self.session ^ self.identity));
+        self.card.arm(now, seed);
         self.armed_at = now;
         self.asked = false;
     }
@@ -573,6 +650,9 @@ impl CardEntry {
     /// the settled frame owed once the episode runs out, `now`. `None` when
     /// settled, not on show, or once asked until a tick draws it.
     fn due(&self, now: Instant) -> Option<Instant> {
+        if let Some(until) = self.deferred {
+            return (!self.asked).then_some(until);
+        }
         if !self.shown || self.asked {
             return None;
         }
@@ -589,34 +669,31 @@ impl CardEntry {
 
     /// Whether this card on show may want a frame — known without a clock:
     /// shown, not yet asked (nor found wanting nothing more, `asked` too),
-    /// and not at rest (`HarnessCard::at_rest`).
+    /// and not at rest (`HarnessCard::at_rest`); or a show the re-show bound
+    /// holds back, not yet asked for.
     fn live(&self) -> bool {
-        self.shown && !self.asked && !self.card.at_rest()
+        !self.asked && (self.deferred.is_some() || self.shown && !self.card.at_rest())
     }
 }
 
-/// What one splice appended to the frame's effect streams, so the next frame
-/// (and a capture's re-splice of the same scratch) takes exactly that back
-/// ([`strip`]). Each stream's part is kept in the stream's own order.
+/// What one splice appended to the frame, so the next frame (and a
+/// capture's re-splice of the same scratch) takes exactly that back
+/// ([`strip`]): the cards' fx layers, each as pushed, and the lines' ink and
+/// stars, each stream's part in the stream's own order.
 #[derive(Debug, Default)]
 struct CardPainted {
-    under: Vec<GlowQuad>,
-    over: Vec<GlowQuad>,
+    layers: Vec<FxLayer>,
     ink: Vec<InkCell>,
     decos: Vec<WordDecoration>,
 }
 
 impl CardPainted {
     fn is_empty(&self) -> bool {
-        self.under.is_empty()
-            && self.over.is_empty()
-            && self.ink.is_empty()
-            && self.decos.is_empty()
+        self.layers.is_empty() && self.ink.is_empty() && self.decos.is_empty()
     }
 
     fn clear(&mut self) {
-        self.under.clear();
-        self.over.clear();
+        self.layers.clear();
         self.ink.clear();
         self.decos.clear();
     }
@@ -632,9 +709,10 @@ pub(crate) struct WindowCards {
     /// The panes the footer's splice gathers for the card pass, reused
     /// ([`Self::take_leaves`]).
     leaves: Vec<CardLeaf>,
-    /// The emitter's two streams for one card (`HarnessCard::tick`), reused.
-    under: Vec<GlowQuad>,
-    over: Vec<GlowQuad>,
+    /// The arts queued for residency ahead of a card's first frame
+    /// ([`App::prefetch_card_arts`]), held so the card that comes draws with
+    /// the very arts the renderer was handed.
+    arts: Option<Arc<CardArts>>,
     /// [`strip`]'s sorted keys, reused.
     keys: Vec<(EntryKey, bool)>,
     /// What [`layout`] reads for the card being laid anew, reused (swapped
@@ -642,19 +720,38 @@ pub(crate) struct WindowCards {
     seen: Seen,
     /// [`cut_out`]'s spares, one per stream type, reused: a cut is built in
     /// one and copied back ([`cut_each_once`]).
-    spare_quads: Vec<GlowQuad>,
     spare_ink: Vec<InkCell>,
     spare_decos: Vec<WordDecoration>,
+    /// The card passes this window composed while the dev card probe runs
+    /// (`SessionFactory::card_probe`): the dev rows' `composed=`.
+    composed: u64,
+    /// The probe's outcomes this pass, one a leaf, reused: noted on each
+    /// session's timeline after the pass (`SessionTimeline::note_card_frame`).
+    outcomes: Vec<(u64, CardOutcome)>,
 }
 
 impl WindowCards {
+    /// Read only the card's recorded layers in sibling fixture assertions.
+    #[cfg(test)]
+    pub(crate) fn painted_layers(&self) -> &[FxLayer] {
+        &self.painted.layers
+    }
+
     /// No card is on show: the splice returned before its card pass (the
     /// footer's `tab_status` gate), so none keys the repaint or arms a wake.
     pub(crate) fn hide_all(&mut self) {
         for entry in &mut self.entries {
+            entry.was_shown = entry.shown;
             entry.shown = false;
             entry.line.on = false;
         }
+    }
+
+    /// Whether this window keeps a card for `session` (on show or not):
+    /// the splice tells its card pass when that session's drawer left
+    /// ([`drawerless_leaf`]).
+    pub(crate) fn keeps(&self, session: u64) -> bool {
+        self.entries.iter().any(|e| e.session == session)
     }
 
     /// Whether any card is on show in this window.
@@ -673,6 +770,15 @@ impl WindowCards {
     /// The lines this frame draws, for the footer's write.
     pub(crate) fn lines(&self) -> impl Iterator<Item = &CardLine> {
         self.entries.iter().map(|e| &e.line).filter(|l| l.on)
+    }
+
+    /// The frame cells each card on show stands over, its border and air
+    /// included ([`CardEntry::glass_box`]): the resident pet's occupied
+    /// ground, like the footer's written cells (`crate::pet_chrome`).
+    /// Without it the cat took the card's blank corner under the mascot,
+    /// inside the rainbow border, for clean ground.
+    pub(crate) fn glass_boxes(&self) -> impl Iterator<Item = (usize, usize, usize, usize)> + '_ {
+        self.entries.iter().filter(|e| e.shown).map(|e| e.glass_box)
     }
 }
 
@@ -693,31 +799,27 @@ fn wanted_frame(
         .filter(|_| crate::active_tab_displays_session(ws, views, entry.session))
 }
 
-/// Take back the light, ink and star the last splice appended to `scratch`'s
-/// streams: each recorded entry once, wherever it still is, and nothing
-/// else. A stream a producer has refilled since (a re-extract, a split's
-/// compose: the effects pass republishes every frame) holds none of it, and
-/// that part costs a look at the stream and the record's rows, no sort
-/// ([`remove_each_once`]); one a later band splice scrubbed rows from
-/// (`scrub_overlay_row_band`) loses the rest. Called where the footer's
-/// `undo` runs — the top of a frame, the top of a compose and the top of the
-/// splice — so a re-splice of an unrefilled scratch never doubles the light.
-/// The record is consumed.
+/// Take back the layers, ink and star the last splice put on `scratch`:
+/// each card's two layers by their ids, wherever they still are (a compose
+/// that cleared the layers holds none of them, and a walk of the layers
+/// finds that), and each recorded ink cell and star once, wherever it still
+/// is, and nothing else. A stream a producer has refilled since (a
+/// re-extract, a split's compose: the effects pass republishes every frame)
+/// holds none of it, and that part costs a look at the stream and the
+/// record's rows, no sort ([`remove_each_once`]); one a later band splice
+/// scrubbed rows from (`scrub_overlay_row_band`) loses the rest. Called
+/// where the footer's `undo` runs — the top of a frame, the top of a compose
+/// and the top of the splice — so a re-splice of an unrefilled scratch never
+/// doubles a card, and at a capture's one-pane refill, which keeps the
+/// layers: a tab strip's prepend moves a grid-space layer (its offset and
+/// clip) before the splice looks, and a moved layer is no longer the one
+/// recorded. The record is consumed.
 pub(crate) fn strip(cards: &mut WindowCards, scratch: &mut RenderInput) {
     if cards.painted.is_empty() {
         return;
     }
     let (painted, keys) = (&mut cards.painted, &mut cards.keys);
-    remove_each_once(
-        &mut scratch.glow_under,
-        &painted.under,
-        keys,
-        quad_key,
-        |q| q.row,
-    );
-    remove_each_once(&mut scratch.nova_add, &painted.over, keys, quad_key, |q| {
-        q.row
-    });
+    withdraw_card_layers(&mut scratch.fx_layers, &painted.layers);
     remove_each_once(&mut scratch.ink, &painted.ink, keys, ink_key, |c| c.row);
     remove_each_once(
         &mut scratch.word_decorations,
@@ -729,56 +831,33 @@ pub(crate) fn strip(cards: &mut WindowCards, scratch: &mut RenderInput) {
     painted.clear();
 }
 
-/// Cut what the last splice put on the glass out of the frame cells `rect`:
-/// the tab context menu (`App::splice_tab_menu`), topmost chrome painted
-/// after the card, hangs from the first grid row, where a fresh card sits,
-/// and no light, ink or star of the card may show on it. A light quad over
-/// the rectangle keeps only its parts either side of it ([`cut_quad`]); an
-/// inked cell or the star inside it goes. The record is cut the same way, so
-/// [`strip`] still takes back exactly what is on the glass. `cw` and `pad`
-/// are the window's cell width and left padding: `glow_under` is window
-/// pixels, `nova_add` grid-interior ones; in both a quad's `row` is its
-/// frame row.
+/// Cut the line's ink and star the last splice put on the glass out of the
+/// frame cells `rect`: the tab menus (`App::splice_tab_menu`, the Autopilot
+/// menu), topmost chrome painted after the card, hang from the first grid
+/// row, where a fresh card sits, and no ink or star of the card may show on
+/// them. The card's layers are cut there by the occluder the menu's own
+/// scrub pushes (`app_render::scrub_overlay_card`), which the renderers
+/// subtract from every layer. The record is cut the same way, so [`strip`]
+/// still takes back exactly what is on the glass.
 pub(crate) fn cut_out(
     cards: &mut WindowCards,
     scratch: &mut RenderInput,
     rect: crate::tab_menu::MenuRect,
-    cw: usize,
-    pad: usize,
 ) {
-    if cards.painted.is_empty() {
+    if cards.painted.ink.is_empty() && cards.painted.decos.is_empty() {
         return;
     }
     let rows = rect.row..rect.row + rect.h;
     let cols = rect.col..rect.col + rect.w;
-    let span = |origin: usize| (origin + rect.col * cw)..(origin + (rect.col + rect.w) * cw);
-    let (window_px, grid_px) = (span(pad), span(0));
     let inside =
         |row: u16, col: u16| rows.contains(&usize::from(row)) && cols.contains(&usize::from(col));
     let WindowCards {
         painted,
         keys,
-        spare_quads,
         spare_ink,
         spare_decos,
         ..
     } = cards;
-    cut_each_once(
-        &mut scratch.glow_under,
-        &mut painted.under,
-        keys,
-        spare_quads,
-        quad_key,
-        |q, out| rows.contains(&usize::from(q.row)) && cut_quad(q, window_px.clone(), out),
-    );
-    cut_each_once(
-        &mut scratch.nova_add,
-        &mut painted.over,
-        keys,
-        spare_quads,
-        quad_key,
-        |q, out| rows.contains(&usize::from(q.row)) && cut_quad(q, grid_px.clone(), out),
-    );
     cut_each_once(
         &mut scratch.ink,
         &mut painted.ink,
@@ -795,54 +874,6 @@ pub(crate) fn cut_out(
         deco_key,
         |d, _| inside(d.row, d.col),
     );
-}
-
-/// What is left of light quad `q` outside the pixel columns `xs`, pushed to
-/// `out`: `false` (nothing pushed) when the quad is clear of them; otherwise
-/// `true`, and its part left of them and its part right of them, each where
-/// there is one. A piece's ends are read off the quad's own ramp
-/// (`GlowQuad::color2`) at the cut, so it draws what the whole drew there,
-/// within the ramp's integer rounding; a flat quad's pieces are flat.
-fn cut_quad(q: &GlowQuad, xs: std::ops::Range<usize>, out: &mut Vec<GlowQuad>) -> bool {
-    let (x0, x1) = (usize::from(q.x), usize::from(q.x) + usize::from(q.w));
-    if x1 <= xs.start || x0 >= xs.end {
-        return false;
-    }
-    if x0 < xs.start {
-        out.push(quad_piece(q, 0, xs.start - x0));
-    }
-    if x1 > xs.end {
-        out.push(quad_piece(q, xs.end - x0, x1 - x0));
-    }
-    true
-}
-
-/// Columns `[from, to)` of quad `q` (relative to its left edge) as a quad of
-/// their own, its ends sampled on `q`'s ramp at those edges.
-fn quad_piece(q: &GlowQuad, from: usize, to: usize) -> GlowQuad {
-    let w = usize::from(q.w).max(1);
-    // One channel's value at relative x on the line from `a` (x = 0) to `b`
-    // (x = w), rounded half up.
-    let at = |a: u32, b: u32, x: usize| {
-        let (w, x) = (w as u64, x as u64);
-        ((u64::from(a) * (w - x) + u64::from(b) * x + w / 2) / w) as u32
-    };
-    let rgb = |x: usize| {
-        [16, 8, 0]
-            .iter()
-            .map(|s| at((q.color >> s) & 0xff, (q.color2 >> s) & 0xff, x) << s)
-            .fold(0, |acc, c| acc | c)
-    };
-    let alpha = |x: usize| at(u32::from(q.alpha), u32::from(q.alpha2), x) as u8;
-    GlowQuad {
-        x: u16_of(usize::from(q.x) + from),
-        w: u16_of(to - from),
-        color: rgb(from),
-        alpha: alpha(from),
-        color2: rgb(to),
-        alpha2: alpha(to),
-        ..*q
-    }
 }
 
 /// Replace in `stream`, once each and in its place, every one of `ours`
@@ -909,15 +940,6 @@ fn take_key(keys: &mut [(EntryKey, bool)], k: EntryKey) -> bool {
 /// An entry's identity for [`remove_each_once`]: every field, packed.
 type EntryKey = [u64; 3];
 
-/// A light quad's [`EntryKey`]: position, size, both ends' colour and opacity.
-fn quad_key(q: &GlowQuad) -> EntryKey {
-    [
-        u64::from(q.row) << 48 | u64::from(q.x) << 32 | u64::from(q.y) << 16 | u64::from(q.w),
-        u64::from(q.h) << 48 | u64::from(q.alpha) << 40 | u64::from(q.color),
-        u64::from(q.alpha2) << 32 | u64::from(q.color2),
-    ]
-}
-
 /// An ink cell's [`EntryKey`].
 fn ink_key(c: &InkCell) -> EntryKey {
     [
@@ -982,6 +1004,37 @@ fn remove_each_once<T: Copy + PartialEq>(
     keys.extend(ours.iter().map(|o| (key(o), false)));
     keys.sort_unstable();
     stream.retain(|item| !take_key(keys, key(item)));
+}
+
+/// Append precisely the card's nonempty layers and remember that contribution.
+fn append_card_frame(
+    painted: &mut CardPainted,
+    scratch: &mut RenderInput,
+    session: u64,
+    frame: aterm_effects::harness_card::CardFrame,
+    pane: PxRect,
+    grid: (i32, i32),
+) {
+    for layer in frame.layers(session, pane, grid) {
+        if !layer.clip.is_empty() && !layer.content.items().is_empty() {
+            painted.layers.push(layer.clone());
+            scratch.fx_layers.push(layer);
+        }
+    }
+}
+
+/// Take back one exact occurrence of each recorded layer, retaining other
+/// producers even when they carry the same id. The common tail needs no scan.
+fn withdraw_card_layers(stream: &mut Vec<FxLayer>, ours: &[FxLayer]) {
+    if stream.ends_with(ours) {
+        stream.truncate(stream.len() - ours.len());
+        return;
+    }
+    for layer in ours.iter().rev() {
+        if let Some(at) = stream.iter().rposition(|other| other == layer) {
+            stream.remove(at);
+        }
+    }
 }
 
 /// Put each written line's ink and star on the glass, recorded for [`strip`]:
@@ -1056,6 +1109,35 @@ thread_local! {
     static TEST_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The constellation the `card` verb pinned ([`crate::card_verb`]):
+    /// every card armed while it stands seeds its stars with it, in place of
+    /// its session and process. The main thread's; a test's thread pins its
+    /// own cards only.
+    static SEED_PIN: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the cards' constellation to `seed` (`None`: each card's own again),
+/// for the cards armed from now on (`card seed=`, [`crate::card_verb`]).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn pin_card_seed(seed: Option<u64>) {
+    SEED_PIN.with(|pin| pin.set(seed));
+}
+
+/// The pinned constellation ([`pin_card_seed`]); never one in a release
+/// build.
+fn pinned_seed() -> Option<u64> {
+    #[cfg(any(test, debug_assertions))]
+    {
+        SEED_PIN.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        None
+    }
+}
+
 /// SplitMix64's finalizer: a seed and a key term from plain integers.
 fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1077,12 +1159,12 @@ fn pack_fill((r, g, b): (f32, f32, f32)) -> u32 {
 
 /// HOW A CARD'S LINE ENDS (`docs/DESIGN-harness-autopilot-2026-10-15.md`
 /// §9.4.1, §10.2.3 item 2): with the Autopilot's own words (`· autopilot ⤓
-/// land`), or, under Land or Cruise, with how the work ended — `· autopilot
-/// ✓ landed` (a landing ended it) or `· autopilot ✓ done` (the done check or
-/// the worker's own token ended it), the words the chip's own faces use. A
-/// landing spent, or a person's own exchange, keeps the mode's words: the
-/// card says the mode, the chip says it is quiet. Under Cruise an armed
-/// timer follows the mode (§10.6): `· autopilot ∞ cruise ⤓18:00`.
+/// land`), or, under Land, with how the work ended — `· autopilot ✓ landed`
+/// (all of it is on the remote main branch), the words the chip's own face
+/// uses. A person's own exchange keeps the mode's words: the card says the
+/// mode, the chip says it is quiet. Cruise takes nothing as the end, so its
+/// line always says the mode; an armed timer follows it (§10.6): `·
+/// autopilot ∞ cruise ⤓18:00`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum LineEnd {
     /// The Autopilot's own words.
@@ -1090,8 +1172,6 @@ pub(crate) enum LineEnd {
     Mode,
     /// `✓ landed`.
     Landed,
-    /// `✓ done`.
-    Done,
     /// `∞ cruise ⤓18:00` — `⤓Sat 18:00` on another day: Cruise until the
     /// armed timer's time (`ChipFace::CruiseUntil`), as the timer's index
     /// gives it (`ChipGlass::land_at`) and the title writes it
@@ -1101,15 +1181,12 @@ pub(crate) enum LineEnd {
 
 impl LineEnd {
     /// The end a line under `view` takes for the task's face `task` (`None`:
-    /// unknown): a face only where the harness carries the work (Land, and
-    /// Cruise since §10.2), and only its two ends.
+    /// unknown): a landing, under Land alone (Cruise takes nothing as the
+    /// end).
     #[must_use]
     pub(crate) const fn of(view: AutopilotView, task: Option<TaskFace>) -> Self {
         match (view, task) {
-            (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Landed)) => {
-                LineEnd::Landed
-            }
-            (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Done)) => LineEnd::Done,
+            (AutopilotView::Land, Some(TaskFace::Landed)) => LineEnd::Landed,
             _ => LineEnd::Mode,
         }
     }
@@ -1133,7 +1210,6 @@ impl LineEnd {
         let face = match self {
             LineEnd::Mode | LineEnd::CruiseUntil(_) => return (view.glyph(), view.wire()),
             LineEnd::Landed => crate::claude_lights::ChipFace::Landed,
-            LineEnd::Done => crate::claude_lights::ChipFace::Done,
         };
         match face.word() {
             Some(word) => (face.glyph(), word),
@@ -1147,18 +1223,16 @@ impl LineEnd {
 /// runs, and a frame formats nothing — they are looked up only where the
 /// card is laid out, when its key moves or the cells its layout read do.
 fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
-    static TEXTS: [OnceLock<Vec<String>>; 7] = [const { OnceLock::new() }; 7];
-    // A task's end is told where the harness carries the work (Land, and
-    // Cruise since §10.2): its words are the face's alone, whichever mode;
-    // an armed timer's time follows Cruise's own words (§10.6).
+    static TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
+    // A landing is told under Land alone: its words are the face's; an
+    // armed timer's time follows Cruise's own words (§10.6).
     let end = match (view, end) {
         (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => return timed_line_texts(None, at),
-        (AutopilotView::Land | AutopilotView::Cruise, _) => end,
+        (AutopilotView::Land, _) => end,
         _ => LineEnd::Mode,
     };
     let slot = match (view, end) {
-        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Landed) => &TEXTS[5],
-        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Done) => &TEXTS[6],
+        (AutopilotView::Land, LineEnd::Landed) => &TEXTS[5],
         (AutopilotView::Cruise, _) => &TEXTS[0],
         (AutopilotView::Land, LineEnd::Mode | LineEnd::CruiseUntil(_)) => &TEXTS[1],
         (AutopilotView::Off, _) => &TEXTS[2],
@@ -1203,8 +1277,8 @@ fn make_line_texts(view: AutopilotView, end: LineEnd) -> Vec<String> {
 }
 
 fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'static [String] {
-    static AGY_TEXTS: [OnceLock<Vec<String>>; 7] = [const { OnceLock::new() }; 7];
-    static MUSE_TEXTS: [OnceLock<Vec<String>>; 7] = [const { OnceLock::new() }; 7];
+    static AGY_TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
+    static MUSE_TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
     let (agent, table) = match rows_kind {
         4 => ("agy", &AGY_TEXTS),
         1 => ("muse", &MUSE_TEXTS),
@@ -1214,12 +1288,11 @@ fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'stat
         (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => {
             return timed_line_texts(Some(agent), at);
         }
-        (AutopilotView::Land | AutopilotView::Cruise, _) => end,
+        (AutopilotView::Land, _) => end,
         _ => LineEnd::Mode,
     };
     let slot = match (view, end) {
-        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Landed) => &table[5],
-        (AutopilotView::Land | AutopilotView::Cruise, LineEnd::Done) => &table[6],
+        (AutopilotView::Land, LineEnd::Landed) => &table[5],
         (AutopilotView::Cruise, _) => &table[0],
         (AutopilotView::Land, LineEnd::Mode | LineEnd::CruiseUntil(_)) => &table[1],
         (AutopilotView::Off, _) => &table[2],
@@ -1657,23 +1730,6 @@ fn pixel(v: usize) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
-/// `over` — quads in window pixels — in the nova stream's grid-interior
-/// pixels, into `out` (emptied first): each moved left by `shift.0` (the
-/// window's padding) and up by `shift.1` (its padding and head), and one
-/// that would land left of or above the grid's origin left out.
-fn nova_of(over: &[GlowQuad], shift: (u16, u16), out: &mut Vec<GlowQuad>) {
-    #[cfg(test)]
-    crate::work_counts::card_nova_moved(over.len());
-    out.clear();
-    out.extend(over.iter().filter_map(|quad| {
-        Some(GlowQuad {
-            x: quad.x.checked_sub(shift.0)?,
-            y: quad.y.checked_sub(shift.1)?,
-            ..*quad
-        })
-    }));
-}
-
 /// `v` as a `u16` (a cell index or a pixel size), saturating.
 fn u16_of(v: usize) -> u16 {
     u16::try_from(v).unwrap_or(u16::MAX)
@@ -1896,22 +1952,294 @@ fn make_line(
     };
 }
 
-/// The footer's splice found a Claude Code pane on the glass (live viewport,
-/// facts in hand): gather what the card pass needs of it — the session's
-/// effective Autopilot `view` and whether this host supervises it
-/// (`supervised`), both read ONCE this frame by the caller
-/// ([`App::session_autopilot`]), and, where every gate holds (module header:
-/// `card_on` is the `[claude_footer] card` switch), the card read off the
-/// pane's cached text (`texts`) and the process it belongs to. `process` is
-/// that process — its group and the build its facts name — as the caller
-/// read them under its own timeline lock. A free function over the text
+/// Why a card on a pane is not decorated this frame (card engine §3.8; the
+/// dev rows' `card-bare reason=`, §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bare {
+    /// Not wrapped: the card switch off, an Autopilot that carries no card,
+    /// or no live claim of this host's (module header: GATES).
+    Unsupervised,
+    /// The current holder image is no card drawer with a token: a shell
+    /// (Claude stopped or gone), another command, an untracked image.
+    NoDrawer,
+    /// No card placed on the pane's rows (none, cut, narrow, redesigned).
+    NoCard,
+    /// The frame's fence is another holder's (`RenderInput::holder`).
+    Token,
+    /// The card is another reader's than the drawer's.
+    Kind,
+    /// The card's rows are not all in one span the drawer laid, or the
+    /// alternate screen is not wholly its.
+    Fence,
+    /// The drawer's mark is tainted: what lay under its cursor at its cut,
+    /// or a row motion the grid could not carry.
+    Tainted,
+    /// The card's banner fails the build policy.
+    Build,
+    /// The re-show bound holds this show back ([`RESHOW_MS`]).
+    Deferred,
+}
+
+impl Bare {
+    /// The word the dev row prints (`card-bare reason=`).
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Unsupervised => "unsupervised",
+            Self::NoDrawer => "no-drawer",
+            Self::NoCard => "no-card",
+            Self::Token => "token",
+            Self::Kind => "kind",
+            Self::Fence => "fence",
+            Self::Tainted => "tainted",
+            Self::Build => "build",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    /// Whether this hide is an IDENTITY OR FENCE hide, which bounds the
+    /// next show of the same card (§3.9: the drawer left, its token, kind,
+    /// build or fence refused the card). A viewport hide (scroll-back, a tab
+    /// switch, a menu: the pane is not gathered, or its card is only cut)
+    /// and an unwrapped one are not.
+    pub(crate) const fn bounds_reshow(self) -> bool {
+        matches!(
+            self,
+            Self::NoDrawer | Self::Token | Self::Kind | Self::Fence | Self::Tainted | Self::Build
+        )
+    }
+}
+
+/// What one card pass did with one pane's card, for the dev rows
+/// (`SessionTimeline::note_card_frame`, run only under the dev card probe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CardOutcome {
+    /// Decorated for drawer `token`, its card's banner at absolute row `row`;
+    /// `armed` names why an episode was armed this frame (`new`, `view`).
+    Decorated {
+        token: u64,
+        row: i64,
+        armed: Option<&'static str>,
+    },
+    /// Left bare, the current drawer's token (`0` with none), why, and the
+    /// absolute row of the banner of the card left bare where one was read.
+    Bare(u64, Bare, Option<i64>),
+}
+
+/// The frame's fence as one pane's frame source carries it, read under the
+/// extraction lock with its cells (`RenderInput::holder`, `base_y`,
+/// `engine_alt`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FenceFrame {
+    pub(crate) holder: aterm_core::terminal::HolderView,
+    /// The absolute row of the pane's top visible line.
+    pub(crate) base_y: i64,
+    /// The frame shows the alternate screen.
+    pub(crate) alt: bool,
+}
+
+impl FenceFrame {
+    /// `scratch`'s fence: the pane's frame source.
+    pub(crate) fn of(scratch: &RenderInput) -> Self {
+        Self {
+            holder: scratch.holder,
+            base_y: scratch.base_y,
+            alt: scratch.engine_alt,
+        }
+    }
+}
+
+/// THE GATE (card engine §3.8, I3): whether `read`, a card placed on a pane
+/// at a live viewport, is the current drawer's own — checked cheapest
+/// first: the frame's fence names the drawer's token; the card is the
+/// drawer's reader's; its rows lie in one span the drawer laid (main), or
+/// the alternate screen is wholly the drawer's (alt); and its banner passes
+/// the build policy. Integer compares only.
+pub(crate) fn admit(
+    gate: &crate::holder_image::CardGate,
+    fence: &FenceFrame,
+    read: &CardRead,
+) -> Result<(), Bare> {
+    use crate::holder_image::GateBuild;
+    token_holds(gate, fence)?;
+    if read.kind != gate.kind {
+        return Err(Bare::Kind);
+    }
+    fence_holds(fence, read.place.top, gate.rows.max(read.place.rows))?;
+    match gate.build {
+        GateBuild::Exact(build) | GateBuild::Registry(build) if read.build == Some(build) => Ok(()),
+        GateBuild::ProvenanceOnly => Ok(()),
+        GateBuild::Exact(_) | GateBuild::Registry(_) | GateBuild::None => Err(Bare::Build),
+    }
+}
+
+/// The gate's first check: the frame's fence names the drawer's token (a
+/// zero on either side is no drawer's).
+fn token_holds(gate: &crate::holder_image::CardGate, fence: &FenceFrame) -> Result<(), Bare> {
+    if gate.token == 0 || fence.holder.token != gate.token {
+        return Err(Bare::Token);
+    }
+    Ok(())
+}
+
+/// THE FENCE (§3.8 step 4), one rule for every row the gate holds to the
+/// drawer: on main, `rows` rows from pane row `top` lie in one span the
+/// drawer laid, its mark untainted; on alt, the alternate screen is wholly
+/// the drawer's.
+fn fence_holds(fence: &FenceFrame, top: usize, rows: usize) -> Result<(), Bare> {
+    if fence.alt {
+        return if fence.holder.admits_alt() {
+            Ok(())
+        } else {
+            Err(Bare::Fence)
+        };
+    }
+    if fence.holder.tainted {
+        return Err(Bare::Tainted);
+    }
+    let lo = u64::try_from(fence.base_y)
+        .ok()
+        .and_then(|base| base.checked_add(top as u64));
+    if lo.is_some_and(|lo| fence.holder.admits_rows(lo, lo.saturating_add(rows as u64))) {
+        Ok(())
+    } else {
+        Err(Bare::Fence)
+    }
+}
+
+/// The gate's verdict on one pane's card this frame: the card read off the
+/// pane's cached text and the number of the CURRENT rebuild of that text
+/// (`claude_footer::PaneTextCache::launch_card`), or why it stays bare.
+pub(crate) type Verdict = Result<(Arc<CardRead>, u64), Bare>;
+
+/// One pane's gate this frame (card engine §3.8): the current drawer's gate
+/// as the splice read it under its one timeline lock
+/// (`SessionTimeline::card_gate`), the frame's fence, and the verdict,
+/// computed at most once ([`Self::verdict`]) and handed to both the card
+/// ([`card_leaf`]) and the footer's kept card
+/// (`SessionTimeline::note_claude_card`), so the footer keeps no
+/// predecessor's card.
+#[derive(Debug)]
+pub(crate) struct GateCheck {
+    gate: Option<crate::holder_image::CardGate>,
+    fence: FenceFrame,
+    verdict: Option<Verdict>,
+    /// The top row on the pane of the card the verdict refused (the dev
+    /// rows' [`Self::refused_row`]).
+    refused_top: Option<usize>,
+}
+
+impl GateCheck {
+    pub(crate) fn new(gate: Option<crate::holder_image::CardGate>, fence: FenceFrame) -> Self {
+        Self {
+            gate,
+            fence,
+            verdict: None,
+            refused_top: None,
+        }
+    }
+
+    /// The absolute row of the banner of the card the verdict refused, once
+    /// it was made: the dev rows' `card-bare row=` (§8's judge).
+    pub(crate) fn refused_row(&self) -> Option<i64> {
+        self.refused_top.map(|top| {
+            self.fence
+                .base_y
+                .saturating_add(i64::try_from(top).unwrap_or(i64::MAX))
+        })
+    }
+
+    /// The drawer's token, or `0` with no drawer.
+    pub(crate) fn token(&self) -> u64 {
+        self.gate.map_or(0, |g| g.token)
+    }
+
+    /// The verdict on leaf `leaf_index`'s card, `session`'s: made the first
+    /// time it is asked, from the reading the pane's text cache already
+    /// holds or takes once per rebuild, and kept for the rest of the frame.
+    /// No drawer reads no card.
+    pub(crate) fn verdict(
+        &mut self,
+        texts: &crate::claude_footer::PaneTextCache,
+        leaf_index: usize,
+        session: u64,
+    ) -> &Verdict {
+        let (gate, fence, refused) = (self.gate, self.fence, &mut self.refused_top);
+        self.verdict.get_or_insert_with(|| {
+            let gate = gate.ok_or(Bare::NoDrawer)?;
+            // Cheapest first: a fence of another holder's reads no card.
+            token_holds(&gate, &fence)?;
+            let (read, text_gen) = texts.launch_card(leaf_index, session).ok_or(Bare::NoCard)?;
+            if let Err(why) = admit(&gate, &fence, &read) {
+                *refused = Some(read.place.top);
+                return Err(why);
+            }
+            Ok((read, text_gen))
+        })
+    }
+
+    /// Whether the footer's launch card reading (`footer::launch_card_read`)
+    /// is the drawer's own, so the footer's facts may keep it
+    /// (`SessionTimeline::note_claude_card`): read by `program`'s reader,
+    /// its card's banner at pane row `banner` is the card the verdict
+    /// admitted ([`Self::verdict`]: that card, that reader), and the live
+    /// status row that named its model (`status`, agy's and Muse Code's
+    /// footers) lies where the drawer drew ([`fence_holds`], its token and
+    /// its reader). A reading of neither row, or by no drawer's reader, is
+    /// not. Integers, and the verdict this frame shares with the card.
+    pub(crate) fn admits_reading(
+        &mut self,
+        texts: &crate::claude_footer::PaneTextCache,
+        leaf_index: usize,
+        session: u64,
+        program: aterm_phase::Program,
+        banner: Option<usize>,
+        status: Option<usize>,
+    ) -> bool {
+        let Some(kind) =
+            crate::holder_image::CardProgram::from_program(program).map(|p| p.rows_kind())
+        else {
+            return false;
+        };
+        if banner.is_none() && status.is_none() {
+            return false;
+        }
+        if let Some(row) = status {
+            let Some(gate) = self.gate else {
+                return false;
+            };
+            if gate.kind != kind
+                || token_holds(&gate, &self.fence).is_err()
+                || fence_holds(&self.fence, row, 1).is_err()
+            {
+                return false;
+            }
+        }
+        banner.is_none_or(|top| {
+            matches!(
+                self.verdict(texts, leaf_index, session),
+                Ok((read, _)) if read.place.top == top && read.kind == kind
+            )
+        })
+    }
+}
+
+/// The footer's splice found a terminal pane at a live viewport whose
+/// holder is a card drawer or whose footer facts are held: gather what the
+/// card pass needs of it — the session's effective Autopilot `view` and
+/// whether this host supervises it (`supervised`), both read ONCE this frame
+/// by the caller ([`App::session_autopilot`]), and, where the card is
+/// wrapped (`card_on` is the `[claude_footer] card` switch) and the gate
+/// admits it ([`GateCheck::verdict`], card engine §3.8), the card read off
+/// the pane's cached text (`texts`) and the drawer's token. The checks run
+/// cheapest first: wrapped, then the gate's. A free function over the text
 /// cache alone, with no `App`: it can reach no session, so it takes no lock
-/// (the PTY reader holds the timeline's while Claude streams) — a second
-/// one cannot be put back here without the compiler saying so — and nothing
-/// is copied: the reading is the cache's.
+/// (the PTY reader holds the timeline's while Claude streams; the gate was
+/// read under the splice's one lock) — a second one cannot be put back here
+/// without the compiler saying so — and nothing is copied: the reading is
+/// the cache's.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the pane's place, its session, its geometry and ground, its Autopilot and its process"
+    reason = "the pane's place, its session, its geometry and ground, its Autopilot and its gate"
 )]
 pub(crate) fn card_leaf(
     texts: &crate::claude_footer::PaneTextCache,
@@ -1922,17 +2250,18 @@ pub(crate) fn card_leaf(
     blank: RenderCell,
     view: AutopilotView,
     supervised: bool,
-    process: Option<(i32, &str)>,
+    check: &mut GateCheck,
 ) -> CardLeaf {
     let wrapped = card_on && view.carries() && supervised;
-    let card = wrapped
-        .then(|| {
-            let (pgid, version) = process?;
-            let (read, text_gen) = texts.launch_card(leaf_index, session)?;
-            // A card of another build is a process that is gone.
-            (*read.version == *version).then_some((read, pgid, text_gen))
-        })
-        .flatten();
+    let token = check.token();
+    let (card, bare) = if wrapped {
+        match check.verdict(texts, leaf_index, session) {
+            Ok((read, text_gen)) => (Some((Arc::clone(read), token, *text_gen)), None),
+            Err(why) => (None, Some(*why)),
+        }
+    } else {
+        (None, Some(Bare::Unsupervised))
+    };
     CardLeaf {
         leaf_index,
         session,
@@ -1941,6 +2270,41 @@ pub(crate) fn card_leaf(
         view,
         end: LineEnd::Mode,
         card,
+        bare,
+        token,
+        row_base: check.fence.base_y,
+        bare_row: if wrapped { check.refused_row() } else { None },
+        drawerless: false,
+    }
+}
+
+/// A pane on the glass whose holder is no drawer and whose footer facts are
+/// not held (Claude stopped by Ctrl-Z, or gone), where this window still
+/// keeps a card for its session: no card is read and no Autopilot asked,
+/// but the card pass learns its card left by IDENTITY, which bounds its
+/// next show (§3.9, [`RESHOW_MS`]).
+pub(crate) fn drawerless_leaf(leaf_index: usize, session: u64, pane: PaneGeom) -> CardLeaf {
+    CardLeaf {
+        leaf_index,
+        session,
+        pane,
+        blank: RenderCell::default(),
+        view: AutopilotView::Off,
+        end: LineEnd::Mode,
+        card: None,
+        bare: Some(Bare::NoDrawer),
+        token: 0,
+        row_base: 0,
+        bare_row: None,
+        drawerless: true,
+    }
+}
+
+impl CardLeaf {
+    /// Whether this leaf read leaf `index`'s card (not a hide alone): its
+    /// pane's text stays cached (`claude_footer::PaneTextCache::retain_active`).
+    pub(crate) fn reads(&self, index: usize) -> bool {
+        self.leaf_index == index && !self.drawerless
     }
 }
 
@@ -1979,22 +2343,27 @@ impl App {
     }
 
     /// The card pass of the footer's splice: decorate each gathered pane's
-    /// card on window `wid`'s frame — the light appended to its streams and
-    /// recorded for [`strip`] — and make each its line, which the footer's
+    /// card on window `wid`'s frame — its two fx layers pushed and recorded
+    /// for [`strip`] — and make each its line, which the footer's
     /// write then takes ([`WindowCards::lines`]). Episodes are armed here (a
     /// new process's card, an Autopilot that moved), the cards of closed
     /// sessions are forgotten, and every card not decorated this frame stops
     /// keying the repaint. `leaves` is handed back to the window
     /// ([`WindowCards::take_leaves`]), empty.
     ///
-    /// A card at rest costs a copy (module header: WHAT A FRAME COSTS): the
-    /// clock is read only to arm an episode or draw one of its frames, and
+    /// A card at rest costs two layers handed on, its kept contents by
+    /// pointer (module header: WHAT A FRAME COSTS): the clock is read only
+    /// to arm an episode or draw one of its frames, and
     /// the motion policy, the window's pixels and the kitty's look only
     /// where a card is decorated.
     pub(crate) fn compose_claude_cards(&mut self, wid: WindowId, mut leaves: Vec<CardLeaf>) {
         let Some(focused) = self.windows.get(&wid).map(|ws| ws.focused) else {
             return;
         };
+        // The dev rows' probe (`holder_image::DEV_ROWS` builds run with
+        // `ATERM_DEV_CARD_PROBE=1`): each leaf's outcome is noted on its
+        // session's timeline after the pass, and nowhere else.
+        let probe = crate::holder_image::DEV_ROWS && self.session_factory.card_probe;
         // What the card is drawn with, read before the window is borrowed —
         // and only where one is decorated.
         let look = leaves
@@ -2029,11 +2398,10 @@ impl App {
         cards.entries.retain(|e| pool.get(e.session).is_some());
         cards.hide_all();
         let mut clock = LazyNow::default();
+        let mut outcomes = std::mem::take(&mut cards.outcomes);
         let WindowCards {
             entries,
             painted,
-            under,
-            over,
             seen,
             ..
         } = cards;
@@ -2053,7 +2421,7 @@ impl App {
             if let Some(at) = at {
                 entries[at].leaf_index = leaf.leaf_index;
             }
-            let Some(((read, pgid, text_gen), look)) = leaf.card.as_ref().zip(look) else {
+            let Some(((read, token, text_gen), look)) = leaf.card.as_ref().zip(look) else {
                 // Not decorated this frame: follow its Autopilot only into a
                 // mode that keeps the card bare (Off, the master switch), so a
                 // move back into Cruise or Land is a change that arms. A
@@ -2062,15 +2430,59 @@ impl App {
                 // going back to Cruise and the new worker's claim (tens of ms)
                 // is drawn bare — recording Cruise there would leave the
                 // decorated frame after it no change to arm on. The same keeps
-                // a card scrolled back, or under another build, from arming
-                // anything when it shows again under the mode it had.
-                if let Some(at) = at
-                    && !leaf.view.carries()
-                {
-                    entries[at].view = leaf.view;
+                // a card scrolled back, or refused by its gate, from arming
+                // anything when it shows again under the mode it had. A hide
+                // by identity or fence bounds the card's next show
+                // ([`RESHOW_MS`]), and a show held back is dropped: there is
+                // no card to show.
+                let why = leaf.bare.unwrap_or(Bare::NoCard);
+                if let Some(at) = at {
+                    let entry = &mut entries[at];
+                    entry.deferred = None;
+                    entry.gate_hid |= why.bounds_reshow();
+                    if !leaf.drawerless && !leaf.view.carries() {
+                        entry.view = leaf.view;
+                    }
+                }
+                if probe {
+                    outcomes.push((
+                        leaf.session,
+                        CardOutcome::Bare(leaf.token, why, leaf.bare_row),
+                    ));
                 }
                 continue;
             };
+            let same = |e: &CardEntry| e.identity == *token;
+            // THE RE-SHOW BOUND: the same card shown again after its identity
+            // or its fence hid it waits out [`RESHOW_MS`] from its previous
+            // show's start, its wake armed for that instant ([`CardEntry::due`]).
+            // Read on a show's start only: a card on show reads no clock here.
+            if let Some(at) = at
+                && same(&entries[at])
+                && !entries[at].was_shown
+            {
+                let entry = &mut entries[at];
+                if entry.gate_hid {
+                    let now = clock.get();
+                    let until = entry
+                        .shown_since
+                        .checked_add(Duration::from_millis(RESHOW_MS))
+                        .unwrap_or(now);
+                    if now < until {
+                        entry.deferred = Some(until);
+                        entry.asked = false;
+                        if probe {
+                            let row = leaf.row_base.saturating_add(read.place.top as i64);
+                            outcomes.push((
+                                leaf.session,
+                                CardOutcome::Bare(*token, Bare::Deferred, Some(row)),
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                entry.deferred = None;
+            }
             let key = LaidKey {
                 pane: leaf.pane,
                 blank: leaf.blank,
@@ -2081,7 +2493,6 @@ impl App {
                 serious: look.serious,
                 kitty: look.kitty,
             };
-            let same = |e: &CardEntry| e.identity.0 == *pgid && *e.identity.1 == *read.version;
             // The layout and the scene: the card's own while their key holds
             // and the cells its layout read say what they said — known
             // without a look while the pane's text is the same rebuild, else
@@ -2128,38 +2539,58 @@ impl App {
                         keep(entry, None, seen);
                     }
                 }
+                if probe {
+                    let row = leaf.row_base.saturating_add(read.place.top as i64);
+                    outcomes.push((
+                        leaf.session,
+                        CardOutcome::Bare(*token, Bare::NoCard, Some(row)),
+                    ));
+                }
                 continue;
             };
+            let mut armed = None;
             let at = match at {
                 Some(at) if same(&entries[at]) => {
-                    if entries[at].view != leaf.view {
-                        entries[at].arm(clock.get());
+                    let entry = &mut entries[at];
+                    if !entry.was_shown {
+                        // A show starts: the re-show bound's anchor.
+                        entry.shown_since = clock.get();
+                        entry.gate_hid = false;
+                    }
+                    if entry.view != leaf.view {
+                        entry.arm(clock.get());
+                        armed = Some("view");
                     }
                     at
                 }
-                // First decorated for this process: a new card, a new episode.
+                // First decorated for this drawer: a new card, a new episode,
+                // never held back.
                 found => {
                     let now = clock.get();
                     let mut entry = CardEntry {
                         leaf_index: leaf.leaf_index,
                         session: leaf.session,
-                        identity: (*pgid, read.version.clone()),
+                        identity: *token,
                         card: HarnessCard::default(),
                         view: leaf.view,
                         armed_at: now,
                         ticked_at: now,
                         shown: false,
+                        was_shown: false,
+                        shown_since: now,
+                        gate_hid: false,
+                        deferred: None,
                         asked: false,
                         place: (0, 0, 0, 0),
-                        kept: SettledFrame::default(),
-                        nova: Vec::new(),
-                        nova_at: None,
+                        glass_box: (0, 0, 0, 0),
+                        frames: CardFrames::default(),
                         laid: None,
                         laid_gen: 0,
                         seen: Seen::default(),
                         line: CardLine::default(),
                     };
                     entry.arm(now);
+                    armed = Some("new");
                     match found {
                         Some(at) => {
                             entries[at] = entry;
@@ -2174,41 +2605,35 @@ impl App {
             };
             let entry = &mut entries[at];
             entry.view = leaf.view;
-            // The nova stream's pixels are grid-interior: the `over` quads
-            // move by the window's padding and head.
-            let shift = (u16_of(look.px.pad), u16_of(look.px.grid_top));
-            // A card at rest is replayed: its settled frame put on the
-            // glass from where it is kept, no clock read; an episode's frame
-            // is drawn on the clock.
-            let ticked = if entry.card.replay(&scene, look.animate, &entry.kept) {
-                if entry.nova_at != Some(shift) {
-                    nova_of(entry.kept.over(), shift, &mut entry.nova);
-                    entry.nova_at = Some(shift);
+            // A card at rest is replayed: its settled frame's own contents
+            // put on the glass at the scene's origin, no clock read, nothing
+            // built; an episode's frame is drawn on the clock.
+            let (frame, ticked) = match entry.card.replay(&scene, look.animate, &entry.frames) {
+                Some(frame) => (frame, None),
+                None => {
+                    let now = clock.get();
+                    let frame = entry
+                        .card
+                        .draw(now, &scene, look.animate, &mut entry.frames);
+                    (frame, Some(now))
                 }
-                // The border and the trail: window pixels, under the glyph ink.
-                scratch.glow_under.extend_from_slice(entry.kept.under());
-                painted.under.extend_from_slice(entry.kept.under());
-                None
-            } else {
-                // Drawn: its fingerprint, which nothing here reads, is
-                // never made.
-                let now = clock.get();
-                under.clear();
-                over.clear();
-                entry
-                    .card
-                    .draw_kept(now, &scene, look.animate, &mut entry.kept, under, over);
-                nova_of(over, shift, &mut entry.nova);
-                entry.nova_at = Some(shift);
-                scratch.glow_under.extend_from_slice(under);
-                painted.under.extend_from_slice(under);
-                Some(now)
             };
-            // The kitty and the stars: the nova stream's grid-interior
-            // pixels (every one lies right of the card's text, inside the
-            // pane).
-            scratch.nova_add.extend_from_slice(&entry.nova);
-            painted.over.extend_from_slice(&entry.nova);
+            // The two layers: the border and the trail in window pixels under
+            // the glyph ink, the kitty, its rim and the stars in the grid's
+            // (every one lies right of the card's text, inside the pane),
+            // both clipped to the pane.
+            if !frame.is_empty() {
+                let (cx0, cy0, cx1, cy1) = scene.clip;
+                let grid = (pixel(look.px.pad), pixel(look.px.grid_top));
+                append_card_frame(
+                    painted,
+                    scratch,
+                    entry.session,
+                    frame,
+                    PxRect::new(cx0, cy0, cx1, cy1),
+                    grid,
+                );
+            }
             #[cfg(test)]
             if ticked.is_some() {
                 crate::work_counts::card_ticked();
@@ -2219,6 +2644,15 @@ impl App {
             entry.shown = true;
             entry.asked = false;
             entry.place = (read.place.top, read.place.text_col, scene.rows, scene.cols);
+            // The air above is only what the pane has over the box.
+            let above = usize::from(lay.air.0).min(read.place.top);
+            let below = usize::from(lay.air.1);
+            entry.glass_box = (
+                leaf.pane.frame_row(read.place.top - above),
+                leaf.pane.frame_col(0),
+                lay.rows + above + below,
+                lay.cols + 1,
+            );
             if let Some(line) = &lay.line {
                 make_line(
                     &mut entry.line,
@@ -2234,8 +2668,104 @@ impl App {
                 );
             }
             keep(entry, Some((lay, scene)), seen);
+            if probe {
+                let row = leaf.row_base.saturating_add(read.place.top as i64);
+                outcomes.push((
+                    leaf.session,
+                    CardOutcome::Decorated {
+                        token: *token,
+                        row,
+                        armed,
+                    },
+                ));
+            }
         }
         cards.leaves = leaves;
+        if probe {
+            cards.composed += 1;
+            // The dev probe's own lock, one a pane judged: a dev seam's
+            // cost, counted apart from the splice's one lock a pane.
+            for (session, outcome) in outcomes.drain(..) {
+                if let Some(s) = pool.get(session) {
+                    #[cfg(test)]
+                    crate::work_counts::card_probe_locked();
+                    s.ctx
+                        .timeline
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .note_card_frame(outcome, cards.composed);
+                }
+            }
+        }
+        cards.outcomes = outcomes;
+    }
+
+    /// Queue the harness card's arts at window `wid`'s cell height for the
+    /// GPU's residency ahead of the card's first frame (design §4.3, eager
+    /// residency): when a card drawer's image is published for a session
+    /// the window shows ([`Self::prefetch_card_arts_for`]), and on a cell
+    /// metric change while one is in front (`App::sync_cell_pixel_size`).
+    /// The first admitted ask builds the arts for that cell height; this
+    /// publication or metric path can ask before drawing, while a draw that
+    /// gets there first may build them itself (`CardArts::for_cell`). The
+    /// window holds its admitted arts ([`WindowCards::arts`]) for the next
+    /// card. Unsupported heights and a switched-off card queue nothing.
+    pub(crate) fn prefetch_card_arts(&mut self, wid: WindowId) {
+        if !self.config.claude_footer_card() {
+            return;
+        }
+        let ch = u16_of(self.win_cell_size(wid).1);
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let arts = match &ws.claude_card.arts {
+            Some(arts) if arts.ch() == ch => Arc::clone(arts),
+            _ => {
+                let Some(arts) = CardArts::for_cell(ch) else {
+                    ws.claude_card.arts = None;
+                    return;
+                };
+                ws.claude_card.arts = Some(Arc::clone(&arts));
+                arts
+            }
+        };
+        let list: Vec<Arc<aterm_core::render::FxArt>> = arts.arts().cloned().collect();
+        self.queue_fx_prefetch(wid, &list);
+    }
+
+    /// [`Self::prefetch_card_arts`] for every window whose tab in front
+    /// shows `session`, when the session's published holder image is a card
+    /// drawer ([`Self::card_drawer_published`]). The status sweep calls it
+    /// for each session whose PTY reader published an image since the last
+    /// sweep (the edged inbox, card engine §3.5).
+    pub(crate) fn prefetch_card_arts_for(&mut self, session: u64) {
+        if !self.card_drawer_published(session) {
+            return;
+        }
+        let wids: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| crate::active_tab_displays_session(ws, &self.view_store, session))
+            .map(|(wid, _)| *wid)
+            .collect();
+        for wid in wids {
+            self.prefetch_card_arts(wid);
+        }
+    }
+
+    /// Whether `session`'s last published holder image is a card drawer
+    /// (Claude Code, agy, Muse Code) or atpkg's shim about to `exec` one
+    /// (`holder_image::HolderImage::drawer`, `launcher_for`): one timeline
+    /// lock, taken only on an edge or a metric change.
+    pub(crate) fn card_drawer_published(&self, session: u64) -> bool {
+        self.pool.get(session).is_some_and(|s| {
+            s.ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .holder_image()
+                .is_some_and(|image| image.drawer.is_some() || image.launcher_for.is_some())
+        })
     }
 
     /// The harness card's repaint-key term for one Claude Code leaf (plan
@@ -2273,6 +2803,19 @@ impl App {
                 .serious_mode_policy()
                 .allows(crate::motion::SeriousEffect::HarnessCard);
         let mut h = mix(u64::from(wrapped) | view.code() << 1 | u64::from(serious) << 8);
+        // A show the re-show bound holds back keys the repaint once it is
+        // due, so the frame its wake asks for goes through ([`RESHOW_MS`]):
+        // the clock is read only while one is held back.
+        if wrapped
+            && let Some(until) = ws
+                .claude_card
+                .entries
+                .iter()
+                .find(|e| (e.leaf_index, e.session) == (index, session))
+                .and_then(|e| e.deferred)
+        {
+            h ^= mix(0x5e5e_0000 | u64::from(card_now() >= until));
+        }
         if wrapped
             && let Some(entry) = ws
                 .claude_card
@@ -2363,17 +2906,30 @@ impl App {
                 .is_some_and(|when| when <= now)
         };
         let mut due = Vec::new();
+        // A show the re-show bound held back, due by now where no frame can
+        // draw it (its tab behind another, its window off screen): let go,
+        // like an episode run out — the splice that shows its window again
+        // shows it.
+        let let_go = |ws: &mut crate::WindowState| {
+            for entry in &mut ws.claude_card.entries {
+                if entry.deferred.is_some_and(|until| until <= now) {
+                    entry.asked = true;
+                }
+            }
+        };
         for (wid, ws) in &mut self.windows {
             for entry in &mut ws.claude_card.entries {
-                if entry.live() && entry.card.deadline(now).is_none() {
+                if entry.live() && entry.deferred.is_none() && entry.card.deadline(now).is_none() {
                     entry.asked = true;
                 }
             }
             let count = ws.claude_card.entries.len();
             let Some(first) = (0..count).find(|&at| due_at(ws, at)) else {
+                let_go(ws);
                 continue;
             };
             if !crate::messages_host::band_on_screen(ws) {
+                let_go(ws);
                 continue;
             }
             for at in first..count {
@@ -2408,6 +2964,41 @@ impl App {
         let now = now();
         for entry in ws.claude_card.entries.iter_mut().filter(|e| e.shown) {
             entry.arm(now);
+        }
+    }
+
+    /// The `card` verb ([`crate::card_verb`]): the constellation pin read,
+    /// or set (a debug or test build) and every card on show re-armed so
+    /// each draws its next frame from it; the line says how many.
+    pub(crate) fn control_card_seed(
+        &mut self,
+        asked: crate::card_verb::Asked,
+    ) -> Result<String, String> {
+        let crate::card_verb::Asked::Pin(seed) = asked else {
+            return Ok(crate::card_verb::line(pinned_seed(), 0));
+        };
+        #[cfg(any(test, debug_assertions))]
+        {
+            pin_card_seed(seed);
+            let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+            let mut rearmed = 0;
+            let mut now = LazyNow::default();
+            for wid in wids {
+                rearmed += self.windows[&wid]
+                    .claude_card
+                    .entries
+                    .iter()
+                    .filter(|e| e.shown)
+                    .count();
+                self.rearm_claude_cards(wid, || now.get());
+            }
+            self.request_redraw_all_windows();
+            Ok(crate::card_verb::line(seed, rearmed))
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            let _ = seed;
+            Err("card needs a debug build".to_string())
         }
     }
 }

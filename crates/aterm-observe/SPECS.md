@@ -45,7 +45,12 @@ after `process_at`.
 - `Eval(t)`: the evaluation points of a watcher armed on Terminal `t`. These are the arm call itself
   (`fresh = true`), plus each later `process_at` after which `WatcherSet::is_advance(content_seq, alt,
   epoch)` holds. At a point `e`, `Rows_e` is the `Vec<Option<String>>` of visible-row texts gathered
-  there, and `cseq_e` is the `content_seq` there.
+  there: `[]` when no range the watchers scanning there read meets the grid
+  (`WatcherSet::row_scan_hull` = `None`); otherwise one entry per visible row, the text of every row
+  in that hull (so every in-grid row of `r`) and `None` outside it. `Hit` and `Clear` read the same in
+  both shapes: an unlatched watcher scans at each of its points, so `r` is one of those ranges; in the
+  `[]` case it meets none of the grid's `n` rows, so `r.covers_any(0)` and `r.covers_any(n)` are both
+  false and no in-range row has text. `cseq_e` is the `content_seq` there.
 - `Hit(m,r,e)` := ∃ i < |Rows_e|: `r.contains(i)` ∧ `Rows_e[i] = Some(s)` ∧ `m.matches(s)`. This is
   `any_row_matches`.
 - `Clear(m,r,e)` := `r.covers_any(|Rows_e|)` ∧ ∀ i: (`r.contains(i)` ∧ `Rows_e[i] = Some(s)`) ⇒ `m.clears(s)`.

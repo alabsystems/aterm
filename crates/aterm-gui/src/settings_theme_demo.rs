@@ -179,7 +179,7 @@ const ZSH_STEPS: &[Step] = &[
     ),
     Step::Prompt,
     Step::Style(b"\x1b[2;90m"),
-    Step::Type(b"# themes follow the system appearance by default, and a pair names both sides"),
+    Step::Type(b"# one theme by default; Follow system pairs one for light and one for dark"),
     Step::Enter,
     Step::Prompt,
     Step::End,
@@ -225,7 +225,7 @@ const PWSH_STEPS: &[Step] = &[
     ),
     Step::Line(b"\x1b[90m 4 \xe2\x94\x82 \x1b[0m}\r\n"),
     Step::Prompt,
-    Step::Type(b"\x1b[32m# themes follow the system appearance by default, and a pair names both sides"),
+    Step::Type(b"\x1b[32m# one theme by default; Follow system pairs one for light and one for dark"),
     Step::Enter,
     Step::Prompt,
     Step::End,
@@ -234,7 +234,7 @@ const PWSH_STEPS: &[Step] = &[
 /// The comment line, the one line allowed to wrap.
 #[cfg(test)]
 const WRAPPING_TEXT: &str =
-    "# themes follow the system appearance by default, and a pair names both sides";
+    "# one theme by default; Follow system pairs one for light and one for dark";
 
 /// The clear that opens every loop: home and erase, as `clear` does.
 const CLEAR: &[u8] = b"\x1b[H\x1b[2J";

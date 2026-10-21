@@ -28,9 +28,12 @@ The last command prints the root `Cargo.toml`'s `[workspace.package] version`.
 Build from the workspace: the crates are not on crates.io (the crates.io
 `aterm` is an unrelated project) and their APIs are not stable.
 
-Derived-model obligations run in-process, so a clone verifies for real. An
-analysis only `ty` or `ay` can run is skipped where they are absent: the test
-reports `ok` and prints why on stderr (`-- --nocapture` shows it).
+Derived-model obligations run in-process, so a clone verifies for real: plain
+tests check every scalar model on the interpreter and run neither `ty` nor
+`ay`. A function-valued model, which only `ty` can walk, ends `NotRun` there,
+never a pass. `verify spec` and `verify checkers` (both in `--release`) require
+`ty` and `ay` and fail closed without them; ALab's default set provides both
+(`aterm pkg install --default-set`).
 
 **`'rustc' is not installed for the custom toolchain 'trust'`**: rustup's
 `trust` link no longer reaches the atpkg store. Run `aterm pkg repair`; never
@@ -41,7 +44,8 @@ aterm first if it is missing).
 What to run before a pull request:
 
 * `targo --unverified test --locked -p <crate>` for every crate you touched,
-  expected green on a fresh clone.
+  expected green on a fresh clone once `targo --unverified verify provision`
+  has run; a COULD NOT RUN names what provides the tool.
 * `targo --unverified run -q -p aterm-verify -- fmt`, the formatter check
   (`fmt --fix` rewrites what it finds).
 * `targo-tippy --workspace --all-targets --keep-going -- -D warnings`,
@@ -50,9 +54,9 @@ What to run before a pull request:
   censuses and the source guards (`--help` lists them).
 
 The development line runs these and the rest of the checks as
-`targo --unverified verify` (`crates/aterm-verify`), an alias in the private
-Cargo configuration this snapshot does not carry, and every release runs its
-`release` set before anything is published. A check that needs the
+`targo --unverified verify` (`crates/aterm-verify`, an alias in the
+workspace's `.cargo/config.toml`), and every release runs its `release` set
+before anything is published. A check that needs the
 development line's machinery reports NOT RUN or COULD NOT RUN here; that says
 nothing about your change.
 

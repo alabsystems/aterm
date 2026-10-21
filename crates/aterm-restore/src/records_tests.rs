@@ -534,3 +534,251 @@ fn history_frames_keep_the_chunk_s_declared_line_count() {
         "HISTORY_FRAME_DECLARED_COUNT_MISMATCH: {refused:?}"
     );
 }
+
+/// CRC-32/IEEE (reflected, polynomial `0xEDB8_8320`, all ones in and out), eight shifts
+/// a byte: the checksum layout v1's step frame carries, computed here with no astream
+/// code, so [`v1_step_record`] spells a record the pinned astream never touched.
+fn crc32_by_hand(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Where a v1 step record's body starts: the 12-byte frame header, then the 13-byte step
+/// header.
+const V1_STEP_BODY_AT: usize = 25;
+
+/// Layout v1's step record, spelled out by hand: the frame (magic `A5 71`, version 1,
+/// flags 0, the payload's length as a u32 LE, its CRC-32/IEEE as a u32 LE) around the
+/// step payload (step-record version 1, the step as a u64 LE, the body's length as a
+/// u32 LE, the body).
+fn v1_step_record(step: u64, body: &[u8]) -> Vec<u8> {
+    let body_len = u32::try_from(body.len()).expect("a test body");
+    let mut payload = vec![1];
+    payload.extend_from_slice(&step.to_le_bytes());
+    payload.extend_from_slice(&body_len.to_le_bytes());
+    payload.extend_from_slice(body);
+    let payload_len = u32::try_from(payload.len()).expect("a test payload");
+    let mut record = vec![0xA5, 0x71, 1, 0];
+    record.extend_from_slice(&payload_len.to_le_bytes());
+    record.extend_from_slice(&crc32_by_hand(&payload).to_le_bytes());
+    record.extend_from_slice(&payload);
+    record
+}
+
+/// What [`layout_v1_holds_astream_step_records_byte_for_byte`] found in each direction:
+/// a row for each record that broke it, none where the direction holds. Both are judged
+/// before either is asserted, because which one broke is what a failing bump's commit
+/// has to decide on (`vendor/README-astream.md`): a bump that changed only what astream
+/// writes fails `write` alone (this build still restores an older build's region), and
+/// one that stopped reading layout v1's records fails `read` as well.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct V1Directions {
+    /// This build's encoders against layout v1's bytes.
+    write: Vec<String>,
+    /// This build's readers against hand-framed layout v1 records.
+    read: Vec<String>,
+}
+
+impl V1Directions {
+    /// A row when `encoded`'s frame and step headers differ from those of `hand`, the
+    /// same body framed by hand.
+    fn write_row(&mut self, what: &str, encoded: &[u8], hand: &[u8]) {
+        let (encoded, hand) = (encoded.get(..V1_STEP_BODY_AT), hand.get(..V1_STEP_BODY_AT));
+        if encoded != hand {
+            self.write.push(format!(
+                "{what}: framed {encoded:02X?}, layout v1 is {hand:02X?}"
+            ));
+        }
+    }
+}
+
+/// THE PIN between layout v1 and the astream this checkout vendors.
+///
+/// A keyframe and a history chunk are astream step records (the module doc), and every
+/// other test in this crate writes and reads them through the one pinned astream. So a
+/// bump that moved astream-wire's frame or step-record bytes would leave every one of
+/// them green, while a restorer of one build misread the region a writer of another
+/// build left: a window that dies with an update staged comes back as the new build,
+/// reading the old build's region. This test spells the v1 record out with no astream
+/// code on the way (a literal for one record, its CRC taken from gzip's trailer, then
+/// [`v1_step_record`] with a hand CRC held to the standard check value) and holds both
+/// directions to it, judging both before it asserts either ([`V1Directions`]):
+///
+/// - **write:** what `encode_keyframe` and `encode_history_chunk` frame is those bytes;
+/// - **read:** a hand-framed keyframe is what `decode_keyframe` restores, and a
+///   hand-framed dense run of chunks is what the ring's step scan accepts.
+///
+/// When it fails, the bump changed the region's format, and `vendor/README-astream.md`
+/// says what the bump's commit owes `LAYOUT_VERSION` in each direction.
+#[test]
+fn layout_v1_holds_astream_step_records_byte_for_byte() {
+    // The hand CRC is the standard one: the CRC-32/IEEE check value.
+    assert_eq!(crc32_by_hand(b"123456789"), 0xCBF4_3926);
+    // One record, byte for byte: step 0x0807_0605_0403_0201 (every byte distinct, so a
+    // swapped order shows) around the body "ab".
+    let literal: [u8; 27] = [
+        0xA5, 0x71, 0x01, 0x00, // frame magic, frame version 1, flags 0
+        0x0F, 0x00, 0x00, 0x00, // payload length 15 (13-byte step header + 2)
+        0x69, 0x23, 0xB7, 0x6A, // CRC-32/IEEE of the payload (gzip's trailer agrees)
+        0x01, // step-record version 1
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // step, u64 LE
+        0x02, 0x00, 0x00, 0x00, // body length 2
+        b'a', b'b', // body
+    ];
+    assert_eq!(v1_step_record(0x0807_0605_0403_0201, b"ab"), literal);
+
+    let mut found = V1Directions::default();
+
+    // Write: the encoders frame layout v1's bytes. The step's eight bytes are distinct.
+    // Each record's body is sliced from the encoder's own output and re-framed by hand,
+    // so the two agree byte for byte exactly when their first V1_STEP_BODY_AT bytes do
+    // (a moved length, CRC, trailer or header size all show there): those are compared,
+    // which keeps a row to two short headers instead of two whole keyframes.
+    let t = shell_with_history(6, 32, 40);
+    let seq = 0x0102_0304_0506_0708;
+    let head = head_for(&t, seq, 8);
+    let checkpoint = t.checkpoint_journal(8).expect("ground");
+    let keyframe = encode_keyframe(&head, &checkpoint).expect("encodes");
+    let compressed = keyframe.get(V1_STEP_BODY_AT..).expect("a framed keyframe");
+    let hand_keyframe = v1_step_record(seq, compressed);
+    found.write_row("keyframe", &keyframe, &hand_keyframe);
+
+    let fence = t.history_fence();
+    let lines = t
+        .history_lines_since_fence(&fence, fence.oldest, CHUNK_LINES)
+        .expect("the fence holds");
+    let (older, newer) = lines.split_at(lines.len() / 2);
+    assert!(
+        !older.is_empty() && !newer.is_empty(),
+        "two chunks of history"
+    );
+    let identity = HistoryIdentity::of(&fence);
+    let first_seq = 0x0A0B_0C0D_0E0F_1011;
+    let mut hand_run = Vec::new();
+    for (step, first_row, part) in [
+        (first_seq, fence.oldest, older),
+        (first_seq + 1, fence.oldest + older.len() as u64, newer),
+    ] {
+        let chunk = encode_history_chunk(step, first_row, identity, part).expect("encodes");
+        let body = chunk.get(V1_STEP_BODY_AT..).expect("a framed chunk");
+        let hand = v1_step_record(step, body);
+        found.write_row(&format!("history chunk {step:#x}"), &chunk, &hand);
+        hand_run.extend_from_slice(&hand);
+    }
+
+    // Read: the hand-framed records restore, through the readers a restore runs. They
+    // are framed from the encoders' bodies whatever the write rows found.
+    match decode_keyframe(&hand_keyframe, seq) {
+        Ok(kf) if kf.head == head && kf.checkpoint == checkpoint => {}
+        Ok(_) => found
+            .read
+            .push("keyframe: decode_keyframe restored another screen".to_owned()),
+        Err(fault) => found
+            .read
+            .push(format!("keyframe: decode_keyframe refused it: {fault:?}")),
+    }
+
+    let scan = scan_steps_from(&hand_run, first_seq);
+    if scan.end != StepEnd::Clean || scan.valid_len != hand_run.len() || scan.steps.len() != 2 {
+        found.read.push(format!(
+            "history: the ring's step scan ended {:?} after {} of {} bytes, {} of 2 chunks accepted",
+            scan.end,
+            scan.valid_len,
+            hand_run.len(),
+            scan.steps.len()
+        ));
+    }
+    let mut read = Vec::new();
+    for (step, range) in &scan.steps {
+        let body = hand_run.get(range.clone()).expect("the scan's range");
+        match decode_history_chunk(*step, body) {
+            Ok(chunk) if chunk.identity != identity => found.read.push(format!(
+                "history chunk {step:#x}: another history's identity"
+            )),
+            Ok(chunk) => match chunk.lines() {
+                Ok(part) => read.extend(part),
+                Err(fault) => found
+                    .read
+                    .push(format!("history chunk {step:#x}: its lines: {fault:?}")),
+            },
+            Err(fault) => found
+                .read
+                .push(format!("history chunk {step:#x}: refused: {fault:?}")),
+        }
+    }
+    if found.read.is_empty() && serialize_lines(&read) != serialize_lines(&lines) {
+        found
+            .read
+            .push("history: the chunks read back other lines".to_owned());
+    }
+
+    assert_eq!(
+        found,
+        V1Directions::default(),
+        "the vendored astream moved layout v1's step records: each row is a record that \
+         broke that direction, and vendor/README-astream.md says what the bump owes each"
+    );
+}
+
+/// A control record (CTR v1) round-trips under its own step only, and is refused, with
+/// nothing allocated past the bound, when its size prefix is past [`MAX_CONTROL_CARRY`],
+/// its version is not this build's, it is empty, or it is not one whole record; a carry
+/// past the bound is never encoded.
+#[test]
+fn a_control_record_round_trips_and_its_bounds_are_held() {
+    let record = encode_control(3, b"the ledger").expect("encodes");
+    assert_eq!(decode_control(&record, 3), Ok(b"the ledger".to_vec()));
+    assert!(matches!(
+        decode_control(&record, 4),
+        Err(ControlFault::Step(_))
+    ));
+    let mut two = record.clone();
+    two.extend_from_slice(&encode_control(4, b"more").expect("encodes"));
+    assert!(matches!(
+        decode_control(&two, 3),
+        Err(ControlFault::Step(_))
+    ));
+
+    let mut past = vec![CTR_VERSION];
+    past.extend_from_slice(
+        &u32::try_from(MAX_CONTROL_CARRY + 1)
+            .expect("u32")
+            .to_le_bytes(),
+    );
+    past.extend_from_slice(&[0u8; 16]);
+    let past = encode_step(5, &past).expect("a frame");
+    assert_eq!(decode_control(&past, 5), Err(ControlFault::Compressed));
+
+    let mut newer = vec![CTR_VERSION + 1];
+    newer.extend_from_slice(&aterm_lz4::compress_prepend_size(b"x"));
+    let newer = encode_step(6, &newer).expect("a frame");
+    assert_eq!(
+        decode_control(&newer, 6),
+        Err(ControlFault::Version(CTR_VERSION + 1))
+    );
+    let empty = encode_step(7, &[]).expect("a frame");
+    assert!(matches!(
+        decode_control(&empty, 7),
+        Err(ControlFault::Step(_))
+    ));
+
+    assert_eq!(
+        encode_control(1, &vec![0u8; MAX_CONTROL_CARRY + 1]),
+        Err(EncodeError::TooLarge)
+    );
+    let at_bound = encode_control(1, &vec![b'{'; MAX_CONTROL_CARRY]).expect("at the bound");
+    assert_eq!(
+        decode_control(&at_bound, 1).map(|carry| carry.len()),
+        Ok(MAX_CONTROL_CARRY)
+    );
+}

@@ -855,16 +855,15 @@ pub(crate) mod tests {
     /// and a ::1 peer as `::/64`: two addresses on loopback with no second
     /// one configured, which a listener on 127.0.0.1 cannot see (lo0 carries
     /// no other usable IPv4 address without an alias, which needs root).
-    /// `None`, said, on a host whose loopback has no IPv6 or whose `[::]`
-    /// listener is IPv6-only by default (Windows): the test cannot run there.
-    pub(crate) fn dual_stack_listener(test: &str) -> Option<(TcpListener, u16)> {
-        let not_run = |why: String| {
-            eprintln!("{test}: NOT RUN, no dual-stack loopback here ({why})");
-            None
-        };
+    /// Ends the test COULD NOT RUN on a host whose loopback has no IPv6 or
+    /// whose `[::]` listener is IPv6-only by default (Windows).
+    pub(crate) fn dual_stack_listener(test: &str) -> (TcpListener, u16) {
+        fn not_run(test: &str, why: &str) -> ! {
+            aterm_spec::host::could_not_run(format!("{test}: no dual-stack loopback here ({why})"))
+        }
         let listener = match TcpListener::bind("[::]:0") {
             Ok(listener) => listener,
-            Err(e) => return not_run(format!("binding [::]: {e}")),
+            Err(e) => not_run(test, &format!("binding [::]: {e}")),
         };
         let port = listener.local_addr().unwrap().port();
         let mut sources = Vec::new();
@@ -874,7 +873,7 @@ pub(crate) mod tests {
         ] {
             let probe = match TcpStream::connect_timeout(&SocketAddr::new(ip, port), MUST_HAPPEN) {
                 Ok(probe) => probe,
-                Err(e) => return not_run(format!("{ip} cannot reach [::]: {e}")),
+                Err(e) => not_run(test, &format!("{ip} cannot reach [::]: {e}")),
             };
             // The connect completed, so the backlog holds it: no wait.
             let (accepted, peer) = listener.accept().unwrap();
@@ -885,7 +884,7 @@ pub(crate) mod tests {
             sources[0], sources[1],
             "127.0.0.1 and ::1 are two addresses"
         );
-        Some((listener, port))
+        (listener, port)
     }
 
     /// The module doc's rule, case by case, on synthetic addresses. The real-socket

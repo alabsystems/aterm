@@ -547,9 +547,9 @@ impl Aterm {
 pub(crate) fn build_aterm() -> Result<Aterm, String> {
     let driver = crate::perf::driver::cargo_driver()?;
     let args = ["--release", "-q", "-p", "aterm"];
-    eprintln!("$ {}", driver.display("build", &args));
+    eprintln!("$ {}", driver.display_workspace("build", &args));
     let status = driver
-        .command("build")
+        .workspace_command("build")
         .args(args)
         .current_dir(workspace_root())
         .status()
@@ -590,22 +590,9 @@ fn release_dir() -> Result<PathBuf, String> {
     Ok(target_dir()?.join("release"))
 }
 
-/// The target directory: `targo`'s own answer through `metadata`, since a
-/// caller's `CARGO_TARGET_DIR` (or the reroute's) moves it.
+/// The target directory ([`crate::perf::driver::target_dir`]).
 pub(crate) fn target_dir() -> Result<PathBuf, String> {
-    let driver = crate::perf::driver::cargo_driver()?;
-    let out = driver
-        .command("metadata")
-        .args(["--no-deps", "--format-version", "1"])
-        .current_dir(workspace_root())
-        .output()
-        .map_err(|e| format!("could not run targo metadata: {e}"))?;
-    let meta: aterm_json::Value = aterm_json::from_slice(&out.stdout)
-        .map_err(|e| format!("targo metadata did not answer JSON: {e}"))?;
-    meta.get("target_directory")
-        .and_then(aterm_json::Value::as_str)
-        .map(PathBuf::from)
-        .ok_or_else(|| "targo metadata names no target_directory".to_string())
+    crate::perf::driver::target_dir()
 }
 
 /// Strip every inherited `ATERM_*` override from a terminal under test: a

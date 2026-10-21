@@ -175,6 +175,25 @@ pub fn unwrap_request(text: &str) -> String {
         .to_string()
 }
 
+/// The user texts of a Gemini API request, oldest first: each user content's
+/// text parts, unwrapped from agy's `<USER_REQUEST>` ([`unwrap_request`]);
+/// a content that holds none (a function's result) is left out.
+#[must_use]
+pub fn gemini_users(body: &[u8]) -> Vec<String> {
+    let Ok(j) = J::parse_bytes(body) else {
+        return Vec::new();
+    };
+    j.get("contents")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| c.get("role").and_then(J::as_str) == Some("user"))
+        .map(parts_text)
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| unwrap_request(&t))
+        .collect()
+}
+
 /// [`GInfo`] of a request body (best effort, never fails).
 #[must_use]
 pub fn analyse_gemini(body: &[u8]) -> GInfo {
@@ -821,6 +840,7 @@ impl Stub {
         }
         let mut mode = mode.to_string();
         if let Some(spec) = self.take_custom(&mode, Some(label)) {
+            let spec = super::with_reply(spec, &gemini_users(body));
             let status = spec
                 .get("status")
                 .and_then(J::as_i64)

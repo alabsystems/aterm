@@ -143,11 +143,13 @@ fn codec_survives_random_bytes_and_truncations() {
     }
     let mut valid = Vec::new();
     for i in 1..40u64 {
+        let severity = Severity::ALL[rng.below(4)];
         let rec = LogRecord {
             id: MessageId::from_raw(i).unwrap(),
             stamp: stamp(i * 1000),
             tag: tags::ALL[rng.below(tags::ALL.len())].clone(),
-            severity: Severity::ALL[rng.below(4)],
+            severity,
+            posted_severity: severity,
             glyph: Glyph::or_fallback(Glyph::ALLOWED[rng.below(Glyph::ALLOWED.len())]),
             title: rand_str(&mut rng, 60),
             detail: (0..rng.below(4)).map(|_| rand_str(&mut rng, 40)).collect(),

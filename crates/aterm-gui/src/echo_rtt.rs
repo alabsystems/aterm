@@ -91,9 +91,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::WindowId;
 
 /// Samples the published percentiles are computed over — the trailing window.
-/// 1024 keystrokes is minutes of real typing, small enough (4 KiB) to sort on
-/// demand and short enough that a bad stretch cannot be diluted by an old good
-/// one.
+/// 1024 keystrokes is minutes of real typing, small enough (4 KiB) to copy out
+/// under the lock and sort on demand outside it, and short enough that a bad
+/// stretch cannot be diluted by an old good one.
 pub const WINDOW: usize = 1024;
 
 /// How long an unanswered write keeps the single arm slot. Past this the write
@@ -173,17 +173,38 @@ impl Ring {
         self.next = 0;
     }
 
-    /// Exact order statistics (nearest-rank) over the live window — a real
+    /// Copy the live window out. This fixed 4 KiB copy is all a reader does
+    /// under the lock: no allocation and no sort, so the PTY reader's
+    /// `try_lock` in [`close_at`] has almost nothing to lose to.
+    const fn copy_out(&self) -> RingCopy {
+        RingCopy {
+            buf: self.buf,
+            len: self.len,
+        }
+    }
+}
+
+/// A reader's private copy of the window, taken by [`Ring::copy_out`] and
+/// ordered after the lock is released.
+struct RingCopy {
+    buf: [u32; WINDOW],
+    len: usize,
+}
+
+impl RingCopy {
+    const EMPTY: Self = Ring::new().copy_out();
+
+    /// Exact order statistics (nearest-rank) over the copied window — a real
     /// observed sample, not a bucket edge, so the number published is one that
-    /// actually happened.
-    fn percentiles(&self) -> (u64, u64, u64) {
-        if self.len == 0 {
+    /// actually happened. Sorts the copy in place.
+    fn percentiles(&mut self) -> (u64, u64, u64) {
+        let v = &mut self.buf[..self.len];
+        if v.is_empty() {
             return (0, 0, 0);
         }
-        let mut v: Vec<u32> = self.buf[..self.len].to_vec();
         v.sort_unstable();
+        let n = v.len();
         let at = |q: f64| -> u64 {
-            let n = v.len();
             // ceil(q * n) - 1, clamped: p50 of one sample is that sample.
             let rank = ((q * n as f64).ceil() as usize).clamp(1, n);
             u64::from(v[rank - 1])
@@ -370,17 +391,17 @@ pub(crate) struct EchoSnapshot {
     pub dropped_locked: u64,
 }
 
-/// Read the live echo facts. Takes the window lock (never held across anything
-/// else); a poisoned lock reports an empty window rather than panicking a
-/// control connection.
+/// Read the live echo facts. Holds the window lock only for the copy and
+/// orders the copy after releasing it; a poisoned lock reports an empty window
+/// rather than panicking a control connection.
 #[must_use]
 pub(crate) fn snapshot() -> EchoSnapshot {
-    let (n, p50_us, p95_us, p99_us) = RING.lock().map_or((0, 0, 0, 0), |ring| {
-        let (a, b, c) = ring.percentiles();
-        (ring.len as u64, a, b, c)
-    });
+    let mut window = RING
+        .lock()
+        .map_or_else(|_| RingCopy::EMPTY, |ring| ring.copy_out());
+    let (p50_us, p95_us, p99_us) = window.percentiles();
     EchoSnapshot {
-        n,
+        n: window.len as u64,
         p50_us,
         p95_us,
         p99_us,
@@ -394,10 +415,10 @@ pub(crate) fn snapshot() -> EchoSnapshot {
     }
 }
 
-/// The `metrics percentiles` TEXT fragment (leading space, no trailing
-/// newline). Built HERE, not in the verb, so the whole echo surface — fields,
-/// units, and the honesty counters that must never be separated from the
-/// percentiles they qualify — lives in one file with the state machine.
+/// The echo fields of the `metrics` summary and of `metrics percentiles`.
+/// Emitted HERE, not in the verb, so the whole echo surface — fields, units,
+/// and the honesty counters that must never be separated from the percentiles
+/// they qualify — lives in one file with the state machine.
 ///
 /// `n_echo` is the trailing WINDOW, not the all-time count (`echo_total`): see
 /// the module note on why the felt question is answered by recent samples.
@@ -405,53 +426,20 @@ pub(crate) fn snapshot() -> EchoSnapshot {
 /// reader can always tell a quiet instrument (`arms=0`, nothing typed) from a
 /// blind one (`expired` climbing, the program is not answering) from a biased
 /// one (`coalesced` high, keys outrunning echoes).
-#[must_use]
-pub(crate) fn percentile_fields_text() -> String {
-    let s = snapshot();
-    let ms = |us: u64| us as f64 / 1e3;
-    format!(
-        " n_echo={} echo_p50_ms={:.2} echo_p95_ms={:.2} echo_p99_ms={:.2} \
-         echo_last_ms={:.2} echo_max_ms={:.2} echo_total={} echo_arms={} \
-         echo_coalesced={} echo_expired={} echo_dropped_locked={}",
-        s.n,
-        ms(s.p50_us),
-        ms(s.p95_us),
-        ms(s.p99_us),
-        ms(s.last_us),
-        ms(s.max_us),
-        s.total,
-        s.arms,
-        s.coalesced,
-        s.expired,
-        s.dropped_locked,
-    )
-}
-
-/// The JSON twin of [`percentile_fields_text`] — a leading comma, so it splices
-/// straight in before the closing brace. Field-for-field identical to the text
-/// form; automation must never have to scrape the line to read a fact the text
-/// verb has.
-#[must_use]
-pub(crate) fn percentile_fields_json() -> String {
-    let s = snapshot();
-    let ms = |us: u64| us as f64 / 1e3;
-    format!(
-        ",\"n_echo\":{},\"echo_p50_ms\":{:.2},\"echo_p95_ms\":{:.2},\
-         \"echo_p99_ms\":{:.2},\"echo_last_ms\":{:.2},\"echo_max_ms\":{:.2},\
-         \"echo_total\":{},\"echo_arms\":{},\"echo_coalesced\":{},\
-         \"echo_expired\":{},\"echo_dropped_locked\":{}",
-        s.n,
-        ms(s.p50_us),
-        ms(s.p95_us),
-        ms(s.p99_us),
-        ms(s.last_us),
-        ms(s.max_us),
-        s.total,
-        s.arms,
-        s.coalesced,
-        s.expired,
-        s.dropped_locked,
-    )
+pub(crate) fn emit_metrics(s: &mut dyn crate::metrics::wire::FieldSink) {
+    use crate::metrics::wire::us_ms;
+    let w = snapshot();
+    s.count("n_echo", w.n);
+    s.decimal("echo_p50_ms", us_ms(w.p50_us));
+    s.decimal("echo_p95_ms", us_ms(w.p95_us));
+    s.decimal("echo_p99_ms", us_ms(w.p99_us));
+    s.decimal("echo_last_ms", us_ms(w.last_us));
+    s.decimal("echo_max_ms", us_ms(w.max_us));
+    s.count("echo_total", w.total);
+    s.count("echo_arms", w.arms);
+    s.count("echo_coalesced", w.coalesced);
+    s.count("echo_expired", w.expired);
+    s.count("echo_dropped_locked", w.dropped_locked);
 }
 
 // ---------------------------------------------------------------------------
@@ -630,5 +618,81 @@ mod tests {
         assert_eq!(s.total, WINDOW as u64 + 500, "the all-time count is not");
         // The window now holds 501..=1524, so p50 is its 512th value.
         assert_eq!(s.p50_us, 501 + 511);
+    }
+
+    /// The nearest rank written as its definition, the smallest sample with at
+    /// least `q·n` samples at or below it, rather than as the `ceil(q·n) - 1`
+    /// index the production walk uses.
+    fn nearest_rank(sorted: &[u32], q: f64) -> u64 {
+        let need = q * sorted.len() as f64;
+        let i = (0..sorted.len())
+            .find(|&i| (i + 1) as f64 >= need)
+            .expect("q <= 1 always reaches a rank");
+        u64::from(sorted[i])
+    }
+
+    /// A copied window's percentiles equal a sorted reference over exactly the
+    /// samples the window holds: one sample, two, an odd length, a full window,
+    /// past the wrap, and refilled after a clear that left the old samples in
+    /// the array beyond `len`.
+    #[test]
+    fn copied_window_percentiles_match_a_sorted_reference() {
+        // Deterministic samples with duplicates and a wide spread.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut sample = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % 50_000
+        };
+        let check = |ring: &Ring, held: &[u64], case: &str| {
+            let mut sorted: Vec<u32> = held
+                .iter()
+                .map(|&us| u32::try_from(us).expect("samples fit the ring's u32"))
+                .collect();
+            sorted.sort_unstable();
+            let mut copy = ring.copy_out();
+            assert_eq!(copy.len, held.len(), "{case}: the copy holds the window");
+            let want = (
+                nearest_rank(&sorted, 0.50),
+                nearest_rank(&sorted, 0.95),
+                nearest_rank(&sorted, 0.99),
+            );
+            assert_eq!(copy.percentiles(), want, "{case}");
+        };
+        for n in [1, 2, 63, WINDOW, WINDOW + 37] {
+            let mut ring = Ring::new();
+            let pushed: Vec<u64> = (0..n).map(|_| sample()).collect();
+            for &us in &pushed {
+                ring.push(us);
+            }
+            check(
+                &ring,
+                &pushed[n.saturating_sub(WINDOW)..],
+                &format!("n={n}"),
+            );
+        }
+        // Every pre-clear sample is larger than any refill sample, so a copy
+        // that read past `len` would publish one of them.
+        let mut ring = Ring::new();
+        for _ in 0..WINDOW {
+            ring.push(1_000_000 + sample());
+        }
+        ring.clear();
+        let refill: Vec<u64> = (0..5).map(|_| sample()).collect();
+        for &us in &refill {
+            ring.push(us);
+        }
+        check(&ring, &refill, "refilled after a clear");
+
+        // Negative control: on two samples the nearest rank of p50 is the lower
+        // one and the off-by-one rank (`ceil(q·n)` read as a 0-based index) is
+        // the upper one, so the comparison above fails an off-by-one walk.
+        let mut two = Ring::new();
+        two.push(20);
+        two.push(10);
+        assert_eq!(two.copy_out().percentiles(), (10, 20, 20));
+        let off_by_one = u64::from([10_u32, 20][(0.50_f64 * 2.0).ceil() as usize]);
+        assert_ne!(off_by_one, nearest_rank(&[10, 20], 0.50));
     }
 }

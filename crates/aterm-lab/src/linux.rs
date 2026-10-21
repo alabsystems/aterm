@@ -8,7 +8,7 @@
 //! Xwayland, with a session D-Bus and at-spi2-core up and Mesa's software
 //! GL and Vulkan (llvmpipe, lavapipe) as the GPU.
 //!
-//! `linux up|down|status|exec|proof|gone|baseline|clean|destroy`
+//! `linux up|down|status|exec|proof|gone|cpu|a11y|baseline|browser|clean|destroy`
 //! (`targo --unverified lab linux help`):
 //!
 //! * the VM is made on the first `up` (`limactl create`: 8 CPUs, 16 GiB,
@@ -80,16 +80,13 @@ pub const BUILT_FROM: &str = "built-from";
 /// never a pass.
 pub const NOT_RUN: i32 = 3;
 
-/// Where Homebrew puts `limactl`, after `$LAB_LIMACTL`.
-const LIMACTL_PATHS: [&str; 2] = ["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"];
-
 /// The verbs, as `linux help` prints them.
 pub const USAGE: &str = "\
 targo --unverified lab linux <verb> — the Linux runtime lane: a lima VM (vz, Ubuntu 24.04 aarch64, Rosetta for x86_64)
   up                       make the VM on first use, mount this checkout read-only, boot, provision; leaves it running
   down                     remove the guest's build output and stop the VM (it is kept; the next run boots it in ~10 s)
   status                   lima, the VM, its mount, provisioning and disk use (guest and host)
-  exec [--arch aarch64|x86_64] [--display xvfb|weston|mutter|xwayland] [--] CMD...
+  exec [--arch aarch64|x86_64] [--display xvfb|weston|mutter|xwayland|weston-x11] [--] CMD...
                            run CMD in the guest at this checkout's path with the arch's cargo environment (stock
                            Rust {rust}; x86_64: CARGO_BUILD_TARGET and the cross linker, run under Rosetta), under
                            the display when one is named, with the session bus and at-spi2-core up; the build
@@ -101,8 +98,11 @@ targo --unverified lab linux <verb> — the Linux runtime lane: a lima VM (vz, U
                            display (and --headless):
                            a session over its control socket, typed, resized, `status` read, a frame kept;
                            then, under xvfb and weston, the display killed under a running aterm-gui, and a
-                           person's quit as their control (`gone`);
-                           then LW.4's baseline replayed (below) under every screen of those displays.
+                           person's quit as their control (`gone`); then the accessibility runtime (`a11y`);
+                           then the stats Deck's layout rows (`deck`); then LW.4's baseline replayed (below)
+                           under every screen of those displays (weston's include weston-x11, the same weston on
+                           an Xvfb window). Every session but the Deck's holds the Deck off ([sys] stats_bars =
+                           \"off\"): its figures redraw every second, which races a frame held to the server's.
                            Exit 0 pass, 1 a row failed, 3 NOT RUN. Report and frames: $LAB_STATE/linux/
   gone [--arch A]... [--display D]... [--wgpu-oracle] [--keep-build] [--keep-up]
                            the proof's display-gone rows alone (xvfb and weston unless named): the display's
@@ -120,15 +120,47 @@ targo --unverified lab linux <verb> — the Linux runtime lane: a lima VM (vz, U
                            each frame held to the server's own pixels under xvfb, xvfb without MIT-SHM, xwayland
                            (lane-bus xgrab) and weston (weston-screenshooter, weston started with --debug); under
                            mutter, whose pixels the lane cannot read back, only typed, echoed and resized
+  deck [--arch A]... [--display D]... [--keep-build] [--keep-up]
+                           the proof's stats Deck rows alone, one per display family (xvfb, weston, mutter,
+                           xwayland, weston-x11; weston's include weston-x11), aterm-gui with the Deck on, on the
+                           GPU and with --cpu, its layout read and never its figures: the Deck's height in the
+                           head and its place at the head's top, the head less the Deck with the Deck turned off,
+                           the strip band under the Deck pixel-identical to the band without it, its buttons
+                           drawn, a click on the strip under the Deck selecting a tab, maximize and restore
+                           clicked where aterm draws the frame, and a window not whole cells (maximized, or sized
+                           by xdotool on X11) held to the server's pixels with its remainder bands continuing the
+                           Deck's rows, on the CPU (mutter's pixels are not read back)
+  a11y [--arch A]... [--keep-build] [--keep-up]
+                           the proof's accessibility runtime rows alone: aterm-dbus, aterm-update-core and
+                           aterm-a11y's tests with every ignored one; aterm-a11y's live_atspi bench on at-spi2-core
+                           (an AT reads a window; its bus killed, and frozen with and without the write deadline);
+                           aterm-gui's a11y suites and its Settings portal read (xdg-desktop-portal); then under xvfb the
+                           accessibility bus's dbus-daemon killed (SIGKILL) and frozen (SIGSTOP, a flood on
+                           screen) under a running aterm-gui, which must say so, rejoin and be read again with
+                           no panic; and Orca (speech-dispatcher's dummy module, whose log of queued messages is
+                           the sink) under xvfb, and under headless mutter with aterm-gui on its Xwayland and as
+                           a Wayland client (keys from the RemoteDesktop seat), which must speak the frame, the
+                           terminal's text and a typed line's output; as a Wayland client, Orca hears no key,
+                           and an output it leaves unspoken must be for want of a cause, as its debug log says
   baseline [--arch A]... [--screen S]... [--record | --wgpu-oracle] [--keep-build] [--keep-up]
                            record a scripted aterm-gui session under each screen (xvfb, xvfb-dpi144, weston,
-                           weston-scale2, mutter, mutter-scale1.5, xwayland): dims and scale, resizes and cast
-                           drift, clipboard and primary, key repeat, compose, XIM and an XDND drop (X11), the
-                           AT-SPI tree and event stream, present percentiles and the item the slowest present
-                           ended in, and the stack under it; replay it against the recordings committed in
-                           crates/aterm-lab/linux-baseline/ (exit 0 same behaviour, 1 it moved, 3 NOT RUN), or
-                           with --record write them there; --wgpu-oracle replays with aterm-gui built with
-                           aterm-gpu's wgpu-oracle, drawing on wgpu (GW.2's Vulkan arm) instead of the GL arm
+                           weston-scale2, mutter, mutter-scale1.5, xwayland, weston-x11): dims and scale, resizes
+                           and cast drift, clipboard and primary, key repeat, compose, XIM and an XDND drop (X11),
+                           a Wayland drop and the frame's gestures (a seat: Mutter's RemoteDesktop, or XTEST into
+                           weston's x11 backend), aterm-gui --cpu typed and resized on weston-x11's seat with each
+                           frame held to weston's output, the AT-SPI tree and event stream, present percentiles
+                           and the item the slowest present ended in, and the stack under it; replay it against
+                           the recordings committed in crates/aterm-lab/linux-baseline/ (exit 0 same behaviour, 1
+                           it moved, 3 NOT RUN), or with --record write them there; --wgpu-oracle replays with
+                           aterm-gui built with aterm-gpu's wgpu-oracle, drawing on wgpu (GW.2's Vulkan arm)
+                           instead of the GL arm
+  browser [--arch A]... [--keep-build] [--keep-up]
+                           the browser lane in the guest: both web modules built and bound on this Mac (`verify
+                           browser-site`), then on each arch aterm-verify built in the guest, its pinned browsers
+                           fetched and `verify browser-drive` run on that site, every GPU frame held to the CPU
+                           frames and the wgpu-WebGL recording within the CPU tolerance: x86_64 (Rosetta)
+                           chrome-headless-shell linux64 on SwiftShader, aarch64 Firefox under Xvfb.
+                           Exit 0 pass, 1 a row failed, 3 NOT RUN. Report and frames: $LAB_STATE/linux/
   clean                    remove the guest's build output and trim the VM disk (its blocks go back to this Mac)
   destroy                  delete the VM and its disk (`limactl delete`); the next `up` makes it again
 ";
@@ -149,6 +181,9 @@ pub fn cmd_linux(args: &[String]) -> Res {
         "baseline" => crate::linux_baseline::cmd_baseline(rest),
         "gone" => crate::linux_proof::cmd_gone(rest),
         "cpu" => crate::linux_proof::cmd_cpu(rest),
+        "a11y" => crate::linux_proof::cmd_a11y(rest),
+        "deck" => crate::linux_proof::cmd_deck(rest),
+        "browser" => crate::linux_browser::cmd_browser(rest),
         "clean" => cmd_clean(),
         "destroy" => cmd_destroy(),
         "help" | "-h" | "--help" => {
@@ -316,7 +351,8 @@ pub fn create_args() -> Vec<String> {
 }
 
 /// The `limactl` to run: `named` (`$LAB_LIMACTL`) alone when it is given,
-/// else the first of Homebrew's paths that `executable` accepts.
+/// else the first of the `limactl` row's usual paths (`aterm_uds::host::TOOLS`) that
+/// `executable` accepts.
 ///
 /// # Errors
 /// A relative `named` (usage), or none that runs (NOT RUN).
@@ -332,13 +368,22 @@ pub fn pick_limactl(
         Some(p) => Err(not_run(format!(
             "LAB_LIMACTL={p} is not an executable limactl"
         ))),
-        None => LIMACTL_PATHS
-            .into_iter()
-            .find(|p| executable(p))
-            .map(str::to_string)
-            .ok_or_else(|| {
-                not_run("no limactl (brew install lima, or LAB_LIMACTL=/path/to/limactl)")
-            }),
+        // Where `limactl` is usually installed, after `$LAB_LIMACTL`: its TOOLS row's
+        // paths, and its provider's remedy when none holds it.
+        None => {
+            let lima = aterm_uds::host::tool("limactl");
+            lima.at
+                .iter()
+                .copied()
+                .find(|p| executable(p))
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    not_run(format!(
+                        "no limactl: {} (or LAB_LIMACTL=/path/to/limactl names one)",
+                        lima.remedy()
+                    ))
+                })
+        }
     }
 }
 
@@ -348,7 +393,7 @@ pub struct Lima {
 }
 
 impl Lima {
-    /// `$LAB_LIMACTL` (an absolute path), else Homebrew's.
+    /// `$LAB_LIMACTL` (an absolute path), else the `limactl` row's usual paths.
     ///
     /// # Errors
     /// No `limactl`: the lane cannot run here.
@@ -543,6 +588,30 @@ impl Lima {
             "copy".into(),
             format!("{VM}:{guest_path}"),
             host_path.to_string_lossy().into_owned(),
+        ])
+    }
+
+    /// Copy the directory `host_dir` of this Mac into the guest directory
+    /// `guest_parent`, where it lands under its own name.
+    #[must_use]
+    pub fn copy_dir_in(&self, host_dir: &Path, guest_parent: &str) -> Out {
+        self.run(&[
+            "copy".into(),
+            "-r".into(),
+            host_dir.to_string_lossy().into_owned(),
+            format!("{VM}:{guest_parent}/"),
+        ])
+    }
+
+    /// Copy the guest directory `guest_dir` into `host_parent` on this Mac,
+    /// where it lands under its own name.
+    #[must_use]
+    pub fn copy_dir_out(&self, guest_dir: &str, host_parent: &Path) -> Out {
+        self.run(&[
+            "copy".into(),
+            "-r".into(),
+            format!("{VM}:{guest_dir}"),
+            format!("{}/", host_parent.to_string_lossy()),
         ])
     }
 }
@@ -1120,7 +1189,7 @@ pub fn parse_exec(args: &[String]) -> Result<ExecArgs, Fail> {
                 let w = args.get(i + 1).map_or("", String::as_str);
                 display = Some(Display::parse(w).ok_or_else(|| {
                     Fail::usage(format!(
-                        "linux exec: --display {w}: xvfb, weston, mutter or xwayland"
+                        "linux exec: --display {w}: xvfb, weston, mutter, xwayland or weston-x11"
                     ))
                 })?);
                 i += 2;
@@ -1191,7 +1260,57 @@ pub fn start_display(up: &Up, display: Display) -> Result<String, String> {
 /// # Errors
 /// As [`start_display`], or a file or an after-step that failed.
 pub fn start_screen(up: &Up, screen: guest::Screen) -> Result<String, String> {
-    for (path, text) in screen.files() {
+    start_servers(up, screen, screen.files(), screen.units(&up.runtime), None)
+}
+
+/// The user's pipewire, through which Mutter makes a screencast stream: the
+/// space a RemoteDesktop finger is placed in (`lane-bus seat`'s finger
+/// steps). Started before a Mutter that a finger will touch; where it is
+/// missing, the finger's seat fails and says so.
+pub fn start_pipewire(up: &Up) {
+    let _ = up.sh(&[
+        "systemctl".into(),
+        "--user".into(),
+        "start".into(),
+        "pipewire.socket".into(),
+        "pipewire.service".into(),
+        "wireplumber.service".into(),
+    ]);
+}
+
+/// [`start_screen`] as the baseline starts it: [`guest::Screen::baseline_files`]
+/// and [`guest::Screen::baseline_units`] (a Mutter's keymap with a dead key),
+/// and an X server's [`guest::Screen::baseline_keymap`] set as soon as that
+/// server listens. Under Mutter the user's pipewire goes first
+/// ([`start_pipewire`]): the touch item's finger is placed in a screencast
+/// stream.
+///
+/// # Errors
+/// As [`start_screen`], or a keymap that was not set.
+pub fn start_baseline_screen(up: &Up, screen: guest::Screen) -> Result<String, String> {
+    if screen.display == Display::Mutter {
+        start_pipewire(up);
+    }
+    start_servers(
+        up,
+        screen,
+        screen.baseline_files(),
+        screen.baseline_units(&up.runtime),
+        screen.baseline_keymap(),
+    )
+}
+
+/// Write `files`, start `units` in order, and run the screen's after-steps.
+/// `then` is a step and the socket of the unit it follows: it runs once that
+/// unit listens, before the next unit starts.
+fn start_servers(
+    up: &Up,
+    screen: guest::Screen,
+    files: Vec<(String, String)>,
+    units: Vec<guest::Unit>,
+    then: Option<(String, guest::Step)>,
+) -> Result<String, String> {
+    for (path, text) in files {
         let dir = Path::new(&path)
             .parent()
             .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
@@ -1213,7 +1332,7 @@ pub fn start_screen(up: &Up, screen: guest::Screen) -> Result<String, String> {
             ));
         }
     }
-    start_units(up, &screen.name(), screen.units(&up.runtime))?;
+    start_units(up, &screen.name(), units, then)?;
     for step in screen.after() {
         let out = up.lima.shell(&up.home, &step.argv, step.stdin.as_deref());
         if !out.ok() {
@@ -1230,8 +1349,14 @@ pub fn start_screen(up: &Up, screen: guest::Screen) -> Result<String, String> {
 }
 
 /// Start `units` in order, each listening within a minute (a hang
-/// detector); `name` says which screen in an error.
-fn start_units(up: &Up, name: &str, units: Vec<guest::Unit>) -> Result<(), String> {
+/// detector); `name` says which screen in an error. `then`'s step runs once
+/// the unit with its socket listens.
+fn start_units(
+    up: &Up,
+    name: &str,
+    units: Vec<guest::Unit>,
+    then: Option<(String, guest::Step)>,
+) -> Result<(), String> {
     for unit in units {
         let started = up.sh(&guest::run_unit(&unit, None));
         let listening = started.ok() && up.sh(&guest::wait_socket(&unit.socket, 60)).ok();
@@ -1252,6 +1377,13 @@ fn start_units(up: &Up, name: &str, units: Vec<guest::Unit>) -> Result<(), Strin
                 started.tail(3),
                 journal.tail(15)
             ));
+        }
+        if let Some((_, step)) = then.as_ref().filter(|(socket, _)| *socket == unit.socket) {
+            let out = up.lima.shell(&up.home, &step.argv, step.stdin.as_deref());
+            if !out.ok() {
+                up.stop_units();
+                return Err(format!("{name}: {} failed: {}", step.label, out.tail(3)));
+            }
         }
     }
     Ok(())
@@ -1281,7 +1413,7 @@ pub fn start_xvfb_without_shm(up: &Up) -> Result<String, String> {
         u.argv
             .extend(["-extension".to_string(), "MIT-SHM".to_string()]);
     }
-    start_units(up, "xvfb without MIT-SHM", units)?;
+    start_units(up, "xvfb without MIT-SHM", units, None)?;
     a11y_bus(up)
 }
 
@@ -1289,17 +1421,19 @@ pub fn start_xvfb_without_shm(up: &Up) -> Result<String, String> {
 /// socket: `weston_capture_v1`, which `weston-screenshooter` reads the
 /// output's pixels through, so the Wayland CPU rows hold the `wl_shm`
 /// presenter (LW.6) to what the compositor shows. Started as
-/// [`start_display`] starts weston, the bus address returned.
+/// [`start_display`] starts weston, its files ([`guest::WESTON_INI`]: no
+/// startup fade over the pixels it holds) written first, the bus address
+/// returned.
 ///
 /// # Errors
 /// As [`start_display`].
 pub fn start_weston_capturing(up: &Up) -> Result<String, String> {
-    let mut units = Display::Weston.units(&up.runtime);
+    let screen = guest::Screen::plain(Display::Weston);
+    let mut units = screen.units(&up.runtime);
     for u in &mut units {
         u.argv.push("--debug".to_string());
     }
-    start_units(up, "weston with its capture protocol", units)?;
-    a11y_bus(up)
+    start_servers(up, screen, screen.files(), units, None)
 }
 
 fn cmd_clean() -> Res {

@@ -9,5 +9,6 @@
 //! file's tests with `targo --unverified test -p aterm-models-session --test suite -- <file>::`.
 
 mod derived_crash_restore;
+mod derived_fabric_exactly_once;
 mod derived_incarnation_lease;
 mod derived_isolation;

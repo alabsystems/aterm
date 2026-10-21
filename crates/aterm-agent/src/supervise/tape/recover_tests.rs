@@ -30,9 +30,14 @@ fn one_frame(items: &[Item]) -> (Vec<u8>, usize) {
     for item in items {
         enc.item(item, &mut raw);
     }
-    let header = frame_bytes(Kind::Header, HEADER.as_bytes());
+    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes());
     let at = MAGIC.len() + header.len();
-    let bytes = [MAGIC.as_slice(), &header, &frame_bytes(Kind::Records, &raw)].concat();
+    let bytes = [
+        MAGIC.as_slice(),
+        &header,
+        &frame_bytes(Kind::Records, 1, &raw),
+    ]
+    .concat();
     (bytes, at)
 }
 
@@ -126,9 +131,9 @@ fn a_name_and_items_that_own_nothing_count_too() {
 /// lengths that run exactly to the end and a checksum that fails — then
 /// `last`. Searching it exhaustively hashes about `len²/34` bytes.
 fn crowded(len: usize, last: &[u8]) -> (Vec<u8>, usize) {
-    let header = frame_bytes(Kind::Header, HEADER.as_bytes());
+    let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes());
     let at = MAGIC.len() + header.len();
-    let mut bad = frame_bytes(Kind::Records, &{
+    let mut bad = frame_bytes(Kind::Records, 1, &{
         let mut raw = Vec::new();
         Encoder::default().item(&mono(5), &mut raw);
         raw
@@ -177,7 +182,7 @@ fn bytes_crowded_with_frame_heads_are_refused_unsearched() {
 /// bound too small for the same crowd says only that it could not tell.
 #[test]
 fn within_its_bound_the_search_still_finds_a_whole_frame() {
-    let whole = frame_bytes(Kind::Records, &{
+    let whole = frame_bytes(Kind::Records, 2, &{
         let mut raw = Vec::new();
         Encoder::default().item(&mono(9), &mut raw);
         raw

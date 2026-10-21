@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn the_rule_reads_the_key_surface_and_the_whole_checkout() {
-        use crate::scan_set::test_fixtures::synth_tree;
+        use crate::scan_set::test_fixtures::disk_tree;
         let key = random_phrase();
         let fixture =
             "const PAPER: &str = \"0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0\";\n";
@@ -293,7 +293,7 @@ mod tests {
             ("crates/x/.scratch/root.key".to_string(), String::new()),
             (".git/signing.key".to_string(), String::new()),
         ]);
-        let root = synth_tree("aterm-census-guards", "key-material", &files);
+        let root = disk_tree("aterm-census-guards", "key-material", &files);
         let corpus = super::super::Corpus::read(&root).expect("the synth tree reads");
         let tree = Tree {
             root: &root,

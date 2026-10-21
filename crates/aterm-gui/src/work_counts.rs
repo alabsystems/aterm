@@ -36,10 +36,31 @@ thread_local! {
     /// The subscribe idle wake: retained ledger records (shell blocks, turn
     /// records, timeline events) an `events` digest touched.
     static RETAINED_RECORDS_TOUCHED: Cell<usize> = const { Cell::new(0) };
+    /// Ring rows (`history`, `timeline`, `exits`) formatted into a reply.
+    static RING_ROWS_FORMATTED: Cell<usize> = const { Cell::new(0) };
+    /// Styled frames gathered off a terminal (`gather_styled_frame`): one per
+    /// frame change per session, however many readers want it.
+    static STYLED_FRAMES_GATHERED: Cell<usize> = const { Cell::new(0) };
+    /// Inline images base64-encoded for the wire (`image_payload_memo`): one
+    /// per image while the memo keeps it, however many frames carry it.
+    static IMAGES_ENCODED: Cell<usize> = const { Cell::new(0) };
+    /// Engine samples an `events` read took (`subscribe::sample_engine_events`):
+    /// the session's term lock, held for its blocks, title, bell and resize
+    /// counters. At most one per `EVENTS_PACE` per watch under a flood.
+    static ENGINE_SAMPLES: Cell<usize> = const { Cell::new(0) };
+    /// Subscribe watches read by a push pass (`subscribe::frames_for_watch`):
+    /// the watches whose session rang, not every watch per wake.
+    static WATCHES_VISITED: Cell<usize> = const { Cell::new(0) };
+    /// Subscribe watches probed against the store for liveness
+    /// (`subscribe::prune_closed`): none while the roster journal stands.
+    static WATCHES_PROBED: Cell<usize> = const { Cell::new(0) };
     /// Windows asked whether they are on screen
     /// (`messages_host::band_on_screen`: off macOS, a round trip to the
     /// window server).
     static ON_SCREEN_ASKS: Cell<usize> = const { Cell::new(0) };
+    /// Strip re-stamps a task's end asked for (`App::restamp_for_end`,
+    /// design §11.2.3 item 7): one per end, one per look that quiets one.
+    static END_RESTAMPS: Cell<usize> = const { Cell::new(0) };
     /// Timed choices resolved to an instant (`App::resolve_timer_choice`, one
     /// wall read): one per press of the `Every session` row's Timer, however
     /// many sessions it arms, so they all land at that one instant.
@@ -99,11 +120,60 @@ pub(crate) fn take_retained_records_touched() -> usize {
     take(&RETAINED_RECORDS_TOUCHED)
 }
 
+pub(crate) fn ring_row_formatted() {
+    bump(&RING_ROWS_FORMATTED);
+}
+pub(crate) fn take_ring_rows_formatted() -> usize {
+    take(&RING_ROWS_FORMATTED)
+}
+
+pub(crate) fn styled_frame_gathered() {
+    bump(&STYLED_FRAMES_GATHERED);
+}
+pub(crate) fn take_styled_frames_gathered() -> usize {
+    take(&STYLED_FRAMES_GATHERED)
+}
+
+pub(crate) fn image_encoded() {
+    bump(&IMAGES_ENCODED);
+}
+pub(crate) fn take_images_encoded() -> usize {
+    take(&IMAGES_ENCODED)
+}
+
+pub(crate) fn engine_sampled() {
+    bump(&ENGINE_SAMPLES);
+}
+pub(crate) fn take_engine_samples() -> usize {
+    take(&ENGINE_SAMPLES)
+}
+
+pub(crate) fn watch_visited() {
+    bump(&WATCHES_VISITED);
+}
+pub(crate) fn take_watches_visited() -> usize {
+    take(&WATCHES_VISITED)
+}
+
+pub(crate) fn watch_probed() {
+    bump(&WATCHES_PROBED);
+}
+pub(crate) fn take_watches_probed() -> usize {
+    take(&WATCHES_PROBED)
+}
+
 pub(crate) fn on_screen_asked() {
     bump(&ON_SCREEN_ASKS);
 }
 pub(crate) fn take_on_screen_asks() -> usize {
     take(&ON_SCREEN_ASKS)
+}
+
+pub(crate) fn end_restamped() {
+    bump(&END_RESTAMPS);
+}
+pub(crate) fn take_end_restamps() -> usize {
+    take(&END_RESTAMPS)
 }
 
 pub(crate) fn timer_resolved() {
@@ -191,8 +261,8 @@ thread_local! {
     /// click's read-back): none for a card at rest, a session with no
     /// lapsing claim or a window with no card.
     static HARNESS_CLOCK_READS: Cell<usize> = const { Cell::new(0) };
-    /// Harness card frames the emitter DREW (`HarnessCard::tick`), as
-    /// against a settled frame replayed from its copy.
+    /// Harness card frames the emitter DREW (`HarnessCard::draw`), as
+    /// against a settled frame replayed (`HarnessCard::replay`).
     static CARD_TICKS: Cell<usize> = const { Cell::new(0) };
     /// Harness card layouts computed over the pane's cells
     /// (`claude_card::layout`).
@@ -211,6 +281,11 @@ thread_local! {
     /// PTY reader holds that lock while output streams, so each one is a
     /// chance for the frame to wait.
     static FOOTER_TIMELINE_LOCKS: Cell<usize> = const { Cell::new(0) };
+    /// Session timeline locks the dev card probe took to record a card
+    /// pass's outcome (`App::compose_claude_cards` under
+    /// `ATERM_DEV_CARD_PROBE=1`, card engine §8): one per pane the pass
+    /// judged, none with the probe off.
+    static CARD_PROBE_LOCKS: Cell<usize> = const { Cell::new(0) };
     /// Rebuilds of a Claude Code pane's text (`claude_footer::PaneTextCache`):
     /// what a frame whose revision moved costs the footer, card or none.
     static PANE_TEXT_REBUILDS: Cell<usize> = const { Cell::new(0) };
@@ -226,10 +301,6 @@ thread_local! {
     /// stream (`claude_card::remove_each_once`), as against a tail truncated
     /// or a stream that holds none of it.
     static CARD_STRIP_SORTS: Cell<usize> = const { Cell::new(0) };
-    /// Light quads the harness card moved into the nova stream's pixels
-    /// (`claude_card::nova_of`): none for a card replayed at rest, whose
-    /// moved kitty and stars are kept.
-    static CARD_NOVA_MOVES: Cell<usize> = const { Cell::new(0) };
     /// Frame cells the footer's write copied into the frame
     /// (`claude_footer::write_edits`): the chips' and the facts' cells and the
     /// card's line, never the rule's own glyphs between them.
@@ -257,6 +328,16 @@ thread_local! {
     /// Chrome band tones derived from a theme (`chrome_band::band_colors`),
     /// as against the last derivation's kept for the same theme.
     static BAND_DERIVES: Cell<usize> = const { Cell::new(0) };
+    /// Owned copies of a window's staged model a capture took to rasterize
+    /// (`App::take_rerender_input`), as against reading the presented scratch
+    /// in place or copying the presented destination.
+    static CAPTURE_INPUTS_CLONED: Cell<usize> = const { Cell::new(0) };
+    /// Output→present latency samples booked at presents a capture's barrier
+    /// forced (`metrics::record_present`'s `capture_forced`): this thread's
+    /// share of the `capture_presents` metrics key.
+    static CAPTURE_FORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
+    /// Output→present latency samples booked at every other present.
+    static UNFORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
     /// Chip blocks fitted and laid (`App::claude_lights_block`), as against
     /// a pane's block kept from a frame whose fit key was the same.
     static FOOTER_BLOCK_FITS: Cell<usize> = const { Cell::new(0) };
@@ -315,6 +396,13 @@ pub(crate) fn take_footer_timeline_locks() -> usize {
     take(&FOOTER_TIMELINE_LOCKS)
 }
 
+pub(crate) fn card_probe_locked() {
+    bump(&CARD_PROBE_LOCKS);
+}
+pub(crate) fn take_card_probe_locks() -> usize {
+    take(&CARD_PROBE_LOCKS)
+}
+
 pub(crate) fn footer_clock_read() {
     bump(&FOOTER_CLOCK_READS);
 }
@@ -341,13 +429,6 @@ pub(crate) fn card_strip_sorted() {
 }
 pub(crate) fn take_card_strip_sorts() -> usize {
     take(&CARD_STRIP_SORTS)
-}
-
-pub(crate) fn card_nova_moved(quads: usize) {
-    CARD_NOVA_MOVES.with(|c| c.set(c.get() + quads));
-}
-pub(crate) fn take_card_nova_moves() -> usize {
-    take(&CARD_NOVA_MOVES)
 }
 
 pub(crate) fn footer_cells_written(cells: usize) {
@@ -397,6 +478,25 @@ pub(crate) fn footer_rule_masked() {
 }
 pub(crate) fn take_footer_rule_masks() -> usize {
     take(&FOOTER_RULE_MASKS)
+}
+
+pub(crate) fn capture_input_cloned() {
+    bump(&CAPTURE_INPUTS_CLONED);
+}
+pub(crate) fn take_capture_inputs_cloned() -> usize {
+    take(&CAPTURE_INPUTS_CLONED)
+}
+
+pub(crate) fn present_sample_booked(capture_forced: bool) {
+    bump(if capture_forced {
+        &CAPTURE_FORCED_SAMPLES
+    } else {
+        &UNFORCED_SAMPLES
+    });
+}
+/// `(capture-forced, other)` latency samples booked since the last take.
+pub(crate) fn take_present_samples() -> (usize, usize) {
+    (take(&CAPTURE_FORCED_SAMPLES), take(&UNFORCED_SAMPLES))
 }
 
 pub(crate) fn footer_block_fitted() {

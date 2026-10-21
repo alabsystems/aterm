@@ -394,6 +394,10 @@ impl KeeperClient {
     /// Never waits for a frame that has not begun to arrive.
     #[must_use]
     pub fn drain(&self) -> bool {
+        self.drain_with_refusals(|_| {})
+    }
+
+    fn drain_with_refusals(&self, mut refused: impl FnMut(u64)) -> bool {
         use std::os::fd::AsRawFd as _;
         loop {
             let mut fds = [crate::sys::PollFd {
@@ -415,6 +419,10 @@ impl KeeperClient {
                 })) => self
                     .synced
                     .set(self.synced.get().max(seq.min(self.syncs.get()))),
+                Ok(Some(Incoming {
+                    frame: Frame::Refused { rdev, .. },
+                    ..
+                })) => refused(rdev),
                 // An OFFER's descriptor, were one ever sent here, closes.
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return false,
@@ -466,6 +474,63 @@ fn protocol(why: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why)
 }
 
+/// A replacement region reached the keeper only after a SYNC behind its COMPANION
+/// was answered. Queue admission and a successful socket write leave this pending.
+#[derive(Debug, Default)]
+pub struct CompanionReceipt {
+    confirmed: std::sync::atomic::AtomicBool,
+    observer: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl CompanionReceipt {
+    /// Also publish this exact accepted read to a process-local admission observer.
+    /// Merely constructing, queueing, writing or dropping the receipt sets no bit.
+    #[must_use]
+    pub fn reporting_confirmation(observer: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            confirmed: std::sync::atomic::AtomicBool::new(false),
+            observer: Some(observer),
+        }
+    }
+
+    /// Whether the keeper confirmed reading this replacement.
+    #[must_use]
+    pub fn confirmed(&self) -> bool {
+        self.confirmed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn confirm(&self) {
+        self.confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(observer) = &self.observer {
+            observer.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// A captured keeper read, for in-memory queue fixtures only.
+    #[cfg(any(test, debug_assertions))]
+    pub fn confirm_captured(&self) {
+        self.confirm();
+    }
+}
+
+#[derive(Debug)]
+struct CompanionRead {
+    receipt: std::sync::Arc<CompanionReceipt>,
+    sync: Option<u64>,
+}
+
+fn confirm_companion(read: &mut Option<CompanionRead>, synced: u64, refused: bool) {
+    if !refused
+        && read
+            .as_ref()
+            .is_some_and(|r| r.sync.is_some_and(|n| n <= synced))
+        && let Some(read) = read.take()
+    {
+        read.receipt.confirm();
+    }
+}
+
 /// One message to the keeper, queued by the window.
 #[derive(Debug)]
 pub enum LinkOp {
@@ -492,18 +557,178 @@ pub enum LinkOp {
         rdev: u64,
         region: OwnedFd,
         len: u64,
+        /// Optional read confirmation for a region that replaces a live predecessor.
+        receipt: Option<std::sync::Arc<CompanionReceipt>>,
     },
     /// The master `rdev` has no journal region (any more): the link drops the one it kept
     /// and tells the keeper, again after a restart too.
     CompanionRelease { rdev: u64 },
 }
 
-/// The queue's bound: a window never blocks on the keeper.
+/// The queue's bound for ordinary ops: a window never blocks on the keeper.
 pub const LINK_QUEUE: usize = 256;
+
+/// Extra channel capacity for waited ops, which ordinary offers cannot fill.
+/// Earlier waited requests can fill it; it is not a guarantee for an arbitrary
+/// number of update attempts while the worker is stalled.
+pub const WAITED_ROOM: usize = 4;
+
+/// How many ordinary ops the queue holds that its worker has not taken: never more than
+/// [`LINK_QUEUE`], so the [`WAITED_ROOM`] places past them stay free for waited ops.
+#[derive(Debug, Default)]
+struct Room(std::sync::atomic::AtomicUsize);
+
+impl Room {
+    /// Claim a place for an ordinary op: `false` when all [`LINK_QUEUE`] are taken.
+    fn claim(&self) -> bool {
+        self.0
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |held| (held < LINK_QUEUE).then_some(held + 1),
+            )
+            .is_ok()
+    }
+
+    /// Give `n` places back: ordinary ops the worker took, or a claim whose op the queue
+    /// did not take.
+    fn give_back(&self, n: usize) {
+        let _ = self.0.try_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |held| Some(held.saturating_sub(n)),
+        );
+    }
+
+    /// Every place back: the worker ended, so its queue takes nothing it would write, and an
+    /// offer finds it gone ([`Refused::Gone`]), never full.
+    fn clear(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Clears the [`Room`] when the worker that owns it ends, a panic included.
+struct Ended(std::sync::Arc<Room>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Why [`KeeperLink::offer`] queued nothing, with the op it hands back.
+#[derive(Debug)]
+pub enum Refused {
+    /// The queue is full: the worker has not taken [`LINK_QUEUE`] ops yet (a keeper
+    /// slow to read, its socket's buffer full). Offered again later, it may fit.
+    Full(LinkOp),
+    /// The worker has ended (the link was shut down, or its thread is gone): nothing
+    /// queued on this link would be written.
+    Gone(LinkOp),
+}
+
+/// The far end of a [`KeeperLink::stalled`] link: a test's stand-in for a worker that
+/// does not read.
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug)]
+pub struct Stalled {
+    /// Behind a lock, so the stand-in can be shared as the worker it stands for is not.
+    rx: std::sync::Mutex<Receiver<Queued>>,
+    /// The link's room, which the ordinary ops taken give back as a worker's do.
+    room: std::sync::Arc<Room>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Stalled {
+    /// Take every op queued so far, in order (the keeper caught up).
+    #[must_use]
+    pub fn drain(&self) -> Vec<LinkOp> {
+        self.drain_at(std::time::Instant::now())
+    }
+
+    fn drain_at(&self, now: std::time::Instant) -> Vec<LinkOp> {
+        let taken: Vec<Queued> = self
+            .rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_iter()
+            .collect();
+        self.room
+            .give_back(taken.iter().filter(|(_, ack)| ack.is_none()).count());
+        taken
+            .into_iter()
+            .filter_map(|queued| claim_queued(queued, now))
+            .map(|(op, _)| op)
+            .collect()
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for Stalled {
+    /// Ends as a worker that ended does: an offer finds it gone.
+    fn drop(&mut self) {
+        self.room.clear();
+    }
+}
 
 /// One queued op, and who waits for it to be written (PENDING before the
 /// grant, BYE before `exit(0)`).
-type Queued = (LinkOp, Option<SyncSender<bool>>);
+type Queued = (LinkOp, Option<Waited>);
+
+/// Cancellation belongs to one queued wait, never to the link or another op.
+/// Once claimed by the worker the op has started; a caller's timeout cannot
+/// retract in-progress socket IO. An unclaimed timeout is discarded at dequeue.
+#[derive(Debug)]
+struct Waited {
+    answer: SyncSender<bool>,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    until: Option<std::time::Instant>,
+}
+
+impl Waited {
+    const QUEUED: u8 = 0;
+    const CLAIMED: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    fn cancel(state: &std::sync::atomic::AtomicU8) {
+        let _ = state.compare_exchange(
+            Self::QUEUED,
+            Self::CANCELLED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    fn claim_at(&self, now: std::time::Instant) -> bool {
+        if self.until.is_some_and(|until| now >= until) {
+            Self::cancel(&self.state);
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                Self::QUEUED,
+                Self::CLAIMED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn try_send(&self, answer: bool) -> Result<(), mpsc::TrySendError<bool>> {
+        self.answer.try_send(answer)
+    }
+}
+
+/// The production worker and captured receiver use the same queued-wait admission.
+fn claim_queued(queued: Queued, now: std::time::Instant) -> Option<Queued> {
+    if let Some(waited) = &queued.1
+        && !waited.claim_at(now)
+    {
+        let _ = waited.try_send(false);
+        return None;
+    }
+    Some(queued)
+}
 
 /// The window's link: a worker thread that owns the connection, reconnects
 /// after a keeper restart and re-registers every master it still holds a
@@ -511,7 +736,10 @@ type Queued = (LinkOp, Option<SyncSender<bool>>);
 /// registered master no keeper confirmed it read ([`Owed`]).
 #[derive(Debug)]
 pub struct KeeperLink {
+    /// Bounded at [`LINK_QUEUE`] ordinary ops plus [`WAITED_ROOM`] waited ones.
     tx: SyncSender<Queued>,
+    /// The ordinary ops' share of the queue ([`Self::offer`]).
+    room: std::sync::Arc<Room>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -552,7 +780,9 @@ impl KeeperLink {
         booted: Option<KeeperClient>,
         journal: bool,
     ) -> io::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel(LINK_QUEUE);
+        let (tx, rx) = mpsc::sync_channel(LINK_QUEUE + WAITED_ROOM);
+        let room = std::sync::Arc::new(Room::default());
+        let ended = Ended(std::sync::Arc::clone(&room));
         let peer = LinkPeer {
             path,
             identity,
@@ -562,9 +792,14 @@ impl KeeperLink {
         };
         let thread = std::thread::Builder::new()
             .name("aterm-keeper-link".to_string())
-            .spawn(move || link_worker(&peer, &rx, booted))?;
+            .spawn(move || {
+                // Dropped after the worker's receiver, which it owns and drops on return.
+                let ended = ended;
+                link_worker(&peer, rx, booted, &ended.0);
+            })?;
         Ok(Self {
             tx,
+            room,
             thread: Some(thread),
         })
     }
@@ -587,23 +822,89 @@ impl KeeperLink {
     }
 
     /// Queue `op`; `false` when the queue is full or the worker is gone (the
-    /// window carries on: custody is insurance, not state).
+    /// window carries on: custody is insurance, not state). The op is dropped
+    /// then: [`Self::offer`] hands it back instead, for an op the caller must not
+    /// lose.
     pub fn enqueue(&self, op: LinkOp) -> bool {
-        match self.tx.try_send((op, None)) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
-        }
+        self.offer(op).is_ok()
     }
 
-    /// Queue `op` and wait at most `within` for the worker to have written it to a keeper:
-    /// `true` only then. Every op queued before it is written first. `false` (no keeper, a full
-    /// queue, the wait ran out) never blocks the caller past `within`.
+    /// Queue `op`, or hand it back with why it was not queued: a caller whose op
+    /// carries what nothing else would tell the keeper (a fresh region's only
+    /// custody descriptor) keeps it and offers it again.
+    ///
+    /// # Errors
+    /// [`Refused::Full`] while the queue holds [`LINK_QUEUE`] ordinary ops the worker has
+    /// not taken (a keeper slow to read; the [`WAITED_ROOM`] past them is not an ordinary
+    /// op's), [`Refused::Gone`] once the worker has ended.
+    pub fn offer(&self, op: LinkOp) -> Result<(), Refused> {
+        if !self.room.claim() {
+            return Err(Refused::Full(op));
+        }
+        self.tx.try_send((op, None)).map_err(|refused| {
+            self.room.give_back(1);
+            match refused {
+                TrySendError::Full((op, _)) => Refused::Full(op),
+                TrySendError::Disconnected((op, _)) => Refused::Gone(op),
+            }
+        })
+    }
+
+    /// A link with no worker: what is queued stays there until the test takes it
+    /// ([`Stalled::drain`]), so [`LINK_QUEUE`] ordinary ops fill it, as a keeper too slow
+    /// to read fills a real one. Dropping the [`Stalled`] ends it as a worker that ended
+    /// does ([`Refused::Gone`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn stalled() -> (Self, Stalled) {
+        let (tx, rx) = mpsc::sync_channel(LINK_QUEUE + WAITED_ROOM);
+        let room = std::sync::Arc::new(Room::default());
+        (
+            Self {
+                tx,
+                room: std::sync::Arc::clone(&room),
+                thread: None,
+            },
+            Stalled {
+                rx: std::sync::Mutex::new(rx),
+                room,
+            },
+        )
+    }
+
+    /// Queue `op` using waited room and wait for a written answer. Earlier
+    /// channel entries remain first. A timeout cancels an unclaimed non-BYE op;
+    /// cancelled entries may occupy a physical slot until dequeued, but cannot
+    /// act later. A claimed op is already running and cannot be retracted by
+    /// this timeout. Terminal BYE remains valid after the bounded wait ends.
     pub fn send_and_wait(&self, op: LinkOp, within: Duration) -> bool {
-        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-        if self.tx.try_send((op, Some(ack_tx))).is_err() {
+        let terminal = matches!(op, LinkOp::Bye);
+        let now = std::time::Instant::now();
+        let Some(until) = now.checked_add(within) else {
+            return false;
+        };
+        if !terminal && within.is_zero() {
             return false;
         }
-        ack_rx.recv_timeout(within).unwrap_or(false)
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(Waited::QUEUED));
+        let waited = Waited {
+            answer: ack_tx,
+            state: std::sync::Arc::clone(&state),
+            until: (!terminal).then_some(until),
+        };
+        if self.tx.try_send((op, Some(waited))).is_err() {
+            return false;
+        }
+        match ack_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+            Ok(written) => written,
+            Err(_) => {
+                if !terminal {
+                    Waited::cancel(&state);
+                }
+                false
+            }
+        }
     }
 
     /// Close the queue and wait for the worker to drain it.
@@ -624,6 +925,9 @@ struct HeldMaster {
     header: MasterHeader,
     tag: Vec<u8>,
     journal: HeldJournal,
+    /// A refusal for this master on this connection prevents using its SYNC as
+    /// acceptance evidence. A reconnect retries the whole registration/journal pair.
+    companion_refused: bool,
 }
 
 /// Where a held master's crash-restore journal stands, as the keeper is told it (and told again
@@ -636,7 +940,11 @@ enum HeldJournal {
     /// window was offered, before it had a region of its own).
     Unsaid,
     /// The read-only custody descriptor of its region, and the region's length.
-    Region { region: OwnedFd, len: u64 },
+    Region {
+        region: OwnedFd,
+        len: u64,
+        read: Option<CompanionRead>,
+    },
     /// It has no region.
     Released,
 }
@@ -669,7 +977,7 @@ enum Send {
 /// keeper is told what this window holds without waiting for its next op (§5.3 step 9).
 pub const LINK_POLL: Duration = Duration::from_millis(500);
 
-fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClient>) {
+fn link_worker(peer: &LinkPeer, rx: Receiver<Queued>, booted: Option<KeeperClient>, room: &Room) {
     // The duplicates this window still holds for the keeper, by rdev, so a
     // restarted keeper can be told again — and the newest META of each.
     let mut held: Held = std::collections::BTreeMap::new();
@@ -680,19 +988,37 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
     let mut next_try = std::time::Instant::now();
     loop {
         let (op, ack) = match rx.recv_timeout(LINK_POLL) {
-            Ok((op, ack)) => (Some(op), ack),
+            Ok(queued) => {
+                if queued.1.is_none() {
+                    room.give_back(1);
+                }
+                match claim_queued(queued, std::time::Instant::now()) {
+                    Some((op, ack)) => (Some(op), ack),
+                    None => continue,
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => (None, None),
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         if let Some(c) = &client {
-            let open = c.drain();
+            let open = c.drain_with_refusals(|rdev| {
+                if let Some(h) = held.get_mut(&rdev) {
+                    h.companion_refused = true;
+                }
+            });
             // What the keeper answered a SYNC behind has reached it, the answers read just
             // before an EOF included.
             let synced = c.synced();
             owed.retain(|_, sync| sync.is_none_or(|n| n > synced));
+            for h in held.values_mut() {
+                if let HeldJournal::Region { read, .. } = &mut h.journal {
+                    confirm_companion(read, synced, h.companion_refused);
+                }
+            }
             if !open {
                 client = None;
                 unconfirm(&mut owed);
+                unconfirm_companions(&mut held);
             }
         }
         let bye = matches!(op, Some(LinkOp::Bye));
@@ -715,6 +1041,7 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
                         header,
                         tag,
                         journal: HeldJournal::Unsaid,
+                        companion_refused: false,
                     },
                 );
                 Some(Send::Register(header.rdev))
@@ -744,9 +1071,21 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
             LinkOp::Bye => Some(Send::Frame(Frame::Bye)),
             // A region rides beside its master only: one for a master this link holds no
             // registration of is dropped (its descriptor closes here).
-            LinkOp::Companion { rdev, region, len } => {
+            LinkOp::Companion {
+                rdev,
+                region,
+                len,
+                receipt,
+            } => {
                 let entry = held.get_mut(&rdev)?;
-                entry.journal = HeldJournal::Region { region, len };
+                entry.journal = HeldJournal::Region {
+                    region,
+                    len,
+                    read: receipt.map(|receipt| CompanionRead {
+                        receipt,
+                        sync: None,
+                    }),
+                };
                 peer.journal.then_some(Send::Companion(rdev))
             }
             LinkOp::CompanionRelease { rdev } => {
@@ -768,7 +1107,7 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
         let fresh = client.is_none();
         // A caller waiting on this op does not wait out a backoff.
         if fresh && (ack.is_some() || std::time::Instant::now() >= next_try) {
-            client = reconnect(peer, &held, &metas, &mut owed);
+            client = reconnect(peer, &mut held, &metas, &mut owed);
             if client.is_some() {
                 backoff = Duration::from_millis(50);
             } else {
@@ -803,13 +1142,21 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
             }
             Send::Companion(rdev) => match held.get(rdev) {
                 Some(HeldMaster {
-                    journal: HeldJournal::Region { region, len },
+                    journal: HeldJournal::Region { region, len, .. },
                     ..
                 }) => c.companion(*rdev, region, *len),
                 _ => Ok(()),
             },
             Send::Frame(frame) => c.send(frame, None),
         };
+        // A replacement's receipt proves a read only after the SYNC behind it is answered.
+        if sent.is_ok()
+            && peer.journal
+            && matches!(&send, Send::Companion(_))
+            && let Err(e) = sync_companions(c, &mut held)
+        {
+            sent = Err(e);
+        }
         // A RELEASE that must reach a keeper is followed by a SYNC, and kept until its answer.
         if sent.is_ok()
             && let Some(rdev) = must_reach
@@ -826,6 +1173,7 @@ fn link_worker(peer: &LinkPeer, rx: &Receiver<Queued>, booted: Option<KeeperClie
         if sent.is_err() {
             client = None;
             unconfirm(&mut owed);
+            unconfirm_companions(&mut held);
             owe(&mut owed, must_reach);
         }
         if bye {
@@ -859,9 +1207,49 @@ fn unconfirm(owed: &mut Owed) {
     }
 }
 
+fn unconfirm_companion(read: &mut Option<CompanionRead>) {
+    if let Some(read) = read {
+        read.sync = None;
+    }
+}
+
+fn unconfirm_companions(held: &mut Held) {
+    for h in held.values_mut() {
+        if let HeldJournal::Region { read, .. } = &mut h.journal {
+            unconfirm_companion(read);
+        }
+    }
+}
+
+fn sync_companions(c: &KeeperClient, held: &mut Held) -> io::Result<()> {
+    // An older keeper gives no read evidence. Leave the receipt pending rather than
+    // treating a write, or absence of the capability, as permission to drop its region.
+    if !c.keeper_journals() || !c.keeper_syncs() {
+        return Ok(());
+    }
+    let pending = held.values().any(|h| {
+        matches!(
+            &h.journal, HeldJournal::Region { read: Some(read), .. } if read.sync.is_none()
+        )
+    });
+    if pending {
+        let n = c.sync()?;
+        for h in held.values_mut() {
+            if let HeldJournal::Region {
+                read: Some(read), ..
+            } = &mut h.journal
+                && read.sync.is_none()
+            {
+                read.sync = Some(n);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reconnect(
     peer: &LinkPeer,
-    held: &Held,
+    held: &mut Held,
     metas: &std::collections::BTreeMap<u64, Vec<u8>>,
     owed: &mut Owed,
 ) -> Option<KeeperClient> {
@@ -871,13 +1259,16 @@ fn reconnect(
     c.hello_link(&peer.build, peer.marker.clone(), peer.journal)
         .ok()?;
     let journals = peer.journal && c.keeper_journals();
-    for (rdev, h) in held {
+    for h in held.values_mut() {
+        h.companion_refused = false;
+    }
+    for (rdev, h) in held.iter() {
         c.register(&h.master, h.header, h.tag.clone()).ok()?;
         // Each master's journal right behind its claim, as the window first told it: a
         // restarted keeper holds no region, and a live one moved the dropped link's to this one.
         if journals {
             match &h.journal {
-                HeldJournal::Region { region, len } => c.companion(*rdev, region, *len).ok()?,
+                HeldJournal::Region { region, len, .. } => c.companion(*rdev, region, *len).ok()?,
                 HeldJournal::Released => c.companion_release(*rdev).ok()?,
                 HeldJournal::Unsaid => {}
             }
@@ -905,6 +1296,9 @@ fn reconnect(
         for sync in owed.values_mut() {
             *sync = Some(n);
         }
+    }
+    if journals {
+        sync_companions(&c, held).ok()?;
     }
     Some(c)
 }
@@ -1187,6 +1581,7 @@ mod tests {
             rdev: journaled,
             region: custody,
             len: len as u64,
+            receipt: None,
         }));
         let view = |s: &Server, rdev| s.core().companion_view(rdev);
         let region_held = |s: &Server| {
@@ -1223,6 +1618,100 @@ mod tests {
         link.shutdown();
         drop(third);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REPLACEMENT'S RECEIPT IS THE KEEPER'S READ, NOT THE LINK'S WRITE (R9 (b)). A window
+    /// whose memory shed replaced a session's region keeps the old one (and erases it on a
+    /// clear) until the keeper holds the fresh one, so the link must say when that is: the
+    /// worker writes a SYNC behind the COMPANION and confirms its receipt only once the
+    /// keeper's answer, which it writes after reading every frame before it, is read back.
+    /// Here every op queued before a waited META is written (`send_and_wait` returned) while
+    /// the keeper has read none of them: the receipt stays unconfirmed, and the keeper still
+    /// offers the first region. Once the keeper reads, the receipt is confirmed and the
+    /// keeper offers the fresh region.
+    /// NEGATIVE CONTROL: the write alone (what a queue admission or a written frame says),
+    /// which a link that let the old region go at the hand-off took for the read.
+    #[test]
+    fn a_replacement_companion_is_confirmed_only_once_the_keeper_has_read_it() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("akl-receipt-")
+            .tempdir()
+            .expect("exclusive receipt fixture");
+        let sock = scratch.path().join("k.sock");
+        let mut server = serve(&sock);
+        let (rdev, register) = register_op("/dev/null", 1);
+        let link = KeeperLink::start_marked(
+            sock.clone(),
+            Identity::same_uid(),
+            "t".into(),
+            None,
+            None,
+            true,
+        )
+        .expect("link");
+        assert!(link.enqueue(register));
+        let len = aterm_uds::shm::PAGE;
+        let region = || {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a test playing the window makes the regions the keeper is sent"
+            )]
+            // SAFETY: this fixture's link and keeper only transfer/hold/query custody, never
+            // reopen, map, write or resize it; the region remains inert until it is dropped.
+            let made = unsafe { aterm_uds::shm::Region::create(len) }.expect("a region");
+            made
+        };
+        let (_first, custody) = region();
+        assert!(link.enqueue(LinkOp::Companion {
+            rdev,
+            region: custody,
+            len: len as u64,
+            receipt: None,
+        }));
+        let offered = |s: &Server| s.core().companion_view(rdev).and_then(|v| v.offered);
+        step_until(&mut server, "the keeper holds the first region", |s| {
+            s.holds(rdev) && offered(s).is_some()
+        });
+        let first = offered(&server);
+
+        let (_fresh, custody) = region();
+        let receipt = std::sync::Arc::new(CompanionReceipt::default());
+        assert!(link.enqueue(LinkOp::Companion {
+            rdev,
+            region: custody,
+            len: len as u64,
+            receipt: Some(std::sync::Arc::clone(&receipt)),
+        }));
+        assert!(
+            link.send_and_wait(
+                LinkOp::Meta {
+                    rdev,
+                    meta: b"m".to_vec(),
+                },
+                Duration::from_secs(60),
+            ),
+            "control: the COMPANION, its SYNC and the META behind them are written"
+        );
+        assert!(
+            !receipt.confirmed(),
+            "a written COMPANION is not a read one"
+        );
+        assert_eq!(
+            offered(&server),
+            first,
+            "premise: the keeper has read nothing since"
+        );
+        step_until(
+            &mut server,
+            "the keeper's read confirms the receipt",
+            |_| receipt.confirmed(),
+        );
+        assert!(
+            offered(&server).is_some_and(|id| Some(id) != first),
+            "the keeper offers the fresh region"
+        );
+        link.shutdown();
+        drop(server);
     }
 
     /// A live keeper drops the link and a tab closes while no reconnect can succeed: the RELEASE
@@ -1429,5 +1918,206 @@ mod tests {
             started.elapsed()
         );
         link.shutdown();
+    }
+}
+
+/// What a full or ended link does with an op, on any unix (no keeper is reached).
+#[cfg(test)]
+mod offer_tests {
+    use super::*;
+
+    /// A FULL QUEUE HANDS THE OP BACK. `enqueue` drops an op its queue cannot take, and an
+    /// op that carries a descriptor nothing else holds (a fresh region's custody) is lost
+    /// with it: `offer` returns it, so the caller keeps it and offers it again once the
+    /// keeper has read. NEGATIVE CONTROL: the same full queue through `enqueue` queues
+    /// nothing and returns nothing, and no op it was given ever reaches the far end.
+    #[test]
+    fn a_full_queue_hands_an_offered_op_back_and_a_gone_worker_does_too() {
+        let (link, far) = KeeperLink::stalled();
+        for rdev in 0..LINK_QUEUE as u64 {
+            assert!(link.offer(LinkOp::Release { rdev }).is_ok(), "{rdev} fits");
+        }
+        let marked = u64::MAX;
+        match link.offer(LinkOp::CompanionRelease { rdev: marked }) {
+            Err(Refused::Full(LinkOp::CompanionRelease { rdev })) => assert_eq!(rdev, marked),
+            other => panic!("a full queue hands the op back: {other:?}"),
+        }
+        assert!(
+            !link.enqueue(LinkOp::CompanionRelease { rdev: marked - 1 }),
+            "control: enqueue drops it"
+        );
+        let drained = far.drain();
+        assert_eq!(drained.len(), LINK_QUEUE, "only what fit");
+        assert!(
+            !drained
+                .iter()
+                .any(|op| matches!(op, LinkOp::CompanionRelease { .. })),
+            "neither the refused offer nor the dropped enqueue reached the keeper"
+        );
+        assert!(
+            link.offer(LinkOp::CompanionRelease { rdev: marked })
+                .is_ok(),
+            "drained, the queue takes it"
+        );
+        assert!(matches!(
+            far.drain().as_slice(),
+            [LinkOp::CompanionRelease { rdev }] if *rdev == marked
+        ));
+        drop(far);
+        assert!(matches!(
+            link.offer(LinkOp::Release { rdev: 1 }),
+            Err(Refused::Gone(LinkOp::Release { rdev: 1 }))
+        ));
+        link.shutdown();
+
+        // The same read receipt the worker completes: an unsent op, a SYNC still
+        // ahead, a matching refusal, or a reconnect gives no retirement authority.
+        let observer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let receipt = std::sync::Arc::new(CompanionReceipt::reporting_confirmation(
+            std::sync::Arc::clone(&observer),
+        ));
+        let mut read = Some(CompanionRead {
+            receipt: std::sync::Arc::clone(&receipt),
+            sync: None,
+        });
+        confirm_companion(&mut read, u64::MAX, false);
+        assert!(!receipt.confirmed() && read.is_some());
+        read.as_mut().expect("pending").sync = Some(7);
+        confirm_companion(&mut read, 6, false);
+        assert!(!receipt.confirmed() && read.is_some());
+        confirm_companion(&mut read, 7, true);
+        assert!(!observer.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !receipt.confirmed() && read.is_some(),
+            "a refusal is not acceptance"
+        );
+        // The real EOF/send-error helper removes the old connection's SYNC.
+        unconfirm_companion(&mut read);
+        confirm_companion(&mut read, 7, false);
+        assert!(!observer.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            !receipt.confirmed() && read.is_some(),
+            "the disconnected op is unsent"
+        );
+        // KeeperClient::connect starts both counters at0. A resend on that new
+        // connection is followed by SYNC1, and no old connection's watermark is used.
+        read.as_mut().expect("pending").sync = Some(1);
+        confirm_companion(&mut read, 0, false);
+        assert!(
+            !receipt.confirmed() && read.is_some(),
+            "reconnected but unanswered"
+        );
+        confirm_companion(&mut read, 1, false);
+        assert!(receipt.confirmed() && read.is_none());
+        assert!(observer.load(std::sync::atomic::Ordering::Acquire));
+
+        // An expired/cancelled wait is never acted on after leaving the channel.
+        // The worker calls this same admission helper; no thread or elapsed-time wait.
+        let now = std::time::Instant::now();
+        let make = || {
+            let (answer, read) = mpsc::sync_channel(1);
+            let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(Waited::QUEUED));
+            let waited = Waited {
+                answer,
+                state: std::sync::Arc::clone(&state),
+                until: Some(now + Duration::from_secs(60)),
+            };
+            ((LinkOp::Pending { pid: 7 }, Some(waited)), state, read)
+        };
+        let (queued, state, answer) = make();
+        Waited::cancel(&state);
+        assert!(claim_queued(queued, now).is_none());
+        assert!(!answer.try_recv().expect("cancelled wait answered"));
+        let (queued, _, answer) = make();
+        assert!(claim_queued(queued, now + Duration::from_secs(60)).is_none());
+        assert!(!answer.try_recv().expect("expired wait answered"));
+        let (queued, state, answer) = make();
+        let (op, waited) = claim_queued(queued, now).expect("live wait claimed");
+        assert!(matches!(op, LinkOp::Pending { pid: 7 }));
+        Waited::cancel(&state);
+        assert_eq!(
+            state.load(std::sync::atomic::Ordering::Acquire),
+            Waited::CLAIMED,
+            "a timeout cannot retract an already-running op"
+        );
+        waited
+            .expect("waiter")
+            .try_send(true)
+            .expect("written answer");
+        assert!(answer.try_recv().expect("live wait answered"));
+    }
+
+    /// A WAITED OP FINDS ROOM IN A QUEUE ITS ORDINARY OPS FILLED (R9 review). A PENDING
+    /// (before an update's grant) and a BYE (before `exit(0)`) are each the keeper's one word
+    /// on what the window is doing; behind [`LINK_QUEUE`] ordinary ops a keeper slow to read
+    /// left unread, the bounded queue refused them, and a refused one was never written. The
+    /// queue keeps [`WAITED_ROOM`] places past the ordinary ops for waited ones: each goes
+    /// in, in order, behind every op before it, and only one past that room is refused. A
+    /// worker that ended with the queue full is gone to an offer, not full.
+    /// NEGATIVE CONTROL: an ordinary op on the same full queue is refused (`Full`): the room
+    /// is not an ordinary op's.
+    #[test]
+    fn a_waited_op_finds_room_in_a_queue_its_ordinary_ops_filled() {
+        let (link, far) = KeeperLink::stalled();
+        for rdev in 0..LINK_QUEUE as u64 {
+            assert!(link.offer(LinkOp::Release { rdev }).is_ok(), "{rdev} fits");
+        }
+        assert!(
+            matches!(
+                link.offer(LinkOp::CompanionRelease { rdev: 1 }),
+                Err(Refused::Full(_))
+            ),
+            "control: an ordinary op finds the queue full"
+        );
+        let now = std::time::Instant::now();
+        let waited = u32::try_from(WAITED_ROOM).expect("a few places");
+        for pid in 0..=waited {
+            let (answer, _read) = mpsc::sync_channel(1);
+            let request = Waited {
+                answer,
+                state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(Waited::QUEUED)),
+                until: Some(now + Duration::from_secs(60)),
+            };
+            let queued = link
+                .tx
+                .try_send((LinkOp::Pending { pid }, Some(request)))
+                .is_ok();
+            assert_eq!(queued, pid < waited, "only the reserved capacity fits");
+        }
+        assert!(
+            !link.send_and_wait(LinkOp::Pending { pid: 99 }, Duration::ZERO),
+            "an already-expired nonterminal wait is never admitted"
+        );
+        let drained = far.drain_at(now);
+        assert_eq!(drained.len(), LINK_QUEUE + WAITED_ROOM);
+        assert!(
+            drained[..LINK_QUEUE]
+                .iter()
+                .all(|op| matches!(op, LinkOp::Release { .. }))
+        );
+        let pids: Vec<u32> = drained[LINK_QUEUE..]
+            .iter()
+            .map(|op| match op {
+                LinkOp::Pending { pid } => *pid,
+                other => panic!("only waited ops follow: {other:?}"),
+            })
+            .collect();
+        assert_eq!(pids, (0..waited).collect::<Vec<_>>());
+        assert!(
+            link.offer(LinkOp::Release { rdev: 1 }).is_ok(),
+            "read, the queue takes ordinary ops again"
+        );
+
+        // The worker ends with the ordinary places full.
+        let (link, far) = KeeperLink::stalled();
+        while link.enqueue(LinkOp::Release { rdev: 1 }) {}
+        drop(far);
+        assert!(
+            matches!(
+                link.offer(LinkOp::Release { rdev: 2 }),
+                Err(Refused::Gone(_))
+            ),
+            "an ended worker is gone, not full"
+        );
     }
 }

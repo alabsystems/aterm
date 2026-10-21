@@ -55,6 +55,11 @@ use crate::run::{Observer, Options};
 use crate::union::Union;
 use crate::verdict::{EXIT_USAGE, PhaseReport, Report};
 
+/// The oracle workspace's own build directory under the checkout, named so
+/// Spotlight skips it and all it holds (`aterm-verify`'s libc-oracle lane is the
+/// same directory).
+const ORACLE_TARGET: &str = "libc-oracle/target.noindex";
+
 const USAGE: &str = "\
 aterm-libc-oracle — decide crates/aterm-libc against the pinned reference libc
 on the ABI cell this box is native to, and regenerate it
@@ -68,8 +73,9 @@ usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>]
   --root <checkout>   the aterm checkout (default: the one containing the
                       working directory)
   --target-dir <dir>  the oracle workspace's builds (default:
-                      <checkout>/libc-oracle/target); one per checkout,
-                      never shared with another
+                      <checkout>/libc-oracle/target.noindex, which
+                      Spotlight skips); one per checkout, never shared
+                      with another
   -h, --help          this text
 
 regen: rewrite crates/aterm-libc/src/<cell>.rs and
@@ -79,7 +85,8 @@ this box is native to is compiled under Trust; the others under a stock rustup
 toolchain with their std installed (STOCK EXCEPTION: Trust ships std for its
 host only).
   --out <dir>         write under this checkout-shaped directory instead
-  --work <dir>        scratch (default: <checkout>/libc-oracle/target/regen)
+  --work <dir>        scratch (default:
+                      <checkout>/libc-oracle/target.noindex/regen)
   --docs <dir>        libc-0.2.186-<triple>.json dumps made elsewhere, used
                       for the cells they cover
   --stock <toolchain> the rustup toolchain for the other cells (default: stable)
@@ -234,7 +241,7 @@ fn regen_options(root: PathBuf, args: &Args) -> regen::Options {
         work: args
             .work
             .clone()
-            .map_or_else(|| root.join("libc-oracle/target/regen"), absolute),
+            .map_or_else(|| root.join(ORACLE_TARGET).join("regen"), absolute),
         docs: args.docs.clone().map(absolute),
         stock: args.stock.clone().unwrap_or_else(|| "stable".into()),
         format: !args.no_format,
@@ -347,7 +354,7 @@ fn main() -> ExitCode {
     }
     let target_dir = match args.target_dir {
         Some(dir) => absolute(dir),
-        None => root.join("libc-oracle/target"),
+        None => root.join(ORACLE_TARGET),
     };
     let options = Options { root, target_dir };
     let report = run::run(&options, &mut Progress);

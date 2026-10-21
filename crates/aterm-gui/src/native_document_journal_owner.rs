@@ -59,8 +59,10 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ContentFingerprint, JournalDocumentKey, JournalImageGeneration, JournalLockPatience,
-    MAX_JOURNAL_BYTES, holds_no_draft, journal_lock_path, recover_journal_for, with_journal_lock,
+    JournalOwnerId, MAX_JOURNAL_BYTES, holds_no_draft, journal_lock_path, recover_journal_for,
+    with_journal_lock,
 };
+use crate::native_document_io::parse_hex16;
 
 /// The directory beside the journals that holds every owner's lease.
 const OWNERS_DIR: &str = ".owners";
@@ -87,35 +89,6 @@ const UNKNOWN_HOLDERS: &[u8] = b"?";
 /// Room for a fingerprint and [`MAX_OWNERS`] ids, with their separators.
 const MARK_CAPACITY: usize = 17 + MAX_OWNERS * 17;
 
-/// One process's identity as a journal owner: nonzero, random, and never reused
-/// while its lease file exists (each is created exclusively).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct JournalOwnerId(u64);
-
-impl JournalOwnerId {
-    fn lease_name(self) -> String {
-        format!("{:016x}.lease", self.0)
-    }
-
-    fn parse(text: &str) -> Option<Self> {
-        parse_hex16(text).filter(|id| *id != 0).map(Self)
-    }
-
-    fn parse_lease(name: &str) -> Option<Self> {
-        Self::parse(name.strip_suffix(".lease")?)
-    }
-}
-
-/// Exactly 16 lowercase hex digits.
-fn parse_hex16(text: &str) -> Option<u64> {
-    (text.len() == 16
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    .then(|| u64::from_str_radix(text, 16).ok())
-    .flatten()
-}
-
 /// This process's lease as a journal owner, held (locked) for as long as the
 /// host lives — in production, the process's life.
 #[derive(Debug)]
@@ -140,10 +113,7 @@ pub(crate) fn establish(root: &Path) -> Result<JournalOwner, String> {
     for _ in 0..16 {
         let mut raw = [0_u8; 8];
         aterm_uds::rand::fill(&mut raw).map_err(|error| format!("no OS entropy: {error}"))?;
-        let Some(id) = Some(u64::from_le_bytes(raw))
-            .filter(|id| *id != 0)
-            .map(JournalOwnerId)
-        else {
+        let Some(id) = JournalOwnerId::from_raw(u64::from_le_bytes(raw)) else {
             continue;
         };
         let path = dir.join(id.lease_name());
@@ -249,7 +219,7 @@ fn format_mark(image: ContentFingerprint, owners: &BTreeSet<JournalOwnerId>) -> 
     }
     let ids = owners
         .iter()
-        .map(|id| format!("{:016x}", id.0))
+        .map(|id| format!("{:016x}", id.raw()))
         .collect::<Vec<_>>()
         .join(",");
     Some(format!("{:016x}:{ids}", image.0).into_bytes())

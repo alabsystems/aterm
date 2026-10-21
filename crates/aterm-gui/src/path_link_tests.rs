@@ -583,39 +583,35 @@ fn a_cwd_report_stands_only_under_the_group_it_was_seen_under() {
 
 /// The sweep names the group a report is held to only when the front held
 /// still: the same group at the sweep before and under the report's own read.
-/// A remote shell's report first seen after its ssh exited, or across a group
-/// that moved under the read, is held to no group. NEGATIVE CONTROLS: a report
-/// first seen under a front that held still is held to it, and a later look at
-/// the same report changes nothing.
+/// A remote shell's report first seen after its ssh exited is held to no
+/// group. NEGATIVE CONTROLS: a report first seen under a front that held still
+/// is held to it, and a later look at the same report changes nothing.
 #[test]
 fn a_report_seen_as_the_front_moved_is_held_to_no_group() {
     let (shell, ssh) = (100, 200);
     let mut tl = crate::session_timeline::SessionTimeline::default();
     tl.note_foreground_group(ssh);
-    tl.witness_cwd_report(Some(1), ssh, ssh);
+    tl.witness_cwd_report(Some(1), ssh);
     assert_eq!(
         tl.cwd_witness(),
         Some((1, ssh)),
         "control: the ssh held still"
     );
     // The remote shell's next report, first seen once the shell is back.
-    tl.witness_cwd_report(Some(2), shell, shell);
+    tl.witness_cwd_report(Some(2), shell);
     assert_eq!(
         tl.cwd_witness(),
         Some((2, 0)),
         "the front moved since the last sweep"
     );
     tl.note_foreground_group(shell);
-    tl.witness_cwd_report(Some(2), shell, shell);
+    tl.witness_cwd_report(Some(2), shell);
     assert_eq!(
         tl.cwd_witness(),
         Some((2, 0)),
         "a later look changes nothing"
     );
-    // A group that moved under the read.
-    tl.witness_cwd_report(Some(3), shell, ssh);
-    assert_eq!(tl.cwd_witness(), Some((3, 0)), "moved under the read");
-    tl.witness_cwd_report(Some(4), shell, shell);
+    tl.witness_cwd_report(Some(4), shell);
     assert_eq!(tl.cwd_witness(), Some((4, shell)), "control: held still");
 }
 

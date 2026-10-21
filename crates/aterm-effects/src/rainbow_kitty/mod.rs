@@ -1688,7 +1688,13 @@ impl Engine {
     ///   slots: the focused cohort's row (the caret's, else the most recently
     ///   alive) and its neighbours first, then other resident rows and their
     ///   neighbours, so the follow pass can see where text went when a
-    ///   bottom-anchored box grew a row.
+    ///   bottom-anchored box grew a row. After scrolls carried every cell up
+    ///   past the follow offsets, the rows that far below the focused cohort,
+    ///   then the others, are named after the focus's neighbours: the screen
+    ///   rows the text stood on before the scroll, where a box redrawn in place
+    ///   still shows it ([`witness::Witness::scroll_carry`]).
+    ///   [`Engine::ribbon_rows_at_caret`] names the caret's carry's rows the
+    ///   same way.
     /// * The arming rows follow in their own [`witness::ARMING_ROWS`] slots:
     ///   the row a waiting key will lay on this frame (`arming`) and the rows
     ///   above and below it, so a copy of its glyph there is seen as a twin at
@@ -1698,6 +1704,24 @@ impl Engine {
     /// fzf list, a quoted composer) must not be taken for where it went
     /// (`tests/copies_are_not_moves.rs`).
     pub fn ribbon_rows_for(&self, arming: Option<u16>, out: &mut [u16]) -> usize {
+        self.ribbon_rows_at_caret(arming, None, out)
+    }
+
+    /// [`Engine::ribbon_rows_for`] with this frame's caret move `(from, to)`:
+    /// the row the caret last stood on and the one the host captured it on
+    /// first this frame. A caret moved past the follow offsets (and not by the
+    /// scroll return) may have gone with its box (a bottom-anchored composer
+    /// pushed down by a transcript that has not filled the screen), so the
+    /// rows that far from the focused cohort, then from the others, are named
+    /// after the scroll return's: the rows the box's lines stand on if it did
+    /// ([`Engine::carry_caret`]). A two-line box's first line is a row above
+    /// the caret's.
+    pub fn ribbon_rows_at_caret(
+        &self,
+        arming: Option<u16>,
+        caret_move: Option<(u16, u16)>,
+        out: &mut [u16],
+    ) -> usize {
         if !self.engaged {
             return 0;
         }
@@ -1712,7 +1736,7 @@ impl Engine {
             }
         };
         let budget = out.len().min(witness::WITNESS_ROWS);
-        let mut n = self.band_rows(&mut out[..budget], add);
+        let mut n = self.band_rows(&mut out[..budget], caret_move, add);
         if let Some(row) = arming {
             for r in [Some(row), row.checked_sub(1), row.checked_add(1)]
                 .into_iter()
@@ -1724,9 +1748,14 @@ impl Engine {
         n
     }
 
-    /// The bands' rows of [`Engine::ribbon_rows_for`], into `out` through
+    /// The bands' rows of [`Engine::ribbon_rows_at_caret`], into `out` through
     /// its `add` (deduped, bounded by the grid and by `out.len()`).
-    fn band_rows(&self, out: &mut [u16], add: impl Fn(&mut [u16], &mut usize, u16)) -> usize {
+    fn band_rows(
+        &self,
+        out: &mut [u16],
+        caret_move: Option<(u16, u16)>,
+        add: impl Fn(&mut [u16], &mut usize, u16),
+    ) -> usize {
         let mut n = 0usize;
         let focus = self
             .ribbon
@@ -1734,17 +1763,50 @@ impl Engine {
             .iter()
             .max_by_key(|coh| (self.caret_known && coh.row == self.caret.0, coh.alive_at))
             .map(|coh| coh.row);
+        // The scroll return's row ([`witness::Witness::scroll_carry`]):
+        // where the text stood on screen before scrolls carried it up.
+        let carry = self.witness.scroll_carry();
+        let back = |row: u16| row.checked_add(carry).filter(|_| carry > 0);
+        // The caret's carry's row ([`Engine::carry_caret`]): where the text
+        // stands if its box went with the caret.
+        let lead = caret_move
+            .map(|(from, to)| i32::from(to) - i32::from(from))
+            .filter(|&d| d.unsigned_abs() > 2 && d != i32::from(carry));
+        let ahead = |row: u16| lead.and_then(|d| u16::try_from(i32::from(row) + d).ok());
         if let Some(focus) = focus {
             add(out, &mut n, focus);
-            for row in [focus.checked_sub(1), focus.checked_add(1)]
-                .into_iter()
-                .flatten()
+            for row in [
+                focus.checked_sub(1),
+                focus.checked_add(1),
+                back(focus),
+                ahead(focus),
+            ]
+            .into_iter()
+            .flatten()
             {
                 add(out, &mut n, row);
             }
         }
         for coh in self.ribbon.cohorts() {
             add(out, &mut n, coh.row);
+            if n == out.len() {
+                return n;
+            }
+        }
+        for coh in self.ribbon.cohorts() {
+            let Some(row) = back(coh.row) else {
+                break;
+            };
+            add(out, &mut n, row);
+            if n == out.len() {
+                return n;
+            }
+        }
+        for coh in self.ribbon.cohorts() {
+            let Some(row) = ahead(coh.row) else {
+                continue;
+            };
+            add(out, &mut n, row);
             if n == out.len() {
                 return n;
             }
@@ -1829,10 +1891,19 @@ impl Engine {
         }
         self.note_rewrap_starts(rows, park);
         // Along the row first: the caret is the one the last tick observed,
-        // the column the hand edited at before this frame's echo moved it.
+        // the column the hand edited at before this frame's echo moved it. A
+        // frame that carries the band past the follow offsets (the scroll
+        // return, [`witness::Witness::scroll_carry`], or the caret's carry,
+        // [`witness::Witness::carry_caret`]) is no insert's: the box moved, and
+        // a short run's glyphs standing farther along the row it left are other
+        // text (`in` in the `statusline` of the tip a tool step drew there).
         let caret = self.caret_known.then_some(self.caret);
-        self.witness
-            .shift_runs(self.ribbon.cells(), rows, caret, &mut self.shift_scratch);
+        if self.witness.scroll_carry() == 0 && self.witness.caret_carry() == 0 {
+            self.witness
+                .shift_runs(self.ribbon.cells(), rows, caret, &mut self.shift_scratch);
+        } else {
+            self.shift_scratch.clear();
+        }
         let mut n = 0u32;
         let mut park_proved = false;
         for k in 0..self.shift_scratch.len() {
@@ -1858,7 +1929,10 @@ impl Engine {
         // The hand rides its line, found once against the mirror the pass
         // began with: the hand's own run is carried whether or not its other
         // cells let the general search name it.
-        let hand = self.hand_rides(rows, hand_withheld, lifted);
+        let hand = self
+            .hand_rides(rows, hand_withheld, lifted)
+            .or_else(|| self.hand_returns());
+        self.witness.end_scroll_carry();
         if let Some(h) = hand
             && !self
                 .follow_scratch
@@ -1972,6 +2046,41 @@ impl Engine {
         Some(run)
     }
 
+    /// THE HAND RETURNS WITH ITS LINE ([`witness::Witness::scroll_carry`]): the
+    /// scroll carried the caret mirror up with every cell, and on the scroll's
+    /// own frame (the host reads the witness's rows then too) a box redrawn on
+    /// its screen row carries the hand's line back down past the follow
+    /// offsets before the caret's observation can. The hand rides with it, as
+    /// it rides a box that moved ([`Engine::lift_hand_anchors`], the lift kept
+    /// for the seam, [`Engine::take_hand_lift`]), so the line is not carried
+    /// off the caret's row: no new-line seam on the row the scroll left it on,
+    /// no flow. A box pushed down with the caret, past the follow offsets
+    /// ([`Engine::carry_caret`]), carries the hand's line the same way. The
+    /// return or the carry this pass named on the mirror's row, if any.
+    fn hand_returns(&mut self) -> Option<witness::FollowRun> {
+        if !self.caret_known {
+            return None;
+        }
+        let run = *self
+            .follow_scratch
+            .iter()
+            .find(|r| r.dr.unsigned_abs() > 2 && r.row == self.caret.0)?;
+        let to = run.row.checked_add_signed(run.dr)?;
+        self.lift_hand_anchors(run.row, to);
+        self.hand_lift = Some((run.row, to));
+        Some(run)
+    }
+
+    /// THE CARET'S CARRY ([`witness::Witness::carry_caret`]): this frame's
+    /// caret stands `dr` rows from the row it last stood on. Set by the host
+    /// before [`Engine::follow_rows`], which searches that far too and ends
+    /// it. Inert while disengaged.
+    pub(crate) fn carry_caret(&mut self, dr: i16) {
+        if self.engaged {
+            self.witness.carry_caret(dr);
+        }
+    }
+
     /// The follow verdict on the hand's own line this frame: the run holding
     /// the hand's last glyph, judged on its typed records alone, with the
     /// caret standing on `rode_to` as the second witness to a single arrival
@@ -2007,6 +2116,13 @@ impl Engine {
         };
         self.lift_hand_anchors(run.row, to);
         self.hand_run = Some(run);
+    }
+
+    /// The hand's anchors lifted with a line that has no typed run to carry
+    /// (the delivered insert's empty composer returned under a scroll,
+    /// `CursorGlow::tick`'s hand seam): [`Engine::lift_hand`] with no run.
+    pub(crate) fn lift_caret(&mut self, row: u16, to: u16) {
+        self.lift_hand_anchors(row, to);
     }
 
     /// [`Engine::lift_hand`]'s anchors: everything the hand addresses on `row`
@@ -4837,6 +4953,149 @@ mod tests {
         assert!(
             eng.field_at(12, 2).is_some() && eng.field_at(12, 3).is_some(),
             "the lit run followed its text onto row 12"
+        );
+    }
+
+    /// THE SCROLL RETURN ([`witness::Witness::scroll_carry`]): a two-line box
+    /// redrawn on its screen rows under a transcript that scrolled three rows.
+    /// The scroll carries both runs up with every cell; the rows they stood on
+    /// are named, the hand's line's and the line above it alike, and each run
+    /// returns to its own row (not to the other line, one or two rows from
+    /// where the scroll put it) with nothing retired. The pass ends the carry,
+    /// and a carry the follow offsets reach names nothing more.
+    #[test]
+    fn a_box_redrawn_in_place_under_a_scroll_carries_its_lines_back() {
+        let ms = Duration::from_millis;
+        let (mut eng, t) = typed_runs(&[14, 15]);
+        let text: Vec<char> = "  ab".chars().collect();
+        let blank: Vec<char> = "    ".chars().collect();
+        let sample = |asked: &[u16], lines: &[u16]| {
+            asked
+                .iter()
+                .map(|&row| RowSample {
+                    row,
+                    cols: if lines.contains(&row) { &text } else { &blank },
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut asked = [0u16; witness::WITNESS_ROWS];
+        let n = eng.ribbon_rows_for(None, &mut asked);
+        assert_eq!(eng.witness_rows(&sample(&asked[..n], &[14, 15]), t), 0);
+        eng.translate_scroll(3, 16);
+        assert!(
+            eng.field_at(11, 2).is_some() && eng.field_at(12, 2).is_some(),
+            "fixture: the scroll carried both runs up three rows"
+        );
+        assert_eq!(eng.witness.scroll_carry(), 3);
+        let n = eng.ribbon_rows_for(None, &mut asked);
+        let asked = &asked[..n];
+        assert!(
+            asked.contains(&14) && asked.contains(&15),
+            "the rows the lines stood on are named: {asked:?}"
+        );
+        let redrawn = sample(asked, &[14, 15]);
+        let now = t + ms(5);
+        assert_eq!(eng.follow_rows(&redrawn, asked, now), 4);
+        tick_at(&mut eng, now);
+        assert_eq!(eng.witness_rows(&redrawn, now), 0, "nothing retired");
+        for row in [14, 15] {
+            assert!(
+                eng.field_at(row, 2).is_some() && eng.field_at(row, 3).is_some(),
+                "row {row}'s run is back under its text"
+            );
+        }
+        assert!(
+            eng.ribbon()
+                .cells()
+                .iter()
+                .all(|c| c.row == 14 || c.row == 15),
+            "no cell is left where the scroll put it"
+        );
+        assert_eq!(
+            eng.witness.scroll_carry(),
+            0,
+            "the follow pass ends the carry"
+        );
+        eng.translate_scroll(2, 16);
+        assert_eq!(
+            eng.witness.scroll_carry(),
+            0,
+            "two rows are within the follow offsets"
+        );
+    }
+
+    /// THE CARET'S CARRY ([`Engine::carry_caret`]): a typed run on row 10 and
+    /// its box pushed four rows down with no scroll, the caret seen on row 14
+    /// with no key behind it (the host's declined relocation and its carry of
+    /// four). The run follows the caret there, the hand with it, and nothing
+    /// melts; the rows the box's line stands on are named. The negative
+    /// controls: with no caret seen there, row 14 is neither named nor
+    /// searched and the run melts under the text that replaced it; with the
+    /// caret there but the text still standing on row 10 (a copy below),
+    /// nothing moves.
+    #[test]
+    fn a_box_pushed_past_the_follow_offsets_follows_the_caret() {
+        // Rows 9..=15, each `lines`' line or else blank.
+        fn sample<'a>(lines: &[(u16, &'a [char])]) -> Vec<RowSample<'a>> {
+            const BLANK: [char; 4] = [' '; 4];
+            (9..=15u16)
+                .map(|row| RowSample {
+                    row,
+                    cols: lines
+                        .iter()
+                        .find(|(r, _)| *r == row)
+                        .map_or(&BLANK[..], |(_, l)| l),
+                })
+                .collect()
+        }
+        let ms = Duration::from_millis;
+        let text: Vec<char> = "  ab".chars().collect();
+        let other: Vec<char> = "  xy".chars().collect();
+        let asked: Vec<u16> = (9..=15).collect();
+        let take = |caret: bool, old_row: &[char]| {
+            let (mut eng, t) = typed_runs(&[10]);
+            assert_eq!(eng.witness_rows(&sample(&[(10, &text)]), t), 0);
+            let now = t + ms(300);
+            tick_at(&mut eng, now);
+            let mut named = [0u16; witness::WITNESS_ROWS];
+            let n = eng.ribbon_rows_at_caret(None, caret.then_some((10, 14)), &mut named);
+            assert_eq!(
+                named[..n].contains(&14),
+                caret,
+                "row 14 is named exactly when the caret went there: {:?}",
+                &named[..n]
+            );
+            if caret {
+                eng.observe_caret((14, 4));
+                eng.carry_caret(4);
+            }
+            let pushed = sample(&[(10, old_row), (14, &text)]);
+            let followed = eng.follow_rows(&pushed, &asked, now);
+            tick_at(&mut eng, now);
+            let retired = eng.witness_rows(&pushed, now);
+            (eng, followed, retired)
+        };
+        let (eng, followed, retired) = take(true, &other);
+        assert_eq!(followed, 2, "the run followed the caret");
+        assert_eq!(retired, 0, "nothing melts");
+        assert!(
+            eng.field_at(14, 2).is_some() && eng.field_at(14, 3).is_some(),
+            "the run is under its text on row 14"
+        );
+        assert!(
+            eng.ribbon().cells().iter().all(|c| c.row == 14),
+            "nothing is left on row 10"
+        );
+        assert_eq!(eng.caret.0, 14, "the hand rode with its line");
+        let (_, followed, retired) = take(false, &other);
+        assert_eq!(followed, 0, "control: no caret, no search four rows down");
+        assert_eq!(retired, 2, "control: the run melts under the new text");
+        let (eng, followed, retired) = take(true, &text);
+        assert_eq!(followed, 0, "control: the text stayed, so nothing moved");
+        assert_eq!(retired, 0, "control: and nothing melts");
+        assert!(
+            eng.ribbon().cells().iter().all(|c| c.row == 10),
+            "control: the run stays on row 10"
         );
     }
 

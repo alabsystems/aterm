@@ -10,23 +10,32 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+use aterm_control::wire::{VisibleTrim, push_visible};
 use aterm_core::grid::extra::ImageData;
-use aterm_core::grid::{CellFlags, Grid};
+use aterm_core::grid::{Cell, CellFlags};
 use aterm_core::search::{
-    DEFAULT_MAX_CACHED_LINES, LineCells, NarrowedSearch, SearchDirection as EngineSearchDirection,
-    SearchMatch, SearchOptionsError, SearchResults, TerminalSearch, max_cached_for_retained,
+    DEFAULT_MAX_CACHED_LINES, SearchDirection as EngineSearchDirection, SearchMatch,
+    SearchOptionsError, SearchResults,
 };
 use aterm_core::selection::SelectionType;
-use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
-use aterm_search::{LineFrame, MAX_SEARCH_MATCHES};
-use aterm_types::text_shaping::AmbiguousWidth;
+use aterm_core::terminal::{
+    AbsRowText, BuiltSearch, RenderCell, SearchKey, SearchLayout, SearchRequest, SearchVerdict,
+    Terminal, UnderlineStyle, WrapFrame,
+};
+use aterm_search::MAX_SEARCH_MATCHES;
 use aterm_window::event_loop::EventLoopProxy;
 
 use super::{
-    DimsSnapshot, control_media, cursor_style_name, image_payload, json_ok, json_str_field,
-    pct_encode, visible_char,
+    DimsSnapshot, control_media, cursor_style_name, json_ok, json_str_field, pct_encode,
+    visible_char,
+};
+use crate::frame_key::FrameKey;
+use crate::frame_memo::{FrameSlot, ScreenText, Styled};
+use crate::image_payload_memo::{ImagePayload, image_payloads};
+use crate::metrics::wire::{
+    FieldSink, FlagWords, Form, JsonSink, ReadCtx, Request, Syntax, TextSink,
 };
 use crate::session_waits::{RewrapGauge, RewrapReading};
 use crate::{Wake, term_lock};
@@ -45,23 +54,10 @@ pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
     aterm_control::wire::visible_row(t, r)
 }
 
-/// How many leading rows a reply keeps once its trailing all-blank rows are dropped:
-/// the index of the last row that is not blank (blank = empty after trimming
-/// spaces) plus one, and 0 when every row is blank. Interior blank rows are KEPT —
-/// only the tail goes — so row `i` of a trimmed reply is still screen row `i`, and
-/// the `line`/`cell`/`search` coordinates an agent reads off it stay valid. THE one
-/// trim rule: `text trim`, `text --json trim`, `turn … trim=1`, `blocktext … trim`,
-/// `temporal … trim` and the `subscribe … screen,trim` DELTA all route here, so the
-/// polled and pushed faces cannot disagree about what a trailing blank is. (F4: a
-/// 55-row grid with 48 blank rows cost ~7.6 KB per read and a `grep -v` on every
-/// reply; the count on a trimmed header is the count of rows actually sent.)
-pub(crate) fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
-    rows.enumerate()
-        .filter(|(_, r)| !r.trim_matches(' ').is_empty())
-        .map(|(i, _)| i + 1)
-        .last()
-        .unwrap_or(0)
-}
+// THE one rule for a reply's blank tail (`text trim`, `turn … trim=1`, `temporal …
+// trim`, the `subscribe … screen,trim` delta): it lives beside the collapse rule in
+// `aterm_control::wire`, where `blocktext` counts with it before it frames a row.
+pub(crate) use aterm_control::wire::trimmed_len;
 
 /// The `text` grammar, as the wire states it on a usage error.
 ///
@@ -240,54 +236,17 @@ pub(crate) fn split_trim_tail(rest: &str) -> (&str, bool) {
     }
 }
 
-/// `blocktext <id> [trim]`: the grammar is validated HERE, and only `<id>` reaches
-/// the shared block-output emitter (`emit`). `trim` drops the block's trailing blank
-/// rows through [`trim_lines_reply`]; a non-numeric id or any other tail is the
-/// usage line rather than a token that vanishes (the `text` hole, on a second verb).
-pub(crate) fn cmd_blocktext_args(rest: &str, emit: impl FnOnce(&str) -> String) -> String {
+/// `blocktext <id> [trim]`: the grammar is validated HERE, and only the parsed id
+/// and whether `trim` was given reach the shared block-output emitter (`emit`, which
+/// frames the reply once, `trim` included, after the terminal is released). A
+/// non-numeric id or any other tail is the usage line rather than a token that
+/// vanishes (the `text` hole, on a second verb).
+pub(crate) fn cmd_blocktext_args(rest: &str, emit: impl FnOnce(u64, bool) -> String) -> String {
     let (id, trim) = split_trim_tail(rest);
-    if id.parse::<u64>().is_err() {
+    let Ok(id) = id.parse::<u64>() else {
         return "ERR usage: blocktext <id> [trim]\n".to_string();
-    }
-    let reply = emit(id);
-    if trim {
-        trim_lines_reply(&reply)
-    } else {
-        reply
-    }
-}
-
-/// Re-frame a line-framed `OK <n>[ <marker…>]\n` + n rows reply with its trailing
-/// blank rows dropped: `OK <sent>[ <marker…>] trimmed=<k>\n` + the first `sent` rows,
-/// `sent` per [`trimmed_len`]. Header tokens after the count survive in place and
-/// `trimmed=` closes the line (reply fields are additive, new ones go LAST). Any
-/// other reply — an `ERR`, a status line — passes through untouched: there is
-/// nothing to trim and the error must reach the caller as it was.
-pub(crate) fn trim_lines_reply(reply: &str) -> String {
-    let Some((header, body)) = reply.split_once('\n') else {
-        return reply.to_string();
     };
-    let mut toks = header.split_whitespace();
-    if toks.next() != Some("OK") {
-        return reply.to_string();
-    }
-    let Some(n) = toks.next().and_then(|t| t.parse::<usize>().ok()) else {
-        return reply.to_string();
-    };
-    let sent = trimmed_len(body.lines().take(n));
-    let mut out = format!("OK {sent}");
-    for tok in toks {
-        out.push(' ');
-        out.push_str(tok);
-    }
-    {
-        use std::fmt::Write as _;
-        let _ = writeln!(out, " trimmed={}", n.saturating_sub(sent));
-    }
-    for row in body.split_inclusive('\n').take(sent) {
-        out.push_str(row);
-    }
-    out
+    emit(id, trim)
 }
 
 /// Frame a gathered screen `body` (`rows` newline-terminated rows, already out from
@@ -354,34 +313,24 @@ pub(crate) fn frame_rows_reply(
 /// the fidelity tests read the whole grid by this name and nothing in the lib does.
 #[cfg(test)]
 pub(crate) fn cmd_text(term: &Arc<Mutex<Terminal>>) -> String {
-    cmd_text_opt(term, TextArgs::default())
+    cmd_text_opt(term, &FrameSlot::default(), TextArgs::default())
 }
 
-/// THE SCREEN'S STAMP: `(content_seq, FNV-1a-64 of the untrimmed visible
-/// screen)` — `status`'s `seq=`/`hash=`, and the same pair `turn` returns and
-/// `history` keeps per turn id.
-///
-/// It lives HERE, beside [`visible_row`] and [`cmd_text_opt`], because the
-/// whole value of the hash is that a reader can recompute it from what `text`
-/// served: a reporter reads `status` for the stamp and `text` for the rows,
-/// hashes the rows itself, and holds the two against each other. Two loops in two modules would have been two chances to disagree
-/// about a trailing space; `screen_stamp_matches_the_text_verbs_rows` pins
-/// that they do not.
-///
-/// COST, measured 2026-09-20 on a 60x200 grid: 61.6 us a call, of which 55.3 us
-/// is [`visible_row`] rendering the grid and ~6 us is the hash. `status` pays it
-/// on every call, under the terminal guard it already takes for `detail=`. That
-/// is the price of a stamp a reader can RECOMPUTE from `text`; a cheaper one
-/// (a running hash on the engine's write path, say) would be a second
-/// definition of the same value, which is the thing this function exists to
-/// avoid.
+/// THE SCREEN'S STAMP as a test reads it: `(content_seq, FNV-1a-64 of the
+/// untrimmed visible screen)`, `status`'s `seq=`/`hash=` and the pair `turn`
+/// returns and `history` keeps per turn id. Production reads the hash off the
+/// session's published text ([`crate::frame_memo::ScreenText::fnv`]); this is
+/// the ground truth it is held to.
+#[cfg(test)]
 pub(crate) fn screen_stamp(t: &Terminal) -> (u64, u64) {
     (t.content_seq(), screen_hash(t))
 }
 
 /// FNV-1a-64 of [`screen_text`]'s bytes, folded row by row so no full-screen
 /// String is built: the hash carries its state across `write`s, so hashing
-/// each row and then its `\n` is the hash of their concatenation.
+/// each row and then its `\n` is the hash of their concatenation. A test's
+/// ground truth for [`crate::frame_memo::ScreenText::fnv`].
+#[cfg(test)]
 pub(crate) fn screen_hash(t: &Terminal) -> u64 {
     let mut h = aterm_hash::Fnv1a64::new();
     for r in 0..t.rows() as usize {
@@ -408,22 +357,12 @@ pub(crate) fn screen_gen(t: &Terminal) -> ScreenGen {
     }
 }
 
-/// The whole visible screen as text: every row [`visible_row`] renders, each
-/// followed by a newline, untrimmed.
-///
-/// THE ONE CONSTRUCTION the hashed screen has. `turn` used to build this inline
-/// and [`screen_stamp`] built it again, which made "the same pair `turn`
-/// returns" true by coincidence rather than by construction — a trailing space
-/// added to one loop and not the other would have made every stamped report
-/// unmatchable and nothing would have failed until it did. `cmd_text_opt` keeps
-/// its own loop because it serves a row SPAN (`tail=`, `rows=`), and that the
-/// bare span agrees with this is pinned by
-/// `screen_stamp_matches_the_text_verbs_rows`.
 /// FNV-1a-64 of the visible rows `first..=last`, each as [`visible_row`]
-/// serves it followed by `\n` — the `turn if-rows=` fence's value, by the one
-/// definition both ends share ([`aterm_types::control_verbs::RowsFence::hash_rows`]),
-/// the screen's own `hash=` over just those rows. `None` for an empty range or
-/// one past the grid: the fence then reads the screen as moved.
+/// serves it followed by `\n`: the `turn if-rows=` fence's value by
+/// [`aterm_types::control_verbs::RowsFence::hash_rows`], read row by row. A
+/// test's ground truth for [`crate::frame_memo::ScreenText::rows_hash`], which
+/// the fence reads. `None` for an empty range or one past the grid.
+#[cfg(test)]
 pub(crate) fn rows_hash(t: &Terminal, first: usize, last: usize) -> Option<u64> {
     if first > last || last >= t.rows() as usize {
         return None;
@@ -434,10 +373,30 @@ pub(crate) fn rows_hash(t: &Terminal, first: usize, last: usize) -> Option<u64> 
     ))
 }
 
+/// The whole visible screen as text: every row [`visible_row`] renders, each
+/// followed by a newline, untrimmed.
+///
+/// THE ONE CONSTRUCTION the hashed screen has. `turn` used to build this inline
+/// and the stamp built it again, which made "the same pair `turn` returns" true
+/// by coincidence rather than by construction: a trailing space added to one
+/// loop and not the other would have made every stamped report unmatchable and
+/// nothing would have failed until it did. Each session's published
+/// [`crate::frame_memo::ScreenText`] is built by this, once per change of the
+/// screen's text key, and `status hash=`, `turn hash=`, the `if-fp=` and
+/// `if-rows=` fences and the logical `text` rows are all read off that one
+/// build. `screen_stamp_matches_the_text_verbs_rows` pins that `text` serves
+/// these bytes. Each row is appended straight into the one buffer
+/// ([`aterm_control::wire::visible_row_into`]).
+///
+/// A memo, not a running hash on the engine's write path: a reader can still
+/// RECOMPUTE the stamp from the rows `text` served, which is the whole value of
+/// the stamp. COST of a build, measured 2026-09-20 on a 60x200 grid: 61.6 us,
+/// of which 55.3 us renders the rows and ~6 us is the hash; a reader of an
+/// unchanged screen pays neither.
 pub(crate) fn screen_text(t: &Terminal) -> String {
     let mut screen = String::with_capacity(t.rows() as usize * (t.cols() as usize + 1));
     for r in 0..t.rows() as usize {
-        screen.push_str(&visible_row(t, r));
+        aterm_control::wire::visible_row_into(t, r, &mut screen);
         screen.push('\n');
     }
     screen
@@ -453,28 +412,43 @@ pub(crate) fn screen_text(t: &Terminal) -> String {
 /// ([`TextShape::select`]) picks the rows BEFORE they are read, so a `tail=20` on
 /// a 63-row grid extracts 20 rows, not 63 and then a cut; `trim` measures that
 /// slice, and `first=<row>` says where it starts whenever that is not row 0. The
-/// rows themselves are the same [`visible_row`] text as ever.
-pub(crate) fn cmd_text_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
-    // The body is gathered into ONE buffer sized up front (one full row + newline
-    // each) so the row loop never reallocates-and-copies the accumulated screen
-    // while holding the terminal lock. The header is written AFTER the lock is
-    // released — a trimmed count is only known once every row has been read — and
-    // the one memcpy that costs is paid with the PTY reader unblocked.
-    let (first, rows, body) = {
+/// rows themselves are the same [`visible_row`] text as ever: in logical order,
+/// a slice of the session's published [`ScreenText`].
+pub(crate) fn cmd_text_opt(
+    term: &Arc<Mutex<Terminal>>,
+    frame: &FrameSlot,
+    args: TextArgs,
+) -> String {
+    // Logical rows are a span of the session's published text, built under the
+    // lock only when the screen changed since the last build and sliced with it
+    // released. `order=display` reads its own rows into ONE buffer sized up front
+    // (one full row + newline each), so the row loop never reallocates-and-copies
+    // the accumulated screen while holding the terminal lock. The header is
+    // written AFTER the lock is released — a trimmed count is only known once
+    // every row has been read — and the one memcpy into the reply is paid with
+    // the PTY reader unblocked.
+    let mut look = frame.look_frame();
+    let (first, end, text, display) = {
         let t = term_lock(term);
         let (first, end) = match args.shape.select(t.rows() as usize) {
             Ok(span) => span,
             Err(err) => return err,
         };
-        let rows = end - first;
-        let mut body = String::with_capacity(rows * (t.cols() as usize + 1));
-        for r in first..end {
-            body.push_str(&row_in_order(&t, r, args.display).0);
-            body.push('\n');
+        if args.display {
+            let mut body = String::with_capacity((end - first) * (t.cols() as usize + 1));
+            for r in first..end {
+                body.push_str(&row_in_order(&t, r, true).0);
+                body.push('\n');
+            }
+            (first, end, None, body)
+        } else {
+            (first, end, Some(look.text(&t)), String::new())
         }
-        (first, rows, body)
     };
-    frame_rows_reply(&body, rows, "", args.trim, first)
+    let body = text
+        .as_deref()
+        .map_or(display.as_str(), |text| text.span(first, end));
+    frame_rows_reply(body, end - first, "", args.trim, first)
 }
 
 /// `cursor` -> `OK <row> <col> <visible:0|1> <style>\n` (0-based). `<style>`
@@ -538,24 +512,37 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
             (blank.fg, blank.bg)
         }
     };
+    // ONE live row handle (offset-INDEPENDENT, the row `render_row_at_screen`
+    // and `cell_grapheme` resolve) for the grapheme, the attrs and the width
+    // markers.
+    let col = c as u16;
+    let view = t.grid().screen_row_view(r as u16);
+    let cell = view.cell(col);
+    // PROTECTED (DECSCA) shares a flag bit with WIDE_CONTINUATION;
+    // `is_wide_continuation` disambiguates via the left neighbor, so a
+    // protected character is ordinary text.
+    let wide_cont = view.is_wide_continuation(col);
     // Combining-aware grapheme for THIS cell, via the same core extraction the
-    // selection/text paths use. A wide-continuation cell yields "" (its glyph
-    // belongs to the lead cell); a blank cell yields "" (the consumer infers a
-    // space from the in-grid position, matching `text`'s trailing trim).
-    let grapheme = t.cell_grapheme(r, c).unwrap_or_default();
+    // selection/text paths use (`cell_grapheme`'s bytes). A wide-continuation
+    // cell yields "" (its glyph belongs to the lead cell); a blank cell yields a
+    // space.
+    let mut grapheme = String::new();
+    if let Some(cell) = cell
+        && !wide_cont
+    {
+        view.push_cell_text(col, cell, &mut grapheme);
+    }
     let grapheme_tok = pct_encode(&grapheme);
     // Width markers, so a consumer can distinguish a full-width (CJK) glyph from
     // an ASCII space without inferring from columns:
     //   `wide`      — the LEAD cell, which holds the double-width glyph
     //   `wide_cont` — its blank right-half spacer
-    // PROTECTED (DECSCA) shares a flag bit with WIDE_CONTINUATION;
-    // `is_wide_continuation_at` disambiguates via the left neighbor, so a
-    // protected character gets NEITHER token (it is ordinary text).
-    let flags = cell_attrs(t.grid(), r, c);
+    // A protected character gets NEITHER token.
+    let flags = cell.map_or_else(CellFlags::default, cell_attrs);
     let mut attrs = attrs_string(flags);
     let wide_tok = if flags.contains(CellFlags::WIDE) {
         Some(aterm_codec::cell::Attribute::Wide.word())
-    } else if t.grid().is_wide_continuation_at_screen(r as u16, c as u16) {
+    } else if wide_cont {
         Some(aterm_codec::cell::Attribute::WideCont.word())
     } else {
         None
@@ -582,18 +569,13 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     )
 }
 
-/// The [`CellFlags`] at grid `(r, c)`: a cell carries its attribute bits
-/// inline. Out-of-range coordinates yield empty flags.
-fn cell_attrs(grid: &Grid, r: usize, c: usize) -> CellFlags {
-    let (Ok(row), Ok(col)) = (u16::try_from(r), u16::try_from(c)) else {
-        return CellFlags::default();
-    };
-    // LIVE frame (`row_at_screen`, offset-INDEPENDENT), NOT the display-mapped
-    // `grid.row` — so the attrs a socket read reports pair with the live glyph/colours
-    // regardless of the GUI's scroll position (see `render_row_at_screen`).
-    grid.row_at_screen(row)
-        .and_then(|gr| gr.get(col))
-        .map_or_else(CellFlags::default, |cell| cell.flags())
+/// The [`CellFlags`] of a live grid `cell`, read off the LIVE frame
+/// (`screen_row_view`, offset-INDEPENDENT), NOT the display-mapped `grid.row` —
+/// so the attrs a socket read reports pair with the live glyph/colours
+/// regardless of the GUI's scroll position (see `render_row_at_screen`). A
+/// cell carries its attribute bits inline.
+fn cell_attrs(cell: Cell) -> CellFlags {
+    cell.flags()
 }
 
 /// Render active text attributes as a stable comma list, or `none` when bare.
@@ -706,7 +688,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
          frame_w={} frame_h={} surface_w={} surface_h={} offset_x={} offset_y={} \
          band_left={} band_right={} band_top={} band_bottom={} crop_left={} \
          crop_right={} crop_top={} crop_bottom={} pad={} pad_top={} pad_bottom={} head={} \
-         tab_rows={} viewers={} visible_viewers={} geometry={} \
+         tab_rows={} deck_y={} deck_h={} viewers={} visible_viewers={} geometry={} \
          present_retry_state={} present_retry_count={} present_retry_remaining={} \
          present_retry_in_ms={} \
          layer_gravity={} layer_scale={} layer_flipped={}\n",
@@ -744,6 +726,8 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
         snapshot.pad_bottom,
         snapshot.head,
         snapshot.tab_rows,
+        snapshot.deck_y,
+        snapshot.deck_h,
         snapshot.viewers,
         snapshot.visible_viewers,
         snapshot.geometry,
@@ -771,1361 +755,58 @@ pub(crate) fn cmd_dims(
 
 const METRICS_USAGE: &str = "ERR usage: metrics [reset|percentiles] [--json]\n";
 
-/// `metrics [reset]` -> one `OK k=v ...\n` line of live render/latency counters so a
-/// driving AI can MEASURE responsiveness AND DETECT lag in the same loop it drives
-/// with — `send`/`key`, then `metrics`. `metrics reset` first zeroes the
-/// measurement-window stats (frames / maxima / slow count) so a SPECIFIC workload can
-/// be timed: `metrics reset`, drive it, then `metrics`.
-///
-/// Fields: `backend=<cpu|gpu>`, grid `rows`/`cols` (`busy` in text / `null` in
-/// JSON when the terminal mutex is occupied, without withholding the remaining
-/// lock-free diagnostics), `frames` (successful application presents since reset
-/// — a steady app-render frame does NOT advance it),
-/// `last_/max_present_latency_ms` (the `output→application-present-return`
-/// slice `$ATERM_TRACE_LATENCY` logs, most-recent + worst), and the
-/// LAG SIGNATURE: `last_/max_frame_render_ms` + `slow_frames` (frames over the ~30 fps
-/// budget, `slow_threshold_ms`). A non-zero `slow_frames`, a large
-/// `max_frame_render_ms`, or `backend=cpu` under heavy output all mean the terminal is
-/// lagging. Values are the process-global [`crate::metrics`] counters + the grid size.
-///
-/// PACING/SHED SIGNATURE (the 2026-07-05 incident class):
-/// `last_/max_input_present_ms` (key arrival → the first attributed successful
-/// content-present return — a software-side typing-latency proxy),
-/// `sync_armed`/`sync_rel_end`/`sync_rel_timeout` (DEC-2026 hold episodes by release
-/// cause — timeouts climbing during ordinary typing = the SYNC-1 bug), `sync_holding`,
-/// and `perf_reduced` + `shed_transitions` (the load-shed latch; engaged during light
-/// typing, or flapping at idle, are both wrong).
-///
-/// WHEN, AND WHOSE. A worst case with no time of occurrence cannot be
-/// correlated with anything else that happened in the process, and a LAST-WRITER
-/// lateness reading is erased before anyone can read it: a live line carried
-/// `max_present_latency_ms=560.54` beside `wake_late_ms=0.00
-/// deadline_late_ms=0.00`, because a late `Timer` wake's lateness is overwritten
-/// with `0` by the next `WaitCancelled` — one per output burst. So the summary
-/// also carries `max_wake_late_ms`/`max_deadline_late_ms` with the OWNER and the
-/// `_at_ms` instant of each, `max_present_latency_at_ms` /
-/// `max_input_present_at_ms`, and `max_present_latency_gap_ms` — the
-/// present→present gap of the frame that set the present max, which separates
-/// "nothing presented for that long" from "frames kept coming while this output
-/// waited". Every `_at_ms` is on the process clock `metrics_now_ms` reads at the
-/// same instant, so "how long ago" is one subtraction. A run of spikes over
-/// 100 ms also writes an `aterm.log` line when it starts and, when it had more
-/// than one, a summary when it ends, in EVERY build — the only other per-spike
-/// record is `$ATERM_TRACE_LATENCY`'s stderr line, and the release stall
-/// watchdog's threshold is 5 s.
-///
-/// THE PARK OUTSIDE THE REDRAW. Everything named so far prices a redraw, a
-/// wake's lateness, or an end-to-end interval that contains both. None of them
-/// could name a main thread parked inside a NON-redraw handler for 100–600 ms —
-/// too short for the 5 s release stall watchdog, never inside the redraw timer,
-/// and charged in full to `present_latency` and `input_present`. So the summary
-/// carries the MAIN-LOOP TURN census (`crate::watchdog`): `max_turn_ms` with the
-/// winit root that owned it (`max_turn_owner=user_event`) and the `_at_ms`
-/// instant it ended, plus `last_turn_ms`, the `turns` booked and the
-/// `long_turns` among them at or over `long_turn_threshold_ms` (one 30 fps frame
-/// budget). Read the max AGAINST `max_redraw_total_ms`: both large is a slow
-/// frame, a large `max_turn_ms` with a small `max_redraw_total_ms` is a park no
-/// other instrument reaches — the bookkeeping the `Wake::Output` arm runs ahead
-/// of its redraw fan-out being the standing candidate. A turn that never ENDS
-/// books nothing here by construction; that one is the stall watchdog's, and it
-/// logs a named root.
-///
-/// THE TAIL, ON THE SUMMARY LINE. `last_` is a momentary reading and `max_` is
-/// an unbounded worst case; neither brackets a distribution. During the 2026-08
-/// spin `last_input_present_ms=8.1` read healthy while the live p99 was 335 ms.
-/// So the summary now also carries `n_input` + `input_p50/p95/p99_ms` and
-/// `n_present` + `present_p50/p95/p99_ms` — the same histograms `percentiles`
-/// publishes, so a healthy median cannot mask a sick tail from a reader who
-/// asked only one question.
-///
-/// US OR THEM, ON THE SAME LINE. Every slice named so far measures ATERM, so a
-/// sick tail among them cannot say whose lag it is. The summary therefore also
-/// carries [`crate::echo_rtt`]'s fragment — `n_echo` + `echo_p50/p95/p99_ms`,
-/// `echo_last_/echo_max_ms`, and the `echo_arms`/`echo_coalesced`/
-/// `echo_expired`/`echo_dropped_locked` ledger that qualifies them — measuring
-/// bytes out to the PTY → the first bytes back, which belongs to the CHILD.
-/// Read against `input_*`: echo high with input low means the program is
-/// behind; the reverse means we are. It is spliced whole, never as a lone
-/// percentile, and aterm cannot fix a sick one by fiat — it can only decline to
-/// compete with the child (its gate, cutter and package lanes run at utility).
-///
-/// PRESENT-LATENCY HONESTY. `present_*` describes aterm ONLY while the window is
-/// actually presenting, so an output→present sample taken while the window was
-/// occluded/parked, or while a `video` capture was pacing presents, is booked to
-/// a separate ledger: `present_tainted` / `last_/max_present_tainted_ms`, with
-/// its own `present_tainted_p50/p95/p99_ms` under `percentiles`. `capture_episodes`
-/// counts recordings opened in this window and `capture_active` is the live
-/// gauge — any non-zero `capture_episodes` means a capture-based instrument ran
-/// inside your measurement window. Nothing is discarded: `n_present +
-/// n_present_tainted` still accounts for every content present.
-///
-/// WHAT THESE SLICES INCLUDE — READ BEFORE QUOTING ONE AS "LATENCY". Both
-/// key→present slices are OPEN INTERVALS closed by the next qualifying present,
-/// so any time in which nothing presented is INSIDE the number. They are not
-/// floored by a sampling rate (that is the `video … keys` failure mode; see
-/// `crate::video_key_analysis`), but they have their own two:
-///
-///  * `present_*` (`output→application-present-return`) opens on the LEADING
-///    EDGE of a PTY output burst — a `compare_exchange(0, …)`, first edge wins —
-///    and closes on the next content present that books it. Output that moves
-///    no pixels opens the interval and does not close it, so the wait until
-///    something else presents is published as if it were render time. The only
-///    bound is a 5 s discard (`PRESENT_LATENCY_CAP_NS`), so a multi-SECOND
-///    reading means "nothing presented for that long", NOT "a frame took that
-///    long". Read it with `n_present` and the percentiles beside it, never as a
-///    lone `last_`/`max_`.
-///  * `input_*` (`key-arrival→content-present-return`): a key typed into a
-///    window is closed only by that window's next content present; input sent
-///    to a session (`send`/`feed`) closes on any window's present. Under
-///    streaming output in the SAME window the closing
-///    present may be a log-line frame rather than the key's echo (reads low);
-///    a key that never echoes — a password prompt — books its whole wait until
-///    the next content present, up to the 5 s discard (reads high).
-///
-///  * `resize_present` has the same shape with a 2 s bound
-///    (`RESIZE_SLICE_CAP_NS`) and closes on ANY successful present, not only a
-///    content one — deliberately, since what ends a compositor rescale is a
-///    frame at the new size, whatever drew it. Same caveat: idle inside the
-///    interval is inside the number.
-///
-/// None of them is key→photon: all stop at application-present return, upstream
-/// of compositor selection, scanout and display. The leg after that return is
-/// published separately under `percentiles` as `present_glass`
-/// (`presentDrawable:` registration → the drawable's `presentedTime`); it still
-/// stops at the display's reported present time, not at photons.
-///
-/// FRAME-EXTRACTION ATTRIBUTION. `frame_refills_scoped` / `frame_refills_full`
-/// split the presented-path refills between the damage-scoped arm and the full
-/// O(rows x cols) walk, and `frame_refill_full_causes=<clause>:<frames>,...` (a
-/// JSON object in the structured twin) names WHICH continuity clause refused on
-/// each of the full ones. The split alone cannot: `host_mutation` (some
-/// per-frame scratch mutator broke the chain — fixable),
-/// `terminal_mismatch` (panes sharing one scratch — fixable), `base_y` (the
-/// content is scrolling — correct, nothing to fix) and `scratch_unstamped` (the
-/// window's first frame — unavoidable) all read as the same climbing
-/// `frame_refills_full`. Non-zero clauses only, so a healthy instance prints
-/// one or two pairs. `frame_refills_skipped` is the third arm: presented frames
-/// that took NO extraction because the effect-only reuse gate proved the engine
-/// had not moved since the snapshot was filled. It is what keeps a FALL in
-/// `frame_refills_scoped` readable as work avoided rather than work gone
-/// missing — `scoped + full + skipped` is still exactly one per presented
-/// non-rescan frame.
-///
-/// SCHEDULER ATTRIBUTION. `past_deadline_arms` is the global spin witness;
-/// `deadline_arms_by_owner=<owner>:<arms>/<past>,...` (a JSON object in the
-/// structured twin) names WHICH producer armed them. `deadline_owner` alone is a
-/// last-writer snapshot and cannot do that — it reported the 2026-08 spin as
-/// `title_summary` when the producer was the session-status observer, now its
-/// own `session_status` owner. Beside it, `past_arm_streak_heals=<owner>:<n>,...`
-/// names every producer whose windowed past-arm streak (> 90% of its last 32
-/// arms already past, at ANY lateness) the fold is actively clamping to frame
-/// cadence — a live, named scheduler bug, not a suspicion.
-///
-/// STARTUP: `first_present_ms` keeps the compatibility-stable GUI
-/// `main_entry` → startup-metrics publication point inside the first
-/// successful-present finalizer. That point follows a successful submit and
-/// includes initial reveal, acknowledgement, and synchronous post-submit
-/// recovery bookkeeping.
-/// `rust_main_to_first_present_ms` adds the shipped one-binary Rust `main`
-/// boundary before router work (0.00 in the thin GUI binary). Schema 1's eight
-/// `startup_*_ms` fields exclusively partition that broader interval: router,
-/// synchronous GUI preparation, winit dispatch, initial surface attachment,
-/// wait/retries to the eventually successful redraw, that redraw's compose,
-/// its surface transaction, and successful-present finalization.
-/// `startup_phase_valid` is true only when every timestamp is present, ordered,
-/// and sums exactly to both enclosing startup metrics. All startup facts remain
-/// 0.00 until first present, survive `metrics reset`, and exclude
-/// dyld/process-loader time. None observes compositor selection, display timing,
-/// scanout, or photons.
-///
-/// `metrics percentiles` -> the latency DISTRIBUTIONS:
-/// input→application-present-return, output→application-present-return,
-/// frame-render, key→write, and pre-present compose histograms
-/// as `n_*` + p50/p95/p99 ms fields, conservative by construction (bucket upper
-/// edge), plus the occluded/parked/capture twin `present_tainted_*`. Same funnel
-/// and honesty bounds as the scalars; zeroed by `metrics reset` like the maxima.
-/// The input legs close the line (`metrics::input_legs_fields_text`):
-/// `out_req_*` is output → redraw request, the first half of `present_*` (the
-/// burst's leading edge to the turn that admits its redraw, once per burst);
-/// `ime_*` is an IME composition's preedit → commit, with `ime_cancelled` for
-/// compositions that ended without one; `input_refused` counts input a full
-/// input queue refused rather than park or queue without bound — keys and
-/// pastes (said once per session in Messages), and mouse, wheel, focus and
-/// colour-scheme reports (silently); `reply_dropped` counts terminal query replies a full reply lane
-/// dropped (a program flooding queries whose answers it never reads).
+/// `metrics [reset|percentiles] [--json]` -> one `OK k=v ...\n` line of live
+/// render/latency counters, or with `--json` the same fields as one JSON object
+/// (`OK 1\n{...}\n`), so a driving AI can MEASURE responsiveness AND DETECT lag
+/// in the same loop it drives with — `send`/`key`, then `metrics`. `metrics
+/// reset` first zeroes the measurement-window stats so a SPECIFIC workload can
+/// be timed: `metrics reset`, drive it, then `metrics`. Every field is
+/// documented where it is emitted, once for both forms:
+/// [`crate::metrics::emit_summary`] and [`crate::metrics::emit_percentiles`].
 /// An argument other than `reset`/`percentiles` is refused, never answered with
-/// the summary: a mistyped `reset` must not read as a successful one.
+/// the summary: a mistyped `reset` must not read as a successful one. `metrics
+/// --json` never reaches here: the dispatch hands it to [`cmd_metrics_json`]
+/// (`control::json_ask`).
 pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> String {
-    let ms = |ns: u64| ns as f64 / 1e6;
-    let wants_json = rest
-        .split_whitespace()
-        .any(|token| token == "json" || token == "--json");
-    if wants_json {
-        let command = rest
-            .split_whitespace()
-            .filter(|token| *token != "json" && *token != "--json")
-            .collect::<Vec<_>>()
-            .join(" ");
-        return cmd_metrics_json(term, &command);
-    }
-    // `metrics percentiles` -> the latency DISTRIBUTIONS (same funnel as the
-    // scalars, log-linear histograms, bucket-upper-edge = conservative):
-    // per distribution `n_*` samples + p50/p95/p99 in ms (0.00 until a sample
-    // lands — check `n`). Window stats: `metrics reset` zeroes them too.
-    if rest.trim() == "percentiles" {
-        let (input, present, render) = crate::metrics::distributions();
-        let key_write = crate::metrics::key_write_distribution();
-        // THE OS-QUEUE SHARE OF `key_write`. The key-arrival stamp is backdated by
-        // the NSEvent queue age, so `key_write_*` (and `input_*`) price a parked
-        // event loop — and used to price it INSEPARABLY: an 18.13 ms max could be
-        // 17 ms of queue wait or 17 ms of on-thread dispatch, which are opposite
-        // fixes. Published beside the total it splits, never instead of it.
-        let key_queue = crate::metrics::key_queue_distribution();
-        let (last_key_queue_ns, max_key_queue_ns) = crate::metrics::key_queue_last_max_ns();
-        let pre_present = crate::metrics::pre_present_distribution();
-        // The drawable-park slice. Until this existed the largest known macOS typing
-        // stall could only be estimated as `redraw_total - compose - render`, mixed
-        // with the post-present tail — so a regression in it moved no published number.
-        let acquire = crate::metrics::acquire_wait_distribution();
-        // …and the two scalars the distribution cannot express. A p99 over
-        // thousands of ~0.02 ms acquires absorbs a single 200 ms park; the max
-        // is the only field that reports it. Published HERE beside the
-        // percentiles it qualifies (and on the summary line, which is the read
-        // most drivers actually take).
-        let (last_acquire_ns, max_acquire_ns) = crate::metrics::acquire_wait_last_max_ns();
-        // THE LEG IN FRONT OF THE PARK. `acquire_*` starts its clock inside the
-        // drawable worker, so it reports what `nextDrawable` cost and nothing
-        // of the wait to be scheduled to call it — a wait the frame spends
-        // parked on `AcquirePending`. Its own slice, so a worker starved behind
-        // other runnable threads is attributable instead of landing in
-        // `input_present` with no cause.
-        let acquire_queue = crate::metrics::acquire_queue_distribution();
-        let (last_queue_ns, max_queue_ns) = crate::metrics::acquire_queue_last_max_ns();
-        // The live-drag STALE-FRAME window: bounds change → first frame submitted
-        // at the new size. For that interval the compositor has new bounds and an
-        // old drawable, so it shows the previous frame rescaled — the smear a drag
-        // reads as "shredded" text. The `video` tap cannot measure it (its ring is
-        // one geometry and it early-stops on the first resize), so this is the only
-        // millisecond-resolution read of it.
-        let resize = crate::metrics::resize_present_distribution();
-        // Its twin: bounds change -> the engine committing the new GRID. The text
-        // trails the window edge for exactly this long, and a width drag keeps it
-        // deliberately long (the throttle bounding scrollback rewrap).
-        let reflow = crate::metrics::resize_reflow_distribution();
-        // The occluded/parked/capture twin of `present`. It is published rather
-        // than dropped so an occluded or RECORDED run stays observable — and so
-        // `n_present + n_present_tainted` still accounts for every content
-        // present, which is what makes the split auditable instead of a silent
-        // filter. See `metrics::tainted_present_distribution`.
-        let tainted = crate::metrics::tainted_present_distribution();
-        let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
-        return format!(
-            "OK n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2} \
-             input_edges_dropped={} \
-             n_present={} present_p50_ms={:.2} present_p95_ms={:.2} present_p99_ms={:.2} \
-             n_render={} render_p50_ms={:.2} render_p95_ms={:.2} render_p99_ms={:.2} \
-             n_key_write={} key_write_p50_ms={:.2} key_write_p95_ms={:.2} \
-             key_write_p99_ms={:.2} \
-             n_key_queue={} key_queue_p50_ms={:.2} key_queue_p95_ms={:.2} \
-             key_queue_p99_ms={:.2} last_key_queue_ms={:.2} max_key_queue_ms={:.2} \
-             n_pre_present={} pre_present_p50_ms={:.2} \
-             pre_present_p95_ms={:.2} pre_present_p99_ms={:.2} \
-             n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2} \
-             last_acquire_wait_ms={:.2} max_acquire_wait_ms={:.2} \
-             n_acquire_queue={} acquire_queue_p50_ms={:.2} \
-             acquire_queue_p95_ms={:.2} acquire_queue_p99_ms={:.2} \
-             last_acquire_queue_ms={:.2} max_acquire_queue_ms={:.2} \
-             n_resize={} resize_p50_ms={:.2} resize_p95_ms={:.2} resize_p99_ms={:.2} \
-             n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
-             n_present_tainted={} present_tainted_p50_ms={:.2} \
-             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2} \
-             turns_by_root={} main_busy_ms_per_s={:.2}{}{}{}{}{gpu}\n",
-            input.count(),
-            p(input, 0.50),
-            p(input, 0.95),
-            p(input, 0.99),
-            // Keystrokes a full per-window edge ring could not hold: their
-            // slices are missing from `input_*`, and this says how many.
-            crate::metrics::input_edges_dropped(),
-            present.count(),
-            p(present, 0.50),
-            p(present, 0.95),
-            p(present, 0.99),
-            render.count(),
-            p(render, 0.50),
-            p(render, 0.95),
-            p(render, 0.99),
-            key_write.count(),
-            p(key_write, 0.50),
-            p(key_write, 0.95),
-            p(key_write, 0.99),
-            key_queue.count(),
-            p(key_queue, 0.50),
-            p(key_queue, 0.95),
-            p(key_queue, 0.99),
-            ms(last_key_queue_ns),
-            ms(max_key_queue_ns),
-            pre_present.count(),
-            p(pre_present, 0.50),
-            p(pre_present, 0.95),
-            p(pre_present, 0.99),
-            acquire.count(),
-            p(acquire, 0.50),
-            p(acquire, 0.95),
-            p(acquire, 0.99),
-            ms(last_acquire_ns),
-            ms(max_acquire_ns),
-            acquire_queue.count(),
-            p(acquire_queue, 0.50),
-            p(acquire_queue, 0.95),
-            p(acquire_queue, 0.99),
-            ms(last_queue_ns),
-            ms(max_queue_ns),
-            resize.count(),
-            p(resize, 0.50),
-            p(resize, 0.95),
-            p(resize, 0.99),
-            reflow.count(),
-            p(reflow, 0.50),
-            p(reflow, 0.95),
-            p(reflow, 0.99),
-            tainted.count(),
-            p(tainted, 0.50),
-            p(tainted, 0.95),
-            p(tainted, 0.99),
-            // THE MAIN-LOOP TURN DISTRIBUTION PER ROOT (responsiveness audit
-            // item 3): the census on the summary line keeps last/max/count only.
-            turns_by_root_pairs(),
-            // …and their sum per second of the window: the main thread's
-            // occupancy, which no percentile of one turn can show.
-            crate::watchdog::main_busy_ms_per_s(),
-            // UI-THREAD TERMINAL-MUTEX WAIT, per acquiring site (the redraw's one
-            // frame hold, the key press): the span the typing audit listed as
-            // unmeasured. Formatted by one helper so text and JSON stay twins.
-            text_term_wait_fields(),
-            // ECHO ROUND TRIP (audit item 5): the one slice on this line that is
-            // NOT aterm's own cost — bytes out to the PTY, first bytes back from
-            // the child. Formatted by `echo_rtt` itself so its percentiles can
-            // never be published apart from the counters that qualify them.
-            crate::echo_rtt::percentile_fields_text(),
-            // PRESENT → GLASS: the compositor leg after present-return that
-            // every slice above stops short of.
-            crate::metrics::present_glass_fields_text(),
-            // THE INPUT LEGS: output → redraw request (the first half of
-            // `present_*`), the IME preedit → commit clock, and the inputs a
-            // full input queue refused.
-            crate::metrics::input_legs_fields_text(),
-            gpu = crate::metrics::gpu_fields_text(),
-        );
-    }
-    if !matches!(rest.trim(), "" | "reset") {
-        return METRICS_USAGE.to_string();
-    }
-    if rest.trim() == "reset" {
-        crate::metrics::reset();
-        crate::echo_rtt::reset();
-    }
-    let (rows, cols, truncated) = try_metrics_dims(term).map_or_else(
-        || ("busy".to_string(), "busy".to_string(), "busy".to_string()),
-        |(rows, cols, truncated)| (rows.to_string(), cols.to_string(), truncated.to_string()),
-    );
-    let m = crate::metrics::snapshot();
-    // TAIL SURFACING (audit item 10). The summary used to publish only `last_`
-    // and `max_`, and during the 2026-08 spin `last_input_present_ms=8.1` read
-    // perfectly healthy while the live p99 was 335 ms — a momentary reading and
-    // an unbounded worst case cannot bracket a distribution between them. The
-    // p95/p99 the `percentiles` verb already computed now ride the SUMMARY, so
-    // a healthy median can never again mask a sick tail from a reader who did
-    // not think to ask a second question.
-    //
-    // AND THE CHILD'S SLICE WITH THEM (2026-09-15). That rule was first applied
-    // to `input` and `present` only — both of them ATERM's own — so the summary
-    // could report a sick tail and still not say WHOSE. During a typing-lag
-    // episode the owner read `max_present_latency_ms=560.54` and
-    // `input_p99_ms=83.89` off this line and filed an aterm present regression;
-    // `metrics percentiles` in the same minute held the answer, `n_echo=499
-    // echo_p95_ms=75.69 echo_p99_ms=150.04 echo_max_ms=367.85` against aterm's
-    // own `key_write_p99_ms=6.29` and `render_p99_ms=2.36` — the child waiting
-    // for the scheduler, not aterm failing to paint. A second question nobody
-    // asks mid-incident is not a published fact, so the echo fragment rides the
-    // summary too.
-    let (h_input, h_present, _) = crate::metrics::distributions();
-    let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
-    let arms = crate::metrics::deadline_arm_attribution();
-    let refill_causes = crate::metrics::frame_refill_full_causes();
-    let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
-    let gpu_repaints = crate::metrics::gpu_repaint_counts();
-    // THE CRASH-RESTORE JOURNAL'S RAM (2026-10-17): every page the regions of this
-    // window's sessions have written, summed with no session's lock (each region's
-    // `aterm_restore::Touched` keeps the running total), the cost the memory shed weighs.
-    let journal_resident = crate::crash_restore::resident_bytes();
-    let backend = if m.backend_gpu { "gpu" } else { "cpu" };
-    format!(
-        "OK backend={backend} rows={rows} cols={cols} \
-         scrollback_truncated_lines={truncated} journal_resident_bytes={journal_resident} \
-         frames={} \
-         last_present_latency_ms={:.2} max_present_latency_ms={:.2} \
-         last_frame_render_ms={:.2} max_frame_render_ms={:.2} \
-         slow_frames={} slow_threshold_ms={:.1} \
-         last_input_present_ms={:.2} max_input_present_ms={:.2} \
-         n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2} \
-         n_present={} present_p50_ms={:.2} present_p95_ms={:.2} present_p99_ms={:.2} \
-         last_key_write_ms={:.2} max_key_write_ms={:.2} \
-         last_resize_present_ms={:.2} max_resize_present_ms={:.2} \
-         last_resize_reflow_ms={:.2} max_resize_reflow_ms={:.2} \
-         sync_armed={} sync_rel_end={} sync_rel_timeout={} sync_holding={} \
-         perf_reduced={} shed_transitions={} wake_heals={} output_wake_late={} output_wake_reposts={} \
-         last_redraw_total_ms={:.2} max_redraw_total_ms={:.2} \
-         redraw_attempts={} redraw_early_outs={} redraw_sync_holds={} redraw_retry_gated={} \
-         frame_refills_scoped={} frame_refills_full={} frame_refills_skipped={} \
-         pet_world_observations={} pet_world_cells={} \
-         fx_glow_quads_last={} fx_under_quads_last={} fx_trail_cells_last={} \
-         fx_under_frames={}{} \
-         frame_refill_full_causes={} \
-         offscreen_rasters={} last_offscreen_raster_ms={:.2} \
-         max_offscreen_raster_ms={:.2} \
-         pre_present_attempts={} last_pre_present_ms={:.2} pre_present_total_ms={:.2} \
-         max_pre_present_ms={:.2} \
-         last_acquire_wait_ms={:.2} max_acquire_wait_ms={:.2} \
-         last_gpu_park_ms={:.2} max_gpu_park_ms={:.2} \
-         present_drops={} last_present_drop_reason={} last_present_drop_parked={} \
-         present_tainted={} last_present_tainted_ms={:.2} max_present_tainted_ms={:.2} \
-         capture_episodes={} capture_active={} \
-         event_wakes={} timer_wakes={} wait_cancelled_wakes={} poll_wakes={} \
-         wake_kind={} wake_owner={} wake_late_ms={:.2} deadline_owner={} \
-         deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
-         deadline_arms_by_owner={} deadline_fires_by_owner={} wakes_by_variant={} \
-         gpu_scissor_taken={} gpu_full_repaints={} gpu_scroll_rescues={} \
-         past_arm_streak_heals={} \
-         stale_arm_heals={}{} \
-         max_frame_gap_ms={:.2} \
-         rust_main_to_first_present_ms={:.2} \
-         rust_main_to_first_visible_ms={:.2} \
-         startup_phase_schema={} startup_phase_valid={} \
-         startup_router_ms={:.2} startup_gui_prepare_ms={:.2} \
-         startup_winit_dispatch_ms={:.2} startup_initial_surface_attach_ms={:.2} \
-         startup_surface_to_successful_redraw_ms={:.2} \
-         startup_successful_compose_ms={:.2} \
-         startup_successful_surface_transaction_ms={:.2} \
-         startup_successful_finalize_ms={:.2} \
-         startup_attach_schema={} startup_attach_valid={} \
-         startup_attach_dispatch_ms={:.2} startup_attach_prepare_ms={:.2} \
-         startup_attach_window_create_ms={:.2} startup_attach_window_setup_ms={:.2} \
-         startup_attach_backend_finalize_ms={:.2} \
-         startup_attach_chrome_geometry_ms={:.2} \
-         startup_attach_surface_create_ms={:.2} startup_attach_finish_ms={:.2} \
-         startup_worker_schema={} startup_worker_valid={} \
-         startup_worker_total_ms={:.2} startup_worker_overlap_ms={:.2} \
-         startup_worker_after_join_ms={:.2} startup_worker_post_join_ms={:.2} \
-         startup_worker_prelude_ms={:.2} startup_worker_gpu_build_ms={:.2} \
-         startup_worker_font_admit_ms={:.2} startup_worker_font_apply_ms={:.2} \
-         startup_worker_font_seal_ms={:.2} startup_worker_epilogue_ms={:.2} \
-         startup_gpu_schema={} startup_gpu_valid={} \
-         startup_gpu_instance_ms={:.2} startup_gpu_adapter_ms={:.2} \
-         startup_gpu_device_ms={:.2} startup_gpu_context_tail_ms={:.2} \
-         startup_gpu_font_thread_ms={:.2} startup_gpu_font_join_ms={:.2} \
-         startup_gpu_pipelines_ms={:.2} startup_gpu_pipe_shader_ms={:.2} \
-         startup_gpu_pipe_uniform_atlas_ms={:.2} startup_gpu_pipe_cell_ms={:.2} \
-         startup_gpu_pipe_blit_ms={:.2} startup_gpu_pipe_tray_ms={:.2} \
-         startup_gpu_pipe_bloom_ms={:.2} startup_gpu_pipe_vbuf_ms={:.2} \
-         startup_gpu_pipe_tail_ms={:.2} startup_gpu_tail_ms={:.2} \
-         startup_gpu_cell_pipeline_ms={} \
-         effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
-         effect_pipelines_built={} \
-         first_present_ms={:.2} first_visible_ms={:.2}{}{}{}{}{}{}{}{}{}{gpu}\n",
-        m.frames_presented,
-        ms(m.last_present_latency_ns),
-        ms(m.max_present_latency_ns),
-        ms(m.last_frame_render_ns),
-        ms(m.max_frame_render_ns),
-        m.slow_frames,
-        ms(crate::metrics::SLOW_FRAME_THRESHOLD_NS),
-        ms(m.last_input_present_ns),
-        ms(m.max_input_present_ns),
-        h_input.count(),
-        pct(h_input, 0.50),
-        pct(h_input, 0.95),
-        pct(h_input, 0.99),
-        h_present.count(),
-        pct(h_present, 0.50),
-        pct(h_present, 0.95),
-        pct(h_present, 0.99),
-        ms(m.last_key_write_ns),
-        ms(m.max_key_write_ns),
-        ms(m.last_resize_present_ns),
-        ms(m.max_resize_present_ns),
-        ms(m.last_resize_reflow_ns),
-        ms(m.max_resize_reflow_ns),
-        m.sync_holds_armed,
-        m.sync_releases_end,
-        m.sync_releases_timeout,
-        u8::from(m.sync_holding),
-        u8::from(m.perf_reduced),
-        m.shed_transitions,
-        m.wake_heals,
-        m.output_wake_late,
-        m.output_wake_reposts,
-        ms(m.last_redraw_total_ns),
-        ms(m.max_redraw_total_ns),
-        m.redraw_attempts,
-        m.redraw_early_outs,
-        m.redraw_sync_holds,
-        m.redraw_retry_gated,
-        m.frame_refills_scoped,
-        m.frame_refills_full,
-        m.frame_refills_skipped,
-        m.pet_world_observations,
-        m.pet_world_cells,
-        m.fx_glow_quads_last,
-        m.fx_under_quads_last,
-        m.fx_trail_cells_last,
-        m.fx_under_frames,
-        crate::metrics::frame_fields_text(),
-        refill_cause_pairs(&refill_causes),
-        // THE PIXELS THAT NEVER REACH GLASS. `record_offscreen_raster` exists
-        // so an `image` / `window` / `snapshot` rasterization stops moving
-        // `frames`, `max_frame_render_ms`, `slow_frames` and `max_frame_gap_ms`
-        // — correct, and argued at length where it is defined. But the three
-        // counters it moved that work INTO were read by nothing at all, so the
-        // cure took the contamination and the observability together: a
-        // full-frame raster of a 2208x1788 window changed no published number.
-        // Published here, on the ledger that same comment tells a driver to
-        // read.
-        m.offscreen_rasters,
-        ms(m.last_offscreen_raster_ns),
-        ms(m.max_offscreen_raster_ns),
-        m.pre_present_attempts,
-        ms(m.last_pre_present_ns),
-        ms(m.pre_present_total_ns),
-        ms(m.max_pre_present_ns),
-        // THE DRAWABLE PARK, AS A SCALAR. `acquire_p99_ms` (the `percentiles`
-        // verb) is a statement about the bulk of thousands of ~0.02 ms samples;
-        // a single 200 ms `nextDrawable` park cannot move it. These two were
-        // recorded on every present and reset with the window since the slice
-        // was instrumented, and no snapshot had ever read them — so the worst
-        // acquire of a run was, until now, unpublishable.
-        ms(m.last_acquire_wait_ns),
-        ms(m.max_acquire_wait_ns),
-        // THE OTHER MAIN-THREAD GPU BLOCK. The armed arm parks in
-        // `waitUntilCompleted` twice per present (the Submit-A pipelining wait,
-        // the pending-ring drain). The first used to be charged to
-        // `frame_render` and the second to nothing at all; both are published
-        // here so a contention stall is attributable at a glance.
-        ms(m.last_gpu_park_ns),
-        ms(m.max_gpu_park_ns),
-        m.present_drops,
-        m.last_present_drop_reason.as_str(),
-        u8::from(m.last_present_drop_parked),
-        m.tainted_present_samples,
-        ms(m.last_tainted_present_latency_ns),
-        ms(m.max_tainted_present_latency_ns),
-        m.capture_episodes,
-        u8::from(m.capture_active),
-        m.event_wakes,
-        m.timer_wakes,
-        m.wait_cancelled_wakes,
-        m.poll_wakes,
-        m.last_wake_kind.as_str(),
-        m.last_wake_owner.as_str(),
-        ms(m.last_wake_late_ns),
-        m.last_deadline_owner.as_str(),
-        ms(m.deadline_in_ns),
-        ms(m.last_deadline_late_ns),
-        m.past_deadline_arms,
-        deadline_arm_pairs(&arms),
-        name_count_pairs(&crate::metrics::deadline_fire_attribution()),
-        name_count_pairs(&crate::metrics::user_wake_attribution()),
-        gpu_repaints.0,
-        gpu_repaints.1,
-        gpu_repaints.2,
-        streak_heal_pairs(&streak_heals),
-        m.stale_arm_heals,
-        // WHEN, AND WHOSE (2026-09-15 attribution audit). `wake_late_ms` and
-        // `deadline_late_ms` above are LAST-WRITER readings — the next wake
-        // stores 0 over a late timer — and every `max_` on this line used to
-        // carry no time of occurrence. This fragment publishes the worst wake
-        // and deadline lateness with the owner and instant of each, the
-        // instants of the present/input maxima, the frame gap that says whether
-        // the present max was a stall or an idle stretch, and the process-clock
-        // `metrics_now_ms` that anchors all of them.
-        crate::metrics::lateness_fields_text(),
-        ms(m.max_frame_gap_ns),
-        ms(m.rust_main_to_first_present_ns),
-        ms(m.rust_main_to_first_visible_ns),
-        m.startup_phase_schema,
-        u8::from(m.startup_phase_valid),
-        ms(m.startup_router_ns),
-        ms(m.startup_gui_prepare_ns),
-        ms(m.startup_winit_dispatch_ns),
-        ms(m.startup_initial_surface_attach_ns),
-        ms(m.startup_surface_to_successful_redraw_ns),
-        ms(m.startup_successful_compose_ns),
-        ms(m.startup_successful_surface_transaction_ns),
-        ms(m.startup_successful_finalize_ns),
-        m.startup_attach_schema,
-        u8::from(m.startup_attach_valid),
-        ms(m.startup_attach_dispatch_ns),
-        ms(m.startup_attach_prepare_ns),
-        ms(m.startup_attach_window_create_ns),
-        ms(m.startup_attach_window_setup_ns),
-        ms(m.startup_attach_backend_finalize_ns),
-        ms(m.startup_attach_chrome_geometry_ns),
-        ms(m.startup_attach_surface_create_ns),
-        ms(m.startup_attach_finish_ns),
-        m.startup_worker_schema,
-        u8::from(m.startup_worker_valid),
-        ms(m.startup_worker_total_ns),
-        ms(m.startup_worker_overlap_ns),
-        ms(m.startup_worker_after_join_ns),
-        ms(m.startup_worker_post_join_ns),
-        ms(m.startup_worker_prelude_ns),
-        ms(m.startup_worker_gpu_build_ns),
-        ms(m.startup_worker_font_admit_ns),
-        ms(m.startup_worker_font_apply_ns),
-        ms(m.startup_worker_font_seal_ns),
-        ms(m.startup_worker_epilogue_ns),
-        m.startup_gpu_schema,
-        u8::from(m.startup_gpu_valid),
-        ms(m.startup_gpu_instance_ns),
-        ms(m.startup_gpu_adapter_ns),
-        ms(m.startup_gpu_device_ns),
-        ms(m.startup_gpu_context_tail_ns),
-        ms(m.startup_gpu_font_thread_ns),
-        ms(m.startup_gpu_font_join_ns),
-        ms(m.startup_gpu_pipelines_ns),
-        ms(m.startup_gpu_pipe_shader_ns),
-        ms(m.startup_gpu_pipe_uniform_atlas_ns),
-        ms(m.startup_gpu_pipe_cell_ns),
-        ms(m.startup_gpu_pipe_blit_ns),
-        ms(m.startup_gpu_pipe_tray_ns),
-        ms(m.startup_gpu_pipe_bloom_ns),
-        ms(m.startup_gpu_pipe_vbuf_ns),
-        ms(m.startup_gpu_pipe_tail_ns),
-        ms(m.startup_gpu_tail_ns),
-        cell_pipeline_pairs(&m.startup_gpu_cell_pipeline_ns),
-        m.effect_pipeline_builds,
-        ms(m.effect_pipeline_build_ns),
-        effect_pipeline_names(m.effect_pipeline_built_mask),
-        ms(m.first_present_ns),
-        ms(m.first_visible_ns),
-        // THE CHILD'S SLICE, ON THE SUMMARY LINE (2026-09-15 misattribution).
-        // Every other field above measures ATERM. This one measures the program
-        // on the far side of the PTY, and without it the summary cannot answer
-        // the only question a lag report actually asks. Spliced as the WHOLE
-        // fragment `echo_rtt` publishes, never a cherry-picked p99: its
-        // percentiles may not be read apart from the sample/coalesce/expiry
-        // ledger that qualifies them.
-        crate::echo_rtt::percentile_fields_text(),
-        // THE PARK OUTSIDE THE REDRAW. Every slice above prices a redraw, a
-        // wake's lateness or an end-to-end interval; none of them can name a
-        // main thread parked in a NON-redraw handler, which is how
-        // `max_present_latency_ms=560.54` came to sit beside a bounded
-        // `max_redraw_total_ms=13.84` with no publishable producer. Spliced
-        // whole, never as a lone max: the count and the long-turn tally are what
-        // separate one hitch from a main thread that is late all the time.
-        crate::watchdog::turn_census_fields_text(),
-        // THE UPDATE'S PRE-COMMIT INPUT (gap #33): keystrokes the successor's
-        // queue lost, and replays it had to repair — cumulative, so a real
-        // drop is a number, not one more line beside a message on every update.
-        crate::metrics::handoff_input_fields_text(),
-        // THE SUCCESSOR'S CLAIM TIMELINE (warm successor P0): on a boot that
-        // claimed a handoff, each boundary of its boot in ms after the claim,
-        // and the warm it did before its dial. `none` on every other launch.
-        crate::metrics::handoff_claim_fields_text(),
-        // BEFORE WINIT RUNS (CS-2): the kernel's birth → Rust main (the
-        // loader's share, a Gatekeeper hold included), and GUI preparation in
-        // ten exclusive phases that sum to `startup_gui_prepare_ms` — read
-        // live, so a headless launch answers too.
-        crate::metrics::startup_prepare_fields_text(m.startup_gui_prepare_ns),
-        // THE CONTROL LISTENER (2026-09-25 incident): accepts, the last
-        // accept's age, the kernel queue it last read, rebinds of a wedged
-        // listening socket, and the lane-admission refusals.
-        crate::control_listener::fields_text(),
-        // THE PTY CENSUS (2026-09-29): the masters the sessions' sinks hold
-        // open beside the live sessions that own one — a lead that stays is a
-        // closed tab's master nothing will close.
-        crate::metrics::pty_census_fields_text(),
-        // THE IDENTITY PRIMER (2026-10-17): the re-prime passes still writing
-        // into an identity's folder, off the spawn that handed them off.
-        crate::agent_identity::metrics_fields_text(),
-        // THE WARM SPARE (`crate::spare`): its state and age, its PTY, the
-        // learned gate, adoptions, misses, discards and budgets.
-        crate::spare::metrics_fields_text(),
-        gpu = crate::metrics::gpu_fields_text(),
-    )
+    metrics_reply(term, rest, Syntax::Text)
 }
 
-/// Render the per-owner deadline arm ledger as `owner:arms/past` pairs,
-/// comma-joined — the same ONE self-labelling field discipline as
-/// [`cell_pipeline_pairs`], for the same reason: a reader never has to know an
-/// order, and a new `DeadlineOwner` cannot silently shift someone else's column.
-///
-/// WHY IT EXISTS (audit item 6). `past_deadline_arms` is a single global number
-/// and `deadline_owner` is a last-writer snapshot, so the two together cannot
-/// name a spin's producer — during the 2026-08 200 kHz spin they read
-/// "31,913 past arms, owner=title_summary" while the producer was the
-/// session-status observer folded under that label. This field names it.
-/// Non-zero owners only, so a healthy instance prints two or three pairs and a
-/// sick one puts its culprit in plain sight.
-/// A sparse `<name>:<count>` ledger for the `metrics` line (`none` when empty,
-/// so a whitespace-splitting reader always gets a token).
-fn name_count_pairs(pairs: &[(&str, u64)]) -> String {
-    if pairs.is_empty() {
-        return "none".to_string();
-    }
-    pairs
-        .iter()
-        .map(|(name, n)| format!("{name}:{n}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The same ledger as a JSON object.
-fn name_count_object(pairs: &[(&str, u64)]) -> String {
-    let body = pairs
-        .iter()
-        .map(|(name, n)| format!("\"{}\":{n}", crate::control::json_escape(name)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{body}}}")
-}
-
-/// The main-loop turn distribution per work root (`metrics percentiles`):
-/// `<root>:<n>/<p50>/<p95>/<p99>` in ms, roots with no turn omitted, `none`
-/// when every root is empty.
-fn turns_by_root_pairs() -> String {
-    let rows = turn_root_rows();
-    if rows.is_empty() {
-        return "none".to_string();
-    }
-    rows.iter()
-        .map(|(root, n, p50, p95, p99)| format!("{root}:{n}/{p50:.2}/{p95:.2}/{p99:.2}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The JSON twin of [`turns_by_root_pairs`].
-fn turns_by_root_object() -> String {
-    let body = turn_root_rows()
-        .iter()
-        .map(|(root, n, p50, p95, p99)| {
-            format!(
-                "\"{root}\":{{\"n\":{n},\"p50_ms\":{p50:.2},\"p95_ms\":{p95:.2},\"p99_ms\":{p99:.2}}}"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{body}}}")
-}
-
-/// `(root, n, p50_ms, p95_ms, p99_ms)` per work root with at least one turn.
-fn turn_root_rows() -> Vec<(&'static str, u64, f64, f64, f64)> {
-    let ms = |ns: u64| ns as f64 / 1e6;
-    (0..crate::metrics::TURN_ROOT_SLOTS)
-        .filter_map(|slot| {
-            let root = u8::try_from(slot).ok()?;
-            let h = crate::metrics::turn_distribution(root)?;
-            let n = h.count();
-            (n != 0).then(|| {
-                let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
-                (
-                    crate::watchdog::Breadcrumb::from_u8(root).metric_name(),
-                    n,
-                    p(0.50),
-                    p(0.95),
-                    p(0.99),
-                )
-            })
-        })
-        .collect()
-}
-
-fn deadline_arm_pairs(arms: &[crate::metrics::OwnerArms]) -> String {
-    if arms.is_empty() {
-        // Never emit a bare `key=` — every field in this line carries a token,
-        // so a whitespace-splitting reader always gets a value to parse.
-        return "none".to_string();
-    }
-    arms.iter()
-        .map(|a| format!("{}:{}/{}", a.owner, a.arms, a.past_arms))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The same ledger as a JSON object, so the structured twin stays parseable
-/// without splitting a string.
-fn deadline_arm_object(arms: &[crate::metrics::OwnerArms]) -> String {
-    let body = arms
-        .iter()
-        .map(|a| {
-            format!(
-                "\"{}\":{{\"arms\":{},\"past\":{}}}",
-                a.owner, a.arms, a.past_arms
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{body}}}")
-}
-
-/// Render the per-owner WINDOWED streak-heal ledger as `owner:heals` pairs,
-/// comma-joined — the arms `record_deadline`'s 32-arm past/future window
-/// detector clamped to frame cadence (wake follow-ups items 18/19). Surfaced
-/// BESIDE `deadline_arms_by_owner` on purpose: that field says who kept
-/// arming the past, this one says whose spin the fold is actively healing.
-/// Same self-labelling discipline; `none` when no owner was ever clamped.
-fn streak_heal_pairs(heals: &[(&'static str, u64)]) -> String {
-    if heals.is_empty() {
-        // Never emit a bare `key=` — every field in this line carries a token.
-        return "none".to_string();
-    }
-    heals
-        .iter()
-        .map(|(owner, count)| format!("{owner}:{count}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The same streak-heal ledger as a JSON object for the structured twin.
-fn streak_heal_object(heals: &[(&'static str, u64)]) -> String {
-    let body = heals
-        .iter()
-        .map(|(owner, count)| format!("\"{owner}\":{count}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{body}}}")
-}
-
-/// Render the damage-scoped refill's FULL-arm attribution as `clause:frames`
-/// pairs, comma-joined — the same ONE self-labelling field discipline as
-/// [`deadline_arm_pairs`], for the same reason.
-///
-/// WHY IT EXISTS. a78dd8a1 wired DMG-1 into the shipping frontend and shipped
-/// `frame_refills_scoped`/`frame_refills_full` with it, closing on the honest
-/// admission that per-cause attribution "needs the engine's validity check to
-/// report its failing clause — deliberately left as follow-up". Three
-/// mechanisms now hang off that continuity chain (the DMG-1 carrier, the D-2
-/// per-row revision lane, the tab-strip lane splice), so a Full-dominated
-/// steady state had become a thing an operator could SEE and not diagnose.
-/// Non-zero clauses only: a healthy instance prints its first-frame
-/// `scratch_unstamped:1` and whatever its content is actually doing.
-fn refill_cause_pairs(causes: &[crate::metrics::RefillCause]) -> String {
-    if causes.is_empty() {
-        // Never emit a bare `key=` — see `deadline_arm_pairs`.
-        return "none".to_string();
-    }
-    causes
-        .iter()
-        .map(|c| format!("{}:{}", c.cause, c.frames))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The same attribution as a JSON object, so the structured twin stays
-/// parseable without splitting a string.
-fn refill_cause_object(causes: &[crate::metrics::RefillCause]) -> String {
-    let body = causes
-        .iter()
-        .map(|c| format!("\"{}\":{}", c.cause, c.frames))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{body}}}")
-}
-
-/// Render the per-cell-pipeline split as `name:ms` pairs, comma-joined.
-///
-/// ONE self-labelling wire field rather than twelve positional ones: a reader
-/// never has to know `build_cell_pipelines`' order, and adding or removing a
-/// pipeline cannot silently shift someone else's column.
-fn cell_pipeline_pairs(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT]) -> String {
-    aterm_gpu::startup_probe::CELL_PIPELINE_NAMES
-        .iter()
-        .zip(cell_ns.iter())
-        .map(|(name, ns)| format!("{name}:{:.2}", *ns as f64 / 1e6))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Name the EFFECT pipelines a `effect_pipeline_built_mask` says were compiled,
-/// comma-joined, or `none` — the same ONE self-labelling field discipline as
-/// [`cell_pipeline_pairs`], for the same reason: a reader never has to know the
-/// slot order, and a new `EffectPipeline` cannot silently shift someone else's
-/// bit. `none` is the healthy reading for a launch with the shipped defaults.
-fn effect_pipeline_names(mask: u64) -> String {
-    let built = aterm_gpu::EFFECT_PIPELINE_NAMES
-        .iter()
-        .enumerate()
-        .filter(|(slot, _)| mask & (1u64 << slot) != 0)
-        .map(|(_, name)| *name)
-        .collect::<Vec<_>>();
-    if built.is_empty() {
-        "none".to_string()
-    } else {
-        built.join(",")
-    }
-}
-
-/// The same split as a JSON object, so the structured twin stays parseable
-/// without splitting a string.
-fn cell_pipeline_object(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT]) -> String {
-    let body = aterm_gpu::startup_probe::CELL_PIPELINE_NAMES
-        .iter()
-        .zip(cell_ns.iter())
-        .map(|(name, ns)| format!("\"{name}\":{:.2}", *ns as f64 / 1e6))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{{{body}}}")
-}
-
-/// The per-site UI-thread terminal-mutex wait fields (text form): for each of
-/// `redraw` / `press`, ` n_term_wait_<site>=N
-/// term_wait_<site>_p50_ms=… _p95_ms=… _p99_ms=… max_term_wait_<site>_ms=…`.
-/// Leading space; empty never (the sites are static).
-fn text_term_wait_fields() -> String {
-    use std::fmt::Write as _;
-    let ms = |ns: u64| ns as f64 / 1e6;
-    let mut out = String::new();
-    for site in crate::metrics::TermWaitSite::ALL {
-        let h = crate::metrics::term_wait_distribution(site);
-        let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
-        let label = site.label();
-        let _ = write!(
-            out,
-            " n_term_wait_{label}={} term_wait_{label}_p50_ms={:.2} \
-             term_wait_{label}_p95_ms={:.2} term_wait_{label}_p99_ms={:.2} \
-             max_term_wait_{label}_ms={:.2}",
-            h.count(),
-            p(0.50),
-            p(0.95),
-            p(0.99),
-            ms(crate::metrics::term_wait_max_ns(site)),
-        );
-    }
-    out
-}
-
-/// JSON twin of [`text_term_wait_fields`]: a leading-comma fragment.
-fn json_term_wait_fields() -> String {
-    use std::fmt::Write as _;
-    let ms = |ns: u64| ns as f64 / 1e6;
-    let mut out = String::new();
-    for site in crate::metrics::TermWaitSite::ALL {
-        let h = crate::metrics::term_wait_distribution(site);
-        let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
-        let label = site.label();
-        let _ = write!(
-            out,
-            ",\"n_term_wait_{label}\":{},\"term_wait_{label}_p50_ms\":{:.2},\
-             \"term_wait_{label}_p95_ms\":{:.2},\"term_wait_{label}_p99_ms\":{:.2},\
-             \"max_term_wait_{label}_ms\":{:.2}",
-            h.count(),
-            p(0.50),
-            p(0.95),
-            p(0.99),
-            ms(crate::metrics::term_wait_max_ns(site)),
-        );
-    }
-    out
-}
-
-/// Structured twin of [`cmd_metrics`]. All scheduler/redraw counters and typed
-/// owner/reason labels are present so automation never has to scrape the text
-/// line. `reset` and `percentiles` retain the text verb's semantics, and each
-/// body is a key-for-key twin of the text form
-/// (`every_text_metrics_key_has_a_json_twin` pins it).
+/// [`cmd_metrics`]'s JSON form, with `--json` already taken off the request by
+/// the dispatch (`control::json_ask`).
 pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &str) -> String {
-    let ms = |ns: u64| ns as f64 / 1e6;
-    if command.trim() == "percentiles" {
-        let (input, present, render) = crate::metrics::distributions();
-        let key_write = crate::metrics::key_write_distribution();
-        // Twin of the text form's key-queue split (see there): the OS-event-queue
-        // share the `key_write` total is backdated by, without which a high total
-        // cannot be told from on-thread dispatch cost.
-        let key_queue = crate::metrics::key_queue_distribution();
-        let (last_key_queue_ns, max_key_queue_ns) = crate::metrics::key_queue_last_max_ns();
-        let pre_present = crate::metrics::pre_present_distribution();
-        // `acquire` was published by the TEXT form and omitted here, so a JSON
-        // driver could not read the drawable-park slice at all; `resize` is new.
-        // Both forms now carry the same set.
-        let acquire = crate::metrics::acquire_wait_distribution();
-        // Twin of the text form's park scalars (see there).
-        let (last_acquire_ns, max_acquire_ns) = crate::metrics::acquire_wait_last_max_ns();
-        // Twin of the text form's queue slice (see there): the worker's
-        // scheduling delay, which the park figures cannot express.
-        let acquire_queue = crate::metrics::acquire_queue_distribution();
-        let (last_queue_ns, max_queue_ns) = crate::metrics::acquire_queue_last_max_ns();
-        let resize = crate::metrics::resize_present_distribution();
-        // Twin of the text form's bounds-change -> grid-commit slice (see there).
-        let reflow = crate::metrics::resize_reflow_distribution();
-        let tainted = crate::metrics::tainted_present_distribution();
-        let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
-        return json_ok(&format!(
-            "{{\"n_input\":{},\"input_p50_ms\":{:.2},\"input_p95_ms\":{:.2},\
-             \"input_p99_ms\":{:.2},\"input_edges_dropped\":{},\"n_present\":{},\"present_p50_ms\":{:.2},\
-             \"present_p95_ms\":{:.2},\"present_p99_ms\":{:.2},\"n_render\":{},\
-             \"render_p50_ms\":{:.2},\"render_p95_ms\":{:.2},\"render_p99_ms\":{:.2},\
-             \"n_key_write\":{},\"key_write_p50_ms\":{:.2},\"key_write_p95_ms\":{:.2},\
-             \"key_write_p99_ms\":{:.2},\
-             \"n_key_queue\":{},\"key_queue_p50_ms\":{:.2},\
-             \"key_queue_p95_ms\":{:.2},\"key_queue_p99_ms\":{:.2},\
-             \"last_key_queue_ms\":{:.2},\"max_key_queue_ms\":{:.2},\
-             \"n_pre_present\":{},\
-             \"pre_present_p50_ms\":{:.2},\"pre_present_p95_ms\":{:.2},\
-             \"pre_present_p99_ms\":{:.2},\"n_acquire\":{},\
-             \"acquire_p50_ms\":{:.2},\"acquire_p95_ms\":{:.2},\
-             \"acquire_p99_ms\":{:.2},\
-             \"last_acquire_wait_ms\":{:.2},\"max_acquire_wait_ms\":{:.2},\
-             \"n_acquire_queue\":{},\"acquire_queue_p50_ms\":{:.2},\
-             \"acquire_queue_p95_ms\":{:.2},\"acquire_queue_p99_ms\":{:.2},\
-             \"last_acquire_queue_ms\":{:.2},\"max_acquire_queue_ms\":{:.2},\
-             \"n_resize\":{},\
-             \"resize_p50_ms\":{:.2},\"resize_p95_ms\":{:.2},\
-             \"resize_p99_ms\":{:.2},\
-             \"n_reflow\":{},\"reflow_p50_ms\":{:.2},\"reflow_p95_ms\":{:.2},\
-             \"reflow_p99_ms\":{:.2},\"n_present_tainted\":{},\
-             \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
-             \"present_tainted_p99_ms\":{:.2},\"turns_by_root\":{},\
-             \"main_busy_ms_per_s\":{:.2}{}{}{}{}{gpu}}}",
-            input.count(),
-            p(input, 0.50),
-            p(input, 0.95),
-            p(input, 0.99),
-            // Keystrokes a full per-window edge ring could not hold: their
-            // slices are missing from `input_*`, and this says how many.
-            crate::metrics::input_edges_dropped(),
-            present.count(),
-            p(present, 0.50),
-            p(present, 0.95),
-            p(present, 0.99),
-            render.count(),
-            p(render, 0.50),
-            p(render, 0.95),
-            p(render, 0.99),
-            key_write.count(),
-            p(key_write, 0.50),
-            p(key_write, 0.95),
-            p(key_write, 0.99),
-            key_queue.count(),
-            p(key_queue, 0.50),
-            p(key_queue, 0.95),
-            p(key_queue, 0.99),
-            ms(last_key_queue_ns),
-            ms(max_key_queue_ns),
-            pre_present.count(),
-            p(pre_present, 0.50),
-            p(pre_present, 0.95),
-            p(pre_present, 0.99),
-            acquire.count(),
-            p(acquire, 0.50),
-            p(acquire, 0.95),
-            p(acquire, 0.99),
-            ms(last_acquire_ns),
-            ms(max_acquire_ns),
-            acquire_queue.count(),
-            p(acquire_queue, 0.50),
-            p(acquire_queue, 0.95),
-            p(acquire_queue, 0.99),
-            ms(last_queue_ns),
-            ms(max_queue_ns),
-            resize.count(),
-            p(resize, 0.50),
-            p(resize, 0.95),
-            p(resize, 0.99),
-            reflow.count(),
-            p(reflow, 0.50),
-            p(reflow, 0.95),
-            p(reflow, 0.99),
-            tainted.count(),
-            p(tainted, 0.50),
-            p(tainted, 0.95),
-            p(tainted, 0.99),
-            // Twin of the text form's per-root turn distribution.
-            turns_by_root_object(),
-            crate::watchdog::main_busy_ms_per_s(),
-            // Field-for-field twin of the text form's term-wait fragment.
-            json_term_wait_fields(),
-            // Field-for-field twin of the text form's echo fragment.
-            crate::echo_rtt::percentile_fields_json(),
-            // Field-for-field twin of the text form's present→glass fragment.
-            crate::metrics::present_glass_fields_json(),
-            // Field-for-field twin of the text form's input-leg fragment.
-            crate::metrics::input_legs_fields_json(),
-            gpu = crate::metrics::gpu_fields_json(),
-        ));
-    }
-    if !matches!(command.trim(), "" | "reset") {
+    metrics_reply(term, command, Syntax::Json)
+}
+
+/// Parse `rest`, reset if it asks, then emit its body once into the sink
+/// `syntax` names. The terminal is only try-locked, and only for the summary's
+/// grid fields.
+fn metrics_reply(term: Option<&Arc<Mutex<Terminal>>>, rest: &str, syntax: Syntax) -> String {
+    let Some(request) = Request::parse(rest) else {
         return METRICS_USAGE.to_string();
-    }
-    if command.trim() == "reset" {
+    };
+    if request.reset {
         crate::metrics::reset();
         crate::echo_rtt::reset();
     }
-    let (rows, cols, truncated) = try_metrics_dims(term).map_or_else(
-        || ("null".to_string(), "null".to_string(), "null".to_string()),
-        |(rows, cols, truncated)| (rows.to_string(), cols.to_string(), truncated.to_string()),
-    );
-    let m = crate::metrics::snapshot();
-    // Same tail surfacing and same honesty split as the text form — the child's
-    // echo round trip included: the two stay field-for-field twins so automation
-    // never has to scrape the line.
-    let (h_input, h_present, _) = crate::metrics::distributions();
-    let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
-    let gpu_repaints = crate::metrics::gpu_repaint_counts();
-    let arms = crate::metrics::deadline_arm_attribution();
-    let refill_causes = crate::metrics::frame_refill_full_causes();
-    let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
-    let journal_resident = crate::crash_restore::resident_bytes();
-    let backend = if m.backend_gpu { "gpu" } else { "cpu" };
-    json_ok(&format!(
-        "{{\"backend\":\"{backend}\",\"rows\":{rows},\"cols\":{cols},\
-         \"scrollback_truncated_lines\":{truncated},\
-         \"journal_resident_bytes\":{journal_resident},\
-         \"frames\":{},\"last_present_latency_ms\":{:.2},\"max_present_latency_ms\":{:.2},\
-         \"last_frame_render_ms\":{:.2},\"max_frame_render_ms\":{:.2},\"slow_frames\":{},\
-         \"slow_threshold_ms\":{:.1},\"last_input_present_ms\":{:.2},\
-         \"max_input_present_ms\":{:.2},\"n_input\":{},\"input_p50_ms\":{:.2},\
-         \"input_p95_ms\":{:.2},\"input_p99_ms\":{:.2},\"n_present\":{},\
-         \"present_p50_ms\":{:.2},\"present_p95_ms\":{:.2},\"present_p99_ms\":{:.2},\
-         \"last_key_write_ms\":{:.2},\
-         \"max_key_write_ms\":{:.2},\"last_resize_present_ms\":{:.2},\
-         \"max_resize_present_ms\":{:.2},\"last_resize_reflow_ms\":{:.2},\
-         \"max_resize_reflow_ms\":{:.2},\"sync_armed\":{},\"sync_rel_end\":{},\
-         \"sync_rel_timeout\":{},\"sync_holding\":{},\"perf_reduced\":{},\
-         \"shed_transitions\":{},\"wake_heals\":{},\"output_wake_late\":{},\"output_wake_reposts\":{},\
-         \"last_redraw_total_ms\":{:.2},\
-         \"max_redraw_total_ms\":{:.2},\"redraw_attempts\":{},\"redraw_early_outs\":{},\
-         \"redraw_sync_holds\":{},\"redraw_retry_gated\":{},\
-         \"frame_refills_scoped\":{},\"frame_refills_full\":{},\
-         \"frame_refills_skipped\":{},\
-         \"pet_world_observations\":{},\"pet_world_cells\":{},\
-         \"fx_glow_quads_last\":{},\"fx_under_quads_last\":{},\"fx_trail_cells_last\":{},\
-         \"fx_under_frames\":{}{},\
-         \"frame_refill_full_causes\":{},\
-         \"offscreen_rasters\":{},\"last_offscreen_raster_ms\":{:.2},\
-         \"max_offscreen_raster_ms\":{:.2},\"pre_present_attempts\":{},\
-         \"last_pre_present_ms\":{:.2},\"pre_present_total_ms\":{:.2},\
-         \"max_pre_present_ms\":{:.2},\
-         \"last_acquire_wait_ms\":{:.2},\"max_acquire_wait_ms\":{:.2},\
-         \"last_gpu_park_ms\":{:.2},\"max_gpu_park_ms\":{:.2},\
-         \"present_drops\":{},\
-         \"last_present_drop_reason\":\"{}\",\"last_present_drop_parked\":{},\
-         \"present_tainted\":{},\"last_present_tainted_ms\":{:.2},\
-         \"max_present_tainted_ms\":{:.2},\"capture_episodes\":{},\
-         \"capture_active\":{},\
-         \"event_wakes\":{},\"timer_wakes\":{},\"wait_cancelled_wakes\":{},\
-         \"poll_wakes\":{},\"wake_kind\":\"{}\",\"wake_owner\":\"{}\",\
-         \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
-         \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\
-         \"deadline_arms_by_owner\":{},\"deadline_fires_by_owner\":{},\
-         \"wakes_by_variant\":{},\"gpu_scissor_taken\":{},\"gpu_full_repaints\":{},\
-         \"gpu_scroll_rescues\":{},\"past_arm_streak_heals\":{},\
-         \"stale_arm_heals\":{}{},\
-         \"max_frame_gap_ms\":{:.2},\
-         \"rust_main_to_first_present_ms\":{:.2},\
-         \"rust_main_to_first_visible_ms\":{:.2},\
-         \"startup_phase_schema\":{},\"startup_phase_valid\":{},\
-         \"startup_router_ms\":{:.2},\"startup_gui_prepare_ms\":{:.2},\
-         \"startup_winit_dispatch_ms\":{:.2},\"startup_initial_surface_attach_ms\":{:.2},\
-         \"startup_surface_to_successful_redraw_ms\":{:.2},\
-         \"startup_successful_compose_ms\":{:.2},\
-         \"startup_successful_surface_transaction_ms\":{:.2},\
-         \"startup_successful_finalize_ms\":{:.2},\
-         \"startup_attach_schema\":{},\"startup_attach_valid\":{},\
-         \"startup_attach_dispatch_ms\":{:.2},\"startup_attach_prepare_ms\":{:.2},\
-         \"startup_attach_window_create_ms\":{:.2},\"startup_attach_window_setup_ms\":{:.2},\
-         \"startup_attach_backend_finalize_ms\":{:.2},\
-         \"startup_attach_chrome_geometry_ms\":{:.2},\
-         \"startup_attach_surface_create_ms\":{:.2},\"startup_attach_finish_ms\":{:.2},\
-         \"startup_worker_schema\":{},\"startup_worker_valid\":{},\
-         \"startup_worker_total_ms\":{:.2},\"startup_worker_overlap_ms\":{:.2},\
-         \"startup_worker_after_join_ms\":{:.2},\"startup_worker_post_join_ms\":{:.2},\
-         \"startup_worker_prelude_ms\":{:.2},\"startup_worker_gpu_build_ms\":{:.2},\
-         \"startup_worker_font_admit_ms\":{:.2},\"startup_worker_font_apply_ms\":{:.2},\
-         \"startup_worker_font_seal_ms\":{:.2},\"startup_worker_epilogue_ms\":{:.2},\
-         \"startup_gpu_schema\":{},\"startup_gpu_valid\":{},\
-         \"startup_gpu_instance_ms\":{:.2},\"startup_gpu_adapter_ms\":{:.2},\
-         \"startup_gpu_device_ms\":{:.2},\"startup_gpu_context_tail_ms\":{:.2},\
-         \"startup_gpu_font_thread_ms\":{:.2},\"startup_gpu_font_join_ms\":{:.2},\
-         \"startup_gpu_pipelines_ms\":{:.2},\"startup_gpu_pipe_shader_ms\":{:.2},\
-         \"startup_gpu_pipe_uniform_atlas_ms\":{:.2},\"startup_gpu_pipe_cell_ms\":{:.2},\
-         \"startup_gpu_pipe_blit_ms\":{:.2},\"startup_gpu_pipe_tray_ms\":{:.2},\
-         \"startup_gpu_pipe_bloom_ms\":{:.2},\"startup_gpu_pipe_vbuf_ms\":{:.2},\
-         \"startup_gpu_pipe_tail_ms\":{:.2},\"startup_gpu_tail_ms\":{:.2},\
-         \"startup_gpu_cell_pipeline_ms\":{},\
-         \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
-         \"effect_pipelines_built\":\"{}\",\
-         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}{}{}{}{}{}{}{}{gpu}}}",
-        m.frames_presented,
-        ms(m.last_present_latency_ns),
-        ms(m.max_present_latency_ns),
-        ms(m.last_frame_render_ns),
-        ms(m.max_frame_render_ns),
-        m.slow_frames,
-        ms(crate::metrics::SLOW_FRAME_THRESHOLD_NS),
-        ms(m.last_input_present_ns),
-        ms(m.max_input_present_ns),
-        h_input.count(),
-        pct(h_input, 0.50),
-        pct(h_input, 0.95),
-        pct(h_input, 0.99),
-        h_present.count(),
-        pct(h_present, 0.50),
-        pct(h_present, 0.95),
-        pct(h_present, 0.99),
-        ms(m.last_key_write_ns),
-        ms(m.max_key_write_ns),
-        ms(m.last_resize_present_ns),
-        ms(m.max_resize_present_ns),
-        ms(m.last_resize_reflow_ns),
-        ms(m.max_resize_reflow_ns),
-        m.sync_holds_armed,
-        m.sync_releases_end,
-        m.sync_releases_timeout,
-        m.sync_holding,
-        m.perf_reduced,
-        m.shed_transitions,
-        m.wake_heals,
-        m.output_wake_late,
-        m.output_wake_reposts,
-        ms(m.last_redraw_total_ns),
-        ms(m.max_redraw_total_ns),
-        m.redraw_attempts,
-        m.redraw_early_outs,
-        m.redraw_sync_holds,
-        m.redraw_retry_gated,
-        m.frame_refills_scoped,
-        m.frame_refills_full,
-        m.frame_refills_skipped,
-        m.pet_world_observations,
-        m.pet_world_cells,
-        m.fx_glow_quads_last,
-        m.fx_under_quads_last,
-        m.fx_trail_cells_last,
-        m.fx_under_frames,
-        crate::metrics::frame_fields_json(),
-        refill_cause_object(&refill_causes),
-        // Field-for-field twin of the text form's offscreen-raster ledger.
-        m.offscreen_rasters,
-        ms(m.last_offscreen_raster_ns),
-        ms(m.max_offscreen_raster_ns),
-        m.pre_present_attempts,
-        ms(m.last_pre_present_ns),
-        ms(m.pre_present_total_ns),
-        ms(m.max_pre_present_ns),
-        // Field-for-field twin of the text form's drawable-park scalars.
-        ms(m.last_acquire_wait_ns),
-        ms(m.max_acquire_wait_ns),
-        // Field-for-field twin of the text form's GPU-park scalars.
-        ms(m.last_gpu_park_ns),
-        ms(m.max_gpu_park_ns),
-        m.present_drops,
-        m.last_present_drop_reason.as_str(),
-        m.last_present_drop_parked,
-        m.tainted_present_samples,
-        ms(m.last_tainted_present_latency_ns),
-        ms(m.max_tainted_present_latency_ns),
-        m.capture_episodes,
-        m.capture_active,
-        m.event_wakes,
-        m.timer_wakes,
-        m.wait_cancelled_wakes,
-        m.poll_wakes,
-        m.last_wake_kind.as_str(),
-        m.last_wake_owner.as_str(),
-        ms(m.last_wake_late_ns),
-        m.last_deadline_owner.as_str(),
-        ms(m.deadline_in_ns),
-        ms(m.last_deadline_late_ns),
-        m.past_deadline_arms,
-        deadline_arm_object(&arms),
-        name_count_object(&crate::metrics::deadline_fire_attribution()),
-        name_count_object(&crate::metrics::user_wake_attribution()),
-        gpu_repaints.0,
-        gpu_repaints.1,
-        gpu_repaints.2,
-        streak_heal_object(&streak_heals),
-        m.stale_arm_heals,
-        // Field-for-field twin of the text summary's lateness fragment.
-        crate::metrics::lateness_fields_json(),
-        ms(m.max_frame_gap_ns),
-        ms(m.rust_main_to_first_present_ns),
-        ms(m.rust_main_to_first_visible_ns),
-        m.startup_phase_schema,
-        m.startup_phase_valid,
-        ms(m.startup_router_ns),
-        ms(m.startup_gui_prepare_ns),
-        ms(m.startup_winit_dispatch_ns),
-        ms(m.startup_initial_surface_attach_ns),
-        ms(m.startup_surface_to_successful_redraw_ns),
-        ms(m.startup_successful_compose_ns),
-        ms(m.startup_successful_surface_transaction_ns),
-        ms(m.startup_successful_finalize_ns),
-        m.startup_attach_schema,
-        m.startup_attach_valid,
-        ms(m.startup_attach_dispatch_ns),
-        ms(m.startup_attach_prepare_ns),
-        ms(m.startup_attach_window_create_ns),
-        ms(m.startup_attach_window_setup_ns),
-        ms(m.startup_attach_backend_finalize_ns),
-        ms(m.startup_attach_chrome_geometry_ns),
-        ms(m.startup_attach_surface_create_ns),
-        ms(m.startup_attach_finish_ns),
-        m.startup_worker_schema,
-        m.startup_worker_valid,
-        ms(m.startup_worker_total_ns),
-        ms(m.startup_worker_overlap_ns),
-        ms(m.startup_worker_after_join_ns),
-        ms(m.startup_worker_post_join_ns),
-        ms(m.startup_worker_prelude_ns),
-        ms(m.startup_worker_gpu_build_ns),
-        ms(m.startup_worker_font_admit_ns),
-        ms(m.startup_worker_font_apply_ns),
-        ms(m.startup_worker_font_seal_ns),
-        ms(m.startup_worker_epilogue_ns),
-        m.startup_gpu_schema,
-        m.startup_gpu_valid,
-        ms(m.startup_gpu_instance_ns),
-        ms(m.startup_gpu_adapter_ns),
-        ms(m.startup_gpu_device_ns),
-        ms(m.startup_gpu_context_tail_ns),
-        ms(m.startup_gpu_font_thread_ns),
-        ms(m.startup_gpu_font_join_ns),
-        ms(m.startup_gpu_pipelines_ns),
-        ms(m.startup_gpu_pipe_shader_ns),
-        ms(m.startup_gpu_pipe_uniform_atlas_ns),
-        ms(m.startup_gpu_pipe_cell_ns),
-        ms(m.startup_gpu_pipe_blit_ns),
-        ms(m.startup_gpu_pipe_tray_ns),
-        ms(m.startup_gpu_pipe_bloom_ns),
-        ms(m.startup_gpu_pipe_vbuf_ns),
-        ms(m.startup_gpu_pipe_tail_ns),
-        ms(m.startup_gpu_tail_ns),
-        cell_pipeline_object(&m.startup_gpu_cell_pipeline_ns),
-        m.effect_pipeline_builds,
-        ms(m.effect_pipeline_build_ns),
-        effect_pipeline_names(m.effect_pipeline_built_mask),
-        ms(m.first_present_ns),
-        ms(m.first_visible_ns),
-        // Field-for-field twin of the text summary's echo fragment.
-        crate::echo_rtt::percentile_fields_json(),
-        // Field-for-field twin of the text summary's turn-census fragment.
-        crate::watchdog::turn_census_fields_json(),
-        // Field-for-field twin of the text summary's warm-spare fragment.
-        crate::spare::metrics_fields_json(),
-        // Field-for-field twin of the text summary's handoff-input fragment.
-        crate::metrics::handoff_input_fields_json(),
-        // Field-for-field twin of the text summary's claim-timeline fragment.
-        crate::metrics::handoff_claim_fields_json(),
-        // Field-for-field twin of the text summary's before-winit fragment.
-        crate::metrics::startup_prepare_fields_json(m.startup_gui_prepare_ns),
-        // Field-for-field twin of the text summary's control-listener fragment.
-        crate::control_listener::fields_json(),
-        // Field-for-field twin of the text summary's PTY census.
-        crate::metrics::pty_census_fields_json(),
-        // Field-for-field twin of the text summary's identity-primer fragment.
-        crate::agent_identity::metrics_fields_json(),
-        gpu = crate::metrics::gpu_fields_json(),
-    ))
+    let ctx = ReadCtx::now();
+    let emit = |s: &mut dyn FieldSink| match request.form {
+        Form::Summary => crate::metrics::emit_summary(&ctx, try_metrics_dims(term), s),
+        Form::Percentiles => crate::metrics::emit_percentiles(&ctx, s),
+    };
+    match syntax {
+        Syntax::Text => {
+            let mut sink = TextSink::new("OK", FlagWords::ZeroOne);
+            emit(&mut sink);
+            let mut line = sink.finish();
+            line.push('\n');
+            line
+        }
+        Syntax::Json => {
+            let mut sink = JsonSink::new();
+            emit(&mut sink);
+            json_ok(&sink.finish())
+        }
+    }
 }
 
 /// `lines` -> `OK <total_scrollback_lines>\n` — how many lines of history
@@ -2321,11 +1002,13 @@ pub(crate) fn offscreen_args(rest: &str) -> Result<OffscreenArgs, String> {
 /// refcount bump each) and the reply is formatted AFTER the lock is released: a
 /// full archive is 4 MiB, which must never be copied while the PTY reader and the
 /// renderer wait on the lock.
-pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, frame: &FrameSlot, rest: &str) -> String {
     let args = match offscreen_args(rest) {
         Ok(args) => args,
         Err(err) => return err,
     };
+    // `screen=1`'s rows are the session's published text.
+    let mut look = frame.look_frame();
     let (read, alt, seq, screen) = {
         let t = term_lock(term);
         let archive = t.alt_archive();
@@ -2348,11 +1031,7 @@ pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
             None => aterm_core::terminal::AltArchiveQuery::oldest(since, page),
         };
         let read = archive.read(query);
-        let screen: Option<Vec<String>> = args.screen.then(|| {
-            (0..usize::from(t.rows()))
-                .map(|r| visible_row(&t, r))
-                .collect()
-        });
+        let screen = args.screen.then(|| look.text(&t));
         (read, t.is_alternate_screen(), t.content_seq(), screen)
     };
     format_offscreen_reply(&read, alt, seq, screen.as_deref())
@@ -2363,12 +1042,12 @@ fn format_offscreen_reply(
     read: &aterm_core::terminal::AltArchiveRead,
     alt: bool,
     seq: u64,
-    screen: Option<&[String]>,
+    screen: Option<&ScreenText>,
 ) -> String {
     use std::fmt::Write as _;
-    let screen_rows = screen.map_or(0, <[String]>::len);
+    let screen_rows = screen.map_or(0, ScreenText::row_count);
     let body_bytes: usize = read.rows.iter().map(|r| r.len() + 1).sum::<usize>()
-        + screen.map_or(0, |s| s.iter().map(|r| r.len() + 1).sum());
+        + screen.map_or(0, |s| s.whole().len());
     let mut out = String::with_capacity(body_bytes + 192);
     // The page's own last row: `since=<last>` must read the NEXT page, never
     // skip to the archive's newest (which `more=1` says lies further on).
@@ -2401,23 +1080,18 @@ fn format_offscreen_reply(
         out.push_str(" more=1");
     }
     if let Some(screen) = screen {
-        let _ = write!(out, " screen_rows={}", screen.len());
+        let _ = write!(out, " screen_rows={}", screen.row_count());
     }
     out.push('\n');
     for row in &read.rows {
         // The archive stores rows already collapsed the way `text` collapses them;
-        // map again anyway, because a control char left in a row (a newline above
-        // all) would break the n-line framing for every client.
-        if row.chars().any(|c| visible_char(c) != c) {
-            out.extend(row.chars().map(visible_char));
-        } else {
-            out.push_str(row);
-        }
+        // collapse again anyway, because a control char left in a row (a newline
+        // above all) would break the n-line framing for every client.
+        push_visible(&mut out, row, VisibleTrim::None);
         out.push('\n');
     }
-    for row in screen.unwrap_or_default() {
-        out.push_str(row);
-        out.push('\n');
+    if let Some(screen) = screen {
+        out.push_str(screen.whole());
     }
     out
 }
@@ -2436,231 +1110,37 @@ fn format_offscreen_reply(
 ///   `hist >= scrollback_lines`        → visible row `hist - scrollback_lines`
 /// A row OLDER than `oldest_absolute_row()` has scrolled past the scrollback cap
 /// and is reported as an EXPLICIT `ERR evicted\n` (never silently-shifted text —
-/// the same eviction contract `blocktext` honors). Control chars collapse to
-/// spaces; trailing spaces are trimmed. An unreadable retained row is an
-/// explicit error, distinct from the live screen's end.
+/// the same eviction contract `blocktext` honors); a retained history row whose
+/// stored line cannot be read is `ERR unreadable\n`. Control chars collapse to
+/// spaces; trailing spaces are trimmed ([`VisibleTrim::Spaces`]: the line as
+/// written keeps a trailing NBSP or U+3000, which `text` drops). The row is read
+/// whole ([`Terminal::abs_row_text_within`] with no byte bound), a history line
+/// longer than the MiB search reads of it included, and framed after the
+/// terminal is released.
 pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let Ok(n) = rest.trim().parse::<u64>() else {
         return "ERR usage: line <abs_row>\n".to_string();
     };
-    let t = term_lock(term);
-    let text = match abs_row_text(&t, n) {
-        AbsRow::Text(s) => s,
-        AbsRow::Evicted => return "ERR evicted\n".to_string(),
-        AbsRow::OutOfRange => return "ERR out of range\n".to_string(),
-        AbsRow::Unreadable => return "ERR unreadable\n".to_string(),
+    let row = term_lock(term).abs_row_text_within(n, usize::MAX);
+    let text = match row {
+        AbsRowText::Text(s) => s,
+        AbsRowText::Evicted => return "ERR evicted\n".to_string(),
+        AbsRowText::OutOfRange => return "ERR out of range\n".to_string(),
+        AbsRowText::Unreadable => return "ERR unreadable\n".to_string(),
     };
-    let mut s: String = text.chars().map(visible_char).collect();
-    while s.ends_with(' ') {
-        s.pop();
-    }
-    format!("OK {s}\n")
+    let mut out = String::with_capacity(text.len() + 4);
+    out.push_str("OK ");
+    push_visible(&mut out, &text, VisibleTrim::Spaces);
+    out.push('\n');
+    out
 }
 
-/// Outcome of resolving an absolute row to its text (B-2 coordinate space).
-pub(crate) enum AbsRow {
-    /// The combining-aware, NOT-yet-control-collapsed line text.
-    Text(String),
-    /// Older than `oldest_absolute_row()` — scrolled past the scrollback cap.
-    Evicted,
-    /// Newer than the live bottom visible row (no such row).
-    OutOfRange,
-    /// Within retained history, but its stored line could not be read.
-    Unreadable,
-}
-
-/// Resolve a MONOTONIC ABSOLUTE row to its grapheme-faithful text, in the ONE
-/// documented read coordinate space shared by `blocks`/`search`/`line`/`text`.
-///
-/// Conversion is identical to the engine's `text_range`: an absolute row maps to
-/// a history index relative to the oldest retained line; indices at/above the
-/// scrollback count land on the visible screen. Scrollback lines come from
-/// `get_history_line` (Line text); visible rows from the combining-aware
-/// `written_line_text` so accents / ZWJ clusters survive (FIDELITY I-1). Both
-/// are the row as written, trailing blanks kept, so find answers the same for
-/// a row on the screen and after it scrolls into history.
-pub(crate) fn abs_row_text(t: &Terminal, abs_row: u64) -> AbsRow {
-    let grid = t.grid();
-    let oldest = grid.oldest_absolute_row();
-    if abs_row < oldest {
-        return AbsRow::Evicted;
-    }
-    let scrollback = grid.scrollback_lines() as u64;
-    let visible_rows = u64::from(t.rows());
-    let rel = abs_row - oldest;
-    if rel < scrollback {
-        // Scrollback history line `rel` (0 = oldest retained).
-        match grid.get_history_line(rel as usize) {
-            Some(line) => AbsRow::Text(line.to_string()),
-            None => AbsRow::Unreadable,
-        }
-    } else {
-        let visible = rel - scrollback;
-        if visible >= visible_rows {
-            return AbsRow::OutOfRange;
-        }
-        AbsRow::Text(t.written_line_text(visible as i32).unwrap_or_default())
-    }
-}
-
-/// Whether absolute row `abs_row` is a soft-wrap CONTINUATION — the grid's
-/// DESTINATION convention, where the row content flowed INTO carries the flag,
-/// so the first row of a logical line always reads `false`.
-///
-/// A row outside the retained range is not a continuation: a run whose head has
-/// been evicted is treated as starting at the oldest row still there, which is
-/// the only logical line the search index can honestly key.
-pub(crate) fn abs_row_wrapped(t: &Terminal, abs_row: u64) -> bool {
-    let grid = t.grid();
-    let oldest = grid.oldest_absolute_row();
-    if abs_row <= oldest {
-        return false;
-    }
-    let scrollback = grid.scrollback_lines() as u64;
-    let rel = abs_row - oldest;
-    if rel < scrollback {
-        return grid
-            .get_history_line(rel as usize)
-            .is_some_and(|line| line.is_wrapped());
-    }
-    let visible = rel - scrollback;
-    if visible >= u64::from(t.rows()) {
-        return false;
-    }
-    u16::try_from(visible)
-        .ok()
-        .and_then(|row| grid.row(row))
-        .is_some_and(aterm_core::grid::Row::is_wrapped)
-}
-
-/// Append the text and soft-wrap flag of absolute rows `first..first + count`
-/// to `text` and `wrapped` — row for row what [`abs_row_text`] and
-/// [`abs_row_wrapped`] answer, an evicted or unreadable row reading as an
-/// empty, unwrapped one — and, when `cells` is given, the grid cells each
-/// row's text was read from ([`LineCells`]: a visible row's live cells, a
-/// history row's as it is drawn, `history_line_text_cells`), which the search
-/// index reports matches in.
-///
-/// The scrollback part is read through ONE dense walk
-/// ([`Grid::history_lines_from`]): one decode per tiered segment, the text and
-/// the wrap flag taken from the same yielded line. Reading it through the two
-/// per-row readers paid a binary search, a block-cache probe and a `Line` clone
-/// per tiered row, twice. Rows stay keyed by position — an undecodable segment
-/// yields one placeholder per line it spans — so every later row keeps its
-/// absolute coordinate. The visible rows keep the combining-aware per-row
-/// reader (FIDELITY I-1). Pinned against the per-row readers by
-/// `abs_rows_read_matches_the_per_row_readers_*`.
-pub(crate) fn read_abs_rows(
-    t: &Terminal,
-    first: u64,
-    count: usize,
-    text: &mut Vec<String>,
-    wrapped: &mut Vec<bool>,
-    mut cells: Option<&mut Vec<LineCells>>,
-) {
-    let grid = t.grid();
-    let oldest = grid.oldest_absolute_row();
-    let history_end = oldest.saturating_add(grid.scrollback_lines() as u64);
-    let end = first.saturating_add(count as u64);
-    let rows_until = |bound: u64, from: u64| {
-        usize::try_from(bound.min(end).saturating_sub(from)).unwrap_or(usize::MAX)
-    };
-    let mut abs = first;
-    // Rows scrolled past the cap.
-    let evicted = rows_until(oldest, abs);
-    text.extend(std::iter::repeat_n(String::new(), evicted));
-    wrapped.extend(std::iter::repeat_n(false, evicted));
-    if let Some(cells) = cells.as_deref_mut() {
-        cells.extend(std::iter::repeat_n(LineCells::new(), evicted));
-    }
-    abs = abs.saturating_add(evicted as u64);
-    // Scrollback, through the dense walk. The oldest retained row is never a
-    // continuation (`abs_row_wrapped`'s rule): its run's head is gone.
-    let in_history = rows_until(history_end, abs);
-    if in_history > 0 {
-        let start = abs - oldest;
-        let mut lines = grid.history_lines_from(usize::try_from(start).unwrap_or(usize::MAX));
-        for k in 0..in_history {
-            match lines.next().flatten() {
-                Some(line) => {
-                    wrapped.push((start > 0 || k > 0) && line.is_wrapped());
-                    let row = line.to_string();
-                    if let Some(cells) = cells.as_deref_mut() {
-                        cells.push(aterm_core::terminal::history_line_text_cells(
-                            grid, &line, &row,
-                        ));
-                    }
-                    text.push(row);
-                }
-                None => {
-                    wrapped.push(false);
-                    text.push(String::new());
-                    if let Some(cells) = cells.as_deref_mut() {
-                        cells.push(LineCells::new());
-                    }
-                }
-            }
-        }
-        abs = abs.saturating_add(in_history as u64);
-    }
-    // The visible screen, and anything past its bottom. Counted, not bounded by
-    // `end`, so exactly `count` rows are appended whatever saturates.
-    for _ in evicted.saturating_add(in_history)..count {
-        match cells.as_deref_mut() {
-            // The same row `abs_row_text` reads (its visible arm), with cells.
-            Some(cells) => {
-                let (row, row_cells) = abs
-                    .checked_sub(history_end)
-                    .and_then(|visible| i32::try_from(visible).ok())
-                    .and_then(|visible| t.written_line_cells(visible))
-                    .unwrap_or_default();
-                text.push(row);
-                cells.push(row_cells);
-            }
-            None => text.push(match abs_row_text(t, abs) {
-                AbsRow::Text(s) => s,
-                AbsRow::Evicted | AbsRow::OutOfRange | AbsRow::Unreadable => String::new(),
-            }),
-        }
-        wrapped.push(abs_row_wrapped(t, abs));
-        abs = abs.saturating_add(1);
-    }
-}
-
-/// How far back a logical-line walk will look for the row a soft-wrap run
-/// starts on. A run this long is not a wrapped sentence, it is a file with no
-/// newlines catted into the grid, and the walk runs once per anchored search —
-/// so past this depth the callers take their bounded fallback (rebuild from the
-/// retained floor / leave the anchor physical) instead of paying a scan over
-/// the whole retained history for a coordinate nobody is reading.
-const MAX_LOGICAL_LINE_WALK: usize = 1024;
-
-/// The absolute row the search index keyed the logical line containing
-/// `abs_row` under: walk back over soft-wrap continuations to the row the run
-/// starts on, stopping at `floor` (the oldest row the index retains).
-///
-/// Every column the index reports is measured from THIS row's column 0, so a
-/// caller holding a physical `(row, col)` point — a find anchor — has to come
-/// through here before it can address the index at all. `None` means the run
-/// reaches back further than [`MAX_LOGICAL_LINE_WALK`] without meeting either
-/// its head or the floor.
-pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u64> {
-    let mut origin = abs_row;
-    for _ in 0..MAX_LOGICAL_LINE_WALK {
-        if origin <= floor || !abs_row_wrapped(t, origin) {
-            return Some(origin);
-        }
-        origin -= 1;
-    }
-    None
-}
-
-/// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete[ capped][ rewrapping][ long-line][ changed][ older]]\n`
+/// `search <pat…> [case] [regex]` -> `OK <count>[ incomplete[ capped][ rewrapping][ long-line][ moving][ older]]\n`
 /// then `<abs_row> <col> <len>` per match. The header ends with
 /// `screen_first=<abs_row>`, the live screen's first row in the searched frame.
 ///
 /// SEARCH-1: backed by the engine's real `TerminalSearch`, indexing BOTH the
-/// SCROLLBACK (one dense walk, [`read_abs_rows`]) AND the visible rows
+/// SCROLLBACK (one dense walk, [`Terminal::read_search_rows`]) AND the visible rows
 /// with grapheme-aware text — so a term that has scrolled OFF the screen is
 /// still found, not just the visible page. Each match's row is an ABSOLUTE row
 /// (B-2's one coordinate space): feed it straight to `line`/`text`, which
@@ -2699,25 +1179,37 @@ pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u
 /// [`search_incomplete_marker`]): ` capped` when the list stopped at
 /// [`MAX_SEARCH_MATCHES`], ` rewrapping` when a width change's rewrap overlapped
 /// the search, so history it held away may not have been read, ` long-line`
-/// when a regex scan could not finish some line within the line's budget (a
-/// soft-wrapped run of megabytes), so matches past where it stopped on that line
-/// are missing — the pattern is fine, and the rest of the searched range was
-/// searched — ` changed` when the terminal moved while the snapshot or query
-/// ran, so its coordinates require a fresh read — and ` older` when, besides
-/// one of those, history older than the newest `search_history_lines` lines
-/// was not read. The depth cap alone is a bare ` incomplete`, as it has been since DL-2.
+/// when some line was not searched to its end — a regex scan could not finish
+/// it within the line's budget (a soft-wrapped run of megabytes), or it is a
+/// history line read only up to its first MiB (a crafted checkpoint can store
+/// longer) — so matches past that point on that line are missing; the pattern
+/// is fine, and the rest of the searched range was searched — ` moving` when
+/// the screen's coordinate frame moved while the search ran (it switched
+/// between the main and the alternate screen, changed width or ambiguous-width
+/// policy, or renumbered its history rows: [`SearchKey::same_frame`]), so a
+/// listed row may now name another line and the search is worth repeating —
+/// and ` older` when, besides one of those, history older than the
+/// newest `search_history_lines` lines was not read. The depth cap alone is a
+/// bare ` incomplete`, as it has been since DL-2. Output that only appends or
+/// rewrites lines during the search is not ` moving`: absolute rows stay put
+/// when output scrolls a line into history, so every listed row still names
+/// its line.
 ///
 /// LOCKING (P1.0c): the O(scrollback) index build NEVER runs under the Terminal
 /// mutex — a rebuild while the shell is streaming output would stall the PTY
 /// reader's `process()` and the frame path for the full build time. Instead the
 /// line texts are SNAPSHOTTED out of the grid in bounded chunks (the lock is
 /// released between chunks, the same bounded-hold discipline as the PTY
-/// reader's `PROCESS_CHUNK`) and the grapheme-aware [`TerminalSearch`] is built
-/// lock-free from the copies. The built index is cached per recent terminal, so
-/// an unchanged repeat reuses it; matching still scales with candidates/results
-/// and finishes with one short generation-validation lock. Under concurrent
-/// output a torn result is marked inconsistent and the GUI makes one bounded
-/// retry instead of installing stale coordinates.
+/// reader's `PROCESS_CHUNK`) and the grapheme-aware `TerminalSearch` is built
+/// lock-free from the copies. The built index stays in the terminal's slot
+/// (`Terminal::search_plan`), so an unchanged repeat reuses it, and so does the
+/// find bar's next search of the same terminal; at most [`SEARCH_RESIDENT_CAP`]
+/// terminals keep one. An index the slot lets go of is freed after the hold
+/// that let it go, never in it: freeing one is O(scrollback) too. Matching
+/// still scales with candidates/results and finishes with one short
+/// generation-validation lock. A result whose
+/// frame moved during the search is named ` moving` rather than run again: the
+/// client decides whether a second full-history pass is worth its cost.
 ///
 /// `rewrap` is the session's rewrap gauge (`ctx.rewrap_gauge`): while a job
 /// runs, the history is detached and the search reaches only the screen.
@@ -2765,17 +1257,29 @@ fn cmd_search_capped(
     let searched = search_full_history_capped(term, pat, case_sensitive, is_regex, depth_cap);
     let after = rewrap();
     let rewrapping = before.running || after.running || before.jobs != after.jobs;
+    search_reply(searched, rewrapping)
+}
+
+/// The `search` reply to one search ([`cmd_search`]): the header, with every
+/// ` incomplete` cause that applies ([`search_incomplete_marker`]), then one
+/// `<row> <col> <len>` line per match. `rewrapping` says a rewrap overlapped the
+/// search.
+fn search_reply(
+    searched: Result<FullHistorySearch, SearchOptionsError>,
+    rewrapping: bool,
+) -> String {
     match searched {
         Ok(search) => {
             // Function-local (like the other `Write` uses in this file) so it can
             // never shadow an `io::Write` elsewhere in the module.
             use std::fmt::Write as _;
+            let moving = !search.frame_stable;
             let qualifier = search_incomplete_marker(
-                search.results.incomplete || rewrapping || !search.consistent,
+                search.results.incomplete || rewrapping || moving,
                 search.results.matches.len() >= MAX_SEARCH_MATCHES,
                 rewrapping,
                 search.results.cut_short_lines > 0,
-                !search.consistent,
+                moving,
                 search.searched_lines.is_some(),
             );
             let mut out = format!(
@@ -2800,15 +1304,24 @@ fn cmd_search_capped(
 /// The ` incomplete…` marker of a `search` reply header ([`cmd_search`]):
 /// empty for an exhaustive list, else ` incomplete` followed by EVERY cause that
 /// applies, in a fixed order — ` capped`, ` rewrapping`, ` long-line`,
-/// ` changed`, then ` older` for the depth cap (`search_history_lines` left
-/// older history unread). A bare ` incomplete` also means the depth cap alone;
-/// ` older` is explicit only when another cause is present.
+/// ` moving`, then ` older` for the depth cap (`search_history_lines` left older history
+/// unread). The depth cap alone stays a bare ` incomplete`, its form since DL-2,
+/// so a reader that knows only that form still reads it right; the rule a reader
+/// applies is "older history was not searched when no cause follows
+/// ` incomplete`, or when ` older` does".
+///
+/// Ruling 2026-10-11 (R15 content-2 review): the header named ONE cause, and the
+/// first one won, so a depth cap under a cut-short line (`long-line`), a full
+/// list (`capped`) or a rewrap went unsaid, and an agent reading the verb help
+/// concluded the older history had been searched. Every cause is now named; the
+/// tokens follow the count, which is all the framing reads, so an older client
+/// keeps every match and an older `aterm ctl` still names the first cause.
 fn search_incomplete_marker(
     incomplete: bool,
     capped: bool,
     rewrapping: bool,
     cut_short: bool,
-    changed: bool,
+    moving: bool,
     older: bool,
 ) -> String {
     if !incomplete {
@@ -2820,7 +1333,7 @@ fn search_incomplete_marker(
         (capped, " capped"),
         (rewrapping, " rewrapping"),
         (cut_short, " long-line"),
-        (changed, " changed"),
+        (moving, " moving"),
     ] {
         if applies {
             marker.push_str(token);
@@ -2831,37 +1344,6 @@ fn search_incomplete_marker(
         marker.push_str(" older");
     }
     marker
-}
-
-/// Full-scrollback search over the LIVE terminal, shared by the `search` control verb
-/// ([`cmd_search`]) and the GUI's Cmd-F find (`App::search_recompute`). Returns
-/// [`SearchResults`] keyed by ABSOLUTE row (`SearchMatch.line`), plus the `incomplete`
-/// eviction flag, or `Err` for an invalid regex.
-///
-/// LOCKING: snapshots only the newest configured/searchable suffix, holding the Terminal
-/// lock at most [`SNAPSHOT_CHUNK_LINES`] rows at a time, and builds the trigram index with
-/// the lock RELEASED. The index is cached per recent terminal (keyed by identity +
-/// alt-screen + `content_seq`), so unchanged queries reuse it; matching still runs and a
-/// short endpoint lock validates its coordinate generation. Socket and GUI callers share
-/// this bounded cache.
-/// Whether the off-lock chunked snapshot may be CACHED as "the content at the cache key".
-/// Both conditions must hold: no chunk read a frame that diverged from the key DURING the
-/// copy (`!torn` — this is what catches a main→alt→main round-trip that leaves the main
-/// grid's `content_seq` unchanged, which an endpoint-only check would miss), AND the frame
-/// STILL matches the key at the end (`alt_now`/`seq_now` equal the key). Either failing
-/// means the index may be torn: fine to answer THIS query from its snapshot, never safe to
-/// re-serve under the key. Pure, so the caching decision is unit-testable without having to
-/// drive the (hard-to-reproduce) mid-copy swap.
-fn snapshot_cacheable(
-    torn: bool,
-    key_alt: bool,
-    alt_now: bool,
-    key_seq: u64,
-    seq_now: u64,
-    key_revision: u64,
-    revision_now: u64,
-) -> bool {
-    !torn && alt_now == key_alt && seq_now == key_seq && revision_now == key_revision
 }
 
 /// Search results together with the absolute-row coordinate frame the index
@@ -2885,558 +1367,19 @@ pub(crate) struct FullHistorySearch {
     /// boundary, and dividing that by any other width puts the continuation on
     /// the wrong row.
     pub(crate) cols: usize,
-    /// False when an alt-screen/content transition occurred during the chunked
-    /// snapshot. Such a mixed snapshot is never safe for GUI highlighting.
+    /// False when the terminal left the key's generation during the search
+    /// ([`SearchVerdict::consistent`]): output, a screen switch or a renumbering.
+    /// Such a result is never safe for GUI highlighting, which reruns it.
     pub(crate) consistent: bool,
+    /// False when the frame moved during the search ([`SearchKey::same_frame`]), so a
+    /// listed row may name another line now. Output alone keeps it true: absolute rows
+    /// stay put as lines scroll into history. The `search` verb names it ` moving`.
+    pub(crate) frame_stable: bool,
     /// How many of the newest lines were searched when the depth cap
     /// (`search_history_lines`) left older history unread; `None` when the whole
     /// retained buffer was searched. The find surfaces say this number instead
     /// of a bare `+`.
     pub(crate) searched_lines: Option<usize>,
-}
-
-/// The soft-wrap layout one query is answered in.
-///
-/// A run of soft-wrapped grid rows is ONE line to the reader, and a hit that
-/// straddles the boundary lives in neither row's own text, so the index holds
-/// the run JOINED, keyed at its first absolute row. Columns in that line
-/// therefore run past the grid's width and address the run's later rows; `cols`
-/// is the uniform stride that inverts them back to a physical `(row, col)`.
-///
-/// `logical_anchor` is the caller's physical find anchor carried into the same
-/// frame. It is not a convenience: the lazy point walks address the index
-/// directly, and a physical point compared against a joined line's columns
-/// would step over every remaining hit on the line the anchor sits in.
-#[derive(Clone, Copy)]
-struct WrapFrame {
-    /// Display columns one grid row holds — the width each continued row was
-    /// padded out to before the join.
-    cols: usize,
-    /// [`WrapFrame::to_logical`] of the caller's anchor, when it has one.
-    logical_anchor: Option<(usize, usize)>,
-}
-
-impl WrapFrame {
-    /// Carry a physical `(row, col)` point into the joined line's columns,
-    /// given the row that line starts on.
-    fn to_logical(cols: usize, origin: usize, row: usize, col: usize) -> (usize, usize) {
-        (
-            origin,
-            row.saturating_sub(origin)
-                .saturating_mul(cols)
-                .saturating_add(col),
-        )
-    }
-
-    /// Re-express one engine match — keyed at a logical line's first row, its
-    /// columns measured along the joined line — as the physical row and column
-    /// the hit STARTS on, with `end_col` still measured from that row's column
-    /// 0. A hit that straddles the wrap therefore keeps `end_col > cols`: one
-    /// record to navigate to, carrying the span the highlight has to paint
-    /// across the rows below it.
-    fn to_physical(self, m: &SearchMatch) -> SearchMatch {
-        // A zero-width grid cannot lay anything out; treat it as one column so
-        // the division is total and the match keeps its own row.
-        let cols = self.cols.max(1);
-        let row_offset = m.start_col / cols;
-        let start_col = m.start_col % cols;
-        SearchMatch::new(
-            m.line.saturating_add(row_offset),
-            start_col,
-            start_col.saturating_add(m.len()),
-        )
-    }
-
-    /// [`Self::to_physical`] over a whole result set, in place.
-    fn results_to_physical(self, results: &mut SearchResults) {
-        for m in &mut results.matches {
-            *m = self.to_physical(m);
-        }
-    }
-}
-
-/// Fold each soft-wrapped run of snapshot rows into the ONE logical line the
-/// reader sees, in place: the run's head takes the whole text and the cells it
-/// was read from, and every continuation becomes empty, so a hit that
-/// straddles the boundary is found exactly once, keyed at the row it starts
-/// on.
-///
-/// Every row a continuation follows is padded back out to the full `cols`
-/// columns it occupies on the glass, however few of them hold text. Grid rows
-/// are read as WRITTEN, and the cells past a row's written extent (a tail the
-/// program never wrote or erased, the cell a wide glyph left when it wrapped
-/// early) are not read, so without the padding such a row would splice its
-/// neighbour's first column onto its last written one, both inventing matches
-/// that are not on the glass and shifting every column after it. With it, the
-/// joined line has a UNIFORM stride: column `c` of the run is row `c / cols`,
-/// column `c % cols`, which is the arithmetic [`WrapFrame::to_physical`]
-/// inverts. That uniformity is the whole contract, so it is built in rather
-/// than counted ([`LineCells::append_wrapped_row`], the join a double-click's
-/// word window takes too): row `k` of the run is drawn from column `k * cols`,
-/// each of its cells at that plus the column the grid drew it in, and the
-/// padding runs from where the row's own cells end. (Ruling 2026-10-11, r15
-/// content-4: counting the columns by re-measuring each row's text broke the
-/// stride wherever the text measured wider than the row is, a VS16 base the
-/// grid left one cell wide in the last column, and moved every later hit on
-/// the run one cell right per such row.)
-///
-/// Joining also makes the logical line the unit a regex sees, so `^`/`$` bind to
-/// the reader's line rather than to a grid row — the semantics
-/// [`search_full_history_direction`] documents.
-fn join_wrapped_rows(lines: &mut [String], cells: &mut [LineCells], wrapped: &[bool], cols: usize) {
-    // A zero-column grid lays nothing out; leaving the rows alone keeps every
-    // coordinate the caller already has, and there is no boundary to straddle.
-    if cols == 0 {
-        return;
-    }
-    let mut head = 0usize;
-    while head < lines.len() {
-        let mut end = head.saturating_add(1);
-        while wrapped.get(end).copied().unwrap_or(false) {
-            end = end.saturating_add(1);
-        }
-        let continuations = end.saturating_sub(head).saturating_sub(1);
-        if continuations > 0
-            && let Some((slot, rest)) = lines.get_mut(head..).and_then(<[String]>::split_first_mut)
-            && let Some((slot_cells, rest_cells)) = cells
-                .get_mut(head..)
-                .and_then(<[LineCells]>::split_first_mut)
-        {
-            let mut joined = std::mem::take(slot);
-            let mut joined_cells = std::mem::take(slot_cells);
-            // Row `k` of the run from column `k * cols`, padded out to it
-            // from where the rows before end: a blank row (`CSI 2 K` erases a
-            // row without clearing the next row's continuation flag) is
-            // padded across its whole width.
-            let mut row_start = 0usize;
-            for (row, row_cells) in rest
-                .iter_mut()
-                .zip(rest_cells.iter_mut())
-                .take(continuations)
-            {
-                row_start = row_start.saturating_add(cols);
-                let continuation = std::mem::take(row);
-                let continuation_cells = std::mem::take(row_cells);
-                joined_cells.append_wrapped_row(
-                    &mut joined,
-                    &continuation,
-                    &continuation_cells,
-                    row_start,
-                );
-            }
-            *slot = joined;
-            *slot_cells = joined_cells;
-        }
-        head = end;
-    }
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the wrap frame rides alongside the query's own surface, like the anchor"
-)]
-fn query_search_index(
-    index: &TerminalSearch,
-    query: &str,
-    case_sensitive: bool,
-    is_regex: bool,
-    direction: EngineSearchDirection,
-    anchor: Option<(usize, usize)>,
-    strict: bool,
-    wrap: WrapFrame,
-) -> Result<(SearchResults, Option<SearchMatch>), SearchOptionsError> {
-    let mut results =
-        index.search_results_opts_direction(query, case_sensitive, is_regex, direction)?;
-    // Physical FIRST: `select_point_match` orders results against the caller's
-    // physical anchor, so a joined line's columns must never reach it.
-    wrap.results_to_physical(&mut results);
-    let point_match = select_point_match(
-        index,
-        &results,
-        query,
-        case_sensitive,
-        is_regex,
-        direction,
-        anchor,
-        strict,
-        wrap,
-    )?;
-    Ok((results, point_match))
-}
-
-/// Anchored point-match selection over ALREADY-COMPUTED batch results — split
-/// out of [`query_search_index`] verbatim so the narrowing path (SA-1) shares
-/// the exact anchored/point/cap-edge policy instead of re-implementing it.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "verbatim split of query_search_index's policy tail; every flag is load-bearing"
-)]
-fn select_point_match(
-    index: &TerminalSearch,
-    results: &SearchResults,
-    query: &str,
-    case_sensitive: bool,
-    is_regex: bool,
-    direction: EngineSearchDirection,
-    anchor: Option<(usize, usize)>,
-    strict: bool,
-    wrap: WrapFrame,
-) -> Result<Option<SearchMatch>, SearchOptionsError> {
-    let point_match = if let Some(anchor) = anchor {
-        if results.matches.len() < MAX_SEARCH_MATCHES {
-            let qualifies = |found: &SearchMatch| {
-                let point = (found.line, found.start_col);
-                match direction {
-                    EngineSearchDirection::Forward => {
-                        if strict {
-                            point > anchor
-                        } else {
-                            point >= anchor
-                        }
-                    }
-                    EngineSearchDirection::Backward => {
-                        if strict {
-                            point < anchor
-                        } else {
-                            point <= anchor
-                        }
-                    }
-                    _ => false,
-                }
-            };
-            match direction {
-                EngineSearchDirection::Forward => results
-                    .matches
-                    .iter()
-                    .find(|found| qualifies(found))
-                    .or_else(|| results.matches.first())
-                    .cloned(),
-                EngineSearchDirection::Backward => results
-                    .matches
-                    .iter()
-                    .rfind(|found| qualifies(found))
-                    .or_else(|| results.matches.last())
-                    .cloned(),
-                _ => None,
-            }
-        } else {
-            // Past the batch cap the walk addresses the INDEX, whose lines are
-            // joined soft-wrap runs — so it takes the anchor in that frame and
-            // hands back a match that still has to be re-expressed physically.
-            //
-            // A walk that found nothing but could not finish some line has no
-            // point to offer, and the batch beside it already carries the
-            // matches and counts the line (`cut_short_lines`): keep the batch.
-            match index.find_direction_opts(
-                query,
-                case_sensitive,
-                is_regex,
-                aterm_search::DirectedFind {
-                    anchor: wrap.logical_anchor.unwrap_or(anchor),
-                    direction,
-                    inclusive: !strict,
-                    wrap: true,
-                },
-            ) {
-                Err(SearchOptionsError::ScanCutShort) => None,
-                found => found?.map(|found| wrap.to_physical(&found)),
-            }
-        }
-    } else {
-        None
-    };
-    Ok(point_match)
-}
-
-// ---------------------------------------------------------------------------
-// SA-1: isearch-style prefix narrowing for the per-keystroke find-bar query.
-//
-// The find bar re-enters `search_full_history_direction` on EVERY text edit.
-// On unchanged content that is a snapshot-cache hit — but the QUERY layer was
-// stateless: each keystroke re-ran the complete batch query (full range scan
-// for 1–2-char literals, posting-list decode + intersection for longer ones,
-// up-to-100k match materialization) even though the consumer above is
-// precisely a stateful incremental search whose grown query can only ever
-// match INSIDE the previous query's occurrence set.
-//
-// A `NarrowSession` keeps, per terminal and per exact index generation
-// (alt/content_seq/revision/max_lines/case key — any content change kills it
-// by key mismatch, never by explicit invalidation), a PREFIX STACK of frames:
-// the ascending occurrence-line sets of each typed prefix, produced by
-// `TerminalSearch::search_literal_narrowed` (whose results are
-// differential-tested equal to the batch path in `aterm-search`). A keystroke
-// that extends a stacked prefix verifies ONLY that frame's lines — no range
-// scan, no posting decode; backspace re-verifies the shorter prefix off its
-// own frame; a non-suffix edit, a regex query, a capped previous set or any
-// content change falls back to the batch path (and reseeds where legal).
-//
-// Frames hold OCCURRENCE lines (fold-level containment), not reported-match
-// lines — the subset property `matches(q + c) ⊆ occurrences(q)` is pure
-// string logic (`lower_fold(q + c) == lower_fold(q) + lower_fold(c)`), immune
-// to the zero-display-width match drops that make reported-match frames
-// unsound (ﬁ/ß multi-char folds, prepend clusters — see the engine tests).
-// ---------------------------------------------------------------------------
-
-/// One typed prefix's occurrence frame.
-struct NarrowFrame {
-    query: String,
-    /// Ascending retained lines whose folded text contains the folded query —
-    /// absolute rows, held as `u32` offsets from the frame's own base, so a
-    /// frame costs four bytes a line past row `u32::MAX` too.
-    occurrence_lines: LineFrame,
-}
-
-/// A terminal's live narrowing stack, valid for exactly one index generation.
-struct NarrowSession {
-    /// Identity key only (never dereferenced) — same discipline as
-    /// [`SearchSnapshot::term`].
-    term: Weak<Mutex<Terminal>>,
-    alt_screen: bool,
-    content_seq: u64,
-    absolute_row_revision: u64,
-    max_lines: usize,
-    case_sensitive: bool,
-    /// Prefix stack: `frames[i].query` is a byte-prefix of `frames[i+1].query`.
-    frames: Vec<NarrowFrame>,
-}
-
-/// A few concurrent find bars; matches the working-set thinking behind
-/// [`SEARCH_SNAPSHOT_CAPACITY`] at a quarter the size (one session per
-/// terminal, newest-kept).
-const NARROW_SESSION_CAPACITY: usize = 4;
-
-/// Retained-entry budget per session (~1.6 MB of `u32` offsets at the bound). The
-/// SHALLOWEST frames (the biggest — short prefixes) are dropped first; a deep
-/// backspace past a dropped frame reseeds from the engine, which is always
-/// correct, merely batch-priced.
-const NARROW_SESSION_MAX_ENTRIES: usize = 4 * MAX_SEARCH_MATCHES;
-
-static NARROW_SESSIONS: Mutex<VecDeque<NarrowSession>> = Mutex::new(VecDeque::new());
-
-fn narrow_sessions_lock() -> MutexGuard<'static, VecDeque<NarrowSession>> {
-    // Stale-on-poison is safe: every session is validated by its full key.
-    NARROW_SESSIONS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Take (remove) this terminal's session iff its ENTIRE key matches the
-/// current query context. A key mismatch leaves nothing behind for this
-/// terminal to reuse, but does not disturb other terminals' sessions.
-fn take_narrow_session(
-    term: &Arc<Mutex<Terminal>>,
-    alt_screen: bool,
-    content_seq: u64,
-    absolute_row_revision: u64,
-    max_lines: usize,
-    case_sensitive: bool,
-) -> Option<NarrowSession> {
-    let mut sessions = narrow_sessions_lock();
-    sessions.retain(|session| session.term.strong_count() != 0);
-    let position = sessions.iter().position(|session| {
-        std::ptr::eq(session.term.as_ptr(), Arc::as_ptr(term))
-            && session.alt_screen == alt_screen
-            && session.content_seq == content_seq
-            && session.absolute_row_revision == absolute_row_revision
-            && session.max_lines == max_lines
-            && session.case_sensitive == case_sensitive
-    })?;
-    sessions.remove(position)
-}
-
-fn store_narrow_session(session: NarrowSession) {
-    let mut sessions = narrow_sessions_lock();
-    sessions.retain(|existing| {
-        existing.term.strong_count() != 0
-            && !std::ptr::eq(existing.term.as_ptr(), session.term.as_ptr())
-    });
-    if sessions.len() >= NARROW_SESSION_CAPACITY {
-        sessions.pop_front();
-    }
-    sessions.push_back(session);
-}
-
-#[cfg(test)]
-thread_local! {
-    static NARROWED_QUERY_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn record_narrowed_query() {
-    NARROWED_QUERY_STEPS.with(|count| count.set(count.get().saturating_add(1)));
-}
-
-#[cfg(not(test))]
-fn record_narrowed_query() {}
-
-/// Take (read and reset) how many queries on THIS thread were served off a
-/// narrowing frame — the deterministic reach signal for the wiring tests
-/// (thread-local so parallel tests on other terminals cannot perturb it).
-#[cfg(test)]
-fn take_narrowed_query_steps() -> usize {
-    NARROWED_QUERY_STEPS.with(|count| {
-        let value = count.get();
-        count.set(0);
-        value
-    })
-}
-
-/// The cache-hit query layer with narrowing: literal queries consult/extend
-/// this terminal's [`NarrowSession`]; regex and empty queries (and any capped
-/// backward edge) take the batch path unchanged. Results are ALWAYS equal to
-/// [`query_search_index`] on the same inputs — narrowing changes which lines
-/// get verified, never what a verified result is (engine-differential-tested;
-/// re-pinned here by the wiring tests).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the narrow-session key rides alongside query_search_index's own surface"
-)]
-fn query_search_index_narrowing(
-    term: &Arc<Mutex<Terminal>>,
-    index: &TerminalSearch,
-    key_alt: bool,
-    key_seq: u64,
-    absolute_row_revision: u64,
-    max_lines: usize,
-    query: &str,
-    case_sensitive: bool,
-    is_regex: bool,
-    direction: EngineSearchDirection,
-    anchor: Option<(usize, usize)>,
-    strict: bool,
-    wrap: WrapFrame,
-) -> Result<(SearchResults, Option<SearchMatch>), SearchOptionsError> {
-    if is_regex || query.is_empty() {
-        // Regex has no prefix-subset property; empty is the neutral bar state.
-        return query_search_index(
-            index,
-            query,
-            case_sensitive,
-            is_regex,
-            direction,
-            anchor,
-            strict,
-            wrap,
-        );
-    }
-    let mut session = take_narrow_session(
-        term,
-        key_alt,
-        key_seq,
-        absolute_row_revision,
-        max_lines,
-        case_sensitive,
-    );
-    // Deepest stacked prefix of this query (equality included: a repeat or
-    // backspaced-to query re-verifies off its OWN frame — occurrences ⊇
-    // matches, so that is complete too).
-    let frame_index = session.as_ref().and_then(|session| {
-        session
-            .frames
-            .iter()
-            .rposition(|frame| query.starts_with(frame.query.as_str()))
-    });
-    let narrowed = {
-        let prev_lines = session
-            .as_ref()
-            .and_then(|session| frame_index.map(|at| &session.frames[at].occurrence_lines));
-        // COST GUARD: a frame is a SUBSET property, not a cost guarantee. The
-        // keystroke that turns a COMMON prefix into a RARE query inverts the
-        // comparison — the engine's trigram intersection visits a handful of
-        // candidates while the inherited frame still holds every line the
-        // common prefix occurred on (measured on a 60k-line log-shaped probe:
-        // 2.60 ms off a 60 000-line frame against 0.085 ms through the index,
-        // on exactly the keystroke whose latency the user feels most). So
-        // narrow only while the frame is no bigger than the candidate set the
-        // engine would walk itself; the fallback is the plain seed path, which
-        // reseeds a fresh, SMALLER frame for the next keystroke, so the guard
-        // costs one step and never compounds.
-        //
-        // The comparison carries a 2x slack because the two sides do not cost
-        // the same PER CANDIDATE: a frame line is one verify, while an engine
-        // candidate additionally pays the driver list's varint decode and a
-        // binary-search probe per remaining trigram (~1.5x per candidate on
-        // the same probe). Only a DECISIVELY smaller candidate set is worth
-        // abandoning a frame for.
-        let prev_lines = prev_lines.filter(|lines| {
-            match index.literal_candidate_bound(query, case_sensitive) {
-                // Sub-trigram query: the engine range-scans every retained
-                // line, so any frame is at least as cheap.
-                None => true,
-                Some(bound) => lines.len() as u64 <= bound.saturating_mul(2),
-            }
-        });
-        if prev_lines.is_some() {
-            record_narrowed_query();
-        }
-        index.search_literal_narrowed(query, case_sensitive, prev_lines)
-    };
-    let NarrowedSearch {
-        results: narrowed_results,
-        occurrence_lines,
-    } = narrowed;
-    // A capped narrowed walk carries the FORWARD (oldest-retaining) cap edge;
-    // a capped BACKWARD batch retains the newest matches instead — fall back
-    // so the direction-aware edge semantics stay byte-identical.
-    let capped = narrowed_results.matches.len() >= MAX_SEARCH_MATCHES;
-    let mut results = if capped && direction == EngineSearchDirection::Backward {
-        index.search_results_opts_direction(query, case_sensitive, false, direction)?
-    } else {
-        narrowed_results
-    };
-    // Physical FIRST, for the reason [`query_search_index`] states.
-    wrap.results_to_physical(&mut results);
-    if let Some(occurrence_lines) = occurrence_lines {
-        let mut session = session.take().unwrap_or_else(|| NarrowSession {
-            term: Arc::downgrade(term),
-            alt_screen: key_alt,
-            content_seq: key_seq,
-            absolute_row_revision,
-            max_lines,
-            case_sensitive,
-            frames: Vec::new(),
-        });
-        // Keep only ancestors (prefixes) of this query, then push/replace so
-        // the stack invariant (each frame a byte-prefix of the next) holds.
-        session.frames.truncate(frame_index.map_or(0, |at| at + 1));
-        if session
-            .frames
-            .last()
-            .is_some_and(|frame| frame.query == query)
-        {
-            session.frames.pop();
-        }
-        session.frames.push(NarrowFrame {
-            query: query.to_string(),
-            occurrence_lines,
-        });
-        let mut total: usize = session
-            .frames
-            .iter()
-            .map(|frame| frame.occurrence_lines.len())
-            .sum();
-        while total > NARROW_SESSION_MAX_ENTRIES && session.frames.len() > 1 {
-            let dropped = session.frames.remove(0);
-            total = total.saturating_sub(dropped.occurrence_lines.len());
-        }
-        store_narrow_session(session);
-    } else if let Some(session) = session {
-        // Capped walk: no frame for THIS query, but the stacked ancestors are
-        // still valid for other extensions of their prefixes — keep them.
-        store_narrow_session(session);
-    }
-    let point_match = select_point_match(
-        index,
-        &results,
-        query,
-        case_sensitive,
-        false,
-        direction,
-        anchor,
-        strict,
-        wrap,
-    )?;
-    Ok((results, point_match))
 }
 
 /// [`search_full_history_capped`] at the configured depth, as the socket verb
@@ -3478,9 +1421,10 @@ fn search_full_history_capped(
 /// historical oldest-first capped subset. Cmd-R uses this entry point so a
 /// capped reverse search retains the newest matches instead.
 ///
-/// THE UNIT OF MATCHING IS THE LOGICAL LINE, not the grid row. Every soft-wrap
-/// run is joined ([`join_wrapped_rows`]) into the one line the reader sees
-/// before the engine looks at it, so a hit may straddle a wrap; the results
+/// THE UNIT OF MATCHING IS THE LOGICAL LINE, not the grid row. The index is
+/// built in [`SearchLayout::Logical`]: every soft-wrap run is joined
+/// ([`aterm_core::terminal::join_wrapped_rows`]) into the one line the reader
+/// sees before the engine looks at it, so a hit may straddle a wrap; the results
 /// come back in PHYSICAL coordinates ([`WrapFrame::to_physical`]) with such a
 /// hit's `end_col` counting straight through the boundary. Two consequences a
 /// caller has to know about, both deliberate:
@@ -3531,332 +1475,93 @@ fn search_full_history_direction_capped(
     strict: bool,
     depth_cap: usize,
 ) -> Result<FullHistorySearch, SearchOptionsError> {
-    // Short lock: capture the cache key and the coordinate frame only.
-    let (key_alt, key_seq, key_epoch, oldest, scrollback, visible_rows, absolute_row_revision) = {
-        let t = term_lock(term);
-        (
-            t.is_alternate_screen(),
-            t.content_seq(),
-            t.grid().history_renumber_epoch(),
-            t.grid().oldest_absolute_row(),
-            t.grid().scrollback_lines(),
-            t.rows() as usize,
-            t.absolute_row_revision(),
-        )
-    };
-    let scrollback_u64 = u64::try_from(scrollback).unwrap_or(u64::MAX);
-    let base_y = i64::try_from(oldest.saturating_add(scrollback_u64)).unwrap_or(i64::MAX);
+    let request = search_request(depth_cap, anchor);
+    // SA-1: a literal query narrows from the previous keystroke's occurrence
+    // frame kept beside the index (batch-identical results, no index work for
+    // the dominant grown-by-one-char edit); regex, empty and every fallback
+    // condition route through the plain batch path inside.
+    full_history_search(search_terminal(term, &request, |built, _| {
+        built.query(query, case_sensitive, is_regex, direction, strict)
+    }))
+}
 
-    // The configured index depth cap (config `search_history_lines`): how many of the
-    // newest lines the trigram index retains before evicting the oldest (and flagging
-    // results incomplete). FLOORED so the LIVE SCREEN is always searchable even under a
-    // tiny configured cap — only scrollback beyond the cap is evicted. The floor is
-    // `max_cached_for_retained(visible_rows)`, NOT `visible_rows` itself: the engine
-    // evicts to a 3/4 low-water mark, so a cap of exactly `visible_rows` would let the
-    // oldest quarter of the visible screen be dropped (top on-screen rows returning "no
-    // match"). Captured once so the cache key and the fresh build agree even across a
-    // concurrent config reload (a resize bumps content_seq, so the floor tracks it).
-    let max_lines = depth_cap.max(max_cached_for_retained(visible_rows));
-
-    // The indexed window, hoisted above the cache branch because the wrap frame
-    // needs its floor: an anchor's logical-line walk stops where the index does.
-    let total = scrollback + visible_rows;
-    let retained_total = total.min(max_lines);
-    let skipped_prefix = total.saturating_sub(retained_total);
-    let retained_oldest = oldest.saturating_add(skipped_prefix as u64);
-    let retained_base = usize::try_from(retained_oldest).unwrap_or(usize::MAX);
-    let indexed_end = retained_base.saturating_add(retained_total);
-    let searched_lines = (skipped_prefix > 0).then_some(retained_total);
-
-    // The soft-wrap layout this query is answered in. `cols` comes from the same
-    // grid the rows do, so the stride that un-joins a logical line's columns can
-    // never belong to a different geometry than the rows that were joined; the
-    // anchor is carried into that frame here, where the runs are readable.
-    let (wrap, ambiguous) = {
-        let t = term_lock(term);
-        let cols = usize::from(t.grid().cols());
-        let wrap = WrapFrame {
-            cols,
-            logical_anchor: anchor.and_then(|(row, col)| {
-                let origin =
-                    logical_origin(&t, u64::try_from(row).unwrap_or(u64::MAX), retained_oldest)?;
-                let origin = usize::try_from(origin).unwrap_or(row);
-                Some(WrapFrame::to_logical(cols, origin, row, col))
-            }),
-        };
-        // The `ambiguous_width` policy every column (and every joined run's
-        // padding) is measured under, read with the width it pads to.
-        (wrap, t.ambiguous_width())
-    };
-
-    // Cache hit: clone the immutable index handle while holding the process-global
-    // cache lock, then run the potentially large query after releasing it. Searches
-    // in another window can therefore proceed concurrently instead of serializing
-    // behind a common one-character query over a deep history.
-    let cached_index = cached_search_index(
-        term,
-        key_alt,
-        key_seq,
-        key_epoch,
-        absolute_row_revision,
-        max_lines,
-        ambiguous,
-    );
-    if let Some(index) = cached_index {
-        // SA-1: the per-keystroke query layer. Literal queries narrow from the
-        // previous keystroke's occurrence frame (batch-identical results, no
-        // index work for the dominant grown-by-one-char edit); regex/empty and
-        // every fallback condition route through the plain batch path inside.
-        let (results, point_match) = query_search_index_narrowing(
-            term,
-            &index,
-            key_alt,
-            key_seq,
-            absolute_row_revision,
-            max_lines,
-            query,
-            case_sensitive,
-            is_regex,
-            direction,
-            anchor,
-            strict,
-            wrap,
-        )?;
-        #[cfg(test)]
-        maybe_mutate_search_cache_hit(term);
-        // A cache key proves the immutable index was current when this query
-        // STARTED. Recheck after the potentially long query so a resize/output
-        // or protected-footer splice cannot install a stale point coordinate.
-        let consistent = {
-            let terminal = term_lock(term);
-            snapshot_cacheable(
-                false,
-                key_alt,
-                terminal.is_alternate_screen(),
-                key_seq,
-                terminal.content_seq(),
-                absolute_row_revision,
-                terminal.absolute_row_revision(),
-            )
-        };
-        return Ok(FullHistorySearch {
-            results,
-            point_match,
-            base_y,
-            absolute_row_revision,
-            history_renumber_epoch: key_epoch,
-            content_seq: key_seq,
-            cols: wrap.cols,
-            consistent,
-            searched_lines,
-        });
-    }
-
-    // Miss: snapshot only the newest suffix the configured index can retain.
-    // Copying/indexing an older prefix merely to trigger repeated 25%-evictions
-    // made cold search scale with unsearchable history (and churn O(n log n)
-    // key sorts). `read_abs_rows` converts each chunk's absolute rows against
-    // the LIVE frame at read time, so a row that scrolls off mid-snapshot reads
-    // as evicted (empty) — exactly what a fresh build under the shifted frame
-    // lacks.
-    let visible_base = usize::try_from(oldest.saturating_add(scrollback_u64)).unwrap_or(usize::MAX);
-    let reusable = take_reusable_search_index(
-        term,
-        key_alt,
-        key_epoch,
-        absolute_row_revision,
-        max_lines,
-        retained_base,
-        indexed_end,
-        ambiguous,
-    );
-    let (mut index, snapshot_start) = if let Some((mut index, previous_visible_base)) = reusable {
-        // The rows below the new retained floor are gone from the TERMINAL
-        // (retention advanced, an `ED 3` erased the scrollback), not merely
-        // un-searchable — a from-scratch rebuild over the survivors reports
-        // COMPLETE results with a zero watermark, so the drop must too, or a
-        // single `clear` latches `incomplete` for the life of the session and
-        // the find bar paints `N+` forever over a count it knows is exact. The
-        // honesty verdict for THIS query is decided once, below, from
-        // `skipped_prefix` — the only thing that means "the source still holds
-        // rows this index deliberately did not read".
-        index.drop_history_below(retained_base);
-        // Scrollback is immutable only after a row leaves the visible grid.
-        // Refresh from the PREVIOUS visible boundary so a row edited while it
-        // was visible and then scrolled away between searches cannot retain
-        // stale text. This remains bounded to the old visible rows plus newly
-        // appended rows (and is clipped at the retained-history floor).
-        //
-        // Or from the CURRENT boundary when that is lower: a rows-grow that
-        // reveals history (`Terminal::resize`, native policy) hands history
-        // rows back to the screen under their own keys, with no epoch or
-        // revision move, and there they are editable again — the audit's
-        // repaint over the revealed band (2026-09-22) left `grow 22` reported
-        // on the row that then held `grow 38`, and `grow 38` not found at all.
-        // `Terminal::indexed_search` takes the same minimum for the same reason.
-        (
-            index,
-            previous_visible_base.min(visible_base).max(retained_base),
-        )
-    } else {
-        (
-            TerminalSearch::with_capacity_and_max(retained_total, max_lines)
-                .with_ambiguous_width(ambiguous),
-            retained_base,
-        )
-    };
-    // A soft-wrap run is indexed as ONE line keyed at the row it starts on, so a
-    // refresh that began INSIDE a run would re-key its tail as an (empty)
-    // continuation while the run's head still carried its old, unjoined text —
-    // and the hits on the tail would vanish.
-    //
-    // The walk starts one row BELOW the refresh boundary, not at it. The row it
-    // begins on is the previous generation's top VISIBLE row, so the program
-    // could have rewritten it out of a run since; the run whose head must be
-    // re-joined is then the one ending at the row ABOVE, and that row's own
-    // flags are immutable history. Starting a row early catches both shapes and
-    // costs one extra row on the ordinary unwrapped refresh. A run too deep to
-    // walk back over falls to the retained floor, which re-indexes more rows
-    // than needed but can never leave a half-joined line behind.
-    let snapshot_start = {
-        let t = term_lock(term);
-        logical_origin(
-            &t,
-            u64::try_from(snapshot_start)
-                .unwrap_or(u64::MAX)
-                .saturating_sub(1)
-                .max(retained_oldest),
-            retained_oldest,
-        )
-        .and_then(|origin| usize::try_from(origin).ok())
-        .unwrap_or(retained_base)
-    };
-    let snapshot_lines = indexed_end.saturating_sub(snapshot_start);
-    let snapshot_start_u64 = u64::try_from(snapshot_start).unwrap_or(u64::MAX);
-    let mut lines: Vec<String> = Vec::with_capacity(snapshot_lines);
-    // The grid cells each row's text was read from, which the index reports
-    // matches in.
-    let mut cells: Vec<LineCells> = Vec::with_capacity(snapshot_lines);
-    // Which snapshot rows are soft-wrap CONTINUATIONS, read in the same lock
-    // holds as the text so the layout and the content can never come from two
-    // different frames.
-    let mut wrapped: Vec<bool> = Vec::with_capacity(snapshot_lines);
-    // Track whether the active screen / content generation ever diverged from the cache key
-    // DURING the chunked copy — not just at the endpoints. A main→alt→main round-trip leaves
-    // the main grid's content_seq unchanged (the alt swap doesn't touch its cells), so an
-    // endpoint-only check would pass yet a mid-copy chunk could have read alt-grid rows; that
-    // torn index must never be cached under the (main, seq) key.
-    let mut torn = false;
-    while lines.len() < snapshot_lines {
-        let t = term_lock(term);
-        if t.is_alternate_screen() != key_alt
-            || t.content_seq() != key_seq
-            || t.grid().history_renumber_epoch() != key_epoch
-            || t.absolute_row_revision() != absolute_row_revision
-        {
-            torn = true;
-        }
-        let done = lines.len();
-        let chunk = SNAPSHOT_CHUNK_LINES.min(snapshot_lines - done);
-        read_abs_rows(
-            &t,
-            snapshot_start_u64.saturating_add(u64::try_from(done).unwrap_or(u64::MAX)),
-            chunk,
-            &mut lines,
-            &mut wrapped,
-            Some(&mut cells),
-        );
-    }
-    // The FIRST snapshot row starts a logical line by construction (the walk
-    // above put it on one), whatever the grid says about the row above it — the
-    // index has nothing older to join it to.
-    if let Some(first) = wrapped.first_mut() {
-        *first = false;
-    }
-    join_wrapped_rows(&mut lines, &mut cells, &wrapped, wrap.cols);
-
-    // Build the index OUTSIDE any lock: line `j` keys at absolute row `oldest + j`, so
-    // SearchMatch.line is already an absolute row and the eviction/incomplete semantics
-    // are the engine's. Cap retained lines at `max_lines`: the oldest are evicted (the
-    // newest — always including the visible screen — stay searchable) and the engine
-    // flags results incomplete, which the callers surface honestly.
-    record_search_snapshot_lines(lines.len());
-    index.index_numbered_cells_owned(
-        lines
-            .into_iter()
-            .zip(cells)
-            .enumerate()
-            .map(|(j, (line, cells))| (snapshot_start.saturating_add(j), line, cells)),
-    );
-    // The completeness verdict for THIS build, stated in both directions from
-    // the window it was actually built over. `skipped_prefix > 0` means the
-    // terminal still retains history older than the configured depth cap and
-    // this index deliberately did not read it — incomplete, from exactly
-    // `retained_base`. Zero means the whole retained buffer is in the index, and
-    // saying so is the point: the index outlives the condition that made it
-    // partial (a `clear`, a scrollback eviction, a raised cap all end it), and a
-    // latched flag would go on qualifying an exact count with `+` forever.
-    index.set_history_prefix_eviction((skipped_prefix > 0).then_some(retained_base));
-
-    // Run the query BEFORE moving the index into the cache (the borrow ends with the owned
-    // `results`). Compute results regardless of caching so an invalid regex still returns Err.
-    let index = Arc::new(index);
-    let results = query_search_index(
-        &index,
-        query,
-        case_sensitive,
-        is_regex,
-        direction,
-        anchor,
-        strict,
-        wrap,
-    );
-
-    // Cache only a PROVEN-consistent snapshot: if the content generation or active screen
-    // moved during the chunked copy (per-chunk `torn`) or differs now, the index may be torn
-    // (fine for this one query's snapshot semantics, but it must never be re-served as "the
-    // content at key_seq"). The decision is [`snapshot_cacheable`] (pure, unit-tested).
-    let consistent = {
-        let t = term_lock(term);
-        snapshot_cacheable(
-            torn,
-            key_alt,
-            t.is_alternate_screen(),
-            key_seq,
-            t.content_seq(),
-            absolute_row_revision,
-            t.absolute_row_revision(),
-        )
-    };
-    if consistent {
-        store_search_snapshot(SearchSnapshot {
-            term: Arc::downgrade(term),
-            alt_screen: key_alt,
-            content_seq: key_seq,
-            history_renumber_epoch: key_epoch,
-            absolute_row_revision,
-            max_lines,
-            retained_base,
-            visible_base,
-            indexed_end,
-            index: Arc::clone(&index),
-        });
-    }
-    results.map(|(results, point_match)| FullHistorySearch {
+/// A batch search's result as the GUI and the `search` verb read it: the
+/// planned key's stamps and the finish's verdict beside the answer.
+fn full_history_search(
+    searched: Searched<Result<(SearchResults, Option<SearchMatch>), SearchOptionsError>>,
+) -> Result<FullHistorySearch, SearchOptionsError> {
+    let (results, point_match) = searched.answer?;
+    let window = searched.key.window();
+    Ok(FullHistorySearch {
         results,
         point_match,
-        base_y,
-        absolute_row_revision,
-        history_renumber_epoch: key_epoch,
-        content_seq: key_seq,
-        cols: wrap.cols,
-        consistent,
-        searched_lines,
+        base_y: i64::try_from(window.visible_base).unwrap_or(i64::MAX),
+        absolute_row_revision: searched.key.row_revision,
+        history_renumber_epoch: searched.key.renumber_epoch,
+        content_seq: searched.key.content_seq,
+        cols: searched.wrap.cols(),
+        consistent: searched.verdict.consistent,
+        frame_stable: searched.verdict.frame_stable,
+        searched_lines: window.searched_lines(),
     })
 }
 
-/// One exact point-relative match from the immutable full-history cache.
-/// Literal navigation is lazy and independent of [`aterm_search::MAX_SEARCH_MATCHES`].
+/// What every find and `search` asks of a terminal's index slot: soft-wrap runs
+/// joined into the lines the reader sees ([`SearchLayout::Logical`]), the newest
+/// `depth_cap` lines, and the find anchor carried into the plan's soft-wrap
+/// frame. The anchor is no part of the slot's key, so a find and a `search` at
+/// the same depth share one index.
+fn search_request(depth_cap: usize, anchor: Option<(usize, usize)>) -> SearchRequest {
+    SearchRequest {
+        depth_cap,
+        layout: SearchLayout::Logical,
+        anchor,
+    }
+}
+
+/// One search's answer, with the key it was planned under, the soft-wrap frame
+/// its hits were re-expressed through, and how it stands against the terminal.
+struct Searched<T> {
+    answer: T,
+    key: SearchKey,
+    wrap: WrapFrame,
+    verdict: SearchVerdict,
+}
+
+/// Run one search through `term`'s index slot (aterm-core search_index.rs): the
+/// plan in one hold, a build's rows copied [`SNAPSHOT_CHUNK_LINES`] per hold,
+/// the index built and `answer` run with no lock held, and the endpoint check
+/// in one final hold. `answer` is told whether the slot served the index (a
+/// hit). Whatever the holds took out of the slot is freed with no lock held:
+/// the plan's by the build, the finish's after its hold. The terminal is then
+/// the most recently searched one in the residency ledger ([`keep_resident`]).
+fn search_terminal<T>(
+    term: &Arc<Mutex<Terminal>>,
+    request: &SearchRequest,
+    answer: impl FnOnce(&mut BuiltSearch, bool) -> T,
+) -> Searched<T> {
+    let mut plan = term_lock(term).search_plan(request);
+    let hit = plan.is_hit();
+    while plan.rows_to_read() > 0 {
+        term_lock(term).read_search_chunk(&mut plan, SNAPSHOT_CHUNK_LINES);
+    }
+    let mut built = plan.build();
+    let answer = answer(&mut built, hit);
+    let (key, wrap) = (*built.key(), built.wrap());
+    let (verdict, discard) = term_lock(term).finish_search(built);
+    drop(discard);
+    keep_resident(term);
+    Searched {
+        answer,
+        key,
+        wrap,
+        verdict,
+    }
+}
+
+/// One exact point-relative match from the full-history index.
+/// Literal navigation over the index the slot serves is lazy and independent of
+/// [`aterm_search::MAX_SEARCH_MATCHES`].
 pub(crate) struct FullHistoryPoint {
     pub(crate) point_match: Option<SearchMatch>,
     pub(crate) base_y: i64,
@@ -3878,102 +1583,53 @@ pub(crate) fn search_full_history_point(
     anchor: (usize, usize),
     strict: bool,
 ) -> Result<FullHistoryPoint, SearchOptionsError> {
-    let (key_alt, key_seq, key_epoch, oldest, scrollback, visible_rows, absolute_row_revision) = {
-        let terminal = term_lock(term);
-        (
-            terminal.is_alternate_screen(),
-            terminal.content_seq(),
-            terminal.grid().history_renumber_epoch(),
-            terminal.grid().oldest_absolute_row(),
-            terminal.grid().scrollback_lines(),
-            terminal.rows() as usize,
-            terminal.absolute_row_revision(),
-        )
-    };
-    let base_y =
-        i64::try_from(oldest.saturating_add(u64::try_from(scrollback).unwrap_or(u64::MAX)))
-            .unwrap_or(i64::MAX);
-    let max_lines = search_max_lines().max(max_cached_for_retained(visible_rows));
-    let retained_oldest = oldest.saturating_add(
-        u64::try_from((scrollback + visible_rows).saturating_sub(max_lines)).unwrap_or(0),
-    );
-    // Same frame as the batch path: the index holds soft-wrapped runs joined, so
-    // this walk hands the anchor over in the joined line's columns and hands the
-    // hit back in the grid's.
-    let (wrap, ambiguous) = {
-        let terminal = term_lock(term);
-        let cols = usize::from(terminal.grid().cols());
-        let wrap = WrapFrame {
-            cols,
-            logical_anchor: logical_origin(
-                &terminal,
-                u64::try_from(anchor.0).unwrap_or(u64::MAX),
-                retained_oldest,
-            )
-            .map(|origin| {
-                let origin = usize::try_from(origin).unwrap_or(anchor.0);
-                WrapFrame::to_logical(cols, origin, anchor.0, anchor.1)
-            }),
+    // The batch path's request: the index holds soft-wrapped runs joined, so the
+    // walk hands the anchor over in the joined line's columns and hands the hit
+    // back in the grid's. An index the search had to build answers as the batch
+    // path does, and so does a walk that found nothing but could not finish some
+    // line: "no match" is not established, and the batch path's answer to that
+    // is its own (`select_point_match` keeps the batch), never a refusal.
+    let request = search_request(search_max_lines(), Some(anchor));
+    full_history_point(search_terminal(term, &request, |built, hit| {
+        let batch = |built: &mut BuiltSearch| {
+            built
+                .query(query, case_sensitive, is_regex, direction, strict)
+                .map(|(_, point_match)| point_match)
         };
-        (wrap, terminal.ambiguous_width())
-    };
-    let cached_index = cached_search_index(
-        term,
-        key_alt,
-        key_seq,
-        key_epoch,
-        absolute_row_revision,
-        max_lines,
-        ambiguous,
-    );
-    let Some(index) = cached_index else {
-        let full = search_full_history_direction(
-            term,
-            query,
-            case_sensitive,
-            is_regex,
-            direction,
-            Some(anchor),
-            strict,
-        )?;
-        return Ok(FullHistoryPoint {
-            point_match: full.point_match,
-            base_y: full.base_y,
-            absolute_row_revision: full.absolute_row_revision,
-            history_renumber_epoch: full.history_renumber_epoch,
-            content_seq: full.content_seq,
-            cols: full.cols,
-            consistent: full.consistent,
-        });
-    };
-
-    let point_match = index
-        .find_direction_opts(
+        if !hit {
+            return batch(built);
+        }
+        let wrap = built.wrap();
+        match built.index().find_direction_opts(
             query,
             case_sensitive,
             is_regex,
             aterm_search::DirectedFind {
-                anchor: wrap.logical_anchor.unwrap_or(anchor),
+                anchor: wrap.logical_anchor().unwrap_or(anchor),
                 direction,
                 inclusive: !strict,
                 wrap: true,
             },
-        )?
-        .map(|found| wrap.to_physical(&found));
-    let consistent = {
-        let terminal = term_lock(term);
-        terminal.is_alternate_screen() == key_alt
-            && terminal.content_seq() == key_seq
-            && terminal.absolute_row_revision() == absolute_row_revision
-    };
+        ) {
+            Err(SearchOptionsError::ScanCutShort) => batch(built),
+            found => found.map(|found| found.map(|found| wrap.to_physical(&found))),
+        }
+    }))
+}
+
+/// A point search's result: the planned key's stamps and the finish's verdict
+/// beside the match.
+fn full_history_point(
+    searched: Searched<Result<Option<SearchMatch>, SearchOptionsError>>,
+) -> Result<FullHistoryPoint, SearchOptionsError> {
     Ok(FullHistoryPoint {
-        point_match,
-        base_y,
-        absolute_row_revision,
-        history_renumber_epoch: key_epoch,
-        content_seq: key_seq,
-        cols: wrap.cols,
-        consistent,
+        point_match: searched.answer?,
+        base_y: i64::try_from(searched.key.window().visible_base).unwrap_or(i64::MAX),
+        absolute_row_revision: searched.key.row_revision,
+        history_renumber_epoch: searched.key.renumber_epoch,
+        content_seq: searched.key.content_seq,
+        cols: searched.wrap.cols(),
+        consistent: searched.verdict.consistent,
     })
 }
 
@@ -3989,8 +1645,9 @@ pub(crate) fn search_full_history_point(
 static SEARCH_MAX_LINES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_CACHED_LINES);
 
 /// Set the search index depth cap from config (`search_history_lines`). A change
-/// invalidates the cached index (the cap is part of its key), so the next search
-/// rebuilds at the new depth. Clamped to at least 1 line.
+/// misses every terminal's kept index (the cap is part of its key,
+/// [`SearchKey::max_lines`]), so the next search rebuilds at the new depth.
+/// Clamped to at least 1 line.
 pub(crate) fn set_search_max_lines(max: usize) {
     SEARCH_MAX_LINES.store(max.max(1), Ordering::Relaxed);
 }
@@ -4000,225 +1657,84 @@ fn search_max_lines() -> usize {
     SEARCH_MAX_LINES.load(Ordering::Relaxed)
 }
 
-/// Test-only serialization of searches that share the process-global bounded index
-/// cache (`SEARCH_SNAPSHOTS`, [`SEARCH_SNAPSHOT_CAPACITY`] entries): a test that
-/// asserts an index was REUSED, or that counts the lines a cold build copied, can be
-/// defeated by another thread's searches evicting or rebuilding entries. The depth cap
-/// needs no lock: tests pass theirs to the `_capped` entry points. Poison-tolerant: a panicked holder leaves only cache entries, which the key check
-/// rejects when stale.
-#[cfg(test)]
-pub(crate) fn search_cap_test_guard() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Grid rows copied per Terminal-lock hold while snapshotting for the search
-/// index (see [`cmd_search`]): bounds each hold so the PTY reader and the
-/// render path interleave with a full-scrollback snapshot instead of stalling
+/// Grid rows copied per Terminal-lock hold while a search builds its index
+/// ([`Terminal::read_search_chunk`]): bounds each hold so the PTY reader and the
+/// render path interleave with a full-scrollback copy instead of stalling
 /// behind it.
 const SNAPSHOT_CHUNK_LINES: usize = 1024;
 
-#[cfg(test)]
-thread_local! {
-    static LAST_SEARCH_SNAPSHOT_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// Most terminals that keep a search index at once. Eight covers normal split
+/// and tab use; past it the least recently searched terminal gives its index
+/// back, and its next search builds again.
+const SEARCH_RESIDENT_CAP: usize = 8;
+
+/// Which terminals keep their search index. A terminal's slot keeps the index
+/// its last search built until the terminal dies or the slot is released, so
+/// the process bounds how many slots stay full: past `cap`, the least recently
+/// searched terminal's index is released. The ledger keeps no key and no index,
+/// only the order terminals were searched in, each as a `Weak` identity (which
+/// pins the allocation, so a dead terminal's address is never taken for a live
+/// one's).
+struct SearchResidency {
+    cap: usize,
+    ring: Mutex<VecDeque<Weak<Mutex<Terminal>>>>,
 }
 
-#[cfg(test)]
-fn record_search_snapshot_lines(lines: usize) {
-    LAST_SEARCH_SNAPSHOT_LINES.with(|count| count.set(lines));
-}
+impl SearchResidency {
+    const fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            ring: Mutex::new(VecDeque::new()),
+        }
+    }
 
-#[cfg(not(test))]
-fn record_search_snapshot_lines(_lines: usize) {}
-
-#[cfg(test)]
-fn take_last_search_snapshot_lines() -> usize {
-    LAST_SEARCH_SNAPSHOT_LINES.with(|count| {
-        let value = count.get();
-        count.set(0);
-        value
-    })
-}
-
-/// One entry in the bounded per-terminal search-index cache.
-///
-/// `term` is a `Weak` used ONLY as an identity key: it pins the Arc control
-/// block so a dead terminal's address cannot be recycled into a false pointer
-/// match, and `Weak::as_ptr` never dereferences.
-struct SearchSnapshot {
-    term: Weak<Mutex<Terminal>>,
-    alt_screen: bool,
-    content_seq: u64,
-    /// `Grid::history_renumber_epoch()` at build time. The index is keyed by
-    /// ABSOLUTE row, and this epoch is the grid's only signal for the mutations
-    /// that slide every retained row's absolute key wholesale without touching
-    /// `content_seq` arithmetic, `base_y()` or the splice revision — a Kitty
-    /// `CSI +T` unscroll and a width rewrap of history. (A rows-only resize that
-    /// adds or trims rows at the BOTTOM slid them too until 2026-10-01; it now
-    /// moves the counter with those rows and every key stays.) Part of
-    /// BOTH the hit key and the reuse guard: serving or refreshing across an
-    /// advance carries pre-shift keys forward, which is how the top band of the
-    /// screen fell out of the search corpus while sitting in plain sight.
-    history_renumber_epoch: u64,
-    absolute_row_revision: u64,
-    /// Depth cap the `index` was built under (see [`set_search_max_lines`]); part
-    /// of the cache key so a config reload that changes it forces a rebuild.
-    max_lines: usize,
-    /// Oldest absolute row this snapshot's index retains. Retention only ever
-    /// ADVANCES it (rows leave the buffer, survivors keep their keys), so a
-    /// retreat is proof of a renumbering the epoch above did not report —
-    /// belt to that brace, and the guard that keeps an unsignalled slide from
-    /// ever being carried forward again.
-    retained_base: usize,
-    /// Absolute row at the top of the visible grid in this generation. A stale
-    /// index refresh begins here because any of these rows could have been
-    /// edited in place before later scrolling into immutable history.
-    visible_base: usize,
-    /// Exclusive absolute row already indexed in this snapshot.
-    indexed_end: usize,
-    index: Arc<TerminalSearch>,
-}
-
-/// Keep the frontmost working set hot without allowing unbounded terminal
-/// lifetime retention. Eight immutable indexes covers normal split/tab use;
-/// weak terminal identities let dead sessions be pruned eagerly.
-const SEARCH_SNAPSHOT_CAPACITY: usize = 8;
-static SEARCH_SNAPSHOTS: Mutex<VecDeque<SearchSnapshot>> = Mutex::new(VecDeque::new());
-
-/// Deterministically force a mutation between a cache-hit query and its
-/// endpoint validation. Targeted by terminal identity so unrelated parallel
-/// search tests cannot consume the hook.
-#[cfg(test)]
-static SEARCH_CACHE_HIT_MUTATION: Mutex<Option<Weak<Mutex<Terminal>>>> = Mutex::new(None);
-
-#[cfg(test)]
-fn arm_search_cache_hit_mutation(term: &Arc<Mutex<Terminal>>) {
-    *SEARCH_CACHE_HIT_MUTATION
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(term));
-}
-
-#[cfg(test)]
-fn maybe_mutate_search_cache_hit(term: &Arc<Mutex<Terminal>>) {
-    let target = {
-        let mut hook = SEARCH_CACHE_HIT_MUTATION
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if hook
-            .as_ref()
-            .is_some_and(|target| Weak::as_ptr(target) == Arc::as_ptr(term))
-        {
-            hook.take()
+    /// Make `term` the most recently searched terminal, and hand back the live
+    /// terminal that fell past the cap, if any. Dead terminals leave first and
+    /// never count against the cap; their slots died with them.
+    fn touch(&self, term: &Arc<Mutex<Terminal>>) -> Option<Arc<Mutex<Terminal>>> {
+        // A panicked holder leaves a whole ring; at worst it names a terminal
+        // whose index is already gone.
+        let mut ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
+        ring.retain(|held| {
+            held.strong_count() != 0 && !std::ptr::eq(held.as_ptr(), Arc::as_ptr(term))
+        });
+        ring.push_back(Arc::downgrade(term));
+        if ring.len() > self.cap {
+            ring.pop_front().and_then(|evicted| evicted.upgrade())
         } else {
             None
         }
-    };
-    if let Some(target) = target.and_then(|target| target.upgrade()) {
-        term_lock(&target).process(b"cache-race");
+    }
+
+    /// [`Self::touch`], then release the index of the terminal that fell past
+    /// the cap. The ring's lock is dropped first: it is a leaf, never held
+    /// across a terminal lock. The index is taken in the evicted terminal's
+    /// hold and freed after it.
+    fn keep(&self, term: &Arc<Mutex<Terminal>>) {
+        if let Some(evicted) = self.touch(term) {
+            let released = term_lock(&evicted).take_search_index();
+            drop(released);
+        }
     }
 }
 
-fn search_cache_lock() -> MutexGuard<'static, VecDeque<SearchSnapshot>> {
-    // A panicked holder leaves valid (if possibly stale) data; stale is safe —
-    // the key check rejects it and the next miss overwrites the entry.
-    SEARCH_SNAPSHOTS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+/// Keep `term`'s index resident as the most recently searched, in the
+/// process's one ledger.
+#[cfg(not(test))]
+fn keep_resident(term: &Arc<Mutex<Terminal>>) {
+    static SEARCH_RESIDENCY: SearchResidency = SearchResidency::new(SEARCH_RESIDENT_CAP);
+    SEARCH_RESIDENCY.keep(term);
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the cache key, field by field, as the snapshot stores it"
-)]
-fn cached_search_index(
-    term: &Arc<Mutex<Terminal>>,
-    alt_screen: bool,
-    content_seq: u64,
-    history_renumber_epoch: u64,
-    absolute_row_revision: u64,
-    max_lines: usize,
-    ambiguous_width: AmbiguousWidth,
-) -> Option<Arc<TerminalSearch>> {
-    let mut cache = search_cache_lock();
-    cache.retain(|snapshot| snapshot.term.strong_count() != 0);
-    let position = cache.iter().position(|snapshot| {
-        std::ptr::eq(snapshot.term.as_ptr(), Arc::as_ptr(term))
-            && snapshot.alt_screen == alt_screen
-            && snapshot.content_seq == content_seq
-            // A renumbering can leave the content generation matching (the
-            // unscroll removes history without rewriting a visible cell), and an
-            // index keyed by absolute row is exactly what such a slide breaks.
-            && snapshot.history_renumber_epoch == history_renumber_epoch
-            && snapshot.absolute_row_revision == absolute_row_revision
-            && snapshot.max_lines == max_lines
-            // A live `ambiguous_width` switch moves no content generation, and
-            // every column (and every joined run's padding) is measured under it.
-            && snapshot.index.ambiguous_width() == ambiguous_width
-    })?;
-    let snapshot = cache.remove(position)?;
-    let index = Arc::clone(&snapshot.index);
-    cache.push_back(snapshot);
-    Some(index)
-}
-
-/// Take ownership of a stale same-terminal index for an incremental ordinary
-/// output refresh. Revision changes (reflow/protected row splices), history
-/// RENUMBERINGS, shrinking coordinate ranges, or concurrent readers
-/// conservatively fall back to a bounded suffix rebuild.
-///
-/// The guards are the GUI twin of `Terminal::try_refresh_search_index`'s, and
-/// for the same reason: a refresh may only be served when it is
-/// indistinguishable from a from-scratch build over the current window. The
-/// index is keyed by ABSOLUTE row and the refresh re-feeds only from the
-/// previous visible base, so every row below that boundary keeps the key it was
-/// filed under — which is sound exactly while those keys still name the same
-/// content. Two guards establish that: `history_renumber_epoch` (the grid's own
-/// report that it slid the absolute space) and a `retained_base` that only ever
-/// ADVANCES (retention drops the oldest rows and leaves every survivor's key
-/// alone, so a retreat can only be a slide nothing reported).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the reuse guards, field by field, as the snapshot stores them"
-)]
-fn take_reusable_search_index(
-    term: &Arc<Mutex<Terminal>>,
-    alt_screen: bool,
-    history_renumber_epoch: u64,
-    absolute_row_revision: u64,
-    max_lines: usize,
-    retained_base: usize,
-    indexed_end: usize,
-    ambiguous_width: AmbiguousWidth,
-) -> Option<(TerminalSearch, usize)> {
-    let mut cache = search_cache_lock();
-    let position = cache.iter().position(|snapshot| {
-        std::ptr::eq(snapshot.term.as_ptr(), Arc::as_ptr(term))
-            && snapshot.alt_screen == alt_screen
-            && snapshot.history_renumber_epoch == history_renumber_epoch
-            && snapshot.absolute_row_revision == absolute_row_revision
-            && snapshot.max_lines == max_lines
-            && snapshot.retained_base <= retained_base
-            && snapshot.indexed_end <= indexed_end
-            && snapshot.index.ambiguous_width() == ambiguous_width
-            && Arc::strong_count(&snapshot.index) == 1
-    })?;
-    let snapshot = cache.remove(position)?;
-    let previous_visible_base = snapshot.visible_base;
-    Arc::try_unwrap(snapshot.index)
-        .ok()
-        .map(|index| (index, previous_visible_base))
-}
-
-fn store_search_snapshot(snapshot: SearchSnapshot) {
-    let mut cache = search_cache_lock();
-    cache.retain(|existing| {
-        existing.term.strong_count() != 0
-            && !std::ptr::eq(existing.term.as_ptr(), snapshot.term.as_ptr())
-    });
-    if cache.len() >= SEARCH_SNAPSHOT_CAPACITY {
-        cache.pop_front();
+/// Keep `term`'s index resident as the most recently searched. Under test each
+/// thread keeps its own ledger, so whether a test's index is still resident
+/// never depends on how many terminals other tests searched meanwhile.
+#[cfg(test)]
+fn keep_resident(term: &Arc<Mutex<Terminal>>) {
+    thread_local! {
+        static SEARCH_RESIDENCY: SearchResidency = const { SearchResidency::new(SEARCH_RESIDENT_CAP) };
     }
-    cache.push_back(snapshot);
+    SEARCH_RESIDENCY.with(|ledger| ledger.keep(term));
 }
 
 /// `custody` -> ONE status line answering "why did my selection disappear?".
@@ -4654,14 +2170,8 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
 /// is the [`ScreenGen`] of the same instant — the value a fenced press names
 /// (`key if-gen=`), so a supervisor binds its press to the very read it judged
 /// rather than to a `status` read taken after it.
-/// The bare form of [`cmd_text_json_opt`] — test-only, like [`cmd_text`], since the
-/// dispatch passes its tail through [`cmd_text_json_read`].
-#[cfg(test)]
-pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
-    cmd_text_json_opt(term, TextArgs::default())
-}
-
-/// `text --json [trim] [tail=<n>|rows=<a>-<b>]`: [`cmd_text_json`], and with `trim`
+///
+/// `text --json [trim] [tail=<n>|rows=<a>-<b>]`: that object, and with `trim`
 /// the `rows` array stops after the last non-blank row ([`trimmed_len`]) and the
 /// object closes with `"trimmed":k` — the JSON twin of the text header's
 /// `trimmed=<k>`. A shape ([`TextShape::select`]) picks which grid rows fill the
@@ -4680,7 +2190,7 @@ pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
 /// (`"launch":null`).
 #[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
-    cmd_text_json_read(term, args, None, None, 0, None)
+    cmd_text_json_read(term, &FrameSlot::default(), args, None, None, 0, None)
 }
 
 /// [`cmd_text_json_opt`] as the dispatch answers it: `human_ms` (2026-09-25)
@@ -4710,6 +2220,7 @@ pub(crate) fn cmd_text_json_looked(
     let human_seq = ctx.human_input.seq();
     cmd_text_json_read(
         term,
+        &ctx.frame,
         args,
         ctx.human_input.ms_since(now_us),
         ctx.human_input.unkeyed_ms(now_us),
@@ -4725,6 +2236,7 @@ pub(crate) fn cmd_text_json_looked(
 /// says since when.
 pub(crate) fn cmd_text_json_read(
     term: &Arc<Mutex<Terminal>>,
+    frame: &FrameSlot,
     args: TextArgs,
     human_ms: Option<u64>,
     unkeyed_ms: Option<u64>,
@@ -4736,18 +2248,26 @@ pub(crate) fn cmd_text_json_read(
     // reply still describes one instant; the escaping and JSON assembly are pure
     // string work over owned data, and doing them under the mutex made the PTY
     // reader's `process()` and the frame snapshot queue behind a screen read.
-    let (rows_text, maps, c, vis, style, rows, cols, seq, generation, first, launch) = {
+    // Logical rows are the session's published text (built only when the screen
+    // changed since the last build); `order=display` reads its own rows and maps.
+    let mut look = frame.look_frame();
+    let (text, display_rows, maps, c, vis, style, rows, cols, seq, generation, first, end, launch) = {
         let t = term_lock(term);
         let rows = t.rows() as usize;
         let (first, end) = match args.shape.select(rows) {
             Ok(span) => span,
             Err(err) => return err,
         };
-        let (rows_text, maps): (Vec<String>, Vec<Option<Vec<usize>>>) = (first..end)
-            .map(|r| row_in_order(&t, r, args.display))
-            .unzip();
+        let (text, (display_rows, maps)) = if args.display {
+            let rows: (Vec<String>, Vec<Option<Vec<usize>>>) =
+                (first..end).map(|r| row_in_order(&t, r, true)).unzip();
+            (None, rows)
+        } else {
+            (Some(look.text(&t)), (Vec::new(), Vec::new()))
+        };
         (
-            rows_text,
+            text,
+            display_rows,
             maps,
             t.cursor(),
             t.cursor_visible(),
@@ -4757,9 +2277,14 @@ pub(crate) fn cmd_text_json_read(
             t.content_seq(),
             screen_gen(&t),
             first,
+            end,
             // The launch lock is a leaf, taken after the terminal's.
             launch.map_or_else(|| "null".to_string(), |w| w.json(human_seq)),
         )
+    };
+    let rows_text: Vec<&str> = match &text {
+        Some(text) => (first..end).map(|r| text.row(r)).collect(),
+        None => display_rows.iter().map(String::as_str).collect(),
     };
     // ONE buffer, written straight through. The retired shape allocated a quoting
     // `format!` + a `json_escape` per row, then copied the WHOLE payload three more
@@ -4768,7 +2293,7 @@ pub(crate) fn cmd_text_json_read(
     // `json_ok` is exactly this `"OK 1\n"` prefix + `"\n"` suffix.
     let selected = rows_text.len();
     let sent = if args.trim {
-        trimmed_len(rows_text.iter().map(String::as_str))
+        trimmed_len(rows_text.iter().copied())
     } else {
         selected
     };
@@ -4995,7 +2520,7 @@ fn write_styled_cell_json(
 
 /// The wire name of a DEC [`LineSize`](aterm_core::grid::LineSize): the renderer
 /// scales these rows, so a lossless frame must carry them (audit finding F2).
-fn line_size_name(s: aterm_core::grid::LineSize) -> &'static str {
+pub(crate) fn line_size_name(s: aterm_core::grid::LineSize) -> &'static str {
     use aterm_core::grid::LineSize;
     match s {
         LineSize::SingleWidth => "single",
@@ -5006,20 +2531,22 @@ fn line_size_name(s: aterm_core::grid::LineSize) -> &'static str {
     }
 }
 
-/// The DEC line size of visible row `r` (default single-width).
-fn row_line_size(t: &Terminal, r: usize) -> aterm_core::grid::LineSize {
+/// The DEC line size of live screen row `r` (default single-width), whatever
+/// the viewport shows: the row the styled frame's cells are read from.
+pub(crate) fn row_line_size(t: &Terminal, r: usize) -> aterm_core::grid::LineSize {
     u16::try_from(r)
         .ok()
-        .and_then(|rr| t.grid().row(rr))
+        .and_then(|rr| t.grid().row_at_screen(rr))
         .map_or(aterm_core::grid::LineSize::SingleWidth, |row| {
             row.line_size()
         })
 }
 
-/// Every DISTINCT inline image on the visible grid, each at its top-left grid
-/// anchor `(row, col)` (deduplicated by payload identity). Shared shape with
-/// `cmd_image_read`'s screen mode; consumed by the styled frame (audit finding F1)
-/// so a `subscribe cells` / `screen` watcher sees images, not blank cells.
+/// Every DISTINCT inline image on the live screen, each at its top-left grid
+/// anchor `(row, col)` (deduplicated by payload identity), whatever the
+/// viewport shows. Shared shape with `cmd_image_read`'s screen mode; consumed
+/// by the styled frame (audit finding F1) so a `subscribe cells` / `screen`
+/// watcher sees images, not blank cells, on the rows its cells describe.
 ///
 /// ROW-MAJOR, ascending column within a row: a socket client indexes into this
 /// array, so the order is part of the wire contract
@@ -5027,7 +2554,7 @@ fn row_line_size(t: &Terminal, r: usize) -> aterm_core::grid::LineSize {
 /// NOT free to follow the extras map, whose `FxHashMap` iteration order is
 /// arbitrary and is not insertion order either.
 ///
-/// [`images_frame`](Terminal::images_frame) is the batch reader: ONE pass over
+/// [`live_images_frame`](Terminal::live_images_frame) is the batch reader: ONE pass over
 /// the extras map, each row sorted by column, instead of the `rows x cols`
 /// `cell_extra` probes the per-row accessor costs. Its emptiness gate only
 /// rescues a screen with NO extras at all, so before this every gather of a
@@ -5044,7 +2571,11 @@ fn distinct_images(t: &Terminal) -> Vec<(usize, usize, std::sync::Arc<ImageData>
     // `ImageRef` per covered cell) — the very case the dedup exists for.
     let mut seen: std::collections::HashSet<*const ImageData> = std::collections::HashSet::new();
     let mut out: Vec<(usize, usize, std::sync::Arc<ImageData>)> = Vec::new();
-    for (r, row) in t.images_frame(t.rows() as usize).into_iter().enumerate() {
+    for (r, row) in t
+        .live_images_frame(t.rows() as usize)
+        .into_iter()
+        .enumerate()
+    {
         for (col, iref) in row {
             if !seen.insert(std::sync::Arc::as_ptr(&iref.image)) {
                 continue;
@@ -5057,29 +2588,35 @@ fn distinct_images(t: &Terminal) -> Vec<(usize, usize, std::sync::Arc<ImageData>
     out
 }
 
-/// One inline image as a JSON object for the styled frame: anchor grid position,
-/// cell footprint, format, raw byte length, and the base64 payload — so a watcher
-/// reconstructs the picture the human sees, independent of the GUI framebuffer.
-pub(crate) fn styled_image_json(anchor_r: usize, anchor_c: usize, img: &ImageData) -> String {
-    styled_image_entry(anchor_r, anchor_c, img, image_payload(img)) // F4: oversized -> ("truncated", "")
-}
-
-/// [`styled_image_json`] with its `(format, base64)` given: `("truncated", "")`
-/// leaves the payload out and keeps the real `nbytes`.
-fn styled_image_entry(
+/// Append one inline image as a JSON object for the styled frame: anchor grid
+/// position, cell footprint, format, raw byte length, and the base64 payload —
+/// so a watcher reconstructs the picture the human sees, independent of the GUI
+/// framebuffer. `payload` is the image's ([`image_payloads`]; F4: an oversized
+/// image is `truncated` with an empty payload), and its base64 is pushed
+/// straight into `out`, never formatted through a temporary.
+pub(crate) fn styled_image_json(
+    out: &mut String,
     anchor_r: usize,
     anchor_c: usize,
     img: &ImageData,
-    (fmt, b64): (&str, String),
-) -> String {
-    format!(
-        "{{\"row\":{anchor_r},\"col\":{anchor_c},\"cols\":{},\"rows\":{},\"format\":\"{fmt}\",\
-         \"nbytes\":{},\"b64\":\"{b64}\"}}",
+    payload: &ImagePayload,
+) {
+    use std::fmt::Write as _;
+    let _ = write!(
+        out,
+        "{{\"row\":{anchor_r},\"col\":{anchor_c},\"cols\":{},\"rows\":{},\"format\":\"{}\",\
+         \"nbytes\":{},\"b64\":\"",
         img.cols,
         img.rows,
+        payload.format(),
         img.bytes.len(),
-    )
+    );
+    out.push_str(payload.b64());
+    out.push_str("\"}");
 }
+
+/// Bytes a styled image object takes besides its base64.
+const STYLED_IMAGE_BYTES: usize = 128;
 
 /// Sentinel [`StyledCellSnap::link`] for a cell with no OSC 8 link. `u32::MAX`
 /// is never a valid index into a table bounded by the grid's extras population,
@@ -5224,6 +2761,12 @@ pub(crate) struct StyledFrameSnapshot {
 }
 
 impl StyledFrameSnapshot {
+    /// Whether the frame serializes an image payload: it holds an image and
+    /// [`Self::image_payloads`] stands.
+    pub(crate) fn carries_image_payloads(&self) -> bool {
+        self.image_payloads && !self.images.is_empty()
+    }
+
     /// Cells in the gathered frame — `rows × cols` by the lossless no-trim
     /// contract. The serializer's reserve input.
     pub(crate) fn cell_count(&self) -> usize {
@@ -5304,7 +2847,7 @@ pub(crate) struct FrameLinks {
 ///
 /// EXACTNESS. `CellExtras::iter()` yields EXTERNAL coordinates with stale
 /// (scrolled-off) entries already filtered — the same view `get` resolves to,
-/// and the shape `Terminal::images_frame` already ships for image placements.
+/// and the shape `Terminal::live_images_frame` already ships for image placements.
 /// Entries are bounds-checked against BOTH the caller's `rows`/`cols` and the
 /// grid's own extent (they can differ mid-resize), exactly as the retired
 /// `0..rows` / `0..cols` loops dropped them, and each row is sorted afterwards
@@ -5364,12 +2907,17 @@ pub(crate) fn gather_frame_links(t: &Terminal, rows: usize, cols: usize) -> Fram
 }
 
 /// Gather the styled frame's raw material. Called with the `Terminal` lock HELD
-/// (one acquisition covers every field). The blank-tail fallback mirrors
+/// (one acquisition covers every field). Every field is read off the LIVE
+/// screen, whatever the viewport shows: cells, glyphs, wide leads and links
+/// (per row, below), line sizes ([`row_line_size`]) and images
+/// ([`distinct_images`]). The blank-tail fallback mirrors
 /// [`cmd_cell`] exactly: rows are padded to the FULL grid width with the
 /// terminal's effective implicit blank (live defaults with DECSCNM folded in;
 /// NO `trim_end`, unlike `text`) — the lossless `dims.rows × dims.cols`
 /// contract.
 pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
+    #[cfg(test)]
+    crate::work_counts::styled_frame_gathered();
     let rows = t.rows() as usize;
     let cols = t.cols() as usize;
     let blank = t.implicit_blank_render_cell();
@@ -5386,18 +2934,16 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
     let mut rendered: Vec<RenderCell> = Vec::with_capacity(cols);
     for r in 0..rows {
         // LIVE frame (offset-INDEPENDENT): colours+attrs from
-        // `render_row_at_screen_into`, glyph from the live `cell_grapheme`,
-        // wide-lead from the live raw grid flag (`RenderCell::wide` means the
-        // RIGHT-HALF continuation), and the links from the offset-blind extras
-        // map (what `hyperlink_at`/`hyperlink_id_at` read) — so all four reads
-        // share one live frame and never stitch a scrolled-back row's colours
-        // onto a live glyph.
+        // `render_row_at_screen_into`, glyph and wide-lead from the live row
+        // (`RenderCell::wide` means the RIGHT-HALF continuation), and the links
+        // from the offset-blind extras map (what `hyperlink_at`/`hyperlink_id_at`
+        // read) — so all four reads share one live frame and never stitch a
+        // scrolled-back row's colours onto a live glyph.
         t.render_row_at_screen_into(r, &mut rendered);
         // ONE live-row handle for the whole row. `screen_row_view` is the
-        // offset-INDEPENDENT twin of `visible_row_view` (and resolves through the
-        // same `row_at_screen` the retired per-column `cell_attrs` call did), so the
-        // live-frame contract above is unchanged — it is just resolved once per row
-        // instead of once per column.
+        // offset-INDEPENDENT twin of `visible_row_view`, resolved through the same
+        // `row_at_screen` as `cell_grapheme`, so the glyph and wide-lead reads below
+        // resolve the row once per row instead of once per column.
         let view = t.grid().screen_row_view(r as u16);
         let mut row_cells: Vec<StyledCellSnap> = Vec::with_capacity(cols);
         // ONE grapheme buffer for the whole row; each cell keeps its byte range
@@ -5412,6 +2958,8 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
         // touches nothing.
         let row_links: &[(u16, u32)] = links_by_row.get(r).map_or(&[][..], Vec::as_slice);
         let mut li = 0usize;
+        // Whether the cell left of this column is a WIDE lead (false at col 0).
+        let mut prev_wide = false;
         for c in 0..cols {
             let rc = rendered.get(c).copied();
             let col = c as u16;
@@ -5422,24 +2970,33 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
                 Some(&(lc, idx)) if lc == col => idx,
                 _ => NO_LINK,
             };
-            // Byte-for-byte the retired `cell_grapheme(r, c).unwrap_or_default()`
-            // — the same `push_cell_text` produces both — with the per-cell
-            // `String` replaced by a range into the row buffer. An out-of-range
-            // cell appends nothing, which is that call's `unwrap_or_default()`
-            // empty string; in-range is all this loop can reach anyway (`rows`
-            // and `cols` are the grid's own).
+            // ONE read of the live cell per column. Its raw WIDE bit is the wide
+            // lead and its raw BLINK bit `cell`'s `blink`, off the cell's own
+            // inline flags; a missing cell is `false` for both. The cell is a
+            // continuation when bit 10 is set on a cell that is not WIDE
+            // and its left neighbour is a WIDE lead: `Row::is_cell_wide_continuation`'s
+            // rule, which keeps a DECSCA-protected cell (PROTECTED shares bit 10) as
+            // text. Otherwise its text comes off the same held row
+            // (`VisibleRowView::push_cell_text`). Byte-for-byte
+            // `cell_grapheme(r, c).unwrap_or_default()`, as a range into the row
+            // buffer: a continuation or a missing cell appends nothing, a blank a
+            // space. `styled_frame_fusion_parity` holds it to that reference.
+            let cell = view.cell(col);
+            let wide_lead = cell.is_some_and(|cell| cell.is_wide());
+            let continuation =
+                prev_wide && !wide_lead && cell.is_some_and(|cell| cell.is_wide_continuation());
+            prev_wide = wide_lead;
             let glyph_start = glyphs.len();
-            t.cell_grapheme_into(r, c, &mut glyphs);
-            let raw = view.cell(col);
+            if let Some(cell) = cell
+                && !continuation
+            {
+                view.push_cell_text(col, cell, &mut glyphs);
+            }
             row_cells.push(StyledCellSnap {
                 cell: rc.unwrap_or(blank),
                 glyph: glyph_start..glyphs.len(),
-                // Raw WIDE lead bit straight off the live cell: the retired
-                // `cell_attrs(..).contains(WIDE)` read the same inline bit, and a
-                // missing cell yields `false` on both paths.
-                wide_lead: raw.is_some_and(|cell| cell.is_wide()),
-                // `cell`'s `blink`, off the same inline flags.
-                blink: raw.is_some_and(|cell| cell.flags().contains(CellFlags::BLINK)),
+                wide_lead,
+                blink: cell.is_some_and(|cell| cell.flags().contains(CellFlags::BLINK)),
                 link,
             });
         }
@@ -5502,20 +3059,38 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
 /// Lock-free by construction (the snapshot owns everything it reads); all
 /// payload-affecting terminal state was captured under the earlier single lock.
 pub(crate) fn serialize_styled_frame(snap: &StyledFrameSnapshot) -> String {
-    let mut out = String::with_capacity(styled_frame_estimate(snap));
-    write_styled_frame(&mut out, snap);
+    let payloads = styled_frame_payloads(snap);
+    let mut out = String::with_capacity(styled_frame_estimate(snap, &payloads));
+    write_styled_frame(&mut out, snap, &payloads);
     out
 }
 
-/// ~180 bytes/cell is the measured shape of an ordinary cell; a short read is
-/// just one realloc, never wrong.
-fn styled_frame_estimate(snap: &StyledFrameSnapshot) -> usize {
+/// The wire payload of each image on the frame, in [`StyledFrameSnapshot::images`]
+/// order: the base64 the process's payload memo holds, encoded only for an
+/// image it does not; every one `truncated` (its real `nbytes` kept) when the
+/// snapshot carries no payloads ([`StyledFrameSnapshot::image_payloads`]).
+fn styled_frame_payloads(snap: &StyledFrameSnapshot) -> Vec<ImagePayload> {
+    if !snap.image_payloads {
+        return vec![ImagePayload::TRUNCATED; snap.images.len()];
+    }
+    let images: Vec<&Arc<ImageData>> = snap.images.iter().map(|(_, _, img)| img).collect();
+    image_payloads(&images)
+}
+
+/// ~180 bytes/cell is the measured shape of an ordinary cell, and each image
+/// adds its base64; a short read is just one realloc, never wrong.
+fn styled_frame_estimate(snap: &StyledFrameSnapshot, payloads: &[ImagePayload]) -> usize {
     256 + snap.cell_count() * 180
+        + payloads
+            .iter()
+            .map(|payload| STYLED_IMAGE_BYTES + payload.b64().len())
+            .sum::<usize>()
 }
 
 /// Append [`serialize_styled_frame`]'s frame to `out`, so `screen` writes its
-/// `OK 1\n` framing and the frame into ONE buffer.
-fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot) {
+/// `OK 1\n` framing and the frame into ONE buffer. `payloads` are
+/// [`styled_frame_payloads`]'s, one per image.
+fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot, payloads: &[ImagePayload]) {
     use std::fmt::Write as _;
     // ONE buffer for the whole frame — now literally one. The retired shape
     // built a `String` per cell, joined those into a `String` per row, then
@@ -5528,22 +3103,8 @@ fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot) {
     // rows, and the tail can be emitted in that order into the single buffer.
     // These are all tiny (a few bytes to a few hundred) and order-independent
     // pure functions of the snapshot; only the rows payload is large.
-    // (`line_sizes` is the exception: it streams straight into the tail.)
-    // F1: inline images (OSC 1337), base64 once per distinct image at its anchor —
-    // without this a `cells`/`screen` watcher sees blank cells where the human sees
-    // a picture. Empty array (cheap) on the common no-image screen.
-    let images_json = snap
-        .images
-        .iter()
-        .map(|(ar, ac, img)| {
-            if snap.image_payloads {
-                styled_image_json(*ar, *ac, img)
-            } else {
-                styled_image_entry(*ar, *ac, img, ("truncated", String::new()))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+    // (`line_sizes` and the images are the exception: they stream straight
+    // into the tail.)
     // Live OVERLAY state (OSC 12/17/19): render-time colour policy a watcher
     // cannot derive from the cells, so the frame names the policy explicitly
     // rather than letting a consumer invent a gray.
@@ -5590,8 +3151,20 @@ fn write_styled_frame(out: &mut String, snap: &StyledFrameSnapshot) {
         out,
         "],\"selection\":{selection_json},\
          \"selection_bg\":{selection_bg},\"selection_fg\":{selection_fg},\
-         \"images\":[{images_json}]}}",
+         \"images\":[",
     );
+    // F1: inline images (OSC 1337), one object per distinct image at its
+    // anchor — without this a `cells`/`screen` watcher sees blank cells where
+    // the human sees a picture. Empty array (cheap) on the common no-image
+    // screen.
+    debug_assert_eq!(payloads.len(), snap.images.len(), "one payload per image");
+    for (i, ((ar, ac, img), payload)) in snap.images.iter().zip(payloads).enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        styled_image_json(out, *ar, *ac, img, payload);
+    }
+    out.push_str("]}");
 }
 
 /// Build the whole styled-screen frame as a single-line JSON object:
@@ -5742,45 +3315,102 @@ fn _styled_cell_snap_is_fully_serialized(snap: &StyledCellSnap) {
 /// claim about the application framebuffer or display. `--json` is implied.
 ///
 /// `since=<etag>` makes it CONDITIONAL: every full frame ends with
-/// `"etag":"<16 hex>"` ([`screen_etag`]), and a read that hands the same etag
+/// `"etag":"<16 hex>"` ([`FrameKey::etag`]), and a read that hands the same etag
 /// back while nothing the frame depends on has moved is answered
 /// `{"unchanged":true,"seq":<n>,"gen":"<epoch>.<seq>","etag":"<etag>"}` — same
 /// `OK 1` framing, no grid gathered under the lock, no frame serialized or sent.
 /// Any other etag, or a screen that moved, gets the full frame. Any argument but
 /// `--json` and one `since=` is [`SCREEN_USAGE`].
-pub(crate) fn cmd_screen_styled_json(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+///
+/// The frame is the session's published one when it is the frame of the live
+/// key (a `subscribe … cells` watch keeps it); otherwise it is gathered here,
+/// and published only while a `cells` watch holds the slot.
+pub(crate) fn cmd_screen_styled_json(
+    term: &Arc<Mutex<Terminal>>,
+    frame: &FrameSlot,
+    rest: &str,
+) -> String {
     let since = match screen_args(rest) {
         Ok(since) => since,
         Err(usage) => return usage,
     };
-    // Gather under ONE lock hold (internally consistent frame), then serialize
-    // with the lock RELEASED — the per-cell format!/base64 never blocks keystroke
-    // encode or frame snapshots, which share this mutex.
-    let (snap, etag) = {
+    // The frame of the key read under ONE lock hold (the published one, or
+    // gathered in that hold), serialized with the lock RELEASED — the per-cell
+    // format!/base64 never blocks keystroke encode or frame snapshots, which
+    // share this mutex. The slot is looked at before the lock: the two never nest.
+    let mut look = frame.look_frame();
+    let (styled, key, etag) = {
         let t = term_lock(term);
-        let etag = screen_etag(&t);
+        let key = FrameKey::read(&t);
+        let etag = key.etag();
         if since == Some(etag) {
             // The whole cost category, skipped: no rows x cols gather under this
             // mutex, no ~180-bytes-per-cell serialize, no frame on the socket.
             return json_ok(&format!(
                 "{{\"unchanged\":true,\"seq\":{},\"gen\":\"{}\",\"etag\":\"{etag:016x}\"}}",
-                t.content_seq(),
-                screen_gen(&t),
+                key.seq(),
+                key.generation(),
             ));
         }
-        (gather_styled_frame(&t), etag)
+        (look.styled(&t, &key), key, etag)
     };
+    // `json_ok`'s exact `OK 1\n<frame>\n`. ONE key is appended by reopening the
+    // object: every existing key, and their order, is untouched (an additive wire
+    // change). The `subscribe … cells` push shares the frame and has no
+    // conditional form, so it does not carry the fingerprint.
+    let reply = |frame: &str| {
+        let mut out = String::with_capacity(32 + frame.len());
+        out.push_str("OK 1\n");
+        out.push_str(frame);
+        close_with_etag(out, etag)
+    };
+    // What the reply is rebuilt from without its image payloads, should it pass
+    // the reply-line cap: the snapshot this read gathered, or, for a published
+    // frame, whether that frame carries any payload to leave out.
+    let (out, lighter) = match styled {
+        Styled::Hit(published) => (
+            reply(published.body()),
+            Lighter::Published(published.carries_image_payloads()),
+        ),
+        Styled::Miss(snap) => {
+            let out = if look.keeps_styled() {
+                reply(look.publish_styled(key, &snap).body())
+            } else {
+                screen_frame_reply(&snap, etag)
+            };
+            (out, Lighter::Gathered(snap))
+        }
+    };
+    drop(look);
     // The frame never passes the reply-line cap its own client enforces (as
-    // `image --bytes` does): past it, once more without the image payloads (a big
-    // picture on a small screen), and still past it, an `ERR` line (a grid of
-    // about 35,000 cells or more), never a line aterm-ctl must reject.
+    // `image --bytes` does): past it, once more without the image payloads (a
+    // big picture on a small screen), and still past it, an `ERR` line (a grid
+    // of about 35,000 cells or more), never a line aterm-ctl must reject. The
+    // snapshot this read gathered is reused; a published frame is gathered
+    // afresh, under the lock again, only when it carries a payload, so the
+    // published frame keeps them for its `cells` watchers. A frame with no image
+    // payload is answered the `ERR` line at once: a second gather of a grid this
+    // size is a rows x cols walk under the mutex the PTY reader and keystroke
+    // encode share, for the same answer.
     let cap = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
-    let mut snap = snap;
-    let mut out = screen_frame_reply(&snap, etag);
-    if frame_line_len(&out) > cap && !snap.images.is_empty() {
-        snap.image_payloads = false;
-        out = screen_frame_reply(&snap, etag);
+    if frame_line_len(&out) <= cap {
+        return out;
     }
+    let out = match lighter {
+        Lighter::Gathered(mut snap) if snap.carries_image_payloads() => {
+            snap.image_payloads = false;
+            screen_frame_reply(&snap, etag)
+        }
+        Lighter::Published(true) => {
+            let (mut snap, etag) = {
+                let t = term_lock(term);
+                (gather_styled_frame(&t), FrameKey::read(&t).etag())
+            };
+            snap.image_payloads = false;
+            screen_frame_reply(&snap, etag)
+        }
+        Lighter::Gathered(_) | Lighter::Published(false) => out,
+    };
     let len = frame_line_len(&out);
     if len > cap {
         return format!(
@@ -5790,17 +3420,29 @@ pub(crate) fn cmd_screen_styled_json(term: &Arc<Mutex<Terminal>>, rest: &str) ->
     out
 }
 
-/// `screen`'s `OK 1\n<frame>\n` reply for a gathered frame.
+/// What an over-cap `screen` reply is rebuilt from without its image payloads
+/// ([`cmd_screen_styled_json`]).
+enum Lighter {
+    /// The snapshot this read gathered.
+    Gathered(StyledFrameSnapshot),
+    /// The read was served a published frame: whether it carries an image
+    /// payload.
+    Published(bool),
+}
+
+/// `screen`'s `OK 1\n<frame>\n` reply for a gathered frame nobody keeps: written
+/// straight into the reply's own buffer, never into a second one to be copied.
 fn screen_frame_reply(snap: &StyledFrameSnapshot, etag: u64) -> String {
-    // `json_ok`'s exact `OK 1\n<frame>\n`, written into the frame's own buffer
-    // instead of copying a finished frame into a second one.
-    let mut out = String::with_capacity(32 + styled_frame_estimate(snap));
+    let payloads = styled_frame_payloads(snap);
+    let mut out = String::with_capacity(32 + styled_frame_estimate(snap, &payloads));
     out.push_str("OK 1\n");
-    write_styled_frame(&mut out, snap);
-    // ONE key appended by reopening the object: every existing key, and their
-    // order, is untouched (an additive wire change). The `subscribe … cells`
-    // push shares the serializer and has no conditional form, so it does not
-    // pay for the fingerprint.
+    write_styled_frame(&mut out, snap, &payloads);
+    close_with_etag(out, etag)
+}
+
+/// Close a full `screen` reply (`OK 1\n` + the frame object) with its etag key
+/// and the framing newline.
+fn close_with_etag(mut out: String, etag: u64) -> String {
     debug_assert!(out.ends_with('}'), "the styled frame is one JSON object");
     out.pop();
     let _ = std::fmt::Write::write_fmt(&mut out, format_args!(",\"etag\":\"{etag:016x}\"}}"));
@@ -5839,65 +3481,11 @@ fn screen_args(rest: &str) -> Result<Option<u64>, String> {
     Ok(since)
 }
 
-/// The `screen` frame's CONDITIONAL ETAG: one `u64` over everything the styled
-/// frame is a function of, cheap enough to take on every read. An etag that
-/// stayed put while the frame moved would hand an agent a stale screen, so the
-/// argument goes read by read through [`gather_styled_frame`] (the serializer
-/// reads only its snapshot); each read is folded by value, or reached only by
-/// writers that move a folded counter:
-///
-/// * The live grid (glyphs, wide flags, links, decorations, image placements)
-///   and the Kitty image store: output reaches them only through `process`,
-///   and [`Terminal::screen_mutations`] moves on every non-empty batch and every
-///   Kitty animation step. `content_seq` alone misses a VS15/VS16 width fix, an
-///   OSC 1337 mark, a `C=1` Kitty placement and a Kitty image re-sent or deleted
-///   under a placeholder. The host's own grid writers (resize, reset, clearing
-///   history) move the content seq, and a reset the epoch.
-/// * The generation ([`screen_gen`]): the seq repeats across an alt-screen exit
-///   and re-entry, the epoch never does.
-/// * By value through [`render_sig`](crate::subscribe::render_sig): the cursor,
-///   the selection and its colours, and everything a cell is coloured against
-///   ([`Terminal::presentation_fingerprint`]: palette, default colours, DECSCNM
-///   and the host style policy, which a config reload changes with no output
-///   and no seq while every bold and dim cell re-colours).
-/// * The dimensions and each row's DEC line size, by value.
-/// * `display_offset`: the cells are the live screen, but `images` are laid out
-///   against the viewport.
-/// * The terminal ([`Terminal::render_identity`], not its reusable address) and
-///   this process, so no other terminal's or process's etag matches.
-///
-/// It may be finer than the frame (a byte that drew nothing moves it); that
-/// costs one full frame, never a wrong answer. `control_screen_etag_tests.rs`
-/// holds it to the frame over a corpus and a seeded walk, with the incomplete
-/// etags as negative controls.
+/// The etag a full `screen` frame carries ([`FrameKey::etag`]): the name the
+/// tests that hold it to the frame call it by.
+#[cfg(test)]
 fn screen_etag(t: &Terminal) -> u64 {
-    static PROCESS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let process = *PROCESS.get_or_init(|| {
-        let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos() as u64);
-        nanos ^ (u64::from(std::process::id()) << 32)
-    });
-    let mut h = aterm_hash::Fnv1a64::new();
-    let generation = screen_gen(t);
-    for v in [
-        process,
-        t.render_identity(),
-        generation.epoch,
-        generation.seq,
-        t.screen_mutations(),
-        u64::from(t.rows()),
-        u64::from(t.cols()),
-        crate::subscribe::render_sig(t),
-        t.grid().display_offset() as u64,
-    ] {
-        h.write(&v.to_le_bytes());
-    }
-    // One stable wire name per row (the names the frame serializes),
-    // delimited so two rows cannot alias by concatenation.
-    for r in 0..t.rows() as usize {
-        h.write(line_size_name(row_line_size(t, r)).as_bytes());
-        h.write_u8(0);
-    }
-    h.finish()
+    FrameKey::read(t).etag()
 }
 
 // The conditional read's promise as tests: the etag moves with every frame
@@ -5923,7 +3511,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
          \"band_left\":{},\"band_right\":{},\"band_top\":{},\"band_bottom\":{},\
          \"crop_left\":{},\"crop_right\":{},\"crop_top\":{},\"crop_bottom\":{},\
          \"pad\":{},\"pad_top\":{},\"pad_bottom\":{},\"head\":{},\"tab_rows\":{},\
-         \"viewers\":{},\"visible_viewers\":{},\"geometry\":\"{}\",\
+         \"deck_y\":{},\"deck_h\":{},\"viewers\":{},\"visible_viewers\":{},\"geometry\":\"{}\",\
          \"present_retry_state\":\"{}\",\"present_retry_count\":{},\
          \"present_retry_remaining\":{},\"present_retry_in_ms\":{}}}",
         snapshot.rows,
@@ -5960,6 +3548,8 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         snapshot.pad_bottom,
         snapshot.head,
         snapshot.tab_rows,
+        snapshot.deck_y,
+        snapshot.deck_h,
         snapshot.viewers,
         snapshot.visible_viewers,
         snapshot.geometry,
@@ -6050,7 +3640,7 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::{Arc, Mutex};
 
-    use aterm_core::terminal::Terminal;
+    use aterm_core::terminal::{Terminal, take_narrowed_query_steps};
     use aterm_messages::WaitEnd;
 
     use super::{
@@ -6059,6 +3649,19 @@ mod tests {
     };
     use crate::session_waits::{RewrapGauge, RewrapReading};
     use crate::term_lock;
+
+    /// Display one 1x1-cell kitty image, filled with `tag`, at 1-based
+    /// `row`/`col`. `s`/`v` are the raster's pixel size — one cell each at a
+    /// 10x20 cell metric — and `f=32` requires exactly `s * v * 4` bytes.
+    fn place(t: &mut Terminal, row: u16, col: u16, id: u8, tag: u8) {
+        t.process(format!("\x1b[{row};{col}H").as_bytes());
+        let raster = vec![tag; 10 * 20 * 4];
+        let b64 = aterm_codec::base64::encode(&raster).expect("encode");
+        let mut apc = format!("\x1b_Ga=T,f=32,s=10,v=20,i={id};").into_bytes();
+        apc.extend_from_slice(b64.as_bytes());
+        apc.extend_from_slice(b"\x1b\\");
+        t.process(&apc);
+    }
 
     /// The styled frame's image array is ROW-MAJOR, ascending column within a row
     /// — the order a socket client indexes into, and the one thing a "just iterate
@@ -6084,19 +3687,6 @@ mod tests {
     /// put two images on one row; kitty transmits-and-displays at the CURSOR.
     #[test]
     fn distinct_images_are_row_major_regardless_of_placement_order() {
-        /// Display one 1x1-cell kitty image, filled with `tag`, at 1-based
-        /// `row`/`col`. `s`/`v` are the raster's pixel size — one cell each at the
-        /// 10x20 cell metric below — and `f=32` requires exactly `s * v * 4` bytes.
-        fn place(t: &mut Terminal, row: u16, col: u16, id: u8, tag: u8) {
-            t.process(format!("\x1b[{row};{col}H").as_bytes());
-            let raster = vec![tag; 10 * 20 * 4];
-            let b64 = aterm_codec::base64::encode(&raster).expect("encode");
-            let mut apc = format!("\x1b_Ga=T,f=32,s=10,v=20,i={id};").into_bytes();
-            apc.extend_from_slice(b64.as_bytes());
-            apc.extend_from_slice(b"\x1b\\");
-            t.process(&apc);
-        }
-
         let mut t = Terminal::new(10, 40);
         t.set_cell_pixel_size(10, 20);
         place(&mut t, 5, 3, 1, b'F');
@@ -6127,6 +3717,44 @@ mod tests {
             ],
             "images must be reported row-major, not in placement or map order"
         );
+    }
+
+    /// The styled frame encodes each picture once: a frame change that moves
+    /// no picture encodes no image and carries the same `images` array. The
+    /// negative control is a new picture, which is encoded.
+    #[test]
+    fn a_frame_change_that_moves_no_picture_encodes_no_image() {
+        use crate::work_counts::take_images_encoded;
+        let frame = styled_frame_payload;
+        let images = |frame: &str| {
+            let at = frame
+                .rfind("\"images\":")
+                .expect("the frame ends with its images");
+            frame[at..].to_string()
+        };
+        let mut t = Terminal::new(6, 40);
+        t.set_cell_pixel_size(10, 20);
+        place(&mut t, 1, 2, 1, b'A');
+        place(&mut t, 1, 8, 2, b'B');
+        place(&mut t, 3, 10, 3, b'C');
+        take_images_encoded();
+
+        let first = frame(&t);
+        assert_eq!(
+            take_images_encoded(),
+            3,
+            "the first frame encodes each picture"
+        );
+        t.process(b"\x1b[6;1Hmore text");
+        let second = frame(&t);
+        assert_ne!(first, second, "the frame changed");
+        assert_eq!(take_images_encoded(), 0, "and no picture is encoded again");
+        assert_eq!(images(&first), images(&second), "the same images array");
+
+        place(&mut t, 5, 20, 4, b'D');
+        let third = frame(&t);
+        assert_eq!(take_images_encoded(), 1, "a new picture is encoded");
+        assert_eq!(images(&third).matches("\"b64\":").count(), 4);
     }
 
     /// The `custody` verb's whole reason to exist: it separates events that leave
@@ -6364,7 +3992,9 @@ mod tests {
     /// So the bytes `screen_stamp` hashes must be exactly the bytes `text`
     /// sends under its header: same rows, same order, one `\n` after each,
     /// trailing spaces and all. A row of blanks or a trailing space on either
-    /// side alone would make every report unpostable.
+    /// side alone would make every report unpostable. The published text
+    /// `status` reads its `hash=` off ([`ScreenText`]) is held to the same
+    /// bytes.
     #[test]
     fn screen_stamp_matches_the_text_verbs_rows() {
         for lines in [
@@ -6392,6 +4022,13 @@ mod tests {
                 aterm_hash::fnv1a_64(body.as_bytes()),
                 "stamp over {lines:?} must hash the rows `text` served:\n{served:?}"
             );
+            let published = super::ScreenText::of(&term.lock().unwrap());
+            assert_eq!(
+                published.whole(),
+                body,
+                "the published text is `text`'s body"
+            );
+            assert_eq!(published.fnv(), stamp, "and its hash is the stamp");
         }
     }
 
@@ -6411,7 +4048,10 @@ mod tests {
                 "{phase}: every row is present"
             );
             for tail in [0, 1, crate::presence::CLASSIFY_ROWS, 100] {
-                let (fp, rows) = crate::session_status::screen_agent_frame(t, tail);
+                let (fp, rows) = crate::session_status::screen_agent_frame(
+                    &crate::frame_memo::ScreenText::of(t),
+                    tail,
+                );
                 let from = all.len().saturating_sub(tail);
                 let expected: Vec<String> =
                     all[from..].iter().map(|row| (*row).to_string()).collect();
@@ -6779,15 +4419,22 @@ mod tests {
         );
     }
 
-    /// P1.0c: a repeat query on unchanged content (the cache-hit path, no
-    /// snapshot) returns byte-identical results, and a content write
-    /// invalidates the snapshot so new content is found — while the old
-    /// needle's ABSOLUTE row survives the incremental refresh unchanged.
+    /// The searches `term`'s slot has built so far, and how many of them
+    /// refreshed a kept index (`Terminal::search_index_rebuilds`,
+    /// `search_index_refreshes`); a hit moves neither.
+    fn builds(term: &Arc<Mutex<Terminal>>) -> (u64, u64) {
+        let t = term_lock(term);
+        (t.search_index_rebuilds(), t.search_index_refreshes())
+    }
+
+    /// P1.0c: a repeat query on unchanged content (a hit on the terminal's
+    /// slot, nothing copied) returns byte-identical results, and a content write
+    /// is answered by refreshing the kept index, not rebuilding it, so new
+    /// content is found while the old needle's ABSOLUTE row survives the
+    /// refresh unchanged; the refresh copies only the rows ordinary output can
+    /// have changed.
     #[test]
     fn repeat_search_stable_and_write_invalidates() {
-        // Searches a needle 20 rows deep in scrollback under the default (large)
-        // cap; the guard keeps other tests' searches from churning the shared index cache.
-        let _serial = super::search_cap_test_guard();
         let term = term_with(&["NEEDLE_alpha"]);
         for i in 0..20 {
             term.lock()
@@ -6796,18 +4443,22 @@ mod tests {
         }
         let r1 = cmd_search(&term, "NEEDLE_alpha", &RewrapGauge::default());
         assert!(r1.starts_with("OK 1"), "scrolled-off needle found: {r1}");
+        let built = builds(&term);
         let r2 = cmd_search(&term, "NEEDLE_alpha", &RewrapGauge::default());
         assert_eq!(r1, r2, "cache-hit repeat must be byte-identical");
         assert!(cmd_search(&term, "NEEDLE_beta", &RewrapGauge::default()).starts_with("OK 0"));
-        let _ = super::take_last_search_snapshot_lines();
+        assert_eq!(
+            builds(&term),
+            built,
+            "unchanged content is served from the slot"
+        );
         term.lock().unwrap().process(b"NEEDLE_beta\r\n");
         let rb = cmd_search(&term, "NEEDLE_beta", &RewrapGauge::default());
         assert!(rb.starts_with("OK 1"), "post-write needle found: {rb}");
-        assert!(
-            super::take_last_search_snapshot_lines() <= 6,
-            "ordinary output refreshes the four visible rows, at most one appended row, \
-             and the one row below the boundary that a soft-wrap run could have reached \
-             into it from"
+        assert_eq!(
+            builds(&term),
+            (built.0 + 1, built.1 + 1),
+            "ordinary output refreshes the kept index"
         );
         let after = cmd_search(&term, "NEEDLE_alpha", &RewrapGauge::default());
         let (before_head, before_hits) = r1.split_once('\n').expect("header");
@@ -6822,6 +4473,19 @@ mod tests {
             after_hits, before_hits,
             "absolute row of the old needle is stable across the refresh"
         );
+        // A refresh names its rows in its first chunk's hold; one row read, the
+        // rest still to copy.
+        term.lock().unwrap().process(b"NEEDLE_gamma\r\n");
+        let mut plan =
+            term_lock(&term).search_plan(&super::search_request(super::search_max_lines(), None));
+        term_lock(&term).read_search_chunk(&mut plan, 1);
+        let named = plan.rows_to_read() + 1;
+        assert!(
+            named <= 6,
+            "{named} rows: ordinary output refreshes the four visible rows, at most one \
+             appended row, and the one row below the boundary that a soft-wrap run could \
+             have reached into it from"
+        );
     }
 
     /// A cached visible row can be edited and then become scrollback before
@@ -6829,7 +4493,6 @@ mod tests {
     /// boundary, not the new one, or that now-historical row remains stale.
     #[test]
     fn incremental_refresh_captures_an_edited_row_that_scrolled_away() {
-        let _serial = super::search_cap_test_guard();
         let term = Arc::new(Mutex::new(Terminal::new(4, 40)));
         term.lock().unwrap().process(b"OLD_VISIBLE_TOKEN");
         assert!(
@@ -6858,7 +4521,6 @@ mod tests {
     /// not found (2026-09-22, a conhost repaint after a native reveal).
     #[test]
     fn incremental_refresh_re_reads_rows_a_rows_grow_revealed_and_output_rewrote() {
-        let _serial = super::search_cap_test_guard();
         let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
         for i in 0..10 {
             term.lock().unwrap().process(format!("L{i}\r\n").as_bytes());
@@ -6904,7 +4566,6 @@ mod tests {
     /// `abfoo` straddles the wrap at the cell `a` is drawn in.
     #[test]
     fn find_measures_ambiguous_characters_as_the_grid_draws_them() {
-        let _serial = super::search_cap_test_guard();
         let wide = aterm_core::config::TerminalConfig {
             ambiguous_width_double: true,
             ..Default::default()
@@ -6936,7 +4597,6 @@ mod tests {
     /// them would put it (column 2, what origin/main answered).
     #[test]
     fn search_reports_a_hit_where_the_grid_drew_it() {
-        let _serial = super::search_cap_test_guard();
         let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
         term.lock()
             .unwrap()
@@ -6952,10 +4612,10 @@ mod tests {
         );
     }
 
-    /// A live `ambiguous_width` switch moves no content generation, and the find
-    /// cache neither serves nor extends an index a fresh one would not equal:
-    /// the first search after the switch answers as a fresh index over the same
-    /// terminal does (one with no cache entry).
+    /// A live `ambiguous_width` switch moves no content generation, and the
+    /// terminal's kept index is neither served nor extended where a fresh one
+    /// would not equal it: the first search after the switch answers as a fresh
+    /// index over the same terminal does (one that never searched before).
     ///
     /// A row written before the switch keeps the cells it was drawn in
     /// (`apply_config` reflows nothing) and find reads those cells, so the
@@ -6965,7 +4625,6 @@ mod tests {
     /// right of where it is drawn; this test pinned that as its precondition.)
     #[test]
     fn a_live_ambiguous_width_switch_is_not_served_from_the_find_cache() {
-        let _serial = super::search_cap_test_guard();
         let wide = aterm_core::config::TerminalConfig {
             ambiguous_width_double: true,
             ..Default::default()
@@ -6994,7 +4653,6 @@ mod tests {
     /// as output scrolls (absolute rows do not move on a scroll).
     #[test]
     fn a_lines_hits_do_not_change_when_it_scrolls_into_history() {
-        let _serial = super::search_cap_test_guard();
         let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
         term.lock()
             .unwrap()
@@ -7031,49 +4689,15 @@ mod tests {
         }
     }
 
-    /// A soft-wrap run is indexed as ONE line keyed at the row it starts on, so
-    /// an incremental refresh that began INSIDE a run would leave that run's
-    /// head holding text for rows the refresh has since re-read — a hit spliced
-    /// out of content that is no longer on the glass. The refresh starts below
-    /// the boundary and walks to the run's head, which is why the bound in
-    /// `repeat_search_stable_and_write_invalidates` is the visible window plus
-    /// one row rather than the visible window exactly.
-    #[test]
-    fn an_incremental_refresh_rejoins_the_run_its_boundary_landed_inside() {
-        let _serial = super::search_cap_test_guard();
-        let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
-        // A wrapped run across the screen-top boundary: "0123456789" scrolls
-        // into history, "ABCDEFGHIJ" stays as the top visible (continuation) row.
-        term.lock()
-            .unwrap()
-            .process(b"0123456789ABCDEFGHIJ\r\naa\r\nbb\r\n");
-        assert!(
-            cmd_search(&term, "9A", &RewrapGauge::default()).starts_with("OK 1"),
-            "the straddling pair is found while the run is whole"
-        );
-
-        // Rewrite the top visible row out of the run, then scroll so the next
-        // query takes the incremental path with its boundary on that row.
-        term.lock()
-            .unwrap()
-            .process(b"\x1b[H\x1b[2Kzz\x1b[4;1H\r\n");
-        assert!(
-            cmd_search(&term, "9A", &RewrapGauge::default()).starts_with("OK 0"),
-            "the run's head must be re-joined, not left holding the rows it lost"
-        );
-        assert!(
-            cmd_search(&term, "0123456789", &RewrapGauge::default()).starts_with("OK 1"),
-            "the head keeps its own row's text"
-        );
-    }
-
     /// Read one absolute row back as the grid renders it, so a test can say
     /// which row a token is ACTUALLY printed on rather than trusting the search
     /// it is checking.
     fn row_text(term: &Arc<Mutex<Terminal>>, abs: u64) -> String {
-        match super::abs_row_text(&term_lock(term), abs) {
-            super::AbsRow::Text(s) => s,
-            super::AbsRow::Evicted | super::AbsRow::OutOfRange | super::AbsRow::Unreadable => {
+        use aterm_core::terminal::AbsRowText;
+        let row = term_lock(term).abs_row_text_within(abs, usize::MAX);
+        match row {
+            AbsRowText::Text(s) => s,
+            AbsRowText::Evicted | AbsRowText::OutOfRange | AbsRowText::Unreadable => {
                 "<evicted>".to_string()
             }
         }
@@ -7092,7 +4716,6 @@ mod tests {
     /// first row still occupies the width its continuation is offset by.
     #[test]
     fn a_blank_row_inside_a_soft_wrap_run_still_holds_its_width_of_the_line() {
-        let _serial = super::search_cap_test_guard();
         for (shape, text, erase, blank, tail, hit) in [
             (
                 "the middle row",
@@ -7133,7 +4756,6 @@ mod tests {
     /// "the start of the line".
     #[test]
     fn regex_anchors_bind_to_the_logical_line_not_the_rows_a_soft_wrap_split_it_into() {
-        let _serial = super::search_cap_test_guard();
         let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
         // One 20-column logical line, laid out as grid rows 0 and 1.
         term.lock().unwrap().process(b"0123456789ABCDEFGHIJ");
@@ -7180,9 +4802,8 @@ mod tests {
         );
     }
 
-    /// The snapshot cache is keyed by TERMINAL IDENTITY: a different session
-    /// searched immediately after must never be answered from the first
-    /// session's index.
+    /// Each terminal keeps its own index: a different session searched
+    /// immediately after must never be answered from the first session's.
     #[test]
     fn search_index_is_not_reused_across_terminals() {
         let a = term_with(&["NEEDLE_shared", "pad a"]);
@@ -7221,8 +4842,6 @@ mod tests {
     /// move it.
     #[test]
     fn search_cap_evicts_scrollback_but_floors_at_the_live_screen() {
-        let _serial = super::search_cap_test_guard();
-
         // A 4-row terminal: OLDNEEDLE buried deep in scrollback, TOPVIS on the TOP visible
         // row (3rd-from-last after the trailing newline scroll).
         let mut lines: Vec<String> = vec!["OLDNEEDLE".to_string()];
@@ -7282,8 +4901,6 @@ mod tests {
     /// LATCHES on the incremental path; a bulk rebuild restates it instead.
     #[test]
     fn a_clear_ends_the_incomplete_qualifier_instead_of_latching_it() {
-        let _serial = super::search_cap_test_guard();
-
         let owned: Vec<String> = (0..200).map(|line| format!("row {line}")).collect();
         let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
         let term = term_with(&refs);
@@ -7333,7 +4950,6 @@ mod tests {
     /// screen and must not read as a definite miss.
     #[test]
     fn the_search_header_names_the_match_limit_and_the_rewrap() {
-        let _serial = super::search_cap_test_guard();
         let row = "a".repeat(40);
         let rows = super::MAX_SEARCH_MATCHES / 40 + 100;
         let owned: Vec<&str> = (0..rows).map(|_| row.as_str()).collect();
@@ -7386,7 +5002,6 @@ mod tests {
     /// invalid pattern.
     #[test]
     fn a_long_soft_wrapped_run_is_searched_and_one_left_unfinished_is_named() {
-        let _serial = super::search_cap_test_guard();
         let cap = super::DEFAULT_MAX_CACHED_LINES;
         let unit = "function a(b){return b+1};var needle_x=[1,2,3];";
         let len = 1_000_000;
@@ -7437,7 +5052,6 @@ mod tests {
     /// depth cap alone stays a bare ` incomplete`.
     #[test]
     fn the_search_header_names_the_depth_cap_beside_another_cause() {
-        let _serial = super::search_cap_test_guard();
         let header = |reply: &str| search_header_without_frame(reply).to_string();
         let term = Arc::new(Mutex::new(Terminal::new(4, 500)));
         let mut text = String::from("old z\r\n");
@@ -7483,7 +5097,6 @@ mod tests {
     /// the screen only; the moved job count marks its short list.
     #[test]
     fn a_rewrap_inside_the_search_marks_its_short_list() {
-        let _serial = super::search_cap_test_guard();
         let mut t = Terminal::with_scrollback(
             4,
             40,
@@ -7536,119 +5149,311 @@ mod tests {
         );
     }
 
-    /// Cold builds copy/index only the suffix that can survive the configured
-    /// cap. The omitted prefix is still surfaced as incomplete history with an
-    /// absolute retained watermark.
+    /// A cold build copies only the suffix the configured depth cap retains:
+    /// the newest `cap` rows. The omitted prefix is still surfaced as
+    /// incomplete history with an absolute retained watermark.
     #[test]
     fn cold_search_snapshot_work_is_bounded_by_retained_cap() {
-        let _serial = super::search_cap_test_guard();
         let owned: Vec<String> = (0..200).map(|line| format!("row {line}")).collect();
         let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
         let term = term_with(&refs);
 
-        let _ = super::take_last_search_snapshot_lines();
+        let plan = term_lock(&term).search_plan(&super::search_request(16, None));
+        assert_eq!(
+            plan.rows_to_read(),
+            16,
+            "cold copy must never exceed the configured retained suffix"
+        );
+        drop(plan);
         let found = super::search_full_history_capped(&term, "row 199", false, false, 16)
             .expect("bounded cold search");
         assert!(found.consistent);
         assert!(found.results.incomplete);
         assert!(found.results.lowest_retained_line > 0);
-        assert!(
-            found.searched_lines.is_some_and(|lines| lines < 200),
-            "the find surfaces learn how far it searched: {:?}",
-            found.searched_lines
-        );
-        assert!(
-            super::take_last_search_snapshot_lines() <= 16,
-            "cold copy must never exceed the configured retained suffix"
+        assert_eq!(
+            found.searched_lines,
+            Some(16),
+            "the find surfaces learn how far it searched"
         );
     }
 
+    /// Each terminal keeps its own index, so searching another terminal leaves
+    /// the first one's in place: switching back is a hit. NEGATIVE CONTROL: a
+    /// write to the first terminal in between is not.
     #[test]
     fn alternating_terminal_searches_reuse_bounded_per_terminal_cache() {
-        let _serial = super::search_cap_test_guard();
-        let first = term_with(&["first needle"]);
-        let second = term_with(&["second needle"]);
-        super::search_full_history(&first, "needle", false, false).unwrap();
-        super::search_full_history(&second, "needle", false, false).unwrap();
-        let _ = super::take_last_search_snapshot_lines();
-
-        let repeat = super::search_full_history(&first, "needle", false, false).unwrap();
-        assert!(repeat.consistent);
-        assert_eq!(
-            super::take_last_search_snapshot_lines(),
-            0,
-            "switching back to a recent terminal must reuse its immutable index"
-        );
+        for write in [false, true] {
+            let first = term_with(&["first needle"]);
+            let second = term_with(&["second needle"]);
+            super::search_full_history(&first, "needle", false, false).unwrap();
+            let built = builds(&first);
+            super::search_full_history(&second, "needle", false, false).unwrap();
+            if write {
+                first.lock().unwrap().process(b"more\r\n");
+            }
+            let repeat = super::search_full_history(&first, "needle", false, false).unwrap();
+            assert!(repeat.consistent);
+            assert_eq!(
+                builds(&first).0 - built.0,
+                u64::from(write),
+                "write={write}: switching back to a recent terminal reuses its index"
+            );
+        }
     }
 
-    /// The off-lock snapshot caches ONLY a proven-consistent index ([`snapshot_cacheable`]).
-    /// Pins the decision so the hard-to-drive mid-copy tear branch stays covered: a `torn`
-    /// snapshot is never cacheable even when the endpoints match (the main→alt→main
-    /// round-trip that preserves `content_seq`), and a moved endpoint (seq or alt) also bars
-    /// caching.
-    #[test]
-    fn snapshot_cacheable_requires_no_tear_and_a_matching_endpoint() {
-        use super::snapshot_cacheable;
-        // Clean: not torn, endpoint still matches the key → cacheable.
-        assert!(snapshot_cacheable(false, false, false, 7, 7, 3, 3));
-        // Torn mid-copy → NEVER cacheable, even though the endpoint matches (key_seq ==
-        // seq_now): the exact main→alt→main-with-unchanged-content_seq case the flag exists for.
-        assert!(!snapshot_cacheable(true, false, false, 7, 7, 3, 3));
-        // Endpoint diverged — content generation moved...
-        assert!(!snapshot_cacheable(false, false, false, 7, 8, 3, 3));
-        // ...or the active screen flipped (either direction).
-        assert!(!snapshot_cacheable(false, false, true, 7, 7, 3, 3));
-        assert!(!snapshot_cacheable(false, true, false, 7, 7, 3, 3));
-        // A protected-footer row splice can invalidate absolute coordinates
-        // independently of the cached index key.
-        assert!(!snapshot_cacheable(false, false, false, 7, 7, 3, 4));
+    /// Whether `term`'s slot still keeps an index of the configured depth: the
+    /// next search plans a hit. A miss frees the slot, so ask last.
+    fn kept(term: &Arc<Mutex<Terminal>>) -> bool {
+        let request = super::search_request(super::search_max_lines(), None);
+        term_lock(term).search_plan(&request).is_hit()
     }
 
-    /// A cache hit is only a START-point proof: mutation after the immutable
-    /// query finishes must make the returned coordinate frame inconsistent.
+    /// Past [`super::SEARCH_RESIDENT_CAP`] terminals, the least recently
+    /// searched one gives its index back, and the others keep theirs.
+    /// NEGATIVE CONTROL: searching the oldest again before the ninth keeps its
+    /// index, and the next oldest gives its index back instead.
     #[test]
-    fn cache_hit_query_rechecks_terminal_generation_after_search() {
-        let _serial = super::search_cap_test_guard();
-        let term = term_with(&["needle", "other"]);
-        let initial =
-            super::search_full_history(&term, "needle", false, false).expect("initial search");
-        assert!(initial.consistent);
+    fn the_ninth_searched_terminal_releases_the_least_recent_index() {
+        let cap = super::SEARCH_RESIDENT_CAP;
+        for search_oldest_again in [false, true] {
+            let terms: Vec<_> = (0..=cap)
+                .map(|i| term_with(&[format!("needle {i}").as_str()]))
+                .collect();
+            let search = |term: &Arc<Mutex<Terminal>>| {
+                super::search_full_history(term, "needle", false, false).expect("searched");
+            };
+            for term in &terms[..cap] {
+                search(term);
+            }
+            if search_oldest_again {
+                search(&terms[0]);
+            }
+            search(&terms[cap]);
+            let released = usize::from(search_oldest_again);
+            for (i, term) in terms.iter().enumerate() {
+                assert_eq!(
+                    kept(term),
+                    i != released,
+                    "search_oldest_again={search_oldest_again}: terminal {i}"
+                );
+            }
+        }
+    }
 
-        super::arm_search_cache_hit_mutation(&term);
-        let raced =
-            super::search_full_history(&term, "needle", false, false).expect("cache-hit search");
-        assert!(!raced.consistent, "post-query mutation must fail closed");
-        assert_ne!(
-            raced.content_seq,
-            term_lock(&term).content_seq(),
-            "the result retains its original coordinate-generation stamp"
-        );
+    /// The ledger counts only live terminals: a dropped terminal's index died
+    /// with it, so it leaves without counting against the cap. NEGATIVE
+    /// CONTROL: alive, it is the one that falls past the cap.
+    #[test]
+    fn a_dropped_terminal_leaves_the_residency_ledger_uncounted() {
+        for drop_first in [false, true] {
+            let ledger = super::SearchResidency::new(2);
+            let mut first = Some(term_with(&[]));
+            let (second, third) = (term_with(&[]), term_with(&[]));
+            assert!(ledger.touch(first.as_ref().expect("alive")).is_none());
+            assert!(ledger.touch(&second).is_none());
+            if drop_first {
+                first = None;
+            }
+            let evicted = ledger.touch(&third);
+            assert_eq!(evicted.is_some(), !drop_first, "drop_first={drop_first}");
+            if let (Some(evicted), Some(first)) = (&evicted, &first) {
+                assert!(Arc::ptr_eq(evicted, first));
+            }
+        }
+    }
 
-        // The socket reply must preserve that refusal too: clients have no
-        // FullHistorySearch generation stamp to judge its coordinates by.
-        let gauge = crate::session_waits::RewrapGauge::default();
-        let settled = super::cmd_search(&term, "needle", &gauge);
-        assert!(settled.starts_with("OK 1 screen_first=0\n"), "{settled}");
-        super::arm_search_cache_hit_mutation(&term);
-        let raced = super::cmd_search(&term, "needle", &gauge);
-        assert!(
-            raced.starts_with("OK 1 incomplete changed screen_first=0\n"),
-            "{raced}"
-        );
-        let settled = super::cmd_search(&term, "needle", &gauge);
-        assert!(
-            settled.starts_with("OK 1 screen_first=0\n"),
-            "the next stable read: {settled}"
-        );
+    /// The find bar and the `search` verb read one index per terminal: a find
+    /// with its anchor, then `search` over the same terminal, builds once.
+    /// NEGATIVE CONTROL: output in between makes the verb's search build (a
+    /// refresh of the find's index).
+    #[test]
+    fn find_and_socket_share_one_index() {
+        for write in [false, true] {
+            let term = term_with(&["needle one", "other", "needle two"]);
+            let found = super::search_full_history_direction(
+                &term,
+                "needle",
+                false,
+                false,
+                super::EngineSearchDirection::Forward,
+                Some((1, 0)),
+                false,
+            )
+            .expect("find");
+            assert_eq!(found.results.matches.len(), 2);
+            let built = builds(&term);
+            if write {
+                term.lock().unwrap().process(b"needle three\r\n");
+            }
+            let reply = cmd_search(&term, "needle", &RewrapGauge::default());
+            let header = if write { "OK 3 " } else { "OK 2 " };
+            assert!(reply.starts_with(header), "write={write}: {reply}");
+            assert_eq!(
+                builds(&term),
+                (built.0 + u64::from(write), built.1 + u64::from(write)),
+                "write={write}"
+            );
+        }
+    }
+
+    /// A terminal that moves while a search's answer runs off the lock is
+    /// reported, and the result keeps the stamps of the key it was planned
+    /// under. Output leaves the frame standing, so only `consistent` drops and
+    /// the `search` header is exact (`OK 1`): absolute rows stay put as lines
+    /// scroll into history. A screen switch or a width change moves the frame,
+    /// and the header names it (`OK 1 incomplete moving`) for the client to
+    /// decide whether to search again. Cold builds and hits alike, batch and
+    /// point results alike. NEGATIVE CONTROL: with no change the result is
+    /// consistent, its frame stood, and the header is `OK 1`.
+    #[test]
+    fn a_search_raced_off_the_lock_reports_the_verdict_under_the_planned_stamps() {
+        type Race = fn(&mut Terminal);
+        let races: [(&str, Option<Race>, bool); 4] = [
+            ("none", None, true),
+            ("output", Some(|t| t.process(b"more\r\n")), true),
+            ("alt switch", Some(|t| t.process(b"\x1b[?1049h")), false),
+            ("width", Some(|t| t.resize(4, 30)), false),
+        ];
+        let depth = super::search_max_lines();
+        for (label, race, frame_stable) in races {
+            for (warm, point) in [(false, false), (true, false), (false, true), (true, true)] {
+                let case = format!("{label} warm={warm} point={point}");
+                let term = term_with(&["needle", "other"]);
+                if warm {
+                    let _ = super::search_full_history(&term, "needle", false, false).expect(&case);
+                }
+                let planned = super::SearchKey::capture(&term_lock(&term), depth);
+                let planned_stamps = (
+                    i64::try_from(planned.window().visible_base).unwrap(),
+                    planned.row_revision,
+                    planned.renumber_epoch,
+                    planned.content_seq,
+                    usize::from(planned.cols),
+                );
+                let request = super::search_request(depth, Some((0, 0)));
+                let searched = super::search_terminal(&term, &request, |built, hit| {
+                    assert_eq!(hit, warm, "{case}: precondition");
+                    if let Some(race) = race {
+                        race(&mut term_lock(&term));
+                    }
+                    built.query(
+                        "needle",
+                        false,
+                        false,
+                        super::EngineSearchDirection::Forward,
+                        false,
+                    )
+                });
+                if point {
+                    let found = super::full_history_point(super::Searched {
+                        answer: searched.answer.map(|(_, point_match)| point_match),
+                        key: searched.key,
+                        wrap: searched.wrap,
+                        verdict: searched.verdict,
+                    })
+                    .expect(&case);
+                    assert_eq!(found.consistent, race.is_none(), "{case}");
+                    assert_eq!(
+                        (
+                            found.base_y,
+                            found.absolute_row_revision,
+                            found.history_renumber_epoch,
+                            found.content_seq,
+                            found.cols,
+                        ),
+                        planned_stamps,
+                        "{case}"
+                    );
+                    continue;
+                }
+                let found = super::full_history_search(searched).expect(&case);
+                assert_eq!(
+                    (found.consistent, found.frame_stable),
+                    (race.is_none(), frame_stable),
+                    "{case}"
+                );
+                assert_eq!(
+                    (
+                        found.base_y,
+                        found.absolute_row_revision,
+                        found.history_renumber_epoch,
+                        found.content_seq,
+                        found.cols,
+                    ),
+                    planned_stamps,
+                    "{case}"
+                );
+                let header = format!(
+                    "OK 1{} screen_first={}",
+                    if frame_stable {
+                        ""
+                    } else {
+                        " incomplete moving"
+                    },
+                    planned_stamps.0,
+                );
+                assert_eq!(
+                    super::search_reply(Ok(found), false).lines().next(),
+                    Some(header.as_str()),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A point step answers a hit on the terminal's index as it answers a
+    /// build: a regex that cannot finish a soft-wrapped run and matches nowhere
+    /// else is no point either way (the batch path keeps its batch), never a
+    /// refusal on the hit alone. NEGATIVE CONTROL: the lazy walk alone over the
+    /// kept index refuses (`ScanCutShort`).
+    #[test]
+    fn a_point_step_answers_a_hit_as_it_answers_a_build() {
+        let costly = "(?:x?){1020}z";
+        let term = Arc::new(Mutex::new(Terminal::new(4, 500)));
+        term.lock()
+            .unwrap()
+            .process(format!("before\r\n{}\r\nafter\r\n", "x".repeat(70_000)).as_bytes());
+        let point = || {
+            super::search_full_history_point(
+                &term,
+                costly,
+                true,
+                true,
+                super::EngineSearchDirection::Forward,
+                (0, 0),
+                true,
+            )
+            .map(|found| (found.point_match, found.consistent))
+        };
+        let built = point();
+        assert_eq!(builds(&term).0, 1, "precondition: a build");
+        let hit = point();
+        assert_eq!(builds(&term).0, 1, "precondition: a hit");
+        assert_eq!(built, Ok((None, true)));
+        assert_eq!(hit, built);
+
+        let request = super::search_request(super::search_max_lines(), Some((0, 0)));
+        let walked = super::search_terminal(&term, &request, |built, hit| {
+            assert!(hit, "precondition: a hit");
+            built.index().find_direction_opts(
+                costly,
+                true,
+                true,
+                aterm_search::DirectedFind {
+                    anchor: built.wrap().logical_anchor().unwrap_or((0, 0)),
+                    direction: super::EngineSearchDirection::Forward,
+                    inclusive: false,
+                    wrap: true,
+                },
+            )
+        });
+        assert_eq!(walked.answer, Err(super::SearchOptionsError::ScanCutShort));
     }
 
     /// A mistyped argument is refused, never answered with the summary: `metrics
     /// rest` used to read as a successful reset while zeroing nothing.
     #[test]
     fn metrics_refuses_an_unknown_argument_and_resets_nothing() {
-        // The metrics tests that `reset()` hold this lock; without it one of them can zero the
-        // counter between the record and the read, which reads as a refused argument resetting.
-        let _serial = crate::metrics::scheduler_state_serial();
         crate::metrics::record_offscreen_raster(1_000_000);
         for arg in ["rest", "percentile", "reset now", "percentiles reset"] {
             assert_eq!(
@@ -7662,10 +5467,6 @@ mod tests {
                 "{arg:?}"
             );
         }
-        assert_eq!(
-            super::cmd_metrics(None, "rest --json"),
-            super::METRICS_USAGE
-        );
         let summary = super::cmd_metrics(None, "");
         let rasters: u64 = summary
             .split("offscreen_rasters=")
@@ -7676,36 +5477,57 @@ mod tests {
         assert!(rasters > 0, "a refused argument reset the counters");
     }
 
-    /// The JSON body is a KEY-FOR-KEY twin of the text form, for the summary
-    /// and for `percentiles`. A hand-listed key set is what let the text form's
-    /// `n_reflow` quartet ship without its JSON twin; this walks every `key=`
-    /// the text line publishes instead, so a field added to one form only fails
-    /// here.
+    /// The verb's routing: `metrics` and `metrics percentiles`, in text through
+    /// `cmd_metrics`, and with `--json` taken off by the dispatch's
+    /// `json_ask` and answered by `cmd_metrics_json`, carry exactly the keys
+    /// their own emitter logs, in order, as one `OK` line or one `OK 1` framed
+    /// object. The control: the two forms' key logs differ, so a form routed to
+    /// the other's emitter or to the other syntax's sink fails here.
     #[test]
-    fn every_text_metrics_key_has_a_json_twin() {
-        for form in ["", "percentiles"] {
-            let text = super::cmd_metrics(None, form);
-            let body = text
-                .strip_prefix("OK ")
-                .unwrap_or_else(|| panic!("{form:?}: text metrics is an OK line"));
-            let json = super::cmd_metrics_json(None, form);
-            let json_body = json.strip_prefix("OK 1\n").unwrap().trim_end();
-            let value: aterm_json::Value = aterm_json::from_str(json_body).unwrap();
-            let mut keys = 0;
-            for token in body.split_whitespace() {
-                let Some((key, _)) = token.split_once('=') else {
-                    continue;
-                };
-                keys += 1;
-                assert!(
-                    value.get(key).is_some(),
-                    "{form:?}: the text form publishes `{key}` but the JSON twin omits it"
-                );
+    fn each_metrics_form_reaches_the_wire_through_its_own_emitter_and_sink() {
+        use crate::metrics::wire::{ReadCtx, law_tests};
+        let ctx = ReadCtx::now();
+        let forms = [
+            (
+                "",
+                law_tests::body(|s| crate::metrics::emit_summary(&ctx, None, s)).keys,
+            ),
+            (
+                "percentiles",
+                law_tests::body(|s| crate::metrics::emit_percentiles(&ctx, s)).keys,
+            ),
+        ];
+        assert_ne!(forms[0].1, forms[1].1);
+        for (form, keys) in &forms {
+            let reply = super::cmd_metrics(None, form);
+            let line = reply
+                .strip_suffix('\n')
+                .filter(|line| line.starts_with("OK ") && !line.contains('\n'))
+                .unwrap_or_else(|| panic!("{form:?}: not one OK line: {reply:?}"));
+            let text_keys: Vec<&str> = law_tests::tokens(line).iter().map(|(k, _)| *k).collect();
+            assert_eq!(text_keys, *keys, "{form:?}: {line}");
+            let flagged = format!("{form} --json");
+            let resolved = aterm_types::control_verbs::spec_for("metrics", &flagged)
+                .expect("metrics is a verb");
+            let body = match super::super::json_ask(&resolved, "metrics", &flagged) {
+                super::super::JsonAsk::Emit(body) => body,
+                other => panic!("{form:?}: the dispatch emits no JSON: {other:?}"),
+            };
+            for reply in [
+                super::cmd_metrics_json(None, &body),
+                super::cmd_metrics_json(None, form),
+            ] {
+                let object = reply
+                    .strip_prefix("OK 1\n")
+                    .and_then(|rest| rest.strip_suffix('\n'))
+                    .filter(|object| object.starts_with('{') && !object.contains('\n'))
+                    .unwrap_or_else(|| panic!("{form:?}: not one framed object: {reply:?}"));
+                let json_keys: Vec<String> = law_tests::members(object)
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect();
+                assert_eq!(json_keys, *keys, "{form:?}: {object}");
             }
-            assert!(
-                keys > 40,
-                "{form:?}: the text form parsed to only {keys} keys: {text}"
-            );
         }
     }
 
@@ -7794,51 +5616,34 @@ mod tests {
         assert!(value.get("redraw_attempts").is_some());
     }
 
-    /// The plain batch layer over the index the last search cached for `term`:
-    /// the oracle every narrowed keystroke must equal.
-    fn batch_oracle(
+    /// The plain batch layer over the index `term`'s slot keeps: the oracle the
+    /// narrowing tests hold the per-keystroke path to. It is served from the
+    /// slot and hands the narrowing frames back untouched.
+    fn cached_batch(
         term: &Arc<Mutex<Terminal>>,
         q: &str,
         direction: super::EngineSearchDirection,
-    ) -> super::SearchResults {
-        let (key_alt, key_seq, key_epoch, revision, rows, cols) = {
-            let t = term_lock(term);
-            (
-                t.is_alternate_screen(),
-                t.content_seq(),
-                t.grid().history_renumber_epoch(),
-                t.absolute_row_revision(),
-                t.rows() as usize,
-                usize::from(t.grid().cols()),
-            )
-        };
-        let max_lines =
-            super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
-        let index = super::cached_search_index(
-            term,
-            key_alt,
-            key_seq,
-            key_epoch,
-            revision,
-            max_lines,
-            aterm_types::text_shaping::AmbiguousWidth::Single,
-        )
-        .expect("the previous search must have cached a consistent snapshot");
-        super::query_search_index(
-            &index,
+    ) -> (super::SearchResults, Option<super::SearchMatch>) {
+        let request = super::search_request(super::search_max_lines(), None);
+        let plan = term_lock(term).search_plan(&request);
+        assert!(
+            plan.is_hit(),
+            "the previous search must have kept its index"
+        );
+        let built = plan.build();
+        let found = aterm_core::terminal::query_search_index(
+            built.index(),
             q,
             false,
             false,
             direction,
             None,
             false,
-            super::WrapFrame {
-                cols,
-                logical_anchor: None,
-            },
+            built.wrap(),
         )
-        .expect("literal batch query cannot fail")
-        .0
+        .expect("literal batch query cannot fail");
+        assert!(term_lock(term).finish_search(built).0.consistent);
+        found
     }
 
     /// SA-1 cost guard: narrowing must not be used when the index would visit
@@ -7849,16 +5654,15 @@ mod tests {
     /// ordinary common-prefix keystrokes still narrow.
     #[test]
     fn narrowing_skips_frames_bigger_than_the_engines_own_candidate_set() {
-        let _guard = super::search_cap_test_guard();
         let mut lines: Vec<String> = (0..40)
             .map(|i| format!("svc-api request completed size=100 seq={i}"))
             .collect();
         lines.push("svc-api request completed size=977 seq=rare".to_string());
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let term = term_with(&refs);
-        let _ = super::take_narrowed_query_steps();
+        let _ = take_narrowed_query_steps();
 
-        let oracle = |q: &str| batch_oracle(&term, q, super::EngineSearchDirection::Forward);
+        let oracle = |q: &str| cached_batch(&term, q, super::EngineSearchDirection::Forward).0;
         let narrowed = |q: &str| {
             super::search_full_history_direction(
                 &term,
@@ -7879,7 +5683,7 @@ mod tests {
             assert_eq!(full.results, oracle(q), "keystroke {q:?}");
         }
         assert!(
-            super::take_narrowed_query_steps() >= 1,
+            take_narrowed_query_steps() >= 1,
             "reach: the common-prefix keystrokes must narrow"
         );
 
@@ -7893,7 +5697,7 @@ mod tests {
             "precondition: the grown query really is rare"
         );
         assert_eq!(
-            super::take_narrowed_query_steps(),
+            take_narrowed_query_steps(),
             0,
             "cost guard: a frame bigger than the engine's candidate set must be skipped"
         );
@@ -7903,10 +5707,81 @@ mod tests {
         let deeper = narrowed("size=97");
         assert_eq!(deeper.results, oracle("size=97"));
         assert_eq!(
-            super::take_narrowed_query_steps(),
+            take_narrowed_query_steps(),
             1,
             "the reseeded frame is small, so narrowing resumes immediately"
         );
+    }
+
+    /// A Kitty `CSI +T` unscroll slides every retained row's key one row and
+    /// leaves `content_seq` standing. The index is rebuilt (the epoch is in its
+    /// key), and the narrowing frames, whose rows were read before the slide,
+    /// must die with it: a frame of pre-shift rows verifies the lines one row
+    /// off, here the `beta` rows between the `alpha` ones, and loses every hit.
+    /// Across the unscroll every other field the slot's key compares is
+    /// unchanged, so only the epoch keeps that frame out. NEGATIVE CONTROL: the
+    /// same keystrokes without the unscroll do narrow on the last one, so the
+    /// cost guard is not what skips the frame.
+    #[test]
+    fn an_epoch_only_renumber_kills_the_narrowing_frames() {
+        let forward = super::EngineSearchDirection::Forward;
+        let run = |unscroll: bool| {
+            // A tiered store under the ring: a ring-only grid routes an unscroll
+            // to a plain region scroll.
+            let mut t = Terminal::with_scrollback(
+                4,
+                40,
+                8,
+                aterm_scrollback::Scrollback::new(64, 512, 8_000_000),
+            );
+            for i in 0..40 {
+                let line = if i % 2 == 0 {
+                    format!("alpha-{i}\r\n")
+                } else {
+                    "beta\r\n".to_string()
+                };
+                t.process(line.as_bytes());
+            }
+            let term = Arc::new(Mutex::new(t));
+            let search = |q: &str| {
+                super::search_full_history_direction(&term, q, false, false, forward, None, false)
+                    .expect("search ok")
+            };
+            // The build seeds the `alph` frame; the hit after it stacks `alpha`.
+            search("alph");
+            search("alpha");
+            if unscroll {
+                let cap = super::search_max_lines();
+                let before = super::SearchKey::capture(&term_lock(&term), cap);
+                term_lock(&term).process(b"\x1b[1+T");
+                let after = super::SearchKey::capture(&term_lock(&term), cap);
+                assert_ne!(before.renumber_epoch, after.renumber_epoch);
+                let mut unslid = after;
+                unslid.renumber_epoch = before.renumber_epoch;
+                assert!(
+                    before.same_generation(&unslid),
+                    "precondition: the unscroll moves no generation field but the epoch"
+                );
+            }
+            // The keystroke a frame of the `alpha` lines would serve. After the
+            // slide it rebuilds the index, and the frames died with the old one.
+            let _ = take_narrowed_query_steps();
+            let grown = search("alpha-");
+            let steps = take_narrowed_query_steps();
+            assert_eq!(grown.results, cached_batch(&term, "alpha-", forward).0);
+            assert_eq!(
+                grown.results.matches.len(),
+                20,
+                "every alpha line, at its row after the slide"
+            );
+            steps
+        };
+        assert_eq!(
+            run(false),
+            1,
+            "control: the stacked frame narrows the keystroke"
+        );
+        assert_eq!(run(true), 0, "a frame of pre-shift rows is never reused");
     }
 
     /// SA-1 wiring: typing a query one char at a time through the real
@@ -7918,7 +5793,6 @@ mod tests {
     /// direction stay equal too.
     #[test]
     fn incremental_typing_narrows_and_equals_the_batch_layer() {
-        let _guard = super::search_cap_test_guard();
         let term = term_with(&[
             "plain ascii find line",
             // Zero-width character: "\u{200b}" alone spans no display column
@@ -7933,9 +5807,9 @@ mod tests {
             "find find find",
             "no hits here",
         ]);
-        let _ = super::take_narrowed_query_steps();
+        let _ = take_narrowed_query_steps();
 
-        let oracle = |q: &str| batch_oracle(&term, q, super::EngineSearchDirection::Forward);
+        let oracle = |q: &str| cached_batch(&term, q, super::EngineSearchDirection::Forward).0;
         let narrowed = |q: &str| {
             super::search_full_history_direction(
                 &term,
@@ -7949,9 +5823,8 @@ mod tests {
             .expect("search ok")
         };
 
-        // Grow: f → fi → fin → find. The first call is a snapshot MISS
-        // (batch build); "fi" seeds the stack off the fresh hit; "fin"/"find"
-        // must run off frames.
+        // Grow: f → fi → fin → find. The first call builds the index and seeds
+        // the stack beside it; "fi", "fin" and "find" must run off frames.
         for q in ["f", "fi", "fin", "find"] {
             let full = narrowed(q);
             assert!(full.consistent, "no concurrent mutation in this test");
@@ -7962,7 +5835,7 @@ mod tests {
             );
         }
         assert!(
-            super::take_narrowed_query_steps() >= 2,
+            take_narrowed_query_steps() >= 2,
             "reach: the grown keystrokes must have run off narrowing frames"
         );
 
@@ -7970,7 +5843,7 @@ mod tests {
         let full = narrowed("fin");
         assert_eq!(full.results, oracle("fin"));
         assert_eq!(
-            super::take_narrowed_query_steps(),
+            take_narrowed_query_steps(),
             1,
             "reach: the backspaced query must be served off its own frame"
         );
@@ -8004,7 +5877,7 @@ mod tests {
         // equals the backward batch path verbatim at every keystroke. (A capped
         // backward edge keeps the newest matches instead, which is why
         // `query_search_index_narrowing` falls back to the batch path there.)
-        let _ = super::take_narrowed_query_steps();
+        let _ = take_narrowed_query_steps();
         for q in ["f", "fi", "fin", "find", "find f"] {
             let full = super::search_full_history_direction(
                 &term,
@@ -8018,12 +5891,12 @@ mod tests {
             .expect("search ok");
             assert_eq!(
                 full.results,
-                batch_oracle(&term, q, super::EngineSearchDirection::Backward),
+                cached_batch(&term, q, super::EngineSearchDirection::Backward).0,
                 "backward keystroke {q:?} must equal the backward batch layer"
             );
         }
         assert!(
-            super::take_narrowed_query_steps() >= 2,
+            take_narrowed_query_steps() >= 2,
             "reach: the backward lane must also run off narrowing frames"
         );
     }
@@ -8038,10 +5911,14 @@ mod trim_tests {
     use aterm_core::terminal::Terminal;
 
     use super::{
-        ROWS_REVERSED, TEXT_USAGE, TextArgs, TextShape, cmd_blocktext_args, cmd_text_json,
-        cmd_text_json_opt, cmd_text_opt, frame_rows_reply, lines_reply, text_args,
-        trim_lines_reply,
+        ROWS_REVERSED, TEXT_USAGE, TextArgs, TextShape, cmd_blocktext_args, cmd_text_json_opt,
+        frame_rows_reply, lines_reply, text_args,
     };
+
+    /// `text` as a session with nothing published serves it.
+    fn cmd_text_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
+        super::cmd_text_opt(term, &crate::frame_memo::FrameSlot::default(), args)
+    }
 
     /// `lines` stays the bare `OK <n>` until history has actually been lost,
     /// and then says so — the field can never appear for a complete history
@@ -8218,13 +6095,13 @@ mod trim_tests {
                 .trim_matches('"')
                 .to_string()
         };
-        let a = cmd_text_json(&term);
+        let a = cmd_text_json_opt(&term, TextArgs::default());
         let gen_a = super::screen_gen(&term.lock().unwrap()).to_string();
         assert_eq!(field(&a, "gen"), gen_a, "{a}");
         term.lock()
             .unwrap()
             .process(&[b"\x1b[?1049l\x1b[?1049h".as_slice(), ALT_B].concat());
-        let b = cmd_text_json(&term);
+        let b = cmd_text_json_opt(&term, TextArgs::default());
         assert!(b.contains("rm -rf"), "PRECONDITION: box B is up: {b}");
         assert_eq!(
             field(&a, "seq"),
@@ -8248,19 +6125,42 @@ mod trim_tests {
     #[test]
     fn text_json_carries_the_persons_stamp_after_gen() {
         let term = term_with(24, &numbered(22));
-        let never = super::cmd_text_json_read(&term, TextArgs::default(), None, None, 0, None);
+        let never = super::cmd_text_json_read(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            TextArgs::default(),
+            None,
+            None,
+            0,
+            None,
+        );
         assert!(
             never.contains(",\"human_ms\":null,\"human_seq\":0,\"launch\":null}"),
             "{never}"
         );
-        let keyed =
-            super::cmd_text_json_read(&term, TextArgs::default(), Some(12_345), None, 3, None);
+        let keyed = super::cmd_text_json_read(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            TextArgs::default(),
+            Some(12_345),
+            None,
+            3,
+            None,
+        );
         let gen_at = keyed.find("\"gen\":").expect("gen");
         let human_at = keyed
             .find(",\"human_ms\":12345,\"human_seq\":3,\"launch\":null}")
             .expect("human_ms, human_seq and launch, closing");
         assert!(gen_at < human_at, "{keyed}");
-        let shaped = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7), None, 9, None);
+        let shaped = super::cmd_text_json_read(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            args("tail=5 trim"),
+            Some(7),
+            None,
+            9,
+            None,
+        );
         assert!(
             shaped.ends_with(
                 ",\"human_ms\":7,\"human_seq\":9,\"launch\":null,\"trimmed\":2,\"first\":19}\n"
@@ -8271,8 +6171,15 @@ mod trim_tests {
         assert_eq!(cmd_text_json_opt(&term, TextArgs::default()), never);
         // A never that says since when (`"unkeyed_ms"`, last, the review of
         // LC-4): beside `null` alone, never beside an age.
-        let served =
-            super::cmd_text_json_read(&term, args("tail=5 trim"), None, Some(5_000), 0, None);
+        let served = super::cmd_text_json_read(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            args("tail=5 trim"),
+            None,
+            Some(5_000),
+            0,
+            None,
+        );
         assert!(
             served.ends_with(
                 ",\"human_ms\":null,\"human_seq\":0,\"launch\":null,\"trimmed\":2,\"first\":19,\
@@ -8280,8 +6187,15 @@ mod trim_tests {
             ),
             "{served}"
         );
-        let keyed =
-            super::cmd_text_json_read(&term, TextArgs::default(), Some(7), Some(5_000), 0, None);
+        let keyed = super::cmd_text_json_read(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            TextArgs::default(),
+            Some(7),
+            Some(5_000),
+            0,
+            None,
+        );
         assert!(!keyed.contains("unkeyed_ms"), "{keyed}");
     }
 
@@ -8300,7 +6214,15 @@ mod trim_tests {
             word: Some("claude"),
             why: Why::Person,
         });
-        let at = super::cmd_text_json_read(&term, args("tail=5 trim"), Some(7), None, 9, Some(&w));
+        let at = super::cmd_text_json_read(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            args("tail=5 trim"),
+            Some(7),
+            None,
+            9,
+            Some(&w),
+        );
         assert!(
             at.ends_with(
                 ",\"human_seq\":9,\"launch\":{\"id\":4,\"seq\":9,\"word\":\"claude\",\
@@ -8308,8 +6230,15 @@ mod trim_tests {
             ),
             "{at}"
         );
-        let moved =
-            super::cmd_text_json_read(&term, TextArgs::default(), Some(7), None, 10, Some(&w));
+        let moved = super::cmd_text_json_read(
+            &term,
+            &crate::frame_memo::FrameSlot::default(),
+            TextArgs::default(),
+            Some(7),
+            None,
+            10,
+            Some(&w),
+        );
         assert!(
             moved.ends_with(",\"human_seq\":10,\"launch\":{\"why\":\"since\"}}\n"),
             "{moved}"
@@ -8489,44 +6418,32 @@ mod trim_tests {
         let whole = cmd_text_json_opt(&term, args("tail=99"));
         assert_eq!(
             whole,
-            cmd_text_json(&term),
+            cmd_text_json_opt(&term, TextArgs::default()),
             "a tail larger than the grid is the bare JSON"
         );
         assert!(!whole.contains("\"first\""), "{whole}");
     }
 
-    /// `blocktext <id> [trim]`: the id alone reaches the emitter; `trim` re-frames
-    /// the emitter's reply; anything else is the arm's usage line. An `ERR` from the
-    /// emitter passes through untouched.
+    /// `blocktext <id> [trim]`: the parsed id and whether `trim` was given reach the
+    /// emitter, whose reply is the verb's untouched (an `ERR` included); anything
+    /// else is the arm's usage line and emits nothing.
     #[test]
-    fn blocktext_args_validate_grammar_and_trim_the_reply() {
-        let emit = |id: &str| {
-            assert_eq!(id, "7", "only the id reaches the emitter");
-            "OK 4 marker\nout\n\n\n\n".to_string()
-        };
-        assert_eq!(cmd_blocktext_args("7", emit), "OK 4 marker\nout\n\n\n\n");
-        assert_eq!(
-            cmd_blocktext_args("7 trim", emit),
-            "OK 1 marker trimmed=3\nout\n"
-        );
-        for bad in ["", "trim", "x", "7 foo", "7 trim foo", "7trim"] {
+    fn blocktext_args_validate_grammar_and_pass_trim_to_the_emitter() {
+        let emit = |id: u64, trim: bool| format!("OK {id} trim={trim}\n");
+        assert_eq!(cmd_blocktext_args("7", emit), "OK 7 trim=false\n");
+        assert_eq!(cmd_blocktext_args(" 7  trim ", emit), "OK 7 trim=true\n");
+        for bad in ["", "trim", "x", "7 foo", "7 trim foo", "7trim", "-7"] {
             assert_eq!(
-                cmd_blocktext_args(bad, |_| unreachable!("usage errors never emit")),
+                cmd_blocktext_args(bad, |_, _| unreachable!("usage errors never emit")),
                 "ERR usage: blocktext <id> [trim]\n",
                 "{bad:?}"
             );
         }
         assert_eq!(
-            cmd_blocktext_args("7 trim", |_| "ERR no such block\n".to_string()),
+            cmd_blocktext_args("7 trim", |_, _| "ERR no such block\n".to_string()),
             "ERR no such block\n",
-            "an emitter error is not re-framed"
+            "an emitter error is the reply"
         );
-        assert_eq!(
-            trim_lines_reply("OK\n"),
-            "OK\n",
-            "a countless header passes through"
-        );
-        assert_eq!(trim_lines_reply("OK 0\n"), "OK 0 trimmed=0\n");
     }
 }
 
@@ -8544,8 +6461,13 @@ mod offscreen_tests {
 
     use super::{
         OFFSCREEN_BAD_SINCE, OFFSCREEN_DEFAULT_MAX, OFFSCREEN_USAGE, OffscreenArgs, OffscreenSince,
-        cmd_offscreen, cmd_text, offscreen_args, visible_row,
+        cmd_text, offscreen_args, visible_row,
     };
+
+    /// `offscreen` as a session with nothing published serves it.
+    fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+        super::cmd_offscreen(term, &crate::frame_memo::FrameSlot::default(), rest)
+    }
 
     const ROWS: u16 = 8;
     const TRANSCRIPT: usize = 6;
@@ -9145,17 +7067,25 @@ mod devtools_verb_tests {
     }
 }
 
-/// DENSE HISTORY on the native search: the snapshot the `search` verb and the
-/// find bar index reads its scrollback through [`read_abs_rows`]'s one dense
-/// walk, row for row what the per-row readers answer.
+/// The native search over the engine's search-row reader
+/// ([`Terminal::read_search_rows`]): the `search` verb and the find bar read every
+/// row through it, so they key rows by absolute row across a corrupt tiered
+/// segment, read a screen row's soft wrap from the live frame however far the
+/// viewport is scrolled back, and name a history row read only up to its first
+/// MiB.
 #[cfg(test)]
-mod dense_history_tests {
+mod engine_reader_tests {
     use std::sync::{Arc, Mutex};
 
+    use aterm_core::grid::Row;
     use aterm_core::terminal::Terminal;
 
-    use super::{AbsRow, abs_row_text, abs_row_wrapped, cmd_line, cmd_search, read_abs_rows};
+    use super::{
+        EngineSearchDirection, FullHistorySearch, cmd_line, cmd_search,
+        search_full_history_direction,
+    };
     use crate::session_waits::RewrapGauge;
+    use crate::term_lock;
 
     /// A terminal whose history runs through a TIERED store holding a corrupt
     /// warm block between its cold tier and its healthy warm blocks, a needle
@@ -9198,137 +7128,11 @@ mod dense_history_tests {
         (t, corrupt)
     }
 
-    /// A ring-only terminal whose history has been capped, so the oldest
-    /// absolute rows are EVICTED and the oldest retained row is a soft-wrap
-    /// continuation whose head is gone.
-    fn evicted_terminal() -> Terminal {
-        let mut t = Terminal::new(4, 20);
-        t.set_scrollback_line_limit(Some(9));
-        // Every line is two rows: a head and one continuation.
-        for i in 0..30 {
-            t.process(format!("row {i:02} {}\r\n", "r".repeat(30)).as_bytes());
-        }
-        if !oldest_is_a_continuation(&t) {
-            let keep = t.grid().scrollback_lines() - 1;
-            t.set_scrollback_line_limit(Some(keep));
-        }
-        assert!(t.grid().oldest_absolute_row() > 0, "rows were evicted");
-        assert!(
-            oldest_is_a_continuation(&t),
-            "the oldest retained row is a continuation whose head was evicted"
-        );
-        t
-    }
-
-    fn oldest_is_a_continuation(t: &Terminal) -> bool {
-        t.grid()
-            .history_lines_from(0)
-            .next()
-            .flatten()
-            .is_some_and(|line| line.is_wrapped())
-    }
-
-    /// The per-row oracle: what `abs_row_text` / `abs_row_wrapped` answer.
-    fn per_row(t: &Terminal, first: u64, count: usize) -> (Vec<String>, Vec<bool>) {
-        (first..first + count as u64)
-            .map(|abs| {
-                let text = match abs_row_text(t, abs) {
-                    AbsRow::Text(s) => s,
-                    AbsRow::Evicted | AbsRow::OutOfRange | AbsRow::Unreadable => String::new(),
-                };
-                (text, abs_row_wrapped(t, abs))
-            })
-            .unzip()
-    }
-
-    fn dense(t: &Terminal, first: u64, count: usize) -> (Vec<String>, Vec<bool>) {
-        let (mut text, mut wrapped) = (Vec::new(), Vec::new());
-        read_abs_rows(t, first, count, &mut text, &mut wrapped, None);
-        (text, wrapped)
-    }
-
-    /// Every window `first..first + count` over evicted rows, the whole
-    /// retained history, the screen and past its bottom.
-    fn assert_matches_everywhere(t: &Terminal) {
-        let oldest = t.grid().oldest_absolute_row();
-        let bottom = oldest + t.grid().scrollback_lines() as u64 + u64::from(t.rows());
-        let lo = oldest.saturating_sub(3);
-        for first in lo..=bottom + 2 {
-            for count in 0..=usize::try_from(bottom + 3 - first).expect("small") {
-                assert_eq!(
-                    dense(t, first, count),
-                    per_row(t, first, count),
-                    "rows {first}..{} (oldest {oldest})",
-                    first + count as u64
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn abs_rows_read_matches_the_per_row_readers_over_a_corrupt_tiered_segment() {
-        let (t, corrupt) = corrupt_tiered_terminal();
-        assert_matches_everywhere(&t);
-        let oldest = t.grid().oldest_absolute_row();
-        let total = t.grid().scrollback_lines() + usize::from(t.rows());
-        let (text, wrapped) = dense(&t, oldest, total);
-        let scrollback = t.grid().scrollback_lines();
-        assert!(
-            wrapped[..scrollback].iter().any(|&w| w),
-            "history holds soft wraps"
-        );
-        assert!(
-            wrapped[scrollback] && wrapped[total - 1],
-            "the last run straddles the history/screen edge"
-        );
-        // NEGATIVE CONTROL: a reader that skips the undecodable segment (the
-        // shape `ScrollbackIter` has) moves every later row onto its
-        // neighbour's coordinate — the conformance above would catch it.
-        let skipping: Vec<String> = t
-            .grid()
-            .history_lines_from(0)
-            .flatten()
-            .map(|line| line.to_string())
-            .collect();
-        let after = |rows: &[String]| {
-            rows.iter()
-                .position(|row| row.starts_with("NEEDLE_after"))
-                .expect("the second needle is read")
-        };
-        assert_eq!(after(&skipping) + corrupt, after(&text));
-
-        // A per-row client must not mistake a corrupt retained row for the
-        // end of the live screen and silently stop a transcript there.
-        let unreadable = oldest
-            + t.grid()
-                .history_lines_from(0)
-                .position(|line| line.is_none())
-                .expect("a corrupt row") as u64;
-        let bottom = oldest + scrollback as u64 + u64::from(t.rows());
-        let term = Arc::new(Mutex::new(t));
-        assert_eq!(cmd_line(&term, &unreadable.to_string()), "ERR unreadable\n");
-        assert_eq!(cmd_line(&term, &bottom.to_string()), "ERR out of range\n");
-        assert!(
-            cmd_line(&term, &(oldest + 2).to_string()).contains("NEEDLE_before"),
-            "a readable row in the same history remains available"
-        );
-    }
-
-    #[test]
-    fn abs_rows_read_matches_the_per_row_readers_over_evicted_history() {
-        let t = evicted_terminal();
-        assert_matches_everywhere(&t);
-        let oldest = t.grid().oldest_absolute_row();
-        let (_, wrapped) = dense(&t, oldest, 1);
-        assert_eq!(wrapped, [false], "which reads as the start of a line");
-    }
-
     /// PRODUCT LEVEL: the `search` verb (the find bar's engine) over a corrupt
     /// tiered segment keys each needle at its own absolute row — the corrupt
     /// block's placeholder rows sit between them.
     #[test]
     fn native_search_over_a_corrupt_tiered_segment_keeps_absolute_rows() {
-        let _serial = super::search_cap_test_guard();
         let (t, corrupt) = corrupt_tiered_terminal();
         let oldest = t.grid().oldest_absolute_row();
         let term = Arc::new(Mutex::new(t));
@@ -9341,6 +7145,139 @@ mod dense_history_tests {
         assert!(reply.starts_with("OK 2"), "both needles are found: {reply}");
         assert_eq!(rows, [oldest + 2, oldest + 38 + corrupt as u64], "{reply}");
     }
+
+    /// PRODUCT LEVEL: `line` answers a corrupt tiered segment's placeholder
+    /// row `ERR unreadable`, never the `ERR out of range` of the live screen's
+    /// bottom, so a per-row client does not take a corrupt retained row for the
+    /// end of the screen and stop a transcript there; a readable row in the same
+    /// history still answers its text.
+    #[test]
+    fn line_over_a_corrupt_tiered_segment_says_unreadable_not_out_of_range() {
+        let (t, _) = corrupt_tiered_terminal();
+        let oldest = t.grid().oldest_absolute_row();
+        let unreadable = oldest
+            + t.grid()
+                .history_lines_from(0)
+                .position(|line| line.is_none())
+                .expect("a corrupt row") as u64;
+        let bottom = oldest + t.grid().scrollback_lines() as u64 + u64::from(t.rows());
+        let term = Arc::new(Mutex::new(t));
+        assert_eq!(cmd_line(&term, &unreadable.to_string()), "ERR unreadable\n");
+        assert_eq!(cmd_line(&term, &bottom.to_string()), "ERR out of range\n");
+        assert!(
+            cmd_line(&term, &(oldest + 2).to_string()).contains("NEEDLE_before"),
+            "a readable row in the same history remains available"
+        );
+    }
+
+    /// Find reads each screen row's soft wrap from the live frame, so a viewport
+    /// scrolled back, inside the ring or into the tiered history past it, answers as
+    /// the live tail does: the hit straddling a wrap on the screen is found once, at
+    /// the row it starts on, and an anchor on its continuation row is carried into
+    /// the joined line.
+    #[test]
+    fn find_joins_a_soft_wrap_the_same_while_scrolled_back() {
+        // A fresh terminal per offset: a viewport scroll moves no cache key.
+        let scrolled = |offset: i32| {
+            let mut t =
+                Terminal::with_scrollback(6, 20, 8, aterm_scrollback::Scrollback::with_defaults());
+            for i in 0..30 {
+                t.process(format!("filler {i:02}\r\n").as_bytes());
+            }
+            // 25 columns into 20: `NEEDL` ends the head row, `E` starts the next.
+            t.process(b"abcdefghijklmnoNEEDLEtail\r\nplain row\r\nNEEDLE again");
+            t.scroll_display(offset);
+            assert_eq!(
+                t.grid().display_offset(),
+                usize::try_from(offset).expect("non-negative"),
+                "precondition: scrolled"
+            );
+            let rows = t.rows();
+            let live: Vec<bool> = (0..rows)
+                .map(|row| t.grid().row_at_screen(row).is_some_and(Row::is_wrapped))
+                .collect();
+            assert!(live.iter().any(|&w| w), "the screen holds the soft wrap");
+            if offset > 0 {
+                // NEGATIVE CONTROL: the viewport accessor maps through
+                // `display_offset` (or reads nothing past the ring), so a reader
+                // built on it reads other flags on this screen.
+                let viewport: Vec<bool> = (0..rows)
+                    .map(|row| t.grid().row(row).is_some_and(Row::is_wrapped))
+                    .collect();
+                assert_ne!(viewport, live, "offset {offset}");
+            }
+            let screen = t.grid().oldest_absolute_row() + t.grid().scrollback_lines() as u64;
+            let term = Arc::new(Mutex::new(t));
+            // Anchored on the continuation row, two cells in.
+            let anchor = (usize::try_from(screen).expect("row") + 3, 2);
+            let search: FullHistorySearch = search_full_history_direction(
+                &term,
+                "NEEDLE",
+                false,
+                false,
+                EngineSearchDirection::Forward,
+                Some(anchor),
+                false,
+            )
+            .expect("searched");
+            let hits: Vec<(usize, usize, usize)> = search
+                .results
+                .matches
+                .iter()
+                .map(|m| (m.line, m.start_col, m.len()))
+                .collect();
+            let point = search.point_match.map(|m| (m.line, m.start_col, m.len()));
+            (screen as usize, hits, point)
+        };
+        let (screen, live_hits, live_point) = scrolled(0);
+        assert_eq!(
+            live_hits,
+            [(screen + 2, 15, 6), (screen + 5, 0, 6)],
+            "the straddling hit at the row it starts on, and the one after"
+        );
+        assert_eq!(
+            live_point,
+            Some((screen + 5, 0, 6)),
+            "the next hit after the anchor"
+        );
+        // Inside the eight-row ring, and into the tiered history past it.
+        for offset in [1, 2, 20] {
+            assert_eq!(
+                scrolled(offset),
+                (screen, live_hits.clone(), live_point),
+                "scrolled back {offset}"
+            );
+        }
+    }
+
+    /// A history line longer than the MiB a row is read to for search (a crafted
+    /// checkpoint can store one) is searched up to the bound and named in the header,
+    /// ` incomplete long-line`; `line` still reads it whole.
+    #[test]
+    fn search_names_a_history_line_cut_at_the_read_bound() {
+        const BOUND: usize = 1024 * 1024;
+        let terminal = |len: usize| {
+            let mut line = b"NEEDLE ".to_vec();
+            line.resize(len, b'A');
+            let mut scrollback = aterm_scrollback::Scrollback::with_defaults();
+            scrollback.push_line(aterm_scrollback::Line::from_bytes(&line));
+            Arc::new(Mutex::new(Terminal::with_scrollback(
+                4, 80, 1000, scrollback,
+            )))
+        };
+        let header = |term: &Arc<Mutex<Terminal>>| {
+            let reply = cmd_search(term, "needle", &RewrapGauge::default());
+            reply.lines().next().expect("a header").to_string()
+        };
+        // NEGATIVE CONTROL: a line at the bound is read whole.
+        assert_eq!(header(&terminal(BOUND)), "OK 1 screen_first=1");
+        let cut = terminal(BOUND + 1);
+        assert_eq!(header(&cut), "OK 1 incomplete long-line screen_first=1");
+        let oldest = term_lock(&cut).grid().oldest_absolute_row();
+        let reply = cmd_line(&cut, &oldest.to_string());
+        assert_eq!(reply.len(), "OK ".len() + BOUND + 1 + "\n".len());
+        assert!(reply.starts_with("OK NEEDLE A"), "the row as written");
+    }
 }
 
 /// DIFFERENTIAL ORACLE for the one-walk link gather (the
@@ -9351,6 +7288,10 @@ mod dense_history_tests {
 /// What the reference deliberately keeps from the retired shape:
 ///   * `Terminal::render_row_at_screen` — the ALLOCATING per-row accessor (the
 ///     gather reuses one buffer through `render_row_at_screen_into`);
+///   * `Terminal::cell_grapheme(r, c)` — the per-cell glyph, which resolves the
+///     row and applies the DECSCA-aware continuation rule for every cell (the
+///     gather reads each cell once off the held row view, carrying the left
+///     neighbour's WIDE bit);
 ///   * `Grid::cell_extra(r, c)` — the per-cell HASH probe, gated only on the map
 ///     being globally empty (the gather walks the map ONCE);
 ///   * link interning BY VALUE, not by `Arc` pointer: if the pointer intern ever
@@ -9496,6 +7437,23 @@ mod styled_frame_fusion_parity {
         out.push(("double_width_line", t));
         // The narrowest grid the engine builds.
         out.push(("single_column", Terminal::new(3, 1)));
+        // A non-BMP emoji: a complex cell whose text is the ring's one codepoint.
+        let mut t = Terminal::new(2, 10);
+        t.process("a\u{1F600}b".as_bytes());
+        out.push(("ring_emoji", t));
+        // A ZWJ family as the extras MAP stores a cluster (a row restored from
+        // history, or `set_cell_complex_char`): one complex cell, several scalars.
+        let mut t = Terminal::new(2, 10);
+        t.process(b"ab");
+        t.grid_mut()
+            .set_cell_complex_char(0, 0, "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}");
+        out.push(("map_cluster", t));
+        // DECSCA-protected text around a wide glyph: PROTECTED shares bit 10 with
+        // WIDE_CONTINUATION, so only the cell right of a WIDE lead is a
+        // continuation and the protected narrow cells are text.
+        let mut t = Terminal::new(2, 10);
+        t.process("\x1b[1\"qP\u{4f60}Q\x1b[0\"qz".as_bytes());
+        out.push(("decsca_protected", t));
         out
     }
 
@@ -9522,9 +7480,14 @@ mod styled_frame_fusion_parity {
 /// answers `unchanged`, a stale token answers the frame) and its grammar.
 #[cfg(test)]
 mod screen_conditional {
-    use super::{SCREEN_USAGE, cmd_screen_styled_json, screen_args, screen_etag};
+    use super::{SCREEN_USAGE, screen_args, screen_etag};
     use aterm_core::terminal::Terminal;
     use std::sync::{Arc, Mutex};
+
+    /// `screen` as a session with nothing published serves it.
+    fn cmd_screen_styled_json(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+        super::cmd_screen_styled_json(term, &crate::frame_memo::FrameSlot::default(), rest)
+    }
 
     /// What a full `screen` read serves: the frame, with its etag stripped so
     /// the comparison is of the frame alone.

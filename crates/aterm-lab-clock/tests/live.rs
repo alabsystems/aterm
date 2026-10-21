@@ -58,7 +58,7 @@ const UPTIME: [&str; 3] = ["uptime_raw_approx", "absolute", "instant"];
 fn library() -> &'static Path {
     static LIB: OnceLock<PathBuf> = OnceLock::new();
     LIB.get_or_init(|| {
-        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("aterm-lab-clock-build");
+        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("aterm-lab-clock-build.noindex");
         let out = aterm_uds::spawnfd::command(env!("CARGO"))
             .args([
                 "--unverified",

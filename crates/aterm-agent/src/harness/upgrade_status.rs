@@ -2908,15 +2908,18 @@ fn home_exports(line: &str) -> Vec<(&'static str, String)> {
         .iter()
         .filter_map(|word| export_of(word))
         .collect();
-    [crate::harness::accounts::HOME_ENV, "HOME"]
-        .into_iter()
-        .filter_map(|name| {
-            exports
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, value)| (name, (*value).to_string()))
-        })
-        .collect()
+    [
+        crate::harness::accounts::HOME_ENV,
+        crate::harness::accounts::HOMEDIR_ENV,
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        exports
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, value)| (name, (*value).to_string()))
+    })
+    .collect()
 }
 
 /// The launch a relaunch line planned, as its argv: the agent's executable and the words after

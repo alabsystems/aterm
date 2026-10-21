@@ -973,6 +973,7 @@ fn insert_row_identity_is_the_witnessed_row_or_a_priced_whole_width() {
         dispatched_at: now,
         cells: CursorGlow::INSERT_GESTURE_CELLS,
         known: false,
+        breaks: false,
         row: Some(12),
     };
     assert!(
@@ -1000,6 +1001,7 @@ fn insert_row_identity_is_the_witnessed_row_or_a_priced_whole_width() {
         dispatched_at: now,
         cells: 11,
         known: true,
+        breaks: false,
         row: Some(12),
     };
     assert!(

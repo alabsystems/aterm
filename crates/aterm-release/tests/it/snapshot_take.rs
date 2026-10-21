@@ -8,7 +8,7 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::snapshot::{
     CacheHold, CacheRoot, LockedCrate, check_vendored, locked_crates, materialize,
@@ -22,9 +22,13 @@ fn scratch() -> aterm_tempfile::TempDir {
         .unwrap()
 }
 
-/// git with nothing of this machine's own configuration in it.
+/// git with nothing of this machine's own configuration in it, run as the developer
+/// directory's git, not macOS's `/usr/bin/git` trampoline
+/// ([`crate::ledger::testing::git_path`]). No template: a repository it makes carries no
+/// sample hooks, description or info/exclude, files nothing here reads. No `git
+/// maintenance run --auto` after a commit or clone: it does nothing in a fixture this small.
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = crate::ledger::testing::git()
         .arg("-C")
         .arg(dir)
         .args([
@@ -40,6 +44,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "init.defaultBranch=main",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "init.templateDir=",
+            "-c",
+            "maintenance.auto=false",
         ])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -73,7 +81,41 @@ fn held(root: PathBuf) -> CacheHold {
 
 /// A workspace whose lockfile names one crates.io package, a submodule and an
 /// executable — its HEAD commit, and the repository.
+///
+/// Everything before the commit is the same in every test bar where it lies, so it is
+/// made once per process ([`template`]) and laid down here, the submodule's URL (the
+/// absolute path of `sub-origin`, as `git submodule add` records it in `.gitmodules` and
+/// both configs) moved to this `root`; the commit is made here, so `.gitmodules` as
+/// committed names this test's own `sub-origin`, which a `--recurse-submodules` clone
+/// fetches from.
 fn fixture(root: &Path) -> (PathBuf, String) {
+    let template = template();
+    let here = root.to_str().unwrap().as_bytes();
+    for (rel, entry) in &template.entries {
+        let path = root.join(rel);
+        match entry {
+            Entry::Dir => std::fs::create_dir_all(&path).unwrap(),
+            Entry::File(bytes, mode) => {
+                std::fs::write(&path, moved(bytes, template.at.as_bytes(), here)).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(*mode)).unwrap();
+            }
+        }
+    }
+    let repo = root.join("repo");
+    let modules = std::fs::read_to_string(repo.join(".gitmodules")).unwrap();
+    assert!(
+        modules.contains(&format!("url = {}\n", root.join("sub-origin").display())),
+        "{modules}"
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "fixture"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    (repo, head)
+}
+
+/// [`fixture`] up to its commit, at `root`: `sub-origin` committed, `repo` with its files
+/// written and `sub-origin` added as the submodule `vendor/sub`.
+fn uncommitted_fixture(root: &Path) {
     let sub = root.join("sub-origin");
     std::fs::create_dir_all(&sub).unwrap();
     git(&sub, &["init", "-q"]);
@@ -110,10 +152,68 @@ fn fixture(root: &Path) -> (PathBuf, String) {
             "vendor/sub",
         ],
     );
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-qm", "fixture"]);
-    let head = git(&repo, &["rev-parse", "HEAD"]);
-    (repo, head)
+}
+
+/// One path of the [`Template`]: a directory, or a file's bytes and permission bits.
+enum Entry {
+    Dir,
+    File(Vec<u8>, u32),
+}
+
+/// [`uncommitted_fixture`] as read back from where it was made: that root, and every
+/// path under it, each directory before what it holds.
+struct Template {
+    at: String,
+    entries: Vec<(PathBuf, Entry)>,
+}
+
+/// The [`Template`], made once per process in a scratch directory removed once it is read.
+fn template() -> &'static Template {
+    static TEMPLATE: OnceLock<Template> = OnceLock::new();
+    TEMPLATE.get_or_init(|| {
+        let dir = scratch();
+        uncommitted_fixture(dir.path());
+        let mut entries = Vec::new();
+        read_tree(dir.path(), Path::new(""), &mut entries);
+        Template {
+            at: dir.path().to_str().unwrap().to_owned(),
+            entries,
+        }
+    })
+}
+
+/// Every path under `root.join(rel)`, depth first.
+fn read_tree(root: &Path, rel: &Path, into: &mut Vec<(PathBuf, Entry)>) {
+    for entry in std::fs::read_dir(root.join(rel)).unwrap() {
+        let entry = entry.unwrap();
+        let rel = rel.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+        if meta.is_dir() {
+            into.push((rel.clone(), Entry::Dir));
+            read_tree(root, &rel, into);
+        } else {
+            assert!(
+                meta.is_file(),
+                "the fixture makes no link: {}",
+                rel.display()
+            );
+            let mode = meta.permissions().mode() & 0o7777;
+            into.push((rel, Entry::File(std::fs::read(entry.path()).unwrap(), mode)));
+        }
+    }
+}
+
+/// `bytes` with every `from` replaced by `to`.
+fn moved(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(at) = rest.windows(from.len()).position(|w| w == from) {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(to);
+        rest = &rest[at + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 /// A stand-in `targo`: `vendor … <out>` lays one versioned directory per line of

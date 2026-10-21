@@ -65,15 +65,17 @@ you share the result.
 | `<id>.conf` | The shipped theme: generated from its upstream file, never edited by hand. |
 | `ATTRIBUTION.md` | Generated: `aterm theme pack --licences` prints the same text. |
 
-`manifest.tsv` is UTF-8, tab-separated, with `#` comment lines. Its one directive comes first:
-`@collection <repo> <commit> <licence file>` (where `upstream/` comes from). A built-in port's
-source licence needs no row: it is `LICENSES/<spdx>-<repo>.txt`, found from the built-in's own
-source, and the build refuses a missing one, or any file in this folder that nothing names.
-Then a header row, and one row per theme with nine columns:
+`manifest.tsv` is UTF-8, tab-separated, with `#` comment lines. Its directives come first:
+`@collection <repo> <commit> <licence file>` (where `upstream/` comes from), then one
+`@withdrawn <id> <theme>` per id a release shipped that has left the pack, naming the pack theme
+or built-in that replaces it (`aterm theme install <id>` says so). A built-in port's source
+licence needs no row: it is `LICENSES/<spdx>-<repo>.txt`, found from the built-in's own source,
+and the build refuses a missing one, or any file in this folder that nothing names. Then a
+header row, and one row per theme with ten columns:
 
 | Column | Meaning |
 |---|---|
-| `id` | The theme's id: its file name in the themes folder, what `theme = "<id>"` names. |
+| `id` | The theme's id: its file name in the themes folder, what `theme = "<id>"` names and `aterm theme install` takes. Once a release ships it, it never changes: re-spell `name` instead. |
 | `upstream` | Its file under `upstream/` (`ghostty/<upstream>` in the collection). |
 | `appearance` | `dark` or `light`, declared in the file and checked by `--strict`. |
 | `pair` | Its family's theme for the other appearance (a pack id or a built-in), or `-`. |
@@ -82,9 +84,10 @@ Then a header row, and one row per theme with nine columns:
 | `project_url` | The project's home page. |
 | `licence` | The project's SPDX licence id. |
 | `licence_files` | The licence files (`LICENSES/…`, `;`-separated) whose notices the file carries. |
+| `name` | What Settings ▸ Themes shows (the file's `name =`), spelled as aterm spells the family (`Tokyo Night Storm`), or `-` for the id. `aterm theme install` takes it too. |
 
 The build refuses a row whose licence is outside the list above, whose id the themes folder could
-not hold, or whose files are missing.
+not hold, whose id or name another row answers to, or whose files are missing.
 
 ## Adding or refreshing a theme
 

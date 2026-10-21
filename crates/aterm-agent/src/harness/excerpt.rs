@@ -14,11 +14,13 @@
 //!   who typed each `turn` (`by=harness`), and the survey skips a prompt
 //!   whose key a harness record's text has — the newest prompt that was not
 //!   the window harness's own continuation. Kept several deep for that: the
-//!   harness types few distinct lines (`keep going`, its done check), so the
-//!   newest prompt it did not type is among them.
-//! * SAID: the newest text the agent wrote, its done token's lines
-//!   (`ATERM-TASK-DONE` alone) dropped as the task's result drops them: a
-//!   message that is the token alone gives the newest one with words.
+//!   harness types few distinct lines (an owner's own `continue_text`, its
+//!   other acts carrying its mark), so the newest prompt it did not type is
+//!   among them.
+//! * SAID: the newest text the agent wrote, the retired done token's lines
+//!   (`ATERM-TASK-DONE` alone, which older workers still write) dropped as
+//!   the task's result drops them: a message that is the token alone gives
+//!   the newest one with words.
 //! * DOING: the tool in flight, by NAME (`Bash`), never its input — a call of
 //!   the newest assistant message no result has answered yet.
 //!

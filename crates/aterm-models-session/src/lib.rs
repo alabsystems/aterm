@@ -24,6 +24,7 @@ mod models_exceptions_digest;
 mod models_exceptions_ends;
 mod models_exceptions_once;
 mod models_fabric_enable;
+mod models_fabric_exactly_once;
 mod models_fabric_outbox_wake;
 mod models_fabric_resume;
 mod models_fork_exec;
@@ -46,6 +47,7 @@ pub use models_exceptions_digest::exceptions_digest_model;
 pub use models_exceptions_ends::{exceptions_digest_ends_liveness, exceptions_digest_ends_model};
 pub use models_exceptions_once::exceptions_once_model;
 pub use models_fabric_enable::*;
+pub use models_fabric_exactly_once::fabric_exactly_once_model;
 pub use models_fabric_outbox_wake::{
     fabric_outbox_wake_model, fabric_reconnect_backoff_model, fabric_refill_retry_model,
 };

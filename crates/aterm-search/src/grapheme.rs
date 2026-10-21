@@ -151,7 +151,7 @@ pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> u
 /// Offsets and columns are `u32`; a line past 4 GiB of text or 4 Gi columns (only a
 /// soft-wrapped run of millions of rows joined into one line) saturates there, so
 /// its later columns read as the last one instead of wrapping.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ColumnMap {
     /// The graphemes, in byte order, as runs of a repeating shape. Empty for
     /// the identity map (every byte one grapheme one column wide: printable

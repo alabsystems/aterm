@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use super::Terminal;
-use super::content::{TrailingBlanks, visible_row_bounds_to_string};
+use super::content::{TrailingBlanks, push_visible_row_bounds, visible_row_bounds_to_string};
 use crate::search::LineCells;
 use crate::selection::SmartSelection;
 
@@ -504,6 +504,24 @@ impl Terminal {
     /// the whole line.
     pub fn get_line_text(&self, row: i32, col_range: Option<(u16, u16)>) -> Option<String> {
         self.line_text(row, col_range, TrailingBlanks::Trim)
+    }
+
+    /// Append live screen row `row`'s whole text to `out`: the bytes
+    /// [`get_line_text(row, None)`](Self::get_line_text) returns, with no `String` of its
+    /// own, for a reader that builds one reply or hash from many rows. What `out` held is
+    /// kept; the trailing-blank trim reads only the appended text. `false`, with nothing
+    /// appended, when `row` is not a screen row.
+    pub fn push_line_text(&self, row: usize, out: &mut String) -> bool {
+        let Ok(row) = u16::try_from(row) else {
+            return false;
+        };
+        if row >= self.grid.rows() {
+            return false;
+        }
+        if let Some(last_col) = self.grid.cols().checked_sub(1) {
+            push_visible_row_bounds(&self.grid, row, 0, last_col, TrailingBlanks::Trim, out);
+        }
+        true
     }
 
     /// The text a row holds as written, trailing blanks included: every cell a live row's
@@ -1236,6 +1254,47 @@ mod tests {
                 "live row {r} must read the same while scrolled back"
             );
         }
+    }
+
+    /// `push_line_text` appends exactly `get_line_text(row, None)` for every screen row
+    /// (wide glyphs, combining marks, a ZWJ cluster, written trailing blanks and NBSP,
+    /// an empty row) while the view is scrolled back, keeps what the buffer held, and
+    /// appends nothing for a row off the screen. NEGATIVE CONTROL: a blank row pushed
+    /// after a prefix ending in spaces leaves those spaces, where a trim of the whole
+    /// buffer would take them.
+    #[test]
+    fn push_line_text_appends_get_line_text_and_keeps_the_prefix() {
+        let mut term = crate::terminal::Terminal::new(6, 12);
+        for i in 0..20 {
+            term.process(format!("old{i}\r\n").as_bytes());
+        }
+        term.process("界e\u{301}👨\u{200d}👩 x   \r\n".as_bytes());
+        term.process("pad\u{a0}  \r\n\r\n".as_bytes());
+        term.scroll_display(4);
+        for row in 0..8 {
+            let mut out = String::from("pre ");
+            let on_screen = term.push_line_text(row, &mut out);
+            let want = i32::try_from(row)
+                .ok()
+                .and_then(|r| term.get_line_text(r, None));
+            assert_eq!(on_screen, want.is_some(), "row {row}");
+            assert_eq!(
+                out,
+                format!("pre {}", want.unwrap_or_default()),
+                "row {row}"
+            );
+        }
+        assert_eq!(
+            term.get_line_text(2, None).as_deref(),
+            Some("界e\u{301}👨\u{200d}👩 x"),
+            "precondition: the fixture row reads whole"
+        );
+
+        assert_eq!(term.get_line_text(5, None).as_deref(), Some(""));
+        let mut out = String::from("pre  ");
+        assert!(term.push_line_text(5, &mut out));
+        assert_eq!(out, "pre  ", "the trim never reaches the prefix");
+        assert_ne!(out.trim_end(), out, "control: a whole-buffer trim would");
     }
 
     /// The copied text does not change when the viewport scrolls between drag and copy.

@@ -98,7 +98,10 @@ fn driver(
         if argv.iter().any(|a| a == "build") {
             let mut s = String::new();
             for (name, bytes) in &bins {
-                let exe = put_exe(&out.join("targets/trust-ir/release").join(name), bytes);
+                let exe = put_exe(
+                    &out.join("targets.noindex/trust-ir/release").join(name),
+                    bytes,
+                );
                 s.push_str(&format!(
                     "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\",\"kind\":[\"bin\"]}},\"executable\":\"{}\"}}\n",
                     exe.display()
@@ -174,7 +177,11 @@ fn each_policy_plans_its_lane_with_the_seals_own_compiler() {
     );
     assert_eq!(
         plan.command.env_of("CARGO_TARGET_DIR"),
-        Some(&w.root.join("dev-builds/targets/trust-ir").into_os_string())
+        Some(
+            &w.root
+                .join("dev-builds/targets.noindex/trust-ir")
+                .into_os_string()
+        )
     );
     assert_eq!(
         plan.triple.as_str(),

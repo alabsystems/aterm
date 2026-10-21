@@ -599,6 +599,100 @@ fn is_tool_row(row: &str) -> bool {
 /// ended on Gemini CLI's own rows (a cancel, an error, a tool's box or row).
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
+    said_reply(rows).map(|(_, said)| said)
+}
+
+/// WHETHER THE REPLY [`said_tail`] READS IS WHOLE ON `rows`: its `✦ ` head
+/// is one of them. `false` for a reply taller than the rows, its head above
+/// them (its tail is then the rows in sight from the top, and what stood
+/// above them — a need, an open item — is not in it), and where there are
+/// no last words.
+#[must_use]
+pub fn said_whole(rows: &[String]) -> bool {
+    said_reply(rows).is_some_and(|(head, _)| head.is_some())
+}
+
+/// THE AGENT'S OTHER WORDS IN THE TURN ITS LAST WORDS END ([`said_tail`]):
+/// every `✦ ` reply of the same turn above its last — the words it said
+/// before a tool call, say — oldest first, each as [`said_tail`] reads one
+/// (its `✦` and indent stripped, one line per row, from its head down to the
+/// last of its rows before Gemini CLI's own: a tool's box or row, a notice),
+/// joined by a blank line. The turn is the rows under the last message a
+/// person sent, or from the rows' top where it is above them. `None` where
+/// the turn holds no other reply on `rows`, or the last reply's head is not
+/// on them.
+#[must_use]
+pub fn turn_said_before(rows: &[String]) -> Option<String> {
+    let (_, said) = turn_before(rows)?;
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+/// WHETHER THE TURN [`said_tail`]'s REPLY ENDS IS WHOLE ON `rows`: the reply
+/// is ([`said_whole`]), and so is the band of the person's message that
+/// opened the turn. `false` where the turn reaches the rows' top: an earlier
+/// reply of the turn, and a need said in it, may stand above them.
+#[must_use]
+pub fn turn_whole(rows: &[String]) -> bool {
+    turn_before(rows).is_some_and(|(opened, _)| opened)
+}
+
+/// A row a read of the history above the screen stops at, for a turn
+/// [`turn_whole`] finds cut: the top of a band (`▄▄▄…`), the person's
+/// message's that opened the turn, read walking up — its `▀` bottom and its
+/// text are under it.
+#[must_use]
+pub fn turn_history_stop(row: &str) -> bool {
+    run_of(row, BAND_TOP).is_some()
+}
+
+/// THE MESSAGE THAT OPENED THE TURN [`said_tail`]'s REPLY ENDS: the text of
+/// the band of the person's last message (` > text`, the rows it wrapped
+/// onto three columns in), joined by a space. `None` where there are no
+/// last words, and where that band is not on `rows`.
+#[must_use]
+pub fn turn_opened_by(rows: &[String]) -> Option<String> {
+    said_reply(rows)?;
+    let (_, end) = ended_on(rows)?;
+    let bottom = last_user(rows, end)?;
+    let sent = (1..bottom).rev().find(|&c| is_sent_row(&rows[c]))?;
+    let text: Vec<&str> = std::iter::once(rows[sent].get(3..).unwrap_or(""))
+        .chain(rows[sent + 1..bottom].iter().map(String::as_str))
+        .map(crate::text::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    Some(text.join(" "))
+}
+
+/// The turn [`turn_said_before`] reads: whether the band of the message that
+/// opened it is on `rows` ([`turn_whole`]), and the words of its other
+/// replies, oldest first. `None` where the last reply's head is not on
+/// `rows`, or there are no last words.
+fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
+    let (from, end) = ended_on(rows)?;
+    let head = said_reply(rows)?.0?;
+    let own = |r: &String| blank(r) || (leading_spaces(r) >= 2 && !is_tool_row(r));
+    let mut said = Vec::new();
+    for h in (from..head).filter(|&h| rows[h].starts_with("✦ ")) {
+        let last = (h + 1..head)
+            .take_while(|&k| own(&rows[k]))
+            .filter(|&k| !blank(&rows[k]))
+            .last()
+            .unwrap_or(h);
+        let words: Vec<&str> = rows[h..=last]
+            .iter()
+            .map(|r| crate::text::trim(r.strip_prefix("✦ ").unwrap_or(r)))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !words.is_empty() {
+            said.push(words.join("\n"));
+        }
+    }
+    Some((last_user(rows, end).is_some(), said))
+}
+
+/// The reply [`said_tail`] reads, as `(its head's row where it is on the
+/// rows, its words)`.
+fn said_reply(rows: &[String]) -> Option<(Option<usize>, String)> {
     let (from, end) = ended_on(rows)?;
     if from == 0 && rows[..end].iter().any(|r| is_banner_row(r)) {
         return None;
@@ -623,7 +717,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
         .map(|r| crate::text::trim(r.strip_prefix("✦ ").unwrap_or(r)))
         .filter(|t| !t.is_empty())
         .collect();
-    Some(out.join("\n"))
+    Some((head, out.join("\n")))
 }
 
 /// Whether a PERSON stopped the last turn: under the last message, Gemini

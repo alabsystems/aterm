@@ -12,7 +12,6 @@
 use crate::supervise::journal::{AGAIN_ADOPTED, AGAIN_RETRY, AGAIN_UNPARKED};
 use crate::supervise::policy::turn_end::{
     DONE_CHECK, LAND, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT,
-    RULE_OPEN_ITEMS,
 };
 
 /// A turn that ended after 3 minutes of work (the done row's measure), the
@@ -36,24 +35,26 @@ fn under(policy: SupervisorConfig) -> SuperviseOpts {
 /// The session's word `land`: the point is decided at Cruise first, the word
 /// read (one bare `meta`, before the `status` an act reads) where Cruise
 /// would act, and the land instruction typed where `keep going` would be;
-/// the worker's done reply ends the task, said once (`DONE … rule=land@v1`).
-/// NEGATIVE CONTROL: a host whose `meta` names no word (an older build) is
-/// asked nothing more, and the table's Cruise continues.
+/// the worker's clean defense (`Nothing left: …`) lands the task, said once
+/// (`DONE … rule=land@v1`). NEGATIVE CONTROL: a host whose `meta` names no
+/// word (an older build) is asked nothing more, and the table's Cruise
+/// continues.
 #[test]
-fn the_sessions_land_word_types_the_land_instruction_and_a_done_reply_ends_the_task() {
+fn the_sessions_land_word_types_the_land_instruction_and_a_clean_defense_lands() {
     let (dir, journal) = journal_file("autopilot-land");
     let mut m = Mock::new(vec![
         busy_screen(),
         worked("Fixed the parser; the suite is green."),
         busy_screen(),
-        worked("Committed the parser and its tests. All done."),
+        worked("Nothing left: all of it is merged into the remote main branch."),
     ]);
+    m.history_served();
     m.autopilot = Some("land");
     m.turn_releases = Some(1);
     m.vanish_after = Some(4);
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
-        ..under(SupervisorConfig::default())
+        ..under(owners_policy())
     };
     let (lines, _) = watch_lines(&mut m, &opts);
     let head = format!("CONTINUED seq=102 rule={RULE_LAND} ");
@@ -99,7 +100,7 @@ fn the_sessions_land_word_types_the_land_instruction_and_a_done_reply_ends_the_t
     ]);
     m.turn_releases = Some(1);
     m.vanish_after = Some(2);
-    let (lines, _) = watch_lines(&mut m, &under(SupervisorConfig::default()));
+    let (lines, _) = watch_lines(&mut m, &under(owners_policy()));
     assert!(
         lines.contains(&format!(
             "CONTINUED seq=102 rule={RULE_CONTINUE} keep going"
@@ -142,7 +143,7 @@ fn a_persons_greeting_under_land_is_left_to_them() {
     };
     let policy = SupervisorConfig {
         human_grace_s: 0,
-        ..SupervisorConfig::default()
+        ..owners_policy()
     };
     let (dir, journal) = journal_file("autopilot-land-exchange");
     let mut m = Mock::new(vec![busy_screen(), quick.clone()]);
@@ -251,13 +252,15 @@ fn acted_on(case: &str, rule: &str, (turns, said, lines): &(usize, Vec<String>, 
 /// nobody's stamp.
 #[test]
 fn a_loop_started_as_off_lifted_acts_on_the_point_it_finds() {
-    // The land instruction as Claude Code wraps it under its `❯`.
-    let (first, rest) = LAND.split_at(LAND.find(" Finish only").expect("the land text"));
-    let land_rows = [format!("❯ {first}"), format!("  {}", rest.trim_start())];
+    // An act's text as Claude Code wraps it under its `❯`: two rows, split
+    // at a space near the middle.
+    let wrapped = |text: &str| {
+        let (first, rest) = text.split_at(text[..text.len() / 2].rfind(' ').expect("a space"));
+        [format!("❯ {first}"), format!("  {}", rest.trim_start())]
+    };
+    let land_rows = wrapped(LAND);
     let land_rows: Vec<&str> = land_rows.iter().map(String::as_str).collect();
-    // The done check as Claude Code wraps it under its `❯`.
-    let (first, rest) = DONE_CHECK.split_at(DONE_CHECK.find(" Report whether").expect("the check"));
-    let check_rows = [format!("❯ {first}"), format!("  {}", rest.trim_start())];
+    let check_rows = wrapped(DONE_CHECK);
     let check_rows: Vec<&str> = check_rows.iter().map(String::as_str).collect();
     // A case: its name, its screen, the act the stopped loop typed (its rule
     // and text), and the rule of the act the new loop types.
@@ -387,7 +390,7 @@ fn an_off_park_then_cruise_acts_on_the_point_it_never_saw_run() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             journal: Some(journal.clone()),
             ..auto(1)
@@ -454,7 +457,7 @@ fn run_lifted(
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         journal: Some(journal.clone()),
         idle_host: lifted.map(|l| Arc::new(Lifted(l)) as Arc<dyn IdleHost>),
@@ -616,7 +619,7 @@ fn the_point_off_stood_on_read_again_is_continued_as_before_the_park() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             journal: Some(journal.clone()),
             ..auto(1)
@@ -671,7 +674,7 @@ const MIN_LOOP: Duration = Duration::from_secs(60);
 fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() {
     let land = SupervisorConfig {
         autopilot: Autopilot::Land,
-        ..SupervisorConfig::default()
+        ..owners_policy()
     };
     let mut m = Mock::new(vec![
         busy_screen(),
@@ -690,7 +693,7 @@ fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() 
 
     let off = SupervisorConfig {
         autopilot: Autopilot::Off,
-        ..SupervisorConfig::default()
+        ..owners_policy()
     };
     let mut m = Mock::new(vec![
         busy_screen(),
@@ -707,6 +710,55 @@ fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() 
         "{lines:#?}"
     );
     assert!(!lines.iter().any(|l| l.starts_with("PARKED")), "{lines:#?}");
+}
+
+/// WHO SET IT IS READ PAST (aterm-gui's `meta` since 2026-10-19, design
+/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.2): a bare `meta`
+/// whose tail names who set the word and when after `land_at=`
+/// (`autopilot_by=human:menu autopilot_since=1792177200`) gives the loop the
+/// same word as a reply without them, set or unset — the reader keys by
+/// name, and `autopilot_by=` is not `autopilot=`. NEGATIVE CONTROL: the
+/// setter spelled under the word's own key, ahead of it, is read as the
+/// word, and no word parses from it — the table's decides.
+#[test]
+fn the_autopilot_word_is_read_past_who_set_it() {
+    let land = SupervisorConfig {
+        autopilot: Autopilot::Land,
+        ..SupervisorConfig::default()
+    };
+    let opts = under(land);
+    let head = "OK title=- user_title=- description=- icon=- role=- attention=- cwd=- state=idle \
+                attention_owner=- attention_owners=0 attention_kinds=- supervisor=- \
+                supervisor_proven=0 questions=- agent_cwd=- trusted_cwd=-";
+    let read = |tail: &str| {
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, None);
+        s.note_meta(&format!("{head} {tail}\n"));
+        s.autopilot(&opts)
+    };
+    for (word, want) in [
+        ("off", Autopilot::Off),
+        ("cruise", Autopilot::Cruise),
+        ("-", Autopilot::Land),
+    ] {
+        let bare = read(&format!("autopilot={word} land_at=-"));
+        assert_eq!(bare, want, "{word}");
+        for by in ["human:menu", "ctl", "aterm", "restored", "-"] {
+            assert_eq!(
+                read(&format!(
+                    "autopilot={word} land_at=- autopilot_by={by} autopilot_since=1792177200"
+                )),
+                want,
+                "{word} by {by}"
+            );
+        }
+    }
+    // NEGATIVE CONTROL: the setter under the word's key, read first.
+    assert_eq!(
+        read("autopilot=human:menu autopilot=off land_at=-"),
+        Autopilot::Land,
+        "the first `autopilot=` is the word"
+    );
 }
 
 /// The journal's lines of the run that wrote `journal`.
@@ -748,7 +800,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     let mut m = Mock::new(script());
     m.autopilot = Some("off");
     m.vanish_after = Some(3);
-    let (lines, said) = run(&mut m, SupervisorConfig::default(), "autopilot-off");
+    let (lines, said) = run(&mut m, owners_policy(), "autopilot-off");
     assert!(
         said.iter()
             .any(|l| l.starts_with("PARKED seq=102 autopilot=off")),
@@ -779,7 +831,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     m.autopilot = Some("off");
     m.autopilot_at = vec![(3, Some("cruise"))];
     m.vanish_after = Some(4);
-    let (lines, said) = run(&mut m, SupervisorConfig::default(), "autopilot-back");
+    let (lines, said) = run(&mut m, owners_policy(), "autopilot-back");
     let parked = said
         .iter()
         .position(|l| l.starts_with("PARKED seq=102"))
@@ -800,7 +852,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     // The table's off on a host that keeps no word: parked, nothing asked.
     let off = SupervisorConfig {
         autopilot: Autopilot::Off,
-        ..SupervisorConfig::default()
+        ..owners_policy()
     };
     let mut m = Mock::new(script());
     m.vanish_after = Some(3);
@@ -821,7 +873,7 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     let mut m = Mock::new(script());
     m.autopilot = Some("cruise");
     m.vanish_after = Some(2);
-    let (_, said) = run(&mut m, SupervisorConfig::default(), "autopilot-cruise");
+    let (_, said) = run(&mut m, owners_policy(), "autopilot-cruise");
     assert!(!said.iter().any(|l| l.contains("PARKED")), "{said:#?}");
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
 }
@@ -1011,7 +1063,7 @@ fn an_autopilot_off_park_gives_the_claim_back_and_takes_it_again() {
     m.autopilot = Some("off");
     m.autopilot_at = vec![(3, Some("cruise"))];
     m.vanish_after = Some(4);
-    let (lines, _) = watch_lines_with(&mut m, &under(SupervisorConfig::default()), claimed);
+    let (lines, _) = watch_lines_with(&mut m, &under(owners_policy()), claimed);
     let order = order(&m);
     let given = order
         .iter()
@@ -1057,7 +1109,7 @@ fn an_autopilot_off_park_gives_the_claim_back_and_takes_it_again() {
     let mut m = Mock::new(script());
     m.autopilot = Some("cruise");
     m.vanish_after = Some(2);
-    let _ = watch_lines_with(&mut m, &under(SupervisorConfig::default()), claimed);
+    let _ = watch_lines_with(&mut m, &under(owners_policy()), claimed);
     assert!(
         !m.claims.iter().any(|c| c.contains("unset")),
         "{:#?}",
@@ -1085,7 +1137,7 @@ fn land_then_off_then_land_types_the_land_instruction_again() {
         let (dir, journal) = journal_file(tag);
         let opts = SuperviseOpts {
             journal: Some(journal.clone()),
-            ..under(SupervisorConfig::default())
+            ..under(owners_policy())
         };
         let (lines, _) = watch_lines(m, &opts);
         let said = journaled(&journal);
@@ -1157,7 +1209,7 @@ fn a_refused_read_of_the_word_keeps_the_word_last_read() {
         let (dir, journal) = journal_file(tag);
         let opts = SuperviseOpts {
             journal: Some(journal.clone()),
-            ..under(SupervisorConfig::default())
+            ..under(owners_policy())
         };
         let (lines, _) = watch_lines(&mut m, &opts);
         let said = journaled(&journal);
@@ -1241,20 +1293,14 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE USUAL LANDING ENDS ON THE WORKER'S OWN TOKEN — the land instruction
-/// asks for it, beside a summary that names nothing left — and that end is
-/// Land's: `DONE … rule=land@v1`, never `finished@v1`. A token beside a
-/// summary that still lists work left ends nothing under Land either (the
-/// owner's rule of 2026-10-19): no `DONE`, its challenge waiting the back-off
-/// the short reply earned (the policy's tests read the challenge's Land
-/// words). NEGATIVE CONTROLS: under Cruise the same open reply ends nothing
-/// either, and the token under a report that leaves nothing is the worker's
-/// own `finished@v1`.
+/// THE RETIRED TOKEN LANDS NOTHING: a reply to the land instruction that
+/// ends on `ATERM-TASK-DONE` beside work left is no clean defense, so Land
+/// nudges it (`land-nudge@v1`) and journals no `DONE`. Under Cruise the same
+/// reply, and a token under a report that leaves nothing, are done claims
+/// that get the done check (FOREVER CRUISE), never an end.
 #[test]
-fn a_token_reply_to_the_land_instruction_is_lands_done() {
-    // The `DONE` lines, and whether the challenge at seq 104 waited the
-    // back-off.
-    let run = |word: &'static str, tag: &str, reply: &str| {
+fn a_token_reply_to_the_land_instruction_is_nudged_never_landed() {
+    let done_lines = |word: &'static str, tag: &str, reply: &str| {
         let mut m = Mock::new(vec![
             busy_screen(),
             worked("Fixed the parser; the suite is green."),
@@ -1264,48 +1310,46 @@ fn a_token_reply_to_the_land_instruction_is_lands_done() {
         m.autopilot = Some(word);
         m.turn_releases = Some(1);
         m.vanish_after = Some(4);
+        // A wait on the screen that sits passes the time it asks: an act
+        // the claim's back-off holds comes inside the run.
+        m.stall_sleep = Some(Duration::from_millis(20));
         let (dir, journal) = journal_file(tag);
         let opts = SuperviseOpts {
             journal: Some(journal.clone()),
-            ..under(SupervisorConfig::default())
+            ..under(owners_policy())
         };
-        let _ = watch_lines(&mut m, &opts);
+        let _ = watch_lines_with(&mut m, &opts, |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                short_backoff: Duration::from_millis(30),
+                short_backoff_max: Duration::from_millis(60),
+                ..TurnEndTiming::default()
+            });
+        });
         let all = journaled(&journal);
         let _ = std::fs::remove_dir_all(&dir);
-        let done: Vec<String> = all
-            .iter()
-            .filter(|l| l.starts_with("DONE "))
-            .cloned()
-            .collect();
-        let waited = all
-            .iter()
-            .any(|l| l.starts_with("WAITING seq=104 ") && l.contains("back-off"))
-            || all
-                .iter()
-                .any(|l| l.starts_with(&format!("CONTINUED seq=104 rule={RULE_OPEN_ITEMS} ")));
-        (done, waited, all)
+        all
     };
-    let clean = "Committed the parser and the lexer. Nothing left.\nATERM-TASK-DONE";
-    let (done, _, all) = run("land", "autopilot-land-token", clean);
-    assert_eq!(done.len(), 1, "{all:#?}");
-    assert!(
-        done[0].starts_with(&format!("DONE seq=104 rule={RULE_LAND} ")),
-        "{all:#?}"
-    );
-    // Work left beside the token: ended by nothing under Land…
     let left = "Committed the parser. Left: the lexer.\nATERM-TASK-DONE";
-    let (done, waited, all) = run("land", "autopilot-land-left", left);
-    assert!(done.is_empty() && waited, "{all:#?}");
-    // NEGATIVE CONTROLS: …nor under Cruise…
-    let (done, waited, all) = run("cruise", "autopilot-cruise-token", left);
-    assert!(done.is_empty() && waited, "{all:#?}");
-    // …and Cruise ends on a report that leaves nothing.
-    let (done, _, all) = run("cruise", "autopilot-cruise-clean", clean);
-    assert_eq!(done.len(), 1, "{all:#?}");
-    assert!(
-        done[0].starts_with("DONE seq=104 rule=finished@v1 "),
-        "{all:#?}"
-    );
+    let clean = "Committed the parser and the lexer. Nothing left.\nATERM-TASK-DONE";
+    for (word, tag, reply, rule) in [
+        ("land", "autopilot-land-token", left, RULE_LAND_NUDGE),
+        ("cruise", "autopilot-cruise-token", left, RULE_DONE_CHECK),
+        ("cruise", "autopilot-cruise-clean", clean, RULE_DONE_CHECK),
+    ] {
+        let all = done_lines(word, tag, reply);
+        let said: Vec<&String> = all
+            .iter()
+            .filter(|l| {
+                l.starts_with("DONE ")
+                    || (l.starts_with("CONTINUED ") && !l.starts_with("CONTINUED seq=102 "))
+            })
+            .collect();
+        assert_eq!(said.len(), 1, "{tag}: {all:#?}");
+        assert!(
+            said[0].starts_with("CONTINUED ") && said[0].contains(&format!(" rule={rule} ")),
+            "{tag}: {all:#?}"
+        );
+    }
 }
 
 /// What a step of the loop SAID and what it only NOTED (the journal alone).
@@ -1661,7 +1705,7 @@ fn an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked() {
             s.attention_ours = Some(entry.to_string());
             s.turn_end_badge = true;
             let deadline = Instant::now() + Duration::from_secs(60);
-            let opts = under(SupervisorConfig::default());
+            let opts = under(owners_policy());
             assert_eq!(s.park_while_off(100, deadline, &opts, &mut notes), Ok(()));
             s.turn_end_badge
         };
@@ -1918,7 +1962,7 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode() {
             s.attention_ours = Some(entry.clone());
             setup(&mut s);
             let deadline = Instant::now() + Duration::from_secs(60);
-            let opts = under(SupervisorConfig::default());
+            let opts = under(owners_policy());
             assert_eq!(s.park_while_off(100, deadline, &opts, &mut notes), Ok(()));
             assert_eq!(s.open_episode(102, notice, None, false, &mut notes), Ok(()));
             s.limit.as_ref().map(|ep| ep.seq)
@@ -1969,7 +2013,7 @@ fn a_limit_after_the_worker_answered_an_adopted_one_is_a_new_ask() {
             ..under(SupervisorConfig {
                 continue_policy: false,
                 resume_limits: false,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             })
         };
         let _ = watch_lines_with(&mut m, &opts, |_| {});
@@ -2036,7 +2080,7 @@ fn a_loop_behind_another_holder_reads_the_word_and_its_park_ends_on_it() {
             journal: Some(journal.clone()),
             ..under(SupervisorConfig {
                 autopilot: Autopilot::Off,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             })
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {

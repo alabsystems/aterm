@@ -22,7 +22,7 @@ pub mod status;
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::host::{HostError, ReleaseHost, Slug};
+use crate::host::{HostError, Probe, ReleaseHost, Slug};
 
 /// A verb's transcript: every line it says, in order. A real run echoes each line as it
 /// is said (a group publish takes an hour); a test captures them and reads them back.
@@ -161,6 +161,31 @@ pub fn download_retried(
         }
     }
     Err(last)
+}
+
+/// How many times an asset this run just created or uploaded is probed on the download
+/// host, [`ReleaseHost::retry_pause`] apart, before it is called unserved: the download
+/// host serves a fresh release only after a while (2026-10-20: `atpkg-index-76` still
+/// answered 404 eight seconds after it was published, and 200 within half a minute).
+/// Thirteen probes five seconds apart are a one-minute hang detector, not a latency budget.
+pub const SERVE_PROBES: usize = 13;
+
+/// What the download host answers for `asset` of a release this run just created or
+/// uploaded: [`Probe::Present`] as soon as it serves it, else its last answer after
+/// [`SERVE_PROBES`] probes.
+#[must_use]
+pub fn probe_served(host: &dyn ReleaseHost, slug: &Slug, tag: &str, asset: &str) -> Probe {
+    let mut answer = Probe::Absent;
+    for attempt in 0..SERVE_PROBES {
+        if attempt > 0 {
+            std::thread::sleep(host.retry_pause());
+        }
+        answer = host.probe_public(slug, tag, asset);
+        if answer == Probe::Present {
+            break;
+        }
+    }
+    answer
 }
 
 /// A freshness horizon a client can read and has not passed: exactly

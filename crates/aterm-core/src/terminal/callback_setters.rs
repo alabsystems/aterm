@@ -71,16 +71,6 @@ impl Terminal {
         self.finalize_resize(cols_changed, rows_before, origin);
     }
 
-    /// The primary-content grid: the inactive one while the alternate screen
-    /// is up.
-    fn main_grid_mut(&mut self) -> &mut crate::grid::Grid {
-        if self.modes.alternate_screen {
-            self.alt_grid.as_mut().unwrap_or(&mut self.grid)
-        } else {
-            &mut self.grid
-        }
-    }
-
     /// Lend the main grid's holder-fence anchors out for a width change or
     /// a re-attach ([`Grid::lend_anchors`](crate::grid::Grid::lend_anchors)),
     /// reading history no further than `reach`. `None`, free, when no drawer

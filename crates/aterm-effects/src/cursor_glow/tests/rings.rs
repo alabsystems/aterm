@@ -22,7 +22,7 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
         scale: 1.0,
     };
 
-    // Dark: additive square outline, never a source-over veil.
+    // Dark: an additive round bloom, never a source-over veil.
     let c_dark = cfg(GlowStyle::RainbowKitty, true);
     let dark = CursorGlow {
         ring: Some(ring),
@@ -31,8 +31,8 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     let (mut d_out, mut d_h) = (Vec::new(), Vec::new());
     dark.emit_ring(at, &c_dark, g, &mut d_out, &mut d_h);
     assert!(
-        !d_out.is_empty(),
-        "dark draws the additive square shockwave"
+        !d_h.is_empty() && d_out.is_empty(),
+        "dark draws the additive round shockwave as halos"
     );
     assert!(
         d_h.iter().all(|h| h.mode != HaloMode::Over),
@@ -48,10 +48,7 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     };
     let (mut l_out, mut l_h) = (Vec::new(), Vec::new());
     light.emit_ring(at, &c_light, g, &mut l_out, &mut l_h);
-    assert!(
-        l_out.is_empty(),
-        "the additive square shockwave is suppressed on light"
-    );
+    assert!(l_out.is_empty(), "no additive shockwave on light");
     assert!(
         !l_h.is_empty() && l_h.iter().all(|h| h.mode == HaloMode::Over),
         "the light ring is a source-over darken veil"
@@ -63,6 +60,67 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
         }),
         "the light ring veil is capped for legibility"
     );
+}
+
+/// Every style lands a ring on a light ground, and none of it is additive:
+/// Water lands its two-ripple train in conservative ink over the text
+/// (source-over quads under the over-text ceiling), and every other style,
+/// Fire included, the shared source-over veil ring, capped for legibility.
+#[test]
+fn every_style_lands_a_veil_ring_on_light() {
+    let g = geom();
+    let born = Instant::now();
+    let ring = Ring {
+        cx: 100.0,
+        cy: 40.0,
+        born,
+        life: 0.30,
+        scale: 1.0,
+    };
+    for style in [
+        GlowStyle::Fire,
+        GlowStyle::Water,
+        GlowStyle::Laser,
+        GlowStyle::Phaser,
+        GlowStyle::Comet,
+    ] {
+        let mut c = cfg(style, true);
+        c.dark_theme = false;
+        let glow = CursorGlow {
+            ring: Some(ring),
+            ..Default::default()
+        };
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_ring(
+            born + Duration::from_millis(60),
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+        );
+        if style == GlowStyle::Water {
+            assert!(halos.is_empty(), "the light ripples are quads");
+            assert!(
+                !out.is_empty()
+                    && out
+                        .iter()
+                        .all(|q| q.alpha > 0 && f32::from(q.alpha) <= LIGHT_INK_ALPHA_CAP),
+                "the light ripples are source-over ink under the over-text ceiling"
+            );
+            continue;
+        }
+        assert!(out.is_empty(), "{style:?}: no additive ring quads on light");
+        assert!(
+            !halos.is_empty() && halos.iter().all(|h| h.mode == HaloMode::Over),
+            "{style:?}: the light ring is a source-over veil"
+        );
+        assert!(
+            halos
+                .iter()
+                .all(|h| (1..=120).contains(&((h.color >> 24) & 0xff))),
+            "{style:?}: the veil is capped for legibility"
+        );
+    }
 }
 
 /// The same ring at the same age: a full-line jump's outline reaches
@@ -119,15 +177,33 @@ fn classic_landing_ring_expands_wider_with_the_jump() {
     }
 }
 
-/// The landing ring's four bars partition the square outline: no pixel is
-/// owned by two bars (an additive double-add would light each corner ~2×), and
-/// the outline stays closed on every edge.
+/// The dark landing ring is one soft round bloom, not a thin square outline
+/// (which read as a stray rectangle left on the page, a side of it cut off by
+/// the pad): through its life its light is radial halos and no quad, along
+/// the row through its middle it is brightest at the middle and falls off a
+/// little at a time to nothing, and it is round (as wide as tall, within the
+/// halo's own squash). Negative control: the old outline's four 2 px bars at
+/// the same size, laid on the same probe, show the hard edge it looks for.
 #[test]
-fn landing_ring_bars_partition_the_square_outline() {
+fn the_dark_landing_ring_is_a_soft_round_bloom() {
     let g = geom();
     let born = Instant::now();
     let c = cfg(GlowStyle::Phaser, true);
-    // Sweep the ring's life so every expansion size s is exercised.
+    // The light along the row through the ring's middle, and down the column.
+    let lines = |quads: &[GlowQuad], halos: &[RainHalo], cx: i32, cy: i32| {
+        let mut glass = Glass::new(g, 0);
+        glass.add_quads(quads);
+        glass.add_halos(halos);
+        let across: Vec<i32> = (0..i32::from(g.win_w))
+            .map(|x| glass.level(cy, x))
+            .collect();
+        let down: Vec<i32> = (0..i32::from(g.win_h))
+            .map(|y| glass.level(y, cx))
+            .collect();
+        (across, down)
+    };
+    let steepest = |l: &[i32]| l.windows(2).map(|w| (w[1] - w[0]).abs()).max().unwrap_or(0);
+    let span = |l: &[i32]| l.iter().filter(|&&v| v > 0).count();
     for ms in [10u64, 60, 120, 170] {
         let ring = Ring {
             cx: 100.0,
@@ -148,41 +224,44 @@ fn landing_ring_bars_partition_the_square_outline() {
             &mut out,
             &mut halos,
         );
-        assert!(!out.is_empty(), "the dark square outline draws at {ms}ms");
-        let mut owners = std::collections::HashMap::new();
-        for q in &out {
-            for y in q.y..q.y + q.h {
-                for x in q.x..q.x + q.w {
-                    *owners.entry((y, x)).or_insert(0u32) += 1;
-                }
-            }
-        }
+        assert!(out.is_empty(), "no quad in the ring at {ms}ms: {out:?}");
+        assert!(!halos.is_empty(), "the ring blooms at {ms}ms");
+        let (across, down) = lines(&out, &halos, 100, 40);
+        let peak = *across.iter().max().unwrap_or(&0);
+        assert!(peak > 0, "the bloom is lit at {ms}ms");
         assert!(
-            owners.values().all(|&n| n == 1),
-            "a ring pixel is owned by two bars at {ms}ms (the corner rivet): {:?}",
-            owners
-                .iter()
-                .filter(|&(_, &n)| n > 1)
-                .take(4)
-                .collect::<Vec<_>>()
+            across[100] == peak,
+            "brightest at its middle at {ms}ms: {} of {peak}",
+            across[100]
         );
-        // Closure: the outline's extreme rows and columns are still lit
-        // (clamped to the effects box, which the fixture's centre avoids).
-        let min_y = out.iter().map(|q| q.y).min().unwrap();
-        let max_y = out.iter().map(|q| q.y + q.h - 1).max().unwrap();
-        let min_x = out.iter().map(|q| q.x).min().unwrap();
-        let max_x = out.iter().map(|q| q.x + q.w - 1).max().unwrap();
-        for (y, x) in [
-            (min_y, min_x),
-            (min_y, max_x),
-            (max_y, min_x),
-            (max_y, max_x),
+        assert!(
+            steepest(&across) * 4 <= peak.max(4),
+            "a hard edge in the bloom at {ms}ms: {} in one pixel of {peak}",
+            steepest(&across)
+        );
+        let (w, h) = (span(&across), span(&down));
+        assert!(
+            (h as f32) >= 0.7 * w as f32 && (h as f32) <= 1.05 * w as f32,
+            "round at {ms}ms: {w} px across, {h} down"
+        );
+        // Control: the old square outline at this size.
+        let s = ((0.6 + 1.0 * (ms as f32 / 300.0)) * g.ch as f32) as i32;
+        let premul = aterm_render::premul_rgb(c.accent, 160);
+        let mut bars = Vec::new();
+        for (x, y, w, h) in [
+            (100 - s, 40 - s, 2 * s, 2),
+            (100 - s, 40 + s - 2, 2 * s, 2),
+            (100 - s, 40 - s + 2, 2, 2 * s - 4),
+            (100 + s - 2, 40 - s + 2, 2, 2 * s - 4),
         ] {
-            assert!(
-                owners.contains_key(&(y, x)),
-                "the outline's {y},{x} corner went dark at {ms}ms — a bar gap"
-            );
+            crate::effect_util::push_fx_rect(&mut bars, g, x, y, w, h, premul);
         }
+        let (old, _) = lines(&bars, &[], 100, 40);
+        let old_peak = *old.iter().max().unwrap_or(&0);
+        assert!(
+            steepest(&old) * 4 > old_peak,
+            "control: the outline's edge is hard at {ms}ms"
+        );
     }
 }
 
@@ -251,4 +330,236 @@ fn cold_navigation_timestamp_scatters_nothing() {
         "a cold one-row RECALL throws no landing stars — this is the stray \
          rainbow the floor exists to stop"
     );
+}
+
+/// A LANDING AT THE GRID'S EDGE FADES BEFORE THE EDGE: a jump that lands on
+/// the left column (an Enter's new line, or a jump to a prompt) blooms with
+/// its whole radial falloff inside the effects box on a dark ground, Fire's
+/// flash and every other style's bloom, so the grid's edge column is all but
+/// dark instead of standing cut through the bloom's middle. Negative
+/// control: the same bloom laid unfitted at its landing lights the edge
+/// column at most of its peak.
+#[test]
+fn a_landing_at_the_grids_edge_fades_before_the_edge() {
+    let g = geom();
+    let born = Instant::now();
+    let (cx, cy) = g.cell_center(2, 0);
+    for style in [GlowStyle::Fire, GlowStyle::Phaser, GlowStyle::Lumen] {
+        let c = cfg(style, true);
+        let glow = CursorGlow {
+            ring: Some(Ring {
+                cx,
+                cy,
+                born,
+                life: 0.30,
+                scale: 1.0,
+            }),
+            ..Default::default()
+        };
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_ring(
+            born + Duration::from_millis(90),
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+        );
+        assert!(!halos.is_empty(), "{style:?}: the landing blooms");
+        for h in &halos {
+            let (hx, hy, rx, ry) = (
+                i32::from(h.cx),
+                i32::from(h.cy),
+                i32::from(h.rx),
+                i32::from(h.ry),
+            );
+            assert!(
+                hx - rx >= g.fx_left() - 1
+                    && hx + rx <= g.fx_right() + 1
+                    && hy - ry >= g.fx_top() - 1
+                    && hy + ry <= g.fx_bot() + 1,
+                "{style:?}: the bloom {h:?} reaches past the effects box"
+            );
+        }
+        let edge_and_peak = |halos: &[RainHalo]| {
+            let mut glass = Glass::new(g, 0);
+            glass.add_halos(halos);
+            let edge = (0..i32::from(g.win_h))
+                .map(|y| glass.level(y, 0))
+                .max()
+                .unwrap_or(0);
+            let peak = (0..i32::from(g.win_h))
+                .flat_map(|y| (0..i32::from(g.win_w)).map(move |x| (y, x)))
+                .map(|(y, x)| glass.level(y, x))
+                .max()
+                .unwrap_or(0);
+            (edge, peak)
+        };
+        let (edge, peak) = edge_and_peak(&halos);
+        assert!(peak > 0, "{style:?}: the bloom is lit");
+        assert!(
+            edge * 5 <= peak,
+            "{style:?}: the grid's edge column stands at {edge} of {peak}"
+        );
+        // Control: the first bloom unfitted, at its landing and full size.
+        let h = halos[0];
+        let grow = (0.55 + 1.25 * 0.3) * g.ch as f32;
+        let mut cut = Vec::new();
+        let (rx, ry) = if style == GlowStyle::Fire {
+            (grow * 1.5, grow * 1.1)
+        } else {
+            let grow = (0.7 + 0.3) * g.ch as f32;
+            (grow, grow * 0.85)
+        };
+        push_halo(&mut cut, g, cx, cy, rx, ry, h.color);
+        let (edge, peak) = edge_and_peak(&cut);
+        assert!(
+            edge * 2 >= peak,
+            "control: {style:?} unfitted lights the edge at only {edge} of {peak}"
+        );
+    }
+}
+
+/// ON PAPER A LANDING VEIL FALLS OFF FROM ITS CENTRE: the veil ring a light
+/// ground lays darkens the page most at the landing and less and less
+/// outward (no flat disc of ink, which reads as a stain), never deeper than
+/// its cap allows. Negative control: one veil held under the same cap is
+/// flat out to half its radius.
+#[test]
+fn a_light_landing_veil_falls_off_from_its_centre() {
+    let g = geom();
+    let born = Instant::now();
+    let (cx, cy) = (100.0f32, 40.0f32);
+    let mut c = cfg(GlowStyle::Fire, true);
+    c.dark_theme = false;
+    (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+    let glow = CursorGlow {
+        ring: Some(Ring {
+            cx,
+            cy,
+            born,
+            life: 0.30,
+            scale: 1.0,
+        }),
+        ..Default::default()
+    };
+    let (mut out, mut halos) = (Vec::new(), Vec::new());
+    glow.emit_ring(
+        born + Duration::from_millis(30),
+        &c,
+        g,
+        &mut out,
+        &mut halos,
+    );
+    assert!(!halos.is_empty(), "the light landing lays its veil");
+    let profile = |halos: &[RainHalo]| -> Vec<f32> {
+        let mut glass = Glass::new(g, 0x00FF_FFFF);
+        glass.add_halos(halos);
+        (cx as i32..i32::from(g.win_w))
+            .map(|x| {
+                1.0 - crate::color_math::relative_luminance(glass.at(cy as i32, x) & 0x00FF_FFFF)
+            })
+            .collect()
+    };
+    let shipped = profile(&halos);
+    let reach = shipped.iter().rposition(|&d| d > 0.002).unwrap_or(0);
+    assert!(
+        reach > 6,
+        "the veil reaches out from the landing ({reach} px)"
+    );
+    for w in shipped[..reach].windows(2) {
+        assert!(w[1] <= w[0] + 1e-4, "the veil deepens outward: {shipped:?}");
+    }
+    let half = shipped[reach * 9 / 20];
+    assert!(
+        half <= 0.75 * shipped[0],
+        "a flat disc: {half:.3} at half its reach against {:.3} at its centre",
+        shipped[0]
+    );
+    // Control: one veil under the same cap, at the same reach.
+    let cap = halos[0].color >> 24;
+    let one = halos.iter().map(|h| h.rx).max().unwrap_or(1);
+    let mut flat = Vec::new();
+    push_halo_rows(
+        &mut flat,
+        g,
+        (cx, cy),
+        (f32::from(one), f32::from(one) * 0.85),
+        (halos[0].color & 0x00FF_FFFF) | ((cap * SOFT_VEIL_LAYERS as u32).min(120) << 24),
+        HaloMode::Over,
+    );
+    let old = profile(&flat);
+    assert!(
+        old[reach * 9 / 20] > 0.95 * old[0],
+        "control: one capped veil is flat at half its reach ({:.3} of {:.3})",
+        old[reach * 9 / 20],
+        old[0]
+    );
+}
+
+/// ON PAPER A LANDING VEIL WEARS ITS STYLE'S HUE: the light landing veil of
+/// the phaser and of sparkle reads, where it is deepest, in the hue of the
+/// style's own colour and clearly coloured (a veil of the darkened
+/// over-text ink thinned to a grey halo round the caret), while the letters
+/// under it keep the light bar. Negative control: the same veil in the
+/// over-text ink reads grey.
+#[test]
+fn a_light_landing_veil_wears_its_style_hue() {
+    let g = geom();
+    let born = Instant::now();
+    let (cx, cy) = (100.0f32, 40.0f32);
+    for style in [GlowStyle::Phaser, GlowStyle::Sparkle, GlowStyle::Beam] {
+        let mut c = cfg(style, true);
+        c.dark_theme = false;
+        (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+        let glow = CursorGlow {
+            ring: Some(Ring {
+                cx,
+                cy,
+                born,
+                life: 0.30,
+                scale: 1.0,
+            }),
+            ..Default::default()
+        };
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_ring(
+            born + Duration::from_millis(30),
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+        );
+        assert!(!halos.is_empty(), "{style:?}: the landing lays its veil");
+        let deepest = |halos: &[RainHalo]| {
+            let mut glass = Glass::new(g, 0x00FF_FFFF);
+            glass.add_halos(halos);
+            glass.at(cy as i32, cx as i32) & 0x00FF_FFFF
+        };
+        let veil = deepest(&halos);
+        let ink = halos[0].color & 0x00FF_FFFF;
+        let (want, _, _) = crate::color_math::rgb2hsv(ink);
+        let (hue, sat, _) = crate::color_math::rgb2hsv(veil);
+        let off = ((hue - want + 540.0) % 360.0 - 180.0).abs();
+        assert!(
+            off <= 20.0 && sat >= 0.18,
+            "{style:?}: the veil reads {veil:06x} ({hue:.0}°, {sat:.2}), not its hue {want:.0}°"
+        );
+        assert!(
+            crate::color_math::contrast_ratio(c.theme_fg, veil) >= 5.25,
+            "{style:?}: a letter under the veil reads {:.2}:1",
+            crate::color_math::contrast_ratio(c.theme_fg, veil)
+        );
+        let greyed: Vec<RainHalo> = halos
+            .iter()
+            .map(|h| RainHalo {
+                color: (h.color & 0xFF00_0000) | InkRole::OverText.ink(ink),
+                ..*h
+            })
+            .collect();
+        let (_, gsat, _) = crate::color_math::rgb2hsv(deepest(&greyed));
+        assert!(
+            gsat < sat,
+            "control: the over-text ink's veil is as coloured ({gsat:.2} against {sat:.2})"
+        );
+    }
 }

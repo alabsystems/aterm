@@ -3,7 +3,7 @@
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! aterm-agent: the agent interface layer — the window harness's supervisor
 //! ([`supervise`]), its readings and the live upgrade ([`harness`]), the
@@ -16,9 +16,9 @@
 //! The floor against a self-driven feedback storm, a hard per-session rate
 //! limit on self-targeted input injection, lives in the control dispatch path
 //! (`aterm-gui::inject_floor`), because any raw control client can drive `@.`
-//! in a loop. Cross-session self-amplification is bounded by the proxy's
-//! per-op edge tokens (`ProxyEntry::token_for` returns `None` for
-//! `DeriveLoop`).
+//! in a loop. Cross-session self-amplification is bounded by edges: no
+//! connection kind carries `DeriveLoop` (`aterm_session::edge::ConnectionKind::ops`),
+//! and an edge-scoped connection never forwards to another instance.
 #![cfg_attr(
     test,
     allow(
@@ -595,6 +595,11 @@ USAGE
               | tape cat FILE [--text] [--salvage] | tape show FILE --decisions | tape stats FILE
               | tape ls [@sid] | tape forget FILE|@sid...
               | replay FILE [--until door=N]
+              | replay FILE --set k=v... | --policy FILE [--set k=v...] [--until door=N]
+              | replay FILE... --shadow [--set k=v...] [--policy FILE]
+              | replay --check FILE|DIR... [--set k=v...] [--policy FILE]
+              | replay FILE --why --at seq=N|door=N|[YYYY-MM-DDT]HH:MM[:SS]|\"<line>\"
+                       [--format text|md|html]
               | help
 
 COMMANDS
@@ -866,10 +871,15 @@ COMMANDS
                        tape cost: its bytes, its items by kind and by door,
                        its decisions, its span and kB per hour of it. A
                        damaged tape is refused, naming the byte, unless
-                       --salvage keeps its whole frames before the damage; a
-                       torn tail (a run that died mid-write) is read up to the
-                       tear and said on stderr. Exit 0, or 2 for a tape that
-                       cannot be read or a usage error.
+                       --salvage keeps its whole frames before the damage:
+                       a frame changed, or, on a tape of frame format 2,
+                       whole frames repeated, moved, or dropped from inside
+                       it (a format-1 tape cannot tell). A tape that lost
+                       its last frames reads as a run that stopped there,
+                       with no end: line. A torn tail (a run that died
+                       mid-write) is read up to the tear and said on stderr.
+                       Exit 0, or 2 for a tape that cannot be read or a
+                       usage error.
     tape ls [@sid] | tape forget FILE|@sid...
                        The window's own loops' tapes: a development build
                        records each hosted run when ATERM_HARNESS_TAPE is set
@@ -913,6 +923,111 @@ COMMANDS
                        host is asked, its notifications compared). Exit 0 (reproduced, ended,
                        reached), 1 (diverged), 4 (panicked), or 2 for a tape
                        that cannot be replayed or a usage error.
+    replay FILE --set k=v... | --policy FILE [--set k=v...] [--until door=N]
+                       \"Would it have pressed the same key under another
+                       policy?\": a COUNTERFACTUAL — the recorded loop run
+                       again under a CANDIDATE policy, up to the first act it
+                       takes otherwise. `--policy FILE` reads a whole
+                       [harness] table (an aterm.toml) by the owner's reader
+                       in place of the recorded policy; each `--set k=v` (a
+                       [harness] key, `harness.` before it or not) sets one
+                       key over it; a key or a value the reader refuses — in
+                       a --set or anywhere in the file, a misplaced key too —
+                       is refused, never run as a default. ACTS MODE:
+                       only the ACTS are held to the tape — a key, send,
+                       post, badge, signal, restart or the window host's act
+                       must be the next one the recorded run took, byte for
+                       byte; a read is answered from its own stretch of the
+                       tape between two acts (skipping ahead within it, or
+                       the same answer again), a derived look from before
+                       the point, never from past an act not yet taken; a
+                       clock with no record there runs on the recorded
+                       stamps and the sleeps; outputs, decisions and the
+                       claim's renewals and release are not compared.
+                       Prints REPRODUCED (every act taken as recorded),
+                       DIVERGED at the first act taken otherwise — the
+                       recorded act and the candidate's (none where it ended
+                       without it, or went on to wait for the screen the
+                       recorded run waited for only after it), the
+                       decisions before each, the
+                       last screen the candidate read — STALE (the candidate
+                       asks a read the tape never answered there: what it
+                       would have seen is not on the tape; the recorded
+                       run's next act said), or ENDED (a tape with no end,
+                       every record on it taken), then how far it strayed
+                       and the BOUND: nothing past the first divergent act,
+                       no agent re-driven. Exit 0, 1 (diverged), 3 (stale),
+                       4 (panicked), or 2.
+    replay FILE... --shadow [--set k=v...] [--policy FILE]
+                       Every decision on each tape decided again by THIS
+                       build under the candidate (the recorded policy with
+                       neither): an approval or a question on any build,
+                       from the facts its mark carries and the looks the
+                       tape holds before it; a turn end on the recording
+                       build only, beside a strict replay that rebuilds its
+                       fold (on another build each says why not). One row
+                       per decision, both sides, `needs:`, and TAINT on
+                       every row after the first that differs (the candidate
+                       would not have seen those screens). Exit 0 (every
+                       point decided again, and as recorded), 1 (one decided
+                       otherwise), 3 (none otherwise, but one not decided
+                       again: the tape cannot say there), or 2. Over several
+                       tapes each is said under its own heading — one that
+                       does not shadow with why — and the exit is 1 if any
+                       point is decided otherwise, else 2 if a tape did not
+                       shadow, else 3, else 0.
+    replay --check FILE|DIR... [--set k=v...] [--policy FILE]
+                       A CORPUS CHECK: every tape named, and every tape
+                       (*.atape, *.atape.txt) under each DIR at any depth,
+                       replayed in ACTS MODE as above under its own recorded
+                       policy (or the candidate's): does this build still
+                       take every act the recorded run took? One line per
+                       tape — REPRODUCED with the acts it took, or its whole
+                       report under it — then the count of each verdict.
+                       aterm's development checkout keeps a corpus of such
+                       tapes, recorded in its lab over a real agent and
+                       scrubbed of the recording machine's names, and its
+                       tests check every one. Exit 0 (every tape's
+                       acts taken), else 1 if one diverged, else 2 if one was
+                       not replayed (each still said), else 3 (stale), else 4
+                       (its recorded panic); 2 too for a check that finds no
+                       tape or a usage error.
+    replay FILE --why --at seq=N|door=N|[YYYY-MM-DDT]HH:MM[:SS]|\"<journal line>\"
+                       [--format text|md|html]
+                       \"Why did it press 2?\": one decision on the tape
+                       explained instead of the whole run replayed — the
+                       screen it judged, the box this build reads on it, the
+                       FACTS it was decided on and the record each came from
+                       (`ctl meta #12`, `probe.worker_proc #30`), the
+                       policy's RULE TRACE (every check consulted, the rule
+                       that decided), the act, its reply, the journal line
+                       and the ledger row. An approval or a question is
+                       decided again by THIS build's policy on the facts the
+                       decision's mark carries, the policy the tape's header
+                       carries and the looks the tape holds before it (never
+                       one from after), labelled with both builds and whether
+                       this build's policy decides the same; a fact or a look
+                       the tape lacks, or a policy value this build supplied
+                       where the header does not say the run's, is listed
+                       under `needs:`, never presented as the recorded
+                       world. A turn end is traced by a strict replay of the
+                       tape to the point, on the build that recorded it only
+                       (it decides on a fold over the whole run); on another
+                       build its note of the fold and reading is printed
+                       instead. --at names the point:
+                       `seq=N` (the decision on that screen), `door=N` (the
+                       decision in force at effect #N of `tape cat`),
+                       `[YYYY-MM-DDT]HH:MM[:SS]` (the last at or before that
+                       local time, each decision read by the offset its own
+                       instant had; with no day named, the one day of the
+                       run the time falls within — a time on more than one
+                       is refused, asking for the day), or a journal line's
+                       text (the decision it followed). `tape ls @sid` names
+                       a session's tapes. Only the file is read (and the
+                       local zone's offsets, for a local time), and no
+                       running loop ever keeps a trace. Exit 0, or 2 for a
+                       point with no decision, a tape that does not read, or
+                       a usage error.
     help               Show this text.
 
 OPTIONS

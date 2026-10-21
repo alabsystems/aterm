@@ -94,6 +94,9 @@ pub struct Connection {
     /// Bytes of an oversized message still to arrive and be dropped.
     discard: usize,
     broken: bool,
+    /// How long [`Connection::send`] may wait for the bus to take its bytes
+    /// ([`Connection::set_send_timeout`]); `None` waits as long as it takes.
+    send_timeout: Option<Duration>,
 }
 
 /// This process's effective uid, the identity EXTERNAL claims.
@@ -126,10 +129,30 @@ impl Connection {
     ///
     /// The last entry's error when none connects.
     pub fn open(addresses: &[Address]) -> Result<Self> {
+        Self::open_within(addresses, HANDSHAKE_TIMEOUT)
+    }
+
+    /// [`Connection::open`], with every handshake bounded by `timeout`
+    /// instead of [`HANDSHAKE_TIMEOUT`]: for a caller that must not wait on a
+    /// bus that stopped answering (a read on a window's main thread).
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::open`]; [`Error::Timeout`] when the bus did not
+    /// finish the handshake within `timeout`.
+    pub fn open_within(addresses: &[Address], timeout: Duration) -> Result<Self> {
         let mut last = Error::Invalid("empty address");
         for address in addresses {
             match address::connect(address) {
-                Ok(stream) => return Self::handshake(stream, effective_uid(), address.guid()),
+                Ok(stream) => {
+                    let deadline = Instant::now().checked_add(timeout);
+                    return Self::handshake_until(
+                        stream,
+                        effective_uid(),
+                        address.guid(),
+                        deadline,
+                    );
+                }
                 Err(e) => last = e,
             }
         }
@@ -146,6 +169,15 @@ impl Connection {
     /// fails, [`Error::Timeout`] after [`HANDSHAKE_TIMEOUT`].
     pub fn handshake(stream: CtlStream, uid: u32, expect_guid: Option<&str>) -> Result<Self> {
         let deadline = Instant::now().checked_add(HANDSHAKE_TIMEOUT);
+        Self::handshake_until(stream, uid, expect_guid, deadline)
+    }
+
+    fn handshake_until(
+        stream: CtlStream,
+        uid: u32,
+        expect_guid: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<Self> {
         let mut conn = Self {
             stream,
             rbuf: Vec::new(),
@@ -157,6 +189,7 @@ impl Connection {
             max_incoming: DEFAULT_MAX_INCOMING,
             discard: 0,
             broken: false,
+            send_timeout: None,
         };
         conn.write_until(&auth::first(uid), deadline)?;
         let line = conn.read_line(deadline)?;
@@ -218,15 +251,33 @@ impl Connection {
             }
     }
 
+    /// Bounds how long [`Connection::send`] (and the replies, errors and
+    /// signals sent through it) may wait for the bus to take the message's
+    /// bytes. A bus daemon reads its clients as messages arrive, so a write
+    /// waits only once the socket's buffer is full of what the daemon has not
+    /// read: a daemon that stopped (frozen, wedged) would otherwise hold the
+    /// sender for as long as it stays stopped. `None`, the default, waits for
+    /// it. [`Connection::call`] keeps its own deadline.
+    pub fn set_send_timeout(&mut self, timeout: Option<Duration>) {
+        self.send_timeout = timeout;
+    }
+
     /// Sends `msg` with the next serial (and this connection as its sender
     /// when it names none), returning that serial.
     ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a message that cannot be encoded,
-    /// [`Error::Closed`] or [`Error::Io`] when the write fails.
+    /// [`Error::Closed`] or [`Error::Io`] when the write fails, and
+    /// [`Error::Timeout`] when the bus took no byte or only part of the message
+    /// within [`Connection::set_send_timeout`]'s bound. A message written in
+    /// part leaves a stream no further message can follow, so that timeout
+    /// closes the connection, as [`Connection::call`]'s does.
     pub fn send(&mut self, msg: Message) -> Result<u32> {
-        self.send_until(msg, None)
+        let deadline = self
+            .send_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        self.send_until(msg, deadline)
     }
 
     fn send_until(&mut self, mut msg: Message, deadline: Option<Instant>) -> Result<u32> {

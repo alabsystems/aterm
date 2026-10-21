@@ -15,6 +15,11 @@ use super::shell::{
 };
 use super::{MAX_COMMANDLINE_BYTES, MAX_CWD_PATH_BYTES};
 
+/// The OSC 133/633 `B` parameter by which aterm's integration says the mark
+/// stands where the line editor's buffer starts (`ShellIntegrationState::
+/// input_start_attested`).
+pub(super) const INPUT_START_ATTESTATION: &[u8] = b"aterm_input=start";
+
 /// The most startup roots one START record names: a fish's sysconf folder and
 /// its vendor conf.d folders (one per `$XDG_DATA_DIRS` entry, its user data
 /// folder's and its build's). A record naming more names none.
@@ -173,6 +178,8 @@ impl TerminalHandler<'_> {
                 // empty line or Ctrl-C while typing emits A→B→A).
                 self.shell.phase = ShellIntegrationPhase::PromptStart;
                 self.shell.phase_stale = false;
+                // A new prompt: its `B` has yet to say where its buffer starts.
+                self.shell.input_start_attested = false;
                 // The shell reported its own cwd immediately before this mark:
                 // a report held at its prompt lands now, so the prompt's mark
                 // and block record it.
@@ -190,6 +197,14 @@ impl TerminalHandler<'_> {
                 // shell's (which comes before the A).
                 self.shell.held_cwd = None;
                 self.shell.phase = ShellIntegrationPhase::CommandStart;
+                // Where the buffer starts, as the shell vouches for it: only a
+                // `B` that says so (`aterm_input=start`) is the buffer's start
+                // (`Terminal::input_region_start`). zsh sends its `B` from
+                // zle-line-init, after zle drew the buffer, so a line pre-filled
+                // from its buffer stack puts the mark after the text.
+                self.shell.input_start_attested = params
+                    .get(2..)
+                    .is_some_and(|p| p.contains(&INPUT_START_ATTESTATION));
                 self.shell_command_input_start(row, col);
             }
             'C' => {

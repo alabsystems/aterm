@@ -6,10 +6,10 @@
 //! Harness sets, and `aterm ctl @<sid> meta set autopilot` writes.
 //!
 //! **The modes** are aterm-agent's ([`Autopilot`]): `cruise` keeps the work
-//! moving until the agent's clear final statement, `land` wraps it up cleanly
-//! and then types nothing more but the land answer to a question asked in
-//! prose, `off` keeps the harness's hands off the session (plain Claude
-//! Code, the owner's A/B baseline). The ENGINE reads
+//! going, and nothing the agent says ends it (FOREVER CRUISE), `land` lands
+//! all of the work on the remote main branch and then types nothing until
+//! someone's turn (FOREVER LAND), `off` keeps the harness's hands off the
+//! session (plain Claude Code, the owner's A/B baseline). The ENGINE reads
 //! `land` at each point (its turn-end policy); the HOST implements `off`: it
 //! stops the session's worker and starts none while the word holds
 //! (`harness_host`'s `OffSessions`).
@@ -143,10 +143,10 @@ pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static st
 /// the session's own word is beside it ([`App::session_autopilot`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AutopilotView {
-    /// Cruise: the work kept moving until the agent's clear final statement.
+    /// Cruise: the work kept going; nothing the agent says ends it.
     Cruise,
-    /// Land: the work wrapped up cleanly, then nothing more typed but the
-    /// land answer to a question asked in prose.
+    /// Land: all of the work landed on the remote main branch, then nothing
+    /// typed until someone's turn.
     Land,
     /// Off: the harness keeps its hands off this session.
     Off,
@@ -156,7 +156,7 @@ pub(crate) enum AutopilotView {
     MasterOff,
     /// No host (no control socket): nothing supervises any session
     /// ([`HarnessPosture::Unhosted`]). The footer draws no chip for it — the
-    /// harness's two need a host (`crate::claude_lights`) — and the surfaces
+    /// Autopilot chip needs a host (`crate::claude_lights`) — and the surfaces
     /// that do say it read it as the master switch's: `off` on the wire
     /// ([`Self::wire`]), no word a cycle writes ([`Self::next`]), and
     /// Settings ▸ Harness naming why.
@@ -184,25 +184,19 @@ pub(crate) enum ChipTone {
 /// "changing"): `◐`, drawn alone.
 pub(crate) const PENDING_GLYPH: &str = "\u{25d0}";
 
-/// The Settings chip beside Autopilot (§2.3): `⚙`, drawn alone at rest; a
-/// click opens Settings ▸ Harness ([`App::open_harness_settings`]).
-pub(crate) const SETTINGS_GLYPH: &str = "\u{2699}";
-
-/// The clause every harness chip's title that opens Settings ▸ Harness ends
-/// with ([`AutopilotView::title`] where the harness runs no mode,
-/// [`SETTINGS_TITLE`]): the page by the name its rail row shows
-/// (`SettingsRoute::Harness`), the one place the chips spell it.
+/// The clause v1's spelling of the Autopilot chip's title ends with where the
+/// harness runs no mode and a click opens Settings ▸ Harness
+/// ([`AutopilotView::title`], which the face table's tests hold
+/// `claude_lights::autopilot_title` to): the page by the name its rail row
+/// shows (`SettingsRoute::Harness`). Test-only since the `⚙` chip, whose
+/// title it also ended, went (owner, 2026-10-20: "remove the harness
+/// settings button in the UX").
+#[cfg(test)]
 macro_rules! open_harness_click {
     () => {
         "click: open Settings \u{25b8} Harness"
     };
 }
-
-/// The Settings chip's title (hover, selection, the accessibility label),
-/// in [`AutopilotView::title`]'s form: what the chip is, then what a click
-/// does — the shared page every agent's supervision is set on, named as the
-/// View menu and the master-off chip name it.
-pub(crate) const SETTINGS_TITLE: &str = concat!("harness settings \u{b7} ", open_harness_click!());
 
 impl AutopilotView {
     /// Every view, the three modes in the chip's cycle order first (the
@@ -450,20 +444,21 @@ pub(crate) fn land_at_field(land_at: Option<i64>) -> String {
     land_at.map_or_else(|| "-".to_string(), |ms| ms.div_euclid(1000).to_string())
 }
 
-/// The `task=` word `status` and `ls` print (§9.4.1): the task's face under
-/// Land as the session's loop last told it (`open|landed|done|spent|theirs`)
-/// for a supervisable agent session (`agent`) whose live supervisor claim
-/// this window's host holds (`claimed_here`), and `-` otherwise — another
-/// process's supervisor sends no fact here, so a face it would leave stale
-/// is never printed, and `-` too before the loop has told one.
+/// The `task=` word `status` and `ls` print (§9.4.1): the task's face as the
+/// session's loop last told it (`open|landed|theirs`) for a supervisable
+/// agent session (`agent`) whose face this window knows (`told_here`: its
+/// host holds the live supervisor claim, or the live claim is a proven
+/// self-claim whose own acts tell it, FOREVER LAND §10.4), and `-` otherwise
+/// — another process's supervisor sends no fact here, so a face it would
+/// leave stale is never printed, and `-` too before anyone has told one.
 #[must_use]
 pub(crate) fn task_field(
     face: Option<aterm_agent::harness::acts::TaskFace>,
-    claimed_here: bool,
+    told_here: bool,
     agent: Option<aterm_phase::Program>,
 ) -> &'static str {
     match face {
-        Some(face) if claimed_here && agent.is_some() => face.status(),
+        Some(face) if told_here && agent.is_some() => face.status(),
         _ => "-",
     }
 }
@@ -483,6 +478,152 @@ pub(crate) fn pause_field(
     match pause {
         Some(p) if claimed_here && agent.is_some() => p.at_unix.to_string(),
         _ => "-".to_string(),
+    }
+}
+
+/// THE WINDOW SURFACE A PERSON PRESSED to write a session's Autopilot pair
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.3, items 1 and 2):
+/// stored with the writer
+/// ([`crate::session_timeline::AutopilotSetBy`]), so the records, the
+/// Autopilot menu, Settings ▸ Harness and `meta` can say whose hand it was.
+/// Each of the window's writers names its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Surface {
+    /// The footer's Autopilot chip ([`App::cycle_session_autopilot`]).
+    Chip,
+    /// The composer border's harness toggle
+    /// ([`App::toggle_session_harness`]).
+    Border,
+    /// The Autopilot menu: a mode, a timed Cruise, its cancel.
+    Menu,
+    /// A SESSIONS row on Settings ▸ Harness: a mode, its Timer, its Cancel.
+    Settings,
+    /// SESSIONS' `Every session` row (§11.5).
+    EverySession,
+}
+
+impl Surface {
+    /// Every surface, in the order the design lists them.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Chip,
+        Self::Border,
+        Self::Menu,
+        Self::Settings,
+        Self::EverySession,
+    ];
+
+    /// Its word after `human:` in `meta`'s `autopilot_by=` and the restore
+    /// leaf's `autopilot_by` (§11.7.2).
+    #[must_use]
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Chip => "chip",
+            Self::Border => "border",
+            Self::Menu => "menu",
+            Self::Settings => "settings",
+            Self::EverySession => "every",
+        }
+    }
+
+    /// The surface [`Self::word`] names; `None` for any other word.
+    #[must_use]
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|surface| surface.word() == word)
+    }
+
+    /// How a line names it (§11.7.1): `from the chip`, `from Settings ▸
+    /// Harness, every session`.
+    #[must_use]
+    pub(crate) const fn phrase(self) -> &'static str {
+        match self {
+            Self::Chip => "from the chip",
+            Self::Border => "from the composer border",
+            Self::Menu => "from the Autopilot menu",
+            Self::Settings => "from Settings \u{25b8} Harness",
+            Self::EverySession => "from Settings \u{25b8} Harness, every session",
+        }
+    }
+}
+
+/// WHO SET A SESSION'S AUTOPILOT, IN WORDS (§11.7.3, item 4): composed
+/// where it is shown — a record, the Autopilot menu's note, a SESSIONS row —
+/// from the stored setter, never kept ([`App::autopilot_set_by_words`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SetByWords {
+    /// Who, as a line ends: `over aterm ctl`, `from the chip`, `from tab 2
+    /// (✳ Claude Code)`, `before aterm restarted`.
+    pub(crate) by: String,
+    /// When, as the local clock and day read it; `None` for a word carried
+    /// from before a restart with no setter, or where the zone cannot be
+    /// read.
+    pub(crate) at: Option<crate::harness_glass::Stamp>,
+}
+
+impl SetByWords {
+    /// The words of a setter (the stored one: `None` for a word that names
+    /// none) as the session's word stands (`has_word`), with
+    /// `sid_place(sid)` naming the tab of a session that wrote over its edge
+    /// connection (`None`: no live session has that sid). `None` where there
+    /// is nothing to say: no setter and no word.
+    #[must_use]
+    pub(crate) fn of(
+        set_by: Option<crate::session_timeline::AutopilotSetBy>,
+        has_word: bool,
+        sid_place: impl FnOnce(&str) -> Option<String>,
+    ) -> Option<Self> {
+        use aterm_slog::Actor;
+        let Some(set_by) = set_by else {
+            // A word carried from a leaf that names no setter (§11.7.3, item
+            // 5: `restored`).
+            return has_word.then(|| Self {
+                by: "before aterm restarted".to_string(),
+                at: None,
+            });
+        };
+        let by = match set_by.actor {
+            Actor::Human => set_by
+                .surface
+                .map_or("from the window", Surface::phrase)
+                .to_string(),
+            Actor::Ctl => "over aterm ctl".to_string(),
+            Actor::Harness => "by aterm's harness".to_string(),
+            Actor::Bridge => "over the fabric".to_string(),
+            Actor::Aterm => "by its timer".to_string(),
+            Actor::Sid(sid) => sid_place(sid.as_str()).map_or_else(
+                || {
+                    format!(
+                        "from session {}",
+                        aterm_messages::presence::short_sid(sid.as_str())
+                    )
+                },
+                |place| format!("from {place}"),
+            ),
+            Actor::Vendor | Actor::Nobody => "over aterm ctl (writer unknown)".to_string(),
+        };
+        Some(Self {
+            by,
+            at: crate::harness_glass::Stamp::at(set_by.since_ms.div_euclid(1000)),
+        })
+    }
+
+    /// The menu's note and a SESSIONS row's words (§11.7.1): `set 14:05 over
+    /// aterm ctl`, `set Fri 14:05 from the chip` (clock times, never ages,
+    /// the day named against `today` by [`crate::harness_glass::Stamp::words`]),
+    /// `set before aterm restarted`.
+    #[must_use]
+    pub(crate) fn line(&self, today: Option<i64>) -> String {
+        match self.at {
+            Some(at) => format!("set {} {}", at.words(today), self.by),
+            None => format!("set {}", self.by),
+        }
+    }
+
+    /// A record's line (§11.7.1): `set over aterm ctl`, `set from the
+    /// chip` — the record has its own time. The timer's fire names its own
+    /// (`set at the 18:00 timer`, `App::autopilot_timer_landed`).
+    #[must_use]
+    pub(crate) fn record_line(&self) -> String {
+        format!("set {}", self.by)
     }
 }
 
@@ -607,9 +748,16 @@ impl App {
     ///
     /// A HAND WRITE: it drops any timer the session's Cruise held, the same
     /// word included (§9.3.6, item 1) —
-    /// [`Self::set_session_autopilot_timed`] with no instant.
-    pub(crate) fn set_session_autopilot(&mut self, local_id: u64, word: Option<Autopilot>) -> bool {
-        self.set_session_autopilot_timed(local_id, word, None)
+    /// [`Self::set_session_autopilot_timed`] with no instant. `surface` is
+    /// the window surface pressed, stored as the pair's setter with the
+    /// person (§11.7.3, item 2).
+    pub(crate) fn set_session_autopilot(
+        &mut self,
+        local_id: u64,
+        word: Option<Autopilot>,
+        surface: Surface,
+    ) -> bool {
+        self.set_session_autopilot_timed(local_id, word, None, surface)
     }
 
     /// THE WINDOW'S ONE WRITER OF THE AUTOPILOT PAIR (§9.3.6, item 1):
@@ -618,12 +766,14 @@ impl App {
     /// `session_timeline::apply_autopilot`, the store write `meta set
     /// autopilot … [until=]` makes. Whether either half moved; a move is
     /// fanned out as [`Self::set_session_autopilot`] says, and the session's
-    /// timer is indexed again from what is stored.
+    /// timer is indexed again from what is stored. Its setter is the person,
+    /// at `surface` (§11.7.3, item 2).
     pub(crate) fn set_session_autopilot_timed(
         &mut self,
         local_id: u64,
         word: Option<Autopilot>,
         land_at: Option<i64>,
+        surface: Surface,
     ) -> bool {
         let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
             return false;
@@ -634,8 +784,9 @@ impl App {
             word.map(|w| w.word().to_string()),
             land_at,
             aterm_slog::Actor::Human,
+            Some(surface),
         );
-        self.autopilot_pair_written(local_id, write.moved, word.is_some())
+        self.autopilot_pair_written(local_id, write)
     }
 
     /// THE FAN-OUT of a window write of session `local_id`'s Autopilot pair
@@ -645,15 +796,14 @@ impl App {
     /// built again (`App::refresh_autopilot_menu`) — both even where the
     /// write moved nothing (a wire write of the same pair whose wake is
     /// still in flight). Where it `moved`, what [`Self::set_session_autopilot`]
-    /// says follows; `has_word`: a word is stored (not unset), for the
-    /// record. Returns `moved`.
+    /// says follows, its record naming the setter the write stored. Returns
+    /// whether it moved.
     pub(crate) fn autopilot_pair_written(
         &mut self,
         local_id: u64,
-        moved: bool,
-        has_word: bool,
+        write: crate::session_timeline::AutopilotWrite,
     ) -> bool {
-        self.autopilot_pair_fanned_out(local_id, moved, has_word, true)
+        self.autopilot_pair_fanned_out(local_id, write, true)
     }
 
     /// WRITE MANY SESSIONS' AUTOPILOT PAIRS AT ONCE (design §11.5.3, item
@@ -661,7 +811,8 @@ impl App {
     /// as the window's one writer writes one
     /// ([`Self::set_session_autopilot_timed`]), with that write's own
     /// fan-out — the timer index, an open menu, the crash journal's owed
-    /// words, the footer, the A/B arm and the keyed record — by `by`, but
+    /// words, the footer, the A/B arm and the keyed record — by `by` at
+    /// `surface` (its setter, §11.7.3, item 2), but
     /// the page published ONCE, after the loop: each publish reads every
     /// session (`App::harness_state`), so N writes each publishing would
     /// read N² sessions on one click. Published whether or not a write
@@ -672,6 +823,7 @@ impl App {
         &mut self,
         writes: &[(u64, Option<Autopilot>, Option<i64>)],
         by: aterm_slog::Actor,
+        surface: Option<Surface>,
     ) -> usize {
         let mut moved = 0;
         for &(local_id, word, land_at) in writes {
@@ -683,8 +835,9 @@ impl App {
                 word.map(|w| w.word().to_string()),
                 land_at,
                 by,
+                surface,
             );
-            if self.autopilot_pair_fanned_out(local_id, write.moved, word.is_some(), false) {
+            if self.autopilot_pair_fanned_out(local_id, write, false) {
                 moved += 1;
             }
         }
@@ -697,10 +850,10 @@ impl App {
     fn autopilot_pair_fanned_out(
         &mut self,
         local_id: u64,
-        moved: bool,
-        has_word: bool,
+        write: crate::session_timeline::AutopilotWrite,
         publish: bool,
     ) -> bool {
+        let moved = write.moved;
         // The timer the write may drop, read BEFORE the index is built again
         // from what is stored (§10.2.3, item 8): the record names it.
         let dropped = self.autopilot_timers.glass(local_id);
@@ -719,11 +872,8 @@ impl App {
         self.refresh_meta_dependent_chrome(local_id);
         self.refresh_presence_session(local_id);
         self.mark_status_dirty();
-        if self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(local_id);
+        if let Some(session) = self.pool.get(local_id) {
+            session.ctx.watchers.ring_watchers();
         }
         crate::claude_footer::post_changed(local_id);
         // The session's A/B arm moves with its mode (Settings ▸ Harness), and
@@ -732,26 +882,139 @@ impl App {
         if publish {
             self.harness_screen_moved();
         }
-        let sid = self
-            .pool
-            .get(local_id)
-            .map(|s| s.ctx.self_id.as_str().to_string());
-        if let Some(sid) = sid {
-            let (_, view, _) = self.session_autopilot(local_id);
-            // The records' titles name no place; their lines lead with it,
-            // the pane named where the tab holds two agents (§10.3.3, item 9).
-            let place = self.session_place(&sid);
-            let message = match self.autopilot_timers.glass(local_id) {
-                // A timed Cruise says when it lands (§9.3.2).
-                Some(until) => crate::message_reporters::autopilot_timer_set(&sid, &place, until),
-                // A hand change says the timer it dropped is cancelled.
-                None => {
-                    crate::message_reporters::autopilot_set(&sid, &place, view, has_word, dropped)
-                }
-            };
-            self.record_message(message);
-        }
+        self.record_autopilot_change(local_id, dropped, write.revision);
         true
+    }
+
+    /// THE KEYED RECORD OF A MOVE OF SESSION `local_id`'S AUTOPILOT PAIR
+    /// (§2, §9.3.2; §11.7.1): the window's own write
+    /// ([`Self::autopilot_pair_written`]) and a write over the wire
+    /// (`App::on_meta_changed`) alike — titled by what is stored now, its
+    /// line led by the session's place, the timer the write dropped
+    /// (`dropped`, read before the index was built again) said cancelled,
+    /// and its last line who set it, from the setter the write stored
+    /// ([`Self::autopilot_set_by_words`]). `revision` is the write's
+    /// ([`crate::session_timeline::AutopilotWrite::revision`]): noted as
+    /// recorded, so the wire's next wake for this session records it no
+    /// second time.
+    pub(crate) fn record_autopilot_change(
+        &mut self,
+        local_id: u64,
+        dropped: Option<crate::claude_lights::LandAtGlass>,
+        revision: u64,
+    ) {
+        self.autopilot_recorded.insert(local_id, revision);
+        let Some((sid, has_word)) = self.pool.get(local_id).map(|s| {
+            let has_word = s
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .autopilot
+                .is_some();
+            (s.ctx.self_id.as_str().to_string(), has_word)
+        }) else {
+            return;
+        };
+        let (_, view, _) = self.session_autopilot(local_id);
+        // The records' titles name no place; their lines lead with it,
+        // the pane named where the tab holds two agents (§10.3.3, item 9).
+        let place = self.session_place(&sid);
+        // Who set it, composed now from the setter the write stored.
+        let set_by = self
+            .autopilot_set_by_words(local_id)
+            .map(|words| words.record_line());
+        let message = match self.autopilot_timers.glass(local_id) {
+            // A timed Cruise says when it lands (§9.3.2).
+            Some(until) => crate::message_reporters::autopilot_timer_set(
+                &sid,
+                &place,
+                until,
+                set_by.as_deref(),
+            ),
+            // A hand change says the timer it dropped is cancelled.
+            None => crate::message_reporters::autopilot_set(
+                &sid,
+                &place,
+                view,
+                has_word,
+                dropped,
+                set_by.as_deref(),
+            ),
+        };
+        self.record_message(message);
+    }
+
+    /// THE STORED SETTER OF SESSION `local_id`'S AUTOPILOT, IN WORDS
+    /// (§11.7.3, item 4; [`SetByWords::of`]), composed now: an edge writer's
+    /// sid names its tab and title as they read now
+    /// ([`Self::autopilot_setter_tab`]). `None` where the session is gone or
+    /// there is nothing to say (no setter and no word).
+    pub(crate) fn autopilot_set_by_words(&self, local_id: u64) -> Option<SetByWords> {
+        let (set_by, has_word) = {
+            let meta = self
+                .pool
+                .get(local_id)?
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (meta.autopilot_set_by, meta.autopilot.is_some())
+        };
+        SetByWords::of(set_by, has_word, |sid| self.autopilot_setter_tab(sid))
+    }
+
+    /// The tab of the live session whose sid is `sid`, as a setter's words
+    /// name it (§11.7.3, item 4): `tab 2 (✳ Claude Code)` — its place
+    /// ([`Self::session_place`]) and its label by the one namer
+    /// ([`Self::tab_label_of_session`]), the label left out where it is the
+    /// place's own words. `None` where no live session has that sid.
+    pub(crate) fn autopilot_setter_tab(&self, sid: &str) -> Option<String> {
+        let local = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_sid(&aterm_session::SessionId::new(sid))
+            .map(|h| h.local_id)?;
+        self.pool.get(local)?;
+        let place = self.session_place(sid);
+        let place = place.strip_prefix("in ").unwrap_or(&place).to_string();
+        let label = self.tab_label_of_session(local);
+        Some(if label == place {
+            place
+        } else {
+            format!("{place} ({label})")
+        })
+    }
+
+    /// A WRITE OVER THE WIRE moved session `local_id`'s Autopilot pair
+    /// (`meta set|unset autopilot …` from an Owner client, the fabric or
+    /// aterm's harness: `App::on_meta_changed`, §11.7.3, item 3): its keyed
+    /// record, through the window's own builders
+    /// ([`Self::record_autopilot_change`]), where the session's
+    /// [`crate::session_timeline::SessionMeta::autopilot_revision`] is not
+    /// the one last recorded — so a wake for another field, a write the
+    /// window already recorded, and a session only restored here record
+    /// nothing. `dropped`: the timer the index held before the wake indexed
+    /// it again.
+    pub(crate) fn record_wire_autopilot(
+        &mut self,
+        local_id: u64,
+        dropped: Option<crate::claude_lights::LandAtGlass>,
+    ) {
+        let Some(revision) = self.pool.get(local_id).map(|s| {
+            s.ctx
+                .meta
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .autopilot_revision
+        }) else {
+            return;
+        };
+        if self.autopilot_recorded.get(&local_id).copied().unwrap_or(0) == revision {
+            return;
+        }
+        self.record_autopilot_change(local_id, dropped, revision);
     }
 
     /// The chip's click: session `local_id`'s EFFECTIVE mode steps to the
@@ -766,7 +1029,7 @@ impl App {
         let Some(next) = view.next() else {
             return view;
         };
-        self.set_session_autopilot(local_id, Some(next));
+        self.set_session_autopilot(local_id, Some(next), Surface::Chip);
         self.session_autopilot(local_id).1
     }
 
@@ -786,13 +1049,13 @@ impl App {
         } else {
             Autopilot::Off
         };
-        self.set_session_autopilot(local_id, Some(next));
+        self.set_session_autopilot(local_id, Some(next), Surface::Border);
         self.session_autopilot(local_id).1
     }
 
-    /// Open Settings ▸ Harness in window `wid` (the `⚙` chip, the chip under
-    /// the master switch off, the Autopilot menu's `Harness settings…`, View ▸
-    /// Coding Agent Harness…): the one Settings tab, raised there at the
+    /// Open Settings ▸ Harness in window `wid` (the chip under the master
+    /// switch off, the Autopilot menu's `Harness settings…`, View ▸ Coding
+    /// Agent Harness…): the one Settings tab, raised there at the
     /// Harness route, and landed at `focus` (§10.3.3, item 8) — a session's
     /// row, drawn selected until the next press or scroll, SUPERVISION, or
     /// [`HarnessFocus::Top`], the page's top (§10.3.1: View ▸ Coding Agent
@@ -819,6 +1082,10 @@ impl App {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "autopilot_set_by_tests.rs"]
+mod set_by_tests;
 
 #[cfg(test)]
 mod tests {
@@ -954,7 +1221,6 @@ mod tests {
         assert_eq!(seen, Autopilot::ALL);
         assert_eq!(view, AutopilotView::Cruise);
         assert_eq!(PENDING_GLYPH, "\u{25d0}");
-        assert_eq!(SETTINGS_GLYPH, "\u{2699}");
         assert!(AutopilotView::Cruise.carries() && AutopilotView::Land.carries());
         assert!(!AutopilotView::Off.carries() && !AutopilotView::MasterOff.carries());
         assert_eq!(AutopilotView::ALL.len(), 6);
@@ -1114,7 +1380,11 @@ mod tests {
         assert_eq!(app.harness_posture(), HarnessPosture::On(Autopilot::Cruise));
         let ctx = app.pool.get(0).unwrap().ctx.clone();
         let rings = crate::harness_host::rings_here();
-        assert!(app.set_session_autopilot(0, Some(Autopilot::Land)));
+        assert!(app.set_session_autopilot(
+            0,
+            Some(Autopilot::Land),
+            crate::autopilot::Surface::Chip
+        ));
         assert_eq!(
             crate::harness_host::rings_here(),
             rings + 1,
@@ -1126,7 +1396,7 @@ mod tests {
             (Some(Autopilot::Land), AutopilotView::Land, false)
         );
         assert!(
-            !app.set_session_autopilot(0, Some(Autopilot::Land)),
+            !app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Chip),
             "a re-set moves nothing"
         );
         assert_eq!(crate::harness_host::rings_here(), rings + 1);
@@ -1141,7 +1411,7 @@ mod tests {
             .unwrap()
             .since(None)
             .filter(|e| e.kind == "meta-change")
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect();
         assert_eq!(events, ["field=autopilot value=land"]);
         assert_eq!(
@@ -1150,7 +1420,8 @@ mod tests {
                 "Autopilot set to land".to_string(),
                 vec![
                     "Tab 1: the harness wraps the work up, then stops".to_string(),
-                    "this session's own setting".to_string()
+                    "this session's own setting".to_string(),
+                    "set from the chip".to_string()
                 ]
             )]
         );
@@ -1163,7 +1434,7 @@ mod tests {
         assert_eq!(app.cycle_session_autopilot(0), AutopilotView::Land);
 
         // Unset: the table's default again, said as the default.
-        assert!(app.set_session_autopilot(0, None));
+        assert!(app.set_session_autopilot(0, None, crate::autopilot::Surface::Chip));
         assert_eq!(
             app.session_autopilot(0),
             (None, AutopilotView::Cruise, false)
@@ -1228,7 +1499,7 @@ mod tests {
         host.set_config(policy.policy.clone());
         app.harness = Some(host.clone());
         app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(policy);
-        app.set_session_autopilot(0, Some(Autopilot::Cruise));
+        app.set_session_autopilot(0, Some(Autopilot::Cruise), crate::autopilot::Surface::Chip);
         (app, StopHost(host))
     }
 
@@ -1311,10 +1582,11 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// The `⚙` chip's page: Settings ▸ Harness, opened in the window it was
-    /// pressed in (View ▸ Coding Agent Harness… opens it in the front one).
+    /// The master-off chip's page (and the Autopilot menu's `Harness
+    /// settings…`): Settings ▸ Harness, opened in the window it was pressed in
+    /// (View ▸ Coding Agent Harness… opens it in the front one).
     #[test]
-    fn the_settings_chip_opens_settings_harness() {
+    fn open_harness_settings_opens_the_page_the_chip_names() {
         use crate::native_settings::SettingsRoute;
         let mut app = App::headless_for_test();
         assert!(
@@ -1326,13 +1598,15 @@ mod tests {
             app.native_settings_route_view_target(SettingsRoute::Harness)
                 .is_some()
         );
-        // The title names the page the click opens, by its rail name.
+        // The master-off title names the page the click opens, by its rail
+        // name.
+        let title = AutopilotView::MasterOff.title();
         assert!(
-            SETTINGS_TITLE.ends_with(&format!(
+            title.ends_with(&format!(
                 "Settings \u{25b8} {}",
                 SettingsRoute::Harness.label()
             )),
-            "{SETTINGS_TITLE}"
+            "{title}"
         );
         assert_eq!(
             SettingsRoute::from_path("/harness"),

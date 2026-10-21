@@ -139,9 +139,15 @@ use aterm_spec::derive::{Liveness, Model};
 /// Assumed, not modeled: the app's changed-size repaint starts with ED 2 (the `Step` that
 /// heals). An app that repaints every row without clearing is seen by no counter, so a net-zero
 /// risk flagged before it stays flagged, and a net-changed run it repaints stays `unverified` —
-/// hence neither risk nor ok. The 250 ms run gap is the host's environment bound: every step
-/// but `Evaluate` lands inside it. Over-approximated: whether a shrink demotes or trims is free
-/// except right after a grow (`bot`), and every draw may have filled or cleared the bottom row.
+/// hence neither risk nor ok. Abstracted: the column debt. The engine's debt also owes `cut`
+/// (drawn columns a narrowing took off that the grow back left blank, S2R-F3), and a cut-only
+/// epoch is judged and nudged as owed rows are. This model and its Tier-1 rig never change the
+/// width, the rig projects the rows half only (`RenderDebt::rows`), and unit tests alone check
+/// the cut path (`a_column_flap_that_cuts_drawn_cells_owes_them_until_a_full_clear` in
+/// aterm-core, `a_column_flap_that_cut_cells_is_judged_until_a_repaint` in aterm-gui). The
+/// 250 ms run gap is the host's environment bound: every step but `Evaluate` lands inside it.
+/// Over-approximated: whether a shrink demotes or trims is free except right after a grow
+/// (`bot`), and every draw may have filled or cleared the bottom row.
 ///
 /// Tier-1: `aterm-gui/src/resize_ledger.rs` drives a real alternate-screen
 /// `aterm_core::Terminal` and the real `ResizeLedger` through every schedule up to a bounded

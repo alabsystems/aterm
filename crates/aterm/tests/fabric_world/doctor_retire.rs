@@ -188,3 +188,95 @@ fn the_bridge_refuses_to_retire_a_session_a_sibling_instance_hosts() {
         "the sibling's session was not retired"
     );
 }
+
+/// **A GHOST NODE'S ROWS ARE RETIRED AS THAT NODE, NEVER SENT TO ANOTHER
+/// NODE'S BRIDGE.** What `aterm fabric` says of a `remote` node: run `aterm
+/// fabric doctor --retire-ghosts` under a `[fabric] command` naming that
+/// node's state dir and cap. This machine's own aterm keeps running meanwhile,
+/// its bridge up as ITS node — the usual case. That bridge retires only its
+/// own node's rows, so a ghost row handed to it was dropped there ("no
+/// presence row on this node"), unrefused, and the doctor waited out its
+/// five seconds and exited 2 with the row still live. Now the row goes to a
+/// bridge of its own node or, with none up, the command publishes it itself
+/// under that node's state-dir lock and cap: retired once, its own facts
+/// carried, and the live instance's sessions untouched.
+#[test]
+fn a_ghost_nodes_rows_are_retired_as_that_node_beside_a_live_bridge() {
+    let w = World::boot("r24ghostnode", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+
+    // THE GHOST NODE: a state dir and a node cap of its own, under the
+    // world's mint secret, as an aterm that quit under another state dir
+    // left them — and one live presence row it advertised.
+    let ghost_node = "n-00000000000a11ce";
+    let ghost_state = w.tmp.join("ghost-link");
+    std::fs::create_dir_all(&ghost_state).expect("the ghost's state dir");
+    std::fs::write(ghost_state.join("node"), format!("{ghost_node}\n")).expect("its node id");
+    let ghost_cap = w.tmp.join("ghost.cap");
+    let caps: String = harness::node_grants(ghost_node)
+        .iter()
+        .map(|g| harness::cap_line(g))
+        .collect();
+    std::fs::write(&ghost_cap, caps).expect("its node cap");
+    let ghost = "s-0000000000000000a1ce";
+    let subject = format!("/f/{FLEET}/pub/{ghost_node}/{ghost}/presence");
+    w.god()
+        .publish(
+            7_401,
+            1,
+            &subject,
+            b"v=1 t=1 inc=3 epoch=e3 gen=g3 state=live hold=0 holder=- attention=-",
+        )
+        .expect("publish the ghost node's row");
+    until("the ghost node's row to be readable", || {
+        (w.row(&subject).as_deref().and_then(state_of).as_deref() == Some("live")).then_some(())
+    });
+
+    // ITS COMMAND: the world's, with the ghost's cap and state dir.
+    let world_cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
+    let bin = world_cmd
+        .split_whitespace()
+        .next()
+        .expect("the bridge binary")
+        .to_string();
+    let ghost_cmd = format!(
+        "{bin} link serve --fleet {FLEET} --broker {} --cap-file {} --state {}",
+        w.broker_sock,
+        ghost_cap.display(),
+        ghost_state.display()
+    );
+    let mut doctor = std::process::Command::new(&bin);
+    doctor
+        .args(["fabric", "doctor", "--retire-ghosts", "--yes"])
+        .env("HOME", w.tmp.join("home"))
+        .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
+        .env("ATERM_FABRIC_COMMAND", &ghost_cmd)
+        .stdin(std::process::Stdio::null());
+    let out = harness::output_within(&mut doctor, "the doctor");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains(ghost), "the row is listed: {text}");
+    assert_eq!(out.status.code(), Some(0), "{text}");
+
+    let body = until("the ghost node's row to read exited", || {
+        let b = w.row(&subject)?;
+        b.contains("state=exited").then_some(b)
+    });
+    assert!(
+        body.contains("inc=3") && body.contains("epoch=e3") && body.contains("gen=g3"),
+        "the row's own facts are carried: {body}"
+    );
+    // The live instance's own sessions are not ghosts, and stay live.
+    assert_eq!(
+        presence_body(&w, &a)
+            .as_deref()
+            .and_then(state_of)
+            .as_deref(),
+        Some("live"),
+        "{text}"
+    );
+}

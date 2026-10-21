@@ -9,11 +9,25 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Output;
 
+/// The shared child construction keeps curl's default configuration out of
+/// both fetch paths. `-q` must be its first argument; the explicit private
+/// header config remains an ordinary later option. Other tools are unchanged.
+fn command(prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
+    let mut command = aterm_uds::spawnfd::command(prog);
+    if prog == "curl" {
+        command
+            .arg("-q")
+            .env_remove("CURL_HOME")
+            .env_remove("XDG_CONFIG_HOME");
+    }
+    command.args(args);
+    command
+}
+
 /// Run a child to completion, capturing output. The command is named in
 /// every error so a failure says what to run by hand.
 pub fn run_capture(prog: &str, args: &[&str]) -> Result<Output, String> {
-    aterm_uds::spawnfd::command(prog)
-        .args(args)
+    command(prog, args)
         .output()
         .map_err(|e| format!("abrew: cannot run {prog}: {e}"))
 }
@@ -21,7 +35,7 @@ pub fn run_capture(prog: &str, args: &[&str]) -> Result<Output, String> {
 /// Run a child with inherited stdio (git, patch); returns
 /// its exit code (2 when it could not be started or was signalled).
 pub fn run_inherit(prog: &str, args: &[&str]) -> i32 {
-    match aterm_uds::spawnfd::command(prog).args(args).status() {
+    match command(prog, args).status() {
         Ok(s) => s.code().unwrap_or(2),
         Err(e) => {
             eprintln!("abrew: cannot run {prog}: {e}");
@@ -64,7 +78,7 @@ pub fn curl_get(url: &str, headers: &[&str]) -> Result<Vec<u8>, String> {
         args.push("-H");
         args.push(h);
     }
-    args.push(url);
+    args.extend(["--", url]);
     let out = run_capture("curl", &args)?;
     if !out.status.success() {
         return Err(format!(
@@ -83,8 +97,14 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|e| format!("abrew: {e}"))?;
-    let work = aterm_tempfile::TempDir::new_in(parent).map_err(|e| format!("abrew: {e}"))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "abrew: cannot create download directory {}: {e}",
+            parent.display()
+        )
+    })?;
+    let work = aterm_tempfile::TempDir::new_in(parent)
+        .map_err(|e| format!("abrew: cannot stage download in {}: {e}", parent.display()))?;
     let partial = work.path().join("download");
     let partial_s = partial.to_string_lossy().into_owned();
     // No total time ceiling (large bottles on slow links are legit);
@@ -116,7 +136,8 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
                 h.replace('\\', "\\\\").replace('"', "\\\"")
             ));
         }
-        std::fs::write(&cfg, body).map_err(|e| format!("abrew: {e}"))?;
+        std::fs::write(&cfg, body)
+            .map_err(|e| format!("abrew: cannot write {}: {e}", cfg.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -131,7 +152,8 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
     if code != 0 {
         return Err(format!("abrew: download failed ({url}), curl exit {code}"));
     }
-    std::fs::rename(&partial, dest).map_err(|e| format!("abrew: {e}"))
+    std::fs::rename(&partial, dest)
+        .map_err(|e| format!("abrew: cannot move download to {}: {e}", dest.display()))
 }
 
 /// SHA-256 of a file, lowercase hex (ring, streamed).
@@ -214,6 +236,16 @@ pub(super) fn archive_supported(name: &str) -> bool {
 
 /// Extract through atpkg's entry-by-entry path and symlink admission. The
 /// unsigned-payload byte and entry ceilings are shared with vendor installs.
+/// Copy one already-verified regular cache file (naked cask payloads).
+pub(super) fn copy_regular(src: &Path, dst: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(src).map_err(|e| format!("abrew: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("abrew: naked payload is not a regular file".to_string());
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("abrew: cannot stage payload: {e}"))?;
+    Ok(())
+}
+
 pub fn untar(archive: &Path, dir: &Path) -> Result<(), String> {
     extract_archive(
         archive,
@@ -221,7 +253,10 @@ pub fn untar(archive: &Path, dir: &Path) -> Result<(), String> {
         crate::extract::ExtractOptions {
             strip_components: 0,
             symlinks: crate::extract::SymlinkPolicy::InRoot,
-            allow_global_pax: false,
+            // Descriptive global PAX metadata is common in real cask
+            // tarballs (GitHub source archives); the extractor validates
+            // it as metadata-only before skipping it.
+            allow_global_pax: true,
         },
     )
 }
@@ -293,6 +328,23 @@ fn extract_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_setup_errors_name_the_path() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        // A dest whose parent is a regular file fails before any
+        // network use; the error must name that parent, not just
+        // relay a bare OS error.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"file").unwrap();
+        let dest = blocker.join("bottle.tar.gz");
+        let error = curl_to_file("https://example.invalid/bottle.tar.gz", &dest, &[])
+            .expect_err("setup must fail");
+        assert!(
+            error.contains(&blocker.display().to_string()),
+            "error names the path: {error}"
+        );
+    }
 
     #[test]
     fn sha256_of_known_bytes() {

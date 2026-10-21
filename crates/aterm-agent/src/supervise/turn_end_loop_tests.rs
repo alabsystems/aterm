@@ -11,9 +11,8 @@ use crate::harness::login_latch::LoginLatches;
 use crate::harness::repo_work::RepoWork;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::turn_end::{
-    DONE_CHECK, FINISHED, RULE_CONTINUE, RULE_DONE_CHECK, RULE_FINISHED, RULE_LEFT, RULE_LOGIN,
-    RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_SUGGESTION, RULE_UNCOMMITTED, open_items_text,
-    uncommitted_text,
+    DONE_CHECK, FINISHED, LAND, LAND_NUDGE, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT,
+    RULE_LOGIN, RULE_LOGIN_BACK, RULE_SUGGESTION, repo_work_suffix,
 };
 use std::sync::PoisonError;
 
@@ -32,7 +31,7 @@ fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {
             answer_questions: false,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(max_s)
     }
@@ -146,15 +145,16 @@ fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }
 
-/// A worker that says it is done is asked once: the done check is typed
-/// where `keep going` would be, and when its answer is `DONE` the task is
-/// done: nothing more is typed, and the journal says so once (`DONE …`) —
-/// nor after Claude Code compacts the idle conversation under it, its own
-/// housekeeping and no turn ([`claude_codes_idle_compaction_is_no_turn`]),
-/// the back-off short so that nothing but the reading holds an act.
-/// (Progress is continued with `keep going`: the first test.)
+/// A worker that says it is done gets the done check where `keep going`
+/// would be, and its answer `DONE` is a done claim again: the check is typed
+/// again (FOREVER CRUISE), the task never ends, and the journal holds no
+/// `DONE` — nor does Claude Code compacting the idle conversation under the
+/// claim, its own housekeeping and no turn
+/// ([`claude_codes_idle_compaction_is_no_turn`]), the back-off short so that
+/// nothing but the reading holds an act. (Progress is continued with `keep
+/// going`: the first test.)
 #[test]
-fn a_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
+fn a_done_report_is_checked_and_a_done_reply_is_checked_again() {
     let (dir, journal) = journal_file("done-check");
     // The reply, its done row, then what the compaction appended under them.
     let mut compacted = rows(&[
@@ -181,7 +181,7 @@ fn a_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
     // clock: an act a back-off holds comes inside the run.
     m.stall_sleep = Some(Duration::from_secs(20));
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         journal: Some(journal.clone()),
         ..auto(30)
     };
@@ -199,35 +199,40 @@ fn a_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
         )),
         "{lines:#?}"
     );
-    assert_eq!(count(&m, "turn"), 1, "the check alone: {:#?}", m.requests);
+    let turns: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("turn "))
+        .collect();
+    assert!(
+        turns.len() >= 2 && turns.iter().all(|r| **r == continue_request(DONE_CHECK)),
+        "the check, and again: {:#?}",
+        m.requests
+    );
     let done: Vec<String> = journal_records(&journal)
         .0
         .into_iter()
         .map(|r| r.line)
         .filter(|l| l.starts_with("DONE "))
         .collect();
-    assert_eq!(done.len(), 1, "{done:#?}");
-    assert!(
-        done[0].starts_with(&format!("DONE seq=104 rule={RULE_DONE_CHECK} ")),
-        "{done:#?}"
-    );
+    assert!(done.is_empty(), "{done:#?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A DONE CHECK ANSWERED FASTER THAN ANY READ ENDS THE TASK AT ITS ANSWER
-/// (the lab's done-check scenario `d1l` on Claude Code 2.1.303):
-/// the worker's every report is the idle line alone, and the check's answer —
-/// the same line, in 41 ms — is drawn under the check's own `❯` row with no
-/// busy screen between. The loop reads the act taken and answered there (the
+/// A DONE CHECK ANSWERED FASTER THAN ANY READ IS JUDGED AT ITS ANSWER (the
+/// lab's done-check scenario `d1l` on Claude Code 2.1.303): the worker's
+/// every report is the idle line alone, and the check's answer — the same
+/// line, in 41 ms — is drawn under the check's own `❯` row with no busy
+/// screen between. The loop reads the act taken and answered there (the
 /// screen's row over the last words, `TurnEndReading::answered`, against the
-/// screen the check was typed at), and its short idle answer ends the task:
-/// `DONE … continue-done-check@v1`, the check the one line typed, no wait for
-/// the act to be taken. FAILS WITHOUT THE FIX: `WAITING … the worker to take
-/// the continue-done-check@v1 act`, then `keep going`. NEGATIVE CONTROL: the
-/// same words drawn under another prompt's row say nothing of the check: it
-/// is waited for to its take window, and never ends the task.
+/// screen the check was typed at), with no wait for the act to be taken; the
+/// short idle answer is a done claim, which ends nothing (FOREVER CRUISE).
+/// FAILS WITHOUT THE FIX: `WAITING … the worker to take the
+/// continue-done-check@v1 act`. NEGATIVE CONTROL: the same words drawn under
+/// another prompt's row say nothing of the check: it is waited for to its
+/// take window.
 #[test]
-fn a_check_answered_faster_than_any_read_ends_the_task_at_its_answer() {
+fn a_check_answered_faster_than_any_read_is_judged_at_its_answer() {
     const IDLE: &str = "Both branches have landed and no lander is running.";
     let screen = |more: &[&str]| {
         let mut r = rows(&[
@@ -269,7 +274,7 @@ fn a_check_answered_faster_than_any_read_ends_the_task_at_its_answer() {
         m.vanish_after = Some(10);
         m.stall_sleep = Some(Duration::from_millis(20));
         let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             journal: Some(journal.clone()),
             ..auto(30)
         };
@@ -298,22 +303,8 @@ fn a_check_answered_faster_than_any_read_ends_the_task_at_its_answer() {
         let waited = records
             .iter()
             .any(|l| l.contains("the worker to take the continue-done-check@v1 act"));
-        if ends {
-            assert_eq!(
-                count(&m, "turn"),
-                1,
-                "{case}: the check alone: {records:#?}"
-            );
-            assert_eq!(done.len(), 1, "{case}: {records:#?}");
-            assert!(
-                done[0].starts_with(&format!("DONE seq=103 rule={RULE_DONE_CHECK} ")),
-                "{case}: {done:#?}"
-            );
-            assert!(!waited, "{case}: taken at its answer: {records:#?}");
-        } else {
-            assert!(done.is_empty(), "{case}: {records:#?}");
-            assert!(waited, "{case}: {records:#?}");
-        }
+        assert!(done.is_empty(), "{case}: {records:#?}");
+        assert_eq!(waited, !ends, "{case}: {records:#?}");
     }
 }
 
@@ -366,11 +357,11 @@ impl IdleHost for TypedRecordHost {
 /// it, and the conversation's record ending on the check's own prompt,
 /// recorded since the act and closed in 41 ms — read while the check stands
 /// untaken (`TurnEndState::reads_record`), handed to the policy as the turn
-/// the record ends on (`TurnEndReading::record_turn`): the task ends at that
-/// read, `DONE … continue-done-check@v1`, with no wait for the act to be
-/// taken. FAILS WITHOUT IT: the window, then `keep going`. NEGATIVE
+/// the record ends on (`TurnEndReading::record_turn`): the answer is judged
+/// at that read, with no wait for the act to be taken — a done claim, which
+/// ends nothing (FOREVER CRUISE). FAILS WITHOUT IT: the window. NEGATIVE
 /// CONTROL: no host, and so no record — the act is waited for to its take
-/// window, and the task is not ended.
+/// window.
 #[test]
 fn the_record_tells_a_check_answered_faster_than_any_read() {
     const IDLE: &str = "Both branches have landed and no lander is running.";
@@ -401,7 +392,7 @@ fn the_record_tells_a_check_answered_faster_than_any_read() {
         m.vanish_after = Some(10);
         m.stall_sleep = Some(Duration::from_millis(20));
         let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             journal: Some(journal.clone()),
             idle_host: hosted.then(|| Arc::clone(&host) as Arc<dyn IdleHost>),
             ..auto(30)
@@ -432,166 +423,8 @@ fn the_record_tells_a_check_answered_faster_than_any_read() {
         let waited = records
             .iter()
             .any(|l| l.contains("the worker to take the continue-done-check@v1 act"));
-        if ends {
-            assert_eq!(
-                count(&m, "turn"),
-                1,
-                "{case}: the check alone: {records:#?}"
-            );
-            assert_eq!(done.len(), 1, "{case}: {records:#?}");
-            assert!(
-                done[0].starts_with(&format!("DONE seq=103 rule={RULE_DONE_CHECK} ")),
-                "{case}: {done:#?}"
-            );
-            assert!(!waited, "{case}: taken at its answer: {records:#?}");
-        } else {
-            assert!(done.is_empty(), "{case}: {records:#?}");
-            assert!(waited, "{case}: {records:#?}");
-        }
-    }
-}
-
-/// A host whose conversation's record GROWS as the loop sees turns run
-/// ([`IdleHost::turn_ran`]): `before` until the `at`-th turn, `after` from
-/// it, folded by the record's own reader
-/// ([`crate::harness::upgrade::FinishedScan`]) as the window host's memo
-/// folds it ([`IdleHost::finished`], [`IdleHost::check_answer`],
-/// [`IdleHost::finished_at_check`]), knowing what the loop typed (`ours`,
-/// its ledger's texts) as that memo does.
-#[derive(Debug)]
-struct GrowingRecordHost {
-    before: String,
-    after: String,
-    at: usize,
-    ran: std::sync::atomic::AtomicUsize,
-    ours: Vec<crate::supervise::approvals::Typed>,
-}
-
-impl GrowingRecordHost {
-    fn scan(&self) -> crate::harness::upgrade::FinishedScan {
-        let ran = self.ran.load(std::sync::atomic::Ordering::SeqCst);
-        let full = if ran >= self.at {
-            &self.after
-        } else {
-            &self.before
-        };
-        let mut scan = crate::harness::upgrade::FinishedScan::default();
-        scan.supervisor_typed(&self.ours);
-        for line in full.lines() {
-            scan.line(line);
-        }
-        scan
-    }
-}
-
-impl IdleHost for GrowingRecordHost {
-    fn wants(&self) -> bool {
-        false
-    }
-    fn at_idle(&self) -> Option<HostStep> {
-        None
-    }
-    fn owns_turn_end(&self) -> bool {
-        false
-    }
-    fn turn_ran(&self) {
-        self.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-    fn finished(&self) -> Option<bool> {
-        Some(self.scan().finished())
-    }
-    fn check_answer(&self) -> Option<bool> {
-        self.scan().check_answer()
-    }
-    fn finished_at_check(&self) -> bool {
-        self.scan().finished_at_check()
-    }
-    fn last_turn(&self) -> Option<crate::harness::upgrade::LastTurn> {
-        Some(self.scan().last_turn())
-    }
-}
-
-/// A TASK THE DONE CHECK ENDED IS JOURNALLED AS THE CHECK'S END, whatever
-/// the record says of it (F2 of the live lab of 2026-10-16, Claude Code
-/// 2.1.301, the lab's S2): the worker said it is done, the check was typed,
-/// and it answered in words — `All tasks are complete and verified; nothing
-/// is left to do.`, no token — its turn seen run. Its record reads a done
-/// reply to the check as a finish too, and the loop's `DONE` said
-/// `rule=finished@v1 the worker reported ATERM-TASK-DONE`: evidence of a
-/// token never said. It says `rule=continue-done-check@v1`; nothing is typed
-/// after the check either way. NEGATIVE CONTROL: the check answered with the
-/// token is the worker's `finished@v1`.
-#[test]
-fn a_task_the_done_check_ended_is_journalled_as_the_checks_end() {
-    let json = |text: &str| aterm_json::to_string(&aterm_json::Value::from(text)).expect("json");
-    let user = |text: &str| {
-        format!(
-            r#"{{"isSidechain":false,"type":"user","timestamp":"1970-01-01T00:00:01.000Z","message":{{"role":"user","content":{}}},"origin":{{"kind":"human"}},"promptSource":"typed","version":"2.1.301"}}"#,
-            json(text)
-        )
-    };
-    let model = |text: &str| {
-        format!(
-            r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}],"stop_reason":"end_turn"}},"version":"2.1.301"}}"#,
-            json(text)
-        )
-    };
-    let report = "All tasks are complete and verified; nothing is left to do.";
-    for (reply, rule) in [(report, RULE_DONE_CHECK), (FINISHED, RULE_FINISHED)] {
-        let before = [
-            user("Finish the remaining items on the list."),
-            model(report),
-        ]
-        .join("\n");
-        let after = [before.clone(), user(DONE_CHECK), model(reply)].join("\n");
-        let host = Arc::new(GrowingRecordHost {
-            before,
-            after,
-            at: 2,
-            ran: std::sync::atomic::AtomicUsize::new(0),
-            ours: Vec::new(),
-        });
-        let (dir, journal) = journal_file(&format!("check-end-{rule}"));
-        let mut m = Mock::new(vec![
-            busy_screen(),
-            ended(report),
-            busy_screen(),
-            ended(reply),
-        ]);
-        m.turn_releases = Some(1);
-        m.vanish_after = Some(4);
-        let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
-            journal: Some(journal.clone()),
-            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            ..auto(30)
-        };
-        let (lines, _) = watch_lines(&mut m, &opts);
-        assert!(
-            lines.contains(&format!(
-                "CONTINUED seq=102 rule={RULE_DONE_CHECK} {}",
-                clip(DONE_CHECK)
-            )),
-            "{rule}: {lines:#?}"
-        );
-        assert_eq!(count(&m, "turn"), 1, "{rule}: the check alone");
-        let done: Vec<String> = journal_records(&journal)
-            .0
-            .into_iter()
-            .map(|r| r.line)
-            .filter(|l| l.starts_with("DONE "))
-            .collect();
-        assert_eq!(done.len(), 1, "{rule}: {done:#?}");
-        assert!(
-            done[0].starts_with(&format!("DONE seq=104 rule={rule} ")),
-            "{done:#?}"
-        );
-        assert_eq!(
-            done[0].contains(&format!("reported {FINISHED}")),
-            rule == RULE_FINISHED,
-            "{done:#?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(done.is_empty(), "{case}: {records:#?}");
+        assert_eq!(waited, !ends, "{case}: {records:#?}");
     }
 }
 
@@ -2034,15 +1867,15 @@ fn a_question_in_prose_is_answered_by_the_sessions_priority_word() {
     use crate::supervise::policy::question::{LONG_TERM_TEXT, SHORT_TERM_TEXT};
     use crate::supervise::policy::turn_end::RULE_ANSWER;
     use crate::supervise::policy::{RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM};
-    let answer_text = SupervisorConfig::default().answer_text;
+    let answer_text = owners_policy().answer_text;
     let full = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     let long = SuperviseOpts {
         policy: SupervisorConfig {
             question_priority: crate::supervise::QuestionPriority::LongTerm,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -2064,6 +1897,8 @@ fn a_question_in_prose_is_answered_by_the_sessions_priority_word() {
     .into_iter()
     .enumerate()
     {
+        // Every answer asks for what only a person can give on its own line.
+        let text = format!("{text} {}", crate::supervise::policy::needs::NEEDS_HINT);
         let (dir, ledger) = ledger_at(&format!("prose-{word}-{k}"));
         let mut m = Mock::new(vec![busy_screen(), ended(PROSE_ASK)]);
         m.turn_releases = Some(1);
@@ -2280,10 +2115,18 @@ fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
     );
 }
 
+/// A WINDOW HOST'S HOLDER, AS ITS LOOPS ARE NAMED (`aterm-gui`'s
+/// `harness_host::holder`, its hand name), and no pid of this test process:
+/// a loop takes its hand under its own setup's holder, never this process's
+/// pid read again, so a replay of its tape in another process asks as the
+/// recorded run did.
+const HAND_HOLDER: &str = "aterm-harness@1";
+
 /// THE WINDOW'S HOST TYPES THE CONTINUATION UNDER ITS OWN HAND
-/// ([`Session::type_under_hand`]): the hand taken with an acquire kept to
-/// the loop's connection (`upgrade_drive::hand_take_here_request`: the
-/// upgrade's hand request, `here`), the fenced `send` and its `key enter`
+/// ([`Session::type_under_hand`]): the hand taken under the loop's holder
+/// ([`HAND_HOLDER`]) with an acquire kept to the loop's connection
+/// (`upgrade_drive::hand_take_here_request_as`: the upgrade's hand request,
+/// `here`), the fenced `send` and its `key enter`
 /// exactly as without it, and the hand given back the same way — so the
 /// server records the text as the harness's turn (`history … by=harness`),
 /// and no other connection types between the text and its Enter. A hand
@@ -2295,8 +2138,13 @@ fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
 /// `lease` at all.
 #[test]
 fn the_windows_host_types_the_fenced_continuation_under_its_hand() {
-    let take = crate::harness::upgrade_drive::hand_take_here_request();
-    let back = crate::harness::upgrade_drive::hand_give_back_here_request();
+    let take = crate::harness::upgrade_drive::hand_take_here_request_as(HAND_HOLDER);
+    let back = crate::harness::upgrade_drive::hand_give_back_here_request_as(HAND_HOLDER);
+    assert_ne!(
+        take,
+        crate::harness::upgrade_drive::hand_take_here_request(),
+        "the holder is no pid of this process's"
+    );
     assert!(
         take.ends_with(" hard here") && back.ends_with(" here"),
         "{take} / {back}"
@@ -2324,7 +2172,10 @@ fn the_windows_host_types_the_fenced_continuation_under_its_hand() {
             "lease",
             VecDeque::from([acquired, ok("OK lease released\n")]),
         );
-        let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| s.type_under_hand(hand));
+        let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
+            s.set_supervisor_name(Some(HAND_HOLDER.to_string()));
+            s.type_under_hand(hand);
+        });
         assert!(
             lines.contains(&format!(
                 "CONTINUED seq=102 rule={RULE_CONTINUE} keep going"
@@ -2392,7 +2243,10 @@ fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
                 ok("OK lease released\n"),
             ]),
         );
-        let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| s.type_under_hand(hand));
+        let (lines, _) = watch_lines_with(&mut m, &hosted(30), |s| {
+            s.set_supervisor_name(Some(HAND_HOLDER.to_string()));
+            s.type_under_hand(hand);
+        });
         assert!(
             lines.contains(&format!(
                 "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
@@ -2410,10 +2264,10 @@ fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
     assert_eq!(
         run(true),
         [
-            crate::harness::upgrade_drive::hand_take_here_request().as_str(),
+            crate::harness::upgrade_drive::hand_take_here_request_as(HAND_HOLDER).as_str(),
             "send if-human=0 if-gen=1.102 if=^❯\\x20keep\\x20going\\s*$ -- keep going",
             "key if-human=0 if-gen=1.103 if=^❯\\x20keep\\x20going\\s*$ enter",
-            crate::harness::upgrade_drive::hand_give_back_here_request().as_str(),
+            crate::harness::upgrade_drive::hand_give_back_here_request_as(HAND_HOLDER).as_str(),
         ]
     );
     let accepted = run(false);
@@ -2518,6 +2372,99 @@ fn a_continuation_a_refusal_turned_away_is_typed_once_it_can_be() {
             && sends[1].ends_with(" if=^❯\\s*$ -- keep going"),
         "{sends:#?}"
     );
+}
+
+/// A KEEP-GOING CONTINUATION WAITS OUT AN EDIT HOLD (amacs design §6.7):
+/// while the session's program waits on an `edit` ticket (`status
+/// editing=1`, the editor open in aterm's own view), the server answers
+/// every write that would type into it `ERR busy editing ticket=<t>
+/// view=<v>` and writes nothing. The loop backs off from that as from any
+/// `ERR busy` — no park, no failure, no try spent — and journals it once,
+/// not at every retry; once the ticket resolves the same point is decided
+/// again and `keep going` typed, exactly once. On the guarded `turn` and on
+/// the fenced `send`. Were it read as a failure, the loop would end at the
+/// first refusal and the continuation would never come.
+#[test]
+fn a_keep_going_continuation_waits_out_an_edit_hold() {
+    let editing = "busy editing ticket=41 view=7";
+    let (jdir, journal) = journal_file("edit-hold");
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        ended("Fixed the parser; the suite is green."),
+    ]);
+    m.verb_replies.insert(
+        "turn",
+        VecDeque::from([err(editing), err(editing), err(editing)]),
+    );
+    m.stall_sleep = Some(Duration::from_millis(20));
+    m.vanish_after = Some(1500);
+    m.exit_when = Some(|m| m.turns >= 4);
+    let opts = SuperviseOpts {
+        journal: Some(journal.clone()),
+        ..hosted(60)
+    };
+    let (lines, _) = watch_lines(&mut m, &opts);
+    assert_eq!(
+        count(&m, "turn"),
+        4,
+        "three refused while editing, then typed: {:#?}",
+        m.requests
+    );
+    let continued: Vec<&String> = lines
+        .iter()
+        .filter(|l| {
+            l.starts_with("CONTINUED seq=")
+                && l.ends_with(&format!("rule={RULE_CONTINUE} keep going"))
+        })
+        .collect();
+    assert_eq!(continued.len(), 1, "typed once, after: {lines:#?}");
+    let (records, _) = journal_records(&journal);
+    let refused: Vec<&str> = records
+        .iter()
+        .map(|r| r.line.as_str())
+        .filter(|n| n.starts_with("REFUSED "))
+        .collect();
+    assert_eq!(
+        refused.len(),
+        1,
+        "said once, not at every retry: {refused:#?}"
+    );
+    assert!(
+        refused[0].ends_with("ERR busy editing ticket=41 view=7"),
+        "{refused:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&jdir);
+
+    // The fenced host's `send`: refused while editing, written once the
+    // ticket resolved, on the screen that never moved.
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        ended("Fixed the parser; the suite is green."),
+    ]);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
+    m.send_replies.push_back(err(editing));
+    m.send_replies.push_back(err(editing));
+    m.stall_sleep = Some(Duration::from_millis(20));
+    m.vanish_after = Some(1500);
+    m.exit_when = Some(|m| m.requests.iter().filter(|r| r.starts_with("send ")).count() >= 3);
+    let _ = watch_lines(&mut m, &hosted(60));
+    let sends: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("send "))
+        .collect();
+    assert_eq!(
+        sends.len(),
+        3,
+        "two refused, then written: {:#?}",
+        m.requests
+    );
+    for send in &sends {
+        assert!(send.ends_with(" -- keep going"), "{sends:#?}");
+    }
 }
 
 /// A REFUSAL'S EPISODE, by its key and its last meeting
@@ -2679,7 +2626,7 @@ fn a_fenced_press_a_hold_turned_away_is_pressed_once_it_lifts() {
         policy: SupervisorConfig {
             answer_questions: false,
             human_grace_s: 1,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(60)
     };
@@ -2725,7 +2672,7 @@ fn a_fenced_press_a_hold_turned_away_is_pressed_once_it_lifts() {
 /// which ride capped.
 #[test]
 fn a_long_texts_guard_never_matches_a_shells_row() {
-    let answer = crate::supervise::SupervisorConfig::default().answer_text;
+    let answer = owners_policy().answer_text;
     let rules = format!(
         "keep going (standing rules: {})",
         "stay on the branch, never push to main, run the lane's tests before every commit, \
@@ -2803,7 +2750,7 @@ fn gemini_clis_guard_is_anchored_one_column_in() {
     let old = aterm_observe::row_matcher(&composer_guard(caret, text)).expect("compiles");
     assert!(!old.matches(measured), "the control");
 
-    let long = crate::supervise::SupervisorConfig::default().answer_text;
+    let long = owners_policy().answer_text;
     let g = aterm_observe::row_matcher(&composer_guard_at(caret, column, &long)).expect("compiles");
     let old = aterm_observe::row_matcher(&composer_guard(caret, &long)).expect("compiles");
     let mut old_missed = 0;
@@ -2853,7 +2800,7 @@ fn a_yolo_caret_is_escaped_in_its_guard() {
     ] {
         assert!(!g.matches(&other), "{other}");
     }
-    let long = crate::supervise::SupervisorConfig::default().answer_text;
+    let long = owners_policy().answer_text;
     let g = aterm_observe::row_matcher(&composer_guard_at(caret, 1, &long)).expect("compiles");
     for width in 30..=160 {
         let last = gemini_wrapped_last_row(&long, width).replacen(" > ", " * ", 1);
@@ -3300,7 +3247,7 @@ fn a_model_switch_is_read_back_by_a_loop_that_starts_after_it() {
 fn a_persons_keystroke_holds_the_loop_for_the_grace() {
     // A short budget: a held point waits out the rest of it.
     let full = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(1)
     };
     for (human_ms, holds) in [(Some(1_000), true), (Some(200_000), false), (None, false)] {
@@ -3343,7 +3290,7 @@ fn another_drivers_hand_holds_the_loop() {
     let opts = || SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 60,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(1)
     };
@@ -3383,7 +3330,7 @@ fn a_held_box_is_answered_once_the_persons_grace_has_passed() {
     let opts = |budget: u64| SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 1,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(budget)
     };
@@ -3435,7 +3382,7 @@ fn a_draft_still_changing_is_never_submitted() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 1,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(4)
     };
@@ -3515,7 +3462,7 @@ fn an_agy_session_is_supervised_end_to_end() {
     m.turn_releases = Some(3);
     m.vanish_after = Some(2);
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -3786,7 +3733,7 @@ fn a_muse_code_session_is_supervised_end_to_end() {
     m.turn_releases = Some(3);
     m.vanish_after = Some(2);
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -3984,7 +3931,7 @@ fn a_muse_code_question_is_answered_by_the_cursor_and_enter() {
         m.key_releases = Some(1);
         m.vanish_after = Some(2);
         let mut opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             ..auto(10)
         };
         opts.policy.answer_questions = answers;
@@ -4066,7 +4013,7 @@ fn a_question_read_by_its_roles_is_told_once_as_the_policys_choice() {
             m.key_releases = Some(usize::from(agent == "muse"));
             m.vanish_after = Some(2);
             let mut opts = SuperviseOpts {
-                policy: SupervisorConfig::default(),
+                policy: owners_policy(),
                 ..auto(10)
             };
             opts.policy.answer_questions = answers;
@@ -4090,25 +4037,25 @@ fn a_question_read_by_its_roles_is_told_once_as_the_policys_choice() {
     }
 }
 
-/// Muse Code's DONE CHECK reads its own reply: a report whose last row is
-/// `ATERM-TASK-DONE` (measured on 1.4.10, under an away recap drawn above its
-/// message) ends the task — nothing typed, and the journal says once why
-/// (`DONE … rule=finished@v1`). NEGATIVE CONTROL: the plain turn's end is
-/// continued, and no `DONE` is journaled.
+/// Muse Code's reply is read as Claude Code's: a report whose last row is
+/// the retired `ATERM-TASK-DONE` (measured on 1.4.10, under an away recap
+/// drawn above its message) is a done claim like any other — the done check
+/// is typed, and no `DONE` is journaled (FOREVER CRUISE). NEGATIVE CONTROL:
+/// the plain turn's end is continued.
 #[test]
-fn a_muse_code_report_ending_with_the_token_ends_the_task() {
+fn a_muse_code_report_ending_with_the_token_gets_the_done_check() {
     use aterm_phase::muse::fixtures as u;
     use aterm_phase::prompt::fixtures::screen;
-    for (tag, end, typed) in [
-        ("muse-finished", u::END_OF_TURN_FINISHED, false),
-        ("muse-plain", u::END_OF_TURN_1_4_10, true),
+    for (tag, end, rule) in [
+        ("muse-finished", u::END_OF_TURN_FINISHED, RULE_DONE_CHECK),
+        ("muse-plain", u::END_OF_TURN_1_4_10, RULE_CONTINUE),
     ] {
         let (dir, journal) = journal_file(tag);
         let mut m = muse_mock(vec![screen(u::BUSY_1_4_10), screen(end)]);
         m.turn_releases = Some(1);
         m.vanish_after = Some(2);
         let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             journal: Some(journal.clone()),
             ..auto(3)
         };
@@ -4125,21 +4072,14 @@ fn a_muse_code_report_ending_with_the_token_ends_the_task() {
             .filter(|l| l.starts_with("DONE "))
             .collect();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(
-            count(&m, "turn") > 0,
-            typed,
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("CONTINUED ") && l.contains(&format!(" rule={rule} "))),
             "{tag}: {lines:#?}\n{:#?}",
             m.requests
         );
-        if typed {
-            assert!(done.is_empty(), "{tag}: {done:#?}");
-        } else {
-            assert_eq!(done.len(), 1, "{tag}: {done:#?}");
-            assert!(
-                done[0].contains(&format!("rule={RULE_FINISHED} ")),
-                "{done:#?}"
-            );
-        }
+        assert!(done.is_empty(), "{tag}: {done:#?}");
     }
 }
 
@@ -4199,7 +4139,7 @@ fn a_gemini_session_is_supervised_end_to_end() {
     m.turn_releases = Some(3);
     m.vanish_after = Some(2);
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -4265,7 +4205,7 @@ fn a_gemini_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
     m.turn_releases = Some(1);
     m.vanish_after = Some(4);
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     let quick = |s: &mut Watched<'_, '_>| {
@@ -4421,7 +4361,7 @@ fn gemini_clis_usage_limit_and_its_stop_are_handed_to_a_person() {
     m.attention_gates = vec![(1, 0)];
     m.vanish_after = Some(3);
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -4689,7 +4629,7 @@ fn backed_off(tag: &str, every_step: bool) -> (Vec<Option<WaitPlan>>, Vec<String
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         policy: SupervisorConfig {
             human_grace_s: 0,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         journal: Some(journal.clone()),
         ..auto(30)
@@ -5386,7 +5326,7 @@ fn a_question_over_agy_or_muse_background_work_is_held_as_over_claude_codes_shel
         let host = Arc::new(CarriedHost::default());
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             ..auto(3)
         };
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -6182,7 +6122,7 @@ fn a_suggestion_on_a_grid_drawn_one_row_high_is_not_a_draft_at_a_wall() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..resuming(&auto(30), None)
         };
@@ -6363,6 +6303,36 @@ fn memory_run_on(
     server: impl FnOnce(&mut Mock),
     setup: impl FnOnce(&mut Session<'_, Mock>),
 ) -> (Mock, Vec<String>, Vec<String>, PathBuf) {
+    memory_run_at(tag, screens, stop_s, sid, None, server, setup)
+}
+
+/// The clock a run of [`memory_run_at`] waits on: its own, moving only by what the run
+/// skips ([`crate::supervise::fx::ScriptedClock::run_virtual`]: the sat screen's waits, the
+/// loop's own sleeps), the wall clock on a whole second of the system's and running with it.
+/// Two runs on one clock are one stretch of time, the second taking up where the first
+/// stopped.
+fn memory_run_clock() -> Arc<crate::supervise::fx::ScriptedClock> {
+    let clock = Arc::new(crate::supervise::fx::ScriptedClock::default());
+    clock.run_virtual();
+    let now_ms = crate::supervise::journal::unix_ms();
+    clock.set_at_ms(now_ms - now_ms.rem_euclid(1000));
+    clock.set_running();
+    clock
+}
+
+/// [`memory_run_on`], on `clock` where it is `Some` ([`memory_run_clock`]): `stop_s` is read
+/// on it, after every request the loop makes, so a run waits out a reset in no real time and
+/// stops at the same step however loaded the machine (a minute of real time stays its hang
+/// detector). `None`: the system's clocks, the loop's waits napped.
+fn memory_run_at(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    stop_s: u64,
+    sid: Option<&str>,
+    clock: Option<&Arc<crate::supervise::fx::ScriptedClock>>,
+    server: impl FnOnce(&mut Mock),
+    setup: impl FnOnce(&mut Session<'_, Mock>),
+) -> (Mock, Vec<String>, Vec<String>, PathBuf) {
     let sits = screens.len() - 1;
     let (dir, path) = journal_file(tag);
     let mut m = Mock::new(screens);
@@ -6384,7 +6354,17 @@ fn memory_run_on(
     // A run that types nothing (the failure, or a control) ends by this stop,
     // not at the budget the wall's reset stretches it to.
     let stop = Arc::new(AtomicBool::new(false));
-    {
+    if let Some(clock) = clock {
+        m.waits = Some(Arc::clone(clock));
+        let (clock, halt) = (Arc::clone(clock), Arc::clone(&stop));
+        let until = clock.mono() + Duration::from_secs(stop_s);
+        let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        m.after_call = Some(Box::new(move || {
+            if clock.mono() >= until || Instant::now() >= hang {
+                halt.store(true, Ordering::SeqCst);
+            }
+        }));
+    } else {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(stop_s));
@@ -6392,8 +6372,11 @@ fn memory_run_on(
         });
     }
     {
-        // The machine's own clock: a span counts from its print in real time.
+        // The machine's own clock (or the run's): a span counts from its print.
         let mut s = session(&mut m, sid.map(str::to_string));
+        if let Some(clock) = clock {
+            s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(clock))));
+        }
         s.stop = Some(stop);
         s.set_zone_lookup(test_zones);
         s.set_turn_end_timing(TurnEndTiming {
@@ -6404,6 +6387,7 @@ fn memory_run_on(
         setup(&mut s);
         let _ = s.watch(&opts, &mut out);
     }
+    m.after_call = None;
     let lines: Vec<String> = String::from_utf8(out)
         .expect("utf-8")
         .lines()
@@ -6538,16 +6522,18 @@ fn auto_continue_cancelled() -> Vec<String> {
 /// (with `continue_policy = false`, nothing ever, and nobody told). Here the
 /// successor's back-off is a second, the reset seven seconds out: it waits by
 /// the wall's own rule (`usage-session resets`) for the reset and its grace,
-/// then types `keep going` once.
+/// then types `keep going` once. Both loops run on one clock of the run's own
+/// ([`memory_run_clock`]): the reset is waited out in no real time.
 #[test]
 fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
     let dir = crate::supervise::test_scratch_path("wm-ledger", "left-restart");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let ledger = dir.join("s-1.jsonl");
-    let reset = Instant::now() + Duration::from_secs(7);
+    let clock = memory_run_clock();
+    let reset = clock.mono() + Duration::from_secs(7);
     // The loop that reads the limit and then the cancel, stopped there.
-    let (m, lines, _, jdir) = memory_run_for(
+    let (m, lines, _, jdir) = memory_run_at(
         "left-restart-1",
         vec![
             busy_screen(),
@@ -6556,6 +6542,8 @@ fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
         ],
         2,
         Some("@s-1"),
+        Some(&clock),
+        |_| {},
         |s| s.set_approval_ledger(Some(ledger.clone())),
     );
     let _ = std::fs::remove_dir_all(&jdir);
@@ -6566,11 +6554,13 @@ fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
         "the wall is open for a loop that follows: {rows}"
     );
     // The loop that follows, on the cancelled screen.
-    let (m, lines, waits, jdir) = memory_run_for(
+    let (m, lines, waits, jdir) = memory_run_at(
         "left-restart-2",
         vec![auto_continue_cancelled()],
         HANG_S,
         Some("@s-1"),
+        Some(&clock),
+        |_| {},
         |s| {
             s.set_approval_ledger(Some(ledger.clone()));
             s.set_turn_end_timing(TurnEndTiming {
@@ -6587,7 +6577,7 @@ fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
     // sooner than the reset: the wait was the wall's, never the continue
     // policy's back-off.
     assert_eq!(m.turns, 1, "{lines:#?}\n{waits:#?}\n{:#?}", m.requests);
-    assert!(Instant::now() >= reset, "not before the reset: {waits:#?}");
+    assert!(clock.mono() >= reset, "not before the reset: {waits:#?}");
     assert!(
         !waits.is_empty() && waits.iter().all(|w| w.ends_with("usage-session resets")),
         "{waits:#?}"
@@ -8987,10 +8977,14 @@ fn the_wait_places_a_reset_across_a_dst_change_with_the_offset_there() {
     );
 }
 
-/// A host that only listens for the canary's ladder.
+/// A host that only listens for the canary's ladder, and answers its jobs
+/// reading with `evidence` (`Unknown` by default: no reading), or with `then`
+/// once it was told a call that made no progress.
 #[derive(Debug, Default)]
 struct LadderHost {
     told: std::sync::Mutex<Vec<String>>,
+    evidence: crate::supervise::background::BackgroundEvidence,
+    then: Option<crate::supervise::background::BackgroundEvidence>,
 }
 
 impl IdleHost for LadderHost {
@@ -9010,14 +9004,21 @@ impl IdleHost for LadderHost {
         ));
     }
     fn stall_unread(&self, stall: Option<StallSeen>) {
-        self.told.lock().unwrap().push(
-            match stall {
-                None => "unread:none",
-                Some(StallSeen::Unread { .. }) => "unread:some",
-                Some(StallSeen::OwnWork { .. }) => "own-work:some",
+        self.told.lock().unwrap().push(match stall {
+            None => "unread:none".to_string(),
+            Some(StallSeen::Unread { .. }) => "unread:some".to_string(),
+            Some(StallSeen::OwnWork { .. }) => "own-work:some".to_string(),
+            Some(StallSeen::NoProgress { minutes, pid }) => {
+                format!("no-progress:{pid}:{minutes}")
             }
-            .to_string(),
-        );
+        });
+    }
+    fn background_jobs(&self) -> crate::supervise::background::BackgroundEvidence {
+        let told = self.told.lock().unwrap();
+        match &self.then {
+            Some(then) if told.iter().any(|t| t.starts_with("no-progress:")) => then.clone(),
+            _ => self.evidence.clone(),
+        }
     }
 }
 
@@ -9149,6 +9150,169 @@ fn a_stall_kept_up_climbs_to_a_record_and_then_an_exception_and_its_end_withdraw
             "{name} climbs nothing: {stuck:#?} {stalled:#?} {told:#?}\n{lines:#?}"
         );
     }
+}
+
+/// THE CANARY NAMES A BACKGROUND CALL THAT MAKES NO PROGRESS (the hung-call
+/// design's R1; system awareness §14.5). The stall of
+/// `a_stall_kept_up_climbs_to_a_record_and_then_an_exception_and_its_end_withdraws_both`
+/// — the screen busy on background work alone under Claude's resting title —
+/// but the host's jobs reading names a call of the agent's own at no progress
+/// (I4: a background `targo test` asleep on a mutex its own thread held, for
+/// 26 h, while three EXCEPTIONs said "nothing here explains it"). The ladder
+/// climbs as the design's `AllStuck` does: `STALLED` at once, with no `STUCK`
+/// before it, naming the call's task id, pid, exe word, quiet age and its
+/// unnamed wait; the host's record told it with the pid and age
+/// (`StallSeen::NoProgress`); the `EXCEPTION` one unit later, its why the
+/// same fact; each once, nothing typed, and the loop's end withdraws both.
+/// A different call that becomes the worst after `STALLED` (the first ended,
+/// another reads no progress) is named at `STALLED` in its turn, and the
+/// exception names it a unit later: never a call no `STALLED` named.
+/// NEGATIVE CONTROL: the very host answering `Unknown` climbs today's ladder
+/// (`STUCK`, `STALLED`, `EXCEPTION`, the host's unread record), naming no
+/// call. The run ends on the mock's count of waits, never on a clock.
+#[test]
+fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_exception() {
+    use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
+    let run = |evidence: BackgroundEvidence, then: Option<BackgroundEvidence>| {
+        let (dir, path) = journal_file("stuck-kernel");
+        let host = Arc::new(LadderHost {
+            evidence,
+            then,
+            ..LadderHost::default()
+        });
+        let mut m = Mock::new(vec![busy_screen(), memory_scrolled()]);
+        m.title = Some("✳ Claude Code".to_string());
+        m.vanish_after = Some(14);
+        m.stall_sleep = Some(Duration::from_millis(25));
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(60)
+        };
+        // The kernel is asked once the break has stood its settle: 30 ms
+        // here, the ladder's unit.
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.setup.stuck_after = Duration::from_millis(30);
+            s.setup.background_settle = Duration::from_millis(30);
+        });
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let kind = |k: &str| -> Vec<String> {
+            records
+                .iter()
+                .filter(|r| r.line.starts_with(k))
+                .map(|r| r.line.clone())
+                .collect()
+        };
+        (
+            kind("STUCK"),
+            kind("STALLED"),
+            kind("EXCEPTION"),
+            host.told.lock().unwrap().clone(),
+            count(&m, "turn"),
+            lines,
+        )
+    };
+    let hung = BackgroundEvidence::NoProgress {
+        worst: BackgroundCall {
+            pid: 27098,
+            pgid: 27090,
+            exe: "aterm_gui-e0964a".to_string(),
+            task: Some("bplle5dxj".to_string()),
+            quiet_ms: 31 * 60_000 + 59_000,
+            wait: None,
+        },
+    };
+    let (stuck, stalled, exception, told, turns, lines) = run(hung.clone(), None);
+    assert!(
+        stuck.is_empty(),
+        "the kernel explains the screen: no first rung: {stuck:#?}\n{lines:#?}"
+    );
+    assert_eq!(stalled.len(), 1, "rung 2 once: {stalled:#?}\n{lines:#?}");
+    for said in ["bplle5dxj", "pid 27098", "31 min"] {
+        assert!(stalled[0].contains(said), "{said:?} in {}", stalled[0]);
+    }
+    assert_eq!(
+        exception.len(),
+        1,
+        "rung 3 once: {exception:#?}\n{lines:#?}"
+    );
+    assert!(
+        exception[0].contains("kind=stalled when=later")
+            && exception[0].contains("pid 27098")
+            && exception[0].contains("31 min"),
+        "{}",
+        exception[0]
+    );
+    assert_eq!(
+        told,
+        [
+            "no-progress:27098:31",
+            "exception:stalled",
+            "unread:none",
+            "exception:none"
+        ],
+        "the host hears the call at rung 2, the exception at rung 3, and their end"
+    );
+    assert_eq!(turns, 0, "the ladder types nothing");
+    // The first call ends and another becomes the worst after `STALLED`:
+    // it is named in its turn, and the exception names it.
+    let other = BackgroundEvidence::NoProgress {
+        worst: BackgroundCall {
+            pid: 31000,
+            pgid: 31000,
+            exe: "sleep".to_string(),
+            task: None,
+            quiet_ms: 20 * 60_000,
+            wait: None,
+        },
+    };
+    let (stuck, stalled, exception, told, _, lines) = run(hung, Some(other));
+    assert!(stuck.is_empty(), "{stuck:#?}\n{lines:#?}");
+    assert_eq!(
+        (stalled.len(), exception.len()),
+        (2, 1),
+        "{stalled:#?} {exception:#?}\n{lines:#?}"
+    );
+    assert!(
+        stalled[0].contains("pid 27098") && stalled[1].contains("pid 31000"),
+        "{stalled:#?}"
+    );
+    assert!(exception[0].contains("pid 31000"), "{}", exception[0]);
+    assert_eq!(
+        told,
+        [
+            "no-progress:27098:31",
+            "no-progress:31000:20",
+            "exception:stalled",
+            "unread:none",
+            "exception:none"
+        ],
+        "the second call's record, then its exception"
+    );
+    // NEGATIVE CONTROL: no reading is today's ladder, naming no call.
+    let (stuck, stalled, exception, told, _, lines) = run(BackgroundEvidence::Unknown, None);
+    assert_eq!(
+        (stuck.len(), stalled.len(), exception.len()),
+        (1, 1, 1),
+        "{stuck:#?} {stalled:#?} {exception:#?}\n{lines:#?}"
+    );
+    assert!(
+        stalled
+            .iter()
+            .chain(&exception)
+            .all(|l| !l.contains("pid 27098")),
+        "{stalled:#?} {exception:#?}"
+    );
+    assert_eq!(
+        told,
+        [
+            "unread:some",
+            "exception:stalled",
+            "unread:none",
+            "exception:none"
+        ]
+    );
 }
 
 /// THE CANARY ON AGY'S AND MUSE CODE'S OWN BACKGROUND WORK THAT NEVER ENDS
@@ -9769,121 +9933,6 @@ fn a_dialog_no_reader_names_climbs_to_a_record_and_a_line_and_its_end_withdraws_
     );
 }
 
-/// A FINISHED REPORT THAT STILL NAMES OPEN WORK through the real supervisor
-/// (the owner, 2026-10-16: "stop telling me done if you're not done"; and
-/// 2026-10-19: the token NEVER ends a job while ANY follow-up is left): a
-/// report drawn as Claude Code draws it — `Still open: …` on its own row,
-/// then `ATERM-TASK-DONE` — gets the challenge typed
-/// (`CONTINUED … rule=continue-open-items@v1`), and the reply that ends with
-/// the token again while it still lists an item ends nothing: no `DONE`, the
-/// next challenge waiting the back-off its short answer earned. A reply that
-/// says it is done in words, nothing left, ends it as the check's does, the
-/// journal naming the challenge (`DONE … rule=continue-open-items@v1`).
-/// NEGATIVE CONTROL: `Nothing left.` over the token ends the task at once,
-/// nothing typed.
-#[test]
-fn a_finished_report_naming_open_work_is_challenged_at_every_token_through_the_loop() {
-    let report = |lines: &[&str]| {
-        let mut r = vec![format!("⏺ {}", lines[0])];
-        r.extend(lines[1..].iter().map(|l| format!("  {l}")));
-        r.extend(rows(&["", "✻ Worked for 12m 2s · done 4:24 PM", ""]));
-        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
-        r
-    };
-    let open = report(&[
-        "Built and tested the parser; committed on main.",
-        "Still open: the lexer's e2e suite (not run).",
-        FINISHED,
-    ]);
-    // The reply still lists an item: challenged again, never ended.
-    let again = report(&[
-        "Ran the lexer's e2e suite: green, committed.",
-        "Left: the docs.",
-        FINISHED,
-    ]);
-    let clean = report(&[
-        "Built, tested and landed the parser. Nothing left.",
-        FINISHED,
-    ]);
-    // `releases`: the report's screen sits until a `turn` is sent.
-    let run = |tag: &str, screens: Vec<Vec<String>>, releases: Option<usize>| {
-        let (dir, journal) = journal_file(tag);
-        let mut m = Mock::new(screens);
-        m.turn_releases = releases;
-        m.vanish_after = Some(4);
-        let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
-            journal: Some(journal.clone()),
-            ..auto(30)
-        };
-        let (mut lines, _) = watch_lines(&mut m, &opts);
-        let noted: Vec<String> = journal_records(&journal)
-            .0
-            .into_iter()
-            .map(|r| r.line)
-            .collect();
-        let done: Vec<String> = noted
-            .iter()
-            .filter(|l| l.starts_with("DONE "))
-            .cloned()
-            .collect();
-        // What it only noted (the back-off's `WAITING`) beside what it said.
-        lines.extend(noted.into_iter().filter(|l| l.starts_with("WAITING ")));
-        let _ = std::fs::remove_dir_all(&dir);
-        (count(&m, "turn"), lines, done)
-    };
-    let (turns, lines, done) = run(
-        "open-items",
-        vec![busy_screen(), open, busy_screen(), again],
-        Some(1),
-    );
-    let challenge = open_items_text(&["still open"], None, false);
-    assert!(
-        lines.contains(&format!(
-            "CONTINUED seq=102 rule={RULE_OPEN_ITEMS} {}",
-            clip(&challenge)
-        )),
-        "{lines:#?}"
-    );
-    assert!(
-        done.is_empty(),
-        "the token over open work ends nothing: {done:#?}"
-    );
-    assert!(
-        turns >= 1
-            && lines
-                .iter()
-                .any(|l| l.starts_with("WAITING seq=104 ") && l.contains("back-off")),
-        "the next challenge waits the back-off: {lines:#?}"
-    );
-    // A done reply in words.
-    let words = report(&["Ran the lexer's e2e suite: green. All done; nothing left to do."]);
-    let open = report(&[
-        "Built and tested the parser; committed on main.",
-        "Still open: the lexer's e2e suite (not run).",
-        FINISHED,
-    ]);
-    let (turns, lines, done) = run(
-        "open-items-words",
-        vec![busy_screen(), open, busy_screen(), words],
-        Some(1),
-    );
-    assert_eq!(turns, 1, "the challenge alone: {lines:#?}");
-    assert_eq!(done.len(), 1, "{done:#?}");
-    assert!(
-        done[0].starts_with(&format!("DONE seq=104 rule={RULE_OPEN_ITEMS} ")),
-        "{done:#?}"
-    );
-    // NEGATIVE CONTROL: nothing left.
-    let (turns, lines, done) = run("open-items-none", vec![busy_screen(), clean], None);
-    assert_eq!(turns, 0, "{lines:#?}");
-    assert_eq!(done.len(), 1, "{done:#?}");
-    assert!(
-        done[0].starts_with(&format!("DONE seq=102 rule={RULE_FINISHED} ")),
-        "{done:#?}"
-    );
-}
-
 /// A host whose probe of the session's repository answers from a script
 /// ([`IdleHost::repo_work`]): each ask takes the next answer, the last one
 /// standing; how often it was asked is counted.
@@ -9923,62 +9972,17 @@ impl IdleHost for RepoHost {
     }
 }
 
-/// The busy completion route asks the repository before ending a task, as
-/// the idle route does. Fixed host findings refuse the token while work is
-/// left; no finding admits it. Re-reading keeps the same probe answer, and
-/// a report with no token never asks. No task store or control request is used.
+/// A DONE CLAIM OVER WORK NO REMOTE MAIN HAS through the real supervisor and
+/// its host (FOREVER CRUISE, the repository's suffix): a done report while
+/// the host's probe of the session's repository finds an uncommitted file
+/// gets the done check with [`repo_work_suffix`] after it — naming the
+/// repository, its counts and the path — and no `DONE`. The probe is asked
+/// only where the worker's words say done. NEGATIVE CONTROLS: the same
+/// report over a clean repository gets the plain check, and no `DONE`
+/// either; progress words over a dirty repository never ask the probe and
+/// are continued.
 #[test]
-fn the_background_token_reads_the_repository_before_ending_the_task() {
-    let marked = "Started the dev server; the parser is fixed.\nATERM-TASK-DONE";
-    let dirty = RepoWork {
-        repo: "/captured/parser".to_string(),
-        changed: 1,
-        ..RepoWork::default()
-    };
-    for (said, finding, done, asked) in [
-        (marked, Some(dirty.clone()), false, 1),
-        (marked, None, true, 1),
-        ("Started the dev server.", Some(dirty), false, 0),
-    ] {
-        let host = Arc::new(RepoHost::new(vec![finding]));
-        let opts = SuperviseOpts {
-            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            ..auto(30)
-        };
-        let mut m = Mock::new(Vec::new());
-        {
-            let mut s = session(&mut m, Some("@s-1".to_string()));
-            s.set_clock(TEST_NOW, PDT);
-            s.set_mono_standing();
-            let screen = read_screen(ended_over_shell(said));
-            for _ in 0..2 {
-                s.finish_over_background(&screen, &opts, &mut Alone)
-                    .expect("the captured completion read");
-                assert_eq!(s.turn_end.task_done(), done, "{said}");
-                assert_eq!(s.turn_end.done_over_background(), done, "{said}");
-            }
-        }
-        assert_eq!(host.asked.load(std::sync::atomic::Ordering::SeqCst), asked);
-        assert!(
-            m.requests.is_empty(),
-            "no control request: {:?}",
-            m.requests
-        );
-    }
-}
-
-/// THE TOKEN OVER UNCOMMITTED WORK through the real supervisor and its host
-/// (the owner's rule of 2026-10-19): a clean report ending with
-/// `ATERM-TASK-DONE` while the host's probe of the session's repository
-/// finds an uncommitted file gets the uncommitted-work challenge
-/// (`CONTINUED … rule=continue-uncommitted@v1`, naming the repository, its
-/// counts and the path) and no `DONE`; the same report over the work
-/// committed and pushed ends the task (`DONE … rule=finished@v1`). The probe
-/// is asked only where the worker's words say done. NEGATIVE CONTROLS: the
-/// same report over a clean repository ends the task at once, nothing
-/// typed; progress words over a dirty repository never ask the probe.
-#[test]
-fn the_token_over_uncommitted_work_is_challenged_until_it_is_pushed_through_the_loop() {
+fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     let report = |lines: &[&str]| {
         let mut r = vec![format!("⏺ {}", lines[0])];
         r.extend(lines[1..].iter().map(|l| format!("  {l}")));
@@ -9986,11 +9990,7 @@ fn the_token_over_uncommitted_work_is_challenged_until_it_is_pushed_through_the_
         r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         r
     };
-    let clean = report(&[
-        "Built, tested and landed the parser. Nothing left.",
-        FINISHED,
-    ]);
-    let pushed = report(&["Committed and pushed src/lexer.rs. Nothing left.", FINISHED]);
+    let claim = report(&["Built, tested and landed the parser. All done; nothing left to do."]);
     let dirty = RepoWork {
         repo: "/Users//a/Developer/parser".to_string(),
         changed: 1,
@@ -10002,7 +10002,7 @@ fn the_token_over_uncommitted_work_is_challenged_until_it_is_pushed_through_the_
         let host = Arc::new(RepoHost::new(found));
         let mut m = Mock::new(screens);
         m.turn_releases = Some(1);
-        m.vanish_after = Some(4);
+        m.vanish_after = Some(2);
         let opts = SuperviseOpts {
             policy: SupervisorConfig::default(),
             journal: Some(journal.clone()),
@@ -10018,168 +10018,59 @@ fn the_token_over_uncommitted_work_is_challenged_until_it_is_pushed_through_the_
             .collect();
         let _ = std::fs::remove_dir_all(&dir);
         let asked = host.asked.load(std::sync::atomic::Ordering::SeqCst);
-        (count(&m, "turn"), lines, done, asked)
+        let turns: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("turn "))
+            .cloned()
+            .collect();
+        (turns, lines, done, asked)
     };
-    let (turns, lines, done, _) = run(
-        "uncommitted",
-        vec![busy_screen(), clean.clone(), busy_screen(), pushed],
-        vec![Some(dirty.clone()), None],
-    );
-    let challenge = uncommitted_text(&dirty, None, false);
+    let suffix = repo_work_suffix(&dirty);
     assert!(
-        lines.contains(&format!(
-            "CONTINUED seq=102 rule={RULE_UNCOMMITTED} {}",
-            clip(&challenge)
-        )),
-        "{lines:#?}"
+        suffix.contains("/Users//a/Developer/parser: 1 changed (src/lexer.rs)"),
+        "{suffix}"
     );
-    assert!(
-        challenge.contains("/Users//a/Developer/parser: 1 changed (src/lexer.rs)"),
-        "{challenge}"
+    let (turns, lines, done, asked) = run(
+        "claim-dirty",
+        vec![busy_screen(), claim.clone()],
+        vec![Some(dirty.clone())],
     );
-    assert_eq!(turns, 1, "the challenge alone: {lines:#?}");
-    assert_eq!(done.len(), 1, "{done:#?}");
-    assert!(
-        done[0].starts_with(&format!("DONE seq=104 rule={RULE_FINISHED} ")),
-        "committed and pushed, it ends: {done:#?}"
+    assert_eq!(
+        turns.first(),
+        Some(&continue_request(&format!("{DONE_CHECK} {suffix}"))),
+        "the check with the repository's suffix: {lines:#?}"
     );
+    assert!(asked >= 1, "the probe was asked at the claim");
+    assert!(done.is_empty(), "{done:#?}");
     // NEGATIVE CONTROLS: a clean repository, and words that say no done.
-    let (turns, lines, done, asked) =
-        run("uncommitted-clean", vec![busy_screen(), clean], vec![None]);
-    assert_eq!(turns, 0, "{lines:#?}");
-    assert!(asked >= 1, "the probe was asked at the token");
-    assert!(
-        done.len() == 1 && done[0].starts_with(&format!("DONE seq=102 rule={RULE_FINISHED} ")),
-        "{done:#?}"
+    let (turns, lines, done, asked) = run("claim-clean", vec![busy_screen(), claim], vec![None]);
+    assert_eq!(
+        turns.first(),
+        Some(&continue_request(DONE_CHECK)),
+        "the plain check: {lines:#?}"
     );
+    assert!(asked >= 1, "the probe was asked at the claim");
+    assert!(done.is_empty(), "{done:#?}");
     let progress = report(&["Stage 2 landed; the parser is next."]);
-    let (_, lines, done, asked) = run(
-        "uncommitted-progress",
+    let (turns, lines, done, asked) = run(
+        "claim-progress",
         vec![busy_screen(), progress],
         vec![Some(dirty)],
     );
     assert_eq!(asked, 0, "no done said, no probe: {lines:#?}");
     assert!(done.is_empty(), "{done:#?}");
     assert!(
-        !lines.iter().any(|l| l.contains(RULE_UNCOMMITTED)),
+        !turns.is_empty() && turns.iter().all(|t| !t.contains(&suffix)),
+        "continued, no suffix: {turns:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("rule={RULE_CONTINUE} "))),
         "{lines:#?}"
     );
 }
-
-/// THE CHALLENGE STOPS NOTHING ITS ANSWER DOES NOT END, UNDER A HOST THAT
-/// READS THE RECORD (the merge review's MG7-A1): the conversation's record
-/// ([`GrowingRecordHost`], folded by `FinishedScan`) holds the open report's
-/// token, then the challenge, then the worker's answer. An answer of work
-/// is continued (`keep going`), and a done reply in words ends the task as
-/// the challenge's end (`DONE … rule=continue-open-items@v1`). FAILS WITHOUT
-/// THE FIX: the record read the challenge as the harness's own line, its
-/// token's finish stood, and the loop ended the job on the answer of work —
-/// `DONE … rule=finished@v1 the worker reported ATERM-TASK-DONE` — and
-/// journalled the done reply in words the same. NEGATIVE CONTROL: the token
-/// answering the challenge is the worker's `finished@v1`.
-#[test]
-fn the_challenge_answered_is_read_off_the_record_as_its_answer() {
-    let json = |text: &str| aterm_json::to_string(&aterm_json::Value::from(text)).expect("json");
-    let user = |text: &str| {
-        format!(
-            r#"{{"isSidechain":false,"type":"user","timestamp":"1970-01-01T00:00:01.000Z","message":{{"role":"user","content":{}}},"origin":{{"kind":"human"}},"promptSource":"typed","version":"2.1.301"}}"#,
-            json(text)
-        )
-    };
-    let model = |text: &str| {
-        format!(
-            r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}],"stop_reason":"end_turn"}},"version":"2.1.301"}}"#,
-            json(text)
-        )
-    };
-    let report = |lines: &[&str]| {
-        let mut r = vec![format!("⏺ {}", lines[0])];
-        r.extend(lines[1..].iter().map(|l| format!("  {l}")));
-        r.extend(rows(&["", "✻ Worked for 12m 2s · done 4:24 PM", ""]));
-        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
-        r
-    };
-    let open = [
-        "Built and tested the parser; committed on main.",
-        "Still open: the lexer's e2e suite (not run).",
-        FINISHED,
-    ];
-    let challenge = open_items_text(&["still open"], None, false);
-    let work = ["Ran the e2e suite: two tests fail. Investigating the timeout now."];
-    let words = ["Ran the lexer's e2e suite: green. All done; nothing left to do."];
-    let token = ["Ran the lexer's e2e suite: green, committed.", FINISHED];
-    for (tag, reply, turns, want) in [
-        ("work", &work[..], 2, None),
-        ("words", &words[..], 1, Some(RULE_OPEN_ITEMS)),
-        ("token", &token[..], 1, Some(RULE_FINISHED)),
-    ] {
-        let before = [user("Fix the parser and land it."), model(&open.join("\n"))].join("\n");
-        let after = [before.clone(), user(&challenge), model(&reply.join("\n"))].join("\n");
-        // The challenge as the loop's ledger records it (typed at 1 000 ms,
-        // as the record's row says), so the record knows it as the loop's.
-        let host = Arc::new(GrowingRecordHost {
-            before,
-            after,
-            at: 2,
-            ran: std::sync::atomic::AtomicUsize::new(0),
-            ours: vec![crate::supervise::approvals::Typed {
-                at_ms: 1_000,
-                text: challenge.clone(),
-                rule: RULE_OPEN_ITEMS.to_string(),
-            }],
-        });
-        let (dir, journal) = journal_file(&format!("challenge-record-{tag}"));
-        let mut m = Mock::new(vec![
-            busy_screen(),
-            report(&open),
-            busy_screen(),
-            report(reply),
-        ]);
-        m.turn_releases = Some(1);
-        m.vanish_after = Some(4);
-        let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
-            journal: Some(journal.clone()),
-            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            ..auto(30)
-        };
-        let (lines, _) = watch_lines(&mut m, &opts);
-        assert!(
-            lines.contains(&format!(
-                "CONTINUED seq=102 rule={RULE_OPEN_ITEMS} {}",
-                clip(&challenge)
-            )),
-            "{tag}: {lines:#?}"
-        );
-        assert_eq!(count(&m, "turn"), turns, "{tag}: {lines:#?}");
-        let done: Vec<String> = journal_records(&journal)
-            .0
-            .into_iter()
-            .map(|r| r.line)
-            .filter(|l| l.starts_with("DONE "))
-            .collect();
-        match want {
-            None => {
-                assert!(done.is_empty(), "{tag}: {done:#?}");
-                assert!(
-                    lines.contains(&format!(
-                        "CONTINUED seq=104 rule={RULE_CONTINUE} keep going"
-                    )),
-                    "{tag}: {lines:#?}"
-                );
-            }
-            Some(rule) => {
-                assert_eq!(done.len(), 1, "{tag}: {done:#?}");
-                assert!(
-                    done[0].starts_with(&format!("DONE seq=104 rule={rule} ")),
-                    "{tag}: {done:#?}"
-                );
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 /// A PERSON'S GREETING LEFT TO THEM STAYS THEIRS IN THE NEXT LOOP (the
 /// review's RR3-TE-2): the loop that left it ledgers the turn it left (a
 /// `skipped` row under `left-to-person@v1`, keyed by the screen's last words
@@ -10198,7 +10089,7 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(1)
     };
@@ -10341,7 +10232,7 @@ fn a_persons_exchange_is_left_under_its_prompts_key() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             idle_host: Some(Arc::new(host) as Arc<dyn IdleHost>),
             ..auto(1)
@@ -10485,7 +10376,7 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
                 fresh: tail.clone(),
@@ -10577,179 +10468,6 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LOOP THAT FOLLOWS AN OLDER BUILD'S BOOKS NEVER ENDS A JOB OVER OPEN
-/// WORK (the owner's rule of 2026-10-19): 0.105.0 typed the open-items
-/// challenge once a job, marked no row with it and kept its verdict on the
-/// task's end in the journal alone, and the loop that followed it read the
-/// job's next `ATERM-TASK-DONE` that still named open work as the end where
-/// the record or the journal said the job had had its challenge. Now no book
-/// says so: whatever the record holds (the challenge typed, a background
-/// task's wake after it, or no record at all) and whatever the journal says
-/// (none, one cut back past the challenge, one that says the task ended
-/// since), the follower challenges that FINISHED again and ends nothing.
-#[test]
-fn a_loop_on_an_older_builds_books_never_ends_a_job_over_open_work() {
-    use crate::supervise::approvals::{Outcome, Row, Typed};
-    use crate::supervise::journal::JournalRecord;
-    let json = |text: &str| aterm_json::to_string(&aterm_json::Value::from(text)).expect("json");
-    // 2026-10-01T12:00:00Z, and the loop's acts 10 and 30 min on.
-    let t0: i64 = 1_790_856_000;
-    let stamp = |s: i64| {
-        let at = s - t0;
-        format!("2026-10-01T12:{:02}:{:02}.000Z", at / 60, at % 60)
-    };
-    let user = |text: &str, at: i64| {
-        format!(
-            r#"{{"isSidechain":false,"type":"user","timestamp":"{}","message":{{"role":"user","content":{}}},"origin":{{"kind":"human"}},"promptSource":"typed","version":"2.1.301"}}"#,
-            stamp(at),
-            json(text)
-        )
-    };
-    let model = |text: &str| {
-        format!(
-            r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}],"stop_reason":"end_turn"}},"version":"2.1.301"}}"#,
-            json(text)
-        )
-    };
-    let wake = r#"{"isSidechain":false,"type":"user","isMeta":false,"message":{"role":"user","content":"<task-notification>\n<task-id>b3e5x3wn5</task-id>\n<status>completed</status>\n</task-notification>"},"origin":{"kind":"task-notification"},"promptSource":"system","version":"2.1.301"}"#;
-    let report = |lines: &[&str]| {
-        let mut r = vec![format!("⏺ {}", lines[0])];
-        r.extend(lines[1..].iter().map(|l| format!("  {l}")));
-        r.extend(rows(&["", "✻ Worked for 12m 2s · done 4:24 PM", ""]));
-        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
-        r
-    };
-    let challenge = open_items_text(&["still open"], None, false);
-    let (challenged_s, kept_s) = (t0 + 600, t0 + 1800);
-    let again = [
-        "Fixed both tests; committed.",
-        "Still open: the docs update (not done).",
-        FINISHED,
-    ];
-    let record = |woke: bool| {
-        let mut r = vec![
-            user("Fix the parser and land it.", t0),
-            model(
-                "Built and tested the parser; committed on main.\nStill open: the lexer's e2e \
-                 suite (not run).\nATERM-TASK-DONE",
-            ),
-            user(&challenge, challenged_s),
-            model("Ran the e2e suite: two tests fail; fixing them now."),
-        ];
-        if woke {
-            r.push(wake.to_string());
-            r.push(model("The background build finished."));
-        }
-        r.push(user("keep going", kept_s));
-        r.push(model(&again.join("\n")));
-        r.join("\n") + "\n"
-    };
-    let typed_row = |rule: &str, command: &str, at_s: i64| {
-        Row {
-            rule_id: rule,
-            outcome: Outcome::Typed,
-            command,
-            reason: "the turn-end policy",
-            box_seq: 1,
-        }
-        .to_json(at_s * 1000, None)
-    };
-    let books = [
-        typed_row(RULE_OPEN_ITEMS, &challenge, challenged_s),
-        typed_row(RULE_CONTINUE, "keep going", kept_s),
-    ]
-    .join("\n")
-        + "\n";
-    let ours = vec![
-        Typed {
-            at_ms: challenged_s * 1000,
-            text: challenge.clone(),
-            rule: RULE_OPEN_ITEMS.to_string(),
-        },
-        Typed {
-            at_ms: kept_s * 1000,
-            text: "keep going".to_string(),
-            rule: RULE_CONTINUE.to_string(),
-        },
-    ];
-    let note =
-        |at_s: i64, line: &str| JournalRecord::of_line(at_s * 1000, None, line, None).to_json();
-    let (dir, ledger) = ledger_at("older-challenge-record");
-    let journal = approvals::journal_beside(&ledger);
-    // What the follower typed (its `turn`s) and said.
-    let run = |host: Option<Arc<dyn IdleHost>>, journal_text: Option<String>| {
-        std::fs::write(&ledger, &books).expect("ledger");
-        let _ = std::fs::remove_file(&journal);
-        if let Some(text) = journal_text {
-            std::fs::write(&journal, text).expect("journal");
-        }
-        let own = ledger.with_extension("own-journal.jsonl");
-        let _ = std::fs::remove_file(&own);
-        let mut m = Mock::new(vec![busy_screen(), report(&again)]);
-        m.turn_releases = Some(1);
-        m.vanish_after = Some(6);
-        let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
-            idle_host: host,
-            journal: Some(own.clone()),
-            ..auto(1)
-        };
-        let (mut lines, _) = watch_lines_with(&mut m, &opts, |s| {
-            s.set_approval_ledger(Some(ledger.to_path_buf()));
-        });
-        // …and what it noted.
-        lines.extend(journal_records(&own).0.into_iter().map(|r| r.line));
-        (count(&m, "turn"), lines)
-    };
-    let record_host = |woke: bool| -> Option<Arc<dyn IdleHost>> {
-        Some(Arc::new(GrowingRecordHost {
-            before: record(woke),
-            after: record(woke),
-            at: 0,
-            ran: std::sync::atomic::AtomicUsize::new(0),
-            ours: ours.clone(),
-        }) as Arc<dyn IdleHost>)
-    };
-    let challenged_again = |lines: &[String]| {
-        lines
-            .iter()
-            .any(|l| l.starts_with("CONTINUED ") && l.contains(&format!("rule={RULE_OPEN_ITEMS} ")))
-    };
-    let ended = |lines: &[String]| {
-        lines
-            .iter()
-            .any(|l| l.starts_with(&format!("DONE seq=102 rule={RULE_FINISHED} ")))
-    };
-    let cut = note(t0 + 1200, "EVENT idle seq=5 cut back") + "\n";
-    let ended_since = [
-        note(t0, "EVENT idle seq=1 the loop attached"),
-        note(
-            t0 + 900,
-            "DONE seq=7 rule=continue-open-items@v1 the worker said it is done after the \
-             open-items challenge: nothing more is typed until a person or an orchestrator types",
-        ),
-    ]
-    .join("\n")
-        + "\n";
-    for (case, host, journal_text) in [
-        ("the record, no journal", record_host(false), None),
-        ("a journal cut back", record_host(false), Some(cut)),
-        ("a wake after the challenge", record_host(true), None),
-        ("no record", None, None),
-        (
-            "the journal says it ended",
-            record_host(false),
-            Some(ended_since),
-        ),
-    ] {
-        let (turns, lines) = run(host, journal_text);
-        assert_eq!(turns, 1, "{case}: {lines:#?}");
-        assert!(challenged_again(&lines), "{case}: {lines:#?}");
-        assert!(!ended(&lines), "{case}: {lines:#?}");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A PERSON'S OWN EXCHANGE AT A WALL STAYS THEIRS IN THE NEXT LOOP (the
 /// review's RR4-TE-2): a person's quick message met a 529 (Claude Code
 /// 2.1.294's measured transcript: the prompt `lag-e5`, the overload's
@@ -10794,7 +10512,7 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
                 fresh: tail.to_string(),
@@ -10914,7 +10632,7 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
                 fresh: tail.to_string(),
@@ -11065,7 +10783,7 @@ fn a_persons_question_answered_at_length_is_left_to_them() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             journal: Some(journal.clone()),
             ..auto(max)
@@ -11092,16 +10810,16 @@ fn a_persons_question_answered_at_length_is_left_to_them() {
 /// tabs typed `keep going` an hour after their finished reports): a spinner,
 /// then a screen whose last thing said is `⏺ Compacted while idle, before the
 /// prompt cache expired`. Nothing is typed where the last turn left nothing
-/// to type: after a FINISHED report (the MEASURED screen) whether the loop
-/// watched the compaction or attaches after it (a seamless update, a fault),
-/// after a person's own exchange (their greeting, answered in seconds), and at
-/// a question held for a person with answers off; 2.1.302's notice, with
-/// the `·` hint it appends, the same, and so with Claude Code's own `keep
-/// going` suggestion in the composer. The person's grace
-/// is off and the back-off short, so nothing but the reading holds an act.
-/// Negative controls, each typed: a message of the worker's in the notice's
-/// place (a turn that ended), that under the suggestion (accepted), and an
-/// attach to a report that did not finish.
+/// to type: after a person's own exchange (their greeting, answered in
+/// seconds), and at a question held for a person with answers off. The
+/// person's grace is off and the back-off short, so nothing but the reading
+/// holds an act. Negative controls, each typed: a message of the worker's in
+/// the notice's place (a turn that ended); and an attach (a seamless update,
+/// a fault) after a report ending in the retired `ATERM-TASK-DONE` (the
+/// MEASURED screen, 2.1.302's notice with the `·` hint it appends, and so
+/// under Claude Code's own `keep going` suggestion) — a done claim read
+/// through the compaction, which gets the done check (FOREVER CRUISE) — or
+/// after a report that did not finish.
 #[test]
 fn claude_codes_idle_compaction_is_no_turn() {
     use aterm_phase::prompt::fixtures::{
@@ -11148,48 +10866,13 @@ fn claude_codes_idle_compaction_is_no_turn() {
         ]
     };
     let arms = [
-        (
-            "watched",
-            run(vec![ended(FINISHED), measured.clone()]),
-            true,
-            false,
-        ),
-        (
-            "watched, a worker's turn",
-            run(vec![ended(FINISHED), swap(&measured, notice, worker)]),
-            true,
-            true,
-        ),
-        ("attached", vec![measured.clone()], true, false),
-        // 2.1.302's notice, its `·` hint after it (the owner's tab,
-        // 2026-10-16: typed `keep going` past its finished report).
-        (
-            "watched, 2.1.302",
-            run(vec![ended(FINISHED), hinted.clone()]),
-            true,
-            false,
-        ),
-        ("attached, 2.1.302", vec![hinted.clone()], true, false),
-        // The same under a `keep going` suggestion (the owner's tab,
-        // 2026-10-17: accepted past its finished report).
-        (
-            "watched, 2.1.302, a suggestion",
-            run(vec![ended(FINISHED), suggested(&hinted)]),
-            true,
-            false,
-        ),
+        ("attached", vec![measured.clone()], true, true),
+        // 2.1.302's notice, its `·` hint after it.
+        ("attached, 2.1.302", vec![hinted.clone()], true, true),
+        // The same under a `keep going` suggestion.
         (
             "attached, 2.1.302, a suggestion",
             vec![suggested(&hinted)],
-            true,
-            false,
-        ),
-        (
-            "watched, a worker's turn, a suggestion",
-            run(vec![
-                ended(FINISHED),
-                suggested(&swap(&hinted, notice, worker)),
-            ]),
             true,
             true,
         ),
@@ -11245,7 +10928,7 @@ fn claude_codes_idle_compaction_is_no_turn() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 answer_questions: answers,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             ..auto(max)
         };
@@ -11371,7 +11054,7 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             journal: Some(journal.clone()),
             idle_host: Some(Arc::new(RecordHost {
@@ -11411,7 +11094,7 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
 
 /// A host whose conversation's record is `full`, folded as the window host
 /// folds it: with the texts the session's supervisor typed, `ours`, read
-/// first ([`IdleHost::finished`], [`IdleHost::check_answer`]).
+/// first ([`IdleHost::finished`]).
 #[derive(Debug)]
 struct LedgeredRecordHost {
     full: String,
@@ -11442,25 +11125,23 @@ impl IdleHost for LedgeredRecordHost {
     fn finished(&self) -> Option<bool> {
         Some(self.scan().finished())
     }
-    fn check_answer(&self) -> Option<bool> {
-        self.scan().check_answer()
-    }
 }
 
-/// A NEW LOOP TYPES NOTHING INTO A TASK A WALL-CUT CHECK'S RETRY ENDED (the
-/// merge review's M5-R1): the done check (Cruise) or Land's instruction
-/// (Land) typed, a 529 cut its turn, the wall's retry typed by the loop
-/// (its ledger) and answered `All done.` — where the previous loop's policy
-/// ended the task. A new loop (a seamless update, a policy reload, Off
-/// lifted) attaches at that point; its host's record reads the retry's
-/// answer as the check's, finished, and nothing is typed (`DONE` said).
-/// FAILS WITHOUT THE FIX: the record read the retry as the harness's own
-/// line and its answer as a first done report, and the loop typed the check
-/// (or LAND) again. NEGATIVE CONTROL: the same record with no ledger (the
-/// retry someone's words) gets the check (Land's instruction under Land),
-/// never `keep going`.
+/// A NEW LOOP TYPES NOTHING INTO A LANDING A WALL-CUT LAND ACT'S RETRY
+/// LANDED (the merge review's M5-R1): Land's instruction typed, a 529 cut
+/// its turn, the wall's retry typed by the loop (its ledger) and answered
+/// with a clean defense (`Nothing left: …`) — where the previous loop's
+/// policy landed the task. A new loop (a seamless update, a policy reload,
+/// Off lifted) attaches at that point; its host's record reads the retry's
+/// answer as the land act's, and nothing is typed. FAILS WITHOUT THE FIX:
+/// the record read the retry as the harness's own line and its answer as a
+/// first done report, and the loop typed LAND again. Under Cruise the same
+/// shape with the done check and `All done.` is a claim at the check's
+/// yield, and the check is typed (FOREVER CRUISE). NEGATIVE CONTROL: the
+/// same record with no ledger (the retry someone's words) gets the check
+/// (Land's instruction under Land), never `keep going`.
 #[test]
-fn a_new_loop_types_nothing_where_a_wall_cut_checks_retry_ended_the_task() {
+fn a_new_loop_types_nothing_where_a_wall_cut_land_acts_retry_landed() {
     use crate::supervise::policy::turn_end::{LAND, RULE_API_RETRY, RULE_LAND, wall_retry_text};
     let json = |text: &str| aterm_json::to_string(&aterm_json::Value::from(text)).expect("json");
     let user = |text: &str| {
@@ -11482,10 +11163,19 @@ fn a_new_loop_types_nothing_where_a_wall_cut_checks_retry_ended_the_task() {
         aterm_phase::WallKind::Overloaded,
         aterm_phase::Program::Claude,
     );
-    let reply = "All done. Nothing left to do.";
-    for (word, asked, check) in [
-        ("cruise", DONE_CHECK, RULE_DONE_CHECK),
-        ("land", LAND, RULE_LAND),
+    for (word, asked, check, reply) in [
+        (
+            "cruise",
+            DONE_CHECK,
+            RULE_DONE_CHECK,
+            "All done. Nothing left to do.",
+        ),
+        (
+            "land",
+            LAND,
+            RULE_LAND,
+            "Nothing left: all of it is merged into the remote main branch.",
+        ),
     ] {
         let full = [
             user("Fix the lexer and land it."),
@@ -11507,7 +11197,7 @@ fn a_new_loop_types_nothing_where_a_wall_cut_checks_retry_ended_the_task() {
             } else {
                 Vec::new()
             };
-            let typed = !ledgered;
+            let typed = !ledgered || word == "cruise";
             let mut m = Mock::new(vec![ended(reply)]);
             m.autopilot = Some(word);
             // An act that must come ends the watch, a minute its hang
@@ -11524,7 +11214,7 @@ fn a_new_loop_types_nothing_where_a_wall_cut_checks_retry_ended_the_task() {
             let opts = SuperviseOpts {
                 policy: SupervisorConfig {
                     human_grace_s: 0,
-                    ..SupervisorConfig::default()
+                    ..owners_policy()
                 },
                 journal: Some(journal.clone()),
                 idle_host: Some(Arc::new(LedgeredRecordHost {
@@ -11543,14 +11233,7 @@ fn a_new_loop_types_nothing_where_a_wall_cut_checks_retry_ended_the_task() {
             let what = format!("{word} ledgered={ledgered}: {lines:#?}");
             assert_eq!(count(&m, "turn") > 0, typed, "{what}");
             if typed {
-                assert!(continued(&lines, check), "CONTROL, the check: {what}");
-            } else {
-                let done = journal_records(&journal)
-                    .0
-                    .into_iter()
-                    .filter(|r| r.line.starts_with("DONE "))
-                    .count();
-                assert_eq!(done, 1, "decided, said once: {what}");
+                assert!(continued(&lines, check), "the check: {what}");
             }
             let _ = std::fs::remove_dir_all(&jdir);
         }
@@ -11632,6 +11315,15 @@ struct AccountHost {
     /// [`IdleHost::login_method`]: the method the session's login already
     /// is, as a test sets it.
     login_method: std::sync::Mutex<Option<aterm_phase::LoginMethod>>,
+    /// [`IdleHost::roster_word`], as a test sets it; and how many times the
+    /// loop asked it.
+    roster: std::sync::Mutex<Option<crate::supervise::policy::turn_end::RosterWord>>,
+    roster_asked: std::sync::atomic::AtomicUsize,
+    /// The owner's `[harness] relaunch = false`, as a window's host reads it
+    /// live ([`IdleHost::relaunch_off`]: and then no restart can be asked,
+    /// [`IdleHost::can_restart`]); and how many times the loop asked it.
+    relaunch_off: std::sync::atomic::AtomicBool,
+    relaunch_off_asked: std::sync::atomic::AtomicUsize,
 }
 
 impl AccountHost {
@@ -11699,7 +11391,11 @@ impl IdleHost for AccountHost {
         false
     }
     fn can_restart(&self) -> bool {
-        true
+        !self.relaunch_off.load(Ordering::SeqCst)
+    }
+    fn relaunch_off(&self) -> bool {
+        self.relaunch_off_asked.fetch_add(1, Ordering::SeqCst);
+        self.relaunch_off.load(Ordering::SeqCst)
     }
     fn restart(&self, why: &Restart) -> Option<String> {
         let what = match why {
@@ -11740,6 +11436,10 @@ impl IdleHost for AccountHost {
     }
     fn login_method(&self) -> Option<aterm_phase::LoginMethod> {
         *self.login_method.lock().unwrap()
+    }
+    fn roster_word(&self) -> Option<crate::supervise::policy::turn_end::RosterWord> {
+        self.roster_asked.fetch_add(1, Ordering::SeqCst);
+        self.roster.lock().unwrap().clone()
     }
     fn transcript_tail(&self) -> Option<String> {
         self.tail.lock().unwrap().clone()
@@ -12105,7 +11805,7 @@ fn account_point_of(rows: Vec<String>, phase: Phase) -> Turn {
 fn account_opts(host: &Arc<AccountHost>) -> SuperviseOpts {
     SuperviseOpts {
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
-        ..SuperviseOpts::hosted()
+        ..SuperviseOpts::hosted_with(&owners_policy())
     }
 }
 
@@ -13016,6 +12716,418 @@ fn the_renewal_edge_keeps_what_the_decision_read() {
 /// the old account's notice: the wall's resume is owed there); and a lost
 /// login before any turn was asked is told nothing and asks the host nothing
 /// (the old process's notice).
+/// THE ROSTER'S WORD ON THE SESSION'S LOGIN IS ASKED AT A WEEKLY LIMIT
+/// (the review's acct-1, acct-7): once a decision, onto the reading the
+/// owner's notice is chosen on, before the host is asked for its advice.
+/// NEGATIVE CONTROLS: a session limit, and a plain turn end, ask nothing and
+/// carry no word.
+#[test]
+fn the_rosters_word_is_asked_at_a_weekly_limit_alone() {
+    use crate::supervise::policy::turn_end::{RosterWord, TurnEndReading};
+    let host = Arc::new(AccountHost {
+        roster: std::sync::Mutex::new(Some(RosterWord::Unread)),
+        ..AccountHost::default()
+    });
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let walled = |message: &str| {
+        let mut r = rows(&["⏺ Carrying on.", &format!("  ⎿  {message}"), ""]);
+        r.extend(composer("  ? for shortcuts"));
+        TurnEndReading::of(
+            &aterm_phase::ClaudeReader.read(&r, Some(2)),
+            &r,
+            false,
+            None,
+            None,
+            None,
+        )
+    };
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    let mut weekly =
+        walled("You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)");
+    assert_eq!(weekly.wall, Some(aterm_phase::WallKind::UsageWeekly));
+    s.account_advise(&mut weekly, 7, &opts);
+    assert_eq!(weekly.roster, Some(RosterWord::Unread));
+    assert_eq!(host.roster_asked.load(Ordering::SeqCst), 1);
+    // NEGATIVE CONTROLS.
+    for message in [
+        "You've hit your session limit · resets 3pm (America/Los_Angeles)",
+        "",
+    ] {
+        let mut r = walled(message);
+        assert_ne!(
+            r.wall,
+            Some(aterm_phase::WallKind::UsageWeekly),
+            "{message}"
+        );
+        s.account_advise(&mut r, 8, &opts);
+        assert_eq!(r.roster, None, "{message}");
+    }
+    assert_eq!(host.roster_asked.load(Ordering::SeqCst), 1);
+}
+
+/// A `/login` LEFT AT A WEEKLY LIMIT ASKS THE ROSTER'S WORD TOO (the review
+/// of the login carry, acct3-1): `❯ /login` / `⎿  Login interrupted` draws
+/// over the limit's row, the reader gives no wall there, and asked at the
+/// row alone the loop handed the notice no word — the owner was told to type
+/// `/login` in the tab, which writes whatever account the browser signs in
+/// into the roster row's own login. With the limit's track standing, the word
+/// is asked there and the notice is the roster's step. NEGATIVE CONTROL: a
+/// login no row names is still told to sign in in the tab — to another
+/// account, the limit's own notice (r5h-4: signed in again, the same
+/// account's limit stands).
+#[test]
+fn a_login_left_at_a_weekly_limit_asks_the_rosters_word() {
+    use crate::supervise::policy::exception::exception_for;
+    use crate::supervise::policy::turn_end::{RosterWord, SignInNext, TurnEndReading};
+    use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
+    let weekly_row = "⏺ You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)";
+    let with_tail = |tail: &[&str]| {
+        let mut r = screen(LOGIN_EXPIRED);
+        let at = r
+            .iter()
+            .position(|row| row.starts_with("⏺ Login expired"))
+            .expect("the wall row");
+        r.splice(at..=at, tail.iter().map(|s| (*s).to_string()));
+        r
+    };
+    let read = |rows: &[String], worked: Option<Duration>| {
+        TurnEndReading::of(
+            &aterm_phase::ClaudeReader.read(rows, Some(2)),
+            rows,
+            false,
+            worked,
+            None,
+            None,
+        )
+    };
+    let next = RosterWord::Row {
+        next: Some(SignInNext {
+            label: "m8-2".to_string(),
+            renew: true,
+        }),
+        ready: None,
+        held: None,
+    };
+    for (word, id) in [
+        (next, "limit-renew"),
+        // NEGATIVE CONTROL.
+        (RosterWord::Unlisted, "limit-sign-in"),
+    ] {
+        let host = Arc::new(AccountHost {
+            roster: std::sync::Mutex::new(Some(word.clone())),
+            ..AccountHost::default()
+        });
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, None);
+        let t = Instant::now();
+        let mut weekly = read(&with_tail(&[weekly_row]), Some(Duration::from_secs(180)));
+        assert_eq!(weekly.wall, Some(aterm_phase::WallKind::UsageWeekly));
+        s.turn_end.observe(&weekly, t);
+        s.account_advise(&mut weekly, 7, &opts);
+        let asked = host.roster_asked.load(Ordering::SeqCst);
+        assert_eq!(asked, 1, "{word:?}");
+        let rows = with_tail(&[weekly_row, "", "❯ /login", "  ⎿  Login interrupted"]);
+        // The host relaunches the tab (`AccountHost::can_restart`), as the
+        // loop's own reading says: a renewal's switch can follow (r3h-2).
+        let mut left = TurnEndReading {
+            person: Some(Duration::from_secs(5)),
+            restartable: opts.idle_host.as_ref().is_some_and(|h| h.can_restart()),
+            ..read(&rows, Some(Duration::from_secs(20)))
+        };
+        assert_eq!(left.wall, None, "the row drawn over");
+        assert!(left.login_interrupted);
+        let now = t + Duration::from_secs(90);
+        s.turn_end.observe(&left, now);
+        s.account_advise(&mut left, 8, &opts);
+        assert_eq!(
+            host.roster_asked.load(Ordering::SeqCst),
+            asked + 1,
+            "{word:?}"
+        );
+        assert_eq!(left.roster.as_ref(), Some(&word));
+        let e = exception_for(&s.turn_end, &left, &opts.policy, now).expect("told");
+        assert_eq!(e.notice.as_ref().map(|n| n.id), Some(id), "{word:?}: {e:?}");
+    }
+}
+
+/// THE OWNER'S `relaunch = false` IS NAMED AT A WEEKLY LIMIT (the review of
+/// the login carry, r4h-1): a window's host masks the key out of the loop's
+/// config, so the policy read `relaunch` on whatever the owner set, and a
+/// tab beside a ready row was told no listed account could take over. The
+/// loop asks the host for it where the roster's word is read, and the notice
+/// names the line that lets the tab switch. NEGATIVE CONTROLS: with the
+/// relaunch on, the same limit is the ready row's `accounts use`; a session
+/// limit, whose roster word is not read, asks the host nothing of it.
+#[test]
+fn a_relaunch_the_host_switched_off_is_named_at_a_weekly_limit() {
+    use crate::supervise::policy::exception::exception_for;
+    use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, TurnEndReading};
+    let walled = |message: &str, host: &AccountHost| {
+        let mut r = rows(&["⏺ Carrying on.", &format!("  ⎿  {message}"), ""]);
+        r.extend(composer("  ? for shortcuts"));
+        TurnEndReading {
+            // As the loop sets it ([`IdleHost::can_restart`]).
+            restartable: host.can_restart(),
+            ..TurnEndReading::of(
+                &aterm_phase::ClaudeReader.read(&r, Some(2)),
+                &r,
+                false,
+                None,
+                None,
+                None,
+            )
+        }
+    };
+    let word = RosterWord::Row {
+        next: None,
+        ready: Some(Ready {
+            label: "m8-3".to_string(),
+        }),
+        held: Some(HeldBy::Earlier),
+    };
+    // The ready row is one the roster holds the tab off (the limit came
+    // before this Claude Code): with the relaunch on, the next step is named.
+    for (off, id, step) in [
+        (true, "limit-stay-held", "relaunch = true"),
+        // NEGATIVE CONTROL.
+        (false, "limit-use", "aterm harness accounts use m8-3"),
+    ] {
+        let host = Arc::new(AccountHost {
+            roster: std::sync::Mutex::new(Some(word.clone())),
+            relaunch_off: std::sync::atomic::AtomicBool::new(off),
+            ..AccountHost::default()
+        });
+        let opts = account_opts(&host);
+        assert!(opts.policy.relaunch, "the host's config never says it off");
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, None);
+        let t = Instant::now();
+        let mut weekly = walled(
+            "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+            &host,
+        );
+        assert_eq!(weekly.wall, Some(aterm_phase::WallKind::UsageWeekly));
+        weekly.reset_at = Some(t + Duration::from_secs(6 * 24 * 3600));
+        s.turn_end.observe(&weekly, t);
+        s.account_advise(&mut weekly, 7, &opts);
+        assert_eq!(weekly.relaunch_off, off);
+        assert_eq!(host.relaunch_off_asked.load(Ordering::SeqCst), 1, "{off}");
+        let e = exception_for(&s.turn_end, &weekly, &opts.policy, t).expect("told");
+        assert_eq!(e.notice.as_ref().map(|n| n.id), Some(id), "{off}: {e:?}");
+        assert!(e.action.contains(step), "{off}: {e:?}");
+        // NEGATIVE CONTROL: a session limit reads no roster word, and asks
+        // nothing of the relaunch.
+        let mut session_limit = walled(
+            "You've hit your session limit · resets 3pm (America/Los_Angeles)",
+            &host,
+        );
+        s.account_advise(&mut session_limit, 8, &opts);
+        assert!(!session_limit.relaunch_off, "{off}");
+        assert_eq!(host.relaunch_off_asked.load(Ordering::SeqCst), 1, "{off}");
+    }
+}
+
+/// A RELAUNCH THE OWNER SWITCHES ON REACHES A TAB WAITING AT ITS WEEKLY LIMIT
+/// (the review of the login carry, r5h-1): with the host's `relaunch` off no
+/// advice is asked there — no move could follow — so the decision kept none,
+/// and the stamp the host moves at the owner's edit (`relaunch` is masked
+/// out of the loop's config and hands no worker over) was news to nothing:
+/// the tab waited the week out under a notice naming `relaunch = true`, a
+/// line already set. The decision read the roster's word, and that is enough
+/// to hear the news: an edge, once, and the point decided again asks the
+/// host, whose move is made. NEGATIVE CONTROLS: the stamp as it stood is no
+/// edge; a session limit, whose roster word is not read, waits on.
+#[test]
+fn a_relaunch_switched_on_reaches_a_tab_waiting_at_its_weekly_limit() {
+    use crate::supervise::policy::turn_end::{Ready, RosterWord};
+    let wait_at = |message: &str| {
+        let host = AccountHost::moving("m8-3", "adopted");
+        *host.roster.lock().unwrap() = Some(RosterWord::Row {
+            next: None,
+            ready: Some(Ready {
+                label: "m8-3".to_string(),
+            }),
+            held: None,
+        });
+        host.relaunch_off.store(true, Ordering::SeqCst);
+        host.stamp.store(7, Ordering::SeqCst);
+        let rows: Vec<String> = limited_screen()
+            .into_iter()
+            .map(|r| {
+                r.replace(
+                    "You've hit your session limit · resets 7:30pm (America/Los_Angeles)",
+                    message,
+                )
+            })
+            .collect();
+        (host, rows)
+    };
+    let weekly = "You've hit your weekly limit · resets Sep 23 at 8am (America/Los_Angeles)";
+    let session_limit = "You've hit your session limit · resets 7:30pm (America/Los_Angeles)";
+    for (message, edge) in [
+        (weekly, true),
+        // NEGATIVE CONTROL: a session limit reads no roster word.
+        (session_limit, false),
+    ] {
+        let (host, rows) = wait_at(message);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![rows.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(ACCOUNT_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        let point = account_point_of(
+            rows,
+            Phase::Limited {
+                message: String::new(),
+                reset: None,
+            },
+        );
+        let action = s
+            .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
+            .expect("a decision");
+        assert!(
+            matches!(action, TurnEndAction::WaitUntil { .. }),
+            "{message}: {action:?}"
+        );
+        s.turn_end_execute(&point, action, &opts, &[], &mut Alone)
+            .expect("the wait is set");
+        assert!(
+            s.turn_end_due.is_some(),
+            "{message}: the limit is waited out"
+        );
+        assert!(host.said("account").is_empty(), "{:?}", host.all());
+        assert_eq!(
+            host.roster_asked.load(Ordering::SeqCst),
+            usize::from(edge),
+            "{message}"
+        );
+        // NEGATIVE CONTROL: the stamp as it stood is no edge.
+        assert!(!s.account_edge(&opts), "{message}");
+        // The owner sets `relaunch = true`: the host's stamp moves.
+        host.relaunch_off.store(false, Ordering::SeqCst);
+        host.stamp.store(8, Ordering::SeqCst);
+        assert_eq!(s.account_edge(&opts), edge, "{message}");
+        assert!(!s.account_edge(&opts), "{message}: once");
+        if !edge {
+            continue;
+        }
+        let again = s
+            .turn_end_at_point(&point, None, &opts)
+            .expect("a decision");
+        assert!(
+            matches!(
+                &again,
+                TurnEndAction::Restart { why: Restart::Account { to, at: AccountAt::Wall }, .. }
+                    if to == "m8-3"
+            ),
+            "{again:?}"
+        );
+        assert_eq!(host.said("account"), ["account:wall:usage-weekly"]);
+    }
+}
+
+/// A MOVE ANSWERED BY A LOST LOGIN IS NOT SERVED BY ITS `/login` DIALOG (the
+/// review of the login carry, acct3-2): the dialog's spinner reads busy, and
+/// at its `Login interrupted` the told move was said served — the host proved
+/// the dead login and marked it `ok`, a rotation candidate other sessions
+/// were moved onto. Told the lost login, `/login` typed, the dialog read busy
+/// and then left: the host hears nothing served, and the move still stands
+/// for the turn that is. NEGATIVE CONTROL: the same `/login` signed in
+/// (`Login successful`) and a turn served after it: told served, once, and
+/// the move is over.
+#[test]
+fn a_moves_lost_login_is_not_served_by_its_login_dialog() {
+    use crate::supervise::policy::turn_end::{TurnEndReading, decide_turn_end};
+    use aterm_phase::prompt::fixtures::{LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_SUCCESS, screen};
+    let mut login = rows(&[
+        "⏺ Carrying on.",
+        "  ⎿  Not logged in · Please run /login",
+        "",
+    ]);
+    login.extend(composer("  ? for shortcuts"));
+    let run = |after: &[(Vec<String>, Option<Duration>)]| {
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![login.clone()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(ACCOUNT_NOW, PDT);
+        let idle = ended("Carried on: stage 3 is done.");
+        let r = TurnEndReading::of(
+            &aterm_phase::ClaudeReader.read(&idle, Some(2)),
+            &idle,
+            false,
+            None,
+            None,
+            None,
+        );
+        let t = Instant::now();
+        s.turn_end.restarted(
+            &Restart::Account {
+                to: "work-2".to_string(),
+                at: AccountAt::Wall,
+            },
+            true,
+            &r,
+            t,
+        );
+        s.turn_end
+            .host_typed(t, crate::supervise::policy::turn_end::HostTurn::CarryOn);
+        let point = |rows: &[String], seq: u64| Screen {
+            rows: rows.to_vec(),
+            seq,
+            cursor_col: 2,
+            ..Screen::default()
+        };
+        // The lost login after a turn asked under the move: told.
+        let lost = point(&login, 102);
+        let mut first = s.turn_end_reading(&lost, Some(Duration::from_secs(180)), &opts);
+        s.fold_point(&mut first, t, lost.seq, &opts);
+        assert_eq!(host.said("answered:"), ["answered:signed-out"]);
+        // `/login` typed into it.
+        let mut at = t;
+        let mut a = decide_turn_end(&s.turn_end, &first, &opts.policy, at);
+        for _ in 0..4 {
+            if let TurnEndAction::WaitUntil { until, .. } = a {
+                at = until;
+                a = decide_turn_end(&s.turn_end, &first, &opts.policy, at);
+            }
+        }
+        assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
+        s.turn_end.acted(&a, &first, at);
+        s.turn_end.took();
+        for (k, (rows, worked)) in after.iter().enumerate() {
+            let seq = 103 + k as u64;
+            let shown = point(rows, seq);
+            let now = at + Duration::from_secs(30 * (k as u64 + 1));
+            let mut r = s.turn_end_reading(&shown, *worked, &opts);
+            s.fold_point(&mut r, now, seq, &opts);
+        }
+        (
+            host.said("served").len(),
+            s.turn_end.account_move().is_some(),
+        )
+    };
+    let busy = Some(Duration::from_secs(4));
+    let left = run(&[
+        (screen(LOGIN_HANDOFF), busy),
+        (screen(LOGIN_INTERRUPTED), busy),
+        (screen(LOGIN_INTERRUPTED), busy),
+    ]);
+    assert_eq!(left, (0, true), "the dialog served nothing");
+    // NEGATIVE CONTROL.
+    let served = run(&[
+        (screen(LOGIN_HANDOFF), busy),
+        (screen(LOGIN_SUCCESS), busy),
+        (ended("Carried on: stage 4 is done."), busy),
+    ]);
+    assert_eq!(served, (1, false), "signed in, then served: once");
+}
+
 #[test]
 fn the_host_is_told_once_what_answered_the_move() {
     let wall = limited_screen();
@@ -13710,8 +13822,8 @@ fn an_account_move_made_closes_the_model_switch_for_the_loop_after_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A TASK THE WORKER FINISHED, OPENED AGAIN BY SOMEONE'S TURN THAT ENDS ON A
-/// USAGE LIMIT, IS ASKED ABOUT AT THAT LIMIT. The host is asked for its
+/// A TASK THAT LANDED, OPENED AGAIN BY SOMEONE'S TURN THAT ENDS ON A USAGE
+/// LIMIT, IS ASKED ABOUT AT THAT LIMIT. The host is asked for its
 /// advice BEFORE the point is folded into the policy's memory, and it is the
 /// fold that opens the task again (a turn of work that a prompt in the
 /// conversation's record asked — here no record is read, and the screen's
@@ -13720,8 +13832,7 @@ fn an_account_move_made_closes_the_model_switch_for_the_loop_after_it() {
 /// out to its reset beside an account that could be run on — with nothing to
 /// decide it again (a wait stands on the host's stamp only where the host
 /// was asked). NEGATIVE CONTROL: the same limit read with NO turn run since
-/// the task was finished is a done session's — nothing asked, nothing
-/// decided.
+/// the task landed is a done session's — nothing asked, nothing decided.
 #[test]
 fn a_finished_task_opened_again_is_asked_about_at_the_limit_its_turn_ends_on() {
     let limited = || Phase::Limited {
@@ -13730,18 +13841,19 @@ fn a_finished_task_opened_again_is_asked_about_at_the_limit_its_turn_ends_on() {
     };
     let run = |worked: Option<Duration>| {
         let host = AccountHost::moving("work-2", "wait:changed");
-        let opts = account_opts(&host);
+        let mut opts = account_opts(&host);
+        opts.policy.autopilot = crate::supervise::config::Autopilot::Land;
         let mut m = Mock::new(vec![limited_screen()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(ACCOUNT_NOW, PDT);
         s.set_zone_lookup(test_zones);
-        // The worker reports its task finished: nothing is typed from here.
-        let done = account_point_of(ended("All landed.\nATERM-TASK-DONE"), Phase::Idle);
-        let action = s
+        // The worker's point, and its task landed (as a loop before this one
+        // left it): nothing is typed from here.
+        let done = account_point_of(ended("All landed."), Phase::Idle);
+        let _ = s
             .turn_end_at_point(&done, Some(Duration::from_secs(300)), &opts)
             .expect("a decision");
-        assert_eq!(action, TurnEndAction::Nothing);
-        assert!(s.turn_end.task_done());
+        assert!(s.turn_end.seed_task_done());
         // Then the session's screen shows a session limit.
         let wall = account_point_of(limited_screen(), limited());
         let action = s
@@ -15571,7 +15683,7 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     let now = RESET + 20 * 60;
     let done = "All done: the change is committed and pushed, and every suite passes.";
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     // The vendor's continuation at the reset and the worker's `reply` under
@@ -15887,7 +15999,7 @@ fn a_done_check_at_an_ordinary_turn_end_is_no_limits_try_whatever_was_seeded() {
     let now = TEST_NOW + 6 * 3600;
     let done = "All done: the change is committed and pushed, and every suite passes.";
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     let seeded_ms = (now - 5 * 60) * 1000;
@@ -16039,7 +16151,7 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     let opts = |mode: Autopilot| SuperviseOpts {
         policy: SupervisorConfig {
             autopilot: mode,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -16362,7 +16474,7 @@ fn a_loop_at_a_buckets_open_wall_waits_on_its_reset_beside_the_act_it_takes_up()
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             model_fallback: None,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -16525,7 +16637,7 @@ fn a_limit_its_own_try_met_again_stays_open_for_a_loop_that_follows() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             model_fallback: None,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -16747,7 +16859,7 @@ fn a_buckets_notice_cancelled_before_the_loops_first_read_answers_its_try() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             model_fallback: None,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -16989,7 +17101,7 @@ fn the_end_of_a_wall_its_try_closed_is_written_for_the_refused_moves_latch() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             model_fallback: None,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -17125,7 +17237,7 @@ fn a_limits_try_the_workers_work_answered_is_no_seed_of_a_loop_that_follows() {
         policy: SupervisorConfig {
             model_fallback: None,
             usage_credits: true,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -17220,7 +17332,7 @@ fn a_limits_try_the_workers_work_answered_is_no_seed_of_a_loop_that_follows() {
         });
         s.set_clock(t, PDT);
         let wait = decided(&mut s, &spend, 100, Some(Duration::from_secs(3 * 60)));
-        let try_at = wait.map_or(t, |(until, _)| until);
+        let try_at = wait.map_or(t, |(until, _)| until).max(t + 2 * 3600);
         s.set_clock(try_at, PDT);
         let p = point_at(&s, spend.clone(), 101);
         let a = s.turn_end_at_point(&p, None, &opts).expect("the try");
@@ -17399,7 +17511,7 @@ fn a_limits_track_dropped_with_no_work_ends_its_try_for_a_loop_that_follows() {
         policy: SupervisorConfig {
             model_fallback: None,
             usage_credits: true,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -17493,7 +17605,7 @@ fn a_limits_track_dropped_with_no_work_ends_its_try_for_a_loop_that_follows() {
         });
         s.set_clock(t, PDT);
         let wait = decided(&mut s, &spend, 100, Some(Duration::from_secs(3 * 60)));
-        let try_at = wait.map_or(t, |(until, _)| until);
+        let try_at = wait.map_or(t, |(until, _)| until).max(t + 2 * 3600);
         s.set_clock(try_at, PDT);
         assert_eq!(
             typed(&mut s, &spend, 101),
@@ -17641,7 +17753,7 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
         policy: SupervisorConfig {
             model_fallback: None,
             usage_credits: true,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -17737,7 +17849,7 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
         });
         s.set_clock(t, PDT);
         let wait = decided(&mut s, &spend, 100, Some(Duration::from_secs(3 * 60)));
-        let try_at = wait.map_or(t, |(until, _)| until);
+        let try_at = wait.map_or(t, |(until, _)| until).max(t + 2 * 3600);
         s.set_clock(try_at, PDT);
         let p = point_at(&s, spend.clone(), 101);
         let a = s.turn_end_at_point(&p, None, &opts).expect("the try");
@@ -17875,7 +17987,7 @@ fn a_bucket_the_fallbacks_relaunch_left_is_no_wall_of_the_relaunched_session() {
     const RESET: i64 = 1_792_279_200;
     let now = RESET - 2 * 86_400;
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     assert_eq!(opts.policy.model_fallback.as_deref(), Some("opus"));
@@ -18152,7 +18264,7 @@ fn a_turn_asked_on_the_fallback_is_written_for_a_loop_that_follows() {
         }
     };
     let plain = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         ..auto(30)
     };
     // The successor, seeded in `drive_loop`'s order: the switch the ledger
@@ -18410,7 +18522,7 @@ fn a_buckets_notice_the_transcript_wrote_after_the_relaunch_is_the_wall() {
         *host.tail.lock().unwrap() = Some(transcript.to_string());
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             ..auto(30)
         };
         (host, opts)
@@ -18607,7 +18719,7 @@ fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             model_fallback: None,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -19576,10 +19688,20 @@ fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
         rosterless.said("account"),
         ["account:turn-end", "account:turn-end"]
     );
+    // The probe gate's `modes` (its fullscreen check) is never asked; a
+    // turn's history read asks it too, the alternate screen's archive right
+    // after it (`offscreen`).
+    let probe_modes = |at: usize, r: &String| {
+        r == "modes"
+            && with_host
+                .get(at + 1)
+                .is_none_or(|next| !next.starts_with("offscreen"))
+    };
     assert!(
         !with_host
             .iter()
-            .any(|r| r == "modes" || r.contains("/usage") || r.ends_with(" esc")),
+            .enumerate()
+            .any(|(at, r)| probe_modes(at, r) || r.contains("/usage") || r.ends_with(" esc")),
         "{with_host:#?}"
     );
     assert_eq!(with_host, run(None, "probe-no-host"));
@@ -19596,7 +19718,9 @@ fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
 /// ([`a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it`]).
 #[test]
 fn the_windows_host_types_the_probes_usage_under_its_hand() {
-    use crate::harness::upgrade_drive::{hand_give_back_here_request, hand_take_here_request};
+    use crate::harness::upgrade_drive::{
+        hand_give_back_here_request_as, hand_take_here_request_as,
+    };
     let run = |hand: bool| {
         let (dir, ledger) = ledger_at(&format!("probe-hand-{hand}"));
         let host = ProbeHost::probing(true);
@@ -19621,10 +19745,16 @@ fn the_windows_host_types_the_probes_usage_under_its_hand() {
             &host,
             &ledger,
             probe_policy(120),
-            |s| s.type_under_hand(hand),
+            |s| {
+                s.set_supervisor_name(Some(HAND_HOLDER.to_string()));
+                s.type_under_hand(hand);
+            },
         );
         let _ = std::fs::remove_dir_all(&dir);
-        let (take, back) = (hand_take_here_request(), hand_give_back_here_request());
+        let (take, back) = (
+            hand_take_here_request_as(HAND_HOLDER),
+            hand_give_back_here_request_as(HAND_HOLDER),
+        );
         m.requests
             .iter()
             .filter_map(|r| match verb_of(r) {
@@ -21590,7 +21720,7 @@ fn a_loop_stopped_mid_probe_presses_nothing_and_the_next_loop_closes_the_panel()
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         ledger: Some(ledger.clone()),
         policy: probe_policy(120),
-        ..SuperviseOpts::hosted()
+        ..SuperviseOpts::hosted_with(&owners_policy())
     };
     let mut out: Vec<u8> = Vec::new();
     {
@@ -21678,6 +21808,8 @@ struct TaskHost {
     ready: bool,
     wanting: AtomicBool,
     steps: std::sync::atomic::AtomicUsize,
+    /// How many points it wants and passes (no step) before it takes one.
+    passes: std::sync::atomic::AtomicUsize,
 }
 
 impl TaskHost {
@@ -21695,6 +21827,13 @@ impl IdleHost for TaskHost {
         self.wanting.load(Ordering::SeqCst)
     }
     fn at_idle(&self) -> Option<HostStep> {
+        if self
+            .passes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return None;
+        }
         self.wanting.store(false, Ordering::SeqCst);
         self.steps.fetch_add(1, Ordering::SeqCst);
         if let Some(clock) = self.sleep.lock().unwrap().take() {
@@ -21740,7 +21879,7 @@ fn tasked_watch(
     journal: Option<&Path>,
 ) -> Vec<String> {
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         journal: journal.map(Path::to_path_buf),
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
         tasks: Some(tasks.to_path_buf()),
@@ -21783,37 +21922,71 @@ fn done_mark(why: &str, bytes: usize, path: &Path) -> String {
     )
 }
 
-/// DONE THROUGH THE DONE CHECK, PUBLISHED ONCE: the worker said it was done,
-/// got the check and said so again — at that point, and only there, its
-/// record is read and marked `done why=done-check` with the REPORT before
-/// the check (not the `DONE` that answered it) snapshotted under
-/// `<tasks>/<gsid>-<rev>.result.md`, and the journal says so (`TASK …`).
-/// NEGATIVE CONTROL: a session with no task — the same run reads the record
-/// once at that point, marks nothing and writes nothing.
-#[test]
-fn a_tasked_workers_done_is_marked_once_with_the_report_before_the_done_check() {
-    let root = crate::supervise::ScratchDir::new("task", "check");
-    let text = transcript_of(&[
+/// What a tasked worker reports at the end of its turn of work: no done.
+const WORK: &str = "Fixed the parser; pushing it next.";
+
+/// THE LANDING'S CLEAN DEFENSE (FOREVER LAND: only Land's landed ends a task
+/// the harness publishes), the worker's result: what the snapshot holds.
+const LANDED: &str = "Fixed the parser and pushed it.\nNothing left: all of it is merged into \
+                      the remote main branch.";
+
+/// [`LANDED`] as the worker answers Land's instruction with it: no token
+/// (FOREVER LAND: the defense is ordinary language).
+fn landed_reply() -> String {
+    LANDED.to_string()
+}
+
+/// The landing's result as the task record's snapshot holds it
+/// (`crate::harness::result`'s landing rule): the worker's report before
+/// Land's instruction ([`WORK`]), then the defense that landed it.
+fn landed_result() -> String {
+    format!("{WORK}\n\n{LANDED}")
+}
+
+/// A landing's transcript rows: the task, the worker's turn of work, Land's
+/// instruction and `reply` answering it.
+fn landing_rows(reply: &str) -> Vec<String> {
+    vec![
         task_row("user", "u-task", "", "Fix the parser."),
-        task_row(
-            "assistant",
-            "a-report",
-            "msg_1",
-            "Fixed the parser; all done.",
-        ),
-        task_row("user", "u-check", "", DONE_CHECK),
-        task_row("assistant", "a-reply", "msg_2", "DONE"),
-    ]);
-    let run = |task: Option<(u64, String)>, tasks: &Path| {
+        task_row("assistant", "a-work", "msg_1", WORK),
+        task_row("user", "u-land", "", LAND),
+        task_row("assistant", "a-land", "msg_2", reply),
+    ]
+}
+
+/// A landing's screens: a turn of work, then `reply` answering Land's
+/// instruction typed at its end.
+fn landing_screens(reply: &str) -> Vec<Vec<String>> {
+    vec![busy_screen(), ended(WORK), busy_screen(), ended(reply)]
+}
+
+/// `m` under Land, its turn of work's end sitting until Land's instruction
+/// is typed there ([`landing_screens`]).
+fn landing(m: &mut Mock) {
+    m.autopilot = Some("land");
+    m.turn_releases = Some(1);
+    m.history_served();
+}
+
+/// LANDED, PUBLISHED ONCE: the worker's turn of work gets Land's
+/// instruction, and its clean defense at that instruction's yield lands the
+/// task — at that point, and only there, its record is read and marked
+/// `done` with the landing's result (the report before Land's instruction,
+/// then the defense) snapshotted under
+/// `<tasks>/<gsid>-<rev>.result.md`, and the journal says so (`TASK …`).
+/// NEGATIVE CONTROLS: the same run under Cruise — never an end — types the
+/// done check at the defense and marks and writes nothing; a session with no
+/// task reads the record and marks and writes nothing.
+#[test]
+fn a_landed_workers_task_is_marked_once_with_its_defense() {
+    let root = crate::supervise::ScratchDir::new("task", "landed");
+    let text = transcript_of(&landing_rows(&landed_reply()));
+    let run = |task: Option<(u64, String)>, tasks: &Path, word: &'static str| {
         let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
-        let journal = root.join(format!("journal-{}.jsonl", task.is_some()));
-        let mut m = Mock::new(vec![
-            busy_screen(),
-            ended("Fixed the parser; all done."),
-            busy_screen(),
-            ended("DONE"),
-        ]);
-        m.turn_releases = Some(1);
+        let journal = root.join(format!("journal-{word}-{}.jsonl", task.is_some()));
+        let mut m = Mock::new(landing_screens(&landed_reply()));
+        landing(&mut m);
+        m.autopilot = Some(word);
         m.vanish_after = Some(4);
         m.task = task;
         let lines = tasked_watch(&mut m, &host, tasks, Some(&journal));
@@ -21826,23 +21999,22 @@ fn a_tasked_workers_done_is_marked_once_with_the_report_before_the_done_check() 
         (m, lines, task_lines)
     };
     let tasks = root.join("tasks");
-    let (m, lines, task_lines) = run(working_task(), &tasks);
+    let (m, lines, task_lines) = run(working_task(), &tasks, "land");
     assert!(
-        lines.contains(&format!(
-            "CONTINUED seq=102 rule={RULE_DONE_CHECK} {}",
-            clip(DONE_CHECK)
-        )),
+        lines
+            .iter()
+            .any(|l| l.starts_with(&format!("CONTINUED seq=102 rule={RULE_LAND} "))),
         "{lines:#?}"
     );
     let path = tasks.join("s-1-1.result.md");
     assert_eq!(
         task_marks(&m),
-        [done_mark("done-check", 27, &path)],
+        [done_mark("landed", landed_result().len(), &path)],
         "{lines:#?}"
     );
     assert_eq!(
         std::fs::read_to_string(&path).expect("the snapshot"),
-        "Fixed the parser; all done."
+        landed_result()
     );
     assert!(
         m.task
@@ -21853,58 +22025,666 @@ fn a_tasked_workers_done_is_marked_once_with_the_report_before_the_done_check() 
     );
     assert_eq!(
         task_lines,
-        ["TASK seq=104 done why=done-check rev=2 result_bytes=27"]
+        [format!(
+            "TASK seq=104 done why=landed rev=2 result_bytes={}",
+            landed_result().len()
+        )]
     );
+    // NEGATIVE CONTROL: Cruise.
+    let cruise = root.join("cruise");
+    let (m, lines, task_lines) = run(working_task(), &cruise, "cruise");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(&format!("CONTINUED seq=104 rule={RULE_DONE_CHECK} "))),
+        "{lines:#?}"
+    );
+    assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
+    assert!(task_lines.is_empty(), "{task_lines:#?}");
+    assert!(!cruise.exists(), "nothing written");
     // NEGATIVE CONTROL: no task.
     let untasked = root.join("untasked");
-    let (m, _, task_lines) = run(None, &untasked);
-    assert_eq!(
-        m.task_requests,
-        ["task", "task", "task"],
-        "the loop's first read, one before the check, one at the done point"
-    );
+    let (m, _, task_lines) = run(None, &untasked, "land");
+    assert!(!m.task_requests.is_empty(), "the record read");
+    assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
     assert!(task_lines.is_empty(), "{task_lines:#?}");
     assert!(!untasked.exists(), "nothing written");
 }
 
-/// DONE BY THE MARKER, AND A LOOP RESTARTED ON IT: a worker that ends its own
-/// turn with `ATERM-TASK-DONE` is marked `done why=marker` with that turn's
-/// message, the marker's line dropped. A loop started again on the same
-/// point (the host's worker restarted, a seamless update's successor) reads
-/// the record — `done` already — and marks nothing, and the snapshot stands.
-/// NEGATIVE CONTROL: the record put back to `working` (a mark the first loop
-/// never got answered), the restarted loop publishes it.
+/// A DEFENSE TALLER THAN THE SCREEN IS READ WHOLE BEFORE IT LANDS
+/// (`Session::said_read_whole`): the land act's yield is a message whose
+/// `⏺` head scrolled into the history above the screen, its rows on the
+/// screen a clean defense. The loop reads the history up to that head, and
+/// the message with it: with a NEEDS YOU line at its head (in the history),
+/// no landing — the nudge typed, the record left `working`; with none, the
+/// landing, marked once. The review of 2026-10-20 found the tall report
+/// landed on its last rows with its need unread. NEGATIVE CONTROLS: each
+/// case flips the other's outcome, and a host whose history cannot be read
+/// lands nothing on the rows read (they stay cut).
 #[test]
-fn the_marker_is_published_once_and_a_restarted_loop_marks_nothing() {
+fn a_defense_taller_than_the_screen_is_read_whole_before_it_lands() {
+    let root = crate::supervise::ScratchDir::new("task", "tall");
+    let tall = |need: bool| -> (Vec<String>, Vec<String>, String) {
+        let mut said = vec!["Merged the parser, the lexer and their suites.".to_string()];
+        if need {
+            said.push("NEEDS YOU: the signing credential".to_string());
+        }
+        said.extend((0..45).map(|i| format!("- merged item {i} into the remote main branch")));
+        said.push(String::new());
+        said.push("Nothing left: all of it is merged into the remote main branch.".to_string());
+        let mut drawn: Vec<String> = vec!["❯ Fix the parser.".to_string(), String::new()];
+        drawn.extend(
+            said.iter()
+                .enumerate()
+                .map(|(i, l)| match (i, l.is_empty()) {
+                    (0, _) => format!("⏺ {l}"),
+                    (_, true) => String::new(),
+                    _ => format!("  {l}"),
+                }),
+        );
+        drawn.extend(rows(&["", "✻ Worked for 12m 2s · done 4:24 PM", ""]));
+        drawn.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        // The screen holds the last 34 rows; the rest is its history.
+        let cut = drawn.len() - 34;
+        let screen = drawn.split_off(cut);
+        (screen, drawn, said.join("\n"))
+    };
+    let run = |need: bool, history: bool, tag: &str| {
+        let (screen, above, text) = tall(need);
+        assert!(
+            !aterm_phase::said_whole(&screen),
+            "the head is above the screen"
+        );
+        let transcript = transcript_of(&landing_rows(&text));
+        let host = TaskHost::reading(&root.join(format!("{tag}.jsonl")), &[&transcript]);
+        let mut m = Mock::new(vec![busy_screen(), ended(WORK), busy_screen(), screen]);
+        landing(&mut m);
+        m.scrollback = history.then_some(above);
+        m.alt_screen = Some(false);
+        m.vanish_after = Some(4);
+        m.task = working_task();
+        let lines = tasked_watch(&mut m, &host, &root.join(format!("tasks-{tag}")), None);
+        (m, lines)
+    };
+    let (m, lines) = run(false, true, "clean");
+    let marks = task_marks(&m);
+    assert!(
+        marks.len() == 1 && marks[0].starts_with("task mark done why=landed "),
+        "{marks:?}: {lines:#?}"
+    );
+    let (m, lines) = run(true, true, "need");
+    assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
+    assert!(
+        lines.iter().any(|l| l.contains(&format!(
+            "rule={} ",
+            crate::supervise::policy::turn_end::RULE_LAND_NUDGE
+        ))),
+        "{lines:#?}"
+    );
+    // NEGATIVE CONTROL: no history to read.
+    let (m, _) = run(false, false, "unread");
+    assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
+}
+
+/// A tall Land report as `program`'s screen draws it: its rows `said` (the
+/// first its head, under `reply_at` of `end`, the program's turn's end
+/// whose reply row is replaced), and the rows of the reply drawn above
+/// the screen — `(screen, history)`, the screen as tall as `end`.
+fn tall_on(
+    end: &[String],
+    reply_at: usize,
+    said: &[String],
+    head: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut drawn = end[..reply_at].to_vec();
+    drawn.extend(
+        said.iter()
+            .enumerate()
+            .map(|(i, l)| match (i, l.is_empty()) {
+                (_, true) => String::new(),
+                (0, _) => format!("{head}{l}"),
+                _ => format!("  {l}"),
+            }),
+    );
+    drawn.extend(end[reply_at + 1..].iter().cloned());
+    let screen = drawn.split_off(drawn.len() - end.len());
+    (screen, drawn)
+}
+
+/// The words of a tall Land report: a NEEDS YOU line near its head when
+/// `need`, 55 merged items, and a clean defense at its foot.
+fn tall_said(need: bool) -> Vec<String> {
+    let mut said = vec!["Merged the parser, the lexer and their suites.".to_string()];
+    if need {
+        said.push("NEEDS YOU: the signing credential".to_string());
+    }
+    said.extend((0..55).map(|i| format!("- merged item {i} into the remote main branch")));
+    said.push(String::new());
+    said.push("Nothing left: all of it is merged into the remote main branch.".to_string());
+    said
+}
+
+/// A Land run on `program`'s screens (its mock `mock`): `busy`, its turn
+/// of work's end `work` sitting until Land's instruction is typed there,
+/// `busy` again, and that instruction's yield `tall` — `(screen,
+/// history)`, the history served only where `history`. The lines printed
+/// with the journal's `DONE` lines after them (the landing's), and the
+/// `meta … attention owner=needs` requests sent (the need raised).
+fn tall_landing(
+    mock: fn(Vec<Vec<String>>) -> Mock,
+    busy: &[String],
+    work: &[String],
+    tall: (Vec<String>, Vec<String>),
+    history: bool,
+) -> (Vec<String>, Vec<String>) {
+    let (dir, journal) = journal_file("tall-landing");
+    let (screen, above) = tall;
+    let mut m = mock(vec![busy.to_vec(), work.to_vec(), busy.to_vec(), screen]);
+    landing(&mut m);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.scrollback = history.then_some(above);
+    m.alt_screen = Some(false);
+    m.vanish_after = Some(6);
+    m.stall_sleep = Some(Duration::from_millis(20));
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        journal: Some(journal.clone()),
+        ..auto(30)
+    };
+    let (mut lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+    });
+    lines.extend(
+        journal_records(&journal)
+            .0
+            .into_iter()
+            .map(|r| r.line)
+            .filter(|l| l.starts_with("DONE ")),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    (lines, m.needs_calls.clone())
+}
+
+/// A TALL LAND REPORT ON EVERY HARNESS IS READ WHOLE BEFORE IT LANDS
+/// (`Session::said_read_whole` by the program's own reader,
+/// [`aterm_phase::ScreenReader::said_whole`]): Gemini CLI's, agy's and Muse
+/// Code's yield of Land's instruction a 60-row report whose head is in the
+/// history above the screen, its rows on the screen a clean defense. With a
+/// NEEDS YOU line near its head: no landing, the nudge typed, the need
+/// raised. The recheck of d88a7bf289 found the cut read on Claude Code
+/// alone: each of these landed on its last rows, the need unread.
+/// NEGATIVE CONTROLS: with no need, the same report read whole lands; with
+/// no history to read, it lands nothing (the words stay cut). agy's report
+/// answers a message that wrapped its `NEEDS YOU:` hint onto a row of its
+/// own: the history is read up to the rule above the message, never its
+/// caret row, so the person's words are no part of the report.
+#[test]
+fn a_tall_land_report_on_every_harness_is_read_whole_before_it_lands() {
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::{agy, gemini, muse};
+    let gemini_tall = |need: bool| {
+        let end = screen(gemini::fixtures::END_OF_TURN);
+        let at = end
+            .iter()
+            .rposition(|r| r.starts_with("✦ "))
+            .expect("the reply");
+        tall_on(&end, at, &tall_said(need), "✦ ")
+    };
+    let muse_tall = |need: bool| {
+        let end = screen(muse::fixtures::END_OF_TURN_1_4_10);
+        let at = end
+            .iter()
+            .position(|r| r.starts_with("◆ Hi!"))
+            .expect("the reply");
+        tall_on(&end, at, &tall_said(need), "◆ ")
+    };
+    // agy's reply has no head: its rows two columns in under the message.
+    let agy_tall = |need: bool| {
+        let end = screen(agy::fixtures::END_OF_TURN);
+        let user = end
+            .iter()
+            .position(|r| r.starts_with("> Write about"))
+            .expect("the message");
+        let composer = (user..end.len())
+            .find(|&i| end[i].starts_with('─'))
+            .expect("the composer's rule");
+        let mut drawn = end[..user].to_vec();
+        drawn.extend([
+            "> Land it all in the remote main branch. Put what only a person can give on a line \
+             starting"
+                .to_string(),
+            "  NEEDS YOU: and carry on.".to_string(),
+            String::new(),
+        ]);
+        drawn.extend(tall_said(need).iter().map(|l| {
+            if l.is_empty() {
+                String::new()
+            } else {
+                format!("  {l}")
+            }
+        }));
+        drawn.push(String::new());
+        drawn.extend(end[composer..].iter().cloned());
+        let screen = drawn.split_off(drawn.len() - end.len());
+        (screen, drawn)
+    };
+    type Tall = Box<dyn Fn(bool) -> (Vec<String>, Vec<String>)>;
+    type Harness = (
+        &'static str,
+        fn(Vec<Vec<String>>) -> Mock,
+        &'static str,
+        &'static str,
+        Tall,
+    );
+    let harnesses: [Harness; 3] = [
+        (
+            "gemini",
+            gemini_mock,
+            gemini::fixtures::BUSY_THINKING,
+            gemini::fixtures::END_OF_TURN,
+            Box::new(gemini_tall),
+        ),
+        (
+            "agy",
+            agy_mock,
+            agy::fixtures::BUSY,
+            agy::fixtures::END_OF_TURN,
+            Box::new(agy_tall),
+        ),
+        (
+            "muse",
+            muse_mock,
+            muse::fixtures::BUSY_1_4_10,
+            muse::fixtures::END_OF_TURN_1_4_10,
+            Box::new(muse_tall),
+        ),
+    ];
+    let landed = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|l| l.starts_with("DONE ") && l.contains(&format!(" rule={RULE_LAND} ")))
+    };
+    for (program, mock, busy, work, tall) in harnesses {
+        let (busy, work) = (screen(busy), screen(work));
+        let (cut, _) = tall(true);
+        assert!(
+            !program_reader(program, &cut).said_whole(&cut),
+            "{program}: the report's head is above the screen"
+        );
+        let (lines, needs) = tall_landing(mock, &busy, &work, tall(true), true);
+        assert!(!landed(&lines), "{program}: {lines:#?}");
+        assert!(
+            lines.iter().any(|l| l.contains(&format!(
+                " rule={} ",
+                crate::supervise::policy::turn_end::RULE_LAND_NUDGE
+            ))),
+            "{program}: the nudge: {lines:#?}"
+        );
+        assert!(
+            needs
+                .first()
+                .is_some_and(|c| c.starts_with("set attention owner=needs ")
+                    && c.contains("the signing credential")),
+            "{program}: the need raised: {needs:#?}\n{lines:#?}"
+        );
+        // NEGATIVE CONTROL: no need — read whole, it lands.
+        let (lines, needs) = tall_landing(mock, &busy, &work, tall(false), true);
+        assert!(landed(&lines), "{program}: {lines:#?}");
+        assert!(needs.is_empty(), "{program}: {needs:#?}");
+        // NEGATIVE CONTROL: no history — cut, it lands nothing.
+        let (lines, _) = tall_landing(mock, &busy, &work, tall(false), false);
+        assert!(!landed(&lines), "{program}: {lines:#?}");
+    }
+}
+
+/// A NEED SAID EARLIER IN A TURN WHOSE START IS ABOVE THE SCREEN IS READ
+/// BEFORE IT LANDS (`Session::said_read_whole` on Claude Code's whole turn,
+/// [`aterm_phase::turn_whole`]): the land act's yield a turn whose last
+/// message, a clean defense, fits on the screen, but whose earlier message —
+/// a NEEDS YOU said before a tool call — and the `❯` row that opened it are
+/// in the history above. The loop reads the history up to that row: no
+/// landing, the nudge typed, the need raised. The recheck of d88a7bf289
+/// found the earlier message never read where the last one fit. NEGATIVE
+/// CONTROL: the same turn with no need lands. A TURN WHOSE START CANNOT BE
+/// READ LANDS NOTHING (the recheck of ea564676a3): with no history to read,
+/// or a turn of 140 tool calls whose `❯` row is further up than the
+/// history is looked through (`OWNER_ROWS`), the need at its start unread,
+/// no landing and the nudge typed — where the build before landed on the
+/// screen's words, the need never raised.
+#[test]
+fn a_need_said_earlier_in_a_turn_above_the_screen_is_read_before_it_lands() {
+    let turn_of = |need: bool, calls: usize| -> (Vec<String>, Vec<String>) {
+        let mut drawn: Vec<String> = vec![
+            "❯ Land it all in the remote main branch.".to_string(),
+            String::new(),
+            "⏺ Merged the lexer and its suites.".to_string(),
+        ];
+        if need {
+            drawn.push("  NEEDS YOU: the signing credential".to_string());
+        }
+        for call in 0..calls {
+            drawn.extend([
+                String::new(),
+                format!("⏺ Bash(git log --oneline -1 branch-{call})"),
+                format!("  ⎿  {call:04}abc merged branch {call}"),
+            ]);
+        }
+        drawn.extend([String::new(), "⏺ Bash(git push origin main)".to_string()]);
+        drawn.push("  ⎿  To github.com:a/parser.git".to_string());
+        drawn.extend((0..40).map(|i| format!("     {i:02}a1b2c..{i:02}d3e4f  main -> main")));
+        drawn.extend(rows(&[
+            "",
+            "⏺ Nothing left: all of it is merged into the remote main branch.",
+            "",
+            "✻ Worked for 12m 2s · done 4:24 PM",
+            "",
+        ]));
+        drawn.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        let screen = drawn.split_off(drawn.len() - 30);
+        (screen, drawn)
+    };
+    let turn = |need: bool| turn_of(need, 0);
+    let (screen, _) = turn(true);
+    assert!(
+        aterm_phase::said_whole(&screen) && !aterm_phase::turn_whole(&screen),
+        "the last message on the screen, the turn's start above it"
+    );
+    let landed = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|l| l.starts_with("DONE ") && l.contains(&format!(" rule={RULE_LAND} ")))
+    };
+    let busy = busy_screen();
+    let work = ended(WORK);
+    let (lines, needs) = tall_landing(Mock::new, &busy, &work, turn(true), true);
+    assert!(!landed(&lines), "{lines:#?}");
+    assert!(
+        lines.iter().any(|l| l.contains(&format!(
+            " rule={} ",
+            crate::supervise::policy::turn_end::RULE_LAND_NUDGE
+        ))),
+        "the nudge: {lines:#?}"
+    );
+    assert!(
+        needs
+            .first()
+            .is_some_and(|c| c.starts_with("set attention owner=needs ")
+                && c.contains("the signing credential")),
+        "the need raised: {needs:#?}\n{lines:#?}"
+    );
+    // NEGATIVE CONTROL: no need.
+    let (lines, needs) = tall_landing(Mock::new, &busy, &work, turn(false), true);
+    assert!(landed(&lines), "{lines:#?}");
+    assert!(needs.is_empty(), "{needs:#?}");
+    // A TURN WHOSE START CANNOT BE READ: no history, or a turn longer than
+    // the history is looked through.
+    let nudged = |lines: &[String]| {
+        lines.iter().any(|l| {
+            l.contains(&format!(
+                " rule={} ",
+                crate::supervise::policy::turn_end::RULE_LAND_NUDGE
+            ))
+        })
+    };
+    for (why, read) in [
+        ("no history", (turn(true), false)),
+        ("140 calls", (turn_of(true, 140), true)),
+        ("140 calls, no need", (turn_of(false, 140), true)),
+    ] {
+        let ((screen, above), history) = read;
+        assert!(above.len() > 400 || !history, "{why}: {}", above.len());
+        let (lines, _) = tall_landing(Mock::new, &busy, &work, (screen, above), history);
+        assert!(!landed(&lines), "{why}: {lines:#?}");
+        assert!(nudged(&lines), "{why}: the nudge: {lines:#?}");
+    }
+}
+
+/// A NEED SAID BEFORE A TOOL CALL ON EVERY HARNESS IS READ BEFORE IT LANDS
+/// (`TurnEndReading::of` and `Session::said_read_whole` by the program's
+/// own reader, [`aterm_phase::ScreenReader::turn_said_before`]): Gemini
+/// CLI's, agy's and Muse Code's yield of Land's instruction a turn whose
+/// first reply says NEEDS YOU, then a tool call, then a clean defense. With
+/// the whole turn on the screen, and with its start in the history above
+/// (sixty tool rows tall): no landing, the nudge typed, the need raised. The
+/// recheck of ea564676a3 found the turn's earlier words read on Claude Code
+/// alone: each of these landed on its last reply, the need unread.
+/// NEGATIVE CONTROLS: the same turns with no need land; with no history to
+/// read, the tall turn lands nothing (its start unread).
+#[test]
+fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
+    use aterm_phase::prompt::fixtures::screen;
+    use aterm_phase::{agy, gemini, muse};
+    let before = |need: bool, head: &str| -> Vec<String> {
+        if need {
+            vec![
+                format!("{head}NEEDS YOU: the signing credential"),
+                "  I will push the branch now.".to_string(),
+            ]
+        } else {
+            vec![format!("{head}I will push the branch now.")]
+        }
+    };
+    let defense = "Nothing left: all of it is merged into the remote main branch.";
+    let calls = |tall: bool| if tall { 60 } else { 1 };
+    // The screen: the whole turn, or the end's height of its foot.
+    let split = |mut drawn: Vec<String>, height: usize, tall: bool| {
+        if tall {
+            let screen = drawn.split_off(drawn.len() - height);
+            (screen, drawn)
+        } else {
+            (drawn, Vec::new())
+        }
+    };
+    let gemini_turn = move |need: bool, tall: bool| {
+        let end = screen(gemini::fixtures::END_OF_TURN);
+        let at = end
+            .iter()
+            .rposition(|r| r.starts_with("✦ "))
+            .expect("the reply");
+        let mut drawn = end[..at].to_vec();
+        drawn.extend(before(need, "✦ "));
+        drawn.push(String::new());
+        drawn.push("╭────────────────────────────────────────────╮".to_string());
+        for call in 0..calls(tall) {
+            drawn.push(format!(
+                "│ ✓  Shell git push origin branch-{call:02}             │"
+            ));
+        }
+        drawn.push("╰────────────────────────────────────────────╯".to_string());
+        drawn.push(String::new());
+        drawn.push(format!("✦ {defense}"));
+        drawn.extend(end[at + 1..].iter().cloned());
+        split(drawn, end.len(), tall)
+    };
+    let agy_turn = move |need: bool, tall: bool| {
+        let end = screen(agy::fixtures::END_OF_TURN);
+        let user = end
+            .iter()
+            .position(|r| r.starts_with("> Write about"))
+            .expect("the message");
+        let composer = (user..end.len())
+            .find(|&i| end[i].starts_with('─'))
+            .expect("the composer's rule");
+        let mut drawn = end[..user].to_vec();
+        drawn.push("> Land it all in the remote main branch.".to_string());
+        drawn.push(String::new());
+        drawn.extend(before(need, "  "));
+        drawn.push(String::new());
+        for call in 0..calls(tall) {
+            drawn.push(format!(
+                "● Ran git push origin branch-{call:02} (ctrl+o to expand)"
+            ));
+        }
+        drawn.push(String::new());
+        drawn.push(format!("  {defense}"));
+        drawn.push(String::new());
+        drawn.extend(end[composer..].iter().cloned());
+        split(drawn, end.len(), tall)
+    };
+    let muse_turn = move |need: bool, tall: bool| {
+        let end = screen(muse::fixtures::END_OF_TURN_1_4_10);
+        let at = end
+            .iter()
+            .position(|r| r.starts_with("◆ Hi!"))
+            .expect("the reply");
+        let mut drawn = end[..at].to_vec();
+        drawn.extend(before(need, "◆ "));
+        drawn.push(String::new());
+        for call in 0..calls(tall) {
+            drawn.push(format!(
+                "◆ Ran command · Push branch-{call:02} · ✓ · 2.3s · ctrl+o"
+            ));
+            drawn.push(String::new());
+        }
+        drawn.push(format!("◆ {defense}"));
+        drawn.extend(end[at + 1..].iter().cloned());
+        split(drawn, end.len().max(20), tall)
+    };
+    type Turn = Box<dyn Fn(bool, bool) -> (Vec<String>, Vec<String>)>;
+    type Harness = (
+        &'static str,
+        fn(Vec<Vec<String>>) -> Mock,
+        &'static str,
+        &'static str,
+        Turn,
+    );
+    let harnesses: [Harness; 3] = [
+        (
+            "gemini",
+            gemini_mock,
+            gemini::fixtures::BUSY_THINKING,
+            gemini::fixtures::END_OF_TURN,
+            Box::new(gemini_turn),
+        ),
+        (
+            "agy",
+            agy_mock,
+            agy::fixtures::BUSY,
+            agy::fixtures::END_OF_TURN,
+            Box::new(agy_turn),
+        ),
+        (
+            "muse",
+            muse_mock,
+            muse::fixtures::BUSY_1_4_10,
+            muse::fixtures::END_OF_TURN_1_4_10,
+            Box::new(muse_turn),
+        ),
+    ];
+    let landed = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|l| l.starts_with("DONE ") && l.contains(&format!(" rule={RULE_LAND} ")))
+    };
+    let nudged = |lines: &[String]| {
+        lines.iter().any(|l| {
+            l.contains(&format!(
+                " rule={} ",
+                crate::supervise::policy::turn_end::RULE_LAND_NUDGE
+            ))
+        })
+    };
+    for (program, mock, busy, work, turn) in harnesses {
+        let (busy, work) = (screen(busy), screen(work));
+        for tall in [false, true] {
+            let at = if tall {
+                "above the screen"
+            } else {
+                "on the screen"
+            };
+            let (rows, _) = turn(true, tall);
+            let reader = program_reader(program, &rows);
+            assert_eq!(
+                reader.said_tail(&rows).as_deref(),
+                Some(defense),
+                "{program} {at}: the last reply"
+            );
+            assert_eq!(
+                reader.turn_whole(&rows),
+                !tall,
+                "{program} {at}: the turn's start"
+            );
+            let (lines, needs) = tall_landing(mock, &busy, &work, turn(true, tall), true);
+            assert!(!landed(&lines), "{program} {at}: {lines:#?}");
+            assert!(nudged(&lines), "{program} {at}: the nudge: {lines:#?}");
+            assert!(
+                needs
+                    .first()
+                    .is_some_and(|c| c.starts_with("set attention owner=needs ")
+                        && c.contains("the signing credential")),
+                "{program} {at}: the need raised: {needs:#?}\n{lines:#?}"
+            );
+            // NEGATIVE CONTROL: no need — it lands.
+            let (lines, needs) = tall_landing(mock, &busy, &work, turn(false, tall), true);
+            assert!(landed(&lines), "{program} {at}: {lines:#?}");
+            assert!(needs.is_empty(), "{program} {at}: {needs:#?}");
+        }
+        // NEGATIVE CONTROL: no history — the tall turn's start unread, it
+        // lands nothing.
+        let (lines, _) = tall_landing(mock, &busy, &work, turn(false, true), false);
+        assert!(!landed(&lines), "{program}: {lines:#?}");
+        assert!(nudged(&lines), "{program}: the nudge: {lines:#?}");
+    }
+}
+
+/// The reader the loop reads `program`'s screen `rows` with.
+fn program_reader(program: &str, rows: &[String]) -> &'static dyn aterm_phase::ScreenReader {
+    let name = if program == "gemini" { "node" } else { program };
+    aterm_phase::identify(Some(name), rows)
+}
+
+/// A LANDING, AND A LOOP RESTARTED ON IT: the landed task is marked `done
+/// why=landed` once, with the defense. A loop started again on the landed
+/// screen (the host's worker restarted, a seamless update's successor)
+/// reads the record — `done` already — takes the landing on at its first
+/// point, whose words are still the landing's clean defense, types nothing
+/// into the landed worker and marks nothing, and the snapshot stands.
+/// NEGATIVE CONTROLS: the record put back to `working` (a mark the first
+/// loop never got answered), the restarted loop lands and publishes it; and
+/// a restarted loop whose first point is a report that is no defense (a
+/// turn after the landing that no loop watched, the review of 2026-10-20)
+/// takes nothing from the `done` record: the record reopened, Land's
+/// instruction typed, and the task landed and published again.
+#[test]
+fn a_landing_is_published_once_and_a_restarted_loop_marks_nothing() {
     let root = crate::supervise::ScratchDir::new("task", "marker");
     let tasks = root.join("tasks");
-    let text = transcript_of(&[
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row(
-            "assistant",
-            "a-report",
-            "msg_1",
-            "Fixed the parser.\nAll green.\nATERM-TASK-DONE",
-        ),
-    ]);
+    let text = transcript_of(&landing_rows(&landed_reply()));
     let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
-    let run = |task: Option<(u64, String)>| {
-        let mut m = Mock::new(vec![busy_screen(), ended("ATERM-TASK-DONE")]);
-        m.vanish_after = Some(2);
+    let run_on = |screens: Vec<Vec<String>>, task: Option<(u64, String)>| {
+        let held = screens.len() > 1;
+        let mut m = Mock::new(screens);
+        landing(&mut m);
+        // The landed screen alone sits as it is: nothing to release.
+        m.turn_releases = m.turn_releases.filter(|_| held);
+        m.vanish_after = Some(4);
         m.task = task;
         let _ = tasked_watch(&mut m, &host, &tasks, None);
         m
     };
+    let run = |task: Option<(u64, String)>| run_on(landing_screens(&landed_reply()), task);
     let m = run(working_task());
     let path = tasks.join("s-1-1.result.md");
-    let report = "Fixed the parser.\nAll green.";
-    assert_eq!(task_marks(&m), [done_mark("marker", report.len(), &path)]);
-    assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), report);
+    assert_eq!(
+        task_marks(&m),
+        [done_mark("landed", landed_result().len(), &path)]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("snapshot"),
+        landed_result()
+    );
     // The loop again, on the record the first one left.
     let done = m.task.clone();
     std::fs::write(&path, "the snapshot as the first loop left it").expect("mark it");
-    let again = run(done.clone());
+    let again = run_on(vec![ended(&landed_reply())], done.clone());
     assert_eq!(again.task_requests, ["task"], "read, never marked");
+    assert_eq!(again.turns, 0, "nothing typed into the landed worker");
     assert_eq!(again.task, done, "the record stands");
     assert_eq!(
         std::fs::read_to_string(&path).expect("snapshot"),
@@ -21915,10 +22695,29 @@ fn the_marker_is_published_once_and_a_restarted_loop_marks_nothing() {
     let unanswered = run(working_task());
     assert_eq!(
         task_marks(&unanswered),
-        [done_mark("marker", report.len(), &path)]
+        [done_mark("landed", landed_result().len(), &path)]
+    );
+    // NEGATIVE CONTROL: the `done` record, the first point no defense.
+    let undefended = run(done.clone());
+    assert!(
+        undefended
+            .task_requests
+            .iter()
+            .any(|r| r.starts_with("task mark working ")),
+        "reopened: {:?}",
+        undefended.task_requests
+    );
+    assert_eq!(undefended.turns, 1, "Land's instruction");
+    assert!(
+        undefended
+            .task_requests
+            .last()
+            .is_some_and(|r| r.starts_with("task mark done why=landed ")),
+        "{:?}",
+        undefended.task_requests
     );
     // A worker the window host's held deadline stalled — a box no rule knew,
-    // which a person answered, and it went on to finish — is published as a
+    // which a person answered, and it went on to land — is published as a
     // working one is, its result under the stall's rev.
     let stalled = |why: &str| {
         Some((
@@ -21930,22 +22729,23 @@ fn the_marker_is_published_once_and_a_restarted_loop_marks_nothing() {
     assert_eq!(
         task_marks(&held),
         [done_mark(
-            "marker",
-            report.len(),
+            "landed",
+            landed_result().len(),
             &tasks.join("s-1-2.result.md")
         )]
     );
-    // NEGATIVE CONTROL: the launcher's stall typed nothing, so no done of
+    // NEGATIVE CONTROL: the launcher's stall typed nothing, so no landing of
     // this loop's is that task's.
     let shell = run(stalled("shell"));
     assert!(task_marks(&shell).is_empty(), "{:?}", shell.task_requests);
-    // A loop with nowhere to snapshot (no host) leaves the
-    // record alone: the window's harness publishes it.
-    let mut m = Mock::new(vec![busy_screen(), ended("ATERM-TASK-DONE")]);
-    m.vanish_after = Some(2);
+    // A loop with nowhere to snapshot (no tasks dir) leaves the record
+    // alone: the window's harness publishes it.
+    let mut m = Mock::new(landing_screens(&landed_reply()));
+    landing(&mut m);
+    m.vanish_after = Some(4);
     m.task = working_task();
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         tasks: None,
         ..auto(30)
@@ -21960,36 +22760,29 @@ fn the_marker_is_published_once_and_a_restarted_loop_marks_nothing() {
     assert_eq!(m.task, working_task());
 }
 
-/// THE DONE EDGE READ BEFORE CLAUDE CODE WROTE ITS REPLY (F1, 2.1.301 on a
-/// real login): the host's read at the screen's done point holds the task's
-/// prompt and no reply, and the transcript on disk has the reply and the
-/// turn's `turn_duration` row by the time it is read again — the record is
-/// marked with that report (`crate::harness::result::settled`). NEGATIVE
-/// CONTROL: with no transcript left to read again, the mark is the miss it
-/// always was (`result_bytes=0`).
+/// THE LANDING READ BEFORE CLAUDE CODE WROTE ITS REPLY (F1, 2.1.301 on a
+/// real login): the host's read at the landing point holds Land's
+/// instruction and no reply, and the transcript on disk has the defense and
+/// the turn's `turn_duration` row by the time it is read again — the record
+/// is marked with that defense (`crate::harness::result::settled`).
+/// NEGATIVE CONTROL: with no transcript left to read again, the mark is the
+/// miss it always was (`result_bytes=0`).
 #[test]
-fn a_done_edge_read_before_the_reply_was_written_waits_for_the_turns_end() {
+fn a_landing_read_before_the_reply_was_written_waits_for_the_turns_end() {
     let root = crate::supervise::ScratchDir::new("task", "lag");
     let tasks = root.join("tasks");
-    let prompt = task_row("user", "u-task", "", "Fix the parser.");
-    let lagging = transcript_of(std::slice::from_ref(&prompt));
-    let mut whole = transcript_of(&[
-        prompt,
-        task_row(
-            "assistant",
-            "a-report",
-            "msg_1",
-            "Fixed the parser.\nATERM-TASK-DONE",
-        ),
-    ]);
-    whole.push_str(
-        r#"{"parentUuid":"a-report","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":9000,"uuid":"td","sessionId":"0b2299fa","version":"2.1.301"}"#,
+    let mut rows = landing_rows(&landed_reply());
+    let lagging = transcript_of(&rows[..rows.len() - 1]);
+    rows.push(
+        r#"{"parentUuid":"a-land","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":9000,"uuid":"td","sessionId":"0b2299fa","version":"2.1.301"}"#
+            .to_string(),
     );
-    whole.push('\n');
+    let whole = transcript_of(&rows);
     let run = |transcript: &Path| {
         let host = TaskHost::reading(transcript, &[&lagging]);
-        let mut m = Mock::new(vec![busy_screen(), ended("ATERM-TASK-DONE")]);
-        m.vanish_after = Some(2);
+        let mut m = Mock::new(landing_screens(&landed_reply()));
+        landing(&mut m);
+        m.vanish_after = Some(4);
         m.task = working_task();
         let _ = tasked_watch(&mut m, &host, &tasks, None);
         m
@@ -21997,13 +22790,18 @@ fn a_done_edge_read_before_the_reply_was_written_waits_for_the_turns_end() {
     let on_disk = root.join("t.jsonl");
     std::fs::write(&on_disk, &whole).expect("the transcript as Claude Code finished it");
     let path = tasks.join("s-1-1.result.md");
-    let report = "Fixed the parser.";
     let m = run(&on_disk);
-    assert_eq!(task_marks(&m), [done_mark("marker", report.len(), &path)]);
-    assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), report);
+    assert_eq!(
+        task_marks(&m),
+        [done_mark("landed", landed_result().len(), &path)]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("snapshot"),
+        landed_result()
+    );
     // NEGATIVE CONTROL: nothing to read again.
     let m = run(&root.join("gone.jsonl"));
-    assert_eq!(task_marks(&m), [done_mark("marker", 0, &path)]);
+    assert_eq!(task_marks(&m), [done_mark("landed", 0, &path)]);
     assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), "");
 }
 
@@ -22038,32 +22836,38 @@ fn notification_at(at: i64) -> String {
     )
 }
 
-/// THE TURN THE DONE WAS READ ON IS THE ONE SNAPSHOTTED — the loop hands
-/// the read that decided the done to the result reader: the worker's turn
-/// ended with the marker, a background command's `<task-notification>` woke
-/// it and the woken turn ran a tool, all in the done edge's read; the woken
-/// turn's reply (with the marker too) and end row are on disk by the next
-/// read. Where the notification was written BEFORE the done's read (the
-/// done held back over a background agent, the wake's end the done), the
-/// wake's turn is waited for and its reply is the result. NEGATIVE CONTROL,
-/// each of the other: the same rows with the notification written AFTER
-/// that read (a shell that ended once the done was on the screen) — the
-/// earlier turn's report, the wake's never taken.
+/// THE TURN THE LANDING WAS READ ON IS THE ONE SNAPSHOTTED — the loop hands
+/// the read that decided the landing to the result reader: the worker
+/// answered Land's instruction (the retired token under it, which the
+/// result drops), a background command's `<task-notification>` woke it and
+/// the woken turn ran a tool, all in the landing's read; the woken turn's
+/// reply (the token under it too) and end row
+/// are on disk by the next read. Where the notification was written BEFORE
+/// the landing's read, the wake's turn is waited for and its reply is the
+/// result. NEGATIVE CONTROL, each of the other: the same rows with the
+/// notification written AFTER that read (a shell that ended once the
+/// defense was on the screen) — the earlier reply, the wake's never taken.
 #[test]
-fn the_done_points_showing_places_the_turn_snapshotted() {
+fn the_landing_points_showing_places_the_turn_snapshotted() {
     let root = crate::supervise::ScratchDir::new("task", "shown");
     let tasks = root.join("tasks");
     let run = |woke_at: i64| {
         let first = vec![
             stamped(
                 task_row("user", "u-task", "", "Fix the parser."),
-                TEST_NOW - 120,
+                TEST_NOW - 300,
             ),
+            stamped(
+                task_row("assistant", "a-work", "msg_1", WORK),
+                TEST_NOW - 200,
+            ),
+            end_row_at(TEST_NOW - 200),
+            stamped(task_row("user", "u-land", "", LAND), TEST_NOW - 150),
             stamped(
                 task_row(
                     "assistant",
                     "a-held",
-                    "msg_1",
+                    "msg_2",
                     "Started the review in the background.\nATERM-TASK-DONE",
                 ),
                 TEST_NOW - 110,
@@ -22077,7 +22881,7 @@ fn the_done_points_showing_places_the_turn_snapshotted() {
                 task_row(
                     "assistant",
                     "a-wake",
-                    "msg_2",
+                    "msg_3",
                     "The review found nothing more.\nATERM-TASK-DONE",
                 ),
                 woke_at + 5,
@@ -22087,8 +22891,9 @@ fn the_done_points_showing_places_the_turn_snapshotted() {
         let on_disk = root.join(format!("t-{woke_at}.jsonl"));
         std::fs::write(&on_disk, transcript_of(&whole)).expect("the transcript on disk");
         let host = TaskHost::reading(&on_disk, &[&transcript_of(&first)]);
-        let mut m = Mock::new(vec![busy_screen(), ended("ATERM-TASK-DONE")]);
-        m.vanish_after = Some(2);
+        let mut m = Mock::new(landing_screens(&landed_reply()));
+        landing(&mut m);
+        m.vanish_after = Some(4);
         m.task = working_task();
         let _ = tasked_watch(&mut m, &host, &tasks, None);
         let path = tasks.join("s-1-1.result.md");
@@ -22099,157 +22904,57 @@ fn the_done_points_showing_places_the_turn_snapshotted() {
         )
     };
     let (marks, snapshot, path) = run(TEST_NOW - 30);
-    let report = "The review found nothing more.";
+    let report = format!("{WORK}\n\nThe review found nothing more.");
     assert_eq!(snapshot, report);
-    assert_eq!(marks, [done_mark("marker", report.len(), &path)]);
-    // NEGATIVE CONTROL: the notification written after the done's read.
+    assert_eq!(marks, [done_mark("landed", report.len(), &path)]);
+    // NEGATIVE CONTROL: the notification written after the landing's read.
     let (marks, snapshot, path) = run(TEST_NOW + 30);
-    let report = "Started the review in the background.";
+    let report = format!("{WORK}\n\nStarted the review in the background.");
     assert_eq!(snapshot, report);
-    assert_eq!(marks, [done_mark("marker", report.len(), &path)]);
-}
-
-/// A TURN THE HOST TYPED, ANSWERED WITH THE MARKER, IS THE TURN SNAPSHOTTED:
-/// the worker's first turn ends without the marker, the host types its step
-/// there (a turn of the harness's: a relaunched agent's carry-on, the live
-/// upgrade's notice), the Mac sleeps two hours at the step, and the worker
-/// answers the step with the marker. That done makes no new point — the
-/// point standing first showed before the step's prompt was written — and
-/// the reader is handed the read that decided the done
-/// ([`TurnEndState::done_shown`]): the step's turn, its report the result.
-/// Handed the point's first showing, it read the turn before the step
-/// (`no-marker`, that turn named in the sidecar for good). NEGATIVE
-/// CONTROL: a background shell's `<task-notification>` and its wake's reply
-/// written after the done's read (P5) — with no cutoff at all, the wake was
-/// the newest turn and its reply the report.
-#[test]
-fn a_host_typed_turn_answered_with_the_marker_is_the_turn_snapshotted() {
-    let root = crate::supervise::ScratchDir::new("task", "host-done");
-    let woke = TEST_NOW + 2 * 3600;
-    let run = |late_wake: bool| {
-        let tasks = root.join(format!("tasks-{late_wake}"));
-        let before = vec![
-            stamped(
-                task_row("user", "u-task", "", "Fix the README."),
-                TEST_NOW - 600,
-            ),
-            stamped(
-                task_row("assistant", "a-half", "msg_1", "Half of the README."),
-                TEST_NOW - 10,
-            ),
-            end_row_at(TEST_NOW - 10),
-        ];
-        let mut rows = before.clone();
-        rows.extend([
-            stamped(
-                task_row(
-                    "user",
-                    "u-host",
-                    "",
-                    "[aterm harness] Carry on with your task.",
-                ),
-                TEST_NOW + 60,
-            ),
-            stamped(
-                task_row(
-                    "assistant",
-                    "a-all",
-                    "msg_2",
-                    "All of it fixed.\nATERM-TASK-DONE",
-                ),
-                woke - 600,
-            ),
-            end_row_at(woke - 600),
-        ]);
-        if late_wake {
-            rows.extend([
-                notification_at(woke + 30),
-                stamped(
-                    task_row("assistant", "a-wake", "msg_3", "The shell finished."),
-                    woke + 35,
-                ),
-                end_row_at(woke + 35),
-            ]);
-        }
-        let path = root.join(format!("t-{late_wake}.jsonl"));
-        std::fs::write(&path, transcript_of(&rows)).expect("the transcript on disk");
-        let host = Arc::new(TaskHost {
-            path,
-            texts: std::sync::Mutex::new([transcript_of(&before)].into_iter().collect()),
-            stepped: Some(transcript_of(&rows)),
-            wanting: AtomicBool::new(true),
-            ..TaskHost::default()
-        });
-        let mut m = Mock::new(vec![
-            busy_screen(),
-            ended("Half of the README."),
-            busy_screen(),
-            ended("All of it fixed.\nATERM-TASK-DONE"),
-        ]);
-        m.vanish_after = Some(4);
-        m.cursor_on_caret = true;
-        m.task = working_task();
-        let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
-            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            tasks: Some(tasks.clone()),
-            ..auto(30)
-        };
-        let mut out: Vec<u8> = Vec::new();
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.set_clock(TEST_NOW, PDT);
-        s.set_zone_lookup(test_zones);
-        *host.sleep.lock().unwrap() = Some(s.clock_jump_handle());
-        let _ = s.watch(&opts, &mut out);
-        let slept = s.wake_settle.is_some();
-        drop(s);
-        let lines = String::from_utf8(out).expect("utf-8");
-        assert!(slept, "the Mac slept at the host's step: {lines}");
-        assert_eq!(host.steps.load(Ordering::SeqCst), 1, "the step: {lines}");
-        let snapshot = tasks.join("s-1-1.result.md");
-        (
-            task_marks(&m),
-            std::fs::read_to_string(&snapshot).expect("snapshot"),
-            snapshot,
-            lines,
-        )
-    };
-    let report = "All of it fixed.";
-    let (marks, text, path, lines) = run(false);
-    assert_eq!(text, report, "{lines}");
-    assert_eq!(marks, [done_mark("marker", report.len(), &path)], "{lines}");
-    // NEGATIVE CONTROL: a wake written after the done's read is no turn of it.
-    let (marks, text, path, lines) = run(true);
-    assert_eq!(text, report, "{lines}");
-    assert_eq!(marks, [done_mark("marker", report.len(), &path)], "{lines}");
+    assert_eq!(marks, [done_mark("landed", report.len(), &path)]);
 }
 
 /// NEVER A PERSON'S OWN EXCHANGE: their greeting, answered in seconds, is a
-/// `done` of theirs (`LEFT … rule=left-to-person@v1`), and a tasked
-/// session's record is not read or marked for it. (On a tasked worker it
-/// comes only from a person typing at its window: the task itself is argv,
-/// and a manager's follow-up is a `turn`, no window gesture.) NEGATIVE
-/// CONTROL: the same words ending a turn of the worker's own with the
-/// marker, nobody's stamp, mark it.
+/// `done` of theirs (`LEFT … rule=left-to-person@v1`) — even with the
+/// retired marker under it — and a tasked session's record is not read or
+/// marked for it. (On a tasked worker it comes only from a person typing at
+/// its window: the task itself is argv, and a manager's follow-up is a
+/// `turn`, no window gesture.) NEGATIVE CONTROL: the same words ending a
+/// turn of the worker's own, nobody's stamp, get Land's instruction, and the
+/// clean defense that answers it is marked.
 #[test]
 fn a_persons_own_exchange_marks_no_task() {
     let root = crate::supervise::ScratchDir::new("task", "left");
     let tasks = root.join("tasks");
     let said = format!("Hi! What would you like me to work on?\n{FINISHED}");
-    let quick = || {
+    let quick = |said: &str| {
         let mut r = rows(&[&format!("⏺ {said}"), ""]);
         r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         r
     };
-    let text = transcript_of(&[
+    let greeting = transcript_of(&[
         task_row("user", "u-hi", "", "hi"),
         task_row("assistant", "a-hi", "msg_1", &said),
     ]);
-    let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
+    let landed = transcript_of(&landing_rows(&landed_reply()));
     let run = |person: bool| {
         let journal = root.join(format!("journal-{person}.jsonl"));
-        let mut m = Mock::new(vec![busy_screen(), quick()]);
-        m.turn_releases = Some(1);
+        let (screens, text) = if person {
+            (vec![busy_screen(), quick(&said)], &greeting)
+        } else {
+            (
+                vec![
+                    busy_screen(),
+                    quick(&said),
+                    busy_screen(),
+                    quick(&landed_reply()),
+                ],
+                &landed,
+            )
+        };
+        let host = TaskHost::reading(&root.join("t.jsonl"), &[text]);
+        let mut m = Mock::new(screens);
+        landing(&mut m);
         m.vanish_after = Some(8);
         if person {
             m.human = vec!["2000"];
@@ -22259,7 +22964,7 @@ fn a_persons_own_exchange_marks_no_task() {
         let opts = SuperviseOpts {
             policy: SupervisorConfig {
                 human_grace_s: 0,
-                ..SupervisorConfig::default()
+                ..owners_policy()
             },
             journal: Some(journal.clone()),
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
@@ -22290,156 +22995,135 @@ fn a_persons_own_exchange_marks_no_task() {
     assert_eq!(task_marks(&m).len(), 1, "{:?}", m.task_requests);
 }
 
-/// WORKING AGAIN, AND DONE AGAIN: after the worker's done is published,
-/// someone else's turn (a manager's follow-up) that ends with no done report
-/// opens the task again — the record is marked `working why=turn`. And a
-/// follow-up the worker answers WITH the marker — the policy's done never
-/// ending between the two points, the server having moved the record back
-/// to `working` at that turn (`Mock::task_reopens_at`) — is a done of its
-/// own: a second snapshot, under the record's new rev, of the follow-up's
-/// report. NEGATIVE CONTROL: with no turn after the done, nothing more is
-/// read or marked.
+/// OPEN AGAIN, AND LANDED AGAIN: after the landing is published, someone
+/// else's turn (a manager's follow-up) that ends with no defense opens the
+/// task again — the record is marked `working why=turn`. And a follow-up
+/// landed in turn — Land's act typed at its end and answered with a clean
+/// defense, the server having moved the record back to `working` at that
+/// turn (`Mock::task_reopens_at`) — is a landing of its own: a second
+/// snapshot, under the record's new rev, of the second defense. NEGATIVE
+/// CONTROL: with no turn after the landing, nothing more is read or marked.
 #[test]
-fn someone_elses_turn_opens_the_task_again_and_its_done_is_published_again() {
+fn someone_elses_turn_opens_the_task_again_and_its_landing_is_published_again() {
+    const HALF: &str = "Half of the README is in.";
+    const AGAIN: &str = "Updated the README and pushed it.\nNothing left: the README is on the \
+                         remote main branch.";
     let root = crate::supervise::ScratchDir::new("task", "reopen");
     let tasks = root.join("tasks");
-    let first = [
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row(
-            "assistant",
-            "a-1",
-            "msg_1",
-            "Fixed the parser.\nATERM-TASK-DONE",
-        ),
-    ];
+    let first = landing_rows(&landed_reply());
     let one = transcript_of(&first);
-    // A follow-up that is not done.
+    let first_mark = done_mark(
+        "landed",
+        landed_result().len(),
+        &tasks.join("s-1-1.result.md"),
+    );
+    // A follow-up that is not landed.
     let host = TaskHost::reading(&root.join("t.jsonl"), &[&one]);
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        ended("Fixed the parser.\nATERM-TASK-DONE"),
-        busy_screen(),
-        ended("Half of the README is in."),
-    ]);
+    let mut screens = landing_screens(&landed_reply());
+    screens.extend([busy_screen(), ended(HALF)]);
+    let mut m = Mock::new(screens);
+    landing(&mut m);
     m.vanish_after = Some(4);
     m.task = working_task();
     let lines = tasked_watch(&mut m, &host, &tasks, None);
     assert_eq!(
         task_marks(&m),
-        [
-            done_mark(
-                "marker",
-                "Fixed the parser.".len(),
-                &tasks.join("s-1-1.result.md")
-            ),
-            "task mark working why=turn".to_string(),
-        ],
+        [first_mark.clone(), "task mark working why=turn".to_string()],
         "{lines:#?}"
     );
-    // A follow-up answered with the marker.
-    let mut rows = first.to_vec();
+    // A follow-up landed in turn.
+    let again_reply = AGAIN.to_string();
+    let mut rows = first.clone();
     rows.extend([
         task_row("user", "u-more", "", "Also update the README."),
-        task_row(
-            "assistant",
-            "a-2",
-            "msg_2",
-            "README updated.\nATERM-TASK-DONE",
-        ),
+        task_row("assistant", "a-more", "msg_3", HALF),
+        task_row("user", "u-nudge", "", LAND_NUDGE),
+        task_row("assistant", "a-again", "msg_4", &again_reply),
     ]);
     let two = transcript_of(&rows);
-    let host = TaskHost::reading(&root.join("t.jsonl"), &[&one, &two]);
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        ended("Fixed the parser.\nATERM-TASK-DONE"),
-        busy_screen(),
-        ended("README updated.\nATERM-TASK-DONE"),
-    ]);
-    m.vanish_after = Some(4);
-    m.task = working_task();
-    m.task_reopens_at = Some(3);
-    let lines = tasked_watch(&mut m, &host, &tasks, None);
+    let relanded = |reopens: Option<usize>| {
+        let host = TaskHost::reading(&root.join("t.jsonl"), &[&one, &two]);
+        let mut screens = landing_screens(&landed_reply());
+        screens.extend([
+            busy_screen(),
+            ended(HALF),
+            busy_screen(),
+            ended(&again_reply),
+        ]);
+        let mut m = Mock::new(screens);
+        m.history_served();
+        m.autopilot = Some("land");
+        // The work's end sits until Land's instruction, the follow-up's
+        // until Land's next act.
+        m.turn_gates = vec![1, 5];
+        m.vanish_after = Some(4);
+        m.task = working_task();
+        m.task_reopens_at = reopens;
+        let lines = tasked_watch(&mut m, &host, &tasks, None);
+        (m, lines)
+    };
     let second = tasks.join("s-1-3.result.md");
+    // The landing's result: the follow-up's report before Land's nudge, then
+    // the defense that landed it.
+    let again_result = format!("{HALF}\n\n{AGAIN}");
+    let (m, lines) = relanded(Some(5));
     assert_eq!(
         task_marks(&m),
         [
-            done_mark(
-                "marker",
-                "Fixed the parser.".len(),
-                &tasks.join("s-1-1.result.md")
-            ),
-            done_mark("marker", "README updated.".len(), &second),
+            first_mark.clone(),
+            done_mark("landed", again_result.len(), &second)
         ],
         "{lines:#?}"
     );
     assert_eq!(
         std::fs::read_to_string(&second).expect("snapshot"),
-        "README updated."
+        again_result
+    );
+    assert!(
+        !tasks.join("s-1-1.result.md").exists(),
+        "the new landing prunes the previous result pair"
     );
     // The same follow-up typed with `send` (or at the keyboard): the server
-    // leaves the record `done`, and the loop opens it again itself before
-    // publishing the follow-up's done under the new rev.
-    let host = TaskHost::reading(&root.join("t.jsonl"), &[&one, &two]);
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        ended("Fixed the parser.\nATERM-TASK-DONE"),
-        busy_screen(),
-        ended("README updated.\nATERM-TASK-DONE"),
-    ]);
-    m.vanish_after = Some(4);
-    m.task = working_task();
-    let lines = tasked_watch(&mut m, &host, &tasks, None);
+    // leaves the record `done`, and the loop opens it again itself at the
+    // follow-up's end before publishing its landing under the new rev.
+    let (m, lines) = relanded(None);
     assert_eq!(
         task_marks(&m),
         [
-            done_mark(
-                "marker",
-                "Fixed the parser.".len(),
-                &tasks.join("s-1-1.result.md")
-            ),
+            first_mark,
             "task mark working why=turn".to_string(),
-            done_mark("marker", "README updated.".len(), &second),
+            done_mark("landed", again_result.len(), &second),
         ],
         "{lines:#?}"
     );
-    // NEGATIVE CONTROL: nothing after the done.
+    // NEGATIVE CONTROL: nothing after the landing.
     let host = TaskHost::reading(&root.join("t.jsonl"), &[&one]);
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        ended("Fixed the parser.\nATERM-TASK-DONE"),
-    ]);
+    let mut m = Mock::new(landing_screens(&landed_reply()));
+    landing(&mut m);
     m.vanish_after = Some(4);
     m.task = working_task();
     let _ = tasked_watch(&mut m, &host, &tasks, None);
     assert_eq!(
         m.task_requests.len(),
         3,
-        "the loop's first read, the read at the done and the mark: {:?}",
+        "the loop's first read, the read at the landing and the mark: {:?}",
         m.task_requests
     );
 }
 
-/// THE SNAPSHOT IS THE DONE EDGE'S: the live upgrade's READY notice, typed by
-/// the host into the done worker, and its answer change nothing — the
-/// record is not read again, nothing is marked (its `done` is not someone
-/// else's turn), and the result file stands — though the transcript has
-/// grown by that exchange. NEGATIVE CONTROL: the same READY turn typed by
-/// nobody of the harness's (no host step) is someone else's turn, and opens
-/// the task again.
+/// THE SNAPSHOT IS THE LANDING'S: the live upgrade's READY notice, typed by
+/// the host into the landed worker, and its answer change nothing — the
+/// record is not read again, nothing is marked (its answer is not someone
+/// else's turn), and the result file stands — though the
+/// transcript has grown by that exchange. NEGATIVE CONTROL: the same READY
+/// turn typed by nobody of the harness's (no host step) is someone else's
+/// turn, and opens the task again.
 #[test]
-fn the_upgrades_ready_after_done_leaves_the_snapshot_and_the_record() {
+fn the_upgrades_ready_after_the_landing_leaves_the_snapshot_and_the_record() {
     let root = crate::supervise::ScratchDir::new("task", "ready");
     let tasks = root.join("tasks");
-    let done = [
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row(
-            "assistant",
-            "a-1",
-            "msg_1",
-            "Fixed the parser.\nATERM-TASK-DONE",
-        ),
-    ];
-    let mut later = done.to_vec();
+    let done = landing_rows(&landed_reply());
+    let mut later = done.clone();
     later.extend([
         task_row(
             "user",
@@ -22460,14 +23144,15 @@ fn the_upgrades_ready_after_done_leaves_the_snapshot_and_the_record() {
             ready,
             ..TaskHost::default()
         });
-        let mut m = Mock::new(vec![
-            busy_screen(),
-            ended("Fixed the parser.\nATERM-TASK-DONE"),
+        let mut screens = landing_screens(&landed_reply());
+        screens.extend([
             // The point read again: where the host takes its step.
-            ended("Fixed the parser.\nATERM-TASK-DONE"),
+            ended(&landed_reply()),
             busy_screen(),
             ended("READY"),
         ]);
+        let mut m = Mock::new(screens);
+        landing(&mut m);
         m.vanish_after = Some(4);
         // The cursor in the composer, where Claude Code keeps it at an idle
         // point: the reading the host's step needs.
@@ -22485,58 +23170,51 @@ fn the_upgrades_ready_after_done_leaves_the_snapshot_and_the_record() {
     );
     assert_eq!(
         task_marks(&m),
-        [done_mark("marker", "Fixed the parser.".len(), &path)],
+        [done_mark("landed", landed_result().len(), &path)],
         "{lines:#?}"
     );
     assert_eq!(
         m.task_requests.len(),
         3,
-        "the loop's first read, the read at the done and the mark: {:?}",
+        "the loop's first read, the read at the landing and the mark: {:?}",
         m.task_requests
     );
     assert_eq!(
         host.asks.load(Ordering::SeqCst),
         1,
-        "read once, at the edge"
+        "read once, at the landing"
     );
     assert_eq!(
         std::fs::read_to_string(&path).expect("snapshot"),
-        "Fixed the parser."
+        landed_result()
     );
     // NEGATIVE CONTROL: the same turn, nobody of the harness's.
     let (m, lines, _) = run(false);
     assert_eq!(
         task_marks(&m),
         [
-            done_mark("marker", "Fixed the parser.".len(), &path),
+            done_mark("landed", landed_result().len(), &path),
             "task mark working why=turn".to_string(),
         ],
         "{lines:#?}"
     );
 }
 
-/// THE DONE IS PUBLISHED BEFORE THE HOST'S STEP TAKES ITS POINT: a host that
-/// wants the very point the worker's marker ends (a Claude Code update
+/// THE LANDING IS PUBLISHED BEFORE THE HOST'S STEP TAKES ITS POINT: a host
+/// that wants the very point the defense lands (a Claude Code update
 /// installed while the task ran, a relaunched agent's continuation) types
-/// its turn there — and the done was read and marked as the point was
+/// its turn there — and the landing was read and marked as the point was
 /// folded in, before the step: the transcript read once, with no step
-/// taken, and the snapshot is the marker turn's report, never the exchange
-/// the step typed after it. NEGATIVE CONTROL: the transcript as the step
-/// leaves it reads no report by the marker's rule.
+/// taken, and the snapshot is the defense, never the exchange the step typed
+/// after it. (The host passes the turn of work's point, where Land's
+/// instruction goes.) NEGATIVE CONTROL: the transcript as the step leaves it
+/// reads the host's exchange as its newest turn's result.
 #[test]
-fn the_done_is_published_before_the_hosts_step_takes_its_point() {
+fn the_landing_is_published_before_the_hosts_step_takes_its_point() {
     let root = crate::supervise::ScratchDir::new("task", "first");
     let tasks = root.join("tasks");
-    let done = [
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row(
-            "assistant",
-            "a-1",
-            "msg_1",
-            "Fixed the parser.\nATERM-TASK-DONE",
-        ),
-    ];
-    let mut later = done.to_vec();
+    let done = landing_rows(&landed_reply());
+    let mut later = done.clone();
     later.extend([
         task_row(
             "user",
@@ -22551,14 +23229,13 @@ fn the_done_is_published_before_the_hosts_step_takes_its_point() {
         texts: std::sync::Mutex::new([transcript_of(&done)].into_iter().collect()),
         stepped: Some(transcript_of(&later)),
         wanting: AtomicBool::new(true),
+        passes: std::sync::atomic::AtomicUsize::new(1),
         ..TaskHost::default()
     });
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        ended("Fixed the parser.\nATERM-TASK-DONE"),
-        busy_screen(),
-        ended("READY"),
-    ]);
+    let mut screens = landing_screens(&landed_reply());
+    screens.extend([busy_screen(), ended("READY")]);
+    let mut m = Mock::new(screens);
+    landing(&mut m);
     m.vanish_after = Some(4);
     m.cursor_on_caret = true;
     m.task = working_task();
@@ -22566,7 +23243,7 @@ fn the_done_is_published_before_the_hosts_step_takes_its_point() {
     assert_eq!(
         host.steps.load(Ordering::SeqCst),
         1,
-        "the host's turn at the done point: {lines:#?}"
+        "the host's turn at the landing point: {lines:#?}"
     );
     assert_eq!(
         *host.read_at.lock().unwrap(),
@@ -22576,47 +23253,40 @@ fn the_done_is_published_before_the_hosts_step_takes_its_point() {
     let path = tasks.join("s-1-1.result.md");
     assert_eq!(
         task_marks(&m),
-        [done_mark("marker", "Fixed the parser.".len(), &path)],
+        [done_mark("landed", landed_result().len(), &path)],
         "{lines:#?}"
     );
     assert_eq!(
         std::fs::read_to_string(&path).expect("snapshot"),
-        "Fixed the parser."
+        landed_result()
     );
-    // NEGATIVE CONTROL: read after the step.
+    // NEGATIVE CONTROL: read after the step, the newest turn is the host's
+    // exchange, and its words are what a late read would have published.
     assert_eq!(
         crate::harness::result::report(
             &transcript_of(&later),
-            crate::harness::result::DoneBy::Marker
-        ),
-        Err("no-marker")
+            crate::harness::result::DoneBy::Turn
+        )
+        .map(|r| r.text),
+        Ok("READY".to_string())
     );
 }
 
-/// A SLEEP AFTER THE DONE PUBLISHES NOTHING MORE: the worker's done is
+/// A SLEEP AFTER THE LANDING PUBLISHES NOTHING MORE: the landing is
 /// published, the live upgrade's READY notice is typed by the host into the
-/// done worker, and the Mac sleeps before its answer — the point's first
+/// landed worker, and the Mac sleeps before its answer — the point's first
 /// showing moves back by the night ([`TurnEndState::slept`]). The READY,
-/// answered short, keeps the point
-/// ([`TurnEndState::point_number`]): the record is not opened again, no
-/// second done is marked, and the snapshot stands. An identity read off the
-/// point's instant made the same point a new one at the wake — `working
-/// why=turn`, then a done under a new rev, read from the transcript the
-/// READY had moved.
+/// answered short, keeps the point ([`TurnEndState::point_number`]): the
+/// record is not opened again, no second landing is marked, and the
+/// snapshot stands. An identity read off the point's instant made the same
+/// point a new one at the wake — `working why=turn`, then a done under a new
+/// rev, read from the transcript the READY had moved.
 #[test]
-fn a_sleep_after_the_done_marks_nothing_more_at_the_hosts_short_turn() {
+fn a_sleep_after_the_landing_marks_nothing_more_at_the_hosts_short_turn() {
     let root = crate::supervise::ScratchDir::new("task", "sleep");
     let tasks = root.join("tasks");
-    let done = [
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row(
-            "assistant",
-            "a-1",
-            "msg_1",
-            "Fixed the parser.\nATERM-TASK-DONE",
-        ),
-    ];
-    let mut later = done.to_vec();
+    let done = landing_rows(&landed_reply());
+    let mut later = done.clone();
     later.extend([
         task_row(
             "user",
@@ -22639,20 +23309,17 @@ fn a_sleep_after_the_done_marks_nothing_more_at_the_hosts_short_turn() {
     // READY in seconds: a short turn of the host's.
     let ready: Vec<String> = ended("READY")
         .into_iter()
-        .map(|r| r.replace("Worked for 3m 2s", "Worked for 2s"))
+        .map(|r| r.replace("Worked for 12m 2s", "Worked for 2s"))
         .collect();
-    let mut m = Mock::new(vec![
-        busy_screen(),
-        ended("Fixed the parser.\nATERM-TASK-DONE"),
-        ended("Fixed the parser.\nATERM-TASK-DONE"),
-        busy_screen(),
-        ready,
-    ]);
+    let mut screens = landing_screens(&landed_reply());
+    screens.extend([ended(&landed_reply()), busy_screen(), ready]);
+    let mut m = Mock::new(screens);
+    landing(&mut m);
     m.vanish_after = Some(4);
     m.cursor_on_caret = true;
     m.task = working_task();
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         tasks: Some(tasks.clone()),
         ..auto(30)
@@ -22666,118 +23333,115 @@ fn a_sleep_after_the_done_marks_nothing_more_at_the_hosts_short_turn() {
     let woke = s.wake_settle.is_some();
     drop(s);
     let lines = String::from_utf8(out).expect("utf-8");
-    assert!(woke, "the Mac slept after the done: {lines}");
+    assert!(woke, "the Mac slept after the landing: {lines}");
     assert_eq!(host.steps.load(Ordering::SeqCst), 1, "the notice: {lines}");
     let path = tasks.join("s-1-1.result.md");
     assert_eq!(
         task_marks(&m),
-        [done_mark("marker", "Fixed the parser.".len(), &path)],
+        [done_mark("landed", landed_result().len(), &path)],
         "{lines}"
     );
+    assert_eq!(m.turns, 1, "Land's instruction alone: {lines}");
     assert_eq!(
         std::fs::read_to_string(&path).expect("snapshot"),
-        "Fixed the parser."
+        landed_result()
     );
 }
 
-/// A LOOP THAT STARTS AT A POINT ANOTHER LOOP'S CHECK ANSWERED (another
-/// supervisor's hand-back, which typed the check and marks nothing; the
-/// harness's fault restart; a seamless update's successor) follows no act of
-/// its own there, yet the worker answered the check: the done is published
-/// `why=done-check` with the REPORT before the check, then the reply's words
-/// where it said more than the marker. NEGATIVE CONTROL: the same reply
-/// ending a turn of the worker's own (no check before it) is the marker's,
-/// and is that reply alone.
+/// AN OLDER BUILD'S `done` IS NO LANDING: a loop that starts on a record an
+/// older build marked done by its marker or its done check (`why=marker`,
+/// `why=done-check`) takes nothing on — the task goes on to Land's landing,
+/// and the record is opened again and marked done with the landing's
+/// result (`why=landed`). NEGATIVE CONTROL: the loop started on a record
+/// still `working` marks only the landing.
 #[test]
-fn a_loop_started_at_a_check_answered_point_publishes_the_report() {
-    let root = crate::supervise::ScratchDir::new("task", "fresh-check");
-    let report = "Fixed the parser; all 12 tests pass.";
-    let verified = format!("{report}\n\nVerified again: green.");
-    for (i, (reply, result)) in [
-        ("ATERM-TASK-DONE", report),
-        ("Verified again: green.\nATERM-TASK-DONE", verified.as_str()),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let tasks = root.join(format!("tasks-{i}"));
-        let text = transcript_of(&[
-            task_row("user", "u-task", "", "Fix the parser."),
-            task_row("assistant", "a-report", "msg_1", report),
-            task_row("user", "u-check", "", DONE_CHECK),
-            task_row("assistant", "a-reply", "msg_2", reply),
-        ]);
-        let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
-        let mut m = Mock::new(vec![ended(reply)]);
-        m.vanish_after = Some(2);
-        m.task = working_task();
-        let lines = tasked_watch(&mut m, &host, &tasks, None);
-        let path = tasks.join("s-1-1.result.md");
-        assert_eq!(
-            task_marks(&m),
-            [done_mark("done-check", result.len(), &path)],
-            "{reply:?}: {lines:#?}"
-        );
-        assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), result);
-    }
-    // NEGATIVE CONTROL: no check before it.
-    let tasks = root.join("tasks-own");
-    let reply = "Verified again: green.\nATERM-TASK-DONE";
-    let text = transcript_of(&[
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row("assistant", "a-reply", "msg_2", reply),
-    ]);
+fn an_older_builds_done_record_is_opened_again_and_the_landing_published() {
+    let root = crate::supervise::ScratchDir::new("task", "older-done");
+    let tasks = root.join("tasks");
+    let text = transcript_of(&landing_rows(&landed_reply()));
     let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
-    let mut m = Mock::new(vec![ended(reply)]);
-    m.vanish_after = Some(2);
-    m.task = working_task();
-    let _ = tasked_watch(&mut m, &host, &tasks, None);
-    let path = tasks.join("s-1-1.result.md");
-    assert_eq!(
-        task_marks(&m),
-        [done_mark("marker", "Verified again: green.".len(), &path)]
-    );
-}
-
-/// A LOOP STARTED ON A PUBLISHED DONE TAKES IT ON: a loop that starts at a
-/// point a loop before it published (the record reads `done`) meets the
-/// worker's answer to the earlier check (`Yes, it's all done.`), which its
-/// policy alone would read as a first done report and check. The record,
-/// read once at the loop's first fold, makes the done this loop's: neither
-/// the check nor a continuation is typed, nothing is held back (no `SKIPPED`
-/// line: the check is never decided), no `DONE` line is said again, and
-/// nothing is marked — though the run stays on for several more waits at
-/// that point. NEGATIVE CONTROL: the record still `working` (no loop
-/// published the done), the check is typed.
-#[test]
-fn a_loop_started_at_a_published_done_types_no_check() {
-    let root = crate::supervise::ScratchDir::new("task", "held-check");
-    let text = transcript_of(&[
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row("assistant", "a-report", "msg_1", "Fixed the parser."),
-        task_row("user", "u-check", "", DONE_CHECK),
-        task_row("assistant", "a-reply", "msg_2", "Yes, it's all done."),
-    ]);
-    let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
-    let published = Some((
-        2,
-        format!(
-            "state=done from=ctl since_ms=0 result_bytes=17 why=done-check result_path={}",
-            aterm_codec::pct::encode(&root.join("tasks/s-1-1.result.md").to_string_lossy())
-        ),
-    ));
     let run = |task: Option<(u64, String)>| {
+        let mut m = Mock::new(landing_screens(&landed_reply()));
+        landing(&mut m);
+        m.vanish_after = Some(4);
+        m.task = task;
+        let lines = tasked_watch(&mut m, &host, &tasks, None);
+        (task_marks(&m), lines)
+    };
+    for why in ["marker", "done-check"] {
+        let older = Some((
+            2,
+            format!("state=done from=ctl since_ms=0 result_bytes=17 why={why}"),
+        ));
+        let (marks, lines) = run(older);
+        // Opened again, under the record's next rev.
+        let path = tasks.join("s-1-3.result.md");
+        assert_eq!(
+            marks.last(),
+            Some(&done_mark("landed", landed_result().len(), &path)),
+            "why={why}: {marks:#?} {lines:#?}"
+        );
+        assert!(
+            marks.len() >= 2 && marks[0].starts_with("task mark working"),
+            "why={why}: opened again first: {marks:#?}"
+        );
+    }
+    // NEGATIVE CONTROL: the record still `working`.
+    let working = Some((
+        2,
+        "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+    ));
+    let (marks, lines) = run(working);
+    let path = tasks.join("s-1-2.result.md");
+    assert_eq!(
+        marks,
+        [done_mark("landed", landed_result().len(), &path)],
+        "{lines:#?}"
+    );
+}
+
+/// A LOOP STARTED ON A PUBLISHED LANDING TAKES IT ON: a loop that starts at
+/// the point a loop before it landed and published (the record reads
+/// `done`) meets the defense with no Land act of its own before it, which
+/// its policy alone would answer with Land's instruction. The record, read
+/// once at the loop's first fold, makes the landing this loop's: nothing is
+/// typed, nothing is held back (no `SKIPPED` line: no act is decided), no
+/// `DONE` line is said again, and nothing is marked — though the run stays
+/// on for several more waits at that point. NEGATIVE CONTROLS: the record
+/// still `working` (no loop published a landing), Land's instruction is
+/// typed; so is it at an older build's `done` record (`why=marker`,
+/// `why=done-check`: no landing); and under Cruise no record is done — the
+/// defense is a done claim, and Cruise's defend prompt is typed.
+#[test]
+fn a_loop_started_at_a_published_landing_types_nothing() {
+    let root = crate::supervise::ScratchDir::new("task", "held-check");
+    let text = transcript_of(&landing_rows(&landed_reply()));
+    let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
+    let record = |why: &str| {
+        Some((
+            2,
+            format!(
+                "state=done from=ctl since_ms=0 result_bytes={} why={why} result_path={}",
+                landed_result().len(),
+                aterm_codec::pct::encode(&root.join("tasks/s-1-1.result.md").to_string_lossy())
+            ),
+        ))
+    };
+    let published = record("landed");
+    let run = |task: Option<(u64, String)>, word: &'static str| {
         let journal = root.join(format!(
-            "journal-{}.jsonl",
+            "journal-{word}-{}.jsonl",
             task.as_ref().map_or(0, |t| t.0)
         ));
-        let mut m = Mock::new(vec![ended("Yes, it's all done.")]);
+        let mut m = Mock::new(vec![ended(&landed_reply())]);
+        m.history_served();
+        m.autopilot = Some(word);
         // Several waits at the point past the read: a decision made again
         // there would read again, and type.
         m.vanish_after = Some(6);
         m.task = task;
         let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             journal: Some(journal.clone()),
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             tasks: Some(root.join("tasks")),
@@ -22811,7 +23475,14 @@ fn a_loop_started_at_a_published_done_types_no_check() {
             .collect::<std::collections::BTreeSet<_>>()
             .len()
     };
-    let (m, lines) = run(published.clone());
+    let typed = |lines: &[String], rule: &str| {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("CONTINUED ") && l.contains(&format!("rule={rule} ")))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    };
+    let (m, lines) = run(published.clone(), "land");
     assert!(m.stalls >= 6, "the run stayed past the read: {}", m.stalls);
     assert_eq!(said(&lines, "CONTINUED "), 0, "{lines:#?}");
     assert_eq!(said(&lines, "SKIPPED "), 0, "never decided: {lines:#?}");
@@ -22823,17 +23494,26 @@ fn a_loop_started_at_a_published_done_types_no_check() {
     assert_eq!(m.task_requests, ["task"], "read once: {lines:#?}");
     assert_eq!(m.task, published, "the record stands");
     // NEGATIVE CONTROL: the record still `working`.
-    let (m, lines) = run(working_task());
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.starts_with("CONTINUED ") && l.contains(RULE_DONE_CHECK))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        1,
-        "{lines:#?}"
-    );
+    let (m, lines) = run(working_task(), "land");
+    assert_eq!(typed(&lines, RULE_LAND), 1, "{lines:#?}");
     assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
+    // NEGATIVE CONTROL: an older build's `done` (its marker or its check, no
+    // landing) is no landing to take on: Land's instruction is typed.
+    for why in ["marker", "done-check"] {
+        let (_, lines) = run(record(why), "land");
+        assert_eq!(typed(&lines, RULE_LAND), 1, "why={why}: {lines:#?}");
+    }
+    // NEGATIVE CONTROL: Cruise takes no `done` record on.
+    let (m, lines) = run(published, "cruise");
+    assert!(typed(&lines, RULE_DONE_CHECK) >= 1, "{lines:#?}");
+    assert_eq!(said(&lines, "DONE "), 0, "{lines:#?}");
+    assert!(
+        !task_marks(&m)
+            .iter()
+            .any(|r| r.starts_with("task mark done")),
+        "{:?}",
+        m.task_requests
+    );
 }
 
 /// A RETRY'S WALL WHOSE NOTICE LEFT WITHHOLDS THE HOST'S STEP as it holds the
@@ -23418,7 +24098,7 @@ fn panel_left_owed(ledger: &Path) -> Mock {
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         ledger: Some(ledger.to_path_buf()),
         policy: probe_policy(120),
-        ..SuperviseOpts::hosted()
+        ..SuperviseOpts::hosted_with(&owners_policy())
     };
     let mut out: Vec<u8> = Vec::new();
     {
@@ -23746,277 +24426,40 @@ fn an_off_sessions_one_close_promises_no_second_escape_and_waits_on_no_hold() {
     assert!(!cruise.owed);
 }
 
-/// THE HELD CHECK IS READ ONCE A POINT: the backstop for a loop whose first
-/// read of the record was not served — the check decided at a point where the
-/// record reads `done` is held back and said once, and decided again at the
-/// same point it reads nothing more (the per-point memo); at a new point it
-/// reads the record again. NEGATIVE CONTROL: a record still `working` lets the
-/// check go.
+/// A LANDING WHOSE MARK WAS TURNED AWAY IS ASKED FOR AGAIN (a seamless
+/// update committing answered `ERR busy`): the point decided again asks
+/// again, the record ends `done`, and the landing is said once (`DONE`).
+/// NEGATIVE CONTROL: the mark served at once is asked for once.
 #[test]
-fn the_held_check_reads_the_record_once_a_point() {
-    let rows = ended("Yes, it's all done.");
-    let reading = |worked| {
-        TurnEndReading::of(
-            &aterm_phase::read(Some("claude"), &rows, Some(2)),
-            &rows,
-            false,
-            worked,
-            None,
-            None,
-        )
-    };
-    let published = Some((
-        2,
-        "state=done from=ctl since_ms=0 result_bytes=17 why=done-check".to_string(),
-    ));
-    let mut m = Mock::new(vec![rows.clone()]);
-    m.task = published;
-    let mut heard = Heard::default();
-    let t = Instant::now();
-    {
-        let mut s = session(&mut m, Some("@s-1".to_string()));
-        s.turn_end
-            .observe(&reading(Some(Duration::from_secs(300))), t);
-        for _ in 0..3 {
-            assert!(s.check_into_done_task(5, &mut heard).expect("served"));
-        }
-        // A new point: someone else's turn ended.
-        s.turn_end.observe(
-            &reading(Some(Duration::from_secs(300))),
-            t + Duration::from_secs(600),
-        );
-        assert!(s.check_into_done_task(6, &mut heard).expect("served"));
-    }
-    assert_eq!(m.task_requests, ["task", "task"], "once a point");
-    let held: Vec<&String> = heard
-        .noted
-        .iter()
-        .filter(|l| l.starts_with("SKIPPED ") && l.contains(RULE_DONE_CHECK))
-        .collect();
-    assert_eq!(held.len(), 2, "{held:#?}");
-    // NEGATIVE CONTROL: `working`.
-    let mut m = Mock::new(vec![rows.clone()]);
-    m.task = working_task();
-    let mut s = session(&mut m, Some("@s-1".to_string()));
-    s.turn_end
-        .observe(&reading(Some(Duration::from_secs(300))), t);
-    assert!(!s.check_into_done_task(5, &mut heard).expect("served"));
-}
-
-/// [`ended`] over a shell the turn left running: Claude Code's done row
-/// counts it, and so does the footer's pill.
-fn ended_over_shell(said: &str) -> Vec<String> {
-    let mut r = rows(&[
-        &format!("⏺ {said}"),
-        "",
-        "✻ Worked for 3m 2s · done 4:24 PM · 1 shell still running",
-        "",
-    ]);
-    r.extend(composer(
-        "  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage",
-    ));
-    r
-}
-
-/// THE MARKER OVER A RUNNING SHELL ENDS THE TASK AT ONCE (design §2.4): a
-/// worker that ends its report with ATERM-TASK-DONE while a shell it left
-/// still runs — a dev server that never ends — is published `done
-/// why=marker` with that turn's report at the busy read, and its DONE line
-/// names that read. The shell ending later with no turn since leaves the
-/// same point: nothing is read or marked again. NEGATIVE CONTROL: the same
-/// shell under prose with no marker publishes nothing (the busy screen is no
-/// point), and before this the marker there was never read while the shell
-/// ran.
-#[test]
-fn the_marker_over_a_running_shell_is_published_at_once() {
-    let root = crate::supervise::ScratchDir::new("task", "shell");
-    let report = "Started the dev server; the parser is fixed.";
-    let marked = format!("{report}\nATERM-TASK-DONE");
-    let (m, tasks, lines) = shell_run(
-        &root,
-        &marked,
-        vec![busy_screen(), ended_over_shell(&marked)],
-        "runs",
-        0,
-    );
-    let path = tasks.join("s-1-1.result.md");
-    assert_eq!(
-        task_marks(&m),
-        [done_mark("marker", report.len(), &path)],
-        "{:?}",
-        m.task_requests
-    );
-    assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), report);
-    // The busy read over the shell is the second screen served.
-    assert_eq!(
-        said_at(&lines, "DONE "),
-        [(102, RULE_FINISHED.to_string())],
-        "{lines:#?}"
-    );
-    // The shell ends, no turn since: the same point.
-    let (m, _, lines) = shell_run(
-        &root,
-        &marked,
-        vec![busy_screen(), ended_over_shell(&marked), ended(&marked)],
-        "ends",
-        0,
-    );
-    assert_eq!(task_marks(&m).len(), 1, "{:?}", m.task_requests);
-    assert_eq!(said_at(&lines, "DONE ").len(), 1, "{lines:#?}");
-    // NEGATIVE CONTROL: no marker.
-    let (m, _, lines) = shell_run(
-        &root,
-        &marked,
-        vec![busy_screen(), ended_over_shell("Started the dev server.")],
-        "prose",
-        0,
-    );
-    assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
-    assert!(said_at(&lines, "DONE ").is_empty(), "{lines:#?}");
-}
-
-/// A `watch` of a worker whose turn ended with `marked` as its report, over
-/// `screens`, its record `working` and its first `busy` marks refused `ERR
-/// busy`: the Mock, the results directory and the journal's lines.
-fn shell_run(
-    root: &crate::supervise::ScratchDir,
-    marked: &str,
-    screens: Vec<Vec<String>>,
-    tag: &str,
-    busy: usize,
-) -> (Mock, PathBuf, Vec<String>) {
-    let text = transcript_of(&[
-        task_row("user", "u-task", "", "Fix the parser."),
-        task_row("assistant", "a-1", "msg_1", marked),
-    ]);
-    let host = TaskHost::reading(&root.join(format!("t-{tag}.jsonl")), &[&text]);
-    let tasks = root.join(format!("tasks-{tag}"));
-    let journal = root.join(format!("journal-{tag}.jsonl"));
-    let mut m = Mock::new(screens);
-    m.vanish_after = Some(4);
-    m.task = working_task();
-    m.task_busy = busy;
-    let _ = tasked_watch(&mut m, &host, &tasks, Some(&journal));
-    let lines = journal_records(&journal)
-        .0
-        .into_iter()
-        .map(|r| r.line)
-        .collect();
-    (m, tasks, lines)
-}
-
-/// The `(seq, rule)` of each journal line that starts with `kind`
-/// (`<KIND> seq=<n> rule=<r> …`).
-fn said_at(lines: &[String], kind: &str) -> Vec<(u64, String)> {
-    lines
-        .iter()
-        .filter_map(|l| l.strip_prefix(kind))
-        .filter_map(|rest| {
-            let mut words = rest.split_whitespace();
-            let seq = words.next()?.strip_prefix("seq=")?.parse().ok()?;
-            let rule = words.next()?.strip_prefix("rule=")?.to_string();
-            Some((seq, rule))
-        })
-        .collect()
-}
-
-/// [`ended_over_shell`]'s screen once the shell has ended and Claude Code
-/// woke itself — `opener` the row that opened the turn running now (its
-/// own notice of the shell's end, or a person's message) — while that turn
-/// runs.
-fn woke_over(marked: &str, opener: &str) -> Vec<String> {
-    let mut r = rows(&[
-        &format!("⏺ {marked}"),
-        "",
-        "✻ Worked for 3m 2s · done 4:24 PM · 1 shell still running",
-        opener,
-        "⏺ The dev server stopped; the parser change stands.",
-        "",
-        "✻ Synthesizing… (18s)",
-        "",
-    ]);
-    r.extend(composer("  esc to interrupt"));
-    r
-}
-
-/// THE AGENT'S OWN WAKE AT THE SHELL'S END IS PART OF THE FINISHED TASK
-/// (design §2.2): the worker's done published over the shell, Claude Code
-/// wakes itself when the shell ends (`⏺ Background command "…" completed`)
-/// and replies with no message of anyone's — said once (`WOKE`), and
-/// nothing typed, marked or published for it: the record stays `done` at
-/// its rev with the task's own report. NEGATIVE CONTROL: the same turn
-/// opened by a person's message (`❯ …`) is theirs — the record opened again
-/// (`working why=turn`).
-#[test]
-fn the_agents_own_wake_at_the_shells_end_types_and_publishes_nothing() {
-    let root = crate::supervise::ScratchDir::new("task", "wake");
-    let report = "Started the dev server; the parser is fixed.";
-    let marked = format!("{report}\nATERM-TASK-DONE");
-    let after = "The dev server stopped; the parser change stands.";
-    let wake = "⏺ Background command \"npm run dev\" completed (exit code 0)";
-    let (m, tasks, lines) = shell_run(
-        &root,
-        &marked,
-        vec![
-            busy_screen(),
-            ended_over_shell(&marked),
-            woke_over(&marked, wake),
-            ended(after),
-        ],
-        "woke",
-        0,
-    );
-    let path = tasks.join("s-1-1.result.md");
-    assert_eq!(
-        task_marks(&m),
-        [done_mark("marker", report.len(), &path)],
-        "{:?}",
-        m.task_requests
-    );
-    assert_eq!(m.task.as_ref().map(|t| t.0), Some(2), "the done's rev");
-    assert_eq!(said_at(&lines, "WOKE ").len(), 1, "{lines:#?}");
-    assert_eq!(said_at(&lines, "DONE ").len(), 1, "{lines:#?}");
-    assert_eq!(m.turns, 0, "nothing typed: {lines:#?}");
-    assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), report);
-    // NEGATIVE CONTROL: a person's message opened it.
-    let (m, _, lines) = shell_run(
-        &root,
-        &marked,
-        vec![
-            busy_screen(),
-            ended_over_shell(&marked),
-            woke_over(&marked, "❯ Also stop the dev server."),
-            ended(after),
-        ],
-        "asked",
-        0,
-    );
-    assert!(said_at(&lines, "WOKE ").is_empty(), "{lines:#?}");
-    assert!(
-        task_marks(&m)
-            .iter()
-            .any(|r| r == "task mark working why=turn"),
-        "{:?}",
-        m.task_requests
-    );
-}
-
-/// A DONE OVER A SHELL WHOSE MARK WENT UNSERVED IS ASKED FOR AGAIN at the
-/// next read of the busy screen (a seamless update committing answered `ERR
-/// busy`): the next point is the shell's end, which a dev server never
-/// reaches, and the manager would wait on it. Said once. NEGATIVE CONTROL:
-/// the mark served at once is asked for once.
-#[test]
-fn a_done_over_a_shell_not_marked_is_asked_for_again_at_the_next_read() {
+fn a_landings_mark_turned_away_is_asked_for_again() {
     let root = crate::supervise::ScratchDir::new("task", "busy");
-    let report = "Started the dev server; the parser is fixed.";
-    let marked = format!("{report}\nATERM-TASK-DONE");
-    let screens = || vec![busy_screen(), ended_over_shell(&marked)];
-    let (m, tasks, lines) = shell_run(&root, &marked, screens(), "refused", 1);
-    let mark = |tasks: &Path| done_mark("marker", report.len(), &tasks.join("s-1-1.result.md"));
+    let text = transcript_of(&landing_rows(&landed_reply()));
+    let run = |busy: usize, tag: &str| {
+        let host = TaskHost::reading(&root.join(format!("t-{tag}.jsonl")), &[&text]);
+        let tasks = root.join(format!("tasks-{tag}"));
+        let journal = root.join(format!("journal-{tag}.jsonl"));
+        let mut m = Mock::new(landing_screens(&landed_reply()));
+        landing(&mut m);
+        m.vanish_after = Some(4);
+        m.task = working_task();
+        m.task_busy = busy;
+        let _ = tasked_watch(&mut m, &host, &tasks, Some(&journal));
+        let dones = journal_records(&journal)
+            .0
+            .into_iter()
+            .filter(|r| r.line.starts_with("DONE "))
+            .count();
+        let mark = done_mark(
+            "landed",
+            landed_result().len(),
+            &tasks.join("s-1-1.result.md"),
+        );
+        (m, mark, dones)
+    };
+    let (m, mark, dones) = run(1, "refused");
     assert_eq!(
         task_marks(&m),
-        [mark(&tasks), mark(&tasks)],
+        [mark.clone(), mark],
         "{:?}",
         m.task_requests
     );
@@ -24027,10 +24470,10 @@ fn a_done_over_a_shell_not_marked_is_asked_for_again_at_the_next_read() {
         "{:?}",
         m.task
     );
-    assert_eq!(said_at(&lines, "DONE ").len(), 1, "{lines:#?}");
+    assert_eq!(dones, 1);
     // NEGATIVE CONTROL: served at once.
-    let (m, tasks, _) = shell_run(&root, &marked, screens(), "served", 0);
-    assert_eq!(task_marks(&m), [mark(&tasks)], "{:?}", m.task_requests);
+    let (m, mark, _) = run(0, "served");
+    assert_eq!(task_marks(&m), [mark], "{:?}", m.task_requests);
 }
 
 /// A LOOP STARTED ON A `done` RECORD AT A WALL STILL ACTS ON THE WALL: a done
@@ -24038,25 +24481,29 @@ fn a_done_over_a_shell_not_marked_is_asked_for_again_at_the_next_read() {
 /// else's turn after the done (a follow-up the server did not reopen on).
 /// Taken on as done, the retry was never typed; here the record is opened
 /// again (`working why=turn`) and the retry goes. NEGATIVE CONTROL: the same
-/// loop on a plain done screen takes the done on and types nothing.
+/// loop on a plain screen whose reply is a clean defense takes the landing
+/// on and types nothing. (Under Land: Cruise takes no `done` record on at
+/// all.)
 #[test]
 fn a_loop_started_on_a_done_record_at_a_wall_still_types_the_retry() {
     let root = crate::supervise::ScratchDir::new("task", "seed-wall");
     let published = Some((
         2,
-        "state=done from=ctl since_ms=0 result_bytes=17 why=marker".to_string(),
+        "state=done from=ctl since_ms=0 result_bytes=17 why=landed".to_string(),
     ));
     let run = |screens: Vec<Vec<String>>, screens_held: bool, tag: &str| {
         let host = TaskHost::reading(&root.join("t.jsonl"), &[""]);
         let mut m = Mock::new(screens);
+        m.history_served();
         // The wall's screen sits until a `turn` is typed; the run ends at
         // the wait after one, or after a few waits with none.
         m.turn_releases = (screens_held).then_some(0);
         m.exit_when = Some(|m| m.turns > 0 || m.stalls >= 3);
         m.vanish_after = Some(3);
+        m.autopilot = Some("land");
         m.task = published.clone();
         let opts = SuperviseOpts {
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             tasks: Some(root.join(format!("tasks-{tag}"))),
             ..auto(30)
@@ -24098,7 +24545,13 @@ fn a_loop_started_on_a_done_record_at_a_wall_still_types_the_retry() {
         m.task_requests
     );
     // NEGATIVE CONTROL: a plain done screen.
-    let (m, lines) = run(vec![ended("Yes, it's all done.")], false, "plain");
+    let (m, lines) = run(
+        vec![ended(
+            "Yes, it's all done.\nNothing left: it is merged into the remote main branch.",
+        )],
+        false,
+        "plain",
+    );
     assert!(
         !lines.iter().any(|l| l.starts_with("CONTINUED ")),
         "{lines:#?}"
@@ -24120,11 +24573,11 @@ fn a_seed_read_served_after_the_loop_acted_reads_nothing_into_the_point() {
     let root = crate::supervise::ScratchDir::new("task", "seed-owed");
     let published = Some((
         2,
-        "state=done from=ctl since_ms=0 result_bytes=17 why=marker".to_string(),
+        "state=done from=ctl since_ms=0 result_bytes=17 why=landed".to_string(),
     ));
     let host = TaskHost::reading(&root.join("t.jsonl"), &[""]);
     let opts = SuperviseOpts {
-        policy: SupervisorConfig::default(),
+        policy: owners_policy(),
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         tasks: Some(root.join("tasks")),
         ..auto(30)
@@ -24322,7 +24775,7 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
         policy: SupervisorConfig {
             model_fallback: None,
             usage_credits: true,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -24515,7 +24968,7 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
         policy: SupervisorConfig {
             model_fallback: None,
             usage_credits: true,
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -24867,7 +25320,7 @@ fn a_restart_of_another_kind_begins_a_run_of_its_own() {
         *host.tail.lock().unwrap() = Some(met.clone());
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             ..auto(30)
         };
         let (dir, ledger) = ledger_at(&format!("restart-kinds-{n}"));
@@ -25081,7 +25534,7 @@ fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() 
         *host.tail.lock().unwrap() = Some(transcript.to_string());
         let opts = SuperviseOpts {
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            policy: SupervisorConfig::default(),
+            policy: owners_policy(),
             ..auto(30)
         };
         (host, opts)
@@ -25280,7 +25733,7 @@ fn paste_person_run(text: &str, shown: &str, setup: impl FnOnce(&mut Mock)) -> (
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             continue_text: text.to_string(),
-            ..SupervisorConfig::default()
+            ..owners_policy()
         },
         ..auto(30)
     };
@@ -25500,6 +25953,9 @@ struct LatchHost {
     sid: &'static str,
     peer: Option<&'static str>,
     blind: bool,
+    /// The login comes back in this tab right after this one takes its
+    /// sign-in: the owner signed in elsewhere.
+    back_in: Option<&'static str>,
     said: std::sync::Mutex<Vec<String>>,
 }
 
@@ -25510,6 +25966,7 @@ impl LatchHost {
             sid,
             peer: None,
             blind: false,
+            back_in: None,
             said: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -25544,6 +26001,12 @@ impl IdleHost for LatchHost {
         {
             let read = self.latches.shared(LATCH_KEY, peer);
             self.said.lock().unwrap().push(format!("{peer}:{read:?}"));
+        }
+        if carried.is_ok()
+            && let Some(by) = self.back_in
+        {
+            self.latches.back(LATCH_KEY, by);
+            self.said.lock().unwrap().push(format!("back in {by}"));
         }
         carried
     }
@@ -25643,6 +26106,11 @@ fn one_sign_in_per_login_however_many_tabs_share_it() {
         ],
     );
     assert_eq!(typed(&lines, RULE_LOGIN), 1, "{lines:#?}");
+    assert_eq!(
+        typed(&lines, RULE_LOGIN_BACK),
+        0,
+        "back where it was carried: {lines:#?}"
+    );
     let said = a.said();
     let carried_by_1 = Some(LoginShared::Carried {
         by: "@1".to_string(),
@@ -25769,6 +26237,270 @@ fn one_sign_in_per_login_however_many_tabs_share_it() {
         assert!(host.said().iter().any(|line| line == "abandon"));
         assert_eq!(latches.shared(LATCH_KEY, "@2"), None);
         assert_eq!(latches.carry(LATCH_KEY, "@2"), Ok(()));
+    }
+}
+
+/// THE CARRIER'S TURN IS DELIVERED AGAIN WHERE THE LOGIN CAME BACK ELSEWHERE
+/// (the review of the login carry, 2026-10-20: the tab whose `/login` was
+/// the login's one sign-in never read the login back once the owner signed
+/// in in another tab, and its turn stayed stopped under the owner's notice).
+/// Tab @1 meets the lost login and types `/login`; the owner signs in in tab
+/// @2 meanwhile. While @1's dialog stands the owner is told to close it
+/// (`login-back-dialog`, never a sign-in asked of a login that is back: the
+/// review's harness-login-misled-dialog), and nothing is typed into it (the
+/// dialog takes no keys of the loop's); once that `/login` is left (`Login
+/// interrupted`), @1's turn is delivered again, once (`login-back@v1`), with
+/// no notice of a sign-in cancelled, and its loss ends as its turn works on.
+/// NEGATIVE CONTROL: with the login back nowhere, the dialog is told as the
+/// sign-in to finish, its `Login interrupted` as a sign-in cancelled, and
+/// nothing is typed into it.
+#[test]
+fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
+    let wall_row = |r: &String| r.trim_end() == "❯ /login";
+    let dialog = handoff();
+    let at = dialog.iter().position(wall_row).expect("the /login row");
+    let mut lost: Vec<String> = dialog[..at].to_vec();
+    while lost.last().is_some_and(|r| r.trim().is_empty()) {
+        lost.pop();
+    }
+    lost.push(String::new());
+    lost.extend(composer("  ? for shortcuts"));
+    let left = login_left_from(&dialog);
+    let run = |back_in: Option<&'static str>| {
+        let latches = Arc::new(LoginLatches::default());
+        let host = Arc::new(LatchHost {
+            back_in,
+            ..LatchHost::tab(&latches, "@1")
+        });
+        let tag = if back_in.is_some() { "back" } else { "none" };
+        let (dir, path) = journal_file(&format!("te-carrier-{tag}"));
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            lost.clone(),
+            dialog.clone(),
+            dialog.clone(),
+            left.clone(),
+            busy_screen(),
+            ended("Pushed."),
+        ]);
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(2);
+        let mut opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(path.clone()),
+            ..hosted(30)
+        };
+        opts.policy.continue_policy = false;
+        let (lines, _) = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let notices: Vec<String> = records
+            .iter()
+            .filter(|r| r.kind == "exception")
+            .filter_map(|r| {
+                r.summary
+                    .split_whitespace()
+                    .find_map(|w| w.strip_prefix("notice="))
+                    .map(str::to_string)
+            })
+            .collect();
+        let typed = |rule: &str| {
+            lines
+                .iter()
+                .filter(|l| {
+                    (l.starts_with("TYPED ") || l.starts_with("CONTINUED "))
+                        && l.contains(&format!(" rule={rule}"))
+                })
+                .count()
+        };
+        let counts = (typed(RULE_LOGIN), typed(RULE_LOGIN_BACK));
+        let log = format!("{lines:#?}\n{records:#?}\n{:#?}", host.said());
+        (notices, counts, host.said(), latches, log)
+    };
+    let (notices, (logins, backs), said, latches, log) = run(Some("@2"));
+    assert_eq!(logins, 1, "`/login` once: {log}");
+    assert_eq!(backs, 1, "the turn delivered again, once: {log}");
+    assert_eq!(
+        notices,
+        ["login-back-dialog"],
+        "the dialog to close, no sign-in, none cancelled: {log}"
+    );
+    assert_eq!(said.last().map(String::as_str), Some("back"), "{log}");
+    assert_eq!(
+        latches.shared(LATCH_KEY, "@1"),
+        None,
+        "its loss over: {log}"
+    );
+    // NEGATIVE CONTROL: the login back nowhere.
+    let (notices, (logins, backs), _, _, log) = run(None);
+    assert_eq!(logins, 1, "{log}");
+    assert_eq!(backs, 0, "nothing typed into the left sign-in: {log}");
+    assert_eq!(notices, ["login-sign-in", "login-cancelled"], "{log}");
+}
+
+/// `rows` up to its `❯ /login` row, then `⎿  Login interrupted` under it and
+/// the composer back: Esc out of that `/login`'s dialog.
+fn login_left_from(dialog: &[String]) -> Vec<String> {
+    let typed = dialog
+        .iter()
+        .position(|r| r.trim_end() == "❯ /login")
+        .expect("the /login row");
+    let mut r = dialog[..=typed].to_vec();
+    r.push("  ⎿  Login interrupted".to_string());
+    r.push(String::new());
+    r.extend(composer("  ? for shortcuts"));
+    r
+}
+
+/// `rows` with the lost login's row above its `/login` made a person's own
+/// Esc (`Interrupted · What should Claude do instead?`): the same dialog,
+/// typed at no lost login.
+fn at_no_wall(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .map(|r| {
+            if r.contains("Not logged in · Please run /login") {
+                "  ⎿  Interrupted · What should Claude do instead?".to_string()
+            } else {
+                r.clone()
+            }
+        })
+        .collect()
+}
+
+/// A LOOP THAT STARTS WHILE A `/login` A LOOP BEFORE IT TYPED STILL STANDS
+/// (the login-carry review, 2026-10-20: Off and back over the browser
+/// hand-off withdrew the owner's notice, and at `Login interrupted` the new
+/// loop typed `keep going` and a second `/login` into the same loss; its
+/// first read, before any `status`, took the dialog for no program's, as no
+/// composer frame names Claude Code while it stands). The ledger's last
+/// act is that `/login`; the new loop never typed one. At each of its
+/// dialog's screens — the browser hand-off, the method picker, and Esc out of
+/// either (`Login interrupted`) — the notice stands as it does for the loop
+/// that typed it (the sign-in; the method left to the owner; the sign-in
+/// cancelled), nothing is typed (no continuation, no second `/login`), and
+/// where the dialog stands the login's one sign-in is this tab's again
+/// (`login_carry`). NEGATIVE CONTROL: the same screens with no lost login
+/// above the `/login` (a person's own, after their own Esc) raise no login
+/// notice, and take no sign-in.
+#[test]
+fn a_loop_started_inside_the_login_a_loop_before_typed_carries_it_on() {
+    use crate::supervise::approvals::{Outcome, Row};
+    use aterm_phase::prompt::fixtures::{LOGIN_PICKER_WARNED, screen};
+    let picker = screen(LOGIN_PICKER_WARNED);
+    let typed_before = || {
+        let now_ms = crate::supervise::journal::unix_ms();
+        let point = Row {
+            rule_id: crate::supervise::approvals::RULE_POINT,
+            outcome: Outcome::Waiting,
+            command: "",
+            reason: "the turn-end policy judged the point (short turns in a row: 0)",
+            box_seq: 90,
+        }
+        .to_json(now_ms - 61_000, None);
+        let login = Row {
+            rule_id: RULE_LOGIN,
+            outcome: Outcome::Typed,
+            command: "/login",
+            reason: "the turn-end policy",
+            box_seq: 90,
+        }
+        .to_json(now_ms - 60_000, None);
+        point + "\n" + &login + "\n"
+    };
+    let run = |tag: &str, screens: Vec<Vec<String>>| {
+        let (dir, ledger) = ledger_at(tag);
+        std::fs::write(&ledger, typed_before()).expect("the ledger");
+        let (jdir, journal) = journal_file(&format!("te-{tag}"));
+        let latches = Arc::new(LoginLatches::default());
+        let host = Arc::new(LatchHost::tab(&latches, "@1"));
+        let mut m = Mock::new(screens);
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(journal.clone()),
+            ..hosted(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&jdir);
+        let notices: Vec<String> = records
+            .iter()
+            .filter(|r| r.kind == "exception")
+            .filter_map(|r| {
+                r.summary
+                    .split_whitespace()
+                    .find_map(|w| w.strip_prefix("notice="))
+                    .map(str::to_string)
+            })
+            .collect();
+        let acts: Vec<String> = lines
+            .iter()
+            .filter(|l| l.starts_with("TYPED ") || l.starts_with("CONTINUED "))
+            .cloned()
+            .collect();
+        let log = format!(
+            "{lines:#?}\n{records:#?}\n{:#?}\n{:#?}",
+            host.said(),
+            m.requests
+        );
+        (notices, acts, host.said(), log)
+    };
+    let carried = |said: &[String]| said.iter().any(|s| s == "carry:Ok(())");
+
+    // The browser hand-off, then Esc out of it.
+    let (notices, acts, said, log) = run(
+        "successor-handoff",
+        vec![handoff(), handoff(), login_left_from(&handoff())],
+    );
+    assert_eq!(notices, ["login-sign-in", "login-cancelled"], "{log}");
+    assert!(acts.is_empty(), "nothing typed: {log}");
+    assert!(carried(&said), "the sign-in is this tab's again: {log}");
+    // The method picker (nothing says the method: the owner's), then Esc.
+    let (notices, acts, said, log) = run(
+        "successor-picker",
+        vec![picker.clone(), picker.clone(), login_left_from(&picker)],
+    );
+    assert_eq!(notices, ["login-choose", "login-cancelled"], "{log}");
+    assert!(acts.is_empty(), "nothing typed: {log}");
+    assert!(carried(&said), "{log}");
+    // `Login interrupted` already standing as the loop starts.
+    let (notices, acts, said, log) = run(
+        "successor-left",
+        vec![login_left_from(&handoff()), login_left_from(&handoff())],
+    );
+    assert_eq!(notices, ["login-cancelled"], "{log}");
+    assert!(acts.is_empty(), "nothing typed: {log}");
+    assert!(!carried(&said), "a sign-in left is nobody's: {log}");
+
+    // NEGATIVE CONTROL: the same screens at no lost login.
+    for (tag, screens) in [
+        (
+            "successor-none-handoff",
+            vec![
+                at_no_wall(&handoff()),
+                at_no_wall(&handoff()),
+                at_no_wall(&login_left_from(&handoff())),
+            ],
+        ),
+        (
+            "successor-none-picker",
+            vec![
+                at_no_wall(&picker),
+                at_no_wall(&picker),
+                at_no_wall(&login_left_from(&picker)),
+            ],
+        ),
+    ] {
+        let (notices, acts, said, log) = run(tag, screens);
+        assert!(notices.is_empty(), "no login notice: {log}");
+        assert!(
+            !acts.iter().any(|a| a.ends_with(" /login")),
+            "no /login: {log}"
+        );
+        assert!(!carried(&said), "{log}");
     }
 }
 
@@ -26020,4 +26752,161 @@ fn the_hosts_background_step_is_withheld_on_usage_credits() {
     // NEGATIVE CONTROLS.
     assert_eq!(run(true, true), (1, vec![]));
     assert_eq!(run(false, false), (1, vec![]));
+}
+
+/// A NEED SAID EARLY IN A TALL TURN WHOSE LAST WORDS CLAIM NO DONE IS RAISED
+/// (`TurnEndState::reads_turn_whole`), on every harness: the turn's start —
+/// a `NEEDS YOU:` said there — is above the screen, in the history, and the
+/// last words say the worker goes on. The review of b8/residuals found the
+/// history read only where the last words claimed done, so the need was
+/// never put up, under Cruise and under Land alike: on Claude Code (an
+/// earlier message of the turn, or the head of one tall last message) and on
+/// Gemini CLI (an earlier reply). NEGATIVE CONTROL: the same turn short
+/// enough to fit on the screen raises it too, and the point before it, whose
+/// history holds no need, raises none.
+#[test]
+fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
+    let fit = |mut drawn: Vec<String>, rows: usize| {
+        if drawn.len() > rows {
+            let screen = drawn.split_off(drawn.len() - rows);
+            (screen, drawn)
+        } else {
+            (drawn, Vec::new())
+        }
+    };
+    let claude_turn = |calls: usize| {
+        let mut drawn: Vec<String> = vec![
+            "❯ Fix the parser and land it.".to_string(),
+            String::new(),
+            "⏺ Merged the lexer and its suites.".to_string(),
+            "  NEEDS YOU: the signing credential".to_string(),
+        ];
+        for call in 0..calls {
+            drawn.extend([
+                String::new(),
+                format!("⏺ Bash(git log --oneline -1 branch-{call})"),
+                format!("  ⎿  {call:04}abc merged branch {call}"),
+            ]);
+        }
+        drawn.extend(rows(&[
+            "",
+            "⏺ Fixed the parser; pushing it next.",
+            "",
+            "✻ Worked for 12m 2s · done 4:24 PM",
+            "",
+        ]));
+        drawn.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        fit(drawn, 30)
+    };
+    let claude_message = |lines: usize| {
+        let mut drawn: Vec<String> = vec![
+            "❯ Fix the parser.".to_string(),
+            String::new(),
+            "⏺ NEEDS YOU: the signing credential".to_string(),
+        ];
+        for i in 0..lines {
+            drawn.push(format!("  - merged branch {i:02} and ran its suite"));
+        }
+        drawn.push("  Pushing the parser next.".to_string());
+        drawn.extend(rows(&["", "✻ Worked for 12m 2s · done 4:24 PM", ""]));
+        drawn.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        fit(drawn, 30)
+    };
+    let gemini_turn = |tall: bool| {
+        use aterm_phase::gemini;
+        use aterm_phase::prompt::fixtures::screen;
+        let end = screen(gemini::fixtures::END_OF_TURN);
+        let at = end
+            .iter()
+            .rposition(|r| r.starts_with("✦ "))
+            .expect("the reply");
+        let mut drawn = end[..at].to_vec();
+        drawn.push("✦ NEEDS YOU: the signing credential".to_string());
+        drawn.push("  I will push the branch now.".to_string());
+        drawn.push(String::new());
+        drawn.push("╭────────────────────────────────────────────╮".to_string());
+        for call in 0..(if tall { 60 } else { 1 }) {
+            drawn.push(format!(
+                "│ ✓  Shell git push origin branch-{call:02}             │"
+            ));
+        }
+        drawn.push("╰────────────────────────────────────────────╯".to_string());
+        drawn.push(String::new());
+        drawn.push("✦ I will push the next branch now.".to_string());
+        drawn.extend(end[at + 1..].iter().cloned());
+        if tall {
+            fit(drawn, end.len())
+        } else {
+            (drawn, Vec::new())
+        }
+    };
+    // The loop over [busy, work, busy, the turn]: what it put up, and when.
+    let run = |mock: fn(Vec<Vec<String>>) -> Mock,
+               busy: Vec<String>,
+               work: Vec<String>,
+               word: &'static str,
+               (screen, above): (Vec<String>, Vec<String>)| {
+        let (dir, journal) = journal_file("tall-need");
+        let mut m = mock(vec![busy.clone(), work, busy, screen]);
+        landing(&mut m);
+        m.autopilot = Some(word);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.scrollback = Some(above);
+        m.scrollback_from = Some(3);
+        m.alt_screen = Some(false);
+        m.vanish_after = Some(6);
+        m.stall_sleep = Some(Duration::from_millis(20));
+        let opts = SuperviseOpts {
+            policy: owners_policy(),
+            journal: Some(journal.clone()),
+            ..auto(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                short_backoff: Duration::from_millis(30),
+                short_backoff_max: Duration::from_millis(60),
+                ..TurnEndTiming::default()
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        let raised = m.needs_calls.iter().any(|c| {
+            c.starts_with("set attention owner=needs ") && c.contains("the signing credential")
+        });
+        // The act at the point before the tall turn (seq 102) names no need.
+        let before: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("CONTINUED seq=102 ") && l.contains("NEEDS YOU"))
+            .collect();
+        (raised, before.is_empty(), lines)
+    };
+    for word in ["cruise", "land"] {
+        for (why, turn) in [
+            ("an earlier message", claude_turn(20)),
+            ("a tall message's head", claude_message(40)),
+            ("control: on the screen", claude_turn(1)),
+        ] {
+            let tall = !turn.1.is_empty();
+            let (raised, clean_before, lines) =
+                run(Mock::new, busy_screen(), ended(WORK), word, turn);
+            assert!(raised, "{word} {why} (tall={tall}): {lines:#?}");
+            assert!(clean_before, "{word} {why}: {lines:#?}");
+        }
+    }
+    for tall in [true, false] {
+        use aterm_phase::gemini;
+        use aterm_phase::prompt::fixtures::screen;
+        let turn = gemini_turn(tall);
+        assert_eq!(!turn.1.is_empty(), tall);
+        let (raised, clean_before, lines) = run(
+            gemini_mock,
+            screen(gemini::fixtures::BUSY_THINKING),
+            screen(gemini::fixtures::END_OF_TURN),
+            "cruise",
+            turn,
+        );
+        assert!(raised, "gemini tall={tall}: {lines:#?}");
+        assert!(clean_before, "gemini tall={tall}: {lines:#?}");
+    }
 }

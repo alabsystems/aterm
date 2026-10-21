@@ -29,6 +29,7 @@ fn judge(now: i64) -> Judge {
         now,
         threshold_days: STALE,
         device: None,
+        volume: None,
     }
 }
 
@@ -37,19 +38,120 @@ fn assessed(path: &Path, now: i64) -> TargetDir {
     assess(path, now, STALE, WalkBudget::SHIPPED).expect("a directory")
 }
 
+/// `rel` (`/`-separated) under `base`, one component at a time: under a verbatim `\\?\` base
+/// (what `canonicalize` answers on Windows) a `/` is a character of a name, not a separator.
+fn at(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/').fold(base.to_path_buf(), |p, c| p.join(c))
+}
+
 /// The bytes the blocks of the file at `p` take.
+#[cfg(unix)]
 fn blocks(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::symlink_metadata(p).expect("stat").blocks() * 512
+}
+
+/// The bytes the file at `p` holds allocated (its `FILE_STANDARD_INFO` allocation, read
+/// through its handle): what deleting its last name releases.
+#[cfg(windows)]
+fn blocks(p: &Path) -> u64 {
+    let f = std::fs::File::open(p).expect("open");
+    aterm_dirfd::fstat(&f).expect("stat").allocation
 }
 
 /// Set the mtime of the directory or file at `path` to `at` (unix seconds).
 fn set_mtime(path: &Path, at: i64) {
     let when = std::time::UNIX_EPOCH
         + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
-    std::fs::File::open(path)
-        .and_then(|f| f.set_modified(when))
-        .expect("set mtime");
+    #[cfg(unix)]
+    let file = std::fs::File::open(path);
+    // A directory opens only with backup semantics, and a time is written with
+    // `FILE_WRITE_ATTRIBUTES` alone.
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    file.and_then(|f| f.set_modified(when)).expect("set mtime");
+}
+
+/// `p` without its verbatim `\\?\` prefix: what `cmd` takes as a working directory or a
+/// `mklink` operand.
+#[cfg(windows)]
+fn plain(p: &Path) -> String {
+    let text = p.to_str().expect("test paths are UTF-8");
+    text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
+}
+
+/// A directory link at `link` to the directory `target`: a symlink on unix, a junction on
+/// Windows (`cmd /C mklink /J`, which needs no privilege; it refuses the verbatim spelling
+/// `canonicalize` answers, so the plain one is passed).
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("link");
+    #[cfg(windows)]
+    {
+        let out = aterm_uds::spawnfd::command("cmd")
+            .args(["/C", "mklink", "/J", &plain(link), &plain(target)])
+            .output()
+            .expect("cmd runs");
+        assert!(
+            out.status.success(),
+            "mklink /J {link:?} {target:?}: {out:?}"
+        );
+    }
+}
+
+/// A file under `dir` (made here, 8 KiB) that no delete can take until this is dropped: on
+/// unix its directory made read-only (`0555`); on Windows the file held open without delete
+/// sharing, which refuses a delete of it with a sharing violation.
+struct Stuck {
+    #[cfg(unix)]
+    dir: PathBuf,
+    #[cfg(windows)]
+    _open: std::fs::File,
+}
+
+impl Stuck {
+    fn at(dir: &Path) -> Stuck {
+        std::fs::create_dir_all(dir).expect("stuck dir");
+        let file = dir.join("file");
+        std::fs::write(&file, vec![1u8; 8192]).expect("stuck file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+            Stuck {
+                dir: dir.to_path_buf(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_SHARE_READ: u32 = 1;
+            let open = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&file)
+                .expect("held");
+            Stuck { _open: open }
+        }
+    }
+}
+
+impl Drop for Stuck {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o755));
+        }
+    }
 }
 
 /// Take `lock` exclusively, as a build would, through [`HeldLock::try_take`] so the release
@@ -71,11 +173,13 @@ fn held(lock: &Path) -> bool {
 /// A child forked from another thread and kept short of its exec, holding a copy of every
 /// descriptor open at the fork, as every child does until its exec. [`Parked::fork`] returns
 /// once the child exists; it execs only at [`Parked::exec`] (a handshake over two pipes).
+#[cfg(unix)]
 struct Parked {
     spawner: std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>,
     go: std::io::PipeWriter,
 }
 
+#[cfg(unix)]
 impl Parked {
     fn fork() -> Parked {
         use std::io::Read as _;
@@ -142,7 +246,9 @@ impl Parked {
 /// A build directory with everything a real one also holds and must keep:
 /// the uplifted binary `debug/lay` (a hard link of its `deps/` twin, as cargo
 /// uplifts), `debug/lay.d`, `debug/examples/ex`, a criterion baseline, a
-/// `doc/` page, and a symlink an uplift left (`debug/lay.dSYM`).
+/// `doc/` page, and a link an uplift left (`debug/lay.dSYM`: on unix a symlink
+/// to the twin; on Windows, where a file symlink needs a privilege, a junction
+/// to `deps/`).
 fn furnished(tmp: &Tmp, name: &str) -> PathBuf {
     let t = synthetic_target(tmp, name);
     let debug = t.join("debug");
@@ -152,8 +258,11 @@ fn furnished(tmp: &Tmp, name: &str) -> PathBuf {
     std::fs::write(debug.join("lay.d"), b"lay: src/main.rs\n").expect(".d");
     std::fs::create_dir_all(debug.join("examples")).expect("examples");
     std::fs::write(debug.join("examples").join("ex"), b"example").expect("ex");
+    #[cfg(unix)]
     std::os::unix::fs::symlink("deps/lay-2bcb77ac5af7c69c", debug.join("lay.dSYM"))
         .expect("dsym link");
+    #[cfg(windows)]
+    link_dir(&debug.join("deps"), &debug.join("lay.dSYM"));
     let baseline = t.join("criterion").join("b").join("before");
     std::fs::create_dir_all(&baseline).expect("criterion");
     std::fs::write(baseline.join("estimates.json"), b"{\"mean\":1}").expect("baseline");
@@ -186,6 +295,11 @@ fn snapshot(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<(PathBuf, String, 
             } else if meta.is_dir() {
                 out.push((rel, "dir".to_owned(), Vec::new()));
                 stack.push(p);
+            } else if cfg!(windows) && CARGO_LOCKS.iter().any(|l| e.file_name() == *l) {
+                // A Windows lock is mandatory: a lock file a test's build holds
+                // cannot be read through another handle, so its length stands
+                // for its bytes (cargo's are empty).
+                out.push((rel, "lock".to_owned(), meta.len().to_le_bytes().to_vec()));
             } else {
                 out.push((rel, "file".to_owned(), std::fs::read(&p).expect("read")));
             }
@@ -208,7 +322,7 @@ fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_
     let tmp = Tmp::new("only-incremental");
     let t = furnished(&tmp, "target");
     let now = now_after_write(STALE + 1);
-    let cache = t.join("debug/incremental/lay-1x2y3z/s-abc-def/query-cache.bin");
+    let cache = at(&t, "debug/incremental/lay-1x2y3z/s-abc-def/query-cache.bin");
     let expect = blocks(&cache);
     let before = snapshot(&t, &in_incremental);
 
@@ -222,13 +336,13 @@ fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_
     assert_eq!(td.reclaimable(now, STALE), (expect, false));
 
     let done = reclaim(&t, &judge(now)).expect("reclaimed");
-    assert_eq!(done.units, vec![t.join("debug/incremental")], "{done:?}");
+    assert_eq!(done.units, vec![at(&t, "debug/incremental")], "{done:?}");
     assert!(
         done.skipped.is_empty() && done.trouble.is_empty(),
         "{done:?}"
     );
     assert_eq!(done.bytes, expect, "the blocks the query cache released");
-    assert!(!t.join("debug/incremental").exists());
+    assert!(!at(&t, "debug/incremental").exists());
     assert_eq!(
         snapshot(&t, &in_incremental),
         before,
@@ -257,13 +371,13 @@ fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_
 fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     let tmp = Tmp::new("nested");
     let t = synthetic_target(&tmp, "target");
-    lay_profile(&t.join("aarch64-apple-darwin/release"));
-    lay_profile(&t.join("conformance-release/release"));
+    lay_profile(&at(&t, "aarch64-apple-darwin/release"));
+    lay_profile(&at(&t, "conformance-release/release"));
     let now = now_after_write(STALE + 1);
     // The triple's profile was compiled into inside the window (as `now`
     // reads it).
     set_mtime(
-        &t.join("aarch64-apple-darwin/release/deps"),
+        &at(&t, "aarch64-apple-darwin/release/deps"),
         inside_window(now),
     );
 
@@ -273,8 +387,8 @@ fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     assert_eq!(
         found,
         vec![
-            t.join("aarch64-apple-darwin/release"),
-            t.join("conformance-release/release"),
+            at(&t, "aarch64-apple-darwin/release"),
+            at(&t, "conformance-release/release"),
             t.join("debug"),
         ]
     );
@@ -289,12 +403,12 @@ fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     assert_eq!(
         went,
         vec![
-            t.join("conformance-release/release/incremental"),
-            t.join("debug/incremental"),
+            at(&t, "conformance-release/release/incremental"),
+            at(&t, "debug/incremental"),
         ]
     );
     assert!(
-        t.join("aarch64-apple-darwin/release/incremental").exists(),
+        at(&t, "aarch64-apple-darwin/release/incremental").exists(),
         "the profile used inside the window keeps its cache"
     );
 }
@@ -395,7 +509,7 @@ fn a_build_holding_any_lock_keeps_its_profile() {
         );
 
         let done = reclaim(&t, &judge(now)).expect("the sibling is reclaimed");
-        assert_eq!(done.units, vec![t.join("release/incremental")], "{lock}");
+        assert_eq!(done.units, vec![at(&t, "release/incremental")], "{lock}");
         assert!(
             done.skipped
                 .iter()
@@ -435,6 +549,7 @@ fn every_lock_is_held_for_the_whole_delete_and_released_after() {
 /// exec ([`Parked`]). Negative control: with [`HeldLock`]'s drop reduced to a plain close,
 /// every lock reads held at `Released`.
 #[test]
+#[cfg(unix)]
 fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
     let tmp = Tmp::new("fork-window");
     let t = synthetic_target(&tmp, "target");
@@ -469,6 +584,7 @@ fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
 /// under it ([`Parked`]) does not keep it held. Negative control: with the probe releasing by
 /// close alone, each lock reads held after the probe and the reclaim fails.
 #[test]
+#[cfg(unix)]
 fn a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exec() {
     let tmp = Tmp::new("probe-fork-window");
     let t = synthetic_target(&tmp, "target");
@@ -568,7 +684,6 @@ fn an_unread_clock_is_said_never_dated_zero_days() {
 /// a read-only profile) skips the profile whole.
 #[test]
 fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skips() {
-    use std::os::unix::fs::PermissionsExt as _;
     let now = now_after_write(STALE + 1);
     let old_cargo = |tmp: &Tmp, name: &str| {
         let t = synthetic_target(tmp, name);
@@ -602,7 +717,7 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
 
     // `.cargo-lock` held: skipped, and nothing created.
     let t = old_cargo(&tmp, "held");
-    let hold = take(&t.join("debug/.cargo-lock"));
+    let hold = take(&at(&t, "debug/.cargo-lock"));
     let err = reclaim(&t, &judge(now)).expect_err("held");
     assert!(err.to_string().contains("a build holds"), "{err}");
     assert_eq!(only(&t), 1, "nothing created while a build holds one");
@@ -616,15 +731,20 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     assert!(err.to_string().contains("could not be created"), "{err}");
     assert!(t.join("debug").join(INCREMENTAL).exists(), "cache intact");
 
-    // A read-only profile: the same.
-    let t = old_cargo(&tmp, "readonly");
-    let debug = t.join("debug");
-    std::fs::set_permissions(&debug, std::fs::Permissions::from_mode(0o555)).expect("chmod");
-    let err = reclaim(&t, &judge(now)).expect_err("cannot lock");
-    std::fs::set_permissions(&debug, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    assert!(err.to_string().contains("could not be created"), "{err}");
-    assert!(debug.join(INCREMENTAL).exists(), "cache intact");
-    assert_eq!(only(&t), 1);
+    // A read-only profile: the same (unix: a Windows directory's read-only
+    // attribute does not keep a file from being created in it).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = old_cargo(&tmp, "readonly");
+        let debug = t.join("debug");
+        std::fs::set_permissions(&debug, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let err = reclaim(&t, &judge(now)).expect_err("cannot lock");
+        std::fs::set_permissions(&debug, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(err.to_string().contains("could not be created"), "{err}");
+        assert!(debug.join(INCREMENTAL).exists(), "cache intact");
+        assert_eq!(only(&t), 1);
+    }
 }
 
 /// Nothing is reached through a symlink: a path component swapped for a link refuses the
@@ -645,52 +765,71 @@ fn nothing_is_reached_through_a_symlink() {
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
     let parent = std::fs::canonicalize(&parent).expect("canonical");
     std::fs::rename(&parent, tmp.path().join("repo.moved")).expect("move");
-    std::os::unix::fs::symlink(&victim, &parent).expect("swap in a link");
+    link_dir(&victim, &parent);
     // `victim` holds a `target/`? It does not; give the link one to find.
     std::fs::create_dir_all(victim.join("target")).expect("decoy");
     lay_target(&victim.join("target"));
     let decoy_before = snapshot(&victim.join("target"), &|_| false);
     let err = reclaim(&t, &judge(now)).expect_err("a link in the path");
     assert!(err.to_string().contains("symlink"), "{err}");
+    // A link is said as one, never as a cloud sync root (Windows says that of a
+    // reparse point that is no link alone).
+    assert!(!err.to_string().contains(IN_SYNC_ROOT), "{err}");
     assert_eq!(snapshot(&victim.join("target"), &|_| false), decoy_before);
     std::fs::remove_dir_all(victim.join("target")).expect("decoy away");
 
     // 2. `incremental` itself a link: never followed, never a candidate.
     let t = synthetic_target(&tmp, "linked-inc");
-    std::fs::remove_dir_all(t.join("debug/incremental")).expect("real one away");
-    std::os::unix::fs::symlink(
-        victim.join("debug/incremental"),
-        t.join("debug/incremental"),
-    )
-    .expect("link");
+    std::fs::remove_dir_all(at(&t, "debug/incremental")).expect("real one away");
+    link_dir(
+        &at(&victim, "debug/incremental"),
+        &at(&t, "debug/incremental"),
+    );
     let why = target_witness(&assessed(&t, now), now, STALE).expect_err("no real cache");
     assert!(
         why.contains("no idle profile holds an incremental/"),
         "{why}"
     );
     assert!(reclaim(&t, &judge(now)).is_err());
-    assert!(std::fs::symlink_metadata(t.join("debug/incremental")).is_ok());
+    assert!(std::fs::symlink_metadata(at(&t, "debug/incremental")).is_ok());
 
     // 3. A link inside incremental/: the link goes, its target stays.
     let t = synthetic_target(&tmp, "inner-link");
-    std::os::unix::fs::symlink(&victim, t.join("debug/incremental/escape")).expect("link");
+    link_dir(&victim, &at(&t, "debug/incremental/escape"));
     reclaim(&t, &judge(now)).expect("reclaimed");
-    assert!(!t.join("debug/incremental").exists());
+    assert!(!at(&t, "debug/incremental").exists());
 
-    // 4. The profile swapped for a link under the locks.
+    // 4. The profile swapped for a link under the locks. On Windows the swap
+    // itself is refused: NTFS renames no directory with a handle open beneath
+    // it, and the reclaim holds the profile and its locks open.
     let t = synthetic_target(&tmp, "swap");
     let debug = t.join("debug");
     let moved = t.join("debug.moved");
+    let mut swapped = None;
     let done = reclaim_with(&t, &judge(now), &mut |stage, _| {
         if stage == Stage::Locked {
-            std::fs::rename(&debug, &moved).expect("swap");
-            std::os::unix::fs::symlink(victim.join("debug"), &debug).expect("link");
+            let renamed = std::fs::rename(&debug, &moved);
+            if renamed.is_ok() {
+                link_dir(&victim.join("debug"), &debug);
+            }
+            swapped = Some(renamed);
         }
     })
     .expect("reclaimed on the checked handle");
+    let swapped = swapped.expect("the hook ran");
+    #[cfg(unix)]
+    let checked = {
+        swapped.expect("swap");
+        moved
+    };
+    #[cfg(windows)]
+    let checked = {
+        swapped.expect_err("NTFS refuses the rename while the reclaim holds the profile");
+        debug
+    };
     assert!(done.bytes > 0, "{done:?}");
     assert!(
-        !moved.join(INCREMENTAL).exists(),
+        !checked.join(INCREMENTAL).exists(),
         "the checked directory's cache went"
     );
     assert_eq!(
@@ -707,7 +846,7 @@ fn the_delete_never_enters_another_device() {
     let tmp = Tmp::new("device");
     let t = synthetic_target(&tmp, "target");
     let inc = t.join("debug").join(INCREMENTAL);
-    let counted = blocks(&inc.join("lay-1x2y3z/s-abc-def/query-cache.bin"));
+    let counted = blocks(&at(&inc, "lay-1x2y3z/s-abc-def/query-cache.bin"));
     let mount = inc.join("mounted");
     std::fs::create_dir_all(&mount).expect("mount");
     std::fs::write(mount.join("theirs"), vec![3u8; 4096]).expect("theirs");
@@ -738,29 +877,83 @@ fn the_delete_never_enters_another_device() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
+/// A VOLUME'S GUID IS ITS OWN NAME, AND THE FENCE'S SECOND READING HOLDS TO IT
+/// ([`same_volume`], pure): a GUID reads in any case and is spelled back as the mount manager
+/// spells it; only a Windows volume's key carries one; the measured GUID and the one read
+/// through the build directory's handle must be one, and either unread refuses. NEGATIVE
+/// CONTROLS: every malformed spelling reads as none, and two GUIDs one bit apart differ.
+#[test]
+fn a_volume_guid_reads_in_any_case_and_the_fence_holds_to_it() {
+    use aterm_sysprobe::volumes::VolumeKey;
+    const C: &str = "{6140fc3b-044f-43d7-b060-cb98170c7a63}";
+    let c = VolumeGuid::parse(C).expect("a GUID");
+    assert_eq!(VolumeGuid::parse(&C.to_ascii_uppercase()), Some(c));
+    assert_eq!(c.to_string(), C);
+    assert_eq!(
+        VolumeGuid::of_key(&VolumeKey::Volume(C.to_owned())),
+        Some(c)
+    );
+    assert_eq!(VolumeGuid::of_key(&VolumeKey::Fsid(7)), None);
+    assert_eq!(
+        VolumeGuid::of_key(&VolumeKey::Container("disk3".to_owned())),
+        None
+    );
+    for not_one in [
+        "",
+        "6140fc3b-044f-43d7-b060-cb98170c7a63",
+        "{6140fc3b-044f-43d7-b060-cb98170c7a6}",
+        "{6140fc3b-044f-43d7-b060-cb98170c7a634}",
+        "{6140fc3b044f-43d7-b060-cb98170c7a63-}",
+        "{6140fc3g-044f-43d7-b060-cb98170c7a63}",
+        "{+140fc3b-044f-43d7-b060-cb98170c7a63}",
+        "{6140fc3b-044f-43d7-b060-cb98170c7a63",
+    ] {
+        assert_eq!(VolumeGuid::parse(not_one), None, "{not_one}");
+    }
+    let d = VolumeGuid::parse("{6140fc3b-044f-43d7-b060-cb98170c7a62}").expect("a GUID");
+    assert_ne!(c, d);
+    assert_eq!(same_volume(Some(c), Some(c)), Ok(()));
+    for (measured, here, why) in [
+        (Some(c), Some(d), "GUIDs differ"),
+        (None, Some(c), "measured volume's own name"),
+        (Some(c), None, "could not be read"),
+        (None, None, "measured volume's own name"),
+    ] {
+        let err = same_volume(measured, here).expect_err("refused");
+        assert!(err.contains(why), "{measured:?} {here:?}: {err}");
+    }
+}
+
 /// The bytes counted are what the unlinks released: a file hard-linked into `deps/` counts
-/// nothing, a sparse file its blocks; the report's estimate and the reclaim's count agree.
+/// nothing, a sparse file its blocks (unix; on Windows a file extended without the sparse flag
+/// is allocated whole); the report's estimate and the reclaim's count agree.
 #[test]
 fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
     let tmp = Tmp::new("bytes");
     let t = synthetic_target(&tmp, "target");
     let debug = t.join("debug");
-    let session = debug.join("incremental/lay-1x2y3z/s-abc-def");
+    let session = at(&debug, "incremental/lay-1x2y3z/s-abc-def");
     std::fs::write(session.join("lay.o"), vec![5u8; 64 * 1024]).expect("object");
-    std::fs::hard_link(session.join("lay.o"), debug.join("deps/lay.o")).expect("linked twin");
-    let sparse = session.join("sparse");
-    std::fs::File::create(&sparse)
-        .and_then(|f| f.set_len(64 * 1024 * 1024))
-        .expect("sparse");
+    std::fs::hard_link(session.join("lay.o"), at(&debug, "deps/lay.o")).expect("linked twin");
     let now = now_after_write(STALE + 1);
-    let expect = blocks(&session.join("query-cache.bin")) + blocks(&sparse);
-    assert!(expect < 1024 * 1024, "a sparse file holds few blocks");
+    #[cfg_attr(windows, expect(unused_mut, reason = "unix adds the sparse file"))]
+    let mut expect = blocks(&session.join("query-cache.bin"));
+    #[cfg(unix)]
+    {
+        let sparse = session.join("sparse");
+        std::fs::File::create(&sparse)
+            .and_then(|f| f.set_len(64 * 1024 * 1024))
+            .expect("sparse");
+        expect += blocks(&sparse);
+        assert!(expect < 1024 * 1024, "a sparse file holds few blocks");
+    }
+    assert!(expect > 0, "the query cache holds blocks");
 
     assert_eq!(assessed(&t, now).reclaimable(now, STALE), (expect, false));
     let done = reclaim(&t, &judge(now)).expect("reclaimed");
     assert_eq!(done.bytes, expect, "{done:?}");
     assert_eq!(
-        std::fs::read(debug.join("deps/lay.o")).expect("kept"),
+        std::fs::read(at(&debug, "deps/lay.o")).expect("kept"),
         vec![5u8; 64 * 1024],
         "the deps/ twin keeps its data"
     );
@@ -770,15 +963,12 @@ fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
 /// non-empty `incremental/` not claimed as gone.
 #[test]
 fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
-    use std::os::unix::fs::PermissionsExt as _;
     let tmp = Tmp::new("undeletable");
     let t = synthetic_target(&tmp, "target");
     let inc = t.join("debug").join(INCREMENTAL);
     let ro = inc.join("stuck");
-    std::fs::create_dir_all(&ro).expect("ro");
-    std::fs::write(ro.join("file"), vec![1u8; 8192]).expect("stuck");
-    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod");
-    let mut counted = blocks(&inc.join("lay-1x2y3z/s-abc-def/query-cache.bin"));
+    let stuck = Stuck::at(&ro);
+    let mut counted = blocks(&at(&inc, "lay-1x2y3z/s-abc-def/query-cache.bin"));
     for i in 0..10 {
         let f = inc.join(format!("f{i:02}"));
         std::fs::write(&f, vec![2u8; 8192]).expect("sibling");
@@ -786,7 +976,7 @@ fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
     }
 
     let done = reclaim(&t, &judge(now_after_write(STALE + 1))).expect("partly reclaimed");
-    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    drop(stuck);
     assert!(ro.join("file").exists(), "the stuck file stays");
     let left: Vec<String> = std::fs::read_dir(&inc)
         .expect("incremental/ stays")
@@ -821,15 +1011,12 @@ fn a_directory_holding_source_is_never_a_candidate() {
 /// which is not part of the idle clock, so the next reclaim takes what is left.
 #[test]
 fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
-    use std::os::unix::fs::PermissionsExt as _;
     let tmp = Tmp::new("cut-short");
     let t = synthetic_target(&tmp, "target");
     let debug = t.join("debug");
     let inc = debug.join(INCREMENTAL);
     let stuck = inc.join("stuck");
-    std::fs::create_dir_all(&stuck).expect("stuck");
-    std::fs::write(stuck.join("file"), vec![1u8; 8192]).expect("stuck file");
-    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    let held = Stuck::at(&stuck);
     // Judged at the real time, with every directory last written a month ago.
     let now = now_after_write(0);
     let old = now - 30 * DAY;
@@ -840,14 +1027,14 @@ fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
         "incremental",
         "incremental/lay-1x2y3z",
     ] {
-        set_mtime(&debug.join(d), old);
+        set_mtime(&at(&debug, d), old);
     }
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
 
     let done = reclaim(&t, &judge(now)).expect("partly reclaimed");
     assert!(done.units.is_empty(), "{done:?}");
     assert!(stuck.join("file").exists());
-    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    drop(held);
 
     let again = assessed(&t, now);
     assert!(
@@ -862,6 +1049,7 @@ fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
 /// A lock the reclaim creates gets the mode cargo's `OpenOptions` gives it (`0666` under the
 /// umask), never a private `0600` that locks out a shared build directory's group.
 #[test]
+#[cfg(unix)]
 fn a_created_lock_takes_the_mode_cargo_gives_it() {
     use std::os::unix::fs::PermissionsExt as _;
     let tmp = Tmp::new("lock-mode");
@@ -918,7 +1106,7 @@ fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
     ));
 
     let done = reclaim(&t, &judge(now)).expect("the debug profile");
-    assert_eq!(done.units, vec![t.join("debug/incremental")], "{done:?}");
+    assert_eq!(done.units, vec![at(&t, "debug/incremental")], "{done:?}");
     assert!(release.join(INCREMENTAL).is_dir(), "the empty one stays");
     assert!(
         !release.join(".cargo-artifact-lock").exists(),
@@ -939,6 +1127,7 @@ fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
 /// `dev_of` follows a link, as the free-space figure does, so a home linked to another volume
 /// fences the reclaim to that volume. The fixture links to `/dev` (devfs, its own volume).
 #[test]
+#[cfg(unix)]
 fn the_device_of_a_link_is_the_one_it_resolves_to() {
     use std::os::unix::fs::MetadataExt as _;
     let tmp = Tmp::new("dev-link");
@@ -1053,36 +1242,55 @@ fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_hand
     let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
     let err = reclaim_whole_with(&t, &judge(now), now, DAY, ok, &mut |stage, _| {
         if stage == Stage::Locked {
-            lay_profile(&t.join("aarch64-apple-darwin/debug"));
+            lay_profile(&at(&t, "aarch64-apple-darwin/debug"));
         }
     })
     .expect_err("a profile it never locked");
     assert!(err.to_string().contains("profiles changed"), "{err}");
-    assert!(t.join("debug/deps/liblay.rlib").exists());
+    assert!(at(&t, "debug/deps/liblay.rlib").exists());
 
     let tmp = Tmp::new("whole-swap");
     let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
     let moved = tmp.path().join("target.moved");
+    let mut swapped = None;
     let done = reclaim_whole_with(&t, &judge(now), now, DAY, ok, &mut |stage, _| {
         if stage == Stage::Deleting {
-            std::fs::rename(&t, &moved).expect("swap out");
-            std::fs::create_dir(&t).expect("swap in");
-            std::fs::write(t.join("keep.txt"), b"not a build's").expect("newcomer");
+            let renamed = std::fs::rename(&t, &moved);
+            if renamed.is_ok() {
+                std::fs::create_dir(&t).expect("swap in");
+                std::fs::write(t.join("keep.txt"), b"not a build's").expect("newcomer");
+            }
+            swapped = Some(renamed);
         }
     })
     .expect("the pinned directory's contents went");
-    assert!(t.join("keep.txt").exists(), "the newcomer is never entered");
-    assert!(
-        !moved.join("debug").exists(),
-        "the pinned directory was emptied through its handle"
-    );
-    assert!(done.units.is_empty(), "{done:?}");
-    assert!(
-        done.trouble
-            .iter()
-            .any(|t| t.contains("names another directory")),
-        "{done:?}"
-    );
+    let swapped = swapped.expect("the hook ran");
+    #[cfg(unix)]
+    {
+        swapped.expect("swap out");
+        assert!(t.join("keep.txt").exists(), "the newcomer is never entered");
+        assert!(
+            !moved.join("debug").exists(),
+            "the pinned directory was emptied through its handle"
+        );
+        assert!(done.units.is_empty(), "{done:?}");
+        assert!(
+            done.trouble
+                .iter()
+                .any(|t| t.contains("names another directory")),
+            "{done:?}"
+        );
+    }
+    // NTFS renames no directory with a handle open beneath it: the reclaim
+    // holds the pinned directory and every lock open, so no swap happens and
+    // the directory goes whole.
+    #[cfg(windows)]
+    {
+        swapped.expect_err("NTFS refuses the rename while the reclaim holds the directory");
+        assert!(!moved.exists(), "nothing was moved");
+        assert_eq!(done.units, std::slice::from_ref(&t), "{done:?}");
+        assert!(!t.exists());
+    }
 
     let tmp = Tmp::new("whole-alone");
     let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
@@ -1104,5 +1312,51 @@ fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_hand
     )
     .expect_err("the check refuses");
     assert!(err.to_string().contains("its session resumed"), "{err}");
-    assert!(t.join("debug/deps/liblay.rlib").exists());
+    assert!(at(&t, "debug/deps/liblay.rlib").exists());
 }
+
+/// Windows' unhashed twin: the same name with `-` read as `_` and an extension, never a
+/// hashed name, a bare name or another extension.
+#[test]
+fn an_unhashed_twin_is_the_same_name_with_an_extension() {
+    for (name, dep) in [
+        ("aterm.exe", "aterm.exe"),
+        ("aterm.pdb", "aterm.pdb"),
+        ("aterm-agent.exe", "aterm_agent.exe"),
+        ("aterm_agent.pdb", "aterm_agent.pdb"),
+    ] {
+        assert!(unhashed_twin(name, dep), "{name} {dep}");
+    }
+    for (name, dep) in [
+        ("aterm.exe", "aterm-2bcb77ac5af7c69c.exe"),
+        ("aterm.exe", "aterm.pdb"),
+        ("aterm", "aterm"),
+        (".exe", ".exe"),
+        ("aterm.", "aterm."),
+        ("aterm.exe", "aterm.exe.old"),
+    ] {
+        assert!(!unhashed_twin(name, dep), "{name} {dep}");
+    }
+}
+
+/// The Windows volume fence: only a local fixed disk passes; a volume no mount holds, one
+/// off the local device allowlist (a share, an unmeasured device), a removable one and one
+/// whose kind could not be read each refuse, saying why.
+#[test]
+fn only_a_local_fixed_disk_passes_the_volume_fence() {
+    assert_eq!(fixed_verdict(Some((true, Some(true)))), Ok(()));
+    for (volume, why) in [
+        (None, "no volume"),
+        (Some((false, Some(true))), "not on a local disk volume"),
+        (Some((false, None)), "not on a local disk volume"),
+        (Some((true, Some(false))), "removable"),
+        (Some((true, None)), "could not be read"),
+    ] {
+        let err = fixed_verdict(volume).expect_err("refused");
+        assert!(err.contains(why), "{volume:?}: {err}");
+    }
+}
+
+#[cfg(windows)]
+#[path = "disk_target_win_tests.rs"]
+mod win;

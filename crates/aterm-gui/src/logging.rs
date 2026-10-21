@@ -648,8 +648,54 @@ pub(crate) fn take_kill_evidence_in(
     own_pid: u32,
     journals: Option<&Path>,
 ) -> Option<KillEvidence> {
+    let marker = consume_dead_markers(
+        dir,
+        own_pid,
+        journals,
+        crate::crash_signal::MarkerOwner::App,
+    )?;
+    Some(KillEvidence {
+        marker,
+        log: dir.join("aterm.log"),
+    })
+}
+
+/// THE LAB DESK'S KILL SCAN (session log Phase 6, step 6C-4, ruling U9):
+/// [`take_kill_evidence`]'s twin for a lab desk (`crash_signal::Arming::Lab`).
+/// The dead, empty `lab` markers its earlier runs left in its private root's log
+/// directory are consumed (renamed `.seen` and pruned, as the windowed scan's are)
+/// for the recovery census, which reads them next; nothing is posted, since a
+/// headless desk shows no row. The marker's path goes to `aterm.log` only.
+#[cfg(unix)]
+pub(crate) fn take_lab_kill_evidence() {
+    let Some(dir) = log_dir() else {
+        return;
+    };
+    if let Some(marker) = consume_dead_markers(
+        &dir,
+        std::process::id(),
+        crate::crash_journal::journal_dir().as_deref(),
+        crate::crash_signal::MarkerOwner::Lab,
+    ) {
+        aterm_log::info!(
+            "crash: the lab desk's last run was killed; marker {}",
+            marker.display()
+        );
+    }
+}
+
+/// Consume the dead, empty markers of `owner` in `dir` another process left
+/// (`crash_signal::markers::dead_markers_of`): each renamed `.seen`, the consumed
+/// reports then pruned ([`prune_seen_crash_reports`]). Answers the newest, by mtime.
+#[cfg(unix)]
+pub(crate) fn consume_dead_markers(
+    dir: &Path,
+    own_pid: u32,
+    journals: Option<&Path>,
+    owner: crate::crash_signal::MarkerOwner,
+) -> Option<PathBuf> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
-    for path in crate::crash_signal::markers::dead_app_markers(dir, own_pid) {
+    for path in crate::crash_signal::markers::dead_markers_of(dir, own_pid, owner) {
         let modified = std::fs::symlink_metadata(&path)
             .and_then(|m| m.modified())
             .unwrap_or(UNIX_EPOCH);
@@ -671,11 +717,7 @@ pub(crate) fn take_kill_evidence_in(
         newest.as_ref().map(|(_, path)| path.as_path()),
         journals,
     );
-    let (_, marker) = newest?;
-    Some(KillEvidence {
-        marker,
-        log: dir.join("aterm.log"),
-    })
+    newest.map(|(_, marker)| marker)
 }
 
 /// Delete consumed crash reports (`crash-….log.seen`) beyond the newest

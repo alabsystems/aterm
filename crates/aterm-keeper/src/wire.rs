@@ -257,7 +257,7 @@ pub const MASTER_HEADER_LEN: usize = 8 + 4 + 8 + 4 + 8;
 
 /// Where a window's crash marker is (§5.4 row 3's cross-check): its log directory and the start
 /// its marker is named with. The keeper takes no file name from the window: it builds
-/// `crash-marker-<pid>-<nanos>-<app|other>.log` with the pid the kernel named for the
+/// `crash-marker-<pid>-<nanos>-<app|other|lab>.log` with the pid the kernel named for the
 /// connection, so a HELLO can point it at no file but that window's own marker. The window holds
 /// the marker's owner lock for its life and its exit path unlinks it (`aterm-gui`'s
 /// `crash_signal`), so after its death a missing marker says the exit path ran, and a marker

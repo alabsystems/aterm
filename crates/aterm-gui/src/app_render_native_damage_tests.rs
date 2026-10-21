@@ -243,6 +243,7 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
         dy: 0,
         fp,
         geom: fp,
+        raster_fingerprint_once: std::sync::OnceLock::new(),
     };
     {
         let window = app.windows.get_mut(&wid).expect("window");
@@ -255,6 +256,7 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
             dy: 0,
             fp: 1,
             geom: 1,
+            raster_fingerprint_once: std::sync::OnceLock::new(),
         });
         window.badge_card = Some(host([0, 0, 255, 255], 2));
     }
@@ -710,6 +712,181 @@ fn settings_preview_tick_patches_only_the_retained_preview_band() {
         ticked.height,
         rect,
     );
+}
+
+/// A preview tick on Top Settings repaints only what moves: the cursor
+/// specimen's frame columns, never the static colour sample beside it, the
+/// cards, their headers or the gutter between them (each tick used to
+/// re-raster the union of every preview's whole card, 2.6x to 3.3x the moving
+/// area on a wide Home page). Negative control: a page whose previews are all
+/// still (the default Text & Fonts) arms no tick at all.
+#[test]
+fn a_top_settings_tick_repaints_only_the_moving_specimen() {
+    // A settled face, so no font convergence widens the tick to every
+    // preview that shares it.
+    let mut renderer = aterm_render::Renderer::from_bytes(
+        aterm_render::embedded_font(),
+        14.0,
+        aterm_render::Theme::default(),
+    )
+    .unwrap();
+    renderer.set_runtime_font_discovery(false);
+    crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    {
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 60;
+        window.cols = 220;
+    }
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (_, view) = app.active_native_view(wid).expect("native Settings view");
+    assert!(app.prepare_native_input_scratch(wid));
+    // Two ticks first: the first frames settle what the page draws.
+    for phase in [33, 66] {
+        app.invalidate_active_native_settings_preview(wid, phase);
+        assert!(app.prepare_native_input_scratch(wid));
+    }
+    let raster = app.windows[&wid].leaf_render_cache[&view]
+        .native
+        .as_ref()
+        .expect("retained Top Settings raster");
+    let previews: Vec<(
+        String,
+        crate::native_ui::LogicalRect,
+        crate::settings_preview::SettingsPreviewSpec,
+    )> = raster
+        .compiled
+        .paint
+        .iter()
+        .filter_map(|node| match &node.content {
+            crate::native_ui::UiContent::SettingsPreview(spec) => {
+                Some((node.key.as_str().to_string(), node.rect, (**spec).clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let moving = previews
+        .iter()
+        .find(|(key, _, _)| key == "settings/top/cursor-trail/preview")
+        .expect("the cursor specimen is on the page");
+    let still = previews
+        .iter()
+        .find(|(key, _, _)| key == "settings/top/theme/preview")
+        .expect("the colour sample is on the page");
+    assert!(
+        app.invalidate_active_native_settings_preview(wid, 720),
+        "the default cursor preview is moving"
+    );
+    assert!(app.prepare_native_input_scratch(wid));
+    let ticked = app.windows[&wid].leaf_render_cache[&view]
+        .native
+        .as_ref()
+        .unwrap();
+    let crate::NativeRasterWork::Region { rect, .. } = ticked.last_work else {
+        panic!("a preview tick widened to a full-page raster")
+    };
+    let scale = app.windows[&wid].scale as f32;
+    let tick = moving.2.tick_rect(moving.1);
+    let device = |value: f32| value * scale;
+    assert!(
+        rect.x as f32 >= device(tick.x) - scale - 0.5
+            && rect.y as f32 >= device(tick.y) - scale - 0.5
+            && (rect.x + rect.width) as f32 <= device(tick.right()) + scale + 0.5
+            && (rect.y + rect.height) as f32 <= device(tick.bottom()) + scale + 0.5,
+        "the tick repainted {rect:?}, more than the moving specimen {tick:?} at {scale}x"
+    );
+    let still_rect = still.1;
+    let overlaps = (rect.x as f32) < device(still_rect.right())
+        && device(still_rect.x) < (rect.x + rect.width) as f32
+        && (rect.y as f32) < device(still_rect.bottom())
+        && device(still_rect.y) < (rect.y + rect.height) as f32;
+    assert!(!overlaps, "the tick repainted the still colour sample");
+
+    // Negative control: the still Text & Fonts page arms no tick.
+    let mut app = App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    assert!(app.prepare_native_input_scratch(wid));
+    let _ = app.active_native_settings_preview(wid, 0);
+    assert!(app.prepare_native_input_scratch(wid));
+    assert_eq!(
+        app.active_native_settings_preview(wid, 720)
+            .map(|(_, animation)| animation),
+        None,
+        "a still page asks for no tick"
+    );
+}
+
+/// Every screen of Top Settings paints its previews in the prepared font,
+/// through the real host seam (the font is prepared before the render seats
+/// the scroll, and each screen is compiled exactly once): the shipped 102x29,
+/// a short wide 167x36 and a tall 120x70, scrolled a Page Down at a time. And
+/// a screen that draws the cursor preview schedules its motion, its link row
+/// cut off below it or not. (The font was prepared only at the paged list's
+/// old offsets, so a scrolled Top Settings painted its previews blank.)
+#[test]
+fn every_top_settings_screen_paints_ready_previews_and_moves_the_cursor_it_draws() {
+    let mut renderer = aterm_render::Renderer::from_bytes(
+        aterm_render::embedded_font(),
+        14.0,
+        aterm_render::Theme::default(),
+    )
+    .unwrap();
+    renderer.set_runtime_font_discovery(false);
+    crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
+    let mut cursor_screens = 0;
+    for (cols, rows) in [(102, 29), (167, 36), (120, 70)] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        {
+            let window = app.windows.get_mut(&wid).unwrap();
+            window.rows = rows;
+            window.cols = cols;
+        }
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        for screen in 0..8 {
+            let context = format!("{cols}x{rows} screen {screen}");
+            let viewport = app.native_ui_viewport(wid).unwrap();
+            let compiled = app
+                .compiled_native_ui_for(wid, instance, view, viewport)
+                .unwrap();
+            let mut cursor_drawn = false;
+            for node in &compiled.paint {
+                let crate::native_ui::UiContent::SettingsPreview(spec) = &node.content else {
+                    continue;
+                };
+                assert!(
+                    !spec.font_status.contains("unavailable") && spec.prepared_font.is_ready(),
+                    "{context}: {} painted with {:?}",
+                    node.key.as_str(),
+                    spec.font_status
+                );
+                cursor_drawn |= node.key.as_str() == "settings/top/cursor-trail/preview";
+            }
+            if cursor_drawn {
+                cursor_screens += 1;
+                let Some(crate::native_app::AppViewState::Settings(state)) =
+                    app.native_runtime.view_state(view)
+                else {
+                    unreachable!();
+                };
+                assert_ne!(
+                    state.preview_animation(
+                        720,
+                        app.native_view_motion_cx(wid, view),
+                        app.win_font_px(wid),
+                        1.0,
+                        viewport,
+                    ),
+                    crate::settings_preview::PreviewAnimation::None,
+                    "{context}: the cursor preview on glass is still"
+                );
+            }
+            let _ = app.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollPage(1));
+        }
+    }
+    assert!(cursor_screens > 0, "some screen draws the cursor preview");
 }
 
 #[test]
@@ -1598,7 +1775,144 @@ fn a_theme_demo_tick_repaints_only_its_grid() {
         "{pixels} > {grid_pixels}: {rect:?} grid {grid:?} node {node:?} scale {scale}"
     );
 
-    let mut cursor = spec.clone();
-    cursor.scene = crate::settings_preview::PreviewScene::CursorMotion;
-    assert_eq!(cursor.tick_rect(node), node);
+    // Any other scene's tick repaints its terminal body at most, never its
+    // card or header.
+    let mut typography = spec.clone();
+    typography.scene = crate::settings_preview::PreviewScene::Typography;
+    assert_eq!(typography.tick_rect(node), typography.terminal_rect(node));
+}
+
+/// A KEY A NATIVE PAGE TAKES IS TIMED TO THE PRESENT OF ITS ANSWER. The
+/// input→present ledger (`input_*`) closed a window's keystrokes only at a
+/// present with PTY output pending, and a native page answers a key with
+/// pixels, so typing into Settings search booked nothing, on glass or in a
+/// headless present-real take, and its latency could not be quoted. A key the
+/// page takes now arms the window's native ring; a present of pixels already
+/// shown leaves it armed; the present that puts the page's answer on glass
+/// closes it. A modifier alone arms nothing.
+#[test]
+fn a_key_typed_into_a_native_page_is_timed_to_the_present_of_its_answer() {
+    use crate::input::InputEvent;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    let key = |key: Key| InputEvent::Key {
+        key,
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    app.dispatch_native_event(
+        wid,
+        crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new("settings/search"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    let (instance, first_view) = app.active_native_view(wid).unwrap();
+    // One present of the page as it stands: `raster` re-rasters it first.
+    let present = |app: &mut App, raster: bool| {
+        let (_, view) = app.active_native_view(wid).unwrap();
+        if raster {
+            assert!(app.prepare_native_input_scratch(wid));
+        }
+        let stamp = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("a retained raster")
+            .stamp;
+        let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
+        app.first_present_done = true;
+        app.finalize_successful_present(
+            wid,
+            metrics::StartupPresentTiming::collapsed(Instant::now()),
+            0,
+            None,
+            SuccessfulPresentRoute::Native {
+                view,
+                presented_stamp: Some(stamp),
+            },
+            route,
+            HostVisualState::default(),
+            &plan,
+        );
+    };
+    let pending = |app: &App| {
+        app.windows[&wid]
+            .present_metrics
+            .pending_native_input
+            .is_pending()
+    };
+    let type_key = |app: &mut App, ev: InputEvent| {
+        let _ = app.input_to_session(
+            wid,
+            ev,
+            crate::input::Source::Controller,
+            None,
+            crate::app_input::PressPhase::Initial,
+        );
+    };
+    present(&mut app, true);
+    type_key(&mut app, key(Key::Named(NamedKey::ShiftLeft)));
+    assert!(!pending(&app), "a modifier alone answers nothing");
+    type_key(&mut app, key(Key::Named(NamedKey::F1)));
+    assert!(
+        !pending(&app),
+        "an unsupported key dispatches no native event"
+    );
+    type_key(&mut app, key(Key::Character('a')));
+    assert!(pending(&app), "the page took the key: its slice is open");
+    present(&mut app, false);
+    assert!(pending(&app), "pixels already shown are not its answer");
+    present(&mut app, true);
+    assert!(!pending(&app), "the present of the page's answer closes it");
+
+    type_key(&mut app, key(Key::Character('b')));
+    assert!(pending(&app));
+    let presentation = app.windows[&wid]
+        .tab_set
+        .active()
+        .unwrap()
+        .presentation
+        .clone();
+    let (_, other_view) = app
+        .install_native_tab(wid, instance, about_view(&app), presentation)
+        .unwrap();
+    assert_ne!(other_view, first_view);
+    present(&mut app, true);
+    assert!(
+        pending(&app),
+        "another view's fresh pixels are not its answer"
+    );
+    app.switch_tab_in(wid, 1);
+    assert_eq!(app.active_native_view(wid).unwrap().1, first_view);
+    // Switching back can publish unrelated service revisions. A fresh input
+    // binds the answer the returned view now owes, never the other view's.
+    type_key(&mut app, key(Key::Character('r')));
+    present(&mut app, true);
+    assert!(!pending(&app), "the returned view's new input presented");
+
+    type_key(&mut app, key(Key::Character('c')));
+    assert!(pending(&app));
+    app.dispatch_native_event(
+        wid,
+        crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
+            "a later unmetered revision".to_string(),
+        )),
+    )
+    .unwrap();
+    present(&mut app, true);
+    assert!(
+        pending(&app),
+        "a different revision cannot close the old edge"
+    );
+    type_key(&mut app, key(Key::Character('d')));
+    present(&mut app, true);
+    assert!(
+        !pending(&app),
+        "the next input binds its own answer revision"
+    );
 }

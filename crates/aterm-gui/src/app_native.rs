@@ -26,12 +26,23 @@ use crate::native_updater_service::{ReturnedApplyDisposition, ReturnedApplyFacts
 use crate::packages_screen::{PackagesBusy, PackagesCommandOutcome, PackagesWorkerCompletion};
 use crate::{App, Wake, WindowId};
 
+/// How often a lane held for its candidate's pre-park read looks again: the automatic
+/// attempt ([`App::try_pending_native_auto_apply`]) and a person's held Install
+/// ([`App::held_person_apply_deadline`]). The read raises only a flag and each look is
+/// memory-only, so either starts within this of the read's end; the looks last only as
+/// long as the read (84-546 ms arm to attempt in a guest, 2026-10-20).
+#[cfg(unix)]
+pub(crate) const PREVERIFY_READ_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Settings ▸ Messages is republished at most this often while the center
 /// moves: a downloading update restates at 10 Hz; the page repaints at 2 Hz.
 pub(crate) const MESSAGES_PUBLISH_MIN_GAP: std::time::Duration =
     std::time::Duration::from_millis(500);
-/// …and at least this often while a view is on the route with nothing
-/// moving, so the relative times tick (`3 min ago` becomes `4 min ago`).
+/// …and, with nothing moving, no oftener than this for the page's clock: a
+/// view on the route is republished when a time word the last publish said
+/// would read otherwise (`3 min ago` becomes `4 min ago`, `Today` becomes
+/// `Yesterday`; [`App::settings_messages_quiet_gap`]), at most once a minute,
+/// and never for a page that says no time.
 pub(crate) const MESSAGES_PUBLISH_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 /// …and this long after the publish that started a transient status line's
 /// clock, the one that clears it. The page times the line by the projections'
@@ -1771,6 +1782,7 @@ fn native_appearance_revision(preferences: crate::native_appearance::AppearanceP
     let mut revision = std::collections::hash_map::DefaultHasher::new();
     preferences.high_contrast.hash(&mut revision);
     preferences.reduced_transparency.hash(&mut revision);
+    preferences.differentiate_without_color.hash(&mut revision);
     preferences.text_scale.to_bits().hash(&mut revision);
     revision.finish()
 }
@@ -1916,7 +1928,7 @@ pub(crate) enum NativeConfigWork {
         value: Option<String>,
     },
     /// A theme chosen in the command palette: `theme` becomes the value
-    /// [`crate::prefs::theme_choice_value`] gives against the newest service
+    /// [`crate::prefs::theme_sideless_choice_value`] gives against the newest service
     /// revision at the lane head, so a Follow-system pair keeps its other
     /// side even when an earlier write in the lane changed it.
     ThemeChoice {
@@ -1957,6 +1969,12 @@ pub(crate) enum NativeConfigOrigin {
     ThemeChoice {
         request_id: u64,
         id: String,
+    },
+    /// View ▸ Stats Bars' durable write (`sys.stats_bars` set to `form`):
+    /// the runtime follows the written file through the reload every write
+    /// ends in; a refused write only says so.
+    StatsBars {
+        form: crate::stats_deck::StatsBars,
     },
     /// Completion sink for the `settings set|unset` wire command. The control
     /// thread blocks on this one-shot while the main loop stays free. Non-success
@@ -2452,6 +2470,10 @@ impl App {
                 self.say_linux_held_stage();
 
                 if let Some(stage) = effective_stage {
+                    // A launch-record renewal in flight yields: this stage's own handoff
+                    // renews the record as it lands.
+                    #[cfg(target_os = "macos")]
+                    self.yield_launch_record_renewal_to_update();
                     if newly_announced
                         && matches!(
                             purpose,
@@ -3236,11 +3258,8 @@ impl App {
                 invocation.id.as_str()
             ));
         }
-        if let AppEvent::EditorCommand(command) = &event {
-            let _ = crate::command_registry::editor_command(command);
-        }
-        // Palette/buttons and the Emacs keymap lower into the same editor
-        // reducer; the command registry above classifies authority first.
+        // Buttons, `act` and completion rows lower into the same editor
+        // reducer the Emacs keymap runs.
         let event = if kind == crate::native_app::AppKind::Markdown {
             match event {
                 AppEvent::ScrollLines(lines) => {
@@ -3344,13 +3363,28 @@ impl App {
         } else {
             event
         };
+        // An editor command a button, `act` or a completion row names is
+        // checked against the authority this gesture carries before it runs
+        // (`command_registry::editor_grant`, from the command's own
+        // `EditorCommand::authority`). A refusal runs nothing, says why in the
+        // view's status line and answers the caller with it; keys and M-x
+        // meet the same check inside the reducer.
+        if kind == crate::native_app::AppKind::Editor
+            && let Some(refusal) = self.refuse_editor_command(view, &event)
+        {
+            self.invalidate_native_view_cache(wid, view, DamageRegion::All);
+            self.refresh_native_presentation(wid, instance, view);
+            return Err(refusal);
+        }
         if let Some(result) = self.dispatch_editor_event(instance, view, &event)? {
             // The editor workspace is an independent reducer and currently has
             // no regional-damage effect lane. Invalidate its exact leaf only,
-            // and not for an input it declined, which changed nothing.
-            if result == EventResult::Handled {
+            // and not for an input it declined, which changed nothing, nor for
+            // a view the command closed.
+            if result == EventResult::Handled && self.view_store.get(view).is_some() {
                 self.invalidate_native_view_cache(wid, view, DamageRegion::All);
                 self.refresh_native_presentation(wid, instance, view);
+                self.note_native_handled_dispatch(wid);
             }
             return Ok(result);
         }
@@ -3371,6 +3405,9 @@ impl App {
             self.execute_native_effect(wid, instance, view, effect)?;
         }
         self.refresh_native_presentation(wid, instance, view);
+        if outcome.result == EventResult::Handled {
+            self.note_native_handled_dispatch(wid);
+        }
         Ok(outcome.result)
     }
 
@@ -3390,6 +3427,50 @@ impl App {
             return Err("native app target is stale or no longer active".to_string());
         }
         self.dispatch_native_event(wid, event)
+    }
+
+    fn note_native_handled_dispatch(&mut self, wid: WindowId) {
+        if let Some(window) = self.windows.get_mut(&wid) {
+            window.native_dispatch_serial = window.native_dispatch_serial.saturating_add(1);
+        }
+    }
+
+    /// Time only a handled native input that changed the current view's revision.
+    /// The boundary's `true` alone also swallows unsupported keys. Keep that
+    /// routing behavior, but never turn it into a presentation sample.
+    pub(crate) fn timed_native_input_event(
+        &mut self,
+        wid: WindowId,
+        event: &crate::input::InputEvent,
+        arrival: Option<u64>,
+    ) -> bool {
+        let Some(arrival) = arrival else {
+            return self.native_input_event(wid, event);
+        };
+        let before = self.native_ui_compile_stamp(wid).ok();
+        let serial = self
+            .windows
+            .get(&wid)
+            .map(|window| window.native_dispatch_serial);
+        let taken = self.native_input_event(wid, event);
+        let dispatched = self
+            .windows
+            .get(&wid)
+            .zip(serial)
+            .is_some_and(|(window, before)| window.native_dispatch_serial != before);
+        if taken
+            && dispatched
+            && let (Some(before), Ok(after)) = (before, self.native_ui_compile_stamp(wid))
+            && let Some(window) = self.windows.get_mut(&wid)
+        {
+            crate::metrics::note_native_window_input(
+                &mut window.present_metrics.pending_native_input,
+                before,
+                after,
+                arrival,
+            );
+        }
+        taken
     }
 
     /// Native tabs are an input boundary: keyboard/text events are reduced by
@@ -4174,7 +4255,7 @@ impl App {
         if let Some(current) = current.as_ref()
             && let Some(crate::native_app::AppViewState::Settings(state)) =
                 self.native_runtime.view_state(view)
-            && let Some(beyond) = state.tab_past_screen(current, &key, !backwards)
+            && let Some(beyond) = state.tab_past_screen(current, &key, !backwards, &focus_order)
         {
             key = beyond;
         }
@@ -4562,8 +4643,12 @@ impl App {
             }
             AppEffect::Themes { request, reply } => {
                 // The themes folder is the host's to resolve: the view named
-                // a catalog id at most (`settings_themes_host`).
-                let outcome = crate::settings_themes_host::perform(&request);
+                // a catalog id at most (`settings_themes_host`). A headless
+                // instance's reaches stop at its own folder.
+                let outcome = crate::settings_themes_host::perform(
+                    &request,
+                    crate::settings_themes_host::ThemesHostArms::for_instance(self.headless),
+                );
                 if matches!(
                     outcome,
                     crate::native_app::ThemesOutcome::Saved { .. }
@@ -4794,7 +4879,8 @@ impl App {
                     }
                     NativeConfigOrigin::View { .. }
                     | NativeConfigOrigin::Presence { .. }
-                    | NativeConfigOrigin::ThemeChoice { .. } => None,
+                    | NativeConfigOrigin::ThemeChoice { .. }
+                    | NativeConfigOrigin::StatsBars { .. } => None,
                 });
     }
 
@@ -4880,12 +4966,81 @@ impl App {
         self.pump_native_config()
     }
 
+    /// View ▸ Stats Bars: queue the durable `sys.stats_bars` write through
+    /// the lane the presence toggles use. The bars follow the written file
+    /// (the write's reload applies it, re-gridding every window once for a
+    /// change into or out of the Deck); the radio reads the applied form.
+    pub(crate) fn user_set_stats_bars(&mut self, form: crate::stats_deck::StatsBars) {
+        if form == self.stats_bars_form() {
+            return;
+        }
+        let queued = (|| {
+            self.proxy
+                .as_ref()
+                .ok_or_else(|| "config persistence needs an event-loop proxy".to_string())?;
+            let _ = native_config_queue()?;
+            self.native_config_pending.push_back(NativeConfigRequest {
+                origin: NativeConfigOrigin::StatsBars { form },
+                work: NativeConfigWork::ControlField {
+                    key: "sys.stats_bars".to_string(),
+                    value: Some(form.word().to_string()),
+                },
+            });
+            self.pump_native_config()
+        })();
+        if let Err(error) = queued {
+            self.post_message(crate::message_reporters::stats_bars_not_saved(
+                form.title(),
+                &error,
+                false,
+            ));
+        }
+    }
+
+    /// The Stats Bars write completed: applied, the reload already drew it;
+    /// refused or unconfirmed, say why (the bars keep the durable form).
+    fn publish_stats_bars_completion(
+        &mut self,
+        form: crate::stats_deck::StatsBars,
+        outcome: &ConfigPatchOutcome,
+    ) {
+        let feedback = match outcome {
+            ConfigPatchOutcome::Applied { .. } => None,
+            ConfigPatchOutcome::Conflict { .. } => Some((
+                "aterm.toml changed first; its current value was kept".to_string(),
+                false,
+            )),
+            ConfigPatchOutcome::Indeterminate { message } => Some((message.clone(), true)),
+            other => Some((
+                control_settings_completion_reply(
+                    "sys.stats_bars",
+                    Some(form.word()),
+                    None,
+                    other,
+                    None,
+                )
+                .err()
+                .unwrap_or_else(|| "the write was refused".to_string()),
+                false,
+            )),
+        };
+        if let Some((cause, indeterminate)) = feedback {
+            self.post_message(crate::message_reporters::stats_bars_not_saved(
+                form.title(),
+                &cause,
+                indeterminate,
+            ));
+        }
+    }
+
     /// Queue the durable `theme` write for a theme chosen in the command
     /// palette, through the lane and OCC materialization the presence toggles
-    /// use. The value is the Settings pickers' ([`crate::prefs::theme_choice_value`]):
-    /// over a plain name or an unset `theme`, the name itself (Default too);
-    /// while `theme` is a `dark:…,light:…` pair, the pair with only the side
-    /// on screen replaced, so the choice keeps following the OS.
+    /// use. The value is the rule for a choice that names no side
+    /// ([`crate::prefs::theme_sideless_choice_value`]): over a plain name or
+    /// an unset `theme`, the name itself (Default too); while `theme` is a
+    /// `dark:…,light:…` pair, the pair with only the side on screen replaced
+    /// for a theme made for that side, so the choice keeps following the OS,
+    /// and the name for both appearances for one made for the other.
     pub(crate) fn queue_theme_choice(&mut self, id: &str) -> Result<(), String> {
         self.proxy
             .as_ref()
@@ -5052,7 +5207,7 @@ impl App {
     ) -> Result<crate::native_app::ConfigPatch, String> {
         let snapshot = self.native_config_service.snapshot();
         let expected = snapshot.values()?.remove(crate::prefs::EDIT_THEME);
-        let (value, _) = crate::prefs::theme_choice_value(
+        let (value, _) = crate::prefs::theme_sideless_choice_value(
             expected.as_deref(),
             side,
             id,
@@ -5809,6 +5964,9 @@ impl App {
             NativeConfigOrigin::Presence { key, desired } => {
                 self.publish_presence_completion(key, desired, &outcome, authoritative.as_ref());
             }
+            NativeConfigOrigin::StatsBars { form } => {
+                self.publish_stats_bars_completion(form, &outcome)
+            }
             NativeConfigOrigin::ThemeChoice { request_id, id } => {
                 self.publish_theme_choice_completion(
                     request_id,
@@ -6544,6 +6702,13 @@ impl App {
         }
         let state = self.messages_state();
         let revision = state.revision;
+        let words_offset_s = state.utc_offset_s;
+        // The zone is read at the instants themselves: a daylight-saving
+        // change before the words move owes the page its publish where it
+        // lands (`MessagesState::words_change_at`).
+        let words_change_in = state
+            .words_change_at(|at| crate::presence::local_offset_at(i64::try_from(at / 1000).ok()?))
+            .map(|at| std::time::Duration::from_millis(at.saturating_sub(state.now_unix_ms)));
         if !self
             .native_runtime
             .replace_settings_messages(state, revision)
@@ -6552,16 +6717,18 @@ impl App {
         }
         self.messages_last_publish = Some(std::time::Instant::now());
         self.messages_published_revision = revision;
+        self.messages_words_change_in = words_change_in;
+        self.messages_words_offset_s = words_offset_s;
         self.dispatch_to_settings_views(&AppEvent::MessagesChanged { revision });
     }
 
     /// [`Self::publish_native_messages_state`] when it is due: the center moved
-    /// and at least [`MESSAGES_PUBLISH_MIN_GAP`] has passed, or
-    /// [`MESSAGES_PUBLISH_TICK`] has passed while a Settings view is on the
-    /// Messages route (sooner while its status line is transient:
-    /// [`Self::settings_messages_quiet_gap`]). Runs after every settle and before
-    /// every wait; a publish the gap holds back is re-armed through
-    /// `messages_deadline`. One enum compare per window off the route.
+    /// and at least [`MESSAGES_PUBLISH_MIN_GAP`] has passed, or a Settings view
+    /// on the Messages route says a time word that now reads otherwise, or its
+    /// status line is transient ([`Self::settings_messages_quiet_gap`]). Runs
+    /// after every settle and before every wait; a publish the gap holds back
+    /// is re-armed through `messages_deadline`. One enum compare per window
+    /// off the route.
     pub(crate) fn publish_native_messages_state_if_due(&mut self, now: std::time::Instant) {
         if self
             .native_runtime
@@ -6589,11 +6756,11 @@ impl App {
     /// The instant the next publish falls due, for the loop's deadline fold; the
     /// twin of [`Self::publish_native_messages_state_if_due`]'s predicate: the
     /// 2 Hz hold-back of a publish the center's move earned, or, with the center
-    /// quiet, the [`MESSAGES_PUBLISH_TICK`] (or a transient status line's
-    /// publishes, [`Self::settings_messages_quiet_gap`]) while a view is on the
-    /// Messages route. The loop waits when idle, so an unarmed tick never
-    /// fires. `None` with no Settings instance, or with the center quiet and no
-    /// view on the route, so an idle band arms no wake.
+    /// quiet, the page's clock or a transient status line's publishes
+    /// ([`Self::settings_messages_quiet_gap`]). The loop waits when idle, so an
+    /// unarmed tick never fires. `None` with no Settings instance, or with the
+    /// center quiet and no shown view on the route (or one whose page says no
+    /// time) and no transient line, so an idle band arms no wake.
     pub(crate) fn messages_publish_due_at(&self) -> Option<std::time::Instant> {
         self.native_runtime
             .instance_by_kind(crate::native_app::AppKind::Settings)?;
@@ -6610,14 +6777,27 @@ impl App {
 
     /// The publish an on-screen Settings view asks for with the center quiet
     /// (on screen: a pane of the active tab of a window whose content is on
-    /// glass, `band_on_screen`): on the Messages route the
-    /// [`MESSAGES_PUBLISH_TICK`], so relative times move; and on any page, while
-    /// its status line is transient (`Copied`, `Build information copied`), the
-    /// publish that starts its clock and the one [`MESSAGES_FEEDBACK_WAIT`]
-    /// later that clears it (xa-13). The shortest over all such views. A background tab or hidden window arms nothing; once
-    /// revealed, what it owes is overdue and publishes at once.
+    /// glass, `band_on_screen`, or a headless window's active tab): on the
+    /// Messages route, the instant a time word the last publish said first
+    /// reads otherwise (`messages_words_change_in`, the Mac's sleep counted:
+    /// [`Self::count_sleep_toward_messages_clock`]; at once when the zone reads
+    /// another offset than those words were read on), but never sooner than
+    /// [`MESSAGES_PUBLISH_TICK`] after it, and nothing for a page that says no
+    /// time; and on any page, while its status line is transient (`Copied`,
+    /// `Build information copied`), the publish that starts its clock and the
+    /// one [`MESSAGES_FEEDBACK_WAIT`] later that clears it (xa-13). The
+    /// shortest over all such views. A background tab or hidden window arms
+    /// nothing; once revealed, what it owes is overdue and publishes at once.
     fn settings_messages_quiet_gap(&self) -> Option<std::time::Duration> {
         let mut gap: Option<std::time::Duration> = None;
+        // Whether the zone reads another offset than the last publish's words
+        // were read on: asked once, and only for a shown page that says time.
+        let zone_moved = std::cell::OnceCell::new();
+        let zone_moved = || {
+            *zone_moved.get_or_init(|| {
+                crate::presence::local_offset_s().unwrap_or(0) != self.messages_words_offset_s
+            })
+        };
         // A headless instance has no glass, but what its active tab shows is
         // what a capture of it shows — the lane UI is validated in — so its
         // status lines run the same clock as a window's (xa-13).
@@ -6647,14 +6827,26 @@ impl App {
                     self.native_runtime.view_state(*view)
                 {
                     // A transient status line's publishes, on every page
-                    // (xa-13); the minute tick on Messages, whose times move.
+                    // (xa-13); on Messages, the publish its time words are
+                    // owed — when one would read otherwise (at once in a zone
+                    // that moved since), at most once a minute, and none while
+                    // it says no time.
                     let clock = match state.status_clock() {
                         Some(false) => Some(MESSAGES_PUBLISH_MIN_GAP),
                         Some(true) => Some(MESSAGES_FEEDBACK_WAIT),
                         None => None,
                     };
                     let tick = (state.route == crate::native_settings::SettingsRoute::Messages)
-                        .then_some(MESSAGES_PUBLISH_TICK);
+                        .then_some(self.messages_words_change_in)
+                        .flatten()
+                        .map(|until| {
+                            if zone_moved() {
+                                std::time::Duration::ZERO
+                            } else {
+                                until
+                            }
+                            .max(MESSAGES_PUBLISH_TICK)
+                        });
                     for next in [clock, tick].into_iter().flatten() {
                         gap = Some(gap.map_or(next, |gap| gap.min(next)));
                     }
@@ -6985,20 +7177,21 @@ impl App {
     /// deadline that turn then mints. What a deadline does once due is
     /// unchanged, and the physical budget's replenish window stays awake time,
     /// which can only remember the bytes longer.
+    ///
+    /// Returns the sleep it counted, for the other calendar clocks
+    /// ([`Self::count_sleep_toward_messages_clock`]); `None` when none counts.
     pub(crate) fn count_sleep_toward_update_deadlines(
         &mut self,
         now: std::time::Instant,
         wall: std::time::SystemTime,
-    ) {
-        let Some((then, then_wall)) = self.update_deadline_clock.replace((now, wall)) else {
-            return;
-        };
+    ) -> Option<std::time::Duration> {
+        let (then, then_wall) = self.update_deadline_clock.replace((now, wall))?;
         let slept = wall
             .duration_since(then_wall)
             .unwrap_or_default()
             .saturating_sub(now.saturating_duration_since(then));
         if slept < SLEEP_COUNTS_FROM {
-            return;
+            return None;
         }
         let forward = |at: std::time::Instant| {
             if at > now {
@@ -7019,6 +7212,36 @@ impl App {
             if let Some(retry) = verdict.newer_retry.as_mut() {
                 retry.at = forward(retry.at);
             }
+        }
+        Some(slept)
+    }
+
+    /// The time the Mac slept since the last turn of the event loop, counted
+    /// toward every calendar clock: the automatic lane's deadlines
+    /// ([`Self::count_sleep_toward_update_deadlines`]) and the Messages page's
+    /// ([`Self::count_sleep_toward_messages_clock`]). First in each turn.
+    pub(crate) fn count_sleep_since_last_turn(
+        &mut self,
+        now: std::time::Instant,
+        wall: std::time::SystemTime,
+    ) {
+        if let Some(slept) = self.count_sleep_toward_update_deadlines(now, wall) {
+            self.count_sleep_toward_messages_clock(slept);
+        }
+    }
+
+    /// THE MESSAGES PAGE'S CLOCK IS CALENDAR TIME TOO. A page is republished
+    /// when the time words its last publish said next read otherwise
+    /// (`messages_words_change_in`, a span after that publish on the
+    /// monotonic clock, which stops while the Mac sleeps), so a page that said
+    /// `3 h ago` and slept the night would say it for most of an awake hour
+    /// more, and `Today` past the midnight it slept through. The time the Mac
+    /// slept ([`Self::count_sleep_toward_update_deadlines`]) comes off that
+    /// span: a page whose words moved during the sleep is owed its publish at
+    /// once, never sooner than [`MESSAGES_PUBLISH_TICK`] after the last.
+    fn count_sleep_toward_messages_clock(&mut self, slept: std::time::Duration) {
+        if let Some(until) = self.messages_words_change_in.as_mut() {
+            *until = until.saturating_sub(slept);
         }
     }
 
@@ -8256,10 +8479,14 @@ impl App {
                             .as_secs()
                     ),
                 }
+                // Due at once: the quiet gate reads the last epoch, which needs no
+                // wait from here, and the attempt waits only for the pre-park read
+                // spawned above (`try_pending_native_auto_apply`). A first look one
+                // epoch out held every idle update 501-509 ms (2026-10-20, n=24).
                 self.auto_apply_intent = Some(crate::AutoApplyIntent {
                     build,
                     dmg_sha256,
-                    retry_at: now + crate::AUTOMATIC_UPDATE_QUIET_EPOCH,
+                    retry_at: now,
                     attempts: 0,
                 });
                 // The status bar's "applies in place" line is now an armed fact
@@ -8753,9 +8980,9 @@ impl App {
         self.announce_apply_phase(phase);
         self.announce_restored_hold(now);
         // A same-image handoff counts as work: a real stage arriving while the QA
-        // seam's handoff is in flight answers `Wait(WorkActive)` (intent kept, no
-        // budget spent) instead of failing as "already in flight". Real handoffs
-        // already set `active`/`Applying`.
+        // seam's or a launch-record renewal's handoff is in flight answers
+        // `Wait(WorkActive)` (intent kept, no budget spent) instead of failing as
+        // "already in flight". Real handoffs already set `active`/`Applying`.
         let work_active = self.native_updater_service.snapshot().active.is_some()
             || self.update_handoff_in_flight()
             || self.person_apply_is_held();
@@ -8856,6 +9083,24 @@ impl App {
         #[cfg(unix)]
         if let Some(retry_at) = self.roster_wait_holds(attempt_build, intent.dmg_sha256, now) {
             intent.retry_at = retry_at;
+            self.auto_apply_intent = Some(intent);
+            return;
+        }
+        // The pre-park read of exactly these bytes, which the arm started, is still
+        // running: the attempt waits for its verdict rather than have its worker verify
+        // the same bytes again beside it, and looks every [`PREVERIFY_READ_POLL`], so
+        // it starts as the read ends. Intent kept, nothing spent.
+        #[cfg(unix)]
+        if self
+            .handoff_preverify_in_flight
+            .as_ref()
+            .is_some_and(|read| {
+                read.build == attempt_build
+                    && decode_dmg_sha256(&read.artifact) == Some(intent.dmg_sha256)
+                    && read.running_for(attempt_build, now)
+            })
+        {
+            intent.retry_at = now + PREVERIFY_READ_POLL;
             self.auto_apply_intent = Some(intent);
             return;
         }
@@ -9262,6 +9507,7 @@ impl App {
             UpdaterPhase::Checking | UpdaterPhase::Available | UpdaterPhase::Downloading
         );
         let attention = snapshot.attention_pending();
+        crate::update_control::publish_staged_activation(snapshot.staged.as_ref());
         let staged = snapshot
             .staged
             .as_ref()
@@ -11536,6 +11782,37 @@ impl App {
             crate::native_app::CloseScope::CarriedRelaunch
         } else {
             crate::native_app::CloseScope::Relaunch
+        }
+    }
+
+    /// The automatic lane's close preflight, asked quietly (no tab switch, no focus move,
+    /// no Close Recovery), for a launch-record renewal: the same steps
+    /// [`Self::apply_native_update`] runs past its updater ticket, which a renewal has
+    /// none of.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn quiet_native_update_safety_token(
+        &mut self,
+    ) -> crate::launch_record_renewal::QuietPreflight {
+        use crate::launch_record_renewal::QuietPreflight;
+        self.drive_owed_document_journals();
+        match self.prepare_all_native_shutdown(
+            self.update_close_scope(),
+            crate::app_tabs::ClosePreflightVisibility::Quiet,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return QuietPreflight::Held(vec![
+                    Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string(),
+                ]);
+            }
+            Err(message) => return QuietPreflight::Broken(message),
+        }
+        match self.native_update_close_preflight() {
+            (ClosePreflight::Ready, Some(token)) => QuietPreflight::Ready(token),
+            (ClosePreflight::Ready, None) => QuietPreflight::Broken(
+                "the close preflight returned Ready without safety evidence".to_string(),
+            ),
+            (ClosePreflight::Blocked(reasons), _) => QuietPreflight::Held(reasons),
         }
     }
 

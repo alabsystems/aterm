@@ -87,6 +87,7 @@ fn report_at(
         None,
         "doctor",
         probes,
+        Detail::Everything,
         &mut out,
         &mut err,
     );
@@ -181,24 +182,32 @@ fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() 
     let entry = rustup.join("toolchains/trust");
     let said = || seam_line(&crate::seam::status(&l, &rustup, "trust"), &l);
     std::os::unix::fs::symlink(&dev, &entry).unwrap();
-    let line = said().expect("a foreign link is said");
-    assert!(line.starts_with("warn — "), "{line}");
+    let (row, remedy) = said().expect("a foreign link is said");
+    let line = row.text;
+    assert_eq!(row.level, Level::Warn, "{line}");
+    let repoint = format!(
+        "ln -sfn '{}' '{}'",
+        crate::seam::seam_target(&l, "trust").display(),
+        entry.display()
+    );
     assert!(
-        line.contains(&format!(
-            "ln -sfn '{}' '{}'",
-            crate::seam::seam_target(&l, "trust").display(),
-            entry.display()
-        )),
+        line.contains(&repoint),
         "the exact re-point command, quoted — the real prefix has a space in \
          `Application Support`: {line}"
+    );
+    // The view is not laid here, so the door re-points it and lays the view after.
+    assert_eq!(
+        remedy,
+        Remedy::Command(format!("{repoint}, then aterm pkg repair")),
+        "the row's remedy is that command"
     );
     assert_eq!(std::fs::read_link(&entry).unwrap(), dev, "nothing moved");
     // A numbered build inside the store, and the pre-view link at `current`: notes.
     for inside in [build.clone(), crate::seam::store_current(&l)] {
         std::fs::remove_file(&entry).unwrap();
         std::os::unix::fs::symlink(&inside, &entry).unwrap();
-        let line = said().unwrap();
-        assert!(line.starts_with("note — "), "{line}");
+        let (row, _) = said().unwrap();
+        assert_eq!(row.level, Level::Note, "{}", row.text);
     }
     // The seam itself, and no entry at all: nothing to say from this line.
     std::fs::remove_file(&entry).unwrap();
@@ -209,8 +218,8 @@ fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() 
     assert_eq!(said(), None);
     // A real directory gets the detach fix, since nothing can be linked over it.
     std::fs::create_dir_all(entry.join("bin")).unwrap();
-    let line = said().unwrap();
-    assert!(line.contains(crate::seam::DETACH_FIX), "{line}");
+    let (row, _) = said().unwrap();
+    assert!(row.text.contains(crate::seam::DETACH_FIX), "{}", row.text);
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -269,7 +278,10 @@ fn a_held_toolchain_update_and_a_lease_are_said_and_healthy() {
     );
     assert_eq!(lease_line(&subject, &crate::lease::Holders::Free), None);
     crate::quiet::clear(&l);
-    assert!(hold_lines(&l, t0).is_empty(), "nothing held, nothing said");
+    assert!(
+        hold_findings(&l, t0).is_empty(),
+        "nothing held, nothing said"
+    );
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -527,6 +539,7 @@ fn report_over(l: &Layout, label: &str) -> (bool, String) {
         None,
         "doctor",
         &Probes::default(),
+        Detail::Everything,
         &mut out,
         &mut err,
     );
@@ -561,7 +574,7 @@ fn an_unserved_platform_is_a_note_not_a_problem_off_macos_and_unchanged_on_macos
             "nothing to do, nothing recommended: {out}"
         );
         assert!(!out.contains("--default-set"), "nothing impossible: {out}");
-        assert!(out.contains("doctor: healthy"), "{out}");
+        assert!(self::healthy(&out), "{out}");
     } else {
         assert!(!healthy, "{out}");
         assert!(
@@ -786,61 +799,109 @@ fn an_unserved_store_is_quiet_only_when_no_served_member_is_missing() {
     );
 }
 
-/// A held member's door at both places the next act names it (the empty store with a
-/// toolset problem, and the held row as the one recorded problem): its own install, or for a
-/// coherence-group member the pass that moves the tuple whole.
+/// A held member's door at both places the toolset row names it (the empty store, and the
+/// held row as the one recorded problem): its own install, or for a coherence-group member
+/// the pass that moves the tuple whole.
 #[test]
 fn a_held_member_s_next_act_is_its_tuple_s_door_when_grouped() {
     let held = [format!(
         "trust: {}",
         crate::state::held_failed("x", "now: aterm pkg update --retry")
     )];
+    let door = |command: &str| Remedy::Command(command.to_owned());
     let in_rustc = |program: &str| program == "trust";
     let alone = |_: &str| false;
-    let empty = NextFacts {
-        toolset_problem: true,
+    let empty = ToolsetFacts {
         empty_store: true,
         recorded_problems: &held,
-        ..NextFacts::default()
+        ..ToolsetFacts::default()
     };
-    let only = NextFacts {
+    let only = ToolsetFacts {
         recorded_problems: &held,
-        ..NextFacts::default()
+        ..ToolsetFacts::default()
     };
     for facts in [&empty, &only] {
         assert_eq!(
-            next_act(facts, in_rustc).as_deref(),
-            Some("aterm pkg update --retry"),
+            toolset_door(facts, in_rustc),
+            door("aterm pkg update --retry"),
             "{facts:?}"
         );
         assert_eq!(
-            next_act(facts, alone).as_deref(),
-            Some("aterm pkg install trust"),
+            toolset_door(facts, alone),
+            door("aterm pkg install trust"),
             "{facts:?}"
         );
     }
-    // With no held row, the same two states take their ordinary acts.
+    // With no held row, the same two states take their ordinary doors: the whole set, and
+    // none (nothing recorded, nothing missing).
     let none: [String; 0] = [];
     assert_eq!(
-        next_act(
-            &NextFacts {
+        toolset_door(
+            &ToolsetFacts {
                 recorded_problems: &none,
                 ..empty
             },
             in_rustc
-        )
-        .as_deref(),
-        Some("aterm pkg install --default-set")
+        ),
+        door("aterm pkg install --default-set")
     );
     assert_eq!(
-        next_act(
-            &NextFacts {
+        toolset_door(
+            &ToolsetFacts {
                 recorded_problems: &none,
                 ..only
             },
             in_rustc
         ),
-        None
+        Remedy::None
+    );
+    // Members the index serves, missing with no recorded reason: the whole-set install, the
+    // explicit door whatever `[packages]` consent says (design §3.2) — never "the next pass,
+    // once online", which is not why they are missing. Beside a member removed on purpose,
+    // which that install would bring back, no one door.
+    assert_eq!(
+        toolset_door(
+            &ToolsetFacts {
+                missing: true,
+                ..ToolsetFacts::default()
+            },
+            in_rustc
+        ),
+        door("aterm pkg install --default-set")
+    );
+    assert_eq!(
+        toolset_door(
+            &ToolsetFacts {
+                missing: true,
+                removed_on_purpose: true,
+                ..ToolsetFacts::default()
+            },
+            in_rustc
+        ),
+        Remedy::None
+    );
+    // A declined toolset is no door's; a recorded failure beside an active set, `update`.
+    let failed = [String::from("ay: error: stage failed")];
+    assert_eq!(
+        toolset_door(
+            &ToolsetFacts {
+                recorded_problems: &failed,
+                declined: true,
+                ..ToolsetFacts::default()
+            },
+            in_rustc
+        ),
+        Remedy::None
+    );
+    assert_eq!(
+        toolset_door(
+            &ToolsetFacts {
+                recorded_problems: &failed,
+                ..ToolsetFacts::default()
+            },
+            in_rustc
+        ),
+        door("aterm pkg update")
     );
 }
 
@@ -1085,9 +1146,7 @@ fn structural_faults_fail_the_report_and_advisories_exit_zero() {
 #[cfg(unix)]
 #[test]
 fn a_shim_whose_target_cannot_be_stat_ed_is_not_reported_broken() {
-    if crate::platform::our_uid() == 0 {
-        return; // root reads through mode 0; the case does not exist.
-    }
+    aterm_uds::host::could_not_run_as_root("a mode-0 shim target");
     let l = layout("unstattable-shim");
     install(&l, "ay", 18);
     let home = synthetic_home("unstattable-shim");
@@ -1619,6 +1678,7 @@ fn a_kept_autocompact_offer_holds_the_window_back_in_the_report() {
             claude_defaults: probe_claude_settings(&home),
             ..Probes::default()
         },
+        Detail::Everything,
         &mut out,
         &mut std::io::sink(),
     );
@@ -1646,9 +1706,7 @@ fn a_kept_autocompact_offer_holds_the_window_back_in_the_report() {
 #[test]
 fn a_dangling_or_unwritable_settings_file_is_the_one_refusal_warn() {
     use DefaultState::{Default as D, Unset};
-    if crate::platform::our_uid() == 0 {
-        return; // root writes through mode 0; the unwritable case does not exist.
-    }
+    aterm_uds::host::could_not_run_as_root("a mode-0 settings file");
     let home = synthetic_home("claude-links");
     let claude = home.join(".claude");
     std::fs::create_dir_all(&claude).unwrap();
@@ -1860,6 +1918,7 @@ fn status_never_speaks_as_doctor() {
             None,
             invoked,
             &Probes::default(),
+            Detail::Everything,
             &mut out,
             &mut err,
         );
@@ -1917,9 +1976,8 @@ fn on_disk_build_is_the_newer_of_receipt_and_bundle_and_the_note_needs_installed
     let updates = base.prefix.join("Updates");
     std::fs::create_dir_all(&updates).unwrap();
     let report = |bundle: Option<u64>| -> String {
-        let mut out = Vec::new();
-        report_aterm_posture_at(&updates, bundle, &[], true, "atpkg", &mut out);
-        String::from_utf8(out).unwrap()
+        report_aterm_posture_at(&updates, bundle, &[], true)
+            .map_or_else(String::new, |row| format!("atpkg: {}\n", spelled(&row)))
     };
     std::fs::write(
         updates.join("installed.toml"),
@@ -2153,23 +2211,11 @@ fn a_local_trust_where_none_is_published_is_a_note_off_macos() {
     };
     // The full report, and the default one: the verdict and only the rows it counts.
     let report = |probes: &Probes| {
-        let mut out: Vec<u8> = Vec::new();
-        let mut err: Vec<u8> = Vec::new();
-        let _ = run_with(
-            &l,
-            Some(&home),
-            Some(&path),
-            0,
-            None,
-            "doctor",
-            probes,
-            &mut out,
-            &mut err,
-        );
-        let out = String::from_utf8(out).unwrap();
-        let err = String::from_utf8(err).unwrap();
-        let shown = present(&out, &err, "doctor", Detail::Problems).joined();
-        (out, shown)
+        let rows = report_with(&l, Some(&home), Some(&path), 0, None, probes);
+        (
+            render(&rows, "doctor", Detail::Everything).joined(),
+            render(&rows, "doctor", Detail::Problems).joined(),
+        )
     };
     let warned = "warn — rustup `trust` names a local toolchain, not the managed one";
     let (out, shown) = report(&probes);
@@ -2332,9 +2378,14 @@ fn whole_report(l: &Layout, home: &Path, path: &OsStr) -> (bool, String, String)
     report_of(l, home, Some(path), &Probes::default())
 }
 
-#[cfg(unix)]
+/// Whether the verdict passes with nothing withheld: `healthy`, or `working` beside
+/// advisories — no problem, and no managed tool that cannot run.
 fn healthy(out: &str) -> bool {
-    out.lines().any(|line| line == "doctor: healthy")
+    out.lines().next().is_some_and(|verdict| {
+        verdict == "doctor: healthy"
+            || verdict.starts_with("doctor: healthy \u{2014} ")
+            || verdict.starts_with("doctor: working \u{2014} ")
+    })
 }
 
 /// The report withholds "healthy" for one tool that cannot run, and exits 0.
@@ -2707,7 +2758,7 @@ fn a_refused_directory_on_the_trust_chain_names_its_next_step() {
             shared.clone(),
             "/home/u/.local/share/aterm",
             Some("775"),
-            "fix: run `chmod go-w '/home/u/.local/share/aterm'`".to_string(),
+            "fix: chmod go-w '/home/u/.local/share/aterm'".to_string(),
         ),
         (
             refusal(
@@ -2729,7 +2780,7 @@ fn a_refused_directory_on_the_trust_chain_names_its_next_step() {
         ),
     ];
     for (refused, dir, mode, fix) in cases {
-        let (ok, out, err) = report_of(&l, &home, Some(&path), &probes(8589, refused));
+        let (ok, out, err) = report_of(&l, &home, Some(&path), &probes(8589, refused.clone()));
         assert_not_healthy_exit_0(ok, &out, &err);
         let names = |line: &str| {
             line.starts_with("doctor: warn — ")
@@ -2750,8 +2801,24 @@ fn a_refused_directory_on_the_trust_chain_names_its_next_step() {
                     .any(|line| line.contains("`targo trust`") && line.contains("chmod")),
             "only a directory of the user's own is given a chmod\n{out}"
         );
-        let shown = present(&out, &err, "doctor", Detail::Problems);
-        assert!(shown.rest.lines().any(names), "{}", shown.rest);
+        // The default report keeps the row, cut to its fact and the same remedy.
+        let rows = report_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            &probes(8589, refused),
+        );
+        let shown = render(&rows, "doctor", Detail::Problems);
+        assert!(
+            shown
+                .rest
+                .lines()
+                .any(|line| names(line) && line.chars().count() <= SHORT_ROW),
+            "{}{err}",
+            shown.rest
+        );
     }
     for quiet in [probes(8588, shared), probes(8589, Vec::new())] {
         let (ok, out, err) = report_of(&l, &home, Some(&path), &quiet);
@@ -3044,7 +3111,8 @@ fn the_exec_root_claim_counts_what_cannot_run_and_what_may_not() {
             shims: shims.clone(),
             unrouted,
         };
-        let (line, claim) = exec_root_line("doctor", 8595, &i);
+        let (row, claim, _) = exec_root_line(8595, &i);
+        let line = row.text;
         assert_eq!(claim, want, "{label}: {line}");
         if let Some(at) = names_at {
             assert!(line.contains(at), "{label}: {line}");
@@ -3105,16 +3173,62 @@ fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
     let (unreached, frozen) = ("has not been reached", "publishing looks frozen");
     let out = run(base.clone());
     assert!(!out.contains(unreached) && !out.contains(frozen), "{out}");
-    let out = run(crate::Status {
+    // A pass that reached a host and failed (a refused signature) is no wait for the network:
+    // a warn whose act is `update`. Only a pass that found no host is the retry ladder's
+    // note, whose remedy is the next pass once online (design §3.3).
+    let refused = crate::Status {
         last_success_at: "2026-10-10T00:00:00Z".into(),
         last_pass: "failed".into(),
+        outcome: "update failed: signature refused".into(),
         ..base.clone()
-    });
+    };
+    let out = run(refused.clone());
     assert!(
-        out.contains("doctor: warn — the signed index has not been reached for 10 day(s)"),
+        out.contains(
+            "doctor: warn — the signed index has not been reached for 10 day(s): signature \
+             refused — now: aterm pkg update"
+        ),
         "{out}"
     );
     assert!(!out.contains(frozen), "unreachable is not frozen:\n{out}");
+    let rows = report_with(&l, Some(&home), Some(&path), now, None, &Probes::default());
+    let row = rows
+        .iter()
+        .find(|r| r.id == crate::converge::INDEX_REACHED)
+        .expect("the unreached row");
+    assert_eq!(
+        (row.outcome, row.explain.as_ref().map(|e| &e.remedy)),
+        (
+            Outcome::Planned,
+            Some(&Remedy::Command(String::from("aterm pkg update")))
+        ),
+        "{row:?}"
+    );
+    assert!(!row.fails_surface(), "advisory: {row:?}");
+    let out = run(crate::Status {
+        last_pass: "offline".into(),
+        outcome: "up to date (index build 32) (index from cache — dns lookup failed: \
+                  github.com (os error 8))"
+            .into(),
+        ..refused
+    });
+    assert!(
+        out.contains(
+            "doctor: note — the signed index has not been reached for 10 day(s): dns lookup \
+             failed: github.com (os error 8) — now: aterm pkg update"
+        ),
+        "{out}"
+    );
+    let rows = report_with(&l, Some(&home), Some(&path), now, None, &Probes::default());
+    let row = rows
+        .iter()
+        .find(|r| r.id == crate::converge::INDEX_REACHED)
+        .expect("the unreached row");
+    assert_eq!(
+        (row.outcome, row.explain.as_ref().map(|e| &e.remedy)),
+        (Outcome::Deferred, Some(&Remedy::Network)),
+        "{row:?}"
+    );
     for (last_pass, last_pass_at) in [
         ("failed", "2026-10-09T00:00:00Z"),
         ("ok", "2026-10-19T00:00:00Z"),
@@ -3157,92 +3271,461 @@ fn doctor_names_an_unreached_index_and_a_frozen_index_separately() {
 }
 
 /// Warnings without a fault read "working", never "healthy"; every printed row fits
-/// [`SHORT_ROW`] with its own next step kept at its end; ok rows and notes wait for
-/// `--verbose`, which prints them all under the same verdict. A clean report is "healthy"; a
-/// faulty one keeps its verdict and next act, and its structural rows (stderr) follow it, cut
-/// the same way and whole under `--verbose`.
+/// [`SHORT_ROW`] with its remedy kept at its end; ok rows and notes wait for `--verbose`,
+/// which prints them all under the same verdict. A clean report is "healthy"; a faulty one
+/// keeps its verdict and next act, and its structural rows (stderr) follow it, cut the same
+/// way and whole under `--verbose`. All of it is rendered from the rows, never re-read.
 #[test]
 fn the_report_leads_with_its_verdict_and_says_only_the_problems() {
+    use crate::converge::{self as c, Finding};
     let unreached = format!(
-        "doctor: warn — the signed index has not been reached for 10 day(s): the last pass \
-         failed: {} — now: aterm pkg update",
+        "the signed index has not been reached for 10 day(s): the last pass failed: {} — now: \
+         aterm pkg update",
         "x".repeat(200)
     );
-    let report = format!(
-        "doctor: ok — prefix /p\n\
-         doctor: note — Trust builds use the ay pinned inside the trust bundle\n\
-         {unreached}\n\
-         doctor: 12 program(s) active\n\
-         doctor: healthy\n"
-    );
-    let out = present(&report, "", "doctor", Detail::Problems).joined();
+    let rows = crate::converge::report(vec![
+        Finding::ok(c::PREFIX, Class::Install, "the prefix", "prefix /p"),
+        Finding::note(
+            c::of(c::SOLVER, "ay"),
+            Class::Install,
+            "the ay Trust builds use",
+            "Trust builds use the ay pinned inside the trust bundle",
+        ),
+        Finding::change(
+            c::INDEX_AGE,
+            Class::Install,
+            "the last completed update pass",
+            unreached.clone(),
+            "a completed update pass",
+            Remedy::Command(String::from("aterm pkg update")),
+        ),
+        Finding::ok(
+            c::TOOLSET,
+            Class::Install,
+            "the ALab toolset",
+            "12 program(s) active",
+        )
+        .detail("12"),
+    ]);
+    let out = render(&rows, "doctor", Detail::Problems).joined();
     let lines: Vec<&str> = out.lines().collect();
-    assert!(
-        lines[0].starts_with("doctor: working — 12 program(s)"),
+    assert_eq!(
+        lines[0], "doctor: working — 12 program(s) installed; 1 thing(s) to look at",
         "{out}"
     );
     assert!(
         lines[1].starts_with("doctor: warn — the signed index")
-            && lines[1].ends_with("aterm pkg update"),
-        "the fact and its next step survive the cut: {out}"
+            && lines[1].ends_with("— fix: aterm pkg update"),
+        "the fact and its remedy survive the cut: {out}"
+    );
+    assert_eq!(
+        lines[2], "doctor: the full report: aterm pkg doctor --verbose",
+        "{out}"
     );
     assert_eq!(lines.len(), 3, "{out}");
     assert!(
         lines.iter().all(|l| l.chars().count() <= SHORT_ROW),
         "{out}"
     );
-    assert!(
-        !out.contains("healthy") && !out.contains("prefix /p"),
-        "{out}"
-    );
-    let all = present(&report, "", "doctor", Detail::Everything).joined();
+    assert!(!out.contains("prefix /p"), "{out}");
+    let all = render(&rows, "doctor", Detail::Everything).joined();
     assert!(
         all.starts_with("doctor: working — 12 program(s)")
             && all.contains("doctor: ok — prefix /p")
-            && all.contains(&unreached)
-            && !all.contains("doctor: healthy"),
+            && all.contains("doctor: note — Trust builds use the ay")
+            && all.contains(&format!("doctor: warn — {unreached}"))
+            && all.contains("doctor: ok — 12 program(s) active")
+            && !all.contains("the full report"),
         "{all}"
     );
 
-    let clean = "status: ok — prefix /p\nstatus: 3 program(s) active\nstatus: healthy\n";
-    assert!(
-        present(clean, "", "status", Detail::Problems)
-            .joined()
-            .starts_with("status: healthy"),
+    let clean = crate::converge::report(vec![
+        Finding::ok(c::PREFIX, Class::Install, "the prefix", "prefix /p"),
+        Finding::ok(
+            c::TOOLSET,
+            Class::Install,
+            "the ALab toolset",
+            "3 program(s) active",
+        )
+        .detail("3"),
+    ]);
+    assert_eq!(
+        render(&clean, "status", Detail::Problems).joined(),
+        "status: healthy — 3 program(s) installed and working\n\
+         status: the full report: aterm pkg status --verbose\n"
     );
 
-    let faults = format!(
-        "doctor: FAIL \u{2014} trust: its bin/ shims are split across builds {} \
-         \u{2014} fix: aterm pkg repair, then aterm pkg update trust\n",
+    let split = format!(
+        "trust: its bin/ shims are split across builds {} — fix: aterm pkg repair, then aterm \
+         pkg update trust",
         (9100..9130)
             .map(|b| b.to_string())
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let report = "doctor: ok \u{2014} prefix /p\n\
-                  doctor: found 1 problem(s)\n\
-                  doctor: next \u{2014} aterm pkg update\n";
-    let shown = present(report, &faults, "doctor", Detail::Problems);
+    let faulty = crate::converge::report(vec![
+        Finding::ok(c::PREFIX, Class::Install, "the prefix", "prefix /p"),
+        Finding::change(
+            c::of(c::LIVE, "trust"),
+            Class::Install,
+            "trust's live build",
+            split.clone(),
+            "one build, recorded current and run",
+            Remedy::Command(String::from("aterm pkg update")),
+        )
+        .essential(),
+    ]);
+    let shown = render(&faulty, "doctor", Detail::Problems);
     assert_eq!(shown.verdict, "doctor: found 1 problem(s)\n");
     assert!(
         shown.faults.chars().count() <= SHORT_ROW + 1
             && shown
                 .faults
-                .trim_end()
-                .ends_with("fix: aterm pkg repair, then aterm pkg update trust"),
-        "the fact yields room to the fix: {}",
+                .starts_with("doctor: FAIL — trust: its bin/ shims are split")
+            && shown.faults.trim_end().ends_with("— fix: aterm pkg update"),
+        "the fact yields room to the remedy: {}",
         shown.faults
     );
     assert!(
-        shown
-            .rest
-            .contains("doctor: next \u{2014} aterm pkg update"),
+        shown.rest.contains("doctor: next — aterm pkg update"),
         "{}",
         shown.rest
     );
     assert_eq!(
-        present(report, &faults, "doctor", Detail::Everything).faults,
-        faults
+        render(&faulty, "doctor", Detail::Everything).faults,
+        format!("doctor: FAIL — {split}\n")
+    );
+}
+
+/// The next act is the first failing row's door in the report's order of acts — the C
+/// toolchain, the workspace, the toolset, a live build, a store tree — whatever order the
+/// rows came in; a failing row with no door names none, an advisory's door is never the
+/// act, and a passing report has no next line.
+#[test]
+fn the_next_act_is_the_first_failing_row_s_door_in_the_order_of_acts() {
+    use crate::converge::{self as c, Finding};
+    let door = |command: &str| Remedy::Command(command.to_owned());
+    let fault = |id: String, command: &str| {
+        Finding::change(
+            id,
+            Class::Install,
+            "t",
+            "broken — x",
+            "fixed",
+            door(command),
+        )
+        .essential()
+    };
+    let next = |findings: Vec<Finding>| {
+        render(
+            &crate::converge::report(findings),
+            "doctor",
+            Detail::Everything,
+        )
+        .rest
+        .lines()
+        .filter_map(|l| l.strip_prefix("doctor: next — "))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        next(vec![
+            fault(c::of(c::STORE, "ay"), "aterm pkg install ay"),
+            fault(c::of(c::LIVE, "ty"), "aterm pkg update"),
+            fault(c::TOOLSET.to_owned(), "aterm pkg update --retry"),
+            fault(c::CLT.to_owned(), "xcode-select --install"),
+        ]),
+        ["xcode-select --install"]
+    );
+    assert_eq!(
+        next(vec![
+            fault(c::of(c::STORE, "ay"), "aterm pkg install ay"),
+            fault(c::of(c::LIVE, "ty"), "aterm pkg update"),
+        ]),
+        ["aterm pkg update"]
+    );
+    assert_eq!(
+        next(vec![fault(c::of(c::STORE, "ay"), "aterm pkg install ay")]),
+        ["aterm pkg install ay"]
+    );
+    // A compiler that refuses with no one act to name (macOS: its own stderr is the cause)
+    // still outranks the rest: no amount of updating or reinstalling fixes it, so there is
+    // no next line rather than another row's door.
+    let refusing = Finding::change(
+        c::CLT,
+        Class::Elevate,
+        "the C toolchain",
+        "the C toolchain refuses to build",
+        "a C toolchain that builds",
+        Remedy::None,
+    )
+    .essential();
+    assert!(
+        next(vec![
+            fault(c::of(c::STORE, "ay"), "aterm pkg install ay"),
+            fault(c::of(c::LIVE, "ty"), "aterm pkg update"),
+            fault(c::TOOLSET.to_owned(), "aterm pkg update"),
+            refusing,
+        ])
+        .is_empty()
+    );
+    // A workspace fault with no door (a retired key, the person's edit) does not stop it.
+    assert_eq!(
+        next(vec![
+            fault(c::of(c::STORE, "ay"), "aterm pkg install ay"),
+            Finding::change(
+                c::WORKSPACE,
+                Class::Person,
+                "the workspace's [trust] policy",
+                "workspace w declares a retired key",
+                "accepted",
+                Remedy::Person {
+                    pane: String::from("w/Cargo.toml"),
+                    how: String::from("edit its [trust] table"),
+                },
+            )
+            .essential(),
+        ]),
+        ["aterm pkg install ay"]
+    );
+    // A shim's repair is said on its row, never as the act.
+    assert!(next(vec![fault(c::of(c::SHIMS, "cargo"), "aterm pkg repair")]).is_empty());
+    // An advisory's door, beside a fault without one, is not the act either.
+    assert!(
+        next(vec![
+            Finding::change(
+                c::of(c::STORE, "ay"),
+                Class::Install,
+                "t",
+                "x",
+                "y",
+                door("aterm pkg update")
+            ),
+            Finding::change(
+                c::of(c::FISH_SAFE, "x.sh"),
+                Class::Person,
+                "t",
+                "x",
+                "y",
+                Remedy::None
+            )
+            .essential(),
+        ])
+        .is_empty()
+    );
+    assert!(
+        next(vec![Finding::change(
+            c::of(c::STORE, "ay"),
+            Class::Install,
+            "t",
+            "x",
+            "y",
+            door("z")
+        )])
+        .is_empty()
+    );
+}
+
+/// `--json` prints the rows the text is rendered from, in the one schema
+/// ([`aterm_converge::Report`]): it round-trips, says whether the exit rule held, and
+/// marks the rows that decide it essential — a broken shim fails it while the toolset row
+/// stays ok, the advisories beside it do not.
+#[cfg(unix)]
+#[test]
+fn the_json_report_round_trips_and_names_the_rows_that_fail_it() {
+    let l = layout("json");
+    install(&l, "ay", 18);
+    let home = synthetic_home("json");
+    let path = on_bin(&l);
+    let rows = report_with(&l, Some(&home), Some(&path), 0, None, &Probes::default());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert!(emit(
+        rows.clone(),
+        "doctor",
+        Detail::Problems,
+        true,
+        &mut out,
+        &mut err
+    ));
+    let text = String::from_utf8(out).unwrap();
+    let back: aterm_converge::Report = aterm_json::from_str(text.trim_end()).unwrap();
+    assert_eq!(
+        back,
+        aterm_converge::Report::new(aterm_converge::ReportMode::Check, true, rows)
+    );
+    assert_eq!(aterm_json::to_string(&back).unwrap(), text.trim_end());
+    assert!(back.complete && err.is_empty(), "{text}");
+    let ids: std::collections::BTreeSet<&str> = back.items.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids.len(), back.items.len(), "ids are unique: {text}");
+    for id in [
+        crate::converge::ATPKG,
+        crate::converge::PATH,
+        crate::converge::LIVE,
+        crate::converge::TOOLSET,
+    ] {
+        assert!(ids.contains(id), "{id}: {text}");
+    }
+    assert!(
+        back.items
+            .iter()
+            .all(|r| r.layer.is_some() && r.class.is_some())
+    );
+    // A shim into a build that is not there, beside a working program: its rows fail the
+    // report, essential, while the toolset row still reads the one program active — so
+    // "the toolset row is ok" alone would call this machine done (A29) — and the
+    // advisories beside it (the reroute stubs not laid yet) plan a change and do not fail.
+    let ghost = crate::store::ToolName::new("ghost").unwrap();
+    crate::platform::install_shim(&l.build_dir("ay", 99).join("bin"), &ghost, &l.shim(&ghost))
+        .unwrap();
+    let rows = report_with(&l, Some(&home), Some(&path), 0, None, &Probes::default());
+    assert!(!crate::converge::passes(&rows));
+    let failing: Vec<&ItemReport> = rows.iter().filter(|r| r.fails_surface()).collect();
+    assert_eq!(
+        failing.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        ["base.pkg.shims@ghost", "base.pkg.live@ay"],
+        "the shim, and the program whose bin/ it splits: {rows:#?}"
+    );
+    assert!(
+        failing
+            .iter()
+            .all(|r| r.essential && r.outcome == Outcome::Planned)
+    );
+    assert!(
+        rows.iter().any(|r| r.id == crate::converge::TOOLSET
+            && r.outcome == Outcome::Ok
+            && r.to.as_deref() == Some("1 program(s) active")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.outcome == Outcome::Planned && !r.essential && !r.fails_surface()),
+        "{rows:#?}"
+    );
+    // What `--json` prints: one line, the report, its `complete` the exit rule.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert!(!emit(
+        rows.clone(),
+        "doctor",
+        Detail::Problems,
+        true,
+        &mut out,
+        &mut err
+    ));
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        err.is_empty() && text.ends_with('\n') && text.lines().count() == 1,
+        "{text}"
+    );
+    let printed: aterm_converge::Report = aterm_json::from_str(text.trim_end()).unwrap();
+    assert_eq!(
+        printed,
+        aterm_converge::Report::new(aterm_converge::ReportMode::Check, false, rows)
+    );
+    assert!(text.starts_with(r#"{"schema":1,"mode":"check","complete":false,"items":[{"#));
+    assert!(
+        text.contains(r#""id":"base.pkg.shims@ghost""#) && text.contains(r#""essential":true"#)
+    );
+}
+
+/// A row's class says which surface would fix it (design §3.2): `relay`, the one class an
+/// unattended lane applies, only for what a pass lays and owns. A foreign file where a stub
+/// goes, an exported variable, free disk and what this shell's PATH holds are no pass's:
+/// `person`, applied by nobody — and a foreign file, which nothing touches, has no remedy.
+#[cfg(unix)]
+#[test]
+fn only_what_a_pass_lays_and_owns_is_relay() {
+    let l = layout("classes");
+    install(&l, "ay", 18);
+    let home = synthetic_home("classes");
+    std::fs::create_dir_all(crate::reroute::dir(&l)).unwrap();
+    std::fs::write(
+        crate::reroute::stub_path(&l, "cargo"),
+        "#!/bin/sh\nexec \"$HOME/.cargo/bin/cargo\" \"$@\"\n",
+    )
+    .unwrap();
+    let probes = Probes {
+        retired_env: vec![("ATPKG_DISABLE", "[packages] enabled = false")],
+        cc: Some(crate::prereq::CcVerdict::Ready {
+            driver: PathBuf::from("/usr/bin/cc"),
+        }),
+        workspace: Some(WorkspacePolicyProbe {
+            workspace: PathBuf::from("/work/ty"),
+            policy: WorkspacePolicy::Accepted,
+        }),
+        ..Probes::default()
+    };
+    // Not on PATH: the shell's PATH is the person's, its fix the line they paste.
+    let rows = report_with(&l, Some(&home), None, 0, None, &probes);
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("{id}: {rows:#?}"))
+    };
+    let class_and_remedy = |id: &str| {
+        let r = row(id);
+        (r.class, r.explain.as_ref().map(|e| e.remedy.clone()))
+    };
+    assert_eq!(
+        class_and_remedy("base.pkg.stubs@cargo"),
+        (Some(Class::Person), Some(Remedy::None)),
+        "a foreign file where the stub goes"
+    );
+    assert_eq!(row("base.pkg.env@ATPKG_DISABLE").class, Some(Class::Person));
+    assert_eq!(row(crate::converge::DISK).class, Some(Class::Person));
+    assert_eq!(row(crate::converge::PATH).class, Some(Class::Person));
+    // What a pass lays: a missing stub (`repair`), the shell.d hooks.
+    assert_eq!(
+        class_and_remedy("base.pkg.stubs@rustc"),
+        (Some(Class::Relay), Some(Remedy::Repair))
+    );
+    assert_eq!(row(crate::converge::HOOKS).class, Some(Class::Relay));
+    // The toolset, the C toolchain and the workspace are essential whether or not they fail
+    // now, as an item is.
+    for id in [
+        crate::converge::TOOLSET,
+        crate::converge::CLT,
+        crate::converge::WORKSPACE,
+    ] {
+        let r = row(id);
+        assert!(
+            r.outcome == Outcome::Ok && r.essential && !r.fails_surface(),
+            "{r:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A remedy whose sentence goes on after its act keeps the act in the short row: the copied
+/// command's `run '…/atpkg' repair — it moves this file aside …` (macOS) is too long whole,
+/// and the row still ends with the one command that fixes it.
+#[test]
+fn a_short_row_keeps_the_act_of_a_remedy_that_goes_on_after_it() {
+    use crate::converge::{self as c, Finding};
+    let path = format!("/Users/{}/.local/bin/aterm", "a".repeat(60));
+    let act = "run `'/Applications/aterm.app/Contents/MacOS/atpkg' repair`";
+    let remedy = format!("{act} \u{2014} it moves this file aside and links the app in its place");
+    let rows = crate::converge::report(vec![Finding::change(
+        c::of(c::COPIED_COMMANDS, &path),
+        Class::Asked,
+        path.clone(),
+        format!(
+            "{path} is a file, not a link to the installed aterm, and it runs instead of it (a \
+             copy that never updates, or a build of your own) \u{2014} fix: {remedy}"
+        ),
+        "a link to the installed aterm",
+        Remedy::Person {
+            pane: path.clone(),
+            how: remedy.clone(),
+        },
+    )]);
+    let out = render(&rows, "doctor", Detail::Problems).joined();
+    let shown = out
+        .lines()
+        .find(|l| l.starts_with("doctor: warn \u{2014} "))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(
+        shown.chars().count() <= SHORT_ROW && shown.ends_with(&format!(" \u{2014} fix: {act}")),
+        "{out}"
     );
 }
 
@@ -3258,18 +3741,15 @@ fn the_channel_head_line_names_update_only_where_it_can_land_the_newer_index() {
     let now: i64 = 1_790_000_000;
     let at = |ago: u64| UNIX_EPOCH + Duration::from_secs(now.unsigned_abs() - ago);
     let line = |floor: u64, near, reached_index_at: Option<i64>, held: Option<Vec<u64>>| {
-        let mut out = Vec::new();
-        index_head_line(
+        let (row, _) = index_head_line(
             &CachedProbe { floor, near },
             &LastPass {
                 reached_index_at,
                 held,
             },
             now,
-            "doctor",
-            &mut out,
         );
-        String::from_utf8(out).unwrap()
+        format!("doctor: {}\n", spelled(&row))
     };
     let published = Some((RangeAnswer::Published, at(120)));
     let not_newest = "doctor: warn — index 42 is not the newest";

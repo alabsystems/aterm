@@ -133,7 +133,7 @@ pub struct PrePromote {
     pub commit: Option<String>,
     /// `PUB_VERSION`, named in the transcript.
     pub version: Option<String>,
-    /// `CARGO_TARGET_DIR`: the build goes in its `pre-promote` directory.
+    /// `CARGO_TARGET_DIR`: the build goes in its `pre-promote.noindex` directory.
     pub target: Option<PathBuf>,
     /// `ATERM_RELEASE_CUTTER`: the running release's own cutter, which `ship release`
     /// hands `pub publish` — it answers, and nothing is built.
@@ -299,18 +299,19 @@ fn commit_of(root: &Path, env: &[(String, String)], rev: &str) -> Option<String>
     .filter(|s| !s.is_empty())
 }
 
-/// Where a commit's own cutter builds in its throwaway worktree: `pre-promote` under
-/// `CARGO_TARGET_DIR` (relative to `root`), else under `root`'s target directory. Its
-/// own directory, because cargo would hand the checkout's next `ship` the cutter a
+/// Where a commit's own cutter builds in its throwaway worktree: `pre-promote.noindex`
+/// under `CARGO_TARGET_DIR` (relative to `root`), else under `root`'s target directory.
+/// Its own directory, because cargo would hand the checkout's next `ship` the cutter a
 /// worktree linked into a directory they share (which the cutter then refuses as
 /// compiled elsewhere); the registry dependencies stay warm from one publish to the next.
+/// Named `*.noindex` so Spotlight skips the build with all it holds.
 fn worktree_target(root: &Path, target: Option<&Path>) -> PathBuf {
     let base = match target {
         Some(t) if t.is_absolute() => t.to_path_buf(),
         Some(t) => root.join(t),
         None => root.join("target"),
     };
-    base.join("pre-promote")
+    base.join("pre-promote.noindex")
 }
 
 fn toplevel(cwd: &Path, env: &[(String, String)]) -> Option<PathBuf> {
@@ -492,7 +493,7 @@ pub struct Transforms {
     pub inputs: crate::transforms::Inputs,
     /// A directory of the checkout this cutter was compiled from.
     pub source: PathBuf,
-    /// `CARGO_TARGET_DIR`: the captured commit's cutter builds in its `pre-promote`.
+    /// `CARGO_TARGET_DIR`: the captured commit's cutter builds in its `pre-promote.noindex`.
     pub target: Option<PathBuf>,
     /// [`DELEGATED`], when a delegating run set it.
     pub delegated: Option<String>,

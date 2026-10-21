@@ -1,34 +1,120 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `video … keys` self-evaluation: correlate pre-routing input attempts against the
-//! frames this recording captured.
+//! What a `video` take's `index.json` says about its frames: each frame's `fp` and
+//! `delta`, and the `video … keys` self-evaluation that correlates pre-routing input
+//! attempts against them.
 //!
-//! It is a sampling instrument: a key's effect is seen at the next captured frame, so every
-//! reading is bounded below by the recorder's sampling grid, published beside it
-//! (`capture_floor_ms`). Two limits are disclosed in band; neither filters anything (every
-//! correlated attempt stays in `n` and the percentiles):
+//! `fp` ([`frame_fingerprint`]) is a 53-bit hash of a frame's whole content, so two
+//! frames of one take whose pixels differ anywhere have different `fp` but for a 2⁻⁵³
+//! collision. `delta` ([`changed_tiles`]) is how many 8×8 tiles differ from the
+//! previous captured frame: 0 for the first frame, every tile of the new frame across
+//! a resize.
+//!
+//! The self-evaluation is a sampling instrument: a key's effect is seen at the next
+//! captured frame, so every reading is bounded below by the recorder's sampling grid,
+//! published beside it (`capture_floor_ms`). Three limits are disclosed in band; none
+//! filters anything (every correlated attempt stays in `n` and the percentiles):
 //!
 //! 1. **The capture floor.** At `N` fps an attempt waits up to `1000/N` ms for the next
 //!    look, so a 1 ms and a 15 ms echo read the same at 30 fps. Field names say
 //!    `frame_change` or `capture_`, never latency; `at_capture_floor_n` counts readings that
 //!    are a bound rather than a measurement.
 //! 2. **Cross-attribution during sustained typing.** The observed change is the first
-//!    fingerprint move after the attempt, often the previous key's echo, so readings come
-//!    out faster than reality. A fingerprint cannot say which key moved it, but the cadence
-//!    is observable: when `attempt_gap_p50_ms` is no slower than `frame_change_max_ms`,
-//!    `attempts_outpace_readings` flags the take as ambiguous.
+//!    content change after the attempt, often the previous key's echo, so readings come
+//!    out faster than reality. A content hash cannot say which key changed it, but the
+//!    cadence is observable: when `attempt_gap_p50_ms` is no slower than
+//!    `frame_change_max_ms`, `attempts_outpace_readings` flags the take as ambiguous.
+//! 3. **Any change counts.** The change is any pixel that differs from the frame on
+//!    screen at the attempt, so a cursor blink, a spinner or a clock that changes before
+//!    the echo is read as the response.
 //!
 //! Key→photon latency is out of reach here. The nearest instrument is `ctl metrics
 //! percentiles` (`input_p50/p95/p99_ms`), sampled per keystroke, with its bounds documented
 //! on `crate::control::control_query::cmd_metrics`.
 
+use aterm_gpu::video_tap::CapturedFrame;
+
+/// The side of a `delta` tile, in pixels.
+const TILE: usize = 8;
+
+/// `fp` keeps the low 53 bits of the hash, so every value is an integer a JSON
+/// reader that parses numbers as doubles (jq, JavaScript) holds exactly.
+const FP_MASK: u64 = (1 << 53) - 1;
+
+/// A frame's `fp`: FxHash of its width, height and every RGBA byte, cut to 53 bits.
+/// It is compared only within one take, which one process wrote.
+pub(crate) fn frame_fingerprint(frame: &CapturedFrame) -> u64 {
+    use std::hash::Hasher as _;
+
+    let mut hash = aterm_hash::FxHasher::default();
+    hash.write_u32(frame.w);
+    hash.write_u32(frame.h);
+    hash.write(&frame.rgba);
+    hash.finish() & FP_MASK
+}
+
+/// A frame's `delta`: the number of 8×8 tiles (the right and bottom ones cut to the
+/// frame) whose bytes differ from `prev`, the previous captured frame. 0 without a
+/// previous frame; every tile of `frame` when the dimensions changed.
+///
+/// Rows are compared in memory order, a whole row first, so an unchanged row costs
+/// one `memcmp`; a changed row compares only the tiles of its band not yet known to
+/// differ, and a band's remaining rows are skipped once every tile in it differs.
+pub(crate) fn changed_tiles(prev: Option<&CapturedFrame>, frame: &CapturedFrame) -> u64 {
+    let Some(prev) = prev else {
+        return 0;
+    };
+    let (w, h) = (frame.w as usize, frame.h as usize);
+    let columns = w.div_ceil(TILE);
+    let stride = w * 4;
+    let comparable = prev.w == frame.w
+        && prev.h == frame.h
+        && frame.rgba.len() == stride * h
+        && prev.rgba.len() == frame.rgba.len();
+    if !comparable {
+        return (columns * h.div_ceil(TILE)) as u64;
+    }
+    if stride == 0 {
+        return 0;
+    }
+    let mut changed = vec![false; columns];
+    let mut total = 0;
+    for (band_prev, band) in prev
+        .rgba
+        .chunks(stride * TILE)
+        .zip(frame.rgba.chunks(stride * TILE))
+    {
+        changed.fill(false);
+        let mut found = 0;
+        for (row_prev, row) in band_prev.chunks(stride).zip(band.chunks(stride)) {
+            if row_prev == row {
+                continue;
+            }
+            let tiles = row_prev.chunks(TILE * 4).zip(row.chunks(TILE * 4));
+            for (seen, (tile_prev, tile)) in changed.iter_mut().zip(tiles) {
+                if !*seen && tile_prev != tile {
+                    *seen = true;
+                    found += 1;
+                }
+            }
+            if found == columns {
+                break;
+            }
+        }
+        total += found as u64;
+    }
+    total
+}
+
 /// One correlated attempt, before it is rendered to JSON.
+#[derive(Debug, PartialEq, Eq)]
 struct Correlated {
     /// Attempt stamp, `metrics::now_us` epoch.
     t_us: u64,
-    /// Delay from the attempt to the first captured frame whose fingerprint
-    /// moved. `None` when no captured frame after it moved.
+    /// Delay from the attempt to the first captured frame whose content
+    /// differs from the frame on screen at the attempt. `None` when no captured
+    /// frame after it differs.
     frame_change_us: Option<u64>,
     /// Delay from the attempt to the recorder's next look: the smallest value
     /// `frame_change_us` could take. `None` when no frame was captured at or
@@ -37,11 +123,6 @@ struct Correlated {
     /// Why the row is null, when it is.
     unobserved: Option<&'static str>,
 }
-
-/// Sampled-fingerprint move that counts as "the screen changed". The
-/// fingerprint is a `step_by(64)` byte sum, so a single glyph moves it by far
-/// more than this.
-const FP_CHANGE: u64 = 200;
 
 fn us_to_ms(us: u64) -> f64 {
     us as f64 / 1000.0
@@ -67,13 +148,16 @@ fn capture_interval_us(frames: &[(u64, u64)]) -> Option<u64> {
     Some(gaps[gaps.len() / 2])
 }
 
-/// Median gap between consecutive input attempts (the typing cadence). `None`
-/// for fewer than two attempts. Compared against the readings to detect
-/// cross-attribution (module docs, limit 2).
+/// Median gap between attempts adjacent in time (the typing cadence). `None`
+/// for fewer than two attempts. The ledger is not in time order (a hardware
+/// key is backdated to its arrival), so the stamps are sorted first. Compared
+/// against the readings to detect cross-attribution (module docs, limit 2).
 fn attempt_gap_p50_us(inputs: &[(u64, String)]) -> Option<u64> {
-    let mut gaps: Vec<u64> = inputs
+    let mut stamps: Vec<u64> = inputs.iter().map(|(t, _)| *t).collect();
+    stamps.sort_unstable();
+    let mut gaps: Vec<u64> = stamps
         .windows(2)
-        .map(|w| w[1].0.saturating_sub(w[0].0))
+        .map(|w| w[1].saturating_sub(w[0]))
         .collect();
     if gaps.is_empty() {
         return None;
@@ -84,56 +168,75 @@ fn attempt_gap_p50_us(inputs: &[(u64, String)]) -> Option<u64> {
 
 /// Correlate every attempt against the captured frame series.
 ///
-/// `frames` is `(t_us, fingerprint)` in capture order; `inputs` is
-/// `(t_us, …)` in attempt order.
+/// `frames` is `(t_us, fingerprint)` in capture order, which is stamp order;
+/// `inputs` is `(t_us, …)` in ledger order, which is not (a hardware key is
+/// backdated to its arrival), and row `i` answers `inputs[i]`. Each attempt
+/// finds its frames by binary search, and the first change after its first
+/// frame is a lookup in `next_change`, so the whole correlation is
+/// O(frames + inputs · log frames).
 fn correlate(inputs: &[(u64, String)], frames: &[(u64, u64)]) -> Vec<Correlated> {
+    debug_assert!(
+        frames.windows(2).all(|w| w[0].0 <= w[1].0),
+        "captured frames are stamped in capture order"
+    );
+    // `next_change[j]`: the first frame after `j` whose fingerprint differs
+    // from frame `j`'s.
+    let mut next_change = vec![None; frames.len()];
+    for j in (0..frames.len().saturating_sub(1)).rev() {
+        next_change[j] = if frames[j + 1].1 == frames[j].1 {
+            next_change[j + 1]
+        } else {
+            Some(j + 1)
+        };
+    }
     let mut out = Vec::with_capacity(inputs.len());
-    for (t, _) in inputs {
-        // The reference is the last frame captured strictly before the attempt:
-        // what was on screen when the key was pressed.
-        let Some((_, ref_fp)) = frames.iter().rev().find(|(ft, _)| ft < t).copied() else {
+    for &(t, _) in inputs {
+        // The first frame captured at or after the attempt; the one before it
+        // is the reference, what was on screen when the key was pressed.
+        let first = frames.partition_point(|&(ft, _)| ft < t);
+        let Some(reference) = first.checked_sub(1) else {
             // The attempt predates the first captured frame: keep its row so
             // `key_response` stays as long as `inputs[]`.
             out.push(Correlated {
-                t_us: *t,
+                t_us: t,
                 frame_change_us: None,
                 capture_floor_us: None,
                 unobserved: Some("no captured frame precedes this attempt"),
             });
             continue;
         };
-        let mut after = frames.iter().filter(|(ft, _)| ft >= t).copied();
-        let Some((first_after_us, first_after_fp)) = after.next() else {
+        let Some(&(first_after_us, first_after_fp)) = frames.get(first) else {
             out.push(Correlated {
-                t_us: *t,
+                t_us: t,
                 frame_change_us: None,
                 capture_floor_us: None,
                 unobserved: Some("no captured frame follows this attempt"),
             });
             continue;
         };
-        let capture_floor_us = Some(first_after_us.saturating_sub(*t));
-        let hit_us = if first_after_fp.abs_diff(ref_fp) > FP_CHANGE {
-            Some(first_after_us)
+        let ref_fp = frames[reference].1;
+        // The first frame is the change, or else it shows the reference's
+        // content and the first frame differing from it is its next change.
+        let hit = if first_after_fp == ref_fp {
+            next_change[first]
         } else {
-            after
-                .find(|(_, fp)| fp.abs_diff(ref_fp) > FP_CHANGE)
-                .map(|(ft, _)| ft)
+            Some(first)
         };
-        match hit_us {
-            Some(ft) => out.push(Correlated {
-                t_us: *t,
-                frame_change_us: Some(ft.saturating_sub(*t)),
+        let capture_floor_us = Some(first_after_us.saturating_sub(t));
+        out.push(match hit {
+            Some(j) => Correlated {
+                t_us: t,
+                frame_change_us: Some(frames[j].0.saturating_sub(t)),
                 capture_floor_us,
                 unobserved: None,
-            }),
-            None => out.push(Correlated {
-                t_us: *t,
+            },
+            None => Correlated {
+                t_us: t,
                 frame_change_us: None,
                 capture_floor_us,
                 unobserved: Some("no captured frame after this attempt changed"),
-            }),
-        }
+            },
+        });
     }
     out
 }
@@ -141,7 +244,9 @@ fn correlate(inputs: &[(u64, String)], frames: &[(u64, u64)]) -> Vec<Correlated>
 /// The sentence that travels with every reading, in band, so grepping a single
 /// line still gets it.
 const SEMANTICS: &str = "frame_change_ms is the delay from a pre-routing input ATTEMPT to the first \
-     frame THIS RECORDING CAPTURED whose fingerprint moved. It is the recorder's observation, NOT \
+     frame THIS RECORDING CAPTURED whose content hash differs from the frame on screen at the \
+     attempt. Any pixel change counts, a cursor blink included, so a blink before the echo is read \
+     as the response. It is the recorder's observation, NOT \
      key->photon latency: it cannot go below capture_floor_ms (the wait until this take's next \
      captured frame), it cannot tell which attempt caused the change it saw (see \
      attempts_outpace_readings), and it observes neither compositor pickup nor scanout. For \
@@ -421,5 +526,200 @@ mod tests {
         let (inputs, frames) = take(50_000, 1_000, &[40_000, 148_000, 255_000], 400_000);
         let block = analysis_block(&inputs, &frames);
         assert_eq!(field(&block, "capture_interval_p50_ms"), "50.0", "{block}");
+    }
+
+    /// The typing cadence is measured between attempts adjacent in time,
+    /// whatever order the ledger holds them in.
+    #[test]
+    fn the_typing_cadence_is_measured_in_time_order() {
+        let ledger: Inputs = [300_000u64, 0, 200_000, 100_000]
+            .iter()
+            .map(|t| (*t, String::new()))
+            .collect();
+        assert_eq!(attempt_gap_p50_us(&ledger), Some(100_000));
+        // Negative control: gaps taken in ledger order read this cadence as 0.
+        let mut naive: Vec<u64> = ledger
+            .windows(2)
+            .map(|w| w[1].0.saturating_sub(w[0].0))
+            .collect();
+        naive.sort_unstable();
+        assert_eq!(naive[naive.len() / 2], 0);
+    }
+
+    /// The quadratic correlation the binary search replaced: per attempt, scan
+    /// every frame for the reference, the first frame and the first change.
+    fn reference_correlate(inputs: &[(u64, String)], frames: &[(u64, u64)]) -> Vec<Correlated> {
+        let row = |t_us, frame_change_us, capture_floor_us, unobserved| Correlated {
+            t_us,
+            frame_change_us,
+            capture_floor_us,
+            unobserved,
+        };
+        inputs
+            .iter()
+            .map(|&(t, _)| {
+                let Some(&(_, ref_fp)) = frames.iter().rev().find(|(ft, _)| *ft < t) else {
+                    return row(
+                        t,
+                        None,
+                        None,
+                        Some("no captured frame precedes this attempt"),
+                    );
+                };
+                let mut after = frames.iter().filter(|(ft, _)| *ft >= t);
+                let Some(&(first_us, _)) = after.clone().next() else {
+                    return row(
+                        t,
+                        None,
+                        None,
+                        Some("no captured frame follows this attempt"),
+                    );
+                };
+                match after.find(|(_, fp)| *fp != ref_fp) {
+                    Some(&(ft, _)) => row(t, Some(ft - t), Some(first_us - t), None),
+                    None => row(
+                        t,
+                        None,
+                        Some(first_us - t),
+                        Some("no captured frame after this attempt changed"),
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    /// Seeded takes with repeated fingerprints, equal stamps, attempts before
+    /// the first frame and after the last, and ledgers out of time order: the
+    /// binary-search correlation gives the quadratic reference's rows, in
+    /// ledger order.
+    #[test]
+    fn correlate_matches_the_reference_on_shuffled_inputs() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let mut out_of_order = 0;
+        for _ in 0..200 {
+            let mut ft = next(50);
+            let frames: Frames = (0..next(40))
+                .map(|_| {
+                    ft += next(3) * 10;
+                    (ft, next(3))
+                })
+                .collect();
+            let inputs: Inputs = (0..next(30))
+                .map(|_| (next(ft + 100), String::new()))
+                .collect();
+            out_of_order += usize::from(inputs.windows(2).any(|w| w[0].0 > w[1].0));
+            assert_eq!(
+                correlate(&inputs, &frames),
+                reference_correlate(&inputs, &frames),
+                "inputs {inputs:?}\nframes {frames:?}"
+            );
+        }
+        // Negative control: most ledgers really were out of time order.
+        assert!(out_of_order > 100, "{out_of_order}");
+    }
+
+    /// A `w`×`h` frame whose pixel at `(x, y)` is `paint(x, y)`.
+    fn frame(w: u32, h: u32, paint: impl Fn(u32, u32) -> [u8; 4]) -> CapturedFrame {
+        let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&paint(x, y));
+            }
+        }
+        CapturedFrame {
+            seq: 0,
+            t_us: 0,
+            w,
+            h,
+            rgba,
+        }
+    }
+
+    /// The strided byte sum `fp` was before it hashed the whole frame, kept to
+    /// show what each fixture below would have hidden.
+    fn legacy_fp(frame: &CapturedFrame) -> u64 {
+        frame.rgba.iter().step_by(64).map(|&b| u64::from(b)).sum()
+    }
+
+    /// Every channel of every pixel counts, wherever it is: a green-only and a
+    /// blue-only change, a pixel off the 16-pixel grid and a one-row scroll each
+    /// change `fp` and `delta`, while identical frames keep both.
+    #[test]
+    fn fingerprint_sees_every_channel_column_and_scroll() {
+        const W: u32 = 32;
+        const H: u32 = 16;
+        let paint = |x: u32, y: u32| {
+            [
+                (x * 7 + y * 13) as u8,
+                (x * 3 + y * 5) as u8,
+                (x * 11 + y * 17) as u8,
+                255,
+            ]
+        };
+        let base = frame(W, H, paint);
+        let same = frame(W, H, paint);
+        assert_eq!(frame_fingerprint(&same), frame_fingerprint(&base));
+        assert_eq!(changed_tiles(Some(&base), &same), 0);
+        let touched = |at: (u32, u32), edit: fn([u8; 4]) -> [u8; 4]| {
+            frame(W, H, move |x, y| {
+                let pixel = paint(x, y);
+                if (x, y) == at { edit(pixel) } else { pixel }
+            })
+        };
+        let cases = [
+            (
+                "green only",
+                touched((16, 3), |[r, g, b, a]| [r, g ^ 1, b, a]),
+                1,
+            ),
+            (
+                "blue only",
+                touched((0, 9), |[r, g, b, a]| [r, g, b ^ 0x80, a]),
+                1,
+            ),
+            (
+                "column 5",
+                touched((5, 0), |[r, g, b, a]| [r ^ 1, g, b, a]),
+                1,
+            ),
+            ("scroll", frame(W, H, |x, y| paint(x, (y + 1) % H)), 8),
+        ];
+        for (what, changed, tiles) in &cases {
+            assert_ne!(
+                frame_fingerprint(changed),
+                frame_fingerprint(&base),
+                "{what}"
+            );
+            assert!(frame_fingerprint(changed) <= FP_MASK, "{what}");
+            assert_eq!(changed_tiles(Some(&base), changed), *tiles, "{what}");
+            // Negative control: the strided sum reads this change as none.
+            assert_eq!(legacy_fp(changed), legacy_fp(&base), "{what}");
+        }
+    }
+
+    /// `delta` counts whole tiles: the cut right and bottom tiles count like
+    /// whole ones, a resize changes every tile of the new frame, and the first
+    /// frame has nothing to differ from.
+    #[test]
+    fn delta_counts_cut_tiles_and_a_resize_changes_every_tile() {
+        let paint = |x: u32, y: u32| [x as u8, y as u8, 0, 255];
+        // 3 × 2 tiles; the last column and the last band are cut.
+        let small = frame(20, 12, paint);
+        assert_eq!(changed_tiles(None, &small), 0);
+        let corner = frame(20, 12, |x, y| {
+            if (x, y) == (19, 11) {
+                [0; 4]
+            } else {
+                paint(x, y)
+            }
+        });
+        assert_eq!(changed_tiles(Some(&small), &corner), 1);
+        assert_eq!(changed_tiles(Some(&small), &frame(40, 12, paint)), 10);
     }
 }

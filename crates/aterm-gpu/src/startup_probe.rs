@@ -11,8 +11,13 @@
 //! * Zero means unset: a sub-ns leg records as 1 ns; a leg that never ran (the CPU fallback)
 //!   reads 0, making the frontend's `startup_gpu_valid` false.
 //! * Durations, not stamps: the legs run on two threads with no shared epoch.
+//! * Published in build order: [`record`] stores with Release and [`leg_ns`] loads with Acquire,
+//!   and [`Leg::PipeTotal`] is the last leg a build records (the font thread is joined before
+//!   it), so a reader that loads it first and finds it set reads every leg and cell-pipeline
+//!   split of that build. A reader on another thread racing a build in flight finds it unset,
+//!   never half a build.
 //!
-//! Cost: one `Instant::now()` pair and one relaxed compare-exchange per leg, off the frame path.
+//! Cost: one `Instant::now()` pair and one release compare-exchange per leg, off the frame path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,12 +88,13 @@ fn slot_ns(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1)
 }
 
-/// Record `elapsed` for `leg`, first write wins (see the module docs).
+/// Record `elapsed` for `leg`, first write wins, publishing every leg recorded before it (see
+/// the module docs).
 pub fn record(leg: Leg, elapsed: Duration) {
     let _ = LEG_NS[leg as usize].compare_exchange(
         0,
         slot_ns(elapsed),
-        Ordering::Relaxed,
+        Ordering::Release,
         Ordering::Relaxed,
     );
 }
@@ -118,9 +124,10 @@ pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
     now
 }
 
-/// Read one leg; 0 means it never ran in this process.
+/// Read one leg; 0 means it never ran in this process. Set, it carries every leg recorded
+/// before it (see the module docs).
 pub fn leg_ns(leg: Leg) -> u64 {
-    LEG_NS[leg as usize].load(Ordering::Relaxed)
+    LEG_NS[leg as usize].load(Ordering::Acquire)
 }
 
 /// Read the per-cell-pipeline split, in [`CELL_PIPELINE_NAMES`] order.

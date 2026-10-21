@@ -955,9 +955,10 @@ mod tests {
         stamp_success(&l, "2026-09-16T00:00:00Z").unwrap();
         std::fs::set_permissions(l.status(), std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(l.status()).is_ok() {
-            // Running as root: a mode cannot refuse this read.
             let _ = std::fs::remove_dir_all(&l.prefix);
-            return;
+            aterm_uds::host::could_not_run(
+                "a mode-0 file read anyway: root, or a file system that ignores modes",
+            );
         }
         let error = stamp_success(&l, "2026-09-17T00:00:00Z").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
@@ -1255,7 +1256,7 @@ mod tests {
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let fixed = records(&model);
         assert!(fixed.len() > 20, "{}", fixed.len());
-        for (i, state) in fixed.iter().enumerate() {
+        crate::testdir::each_side_by_side(&fixed, |i, state| {
             let now = crate::flow::now_unix();
             let (l, sink) = realize(&format!("tier1-{i}"), state, true, now);
             let stamps = pass_stamps(&l, now);
@@ -1269,10 +1270,10 @@ mod tests {
             );
             drop(sink);
             let _ = std::fs::remove_dir_all(&l.prefix);
-        }
+        });
         let old = records(&buggy);
         assert!(old.len() > 5, "{}", old.len());
-        for (i, state) in old.iter().enumerate() {
+        crate::testdir::each_side_by_side(&old, |i, state| {
             let now = crate::flow::now_unix();
             let (l, sink) = realize(&format!("tier1-old-{i}"), state, false, now);
             let legacy = legacy_stamps(&l, now);
@@ -1292,7 +1293,7 @@ mod tests {
             );
             drop(sink);
             let _ = std::fs::remove_dir_all(&l.prefix);
-        }
+        });
         // The replayed defect: a success an interval old, then the head watch writes.
         let defect = super::full_pass_rule_tier1::walk(
             &model,

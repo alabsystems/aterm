@@ -77,6 +77,7 @@ fn record(local_id: u64) -> SessionRecord {
         journal_key: None,
         task: None,
         status_seen: None,
+        autopilot_end: None,
     }
 }
 
@@ -496,7 +497,10 @@ fn a_history_deeper_than_one_export_keeps_the_newest_and_counts_the_rest() {
 fn an_older_successor_is_handed_no_export() {
     assert!(exports_for_target(100, 100));
     assert!(exports_for_target(100, 101));
-    assert!(!exports_for_target(101, 100), "a rollback has no importer");
+    assert!(
+        !exports_for_target(101, 100),
+        "a rollback to a build before v0.94.0 has no importer"
+    );
 }
 
 #[test]
@@ -1364,6 +1368,45 @@ fn a_frame_corrupt_for_any_other_reason_still_refuses_the_sidecar() {
             .err(),
         Some("a sha other than its stamp")
     );
+}
+
+/// AN IMPORT RINGS ITS SESSION'S SCREEN READERS. The attach moves the screen
+/// generation (it invalidates the scroll state) with no output, on the import
+/// worker, so only the end of its own hold can push that to a `screen` or
+/// `cells` subscriber. Negative control: a watcher that reads no screen is not
+/// rung.
+#[test]
+fn an_import_rings_the_sessions_screen_readers() {
+    use crate::session_watch::{Subscription, Watchers};
+    use std::sync::atomic::Ordering;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    write_lines(&mut term.lock().unwrap(), "line", 0, 3000);
+    let crossed = cross(dir.path(), &term, |_| {});
+    let mut adopted = open_sidecar(dir.path(), &crossed.manifest.sessions[0]);
+    let successor = adopt(&crossed.checkpoint, &mut adopted);
+    let watchers = Arc::<Watchers>::default();
+    watchers.bind_frame(&successor);
+    let other = Subscription::single(&watchers);
+    let mut screen = Subscription::new();
+    let flag = screen.watch_frame(&watchers);
+    flag.store(false, Ordering::Release);
+    let generation = || crate::frame_key::FrameKey::read(&successor.lock().unwrap()).generation();
+    let before = generation();
+
+    let report = import_one(&successor, adopted);
+    assert_eq!(report.failed, None);
+    assert!(report.imported > 1000, "REACH: the history came back");
+    assert_ne!(
+        generation(),
+        before,
+        "the premise: the attach moved the screen"
+    );
+    assert!(
+        flag.load(Ordering::Acquire) && screen.wait(Duration::ZERO),
+        "the import's hold rang the screen readers"
+    );
+    assert!(!other.wait(Duration::ZERO), "and only them");
 }
 
 /// A session scrolled back at the park crosses with its viewport (lines from

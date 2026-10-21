@@ -7,8 +7,15 @@
 //! through the `spawn agent=claude` path, raised, with no role and `from=ctl`,
 //! whose task is [`FLEET_BRIEF`] (or [`MAC_BRIEF`]): read the survey once, say
 //! what needs the person, what each machine's managers and workers are doing
-//! and what finished, and end. Its result arrives where every `from=ctl` task's
-//! does (the menu bar's Done for you).
+//! and what finished. It runs under Autopilot Land, as every worker does
+//! ([`crate::task_launch::WORKER_AUTOPILOT`]): it changes nothing, so its
+//! clean `Nothing left:` defense (a read-only summary, nothing to land) is its
+//! landing, and its end. It starts in aterm's own folder for it
+//! ([`summary_folder`]), never where the focused pane was: Land lands only
+//! over a repository the probe finds nothing in, and the pane's repository is
+//! the person's own work, which the summary must not be told to land. Its
+//! result arrives where every `from=ctl` task's does (the menu bar's Done for
+//! you).
 //!
 //! The row is grey with the reason in its tool tip while a worker cannot
 //! start here ([`StartBlock`], the spawn's own checks plus a `claude` on the
@@ -21,22 +28,26 @@ use std::time::{Duration, Instant};
 
 /// The task Summarize the Fleet gives its worker. FACTS and one finishable
 /// task, never standing orders; SELF-CONTAINED: it names no filesystem path,
-/// because the worker's cwd is wherever the focused pane was and an installed
-/// aterm has no repo checkout.
+/// because the worker's folder is aterm's own ([`summary_folder`]) and an
+/// installed aterm has no repo checkout. It asks for no token: under Land the worker's
+/// end is its landing, and a read-only summary has nothing to land.
 pub(crate) const FLEET_BRIEF: &str = "Summarize this aterm fleet for the person reading this \
 tab. Run `aterm ctl survey --fleet` once. Write, in this order: first what needs the person \
 (the machine, the session, and why); then what each machine's managers and workers are doing; \
-then what finished. Change nothing and start nothing. Say in ordinary language when the summary is complete.";
+then what finished. Change nothing and start nothing: this is a read-only summary, with nothing \
+to commit, push or land.";
 
 /// [`FLEET_BRIEF`] for a Mac in no fleet: the same summary of this Mac's
 /// sessions, from `aterm ctl survey`.
 pub(crate) const MAC_BRIEF: &str = "Summarize this Mac's aterm sessions for the person reading \
 this tab. Run `aterm ctl survey` once. Write, in this order: first what needs the person (the \
 session, and why); then what each manager and its workers are doing; then what finished. \
-Change nothing and start nothing. Say in ordinary language when the summary is complete.";
+Change nothing and start nothing: this is a read-only summary, with nothing to commit, push or \
+land.";
 
 /// The worker order Summarize spawns: the brief alone, no fact line naming a
-/// starter (no client waits on it; its task record's `from=` is `ctl`).
+/// starter (no client waits on it; its task record's `from=` is `ctl`), under
+/// Autopilot Land, so its end is its landing.
 pub(crate) fn summary_order(fleet: bool) -> crate::task_launch::TaskOrder {
     let brief = if fleet { FLEET_BRIEF } else { MAC_BRIEF };
     crate::task_launch::TaskOrder {
@@ -45,7 +56,98 @@ pub(crate) fn summary_order(fleet: bool) -> crate::task_launch::TaskOrder {
         caller: None,
         trusted_cwd: None,
         fact_line: false,
+        autopilot: aterm_agent::supervise::Autopilot::Land,
     }
+}
+
+/// The name of [`summary_folder`] under aterm's state root.
+const SUMMARY_FOLDER: &str = "summary";
+
+/// THE FOLDER A SUMMARY'S WORKER STARTS IN: `<state>/summary`, aterm's own,
+/// made on first use and private to this user (0o700 on unix). A summary
+/// changes nothing, so it has nothing to land: started where the focused pane
+/// was, Land's fourth condition — the repository probe, in the session's
+/// folder — read that pane's repository, the person's own work, and the
+/// summary's clean defense never landed; the worker was nudged without end to
+/// commit, merge and push someone else's work (the review of 2026-10-20). The
+/// probe reads nothing here ([`in_summary_folder_under`]). `None` where the state
+/// root resolves to nothing or the folder cannot be made private: the press
+/// then books nothing ([`NO_SUMMARY_FOLDER`], [`summary_spawn`]) rather than
+/// fall back to the focused pane's folder.
+pub(crate) fn summary_folder() -> Option<std::path::PathBuf> {
+    summary_folder_under(&aterm_types::dirs::state_dir()?)
+}
+
+/// [`summary_folder`] under the state root `state`: made if it is not there
+/// yet, then made owner-only; a folder whose mode cannot be set is no folder.
+fn summary_folder_under(state: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = state.join(SUMMARY_FOLDER);
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(dir)
+}
+
+/// Why Summarize books nothing where aterm has no folder of its own to start
+/// the worker in ([`summary_folder`]).
+pub(crate) const NO_SUMMARY_FOLDER: &str =
+    "no folder of aterm's own to start the summary in (no state directory)";
+
+/// Whether `dir` is the summary folder under the state root `state`
+/// ([`summary_folder`]) or inside it, as given or resolved: no repository work
+/// there is anyone's to land (`harness_host`'s probe of a session's repository
+/// reads nothing for it). The caller reads the state root once: a test names
+/// its own, since the process's can be another test's for a while (a test
+/// scopes `ATERM_STATE_HOME` for its body, and that read does not wait for it).
+pub(crate) fn in_summary_folder_under(dir: &std::path::Path, state: &std::path::Path) -> bool {
+    let folder = state.join(SUMMARY_FOLDER);
+    dir.starts_with(&folder)
+        || folder
+            .to_str()
+            .and_then(crate::spawn_folder::canonical_folder)
+            .is_some_and(|canon| dir.starts_with(canon))
+}
+
+/// The booking a summary's worker is spawned with: in a new tab, raised, in
+/// `folder` ([`summary_folder`]), its admission the summary's single flight.
+pub(crate) fn summary_booking(
+    folder: &std::path::Path,
+) -> crate::control::control_media::SpawnBooking {
+    crate::control::control_media::SpawnBooking {
+        cwd: folder.to_str().map(str::to_string),
+        split: None,
+        raise: true,
+        admission: crate::tab_spawn::SpawnAdmission::Summary,
+    }
+}
+
+/// What Summarize books in `folder` ([`summary_folder`]): its order
+/// ([`summary_order`]), trusting that folder alone as a spawn's named folder
+/// is, and its booking ([`summary_booking`]). With no folder it books
+/// nothing and says why ([`NO_SUMMARY_FOLDER`]): the focused pane's folder is
+/// a person's repository, where Land would press the read-only summary to
+/// commit and push that person's work.
+fn summary_spawn(
+    fleet: bool,
+    folder: Option<&std::path::Path>,
+) -> Result<
+    (
+        crate::task_launch::TaskOrder,
+        crate::control::control_media::SpawnBooking,
+    ),
+    String,
+> {
+    let folder = folder.ok_or_else(|| NO_SUMMARY_FOLDER.to_string())?;
+    let order = crate::task_launch::TaskOrder {
+        trusted_cwd: folder
+            .to_str()
+            .and_then(crate::spawn_folder::canonical_folder),
+        ..summary_order(fleet)
+    };
+    Ok((order, summary_booking(folder)))
 }
 
 /// Why Summarize cannot start a worker here, said in the row's tool tip:
@@ -97,24 +199,91 @@ const CLAUDE_LOOK_TTL: Duration = Duration::from_secs(2);
 /// (launchd's four dirs, for a Finder or Dock launch) plus aterm's managed
 /// `agents/` and `bin/` and the places a foreign `claude` measurably lives
 /// ([`crate::spawn::fallback_child_path`]). A handful of stat calls, looked
-/// at again after [`CLAUDE_LOOK_TTL`] so an install or uninstall mid-run is
-/// noticed; only the managed layout is resolved once.
+/// at again after [`CLAUDE_LOOK_TTL`], off the main thread ([`Look`]), so an
+/// install or uninstall mid-run is noticed; only the managed layout is
+/// resolved once.
 pub(crate) fn claude_on_path() -> bool {
     #[cfg(test)]
     if let Some(answer) = CLAUDE_ON_PATH_FOR_TEST.get() {
         return answer;
     }
-    static LOOK: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-    let now = Instant::now();
-    let mut look = LOOK.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((at, answer)) = *look
-        && now.saturating_duration_since(at) < CLAUDE_LOOK_TTL
-    {
-        return answer;
+    static LOOK: Look = Look::new();
+    LOOK.answer(
+        CLAUDE_LOOK_TTL,
+        "aterm-claude-look",
+        claude_on_path_now,
+        Instant::now(),
+    )
+}
+
+/// A yes or no about the file system that the main thread asks on the way to
+/// every wait (the menu's live bits: [`claude_on_path`], [`in_fleet`]): the
+/// first answer is looked at where it is asked — the launch has just read the
+/// same home folder — and every look after it, once the last is older than
+/// its TTL, on a thread of its own, one at a time, the last answer standing
+/// meanwhile. Looked at again on the main thread, a home on a network volume
+/// that stopped answering held every window there until the server came back
+/// (measured in a macOS 27 guest, 2026-10-20: a `call_main` verb waited out
+/// its 30 s twice); now that thread waits alone.
+pub(crate) struct Look {
+    state: Mutex<LookState>,
+}
+
+#[derive(Clone, Copy)]
+struct LookState {
+    /// The last look's answer, and when it ended.
+    last: Option<(bool, Instant)>,
+    /// A look is out on its own thread.
+    looking: bool,
+}
+
+impl Look {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: Mutex::new(LookState {
+                last: None,
+                looking: false,
+            }),
+        }
     }
-    let answer = claude_on_path_now();
-    *look = Some((now, answer));
-    answer
+
+    /// The answer at `now`: the first look's, made here; after it the last
+    /// look's, with the next started off this thread (`name`) once that one is
+    /// older than `ttl` and none is out.
+    pub(crate) fn answer(
+        &'static self,
+        ttl: Duration,
+        name: &'static str,
+        look: fn() -> bool,
+        now: Instant,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((answer, at)) = state.last else {
+            let answer = look();
+            state.last = Some((answer, now));
+            return answer;
+        };
+        if !state.looking && now.saturating_duration_since(at) >= ttl {
+            state.looking = true;
+            let spawned =
+                crate::qos::spawn_lane_thread(name, crate::qos::Role::Background, move || {
+                    let answer = look();
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    *state = LookState {
+                        last: Some((answer, Instant::now())),
+                        looking: false,
+                    };
+                });
+            if spawned.is_err() {
+                // No thread to look on: the answer stands a TTL longer.
+                *state = LookState {
+                    last: Some((answer, now)),
+                    looking: false,
+                };
+            }
+        }
+        answer
+    }
 }
 
 #[cfg(test)]
@@ -154,22 +323,20 @@ const FLEET_LOOK_TTL: Duration = Duration::from_secs(15);
 
 /// WHETHER THIS MAC IS IN A FLEET, for the Agents rows and Summarize's brief:
 /// the one answer the fleet glance's book reads too
-/// (`fleet_glance::holds_fleet_key`), looked at once per [`FLEET_LOOK_TTL`]
-/// on the main thread; no state directory is no fleet (the rows that need
-/// one grey).
+/// (`fleet_glance::holds_fleet_key`), looked at again once per
+/// [`FLEET_LOOK_TTL`], off the main thread ([`Look`]); no state directory is
+/// no fleet (the rows that need one grey).
 pub(crate) fn in_fleet() -> bool {
-    static LOOK: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-    let now = Instant::now();
-    let mut look = LOOK.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((at, answer)) = *look
-        && now.saturating_duration_since(at) < FLEET_LOOK_TTL
-    {
-        return answer;
-    }
-    let answer = aterm_types::dirs::state_dir()
-        .is_some_and(|dir| crate::fleet_glance::holds_fleet_key(&dir));
-    *look = Some((now, answer));
-    answer
+    static LOOK: Look = Look::new();
+    LOOK.answer(
+        FLEET_LOOK_TTL,
+        "aterm-fleet-look",
+        || {
+            aterm_types::dirs::state_dir()
+                .is_some_and(|dir| crate::fleet_glance::holds_fleet_key(&dir))
+        },
+        Instant::now(),
+    )
 }
 
 impl crate::App {
@@ -199,19 +366,13 @@ impl crate::App {
         if self.tab_spawns.summary_pending() {
             return Err(SUMMARY_STARTING.to_string());
         }
-        let plan = self.resolve_spawn(
-            crate::control::SpawnAim::Front,
-            None,
-            Some(summary_order(in_fleet())),
-        )?;
+        // In aterm's own folder, trusted as a spawn's named folder is; with
+        // none, nothing is booked.
+        let (order, booking) = summary_spawn(in_fleet(), summary_folder().as_deref())?;
+        let plan = self.resolve_spawn(crate::control::SpawnAim::Front, None, Some(order))?;
         self.book_spawn(
             plan,
-            crate::control::control_media::SpawnBooking {
-                cwd: None,
-                split: None,
-                raise: true,
-                admission: crate::tab_spawn::SpawnAdmission::Summary,
-            },
+            booking,
             Box::new(|app, spawned| {
                 match spawned {
                     // No client waits on a reply: the worker's launcher
@@ -238,7 +399,8 @@ mod tests {
 
     /// The two briefs are one finishable task each: the survey they read
     /// (the fleet's with `--fleet`, this Mac's without), an ordinary report, no
-    /// standing order, no filesystem path, and no role for the worker.
+    /// standing order, no filesystem path, no role for the worker, and
+    /// nothing to land, under Land.
     #[test]
     fn the_briefs_read_the_survey_once_and_end() {
         for (fleet, survey) in [
@@ -252,7 +414,145 @@ mod tests {
             assert!(!brief.contains("meta set role"), "no role");
             assert_eq!(order.caller, None, "from=ctl");
             assert!(!order.fact_line);
+            assert_eq!(
+                order.autopilot,
+                aterm_agent::supervise::Autopilot::Land,
+                "spawned under Land: its end is its landing"
+            );
         }
+    }
+
+    /// A SUMMARY STARTS IN ATERM'S OWN FOLDER ([`summary_folder`],
+    /// [`summary_booking`]), and the probe of a session's repository reads
+    /// nothing there (`harness_host::session_repo_work`), so its clean
+    /// defense lands under Land, a repository there or not. The review of
+    /// 2026-10-20 found the summary started in the focused pane's folder,
+    /// where the person's own dirty repository kept its landing off for
+    /// good. NEGATIVE CONTROL: the same dirty repository elsewhere is found
+    /// by the probe.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_summary_starts_in_aterms_own_folder_where_no_repository_is_read() {
+        // A state root of the test's own, read once: the process's is another
+        // test's while that test scopes `ATERM_STATE_HOME`, and a read of it
+        // between the folder and the probe (a loaded run) found the folder no
+        // summary's and its repository work.
+        let state = aterm_tempfile::tempdir().expect("state root");
+        let folder = summary_folder_under(state.path()).expect("the summary folder");
+        assert!(folder.is_dir() && in_summary_folder_under(&folder, state.path()));
+        let booking = summary_booking(&folder);
+        assert_eq!(booking.cwd.as_deref(), folder.to_str());
+        assert!(booking.raise);
+        // A dirty repository made there, as a state root inside a checkout
+        // would put one: still nothing read.
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = aterm_uds::spawnfd::command("git")
+                .args([
+                    "-c",
+                    "user.name=Andrew Yates",
+                    "-c",
+                    "user.email=a@example.invalid",
+                ])
+                .args([
+                    "-c",
+                    "init.defaultBranch=main",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let dirty = |dir: &std::path::Path| {
+            git(dir, &["init", "-q", "."]);
+            std::fs::write(dir.join("notes.md"), "x").expect("notes");
+        };
+        dirty(&folder);
+        let home = aterm_tempfile::tempdir().expect("home");
+        assert_eq!(
+            crate::harness_host::session_repo_work_under(
+                &folder,
+                Some(home.path()),
+                Some(state.path())
+            ),
+            None
+        );
+        // NEGATIVE CONTROLS.
+        let elsewhere = aterm_tempfile::tempdir().expect("tmp");
+        dirty(elsewhere.path());
+        assert!(!in_summary_folder_under(elsewhere.path(), state.path()));
+        let found = crate::harness_host::session_repo_work_under(
+            elsewhere.path(),
+            Some(home.path()),
+            Some(state.path()),
+        );
+        assert!(found.is_some_and(|w| w.untracked == 1));
+    }
+
+    /// THE SUMMARY FOLDER IS PRIVATE ([`summary_folder_under`]): made under
+    /// the state root it is given, owner-only (0o700) on unix even where the
+    /// umask would leave it readable by others, and found again. NEGATIVE
+    /// CONTROL: a state root that cannot hold it (a file in its place) gives
+    /// no folder.
+    #[test]
+    fn the_summary_folder_is_private_to_its_owner() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Already there, readable by everyone: the mode is still set.
+            let there = root.path().join(SUMMARY_FOLDER);
+            std::fs::create_dir(&there).expect("pre-made");
+            std::fs::set_permissions(&there, std::fs::Permissions::from_mode(0o755))
+                .expect("world-readable");
+        }
+        let folder = summary_folder_under(root.path()).expect("made");
+        assert_eq!(folder, root.path().join(SUMMARY_FOLDER));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&folder)
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "owner-only");
+        }
+        assert_eq!(summary_folder_under(root.path()), Some(folder));
+        let blocked = aterm_tempfile::tempdir().expect("tempdir");
+        std::fs::write(blocked.path().join(SUMMARY_FOLDER), b"").expect("a file in its place");
+        assert_eq!(
+            summary_folder_under(blocked.path()),
+            None,
+            "CONTROL: no folder"
+        );
+    }
+
+    /// WITH NO FOLDER OF ITS OWN, SUMMARIZE REFUSES ([`summary_spawn`]) with
+    /// a plain reason instead of booking a tab where the focused pane was (a
+    /// person's repository, where Land would press the summary to commit and
+    /// push their work). NEGATIVE CONTROL: given its folder, it books there,
+    /// raised, trusting that folder alone.
+    #[test]
+    fn summarize_with_no_folder_of_its_own_refuses_in_plain_words() {
+        let refused = summary_spawn(true, None).map(|_| ());
+        assert_eq!(refused, Err(NO_SUMMARY_FOLDER.to_string()));
+        assert!(!NO_SUMMARY_FOLDER.contains("ATERM-TASK-DONE"));
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let folder = summary_folder_under(root.path()).expect("made");
+        let (order, booking) = summary_spawn(false, Some(&folder)).expect("CONTROL: books");
+        assert_eq!(booking.cwd.as_deref(), folder.to_str(), "started there");
+        assert!(booking.raise && booking.split.is_none());
+        let canonical = std::fs::canonicalize(&folder).expect("canonical");
+        assert_eq!(
+            order.trusted_cwd.as_deref(),
+            canonical.to_str(),
+            "trusted there"
+        );
+        assert_eq!(order.autopilot, aterm_agent::supervise::Autopilot::Land);
     }
 
     /// Summarize starts nothing where no worker can start: a headless test
@@ -428,5 +728,69 @@ mod tests {
                 assert!(app.worker_shell().is_ok(), "{version} takes the operand");
             }
         }
+    }
+
+    /// THE MENU'S LIVE FILE BITS ARE LOOKED AT AGAIN OFF THE MAIN THREAD: the
+    /// first answer is looked at where it is asked; once it is older than its
+    /// TTL the next ask starts one look on a thread of its own and answers the
+    /// last at once, without waiting for it, and asks while it is out start no
+    /// other; once it has ended its answer stands. NEGATIVE CONTROL: looked at
+    /// again where it is asked, the stale ask waits for the look (here held
+    /// until the test lets it go) and answers it.
+    #[test]
+    fn a_stale_look_is_looked_at_again_off_the_asking_thread() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Condvar, PoisonError};
+        static LOOK: Look = Look::new();
+        static LOOKS: AtomicUsize = AtomicUsize::new(0);
+        static ANSWER: AtomicBool = AtomicBool::new(false);
+        static GATE: (Mutex<bool>, Condvar) = (Mutex::new(true), Condvar::new());
+        fn look() -> bool {
+            LOOKS.fetch_add(1, Ordering::SeqCst);
+            let (open, bell) = &GATE;
+            let open = open.lock().unwrap_or_else(PoisonError::into_inner);
+            // Held until the test lets it go, or for the minute that is this
+            // test's hang detector.
+            let _ = bell
+                .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
+                .unwrap_or_else(PoisonError::into_inner);
+            ANSWER.load(Ordering::SeqCst)
+        }
+        let ttl = Duration::from_secs(2);
+        let t0 = Instant::now();
+        assert!(
+            !LOOK.answer(ttl, "aterm-test-look", look, t0),
+            "the first, here"
+        );
+        assert_eq!(LOOKS.load(Ordering::SeqCst), 1);
+        assert!(!LOOK.answer(ttl, "aterm-test-look", look, t0 + Duration::from_secs(1)));
+        assert_eq!(LOOKS.load(Ordering::SeqCst), 1, "fresh: no look");
+        // The next look is held, and finds the answer moved.
+        *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
+        ANSWER.store(true, Ordering::SeqCst);
+        let stale = t0 + ttl * 2;
+        assert!(
+            !LOOK.answer(ttl, "aterm-test-look", look, stale),
+            "stale: the last answer, at once"
+        );
+        let began = Instant::now();
+        while LOOKS.load(Ordering::SeqCst) < 2 {
+            assert!(began.elapsed() < Duration::from_secs(60), "no look started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!LOOK.answer(ttl, "aterm-test-look", look, stale));
+        assert_eq!(LOOKS.load(Ordering::SeqCst), 2, "one look out at a time");
+        *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        GATE.1.notify_all();
+        let began = Instant::now();
+        // Asked as of `t0`: the ended look's own stamp is later, so it is fresh.
+        while !LOOK.answer(ttl, "aterm-test-look", look, t0) {
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "the look never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(LOOKS.load(Ordering::SeqCst), 2);
     }
 }

@@ -361,8 +361,11 @@ mod tests {
     use std::os::fd::{AsRawFd as _, IntoRawFd as _};
     use std::os::unix::fs::MetadataExt as _;
 
+    /// The node `fd` names, read from the descriptor itself, never by its `/dev/fd` path:
+    /// on Darwin that lookup reads an open descriptor as closed while anything else looks
+    /// the number up.
     fn node(fd: i32) -> Option<(u64, u64)> {
-        std::fs::metadata(format!("/dev/fd/{fd}"))
+        aterm_uds::spawnfd::descriptor_metadata(fd)
             .ok()
             .map(|meta| (meta.dev(), meta.ino()))
     }

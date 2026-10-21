@@ -8,11 +8,12 @@
 //! pass's `progress.json` and retires its `pass-owed.json` promise in the prefix, each by a
 //! rename or a removal. A watch on both directories makes those edges promptly visible —
 //! the shim the moment it lands, and the pass's end or the promise's retirement (an offline
-//! first launch's whole answer) the moment it is written rather than up to a poll later: a
-//! vnode watch on macOS (kqueue), an inotify watch on Linux, a change notification on
-//! Windows. The old 250 ms poll remains the fallback on every other platform and after
-//! watch failure. A notification is only a hint: the caller always re-reads the pass first,
-//! then the shim, before deciding whether to run or fail.
+//! first launch's whole answer) the moment it is written rather than up to a poll later:
+//! [`crate::dirwatch::Watcher`] on macOS (kqueue) and Linux (inotify), and this module's
+//! own change notification on Windows, where that watcher has no arm. The old 250 ms poll
+//! remains the fallback on every other platform and after watch failure. A notification is
+//! only a hint: the caller always re-reads the pass first, then the shim, before deciding
+//! whether to run or fail.
 
 use std::time::Duration;
 
@@ -84,172 +85,41 @@ impl PendingShimWake {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// Both directories under one [`crate::dirwatch::Watcher`]: an entry renamed into,
+/// out of or removed from either, or either moved or removed, wakes [`Self::wait`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct DirWatch {
-    _dirs: Vec<std::fs::File>,
-    kq: std::os::fd::OwnedFd,
+    watcher: crate::dirwatch::Watcher,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only Linux retires")
+    )]
+    ids: Vec<crate::dirwatch::WatchId>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl DirWatch {
-    /// One kqueue over every directory of `dirs`: an entry renamed into, out of or removed
-    /// from any of them wakes [`Self::wait`].
     fn new(dirs: &[std::path::PathBuf]) -> std::io::Result<Self> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        // SAFETY: kqueue creates a new descriptor owned by this process.
-        let raw = unsafe { libc::kqueue() };
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `raw` is fresh and exclusively ours.
-        let kq = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        // SAFETY: F_SETFD changes only this descriptor's close-on-exec flag.
-        unsafe { libc::fcntl(kq.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
-        let mut files = Vec::with_capacity(dirs.len());
-        for dir in dirs {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(dir)?;
-            if !file.metadata()?.is_dir() {
-                return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory));
-            }
-            let change = libc::kevent {
-                ident: file.as_raw_fd() as libc::uintptr_t,
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-                fflags: libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            // SAFETY: one initialized change entry, and no output slot.
-            let rc = unsafe {
-                libc::kevent(
-                    kq.as_raw_fd(),
-                    &change,
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            if rc < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            files.push(file);
-        }
-        Ok(Self { _dirs: files, kq })
-    }
-
-    fn wait(&self, timeout: Duration) -> std::io::Result<bool> {
-        use std::os::fd::AsRawFd as _;
-
-        // SAFETY: kevent initializes this output slot before it is read.
-        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
-        let ts = libc::timespec {
-            tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
-            tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
-        };
-        // SAFETY: the initialized timeout and output slot live for this call.
-        let rc =
-            unsafe { libc::kevent(self.kq.as_raw_fd(), std::ptr::null(), 0, &mut event, 1, &ts) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if rc == 0 {
-            return Ok(false);
-        }
-        if event.flags & libc::EV_ERROR != 0 {
-            return Err(std::io::Error::from_raw_os_error(event.data as i32));
-        }
-        Ok(true)
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct DirWatch {
-    fd: std::os::fd::OwnedFd,
-    wds: Vec<libc::c_int>,
-}
-
-#[cfg(target_os = "linux")]
-impl DirWatch {
-    /// One inotify instance over every directory of `dirs`: an entry created in, renamed
-    /// into or out of, or removed from any of them, or the directory itself moved or
-    /// removed, wakes [`Self::wait`] — the edges the macOS arm's `NOTE_WRITE`,
-    /// `NOTE_DELETE` and `NOTE_RENAME` report. `IN_ONLYDIR | IN_DONT_FOLLOW` refuses a
-    /// symlink or a non-directory, as that arm's `O_NOFOLLOW` open and directory check do.
-    fn new(dirs: &[std::path::PathBuf]) -> std::io::Result<Self> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
-        use std::os::unix::ffi::OsStrExt as _;
-
-        const MASK: u32 = libc::IN_CREATE
-            | libc::IN_DELETE
-            | libc::IN_MOVED_FROM
-            | libc::IN_MOVED_TO
-            | libc::IN_DELETE_SELF
-            | libc::IN_MOVE_SELF
-            | libc::IN_ONLYDIR
-            | libc::IN_DONT_FOLLOW;
-        // SAFETY: inotify_init1 creates a new descriptor owned by this process.
-        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `raw` is fresh and exclusively ours.
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        let mut wds = Vec::with_capacity(dirs.len());
-        for dir in dirs {
-            let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
-            // SAFETY: `path` is NUL-terminated and outlives the call.
-            let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), MASK) };
-            if wd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            wds.push(wd);
-        }
-        Ok(Self { fd, wds })
+        let watcher = crate::dirwatch::Watcher::new()?;
+        let ids = dirs
+            .iter()
+            .map(|dir| watcher.add_dir(dir))
+            .collect::<std::io::Result<_>>()?;
+        Ok(Self { watcher, ids })
     }
 
     /// Takes every watch off, leaving the descriptor open ([`PendingShimWake::retire`]).
-    /// A watch the kernel already dropped (its directory removed) answers `EINVAL`,
-    /// which leaves nothing to undo.
+    #[cfg(target_os = "linux")]
     fn unwatch(&self) {
-        use std::os::fd::AsRawFd as _;
-
-        for &wd in &self.wds {
-            // SAFETY: `wd` was returned for this descriptor, which is still open.
-            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
+        for &id in &self.ids {
+            self.watcher.remove(id);
         }
     }
 
-    /// Whether an event is queued within `timeout`. The queue is never read here: a wake
-    /// replaces this watch ([`PendingShimWake::wait`]), and the queue goes with it.
+    /// Whether either directory moved within `timeout`. Nothing else wakes this watcher:
+    /// a wake replaces the watch ([`PendingShimWake::wait`]).
     fn wait(&self, timeout: Duration) -> std::io::Result<bool> {
-        use std::os::fd::AsRawFd as _;
-
-        let mut pfd = libc::pollfd {
-            fd: self.fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // Rounded up: a sub-millisecond remainder must not turn into a zero-timeout spin.
-        let ms = timeout.as_nanos().div_ceil(1_000_000);
-        let ms = libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX);
-        // SAFETY: one initialized pollfd that lives for this call.
-        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if rc == 0 {
-            return Ok(false);
-        }
-        if pfd.revents & libc::POLLIN == 0 {
-            return Err(std::io::Error::other("the inotify descriptor failed"));
-        }
-        Ok(true)
+        Ok(!self.watcher.wait(Some(timeout))?.is_empty())
     }
 }
 
@@ -269,7 +139,8 @@ unsafe extern "system" {
     ) -> u32;
 }
 
-/// One change-notification handle per directory, each closed with the watch.
+/// One change-notification handle per directory, each closed with the watch: this
+/// module's own Windows arm, since [`crate::dirwatch`] has none there.
 #[cfg(windows)]
 struct DirWatch {
     handles: Vec<*mut core::ffi::c_void>,
@@ -427,8 +298,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn retiring_takes_the_watches_off_and_keeps_the_descriptor() {
-        use std::os::fd::AsRawFd as _;
-
         let dir = crate::testdir::dir("atpkg-pending-wake-retire-");
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         let layout = Layout {
@@ -439,8 +308,8 @@ mod tests {
             .watch
             .as_ref()
             .expect("the test requires a live directory watch")
-            .fd
-            .as_raw_fd();
+            .watcher
+            .inotify_fd();
         let watches = || {
             std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
                 .expect("the descriptor is open")

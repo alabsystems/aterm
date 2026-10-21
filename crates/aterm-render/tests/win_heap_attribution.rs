@@ -115,6 +115,7 @@ fn the_font_seal_maps_its_system_faces_and_keeps_no_heap_copy() {
         peak_kb - live_kb
     );
 
+    let mut unchecked = Vec::new();
     for (ch, what, files) in [
         ('\u{D55C}', "Hangul", &["malgun.ttf"][..]),
         ('\u{4F60}', "a CJK ideograph", &["msyh.ttc"][..]),
@@ -126,7 +127,7 @@ fn the_font_seal_maps_its_system_faces_and_keeps_no_heap_copy() {
     ] {
         let fonts = std::path::Path::new("C:\\Windows\\Fonts");
         if !files.iter().any(|file| fonts.join(file).is_file()) {
-            eprintln!("draw: {what} not checked: this host has none of {files:?}");
+            unchecked.push(format!("{what} (none of {files:?})"));
             continue;
         }
         let key = r.glyph_key(ch);
@@ -144,5 +145,9 @@ fn the_font_seal_maps_its_system_faces_and_keeps_no_heap_copy() {
             "{what} fell back to the primary face: the mapped {files:?} was lost"
         );
         assert!(ink > 0, "{what} drew no ink from its mapped face {files:?}");
+    }
+    // The draws this host has faces for ran first; a script it lacks did not.
+    if !unchecked.is_empty() {
+        aterm_spec::host::could_not_run(format!("no face here to draw {}", unchecked.join(", ")));
     }
 }

@@ -304,7 +304,7 @@ fn agent_primer_line(config: &crate::app_config::Config) -> String {
 /// the bundle passes `Some`, as with `lock_modifiers` / `user_input_recent`.
 ///
 /// `unknown` means aterm did not look, never denial, and `granted` never claims no prompt
-/// can appear. The scope rule lives in [`crate::control_privacy::observed_fda_scope`],
+/// can appear. The scope rule lives in [`crate::privacy_report::observed_fda_scope`],
 /// which the `privacy` verb renders from too, so the two surfaces agree.
 pub(crate) fn privacy_line(
     config: &crate::app_config::Config,
@@ -336,7 +336,7 @@ pub(crate) fn privacy_line(
         // passes under `SpikeEvidence::MEASURED`. Per-folder state stays unknown:
         // testing a folder is what raises the dialog.
         scope =
-            crate::control_privacy::observed_fda_scope(fda, aterm_containment::FdaScope::Unknown,)
+            crate::privacy_report::observed_fda_scope(fda, aterm_containment::FdaScope::Unknown,)
                 .as_str(),
         warmup = config.privacy_warmup().as_str(),
         hold = config.privacy_warmup_hold_ms(),
@@ -674,7 +674,7 @@ pub(crate) fn config_semantic_warnings(
                     .to_string(),
             });
         }
-        // The master switch outranks both features below. Only an authored key is
+        // The master switch outranks the features below. Only an authored key is
         // flagged: an absent one resolves the same but has no token to underline (as in
         // the environment-override walk).
         if privacy.enabled == Some(false) {
@@ -700,6 +700,14 @@ pub(crate) fn config_semantic_warnings(
                          launch",
                         warmup.as_str()
                     ),
+                });
+            }
+            if privacy.observer == Some(true) {
+                warnings.push(ConfigSemanticWarning {
+                    key: "privacy.observer",
+                    message: "privacy.observer = true has no effect while privacy.enabled = \
+                              false; the tccd log is never read"
+                        .to_string(),
                 });
             }
         }
@@ -1891,14 +1899,25 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
             .map(|issue| format!("{issue} (ignored at load)")),
     );
     for (key, value) in [
-        ("cursor_trail_color", config.cursor_trail_color.as_deref()),
-        ("cursor_trail_accent", config.cursor_trail_accent.as_deref()),
+        (
+            crate::prefs::EDIT_CURSOR_TRAIL_COLOR,
+            config.cursor_trail_color.as_deref(),
+        ),
+        (
+            crate::prefs::EDIT_CURSOR_TRAIL_ACCENT,
+            config.cursor_trail_accent.as_deref(),
+        ),
     ] {
         if let Some(s) = value
-            && aterm_types::scheme::parse_hex(s).is_none()
+            && !crate::prefs::color_value_is_valid(key, s)
         {
+            let expected = if key == crate::prefs::EDIT_CURSOR_TRAIL_COLOR {
+                "#RRGGBB, #RGB or cursor"
+            } else {
+                "#RRGGBB or #RGB"
+            };
             warnings.push(format!(
-                "{key}: expected #RRGGBB or #RGB, got {s:?} (ignored at load)"
+                "{key}: expected {expected}, got {s:?} (ignored at load)"
             ));
         }
     }
@@ -3379,14 +3398,14 @@ ink = "rainbow"
         assert!(config_semantic_warnings(&parsed("[privacy]\nauto_accept = false\n")).is_empty());
     }
 
-    /// With the master switch off, an authored `notice` or `warmup` cannot fire and is
-    /// flagged; an absent one expresses no expectation and is not.
+    /// With the master switch off, an authored `notice`, `warmup` or `observer` cannot
+    /// fire and is flagged; an absent one expresses no expectation and is not.
     #[test]
     fn privacy_master_switch_off_flags_the_features_it_silences() {
         let warnings = config_semantic_warnings(&parsed(
-            "[privacy]\nenabled = false\nnotice = true\nwarmup = \"on-request\"\n",
+            "[privacy]\nenabled = false\nnotice = true\nwarmup = \"on-request\"\nobserver = true\n",
         ));
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
             warnings.iter().any(|w| w.key == "privacy.notice"),
             "{warnings:?}"
@@ -3395,12 +3414,16 @@ ink = "rainbow"
             warnings.iter().any(|w| w.key == "privacy.warmup"),
             "{warnings:?}"
         );
+        assert!(
+            warnings.iter().any(|w| w.key == "privacy.observer"),
+            "{warnings:?}"
+        );
         // Off with nothing else authored: no token to underline, nothing said.
         assert!(config_semantic_warnings(&parsed("[privacy]\nenabled = false\n")).is_empty());
         // On with both: they work, so there is nothing to warn about.
         assert!(
             config_semantic_warnings(&parsed(
-                "[privacy]\nenabled = true\nnotice = true\nwarmup = \"never\"\n"
+                "[privacy]\nenabled = true\nnotice = true\nwarmup = \"never\"\nobserver = true\n"
             ))
             .is_empty()
         );

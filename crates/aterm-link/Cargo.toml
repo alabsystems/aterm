@@ -40,6 +40,14 @@ aterm-tempfile = { workspace = true }
 # looks for the `.base` and `.state` sidecars, which nothing in aterm creates.
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
+# astream's address grammar (`subject::validate_filter_str`), the one the broker
+# parses a subscription with: `aterm fabric tail --filter` refuses at the parse,
+# before a broker is dialled, a filter the broker's grammar would refuse after
+# it. Only the grammar: a well-formed filter the caps do not grant still dials
+# and is the broker's to refuse, and the fleet segment is tail's check against
+# the config. Zero dependencies, and already in the shipped graph through
+# astream-broker.
+astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 # The kernel's boot session (`boot_session`), aterm-link's ONE reading of this
 # boot (`durability::this_boot`): the boot the broker opens its log in and judges
 # a legacy relaxed mark by (`durability.rs`, "One boot, one reading"), and whether
@@ -77,6 +85,13 @@ aterm-toml = { workspace = true }
 # `pthread_sigmask` and `sigwait`, for a relaxed broker's clean stop
 # (`cli::take_stop_signals`): the workspace's own libc (crates/aterm-libc).
 libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The kernel's process records, read in-process where `aterm fabric` once ran
+# `ps -A -ww` (the broker and bridges it looks for) and `lsof -d txt` (the
+# image a broker runs): `fabric::process_table`, `fabric::running_image_inode`.
+# Linux reads `/proc` and keeps `ps`.
+aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]
 # The unit tests' derived models and hang detectors.

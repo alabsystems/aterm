@@ -27,9 +27,11 @@
 //!   `NSApplication` exists it reads the `AppleInterfaceStyle` default.
 //! * Linux asks the XDG desktop portal (`org.freedesktop.appearance
 //!   color-scheme`) and watches its `SettingChanged` signal, falling back to
-//!   GNOME's `color-scheme` key through `gsettings`, on a worker thread. Both
-//!   are bounded CLI reads (`gdbus`, `gsettings`): the crate carries no D-Bus
-//!   client (the zbus graph was dropped, see `Cargo.toml`).
+//!   GNOME's `color-scheme` key through `gsettings`, on a worker thread, with
+//!   bounded CLI reads (`gdbus`, `gsettings`). The launch read, on the main
+//!   thread before session 0, asks a running portal only, over aterm-dbus
+//!   (`portal_settings`), then `gsettings`: one that is not running is left to
+//!   the worker, whose `gdbus` read starts it.
 //! * Windows keeps winit's window theme, which there IS the OS setting (its
 //!   caption is resolved separately, `platform_win`).
 //!
@@ -285,8 +287,17 @@ mod desktop {
     /// How long one read may take. The launch read runs on the main thread
     /// before the first window, so it is bounded well under a visible delay;
     /// a slower desktop answers "unknown" and the engine default stands until
-    /// the watcher's own read lands.
+    /// the watcher's own read lands. On Linux it never waits for a portal to
+    /// start ([`read_now`]): one installed with no backend for the desktop
+    /// never starts, and every launch waited out this bound for it.
     const READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// How long the watcher's portal read may take, on its own thread: `gdbus`'s
+    /// own call timeout (`--timeout=1`, [`portal_read_args`]). On Linux it is the
+    /// first read that may start the portal ([`read_now`] never does), at the
+    /// first window's attach; held to [`READ_BOUND`], a portal whose start took
+    /// longer than that was never followed, and the watcher settled on gsettings.
+    const WATCH_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// The portal's `color-scheme` value: `1` prefer dark, `2` prefer light,
     /// `0` no preference. No preference is LIGHT: the desktops that answer it
@@ -360,9 +371,9 @@ mod desktop {
         ]
     }
 
-    /// One bounded portal read.
-    fn read_portal() -> Option<Appearance> {
-        crate::platform::read_bounded_stdout("gdbus", &portal_read_args(), READ_BOUND)
+    /// One portal read within `bound`.
+    fn read_portal(bound: std::time::Duration) -> Option<Appearance> {
+        crate::platform::read_bounded_stdout("gdbus", &portal_read_args(), bound)
             .as_deref()
             .and_then(parse_portal_read)
             .and_then(portal_color_scheme)
@@ -379,9 +390,30 @@ mod desktop {
         .and_then(parse_gsettings)
     }
 
-    /// The desktop's appearance now: the portal, else gsettings.
+    /// The desktop's appearance now, the launch read: the portal, else
+    /// gsettings.
     pub(super) fn read_now() -> Option<Appearance> {
-        read_portal().or_else(read_gsettings)
+        read_running_portal().or_else(read_gsettings)
+    }
+
+    /// The portal's reading if it is running, asked in-process
+    /// (`portal_settings`, which never starts it): no `gdbus` child, and no
+    /// wait for a portal that cannot start (200 ms of a Linux window's launch
+    /// before, 2026-10-20). The watcher's `gdbus` read starts one that can
+    /// ([`WATCH_READ_BOUND`]).
+    #[cfg(target_os = "linux")]
+    fn read_running_portal() -> Option<Appearance> {
+        crate::portal_settings::read(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, READ_BOUND)
+            .as_ref()
+            .and_then(aterm_dbus::Value::as_u32)
+            .and_then(portal_color_scheme)
+    }
+
+    /// The other unixes have no in-process portal reader (aterm-dbus is a
+    /// Linux dependency): the bounded `gdbus` read.
+    #[cfg(not(target_os = "linux"))]
+    fn read_running_portal() -> Option<Appearance> {
+        read_portal(READ_BOUND)
     }
 
     /// A long-running watcher (`gdbus monitor`, `gsettings monitor`) TETHERED
@@ -473,7 +505,7 @@ mod desktop {
             PORTAL_PATH,
         ];
         if let Some(watcher) = tethered("gdbus", &portal_monitor)
-            && let Some(now) = read_portal()
+            && let Some(now) = read_portal(WATCH_READ_BOUND)
         {
             follow(watcher, now, post, "the XDG desktop portal", |line| {
                 parse_portal_signal(line).and_then(portal_color_scheme)

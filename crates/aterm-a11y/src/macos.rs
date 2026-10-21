@@ -869,6 +869,10 @@ fn role(role: Role) -> &'static str {
         Role::ListBoxOption => "AXRow",
         Role::Menu => "AXMenu",
         Role::ProgressIndicator => "AXProgressIndicator",
+        // A gauge, not a task: VoiceOver reads a level indicator's value as
+        // a level ("3.1 of 10").
+        Role::Meter => "AXLevelIndicator",
+        Role::Grid => "AXGrid",
         Role::Slider => "AXSlider",
         Role::Tab => "AXRadioButton",
         Role::TabList => "AXTabGroup",
@@ -932,6 +936,15 @@ mod tests {
         fn do_action(&mut self, _: ActionRequest) {
             panic!("offscreen action");
         }
+    }
+
+    /// The stats bars' gauges read as level indicators and their core
+    /// heatmap as a grid; a progress bar stays a progress indicator.
+    #[test]
+    fn a_meter_is_a_level_indicator_and_a_grid_a_grid() {
+        assert_eq!(role(Role::Meter), "AXLevelIndicator");
+        assert_eq!(role(Role::Grid), "AXGrid");
+        assert_eq!(role(Role::ProgressIndicator), "AXProgressIndicator");
     }
 
     #[test]

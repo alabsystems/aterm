@@ -66,7 +66,7 @@ trust_island! {
             (publishSplitStep1 seq).hasSentAt = false := rfl
 
         -- Model of PTY reader batch cap selection (8 KiB interactive vs 64 KiB bulk)
-        -- when note_window_input (inputPending) runs before vs after term_lock_ui.
+        -- when input_hint::arm (inputPending) runs before vs after term_lock_ui.
         def ptyBatchCap (inputPending : Bool) : Nat :=
           if inputPending = true then 8192 else 65536
 
@@ -143,6 +143,25 @@ pub(crate) struct OutputEchoTracker {
     /// counts what a person or controller sent ([`Self::input_sent`]).
     sent: AtomicU64,
     published: Mutex<OutputEchoPublished>,
+}
+
+/// How a paste's insert is priced for the cursor engine ([`DeliveryTicket::insert`]),
+/// from the text the formatter sends: a single-line body in cells
+/// (`Terminal::paste_insert_cells`); one line of more than zero cells and the one
+/// line break after it (`LF`, `CR` or `CR LF`, which go out as one `CR`: a link
+/// copied with its line ending) as [`InsertWidth::Line`], so the line is lit when
+/// its echo draws the break's new line in the same frame; any other body is the
+/// unknown class.
+pub(crate) fn paste_insert_width(text: &str, ambiguous_width_double: bool) -> InsertWidth {
+    use aterm_core::terminal::Terminal;
+    if let Some(cells) = Terminal::paste_insert_cells(text, ambiguous_width_double) {
+        return InsertWidth::Cells(cells);
+    }
+    text.strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix(['\n', '\r']))
+        .and_then(|line| Terminal::paste_insert_cells(line, ambiguous_width_double))
+        .filter(|&cells| cells > 0)
+        .map_or(InsertWidth::Unknown, InsertWidth::Line)
 }
 
 /// What a queued write's completion re-stamps on the cursor engines. A paste, and
@@ -520,12 +539,6 @@ impl OutputEchoTracker {
             0
         };
         out
-    }
-
-    /// Allocation-free raw editor-input arm for trait hosts that already own
-    /// the exact bytes and must preserve them verbatim.
-    pub(crate) fn begin_raw_editor(&self, bytes: &[u8]) -> OutputEchoWrite<'_> {
-        self.begin(OutputEchoInput::raw_editor(bytes))
     }
 
     /// Samples echo evidence against the render frame's injected clock. Each stamp is
@@ -1436,6 +1449,14 @@ pub(crate) mod paste_order {
         ) -> Result<crate::input::EgressReceipt, RecvTimeoutError> {
             self.0.recv_timeout(bound)
         }
+
+        /// Test-only: a receipt and the sender the writer would answer it on.
+        #[cfg(test)]
+        #[cfg_attr(not(unix), allow(dead_code))] // its tests are unix-only
+        pub(crate) fn for_test() -> (SyncSender<crate::input::EgressReceipt>, Written) {
+            let (tx, rx) = sync_channel(1);
+            (tx, Written(rx))
+        }
     }
 
     /// ConPTY has no non-blocking write, so an inline key or report on Windows could
@@ -1625,7 +1646,6 @@ pub(crate) mod paste_order {
                 let at = timeline.slog().now();
                 timeline.slog_mut().open_session(None, at);
             }
-            let subscribers = crate::subscribe::new_registry();
             let caller = |word: &str| {
                 Some(crate::typed_by::Caller::new(crate::typed_by::Who::Word(
                     word.to_owned(),
@@ -1634,7 +1654,6 @@ pub(crate) mod paste_order {
             let credited = || handle.ctx.typed.last().map(|t| t.by.words());
             let mark = InputMark::at_epoch(
                 &handle.ctx,
-                Some(&subscribers),
                 73,
                 aterm_slog::Actor::Bridge,
                 crate::session_log::InputVerb::Feed,
@@ -1690,7 +1709,6 @@ pub(crate) mod paste_order {
             // A fresh actor/factory could mark: dropping an unrun job must not.
             let cancelled = InputMark::at_epoch(
                 &handle.ctx,
-                None,
                 73,
                 aterm_slog::Actor::Harness,
                 crate::session_log::InputVerb::Key,
@@ -1711,7 +1729,6 @@ pub(crate) mod paste_order {
             );
             let refused = InputMark::at_epoch(
                 &handle.ctx,
-                None,
                 73,
                 aterm_slog::Actor::Ctl,
                 crate::session_log::InputVerb::Key,
@@ -1766,7 +1783,6 @@ pub(crate) mod paste_order {
             assert_eq!(testing::input_count(&handle), 2);
             let stale = InputMark::at_epoch(
                 &handle.ctx,
-                None,
                 73,
                 aterm_slog::Actor::Harness,
                 crate::session_log::InputVerb::Send,
@@ -1813,7 +1829,6 @@ pub(crate) mod paste_order {
             );
             let current = InputMark::at_epoch(
                 &handle.ctx,
-                None,
                 73,
                 aterm_slog::Actor::Harness,
                 crate::session_log::InputVerb::Send,
@@ -2626,7 +2641,7 @@ fn release_overscroll(
 /// `page_rows` is the viewport height the seam read under its lock
 /// ([`input::WheelViewport::rows`]).
 fn wheel_viewport_lines(notch_lines: i32, page_rows: u16, detent: bool) -> i32 {
-    input::wheel_platform_lines(notch_lines, page_rows, detent)
+    input::wheel_platform_lines(input::WheelPlatform::Host, notch_lines, page_rows, detent)
 }
 
 /// The modifier-independent (unshifted base) logical key of a winit event, used for
@@ -2989,22 +3004,75 @@ fn find_suspends_action(action: keybinding::Action) -> bool {
     )
 }
 
-/// Classify the terminal-only Emacs navigation chords after layout normalization.
-/// Bare Super-S/Super-R (when `HARDCODED_SUPER_CHORDS` is enabled) and bare
-/// Control-S/Control-R qualify: adding Shift, Alt, or both Super+Control leaves the
-/// chord available to its existing owner. The caller intentionally runs this only
-/// after the native-view and configured-keybinding boundaries.
-fn terminal_emacs_search_direction(base: &Key, mods: ModifiersState) -> Option<bool> {
+/// Classify the terminal-only Emacs navigation chords after layout normalization:
+/// `Some(forward)` when the press opens (or repeats) aterm's find, `None` when it
+/// stays with its existing owner.
+///
+/// Bare Super-S/Super-R (when `HARDCODED_SUPER_CHORDS` is enabled) are aterm's in
+/// every terminal. Bare Control-S/Control-R are aterm's only where
+/// `agent_composer` answers that an agent's composer owns the front prompt
+/// ([`App::front_agent_composer`]); anywhere else the foreground program owns
+/// them, as in every terminal: bash's readline reverse-i-search (emacs mode's
+/// C-r, stepping back with each further press inside it), zle, fish, a REPL,
+/// and vim's redo, including an editor an agent handed the terminal to. A
+/// bare Control-S reaches the tty first: under its default IXON it is XOFF
+/// (output pauses until Ctrl-Q, or until any key where IXANY is set, as on
+/// macOS), and only after `stty -ixon` does readline see it as
+/// forward-search-history. `agent_composer` is asked only for a bare
+/// Control-S/R. Adding Shift, Alt, or both Super+Control leaves the chord
+/// with its existing owner. The caller
+/// intentionally runs this only after the native-view and configured-keybinding
+/// boundaries; an open find bar takes Control-S/R as its own isearch-repeat
+/// below them (`App::search_repeat_action`).
+fn terminal_emacs_search_direction(
+    base: &Key,
+    mods: ModifiersState,
+    agent_composer: impl FnOnce() -> bool,
+) -> Option<bool> {
     let bare_super = HARDCODED_SUPER_CHORDS && mods == ModifiersState::SUPER;
     let bare_ctrl = mods == ModifiersState::CONTROL;
     if !bare_super && !bare_ctrl {
         return None;
     }
-    match base {
-        Key::Character(key) if key.eq_ignore_ascii_case("s") => Some(true),
-        Key::Character(key) if key.eq_ignore_ascii_case("r") => Some(false),
-        _ => None,
-    }
+    let forward = match base {
+        Key::Character(key) if key.eq_ignore_ascii_case("s") => true,
+        Key::Character(key) if key.eq_ignore_ascii_case("r") => false,
+        _ => return None,
+    };
+    (bare_super || agent_composer()).then_some(forward)
+}
+
+/// The shipping `SessionFactory::handed_terminal`: whether the program leading
+/// foreground group `pgid` has handed the terminal to another program in its
+/// group. That is a member reading the leader's own input device
+/// ([`aterm_sysprobe::stdin_sharers`]) under a published name
+/// ([`crate::session_status::program::program_of`]) that [`hands_the_terminal_off`]:
+/// Claude Code's `$EDITOR`, started with inherited stdio and no group of its
+/// own. `false` for no group, or where the group cannot be read. Asked only
+/// for a bare Ctrl-R/Ctrl-S under an identified agent
+/// ([`App::front_agent_composer`]).
+pub(crate) fn agent_handed_terminal(pgid: i32) -> bool {
+    let Some(leader) = u32::try_from(pgid).ok().filter(|pgid| *pgid > 0) else {
+        return false;
+    };
+    aterm_sysprobe::stdin_sharers(leader).is_some_and(|members| {
+        members.into_iter().any(|member| {
+            i32::try_from(member)
+                .ok()
+                .and_then(crate::session_status::program::program_of)
+                .is_some_and(|name| hands_the_terminal_off(&name))
+        })
+    })
+}
+
+/// Whether a member named `program` that reads its group leader's input took
+/// the terminal from it: any program but an agent ([`aterm_phase::program_of`])
+/// or a runtime one runs as ([`aterm_phase::may_host_agent`]). An agent a
+/// launcher runs as its child on the launcher's own stdio (a `node` script
+/// starting the native binary, a runtime relaunching itself) IS the agent in
+/// front, not a handoff.
+fn hands_the_terminal_off(program: &str) -> bool {
+    aterm_phase::program_of(program).is_none() && !aterm_phase::may_host_agent(program)
 }
 
 fn font_zoom_repeat_action(
@@ -3093,6 +3161,14 @@ fn next_kitty_summon_ident(seq: &mut u64, tag: u64) -> u64 {
     tag ^ *seq
 }
 
+/// What a press hands the predictor: a typed glyph, or an edit key
+/// (`Predictor::predict_edit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PredictKey {
+    Glyph(char),
+    Edit(crate::predict::EditKey),
+}
+
 /// One pure classification of a committed Key/Text/KeySequence press, computed once
 /// at the top of `input_to_session`'s key arm and read by every effect feed on that
 /// path (predictor arming, cursor-FX hints, post-egress cosmetic feeds). Pure over
@@ -3101,11 +3177,11 @@ struct PressClass<'ev> {
     /// One classified input intent for the resident pet. This is not a claim
     /// about delivery or changed ink; the post-egress caller admits it once.
     console_input: Option<PetInputKind>,
-    /// Predictive-echo candidate for a bare printable key (no ⌃/⌥/⌘):
-    /// `(Some(glyph), false)` registers a speculative glyph, `(None, true)` is a
-    /// Backspace retraction. The predictor's `predict_mode` gate stays at the call
-    /// site.
-    predict_candidate: Option<(Option<char>, bool)>,
+    /// Predictive-echo candidate: a bare printable key (no ⌃/⌥/⌘) as the glyph
+    /// it types, or an edit key the predictor models (Backspace, and a bare
+    /// main-block `←` or `→`). The predictor's `predict_mode` gate stays at the
+    /// call site.
+    predict_candidate: Option<PredictKey>,
     /// Forward-typing direction for the kitty-cursor momentum, independent of the
     /// predictor's mode gate: a visible char, space or newline advances, a backspace
     /// moves back; other keys leave momentum to decay.
@@ -3422,9 +3498,81 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     // press means (a glyph, a submit, a caret move, a kill), where the keypad is a
     // second main block. `PressClass` never gates bytes, so the fold cannot reach
     // the encoder.
+    // The arrows the predictor models: a bare `←` or `→`, from the main block or
+    // the keypad (NumLock off), which the legacy encoder sends alike (`ESC [ D`,
+    // `ESC O D` under DECCKM; `encode_navigation_named_legacy` takes
+    // `NumpadArrowLeft` with `ArrowLeft`, DECKPAM or not). Bare means bare:
+    // Shift, Ctrl, Alt and Super arrows are word motions, selections or the
+    // window's, and Hyper and Meta are no chord a line editor reads as a plain
+    // arrow. A LOCK is not a chord: Caps Lock and Num Lock ride on every press
+    // while they are on (`keymap::lock_modifiers`; Num Lock is on by default on
+    // most Windows keyboards), and the legacy encoder drops them, so the arrow
+    // still sends `ESC [ D`. Only Kitty's encoder sends either kind otherwise
+    // (the lock in the modifier byte, `ESC [ 1 ; 65 D`; the keypad's own code,
+    // `CSI 57417 u`), which the press path asks under its hold
+    // (`kitty_reports_functional_keys`).
+    let bare = |mods: &TMods| {
+        mods.difference(TMods::CAPS_LOCK | TMods::NUM_LOCK)
+            .is_empty()
+    };
+    // The LEARNED keys the predictor places at an authenticated prompt: Home,
+    // End and Delete of the main block only (the keypad's are other keys under
+    // DECKPAM, and the fold below would make them these), bare; and Ctrl-A and
+    // Ctrl-E, Ctrl and nothing else but a lock (the legacy encoder sends `SOH`
+    // and `ENQ` with Shift too, but a Kitty mode does not, and nothing here
+    // needs it). Under a Kitty mode that reports functional keys Ctrl-A goes out
+    // as `CSI 97;5u`, which the predictor refuses itself (R-KITTY, from the
+    // press's hold).
+    let ctrl_only =
+        |mods: &TMods| mods.difference(TMods::CAPS_LOCK | TMods::NUM_LOCK) == TMods::CTRL;
+    let edit_arrow = match ev {
+        InputEvent::Key {
+            key: TKey::Named(TNamed::ArrowLeft | TNamed::NumpadArrowLeft),
+            mods,
+            ..
+        } if bare(mods) => Some(crate::predict::EditKey::Left),
+        InputEvent::Key {
+            key: TKey::Named(TNamed::ArrowRight | TNamed::NumpadArrowRight),
+            mods,
+            ..
+        } if bare(mods) => Some(crate::predict::EditKey::Right),
+        InputEvent::Key {
+            key: TKey::Named(TNamed::Home),
+            mods,
+            ..
+        } if bare(mods) => Some(crate::predict::EditKey::Home),
+        InputEvent::Key {
+            key: TKey::Named(TNamed::End),
+            mods,
+            ..
+        } if bare(mods) => Some(crate::predict::EditKey::End),
+        InputEvent::Key {
+            key: TKey::Named(TNamed::Delete),
+            mods,
+            ..
+        } if bare(mods) => Some(crate::predict::EditKey::Delete),
+        _ => None,
+    };
+    let edit_chord = match ev {
+        InputEvent::Key {
+            key: TKey::Character(c),
+            mods,
+            ..
+        } if ctrl_only(mods) && c.eq_ignore_ascii_case(&'a') => {
+            Some(crate::predict::EditKey::CtrlA)
+        }
+        InputEvent::Key {
+            key: TKey::Character(c),
+            mods,
+            ..
+        } if ctrl_only(mods) && c.eq_ignore_ascii_case(&'e') => {
+            Some(crate::predict::EditKey::CtrlE)
+        }
+        _ => None,
+    };
     let folded = ev.keypad_folded();
     let ev = folded.as_ref().unwrap_or(ev);
-    let predict_candidate: Option<(Option<char>, bool)> = match ev {
+    let predict_candidate: Option<PredictKey> = match ev {
         InputEvent::Key {
             key,
             mods,
@@ -3438,25 +3586,31 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
                 // Predict the glyph the encoder sends and the shell echoes:
                 // `Key::Character` holds the unshifted base, so 'h'+Shift predicts
                 // 'H', and German Shift+2 the layout's '"'.
-                TKey::Character(c) => {
-                    Some((Some(input::typed_glyph(*c, *mods, *layout_text)), false))
+                TKey::Character(c) => Some(PredictKey::Glyph(input::typed_glyph(
+                    *c,
+                    *mods,
+                    *layout_text,
+                ))),
+                TKey::Named(TNamed::Space) => Some(PredictKey::Glyph(' ')),
+                TKey::Named(TNamed::Backspace) => {
+                    Some(PredictKey::Edit(crate::predict::EditKey::Backspace))
                 }
-                TKey::Named(TNamed::Space) => Some((Some(' '), false)),
-                TKey::Named(TNamed::Backspace) => Some((None, true)),
-                _ => None,
+                _ => edit_arrow.map(PredictKey::Edit),
             }
         }
         InputEvent::Text(s) => {
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) if !c.is_control() && aterm_grapheme::char_width(c) == 1 => {
-                    Some((Some(c), false))
+                    Some(PredictKey::Glyph(c))
                 }
                 _ => None,
             }
         }
         _ => None,
-    };
+    }
+    // A control chord the predictor learns: Ctrl-A, Ctrl-E.
+    .or(edit_chord.map(PredictKey::Edit));
     let typed_forward: Option<bool> = match ev {
         InputEvent::Key { key, mods, .. }
             if !mods.contains(TMods::CTRL)
@@ -3890,9 +4044,9 @@ pub(crate) fn note_person(ctx: &crate::SessionCtx, gesture: crate::human_input::
 /// input never waits on the timeline, and one that finds it held is attributed
 /// by the next (a person's Enter follows the keys before it).
 ///
-/// Returns whether the session log's readers are owed a wake (a burst's `mark -
-/// human` was written): the caller wakes the session's subscribers, the
-/// timeline's lock released.
+/// Returns whether the session log's readers were owed a wake (a burst's `mark -
+/// human` was written), which rang the session's watchers under the timeline
+/// lock (`slog_take_wake`).
 ///
 /// `reaches` is whether the gesture reached the program
 /// ([`crate::human_input::reaches_program`]): every gesture stamps the
@@ -3949,7 +4103,7 @@ pub(crate) fn note_person_event(ctx: &crate::SessionCtx, ev: &InputEvent) -> boo
     note_person_reaching(
         ctx,
         crate::human_input::Gesture::of(ev),
-        crate::human_input::reaches_program(ev, &ctx.modes),
+        crate::human_input::reaches_program(ev, &ctx.modes, crate::input::WheelPlatform::Host),
     )
 }
 
@@ -4469,27 +4623,26 @@ impl App {
                     .is_some_and(keybinding::Action::is_paste))
     }
 
-    /// Main-thread, session-resolving twin for reply-bearing control operations with no
-    /// `InputEvent` of their own (e.g. `signal`). `false` means the session is no
-    /// longer visible, so no window holds a licence for it. `keep_hand` is the control
-    /// socket's fence (`control_input::control_fence`): a line-editing key or a paste
-    /// keeps the glow's hand on its row.
-    pub(crate) fn clear_move_license_for_session(&mut self, session: u64, keep_hand: bool) -> bool {
-        // Focus notifications from two OS windows are unordered (B may gain focus
-        // before A reports its loss), so resolve every window presenting this session
-        // rather than trusting `frontmost_window`.
-        let targets: Vec<_> = self
-            .windows
-            .keys()
-            .copied()
-            .filter(|wid| {
-                self.front_terminal(*wid).map(|terminal| terminal.session) == Some(session)
-            })
-            .collect();
-        for wid in &targets {
-            self.fence_move_license(*wid, keep_hand);
+    /// Applies the control socket's licence fences this window owes
+    /// ([`crate::licence_fence::owed`]): those recorded on the session it presented
+    /// at its last look, each closing the licence as [`Self::fence_move_license`]
+    /// does, the hand kept on its row only if none took it off. Called before a
+    /// licence is armed (the head of a winit event, the input seam, a controller
+    /// batch) and before one is judged (the cursor frame), so a fence lands ahead
+    /// of the output its write causes and behind a key the person pressed after
+    /// it. Mints nothing and touches no PTY, cadence or rain state.
+    pub(crate) fn reconcile_licence(&mut self, wid: WindowId) {
+        let front = self.front_terminal(wid).map(|terminal| terminal.session);
+        let pool = &self.pool;
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let owed = crate::licence_fence::owed(&mut ws.licence_seen, front, |session| {
+            pool.get(session).map(|owner| owner.ctx.licence.clone())
+        });
+        if let Some(keep_hand) = owed {
+            self.fence_move_license(wid, keep_hand);
         }
-        !targets.is_empty()
     }
 
     /// External OS command surfaces (native menu key equivalents, accessibility
@@ -5164,8 +5317,8 @@ impl App {
             // A person is present: the warm spare may exist (`spare`).
             self.spares.note_person(std::time::Instant::now());
             if let Some(owner) = self.pool.get(session) {
-                let owed = note_person_event(&owner.ctx, ev);
-                self.wake_log_watchers(session, owed);
+                // An owed log wake rang the session's watchers in the mark's hold.
+                let _ = note_person_event(&owner.ctx, ev);
             }
         }
     }
@@ -5414,7 +5567,30 @@ impl App {
         // paste, pointer and local scrolling. Human and controller events go through
         // its reducer and never leak bytes into the parked terminal session. Focus and
         // Resize continue through the host seam below.
-        if target_session.is_none() && self.native_input_event(wid, &ev) {
+        //
+        // A keystroke or text it takes is timed as a terminal's is, from its arrival
+        // (read before the reducer runs) to the present of the page's answer, into the
+        // same `input_*` ledger (`metrics::note_native_window_input`). A modifier alone
+        // and a release answer nothing, so they arm nothing.
+        let typed = match &ev {
+            InputEvent::Key {
+                key, event_type, ..
+            } => {
+                !matches!(event_type, aterm_types::keyboard::KeyEventType::Release)
+                    && !aterm_types::keyboard::is_modifier_or_lock_key(key)
+            }
+            InputEvent::Text(_) | InputEvent::Paste(..) => true,
+            _ => false,
+        };
+        let arrival =
+            (target_session.is_none() && typed).then(crate::metrics::native_input_arrival);
+        // A control client's key or text into a native view is its gesture
+        // (an Editor runs only the commands its grant holds).
+        if target_session.is_none()
+            && self.with_gesture_source(matches!(src, Source::Controller), |app| {
+                app.timed_native_input_event(wid, &ev, arrival)
+            })
+        {
             return InputOutcome::Ok;
         }
         // Presentation side effects follow a current view of the owned session, not
@@ -5450,7 +5626,7 @@ impl App {
             let Some(presented) = presented else {
                 // The hidden seam carries the keyboard and paste payloads it
                 // was built for. A pinned control request whose session left
-                // the front between its check and now (`front_routed_input`)
+                // the front between its check and now (`control::InputRoute`)
                 // can also carry a view-bound gesture: focus, pointer, viewport
                 // scroll or geometry. With no view of the session there is
                 // nothing for it to act on, so it is dropped rather than
@@ -5473,6 +5649,9 @@ impl App {
         } else {
             wid
         };
+        // The control fences the presenting window owes, before any arm below stamps
+        // its licence ([`Self::reconcile_licence`]).
+        self.reconcile_licence(wid);
         // Resolve the optional terminal. Native focus has no fallback shell; resize
         // stays a window property, and focus has no DEC-1004 report to emit. The
         // session id rides along: the typed-"kitty" detector keys its keystroke window
@@ -5669,26 +5848,69 @@ impl App {
                     // `pmode` is cached per config generation (invalidated by
                     // `reload_config`), shared with the render paths.
                     let pmode = self.predict_mode();
-                    let act: Option<(Option<char>, bool)> =
-                        if pmode == crate::predict::PredictMode::Off {
-                            None
-                        } else {
-                            predict_candidate
-                        };
+                    let act: Option<PredictKey> = if pmode == crate::predict::PredictMode::Off {
+                        None
+                    } else {
+                        predict_candidate
+                    };
+                    let pediting = self.config.predictive_echo_editing_or_default();
                     let typed_enter = is_plain_enter(&ev);
                     // A run's first glyph carries the cursor row to the predictor, its
                     // tail guard's reference (an echo that moved the text right of it
-                    // proves nothing), read under the press's hold below. Asked of the
-                    // predictor here, before the hold, so type-ahead reads no row; the
-                    // resident buffer goes back to the window after the arm.
-                    let mut key_row = if act.is_some_and(|(ch, _)| ch.is_some()) {
-                        self.windows
+                    // proves nothing), and so does every edit key, which the predictor
+                    // places only on a row it can read (with editing off it routes
+                    // them as before and reads none); read under the press's hold
+                    // below. Asked of the predictor here, before the hold, so type-ahead
+                    // reads no row; the resident buffer goes back to the window after
+                    // the arm.
+                    let mut key_row = match act {
+                        Some(PredictKey::Glyph(_)) => self
+                            .windows
                             .get_mut(&wid)
                             .filter(|ws| ws.predictor.wants_key_row())
-                            .map(|ws| std::mem::take(&mut ws.predict_key_row))
-                    } else {
-                        None
+                            .map(|ws| std::mem::take(&mut ws.predict_key_row)),
+                        Some(PredictKey::Edit(_)) if pediting => self
+                            .windows
+                            .get_mut(&wid)
+                            .map(|ws| std::mem::take(&mut ws.predict_key_row)),
+                        Some(PredictKey::Edit(_)) | None => None,
                     };
+                    // An arrow, Home, End or Delete classified bare that Kitty's
+                    // encoder sends as another key (`classify_press`): one with a
+                    // lock on (the lock in its modifier byte, `CSI 1;65H`) or the
+                    // keypad's arrow (its own `CSI 57417 u` code). The legacy encoder
+                    // sends either as the main block's key; the hold below asks which
+                    // encoder applies, only for this press. (Ctrl-A and Ctrl-E under
+                    // such a mode are the predictor's own refusal, R-KITTY.)
+                    let kitty_keyed_arrow = matches!(
+                        act,
+                        Some(PredictKey::Edit(
+                            crate::predict::EditKey::Left
+                                | crate::predict::EditKey::Right
+                                | crate::predict::EditKey::Home
+                                | crate::predict::EditKey::End
+                                | crate::predict::EditKey::Delete
+                        ))
+                    ) && matches!(
+                        &ev,
+                        InputEvent::Key { key, mods, .. } if mods.intersects(
+                            aterm_types::keyboard::Modifiers::CAPS_LOCK
+                                | aterm_types::keyboard::Modifiers::NUM_LOCK
+                        ) || matches!(
+                            key,
+                            aterm_types::keyboard::Key::Named(
+                                aterm_types::keyboard::NamedKey::NumpadArrowLeft
+                                    | aterm_types::keyboard::NamedKey::NumpadArrowRight
+                            )
+                        )
+                    );
+                    // An edit key at a tty that will not echo is input the
+                    // predictor does not model, as a glyph is there (the no-echo
+                    // gate below): `tty_swallows` is read for typed text alone, so
+                    // an edit key pays its own `tcgetattr`, and only while
+                    // prediction is on.
+                    let edit_swallowed =
+                        matches!(act, Some(PredictKey::Edit(_))) && sink.tty_swallows_input();
                     // Momentum arms the cursor cat only while the trail master is on and
                     // the style is rainbow kitty. Collection and typed hellos are
                     // activated separately below, independent of this gate. Cached like
@@ -5749,16 +5971,17 @@ impl App {
                             self.glow_style(),
                             crate::cursor_glow::GlowStyle::RainbowKitty
                         );
-                    // Keystroke-priority frame pacing and `input_pending()` signal:
+                    // Keystroke-priority frame pacing and `input_hint::pending()` signal:
                     // stamped BEFORE acquiring `term_lock_ui` so a PTY reader currently
-                    // mid-batch observes `input_pending() == true` at its next slice
+                    // mid-batch observes `input_hint::pending() == true` at its next slice
                     // boundary (switching from 64 KiB to 8 KiB chunks) and so the
                     // `metrics` input→present slice includes any `term_lock_ui` wait.
                     if !inert_modifier && let Some(ws) = self.windows.get_mut(&wid) {
                         ws.input_hot = true;
                         ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
                         ws.last_key_at = Some(input_now);
-                        crate::metrics::note_window_input(&mut ws.pending_input);
+                        crate::metrics::note_window_input(&mut ws.present_metrics.pending_input);
+                        crate::input_hint::arm();
                     }
                     // One term-lock scope for every press-path terminal touch: the
                     // viewport snap, the typing-deselects clear, and the predictor's
@@ -5775,6 +5998,7 @@ impl App {
                         term_cols,
                         ambiguous_width_double,
                         shell_executing,
+                        submit_prompt,
                     ) = {
                         // Registered as a UI waiter while blocking, so the reader hands
                         // its next slice boundary to this press. The acquire stays on
@@ -5810,11 +6034,48 @@ impl App {
                             // The content-coordinate generation rides with the cursor:
                             // rows that moved since the predictor last looked (a prompt
                             // scrolled onto the proven bottom row) end its epoch.
+                            //
+                            // The last field: an arrow with a lock on, or the keypad's,
+                            // while Kitty reports functional keys (DISAMBIGUATE), goes
+                            // out as another key (the lock in its modifier byte, `ESC [
+                            // 1 ; 65 D`; the keypad's code, `CSI 57417 u`), which no
+                            // line editor reads as a bare motion, so it is input the
+                            // predictor does not model.
+                            //
+                            // And the integration's word on where the shell's buffer
+                            // starts (the authenticated OSC 133 B of the prompt in
+                            // front that says so, and which prompt that is, or none),
+                            // the editor context the learned keys reach (this session,
+                            // the nonce its shell signs with, DECCKM, whether control
+                            // chords go out escaped) and whether they do: Ctrl-A is
+                            // `CSI 97;5u` under a Kitty mode that reports functional
+                            // keys and `CSI 27;5;97~` under modifyOtherKeys level 2.
+                            // A few field reads under the hold the press already takes.
+                            let kitty_fn = t.kitty_reports_functional_keys();
+                            let escaped_chords = t.control_chords_escaped();
                             (
                                 t.cursor(),
                                 t.content_scroll_state().coordinate_generation(),
                                 (t.cols(), t.rows()),
                                 t.is_alternate_screen() || kitty_owns_keyboard,
+                                kitty_keyed_arrow && kitty_fn,
+                                (
+                                    t.input_region_start().map(|s| crate::predict::InputStart {
+                                        cell: (s.row, s.col),
+                                        prompt: s.prompt,
+                                    }),
+                                    crate::predict::EditorContext::new(
+                                        session,
+                                        t.shell_integration_nonce_in_use().as_ref(),
+                                        t.modes().application_cursor_keys,
+                                        escaped_chords,
+                                    ),
+                                    escaped_chords,
+                                    // The engine's own deferred-wrap flag: a cursor on
+                                    // a filled last column is parked there only after
+                                    // the terminal wrote that column.
+                                    t.grid().pending_wrap(),
+                                ),
                             )
                         });
                         // The cursor row, under the hold that read the cursor: what
@@ -5836,6 +6097,12 @@ impl App {
                         // foreground program's composer.
                         let shell_executing =
                             typed_enter && crate::quit_safety::shell_executing(&t);
+                        // The authenticated prompt a line terminator is pressed at, read
+                        // for a terminator alone: the next prompt's first key may start
+                        // the line the predictor places Home, End, Ctrl-A, Ctrl-E and
+                        // Delete on (`Predictor::note_line_submit_at`), and only at
+                        // another prompt.
+                        let submit_prompt = line_terminator.then(|| t.prompt_in_front()).flatten();
                         // ATERM_TRACE_SPAWN press sensor (the render trace's gate): one
                         // line per typed-class press, so a ribbon that never lights is
                         // diagnosed at the input seam.
@@ -5854,6 +6121,7 @@ impl App {
                             term_cols,
                             ambiguous_width_double,
                             shell_executing,
+                            submit_prompt,
                         )
                     };
                     // Publish what this press learned so the matching key release can
@@ -5913,8 +6181,8 @@ impl App {
                             ws.fx.cursor_mut().trail.clear_typed();
                         }
                         // Stamp the arrival for the `metrics` verb's input→present slice,
-                        // the latency typing feels. The same stamp drives
-                        // `input_pending()`, which keeps the PTY reader on short slices
+                        // the latency typing feels. The hint armed beside it
+                        // (`input_hint::arm`) keeps the PTY reader on short slices
                         // while a human waits on the echo. The write-slice close
                         // (`note_pty_write`) comes after the real egress below, isolating
                         // any blocking write inside this interval.
@@ -6261,7 +6529,7 @@ impl App {
                             // may erase them (Ctrl+H, Ctrl+W, a remapped kill), and a
                             // guess over an erased cell is a ghost of the erased text.
                             if line_terminator {
-                                ws.predictor.note_line_submit(input_now);
+                                ws.predictor.note_line_submit_at(submit_prompt, input_now);
                             } else {
                                 ws.predictor.note_unmodelled_input(input_now);
                             }
@@ -6318,8 +6586,17 @@ impl App {
                             }
                         }
                     }
-                    if let Some(((ch, is_backspace), (cur, coords, (cols, rows), no_echo))) =
-                        act.zip(sample)
+                    if let Some((
+                        key,
+                        (
+                            cur,
+                            coords,
+                            (cols, rows),
+                            no_echo,
+                            chord_arrow,
+                            (input_start, context, escaped_chords, wrap_pending),
+                        ),
+                    )) = act.zip(sample)
                     {
                         // Split panes predict too: the composed render path paints the
                         // focused pane's guesses (`redraw_compose`), and `sync_window`
@@ -6337,8 +6614,11 @@ impl App {
                             // guess, in ANY mode: the program will not draw it, so a
                             // ghost would be the secret itself, on glass and in every
                             // capture of it. Positive evidence only: a raw-mode program
-                            // echoes for itself and stays eligible.
-                            if no_echo || tty_swallows {
+                            // echoes for itself and stays eligible. An edit key there
+                            // (`edit_swallowed`) moves nothing on screen either, and a
+                            // line proven before the echo went off is no line it may
+                            // be placed on.
+                            if no_echo || tty_swallows || edit_swallowed {
                                 // A no-echo press arms nothing, but it is still sent,
                                 // and the program may echo it after all: an app can
                                 // leave the alternate screen before it reads the key,
@@ -6349,23 +6629,37 @@ impl App {
                                 // epoch from before entering the app must not let the
                                 // first keystroke back on that row display).
                                 ws.predictor.note_unmodelled_input(now);
+                            } else if chord_arrow {
+                                // A modified arrow (a lock in Kitty's modifier byte):
+                                // routed as an arrow was before predictive editing.
+                                ws.predictor.note_unmodelled_input(now);
                             } else {
                                 ws.predictor.set_mode(pmode);
+                                ws.predictor.set_editing(pediting);
                                 ws.predictor
                                     .set_ambiguous_width_double(ambiguous_width_double);
-                                let _changed = match ch {
-                                    Some(c) => {
-                                        let sample = crate::predict::KeySample {
-                                            cursor: (cur.row, cur.col),
-                                            coords,
-                                            grid: (cols, rows),
-                                            row: key_row.as_ref().map(|row| row.cells()),
-                                        };
-                                        ws.predictor.predict_glyph(c, &sample, now)
-                                    }
-                                    None if is_backspace => ws.predictor.predict_backspace(now),
-                                    None => false,
+                                let sample = crate::predict::KeySample {
+                                    cursor: (cur.row, cur.col),
+                                    coords,
+                                    grid: (cols, rows),
+                                    row: key_row.as_ref().map(|row| row.cells()),
+                                    below: key_row.as_ref().and_then(|row| row.below()),
+                                    input_start,
+                                    context,
+                                    escaped_chords,
+                                    wrap_pending: Some(wrap_pending),
                                 };
+                                // An edit key is accounted for whatever its outcome
+                                // (armed, a cancelled glyph, or declined and owed):
+                                // never noted as unmodelled input as well.
+                                match key {
+                                    PredictKey::Glyph(c) => {
+                                        let _armed = ws.predictor.predict_glyph(c, &sample, now);
+                                    }
+                                    PredictKey::Edit(k) => {
+                                        let _outcome = ws.predictor.predict_edit(k, &sample, now);
+                                    }
+                                }
                             }
                             if let Some(row) = key_row.take() {
                                 ws.predict_key_row = row;
@@ -7981,20 +8275,16 @@ impl App {
         // the wire (the formatter's sanitizer, then grapheme width under the
         // terminal's ambiguous-width mode), rides the FIFO job; the writer's completed
         // write publishes it and the render prelude arms the delivered-insert licence.
-        // A body whose width the text cannot say (a Tab, a line break, a body past the
-        // price probe) is an insert of unknown width, bounded by the gesture cap: a
-        // same-row echo within it (Claude Code's `[Pasted text #1 +N lines] `, a
-        // shell's first line) is admitted, a multi-row echo declines.
+        // One line and the line break after it (a link copied with its line ending)
+        // is priced as that line ([`paste_insert_width`]). A body whose width the
+        // text cannot say (a Tab, any other line break, a body past the price probe)
+        // is an insert of unknown width, bounded by the gesture cap: a same-row echo
+        // within it (Claude Code's `[Pasted text #1 +N lines] `, a shell's first
+        // line) is admitted, a multi-row echo declines.
         let insert = match &ev {
             InputEvent::Paste(text, _) if movement_capable => {
                 let ambiguous_width_double = term_lock(term).modes().ambiguous_width_double;
-                Some(
-                    aterm_core::terminal::Terminal::paste_insert_cells(
-                        text,
-                        ambiguous_width_double,
-                    )
-                    .map_or(InsertWidth::Unknown, InsertWidth::Cells),
-                )
+                Some(paste_insert_width(text, ambiguous_width_double))
             }
             _ => None,
         };
@@ -8508,7 +8798,10 @@ impl App {
                 }
                 self.note_update_handoff_activity();
                 self.reset_blink(wid);
-                self.native_input_event(wid, &event)
+                // A held key's repeat is typing too: timed as the seam times a
+                // press (`input_to_session_inner`'s native boundary).
+                let arrival = crate::metrics::native_input_arrival();
+                self.timed_native_input_event(wid, &event, Some(arrival))
             }
             LocalRepeatAction::Search { session, action } => {
                 if self.front_terminal(wid).map(|terminal| terminal.session) != Some(session)
@@ -9274,6 +9567,7 @@ impl App {
         //   closes the cohort and takes the hand off its row.
         let mods = self.windows.get(&wid).map(|ws| ws.mods);
         let option_composes = self.option_composes_in(wid);
+        let (ev, mods) = self.option_as_layout_level(ev, mods, option_composes);
         let press = mods.and_then(|m| physical_press(&ev, m, option_composes));
         // Selection custody: a bare modifier/lock press is inert; it does not
         // cancel scroll motion, snap the viewport, or clear the selection.
@@ -9397,6 +9691,13 @@ impl App {
         // hardcoded chord can fire, like the overlay gate above (and the modal
         // gate ordering in `on_mouse_input`).
         if self.on_key_tab_menu_mode(wid, &ev) {
+            self.note_press_disposition(wid, &ev, None);
+            return;
+        }
+        // An open stats lens (`crate::stats_lens`): the keyboard lens takes its
+        // own keys; any other key closes any lens and goes on to the terminal,
+        // so the echo frame is the first frame without the lens.
+        if self.stats_lens_key(wid, mods, &ev.logical_key, inert) {
             self.note_press_disposition(wid, &ev, None);
             return;
         }
@@ -9587,16 +9888,22 @@ impl App {
         }
         // Terminal Emacs navigation: native content and configured bindings
         // have had first refusal. A genuine press captures a local
-        // repeat owner, so a held Cmd-S/Cmd-R or Ctrl-S/Ctrl-R repeats search
-        // against the press-time terminal and every Kitty release stays
-        // byte-silent; shells, Claude and Codex see zero bytes. Only bare
-        // Cmd-S/R (when `HARDCODED_SUPER_CHORDS` is on) and bare Ctrl-S/R
-        // qualify, so the base key is normalized only after the modifier gate.
+        // repeat owner, so a held Cmd-S/Cmd-R (or, in an agent's composer,
+        // Ctrl-S/Ctrl-R) repeats search against the press-time terminal and
+        // every Kitty release stays byte-silent; Claude and Codex see zero
+        // bytes. At a shell, a REPL or any other program a bare Ctrl-S/R is
+        // declined here and reaches the program below as 0x13/0x12 (or its
+        // Kitty encoding), booked as a forwarded press so its repeats and
+        // release follow it there. Only bare Cmd-S/R (when
+        // `HARDCODED_SUPER_CHORDS` is on) and bare Ctrl-S/R qualify, so the
+        // base key is normalized only after the modifier gate, and the front
+        // program is read only for a bare Ctrl-S/R.
         if ((HARDCODED_SUPER_CHORDS && mods == ModifiersState::SUPER)
             || mods == ModifiersState::CONTROL)
             && let Some(forward) = terminal_emacs_search_direction(
                 base_key.get_or_insert_with(|| base_logical_key(&ev)),
                 mods,
+                || self.front_agent_composer(wid),
             )
         {
             self.terminal_emacs_search_pressed(wid, ev.physical_key, forward);
@@ -9889,6 +10196,55 @@ impl App {
         // `NamedKey` long tail (media/browser/launch keys). None produce PTY
         // bytes, so none snap the viewport.
         self.note_consumed_press(wid, &ev);
+    }
+
+    /// Whether an agent's composer owns the front terminal's prompt, so a bare
+    /// Ctrl-S/Ctrl-R is aterm's find there ([`terminal_emacs_search_direction`])
+    /// rather than the program's. Prompt ownership, as the citation gate reads
+    /// it (`App::resolve_citation`): the agent aterm identifies in front
+    /// ([`crate::harness_host::identified_agent`]: by its own name, or a
+    /// runtime like `node` by its screen), and only while the group that
+    /// publication names is still the PTY's foreground group as a fresh read
+    /// finds it. A publication the status sweep has not caught up on speaks for
+    /// nobody: the agent exited to its shell, and the shell owns the key.
+    /// Nor does one whose agent has handed the terminal to a program it
+    /// started in its own group (`SessionFactory::handed_terminal`): Claude
+    /// Code runs `$EDITOR` with inherited stdio and no group of its own, so
+    /// the group in front and its leader's name stay the agent's while vim
+    /// reads the keys, and vim owns the key. Where no foreground group can be
+    /// read (a ConPTY on Windows always answers `-1`, and the sweep then names
+    /// no group: `SessionTimeline::sweep_slog`), the publication, there the
+    /// screen reader's, stands alone. No front terminal (a native tab) ⇒
+    /// `false`.
+    fn front_agent_composer(&self, wid: WindowId) -> bool {
+        let Some(pooled) = self
+            .front_terminal(wid)
+            .and_then(|terminal| self.pool.get(terminal.session))
+        else {
+            return false;
+        };
+        // The timeline is a leaf lock; the kernel is asked after it is let go.
+        let (agent, group) = {
+            let timeline = pooled
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let agent = timeline.agent();
+            (
+                crate::harness_host::identified_agent(agent).is_some(),
+                agent.program_pgid,
+            )
+        };
+        if !agent {
+            return false;
+        }
+        let front = if pooled.master >= 0 {
+            (self.session_factory.fg_probe)(pooled.master)
+        } else {
+            -1
+        };
+        (front <= 0 || front == group) && !(self.session_factory.handed_terminal)(group)
     }
 
     /// Whether the front terminal shows its alternate screen, which keeps no
@@ -11092,9 +11448,9 @@ impl App {
             && let Some(session) = self.focused_session_id(wid)
             && let Some(owner) = self.pool.get(session)
         {
-            // The preedit reaches no program: it can dismiss no box.
-            let owed = note_person_reaching(&owner.ctx, crate::human_input::Gesture::Other, false);
-            self.wake_log_watchers(session, owed);
+            // The preedit reaches no program: it can dismiss no box. An owed log
+            // wake rang the session's watchers in the mark's hold.
+            let _ = note_person_reaching(&owner.ctx, crate::human_input::Gesture::Other, false);
         }
         if changed && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
@@ -11360,11 +11716,31 @@ impl App {
     /// Whether window `wid`'s Option keys should be an Alt ([`crate::platform::set_option_as_alt`]):
     /// in Meta mode (`option_as_meta`, the default) while the window's typing reaches its
     /// terminal ([`Self::typing_reaches_grid`]), whose encoder sends an Option chord as ESC
-    /// and the key. A GUI field that owns the keyboard (the find bar, the inline rename, the
-    /// palette, a native page) keeps Option composing, so German Option+L types '@' there and
-    /// Option+e e types 'é' (ATERM-KI-1015-9).
+    /// and the key, or a native Editor ([`Self::typing_reaches_editor`]), whose keymap reads
+    /// an Option chord as its M- chord (Option+b is M-b, backward-word; Option+u is M-u,
+    /// never a dead key). A GUI field that owns the keyboard (the find bar, the inline
+    /// rename, the palette, another native page) keeps Option composing, so German Option+L
+    /// types '@' there and Option+e e types 'é' (ATERM-KI-1015-9).
     pub(crate) fn option_is_alt(&self, wid: WindowId) -> bool {
-        self.option_as_meta && self.typing_reaches_grid(wid)
+        self.option_as_meta && (self.typing_reaches_grid(wid) || self.typing_reaches_editor(wid))
+    }
+
+    /// Whether window `wid`'s typing reaches a native Editor (amacs, design §4.4): the front
+    /// view is an Editor buffer, and no overlay, tab menu or inline rename takes the keys
+    /// first. Settings, a Markdown page and the recovery page are not editors: their fields
+    /// type what Option composes. `false` for a window that is gone.
+    pub(crate) fn typing_reaches_editor(&self, wid: WindowId) -> bool {
+        let Some((_, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        matches!(
+            self.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Editor(_))
+        ) && self.inline_rename_edit(wid).is_none()
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| !ws.overlay_open() && ws.tab_menu.is_none())
     }
 
     /// Bring every window's Option keys to [`Self::option_is_alt`]: the one writer of the
@@ -11382,6 +11758,37 @@ impl App {
                 crate::platform::set_option_as_alt(window, alt);
             }
         }
+    }
+
+    /// An Option chord's press as Meta mode sends it ([`Self::on_key`]): while the window
+    /// reads Option as an Alt (`option_composes` false) an Option chord goes out as ESC and
+    /// the key, except one whose character its layout reaches ONLY with Option
+    /// ([`crate::platform::OptionOnly`]: German Option+L `@`, Option+7 `|`, Option+N `~`;
+    /// French Option+( `{`; British Option+3 `#`). Sending that one as Meta would leave the
+    /// character out of reach in every tab, so there Option is the layout's own level, as
+    /// AltGr is on Linux: the press types the character, with Option taken off the
+    /// modifiers it carries. Every Option chord of the U.S. layout stays Meta (its Option
+    /// characters are not ASCII, or a key of their own types them too), and a chord with
+    /// Control or Command is left as it came (ATERM-KI-1015-9).
+    fn option_as_layout_level(
+        &self,
+        mut ev: KeyEvent,
+        mods: Option<ModifiersState>,
+        option_composes: bool,
+    ) -> (KeyEvent, Option<ModifiersState>) {
+        let Some(m) = mods else {
+            return (ev, mods);
+        };
+        if option_composes || !m.alt_key() || m.control_key() || m.super_key() {
+            return (ev, mods);
+        }
+        let Some(c) = (self.option_only)(ev.physical_key, m.shift_key()) else {
+            return (ev, mods);
+        };
+        let text = aterm_window::keyboard::SmolStr::new(c.encode_utf8(&mut [0; 4]));
+        ev.logical_key = Key::Character(text.clone());
+        ev.text = Some(text);
+        (ev, Some(m - ModifiersState::ALT))
     }
 
     /// Whether an Option chord pressed in window `wid` carries what Option composed
@@ -11821,6 +12228,17 @@ impl App {
             }
             // View ▸ Show Needs in Windows: flip the live bit and persist it.
             MenuAction::ToggleNeedsInWindows => self.user_toggle_needs_in_windows(),
+            // View ▸ Stats Bars: write the chosen form; the config apply
+            // re-grids for a change into or out of the Deck.
+            MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
+                if let Some(form) = action.stats_bars_form() {
+                    self.user_set_stats_bars(form);
+                }
+            }
+            // View ▸ Stats Lens (⌘I): the keyboard lens on the front window.
+            MenuAction::ToggleStatsLens => {
+                let _ = self.toggle_stats_lens();
+            }
             MenuAction::CloseTab => {
                 // Same rule as Cmd-W: close the focused pane; a tab's last pane
                 // closes the tab (`App::close_active_tab`). When that was the
@@ -11942,8 +12360,8 @@ impl App {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
             // …and at the Harness route — the bar and palette path to the
-            // coding agent harness's page (the footer's `⚙` chip opens it in
-            // the window it was pressed in: `App::open_harness_settings`).
+            // coding agent harness's page (the Autopilot menu opens it in the
+            // window it was opened in: `App::open_harness_settings`).
             MenuAction::HarnessSettings => {
                 if let Some(wid) = self.frontmost_window {
                     self.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top);
@@ -12820,8 +13238,9 @@ mod terminal_emacs_search_input_tests;
 /// for `Character('5')` / `Enter` / `End`. `PressClass` never gates bytes.
 #[cfg(test)]
 mod keypad_press_class_tests {
-    use super::{OutputEchoInput, PetInputKind, classify_press, is_plain_enter};
+    use super::{OutputEchoInput, PetInputKind, PredictKey, classify_press, is_plain_enter};
     use crate::input::InputEvent;
+    use crate::predict::EditKey;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
     fn press(key: NamedKey, mods: Modifiers) -> InputEvent {
@@ -12861,7 +13280,7 @@ mod keypad_press_class_tests {
         let five_ev = press(NamedKey::Numpad5, Modifiers::empty());
         let class = classify_press(&five_ev);
         assert_eq!(class.typed, Some('5'));
-        assert_eq!(class.predict_candidate, Some((Some('5'), false)));
+        assert_eq!(class.predict_candidate, Some(PredictKey::Glyph('5')));
         assert_eq!(class.typed_forward, Some(true));
         assert!(matches!(class.console_input, Some(PetInputKind::Text)));
         assert!(!class.brk);
@@ -12874,9 +13293,152 @@ mod keypad_press_class_tests {
         let shifted_ev = press(NamedKey::Numpad5, Modifiers::SHIFT);
         let shifted = classify_press(&shifted_ev);
         assert_eq!(shifted.typed, Some('5'));
-        assert_eq!(shifted.predict_candidate, Some((Some('5'), false)));
+        assert_eq!(shifted.predict_candidate, Some(PredictKey::Glyph('5')));
         let equal_ev = press(NamedKey::NumpadEqual, Modifiers::SHIFT);
         assert_eq!(classify_press(&equal_ev).typed, Some('='));
+    }
+
+    /// The edit keys the predictor models are a bare `←` or `→` and Backspace: a
+    /// modified arrow is a word motion, a selection or the window's. The keypad's
+    /// arrows (NumLock off) are edit keys too: the legacy encoder sends
+    /// `NumpadArrowLeft` exactly as `ArrowLeft` (`ESC [ D`, DECKPAM or not), and
+    /// under a Kitty mode that gives the keypad its own code the press path
+    /// routes it as input the predictor does not model. A lock is no chord: an
+    /// arrow with Caps Lock or Num Lock on is still bare (the legacy encoder
+    /// drops locks; Kitty's case is the press path's), but a lock beside a chord
+    /// is still that chord.
+    #[test]
+    fn only_bare_arrows_and_backspace_are_edit_keys() {
+        let candidate = |key, mods| classify_press(&press(key, mods)).predict_candidate;
+        for locks in [
+            Modifiers::CAPS_LOCK,
+            Modifiers::NUM_LOCK,
+            Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
+        ] {
+            assert_eq!(
+                candidate(NamedKey::ArrowRight, locks),
+                Some(PredictKey::Edit(EditKey::Right)),
+                "{locks:?}"
+            );
+            assert_eq!(
+                candidate(NamedKey::ArrowLeft, locks | Modifiers::ALT),
+                None,
+                "{locks:?} with Alt is a word motion"
+            );
+        }
+        for mods in [Modifiers::HYPER, Modifiers::META] {
+            assert_eq!(candidate(NamedKey::ArrowLeft, mods), None, "{mods:?}");
+        }
+        assert_eq!(
+            candidate(NamedKey::ArrowLeft, Modifiers::empty()),
+            Some(PredictKey::Edit(EditKey::Left))
+        );
+        assert_eq!(
+            candidate(NamedKey::ArrowRight, Modifiers::empty()),
+            Some(PredictKey::Edit(EditKey::Right))
+        );
+        assert_eq!(
+            candidate(NamedKey::Backspace, Modifiers::empty()),
+            Some(PredictKey::Edit(EditKey::Backspace))
+        );
+        for mods in [
+            Modifiers::SHIFT,
+            Modifiers::CTRL,
+            Modifiers::ALT,
+            Modifiers::SUPER,
+        ] {
+            assert_eq!(candidate(NamedKey::ArrowLeft, mods), None, "{mods:?}");
+        }
+        for locks in [Modifiers::empty(), Modifiers::NUM_LOCK] {
+            assert_eq!(
+                candidate(NamedKey::NumpadArrowLeft, locks),
+                Some(PredictKey::Edit(EditKey::Left)),
+                "the keypad's ←, {locks:?}"
+            );
+            assert_eq!(
+                candidate(NamedKey::NumpadArrowRight, locks),
+                Some(PredictKey::Edit(EditKey::Right)),
+                "the keypad's →, {locks:?}"
+            );
+        }
+        assert_eq!(
+            candidate(NamedKey::NumpadArrowLeft, Modifiers::SHIFT),
+            None,
+            "a chord on the keypad is a chord"
+        );
+        assert_eq!(candidate(NamedKey::ArrowUp, Modifiers::empty()), None);
+    }
+
+    /// The LEARNED keys the predictor places at an authenticated prompt: Home,
+    /// End and Delete of the main block, bare (a lock is no chord), and Ctrl-A
+    /// and Ctrl-E, Ctrl alone. The keypad's Home is another key (`ESC O w`
+    /// under DECKPAM), and Shift, Alt or Super on any of them is a chord the
+    /// predictor does not model; so is Ctrl with Shift or Alt on `a`.
+    #[test]
+    fn home_end_delete_and_ctrl_a_e_are_learned_edit_keys() {
+        let candidate = |key, mods| classify_press(&press(key, mods)).predict_candidate;
+        for (key, edit) in [
+            (NamedKey::Home, EditKey::Home),
+            (NamedKey::End, EditKey::End),
+            (NamedKey::Delete, EditKey::Delete),
+        ] {
+            for locks in [
+                Modifiers::empty(),
+                Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
+            ] {
+                assert_eq!(
+                    candidate(key, locks),
+                    Some(PredictKey::Edit(edit)),
+                    "{key:?} {locks:?}"
+                );
+            }
+            for mods in [
+                Modifiers::SHIFT,
+                Modifiers::ALT,
+                Modifiers::SUPER,
+                Modifiers::CTRL,
+            ] {
+                assert_eq!(candidate(key, mods), None, "{key:?} {mods:?}");
+            }
+        }
+        for key in [
+            NamedKey::NumpadHome,
+            NamedKey::NumpadEnd,
+            NamedKey::NumpadDelete,
+        ] {
+            assert_eq!(candidate(key, Modifiers::empty()), None, "{key:?}");
+        }
+        let chord = |c: char, mods| {
+            classify_press(&InputEvent::Key {
+                key: Key::Character(c),
+                mods,
+                base_layout: None,
+                layout_text: None,
+                event_type: KeyEventType::Press,
+            })
+            .predict_candidate
+        };
+        for (c, edit) in [('a', EditKey::CtrlA), ('e', EditKey::CtrlE)] {
+            assert_eq!(
+                chord(c, Modifiers::CTRL),
+                Some(PredictKey::Edit(edit)),
+                "Ctrl-{c}"
+            );
+            assert_eq!(
+                chord(c, Modifiers::CTRL | Modifiers::NUM_LOCK),
+                Some(PredictKey::Edit(edit)),
+                "Ctrl-{c} with a lock"
+            );
+            for mods in [
+                Modifiers::CTRL | Modifiers::SHIFT,
+                Modifiers::CTRL | Modifiers::ALT,
+                Modifiers::CTRL | Modifiers::SUPER,
+            ] {
+                assert_eq!(chord(c, mods), None, "{c} {mods:?}");
+            }
+            assert_eq!(chord(c, Modifiers::empty()), Some(PredictKey::Glyph(c)));
+        }
+        assert_eq!(chord('b', Modifiers::CTRL), None, "Ctrl-B is not modelled");
     }
 
     /// NumLock off, the keypad is a second navigation block: its arrows and

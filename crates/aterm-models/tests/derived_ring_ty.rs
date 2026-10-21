@@ -1172,6 +1172,7 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
             "ActOverPerson",
             "ActLeadOverPerson",
             "ActTwice",
+            "ActorSwap",
         ],
     );
 
@@ -1250,7 +1251,7 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
     // in its lead; a person's later input takes the step; a close consumes
     // the binding; an input past the bound attributes nothing.
     let mut b = model.init_state();
-    for action in ["SeeBusy", "SeeBox", "Admit", "SeeNextBox"] {
+    for action in ["SeeBusy", "SeeBox", "AdmitHarness", "SeeNextBox"] {
         assert!(model.fire(action, &mut b), "{action}");
     }
     assert_eq!(b["pd"], 4, "box 1 closed before the acceptance");
@@ -1261,22 +1262,32 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
         "a late acceptance binds nothing"
     );
     let mut lead = model.init_state();
-    for action in ["SeeBusy", "Admit", "Accept"] {
+    for action in ["SeeBusy", "AdmitCtl", "Accept"] {
         assert!(model.fire(action, &mut lead), "{action}");
     }
     assert_eq!(lead["pd"], 3, "accepted on the lead");
     assert!(model.fire("SeeBox", &mut lead));
     assert_eq!((lead["bk"], lead["pd"]), (1, 0), "the lead's first box");
+    assert_eq!(
+        (lead["ba"], lead["bs"], lead["pa"]),
+        (1, 1, 0),
+        "a ctl act on the lead binds as ctl's"
+    );
     assert!(model.fire("Person", &mut lead));
     assert_eq!(
         (lead["bk"], lead["pp"]),
         (2, 1),
         "the person's input is latest"
     );
+    assert_eq!(
+        (lead["ba"], lead["bs"]),
+        (0, 0),
+        "the person's binds no actor"
+    );
     assert!(model.fire("SeeBusy", &mut lead));
     assert_eq!((lead["bk"], lead["pp"]), (0, 0), "the close consumed it");
     let mut first = model.init_state();
-    for action in ["SeeBusy", "Admit", "SeeBox", "Accept"] {
+    for action in ["SeeBusy", "AdmitHarness", "SeeBox", "Accept"] {
         assert!(model.fire(action, &mut first), "{action}");
     }
     assert_eq!(
@@ -1284,11 +1295,16 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
         (1, 0),
         "admitted on the lead, bound by its first box"
     );
+    assert_eq!(
+        (first["ba"], first["bs"], first["pa"]),
+        (2, 2, 0),
+        "a harness act binds as the harness's, never ctl's"
+    );
     let mut stale = model.init_state();
-    for action in ["SeeBusy", "SeeBox", "Admit", "Accept", "Age"] {
+    for action in ["SeeBusy", "SeeBox", "AdmitCtl", "Accept", "Age"] {
         assert!(model.fire(action, &mut stale), "{action}");
     }
-    assert_eq!(stale["bk"], 3);
+    assert_eq!((stale["bk"], stale["ba"], stale["bs"]), (3, 0, 0));
     assert!(model.fire("SeeBusy", &mut stale));
     assert_eq!(
         (stale["bk"], stale["ga"]),

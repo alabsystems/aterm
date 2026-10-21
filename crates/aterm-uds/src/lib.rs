@@ -56,6 +56,11 @@ pub use win::{CtlListener, CtlStream};
 #[cfg(unix)]
 pub mod atomic_file;
 
+/// This account's own home as the account database has it ([`account::home`]), whatever
+/// `$HOME` says: what a launchd job of this login runs with.
+#[cfg(unix)]
+pub mod account;
+
 /// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the
 /// shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]). Native-only:
 /// it starts threads, which the wasm32 build never does.
@@ -69,6 +74,10 @@ pub mod elevation;
 /// `aterm ctl subscribe`'s redial).
 pub mod exitwatch;
 pub mod fdpass;
+/// Another program's live SQLite database (agy's summaries, tccd's `TCC.db`), read with
+/// no lock on it: the file itself as an immutable URI, or a private copy of it and its
+/// `-wal`, kept only when nothing changed meanwhile. See [`foreign_db`].
+pub mod foreign_db;
 /// Whether a connected stream's peer has closed entirely (a lane's hangup check).
 pub mod hangup;
 /// Which live processes of this uid hold a descriptor for one device (the PTY
@@ -93,7 +102,17 @@ pub mod output;
 pub mod ownerlock;
 /// The kernel's record of a socket peer: its uid and (Darwin) audit token.
 pub mod peer;
+/// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one
+/// reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate
+/// reads it through, aterm-sysprobe's (its `kproc` reads a process with it, and this crate
+/// depends on that one). See [`procargs`].
+#[cfg(any(unix, windows))]
+pub use aterm_sysprobe::procargs;
 pub mod process;
+/// A kernel witness of a session's `exec`s (card engine §3.3): one kqueue per shell, its forks
+/// and the `exec`s and exits of its children and of the terminal's holder.
+#[cfg(unix)]
+pub mod procwatch;
 /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: a child that inherits
 /// nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
 pub mod pspawn;

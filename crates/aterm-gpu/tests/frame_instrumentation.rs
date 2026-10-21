@@ -99,9 +99,10 @@ fn a_metal_present_reports_its_gpu_time() {
 }
 
 /// The wgpu arm (the Windows and BSD presents, the oracle here) times a present with per-pass
-/// timestamp queries: the readback lands after the present returns and is harvested by
-/// `poll_gpu_time`, reporting one part per render pass the present ran (the offscreen plan's
-/// passes and the blit, with bloom off), so no pass goes untimed.
+/// timestamp queries: the readback waits for the device to run the frame, lands after the
+/// present returns and is harvested by `poll_gpu_time`, reporting one part per render pass the
+/// present ran (the offscreen plan's passes and the blit, with bloom off), so no pass goes
+/// untimed and no healthy present is dropped.
 #[test]
 #[cfg(wgpu_arm)]
 fn a_wgpu_present_reports_its_gpu_time_through_timestamp_queries() {
@@ -113,40 +114,41 @@ fn a_wgpu_present_reports_its_gpu_time_through_timestamp_queries() {
             "this adapter grants no TIMESTAMP_QUERY, so the wgpu arm has no GPU clock",
         );
     }
-    let mut win = aterm_gpu::WindowGpu::new();
-    let input = glow_scene(&gpu);
-    assert!(gpu.present_virtual(&mut win, &input, false, None, None));
-    let serial = gpu
-        .last_gpu_time_serial()
-        .expect("a timed wgpu present records its serial");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let outcome = loop {
-        gpu.poll_gpu_time();
-        if let Some(outcome) = aterm_gpu::gpu_time::settled(serial) {
-            break outcome;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the timestamp readback of frame {serial} never mapped"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
-    match outcome {
-        aterm_gpu::gpu_time::Settled::Timed(t) => {
-            assert!(t.gpu_ns > 0, "the timed passes ran on the device: {t:?}");
-            assert_eq!(
-                t.parts,
-                gpu.frame_shape().passes + 1,
-                "every offscreen pass and the blit are timed: {t:?}"
+    // Each present on a fresh window, so every one repaints in full and runs the same passes.
+    // Twenty in a row: a readback that raced the device's last sample dropped about a third
+    // of them, so a regression of the wait cannot pass by luck. That race, not the device's
+    // clock, is what dropped the present the 0.107.0 release's verify met (9f5d6bf2a1 then
+    // let a Failed frame pass): the readback now waits for the frame, so a healthy present
+    // that settles Failed is a defect again.
+    for present in 0..20 {
+        let mut win = aterm_gpu::WindowGpu::new();
+        let input = glow_scene(&gpu);
+        assert!(gpu.present_virtual(&mut win, &input, false, None, None));
+        let serial = gpu
+            .last_gpu_time_serial()
+            .expect("a timed wgpu present records its serial");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let outcome = loop {
+            gpu.poll_gpu_time();
+            if let Some(outcome) = aterm_gpu::gpu_time::settled(serial) {
+                break outcome;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the timestamp readback of frame {serial} never mapped"
             );
-        }
-        // The device's clock, not this code: a pass pair the stage-boundary counters sample
-        // backwards, or a readback the device will not map, drops the frame by design
-        // (`pass_spans`). Measured: the 0.107.0 release's verify on m3 met one under load,
-        // on a tree whose two earlier verifies timed the same present.
-        aterm_gpu::gpu_time::Settled::Failed => {}
-        aterm_gpu::gpu_time::Settled::Untimed => {
-            panic!("a present that ran timed passes sealed untimed (frame {serial})")
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        match outcome {
+            aterm_gpu::gpu_time::Settled::Timed(t) => {
+                assert!(t.gpu_ns > 0, "the timed passes ran on the device: {t:?}");
+                assert_eq!(
+                    t.parts,
+                    gpu.frame_shape().passes + 1,
+                    "every offscreen pass and the blit are timed: {t:?}"
+                );
+            }
+            other => panic!("healthy wgpu present {present} must be timed, got {other:?}"),
         }
     }
 }
@@ -188,7 +190,8 @@ fn the_frame_shape_counts_streams_passes_and_bytes() {
 
 /// The ablation seam prices the Unorm light a glow frame pays for, and only it: with the light
 /// dropped the same frame runs one pass and still stages the glow instances; thinned, it keeps
-/// every pass; with the seam off again the passes come back.
+/// every pass; with the seam off again the passes come back. The shape says what the arm's plan
+/// took, so an arm that ignored the seam reads as the plan it ran.
 #[test]
 fn the_unorm_ablation_saves_the_glow_frames_passes() {
     use aterm_gpu::UnormAblation;
@@ -208,6 +211,11 @@ fn the_unorm_ablation_saves_the_glow_frames_passes() {
     assert_eq!(full.ablation, UnormAblation::Off);
     assert_eq!(dropped.ablation, UnormAblation::Drop);
     assert_eq!(thinned.ablation, UnormAblation::Thin);
+    // The shape counts the Unorm draws off the plan the arm ran: the glow's eight quads in
+    // one draw, none dropped, one instance thinned.
+    assert_eq!((full.unorm_draws, full.unorm_instances), (1, 8));
+    assert_eq!((dropped.unorm_draws, dropped.unorm_instances), (0, 0));
+    assert_eq!((thinned.unorm_draws, thinned.unorm_instances), (1, 1));
     assert!(
         dropped.passes < full.passes,
         "the glow's Unorm group costs passes: {} full vs {} dropped",

@@ -111,9 +111,10 @@ pub(crate) fn binary_path(header: &str) -> Option<&str> {
 /// code, so the run records it as COULD NOT RUN, never `FAIL`.
 ///
 /// Producers print it verbatim in their panic message, most through
-/// `aterm_uds::host::could_not_run` (its `COULD_NOT_RUN` is this string); a
-/// reworded producer turns its refusals into findings, which fails closed.
-pub const COULD_NOT_RUN_SENTINEL: &str = "aterm-gate: COULD NOT RUN";
+/// `aterm_uds::host::could_not_run`: this is that crate's `COULD_NOT_RUN`, re-exported,
+/// so the producers' words and the reader's are one constant. A reworded producer turns
+/// its refusals into findings, which fails closed.
+pub use aterm_uds::host::COULD_NOT_RUN as COULD_NOT_RUN_SENTINEL;
 
 /// The failed tests in a failed `targo test` child's log, when every failure
 /// carries [`COULD_NOT_RUN_SENTINEL`]; `None` when any does not, or when the

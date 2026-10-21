@@ -22,7 +22,9 @@
 //! [`Font::horizontal_line_metrics`], [`Font::horizontal_kern`],
 //! [`Font::metrics`] — plus [`Metrics`], [`LineMetrics`] and [`FontSettings`].
 //! Nothing was added "for completeness": an unused method is an unmeasured
-//! method.
+//! method. One was added since, because a caller drew wrong without it:
+//! [`Font::unicode_glyph_index`], the answer of the face's UNICODE subtables
+//! (see `lookup_glyph_index` below).
 //!
 //! # Where it is deliberately IDENTICAL to fontdue, and where it is not
 //!
@@ -47,6 +49,17 @@
 //!   which face a cell draws from. (`crate::fontdue_cmap_covers`, the
 //!   parse-free predicate for the deferred tier, predicts exactly this map — so
 //!   the two stay consistent by construction.)
+//!
+//!   That answer is WRONG as a glyph choice wherever a legacy subtable is
+//!   listed after the Unicode one. Monaco's cmap is `(0,3)`, then seven Mac
+//!   Roman `(1,0)`, Mac Cyrillic `(1,7)` and Mac Central European `(1,29)`, so
+//!   94 of the 96 printable Latin-1 characters U+00A0–U+00FF map to the glyph
+//!   of the Mac byte with that value: `·` U+00B7 to `∑`, `×` U+00D7 to `◊`.
+//!   [`Font::unicode_glyph_index`] is the answer of the Unicode subtables, the
+//!   way CoreText, FreeType's charmap selection and HarfBuzz choose. The grid
+//!   draws its primary face by that answer (`Renderer::primary_unicode_gid`),
+//!   and so must any other text that turns a char into a glyph outside the
+//!   routing lattice — the chrome drew `·` as `∑` through this map.
 //! * **`px <= 0`** returns `(Metrics::default(), Vec::new())`, and a glyph with
 //!   no outline (space) returns a 0×0 raster carrying only the advance.
 //!
@@ -127,6 +140,16 @@
 //! megabyte of derived tables where fontdue's cost 300, and that megabyte is
 //! what the deferred-parse machinery (`LazyFontdue`) now defers.
 //!
+//! [`Font::unicode_glyph_index`]'s override table came after that table was
+//! measured, and it is the one derived table that depends on the cmap's
+//! legacy subtables. MEASURED: none for Apple Symbols or Arial Unicode, 5
+//! entries for Symbols Nerd Font Mono and 37 for DejaVu Sans Mono (control
+//! codes their Mac Roman subtables map and their Unicode ones do not), 129 for
+//! Monaco (1 kB), and 12 280 for STHeiti Light (98 kB), whose Macintosh
+//! Chinese subtable enumerates its two-byte codes as code points. Building it
+//! is one Unicode lookup per code point a legacy subtable maps: about 25 µs
+//! on Monaco and under 1 ms on STHeiti Light in an unoptimised build.
+//!
 //! The FILE is retained, unlike fontdue's — which kept converted geometry and
 //! not one byte of the file — so the constructors come in three shapes and only
 //! one of them copies: [`Font::from_shared_slice`] and [`Font::from_shared_vec`]
@@ -143,7 +166,7 @@
 //! Those are exactly the calls every consumer in the workspace already serves
 //! from a glyph cache.
 
-use aterm_hash::FxHashMap;
+use aterm_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
@@ -407,6 +430,20 @@ pub struct Font {
     /// fontdue's `char_to_glyph`: EVERY cmap subtable enumerated, non-zero
     /// mappings only, later subtables overwriting earlier ones.
     char_to_glyph: FxHashMap<char, NonZeroU16>,
+    /// Where [`Font::unicode_glyph_index`] answers differently from
+    /// [`Self::char_to_glyph`]: each code point a legacy subtable (Macintosh
+    /// `(1,*)`, Windows Symbol `(3,0)`, …), or a later Unicode subtable that
+    /// disagrees with an earlier one, won in the enumerated map, with the glyph
+    /// the face's Unicode subtables map it to (`0`: none), sorted by code
+    /// point. Empty for a face that has no legacy subtable and whose Unicode
+    /// subtables agree, and for one with no Unicode subtable at all, which
+    /// keeps the enumerated answer.
+    ///
+    /// A sorted slice, not a map, because the big ones are Apple's CJK faces,
+    /// whose Macintosh two-byte subtable enumerates its codes as code points
+    /// (STHeiti Light: 12 280 entries, 98 kB here against ~150 kB as a map),
+    /// and a lookup that misses an empty slice costs nothing.
+    unicode_overrides: Box<[(char, u16)]>,
     /// `hmtx` advance per glyph id, in design units. Indexed by gid; a gid past
     /// the end of the table repeats the last entry, which is what
     /// `glyph_hor_advance` already does, so this is a straight copy.
@@ -507,9 +544,20 @@ impl Font {
         // place this is strictly safer rather than merely equal: a cmap that
         // emits a surrogate code point yields `None` here instead of an invalid
         // `char`, and no `char` a caller can hold is a surrogate anyway.
+        //
+        // The same walk notes each code point whose winner may not be the
+        // Unicode subtables' answer (`unicode_overrides`): one a legacy
+        // subtable mapped, or one a subtable re-mapped to a different glyph. A
+        // face with no Unicode subtable notes nothing; its legacy map is its
+        // answer.
         let mut char_to_glyph: FxHashMap<char, NonZeroU16> = FxHashMap::default();
+        // Keep one candidate per scalar while walking: repeated legacy subtables
+        // must not multiply temporary storage before the final sort.
+        let mut contested: FxHashSet<char> = FxHashSet::default();
         if let Some(cmap) = face.tables().cmap {
+            let has_unicode = cmap.subtables.into_iter().any(|s| s.is_unicode());
             for subtable in cmap.subtables {
+                let legacy = has_unicode && !subtable.is_unicode();
                 subtable.codepoints(|cp| {
                     let Some(ch) = char::from_u32(cp) else {
                         return;
@@ -518,11 +566,15 @@ impl Font {
                         && let Some(nz) = NonZeroU16::new(gid.0)
                         && nz.get() < glyph_count
                     {
-                        char_to_glyph.insert(ch, nz);
+                        let replaced = char_to_glyph.insert(ch, nz);
+                        if legacy || (has_unicode && replaced.is_some_and(|old| old != nz)) {
+                            contested.insert(ch);
+                        }
                     }
                 });
             }
         }
+        let unicode_overrides = unicode_overrides(&face, &char_to_glyph, contested, glyph_count);
 
         // `hmtx` is a flat array; reading it once here is what keeps
         // `metrics(..).advance_width` — the UI text measurer's per-character
@@ -564,6 +616,7 @@ impl Font {
             upem,
             glyph_count,
             char_to_glyph,
+            unicode_overrides,
             advances,
             bboxes,
             line_metrics,
@@ -578,6 +631,27 @@ impl Font {
     #[must_use]
     pub fn lookup_glyph_index(&self, ch: char) -> u16 {
         self.char_to_glyph.get(&ch).map_or(0, |g| g.get())
+    }
+
+    /// The glyph id the face's UNICODE cmap subtables map `ch` to — platform
+    /// 0, and Windows `(3,1)` and `(3,10)` — or `0` (`.notdef`) when they map
+    /// it to nothing. The first Unicode subtable, in table order, that maps
+    /// `ch` to a glyph the face has wins. A face with no Unicode subtable
+    /// answers [`Font::lookup_glyph_index`]: its legacy subtables are all the
+    /// map it has.
+    ///
+    /// This, not [`Font::lookup_glyph_index`], is the glyph a char draws as:
+    /// see the module docs for the Macintosh subtables that answer otherwise.
+    /// Draw by id with it ([`Font::rasterize_indexed`],
+    /// [`Font::metrics_indexed`], [`Font::horizontal_kern_indexed`]).
+    #[inline]
+    #[must_use]
+    pub fn unicode_glyph_index(&self, ch: char) -> u16 {
+        self.unicode_overrides
+            .binary_search_by_key(&ch, |&(point, _)| point)
+            .ok()
+            .and_then(|at| self.unicode_overrides.get(at))
+            .map_or_else(|| self.lookup_glyph_index(ch), |&(_, gid)| gid)
     }
 
     /// Design-units → pixels at `px`.
@@ -748,6 +822,91 @@ fn ink_box_px(bbox: [i16; 4], scale: f32) -> (i32, i32, usize, usize) {
     (x_min as i32, y_min as i32, w, h)
 }
 
+/// [`Font::unicode_overrides`] for a face whose enumerated map is
+/// `char_to_glyph`: of the `contested` code points, each whose Unicode answer
+/// ([`Font::unicode_glyph_index`]) is not the enumerated one, with that answer.
+/// A code point no subtable contested has one answer in every Unicode
+/// subtable that maps it, and that answer won the enumeration, so only the
+/// contested ones are asked. Sorted, because `contested` is sorted first.
+fn unicode_overrides(
+    face: &aterm_font::Face<'_>,
+    char_to_glyph: &FxHashMap<char, NonZeroU16>,
+    contested: FxHashSet<char>,
+    glyph_count: u16,
+) -> Box<[(char, u16)]> {
+    let mut overrides = Vec::new();
+    let Some(cmap) = face.tables().cmap else {
+        return overrides.into();
+    };
+    if contested.is_empty() {
+        return overrides.into();
+    }
+    let mut contested: Vec<char> = contested.into_iter().collect();
+    contested.sort_unstable();
+    let unicode: Vec<aterm_font::cmap::Subtable<'_>> = cmap
+        .subtables
+        .into_iter()
+        .filter(|s| s.is_unicode())
+        .collect();
+    for ch in contested {
+        let answer = unicode
+            .iter()
+            .find_map(|s| {
+                s.glyph_index(u32::from(ch))
+                    .map(|g| g.0)
+                    .filter(|&g| g != 0 && g < glyph_count)
+            })
+            .unwrap_or(0);
+        if answer != char_to_glyph.get(&ch).map_or(0, |g| g.get()) {
+            overrides.push((ch, answer));
+        }
+    }
+    overrides.into()
+}
+
+/// `bytes`, a single-face font file, with the first cmap encoding record for
+/// `(platform, encoding)` moved to the END of the record list, the others kept
+/// in order. Every subtable and every other table keep their bytes; only which
+/// subtable the enumeration reaches last changes. `None` when the file has no
+/// such record.
+///
+/// This is how a test gets Monaco's shape — a Macintosh subtable after the
+/// Unicode one — on a face every host has: the embedded DejaVu Sans Mono lists
+/// its Mac Roman `(1,0)` subtable BEFORE `(3,1)`, where the enumeration lets
+/// the Unicode subtable win.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn with_cmap_record_last(bytes: &[u8], platform: u16, encoding: u16) -> Option<Vec<u8>> {
+    let u16_at = |at: usize| -> Option<usize> {
+        let field: [u8; 2] = bytes.get(at..at.checked_add(2)?)?.try_into().ok()?;
+        Some(usize::from(u16::from_be_bytes(field)))
+    };
+    let u32_at = |at: usize| -> Option<usize> {
+        let field: [u8; 4] = bytes.get(at..at.checked_add(4)?)?.try_into().ok()?;
+        usize::try_from(u32::from_be_bytes(field)).ok()
+    };
+    // The table directory: 12 bytes of header, then 16 per table record, whose
+    // tag leads and whose offset is the third field.
+    let cmap_record = (0..u16_at(4)?)
+        .map(|i| 12 + 16 * i)
+        .find(|&record| bytes.get(record..record + 4) == Some(b"cmap".as_slice()))?;
+    let cmap = u32_at(cmap_record + 8)?;
+    // The cmap header: version, record count, then 8 bytes per encoding record
+    // (platform, encoding, subtable offset).
+    let count = u16_at(cmap.checked_add(2)?)?;
+    let first = cmap + 4;
+    let found = (0..count).find(|&i| {
+        u16_at(first + 8 * i) == Some(usize::from(platform))
+            && u16_at(first + 8 * i + 2) == Some(usize::from(encoding))
+    })?;
+    let mut moved = bytes.to_vec();
+    moved
+        .get_mut(first + 8 * found..first + 8 * count)?
+        .rotate_left(8);
+    Some(moved)
+}
+
 /// aterm-font's parse failure, as the `&'static str` the call sites format
 /// (ttf-parser's wording, which they always printed).
 fn describe(error: aterm_font::FaceParsingError) -> &'static str {
@@ -761,5 +920,194 @@ fn describe(error: aterm_font::FaceParsingError) -> &'static str {
         NoHeadTable => "The head table is missing or malformed.",
         NoHheaTable => "The hhea table is missing or malformed.",
         NoMaxpTable => "The maxp table is missing or malformed.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Font, FontSettings, with_cmap_record_last};
+
+    /// The characters the Stats Deck drew wrong on Monaco — `·` as `∑`, `×`
+    /// as `◊` — and two more Latin-1 characters the same subtables remap.
+    const LATIN_1: [char; 4] = ['\u{B7}', '\u{D7}', '\u{B0}', '\u{E9}'];
+
+    /// What the face's Unicode subtables map `ch` to, read off aterm-font one
+    /// subtable at a time: the first that maps it to a glyph the face has, `0`
+    /// for none, and `None` for a face with no Unicode subtable.
+    fn unicode_answer(face: &aterm_font::Face<'_>, ch: char) -> Option<u16> {
+        let cmap = face.tables().cmap?;
+        let mut unicode = cmap
+            .subtables
+            .into_iter()
+            .filter(|s| s.is_unicode())
+            .peekable();
+        unicode.peek()?;
+        Some(
+            unicode
+                .find_map(|s| {
+                    s.glyph_index(u32::from(ch))
+                        .map(|g| g.0)
+                        .filter(|&g| g != 0 && g < face.number_of_glyphs())
+                })
+                .unwrap_or(0),
+        )
+    }
+
+    /// Holds [`Font::unicode_glyph_index`] to [`unicode_answer`] (to the
+    /// enumerated map for a face with no Unicode subtable) over every char any
+    /// subtable of `face` maps, and answers the chars where it is not
+    /// [`Font::lookup_glyph_index`]'s answer.
+    fn moved_from_the_enumerated_map(font: &Font, face: &aterm_font::Face<'_>) -> Vec<char> {
+        let mut chars = Vec::new();
+        if let Some(cmap) = face.tables().cmap {
+            for subtable in cmap.subtables {
+                subtable.codepoints(|cp| chars.extend(char::from_u32(cp)));
+            }
+        }
+        chars.sort_unstable();
+        chars.dedup();
+        let mut moved = Vec::new();
+        for ch in chars {
+            let want = unicode_answer(face, ch).unwrap_or_else(|| font.lookup_glyph_index(ch));
+            assert_eq!(
+                font.unicode_glyph_index(ch),
+                want,
+                "U+{:04X}: the Unicode subtables' glyph",
+                u32::from(ch)
+            );
+            if want != font.lookup_glyph_index(ch) {
+                moved.push(ch);
+            }
+        }
+        moved
+    }
+
+    /// A MACINTOSH SUBTABLE LISTED AFTER THE UNICODE ONE DOES NOT MOVE A CHAR
+    /// OFF ITS GLYPH. The embedded DejaVu Sans Mono with its Mac Roman `(1,0)`
+    /// record moved last has Monaco's shape on every host: the enumerated map,
+    /// kept as it was, now gives `·` the glyph of Mac Roman byte 0xB7 (`∑`)
+    /// and `×` that of 0xD7 (`◊`), which is what the chrome drew. The Unicode
+    /// answer is the Unicode subtable's glyph, the very glyph the shipped face
+    /// (whose Unicode subtables come last and win its enumeration) answers.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn a_mac_subtable_listed_last_does_not_remap_latin_1() {
+        let shipped_bytes = crate::embedded_font();
+        let moved_bytes = with_cmap_record_last(shipped_bytes, 1, 0)
+            .expect("DejaVu Sans Mono carries a Mac Roman (1,0) subtable");
+        let font = Font::from_bytes(moved_bytes.as_slice(), FontSettings::default())
+            .expect("the reordered face parses");
+        let face = aterm_font::Face::parse(&moved_bytes, 0).expect("the reordered face parses");
+        let shipped = Font::from_bytes(shipped_bytes, FontSettings::default())
+            .expect("the embedded face parses");
+        let gid = |ch: char| face.glyph_index(ch).map_or(0, |g| g.0);
+
+        // The fixture has the defect: the enumerated map reaches Mac Roman last.
+        assert_eq!(font.lookup_glyph_index('\u{B7}'), gid('\u{2211}'), "· is ∑");
+        assert_eq!(font.lookup_glyph_index('\u{D7}'), gid('\u{25CA}'), "× is ◊");
+        for ch in LATIN_1 {
+            let want = gid(ch);
+            assert_ne!(want, 0, "DejaVu Sans Mono maps U+{:04X}", u32::from(ch));
+            assert_ne!(
+                font.lookup_glyph_index(ch),
+                want,
+                "the enumerated map remaps U+{:04X}",
+                u32::from(ch)
+            );
+            assert_eq!(
+                font.unicode_glyph_index(ch),
+                want,
+                "U+{:04X}",
+                u32::from(ch)
+            );
+            assert_eq!(
+                shipped.lookup_glyph_index(ch),
+                want,
+                "U+{:04X}",
+                u32::from(ch)
+            );
+        }
+        let moved = moved_from_the_enumerated_map(&font, &face);
+        // 89 of the 96 on this face: Mac Roman shares `¢ £ © ± µ` with
+        // Latin-1, and DejaVu maps its 0xDA and 0xF0 to no glyph.
+        let latin_1 = moved
+            .iter()
+            .filter(|ch| ('\u{A0}'..='\u{FF}').contains(*ch));
+        assert!(
+            latin_1.count() >= 80,
+            "the Mac Roman subtable remaps most of Latin-1: {moved:?}"
+        );
+        // And every printable char the reordered face answers by Unicode is the
+        // glyph the shipped face draws today.
+        for ch in moved.iter().filter(|ch| !ch.is_control()) {
+            assert_eq!(
+                font.unicode_glyph_index(*ch),
+                shipped.lookup_glyph_index(*ch),
+                "U+{:04X}",
+                u32::from(*ch)
+            );
+        }
+    }
+
+    /// NOTHING A FACE DRAWS RIGHT TODAY MOVES. The embedded faces carry a Mac
+    /// Roman subtable BEFORE their Unicode ones, so the enumeration already
+    /// gives every printable char its Unicode glyph; the Unicode answer agrees
+    /// with it on all of them and differs only on control codes the Mac
+    /// subtable maps and the Unicode ones do not. A face whose cmap is Unicode
+    /// only (the bundled Iosevka Term) agrees everywhere.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn the_unicode_answer_keeps_every_printable_char_of_the_shipped_faces() {
+        for (name, bytes) in [
+            ("DejaVu Sans Mono", crate::embedded_font()),
+            ("Symbols Nerd Font Mono", crate::embedded_symbols_font()),
+            (
+                "Iosevka Term",
+                crate::bundled::face_for_id(crate::bundled::IOSEVKA_ID)
+                    .expect("the bundled Iosevka Term"),
+            ),
+        ] {
+            let font = Font::from_bytes(bytes, FontSettings::default()).expect(name);
+            let face = aterm_font::Face::parse(bytes, 0).expect(name);
+            let moved = moved_from_the_enumerated_map(&font, &face);
+            assert!(
+                moved.iter().all(|ch| ch.is_control()),
+                "{name}: only control codes move: {moved:?}"
+            );
+        }
+    }
+
+    /// MONACO DRAWS LATIN-1 BY ITS UNICODE SUBTABLE. The face that showed the
+    /// defect: its `(0,3)` subtable is followed by Mac Roman, Mac Cyrillic and
+    /// Mac Central European ones, and the last wins the enumeration. Every
+    /// printable Latin-1 char resolves to the glyph `(0,3)` maps it to — the
+    /// glyph the terminal grid draws (`aterm_font::Face::glyph_index`, behind
+    /// `Renderer::primary_unicode_gid`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn monaco_resolves_latin_1_through_its_unicode_subtable() {
+        let path = "/System/Library/Fonts/Monaco.ttf";
+        let Ok(bytes) = std::fs::read(path) else {
+            aterm_spec::host::could_not_run(format!("no {path} on this Mac"));
+        };
+        let font = Font::from_bytes(bytes.as_slice(), FontSettings::default()).expect(path);
+        let face = aterm_font::Face::parse(&bytes, 0).expect(path);
+        let grid = |ch: char| face.glyph_index(ch).map_or(0, |g| g.0);
+        for ch in LATIN_1 {
+            assert_ne!(grid(ch), 0, "Monaco maps U+{:04X}", u32::from(ch));
+        }
+        for ch in '\u{A0}'..='\u{FF}' {
+            assert_eq!(
+                font.unicode_glyph_index(ch),
+                grid(ch),
+                "U+{:04X}",
+                u32::from(ch)
+            );
+        }
+        // Every other char Monaco's subtables map answers by Unicode too. How
+        // many of them the enumerated map gets wrong is a fact of Apple's file,
+        // not of aterm, so it is not asserted here: the fixture test above
+        // proves the defect on every host.
+        moved_from_the_enumerated_map(&font, &face);
     }
 }

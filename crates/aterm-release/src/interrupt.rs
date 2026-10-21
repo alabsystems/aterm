@@ -80,10 +80,13 @@ mod imp {
 
     /// The running step's child, for as long as this value lives: a forwarder thread
     /// polls the signals caught (every 50 ms) and hands them on — so a signal that
-    /// arrived between the spawn and this is handed on at its first look.
+    /// arrived between the spawn and this is handed on at its first look — and a
+    /// git credential helper of the child's that waits for a person is ended
+    /// ([`crate::credential_wait`]).
     pub struct Running {
         done: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+        _credentials: crate::credential_wait::Watch,
     }
 
     impl Running {
@@ -94,7 +97,11 @@ mod imp {
                 let done = Arc::clone(&done);
                 std::thread::spawn(move || forward(group, &done))
             });
-            Self { done, thread }
+            Self {
+                done,
+                thread,
+                _credentials: crate::credential_wait::Watch::enter(leader),
+            }
         }
     }
 

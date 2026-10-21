@@ -1063,6 +1063,64 @@ fn publish_refuses_a_marker_that_would_exceed_the_ledger_cap() {
     );
     assert_eq!(read_id(&s.staged_app), "OLD-STAGE");
     assert_eq!(read_id(&incoming), "NEW-STAGE");
+
+    // Model an unpublished candidate whose assessment-end is unknown. Dropping
+    // this attempt and allocating another may not unlink or rename its path.
+    use std::os::unix::fs::MetadataExt as _;
+    let retained = StageIncoming::create(&s).unwrap();
+    let retained_path = retained.path.clone();
+    make_app(&retained_path, "RETAINED-UNKNOWN");
+    let identity = |path: &Path| {
+        let metadata = std::fs::metadata(path).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    let retained_dir = identity(&retained_path);
+    let retained_file = identity(&retained_path.join("id"));
+    let unwound = std::panic::catch_unwind(move || {
+        let _retained = retained;
+        panic!("captured stage unwind");
+    });
+    assert!(unwound.is_err());
+
+    let retry = StageIncoming::create(&s).unwrap();
+    assert_ne!(retry.path, retained_path);
+    assert_ne!(retry.path, incoming, "the legacy fixed path is not reused");
+    assert_eq!(read_id(&retained_path), "RETAINED-UNKNOWN");
+    assert_eq!(read_id(&incoming), "NEW-STAGE");
+    // The actual isolated-copy promotion can replace the fresh empty reservation;
+    // its own scratch stays directly under staged/, at the old reaper's depth.
+    use std::os::unix::process::ExitStatusExt as _;
+    copy_into_isolated_destination(
+        &[retry.path.clone().into_os_string()],
+        "incoming retry fixture",
+        |args, attempt| {
+            assert_eq!(attempt.parent(), Some(s.staged_dir().as_path()));
+            make_app(Path::new(args.last().unwrap()), "RETRY");
+            Ok((std::process::ExitStatus::from_raw(0), String::new()))
+        },
+    )
+    .unwrap();
+    ready.changelog = None;
+    publish_verified_stage(&s, &retry.path, &ready).unwrap();
+    let retry_path = retry.path.clone();
+    drop(retry);
+    assert!(
+        !retry_path.exists(),
+        "the published attempt left no reservation"
+    );
+    assert_eq!(read_id(&s.staged_app), "RETRY");
+    assert_eq!(read_id(&incoming), "NEW-STAGE");
+    assert_eq!(read_id(&retained_path), "RETAINED-UNKNOWN");
+    assert_eq!(identity(&retained_path), retained_dir);
+    assert_eq!(identity(&retained_path.join("id")), retained_file);
+
+    let empty = StageIncoming::create(&s).unwrap();
+    let empty_path = empty.path.clone();
+    drop(empty);
+    assert!(
+        !empty_path.exists(),
+        "an unused empty reservation is reclaimed"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -5028,4 +5086,263 @@ fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_e
         !left_stage_path(&s).exists(),
         "a swap of the stage removes the record of the launches that left it"
     );
+}
+
+/// Which start-probe failures leave the candidate unproven: a probe killed at its
+/// ceiling (the helper timeout or the apply budget) and a wait that failed started it
+/// and never saw it exit. NEGATIVE CONTROLS: a refused spawn started nothing, passing or
+/// not, and a verdict ran it to an exit.
+#[test]
+fn only_a_probe_that_lost_a_started_candidate_leaves_it_unproven() {
+    let what = "candidate --version probe";
+    for unproven in [
+        crate::verify::timed_out(what, false),
+        crate::verify::timed_out(what, true),
+        crate::verify::mark_passing(format!("wait for {what}: Interrupted system call")),
+    ] {
+        assert!(probe_left_unproven(&unproven), "{unproven}");
+    }
+    for answered in [
+        crate::verify::spawn_refusal(what, &std::io::Error::from_raw_os_error(libc::EAGAIN)),
+        crate::verify::spawn_refusal(what, &std::io::Error::from_raw_os_error(libc::EACCES)),
+        "the staged bundle could not start (exit status: 1): dyld: boom".to_string(),
+        "no executable at /x/aterm.app/Contents/MacOS/aterm".to_string(),
+    ] {
+        assert!(!probe_left_unproven(&answered), "{answered}");
+    }
+}
+
+/// A START PROBE KILLED BEFORE ITS CANDIDATE EXITED LEAVES IT WHERE IT RAN (r4g-2).
+/// The apply's probe of the candidate prepared at the fixed path timed out: macOS may
+/// still be assessing that file's first exec, which the kill does not end, so the
+/// same-volume swap neither renames it back to the stage nor removes it. Its marker is
+/// retired (the stage path no longer holds it) and the candidate recorded; the next
+/// stage of the build is not swapped through that path until the first-exec hang has
+/// passed, and then it is, the record dropped. NEGATIVE CONTROLS: a probe that ran the
+/// candidate to an exit (a verdict) and one whose spawn was refused (nothing started)
+/// back out as before, the stage restored and nothing recorded.
+#[test]
+fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
+    let (running, build, commit, other_commit) = (
+        10,
+        11,
+        "0123456789abcdef0123456789abcdef01234567",
+        "fedcba9876543210fedcba9876543210fedcba98",
+    );
+    let stage = |s: &Staging, id: &str| {
+        write_ready(s, build);
+        make_app(&s.staged_app, id);
+        std::fs::create_dir_all(s.staged_app.join("Contents")).unwrap();
+        std::fs::write(
+            s.staged_app.join("Contents/Info.plist"),
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>{build}</string>\
+                 <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
+            ),
+        )
+        .unwrap();
+    };
+    let desk = |id: &str| {
+        let (s, root) = temp_staging();
+        stage(&s, id);
+        let installed = root.join("Applications/aterm.app");
+        make_app(&installed, "OLD");
+        (s, root, installed)
+    };
+    let swap = |s: &Staging,
+                installed: &Path,
+                probe: &dyn Fn(&Path, u64) -> Result<(), String>|
+     -> Result<(), ApplyOutcome> {
+        let read = |path: &Path| -> Result<(u64, String), String> {
+            if path == installed {
+                Ok((running, other_commit.to_string()))
+            } else {
+                Ok((build, commit.to_string()))
+            }
+        };
+        let read_both = |[a, b]: [&Path; 2]| [read(a), read(b)];
+        let admitted =
+            admit_stage_under_apply_lock(s, installed, running, Some(other_commit), None)?;
+        swap_admitted_stage(
+            s,
+            installed,
+            running,
+            Some(other_commit),
+            admitted,
+            &SwapSeams {
+                one: &read,
+                both: &read_both,
+                probe,
+            },
+        )
+        .map(drop)
+    };
+    let killed = |_: &Path, _: u64| -> Result<(), String> {
+        Err(crate::verify::timed_out("candidate --version probe", false))
+    };
+    let starts = |_: &Path, _: u64| -> Result<(), String> { Ok(()) };
+
+    let (s, root, installed) = desk("NEW");
+    let fixed = rollback_path(&installed);
+    assert!(matches!(
+        swap(&s, &installed, &killed),
+        Err(ApplyOutcome::Deferred(_))
+    ));
+    assert_eq!(read_id(&fixed), "NEW", "left exactly where it ran");
+    assert!(
+        !s.staged_app.exists() && !s.ready.exists(),
+        "the moved stage's marker is retired"
+    );
+    assert_eq!(read_id(&installed), "OLD");
+    let record = UnprovenCandidate::read(&s).expect("the unproven candidate is recorded");
+    assert_eq!(record.bundle, fixed);
+    // The build staged again waits out the record: nothing at the fixed path moves.
+    stage(&s, "NEW2");
+    match swap(&s, &installed, &starts) {
+        Err(ApplyOutcome::Deferred(why)) => assert!(
+            crate::is_passing_refusal(&why) && why.contains("first exec"),
+            "{why}"
+        ),
+        other => panic!("swapped through an unproven candidate: {other:?}"),
+    }
+    assert_eq!(read_id(&fixed), "NEW");
+    assert_eq!(read_id(&s.staged_app), "NEW2");
+    assert_eq!(read_id(&installed), "OLD");
+    // The first-exec hang has passed since the kill: the record goes, the swap goes on.
+    UnprovenCandidate {
+        bundle: fixed.clone(),
+        killed_at: record.killed_at - aterm_uds::deadline::FIRST_EXEC_HANG.as_secs(),
+    }
+    .record(&s)
+    .unwrap();
+    assert!(swap(&s, &installed, &starts).is_ok());
+    assert_eq!(read_id(&installed), "NEW2");
+    assert_eq!(read_id(&fixed), "OLD", "the rollback source");
+    assert!(
+        UnprovenCandidate::read(&s).is_none(),
+        "the record is dropped"
+    );
+    let _ = std::fs::remove_dir_all(root);
+
+    // NEGATIVE CONTROLS: answered probes back out as before.
+    let verdict = |_: &Path, _: u64| -> Result<(), String> {
+        Err("the staged bundle could not start (exit status: 1): dyld: boom".to_string())
+    };
+    let refused = |_: &Path, _: u64| -> Result<(), String> {
+        Err(crate::verify::spawn_refusal(
+            "candidate --version probe",
+            &std::io::Error::from_raw_os_error(libc::EAGAIN),
+        ))
+    };
+    for (what, probe) in [
+        (
+            "a verdict",
+            &verdict as &dyn Fn(&Path, u64) -> Result<(), String>,
+        ),
+        ("a refused spawn", &refused),
+    ] {
+        let (s, root, installed) = desk("NEW");
+        assert!(
+            matches!(swap(&s, &installed, probe), Err(ApplyOutcome::Deferred(_))),
+            "{what}"
+        );
+        assert_eq!(
+            read_id(&s.staged_app),
+            "NEW",
+            "{what}: the stage is restored"
+        );
+        assert!(s.ready.exists(), "{what}: its marker stays");
+        assert!(!rollback_path(&installed).exists(), "{what}");
+        assert!(
+            UnprovenCandidate::read(&s).is_none(),
+            "{what}: nothing recorded"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// Across volumes the candidate is a copy at the fixed path beside an intact stage: an
+/// unproven one stays there with the stage and its marker, recorded. NEGATIVE CONTROL:
+/// backed out (a verdict), the copy is removed.
+#[test]
+fn an_unproven_copied_candidate_stays_beside_its_stage() {
+    let (s, root) = temp_staging();
+    write_ready(&s, 54);
+    make_app(&s.staged_app, "NEW");
+    let installed = root.join("Applications/aterm.app");
+    make_app(&installed, "OLD");
+    let fixed = rollback_path(&installed);
+    make_app(&fixed, "COPY");
+    keep_unproven_candidate(&copied_candidate(&fixed), &s, 1_800_000_000);
+    assert_eq!(read_id(&fixed), "COPY");
+    assert_eq!(read_id(&s.staged_app), "NEW");
+    assert!(s.ready.exists());
+    assert_eq!(
+        UnprovenCandidate::read(&s),
+        Some(UnprovenCandidate {
+            bundle: fixed.clone(),
+            killed_at: 1_800_000_000
+        })
+    );
+    // A crash after recording a moved candidate can leave ready present but its
+    // stage absent. Orphan recovery must not verify or rename the held fixed copy.
+    std::fs::remove_dir_all(&s.staged_app).unwrap();
+    UnprovenCandidate {
+        bundle: fixed.clone(),
+        killed_at: u64::MAX,
+    }
+    .record(&s)
+    .unwrap();
+    let ready_bytes = std::fs::read(&s.ready).unwrap();
+    let ready = Ready::read(&s.ready).unwrap();
+    let refusal = recover_orphaned_prepared_candidate(&s, &installed, 53, &ready).unwrap_err();
+    assert!(crate::is_passing_refusal(&refusal), "{refusal}");
+    assert_eq!(read_id(&fixed), "COPY");
+    assert_eq!(std::fs::read(&s.ready).unwrap(), ready_bytes);
+    assert!(
+        !s.staged_app.exists(),
+        "the held copy stays at its fixed path"
+    );
+    make_app(&s.staged_app, "NEW");
+    UnprovenCandidate {
+        bundle: fixed.clone(),
+        killed_at: 1_800_000_000,
+    }
+    .record(&s)
+    .unwrap();
+
+    let hang = aterm_uds::deadline::FIRST_EXEC_HANG.as_secs();
+    for earlier in [1_800_000_000 - hang, 0] {
+        assert_eq!(
+            UnprovenCandidate::holds(&s, &fixed, earlier),
+            Some(hang),
+            "a backward or unavailable clock cannot age the candidate"
+        );
+        assert!(UnprovenCandidate::read(&s).is_some());
+    }
+    assert_eq!(
+        UnprovenCandidate::holds(&s, &fixed, 1_800_000_000 + 60),
+        Some(hang - 60)
+    );
+    assert_eq!(
+        UnprovenCandidate::holds(&s, &root.join("elsewhere"), 1_800_000_060),
+        None,
+        "it holds only the path it names"
+    );
+    assert!(
+        UnprovenCandidate::read(&s).is_some(),
+        "kept for its own path"
+    );
+    assert_eq!(
+        UnprovenCandidate::holds(&s, &fixed, 1_800_000_000 + hang),
+        None
+    );
+    assert!(
+        UnprovenCandidate::read(&s).is_none(),
+        "run its course: dropped"
+    );
+    recover_prepared_candidate(&copied_candidate(&fixed), &s);
+    assert!(!fixed.exists(), "backed out, the copy goes");
+    assert_eq!(read_id(&s.staged_app), "NEW");
+    let _ = std::fs::remove_dir_all(root);
 }

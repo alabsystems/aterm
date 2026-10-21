@@ -18,6 +18,7 @@ use crate::items::{self, Ctx};
 use crate::model::{Effect, HostFacts, HostReport, ItemReport, Mode, Outcome, User};
 use crate::port::{Cmd, Ran, System};
 use crate::protocol::Line;
+use aterm_converge::Remedy;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -105,7 +106,7 @@ fn run_job_at(sys: &dyn System, layout: &Layout, exe: &Path, run: &str, pid: u32
         Ok(rows) => {
             for row in &rows {
                 if !matches!(envelope.action, Action::Plan | Action::Apply) {
-                    progress.push(&Line::Item(row.clone()));
+                    progress.push(&Line::Item(Box::new(row.clone())));
                 }
             }
             report.items = rows;
@@ -231,7 +232,13 @@ impl<'a> FileJournal<'a> {
 }
 
 impl Journal for FileJournal<'_> {
-    fn before_change(&mut self, id: &str, from: &str, to: &str) -> Result<(), String> {
+    fn before_change(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+        _revert: Option<&str>,
+    ) -> Result<(), String> {
         let mut text = match self.sys.read_file(&self.path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -299,14 +306,11 @@ fn baseline_run(
     let list = items::expand(&baseline, &ctx)?;
     let mode = e.action.mode().unwrap_or(Mode::Plan);
     let mut journal = FileJournal::new(sys, layout, run);
-    Ok(engine::run_with(
-        &list,
-        mode,
-        sys,
-        &ctx,
-        &mut journal,
-        &mut |row| progress.push(&Line::Item(row.clone())),
-    ))
+    let remedy = Remedy::Command(format!("aterm machines apply {}", e.host_name));
+    engine::run_with(&list, mode, sys, &ctx, &remedy, &mut journal, &mut |row| {
+        progress.push(&Line::Item(Box::new(row.clone())))
+    })
+    .map_err(|refused| refused.to_string())
 }
 
 /// Remember every item id an apply run touched (design §4.2 step 5's `managed.toml`).
@@ -337,6 +341,11 @@ fn row(id: &str, family: &str, title: String) -> ItemReport {
         revert: None,
         effect: Effect::Now,
         detail: None,
+        layer: None,
+        class: None,
+        explain: None,
+        stood_aside: None,
+        essential: false,
     }
 }
 
@@ -745,8 +754,9 @@ mod tests {
     fn the_journal_records_each_change_as_one_line_before_it_is_made() {
         let fake = Fake::root();
         let mut j = FileJournal::new(&fake, &layout(), "1-5");
-        j.before_change("power.ac.sleep", "10", "0").unwrap();
-        j.before_change("names.computer", "\"a\"", "\"b\"").unwrap();
+        j.before_change("power.ac.sleep", "10", "0", None).unwrap();
+        j.before_change("names.computer", "\"a\"", "\"b\"", None)
+            .unwrap();
         let text = String::from_utf8(fake.written("/A/state/journal.ndjson").unwrap()).unwrap();
         let lines: Vec<aterm_json::Value> = text
             .lines()

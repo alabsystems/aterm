@@ -1,0 +1,754 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+// `aterm drive replay --why` OVER A RECORDED LOOP (`run_tests.rs`'s
+// `why_loop` module): a run of the hosted loop's engine recorded over the
+// scripted worker — a read box approved by a safe rule, a question and an
+// idle point handed over — explained at each kind of point. Every assertion
+// is on the structured `Why` (`tape::explain`), never its rendering.
+
+use astream_effects::EffectRecord;
+
+use crate::supervise::policy::approval::{RULE_ALLOW_ONCE, RULE_READ_ONLY};
+use crate::supervise::tape::codec::Item;
+use crate::supervise::tape::core::DecideMark;
+use crate::supervise::tape::doors;
+use crate::supervise::tape::explain::{At, Format, Why, render, why};
+use crate::supervise::tape::recover::recover;
+use crate::supervise::tape::replay::{Options, replay_traced};
+use crate::supervise::tape::testing::written;
+
+/// The scripted worker: a read box approved, a question and an idle point
+/// handed over, then the session gone.
+fn script() -> Mock {
+    let mut m = fenced(vec![
+        busy_screen(),
+        bash_one_row(),
+        busy_screen(),
+        question_screen(),
+        busy_screen(),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(3);
+    m
+}
+
+/// A run of [`script`] recorded as the engine tests record one: its
+/// header's text and its tape's items.
+fn recorded() -> (String, Vec<Item>) {
+    let mut m = script();
+    let run = record_watch(&mut m, &auto(30), |_| {});
+    let header = run.header.encode();
+    let read = recover(&run.tape.reframed(&header));
+    (header, read.items)
+}
+
+/// The zone reader for a point named by no local time: never asked — such a
+/// point is found on the tape alone, with no look at the machine.
+fn no_zone(unix: i64) -> Option<i64> {
+    panic!("the local zone read for a point named by no local time (at {unix})")
+}
+
+/// UTC as the local zone.
+fn utc(_: i64) -> Option<i64> {
+    Some(0)
+}
+
+/// `--why` at `at` on the tape of `items` under `header`.
+fn explained(header: &str, items: &[Item], at: &At) -> Why {
+    why(&written(header, items), at, &no_zone).unwrap_or_else(|e| panic!("why at {at:?}: {e}"))
+}
+
+/// Whether `item` is a round trip at `door`.
+fn crosses(item: &Item, door: &str) -> bool {
+    matches!(item.record(), Some(EffectRecord::Exchange { door: d, .. }) if d == door)
+}
+
+/// WHY DID IT PRESS 1? — the recorded approval explained from the tape
+/// alone: the judged screen and the box this build reads on it, the facts it
+/// was decided on with the door each came through, the act, its reply, the
+/// journal line; and the decision made again by this build's policy on
+/// those facts agrees with the recorded one, its trace naming the rule that
+/// decided — the very rule the recorded mark names — with nothing needed
+/// that the tape did not hold.
+#[test]
+fn why_explains_a_recorded_approval() {
+    let (header, items) = recorded();
+    let w = explained(&header, &items, &At::Seq(102));
+    assert_eq!(w.door, doors::DECIDE_APPROVAL);
+    assert_eq!(w.seq, 102);
+    assert_eq!(w.screen.as_deref(), Some(bash_one_row().as_slice()));
+    let parsed = w.parsed.as_ref().expect("a box read");
+    assert_eq!(parsed.kind, "bash", "{parsed:?}");
+    assert!(
+        parsed.options.iter().any(|o| o.contains("1. Yes")),
+        "{parsed:?}"
+    );
+    assert_eq!(w.recorded_rule.as_deref(), Some(RULE_READ_ONLY));
+    assert_eq!(
+        w.agrees,
+        Some(true),
+        "{:?} vs {}",
+        w.decided,
+        w.recorded_outcome
+    );
+    assert_eq!(w.decided_by(), Some(RULE_READ_ONLY), "{:#?}", w.trace);
+    assert!(w.needs.is_empty(), "{:?}", w.needs);
+    assert!(
+        w.act
+            .as_ref()
+            .is_some_and(|a| a.first().map(String::as_str) == Some("key")
+                && a.last().map(String::as_str) == Some("1")),
+        "{:?}",
+        w.act
+    );
+    assert!(w.reply.is_some(), "{w:#?}");
+    assert_eq!(
+        w.journal.as_deref(),
+        Some("APPROVED seq=102 git log --oneline -5")
+    );
+    let fact = |name: &str| {
+        w.facts
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("fact {name}: {:#?}", w.facts))
+    };
+    assert!(
+        fact("worker").value.starts_with("digest "),
+        "{:#?}",
+        w.facts
+    );
+    assert!(
+        fact("screen").door.starts_with("ctl text #"),
+        "{:#?}",
+        w.facts
+    );
+    assert_eq!(w.recorded_by.as_deref(), Some(w.explained_by.as_str()));
+    // Rendered every way, and every way names the rule.
+    for format in [Format::Text, Format::Md, Format::Html] {
+        assert!(render(&w, format).contains(RULE_READ_ONLY), "{format:?}");
+    }
+}
+
+/// THE SAME DECISION BY EVERY NAME: an effect's ordinal after the mark (the
+/// decision in force there), the journal line it was followed by, and its
+/// screen's sequence each find the one approval; a point with no decision
+/// is refused.
+#[test]
+fn why_finds_a_decision_by_door_and_by_line() {
+    let (header, items) = recorded();
+    let by_seq = explained(&header, &items, &At::Seq(102));
+    let by_door = explained(&header, &items, &At::Door(by_seq.mark + 2));
+    assert_eq!(by_door, by_seq);
+    let by_line = explained(&header, &items, &At::Line("APPROVED seq=102".to_string()));
+    assert_eq!(by_line, by_seq);
+    assert!(why(&written(&header, &items), &At::Seq(9_999), &no_zone).is_err());
+    assert!(why(&written(&header, &items), &At::Door(0), &no_zone).is_err());
+}
+
+/// A MARK FROM A BUILD THAT DID NOT WRITE A FACT: the facts read back without
+/// it, the decision made again at its default — and the explanation NAMES
+/// it among what the re-decision needed (`fact screen_cols`), never
+/// presenting the default as what the recorded run knew.
+#[test]
+fn a_fact_the_recording_build_did_not_write_is_named_in_needs() {
+    let (header, mut items) = recorded();
+    let mut edited = 0;
+    for item in &mut items {
+        if let Item::Effect {
+            record: EffectRecord::Emit { door, bytes },
+            ..
+        } = item
+            && door == doors::DECIDE_APPROVAL
+            && let Some(mut mark) = std::str::from_utf8(bytes).ok().and_then(DecideMark::decode)
+        {
+            let facts = mark.facts.take().expect("an approval's facts");
+            let at = facts.find("\"screen_cols\":").expect("the field");
+            let end = at + facts[at..].find(',').expect("a field after it") + 1;
+            mark.facts = Some(format!("{}{}", &facts[..at], &facts[end..]));
+            *bytes = mark.encode().into_bytes();
+            edited += 1;
+        }
+    }
+    assert_eq!(edited, 1, "the one approval's mark");
+    let w = explained(&header, &items, &At::Seq(102));
+    assert_eq!(w.needs, vec!["fact screen_cols".to_string()]);
+    assert!(w.trace.is_some(), "decided again all the same");
+}
+
+/// A LOOK THE TAPE DOES NOT HOLD: the approval's git read (`probe.git_view`)
+/// taken off the tape, the re-decision asks the tape for it, finds nothing
+/// before the mark, decides the cautious way an unreadable look goes — and
+/// says the look among what it needed, so it does not agree in silence. Nor
+/// does it differ: a cautious answer to a look the tape lacks is no evidence
+/// of what the policy decides, so whether it agrees stays unknown (since
+/// d8e9fb9e1b, which made a missing look an unknown point of the shadow).
+/// The negative control of the keyed probe: with the record, it agrees.
+#[test]
+fn a_look_the_tape_does_not_hold_is_named_and_decided_cautiously() {
+    let (header, items) = recorded();
+    let with = explained(&header, &items, &At::Seq(102));
+    assert_eq!(with.agrees, Some(true));
+    let without: Vec<Item> = items
+        .into_iter()
+        .filter(|i| !crosses(i, doors::PROBE_GIT_VIEW))
+        .collect();
+    let w = explained(&header, &without, &At::Seq(102));
+    decided_cautiously_without_the_look(&w);
+}
+
+/// The re-decision of [`a_look_the_tape_does_not_hold_is_named_and_decided_cautiously`]
+/// and [`a_look_recorded_after_the_point_is_not_an_answer`]: the git read
+/// named among what it needed, the cautious answer shown, and no agreement
+/// either way.
+fn decided_cautiously_without_the_look(w: &Why) {
+    assert!(
+        w.needs.iter().any(|n| n.starts_with("look probe.git_view")),
+        "{:?}",
+        w.needs
+    );
+    assert!(
+        w.decided
+            .as_deref()
+            .is_some_and(|d| d.starts_with("Escalate")),
+        "the cautious answer: {:?}",
+        w.decided
+    );
+    assert_eq!(w.agrees, None, "{:?}", w.decided);
+}
+
+/// NEVER AN ANSWER FROM AFTER THE POINT: the approval's git read moved from
+/// before its mark to right after it — the same door, the same request, the
+/// same answer, on the same tape — is no answer to the decision made before
+/// it: the keyed probe stands where the recorded loop had read the records
+/// before the mark (astream's keyed view, bounded by that count), so the
+/// re-decision names the look it needed and decides cautiously, exactly as
+/// with the look gone. (The record left in its place is the control above.)
+#[test]
+fn a_look_recorded_after_the_point_is_not_an_answer() {
+    let (header, mut items) = recorded();
+    let look = items
+        .iter()
+        .position(|i| crosses(i, doors::PROBE_GIT_VIEW))
+        .expect("the approval's git read");
+    let moved = items.remove(look);
+    let mark = items
+        .iter()
+        .position(|i| {
+            matches!(i.record(), Some(EffectRecord::Emit { door, .. })
+                if door == doors::DECIDE_APPROVAL)
+        })
+        .expect("the approval's mark");
+    assert!(look <= mark, "the look was before the mark");
+    items.insert(mark + 1, moved);
+    let w = explained(&header, &items, &At::Seq(102));
+    decided_cautiously_without_the_look(&w);
+}
+
+/// A TURN END'S TRACE COMES FROM A STRICT REPLAY TO THE POINT, on the build
+/// that recorded it: the question handed over at its turn end is explained
+/// with the fold and reading the recorder noted, and a trace computed by
+/// replaying the tape to the mark, ending on the step that decided, each
+/// pass of the point named. On another build there is no trace, and the
+/// explanation says why.
+#[test]
+fn a_turn_ends_trace_is_computed_in_a_replay_on_the_recording_build() {
+    let (header, items) = recorded();
+    let w = explained(&header, &items, &At::Seq(104));
+    assert_eq!(w.door, doors::DECIDE_TURN_END);
+    assert!(!w.notes.is_empty(), "the recorder's note of the fold");
+    let steps = w
+        .trace
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", w.trace_note));
+    assert!(!steps.is_empty());
+    assert!(w.decided_by().is_some(), "{steps:#?}");
+    assert!(
+        steps.iter().any(|s| s.check.starts_with("pass:")),
+        "each pass of the point named: {steps:#?}"
+    );
+    // The trace is the replay's only where asked, and keeping it changes
+    // nothing the replay does: the same replay to the mark, asked for none,
+    // reports the same and keeps none.
+    let bytes = written(&header, &items);
+    let to_mark = Options {
+        until: Some(w.mark),
+        ..Options::default()
+    };
+    let (plain, none) = replay_traced(&bytes, &to_mark).expect("replays");
+    assert!(none.is_none(), "{none:#?}");
+    let (traced, kept) = replay_traced(
+        &bytes,
+        &Options {
+            trace_at: Some(w.mark),
+            ..to_mark
+        },
+    )
+    .expect("replays");
+    assert_eq!(
+        traced, plain,
+        "a kept trace changes nothing the replay does"
+    );
+    assert_eq!(kept.as_ref(), w.trace.as_ref());
+    let other: String = header
+        .lines()
+        .map(|l| {
+            if l.starts_with("build=") {
+                "build=g0000000-other".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_ne!(other, header, "the header names its build");
+    let w = explained(&other, &items, &At::Seq(104));
+    assert!(w.trace.is_none());
+    assert!(
+        w.trace_note
+            .as_deref()
+            .is_some_and(|n| n.contains("g0000000-other")),
+        "{:?}",
+        w.trace_note
+    );
+}
+
+/// A HEADER THIS BUILD CANNOT READ — another build's format, which a tape
+/// read after an update may carry — still leaves the decision explained as
+/// far as the tape alone goes: its screen, its act, its journal line and
+/// the build that recorded it, as the header writes it; there is no
+/// re-decision (no policy reads), and the explanation says why rather than
+/// refusing the tape. The control: under its own header the same point is
+/// decided again.
+#[test]
+fn a_header_this_build_cannot_read_still_explains_what_the_tape_holds() {
+    let (header, items) = recorded();
+    let control = explained(&header, &items, &At::Seq(102));
+    assert!(control.trace.is_some());
+    let (_, body) = header.split_once('\n').expect("a header's first line");
+    let unread = format!("atape 999\n{body}");
+    let w = explained(&unread, &items, &At::Seq(102));
+    assert_eq!(w.door, doors::DECIDE_APPROVAL);
+    assert_eq!(w.screen, control.screen);
+    assert_eq!(w.act, control.act);
+    assert_eq!(w.journal, control.journal);
+    assert_eq!(w.recorded_by, control.recorded_by);
+    assert_eq!(w.tape, control.tape);
+    assert!(w.trace.is_none() && w.agrees.is_none(), "{w:#?}");
+    assert!(
+        w.trace_note
+            .as_deref()
+            .is_some_and(|n| n.contains("does not read on this build")),
+        "{:?}",
+        w.trace_note
+    );
+}
+
+/// The decision marks at `door` on the tape of `items`: each one's seq.
+fn marked(items: &[Item], door: &str) -> Vec<u64> {
+    items
+        .iter()
+        .filter_map(|i| match i.record() {
+            Some(EffectRecord::Emit { door: d, bytes }) if d == door => {
+                std::str::from_utf8(bytes).ok().and_then(DecideMark::decode)
+            }
+            _ => None,
+        })
+        .map(|m| m.seq)
+        .collect()
+}
+
+/// A POLICY KEY THE HEADER DOES NOT SAY — a tape from a build before the key
+/// (`approve` taken out of its `[policy]`) — is decided again at this
+/// build's value, and the explanation NAMES it among what the re-decision
+/// needed (`supplied by this build: [policy] approve`), its note saying the
+/// policy is the header's WITH what this build supplied, never the header's
+/// alone. The control: under the whole header nothing is supplied.
+#[test]
+fn a_policy_key_the_header_lacks_is_named_as_supplied_by_this_build() {
+    let (header, items) = recorded();
+    let control = explained(&header, &items, &At::Seq(102));
+    assert!(control.needs.is_empty(), "{:?}", control.needs);
+    let older: String = header
+        .lines()
+        .filter(|l| !l.starts_with("approve="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(older, header, "PRECONDITION: the header says approve");
+    let w = explained(&older, &items, &At::Seq(102));
+    assert!(
+        w.needs
+            .iter()
+            .any(|n| n == "supplied by this build: [policy] approve"),
+        "{:?}",
+        w.needs
+    );
+    assert!(
+        w.trace_note
+            .as_deref()
+            .is_some_and(|n| n.contains("with what this build supplied")),
+        "{:?}",
+        w.trace_note
+    );
+}
+
+/// A TURN END'S DECISION CUT SHORT LEAVES NO STEPS FOR THE NEXT ONE: the
+/// connection lost inside the turn end at seq=104 (its bare `meta`, the
+/// autopilot's read), the loop rides the loss out and that point is never
+/// marked; the next turn end's trace, computed in a strict replay to its
+/// mark, is that decision's alone — one cruise pass, opening the trace —
+/// never the cut decision's steps ahead of its own.
+#[test]
+fn a_turn_end_cut_short_leaves_no_steps_in_the_next_ones_trace() {
+    let mut m = script();
+    // The bare `meta` of the turn end at 104, after its read of the
+    // turn's history (`modes`, `offscreen`).
+    m.by_index.insert(15, closed());
+    let run = record_watch(&mut m, &auto(30), |_| {});
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    let ends = marked(&items, doors::DECIDE_TURN_END);
+    assert!(
+        !ends.contains(&104) && ends.contains(&106),
+        "PRECONDITION: the turn end at 104 cut short, the one at 106 marked: {ends:?}"
+    );
+    let w = explained(&header, &items, &At::Seq(106));
+    let steps = w
+        .trace
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", w.trace_note));
+    assert_eq!(
+        steps.iter().filter(|s| s.check == "pass:cruise").count(),
+        1,
+        "{steps:#?}"
+    );
+    assert_eq!(steps.first().map(|s| s.check), Some("pass:cruise"));
+}
+
+/// The NOTE ON A MARK WITH NO FACTS blames no cause the recorded outcome does
+/// not name: a box handed over before the facts were read — here by the
+/// question latch, which is neither another supervisor nor `approve =
+/// "none"` — is said to be handed over for the reason recorded, with no
+/// re-decision.
+#[test]
+fn a_mark_with_no_facts_blames_no_cause_its_outcome_does_not_name() {
+    let (header, mut items) = recorded();
+    let latch = "Escalate { reason: \"the question policy was recommended at the supervisor's \
+                 first key on this dialog and is ask now: a person answers it\" }";
+    for item in &mut items {
+        if let Item::Effect {
+            record: EffectRecord::Emit { door, bytes },
+            ..
+        } = item
+            && door == doors::DECIDE_APPROVAL
+            && let Some(mut mark) = std::str::from_utf8(bytes).ok().and_then(DecideMark::decode)
+        {
+            mark.facts = None;
+            mark.rule = None;
+            mark.outcome = latch.to_string();
+            *bytes = mark.encode().into_bytes();
+        }
+    }
+    let w = explained(&header, &items, &At::Seq(102));
+    assert!(w.trace.is_none() && w.agrees.is_none(), "{w:#?}");
+    let note = w.trace_note.as_deref().unwrap_or_default();
+    assert!(
+        !note.contains("another supervisor") && !note.contains("approve = \"none\""),
+        "{note}"
+    );
+    assert!(note.contains("the reason recorded"), "{note}");
+}
+
+/// `items` with every wall reading (a clock read, a stamp) at or before item
+/// `split` at `before` and every one after it at `after` (Unix ms).
+fn walls(items: &mut [Item], split: usize, before: i64, after: i64) {
+    for (i, item) in items.iter_mut().enumerate() {
+        let ms = if i <= split { before } else { after };
+        if let Item::Effect { record, stamp } = item {
+            if let EffectRecord::Clock(ns) = record {
+                *ns = u64::try_from(ms).expect("after 1970") * 1_000_000;
+            }
+            if let Some(s) = stamp {
+                s.wall_ms = ms;
+            }
+        }
+    }
+}
+
+/// The item index of the approval's mark.
+fn approval_mark(items: &[Item]) -> usize {
+    items
+        .iter()
+        .position(|i| {
+            matches!(i.record(), Some(EffectRecord::Emit { door, .. })
+                if door == doors::DECIDE_APPROVAL)
+        })
+        .expect("the approval's mark")
+}
+
+/// 2026-10-19T23:55:00Z and 2026-10-20T00:05:00Z, Unix ms.
+const LATE: i64 = 1_792_454_100_000;
+const EARLY: i64 = LATE + 600_000;
+
+/// `--at HH:MM` ACROSS MIDNIGHT: a tape whose approval was decided at 23:55
+/// and whose later decisions were made at 00:05 the next day. `--at 23:58`
+/// is the approval (the 00:05 decisions came after 23:58), and so is `--at
+/// 00:01` (the last decision at or before it is 23:55's) — a time is an
+/// instant on the tape's days, never a time of day compared alone; the
+/// explanation says when the decision was made, by the local clock. A time
+/// inside the run on neither day (noon, or 00:06 just after its end) is
+/// refused, asking for the day, and named with its day it is answered: the
+/// second day's is after every decision, the first day's noon before every
+/// one.
+#[test]
+fn a_local_time_names_an_instant_on_a_tape_that_runs_past_midnight() {
+    let (header, mut items) = recorded();
+    let split = approval_mark(&items);
+    walls(&mut items, split, LATE, EARLY);
+    let bytes = written(&header, &items);
+    let at = |text: &str| why(&bytes, &At::parse(text).expect("reads"), &utc);
+    for text in ["23:58", "00:01", "2026-10-20T00:01", "2026-10-19 23:59:59"] {
+        let w = at(text).unwrap_or_else(|e| panic!("--at {text}: {e}"));
+        assert_eq!(
+            (w.door.as_str(), w.seq, w.at_ms),
+            (doors::DECIDE_APPROVAL, 102, Some(LATE)),
+            "--at {text}"
+        );
+        assert_eq!(w.at_local.as_deref(), Some("2026-10-19 23:55:00"));
+        assert!(
+            render(&w, Format::Text)
+                .contains("made 2026-10-19T23:55:00Z (2026-10-19 23:55:00 local)"),
+            "{}",
+            render(&w, Format::Text)
+        );
+    }
+    let last = at("2026-10-20T00:06").expect("the last decision");
+    assert_eq!(last.at_ms, Some(EARLY));
+    assert!(last.seq > 102, "{last:?}");
+    for text in ["12:00", "00:06"] {
+        let err = at(text).expect_err("inside the run on neither day");
+        assert!(
+            err.contains("name the day") && err.contains("2026-10-19 23:55:00"),
+            "{err}"
+        );
+    }
+    assert_eq!(at("2026-10-20T12:00").map(|w| w.seq), Ok(last.seq));
+    assert!(at("2026-10-19T12:00").is_err(), "before every decision");
+}
+
+/// EACH DECISION'S LOCAL TIME IS READ BY THE OFFSET ITS OWN INSTANT HAD: a
+/// zone that left daylight saving between the approval (04:00Z, 00:00 at
+/// UTC−4) and the later decisions (06:30Z, 01:30 at UTC−5). `--at 01:45`
+/// is a later decision: read by the approval's offset (or today's, in
+/// summer) 06:30Z would be 02:30, after the time named, and the approval
+/// would be explained in its place. The zone is asked of the tape's
+/// instants only.
+#[test]
+fn a_decisions_local_time_is_read_by_its_own_instants_offset() {
+    const BEFORE: i64 = 1_793_505_600_000; // 2026-11-01T04:00:00Z
+    const AFTER: i64 = BEFORE + 9_000_000; // 06:30:00Z
+    const CHANGE: i64 = 1_793_512_800; // 06:00:00Z
+    let (header, mut items) = recorded();
+    let split = approval_mark(&items);
+    walls(&mut items, split, BEFORE, AFTER);
+    let bytes = written(&header, &items);
+    let asked = std::cell::RefCell::new(Vec::new());
+    let zone = |unix: i64| {
+        asked.borrow_mut().push(unix);
+        Some(if unix < CHANGE { -4 * 3600 } else { -5 * 3600 })
+    };
+    let w = why(&bytes, &At::parse("01:45").expect("reads"), &zone).expect("a decision");
+    assert_eq!(w.at_ms, Some(AFTER), "{w:?}");
+    assert_eq!(w.at_local.as_deref(), Some("2026-11-01 01:30:00"));
+    let w = why(&bytes, &At::parse("01:15").expect("reads"), &zone).expect("a decision");
+    assert_eq!((w.seq, w.at_ms), (102, Some(BEFORE)), "{w:?}");
+    assert!(
+        asked
+            .borrow()
+            .iter()
+            .all(|&u| u == BEFORE / 1000 || u == AFTER / 1000),
+        "{:?}",
+        asked.borrow()
+    );
+}
+
+/// The rm breaker cut `off` rows under its top rule on a fenced host's main
+/// screen, its head (and an older box above its transcript) in the history,
+/// the screen sitting until a key; full power (`box_head_tests.rs`'s
+/// `breaker_host`), and `spoil` applied.
+fn breaker_recorded(off: usize, spoil: impl FnOnce(&mut Mock)) -> (String, Vec<Item>) {
+    use aterm_phase::prompt::fixtures as boxes;
+    let rows = boxes::screen(boxes::BOX_RM_BREAKER_2_1_287);
+    let rule = rows
+        .iter()
+        .rposition(|r| aterm_phase::phase::is_rule(r))
+        .expect("the box's top rule");
+    let mut m = fenced(vec![rows[rule + off..].to_vec(), idle_screen()]);
+    m.key_releases = Some(0);
+    m.alt_screen = Some(false);
+    let mut history = boxes::screen(boxes::BOX_READ_FORCED_ACCEPT_EDITS_2_1_292);
+    history.extend(rows[..rule + off].iter().cloned());
+    m.scrollback = Some(history);
+    m.vanish_after = Some(2);
+    spoil(&mut m);
+    let mut opts = auto(30);
+    opts.policy.approve = Approve::All;
+    opts.policy.rm_breaker_ask = false;
+    let run = record_watch(&mut m, &opts, |_| {});
+    let header = run.header.encode();
+    (header.clone(), recover(&run.tape.reframed(&header)).items)
+}
+
+/// A BOX WHOSE HEAD THE LOOP READ FROM THE HISTORY IS DECIDED AGAIN WHOLE:
+/// the rm breaker cut eight rows under its rule, joined by the loop with its
+/// head (`search`, a `line` read a row, the screen read again unmoved) and
+/// pressed `1` at full power. The explanation rebuilds the same join from
+/// the replies the tape holds — the same reader of them the loop has — and
+/// decides the box whole as the loop did: it agrees, needs nothing, and
+/// names the head's rows and the records they came through. The tape
+/// short of one of those reads: the join is not rebuilt, and the
+/// explanation names it among what it needed. NEGATIVE CONTROLS, where
+/// the loop searched but did not join (a transcript row under the rule,
+/// the screen's generation moving under the reads): the
+/// loop decided the cut, and so does the explanation — it agrees, and names
+/// no head among what it needed, where the loop read none.
+#[test]
+fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
+    let (header, items) = breaker_recorded(8, |_| {});
+    let seq = *marked(&items, doors::DECIDE_APPROVAL)
+        .first()
+        .expect("the box's mark");
+    let w = explained(&header, &items, &At::Seq(seq));
+    assert_eq!(w.recorded_rule.as_deref(), Some(RULE_ALLOW_ONCE));
+    assert!(w.needs.is_empty(), "{:?}", w.needs);
+    assert_eq!(
+        w.agrees,
+        Some(true),
+        "{:?} vs {}",
+        w.decided,
+        w.recorded_outcome
+    );
+    assert!(
+        w.facts
+            .iter()
+            .any(|f| f.name == "box_head" && f.door.starts_with("ctl search #")),
+        "{:#?}",
+        w.facts
+    );
+    // The tape short of a read the join was made on (the head's first
+    // row's `line`): the join is not rebuilt, the explanation says so among
+    // what it needed, and decides the cut — not as the loop decided.
+    let first_line = items
+        .iter()
+        .position(|i| match i.record() {
+            Some(EffectRecord::Exchange { door, request, .. }) if door == doors::CTL => {
+                crate::supervise::tape::codec::ctl_args(request)
+                    .is_ok_and(|w| w.iter().any(|w| w == "line"))
+            }
+            _ => false,
+        })
+        .expect("a head row's read");
+    let mut short = items.clone();
+    short.remove(first_line);
+    let w = explained(&header, &short, &At::Seq(seq));
+    assert!(
+        w.needs
+            .iter()
+            .any(|n| n.starts_with("the box's head off the screen")),
+        "{:?}",
+        w.needs
+    );
+    assert_eq!(w.agrees, Some(false), "{:?}", w.decided);
+    type Spoil = fn(&mut Mock);
+    let controls: [(&str, Spoil); 2] = [
+        ("a transcript row under the rule", |m| {
+            if let Some(h) = m.scrollback.as_mut() {
+                let at = h.len() - 2;
+                h.insert(at, "⏺ Bash(rm -rf /)".to_string());
+            }
+        }),
+        ("the generation moving", |m| {
+            m.key_releases = None;
+            m.screens.truncate(1);
+        }),
+    ];
+    for (what, spoil) in controls {
+        let (header, items) = breaker_recorded(8, spoil);
+        let seq = *marked(&items, doors::DECIDE_APPROVAL)
+            .first()
+            .unwrap_or_else(|| panic!("{what}: the box's mark"));
+        assert!(
+            items.iter().any(|i| matches!(i.record(),
+                Some(EffectRecord::Exchange { door, request, .. })
+                    if door == doors::CTL
+                        && String::from_utf8_lossy(request).contains("search"))),
+            "PRECONDITION {what}: the loop searched for the head"
+        );
+        let w = explained(&header, &items, &At::Seq(seq));
+        assert!(w.needs.is_empty(), "{what}: {:?}", w.needs);
+        assert_eq!(
+            w.agrees,
+            Some(true),
+            "{what}: {:?} vs {}",
+            w.decided,
+            w.recorded_outcome
+        );
+        assert!(
+            !w.facts.iter().any(|f| f.name == "box_head"),
+            "{what}: {:#?}",
+            w.facts
+        );
+    }
+}
+
+/// THE RUN'S PYTHON GLOBS REACH THE DECISION MADE AGAIN: a run that reads
+/// `python3 tools/report.py` as a read by its own `--allow-python` glob
+/// approves the box by the read-only rule, and the explanation — deciding
+/// it again under the globs the header carries, as the loop decides with
+/// them (`SuperviseOpts::allow`: the run's, else the defaults) — agrees. The
+/// control: the same tape under a header that carries no glob decides
+/// otherwise, so the globs are what the agreement stands on.
+#[test]
+fn the_runs_python_globs_reach_the_decision_made_again() {
+    let mut m = fenced(vec![
+        busy_screen(),
+        bash_box(&["⏺ Reporting."], "python3 tools/report.py"),
+        busy_screen(),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(2);
+    let mut opts = auto(30);
+    opts.python_allow = vec!["tools/*.py".to_string()];
+    let run = record_watch(&mut m, &opts, |_| {});
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    let seq = *marked(&items, doors::DECIDE_APPROVAL)
+        .first()
+        .expect("the box's mark");
+    let w = explained(&header, &items, &At::Seq(seq));
+    assert_eq!(
+        w.recorded_rule.as_deref(),
+        Some(RULE_READ_ONLY),
+        "{}",
+        w.recorded_outcome
+    );
+    assert_eq!(w.agrees, Some(true), "{:?}", w.decided);
+    let globless: String = header
+        .lines()
+        .filter(|l| !l.starts_with("python_allow."))
+        .map(|l| {
+            if l.starts_with("python_allow=") {
+                "python_allow=0\n".to_string()
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    assert_ne!(
+        globless, header,
+        "PRECONDITION: the header carries the glob"
+    );
+    let w = explained(&globless, &items, &At::Seq(seq));
+    assert_eq!(w.agrees, Some(false), "{:?}", w.decided);
+}

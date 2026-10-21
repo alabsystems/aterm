@@ -9,7 +9,10 @@
 
 use super::*;
 use crate::supervise::ScratchDir;
-use crate::supervise::policy::turn_end::{DONE_CHECK, DONE_CHECK_MARKER_BEFORE, done_check_text};
+use crate::supervise::policy::turn_end::{
+    DONE_CHECK, DONE_CHECK_MARKER_BEFORE, LAND, LAND_ANSWER, LAND_NUDGE, RETIRED_LAND_NUDGES,
+    RETIRED_LANDS, done_check_text,
+};
 
 const SESSION: &str = "0b2299fa-2e8d-447e-a9b8-082171298ccd";
 
@@ -85,14 +88,16 @@ fn worked(report_rows: &[String]) -> Vec<String> {
     rows
 }
 
-/// DONE BY THE MARKER: the final assistant message of the turn, its
-/// marker-only lines dropped (Markdown punctuation around the marker too),
-/// stamped with the row it came from. The marker inside the tool's output
-/// and the tool call is no report. NEGATIVE CONTROL: the same message
-/// without the marker is no report at all (`no-marker`).
+/// A PLAIN TURN: its final assistant message, NO TOKEN REQUIRED — the
+/// retired token's lines dropped (Markdown punctuation around it too) where
+/// a worker still writes it, the message the same without one — stamped
+/// with the row it came from. The token inside the tool's output and the
+/// tool call is no report. NEGATIVE CONTROL: a turn whose only rows are a
+/// tool's call and its result has no reply yet (`no-reply`).
 #[test]
-fn a_marker_turn_is_its_final_message_with_the_marker_lines_dropped() {
+fn a_plain_turn_is_its_final_message_no_token_required() {
     for marker in [
+        "",
         "ATERM-TASK-DONE",
         "**ATERM-TASK-DONE**",
         "`ATERM-TASK-DONE`",
@@ -103,7 +108,7 @@ fn a_marker_turn_is_its_final_message_with_the_marker_lines_dropped() {
             &format!("Fixed the parser.\n\nAll 12 tests pass.\n\n{marker}\n"),
         )]);
         assert_eq!(
-            report(&jsonl(&rows), DoneBy::Marker),
+            report(&jsonl(&rows), DoneBy::Turn),
             Ok(Report {
                 text: "Fixed the parser.\n\nAll 12 tests pass.".to_string(),
                 session: SESSION.to_string(),
@@ -112,16 +117,22 @@ fn a_marker_turn_is_its_final_message_with_the_marker_lines_dropped() {
             "{marker}"
         );
     }
-    let rows = worked(&[says("a-report", "msg_2", "Fixed the parser.")]);
-    assert_eq!(report(&jsonl(&rows), DoneBy::Marker), Err("no-marker"));
+    // NEGATIVE CONTROL: no words yet.
+    let rows = [
+        user("u-task", "Fix the parser and run the suite."),
+        said("a-call", "msg_1", &format!("[{}]", tool_use())),
+        tool_result("u-result"),
+    ];
+    assert_eq!(report(&jsonl(&rows), DoneBy::Turn), Err("no-reply"));
 }
 
-/// THE MARKER ALONE AT THE END: the report, a check of the work, then a bare
-/// `ATERM-TASK-DONE` — the turn's last earlier message with words is the
-/// result, stamped with its own row. NEGATIVE CONTROL: a turn whose only
-/// words are the marker is `empty`.
+/// THE RETIRED TOKEN ALONE AT THE END: the report, a check of the work,
+/// then a bare `ATERM-TASK-DONE` (a worker taught by an older build) — the
+/// turn's last earlier message with words is the result, stamped with its
+/// own row. NEGATIVE CONTROL: a turn whose only words are the token is
+/// `empty`.
 #[test]
-fn a_marker_alone_after_the_report_gives_the_report() {
+fn a_token_alone_after_the_report_gives_the_report() {
     let rows = worked(&[
         said(
             "a-report",
@@ -135,15 +146,15 @@ fn a_marker_alone_after_the_report_gives_the_report() {
         tool_result("u-verify"),
         says("a-marker", "msg_3", "ATERM-TASK-DONE"),
     ]);
-    let got = report(&jsonl(&rows), DoneBy::Marker).expect("a report");
+    let got = report(&jsonl(&rows), DoneBy::Turn).expect("a report");
     assert_eq!(got.text, "Fixed the parser; 12 tests pass.");
     assert_eq!(got.uuid, "a-report");
-    // NEGATIVE CONTROL: the marker is all the turn said.
+    // NEGATIVE CONTROL: the token is all the turn said.
     let rows = [
         user("u-task", "Fix it."),
         says("a-marker", "msg_1", "ATERM-TASK-DONE"),
     ];
-    assert_eq!(report(&jsonl(&rows), DoneBy::Marker), Err("empty"));
+    assert_eq!(report(&jsonl(&rows), DoneBy::Turn), Err("empty"));
 }
 
 /// The task, a `keep going`, the report, then the harness's done check and
@@ -167,13 +178,13 @@ fn checked(reply: &[String]) -> Vec<String> {
 
 /// DONE THROUGH THE DONE CHECK: the worker's REPORT — the final message of
 /// the turn before the check — then what the check's turn says beyond its
-/// done, as the marker's rule reads a turn: its final message, marker lines
-/// dropped, or where that is the marker alone the turn's last earlier
-/// message with words (a report, a commit, then a bare marker). A worker
+/// done, as a plain turn is read: its final message, token lines dropped,
+/// or where that is the retired token alone the turn's last earlier
+/// message with words (a report, a commit, then a bare token). A worker
 /// that verified or fixed inside the check's turn has its final word
 /// returned (the fact line's promise), named by its row. A `keep going`
 /// before the report opens the report's own turn. NEGATIVE CONTROLS: a
-/// reply that is the marker alone, or `DONE`, with nothing before it in the
+/// reply that is the token alone, or `DONE`, with nothing before it in the
 /// turn, adds nothing — the report alone, by its row; a check whose turn
 /// before it said nothing, answered bare, is no report.
 #[test]
@@ -320,10 +331,10 @@ fn a_check_reply_written_late_is_read_again_by_the_checks_rule() {
 /// THE CHECK AS THE HARNESS TYPES IT: with `[harness] rules_file` set it is
 /// the check and the standing rules after it, and is the check all the
 /// same — the report before it is the result, the reply's words after it
-/// where it said more than the marker. An earlier check answered with a
+/// where it said more than the token. An earlier check answered with a
 /// bare done (a loop started again types its own) is passed over for the
 /// report before it. NEGATIVE CONTROLS: a newest turn that is no check is
-/// `no-check`, never the marker rule's read of it; a check answered with
+/// `no-check`, never the plain turn's read of it; a check answered with
 /// work is the report the next check follows.
 #[test]
 fn a_done_check_with_the_standing_rules_is_the_check() {
@@ -344,13 +355,21 @@ fn a_done_check_with_the_standing_rules_is_the_check() {
                     user("u-check", &check),
                     says("a-reply", "msg_2", completion),
                 ];
-                for by in [DoneBy::Check, DoneBy::Marker] {
+                for by in [DoneBy::Check, DoneBy::Turn] {
                     let got = report(&jsonl(&rows), by).expect("the emitted check's report");
                     assert_eq!(got.text, format!("The parser is fixed.\n\n{completion}"));
                     assert_eq!(got.uuid, "a-reply");
                 }
                 if rules.is_none() {
-                    rows[2] = user("u-check", &format!("{check} This is another request."));
+                    // NEGATIVE CONTROL: an older check with someone's words
+                    // after it, and today's (whose suffixes vary, so any
+                    // words after it are its own) after someone's words.
+                    let near = if check == current {
+                        format!("Please read this: {check}")
+                    } else {
+                        format!("{check} This is another request.")
+                    };
+                    rows[2] = user("u-check", &near);
                     assert_eq!(report(&jsonl(&rows), DoneBy::Check), Err("no-check"));
                 }
             }
@@ -425,7 +444,7 @@ fn a_legacy_done_check_still_recovers_the_workers_result() {
             user("u-check2", check),
             says("a-reply2", "msg_3", completion),
         ];
-        for by in [DoneBy::Check, DoneBy::Marker] {
+        for by in [DoneBy::Check, DoneBy::Turn] {
             let got = report(&jsonl(&rows), by).expect("legacy check's result");
             assert_eq!(got.text, format!("The parser is fixed.\n\n{completion}"));
             assert_eq!(got.uuid, "a-reply2");
@@ -443,13 +462,13 @@ fn a_legacy_done_check_still_recovers_the_workers_result() {
 /// starts at a point another loop's check answered (another supervisor's
 /// hand-back, the harness's fault restart, a seamless update's successor)
 /// follows no act of its own there, and its policy hands the
-/// marker's rule — the reader still gives the report before the check,
-/// then the reply's words where it said more than the marker, and says it
-/// read by the check's ([`Snapshot::by`], the mark's `why=`). An earlier
+/// plain turn's rule — the reader still gives the report before the check,
+/// then the reply's words where it said more than the token, and says it
+/// read by the check's ([`Snapshot::by`]). An earlier
 /// check answered with a done the policy ends the task on (`Yes, it's all
 /// done.`), asked again by a loop started after it, is passed over, its
 /// words kept after the report. NEGATIVE CONTROL: a newest turn that is no
-/// check is read by the marker's rule, and says so.
+/// check is read by the plain turn's rule, and says so.
 #[test]
 fn a_check_newest_is_read_by_the_checks_rule_whatever_rule_is_asked() {
     let tasks = ScratchDir::new("result", "check-newest");
@@ -479,13 +498,13 @@ fn a_check_newest_is_read_by_the_checks_rule_whatever_rule_is_asked() {
             turn_duration(),
         ];
         let text = jsonl(&rows);
-        let got = report(&text, DoneBy::Marker).expect("a report");
+        let got = report(&text, DoneBy::Turn).expect("a report");
         assert_eq!((got.text.as_str(), got.uuid.as_str()), want, "{reply:?}");
         let snap = snapshot(
             &tasks,
             &format!("s-1-{i}"),
             Some((file, &text)),
-            DoneBy::Marker,
+            DoneBy::Turn,
         )
         .expect("written");
         assert_eq!(snap.by, DoneBy::Check, "{reply:?}");
@@ -500,7 +519,7 @@ fn a_check_newest_is_read_by_the_checks_rule_whatever_rule_is_asked() {
         user("u-check2", DONE_CHECK),
         says("a-reply2", "msg_3", "ATERM-TASK-DONE"),
     ];
-    for by in [DoneBy::Check, DoneBy::Marker] {
+    for by in [DoneBy::Check, DoneBy::Turn] {
         assert_eq!(
             report(&jsonl(&rows), by).map(|r| (r.text, r.uuid)),
             Ok((
@@ -516,11 +535,147 @@ fn a_check_newest_is_read_by_the_checks_rule_whatever_rule_is_asked() {
         "msg_2",
         "Fixed.\nATERM-TASK-DONE",
     )]));
-    let snap = snapshot(&tasks, "s-1-9", Some((file, &text)), DoneBy::Marker).expect("written");
-    assert_eq!(
-        (snap.by, snap.bytes),
-        (DoneBy::Marker, "Fixed.".len() as u64)
+    let snap = snapshot(&tasks, "s-1-9", Some((file, &text)), DoneBy::Turn).expect("written");
+    assert_eq!((snap.by, snap.bytes), (DoneBy::Turn, "Fixed.".len() as u64));
+}
+
+/// The task, its report, then Land's instruction answered with progress
+/// and `act` (a nudge, Land's answer to a question) answered with `reply`'s
+/// rows: the conversation a landing writes.
+fn landing(act: &str, reply: &[String]) -> Vec<String> {
+    let mut rows = vec![
+        user("u-task", "Fix the parser."),
+        says("a-report", "msg_1", "The parser is fixed; 12 tests pass."),
+        turn_duration(),
+        user("u-land", LAND),
+        says(
+            "a-progress",
+            "msg_2",
+            "Committed it on the branch and pushed; merging next.",
+        ),
+        turn_duration(),
+        user("u-act", act),
+    ];
+    rows.extend_from_slice(reply);
+    rows.push(turn_duration());
+    rows
+}
+
+/// THE RESULT IS THE LANDING: the newest turn a land act opened (a nudge,
+/// Land's answer to a question, the instruction itself — today's words and
+/// every older build's), its reply the defense that landed the task: the
+/// worker's REPORT, the final message of the turn before the episode's land
+/// acts (each passed over: their replies are the landing's progress), then
+/// the defense's words — read by the check's rule whatever rule is asked,
+/// no token anywhere. NEGATIVE CONTROLS: a land act's reply that is no done
+/// (more progress) is `no-reply`, the lag read again; so is a defense
+/// written as a preamble before a tool's call (its turn goes on); and the
+/// same defense after a person's prompt is a plain turn, its words alone.
+#[test]
+fn the_result_is_the_report_before_the_land_acts_then_the_defense() {
+    let defense = "Nothing left: merged to origin/main at 4f2a9c1, worktree removed.";
+    let acts = [LAND, LAND_NUDGE, LAND_ANSWER]
+        .into_iter()
+        .chain(RETIRED_LANDS)
+        .chain(RETIRED_LAND_NUDGES);
+    for act in acts {
+        let rows = landing(act, &[says("a-defense", "msg_3", defense)]);
+        for by in [DoneBy::Turn, DoneBy::Check] {
+            let got = report(&jsonl(&rows), by).expect("the landing's result");
+            assert_eq!(
+                (got.text.as_str(), got.uuid.as_str()),
+                (
+                    format!("The parser is fixed; 12 tests pass.\n\n{defense}").as_str(),
+                    "a-defense"
+                ),
+                "{act:.40}"
+            );
+        }
+        let tasks = ScratchDir::new("result", "landing");
+        let text = jsonl(&rows);
+        let snap = snapshot(
+            &tasks,
+            "s-1-1",
+            Some((Path::new("/t.jsonl"), &text)),
+            DoneBy::Turn,
+        )
+        .expect("written");
+        assert_eq!(snap.by, DoneBy::Check, "{act:.40}");
+    }
+    // NEGATIVE CONTROL: the nudge answered with more progress.
+    let rows = landing(
+        LAND_NUDGE,
+        &[says(
+            "a-more",
+            "msg_3",
+            "Merging now; the suite runs on main.",
+        )],
     );
+    assert_eq!(report(&jsonl(&rows), DoneBy::Turn), Err("no-reply"));
+    // NEGATIVE CONTROL: a defense before a tool's call, its turn going on.
+    let rows = landing(
+        LAND_NUDGE,
+        &[
+            said(
+                "a-pre",
+                "msg_3",
+                &format!("[{},{}]", text(defense), tool_use()),
+            ),
+            tool_result("u-pre"),
+        ],
+    );
+    assert_eq!(report(&jsonl(&rows), DoneBy::Turn), Err("no-reply"));
+    // NEGATIVE CONTROL: the same words after a person's prompt.
+    let mut rows = landing(LAND_NUDGE, &[says("a-defense", "msg_3", defense)]);
+    rows.extend([
+        user("u-person", "status?"),
+        says("a-person", "msg_4", defense),
+    ]);
+    assert_eq!(
+        report(&jsonl(&rows), DoneBy::Turn).map(|r| (r.text, r.uuid)),
+        Ok((defense.to_string(), "a-person".to_string()))
+    );
+}
+
+/// A LANDING REPLACES THE ONE BEFORE IT ([`prune_results`]): beside the
+/// result just written, every other `<gsid>-<n>.result.md` and its sidecar
+/// of the same session goes. NEGATIVE CONTROLS: the new pair stays, and
+/// another session's pair — one whose sid only begins with this one's, and
+/// a file of this sid's whose suffix is no revision — is never touched.
+#[test]
+fn a_landing_prunes_the_previous_result_pair() {
+    let tasks = ScratchDir::new("result", "prune");
+    for name in [
+        "s-ab12-1.result.md",
+        "s-ab12-1.result.src",
+        "s-ab12-2.result.md",
+        "s-ab12-2.result.src",
+        "s-ab12-3.result.md",
+        "s-ab12-3.result.src",
+        "s-ab123-1.result.md",
+        "s-ab12-x.result.md",
+        "s-ab12-1.task",
+    ] {
+        std::fs::write(tasks.join(name), "").expect("file");
+    }
+    assert_eq!(prune_results(&tasks, "s-ab12-3"), 4);
+    let mut left: Vec<String> = std::fs::read_dir(&*tasks)
+        .expect("dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "s-ab12-1.task",
+            "s-ab12-3.result.md",
+            "s-ab12-3.result.src",
+            "s-ab12-x.result.md",
+            "s-ab123-1.result.md",
+        ]
+    );
+    // Nothing else of the session: nothing goes.
+    assert_eq!(prune_results(&tasks, "s-ab12-3"), 0);
 }
 
 /// A pid that WAS a process and is not one now: the transcript's resolver
@@ -628,7 +783,7 @@ fn the_upgrades_announcement_turn_is_read_past() {
         "Fixed the parser.\nATERM-TASK-DONE",
     )]);
     rows.extend([user("u-ready", &notice), says("a-ready", "msg_r", "READY")]);
-    let got = report(&jsonl(&rows), DoneBy::Marker).expect("a report");
+    let got = report(&jsonl(&rows), DoneBy::Turn).expect("a report");
     assert_eq!(got.uuid, "a-report");
     // Between the report and the check.
     let mut rows = worked(&[says("a-report", "msg_2", "Fixed the parser.")]);
@@ -646,7 +801,7 @@ fn the_upgrades_announcement_turn_is_read_past() {
         user("u-carry", "[aterm harness] Upgraded: carry on"),
         says("a-rest", "msg_3", "The rest is in.\nATERM-TASK-DONE"),
     ]);
-    let got = report(&jsonl(&rows), DoneBy::Marker).expect("a report");
+    let got = report(&jsonl(&rows), DoneBy::Turn).expect("a report");
     assert_eq!(got.uuid, "a-rest");
 }
 
@@ -669,15 +824,15 @@ fn a_message_written_over_several_rows_is_one_message() {
             says("a-two", second, "Part two: the suite.\nATERM-TASK-DONE"),
         ])
     };
-    let got = report(&jsonl(&rows("msg_2")), DoneBy::Marker).expect("a report");
+    let got = report(&jsonl(&rows("msg_2")), DoneBy::Turn).expect("a report");
     assert_eq!(got.text, "Part one: the parser.\n\nPart two: the suite.");
     assert_eq!(got.uuid, "a-two");
-    let got = report(&jsonl(&rows("msg_3")), DoneBy::Marker).expect("a report");
+    let got = report(&jsonl(&rows("msg_3")), DoneBy::Turn).expect("a report");
     assert_eq!(got.text, "Part two: the suite.");
 }
 
 /// THE ROWS THAT ARE NO ONE'S WORDS change nothing: a subagent's
-/// (`isSidechain`) report with the marker, Claude Code's own `<synthetic>`
+/// (`isSidechain`) report, Claude Code's own `<synthetic>`
 /// row (`No response requested.`), an API error's row
 /// (`isApiErrorMessage`), an `isMeta` prompt (a skill's expansion), a
 /// compaction summary and a `/usage` probe's tagged rows — each written
@@ -719,7 +874,7 @@ fn a_subagents_rows_and_claude_codes_own_are_no_ones_words() {
     ] {
         rows.push(row.clone());
     }
-    let got = report(&jsonl(&rows), DoneBy::Marker).expect("a report");
+    let got = report(&jsonl(&rows), DoneBy::Turn).expect("a report");
     assert_eq!(got.text, "Fixed the parser.");
     assert_eq!(got.uuid, "a-report");
     // NEGATIVE CONTROL: the subagent's row on the main chain.
@@ -731,39 +886,34 @@ fn a_subagents_rows_and_claude_codes_own_are_no_ones_words() {
     )]);
     rows.push(main);
     assert_eq!(
-        report(&jsonl(&rows), DoneBy::Marker).map(|r| r.text),
+        report(&jsonl(&rows), DoneBy::Turn).map(|r| r.text),
         Ok("Subagent: I fixed everything.".to_string())
     );
 }
 
 /// A SHAPE THE READER DOES NOT KNOW IS SAID, NEVER GUESSED: a newest turn
-/// with no answer yet (`no-reply`), one that ends on no marker
-/// (`no-marker`), the marker alone (`empty`), a done through the check whose
-/// newest turn is no check (`no-check`), and no transcript at all
-/// (`no-transcript`) — each snapshotted as an empty result with its word,
-/// which `result` answers as `ERR result unavailable why=<word>`.
+/// with no answer yet (`no-reply`), the retired token alone (`empty`), a
+/// read by the check's rule whose newest turn is no check (`no-check`), and
+/// no transcript at all (`no-transcript`) — each snapshotted as an empty
+/// result with its word, which `result` answers as `ERR result unavailable
+/// why=<word>`.
 #[test]
 fn an_unknown_shape_is_said_never_guessed() {
     let tasks = ScratchDir::new("result", "unknown");
     let marked = |t: &str| vec![user("u-task", "Fix it."), says("a", "m1", t)];
-    let cases: [(&str, DoneBy, Option<Vec<String>>); 5] = [
+    let cases: [(&str, DoneBy, Option<Vec<String>>); 4] = [
         (
             "no-reply",
-            DoneBy::Marker,
+            DoneBy::Turn,
             Some(vec![user("u-task", "Fix it.")]),
         ),
-        (
-            "no-marker",
-            DoneBy::Marker,
-            Some(worked(&[says("a", "m2", "Fixed, I think.")])),
-        ),
-        ("empty", DoneBy::Marker, Some(marked("ATERM-TASK-DONE"))),
+        ("empty", DoneBy::Turn, Some(marked("ATERM-TASK-DONE"))),
         (
             "no-check",
             DoneBy::Check,
             Some(marked("Fixed.\nATERM-TASK-DONE")),
         ),
-        ("no-transcript", DoneBy::Marker, None),
+        ("no-transcript", DoneBy::Turn, None),
     ];
     for (i, (why, by, rows)) in cases.iter().enumerate() {
         let text = rows.as_ref().map(|rows| jsonl(rows));
@@ -808,13 +958,8 @@ fn result_answers_the_snapshot_and_full_reads_the_thread_now() {
     )]);
     std::fs::write(&transcript, jsonl(&rows)).expect("transcript");
     let text = std::fs::read_to_string(&transcript).expect("read");
-    let snap = snapshot(
-        &tasks,
-        "s-ab12-1",
-        Some((&transcript, &text)),
-        DoneBy::Marker,
-    )
-    .expect("written");
+    let snap =
+        snapshot(&tasks, "s-ab12-1", Some((&transcript, &text)), DoneBy::Turn).expect("written");
     assert_eq!(snap.path, tasks.join("s-ab12-1.result.md"));
     assert_eq!(snap.unavailable, None);
     assert_eq!(snap.bytes, "Fixed the parser.\nAll green.".len() as u64);
@@ -883,7 +1028,7 @@ fn the_reply_is_capped_at_24000_characters_and_ends_with_the_path() {
     let text = jsonl(&rows);
     std::fs::write(&transcript, &text).expect("transcript");
     let snap =
-        snapshot(&tasks, "s-1-1", Some((&transcript, &text)), DoneBy::Marker).expect("written");
+        snapshot(&tasks, "s-1-1", Some((&transcript, &text)), DoneBy::Turn).expect("written");
     let reply = answer(&snap.path, false);
     let mut lines: Vec<&str> = reply.lines().collect();
     let head = lines.remove(0);
@@ -927,7 +1072,7 @@ fn the_reply_is_capped_at_24000_characters_and_ends_with_the_path() {
     )]);
     let text = jsonl(&rows);
     let snap =
-        snapshot(&tasks, "s-1-2", Some((&transcript, &text)), DoneBy::Marker).expect("written");
+        snapshot(&tasks, "s-1-2", Some((&transcript, &text)), DoneBy::Turn).expect("written");
     let reply = answer(&snap.path, false);
     assert_eq!(reply.lines().count(), 2, "the header and the one line");
     assert!(!reply.contains("truncated"));
@@ -958,7 +1103,7 @@ fn a_thread_with_no_prompt_is_shown_cut_or_said() {
         &root.join("tasks"),
         "s-1-1",
         Some((&transcript, &text)),
-        DoneBy::Marker,
+        DoneBy::Turn,
     )
     .expect("written");
     std::fs::write(&transcript, jsonl(&rows)).expect("transcript");
@@ -1004,7 +1149,7 @@ fn the_sidecar_line_reads_back_and_a_stem_is_one_name() {
     let tasks = ScratchDir::new("result", "stem");
     for stem in ["", "../x", "a/b", "s 1"] {
         assert!(
-            snapshot(&tasks, stem, None, DoneBy::Marker).is_err(),
+            snapshot(&tasks, stem, None, DoneBy::Turn).is_err(),
             "{stem:?}"
         );
     }
@@ -1121,11 +1266,11 @@ fn a_reply_written_after_the_done_edges_read_is_waited_for() {
         [END_READ_BYTES, END_READ_BYTES, TRANSCRIPT_READ_BYTES]
     );
     assert_eq!(
-        report(&got.tail, DoneBy::Marker).map(|r| r.text),
+        report(&got.tail, DoneBy::Turn).map(|r| r.text),
         Ok("Fixed the parser.".to_string())
     );
     // NEGATIVE CONTROL: the done edge's own read.
-    assert_eq!(report(&first, DoneBy::Marker), Err("no-reply"));
+    assert_eq!(report(&first, DoneBy::Turn), Err("no-reply"));
     // The end row in the first read: nothing read again.
     let at_once = settle_with(
         whole.clone(),
@@ -1168,8 +1313,7 @@ fn past_the_bound_the_snapshot_is_read_as_it_stands() {
     let root = ScratchDir::new("result", "bound");
     let tasks = root.join("tasks");
     let file = root.join("t.jsonl");
-    let snap =
-        snapshot(&tasks, "s-1-1", Some((&file, &got.tail)), DoneBy::Marker).expect("written");
+    let snap = snapshot(&tasks, "s-1-1", Some((&file, &got.tail)), DoneBy::Turn).expect("written");
     assert_eq!((snap.bytes, snap.unavailable), (0, Some("no-reply")));
     assert_eq!(
         answer(&snap.path, false),
@@ -1203,7 +1347,7 @@ fn past_the_bound_the_snapshot_is_read_as_it_stands() {
 /// answers it, and written over the snapshot it is the result from then on
 /// (read again no more). NEGATIVE CONTROLS: nothing written since reads
 /// nothing; a turn that ended with no reply, followed by a person's turn
-/// answered with the marker, gives nothing — the later turn's reply is never
+/// answered with a done, gives nothing — the later turn's reply is never
 /// the task's; a miss no lag explains (`no-check`) and an old sidecar that
 /// names no turn are never read again.
 #[test]
@@ -1214,7 +1358,7 @@ fn result_reads_a_lagged_turn_again_and_never_a_later_one() {
     let first = jsonl(&lagging());
     std::fs::write(&transcript, &first).expect("transcript");
     let snap =
-        snapshot(&tasks, "s-1-1", Some((&transcript, &first)), DoneBy::Marker).expect("written");
+        snapshot(&tasks, "s-1-1", Some((&transcript, &first)), DoneBy::Turn).expect("written");
     assert_eq!(snap.unavailable, Some("no-reply"));
     assert_eq!(reread(&snap.path), None, "nothing written since");
     // Claude Code writes the reply, and a person's turn follows it.
@@ -1243,7 +1387,7 @@ fn result_reads_a_lagged_turn_again_and_never_a_later_one() {
 
     // NEGATIVE CONTROL: the task's turn ended with no reply; a later one's.
     let snap =
-        snapshot(&tasks, "s-1-2", Some((&transcript, &first)), DoneBy::Marker).expect("written");
+        snapshot(&tasks, "s-1-2", Some((&transcript, &first)), DoneBy::Turn).expect("written");
     let mut later = lagging();
     later.extend([
         turn_duration(),
@@ -1358,7 +1502,7 @@ fn woken_reply() -> [String; 2] {
 /// notification, so it is read again until the final reply and its end row
 /// are there, and the reply is the result. NEGATIVE CONTROLS: the read cut
 /// before the notification HAS ended (the end row the wait must not stop
-/// at), and the edge's own read gives the miss F1 measured (`no-marker`:
+/// at), and the edge's own read gives the miss F1 measured (`no-reply`:
 /// the text before the last tool call is no report). Claude Code's own
 /// continuation after a usage limit reset (an `isMeta` row) starts a turn
 /// the same way.
@@ -1374,7 +1518,7 @@ fn a_turn_a_task_notification_started_is_waited_for() {
     assert!(!turn_ended(&jsonl(&resumed)), "the continuation's turn");
     resumed.extend(woken_reply());
     assert!(turn_ended(&jsonl(&resumed)));
-    assert_eq!(report(&first, DoneBy::Marker), Err("no-marker"));
+    assert_eq!(report(&first, DoneBy::Turn), Err("no-reply"));
     let mut rows = woken();
     rows.extend(woken_reply());
     let whole = jsonl(&rows);
@@ -1395,7 +1539,7 @@ fn a_turn_a_task_notification_started_is_waited_for() {
     assert_eq!((got.waits, got.ended), (1, true));
     assert_eq!(got.tail, whole);
     assert_eq!(
-        report(&got.tail, DoneBy::Marker).map(|r| (r.text, r.uuid)),
+        report(&got.tail, DoneBy::Turn).map(|r| (r.text, r.uuid)),
         Ok((
             "Worker 1 counted 932; worker 2 counted 41.".to_string(),
             "a-report".to_string()
@@ -1405,7 +1549,7 @@ fn a_turn_a_task_notification_started_is_waited_for() {
 
 /// THE WAIT IS FOR THE DONE EDGE'S TURN, NEVER ONE BEGUN SINCE: read
 /// again, the transcript holds the task's reply and end row and then a
-/// person's turn answered with the marker. The tail stops at the task's end
+/// person's turn answered with a done. The tail stops at the task's end
 /// row, so the snapshot is the task's report. NEGATIVE CONTROL: the newest
 /// turn of that same read is the person's (`Docs too.`). A task's turn
 /// that never ended, a prompt typed after it, is read up to that prompt:
@@ -1431,12 +1575,12 @@ fn the_wait_is_for_the_done_edges_turn_never_one_begun_since() {
     assert_eq!((got.waits, got.ended), (0, true));
     assert_eq!(got.tail, jsonl(&task));
     assert_eq!(
-        report(&got.tail, DoneBy::Marker).map(|r| r.text),
+        report(&got.tail, DoneBy::Turn).map(|r| r.text),
         Ok("Fixed the parser.".to_string())
     );
     // NEGATIVE CONTROL: the read's own newest turn.
     assert_eq!(
-        report(&later, DoneBy::Marker).map(|r| r.text),
+        report(&later, DoneBy::Turn).map(|r| r.text),
         Ok("Docs too.".to_string())
     );
 
@@ -1457,7 +1601,7 @@ fn the_wait_is_for_the_done_edges_turn_never_one_begun_since() {
         &tasks,
         "s-1-1",
         Some((&transcript, &got.tail)),
-        DoneBy::Marker,
+        DoneBy::Turn,
     )
     .expect("written");
     assert_eq!(snap.unavailable, Some("no-reply"));
@@ -1473,11 +1617,12 @@ fn the_wait_is_for_the_done_edges_turn_never_one_begun_since() {
 }
 
 /// `result` READS A NOTIFICATION'S TURN AGAIN UP TO ITS END: past the bound
-/// the snapshot of the manager's woken turn is `no-marker`, its sidecar
-/// naming the notification's row. Once the reply is written, `result`
-/// finds it, though another notification woke the manager since and its
-/// reply carries the marker too. NEGATIVE CONTROL: the woken turn ended
-/// with no report, and the later notification's reply is never taken.
+/// the snapshot of the manager's woken turn is `no-reply` (its last message
+/// a preamble before a tool's call), its sidecar naming the notification's
+/// row. Once the reply is written, `result` finds it, though another
+/// notification woke the manager since and its reply says done too.
+/// NEGATIVE CONTROL: the woken turn ended with no report, and the later
+/// notification's reply is never taken.
 #[test]
 fn result_reads_a_notifications_turn_again_up_to_its_end() {
     let first = jsonl(&woken());
@@ -1490,14 +1635,14 @@ fn result_reads_a_notifications_turn_again_up_to_its_end() {
         &tasks,
         "s-1-1",
         Some((&transcript, &got.tail)),
-        DoneBy::Marker,
+        DoneBy::Turn,
     )
     .expect("written");
-    assert_eq!(snap.unavailable, Some("no-marker"));
+    assert_eq!(snap.unavailable, Some("no-reply"));
     assert_eq!(
         source_of(&snap.path),
         Some(Source::Unavailable {
-            why: "no-marker".to_string(),
+            why: "no-reply".to_string(),
             transcript: Some(transcript.clone()),
             turn: Some("u-woke".to_string()),
         })
@@ -1541,14 +1686,15 @@ fn shown(at: &str) -> Option<i64> {
     Some(stamp_ms(at).expect("a stamp"))
 }
 
-/// The task's turn ended with the marker, its end row written at
+/// The task's turn ended with a done, its end row written at
 /// 17:28:28.000; then a background shell the worker left ended, and its
 /// `<task-notification>` (40 ms later, the quickest this machine's
 /// transcripts hold is 10 ms) woke Claude Code on a turn of its own — all
 /// before the done edge read the transcript (P5 of the rl review): the
-/// shape `finished_over_background` publishes on, with the shell quick to
-/// end. Its screen showed the done at 17:28:27.990, before the end row (the
-/// screen leads the transcript).
+/// shape the retired `finished_over_background` published on, with the
+/// shell quick to end (a result is still read from it). Its screen showed
+/// the done at 17:28:27.990, before the end row (the screen leads the
+/// transcript).
 fn done_then_woken() -> Vec<String> {
     let mut rows = worked(&[says(
         "a-report",
@@ -1564,13 +1710,13 @@ const DONE_AT_THE_MARKER: &str = "2026-10-15T17:28:27.990Z";
 
 /// A NOTIFICATION WRITTEN AFTER THE SCREEN SHOWED THE DONE STARTS NO TURN
 /// THE SNAPSHOT WAITS FOR OR TAKES: the done edge's turn is the one that
-/// ended with the marker, already ended in the first read — nothing is read
+/// ended with the done, already ended in the first read — nothing is read
 /// again — and the tail stops at its end row, so the wake's own reply
 /// (written by the next read) is never the result. A person's prompt
 /// written after the done showed is no turn of it either, and the check's
 /// rule is placed the same. NEGATIVE CONTROLS: with no done point to place
-/// it, the newest turn is the wake's, waited for, and its reply is no
-/// report (`no-marker`) — what the snapshot read when the opener was the
+/// it, the newest turn is the wake's, waited for, and the wake's reply would
+/// be read for the task's — what the snapshot read when the opener was the
 /// newest row.
 #[test]
 fn a_notification_after_the_done_showed_is_no_turn_waited_for() {
@@ -1589,7 +1735,7 @@ fn a_notification_after_the_done_showed_is_no_turn_waited_for() {
     assert_eq!((got.waits, got.ended), (0, true));
     assert_eq!(got.tail, task);
     assert_eq!(
-        report(&got.tail, DoneBy::Marker).map(|r| r.text),
+        report(&got.tail, DoneBy::Turn).map(|r| r.text),
         Ok("Fixed the parser; the build runs in the background.".to_string())
     );
     // The wake's reply and end row written since: the first read still
@@ -1607,8 +1753,11 @@ fn a_notification_after_the_done_showed_is_no_turn_waited_for() {
         || panic!("waited"),
     );
     assert_eq!(again.tail, task);
-    // NEGATIVE CONTROL: no done point to place it — the wake's turn.
-    assert_eq!(report(&whole, DoneBy::Marker), Err("no-marker"));
+    // NEGATIVE CONTROL: no done point to place it — the wake's reply.
+    assert_eq!(
+        report(&whole, DoneBy::Turn).map(|r| r.text),
+        Ok("The background build passed.".to_string())
+    );
     let mut pauses = 0;
     let unplaced = settle_with(
         first.clone(),
@@ -1662,7 +1811,7 @@ fn a_notification_after_the_done_showed_is_no_turn_waited_for() {
     );
 }
 
-/// The task's turn ended with the marker while a background agent it
+/// The task's turn ended with a done while a background agent it
 /// started still ran (its done row counts `1 background agent still
 /// running`, a done the policy holds back for that work's end); the agent
 /// ended at 17:29:10, its `<task-notification>` woke Claude Code, and the
@@ -1704,7 +1853,7 @@ fn held_woken_reply() -> [String; 2] {
 
 /// THE WAKE WHOSE END THE DONE IS, IS WAITED FOR: a marker the policy held
 /// back over a background agent, then that agent's notification woke the
-/// worker, and the woken turn's end — with the marker too — is the done
+/// worker, and the woken turn's end — a done too — is the done
 /// point. The done edge's read holds the earlier turn's marker and the
 /// woken turn's tool rows, but not its final reply: the woken turn began
 /// before the screen showed the done, so it is the turn waited for, and its
@@ -1734,7 +1883,7 @@ fn the_wake_whose_end_is_the_done_is_waited_for() {
     assert_eq!((got.waits, got.ended), (1, true));
     assert_eq!(got.tail, whole);
     assert_eq!(
-        report(&got.tail, DoneBy::Marker).map(|r| (r.text, r.uuid)),
+        report(&got.tail, DoneBy::Turn).map(|r| (r.text, r.uuid)),
         Ok((
             "The review agent found nothing more to fix.".to_string(),
             "a-wake".to_string()
@@ -1749,7 +1898,7 @@ fn the_wake_whose_end_is_the_done_is_waited_for() {
     );
     assert_eq!((earlier.waits, earlier.ended), (0, true));
     assert_eq!(
-        report(&earlier.tail, DoneBy::Marker).map(|r| (r.text, r.uuid)),
+        report(&earlier.tail, DoneBy::Turn).map(|r| (r.text, r.uuid)),
         Ok((
             "Started the review agent in the background.".to_string(),
             "a-held".to_string()
@@ -1780,9 +1929,10 @@ fn a_rows_stamp_is_read_to_the_millisecond() {
 /// the done edge read the task's turn with no reply yet; the turn then
 /// stopped without its `turn_duration` row (an interrupted one), and a
 /// background command's notification woke Claude Code on a turn whose reply
-/// ends with the marker. The settled tail stops at the notification — the
-/// next turn's start — so neither the snapshot nor `result`'s read again
-/// takes the later reply. NEGATIVE CONTROLS: the same rows with the end
+/// says done. The settled tail stops at the notification — the next turn's
+/// start — so neither the snapshot nor `result`'s read again takes the
+/// later reply: the task's turn gives its own last words, cut as they are.
+/// NEGATIVE CONTROLS: the same rows with the end
 /// row written are cut at that row alike; and a tagged row before the
 /// turn said anything (two notifications delivered together) is the same
 /// turn's.
@@ -1800,16 +1950,21 @@ fn a_turn_that_wrote_no_end_row_stops_at_the_next_turns_start() {
     let got = settle_with(first.clone(), None, |_| Some(later.clone()), || true);
     assert_eq!((got.waits, got.ended), (0, true));
     assert_eq!(got.tail, jsonl(&rows[..4]));
-    assert_eq!(report(&got.tail, DoneBy::Marker), Err("no-marker"));
+    let half = Ok("Fixed the parser, now running the".to_string());
+    assert_eq!(report(&got.tail, DoneBy::Turn).map(|r| r.text), half);
     // `result`'s read again: the task's turn, never the wake's.
     let root = ScratchDir::new("result", "no-end");
     let tasks = root.join("tasks");
     let transcript = root.join(format!("{SESSION}.jsonl"));
     let snap =
-        snapshot(&tasks, "s-1-1", Some((&transcript, &first)), DoneBy::Marker).expect("written");
+        snapshot(&tasks, "s-1-1", Some((&transcript, &first)), DoneBy::Turn).expect("written");
     assert_eq!(snap.unavailable, Some("no-reply"));
     std::fs::write(&transcript, &later).expect("transcript");
-    assert_eq!(reread(&snap.path), None, "never the wake's reply");
+    assert_eq!(
+        reread(&snap.path).map(|r| r.report.text),
+        half.ok(),
+        "never the wake's reply"
+    );
     // NEGATIVE CONTROL: the end row written, the cut is there.
     let mut ended = rows[..4].to_vec();
     ended.push(turn_duration());
@@ -1825,7 +1980,7 @@ fn a_turn_that_wrote_no_end_row_stops_at_the_next_turns_start() {
     assert_eq!(
         report(
             &settle_with(whole.clone(), None, |_| None, || true).tail,
-            DoneBy::Marker
+            DoneBy::Turn
         )
         .map(|r| r.uuid),
         Ok("a-report".to_string())

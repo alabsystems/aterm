@@ -68,15 +68,16 @@ impl Outcome {
 }
 
 /// Every check ([`run_read_only`], then [`run_selection_state`], then
-/// [`run_input`]) against `host`'s session `sid`, in order. Never panics.
+/// [`check_unserved_sid`]) against `host`'s session `sid`, in order. Never
+/// panics.
 ///
-/// Safe on a live session: the selection checks restore what they found and
-/// the input check writes a zero-byte frame. Use [`run_read_only`] when the
-/// session must not be written at all.
+/// Safe on a live session: the selection checks restore what they found, and
+/// the unserved-sid check hands the host only a closure that changes nothing.
+/// Use [`run_read_only`] when the session must not be written at all.
 pub fn run_all<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     let mut outcomes = run_read_only(host, sid);
     outcomes.extend(run_selection_state(host, sid));
-    outcomes.extend(run_input(host, sid));
+    outcomes.push(check_unserved_sid(host, sid));
     outcomes
 }
 
@@ -85,10 +86,10 @@ pub fn run_all<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
 /// it lacks one fails.
 ///
 /// Every gated check reads `host.capabilities()`, so a host advertising none
-/// takes the easy arm of each (`ERR unsupported` for `copy`, an empty roster,
-/// `Some(false)` for a write). Only the caller knows whether that absence is
-/// honest. Use this wherever the host's shape is known (a shipped host, a
-/// gate); [`run_all`] is for a host discovered over the wire.
+/// takes the easy arm of each (`ERR unsupported` for `copy`, an empty roster).
+/// Only the caller knows whether that absence is honest. Use this wherever the
+/// host's shape is known (a shipped host, a gate); [`run_all`] is for a host
+/// discovered over the wire.
 pub fn run_all_declared<H: SessionHost>(
     host: &H,
     sid: u64,
@@ -101,15 +102,15 @@ pub fn run_all_declared<H: SessionHost>(
     outcomes
 }
 
-/// The checks that only read: no selection, repaint request, input or
-/// clipboard write. Always safe against a live session, including one a human
+/// The checks that only read: no selection, repaint request or clipboard
+/// write. Always safe against a live session, including one a human
 /// is mid-drag in.
 ///
 /// These are wire-shape checks only: a host serving a fresh empty `Terminal`
 /// from every accessor with no capabilities passes all six. So this shows the
 /// host speaks the protocol, not that it has a session. For that, name the
 /// session's content ([`run_read_only_witnessed`]) or the host's capabilities
-/// ([`run_all_declared`], which writes an empty frame).
+/// ([`run_all_declared`]).
 pub fn run_read_only<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
     vec![
         check_blocks(host, sid),
@@ -141,13 +142,6 @@ pub fn run_selection_state<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
         check_selection(host, sid),
         check_copy(host, sid),
     ]
-}
-
-/// The checks that reach the input sink, separate from [`run_read_only`]
-/// because they call the one method that can move bytes toward a child process
-/// (though the only frame written is empty; see [`check_write_input`]).
-pub fn run_input<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
-    vec![check_write_input(host, sid)]
 }
 
 /// Snapshots session `sid`'s selection and puts it back when dropped, so the
@@ -192,17 +186,14 @@ impl<H: SessionHost> Drop for SelectionRestore<'_, H> {
 }
 
 /// Every capability `declared` names is advertised by the host and answers: a
-/// roster listing and resolving the session under test, an input sink taking
-/// the empty frame. A host may advertise more (a floor, not an equality).
+/// roster listing and resolving the session under test. A host may advertise
+/// more (a floor, not an equality).
 ///
 /// `clipboard` is flag-only because probing it would run `copy` and could
 /// write the user's real clipboard ([`check_copy`]'s empty-selection arm
 /// exercises it safely). `frame_source` and `event_loop` are flag-only because
 /// neither is observable through this trait (aterm-gui's redraw-conformance
 /// binary covers them).
-///
-/// Writes the same empty frame [`check_write_input`] does, so it belongs with
-/// [`run_input`].
 pub fn check_declared_capabilities<H: SessionHost>(
     host: &H,
     sid: u64,
@@ -219,7 +210,6 @@ pub fn check_declared_capabilities<H: SessionHost>(
         ("event_loop", declared.event_loop, advertised.event_loop),
         ("clipboard", declared.clipboard, advertised.clipboard),
         ("roster", declared.roster, advertised.roster),
-        ("input_sink", declared.input_sink, advertised.input_sink),
     ] {
         if want && !got {
             return Outcome::fail(CHECK, format!("{name} declared, host advertises none"));
@@ -236,15 +226,6 @@ pub fn check_declared_capabilities<H: SessionHost>(
             return Outcome::fail(
                 CHECK,
                 format!("roster declared, yet @{sid} does not resolve"),
-            );
-        }
-    }
-    if declared.input_sink {
-        let wrote = host.write_input(sid, b"");
-        if wrote != Some(true) {
-            return Outcome::fail(
-                CHECK,
-                format!("input_sink declared, yet the empty frame answered {wrote:?}"),
             );
         }
     }
@@ -392,9 +373,10 @@ pub fn check_wait<H: SessionHost>(host: &H, sid: u64) -> Outcome {
 }
 
 /// `sessions` -> a non-empty roster, strictly ascending by sid, carrying the
-/// session under test, with every row's `@<id>` reading back through
-/// [`Selector::parse`] as a stable id (an all-digit `id` would address another
-/// session's local sid).
+/// session under test, with every row's `@<id>` reading back through the wire's
+/// grammar ([`aterm_types::control_request::Sid::parse`]) as a stable id (an
+/// all-digit `id` would address another session's local sid, and any other
+/// spelling names no session).
 ///
 /// A host keeping no roster ([`HostCapabilities::roster`] false) must answer
 /// empty, the only legal empty roster, so an empty roster never reads as "no
@@ -422,7 +404,7 @@ pub fn check_sessions<H: SessionHost>(host: &H, sid: u64) -> Outcome {
         );
     }
     for e in &roster {
-        if Selector::parse(&e.id) != Some(Selector::Id(&e.id)) {
+        if aterm_types::control_request::Sid::parse(&e.id).is_none() {
             return Outcome::fail(
                 CHECK,
                 format!("sid {} has an unaddressable id: {:?}", e.sid, e.id),
@@ -498,9 +480,9 @@ fn unrostered_sid<H: SessionHost>(host: &H, sid: u64) -> u64 {
 }
 
 /// A sid this host does not serve (not the same as "unrostered"), as
-/// [`check_write_input`]'s foreign arm needs. `with_terminal` is the read-only
-/// oracle, since it and `write_input` share the "serves `sid`" definition.
-/// `None` when every probed sid is served.
+/// [`check_unserved_sid`] needs. `with_terminal` is the read-only oracle: every
+/// per-session method shares its "serves `sid`" definition. `None` when every
+/// probed sid is served.
 fn unserved_sid<H: SessionHost>(host: &H, sid: u64) -> Option<u64> {
     let roster = host.sessions();
     let serves = |c: u64| host.with_terminal(c, |_: &Terminal| ()).is_some();
@@ -666,40 +648,32 @@ pub fn check_copy<H: SessionHost>(host: &H, sid: u64) -> Outcome {
     }
 }
 
-/// `write_input` -> the three answers a driver must be able to trust:
-///   * a sid this host does not serve -> `None`, never its own session under a
-///     borrowed number;
-///   * its own sid with no sink -> `Some(false)`;
-///   * its own sid with a sink -> `Some(true)`.
-///
-/// Every frame written is empty, since no byte is safe to inject into a live
-/// shell; an empty frame still traverses the sid check and the sink. That
-/// bytes land is proven per host.
+/// A sid this host does not serve -> the mutable accessor declines it as the
+/// read accessor does, so a sid `resolve` hands out fleet-wide never reaches
+/// the session this host holds under a borrowed number.
 ///
 /// The foreign sid is probed ([`unserved_sid`]), so this works for
-/// session-scoped and fleet hosts alike.
-pub fn check_write_input<H: SessionHost>(host: &H, sid: u64) -> Outcome {
-    const CHECK: &str = "write_input: refuses a foreign sid, never a false OK";
+/// session-scoped and fleet hosts alike; a host serving every sid probed fails,
+/// since nothing on it can fail closed. The closure handed over changes
+/// nothing, so a host that does serve the sid is left as it was.
+pub fn check_unserved_sid<H: SessionHost>(host: &H, sid: u64) -> Outcome {
+    const CHECK: &str = "unserved sid: refused by the accessors, never a borrowed session";
     let Some(foreign) = unserved_sid(host, sid) else {
         return Outcome::fail(
             CHECK,
             format!("serves every sid probed near {sid}: nothing here can fail closed"),
         );
     };
-    if let Some(wrote) = host.write_input(foreign, b"") {
+    if host
+        .with_terminal_mut(foreign, |_: &mut Terminal| ())
+        .is_some()
+    {
         return Outcome::fail(
             CHECK,
-            format!("foreign sid {foreign} was served: Some({wrote})"),
+            format!("foreign sid {foreign} was served by with_terminal_mut"),
         );
     }
-    let sink = host.capabilities().input_sink;
-    match host.write_input(sid, b"") {
-        Some(wrote) if wrote == sink => Outcome::pass(CHECK),
-        other => Outcome::fail(
-            CHECK,
-            format!("input_sink={sink} but the write answered {other:?}"),
-        ),
-    }
+    Outcome::pass(CHECK)
 }
 
 /// The `<n>` from a `blocks` header, or `None` if the reply is not that shape.
@@ -718,8 +692,7 @@ fn block_count(reply: &str) -> Option<usize> {
 type ChangeSignal = Arc<(Mutex<u64>, Condvar)>;
 
 /// The reference [`SessionHost`]: one `Arc<Mutex<Terminal>>`, a counted redraw
-/// no-op, a condvar change signal, an input sink that drops what it is given
-/// and an in-memory clipboard.
+/// no-op, a condvar change signal and an in-memory clipboard.
 ///
 /// It keeps [`run_all`] honest (a suite run only against the host it was
 /// written for proves nothing) and is small enough for a new implementor to
@@ -739,8 +712,8 @@ pub struct MemoryHost {
 
 #[cfg(test)]
 impl MemoryHost {
-    /// A host owning one 24x80 session numbered `sid`, with a clipboard, a roster
-    /// and an input sink.
+    /// A host owning one 24x80 session numbered `sid`, with a clipboard and a
+    /// roster.
     #[must_use]
     pub fn new(sid: u64) -> Self {
         Self {
@@ -753,7 +726,6 @@ impl MemoryHost {
                 event_loop: false,
                 clipboard: true,
                 roster: true,
-                input_sink: true,
             },
             changed: Arc::new((Mutex::new(0), Condvar::new())),
             redraws: AtomicU64::new(0),
@@ -876,11 +848,6 @@ impl SessionHost for MemoryHost {
 
     fn with_terminal_mut<R>(&self, sid: u64, f: impl FnOnce(&mut Terminal) -> R) -> Option<R> {
         (sid == self.sid).then(|| f(&mut self.term.lock().unwrap_or_else(|p| p.into_inner())))
-    }
-
-    fn write_input(&self, sid: u64, _bytes: &[u8]) -> Option<bool> {
-        // The sid is checked before the sink, so a foreign sid can never reach it.
-        (sid == self.sid).then_some(self.capabilities.input_sink)
     }
 
     fn request_redraw(&self, sid: u64) {
@@ -1133,9 +1100,6 @@ mod tests {
                 f: impl FnOnce(&mut Terminal) -> R,
             ) -> Option<R> {
                 self.0.with_terminal_mut(sid, f)
-            }
-            fn write_input(&self, sid: u64, bytes: &[u8]) -> Option<bool> {
-                self.0.write_input(sid, bytes)
             }
             fn request_redraw(&self, sid: u64) {
                 self.0.request_redraw(sid);

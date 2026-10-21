@@ -24,6 +24,12 @@
 //! * BYE — once, on the final-exit path just before `exit(0)` ([`bye`], from its
 //!   one call site).
 //!
+//! The worker channel is bounded. Lifecycle ops it cannot take are owed in order
+//! (`send_in`); closing a fresh session whose REGISTER is still external cancels
+//! that unsent lifecycle. Prior keeper claims still owe their ordered release.
+//! PENDING refuses while older ops remain external; final BYE supersedes them.
+//! Waited-room capacity is retained, but is no guarantee that every attempt fits.
+//!
 //! AT BOOT a window that is not an update's candidate says HELLO, and every
 //! OFFER — a crashed window's master the keeper kept — passes the ONE admission
 //! ([`admit_recovered_master`]: `seamless::admit_master_descriptor`, the
@@ -41,7 +47,7 @@
 //! `--no-relaunch`, and the next launch a person makes recovers.
 
 #[cfg(unix)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 #[cfg(unix)]
 use std::sync::{Arc, Mutex, Weak};
@@ -54,6 +60,8 @@ use aterm_core::terminal::Terminal;
 use aterm_keeper::client::{KeeperClient, KeeperLink, LinkOp, Offered};
 #[cfg(unix)]
 use aterm_keeper::wire::{Birth, Frame, MarkerRef, MasterHeader};
+#[cfg(unix)]
+use aterm_update::recovery_ledger::KeeperAtLaunch;
 
 /// Whether this process takes part at all: the fast path every call site
 /// reads before anything else, so a window with the keeper off pays one
@@ -181,6 +189,10 @@ enum Phase {
 #[derive(Clone)]
 struct Tracked {
     rdev: u64,
+    /// Boot offers and handoff adoptions can already belong to a keeper before
+    /// this window's REGISTER is queued. Their close still owes the ordered
+    /// registration and RELEASE; a fresh unadmitted lifecycle can be cancelled.
+    prior_claim: bool,
     term: Weak<Mutex<Terminal>>,
     fabric: Weak<crate::fabric::SessionFabric>,
     /// What the last META SENT said: the terminal's fingerprint and the
@@ -193,6 +205,19 @@ struct State {
     phase: Phase,
     /// A candidate's registrations, sent at its Commit.
     buffered: Vec<(u64, LinkOp)>,
+    /// THE OWED OPS, in order: what the live link's queue was too full to take (a keeper
+    /// slow to read, its socket's buffer full) and every op sent after one, so none overtakes
+    /// another ([`send_in`]). A REGISTER, a session's first COMPANION, a COMPANION_RELEASE
+    /// and a RELEASE each tell the keeper what nothing else will: dropped, the keeper never
+    /// holds the session's master or region, or keeps holding a region the journal stopped
+    /// writing, or a master whose tab closed. Offered again, oldest first, by every op sent
+    /// and every pass of the META pump ([`flush_owed`]); a META waits until none is owed
+    /// (it would land before the REGISTER it rides on, and the link drops one for a master
+    /// it does not hold). Each entry keeps its local session id, or None for an unclaimed
+    /// boot offer. Close cancels a fresh lifecycle whose REGISTER has not entered the
+    /// channel; already admitted claims and the finite boot/handoff cohort still owe
+    /// their ordered RELEASE. Fresh unadmitted spawn/close churn retains no descriptors.
+    owed: VecDeque<(Option<u64>, LinkOp)>,
     /// Every registered session, by this process's session id.
     tracked: BTreeMap<u64, Tracked>,
     pump: bool,
@@ -202,9 +227,68 @@ struct State {
 static KEEPER_STATE: Mutex<State> = Mutex::new(State {
     phase: Phase::Off,
     buffered: Vec::new(),
+    owed: VecDeque::new(),
     tracked: BTreeMap::new(),
     pump: false,
 });
+
+/// Send `op` (session `session_id`'s, for a candidate's buffer) over `st`: behind every
+/// op still owed, else straight into the live link's queue, or OWED when the queue is
+/// full ([`State::owed`]). A fresh closed lifecycle not yet registered is cancelled;
+/// final exit supersedes external lifecycle work. An update's
+/// candidate buffers it until its Commit; with the link off, or its worker gone, nothing
+/// would be written.
+#[cfg(unix)]
+fn send_in(st: &mut State, session_id: Option<u64>, op: LinkOp) {
+    match &st.phase {
+        Phase::Live(link) => {
+            let link = Arc::clone(link);
+            if !flush_owed(&link, &mut st.owed) {
+                st.owed.push_back((session_id, op));
+                return;
+            }
+            match link.offer(op) {
+                Ok(()) => {}
+                Err(aterm_keeper::client::Refused::Full(op)) => {
+                    aterm_log::info!(
+                        "keeper: the link's queue is full (a keeper slow to read); what it \
+                         could not take is owed and offered again"
+                    );
+                    st.owed.push_back((session_id, op));
+                }
+                Err(aterm_keeper::client::Refused::Gone(_)) => {}
+            }
+        }
+        Phase::Armed => {
+            if let Some(id) = session_id {
+                st.buffered.push((id, op));
+            }
+        }
+        Phase::Off => {}
+    }
+}
+
+/// Offer `link` every owed op again, oldest first, until its queue refuses one: `true`
+/// when none is owed any more (a link whose worker has gone writes nothing, so what it
+/// owed goes with it).
+#[cfg(unix)]
+fn flush_owed(link: &KeeperLink, owed: &mut VecDeque<(Option<u64>, LinkOp)>) -> bool {
+    while let Some((session_id, op)) = owed.pop_front() {
+        match link.offer(op) {
+            Ok(()) => {
+                if owed.is_empty() {
+                    aterm_log::info!("keeper: every op the link's full queue owed is queued");
+                }
+            }
+            Err(aterm_keeper::client::Refused::Full(op)) => {
+                owed.push_front((session_id, op));
+                return false;
+            }
+            Err(aterm_keeper::client::Refused::Gone(_)) => owed.clear(),
+        }
+    }
+    true
+}
 
 #[cfg(unix)]
 fn keeper_state() -> std::sync::MutexGuard<'static, State> {
@@ -213,11 +297,38 @@ fn keeper_state() -> std::sync::MutexGuard<'static, State> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The live link, cloned out of the state lock (`None` unless live).
+/// PENDING uses the waited room only after earlier lifecycle ops have entered
+/// the channel. Off and a live link with external owed work are distinct.
 #[cfg(unix)]
-fn live_link() -> Option<Arc<KeeperLink>> {
-    match &keeper_state().phase {
-        Phase::Live(link) => Some(Arc::clone(link)),
+fn live_link(state: &Mutex<State>) -> Result<Option<Arc<KeeperLink>>, ()> {
+    let mut st = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    live_link_in(&mut st)
+}
+
+#[cfg(unix)]
+fn live_link_in(st: &mut State) -> Result<Option<Arc<KeeperLink>>, ()> {
+    let link = match &st.phase {
+        Phase::Live(link) => Arc::clone(link),
+        Phase::Armed | Phase::Off => return Ok(None),
+    };
+    if !flush_owed(&link, &mut st.owed) {
+        return Err(());
+    }
+    Ok(Some(link))
+}
+
+/// Final exit supersedes external lifecycle work. Already admitted channel
+/// entries retain their FIFO order before BYE; no later lifecycle is admitted.
+#[cfg(unix)]
+fn quit_link_in(st: &mut State) -> Option<Arc<KeeperLink>> {
+    let phase = std::mem::replace(&mut st.phase, Phase::Off);
+    st.owed.clear();
+    st.buffered.clear();
+    st.tracked.clear();
+    match phase {
+        Phase::Live(link) => Some(link),
         Phase::Armed | Phase::Off => None,
     }
 }
@@ -252,6 +363,8 @@ pub(crate) struct Claim {
     /// losses), taken by the spawn onto the session for `status restore=`.
     restore: Option<crate::crash_restore::RestoreReport>,
     armed: bool,
+    #[cfg(unix)]
+    recovery_count: Option<std::sync::Arc<AtomicBool>>,
 }
 
 impl Claim {
@@ -265,6 +378,8 @@ impl Claim {
             keyed: None,
             restore: None,
             armed: true,
+            #[cfg(unix)]
+            recovery_count: None,
         }
     }
 
@@ -304,6 +419,12 @@ impl Claim {
     /// What the crash restore brought back for this master, taken once.
     pub(crate) fn take_restore(&mut self) -> Option<crate::crash_restore::RestoreReport> {
         self.restore.take()
+    }
+
+    /// This old authority stays in the boot cohort even if the claim is dropped.
+    #[cfg(unix)]
+    pub(crate) fn recovery_count(&self) -> Option<std::sync::Arc<AtomicBool>> {
+        self.recovery_count.as_ref().map(std::sync::Arc::clone)
     }
 
     /// The master became a registered session: nothing to release here.
@@ -346,9 +467,13 @@ fn release_unclaimed(rdev: u64) {
         return;
     }
     #[cfg(unix)]
-    if let Some(link) = live_link() {
-        aterm_log::info!("keeper: an offered master became no session; released");
-        let _ = link.enqueue(LinkOp::Release { rdev });
+    {
+        let mut st = keeper_state();
+        if matches!(st.phase, Phase::Live(_)) {
+            aterm_log::info!("keeper: an offered master became no session; released");
+            // No session carries it: no candidate's buffer (it takes no offers) is keyed by it.
+            send_in(&mut st, None, LinkOp::Release { rdev });
+        }
     }
     #[cfg(not(unix))]
     let _ = rdev;
@@ -481,9 +606,46 @@ pub(crate) fn place_by_owner(
     }
 }
 
+/// Fixed boot cohort of old journal authorities the keeper may still offer. No
+/// ticket is removed on local drop, RELEASE enqueue, or failed placement. A ticket
+/// becomes true only through a new journal's accepted COMPANION read receipt.
+/// The cohort is sealed before control startup; readiness is therefore monotone.
+#[derive(Debug, Default)]
+pub(crate) struct RecoveryCountAdmission {
+    retained: Vec<std::sync::Arc<AtomicBool>>,
+    ready: AtomicBool,
+}
+
+impl RecoveryCountAdmission {
+    #[cfg(unix)]
+    pub(crate) fn from_retained(retained: Vec<std::sync::Arc<AtomicBool>>) -> Self {
+        Self {
+            retained,
+            ready: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        if self.ready.load(Ordering::Acquire) {
+            return true;
+        }
+        if self
+            .retained
+            .iter()
+            .all(|accepted| accepted.load(Ordering::Acquire))
+        {
+            self.ready.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// What the boot HELLO recovered.
 #[derive(Default)]
 pub(crate) struct Recovery {
+    pub(crate) count_admission: std::sync::Arc<RecoveryCountAdmission>,
     /// The admitted offers, each an adoption for `seamless_adopt`.
     pub(crate) adopted: Vec<crate::spawn::Adopted>,
     /// Offers refused by the admission (each released back to the keeper,
@@ -498,6 +660,45 @@ pub(crate) struct Recovery {
     /// screen with a loss counted, or blank (`crash_restore::Rung`): the band row
     /// and the recovery census say it.
     pub(crate) restores: crate::crash_restore::RestoreTally,
+    /// The recovery census's `keeper=` for this cold launch, as [`boot`] left the link:
+    /// `off` when the link is off (the setting, a headless launch of the installed app,
+    /// no code identity to check a keeper by, or a link worker that did not start), `on`
+    /// when a keeper answered the boot HELLO, `absent` when none did (the link registers
+    /// every terminal with the first one that answers), `armed` for an update's candidate
+    /// (it registers at its Commit). The crash restore's soak counts days of the link on
+    /// and tells a kill the keeper held from one it never did
+    /// (`aterm_update::restore_soak`).
+    #[cfg(unix)]
+    pub(crate) keeper: KeeperAtLaunch,
+}
+
+impl Recovery {
+    /// The recovery census's `restored=`, `restore_lost=`, `restore_why=`, `restore_history=`
+    /// and `restore_refused=`: how the crash restore brought the recovered sessions' screens
+    /// back, what it lost, and how many offers the admission refused, when a keeper offered
+    /// any (a recovery that refused every offer says so too: the soak counts each refused
+    /// session as one the keeper held and the launch did not bring back).
+    #[cfg(unix)]
+    pub(crate) fn ledger(&self) -> Option<aterm_update::recovery_ledger::Restores> {
+        if self.shells.is_empty() && self.refused.is_empty() {
+            return None;
+        }
+        let mut restores = self.restores.ledger();
+        restores.refused = u32::try_from(self.refused.len()).unwrap_or(u32::MAX);
+        Some(restores)
+    }
+}
+
+/// The recovery census's `keeper=` for an update's successor at its Commit: `armed` when
+/// the link is on (it says no boot HELLO, and registers what it adopted now, with whichever
+/// keeper answers), else `off`.
+#[cfg(unix)]
+pub(crate) fn at_commit() -> KeeperAtLaunch {
+    if on() {
+        KeeperAtLaunch::Armed
+    } else {
+        KeeperAtLaunch::Off
+    }
 }
 
 /// The build string a HELLO carries.
@@ -656,13 +857,17 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
     if candidate {
         keeper_state().phase = Phase::Armed;
         aterm_log::info!("keeper: armed; this update candidate registers at its Commit");
-        return Recovery::default();
+        return Recovery {
+            keeper: KeeperAtLaunch::Armed,
+            ..Recovery::default()
+        };
     }
     // Room for what the HELLO hands over, before it does (round seven,
     // finding 26's review): each adopted session holds about four
     // descriptors, and a cold launch runs at launchd's soft 256.
     crate::descriptor_limit::raise_descriptor_limit_for_recovery();
     let mut recovery = Recovery::default();
+    let mut retained_counts = Vec::new();
     let booted = match KeeperClient::connect(&socket, &identity, Duration::from_secs(2)) {
         Ok(client) => match client.hello_app_marked(&build(), marker(), JOURNAL) {
             Ok(offers) => {
@@ -671,6 +876,13 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
                 KEEPER_JOURNALS.store(client.keeper_journals(), Ordering::Relaxed);
                 let mut used_cells = 0u64;
                 for offer in offers {
+                    // Enroll before admission: a refused offer's best-effort RELEASE
+                    // is not a confirmed retirement of its old companion either.
+                    let recovery_count = offer.companion.as_ref().map(|_| {
+                        let accepted = Arc::new(AtomicBool::new(false));
+                        retained_counts.push(Arc::clone(&accepted));
+                        accepted
+                    });
                     let rdev = offer.header.rdev;
                     let local_id = offer.header.local_id;
                     if let Some(owner) = Tag::decode(&offer.tag).and_then(|t| t.owner)
@@ -679,7 +891,10 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
                         recovery.owners.push(owner);
                     }
                     match admit_recovered_master(offer, &mut used_cells, cfg) {
-                        Ok(adopted) => {
+                        Ok(mut adopted) => {
+                            if let Some(claim) = adopted.keeper.as_mut() {
+                                claim.recovery_count = recovery_count;
+                            }
                             if let Some(report) =
                                 adopted.keeper.as_ref().and_then(|c| c.restore.as_ref())
                             {
@@ -720,6 +935,16 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
             None
         }
     };
+    recovery.count_admission = Arc::new(RecoveryCountAdmission::from_retained(retained_counts));
+    recovery.keeper = if booted.is_some() {
+        KeeperAtLaunch::On
+    } else {
+        KeeperAtLaunch::Absent
+    };
+    // Before this process mints a turn id: the count goes on above every carried ledger's,
+    // and each of them stops vouching for the ids the dead window may have used since its
+    // last carry (`crash_restore::continue_carried_turns`).
+    crate::crash_restore::continue_carried_turns(&mut recovery.adopted);
     if !recovery.adopted.is_empty() {
         aterm_log::info!(
             "keeper: {} session(s) the last window's end left running are reattached (from pid(s) \
@@ -739,6 +964,7 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
         Err(e) => {
             aterm_log::warn!("keeper: the link worker did not start: {e}");
             ON.store(false, Ordering::Relaxed);
+            recovery.keeper = KeeperAtLaunch::Off;
         }
     }
     recovery
@@ -762,10 +988,12 @@ pub(crate) fn activate() {
     };
     match KeeperLink::start_marked(socket, identity, build(), marker(), None, JOURNAL) {
         Ok(link) => {
-            for (_, op) in st.buffered.drain(..) {
-                let _ = link.enqueue(op);
-            }
             st.phase = Phase::Live(Arc::new(link));
+            // In order, and owed past what the fresh queue takes: a successor that adopted
+            // more sessions than it holds is never left with one the keeper is not told of.
+            for (id, op) in std::mem::take(&mut st.buffered) {
+                send_in(&mut st, Some(id), op);
+            }
             drop(st);
             start_meta_pump();
             aterm_log::info!("keeper: this successor's sessions are registered at its Commit");
@@ -1043,7 +1271,19 @@ fn admit_recovered_journaled(
     // or resizes the object while the restore maps it.
     let restored =
         unsafe { crate::crash_restore::restore_offered(companion, attempts, cfg, used_cells) };
-    let (checkpoint, repaint, report, history) = match restored {
+    // THE TURN LEDGER (`crash_restore`'s increment 7): the region's control slot, whatever
+    // the screen's rung, adopted as an update adopts its sidecar (`history` prints its
+    // records `carried=1`), with the dead window's turn-id count the region held beside it
+    // (`crash_restore::counted_carry`); the boot continues the count above it
+    // (`crash_restore::continue_carried_turns`).
+    if let Some(carry) = &restored.control {
+        aterm_log::info!(
+            "keeper: session {sid}'s turn ledger: {} record(s) carried",
+            carry.turns.len()
+        );
+    }
+    let control = crate::crash_restore::counted_carry(restored.control, restored.turn_ids);
+    let (checkpoint, repaint, report, history) = match restored.screen {
         Ok(restore) => (
             Some(restore.checkpoint),
             restore.repaint,
@@ -1076,7 +1316,7 @@ fn admit_recovered_journaled(
         sid: aterm_session::SessionId::new(sid),
         nonce: aterm_session::LaunchNonce::generate(),
         checkpoint,
-        control: None,
+        control,
         repaint,
         frozen_path: tag.frozen,
         identity: tag.identity,
@@ -1098,6 +1338,9 @@ fn admit_recovered_journaled(
         outgoing_build: None,
         render_debt: None,
         fabric: fabric.carry,
+        // No META carries the timeline's count, so the recovery's starts at 1;
+        // an anchor the crashed window handed out, above it, reads it from its
+        // first row (`SessionTimeline::since`, U13).
         timeline_id: 0,
         // A crashed window's shell: no manifest carried its log's counters,
         // but the keeper's tag names the epoch its log was at.
@@ -1108,6 +1351,7 @@ fn admit_recovered_journaled(
         },
         journal_key: None,
         task: None,
+        autopilot_end: None,
     })
 }
 
@@ -1129,7 +1373,10 @@ pub(crate) fn register(session: &crate::Session, claim: Option<Claim>) {
         return;
     }
     #[cfg(unix)]
-    let tracked = register_unix(session);
+    let tracked = register_unix(
+        session,
+        claim.is_some() || session.handoff_local_id.is_some(),
+    );
     #[cfg(not(unix))]
     let tracked = {
         let _ = session;
@@ -1142,7 +1389,7 @@ pub(crate) fn register(session: &crate::Session, claim: Option<Claim>) {
 
 /// Whether the session is now tracked (and so released at its drop).
 #[cfg(unix)]
-fn register_unix(session: &crate::Session) -> bool {
+fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
     use std::os::fd::{BorrowedFd, OwnedFd};
     use std::os::unix::fs::MetadataExt as _;
     if session.master < 3 || session.pid <= 1 {
@@ -1183,41 +1430,56 @@ fn register_unix(session: &crate::Session) -> bool {
         tag: tag.encode(),
     };
     let mut st = keeper_state();
-    st.tracked.insert(
-        session.id,
-        Tracked {
-            rdev,
-            term: Arc::downgrade(&session.term),
-            fabric: Arc::downgrade(&session.ctx.fabric),
-            last: None,
-        },
-    );
     // THE CLAIM SETTLED (`JOURNAL`): right behind its REGISTER, the session's
     // crash-restore region (its read-only custody descriptor, which the link keeps
     // with the master and tells a restarted keeper again), or that it has none. A
     // recovered session's COMPANION is what ends the keeper's poison window for the
     // region it was restored from.
-    let journal = match session
-        .ctx
-        .crash_journal
-        .get()
-        .and_then(|j| j.take_custody())
-    {
-        Some((region, len)) => LinkOp::Companion { rdev, region, len },
+    let journal = match session.ctx.crash_journal.get().and_then(|j| {
+        j.note_custody_registered();
+        j.take_custody_with_receipt()
+    }) {
+        Some(held) => LinkOp::Companion {
+            rdev,
+            region: held.region,
+            len: held.len,
+            receipt: held.receipt,
+        },
         None => LinkOp::CompanionRelease { rdev },
     };
-    match &st.phase {
-        Phase::Live(link) => {
-            let _ = link.enqueue(op);
-            let _ = link.enqueue(journal);
-        }
-        Phase::Armed => {
-            st.buffered.push((session.id, op));
-            st.buffered.push((session.id, journal));
-        }
-        Phase::Off => {}
-    }
+    register_in(
+        &mut st,
+        session.id,
+        Tracked {
+            rdev,
+            prior_claim,
+            term: Arc::downgrade(&session.term),
+            fabric: Arc::downgrade(&session.ctx.fabric),
+            last: None,
+        },
+        op,
+        journal,
+    );
     true
+}
+
+/// [`register`] over `st` (the process's link state, or a test's): track session
+/// `session_id`, then send its REGISTER and, right behind it, the op that settles its claim
+/// (its first COMPANION, or COMPANION_RELEASE). Neither is dropped on a full queue: each
+/// is owed and offered again ([`send_in`]), in order, so the keeper holds the session's
+/// master and the region beside it once it has read, never the master alone, never
+/// neither.
+#[cfg(unix)]
+fn register_in(
+    st: &mut State,
+    session_id: u64,
+    tracked: Tracked,
+    register: LinkOp,
+    journal: LinkOp,
+) {
+    st.tracked.insert(session_id, tracked);
+    send_in(st, Some(session_id), register);
+    send_in(st, Some(session_id), journal);
 }
 
 /// COMPANION_RELEASE (`crash_restore::SessionJournal::stop`): session `session_id`'s
@@ -1229,18 +1491,39 @@ pub(crate) fn release_companion(session_id: u64) {
     if !on() {
         return;
     }
-    let mut st = keeper_state();
+    release_companion_in(&mut keeper_state(), session_id);
+}
+
+/// [`release_companion`] over `st`: owed on a full queue, never dropped before a BYE
+/// ([`send_in`]),
+/// or the keeper would keep the region the journal stopped writing and restore it after
+/// a crash as if it were the session's last state.
+#[cfg(unix)]
+fn release_companion_in(st: &mut State, session_id: u64) {
     let Some(rdev) = st.tracked.get(&session_id).map(|t| t.rdev) else {
         return;
     };
-    let op = LinkOp::CompanionRelease { rdev };
-    match &st.phase {
-        Phase::Live(link) => {
-            let _ = link.enqueue(op);
-        }
-        Phase::Armed => st.buffered.push((session_id, op)),
-        Phase::Off => {}
-    }
+    send_in(st, Some(session_id), LinkOp::CompanionRelease { rdev });
+}
+
+/// What became of a fresh region's custody offered to the keeper link
+/// ([`replace_companion`]).
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum CompanionOffer {
+    /// Queued for the keeper (or, for an update's candidate, buffered until its Commit):
+    /// the link keeps it with the master and tells the keeper.
+    Handed,
+    /// The link's queue is full (a keeper slow to read, as one paged out under the very
+    /// pressure the shed answers is): the descriptor comes back for the caller to offer
+    /// again. Dropped, it would leave the keeper holding the superseded region for good,
+    /// so every later crash would restore the stale screen of the shed, never the
+    /// session's own.
+    Busy(std::os::fd::OwnedFd),
+    /// No link carries the session (the link is off or its worker ended, or the session
+    /// was never registered or is gone): the descriptor comes back for the caller to keep,
+    /// as a session's first one waits for its registration.
+    Unlinked(std::os::fd::OwnedFd),
 }
 
 /// COMPANION again (`crash_restore::SessionJournal::replace_region`, the memory shed):
@@ -1249,30 +1532,276 @@ pub(crate) fn release_companion(session_id: u64) {
 /// one closes there) and reaches the keeper, which replaces and closes the claim's old
 /// region on it. Queued behind everything already queued for the session, so it lands
 /// after the session's REGISTER and whatever its registration settled. The descriptor
-/// comes back when no link carries the session (the link is off, or the session was
-/// never registered or is gone), for the caller to keep.
+/// comes back, never dropped, when the link's queue cannot take it now
+/// ([`CompanionOffer::Busy`]) or no link carries the session
+/// ([`CompanionOffer::Unlinked`]).
 #[cfg(unix)]
 pub(crate) fn replace_companion(
     session_id: u64,
     region: std::os::fd::OwnedFd,
     len: u64,
-) -> Option<std::os::fd::OwnedFd> {
+) -> CompanionOffer {
     if !on() {
-        return Some(region);
+        return CompanionOffer::Unlinked(region);
     }
-    let mut st = keeper_state();
+    replace_companion_in(&mut keeper_state(), session_id, region, len, None)
+}
+
+/// Replacement with explicit keeper-read evidence. This remains pending on queue
+/// admission, reconnect failure, or a keeper without SYNC support.
+#[cfg(unix)]
+pub(crate) fn replace_companion_checked(
+    session_id: u64,
+    region: std::os::fd::OwnedFd,
+    len: u64,
+    receipt: Arc<aterm_keeper::client::CompanionReceipt>,
+) -> CompanionOffer {
+    if !on() {
+        return CompanionOffer::Unlinked(region);
+    }
+    replace_companion_in(&mut keeper_state(), session_id, region, len, Some(receipt))
+}
+
+/// [`replace_companion`] over `st` (the process's link state, or a test's).
+#[cfg(unix)]
+fn replace_companion_in(
+    st: &mut State,
+    session_id: u64,
+    region: std::os::fd::OwnedFd,
+    len: u64,
+    receipt: Option<Arc<aterm_keeper::client::CompanionReceipt>>,
+) -> CompanionOffer {
     let Some(rdev) = st.tracked.get(&session_id).map(|t| t.rdev) else {
-        return Some(region);
+        return CompanionOffer::Unlinked(region);
     };
-    let op = LinkOp::Companion { rdev, region, len };
-    match &st.phase {
-        Phase::Live(link) => {
-            let _ = link.enqueue(op);
+    let op = LinkOp::Companion {
+        rdev,
+        region,
+        len,
+        receipt,
+    };
+    let (busy, op) = match &st.phase {
+        // Behind every op still owed (the session's own REGISTER among them, which the
+        // link must read first: it drops a COMPANION for a master it does not hold), so
+        // while one is, the descriptor comes back as from a full queue.
+        Phase::Live(link) if !flush_owed(&Arc::clone(link), &mut st.owed) => (true, op),
+        Phase::Live(link) => match link.offer(op) {
+            Ok(()) => return CompanionOffer::Handed,
+            Err(aterm_keeper::client::Refused::Full(op)) => (true, op),
+            Err(aterm_keeper::client::Refused::Gone(op)) => (false, op),
+        },
+        Phase::Armed => {
+            st.buffered.push((session_id, op));
+            return CompanionOffer::Handed;
         }
-        Phase::Armed => st.buffered.push((session_id, op)),
-        Phase::Off => {}
+        Phase::Off => (false, op),
+    };
+    let LinkOp::Companion { region, .. } = op else {
+        unreachable!("the link hands back the COMPANION it was offered")
+    };
+    if busy {
+        CompanionOffer::Busy(region)
+    } else {
+        CompanionOffer::Unlinked(region)
     }
-    None
+}
+
+/// A keeper link whose keeper does not read (a test's): one session, `session_id`, is
+/// registered on it at `rdev`, and its queue fills as a slow keeper's does, so a test sees
+/// what [`replace_companion`] makes of a full queue, and what reaches the keeper once it
+/// has read.
+#[cfg(all(test, unix))]
+pub(crate) struct TestLink {
+    state: Mutex<State>,
+    far: aterm_keeper::client::Stalled,
+}
+
+/// The rdev of the ops [`TestLink::fill`] queues: none a test registers.
+#[cfg(all(test, unix))]
+pub(crate) const FILLER_RDEV: u64 = u64::MAX;
+
+#[cfg(all(test, unix))]
+impl TestLink {
+    pub(crate) fn stalled(session_id: u64, rdev: u64) -> Self {
+        let link = Self::bare();
+        link.state.lock().expect("test link").tracked.insert(
+            session_id,
+            Tracked {
+                rdev,
+                prior_claim: false,
+                term: Weak::new(),
+                fabric: Weak::new(),
+                last: None,
+            },
+        );
+        link
+    }
+
+    /// A stalled link that carries no session yet ([`Self::register`] registers one).
+    pub(crate) fn bare() -> Self {
+        let (link, far) = KeeperLink::stalled();
+        Self {
+            state: Mutex::new(State {
+                phase: Phase::Live(Arc::new(link)),
+                buffered: Vec::new(),
+                owed: VecDeque::new(),
+                tracked: BTreeMap::new(),
+                pump: false,
+            }),
+            far,
+        }
+    }
+
+    /// Queue ops until the queue takes no more.
+    pub(crate) fn fill(&self) {
+        let st = self.state.lock().expect("test link");
+        let Phase::Live(link) = &st.phase else {
+            unreachable!("a test link is live")
+        };
+        while link.enqueue(LinkOp::Release { rdev: FILLER_RDEV }) {}
+    }
+
+    /// Fill the queue but for `free` places (what the keeper read so far is taken).
+    pub(crate) fn fill_but(&self, free: usize) {
+        let _ = self.far.drain();
+        let st = self.state.lock().expect("test link");
+        let Phase::Live(link) = &st.phase else {
+            unreachable!("a test link is live")
+        };
+        for _ in free..aterm_keeper::client::LINK_QUEUE {
+            assert!(link.enqueue(LinkOp::Release { rdev: FILLER_RDEV }));
+        }
+    }
+
+    /// [`register`] over this link: session `session_id`'s REGISTER of `master` at `rdev`,
+    /// then `journal` (its first COMPANION, or COMPANION_RELEASE).
+    pub(crate) fn register(
+        &self,
+        session_id: u64,
+        rdev: u64,
+        master: std::os::fd::OwnedFd,
+        journal: LinkOp,
+    ) {
+        let op = LinkOp::Register {
+            master,
+            header: MasterHeader {
+                rdev,
+                shell_pid: 1,
+                shell_birth: Birth {
+                    seconds: 1,
+                    micros: 0,
+                },
+                local_id: session_id,
+            },
+            tag: Vec::new(),
+        };
+        register_in(
+            &mut self.state.lock().expect("test link"),
+            session_id,
+            Tracked {
+                rdev,
+                prior_claim: false,
+                term: Weak::new(),
+                fabric: Weak::new(),
+                last: None,
+            },
+            op,
+            journal,
+        );
+    }
+
+    /// [`release_companion`] over this link.
+    pub(crate) fn release_companion(&self, session_id: u64) {
+        release_companion_in(&mut self.state.lock().expect("test link"), session_id);
+    }
+
+    /// [`release`] over this link.
+    pub(crate) fn release(&self, session_id: u64) {
+        release_in(&mut self.state.lock().expect("test link"), session_id);
+    }
+
+    /// One pass of the META pump over this link (no session here has a terminal to send a
+    /// META of): the tick that offers the owed ops again.
+    pub(crate) fn tick(&self) {
+        let _ = meta_pass_over(&self.state, |_, _| None);
+    }
+
+    /// How many ops are owed.
+    pub(crate) fn owed(&self) -> usize {
+        self.state.lock().expect("test link").owed.len()
+    }
+
+    /// [`pending_before_grant`] over this link, waiting for nothing (this keeper never
+    /// reads, so nothing is written; what was queued is what [`Self::drain`] reads).
+    pub(crate) fn pending(&self, successor: u32) -> bool {
+        pending_over(&self.state, successor, Duration::ZERO)
+    }
+
+    /// [`bye`] over this link, waiting for nothing, as [`Self::pending`].
+    pub(crate) fn bye(&self) {
+        bye_over(&self.state, Duration::ZERO);
+    }
+
+    /// What the old code did with `op` (`let _ = link.enqueue(op)`): a NEGATIVE CONTROL.
+    pub(crate) fn enqueue_dropping(&self, op: LinkOp) {
+        let st = self.state.lock().expect("test link");
+        let Phase::Live(link) = &st.phase else {
+            unreachable!("a test link is live")
+        };
+        let _ = link.enqueue(op);
+    }
+
+    /// The keeper reads: every op queued so far, in order.
+    pub(crate) fn drain(&self) -> Vec<LinkOp> {
+        let ops = self.far.drain();
+        for op in &ops {
+            if let LinkOp::Companion {
+                receipt: Some(receipt),
+                ..
+            } = op
+            {
+                receipt.confirm_captured();
+            }
+        }
+        ops
+    }
+
+    /// [`replace_companion`] over this link.
+    pub(crate) fn replace_companion(
+        &self,
+        session_id: u64,
+        region: std::os::fd::OwnedFd,
+        len: u64,
+    ) -> CompanionOffer {
+        replace_companion_in(
+            &mut self.state.lock().expect("test link"),
+            session_id,
+            region,
+            len,
+            None,
+        )
+    }
+
+    /// Take queued ops without claiming a keeper read or SYNC response.
+    pub(crate) fn take_queued(&self) -> Vec<LinkOp> {
+        self.far.drain()
+    }
+
+    pub(crate) fn replace_companion_checked(
+        &self,
+        session_id: u64,
+        region: std::os::fd::OwnedFd,
+        len: u64,
+        receipt: Arc<aterm_keeper::client::CompanionReceipt>,
+    ) -> CompanionOffer {
+        replace_companion_in(
+            &mut self.state.lock().expect("test link"),
+            session_id,
+            region,
+            len,
+            Some(receipt),
+        )
+    }
 }
 
 /// What `session`'s registration by window `own_pid` says of it: its sid,
@@ -1317,18 +1846,35 @@ pub(crate) fn release(session_id: u64) {
         return;
     }
     #[cfg(unix)]
-    {
-        let mut st = keeper_state();
-        let Some(tracked) = st.tracked.remove(&session_id) else {
-            return;
-        };
-        st.buffered.retain(|(id, _)| *id != session_id);
-        if let Phase::Live(link) = &st.phase {
-            let _ = link.enqueue(LinkOp::Release { rdev: tracked.rdev });
-        }
-    }
+    release_in(&mut keeper_state(), session_id);
     #[cfg(not(unix))]
     let _ = session_id;
+}
+
+/// [`release`] over `st`.
+#[cfg(unix)]
+fn release_in(st: &mut State, session_id: u64) {
+    let Some(tracked) = st.tracked.remove(&session_id) else {
+        return;
+    };
+    st.buffered.retain(|(id, _)| *id != session_id);
+    // Nothing from this lifecycle reached the channel when its REGISTER is
+    // still ours. Closing it retires its descriptors and all its pending ops;
+    // old admitted lifecycles, including ones at the same rdev, stay ordered.
+    let unadmitted = st.owed.iter().any(|(id, op)| {
+        *id == Some(session_id)
+            && matches!(op, LinkOp::Register { header, .. } if header.local_id == session_id)
+    });
+    if unadmitted && !tracked.prior_claim {
+        st.owed.retain(|(id, _)| *id != Some(session_id));
+        return;
+    }
+    // An admitted REGISTER or earlier keeper claim still owes its RELEASE.
+    // Session::drop still hangs up/reaps the shell independently; until release,
+    // the keeper can retain a stale master/region and offer it after a crash.
+    if matches!(st.phase, Phase::Live(_)) {
+        send_in(st, Some(session_id), LinkOp::Release { rdev: tracked.rdev });
+    }
 }
 
 /// PENDING (both seamless-update lanes, before the grant): name the
@@ -1344,16 +1890,7 @@ pub(crate) fn pending_before_grant(successor: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        let written = live_link().is_none_or(|link| {
-            link.send_and_wait(LinkOp::Pending { pid: successor }, PENDING_WAIT)
-        });
-        if !written {
-            aterm_log::warn!(
-                "keeper: PENDING for successor {successor} was not written; the holder scan \
-                 stands alone"
-            );
-        }
-        written
+        pending_over(&KEEPER_STATE, successor, PENDING_WAIT)
     }
     #[cfg(not(unix))]
     {
@@ -1362,19 +1899,48 @@ pub(crate) fn pending_before_grant(successor: u32) -> bool {
     }
 }
 
+/// [`pending_before_grant`] over `state`, waiting at most `wait`.
+#[cfg(unix)]
+fn pending_over(state: &Mutex<State>, successor: u32, wait: Duration) -> bool {
+    let written = match live_link(state) {
+        Ok(None) => true,
+        Ok(Some(link)) => link.send_and_wait(LinkOp::Pending { pid: successor }, wait),
+        Err(()) => false,
+    };
+    if !written {
+        aterm_log::warn!(
+            "keeper: PENDING for successor {successor} was not written; the holder scan stands alone"
+        );
+    }
+    written
+}
+
 /// BYE — ONLY from the final-exit path, just before `exit(0)` (§5.3 step 4):
 /// quit intent, so the keeper closes this
 /// window's masters and the kernel hangs the shells up as today. Waits at most
 /// [`BYE_WAIT`] for the frame to be written.
 pub(crate) fn bye() {
     #[cfg(unix)]
+    if on() {
+        bye_over(&KEEPER_STATE, BYE_WAIT);
+        ON.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Final quit intent supersedes unsent lifecycle work; the waited-room bound
+/// does not guarantee delivery. A failed/timed-out write is reported. Terminal
+/// BYE stays valid if it is still queued after the caller's bounded wait ends.
+#[cfg(unix)]
+fn bye_over(state: &Mutex<State>, wait: Duration) {
+    let link = quit_link_in(
+        &mut state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    if let Some(link) = link
+        && !link.send_and_wait(LinkOp::Bye, wait)
     {
-        if on()
-            && let Some(link) = live_link()
-            && !link.send_and_wait(LinkOp::Bye, BYE_WAIT)
-        {
-            aterm_log::warn!("keeper: the BYE was not written");
-        }
+        aterm_log::warn!("keeper: the BYE was not written");
     }
 }
 
@@ -1435,18 +2001,23 @@ fn meta_pass_over<B>(state: &Mutex<State>, build: B) -> usize
 where
     B: Fn(aterm_core::terminal::CheckpointMeta, &crate::fabric::KeeperCarry) -> Option<Vec<u8>>,
 {
-    let targets: Vec<(u64, Tracked)> = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .tracked
-        .iter()
-        .map(|(id, t)| (*id, t.clone()))
-        .collect();
+    let targets: Vec<(u64, Tracked)> = {
+        let mut st = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // THE OWED OPS' TICK: what a full queue could not take is offered again first.
+        if let Phase::Live(link) = &st.phase {
+            let link = Arc::clone(link);
+            let _ = flush_owed(&link, &mut st.owed);
+        }
+        st.tracked.iter().map(|(id, t)| (*id, t.clone())).collect()
+    };
     let mut sent = 0;
     for (
         id,
         Tracked {
             rdev,
+            prior_claim: _,
             term,
             fabric,
             last,
@@ -1477,14 +2048,21 @@ where
         let mut st = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let State { phase, tracked, .. } = &mut *st;
+        let State {
+            phase,
+            tracked,
+            owed,
+            ..
+        } = &mut *st;
         let Some(tracked) = tracked.get_mut(&id) else {
             continue;
         };
         // Recorded only for a META that went (R17-HANDOFF-1, 2026-10-11): one
-        // not built, or that found no link or a full queue, is tried again on
-        // the next pass, not when the modes next move.
+        // not built, or that found no link, a full queue or an op still owed ahead
+        // of it (its REGISTER, perhaps), is tried again on the next pass, not when
+        // the modes next move.
         if let (Some(meta), Phase::Live(link)) = (meta, &*phase)
+            && owed.is_empty()
             && link.enqueue(LinkOp::Meta { rdev, meta })
         {
             tracked.last = Some((fingerprint, carry));
@@ -1602,6 +2180,7 @@ mod tests {
         {
             assert!(keeper_state().tracked.is_empty(), "nothing tracked");
             assert!(matches!(keeper_state().phase, Phase::Off));
+            assert_eq!(recovery.keeper, KeeperAtLaunch::Off, "the census says off");
         }
     }
 
@@ -1784,7 +2363,7 @@ mod tests {
         assert_eq!(adopted.sid.as_str(), "s-0123456789abcdef0123");
         assert!(adopted.repaint && adopted.rekey);
         // THE LOG'S EPOCH the crashed window registered (`slog_ep=4`), for
-        // the recovery's log to take one above (`session_log::crash_epoch`);
+        // the recovery's log to take one above (`session_log::Epochs::crash`);
         // no manifest carried anything else of it.
         assert_eq!(
             adopted.log,
@@ -1920,6 +2499,22 @@ mod tests {
             refused.err(),
             Some("its shell is gone or no longer leads its terminal")
         );
+    }
+
+    /// The census's row of a recovery: none when nothing was offered; the refused offers
+    /// counted beside the admitted ones, a recovery that refused every offer included.
+    #[cfg(unix)]
+    #[test]
+    fn a_recovery_s_row_counts_the_offers_it_refused() {
+        let mut recovery = Recovery::default();
+        assert_eq!(recovery.ledger(), None, "nothing offered, no restores");
+        recovery.refused.push((3, "carries no session id"));
+        let all_refused = recovery.ledger().expect("a refusal is a row");
+        assert_eq!((all_refused.recovered(), all_refused.refused), (0, 1));
+        recovery.shells.push(4242);
+        recovery.restores.counts.exact = 1;
+        let some = recovery.ledger().expect("an adopted session is a row");
+        assert_eq!((some.exact, some.refused), (1, 1));
     }
 
     /// META round-trips through the keeper's bound onto the Repaint rung, the
@@ -2621,10 +3216,12 @@ mod tests {
         let state = Mutex::new(State {
             phase: Phase::Off,
             buffered: Vec::new(),
+            owed: VecDeque::new(),
             tracked: BTreeMap::from([(
                 7,
                 Tracked {
                     rdev: 1,
+                    prior_claim: false,
                     term: Arc::downgrade(&term),
                     fabric: Arc::downgrade(&session.ctx.fabric),
                     last: None,
@@ -2714,5 +3311,520 @@ mod tests {
         {
             link.shutdown();
         }
+    }
+
+    /// A FULL QUEUE NEVER DROPS A REPLACED REGION'S CUSTODY (R6). The memory shed hands the
+    /// keeper a fresh region's only read-only descriptor; a link whose keeper is slow to
+    /// read (paged out under the very pressure being shed) has a full queue, and the
+    /// COMPANION it could not take used to be dropped there (`let _ = link.enqueue(op)`),
+    /// leaving the keeper on the superseded region for good. Now the descriptor comes back
+    /// (`Busy`), and offered again once the keeper has read, it reaches the keeper as that
+    /// session's COMPANION. A session the link does not carry gets it back as `Unlinked`.
+    /// NEGATIVE CONTROL: the old `let _ = link.enqueue(op)` on the same full queue reaches
+    /// the keeper with nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_queue_hands_a_replaced_regions_custody_back_for_another_offer() {
+        use std::os::fd::{AsFd as _, OwnedFd};
+        use std::os::unix::fs::MetadataExt as _;
+        let inode = |fd: &OwnedFd| {
+            std::fs::File::from(fd.as_fd().try_clone_to_owned().expect("dup"))
+                .metadata()
+                .expect("stat")
+                .ino()
+        };
+        // Each region its own file, so an inode names the one region: every open of
+        // `/dev/null` shares one inode, which would tell no descriptor from another.
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let made = std::cell::Cell::new(0u32);
+        let region = || {
+            made.set(made.get() + 1);
+            let path = scratch.path().join(format!("region-{}", made.get()));
+            OwnedFd::from(std::fs::File::create(path).expect("a region of its own"))
+        };
+        let companions = |ops: Vec<LinkOp>| -> Vec<(u64, u64)> {
+            ops.into_iter()
+                .filter_map(|op| match op {
+                    LinkOp::Companion { rdev, region, .. } => Some((rdev, inode(&region))),
+                    _ => None,
+                })
+                .collect()
+        };
+        let link = TestLink::stalled(7, 70);
+        link.fill();
+        let fresh = region();
+        let fresh_ino = inode(&fresh);
+        assert_ne!(
+            inode(&region()),
+            fresh_ino,
+            "premise: an inode tells one region from another"
+        );
+        let busy = match link.replace_companion(7, fresh, 4096) {
+            CompanionOffer::Busy(back) => back,
+            other => panic!("a full queue hands the custody back: {other:?}"),
+        };
+        assert_eq!(
+            inode(&busy),
+            fresh_ino,
+            "the region it was offered comes back"
+        );
+        assert_eq!(
+            companions(link.drain()),
+            Vec::<(u64, u64)>::new(),
+            "nothing reached the keeper meanwhile"
+        );
+        assert!(matches!(
+            link.replace_companion(7, busy, 4096),
+            CompanionOffer::Handed
+        ));
+        assert_eq!(
+            companions(link.drain()),
+            [(70, fresh_ino)],
+            "offered again, the keeper is told the fresh region"
+        );
+        assert!(matches!(
+            link.replace_companion(8, region(), 4096),
+            CompanionOffer::Unlinked(_)
+        ));
+
+        // The old code, on the same full queue: the op is dropped with its descriptor.
+        link.fill();
+        {
+            let st = link.state.lock().expect("test link");
+            let Phase::Live(live) = &st.phase else {
+                unreachable!("a test link is live")
+            };
+            let _ = live.enqueue(LinkOp::Companion {
+                rdev: 70,
+                region: region(),
+                len: 4096,
+                receipt: None,
+            });
+        }
+        assert_eq!(
+            companions(link.drain()),
+            Vec::<(u64, u64)>::new(),
+            "control: `let _ = enqueue` leaves the keeper on the superseded region"
+        );
+    }
+
+    /// Descriptors of files of their own, each told from another by its inode (every open
+    /// of `/dev/null` shares one), for the owed-op tests: a master, a region.
+    #[cfg(unix)]
+    struct Files {
+        dir: aterm_tempfile::TempDir,
+        made: std::cell::Cell<u32>,
+    }
+
+    #[cfg(unix)]
+    impl Files {
+        fn new() -> Self {
+            Self {
+                dir: aterm_tempfile::tempdir().expect("scratch"),
+                made: std::cell::Cell::new(0),
+            }
+        }
+
+        fn fd(&self) -> (std::os::fd::OwnedFd, u64) {
+            self.made.set(self.made.get() + 1);
+            let path = self.dir.path().join(format!("file-{}", self.made.get()));
+            let fd = std::os::fd::OwnedFd::from(std::fs::File::create(path).expect("a file"));
+            let ino = inode(&fd);
+            (fd, ino)
+        }
+    }
+
+    #[cfg(unix)]
+    fn inode(fd: &std::os::fd::OwnedFd) -> u64 {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::File::from(fd.as_fd().try_clone_to_owned().expect("dup"))
+            .metadata()
+            .expect("stat")
+            .ino()
+    }
+
+    /// What the keeper read, in order, but for [`TestLink::fill`]'s ops: each op's kind, its
+    /// rdev (a PENDING's pid) and the inode of the descriptor it carries (0 for none).
+    #[cfg(unix)]
+    fn seen(ops: Vec<LinkOp>) -> Vec<(&'static str, u64, u64)> {
+        ops.into_iter()
+            .filter_map(|op| match op {
+                LinkOp::Release { rdev } if rdev == FILLER_RDEV => None,
+                LinkOp::Release { rdev } => Some(("RELEASE", rdev, 0)),
+                LinkOp::Register { master, header, .. } => {
+                    Some(("REGISTER", header.rdev, inode(&master)))
+                }
+                LinkOp::Companion { rdev, region, .. } => Some(("COMPANION", rdev, inode(&region))),
+                LinkOp::CompanionRelease { rdev } => Some(("COMPANION_RELEASE", rdev, 0)),
+                LinkOp::Meta { rdev, .. } => Some(("META", rdev, 0)),
+                LinkOp::Pending { pid } => Some(("PENDING", u64::from(pid), 0)),
+                LinkOp::Bye => Some(("BYE", 0, 0)),
+            })
+            .collect()
+    }
+
+    /// A REGISTER A FULL QUEUE COULD NOT TAKE IS OWED, AND A LATER TICK DELIVERS IT (R9 (a)).
+    /// A session's REGISTER is the keeper's only copy of its master: dropped on a full queue
+    /// (`let _ = link.enqueue(op)`, as `register` did), the keeper never holds the session,
+    /// so a crash loses its shell, and the claim it settles (COMPANION_RELEASE here) lands
+    /// for a master the link never registered. Now both are owed, in order; a COMPANION a
+    /// shed offers meanwhile comes back (`Busy`) rather than overtake them; the META pump's
+    /// next pass, once the keeper has read, queues them, REGISTER first.
+    /// NEGATIVE CONTROL: the old `let _ = link.enqueue(op)` on the same full queue: the
+    /// keeper reads no REGISTER, then or after a tick.
+    #[cfg(unix)]
+    #[test]
+    fn a_register_a_full_queue_refused_is_owed_and_a_later_tick_delivers_it() {
+        let files = Files::new();
+        let link = TestLink::bare();
+        link.fill();
+        let (master, master_ino) = files.fd();
+        link.register(7, 70, master, LinkOp::CompanionRelease { rdev: 70 });
+        assert_eq!(
+            link.owed(),
+            2,
+            "the REGISTER and its claim's settle are owed"
+        );
+        let (fresh, _) = files.fd();
+        assert!(
+            matches!(
+                link.replace_companion(7, fresh, 4096),
+                CompanionOffer::Busy(_)
+            ),
+            "a COMPANION never overtakes the REGISTER it rides on"
+        );
+        assert_eq!(
+            seen(link.drain()),
+            [],
+            "nothing reached the keeper meanwhile"
+        );
+        link.tick();
+        assert_eq!(link.owed(), 0, "the tick queued what was owed");
+        assert_eq!(
+            seen(link.drain()),
+            [("REGISTER", 70, master_ino), ("COMPANION_RELEASE", 70, 0)],
+            "the keeper reads the REGISTER, then its claim settled"
+        );
+
+        // The old code, on the same full queue.
+        link.fill();
+        let (master, _) = files.fd();
+        link.enqueue_dropping(LinkOp::Register {
+            master,
+            header: MasterHeader {
+                rdev: 80,
+                shell_pid: 1,
+                shell_birth: Birth {
+                    seconds: 1,
+                    micros: 0,
+                },
+                local_id: 8,
+            },
+            tag: Vec::new(),
+        });
+        let first = seen(link.drain());
+        link.tick();
+        let later = seen(link.drain());
+        assert_eq!(
+            (first, later),
+            (vec![], vec![]),
+            "control: `let _ = enqueue` never registers the master"
+        );
+
+        // A permanently full link must not retain past unadmitted sessions.
+        let churn = TestLink::bare();
+        churn.fill();
+        for id in 100..132 {
+            let (master, _) = files.fd();
+            churn.register(
+                id,
+                id + 1_000,
+                master,
+                LinkOp::CompanionRelease { rdev: id + 1_000 },
+            );
+            assert_eq!(churn.owed(), 2);
+            assert!(
+                live_link_in(&mut churn.state.lock().expect("state")).is_err(),
+                "PENDING is refused while older ops remain outside the channel"
+            );
+            churn.release(id);
+            assert_eq!(churn.owed(), 0, "close retires its unsent lifecycle");
+        }
+        assert!(churn.state.lock().expect("state").tracked.is_empty());
+        assert!(
+            seen(churn.drain()).is_empty(),
+            "no closed lifecycle entered the channel"
+        );
+
+        // An admitted REGISTER still owes its settle and RELEASE, even after close.
+        let admitted = TestLink::bare();
+        admitted.fill_but(1);
+        let (master, ino) = files.fd();
+        admitted.register(200, 2_000, master, LinkOp::CompanionRelease { rdev: 2_000 });
+        admitted.release(200);
+        assert_eq!(admitted.owed(), 2);
+        assert_eq!(seen(admitted.drain()), [("REGISTER", 2_000, ino)]);
+        admitted.tick();
+        assert_eq!(
+            seen(admitted.drain()),
+            [("COMPANION_RELEASE", 2_000, 0), ("RELEASE", 2_000, 0)]
+        );
+        assert!(matches!(
+            live_link_in(&mut admitted.state.lock().expect("state")),
+            Ok(Some(_))
+        ));
+
+        // A boot offer/handoff can already be held before this REGISTER is
+        // admitted. Keep that finite prior lifecycle's ordered release.
+        let prior = TestLink::bare();
+        prior.fill();
+        let (master, ino) = files.fd();
+        prior.register(250, 2_500, master, LinkOp::CompanionRelease { rdev: 2_500 });
+        prior
+            .state
+            .lock()
+            .expect("state")
+            .tracked
+            .get_mut(&250)
+            .expect("tracked")
+            .prior_claim = true;
+        prior.release(250);
+        assert_eq!(prior.owed(), 3, "the earlier keeper claim still must end");
+        assert!(seen(prior.drain()).is_empty());
+        prior.tick();
+        assert_eq!(
+            seen(prior.drain()),
+            [
+                ("REGISTER", 2_500, ino),
+                ("COMPANION_RELEASE", 2_500, 0),
+                ("RELEASE", 2_500, 0)
+            ]
+        );
+
+        // An unclaimed offer is not keyed by any local session id, including MAX.
+        let unclaimed = TestLink::bare();
+        unclaimed.fill();
+        send_in(
+            &mut unclaimed.state.lock().expect("state"),
+            None,
+            LinkOp::Release { rdev: 9_000 },
+        );
+        let (master, _) = files.fd();
+        unclaimed.register(
+            u64::MAX,
+            9_001,
+            master,
+            LinkOp::CompanionRelease { rdev: 9_001 },
+        );
+        unclaimed.release(u64::MAX);
+        assert_eq!(unclaimed.owed(), 1);
+        assert!(seen(unclaimed.drain()).is_empty());
+        unclaimed.tick();
+        assert_eq!(seen(unclaimed.drain()), [("RELEASE", 9_000, 0)]);
+
+        // Final exit supersedes unsent lifecycle work rather than bypassing it.
+        let quitting = TestLink::bare();
+        quitting.fill();
+        let (master, _) = files.fd();
+        quitting.register(300, 3_000, master, LinkOp::CompanionRelease { rdev: 3_000 });
+        let live = quit_link_in(&mut quitting.state.lock().expect("state"));
+        assert!(live.is_some());
+        assert_eq!(quitting.owed(), 0);
+        assert!(quitting.state.lock().expect("state").tracked.is_empty());
+        assert!(seen(quitting.drain()).is_empty());
+    }
+
+    /// A SESSION'S FIRST COMPANION A FULL QUEUE COULD NOT TAKE IS OWED, AND A LATER TICK
+    /// DELIVERS IT (R9 (a)). The queue takes the REGISTER and has no room for the COMPANION
+    /// behind it, the region's only custody descriptor: dropped (as `register` did), the
+    /// keeper holds the master with no region — the claim never settled, its poison window
+    /// open, a crash restoring the session blank. Now it is owed; a shed's replacement
+    /// offered meanwhile comes back (`Busy`: queued first, it would be overwritten by the
+    /// first region behind it, leaving the keeper on the superseded one); the next tick
+    /// queues the first region, and the replacement offered again follows it.
+    /// NEGATIVE CONTROL: the old `let _ = link.enqueue(op)` on the same queue: the keeper
+    /// reads the REGISTER and no COMPANION, then or after a tick.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_companion_a_full_queue_refused_is_owed_and_a_later_tick_delivers_it() {
+        let files = Files::new();
+        let link = TestLink::bare();
+        link.fill_but(1);
+        let (master, master_ino) = files.fd();
+        let (region, region_ino) = files.fd();
+        link.register(
+            7,
+            70,
+            master,
+            LinkOp::Companion {
+                rdev: 70,
+                region,
+                len: 4096,
+                receipt: None,
+            },
+        );
+        assert_eq!(link.owed(), 1, "the COMPANION is owed");
+        let (fresh, fresh_ino) = files.fd();
+        let fresh = match link.replace_companion(7, fresh, 4096) {
+            CompanionOffer::Busy(back) => back,
+            other => panic!("the replacement waits behind the first region: {other:?}"),
+        };
+        assert_eq!(
+            seen(link.drain()),
+            [("REGISTER", 70, master_ino)],
+            "the queue took the REGISTER alone"
+        );
+        link.tick();
+        assert_eq!(link.owed(), 0, "the tick queued what was owed");
+        assert!(matches!(
+            link.replace_companion(7, fresh, 4096),
+            CompanionOffer::Handed
+        ));
+        assert_eq!(
+            seen(link.drain()),
+            [("COMPANION", 70, region_ino), ("COMPANION", 70, fresh_ino)],
+            "the first region, then its replacement: the keeper ends on the fresh one"
+        );
+
+        // The old code, on the same queue.
+        link.fill_but(1);
+        let (master, master_ino) = files.fd();
+        let (region, _) = files.fd();
+        link.enqueue_dropping(LinkOp::Register {
+            master,
+            header: MasterHeader {
+                rdev: 80,
+                shell_pid: 1,
+                shell_birth: Birth {
+                    seconds: 1,
+                    micros: 0,
+                },
+                local_id: 8,
+            },
+            tag: Vec::new(),
+        });
+        link.enqueue_dropping(LinkOp::Companion {
+            rdev: 80,
+            region,
+            len: 4096,
+            receipt: None,
+        });
+        let first = seen(link.drain());
+        link.tick();
+        let later = seen(link.drain());
+        assert_eq!(
+            (first, later),
+            (vec![("REGISTER", 80, master_ino)], vec![]),
+            "control: `let _ = enqueue` leaves the master with no region"
+        );
+    }
+
+    /// A COMPANION_RELEASE A FULL QUEUE COULD NOT TAKE IS OWED, AND A LATER TICK DELIVERS IT
+    /// (R9 (a)). A journal that stopped (`SessionJournal::stop`) tells the keeper to drop the
+    /// session's region; dropped on a full queue (as `release_companion` did), the keeper
+    /// keeps the region that stopped mid-way and a crash restores it as if it were the
+    /// session's last state. Now it is owed and the next tick queues it. A RELEASE (a closed
+    /// tab) is owed the same way, behind it: dropped, the keeper keeps a stale copy of the
+    /// master (the shell is hung up regardless, F3) until the window ends, and a crash's
+    /// next launch is offered a dead one.
+    /// NEGATIVE CONTROL: the old `let _ = link.enqueue(op)` on the same full queue: the
+    /// keeper reads no COMPANION_RELEASE, then or after a tick.
+    #[cfg(unix)]
+    #[test]
+    fn a_companion_release_a_full_queue_refused_is_owed_and_a_later_tick_delivers_it() {
+        let link = TestLink::stalled(7, 70);
+        link.fill();
+        link.release_companion(7);
+        link.release(7);
+        assert_eq!(
+            link.owed(),
+            2,
+            "the COMPANION_RELEASE and the RELEASE are owed"
+        );
+        assert_eq!(
+            seen(link.drain()),
+            [],
+            "nothing reached the keeper meanwhile"
+        );
+        link.tick();
+        assert_eq!(link.owed(), 0, "the tick queued what was owed");
+        assert_eq!(
+            seen(link.drain()),
+            [("COMPANION_RELEASE", 70, 0), ("RELEASE", 70, 0)],
+            "the keeper drops the region, then the master"
+        );
+        link.release_companion(7);
+        assert_eq!(
+            (link.owed(), seen(link.drain())),
+            (0, vec![]),
+            "nothing for a session the link no longer carries"
+        );
+
+        // The old code, on the same full queue.
+        let link = TestLink::stalled(8, 80);
+        link.fill();
+        link.enqueue_dropping(LinkOp::CompanionRelease { rdev: 80 });
+        let first = seen(link.drain());
+        link.tick();
+        let later = seen(link.drain());
+        assert_eq!(
+            (first, later),
+            (vec![], vec![]),
+            "control: `let _ = enqueue` leaves the keeper on the stopped region"
+        );
+    }
+
+    /// PENDING refuses while older lifecycle work is external, even when waited
+    /// room is available. BYE supersedes that lifecycle and follows work already
+    /// in the channel. Ordinary admission on the same full queue still refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_waits_for_older_lifecycle_ops_and_a_bye_ends_them() {
+        let files = Files::new();
+        // The keeper fell behind while a tab opened, read since, and the META pump's next
+        // pass filled the place it freed with what was owed.
+        let behind = || {
+            let link = TestLink::bare();
+            link.fill();
+            let (master, master_ino) = files.fd();
+            link.register(7, 70, master, LinkOp::CompanionRelease { rdev: 70 });
+            assert_eq!(
+                link.owed(),
+                2,
+                "premise: the REGISTER and its claim's settle are owed"
+            );
+            link.fill_but(1);
+            link.tick();
+            assert_eq!(
+                link.owed(),
+                1,
+                "premise: the pass queued the REGISTER, and the queue is full again"
+            );
+            (link, master_ino)
+        };
+
+        let (link, master_ino) = behind();
+        assert!(
+            live_link_in(&mut link.state.lock().expect("state")).is_err(),
+            "PENDING does not overtake external lifecycle work"
+        );
+        assert!(!link.pending(9), "blocked before waited admission");
+        link.bye();
+        link.tick();
+        assert_eq!(
+            seen(link.drain()),
+            [("REGISTER", 70, master_ino), ("BYE", 0, 0)],
+            "no blocked PENDING was queued; terminal BYE follows admitted work"
+        );
+        assert_eq!(link.owed(), 0, "the BYE dropped what was owed");
+
+        let (link, master_ino) = behind();
+        link.enqueue_dropping(LinkOp::Bye);
+        assert_eq!(
+            seen(link.drain()),
+            [("REGISTER", 70, master_ino)],
+            "control: the full queue's ordinary admission takes no BYE"
+        );
     }
 }

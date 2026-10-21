@@ -231,8 +231,8 @@ kinds! {
     // Phase 5 (step 5C-1, ruling T21), appended so no kind moves: a worker's
     // task moved (`task rev= state= attention= why= code=`, the fact of the
     // timeline's `task-change` row: closed words and counters only). Local:
-    // never bus class, never journaled while D3 is off, no brief line. A
-    // reader without it maps it to `unknown`.
+    // never bus class, journaled with the rest of its session's log (D3, on
+    // by default), no brief line. A reader without it maps it to `unknown`.
     Task => "task",
 }
 
@@ -838,6 +838,10 @@ pub const WORD_WORDS: &[&str] = &[
     "escalate",
     "interrupt",
     "dispatch",
+    // a self-supervising agent's landing (`aterm_agent::harness::acts::
+    // self_claim_act`: codex-alab's `landed@v1`, FOREVER LAND), written only
+    // beside its `harness-act` row, never by `mark`
+    "landed",
     // verdict
     "on-track",
     "off-track",
@@ -881,7 +885,10 @@ pub const WHY_WORDS: &[&str] = &[
     "dropped",
     "unknown",
     // phase 5 (5C-1): what moved a worker's task (`task why=`), the closed
-    // `aterm-gui` task vocabulary, held by `task_record`'s tests (T16)
+    // `aterm-gui` task vocabulary, held by `task_record`'s tests (T16).
+    // `landed` is FOREVER LAND's one `done` reason; `marker` and `done-check`
+    // stay so an older build's lines still read.
+    "landed",
     "marker",
     "done-check",
     "exit",
@@ -898,6 +905,11 @@ pub const VERB_WORDS: &[&str] = &["send", "key", "paste", "feed", "turn", "unkno
 /// What a control input says it means for the box it dismisses (`key`/`send
 /// act=`, ruling T1): [`crate::ActWord`]'s words, in its order.
 pub const ACT_WORDS: &[&str] = &["approve", "deny", "answer"];
+
+/// Whose count an input mark's `dropped=` is when it is not the mark's
+/// author's own (`pool=`, Phase 6 step 6C-6, ruling U18): the mark
+/// limiter's shared pool ([`crate::Owed::Shared`]).
+pub const POOL_WORDS: &[&str] = &["shared"];
 
 /// A mail's direction.
 pub const DIR_WORDS: &[&str] = &["in", "out", "unknown"];
@@ -955,8 +967,9 @@ pub const STATE_WORDS: &[&str] = &[
 /// How the previous run of this instance ended (`start prev_end=` on the
 /// node log, 5J): `aterm_update::recovery_ledger::EndClass`'s row tokens, a
 /// caught signal as `signal` with its number in `code=`, and `-` while the
-/// recovery ledger has not been read (a launch that never reads it, a
-/// headless or dev one, keeps `-`).
+/// recovery ledger has not been read (a launch that never reads it, a plain
+/// headless or dev one, keeps `-`; a lab desk reads its private root's own,
+/// Phase 6 step 6C-4).
 pub const END_WORDS: &[&str] = &[
     "clean", "handoff", "killed", "signal", "panic", "running", "unknown", "none", "-",
 ];

@@ -203,7 +203,7 @@ pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
 /// a cleared flag alone does not prove inheritance or lack of another owner.
 pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
     use std::os::unix::fs::FileTypeExt as _;
-    let meta = std::fs::metadata(format!("/dev/fd/{fd}")).map_err(|e| {
+    let meta = descriptor_metadata(fd).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotConnected,
             format!("descriptor {fd} is not open ({e})"),
@@ -240,6 +240,43 @@ pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
     // immediately after its close-on-exec copy is made.
     let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
     inherited.try_clone()
+}
+
+/// What descriptor `fd` refers to, read from the descriptor itself: an `fstat` of the
+/// number as it stands, never copied and never closed. `EBADF` when the number is not
+/// open; any number may be asked, at any time. THE ONE READ OF A DESCRIPTOR BY NUMBER, for
+/// product code and Rust tests alike, in place of a path lookup of `/dev/fd/N` (or of
+/// `/proc/self/fd/N`); a shell asks with [`crate::host::sh_held_any`].
+///
+/// Never through a copy: Darwin kills a process that duplicates a descriptor guarded with
+/// `GUARD_DUP` (`EXC_GUARD`, SIGKILL; measured 2026-10-20), and such a guard is always this
+/// process's own (guarding forces close-on-exec), set by whatever opened it. `F_GETFD` and
+/// `fstat` are guarded by nothing.
+///
+/// Never `stat("/dev/fd/N")`: Darwin's devfs has ONE vnode per number, shared by every
+/// process. A `stat` of it has the descriptor's type stored in that vnode
+/// (`fdesc_getattr`) and then reads it back (`vn_stat`), while any other lookup of the
+/// same number, in any process or thread, resets it to `VNON` (`fdesc_allocvp`,
+/// `fdesc_inactive`); a reset landing between the two answers `EBADF` for an open
+/// descriptor. Measured 2026-10-20: with one other thread looking up `/dev/fd/3`, 6% of
+/// path `stat`s of an open fd 3 failed so, and 0 of 80 000 `fstat`s under heavier
+/// contention. `lstat` (`symlink_metadata`) and `Path::exists` race alike: with eight
+/// processes looking up `/dev/fd/105`, 8 958 `stat`s and 8 880 `lstat`s of 100 000 failed,
+/// while `access`, an `open` (read, write, or the shell's `>`) and a listing of `/dev/fd`
+/// failed none.
+///
+/// # Errors
+/// `EBADF` for a number that is not open.
+pub fn descriptor_metadata(fd: RawFd) -> io::Result<std::fs::Metadata> {
+    // SAFETY: `F_GETFD` reads one descriptor's flags and touches no memory.
+    if unsafe { fcntl(fd, F_GETFD) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is open (just answered), and the `File` is never dropped
+    // (`ManuallyDrop`): it names the number for one `fstat`, which changes nothing.
+    // Closed by another thread in between, the `fstat` answers `EBADF`.
+    let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    file.metadata()
 }
 
 /// The lowest number a source may sit on when the spawn places it: above every

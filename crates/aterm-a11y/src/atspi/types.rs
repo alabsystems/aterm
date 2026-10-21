@@ -283,6 +283,7 @@ pub(crate) enum Role {
     RadioMenuItem = 45,
     Slider = 51,
     StatusBar = 54,
+    Table = 55,
     Terminal = 60,
     ToggleButton = 62,
     Unknown = 67,
@@ -294,6 +295,7 @@ pub(crate) enum Role {
     Link = 88,
     ListBox = 98,
     Notification = 101,
+    LevelBar = 103,
     Landmark = 110,
     Static = 116,
 }

@@ -20,13 +20,15 @@ impl Scratch {
 
 /// `git <args>` in `dir`, hermetic (no system or global config), asserted ok.
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .expect("run git");
+    let out = aterm_uds::deadline::output_until(
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -769,12 +771,14 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     git(r.0.path(), &["config", "core.fsmonitor", "./evil.sh"]);
     let empty = r.0.path().join("empty.cfg");
     std::fs::write(&empty, "").unwrap();
-    let hidden = Command::new("git")
-        .args(["config", "--list"])
-        .current_dir(r.0.path())
-        .env("GIT_CONFIG", &empty)
-        .output()
-        .expect("git config");
+    let hidden = aterm_uds::deadline::output_until(
+        Command::new("git")
+            .args(["config", "--list"])
+            .current_dir(r.0.path())
+            .env("GIT_CONFIG", &empty),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("git config within the hang detector: {e}"));
     assert!(
         !String::from_utf8_lossy(&hidden.stdout).contains("core.fsmonitor"),
         "the control: GIT_CONFIG hides the repository's config"
@@ -868,16 +872,49 @@ fn a_worker_path_that_cannot_name_the_git_is_refused() {
 /// probe passes on.
 #[test]
 fn the_first_entry_of_a_variable_wins() {
+    use crate::harness::accounts::HOMEDIR_ENV;
     let env = WorkerEnv::from_env(vec![
         "CLAUDE_CONFIG_DIR=/a".to_string(),
         "CLAUDE_CONFIG_DIR=/b".to_string(),
-        "HOME=/h".to_string(),
+        format!("{HOMEDIR_ENV}=/h"),
     ]);
     assert_eq!(env.var("CLAUDE_CONFIG_DIR"), Some("/a"));
     let cwd = Path::new("/w");
     assert_eq!(env.claude_dir(cwd), Ok(PathBuf::from("/a")));
-    let home_only = WorkerEnv::from_env(vec!["HOME=/h".to_string()]);
+    let home_only = WorkerEnv::from_env(vec![format!("{HOMEDIR_ENV}=/h")]);
     assert_eq!(home_only.claude_dir(cwd), Ok(PathBuf::from("/h/.claude")));
+}
+
+/// A WORKER RESOLVES UNDER ITS OWN `os.homedir()`, the one variable it reads
+/// ([`crate::harness::accounts::HOMEDIR_ENV`]): on Windows its
+/// `USERPROFILE`, a scratch one included, EVEN BESIDE A `HOME` naming
+/// another folder (measured, `claude.exe` 2.1.304: it wrote under
+/// `USERPROFILE` and nothing under `HOME`); elsewhere its `HOME`. An empty
+/// one falls to the account's home. NEGATIVE CONTROL: the other variable
+/// alone names nothing (the account's home answers).
+#[test]
+fn a_worker_resolves_under_its_own_homedir() {
+    use crate::harness::accounts::HOMEDIR_ENV;
+    let cwd = Path::new("/w");
+    let (scratch, own, other) = if cfg!(windows) {
+        (r"C:\scratch\profile", "USERPROFILE", "HOME")
+    } else {
+        ("/scratch/profile", "HOME", "USERPROFILE")
+    };
+    assert_eq!(own, HOMEDIR_ENV);
+    let under_scratch = Path::new(scratch).join(".claude");
+    let account = atpkg::platform::account_home().map(|h| h.join(".claude"));
+    let worker = |env: &[String]| WorkerEnv::from_env(env.to_vec()).claude_dir(cwd);
+    assert_eq!(
+        worker(&[format!("{own}={scratch}")]),
+        Ok(under_scratch.clone())
+    );
+    assert_eq!(
+        worker(&[format!("{other}=/h"), format!("{own}={scratch}")]),
+        Ok(under_scratch.clone())
+    );
+    assert_eq!(worker(&[format!("{own}=")]).ok(), account);
+    assert_eq!(worker(&[format!("{other}={scratch}")]).ok(), account);
 }
 
 /// A set `CLAUDE_CONFIG_DIR` wins, a relative (or empty) one taken against the

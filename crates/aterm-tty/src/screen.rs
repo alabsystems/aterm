@@ -69,6 +69,15 @@ const REPLACEMENT: char = '\u{FFFD}';
 /// `CellExtra::MAX_COMBINING`, which `aterm_grapheme::GridColumns` mirrors.
 pub const MAX_JOINED: usize = 16;
 
+/// The most rows, and the most columns, a [`Screen`] holds: aterm's grid's
+/// `MAX_GRID_ROWS` and `MAX_GRID_COLS`. A terminal reports its own size, so a frame
+/// is clamped to this, as the grid is, and a `u16::MAX × u16::MAX` report cannot make
+/// it allocate billions of cells.
+pub const MAX_SIDE: u16 = 4096;
+
+/// The most cells a [`Screen`] holds: [`MAX_SIDE`] squared.
+const MAX_CELLS: usize = MAX_SIDE as usize * MAX_SIDE as usize;
+
 /// A colour from the terminal's own palette, so its theme applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum Color {
@@ -274,11 +283,26 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// A blank frame of `size`, laid out under the terminal's ambiguous-width policy,
-    /// with no cursor shown.
+    /// A blank frame of `size`, each side clamped to [`MAX_SIDE`], laid out under the
+    /// terminal's ambiguous-width policy, with no cursor shown.
     #[must_use]
     pub fn new(size: Size, ambiguous: AmbiguousWidth) -> Self {
+        let size = Size {
+            cols: if size.cols > MAX_SIDE {
+                MAX_SIDE
+            } else {
+                size.cols
+            },
+            rows: if size.rows > MAX_SIDE {
+                MAX_SIDE
+            } else {
+                size.rows
+            },
+        };
+        // Each side is clamped, so the product never exceeds `MAX_CELLS`; the check says
+        // so where the allocation's bound is proved.
         let count = usize::from(size.cols) * usize::from(size.rows);
+        let count = if count > MAX_CELLS { MAX_CELLS } else { count };
         Self {
             size,
             ambiguous,
@@ -322,7 +346,11 @@ impl Screen {
     /// The cell at `row`, `col`.
     #[must_use]
     pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
-        (row < self.size.rows && col < self.size.cols).then(|| &self.cells[self.index(row, col)])
+        if row < self.size.rows && col < self.size.cols {
+            self.cells.get(self.index(row, usize::from(col)))
+        } else {
+            None
+        }
     }
 
     /// Row `row` as text, a wide cell's right half adding nothing.
@@ -358,17 +386,19 @@ impl Screen {
         usize::from(self.size.cols)
     }
 
-    fn index(&self, row: u16, col: u16) -> usize {
-        usize::from(row) * self.cols() + usize::from(col)
+    /// Where `row`, `col` sits in `cells`. Every caller keeps `col` inside the row, so
+    /// the sum never saturates.
+    fn index(&self, row: u16, col: usize) -> usize {
+        (usize::from(row) * usize::from(self.size.cols)).saturating_add(col)
     }
 
     fn at(&mut self, row: u16, col: usize) -> &mut Cell {
-        let index = usize::from(row) * self.cols() + col;
+        let index = self.index(row, col);
         &mut self.cells[index]
     }
 
     fn get(&self, row: u16, col: usize) -> &Cell {
-        &self.cells[usize::from(row) * self.cols() + col]
+        &self.cells[self.index(row, col)]
     }
 
     /// The first column of the cell covering `col`.
@@ -394,12 +424,13 @@ impl Screen {
     /// overwritten, a wide cell whose right half was.
     fn mend(&mut self, row: u16, from: usize, to: usize) {
         let cols = self.cols();
-        for col in from..=to.min(cols - 1) {
+        for col in from..=to.min(cols.saturating_sub(1)) {
             let cell = self.get(row, col);
             let orphan = if cell.is_continuation() {
                 col == 0 || self.get(row, col - 1).width != 2
             } else {
-                cell.width == 2 && (col + 1 >= cols || !self.get(row, col + 1).is_continuation())
+                let right = col.saturating_add(1);
+                cell.width == 2 && (right >= cols || !self.get(row, right).is_continuation())
             };
             if orphan {
                 let style = cell.style;
@@ -435,7 +466,7 @@ impl Screen {
                 }
                 origin = head;
                 current = Some(head);
-                debug_assert_eq!(origin + walker.column(), start);
+                debug_assert_eq!(origin.saturating_add(walker.column()), start);
             }
         }
 
@@ -443,9 +474,11 @@ impl Screen {
             let c = if c.is_control() { REPLACEMENT } else { c };
             let mut next = walker.clone();
             match next.step(c) {
+                // Column sums stay inside the row (a put stops at its edge), so none
+                // saturates.
                 GridStep::Opens { col, width } => {
-                    let at = origin + col;
-                    if at + width > cols {
+                    let at = origin.saturating_add(col);
+                    if at.saturating_add(width) > cols {
                         break;
                     }
                     *self.at(row, at) = Cell {
@@ -455,12 +488,12 @@ impl Screen {
                         style,
                     };
                     if width == 2 {
-                        *self.at(row, at + 1) = Cell::continuation(style);
+                        *self.at(row, at.saturating_add(1)) = Cell::continuation(style);
                     }
                     current = Some(at);
                 }
                 GridStep::Folds { col } => {
-                    let cell = self.at(row, origin + col);
+                    let cell = self.at(row, origin.saturating_add(col));
                     if cell.is_full() {
                         continue;
                     }
@@ -484,18 +517,19 @@ impl Screen {
                         cell.text.push(c);
                         cell.width = 1;
                         cell.narrowed = true;
-                        *self.at(row, at + 1) = Cell::blank(Style::default());
-                        current = Some(at + 1);
+                        let right = at.saturating_add(1);
+                        *self.at(row, right) = Cell::blank(Style::default());
+                        current = Some(right);
                     } else if widened {
                         // The grid widens nothing at the last column.
-                        if at + 2 > cols {
+                        if at.saturating_add(2) > cols {
                             break;
                         }
                         let cell = self.at(row, at);
                         cell.text.push(c);
                         cell.width = 2;
                         let style = cell.style;
-                        *self.at(row, at + 1) = Cell::continuation(style);
+                        *self.at(row, at.saturating_add(1)) = Cell::continuation(style);
                     } else {
                         self.at(row, at).text.push(c);
                     }
@@ -503,7 +537,7 @@ impl Screen {
             }
             walker = next;
         }
-        let end = (origin + walker.column()).min(cols);
+        let end = origin.saturating_add(walker.column()).min(cols);
         self.mend(row, start.saturating_sub(1), end);
 
         // The cell after the put would join its last cell were the two written in a row.
@@ -514,7 +548,7 @@ impl Screen {
                 && matches!(walker.clone().step(base), GridStep::Folds { .. })
             {
                 let (style, width) = (right.style, usize::from(right.width));
-                for col in end..end + width {
+                for col in end..end.saturating_add(width) {
                     *self.at(row, col) = Cell::blank(style);
                 }
             }
@@ -546,10 +580,11 @@ impl Screen {
         let mut col = self.head(row, usize::from(from));
         while col < to {
             let width = usize::from(self.get(row, col).width).max(1);
-            for part in col..col + width {
+            let next = col.saturating_add(width);
+            for part in col..next {
                 self.at(row, part).style = style;
             }
-            col += width;
+            col = next;
         }
     }
 }
@@ -624,9 +659,10 @@ impl Painter<'_> {
                 p.out.extend_from_slice(CLEAR);
                 p.at = Some(Pos { row: 0, col: 0 });
             }
-            let cols = next.cols();
+            let cols = usize::from(next.size.cols);
             for row in 0..next.size.rows {
-                let span = usize::from(row) * cols..(usize::from(row) + 1) * cols;
+                let start = usize::from(row) * cols;
+                let span = start..start.saturating_add(cols);
                 if prev.cells[span.clone()] != next.cells[span] {
                     p.row(prev, row);
                 }
@@ -656,22 +692,30 @@ impl Painter<'_> {
     /// Rewrite the cells of `row` that differ from `prev`'s.
     fn row(&mut self, prev: &Screen, row: u16) {
         let next = self.next;
-        let cols = next.cols();
+        let cols = usize::from(next.size.cols);
         let mut need: Vec<bool> = (0..cols)
             .map(|col| next.get(row, col) != prev.get(row, col))
             .collect();
         for col in 0..cols {
-            // A changed right half is written with its wide cell; writing a narrowed cell
-            // empties the column after it, which is written again when it holds more.
-            if need[col] && next.get(row, col).is_continuation() {
-                need[col - 1] = true;
+            if need.get(col) != Some(&true) {
+                continue;
             }
-            if need[col]
-                && next.get(row, col).narrowed
-                && col + 1 < cols
-                && !next.get(row, col + 1).is_erased()
+            // A changed right half is written with its wide cell (a frame's first column
+            // is never one); writing a narrowed cell empties the column after it, which
+            // is written again when it holds more.
+            let cell = next.get(row, col);
+            if cell.is_continuation()
+                && let Some(left) = col.checked_sub(1).and_then(|left| need.get_mut(left))
             {
-                need[col + 1] = true;
+                *left = true;
+            }
+            let right = col.saturating_add(1);
+            if cell.narrowed
+                && right < cols
+                && !next.get(row, right).is_erased()
+                && let Some(right) = need.get_mut(right)
+            {
+                *right = true;
             }
         }
         // The row's blank tail, which one EL can write.
@@ -680,7 +724,8 @@ impl Painter<'_> {
             tail -= 1;
         }
         let needed = |from: usize| {
-            (from..cols).find(|&col| need[col] && !next.get(row, col).is_continuation())
+            (from..cols)
+                .find(|&col| need.get(col) == Some(&true) && !next.get(row, col).is_continuation())
         };
         let mut col = 0;
         while let Some(at) = needed(col) {
@@ -690,7 +735,7 @@ impl Painter<'_> {
             }
             self.reach(row, at);
             self.cell(row, at);
-            col = at + usize::from(next.get(row, at).width);
+            col = at.saturating_add(usize::from(next.get(row, at).width));
         }
     }
 
@@ -712,9 +757,11 @@ impl Painter<'_> {
                     cost = usize::MAX;
                     break;
                 }
-                cost += sgr_bytes(sgr, cell.style).len() + cell.text.len();
+                cost = cost
+                    .saturating_add(sgr_bytes(sgr, cell.style).len())
+                    .saturating_add(cell.text.len());
                 sgr = cell.style;
-                gap += usize::from(cell.width);
+                gap = gap.saturating_add(usize::from(cell.width));
             }
             let pos = Pos {
                 row,
@@ -724,7 +771,7 @@ impl Painter<'_> {
                 let mut through = from;
                 while through < at {
                     self.cell(row, through);
-                    through += usize::from(next.get(row, through).width);
+                    through = through.saturating_add(usize::from(next.get(row, through).width));
                 }
                 return;
             }
@@ -738,8 +785,11 @@ impl Painter<'_> {
     /// The cells from `at` to the end of `row` are blank in the default style: one EL,
     /// or the few spaces that are shorter.
     fn erase_tail(&mut self, row: u16, at: usize, need: &[bool]) {
-        let last = (at..need.len()).rev().find(|&col| need[col]).unwrap_or(at);
-        let spaces = last + 1 - at;
+        let last = (at..need.len())
+            .rev()
+            .find(|&col| need.get(col) == Some(&true))
+            .unwrap_or(at);
+        let spaces = last.saturating_sub(at).saturating_add(1);
         self.reach(row, at);
         self.style(Style::default());
         if spaces < ERASE_LINE.len() {
@@ -756,7 +806,7 @@ impl Painter<'_> {
         let cell = self.next.get(row, col);
         self.style(cell.style);
         self.out.extend_from_slice(cell.text.as_bytes());
-        let end = col + cell.footprint();
+        let end = col.saturating_add(cell.footprint());
         self.at = (end < self.next.cols()).then(|| Pos {
             row,
             col: u16::try_from(end).unwrap_or(u16::MAX),
@@ -789,8 +839,10 @@ fn moves(from: Option<Pos>, to: Pos) -> Vec<u8> {
             best = bytes;
         }
     };
+    // Widened, so a 1-based column or the row after one cannot overflow.
+    let (from_row, to_row) = (u32::from(from.row), u32::from(to.row));
     if from.row == to.row {
-        let (a, b) = (from.col, to.col);
+        let (a, b) = (u32::from(from.col), u32::from(to.col));
         if b > a {
             consider(csi_n(b - a, b'C'));
         } else {
@@ -803,19 +855,19 @@ fn moves(from: Option<Pos>, to: Pos) -> Vec<u8> {
         }
         consider(csi_n(b + 1, b'G'));
     } else if from.col == to.col {
-        if to.row > from.row {
-            consider(csi_n(to.row - from.row, b'B'));
+        if to_row > from_row {
+            consider(csi_n(to_row - from_row, b'B'));
         } else {
-            consider(csi_n(from.row - to.row, b'A'));
+            consider(csi_n(from_row - to_row, b'A'));
         }
-    } else if to.col == 0 && to.row == from.row + 1 {
+    } else if to.col == 0 && to_row == from_row + 1 {
         consider(b"\r\n".to_vec());
     }
     best
 }
 
 /// `CSI n <final>`, the 1 left out.
-fn csi_n(n: u16, final_byte: u8) -> Vec<u8> {
+fn csi_n(n: u32, final_byte: u8) -> Vec<u8> {
     let mut out = b"\x1b[".to_vec();
     if n != 1 {
         out.extend_from_slice(n.to_string().as_bytes());
@@ -828,11 +880,11 @@ fn csi_n(n: u16, final_byte: u8) -> Vec<u8> {
 fn csi_pos(to: Pos) -> Vec<u8> {
     let mut out = b"\x1b[".to_vec();
     if to.row != 0 || to.col != 0 {
-        out.extend_from_slice((to.row + 1).to_string().as_bytes());
+        out.extend_from_slice((u32::from(to.row) + 1).to_string().as_bytes());
     }
     if to.col != 0 {
         out.push(b';');
-        out.extend_from_slice((to.col + 1).to_string().as_bytes());
+        out.extend_from_slice((u32::from(to.col) + 1).to_string().as_bytes());
     }
     out.push(b'H');
     out
@@ -920,7 +972,7 @@ fn sgr_encode(params: &[u16]) -> Vec<u8> {
 mod tests {
     use aterm_types::text_shaping::AmbiguousWidth;
 
-    use super::{Attrs, Color, MAX_JOINED, Pos, Screen, Style, moves, sgr_bytes};
+    use super::{Attrs, Color, MAX_JOINED, MAX_SIDE, Pos, Screen, Style, moves, sgr_bytes};
     use crate::tty::Size;
 
     fn screen(cols: u16) -> Screen {
@@ -1011,6 +1063,27 @@ mod tests {
         };
         assert_eq!(sgr_bytes(Style::default(), grey), b"\x1b[48;5;236m");
         assert_eq!(sgr_bytes(grey, grey), b"");
+    }
+
+    #[test]
+    fn a_frame_is_clamped_to_the_grid_size_limit() {
+        let huge = Size {
+            cols: u16::MAX,
+            rows: 2,
+        };
+        let mut s = Screen::new(huge, AmbiguousWidth::Single);
+        assert_eq!(s.size().cols, MAX_SIDE);
+        assert_eq!(s.size().rows, 2);
+        assert!(s.cell(1, MAX_SIDE - 1).is_some());
+        assert!(s.cell(1, MAX_SIDE).is_none());
+        s.set_cursor(Some(Pos { row: 1, col: 2 }));
+        s.resize(Size {
+            cols: 3,
+            rows: u16::MAX,
+        });
+        assert_eq!(s.size().rows, MAX_SIDE);
+        assert_eq!(s.size().cols, 3);
+        assert_eq!(s.cursor(), Some(Pos { row: 1, col: 2 }));
     }
 
     #[test]

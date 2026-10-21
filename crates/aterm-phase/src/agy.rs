@@ -760,6 +760,132 @@ fn is_card_row(row: &str) -> bool {
 /// own rows (an interrupt, an error, a tool row and its output).
 #[must_use]
 pub fn said_tail(rows: &[String]) -> Option<String> {
+    said_reply(rows).map(|(_, said)| said)
+}
+
+/// WHETHER THE REPLY [`said_tail`] READS IS WHOLE ON `rows`: the row above
+/// its first is one of them and no part of it — the person's message it
+/// answers, or agy's own row. `false` for a reply whose rows reach the top
+/// of `rows` (taller than them: its tail is then the rows in sight, and what
+/// stood above them — a need, an open item — is not in it), and for one
+/// under a caret row on the top row, whose rule above (what makes it a
+/// person's message, [`is_user_row`]) is not on `rows`: the rows the
+/// message wrapped onto, two columns in as a reply's, read as the reply's.
+/// `false` too where there are no last words.
+#[must_use]
+pub fn said_whole(rows: &[String]) -> bool {
+    said_reply(rows).is_some_and(|(head, _)| head > 1 || (head == 1 && !is_caret_row(&rows[0])))
+}
+
+/// A row a read of the history above the screen stops at, for a reply
+/// [`said_whole`] finds cut: one that opens in column 0 with words, but no
+/// caret row — the rule above a person's message is, which makes it theirs
+/// ([`is_user_row`]).
+#[must_use]
+pub fn said_history_stop(row: &str) -> bool {
+    !row.is_empty() && !row.starts_with(char::is_whitespace) && !is_caret_row(row)
+}
+
+/// THE AGENT'S OTHER WORDS IN THE TURN ITS LAST WORDS END ([`said_tail`]):
+/// every reply of the same turn above its last — the words it said before a
+/// tool call, say — oldest first, each as [`said_tail`] reads one (its
+/// indent stripped, one line per row), joined by a blank line. A reply is a
+/// run of rows two columns in, blank rows among them, between agy's own
+/// rows in column 0 (a tool's `●` row, a thought's `○` row, a box's
+/// remains); a run drawn right under a `●` or `○` row is that row's output.
+/// The turn is the rows under the person's last message, or from the rows'
+/// top where it is above them. `None` where the turn holds no other reply
+/// on `rows`, or there are no last words.
+#[must_use]
+pub fn turn_said_before(rows: &[String]) -> Option<String> {
+    let (_, said) = turn_before(rows)?;
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+/// WHETHER THE TURN [`said_tail`]'s REPLY ENDS IS WHOLE ON `rows`: the reply
+/// is ([`said_whole`]), and so is the person's message that opened the turn
+/// (its caret row under its rule, [`is_user_row`]). `false` where the turn
+/// reaches the rows' top: an earlier reply of the turn, and a need said in
+/// it, may stand above them.
+#[must_use]
+pub fn turn_whole(rows: &[String]) -> bool {
+    said_whole(rows) && turn_before(rows).is_some_and(|(opened, _)| opened)
+}
+
+/// A row a read of the history above the screen stops at, for a turn
+/// [`turn_whole`] finds cut: a plain rule, the turn's separator over the
+/// person's message that opened it, read walking up — the message is under
+/// it.
+#[must_use]
+pub fn turn_history_stop(row: &str) -> bool {
+    plain_rule_width(row).is_some()
+}
+
+/// THE MESSAGE THAT OPENED THE TURN [`said_tail`]'s REPLY ENDS: the person's
+/// last message (its caret row under its rule, [`is_user_row`], the `>`
+/// stripped) and the rows it wrapped onto, up to the blank row under it,
+/// joined by a space. `None` where there are no last words, and where that
+/// message is not on `rows`.
+#[must_use]
+pub fn turn_opened_by(rows: &[String]) -> Option<String> {
+    said_reply(rows)?;
+    let f = frame(rows)?;
+    let user = last_user(rows, f.top)?;
+    let end = (user + 1..f.top)
+        .find(|&i| blank(&rows[i]))
+        .unwrap_or(f.top);
+    let text: Vec<&str> = std::iter::once(rows[user].get(1..).unwrap_or(""))
+        .chain(rows[user + 1..end].iter().map(String::as_str))
+        .map(crate::text::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    Some(text.join(" "))
+}
+
+/// The turn [`turn_said_before`] reads: whether the person's message that
+/// opened it is on `rows` ([`turn_whole`]), and the words of its other
+/// replies, oldest first. `None` where there are no last words.
+fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
+    let f = frame(rows)?;
+    let (head, _) = said_reply(rows)?;
+    let user = last_user(rows, f.top);
+    let from = user.map_or(0, |u| {
+        (u + 1..f.top).find(|&i| blank(&rows[i])).unwrap_or(f.top)
+    });
+    let mut said = Vec::new();
+    let mut at = from;
+    while at < head {
+        if !is_reply_row(&rows[at]) {
+            at += 1;
+            continue;
+        }
+        // A run of reply rows and blank rows, up to agy's next own row.
+        let start = at;
+        let mut last = at;
+        while at < head && (is_reply_row(&rows[at]) || blank(&rows[at])) {
+            if !blank(&rows[at]) {
+                last = at;
+            }
+            at += 1;
+        }
+        // A tool row's own output is drawn right under it.
+        let output = start > 0 && crate::text::trim_start(&rows[start - 1]).starts_with(['●', '○']);
+        if !output {
+            let words: Vec<&str> = rows[start..=last]
+                .iter()
+                .map(|r| crate::text::trim(r))
+                .filter(|t| !t.is_empty())
+                .collect();
+            said.push(words.join("\n"));
+        }
+    }
+    Some((user.is_some(), said))
+}
+
+/// The reply [`said_tail`] reads, as `(the row its walk up stopped at — the
+/// first under the row that bounds it, 0 where nothing on the rows does —,
+/// its words)`.
+fn said_reply(rows: &[String]) -> Option<(usize, String)> {
     let f = frame(rows)?;
     if spinning(rows, f.top) {
         return None;
@@ -795,7 +921,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
         .map(|r| crate::text::trim(r))
         .filter(|t| !t.is_empty())
         .collect();
-    Some(out.join("\n"))
+    Some((head, out.join("\n")))
 }
 
 /// Whether a PERSON stopped the last turn: under the last message, agy's `⎿
@@ -1688,6 +1814,15 @@ fn agy_feet_row(row: &str, text_col: usize) -> Option<usize> {
     }
 }
 
+/// agy's banner is not known to print its running build: every recorded
+/// card reads 1.4.0, captured while the store held 1.4.1 and 1.4.2
+/// (`crate::BannerBuild::ProvenanceOnly`).
+pub const LAUNCH_CARD_BUILD: crate::BannerBuild = crate::BannerBuild::ProvenanceOnly;
+
+/// The rows [`launch_card_scan`] reads of a card from its banner down: the
+/// banner, three mascot rows and the feet row under them.
+pub const LAUNCH_CARD_ROWS: usize = 5;
+
 fn agy_card_at(rows: &[String], top: usize) -> Option<CardPlace> {
     if top + 4 >= rows.len() {
         return None;
@@ -1779,54 +1914,104 @@ fn parse_agy_model_row(text: &str) -> Option<(String, Option<String>)> {
 
 fn parse_agy_footer_model(row: &str) -> Option<(String, Option<String>)> {
     let t = crate::text::trim_end(row);
-    let (model_part, effort_part) = t.rsplit_once(" \u{00B7} ")?;
-    let effort = crate::text::trim(effort_part).to_ascii_lowercase();
-    if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+    let right = t.rsplit("  ").next().map(crate::text::trim)?;
+    let mut parts = right.split(" \u{00B7} ").map(crate::text::trim);
+    let model = parts
+        .next()
+        .filter(|m| !m.is_empty() && *m != "(initializing...)" && !m.starts_with('?'))?;
+    let effort = parts
+        .next()
+        .map(str::to_ascii_lowercase)
+        .filter(|e| matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max"))?;
+    Some((model.to_owned(), Some(effort)))
+}
+
+/// The signed-in email and optional subscription plan on agy's launch card
+/// (`user@example.com (Google AI Ultra)` on row `place.top + 1`).
+#[must_use]
+pub fn launch_card_account(rows: &[String]) -> Option<(String, Option<String>)> {
+    let f = frame(rows)?;
+    let (_, place) = launch_card_scan(&rows[..f.top]);
+    let p = place?;
+    let (_, after) = split_at_col(rows.get(p.top + 1)?, p.text_col)?;
+    let t = crate::text::trim(after);
+    if t.is_empty() || t.contains('\u{2026}') {
         return None;
     }
-    let model = model_part
-        .rsplit("  ")
-        .next()
-        .map(crate::text::trim)
-        .filter(|m| !m.is_empty())?;
-    Some((model.to_owned(), Some(effort)))
+    if let Some((email, plan)) = t.strip_suffix(')').and_then(|s| s.rsplit_once(" (")) {
+        let email = crate::text::trim(email);
+        let plan = crate::text::trim(plan);
+        if email.contains('@') && !email.chars().any(char::is_whitespace) {
+            return Some((
+                email.to_owned(),
+                (!plan.is_empty()).then(|| plan.to_owned()),
+            ));
+        }
+    }
+    if t.contains('@') && !t.chars().any(char::is_whitespace) {
+        return Some((t.to_owned(), None));
+    }
+    None
 }
 
 /// agy's launch card and live footer model/effort for the harness footer.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
+    launch_card_read(rows).map(|read| read.card)
+}
+
+/// [`launch_card`] with the rows it was read from
+/// ([`crate::LaunchCardRead`]): the card's banner row where its version (and
+/// its model, with no footer to name one) came from the card, and the live
+/// footer's row where the model came from there. Never panics, on any rows.
+#[must_use]
+pub fn launch_card_read(rows: &[String]) -> Option<crate::LaunchCardRead> {
     let f = frame(rows)?;
     let footer_model = f
         .footer
-        .and_then(|r| rows.get(r))
-        .and_then(|r| parse_agy_footer_model(r));
+        .and_then(|r| Some((r, parse_agy_footer_model(rows.get(r)?)?)));
     let (_, place) = launch_card_scan(&rows[..f.top]);
     let card_info = place.and_then(|p| {
         let ver = launch_card_version(rows, &p)?.to_owned();
         let (_, after) = split_at_col(rows.get(p.top + 2)?, p.text_col)?;
         let (model, effort) = parse_agy_model_row(after)?;
-        Some((ver, model, effort))
+        Some((p.top, ver, model, effort))
     });
-    match (card_info, footer_model) {
-        (Some((version, _card_model, card_effort)), Some((f_model, f_effort))) => {
-            Some(LaunchCard {
+    let (card, banner, status) = match (card_info, footer_model) {
+        (Some((top, version, _card_model, card_effort)), Some((row, (f_model, f_effort)))) => (
+            LaunchCard {
                 version,
                 model: f_model,
                 effort: f_effort.or(card_effort),
-            })
-        }
-        (Some((version, model, effort)), None) => Some(LaunchCard {
-            version,
-            model,
-            effort,
-        }),
-        (None, Some((model, effort))) => Some(LaunchCard {
-            version: String::new(),
-            model,
-            effort,
-        }),
-        (None, None) => None,
-    }
+            },
+            Some(top),
+            Some(row),
+        ),
+        (Some((top, version, model, effort)), None) => (
+            LaunchCard {
+                version,
+                model,
+                effort,
+            },
+            Some(top),
+            None,
+        ),
+        (None, Some((row, (model, effort)))) => (
+            LaunchCard {
+                version: String::new(),
+                model,
+                effort,
+            },
+            None,
+            Some(row),
+        ),
+        (None, None) => return None,
+    };
+    Some(crate::LaunchCardRead {
+        card,
+        banner,
+        status,
+    })
 }
 
 /// agy's screens, measured, for this crate's tests and a dependent crate's

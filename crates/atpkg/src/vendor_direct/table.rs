@@ -169,10 +169,13 @@ pub struct VendorSpec {
     /// `--yolo` typed ahead of one expands there too. Each must pass
     /// [`crate::selfupdate::is_shell_safe_verb`].
     pub yolo_after: &'static [&'static str],
-    /// First words (subcommands) that are not sessions and take no safety
-    /// switches, so the default injection leaves them as typed (muse's
-    /// `skills`, `auth`, …: switches in front are `invalid TUI options`,
-    /// measured 1.4.11, 2026-10-19). Each must pass
+    /// First words (subcommands) the default injection never lands on: words
+    /// that are not sessions and take no safety switches (muse's `skills`,
+    /// `auth`, …: switches in front are `invalid TUI options`, measured
+    /// 1.4.11, 2026-10-19), and words whose launch's posture the SESSION owns
+    /// (a resume: the flags would override the choice the session kept). A
+    /// word may also sit in [`Self::yolo_after`] (muse's `resume`): there an
+    /// explicit `--yolo` still expands, behind the word. Each must pass
     /// [`crate::selfupdate::is_shell_safe_verb`].
     pub yolo_skip: &'static [&'static str],
     /// Whether aterm's live upgrade moves a running session of this program onto a build a
@@ -372,11 +375,37 @@ pub const VENDORS: &[VendorSpec] = &[
         // `--yolo` itself is an unknown option to claude (measured 2.1.304,
         // 2026-10-19).
         yolo_flags: &["--dangerously-skip-permissions"],
+        // The mode words, the prompt handler, restricted mode, a tool
+        // allow/deny list, a settings source (it can carry the mode), and a
+        // resume — a session's own posture, which the harness restates on its
+        // relaunch lines — each in every spelling the CLI takes.
         yolo_markers: &[
             "--dangerously-skip-permissions",
             "--allow-dangerously-skip-permissions",
             "--permission-mode",
             "--permission-mode=",
+            "--permission-prompts",
+            "--permission-prompts=",
+            "--restricted",
+            "--allowedTools",
+            "--allowedTools=",
+            "--allowed-tools",
+            "--allowed-tools=",
+            "--disallowedTools",
+            "--disallowedTools=",
+            "--disallowed-tools",
+            "--disallowed-tools=",
+            "--tools",
+            "--tools=",
+            "--settings",
+            "--settings=",
+            "--setting-sources",
+            "--setting-sources=",
+            "--resume",
+            "--resume=",
+            "-r",
+            "--continue",
+            "-c",
         ],
         // Global options ride in front of every subcommand measured (mcp, doctor,
         // 2.1.304).
@@ -440,6 +469,11 @@ pub const VENDORS: &[VendorSpec] = &[
         yolo_flags: &["--dangerously-bypass-approvals-and-sandbox"],
         // The bypass flag repeated is a clap refusal (exit 2, measured 0.163), so
         // its presence must suppress any second copy, by the flag or by default.
+        // The sandbox/approval words (attached short spellings included, by
+        // `yolo::marker_matches` — `-sread-only` is `-s read-only` to clap),
+        // and the two config carriers: a `-c` override or a `--profile` can
+        // spell the launch's whole posture (`sandbox_mode=`, measured in the
+        // harness's own relaunch corpus), so either leaves the launch typed.
         yolo_markers: &[
             "--dangerously-bypass-approvals-and-sandbox",
             "--sandbox",
@@ -448,9 +482,18 @@ pub const VENDORS: &[VendorSpec] = &[
             "--ask-for-approval",
             "--ask-for-approval=",
             "-a",
+            "--approve-for-me",
+            "--config",
+            "--config=",
+            "-c",
+            "--profile",
+            "--profile=",
+            "-p",
         ],
         yolo_after: &[],
-        yolo_skip: &[],
+        // A resumed or forked thread keeps its own settings; the default
+        // never overrides them (an explicit `--yolo` still expands).
+        yolo_skip: &["resume", "fork"],
         live_upgrade: true,
         revision_versions: false,
         floor: floor(0, 156, 1),
@@ -552,6 +595,9 @@ pub const VENDORS: &[VendorSpec] = &[
             "--trust-workspace",
             "--disable-request-user-input",
         ],
+        // The approval/sandbox words, its restriction switches, the network
+        // mode and judge (the session's permission snapshot, `upgrade_muse`),
+        // and a `-c` setting, which can spell any of them for the run.
         yolo_markers: &[
             "--disable-approval",
             "--disable-sandbox",
@@ -561,12 +607,24 @@ pub const VENDORS: &[VendorSpec] = &[
             "--approval-mode=",
             "--permission-profile",
             "--permission-profile=",
+            "--approval-judge",
+            "--approval-judge=",
+            "--sandbox-network",
+            "--sandbox-network=",
+            "--disable-write",
+            "--disable-shell",
+            "--config",
+            "--config=",
+            "-c",
         ],
         // Top-level switches AHEAD of a subcommand are `invalid TUI options`
         // (measured 1.4.11): `exec` and `resume` take them behind the word, the
         // rest take none at all.
         yolo_after: &["exec", "resume"],
         yolo_skip: &[
+            // The session keeps its permission mode (measured, `upgrade_muse`):
+            // the default never lands on a resume, an explicit `--yolo` does.
+            "resume",
             "config",
             "export",
             "trace",

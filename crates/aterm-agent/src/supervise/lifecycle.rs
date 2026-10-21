@@ -38,7 +38,7 @@
 use super::super::journal::{
     ADOPTED, AGAIN_UNPARKED, ATTENTION_SKIPPED, CLEARED_HIDDEN, CLEARED_STALE, ESCALATED_BEHIND,
 };
-use super::escalate::{point_label, status_field};
+use super::escalate::{NEEDS_LEFT, kinds_name_owner, point_label, status_field};
 use super::*;
 
 /// The `<why>` of the `CLEARED seq=<n> attention=<said> <why>` line that takes
@@ -417,6 +417,19 @@ impl<C: Ctl> Session<'_, C> {
     /// settles nothing: a loop that never read the word would take the host
     /// for one that keeps none, so a park on the table's `off` would ask it
     /// nothing again and never end on the session's word.
+    ///
+    /// A NEEDS YOU ENTRY A LOOP BEFORE THIS ONE LEFT (owner `needs`, read by
+    /// `attention_kinds=`: a loop that crashed or was killed, an update's old
+    /// loop that ended before its last act) is this loop's to settle, or the
+    /// menu bar would say "needs you" for ever: no loop would ever have put
+    /// it up, so none would take it down. It is told as this loop's, keyed by
+    /// no set ([`NEEDS_LEFT`]): the first point decides it — its own needs
+    /// put up where one stands (the entry replaced), else taken down,
+    /// journaled `CLEARED seq=<n> needs attention=<reply> no need stands at
+    /// the loop's start` — and an Off park or the loop's end before that
+    /// point takes it down as its own. Behind another supervisor's claim
+    /// (beside a proven self-claim, whose agent raises its own) it is never
+    /// touched.
     pub(super) fn reconcile(&mut self, review: &mut dyn Review) -> Result<(), Fail> {
         let read = self.call(&["meta"])?;
         if self.unserved(&read) {
@@ -426,8 +439,14 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         self.note_meta(&read.stdout);
-        if self.claim.watching_behind().is_some() {
+        if self.needs_not_ours() {
             return Ok(());
+        }
+        if self.needs_told.is_none()
+            && status_field(&read.stdout, "attention_kinds")
+                .is_some_and(|kinds| kinds_name_owner(kinds, NEEDS_ATTENTION_OWNER))
+        {
+            self.needs_told = Some(NEEDS_LEFT);
         }
         let shown_owner =
             status_field(&read.stdout, "attention_owner").map(super::super::report::pct_decode);
@@ -500,7 +519,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A watch's last act: the badges it raised — a point's, a limit's, the
-    /// turn-end policy's — are cleared if they are still its own, each
+    /// turn-end policy's, the worker's NEEDS YOU entry ([`Self::needs_down`])
+    /// — are cleared if they are still its own, each
     /// journaled `CLEARED` (the turn-end policy's `CLEARED seq=<n> turn-end
     /// attention=<said>`, so the harness's stats close the person's wait it
     /// opened on its own line, not on the loop's end), and the claim is
@@ -520,6 +540,8 @@ impl<C: Ctl> Session<'_, C> {
                 "CLEARED seq={seq} {CLEARED_TURN_END} attention={said}"
             ));
         }
+        // The worker's NEEDS YOU goes with the loop that put it up.
+        let _ = self.needs_down(seq, "the loop ended", review);
         self.release_claim();
     }
 
@@ -530,8 +552,10 @@ impl<C: Ctl> Session<'_, C> {
     /// `CLEARED seq=<n> box attention=<said>`), a limit episode's
     /// ([`Self::close_episode`], `CLEARED seq=<n> attention=<said> <why>`),
     /// a limit's adopted from a previous loop whose episode has not opened
-    /// yet (the same line, while its badge is still the loop's entry), and
-    /// the turn-end policy's (`CLEARED seq=<n> turn-end attention=<said>`).
+    /// yet (the same line, while its badge is still the loop's entry), the
+    /// turn-end policy's (`CLEARED seq=<n> turn-end attention=<said>`), and
+    /// the worker's NEEDS YOU entry (`CLEARED seq=<n> needs attention=<said>
+    /// <why>`, [`Self::needs_down`]), which is not kept for after the park.
     ///
     /// What the point decided afresh after the park would not say again is
     /// kept for it. A box's or a question's point escalates again where it
@@ -572,6 +596,10 @@ impl<C: Ctl> Session<'_, C> {
             ));
             self.badge_parked = text;
         }
+        // NO NEED STANDS UNDER OFF: the person drives the session, and the
+        // policy's park drops the set (`TurnEndState::park_off`), so nothing
+        // puts it up again after the park unless the worker names it anew.
+        self.needs_down(seq, PARKED_OFF, review)?;
         Ok(())
     }
 
@@ -637,6 +665,13 @@ impl<C: Ctl> Session<'_, C> {
         out: &mut (dyn Write + Send),
     ) -> Result<(), String> {
         self.stop = Some(stop);
+        // CLAIM AT NAMING (card engine §8): the lease first, before the
+        // journal, the ledger or the screen is read — the harness card wraps
+        // a pane only under a live claim, and a claim that lands after the
+        // agent's first paint leaves its card bare for that paint.
+        if !self.stopped() {
+            self.claim_at_naming();
+        }
         // The story lines the hosted loop owes the window (`story chose …`)
         // go out on its own connection.
         self.tell_own = true;

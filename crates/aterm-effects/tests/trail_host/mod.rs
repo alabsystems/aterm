@@ -187,7 +187,10 @@ pub fn istr(g: &[i32]) -> String {
 #[derive(Clone, Copy, Debug)]
 pub struct Opts {
     /// `sync_cursor_effect_scroll` first: a scroll / band move is applied to
-    /// the engine and that frame samples NOTHING (as `app_render.rs`).
+    /// the engine and that frame takes no row probe (as `app_render.rs`); a
+    /// whole-grid translation still feeds the content witness the caret's row
+    /// and the rows it names after the sync
+    /// (`ScrollChange::translated_only`), a band move nothing.
     pub scroll_seam: bool,
     /// `sync_cursor_effect_coordinate_space`: an alt-screen switch
     /// re-baselines the scroll clock.
@@ -319,6 +322,7 @@ impl Core {
             .push(self.now.duration_since(self.t0).as_millis() as u64);
         let alt = self.term.is_alternate_screen();
         let mut changed = false;
+        let mut translated = false;
         if self.o.scroll_seam {
             if self.o.alt_rebaseline {
                 if self.alt_seen.is_some_and(|a| a != alt) {
@@ -333,6 +337,7 @@ impl Core {
                     self.glow.note_scroll(rows);
                     self.glow.drop_row_probe();
                     changed = true;
+                    translated = true;
                 }
                 ContentScrollDelta::Bands { first_seq, count } => {
                     for i in 0..u64::from(count) {
@@ -364,10 +369,12 @@ impl Core {
             false
         };
         let drop_far = one_shot || !self.far_ok;
-        if !changed {
+        if !changed || translated {
             self.term
                 .row_cols_into(usize::from(c.row), &mut self.row_buf);
-            self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
+            if !changed {
+                self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
+            }
             self.glow.observe_ribbon_row(c.row, &self.row_buf);
             let mut rows = [0u16; CURSOR_WITNESS_ROWS];
             let n = self.glow.ribbon_rows(&mut rows);

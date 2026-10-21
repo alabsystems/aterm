@@ -5,15 +5,18 @@
 //! well-framed message that breaks the specification or is larger than the
 //! connection accepts is consumed and reported while the connection stays
 //! usable; a framing fault ends it, and every later call says
-//! [`Error::Closed`]; a server that refuses EXTERNAL fails the handshake.
+//! [`Error::Closed`]; a server that refuses EXTERNAL fails the handshake; and
+//! a bus that stops reading, or never answers the handshake, holds a sender or
+//! a joiner no longer than the bound it was given.
 
 #![cfg(unix)]
 
 use std::io::{Read as _, Write as _};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::support::*;
+use aterm_dbus::conn::HANDSHAKE_TIMEOUT;
 use aterm_dbus::{Connection, Error, Message, Value};
 use aterm_uds::CtlStream;
 
@@ -203,4 +206,141 @@ fn a_hangup_is_closed_and_a_refusal_fails_the_handshake() {
     let closed = conn.recv(Some(HANG));
     assert!(matches!(closed, Err(Error::Closed)), "{closed:?}");
     assert!(matches!(conn.recv(Some(HANG)), Err(Error::Closed)));
+}
+
+/// A bus that answers the handshake and then reads nothing more: a daemon
+/// frozen (SIGSTOP) or wedged after the client joined. The server's end comes
+/// back from the thread, unread, so its socket stays open.
+fn silent_bus() -> (CtlStream, thread::JoinHandle<CtlStream>) {
+    let (ours, mut bus) = CtlStream::pair().unwrap();
+    let served = thread::spawn(move || {
+        bus.set_read_timeout(Some(HANG)).unwrap();
+        line(&mut bus);
+        bus.write_all(b"OK 8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f\r\n")
+            .unwrap();
+        assert_eq!(line(&mut bus), b"BEGIN\r\n");
+        let mut hello = vec![0u8; recorded("hello").len()];
+        bus.read_exact(&mut hello).unwrap();
+        bus.write_all(&recorded("hello_reply")).unwrap();
+        bus
+    });
+    (ours, served)
+}
+
+/// A signal larger than any socket buffer, so a bus that reads nothing can
+/// never take all of it.
+fn too_big_to_buffer() -> Message {
+    Message::signal("/org/aterm/test", "org.aterm.Test", "Flood")
+        .unwrap()
+        .with_body(vec![Value::Str("x".repeat(8 << 20))])
+}
+
+/// Sends `msg` on another thread; what the send returned, once it returned.
+fn sending(
+    mut conn: Connection,
+    msg: Message,
+) -> (
+    std::sync::mpsc::Receiver<(Connection, aterm_dbus::Result<u32>)>,
+    thread::JoinHandle<()>,
+) {
+    let (done, sent) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = conn.send(msg);
+        let _ = done.send((conn, result));
+    });
+    (sent, worker)
+}
+
+#[test]
+fn a_send_timeout_gives_up_on_a_bus_that_stopped_reading() {
+    let (ours, served) = silent_bus();
+    let mut conn = Connection::handshake(ours, 1000, None).unwrap();
+    let bus = served.join().unwrap();
+    // The bound under test is the API's, not the machine's speed: the bus
+    // reads nothing, so the send cannot finish; the observer allows a minute.
+    conn.set_send_timeout(Some(Duration::from_millis(100)));
+    let (sent, worker) = sending(conn, too_big_to_buffer());
+    let outcome = sent.recv_timeout(HANG);
+    drop(bus);
+    worker.join().unwrap();
+    let (mut conn, result) = outcome.expect("the send outlived its timeout");
+    assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+    // Part of the message went out, so no message can follow it.
+    assert!(matches!(conn.recv(Some(HANG)), Err(Error::Closed)));
+}
+
+#[test]
+fn without_a_send_timeout_a_send_waits_for_the_bus_to_read() {
+    // The negative control: the same bus and message with no timeout. The
+    // send is still waiting after ten times the bound above, and returns only
+    // when the bus goes away.
+    let (ours, served) = silent_bus();
+    let conn = Connection::handshake(ours, 1000, None).unwrap();
+    let bus = served.join().unwrap();
+    let (sent, worker) = sending(conn, too_big_to_buffer());
+    let early = sent.recv_timeout(Duration::from_secs(1));
+    assert!(
+        early.is_err(),
+        "the send returned with the bus still silent"
+    );
+    drop(bus);
+    let (_, result) = sent
+        .recv_timeout(HANG)
+        .expect("the send ended with the bus");
+    worker.join().unwrap();
+    assert!(
+        matches!(result, Err(Error::Closed | Error::Io(_))),
+        "{result:?}"
+    );
+}
+
+fn listening(
+    scratch: &std::path::Path,
+    name: &str,
+) -> (
+    std::os::unix::net::UnixListener,
+    Vec<aterm_dbus::address::Address>,
+) {
+    let path = scratch.join(name);
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let addresses = aterm_dbus::address::parse(&format!("unix:path={}", path.display())).unwrap();
+    (listener, addresses)
+}
+
+#[test]
+fn open_within_gives_up_on_a_bus_that_never_answers() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    // A listener that never accepts: the kernel completes the connection into
+    // its backlog, and nothing ever answers the handshake.
+    let (_silent, addresses) = listening(scratch.path(), "silent");
+    let asked = Instant::now();
+    let joined = Connection::open_within(&addresses, Duration::from_millis(100));
+    let waited = asked.elapsed();
+    assert!(matches!(joined, Err(Error::Timeout)), "{:?}", joined.err());
+    // The bound given, not the default: a join that waited out
+    // HANDSHAKE_TIMEOUT (25 s) ignored it. This compares the two bounds, not
+    // the machine's speed.
+    assert!(
+        waited < HANDSHAKE_TIMEOUT,
+        "the join gave up after {waited:?}, the default's {HANDSHAKE_TIMEOUT:?}, not the 100 ms \
+         it was given"
+    );
+
+    // The control: a bus that answers, joined within the bound given.
+    let (listener, addresses) = listening(scratch.path(), "answering");
+    let answered = thread::spawn(move || {
+        let (mut bus, _) = listener.accept().unwrap();
+        bus.set_read_timeout(Some(HANG)).unwrap();
+        line(&mut bus);
+        bus.write_all(b"OK 8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f\r\n")
+            .unwrap();
+        assert_eq!(line(&mut bus), b"BEGIN\r\n");
+        let mut hello = vec![0u8; recorded("hello").len()];
+        bus.read_exact(&mut hello).unwrap();
+        bus.write_all(&recorded("hello_reply")).unwrap();
+        bus
+    });
+    let conn = Connection::open_within(&addresses, HANG).expect("an answered handshake");
+    assert!(conn.unique_name().starts_with(':'));
+    drop(answered.join().unwrap());
 }

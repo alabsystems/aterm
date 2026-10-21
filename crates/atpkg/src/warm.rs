@@ -1159,16 +1159,19 @@ mod tests {
         assert!(fd >= 100, "F_DUPFD: {}", std::io::Error::last_os_error());
         // SAFETY: `fd` was just opened here and nothing else owns it.
         let _held = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        // Read from the script's own table: a `[ -e /dev/fd/N ]` read the held number as
+        // absent on Darwin while anything else looked it up.
         install(
             layout,
             "claude",
             2_001_282,
             &format!(
                 "#!/bin/sh
-if [ -e /dev/fd/{fd} ]; then w=held; else w=absent; fi
+if {held}; then w=held; else w=absent; fi
                  echo $w > '{m}/fd.tmp'
 mv '{m}/fd.tmp' '{m}/fd'
 ",
+                held = aterm_spec::host::sh_held(fd),
                 m = marks.display()
             ),
         );

@@ -143,6 +143,7 @@ unsafe extern "C" {
     pub fn CFArrayGetCount(the_array: CFArrayRef) -> CFIndex;
     pub fn CFArrayGetValueAtIndex(the_array: CFArrayRef, idx: CFIndex) -> *const c_void;
     pub fn CFDataGetBytePtr(the_data: CFDataRef) -> *const u8;
+    pub fn CFDataGetLength(the_data: CFDataRef) -> CFIndex;
     pub fn CFStringGetLength(the_string: CFStringRef) -> CFIndex;
     pub fn CFStringGetCharacters(the_string: CFStringRef, range: CFRange, buffer: *mut u16);
     pub fn CFUUIDGetUUIDBytes(uuid: CFUUIDRef) -> CFUUIDBytes;

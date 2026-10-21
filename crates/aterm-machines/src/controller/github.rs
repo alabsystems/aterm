@@ -65,8 +65,8 @@ pub fn gh_path(sys: &dyn System) -> Result<PathBuf, String> {
         .map(Path::to_path_buf)
         .ok_or_else(|| {
             format!(
-                "gh is not installed ({} or {}): brew install gh, then gh auth login as the \
-                 machine user",
+                "gh is not installed ({} or {}), and aterm does not install it: with one \
+                 there, gh auth login as the machine user",
                 GH_PATHS[0], GH_PATHS[1]
             )
         })

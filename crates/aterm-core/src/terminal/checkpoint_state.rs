@@ -497,8 +497,10 @@ pub struct ShellRepr {
     #[cfg_attr(feature = "serde", serde(default))]
     pub completed_seq: u64,
     /// Started-command counter (accepted OSC 133/633 C); never replayed
-    /// backwards. Absent from a predecessor that did not count it, and left
-    /// out at `0`, so that state re-encodes as it was written.
+    /// backwards, nor restored below the carried blocks that reached C.
+    /// Absent from a predecessor that did not count it, and left out at `0`,
+    /// so a terminal that never started a command encodes as a predecessor's
+    /// did.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_seq"))]
     pub started_seq: u64,
     /// The shell signs its own cwd report (`ShellIntegrationState::signs_cwd`).
@@ -938,7 +940,17 @@ impl Terminal {
         // counted commands of its own.
         s.next_block_id = s.next_block_id.max(repr.next_block_id);
         s.completed_seq = s.completed_seq.max(repr.completed_seq);
-        s.started_seq = s.started_seq.max(repr.started_seq);
+        // Each carried block that reached C took a C of its own, so the count
+        // never reads below them: a predecessor that did not count C's carries
+        // none, and a live shell's stream must not read as one that never
+        // started a command.
+        let proven = s
+            .output_blocks
+            .iter()
+            .chain(s.current_block.as_ref())
+            .filter(|b| matches!(b.state, BlockState::Executing | BlockState::Complete))
+            .count() as u64;
+        s.started_seq = s.started_seq.max(repr.started_seq).max(proven);
         // The shell's habits and the reports its prompt left pending are the
         // carry's: a report held at this engine's previous prompt, or a cwd
         // its own job replaced, belongs to a shell this projection replaces.

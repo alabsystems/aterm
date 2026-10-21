@@ -228,13 +228,71 @@ fn a_policy_its_texts_cannot_give_back_is_marked_inexact() {
     let back = Header::decode(&text).expect("decodes");
     assert!(!back.policy_exact);
     assert_eq!(back.opts.policy.trust_roots, ["~/a", "b"]);
+    assert_eq!(
+        back.supplied,
+        [format!("[policy] {INEXACT}")],
+        "said inexact"
+    );
+}
+
+/// A policy marked inexact because the owner's reader REFUSES one of its
+/// values — an `autocompact_offer` off Claude Code's ladder, which a test
+/// builds as it likes — still decodes: the value is read as the owner's file
+/// reads it (its default kept) and named in what the build supplied, beside
+/// the inexactness, so the tape replays and says what it could not take.
+/// The same text claiming `exact=true` is refused (the negative control):
+/// there a value no reader takes is damage.
+#[test]
+fn a_policy_marked_inexact_decodes_where_the_reader_refuses_a_value() {
+    let mut policy = SupervisorConfig::default();
+    policy.set("approve", "safe").expect("approve");
+    policy.autocompact_offer = Some(450);
+    let opts = SuperviseOpts {
+        policy: policy.clone(),
+        ..SuperviseOpts::default()
+    };
+    let h = Header::capture("t", Entry::Watch, None, &watched(), &opts);
+    assert!(!h.policy_exact);
+    let text = h.encode();
+    assert!(
+        text.lines().any(|l| l == "autocompact_offer=450k"),
+        "{text}"
+    );
+    let back = Header::decode(&text).expect("an inexact policy's tape reads");
+    assert!(!back.policy_exact);
+    assert_eq!(
+        back.opts.policy,
+        SupervisorConfig {
+            autocompact_offer: Some(crate::supervise::config::AUTOCOMPACT_DEFAULT_K),
+            ..policy
+        }
+    );
+    assert_eq!(back.supplied.len(), 2, "{:?}", back.supplied);
+    assert!(
+        back.supplied[0].starts_with("[policy] harness.autocompact_offer: ")
+            && back.supplied[0].contains("450k")
+            && back.supplied[0].ends_with("; this build read autocompact_offer=400k"),
+        "what this build supplied in its place: {:?}",
+        back.supplied
+    );
+    assert_eq!(back.supplied[1], format!("[policy] {INEXACT}"));
+    assert_eq!(
+        back.encode(),
+        text.replacen("autocompact_offer=450k", "autocompact_offer=400k", 1),
+        "written again, the nearest policy, still marked inexact"
+    );
+    let e = Header::decode(&replace_header_field(&text, "[policy]", "exact", "true"))
+        .expect_err("a value no reader takes, in a policy said to rebuild exactly");
+    assert!(e.contains("autocompact_offer"), "{e}");
 }
 
 /// THE ROOTS: each file the loop opens is written under the most specific
 /// root that holds it, the same directory twice is one root, a path under
 /// none is written as it is (one starting with `@` escaped), and a replay's
 /// remapped decode moves every one of them under its base — while the
-/// approval policy's home and `$TMPDIR`, values it compares, stay put.
+/// approval policy's home and `$TMPDIR`, values it reads the screen with,
+/// stay put (`replay_loop_tests.rs` replays a run that looked under the
+/// home, and moves the home as the negative control).
 #[test]
 fn paths_are_written_under_their_roots_and_move_with_them() {
     let setup = watched();
@@ -444,6 +502,37 @@ fn a_header_this_build_did_not_write_is_refused_by_name() {
     );
 }
 
+/// A DAMAGED OR HOSTILE HEADER is refused as fast as it can be read: half a
+/// million distinct keys in one section — a header frame holds up to 64 MiB,
+/// and a tape may come from elsewhere — are read in one pass and the first
+/// key this build does not have is refused by name. Checked against every
+/// earlier line, as each key once was, the same header cost ~10^11
+/// comparisons and decoding it hung instead of refusing it: the wait for the
+/// refusal is a one-minute hang detector, not a latency budget.
+#[test]
+fn a_header_of_half_a_million_keys_is_refused_in_one_pass() {
+    use std::fmt::Write as _;
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
+    let text = Header::capture("t", Entry::Watch, None, &watched(), &every_option()).encode();
+    let mut many = String::from("[setup]\n");
+    for i in 0..500_000 {
+        let _ = writeln!(many, "k{i}=1");
+    }
+    let hostile = text.replacen("[setup]\n", &many, 1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(Header::decode(&hostile).map(|_| ()));
+    });
+    let e = rx
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the decode returns")
+        .expect_err("keys this build does not have");
+    assert!(
+        e.contains("[setup] k0: a key this build does not have"),
+        "{e}"
+    );
+}
+
 /// Edit one real encoded field, keeping every other required header field intact.
 fn replace_header_field(text: &str, section: &str, key: &str, value: &str) -> String {
     let mut here = "";
@@ -602,6 +691,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
                 "codex.enabled=",
                 "person_hold_wait",
                 "beside_idle_min=",
+                "wait_step=",
                 "box_call_step=",
                 "turn_end.refused_backoff=",
                 "types_under_hand=",
@@ -617,6 +707,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
         back.supplied,
         [
             "[setup] types_under_hand",
+            "[setup] wait_step",
             "[setup] box_call_step",
             "[setup] turn_end.refused_backoff",
             "[setup] person_hold_wait",

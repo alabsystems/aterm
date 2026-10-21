@@ -59,6 +59,11 @@ aterm-wasm-abi = { workspace = true }
 
 # Scratch output captures (and test directories) removed on drop.
 aterm-tempfile = { workspace = true }
+# `verify soak`: the crash restore's soak, judged from this machine's recovery ledger by
+# the updater crate's own reader and judge (`aterm_update::restore_soak`), at the clock the
+# workspace reads (`aterm_time::unix_secs`).
+aterm-update = { workspace = true }
+aterm-time = { workspace = true }
 # THE toolchain resolution, rustup's finder, the build-cache rule plain `targo`
 # follows (so the main lane's children share its cache) and the toolchain lease
 # a run holds: one std-only source with atpkg.

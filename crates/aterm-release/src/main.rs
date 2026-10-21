@@ -35,6 +35,9 @@ mod channel;
 // The one clean-tree judge: which paths of a checkout differ from its HEAD.
 mod clean;
 mod cli;
+// A git credential helper that waits for a person, ended: nothing the release starts
+// waits on one.
+mod credential_wait;
 // Which commit this running cutter is the build of, judged as it starts.
 mod cutter;
 // `ship dev-app`: this checkout built into `aterm (dev).app`, signed locally, installed

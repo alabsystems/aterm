@@ -8,10 +8,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Fd-relative POSIX directory operations for aterm's confined artifact paths"
+description = "Handle-relative directory operations for aterm's confined artifact paths and disk reclaim: fd-relative POSIX calls on unix, NT handle-relative opens on Windows"
 
-[dependencies]
-# Already in the shipped graph, so this crate adds no package.
+[target.'cfg(unix)'.dependencies]
+# Already in the shipped graph, so this crate adds no package. The Windows half
+# is direct ntdll/kernel32 FFI (`src/windows/ffi.rs`) and needs nothing.
 libc = { workspace = true }
 
 [dev-dependencies]
@@ -19,9 +20,16 @@ libc = { workspace = true }
 # atomicity exist only on a real filesystem.
 aterm-tempfile = { workspace = true }
 
+[target.'cfg(windows)'.dev-dependencies]
+# The Windows tests' junctions: `cmd /C mklink /J`, spawned through
+# `aterm_uds::spawnfd::command` as every child is. A test-only edge; aterm-uds
+# is itself dependency-free on Windows.
+aterm-uds = { workspace = true }
+
 [lints]
 workspace = true
 
 [lib]
-# No unit tests in src/; doctests still run.
+# No unit tests in src/; doctests still run. The Windows FFI layouts are
+# compile-time assertions in `src/windows/ffi.rs`.
 test = false

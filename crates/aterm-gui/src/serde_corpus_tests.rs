@@ -752,6 +752,32 @@ fn handoff_manifests_answer_as_recorded() {
             "lenient/fabric-attached-int",
             &[("fabric_attached = [\"s-1\"]", "fabric_attached = 5")],
         ),
+        // The Autopilot's carried end (slice 2b, `SessionRecord::autopilot_end`):
+        // a row reads as written and is written back; a value of another type
+        // reads as an unreadable row (`""`, which `EndCarry::parse` refuses),
+        // never a refused manifest. A record with none writes no key (`base`),
+        // so an older reader sees the wire it always saw.
+        (
+            "autopilot-end/row",
+            &[(
+                "journal_key = \"663:1\"\n",
+                "journal_key = \"663:1\"\nautopilot_end = \"end=landed@1760978520000 seen=0 worked=25000\"\n",
+            )],
+        ),
+        (
+            "lenient/autopilot-end-int",
+            &[(
+                "journal_key = \"663:1\"\n",
+                "journal_key = \"663:1\"\nautopilot_end = 5\n",
+            )],
+        ),
+        (
+            "lenient/autopilot-end-table",
+            &[(
+                "journal_key = \"663:1\"\n",
+                "journal_key = \"663:1\"\nautopilot_end = { end = \"landed\" }\n",
+            )],
+        ),
         // Not lenient: these still refuse the manifest.
         (
             "strict/local-id-string",

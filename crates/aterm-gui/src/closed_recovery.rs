@@ -278,6 +278,7 @@ mod tests {
         RestoredView::Terminal(TerminalLeafRestore {
             sid: None,
             lineage: None,
+            log_ep: None,
             cwd: Some(format!("/{label}")),
             title: label.to_string(),
             profile: None,
@@ -290,6 +291,7 @@ mod tests {
             questions: None,
             autopilot: None,
             land_at: None,
+            autopilot_by: None,
             identity: None,
             theme: None,
             agent: None,

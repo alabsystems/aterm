@@ -88,11 +88,12 @@ fn facts_from_bits(bits: u32) -> HandoffCommitFacts {
         proof_exact: bits & (1 << 9) != 0,
         commit_channel: bits & (1 << 10) != 0,
         exact_agent_carry: bits & (1 << 11) != 0,
+        recovery_count_ready: bits & (1 << 12) != 0,
     }
 }
 
 /// How many bounded facts the Commit admission reads ([`facts_from_bits`]).
-const FACTS: u32 = 12;
+const FACTS: u32 = 13;
 
 /// Every fact true: the one combination that may Commit.
 const ALL_FACTS: u32 = (1 << FACTS) - 1;
@@ -105,6 +106,7 @@ fn model_revoked(facts: HandoffCommitFacts) -> bool {
     !(facts.exact_sessions
         && facts.exact_layout
         && facts.exact_agent_carry
+        && facts.recovery_count_ready
         && facts.exact_activity
         && facts.teardown_allows_commit
         && facts.sessions_alive
@@ -196,11 +198,31 @@ fn an_agent_carry_that_moved_refuses_the_commit_by_its_own_name() {
     );
 }
 
-/// `handoff_commit_admitted` alone decides whether ownership moves; all 2^12 fact combinations
+/// `handoff_commit_admitted` alone decides whether ownership moves; all 2^13 fact combinations
 /// must get the same verdict from it and from the model's `CommitAtomically` guard.
 #[test]
 fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact_combination() {
     let model = native_update_seamless_handoff_ownership_model();
+    let all = facts_from_bits(ALL_FACTS);
+    let waiting = HandoffCommitFacts {
+        recovery_count_ready: false,
+        ..all
+    };
+    assert!(!handoff_commit_admitted(waiting));
+    assert!(handoff_rejection_activity_shaped(waiting));
+    assert_ne!(
+        handoff_rejection_reason(waiting, &Err(Vec::new()), false, false),
+        handoff_rejection_reason(
+            HandoffCommitFacts {
+                exact_activity: false,
+                ..all
+            },
+            &Err(Vec::new()),
+            false,
+            false
+        ),
+        "unconfirmed recovery custody is named apart from structural activity",
+    );
     let transferred = walk(&model, &TO_DESCRIPTORS_TRANSFERRED);
     let matched = walk(&model, &TO_PROOF_MATCHED);
     let mut admitted_combinations = 0usize;

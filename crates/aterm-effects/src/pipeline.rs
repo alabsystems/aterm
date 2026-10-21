@@ -85,6 +85,13 @@ pub fn web_typed_class(ch: char) -> TypedClass {
 const COLD_THEME_FG: u32 = 0x00C8_D3F5;
 const COLD_THEME_BG: u32 = 0x001A_1B26;
 
+/// The frame grid a settling caret body's next step is forecast on in a page
+/// ([`crate::cursor_fx::CursorFx::bodies_next_change_deadline`]). A page
+/// learns no display rate, so it is a 60 Hz frame: a step is named no
+/// sooner than this after `now`, and a faster display presents it on the
+/// next rAF after the wake.
+const PAGE_SETTLE_FRAME: Duration = Duration::from_micros(16_667);
+
 /// The cursor colour the pet's contrast sampler falls back to over blank
 /// glass. The engine snapshot leaves `RenderInput::cursor_color` as the
 /// `COLOR_UNSET` sentinel when the frame is not cursor-authoritative, and a
@@ -225,6 +232,9 @@ pub struct EffectsPipeline {
     /// Reused row material for the glow engine's row probe
     /// (`CursorGlow::observe_row`); capacity is retained.
     row_probe_scratch: Vec<char>,
+    /// The caret row the flying head last sat in the sky seat over
+    /// ([`crate::rainbow_kitty::companion::SeatQuery::held_sky`]).
+    flying_sky_row: Option<u16>,
 
     decos: WordDecorations,
     /// Compiled lexicon + resolved config; `None` while sparkle words are off.
@@ -283,8 +293,8 @@ pub struct EffectsPipeline {
     /// flying head, the sing-along, the typed detectors and the dog.
     /// A native window's; the page drives none of them.
     companions: crate::companions::Companions,
-    /// The RAW glow style string named a pet at the last
-    /// [`Self::set_cursor_glow`] (`GlowStyle::style_names_any_pet`), captured
+    /// The glow style string named a pet at the last
+    /// [`Self::set_cursor_glow`] (`GlowSpelling::pet_of`), captured
     /// beside `ribbon_tall` because the parsed enum cannot tell
     /// `rainbow kitty` (the resident) from `rainbow kitty flying` (the earned
     /// head): the pet's ownership law reads the spelling, not the variant.
@@ -390,6 +400,7 @@ impl EffectsPipeline {
             block_fill: None,
             pending_keys: 0,
             row_probe_scratch: Vec::new(),
+            flying_sky_row: None,
             decos: WordDecorations::default(),
             sparkle: None,
             deco_cfg: DecoConfig::default(),
@@ -522,11 +533,15 @@ impl EffectsPipeline {
     ///
     /// The pet contributes `needs_frames()` or a named next visible step, never
     /// the brain's `is_active` (a cat exists): a sleeping cat pins nothing.
+    /// A settling caret body (the rainbow caret's colour release, the momentum
+    /// glow's cool-down) counts: it still owes steps, paced by
+    /// [`Self::next_deadline_ms`].
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.cursor.trail.is_active()
             || self.cursor.glow.is_active()
             || self.cursor.bodies_active()
+            || self.cursor.bodies_settling()
             || self.decos.is_active(self.now())
             || self.companion.needs_frames()
             || self.companion.next_change_deadline(self.now()).is_some()
@@ -538,13 +553,17 @@ impl EffectsPipeline {
     /// active effect needs display-rAF cadence. Rain-only animation returns the
     /// time to its next tick; a glow whose only live term is the cooling forge
     /// ember (or a pending kill hint) returns its coarse poll; the streak arms
-    /// only its idle cutoff or episode-settle crossing. Settled one-shots arm
-    /// no deadline.
+    /// only its idle cutoff or episode-settle crossing; a settling caret body
+    /// names its next visible step. Settled one-shots arm no deadline.
+    ///
+    /// `&mut` because the rainbow caret's step is a memoised dry run of its
+    /// tick ([`CursorFx::bodies_next_change_deadline`]).
     #[must_use]
-    pub fn next_deadline_ms(&self) -> Option<f64> {
+    pub fn next_deadline_ms(&mut self) -> Option<f64> {
         let now = self.now();
-        // Every block-cursor body animates at display cadence while it is
-        // settling (the native frame-cadence set), then reports inactive.
+        // Every block-cursor body animates at display cadence while its
+        // frames still move (the native frame-cadence set); once they stop it
+        // is settling, paced by its named step below, then inactive.
         if self.cursor.trail.is_active()
             || self.cursor.bodies_active()
             || self.decos.is_active(now)
@@ -582,7 +601,22 @@ impl EffectsPipeline {
         } else {
             None
         };
-        [glow_ms, pet_ms, rain_ms, streak_ms]
+        // A settling caret body (the rainbow caret's colour release, the
+        // momentum glow's cool-down) names its next visible step, never
+        // sooner than a frame out; the native coarse arm reads the same.
+        let body_ms = if self.cursor.bodies_settling() {
+            match self
+                .cursor
+                .bodies_next_change_deadline(now, PAGE_SETTLE_FRAME)
+            {
+                Some(d) if d > now => Some(d.duration_since(now).as_secs_f64() * 1000.0),
+                Some(_) => return None, // a step due now → display-rAF
+                None => None,
+            }
+        } else {
+            None
+        };
+        [glow_ms, pet_ms, rain_ms, streak_ms, body_ms]
             .into_iter()
             .flatten()
             .reduce(f64::min)
@@ -592,7 +626,7 @@ impl EffectsPipeline {
     /// is live, `At` for an exact engine wake, `Idle` once everything settled.
     #[must_use]
     #[cfg(test)]
-    pub fn wake(&self) -> Wake {
+    pub fn wake(&mut self) -> Wake {
         match self.next_deadline_ms() {
             Some(ms) => Wake::At(self.now() + Duration::from_secs_f64(ms / 1000.0)),
             None if self.is_active() => Wake::Frames,
@@ -834,11 +868,15 @@ impl EffectsPipeline {
     // --- cursor wake ------------------------------------------------------
 
     /// Configure the lumen cursor aurora (the additive `cursor_glow_add`
-    /// channel), with the native knobs and clamps: `style` ∈ lumen|phaser|
-    /// rainbow kitty|sparkle|fire|laser|beam|water|comet (unknown → lumen;
-    /// `rainbow` aliases the rainbow kitty ribbon); `color = None` uses the
+    /// channel), with the native knobs and clamps: `style` is any
+    /// `cursor_trail_style` spelling the native app accepts
+    /// ([`crate::cursor_glow::spellings`]: its canonical rows and aliases,
+    /// read the same way), where `off` draws nothing and an unknown spelling
+    /// draws lumen; `color = None` uses the
     /// style default (Laser/Beam/Sparkle/Comet have canonical hues, others
-    /// derive from `theme_cursor`); `accent = None` brightens that color 1.5×;
+    /// derive from `theme_cursor`), which `apply` re-resolves each frame
+    /// against the live cursor ([`crate::cursor_fx::automatic_glow_color`]);
+    /// `accent = None` brightens that color 1.5×;
     /// `duration_ms` clamps 30..=2000, `length` 1..=512, `intensity` 0..=1,
     /// `radius` 0..=2.
     #[allow(
@@ -905,7 +943,9 @@ impl EffectsPipeline {
     }
 
     /// Configure the legacy opaque comet trail (the `cursor_trail` channel).
-    /// `color` `None` = the theme cursor. Clamps mirror the native accessors.
+    /// `color` `None` = the theme cursor, re-tinted each frame to the live
+    /// cursor (OSC 12 / OSC 112) whatever the glow style. Clamps mirror the
+    /// native accessors.
     pub fn set_cursor_trail(
         &mut self,
         enabled: bool,
@@ -1637,14 +1677,29 @@ impl EffectsPipeline {
         // it masks real values itself.
         self.glow_cfg.theme_fg = input.default_fg;
         self.glow_cfg.theme_bg = input.default_bg;
-        // As natively: automatic colors follow the live cursor; explicit
-        // colors stay fixed, and Laser keeps its configured/default hue.
+        // Was the cursor colour pinned (a program's live OSC 12; a page has no
+        // config colour) rather than the theme's seed? Read BEFORE the colour
+        // fold below, which needs it, and handed to the step as the same fact.
+        let cursor_color_pinned = term.cursor_color_recoloured();
+        // As natively, one colour law ([`crate::cursor_fx::automatic_glow_color`]):
+        // an automatic glow colour follows the live cursor for the styles with
+        // no hue of their own; Beam, Comet and Sparkle keep their canonical hue
+        // until the cursor colour is pinned (and return to it on OSC 112);
+        // Laser keeps storm violet; explicit colors stay fixed. The page's
+        // opaque trail is its own effect (`set_cursor_trail`, configured apart
+        // from the glow style), so an automatic one follows the live cursor
+        // whatever the glow style.
         if input.cursor_color != aterm_core::render::COLOR_UNSET {
             let live = input.cursor_color & 0x00FF_FFFF;
-            if self.glow_color_from_cursor && !matches!(self.glow_cfg.style, GlowStyle::Laser) {
-                self.glow_cfg.color = live;
+            if self.glow_color_from_cursor {
+                let color = crate::cursor_fx::automatic_glow_color(
+                    self.glow_cfg.style,
+                    live,
+                    cursor_color_pinned,
+                );
+                self.glow_cfg.color = color;
                 if self.glow_accent_from_cursor {
-                    self.glow_cfg.accent = brighten(live, 1.5);
+                    self.glow_cfg.accent = brighten(color, 1.5);
                 }
             }
             if self.trail_color_from_cursor {
@@ -1713,14 +1768,25 @@ impl EffectsPipeline {
                     // The terminal's own resolution of its cursor colour (OSC 12,
                     // else the default foreground) — the native `live_cursor_rgb`.
                     live_cursor: term_cursor_color,
-                    // A program's live OSC 12 pins it; a page has no config colour.
-                    cursor_color_pinned: term.cursor_color_recoloured(),
+                    cursor_color_pinned,
                     default_bg,
+                    // The caret's cell in the frame this page renders: the
+                    // background its block cuts the glyph out in.
+                    cursor_cell_bg: cur.and_then(|(row, col)| {
+                        input
+                            .cells
+                            .get(usize::from(row))?
+                            .get(usize::from(col))
+                            .map(|cell| aterm_render::rgb_to_u32(cell.bg))
+                    }),
                     geom: glow_geom,
                     focused,
-                    amplitude: motion_amp,
                     // A page has no load-shed latch.
                     shed_envelope: 1.0,
+                    // The page's opaque trail takes no brightness dial: the
+                    // glow's `intensity` is the aurora's and the bodies', not
+                    // this separately configured trail's.
+                    trail_brightness: 1.0,
                     body_allowed: !self.serious,
                     // A page's glow switch is also its momentum-glow switch.
                     momentum_glow: self.glow_cfg.enabled,
@@ -1729,6 +1795,9 @@ impl EffectsPipeline {
                 glow: &self.glow_cfg,
                 trail: trail_cfg,
                 animate,
+                // The page's own cells: the dark streak reads the rows it
+                // crosses there.
+                frame_cells: Some(&input.cells),
                 row_probe: probe_row.map(|(row, caret)| native::RowProbe {
                     row,
                     caret,
@@ -3278,6 +3347,37 @@ mod tests {
         assert!(control, "control: with no companion the word-cat peeks");
     }
 
+    /// A page's `set_cursor_glow` reads the native vocabulary: an alias of
+    /// the pet draws the rainbow kitty with its pet, the owner's `nyan
+    /// rainbow` the flying head, the old `classic mono` spelling Classic's
+    /// mono face, and `off` draws nothing. Controls: `lumen` and an unknown
+    /// word stay lit (an unknown word is the page's documented Lumen
+    /// fallback).
+    #[test]
+    fn web_pipeline_reads_off_and_aliases_like_the_native_host() {
+        let mut p = EffectsPipeline::new();
+        rainbow_kitty_glow(&mut p, "rainbow kitty");
+        assert!(p.glow_cfg.enabled);
+        assert_eq!(p.glow_cfg.style, GlowStyle::RainbowKitty);
+        assert!(p.pet_style_named, "the bare name names the pet");
+        rainbow_kitty_glow(&mut p, "nyan rainbow");
+        assert_eq!(p.glow_cfg.style, GlowStyle::RainbowKitty);
+        assert!(!p.pet_style_named, "nyan rainbow keeps the flying head");
+        rainbow_kitty_glow(&mut p, "classic mono");
+        assert_eq!(p.glow_cfg.style, GlowStyle::Classic);
+        assert!(
+            p.glow_cfg.classic_mono,
+            "the old spelling still draws the mono face"
+        );
+        rainbow_kitty_glow(&mut p, "off");
+        assert!(!p.glow_cfg.enabled, "`off` disables the trail");
+        assert!(!p.pet_style_named);
+        rainbow_kitty_glow(&mut p, "lumen");
+        assert!(p.glow_cfg.enabled && p.glow_cfg.style == GlowStyle::Lumen);
+        rainbow_kitty_glow(&mut p, "plasma");
+        assert!(p.glow_cfg.enabled && p.glow_cfg.style == GlowStyle::Lumen);
+    }
+
     /// The pointer and stroke only latch: the pointer is value-shadowed (still
     /// reports no change, poison dropped, leaving is one change); a press
     /// outside the body passes, one inside is consumed and queues a stroke
@@ -4209,6 +4309,57 @@ mod tests {
         );
     }
 
+    /// The web host's half of the one colour law: an automatic comet keeps
+    /// its glacial hue over the theme's seed (which the host stamps as the
+    /// frame's cursor colour), wears a program's OSC 12, and returns to the
+    /// glacial hue on OSC 112. The lumen rows above are the negative control:
+    /// a style with no hue of its own follows the seed too.
+    #[test]
+    fn an_automatic_comet_keeps_its_hue_until_osc12_pins_the_cursor() {
+        let theme_cursor = 0x0011_2233;
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "comet",
+            None,
+            None,
+            400,
+            24,
+            1.0,
+            0.9,
+            true,
+            theme_cursor,
+        );
+        let mut term = Terminal::new(2, 8);
+        term.set_default_cursor_color(Some(aterm_core::terminal::Rgb::new(0x11, 0x22, 0x33)));
+        let comet = crate::cursor_glow::COMET_DEFAULT_COLOR;
+
+        let mut input = term.cell_frame(2, 8);
+        stamp_cursor_color(&term, &mut input, theme_cursor);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            pipeline.glow_cfg.color, comet,
+            "the theme's seed is not a request"
+        );
+        assert_eq!(pipeline.glow_cfg.accent, brighten(comet, 1.5));
+
+        term.process(b"\x1b]12;rgb:aa/00/11\x07");
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_cursor_color(&term, &mut input, theme_cursor);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(pipeline.glow_cfg.color, 0x00AA_0011, "OSC 12 pins it");
+        assert_eq!(pipeline.glow_cfg.accent, brighten(0x00AA_0011, 1.5));
+
+        term.process(b"\x1b]112\x07");
+        term.cell_frame_into(&mut input, 2, 8);
+        stamp_cursor_color(&term, &mut input, theme_cursor);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            pipeline.glow_cfg.color, comet,
+            "OSC 112 hands the comet its own hue back"
+        );
+    }
+
     /// Keystrokes batched between `advance` calls do not collapse to a zero
     /// inter-key gap: `advance` spreads them across its `dt`, so a batching web
     /// host ignites the cadence like a host that saw real arrival times.
@@ -4658,6 +4809,77 @@ mod tests {
         }
     }
 
+    /// A page keeps its wake through the momentum glow's cool-down. After a
+    /// typed burst under `classic` (no body of its own, so the caret's tint
+    /// and halo are the momentum glow's), the page is driven as an embedder's
+    /// loop drives it — a rAF frame on `Frames`, a timer to the instant on
+    /// `At` — and goes `Idle` only after a frame with no momentum caret and a
+    /// cold glow. While it settles the page stays `is_active`: the bindings'
+    /// frame gate (`FrameGateKey::effects_active`) skips an inactive page's
+    /// render, so a timer wake would never apply the step it was armed for.
+    /// Negative control: on the way down the frame-cadence set
+    /// (`bodies_active`) lets go while the glow is still hot, so only the
+    /// settle arm held the wake there.
+    #[test]
+    fn a_page_keeps_its_wake_until_the_momentum_glow_is_cold() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_glow(
+            true,
+            "classic",
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
+        for ch in b"abcdefghij" {
+            commit_ascii(&mut p, &mut term, &mut input, &[*ch], 60.0);
+        }
+        assert!(
+            p.cursor_block_fill()
+                .is_some_and(|owned| owned.owner == crate::cursor_glow::BlockFillOwner::Momentum),
+            "fixture: the typed caret is the momentum glow's"
+        );
+        let (mut held_by_settle, mut frames) = (false, 0u32);
+        loop {
+            let dt_ms = match p.wake() {
+                Wake::Frames => 16.7,
+                Wake::At(at) => {
+                    let ms = at.saturating_duration_since(p.now()).as_secs_f64() * 1000.0;
+                    assert!(ms > 0.0, "a named wake at or before now is a busy re-arm");
+                    ms
+                }
+                Wake::Idle => break,
+            };
+            held_by_settle |= p.cursor.momentum.settling() && !p.cursor.bodies_active();
+            assert!(
+                !p.cursor.momentum.settling() || p.is_active(),
+                "a settling glow keeps the page active, or the frame gate skips its step"
+            );
+            idle(&mut p, &mut term, &mut input, 1, dt_ms);
+            frames += 1;
+            assert!(frames < 5_000, "the page never went idle");
+        }
+        assert!(
+            held_by_settle,
+            "negative control: the frame cadence alone let go of a hot glow"
+        );
+        assert!(
+            !p.cursor.momentum.is_active() && !p.cursor.momentum.settling(),
+            "idle only once the glow is cold"
+        );
+        assert!(
+            p.cursor_block_fill().is_none(),
+            "the last frame before idle returned the caret to the terminal"
+        );
+    }
+
     /// Hiding the page retires the block bodies, momentum and cadence with the
     /// aurora before any `apply`, so `is_active()` does not ask for frames a
     /// hidden page cannot show. The typed page before the edge is the control.
@@ -4846,6 +5068,63 @@ mod tests {
         );
     }
 
+    /// The page floors its caret against the cell the caret sits on, read from
+    /// the frame it renders, as the native host does: Fire's ember on a
+    /// reverse-video cell (SGR 7, so the cell's ground is the default ink)
+    /// keeps 4.5:1 against that cell. Negative control: the same caret on a
+    /// plain cell of the same row is floored against the page and reads under
+    /// that floor on the reverse cell, so the cell is what moved it.
+    #[test]
+    fn the_page_floors_its_caret_against_the_cell_under_it() {
+        let fill_on = |reverse: bool| {
+            let mut p = EffectsPipeline::new();
+            p.set_cursor_glow(
+                true,
+                "fire",
+                None,
+                None,
+                400,
+                24,
+                1.0,
+                0.9,
+                true,
+                0x0050_FA7B,
+            );
+            let mut term = Terminal::new(6, 20);
+            // A reverse-video `x` at column 2, the caret parked on it.
+            term.process(if reverse {
+                b"ab\x1b[7mx\x1b[27m\x1b[1;3H"
+            } else {
+                b"abx\x1b[1;3H"
+            });
+            let mut input = term.cell_frame(6, 20);
+            p.apply(&mut term, &mut input, 10, 19);
+            let cell = aterm_render::rgb_to_u32(input.cells[0][2].bg);
+            (
+                input
+                    .cursor_fill_override
+                    .expect("the forge owns the caret"),
+                cell,
+            )
+        };
+        let (fill, cell) = fill_on(true);
+        let (plain, page_cell) = fill_on(false);
+        assert_ne!(
+            cell, page_cell,
+            "SGR 7 gives the caret's cell its own ground"
+        );
+        let ratio = crate::color_math::contrast_ratio(fill, cell);
+        assert!(
+            ratio >= crate::cursor_fx::CARET_PAGE_MIN_CONTRAST,
+            "the ember {fill:06x} on the reverse cell {cell:06x} reads {ratio:.2}:1"
+        );
+        assert!(
+            crate::color_math::contrast_ratio(plain, cell)
+                < crate::cursor_fx::CARET_PAGE_MIN_CONTRAST,
+            "control: the page-floored ember {plain:06x} is under the floor on the reverse cell"
+        );
+    }
+
     /// The embedded hosts use this pipeline as their sole overlay producer, so
     /// Fire's warm-metal cursor body must ride the same RenderInput field as it
     /// does in the native GUI. A live style toggle must scrub it immediately
@@ -4869,10 +5148,29 @@ mod tests {
         let mut term = Terminal::new(6, 20);
         let mut input = term.cell_frame(6, 20);
         p.apply(&mut term, &mut input, 10, 19);
+        // The page the step floored against: this frame's default
+        // background, or the cold theme's when the frame names none.
+        let page = if input.default_bg == aterm_core::render::COLOR_UNSET {
+            COLD_THEME_BG
+        } else {
+            input.default_bg & 0x00FF_FFFF
+        };
         assert_eq!(
             input.cursor_fill_override,
-            p.cursor.glow.forge_fill(),
-            "Fire publishes its warm-metal cursor fill"
+            p.cursor.glow.forge_fill().map(|raw| {
+                crate::cursor_fx::floor_block_fill(
+                    crate::cursor_glow::BlockFill {
+                        owner: crate::cursor_glow::BlockFillOwner::Forge,
+                        fill: raw,
+                        base: None,
+                    },
+                    page,
+                    terminal_cursor_color(&term),
+                    None,
+                )
+                .fill
+            }),
+            "Fire publishes its warm-metal cursor fill, held to the page floor"
         );
         assert!(
             input.cursor_fill_override.is_some(),

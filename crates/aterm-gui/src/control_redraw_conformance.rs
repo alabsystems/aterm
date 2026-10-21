@@ -131,6 +131,7 @@ fn pump_until_quiet(
 fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHandle {
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
+    let observed = crate::session_watch::Observed::default();
     let ctx = Arc::new(SessionCtx {
         sink: Arc::new(SinkWriter::new(-1)),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
@@ -143,20 +144,21 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         cast: Arc::new(Mutex::new(crate::cast::CastRecorder::new(80, 24))),
         temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
-        turns: Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::default())),
+        turns: observed.turns,
         meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
-        timeline: Arc::new(Mutex::new(
-            crate::session_timeline::SessionTimeline::default(),
-        )),
+        timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        licence: Default::default(),
         launch: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
         update_parked: Default::default(),
+        watchers: observed.watchers,
+        frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
     });
@@ -199,7 +201,6 @@ pub fn run_redraw_conformance() -> i32 {
         b"\x1b]133;A\x07$ \x1b]633;E;echo hi\x07\x1b]133;B\x07echo hi\n\x1b]133;C\x07hi\n\x1b]133;D;0\x07",
     );
     let sibling_term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-    let subscribers = crate::subscribe::new_registry();
     let store = session_store::new_store();
     let handle = registered_session(SID, &term);
     {
@@ -207,12 +208,12 @@ pub fn run_redraw_conformance() -> i32 {
         registry.register(handle.clone());
         registry.register(registered_session(SIBLING_SID, &sibling_term));
     }
-    let host = GuiHost::with_fleet(SID, &term, Some(&proxy), &subscribers, &store, &handle.ctx);
+    let host = GuiHost::with_fleet(SID, &term, Some(&proxy), &store, &handle.ctx);
 
     let caps = host.capabilities();
     println!(
-        "aterm-redraw-conformance: caps event_loop={} roster={} input_sink={} clipboard={}",
-        caps.event_loop, caps.roster, caps.input_sink, caps.clipboard
+        "aterm-redraw-conformance: caps event_loop={} roster={} clipboard={}",
+        caps.event_loop, caps.roster, caps.clipboard
     );
     if !caps.event_loop {
         eprintln!(
@@ -231,7 +232,6 @@ pub fn run_redraw_conformance() -> i32 {
             event_loop: true,
             clipboard: true,
             roster: true,
-            input_sink: true,
         },
     );
     for outcome in &outcomes {

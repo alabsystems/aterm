@@ -420,6 +420,7 @@ mod macos {
             conn,
             closable: true,
             team: crate::tab_bar::TabTeam::NONE,
+            load: 0,
         }
     }
 

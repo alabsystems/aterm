@@ -6,31 +6,38 @@
 //!
 //! It stands up the REAL stack, the way the fabric worlds do — it mounts their
 //! harness (`fabric_world/harness.rs`) and boots `harness::World`s: astream's
-//! broker opened as aterm opens it (`Broker::open_guarded`, which is
-//! `Durability::Strict`, an fsync before every ack), the headless `aterm`
-//! this package builds, and the `aterm link serve` bridge that `aterm`
-//! launches and supervises. Nothing is stubbed: a message here travels every
-//! hop a person's does. It reports, each as `n` with mean and nearest-rank
-//! p50/p95/p99 ([`stats`]):
+//! broker opened as aterm opens it (`Broker::open_opts` with aterm's own
+//! options for the run's tier, `harness::broker_opts`: ordered at aterm's
+//! horizon — what aterm opens its guarded broker at by default — unless the
+//! arm names strict or relaxed, with aterm's escalation table on a weak tier),
+//! the headless `aterm` this package builds, and the `aterm link serve` bridge
+//! that `aterm` launches and supervises. Nothing is stubbed: a message here
+//! travels every hop a person's does. It reports, each as `n` with mean and
+//! nearest-rank p50/p95/p99 ([`stats`]):
 //!
 //! 1. **post -> deliver**: one session posts to another on the same node; from
 //!    the `post` reply to the row visible in the recipient's inbox (its
-//!    `await inbox` answering), split at the moment the record was durable on
-//!    the broker.
+//!    `await inbox` answering), split at the moment the record was ACKED on
+//!    the broker and, apart, the moment it was DURABLE ([`clock`]: on a strict
+//!    broker the two are one).
 //! 2. **burst throughput**: N posts back to back to one recipient; when all N
-//!    were accepted, durable, visible, and covered by the recipient bridge's
-//!    inbox commit, and each message's own post -> visible.
+//!    were accepted, acked, visible, durable, and covered by the recipient
+//!    bridge's inbox commit, and each message's own post -> visible.
 //! 3. **ping-pong**: A posts to B and B replies the moment it sees the message,
-//!    back to back (default 200 rounds): the round trip, each reply's wait for
-//!    the inbox commit of the delivery it answers, and the share of the window
-//!    the bridge's one loop spent blocked on broker replies, counted inside the
-//!    bridge by its wait-tally seam (`aterm_link::wait_tally`).
+//!    back to back (default 200 rounds): the round trip, its legs acked and
+//!    durable apart, each reply's wait for the inbox commit of the delivery it
+//!    answers, and the share of the window the bridge's one loop spent blocked
+//!    on broker replies, counted inside the bridge by its wait-tally seam
+//!    (`aterm_link::wait_tally`).
 //! 4. **attach time**: a bridge starting with N sessions (default 1, 8, 32),
-//!    from its pid file to every session's presence row durable again.
+//!    from its pid file to every session's presence row acked, and durable,
+//!    again.
 //! 5. **records per delivered message**: every record the broker wrote over
 //!    each measured window, hidden commits included, by kind ([`census`]) —
 //!    the count the bridge's batching reduces (in the burst, how far depends
-//!    on scheduling: the README says which counts compare).
+//!    on scheduling: the README says which counts compare) — and the broker's
+//!    barrier, full and skipped flushes per delivered message (per round trip
+//!    too, in the ping-pong).
 //!
 //! How the times are taken, and why they need no clock inside the stack, is
 //! [`clock`]; what each phase does is [`run`]. The one count taken inside it is
@@ -38,8 +45,9 @@
 //! the bridge can see, so it counts that on its own clock and the bench divides
 //! two of its tallies.
 //!
-//! MEASURED, NEVER JUDGED. A Strict ack is an fsync, `F_FULLFSYNC` on macOS,
-//! and its cost is the disk's: an absolute floor here would fail on a slower
+//! MEASURED, NEVER JUDGED. A Strict ack is an fsync, `F_FULLFSYNC` on macOS
+//! (an ordered one an `F_BARRIERFSYNC`), and its cost is the disk's: an
+//! absolute floor here would fail on a slower
 //! machine and pass a regression on a faster one. So there is no assertion on
 //! any number — the checks that ARE here are about the measurement being of
 //! what it says (the row that woke the reader is the message just posted; every
@@ -56,8 +64,13 @@
 //! ```text
 //! targo --unverified verify perf fabric [--profile dev|opt] [--latency-samples N]
 //!     [--burst N] [--pingpong-rounds N] [--attach-sessions 1,8,32] [--attach-rounds N]
+//!     [--durability strict,ordered,relaxed] [--horizon-ms 1000,100] [--passes N]
 //!     [--json-out PATH]
 //! ```
+//!
+//! `--durability` names the arms, each one run of this bench and one ledger
+//! entry, an ordered arm once per `--horizon-ms`; the bench itself runs one
+//! arm, `durability=<tier> [horizon_ms=<n>]` in [`spec::ENV`].
 //!
 //! `--profile` picks the build: the dev code generation (the default) or the
 //! optimized `opt-test` one, both with the test seams compiled in ([`profile`]).

@@ -228,6 +228,7 @@ impl<C: Ctl> Session<'_, C> {
         if reader.composer(rows).is_none()
             || aterm_phase::background_only(rows)
             || background_alone(reader, rows)
+            || super::super::policy::login::dialog_stands(rows)
         {
             return;
         }
@@ -623,6 +624,13 @@ impl<C: Ctl> Session<'_, C> {
     /// [`still_words`]), the episode counted from when they last moved; the
     /// host's record is told as their work's ([`StallSeen::OwnWork`]), and
     /// the last rung is [`Exception::stalled_on_work`].
+    ///
+    /// A BACKGROUND CALL THE KERNEL SAYS MADE NO PROGRESS explains the screen
+    /// (the hung-call design's R1: a test that slept on its own mutex for
+    /// 26 h, while each rung said nothing here explained it): the host's jobs
+    /// reading ([`IdleHost::background_jobs`]) names it, and the ladder goes
+    /// to `STALLED` at once in its words, and to [`Exception::no_progress`]
+    /// one unit later if it still stands ([`Self::stuck_climb`]).
     /// `since`: when the screen began reading background work only
     /// ([`Self::host_steps_in_background`]'s clock). A busy read, background
     /// work alone included, is also the end of a dialog's episode
@@ -670,6 +678,18 @@ impl<C: Ctl> Session<'_, C> {
             witness,
             review,
         );
+    }
+
+    /// THE KERNEL'S WORD on the agent's own background work
+    /// ([`IdleHost::background_jobs`]): the call the host's jobs reading says
+    /// has made no progress, or `None` (no host, no reading, or nothing of
+    /// this session's): today's ladder.
+    fn no_progress_call(&self) -> Option<super::super::background::BackgroundCall> {
+        let host = self.stall_host.as_ref()?;
+        match host.background_jobs() {
+            super::super::background::BackgroundEvidence::NoProgress { worst } => Some(worst),
+            super::super::background::BackgroundEvidence::Unknown => None,
+        }
     }
 
     /// THE CANARY'S SECOND FLAVOUR, for a DIALOG NO READER NAMES: Claude Code
@@ -777,6 +797,20 @@ impl<C: Ctl> Session<'_, C> {
     /// title that moves is an agent at work, and, for a dialog, a tab that
     /// runs no Claude (a shell left in a swapped tab keeps the title it had)
     /// has none to wait for: either ends the episode.
+    ///
+    /// THE KERNEL'S WORD (the busy flavour's: a dialog runs no background
+    /// work), asked of the host, once the break has stood the host's own
+    /// break settle, at each climb the title's own spacing allows (none
+    /// within `after` of the last title read; past that, at every busy read
+    /// until the next rung is said): a background call of the agent's own
+    /// that the host's jobs reading says has made no progress
+    /// ([`Self::no_progress_call`]) explains the screen. The ladder then
+    /// climbs as the design's `AllStuck` does: to `STALLED` at once, naming
+    /// the call (`STUCK`, which says no reader names the screen, is not
+    /// said), and to the exception one `after` past `STALLED` if that same
+    /// call still stands, in its words; another call (its group differs) is
+    /// named at `STALLED` in its turn and waits its own unit. Without it (no
+    /// reading, or refused), the rungs and their words are today's.
     fn stuck_climb(
         &mut self,
         screen: &Screen,
@@ -789,12 +823,37 @@ impl<C: Ctl> Session<'_, C> {
         let Some((next, times)) = self.stuck_rung.next() else {
             return;
         };
-        if self.fx.since(at) < after * times
-            || self.stuck_asked.is_some_and(|t| self.fx.since(t) < after)
-        {
+        if self.stuck_asked.is_some_and(|t| self.fx.since(t) < after) {
             return;
         }
         let dialog = kind == ExceptionKind::Dialog;
+        // Asked once the break has stood the settle the host's own break
+        // waits for ([`IdleHost::at_background`]'s `background_settle`): a
+        // turn that has just ended over a shell (a rating card about to
+        // come up, a notice about to wake the agent) is no stall to explain.
+        let call = if dialog || self.fx.since(at) < self.setup.background_settle {
+            None
+        } else {
+            self.no_progress_call()
+        };
+        let (next, due) = match &call {
+            Some(_) if next <= StuckRung::Told => (StuckRung::Told, true),
+            // A call other than the one `STALLED` named (or one where it
+            // named none): it is named in its turn, and its exception waits
+            // its own unit.
+            Some(c) if self.stuck_told.is_some_and(|(_, g)| g != Some(c.pgid)) => {
+                (StuckRung::Told, true)
+            }
+            Some(_) => (
+                next,
+                self.stuck_told
+                    .is_some_and(|(told, _)| self.fx.since(told) >= after),
+            ),
+            None => (next, self.fx.since(at) >= after * times),
+        };
+        if !due {
+            return;
+        }
         // The words' witness was read by the caller on this screen
         // ([`Self::stuck_busy_note`]): no `status` is asked for it.
         let status = match witness {
@@ -819,6 +878,30 @@ impl<C: Ctl> Session<'_, C> {
         };
         let minutes = self.fx.since(at).as_secs() / 60;
         self.stuck_rung = next;
+        match (next, &call) {
+            // The kernel explains the screen: the call is named, in the
+            // journal, to the host's record and in the exception.
+            (StuckRung::Told, Some(call)) => {
+                self.stuck_told = Some((self.fx.mono(), Some(call.pgid)));
+                review.note(&format!(
+                    "STALLED seq={} {}; told to the window as a record",
+                    screen.seq,
+                    call.fact(),
+                ));
+                if let Some(host) = &self.stall_host {
+                    host.stall_unread(Some(StallSeen::NoProgress {
+                        minutes: call.quiet_min(),
+                        pid: call.pid,
+                    }));
+                }
+                return;
+            }
+            (StuckRung::Raised, Some(call)) => {
+                self.raise_stuck(screen.seq, &Exception::no_progress(call), kind, review);
+                return;
+            }
+            _ => {}
+        }
         match next {
             StuckRung::Quiet => {}
             StuckRung::Said if dialog => {
@@ -850,6 +933,7 @@ impl<C: Ctl> Session<'_, C> {
                 )),
             },
             StuckRung::Told => {
+                self.stuck_told = Some((self.fx.mono(), None));
                 let what = match witness {
                     _ if dialog => "a dialog this build does not read",
                     Witness::Title => "a wait this build does not classify",
@@ -877,20 +961,32 @@ impl<C: Ctl> Session<'_, C> {
                     Witness::Title => Exception::stalled(),
                     Witness::Words(_) => Exception::stalled_on_work(),
                 };
-                review.note(&format!(
-                    "EXCEPTION seq={} kind={} when={} {} => {}",
-                    screen.seq,
-                    exception.kind.word(),
-                    exception.when.word(),
-                    exception.why,
-                    exception.action
-                ));
-                if let Some(host) = &self.stall_host {
-                    host.exception(Some(&exception));
-                }
-                self.stuck_raised = Some((self.fx.mono(), kind));
+                self.raise_stuck(screen.seq, &exception, kind, review);
             }
         }
+    }
+
+    /// The ladder's third rung: `exception` journaled (`EXCEPTION seq=<n>
+    /// kind=<k> when=<w> <why> => <action>`), told to the host, and kept as
+    /// raised for its end's `CLEARED` line ([`Self::stuck_over`]).
+    fn raise_stuck(
+        &mut self,
+        seq: u64,
+        exception: &Exception,
+        kind: ExceptionKind,
+        review: &mut dyn Review,
+    ) {
+        review.note(&format!(
+            "EXCEPTION seq={seq} kind={} when={} {} => {}",
+            exception.kind.word(),
+            exception.when.word(),
+            exception.why,
+            exception.action
+        ));
+        if let Some(host) = &self.stall_host {
+            host.exception(Some(exception));
+        }
+        self.stuck_raised = Some((self.fx.mono(), kind));
     }
 
     /// THE STALL NO READER NAMED IS OVER (or never was): the screen moved on,
@@ -904,6 +1000,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn stuck_over(&mut self, seq: u64, cause: &str, review: &mut dyn Review) {
         self.stuck_dialog = None;
         self.stuck_still = None;
+        self.stuck_told = None;
         let rung = std::mem::replace(&mut self.stuck_rung, StuckRung::Quiet);
         let raised = self.stuck_raised.take();
         if rung >= StuckRung::Told

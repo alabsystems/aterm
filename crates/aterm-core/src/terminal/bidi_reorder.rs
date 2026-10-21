@@ -16,6 +16,7 @@
 //! its columns.
 
 use super::Terminal;
+use aterm_grid::VisibleRowView;
 use aterm_types::{BiDiMode, ParagraphDirection};
 
 impl Terminal {
@@ -56,20 +57,27 @@ impl Terminal {
             return None;
         }
         let cols = self.grid.cols();
-        let continuation: Vec<bool> = (0..cols)
-            .map(|c| self.grid.is_wide_continuation_at_screen(row, c))
-            .collect();
-        // One scalar per cell for the class lookup: a cluster's first scalar
-        // decides its direction, a blank cell is a space.
-        let chars: Vec<char> = (0..cols)
-            .map(|c| {
-                let mut one = String::new();
-                super::content::push_cell_text(&self.grid, row, c, &mut one);
-                one.chars().next().unwrap_or(' ')
-            })
-            .collect();
+        // One resolve of the live on-screen row, whatever the scroll position,
+        // serves the guard, the scalars and the text.
+        let view = self.grid.screen_row_view(row);
+        Some(
+            if self.modes.bidi_mode != BiDiMode::Disabled && may_reorder(&view) {
+                self.row_display_order_full(&view, cols)
+            } else {
+                row_logical_order(&view, cols)
+            },
+        )
+    }
+
+    /// [`Self::row_display_order`] through the reordering: the renderer's
+    /// scalars and continuation flags for `view` ([`render_scalars`]), its
+    /// permutation of the written cells with the columns past them in place up
+    /// to `cols`, then one text pass in visual order. Holds for every row, the
+    /// identity included.
+    fn row_display_order_full(&self, view: &VisibleRowView<'_>, cols: u16) -> (String, Vec<usize>) {
+        let (chars, continuation) = render_scalars(view);
         let mut levels = aterm_bidi::Scratch::default();
-        let map = visual_order_cells_into(
+        let mut map = visual_order_cells_into(
             self.modes.bidi_mode,
             self.modes.bidi_direction,
             self.modes.bidi_autodetection,
@@ -77,11 +85,14 @@ impl Terminal {
             &continuation,
             &mut levels,
         );
+        // `render_row` stops at the row's last written cell, so the frame
+        // orders those and leaves the columns past them where they are.
+        map.extend(map.len()..usize::from(cols));
         let mut text = String::with_capacity(usize::from(cols));
         for &l in &map {
             if let Ok(col) = u16::try_from(l) {
                 let start = text.len();
-                super::content::push_cell_text(&self.grid, row, col, &mut text);
+                push_text(view, col, &mut text);
                 // L4, as `apply_bidi_reorder` paints the cell's first scalar.
                 if levels.cell_is_rtl(l)
                     && let Some(first) = text.get(start..).and_then(|t| t.chars().next())
@@ -94,7 +105,7 @@ impl Terminal {
         }
         let end = text.trim_end().len();
         text.truncate(end);
-        Some((text, map))
+        (text, map)
     }
 
     /// Where a pointer on viewport cell (`row`, `col`) lands in logical order: the
@@ -113,48 +124,19 @@ impl Terminal {
             return (col, false);
         }
         // A drag asks on every pointer move, so read the stored codepoints of
-        // the same offset-aware row first: only a row with one at or past the
-        // first RTL block can reorder. `Cell::char` is the packed codepoint, or
-        // U+FFFD for a complex cell (which passes, and is resolved below), so
-        // this rejects no row the renderer would permute.
+        // the same offset-aware row first.
         let view = self.grid().visible_row_view(row);
-        if col >= view.len()
-            || !(0..view.len()).any(|c| view.cell(c).is_some_and(|cell| cell.char() >= '\u{0590}'))
-        {
+        if col >= view.len() || !may_reorder(&view) {
             return (col, false);
         }
-        // Each cell's scalar, wide-continuation flag and class straight from `view`,
-        // by the `render_row_into_impl` rule, without building `RenderCell`s.
-        let len = usize::from(view.len());
+        let (chars, wide) = render_scalars(&view);
         let visual = usize::from(col);
-        let mut chars = Vec::with_capacity(len);
-        let mut wide = Vec::with_capacity(len);
-        let mut classes = Vec::with_capacity(len);
-        let mut has_rtl_candidate = false;
-        let mut prev_wide = false;
-        for c in 0..view.len() {
-            let Some(cell) = view.cell(c) else {
-                prev_wide = false;
-                continue;
-            };
-            let is_wide_cont = cell.is_wide_continuation() && !cell.is_wide() && prev_wide;
-            prev_wide = cell.is_wide();
-            let raw = if cell.is_complex() {
-                view.cell_data(c, cell).complex_base().unwrap_or('\u{FFFD}')
-            } else {
-                cell.char()
-            };
-            let ch = if is_wide_cont || raw == '\0' {
-                ' '
-            } else {
-                raw
-            };
-            has_rtl_candidate |= ch >= '\u{0590}';
-            chars.push(ch);
-            wide.push(is_wide_cont);
-            classes.push(aterm_bidi::bidi_class(ch));
+        if visual >= chars.len() || !chars.iter().any(|&ch| ch >= '\u{0590}') {
+            return (col, false);
         }
-        if visual >= chars.len() || !has_rtl_candidate || !aterm_bidi::has_bidi_classes(&classes) {
+        let classes: Vec<aterm_bidi::BidiClass> =
+            chars.iter().map(|&ch| aterm_bidi::bidi_class(ch)).collect();
+        if !aterm_bidi::has_bidi_classes(&classes) {
             return (col, false);
         }
         let brackets: Vec<aterm_bidi::Bracket> =
@@ -172,6 +154,26 @@ impl Terminal {
         let logical = order.get(visual).copied().unwrap_or(visual);
         let rtl = levels.get(logical).is_some_and(|level| level % 2 == 1);
         (u16::try_from(logical).unwrap_or(col), rtl)
+    }
+
+    /// The logical grid column of the character the frame paints at viewport cell
+    /// (`row`, `col`), and whether that cell resolved right-to-left: what a pointer
+    /// on a painted cell names. A DEC double-width or double-height line paints grid
+    /// column `c` at cells `2c` and `2c + 1`, so the painted column is halved first;
+    /// the BiDi permutation ([`Self::viewport_cell_logical`]) then maps it, in the
+    /// order the frame applies them (it reorders the stored cells, then doubles
+    /// them). The one painted-to-logical mapping a front end's pointer takes: the
+    /// GUI's selection press and link probes, and a web host's `link_at`.
+    #[must_use]
+    pub fn painted_cell_logical(&self, row: u16, col: u16) -> (u16, bool) {
+        use crate::grid::LineSize;
+        let col = match self.grid().row(row).map(crate::grid::Row::line_size) {
+            Some(
+                LineSize::DoubleWidth | LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom,
+            ) => col / 2,
+            _ => col,
+        };
+        self.viewport_cell_logical(row, col)
     }
 
     /// Reorder each row of a render snapshot into BiDi visual order, in place:
@@ -306,6 +308,66 @@ impl Terminal {
             reordered_any = true;
         }
         reordered_any
+    }
+}
+
+/// Whether `view` holds a stored codepoint at or past the first RTL block
+/// (U+0590): the guard of [`Terminal::bidi_visual_order_cells`], read off the
+/// cells before anything is gathered. `Cell::char` is the packed codepoint, or
+/// U+FFFD for a complex cell (which passes, and [`render_scalars`] resolves),
+/// so a row this rejects is one the renderer leaves in logical order.
+fn may_reorder(view: &VisibleRowView<'_>) -> bool {
+    (0..view.len()).any(|c| view.cell(c).is_some_and(|cell| cell.char() >= '\u{0590}'))
+}
+
+/// The scalar and wide-continuation flag `render_row_into_impl` gives each
+/// cell of `view`, without building `RenderCell`s, so the class lookup sees
+/// what the renderer's permutation sees: a complex cell's base, a space for a
+/// blank or a continuation. A cell is a continuation only right of a wide
+/// cell, since DECSCA-protected cells share its bit 10; a missing cell is
+/// skipped and breaks that carry, as in the render loop.
+fn render_scalars(view: &VisibleRowView<'_>) -> (Vec<char>, Vec<bool>) {
+    let len = usize::from(view.len());
+    let mut chars = Vec::with_capacity(len);
+    let mut continuation = Vec::with_capacity(len);
+    let mut prev_wide = false;
+    for c in 0..view.len() {
+        let Some(cell) = view.cell(c) else {
+            prev_wide = false;
+            continue;
+        };
+        let is_cont = cell.is_wide_continuation() && !cell.is_wide() && prev_wide;
+        prev_wide = cell.is_wide();
+        let raw = if cell.is_complex() {
+            view.cell_data(c, cell).complex_base().unwrap_or('\u{FFFD}')
+        } else {
+            cell.char()
+        };
+        chars.push(if is_cont || raw == '\0' { ' ' } else { raw });
+        continuation.push(is_cont);
+    }
+    (chars, continuation)
+}
+
+/// [`Terminal::row_display_order`] of a row the renderer leaves in logical
+/// order: one text pass over `view`'s `cols` columns and the identity.
+fn row_logical_order(view: &VisibleRowView<'_>, cols: u16) -> (String, Vec<usize>) {
+    let mut text = String::with_capacity(usize::from(cols));
+    for col in 0..cols {
+        push_text(view, col, &mut text);
+    }
+    let end = text.trim_end().len();
+    text.truncate(end);
+    (text, (0..usize::from(cols)).collect())
+}
+
+/// Column `col`'s text in a row read: nothing for a wide glyph's continuation
+/// or a column past the row.
+fn push_text(view: &VisibleRowView<'_>, col: u16, out: &mut String) {
+    if !view.is_wide_continuation(col)
+        && let Some(cell) = view.cell(col)
+    {
+        view.push_cell_text(col, cell, out);
     }
 }
 
@@ -617,6 +679,172 @@ mod tests {
         assert_eq!(text, "hello");
         assert_eq!(map, (0..10).collect::<Vec<_>>());
         assert!(ltr.row_display_order(2).is_none(), "off the screen");
+    }
+
+    /// A row the guard keeps out of the reordering reads the same through the
+    /// logical pass as through the full one, over a corpus of cell kinds; a row
+    /// it lets in holds a codepoint at or past U+0590 (a complex cell counts).
+    /// Every row's map is the renderer's permutation, under the default
+    /// paragraph and SCP 2.
+    #[test]
+    fn ltr_fast_path_equals_the_full_pass() {
+        const COLS: u16 = 12;
+        // (case, bytes, BiDi on, the guard lets it in, the frame moves a run, text)
+        let corpus: &[(&str, &str, bool, bool, bool, &str)] = &[
+            ("ascii", "hello world", true, false, false, "hello world"),
+            (
+                "below U+0590",
+                "caf\u{E9} \u{3B1}\u{3B2} \u{436}",
+                true,
+                false,
+                false,
+                "caf\u{E9} \u{3B1}\u{3B2} \u{436}",
+            ),
+            (
+                "NFD combining",
+                "e\u{301}a\u{308}o",
+                true,
+                false,
+                false,
+                "e\u{301}a\u{308}o",
+            ),
+            (
+                "interior NUL cells",
+                "a\x1b[3Cb",
+                true,
+                false,
+                false,
+                "a   b",
+            ),
+            (
+                "interior and trailing blanks",
+                "a  b   ",
+                true,
+                false,
+                false,
+                "a  b",
+            ),
+            (
+                "DECSCA-protected",
+                "\x1b[1\"qab\x1b[0\"qc",
+                true,
+                false,
+                false,
+                "abc",
+            ),
+            (
+                "BiDi off, Hebrew",
+                "x \u{5D0}\u{5D1} y",
+                false,
+                false,
+                false,
+                "x \u{5D0}\u{5D1} y",
+            ),
+            (
+                "BiDi off, complex right-to-left",
+                "x \u{10900}\u{10901} y",
+                false,
+                false,
+                false,
+                "x \u{10900}\u{10901} y",
+            ),
+            (
+                "CJK wide",
+                "\u{4E2D}\u{6587}x",
+                true,
+                true,
+                false,
+                "\u{4E2D}\u{6587}x",
+            ),
+            (
+                "DECSCA-protected after a wide glyph",
+                "\u{4E2D}\x1b[1\"qab\x1b[0\"q",
+                true,
+                true,
+                false,
+                "\u{4E2D}ab",
+            ),
+            (
+                "ZWJ emoji",
+                "a\u{1F469}\u{200D}\u{1F4BB}b",
+                true,
+                true,
+                false,
+                "a\u{1F469}\u{200D}\u{1F4BB}b",
+            ),
+            (
+                "Hebrew with a point",
+                "x \u{5D0}\u{5B7}\u{5D1} y",
+                true,
+                true,
+                true,
+                "x \u{5D1}\u{5D0}\u{5B7} y",
+            ),
+            (
+                "complex right-to-left",
+                "x \u{10900}\u{10901} y",
+                true,
+                true,
+                true,
+                "x \u{10901}\u{10900} y",
+            ),
+            // A protected cell read as a continuation (bit 10 without the wide
+            // cell before it) would class as a space and hide the run.
+            (
+                "DECSCA-protected Hebrew",
+                "x \x1b[1\"q\u{5D0}\u{5D1}\x1b[0\"q y",
+                true,
+                true,
+                true,
+                "x \u{5D1}\u{5D0} y",
+            ),
+            // The frame orders the written cells only: under an RTL paragraph a
+            // reordered blank tail would lead the text and shift the map.
+            (
+                "SCP 2, unwritten tail",
+                "\x1b[2 kx \u{5D0}\u{5D1} y",
+                true,
+                true,
+                true,
+                "y \u{5D1}\u{5D0} x",
+            ),
+        ];
+        for &(case, bytes, bidi, let_in, moves, text) in corpus {
+            let mut t = Terminal::new(1, COLS);
+            if !bidi {
+                t.modes.bidi_mode = BiDiMode::Disabled;
+            }
+            t.process(bytes.as_bytes());
+            let view = t.grid.screen_row_view(0);
+            assert_eq!(bidi && may_reorder(&view), let_in, "{case}: the guard");
+            let full = t.row_display_order_full(&view, COLS);
+            let logical = row_logical_order(&view, COLS);
+            let read = t.row_display_order(0).expect("on screen");
+            let arm = if let_in { &full } else { &logical };
+            assert_eq!(&read, arm, "{case}");
+            assert_eq!(full.0, text, "{case}");
+            let painted = t.bidi_visual_order_cells(&t.render_row(0));
+            assert_eq!(
+                full.1[..painted.len()],
+                painted[..],
+                "{case}: the frame's map"
+            );
+            assert!(
+                full.1[painted.len()..]
+                    .iter()
+                    .copied()
+                    .eq(painted.len()..usize::from(COLS)),
+                "{case}: the blank tail stays"
+            );
+            if moves {
+                // Negative control: on a row whose run the frame moves, the
+                // logical pass reads other text and another map.
+                assert_ne!(logical.0, full.0, "{case}");
+                assert_ne!(logical.1, full.1, "{case}");
+            } else {
+                assert_eq!(logical, full, "{case}");
+            }
+        }
     }
 
     /// `abc שלום עולם def`: the frame paints the two Hebrew words reversed in

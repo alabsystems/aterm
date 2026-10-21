@@ -56,6 +56,7 @@ fn ino(p: &Path) -> u64 {
 
 #[test]
 fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
+    crate::shared::need_compressor();
     let tmp = scratch("e2e-bundle");
     let root = std::fs::canonicalize(tmp.path()).expect("root");
     let host = if std::env::consts::ARCH == "aarch64" {

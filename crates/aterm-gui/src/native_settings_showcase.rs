@@ -24,11 +24,14 @@
 //! the host draws it everywhere through the transient preview lane
 //! ([`crate::App::sync_settings_theme_trial`]), writing nothing; a community
 //! pack theme is drawn from the embedded pack, so no file is written either.
-//! Keep writes `theme` once through the patch lane (only the side the
-//! segment names while the theme follows the system); a pack theme's Keep
+//! Keep writes `theme` once through the patch lane (while the theme follows
+//! the system, only one side: the one the person chose in the segment, else
+//! the one the kept theme is made for, which the segment shows meanwhile);
+//! a pack theme's Keep
 //! adds its file first and writes `theme` once the catalog lists it. Revert,
-//! Esc, leaving the page and closing Settings all end the trial the same way:
-//! no view asks for it any more, so the host reverts.
+//! Esc, leaving the page, Search Results or the category list replacing it,
+//! and closing Settings all end the trial the same way: no view asks for it
+//! any more, so the host reverts.
 //!
 //! THE CUSTOMIZE SHEET ([`customize`]) replaces the chooser: the five colour
 //! overrides with their Resets, the sixteen palette slots, and "Save as
@@ -47,7 +50,11 @@ mod customize;
 #[path = "native_settings_showcase_view.rs"]
 mod view;
 
+#[cfg(test)]
+pub(super) use view::SHEET_TITLE;
 pub(super) use view::{demo_font_candidate, demo_spec, themes_page};
+#[cfg(test)]
+pub(super) use view::{list_blocks, section_items};
 
 /// Every action the page mints starts with this.
 pub(super) const SHOWCASE_ACTION_PREFIX: &str = "settings/showcase/";
@@ -80,7 +87,7 @@ const CUSTOMIZE: &str = "settings/showcase/customize";
 const CUSTOMIZE_DONE: &str = "settings/showcase/customize-done";
 /// The community pack's disclosure.
 const PACK: &str = "settings/showcase/pack";
-/// Match system appearance.
+/// Follow system light/dark (Appearance's switch).
 const FOLLOW_SYSTEM: &str = "settings/showcase/follow-system";
 /// The Dark | Light segment while the theme follows the system:
 /// `settings/showcase/side/<dark|light>`.
@@ -206,6 +213,26 @@ pub(crate) struct PendingKeep {
     pub(crate) written: bool,
 }
 
+/// What the strip's live region settled on when a trial ended, and the theme
+/// those words name. The words stand only while that theme is the one in use
+/// on the side the page shows: an Undo, a save's select, the Follow switch,
+/// the Dark | Light segment, a hand edit or the system's appearance can put
+/// another theme in use without a trial, and the strip then says that one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Settled {
+    pub(crate) id: String,
+    pub(crate) words: String,
+}
+
+/// A measured [`ShowcaseState::name_floors`] entry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct NameFloor {
+    pub(super) cards: usize,
+    pub(super) scale: u32,
+    pub(super) heading: bool,
+    pub(super) floor: f32,
+}
+
 /// Settings ▸ Themes' view state. View-local, never config.
 #[derive(Debug)]
 pub(crate) struct ShowcaseState {
@@ -222,6 +249,14 @@ pub(crate) struct ShowcaseState {
     /// The theme files that did not load, for NEEDS ATTENTION.
     pub(crate) attention: Arc<[AttentionRow]>,
     pub(crate) trial: ShowcaseTrial,
+    /// The side the theme the highlight last moved to is made for, by the
+    /// catalog: while the theme follows the system and the person has chosen
+    /// no side in the Dark | Light segment, the side the page shows and Keep
+    /// writes ([`SettingsViewState::showcase_highlight_side`]), so a theme is
+    /// filed by the side it is made for, never by the OS's. `None` (the OS
+    /// side) until the highlight moves, after a Revert, and for a theme the
+    /// catalog does not know.
+    pub(crate) highlight_side: Option<aterm_types::Appearance>,
     /// The palette slot being edited.
     pub(crate) slot: Option<SlotEditor>,
     pub(crate) save: Option<SaveAsState>,
@@ -237,14 +272,20 @@ pub(crate) struct ShowcaseState {
     /// strip's second line, in the danger ink, until the next trial.
     pub(crate) error: Option<String>,
     /// What the strip's live region last settled on ("Kept Dracula",
-    /// "Reverted to Aterm Night"), until the next trial starts.
-    pub(crate) settled: Option<String>,
+    /// "Reverted to Aterm Night"), until the next trial starts or the theme
+    /// in use is no longer the one it names ([`Settled`]).
+    pub(crate) settled: Option<Settled>,
     /// The rows the chooser lists, in order, as the last render laid them
     /// out: the arrows, Home, End and the page keys walk them.
     order: RefCell<Vec<String>>,
     /// The rows a screen of the list holds, as the last render laid it out
     /// (Page Up and Page Down move by it).
     page_rows: Cell<usize>,
+    /// The least a theme's name keeps beside what shares its line, as last
+    /// measured: for which rows (`cards`, by address), at which text scale and
+    /// in which face (the strip's title, a row's name), so a frame measures
+    /// every name once, not once a layout ([`view::name_floor`]).
+    pub(super) name_floors: RefCell<Vec<NameFloor>>,
     /// The animation clock's reading when the page opened: the demo's
     /// phase counts from it, so a theme change never restarts the tape.
     pub(crate) demo_epoch_ms: Cell<Option<u64>>,
@@ -267,6 +308,7 @@ impl ShowcaseState {
             attention: crate::settings_preview::theme_card::attention_rows(themes, &cards).into(),
             cards,
             trial: ShowcaseTrial::Idle,
+            highlight_side: None,
             slot: None,
             save: None,
             pending_select: None,
@@ -277,6 +319,7 @@ impl ShowcaseState {
             settled: None,
             order: RefCell::new(Vec::new()),
             page_rows: Cell::new(8),
+            name_floors: RefCell::new(Vec::new()),
             demo_epoch_ms: Cell::new(None),
             last_input_phase_ms: Cell::new(0),
             input_pending: Cell::new(true),
@@ -292,13 +335,18 @@ impl ShowcaseState {
     /// Community rows are admitted while the disclosure is open or a query
     /// is typed.
     pub(crate) fn visible(&self) -> Vec<usize> {
-        let query = self.query();
+        self.visible_for(&self.query())
+    }
+
+    /// The rows `query` (trimmed, lowercase) admits: [`Self::visible`] for
+    /// that filter.
+    pub(crate) fn visible_for(&self, query: &str) -> Vec<usize> {
         self.cards
             .iter()
             .enumerate()
             .filter(|(_, card)| {
                 (card.section != Section::Community || self.pack_open || !query.is_empty())
-                    && card.matches(&query)
+                    && card.matches(query)
             })
             .map(|(index, _)| index)
             .collect()
@@ -349,10 +397,51 @@ pub(super) enum ShowcaseText {
 }
 
 impl SettingsViewState {
+    /// Whether the Themes page is the surface on glass: its route, with no
+    /// Search Results and no compact category list replacing it. Its trial,
+    /// previews and Escape steps belong to it only then; another surface
+    /// replacing it ends them ([`SettingsViewState::page_replaced`]).
+    pub(super) fn showcase_on_glass(&self) -> bool {
+        self.route == SettingsRoute::Themes
+            && self.search.trim().is_empty()
+            && !self.compact_navigation
+    }
+
+    /// THE SIDE OF THE THEME THE HIGHLIGHT IS ON, while the Themes page is
+    /// on glass and the theme follows the system: the side the page shows
+    /// where the person chose none ([`theme_visible_side`]) — the segment
+    /// shows it, the strip says it ("for Light") and Keep writes it, so
+    /// keeping a light theme while the OS is dark files it under Light (a
+    /// theme is filed by the side it is made for). Over one theme there is no
+    /// side to file under, and the OS's stays the side shown.
+    pub(super) fn showcase_highlight_side(&self) -> Option<aterm_types::Appearance> {
+        let following = prefs::theme_mode(self.raw_value(prefs::EDIT_THEME).as_deref())
+            == prefs::ThemeMode::FollowSystem;
+        (self.showcase_on_glass() && following)
+            .then_some(self.showcase.highlight_side)
+            .flatten()
+    }
+
+    /// The side a theme `id` is made for (declared or measured), as the
+    /// catalog admitted it, else as the chooser's row for it says (a
+    /// community theme not yet added); `None` for one neither knows.
+    fn theme_made_for(&self, id: &str) -> Option<aterm_types::Appearance> {
+        self.assets
+            .themes
+            .meta(id.trim())
+            .map(|meta| meta.appearance)
+            .or_else(|| self.showcase.card(id.trim()).map(|card| card.appearance))
+    }
+
     /// What this view asks of the live theme: the theme it tries, or keeps
-    /// drawn while its Keep write is in flight. `None` off the page.
+    /// drawn while its Keep write is in flight. `None` off the page, except
+    /// a Keep in flight, which the host holds until its write lands.
     pub(crate) fn theme_trial_intent(&self) -> Option<ThemeTrialIntent> {
         if self.route != SettingsRoute::Themes {
+            return None;
+        }
+        if !self.showcase_on_glass() && matches!(self.showcase.trial, ShowcaseTrial::Trying { .. })
+        {
             return None;
         }
         match &self.showcase.trial {
@@ -371,6 +460,7 @@ impl SettingsViewState {
             .is_some_and(|tried| tried.eq_ignore_ascii_case(id))
         {
             self.showcase.trial = ShowcaseTrial::Idle;
+            self.showcase.highlight_side = None;
             self.feedback = Some(format!("Can\u{2019}t try {id}: {why}"));
             self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
         }
@@ -384,12 +474,15 @@ impl SettingsViewState {
         self.showcase.attention =
             crate::settings_preview::theme_card::attention_rows(&self.assets.themes, &cards).into();
         self.showcase.cards = cards;
+        self.showcase.name_floors.borrow_mut().clear();
         self.showcase.trash_armed = None;
+        self.reseat_focus_off_a_gone_row();
         if let Some(id) = self.showcase.trial_id().map(str::to_string)
             && let Err(reason) = self.assets.themes.resolve(&id)
             && self.assets.themes.pack_fallback(&id).is_none()
         {
             self.showcase.trial = ShowcaseTrial::Idle;
+            self.showcase.highlight_side = None;
             self.showcase.error = Some(if self.assets.themes.lists(&id) {
                 reason
             } else {
@@ -398,11 +491,112 @@ impl SettingsViewState {
         }
     }
 
+    /// A ROW THAT LEAVES THE LIST TAKES NO KEYBOARD WITH IT: where the
+    /// keyboard is on a row (or its Open or Trash) that the new catalog no
+    /// longer lists — its file moved to the Trash here, or gone from the
+    /// folder — it goes to the row that followed it as the last render
+    /// listed them, else the one before it, else the highlighted row, and
+    /// that row is shown. Never on nothing: a key no tree holds makes the
+    /// next Tab start over at the window's first control.
+    fn reseat_focus_off_a_gone_row(&mut self) {
+        if self.route != SettingsRoute::Themes || self.showcase.sheet_open {
+            return;
+        }
+        let Some(rest) = self
+            .common
+            .last_focus
+            .as_ref()
+            .and_then(|key| key.as_str().strip_prefix(CARD_PREFIX))
+        else {
+            return;
+        };
+        let (slug, action) = match rest.split_once('/') {
+            Some((slug, action)) => (slug.to_string(), Some(action.to_string())),
+            None => (rest.to_string(), None),
+        };
+        let visible: Vec<usize> = self.showcase.visible();
+        let listed = |slug: &str| {
+            visible
+                .iter()
+                .any(|&index| self.showcase.cards[index].slug == slug)
+        };
+        let still_there = match action.as_deref() {
+            // A row's file actions are a Yours row's (or a NEEDS ATTENTION
+            // row's Open).
+            Some(_) => {
+                visible.iter().any(|&index| {
+                    let card = &self.showcase.cards[index];
+                    card.slug == slug && card.section == Section::Yours
+                }) || self.showcase.attention.iter().any(|row| row.slug == slug)
+            }
+            None => listed(&slug),
+        };
+        if still_there {
+            return;
+        }
+        let order = self.showcase.order.borrow().clone();
+        let target = order
+            .iter()
+            .position(|row| *row == slug)
+            .and_then(|at| {
+                order[at + 1..]
+                    .iter()
+                    .find(|row| listed(row))
+                    .or_else(|| order[..at].iter().rev().find(|row| listed(row)))
+                    .cloned()
+            })
+            .or_else(|| self.highlighted_slug().filter(|row| listed(row)));
+        let key = target.map_or_else(
+            || UiKey::new(SHOWCASE_FILTER),
+            |row| UiKey::new(format!("{CARD_PREFIX}{row}")),
+        );
+        self.common.last_focus = Some(key.clone());
+        self.reveal_control(key);
+    }
+
+    /// What [`Self::follow_showcase_change`] compares: the row highlighted
+    /// before the configuration or the catalog changes.
+    pub(super) fn showcase_highlight_before_change(&self) -> Option<String> {
+        (self.route == SettingsRoute::Themes)
+            .then(|| self.highlighted_slug())
+            .flatten()
+    }
+
+    /// The configuration or the catalog changed under the page without a
+    /// trial (an Undo or Redo, a save's select, the Follow switch, a hand
+    /// edit, a rescan): the strip's settled words go once they no longer name
+    /// the theme in use, and a keyboard that was on the highlighted row
+    /// (`highlighted_before`) goes with the highlight to the row of the theme
+    /// now in use, shown — the keyboard never stays on a row the highlight
+    /// has left.
+    pub(super) fn follow_showcase_change(&mut self, highlighted_before: Option<String>) {
+        if self
+            .showcase
+            .settled
+            .as_ref()
+            .is_some_and(|settled| !settled.id.eq_ignore_ascii_case(&self.configured_theme_id()))
+        {
+            self.showcase.settled = None;
+        }
+        if self.route != SettingsRoute::Themes || self.showcase.trial != ShowcaseTrial::Idle {
+            return;
+        }
+        let (Some(before), Some(now)) = (highlighted_before, self.highlighted_slug()) else {
+            return;
+        };
+        if now != before && self.showcase_focused_card().as_deref() == Some(before.as_str()) {
+            let key = UiKey::new(format!("{CARD_PREFIX}{now}"));
+            self.common.last_focus = Some(key.clone());
+            self.reveal_control(key);
+        }
+    }
+
     /// Leaving the page: the trial ends (the host reverts it) and the page's
     /// transient state goes. The filter and the disclosure stay, so a return
     /// finds the list as it was left; the demo starts its tape again.
     pub(super) fn leave_showcase(&mut self) {
         self.showcase.trial = ShowcaseTrial::Idle;
+        self.showcase.highlight_side = None;
         self.showcase.slot = None;
         self.showcase.save = None;
         self.showcase.sheet_open = false;
@@ -423,9 +617,13 @@ impl SettingsViewState {
         self.showcase.keep_more = false;
         if matches!(self.showcase.trial, ShowcaseTrial::Trying { .. }) {
             self.showcase.trial = ShowcaseTrial::Idle;
+            // Back to what the terminal draws: the side the OS picks, unless
+            // the person chose one.
+            self.showcase.highlight_side = None;
             self.showcase.error = None;
-            let label = self.showcase.label_of(&self.configured_theme_id());
-            self.showcase.settled = Some(format!("Reverted to {label}"));
+            let id = self.configured_theme_id();
+            let words = format!("Reverted to {}", self.showcase.label_of(&id));
+            self.showcase.settled = Some(Settled { id, words });
             self.common.last_focus = self
                 .highlighted_slug()
                 .map(|slug| UiKey::new(format!("{CARD_PREFIX}{slug}")))
@@ -439,7 +637,8 @@ impl SettingsViewState {
     /// it), a save or community add still waiting, the trial. Whether it took
     /// the Escape; otherwise the page is left the normal way.
     pub(super) fn cancel_showcase(&mut self) -> bool {
-        if self.route != SettingsRoute::Themes {
+        // Escape aimed at Search Results or the category list is theirs.
+        if !self.showcase_on_glass() {
             return false;
         }
         if self.showcase.trash_armed.take().is_some() {
@@ -483,14 +682,39 @@ impl SettingsViewState {
     }
 
     /// Close the Customize sheet: the chooser comes back, the keyboard on
-    /// Customize.
+    /// Customize, the list on the highlighted row ([`Self::showcase_landing`]).
     pub(super) fn close_showcase_sheet(&mut self) {
         self.showcase.sheet_open = false;
         self.showcase.slot = None;
         self.showcase.save = None;
         self.invalidate_result_page_limit();
         self.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+        if let Some(row) = self.showcase_landing() {
+            self.land_on_control(row);
+        }
         self.common.last_focus = Some(UiKey::new(CUSTOMIZE));
+    }
+
+    /// THE CHOOSER COMES ON GLASS ON ITS HIGHLIGHTED ROW — Settings ▸ Themes
+    /// opening, a return to it from another page, Search Results or the
+    /// category list, the Customize sheet closing: the row of the theme in
+    /// use (or the one being tried) is where the list lands, whole, as Cursor
+    /// Styles lands on the saved style's row. The list's first screen used to
+    /// leave it wherever it fell: off the screen on a short window, or cut
+    /// by the chooser's bottom edge (GitHub Light at 220×60). `None` where
+    /// the list does not show that row (the filter hides it, or the closed
+    /// Community holds it), so no landing waits to pull the list later.
+    pub(super) fn showcase_landing(&self) -> Option<UiKey> {
+        if !self.showcase_on_glass() || self.showcase.sheet_open {
+            return None;
+        }
+        let slug = self.highlighted_slug()?;
+        self.showcase
+            .visible()
+            .into_iter()
+            .any(|index| self.showcase.cards[index].slug == slug)
+            .then(|| self.highlighted_row())
+            .flatten()
     }
 
     /// The page text field the keyboard is in, if any.
@@ -522,7 +746,7 @@ impl SettingsViewState {
     /// The theme the page draws in place of the configured one: the trial.
     /// Hover never previews (highlight equals trial).
     pub(super) fn showcase_preview_id(&self) -> Option<String> {
-        if self.route != SettingsRoute::Themes {
+        if !self.showcase_on_glass() {
             return None;
         }
         self.showcase.trial_id().map(str::to_string)
@@ -531,7 +755,7 @@ impl SettingsViewState {
     /// The theme the demo draws: the trial, else the configured theme on the
     /// side the page shows (never the raw `dark:…,light:…` value).
     pub(super) fn showcase_stage_theme_id(&self) -> Option<String> {
-        if self.route != SettingsRoute::Themes {
+        if !self.showcase_on_glass() {
             return None;
         }
         Some(
@@ -542,7 +766,7 @@ impl SettingsViewState {
 
     /// The row the keyboard is on, as its slug.
     pub(super) fn showcase_focused_card(&self) -> Option<String> {
-        if self.route != SettingsRoute::Themes || self.showcase.sheet_open {
+        if !self.showcase_on_glass() || self.showcase.sheet_open {
             return None;
         }
         card_slug_of(self.common.last_focus.as_ref()?).map(str::to_string)
@@ -571,9 +795,17 @@ impl SettingsViewState {
         self.showcase.keep_more = false;
         self.showcase.error = None;
         self.showcase.pending_keep = None;
+        // The page shows the side the highlighted theme is made for (where
+        // the person chose none), so the theme in use there is what it is
+        // compared with: the light side's own theme, highlighted on a dark
+        // OS, is in use, not a trial.
+        self.showcase.highlight_side = self.theme_made_for(id);
         if id.eq_ignore_ascii_case(&self.configured_theme_id()) {
             if self.showcase.trial != ShowcaseTrial::Idle {
-                self.showcase.settled = Some(format!("Reverted to {}", self.showcase.label_of(id)));
+                self.showcase.settled = Some(Settled {
+                    id: id.to_string(),
+                    words: format!("Reverted to {}", self.showcase.label_of(id)),
+                });
             }
             self.showcase.trial = ShowcaseTrial::Idle;
         } else {
@@ -761,6 +993,78 @@ impl SettingsViewState {
         self.showcase.page_rows.get().max(1)
     }
 
+    /// PAGE UP AND PAGE DOWN TURN THE CHOOSER BY THE SCREEN IT DRAWS: how
+    /// far along the list's rows (`direction` +1, Page Down, or -1) the
+    /// highlight moves ([`Self::step_highlight`]), measured on the screens of
+    /// the list the last render seated. Page Down lands on the last row whole
+    /// on the screen whose first stop is the one after the keyboard's, so
+    /// every row between is whole on the screen it lands on; Page Up on the
+    /// first row of the screen that ends at the stop before it; where that
+    /// screen holds no row, the next row. `0` where no row lies that way:
+    /// the page keys then turn the list's page past its rows, as every
+    /// list's do. (A step of the list's room in row heights skipped a row
+    /// wherever a screen repeated a section's caption over its first row: at
+    /// 102×29 One Dark was only ever a 1pt peek.) Where no screen was
+    /// measured, the rows a screen holds.
+    pub(super) fn showcase_page_step(&self, direction: isize) -> isize {
+        let direction = direction.signum();
+        let fallback = direction * self.showcase_page_rows() as isize;
+        let Some(plan) = self.scroll_plan() else {
+            return fallback;
+        };
+        let order = self.showcase.order.borrow();
+        let row_stop =
+            |index: usize| plan.stop_of(&UiKey::new(format!("{CARD_PREFIX}{}", order[index])));
+        // Where the step counts from: the keyboard's stop, and the place
+        // among the rows the highlight moves from — the keyboard's row, or,
+        // from the Community disclosure, between the rows over it and its
+        // own, as [`Self::step_highlight`] reads it.
+        let (here, from) = if self.showcase_pack_focused() {
+            let first = order
+                .iter()
+                .position(|slug| {
+                    self.showcase
+                        .card_by_slug(slug)
+                        .is_some_and(|card| card.section == Section::Community)
+                })
+                .unwrap_or(order.len());
+            let Some(here) = plan.stop_of(&UiKey::new(PACK)) else {
+                return fallback;
+            };
+            (here, first as isize - isize::from(direction > 0))
+        } else {
+            let Some(at) = self
+                .showcase_focused_card()
+                .or_else(|| self.highlighted_slug())
+                .and_then(|slug| order.iter().position(|row| *row == slug))
+            else {
+                return fallback;
+            };
+            let Some(here) = row_stop(at) else {
+                return fallback;
+            };
+            (here, at as isize)
+        };
+        let on = |screen: &std::ops::Range<usize>, index: usize| {
+            row_stop(index).is_some_and(|stop| screen.contains(&stop))
+        };
+        let target = if direction > 0 {
+            let screen = plan.view(here + 1);
+            let next = usize::try_from(from + 1).unwrap_or(0);
+            (next..order.len())
+                .rev()
+                .find(|index| on(&screen, *index))
+                .or((next < order.len()).then_some(next))
+        } else {
+            let screen = plan.page_before(here)..here;
+            let before = usize::try_from(from).unwrap_or(0);
+            (0..before)
+                .find(|index| on(&screen, *index))
+                .or_else(|| before.checked_sub(1))
+        };
+        target.map_or(0, |target| target as isize - from)
+    }
+
     /// The highlighted row: the trial's, else the theme in use's.
     pub(crate) fn highlighted_slug(&self) -> Option<String> {
         let id = self
@@ -769,6 +1073,12 @@ impl SettingsViewState {
             .map(str::to_string)
             .unwrap_or_else(|| self.configured_theme_id());
         self.showcase.card(&id).map(|card| card.slug.clone())
+    }
+
+    /// The highlighted row's key ([`Self::highlighted_slug`]).
+    pub(super) fn highlighted_row(&self) -> Option<UiKey> {
+        self.highlighted_slug()
+            .map(|slug| UiKey::new(format!("{CARD_PREFIX}{slug}")))
     }
 
     /// Open the Community disclosure when `key` is the row of a community
@@ -803,13 +1113,20 @@ impl SettingsViewState {
         config.resolved_colors(side, &self.assets.themes, None).id
     }
 
-    /// The value Keep writes for `id`, by the rule every theme picker shares
-    /// ([`prefs::theme_choice_value`]): over a plain name or an unset theme,
-    /// the name; over a Follow-system split, the split with only the side the
-    /// page shows replaced.
+    /// The value Keep writes for `id`, by the rule for a choice whose side is
+    /// named ([`prefs::theme_choice_value`]): over one theme, the name; over a
+    /// Follow-system split, the split with only one side replaced — the side
+    /// the person chose in the page's Dark | Light segment (as a slot
+    /// picker's side is theirs), else the side `id` is made for (a theme is
+    /// filed by the side it is made for: a light theme kept while the OS is
+    /// dark goes to Light), else, for a theme the catalog does not know, the
+    /// side the OS picks. The segment shows that same side while the
+    /// highlight is on `id` ([`Self::showcase_highlight_side`]).
     fn keep_value(&self, id: &str) -> (Option<String>, Option<aterm_types::Appearance>) {
         let raw = self.raw_value(prefs::EDIT_THEME);
-        let side = theme_visible_side(self, self.presented_motion.get().system_dark);
+        let side = chosen_theme_side(self)
+            .or_else(|| self.theme_made_for(id))
+            .unwrap_or_else(|| os_theme_side(self.presented_motion.get().system_dark));
         let (value, side) =
             prefs::theme_choice_value(raw.as_deref(), side, id, &self.assets.themes);
         (Some(value), side)
@@ -996,7 +1313,7 @@ pub(super) fn palette_slot_name(key: &str) -> Option<String> {
         .parse::<usize>()
         .ok()?;
     let name = SLOT_NAMES.get(index)?;
-    Some(format!("Palette colour {index}, {name}"))
+    Some(format!("Palette color {index}, {name}"))
 }
 
 fn hex_of(color: aterm_types::Rgb) -> String {
@@ -1054,7 +1371,19 @@ pub(super) fn save_name_problem(
 }
 
 /// The first `<label> Custom`, `<label> Custom 2`, … no theme answers to.
+/// A label that is itself such a name (a theme saved here, customized
+/// again) counts from its own base: `Dracula Custom` suggests
+/// `Dracula Custom 2`, never `Dracula Custom Custom`.
 pub(super) fn suggested_save_name(label: &str, themes: &crate::app_config::ThemeCatalog) -> String {
+    let label = label.trim();
+    let stem = label
+        .rsplit_once(' ')
+        .filter(|(_, last)| !last.is_empty() && last.chars().all(|ch| ch.is_ascii_digit()))
+        .map_or(label, |(stem, _)| stem);
+    let label = stem
+        .strip_suffix(" Custom")
+        .filter(|base| !base.trim().is_empty())
+        .unwrap_or(label);
     let base: String = format!("{label} Custom")
         .chars()
         .filter(|ch| !matches!(ch, '/' | '\\' | ',' | '[' | ']' | ':') && !ch.is_control())
@@ -1087,9 +1416,9 @@ pub(super) fn save_as_text(
     scheme.name = aterm_types::scheme_import::sanitize_text(name).unwrap_or_default();
     scheme.appearance = resolved.reported;
     let description = if typography.is_empty() {
-        format!("Saved from {from_label} with your colour settings")
+        format!("Saved from {from_label} with your color settings")
     } else {
-        format!("Saved from {from_label} with your colour and type settings")
+        format!("Saved from {from_label} with your color and type settings")
     };
     let mut theme = aterm_types::scheme::ParsedTheme::colours_only(
         scheme,
@@ -1232,21 +1561,24 @@ pub(super) fn override_count(resolved: &crate::resolved_colors::ResolvedColors) 
     named + slots.len()
 }
 
-/// `count` and its noun, singular or plural: `1 colour`, `3 colours`.
+/// `count` and its noun, singular or plural: `1 color`, `3 colors`.
 pub(super) fn count_noun(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// The strip's note while the person's colour settings draw on top of every
-/// theme (`2 colours of your own on top`), or `None` when none does.
+/// The one noun for the person's color settings ([`override_count`]): the
+/// Customize button, the strip, the sheet and what a reader hears all count
+/// them in it.
+pub(super) fn custom_colors(count: usize) -> String {
+    count_noun(count, "custom color", "custom colors")
+}
+
+/// The strip's note while the person's color settings draw on top of every
+/// theme (`2 custom colors on every theme`), whether a theme is tried or
+/// not — a tried theme is drawn under them too — or `None` when none does.
 pub(super) fn override_note(resolved: &crate::resolved_colors::ResolvedColors) -> Option<String> {
     let count = override_count(resolved);
-    (count > 0).then(|| {
-        format!(
-            "{} of your own on top",
-            count_noun(count, "colour", "colours")
-        )
-    })
+    (count > 0).then(|| format!("{} on every theme", custom_colors(count)))
 }
 
 /// The page's palette commands while it is the route.
@@ -1267,7 +1599,7 @@ pub(super) fn showcase_commands(view: &SettingsViewState) -> Vec<Command> {
         },
         Command {
             id: ActionId::new(SHOWCASE_KEEP_COLOURS),
-            title: "Themes: Keep Colours Only".to_string(),
+            title: "Themes: Keep Colors Only".to_string(),
             shortcut: None,
             // Only while the tried theme would change the face, and every
             // change can be kept apart.
@@ -1357,13 +1689,17 @@ impl SettingsApp {
             .and_then(parse_appearance_word)
         {
             // The segment picks the side Keep writes; the highlight goes to
-            // that side's theme.
+            // that side's theme, and the list lands on its row (✓ and all)
+            // while the keyboard stays on the segment.
             view.theme_preview_side = Some(side);
             if matches!(view.showcase.trial, ShowcaseTrial::Trying { .. }) {
                 view.showcase.trial = ShowcaseTrial::Idle;
             }
             view.showcase.error = None;
             view.common.last_focus = Some(UiKey::new(action));
+            if let Some(slug) = view.highlighted_slug() {
+                view.land_on_control(UiKey::new(format!("{CARD_PREFIX}{slug}")));
+            }
         } else if action == FILTER_CLEAR {
             view.showcase.filter = crate::native_text_input::TextInputState::new(String::new());
             view.invalidate_result_page_limit();
@@ -1624,11 +1960,6 @@ impl SettingsApp {
             view.showcase.trial = ShowcaseTrial::Idle;
             return;
         }
-        // A pair that draws the kept theme on both sides is kept for both.
-        let both_sides = value
-            .as_deref()
-            .and_then(prefs::theme_pair_names)
-            .is_some_and(|(dark, light)| dark.eq_ignore_ascii_case(&light));
         let patch = ConfigPatch {
             base_revision: self.config_revision,
             edits: vec![ConfigEdit {
@@ -1646,7 +1977,6 @@ impl SettingsApp {
         let following = prefs::theme_mode(view.raw_value(prefs::EDIT_THEME).as_deref())
             == prefs::ThemeMode::FollowSystem;
         view.feedback = Some(match side {
-            Some(_) if both_sides => format!("Keeping {label} for light and dark mode\u{2026}"),
             Some(side) => format!("Keeping {label} for {} mode\u{2026}", appearance_word(side)),
             None if following => format!("Keeping {label} for light and dark mode\u{2026}"),
             None => format!("Keeping {label}\u{2026}"),
@@ -1701,7 +2031,7 @@ impl SettingsApp {
             .card(&id)
             .map_or_else(|| id.clone(), |card| card.label.clone());
         view.feedback = Some(format!(
-            "Keeping {label}'s colours and your type settings\u{2026}"
+            "Keeping {label}'s colors and your type settings\u{2026}"
         ));
         view.showcase.trial = ShowcaseTrial::Keeping { id, operation };
     }
@@ -1742,7 +2072,10 @@ impl SettingsApp {
         }
         if applied {
             let kept = written.as_deref().unwrap_or(id).to_string();
-            view.showcase.settled = Some(format!("Kept {}", view.showcase.label_of(&kept)));
+            view.showcase.settled = Some(Settled {
+                words: format!("Kept {}", view.showcase.label_of(&kept)),
+                id: kept.clone(),
+            });
             view.showcase.error = None;
             view.showcase.trial = ShowcaseTrial::Idle;
             // The strip's Keep, Keep colours only and Revert go with the
@@ -1887,6 +2220,10 @@ impl SettingsApp {
             drafts,
         });
         view.showcase.save = None;
+        // The name row closes and Save as theme takes its place again: the
+        // keyboard goes back to it, as Cancel and Escape send it, never on
+        // nothing.
+        view.common.last_focus = Some(UiKey::new(SHOWCASE_SAVE_AS));
         view.feedback = Some(format!("Saving {name}\u{2026}"));
         view.invalidate_result_page_limit();
     }
@@ -1942,11 +2279,15 @@ impl SettingsApp {
         // value the Save click saw (checked unchanged above) and the catalog
         // that now knows the saved theme's appearance: a light theme saved
         // on a dark OS is then made for the other side, as a catalog theme
-        // would be, instead of a name nobody knew yet.
+        // would be, instead of a name nobody knew yet. The page then shows
+        // the side it went to, so the saved theme is the one highlighted.
         let mut select = select;
         let (value, side) = view.keep_value(&select.id);
         select.theme.value = value;
         select.side = side;
+        if side.is_some() {
+            view.showcase.highlight_side = side;
+        }
         let has_clears = !select.clears.is_empty();
         let mut edits = vec![select.theme];
         edits.extend(select.clears);
@@ -1966,7 +2307,7 @@ impl SettingsApp {
         };
         view.feedback = Some(if select.side.is_some() && has_clears {
             format!(
-                "Selected {} \u{b7} its colour settings came off the other side too",
+                "Selected {} \u{b7} its color settings came off the other side too",
                 select.id
             )
         } else {
@@ -2347,6 +2688,12 @@ fn drop_carried_drafts(view: &mut SettingsViewState, drafts: &CarriedDrafts) {
         view.showcase.slot = None;
     }
     view.invalidate_result_page_limit();
+}
+
+/// The width `text` paints at in the face `role`/`style` paints it in.
+fn text_width(text: &str, role: SemanticRole, style: StyleRef) -> f32 {
+    let (px, face) = crate::native_ui::text_paint_metrics(role, style);
+    crate::tray_raster::ui_text_width_for(face, text, px)
 }
 
 /// `text` fitted to `width` in the face `role`/`style` paints it in.

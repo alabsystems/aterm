@@ -227,6 +227,10 @@ impl ConfigWriteLock {
         if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
             return Err(not_a_file());
         }
+        // The window a writer racing this check can swap the name in; the no-follow open and
+        // the descriptor's own type refuse what it plants. A test's racer runs here.
+        #[cfg(test)]
+        tests::race();
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -386,6 +390,10 @@ impl ConfigEdit<'_> {
             }
             None => (None, 0o600),
         };
+        // The window a writer that ignores the lock can change the text in, after the first
+        // check; the check before the rename refuses it. A test's racer runs here.
+        #[cfg(test)]
+        tests::race();
         write_checked(&file.target, text.as_bytes(), mode, || file.unchanged())?;
         Ok(bak)
     }

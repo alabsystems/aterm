@@ -6,8 +6,9 @@
 //! The trace drives the genuine `EditorWorkspace` reducer over the shipping
 //! `DocumentStore`, projects its view/document state into the derived model, and
 //! checks each named transition. Independent corrupted projections prove that a
-//! collapsed active mark, a minibuffer-to-document input leak, or a search caret
-//! past the document end cannot pass.
+//! collapsed active mark, a minibuffer-to-document input leak, a search caret
+//! past the document end, or a command prompt that edits the document cannot
+//! pass.
 
 #![cfg(test)]
 
@@ -29,6 +30,7 @@ struct ProjectionFacts {
     mark_origin: usize,
     search_origin: usize,
     last_exit: i64,
+    prompt_base: i64,
 }
 
 fn project(
@@ -54,6 +56,7 @@ fn project(
                 .unwrap_or(0),
             Some(*origin),
         ),
+        Minibuffer::Prompt { query, .. } => (5, query.chars().count(), None),
     };
     let mut state = model.init_state();
     state.insert("mode", mode);
@@ -83,6 +86,7 @@ fn project(
     );
     state.insert("authorized_edits", facts.authorized_edits);
     state.insert("last_exit", facts.last_exit);
+    state.insert("prompt_base", facts.prompt_base);
     state
 }
 
@@ -108,6 +112,7 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
         mark_origin: 0,
         search_origin: 0,
         last_exit: 0,
+        prompt_base: 0,
     };
     assert_eq!(
         project(&model, &store, document, &view, facts),
@@ -222,6 +227,65 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let buffer_submitted = project(&model, &store, document, &view, facts);
     assert_transition(&model, &buffer_typed, &buffer_submitted, "Submit");
 
+    // A command's prompt (`kill-buffer`'s buffer name) holds the keys until
+    // it is answered or abandoned, and the document stays at the revision it
+    // opened at.
+    let before_prompt = buffer_submitted;
+    workspace
+        .execute(&mut store, &mut view, EditorCommand::KillBuffer)
+        .unwrap();
+    facts.prompt_base = before_prompt["document_edits"];
+    let prompt_open = project(&model, &store, document, &view, facts);
+    assert_transition(&model, &before_prompt, &prompt_open, "OpenPrompt");
+    assert_eq!(
+        view.minibuffer.prompt_label(),
+        Some("Kill buffer (default this buffer): ")
+    );
+    workspace.insert_text(&mut store, &mut view, "x").unwrap();
+    let prompt_typed = project(&model, &store, document, &view, facts);
+    assert_transition(&model, &prompt_open, &prompt_typed, "MinibufferType");
+    assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "bc");
+
+    // Negative control (PromptEditsDoc): prompt typing committed through the
+    // authorized lane keeps the edit ledger balanced, so only the prompt law
+    // can refuse it, and the transition is not admitted.
+    let mut prompt_leak = prompt_typed.clone();
+    prompt_leak.insert("document_edits", prompt_typed["document_edits"] + 1);
+    prompt_leak.insert("authorized_edits", prompt_typed["authorized_edits"] + 1);
+    assert_eq!(admits(&model, &prompt_open, &prompt_leak), None);
+    assert!(model.check_invariant("MinibufferCannotEditDocument", &prompt_leak));
+    assert!(!model.check_invariant("PromptNeverEditsDocument", &prompt_leak));
+
+    workspace.minibuffer_backspace(&store, &mut view).unwrap();
+    let prompt_erased = project(&model, &store, document, &view, facts);
+    assert_transition(&model, &prompt_typed, &prompt_erased, "MinibufferBackspace");
+    workspace
+        .execute(&mut store, &mut view, EditorCommand::Abort)
+        .unwrap();
+    facts.last_exit = 1;
+    let prompt_aborted = project(&model, &store, document, &view, facts);
+    assert_transition(&model, &prompt_erased, &prompt_aborted, "AbortPrompt");
+
+    workspace
+        .execute(&mut store, &mut view, EditorCommand::KillBuffer)
+        .unwrap();
+    facts.last_exit = 0;
+    facts.prompt_base = prompt_aborted["document_edits"];
+    let prompt_reopened = project(&model, &store, document, &view, facts);
+    assert_transition(&model, &prompt_aborted, &prompt_reopened, "OpenPrompt");
+    workspace.insert_text(&mut store, &mut view, "x").unwrap();
+    let prompt_answered = project(&model, &store, document, &view, facts);
+    assert_transition(&model, &prompt_reopened, &prompt_answered, "MinibufferType");
+    assert_eq!(
+        workspace.submit_minibuffer(&mut store, &mut view).unwrap(),
+        vec![EditorEffect::KillBuffer {
+            query: "x".to_string()
+        }]
+    );
+    let prompt_submitted = project(&model, &store, document, &view, facts);
+    assert_transition(&model, &prompt_answered, &prompt_submitted, "SubmitPrompt");
+    assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "bc");
+
     // Bind the added goto lifecycle to genuine shipping code. A two-line
     // buffer makes the abstract zero-based target `1` equal the real byte of
     // line 2, so acceptance is checked as a transition rather than inferred.
@@ -237,6 +301,7 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
         mark_origin: 0,
         search_origin: 0,
         last_exit: 0,
+        prompt_base: 0,
     };
     let goto_initial = project(&model, &goto_store, goto_document, &goto_view, goto_facts);
     assert_eq!(goto_initial, model.init_state());
@@ -260,4 +325,22 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let goto_submitted = project(&model, &goto_store, goto_document, &goto_view, goto_facts);
     assert_transition(&model, &goto_typed, &goto_submitted, "SubmitGoto");
     assert_eq!(goto_view.primary_selection().head, 1);
+}
+
+/// The PromptEditsDoc mutant (`Buggy=2`) is the defect the prompt law exists
+/// for: a prompt whose typing commits through the authorized lane keeps the
+/// edit ledger balanced, so `MinibufferCannotEditDocument` holds under it and
+/// only `PromptNeverEditsDocument` is broken. The committed model breaks
+/// neither.
+#[test]
+fn prompt_edits_doc_mutant_breaks_only_the_prompt_law() {
+    use aterm_spec::interp::{violated_invariants, with_buggy};
+    let model = native_editor_modal_model();
+    assert!(violated_invariants(&with_buggy(&model, 0)).is_empty());
+    let broken = violated_invariants(&with_buggy(&model, 2));
+    assert!(broken.contains("PromptNeverEditsDocument"), "{broken:?}");
+    assert!(
+        !broken.contains("MinibufferCannotEditDocument"),
+        "{broken:?}"
+    );
 }

@@ -3,7 +3,7 @@
 
 // The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
 // under them (crates/aterm-spec-anchor/anchor_rules.rs).
-#![cfg_attr(anchor_rules, feature(macro_attr))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! Hierarchical-session routing fabric: the per-edge authority and write seam
 //! (`docs/design/HIERARCHICAL_SESSIONS.md` §§2, 4, 6.3, 7).

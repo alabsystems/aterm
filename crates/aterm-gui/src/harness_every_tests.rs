@@ -38,8 +38,16 @@ fn five_sessions(policy: &str) -> (App, crate::harness_host::HostHandle, [u64; 5
         crate::harness_policy_cell::HarnessPolicyCell::new(crate::app_config::HarnessPolicy::read(
             &format!("[harness.agy]\nenabled = false\n{policy}"),
         ));
-    assert!(app.set_session_autopilot(ids[2], Some(Autopilot::Off)));
-    assert!(app.set_session_autopilot(ids[3], Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        ids[2],
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Settings
+    ));
+    assert!(app.set_session_autopilot(
+        ids[3],
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Settings
+    ));
     assert_eq!(
         app.session_harness_posture(ids[4]),
         HarnessPosture::AgentOff(aterm_phase::Program::Agy),
@@ -246,7 +254,11 @@ fn a_timer_for_every_session_arms_one_instant() {
     for (i, &s) in [a, b, land].iter().enumerate() {
         let moved = if i == 0 { 0 } else { 61_000 };
         set_fake_clocks(Some((now, wall + moved)));
-        assert!(app.choose_autopilot_timer(s, TimerChoice::In(120)));
+        assert!(app.choose_autopilot_timer(
+            s,
+            TimerChoice::In(120),
+            crate::autopilot::Surface::Settings
+        ));
     }
     assert_eq!(
         crate::work_counts::take_timer_resolves(),
@@ -348,8 +360,16 @@ fn follow_under_a_default_of_off_says_the_harness_lets_go() {
     use crate::harness_screen::EveryPress;
     let (mut app, host, ids) = five_sessions("[harness]\nautopilot = \"off\"\n");
     let [a, b, off, land, _] = ids;
-    assert!(app.set_session_autopilot(a, Some(Autopilot::Cruise)));
-    assert!(app.set_session_autopilot(b, Some(Autopilot::Cruise)));
+    assert!(app.set_session_autopilot(
+        a,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Settings
+    ));
+    assert!(app.set_session_autopilot(
+        b,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Settings
+    ));
     let every = app.harness_state().every_row().expect("five sessions");
     assert_eq!(
         every.description(EveryPress::Follow),
@@ -370,7 +390,11 @@ fn follow_under_a_default_of_off_says_the_harness_lets_go() {
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness.agy]\nenabled = false\n"),
     );
-    assert!(app.set_session_autopilot(a, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        a,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Settings
+    ));
     let every = app.harness_state().every_row().expect("five sessions");
     assert_eq!(
         every.description(EveryPress::Follow),
@@ -391,8 +415,16 @@ fn follow_the_default_keeps_a_pinned_off() {
     use crate::harness_screen::EveryPress;
     let (mut app, host, ids) = five_sessions("");
     let [a, _, off, land, agy] = ids;
-    assert!(app.set_session_autopilot(a, Some(Autopilot::Cruise)));
-    assert!(app.set_session_autopilot(agy, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        a,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Settings
+    ));
+    assert!(app.set_session_autopilot(
+        agy,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Settings
+    ));
     assert_eq!(
         app.press_autopilot_every(EveryPress::Follow),
         2,
@@ -430,8 +462,16 @@ fn a_bulk_land_hands_back_as_the_rows_land_does() {
     let setup = || {
         let (mut app, host, ids) = five_sessions("[harness]\nautopilot = \"land\"\n");
         let [a, b, ..] = ids;
-        assert!(app.set_session_autopilot(a, Some(Autopilot::Cruise)));
-        assert!(app.set_session_autopilot(b, Some(Autopilot::Cruise)));
+        assert!(app.set_session_autopilot(
+            a,
+            Some(Autopilot::Cruise),
+            crate::autopilot::Surface::Settings
+        ));
+        assert!(app.set_session_autopilot(
+            b,
+            Some(Autopilot::Cruise),
+            crate::autopilot::Surface::Settings
+        ));
         (app, host, ids)
     };
     let (mut bulk, bulk_host, ids) = setup();
@@ -567,7 +607,11 @@ fn the_every_row_counts_by_the_presses_own_rule() {
     let [a, ..] = ids;
     let now = std::time::Instant::now();
     set_fake_clocks(Some((now, 1_792_177_230_000)));
-    assert!(app.choose_autopilot_timer(a, TimerChoice::In(60)));
+    assert!(app.choose_autopilot_timer(
+        a,
+        TimerChoice::In(60),
+        crate::autopilot::Surface::Settings
+    ));
     set_fake_clocks(None);
     let every = app.harness_state().every_row().expect("five sessions");
     assert_eq!(
@@ -889,7 +933,11 @@ fn a_row_the_layout_moved_under_a_pointer_on_the_bulk_row_waits_for_a_look() {
         run_program(&app, s, Some("claude"));
     }
     for &s in &ids[2..] {
-        assert!(app.set_session_autopilot(s, Some(Autopilot::Off)));
+        assert!(app.set_session_autopilot(
+            s,
+            Some(Autopilot::Off),
+            crate::autopilot::Surface::Settings
+        ));
     }
     assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
     let shown = |app: &mut App, claude: bool| {
@@ -963,5 +1011,131 @@ fn a_row_the_layout_moved_under_a_pointer_on_the_bulk_row_waits_for_a_look() {
             assert_eq!(after[i], before[i], "only {row}'s session moves");
         }
     }
+    host.shutdown_and_join();
+}
+
+/// A SESSIONS ROW'S OWN BUTTONS WAIT FOR A LOOK TOO (the post-landing check's
+/// owner-eye-4, design §11.5.7): three Claude Code sessions cruising on
+/// Settings ▸ Harness, the first under a timer, so its row says `lands at
+/// …`. The pointer comes to rest where, once that line goes (the timer's
+/// fire, or another surface cancelling it), the rows under it come up 22 pt
+/// and one of their buttons stands — a point that showed some other thing
+/// before. The line goes; a click there presses nothing (no session's word,
+/// no disclosure, no tab moves) and lights that button; the next click, the
+/// pointer now resting on it, presses it. NEGATIVE CONTROL: the row's buttons
+/// without `Control::look_first` (main's) take the first click.
+#[test]
+fn a_rows_button_a_state_line_moved_under_a_still_pointer_waits_for_a_look() {
+    use crate::native_app::HarnessTimerRequest;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let mut ids = vec![0];
+    for _ in 0..2 {
+        let s = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(s));
+        ids.push(s);
+    }
+    for &s in &ids {
+        run_claude(&app, s);
+    }
+    let host = idle_host();
+    app.harness = Some(host.clone());
+    {
+        let ws = app.windows.get_mut(&wid).expect("window");
+        ws.cols = 160;
+        ws.rows = 90;
+    }
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
+    let first = ids[0];
+    let timed = |app: &mut App, armed: bool| {
+        app.execute_harness_timer(HarnessTimerRequest {
+            session: first,
+            choice: if armed {
+                TimerChoice::In(60)
+            } else {
+                TimerChoice::Cancel
+            },
+        });
+        app.publish_native_harness_state();
+        let view = present_settings(app, wid);
+        let line = format!("harness/session/{first}/state");
+        let artifact = app
+            .retained_native_leaf_artifact(wid, view, true)
+            .expect("a shown frame");
+        assert_eq!(
+            artifact
+                .compiled
+                .paint
+                .iter()
+                .any(|node| node.key.as_str() == line),
+            armed,
+            "the first row's `lands at` line is drawn while its timer is armed"
+        );
+        view
+    };
+    // Where a row's button stands once the line goes, over what the page
+    // showed there with it.
+    let view = timed(&mut app, false);
+    let after = rects_of(&app, wid, view, "harness/session/");
+    let view = timed(&mut app, true);
+    let before = rects_of(&app, wid, view, "");
+    let under = |rects: &[(String, [f64; 4])], (x, y): (f64, f64)| {
+        rects
+            .iter()
+            .find(|(_, r)| x >= r[0] && x < r[2] && y >= r[1] && y < r[3])
+            .map(|(key, _)| key.clone())
+    };
+    let (rest, row) = after
+        .iter()
+        // A button whose press shows (the sessions cruise already by their
+        // default, which a Cruise press hands back to, moving nothing).
+        .filter(|(key, _)| {
+            !key.starts_with("harness/session/all/")
+                && !key.contains(&format!("/{first}/"))
+                && !key.ends_with("/autopilot/cruise")
+        })
+        .find_map(|(key, r)| {
+            let mut y = r[1] + 2.0;
+            while y < r[3] - 2.0 {
+                let p = ((r[0] + r[2]) / 2.0, y);
+                if under(&before, p).as_deref() != Some(key.as_str()) {
+                    return Some((p, key.clone()));
+                }
+                y += 2.0;
+            }
+            None
+        })
+        .expect("a row's button comes where the page showed another thing");
+    app.on_cursor_moved(wid, rest.0, rest.1);
+    let view = timed(&mut app, false);
+    assert_eq!(
+        key_at(&app, wid, rest).as_deref(),
+        Some(row.as_str()),
+        "{row} moved under the still pointer"
+    );
+    let state = |app: &App| {
+        let open = match app.native_runtime.view_state(view) {
+            Some(crate::native_app::AppViewState::Settings(state)) => state.harness_timer_open,
+            _ => None,
+        };
+        (
+            words(app, &ids),
+            open,
+            app.active_native_view(wid).map(|(_, view)| view),
+        )
+    };
+    let still = state(&app);
+    click_at(&mut app, wid, rest);
+    assert_eq!(state(&app), still, "the click pressed nothing");
+    assert_eq!(
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().hovered.as_ref())
+            .map(|key| key.as_str()),
+        Some(row.as_str()),
+        "{row} is lit"
+    );
+    click_at(&mut app, wid, rest);
+    assert_ne!(state(&app), still, "the next click presses {row}");
     host.shutdown_and_join();
 }

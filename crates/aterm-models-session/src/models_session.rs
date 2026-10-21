@@ -1086,7 +1086,7 @@ pub fn window_routing_model() -> Model {
 /// remote child to the cross-process forward, never to the local path (where it answers
 /// `ERR no such session`). `vc` enumerates the classes `0..MaxVc`; `decided` is the verdict (`0`
 /// undecided, `2` forward, `3` deny/local-miss). Forwardable is `vc =< 3`
-/// (read/write/subscribe/feed-bin); `vc = 4` is a non-forwardable owner verb. `Buggy = 1` drops
+/// (read/write/subscribe/feed-bin); `vc = 4` is a non-forwardable instance verb. `Buggy = 1` drops
 /// the subscribe class (`vc = 2`), as a selector-first planner misses the verb-first
 /// `subscribe` grammar. `ForwardableRemoteAlwaysForwarded`: once decided, a forwardable class
 /// is forwarded.
@@ -1138,20 +1138,20 @@ pub fn relay_teardown_model() -> Model {
     })
 }
 
-/// Proxy registry lifecycle: a spawned child's `ProxyEntry` is deregistered on session close,
-/// so the process-wide table never outgrows the live-session count. `live` counts live
-/// sessions, `registered` retained entries, bounded by `MaxN`; `Spawn` registers and adds a
-/// session, `Close` removes one and its entry. `Buggy = 1` is a `Drop` that forgets to
-/// deregister, once, from a table not yet leaked (keeping the space finite).
-/// `NoRegistryLeak`: `registered =< live`.
+/// Proxy registry lifecycle: what a parent retains for a spawned child (its 0600 edge-token
+/// file, owned by the `proxy::ChildProxy` the session keeps) is retired on session close, so it
+/// never outnumbers the live sessions. `live` counts live sessions, `registered` retained files,
+/// bounded by `MaxN`; `Spawn` registers and adds a session, `Close` removes one and its file.
+/// `Buggy = 1` is a `Drop` that forgets to retire it, once, from a set not yet leaked (keeping
+/// the space finite). `NoRegistryLeak`: `registered =< live`.
 ///
 /// Tier-1: aterm-gui's `session_pool_tests::session_close_conforms_to_proxy_registry_no_leak`
 /// drives the real provisioning (`spawn::provision_child_proxy`, whose `proxy::ChildProxy` the
 /// session keeps) and the real session drop through a spawn/close script that fills `MaxN` and
-/// drains it, projecting the pool and `proxy::proxies()` onto `live`/`registered` at every
-/// step. Storing the `ChildProxy` is `spawn_session`'s, which needs a live event loop; the test
-/// stores it the same way, and the undriven half is structural: an unstored `ChildProxy` drops,
-/// deregistering.
+/// drains it, projecting the pool and the children's edge-token files onto `live`/`registered`
+/// at every step. Storing the `ChildProxy` is `spawn_session`'s, which needs a live event loop;
+/// the test stores it the same way, and the undriven half is structural: an unstored
+/// `ChildProxy` drops, removing the file.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn proxy_registry_model() -> Model {
@@ -1167,7 +1167,8 @@ pub fn proxy_registry_model() -> Model {
     })
 }
 
-/// Forward-handshake liveness (proxy.rs `drain_buffered`/`connect_and_relay`): a blocking I/O
+/// Forward-handshake liveness (the `drain_buffered` bug; `control::try_proxy_forward`:
+/// `control_lanes::LaneReader::take_buffered`, then proxy.rs `relay_hop`): a blocking I/O
 /// deadlock no bad-state invariant can see. The cross-process forward is request → relay →
 /// reply: the reply bytes are already buffered past the request line, and the client is parked
 /// awaiting them. At `Buggy = 0` the server relays the buffered bytes (`reader.buffer()`) and
@@ -1253,26 +1254,29 @@ pub fn authorize_soundness_model() -> Model {
     })
 }
 
-/// No transitive authority: the reason `proxy_forward_plan` refuses to forward a chained
-/// `@a @b verb`. Forwarding requires owner-class scope (`scope.is_owner_class()`: the instance
-/// token, or the fabric bridge connection, which is Owner plus the two bridge verbs), so a
-/// connection that arrived over a forward, and so carries only an edge scope, cannot forward
-/// further. A forwarded connection authenticates at the child socket with a token and resolves
-/// to `Owner` or `Edge` there, never `Bridge`: that scope exists only on an fd the instance
-/// handed its own child, never a relayed one. So a grandparent that owns a parent cannot borrow
-/// the parent's authority to reach a grandchild; it needs a direct edge (a delegation/grant).
+/// No transitive authority: forwarding requires owner-class scope (`relay_candidate` answers
+/// `None` unless `scope.is_owner_class()`: the instance token, or the fabric bridge connection,
+/// which is Owner plus the two bridge verbs), so a connection that holds only an edge (a
+/// parent's edge onto a child, a granted one) cannot initiate a forward. A connection
+/// authenticates at a socket with a token and resolves to `Owner` or `Edge` there, never
+/// `Bridge`: that scope exists only on an fd the instance handed its own child, never a relayed
+/// one. Authority does not compose through edges: an edge onto a parent cannot be borrowed to
+/// reach the parent's child; that needs a direct edge to the grandchild (a delegation/grant).
+/// An Owner reaches any instance with that instance's own token, a credential any same-uid
+/// client reads directly, so a forward grants it nothing.
 ///
 /// A single-guard instance of [`props::conjunctive_authz`]: a forward is permitted only when the
 /// connection is Owner-scoped; `Buggy` waives the guard. `ForwardImpliesOwner`: a permitted
 /// forward implies the connection was Owner.
 ///
 /// Tier-1: aterm-gui's `control::tests::proxy_forward_plan_conforms_to_no_transitive_authority`
-/// drives the real `proxy_forward_plan` across read, write, signal and subscribe lines aimed at
-/// a forwardable child for an Owner connection, a bridge one, and one that arrived over the
-/// forward (whose scope is what the child's connect-time auth, `control::first_line_scope`,
-/// makes of the Owner plan's exact first line), stating `owner` from each scope rather than
+/// drives the real `proxy_forward_plan` across read, write, signal, owner and subscribe lines
+/// aimed at a session another instance hosts, for an Owner connection, a bridge one, and one
+/// that arrived with an edge (whose scope is what a child's connect-time auth,
+/// `control::first_line_scope`, makes of `TOKEN <parent edge> <line>` against the edges
+/// `spawn::install_parent_edges` put in its table), stating `owner` from each scope rather than
 /// from `is_owner_class`, and replays the steps against `Buggy = 1`, which must part from the
-/// real router on every arrived line.
+/// real router on every edge line.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn no_transitive_authority_model() -> Model {
@@ -1442,7 +1446,7 @@ pub fn session_id_claim_model() -> Model {
 /// `control::publish_when_committed_conformance::a_candidates_entries_name_it_only_after_the_commit`
 /// drives the real gated publication (`SuccessorPublishes` at the Commit, never before);
 /// `control::tests::an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit`
-/// the real `ambiguous_sid_refusal` and `resolve_explicit` through every entry and registration
+/// the real `ambiguous_sid_refusal` and `resolve` through every entry and registration
 /// state; and `identity_claim::tests::a_handoff_candidate_registration_is_exactly_its_own` the
 /// registration's life.
 #[must_use]

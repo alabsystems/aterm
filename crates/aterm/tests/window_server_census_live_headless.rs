@@ -161,16 +161,18 @@ fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Outp
 }
 
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    cmd.args(["ctl", "--sock", &inst.sock])
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    launch_isolation::apply(&mut cmd, &inst.tmp);
-    let child = cmd.spawn().expect("spawn the aterm client");
-    let out = bounded_wait(child, &format!("aterm ctl {args:?}"), CLIENT_EXIT_DEADLINE)
-        .unwrap_or_else(|e| panic!("{e}"));
+    let out = headless_boot::until_served(|| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        cmd.args(["ctl", "--sock", &inst.sock])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        launch_isolation::apply(&mut cmd, &inst.tmp);
+        let child = cmd.spawn().expect("spawn the aterm client");
+        bounded_wait(child, &format!("aterm ctl {args:?}"), CLIENT_EXIT_DEADLINE)
+            .unwrap_or_else(|e| panic!("{e}"))
+    });
     assert!(
         out.status.success(),
         "aterm ctl {args:?} failed: stdout={:?} stderr={:?}\ninstance log tail:\n{}",

@@ -229,7 +229,7 @@ pub fn home_env(
     claude_dir
         .filter(|dir| !super::upgrade_drive::same_dir(dir, &user_home.join(".claude")))
         .and_then(super::upgrade_drive::homedir_holding)
-        .map(|homedir| ("HOME", homedir))
+        .map(|homedir| (super::accounts::HOMEDIR_ENV, homedir))
         .into_iter()
         .collect()
 }

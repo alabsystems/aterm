@@ -18,7 +18,8 @@ use aterm_core::terminal::{Terminal, smart_word_in_cells};
 
 use crate::host::SessionHost;
 use crate::wire::{
-    WAIT_DEFAULT_MS, json_ok, json_str_field, pct_encode_into, visible_char, wait_ms,
+    VisibleTrim, WAIT_DEFAULT_MS, json_ok, json_str_field, pct_encode_into, push_visible,
+    trimmed_len, wait_ms,
 };
 
 /// The host does not resolve the target sid. Unreachable from a dispatcher that
@@ -144,36 +145,67 @@ pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
 /// `blocktext <id>` -> the output text of command block `<id>` (from
 /// `blocks`), one row per line after `OK <n>`. The engine reads the block's
 /// absolute row range itself, across scrollback and screen. `ERR` if the id is
-/// unknown or the block has no output yet.
+/// unknown or the block has no output yet. [`blocktext`] with no trim.
 pub fn cmd_blocktext(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     let Ok(id) = rest.trim().parse::<u64>() else {
         return "ERR usage: blocktext <id>\n".to_string();
     };
-    host.with_terminal(sid, |t: &Terminal| {
-        let Some(block) = t.block_by_id(id).cloned() else {
-            return "ERR no such block\n".to_string();
-        };
-        // The enum form returns an explicit signal for an evicted block instead
-        // of silently-shifted or empty text.
-        let text = match t.block_output_text(&block) {
-            aterm_core::terminal::BlockText::Text(s) => s,
-            aterm_core::terminal::BlockText::Evicted => {
-                return "ERR block output evicted from scrollback\n".to_string();
-            }
-            aterm_core::terminal::BlockText::NotAvailable => {
-                return "ERR block has no output yet\n".to_string();
-            }
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        let mut out = format!("OK {}\n", lines.len());
-        for line in lines {
-            let s: String = line.chars().map(visible_char).collect();
-            out.push_str(s.trim_end());
-            out.push('\n');
-        }
-        out
-    })
-    .unwrap_or_else(|| NO_SESSION.to_string())
+    blocktext(host, sid, id, false)
+}
+
+/// Block `id`'s output as `blocktext` answers it: `OK <n>\n` and each output
+/// line with its control chars collapsed and its tail trimmed
+/// ([`VisibleTrim::Whitespace`]); with `trim`, `OK <sent> trimmed=<k>\n` and only
+/// the rows before the blank tail ([`trimmed_len`]). The terminal is held only to
+/// copy the block's text out; the collapse, the count and the framing run after
+/// it is released, so a block of thousands of rows does not stall the PTY
+/// reader while it is framed.
+pub fn blocktext(host: &impl SessionHost, sid: u64, id: u64, trim: bool) -> String {
+    match host.with_terminal(sid, |t: &Terminal| block_text(t, id)) {
+        None => NO_SESSION.to_string(),
+        Some(Err(refusal)) => refusal.to_string(),
+        Some(Ok(text)) => frame_block_text(&text, trim),
+    }
+}
+
+/// Block `id`'s raw output text, or the reply line that refuses it. The enum
+/// `block_output_text` answers is an explicit signal for an evicted block,
+/// never silently shifted or empty text.
+fn block_text(t: &Terminal, id: u64) -> Result<String, &'static str> {
+    use aterm_core::terminal::BlockText;
+    let block = t.block_by_id(id).ok_or("ERR no such block\n")?;
+    match t.block_output_text(block) {
+        BlockText::Text(text) => Ok(text),
+        BlockText::Evicted => Err("ERR block output evicted from scrollback\n"),
+        BlockText::NotAvailable => Err("ERR block has no output yet\n"),
+    }
+}
+
+/// Frame block output `text` (see [`blocktext`]). Runs with no lock held. The
+/// blank tail is counted on the raw lines ([`trimmed_len`] reads a raw line as
+/// its shown form), so the header is written first and every row once.
+fn frame_block_text(text: &str, trim: bool) -> String {
+    use std::fmt::Write as _;
+    #[cfg(test)]
+    blocktext_tests::FRAMED.with(|n| n.set(n.get() + 1));
+    let rows = text.lines().count();
+    let sent = if trim {
+        trimmed_len(text.lines())
+    } else {
+        rows
+    };
+    // The framed rows are never longer than `text` and a closing '\n'.
+    let mut out = String::with_capacity(text.len() + 64);
+    let _ = write!(out, "OK {sent}");
+    if trim {
+        let _ = write!(out, " trimmed={}", rows - sent);
+    }
+    out.push('\n');
+    for line in text.lines().take(sent) {
+        push_visible(&mut out, line, VisibleTrim::Whitespace);
+        out.push('\n');
+    }
+    out
 }
 
 /// The newest completed block (ids are monotonic and blocks iterate
@@ -1132,5 +1164,189 @@ mod gesture_tests {
         // A click past the end of the text still selects just that cell.
         assert_eq!(select_word(&mut term, 0, 40), ((0, 40), (0, 40)));
         assert!(word_span(&term, 0, 40).is_none());
+    }
+}
+
+/// `blocktext`'s framing, and where it runs relative to the terminal lock.
+#[cfg(test)]
+mod blocktext_tests {
+    use std::cell::Cell;
+
+    use aterm_core::terminal::Terminal;
+
+    use super::{NO_SESSION, block_text, blocktext, frame_block_text};
+    use crate::conformance::MemoryHost;
+    use crate::host::{ChangeWait, HostCapabilities, Selector, SessionEntry, SessionHost};
+    use crate::wire::visible_char;
+
+    thread_local! {
+        /// How many block replies [`frame_block_text`] framed on this thread.
+        pub(super) static FRAMED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn framed() -> usize {
+        FRAMED.with(Cell::get)
+    }
+
+    /// The reply the verb gave before its framing left the lock: every line
+    /// collapsed then `trim_end`ed under the lock, and `trim` re-parsing that
+    /// reply to drop rows blank by a spaces-only test.
+    fn two_step_reply(text: &str, trim: bool) -> String {
+        let rows: Vec<String> = text
+            .lines()
+            .map(|l| {
+                l.chars()
+                    .map(visible_char)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let sent = if trim {
+            rows.iter()
+                .rposition(|r| !r.trim_matches(' ').is_empty())
+                .map_or(0, |i| i + 1)
+        } else {
+            rows.len()
+        };
+        let mut out = format!("OK {sent}");
+        if trim {
+            out.push_str(&format!(" trimmed={}", rows.len() - sent));
+        }
+        out.push('\n');
+        for row in &rows[..sent] {
+            out.push_str(row);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Each row is collapsed and trimmed, `trim` drops exactly the blank tail,
+    /// and every reply is the one the two-step framing gave, byte for byte.
+    /// NEGATIVE CONTROL: counting the tail on the raw lines with the spaces-only
+    /// test would keep rows that show nothing.
+    #[test]
+    fn blocktext_frames_each_row_and_trims_the_blank_tail() {
+        let text = "out\x01\n\u{a0}\n\x01 \t\n\n";
+        assert_eq!(frame_block_text(text, false), "OK 4\nout\n\n\n\n");
+        assert_eq!(frame_block_text(text, true), "OK 1 trimmed=3\nout\n");
+        assert_eq!(frame_block_text("", false), "OK 0\n");
+        assert_eq!(frame_block_text("", true), "OK 0 trimmed=0\n");
+        assert_eq!(
+            frame_block_text("a\r\nb \u{9b} \r\n", false),
+            "OK 2\na\nb\n"
+        );
+        for sample in [
+            text,
+            "",
+            "\n\n",
+            "a\r\nb \u{9b} \r\n",
+            "head\n\nmid  \n\u{3000}\n",
+            "no newline at the end",
+            "\0\t\x1b[0m\nlast\x7f",
+        ] {
+            for trim in [false, true] {
+                assert_eq!(
+                    frame_block_text(sample, trim),
+                    two_step_reply(sample, trim),
+                    "{sample:?} trim={trim}"
+                );
+            }
+        }
+        let raw_spaces_only = text
+            .lines()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|l| !l.trim_matches(' ').is_empty())
+            .map_or(0, |i| i + 1);
+        assert_eq!(
+            raw_spaces_only, 3,
+            "control: the raw spaces-only count keeps two blank rows"
+        );
+    }
+
+    /// [`MemoryHost`] that records whether a block reply was framed while it
+    /// held the terminal.
+    struct Watching {
+        inner: MemoryHost,
+        framed_inside: Cell<usize>,
+    }
+
+    impl SessionHost for Watching {
+        fn capabilities(&self) -> HostCapabilities {
+            self.inner.capabilities()
+        }
+        fn sessions(&self) -> Vec<SessionEntry> {
+            self.inner.sessions()
+        }
+        fn resolve(&self, selector: Selector<'_>) -> Option<u64> {
+            self.inner.resolve(selector)
+        }
+        fn with_terminal<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R> {
+            let before = framed();
+            let out = self.inner.with_terminal(sid, f);
+            self.framed_inside
+                .set(self.framed_inside.get() + framed() - before);
+            out
+        }
+        fn with_terminal_mut<R>(&self, sid: u64, f: impl FnOnce(&mut Terminal) -> R) -> Option<R> {
+            self.inner.with_terminal_mut(sid, f)
+        }
+        fn request_redraw(&self, sid: u64) {
+            self.inner.request_redraw(sid);
+        }
+        fn subscribe(&self, sid: u64) -> Box<dyn ChangeWait + '_> {
+            self.inner.subscribe(sid)
+        }
+        fn clipboard_set(&self, text: &str) -> bool {
+            self.inner.clipboard_set(text)
+        }
+    }
+
+    /// `blocktext` frames its reply after the host has released the terminal,
+    /// with or without `trim`; a refusal frames nothing. NEGATIVE CONTROL: the
+    /// same framing called inside the host's closure is seen inside.
+    #[test]
+    fn blocktext_frames_after_the_terminal_lock() {
+        let host = Watching {
+            inner: MemoryHost::new(0),
+            framed_inside: Cell::new(0),
+        };
+        host.inner.feed(
+            b"\x1b]133;A\x07$ ls\x1b]133;B\x07\r\n\x1b]133;C\x07a\r\nb\r\n\r\n\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ",
+        );
+        let start = framed();
+        let whole = blocktext(&host, 0, 0, false);
+        assert!(
+            whole.starts_with("OK ") && whole.contains("\na\nb\n"),
+            "{whole}"
+        );
+        let trimmed = blocktext(&host, 0, 0, true);
+        assert!(
+            trimmed.contains(" trimmed=")
+                && !trimmed.contains(" trimmed=0")
+                && trimmed.ends_with("\na\nb\n"),
+            "{trimmed}"
+        );
+        assert_eq!(framed() - start, 2, "both replies were framed");
+        assert_eq!(
+            host.framed_inside.get(),
+            0,
+            "neither was framed under the lock"
+        );
+
+        assert_eq!(blocktext(&host, 0, 99, true), "ERR no such block\n");
+        assert_eq!(blocktext(&host, 5, 0, true), NO_SESSION);
+        assert_eq!(framed() - start, 2, "a refusal frames nothing");
+
+        let inside = host.with_terminal(0, |t| {
+            frame_block_text(&block_text(t, 0).expect("the block has output"), false)
+        });
+        assert_eq!(inside.as_deref(), Some(whole.as_str()));
+        assert_eq!(
+            host.framed_inside.get(),
+            1,
+            "control: framing in the closure is seen"
+        );
     }
 }

@@ -4748,10 +4748,11 @@ mod tests {
 
     /// One font-size unit: every size — the default and one someone named —
     /// draws at `round(size × scale)` on a window of that scale, the size
-    /// itself at 1×, so Settings' "12 px" is Automatic on every display and one
-    /// step up from it is one step up in every window. Negative control: the
-    /// old rule drew a named 13 at 13 device px on a 2× display, half of
-    /// Automatic's 24.
+    /// itself at 1×, so Settings' default size (12 px on macOS, 15 on Linux,
+    /// 17 on Windows) is Automatic on every display and one step up from it is
+    /// one step up in every window. Negative control: the old rule drew a named
+    /// size at that many device px on a 2× display, so macOS's 13 drew at 13,
+    /// half of Automatic's 24.
     #[test]
     fn every_font_size_draws_at_its_window_scale() {
         assert_eq!(crate::font_px_for_scale(FONT_PX, 1.0), FONT_PX);
@@ -4763,7 +4764,10 @@ mod tests {
             );
         }
         assert_eq!(crate::font_px_for_scale(13.0, 2.0), 26.0);
-        assert!(crate::font_px_for_scale(13.0, 2.0) > crate::font_px_for_scale(FONT_PX, 2.0));
+        assert!(
+            crate::font_px_for_scale(FONT_PX + 1.0, 2.0) > crate::font_px_for_scale(FONT_PX, 2.0),
+            "one step up from this platform's default grows the text at 2×"
+        );
         assert_eq!(
             crate::font_px_for_scale(12.5, 1.0),
             12.5,

@@ -441,7 +441,7 @@ mod tests {
                 .unwrap()
                 .since(None)
                 .filter(|e| e.kind == PROGRAM_STATE)
-                .map(|e| e.payload.clone())
+                .map(|e| e.payload.to_string())
                 .collect();
             let status = app.fx_control(crate::FxCtlOp::Status).expect("reads");
             if codex {

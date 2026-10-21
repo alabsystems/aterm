@@ -853,3 +853,96 @@ fn a_receipt_that_lands_after_the_echoing_frame_still_lights_the_insert() {
         "a refused hop of another width is not the insert's"
     );
 }
+
+/// One line pasted with its line break after the three typed echoes (a link
+/// copied with its line ending), the insert priced `width`, its echo landing the
+/// caret at `to` in one frame: the glow, and the admission rows that frame drew.
+fn line_break_paste(width: InsertWidth, to: (u16, u16)) -> (CursorGlow, Vec<String>) {
+    let g = geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    three_visible_echoes(&mut glow, t0, &mut out);
+    let before = glow.admission_log().count();
+    glow.note_insert_delivered(at(700), width);
+    glow.tick(Some(to), at(720), &c, g, &mut out);
+    let rows = glow
+        .admission_log()
+        .skip(before)
+        .map(|r| format!("{} {:?}->{:?} {}", r.reason, r.origin, r.target, r.licence))
+        .collect();
+    (glow, rows)
+}
+
+/// A line pasted with its line break (`InsertWidth::Line`, a link copied with
+/// its line ending) echoes the line and the break's new line in one frame, the
+/// caret going from `(3, 5)` down to the next row's start `(4, 2)`: the line is
+/// laid as the insert's one sweep `5 → 16` on its own row, the rest of the move
+/// is judged from the line's end as any other (nothing licenses a row change
+/// here), and the keys typed on the new line lay there. The review's lab (2026-10-20) left such a link dark on Claude
+/// Code's composer, a multi-line body of unknown width whose echo crossed a
+/// row. A host that swallows the break echoes the line alone, on its row. The
+/// controls: the same frame priced unknown lays nothing on the line, and a
+/// landing two rows down (not the break's new line) lays nothing either.
+#[test]
+fn a_line_pasted_with_its_line_break_lays_the_line_on_its_own_row() {
+    let (mut glow, rows) = line_break_paste(InsertWidth::Line(11), (4, 2));
+    assert_eq!(
+        rows.first().map(String::as_str),
+        Some("licensed (3, 5)->(3, 16) insert"),
+        "the line is the insert's sweep on its own row: {rows:?}"
+    );
+    assert_eq!(
+        rows.get(1).map(String::as_str),
+        Some("no-fresh-hint (3, 16)->(4, 2) none"),
+        "then the break's move, judged from the line's end: {rows:?}"
+    );
+    let lit = v2_cols(&glow, 3);
+    assert!(
+        (2..16u16).all(|col| lit.contains(&col)),
+        "the typed run and the pasted line are lit: {lit:?}"
+    );
+    let g = geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let t1 = Instant::now() + Duration::from_millis(900);
+    let mut out = Vec::new();
+    for (i, col) in (3..=4u16).enumerate() {
+        let key = t1 + Duration::from_millis(100 * i as u64);
+        glow.note_typed(key);
+        glow.tick(
+            Some((4, col)),
+            key + Duration::from_millis(8),
+            &c,
+            g,
+            &mut out,
+        );
+    }
+    let lit = v2_cols(&glow, 4);
+    assert!(
+        lit.contains(&2) && lit.contains(&3),
+        "the keys typed on the new line lay there: {lit:?}"
+    );
+
+    let (glow, rows) = line_break_paste(InsertWidth::Line(11), (3, 16));
+    assert_eq!(
+        rows,
+        ["licensed (3, 5)->(3, 16) insert"],
+        "a swallowed break: the line alone"
+    );
+    assert!((2..16u16).all(|col| v2_cols(&glow, 3).contains(&col)));
+
+    for (width, to) in [
+        (InsertWidth::Unknown, (4, 2)),
+        (InsertWidth::Line(11), (5, 2)),
+        (InsertWidth::Line(40), (4, 2)),
+    ] {
+        let (glow, rows) = line_break_paste(width, to);
+        let lit = v2_cols(&glow, 3);
+        assert!(
+            !lit.contains(&5) && !lit.contains(&15),
+            "{width:?} to {to:?}: the line is not laid: {lit:?} {rows:?}"
+        );
+    }
+}

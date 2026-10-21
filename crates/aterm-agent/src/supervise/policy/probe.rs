@@ -25,7 +25,12 @@
 //!   look and returns the same value, and hands the loop's door
 //!   (`Fx::exchange`) the request and the DERIVED answer as a round trip
 //!   at `probe.<name>` ([`doors`]), so the tape holds what the decision
-//!   turned on, in the order it turned on it.
+//!   turned on, in the order it turned on it;
+//! * `KeyedProbe` answers each look from a tape out of order, through
+//!   astream-effects' keyed index of the tape — built once per tape and shared
+//!   by every decision decided again on it — bounded at the point a recorded
+//!   decision was made (`aterm drive replay --why`, `--shadow`): what the
+//!   recorded loop had learned by then, never later, and never the machine.
 //!
 //! **Derived, not raw — the privacy line.** What crosses a probe is the
 //! answer, never what was read to reach it (the replay plan's §4.7 and §7):
@@ -83,7 +88,10 @@
 //! recorded view is how a later build tells.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use astream_effects::{EffectRecord, KeyedIndex};
+use aterm_types::MutexExt;
 use serde::{Deserialize, Serialize};
 
 use super::approval::ApprovalCtx;
@@ -95,6 +103,7 @@ use crate::supervise::fx::Fx;
 use crate::supervise::tape::codec::CodecError;
 use crate::supervise::tape::core::TapeValue;
 use crate::supervise::tape::doors;
+use crate::supervise::tape::header::Roots;
 
 /// How the approval policy looks at the machine ([module docs](self)): one
 /// method per look, each returning what the policy concluded from it.
@@ -354,11 +363,21 @@ impl PolicyProbe for NoLook {
     }
 }
 
-impl<P: PolicyProbe> TapedProbe<P> {
+/// How a probe's REQUEST is written ([module docs](self)): each path as the
+/// run's roots write it (`path`), the worker by its digest under the tape's
+/// `seed`. One writer for the probe that records a request ([`TapedProbe`])
+/// and for the one that asks a tape for it again ([`KeyedProbe`]), so the two
+/// cannot spell one request two ways: a request asked otherwise than it was
+/// recorded finds nothing.
+struct Requests<'a> {
+    path: &'a dyn Fn(&Path) -> Vec<u8>,
+    seed: u64,
+}
+
+impl Requests<'_> {
     /// The absolute path `comps` as the run's roots write it.
-    fn comps_request(&self, comps: &[String]) -> Vec<u8> {
-        self.fx
-            .path_bytes(Path::new(&format!("/{}", comps.join("/"))))
+    fn comps(&self, comps: &[String]) -> Vec<u8> {
+        (self.path)(Path::new(&format!("/{}", comps.join("/"))))
     }
 
     /// `key=value` lines, each path as the run's roots write it.
@@ -369,7 +388,7 @@ impl<P: PolicyProbe> TapedProbe<P> {
             out.push(b'=');
             match value {
                 Field::Text(t) => out.extend_from_slice(t.as_bytes()),
-                Field::Path(p) => out.extend(self.fx.path_bytes(p)),
+                Field::Path(p) => out.extend((self.path)(p)),
             }
             out.push(b'\n');
         }
@@ -388,6 +407,49 @@ impl<P: PolicyProbe> TapedProbe<P> {
             (key, Field::Path(at)),
         ])
     }
+
+    /// The worker asked for by its foreground group and session.
+    fn worker_proc(&self, group: u32, sid: &str) -> Vec<u8> {
+        self.lines(&[
+            ("group", Field::Text(&group.to_string())),
+            ("sid", Field::Text(sid)),
+        ])
+    }
+
+    /// A git view asked for: the worker, the directory, and where the worker
+    /// may write.
+    fn git_view(&self, worker: &WorkerEnv, dir: &Path, writes: &WorkerWrites<'_>) -> Vec<u8> {
+        let worker = self.worker(worker);
+        let mut fields = vec![
+            ("worker", Field::Text(&worker)),
+            ("dir", Field::Path(dir)),
+            ("cwd", Field::Path(writes.cwd)),
+        ];
+        fields.extend(
+            writes
+                .shell_cwds
+                .iter()
+                .map(|d| ("shell_cwd", Field::Path(d))),
+        );
+        fields.extend(
+            writes
+                .scratch_roots
+                .iter()
+                .map(|r| ("root", Field::Text(r.label()))),
+        );
+        self.lines(&fields)
+    }
+}
+
+impl<P: PolicyProbe> TapedProbe<P> {
+    /// A request written by [`Requests`] through this probe's door.
+    fn request(&self, write: impl FnOnce(&Requests<'_>) -> Vec<u8>) -> Vec<u8> {
+        let path = |p: &Path| self.fx.path_bytes(p);
+        write(&Requests {
+            path: &path,
+            seed: self.seed,
+        })
+    }
 }
 
 /// One value of a probe's request.
@@ -400,7 +462,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
         self.fx.exchange(
             doors::PROBE_HIDDEN_TWIN,
-            || self.comps_request(comps),
+            || self.request(|r| r.comps(comps)),
             || self.live.hidden_twin(comps),
         )
     }
@@ -408,7 +470,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn real_components(&self, comps: &[String]) -> Option<Vec<String>> {
         self.fx.exchange(
             doors::PROBE_REAL_COMPONENTS,
-            || self.comps_request(comps),
+            || self.request(|r| r.comps(comps)),
             || self.live.real_components(comps),
         )
     }
@@ -416,7 +478,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String> {
         self.fx.exchange(
             doors::PROBE_RM_PHYSICAL,
-            || self.comps_request(comps),
+            || self.request(|r| r.comps(comps)),
             || self.live.rm_physical(comps),
         )
     }
@@ -424,12 +486,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn worker_proc(&self, group: u32, sid: &str) -> Result<WorkerEnv, String> {
         self.fx.exchange(
             doors::PROBE_WORKER_PROC,
-            || {
-                self.lines(&[
-                    ("group", Field::Text(&group.to_string())),
-                    ("sid", Field::Text(sid)),
-                ])
-            },
+            || self.request(|r| r.worker_proc(group, sid)),
             // Digested where it crosses: every later request names the
             // worker as this record does.
             || {
@@ -448,27 +505,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     ) -> Result<GitView, String> {
         self.fx.exchange(
             doors::PROBE_GIT_VIEW,
-            || {
-                let worker = self.worker(worker);
-                let mut fields = vec![
-                    ("worker", Field::Text(&worker)),
-                    ("dir", Field::Path(dir)),
-                    ("cwd", Field::Path(writes.cwd)),
-                ];
-                fields.extend(
-                    writes
-                        .shell_cwds
-                        .iter()
-                        .map(|d| ("shell_cwd", Field::Path(d))),
-                );
-                fields.extend(
-                    writes
-                        .scratch_roots
-                        .iter()
-                        .map(|r| ("root", Field::Text(r.label()))),
-                );
-                self.lines(&fields)
-            },
+            || self.request(|r| r.git_view(worker, dir, writes)),
             || self.live.git_view(worker, dir, writes),
         )
     }
@@ -476,7 +513,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn settings_env(&self, worker: &WorkerEnv, launch: &Path) -> Result<(), String> {
         self.fx.exchange(
             doors::PROBE_SETTINGS_ENV,
-            || self.worker_at(worker, "launch", launch),
+            || self.request(|r| r.worker_at(worker, "launch", launch)),
             || self.live.settings_env(worker, launch),
         )
     }
@@ -484,7 +521,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn shell_startup(&self, worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
         self.fx.exchange(
             doors::PROBE_SHELL_STARTUP,
-            || self.worker_at(worker, "launch", launch),
+            || self.request(|r| r.worker_at(worker, "launch", launch)),
             || self.live.shell_startup(worker, launch),
         )
     }
@@ -492,7 +529,7 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn owner_asks(&self, worker: &WorkerEnv, launch: &Path) -> Result<Vec<OwnerAsk>, String> {
         self.fx.exchange(
             doors::PROBE_OWNER_ASKS,
-            || self.worker_at(worker, "launch", launch),
+            || self.request(|r| r.worker_at(worker, "launch", launch)),
             || self.live.owner_asks(worker, launch),
         )
     }
@@ -500,8 +537,170 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf> {
         self.fx.exchange(
             doors::PROBE_SHELL_CWDS,
-            || self.worker_at(worker, "cwd", cwd),
+            || self.request(|r| r.worker_at(worker, "cwd", cwd)),
             || self.live.shell_cwds(worker, cwd),
+        )
+    }
+}
+
+/// The tape's effects, by ordinal, and astream-effects' keyed index of their
+/// round trips ([`KeyedIndex`]): built once per tape and shared, behind an
+/// `Arc`, by the keyed probe of every decision decided again on it.
+pub(crate) type TapeIndex = KeyedIndex<Arc<[EffectRecord]>>;
+
+/// A probe that answers from a TAPE, asked out of order: what `aterm drive
+/// replay --why` and `--shadow` decide a recorded box again with, on any
+/// build. Each look is asked of the tape's round trips through
+/// astream-effects' keyed index ([`TapeIndex`]) by its door and its request,
+/// written as the recording wrote it ([`Requests`], under the tape's RECORDED
+/// roots and seed), and answered by the LATEST such round trip among the
+/// records the recorded loop had read when it decided — `seen`, the index's
+/// own bound, a count of records — never one from after: what the loop had
+/// learned by then, never what it learned later. Nothing is consumed and the
+/// machine is never looked at.
+///
+/// A look costs one lookup in the shared index. It once built a keyed VIEW of
+/// the whole tape at every look (a view borrows the records, and a probe must
+/// own what it reads): on a tape grown to 100,049 effects from the corpus's
+/// `c4-read`, two looks a box, a shadow took 2.59 s, quadratic in the tape
+/// (`benches/tape_shadow_cost.rs`, T12).
+///
+/// A look the tape does not hold before the point — a build that asks what
+/// the recording's build never asked, or asks it otherwise — is answered as
+/// a refused look ("not on the tape"), so the decision goes the cautious way
+/// it goes for any unreadable look, and the door and request are kept
+/// ([`Self::misses`]): what the re-decision NEEDED and did not have, said
+/// beside it, never a guess presented as the recorded world.
+#[derive(Debug)]
+pub(crate) struct KeyedProbe {
+    /// The tape's records, by ordinal, and their keyed index, shared.
+    index: Arc<TapeIndex>,
+    /// How many of them the recorded loop had read at the point.
+    seen: usize,
+    /// The tape's roots as recorded: paths are asked as the recording wrote
+    /// them.
+    roots: Roots,
+    /// The tape's seed for a worker's digest ([`WorkerEnv::digest`]).
+    seed: u64,
+    misses: Mutex<Vec<String>>,
+}
+
+impl KeyedProbe {
+    /// A probe standing where the recorded loop had read the first `seen` of
+    /// the records `index` holds (the tape's effects, by ordinal), its
+    /// requests written under `roots` and `seed` as the recording wrote them.
+    pub(crate) fn at(index: Arc<TapeIndex>, seen: usize, roots: Roots, seed: u64) -> Self {
+        Self {
+            index,
+            seen,
+            roots,
+            seed,
+            misses: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every look asked that the tape did not answer before the point: its
+    /// door, and what it asked as the tape writes it.
+    pub(crate) fn misses(&self) -> Vec<String> {
+        self.misses.lock_or_recover().clone()
+    }
+
+    /// The answer to the request `write` writes at `door`, or `unrecorded`
+    /// with why.
+    fn answer<A: TapeValue>(
+        &self,
+        door: &str,
+        write: impl FnOnce(&Requests<'_>) -> Vec<u8>,
+        unrecorded: impl FnOnce(String) -> A,
+    ) -> A {
+        // Lossy as the recorder writes a path (`TapeCore::path`).
+        let path = |p: &Path| {
+            String::from_utf8_lossy(&self.roots.encode(p))
+                .into_owned()
+                .into_bytes()
+        };
+        let request = write(&Requests {
+            path: &path,
+            seed: self.seed,
+        });
+        let found = self
+            .index
+            .lookup(door, &request, self.seen)
+            .map_err(|_| "not on the tape before this point")
+            .and_then(|hit| {
+                A::from_tape(hit.reply).map_err(|_| "on the tape in a form this build cannot read")
+            });
+        found.unwrap_or_else(|why| {
+            self.misses.lock_or_recover().push(format!(
+                "{door} {}",
+                String::from_utf8_lossy(&request)
+                    .trim_end()
+                    .replace('\n', " ")
+            ));
+            unrecorded(format!("{door}: {why}"))
+        })
+    }
+}
+
+impl PolicyProbe for KeyedProbe {
+    fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
+        self.answer(doors::PROBE_HIDDEN_TWIN, |r| r.comps(comps), Err)
+    }
+
+    fn real_components(&self, comps: &[String]) -> Option<Vec<String>> {
+        self.answer(doors::PROBE_REAL_COMPONENTS, |r| r.comps(comps), |_| None)
+    }
+
+    fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String> {
+        self.answer(doors::PROBE_RM_PHYSICAL, |r| r.comps(comps), Err)
+    }
+
+    fn worker_proc(&self, group: u32, sid: &str) -> Result<WorkerEnv, String> {
+        self.answer(doors::PROBE_WORKER_PROC, |r| r.worker_proc(group, sid), Err)
+    }
+
+    fn git_view(
+        &self,
+        worker: &WorkerEnv,
+        dir: &Path,
+        writes: &WorkerWrites<'_>,
+    ) -> Result<GitView, String> {
+        self.answer(
+            doors::PROBE_GIT_VIEW,
+            |r| r.git_view(worker, dir, writes),
+            Err,
+        )
+    }
+
+    fn settings_env(&self, worker: &WorkerEnv, launch: &Path) -> Result<(), String> {
+        self.answer(
+            doors::PROBE_SETTINGS_ENV,
+            |r| r.worker_at(worker, "launch", launch),
+            Err,
+        )
+    }
+
+    fn shell_startup(&self, worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
+        self.answer(
+            doors::PROBE_SHELL_STARTUP,
+            |r| r.worker_at(worker, "launch", launch),
+            Err,
+        )
+    }
+
+    fn owner_asks(&self, worker: &WorkerEnv, launch: &Path) -> Result<Vec<OwnerAsk>, String> {
+        self.answer(
+            doors::PROBE_OWNER_ASKS,
+            |r| r.worker_at(worker, "launch", launch),
+            Err,
+        )
+    }
+
+    fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf> {
+        self.answer(
+            doors::PROBE_SHELL_CWDS,
+            |r| r.worker_at(worker, "cwd", cwd),
+            |_| Vec::new(),
         )
     }
 }

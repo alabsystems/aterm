@@ -56,6 +56,17 @@ impl PresenceTable {
     }
 }
 
+/// WHAT ONE LOOK MOVED ([`App::see_front`]): a task's done rev seen (the
+/// menu bar's Done for you), and a task's end on the glass seen (the tab's
+/// `•`, wherever else the session is drawn).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Seen {
+    /// A finished task's done rev was seen.
+    pub(crate) task: bool,
+    /// A task's end on the glass was seen (§11.2.3, item 6).
+    pub(crate) end: bool,
+}
+
 /// The chrome-row re-grid a [`App::with_chrome_regrid_batch`] recorded, to
 /// apply at its end.
 #[derive(Debug, Default)]
@@ -509,7 +520,7 @@ impl App {
         let holds = ctx.fabric.holds();
         let hold = holds.word();
         // The stall in the server attention's own words — composed after the
-        // timeline's leaf lock is released (it reads the clock and the zone) —
+        // timeline's leaf lock is released (it reads the zone) —
         // and whether the pill carries its restart now, by the one predicate
         // the pill's Restart is offered by (`restart_act::offered`), or would
         // once Hand Back lifts the one hold that refuses it.
@@ -798,16 +809,50 @@ impl App {
     /// where it moved, the session's footer is posted and the move goes past
     /// the glass (`App::harness_task_moved`: the page, and a record of a
     /// landing's end). A fact for a session this window does not hold is
-    /// dropped. A face told again is no move: no frame.
+    /// dropped. A face told again is no move: no frame. Beside a PROVEN
+    /// self-claim the face is the self-claim's (FOREVER LAND §10.4): the
+    /// hosted loop's own faces are dropped, and the self-claim's
+    /// ([`crate::HarnessFact::SelfTask`]) are taken only while it stands.
     pub(crate) fn apply_harness_fact(&mut self, sid: &str, fact: crate::HarnessFact) {
         let Some(session) = self.local_session_of(&SessionId::new(sid)) else {
             return;
         };
         match fact {
             crate::HarnessFact::Act(act) => crate::harness_glass::on_act(self, session, act),
-            crate::HarnessFact::Task(face) => self.apply_task_face(session, face, None),
+            crate::HarnessFact::Task(face) => {
+                if self.beside_proven_self_claim(session) {
+                    return;
+                }
+                self.apply_task_face(session, face, None, None);
+            }
             crate::HarnessFact::TaskNoted(face, noted_ms) => {
-                self.apply_task_face(session, Some(face), Some(noted_ms));
+                if self.beside_proven_self_claim(session) {
+                    return;
+                }
+                self.apply_task_face(session, Some(face), None, Some(noted_ms));
+            }
+            crate::HarnessFact::SelfTask(face) => {
+                if !self.beside_proven_self_claim(session) {
+                    return;
+                }
+                // A LANDING ONLY UNDER LAND: nothing ends a Cruise task (nor
+                // an Off one), whatever the self-claim's act says — a
+                // codex-alab that recorded `landed@v1` under Cruise would
+                // read `task=landed`, the glass's end mark with it.
+                if face == aterm_agent::harness::acts::TaskFace::Landed
+                    && !self.self_claim_may_land(session)
+                {
+                    return;
+                }
+                // A self-claim's act is its own news, never a landing a loop
+                // before restated: a landing told over "unknown" is a move
+                // from open, and is recorded.
+                self.apply_task_face(
+                    session,
+                    Some(face),
+                    Some(aterm_agent::harness::acts::TaskFace::Open),
+                    None,
+                );
             }
             // THE LOOP'S PAUSE AFTER SHORT TURNS (§10.5.3, item 4): on the
             // timeline (`status pause=`, under the lock it already takes)
@@ -840,50 +885,16 @@ impl App {
         }
     }
 
-    /// THE TASK'S FACE of session `session` told by its loop
-    /// ([`Self::apply_harness_fact`]): `face` (`None`: unknown), and
-    /// `noted_ms` where the loop's start restated it from the journal
-    /// (`HarnessFact::TaskNoted`: the wall time, unix ms, its end was
-    /// noted). On the timeline and in the glass; where it moved, the footer
-    /// posted and the move taken past the glass.
-    fn apply_task_face(
-        &mut self,
-        session: u64,
-        face: Option<aterm_agent::harness::acts::TaskFace>,
-        noted_ms: Option<i64>,
-    ) {
-        let Some(entry) = self.pool.get(session) else {
-            return;
-        };
-        // The wall clock, unix ms, as the timeline keeps it and the glass
-        // formats the face's clock time from it (`landed 17:42`) — never the
-        // turn ledger's process-relative ms. A face restated from the
-        // journal takes its note's time instead (never one past now): a
-        // window that held no face of the session — a seamless update's new
-        // one — shows when the work ended, not when the loop came back
-        // (§10.2.7).
-        let now_ms = crate::harness_screen::unix_ms_now();
-        let stamp_ms = noted_ms.map_or(now_ms, |noted| noted.min(now_ms));
-        // The face it moved from, and the time the face now held moved
-        // there: a restated face (the same face told after "unknown") keeps
-        // the first time this window held.
-        let (was, at_ms) = {
-            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let was = timeline.task_face().map(|(f, _)| f);
-            if !timeline.set_task_face(face, stamp_ms) {
-                return;
-            }
-            (was, timeline.task_face().map_or(stamp_ms, |(_, at)| at))
-        };
-        if crate::harness_glass::on_task(self, session, face, at_ms) {
-            crate::claude_footer::post_changed(session);
-        }
-        // The A/B book's cause may have moved with the face (done or landed
-        // is "finished" at the prompt, §10.5.3 B.3).
-        self.note_harness_arm(session);
-        // Past the glass: the page republished, and a landing that landed
-        // or was spent under Land recorded (§9.4.4).
-        self.harness_task_moved(session, was, face);
+    /// Whether a proven self-claim's `landed@v1` may land session
+    /// `session`'s task (FOREVER CRUISE / FOREVER LAND §10.4): the mode the
+    /// session runs under is Land — its own word, else the table's default
+    /// ([`crate::autopilot::AutopilotView::of`]) — or none this window can
+    /// name (no harness here to say otherwise).
+    fn self_claim_may_land(&self, session: u64) -> bool {
+        let (word, view, _) = self.session_autopilot(session);
+        view.mode()
+            .or(word)
+            .is_none_or(|mode| mode == aterm_agent::supervise::Autopilot::Land)
     }
 
     /// The wake arms: resolve the fabric sid to the pool's local id.
@@ -1061,6 +1072,7 @@ impl App {
             return;
         };
         let front = ws.tab_set.active_index();
+        let tab_count = ws.tab_set.len();
         for (index, (tab, item)) in ws
             .tab_set
             .tabs()
@@ -1068,6 +1080,9 @@ impl App {
             .zip(metadata.iter_mut())
             .enumerate()
         {
+            // The tab's load meter (design §12.4): its focused session's
+            // cores-worth from the latest vitals reading.
+            item.load = self.chip_load(tab_count, tab.focus);
             let mut level = item.attention;
             tab.root.any_leaf(&mut |view| {
                 if let Some(session) = self
@@ -1140,14 +1155,27 @@ impl App {
     /// program, which reported its own turn end where nobody watched (a
     /// background codex: codex-alab keeps OSC 9 inert and desktop notices
     /// are off by default, so the tab is where the end shows), beyond the
-    /// count [`Self::turn_end_seen`] holds. The tab's `•`. Reads the done
-    /// revs the last team build took ([`Self::rebuild_teams`]) and the
-    /// presence slot, so a strip stamp on the frame path takes no lock.
+    /// count [`Self::turn_end_seen`] holds, or its supervised agent's task,
+    /// which CAME DOWN (`harness_task::is_a_task_end`) and whose end on the
+    /// glass nobody looked at ([`Self::end_unseen`], §11.2.3 item 5). The
+    /// tab's `•`. Reads the done revs the last team build took
+    /// ([`Self::rebuild_teams`]), the presence slot and the glass, so a strip
+    /// stamp on the frame path takes no lock.
     fn done_unseen(&self, session: u64) -> bool {
         self.task_done
             .get(&session)
             .is_some_and(|rev| self.done_seen.get(&session) != Some(rev))
             || self.turn_ends_unseen(session).is_some()
+            || self.end_unseen(session)
+    }
+
+    /// Whether `session`'s task end stands on its glass unseen (§11.2.3,
+    /// item 5): a map lookup.
+    pub(crate) fn end_unseen(&self, session: u64) -> bool {
+        self.harness_glass
+            .get(&session)
+            .and_then(crate::harness_glass::SessionGlass::end)
+            .is_some_and(crate::harness_glass::EndGlass::unseen)
     }
 
     /// `session`'s program turn ends that were news (the slot's
@@ -1171,19 +1199,38 @@ impl App {
     /// others alike (a zoomed tab shows its focused pane alone). Run where
     /// that can begin: a projection, a task that finished in front
     /// ([`Self::rebuild_teams`]), the window's focus gain and its reveal.
+    /// A task's END on the glass (§11.2.3, item 6) is seen by the same rule:
+    /// the front tab wears no `•`, but another window may show the session
+    /// behind its own front tab, so a look that quiets an end stamps every
+    /// strip again, once ([`Self::restamp_for_end`]).
     pub(crate) fn note_done_seen(&mut self, wid: WindowId) {
+        let seen = self.see_front(wid);
+        if seen.end {
+            self.restamp_for_end();
+        } else if seen.task {
+            // The front tab wears no `•`, so only the menu bar's Done for
+            // you can have moved.
+            self.mark_status_dirty();
+        }
+    }
+
+    /// THE LOOK ITSELF ([`Self::note_done_seen`]): where `wid` is looked at
+    /// ([`Self::window_looked_at`]), every pane its front tab shows has its
+    /// task's done rev, its program's turn ends and its task's end seen.
+    /// What moved; the caller says so to the strips and the glance.
+    pub(crate) fn see_front(&mut self, wid: WindowId) -> Seen {
+        let mut seen = Seen::default();
         if !self.window_looked_at(wid) {
-            return;
+            return seen;
         }
         let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.active()) else {
-            return;
+            return seen;
         };
         let shown = if tab.zoomed {
             vec![tab.focus]
         } else {
             tab.root.leaves()
         };
-        let mut moved = false;
         for view in shown {
             let Some(session) = self
                 .view_store
@@ -1194,18 +1241,17 @@ impl App {
                 continue;
             };
             if let Some(rev) = self.task_done.get(&session).copied() {
-                moved |= self.done_seen.insert(session, rev) != Some(rev);
+                seen.task |= self.done_seen.insert(session, rev) != Some(rev);
             }
             // A program's turn end is a tab mark alone: no menu bar row.
             if let Some(news) = self.turn_ends_unseen(session) {
                 self.turn_end_seen.insert(session, news);
             }
+            if let Some(glass) = self.harness_glass.get_mut(&session) {
+                seen.end |= glass.see_end();
+            }
         }
-        // The front tab wears no `•`, so only the menu bar's Done for you
-        // can have moved.
-        if moved {
-            self.mark_status_dirty();
-        }
+        seen
     }
 
     /// THE ONE WRITE OF A DONE SEEN BY AN ACT (owner surfaces §3): the
@@ -1219,6 +1265,23 @@ impl App {
         if self.done_seen.insert(session, entered) == Some(entered) {
             return;
         }
+        self.mark_status_dirty();
+        let windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in &windows {
+            Desk::request_redraw(self, *wid);
+        }
+        self.refresh_tab_chrome_windows(windows);
+    }
+
+    /// A TASK'S END MOVED ON THE TAB'S `•` (§11.2.3, items 6 and 7): one
+    /// told and standing unseen, one looked at, or one cleared by a move to
+    /// a face that is no end. Every strip is stamped again — wherever the
+    /// session is drawn behind a front tab — and the menu bar's glance
+    /// dirtied, as [`Self::mark_done_seen`] does: one re-stamp per end, and
+    /// one per look that quiets an end, never per frame.
+    pub(crate) fn restamp_for_end(&mut self) {
+        #[cfg(test)]
+        crate::work_counts::end_restamped();
         self.mark_status_dirty();
         let windows: Vec<WindowId> = self.windows.keys().copied().collect();
         for wid in &windows {
@@ -1440,7 +1503,7 @@ impl App {
         {
             parts.push(format!("driven by aterm ({})", view.wire()));
         }
-        (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
+        (!parts.is_empty()).then(|| parts.join(crate::native_ui::FACT_SEPARATOR))
     }
 
     /// The native pill's click as its wake delivers it (`Wake::PillAct`): it
@@ -1654,13 +1717,13 @@ impl App {
             .into_iter()
             .find(|w| StoryVerb::parse_told(w) == Some(verb))
             .unwrap_or("unknown");
-        let owed = self.pool.get(session).is_some_and(|s| {
+        if let Some(s) = self.pool.get(session) {
             let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let at = timeline.slog().now();
             timeline.slog_mut().observe_story(word, by, at);
-            timeline.slog_take_wake()
-        });
-        self.wake_log_watchers(session, owed);
+            // An owed wake rings the session's watchers under this lock.
+            let _ = timeline.slog_take_wake();
+        }
         Ok(seq)
     }
 
@@ -2062,12 +2125,6 @@ impl Desk for App {
             self.redraw_claude_footer(session);
             self.note_harness_arm(session);
             self.harness_screen_moved();
-            if self.subscribers.any() {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(session);
-            }
         }
     }
 
@@ -2147,12 +2204,12 @@ mod tests {
     }
 
     /// `ctx`'s task marked `state` (a `stalled` one is a stuck need).
-    fn task(app: &App, ctx: &crate::SessionCtx, local: u64, state: TaskState) {
+    fn task(ctx: &crate::SessionCtx, local: u64, state: TaskState) {
         let mark = TaskMark {
             why: (state == TaskState::Stalled).then_some("startup"),
             ..TaskMark::new(state)
         };
-        mark_session_task(ctx, local, &mark, &app.subscribers).expect("unfenced");
+        mark_session_task(ctx, local, &mark).expect("unfenced");
     }
 
     fn view(app: &App, wid: WindowId) -> &WindowView {
@@ -2187,11 +2244,11 @@ mod tests {
             line.contains(&format!("pressing=@{}", ctx.self_id.as_str())),
             "{line}"
         );
-        task(&app, &ctx, sid, TaskState::Stalled);
+        task(&ctx, sid, TaskState::Stalled);
         app.refresh_presence_session(sid);
         assert_eq!(view(&app, wid).rim, Rim::Stuck, "stuck outranks decide");
         ask(&ctx, None);
-        task(&app, &ctx, sid, TaskState::Working);
+        task(&ctx, sid, TaskState::Working);
         app.refresh_presence_session(sid);
         assert_eq!(view(&app, wid).rim, Rim::None);
         assert!(app.presence_pill(wid).is_none());
@@ -2437,6 +2494,49 @@ mod tests {
         );
     }
 
+    /// THE CHIPS' LOAD METERS (design §12.4): each tab's chip carries its
+    /// focused session's cores-worth on the machine from the latest reading;
+    /// a tab the reading has not measured carries none, and turning the
+    /// stats bars off clears every meter (nothing is read then, so a step
+    /// would be stale).
+    #[test]
+    fn each_chip_carries_its_tabs_load_until_the_bars_are_off() {
+        let (mut app, wid, _first, _ctx) = app_with_stub();
+        let (second, _second_ctx) = second_tab(&mut app, wid);
+        let mut snap = crate::stats_deck::tests::snapshot();
+        snap.tabs[0].key = second;
+        snap.tabs[0].scope.cores.level = 5.0;
+        app.vitals.snapshot = Some(std::sync::Arc::new(snap));
+        let loads = |app: &App| {
+            let mut metadata: Vec<crate::tab_bar::TabStripMetadata> = app.windows[&wid]
+                .tab_set
+                .tabs()
+                .iter()
+                .map(|t| crate::tab_bar::TabStripMetadata::from_presentation(&t.presentation))
+                .collect();
+            app.stamp_presence_chips(wid, &mut metadata);
+            metadata.iter().map(|m| m.load).collect::<Vec<_>>()
+        };
+        let lit = loads(&app);
+        assert_eq!(lit.last(), Some(&128), "five of ten cores: half the meter");
+        assert!(
+            lit[..lit.len() - 1].iter().all(|&l| l == 0),
+            "an unmeasured tab draws no meter: {lit:?}"
+        );
+        assert_eq!(
+            app.tab_strip_metadata(wid).last().map(|m| m.load),
+            Some(128)
+        );
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("off".into());
+        assert!(
+            loads(&app).iter().all(|&l| l == 0),
+            "the bars off, no meters"
+        );
+    }
+
     /// THE TAB MARKS: a decide need is the hollow diamond, a stuck one the
     /// filled, a finished task not yet looked at the dot — never on the front
     /// tab, and gone once the tab has been front.
@@ -2466,7 +2566,7 @@ mod tests {
         app.refresh_presence_session(first);
         assert_eq!(marks(&app), [ChipLevel::Wait, ChipLevel::Off]);
         ask(&first_ctx, None);
-        task(&app, &first_ctx, first, TaskState::Done);
+        task(&first_ctx, first, TaskState::Done);
         app.on_task_changed(first);
         assert_eq!(
             marks(&app),
@@ -2476,7 +2576,7 @@ mod tests {
         // The front tab's own task finishes in front, moving no need (no
         // projection runs): it is seen as it lands, so the tab left behind
         // wears no dot.
-        task(&app, &second_ctx, second, TaskState::Done);
+        task(&second_ctx, second, TaskState::Done);
         app.on_task_changed(second);
         assert_eq!(marks(&app)[1], ChipLevel::Off);
         // The stub's tab comes front, and back: its dot is gone, the rev seen;
@@ -2487,7 +2587,7 @@ mod tests {
         app.switch_tab_in(wid, tabs - 1);
         assert_eq!(marks(&app), [ChipLevel::Off, ChipLevel::Off]);
         // NEGATIVE CONTROL: a stalled task is a stuck need's mark.
-        task(&app, &first_ctx, first, TaskState::Stalled);
+        task(&first_ctx, first, TaskState::Stalled);
         app.on_task_changed(first);
         assert!(matches!(marks(&app)[0], ChipLevel::Stop(_)));
     }
@@ -2530,7 +2630,7 @@ mod tests {
             .band_on_screen_for_test = true;
         parent.frontmost_window = Some(wid);
         for (ctx, local) in [(&seen_ctx, seen), (&unseen_ctx, unseen)] {
-            task(&parent, ctx, local, TaskState::Done);
+            task(ctx, local, TaskState::Done);
             parent.on_task_changed(local);
         }
         parent.switch_tab_in(wid, 1);
@@ -2619,7 +2719,7 @@ mod tests {
             ws.band_on_screen_for_test = true;
             ws.occluded = true;
         }
-        task(&app, &second_ctx, second, TaskState::Done);
+        task(&second_ctx, second, TaskState::Done);
         app.on_task_changed(second);
         app.refresh_presence_all_windows();
         app.switch_tab_in(wid, tabs - 2);
@@ -2647,7 +2747,7 @@ mod tests {
                 ws.occluded = occluded;
             }
             app.frontmost_window = Some(wid);
-            task(&app, &worker_ctx, worker, TaskState::Done);
+            task(&worker_ctx, worker, TaskState::Done);
             app.on_task_changed(worker);
             let split = app.windows[&wid].tab_set.tabs().len() - 1;
             let _ = second_tab(&mut app, wid);
@@ -2678,7 +2778,7 @@ mod tests {
             from: Some(manager_ctx.self_id.as_str().to_string()),
             ..TaskMark::new(TaskState::Working)
         };
-        mark_session_task(&worker_ctx, worker, &mark, &app.subscribers).expect("unfenced");
+        mark_session_task(&worker_ctx, worker, &mark).expect("unfenced");
         app.on_task_changed(worker);
         ask(&manager_ctx, Some("approve?"));
         app.refresh_presence_session(manager);
@@ -2718,7 +2818,7 @@ mod tests {
                 from: Some(manager_ctx.self_id.as_str().to_string()),
                 ..TaskMark::new(TaskState::Working)
             };
-            mark_session_task(&worker_ctx, worker, &mark, &app.subscribers).expect("unfenced");
+            mark_session_task(&worker_ctx, worker, &mark).expect("unfenced");
             app.on_task_changed(worker);
             assert_eq!(app.focused_session_id(w1), Some(worker));
             if via_chip {
@@ -2942,11 +3042,9 @@ mod tests {
             ..TaskMark::new(TaskState::Working)
         };
         let manager_sid = manager_ctx.self_id.as_str().to_string();
-        mark_session_task(&worker_ctx, worker, &from(&manager_sid), &app.subscribers)
-            .expect("unfenced");
+        mark_session_task(&worker_ctx, worker, &from(&manager_sid)).expect("unfenced");
         app.on_task_changed(worker);
-        mark_session_task(&stray_ctx, stray, &from("s-not-here"), &app.subscribers)
-            .expect("unfenced");
+        mark_session_task(&stray_ctx, stray, &from("s-not-here")).expect("unfenced");
         app.on_task_changed(stray);
         let _ = crate::app_tabs::take_raised_windows();
 
@@ -3013,7 +3111,7 @@ mod tests {
         // parent's.
         unsafe {
             cmd.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -3042,6 +3140,11 @@ mod tests {
             "ERR not-stopped\n",
             "CONTROL: a running job is sent nothing"
         );
+        // Darwin mishandles a SIGSTOP that lands while the child is exec'ing
+        // (7d71bf733f); none can be here: `spawn` returned once the one exec
+        // (`/bin/sleep`, no shim) closed std's status pipe, and nothing execs
+        // after it. Measured on Darwin 27.0.0, 24-wide beside 16 spinners: 0
+        // of 24,000 runs failed.
         // SAFETY: `pid` is this test's own live child.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
         until("the job stops", true);
@@ -3337,10 +3440,10 @@ mod tests {
                 from: Some(from.clone()),
                 ..TaskMark::new(TaskState::Working)
             };
-            mark_session_task(ctx, local, &mark, &app.subscribers).expect("unfenced");
+            mark_session_task(ctx, local, &mark).expect("unfenced");
             app.on_task_changed(local);
         }
-        task(&app, &solo_ctx, solo, TaskState::Working);
+        task(&solo_ctx, solo, TaskState::Working);
         app.on_task_changed(solo);
         assert_eq!(
             app.team_face(manager),

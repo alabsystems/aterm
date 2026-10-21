@@ -340,7 +340,9 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
         // A build that pins no root key is disabled everywhere; the verb refuses before
         // the child (pinned below) and this ending is unreachable.
-        return;
+        aterm_uds::host::could_not_run(
+            "this build pins no root key, so the package manager is off and waits for nothing",
+        );
     }
     let fx = Fixture::new("held-then-released");
     fx.install_claude(2026091601);

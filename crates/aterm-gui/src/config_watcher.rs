@@ -702,22 +702,43 @@ fn feed_paths_of(text: &str) -> Option<Vec<std::path::PathBuf>> {
 /// Metadata-only stamp over the path feeds: the logical entry, a symlink's
 /// target and the followed file for each, or its absence. No feed byte is
 /// opened here — the content fingerprint is admission's job. A warm successor
-/// stamps every file its early warm reads with it (`crate::WarmConfigRead`).
+/// stamps every file its early warm reads with it (`crate::WarmConfigRead`),
+/// and the warm spare its rc generation (`spare::rc_generation`), several
+/// times per new tab.
 pub(crate) fn path_feed_stamp(paths: &[std::path::PathBuf]) -> u64 {
+    path_feed_stamp_with(paths, |path| std::fs::metadata(path))
+}
+
+/// [`path_feed_stamp`] with the following `stat` injected, so a test counts
+/// the calls. On unix only a symlink is followed: `lstat` of anything else
+/// IS its `stat`, and an `lstat` that fails is a `stat` that fails, so the
+/// one observation is hashed for both halves and the stamp is the value the
+/// two calls gave. Each call costs 35-52k instructions on macOS 27 (12k for
+/// an absent path; measured 2026-10-20), and the spare's generation stamps
+/// about 16 paths per stamp, so the second call was half its cost. Windows
+/// keeps both calls: a reparse point that is no symlink (a placeholder) can
+/// read differently followed.
+fn path_feed_stamp_with(
+    paths: &[std::path::PathBuf],
+    mut stat: impl FnMut(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
+) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     "aterm-path-feed-metadata-v1".hash(&mut hasher);
     for path in paths {
         path.hash(&mut hasher);
-        match std::fs::symlink_metadata(path) {
+        let logical = std::fs::symlink_metadata(path);
+        match &logical {
             Ok(logical) => {
-                hash_file_metadata(&logical, &mut hasher);
+                hash_file_metadata(logical, &mut hasher);
                 if logical.file_type().is_symlink() {
                     std::fs::read_link(path).ok().hash(&mut hasher);
                 }
             }
             Err(_) => "absent".hash(&mut hasher),
         }
-        match std::fs::metadata(path) {
+        let follow = cfg!(not(unix)) || logical.as_ref().is_ok_and(|l| l.file_type().is_symlink());
+        let followed = if follow { stat(path) } else { logical };
+        match followed {
             Ok(followed) => hash_file_metadata(&followed, &mut hasher),
             Err(_) => "target-absent".hash(&mut hasher),
         }
@@ -1122,6 +1143,61 @@ pub(crate) mod tests {
         path_feed_stamp, prepare_config_edge_with, prepare_theme_edge_with, theme_directory_stamp,
         theme_directory_stamp_capped,
     };
+
+    /// ONE `stat` PER PATH THAT IS NOT A SYMLINK (unix): a regular file, a
+    /// folder and an absent path are hashed from their `lstat` alone, a
+    /// symlink and a dangling one are followed, and the stamp is the value the
+    /// two calls per path gave before, so the warm spare's learned gate, keyed
+    /// by a generation stamped with it and persisted, survives the update.
+    /// NEGATIVE CONTROL: following every path (the two calls per path) makes
+    /// five follows and fails the count.
+    #[cfg(unix)]
+    #[test]
+    fn the_feed_stamp_follows_only_symlinks_and_keeps_its_value() {
+        use std::hash::{Hash as _, Hasher as _};
+        let dir = std::env::temp_dir().join(format!("aterm-feed-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::write(dir.join("file"), b"feed").unwrap();
+        std::os::unix::fs::symlink(dir.join("file"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).unwrap();
+        let paths: Vec<std::path::PathBuf> = ["file", "folder", "link", "dangling", "absent"]
+            .iter()
+            .map(|name| dir.join(name))
+            .collect();
+        let mut follows = 0;
+        let stamp = super::path_feed_stamp_with(&paths, |path| {
+            follows += 1;
+            std::fs::metadata(path)
+        });
+        // The stamp as two calls per path computed it.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "aterm-path-feed-metadata-v1".hash(&mut hasher);
+        for path in &paths {
+            path.hash(&mut hasher);
+            match std::fs::symlink_metadata(path) {
+                Ok(logical) => {
+                    super::hash_file_metadata(&logical, &mut hasher);
+                    if logical.file_type().is_symlink() {
+                        std::fs::read_link(path).ok().hash(&mut hasher);
+                    }
+                }
+                Err(_) => "absent".hash(&mut hasher),
+            }
+            match std::fs::metadata(path) {
+                Ok(followed) => super::hash_file_metadata(&followed, &mut hasher),
+                Err(_) => "target-absent".hash(&mut hasher),
+            }
+        }
+        let production = path_feed_stamp(&paths);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            follows, 2,
+            "only the symlink and the dangling one are followed"
+        );
+        assert_eq!(stamp, hasher.finish(), "the stamp two calls per path gave");
+        assert_eq!(production, stamp, "the production stamp is the same");
+    }
 
     /// Return once the clock the filesystem stamps a ctime from has moved past
     /// `path`'s ctime, so a rewrite now carries a ctime of its own. Linux takes

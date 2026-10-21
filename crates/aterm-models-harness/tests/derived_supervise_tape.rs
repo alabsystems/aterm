@@ -3,10 +3,11 @@
 
 //! Tier-0 of the harness tape's models (the replay plan's §9):
 //! `SuperviseTapeRecovery` (model 1, §6.4), `SuperviseReplayCursor` (model 2,
-//! the strict arm of §5.2) and `SupervisorRaisedLatch` (model 3) — each proved
-//! at `Buggy = 0` and caught at `Buggy = 1`, each invariant broken by the
-//! mutant written to break it, and walked the way a tape meets its ends, a
-//! replay its tape and a raised flag its loop. Tier-1 is
+//! §5.2's strict arm and its acts arm, a scenario) and `SupervisorRaisedLatch`
+//! (model 3) — each proved at `Buggy = 0` and caught at `Buggy = 1`, each
+//! invariant broken by the mutant written to break it, and walked the way a
+//! tape meets its ends, a replay (and a counterfactual) its tape and a raised
+//! flag its loop. Tier-1 is
 //! `aterm-agent/src/supervise/tape/conformance_tests.rs`.
 
 use aterm_models_harness::supervise_tape_recovery_model;
@@ -18,7 +19,7 @@ fn supervise_tape_recovery_proves_and_catches() {
     let model = supervise_tape_recovery_model();
     let committed = interp::fired_actions(&model);
     for action in [
-        "Write", "Tear", "Crash", "Rot", "RotLast", "RotMagic", "Recover",
+        "Write", "Tear", "Crash", "Rot", "RotLast", "RotMagic", "Misplace", "Recover",
     ] {
         assert!(
             committed.contains(action),
@@ -27,7 +28,8 @@ fn supervise_tape_recovery_proves_and_catches() {
     }
     verify::prove_and_catch_scalar(
         &model,
-        "harness tape: a whole-frame prefix, every whole frame back, damage refused, a tear said",
+        "harness tape: a whole-frame prefix, every whole frame back, damage and misplaced frames \
+         refused, a tear said",
     );
 }
 
@@ -41,6 +43,7 @@ fn each_wrong_reader_breaks_its_own_law() {
         (3, "NoSilentLoss"),
         (4, "TornSaid"),
         (5, "RotRefused"),
+        (6, "MisplacedRefused"),
     ] {
         let wrong = interp::with_buggy(&only(&model, law), dial);
         assert!(
@@ -57,7 +60,8 @@ fn each_wrong_reader_breaks_its_own_law() {
 
 /// The ends a tape meets: a clean end comes back whole; a crash inside a frame
 /// loses only that frame and says so; damage before a whole frame is refused;
-/// damage to the last frame is a torn tail.
+/// damage to the last frame is a torn tail; whole frames out of place are
+/// refused.
 #[test]
 fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
     let m = supervise_tape_recovery_model();
@@ -121,67 +125,106 @@ fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
         !m.action_enabled("RotLast", &damaged),
         "one damage per tape: {damaged:?}"
     );
-}
 
-// -- model 2: a strict replay's cursor ---------------------------------------
-
-/// Tier-0 of `SuperviseReplayCursor` (model 2, the strict arm): proved at
-/// `Buggy = 0`, caught at `Buggy = 1`, every move firing at the committed
-/// configuration.
-#[test]
-fn supervise_replay_cursor_proves_and_catches() {
-    use aterm_models_harness::supervise_replay_cursor_model;
-    let model = supervise_replay_cursor_model();
-    let committed = interp::fired_actions(&model);
-    for action in [
-        "AskNext",
-        "AskOtherRead",
-        "AskOtherAct",
-        "AskPastEnd",
-        "AskAfterDivergence",
+    // Whole frames repeated, dropped or moved are refused, the header's
+    // repeat on a one-frame tape too; a tape torn mid-frame has no whole
+    // frames to arrange past its tear, and is the torn tail.
+    for schedule in [
+        ["Write", "Crash", "Misplace", "Recover"].as_slice(),
+        &["Write", "Write", "Write", "Crash", "Misplace", "Recover"],
     ] {
-        assert!(
-            committed.contains(action),
-            "{action} fires at the committed configuration: {committed:?}"
+        let moved = walk(&m, schedule);
+        assert_eq!(
+            read(&moved),
+            (0, 1, 0),
+            "frames out of place are refused: {moved:?}"
         );
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "strict replay: nothing from the world, no act skipped, nothing after the divergence",
+    let torn = walk(&m, &["Write", "Write", "Tear"]);
+    assert!(!m.action_enabled("Misplace", &torn), "{torn:?}");
+    assert!(
+        !m.action_enabled("Misplace", &damaged),
+        "one damage per tape: {damaged:?}"
     );
 }
 
-/// Each wrong cursor breaks the law it was written to break, alone.
+// -- model 2: a replay's cursor, both arms -----------------------------------
+
+/// Every move of model 2, each of which fires in both arms.
+const CURSOR_MOVES: [&str; 7] = [
+    "AskNext",
+    "AskOtherRead",
+    "AskRepeat",
+    "AskClosingAct",
+    "AskOtherAct",
+    "AskPastEnd",
+    "AskAfterDivergence",
+];
+
+/// Model 2 in the arm `acts` (0: strict, 1: the acts scenario).
+fn cursor_arm(acts: i64) -> aterm_spec::derive::Model {
+    interp::with_consts(
+        &aterm_models_harness::supervise_replay_cursor_model(),
+        &[("Acts", acts)],
+    )
+}
+
+/// Tier-0 of `SuperviseReplayCursor` (model 2): proved at `Buggy = 0` and
+/// caught at `Buggy = 1` in both arms — the strict one the model commits to
+/// and the acts scenario — every move firing in each.
 #[test]
-fn each_wrong_cursor_breaks_its_own_law() {
-    use aterm_models_harness::supervise_replay_cursor_model;
-    let model = supervise_replay_cursor_model();
-    for (dial, law) in [
-        (1, "NoLiveEffect"),
-        (2, "NoActSkipped"),
-        (3, "NothingServedAfterDivergence"),
-    ] {
-        let wrong = interp::with_buggy(&only(&model, law), dial);
-        assert!(
-            interp::violated_invariants(&wrong).contains(&law),
-            "Buggy = {dial} breaks {law}"
-        );
-        let right = interp::with_buggy(&only(&model, law), 0);
-        assert!(
-            interp::violated_invariants(&right).is_empty(),
-            "the committed cursor keeps {law}"
+fn supervise_replay_cursor_proves_and_catches() {
+    for acts in [0, 1] {
+        let model = cursor_arm(acts);
+        let committed = interp::fired_actions(&model);
+        for action in CURSOR_MOVES {
+            assert!(
+                committed.contains(action),
+                "Acts = {acts}: {action} fires at the committed configuration: {committed:?}"
+            );
+        }
+        verify::prove_and_catch_scalar(
+            &model,
+            "a replay: nothing from the world, no act skipped, nothing after the divergence, \
+             nothing from the future",
         );
     }
 }
 
-/// The cursor the way a replay meets its tape: every record asked in order is
-/// served to the end, and the end is a divergence, never a question to the
-/// world; a read the tape does not hold diverges where it is asked, before the
-/// act after it — and the lenient cursor resyncs across that act.
+/// Each wrong cursor breaks the law it was written to break, alone, in both
+/// arms.
+#[test]
+fn each_wrong_cursor_breaks_its_own_law() {
+    for acts in [0, 1] {
+        let model = cursor_arm(acts);
+        for (dial, law) in [
+            (1, "NoLiveEffect"),
+            (2, "NoActSkipped"),
+            (3, "NothingServedAfterDivergence"),
+            (4, "NothingFromTheFuture"),
+        ] {
+            let wrong = interp::with_buggy(&only(&model, law), dial);
+            assert!(
+                interp::violated_invariants(&wrong).contains(&law),
+                "Acts = {acts}: Buggy = {dial} breaks {law}"
+            );
+            let right = interp::with_buggy(&only(&model, law), 0);
+            assert!(
+                interp::violated_invariants(&right).is_empty(),
+                "Acts = {acts}: the committed cursor keeps {law}"
+            );
+        }
+    }
+}
+
+/// The strict cursor the way a replay meets its tape: every record asked in
+/// order is served to the end, and the end is a divergence, never a question
+/// to the world; a read the tape does not hold diverges where it is asked,
+/// before the act after it — and the lenient cursor resyncs across that act.
+/// A read asked again, or an act asked before its read, diverges too.
 #[test]
 fn supervise_replay_cursor_walks_a_replay() {
-    use aterm_models_harness::supervise_replay_cursor_model;
-    let m = supervise_replay_cursor_model();
+    let m = cursor_arm(0);
     let read = |s: &interp::State| (s["pos"], s["diverged"], s["live"], s["skipped_act"]);
     let whole = walk(&m, &["AskNext", "AskNext", "AskNext", "AskNext"]);
     assert_eq!(
@@ -204,12 +247,58 @@ fn supervise_replay_cursor_walks_a_replay() {
         !m.action_enabled("AskNext", &other),
         "nothing served after it"
     );
+    for strict_only in [&["AskNext", "AskRepeat"][..], &["AskClosingAct"]] {
+        let s = walk(&m, strict_only);
+        assert_eq!(s["diverged"], 1, "strict: {strict_only:?} diverges: {s:?}");
+    }
     let lenient = interp::with_buggy(&m, 2);
     let resynced = walk(&lenient, &["AskOtherRead"]);
     assert_eq!(
         read(&resynced),
         (3, 0, 0, 1),
         "the lenient cursor passes the act: {resynced:?}"
+    );
+}
+
+/// The acts cursor the way a counterfactual meets its tape: a read the
+/// segment served is served again, the closing act asked with the read
+/// before it unasked drops the read and moves to the next segment — no act
+/// skipped — and a read held only past the act is STALE, never resynced to
+/// nor answered from there; the mutant that answers it from there stands
+/// still and serves the future.
+#[test]
+fn supervise_replay_cursor_walks_a_counterfactual() {
+    let m = cursor_arm(1);
+    let read = |s: &interp::State| {
+        (
+            s["pos"],
+            s["diverged"],
+            s["skipped_act"],
+            s["served_future"],
+        )
+    };
+    let repeated = walk(&m, &["AskNext", "AskRepeat", "AskRepeat", "AskNext"]);
+    assert_eq!(
+        read(&repeated),
+        (2, 0, 0, 0),
+        "a read served again: {repeated:?}"
+    );
+    let dropped = walk(&m, &["AskClosingAct", "AskClosingAct"]);
+    assert_eq!(
+        read(&dropped),
+        (4, 0, 0, 0),
+        "each read dropped, each act taken: {dropped:?}"
+    );
+    let stale = walk(&m, &["AskOtherRead"]);
+    assert_eq!(read(&stale), (0, 1, 0, 0), "STALE where asked: {stale:?}");
+    let past = walk(&m, &["AskClosingAct", "AskClosingAct", "AskPastEnd"]);
+    assert_eq!(past["diverged"], 1, "nothing past the last act: {past:?}");
+    let future = interp::with_buggy(&m, 4);
+    let served = walk(&future, &["AskOtherRead"]);
+    assert_eq!(
+        read(&served),
+        (0, 0, 0, 1),
+        "the future served, the cursor still: {served:?}"
     );
 }
 

@@ -7,14 +7,15 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    PresentDropAccounting, PresentTarget, VideoCancellation, VideoInputSample, VideoMode, VideoRec,
-    WindowId, fold_video_deadlines, raw_present_capture_guard, record_controller_video_attempts,
-    video_capture_mode, video_capture_opacity_requires_abort, video_capture_translucency_guard,
-    video_initial_next_frame, video_post_present_should_finalize, window_capture_material_guard,
-    window_capture_translucency_guard,
+    LINUX_CAPTURE, MAC_CAPTURE, MATERIAL_CAPTURE_ERROR, PresentDropAccounting, PresentTarget,
+    TRANSLUCENT_CAPTURE_ERROR, VideoCancellation, VideoInputSample, VideoMode, VideoRec,
+    WIN_CAPTURE, WindowId, fold_video_deadlines, platform_capture_guards,
+    raw_present_capture_guard, record_controller_video_attempts, video_capture_mode,
+    video_capture_opacity_requires_abort, video_capture_translucency_guard,
+    video_initial_next_frame, video_post_present_should_finalize,
 };
 
-use crate::app_config::BackgroundMaterial;
+use crate::app_config::{BackgroundMaterial, RenderKnobs};
 use crate::app_render::GpuRecoveryOutcome;
 use crate::input::InputEvent;
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -436,40 +437,105 @@ fn capture_regression_translucent_raw_present_refuses_wysiwyg_claim() {
         Ok(VideoMode::SwapchainTap),
         "a platform whose client remains opaque need not refuse"
     );
-
-    assert!(
-        window_capture_translucency_guard(0.75, true, false, false).is_ok(),
-        "macOS CPU/softbuffer is an effective solid fallback, not missing glass"
-    );
-    assert!(
-        window_capture_translucency_guard(0.75, true, true, true).is_err(),
-        "only the actual translucent GPU window needs the raw-layer refusal"
-    );
-    assert!(
-        window_capture_translucency_guard(0.75, true, true, false).is_ok(),
-        "a backend/target mismatch cannot be called a translucent GPU present"
-    );
 }
 
+/// Each platform's capture traits route both guards: a translucent GPU window
+/// is refused where the compositor blends the client (macOS) and admitted where
+/// it stays opaque (Windows, Linux); a compositor material is refused where the
+/// photograph omits it (Windows) and admitted where it does not. A solid window
+/// without a material passes on every platform.
 #[test]
-fn capture_regression_window_material_and_post_present_stop_fail_closed() {
-    assert!(
-        window_capture_material_guard(BackgroundMaterial::None, false).is_ok(),
-        "the ordinary opaque Windows PrintWindow result remains supported"
+fn platform_traits_route_both_guards() {
+    let solid = RenderKnobs {
+        background_opacity: 1.0,
+        background_material: BackgroundMaterial::None,
+        ..RenderKnobs::default()
+    };
+    let translucent = RenderKnobs {
+        background_opacity: 0.75,
+        ..solid
+    };
+    let platforms = [
+        ("macOS", MAC_CAPTURE),
+        ("Windows", WIN_CAPTURE),
+        ("Linux", LINUX_CAPTURE),
+    ];
+    for (platform, traits) in platforms {
+        assert_eq!(
+            platform_capture_guards(traits, &solid, true, true),
+            Ok(()),
+            "{platform}: a solid GPU window is what the window shows"
+        );
+    }
+
+    // Translucency: only a window that really presents through the GPU
+    // swapchain the compositor blends.
+    assert_eq!(
+        platform_capture_guards(MAC_CAPTURE, &translucent, true, true),
+        Err(TRANSLUCENT_CAPTURE_ERROR),
+        "macOS: the raw layer of a translucent GPU window omits the backdrop"
     );
+    assert_eq!(
+        platform_capture_guards(MAC_CAPTURE, &translucent, false, false),
+        Ok(()),
+        "macOS CPU/softbuffer is an effective solid fallback, not missing glass"
+    );
+    assert_eq!(
+        platform_capture_guards(MAC_CAPTURE, &translucent, true, false),
+        Ok(()),
+        "a backend/target mismatch cannot be called a translucent GPU present"
+    );
+    for (platform, traits) in [("Windows", WIN_CAPTURE), ("Linux", LINUX_CAPTURE)] {
+        assert_eq!(
+            platform_capture_guards(traits, &translucent, true, true),
+            Ok(()),
+            "{platform}: the compositor does not blend the client layer"
+        );
+    }
+
+    // Material: only where the platform photograph omits it.
     for material in [
         BackgroundMaterial::Hud,
         BackgroundMaterial::Sidebar,
         BackgroundMaterial::UnderWindow,
     ] {
-        window_capture_material_guard(material, false)
-            .expect_err("a window-local capture omits the live DWM material");
-        assert!(
-            window_capture_material_guard(material, true).is_ok(),
-            "a compositor-aware capture may represent the configured material"
-        );
+        let knobs = RenderKnobs {
+            background_material: material,
+            ..solid
+        };
+        platform_capture_guards(WIN_CAPTURE, &knobs, true, true)
+            .expect_err("PrintWindow omits the live DWM material");
+        for (platform, traits) in [("macOS", MAC_CAPTURE), ("Linux", LINUX_CAPTURE)] {
+            assert_eq!(
+                platform_capture_guards(traits, &knobs, true, true),
+                Ok(()),
+                "{platform}: the photograph does not omit {material:?}"
+            );
+        }
     }
 
+    // Both guards are asked: a translucent GPU window with a material is
+    // refused by each platform for its own reason.
+    let both = RenderKnobs {
+        background_material: BackgroundMaterial::Hud,
+        ..translucent
+    };
+    assert_eq!(
+        platform_capture_guards(MAC_CAPTURE, &both, true, true),
+        Err(TRANSLUCENT_CAPTURE_ERROR)
+    );
+    assert_eq!(
+        platform_capture_guards(WIN_CAPTURE, &both, true, true),
+        Err(MATERIAL_CAPTURE_ERROR)
+    );
+    assert_eq!(
+        platform_capture_guards(LINUX_CAPTURE, &both, true, true),
+        Ok(())
+    );
+}
+
+#[test]
+fn capture_regression_post_present_stop_fails_closed() {
     assert!(
         video_post_present_should_finalize(false, true),
         "a resize/format stop finalizes before the duration deadline"

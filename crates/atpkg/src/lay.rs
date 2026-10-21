@@ -32,7 +32,8 @@ impl Executable {
 /// the reroute dir's walk; the sequence keeps two lays of one name in one process off each
 /// other's temp), the bytes, mode `0755` set explicitly (so a restrictive umask cannot lay
 /// a shim only its owner can run in a system prefix), a flush, then `rename(2)` over the
-/// destination, so a shim on the user's PATH is never briefly absent or half-written.
+/// destination, so a shim on the user's PATH is never briefly absent or half-written. Only
+/// the rename takes [`PUBLICATION_TURN`]: the staging before it is this writer's own file.
 ///
 /// The flush is [`aterm_durable::ordered`] (on Apple targets `F_BARRIERFSYNC`): a real
 /// shim, a tombstone or a trust exec root's re-render is what a terminal outside aterm
@@ -63,14 +64,43 @@ pub fn write_regenerable(file: &Executable) -> io::Result<()> {
 /// Per-process sequence for the writer's temp names ([`write_in_process`]).
 static LAY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Serializes every executable publication in the process (lay or removal) with a
-/// reconcile's read of a primary and its publish of what that read selected. Lock order:
-/// `activate::AGENTS_TURN`, then this. A writer releases this before it asks for an agents
-/// reconcile; a reconcile holds both and writes through [`write_in_publication_turn`].
+/// The temp a lay of `dest` stages in: `.<name>.lay-<pid>-<seq>` beside it.
+pub(crate) fn staged_at(dest: &std::path::Path, name: &str, seq: u64) -> PathBuf {
+    dest.with_file_name(format!(".{name}.lay-{}-{seq}", std::process::id()))
+}
+
+/// Whether a directory entry is the temp of a lay THIS process has in flight: staged, not
+/// yet renamed over its destination (every failing lay removes its own temp, so one named
+/// for this pid is mid-publish). The walks that hold [`PUBLICATION_TURN`] to sweep `bin/`
+/// and `agents/` leave it to its writer, which renames it the moment the turn is free:
+/// removing it would fail that lay, where before the staging left the turn the lay simply
+/// ran after the sweep. A temp another process left is no lay of this one, and is swept.
+pub(crate) fn in_flight_here(entry: &OsStr) -> bool {
+    entry
+        .to_str()
+        .and_then(|name| name.strip_prefix('.'))
+        .and_then(|name| name.rsplit_once(".lay-"))
+        .and_then(|(_, tail)| tail.split_once('-'))
+        .is_some_and(|(pid, seq)| {
+            pid.parse() == Ok(std::process::id())
+                && !seq.is_empty()
+                && seq.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// Serializes every executable publication in the process (a lay's rename, or a removal)
+/// with a reconcile's read of a primary and its publish of what that read selected. Lock
+/// order: `activate::AGENTS_TURN`, then this. A writer stages its bytes before it asks for
+/// this and releases it before it asks for an agents reconcile; a reconcile holds both and
+/// writes through [`write_in_publication_turn`]. Held for a rename, not a flush: every
+/// lay in the process (a test binary's thousand stores included) waits on it.
 pub(crate) static PUBLICATION_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The one writer: takes [`PUBLICATION_TURN`], then lays with the caller's flush `sync`.
+/// The one writer: stages the bytes with the caller's flush `sync` (a sibling temp only
+/// this writer names), then takes [`PUBLICATION_TURN`] for the publication alone: the
+/// `rename(2)` that is the only step a reader of the destination can see.
 fn write_with(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+    let tmp = stage(file, sync)?;
     #[cfg(all(test, unix))]
     if matches!(
         PUBLICATION_TURN.try_lock(),
@@ -81,7 +111,7 @@ fn write_with(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> 
     let _turn = PUBLICATION_TURN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    write_bytes(file, sync)
+    publish(file, &tmp)
 }
 
 /// The ordered writer while the caller holds [`PUBLICATION_TURN`] across the read that
@@ -91,7 +121,8 @@ pub(crate) fn write_in_publication_turn(
     _turn: &std::sync::MutexGuard<'_, ()>,
 ) -> io::Result<()> {
     // Ordered, as [`write_in_process`]: the old shim or the new one.
-    write_bytes(file, aterm_durable::ordered)
+    let tmp = stage(file, aterm_durable::ordered)?;
+    publish(file, &tmp)
 }
 
 /// Remove a primary under [`PUBLICATION_TURN`]: a reconcile that already read it finishes
@@ -104,7 +135,9 @@ pub(crate) fn remove_in_process(path: &std::path::Path) -> io::Result<()> {
     std::fs::remove_file(path)
 }
 
-fn write_bytes(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> io::Result<()> {
+/// Write `file`'s bytes to a fresh sibling temp ([`staged_at`]), mode `0755`, flushed with
+/// `sync`; the temp is removed again on any error.
+fn stage(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> io::Result<PathBuf> {
     let name = file
         .path
         .file_name()
@@ -112,11 +145,11 @@ fn write_bytes(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) ->
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "executable has no file name")
         })?;
-    let tmp = file.path.with_file_name(format!(
-        ".{name}.lay-{}-{}",
-        std::process::id(),
-        LAY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let tmp = staged_at(
+        &file.path,
+        name,
+        LAY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
     let _ = std::fs::remove_file(&tmp);
     let written = (|| -> io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
@@ -137,16 +170,23 @@ fn write_bytes(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) ->
         }
         Ok(())
     })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    match written {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
+}
+
+/// Rename a [`stage`]d temp over `file`'s destination; the temp is removed if that fails.
+fn publish(file: &Executable, tmp: &std::path::Path) -> io::Result<()> {
     // Windows `rename` does not replace an existing file (the same brief window the
     // Windows shim writer documents; a shim there is per-user and serialized).
     #[cfg(windows)]
     let _ = std::fs::remove_file(&file.path);
-    if let Err(e) = std::fs::rename(&tmp, &file.path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = std::fs::rename(tmp, &file.path) {
+        let _ = std::fs::remove_file(tmp);
         return Err(e);
     }
     Ok(())
@@ -218,5 +258,71 @@ mod tests {
             assert!(leftovers.is_empty(), "{label}: {leftovers:?}");
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    /// The turn covers the publication alone. A lay that finds [`PUBLICATION_TURN`] held
+    /// has already staged its bytes: its one in-flight temp ([`in_flight_here`]) holds the
+    /// whole body at mode `0755`, and the destination is untouched. Released, the turn lets
+    /// the rename publish those bytes, and no temp is left. A lay that flushed under the
+    /// turn held every other lay in the process behind its flush.
+    #[test]
+    fn a_lay_waits_for_the_turn_with_its_bytes_already_staged() {
+        use crate::activate::agents_checkpoint::{self, Event};
+        use std::os::unix::fs::PermissionsExt as _;
+        let layout = crate::testdir::layout("atpkg-lay-staged-");
+        let bin = layout.bin_dir();
+        std::fs::create_dir_all(&bin).unwrap();
+        let file = Executable::new(
+            layout.shim(&crate::store::ToolName::new("ay").unwrap()),
+            "#!/bin/sh\necho staged\n",
+        );
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let staged_in = bin.clone();
+        let _watch = agents_checkpoint::watch(
+            &layout,
+            std::sync::Arc::new(move |event| {
+                if let Event::Waiting(name) = event {
+                    let staged: Vec<(Vec<u8>, u32)> = std::fs::read_dir(&staged_in)
+                        .unwrap()
+                        .flatten()
+                        .filter(|e| in_flight_here(&e.file_name()))
+                        .map(|e| {
+                            let mode = e.metadata().unwrap().permissions().mode() & 0o777;
+                            (std::fs::read(e.path()).unwrap(), mode)
+                        })
+                        .collect();
+                    let _ = waiting_tx.send((name.to_owned(), staged));
+                }
+            }),
+        );
+        let turn = PUBLICATION_TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = std::thread::spawn({
+            let file = file.clone();
+            move || write_in_process(&file)
+        });
+        let (name, staged) = waiting_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the writer reaches the held turn");
+        assert_eq!(name, "ay");
+        assert_eq!(
+            staged,
+            [(file.body.clone(), 0o755)],
+            "staged before the turn"
+        );
+        assert!(
+            !file.path.exists(),
+            "nothing published while the turn is held"
+        );
+        drop(turn);
+        writer.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(&file.path).unwrap(), file.body);
+        let left: Vec<_> = std::fs::read_dir(&bin)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["ay"], "the temp became the destination");
     }
 }

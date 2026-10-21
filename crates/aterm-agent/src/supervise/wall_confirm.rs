@@ -1274,7 +1274,7 @@ fn named_by(w: &aterm_phase::Wall, end: &TranscriptEnd) -> Option<Named> {
 /// of words that name none of their own (`You've hit your limit · …`, read
 /// as a session limit that names no window). `None` where neither names a
 /// limit.
-pub(super) fn limit_named(text: &str, limit: Option<&str>) -> Option<WallKind> {
+pub(crate) fn limit_named(text: &str, limit: Option<&str>) -> Option<WallKind> {
     let typed = limit.and_then(|limit| match limit {
         "five_hour" => Some(WallKind::UsageSession),
         "seven_day" => Some(WallKind::UsageWeekly),
@@ -2196,7 +2196,7 @@ impl<C: Ctl> Session<'_, C> {
     /// grid read again after them is `rows` (and the screen's place the
     /// same), so they are the rows over the screen the wall was read on. On
     /// the alternate screen they are the ARCHIVE of the rows that scrolled
-    /// off it ([`Self::archived_up_to_owner`]). `None` where they cannot all
+    /// off it ([`Self::archived_up_to`]). `None` where they cannot all
     /// be read: a host without the verbs, an evicted or unreadable row, no
     /// owner within [`OWNER_ROWS`], or the screen moved by the time the rows
     /// were read.
@@ -2204,8 +2204,19 @@ impl<C: Ctl> Session<'_, C> {
         &mut self,
         rows: &[String],
     ) -> Result<Option<Vec<String>>, Fail> {
+        self.rows_up_to(rows, &is_owner_row)
+    }
+
+    /// [`Self::rows_up_to_owner`], the walk up stopping at the nearest row
+    /// `stop` names rather than any that opens in column 0 (a reader's
+    /// [`aterm_phase::ScreenReader::said_history_stop`]).
+    pub(super) fn rows_up_to(
+        &mut self,
+        rows: &[String],
+        stop: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<Vec<String>>, Fail> {
         if self.alt_screen_now()? {
-            return self.archived_up_to_owner(rows);
+            return self.archived_up_to(rows, stop);
         }
         let screen_first = |s: &mut Self| -> Result<Option<u64>, Fail> {
             let r = s.call(&["search"])?;
@@ -2219,6 +2230,11 @@ impl<C: Ctl> Session<'_, C> {
         let Some(first) = screen_first(self)? else {
             return Ok(None);
         };
+        // No history above the screen: nothing to read, and nothing read to
+        // hold against the screen again.
+        if first == 0 {
+            return Ok(Some(Vec::new()));
+        }
         let mut above = Vec::new();
         let mut at = first;
         while at > 0 {
@@ -2236,7 +2252,7 @@ impl<C: Ctl> Session<'_, C> {
             let line = r.stdout.lines().next().unwrap_or("");
             let text = line.strip_prefix("OK").unwrap_or(line);
             let text = text.strip_prefix(' ').unwrap_or(text).to_string();
-            let owner = is_owner_row(&text);
+            let owner = stop(&text);
             above.push(text);
             if owner {
                 break;
@@ -2263,7 +2279,11 @@ impl<C: Ctl> Session<'_, C> {
     /// owner among the newest [`OWNER_ROWS`]. Before, the alternate screen
     /// counted as under a call: a real wall under a long prompt there was
     /// left to the person with no transcript (the review of 87faa9bf23).
-    fn archived_up_to_owner(&mut self, rows: &[String]) -> Result<Option<Vec<String>>, Fail> {
+    fn archived_up_to(
+        &mut self,
+        rows: &[String],
+        stop: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<Vec<String>>, Fail> {
         let read = |s: &mut Self, args: &[&str]| -> Result<Option<Offscreen>, Fail> {
             let mut call = vec!["offscreen"];
             call.extend_from_slice(args);
@@ -2294,7 +2314,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(off
             .archived
             .iter()
-            .rposition(|r| is_owner_row(r))
+            .rposition(|r| stop(r))
             .map(|owner| off.archived[owner..].to_vec()))
     }
 

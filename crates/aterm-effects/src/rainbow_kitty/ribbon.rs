@@ -399,10 +399,12 @@ pub const PAPER_MARK_CONTRAST: f32 = 4.5;
 
 /// The vivid inks' hue bend on paper ([`paper_caret_ink`], [`paper_mark_ink`]), as
 /// `(from, to)` HSV hue knots in degrees, linear between them. A yellow darkened to [`PAPER_CARET_CONTRAST`] at its own hue is olive, and no
-/// continuous path from orange to green avoids the olive band (about `50°..85°`), so the
-/// path crosses it in ten degrees of the arc instead of fifty: yellow lands on amber,
+/// continuous path from orange to green avoids the olive band (about `45°..85°`), so the
+/// path crosses it in under twenty degrees of the arc instead of fifty, gently enough
+/// that a palette sampled along it steps unseen: yellow and its greener neighbours land
+/// on amber (a stop bent only to `50°` still darkened to a mustard olive on the caret),
 /// chartreuse on leaf green.
-const PAPER_HUE_BEND: [(f32, f32); 4] = [(30.0, 30.0), (72.0, 50.0), (82.0, 85.0), (110.0, 110.0)];
+const PAPER_HUE_BEND: [(f32, f32); 4] = [(30.0, 30.0), (72.0, 40.0), (90.0, 85.0), (110.0, 110.0)];
 
 // No floor for the bed against the ground: it would lift the bed over the
 // luminance the text can bear. The bar wins; a dark-foreground theme's dim bed
@@ -690,6 +692,15 @@ pub const CURTAIN_MIN_FRAMES: usize = 5;
 /// ([`Ribbon::release_cells`]).
 pub const RETIRE_MELT_S: f32 = 0.12;
 
+/// The share of its light a line keeps once a Return has left it printed
+/// ([`Cohort::printed`]): the band dims to this over [`RETURN_DIM_S`] and goes
+/// on out through its own swoosh, so the letters it stands under are clear
+/// of it by the time the output lands.
+pub const RETURN_PRINTED_SHARE: f32 = 0.3;
+
+/// How long the dim to [`RETURN_PRINTED_SHARE`] takes after the Return.
+pub const RETURN_DIM_S: f32 = 0.06;
+
 /// The share of a cell's life over which the expiry melt runs; identity over the first 70 %.
 pub const EXPIRY_MELT_SHARE: f32 = 0.30;
 
@@ -948,6 +959,11 @@ pub struct Cohort {
     /// dead to a key ([`Ribbon::stands`]), since the next line is a new line;
     /// a run Backspaced or `^W`-ed away is still its band.
     line_killed: bool,
+    /// The Return that left this cohort's line printed text
+    /// ([`Ribbon::print_row`]): from then its light is capped toward
+    /// [`RETURN_PRINTED_SHARE`] while the swoosh keeps its clock. A key that
+    /// rejoins the run lifts it.
+    printed: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1694,6 +1710,20 @@ pub fn paper_caret_ink(rgb: u32, bg: u32) -> u32 {
     paper_vivid_ink(rgb, bg, PAPER_CARET_CONTRAST)
 }
 
+/// The caret's colour for the walk's stop `arc`: the authored stop on a dark
+/// ground (the consumer applies its own ink), that stop's caret ink on the
+/// page on a light one ([`paper_caret_ink`]). The one spelling both the live
+/// head ([`Ribbon::head_rgb`]) and a seated stop
+/// (`CursorGlow::v2_caret_stop_rgb`) read, so the two agree to the byte.
+#[must_use]
+pub(crate) fn caret_ink(arc: u32, cfg: &Config) -> u32 {
+    if cfg.dark_theme {
+        arc
+    } else {
+        paper_caret_ink(arc, cfg.theme_bg)
+    }
+}
+
 /// A point mark's ink on paper: [`paper_caret_ink`]'s law at [`PAPER_MARK_CONTRAST`], so a
 /// star or spark keeps its stop's hue (a yellow one gold, never olive) and a letter it
 /// crosses stays readable through it.
@@ -1911,23 +1941,30 @@ impl BedInkLut {
             // Indexed by the walk, filled from the arc ([`walk_pace`]): readers keep
             // `sample`'s one lerp and the pace costs nothing per frame.
             let arc = spectrum(walk_pace(x));
-            // A light ground: the tall body stands under the letters, so its
-            // ink is solved against the theme's text at the body's strongest
-            // opacity (the role's ceiling plus one Bayer level), the dark
-            // bed's bar read as a floor (`cursor_glow::light_body_ink`). The
-            // underline body lives in the leading, under no glyph, and keeps
-            // its vivid role ink.
+            // A light ground: each stop keeps its own hue at full value and
+            // spends coverage, not luminance ([`paper_ink`]): the tall body
+            // stands under the letters, so it stops short of the body's bar
+            // against the theme's text; the underline body lives in the
+            // leading, under no glyph, at its own weight. (Darkening a stop
+            // onto one luminance printed yellow as olive and orange as brown
+            // under the letters.) On a theme whose own text sits under the
+            // bar (Solarized Light) that tint can thin out of sight, and the
+            // tall body falls back on the light body law, which reads there
+            // (`cursor_glow::light_body_ink`).
             let bed = if cfg.dark_theme {
                 bed_ink(arc, budget)
-            } else if cfg.ribbon_tall {
-                crate::cursor_glow::light_body_ink(
-                    arc,
-                    cfg.theme_fg,
-                    cfg.theme_bg,
-                    (cov_cap(cfg) + 16.0).min(255.0) as u8,
-                )
             } else {
-                paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role)
+                let paper = paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role);
+                let a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
+                let shows = seen(
+                    over_premul(cfg.theme_bg, premul_rgb(paper, a), a) & 0x00FF_FFFF,
+                    cfg.theme_bg,
+                );
+                if cfg.ribbon_tall && !shows {
+                    crate::cursor_glow::light_body_ink(arc, cfg.theme_fg, cfg.theme_bg, a)
+                } else {
+                    paper
+                }
             };
             self.lut.push(bed);
             self.hot.push(hot_edge_ink(arc));
@@ -3037,6 +3074,12 @@ impl Ribbon {
                         } else {
                             same_row.then_some((Some(to.0), to.1, to.1 < from.1))
                         };
+                        // A Return leaves its line printed text: its light dims off it
+                        // as `leave_row`'s does. (A program's round trip below and back
+                        // keeps the band for the hand's next key.)
+                        if to.0 > from.0 && licence == Licence::Return {
+                            self.print_row(from.0, at);
+                        }
                         self.abandon(at, keep, toward, program);
                     } else if same_row && licence == Licence::Nav && from.1 != to.1 {
                         // An arrow's hop: a short wake behind the caret, no
@@ -3313,6 +3356,11 @@ impl Ribbon {
     fn hold(&mut self, open: u32, hand_row: u16, laid_into: Option<usize>, at: Instant) {
         let grace = self.rest_s();
         let floor = swoosh_life_s(grace);
+        for coh in &mut self.cohorts {
+            if !coh.abandoned && coh.row == hand_row && coh.flow.is_some() {
+                coh.phrase = open;
+            }
+        }
         let held_by = |i: usize, c: &Cohort| {
             !c.abandoned && c.phrase == open && (c.row == hand_row || laid_into == Some(i))
         };
@@ -3786,6 +3834,16 @@ impl Ribbon {
             }
             self.flow_row(from.0, at);
         } else {
+            // A line the hand left downward by anything but a navigation (a
+            // Return, the line feed after it) is printed text now: its light
+            // dims to [`RETURN_PRINTED_SHARE`] over [`RETURN_DIM_S`], clear of
+            // its letters by the time the output lands, and goes on out
+            // through the swoosh's retract (at full light the band under the
+            // line's last word took it under 4.5:1 on paper for longer than
+            // a sixth of a second).
+            if to.0 > from.0 && licence != Licence::Nav {
+                self.print_row(from.0, at);
+            }
             self.abandon_row(from.0, at, Some(from.1));
             // The hand is back on the row it folded off: an erase's retreat one
             // row up, inside the phrase (not a line kill, which ends it).
@@ -4411,6 +4469,18 @@ impl Ribbon {
         }
     }
 
+    /// Every cohort on `row` is printed text from `at` ([`Cohort::printed`]):
+    /// its light dims to [`RETURN_PRINTED_SHARE`] while the swoosh keeps its
+    /// clock, nothing stamped as leaving. A cohort already printed keeps its
+    /// clock.
+    fn print_row(&mut self, row: u16, at: Instant) {
+        for coh in &mut self.cohorts {
+            if coh.row == row && coh.printed.is_none() {
+                coh.printed = Some(at);
+            }
+        }
+    }
+
     /// The hand touched `(row, col)`: fold it into [`Ribbon::hand_floor`]. A
     /// new row replaces the floor; the same row keeps the leftmost. Callers
     /// are only places the hand acted (a typed glyph, a relocation it made,
@@ -4957,6 +5027,7 @@ impl Ribbon {
             release_parts: [None; RELEASE_PARTS],
             parts_revoked_at: None,
             line_killed: false,
+            printed: None,
         });
         self.cohorts.len() - 1
     }
@@ -5007,6 +5078,7 @@ impl Ribbon {
             let coh = &mut self.cohorts[i];
             coh.abandoned = false;
             coh.retract_col = None;
+            coh.printed = None;
             return i;
         }
         // The revive mints on the run's own walk (`tests/revived_line_keeps_its_stops.rs`); a
@@ -6211,6 +6283,12 @@ impl Ribbon {
                 spend(clamp01((r - t0) / CURTAIN_SPEND_S))
             };
         }
+        if let Some(at) = coh.and_then(|c| c.printed) {
+            // A printed line ([`Cohort::printed`]): capped toward its share,
+            // never brightening, its exit still the swoosh below.
+            let r = now.saturating_duration_since(at).as_secs_f32();
+            env *= 1.0 - (1.0 - RETURN_PRINTED_SHARE) * smoothstep01(r / RETURN_DIM_S);
+        }
         if let Some(coh) = coh
             && coh.phase.is_retracting()
         {
@@ -7106,12 +7184,7 @@ impl Ribbon {
     #[must_use]
     pub fn head_rgb(&self, cfg: &Config) -> Option<u32> {
         self.caret?;
-        let arc = spectrum(walk_arc(self.field_at_caret()));
-        Some(if cfg.dark_theme {
-            arc
-        } else {
-            paper_caret_ink(arc, cfg.theme_bg)
-        })
+        Some(caret_ink(spectrum(walk_arc(self.field_at_caret())), cfg))
     }
 
     /// The body's vertical extent at a cell, or `None` where no cell is laid (§4.2, §5.4, D16);
@@ -10386,6 +10459,93 @@ mod tests {
             .map(|s| s.cov)
             .max()
             .unwrap_or(0)
+    }
+
+    /// A RETURN LEAVES ITS LINE PRINTED, NOT LIT: eight keys on row 2, then
+    /// a Return down to the next line's home: by 100 ms after it the band on
+    /// row 2 stands at no more than [`RETURN_PRINTED_SHARE`] of an arrow's
+    /// (on paper the band under the line's last word, drawn in a word
+    /// decoration's lighter ink, kept it under 4.5:1 through the swoosh's
+    /// retract), still lit and with no cell stamped as leaving, so it goes
+    /// out through its own swoosh. Negative control: an arrow down from the
+    /// same line leaves the band its full light at 100 ms.
+    #[test]
+    fn a_return_dims_the_line_it_leaves() {
+        let c = cfg(false, true);
+        let t0 = Instant::now();
+        let lit_after = |licence: Licence| -> (u8, bool) {
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 2, 8, &c, 0.9);
+            let leave = at(t0, 8 * 60 + 40);
+            let cx = ctx(leave, &c, (3, 0), 0.9);
+            rib.on_event(&row_change((2, 10), (3, 0), licence), leave, &cx);
+            rib.plan(&cx);
+            let late = at(leave, 100);
+            let cx = ctx(late, &c, (3, 0), 0.9);
+            rib.plan(&cx);
+            let cov = rib.plan_segments().iter().map(|s| s.cov).max().unwrap_or(0);
+            (cov, rib.cells().iter().any(|c| c.row == 2 && c.leaving()))
+        };
+        let (ret, ret_leaving) = lit_after(Licence::Return);
+        let (nav, _) = lit_after(Licence::Nav);
+        assert!(nav > 0, "control: an arrow down leaves the band lit");
+        assert!(
+            f32::from(ret) <= RETURN_PRINTED_SHARE * f32::from(nav) + 2.0,
+            "the line a Return left still stands at {ret} of the arrow's {nav} at 100 ms"
+        );
+        assert!(
+            ret > 0 && !ret_leaving,
+            "…but dimmed, not cut: it goes out through its own swoosh"
+        );
+    }
+
+    /// ON PAPER THE RIBBON'S YELLOW IS A YELLOW: the tall body's ink for the
+    /// yellow stop, composited at its strongest opacity on GitHub Light and
+    /// Default Light, is a clean light yellow (hue 48°..68°, value over 0.85),
+    /// never the olive a stop darkened onto one luminance prints; and the
+    /// paper caret for a stop just greener than yellow lands on amber.
+    /// Negative control: the light body law's ink for the same stop
+    /// composites olive.
+    #[test]
+    fn the_paper_ribbon_keeps_its_yellow_clean() {
+        for (fg, bg) in [(0x001F_2328, 0x00FF_FFFF), (0x002B_2D33, 0x00F6_F7F9)] {
+            let mut c = cfg(false, true);
+            (c.theme_fg, c.theme_bg) = (fg, bg);
+            let mut lut = BedInkLut::default();
+            lut.sync(&c);
+            let a = (cov_cap(&c) + 16.0).min(255.0) as u8;
+            let lay = |ink: u32| over_premul(bg, premul_rgb(ink, a), a) & 0x00FF_FFFF;
+            // The walk position whose arc is the yellow stop.
+            let yellow = (0..BED_INK_LUT_LEN)
+                .map(|i| i as f32 / (BED_INK_LUT_LEN - 1) as f32)
+                .min_by(|x, y| {
+                    let d = |t: f32| {
+                        let (h, ..) = rgb2hsv(spectrum(walk_pace(t)));
+                        (h - 60.0).abs()
+                    };
+                    d(*x).total_cmp(&d(*y))
+                })
+                .expect("a walk");
+            let (h, s, v) = rgb2hsv(lay(lut.at(yellow)));
+            assert!(
+                (48.0..=68.0).contains(&h) && v > 0.85 && s > 0.2,
+                "on #{bg:06X} the yellow lays ({h:.0}°, {s:.2}, {v:.2})"
+            );
+            let law = crate::cursor_glow::light_body_ink(spectrum(walk_pace(yellow)), fg, bg, a);
+            let (_, _, lv) = rgb2hsv(lay(law));
+            assert!(
+                lv < 0.8,
+                "control: the body law's yellow is not olive ({lv:.2})"
+            );
+        }
+        let (h, ..) = rgb2hsv(paper_caret_ink(
+            crate::color_math::hsv2rgb(68.0, 1.0, 1.0),
+            0x00FF_FFFF,
+        ));
+        assert!(
+            h <= 45.0,
+            "a greenish yellow's caret sits at hue {h:.1}, not amber"
+        );
     }
 
     #[test]

@@ -3,8 +3,7 @@
 
 //! # astream-sys
 //!
-//! The durable log's OS cordon: the two things `astream-broker` needs from the
-//! kernel that safe `std` does not offer.
+//! The broker's OS cordon: kernel operations that safe `std` does not offer.
 //!
 //! - [`barrier_sync`]: an ORDERING-only flush of a file. On Apple it is
 //!   `fcntl(fd, F_BARRIERFSYNC)`, which fcntl(2) defines device-wide: every write
@@ -37,11 +36,11 @@
 //! ## The cordon
 //!
 //! The crate root is `deny(unsafe_code)`, and exactly one module re-permits it:
-//! `apple` (`cfg(target_vendor = "apple")`), two hand-declared FFI calls with a
+//! `apple` (`cfg(target_vendor = "apple")`), hand-declared FFI calls with a
 //! `// SAFETY:` note each. Nothing else here may use `unsafe` — the compiler refuses
 //! it — and no errno or raw pointer leaves that module: every call returns
 //! `io::Result` or an owned value. `astream-broker` stays `forbid(unsafe_code)` and
-//! reaches the OS through this crate's two safe functions (and reads a barrier's
+//! reaches the OS through this crate's safe functions (and reads a barrier's
 //! refusal through [`barrier_refused`], plain errno numbers that need no `unsafe`).
 
 #![deny(unsafe_code)]
@@ -51,6 +50,12 @@ use std::io;
 
 #[cfg(target_vendor = "apple")]
 macro_rules! apple_ffi {
+    (socket_hangup($fds:expr)) => {
+        // SAFETY: the caller provides two initialized pollfd entries, writable for
+        // this call; each descriptor is retained by a BorrowedFd. Timeout zero does
+        // not wait for readiness and the call does not read or change socket flags.
+        unsafe { poll($fds, 2, 0) }
+    };
     (barrier_fsync($fd:expr, $cmd:expr)) => {
         // SAFETY: `fd` is a valid open descriptor owned by `file` and `F_BARRIERFSYNC` takes no extra arguments.
         unsafe { fcntl($fd, $cmd) }
@@ -58,6 +63,11 @@ macro_rules! apple_ffi {
     (sysctlbyname($name:expr, $oldp:expr, $oldlenp:expr, $newp:expr, $newlen:expr)) => {
         // SAFETY: NUL-terminated name, writable buffer, and length pointer are valid for the duration of the call.
         unsafe { sysctlbyname($name, $oldp, $oldlenp, $newp, $newlen) }
+    };
+    (install_sighup($sig:expr, $handler:expr)) => {
+        // SAFETY: `SIGHUP` is a valid standard POSIX signal number and `$handler` is an
+        // async-signal-safe `extern "C" fn(c_int)` that only performs an atomic fetch_add.
+        unsafe { signal($sig, $handler) }
     };
 }
 
@@ -159,6 +169,50 @@ pub const fn decode_boot_id_u128_be(hi: u64, lo: u64) -> [u8; 16] {
         ((lo >> 8) & 0xFF) as u8,
         (lo & 0xFF) as u8,
     ]
+}
+
+/// Whether a zero-wait poll positively observes BOTH directions of this retained
+/// socket hung up. A read-side EOF alone does not establish that writes cannot wait.
+/// No bytes are consumed and descriptor flags/timeouts are unchanged. Any refusal
+/// (including interruption), invalid descriptor or missing event returns `false`.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn socket_hung_up(socket: std::os::fd::BorrowedFd<'_>) -> bool {
+    apple::socket_hung_up(socket)
+}
+
+/// Install the process-wide Apple `SIGHUP` handler once. Success means installation
+/// completed, so later `SIGHUP` signals advance [`sighup_generation`] rather than
+/// terminating the process. Concurrent callers receive the same installation result.
+/// This replaces any previous handler and does not restore it. Non-Apple targets
+/// return [`io::ErrorKind::Unsupported`] without changing signal disposition.
+pub fn install_sighup_handler() -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        apple::install_sighup_handler()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SIGHUP reload is supported only on Apple targets",
+        ))
+    }
+}
+
+/// The current `SIGHUP` generation counter: increments on each `SIGHUP` delivered to
+/// this process after a successful [`install_sighup_handler`] on Apple targets.
+/// Other targets always return zero.
+#[must_use]
+pub fn sighup_generation() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        apple::sighup_generation()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        0
+    }
 }
 
 /// Whether a Darwin `errno` value (`ENODEV=19`, `EINVAL=22`, `ENOTTY=25`, `ENOTSUP=45`)

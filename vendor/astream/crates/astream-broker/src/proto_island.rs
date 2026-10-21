@@ -397,6 +397,24 @@ clean {
     -- record with `willSeq < highWater` (`will_is_fenced_isl highWater willSeq = false`
     -- in `BrokerLog::stage_will_fire`), the capability is not expired (`nowMs < willExpMs`),
     -- and the principal is not revoked (`revoked = 0`).
+    --
+    -- THE PRODUCER OBLIGATION is NOT this invariant's assumption: it holds for EVERY
+    -- `newSeq`, and says only that a will which fired was not fenced. It does not say
+    -- that a reconnect FENCES the will, i.e. raises the high water above it. That holds
+    -- only when the newer incarnation publishes ABOVE the will, `willSeq < newSeq`, and
+    -- the broker cannot check it: a will is a hidden record, and incarnations are the
+    -- producer's own count. The producer owes it (`Request::Will`, `Client::will`): a
+    -- new incarnation's sequences sit above every sequence of any incarnation it ever
+    -- presented, and the incarnation is flushed before its will is registered.
+    -- `astream_broker::will_seq` exports the layout that meets the first half (aterm's:
+    -- `(inc << 32) | 0xFFFF_FFFF`, up to `INC_MAX`). The obligation is the hypothesis of
+    -- what the fence buys, proved below: the newer incarnation's publish fences the will
+    -- (`newer_incarnation_publish_fences_the_will`), every later step keeps it fenced
+    -- (`next_keeps_a_fenced_will_fenced`), a fenced will has no fire step
+    -- (`a_fenced_will_cannot_fire`), and over the spec, once the publish has landed the
+    -- will is fenced and unfired in every state (`obliged_spec_fences_the_will_once_landed`).
+    -- A producer that reuses an incarnation has `newSeq ≤ willSeq`, and its old will
+    -- fires (`will::a_reused_incarnation_is_not_fenced`).
     def WillFencingInv (s : WillState) : Prop :=
       s.willFired = 1 →
         ((Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat s.highWater) → False) ∧
@@ -528,6 +546,166 @@ clean {
       invariantSatisfies (Spec wSeq wExp t0 newSeq) WillFencingInv
         (init_establishes_inv wSeq wExp t0)
         (fun _ sNext _ hNext => next_preserves_inv newSeq _ sNext hNext)
+
+    -- WHAT THE OBLIGATION BUYS, step by step, each kernel-checked.
+    --
+    -- (1) A record above the will raises the high water above the will, whatever the
+    -- high water was before it ...
+    theorem high_water_above_a_newer_seq (hw newSeq ws : UInt64)
+        (hAbove : Nat.lt (UInt64.toNat ws) (UInt64.toNat newSeq)) :
+        Nat.lt (UInt64.toNat ws) (UInt64.toNat (_root_.high_water_monotone hw newSeq)) :=
+      @Decidable.casesOn (LT.lt hw newSeq)
+        (fun (d : Decidable (LT.lt hw newSeq)) =>
+          Nat.lt (UInt64.toNat ws) (UInt64.toNat (@ite UInt64 (LT.lt hw newSeq) d newSeq hw)))
+        (instDecidableUInt64Lt hw newSeq)
+        (fun hNotLt =>
+          -- Not below the new record, so the high water is at or above it (Nat totality).
+          let hNewLe : Nat.le (UInt64.toNat newSeq) (UInt64.toNat hw) :=
+            Or.elim (Nat.le_or_lt (UInt64.toNat newSeq) (UInt64.toNat hw))
+              (fun hLe => hLe)
+              (fun hLt => False.elim (hNotLt hLt))
+          Nat.le_trans hAbove hNewLe)
+        (fun _ => hAbove)
+
+    -- (2) ... and the high water NEVER FALLS, whatever sequence a later publish
+    -- carries: a stale incarnation's record below it leaves it where it was. This is
+    -- what `_root_.high_water_monotone` being a maximum buys, and a "latest record
+    -- wins" rule would fail here ...
+    theorem high_water_never_falls (hw pubSeq : UInt64) :
+        Nat.le (UInt64.toNat hw) (UInt64.toNat (_root_.high_water_monotone hw pubSeq)) :=
+      @Decidable.casesOn (LT.lt hw pubSeq)
+        (fun (d : Decidable (LT.lt hw pubSeq)) =>
+          Nat.le (UInt64.toNat hw) (UInt64.toNat (@ite UInt64 (LT.lt hw pubSeq) d pubSeq hw)))
+        (instDecidableUInt64Lt hw pubSeq)
+        (fun _ => Nat.le.refl (UInt64.toNat hw))
+        (fun hLt => Nat.le_of_lt hLt)
+
+    -- A step that keeps the will and sets the high water to `hw` keeps `willSeq < hw`.
+    theorem fenced_carried (s sNext : WillState) (hw : UInt64)
+        (hWs : sNext.willSeq = s.willSeq) (hHw : sNext.highWater = hw)
+        (hLt : Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat hw)) :
+        Nat.lt (UInt64.toNat sNext.willSeq) (UInt64.toNat sNext.highWater) :=
+      let h1 : Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat sNext.highWater) :=
+        Eq.mpr (congrArg (fun h => Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat h)) hHw) hLt
+      Eq.mpr (congrArg (fun w => Nat.lt (UInt64.toNat w) (UInt64.toNat sNext.highWater)) hWs) h1
+
+    -- (3) ... the Rust-verified guard reads a will below the high water as fenced, so
+    -- a fenced will has no fire step ...
+    theorem fenced_isl_of_lt (hw ws : UInt64)
+        (hLt : Nat.lt (UInt64.toNat ws) (UInt64.toNat hw)) :
+        will_is_fenced_isl hw ws = true :=
+      @Decidable.casesOn (LT.lt ws hw)
+        (fun (d : Decidable (LT.lt ws hw)) => @Decidable.decide (LT.lt ws hw) d = true)
+        (instDecidableUInt64Lt ws hw)
+        (fun hNotLt => False.elim (hNotLt hLt))
+        (fun _ => rfl)
+
+    theorem a_fenced_will_cannot_fire (s sNext : WillState)
+        (hFenced : Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat s.highWater)) :
+        FireWillOnDisconnect s sNext → False :=
+      fun hFire =>
+        bool_true_ne_false
+          (Eq.trans (Eq.symm (fenced_isl_of_lt s.highWater s.willSeq hFenced)) hFire.1)
+
+    -- (4) ... so EVERY step keeps a fenced will fenced, a publish under ANY sequence
+    -- included (a stale incarnation's, below the will): a publish only raises the high
+    -- water (2), a revocation or a suppression leaves the will and the high water as
+    -- they were, and a fire step does not exist from a fenced will (3) ...
+    theorem next_keeps_a_fenced_will_fenced (pubSeq : UInt64) (s sNext : WillState)
+        (hFenced : Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat s.highWater))
+        (hNext : Next pubSeq s sNext) :
+        Nat.lt (UInt64.toNat sNext.willSeq) (UInt64.toNat sNext.highWater) :=
+      Or.elim hNext
+        (fun hPub =>
+          fenced_carried s sNext (_root_.high_water_monotone s.highWater pubSeq)
+            hPub.2.1 hPub.2.2.2.1
+            (Nat.le_trans hFenced (high_water_never_falls s.highWater pubSeq)))
+        (fun hR1 =>
+          Or.elim hR1
+            (fun hRev => fenced_carried s sNext s.highWater hRev.2.1 hRev.2.2.2.1 hFenced)
+            (fun hR2 =>
+              Or.elim hR2
+                (fun hFire => False.elim (a_fenced_will_cannot_fire s sNext hFenced hFire))
+                (fun hSup => fenced_carried s sNext s.highWater hSup.1 hSup.2.2.1 hFenced)))
+
+    -- (5) ... and under the producer obligation (`willSeq < newSeq`) the newer
+    -- incarnation's publish is what fences the will. From that publish on, by (4) and
+    -- (3), the will is fenced in every later state and has no fire step in any of them.
+    theorem newer_incarnation_publish_fences_the_will (newSeq : UInt64)
+        (s sNext : WillState)
+        (hObligation : Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat newSeq))
+        (hPub : NewerIncarnationPublish newSeq s sNext) :
+        Nat.lt (UInt64.toNat sNext.willSeq) (UInt64.toNat sNext.highWater) :=
+      fenced_carried s sNext (_root_.high_water_monotone s.highWater newSeq)
+        hPub.2.1 hPub.2.2.2.1
+        (high_water_above_a_newer_seq s.highWater newSeq s.willSeq hObligation)
+
+    -- OVER THE SPEC, as a temporal law like `WillFencingInv`'s. Under the obligation
+    -- (`wSeq < newSeq`), in EVERY reachable state, once the newer incarnation's publish
+    -- has landed (`newSeq ≤ highWater`: the high water starts at 0 and only that publish
+    -- moves it) the will is fenced and has not fired. The high water never falls (2),
+    -- so every state after the landing is one this clause speaks for.
+    def FencedOnceLanded (newSeq : UInt64) (s : WillState) : Prop :=
+      Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat newSeq) ∧
+        (Nat.le (UInt64.toNat newSeq) (UInt64.toNat s.highWater) →
+          (Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat s.highWater) ∧ s.willFired = 0))
+
+    theorem fenced_once_landed_of_unfired (newSeq : UInt64) (s : WillState)
+        (hBelow : Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat newSeq))
+        (hUnfired : s.willFired = 0) : FencedOnceLanded newSeq s :=
+      And.intro hBelow (fun hLanded => And.intro (Nat.le_trans hBelow hLanded) hUnfired)
+
+    theorem will_stays_below (newSeq : UInt64) (s sNext : WillState)
+        (hWs : sNext.willSeq = s.willSeq)
+        (hBelow : Nat.lt (UInt64.toNat s.willSeq) (UInt64.toNat newSeq)) :
+        Nat.lt (UInt64.toNat sNext.willSeq) (UInt64.toNat newSeq) :=
+      Eq.mpr (congrArg (fun w => Nat.lt (UInt64.toNat w) (UInt64.toNat newSeq)) hWs) hBelow
+
+    theorem init_establishes_fenced_once_landed (wSeq wExp t0 newSeq : UInt64)
+        (hObligation : Nat.lt (UInt64.toNat wSeq) (UInt64.toNat newSeq))
+        (s : WillState) (hInit : Init wSeq wExp t0 s) : FencedOnceLanded newSeq s :=
+      fenced_once_landed_of_unfired newSeq s
+        (Eq.mpr (congrArg (fun w => Nat.lt (UInt64.toNat w) (UInt64.toNat newSeq)) hInit.1)
+          hObligation)
+        hInit.2.2.2.2.2
+
+    theorem next_preserves_fenced_once_landed (newSeq : UInt64) (s sNext : WillState)
+        (hInv : FencedOnceLanded newSeq s) (hNext : Next newSeq s sNext) :
+        FencedOnceLanded newSeq sNext :=
+      Or.elim hNext
+        (fun hPub =>
+          fenced_once_landed_of_unfired newSeq sNext
+            (will_stays_below newSeq s sNext hPub.2.1 hInv.1) hPub.2.2.2.2.2.2)
+        (fun hR1 =>
+          Or.elim hR1
+            (fun hRev =>
+              fenced_once_landed_of_unfired newSeq sNext
+                (will_stays_below newSeq s sNext hRev.2.1 hInv.1) hRev.2.2.2.2.2.2)
+            (fun hR2 =>
+              Or.elim hR2
+                (fun hFire =>
+                  -- A fire step leaves the high water where it was: had the publish
+                  -- landed after it, it had landed before it, the will was fenced
+                  -- there (the obligation), and a fenced will has no fire step (3).
+                  And.intro (will_stays_below newSeq s sNext hFire.2.2.2.1 hInv.1)
+                    (fun hLanded =>
+                      let hLandedBefore : Nat.le (UInt64.toNat newSeq) (UInt64.toNat s.highWater) :=
+                        Eq.mp (congrArg (fun h => Nat.le (UInt64.toNat newSeq) (UInt64.toNat h))
+                          hFire.2.2.2.2.2.1) hLanded
+                      False.elim
+                        (a_fenced_will_cannot_fire s sNext (Nat.le_trans hInv.1 hLandedBefore) hFire)))
+                (fun hSup =>
+                  fenced_once_landed_of_unfired newSeq sNext
+                    (will_stays_below newSeq s sNext hSup.1 hInv.1) hSup.2.2.2.2.2)))
+
+    -- Full TLA+ Temporal Safety Theorem, under the producer obligation:
+    --   `wSeq < newSeq → Spec wSeq wExp t0 newSeq ⊨ □ (Lift (FencedOnceLanded newSeq))`
+    theorem obliged_spec_fences_the_will_once_landed (wSeq wExp t0 newSeq : UInt64)
+        (hObligation : Nat.lt (UInt64.toNat wSeq) (UInt64.toNat newSeq)) :
+        (Spec wSeq wExp t0 newSeq) ⊨ □ (Lift (FencedOnceLanded newSeq)) :=
+      invariantSatisfies (Spec wSeq wExp t0 newSeq) (FencedOnceLanded newSeq)
+        (init_establishes_fenced_once_landed wSeq wExp t0 newSeq hObligation)
+        (fun s sNext hInv hNext => next_preserves_fenced_once_landed newSeq s sNext hInv hNext)
 
     end TlaWillFencing
 

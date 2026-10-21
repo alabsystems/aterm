@@ -398,3 +398,37 @@ fn said_drops_the_done_tokens_lines_as_the_result_does() {
         Some("A worker ends with ATERM-TASK-DONE on a line by itself.")
     );
 }
+
+/// THE HARNESS'S OWN ACTS ARE NO PROMPT (FOREVER CRUISE / FOREVER LAND):
+/// Cruise's continuation (`CONTINUE_TEXT`, the default `continue_text`), its
+/// prompt at a done claim (`DONE_CHECK`), Land's instruction and nudge, and a
+/// restart's carry-on each open with the harness's mark, so the survey's
+/// newest prompt stays the one a person or a manager typed. NEGATIVE
+/// CONTROL: the owner's own unmarked `continue_text` (`keep going`) is a
+/// prompt, which the survey skips only by the host's turn ledger.
+#[test]
+fn the_harnesss_own_acts_are_no_prompt() {
+    use crate::supervise::policy::turn_end::{DONE_CHECK, LAND, LAND_NUDGE};
+    let carry_on =
+        crate::harness::relaunch::resumed_prompt("2.1.300", crate::harness::relaunch::CAUSE_HOST);
+    for act in [
+        crate::supervise::config::CONTINUE_TEXT,
+        DONE_CHECK,
+        LAND,
+        LAND_NUDGE,
+        carry_on.as_str(),
+    ] {
+        let rows = vec![user("ship the survey"), said("m1", "working"), user(act)];
+        assert_eq!(texts(&excerpts(&rows)), ["ship the survey"], "{act}");
+    }
+    let rows = vec![
+        user("ship the survey"),
+        said("m1", "working"),
+        user("keep going"),
+    ];
+    assert_eq!(
+        texts(&excerpts(&rows)),
+        ["keep going", "ship the survey"],
+        "CONTROL: the owner's unmarked words"
+    );
+}

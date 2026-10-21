@@ -104,9 +104,16 @@ pub struct EventLoop<T: 'static> {
 
 impl<T: 'static> EventLoop<T> {
     pub fn new() -> Result<EventLoop<T>, EventLoopError> {
+        Self::on_display(None)
+    }
+
+    /// A loop on the compositor `display` names (`None`: as libwayland reads the environment).
+    pub(crate) fn on_display(
+        display: Option<&std::ffi::CStr>,
+    ) -> Result<EventLoop<T>, EventLoopError> {
         let wire_error = |error: aterm_wayland::proxy::Error| os_error!(OsError::from(error));
 
-        let connection = Arc::new(Connection::connect().map_err(wire_error)?);
+        let connection = Arc::new(Connection::connect(display).map_err(wire_error)?);
 
         let mut winit_state =
             WinitState::new(Arc::clone(&connection)).map_err(|error| os_error!(error))?;

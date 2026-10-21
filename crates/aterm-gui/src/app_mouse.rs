@@ -99,6 +99,21 @@ pub(crate) fn pointer_anchor(
     (logical, side)
 }
 
+/// The logical grid column under the pointer on pane-local viewport cell (`row`, `col`), the
+/// cell the frame painted there, and the side of it a press anchors before: a doubled line
+/// halves the column, then the BiDi permutation maps it ([`Terminal::painted_cell_logical`],
+/// the mapping a web host's `link_at` takes too), so on a right-to-left cell the side is its
+/// logical end. The one painted → logical mapping a selection press and the link probes (the
+/// hand, the caption, a Cmd-click, a file citation) share: the link they name is the one
+/// painted under the pointer, in the cell a press selects. PTY mouse reports keep the screen
+/// cell.
+pub(crate) fn pointer_cell(t: &Terminal, row: u16, col: u16) -> (u16, SelectionSide) {
+    match t.painted_cell_logical(row, col) {
+        (logical, true) => (logical, SelectionSide::Right),
+        (logical, false) => (logical, SelectionSide::Left),
+    }
+}
+
 /// [`pointer_anchor`] for a press already in selection rows (`sel_row`, the
 /// viewport row minus `display_offset`).
 fn pointer_anchor_at_sel_row(
@@ -272,7 +287,8 @@ enum HoverProbe {
 pub(crate) struct HoverMemo {
     session: u64,
     window_cell: (u16, u16),
-    /// The pane-local cell the probe read — the one a `LinkHover` names.
+    /// The pane-local painted cell the pointer was on — the one a `LinkHover`
+    /// names; the probe read the logical cell under it ([`pointer_cell`]).
     cell: (u16, u16),
     mod_held: bool,
     /// `pointer_is_inside_focused_pane && !chrome_owns_terminal_row` at
@@ -519,9 +535,10 @@ pub(crate) fn caption_admits(
 /// the viewport row `render_row` resolves, at the renderer's `min_contrast`), so the hand
 /// appears exactly where a click opens something. That reading needs the row's inks, not
 /// just its characters: a concealed cell keeps its character, and a URL run ends where the
-/// ink does. Both are viewport-keyed: the pointer stands on the row the frame drew. A plain
-/// URL is its own visible text, so it earns a caption only when part of it is painted
-/// faintly. With neither, the same row is read for a plain-text file citation
+/// ink does. Both are viewport-keyed: the pointer stands on the row the frame drew, and on
+/// its painted cell `col`, read at the logical cell under it ([`pointer_cell`]) as a press
+/// selects it. A plain URL is its own visible text, so it earns a caption only when part of
+/// it is painted faintly. With neither, the same row is read for a plain-text file citation
 /// ([`crate::plain_path_at`]), returned with the shell's OSC 7 directory for the caller
 /// to resolve once the terminal is no longer needed. Returns `(disclosed, plain_url,
 /// citation)`.
@@ -533,12 +550,12 @@ fn probe_hover_cell(
     mod_held: bool,
     min_contrast: f32,
 ) -> (Option<std::sync::Arc<str>>, bool, Option<CitationProbe>) {
-    let link = if cell_is_under_pointer {
-        t.hyperlink_at_visible(row, col)
-    } else {
-        None
-    };
-    if link.is_some() || !mod_held || !cell_is_under_pointer {
+    if !cell_is_under_pointer {
+        return (None, false, None);
+    }
+    let col = pointer_cell(t, row, col).0;
+    let link = t.hyperlink_at_visible(row, col);
+    if link.is_some() || !mod_held {
         return (link, false, None);
     }
     let cells = t.render_row(usize::from(row));
@@ -978,6 +995,17 @@ pub(crate) enum NativePointerTarget {
     Point(f32, f32),
 }
 
+/// The unit of a `pointer wheel`'s deltas, and so the device it stands in for:
+/// a wheel's notches (`MouseScrollDelta::LineDelta`, a fraction banked toward
+/// the next whole line as a free-spinning wheel's is), or a trackpad's logical
+/// points (`MouseScrollDelta::PixelDelta` at the window's scale, then the
+/// zero-delta `Ended` its finger's lift sends).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WheelUnit {
+    Lines,
+    Points,
+}
+
 /// What the `pointer` verb asks of the front window's pointer. Each variant is the
 /// winit event it stands in for, so [`App::pointer_cmd`] has one call to make per
 /// arm and no pointer behaviour of its own to keep in step.
@@ -996,6 +1024,16 @@ pub(crate) enum PointerAction {
     /// the pointer is: a click, through the functions winit's own event
     /// calls.
     Click,
+    /// `WindowEvent::MouseWheel` where the pointer is, or where `aim` puts it
+    /// first (a `CursorMoved` onto a native view's control or point): `dy`
+    /// down and `dx` right, in a wheel's lines or a trackpad's points
+    /// ([`WheelUnit`]).
+    Wheel {
+        dx: f64,
+        dy: f64,
+        unit: WheelUnit,
+        aim: Option<NativePointerTarget>,
+    },
     /// `WindowEvent::CursorLeft`: the pointer withdraws from the window.
     Leave,
     /// Report only — moves nothing.
@@ -1932,6 +1970,14 @@ impl App {
     /// macOS), and the native view's `copy_native_selection(wid)`. Only `MenuAction::Copy`
     /// keeps the frontmost form: a menu item carries no window.
     pub(crate) fn copy_selection_in(&self, wid: WindowId) -> bool {
+        // The keyboard lens's ⌘C copies its selected bar's sentence.
+        if self.windows.get(&wid).is_some_and(|ws| {
+            ws.stats_lens
+                .open
+                .is_some_and(|l| l.how == crate::stats_lens::Opened::Keyboard)
+        }) {
+            return self.copy_stats_sentence(wid);
+        }
         let Some(text) = self.window_selection_text(wid) else {
             return false;
         };
@@ -2128,7 +2174,7 @@ impl App {
     /// the origin is one rounding from the neighbouring cell, and the half-cell puts the
     /// pointer on a definite `SelectionSide`. `None` before the first layout or for a cell
     /// outside the grid, so the caller replies `ERR` instead of moving the pointer elsewhere.
-    fn cell_centre_px(&self, wid: WindowId, row: u16, col: u16) -> Option<(f64, f64)> {
+    pub(crate) fn cell_centre_px(&self, wid: WindowId, row: u16, col: u16) -> Option<(f64, f64)> {
         let (rows, cols) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols))?;
         if row >= rows || col >= cols {
             return None;
@@ -2189,10 +2235,13 @@ impl App {
         // A native front in a window with no glass (headless, no video take) has
         // never presented a frame for the glass-commit guard to stand on; it
         // commits the one a capture of it shows first, so a pointer reaches the
-        // same tree `image` renders (cs-25).
+        // same tree `image` renders (cs-25), and again before the reply.
         if matches!(
             action,
-            PointerAction::Move { .. } | PointerAction::MoveNative(_) | PointerAction::Click
+            PointerAction::Move { .. }
+                | PointerAction::MoveNative(_)
+                | PointerAction::Click
+                | PointerAction::Wheel { .. }
         ) {
             let _ = self.commit_glassless_native_frame(wid);
         }
@@ -2200,6 +2249,55 @@ impl App {
             PointerAction::MoveNative(target) => {
                 let (x, y) = self.native_pointer_target_px(wid, &target)?;
                 self.on_cursor_moved(wid, x, y);
+            }
+            PointerAction::Wheel { dx, dy, unit, aim } => {
+                let aimed = aim.is_some();
+                let (x, y) = match aim {
+                    Some(target) => self.native_pointer_target_px(wid, &target)?,
+                    None => self
+                        .windows
+                        .get(&wid)
+                        .filter(|ws| ws.pointer_position_known)
+                        .map(|ws| ws.last_cursor_px)
+                        .ok_or("the pointer holds no position (move it first)")?,
+                };
+                // An aimed wheel is a hand that moved there first. On macOS
+                // every wheel is: AppKit's `scrollWheel:` queues a
+                // `CursorMoved` at the event's point ahead of the
+                // `MouseWheel` (`aterm-window`'s macOS `view.rs`).
+                if aimed || cfg!(target_os = "macos") {
+                    self.on_cursor_moved(wid, x, y);
+                }
+                // The verb's `dy` is down and `dx` right, toward a list's end;
+                // winit's are the content's motion, up and left (a positive
+                // `y` reveals what is above).
+                let (delta, lifts) = match unit {
+                    WheelUnit::Lines => {
+                        (MouseScrollDelta::LineDelta(-dx as f32, -dy as f32), false)
+                    }
+                    WheelUnit::Points => {
+                        let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
+                        (
+                            MouseScrollDelta::PixelDelta(aterm_window::dpi::PhysicalPosition::new(
+                                -dx * scale,
+                                -dy * scale,
+                            )),
+                            true,
+                        )
+                    }
+                };
+                // What the event loop's `MouseWheel` arm calls, and for a
+                // trackpad the zero-delta `Ended` its finger's lift sends.
+                self.on_mouse_wheel_phased(wid, delta, TouchPhase::Moved);
+                if lifts {
+                    self.on_mouse_wheel_phased(
+                        wid,
+                        MouseScrollDelta::PixelDelta(aterm_window::dpi::PhysicalPosition::new(
+                            0.0, 0.0,
+                        )),
+                        TouchPhase::Ended,
+                    );
+                }
             }
             PointerAction::Move { row, col } => {
                 let (x, y) = self
@@ -2270,7 +2368,46 @@ impl App {
                 self.on_modifiers_changed(wid, mods);
             }
         }
+        // The reply reads where the pointer is in the frame the event left: a
+        // hover, a click or a wheel that acted changed the page, and input
+        // reads only a presented frame. A glassless window presents nothing
+        // until it is committed (it answered `ERR no presented native frame
+        // under the pointer`); glass shows the change on the window's next
+        // redraw, which the reply would not wait for (it answered `ERR the page
+        // under the pointer changed …` for every event that worked).
+        if !self.commit_glassless_native_frame(wid) {
+            self.present_native_frame_on_glass(wid);
+        }
         Ok(self.pointer_readback(wid))
+    }
+
+    /// Present `wid`'s next frame now, as its next redraw would, where it has
+    /// glass and the native page in front changed since its last present, so
+    /// a reply reads the page the person sees next rather than the one before
+    /// the event. Nothing where the page in front is presented as it stands,
+    /// or is not native. The reply waits on the present, as a capture does,
+    /// so it is a capture's (a minimized Windows window presents it too); a
+    /// present that fails leaves the reply saying the frame is not presented.
+    fn present_native_frame_on_glass(&mut self, wid: WindowId) {
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.present.is_some())
+        {
+            return;
+        }
+        let Some((_, view)) = self.active_native_view(wid) else {
+            return;
+        };
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return;
+        };
+        if self
+            .retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
+            .is_none()
+        {
+            self.redraw_capture_frame(wid, None);
+        }
     }
 
     /// The `pointer` verb's answer after [`Self::pointer_cmd`] ran: over a native
@@ -2306,10 +2443,30 @@ impl App {
                 px,
             });
         }
-        if self.active_native_view(wid).is_some()
+        // A pointer over the chrome above the page (a negative row: the band,
+        // the tab strip) is on the chrome, whatever the tab holds.
+        if cell.0 >= 0
+            && let Some((_, view)) = self.active_native_view(wid)
             && !self.active_tab_has_multiple_visible_panes(wid)
         {
-            return Err("no presented native frame under the pointer".into());
+            // A page that changed since its last present still shows that
+            // frame, and input reads only what is shown. The verb presented
+            // (glass) or committed (no glass) the page its event left before
+            // replying, so this is a present that failed (its frame is staged,
+            // not shown), or a change the verb did not make (`pointer status`
+            // presents it). With no frame of the page at all, none is there.
+            let framed = self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.leaf_render_cache.get(&view))
+                .is_some_and(|cache| cache.native.is_some());
+            return Err(if framed {
+                "the page under the pointer changed and its next frame is not presented yet \
+                 (pointer status reads it)"
+            } else {
+                "no presented native frame under the pointer"
+            }
+            .into());
         }
         Ok(PointerAt::Grid { cell, px })
     }
@@ -2366,14 +2523,23 @@ impl App {
             .ok_or("no presented native frame to aim at")?;
         let (x, y) = match target {
             NativePointerTarget::Key(key) => {
-                let rect = artifact
-                    .compiled
+                let compiled = &artifact.compiled;
+                let shown = compiled
                     .paint
                     .iter()
                     .find(|node| node.key.as_str() == key)
                     .map(|node| node.clip)
                     .filter(|clip| clip.width > 0.0 && clip.height > 0.0)
                     .ok_or_else(|| format!("{key} is not on the presented page"))?;
+                // Where a press takes the control, where it takes one: a
+                // control a list's edge cuts is drawn on into the strip under
+                // the list's room, which is only a picture, so the centre of
+                // what is drawn can be a point no press there takes it at.
+                let rect = compiled
+                    .hits
+                    .iter()
+                    .find(|hit| hit.key.as_str() == key)
+                    .map_or(shown, |hit| hit.rect);
                 (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
             }
             NativePointerTarget::Point(x, y) => (*x, *y),
@@ -2667,6 +2833,16 @@ impl App {
         let (cw, ch) = geom.cell;
         let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols);
         let (x, y) = self.window_to_frame_with(wid, geom, x, y);
+        // The stats Deck in the head is not the strip, though a point above
+        // the grid clamps onto the strip's row: it takes its own presses
+        // (`App::stats_press`), and a pointer resting on it lights no tab.
+        if y >= 0.0
+            && self
+                .deck_rows_px(wid)
+                .is_some_and(|rows| rows.contains(&(y as usize)))
+        {
+            return None;
+        }
         strip_col_for_pixel(
             x,
             y,
@@ -3001,6 +3177,8 @@ impl App {
         self.clear_claude_light_hover(wid);
         // …and a widened scrollbar (`crate::pane_chrome`).
         self.scrollbar_pointer_left(wid);
+        // …and a rest armed on a stats instrument; a hover lens starts its leave.
+        self.stats_pointer_left(wid, Instant::now());
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -3861,6 +4039,28 @@ impl App {
             self.overview_pointer_motion(wid, x, y);
             return;
         }
+        // The stats surfaces (the Deck's band, a sill instrument, an open lens)
+        // own the motion over them: it arms the lens's rest and never reaches a
+        // pane, so a mouse-reporting program sees no motion there. A drag that
+        // began in the grid keeps going (a selection crossing the sill still
+        // selects).
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
+            && self.stats_pointer_motion(wid, Instant::now())
+        {
+            if let Some(ws) = self.windows.get_mut(&wid)
+                && (ws.hover_pointer || ws.native_text_cursor)
+            {
+                ws.hover_pointer = false;
+                ws.native_text_cursor = false;
+                if let Some(w) = &ws.os_window {
+                    w.set_cursor(CursorIcon::Default);
+                }
+            }
+            return;
+        }
         let over_pane_header = self.pane_header_at_with(wid, geom, x, y).is_some();
         // Native tabs own the full content region below host tab chrome. Track
         // hover in the view-local controller so the same typed tree drives the
@@ -4612,12 +4812,9 @@ impl App {
         let (sel_row, col) = {
             let mut term = term_lock(&term);
             let sel_row = i32::from(row) - term.grid().display_offset() as i32;
-            // A doubled line halves the column first (`pointer_char`); then the
-            // press anchors before the painted cell under it: its logical start,
-            // or on a right-to-left cell its logical end (BiDi; `pointer_anchor`
-            // maps painted grid columns).
-            let (col, _) = pointer_char(&term, row, col);
-            let (col, side) = pointer_anchor(&term, row, col, SelectionSide::Left);
+            // The press anchors before the painted cell under it: its logical
+            // start, or on a right-to-left cell its logical end (`pointer_cell`).
+            let (col, side) = pointer_cell(&term, row, col);
             term.text_selection_mut()
                 .start_selection(sel_row, col, side, kind);
             // Inside the same guard as the mutation, so no PTY-reader output can
@@ -4764,7 +4961,9 @@ impl App {
         let term = term_lock(&ws.front_terminal()?.term);
         // Viewport rows for both probes: `render_row` resolves through `display_offset`, so
         // a screen-keyed OSC 8 lookup would name a scrolled-back row's neighbour while the
-        // plain-text arm names the row under the pointer.
+        // plain-text arm names the row under the pointer. Both read the logical cell under
+        // the painted one, as the hover does (`probe_hover_cell`).
+        let col = pointer_cell(&term, row, col).0;
         term.hyperlink_at_visible(row, col)
             .map(|url| (url.to_string(), true))
             .or_else(|| {
@@ -4793,6 +4992,7 @@ impl App {
         let session = front.session;
         let probe = {
             let term = term_lock(&front.term);
+            let col = pointer_cell(&term, row, col).0;
             let cells = term.render_row(row as usize);
             crate::plain_path_at(&cells, col as usize, self.render_knobs.minimum_contrast)
                 .map(|span| CitationProbe::new(&term, span))
@@ -5185,7 +5385,7 @@ impl App {
         // acquisitions below. Releases and motion do not arm it; arming on motion would
         // double the reader's lock round-trips during any mouse movement.
         if pressed {
-            crate::metrics::note_typing_hot();
+            crate::input_hint::arm();
         }
         // Lifting the left button ends drag-to-reorder wherever the pointer is, above every
         // gate below: a release the palette or tab menu swallows must still disarm the chip.
@@ -5337,13 +5537,30 @@ impl App {
                 return;
             }
         }
-        // The Deck (`crate::stats_deck`) is chrome above the grid: a press on it
-        // goes nowhere, where the grid's clamp would make it a press on row 0.
-        if pressed
-            && self.windows.get(&wid).is_some_and(|ws| !ws.overlay_open())
-            && self.pointer_is_over_stats_deck(wid)
-        {
-            return;
+        // The stats surfaces (`crate::stats_deck`, `crate::stats_sill`,
+        // `crate::stats_lens`) are chrome: a left press on an instrument pins
+        // the lens there, any press on the Deck's band goes nowhere (the grid's
+        // clamp would make it a press on row 0), and a press elsewhere closes
+        // an open lens and goes on. Their release goes nowhere either, unless
+        // a press the grid took is still held (a drag crossing the sill).
+        if self.windows.get(&wid).is_some_and(|ws| !ws.overlay_open()) {
+            if pressed {
+                let taken = if button == WinitMouseButton::Left {
+                    self.stats_press(wid)
+                } else {
+                    self.stats_owns_pointer(wid)
+                };
+                if taken {
+                    return;
+                }
+            } else if self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| !ws.selecting && ws.held_mouse_button.is_none())
+                && self.stats_owns_pointer(wid)
+            {
+                return;
+            }
         }
         // Mixed tabs use the canonical tree before either content-specific
         // boundary. A divider consumes the press; otherwise a press in a sibling
@@ -6216,7 +6433,7 @@ impl App {
         // A wheel gesture is a human waiting on the UI thread, as a key press is: arm the
         // reader's hint first so its next lock holds are the fine slices, not the 16 KiB
         // idle ones.
-        crate::metrics::note_typing_hot();
+        crate::input_hint::arm();
         self.clear_move_license(wid);
         // The modal claim is decided before normalization. Sub-line gestures return below
         // without reaching native or terminal scroll consumers, and so do horizontal ones
@@ -6231,6 +6448,11 @@ impl App {
         // Do not bank fractional wheel deltas from chrome: otherwise a later
         // scroll in content would inherit motion that began over its title.
         if !(palette || session_picker || overview) && self.pointer_is_over_pane_header(wid) {
+            return;
+        }
+        // Nor from the stats surfaces: a wheel over the Deck, a sill instrument
+        // or the lens reaches no pane.
+        if !(palette || session_picker || overview) && self.stats_owns_pointer(wid) {
             return;
         }
         // The vertical pixel delta, taken before `wheel_notches` banks it: banking keeps
@@ -7078,6 +7300,483 @@ mod tests {
             .expect("the pointer leaves");
         assert_eq!(hovered(&app), None, "leaving clears the hover");
         assert_eq!(app.pointer_reply(cell), Ok(PointerAt::Absent));
+    }
+
+    /// A headless App whose 1,000×600 window has Settings open at `route`:
+    /// the sidebar beside a list.
+    fn settings_at_1000_by_600(
+        route: crate::native_settings::SettingsRoute,
+    ) -> (crate::App, crate::WindowId, crate::tab_model::ViewId) {
+        settings_at_1000_by_600_in(crate::App::headless_for_test(), route)
+    }
+
+    /// [`settings_at_1000_by_600`] in `app`: a window with glass (a scripted
+    /// surface) as well as without.
+    fn settings_at_1000_by_600_in(
+        app: crate::App,
+        route: crate::native_settings::SettingsRoute,
+    ) -> (crate::App, crate::WindowId, crate::tab_model::ViewId) {
+        settings_sized_in(app, route, (1_000, 600))
+    }
+
+    /// [`settings_at_1000_by_600_in`] in a window of about `width`×`height`
+    /// pixels (whole cells of it).
+    fn settings_sized_in(
+        mut app: crate::App,
+        route: crate::native_settings::SettingsRoute,
+        (width, height): (usize, usize),
+    ) -> (crate::App, crate::WindowId, crate::tab_model::ViewId) {
+        let wid = crate::WindowId(0);
+        let (cell_w, cell_h) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid);
+        if let Some(window) = app.windows.get_mut(&wid) {
+            window.cols = u16::try_from((width - pad * 2) / cell_w.max(1)).unwrap();
+            window.rows = u16::try_from((height - pad * 2) / cell_h.max(1)).unwrap();
+        }
+        assert!(app.open_settings_tab(route));
+        let (_, view) = app.active_native_view(wid).expect("Settings in front");
+        (app, wid, view)
+    }
+
+    /// A GLASSLESS POINTER'S REPLY READS THE FRAME ITS EVENT LEFT: a click that
+    /// acted on a native page changed it after the one commit the verb made,
+    /// before the click, and the reply answered `ERR no presented native frame
+    /// under the pointer` although the click landed. Where glass would still
+    /// show the frame before a change (no commit since), the answer says that
+    /// rather than that no native frame is there, and `status` commits and
+    /// reads the new one.
+    #[test]
+    fn a_glassless_pointers_reply_reads_the_frame_its_click_left() {
+        use super::{NativePointerTarget, PointerAt};
+        let (mut app, wid, view) =
+            settings_at_1000_by_600(crate::native_settings::SettingsRoute::KeyboardInput);
+        let switch = crate::native_ui::UiKey::new("settings/control/copy_on_select");
+        let look = |app: &crate::App| {
+            let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+            compiled
+                .semantic(&switch)
+                .map(|node| (node.value.clone(), node.state))
+        };
+        let native_reply = |app: &crate::App, cell| match app.pointer_reply(cell) {
+            Ok(PointerAt::Native { view: at, .. }) => assert_eq!(at, view.get()),
+            other => panic!("the reply reads the frame after the event: {other:?}"),
+        };
+        let before = look(&app);
+        assert!(
+            app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+                switch.as_str().to_string()
+            )))
+            .is_ok()
+        );
+        let cell = app.pointer_cmd(PointerAction::Click).expect("a click");
+        assert_ne!(look(&app), before, "the click acted");
+        native_reply(&app, cell);
+        let _ = app.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollLines(1));
+        assert_eq!(
+            app.pointer_reply(cell),
+            Err(
+                "the page under the pointer changed and its next frame is not presented yet \
+                 (pointer status reads it)"
+                    .to_string()
+            )
+        );
+        let cell = app.pointer_cmd(PointerAction::Status).expect("status");
+        native_reply(&app, cell);
+    }
+
+    /// ON GLASS A POINTER'S REPLY READS THE FRAME ITS EVENT LEFT: a click,
+    /// a wheel or a hover that changed a native page leaves the frame on
+    /// glass a page behind until the window's next present, and the reply,
+    /// read from the presented frame as input is, answered `ERR the page
+    /// under the pointer changed` for every one that worked. The verb presents
+    /// the frame its event left before it replies, as the window's next
+    /// redraw would, so each answer names the control the presented page
+    /// holds under the pointer.
+    #[test]
+    fn a_pointer_reply_on_glass_reads_the_frame_its_event_left() {
+        use super::{NativePointerTarget, PointerAt, WheelUnit};
+        let (mut app, wid, view) = settings_at_1000_by_600_in(
+            crate::scripted_redraw_fixture::scripted_app(),
+            crate::native_settings::SettingsRoute::KeyboardInput,
+        );
+        assert!(
+            !app.commit_glassless_native_frame(wid),
+            "the window has glass"
+        );
+        app.redraw_window(wid);
+        let switch = "settings/control/copy_on_select";
+        let reply = |app: &mut crate::App, action| {
+            let cell = app.pointer_cmd(action).expect("the pointer acts");
+            match app.pointer_reply(cell) {
+                Ok(PointerAt::Native { view: at, key, .. }) => {
+                    assert_eq!(at, view.get());
+                    key
+                }
+                other => panic!("the reply reads the presented frame: {other:?}"),
+            }
+        };
+        let value = |app: &crate::App| {
+            app.compiled_native_ui(wid)
+                .expect("the page compiles")
+                .semantic(&crate::native_ui::UiKey::new(switch))
+                .map(|node| (node.value.clone(), node.state))
+        };
+        let hovered = reply(
+            &mut app,
+            PointerAction::MoveNative(NativePointerTarget::Key(switch.into())),
+        );
+        assert_eq!(hovered.as_deref(), Some(switch), "the hover is presented");
+        let before = value(&app);
+        let _ = reply(&mut app, PointerAction::Click);
+        assert_ne!(value(&app), before, "the click acted");
+        let wheel = PointerAction::Wheel {
+            dx: 0.0,
+            dy: 1.0,
+            unit: WheelUnit::Lines,
+            aim: None,
+        };
+        let _ = reply(&mut app, wheel);
+        let status = reply(&mut app, PointerAction::Status);
+        let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+        let (x, y) = app.windows[&wid].last_cursor_px;
+        let (artifact, local_x, local_y) = app
+            .retained_native_leaf_at_pointer(wid, x, y)
+            .expect("the frame under the pointer is presented");
+        assert_eq!(artifact.compiled.paint.len(), compiled.paint.len());
+        assert_eq!(
+            status,
+            compiled
+                .hit_test(local_x, local_y)
+                .map(|hit| hit.key.as_str().to_string()),
+            "the reply names what the page now holds there"
+        );
+        // An unchanged page is not presented again for a reply.
+        let surface = crate::scripted_redraw_fixture::surface;
+        let commits = surface(&mut app).commits();
+        let _ = reply(&mut app, PointerAction::Status);
+        assert_eq!(surface(&mut app).commits(), commits, "nothing changed");
+        // A present that fails leaves glass a page behind, and the reply says
+        // so rather than name a control the person cannot see there.
+        surface(&mut app).fail_next(crate::present::scripted::ScriptedOutcome::FailCommit);
+        let wheel_up = PointerAction::Wheel {
+            dx: 0.0,
+            dy: -1.0,
+            unit: WheelUnit::Lines,
+            aim: None,
+        };
+        let cell = app.pointer_cmd(wheel_up).expect("the wheel turns");
+        assert_eq!(
+            app.pointer_reply(cell),
+            Err(
+                "the page under the pointer changed and its next frame is not presented yet \
+                 (pointer status reads it)"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A HEADLESS WHEEL TAKES THE WHEEL'S OWN PATH INTO A NATIVE VIEW: with no
+    /// `pointer wheel`, a wheel over Settings was checked only below the App,
+    /// as `ScrollLines` handed to the reducer. The verb delivers `MouseWheel`
+    /// through `on_mouse_wheel_phased`, where the pointer is: aimed at a list
+    /// row the list scrolls one stop a line, the plan's step; unaimed it turns
+    /// where the pointer rests; a trackpad's points bank into whole stops; over
+    /// the sidebar it is the sidebar's (the target finder under the pointer),
+    /// which no shortcut into the page's scroll would be; and the reply says
+    /// where the pointer is in the frame the wheel left.
+    /// NEGATIVE CONTROLS: no position and no aim is refused and scrolls
+    /// nothing; a sideways wheel scrolls no native view.
+    #[test]
+    fn a_headless_pointer_wheel_takes_the_wheels_own_path_into_a_native_view() {
+        use super::{NativePointerTarget, PointerAt, WheelUnit};
+        use crate::native_app::AppViewState;
+        let (mut app, wid, view) =
+            settings_at_1000_by_600(crate::native_settings::SettingsRoute::Terminal);
+        let page_scroll = |app: &crate::App| match app.native_runtime.view_state(view) {
+            Some(AppViewState::Settings(settings)) => settings.page_scroll,
+            _ => panic!("Settings state"),
+        };
+        let lines = |dy: f64, aim: Option<&str>| PointerAction::Wheel {
+            dx: 0.0,
+            dy,
+            unit: WheelUnit::Lines,
+            aim: aim.map(|key| NativePointerTarget::Key(key.to_string())),
+        };
+        let native_reply = |app: &crate::App, cell| match app.pointer_reply(cell) {
+            Ok(PointerAt::Native { view: at, .. }) => assert_eq!(at, view.get()),
+            other => panic!("the reply reads the frame after the event: {other:?}"),
+        };
+        // NEGATIVE CONTROL: a window that never saw the pointer has nowhere
+        // to turn a wheel.
+        assert_eq!(
+            app.pointer_cmd(lines(1.0, None)),
+            Err("the pointer holds no position (move it first)".to_string())
+        );
+        assert_eq!(page_scroll(&app), 0);
+        let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+        let on_screen = |prefix: &str| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| {
+                    node.key.as_str().starts_with(prefix)
+                        && node.clip.width > 0.0
+                        && node.clip.height > 0.0
+                })
+                .map(|node| node.key.as_str().to_string())
+                .unwrap_or_else(|| panic!("a {prefix} control on screen"))
+        };
+        let (row, nav) = (on_screen("settings/control/"), on_screen("settings/nav/"));
+        let cell = app
+            .pointer_cmd(lines(2.0, Some(&row)))
+            .expect("a wheel aimed at a row");
+        assert_eq!(page_scroll(&app), 2, "one stop a line");
+        native_reply(&app, cell);
+        let cell = app
+            .pointer_cmd(lines(-1.0, None))
+            .expect("a wheel where it rests");
+        assert_eq!(page_scroll(&app), 1);
+        native_reply(&app, cell);
+        // NEGATIVE CONTROL: sideways scrolls no native view.
+        let sideways = PointerAction::Wheel {
+            dx: 3.0,
+            dy: 0.0,
+            unit: WheelUnit::Lines,
+            aim: None,
+        };
+        assert!(app.pointer_cmd(sideways).is_ok());
+        assert_eq!(page_scroll(&app), 1);
+        // A trackpad's two rows of points bank into two stops.
+        let (_, cell_h) = app.win_cell_size(wid);
+        let scale = app.windows[&wid].scale;
+        let points = PointerAction::Wheel {
+            dx: 0.0,
+            dy: 2.0 * cell_h as f64 / scale,
+            unit: WheelUnit::Points,
+            aim: None,
+        };
+        assert!(app.pointer_cmd(points).is_ok());
+        assert_eq!(page_scroll(&app), 3, "points bank into whole stops");
+        // Over the sidebar the wheel is the sidebar's: the list stays.
+        assert!(app.pointer_cmd(lines(1.0, Some(&nav))).is_ok());
+        assert_eq!(page_scroll(&app), 3, "the sidebar's wheel leaves the list");
+    }
+
+    /// `pointer wheel` is a hand's wheel over a terminal too: where the pointer
+    /// rests on the grid, a turn up reaches the scrollback (the seam's local
+    /// scroll, a glide or the offset), and a turn down at the bottom moves
+    /// nothing.
+    #[test]
+    fn a_pointer_wheel_over_a_terminal_scrolls_its_history() {
+        use super::WheelUnit;
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let term = app.front_terminal(wid).expect("a terminal").term.clone();
+        {
+            let mut terminal = crate::term_lock(&term);
+            for line in 0..100 {
+                terminal.process(format!("history {line}\r\n").as_bytes());
+            }
+        }
+        let wheel = |dy: f64| PointerAction::Wheel {
+            dx: 0.0,
+            dy,
+            unit: WheelUnit::Lines,
+            aim: None,
+        };
+        assert!(
+            app.pointer_cmd(PointerAction::Move { row: 2, col: 3 })
+                .is_ok()
+        );
+        assert!(app.pointer_cmd(wheel(1.0)).is_ok());
+        assert_eq!(crate::term_lock(&term).grid().display_offset(), 0);
+        assert!(
+            app.windows[&wid].scroll_glide.is_none(),
+            "down at the bottom"
+        );
+        assert!(app.pointer_cmd(wheel(-3.0)).is_ok());
+        assert!(
+            app.windows[&wid].scroll_glide.is_some()
+                || crate::term_lock(&term).grid().display_offset() > 0,
+            "up reaches the history"
+        );
+    }
+
+    /// THE WHEEL OVER AN OPEN PICKER, BY THE WHEEL'S OWN PATH: the theme
+    /// picker opened by a click scrolls under `pointer wheel` and the tile
+    /// the pointer hovered is no longer hovered once the list moved; at the
+    /// end the wheel turns toward nothing moves, and the tile, still under the
+    /// pointer, stays hovered (the wheel cleared it there too, so a tile under
+    /// a still pointer lost its wash until the pointer moved).
+    #[test]
+    fn a_wheel_over_an_open_picker_clears_the_hover_only_when_the_list_moves() {
+        use super::{NativePointerTarget, WheelUnit};
+        use crate::native_app::AppViewState;
+        let (mut app, wid, view) =
+            settings_at_1000_by_600(crate::native_settings::SettingsRoute::Appearance);
+        let aim = |key: &str| PointerAction::MoveNative(NativePointerTarget::Key(key.into()));
+        let wheel = |dy: f64| PointerAction::Wheel {
+            dx: 0.0,
+            dy,
+            unit: WheelUnit::Lines,
+            aim: None,
+        };
+        let tiles = |app: &crate::App| {
+            app.compiled_native_ui(wid)
+                .expect("the page compiles")
+                .paint
+                .iter()
+                .filter(|node| {
+                    node.key.as_str().starts_with("settings/choice/theme/")
+                        && node.clip.height > 0.0
+                })
+                .map(|node| node.key.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        let hovered = |app: &crate::App| match app.native_runtime.view_state(view) {
+            Some(AppViewState::Settings(settings)) => settings
+                .common
+                .hovered
+                .as_ref()
+                .map(|key| key.as_str().to_string()),
+            _ => panic!("Settings state"),
+        };
+        assert!(app.pointer_cmd(aim("settings/control/theme")).is_ok());
+        assert!(app.pointer_cmd(PointerAction::Click).is_ok());
+        let top = tiles(&app);
+        let tile = top.get(1).cloned().expect("the picker opened on its tiles");
+        assert!(app.pointer_cmd(aim(&tile)).is_ok());
+        assert_eq!(hovered(&app), Some(tile.clone()));
+        // At the top, a wheel up moves nothing: the tile stays hovered.
+        assert!(app.pointer_cmd(wheel(-1.0)).is_ok());
+        assert_eq!(tiles(&app), top, "the list was at its top");
+        assert_eq!(hovered(&app), Some(tile.clone()), "nothing moved under it");
+        // Down, the list moves and the tile is no longer under the pointer.
+        assert!(app.pointer_cmd(wheel(1.0)).is_ok());
+        assert_ne!(tiles(&app), top, "the list scrolled");
+        assert_eq!(hovered(&app), None, "the hover went with the move");
+    }
+
+    /// THE WHEEL PUTS A PRESS'S NUDGE BACK ON THE LIST'S STOPS, BY THE WHEEL'S
+    /// OWN PATH: a click on a switch the list's bottom edge cuts scrolls the
+    /// list by the switch's hidden part (the press nudge,
+    /// `settings_scroll::ScrollPlan::press_nudge`), and the list holds that
+    /// place; a `pointer wheel` one line down then shows the screen one stop
+    /// on that an un-nudged wheel shows, and one line up at the top shows the
+    /// top again, as it was before the press.
+    /// NEGATIVE CONTROL: `pointer status` after the press scrolls nothing, so
+    /// the nudge stands until the wheel turns.
+    #[test]
+    fn a_pointer_wheel_puts_a_press_nudge_back_on_the_lists_stops() {
+        use super::{NativePointerTarget, WheelUnit};
+        let wheel = |dy: f64| PointerAction::Wheel {
+            dx: 0.0,
+            dy,
+            unit: WheelUnit::Lines,
+            aim: None,
+        };
+        let aim = |key: &str| PointerAction::MoveNative(NativePointerTarget::Key(key.into()));
+        // Where each control the list's room shows live sits (the strip under
+        // the room only pictures the stops after it, under a status bar the
+        // click's change can bring up).
+        let place = |app: &crate::App, wid| {
+            app.compiled_native_ui(wid)
+                .expect("the page compiles")
+                .semantics
+                .iter()
+                .filter(|node| {
+                    !node.offscreen && node.key.as_str().starts_with("settings/control/")
+                })
+                .map(|node| (node.key.as_str().to_string(), node.rect.y, node.rect.height))
+                .collect::<Vec<_>>()
+        };
+        // Security at `size`, and a switch the list's bottom edge cuts there:
+        // its top live inside the list's room, the rest under the edge; with
+        // its top and its hidden part.
+        let security = |size| {
+            let (app, wid, _) = settings_sized_in(
+                crate::App::headless_for_test(),
+                crate::native_settings::SettingsRoute::Security,
+                size,
+            );
+            let compiled = app.compiled_native_ui(wid).expect("the page compiles");
+            let cut = compiled
+                .paint
+                .iter()
+                .filter(|node| matches!(node.content, crate::native_ui::UiContent::Switch(_)))
+                .find_map(|node| {
+                    let live = compiled.hits.iter().find(|hit| hit.key == node.key)?.rect;
+                    (live.y == node.rect.y
+                        && live.height > 4.0
+                        && live.height + 0.5 < node.rect.height)
+                        .then(|| {
+                            (
+                                node.key.as_str().to_string(),
+                                node.rect.y,
+                                node.rect.height - live.height,
+                            )
+                        })
+                })?;
+            Some((app, wid, cut))
+        };
+        // The press on the cut switch: the list moves up by its hidden part,
+        // so the switch shows whole.
+        let press = |app: &mut crate::App, wid, (cut, y0, hidden): &(String, f32, f32)| {
+            let at = app.pointer_cmd(aim(cut)).expect("the pointer moves");
+            assert!(
+                matches!(
+                    app.pointer_reply(at),
+                    Ok(super::PointerAt::Native { key: Some(ref on), .. }) if on == cut
+                ),
+                "the pointer is on the switch's live part"
+            );
+            assert!(app.pointer_cmd(PointerAction::Click).is_ok());
+            let nudged = place(app, wid);
+            let y1 = nudged
+                .iter()
+                .find(|(key, ..)| key == cut)
+                .map(|(_, y, _)| *y)
+                .expect("the switch is listed");
+            assert!(
+                (y0 - y1 - hidden).abs() < 0.5,
+                "nudged up by its hidden part {hidden}: {y0} -> {y1}"
+            );
+            nudged
+        };
+        let mut checked = 0;
+        for size in [(600, 360), (640, 400), (738, 418), (800, 480), (1_000, 600)] {
+            let Some((mut app, wid, cut)) = security(size) else {
+                continue;
+            };
+            let top = place(&app, wid);
+            assert!(app.pointer_cmd(aim(&cut.0)).is_ok());
+            assert!(app.pointer_cmd(wheel(1.0)).is_ok());
+            let one_on = place(&app, wid);
+            assert_ne!(one_on, top, "{size:?}: the wheel scrolled the list");
+            assert!(app.pointer_cmd(wheel(-1.0)).is_ok());
+            assert_eq!(place(&app, wid), top, "{size:?}: back at the top");
+            let nudged = press(&mut app, wid, &cut);
+            // NEGATIVE CONTROL: nothing that scrolls, nothing that moves.
+            assert!(app.pointer_cmd(PointerAction::Status).is_ok());
+            assert_eq!(place(&app, wid), nudged, "{size:?}: the nudge stands");
+            assert!(app.pointer_cmd(wheel(1.0)).is_ok());
+            assert_eq!(
+                place(&app, wid),
+                one_on,
+                "{size:?}: down a line from the nudge is a stop on"
+            );
+            // Up a line at the top: no stop moves, and the top shows again.
+            let (mut app, wid, cut) = security(size).expect("the same page");
+            let _ = press(&mut app, wid, &cut);
+            assert!(app.pointer_cmd(wheel(-1.0)).is_ok());
+            assert_eq!(
+                place(&app, wid),
+                top,
+                "{size:?}: up a line from the nudge is the top"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "some size cuts a switch at the list's bottom");
     }
 
     /// A file URI built as the shipping path builds it; a hand-rolled `file://` is malformed
@@ -8507,7 +9206,10 @@ mod tests {
 
     /// A click on a popup-chip Enum row opens the ChoicePicker with no config edit, and
     /// Cancel returns to the unchanged value (the option commit itself is pinned by
-    /// `pointer_activation_opens_choice_surface_then_selection_patches`).
+    /// `pointer_activation_opens_choice_surface_then_selection_patches`). The row is
+    /// Background material's, which Appearance offers on macOS and Windows alone
+    /// (`row_available_here`): elsewhere no Appearance row is a chip.
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn enum_chip_click_opens_the_choice_picker_and_commits_nothing() {
         use crate::native_ui::UiContent;
@@ -8516,12 +9218,14 @@ mod tests {
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // Background material's four choices open a picker; two or three are
-        // segments in their row and open none.
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+        // The typing sound's many voices open a picker; two or three choices
+        // are segments in their row and open none. Its row is on every
+        // platform (Background material's, a picker of four, has none on
+        // Linux; the cursor trail's chip opens the Cursor Styles page).
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Sound));
         let key = crate::native_ui::UiKey::new(format!(
             "settings/control/{}",
-            crate::prefs::EDIT_BACKGROUND_MATERIAL
+            crate::prefs::EDIT_TRAIL_SOUND_STYLE
         ));
         // The page window is virtualized: scroll until the enum chip paints.
         let mut compiled = presented_native_ui(&mut app, wid);
@@ -8569,7 +9273,7 @@ mod tests {
                 node.key.as_str()
                     == format!(
                         "settings/choice-picker/{}",
-                        crate::prefs::EDIT_BACKGROUND_MATERIAL
+                        crate::prefs::EDIT_TRAIL_SOUND_STYLE
                     )
             }),
             "a click on a popup-chip enum row opens the ChoicePicker"
@@ -11244,6 +11948,33 @@ mod tests {
             Some(crate::native_settings::SettingsRoute::Packages),
             "the same Settings tab, now on Packages"
         );
+    }
+
+    /// A POINTER OVER THE CHROME ABOVE A NATIVE PAGE IS ON THE CHROME: with
+    /// Settings in front, `pointer move -1 <c>` onto the band's row moved the
+    /// pointer there (the band lit its hover) and answered `ERR` that no
+    /// presented native frame was under the pointer, as though it were over
+    /// the page. The reply names the chrome cell, as over a terminal.
+    #[test]
+    fn a_pointer_over_the_chrome_above_a_native_page_reads_back_the_chrome_row() {
+        use super::PointerAt;
+        let (mut app, wid, _) =
+            settings_at_1000_by_600(crate::native_settings::SettingsRoute::KeyboardInput);
+        let _ = app.post_message(toolchain_row());
+        assert!(app.chrome_rows(wid) >= 1, "the band holds a chrome row");
+        let col = u16::try_from(capsule_col(&app, wid)).unwrap();
+        let cell = app
+            .pointer_cmd(PointerAction::MoveChrome { up: 1, col })
+            .expect("the band's row is a chrome row");
+        assert_eq!(cell, Some((-1, col)));
+        assert!(
+            app.windows[&wid].band_hover.is_some(),
+            "the band is hovered"
+        );
+        match app.pointer_reply(cell) {
+            Ok(PointerAt::Grid { cell: at, .. }) => assert_eq!(at, (-1, col)),
+            other => panic!("the reply is the chrome cell: {other:?}"),
+        }
     }
 
     /// The `pointer` verb reaches the band: `move -1 <c>` is the chrome row right above the

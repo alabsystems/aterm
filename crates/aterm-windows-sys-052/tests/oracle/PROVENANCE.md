@@ -13,7 +13,9 @@ aarch64 Windows (docs/AUDIT-third-party-2026-10-15.md, windows-bindings step
 --unverified run -p aterm-win32-oracle -- oracle-052` drives it (a STOCK
 EXCEPTION: it needs rustup's stable and a Windows std), `tests/recorded.rs`
 holds the recorded answers on every host, and the Windows cells of `targo
---unverified verify cells` keep compiling ring against this crate.
+--unverified verify cells` keep compiling ring against this crate. Since
+2026-10-19 a `verify cells` run that checks either Windows cell also runs
+`oracle-052` (and the 0.61 closure's `oracle`) as rows of its own.
 
 ## What it compared, and the result
 

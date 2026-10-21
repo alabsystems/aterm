@@ -31,23 +31,26 @@
 //! | `keeper-gui`        | a GUI framework, an ObjC send or winit in the PTY keeper's source |
 //! | `keeper-gui-deps`   | a GUI crate in the PTY keeper's process closure, `Cargo.lock` walked transitively |
 //! | `keeper-no-mmap`    | a mapping call named in the PTY keeper's own source (a local `mmap` declaration; the region API is its clippy.toml's): it holds crash-restore regions unmapped |
-//! | `restore-stays-local` | aterm-restore in aterm-link's closure, or a socket named in aterm-restore's source: a crash-restore region never leaves the host |
+//! | `restore-stays-local` | aterm-restore in the closure of a crate that carries bytes off the host (aterm-link, aterm-net, aterm-http, aterm-gui-fabric), or a socket named in aterm-restore's source: a crash-restore region never leaves the host |
 //! | `headless-lifeline` | a `--headless` launch in tests, tools or scripts that holds no lifeline |
 //! | `std-command`       | the `StdCommand` alias built, renamed or re-aliased outside aterm-uds |
 //! | `flock-door`        | an `flock` the clippy lint cannot name |
 //! | `supervise-fx`      | a clock read, a sleep, the pid, a delivery, the goal record or the ledger by path that skips the supervisor's `Fx` door; a look at the filesystem, a process, the kernel, the zone or the environment that skips a derived door (the policy probe or `Fx`'s) |
+//! | `bridge-fx`         | a clock read in the fabric bridge (`Instant::now`, `SystemTime::now`, `.elapsed()`) that skips its `Fx` door, the deterministic simulation's |
 //! | `store-current`     | a store `current` path run unresolved |
 //! | `key-material`      | a master phrase on the key surface, a key file in the checkout |
 //! | `capture-privacy`   | in an encoded test capture's decoded bytes (a pty log's hex, a `.reads` file's escapes), what the export forbids in text, a home path, a banner's plan or a session id |
 //! | `devtools-door`     | a developer-mode change outside the owner's gesture; an admin-rights API |
 //! | `machines-root-door`| a root tool (`installer`, `pmset`, `/etc/sudoers.d`, …) or the machines agent outside aterm-machines |
 //! | `ffi-door`          | a WindowServer or process-creation `extern` declared outside its one file |
+//! | `boot-id-door`      | a `sysctlbyname` of `kern.bootsessionuuid` outside astream (`astream_sys::boot_session` is the one reader) |
 //! | `handoff-name`      | a live-upgrade handoff variable spelled outside `HandoffName::new` |
 //! | `core-signal`       | a kill, abort or crash helper that ends a process by a core-dump signal |
 //! | `launcher-mint`     | the root-authority mint reached or enabled outside the launchers |
 //! | `checked-mktemp`    | a scratch directory from an unchecked `$(cd "$(mktemp …)")` |
 //! | `installer-network` | a fetch in `tools/install.sh` outside `web_curl`, the GitHub API, `gh` |
 //! | `agent-gate`        | an agent tested by `==`, `matches!` or `if let` instead of an exhaustive `match` |
+//! | `term-write`        | a session's terminal written through a raw guard, which rings no screen reader |
 //! | `slog-inert`        | a PTY write path or an input-verb request in the session log's code; `dispatch_mark` past its calls |
 //! | `eager-drop`        | `then_some` building a value whose type has a `Drop` (built and dropped on false) |
 //! | `licence-header`    | a `.rs` without its SPDX and copyright lines |
@@ -55,7 +58,7 @@
 //! [`run_guards`] returns typed [`Finding`]s; `aterm-census --guards` (and
 //! bare `aterm-census`, which runs every census) prints them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -64,6 +67,7 @@ use crate::lex::{Lexed, lex};
 use crate::{CensusOutcome, Floor};
 
 mod agent_gate;
+mod bridge_fx;
 mod captures;
 mod doors;
 mod eager_drop;
@@ -76,6 +80,7 @@ mod mint;
 mod mktemp;
 mod rules;
 mod slog_inert;
+mod term_write;
 
 /// One violation: where, which rule, and what the rule saw there.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,18 +125,21 @@ pub const GUARDS: &[Rule] = &[
     rules::STD_COMMAND,
     rules::FLOCK_DOOR,
     rules::SUPERVISE_FX,
+    bridge_fx::BRIDGE_FX,
     rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
     captures::CAPTURE_PRIVACY,
     doors::DEVTOOLS_DOOR,
     machines::MACHINES_ROOT_DOOR,
     doors::FFI_DOOR,
+    doors::BOOT_ID_DOOR,
     doors::HANDOFF_NAME,
     doors::CORE_SIGNAL,
     mint::LAUNCHER_MINT,
     mktemp::CHECKED_MKTEMP,
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,
+    term_write::TERM_WRITE,
     slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
     rules::LICENCE_HEADER,
@@ -387,6 +395,34 @@ impl Corpus {
     pub(crate) fn get(&self, rel: &str) -> Option<&SourceFile> {
         self.files.iter().find(|f| f.rel == rel)
     }
+
+    /// The files under `prefix` that compile only under `test`: each file a
+    /// test-gated `mod` declaration names (`#[cfg(all(test, unix))]
+    /// #[path = "x.rs"] mod x;`), and every module such a file declares. The
+    /// in-file mask ([`SourceFile::shipped_lines`]) cannot see these, because
+    /// the gate sits in the parent.
+    pub(crate) fn test_only(&self, prefix: &str) -> BTreeSet<String> {
+        let prefixes = [prefix];
+        let declared: Vec<(&str, Vec<(String, bool)>)> = self
+            .under(&prefixes)
+            .map(|f| (f.rel.as_str(), f.mod_decls()))
+            .collect();
+        let mut out = BTreeSet::new();
+        loop {
+            let before = out.len();
+            for (rel, decls) in &declared {
+                let whole = out.contains(*rel);
+                for (child, gated) in decls {
+                    if (whole || *gated) && self.get(child).is_some() {
+                        out.insert(child.clone());
+                    }
+                }
+            }
+            if out.len() == before {
+                return out;
+            }
+        }
+    }
 }
 
 /// A directory no walk enters: `.git`, build output (`target`, `target-*`,
@@ -620,6 +656,57 @@ impl SourceFile {
             .filter(move |l| shipped.get(l.no - 1).copied().unwrap_or(true))
     }
 
+    /// The CODE view with every test-only line blanked, so an offset in it
+    /// reads one line of the file and a rule can read a statement rustfmt
+    /// wrapped as one.
+    pub(crate) fn shipped_code(&self) -> String {
+        let mut shipped = self.shipped_lines().map(|l| l.no).peekable();
+        let mut code = String::with_capacity(self.raw.len());
+        for line in self.lines() {
+            if shipped.next_if_eq(&line.no).is_some() {
+                code.push_str(line.code);
+            } else {
+                code.extend(std::iter::repeat_n(' ', line.code.len()));
+            }
+            code.push('\n');
+        }
+        code
+    }
+
+    /// Each out-of-line `mod` this file declares, as the files it can name
+    /// (`x.rs` and `x/mod.rs` beside the file's own module directory, or its
+    /// `#[path]`), each with whether the declaration is test-gated: outside
+    /// the shipped lines.
+    fn mod_decls(&self) -> Vec<(String, bool)> {
+        let shipped: BTreeSet<usize> = self.shipped_lines().map(|l| l.no).collect();
+        let lines: Vec<Line<'_>> = self.lines().collect();
+        let dir = self.rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let base = match self.name() {
+            "lib.rs" | "main.rs" | "mod.rs" => dir.to_string(),
+            name => format!("{dir}/{}", name.trim_end_matches(".rs")),
+        };
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(name) = mod_decl(line.code) else {
+                continue;
+            };
+            let gated = !shipped.contains(&line.no);
+            let path = lines[..i]
+                .iter()
+                .rev()
+                .take_while(|l| l.code.trim_start().starts_with("#["))
+                .find_map(|l| path_attr(l.text));
+            match path {
+                Some(path) => out.push((joined(dir, path), gated)),
+                None => {
+                    out.push((format!("{base}/{name}.rs"), gated));
+                    out.push((format!("{base}/{name}/mod.rs"), gated));
+                }
+            }
+        }
+        out
+    }
+
     /// The file name, without its directories.
     pub(crate) fn name(&self) -> &str {
         self.rel.rsplit('/').next().unwrap_or(&self.rel)
@@ -633,6 +720,42 @@ impl SourceFile {
             detail,
         }
     }
+}
+
+/// The name an out-of-line module declaration (`pub(crate) mod x;`) declares.
+fn mod_decl(code: &str) -> Option<&str> {
+    let mut rest = code.trim();
+    if let Some(vis) = rest.strip_prefix("pub") {
+        rest = vis.trim_start();
+        if rest.starts_with('(') {
+            rest = rest[rest.find(')')? + 1..].trim_start();
+        }
+    }
+    let rest = rest.strip_prefix("mod ")?.trim_start();
+    let end = rest.bytes().position(|b| !is_word(b)).unwrap_or(rest.len());
+    (end > 0 && rest[end..].trim() == ";").then(|| &rest[..end])
+}
+
+/// The path of a `#[path = "…"]` attribute line (TEXT view).
+fn path_attr(text: &str) -> Option<&str> {
+    let rest = after_ws(text, "#[path")?.trim_start().strip_prefix('=')?;
+    let rest = rest.trim_start().strip_prefix('"')?;
+    rest.split_once('"').map(|(path, _)| path)
+}
+
+/// `path` under the directory `dir`, `..` and `.` resolved.
+fn joined(dir: &str, path: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
 }
 
 // Token helpers over one line of a view.
@@ -765,12 +888,67 @@ pub(crate) mod tests {
         assert_eq!(found[0].rule, "boom");
     }
 
+    /// A file is test-only when its parent declares it under a test `cfg`,
+    /// by its own name, its `mod.rs` or a `#[path]`, or when a test-only file
+    /// declares it. Negative controls: a `cfg(not(test))` declaration and a
+    /// plain one leave their files shipped.
+    #[test]
+    fn a_module_its_parent_gates_on_test_is_test_only() {
+        let corpus = Corpus::of(&[
+            (
+                "crates/x/src/lib.rs",
+                "#[cfg(test)]\nmod a;\n#[cfg(all(test, unix))]\n#[path = \"rig_conformance.rs\"]\n\
+                 pub(crate) mod rig;\n#[cfg(not(test))]\nmod live;\nmod plain;\n",
+            ),
+            ("crates/x/src/a.rs", "mod b;\n"),
+            ("crates/x/src/a/b/mod.rs", ""),
+            ("crates/x/src/rig_conformance.rs", ""),
+            ("crates/x/src/live.rs", ""),
+            (
+                "crates/x/src/plain.rs",
+                "#[cfg(test)]\nmod tests;\nmod inner;\n",
+            ),
+            ("crates/x/src/plain/tests.rs", ""),
+            ("crates/x/src/plain/inner.rs", ""),
+        ]);
+        let found: Vec<String> = corpus.test_only("crates/x/").into_iter().collect();
+        assert_eq!(
+            found,
+            [
+                "crates/x/src/a.rs",
+                "crates/x/src/a/b/mod.rs",
+                "crates/x/src/plain/tests.rs",
+                "crates/x/src/rig_conformance.rs",
+            ]
+        );
+    }
+
+    /// The corpus fails closed: a source directory its `.rs` walk may not list
+    /// refuses the read, never a corpus of what it could read. The tree is
+    /// held in memory, which only that walk sees (the walk of paths reads the
+    /// disk, where nothing is), and no `.rs` lies in it, so read whole it is
+    /// an empty corpus: the negative control.
+    #[test]
+    fn a_source_directory_it_cannot_list_refuses_the_corpus() {
+        let read = |fault: fn(&crate::tree::memory::Tree)| {
+            let root = crate::scan_set::test_fixtures::synth_tree(
+                "aterm-census-guards",
+                "unlisted",
+                &[("crates/a/src/notes.md".to_string(), String::new())],
+            );
+            fault(&root);
+            Corpus::read(&root).map(|corpus| corpus.files.len())
+        };
+        assert_eq!(read(|_| {}), Ok(0));
+        assert!(read(|root| root.unlistable("crates/a/src")).is_err());
+    }
+
     /// The walk enters dot directories for paths (never `.git`, nor one
     /// `.gitignore` keeps out by directory), and reads scripts only outside
     /// them.
     #[test]
     fn the_walk_lists_dot_directories_but_reads_no_script_there() {
-        use crate::scan_set::test_fixtures::synth_tree;
+        use crate::scan_set::test_fixtures::disk_tree;
         let files: Vec<(String, String)> = [
             (
                 ".gitignore",
@@ -795,7 +973,7 @@ pub(crate) mod tests {
         .iter()
         .map(|(p, c)| ((*p).to_string(), (*c).to_string()))
         .collect();
-        let root = synth_tree("aterm-census-guards", "walk-dot-dirs", &files);
+        let root = disk_tree("aterm-census-guards", "walk-dot-dirs", &files);
         let corpus = Corpus::read(&root);
         let _ = std::fs::remove_dir_all(&root);
         let corpus = corpus.expect("the synth tree reads");

@@ -25,7 +25,7 @@ use crate::app_config::{
     MAX_TAB_STATUS_DWELL_MS, MAX_TAB_STATUS_QUIET_AFTER_MS, MIN_TAB_STATUS_DWELL_MS,
     MIN_TAB_STATUS_QUIET_AFTER_MS,
 };
-use aterm_effects::cursor_glow::GlowStyle;
+use aterm_effects::cursor_glow::{GlowStyle, spellings};
 use aterm_effects::trail_sound::SoundVoice;
 use aterm_phase::Program;
 
@@ -64,6 +64,14 @@ pub(crate) const EDIT_CURSOR_MOMENTUM_GLOW: &str = "cursor_momentum_glow";
 /// config language service and Settings ▸ Modified ([`RETIRED_SPELLINGS`]).
 pub(crate) const RETIRED_CURSOR_TRAIL: &str = "cursor_trail";
 pub(crate) const EDIT_CURSOR_TRAIL_STYLE: &str = "cursor_trail_style";
+/// THE STYLE OFF REPLACED: Off is a value of the one style key, so an edit
+/// that turns a drawn style Off would overwrite the person's style — their
+/// own Off, and Serious Mode's exit, which holds the cursor Off while another
+/// effect turns on ("other effects stay off"). The writer keeps the style it
+/// replaced here ([`apply_prefs_edits`]), Cursor Styles marks it, and an edit
+/// that makes the style draw again takes it out. It never draws: the style
+/// key alone decides what the cursor draws.
+pub(crate) const EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF: &str = "cursor_trail_style_before_off";
 pub(crate) const EDIT_TRAIL_SOUNDS: &str = "trail_sounds";
 /// Tone-melody toggle (`Config::tone_melody`, default ON): the trail-sound
 /// melody leans with the typed line's inferred mood (the tiny on-device
@@ -221,6 +229,85 @@ pub(crate) const CURSOR_STYLE_TUNING_KEYS: &[&str] = &[
 ];
 pub(crate) const EDIT_CURSOR_TRAIL_COLOR: &str = "cursor_trail_color";
 pub(crate) const EDIT_CURSOR_TRAIL_ACCENT: &str = "cursor_trail_accent";
+/// `cursor_trail_color`'s one word beside a colour: the cursor's colour,
+/// chosen as the trail colour ([`aterm_effects::cursor_fx::TrailColor::Cursor`]).
+/// A trail colour like any other — Classic draws its one-colour face, Laser
+/// drops its violet, a bar's rod wears it — whose value follows the live
+/// cursor colour. It is what the old `classic mono` style spellings say beside
+/// Classic, so the writer can say it too when it rewrites one
+/// ([`apply_prefs_edits`]).
+pub(crate) const TRAIL_COLOR_CURSOR: &str = "cursor";
+
+/// [`TRAIL_COLOR_CURSOR`] as a Settings row names it.
+pub(crate) const TRAIL_COLOR_CURSOR_LABEL: &str = "Cursor color";
+
+/// What the trail colour key `key` (the colour or its accent) draws while
+/// unset, in a row's words, under the cursor style aterm.toml spells
+/// `style_raw`, the trail colour setting `color` and whether a cursor colour
+/// is set (`cursor_color_pinned`, the colour law's pin): the colour, a style's
+/// own (Laser's "Violet", Comet's "Pale blue" with no cursor colour set),
+/// Classic's "Shifting colors" (an old `classic mono` spelling's cursor
+/// colour), else the cursor's; the accent a brighter one of
+/// what a window brightens ([`aterm_effects::cursor_fx::unset_accent_base`]:
+/// the trail colour chosen, where the style draws it). The row's placeholder
+/// and Modified's "Default:" both say it, so Reset is named by what it gives
+/// back.
+pub(crate) fn trail_color_default_words(
+    key: &str,
+    style_raw: &str,
+    color: aterm_effects::cursor_fx::TrailColor,
+    cursor_color_pinned: bool,
+) -> String {
+    use aterm_effects::cursor_fx::AccentBase;
+    let style = crate::app_config::resolve_trail_style(style_raw).style;
+    if key == EDIT_CURSOR_TRAIL_ACCENT {
+        let base = style.map_or(AccentBase::Cursor, |style| {
+            aterm_effects::cursor_fx::unset_accent_base(style, color, cursor_color_pinned)
+        });
+        return match base {
+            AccentBase::Cursor => "Brighter cursor color".to_string(),
+            AccentBase::Own(_, name) => format!("Brighter {}", name.to_lowercase()),
+            AccentBase::Trail(_) => "Brighter trail color".to_string(),
+        };
+    }
+    // The old `classic mono` spelling draws Classic in the cursor's colour.
+    if style == Some(aterm_effects::cursor_glow::GlowStyle::Classic)
+        && aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono(style_raw.trim())
+    {
+        return TRAIL_COLOR_CURSOR_LABEL.to_string();
+    }
+    style
+        .and_then(|style| {
+            aterm_effects::cursor_fx::trail_color_default_name(style, cursor_color_pinned)
+        })
+        .map_or_else(|| TRAIL_COLOR_CURSOR_LABEL.to_string(), str::to_string)
+}
+
+/// Whether `raw` is a value colour key `key` takes: a colour the runtime
+/// parses (`RRGGBB`, `#RRGGBB`, `#RGB`), or, for the trail colour, the word
+/// [`TRAIL_COLOR_CURSOR`]. The writer and the config check both ask it.
+pub(crate) fn color_value_is_valid(key: &str, raw: &str) -> bool {
+    let raw = raw.trim();
+    aterm_types::scheme::parse_hex(raw).is_some()
+        || (key == EDIT_CURSOR_TRAIL_COLOR && raw.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR))
+}
+
+/// What a `cursor_trail_color` value says: unset, blank or not a colour is
+/// each style's automatic colour (the config check flags the last), the word
+/// [`TRAIL_COLOR_CURSOR`] (any case) the cursor's colour chosen, and a hex
+/// colour that colour.
+pub(crate) fn trail_color_setting(raw: Option<&str>) -> aterm_effects::cursor_fx::TrailColor {
+    use aterm_effects::cursor_fx::TrailColor;
+    let Some(raw) = raw.map(str::trim) else {
+        return TrailColor::Automatic;
+    };
+    if raw.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR) {
+        return TrailColor::Cursor;
+    }
+    aterm_types::scheme::parse_hex(raw).map_or(TrailColor::Automatic, |color| {
+        TrailColor::Pinned(crate::app_config::rgb_u32(color))
+    })
+}
 /// The rainbow kitty's user sprite. KEEPS the `nyan` spelling — unlike the
 /// trail-style VALUE (which has an alias table), a config KEY has no aliasing
 /// seam, so renaming it would silently orphan every `cursor_nyan_sprite` line
@@ -463,12 +550,14 @@ pub(crate) const EDIT_HARNESS_ENABLED: &str = "harness.enabled";
 /// power), registered through [`NESTED_LEAVES`] beside the master switch, so
 /// it is a Settings row, a Search hit and a Manual key at once.
 ///
-/// `cruise`: every point answered and the work continued until the agent's
-/// clear final statement. `land`: the work wrapped up cleanly — the land
-/// instruction once, at most two nudges, then nothing typed but the land
-/// answer to a question asked in prose, which the nudges' bound does not
-/// cover. `off`: the harness keeps its hands off (plain Claude Code; the
-/// window's host stops the session's worker). Each step down takes power
+/// `cruise` (FOREVER CRUISE): every point answered and the work continued;
+/// nothing the agent says ends it — a done claim gets the Cruise prompt.
+/// `land` (FOREVER LAND): all of the work landed on the remote main branch —
+/// the land instruction once, then a nudge at every point until a clean
+/// `Nothing left:` defense stands over a repository holding nothing no
+/// remote main has, then nothing typed until someone's turn. `off`: the
+/// harness keeps its hands off (plain Claude Code; the window's host stops
+/// the session's worker). Each step down takes power
 /// away, so `land` and `off` are limits. A session's own word (the footer's
 /// chip, Settings ▸ Harness, `aterm ctl @<sid> meta set autopilot …`)
 /// decides over it; the master switch off wins over both. The row seeds
@@ -719,6 +808,10 @@ pub(crate) const SPARKLE_PROFANITY_STYLES: &[&str] = &["rainbow", "nova", "spark
 /// Closed domain for `sparkle_words.feline.style` (unknown → `cat`).
 pub(crate) const SPARKLE_FELINE_STYLES: &[&str] = &["cat", "paw"];
 pub(crate) const EDIT_PREDICTIVE_ECHO: &str = "predictive_echo";
+/// Predictive editing (`Config::predictive_echo_editing`, default on): the
+/// kill switch for `←`, `→` and the end-of-line Backspace as predicted edits
+/// (`Predictor::set_editing`). Inert while `predictive_echo` is off.
+pub(crate) const EDIT_PREDICTIVE_ECHO_EDITING: &str = "predictive_echo_editing";
 /// Focus-linked shell priority boost (Windows QoS; no-op elsewhere).
 pub(crate) const EDIT_FOCUS_BOOST: &str = "focus_boost";
 
@@ -756,9 +849,9 @@ pub(crate) const EDIT_WINDOW_COLORSPACE: &str = "window_colorspace";
 pub(crate) const EDIT_RESTORE_SESSION: &str = "restore_session";
 /// Opt-in shell custody, read at launch.
 pub(crate) const EDIT_KEEPER_ENABLED: &str = "keeper.enabled";
-/// Opt-in session activity on disk, read at launch.
+/// Session activity on disk (on by default, D3), read at launch.
 pub(crate) const EDIT_SESSION_LOG_JOURNAL: &str = "session_log.journal";
-/// Live activity in terminal tab tooltips and menus.
+/// Live activity in terminal tab tooltips and menus (on by default, D6).
 pub(crate) const EDIT_SESSION_LOG_CLAUSE: &str = "session_log.clause";
 /// OpenType feature requests (`Config::font_features`) — a [`LIST_KEYS`] row.
 pub(crate) const EDIT_FONT_FEATURES: &str = "font_features";
@@ -1392,36 +1485,16 @@ const DEFAULT_CURSOR_STYLE: &str = "block";
 /// one line.
 pub(crate) const DEFAULT_CURSOR_TRAIL_STYLE: &str = "rainbow kitty pet";
 
-/// Selectable `cursor_trail_style` values. Every rainbow entry shares one continuous
-/// spectrum, animation clock, fade, and sparkle engine; the raw spelling chooses only
-/// companion and geometry. This table is also the save-time and introspection domain.
-pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
-    "phaser",
-    "rainbow kitty pet",
-    "rainbow dog pet",
-    "rainbow kitty flying",
-    "rainbow kitty underline",
-    // THE FLAT BODY (2026-09-13): the owner's A/B control against the default
-    // comet body and its vivid rail (`docs/design/RAINBOW-KITTY-V2.md` §30) —
-    // the same ribbon, the same resident pet, the body as it was before.
-    "rainbow kitty flat",
-    "comet",
-    "lumen",
-    "sparkle",
-    "fire",
-    "laser",
-    "water",
-    "beam",
-    // THE SALVAGE — the v0.28 trail, restored as an option: a thin four-layer
-    // comet under a soft square bloom, with the long diagonal jump comet the
-    // modern engine's shape gates no longer mint. Offered last among the
-    // effects because it is a restoration, not a new look.
-    // Its one-colour face is a colour choice, not a style: a trail colour
-    // draws it (the old `classic mono` spellings are aliases, still drawn in
-    // the cursor's colour).
-    "classic",
-    "off",
-];
+/// Every canonical `cursor_trail_style`, in the order the Settings Cursor
+/// Styles page and the Cursor & Motion picker list them: the save-time domain
+/// the writer and `--validate-config`'s near-miss suggestions read, and the
+/// picker's options. Every row is listed; nothing is hidden. The rows, the
+/// aliases, the list names and the one-line descriptions are one table in
+/// the engine ([`aterm_effects::cursor_glow::spellings`]), which a web page's
+/// `set_cursor_glow` reads too. The old `classic mono` spellings are aliases
+/// of `classic` that still draw its one-colour face
+/// (`GlowStyle::style_names_classic_mono` reads the authored spelling).
+pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &spellings::TRAIL_STYLE_NAMES;
 
 /// `trail_sound_style` options — THE TYPING-SOUND PICKER (Settings ▸ Sound ▸
 /// "Typing sound"). Same single-source-of-truth law as
@@ -1473,69 +1546,19 @@ pub(crate) fn trail_sound_style_canonical(token: &str) -> Option<&'static str> {
     SoundVoice::parse(token).map(SoundVoice::name)
 }
 
-/// Documented aliases accepted by both the runtime and Settings. Historical
-/// `nyan`/`rainbow` spellings retain the flying companion; geometry aliases map
-/// to their explicit picker entries so validation and rendering cannot disagree.
-pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
-    ("classic wake", "classic"),
-    // Classic in one colour is Classic with a trail colour; the old
-    // spellings still draw it in the cursor's colour
-    // (`GlowStyle::style_names_classic_mono` reads the authored spelling).
-    ("classic mono", "classic"),
-    ("classic lumen", "classic"),
-    ("mono classic", "classic"),
-    ("nyan rainbow", "rainbow kitty flying"),
-    ("nyan", "rainbow kitty flying"),
-    ("rainbow", "rainbow kitty flying"),
-    ("flying kitty", "rainbow kitty flying"),
-    ("kitty flying", "rainbow kitty flying"),
-    ("kitty", "rainbow kitty pet"),
-    ("kitty pet", "rainbow kitty pet"),
-    ("pet kitty", "rainbow kitty pet"),
-    ("dog pet", "rainbow dog pet"),
-    ("pet dog", "rainbow dog pet"),
-    ("rainbow puppy pet", "rainbow dog pet"),
-    ("rainbow underline", "rainbow kitty underline"),
-    ("underline rainbow", "rainbow kitty underline"),
-    ("nyan underline", "rainbow kitty underline"),
-    // The bare name and the `… tall` spellings draw exactly what the default
-    // draws (the tall body is the default geometry), so they are spellings of
-    // it rather than entries of their own.
-    ("rainbow kitty", "rainbow kitty pet"),
-    ("rainbow kitty tall", "rainbow kitty pet"),
-    ("rainbow tall", "rainbow kitty pet"),
-    ("tall rainbow", "rainbow kitty pet"),
-    ("nyan tall", "rainbow kitty pet"),
-    ("rainbow flat", "rainbow kitty flat"),
-    ("flat rainbow", "rainbow kitty flat"),
-    ("nyan flat", "rainbow kitty flat"),
-    ("sparkles", "sparkle"),
-    ("phaser-sparkle", "sparkle"),
-    ("rainbow-sparkle", "sparkle"),
-    ("ember", "fire"),
-    ("embers", "fire"),
-    ("ocean", "water"),
-    ("wave", "water"),
-    ("lightbeam", "beam"),
-    ("light-beam", "beam"),
-];
+/// Documented aliases accepted by the runtime, the validator and the Settings
+/// writer, each mapped in one step to a [`CURSOR_TRAIL_STYLES`] name. The
+/// engine's table ([`spellings::TRAIL_STYLE_ALIASES`]), so every host reads an
+/// alias the same way.
+pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = spellings::TRAIL_STYLE_ALIASES;
 
-/// Resolve a `cursor_trail_style` spelling (canonical or documented alias,
-/// case-insensitive, pre-trimmed by the caller) to its canonical option, or
+/// Resolve a `cursor_trail_style` spelling (a canonical row or a
+/// documented alias; trimmed, case-insensitive) to its canonical name, or
 /// `None` for a spelling nothing recognizes — the case that falls back to
 /// [`DEFAULT_CURSOR_TRAIL_STYLE`], and that the validator and the load-time
 /// warning must flag so the substitution is not silent.
 pub(crate) fn cursor_trail_style_canonical(token: &str) -> Option<&'static str> {
-    CURSOR_TRAIL_STYLES
-        .iter()
-        .find(|o| token.eq_ignore_ascii_case(o))
-        .copied()
-        .or_else(|| {
-            CURSOR_TRAIL_STYLE_ALIASES
-                .iter()
-                .find(|(a, _)| token.eq_ignore_ascii_case(a))
-                .map(|&(_, canonical)| canonical)
-        })
+    spellings::canonical(token)
 }
 
 /// How a Preferences key should be TYPED in the written TOML, so a Save round-trips
@@ -1697,6 +1720,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_CURSOR_MOMENTUM_GLOW
         | EDIT_OPTION_AS_META
         | EDIT_CONFIRM_MULTILINE_PASTE
+        | EDIT_PREDICTIVE_ECHO_EDITING
         | EDIT_SELECTION_INACTIVE
         | EDIT_SPLIT_FOCUS_MARK
         | EDIT_CURSOR_BREAK_LIGATURES
@@ -1732,7 +1756,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | RETIRED_PACKAGES_AUTO_UPDATE
         | RETIRED_PACKAGES_SEED_INSTALL
         | EDIT_WALLPAPER_TEXT_TINT => EditKind::Bool,
-        EDIT_CURSOR_TRAIL_STYLE => EditKind::Enum {
+        EDIT_CURSOR_TRAIL_STYLE | EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF => EditKind::Enum {
             options: CURSOR_TRAIL_STYLES,
         },
         EDIT_TRAIL_SOUND_STYLE => EditKind::Enum {
@@ -1891,18 +1915,40 @@ pub(crate) fn theme_split_value(dark: &str, light: &str) -> String {
     format!("dark:{dark},light:{light}")
 }
 
-/// The value turning Follow system on writes: the configured name (Default
-/// when none is set, so an unset theme writes `dark:Default,light:Default
-/// Light`) on its own side and its pair on the other. A value already
-/// following the system is returned as written.
+/// What turning Follow system off replaced: the one name it wrote, and the
+/// pair that name came from. View state, never config (the mode is the
+/// value), so turning the switch back on while the name is still that one
+/// gives the pair back ([`theme_follow_system_value`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThemeFollowKept {
+    /// The value Off wrote.
+    pub(crate) always: String,
+    /// The value it replaced.
+    pub(crate) pair: String,
+}
+
+/// The value turning Follow system on writes. Where the value is still the
+/// name turning it off wrote (`kept`), the pair that name came from, so Off
+/// then On is a round trip and the side the person had chosen for the other
+/// appearance comes back. Otherwise the configured name (Default when none
+/// is set, so an unset theme writes `dark:Default,light:Default Light`) on its
+/// own side and its pair on the other. A value already following the system
+/// is returned as written.
 pub(crate) fn theme_follow_system_value(
     raw: Option<&str>,
+    kept: Option<&ThemeFollowKept>,
     themes: &crate::app_config::ThemeCatalog,
 ) -> String {
     if let Some(raw) = raw
         && theme_mode(Some(raw)) == ThemeMode::FollowSystem
     {
         return raw.to_string();
+    }
+    if let Some(kept) = kept
+        && raw.is_some_and(|raw| raw.trim().eq_ignore_ascii_case(kept.always.trim()))
+        && theme_mode(Some(&kept.pair)) == ThemeMode::FollowSystem
+    {
+        return kept.pair.clone();
     }
     let (dark, light) = theme_slots(raw, themes);
     theme_split_value(&dark, &light)
@@ -1936,17 +1982,14 @@ pub(crate) fn theme_is_unset(raw: Option<&str>) -> bool {
         && selector.name_for(aterm_types::Appearance::Light).is_none()
 }
 
-/// The `theme` value choosing theme `id` writes, the one rule every picker
-/// that is not tied to one side shares (the command palette, Settings ▸
-/// Themes' Keep and Save as, the Appearance theme picker): while the value is
-/// a Follow-system split only the `side` slot changes ([`theme_with_side`])
-/// and the side is returned. A split that draws one theme on both sides
-/// (`dark:Aterm Day,light:Aterm Day`) is one choice, not two: a theme made for
-/// the other appearance replaces it on both sides, and one made for the shown
-/// side takes that side alone. A plain name, or no theme at all, is replaced
-/// by `id` itself, for every appearance: choosing over an unset theme never
-/// starts following the OS (that is the Follow system switch's to do). A theme
-/// the catalog does not know counts as made for `side`.
+/// The `theme` value choosing theme `id` for a NAMED side writes (Settings ▸
+/// Themes' Keep and Save as, whose Dark | Light segment says the side Keep
+/// writes while the theme follows the system): while the value follows the
+/// system only the `side` slot changes ([`theme_with_side`]) and the side is
+/// returned; over one theme (a plain name, or no theme at all) it is
+/// replaced by `id` itself, for every appearance: a choice never starts following the OS
+/// (that is the Follow system switch's to do). How the pair is spelled (two
+/// themes, or one theme on both sides) never changes the rule.
 pub(crate) fn theme_choice_value(
     raw: Option<&str>,
     side: aterm_types::Appearance,
@@ -1957,15 +2000,30 @@ pub(crate) fn theme_choice_value(
     if theme_mode(raw) != ThemeMode::FollowSystem {
         return (id.to_string(), None);
     }
-    let one_theme_pair = raw
-        .and_then(theme_pair_names)
-        .is_some_and(|(dark, light)| dark.eq_ignore_ascii_case(&light));
-    let made_for_other_side = themes.meta(id).is_some_and(|meta| meta.appearance != side);
-    if one_theme_pair && made_for_other_side {
-        (theme_split_value(id, id), Some(side))
-    } else {
-        (theme_with_side(raw, side, id, themes), Some(side))
+    (theme_with_side(raw, side, id, themes), Some(side))
+}
+
+/// The `theme` value a choice that names NO side writes (the command
+/// palette, the whole-theme picker), decided by what the chosen theme is
+/// made for rather than by how `theme` is spelled. While the value follows
+/// the system, a theme made for the `shown` side takes that side alone
+/// ([`theme_choice_value`]); one made for the other appearance is kept as
+/// the one theme for both, Follow system off: it is what is on screen now,
+/// and filed under the shown side it would sit in the slot of the wrong
+/// appearance, while filed under its own side it would leave the screen at
+/// once. Over one theme, `id` itself. A theme the catalog does not know
+/// counts as made for `shown`.
+pub(crate) fn theme_sideless_choice_value(
+    raw: Option<&str>,
+    shown: aterm_types::Appearance,
+    id: &str,
+    themes: &crate::app_config::ThemeCatalog,
+) -> (String, Option<aterm_types::Appearance>) {
+    let made_for = themes.meta(id.trim()).map_or(shown, |meta| meta.appearance);
+    if theme_mode(raw) == ThemeMode::FollowSystem && made_for != shown {
+        return (id.trim().to_string(), None);
     }
+    theme_choice_value(raw, shown, id, themes)
 }
 
 /// The value turning Follow system off writes: the theme the `visible` side
@@ -1985,8 +2043,9 @@ pub(crate) fn theme_always_value(
 #[cfg(test)]
 mod theme_pair_tests {
     use super::{
-        ThemeMode, theme_always_value, theme_choice_value, theme_follow_system_value,
-        theme_is_unset, theme_mode, theme_slots, theme_with_side,
+        ThemeFollowKept, ThemeMode, theme_always_value, theme_choice_value,
+        theme_follow_system_value, theme_is_unset, theme_mode, theme_sideless_choice_value,
+        theme_slots, theme_with_side,
     };
     use aterm_types::Appearance::{Dark, Light};
 
@@ -2017,12 +2076,12 @@ mod theme_pair_tests {
     fn turning_follow_system_on_seeds_the_other_side_from_the_pair() {
         let themes = builtins();
         assert_eq!(
-            theme_follow_system_value(Some("Gruvbox Dark"), &themes),
+            theme_follow_system_value(Some("Gruvbox Dark"), None, &themes),
             "dark:Gruvbox Dark,light:Gruvbox Light"
         );
         // A light theme keeps the light side.
         assert_eq!(
-            theme_follow_system_value(Some("Gruvbox Light"), &themes),
+            theme_follow_system_value(Some("Gruvbox Light"), None, &themes),
             "dark:Gruvbox Dark,light:Gruvbox Light"
         );
         // From Default, Default Light or no theme at all, the switch writes
@@ -2035,7 +2094,7 @@ mod theme_pair_tests {
             Some("dark:,light:"),
         ] {
             assert_eq!(
-                theme_follow_system_value(raw, &themes),
+                theme_follow_system_value(raw, None, &themes),
                 "dark:Default,light:Default Light",
                 "{raw:?}"
             );
@@ -2058,25 +2117,25 @@ mod theme_pair_tests {
                 Light => format!("dark:Default,light:{}", theme.name),
             };
             assert_eq!(
-                theme_follow_system_value(Some(theme.name), &themes),
+                theme_follow_system_value(Some(theme.name), None, &themes),
                 expected
             );
         }
         assert_eq!(
-            theme_follow_system_value(Some("Nord"), &themes),
+            theme_follow_system_value(Some("Nord"), None, &themes),
             "dark:Nord,light:Default Light"
         );
         assert_eq!(
-            theme_follow_system_value(Some("GitHub Light"), &themes),
+            theme_follow_system_value(Some("GitHub Light"), None, &themes),
             "dark:Default,light:GitHub Light"
         );
         assert_eq!(
-            theme_follow_system_value(Some("Office Missing"), &themes),
+            theme_follow_system_value(Some("Office Missing"), None, &themes),
             "dark:Office Missing,light:Default Light"
         );
         // An existing split is never replaced.
         assert_eq!(
-            theme_follow_system_value(Some("dark:Dracula,light:Nord"), &themes),
+            theme_follow_system_value(Some("dark:Dracula,light:Nord"), None, &themes),
             "dark:Dracula,light:Nord"
         );
     }
@@ -2118,36 +2177,158 @@ mod theme_pair_tests {
         }
     }
 
-    /// A pair that draws one theme on both sides is one choice: a theme made
-    /// for the other appearance replaces it on both sides, one made for the
-    /// shown side takes that side alone. A pair with two themes (the control)
-    /// only ever changes the shown side.
+    /// A pair that draws one theme on both sides follows the same rules as
+    /// any pair, never a rule of its own: a choice for a named side changes
+    /// that side, and a choice that names no side keeps a theme made for the
+    /// other appearance as the one theme for both (the old special case wrote
+    /// `dark:Linen,light:Linen`, a pair that follows nothing).
     #[test]
-    fn a_choice_over_a_one_theme_pair_is_one_choice() {
+    fn a_one_theme_pair_takes_the_rules_every_pair_takes() {
         let themes = builtins();
         let same = Some("dark:Aterm Day,light:Aterm Day");
+        assert_eq!(theme_mode(same), ThemeMode::FollowSystem);
         assert_eq!(
             theme_choice_value(same, Dark, "Linen", &themes),
-            ("dark:Linen,light:Linen".to_string(), Some(Dark))
+            ("dark:Linen,light:Aterm Day".to_string(), Some(Dark))
         );
         assert_eq!(
-            theme_choice_value(same, Dark, "Hearth", &themes),
+            theme_sideless_choice_value(same, Dark, "Linen", &themes),
+            ("Linen".to_string(), None)
+        );
+        assert_eq!(
+            theme_sideless_choice_value(same, Dark, "Hearth", &themes),
             ("dark:Hearth,light:Aterm Day".to_string(), Some(Dark))
         );
         // A name the catalog does not know counts as made for the shown side.
         assert_eq!(
-            theme_choice_value(same, Light, "Harbor Day", &themes).0,
+            theme_sideless_choice_value(same, Light, "Harbor Day", &themes).0,
             "dark:Aterm Day,light:Harbor Day"
         );
+        // The same choices over a pair of two themes give the same shapes.
         let two = Some("dark:Nord,light:Aterm Day");
         assert_eq!(
-            theme_choice_value(two, Dark, "Linen", &themes).0,
-            "dark:Linen,light:Aterm Day"
+            theme_choice_value(two, Dark, "Linen", &themes),
+            ("dark:Linen,light:Aterm Day".to_string(), Some(Dark))
         );
-        // A slot edit names its side and never takes both.
         assert_eq!(
-            theme_with_side(same, Dark, "Linen", &themes),
-            "dark:Linen,light:Aterm Day"
+            theme_sideless_choice_value(two, Dark, "Linen", &themes),
+            ("Linen".to_string(), None)
+        );
+    }
+
+    /// A choice that names no side never files a theme under the slot of the
+    /// other appearance, however `theme` is spelled: a theme made for the
+    /// shown side takes that side; one made for the other appearance is kept
+    /// as the one theme for both (Follow system off), so what is on screen
+    /// stays. Law over every built-in, both sides and every spelling.
+    #[test]
+    fn a_side_less_choice_never_files_a_theme_under_the_other_appearance() {
+        let themes = builtins();
+        let raws = [
+            None,
+            Some("Nord"),
+            Some("dark:Default,light:Default Light"),
+            Some("dark:Nord,light:Default Light"),
+            Some("dark:Nord,light:Solarized Light"),
+            Some("dark:Aterm Day,light:Aterm Day"),
+        ];
+        for raw in raws {
+            for theme in aterm_types::scheme::builtin_theme_list() {
+                for shown in [Dark, Light] {
+                    let (value, side) =
+                        theme_sideless_choice_value(raw, shown, theme.name, &themes);
+                    // The shown side draws the chosen theme.
+                    let (dark, light) = theme_slots(Some(&value), &themes);
+                    let drawn = match (theme_mode(Some(&value)), shown) {
+                        (ThemeMode::Always, _) => value.clone(),
+                        (ThemeMode::FollowSystem, Dark) => dark.clone(),
+                        (ThemeMode::FollowSystem, Light) => light.clone(),
+                    };
+                    assert_eq!(drawn, theme.name, "{raw:?} {shown:?} -> {value}");
+                    if theme_mode(Some(&value)) == ThemeMode::FollowSystem {
+                        // Only the shown side changed, and it holds a theme
+                        // made for it.
+                        assert_eq!(theme.appearance, shown, "{raw:?} -> {value}");
+                        assert_eq!(side, Some(shown));
+                        let (was_dark, was_light) = theme_slots(raw, &themes);
+                        match shown {
+                            Dark => assert_eq!(light, was_light, "{raw:?} -> {value}"),
+                            Light => assert_eq!(dark, was_dark, "{raw:?} -> {value}"),
+                        }
+                    } else {
+                        assert_eq!(side, None);
+                        assert_eq!(value, theme.name);
+                    }
+                }
+            }
+        }
+        // The lab's cases: Keep Aterm Day on a dark OS over a pair, and
+        // Hearth on a light one, keep the theme for both appearances.
+        assert_eq!(
+            theme_sideless_choice_value(
+                Some("dark:Nord,light:Default Light"),
+                Dark,
+                "Aterm Day",
+                &themes
+            ),
+            ("Aterm Day".to_string(), None)
+        );
+        assert_eq!(
+            theme_sideless_choice_value(
+                Some("dark:Nord,light:Solarized Light"),
+                Light,
+                "Hearth",
+                &themes
+            ),
+            ("Hearth".to_string(), None)
+        );
+        // Negative control: a choice for a NAMED side (a slot, the Themes
+        // segment) files any theme under that side.
+        assert_eq!(
+            theme_choice_value(
+                Some("dark:Nord,light:Default Light"),
+                Dark,
+                "Aterm Day",
+                &themes
+            ),
+            ("dark:Aterm Day,light:Default Light".to_string(), Some(Dark))
+        );
+    }
+
+    /// Off then On is a round trip: the pair Off replaced comes back while
+    /// the value is still the name Off wrote, on either side; any other one
+    /// theme seeds its own pair as before.
+    #[test]
+    fn turning_follow_system_off_then_on_restores_the_pair_it_replaced() {
+        let themes = builtins();
+        let pair = "dark:Nord,light:Solarized Light";
+        for (side, name) in [(Dark, "Nord"), (Light, "Solarized Light")] {
+            let always = theme_always_value(Some(pair), side, &themes);
+            assert_eq!(always, name);
+            let kept = ThemeFollowKept {
+                always: always.clone(),
+                pair: pair.to_string(),
+            };
+            assert_eq!(
+                theme_follow_system_value(Some(&always), Some(&kept), &themes),
+                pair,
+                "{side:?}"
+            );
+            // Without the memory the name seeds its own pair, which loses
+            // the other side (the defect).
+            assert_ne!(
+                theme_follow_system_value(Some(&always), None, &themes),
+                pair
+            );
+        }
+        // Negative control: a different theme since then seeds its own.
+        let kept = ThemeFollowKept {
+            always: "Nord".to_string(),
+            pair: pair.to_string(),
+        };
+        assert_eq!(
+            theme_follow_system_value(Some("Dracula"), Some(&kept), &themes),
+            theme_follow_system_value(Some("Dracula"), None, &themes)
         );
     }
 
@@ -2212,7 +2393,7 @@ mod theme_pair_tests {
         assert_eq!(theme_always_value(raw, Dark, &themes), "Dracula");
         assert_eq!(theme_always_value(raw, Light, &themes), "GitHub Light");
         // On and off again round-trips the name it started from on its side.
-        let on = theme_follow_system_value(Some("Gruvbox Dark"), &themes);
+        let on = theme_follow_system_value(Some("Gruvbox Dark"), None, &themes);
         assert_eq!(theme_always_value(Some(&on), Dark, &themes), "Gruvbox Dark");
     }
 }
@@ -2311,6 +2492,7 @@ pub(crate) fn apply_prefs_edits(
         .parse::<aterm_toml::edit::DocumentMut>()
         .map_err(|e| PrefsEditError::Parse(e.to_string()))?;
 
+    let cursor_before = CursorStyleFacts::of(&doc);
     fold_retired_cursor_trail(&mut doc, edits);
     for (key, value) in edits {
         // DOTTED keys edit a nested-table leaf (`update.auto_apply`,
@@ -2359,8 +2541,137 @@ pub(crate) fn apply_prefs_edits(
             }
         }
     }
+    keep_cursor_style_before_off(&cursor_before, &mut doc, edits);
+    keep_classic_mono_color(&cursor_before, &mut doc, edits);
 
     Ok(doc.to_string())
+}
+
+/// AN OLD `classic mono` STYLE KEEPS ITS COLOUR when the writer rewrites it.
+/// The `classic mono` spellings ([`aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono`])
+/// say two things: the style, Classic, and its colour, the cursor's — what
+/// Classic with `cursor_trail_color = "cursor"` ([`TRAIL_COLOR_CURSOR`]) says.
+/// The style list knows only the first half, so any edit that takes such a
+/// spelling out of `cursor_trail_style` (Off over it, whatever wrote the Off,
+/// which keeps the style as `classic`; another style; the retired master's
+/// fold) writes the second half as the trail colour in the same write — unless
+/// the file already names a trail colour that reads (with one, the old
+/// spelling drew in that colour, as Classic does; one the loader ignores, a
+/// typo, drew the cursor's, so the cursor's takes its place) or the edit names
+/// it (Reset All, Undo). So bringing Classic back, from Cursor Styles' "Your
+/// style before Off" or by hand, draws it in the cursor's colour again;
+/// nothing the spelling said is lost, and the trail colour row shows and
+/// resets it.
+fn keep_classic_mono_color(
+    before: &CursorStyleFacts,
+    doc: &mut aterm_toml::edit::DocumentMut,
+    edits: &[(&str, Option<String>)],
+) {
+    let names_mono = |style: Option<&str>| {
+        style.is_some_and(aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono)
+    };
+    if !names_mono(before.style.as_deref())
+        || names_mono(CursorStyleFacts::of(doc).style.as_deref())
+        || trail_color_setting(
+            doc.get(EDIT_CURSOR_TRAIL_COLOR)
+                .and_then(aterm_toml::edit::Item::as_str),
+        )
+        .chosen()
+        || edits.iter().any(|(key, _)| *key == EDIT_CURSOR_TRAIL_COLOR)
+    {
+        return;
+    }
+    if let Ok(item) = typed_item(EDIT_CURSOR_TRAIL_COLOR, TRAIL_COLOR_CURSOR) {
+        doc[EDIT_CURSOR_TRAIL_COLOR] = item;
+    }
+}
+
+/// What an aterm.toml says about the cursor's style: the style key and the
+/// retired master, as written (a master that is not true or false never
+/// reads).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CursorStyleFacts {
+    master: Option<bool>,
+    style: Option<String>,
+}
+
+impl CursorStyleFacts {
+    fn of(doc: &aterm_toml::edit::DocumentMut) -> Self {
+        Self {
+            master: doc
+                .get(RETIRED_CURSOR_TRAIL)
+                .and_then(aterm_toml::edit::Item::as_bool),
+            style: doc
+                .get(EDIT_CURSOR_TRAIL_STYLE)
+                .and_then(aterm_toml::edit::Item::as_str)
+                .map(str::to_string),
+        }
+    }
+
+    /// The style the file draws ([`crate::app_config::drawn_cursor_trail_style`]).
+    fn drawn(&self) -> &str {
+        crate::app_config::drawn_cursor_trail_style(self.master, self.style.as_deref())
+    }
+}
+
+/// Whether a drawn style draws a trail: anything but Off (a spelling aterm
+/// does not know draws the default).
+fn style_draws(style: &str) -> bool {
+    crate::app_config::resolve_trail_style(style)
+        .style
+        .is_some()
+}
+
+/// THE STYLE OFF REPLACED STAYS IN THE FILE ([`EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF`]),
+/// wherever the edit came from — a Settings row, Serious Mode's exit holding
+/// the cursor Off while another effect turns on, `aterm ctl settings set`,
+/// the retired master's fold. Only an edit that changed what the file says
+/// about the style acts: one that turned a drawn style Off keeps the style
+/// that drew (an older file's `cursor_trail = false` held its style off, so
+/// that style), by its own name in the style list (an old alias by the style
+/// it names, a spelling aterm does not know by the default it drew), so the
+/// key holds a value its own check takes; one that makes the style draw again
+/// takes the key out, as the style now says what the cursor draws; Off to
+/// Off leaves it. An edit that names the key itself is written as it says
+/// (Undo, its Reset).
+fn keep_cursor_style_before_off(
+    before: &CursorStyleFacts,
+    doc: &mut aterm_toml::edit::DocumentMut,
+    edits: &[(&str, Option<String>)],
+) {
+    if edits
+        .iter()
+        .any(|(key, _)| *key == EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF)
+    {
+        return;
+    }
+    let after = CursorStyleFacts::of(doc);
+    if after == *before {
+        return;
+    }
+    if style_draws(after.drawn()) {
+        doc.remove(EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF);
+        return;
+    }
+    let kept = if style_draws(before.drawn()) {
+        Some(before.drawn())
+    } else if before.master == Some(false) {
+        Some(
+            before
+                .style
+                .as_deref()
+                .map_or(DEFAULT_CURSOR_TRAIL_STYLE, str::trim),
+        )
+        .filter(|held| style_draws(held))
+    } else {
+        None
+    };
+    let named = kept.and_then(|kept| crate::app_config::resolve_trail_style(kept).canonical);
+    if let Some(kept) = named
+        && let Ok(item) = typed_item(EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF, kept)
+    {
+        doc[EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF] = item;
+    }
 }
 
 /// A write of either successor of the retired [`RETIRED_CURSOR_TRAIL`] takes it
@@ -3103,7 +3414,23 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
         // out-of-domain value is rejected (BadValue) rather than written as a style the
         // reload parser would silently fall back to (e.g. a typo'd "rainbwo").
         EditKind::Enum { options } => {
-            if key == EDIT_DISPLAY_FONT && trimmed.contains('+') {
+            if key == EDIT_CURSOR_TRAIL_STYLE || key == EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF {
+                // Every spelling the loader accepts is accepted here too, and
+                // written as its canonical name: an alias (`rainbow kitty`,
+                // `lightning`, `nyan rainbow`) as the row it resolves to.
+                // Released configs carry aliases, so `settings set` and a
+                // Settings re-commit must not refuse them; a typo still dies
+                // here as a BadValue. The one alias that draws differently
+                // from its row is the old `classic mono` face: it is written
+                // as `classic mono`, so the saved file draws what was asked
+                // instead of switching to the spectrum.
+                let canonical = cursor_trail_style_canonical(trimmed).ok_or_else(bad)?;
+                if GlowStyle::style_names_classic_mono(trimmed) {
+                    Value::from("classic mono")
+                } else {
+                    Value::from(canonical)
+                }
+            } else if key == EDIT_DISPLAY_FONT && trimmed.contains('+') {
                 // The `display_font` row ALSO accepts a MIX — 2..=3 distinct
                 // bundled ids joined by `+` ("pixel+engraved"), authored by
                 // the Text & Fonts toggles. Each part must be a real bundled
@@ -3157,13 +3484,19 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
             return Err(bad());
         }
         EditKind::Text | EditKind::Theme => Value::from(trimmed),
-        // A colour must parse as RRGGBB/#RRGGBB; reject a malformed value at Save
-        // rather than write a string the config loader would silently ignore.
+        // A colour must parse as RRGGBB/#RRGGBB ([`color_value_is_valid`]);
+        // reject a malformed value at Save rather than write a string the
+        // config loader would silently ignore. The trail colour's word for the
+        // cursor's colour is written as spelled here, whatever its case.
         EditKind::Color => {
-            if aterm_types::scheme::parse_hex(trimmed).is_none() {
+            if !color_value_is_valid(key, trimmed) {
                 return Err(bad());
             }
-            Value::from(trimmed)
+            if trimmed.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR) {
+                Value::from(TRAIL_COLOR_CURSOR)
+            } else {
+                Value::from(trimmed)
+            }
         }
     };
     Ok(Item::Value(value))
@@ -3235,8 +3568,8 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
     }
     match key {
         EDIT_KEEPER_ENABLED => boolean(Some(cfg.keeper_enabled()), false),
-        EDIT_SESSION_LOG_JOURNAL => boolean(Some(cfg.session_log_journal()), false),
-        EDIT_SESSION_LOG_CLAUSE => boolean(Some(cfg.session_log_clause()), false),
+        EDIT_SESSION_LOG_JOURNAL => boolean(Some(cfg.session_log_journal()), true),
+        EDIT_SESSION_LOG_CLAUSE => boolean(Some(cfg.session_log_clause()), true),
         EDIT_UPDATE_ENABLED => boolean(upd.and_then(|u| u.enabled), true),
         "update.auto_apply" => boolean(upd.and_then(|u| u.auto_apply), true),
         EDIT_REROUTE_ANNOUNCE => boolean(cfg.reroute.as_ref().and_then(|r| r.announce), true),
@@ -3605,7 +3938,8 @@ pub(crate) fn section_of(key: &str) -> Section {
         EDIT_COPY_ON_SELECT
         | EDIT_CONFIRM_MULTILINE_PASTE
         | EDIT_OPTION_AS_META
-        | EDIT_PREDICTIVE_ECHO => Section::Input,
+        | EDIT_PREDICTIVE_ECHO
+        | EDIT_PREDICTIVE_ECHO_EDITING => Section::Input,
         // Terminal ▸ System: the launch-time renderer choice, the opt-in
         // replay recorder and the focused shell's priority — how the terminal
         // itself runs, under its Shell.
@@ -3808,7 +4142,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_SESSION_LOG_CLAUSE => ("Session", 4),
         // Input › clipboard (copy and paste) then keyboard.
         EDIT_COPY_ON_SELECT | EDIT_CONFIRM_MULTILINE_PASTE => ("Clipboard", 0),
-        EDIT_OPTION_AS_META | EDIT_PREDICTIVE_ECHO => ("Keyboard", 1),
+        EDIT_OPTION_AS_META | EDIT_PREDICTIVE_ECHO | EDIT_PREDICTIVE_ECHO_EDITING => {
+            ("Keyboard", 1)
+        }
         // Terminal › System: the renderer, replay and the focused shell's
         // priority, after the Shell.
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => ("System", 3),
@@ -3944,8 +4280,15 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
             "Keyword kitties: a little cat peeks out by words like \u{201c}cat\u{201d} and \
              \u{201c}kitty\u{201d}."
         }
+        // One note for both rows. Blank is each style's own colour under the
+        // colour law (Laser's violet; Beam's, Comet's and Sparkle's hue until
+        // a cursor colour is set; else the cursor's, the accent a brighter
+        // one); the word is the cursor's colour chosen, which the trail
+        // colour's picker offers as Cursor color.
         EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => {
-            "Used by trails that take a color; blank follows the theme's cursor color."
+            "Blank: Lightning keeps its violet, and Beam, Comet and Sparkle keep their own \
+             color until you set a cursor color; other styles follow the cursor color. \
+             Cursor color (or \u{201c}cursor\u{201d}) makes every style follow it."
         }
         EDIT_MINIMUM_CONTRAST => "1.0 leaves colors as the theme draws them.",
         // The one place the translucent contrast floor is stated.
@@ -3975,11 +4318,15 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
         EDIT_LOAD_ADAPTIVE_MOTION => {
             "Drops decorative effects while drawing falls behind. Scrolling stays smooth."
         }
+        // The shimmer is the GPU's refraction pass at present time, which no
+        // still raster draws, so the preview shows the fire without it; the
+        // row says so rather than let the preview read as the terminal.
+        EDIT_CURSOR_FIRE_SHIMMER => {
+            "The preview can\u{2019}t show the heat shimmer; the terminal draws it."
+        }
         EDIT_CURSOR_TRAIL_BLOOM
         | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
         | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
-        | EDIT_CURSOR_FIRE_SHIMMER
-        | EDIT_HDR_GLOW
         | EDIT_CURSOR_GLOW_SDR_BOOST => {
             "Bloom, shimmer, and HDR fall back quietly when the display cannot show them."
         }
@@ -4086,8 +4433,8 @@ pub(crate) const HARNESS_AGENT_NOTE: &str = "Off, aterm leaves that agent's sess
 /// What the default autopilot's modes mean, for a session with none of its
 /// own.
 pub(crate) const HARNESS_AUTOPILOT_NOTE: &str = "For sessions with no autopilot of their own: \
-     Cruise keeps the work moving until the agent says it is done; Land wraps the work up, then \
-     stops; Off leaves the session alone.";
+     Cruise keeps the work going, and nothing the agent says ends it; Land lands all of the work \
+     on the remote main branch, then stops; Off leaves the session alone.";
 /// What the Land at time does: offered, never armed.
 pub(crate) const HARNESS_LAND_AT_NOTE: &str = "A time, HH:MM, that each session's Autopilot \
      menu offers: cruise until then, then land. Nothing changes until you pick it.";
@@ -4342,9 +4689,11 @@ pub(crate) fn security_label(key: &str) -> &'static str {
 }
 
 /// Truthful copy for `motion = "auto"` differs with the shipping platform
-/// seam: macOS observes Reduce Motion live, Windows samples its animations
-/// switch when a window attaches, and other platforms have no OS query yet.
-/// Returns the Settings note under the Motion row and Manual's help fragment.
+/// seam: macOS observes Reduce Motion live; Windows samples its animations
+/// switch, and Linux GNOME's `enable-animations` through the desktop's
+/// Settings portal (`platform::gnome_reduce_motion`), when a window attaches;
+/// other platforms have no OS query yet. Returns the Settings note under the
+/// Motion row and Manual's help fragment.
 pub(crate) fn motion_auto_copy(target_os: &str) -> (&'static str, &'static str) {
     match target_os {
         "macos" => (
@@ -4354,6 +4703,10 @@ pub(crate) fn motion_auto_copy(target_os: &str) -> (&'static str, &'static str) 
         "windows" => (
             "Automatic follows the Windows animation setting each time a window opens.",
             " · motion=auto samples Show animations in Windows when a window attaches; preference changes are not observed live",
+        ),
+        "linux" => (
+            "Automatic follows the desktop's animation setting each time a window opens.",
+            " · motion=auto samples the desktop's animation setting (GNOME's enable-animations, through the Settings portal) when a window attaches; preference changes are not observed live",
         ),
         _ => (
             "Automatic animates fully here: this system has no Reduce Motion setting to follow.",
@@ -4660,6 +5013,7 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "pet",
             "companion",
         ],
+        EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF => &["trail", "previous", "last", "off", "restore"],
         EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => {
             &["effect", "trail", "color", "colour", "aurora", "accent"]
         }
@@ -4800,6 +5154,15 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "echo",
             "ssh",
             "remote",
+        ],
+        EDIT_PREDICTIVE_ECHO_EDITING => &[
+            "editing",
+            "arrow",
+            "cursor",
+            "backspace",
+            "prediction",
+            "latency",
+            "ssh",
         ],
         EDIT_FOCUS_BOOST => &["priority", "qos", "latency", "windows", "starvation"],
         EDIT_MATRIX_RAIN_ENABLED => &[
@@ -5286,17 +5649,8 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     let cursor_trail_style = configured_str(cfg.cursor_trail_style.as_deref());
     let cursor_trail_color = configured_str(cfg.cursor_trail_color.as_deref());
     let cursor_trail_accent = configured_str(cfg.cursor_trail_accent.as_deref());
-    // The saved style's own trail colour, where it keeps one (Laser), and
-    // what an unset trail colour draws by name (Classic's shifting colours).
-    let saved_glow = crate::app_config::resolve_trail_style(cfg.cursor_trail_style_raw()).style;
-    let own_trail_color = saved_glow.and_then(aterm_effects::cursor_fx::own_trail_color);
-    let trail_color_default = saved_glow
-        .and_then(aterm_effects::cursor_fx::trail_color_default_name)
-        .map(|name| format!("{name} (default)"));
     // The old `classic mono` spelling draws Classic in the cursor's colour.
-    let classic_in_cursor_color = aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono(
-        cfg.cursor_trail_style_raw(),
-    );
+    let classic_in_cursor_color = GlowStyle::style_names_classic_mono(cfg.cursor_trail_style_raw());
     let cursor_nyan_sprite = configured_str(cfg.cursor_nyan_sprite.as_deref());
     let foreground = configured_str(cfg.foreground.as_deref());
     let background = configured_str(cfg.background.as_deref());
@@ -5630,6 +5984,20 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 .then(|| cfg.cursor_trail_style_raw().to_string()),
         },
         EditField {
+            // Written by the writer beside an Off, never drawn: no row of its
+            // own (Cursor Styles marks the style), a key only in aterm.toml
+            // on Modified, with Reset to forget it.
+            label: "Cursor style before Off",
+            key: EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF,
+            // A style by its name in the list, so Manual offers the styles
+            // and checks the value as it does the style's.
+            kind: EditKind::Enum {
+                options: CURSOR_TRAIL_STYLES,
+            },
+            seed: None,
+            placeholder: String::new(),
+        },
+        EditField {
             // The master switch for every synth sound: the typing notes (each
             // style's signature palette on the spawn edge that lights the
             // trail), the ambient bed, the song, the output streak's note, the
@@ -5755,7 +6123,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.cursor_trail_intensity.map(|v| v.to_string()),
             placeholder: match cfg.cursor_trail_intensity {
                 Some(v) => v.to_string(),
-                None => "1.0 (default)".to_string(),
+                // Unset, the configured style's own brightness
+                // (`Config::cursor_trail_intensity_for`): Classic's is the
+                // v0.28 release's 0.7.
+                None => format!(
+                    "{:.1} (default)",
+                    cfg.cursor_trail_intensity_for(crate::app_config::resolve_trail_presentation(
+                        cfg.cursor_trail_style_raw()
+                    ))
+                ),
             },
         },
         EditField {
@@ -5779,17 +6155,26 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             label: "Trail color",
             key: EDIT_CURSOR_TRAIL_COLOR,
             kind: EditKind::Color,
-            // Unset, the trail draws the saved style's own colour where it
-            // has one (Laser's violet; Classic's shifting colours), else the
+            // Unset, the trail draws the saved style's own colour where the
+            // colour law keeps one (or Classic's shifting colours), else the
             // live cursor colour, as the old `classic mono` spelling draws
-            // Classic.
-            placeholder: cursor_trail_color.clone().unwrap_or_else(|| {
-                if classic_in_cursor_color {
-                    "Cursor color".to_string()
-                } else {
-                    trail_color_default.unwrap_or_else(|| "Cursor color (default)".to_string())
+            // Classic; `cursor` is that colour chosen.
+            placeholder: match cursor_trail_color.as_deref() {
+                Some(word) if word.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR) => {
+                    TRAIL_COLOR_CURSOR_LABEL.to_string()
                 }
-            }),
+                Some(color) => color.to_string(),
+                None if classic_in_cursor_color => TRAIL_COLOR_CURSOR_LABEL.to_string(),
+                None => format!(
+                    "{} (default)",
+                    trail_color_default_words(
+                        EDIT_CURSOR_TRAIL_COLOR,
+                        cfg.cursor_trail_style_raw(),
+                        cfg.trail_color(),
+                        cfg.cursor_color.is_some(),
+                    )
+                ),
+            },
             seed: cursor_trail_color,
         },
         EditField {
@@ -5797,9 +6182,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_CURSOR_TRAIL_ACCENT,
             kind: EditKind::Color,
             placeholder: cursor_trail_accent.clone().unwrap_or_else(|| {
-                own_trail_color.map_or_else(
-                    || "Brighter cursor color (default)".to_string(),
-                    |(_, name)| format!("Brighter {} (default)", name.to_lowercase()),
+                format!(
+                    "{} (default)",
+                    trail_color_default_words(
+                        EDIT_CURSOR_TRAIL_ACCENT,
+                        cfg.cursor_trail_style_raw(),
+                        cfg.trail_color(),
+                        cfg.cursor_color.is_some(),
+                    )
                 )
             }),
             seed: cursor_trail_accent,
@@ -6156,6 +6546,13 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 .clone()
                 .unwrap_or_else(|| "adaptive (default)".to_string()),
             seed: predictive_echo,
+        },
+        EditField {
+            label: "Predictive editing",
+            key: EDIT_PREDICTIVE_ECHO_EDITING,
+            kind: EditKind::Bool,
+            seed: Some(cfg.predictive_echo_editing_or_default().to_string()),
+            placeholder: String::new(),
         },
         EditField {
             label: "Focus priority boost (Windows)",
@@ -6600,135 +6997,256 @@ pub(crate) fn save_prefs_snapshot_observed(
 mod trail_style_tests {
     use super::{CURSOR_TRAIL_STYLES, Config, apply_prefs_edits};
     use crate::cursor_glow::GlowStyle;
+    use aterm_effects::cursor_fx::GlowSpelling;
+    use aterm_effects::kitty_pet::PetSpecies;
 
     /// `Some(v)` helper to keep the edit lists terse.
     fn set(v: &str) -> Option<String> {
         Some(v.to_string())
     }
 
-    /// The pet's twin pin: the KITTY-NAMED canonical styles (and their
-    /// documented aliases) select the full-body CAT companion, and every other
-    /// spelling — the explicit flying head they share a `GlowStyle` with, and
-    /// the dog pet they share the pet machinery with — does not.
-    ///
-    /// TWO ENTRIES, NOT ONE, since 2026-08-26: `rainbow kitty` joined
-    /// `rainbow kitty pet` because the owner asked twice for the kitty their
-    /// config names and kept getting the flying head. The pin that matters is
-    /// unchanged in kind — the picker's kitty entries and the draw path's
-    /// predicate agree, and nothing else in the domain drifts into the pet.
-    #[test]
-    fn the_kitty_named_trail_styles_select_the_full_body_pet() {
-        for &s in CURSOR_TRAIL_STYLES {
-            assert_eq!(
-                GlowStyle::style_names_kitty_pet(s),
-                // …and `rainbow kitty underline` since 2026-08-27: it is a
-                // GEOMETRY of `rainbow kitty`, and the engine's own
-                // `style_names_underline_ribbon` docstring already promised the
-                // companion was shared. It answered `false` here only because
-                // the predicate is a whole-string equality it did not match, so
-                // one appended geometry word swapped the animal on glass
-                // (`pet_active=true cat_active=false` tall vs
-                // `pet_active=false cat_active=true` underline, same input).
-                // …and `rainbow kitty flat` since 2026-09-13, the A/B twin of
-                // the default body: it must differ from the default in the
-                // body alone, so it draws the same resident.
-                // …and `rainbow kitty tall` since 2026-09-21, for the third
-                // time and the plainest reason: `… tall` names the geometry
-                // the DEFAULT ALREADY DRAWS, so the word changed nothing it
-                // named and swapped the animal instead. Both docs a user
-                // reads call it "an explicit spelling of the default".
-                s == "rainbow kitty pet"
-                    || s == "rainbow kitty"
-                    || s == "rainbow kitty underline"
-                    || s == "rainbow kitty flat"
-                    || s == "rainbow kitty tall",
-                "style {s:?}"
-            );
-        }
-        for alias in [
-            "kitty pet",
-            "pet kitty",
-            "  Kitty Pet  ",
-            // The owner's spelling and the bare word.
-            "rainbow kitty",
-            "kitty",
-            "  Rainbow Kitty  ",
-        ] {
-            assert!(
-                GlowStyle::style_names_kitty_pet(alias),
-                "documented alias {alias:?} must select the pet"
-            );
-        }
-        for other in [
-            "rainbow",
-            "nyan",
-            "pet",
-            "rainbowkittypet",
-            // The explicit flying-head spellings are the escape hatch: they must
-            // never be swallowed by the widened kitty list.
-            "rainbow kitty flying",
-            "flying kitty",
-            "kitty flying",
-        ] {
-            assert!(
-                !GlowStyle::style_names_kitty_pet(other),
-                "{other:?} must NOT select the pet"
-            );
-        }
-        // The cat predicate must not claim the dog's spellings — they share the
-        // pet machinery, so a leak here would draw a cat for `rainbow dog pet`.
-        for dog in ["rainbow dog pet", "dog pet", "pet dog", "rainbow puppy pet"] {
-            assert!(
-                !GlowStyle::style_names_kitty_pet(dog),
-                "{dog:?} is the DOG pet, not the kitty pet"
-            );
+    /// What one spelling draws: the engine style, the companion and the
+    /// spelling forks every host derives (`beam` is the additive beam).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Look {
+        style: Option<GlowStyle>,
+        pet: Option<PetSpecies>,
+        ribbon_tall: bool,
+        ribbon_flat: bool,
+        classic_mono: bool,
+        comet: bool,
+        beam: bool,
+    }
+
+    const OFF: Look = Look {
+        style: None,
+        pet: None,
+        ribbon_tall: true,
+        ribbon_flat: false,
+        classic_mono: false,
+        comet: false,
+        beam: true,
+    };
+
+    const fn styled(style: GlowStyle) -> Look {
+        Look {
+            style: Some(style),
+            ..OFF
         }
     }
 
-    /// The DOG pet's pin, the exact mirror of the kitty pet's above: one
-    /// canonical style plus its documented aliases selects the dog skin, the
-    /// cat pet does not, and `style_names_any_pet` is the union — which is the
-    /// predicate the draw path asks, so it must cover both and nothing else.
+    const fn ribbon(pet: Option<PetSpecies>) -> Look {
+        Look {
+            style: Some(GlowStyle::RainbowKitty),
+            pet,
+            beam: false,
+            ..OFF
+        }
+    }
+
+    /// Every look a spelling drew at origin/main 5e5f7cb17f (its 15-row
+    /// `CURSOR_TRAIL_STYLES`, plus the old `classic mono` face its aliases
+    /// kept), read off that commit's tables and
+    /// `resolve_trail_presentation_from_style`. Frozen: this is history, not
+    /// the current table.
+    const BEFORE: &[(&str, Look)] = &[
+        ("phaser", styled(GlowStyle::Phaser)),
+        ("rainbow kitty pet", ribbon(Some(PetSpecies::Cat))),
+        ("rainbow dog pet", ribbon(Some(PetSpecies::Dog))),
+        ("rainbow kitty flying", ribbon(None)),
+        (
+            "rainbow kitty underline",
+            Look {
+                ribbon_tall: false,
+                ..ribbon(Some(PetSpecies::Cat))
+            },
+        ),
+        (
+            "rainbow kitty flat",
+            Look {
+                ribbon_flat: true,
+                ..ribbon(Some(PetSpecies::Cat))
+            },
+        ),
+        (
+            "comet",
+            Look {
+                comet: true,
+                ..styled(GlowStyle::Comet)
+            },
+        ),
+        ("lumen", styled(GlowStyle::Lumen)),
+        ("sparkle", styled(GlowStyle::Sparkle)),
+        ("fire", styled(GlowStyle::Fire)),
+        ("laser", styled(GlowStyle::Laser)),
+        (
+            "water",
+            Look {
+                beam: false,
+                ..styled(GlowStyle::Water)
+            },
+        ),
+        ("beam", styled(GlowStyle::Beam)),
+        ("classic", styled(GlowStyle::Classic)),
+        (
+            "classic mono",
+            Look {
+                classic_mono: true,
+                ..styled(GlowStyle::Classic)
+            },
+        ),
+        ("off", OFF),
+    ];
+
+    /// Every alias at 5e5f7cb17f and the look it drew there (the `classic
+    /// mono` spellings drew its one-colour face).
+    const BEFORE_ALIASES: &[(&str, &str)] = &[
+        ("classic wake", "classic"),
+        ("classic lumen", "classic mono"),
+        ("mono classic", "classic mono"),
+        ("nyan rainbow", "rainbow kitty flying"),
+        ("nyan", "rainbow kitty flying"),
+        ("rainbow", "rainbow kitty flying"),
+        ("flying kitty", "rainbow kitty flying"),
+        ("kitty flying", "rainbow kitty flying"),
+        ("kitty", "rainbow kitty pet"),
+        ("kitty pet", "rainbow kitty pet"),
+        ("pet kitty", "rainbow kitty pet"),
+        ("dog pet", "rainbow dog pet"),
+        ("pet dog", "rainbow dog pet"),
+        ("rainbow puppy pet", "rainbow dog pet"),
+        ("rainbow underline", "rainbow kitty underline"),
+        ("underline rainbow", "rainbow kitty underline"),
+        ("nyan underline", "rainbow kitty underline"),
+        ("rainbow kitty", "rainbow kitty pet"),
+        ("rainbow kitty tall", "rainbow kitty pet"),
+        ("rainbow tall", "rainbow kitty pet"),
+        ("tall rainbow", "rainbow kitty pet"),
+        ("nyan tall", "rainbow kitty pet"),
+        ("rainbow flat", "rainbow kitty flat"),
+        ("flat rainbow", "rainbow kitty flat"),
+        ("nyan flat", "rainbow kitty flat"),
+        ("sparkles", "sparkle"),
+        ("phaser-sparkle", "sparkle"),
+        ("rainbow-sparkle", "sparkle"),
+        ("ember", "fire"),
+        ("embers", "fire"),
+        ("ocean", "water"),
+        ("wave", "water"),
+        ("lightbeam", "beam"),
+        ("light-beam", "beam"),
+    ];
+
+    /// What the native host draws for one spelling, and whether it reported
+    /// the spelling as unknown.
+    fn native_look(raw: &str) -> (Look, bool) {
+        let p = crate::app_config::resolve_trail_presentation(raw);
+        let look = Look {
+            style: p.style.style,
+            pet: p.pet_species,
+            ribbon_tall: p.ribbon_tall,
+            ribbon_flat: p.ribbon_flat,
+            classic_mono: p.classic_mono,
+            comet: p.comet,
+            beam: p.beam,
+        };
+        (look, p.style.unknown)
+    }
+
+    /// What a page's `set_cursor_glow` derives from the same spelling.
+    fn web_look(raw: &str) -> Look {
+        let s = GlowSpelling::parse(raw);
+        Look {
+            style: s.style,
+            pet: GlowSpelling::pet_of(raw),
+            ribbon_tall: s.ribbon_tall,
+            ribbon_flat: s.ribbon_flat,
+            classic_mono: s.classic_mono,
+            comet: s.style == Some(GlowStyle::Comet),
+            beam: s.beam,
+        }
+    }
+
+    /// NO SPELLING CHANGES WHAT IT DRAWS. Every spelling that loaded at
+    /// origin/main 5e5f7cb17f, in any case and padding, still loads without a
+    /// warning and resolves natively to exactly the look it had there, and a
+    /// web page's reading of the same spelling agrees with the native one.
+    /// `lightning` and `rainbow dog` (the Cursor Styles names of two rows) are
+    /// new and draw what their rows draw.
+    ///
+    /// The merge that moved the vocabulary into one engine table
+    /// (`aterm_effects::cursor_glow::spellings`) and reordered the list is
+    /// presentation only; this is the pin that it is.
     #[test]
-    fn exactly_one_trail_style_selects_the_dog_pet() {
-        for &s in CURSOR_TRAIL_STYLES {
-            assert_eq!(
-                GlowStyle::style_names_dog_pet(s),
-                s == "rainbow dog pet",
-                "style {s:?}"
-            );
-            assert_eq!(
-                GlowStyle::style_names_any_pet(s),
-                s == "rainbow dog pet"
-                    || s == "rainbow kitty pet"
-                    || s == "rainbow kitty"
-                    || s == "rainbow kitty underline"
-                    || s == "rainbow kitty flat"
-                    || s == "rainbow kitty tall",
-                "any-pet union, style {s:?}"
-            );
+    fn no_spelling_that_loaded_before_changes_what_it_draws() {
+        let before = |name: &str| {
+            BEFORE
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|&(_, look)| look)
+                .unwrap_or_else(|| panic!("{name:?} is not a 5e5f7cb17f look"))
+        };
+        let spellings = BEFORE
+            .iter()
+            .map(|&(name, _)| (name, name))
+            .chain(BEFORE_ALIASES.iter().copied());
+        for (raw, then) in spellings {
+            let want = before(then);
+            for spelt in [
+                raw.to_string(),
+                raw.to_ascii_uppercase(),
+                format!("  {raw} "),
+            ] {
+                let (native, unknown) = native_look(&spelt);
+                assert!(!unknown, "{spelt:?} loads without a warning");
+                assert_eq!(native, want, "native {spelt:?} draws what it drew");
+                assert_eq!(web_look(&spelt), native, "web {spelt:?} agrees with native");
+            }
         }
-        for alias in ["dog pet", "pet dog", "rainbow puppy pet", "  Dog Pet  "] {
-            assert!(
-                GlowStyle::style_names_dog_pet(alias),
-                "documented alias {alias:?} must select the dog pet"
-            );
+        for (new, row) in [("lightning", "laser"), ("rainbow dog", "rainbow dog pet")] {
+            assert_eq!(native_look(new), (before(row), false), "{new:?}");
+            assert_eq!(web_look(new), before(row), "{new:?}");
         }
-        for other in [
-            "rainbow",
-            "dog",
-            "puppy",
-            "rainbowdogpet",
-            "rainbow kitty pet",
-            // THE DOG OPT-IN IS UNCHANGED by the kitty widening: no kitty
-            // spelling, old or new, may reach the dog skin.
+        // Controls. The fixture tells companions and bodies apart, so the
+        // equalities above are not vacuous…
+        assert_ne!(before("rainbow kitty flying"), before("rainbow kitty pet"));
+        assert_ne!(before("rainbow kitty flat"), before("rainbow kitty pet"));
+        // …and an unknown word is still reported natively (and drawn as the
+        // default), while a page keeps its documented Lumen fallback.
+        let (typo, unknown) = native_look("rainbow kity");
+        assert!(unknown);
+        assert_eq!(typo, before(super::DEFAULT_CURSOR_TRAIL_STYLE));
+        assert_eq!(web_look("rainbow kity").style, Some(GlowStyle::Lumen));
+    }
+
+    /// `--validate-config` accepts the aliases with no warning (the Cursor
+    /// Styles names among them, and the old `classic mono` face); a retired
+    /// `… v2` spelling and a near miss still warn.
+    #[test]
+    fn validate_config_accepts_aliased_trail_styles() {
+        let baseline = crate::diagnostics::validate_config_text("").expect("empty config");
+        for style in [
+            "classic mono",
+            "rainbow kitty tall",
             "rainbow kitty",
-            "kitty",
-            "rainbow kitty flying",
+            "nyan rainbow",
+            "rainbow dog",
+            "lightning",
         ] {
+            let warnings = crate::diagnostics::validate_config_text(&format!(
+                "cursor_trail_style = {style:?}\n"
+            ))
+            .expect("parses");
+            assert_eq!(warnings, baseline, "{style:?}");
+        }
+        for unknown in ["lightnin", "kitty v2"] {
+            let warnings = crate::diagnostics::validate_config_text(&format!(
+                "cursor_trail_style = {unknown:?}\n"
+            ))
+            .expect("parses");
             assert!(
-                !GlowStyle::style_names_dog_pet(other),
-                "{other:?} must NOT select the dog pet"
+                warnings.iter().any(|w| w.contains("cursor_trail_style")),
+                "{unknown:?} is still flagged: {warnings:?}"
             );
         }
     }
@@ -6797,159 +7315,13 @@ mod trail_style_tests {
         }
     }
 
-    /// The alias table's twin pin: every documented alias maps to a canonical
-    /// option that is (a) actually in the picker's domain and (b) parses to the
-    /// SAME engine style as the alias itself — so the Settings panel, the
-    /// validator, and `GlowStyle::parse` can never disagree about what an
-    /// aliased spelling means (the "rainbow shows phaser but renders rainbow kitty" bug).
-    #[test]
-    fn cursor_trail_style_aliases_agree_with_engine_parse() {
-        for &(alias, canonical) in super::CURSOR_TRAIL_STYLE_ALIASES {
-            assert!(
-                CURSOR_TRAIL_STYLES.contains(&canonical),
-                "alias {alias:?} maps outside the picker domain: {canonical:?}"
-            );
-            assert_eq!(
-                GlowStyle::parse(alias),
-                GlowStyle::parse(canonical),
-                "alias {alias:?} and its canonical {canonical:?} diverge in the engine"
-            );
-            // …AND THE SAME COMPANION. The style alone stopped being the whole
-            // answer once `rainbow kitty` became the walking pet: an alias whose
-            // canonical draws a different animal would make the Settings panel
-            // name a companion the engine does not draw for that config, which
-            // is exactly the split this table exists to prevent (it is why
-            // `nyan`/`rainbow`/`nyan rainbow` canonicalise to the flying head).
-            assert_eq!(
-                GlowStyle::style_names_kitty_pet(alias),
-                GlowStyle::style_names_kitty_pet(canonical),
-                "alias {alias:?} and its canonical {canonical:?} draw different cats"
-            );
-            assert_eq!(
-                GlowStyle::style_names_dog_pet(alias),
-                GlowStyle::style_names_dog_pet(canonical),
-                "alias {alias:?} and its canonical {canonical:?} draw different species"
-            );
-            // …AND THE SAME BODY. The engine draws the tall body unless the
-            // spelling names the underline (`ribbon_tall` is
-            // `!style_names_underline_ribbon`), and the flat body only when it
-            // names it, so an alias whose canonical disagrees on either would
-            // silently swap the body the user asked for. (`… tall` spellings
-            // name the default's own body, so they share its canonical.)
-            assert_eq!(
-                GlowStyle::style_names_underline_ribbon(alias),
-                GlowStyle::style_names_underline_ribbon(canonical),
-                "alias {alias:?} and its canonical {canonical:?} draw different ribbons"
-            );
-            assert_eq!(
-                GlowStyle::style_names_flat_ribbon(alias),
-                GlowStyle::style_names_flat_ribbon(canonical),
-                "alias {alias:?} and its canonical {canonical:?} draw different bodies"
-            );
-            assert_eq!(
-                super::cursor_trail_style_canonical(alias),
-                Some(canonical),
-                "resolver must accept the documented alias {alias:?}"
-            );
-        }
-        // Canonical spellings resolve to themselves (case-insensitively)…
-        for &s in CURSOR_TRAIL_STYLES {
-            assert_eq!(super::cursor_trail_style_canonical(s), Some(s));
-            assert_eq!(
-                super::cursor_trail_style_canonical(&s.to_ascii_uppercase()),
-                Some(s)
-            );
-        }
-        // …and a genuinely unknown spelling is refused (the validator's arm).
-        assert_eq!(super::cursor_trail_style_canonical("plasma"), None);
-        assert_eq!(super::cursor_trail_style_canonical(""), None);
-    }
-
-    /// THE TALL RIBBON MUST NOT BE A TRAPDOOR — the pin for the defect measured
-    /// on v0.60.0 (build 1787762776), where asking for a look the engine
-    /// implements switched the cursor effect OFF.
-    ///
-    /// `cursor_trail_style_canonical` returning `None` is not "no style"; it is
-    /// an unknown style, and `resolve_trail_style` answers that by
-    /// substituting the DEFAULT style. So every spelling the ENGINE advertises
-    /// has to be a spelling THIS module resolves, or the two halves disagree in
-    /// the one direction the user cannot see: an explicit style silently falls
-    /// back to the default, and the only word about it is a warning on the
-    /// startup banner. (Before 2026-08-29 the same gap switched the whole
-    /// cursor effect OFF — `effective=false intensity=0.00` under a
-    /// `ribbon_look=tall` diagnostic.)
-    ///
-    /// Both directions are pinned. Forward: each historical explicit-tall
-    /// spelling resolves to a canonical picker option that is itself still tall
-    /// (an alias that canonicalised to an underline spelling would re-enable the
-    /// trail while silently dropping the requested geometry). Backward: every
-    /// every ordinary canonical rainbow-kitty spelling draws the tall default;
-    /// only the one explicitly named `underline` selects the
-    /// highlighter-plus-under-baseline alternate. Companion selection must not
-    /// accidentally change the ribbon geometry.
-    ///
-    /// The four spellings are written out rather than imported because the
-    /// engine exports the predicate, not the list; `cursor_glow`'s own
-    /// `rainbow_spellings_share_one_mark_and_differ_only_in_the_shoulder`
-    /// holds the other copy.
-    #[test]
-    fn every_tall_ribbon_spelling_stays_selectable() {
-        for tall in [
-            "rainbow kitty tall",
-            "rainbow tall",
-            "tall rainbow",
-            "nyan tall",
-        ] {
-            assert!(
-                GlowStyle::style_names_tall_ribbon(tall),
-                "{tall:?} is one of the engine's tall spellings"
-            );
-            let canonical = super::cursor_trail_style_canonical(tall).unwrap_or_else(|| {
-                panic!(
-                    "{tall:?} resolves to None — the resolver would substitute the DEFAULT style \
-                     for a look the engine implements"
-                )
-            });
-            assert!(
-                CURSOR_TRAIL_STYLES.contains(&canonical),
-                "{tall:?} canonicalises outside the picker domain: {canonical:?}"
-            );
-            // Tall is the default body: every spelling but the underline
-            // draws it (`ribbon_tall` is `!style_names_underline_ribbon`).
-            assert!(
-                !GlowStyle::style_names_underline_ribbon(canonical)
-                    && !GlowStyle::style_names_flat_ribbon(canonical),
-                "{tall:?} canonicalises to {canonical:?}, which is NOT tall — the trail would \
-                 come back as the flat strip and the look would be silently dropped"
-            );
-            assert_eq!(
-                GlowStyle::parse(tall),
-                GlowStyle::RainbowKitty,
-                "the tall body is a presentation of the rainbow ribbon, not a style of its own"
-            );
-        }
-        // The predicate records an explicit `tall` token, not resolved
-        // geometry: the tall spellings are aliases of the default, which
-        // draws tall without matching it, so no listed style says tall.
-        for &s in CURSOR_TRAIL_STYLES {
-            assert!(!GlowStyle::style_names_tall_ribbon(s), "style {s:?}");
-            // The underline spelling is the other half of the same axis: exactly
-            // one canonical option SAYS underline, and the paint label reads that
-            // predicate off the displayed (canonical) value.
-            assert_eq!(
-                GlowStyle::style_names_underline_ribbon(s),
-                matches!(s, "rainbow kitty underline"),
-                "style {s:?}"
-            );
-        }
-    }
-
     /// The typing-sound resolver: canonical spellings resolve to themselves
     /// (case- and whitespace-insensitively), every documented synth alias
     /// projects onto its canonical row, and an unknown spelling is refused —
     /// while the WRITER accepts only canonical spellings (aliases are load-
-    /// only, exactly as for `cursor_trail_style`) and the loader
-    /// (`Config::trail_sound_voice`) accepts both and falls back to `auto`.
+    /// only here; `cursor_trail_style`'s writer canonicalises them instead)
+    /// and the loader (`Config::trail_sound_voice`) accepts both and falls
+    /// back to `auto`.
     #[test]
     fn trail_sound_style_canonical_resolves_aliases_and_the_loader_agrees() {
         use aterm_effects::cursor_glow::GlowStyle;
@@ -8746,6 +9118,276 @@ auto_apply = true # hands off
             "the field says Theme default"
         );
     }
+
+    /// OFF NEVER OVERWRITES THE STYLE (lead-known-open #29): the writer every
+    /// lane meets keeps the style an edit turned Off beside it, whatever wrote
+    /// the Off — a Settings row, Serious Mode's exit, `settings set`, the
+    /// retired master's fold over an older file — and an edit that makes the
+    /// style draw again takes it out. An edit that changed nothing about the
+    /// style leaves it alone, and one that names it is written as it says.
+    #[test]
+    fn off_keeps_the_style_it_replaced_and_a_drawn_style_takes_it_out() {
+        use super::{
+            EDIT_CURSOR_MOMENTUM_GLOW, EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF as BEFORE_OFF,
+            RETIRED_CURSOR_TRAIL,
+        };
+        let read = |toml: &str, key: &str| {
+            toml.parse::<aterm_toml::edit::DocumentMut>()
+                .unwrap()
+                .get(key)
+                .map(|item| item.to_string().trim().trim_matches('"').to_string())
+        };
+        let write =
+            |toml: &str, edits: &[(&str, Option<String>)]| apply_prefs_edits(toml, edits).unwrap();
+        // A person's own Off, and Serious Mode's exit pin (the same write).
+        let off = write(
+            "cursor_trail_style = \"comet\"\n",
+            &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))],
+        );
+        assert_eq!(read(&off, EDIT_CURSOR_TRAIL_STYLE).as_deref(), Some("off"));
+        assert_eq!(read(&off, BEFORE_OFF).as_deref(), Some("comet"));
+        // Unset, the style drew the platform's default: that is what Off
+        // replaced (none where the default is Off already).
+        let from_default = write("", &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))]);
+        assert_eq!(
+            read(&from_default, BEFORE_OFF),
+            crate::app_config::DEFAULT_DECORATIVE_EFFECTS
+                .then(|| super::DEFAULT_CURSOR_TRAIL_STYLE.to_string())
+        );
+        // Off to Off, and an edit of another key, leave it.
+        assert_eq!(
+            read(
+                &write(&off, &[(EDIT_CURSOR_TRAIL_STYLE, set("OFF"))]),
+                BEFORE_OFF
+            )
+            .as_deref(),
+            Some("comet")
+        );
+        assert_eq!(
+            read(&write(&off, &[(EDIT_FONT_PX, set("15"))]), BEFORE_OFF).as_deref(),
+            Some("comet")
+        );
+        // A drawn style takes it out, chosen or reset to a default that draws.
+        let water = write(&off, &[(EDIT_CURSOR_TRAIL_STYLE, set("water"))]);
+        assert_eq!(read(&water, BEFORE_OFF), None);
+        let reset = write(&off, &[(EDIT_CURSOR_TRAIL_STYLE, None)]);
+        assert_eq!(
+            read(&reset, BEFORE_OFF).is_none(),
+            crate::app_config::DEFAULT_DECORATIVE_EFFECTS
+        );
+        // Named by the edit (Undo, its Reset): written as it says.
+        let forgot = write(
+            &off,
+            &[(EDIT_CURSOR_TRAIL_STYLE, set("off")), (BEFORE_OFF, None)],
+        );
+        assert_eq!(read(&forgot, BEFORE_OFF), None);
+        // AN OLDER FILE: `cursor_trail = false` held Fire off. A write of the
+        // typing glow drops the old switch and pins the style Off (the fold),
+        // and Fire is kept rather than lost.
+        let held = "cursor_trail = false\ncursor_trail_style = \"fire\"\n";
+        let glow = write(held, &[(EDIT_CURSOR_MOMENTUM_GLOW, set("true"))]);
+        assert_eq!(read(&glow, RETIRED_CURSOR_TRAIL), None);
+        assert_eq!(read(&glow, EDIT_CURSOR_TRAIL_STYLE).as_deref(), Some("off"));
+        assert_eq!(read(&glow, BEFORE_OFF).as_deref(), Some("fire"));
+        // Choosing Off over it keeps Fire too; choosing a style needs none.
+        let chose_off = write(held, &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))]);
+        assert_eq!(read(&chose_off, BEFORE_OFF).as_deref(), Some("fire"));
+        let chose_water = write(held, &[(EDIT_CURSOR_TRAIL_STYLE, set("water"))]);
+        assert_eq!(read(&chose_water, BEFORE_OFF), None);
+        // Kept by its name in the style list, a value the key's own check
+        // takes: an old alias by the style it names, a spelling aterm does not
+        // know by the default it drew.
+        let alias = write(
+            "cursor_trail_style = \"nyan\"\n",
+            &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))],
+        );
+        assert_eq!(
+            read(&alias, BEFORE_OFF).as_deref(),
+            Some("rainbow kitty flying")
+        );
+        let unknown = write(
+            "cursor_trail_style = \"cometz\"\n",
+            &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))],
+        );
+        assert_eq!(
+            read(&unknown, BEFORE_OFF).as_deref(),
+            Some(super::DEFAULT_CURSOR_TRAIL_STYLE)
+        );
+        for kept in ["rainbow kitty flying", "nyan"] {
+            assert!(
+                crate::native_config_language::registered_enum_value_is_valid(
+                    BEFORE_OFF,
+                    kept,
+                    super::CURSOR_TRAIL_STYLES
+                ),
+                "{kept}"
+            );
+        }
+        // A kept style never draws: the style alone decides.
+        let config: Config = aterm_toml::from_str(&off).unwrap();
+        assert_eq!(config.cursor_trail_style_raw(), "off");
+    }
+
+    /// AN OLD `classic mono` KEEPS ITS COLOUR WHEN THE WRITER REWRITES IT. The
+    /// spelling says Classic and the cursor's colour; the style list knows
+    /// only Classic, so the Off that keeps the style before it (`classic`)
+    /// — and any other edit that takes the spelling out — writes the colour
+    /// as the trail colour (`cursor`) in the same write, and Classic brought
+    /// back draws its one-colour face in the live cursor colour, as the old
+    /// spelling did. A file that names a trail colour already says it, and an
+    /// edit that names the colour is written as it says. Every other spelling
+    /// the style reader takes says the style alone, so its list name draws
+    /// what it drew and the writer adds nothing. Without the rule the Off
+    /// kept `classic` alone and Classic came back in shifting colours.
+    #[test]
+    fn a_classic_mono_spelling_keeps_its_colour_when_rewritten() {
+        use super::{
+            CURSOR_TRAIL_STYLE_ALIASES, EDIT_CURSOR_MOMENTUM_GLOW,
+            EDIT_CURSOR_TRAIL_COLOR as COLOR, EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF as BEFORE_OFF,
+        };
+        use aterm_effects::cursor_glow::GlowStyle;
+        let read = |toml: &str, key: &str| {
+            toml.parse::<aterm_toml::edit::DocumentMut>()
+                .unwrap()
+                .get(key)
+                .map(|item| item.to_string().trim().trim_matches('"').to_string())
+        };
+        let write =
+            |toml: &str, edits: &[(&str, Option<String>)]| apply_prefs_edits(toml, edits).unwrap();
+        // What a window draws from the file: the style, its one-colour face,
+        // and the colour the trail follows (the live cursor's, per frame).
+        let theme_cursor = 0x0009_69DA;
+        let drawn = |toml: &str| {
+            let config: Config = aterm_toml::from_str(toml).unwrap();
+            let presentation =
+                crate::app_config::resolve_trail_presentation(config.cursor_trail_style_raw());
+            let glow = crate::app_config::resolve_cursor_glow(
+                config.cursor_glow_inputs(true, theme_cursor, presentation),
+                presentation,
+                theme_cursor,
+                true,
+                0x00C8_D3F5,
+                0x001A_1B26,
+                0.5,
+            );
+            (
+                glow.enabled.then_some(glow.style),
+                glow.classic_mono,
+                config.trail_color(),
+            )
+        };
+        let classic_in_cursor_color = (
+            Some(GlowStyle::Classic),
+            true,
+            aterm_effects::cursor_fx::TrailColor::Cursor,
+        );
+        for mono in ["classic mono", "Classic Lumen", " mono classic "] {
+            let file = format!("cursor_trail_style = \"{mono}\"\n");
+            assert_eq!(drawn(&file).0, Some(GlowStyle::Classic));
+            assert!(drawn(&file).1, "{mono:?} draws the one-colour face");
+            // Off over it (Serious Mode's exit pin, a Settings row, `settings
+            // set`): Classic kept, its colour beside it, and nothing drawn.
+            let off = write(&file, &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))]);
+            assert_eq!(
+                read(&off, BEFORE_OFF).as_deref(),
+                Some("classic"),
+                "{mono:?}"
+            );
+            assert_eq!(read(&off, COLOR).as_deref(), Some("cursor"), "{mono:?}");
+            assert_eq!(drawn(&off).0, None, "{mono:?}");
+            // Brought back, Classic draws in the cursor's colour again.
+            let back = write(&off, &[(EDIT_CURSOR_TRAIL_STYLE, set("classic"))]);
+            assert_eq!(drawn(&back), classic_in_cursor_color, "{mono:?}");
+            assert_eq!(read(&back, BEFORE_OFF), None, "{mono:?}");
+            // Another style keeps the colour too, as it keeps any trail colour.
+            let comet = write(&file, &[(EDIT_CURSOR_TRAIL_STYLE, set("comet"))]);
+            assert_eq!(read(&comet, COLOR).as_deref(), Some("cursor"), "{mono:?}");
+            // Classic chosen over it (its list name) draws what it drew; the
+            // colour is now on its own row, whose Reset gives the shifting
+            // colours.
+            let named = write(&file, &[(EDIT_CURSOR_TRAIL_STYLE, set("classic"))]);
+            assert_eq!(drawn(&named), classic_in_cursor_color, "{mono:?}");
+            let shifting = write(&named, &[(COLOR, None)]);
+            assert_eq!(
+                drawn(&shifting),
+                (
+                    Some(GlowStyle::Classic),
+                    false,
+                    aterm_effects::cursor_fx::TrailColor::Automatic
+                ),
+                "{mono:?}"
+            );
+            // The retired master's fold over an older file.
+            let held = format!("cursor_trail = false\n{file}");
+            let glow = write(&held, &[(EDIT_CURSOR_MOMENTUM_GLOW, set("true"))]);
+            assert_eq!(
+                read(&glow, BEFORE_OFF).as_deref(),
+                Some("classic"),
+                "{mono:?}"
+            );
+            assert_eq!(read(&glow, COLOR).as_deref(), Some("cursor"), "{mono:?}");
+            // A trail colour in the file already says it: kept as it is.
+            let tinted = format!("{file}cursor_trail_color = \"#50FA7B\"\n");
+            let tinted_off = write(&tinted, &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))]);
+            assert_eq!(read(&tinted_off, COLOR).as_deref(), Some("#50FA7B"));
+            // One the loader ignores (a typo) drew the cursor's colour: the
+            // cursor's takes its place, so Classic comes back as it drew.
+            let typo = format!("{file}cursor_trail_color = \"#50FA7\"\n");
+            assert_eq!(
+                drawn(&typo),
+                (
+                    Some(GlowStyle::Classic),
+                    true,
+                    aterm_effects::cursor_fx::TrailColor::Automatic
+                ),
+                "{mono:?}: the one-colour face, in the cursor's colour"
+            );
+            let typo_off = write(&typo, &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))]);
+            assert_eq!(
+                read(&typo_off, COLOR).as_deref(),
+                Some("cursor"),
+                "{mono:?}"
+            );
+            let typo_back = write(&typo_off, &[(EDIT_CURSOR_TRAIL_STYLE, set("classic"))]);
+            assert_eq!(drawn(&typo_back), classic_in_cursor_color, "{mono:?}");
+            // An edit that names the colour is written as it says (Reset All).
+            let reset = write(&file, &[(EDIT_CURSOR_TRAIL_STYLE, None), (COLOR, None)]);
+            assert_eq!(read(&reset, COLOR), None, "{mono:?}");
+            // An edit of another key leaves the old spelling as it is.
+            let other = write(&file, &[(EDIT_FONT_PX, set("15"))]);
+            assert_eq!(read(&other, COLOR), None, "{mono:?}");
+            assert_eq!(read(&other, EDIT_CURSOR_TRAIL_STYLE).as_deref(), Some(mono));
+        }
+        // Every other spelling the reader takes says the style alone.
+        for &(alias, canonical) in CURSOR_TRAIL_STYLE_ALIASES {
+            if GlowStyle::style_names_classic_mono(alias) {
+                continue;
+            }
+            assert_eq!(
+                crate::app_config::resolve_trail_presentation(alias),
+                crate::app_config::resolve_trail_presentation(canonical),
+                "{alias:?} draws what {canonical:?} draws"
+            );
+            let off = write(
+                &format!("cursor_trail_style = \"{alias}\"\n"),
+                &[(EDIT_CURSOR_TRAIL_STYLE, set("off"))],
+            );
+            assert_eq!(
+                read(&off, BEFORE_OFF).as_deref(),
+                Some(canonical),
+                "{alias:?}"
+            );
+            assert_eq!(read(&off, COLOR), None, "{alias:?}");
+        }
+        // The colour's word is a value the trail colour takes, as written,
+        // and no other colour key takes it.
+        let chosen = write("", &[(COLOR, set(" CURSOR "))]);
+        assert_eq!(read(&chosen, COLOR).as_deref(), Some("cursor"));
+        assert!(apply_prefs_edits("", &[(EDIT_FOREGROUND, set("cursor"))]).is_err());
+        assert!(
+            apply_prefs_edits("", &[(super::EDIT_CURSOR_TRAIL_ACCENT, set("cursor"))]).is_err()
+        );
+    }
 }
 
 /// REGISTRY conformance: the proofs behind Manual and `settings set|unset` (the
@@ -8817,6 +9459,75 @@ mod registry_conformance_tests {
             let _: Config = aterm_toml::from_str(&out).unwrap_or_else(|e| {
                 panic!("{} wrote TOML serde rejects: {e}\n---\n{out}", leaf.key)
             });
+        }
+    }
+
+    /// THE SESSION LOG'S TWO SWITCHES (session log Phase 6, step 6B-3; D3 and
+    /// D6, ruled 2026-10-19) are Bool rows in the group and section of
+    /// "Restore session at launch", seeded on from the resolved getters, and
+    /// the writer types them as TOML booleans, like the `[packages]` switches:
+    /// writing `false` leaves a `[session_log]` table that re-parses with the
+    /// switch off and seeds the row off, and writing `true` over it turns it
+    /// back on. NEGATIVE CONTROL: a dotted key that falls through to Text
+    /// (the warning on `edit_kind`'s `[packages]` arm) writes
+    /// `journal = "false"`, a string, and the boolean assertion fails before
+    /// the kind assertions would.
+    #[test]
+    fn the_session_log_switches_are_bool_rows_beside_restore() {
+        let read = |key: &str, cfg: &Config| match key {
+            super::EDIT_SESSION_LOG_JOURNAL => cfg.session_log_journal(),
+            _ => cfg.session_log_clause(),
+        };
+        let fields = editable_fields(&Config::default());
+        for key in [
+            super::EDIT_SESSION_LOG_JOURNAL,
+            super::EDIT_SESSION_LOG_CLAUSE,
+        ] {
+            // The writer first, so a key typed as Text shows as the string
+            // it writes.
+            let (table, leaf) = key.split_once('.').expect("a dotted key");
+            let off = apply_prefs_edits("", &[(key, set("false"))])
+                .unwrap_or_else(|e| panic!("{key} = false: {e}"));
+            assert!(
+                off.lines().any(|l| l.trim() == format!("[{table}]")),
+                "a [{table}] table: {off}"
+            );
+            assert!(
+                off.lines().any(|l| l.trim() == format!("{leaf} = false")),
+                "a TOML boolean, never a string: {off}"
+            );
+            let saved: Config = aterm_toml::from_str(&off)
+                .unwrap_or_else(|e| panic!("{key} wrote TOML serde rejects: {e}\n---\n{off}"));
+            assert!(!read(key, &saved), "{key} reads back off");
+            let seeded = editable_fields(&saved);
+            let row = seeded.iter().find(|f| f.key == key).expect("the row");
+            assert_eq!(
+                row.seed.as_deref(),
+                Some("false"),
+                "{key} seeds the saved value"
+            );
+            let on = apply_prefs_edits(&off, &[(key, set("true"))])
+                .unwrap_or_else(|e| panic!("{key} = true: {e}"));
+            let saved: Config = aterm_toml::from_str(&on)
+                .unwrap_or_else(|e| panic!("{key} wrote TOML serde rejects: {e}\n---\n{on}"));
+            assert!(read(key, &saved), "{key} reads back on: {on}");
+            let row = fields
+                .iter()
+                .find(|f| f.key == key)
+                .unwrap_or_else(|| panic!("{key} is a Settings row"));
+            assert_eq!(row.kind, EditKind::Bool, "{key} row kind");
+            assert_eq!(edit_kind(key), EditKind::Bool, "{key} writer kind");
+            assert_eq!(row.seed.as_deref(), Some("true"), "{key} seeds its default");
+            assert_eq!(
+                super::group_of(key),
+                super::group_of(super::EDIT_RESTORE_SESSION),
+                "{key} sits beside Restore session at launch"
+            );
+            assert_eq!(
+                section_of(key),
+                section_of(super::EDIT_RESTORE_SESSION),
+                "{key} section"
+            );
         }
     }
 
@@ -9193,6 +9904,27 @@ enabled = true
         assert!(range_of(super::EDIT_TRAIL_SOUND_VOLUME).is_some());
         assert!(range_of(super::EDIT_WINDOW_PADDING).is_some());
         assert!(range_of(super::EDIT_WINDOW_PADDING_TOP).is_some());
+    }
+
+    /// Predictive editing's kill switch is a Bool row beside Predictive echo
+    /// (Keyboard & Input), seeded with the resolved default (on): a Save writes
+    /// a TOML bool its serde `Option<bool>` reads back, and that turns it off.
+    #[test]
+    fn the_predictive_editing_switch_is_a_bool_row_that_round_trips() {
+        let key = super::EDIT_PREDICTIVE_ECHO_EDITING;
+        assert!(matches!(edit_kind(key), EditKind::Bool));
+        assert_eq!(section_of(key), section_of(super::EDIT_PREDICTIVE_ECHO));
+        let fields = editable_fields(&Config::default());
+        let row = fields
+            .iter()
+            .find(|f| f.key == key)
+            .expect("a settings row");
+        assert_eq!(row.seed.as_deref(), Some("true"), "on by default");
+        let out = apply_prefs_edits("", &[(key, set("false"))]).expect("a Bool writes");
+        let c: Config = aterm_toml::from_str(&out).expect("a TOML bool round-trips");
+        assert_eq!(c.predictive_echo_editing, Some(false));
+        assert!(!c.predictive_echo_editing_or_default());
+        assert!(Config::default().predictive_echo_editing_or_default());
     }
 
     /// FONT-DISPLAY: the two keys round-trip through the real TOML writer with

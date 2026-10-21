@@ -579,12 +579,13 @@ pub fn lasting(path: &Path) -> bool {
 /// temp dir, `/tmp` and `/var/tmp`. A root that is the filesystem root itself (a `TMPDIR=/`)
 /// is dropped — it would make every path transient.
 fn temp_roots() -> Vec<PathBuf> {
+    temp_roots_from(std::env::temp_dir())
+}
+
+/// [`temp_roots`] with `temp_dir` as the system temp dir.
+fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for root in [
-        std::env::temp_dir(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/var/tmp"),
-    ] {
+    for root in [temp_dir, PathBuf::from("/tmp"), PathBuf::from("/var/tmp")] {
         if let Ok(real) = std::fs::canonicalize(&root) {
             roots.push(real);
         }
@@ -1785,6 +1786,12 @@ mod tests {
             (untagged.join("debug/atpkg"), Durability::Plain),
             // Not the exact bundle shape: a plain binary.
             (root.join("aterm.app/MacOS/atpkg"), Durability::Plain),
+            (
+                root.join("aterm.app/Contents/Resources/atpkg"),
+                Durability::Plain,
+            ),
+            (root.join("aterm.app/Other/MacOS/atpkg"), Durability::Plain),
+            (root.join("aterm/Contents/MacOS/atpkg"), Durability::Plain),
             (target.join("debug/atpkg"), Durability::Transient),
             (
                 target.join("release/bundle/aterm.app/Contents/MacOS/atpkg"),
@@ -1809,10 +1816,44 @@ mod tests {
                 path.display()
             );
         }
-        // The machine's own temp dirs are transient, and the filesystem root is not a temp
-        // dir whatever `TMPDIR` says.
+        // A temp dir is a root as spelled and as it resolves: macOS's `$TMPDIR` sits under
+        // `/var`, a link to `/private/var`, and a running copy's own path is the resolved
+        // one. And the filesystem root is never a temp dir, whatever `TMPDIR` says.
+        let real = root.join("real-tmp");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("link-tmp");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let through_a_link = temp_roots_from(link.clone());
+        assert!(
+            through_a_link.contains(&link) && through_a_link.contains(&real),
+            "{through_a_link:?}"
+        );
+        assert_eq!(
+            durability(&real.join("x/bin/atpkg"), &through_a_link),
+            Durability::Transient
+        );
+        let at_the_root = temp_roots_from(PathBuf::from("/"));
+        assert!(
+            at_the_root.iter().all(|r| r.parent().is_some()),
+            "{at_the_root:?}"
+        );
+        // `/tmp` and `/var/tmp` are roots whatever the temp dir is.
+        for scratch in ["/tmp/x/bin/atpkg", "/var/tmp/x/bin/atpkg"] {
+            assert_eq!(
+                durability(Path::new(scratch), &at_the_root),
+                Durability::Transient,
+                "{scratch}: {at_the_root:?}"
+            );
+        }
+        assert_eq!(
+            durability(
+                Path::new("/Applications/aterm.app/Contents/MacOS/atpkg"),
+                &at_the_root
+            ),
+            Durability::Bundle
+        );
+        // The machine's own temp dirs are transient.
         let roots = temp_roots();
-        assert!(roots.iter().all(|r| r.parent().is_some()), "{roots:?}");
         assert_eq!(
             durability(&std::env::temp_dir().join("x/bin/atpkg"), &roots),
             Durability::Transient
@@ -1998,6 +2039,13 @@ mod tests {
     /// code-signature state with the file it ran from, and a file written over after it ran
     /// can be SIGKILLed at its next exec (5 of 200 runs copied over; 0 of 200 removed
     /// first).
+    ///
+    /// The copy is a hard link where the file system takes one: this binary under the new
+    /// name, which the copy's lays see as theirs (`current_exe` is the path it ran from).
+    /// Only names are ever removed here, never the file written, so the link cannot touch
+    /// the running binary. A byte copy is a new file, and macOS held each first exec of one
+    /// 0.34-0.45 s (two runs, both paths); a link's first exec took 4-6 ms. Where no link
+    /// can be made (another volume), it is copied.
     #[cfg(unix)]
     fn lay_as_copy_at(exe: &Path, alias: bool, l: &Layout) {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
@@ -2006,8 +2054,11 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => panic!("remove the previous copy at {}: {e}", exe.display()),
         }
-        std::fs::copy(std::env::current_exe().unwrap(), exe).expect("copy this test binary");
-        std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let this = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&this, exe).is_err() {
+            std::fs::copy(&this, exe).expect("copy this test binary");
+            std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         if alias {
             let _ = std::fs::remove_file(exe.with_file_name("atpkg"));
             std::os::unix::fs::symlink(exe.file_name().unwrap(), exe.with_file_name("atpkg"))

@@ -42,14 +42,25 @@ fn dropping_a_session_whose_pid_names_another_process_signals_nothing() {
         "the stale identity must not verify"
     );
     drop(session);
-    // Past the old SIGKILL tick (250 ms), with margin.
-    std::thread::sleep(Duration::from_millis(500));
-    let survived = running(&mut bystander);
-    let _ = bystander.kill();
-    let _ = bystander.wait();
+    // Every reap the drop started has settled or sent its SIGKILL (a hang
+    // detector, not a budget), so any signal the teardown sends is sent.
     assert!(
-        survived,
-        "closing the tab SIGNALLED an unrelated process that holds its shell's old pid"
+        aterm_pty::wait_for_reaps(aterm_spec::wait::MUST_HAPPEN),
+        "the teardown's reaps never settled"
+    );
+    // Then this test ends the bystander with SIGTERM. A SIGHUP or SIGKILL the
+    // teardown sent ended it already or is delivered first (lowest signal
+    // first), so how it died names who signalled it, however late a
+    // descheduled reaper ran.
+    // SAFETY: a signal to the test's own child, not yet reaped.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let status = bystander
+        .wait()
+        .expect("the bystander is the test's to reap: the teardown reaped it");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "closing the tab SIGNALLED an unrelated process that holds its shell's old pid: {status}"
     );
 }
 

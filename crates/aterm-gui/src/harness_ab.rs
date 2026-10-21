@@ -10,9 +10,10 @@
 //! prompt). The words are published whether or not the harness runs
 //! (`SessionTimeline::publish_agent`), so every arm is split alike. The arm
 //! ([`AbArm`]) is the Autopilot state the stretch ran under. Under Cruise
-//! and Land, the time at the prompt also has a cause ([`AbCause`]): the
-//! agent said it was finished (the task's face `done` or `landed`), or the
-//! harness was pausing after short turns. Off has no harness to say why.
+//! and Land, the time at the prompt also has a cause ([`AbCause`]): under
+//! Land the work landed (the task's face `landed`; Cruise takes nothing as
+//! the end), or the harness was pausing after short turns. Off has no harness
+//! to say why.
 //!
 //! **Holds.** A run of a box (or of a question) ends at the first word that
 //! is not that one. Its length goes into a log₂ histogram of 250 ms
@@ -31,9 +32,10 @@
 //! crosses the midnight is split there. No "time saved" is derived (§6).
 //!
 //! **The ends** (§11.6.3, item 4): each day also counts the tasks that came
-//! down ([`AbEnds`]) — Land's landings and quiet ends, Cruise's dones past
-//! the work floor — and the time from Land to landed, one log₂ sample per
-//! landing whose Land start the book saw ([`AbBook::end`]). That start is
+//! down ([`AbEnds`]) — Land's landings, the one end under FOREVER CRUISE /
+//! FOREVER LAND (Cruise ends nothing, Land is never quiet) — and the time
+//! from Land to landed, one log₂ sample per landing whose Land start the book
+//! saw ([`AbBook::landed`]). That start is
 //! kept per session apart from the open stretch ([`AbTask`]), so a word that
 //! counts in no phase (a wall) drops nothing of it. Kept the way every other
 //! number of the book is: a seamless update loses the part since the last
@@ -43,7 +45,8 @@ use std::collections::HashMap;
 
 use crate::autopilot::AutopilotView;
 use crate::harness_glass::Stamp;
-use crate::harness_screen::{JOINT, duration_words, local_midnight_ms, share_words};
+use crate::harness_screen::{duration_words, local_midnight_ms, share_words};
+use crate::native_ui::FACT_SEPARATOR;
 
 /// The local days the ring keeps: today and the seven before, so the day
 /// that just left the page's week is still there while the next one opens.
@@ -181,30 +184,29 @@ impl AbPhase {
 /// can say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AbCause {
-    /// The agent said it was finished: the task's face is `done` or
-    /// `landed` (§9.4.2).
-    Finished,
+    /// Under Land, the work landed: the task's face is `landed` (§9.4.2).
+    Landed,
     /// The harness's own pause after short turns (§10.5.1).
     Pausing,
 }
 
 impl AbCause {
     /// The cause of a stretch in `phase` under `arm`, from the session's
-    /// glass: whether its face says finished, and whether a pause stands.
-    /// Cruise and Land at the prompt only; finished first (an agent done
-    /// with its work is not waiting on the pause).
+    /// glass: whether its face says landed, and whether a pause stands.
+    /// Cruise and Land at the prompt only; landed first and under Land alone
+    /// (a landed agent is not waiting on the pause, and Cruise never lands).
     #[must_use]
     pub(crate) fn of(
         arm: AbArm,
         phase: Option<AbPhase>,
-        finished: bool,
+        landed: bool,
         pausing: bool,
     ) -> Option<Self> {
         if phase != Some(AbPhase::AtPrompt) || !matches!(arm, AbArm::Cruise | AbArm::Land) {
             return None;
         }
-        if finished {
-            Some(Self::Finished)
+        if landed && arm == AbArm::Land {
+            Some(Self::Landed)
         } else if pausing {
             Some(Self::Pausing)
         } else {
@@ -224,8 +226,9 @@ pub(crate) struct AbArmTotals {
     pub(crate) asked_ms: u64,
     /// At its prompt.
     pub(crate) at_prompt_ms: u64,
-    /// Of `at_prompt_ms`, after the agent said it was finished.
-    pub(crate) finished_ms: u64,
+    /// Of `at_prompt_ms`, after the work landed (Land alone; a day an older
+    /// build kept holds its finished time here).
+    pub(crate) landed_ms: u64,
     /// Of `at_prompt_ms`, the harness pausing after short turns.
     pub(crate) pausing_ms: u64,
 }
@@ -262,7 +265,7 @@ impl AbArmTotals {
         };
         *bucket = bucket.saturating_add(ms);
         let of_prompt = match cause {
-            Some(AbCause::Finished) => &mut self.finished_ms,
+            Some(AbCause::Landed) => &mut self.landed_ms,
             Some(AbCause::Pausing) => &mut self.pausing_ms,
             None => return,
         };
@@ -274,39 +277,21 @@ impl AbArmTotals {
         self.at_box_ms = self.at_box_ms.saturating_add(other.at_box_ms);
         self.asked_ms = self.asked_ms.saturating_add(other.asked_ms);
         self.at_prompt_ms = self.at_prompt_ms.saturating_add(other.at_prompt_ms);
-        self.finished_ms = self.finished_ms.saturating_add(other.finished_ms);
+        self.landed_ms = self.landed_ms.saturating_add(other.landed_ms);
         self.pausing_ms = self.pausing_ms.saturating_add(other.pausing_ms);
     }
 }
 
-/// One kind of task end the book counts ([`AbBook::end`], [`AbEnds`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum AbEnd {
-    /// Cruise's done past the work floor (`harness_task::END_WORK_MS`): the
-    /// one end (§11.2.3, item 1), which slice 2a's `App::note_harness_end`
-    /// counts. Nothing counts it before that slice lands.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "slice 2a's `App::note_harness_end` counts it")
-    )]
-    Done,
-    /// A landing that landed under Land (`harness_task::is_an_end`).
-    Landed,
-    /// A landing spent with no done reply under Land: quiet.
-    Quiet,
-}
-
-/// THE ENDS ONE DAY COUNTED (§11.6.3, item 4): each kind of end
-/// ([`AbEnd`]), and the time from Land to landed as a hold's is kept, one
-/// sample per landing whose Land start the book saw, in [`bucket`]s.
+/// THE ENDS ONE DAY COUNTED (§11.6.3, item 4): Land's landings
+/// ([`AbBook::landed`]), and the time from Land to landed as a hold's is
+/// kept, one sample per landing whose Land start the book saw, in
+/// [`bucket`]s. (An older build also counted Cruise's dones and Land's quiet
+/// ends; FOREVER CRUISE / FOREVER LAND has neither, and their counts in an
+/// older day file are passed over.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct AbEnds {
-    /// Cruise's dones past the work floor ([`AbEnd::Done`]).
-    pub(crate) done: u32,
-    /// Land's landings ([`AbEnd::Landed`]).
+    /// Land's landings.
     pub(crate) landed: u32,
-    /// Land's quiet ends ([`AbEnd::Quiet`]).
-    pub(crate) quiet: u32,
     /// The time from Land to landed.
     pub(crate) landing: Hist,
 }
@@ -314,9 +299,7 @@ pub(crate) struct AbEnds {
 impl AbEnds {
     /// Another day's ends added to these.
     pub(crate) fn plus(&mut self, other: &Self) {
-        self.done = self.done.saturating_add(other.done);
         self.landed = self.landed.saturating_add(other.landed);
-        self.quiet = self.quiet.saturating_add(other.quiet);
         for (count, add) in self.landing.iter_mut().zip(other.landing) {
             *count = count.saturating_add(add);
         }
@@ -623,12 +606,28 @@ struct AbClock {
     hold: Option<(u64, AbArm)>,
 }
 
+impl AbClock {
+    /// Whether this stretch is THE TASK'S WORK (§11.2.3, item 2): the
+    /// agent busy under any arm but [`AbArm::Off`]. Off's work is the
+    /// person's — no loop watched it (§11.2.4) — so a session set Off, worked
+    /// by hand to a done, then set to Cruise again, whose loop restates open
+    /// from unknown and reads that done at its first point, arms no end and
+    /// no Cruise count. A stretch with no claim of this host's under a
+    /// supervised word ([`AbArm::Unsupervised`]: the agent not yet attached,
+    /// a loop between its runs, a successor before its loop claims) is still
+    /// the harness's task, and counts.
+    const fn is_task_work(&self) -> bool {
+        matches!(self.phase, AbPhase::Busy) && !matches!(self.arm, AbArm::Off)
+    }
+}
+
 /// ONE SESSION'S TASK as the book follows it (§11.2.3, item 2; §11.6.3,
 /// item 4), kept APART from its [`AbClock`]: `observe(…, None, …)` drops a
 /// session's clock at any word that counts in no phase — a wall's among
-/// them — and a landing's start must outlive that. Made where the book
-/// first reads the session's mode ([`AbBook::follow_mode`]); only
-/// [`AbBook::retire`] drops it.
+/// them — and a landing's start and a task's work must outlive that. Made
+/// where the book first reads the session's mode ([`AbBook::follow_mode`]),
+/// charges its busy time or hears its task open, whichever comes first;
+/// only [`AbBook::retire`] drops it.
 ///
 /// It follows the session's MODE — its Autopilot word, else the table's
 /// default — never its [`AbArm`]: the arm is Land only under this host's
@@ -637,14 +636,19 @@ struct AbClock {
 /// would move the arm into Land with no word moved, and start the time from
 /// Land to landed where nobody said Land.
 ///
-/// Slice 2a adds the work since the task opened (`worked_ms`, `from_ms`) and
-/// `task_opened`, which sets `land_from` again where a task opens under
-/// Land; until then a second landing in one Land stretch is counted with no
-/// span.
+/// It also keeps THE WORK SINCE THE TASK OPENED (§11.2.3, item 2): the
+/// agent's busy time under any arm but Off ([`AbClock::is_task_work`])
+/// charged after [`Self::from_ms`], added wherever the
+/// book charges a busy piece ([`AbBook::observe`], and
+/// [`AbBook::set_calendar`]'s split, so a calendar read mid-stretch loses
+/// nothing), read by [`AbBook::worked`] and zeroed by
+/// [`AbBook::task_opened`] — the work floor of the one end
+/// (`harness_task::is_a_task_end`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AbTask {
-    /// Whether the session's mode was Land when the book last read it.
-    lands: bool,
+    /// Whether the session's mode was Land when the book last read it;
+    /// `None` until the book first reads it ([`AbBook::follow_mode`]).
+    lands: Option<bool>,
     /// The ledger instant the session's mode moved into Land, as the book
     /// read it move: where the time from Land to landed starts. Carried
     /// while the mode stays Land, whatever the claim does; cleared where it
@@ -653,39 +657,57 @@ pub(crate) struct AbTask {
     /// process, or before the book read it): its landing counts, with no
     /// span.
     land_from: Option<u64>,
-    /// The day this book counted the session's last quiet end on, while
-    /// that landing may still land after all ([`AbBook::quiet_landed`]):
-    /// cleared by a landing and where the mode leaves Land.
-    quiet_day: Option<i64>,
+    /// The agent's busy time charged since [`Self::from_ms`], ledger ms.
+    worked_ms: u64,
+    /// The ledger instant the task opened ([`AbBook::task_opened`]); 0 for
+    /// a session no move from a known face has opened a task in yet (its
+    /// first task, a seamless update's successor, a cold restore): every
+    /// busy piece the book saw counts.
+    from_ms: u64,
 }
 
 impl AbTask {
-    /// The task of a session whose mode the book first reads (`lands`: Land).
-    const fn first_read(lands: bool) -> Self {
+    /// The task of a session the book has just begun to follow: no mode
+    /// read, no work, open since the book first saw it.
+    const fn new() -> Self {
         Self {
-            lands,
+            lands: None,
             land_from: None,
-            quiet_day: None,
+            worked_ms: 0,
+            from_ms: 0,
         }
     }
 
-    /// The session's mode is Land (`lands`) or not, read at `at_ms`.
+    /// The session's mode is Land (`lands`) or not, read at `at_ms`. A mode
+    /// first read as Land has no start.
     fn mode(&mut self, lands: bool, at_ms: u64) {
         self.land_from = match (self.lands, lands) {
-            (true, true) => self.land_from,
-            (false, true) => Some(at_ms),
-            (_, false) => None,
+            (Some(true), true) => self.land_from,
+            (Some(false), true) => Some(at_ms),
+            (None, true) | (_, false) => None,
         };
-        if !lands {
-            self.quiet_day = None;
-        }
-        self.lands = lands;
+        self.lands = Some(lands);
+    }
+
+    /// The session's mode is Land (`lands`) or not as CARRIED from before
+    /// this process ([`AbBook::carry_mode`]): read as a first read is, with
+    /// no start; the work is kept.
+    const fn carried(&mut self, lands: bool) {
+        self.lands = Some(lands);
+        self.land_from = None;
+    }
+
+    /// A busy piece `from..to` was charged: its part after the task opened
+    /// is the task's work.
+    fn worked(&mut self, from: u64, to: u64) {
+        let ms = to.saturating_sub(from.max(self.from_ms));
+        self.worked_ms = self.worked_ms.saturating_add(ms);
     }
 }
 
 /// THE A/B BOOK: each session's open stretch and its task, the ring of days
 /// and the calendar. Fed at each change ([`Self::observe`]), at a task's end
-/// ([`Self::end`]) and at a session's end ([`Self::retire`]); read with the
+/// ([`Self::landed`]) and at a session's end ([`Self::retire`]); read with the
 /// open stretches counted up to a given instant ([`Self::ring_at`],
 /// [`Self::week_at`]). Every instant is on the ledger clock.
 #[derive(Debug, Default)]
@@ -712,11 +734,13 @@ impl AbBook {
     /// to the read's instant under the calendar it ran under, and goes on
     /// from there under the new one — so a sleep that crossed a midnight
     /// leaves the time before it in the day it was spent, and a clock set
-    /// back charges no negative (ledger instants only ever grow).
+    /// back charges no negative (ledger instants only ever grow). A busy
+    /// piece charged here is its task's work too ([`AbTask`]), since the
+    /// stretch goes on from the read.
     pub(crate) fn set_calendar(&mut self, calendar: AbCalendar) {
         let at = calendar.ledger_ms;
         if let Some(old) = self.calendar.as_mut() {
-            for open in self.clocks.values_mut() {
+            for (session, open) in &mut self.clocks {
                 if at > open.since_ms {
                     charge(
                         &mut self.ring,
@@ -725,6 +749,12 @@ impl AbBook {
                         open.since_ms,
                         at,
                     );
+                    if open.is_task_work() {
+                        self.tasks
+                            .entry(*session)
+                            .or_insert_with(AbTask::new)
+                            .worked(open.since_ms, at);
+                    }
                     open.since_ms = at;
                 }
             }
@@ -756,6 +786,15 @@ impl AbBook {
         let at_ms = open.map_or(at_ms, |open| at_ms.max(open.since_ms));
         let mut hold = None;
         if let Some(open) = open {
+            // The task's work: the busy piece's part after the task opened,
+            // kept apart from the clock, so the word that drops the clock (a
+            // wall's) keeps it; never under Off (`AbClock::is_task_work`).
+            if open.is_task_work() {
+                self.tasks
+                    .entry(session)
+                    .or_insert_with(AbTask::new)
+                    .worked(open.since_ms, at_ms);
+            }
             let goes_on = phase == Some(open.phase);
             if let Some(calendar) = self.calendar.as_mut() {
                 charge(
@@ -813,8 +852,62 @@ impl AbBook {
     pub(crate) fn follow_mode(&mut self, session: u64, lands: bool, at_ms: u64) {
         self.tasks
             .entry(session)
-            .and_modify(|task| task.mode(lands, at_ms))
-            .or_insert_with(|| AbTask::first_read(lands));
+            .or_insert_with(AbTask::new)
+            .mode(lands, at_ms);
+    }
+
+    /// THE WORK SINCE SESSION `session`'S TASK OPENED, at `now_ms`
+    /// (§11.2.3, item 2): the busy time charged after the task opened, and a
+    /// busy stretch still open counted up to `now_ms` (its part after the
+    /// opening) — never Off's ([`AbClock::is_task_work`]). 0 for a session
+    /// the book never charged.
+    #[must_use]
+    pub(crate) fn worked(&self, session: u64, now_ms: u64) -> u64 {
+        let Some(task) = self.tasks.get(&session) else {
+            return 0;
+        };
+        let open = self
+            .clocks
+            .get(&session)
+            .filter(|open| open.is_task_work())
+            .map_or(0, |open| {
+                now_ms.saturating_sub(open.since_ms.max(task.from_ms))
+            });
+        task.worked_ms.saturating_add(open)
+    }
+
+    /// SESSION `session`'S TASK OPENED at `at_ms` (§11.2.3, item 2): its
+    /// face moved from a known face to open, done or landed
+    /// (`App::apply_task_face`; at an end, after the end has read the sum).
+    /// The work is zeroed and counts only what is charged after `at_ms` —
+    /// the CLIP: a reply whose busy time ran before the move that opened the
+    /// task (the done seed's withdrawal, `open` then `done` at one point)
+    /// counts none of it. Under Land the time from Land to landed starts
+    /// here again (§11.6.3, item 4), so the next landing of one Land
+    /// stretch is timed from its own task, not from the mode's move.
+    pub(crate) fn task_opened(&mut self, session: u64, at_ms: u64) {
+        let task = self.tasks.entry(session).or_insert_with(AbTask::new);
+        task.worked_ms = 0;
+        task.from_ms = at_ms;
+        if task.lands == Some(true) {
+            task.land_from = Some(at_ms);
+        }
+    }
+
+    /// SESSION `session`'S TASK WORK CARRIED across a seamless update
+    /// (§11.2.3, items 2 and 8; the review's R12): `worked_ms`, the busy time
+    /// the outgoing process's book had charged since the task opened
+    /// (`SessionRecord::autopilot_end`, spent by `App::adopt_end_carry`), is
+    /// added to what this book has charged of the session since — a task 25
+    /// s into its work before the update needs 5 s more after it, as across
+    /// a loop's restart, which zeroes nothing either. Only where no task has
+    /// opened in this process yet ([`AbTask::from_ms`] 0): the carried work
+    /// is that task's, and a task opened here since is another.
+    pub(crate) fn carry_work(&mut self, session: u64, worked_ms: u64) {
+        let task = self.tasks.entry(session).or_insert_with(AbTask::new);
+        if task.from_ms == 0 {
+            task.worked_ms = task.worked_ms.saturating_add(worked_ms);
+        }
     }
 
     /// SESSION `session`'S MODE WAS CARRIED from before this process (a
@@ -822,26 +915,26 @@ impl AbBook {
     /// shell the book may have read under the default first): it is read as
     /// Land (`lands`) or not with NO move, as a first read is — a landing it
     /// carries began before this process (§11.6.4 "Before this process").
+    /// The task's work since it opened (§11.2.3 item 2) is the task's, not
+    /// the mode's: a carried word moves no task, so its sum is kept.
     pub(crate) fn carry_mode(&mut self, session: u64, lands: bool) {
-        self.tasks.insert(session, AbTask::first_read(lands));
+        self.tasks
+            .entry(session)
+            .or_insert_with(AbTask::new)
+            .carried(lands);
     }
 
-    /// SESSION `session`'S TASK CAME DOWN at `at_ms` (§11.6.3, item 4): one
-    /// count of `end` in the day `at_ms` falls on, as a hold's sample is
-    /// placed; and where it LANDED with a Land start the book read
-    /// ([`AbTask`]), one sample of the time from Land to landed, the start
-    /// spent. The caller decides that it is an end, once
-    /// (`harness_task::is_an_end`, the records' own rule). Nothing is
-    /// counted before the calendar is read.
-    pub(crate) fn end(&mut self, session: u64, end: AbEnd, at_ms: u64) {
-        let task = self.tasks.get_mut(&session);
-        let span = match (end, task) {
-            (AbEnd::Landed, Some(task)) => {
-                task.quiet_day = None;
-                task.land_from.take()
-            }
-            _ => None,
-        };
+    /// SESSION `session`'S TASK LANDED at `at_ms` (§11.6.3, item 4): one
+    /// landing counted in the day `at_ms` falls on, as a hold's sample is
+    /// placed; and where the book read its Land start ([`AbTask`]), one
+    /// sample of the time from Land to landed, the start spent. The caller
+    /// decides that it is an end, once (`harness_task::is_an_end`, the
+    /// records' own rule). Nothing is counted before the calendar is read.
+    pub(crate) fn landed(&mut self, session: u64, at_ms: u64) {
+        let span = self
+            .tasks
+            .get_mut(&session)
+            .and_then(|task| task.land_from.take());
         let Some(calendar) = self.calendar.as_mut() else {
             return;
         };
@@ -850,41 +943,12 @@ impl AbBook {
         let Some(kept) = slot(&mut self.ring, day, first, calendar.today) else {
             return;
         };
-        if let (AbEnd::Quiet, Some(task)) = (end, self.tasks.get_mut(&session)) {
-            task.quiet_day = Some(day);
-        }
         let ends = &mut kept.ends;
-        let count = match end {
-            AbEnd::Done => &mut ends.done,
-            AbEnd::Landed => &mut ends.landed,
-            AbEnd::Quiet => &mut ends.quiet,
-        };
-        *count = count.saturating_add(1);
+        ends.landed = ends.landed.saturating_add(1);
         if let Some(from) = span {
             let sample = &mut ends.landing[bucket(at_ms.saturating_sub(from))];
             *sample = sample.saturating_add(1);
         }
-    }
-
-    /// SESSION `session`'S QUIET LANDING LANDED AFTER ALL at `at_ms` (its
-    /// face moved spent → landed: a question's land answer, whose done reply
-    /// ends the quiet): ONE task's end, not two. The quiet end this book
-    /// counted for it ([`AbTask::quiet_day`]) is taken back from its day,
-    /// where the ring still keeps that day, and the landing is counted
-    /// ([`Self::end`]). A quiet end another process counted (a relaunch
-    /// between the two) stays in that process's book.
-    pub(crate) fn quiet_landed(&mut self, session: u64, at_ms: u64) {
-        let quiet_day = self
-            .tasks
-            .get_mut(&session)
-            .and_then(|task| task.quiet_day.take());
-        if let Some(day) = quiet_day {
-            let at = usize::try_from(day.rem_euclid(DAYS as i64)).unwrap_or(0);
-            if let Some(kept) = self.ring[at].as_mut().filter(|kept| kept.day == day) {
-                kept.ends.quiet = kept.ends.quiet.saturating_sub(1);
-            }
-        }
-        self.end(session, AbEnd::Landed, at_ms);
     }
 
     /// Where session `session`'s time from Land to landed starts, if the
@@ -1082,7 +1146,11 @@ impl AbLead {
     pub(crate) fn words(&self) -> String {
         match self {
             Self::Both { cruise, off } => {
-                format!("{LEAD_CAPTION}: {}{JOINT}{}", cruise.words(), off.words())
+                format!(
+                    "{LEAD_CAPTION}: {}{FACT_SEPARATOR}{}",
+                    cruise.words(),
+                    off.words()
+                )
             }
             Self::NoOff => LEAD_NOTE.to_string(),
         }
@@ -1212,9 +1280,9 @@ fn held_words(week: &AbWeek) -> String {
 }
 
 /// The At its prompt row: how much of Cruise's and Off's time the agent
-/// sat at its prompt, and for Cruise how much of its time came after the
-/// agent said it was finished and how much was the harness's pause — each
-/// a share of the arm's whole time.
+/// sat at its prompt, and for Cruise how much was the harness's pause — a
+/// share of the arm's whole time (Cruise never lands, so it has no landed
+/// share).
 fn prompt_words(week: &AbWeek) -> String {
     let mut parts = Vec::new();
     for (arm, label) in [(AbArm::Cruise, "Cruise"), (AbArm::Off, "Off")] {
@@ -1230,8 +1298,7 @@ fn prompt_words(week: &AbWeek) -> String {
         );
         if arm == AbArm::Cruise {
             words.push_str(&format!(
-                ": finished {}, pausing {}",
-                share_words(t.finished_ms, measured),
+                ": pausing {}",
                 share_words(t.pausing_ms, measured)
             ));
         }
@@ -1240,11 +1307,11 @@ fn prompt_words(week: &AbWeek) -> String {
     if parts.is_empty() {
         "not measured yet".to_string()
     } else {
-        parts.join(" \u{b7} ")
+        parts.join(FACT_SEPARATOR)
     }
 }
 
-/// Land's own row: held, at its prompt and finished as shares of its time
+/// Land's own row: held, at its prompt and landed as shares of its time
 /// (pausing where it paused), and its boxes' median. Never set beside
 /// Cruise.
 fn land_words(week: &AbWeek) -> String {
@@ -1254,10 +1321,10 @@ fn land_words(week: &AbWeek) -> String {
         return "not measured yet".to_string();
     }
     let mut words = format!(
-        "held {} \u{b7} at its prompt {}, finished {}",
+        "held {} \u{b7} at its prompt {}, landed {}",
         share_words(t.held_ms(), measured),
         share_words(t.at_prompt_ms, measured),
-        share_words(t.finished_ms, measured)
+        share_words(t.landed_ms, measured)
     );
     if t.pausing_ms > 0 {
         words.push_str(&format!(
@@ -1275,37 +1342,17 @@ fn land_words(week: &AbWeek) -> String {
     words
 }
 
-/// A count of times as words: `once`, else `6 times`.
-fn times_words(n: u32) -> String {
-    if n == 1 {
-        "once".to_string()
-    } else {
-        format!("{n} times")
-    }
-}
-
-/// THE ENDS ROW (§11.6.1): its three parts, each only where it counted
-/// anything — Cruise's dones with the work floor's words (only ends past
-/// it count), Land's landings and quiet ends, and the median time from
-/// Land to landed with its n (`Land to landed: about 6m (5)`; `Land to
-/// landed: not enough yet (2)` under [`ENOUGH`]) — `None` with nothing to
-/// count (the row then reads `none yet`, [`ab_rows`]). No Off side: Off has
-/// no done reader.
+/// THE ENDS ROW (§11.6.1): its two parts, each only where it counted
+/// anything — Land's landings, and the median time from Land to landed with
+/// its n (`Land to landed: about 6m (5)`; `Land to landed: not enough yet
+/// (2)` under [`ENOUGH`]) — `None` with nothing to count (the row then reads
+/// `none yet`, [`ab_rows`]). No Cruise or Off side: under FOREVER CRUISE /
+/// FOREVER LAND a landing is the one end.
 #[must_use]
 pub(crate) fn ends_words(ends: &AbEnds) -> Option<String> {
     let mut parts = Vec::new();
-    if ends.done > 0 {
-        parts.push(format!(
-            "Cruise said done {} ({} s of work or more)",
-            times_words(ends.done),
-            crate::harness_task::END_WORK_MS / 1_000
-        ));
-    }
-    match (ends.landed, ends.quiet) {
-        (0, 0) => {}
-        (landed, 0) => parts.push(format!("Land landed {landed}")),
-        (0, quiet) => parts.push(format!("Land quiet {quiet}")),
-        (landed, quiet) => parts.push(format!("Land landed {landed}, quiet {quiet}")),
+    if ends.landed > 0 {
+        parts.push(format!("Land landed {}", ends.landed));
     }
     match median(&ends.landing) {
         (_, 0) => {}
@@ -1314,7 +1361,7 @@ pub(crate) fn ends_words(ends: &AbEnds) -> Option<String> {
         }
         (_, n) => parts.push(format!("Land to landed: not enough yet ({n})")),
     }
-    (!parts.is_empty()).then(|| parts.join(JOINT))
+    (!parts.is_empty()).then(|| parts.join(FACT_SEPARATOR))
 }
 
 /// The Measured row: how many local days the week holds, since when, and
@@ -1341,3 +1388,7 @@ fn measured_words(week: &AbWeek, today: i64) -> String {
 #[cfg(test)]
 #[path = "harness_ab_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "harness_ab_work_tests.rs"]
+mod work_tests;

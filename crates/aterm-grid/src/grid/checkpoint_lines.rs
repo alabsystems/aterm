@@ -126,6 +126,58 @@ impl Grid {
             }
         }
     }
+
+    /// A copy of this grid that later output and resizes treat as they treat
+    /// this one, for a replay forked mid-recording (`Terminal::replay_fork` in
+    /// aterm-core): every history line, pushed through the scroll path output
+    /// takes into a ring with this grid's cap, then the live frame (not a
+    /// scrolled viewport), the cursor state (position, pending wrap, DECSC slot,
+    /// scroll region, margins, tab stops, BCE template) and the absolute row
+    /// numbering.
+    ///
+    /// `None` for a grid whose state a copy cannot hold exactly: a tiered
+    /// history store (its tiers, budgets and limit split), one out with an
+    /// off-thread reflow, an open resize undo, or a resize hand-back still
+    /// standing (rows only this grid can hand back to a grow). The fork keeps
+    /// this grid's resize law.
+    #[must_use]
+    pub fn replay_fork(&self) -> Option<Grid> {
+        let storage = &self.storage;
+        if storage.scrollback.is_some()
+            || storage.scrollback_detached_for_reflow
+            || storage.resize_undo.is_some()
+            || !self.handback_idle()
+        {
+            return None;
+        }
+        let (rows, cols) = (self.rows(), self.cols());
+        let lines = self.checkpoint_lines_bounded(usize::MAX);
+        let (history, visible) = lines.split_at(lines.len().saturating_sub(usize::from(rows)));
+        let mut fork = Grid::with_scrollback(rows, cols, storage.max_scrollback);
+        // Each line enters history as output scrolls a row off the top: the
+        // ring holds what this one holds, under the same cap.
+        for line in history {
+            fork.fill_row_from_line(0, line, cols);
+            fork.scroll_up(1);
+        }
+        fork.restore_visible_from_lines(visible);
+        let from = &storage.cursor_state;
+        let to = &mut fork.storage.cursor_state;
+        to.cursor = from.cursor;
+        to.saved_cursor = from.saved_cursor;
+        to.scroll_region = from.scroll_region;
+        to.horizontal_margins = from.horizontal_margins;
+        to.tab_stops.clone_from(&from.tab_stops);
+        to.tab_defaults_suppressed = from.tab_defaults_suppressed;
+        to.pending_wrap = from.pending_wrap;
+        to.cursor_template = from.cursor_template;
+        to.cursor_template_bg_rgb = from.cursor_template_bg_rgb;
+        fork.storage.has_horizontal_margins = storage.has_horizontal_margins;
+        fork.storage.any_double_width = storage.any_double_width;
+        fork.storage.resize_law = storage.resize_law;
+        fork.continue_absolute_numbering(self.absolute_row_counter());
+        Some(fork)
+    }
 }
 
 #[cfg(test)]

@@ -396,27 +396,23 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
         "{answer}"
     );
 
-    let logged = std::fs::read_to_string(&log).unwrap();
-    assert!(logged.contains("stub listening on 127.0.0.1:"), "{logged}");
-    assert!(logged.contains("MODE -> ok (from file)"), "{logged}");
-    assert!(
-        logged.contains("POST /v1/messages -> 200 body="),
-        "{logged}"
-    );
-    assert!(logged.contains(" kind=main model=claude-x stream=true max_tokens=32000 msgs=1 tools=1 sys=0c last_user=\"hi\" sse="), "{logged}");
-    assert!(logged.contains("POST /v1/messages -> 529"), "{logged}");
-    assert!(logged.contains(" RL200[5h-utilization=0.4000]"), "{logged}");
-    assert!(logged.contains(" RL200[5h-utilization=0.4200]"), "{logged}");
-    assert!(logged.contains("limit:five_hour resets in "), "{logged}");
-    assert!(logged.contains("limit lifted (reset passed)"), "{logged}");
-    assert!(
-        logged.contains("POST /nope -> 404 body=0B mode="),
-        "{logged}"
-    );
-    assert!(
-        logged.contains("PROXY refused: CONNECT api.anthropic.com:443 HTTP/1.1"),
-        "{logged}"
-    );
+    let want = [
+        "stub listening on 127.0.0.1:",
+        "MODE -> ok (from file)",
+        "POST /v1/messages -> 200 body=",
+        " kind=main model=claude-x stream=true max_tokens=32000 msgs=1 tools=1 sys=0c last_user=\"hi\" sse=",
+        "POST /v1/messages -> 529",
+        " RL200[5h-utilization=0.4000]",
+        " RL200[5h-utilization=0.4200]",
+        "limit:five_hour resets in ",
+        "limit lifted (reset passed)",
+        "POST /nope -> 404 body=0B mode=",
+        "PROXY refused: CONNECT api.anthropic.com:443 HTTP/1.1",
+    ];
+    let logged = logged_with(&log, &want, Duration::from_secs(60));
+    for w in want {
+        assert!(logged.contains(w), "{w:?} is not in the log:\n{logged}");
+    }
     assert!(dir.join("dump/req-00001.json").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -653,25 +649,19 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
     assert_eq!(post("/v1/responses", turn, "").status(), 200);
     control(&port, "/__note?t=auth.json%20now%20holds%20B").unwrap();
 
-    let logged = std::fs::read_to_string(&log).unwrap();
-    assert!(
-        logged.contains("POST /v1/responses -> 200 body="),
-        "{logged}"
-    );
-    assert!(logged.contains(" kind=codex auth=key model=gpt-x stream=true items=1 tools=0 instructions=0c last_user=\"hi\" sse="), "{logged}");
-    assert!(
-        logged.contains("limit:seven_day resets in ") && logged.contains(" plan=team"),
-        "{logged}"
-    );
-    assert!(
-        logged.contains("kind=usage auth=jwt:A primary=76 secondary=None credits=True"),
-        "{logged}"
-    );
-    assert!(
-        logged.contains("kind=refresh auth=none (refresh.json)"),
-        "{logged}"
-    );
-    assert!(logged.contains("NOTE auth.json now holds B"), "{logged}");
+    let want = [
+        "POST /v1/responses -> 200 body=",
+        " kind=codex auth=key model=gpt-x stream=true items=1 tools=0 instructions=0c last_user=\"hi\" sse=",
+        "limit:seven_day resets in ",
+        " plan=team",
+        "kind=usage auth=jwt:A primary=76 secondary=None credits=True",
+        "kind=refresh auth=none (refresh.json)",
+        "NOTE auth.json now holds B",
+    ];
+    let logged = logged_with(&log, &want, Duration::from_secs(60));
+    for w in want {
+        assert!(logged.contains(w), "{w:?} is not in the log:\n{logged}");
+    }
     assert!(
         !logged.contains("lab-refresh-A") && !logged.contains(&jwt),
         "no token is ever logged"
@@ -726,14 +716,14 @@ fn served_on_loopback_the_account_routes_answer_from_the_account_file() {
     assert_eq!(get(&port, "/api/claude_cli_profile", None).0, 404);
     assert_eq!(get(&port, "/api/claude_cli/bootstrap", None).0, 404);
 
-    let text = std::fs::read_to_string(&log).unwrap();
-    assert!(text.contains(
-        "GET /api/oauth/usage -> 200 body=0B mode=ok kind=account route=usage read=at_wall auth=oat served=yes"
-    ), "{text}");
-    assert!(
-        text.contains("route=cli-profile auth=none served=none"),
-        "{text}"
-    );
+    let want = [
+        "GET /api/oauth/usage -> 200 body=0B mode=ok kind=account route=usage read=at_wall auth=oat served=yes",
+        "route=cli-profile auth=none served=none",
+    ];
+    let text = logged_with(&log, &want, Duration::from_secs(60));
+    for w in want {
+        assert!(text.contains(w), "{w:?} is not in the log:\n{text}");
+    }
     assert!(!text.contains(&oat), "the token is never logged");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1145,52 +1135,22 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
         .unwrap();
     assert_eq!(both.status(), 200);
 
-    // The stub writes a request's line once its answer is sent, so the last answer reaches this client
-    // before its line reaches the log (one minute: a hang detector).
-    let logged = logged_with(
-        &log,
-        &[
-            "GET /v1beta/models -> 200 body=0B mode=ok kind=gemini-models auth=gemini-key\n",
-            "GET /v1beta/models/m -> 200 body=0B mode=ok kind=gemini-models auth=other(19 chars)\n",
-            " kind=gemini auth=gemini-key+other(19 chars) model=gemini-3.5-flash ",
-        ],
-        Duration::from_secs(60),
-    );
-    assert!(
-        logged.contains(
-            "GET /v1beta/models -> 200 body=0B mode=ok kind=gemini-models auth=gemini-key\n"
-        ),
-        "{logged}"
-    );
-    assert!(
-        logged.contains(
-            "GET /v1beta/models/m -> 200 body=0B mode=ok kind=gemini-models auth=other(19 chars)\n"
-        ),
-        "{logged}"
-    );
-    assert!(
-        logged.contains(" kind=gemini auth=gemini-key+other(19 chars) model=gemini-3.5-flash "),
-        "{logged}"
-    );
+    let want = [
+        "GET /v1beta/models -> 200 body=0B mode=ok kind=gemini-models auth=gemini-key\n",
+        "GET /v1beta/models/m -> 200 body=0B mode=ok kind=gemini-models auth=other(19 chars)\n",
+        " kind=gemini auth=gemini-key+other(19 chars) model=gemini-3.5-flash ",
+        ":streamGenerateContent -> 200 body=",
+        " kind=gemini auth=gemini-key model=gemini-3.5-flash stream=true contents=1 tools=1 sys=0c results=0 last_user=\"hi\" sse=",
+        "kind=gemini-json auth=gemini-key",
+        ":streamGenerateContent -> 429 ",
+        "tool:run_shell_command step 0",
+        "tool:done",
+    ];
+    let logged = logged_with(&log, &want, Duration::from_secs(60));
+    for w in want {
+        assert!(logged.contains(w), "{w:?} is not in the log:\n{logged}");
+    }
     assert!(!logged.contains("ya29"), "a token is never logged");
-    assert!(
-        logged.contains(":streamGenerateContent -> 200 body="),
-        "{logged}"
-    );
-    assert!(
-        logged.contains(" kind=gemini auth=gemini-key model=gemini-3.5-flash stream=true contents=1 tools=1 sys=0c results=0 last_user=\"hi\" sse="),
-        "{logged}"
-    );
-    assert!(
-        logged.contains("kind=gemini-json auth=gemini-key"),
-        "{logged}"
-    );
-    assert!(
-        logged.contains(":streamGenerateContent -> 429 "),
-        "{logged}"
-    );
-    assert!(logged.contains("tool:run_shell_command step 0"), "{logged}");
-    assert!(logged.contains("tool:done"), "{logged}");
     assert!(
         !logged.contains(gemini::LAB_GEMINI_KEY),
         "the key is never logged"
@@ -1245,4 +1205,45 @@ fn the_shared_wall_modes_answer_each_api_in_its_shape() {
             "{mode}"
         );
     }
+}
+
+/// REQUESTS IN FLIGHT TOGETHER ARE EACH DUMPED: a dump's index is taken as
+/// it is written, never from the request count `record` bumps once the
+/// reply's delay and pace are over — sixteen bodies dumped at once from
+/// sixteen threads are sixteen files, each its own body (measured
+/// 2026-10-20: a lab whose replies overlapped kept 27 dumps of 32
+/// requests). NEGATIVE CONTROL: none was recorded, so the count stands at
+/// zero throughout.
+#[test]
+fn requests_in_flight_together_are_each_dumped() {
+    let dir = std::env::temp_dir().join(format!("lab-stub-dumps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let stub = Stub::new(Args {
+        dump_dir: Some(dir.clone()),
+        ..Args::default()
+    });
+    let gate = Arc::new(std::sync::Barrier::new(16));
+    let threads: Vec<_> = (0..16)
+        .map(|i| {
+            let (stub, gate) = (Arc::clone(&stub), Arc::clone(&gate));
+            std::thread::spawn(move || {
+                gate.wait();
+                stub.dump(format!("body {i}").as_bytes());
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let mut bodies: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect();
+    bodies.sort();
+    let mut want: Vec<String> = (0..16).map(|i| format!("body {i}")).collect();
+    want.sort();
+    assert_eq!(bodies, want);
+    assert_eq!(stub.st().n_requests, 0, "the control");
+    let _ = std::fs::remove_dir_all(&dir);
 }

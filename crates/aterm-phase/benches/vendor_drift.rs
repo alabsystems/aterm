@@ -7,6 +7,7 @@
 
 use anchors::*;
 use aterm_phase::anchors;
+use aterm_phase::reset;
 use aterm_phase::wall::PHRASES;
 
 #[path = "../../aterm-conformance/benches/support/mod.rs"]
@@ -203,9 +204,8 @@ fn literal_anchors_are_in_the_store(program: &str, env: &str, table: &[Anchor]) 
 fn literal_anchors_in_build(path: &str, bytes: &[u8], table: &[Anchor]) -> Outcome {
     // AN ANCHOR IS OWED ONLY BY THE BUILDS IT WAS WRITTEN FOR: each carries
     // the version it was measured on (`since`), and a store holding an older
-    // build is not a build that lost it; one a later build no longer draws
-    // carries the last that does (`last`, [`Anchor::drawn_by`]). A version
-    // that cannot be read owes every anchor the newest build draws.
+    // build is not a build that lost it ([`Anchor::drawn_by`]). A version
+    // that cannot be read owes every anchor.
     let version = build_version(path);
     let (owed, other): (Vec<Anchor>, Vec<Anchor>) = table
         .iter()
@@ -290,9 +290,11 @@ fn every_rollout_key_is_in_the_store_codex() -> Outcome {
     outcome
 }
 
-/// The drift check for [`reset_templates`], admitted by [`store_binary`]
-/// and owed by build as the table's
-/// rows are ([`Anchor::drawn_by`]).
+/// The drift check for [`reset_templates`], admitted by [`store_binary`].
+/// NOT gated on the build's version: the readers read one build's wording,
+/// the store's (`aterm_phase::reset`'s module doc), so the store's build
+/// owes every template. NEGATIVE CONTROL: a template of a kind no build
+/// names is named missing.
 fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
     let Some((path, bytes)) = store_binary("claude", "ATERM_CLAUDE_BIN") else {
         return Outcome::CouldNotRun(
@@ -303,25 +305,27 @@ fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
         );
     };
     let version = build_version(&path);
-    if !reset_templates()
-        .iter()
-        .any(|template| template.spelled_by(version.as_deref()))
-    {
-        return Outcome::CouldNotRun(format!(
-            "{path} ({}): no reset templates apply to this build; no templates checked",
-            version.as_deref().unwrap_or("unknown version")
-        ));
-    }
-    let missing = missing_templates(&bytes, version.as_deref());
+    let templates = reset_templates();
+    let missing = missing_templates(&bytes, &templates);
     assert!(
         missing.is_empty(),
         "{path} ({}): {} reset templates not whole: {missing:?}",
         version.as_deref().unwrap_or("?"),
         missing.len()
     );
+    let planted = [(
+        "planted",
+        format!("{} planted-by-no-build reset?", anchor("reset.row")),
+    )];
+    assert_eq!(
+        missing_templates(&bytes, &planted),
+        ["planted"],
+        "{path}: the planted template"
+    );
     eprintln!(
-        "{path} ({}): every reset template is whole",
-        version.as_deref().unwrap_or("?")
+        "{path} ({}): every reset template is whole ({})",
+        version.as_deref().unwrap_or("?"),
+        templates.len()
     );
     Outcome::Pass(format!(
         "{path} ({}): reset templates checked",
@@ -339,8 +343,8 @@ fn every_literal_muse_anchor_is_in_the_store_muse() -> Outcome {
 fn every_literal_gemini_anchor_is_in_its_bundle() -> Outcome {
     let Some((dir, bytes, version)) = gemini_bin().as_deref().and_then(gemini_bundle) else {
         return Outcome::CouldNotRun(
-            "no Gemini CLI bundle (set ATERM_GEMINI_BIN to its `gemini`, or \
-             `brew install gemini-cli`); anchors not checked"
+            "no Gemini CLI bundle (set ATERM_GEMINI_BIN to its `gemini`; aterm installs \
+             none); anchors not checked"
                 .into(),
         );
     };

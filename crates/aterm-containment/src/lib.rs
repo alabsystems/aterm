@@ -65,10 +65,10 @@ pub use capability::{FsCapability, NetworkCapability, ProcessCapability};
 // The consent tier's types and OS entry points. Its pure helpers and `tccutil_presence`
 // stay under `consent::`, so generic names do not read as the crate's own.
 pub use consent::{
-    Attribution, ConsentKey, ConsentPosture, DevToolGrant, DevToolList, DevToolListLabel,
-    DevToolListing, DevToolProbe, DevToolProbeLabel, DevToolState, DrClass, FdaProbe, FdaScope,
-    FdaState, Folder, FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome,
-    ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible,
+    Attribution, ConsentPosture, DevToolGrant, DevToolList, DevToolListLabel, DevToolListing,
+    DevToolProbe, DevToolProbeLabel, DevToolState, DrClass, FdaProbe, FdaScope, FdaState, Folder,
+    FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome, ResetAttempt,
+    ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible,
     ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr,
     classify_image_anchor, devtool_grant, image_anchor, probe_devtool, probe_devtool_list,
     probe_fda, protected_roots, responsible_app, responsible_pid,

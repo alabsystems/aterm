@@ -208,7 +208,7 @@ mod tests {
                     total: 32 << 30,
                     app: 12 << 30,
                     wired: (4 << 30) + (700 << 20),
-                    compressed: 1 << 30,
+                    compressed: Some(1 << 30),
                     pressure: Pressure::Normal,
                     ..MemSample::default()
                 },

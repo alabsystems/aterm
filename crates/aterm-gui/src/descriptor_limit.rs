@@ -181,10 +181,28 @@ pub(crate) const ENV_PARK_RAISED_FROM: HandoffName =
 pub(crate) const ENV_LAUNCHER_NOFILE: HandoffName =
     HandoffName::new("ATERM_HANDOFF_LAUNCHER_NOFILE");
 
+/// v0.100.0's build (`RELEASES.ledger`; no v0.99.0 was cut): the first
+/// release that takes [`ENV_LAUNCHER_NOFILE`] out of its environment at its
+/// capture (06b06e74e). A build before it leaves the name in its `environ`, so
+/// every shell it opens inherits it.
+const TAKES_LAUNCHER_NOFILE_FROM_BUILD: u64 = 1_790_807_622;
+
+/// v0.101.0's build: the first release that takes [`ENV_PARK_RAISED_FROM`]
+/// out of its environment (ddaf83ae2f, after v0.100.0 was cut).
+const TAKES_PARK_RAISED_FROM_BUILD: u64 = 1_791_501_389;
+
 /// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps
 /// this process's soft descriptor limit — the fork lane's child and the cold
 /// lane's `exec` alike. Nothing when this process never raised its limit, so
 /// its shells already get what it runs at.
+///
+/// ONLY TO A TARGET THAT TAKES IT (ATERM-KI-1015-2, U1). A successor built
+/// before the name ([`TAKES_LAUNCHER_NOFILE_FROM_BUILD`]) never reads it and
+/// leaves it in its environment: every shell of a rollback to it carried the
+/// launcher's limit, and a newer aterm started from one adopted it as its own
+/// and handed every tab of its window that limit, whatever the shell ran at.
+/// Such a successor's shells get what it inherits, as before 06b06e74e; one
+/// built before [`ENV_PARK_RAISED_FROM`] is told the launcher's limit alone.
 ///
 /// THE COLD LANE OWES IT TOO (round eight of the update audit, #81): `execve`
 /// keeps the raised soft limit exactly as a fork does, and the new image's
@@ -196,13 +214,50 @@ pub(crate) const ENV_LAUNCHER_NOFILE: HandoffName =
 /// A PARK'S RAISE IS NAMED BESIDE IT (round eight's second review of #3,
 /// [`ENV_PARK_RAISED_FROM`]): the successor keeps that raise too, and must
 /// know it is one no successor inherited before round eight.
-pub(crate) fn carry_launcher_limit(command: &mut aterm_uds::spawnfd::StdCommand) {
+pub(crate) fn carry_launcher_limit(
+    command: &mut aterm_uds::spawnfd::StdCommand,
+    target_build: u64,
+) {
+    if target_build < TAKES_LAUNCHER_NOFILE_FROM_BUILD {
+        return;
+    }
     if let Some(soft) = launcher_soft_descriptor_limit() {
         command.envs([ENV_LAUNCHER_NOFILE.pair(soft.to_string())]);
+    }
+    if target_build < TAKES_PARK_RAISED_FROM_BUILD {
+        return;
     }
     if let Some(from) = park_raised_from() {
         command.envs([ENV_PARK_RAISED_FROM.pair(from.to_string())]);
     }
+}
+
+/// A CARRIED LIMIT IS AN UPDATE'S WORD TO ITS SUCCESSOR, AND NOTHING ELSE'S
+/// (ATERM-KI-1015-2, U1). Every lane that names [`ENV_LAUNCHER_NOFILE`] or
+/// [`ENV_PARK_RAISED_FROM`] — the fork lane's child, the cold lane's `exec` —
+/// names `ATERM_UPDATED_FROM` beside it (`update_launch`), and every build
+/// takes that one out of its environment before any shell. A copy on any
+/// other launch is a stray: a successor built before the name left it in its
+/// shells' environment (every release up to v0.99.0, handed it by a later
+/// release's rollback), and a window started from one of them adopted it and
+/// handed every tab that limit — 256 where the shell ran at 4096, so builds
+/// and servers there failed `EMFILE`.
+///
+/// Dropped from the snapshot here, right after the capture and before the
+/// boot apply, whose re-exec names `ATERM_UPDATED_FROM` itself and carries
+/// the snapshot on: dropped later, the stray would reach that image as an
+/// update's word.
+pub(crate) fn forget_stray_limits(env: &mut crate::handoff_env::HandoffEnv, update_launch: bool) {
+    if update_launch || !(env.present(ENV_LAUNCHER_NOFILE) || env.present(ENV_PARK_RAISED_FROM)) {
+        return;
+    }
+    env.remove(ENV_LAUNCHER_NOFILE);
+    env.remove(ENV_PARK_RAISED_FROM);
+    aterm_log::info!(
+        "descriptor limit: this launch is no update's, so the launcher's limit in its \
+         environment is a stray an older successor left in a shell; new shells get what this \
+         process runs at"
+    );
 }
 
 /// A carried launcher limit this process may adopt: a number, and never above
@@ -666,7 +721,7 @@ pub(crate) mod tests {
         // running exactly this test (its shells got the launcher's limit).
         let mut image = crate::test_alone::StandIn::this_test();
         image.command().env(NEW_IMAGE, "1");
-        carry_launcher_limit(image.command());
+        carry_launcher_limit(image.command(), TAKES_PARK_RAISED_FROM_BUILD);
         assert!(
             image
                 .command()
@@ -886,7 +941,7 @@ pub(crate) mod tests {
         // launchd's limit).
         let mut image = crate::test_alone::StandIn::this_test();
         image.command().env(NEW_IMAGE, "1");
-        carry_launcher_limit(image.command());
+        carry_launcher_limit(image.command(), TAKES_PARK_RAISED_FROM_BUILD);
         assert!(
             image
                 .command()
@@ -998,5 +1053,141 @@ pub(crate) mod tests {
             "room already held is not raised again"
         );
         assert_eq!(park_raised_from(), None, "and the record stays the claim's");
+    }
+
+    /// A STRAY LAUNCHER LIMIT IS NOBODY'S (ATERM-KI-1015-2, U1). A window
+    /// whose limit a park raised updates; its successor is a build that never
+    /// reads the names (every release up to v0.99.0, reached by a rollback,
+    /// played here by a stand-in that takes neither) and so leaves them in the
+    /// environment of every shell it opens, while it takes `ATERM_UPDATED_FROM`
+    /// out as every build does. A current window started from one of those
+    /// shells used to adopt the launcher's limit as its own and hand every tab
+    /// that limit, whatever the shell ran at. Driven through the steps
+    /// `main_entry` runs, in its order: the capture, the stray filter, the
+    /// settle — and the boot apply's re-exec, which names `ATERM_UPDATED_FROM`
+    /// itself and carries the snapshot on, must not carry the stray to the next
+    /// image as an update's word. CONTROL: the update's own successor, named
+    /// both beside `ATERM_UPDATED_FROM`, adopts them.
+    ///
+    /// RED before the fix: the window adopted the stray launcher's limit.
+    #[test]
+    fn only_an_updates_launch_adopts_a_carried_launcher_limit() {
+        const ROLE: &str = "ATERM_TEST_STRAY_LIMIT_ROLE";
+        const BUILD: u64 = 7;
+        /// `main_entry`'s steps for the limit, in its order.
+        fn launch() -> crate::handoff_env::HandoffEnv {
+            let mut env = crate::handoff_env::HandoffEnv::capture();
+            forget_stray_limits(&mut env, std::env::var_os("ATERM_UPDATED_FROM").is_some());
+            settle_incoming_descriptor_limit(&env);
+            env
+        }
+        match std::env::var(ROLE).as_deref() {
+            Ok("older successor") => {
+                // A window started from one of its shells: the names
+                // inherited, `ATERM_UPDATED_FROM` taken out.
+                let mut window = crate::test_alone::StandIn::this_test();
+                window
+                    .command()
+                    .env(ROLE, "window")
+                    .env_remove("ATERM_UPDATED_FROM");
+                window.spawn().passed();
+                // CONTROL: launched by the update, they are its word.
+                launch();
+                let launcher = launcher_soft_descriptor_limit().expect("the update's word");
+                assert!(launcher < soft_nofile(), "below the raise it inherited");
+                assert_eq!(park_raised_from(), Some(launcher));
+                return;
+            }
+            Ok("window") => {
+                let env = launch();
+                assert_eq!(
+                    launcher_soft_descriptor_limit(),
+                    None,
+                    "a window started from a shell takes no stray launcher limit"
+                );
+                assert_eq!(park_raised_from(), None, "nor a stray park's raise");
+                // Its boot apply's re-exec: the snapshot carried on, and
+                // `ATERM_UPDATED_FROM` named by the re-exec.
+                let mut reexec = crate::test_alone::StandIn::this_test();
+                reexec
+                    .command()
+                    .env(ROLE, "boot re-exec")
+                    .env("ATERM_UPDATED_FROM", BUILD.to_string())
+                    .envs(env.exec_env());
+                reexec.spawn().passed();
+                return;
+            }
+            Ok("boot re-exec") => {
+                launch();
+                assert_eq!(
+                    launcher_soft_descriptor_limit(),
+                    None,
+                    "the boot re-exec carries no stray on"
+                );
+                assert_eq!(park_raised_from(), None);
+                return;
+            }
+            _ => {}
+        }
+        if !crate::control_auth::enter_low_nofile_test_child(64) {
+            return;
+        }
+        raise_descriptor_limit_for_park(BUILD, BUILD);
+        assert!(park_raised_from().is_some(), "PRECONDITION: a park's raise");
+        let mut successor = crate::test_alone::StandIn::this_test();
+        successor
+            .command()
+            .env(ROLE, "older successor")
+            .env("ATERM_UPDATED_FROM", BUILD.to_string());
+        carry_launcher_limit(successor.command(), TAKES_PARK_RAISED_FROM_BUILD);
+        successor.spawn().passed();
+    }
+
+    /// ONLY A TARGET THAT TAKES THE NAMES IS TOLD THEM (ATERM-KI-1015-2, U1):
+    /// a successor built before a name leaves it in its shells' environment.
+    /// Toward v0.98.0 neither is named, toward v0.100.0 the launcher's limit
+    /// alone, and from v0.101.0 on both.
+    ///
+    /// RED before the fix: both lanes named both toward every target.
+    #[test]
+    fn only_a_target_that_takes_the_names_is_told_them() {
+        const V0_98_0: u64 = 1_790_607_299;
+        if !crate::control_auth::enter_low_nofile_test_child(64) {
+            return;
+        }
+        raise_descriptor_limit_for_park(7, 7);
+        let launchd = park_raised_from().expect("PRECONDITION: a park's raise");
+        assert_eq!(launcher_soft_descriptor_limit(), Some(launchd));
+        let told = |target_build: u64| -> Vec<&'static str> {
+            // std's Command on purpose: the shipped helper takes std's, and
+            // nothing is spawned.
+            let mut command = std::process::Command::new("/usr/bin/true");
+            carry_launcher_limit(&mut command, target_build);
+            [ENV_LAUNCHER_NOFILE, ENV_PARK_RAISED_FROM]
+                .into_iter()
+                .filter(|name| {
+                    command.get_envs().any(|(key, value)| {
+                        key == name.name()
+                            && value == Some(std::ffi::OsStr::new(&launchd.to_string()))
+                    })
+                })
+                .map(HandoffName::name)
+                .collect()
+        };
+        assert_eq!(told(V0_98_0), Vec::<&str>::new(), "v0.98.0 takes neither");
+        assert_eq!(
+            told(TAKES_LAUNCHER_NOFILE_FROM_BUILD - 1),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            told(TAKES_LAUNCHER_NOFILE_FROM_BUILD),
+            vec![ENV_LAUNCHER_NOFILE.name()],
+            "v0.100.0 takes the launcher's limit alone"
+        );
+        assert_eq!(
+            told(TAKES_PARK_RAISED_FROM_BUILD),
+            vec![ENV_LAUNCHER_NOFILE.name(), ENV_PARK_RAISED_FROM.name()],
+            "v0.101.0 takes both"
+        );
     }
 }

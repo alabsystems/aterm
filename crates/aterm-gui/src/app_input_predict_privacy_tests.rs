@@ -507,3 +507,168 @@ fn the_composed_cursor_never_covers_half_of_a_wide_glyph() {
         "one past `b`, on `日`'s lead — not one past the refused `c`, on its right half"
     );
 }
+
+/// Predictive editing on the press path: a bare `←` on a line that proved it
+/// echoes is handed to the predictor as an edit key (with the cursor row), not
+/// as input it does not model. The first is tracked dark (no motion of the line
+/// has echoed: a cooked tty echoes `^[[D`); once its echo lands, the second shows
+/// at once, as the composed cursor moved with no cell painted. With
+/// `predictive_echo_editing = false` the same arrow ends the epoch as before.
+#[test]
+fn an_arrow_on_a_proven_line_shows_once_a_motion_has_echoed() {
+    let mut rig = Rig::new("adaptive");
+    rig.type_command_on_a_slow_link("./go");
+    let left = || press(Key::Named(NamedKey::ArrowLeft), Modifiers::empty());
+    rig.key(left());
+    assert!(
+        !rig.app.windows[&rig.wid].predictor.idle(),
+        "the arrow is tracked as an edit op"
+    );
+    rig.present(Instant::now());
+    assert!(!rig.displaying(), "the first motion stays dark");
+    rig.feed("\x08");
+    rig.present(Instant::now() + RTT);
+    assert!(
+        rig.app.windows[&rig.wid].predictor.idle(),
+        "its echo retired it"
+    );
+    rig.key(left());
+    rig.present(Instant::now());
+    assert!(rig.displaying(), "the second motion shows");
+    let ws = &rig.app.windows[&rig.wid];
+    let tree = &ws.layouts[ws.tabs.active];
+    let rect = *tree
+        .compute_layout(ws.rows, ws.cols)
+        .iter()
+        .find(|r| r.session == rig.focus)
+        .expect("focused leaf");
+    assert_eq!(
+        (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
+        (
+            usize::from(rect.row_off) + rig.bottom,
+            usize::from(rect.col_off) + 4
+        ),
+        "the composed cursor is the chain's, on `g`"
+    );
+
+    let mut rig = Rig::new("adaptive");
+    rig.app.config.predictive_echo_editing = Some(false);
+    rig.type_command_on_a_slow_link("./go");
+    rig.key(left());
+    let predictor = &rig.app.windows[&rig.wid].predictor;
+    assert!(
+        predictor.idle() && !predictor.is_displaying(Instant::now()),
+        "editing off: the arrow is input the predictor does not model"
+    );
+}
+
+/// A proven line under Kitty DISAMBIGUATE, pushed by the shell at its prompt (fish
+/// 4 does), with a bare `←` in flight: an edit op, since a bare arrow is still
+/// `ESC [ D` there.
+fn kitty_line_with_an_arrow_in_flight() -> Rig {
+    let mut rig = Rig::new("adaptive");
+    rig.feed("\x1b[>1u");
+    {
+        let term = rig.app.pool.get(rig.focus).expect("focus").term.clone();
+        assert!(
+            term_lock(&term).kitty_reports_functional_keys(),
+            "fixture: Kitty reports functional keys"
+        );
+    }
+    rig.type_command_on_a_slow_link("./go");
+    rig.key(press(Key::Named(NamedKey::ArrowLeft), Modifiers::empty()));
+    assert!(
+        !rig.app.windows[&rig.wid].predictor.idle(),
+        "a bare `←` under DISAMBIGUATE is still `ESC [ D`, an edit op"
+    );
+    rig
+}
+
+/// A lock is no chord to the legacy encoder: `←` with Caps Lock or Num Lock on
+/// still sends `ESC [ D`, so on a proven line it is handed to the predictor as
+/// an edit key. Under Kitty DISAMBIGUATE it goes out with the lock in its
+/// modifier byte (`ESC [ 1 ; 65 D`, `ESC [ 1 ; 129 D`), which no line editor
+/// reads as a bare motion, so there it is input the predictor does not model (it
+/// retires what is in flight). Num Lock as much as Caps Lock: it is on by
+/// default on most Windows keyboards.
+#[test]
+fn a_locked_arrow_is_an_edit_key_unless_kitty_reports_the_lock() {
+    let left = |mods| press(Key::Named(NamedKey::ArrowLeft), mods);
+    let mut rig = Rig::new("adaptive");
+    rig.type_command_on_a_slow_link("./go");
+    rig.key(left(Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK));
+    assert!(
+        !rig.app.windows[&rig.wid].predictor.idle(),
+        "a locked `←` is tracked as an edit op"
+    );
+
+    for lock in [Modifiers::CAPS_LOCK, Modifiers::NUM_LOCK] {
+        let mut rig = kitty_line_with_an_arrow_in_flight();
+        rig.key(left(lock));
+        assert!(
+            rig.app.windows[&rig.wid].predictor.idle(),
+            "{lock:?} in Kitty's modifier byte: input the predictor does not model"
+        );
+    }
+}
+
+/// The keypad's `←` (NumLock off) is the main block's to the legacy encoder
+/// (`encode_navigation_named_legacy` takes `NumpadArrowLeft` with `ArrowLeft`:
+/// `ESC [ D`, DECKPAM or not), so on a proven line it is an edit key and keeps
+/// a typed-ahead line on glass as the main block's does. Under Kitty
+/// DISAMBIGUATE it goes out as its own code (`CSI 57417 u`), which no line
+/// editor reads as a bare motion: input the predictor does not model.
+#[test]
+fn a_keypad_arrow_is_an_edit_key_unless_kitty_reports_the_keypad() {
+    let keypad_left = || press(Key::Named(NamedKey::NumpadArrowLeft), Modifiers::empty());
+    let mut rig = Rig::new("adaptive");
+    rig.type_command_on_a_slow_link("./go");
+    rig.key(keypad_left());
+    assert!(
+        !rig.app.windows[&rig.wid].predictor.idle(),
+        "the keypad's `←` is tracked as an edit op"
+    );
+
+    let mut rig = kitty_line_with_an_arrow_in_flight();
+    rig.key(keypad_left());
+    assert!(
+        rig.app.windows[&rig.wid].predictor.idle(),
+        "the keypad's own code: input the predictor does not model"
+    );
+}
+
+/// An edit key at a local tty that will not echo (canonical, ECHO clear) is
+/// input the predictor does not model, as a glyph is there: the line it would
+/// be placed on proved itself before the echo went off, and the arrow's own
+/// effect is the program's. The control: with the echo on, the same `←` on the
+/// same proven line is an edit op.
+#[cfg(unix)]
+#[test]
+fn an_edit_key_at_a_tty_that_will_not_echo_is_not_predicted() {
+    for echo in [true, false] {
+        let (master, slave) = super::typed_kitty_summon_tests::pty_pair_with_lflag(|_| {});
+        let sink = Arc::new(SinkWriter::new(master));
+        let mut rig = Rig::with_sink("always", sink.clone());
+        rig.type_echoed('a');
+        rig.type_echoed('b');
+        if !echo {
+            set_lflag(slave, |l| *l &= !libc::ECHO);
+        }
+        rig.key(press(Key::Named(NamedKey::ArrowLeft), Modifiers::empty()));
+        assert_eq!(
+            rig.app.windows[&rig.wid].predictor.idle(),
+            !echo,
+            "echo {echo}: the arrow is an edit op only where the tty echoes"
+        );
+        drop(rig);
+        drop(sink);
+        // SAFETY: both fds are ours and open; the borrowed-fd sink did not
+        // close the master.
+        unsafe {
+            // The master first: a slave closed over output its master never read
+            // waits out the tty's drain (0.6 s on macOS).
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+}

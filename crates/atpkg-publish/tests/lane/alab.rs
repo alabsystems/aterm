@@ -19,6 +19,7 @@ use atpkg_publish::lane::report::Transcript;
 use atpkg_publish::lane::state::LaneState;
 use atpkg_publish::triple::{AARCH64_APPLE_DARWIN as ARM, X86_64_APPLE_DARWIN as X86};
 
+use super::super::shared::{Made, made_once};
 use super::fixture::{self, Fx, Release, git};
 
 /// The shell suite's world: index 5 pins ay 2, nn 2, trust-ir 1, trust 5, trust-mc 4 and
@@ -40,16 +41,21 @@ fn sha_at(dir: &Path, build: u64) -> String {
         .to_string()
 }
 
+/// The commit at `build` of a history, oldest first.
+fn at(history: &[String], build: u64) -> &str {
+    &history[usize::try_from(build).expect("small") - 1]
+}
+
 impl World {
     fn new(label: &str) -> Self {
         let fx = Fx::new(label);
-        let ay = fx.dev_repo("ay", 4);
-        fx.release("ay", "v0.1.0", &sha_at(&ay, 2), Release::GOOD);
-        fx.release("ay", "v0.2.0", &sha_at(&ay, 3), Release::GOOD);
+        let (_, ay) = fx.dev_repo("ay", 4);
+        fx.release("ay", "v0.1.0", at(&ay, 2), Release::GOOD);
+        fx.release("ay", "v0.2.0", at(&ay, 3), Release::GOOD);
         fx.release(
             "ay",
             "v0.3.0",
-            &sha_at(&ay, 4),
+            at(&ay, 4),
             Release {
                 prerelease: true,
                 ..Release::GOOD
@@ -58,20 +64,20 @@ impl World {
         fx.release(
             "ay",
             "v0.4.0",
-            &sha_at(&ay, 4),
+            at(&ay, 4),
             Release {
                 signed: false,
                 ..Release::GOOD
             },
         );
-        let nn = fx.dev_repo("nn", 2);
-        fx.release("nn", "v0.1.0", &sha_at(&nn, 2), Release::GOOD);
-        let mc = fx.dev_repo("trust-mc", 4);
-        fx.release("trust-mc", "v0.6.0", &sha_at(&mc, 4), Release::GOOD);
-        let trust = fx.dev_repo("trust", 7);
-        fx.release("trust", "v0.9.0", &sha_at(&trust, 7), Release::GOOD);
-        let ir = fx.dev_repo("trust-ir", 2);
-        fx.release("trust-ir", "v0.3.0", &sha_at(&ir, 2), Release::GOOD);
+        let (_, nn) = fx.dev_repo("nn", 2);
+        fx.release("nn", "v0.1.0", at(&nn, 2), Release::GOOD);
+        let (_, mc) = fx.dev_repo("trust-mc", 4);
+        fx.release("trust-mc", "v0.6.0", at(&mc, 4), Release::GOOD);
+        let (_, trust) = fx.dev_repo("trust", 7);
+        fx.release("trust", "v0.9.0", at(&trust, 7), Release::GOOD);
+        let (_, ir) = fx.dev_repo("trust-ir", 2);
+        fx.release("trust-ir", "v0.3.0", at(&ir, 2), Release::GOOD);
         fx.publish_head(
             5,
             &[
@@ -287,13 +293,8 @@ fn the_bundle_landing_on_staging_moves_the_whole_group_together() {
 #[test]
 fn a_pin_ahead_of_the_newest_signed_release_is_ok_and_a_clean_no_op() {
     let fx = Fx::new("alab-ahead");
-    let nn = fx.dev_repo("nn", 1);
-    fx.release(
-        "nn",
-        "v0.1.1",
-        &git(&nn, &["rev-parse", "HEAD"]),
-        Release::GOOD,
-    );
+    let (_, nn) = fx.dev_repo("nn", 1);
+    fx.release("nn", "v0.1.1", at(&nn, 1), Release::GOOD);
     fx.publish_head(5, &[("nn", 2)]);
     let w = World {
         opts: Mutex::new(Options::new(&fx.ctx, false)),
@@ -606,15 +607,26 @@ fn what_is_built_is_what_was_signed() {
 /// A trust world for the gap to main: pin 9 AHEAD of the newest signed release (v0.9.0,
 /// build 7), main at build 12, the pin's compiler reporting commit build 9.
 fn gap_world(label: &str) -> World {
+    static MADE: Made<(), Vec<String>> = Mutex::new(BTreeMap::new());
     let fx = Fx::new(label);
-    let trust = fx.dev_repo("trust", 0);
-    for i in 1..=9 {
-        fixture::commit(&trust, &format!("t{i}"), Some("2026-09-17"));
-    }
-    for i in 10..=12 {
-        fixture::commit(&trust, &format!("t{i}"), Some("2026-10-01"));
-    }
-    fx.release("trust", "v0.9.0", &sha_at(&trust, 7), Release::GOOD);
+    // Fixed dates and a fixed identity: the same history every time, made once per process.
+    let dir = fx.path("dev/trust");
+    let trust = made_once(&MADE, &(), &dir, |dir| {
+        fixture::repo(dir, 0);
+        for i in 1..=9 {
+            fixture::commit(dir, &format!("t{i}"), Some("2026-09-17"));
+        }
+        for i in 10..=12 {
+            fixture::commit(dir, &format!("t{i}"), Some("2026-10-01"));
+        }
+        git(dir, &["rev-list", "--reverse", "HEAD"])
+            .lines()
+            .map(str::to_string)
+            .collect()
+    });
+    fx.host
+        .add_clone_source(&fx.ctx.staging_slug("trust"), &dir);
+    fx.release("trust", "v0.9.0", at(&trust, 7), Release::GOOD);
     fx.publish_head(5, &[("trust", 9)]);
     let w = World {
         opts: Mutex::new(Options::new(&fx.ctx, false)),
@@ -624,7 +636,7 @@ fn gap_world(label: &str) -> World {
     w.pins.lock().expect("pins").insert(
         ("trust".into(), 9),
         PinCommit {
-            commit: sha_at(&w.dev("trust"), 9)[..9].to_string(),
+            commit: at(&trust, 9)[..9].to_string(),
             date: Some("2026-09-17".into()),
         },
     );

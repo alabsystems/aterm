@@ -73,6 +73,10 @@
 //!    whose keyframes are stamped with that theme's config, restores exactly when it sat
 //!    idle; only a tail replayed under the restorer's other config costs the exactness.
 //!
+//! The CONTROL SLOT is read apart ([`read_control`]): the window's control state (the
+//! session's turn ledger) rides a restore on every rung once the header holds, screen or
+//! no screen.
+//!
 //! Panic-free on any bytes: every read is bounds-checked through the view, every length
 //! is checked before it indexes or allocates. The engine's own `process` is the
 //! engine's; the window runs the whole call under `catch_unwind` and takes the META
@@ -85,18 +89,18 @@ use aterm_core::grid::{HistoryFence, MAX_GRID_COLS, MAX_GRID_ROWS};
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 use crate::layout::{
-    Geometry, LAYOUT_VERSION, LayoutError, MAGIC, MAX_REGION_LEN, OFF_CELL_PX, OFF_CONFIG_FP,
-    OFF_ENGINE_RESIZE_LIFETIME, OFF_ENGINE_RESIZE_ORDINAL, OFF_HIST_CAP, OFF_HIST_CAP_PHYS,
-    OFF_HIST_END_ROW, OFF_HIST_HI, OFF_HIST_IDENTITY, OFF_HIST_LO, OFF_HIST_LO_SEQ, OFF_HIST_OFF,
-    OFF_KF_CAP, OFF_KF_OFF, OFF_LOCAL_ID, OFF_MAGIC, OFF_REGION_LEN, OFF_SID, OFF_STREAM_GATHERED,
-    OFF_STREAM_PROCESSED, OFF_TAIL_CAP, OFF_TAIL_COMMIT, OFF_TAIL_FLOOR, OFF_TAIL_MARKS,
-    OFF_TAIL_OFF, OFF_WRITER_BIRTH, OFF_WRITER_BUILD, OFF_WRITER_PID, SID_LEN, cell_px_of,
-    kf_commit_word, kf_len_word, slot_of,
+    ERASED_COUNT_V1, Geometry, LAYOUT_VERSION, LayoutError, MAGIC, MAX_REGION_LEN, OFF_CELL_PX,
+    OFF_CONFIG_FP, OFF_CTL_COMMIT, OFF_CTL_COUNT, OFF_CTL_LEN, OFF_ENGINE_RESIZE_LIFETIME,
+    OFF_ENGINE_RESIZE_ORDINAL, OFF_HIST_CAP, OFF_HIST_CAP_PHYS, OFF_HIST_END_ROW, OFF_HIST_HI,
+    OFF_HIST_IDENTITY, OFF_HIST_LO, OFF_HIST_LO_SEQ, OFF_HIST_OFF, OFF_KF_CAP, OFF_KF_OFF,
+    OFF_LOCAL_ID, OFF_MAGIC, OFF_REGION_LEN, OFF_SID, OFF_STREAM_GATHERED, OFF_STREAM_PROCESSED,
+    OFF_TAIL_CAP, OFF_TAIL_COMMIT, OFF_TAIL_FLOOR, OFF_TAIL_MARKS, OFF_TAIL_OFF, OFF_WRITER_BIRTH,
+    OFF_WRITER_BUILD, OFF_WRITER_PID, SID_LEN, cell_px_of, kf_commit_word, kf_len_word, slot_of,
 };
 use crate::records::{
-    ChunkFault, HistoryChunk, HistoryIdentity, KIND_PAD, Keyframe, KeyframeFault, KeyframeHead,
-    TAIL_RECORD_HEADER, TailFault, TailHeader, TailRecord, decode_history_chunk, decode_keyframe,
-    decode_tail_payload,
+    ChunkFault, ControlFault, HistoryChunk, HistoryIdentity, KIND_PAD, Keyframe, KeyframeFault,
+    KeyframeHead, TAIL_RECORD_HEADER, TailFault, TailHeader, TailRecord, decode_control,
+    decode_history_chunk, decode_keyframe, decode_tail_payload,
 };
 use crate::store::RegionView;
 
@@ -185,6 +189,9 @@ pub struct HeaderFacts {
     /// restorer builds its scratch engine with it, so an inline image in the tail spans
     /// the rows it spanned live. `None`: never set.
     pub cell_px: Option<(u16, u16)>,
+    /// The window's control count ([`OFF_CTL_COUNT`]: `aterm-gui`'s turn-id count as it last
+    /// stored it), read whatever the control slot holds; 0: never stored.
+    pub ctl_count: u64,
 }
 
 /// Everything a restore could not reproduce.
@@ -578,6 +585,16 @@ fn as_usize(v: u64) -> Option<usize> {
     usize::try_from(v).ok()
 }
 
+/// Read only the turn count of a privacy-erased v1 region. This marker authorizes no
+/// geometry, allocation, ledger or screen bytes; the caller still takes the META rung.
+#[must_use]
+pub fn read_erased_turn_count<V: RegionView + ?Sized>(view: &V) -> Option<u64> {
+    if view.len() > MAX_REGION_LEN || load(view, OFF_MAGIC)? != ERASED_COUNT_V1 {
+        return None;
+    }
+    load(view, OFF_CTL_COUNT)
+}
+
 /// Read and check a region's header (module doc, step 1) without restoring anything:
 /// what a restorer reads first, to build its scratch engine as the writer's was built
 /// ([`HeaderFacts::cell_px`]) and to fingerprint its own config under that cell size.
@@ -633,6 +650,7 @@ pub fn read_header<V: RegionView + ?Sized>(view: &V) -> Result<HeaderFacts, Head
         geometry,
         config_fp: load(view, OFF_CONFIG_FP).ok_or(HeaderFault::Unreadable)?,
         cell_px: cell_px_of(load(view, OFF_CELL_PX).ok_or(HeaderFault::Unreadable)?),
+        ctl_count: load(view, OFF_CTL_COUNT).ok_or(HeaderFault::Unreadable)?,
     })
 }
 
@@ -668,6 +686,81 @@ pub(crate) fn read_slot<V: RegionView + ?Sized>(
     match decode_keyframe(&record, commit) {
         Ok(kf) => (SlotVerdict::Valid(commit), Some(kf)),
         Err(fault) => (SlotVerdict::Keyframe(fault), None),
+    }
+}
+
+/// What a region's control slot holds (the crash-restore plan's increment 7,
+/// [`read_control`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlVerdict {
+    /// Commit word 0: never written, or being written when the writer died. No carry.
+    Empty,
+    /// The layout has no control slot (a test's geometry).
+    NoSlot,
+    /// A length of zero or past the slot.
+    Length(u64),
+    /// The slot could not be read.
+    Unreadable,
+    /// The record is not one this build reads, or not the one its commit word names. A
+    /// writer of this protocol never leaves one: a fault, so no carry.
+    Record(ControlFault),
+    /// The newest complete record: its sequence number and the window's carry.
+    Valid {
+        /// The record's sequence number (its commit word).
+        seq: u64,
+        /// The window's carry, decompressed.
+        carry: Vec<u8>,
+    },
+}
+
+impl ControlVerdict {
+    /// The carry, when the slot holds a valid record.
+    #[must_use]
+    pub fn into_carry(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Valid { carry, .. } => Some(carry),
+            _ => None,
+        }
+    }
+}
+
+/// Read a region's CONTROL SLOT (the crash-restore plan's increment 7): the carry its
+/// writer's newest complete record holds, or why there is none. Apart from [`recover`]
+/// and its rungs: the slot is the window's control state (the session's turn ledger),
+/// which a restore carries whether or not it brings back a screen, once the header
+/// ([`read_header`]) has vouched for the geometry. Strict as a keyframe slot is read: a
+/// commit word nonzero, a length inside the slot, one step record whose step is that word
+/// and whose CRC holds, a body version this build reads and an LZ4 size bounded before
+/// anything is allocated (`records::decode_control`). Panic-free on any bytes.
+#[must_use]
+pub fn read_control<V: RegionView + ?Sized>(view: &V, geometry: &Geometry) -> ControlVerdict {
+    let cap = geometry.ctl_cap();
+    if cap == 0 {
+        return ControlVerdict::NoSlot;
+    }
+    let Some(seq) = load(view, OFF_CTL_COMMIT) else {
+        return ControlVerdict::Unreadable;
+    };
+    if seq == 0 {
+        return ControlVerdict::Empty;
+    }
+    let Some(len) = load(view, OFF_CTL_LEN) else {
+        return ControlVerdict::Unreadable;
+    };
+    let Some(n) = as_usize(len).filter(|n| *n > 0 && *n <= cap) else {
+        return ControlVerdict::Length(len);
+    };
+    let mut record = Vec::new();
+    if record.try_reserve_exact(n).is_err() {
+        return ControlVerdict::Unreadable;
+    }
+    record.resize(n, 0);
+    if view.read(geometry.ctl_off(), &mut record).is_err() {
+        return ControlVerdict::Unreadable;
+    }
+    match decode_control(&record, seq) {
+        Ok(carry) => ControlVerdict::Valid { seq, carry },
+        Err(fault) => ControlVerdict::Record(fault),
     }
 }
 

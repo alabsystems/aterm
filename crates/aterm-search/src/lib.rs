@@ -45,8 +45,9 @@ pub use types::{DirectedFind, LineFrame, SearchDirection, SearchMatch, SearchRes
 #[cfg(test)]
 mod tests;
 
-/// Search over a terminal's grid and scrollback.
-#[derive(Debug)]
+/// Search over a terminal's grid and scrollback. `Clone` copies the index
+/// ([`SearchIndex`] says when that is worth it).
+#[derive(Clone, Debug)]
 pub struct TerminalSearch {
     /// Search index for all content.
     index: SearchIndex,

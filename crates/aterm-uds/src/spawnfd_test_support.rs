@@ -28,11 +28,13 @@
 //!   SP-1 a `std` command with the strip in `pre_exec` keeps the descriptor
 //!   out with or without the strip, because std strips first.
 //!
-//! The probes these run are `/bin/sh -c` tests of `/dev/fd`, which no signal
-//! mask or disposition changes. So the child keeps this process's signal mask
+//! The probes these run are `/bin/sh -c` reads of the child's own descriptor
+//! table ([`crate::host::sh_held_any`]), which no signal mask or disposition changes. So the child keeps this process's signal mask
 //! and dispositions, with no reset.
 
 use super::{InheritStrip, pass_libnotify_gate, waitpid};
+/// Every crate's shell probe of a descriptor, which this crate's tests call from here.
+pub(crate) use crate::host::{held_probe, sh_held, sh_held_any};
 use core::ffi::c_char;
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read as _};
@@ -147,6 +149,74 @@ impl Image {
 /// quick: the intermittent `stripped spawn: ... Invalid argument`.
 pub(crate) fn bound_read(near: &UnixStream) -> io::Result<()> {
     near.set_read_timeout(Some(Duration::from_secs(60)))
+}
+
+/// Call `round` over and over while another thread looks `/dev/fd/{number}` up without
+/// pause, until the path `stat`s `round` makes of `number` (through the [`Looker`] it is
+/// handed, while it holds `number` open) have failed `races` times; return how many rounds
+/// ran. Those failures are the NEGATIVE CONTROL of a test that reads a descriptor while its
+/// number is contended: Darwin's `/dev/fd/N` is one vnode every lookup shares, and a path
+/// `stat` racing another lookup answers `EBADF` for an open descriptor
+/// ([`super::descriptor_metadata`]). A host that never interleaves the two lookups within
+/// the one-minute hang detector ends the test COULD NOT RUN. Darwin only: Linux's
+/// `/proc/self/fd` is per process, with nothing shared to race.
+// `#[cfg(test)]` repeats the gate on this module's `mod` line in spawnfd.rs for the
+// wasm-process census, which reads this file on its own and would take the thread
+// below for one in the shipped wasm closure (OB-12).
+#[cfg(test)]
+#[cfg(target_vendor = "apple")]
+#[track_caller]
+pub(crate) fn racing_lookups(number: RawFd, races: usize, mut round: impl FnMut(&Looker)) -> usize {
+    use std::sync::atomic::Ordering;
+    super::tests::require_soft_limit(u64::try_from(number).unwrap_or(0) + 1, number);
+    let path = format!("/dev/fd/{number}");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread = {
+        let (stop, path) = (std::sync::Arc::clone(&stop), path.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::fs::metadata(&path);
+            }
+        })
+    };
+    let looker = Looker {
+        path,
+        raced: std::cell::Cell::new(0),
+    };
+    let hang = std::time::Instant::now() + Duration::from_secs(60);
+    let mut rounds = 0;
+    while looker.raced.get() < races && std::time::Instant::now() < hang {
+        round(&looker);
+        rounds += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    thread.join().expect("the looking thread");
+    let raced = looker.raced.get();
+    if raced < races {
+        crate::host::could_not_run(format!(
+            "two lookups of {} never raced in a minute ({raced} of {races} in {rounds} rounds)",
+            looker.path
+        ));
+    }
+    rounds
+}
+
+/// [`racing_lookups`]' control: a path `stat` of the contended number.
+#[cfg(target_vendor = "apple")]
+pub(crate) struct Looker {
+    path: String,
+    raced: std::cell::Cell<usize>,
+}
+
+#[cfg(target_vendor = "apple")]
+impl Looker {
+    /// `stat` the contended number by its `/dev/fd` path, which the caller holds open
+    /// now, counting a failure as a race.
+    pub(crate) fn probe(&self) {
+        if std::fs::metadata(&self.path).is_err() {
+            self.raced.set(self.raced.get() + 1);
+        }
+    }
 }
 
 /// Wait for `pid`, this process's own child, and give its status.

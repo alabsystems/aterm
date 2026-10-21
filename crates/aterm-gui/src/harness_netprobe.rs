@@ -1016,6 +1016,24 @@ mod tests {
         std::fs::write(path, text).expect("write");
     }
 
+    /// `HOME` (where the vendor's profile store is looked for) and the
+    /// variable Claude Code's `os.homedir()` reads
+    /// (`aterm_agent::harness::accounts::HOMEDIR_ENV`, `USERPROFILE` on
+    /// Windows), both naming `home`: a test's agent resolves its scratch
+    /// home alone, never the account's.
+    fn homed(home: &Path) -> Vec<String> {
+        let mut vars = vec![
+            format!("HOME={}", home.display()),
+            format!(
+                "{}={}",
+                aterm_agent::harness::accounts::HOMEDIR_ENV,
+                home.display()
+            ),
+        ];
+        vars.dedup();
+        vars
+    }
+
     /// THE AGENT'S SETTINGS SIDE OF ITS LOGIN ([`stored_login_of`]): over the
     /// route's own gather, a quiet tree leaves it its stored login; and it
     /// is NO stored login where a settings source — the user's, the
@@ -1032,7 +1050,8 @@ mod tests {
         let dir = scratch("stored");
         let home = dir.join("home");
         let env = |more: &[String]| {
-            let mut env = vec![format!("HOME={}", home.display()), "USER=owner".to_string()];
+            let mut env = homed(&home);
+            env.push("USER=owner".to_string());
             env.extend(more.iter().cloned());
             Some(env)
         };
@@ -1131,10 +1150,9 @@ mod tests {
         let proxy = "{\"env\":{\"HTTPS_PROXY\":\"http://proxy.corp:3128\"}}";
         let dir = scratch("route");
         let env = || {
-            Some(vec![
-                format!("HOME={}", dir.join("home").display()),
-                "USER=owner".to_string(),
-            ])
+            let mut env = homed(&dir.join("home"));
+            env.push("USER=owner".to_string());
+            Some(env)
         };
         let facts = |argv: &[&str]| {
             let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
@@ -1232,10 +1250,12 @@ mod tests {
         std::fs::create_dir_all(&cloud).expect("the project");
         let facts = |cwd: &Path| {
             gather(
-                Some(vec![
-                    format!("HOME={}", home.display()),
-                    "USER=owner".to_string(),
-                ]),
+                Some(
+                    homed(&home)
+                        .into_iter()
+                        .chain(["USER=owner".to_string()])
+                        .collect(),
+                ),
                 &["claude".to_string()],
                 cwd,
                 Some(&dir.join("managed")),

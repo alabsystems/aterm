@@ -600,6 +600,169 @@ fn an_update_reads_once_across_both_chains_and_says_a_shortfall() {
     }
 }
 
+/// One process's log of the session at epoch `ep`: its open at `start` ms
+/// and `marks` person marks after it.
+fn relaunched(ep: u32, start: u64, marks: u64) -> Log {
+    let mut log = Log::new(ep);
+    open_session(&mut log, start);
+    for i in 0..marks {
+        log.mark(
+            Mark::new(Kind::Human, Src::Input, Conf::Exact),
+            at(start + 1 + i),
+        )
+        .expect("marks");
+    }
+    log
+}
+
+/// THE JOURNAL SHOWS THE RELAUNCH'S OWN OPEN (session log phase 6, 6A-2,
+/// ruling U1): a session relaunched under the same sid (a
+/// `$ATERM_SESSION_ID` re-adoption) by a process that quit, journaled by
+/// two chains. This build's producer starts the relaunch's log in an epoch
+/// above the predecessor's, a space of its own; and a producer that reused
+/// the epoch (every log at 1, before 6A-2) wrote two chains no `#handed`
+/// links with different records at the same seqs, which the reader now
+/// reads as two spaces, the later chain's newest. Either way the view is
+/// the live process's: its `open - spawn` first, every one of its records
+/// shown, none of the dead one's. NEGATIVE CONTROL: the reader before 6A-2
+/// (`split_unlinked` off) over the reused epoch merges the two into one
+/// space, the dead process's records 1-7 hiding the live one's (the
+/// audit's scratch run at `cc4283bf7f`: left 1760000000000, right
+/// 1760000001000).
+#[test]
+fn the_journal_shows_the_relaunchs_own_open() {
+    let shown = |a_ep: u32, b_ep: u32, rules: ViewRules| -> Vec<Rec> {
+        let (a, b) = (relaunched(a_ep, 0, 6), relaunched(b_ep, 1000, 10));
+        let mut wa = Writer::new("p1-aaaa", 0);
+        wa.pass(&a, 512);
+        wa.fin(EndWhy::Quit);
+        let mut wb = Writer::new("p2-bbbb", 100);
+        wb.pass(&b, 512);
+        let v = view_of(
+            &sid(),
+            &[wa.read(Liveness::Dead), wb.read(Liveness::Live)],
+            false,
+            rules,
+        )
+        .expect("a view");
+        all(&v.log)
+    };
+    let own = |recs: &[Rec]| {
+        recs.first().map(|r| (r.k, r.t)) == Some((Kind::Spawn, at(1000).wall_ms))
+            && recs.len() == 11
+            && recs.iter().all(|r| r.t >= at(1000).wall_ms)
+    };
+    let s = 1_792_100_000;
+    for (a_ep, b_ep) in [(s, s + 1), (1, 1)] {
+        let recs = shown(a_ep, b_ep, ViewRules::READER);
+        assert!(
+            own(&recs),
+            "epochs {a_ep} then {b_ep}: {:?}",
+            recs.iter().map(|r| (r.seq, r.t)).collect::<Vec<_>>()
+        );
+    }
+    let merged = shown(
+        1,
+        1,
+        ViewRules {
+            split_unlinked: false,
+            ..ViewRules::READER
+        },
+    );
+    assert!(
+        !own(&merged),
+        "NEGATIVE CONTROL: the merged view is the relaunch's: {merged:?}"
+    );
+}
+
+/// A `#handed` LINK KEEPS ONE SPACE THROUGH A DISAGREEMENT (session log
+/// phase 6, 6A-2, ruling U1: the view splits two chains "that no `#handed`
+/// line links"): a seamless update's predecessor journals the session and
+/// hands it on (`#handed`); its carried successor, in the same base,
+/// journals its own records and one record at a seq of the predecessor's
+/// that is not the predecessor's (a restatement that does not match). The
+/// chains are linked, so they are one seq space: the view holds every
+/// record the predecessor journaled, its own at the disputed seq, and the
+/// successor's records after them. NEGATIVE CONTROL (scratch-applied): a
+/// reader that splits linked chains too (the exemption dropped from
+/// `space_numbers`) answers with the successor's space alone, the
+/// predecessor's records gone and the disputed seq the successor's.
+#[test]
+fn a_handed_link_keeps_one_space_through_a_disagreement() {
+    let mut a_log = Log::new(1);
+    open_session(&mut a_log, 0);
+    let r = cmd(&mut a_log, 1);
+    for i in 0..4 {
+        let _ = a_log.mark(Mark::new(Kind::Human, Src::Input, Conf::Exact), at(2 + i));
+    }
+    let h = a_log.last_seq();
+    let mut a = Writer::new("p1-a1", 0);
+    a.pass(&a_log, 512);
+    let mut src = a_log.clone();
+    let snap = src.carry_snapshot();
+    src.fence_reads();
+    let carry = snap
+        .prepare()
+        .encode(CarryBudget::SESSION, &[])
+        .expect("a carry");
+    a.line(&Frame::Handed {
+        sid: sid(),
+        fence: h,
+    });
+    a.fin(EndWhy::Handoff);
+    let (mut b_log, _, _) = Log::from_carry(
+        &carry.lines,
+        CarryAdopt {
+            ep: 2,
+            next_seq: h + 65536 + 1,
+            ids: IdCounters::default(),
+            limits: Limits::SESSION,
+            at: at(50),
+        },
+    )
+    .expect("carried");
+    b_log
+        .close(
+            r,
+            Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+            at(60),
+        )
+        .expect("closes in B");
+    let mut b = Writer::new("p2-b2", 100);
+    b.cursor = h;
+    b.pass(&b_log, 512);
+    // The disputed seq: the successor's own word on the predecessor's last.
+    let theirs = a_log
+        .window()
+        .find(|x| x.seq == h)
+        .cloned()
+        .expect("A's last record");
+    let mut other = theirs.clone();
+    other.t += 7;
+    b.line(&Frame::Rec {
+        sid: sid(),
+        rec: other,
+        restated: false,
+    });
+    let v = view(&[a.read(Liveness::Dead), b.read(Liveness::Live)]);
+    let recs = all(&v.log);
+    let seqs: Vec<u64> = recs.iter().map(|x| x.seq).collect();
+    let mine: Vec<u64> = b_log.window().map(|x| x.seq).filter(|&q| q > h).collect();
+    assert!(
+        !mine.is_empty(),
+        "PRECONDITION: the successor wrote its own"
+    );
+    assert!(
+        (1..=h).all(|q| seqs.contains(&q)) && mine.iter().all(|q| seqs.contains(q)),
+        "one space, the predecessor's then the successor's: {seqs:?}"
+    );
+    assert_eq!(
+        recs.iter().find(|x| x.seq == h),
+        Some(&host(&theirs)),
+        "the disputed seq is the predecessor's"
+    );
+}
+
 /// A READER HOLDS EVERY RECORD IT READ: 10⁵ journaled records read back are
 /// all in the view and none is said lost (a reply's ring is sized to its
 /// read, which the read's own budget bounds), and `n=`-style paging reaches
@@ -1228,10 +1391,66 @@ fn a_restatement_past_its_snaps_head_accounts_for_nothing() {
         ..ViewRules::READER
     });
     assert_eq!(before.len(), 4, "{before:?}");
+
+    // Across two unhanded chains the same ignored row is still no evidence
+    // of another seq space. The earlier chain owns seq 6; the later chain's
+    // corrupt restatement disagrees with it but the view must not read it.
+    // Exercise both rejection reasons: past the snap head, and within that
+    // head but after a real record ended the snap's restatement. An eligible
+    // corrupt restatement superseded by the ordinary row is no conflict either.
+    let mut writer = Writer::new("p0-a0", 0);
+    writer.pass(&log, 512);
+    writer.fin(EndWhy::Quit);
+    let mut prior = writer.read(Liveness::Dead);
+    prior.start_t = 0;
+    for shape in ["past-head", "after-record", "real-wins"] {
+        let mut later = chain.clone();
+        later.live = Liveness::Live;
+        let tail = &mut later.segments[1].frames;
+        if shape != "past-head" {
+            for frame in tail.iter_mut() {
+                if let Frame::Snap { head, .. } = frame {
+                    *head = 6;
+                }
+            }
+        }
+        if shape == "after-record" {
+            let i = tail
+                .iter()
+                .position(|f| matches!(f, Frame::Rec { rec, restated: true, .. } if rec.seq == 6))
+                .expect("the restated run");
+            tail.insert(i, rec(3, false));
+        }
+        for frame in tail.iter_mut() {
+            if let Frame::Rec {
+                rec,
+                restated: true,
+                ..
+            } = frame
+                && rec.seq == 6
+            {
+                rec.t += 7;
+            }
+        }
+        if shape == "real-wins" {
+            tail.push(rec(6, false));
+        }
+        let kept = view_of(&sid(), &[prior.clone(), later], false, ViewRules::READER)
+            .expect("the two chains read");
+        let shown = all(&kept.log);
+        for wanted in recs.iter().filter(|r| (4..=6).contains(&r.seq)) {
+            let expected = host(wanted);
+            assert_eq!(
+                shown.iter().find(|r| r.seq == expected.seq),
+                Some(&expected),
+                "a nonauthoritative restatement hid the earlier chain's real row ({shape})"
+            );
+        }
+    }
 }
 
 /// A crash recovery's log of the session (its epoch `ep`, the Unix seconds
-/// `crash_epoch` gives one): its crash gap, its open and `n` marks,
+/// `Epochs::crash` gives one): its crash gap, its open and `n` marks,
 /// journaled whole by `inst`'s writer.
 fn recovered_space(ep: u32, n: u64, inst: &str, ms: u64) -> Writer {
     let mut log = Log::new(ep);
@@ -1282,7 +1501,7 @@ fn keyed_placement(v: &View, c: Cursor) -> Cursor {
 
 /// A CURSOR OF ANOTHER SEQ SPACE IS RESET, SAID, in both directions. Two
 /// crash recoveries of one shell ten minutes apart each start a space of
-/// their own, their epochs Unix seconds (`crash_epoch`), and each holds 402
+/// their own, their epochs Unix seconds (`Epochs::crash`), and each holds 402
 /// records, so a reply epoch over the earlier space under the keyed rule
 /// (`ep + 1 + 2·head`) lands past the later space's epoch. Read in the later
 /// space (the newest answers): the earlier process's live cursor and the

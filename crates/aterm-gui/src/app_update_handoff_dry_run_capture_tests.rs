@@ -517,7 +517,6 @@ fn the_park_carries_which_done_the_owner_saw() {
             &ctx,
             0,
             &crate::task_record::TaskMark::new(crate::task_record::TaskState::Done),
-            &app.subscribers,
         )
         .expect("unfenced");
         app.on_task_changed(0);
@@ -822,6 +821,29 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
 }
 
 /// The scrollback sidecars in `dir`.
+/// Re-runs the park as the event loop does, at each `park_retry_at` (or now), until `done`
+/// says what it waits for has happened: a park that asked its history export to pause comes
+/// back for the answer (`ParkAttempt::Pausing`). A hang detector, never a latency budget.
+fn park_until<T>(
+    app: &mut crate::App,
+    what: &str,
+    mut done: impl FnMut(&crate::App) -> Option<T>,
+) -> T {
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+        if let Some(value) = done(app) {
+            return Some(value);
+        }
+        let now = std::time::Instant::now();
+        let now = app
+            .update_handoff_prelaunch
+            .as_ref()
+            .and_then(|prelaunch| prelaunch.park_retry_at)
+            .map_or(now, |at| at.max(now));
+        app.try_park_for_prelaunched_successor(now);
+        done(app)
+    })
+}
+
 fn sidecars(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     std::fs::read_dir(dir)
         .map(|entries| {
@@ -897,9 +919,11 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
             .join()
             .expect("the ledger writer finished");
         app.on_update_handoff_awaiting_park(attempt_id, Some(4242), None);
-        let transfer = transferred
-            .try_recv()
-            .unwrap_or_else(|_| panic!("{at}: the park landed and handed its capture over"));
+        let transfer = park_until(
+            &mut app,
+            "the park landed and handed its capture over",
+            |_| transferred.try_recv().ok(),
+        );
         if cfg!(target_os = "macos") {
             super::ledger_writers::wait_until_landed();
             assert!(
@@ -982,18 +1006,20 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
     }
 }
 
-/// Holds `term`'s engine from another thread past the widest freeze rung, returning once held,
-/// so a park on the real rung (`park_budget_for_test::real`) misses with `EngineBusy` and its
-/// rollback waits the hold out.
-pub(super) fn hold_engine_past_every_rung(
+/// Holds `term`'s engine from another thread until the park's bounded take of it has run past
+/// its deadline (`park_budget_for_test::wait_gave_up`), returning once held, so a park on the
+/// real rung (`park_budget_for_test::real`) misses (its rollback no longer waits for the
+/// release: `a_missed_parks_rollback_never_waits_on_an_engine`).
+pub(super) fn hold_engine_until_the_park_gives_up(
     term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
 ) -> std::thread::JoinHandle<()> {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let term = std::sync::Arc::clone(term);
+    super::park_budget_for_test::watch(&term);
     let holder = std::thread::spawn(move || {
         let guard = crate::term_lock(&term);
         held_tx.send(()).expect("the test waits");
-        std::thread::sleep(Duration::from_millis(1500));
+        super::park_budget_for_test::wait_gave_up(&term);
         drop(guard);
     });
     held_rx.recv().expect("the engine is held");
@@ -1001,11 +1027,12 @@ pub(super) fn hold_engine_past_every_rung(
 }
 
 /// A missed park resumes the history export it paused: after a miss (engine held past the
-/// deadline) the tab prints more than 256 lines before the re-park, and the whole history still
-/// crosses through the second capture's join.
+/// deadline) the tab prints more than 256 lines before the re-park, the export follows them
+/// before the re-park is tried, and the whole history still crosses through the second
+/// capture's join.
 #[test]
 fn a_missed_park_resumes_the_history_export_for_the_repark() {
-    use crate::handoff_history::{HistoryExporter, HistoryPlan};
+    use crate::handoff_history::{ExportSessions, HistoryExporter, HistoryPlan};
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let nonce = "0123456789abcdef0123456789abcdef";
     let mut app = crate::App::headless_for_test();
@@ -1018,9 +1045,10 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     let dir = std::env::temp_dir().join(format!("aterm-repark-history-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
+    let sessions = ExportSessions::from(vec![(0, std::sync::Arc::clone(&term))]);
+    let followed = std::sync::Arc::clone(&sessions.followed);
     let mut export =
-        HistoryExporter::start(dir.clone(), vec![(0, std::sync::Arc::clone(&term))], true)
-            .expect("the export starts");
+        HistoryExporter::start(dir.clone(), sessions, true).expect("the export starts");
     assert!(export.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
     let (mut record, transferred) = prelaunched(31, ApplyMode::Immediate, FreezeSeed::Default);
     record.history_export = Some(export);
@@ -1031,12 +1059,16 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     });
     app.update_handoff_prelaunch = Some(record);
 
-    // The first park misses: the engine is held past every rung's deadline, on the real rung
-    // (a test park's default deadline would wait it out).
+    // The first park misses: the engine is held until the park's take of it gives up, on the
+    // real rung (a test park's default deadline would wait it out).
     let real = super::park_budget_for_test::real();
-    let holder = hold_engine_past_every_rung(&term);
-    let first = std::time::Instant::now();
-    app.try_park_for_prelaunched_successor(first);
+    let holder = hold_engine_until_the_park_gives_up(&term);
+    park_until(&mut app, "the park went ahead and missed", |app| {
+        app.update_handoff_prelaunch
+            .as_ref()
+            .is_some_and(|prelaunch| prelaunch.park_misses > 0)
+            .then_some(())
+    });
     holder.join().expect("the holder finished");
     drop(real);
     assert!(
@@ -1048,22 +1080,31 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
         prelaunch.park_misses, 1,
         "PRECONDITION — one miss, re-parked"
     );
-    let retry_at = prelaunch.park_retry_at.expect("a re-park is scheduled");
+    assert!(
+        prelaunch.park_retry_at.is_some(),
+        "PRECONDITION — a re-park is scheduled"
+    );
 
     // The tab prints past the screen carry's lines through the retry delay; the resumed
-    // export follows it.
+    // export follows it (a paused one never would: the hang detector).
     for n in 2000..2600 {
         crate::term_lock(&term)
             .process(format!("line {n}: printed during the retry delay\r\n").as_bytes());
     }
-    std::thread::sleep(crate::handoff_history::FOLLOW_EVERY * 4);
+    let end = crate::term_lock(&term).history_fence().end;
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the resumed export followed the retry delay's lines",
+        || (followed.load(std::sync::atomic::Ordering::Acquire) >= end).then_some(()),
+    );
 
     super::keep_landed_park(Duration::from_micros(1))
         .expect("the sentinel is kept")
         .join()
         .expect("the ledger writer finished");
-    app.try_park_for_prelaunched_successor(retry_at + Duration::from_millis(1));
-    let transfer = transferred.try_recv().expect("the re-park landed");
+    let transfer = park_until(&mut app, "the re-park landed", |_| {
+        transferred.try_recv().ok()
+    });
     if cfg!(target_os = "macos") {
         super::ledger_writers::wait_until_landed();
         assert!(
@@ -1109,6 +1150,197 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     app.update_handoff_prelaunch = None;
     release_pty(&mut app, pty);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE PARK NEVER WAITS ON THE EXPORT'S LAST LOOK (ATERM-KI-1015-2, U20). Every park — and
+/// so every free mid-sequence re-park of a flood — pauses the history export before it freezes
+/// anything, and the export's worker answers only after its last look: on a desk of 32
+/// flooding tabs, 10–20 ms each, measured. The park waited for that answer on the event loop,
+/// up to `HALT_WAIT`; it now asks, and the event loop re-runs it for the answer
+/// (`ParkAttempt::Pausing`). Here the worker cannot answer, because its last look waits on an
+/// engine another thread holds until the park returns, and the park returns with the pause
+/// still asked, no miss and nothing handed over. Once the engine is free, the park the event
+/// loop re-runs lands, and the sidecar the paused export hands over carries every line.
+///
+/// RED before the fix: the park waited `HALT_WAIT` for an answer, then went ahead into the
+/// held engine, so it returned only when the hang detector released it.
+#[test]
+fn a_park_asks_the_export_to_pause_and_never_waits_for_its_last_look() {
+    use crate::handoff_history::{HistoryExporter, HistoryPlan};
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let mut app = crate::App::headless_for_test();
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    for n in 0..2000 {
+        crate::term_lock(&term)
+            .process(format!("line {n}: the history a capture carries\r\n").as_bytes());
+    }
+    let pty = quiet_pty(&mut app);
+    let dir = std::env::temp_dir().join(format!("aterm-pause-asked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let mut export =
+        HistoryExporter::start(dir.clone(), vec![(0, std::sync::Arc::clone(&term))], true)
+            .expect("the export starts");
+    assert!(export.await_caught_up(aterm_spec::wait::MUST_HAPPEN));
+    let (mut record, transferred) = prelaunched(33, ApplyMode::Immediate, FreezeSeed::Default);
+    record.history_export = Some(export);
+    record.dialled = Some(crate::DialledSuccessor {
+        pid: Some(4242),
+        grant_limit: None,
+        at: std::time::Instant::now(),
+    });
+    app.update_handoff_prelaunch = Some(record);
+
+    // The engine is held until the park returns: a park that waits for the export's answer,
+    // and then for the engine, waits out the hang detector instead.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let term = std::sync::Arc::clone(&term);
+        std::thread::spawn(move || {
+            let guard = crate::term_lock(&term);
+            held_tx.send(()).expect("the test waits");
+            let waited_out = returned_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .is_err();
+            drop(guard);
+            waited_out
+        })
+    };
+    held_rx.recv().expect("the engine is held");
+    app.try_park_for_prelaunched_successor(std::time::Instant::now());
+    let _ = returned_tx.send(());
+    let waited_out = holder.join().expect("the holder finished");
+    assert!(!waited_out, "the park waited for the export's last look");
+    assert!(
+        transferred.try_recv().is_err(),
+        "nothing was handed over before the answer"
+    );
+    let prelaunch = app.update_handoff_prelaunch.as_ref().expect("still held");
+    assert_eq!(
+        prelaunch.park_misses, 0,
+        "the park did not go ahead and miss"
+    );
+    assert!(
+        prelaunch
+            .history_export
+            .as_ref()
+            .is_some_and(HistoryExporter::pause_asked),
+        "the pause stays asked for the park's next run"
+    );
+    assert!(
+        prelaunch.park_retry_at.is_some(),
+        "and the next run is scheduled"
+    );
+
+    let transfer = park_until(&mut app, "the re-run park landed", |_| {
+        transferred.try_recv().ok()
+    });
+    assert_eq!(
+        app.update_handoff_prelaunch
+            .as_ref()
+            .map_or(0, |prelaunch| prelaunch.park_misses),
+        0,
+        "it landed without a miss"
+    );
+    let mut capture = transfer.capture;
+    let verdicts = crate::handoff_history::stamp_manifest(
+        &mut capture.manifest,
+        &capture.screens,
+        &capture.history_heads,
+        std::mem::replace(&mut capture.history, HistoryPlan::Unexported).results_for_test(&dir),
+        &dir,
+        nonce,
+    );
+    let (_, joined) = verdicts
+        .iter()
+        .find(|(local_id, _)| *local_id == 0)
+        .expect("session 0 is joined");
+    let record = capture
+        .manifest
+        .sessions
+        .iter()
+        .find(|record| record.local_id == 0)
+        .expect("session 0 is handed");
+    assert_eq!(
+        joined.fallback, None,
+        "the paused export meets the park's head"
+    );
+    assert!(joined.take > 0, "the sidecar carries the older history");
+    assert_eq!(record.history_dropped, 0, "no line is left behind");
+
+    drop(capture);
+    app.pending_update_handoff = None;
+    app.update_handoff_prelaunch = None;
+    release_pty(&mut app, pty);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A MISSED PARK'S ROLLBACK NEVER WAITS ON AN ENGINE (ATERM-KI-1015-2, U44). A park whose
+/// capture misses because another thread holds a session's engine
+/// (`CaptureFailure::EngineBusy`) rolls back before any successor held a PTY: nothing resized
+/// one, so no size is put back, and the rollback must not wait the holder out while every
+/// reader is still parked. It did: the rollback's size reassert took each handed engine with a
+/// blocking lock, so the park returned only when the holder let go — never, for a holder that
+/// does not. The holder here keeps the engine until the park has returned, or until the
+/// one-minute hang detector says the park waited for it.
+///
+/// RED before the fix: the park returned only when the hang detector released the engine.
+#[test]
+fn a_missed_parks_rollback_never_waits_on_an_engine() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = crate::App::headless_for_test();
+    let term = app.pool.get(0).expect("session 0").term.clone();
+    let pty = quiet_pty(&mut app);
+    let (mut record, transferred) = prelaunched(31, ApplyMode::Immediate, FreezeSeed::Default);
+    record.dialled = Some(crate::DialledSuccessor {
+        pid: Some(4242),
+        grant_limit: None,
+        at: std::time::Instant::now(),
+    });
+    app.update_handoff_prelaunch = Some(record);
+
+    // The engine is held until the park returns: a park that waits for it waits out the
+    // hang detector instead.
+    let real = super::park_budget_for_test::real();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (returned_tx, returned_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let term = std::sync::Arc::clone(&term);
+        std::thread::spawn(move || {
+            let guard = crate::term_lock(&term);
+            held_tx.send(()).expect("the test waits");
+            let waited_out = returned_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .is_err();
+            drop(guard);
+            waited_out
+        })
+    };
+    held_rx.recv().expect("the engine is held");
+    app.try_park_for_prelaunched_successor(std::time::Instant::now());
+    let _ = returned_tx.send(());
+    let waited_out = holder.join().expect("the holder finished");
+    drop(real);
+    assert!(
+        transferred.try_recv().is_err(),
+        "PRECONDITION — the park missed"
+    );
+    assert_eq!(
+        app.update_handoff_prelaunch
+            .as_ref()
+            .expect("still held")
+            .park_misses,
+        1,
+        "PRECONDITION — one miss, re-parked on the next rung"
+    );
+    assert!(
+        !waited_out,
+        "the missed park's rollback waited for the engine's holder"
+    );
+    app.update_handoff_prelaunch = None;
+    release_pty(&mut app, pty);
 }
 
 /// The dry run captures under the successor's policy. With aterm-core's

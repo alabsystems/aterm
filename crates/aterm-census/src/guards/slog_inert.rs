@@ -42,14 +42,7 @@ const DISPATCH: (&str, &str) = ("crates/aterm-gui/src/control.rs", "dispatch_mar
 fn dispatch_allows(call: &str) -> bool {
     matches!(
         call.rsplit("::").next().unwrap_or(call),
-        "cmd_mark"
-            | "log_actor"
-            | "cross_session_authorized"
-            | "wake_watchers"
-            | "let"
-            | "if"
-            | "match"
-            | "return"
+        "cmd_mark" | "log_actor" | "cross_session_authorized" | "let" | "if" | "match" | "return"
     )
 }
 
@@ -61,7 +54,6 @@ fn dispatch_allows(call: &str) -> bool {
 /// silently blind.
 const PTY_PATH: &[(&str, Bound, &str)] = &[
     ("SinkWriter", Bound::Word, "the PTY's writer"),
-    ("write_input", Bound::Sub, "an input write"),
     ("post_input", Bound::Sub, "the event loop's input hop"),
     ("InputEvent", Bound::Word, "an input event"),
     ("Wake::Input", Bound::Sub, "the input wake"),
@@ -75,14 +67,13 @@ const PTY_PATH: &[(&str, Bound, &str)] = &[
     (".master(", Bound::Sub, "the PTY master"),
     ("aterm_pty::", Bound::Sub, "the PTY crate"),
     ("background_input", Bound::Sub, "a background input write"),
-    ("cross_input", Bound::Sub, "a cross-session input write"),
-    ("cross_raw_input", Bound::Sub, "a cross-session input write"),
     (
-        "front_routed_input",
-        Bound::Sub,
-        "the front tab's input seam",
+        "InputRoute",
+        Bound::Word,
+        "an input verb's route: the seam or the background write",
     ),
-    ("local_input", Bound::Sub, "the front tab's input write"),
+    ("front_routed", Bound::Sub, "the front tab's routed input"),
+    ("cross_mouse", Bound::Sub, "a cross-session mouse write"),
     ("tracked_egress", Bound::Sub, "an input write"),
     ("input_if_fenced", Bound::Sub, "a fenced input write"),
     ("type_launch_line", Bound::Sub, "a worker's launch line"),
@@ -374,12 +365,12 @@ mod tests {
         t
     }
 
-    const DISPATCH_OK: &str = "fn dispatch_mark(ctx: &SessionCtx, scope: Scope, session: u64, \
-         rest: &str, subscribers: &Subscribers) -> String {\n\
+    const DISPATCH_OK: &str = "fn dispatch_mark(ctx: &SessionCtx, scope: Scope, rest: &str) -> \
+         String {\n\
          let reads = scope.is_owner_class() || cross_session_authorized(scope, \"text\", ctx);\n\
          let (reply, owed) = crate::session_log::cmd_mark(ctx, control_session::log_actor(scope, \
          ctx), reads, rest);\n\
-         if owed { wake_watchers(subscribers, session); }\n\
+         if owed { ctx.watchers.ring_watchers(); }\n\
          reply\n}\n";
 
     /// `needle` in a shipped call, as one line.
@@ -492,10 +483,10 @@ mod tests {
             "crate::task_launch::type_launch_line(store, sid, nonce, prompt, \"x\")",
             "proxy.send_event(crate::Wake::WorkerLaunch { session: 1 })",
             "crate::control_input::cmd_key_fenced_observed(a, b)",
-            "crate::control::cross_raw_input_observed(a, b)",
+            "crate::control::post_input_reply_to_observed(a, b)",
             "crate::control::background_input_observed(a, b)",
             "crate::app_input::tracked_egress_metered(a, b)",
-            "crate::control::local_input_observed(a, b)",
+            "crate::control::front_routed_resize(a, b)",
         ] {
             let file = format!("{HEADER}fn bad() {{ let _ = {call}; }}\n");
             let found = tree_with(&[("crates/aterm-gui/src/session_log_mark.rs", file)]);
@@ -509,9 +500,8 @@ mod tests {
 
     /// A NEEDLE THAT NAMES NOTHING IS A FINDING: each PTY-path needle the
     /// PTY's home no longer names on a shipped line (renamed away, or left
-    /// only in a comment, a test item or a `*_tests.rs` file, as
-    /// `control_tests.rs` still calls the test-only `cross_raw_input(`) is
-    /// one finding naming it, so a rename cannot leave the rule blind.
+    /// only in a comment, a test item or a `*_tests.rs` file) is one finding
+    /// naming it, so a rename cannot leave the rule blind.
     #[test]
     fn a_needle_that_names_nothing_is_a_finding() {
         const TESTS: &str = "crates/aterm-gui/src/control_tests.rs";

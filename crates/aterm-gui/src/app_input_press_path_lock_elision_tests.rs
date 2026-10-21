@@ -306,10 +306,9 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         Winit(KeyCode, WinitKey, ModifiersState),
         /// A bare modifier edge.
         ModifierEdge(ModifiersState),
-        /// A control verb: `handle`'s fence (`control_fence`), then the
-        /// event the verb's own command posts through the seam
-        /// (`cmd_key`'s `parse_key`, `cmd_ctrl`'s `parse_ctrl`,
-        /// `cmd_paste`'s `paste_event`).
+        /// A control verb: `serve_session_verb`'s fence (`control_fence`), then the
+        /// event the verb's arm delivers through the seam (`key`'s `parse_key`,
+        /// `ctrl`'s `parse_ctrl`, `paste`'s `paste_event`).
         Control(&'static str, &'static str),
         /// The menu's Paste: its fence, then the clipboard's delivery.
         MenuPaste,
@@ -482,9 +481,21 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
             }
             Via::ModifierEdge(mods) => app.on_modifiers_changed(wid, mods),
             Via::Control(verb, body) => {
+                // The dispatch records its fence on the session; the seam's
+                // look applies it before the press arms anything.
                 let session = app.front_terminal(wid).unwrap().session;
-                if let Some(keep_hand) = crate::control::control_fence(verb, body, false) {
-                    assert!(app.clear_move_license_for_session(session, keep_hand));
+                if let Some(keep_hand) = crate::control::control_fence(
+                    aterm_types::control_verbs::input_of(verb),
+                    verb,
+                    body,
+                    false,
+                ) {
+                    app.pool
+                        .get(session)
+                        .expect("the front session")
+                        .ctx
+                        .licence
+                        .fence(keep_hand);
                 }
                 let ev = match verb {
                     "key" => crate::control::parse_key(body),

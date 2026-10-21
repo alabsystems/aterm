@@ -241,8 +241,11 @@ fn group(
     let mut groups: Vec<Group> = Vec::new();
     for target in targets {
         let sock = match global_sid(&target.selector) {
+            // The graph entry's socket, with a listener on it: a sid no live
+            // instance hosts is refused here, before anything is sent.
             Some(sid) if !pinned => dir
                 .and_then(|dir| self_instance_sock_in(dir, Some(sid)))
+                .filter(|sock| aterm_uds::CtlStream::connect(sock).is_ok())
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,

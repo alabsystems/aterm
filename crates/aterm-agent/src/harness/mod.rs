@@ -195,6 +195,7 @@ pub mod tap;
 pub mod timings;
 pub use timings::Timings;
 pub(crate) mod transcript;
+pub use transcript::{claude_reads, codex_reads};
 pub mod upgrade;
 pub mod upgrade_agy;
 pub mod upgrade_agy_live;

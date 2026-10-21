@@ -1024,15 +1024,16 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
     );
     assert_eq!(upgrade::QUEUE_REST_MAX_S, DAY);
     let retype_max = i64::from(upgrade::REQUEUE_MAX);
-    let defective: Vec<(&str, Model)> = std::iter::once(("Buggy", interp::with_buggy(&model, 1)))
-        .chain(
-            ["CountRetype", "Unbounded", "NoBound", "ForGood", "Flat"]
-                .into_iter()
-                .map(|knob| (knob, interp::with_consts(&model, &[(knob, 1)]))),
-        )
-        .collect();
-    let mut disagree: std::collections::BTreeMap<&str, usize> =
-        defective.iter().map(|(n, _)| (*n, 0)).collect();
+    // Each defect is caught by one look where it disagrees: a defective model
+    // is judged until then.
+    let mut uncaught: Vec<(&str, Model)> =
+        std::iter::once(("Buggy", interp::with_buggy(&model, 1)))
+            .chain(
+                ["CountRetype", "Unbounded", "NoBound", "ForGood", "Flat"]
+                    .into_iter()
+                    .map(|knob| (knob, interp::with_consts(&model, &[(knob, 1)]))),
+            )
+            .collect();
     let mut taken = std::collections::BTreeSet::new();
     let mut owned = std::collections::BTreeSet::new();
     let states = walk_reachable(&model);
@@ -1076,11 +1077,7 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
                     w.queued
                 );
                 rests.insert(w.queued);
-                for (name, m) in &defective {
-                    if !agrees(m) {
-                        *disagree.get_mut(name).expect("a knob") += 1;
-                    }
-                }
+                uncaught.retain(|(_, m)| agrees(m));
             }
         }
         for shape in renderings.of(s) {
@@ -1111,11 +1108,7 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
                 w.runs
             );
             taken.extend(w.taken);
-            for (name, m) in &defective {
-                if !walk_agrees(m, s, &w, false) {
-                    *disagree.get_mut(name).expect("a knob") += 1;
-                }
-            }
+            uncaught.retain(|(_, m)| walk_agrees(m, s, &w, false));
             // The owner's `--now`, given after the latest notice.
             let now = decisions.decide(s, shape, &Request::Now);
             assert_eq!(now.limited, reads_limit, "the owner's word at {at}");
@@ -1153,10 +1146,9 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
         std::collections::BTreeSet::from(["Retype"]),
         "the owner's word types into a full queue"
     );
-    for (name, n) in &disagree {
-        assert!(
-            *n > 0,
-            "the real code has the `{name}` defect: {disagree:?}"
-        );
-    }
+    let uncaught: Vec<&str> = uncaught.iter().map(|(name, _)| *name).collect();
+    assert!(
+        uncaught.is_empty(),
+        "the real code has these defects: {uncaught:?}"
+    );
 }

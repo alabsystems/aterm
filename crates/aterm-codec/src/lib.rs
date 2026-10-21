@@ -2,13 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Base64, hex, the wire's percent escape, the JSON string escape, the
-//! terminal-safe rendering, CRC-32 and DEFLATE for aterm.
+//! typed record sinks, the terminal-safe rendering, CRC-32 and DEFLATE for
+//! aterm.
 //!
-//! Zero external dependencies. Provides:
+//! Its one dependency is astream-wire (itself dependency-free), whose CRC-32
+//! [`crc32`] wraps. Provides:
 //!
 //! - [`base64`] — standard Base64 (RFC 4648 §4), strict and lenient decode.
+//! - [`crc32`] — CRC-32/ISO-HDLC, the gzip trailer's checksum, as a running
+//!   value over astream-wire's fold.
 //! - [`hex`] — lowercase/uppercase hex encode, either-case decode, and the
 //!   "exactly N hex digits" checks.
+//! - [`fields`] — one record, two syntaxes: a [`fields::FieldSink`] that a
+//!   producer writes each field to once, spelled as the control wire's
+//!   `key=value` line ([`fields::TextSink`]) or one JSON object
+//!   ([`fields::JsonSink`]).
 //! - [`inflate`] — RFC 1951 (DEFLATE) + RFC 1950 (zlib) decompression with a
 //!   decompression-bomb output ceiling.
 //! - [`json`] — the control path's JSON string escape: RFC 8259's, plus every
@@ -34,6 +42,7 @@ pub mod base64;
 /// The cell wire's attribute vocabulary and strict style reader.
 pub mod cell;
 pub mod crc32;
+pub mod fields;
 pub mod hex;
 pub mod inflate;
 pub mod json;

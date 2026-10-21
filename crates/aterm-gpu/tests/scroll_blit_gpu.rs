@@ -221,3 +221,142 @@ fn a_rescued_scroll_present_parks_on_no_command_buffer_of_its_own() {
         gpu.metal_encode_inline_waits() - waits_before
     );
 }
+
+/// A CARD RIDES THE GPU'S RESCUE (design §4.4 as built, B3): over scrollback
+/// with an inline card on screen (a Window Under layer, a Grid Over layer,
+/// its line's animated ink and its in-band star), each wheel notch that moves
+/// the card with its content is rescued, the planner leaving the card's rows
+/// to the band copy instead of re-encoding them, and equals a fresh full
+/// repaint: the offscreen's band copy carries the layers' light and the ink
+/// exactly as the encode draws them. A card whose layers stay put while the
+/// text scrolls is still rescued, its rows re-encoded; one whose ink stays put
+/// refuses the rescue (a retained row changed). Every frame equals a full
+/// repaint.
+///
+/// The negative controls are mutations of the shared planner (run by hand,
+/// recorded in the lane report): dropping the offset clause of
+/// `fx_damage::rides_the_blit` fails "layers held", and dropping
+/// `row_overlays_differ_shifted` from its `Rigid` check fails "ink held", each
+/// on the light or ink the band copy slid.
+#[test]
+fn a_card_rides_the_rescue_byte_identical() {
+    use std::sync::Arc;
+
+    use aterm_core::render::{
+        DecoBlend, DecoGlyph, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace,
+        InkCell, WordDecoration,
+    };
+
+    let mut gpu = fresh_gpu();
+    let (cw, ch) = gpu.cell_size();
+    let (top, chi) = (
+        i32::try_from(gpu.pad()).expect("small"),
+        i32::try_from(ch).expect("small"),
+    );
+    let rect = |x: i32, y: i32, w: usize, h: usize| {
+        FxItem::Rect(FxRect {
+            x,
+            y,
+            w: u16::try_from(w).expect("small"),
+            h: u16::try_from(h).expect("small"),
+            ink: 0,
+        })
+    };
+    // The card's line is row 4 as the scroll starts.
+    let card = [
+        FxLayer::new(
+            1,
+            Arc::new(FxContent::new(
+                vec![rect(cw as i32, top + 3 * chi + 3, 12 * cw, 2 * ch - 6)],
+                vec![FxInk::add(0x0030_2010), FxInk::add(0x0010_2030)],
+            )),
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Exact,
+        ),
+        FxLayer::new(
+            2,
+            Arc::new(FxContent::new(
+                vec![rect(3 * cw as i32, 4 * chi + 2, 4 * cw, ch - 4)],
+                vec![FxInk::over(0x0040_2030, 0x90); 2],
+            )),
+            FxSlot::Over,
+            FxSpace::Grid,
+            FxBlend::Exact,
+        ),
+    ];
+    // The card's layers `layers` rows and its line's overlays `line` rows
+    // below where they start.
+    let frame = |term: &mut Terminal, layers: i32, line: i32| {
+        let mut input = term.cell_frame(ROWS, COLS);
+        input.fx_layers = card
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                l.offset.1 += layers * chi;
+                l
+            })
+            .collect();
+        let row = u16::try_from(4 + line).expect("on the grid");
+        input.ink = (0..6)
+            .map(|i| InkCell {
+                row,
+                col: 2 + i,
+                color: [0x60, 0x40 + 0x20 * i as u8, 0xe0],
+            })
+            .collect();
+        input.word_decorations = vec![WordDecoration {
+            row,
+            col: 0,
+            dx: 0,
+            dy: 0,
+            glyph: DecoGlyph::Star4,
+            blend: DecoBlend::Add,
+            color: 0x0060_5030,
+            alpha: 220,
+        }];
+        input
+    };
+    let mut term = scrollback_term(true);
+    let mut win = WindowGpu::new();
+    let _ = gpu.present_input_readback(&mut win, &frame(&mut term, 0, 0));
+    let mut shown = 0i32;
+    // (name, notch, the card's layers ride, its ink rides, rescued)
+    // "ink held" comes last, into history after a notch the whole card rode,
+    // so no other mark (the exposed strip, the bottom row, a layer that did not
+    // ride) rebuilds the rows its ink left and reached.
+    let notches = [
+        ("rides", 1, true, true, true),
+        ("layers held", 1, false, true, true),
+        ("layers held", 1, false, true, true),
+        ("layers catch up", -1, true, true, true),
+        ("rides", 1, true, true, true),
+        ("ink held", 1, true, false, false),
+    ];
+    let (mut layers_at, mut ink_at) = (0i32, 0i32);
+    for (n, (name, step, layers_ride, ink_rides, rescues)) in notches.into_iter().enumerate() {
+        term.scroll_display(step);
+        shown += step;
+        if layers_ride {
+            layers_at = shown;
+        }
+        if ink_rides {
+            ink_at = shown;
+        }
+        let input = frame(&mut term, layers_at, ink_at);
+        let before = gpu.scroll_rescues();
+        let got = gpu.present_input_readback(&mut win, &input);
+        // The pixels first, so a planner that slid what it should have
+        // rebuilt shows as what it left behind.
+        assert_eq!(
+            got.pixels,
+            fresh_render(&input),
+            "notch {n} ({name}): the frame equals a full repaint"
+        );
+        assert_eq!(
+            gpu.scroll_rescues() - before,
+            u64::from(rescues),
+            "notch {n} ({name}): rescued"
+        );
+    }
+}

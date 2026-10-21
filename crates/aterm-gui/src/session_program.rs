@@ -199,50 +199,17 @@ pub(crate) fn program_of(pid: i32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn platform_argv_head(pid: i32) -> Option<(String, Option<String>)> {
-    // KERN_PROCARGS2 answers `int argc`, the exec path (NUL-terminated, then
-    // NUL padding), then argv[0..argc], each NUL-terminated.
-    // `KERN_PROCARGS2` (`<sys/sysctl.h>`), which the workspace's libc does
-    // not export.
-    const KERN_PROCARGS2: libc::c_int = 49;
-    let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
-    let mut size: libc::size_t = 0;
-    // SAFETY: a size query (null buffer) on a fixed three-int MIB.
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || size < std::mem::size_of::<libc::c_int>() {
-        return None;
-    }
-    let mut buf = vec![0u8; size];
-    // SAFETY: `buf` holds `size` writable bytes and `size` says so; the kernel
-    // writes at most that many and updates `size` to what it wrote.
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buf.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    buf.truncate(size);
-    argv_head_from_procargs2(&buf)
+    // aterm-uds's reader, whose buffer holds the whole answer: one sized by a
+    // size query first was given only the argc of a shell that exec'd between
+    // the two calls.
+    argv_head_from_procargs2(&aterm_uds::procargs::read(u32::try_from(pid).ok()?)?)
 }
 
 #[cfg(target_os = "linux")]
 fn platform_argv_head(pid: i32) -> Option<(String, Option<String>)> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    // aterm-uds's read, which leaks nothing under Rosetta and drops the word its
+    // interpreter put first (`aterm_uds::process::read_cmdline`).
+    let bytes = aterm_uds::process::read_cmdline(u32::try_from(pid).ok()?)?;
     let mut args = bytes.split(|b| *b == 0);
     let first = args.next().filter(|a| !a.is_empty())?;
     let second = args.next().filter(|a| !a.is_empty());
@@ -255,47 +222,16 @@ fn platform_argv_head(_pid: i32) -> Option<(String, Option<String>)> {
     None
 }
 
-/// argv[0] and (when `argc > 1`) argv[1] out of a `KERN_PROCARGS2` buffer.
-/// Pure, so the layout is testable without a process.
+/// argv[0] and (when `argc > 1`) argv[1] out of a `KERN_PROCARGS2` buffer
+/// ([`aterm_uds::procargs::parse`]), each where it is not empty. Pure, so the
+/// policy is testable without a process.
 #[cfg(any(target_os = "macos", test))]
 fn argv_head_from_procargs2(buf: &[u8]) -> Option<(String, Option<String>)> {
-    let argv0 = argv0_from_procargs2(buf)?;
-    let int = std::mem::size_of::<i32>();
-    let argc = i32::from_ne_bytes(buf.get(..int)?.try_into().ok()?);
-    let argv1 = (argc > 1)
-        .then(|| {
-            let rest = &buf[int..];
-            let path_end = rest.iter().position(|b| *b == 0)?;
-            let rest = &rest[path_end..];
-            let start = rest.iter().position(|b| *b != 0)?;
-            let rest = &rest[start..];
-            let end0 = rest.iter().position(|b| *b == 0)?;
-            let rest = rest.get(end0 + 1..)?;
-            let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
-            let arg = &rest[..end];
-            (!arg.is_empty()).then(|| String::from_utf8_lossy(arg).into_owned())
-        })
-        .flatten();
+    let args = aterm_uds::procargs::parse(buf)?;
+    let text = |a: &&[u8]| String::from_utf8_lossy(a).into_owned();
+    let argv0 = args.argv.first().filter(|a| !a.is_empty()).map(text)?;
+    let argv1 = args.argv.get(1).filter(|a| !a.is_empty()).map(text);
     Some((argv0, argv1))
-}
-
-/// argv[0] out of a `KERN_PROCARGS2` buffer.
-#[cfg(any(target_os = "macos", test))]
-fn argv0_from_procargs2(buf: &[u8]) -> Option<String> {
-    let int = std::mem::size_of::<i32>();
-    let argc = i32::from_ne_bytes(buf.get(..int)?.try_into().ok()?);
-    if argc < 1 {
-        return None;
-    }
-    let rest = &buf[int..];
-    // Skip the exec path, then the NUL padding after it.
-    let path_end = rest.iter().position(|b| *b == 0)?;
-    let rest = &rest[path_end..];
-    let start = rest.iter().position(|b| *b != 0)?;
-    let rest = &rest[start..];
-    let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
-    let argv0 = &rest[..end];
-    (!argv0.is_empty()).then(|| String::from_utf8_lossy(argv0).into_owned())
 }
 
 // ---------------------------------------------------------------- the leader's facts
@@ -1546,16 +1482,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn procargs2_layout_yields_argv0_not_the_exec_path() {
-        let mut buf = 2i32.to_ne_bytes().to_vec();
-        buf.extend_from_slice(b"/Users//x/.local/share/claude/versions/2.1.280\0\0\0\0");
-        buf.extend_from_slice(b"claude\0--resume\0PATH=/bin\0");
-        assert_eq!(argv0_from_procargs2(&buf).as_deref(), Some("claude"));
-        assert_eq!(argv0_from_procargs2(&0i32.to_ne_bytes()), None, "argc 0");
-        assert_eq!(argv0_from_procargs2(b"\x01"), None, "short buffer");
-    }
-
     /// A real child: its argv[0] is read from the process table, and a
     /// renamed argv[0] (`exec -a claude`) is what is published — the shape an
     /// agent launched through a shim or a version directory takes.
@@ -1581,14 +1507,21 @@ mod tests {
         assert_eq!(program_of(-1), None);
 
         // `exec -a` is a bash builtin (not POSIX sh's).
-        if !std::path::Path::new("/bin/bash").exists() {
-            return;
-        }
+        let Some(bash) = aterm_spec::host::test_shell("bash") else {
+            aterm_spec::host::could_not_run(format!(
+                "the `exec -a` half did not run: {}",
+                aterm_spec::host::tool("bash").refusal()
+            ));
+        };
+        // A real bash, so a hermetic one (§8.6 of the init design): a scratch home, and no
+        // inherited `$BASH_ENV`, which a non-interactive bash would source.
+        let home = aterm_tempfile::tempdir().expect("scratch home");
         let mut child = quiet_child(
-            aterm_uds::spawnfd::command("/bin/bash").args(["-c", "exec -a claude sleep 30"]),
+            aterm_spec::host::shell_command(&bash, home.path())
+                .args(["-c", "exec -a claude sleep 30"]),
         )
         .spawn()
-        .expect("spawn sh");
+        .expect("spawn bash");
         let pid = i32::try_from(child.id()).expect("pid");
         // `exec -a` replaces the shell in place; wait for the new image —
         // the same exec window, so the same bounded, exact-match poll.
@@ -1667,8 +1600,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The head is argv[0], never the exec path, and argv[1] where argc says
+    /// there is one; a process with no argv[0] has no head. The layout's edge
+    /// cases are `aterm_uds::procargs`'s (`procargs_tests.rs`).
     #[test]
     fn procargs2_layout_yields_argv1_after_argv0() {
+        let mut two = 2i32.to_ne_bytes().to_vec();
+        two.extend_from_slice(b"/Users//x/.local/share/claude/versions/2.1.280\0\0\0\0");
+        two.extend_from_slice(b"claude\0\0PATH=/bin\0");
+        assert_eq!(
+            argv_head_from_procargs2(&two),
+            Some(("claude".to_string(), None)),
+            "argv[0], not the exec path; an empty argv[1] is none"
+        );
+        assert_eq!(
+            argv_head_from_procargs2(&0i32.to_ne_bytes()),
+            None,
+            "argc 0"
+        );
         let mut buf = 3i32.to_ne_bytes().to_vec();
         buf.extend_from_slice(b"/bin/sh\0\0\0");
         buf.extend_from_slice(b"/bin/sh\0/pkg/agents/claude\0--resume\0PATH=/bin\0");

@@ -333,8 +333,8 @@ fn water_repaint_corridor_deduplicates_and_cannot_cover_text() {
     let newest = residents.next().expect("newest resident exists");
     let previous = residents.next().expect("a duplicate resident exists");
     let heat = glow.heat.clamp(0.0, 1.0);
-    let newest_color = water_ramp(0.58 + 0.30 * newest.pos + 0.12 * heat);
-    let previous_color = water_ramp(0.58 + 0.30 * previous.pos + 0.12 * heat);
+    let newest_color = CursorGlow::water_crest_color(newest.pos, heat);
+    let previous_color = CursorGlow::water_crest_color(previous.pos, heat);
     assert_ne!(
         newest_color, previous_color,
         "fixture must distinguish newest from the previous crossing"
@@ -494,81 +494,255 @@ fn water_jump_reflection_drips_then_fades_smoothly_to_zero() {
     );
 }
 
-/// Light-theme law: Water draws its own wake in ink. The undertow and crest
-/// ride the swell as on a dark ground, as source-over ink under the letters
-/// (no additive light, which white paper cannot show), so the spine moves
-/// vertically from cell to cell; a jump's droplets and ripples are ink marks
-/// over the text. Negative control: the same run on a dark ground stays
-/// additive.
+/// Water on a light ground is ink under the letters: a hot typing run and a
+/// jump with `dark_theme: false`, at the default intensity, emit no additive
+/// quad or halo in any stream; the wake is source-over paint in the
+/// under-ink stream and keeps its travelling wave; and the landing lays its
+/// ripple train in conservative ink. Legibility is read the way the gallery probe reads a
+/// cell: every cell's x-height ground, which the letters' strokes are drawn
+/// over, keeps a dark foreground 4.5:1 on average; and along a typed run,
+/// where the wave has no corners, so does its darkest pixel (crest over
+/// undertow). A diagonal jump's staircase corners paint a stroke's join twice,
+/// as they light it twice on a dark ground, so its pixels are judged by cell.
 #[test]
-fn light_theme_wake_is_water_in_ink() {
+fn water_on_light_is_ink_under_the_letters() {
     let g = geom();
     let mut c = cfg(GlowStyle::Water, true);
     c.dark_theme = false;
-    c.theme_fg = 0x0024_292F;
+    c.theme_fg = 0x001F_2328;
     c.theme_bg = 0x00FF_FFFF;
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
-    glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+    let table = crate::color_math::relative_luminance_table();
+    let lum = |px: u32| crate::color_math::relative_luminance_with(table, px);
+    let fg = lum(c.theme_fg);
+    let (mut darkest_cell, mut darkest_run) = (1.0f32, 1.0f32);
+    let (mut wake_rows, mut ripple) = (std::collections::BTreeSet::new(), false);
+    let mut check = |glow: &CursorGlow, out: &[GlowQuad], typing: bool, ring: bool| {
+        for q in out.iter().chain(glow.under_quads()) {
+            assert!(q.alpha > 0, "an additive quad on a light ground: {q:?}");
+        }
+        for h in glow.halos() {
+            assert_eq!(h.mode, HaloMode::Over, "an additive halo on light: {h:?}");
+        }
+        // Water lands its ripple train as ink quads over the text.
+        ripple |= ring && out.iter().any(|q| q.alpha > 0);
+        let mut glass = Glass::new(g, c.theme_bg);
+        glass.add_quads(glow.under_quads());
+        if typing {
+            darkest_run = glass
+                .px
+                .iter()
+                .map(|&px| lum(px))
+                .fold(darkest_run, f32::min);
+        }
+        for row in 0..g.rows as u16 {
+            for col in 0..g.cols as u16 {
+                let (x0, y0, x1, _) = glass.cell_rect(row, col);
+                let (top, bot) = (y0 + g.ch as i32 * 3 / 10, y0 + g.ch as i32 * 8 / 10);
+                let band: Vec<f32> = (top..bot)
+                    .flat_map(|y| (x0..x1).map(move |x| (y, x)))
+                    .map(|(y, x)| lum(glass.at(y, x)))
+                    .collect();
+                let mean = band.iter().sum::<f32>() / band.len() as f32;
+                darkest_cell = darkest_cell.min(mean);
+            }
+        }
+        wake_rows.extend(
+            glow.under_quads()
+                .iter()
+                .filter(|q| q.row == 2)
+                .map(|q| q.y),
+        );
+    };
     let mut t = t0;
-    for col in 5..=12u16 {
-        t += Duration::from_millis(60);
+    glow.tick(Some((2, 1)), t, &c, g, &mut out);
+    for col in 2..=14u16 {
+        t += Duration::from_millis(50);
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, col)), t, &c, g, &mut out);
+        check(&glow, &out, true, false);
     }
-    let under = glow.under_quads();
-    assert!(!under.is_empty(), "the light wake is drawn");
+    assert!(!glow.under_quads().is_empty(), "the wake paints on white");
+    let jump = t + Duration::from_millis(60);
+    glow.note_synthetic_move(jump);
+    glow.tick(Some((4, 34)), jump, &c, g, &mut out);
+    assert!(glow.ring.is_some(), "the jump lands a ring");
+    check(&glow, &out, false, true);
+    for ms in [40u64, 120, 250, 420] {
+        glow.tick(
+            Some((4, 34)),
+            jump + Duration::from_millis(ms),
+            &c,
+            g,
+            &mut out,
+        );
+        check(&glow, &out, false, ms <= 120);
+    }
     assert!(
-        under.iter().all(|q| q.alpha > 0 && q.alpha2 > 0),
-        "the light wake is source-over ink"
+        wake_rows.len() >= 3,
+        "the wake still travels as a wave on white: {wake_rows:?}"
+    );
+    assert!(ripple, "the landing lays the inked ripple train");
+    assert!(
+        darkest_run < 0.5,
+        "the wake visibly paints the paper: {darkest_run}"
+    );
+    let ratio = |l: f32| (l + 0.05) / (fg + 0.05);
+    assert!(
+        ratio(darkest_cell) >= 4.5,
+        "a cell's ground under the wake leaves the foreground {:.2}:1",
+        ratio(darkest_cell)
     );
     assert!(
-        out.iter().all(|q| q.alpha > 0),
-        "no additive light on paper"
+        ratio(darkest_run) >= 4.5,
+        "the typed run's darkest pixel leaves the foreground {:.2}:1",
+        ratio(darkest_run)
     );
-    // The swell: the ink's top edge moves between cells behind the caret.
-    let tops: std::collections::BTreeSet<u16> = (6..11u16)
-        .filter_map(|col| {
-            let x = col * g.cw as u16 + g.cw as u16 / 2;
-            under
-                .iter()
-                .filter(|q| (q.x..q.x + q.w).contains(&x))
-                .map(|q| q.y)
-                .min()
+}
+
+/// The largest turn, in degrees, between two consecutive segments of a
+/// polyline (zero-length segments skipped).
+fn sharpest_turn(points: &[(f32, f32)]) -> f32 {
+    let segs: Vec<(f32, f32)> = points
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0, w[1].1 - w[0].1))
+        .filter(|d| d.0.hypot(d.1) > 1e-3)
+        .collect();
+    segs.windows(2)
+        .map(|w| {
+            let (a, b) = (w[0].1.atan2(w[0].0), w[1].1.atan2(w[1].0));
+            let d = (b - a).abs().to_degrees();
+            d.min(360.0 - d)
+        })
+        .fold(0.0f32, f32::max)
+}
+
+/// THE WATER'S SURFACE IS A SWELL, NOT A POLYLINE: along a hot typed run the
+/// crest is drawn through the swell between its cells, so no knot turns it
+/// sharply (a chord's corner at a crest stood between two words as a typed
+/// `^`); a leap's surface across rows is one straight line from its first
+/// cell to its last (the cells' stair drew a zigzag through the lines it
+/// crossed). Negative control: the chords between the same cells turn
+/// sharply at the crests.
+#[test]
+fn the_water_surface_is_a_swell_and_a_leap_is_straight() {
+    let g = tall_geom();
+    let mut c = cfg(GlowStyle::Water, true);
+    c.intensity = 1.0;
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let mut t = Instant::now();
+    let row = 3u16;
+    glow.tick(Some((row, 2)), t, &c, g, &mut out);
+    for col in 3..=26u16 {
+        t += Duration::from_millis(45);
+        glow.note_synthetic_typed(t, 1);
+        glow.tick(Some((row, col)), t, &c, g, &mut out);
+    }
+    let samples = glow.water_samples.clone();
+    assert!(
+        samples.len() >= 8,
+        "fixture: a run of water ({})",
+        samples.len()
+    );
+    let mut curve = Vec::new();
+    CursorGlow::water_curve(&samples, &mut curve);
+    let smooth = sharpest_turn(&curve.iter().map(|v| (v.x, v.y)).collect::<Vec<_>>());
+    let chords = sharpest_turn(
+        &samples
+            .iter()
+            .map(|s| (s.surface.x, s.surface.y))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        smooth * 2.5 < chords,
+        "the crest turns {smooth:.1}° at a knot (its chords {chords:.1}°)"
+    );
+    assert!(chords >= 20.0, "control: the chords turn only {chords:.1}°");
+    // A leap: the same samples carried down a stair of rows.
+    let stair: Vec<WaterSample> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| WaterSample {
+            row: s.row + (i / 3) as u16,
+            line_y: s.line_y + (i / 3) as f32 * g.ch as f32,
+            ..*s
         })
         .collect();
-    assert!(tops.len() >= 2, "the wake rides the swell: {tops:?}");
-    // A jump: droplets and ripples are ink marks.
-    glow.note_synthetic_move(t + Duration::from_millis(60));
-    glow.tick(
-        Some((4, 34)),
-        t + Duration::from_millis(60),
-        &c,
-        g,
-        &mut out,
-    );
-    glow.tick(
-        Some((4, 34)),
-        t + Duration::from_millis(120),
-        &c,
-        g,
-        &mut out,
-    );
+    CursorGlow::water_curve(&stair, &mut curve);
+    let (a, b) = (curve[0], curve[curve.len() - 1]);
+    let off = curve
+        .iter()
+        .map(|v| {
+            let u = (v.x - a.x) / (b.x - a.x);
+            (v.y - (a.y + (b.y - a.y) * u)).abs()
+        })
+        .fold(0.0f32, f32::max);
     assert!(
-        glow.halos().iter().all(|h| h.mode == HaloMode::Over),
-        "every mark over the text is source-over ink"
+        off <= 1.0,
+        "a leap's surface strays {off:.1} px off its line"
     );
-    assert!(out.iter().all(|q| q.alpha > 0), "the ripples are ink");
-    // Negative control: a dark ground keeps the additive wake.
-    let dark = cfg(GlowStyle::Water, true);
-    let mut glow = CursorGlow::default();
-    let mut t = t0;
-    glow.tick(Some((2, 4)), t, &dark, g, &mut out);
-    for col in 5..=12u16 {
-        t += Duration::from_millis(60);
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((2, col)), t, &dark, g, &mut out);
+}
+
+/// ON PAPER A WATER DROP IS CLEAR BLUE AND ROUND: a falling drop over the
+/// white page is laid as a round bead whose ink is a saturated water blue
+/// (a slate mote read as grit). Negative control: the dark ground's drop of
+/// the same grain is light, not ink.
+#[test]
+fn a_light_water_drop_is_clear_blue() {
+    let g = tall_geom();
+    let at = Instant::now();
+    let drop = |dark: bool| {
+        let mut c = cfg(GlowStyle::Water, true);
+        c.intensity = 1.0;
+        c.dark_theme = dark;
+        if !dark {
+            (c.theme_fg, c.theme_bg) = (0x001F_2328, 0x00FF_FFFF);
+        }
+        let mut glow = CursorGlow::default();
+        let (x, y) = g.cell_center(1, 20);
+        glow.particles.push(Particle {
+            x0: x,
+            y0: y,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            hue: 0.8,
+            cov_scale: 1.0,
+            born: at,
+        });
+        let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+        glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut under);
+        (out, halos)
+    };
+    let (ink, halos) = drop(false);
+    assert!(halos.is_empty() && !ink.is_empty(), "the light drop is ink");
+    for q in &ink {
+        let a = u32::from(q.alpha.max(1));
+        let un = |sh: u32| (((q.color >> sh) & 0xff) * 255 / a).min(255);
+        let rgb = (un(16) << 16) | (un(8) << 8) | un(0);
+        let (hue, sat, _) = crate::color_math::rgb2hsv(rgb);
+        assert!(
+            (190.0..=215.0).contains(&hue) && sat >= 0.6,
+            "the drop's ink is not clear water blue: {rgb:06x} ({hue:.0}°, {sat:.2})"
+        );
     }
-    assert!(glow.under_quads().iter().all(|q| q.alpha == 0));
+    let rows: std::collections::BTreeMap<u16, u32> =
+        ink.iter().fold(Default::default(), |mut m, q| {
+            *m.entry(q.y).or_default() += u32::from(q.w);
+            m
+        });
+    let widths: Vec<u32> = rows.values().copied().collect();
+    assert!(
+        widths.len() >= 3 && widths[widths.len() / 2] > widths[0],
+        "the drop is round: row widths {widths:?}"
+    );
+    let (lit, light) = drop(true);
+    assert!(
+        lit.iter().all(|q| q.alpha == 0) && !light.is_empty(),
+        "control: the dark drop is light"
+    );
 }

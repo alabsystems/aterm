@@ -20,7 +20,7 @@ pub const FAST_TAU_S: f32 = 2.0;
 pub const SLOW_TAU_S: f32 = 20.0;
 /// Raw samples the variance is taken over (10 s at the 1 s cadence).
 pub const MAD_WINDOW: usize = 10;
-/// Samples a [`History`] keeps by default: two minutes at 1 Hz.
+/// Seconds a [`History`] keeps by default: two minutes.
 pub const HISTORY_LEN: usize = 120;
 
 /// A quantity's level, momentum and variance ([`Trend::view`]).
@@ -219,13 +219,28 @@ fn median(v: &mut [f32]) -> f32 {
     }
 }
 
-/// The last [`HISTORY_LEN`] (or a chosen count of) samples of one quantity,
-/// oldest first. `None` marks a gap: a sample that was not taken (the window
+/// Skipped seconds a timed push ([`History::push_at`]) fills with the
+/// reading that ends them: a reading every five seconds in the background is
+/// that quantity over those five seconds. A longer silence (no window showed
+/// the bars) is a gap.
+pub const HISTORY_FILL_S: u64 = 6;
+
+/// The last [`HISTORY_LEN`] (or a chosen count of) seconds of one quantity,
+/// oldest first. `None` marks a gap: a second nothing was read (the window
 /// was hidden, the reader failed), drawn as a gap, never as zero.
+///
+/// A timed push ([`History::push_at`]) keeps one entry per second of the
+/// host clock whatever the reading cadence: two readings in one second (the
+/// lens's 2 Hz) fold into that second's mean, and a reading after a short
+/// silence (the background's 5 s) fills the seconds it spans. So a history
+/// of 60 entries is always the last minute, and the surfaces may say so.
 #[derive(Clone, Debug, PartialEq)]
 pub struct History {
     values: std::collections::VecDeque<Option<f32>>,
     cap: usize,
+    /// The second the newest entry holds, and how many readings it averages
+    /// (`None` before the first timed push).
+    last: Option<(u64, u32)>,
 }
 
 impl Default for History {
@@ -242,15 +257,57 @@ impl History {
         Self {
             values: std::collections::VecDeque::with_capacity(cap),
             cap,
+            last: None,
         }
     }
 
-    /// Append one sample, or a gap with `None`, dropping the oldest past the cap.
+    /// Append one sample, or a gap with `None`, dropping the oldest past the
+    /// cap: one entry per call, whatever the time (see [`Self::push_at`]).
     pub fn push(&mut self, v: Option<f32>) {
+        self.last = None;
+        self.append(v.filter(|x| x.is_finite()));
+    }
+
+    /// Record the reading taken at `at_ns` (the host's monotonic clock) in
+    /// the second it fell in: folded into that second's mean when the second
+    /// already holds one, else appended after the seconds since the last
+    /// reading (filled with this reading for at most [`HISTORY_FILL_S`] of
+    /// them, gaps beyond).
+    pub fn push_at(&mut self, v: Option<f32>, at_ns: u64) {
+        let v = v.filter(|x| x.is_finite());
+        let second = at_ns / 1_000_000_000;
+        match self.last {
+            Some((last, n)) if second <= last => {
+                // A gap reading leaves the second's mean as it is.
+                if let (Some(back), Some(new)) = (self.values.back_mut(), v) {
+                    *back = Some(match *back {
+                        Some(old) if n > 0 => (old * n as f32 + new) / (n + 1) as f32,
+                        _ => new,
+                    });
+                    self.last = Some((last, n + 1));
+                }
+            }
+            Some((last, _)) => {
+                let skipped = second - last - 1;
+                let fill = if skipped <= HISTORY_FILL_S { v } else { None };
+                for _ in 0..skipped.min(self.cap as u64) {
+                    self.append(fill);
+                }
+                self.append(v);
+                self.last = Some((second, u32::from(v.is_some())));
+            }
+            None => {
+                self.append(v);
+                self.last = Some((second, u32::from(v.is_some())));
+            }
+        }
+    }
+
+    fn append(&mut self, v: Option<f32>) {
         if self.values.len() == self.cap {
             self.values.pop_front();
         }
-        self.values.push_back(v.filter(|x| x.is_finite()));
+        self.values.push_back(v);
     }
 
     /// The samples, oldest first.
@@ -377,6 +434,60 @@ mod tests {
         t.push(0.5, f32::NAN);
         t.push(f32::INFINITY, 1.0);
         assert_eq!(t.view().level, 0.5);
+    }
+
+    const S: u64 = 1_000_000_000;
+
+    #[test]
+    fn a_timed_history_keeps_one_entry_a_second_at_any_cadence() {
+        // 2 Hz (the lens): two readings a second fold into that second's mean.
+        let mut h = History::with_capacity(60);
+        for i in 0..120u64 {
+            h.push_at(Some(if i % 2 == 0 { 0.2 } else { 0.4 }), 10 * S + i * S / 2);
+        }
+        assert_eq!(h.len(), 60, "120 readings at 2 Hz are the last minute");
+        assert!(
+            h.to_vec()
+                .iter()
+                .all(|v| v.is_some_and(|x| (x - 0.3).abs() < 1e-6))
+        );
+        // 1 Hz: one entry each.
+        let mut h = History::with_capacity(60);
+        for i in 0..30u64 {
+            h.push_at(Some(0.5), 10 * S + i * S);
+        }
+        assert_eq!(h.len(), 30);
+    }
+
+    #[test]
+    fn a_timed_history_fills_a_short_silence_and_gaps_a_long_one() {
+        // The background's 5 s: the reading spans the seconds it ends.
+        let mut h = History::with_capacity(60);
+        h.push_at(Some(0.1), 10 * S);
+        h.push_at(Some(0.7), 15 * S);
+        assert_eq!(
+            h.to_vec(),
+            vec![
+                Some(0.1),
+                Some(0.7),
+                Some(0.7),
+                Some(0.7),
+                Some(0.7),
+                Some(0.7)
+            ]
+        );
+        // Minutes with no reading (the bars were hidden) are gaps.
+        let mut h = History::with_capacity(60);
+        h.push_at(Some(0.1), 10 * S);
+        h.push_at(Some(0.7), 100 * S);
+        let v = h.to_vec();
+        assert_eq!(
+            v.len(),
+            60,
+            "the gap fills the whole minute, then the reading"
+        );
+        assert_eq!(v.last(), Some(&Some(0.7)));
+        assert!(v[..59].iter().all(Option::is_none));
     }
 
     #[test]

@@ -362,9 +362,12 @@ impl ReleaseHost for FakeHost {
         self.log(format!("clone {slug}"));
         self.reachable(slug)?;
         let source = self.clone_source(slug)?;
-        git(aterm_uds::spawnfd::command("git")
-            .arg("clone")
-            .arg("--quiet")
+        // No template: the fake's clone carries no sample hooks or description, files every
+        // lane test makes and removes and no lane reads. Automatic maintenance stays off in
+        // the clone, for the fetches the fake runs in it later ([`crate::testkit::git`]).
+        git(crate::testkit::git()
+            .args(["-c", "init.templateDir=", "clone"])
+            .args(["--quiet", "--config", "maintenance.auto=false"])
             .arg(&source)
             .arg(dest))
     }
@@ -373,7 +376,7 @@ impl ReleaseHost for FakeHost {
         self.log(format!("fetch-repo {slug}"));
         self.reachable(slug)?;
         let source = self.clone_source(slug)?;
-        git(aterm_uds::spawnfd::command("git")
+        git(crate::testkit::git()
             .arg("-C")
             .arg(dir)
             .args(["fetch", "--quiet", "--tags", "--force"])

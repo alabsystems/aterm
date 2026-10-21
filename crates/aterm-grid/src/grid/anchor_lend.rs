@@ -15,11 +15,21 @@
 //!
 //! The walk is checked, not trusted. Each line's glyphs are hashed on the
 //! way out and again on the way back, as one rolling digest from the
-//! cursor's line up, and the drawn lines below the cursor's line (glyphs
-//! or coloured backgrounds) must come back as a prefix of what they were. A mismatch (a row the resize
-//! rotated across the cursor, a fragment severed from its head, glyphs a
-//! DECDWL row truncated) marks every anchor lost, so the fence taints: the
-//! lend never places an anchor on text it cannot show is the same.
+//! cursor's line up, and the drawn lines below the cursor's line (anything
+//! an erased cell does not show: a glyph, a background, a reversed or
+//! underlined blank, an image, a double-size row) must come back as a
+//! prefix of what they were. A mismatch (a row the resize rotated across the
+//! cursor, a fragment severed from its head, glyphs a DECDWL row truncated)
+//! marks every anchor lost, so the fence taints: the lend never places an
+//! anchor on text it cannot show is the same, nor on a line it cannot read
+//! from its head.
+//!
+//! A bottom-push's owed rows are refused outright. They sit in history as
+//! its newest lines and come back under the screen at a resize: a rotation
+//! across the cursor's line that the line count does not describe, and one
+//! the glyph trail cannot see when the rotated row holds no glyph (another
+//! writer's background, landing on the cursor's own line). A lend with rows
+//! owed places nothing.
 //!
 //! What it cannot reach it clamps (the design's "clamp before detach"): a
 //! line beyond the walk's reach (an offloaded detach hands older history to
@@ -37,7 +47,6 @@ use aterm_hash::FxHasher;
 use std::hash::Hasher;
 
 use super::Grid;
-use super::anchor_hooks::row_inked;
 use super::reflow::is_mergeable_continuation;
 use super::scroll_convert::{RowToLineCursorState, next_combining, next_complex_char};
 use super::scrollback_offload::HOLD_BACK_SCREENS;
@@ -61,8 +70,9 @@ enum Lent {
     Head(usize),
     /// On a continuation row of that line.
     Mid(usize),
-    /// Below the cursor's line; `true` when nothing was drawn (no glyph, no
-    /// background) on any row between that line and the anchor.
+    /// Below the cursor's line; `true` when nothing was drawn (nothing an
+    /// erased cell does not show) on any row between that line and the
+    /// anchor.
     Below(bool),
     /// Not placeable (the cursor's own line could not be read).
     Unknown,
@@ -230,9 +240,10 @@ impl Grid {
     }
 
     /// The glyph digests of drawn logical lines below the line ending at
-    /// `last`. Background-only rows count even though their glyph digest is
-    /// blank, so a rewrap cannot silently bring another writer's background
-    /// into an open span. Unreadable payloads still refuse the lend.
+    /// `last`. A line drawn with no glyph (a background, a reversed or
+    /// underlined blank, an image, a double size) counts though its glyph
+    /// digest is blank, so a rewrap cannot silently bring another writer's
+    /// ink into an open span. Unreadable payloads still refuse the lend.
     fn below_digests(&self, last: u64) -> Option<Vec<u64>> {
         let end = self.visible_to_absolute(0) + u64::from(self.storage.visible_rows);
         let mut out = Vec::new();
@@ -246,7 +257,7 @@ impl Grid {
                     break;
                 }
                 hash_glyphs(&mut h, self, r, cells)?;
-                drawn |= row_inked(cells, 0);
+                drawn |= self.absolute_row_inked(r);
                 r += 1;
             }
             if drawn {
@@ -265,6 +276,8 @@ impl Grid {
             return None;
         }
         let set = self.storage.presentation.anchors.take_for_lend();
+        // Rows a bottom-push owes come back by rotation (see the module doc).
+        let owed = self.pushed_rows() > 0;
         let floor = match reach {
             LendReach::Ring => 0,
             LendReach::Rows(rows) => self.visible_to_absolute(0).saturating_sub(rows),
@@ -291,7 +304,7 @@ impl Grid {
             }
         }
         let classify = |row: u64| -> Lent {
-            let (Some((_, last0)), Some(oldest)) = (cursor_line, lines.last()) else {
+            let (Some((_, last0)), Some(oldest), false) = (cursor_line, lines.last(), owed) else {
                 return Lent::Unknown;
             };
             let Some(past_screen) = self
@@ -300,16 +313,22 @@ impl Grid {
             else {
                 return Lent::Unknown;
             };
-            if row > past_screen {
+            // A point past the screen is a real one up to the rows a shrink
+            // trimmed off the bottom (a rows-only resize leaves anchors where
+            // they were); no row is drawn there, so only the screen's rows
+            // make its gap (a bottom-push's owed rows refused the lend
+            // above). A point further out than any screen reaches names no
+            // row.
+            if row > past_screen.saturating_add(u64::from(crate::MAX_GRID_ROWS)) {
                 return Lent::Unknown;
             }
             if row > last0 {
                 let mut gap_blank = true;
-                for r in last0 + 1..row {
-                    let Some(cells) = self.live_row_at_absolute(r) else {
+                for r in last0 + 1..row.min(past_screen) {
+                    if self.live_row_at_absolute(r).is_none() {
                         return Lent::Unknown;
-                    };
-                    gap_blank &= !row_inked(cells, 0);
+                    }
+                    gap_blank &= !self.absolute_row_inked(r);
                 }
                 return Lent::Below(gap_blank);
             }
@@ -519,6 +538,20 @@ mod tests {
                 );
             }
         }
+
+        // A rows-only shrink trims blank rows off the bottom and leaves an
+        // open span's Start where it was, past the new screen: still a
+        // point below the cursor's line, with nothing drawn between.
+        let mut g = Grid::with_scrollback(8, 10, 100);
+        let start = g.anchors_mut().place(8, AnchorRole::Start).unwrap();
+        g.resize(4, 10);
+        assert_eq!(g.visible_to_absolute(0), 0, "precondition: a trim");
+        assert_eq!(g.anchors().row(start), Some(8), "precondition: past it");
+        let lend = g.lend_anchors(LendReach::Ring).unwrap();
+        g.resize(4, 12);
+        g.take_back_anchors(lend);
+        assert!(!g.anchors().lost(), "a trimmed-past Start is no unknown");
+        assert_eq!(g.anchors().row(start), Some(1), "after the cursor's line");
 
         let mut g = Grid::with_scrollback(4, 10, 100);
         g.set_cursor(1, 0);

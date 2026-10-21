@@ -856,3 +856,61 @@ fn a_discard_racing_the_drainers_write_drops_the_frame_whole() {
     drop(sink);
     close_pair(master, slave);
 }
+
+/// A DISCARD BEHIND A GUARDED WRITE MARKS WHAT THE KERNEL TOOK. The guarded
+/// write closes its ledger bracket as its `write(2)` returns, while it still
+/// holds the spill mutex, so a discard waiting on that mutex marks the
+/// ledger at the 1022 bytes the kernel accepted, not at the 1118 the frame
+/// was. The discard is run from the arranger poke, the first thing the write
+/// does after it lets the spill mutex go, with the fd lock still held. It
+/// drops the head and the queued rest; then one byte is written and the
+/// program reads it, and that read is seen.
+///
+/// NEGATIVE CONTROL (by hand): with the bracket closed after the poke, the
+/// discard marks the whole frame as in flight (`accepted + inflight` = 1118) and
+/// the write then closes at 1022, so every later byte is under-counted by
+/// the 96 queued ones: the program's read of its one byte answers `false`.
+#[test]
+fn a_discard_behind_a_guarded_write_marks_what_the_kernel_took() {
+    let text = head_and_tail();
+    let (master, slave) = pty_pair(true);
+    aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
+    let sink = Arc::new(nonblocking_sink(master));
+    let dropped = Arc::new(Mutex::new(None));
+    {
+        let (weak, dropped) = (Arc::downgrade(&sink), Arc::clone(&dropped));
+        let fired = AtomicBool::new(false);
+        sink.install_spill_arranger(move || {
+            let Some(sink) = weak.upgrade() else { return };
+            if !fired.swap(true, Ordering::SeqCst) {
+                *dropped.lock().expect("dropped") = sink.discard_unread_input(Discard::Flush);
+            }
+            sink.arrange_pending_drainer();
+        });
+    }
+    assert_eq!(
+        sink.try_write_frame_whole_with_receipt(&text).0,
+        ImmediateWrite::Queued { accepted: 1022 }
+    );
+    assert_eq!(
+        *dropped.lock().expect("dropped"),
+        Some(text.len()),
+        "the head from the kernel's queue and the rest from the spill"
+    );
+    assert!(!sink.read_since_discard(), "nothing written since");
+    let pressed = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(5), || {
+        match sink.try_write_frame_whole_with_receipt(b"x").0 {
+            ImmediateWrite::Full => Some(()),
+            ImmediateWrite::BusyZero => None,
+            other => panic!("one byte into an empty queue: {other:?}"),
+        }
+    });
+    assert!(pressed.is_some(), "the byte never went after the discard");
+    let _ = settle(&sink, |b| b.queued == 1);
+    assert!(!sink.read_since_discard(), "written, not read");
+    assert_eq!(read_all_within(slave, 1), b"x");
+    assert!(nothing_more(slave));
+    assert!(sink.read_since_discard(), "the program read it");
+    drop(sink);
+    close_pair(master, slave);
+}

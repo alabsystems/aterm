@@ -42,7 +42,8 @@ fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
             .last_output_ns
             .store(stamp, Ordering::Relaxed);
     };
-    let before = crate::metrics::output_redraw_request_distribution().count();
+    let requests = || crate::metrics::METRICS.window.input.out_req.copy_out().n();
+    let before = requests();
     stamp_ms_ago(7);
     let span = app
         .note_output_redraw_request(session)
@@ -58,7 +59,7 @@ fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
         app.note_output_redraw_request(session).is_some(),
         "the next burst books its own span"
     );
-    assert!(crate::metrics::output_redraw_request_distribution().count() >= before + 2);
+    assert!(requests() >= before + 2);
     // The negative control: a stamp that aged past the cap is discarded.
     let cap_ms = crate::metrics::OUTPUT_REDRAW_REQUEST_CAP_NS / 1_000_000;
     stamp_ms_ago(cap_ms + 5);
@@ -79,7 +80,7 @@ fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
 fn the_ime_clock_times_preedit_to_commit_and_counts_cancels() {
     let (mut app, _sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
     let wid = WindowId(0);
-    let composed_before = crate::metrics::ime_compose_distribution().count();
+    let composed_before = crate::metrics::METRICS.window.input.ime.copy_out().n();
     app.on_ime_preedit(wid, "に".into(), Some((0, 3)));
     let started = app.windows[&wid].ime_compose.expect("the clock started").0;
     app.on_ime_preedit(wid, "にほ".into(), Some((0, 6)));
@@ -97,7 +98,7 @@ fn the_ime_clock_times_preedit_to_commit_and_counts_cancels() {
     app.on_ime_commit(wid, "日本".into());
     assert_eq!(app.windows[&wid].ime_compose, None);
     assert!(
-        crate::metrics::ime_compose_distribution().count() > composed_before,
+        crate::metrics::METRICS.window.input.ime.copy_out().n() > composed_before,
         "the committed composition booked its duration"
     );
 

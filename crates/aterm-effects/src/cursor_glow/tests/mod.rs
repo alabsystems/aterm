@@ -7,13 +7,14 @@
 
 use super::*;
 // The parts the hub does not re-export (their items are the engine's own).
-use super::{seam::*, spawn::*};
+use super::{seam::*, spawn::*, thermal::*};
 use crate::cursor_trail::{CursorTrail, TrailConfig};
 
 mod band_move;
 mod beam;
 mod cold_motion;
 mod comet;
+mod departed;
 mod erase;
 mod fire;
 mod heat_and_laser;
@@ -25,6 +26,7 @@ mod lifecycle;
 mod light_ground;
 mod momentum;
 mod park;
+mod particles;
 mod phaser;
 mod rainbow;
 mod reanchor;
@@ -37,6 +39,8 @@ mod stall;
 mod stall_fold;
 mod status;
 mod stray;
+mod streak_bed;
+mod streak_budget;
 mod style_switch;
 mod tint;
 mod typed_stamps;
@@ -254,6 +258,7 @@ fn retina_geom() -> Geom {
 /// ```text
 ///   ground                                   the theme background
 ///   glow_under        add_sat                phase B3
+///   fire_patch        add_sat / source-over  phase B3, after glow_under
 ///   glyph ink         replace                phase C
 ///   cursor_glow_add   add_sat                draw_glow
 ///   glow_halo         add_sat / source-over  draw_glow_halo
@@ -300,10 +305,30 @@ impl Glass {
     /// drawn rather than brighter.
     fn add_quads(&mut self, qs: &[GlowQuad]) {
         for q in qs {
+            // A gradient quad's column `i` by [`GlowQuad::color2`]'s integer
+            // law, as the rasterizers draw it.
+            let w = u32::from(q.w.max(1));
+            let at = |i: u32, a: u32, b: u32| {
+                (a * (2 * w - (2 * i + 1)) + b * (2 * i + 1) + w) / (2 * w)
+            };
+            let lerp = |i: u32, a: u32, b: u32| {
+                (at(i, (a >> 16) & 0xff, (b >> 16) & 0xff) << 16)
+                    | (at(i, (a >> 8) & 0xff, (b >> 8) & 0xff) << 8)
+                    | at(i, a & 0xff, b & 0xff)
+            };
             for y in q.y as usize..(q.y as usize + q.h as usize).min(self.h) {
                 for x in q.x as usize..(q.x as usize + q.w as usize).min(self.w) {
+                    let i = (x - q.x as usize) as u32;
+                    let (color, alpha) = if q.is_flat() {
+                        (q.color, q.alpha)
+                    } else {
+                        (
+                            lerp(i, q.color, q.color2),
+                            at(i, u32::from(q.alpha), u32::from(q.alpha2)) as u8,
+                        )
+                    };
                     let slot = &mut self.px[y * self.w + x];
-                    *slot = aterm_render::over_premul(*slot, q.color, q.alpha);
+                    *slot = aterm_render::over_premul(*slot, color, alpha);
                 }
             }
         }
@@ -343,6 +368,54 @@ impl Glass {
         }
     }
 
+    /// A [`FirePatch`] stream as `draw_fire_patch` draws it, Add before Over,
+    /// through the renderer's own integer field sampler and its top-edge fade
+    /// anchored at the pad (`origin_y - head`). It belongs under the glyph ink
+    /// (phase B3, after `glow_under`).
+    fn add_fire_patches(&mut self, patches: &[FirePatch]) {
+        use aterm_render::fire_field as ff;
+        for mode in [FireMode::Add, FireMode::Over] {
+            for q in patches.iter().filter(|q| q.mode == mode) {
+                let fp = ff::FireFieldParams {
+                    base_y: i32::from(q.base_y),
+                    peak_h: i32::from(q.peak_h),
+                    phase: q.phase,
+                    temp: i32::from(q.temp),
+                    strength: i32::from(q.strength),
+                    lean: i32::from(q.lean),
+                    cov_cap: i32::from(q.cov_cap),
+                    cell_h: i32::from(q.cell_h),
+                    top_fade_y: i32::from(self.g.origin_y) - i32::from(self.g.head),
+                };
+                let pc = ff::fire_precomp(&fp);
+                let (x0, y0) = (usize::from(q.x), usize::from(q.y));
+                let x1 = (x0 + usize::from(q.w)).min(self.w);
+                for y in y0..(y0 + usize::from(q.h)).min(self.h) {
+                    let tf = ff::fire_top_fade(y as i32, &fp);
+                    let mut row = ff::FireRow::new(y as i32, x0 as i32, &fp, &pc);
+                    for x in x0..x1 {
+                        let c = row.core(x as i32);
+                        let slot = &mut self.px[y * self.w + x];
+                        match mode {
+                            FireMode::Add => {
+                                let pm = ff::fire_shade_add(&c, &fp, tf);
+                                if pm != 0 {
+                                    *slot = aterm_render::add_sat(*slot, pm);
+                                }
+                            }
+                            FireMode::Over => {
+                                let (rgb, a) = ff::fire_shade_over(&c, &fp, tf);
+                                if a != 0 {
+                                    *slot = aterm_render::over_rgb(*slot, rgb, a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The pixel rect of one grid cell, window-absolute.
     fn cell_rect(&self, row: u16, col: u16) -> (i32, i32, i32, i32) {
         let x0 = i32::from(self.g.origin_x) + i32::from(col) * self.g.cw as i32;
@@ -375,6 +448,59 @@ impl Glass {
             }
         }
     }
+}
+
+/// A set of pixels, `(y, x)`.
+type Pixels = Vec<(i32, i32)>;
+
+/// A 22 px font's cell (13 × 26), the size the trail gallery captures at, so
+/// an effect's layer thicknesses meet glyphs at their real proportions.
+fn tall_geom() -> Geom {
+    Geom {
+        cw: 13,
+        ch: 26,
+        rows: 8,
+        cols: 48,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 624,
+        win_h: 208,
+        head: 0,
+    }
+}
+
+/// One glyph at `(row, col)`: three 2 px stems across the x-height band (an
+/// `m`), and the counters between and beside them in the same band. A stroke
+/// is legible against the counters next to it, so those are the ground.
+fn glyph(g: Geom, row: u16, col: u16) -> (Pixels, Pixels) {
+    let x0 = i32::from(g.origin_x) + i32::from(col) * g.cw as i32;
+    let y0 = i32::from(g.origin_y) + i32::from(row) * g.ch as i32;
+    let (top, bot) = (y0 + (g.ch as i32 * 3) / 10, y0 + (g.ch as i32 * 8) / 10);
+    let mut ink = Vec::new();
+    let mut counters = Vec::new();
+    for y in top..bot {
+        for x in x0 + 1..x0 + g.cw as i32 - 1 {
+            if matches!(x - x0, 2 | 3 | 6 | 7 | 10 | 11) {
+                ink.push((y, x));
+            } else {
+                counters.push((y, x));
+            }
+        }
+    }
+    (ink, counters)
+}
+
+/// The WCAG ratio between the mean relative luminance of `ink` and that of
+/// `ground`.
+fn ratio(glass: &Glass, ink: &[(i32, i32)], ground: &[(i32, i32)]) -> f32 {
+    let mean = |px: &[(i32, i32)]| {
+        px.iter()
+            .map(|&(y, x)| rel_luminance(glass.at(y, x) & 0x00FF_FFFF))
+            .sum::<f32>()
+            / px.len() as f32
+    };
+    let (a, b) = (mean(ink), mean(ground));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 /// Whether a quad is a ribbon quad: a saturated spectrum colour (chroma above a

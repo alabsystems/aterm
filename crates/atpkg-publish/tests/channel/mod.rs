@@ -23,7 +23,7 @@ mod status;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use atpkg_publish::channel::Log;
 use atpkg_publish::ctx::Ctx;
@@ -31,6 +31,8 @@ use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::host::{Hosts, Slug};
 use atpkg_publish::quad::index_tag;
 use atpkg_publish::testkit::{FAR_FUTURE, Keys};
+
+use super::shared::{Made, made_once};
 
 /// A scratch directory removed on drop.
 pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
@@ -274,14 +276,14 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     atpkg::sha256_file(&path).expect("hash")
 }
 
-/// `git -C <dir> <args…>` for a fixture, with a fixed identity and no signing; its
-/// trimmed stdout.
+/// `git -C <dir> <args…>` for a fixture ([`atpkg_publish::testkit::git`]), with a fixed
+/// identity and no signing; its trimmed stdout.
 ///
 /// # Panics
 ///
 /// When git fails — a broken fixture.
 pub fn git(dir: &Path, args: &[&str]) -> String {
-    let out = aterm_uds::spawnfd::command("git")
+    let out = atpkg_publish::testkit::git()
         .arg("-C")
         .arg(dir)
         .args([
@@ -293,6 +295,10 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
+            // No template: a fixture repository carries no sample hooks, no description and
+            // no info/exclude, files every test lays down and removes and nothing reads.
+            "-c",
+            "init.templateDir=",
         ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -308,8 +314,15 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 /// A fresh repository at `dir` with `commits` commits of one file, checked out; its
-/// HEAD. The history is one `git fast-import` stream, not a commit per process.
+/// HEAD. The history is one `git fast-import` stream, not a commit per process, and each
+/// count is made once per process and laid down after (no test reads its dates).
 pub fn repo(dir: &Path, commits: usize) -> String {
+    static MADE: Made<usize, String> = Mutex::new(BTreeMap::new());
+    made_once(&MADE, &commits, dir, |dir| make_repo(dir, commits))
+}
+
+/// [`repo`], made.
+fn make_repo(dir: &Path, commits: usize) -> String {
     use std::io::Write as _;
     std::fs::create_dir_all(dir).expect("mkdir repo");
     git(dir, &["init", "-q", "-b", "main"]);
@@ -333,10 +346,12 @@ pub fn repo(dir: &Path, commits: usize) -> String {
         }
         stream.push_str(&format!("M 100644 inline f\ndata {}\n{body}\n", body.len()));
     }
-    let mut child = aterm_uds::spawnfd::command("git")
+    let mut child = atpkg_publish::testkit::git()
         .arg("-C")
         .arg(dir)
-        .args(["fast-import", "--quiet"])
+        // One pack, not a loose object (and a directory) per object: below its unpack limit
+        // fast-import explodes what it wrote, and every test lays the tree down and removes it.
+        .args(["-c", "fastimport.unpackLimit=0", "fast-import", "--quiet"])
         .stdin(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("spawn git fast-import");

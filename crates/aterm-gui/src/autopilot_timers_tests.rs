@@ -549,7 +549,7 @@ fn meta_changes(app: &App) -> Vec<String> {
         .unwrap()
         .since(None)
         .filter(|e| e.kind == "meta-change")
-        .map(|e| e.payload.clone())
+        .map(|e| e.payload.to_string())
         .collect()
 }
 
@@ -604,7 +604,9 @@ fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     );
     let (read, _) = wire(&mut app, "");
     assert!(
-        read.ends_with(&format!(" autopilot=cruise land_at={land_at}\n")),
+        read.contains(&format!(
+            " autopilot=cruise land_at={land_at} autopilot_by=ctl autopilot_since="
+        )),
         "{read}"
     );
     assert_eq!(
@@ -679,7 +681,12 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     let land_at = wall + 120_000;
 
     // Due, stored: Land.
-    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(land_at)));
+    assert!(app.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(land_at),
+        crate::autopilot::Surface::Menu
+    ));
     assert_eq!(
         app.autopilot_timer_deadline(),
         Some(mono + Duration::from_secs(120))
@@ -728,7 +735,12 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
 
     // The race: armed, then `off` stored over the wire, its wake NOT applied.
     set_fake_clocks(Some((mono, wall)));
-    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(land_at)));
+    assert!(app.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(land_at),
+        crate::autopilot::Surface::Menu
+    ));
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     let (reply, changed) = crate::control::cmd_meta(
         &app.pool.get(0).unwrap().term.clone(),
@@ -752,7 +764,12 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     // The clock set back under a due entry: the wall is short; nothing is
     // written, and the remainder is indexed.
     set_fake_clocks(Some((mono, wall)));
-    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(land_at)));
+    assert!(app.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(land_at),
+        crate::autopilot::Surface::Menu
+    ));
     let due = mono + Duration::from_secs(120);
     set_fake_clocks(Some((due, land_at - 30_000)));
     app.expire_autopilot_timers();
@@ -770,7 +787,8 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
             &ctx,
             Some("cruise".into()),
             Some(later),
-            aterm_slog::Actor::Ctl
+            aterm_slog::Actor::Ctl,
+            None
         )
         .moved
     );
@@ -809,7 +827,8 @@ fn closing_the_session_drops_its_timer() {
     assert!(app.set_session_autopilot_timed(
         terminal,
         Some(Autopilot::Cruise),
-        Some(wall + 3_600_000)
+        Some(wall + 3_600_000),
+        crate::autopilot::Surface::Menu
     ));
     assert!(app.autopilot_timer_deadline().is_some(), "armed");
     assert!(app.close_session_by_id(terminal).is_ok());
@@ -845,11 +864,12 @@ fn run_claude(app: &App) {
 /// THE FIRE SAYS WHAT IT FOUND (§10.2.3 item 8; the lifecycle hunt: main's
 /// line said "the harness wraps the work up at its next point" over every
 /// session): `Autopilot switched to land`, and at 18:00-style time Autopilot
-/// switched to land, then — over open work — that the harness wraps it up; over
-/// a done task, `nothing to land, the task was done at HH:MM`; over a landed
-/// one, that it landed; with the harness switched off, or Claude Code's own
-/// switch off, that nothing is landed; in a tab with no agent, that there is
-/// nothing to land. NEGATIVE CONTROL: only the open work is wrapped up.
+/// switched to land, then — over a hosted agent's work, whatever face a loop
+/// told before (Cruise takes nothing as the end, so the turn to Land starts
+/// the landing) — that the harness lands all of it on the remote main branch;
+/// with the harness switched off, or Claude Code's own switch off, that
+/// nothing is landed; in a tab with no agent, that there is nothing to land.
+/// NEGATIVE CONTROL: only work the harness carries is landed.
 #[test]
 fn the_fire_says_what_it_found() {
     use aterm_agent::harness::acts::TaskFace;
@@ -870,7 +890,12 @@ fn the_fire_says_what_it_found() {
                 wall - 60_000
             ));
         }
-        assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(land_at)));
+        assert!(app.set_session_autopilot_timed(
+            0,
+            Some(Autopilot::Cruise),
+            Some(land_at),
+            crate::autopilot::Surface::Menu
+        ));
         if let Some(policy) = after {
             app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
                 crate::app_config::HarnessPolicy::read(policy),
@@ -891,34 +916,25 @@ fn the_fire_says_what_it_found() {
     let clock = glass_of(land_at, wall, &local_offset_at)
         .expect("the zone reads")
         .clock;
-    let face_at = crate::harness_glass::Stamp::at((wall - 60_000) / 1000)
-        .expect("the zone reads")
-        .clock;
     let turned = format!("at {} Autopilot switched to land; ", clock.as_str());
     for (agent, face, after, then) in [
         (
             true,
             None,
             None,
-            "the harness wraps the work up at its next point, then stops".to_string(),
+            "the harness lands all of the work on the remote main branch, then stops".to_string(),
         ),
         (
             true,
             Some(TaskFace::Open),
             None,
-            "the harness wraps the work up at its next point, then stops".to_string(),
-        ),
-        (
-            true,
-            Some(TaskFace::Done),
-            None,
-            format!("nothing to land, the task was done at {}", face_at.as_str()),
+            "the harness lands all of the work on the remote main branch, then stops".to_string(),
         ),
         (
             true,
             Some(TaskFace::Landed),
             None,
-            format!("nothing to land, the task landed at {}", face_at.as_str()),
+            "the harness lands all of the work on the remote main branch, then stops".to_string(),
         ),
         (
             true,
@@ -942,15 +958,21 @@ fn the_fire_says_what_it_found() {
         let (title, detail) = fire(agent, face, after);
         let what = format!("{agent} {face:?} {after:?}");
         assert_eq!(title, "Autopilot switched to land", "{what}");
-        assert_eq!(detail.len(), 1, "{what}: {detail:?}");
+        assert_eq!(detail.len(), 2, "{what}: {detail:?}");
+        // Who set it: the timer, by its own clock (§11.7.1).
+        assert_eq!(
+            detail[1],
+            format!("set at the {} timer", clock.as_str()),
+            "{what}"
+        );
         assert!(
             detail[0].ends_with(&format!("{turned}{then}")),
             "{what}: {detail:?}"
         );
         assert_eq!(
-            detail[0].contains("wraps the work up"),
-            agent && after.is_none() && matches!(face, None | Some(TaskFace::Open)),
-            "NEGATIVE CONTROL {what}: only open work is wrapped up"
+            detail[0].contains("remote main branch"),
+            agent && after.is_none(),
+            "NEGATIVE CONTROL {what}: only work the harness carries is landed"
         );
     }
 }
@@ -985,7 +1007,12 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
     let fire = |app: &mut App, session: u64| {
         let mono = Instant::now();
         set_fake_clocks(Some((mono, wall)));
-        assert!(app.set_session_autopilot_timed(session, Some(Autopilot::Cruise), Some(land_at)));
+        assert!(app.set_session_autopilot_timed(
+            session,
+            Some(Autopilot::Cruise),
+            Some(land_at),
+            crate::autopilot::Surface::Menu
+        ));
         set_fake_clocks(Some((mono + Duration::from_secs(120), land_at)));
         app.expire_autopilot_timers();
         set_fake_clocks(None);
@@ -1004,9 +1031,13 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
     assert_eq!(title, "Autopilot switched to land");
     assert_eq!(
         detail,
-        [format!(
-            "Tab 1, right pane: {turned}no agent runs in this pane, so there is nothing to land"
-        )],
+        [
+            format!(
+                "Tab 1, right pane: {turned}no agent runs in this pane, so there is nothing to \
+                 land"
+            ),
+            format!("set at the {} timer", clock.as_str())
+        ],
         "the pane named, and the pane's own words"
     );
     // CONTROL: Claude Code's own record beside the shell names no pane.
@@ -1022,9 +1053,10 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
     let (_, alone) = fire(&mut app, 0);
     assert_eq!(
         alone,
-        [format!(
-            "Tab 1: {turned}no agent runs in the tab, so there is nothing to land"
-        )]
+        [
+            format!("Tab 1: {turned}no agent runs in the tab, so there is nothing to land"),
+            format!("set at the {} timer", clock.as_str())
+        ]
     );
     host.shutdown_and_join();
 }
@@ -1041,7 +1073,12 @@ fn a_hand_change_names_the_timer_it_dropped() {
     let wall = FRI_19Z * 1000;
     set_fake_clocks(Some((Instant::now(), wall)));
     let land_at = wall + 3_600_000;
-    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(land_at)));
+    assert!(app.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(land_at),
+        crate::autopilot::Surface::Menu
+    ));
     let when = crate::autopilot_menu::when(
         glass_of(land_at, wall, &local_offset_at).expect("the zone reads"),
     );
@@ -1049,17 +1086,20 @@ fn a_hand_change_names_the_timer_it_dropped() {
         last_record(&app).0,
         format!("Autopilot cruises until {when}")
     );
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Menu));
     let (title, detail) = last_record(&app);
     assert_eq!(title, "Autopilot set to land");
     assert_eq!(
-        detail.last().map(String::as_str),
-        Some(format!("the {when} landing time is cancelled").as_str()),
+        detail[detail.len().saturating_sub(2)..],
+        [
+            format!("the {when} landing time is cancelled"),
+            "set from the Autopilot menu".to_string()
+        ],
         "{detail:?}"
     );
     // NEGATIVE CONTROL: no timer, no cancel line.
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Cruise)));
-    assert!(app.set_session_autopilot(0, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Cruise), crate::autopilot::Surface::Menu));
+    assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Menu));
     let (_, detail) = last_record(&app);
     assert!(
         !detail.iter().any(|l| l.contains("cancelled")),
@@ -1078,7 +1118,7 @@ fn the_windows_timer_choices_arm_and_cancel() {
     let (mut app, host) = hosted();
     let wall = FRI_19Z * 1000;
     set_fake_clocks(Some((Instant::now(), wall)));
-    assert!(app.choose_autopilot_timer(0, TimerChoice::In(60)));
+    assert!(app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu));
     assert_eq!(
         stored(&app),
         (Some("cruise".into()), Some(wall + 3_600_000))
@@ -1088,28 +1128,28 @@ fn the_windows_timer_choices_arm_and_cancel() {
         None,
         "no land_at"
     );
-    assert!(!app.choose_autopilot_timer(0, TimerChoice::At));
+    assert!(!app.choose_autopilot_timer(0, TimerChoice::At, crate::autopilot::Surface::Menu));
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nland_at = \"18:00\"\n"),
     );
     assert!(app.resolve_timer_choice(TimerChoice::At).is_some());
-    assert!(app.choose_autopilot_timer(0, TimerChoice::At));
+    assert!(app.choose_autopilot_timer(0, TimerChoice::At, crate::autopilot::Surface::Menu));
     let at = stored(&app).1.expect("armed at 18:00");
     assert!(at > wall && at - wall <= 25 * 3_600 * 1000);
-    assert!(app.choose_autopilot_timer(0, TimerChoice::Cancel));
+    assert!(app.choose_autopilot_timer(0, TimerChoice::Cancel, crate::autopilot::Surface::Menu));
     assert_eq!(stored(&app), (Some("cruise".into()), None));
     assert!(app.autopilot_timers.is_empty());
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
     assert!(
-        !app.choose_autopilot_timer(0, TimerChoice::In(60)),
+        !app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu),
         "master switch"
     );
     assert_eq!(stored(&app), (Some("cruise".into()), None));
     app.harness = None;
     assert!(
-        !app.choose_autopilot_timer(0, TimerChoice::In(60)),
+        !app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu),
         "no host"
     );
     set_fake_clocks(None);
@@ -1143,7 +1183,8 @@ fn a_timer_for_a_switched_off_agent_is_refused() {
             "{policy}"
         );
         set_fake_clocks(Some((Instant::now(), wall)));
-        let moved = app.choose_autopilot_timer(0, TimerChoice::In(60));
+        let moved =
+            app.choose_autopilot_timer(0, TimerChoice::In(60), crate::autopilot::Surface::Menu);
         let pair = stored(&app);
         set_fake_clocks(None);
         host.shutdown_and_join();
@@ -1171,7 +1212,12 @@ fn a_moved_wall_derives_the_due_again() {
     set_fake_clocks(Some((mono, wall)));
     app.on_wall_moved();
     assert!(app.autopilot_timers.is_empty());
-    assert!(app.set_session_autopilot_timed(0, Some(Autopilot::Cruise), Some(wall + 600_000)));
+    assert!(app.set_session_autopilot_timed(
+        0,
+        Some(Autopilot::Cruise),
+        Some(wall + 600_000),
+        crate::autopilot::Surface::Menu
+    ));
     // Slept an hour: the monotonic clock moved a second.
     let woke = mono + Duration::from_secs(1);
     set_fake_clocks(Some((woke, wall + 3_600_000)));
@@ -1208,7 +1254,8 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
             &ctx,
             Some("cruise".into()),
             Some(wall + 60_000),
-            aterm_slog::Actor::Ctl
+            aterm_slog::Actor::Ctl,
+            None
         )
         .moved
     );
@@ -1258,6 +1305,7 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
         Some("cruise".into()),
         Some(wall + 60_000),
         aterm_slog::Actor::Ctl,
+        None,
     );
     assert!(app.autopilot_timers.is_empty(), "stored, never indexed");
     app.expire_autopilot_timers();

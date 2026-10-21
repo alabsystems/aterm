@@ -222,7 +222,7 @@ fn only(rows: Vec<(String, String)>, kinds: &[&str]) -> Vec<(String, String)> {
 fn ring_rows(tl: &SessionTimeline, kinds: &[&str]) -> Vec<(String, String)> {
     tl.since(None)
         .filter(|e| kinds.contains(&e.kind))
-        .map(|e| (e.kind.to_string(), e.payload.clone()))
+        .map(|e| (e.kind.to_string(), e.payload.to_string()))
         .collect()
 }
 
@@ -289,7 +289,6 @@ fn the_ring_and_the_log_agree_on_the_exact_pairs() {
         let reply = crate::fabric::cmd_deliver_waking(&app.store, &line, &wake);
         assert!(reply.starts_with("OK "), "{reply}");
     }
-    let subs = crate::subscribe::new_registry();
     for args in [
         "working",
         "done why=marker",
@@ -301,7 +300,6 @@ fn the_ring_and_the_log_agree_on_the_exact_pairs() {
             local,
             crate::control::Scope::Owner,
             &format!("mark {args}"),
-            &subs,
         );
         assert!(reply.starts_with("OK task "), "{reply}");
     }
@@ -619,7 +617,7 @@ fn seen_since(tl: &Mutex<SessionTimeline>, id: Option<u64>, seq: u64) -> Seen {
     Seen {
         rows: g
             .since(id)
-            .map(|e| (e.kind.to_string(), e.payload.clone()))
+            .map(|e| (e.kind.to_string(), e.payload.to_string()))
             .collect(),
         recs: g
             .slog()
@@ -856,20 +854,19 @@ fn delivered(local: u64) -> (SessionHandle, Store) {
 
 fn drive_inbox_seen() -> Seen {
     let (h, _store) = delivered(54);
-    let seen = crate::fabric::cmd_inbox_seen_waking(&h.ctx, "1 handled", &|| {});
+    let seen = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
     assert!(seen.starts_with("OK seen=1"), "{seen}");
     during(&h.ctx.timeline, || {
-        let _ = crate::fabric::cmd_inbox_seen_waking(&h.ctx, "1 handled", &|| {});
+        let _ = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
     })
 }
 
 /// A post from `h` (post id 1), queued whether or not a bridge is up.
 fn post(h: &SessionHandle) {
-    let reply = crate::fabric::cmd_post_waking(
+    let reply = crate::fabric::cmd_post(
         &h.ctx,
         "to=@s-peer kind=ask dl=60000 key=k1 --wait=0 SENTINEL-POST",
         None,
-        &|| {},
     );
     assert!(
         reply.starts_with("OK 1") || reply.contains(" id=1 "),

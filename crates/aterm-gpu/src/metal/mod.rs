@@ -1477,6 +1477,40 @@ mod tests {
             (2, 2),
             "a changed card must upload exactly once more per arm"
         );
+        // A change to a few rows uploads those rows, never the whole card, on
+        // both arms, and the frames stay byte-identical. The armed arm writes
+        // the ring slot not shown, catching up the rows it missed while the
+        // other was: after a change to every row, that slot takes every row
+        // once; after that, the band since it was last written.
+        let stride = pw as usize * 4;
+        let rows_changed = |base: &[u8], rows: std::ops::Range<usize>, tint: u8| {
+            let mut card = base.to_vec();
+            for byte in &mut card[rows.start * stride..rows.end * stride] {
+                *byte = byte.wrapping_add(tint);
+            }
+            &*card.leak()
+        };
+        let card_c: &'static [u8] = rows_changed(card_b, 5..8, 31);
+        let card_d: &'static [u8] = rows_changed(card_c, 10..12, 57);
+        for (card, wg_rows, armed_most) in [(card_c, 3, ph as usize), (card_d, 2, 12 - 5)] {
+            let (wg_before, armed_before) = (wg.tray_upload_bytes(), armed.tray_upload_bytes());
+            let expected = wg.render_input(&mut wg_win, &input, Some(tray(card)));
+            let actual = armed.render_input(&mut armed_win, &input, Some(tray(card)));
+            assert_eq!(
+                expected.pixels, actual.pixels,
+                "a band-changed card's frames diverged between the arms"
+            );
+            assert_eq!(
+                wg.tray_upload_bytes() - wg_before,
+                (wg_rows * stride) as u64,
+                "the wgpu arm uploads the changed rows alone"
+            );
+            let armed_bytes = armed.tray_upload_bytes() - armed_before;
+            assert!(
+                armed_bytes <= (armed_most * stride) as u64 && armed_bytes > 0,
+                "the armed arm uploaded {armed_bytes} bytes for a band of rows"
+            );
+        }
 
         // Non-vacuity: removing each layer must change the armed bytes.
         let base = armed_frame.expect("N runs produced a frame").pixels;
@@ -1596,6 +1630,7 @@ mod tests {
             .expect("one-shot finishes");
         let snap = armed
             .presented_snapshot_take(&mut win)
+            .and_then(crate::video_tap::RawCapture::convert)
             .expect("one-shot yields its frame");
         assert_eq!(
             snap.rgba, presented[0],
@@ -1923,9 +1958,11 @@ mod tests {
             );
             let expected = wg
                 .virtual_presented_snapshot_current(&wg_win, wg_win.resident_input_epoch(), 7)
+                .and_then(crate::video_tap::RawCapture::convert)
                 .expect("the wgpu tap snapshot completes");
             let actual = armed
                 .virtual_presented_snapshot_current(&armed_win, armed_win.resident_input_epoch(), 7)
+                .and_then(crate::video_tap::RawCapture::convert)
                 .expect("the armed tap snapshot completes");
             assert_eq!(
                 (expected.w, expected.h),

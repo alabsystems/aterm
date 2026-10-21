@@ -129,3 +129,93 @@ fn the_warm_up_seam_builds_every_slot_off_the_frame_path() {
         "the warm-up must be idempotent"
     );
 }
+
+/// The fx rows are demanded like every other effect slot (design §4.5): the
+/// first frame drawing an Exact layer builds exactly `fx`, a Linear layer
+/// exactly `fx_linear`, and a `bloom` layer on a frame with no aurora also
+/// `glow_add`, the bloom extract's pipeline. The same layer without `bloom`
+/// does not demand `glow_add`: the control that the bloom is what does.
+#[test]
+fn an_fx_frame_demands_exactly_its_rows() {
+    use std::sync::Arc;
+
+    use aterm_core::render::{
+        FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace, FxSprite,
+        FxTexels, PxRect,
+    };
+    use aterm_gpu::EffectPipeline;
+
+    let rect = FxItem::Rect(FxRect {
+        x: 4,
+        y: 4,
+        w: 40,
+        h: 12,
+        ink: 0,
+    });
+    let sprite = FxItem::Sprite(FxSprite {
+        x: 4,
+        y: 4,
+        dw: 40,
+        dh: 12,
+        flip_x: false,
+        art: Arc::new(
+            FxArt::new(1, 1, FxTexels::Rgba8Straight, vec![200, 90, 40, 160]).expect("sized"),
+        ),
+        ink: 0,
+        clip: PxRect::EVERYWHERE,
+    });
+    let layer = |item: &FxItem, slot, blend, bloom| {
+        let mut l = FxLayer::new(
+            1,
+            Arc::new(FxContent::new(
+                vec![item.clone()],
+                vec![FxInk::add(0x0030_2010); 2],
+            )),
+            slot,
+            FxSpace::Window,
+            blend,
+        );
+        l.bloom = bloom;
+        l
+    };
+    let cases = [
+        (
+            "exact",
+            layer(&rect, FxSlot::Over, FxBlend::Exact, false),
+            &[EffectPipeline::Fx][..],
+        ),
+        (
+            "linear",
+            layer(&sprite, FxSlot::Under, FxBlend::Linear, false),
+            &[EffectPipeline::FxLinear][..],
+        ),
+        (
+            "bloom",
+            layer(&rect, FxSlot::Glow, FxBlend::Exact, true),
+            &[EffectPipeline::Fx, EffectPipeline::GlowAdd][..],
+        ),
+    ];
+    let (rows, cols) = (4usize, 16usize);
+    for (name, l, rows_wanted) in cases {
+        let (_, mut gpu) = backends(18.0, Theme::default());
+        let mut win = aterm_gpu::WindowGpu::new();
+        let mut input = Terminal::new(rows as u16, cols as u16).cell_frame(rows, cols);
+        input.fx_layers = vec![l];
+        let _ = gpu.render_input(&mut win, &input, None);
+        assert!(gpu.frame_shape().fx_instances > 0, "{name}: the layer drew");
+        let mut want = [false; aterm_gpu::EFFECT_PIPELINE_COUNT];
+        for &p in rows_wanted {
+            want[p as usize] = true;
+        }
+        assert_eq!(
+            gpu.effect_pipelines_resident(),
+            want,
+            "{name}: the frame demanded {:?}",
+            aterm_gpu::EFFECT_PIPELINE_NAMES
+                .iter()
+                .zip(gpu.effect_pipelines_resident())
+                .filter_map(|(n, built)| built.then_some(*n))
+                .collect::<Vec<_>>()
+        );
+    }
+}

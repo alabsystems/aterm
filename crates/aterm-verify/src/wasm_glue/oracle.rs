@@ -24,8 +24,11 @@
 //!    interface (the ABI's own) are not compared. NEGATIVE CONTROL: the
 //!    golden with one parameter renamed must not match.
 //!
-//! A machine without node, the stable wasm32 std or the 0.2.108 CLI skips the
-//! row with the fix. Progress goes to the caller's log, never the terminal.
+//! The 0.2.108 CLI is looked for on PATH, beside rustup, in the checkout's
+//! `target/tooling` and in the machine's `tooling` ([`host_tooling`]), where
+//! a full `ship provision` installs it for every checkout. A machine without
+//! node, the stable wasm32 std or the CLI skips the row with the fix.
+//! Progress goes to the caller's log, never the terminal.
 
 use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
@@ -39,45 +42,109 @@ use crate::perf::{LaneRun, Status};
 
 /// The wasm-bindgen the goldens are held to, crate and CLI: the version both
 /// web modules left (aterm-wasm at WP.7, aterm-gpu-web at WP.8). This row is
-/// the only user of the CLI: no module aterm ships is bound with it.
-const BINDGEN: &str = "0.2.108";
+/// the only user of the CLI: no module aterm ships is bound with it. The pin is
+/// the `wasm-bindgen` row of `aterm_uds::host::TOOLS` (a `--record` row of
+/// `verify provision`), which the resolver reads too.
+pub const BINDGEN: &str = aterm_uds::host::pinned_version("wasm-bindgen");
 
-/// The version `wasm-bindgen --version` reports (`wasm-bindgen 0.2.108`'s
-/// second field), compared exactly: a substring test reads 0.2.1080 as 0.2.108.
-fn bindgen_version(program: &Path, path_env: Option<&std::ffi::OsStr>) -> Option<String> {
+/// The machine-wide tooling directory's name in aterm's user cache.
+const TOOLING: &str = aterm_uds::host::TOOLING;
+
+/// The machine-wide tooling directory under `home` and `xdg_cache`: aterm's
+/// `tooling` in the user's cache ([`crate::user_cache`]: on macOS
+/// `~/Library/Caches/aterm/tooling.noindex`, elsewhere
+/// `$XDG_CACHE_HOME/aterm/tooling`, else `~/.cache/aterm/tooling`). A full
+/// `ship provision` installs the CLI here ([`bindgen_root`]), and this row
+/// reads it from every checkout and worktree; `None` where no home names one.
+#[must_use]
+pub fn tooling(home: Option<&Path>, xdg_cache: Option<&Path>) -> Option<PathBuf> {
+    crate::user_cache(std::env::consts::OS, home, xdg_cache, TOOLING)
+}
+
+/// [`tooling`] for this process's `$HOME` and `$XDG_CACHE_HOME`.
+#[must_use]
+pub fn host_tooling() -> Option<PathBuf> {
+    crate::host_user_cache(TOOLING)
+}
+
+/// Where the CLI at [`BINDGEN`] is installed under a tooling directory (the
+/// machine-wide one, or a checkout's `target/tooling`): `cargo install
+/// --root`'s root, the binary at `bin/wasm-bindgen`.
+#[must_use]
+pub fn bindgen_root(tooling: &Path) -> PathBuf {
+    tooling.join(format!("wasm-bindgen-{BINDGEN}"))
+}
+
+/// `targo --unverified`'s arguments that lay the CLI at [`BINDGEN`], `--locked`
+/// to its own lockfile, ahead of `--root` and a [`bindgen_root`]: the skip's
+/// fix and `ship provision` both run it. `--force` because each runs it only
+/// where the root holds no wasm-bindgen that answers the pin, and cargo
+/// replaces neither one its records there do not know (laid by hand: it
+/// refuses) nor one they call current (one that stopped answering: it says
+/// "already installed" and builds nothing). The root is the pin's alone, so
+/// nothing else is overwritten.
+pub const BINDGEN_INSTALL: [&str; 6] = [
+    "install",
+    "wasm-bindgen-cli",
+    "--version",
+    BINDGEN,
+    "--locked",
+    "--force",
+];
+
+/// The version a `wasm-bindgen --version` stdout reports (`wasm-bindgen
+/// 0.2.108`'s second field).
+fn reported_version(stdout: &str) -> Option<&str> {
+    stdout.lines().next()?.split_whitespace().nth(1)
+}
+
+/// Whether a `wasm-bindgen --version` stdout reports exactly [`BINDGEN`]: a
+/// substring test reads 0.2.1080 as 0.2.108.
+#[must_use]
+pub fn reports_pin(stdout: &str) -> bool {
+    reported_version(stdout) == Some(BINDGEN)
+}
+
+/// Whether a successful `program --version`, with `PATH` set to `path_env`
+/// when given, reports exactly the pin ([`reports_pin`]).
+fn answers_pin(program: &Path, path_env: Option<&std::ffi::OsStr>) -> bool {
     let mut cmd = command(program);
     cmd.arg("--version");
     if let Some(p) = path_env {
         cmd.env("PATH", p);
     }
-    let out = cmd.output_owned().ok().filter(|o| o.status.success())?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .split_whitespace()
-        .nth(1)
-        .map(str::to_string)
+    cmd.output_owned()
+        .is_ok_and(|o| o.status.success() && reports_pin(&String::from_utf8_lossy(&o.stdout)))
 }
 
-/// wasm-bindgen at exactly `version`: on PATH (with rustup's directory
-/// appended, where a `cargo install`ed one lands), else in this repo's
-/// tooling cache.
-fn find_bindgen(root: &Path, version: &str, path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+/// wasm-bindgen at exactly [`BINDGEN`]: on PATH (with rustup's directory
+/// appended, where a `cargo install`ed one lands), else in this checkout's
+/// `target/tooling`, else in the machine-wide `tooling` ([`host_tooling`]).
+fn find_bindgen(
+    root: &Path,
+    tooling: Option<&Path>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
     let on_path = std::env::split_paths(path_env.unwrap_or_default())
         .map(|d| d.join("wasm-bindgen"))
         .find(|p| p.is_file());
-    let cache = root.join(format!(
-        "target/tooling/wasm-bindgen-{version}/bin/wasm-bindgen"
-    ));
+    let cached = [
+        Some(root.join("target/tooling")),
+        tooling.map(Path::to_path_buf),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|t| bindgen_root(&t).join("bin/wasm-bindgen"));
     on_path
         .into_iter()
-        .chain([cache])
-        .find(|p| bindgen_version(p, path_env).as_deref() == Some(version))
+        .chain(cached)
+        .find(|p| answers_pin(p, path_env))
 }
 
-/// The wasm-bindgen CLI at exactly `version` ([`find_bindgen`], with
-/// `rustup`'s directory appended to PATH), or the skip naming its install.
-fn bindgen_at(root: &Path, rustup: &Path, version: &str) -> Result<PathBuf, LaneRun> {
+/// The wasm-bindgen CLI at exactly [`BINDGEN`] ([`find_bindgen`], with
+/// `rustup`'s directory appended to PATH), or the skip naming its install into
+/// the machine-wide `tooling`, where `ship provision` puts it.
+fn bindgen_at(root: &Path, rustup: &Path) -> Result<PathBuf, LaneRun> {
     let mut path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -85,17 +152,41 @@ fn bindgen_at(root: &Path, rustup: &Path, version: &str) -> Result<PathBuf, Lane
         path_dirs.push(dir.to_path_buf());
     }
     let path_env = std::env::join_paths(path_dirs).ok();
-    find_bindgen(root, version, path_env.as_deref()).ok_or_else(|| {
-        let tooling = root.join(format!("target/tooling/wasm-bindgen-{version}"));
-        LaneRun::skip(
-            format!("wasm-bindgen {version} is not on PATH, beside rustup or in target/tooling"),
-            format!(
-                "cd / && targo --unverified install wasm-bindgen-cli --version {version} \
-                 --locked --root '{}'",
-                tooling.display()
-            ),
+    let tooling = host_tooling();
+    find_bindgen(root, tooling.as_deref(), path_env.as_deref())
+        .ok_or_else(|| bindgen_skip(root, tooling.as_deref()))
+}
+
+/// The skip for a machine without the CLI: its install, by hand, into the
+/// machine-wide `tooling`, which a full `ship provision` runs itself; into the
+/// checkout's `target/tooling` where no `$HOME` names the machine's.
+fn bindgen_skip(root: &Path, tooling: Option<&Path>) -> LaneRun {
+    let install = |into: &Path| {
+        format!(
+            "cd / && targo --unverified {} --root '{}'",
+            BINDGEN_INSTALL.join(" "),
+            bindgen_root(into).display()
         )
-    })
+    };
+    match tooling {
+        Some(t) => LaneRun::skip(
+            format!(
+                "wasm-bindgen {BINDGEN} is not on PATH, beside rustup, in target/tooling or in {}",
+                t.display()
+            ),
+            format!(
+                "{} (a full `targo --unverified ship provision` installs it there)",
+                install(t)
+            ),
+        ),
+        None => LaneRun::skip(
+            format!(
+                "wasm-bindgen {BINDGEN} is not on PATH, beside rustup or in target/tooling, and no \
+                 $HOME names the machine's tooling"
+            ),
+            install(&root.join("target/tooling")),
+        ),
+    }
 }
 
 /// What the twin binds in place of `export_runtime!()`: the console and
@@ -136,7 +227,7 @@ pub(crate) fn gate(root: &Path, work: &Path, log: &mut String) -> LaneRun {
         Ok(rustup) => rustup,
         Err(skip) => return skip,
     };
-    let bindgen = match bindgen_at(root, &rustup, BINDGEN) {
+    let bindgen = match bindgen_at(root, &rustup) {
         Ok(bindgen) => bindgen,
         Err(skip) => return skip,
     };
@@ -596,8 +687,11 @@ mod tests {
         assert!(missing_from(&s(&["a"]), &s(&["a", "b"])).is_empty());
     }
 
-    /// Only a wasm-bindgen that answers exactly the pin is found: a version
-    /// the pin is a prefix of, and one that does not answer, are not.
+    /// Only a wasm-bindgen that answers exactly the pin is found, in the
+    /// checkout's `target/tooling` or the machine's `tooling`: a version the
+    /// pin is a prefix of, and one that does not answer, are not. The skip
+    /// installs where the lookup reads. NEGATIVE CONTROL: the machine's is
+    /// read only where a tooling directory is named.
     #[cfg(unix)]
     #[test]
     fn only_a_bindgen_answering_exactly_the_pin_is_found() {
@@ -606,26 +700,47 @@ mod tests {
             .prefix("atv-wasm-")
             .tempdir()
             .expect("scratch");
-        let cache = dir.path().join(format!(
-            "target/tooling/wasm-bindgen-{BINDGEN}/bin/wasm-bindgen"
-        ));
-        std::fs::create_dir_all(cache.parent().expect("parent")).expect("mkdir");
+        let checkout = dir.path().join("checkout");
+        let machine = dir.path().join("tooling");
         let no_path = Some(std::ffi::OsStr::new(""));
-        for (body, found) in [
-            (format!("echo 'wasm-bindgen {BINDGEN}0'"), false),
-            ("exit 1".to_string(), false),
-            (format!("echo 'wasm-bindgen {BINDGEN}'"), true),
-        ] {
-            // Replaced, not rewritten in place: a running text file is busy.
-            let _ = std::fs::remove_file(&cache);
-            std::fs::write(&cache, format!("#!/bin/sh\n{body}\n")).expect("stub");
-            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-            assert_eq!(
-                find_bindgen(dir.path(), BINDGEN, no_path),
-                found.then(|| cache.clone()),
-                "{body}"
-            );
+        let installs_into = |skip: LaneRun, tooling: &Path| match skip.status {
+            Status::Skip { fix, .. } => {
+                fix.contains(&format!("--root '{}'", bindgen_root(tooling).display()))
+            }
+            _ => false,
+        };
+        assert!(installs_into(
+            bindgen_skip(&checkout, Some(&machine)),
+            &machine
+        ));
+        assert!(installs_into(
+            bindgen_skip(&checkout, None),
+            &checkout.join("target/tooling")
+        ));
+        for tooling in [checkout.join("target/tooling"), machine.clone()] {
+            let cache = bindgen_root(&tooling).join("bin/wasm-bindgen");
+            std::fs::create_dir_all(cache.parent().expect("parent")).expect("mkdir");
+            for (body, found) in [
+                (format!("echo 'wasm-bindgen {BINDGEN}0'"), false),
+                ("exit 1".to_string(), false),
+                (format!("echo 'wasm-bindgen {BINDGEN}'"), true),
+            ] {
+                // Replaced, not rewritten in place: a running text file is busy.
+                let _ = std::fs::remove_file(&cache);
+                std::fs::write(&cache, format!("#!/bin/sh\n{body}\n")).expect("stub");
+                std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+                assert_eq!(
+                    find_bindgen(&checkout, Some(&machine), no_path),
+                    found.then(|| cache.clone()),
+                    "{}: {body}",
+                    tooling.display()
+                );
+            }
+            if tooling != machine {
+                std::fs::remove_file(&cache).expect("rm");
+            }
         }
+        assert_eq!(find_bindgen(&checkout, None, no_path), None);
     }
 }

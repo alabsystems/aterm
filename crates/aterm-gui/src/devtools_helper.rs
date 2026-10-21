@@ -2039,7 +2039,7 @@ fn accepted_bundle(
 // ---------------------------------------------------------------------------
 
 /// What the hand-over does to the Mac and to its markers, injected like the consent
-/// probes (`control_privacy::ConsentProbes`) and atpkg's own `Reach`: the window's
+/// probes (`consent_state::ConsentProbes`) and atpkg's own `Reach`: the window's
 /// instance gets [`Self::live`]; a headless instance and every unit test [`Self::inert`],
 /// which opens, runs, reads and writes nothing. None of it flips the switch.
 #[derive(Clone, Copy)]
@@ -2130,7 +2130,7 @@ fn live_declined() -> Option<(u64, u64)> {
 }
 
 fn live_grant_stable() -> bool {
-    crate::control_privacy::running_dr_class_if_warm().grant_stable()
+    crate::signing_identity::running_dr_class_if_warm().grant_stable()
 }
 
 fn inert_open_pane() -> bool {

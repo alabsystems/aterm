@@ -8,8 +8,8 @@
 //! timings. A bare run is the `dev` set on the change cone. Each check's
 //! stages run concurrently where they share no resource ([`sched`]), and the
 //! run prints one line per check as it finishes ([`report`]), the full ladder
-//! going to a log. `verify perf` ([`perf`]) and `verify glue` ([`wasm_glue`])
-//! are verbs beside the checks, with arguments of their own. `ship release`
+//! going to a log. `verify perf` ([`perf`]), `verify soak` ([`soak`]) and `verify glue`
+//! ([`wasm_glue`]) are verbs beside the checks, with arguments of their own. `ship release`
 //! runs `verify release --app <bundle>` and publishes only on `0`.
 //!
 //! Exit codes ([`exit`]): `0` every check that ran passed, `1` a check failed,
@@ -46,6 +46,7 @@ pub mod scope;
 pub mod smoke;
 #[cfg(unix)]
 pub mod smoke_stages;
+pub mod soak;
 pub mod stages;
 pub mod testrun;
 /// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc
@@ -141,8 +142,8 @@ impl EnvSnapshot {
 }
 
 /// The variables that move cargo's target or build directory, and the home whose
-/// config may: any one set (even empty) and atpkg's shim leaves plain `targo`'s
-/// layout alone, so the run does too ([`main_build_dir`]).
+/// config may: any one set (even empty) and atpkg's shim gives plain `targo` no
+/// shared cache, so the run does not either ([`main_build_dir`]).
 pub const CARGO_LAYOUT_VARS: [&str; 4] = [
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
@@ -150,15 +151,15 @@ pub const CARGO_LAYOUT_VARS: [&str; 4] = [
     "CARGO_HOME",
 ];
 
-/// The `build.build-dir` value atpkg's `targo` shim hands a build at `root`
-/// (`aterm_toolchain::build_cache::with_build_dir`, the shim's own rule), so the
-/// main lane's children share plain `targo`'s cache: `None` off macOS, and
-/// wherever the shim would leave the layout alone (the caller chose a target or
+/// The `build.build-dir` value atpkg's `targo` shim hands a build at `root` when
+/// it gives the shared cache (`aterm_toolchain::build_cache::decide`, the shim's
+/// own rule), so the main lane's children share plain `targo`'s cache: `None` off
+/// macOS, and wherever the shim would not give it (the caller chose a target or
 /// build directory, a cargo config names one, the root is not under `$HOME`, the
 /// cache cannot be written).
 #[must_use]
 pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
-    use aterm_toolchain::build_cache::{Machine, Tool, read_config, with_build_dir};
+    use aterm_toolchain::build_cache::{BuildDir, Machine, Tool, decide, read_config};
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -176,11 +177,40 @@ pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
         writable: &writable_dir,
     };
     let probe = ["--unverified".to_string(), "test".to_string()];
-    let args = with_build_dir(&probe, Tool::Targo, &machine)?;
-    match args.as_slice() {
-        [flag, value, ..] if flag == "--config" => Some(value.clone()),
-        _ => None,
+    match decide(&probe, Tool::Targo, &machine)? {
+        BuildDir::Cache(value) => Some(value),
+        BuildDir::Target(_) | BuildDir::TrustEnv(_) => None,
     }
+}
+
+/// The `build.build-dir` the main lane's children get where atpkg's shim would
+/// leave the layout alone ([`main_build_dir`] is `None`) and the run pins them to
+/// `target` (`CARGO_TARGET_DIR`): `<target>/build.noindex`, so the intermediates
+/// (deps, incremental, fingerprints, build scripts) stay out of Spotlight and
+/// only the uplifted artifacts (`<target>/debug/aterm`) land in the plain
+/// folder (`aterm_toolchain::build_cache::target_build_dir`). `None` where the
+/// caller chose a build directory (`CARGO_BUILD_BUILD_DIR`, a cargo config's
+/// `build-dir`) or `target` is a path the literal cannot hold.
+#[must_use]
+pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Option<String> {
+    use aterm_toolchain::build_cache::{Machine, read_config, target_build_dir};
+    let lookup = |k: &str| {
+        env.cargo_layout
+            .iter()
+            .find(|(name, _)| *name == k)
+            .map(|(_, v)| v.clone())
+    };
+    let target = std::path::absolute(target).ok()?;
+    let machine = Machine {
+        home: Some(&env.home)
+            .filter(|h| !h.as_os_str().is_empty())
+            .map(PathBuf::as_path),
+        cwd: Some(root),
+        env: &lookup,
+        read: &read_config,
+        writable: &writable_dir,
+    };
+    target_build_dir(&target, &machine)
 }
 
 /// Whether this process may write the directory `dir` (`access(2)`, which a
@@ -266,9 +296,12 @@ pub struct Ctx {
     /// Variables given to every child, after the removals and before a stage's
     /// own ([`exec::ExecEnv::add_env`]).
     pub child_env_add: Vec<(OsString, OsString)>,
-    /// The `build.build-dir` the main lane's children are handed as `--config`
-    /// ([`main_build_dir`]), so they share plain `targo`'s cache; `None` pins
-    /// `CARGO_TARGET_DIR` to [`Ctx::target_dir`] instead.
+    /// The `build.build-dir` the main lane's children are handed as `--config`:
+    /// plain `targo`'s cache where atpkg's shim would hand one ([`main_build_dir`]),
+    /// and no `CARGO_TARGET_DIR`; anywhere else the children are pinned to
+    /// [`Ctx::target_dir`] and this is `<target>/build.noindex`
+    /// ([`fallback_build_dir`]), `None` only where the caller chose a build
+    /// directory.
     pub main_build_dir: Option<String>,
     /// What the run's toolchain lease is, for the log ([`hold_toolchain`]).
     pub toolchain_lease: Option<String>,
@@ -366,18 +399,23 @@ impl Ctx {
             .unwrap_or_else(|| root.join("target"));
         // ONE CACHE WITH PLAIN TARGO. Where atpkg's shim would hand a build its
         // build-cache `--config`, the main lane's children get the same one and
-        // no CARGO_TARGET_DIR, which would turn the shim's rule off and fork a
-        // second cache; the target dir is `<root>/target` either way. Anywhere
+        // no CARGO_TARGET_DIR, which would take them off the shared cache and
+        // fork a second one; the target dir is `<root>/target` either way. Anywhere
         // else (a caller's CARGO_TARGET_DIR among them) every child is pinned to
         // the run's target dir.
-        let main_build_dir = main_build_dir(&env, &root);
+        // Pinned there, the intermediates still go where Spotlight never looks:
+        // `<target>/build.noindex`, unless the caller chose a build directory
+        // ([`fallback_build_dir`]).
+        let shim_build_dir = main_build_dir(&env, &root);
         let mut child_env_add: Vec<(OsString, OsString)> = Vec::new();
-        if main_build_dir.is_none() {
+        if shim_build_dir.is_none() {
             child_env_add.push((
                 "CARGO_TARGET_DIR".into(),
                 target_dir.clone().into_os_string(),
             ));
         }
+        let main_build_dir =
+            shim_build_dir.or_else(|| fallback_build_dir(&env, &root, &target_dir));
         // Every child runs this run's compiler rather than re-discovering one.
         if tools.have_targo() {
             child_env_add.push((
@@ -671,12 +709,20 @@ pub fn time_line(begun: Duration, ran: Duration) -> String {
 #[must_use]
 pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
     let names: Vec<&str> = ctx.checks.iter().map(|c| c.name()).collect();
+    let holds = |p: &str| ctx.scope.includes_crate(p);
+    let pulled = checks::pulled(&checks::DEV, holds);
     let what = if ctx.release {
         "release".to_string()
     } else if ctx.checks == checks::DEV {
         "dev".to_string()
-    } else if ctx.checks == checks::with_pulled(&checks::DEV, true) {
-        "dev + gpu-oracle (the selection holds aterm-gpu)".to_string()
+    } else if !pulled.is_empty() && ctx.checks == checks::with_pulled(&checks::DEV, false, holds) {
+        let (added, by): (Vec<&str>, Vec<&str>) =
+            pulled.iter().map(|(c, p)| (c.name(), *p)).unzip();
+        format!(
+            "dev + {} (the selection holds {})",
+            added.join(" + "),
+            by.join(", ")
+        )
     } else {
         names.join(" ")
     };
@@ -870,12 +916,20 @@ fn toolchain_lines(ctx: &Ctx) -> String {
     if let Some(lease) = &ctx.toolchain_lease {
         s.push_str(&format!("toolchain lease: {lease}\n"));
     }
-    match &ctx.main_build_dir {
-        Some(value) => s.push_str(&format!(
+    let pinned = ctx
+        .child_env_add
+        .iter()
+        .any(|(k, _)| k == "CARGO_TARGET_DIR");
+    match (&ctx.main_build_dir, pinned) {
+        (Some(value), false) => s.push_str(&format!(
             "build cache: the main lane shares plain targo's ({value})\n"
         )),
-        None => s.push_str(&format!(
-            "build cache: CARGO_TARGET_DIR={} (no shim cache here)\n",
+        (Some(value), true) => s.push_str(&format!(
+            "build cache: CARGO_TARGET_DIR={}, intermediates out of Spotlight ({value}; no shim cache here)\n",
+            ctx.target_dir.display()
+        )),
+        (None, _) => s.push_str(&format!(
+            "build cache: CARGO_TARGET_DIR={} (no shim cache here; the caller chose the build directory)\n",
             ctx.target_dir.display()
         )),
     }
@@ -1016,9 +1070,14 @@ pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
 /// checkout `cwd` is in, run, print, and answer the exit code.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
-    // `perf`, `glue` and `fetch-browser` parse their own arguments.
+    // `perf`, `soak`, `glue` and the browser lane's verbs (`fetch-browser`,
+    // `browser-site`, `browser-drive`) parse their own arguments, and none
+    // needs targo: a host without Trust drives the browser lane.
     if args.first().is_some_and(|a| a == "perf") {
         return perf::run(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "soak") {
+        return soak::run(&args[1..]);
     }
     if args.first().is_some_and(|a| a == "glue") {
         return wasm_glue::run(&args[1..]);
@@ -1026,6 +1085,14 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     #[cfg(unix)]
     if args.first().is_some_and(|a| a == "fetch-browser") {
         return browser::fetch_main(&args[1..]);
+    }
+    #[cfg(unix)]
+    if args.first().is_some_and(|a| a == "browser-site") {
+        return browser::site_main(&args[1..], cwd);
+    }
+    #[cfg(unix)]
+    if args.first().is_some_and(|a| a == "browser-drive") {
+        return browser::drive_main(&args[1..]);
     }
     let stop = |code: i32, line: String| {
         eprintln!("{line}");
@@ -1106,8 +1173,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         let (scope, said) = changed::cone(&base, &sel);
         (scope, Some(said))
     };
-    // A selection holding aterm-gpu runs its oracle arm with its tests.
-    let wanted = checks::with_pulled(&parsed.checks, scope.includes_crate(checks::ORACLE.0));
+    // A selection holding aterm-gpu runs its oracle arm with its tests, and one
+    // holding a web module its replay.
+    let wanted = checks::with_pulled(&parsed.checks, parsed.release, |p| scope.includes_crate(p));
     let ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
         .with_checks(&wanted)
         .with_release(parsed.release)
@@ -1255,17 +1323,11 @@ pub fn have_on_path(name: &str, path: &OsStr) -> bool {
     std::env::split_paths(path).any(|d| is_executable_file(&d.join(name)))
 }
 
-/// The fix a run that lacks `tool` names: Homebrew's `formula` on macOS, and the OS's own
-/// `package` elsewhere, where Homebrew is not how a machine gets tools and the name can
-/// differ (Debian and Fedora ship node as `nodejs`).
-#[must_use]
-pub fn install_fix(tool: &str, formula: &str, package: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("install {tool} (brew install {formula})")
-    } else {
-        format!("install {tool} (the {package} package)")
-    }
-}
+/// aterm's directories in this user's cache ([`aterm_uds::host::user_cache`]: the one
+/// computation the tool resolver reads too), on this host ([`host_user_cache`]). The
+/// browser lane unpacks its pinned browsers into `browser`, and the tools a check runs
+/// live in `tooling` ([`wasm_glue::tooling`], [`aterm_uds::host::tooling_dir`]).
+pub use aterm_uds::host::{host_user_cache, user_cache};
 
 #[cfg(test)]
 mod tests {
@@ -1327,11 +1389,19 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+            // Each stand-in is run once as it is laid, through spawnfd's `ETXTBSY`
+            // retry: a sibling test thread forking while this one held the file
+            // open for writing hands its child that descriptor, and Linux refuses
+            // the exec until the child's own exec closes it. Once one exec has
+            // started, discovery's own (a bare std spawn) cannot meet it.
             let runnable = |path: &Path, body: &str| {
                 std::fs::create_dir_all(path.parent().expect("bin")).expect("mkdir");
                 std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write");
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
                     .expect("chmod");
+                aterm_uds::spawnfd::command(path)
+                    .output()
+                    .expect("a stand-in just laid runs");
             };
             for bin in [&own, &managed] {
                 std::fs::create_dir_all(bin.parent().expect("sysroot").join("lib/rustlib"))
@@ -1468,6 +1538,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// WHERE THE SHIM STEPS ASIDE the main lane is pinned to the run's target dir
+    /// and its intermediates still go where Spotlight never looks:
+    /// `<target>/build.noindex`, so only the uplifted artifacts land in the plain
+    /// folder. A caller's own build directory (the variable, even empty, or a
+    /// cargo config naming one) is left alone; the pin stays either way.
+    #[test]
+    fn a_pinned_main_lane_keeps_its_intermediates_out_of_spotlight() {
+        let pinned = |c: &Ctx| {
+            c.child_env_add
+                .iter()
+                .find(|(k, _)| k == "CARGO_TARGET_DIR")
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        let ctx = |root: &Path, env: EnvSnapshot| {
+            Ctx::new(
+                root.to_path_buf(),
+                Scope::workspace(),
+                env,
+                PathBuf::from("/tmp"),
+            )
+        };
+        let theirs = EnvSnapshot {
+            cargo_target_dir: Some(PathBuf::from("/fast/tgt")),
+            cargo_layout: vec![("CARGO_TARGET_DIR", "/fast/tgt".into())],
+            ..EnvSnapshot::default()
+        };
+        let c = ctx(Path::new("/repo"), theirs.clone());
+        assert_eq!(pinned(&c), Some(PathBuf::from("/fast/tgt")));
+        assert_eq!(
+            c.main_build_dir.as_deref(),
+            Some("build.build-dir='/fast/tgt/build.noindex'")
+        );
+        let argv = stages::main_targo(&c, vec!["--unverified".into(), "test".into()]).argv();
+        assert_eq!(
+            argv[1..],
+            [
+                "--config",
+                "build.build-dir='/fast/tgt/build.noindex'",
+                "--unverified",
+                "test"
+            ]
+        );
+        // No HOME (no shim cache): the checkout's own target dir.
+        let c = ctx(Path::new("/repo"), EnvSnapshot::default());
+        assert_eq!(pinned(&c), Some(PathBuf::from("/repo/target")));
+        assert_eq!(
+            c.main_build_dir.as_deref(),
+            Some("build.build-dir='/repo/target/build.noindex'")
+        );
+        // The caller's build directory wins.
+        let chose = EnvSnapshot {
+            cargo_layout: vec![("CARGO_BUILD_BUILD_DIR", OsString::new())],
+            ..theirs.clone()
+        };
+        let c = ctx(Path::new("/repo"), chose);
+        assert_eq!((pinned(&c).is_some(), c.main_build_dir), (true, None));
+        let tmp = std::fs::canonicalize(mktemp_dir("atv-bdir").expect("mktemp")).expect("real");
+        let root = tmp.join("repo");
+        std::fs::create_dir_all(root.join(".cargo")).expect("mkdir");
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\nbuild-dir = 'mine'\n",
+        )
+        .expect("config");
+        let c = ctx(&root, theirs);
+        assert_eq!((pinned(&c).is_some(), c.main_build_dir), (true, None));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// A caller's own RUST_TEST_THREADS is a pin, as --test-threads is.
     #[test]
     fn a_callers_rust_test_threads_pins_every_binary() {
@@ -1522,5 +1661,38 @@ mod tests {
         assert_eq!(run_cli(&args(&["list"]), &tmp), exit::PASS);
         assert_eq!(run_cli(&args(&["--help"]), &tmp), exit::PASS);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The header says what the selection pulled into `dev`, and the package
+    /// that pulled each.
+    #[test]
+    fn the_header_names_what_the_selection_pulled_and_why() {
+        let head = |crates: &[&str]| {
+            let scope = Scope::changed(
+                "origin/main",
+                crates.iter().map(|c| c.to_string()).collect(),
+                true,
+            );
+            let holds = |p: &str| scope.includes_crate(p);
+            let checks = checks::with_pulled(&checks::DEV, false, holds);
+            let ctx = Ctx::new(
+                PathBuf::from("/repo"),
+                scope.clone(),
+                EnvSnapshot::default(),
+                PathBuf::from("/tmp"),
+            )
+            .with_checks(&checks);
+            header(&ctx, Some("the cone"))
+        };
+        assert_eq!(head(&["aterm-gui"]), "verify: dev — the cone");
+        assert_eq!(
+            head(&["aterm-gpu"]),
+            "verify: dev + gpu-oracle (the selection holds aterm-gpu) — the cone"
+        );
+        assert_eq!(
+            head(&["aterm-core", "aterm-gpu", "aterm-gpu-web", "aterm-wasm"]),
+            "verify: dev + gpu-oracle + wasm-smoke (the selection holds aterm-gpu, aterm-wasm) \
+             — the cone"
+        );
     }
 }

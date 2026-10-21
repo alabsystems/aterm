@@ -597,6 +597,11 @@ mod tests {
             revert: None,
             effect: Effect::Now,
             detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside: None,
+            essential: false,
         }
     }
 
@@ -628,7 +633,7 @@ mod tests {
         let mut progress = String::new();
         for l in [
             Line::Started { run: "1-5".into() },
-            Line::Item(row("power.ac.sleep")),
+            Line::Item(Box::new(row("power.ac.sleep"))),
         ] {
             progress.push_str(&aterm_json::to_string(&l).unwrap());
             progress.push('\n');

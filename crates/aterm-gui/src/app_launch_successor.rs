@@ -476,7 +476,8 @@ pub(crate) enum OwnLaunchRecord {
     Named,
     /// No entry carries it and one carries none (`-1`): the stale record an `execve`
     /// after a LaunchServices launch leaves ([`LaunchError::PidUnknown`]), which lasts
-    /// the process's life.
+    /// the process's life, and which a launch-record renewal replaces with a fresh
+    /// process (`launch_record_renewal`).
     Stale,
     /// Neither: no bundle identifier, or no entry without a pid to be this one.
     Unknown,
@@ -500,7 +501,7 @@ pub(crate) const OWN_LAUNCH_RECORD_SETTLE: std::time::Duration = std::time::Dura
 #[cfg(target_os = "macos")]
 pub(crate) fn own_launch_record() -> OwnLaunchRecord {
     use aterm_objc::{autoreleasepool, class, sel};
-    let Some(bundle_id) = crate::control_privacy::running_bundle_id() else {
+    let Some(bundle_id) = crate::signing_identity::running_bundle_id() else {
         return OwnLaunchRecord::Unknown;
     };
     let own = i32::try_from(std::process::id()).unwrap_or(-1);

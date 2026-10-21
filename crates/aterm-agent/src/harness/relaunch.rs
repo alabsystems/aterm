@@ -60,16 +60,16 @@
 //! DONE, whatever brought it back (a crash, aterm's own end, the memory
 //! restart, a stall, an asked restart, a model or an account move): one
 //! nobody but the harness asked anything (`done:taskless`), and one whose
-//! worker FINISHED its task — its token, or a done reply to the done check,
-//! with no prompt of a person's or an orchestrator's since
-//! (`super::upgrade::FinishedScan`; `done:finished`), read once a restart
-//! from `upgrade_drive::FINISHED_ONCE_BYTES` before the record's end, and
-//! from further back where that window settles nothing (a token behind more
-//! wakes than that is still read).
+//! task LANDED — a clean `Nothing left:` defense answering one of Autopilot
+//! Land's acts, with no prompt of a person's or an orchestrator's since
+//! (`super::upgrade::FinishedScan`; `done:finished`; never a token or a
+//! done reply), read once a restart from `upgrade_drive::FINISHED_ONCE_BYTES`
+//! before the record's end, and from further back where that window settles
+//! nothing (a landing behind more wakes than that is still read).
 //! The restart itself is still made (the memory banner's included); only the
-//! carry-on is not. A conversation whose LAST WORDS ARE A DONE REPORT in
-//! words, its task not finished by its record, is typed the carry-on's facts
-//! and the done check in place of `keep going` (`continued:check`;
+//! carry-on is not. A conversation whose LAST WORDS CLAIM THE WORK IS DONE,
+//! its task not landed by its record, is typed under Cruise the carry-on's
+//! facts and the Cruise prompt in place of `keep going` (`continued:check`;
 //! `super::upgrade::FinishedScan::said_done`, the live lab's LIVE-RL-1), as
 //! the turn-end policy types there. A conversation whose last turn is A
 //! PERSON'S OWN EXCHANGE a tab's loop left to them (its ledger's
@@ -81,7 +81,7 @@
 //! a second continuation of one resume. UNDER AUTOPILOT LAND
 //! ([`Opts::land`], F2) no carry-on of Cruise's is typed at all
 //! (`done:landing`): the tab's loop's land policy decides the point — the
-//! land instruction, a nudge, or nothing once the landing is spent.
+//! land instruction, a nudge, or nothing once the task landed.
 //! Codex is out of this: no rollout is read for whose turns it holds (the
 //! owner's ruling on the no-task rule), so a Codex relaunch carries on as
 //! before.
@@ -336,7 +336,7 @@ pub(super) fn required_env<'a>(
 ) -> Vec<(&'static str, &'a str)> {
     home.map(|value| (accounts::HOME_ENV, value))
         .into_iter()
-        .chain(homedir.map(|value| ("HOME", value)))
+        .chain(homedir.map(|value| (accounts::HOMEDIR_ENV, value)))
         .chain(login_env(login))
         .collect()
 }
@@ -368,7 +368,7 @@ pub(super) fn plan(
     opts: &Opts,
     launch: &Launch<'_>,
     shell: u32,
-    t: &[(u32, u32, String)],
+    t: &[super::upgrade_drive::ProcRow],
 ) -> Result<Plan, NoPlan> {
     if shell == NO_SHELL {
         return Err(NoPlan::Refused {
@@ -490,13 +490,13 @@ fn tap_of(
 
 /// The dialect of the shell `shell`, as its executable names it: the kernel's
 /// argv, or the name in the process table `t` where that cannot be read.
-pub(super) fn shell_dialect(shell: u32, t: &[(u32, u32, String)]) -> Option<Dialect> {
+pub(super) fn shell_dialect(shell: u32, t: &[super::upgrade_drive::ProcRow]) -> Option<Dialect> {
     atpkg::caller_shell::process_args(shell)
         .map(|a| a.exec_path)
         .or_else(|| {
             t.iter()
                 .find(|(p, _, _)| *p == shell)
-                .map(|(_, _, n)| n.clone())
+                .map(|(_, _, n)| n.to_string())
         })
         .as_deref()
         .and_then(Dialect::from_exe_name)
@@ -1056,8 +1056,17 @@ pub(super) fn relaunch_of(
 /// production bound ([`super::Timings::PRODUCTION`], 3 s and up) polls at
 /// 250 ms, and a test's millisecond bound ([`super::Timings::FAST`]) still
 /// asks a dozen times.
-pub(super) fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let gap = (limit / 12).clamp(Duration::from_millis(5), Duration::from_millis(250));
+pub(super) fn wait_until(limit: Duration, cond: impl FnMut() -> bool) -> bool {
+    wait_every(limit, poll_gap(limit), cond)
+}
+
+/// [`wait_until`]'s pace for `limit`.
+fn poll_gap(limit: Duration) -> Duration {
+    (limit / 12).clamp(Duration::from_millis(5), Duration::from_millis(250))
+}
+
+/// [`wait_until`], `cond` polled every `gap`.
+fn wait_every(limit: Duration, gap: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < limit {
         if cond() {
@@ -1637,8 +1646,7 @@ fn first_mark(
         .cursor
         .and_then(|(r, _)| scr.rows.get(r))
         .map_or("", String::as_str);
-    let at_cursor: String = row.chars().skip(mark.col).take(2).collect();
-    if !at_cursor.trim().is_empty() {
+    if first_drawn(row, mark.col).is_some_and(|at| at < mark.col.saturating_add(2)) {
         return Err(RelaunchLineError::Wait("typing"));
     }
     if held_since_s != 0
@@ -1664,11 +1672,7 @@ fn first_mark(
         }
         Some(_) if unkeyed => Ok(Some(mark)),
         Some(_) => Err(RelaunchLineError::Wait("mark-elsewhere")),
-        None if mark.left.chars().count() < mark.col
-            || mark.left.ends_with(char::is_whitespace) =>
-        {
-            Ok(Some(mark))
-        }
+        None if blank_before(row, mark.col) => Ok(Some(mark)),
         None if unkeyed => Err(RelaunchLineError::Wait("unmarked")),
         None => Err(RelaunchLineError::Wait("typing")),
     }
@@ -1694,11 +1698,46 @@ impl InputStart {
     /// Whether the mark names `cursor_row` — the cursor's row as the screen
     /// read it: the two read the same left of the mark's column.
     fn names(&self, cursor_row: &str) -> bool {
-        self.row
-            .chars()
-            .take(self.col)
-            .eq(cursor_row.chars().take(self.col))
+        left_of(&self.row, self.col) == left_of(cursor_row, self.col)
     }
+}
+
+/// The text of `row` drawn left of grid column `col`. The cursor's column
+/// and the shell's input start (`cmdcol`) count CELLS, while a row's text
+/// holds one char per glyph drawn (a wide glyph's second cell is no char), so
+/// a column is found by grid column ([`aterm_grapheme::grid_graphemes`], cut
+/// where [`aterm_grapheme::column_to_char_index`] cuts, as the session survey
+/// cuts a command row at its `133;B` column), never by char count: counted by
+/// chars, the cursor after `🦀 % x` sat past the row's end and the person's `x`
+/// read as the blank after the prompt.
+fn left_of(row: &str, col: usize) -> &str {
+    let end = aterm_grapheme::grid_graphemes(row)
+        .find(|g| col < g.end_col)
+        .map_or(row.len(), |g| g.byte_offset);
+    &row[..end]
+}
+
+/// The grid column where the first glyph other than a blank is drawn in `row`
+/// at or right of column `col` (one that starts left of it and covers it
+/// included), in the cells [`left_of`] counts.
+fn first_drawn(row: &str, col: usize) -> Option<usize> {
+    aterm_grapheme::grid_graphemes(row)
+        .find(|g| g.end_col > col && !g.text.trim().is_empty())
+        .map(|g| g.start_col)
+}
+
+/// Whether the cell left of grid column `col` in `row` shows a blank: past
+/// the row's text (a `text` row's trailing blanks are trimmed), or a blank
+/// glyph. A character the grid stores in that cell and draws in no cell of
+/// its own (a ZWSP, an LRM after the prompt's last space) is no glyph, so
+/// `% ` with an LRM after it still ends in a blank. Column 0 has no cell
+/// before it.
+fn blank_before(row: &str, col: usize) -> bool {
+    col > 0
+        && aterm_grapheme::grid_graphemes(row)
+            .filter(|g| g.start_col < g.end_col && g.start_col < col)
+            .last()
+            .is_none_or(|g| g.end_col < col || g.text.trim().is_empty())
 }
 
 /// [`InputStart`] as the tab answers it. `None` where no such mark reads: no
@@ -1775,18 +1814,11 @@ impl PromptMark {
     pub(super) fn of(scr: &Screen) -> Option<PromptMark> {
         let (row, col) = scr.cursor?;
         let text = scr.rows.get(row)?;
-        let left = text.chars().take(col).collect();
-        let right = text
-            .chars()
-            .enumerate()
-            .skip(col)
-            .find(|(_, ch)| !ch.is_whitespace())
-            .map(|(i, _)| i);
         Some(PromptMark {
             row: scr.first.saturating_add(row),
             col,
-            left,
-            right,
+            left: left_of(text, col).to_string(),
+            right: first_drawn(text, col),
         })
     }
 
@@ -1803,12 +1835,7 @@ impl PromptMark {
                 .and_then(|r| scr.rows.get(r))
                 .map_or("", String::as_str);
             let end = self.right.unwrap_or(usize::MAX);
-            let typed = text
-                .chars()
-                .enumerate()
-                .skip(self.col)
-                .take_while(|(i, _)| *i < end)
-                .any(|(_, ch)| !ch.is_whitespace());
+            let typed = first_drawn(text, self.col).is_some_and(|at| at < end);
             return if typed {
                 AtPrompt::Typed
             } else {
@@ -1907,7 +1934,13 @@ fn await_held(
     let mut ended = false;
     let look_back = ends_at_once(&st.cause);
     let tab = st.tab.clone();
-    wait_until(held_wait(&opts.timings, &st.cause), || {
+    // Polled at least as often as a shell look is due ([`ShellBack`]): the
+    // product's look (1 s) is slower than its poll (250 ms), so this moves
+    // nothing there. On the tests' clock (a 50 ms look) the looks otherwise
+    // ran at the poll's 250 ms, and a relaunch that ended as it started read
+    // so about 0.75 s after its line instead of 0.35 s.
+    let limit = held_wait(&opts.timings, &st.cause);
+    wait_every(limit, poll_gap(limit).min(opts.timings.shell_look), || {
         hand.keep(c);
         new = roster.files(&records, Instant::now()).and_then(|files| {
             files
@@ -2572,18 +2605,18 @@ fn carry_on_once(
     let written = WhereWritten::new(opts, &records, key, &ours);
     // Carried on with NOTHING where the conversation's own records say a
     // carry-on is owed no longer ([`nothing_owed`]: nobody asked it anything,
-    // its worker finished, its last turn is a person's own exchange, or the
+    // its task landed, its last turn is a person's own exchange, or the
     // tab's loop resumed it first).
     if settled && let Some((word, why)) = nothing_owed(opts, &written, tab, st) {
         return done_with_nothing(opts, r, st, key, word, why, &latest.version, new.pid);
     }
     // AUTOPILOT LAND (`Opts::land`, F2): no continuation of Cruise's is
-    // typed — not `keep going`, not the done check's `otherwise continue`.
-    // The point is the tab's loop's, whose land policy types the land
-    // instruction, a nudge, or nothing once the landing is spent, as at any
-    // point under Land (ddd3452dd made a limit's end Land's the same way).
-    // Typed, a spent landing's memory restart started the work again, the
-    // very reason a spent landing is wrapped in no other relaunch. The one
+    // typed — not `keep going`, not the Cruise prompt. The point is the
+    // tab's loop's, whose land policy types the land instruction, a nudge,
+    // or nothing once the task landed, as at any point under Land
+    // (ddd3452dd made a limit's end Land's the same way). Typed, a landed
+    // task's memory restart started the work again, the very reason a
+    // landing is wrapped in no other relaunch. The one
     // look at what did not come back stays. A pass that carries no Autopilot
     // of its own (the CLI's hand-run sweep, `Opts::land` false) reads the
     // tab's own `status`, as an adopting pass does ([`tab_under_land`];
@@ -2604,13 +2637,12 @@ fn carry_on_once(
         save(opts, key, st);
         return r;
     }
-    // THE CONVERSATION'S LAST WORDS ARE A DONE REPORT, its task not finished
-    // by its record (no token, no done check answered): the carry-on keeps
-    // its facts and asks the done check in place of `keep going`, as the
-    // turn-end policy would at that point (the live lab's LIVE-RL-1: a
-    // crash's restore typed `keep going` after `All tasks are complete and
-    // verified; nothing is left to do.`).
-    // Where that report names an irreversible act, the check says to
+    // THE CONVERSATION'S LAST WORDS CLAIM THE WORK IS DONE (Cruise; its task
+    // not landed by its record): the carry-on keeps its facts and types the
+    // Cruise prompt in place of `keep going`, as the turn-end policy would at
+    // that point (the live lab's LIVE-RL-1: a crash's restore typed `keep
+    // going` after `All tasks are complete and verified; nothing is left to
+    // do.`). Where that report names an irreversible act, the prompt says to
     // approve nothing irreversible, as the policy's does (RR4-RL-3).
     let (said_done, irreversible) = if settled {
         written.said_done().unwrap_or_default()
@@ -2688,8 +2720,8 @@ fn carry_on_once(
         opts,
         &r,
         if said_done {
-            "its last words are a done report: the continuation's facts and the done check are \
-             typed; a later step reads the model its answer names"
+            "its last words claim the work is done: the continuation's facts and the Cruise \
+             prompt are typed; a later step reads the model its answer names"
         } else {
             "the continuation is typed; a later step reads the model its answer names"
         },
@@ -2729,6 +2761,13 @@ fn done_quietly(
 /// row says it too).
 pub(super) const NOBODY_ASKED: &str = "nobody has asked this conversation anything";
 
+/// Why a relaunch whose conversation's record says its task landed is
+/// carried on with nothing ([`nothing_owed`]): the record's words, a clean
+/// defense answering a land act — which cannot see the repository, so it
+/// says no more than that.
+pub const RECORD_LANDED: &str = "its record says it defended its task as landed and nobody has asked \
+                                 anything since (the tab's loop checks the repository)";
+
 /// WHETHER THE CARRY-ON OWED TO THE RESTART `st` RECORDS IS OWED NO LONGER,
 /// by what the conversation's own records say — in [`carry_on_once`]'s
 /// order, the word it ends on and why — or `None` where it is still owed.
@@ -2748,21 +2787,21 @@ fn nothing_owed(
     if records.tasked(key, ours) == Some(false) {
         return Some(("done:taskless", NOBODY_ASKED));
     }
-    // A conversation whose own record says its task is FINISHED — its worker
-    // ended it, and nobody has asked anything since — is carried on with
-    // nothing, whatever brought it back (a crash, aterm's own end, the memory
-    // restart, a stall, an asked restart, a model or account move): a
-    // carry-on would reopen a task its worker closed (the done ruling of
-    // 2026-09-27: nothing is typed until a person's or an orchestrator's
-    // turn). The tab's loop reads the same record at its point
+    // A conversation whose own record says its task LANDED — a clean
+    // defense answering a land act, and nobody has asked anything since — is
+    // carried on with nothing, whatever brought it back (a crash, aterm's own
+    // end, the memory restart, a stall, an asked restart, a model or account
+    // move): a carry-on would reopen a landed task (FOREVER LAND: nothing is
+    // typed until a person's or an orchestrator's turn). The tab's loop reads the same record at its point
     // ([`upgrade::FinishedScan`]); this one read starts
     // `upgrade_drive::FINISHED_ONCE_BYTES` back, and further back where that
-    // window settles nothing ([`upgrade::FinishedScan::settled`]).
+    // window settles nothing ([`upgrade::FinishedScan::settled`]). The
+    // record speaks of the words alone — it cannot see the repository, the
+    // landing's fourth condition — so the word says what the record says,
+    // and the tab's loop holds the landing to the repository at its point
+    // (a dirty one is nudged there).
     if written.finished() == Some(true) {
-        return Some((
-            "done:finished",
-            "its worker finished its task and nobody has asked anything since",
-        ));
+        return Some(("done:finished", RECORD_LANDED));
     }
     // A PERSON'S OWN EXCHANGE, LEFT TO THEM by the loop of a tab that held
     // the conversation, is still its last turn (the review's RR3-TE-2): the
@@ -2982,9 +3021,9 @@ const RESTORE_LOST: &str =
 /// only once the bound passed. Off, `-` or an unreadable status: nothing
 /// typed, as before. `None`: the look is still open. `tab_probe` is the seam
 /// for the tab's claim on the process, as [`carry_on_with_tab_probe`]'s.
-/// Whether the task is finished is read once, from
+/// Whether the task landed is read once, from
 /// `upgrade_drive::FINISHED_ONCE_BYTES` before the transcript's end and from
-/// further back where that window settles nothing: a token with more of
+/// further back where that window settles nothing: a landing with more of
 /// Claude Code's wakes after it than that is still read.
 pub(super) fn restore_look(
     opts: &Opts,
@@ -4435,7 +4474,11 @@ pub fn told_command(user_home: &Path, state: Option<&Path>, snap: &Snapshot) -> 
         .as_deref()
         .map(|home| (accounts::HOME_ENV, home))
         .into_iter()
-        .chain(homedir.as_deref().map(|homedir| ("HOME", homedir)))
+        .chain(
+            homedir
+                .as_deref()
+                .map(|homedir| (accounts::HOMEDIR_ENV, homedir)),
+        )
         .collect();
     super::resume::with_env(&env, &line)
 }
@@ -6391,17 +6434,16 @@ pub fn resume(opts: &Opts) -> Report {
     resume_as(opts, false, None)
 }
 
-/// [`resume`] at a point the loop read as a TASK DONE UNDER LAND
+/// [`resume`] at a point the loop read as a TASK LANDED UNDER LAND
 /// (`done_under_land`, `crate::supervise::IdlePoint::done_under_land`): the
-/// session's word is Land and its last reply said done. Its carry-on —
-/// "Continue where you left off" — would start again the work the person
-/// asked to wrap up, after a cold restore, a crash's or a relaunch on exit
+/// session's word is Land and the policy read the task landed. Its
+/// carry-on — "Continue where you left off" — would start again the work
+/// that landed, after a cold restore, a crash's or a relaunch on exit
 /// alike, so the relaunched agent is found and adopted as a loop's
 /// ([`await_new`] under `hand_back`, the same look that precedes every
 /// carry-on), and its record is done with NOTHING TYPED ([`carried_done`],
-/// `done:said-done`). The loop then decides the point as any other: under
-/// Land a done reply ends the task, a first done report in words gets
-/// Land's own instruction. A model a typed continuation owes is read as
+/// `done:said-done`). The loop then decides the point as any other: a
+/// landed task gets nothing until someone else's turn. A model a typed continuation owes is read as
 /// ever ([`confirm`]); a relaunch whose agent is not found yet waits, owed.
 /// `only`: the one agent whose record is carried ([`owed_of`]); another
 /// agent's owed in the tab is `current` here.
@@ -6450,7 +6492,7 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
         return confirm(opts, &r, &mut st, &session, now_s())
             .unwrap_or_else(|| said(r, "wait:model"));
     }
-    // A task done under Land is adopted, never carried on: the look stops
+    // A task landed under Land is adopted, never carried on: the look stops
     // where a loop's relaunch stops (`adopted`), before anything is typed.
     let carry = Opts {
         hand_back: done_under_land,
@@ -6480,12 +6522,13 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
     r
 }
 
-/// The word of a relaunch carried on with nothing because its task is done
+/// The word of a relaunch carried on with nothing because its task landed
 /// under Land ([`resume_as`]): a last word that typed and ended nothing
-/// (`upgrade_drive::moved`), so the loop decides the point after it.
+/// (`upgrade_drive::moved`), so the loop decides the point after it. The
+/// word is an older build's, kept for the ledgers that hold it.
 pub const CARRIED_DONE: &str = "done:said-done";
 
-/// THE RELAUNCH OF A TASK DONE UNDER LAND, CARRIED ON WITH NOTHING
+/// THE RELAUNCH OF A TASK LANDED UNDER LAND, CARRIED ON WITH NOTHING
 /// ([`resume_as`]): its agent adopted (`r`), the record of `session` is done
 /// — no continuation typed, none owed, no model to read after — and the
 /// owner's outcome line says why. A record no longer in flight (another
@@ -6498,7 +6541,7 @@ fn carried_done(opts: &Opts, r: Report, session: &str) -> Report {
     };
     st.phase = upgrade::Phase::Done;
     st.done_at = now_s();
-    let why = "nothing typed: under Land, its last reply said done";
+    let why = "nothing typed: under Land, its task landed";
     st.outcome = match st.agent {
         upgrade::Agent::Claude => {
             format!("claude restarted on {} · {why}", one_line(&st.to))
@@ -6549,7 +6592,7 @@ fn carried_done(opts: &Opts, r: Report, session: &str) -> Report {
 /// crash relaunched the agent into a usage limit; its loop's limit episode
 /// withheld every idle point from the host until the limit's reset plus
 /// `upgrade_drive::LIMIT_GRACE_S` (an hour; for good where the limit names
-/// no reset), while the loop typed the done check and said `DONE`. The
+/// no reset), while the loop typed its act and said `DONE`. The
 /// record stayed `relaunched` (owed) through it all, and an owed relaunch
 /// holds the tab's automatic update — its notice at a break and its step
 /// at an idle point are the carry-on's first, and the upgrade's own record
@@ -6557,8 +6600,8 @@ fn carried_done(opts: &Opts, r: Report, session: &str) -> Report {
 /// begun. Nothing wrong was typed: the step, taken late, ends at
 /// `done:carried`.
 ///
-/// Every other carry-on — one that would type (the continuation, the done
-/// check after a done report, an open task's restore line), a Codex's, a
+/// Every other carry-on — one that would type (the continuation, the Cruise
+/// prompt after a done claim, an open task's restore line), a Codex's, a
 /// typed continuation's model — is left to the tab's idle point
 /// (`wait:owed`). `wait:resume`: the relaunch
 /// has not adopted its new process yet (its own step does, and a settle

@@ -266,6 +266,27 @@ pub(crate) struct SessionRow {
     /// The Mac that holds the tab over the fleet (the step-in's remote
     /// slot), by the name this Mac's book gives it.
     pub held_by_host: Option<String>,
+    /// Its supervised agent's task END, while one stands on the harness's
+    /// glass (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4.3, item 1;
+    /// `harness_glass::EndGlass`, the one end §11.2 decides).
+    pub end: Option<EndRow>,
+}
+
+/// A SUPERVISED AGENT'S TASK END as the glance reads it (§11.4.3, item 1):
+/// under FOREVER CRUISE / FOREVER LAND the one end is Land's landing (Cruise
+/// never ends), so an instant and whether it was seen, nothing that moves
+/// while it stands — no trail words, no live state words, no clock words —
+/// so the Done for you row it makes cannot go stale; its age is composed
+/// when the menu is painted ([`done_line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EndRow {
+    /// The end's session-local serial: a captured result acknowledges this end.
+    pub serial: u32,
+    /// When the task's face moved there (unix milliseconds); `0` where no
+    /// time is known, and the row then says no age.
+    pub since_unix_ms: u64,
+    /// Someone looked at it (the one looking rule, or the menu bar's Go).
+    pub seen: bool,
 }
 
 /// A worker's task record as the glance reads it.
@@ -1455,17 +1476,22 @@ pub(crate) enum DoneAt {
     Go(u16),
 }
 
-/// A finished worker nobody waits on: started from `ctl`, or its manager gone.
+/// What came down that nobody here waits on and nobody has looked at: a
+/// finished worker started from `ctl` or whose manager is gone, or a
+/// supervised agent's task end (§11.4.3, item 2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DoneRow {
     /// Its tab's label.
     pub label: String,
-    /// When it finished (unix milliseconds).
+    /// When it finished (unix milliseconds); `0`: not known, no age.
     pub since_unix_ms: u64,
     /// Its result's size.
     pub result_bytes: u64,
     /// What a click does.
     pub at: DoneAt,
+    /// A landing (`landed`): a supervised agent's end, or a worker's task
+    /// row whose end stands unseen; else a worker's `done`.
+    pub landed: bool,
 }
 
 /// One Waiting cause: every tab aterm waits out for the same reason.
@@ -1529,6 +1555,8 @@ pub(crate) struct ResultRef {
     pub session: u64,
     /// The done it is (its task's entry rev): what reading it marks seen.
     pub entered: u64,
+    /// The unseen end this result shared when drawn; no later end is acknowledged.
+    pub end_serial: Option<u32>,
     /// The result file.
     pub path: std::path::PathBuf,
     /// The worker's label, for the tab's title.
@@ -1833,6 +1861,7 @@ impl Glance {
                         ResultRef {
                             session: row.id,
                             entered: task.entered,
+                            end_serial: row.end.filter(|end| !end.seen).map(|end| end.serial),
                             path,
                             label: row.title.clone(),
                         },
@@ -1881,6 +1910,8 @@ impl Glance {
         g.managers = managers.into_iter().map(|(_, m)| m).collect();
         // Done for you: a done task nobody here waits on, not yet looked at.
         let mut done: Vec<DoneRow> = Vec::new();
+        // The sessions whose own task row stands there.
+        let mut listed: Vec<u64> = Vec::new();
         for row in rows {
             let Some(task) = row.task.as_ref().filter(|t| {
                 t.state == TaskState::Done
@@ -1899,6 +1930,7 @@ impl Glance {
                         ResultRef {
                             session: row.id,
                             entered: task.entered,
+                            end_serial: row.end.filter(|end| !end.seen).map(|end| end.serial),
                             path,
                             label: row.title.clone(),
                         },
@@ -1916,6 +1948,41 @@ impl Glance {
                 since_unix_ms: task.since_unix_ms,
                 result_bytes: task.result_bytes,
                 at,
+                // A worker under Land whose end (a landing) stands unseen:
+                // this one row is that landing's too, worded as it.
+                landed: row.end.is_some_and(|end| !end.seen),
+            });
+            listed.push(row.id);
+        }
+        // …and a supervised agent's task END nobody has looked at (§11.4.3,
+        // item 2): its tab's label, `landed`, the instant its face moved
+        // there, and a click that goes to the session — no result. One
+        // row per session: where its own task row stands above (a worker
+        // under Autopilot), that row is it. A worker its manager here waits
+        // on gets none, as its task's done gets none: its row is under its
+        // manager, and Done for you is what nobody here waits on.
+        for row in rows {
+            let Some(end) = row.end.filter(|end| !end.seen) else {
+                continue;
+            };
+            let waited_on = row.task.as_ref().is_some_and(|t| {
+                t.from != crate::task_record::FROM_CTL && rows.iter().any(|r| r.sid == t.from)
+            });
+            if waited_on {
+                continue;
+            }
+            if listed.contains(&row.id) {
+                continue;
+            }
+            let Some(at) = go(&mut g, row.id) else {
+                continue;
+            };
+            done.push(DoneRow {
+                label: row.title.clone(),
+                since_unix_ms: end.since_unix_ms,
+                result_bytes: 0,
+                at: DoneAt::Go(at),
+                landed: true,
             });
         }
         done.sort_by_key(|d| std::cmp::Reverse(d.since_unix_ms));
@@ -2097,8 +2164,9 @@ impl Glance {
     }
 
     /// The menu-bar button title: `❯N` while N needs stand, else `❯•` while
-    /// the digest holds entries or a worker's result waits under Done for
-    /// you, else `❯`.
+    /// the digest holds entries or a row stands under Done for you (a
+    /// worker's done, a supervised agent's end nobody has looked at), else
+    /// `❯`.
     pub(crate) fn button_title(&self) -> String {
         match self.need_count() {
             0 if !self.exceptions.is_empty() || !self.done.is_empty() => "\u{276f}\u{2022}".into(),
@@ -2430,20 +2498,28 @@ fn worker_line(w: &WorkerRow, now_unix: i64) -> String {
     fold_clip(&line, LINE_MAX)
 }
 
-/// A Done for you line: "✓ fleet summary — done 3m · 1.4 KB".
+/// A Done for you line: "✓ fleet summary — done 3m · 1.4 KB", and a
+/// landing's "✓ proj-api refactor — landed 3m" (§11.4.1). The age is
+/// composed here, when the menu is painted, never kept on the row; a row
+/// with no known time says none.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
 )]
 fn done_line(d: &DoneRow, now_unix: i64) -> String {
-    let age = age_words(ms_age(d.since_unix_ms, now_unix));
+    let word = if d.landed { "landed" } else { "done" };
+    let age = if d.since_unix_ms == 0 {
+        String::new()
+    } else {
+        format!(" {}", age_words(ms_age(d.since_unix_ms, now_unix)))
+    };
     let size = if d.result_bytes > 0 {
         format!(" \u{b7} {}", bytes_words(d.result_bytes))
     } else {
         String::new()
     };
     fold_clip(
-        &format!("\u{2713} {} \u{2014} done {age}{size}", d.label),
+        &format!("\u{2713} {} \u{2014} {word}{age}{size}", d.label),
         LINE_MAX,
     )
 }
@@ -2666,8 +2742,8 @@ fn notify_tip(voice: Option<NoticeVoice>, on: bool) -> String {
             NoticeFallback::ScriptEditor => format!(
                 "{what}. This aterm is not running from aterm.app, and without terminal-notifier \
                  macOS shows them as Script Editor's banners, and a click opens Script Editor. \
-                 Installed (brew install terminal-notifier), they are terminal-notifier's banners \
-                 from aterm's next start; run from aterm.app, they are aterm's own once macOS \
+                 With terminal-notifier installed, they are terminal-notifier's banners from \
+                 aterm's next start; run from aterm.app, they are aterm's own once macOS \
                  allows it."
             ),
         },
@@ -4221,6 +4297,7 @@ mod tests {
         crate::input_stall::InputStallFact {
             word: aterm_session::input_backlog::InputWord::Stalled,
             since: std::time::Instant::now(),
+            since_unix: None,
             bytes: 1,
             stopped: false,
             rss_mb: Some(39_731),
@@ -5895,6 +5972,271 @@ mod tests {
         assert!(matches!(g.done[1].at, DoneAt::Go(_)));
         // The orphan's manager is not here: its workers are grouped so.
         assert!(g.managers.iter().any(|m| m.go.is_none()));
+    }
+
+    /// A supervised agent's session whose task END (Land's landing, the one
+    /// end under FOREVER CRUISE / FOREVER LAND) stands since `at_unix`, looked
+    /// at (`seen`) or not.
+    fn ended(id: u64, title: &str, at_unix: i64, seen: bool) -> SessionRow {
+        SessionRow {
+            id,
+            sid: format!("s-{id:020}"),
+            title: title.to_string(),
+            agent: "idle",
+            end: Some(EndRow {
+                serial: 1,
+                since_unix_ms: unix_ms(at_unix),
+                seen,
+            }),
+            ..SessionRow::default()
+        }
+    }
+
+    /// The composed menu's Done for you rows as `chrome` prints them.
+    fn done_lines(g: &Glance, now_unix: i64) -> Vec<String> {
+        menu_lines(&compose_status_menu(g, now_unix), &[])
+            .into_iter()
+            .filter(|l| l.starts_with("statusmenu \"Done for you") || l.contains("\u{2713} "))
+            .collect()
+    }
+
+    /// AN END NOBODY HAS LOOKED AT IS ONE DONE FOR YOU ROW
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4.1; §11.4.5
+    /// "`Glance::build`"): a landing worded `landed` (Cruise never ends, so it
+    /// has no row of its own), the tab's label and its age as the menu is
+    /// painted, no size, a click that goes to the session — newest first —
+    /// and a seen end none; the title is `❯•`. NEGATIVE CONTROLS: `seen`
+    /// ignored lists the seen end (as run, this test fails); in-test, the same
+    /// end unseen is listed.
+    #[test]
+    fn an_unseen_end_is_one_go_row_worded_landed() {
+        let now = 1_000_000;
+        let rows = [
+            ended(1, "Calc.py small tested module", now - 41 * 60, false),
+            ended(2, "proj-api refactor", now - 3 * 60, false),
+            ended(3, "looked at", now - 60, true),
+        ];
+        let g = local_glance(&rows, &[], now, None);
+        let labels: Vec<&str> = g.done.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["proj-api refactor", "Calc.py small tested module"],
+            "newest first; the seen end has none"
+        );
+        let goes: Vec<u64> = g
+            .done
+            .iter()
+            .map(|d| match d.at {
+                DoneAt::Go(at) => g.go[usize::from(at)],
+                DoneAt::Read(_) => panic!("an end has no result: {d:?}"),
+            })
+            .collect();
+        assert_eq!(goes, [2, 1], "a click goes to the session");
+        assert!(g.done.iter().all(|d| d.result_bytes == 0));
+        assert_eq!(
+            done_lines(&g, now),
+            [
+                "statusmenu \"Done for you (2)\" enabled=no",
+                "statusmenu \"\u{2713} proj-api refactor \u{2014} landed 3m\" enabled=yes checked=no",
+                "statusmenu \"\u{2713} Calc.py small tested module \u{2014} landed 41m\" enabled=yes checked=no",
+            ]
+        );
+        assert_eq!(g.button_title(), "\u{276f}\u{2022}");
+        // CONTROL: the seen end, unseen, is a row.
+        let mut unseen = rows.clone();
+        unseen[2].end.as_mut().expect("an end").seen = false;
+        assert_eq!(local_glance(&unseen, &[], now, None).done.len(), 3);
+    }
+
+    /// ONE ROW PER SESSION (§11.4.3, item 2): a worker under Autopilot whose
+    /// own task row stands under Done for you is that row alone — its Read
+    /// Result where it has one, else Go — and a worker its manager here
+    /// waits on gets none, as its task's done gets none (Done for you is what
+    /// nobody here waits on; its row is under its manager). NEGATIVE
+    /// CONTROLS (as run, each failing this test): the de-duplication dropped
+    /// lists both workers twice; the manager's rule dropped lists the managed
+    /// worker. In-test: the same end with no task row is listed.
+    #[test]
+    fn a_worker_whose_task_row_stands_gets_one_row() {
+        let end = Some(EndRow {
+            serial: 1,
+            since_unix_ms: 2_000_000,
+            seen: false,
+        });
+        let manager = SessionRow {
+            id: 1,
+            sid: "s-manager".to_string(),
+            title: "lab-sweep".to_string(),
+            ..SessionRow::default()
+        };
+        let mut read = worker(
+            2,
+            "fleet summary",
+            crate::task_record::FROM_CTL,
+            TaskState::Done,
+            1434,
+        );
+        read.end = end;
+        let mut bare = worker(3, "bare", crate::task_record::FROM_CTL, TaskState::Done, 0);
+        bare.end = end;
+        let mut managed = worker(4, "managed", "s-manager", TaskState::Working, 0);
+        managed.end = end;
+        let g = local_glance(&[manager, read, bare, managed.clone()], &[], 2_000, None);
+        let rows: Vec<(&str, bool)> = g
+            .done
+            .iter()
+            .map(|d| (d.label.as_str(), matches!(d.at, DoneAt::Read(_))))
+            .collect();
+        assert_eq!(rows, [("fleet summary", true), ("bare", false)], "one each");
+        assert_eq!(
+            done_lines(&g, 2_000)[1],
+            "statusmenu \"\u{2713} fleet summary \u{2014} landed 16m \u{b7} 1.4 KB\" enabled=yes checked=no",
+            "the task's own row, worded as its landing"
+        );
+        assert!(
+            g.managers
+                .iter()
+                .any(|m| m.workers.iter().any(|w| w.label == "managed")),
+            "the managed worker's row is under its manager"
+        );
+        // CONTROL: its manager gone, the managed worker's end is listed.
+        let g = local_glance(&[managed], &[], 2_000, None);
+        assert_eq!(g.done.len(), 1);
+        assert!(matches!(g.done[0].at, DoneAt::Go(_)));
+    }
+
+    /// A LANDED WORKER'S ONE ROW SAYS `landed` (§11.4.3, item 2: `done_line`
+    /// says `landed` for a landing): a `ctl` worker under Land whose task row
+    /// stands and whose end is a landing is the task's row — its Read Result
+    /// and its size — worded as its end, while that end stands unseen. The
+    /// same worker with no end (Cruise never ends), or its landing looked at,
+    /// says `done`. NEGATIVE CONTROL (as run, `controls/run.sh`
+    /// `worker-word-dropped`): the task row built `landed: false` says `done`
+    /// for the landing and fails here.
+    #[test]
+    fn a_landed_workers_one_row_says_landed() {
+        let with_end = |end: Option<bool>| {
+            let mut read = worker(
+                2,
+                "fleet summary",
+                crate::task_record::FROM_CTL,
+                TaskState::Done,
+                1434,
+            );
+            read.end = end.map(|seen| EndRow {
+                serial: 1,
+                since_unix_ms: 2_000_000,
+                seen,
+            });
+            local_glance(&[read], &[], 2_000, None)
+        };
+        let g = with_end(Some(false));
+        assert_eq!(g.done.len(), 1, "one row: {:?}", g.done);
+        assert!(matches!(g.done[0].at, DoneAt::Read(_)), "the task's row");
+        assert_eq!(
+            done_lines(&g, 2_000)[1],
+            "statusmenu \"\u{2713} fleet summary \u{2014} landed 16m \u{b7} 1.4 KB\" enabled=yes checked=no",
+        );
+        for end in [None, Some(true)] {
+            let g = with_end(end);
+            assert_eq!(g.done.len(), 1, "the task's row stands: {:?}", g.done);
+            assert!(!g.done[0].landed, "end={end:?}: done");
+        }
+    }
+
+    /// EVERY END IS COUNTED, THE NEWEST SHOWN (§11.4.1, §11.4.4): seven
+    /// unseen ends are `Done for you (7)` and the five newest rows, newest
+    /// first; a sixth is shown once a newer row goes.
+    #[test]
+    fn the_heading_counts_every_end_and_the_newest_are_shown() {
+        let now = 1_000_000;
+        let rows: Vec<SessionRow> = (1..=7)
+            .map(|id| {
+                ended(
+                    id,
+                    &format!("t{id}"),
+                    now - i64::try_from(id).unwrap() * 60,
+                    false,
+                )
+            })
+            .collect();
+        let g = local_glance(&rows, &[], now, None);
+        let lines = done_lines(&g, now);
+        assert_eq!(lines[0], "statusmenu \"Done for you (7)\" enabled=no");
+        let shown: Vec<&str> = lines[1..]
+            .iter()
+            .map(|l| {
+                l.split('\u{2713}')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .split(' ')
+                    .nth(1)
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(shown, ["t1", "t2", "t3", "t4", "t5"]);
+        let mut fewer = rows.clone();
+        fewer[0].end.as_mut().expect("an end").seen = true;
+        let g = local_glance(&fewer, &[], now, None);
+        assert_eq!(
+            done_lines(&g, now).last().map(|l| l.contains("t6")),
+            Some(true)
+        );
+    }
+
+    /// THE TITLE IS `❯•` WHILE AN END'S ROW STANDS AND NOTHING NEEDS YOU
+    /// (§11.4.1; owner surfaces' rule for a Done for you row): no new title
+    /// class, and a need still wins it (`❯1`). NEGATIVE CONTROLS: a build
+    /// that skips ends reads `❯` (as run, this test fails); in-test, the
+    /// end seen reads `❯`.
+    #[test]
+    fn the_title_lights_for_an_end_row_while_nothing_needs_you() {
+        let now = 1_000_000;
+        let end = ended(1, "proj-api refactor", now - 60, false);
+        let g = local_glance(
+            &[end.clone(), agent_row(2, "busy", "busy", 1)],
+            &[],
+            now,
+            None,
+        );
+        assert_eq!(g.button_title(), "\u{276f}\u{2022}");
+        assert_eq!(g.need_count(), 0);
+        let g = local_glance(
+            &[end.clone(), agent_row(2, "rm", "prompt", 1)],
+            &[],
+            now,
+            None,
+        );
+        assert_eq!(g.button_title(), "\u{276f}1", "a need wins the title");
+        let mut seen = end;
+        seen.end.as_mut().expect("an end").seen = true;
+        let g = local_glance(&[seen, agent_row(2, "busy", "busy", 1)], &[], now, None);
+        assert_eq!(g.button_title(), "\u{276f}", "CONTROL: seen");
+    }
+
+    /// NOTHING ON AN END'S ROW GOES STALE (§11.4.3, item 3): its age is
+    /// composed at paint, so the same glance painted later says an older age,
+    /// and a glance built later from the same facts hands nothing over (its
+    /// fingerprint leaves the age out, as it does a worker's).
+    #[test]
+    fn an_end_rows_age_is_composed_at_paint() {
+        let now = 1_000_000;
+        let rows = [ended(1, "proj-api refactor", now - 3 * 60, false)];
+        let g = local_glance(&rows, &[], now, None);
+        assert!(done_lines(&g, now)[1].contains("landed 3m"));
+        assert!(done_lines(&g, now + 2 * 3600)[1].contains("landed 2h"));
+        assert_eq!(
+            local_glance(&rows, &[], now + 600, None).fingerprint(),
+            g.fingerprint()
+        );
+        // No time known: no age, never `20000d`.
+        let mut untimed = rows.clone();
+        untimed[0].end.as_mut().expect("an end").since_unix_ms = 0;
+        let g = local_glance(&untimed, &[], now, None);
+        assert_eq!(
+            done_lines(&g, now)[1],
+            "statusmenu \"\u{2713} proj-api refactor \u{2014} landed\" enabled=yes checked=no"
+        );
     }
 
     /// WAITING IS ONE ROW PER CAUSE, NEVER ONE PER TAB: eight tabs at one

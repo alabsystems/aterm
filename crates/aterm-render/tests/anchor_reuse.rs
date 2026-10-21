@@ -247,7 +247,16 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
     ));
 
     let mut dirty = Vec::new();
-    let decision = compute_dirty_rows(&prev, &next, true, None, true, None, 16, &mut dirty);
+    let decision = compute_dirty_rows(
+        &prev,
+        &next,
+        true,
+        None,
+        true,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    );
     match decision {
         DirtyDecision::FullRepaint => panic!("anchor-equal frames must not full-repaint"),
         DirtyDecision::Rows(_) => {
@@ -261,7 +270,16 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
     // Negative control: an anchor-UNEQUAL offset shift stays a full repaint.
     let mut skewed = prev.clone();
     skewed.display_offset += 1; // base_y unchanged → anchor moved
-    let decision = compute_dirty_rows(&prev, &skewed, true, None, true, None, 16, &mut dirty);
+    let decision = compute_dirty_rows(
+        &prev,
+        &skewed,
+        true,
+        None,
+        true,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    );
     assert!(
         matches!(decision, DirtyDecision::FullRepaint),
         "a real viewport move still takes the full path"

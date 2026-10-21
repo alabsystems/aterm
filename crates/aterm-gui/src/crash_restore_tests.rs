@@ -22,6 +22,7 @@ struct Rig {
     journal: Arc<SessionJournal>,
     custody: OwnedFd,
     len: u64,
+    first_receipt: Option<Arc<aterm_keeper::client::CompanionReceipt>>,
     /// The config the session's engine was built with, and the restorer runs.
     cfg: Option<aterm_core::config::TerminalConfig>,
 }
@@ -31,8 +32,26 @@ impl Rig {
         Self::with_config(rows, cols, None)
     }
 
+    /// [`Self::new`] on a held ring clock ([`SessionJournal::hold_ring_clock`]): for a
+    /// test that reads the ring's due stamps against its clock and runs the ticks itself,
+    /// so a step a loaded machine spends a tick on cannot make a stamp due early.
+    fn held(rows: u16, cols: u16) -> Self {
+        let rig = Self::new(rows, cols);
+        rig.journal.hold_ring_clock();
+        rig
+    }
+
     /// A session built, journaled and restored under `cfg` (a theme of its own).
     fn with_config(rows: u16, cols: u16, cfg: Option<aterm_core::config::TerminalConfig>) -> Self {
+        Self::with_recovery_count(rows, cols, cfg, None)
+    }
+
+    fn with_recovery_count(
+        rows: u16,
+        cols: u16,
+        cfg: Option<aterm_core::config::TerminalConfig>,
+        accepted: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let term = Arc::new(Mutex::new(crate::spawn::new_live_terminal(
             rows,
             cols,
@@ -48,13 +67,19 @@ impl Rig {
             Arc::new(crate::manual_reset::ResetLane::default()),
         )
         .expect("a journal");
-        let (custody, len) = journal.take_custody().expect("custody, once");
+        journal.bind_recovery_count(accepted);
+        let JournalCustody {
+            region: custody,
+            len,
+            receipt: first_receipt,
+        } = journal.take_custody_with_receipt().expect("custody, once");
         assert!(journal.take_custody().is_none(), "the custody goes once");
         Self {
             term,
             journal,
             custody,
             len,
+            first_receipt,
             cfg,
         }
     }
@@ -130,6 +155,16 @@ fn offered_restore(
     cfg: Option<&aterm_core::config::TerminalConfig>,
     used: &mut u64,
 ) -> Result<Restore, RestoreReport> {
+    offered_restoration(companion, attempts, cfg, used).screen
+}
+
+/// [`offered_restore`] with the control slot's carry beside the screen.
+fn offered_restoration(
+    companion: Option<OfferedCompanion>,
+    attempts: u8,
+    cfg: Option<&aterm_core::config::TerminalConfig>,
+    used: &mut u64,
+) -> Restoration {
     // SAFETY: the region's one writer is this thread's journal, which writes nothing during
     // the call; the mapping is dropped before it returns.
     unsafe { restore_offered(companion, attempts, cfg, used) }
@@ -137,7 +172,11 @@ fn offered_restore(
 
 /// What a person sees of an engine: its visible-only journal projection.
 fn visible(t: &Terminal) -> TerminalCheckpoint {
-    t.checkpoint_journal(0).expect("ground")
+    // A restore whose replay ran a tail carries its lineage's seed uncertainty
+    // (`HolderRepr::seed_untrusted`), which a live engine never has: not what it shows.
+    t.checkpoint_journal(0)
+        .expect("ground")
+        .without_seed_lineage()
 }
 
 /// The engine a restored checkpoint lands in, built as the spawn builds an adopted one.
@@ -432,13 +471,23 @@ fn secret(i: usize) -> String {
     )
 }
 
-/// Whether `token` appears anywhere in the region's bytes.
-fn region_holds(journal: &SessionJournal, token: &str) -> bool {
+/// Every [`secret`]-shaped run of bytes anywhere in the region (`secret-` and the 16
+/// bytes after it, whatever they are): a token is in the region's bytes exactly when it
+/// is in this set. One copy of the region and one pass over it — searching the 8 MiB
+/// copy afresh for each of 32 tokens was 2.3 CPU-s at opt-level 0.
+fn region_secrets(journal: &SessionJournal) -> std::collections::BTreeSet<Vec<u8>> {
     use aterm_restore::RegionView as _;
     let region = journal.snapshot();
     let mut bytes = vec![0u8; region.len()];
     region.read(0, &mut bytes).expect("the copy reads");
-    bytes.windows(token.len()).any(|w| w == token.as_bytes())
+    let len = secret(0).len();
+    let mut found = std::collections::BTreeSet::new();
+    for start in 0..bytes.len().saturating_sub(len - 1) {
+        if bytes[start] == b's' && bytes[start..start + len].starts_with(b"secret-") {
+            found.insert(bytes[start..start + len].to_vec());
+        }
+    }
+    found
 }
 
 /// An ED3 forces a keyframe at the hold's end, after which the clear is settled out of
@@ -460,8 +509,9 @@ fn a_clear_forces_a_keyframe_and_restores_exactly_after_it() {
         rig.slice(format!("{}\r\n", secret(i)).as_bytes());
     }
     let scrolled_off: Vec<String> = (20..25).map(secret).collect();
+    let held = region_secrets(&rig.journal);
     assert!(
-        scrolled_off.iter().all(|s| region_holds(&rig.journal, s)),
+        scrolled_off.iter().all(|s| held.contains(s.as_bytes())),
         "premise: the raw tail holds what scrolled off"
     );
     assert!(
@@ -482,9 +532,10 @@ fn a_clear_forces_a_keyframe_and_restores_exactly_after_it() {
     // Only what the scrollback held at the clear (secrets 0 to 26): the visible rows
     // still show the newest, and one of them scrolls into the new history after it.
     let cleared: Vec<String> = (0..27).map(secret).collect();
+    let held = region_secrets(&rig.journal);
     for token in &cleared {
         assert!(
-            !region_holds(&rig.journal, token),
+            !held.contains(token.as_bytes()),
             "{token}, cleared from the scrollback, survives in the region"
         );
     }
@@ -1028,7 +1079,8 @@ fn the_status_words_say_the_journal_and_the_restore() {
     assert_eq!(
         live.status_words(),
         format!(
-            "journal=live journal_tail=0 journal_ring_lag=0 journal_ring=live journal_bytes={bytes}"
+            "journal=live journal_tail=0 journal_ring_lag=0 journal_ring=live journal_bytes={bytes} \
+             journal_ledger_lag=0"
         )
     );
     live.note_restored(RestoreReport {
@@ -1045,8 +1097,8 @@ fn the_status_words_say_the_journal_and_the_restore() {
         live.status_words(),
         format!(
             "journal=live journal_tail=0 journal_ring_lag=0 journal_ring=live \
-             journal_bytes={bytes} restore=screen restore_why=in-flight in_flight_lost=12 \
-             tail_overflow=0 marks_lost=0 resizes_unjournaled=0"
+             journal_bytes={bytes} journal_ledger_lag=0 restore=screen restore_why=in-flight \
+             in_flight_lost=12 tail_overflow=0 marks_lost=0 resizes_unjournaled=0"
         )
     );
     live.get().expect("installed").request_shed();
@@ -1133,6 +1185,7 @@ fn the_recovery_tally_carries_the_losses_to_the_ledger() {
                 ("no-region".to_string(), 1),
                 ("tail-overflow".to_string(), 1),
             ],
+            refused: 0,
         }
     );
 }
@@ -2464,21 +2517,71 @@ fn an_untouched_ring_is_shed_in_place() {
 }
 
 /// A shed replacement the parser defers (K5: it holds a sequence no keyframe carries whole)
-/// changes nothing and is tried again after K1's quiet; once the sequence ends it lands.
+/// changes nothing, and waits for the program's next bytes as the parse loop does: never
+/// due until the parse thread records them (an idle session parked mid-sequence costs the
+/// worker nothing, where it used to cost a fresh region and a term-lock hold five times a
+/// second), then tried no sooner than K1's quiet after its last try, with the region the
+/// first try created (no second `shm_open`). Once the sequence ends it lands. Meanwhile the
+/// session says `journal_ring=shedding`, the ring's pages still this window's.
 #[test]
-fn a_replacement_the_parser_defers_is_tried_again() {
+fn a_replacement_the_parser_defers_waits_for_the_programs_next_bytes() {
     let rig = deep_rig();
+    let slot = JournalSlot::default();
+    slot.install(Arc::clone(&rig.journal));
+    let ring_word = || {
+        slot.status_words()
+            .split(' ')
+            .find_map(|word| word.strip_prefix("journal_ring="))
+            .expect("journal_ring=")
+            .to_string()
+    };
+    let now = || rig.journal.ring_now_ms();
     // An unterminated XTGETTCAP query: the parser holds it, and no keyframe can.
     rig.slice(b"\x1bP+q544e");
     rig.journal.request_shed();
+    assert_eq!(ring_word(), "shedding", "owed, not yet replaced");
     rig.journal.export_tick(&rig.term);
     assert_eq!(rig.journal.regions_replaced(), 0, "deferred");
+    assert!(rig.journal.spare_kept(), "the region it created, kept");
+    assert_eq!(rig.journal.ring_due(now()), None, "parked: never due");
+    rig.journal.pass_ms(100 * aterm_restore::policy::QUIET_MS);
+    assert_eq!(
+        rig.journal.ring_due(now()),
+        None,
+        "however long the program stays silent"
+    );
+    assert_eq!(ring_word(), "shedding");
+
+    // More of the query, still unterminated: due again, deferred again, parked again,
+    // on the region the first try made.
+    rig.slice(b"54");
+    assert!(
+        rig.journal.ring_due(now()).is_some_and(|due| due <= now()),
+        "the program wrote: due"
+    );
+    // The last try reads the journal's clock (real time plus the skew `pass_ms` adds)
+    // between these two readings: no sooner than `last_try`, no later than `tried_by`.
+    let last_try = now();
+    rig.journal.export_tick(&rig.term);
+    let tried_by = now();
+    assert_eq!(rig.journal.regions_replaced(), 0, "deferred again");
+    assert!(rig.journal.spare_kept());
+    assert_eq!(rig.journal.ring_due(now()), None, "parked again");
+
+    rig.slice(b"\x1b\\done\r\n");
     let due = rig
         .journal
-        .ring_due(rig.journal.ring_now_ms())
-        .expect("tried again");
-    assert!(due > rig.journal.ring_now_ms(), "after K1's quiet, not now");
-    rig.slice(b"\x1b\\done\r\n");
+        .ring_due(now())
+        .expect("due once the query ended");
+    // Against the last try, not the clock now: a loaded host can spend K1's
+    // 200 ms between the try and this read. The quiet is counted from that try's own
+    // clock reading, so the due time lies within the try's readings plus the quiet.
+    let quiet = aterm_restore::policy::QUIET_MS;
+    assert!(
+        (last_try + quiet..=tried_by + quiet).contains(&due),
+        "no sooner than K1's quiet after the last try: due {due}, tried in \
+         {last_try}..={tried_by}"
+    );
     rig.journal.pass_ms(aterm_restore::policy::QUIET_MS);
     rig.journal.export_tick(&rig.term);
     assert_eq!(
@@ -2486,11 +2589,77 @@ fn a_replacement_the_parser_defers_is_tried_again() {
         1,
         "landed once the query ended"
     );
-    assert_eq!(
-        rig.journal.ring_due(rig.journal.ring_now_ms()),
-        None,
-        "nothing owed"
+    assert!(
+        !rig.journal.spare_kept(),
+        "the kept region is the session's now"
     );
+    assert_eq!(rig.journal.ring_due(now()), None, "nothing owed");
+    assert_eq!(ring_word(), "shed");
+}
+
+/// The bytes of the region `custody` names, as the keeper holds it: read while nothing
+/// writes it (every region here is written only by this test's thread, and only between
+/// reads, the contract [`offered_restore`] states too).
+fn custody_bytes(custody: &OwnedFd, len: u64) -> Vec<u8> {
+    use std::os::fd::AsFd as _;
+    let len = usize::try_from(len).expect("a region's length");
+    // SAFETY: the region's one writer is this thread's journal, which writes nothing while
+    // the mapping lives; the mapping is dropped before this returns.
+    let region = unsafe { aterm_uds::shm::Region::map_readonly(custody.as_fd(), len) }
+        .expect("the custody maps");
+    let mut bytes = vec![0u8; region.len()];
+    region.read_into(0, &mut bytes).expect("the region reads");
+    bytes
+}
+
+/// A CLEAR WHILE THE REPLACEMENT IS OWED STILL ZEROES THE RING AT ONCE (plan §5 claim 4).
+/// A shed ring's region can wait to be replaced for as long as the program sits
+/// mid-sequence (K5) or no region can be created, and the keeper holds that region until
+/// the replacement's COMPANION lands: the scrollback the person clears meanwhile must not
+/// stay in it. Here the replacement is deferred, then the program ends its sequence and
+/// clears (ED3): the tick the clear wakes zeroes the ring in the region the keeper holds
+/// before anything else, whether or not the replacement (due K1's quiet after the deferred
+/// try) lands in that same tick, and no line the person cleared is left in that region.
+/// NEGATIVE CONTROL: before the ED3 the keeper's region held every token; a shed tick that
+/// only replaces (the code before this change) supersedes that region with its ring as it
+/// was, or leaves it untouched while the replacement waits.
+#[test]
+fn a_clear_while_the_replacement_is_owed_zeroes_the_ring_at_once() {
+    let rig = Rig::new(4, 30);
+    let found = exported_tokens(&rig, 3_000);
+    rig.slice(b"\x1bP+q544e");
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(rig.journal.regions_replaced(), 0, "premise: deferred");
+    assert!(rig.journal.ring_shedding(), "premise: owed");
+    let held = custody_bytes(&rig.custody, rig.len);
+    let windows = windows_of(&held);
+    assert!(
+        found.iter().all(|token| windows.contains(needle(token))),
+        "control: the keeper's region still holds the history"
+    );
+
+    rig.slice(b"\x1b\\\x1b[3Jcleared\r\n");
+    let now = rig.journal.ring_now_ms();
+    assert_eq!(
+        rig.journal.ring_due(now),
+        Some(now),
+        "the clear wakes the worker"
+    );
+    rig.journal.export_tick(&rig.term);
+    let held = custody_bytes(&rig.custody, rig.len);
+    let windows = windows_of(&held);
+    for token in &found {
+        assert!(
+            !windows.contains(needle(token)),
+            "{token}, cleared while the shed's replacement was owed, survives in the region \
+             the keeper holds"
+        );
+    }
+    rig.journal.pass_ms(aterm_restore::policy::QUIET_MS);
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(rig.journal.regions_replaced(), 1, "the replacement lands");
+    assert!(!rig.journal.ring_shedding());
 }
 
 /// THE SHED POLICY: under WARN the largest rings go, largest first, until those left hold
@@ -2881,5 +3050,1267 @@ fn a_privacy_cleared_history_ring_still_releases_its_pages_when_shed() {
     assert!(
         replaced && released && fresh_history,
         "SHED_KEPT_PRIVACY_CLEARED_HISTORY_PAGES: replaced={replaced} released={released} fresh_history={fresh_history}"
+    );
+}
+
+/// A REPLACED REGION'S CUSTODY OUTLASTS A FULL LINK QUEUE (R6). The shed hands the keeper
+/// the fresh region's only read-only descriptor; when the keeper link's queue is full (a
+/// keeper slow to read, under the very pressure being shed) the descriptor comes back
+/// (`keeper_link::CompanionOffer::Busy`) and the session keeps it, offering it again a
+/// tick later, rather than leave the keeper on the superseded region for good. Once the
+/// keeper has read, the next offer reaches it, and what it holds is the fresh region: a
+/// crash then restores the session's own screen exactly, not the shed's stale one.
+/// NEGATIVE CONTROL: the superseded region the keeper held until then restores only as a
+/// pulsed screen (`restore_why=superseded`); with the old `let _ = link.enqueue(op)` in
+/// `keeper_link::replace_companion`, the custody is not kept and no COMPANION for the fresh
+/// region ever reaches the keeper (checked by hand against this test).
+#[test]
+fn a_full_link_queue_keeps_the_fresh_regions_custody_and_offers_it_again() {
+    use aterm_keeper::client::LinkOp;
+    const RDEV: u64 = 0x5eed;
+    let rig = deep_rig();
+    // Held from here: "offered again a tick later" is read against the clock, which a
+    // loaded machine could move a tick past the offer before the read.
+    rig.journal.hold_ring_clock();
+    let link = Arc::new(crate::keeper_link::TestLink::stalled(rig.journal.id, RDEV));
+    rig.journal.link_custody_to(Arc::clone(&link));
+    let fresh_companions = |ops: Vec<LinkOp>| -> Vec<(OwnedFd, u64)> {
+        ops.into_iter()
+            .filter_map(|op| match op {
+                LinkOp::Companion {
+                    rdev, region, len, ..
+                } if rdev == RDEV => Some((region, len)),
+                _ => None,
+            })
+            .collect()
+    };
+    link.fill();
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(rig.journal.regions_replaced(), 1, "the region was replaced");
+    assert!(
+        rig.journal.custody_owed(),
+        "the custody a full queue refused is kept, not dropped"
+    );
+    let now = rig.journal.ring_now_ms();
+    assert!(
+        rig.journal
+            .ring_due(now)
+            .is_some_and(|due| due > now && due <= now + TICK_MS),
+        "offered again a tick later"
+    );
+    assert!(
+        fresh_companions(link.drain()).is_empty(),
+        "the keeper read only what filled the queue"
+    );
+
+    rig.journal.pass_ms(TICK_MS);
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        rig.journal.custody_owed(),
+        "queue admission still owes a read"
+    );
+    assert!(
+        rig.journal.ring_due(rig.journal.ring_now_ms()).is_some(),
+        "queue admission still owes a keeper read"
+    );
+    let mut handed = fresh_companions(link.drain());
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        !rig.journal.custody_owed(),
+        "the captured read settled custody"
+    );
+    assert_eq!(
+        rig.journal.ring_due(rig.journal.ring_now_ms()),
+        None,
+        "the captured keeper read settled the predecessor"
+    );
+    assert_eq!(handed.len(), 1, "one COMPANION, the fresh region's");
+    let (region, len) = handed.pop().expect("one");
+    let restore = restore_custody(&region, len, rig.cfg.as_ref()).expect("a screen");
+    assert_eq!(restore.report.rung, Rung::Exact, "{:?}", restore.report);
+    let (adopted, _) = adopt_and_import(restore.checkpoint, restore.history, None);
+    assert_eq!(
+        visible(&crate::term_lock(&adopted)),
+        rig.visible(),
+        "the session's own screen"
+    );
+    let stale = rig.restore(0).expect("the superseded region's screen");
+    assert_eq!(
+        (stale.report.rung, stale.report.why),
+        (Rung::Screen, "superseded"),
+        "control: the region the keeper held meanwhile"
+    );
+}
+
+/// A CLEAR WHILE A REPLACED REGION'S CUSTODY IS OWED ERASES THE REGION THE KEEPER STILL
+/// HOLDS (R6 review; plan §5 claim 4). With the keeper link's queue full, the shed's
+/// replacement lands but its COMPANION cannot be queued, so the keeper keeps the old region
+/// (its whole history ring, its keyframes and their bridges) until the queue takes the
+/// fresh one's custody: as long as the keeper stays slow, the very case the custody retry
+/// is for. The session keeps the old region mapped meanwhile (`journal_ring=shedding`: it
+/// is still in memory), and a clear made then (ED3) erases it at once, so a crash before
+/// the keeper reads restores none of the cleared lines: the erased region reads as no
+/// region (the META rung). Once the queue takes the custody, the old region is let go
+/// (`journal_ring=shed`) and the keeper is told the fresh one.
+/// NEGATIVE CONTROL: before the clear the old region holds every token and restores the
+/// shed's screen (`restore_why=superseded`) with them; a session that let the old region
+/// go at the replacement (the code before this change) leaves every cleared token in it.
+#[test]
+fn a_clear_while_the_custody_is_owed_erases_the_region_the_keeper_holds() {
+    use aterm_keeper::client::LinkOp;
+    const RDEV: u64 = 0x5eed;
+    // Held: the owed custody is due again a tick after the replacement, so a loaded
+    // machine that spends a tick before the clear would make the worker due for that, and
+    // the clear's own wake would go unseen.
+    let rig = Rig::held(4, 30);
+    let found = exported_tokens(&rig, 3_000);
+    let slot = JournalSlot::default();
+    slot.install(Arc::clone(&rig.journal));
+    let ring_word = || {
+        slot.status_words()
+            .split(' ')
+            .find_map(|word| word.strip_prefix("journal_ring="))
+            .expect("journal_ring=")
+            .to_string()
+    };
+    let survivors = || {
+        let held = custody_bytes(&rig.custody, rig.len);
+        let windows = windows_of(&held);
+        found
+            .iter()
+            .filter(|token| windows.contains(needle(token)))
+            .count()
+    };
+    let link = Arc::new(crate::keeper_link::TestLink::stalled(rig.journal.id, RDEV));
+    rig.journal.link_custody_to(Arc::clone(&link));
+    link.fill();
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    // Before the owed custody's own retry (a tick on): the clear must be due by then, at
+    // once, however long a loaded machine takes from here to the clear.
+    let owed_at = rig.journal.ring_now_ms();
+    assert_eq!(rig.journal.regions_replaced(), 1, "premise: replaced");
+    assert!(rig.journal.custody_owed(), "premise: the custody is owed");
+    assert_eq!(
+        ring_word(),
+        "shedding",
+        "the old region is still in memory, held for the keeper"
+    );
+    assert_eq!(
+        survivors(),
+        found.len(),
+        "control: the keeper's region holds the history"
+    );
+    let stale = rig
+        .restore(0)
+        .expect("control: the superseded region's screen");
+    assert_eq!(
+        (stale.report.rung, stale.report.why),
+        (Rung::Screen, "superseded")
+    );
+
+    let owed = rig.journal.ring_due(owed_at);
+    assert!(
+        owed.is_some_and(|due| due > owed_at),
+        "control: before the clear the worker is due only for the custody's retry, later: \
+         due {owed:?}, now {owed_at}"
+    );
+    rig.slice(b"\x1b[3Jcleared\r\n");
+    assert_eq!(
+        rig.journal.ring_due(owed_at),
+        Some(owed_at),
+        "the clear wakes the worker"
+    );
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(
+        survivors(),
+        0,
+        "lines cleared while the custody was owed survive in the region the keeper holds"
+    );
+    let erased = match rig.restore(0) {
+        Ok(restore) => panic!("the erased region restores no screen: {:?}", restore.report),
+        Err(report) => report,
+    };
+    assert_eq!(erased.rung, Rung::Meta, "{erased:?}");
+    assert!(rig.journal.custody_owed(), "the queue is still full");
+    assert_eq!(ring_word(), "shedding");
+
+    // The keeper reads; the next offer lands, and the old region is let go.
+    let read: Vec<LinkOp> = link.drain();
+    assert!(
+        !read
+            .iter()
+            .any(|op| matches!(op, LinkOp::Companion { rdev: RDEV, .. })),
+        "nothing for the session reached the keeper meanwhile"
+    );
+    rig.journal.pass_ms(TICK_MS);
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        rig.journal.custody_owed(),
+        "queue admission still owes a read"
+    );
+    assert_eq!(
+        ring_word(),
+        "shedding",
+        "the queue has not confirmed a read"
+    );
+    let read = link.drain();
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        !rig.journal.custody_owed(),
+        "the captured read settled custody"
+    );
+    assert_eq!(
+        ring_word(),
+        "shed",
+        "the captured keeper read released the predecessor"
+    );
+    assert_eq!(
+        read.iter()
+            .filter(|op| matches!(op, LinkOp::Companion { rdev: RDEV, .. }))
+            .count(),
+        1,
+        "the keeper is told the fresh region"
+    );
+}
+
+/// A SECOND SHED WHILE A CUSTODY IS STILL OWED KEEPS THE REGION THE KEEPER HOLDS (R6
+/// review). The pressure eases, the ring exports into the fresh region, and pressure comes
+/// back before the keeper link's queue has taken that region's custody: the second
+/// replacement's custody is owed too, and the keeper still holds the FIRST region, never
+/// told of the one between. So that first region is the one kept for a clear to erase;
+/// the one between goes with its custody. Once the queue takes the custody, the keeper is
+/// told the newest region, which restores the session's own screen exactly.
+/// NEGATIVE CONTROL: before the clear the first region holds every token; keeping the
+/// region between instead (the region this replacement superseded) would leave every
+/// cleared token in the one the keeper holds.
+#[test]
+fn a_second_shed_while_the_custody_is_owed_keeps_the_region_the_keeper_holds() {
+    use aterm_keeper::client::LinkOp;
+    const RDEV: u64 = 0x5eed;
+    let rig = Rig::new(4, 30);
+    let found = exported_tokens(&rig, 3_000);
+    let survivors = || {
+        let held = custody_bytes(&rig.custody, rig.len);
+        let windows = windows_of(&held);
+        found
+            .iter()
+            .filter(|token| windows.contains(needle(token)))
+            .count()
+    };
+    let link = Arc::new(crate::keeper_link::TestLink::stalled(rig.journal.id, RDEV));
+    rig.journal.link_custody_to(Arc::clone(&link));
+    link.fill();
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        rig.journal.custody_owed(),
+        "premise: the first custody is owed"
+    );
+    rig.journal.request_unshed();
+    rig.export();
+    assert!(
+        rig.journal.ring_bytes() > 0,
+        "premise: the ring wrote the fresh region"
+    );
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(rig.journal.regions_replaced(), 2, "premise: replaced again");
+    assert!(rig.journal.custody_owed(), "premise: owed again");
+    assert_eq!(
+        survivors(),
+        found.len(),
+        "control: the keeper's region holds the history"
+    );
+
+    rig.slice(b"\x1b[3Jcleared\r\n");
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(
+        survivors(),
+        0,
+        "the clear erased the region the keeper holds, not the one between"
+    );
+
+    let _ = link.drain();
+    rig.journal.pass_ms(TICK_MS);
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        rig.journal.custody_owed(),
+        "queue admission still owes a read"
+    );
+    let mut handed: Vec<(OwnedFd, u64)> = link
+        .drain()
+        .into_iter()
+        .filter_map(|op| match op {
+            LinkOp::Companion {
+                rdev, region, len, ..
+            } if rdev == RDEV => Some((region, len)),
+            _ => None,
+        })
+        .collect();
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        !rig.journal.custody_owed(),
+        "the captured read settled custody"
+    );
+    assert_eq!(handed.len(), 1, "one COMPANION, the newest region's");
+    let (region, len) = handed.pop().expect("one");
+    let restore = restore_custody(&region, len, rig.cfg.as_ref()).expect("a screen");
+    assert_eq!(restore.report.rung, Rung::Exact, "{:?}", restore.report);
+}
+
+/// How many of `tokens` a byte search still finds in the region `custody` names.
+fn tokens_in(custody: &OwnedFd, len: u64, tokens: &[String]) -> usize {
+    let held = custody_bytes(custody, len);
+    let windows = windows_of(&held);
+    tokens
+        .iter()
+        .filter(|token| windows.contains(needle(token)))
+        .count()
+}
+
+/// A CLEAR MADE AFTER THE COMPANION IS QUEUED BUT BEFORE THE KEEPER READS IT ERASES THE
+/// REGION THE KEEPER STILL HOLDS (R9 (b)). The queue takes the shed's COMPANION at once
+/// (`CompanionOffer::Handed`), but taking it is not the keeper reading it: until it does,
+/// the keeper holds the old region, whose ring and keyframes hold the history. The link
+/// reports the read (`aterm_keeper::client::CompanionReceipt`, confirmed by the SYNC the
+/// worker writes behind the COMPANION), the session keeps the old region until then
+/// (`journal_ring=shedding`), and a clear made meanwhile (ED3) erases it: a crash before
+/// the read restores none of the cleared lines (the META rung). Once the keeper has read,
+/// the old region is let go (`journal_ring=shed`), and what the keeper holds is the fresh
+/// region, which restores exactly.
+/// NEGATIVE CONTROL: the same clear made after the old region was let go leaves every
+/// token in it. A link that let it go at the hand-off (the queue's admission, as R6's did)
+/// left exactly that in the region a keeper that had not read yet still held.
+#[test]
+fn a_clear_after_the_companion_is_queued_but_unread_erases_the_region_the_keeper_holds() {
+    use aterm_keeper::client::LinkOp;
+    const RDEV: u64 = 0x5eed;
+    let fresh_companion = |ops: Vec<LinkOp>| -> Option<(OwnedFd, u64)> {
+        ops.into_iter().find_map(|op| match op {
+            LinkOp::Companion {
+                rdev: RDEV,
+                region,
+                len,
+                ..
+            } => Some((region, len)),
+            _ => None,
+        })
+    };
+    // The keeper reads before (`read_first`) or after the clear.
+    let run = |read_first: bool| -> (usize, usize, Rung) {
+        let rig = Rig::new(4, 30);
+        let found = exported_tokens(&rig, 3_000);
+        let slot = JournalSlot::default();
+        slot.install(Arc::clone(&rig.journal));
+        let ring_word = || {
+            slot.status_words()
+                .split(' ')
+                .find_map(|word| word.strip_prefix("journal_ring="))
+                .expect("journal_ring=")
+                .to_string()
+        };
+        let link = Arc::new(crate::keeper_link::TestLink::stalled(rig.journal.id, RDEV));
+        rig.journal.link_custody_to(Arc::clone(&link));
+        rig.journal.request_shed();
+        rig.journal.export_tick(&rig.term);
+        assert_eq!(rig.journal.regions_replaced(), 1, "premise: replaced");
+        assert!(
+            rig.journal.custody_owed(),
+            "a queued COMPANION is not a read one"
+        );
+        assert_eq!(
+            ring_word(),
+            "shedding",
+            "the old region is kept for the keeper"
+        );
+        assert_eq!(
+            tokens_in(&rig.custody, rig.len, &found),
+            found.len(),
+            "control: the keeper's region holds the history"
+        );
+        let mut read = None;
+        if read_first {
+            read = fresh_companion(link.drain());
+            rig.journal.export_tick(&rig.term);
+            assert!(
+                !rig.journal.custody_owed(),
+                "the read let the old region go"
+            );
+            assert_eq!(ring_word(), "shed");
+        }
+        rig.slice(b"\x1b[3Jcleared\r\n");
+        rig.journal.export_tick(&rig.term);
+        let left = tokens_in(&rig.custody, rig.len, &found);
+        let rung = match rig.restore(0) {
+            Ok(restore) => restore.report.rung,
+            Err(report) => report.rung,
+        };
+        if read.is_none() {
+            assert_eq!(ring_word(), "shedding", "the keeper has still not read");
+            read = fresh_companion(link.drain());
+            rig.journal.export_tick(&rig.term);
+            assert!(
+                !rig.journal.custody_owed(),
+                "the read let the old region go"
+            );
+            assert_eq!(ring_word(), "shed");
+        }
+        let (region, len) = read.expect("the keeper read the fresh region's COMPANION");
+        let restore = restore_custody(&region, len, rig.cfg.as_ref()).expect("a screen");
+        assert_eq!(restore.report.rung, Rung::Exact, "{:?}", restore.report);
+        assert_eq!(
+            tokens_in(&region, len, &found),
+            0,
+            "the fresh region never held the shed history"
+        );
+        (left, found.len(), rung)
+    };
+
+    let (left, _, rung) = run(false);
+    assert_eq!(
+        left, 0,
+        "lines cleared before the keeper read the COMPANION survive in the region it holds"
+    );
+    assert_eq!(rung, Rung::Meta, "the erased region restores no screen");
+
+    let (left, all, rung) = run(true);
+    assert_eq!(
+        left, all,
+        "control: a region let go before the clear keeps every cleared line"
+    );
+    assert_eq!(rung, Rung::Screen, "control: the superseded screen");
+}
+
+/// A CLEAR WHOSE KEYFRAME A REPLACEMENT SKIPPED LEAVES NOTHING IN THE REGION THE KEEPER
+/// HOLDS (R9 (c)). The parse thread records an ED3 into the region and captures the
+/// keyframe the clear forces under the term lock, and writes it, and settles the clear
+/// (`aterm_restore::JournalWriter::settle_clear`), after the lock. A shed replacing the
+/// region in between keyframes the engine into the fresh region itself, so that capture
+/// is skipped (`Writer::region_gen` moved), and the old region's settle with it: the
+/// region the keeper still holds until it reads the replacement's COMPANION keeps the
+/// pre-clear keyframes (the quiet one's bridge of history, the older slot's) and the
+/// tail's pre-clear records, every line the person cleared. The replacement erases it,
+/// as a clear made after it does (`aterm_restore::erase_region`): a crash before the read
+/// restores none of them (the META rung), and the fresh region holds none either.
+/// NEGATIVE CONTROL (in the tree): the region holds every cleared line before the clear,
+/// and still holds every one once the clear is recorded and its keyframe captured, before
+/// the replacement: only the clear's settle, whose write the replacement makes skip, or the
+/// replacement's erase takes them out. The code without the erase failed this test at
+/// `left.is_empty()`; that run was made once, before the fix, and is not kept.
+#[test]
+fn a_clear_whose_keyframe_a_replacement_skipped_leaves_nothing_in_the_region_the_keeper_holds() {
+    use aterm_keeper::client::LinkOp;
+    const RDEV: u64 = 0x5eed;
+    let rig = Rig::new(4, 30);
+    let mut cleared = exported_tokens(&rig, 3_000);
+    // Lines past the quiet keyframe, in the tail as BYTES records; the newest few stay on
+    // the screen, which an ED3 does not clear.
+    let tail: Vec<String> = (10_000..10_040).map(entropic).collect();
+    let mut bytes = String::new();
+    for token in &tail {
+        bytes.push_str(token);
+        bytes.push_str("\r\n");
+    }
+    rig.slice(bytes.as_bytes());
+    cleared.extend(tail[..tail.len() - 8].iter().cloned());
+    assert_eq!(
+        tokens_in(&rig.custody, rig.len, &cleared),
+        cleared.len(),
+        "control: the region holds every line before the clear"
+    );
+    let link = Arc::new(crate::keeper_link::TestLink::stalled(rig.journal.id, RDEV));
+    rig.journal.link_custody_to(Arc::clone(&link));
+    rig.journal.request_shed();
+
+    // The parse thread's hold: the clear recorded and its keyframe captured, not written.
+    let clear = b"\x1b[3Jcleared\r\n";
+    rig.journal.gathered(clear.len());
+    let captured = {
+        let mut t = crate::term_lock(&rig.term);
+        let mut pre = rig.journal.pre(&t);
+        t.process(clear);
+        let _ = t.take_response();
+        rig.journal.record(&t, &mut pre, clear, false);
+        rig.journal.decide(&t, &pre)
+    }
+    .expect("premise: the clear forces a keyframe");
+    assert_eq!(
+        tokens_in(&rig.custody, rig.len, &cleared),
+        cleared.len(),
+        "control: recorded and captured, the clear has taken no line out of the region yet"
+    );
+    // The worker's tick between the capture and the write: the shed replaces the region.
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(rig.journal.regions_replaced(), 1, "premise: replaced");
+    assert!(
+        rig.journal.custody_owed(),
+        "premise: the keeper has not read"
+    );
+    rig.journal.write(captured);
+    assert!(rig.journal.broken().is_none(), "the journal kept recording");
+
+    let left: Vec<&String> = {
+        let held = custody_bytes(&rig.custody, rig.len);
+        let windows = windows_of(&held);
+        cleared
+            .iter()
+            .filter(|token| windows.contains(needle(token)))
+            .collect()
+    };
+    assert!(
+        left.is_empty(),
+        "{} of {} cleared lines survive in the region the keeper holds: {:?}",
+        left.len(),
+        cleared.len(),
+        &left[..left.len().min(4)]
+    );
+    match rig.restore(0) {
+        Ok(restore) => panic!("the erased region restores no screen: {:?}", restore.report),
+        Err(report) => assert_eq!(report.rung, Rung::Meta, "{report:?}"),
+    }
+    let (region, len) = link
+        .drain()
+        .into_iter()
+        .find_map(|op| match op {
+            LinkOp::Companion {
+                rdev: RDEV,
+                region,
+                len,
+                ..
+            } => Some((region, len)),
+            _ => None,
+        })
+        .expect("the fresh region's COMPANION");
+    assert_eq!(
+        tokens_in(&region, len, &cleared),
+        0,
+        "the fresh region holds no cleared line"
+    );
+    let restore = restore_custody(&region, len, rig.cfg.as_ref()).expect("a screen");
+    assert_eq!(restore.report.rung, Rung::Exact, "{:?}", restore.report);
+    let (adopted, _) = adopt_and_import(restore.checkpoint, restore.history, None);
+    assert_eq!(
+        visible(&crate::term_lock(&adopted)),
+        rig.visible(),
+        "the session's own screen"
+    );
+}
+
+/// A LEVEL REPORTED BEFORE THE JOURNAL WORKER STARTS IS WHERE IT BEGINS (R6 review). The
+/// worker starts with a window's first export; a CRITICAL the OS reported before it (or
+/// with the keeper off, before any session journaled) used to be dropped, so `pressure
+/// level=` said `-` and the first rings were not shed although the system was critical.
+/// The level is kept whether a worker runs or not, and a worker that starts after it
+/// begins from it, told once. NEGATIVE CONTROL: a worker started after the same report but
+/// never told it (the old path) exports a session's ring as if no pressure had been
+/// reported.
+#[test]
+fn a_pressure_level_reported_before_the_worker_starts_is_where_it_begins() {
+    const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+    struct Stop(Arc<HistoryWorker>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.stop_ring_worker();
+        }
+    }
+    let gap = std::time::Duration::from_millis(5);
+    let grow = |rig: &Rig| {
+        for i in 0..200 {
+            rig.slice(format!("{}\r\n", noisy_line(i, 76)).as_bytes());
+        }
+    };
+    let cell: PressureCell = std::sync::Mutex::new((None, false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    note_pressure_in(&cell, || None, PressureLevel::Critical, Some(tx));
+    rx.recv_timeout(HANG).expect("answered at once: no worker");
+    assert_eq!(
+        *cell.lock().expect("the cell"),
+        (Some(PressureLevel::Critical), false),
+        "kept, untold"
+    );
+
+    // Control: a worker that starts and is never told runs its passes at no level.
+    let control = Stop(HistoryWorker::start_ring_worker().expect("a worker"));
+    let unshed = Rig::new(8, 80);
+    unshed
+        .journal
+        .start_export_with(&control.0, &unshed.term, false);
+    grow(&unshed);
+    let exported =
+        aterm_spec::wait::within(HANG, gap, || (unshed.journal.ring_lag() == 0).then_some(()));
+    assert!(exported.is_some(), "the control's worker exported the ring");
+    assert!(!unshed.journal.ring_shed(), "control: nothing shed");
+    assert_eq!(control.0.shed_view().0, None, "control: no level");
+
+    let worker = Stop(HistoryWorker::start_ring_worker().expect("a worker"));
+    seed_pressure_in(&cell, &worker.0);
+    assert!(cell.lock().expect("the cell").1, "told");
+    let rig = Rig::new(8, 80);
+    rig.journal.start_export_with(&worker.0, &rig.term, false);
+    grow(&rig);
+    // The pass sheds the ring first and publishes its level at its end: both are waited for
+    // (reading the level the moment the ring reads shed raced that pass's end).
+    let shed = aterm_spec::wait::within(HANG, gap, || {
+        (rig.journal.ring_shed() && worker.0.shed_view().0 == Some(PressureLevel::Critical))
+            .then_some(())
+    });
+    assert!(
+        shed.is_some(),
+        "the ring a session opened under CRITICAL is shed, the worker at CRITICAL: {:?}",
+        worker.0.shed_view().0
+    );
+
+    // Told once: seeding again does nothing; a later report goes to the worker itself.
+    seed_pressure_in(&cell, &worker.0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let live = Arc::clone(&worker.0);
+    note_pressure_in(&cell, || Some(live), PressureLevel::Normal, Some(tx));
+    rx.recv_timeout(HANG).expect("the worker applied it");
+    assert_eq!(worker.0.shed_view().0, Some(PressureLevel::Normal));
+    assert_eq!(
+        *cell.lock().expect("the cell"),
+        (Some(PressureLevel::Normal), true)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The control slot (the plan's increment 7)
+// ---------------------------------------------------------------------------
+
+/// A turn record as `cmd_turn` records one.
+fn turn(id: u64, text: &str) -> crate::turn_ledger::TurnRecord {
+    crate::turn_ledger::TurnRecord {
+        id,
+        started_ms: id * 10,
+        dur_ms: 5,
+        submitted: true,
+        status: "settled",
+        text: text.into(),
+        screen_hash: id,
+        seq: id,
+        arch: crate::turn_ledger::ArchMark {
+            origin: 7,
+            last: id,
+        },
+        by: crate::turn_ledger::TurnBy::Ctl,
+        carried: false,
+    }
+}
+
+/// A session's ledger, shared as `SessionCtx::turns` shares it.
+fn ledger_of(
+    records: Vec<crate::turn_ledger::TurnRecord>,
+) -> Arc<Mutex<crate::turn_ledger::TurnLedger>> {
+    let mut ledger = crate::turn_ledger::TurnLedger::default();
+    for record in records {
+        ledger.push(record);
+    }
+    Arc::new(Mutex::new(ledger))
+}
+
+impl Rig {
+    /// The region restored as a recovering window restores it, the control slot's carry
+    /// beside the screen.
+    fn restoration(&self) -> Restoration {
+        let mut used = 0u64;
+        offered_restoration(Some(self.offered()), 0, self.cfg.as_ref(), &mut used)
+    }
+
+    /// A word of the live region's header, stored as a writer would.
+    fn store_word(&self, at: usize, value: u64) {
+        use aterm_restore::RegionStore as _;
+        self.journal
+            .store
+            .store_u64_release(at, value)
+            .expect("a header word");
+    }
+}
+
+/// The turn ids a restoration's control carry holds (none without one).
+fn carried_ids(restoration: &Restoration) -> Vec<u64> {
+    restoration
+        .control
+        .as_ref()
+        .map(|carry| carry.turns.iter().map(|t| t.id).collect())
+        .unwrap_or_default()
+}
+
+/// THE TURN LEDGER ACROSS A CRASH (the plan's increment 7): a session's ledger rides its
+/// region's control slot. An empty ledger writes nothing and costs the worker nothing; a
+/// record is due at once, carried by the worker's tick, and read back by the restore with
+/// its text, its archive mark and the writer's turn-id count, no archive and no log; the
+/// next carry waits two seconds from the last; and the screen restores exactly beside it.
+#[test]
+fn a_turn_ledger_rides_the_control_slot_across_a_crash() {
+    let rig = Rig::new(6, 40);
+    rig.slice(b"$ ");
+    let turns = ledger_of(Vec::new());
+    rig.journal.carry_ledger(&turns);
+    assert!(
+        rig.restoration().control.is_none(),
+        "an empty ledger writes nothing"
+    );
+    assert_eq!(
+        rig.journal.control_due(rig.journal.ring_now_ms()),
+        None,
+        "nothing due while no record lands"
+    );
+    assert_eq!(rig.journal.ledger_lag(), 0);
+
+    turns.lock().expect("ledger").push(turn(41, "echo one"));
+    assert_eq!(rig.journal.ledger_lag(), 1, "a record the slot lacks");
+    let now = rig.journal.ring_now_ms();
+    assert_eq!(
+        rig.journal.control_due(now),
+        Some(now),
+        "the first carry is due at once"
+    );
+    rig.journal.control_tick();
+    assert_eq!(rig.journal.ledger_lag(), 0, "carried");
+    assert_eq!(rig.journal.control_due(rig.journal.ring_now_ms()), None);
+    let restoration = rig.restoration();
+    assert_eq!(
+        restoration.screen.as_ref().expect("a screen").report.rung,
+        Rung::Exact,
+        "the screen beside it"
+    );
+    let carry = restoration.control.expect("the ledger");
+    assert_eq!(carry.turns.len(), 1);
+    let record = &carry.turns[0];
+    assert_eq!((record.id, &*record.text), (41, "echo one"));
+    assert_eq!(record.arch.to_string(), "7:41");
+    assert!(record.carried, "a carried record");
+    assert!(
+        carry.turn_ids <= crate::control::turn_ids_minted(),
+        "the writer's turn-id count at the write rides it"
+    );
+    assert!(carry.archive.is_none() && carry.log.is_none());
+
+    // The next carry waits two seconds from the last one, then carries both records.
+    turns.lock().expect("ledger").push(turn(42, "echo two"));
+    let due = rig.journal.control_due(0).expect("due");
+    assert!(due >= CONTROL_MS, "two seconds after the last carry: {due}");
+    rig.journal.pass_ms(CONTROL_MS);
+    let now = rig.journal.ring_now_ms();
+    assert!(rig.journal.control_due(now).is_some_and(|due| due <= now));
+    rig.journal.control_tick();
+    assert_eq!(carried_ids(&rig.restoration()), [41, 42]);
+}
+
+/// A TORN SLOT YIELDS NO CARRY, NEVER A WRONG ONE (the plan's increment 7 test), in the
+/// window's restore: a slot whose commit word is 0 (a death inside the slot's write) or
+/// names a record the slot does not hold is no ledger, and the screen restores exactly all
+/// the same. The turn-id count beside the slot survives the tear: the recovery still
+/// adopts the count, with an empty ledger that vouches for no id below it. The ledger
+/// rides the META rung too: a region with no valid keyframe still carries it.
+#[test]
+fn a_torn_control_slot_carries_no_ledger_and_the_meta_rung_carries_a_whole_one() {
+    use aterm_restore::layout::{OFF_CTL_COMMIT, kf_commit_word};
+    let rig = Rig::new(6, 40);
+    rig.slice(b"$ ");
+    let turns = ledger_of(vec![turn(7, "make")]);
+    rig.journal.carry_ledger(&turns);
+    assert_eq!(carried_ids(&rig.restoration()), [7], "premise: carried");
+    // Past any count a concurrent test's mint stores into this region.
+    let count = 1 << 40;
+    rig.journal.hold_turn_ids(count);
+    let seq = {
+        use aterm_restore::RegionView as _;
+        rig.journal
+            .store
+            .load_u64_acquire(OFF_CTL_COMMIT)
+            .expect("word")
+    };
+    assert_eq!(seq, 1);
+
+    for (word, why) in [(0, "a write cut short"), (seq + 1, "another record's word")] {
+        rig.store_word(OFF_CTL_COMMIT, word);
+        let restoration = rig.restoration();
+        assert!(restoration.control.is_none(), "{why}: no ledger");
+        assert_eq!(
+            restoration.screen.as_ref().expect("a screen").report.rung,
+            Rung::Exact,
+            "{why}: the screen all the same"
+        );
+        assert_eq!(restoration.turn_ids, count, "{why}: the count survives it");
+        let carry = counted_carry(restoration.control, restoration.turn_ids)
+            .unwrap_or_else(|| panic!("{why}: the count alone is carried"));
+        assert!(carry.turns.is_empty() && carry.turn_ids == count, "{why}");
+    }
+    rig.store_word(OFF_CTL_COMMIT, seq);
+    assert_eq!(carried_ids(&rig.restoration()), [7], "the slot whole again");
+
+    // No keyframe: the META rung, and the ledger beside it.
+    rig.store_word(kf_commit_word(0), 0);
+    rig.store_word(kf_commit_word(1), 0);
+    let restoration = rig.restoration();
+    let report = restoration.screen.as_ref().err().expect("the META rung");
+    assert_eq!((report.rung, report.why), (Rung::Meta, "no-keyframe"));
+    assert_eq!(
+        carried_ids(&restoration),
+        [7],
+        "the ledger rides the META rung"
+    );
+}
+
+/// An ADOPTED session's ledger (an update's carry, a crash's) is written into its fresh
+/// region at the spawn, before anything is told the region exists: a crash right after
+/// the adoption still carries it, with its floor.
+#[test]
+fn an_adopted_ledger_is_carried_from_the_spawn() {
+    let rig = Rig::new(6, 40);
+    let turns = Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::carried(
+        vec![turn(5, "a"), turn(6, "b")],
+        3,
+    )));
+    rig.journal.carry_ledger(&turns);
+    assert_eq!(rig.journal.ledger_lag(), 0, "written at once");
+    let restoration = rig.restoration();
+    assert_eq!(carried_ids(&restoration), [5, 6]);
+    assert!(restoration.control.expect("carried").unheld_below >= 3);
+    // A ledger an update could not carry at all says only its floor: carried too.
+    let floored = Rig::new(6, 40);
+    let empty = Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::carried(
+        Vec::new(),
+        900,
+    )));
+    floored.journal.carry_ledger(&empty);
+    let carry = floored.restoration().control.expect("the floor rides");
+    assert!(carry.turns.is_empty());
+    assert_eq!(carry.unheld_below, 900);
+}
+
+/// The memory shed's fresh region is given the control slot's record and the turn-id count
+/// before its custody goes anywhere: a crash restored from either region carries the same
+/// ledger and a count as high, and the next mint's count lands in the fresh one.
+#[test]
+fn a_shed_region_s_replacement_carries_the_ledger() {
+    let rig = deep_rig();
+    let turns = ledger_of(vec![turn(11, "cargo test"), turn(12, "git status")]);
+    rig.journal.carry_ledger(&turns);
+    // Past any count a concurrent test's mint stores into this region.
+    let count = 1 << 41;
+    rig.journal.hold_turn_ids(count);
+    let restoration = rig.restoration();
+    assert_eq!(carried_ids(&restoration), [11, 12], "premise");
+    assert_eq!(restoration.turn_ids, count, "premise");
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(rig.journal.regions_replaced(), 1);
+    let (fresh, len) = rig
+        .journal
+        .take_custody()
+        .expect("the fresh region's custody");
+    let mut used = 0u64;
+    let restoration = offered_restoration(
+        Some(OfferedCompanion {
+            region: fresh.try_clone().expect("dup"),
+            kind: COMPANION_JOURNAL,
+            len,
+        }),
+        0,
+        rig.cfg.as_ref(),
+        &mut used,
+    );
+    assert_eq!(
+        carried_ids(&restoration),
+        [11, 12],
+        "the fresh region carries it"
+    );
+    assert_eq!(restoration.turn_ids, count, "and the count");
+    // The worker goes on in the fresh region, and so does the count.
+    turns.lock().expect("ledger").push(turn(13, "ls"));
+    rig.journal.control_tick();
+    rig.journal.hold_turn_ids(count + 1);
+    let restoration = offered_restoration(
+        Some(OfferedCompanion {
+            region: fresh.try_clone().expect("dup"),
+            kind: COMPANION_JOURNAL,
+            len,
+        }),
+        0,
+        rig.cfg.as_ref(),
+        &mut used,
+    );
+    assert_eq!(carried_ids(&restoration), [11, 12, 13]);
+    assert_eq!(restoration.turn_ids, count + 1);
+}
+
+/// The worker on its own thread carries a record with no tick asked for: the ledger's
+/// watch wakes it (each wait a one-minute hang detector, never a latency budget).
+#[test]
+fn the_worker_carries_a_record_the_ledger_takes() {
+    const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+    struct Stop(Arc<HistoryWorker>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.stop_ring_worker();
+        }
+    }
+    let worker = Stop(HistoryWorker::start_ring_worker().expect("the worker's thread"));
+    let rig = Rig::new(6, 40);
+    let turns = ledger_of(Vec::new());
+    rig.journal.carry_ledger(&turns);
+    rig.journal.start_export_with(&worker.0, &rig.term, false);
+    turns.lock().expect("ledger").push(turn(3, "date"));
+    let carried = aterm_spec::wait::within(HANG, std::time::Duration::from_millis(5), || {
+        (rig.journal.ledger_lag() == 0).then_some(())
+    });
+    assert!(carried.is_some(), "the worker carried the record");
+    assert_eq!(carried_ids(&rig.restoration()), [3]);
+}
+
+/// TURN IDS GO ON ABOVE EVERY CARRY: the count continues past the highest carried count or
+/// record plus the update's reserve, and every carried ledger stops vouching for the ids
+/// below where it goes on (a floor above it stands). No carry: nothing moves.
+#[test]
+fn a_recovery_continues_turn_ids_above_every_carry() {
+    let carry =
+        |turn_ids: u64, ids: &[u64], unheld_below: u64| crate::handoff_carry::ControlCarry {
+            turns: ids.iter().map(|id| turn(*id, "t")).collect(),
+            unheld_below,
+            turn_ids,
+            ..crate::handoff_carry::ControlCarry::default()
+        };
+    let mut a = carry(100, &[90, 99], 0);
+    let mut b = carry(40, &[150], 7);
+    let reserve = crate::control::TURN_ID_RESERVE;
+    let mut far = carry(0, &[], 150 + reserve + 50);
+    let ceiling = carried_turn_ceiling(&mut [&mut a, &mut b, &mut far]);
+    assert_eq!(ceiling, Some(150 + reserve), "above the highest record");
+    assert_eq!(a.unheld_below, 150 + reserve + 1);
+    assert_eq!(b.unheld_below, 150 + reserve + 1);
+    assert_eq!(
+        far.unheld_below,
+        150 + reserve + 50,
+        "a floor above it stands"
+    );
+    assert_eq!(carried_turn_ceiling(&mut []), None);
+    let mut top = carry(crate::handoff_carry::MAX_TURN_ID, &[], 0);
+    assert_eq!(
+        carried_turn_ceiling(&mut [&mut top]),
+        Some(crate::handoff_carry::MAX_TURN_ID),
+        "never past what a carry holds"
+    );
+}
+
+/// THE TURN-ID COUNT RIDES EVERY REGION: a turn id minted anywhere in the process (a turn
+/// begun in another session, one whose journal stopped, one since closed: none of them
+/// moves this session's ledger, so no carry follows) is in this session's region before
+/// the mint returns it, the control slot untouched; a restore reads it, and the recovery
+/// goes on past it, the carried ledger vouching for no id up to there. NEGATIVE CONTROL:
+/// without the mint's store (`control::mint_turn_id`'s `note_turn_ids`) the region holds
+/// only the count at the journal's creation, and the minted id is above it.
+#[test]
+fn every_minted_turn_id_is_in_every_live_region_before_it_is_anyone_s() {
+    let rig = Rig::new(6, 40);
+    let turns = ledger_of(vec![turn(41, "echo one")]);
+    rig.journal.carry_ledger(&turns);
+    let id = crate::control::mint_turn_id_for_test();
+    assert!(
+        rig.journal.turn_ids_held() >= id,
+        "the mint stored the count before returning the id"
+    );
+    let restoration = rig.restoration();
+    assert!(restoration.turn_ids >= id, "the region holds it");
+    assert_eq!(carried_ids(&restoration), [41], "a mint carries no ledger");
+    let mut carry = counted_carry(restoration.control, restoration.turn_ids).expect("a carry");
+    let ceiling = carried_turn_ceiling(&mut [&mut carry]).expect("a ceiling");
+    assert!(
+        ceiling >= id,
+        "the count goes on past the id: {ceiling} < {id}"
+    );
+    assert!(
+        carry.unheld_below > id,
+        "and no carried floor vouches for it"
+    );
+}
+
+/// THE REVIEW'S SCENARIO (a crash restore named an id again): a session's ledger carried
+/// when the count was `c`; the window then minted ids up to `c + 5_000` in sessions whose
+/// ledgers carried nothing and began a turn here under the last of them, which moves no
+/// ledger, and died. Its slot's carry names `c`, beyond the update's reserve below the
+/// last id; the region's count names the last id, and the recovery goes on past it: no id
+/// the dead window used is minted again, and `history since=<it>` or a resumed
+/// `since-turn=<it>` is told turns may be missing (the floor above it).
+#[test]
+fn a_crash_restore_continues_past_ids_no_carry_named() {
+    let accepted = Arc::new(AtomicBool::new(false));
+    let unplaced = Arc::new(AtomicBool::new(false));
+    let one =
+        crate::keeper_link::RecoveryCountAdmission::from_retained(vec![Arc::clone(&accepted)]);
+    let all = crate::keeper_link::RecoveryCountAdmission::from_retained(vec![
+        Arc::clone(&accepted),
+        Arc::clone(&unplaced),
+    ]);
+    assert!(crate::keeper_link::RecoveryCountAdmission::default().ready());
+    assert!(!one.ready() && !all.ready());
+    let rig = Rig::with_recovery_count(6, 40, None, Some(Arc::clone(&accepted)));
+    let initial = rig
+        .first_receipt
+        .as_ref()
+        .expect("initial admission receipt");
+    assert!(!initial.confirmed() && !one.ready());
+    let turns = ledger_of(vec![turn(9, "make")]);
+    rig.journal.carry_ledger(&turns);
+    let carried = rig
+        .restoration()
+        .control
+        .expect("premise: carried")
+        .turn_ids;
+    let reserve = crate::control::TURN_ID_RESERVE;
+    // As the mints store it (`note_turn_ids`), no carry following: past any count a
+    // concurrent test's mint stores into this region.
+    let last = (1 << 42) + carried + reserve + 904;
+    rig.journal.hold_turn_ids(last);
+    turns.lock().expect("ledger").begin(last);
+    assert_eq!(
+        rig.journal.control_due(rig.journal.ring_now_ms()),
+        None,
+        "premise: a turn begun carries nothing"
+    );
+    let restoration = rig.restoration();
+    let slot = restoration.control.as_ref().expect("the slot's carry");
+    assert!(
+        slot.turn_ids.saturating_add(reserve) < last,
+        "premise: the slot's carry alone would have gone on below the last id"
+    );
+    let mut carry = counted_carry(restoration.control, restoration.turn_ids).expect("a carry");
+    assert_eq!(carry.turn_ids, last, "the region's count");
+    let ceiling = carried_turn_ceiling(&mut [&mut carry]).expect("a ceiling");
+    assert_eq!(ceiling, last + reserve);
+    assert!(carry.unheld_below > last, "the floor is past the last id");
+
+    // A keeper that still holds the predecessor must observe later counts too,
+    // both while the queue is full and after it takes a COMPANION but before SYNC.
+    use aterm_keeper::client::LinkOp;
+    const RDEV: u64 = 0xc017;
+    for _ in 0..12 {
+        rig.slice(b"a line to export\r\n");
+    }
+    rig.export();
+    assert!(rig.journal.ring_bytes() > 0, "premise: a region to shed");
+    let link = Arc::new(crate::keeper_link::TestLink::stalled(rig.journal.id, RDEV));
+    rig.journal.link_custody_to(Arc::clone(&link));
+    link.fill();
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    assert!(rig.journal.custody_owed(), "the queue refused custody");
+    let busy_count = last + reserve + 1;
+    rig.journal.hold_turn_ids(busy_count);
+    assert_eq!(
+        rig.restoration().turn_ids,
+        busy_count,
+        "the old region remains counted"
+    );
+    assert!(
+        link.drain()
+            .iter()
+            .all(|op| !matches!(op, LinkOp::Companion { .. }))
+    );
+    rig.journal.pass_ms(TICK_MS);
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        rig.journal.custody_owed(),
+        "queue admission still owes a read"
+    );
+    let (fresh, len, receipt) = link
+        .take_queued()
+        .into_iter()
+        .find_map(|op| match op {
+            LinkOp::Companion {
+                rdev: RDEV,
+                region,
+                len,
+                receipt: Some(receipt),
+            } => Some((region, len, receipt)),
+            _ => None,
+        })
+        .expect("the queued replacement");
+    assert!(!receipt.confirmed(), "queue admission is no read receipt");
+    assert!(
+        !one.ready() && !all.ready(),
+        "a queued replacement grants no admission"
+    );
+    let unread_count = busy_count + reserve + 1;
+    rig.journal.hold_turn_ids(unread_count);
+    assert_eq!(
+        rig.restoration().turn_ids,
+        unread_count,
+        "the unread predecessor stays counted"
+    );
+
+    // At most one predecessor can be queued and unread. No clock wait or rate
+    // assumption turns the finite reserve into authority to drop another mapping.
+    rig.journal.request_unshed();
+    rig.export();
+    rig.journal.request_shed();
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(
+        rig.journal.regions_replaced(),
+        1,
+        "another replacement awaits the read"
+    );
+    rig.journal.request_unshed();
+
+    // Clearing privacy data must not clear the independent count. The old image
+    // takes META, has no ledger, and carries ids minted after the clear as well.
+    rig.slice(b"\x1b[3Jcleared\r\n");
+    rig.journal.export_tick(&rig.term);
+    let cleared_count = unread_count + reserve + 1;
+    rig.journal.hold_turn_ids(cleared_count);
+    rig.journal.hold_turn_ids(cleared_count - 1);
+    let erased = rig.restoration();
+    assert_eq!(erased.screen.err().expect("cleared image").rung, Rung::Meta);
+    assert!(erased.control.is_none());
+    assert_eq!(
+        erased.turn_ids, cleared_count,
+        "META preserves the count only"
+    );
+    let mut count_only = counted_carry(erased.control, erased.turn_ids).expect("count only");
+    assert_eq!(
+        carried_turn_ceiling(&mut [&mut count_only]),
+        Some(cleared_count + reserve)
+    );
+
+    // The captured SYNC is the sole retirement authority. Later ids go to the
+    // replacement, not the now-unreachable predecessor retained by this fixture.
+    receipt.confirm_captured();
+    assert!(
+        !initial.confirmed(),
+        "the first descriptor was superseded unread"
+    );
+    assert!(
+        one.ready(),
+        "the accepted replacement retires the same old authority"
+    );
+    drop(unplaced);
+    assert!(
+        !all.ready(),
+        "a lost or unplaced ticket is not a retirement receipt"
+    );
+    rig.journal.export_tick(&rig.term);
+    assert!(
+        !rig.journal.custody_owed(),
+        "the captured read settled custody"
+    );
+    rig.journal.hold_turn_ids(cleared_count + 1);
+    assert_eq!(rig.restoration().turn_ids, cleared_count);
+    let mut used = 0;
+    let current = offered_restoration(
+        Some(OfferedCompanion {
+            region: fresh,
+            kind: COMPANION_JOURNAL,
+            len,
+        }),
+        0,
+        rig.cfg.as_ref(),
+        &mut used,
+    );
+    assert_eq!(current.turn_ids, cleared_count + 1);
+}
+
+/// A stored count only rises, whatever order the minting threads store in; a count read
+/// before a higher one was stored is no lowering. The region keeps the highest.
+#[test]
+fn the_region_s_turn_id_count_only_rises() {
+    let rig = Rig::new(6, 40);
+    let high = 1 << 43;
+    rig.journal.hold_turn_ids(high);
+    rig.journal.hold_turn_ids(high - 1);
+    rig.journal.hold_turn_ids(3);
+    assert_eq!(rig.journal.turn_ids_held(), high);
+    assert_eq!(rig.restoration().turn_ids, high);
+}
+
+/// A recovered session's carry is the slot's, its count raised to the region's; a region
+/// with a count and no carry (a torn slot, a session that never took a turn) is adopted
+/// with the count alone; neither: none. The recovery goes on above the counts as above the
+/// carries' own.
+#[test]
+fn a_recovered_carry_takes_the_region_s_count() {
+    let reserve = crate::control::TURN_ID_RESERVE;
+    let slot = crate::handoff_carry::ControlCarry {
+        turns: vec![turn(90, "t")],
+        turn_ids: 100,
+        ..crate::handoff_carry::ControlCarry::default()
+    };
+    let mut raised = counted_carry(Some(slot), 7_000).expect("the slot's carry");
+    assert_eq!((raised.turns.len(), raised.turn_ids), (1, 7_000));
+    let mut alone = counted_carry(None, 9_000).expect("the count alone");
+    assert!(alone.turns.is_empty());
+    assert_eq!((alone.turn_ids, alone.unheld_below), (9_000, 0));
+    assert!(counted_carry(None, 0).is_none(), "no count, no carry: none");
+    let lower = crate::handoff_carry::ControlCarry {
+        turn_ids: 50,
+        ..crate::handoff_carry::ControlCarry::default()
+    };
+    assert_eq!(
+        counted_carry(Some(lower), 0).map(|c| c.turn_ids),
+        Some(50),
+        "a region with no count keeps the carry's"
+    );
+    let ceiling = carried_turn_ceiling(&mut [&mut raised, &mut alone]);
+    assert_eq!(ceiling, Some(9_000 + reserve));
+    assert_eq!(alone.unheld_below, 9_000 + reserve + 1);
+    assert_eq!(raised.unheld_below, 9_000 + reserve + 1);
+    assert_eq!(
+        counted_carry(None, u64::MAX).map(|c| c.turn_ids),
+        Some(crate::handoff_carry::MAX_TURN_ID),
+        "never past what a carry holds"
+    );
+}
+
+/// A LEDGER TOO LONG FOR THE SLOT IS SAID: a full ledger of long, varied prompts does not
+/// fit the 64 KiB slot, so its carry sheds the oldest records, and `journal_ledger_lag=`
+/// counts them: the slot does not hold them, and 0 would promise a crash restores every
+/// turn the ledger holds. They stay counted while the ledger is that long.
+#[test]
+fn a_ledger_the_slot_cannot_hold_whole_is_counted_in_its_lag() {
+    use crate::turn_ledger::LEDGER_CAP;
+    // Varied text LZ4 cannot fold: each record's own letters (xorshift).
+    let text = |id: u64| -> String {
+        let mut x = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..300)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(b'a' + u8::try_from(x % 26).expect("a letter"))
+            })
+            .collect()
+    };
+    let cap = u64::try_from(LEDGER_CAP).expect("cap");
+    let rig = Rig::new(6, 40);
+    let turns = ledger_of((1..=cap).map(|id| turn(id, &text(id))).collect());
+    rig.journal.carry_ledger(&turns);
+    let held = carried_ids(&rig.restoration());
+    let held_len = u64::try_from(held.len()).expect("len");
+    assert!(
+        !held.is_empty() && held_len < cap,
+        "premise: the slot holds only the newest, {held_len} of {cap}"
+    );
+    assert_eq!(held.last(), Some(&cap), "the newest are the ones held");
+    assert_eq!(
+        rig.journal.ledger_lag(),
+        cap - held_len,
+        "the records the slot does not hold are counted"
+    );
+    // The next carry sheds as many again: still counted, never 0.
+    turns
+        .lock()
+        .expect("ledger")
+        .push(turn(cap + 1, &text(cap + 1)));
+    rig.journal.pass_ms(CONTROL_MS);
+    rig.journal.control_tick();
+    let held = carried_ids(&rig.restoration());
+    assert_eq!(held.last(), Some(&(cap + 1)), "carried");
+    assert_eq!(
+        rig.journal.ledger_lag(),
+        cap - u64::try_from(held.len()).expect("len"),
+        "the ledger holds {cap} records, the slot {}",
+        held.len()
     );
 }

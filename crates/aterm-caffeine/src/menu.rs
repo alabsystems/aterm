@@ -146,8 +146,8 @@ pub fn compose(mode: Mode, now: u64, startup: bool, version: &str) -> Vec<Row> {
     rows
 }
 
-/// Format the tooltip for an activity that holds `mode` at `now`.
-/// The live mug also accounts for failed activity starts through its private wrapper.
+/// The mug's tooltip in `mode` at `now`. A keep-awake activity that could not begin has
+/// already turned the mode off, so the tooltip reads off then too.
 #[must_use]
 pub fn tooltip(mode: Mode, now: u64) -> String {
     match mode.settled(now) {
@@ -157,17 +157,6 @@ pub fn tooltip(mode: Mode, now: u64) -> String {
             "Caffeine is keeping this Mac awake for {} more",
             describe_left(deadline - now)
         ),
-    }
-}
-
-/// The live mug's tooltip, using its actual activity ownership alongside the request.
-#[cfg(any(target_os = "macos", test))]
-#[must_use]
-pub(crate) fn tooltip_for_activity(mode: Mode, now: u64, held: bool) -> String {
-    if mode.is_on(now) && !held {
-        "Caffeine is requested on, but no keep-awake activity is held".to_string()
-    } else {
-        tooltip(mode, now)
     }
 }
 
@@ -280,26 +269,5 @@ mod tests {
         let timed = tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + 8 * 60);
         assert!(timed.contains(&describe_left(52 * 60)), "{timed}");
         assert!(tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + HOUR).contains("off"));
-
-        // The request can remain on even when the native activity did not begin. The
-        // production formatter must distinguish that from held activity ownership.
-        let absent = tooltip_for_activity(Mode::Forever, NOW, false);
-        assert_ne!(absent, tooltip(Mode::Forever, NOW));
-        assert_eq!(
-            absent,
-            tooltip_for_activity(Mode::chosen(Choice::Hours1, NOW), NOW, false)
-        );
-        assert_eq!(
-            tooltip_for_activity(Mode::Forever, NOW, true),
-            tooltip(Mode::Forever, NOW)
-        );
-        assert_eq!(
-            tooltip_for_activity(Mode::Off, NOW, false),
-            tooltip(Mode::Off, NOW)
-        );
-        assert_eq!(
-            tooltip_for_activity(Mode::chosen(Choice::Hours1, NOW), NOW + HOUR, false),
-            tooltip(Mode::Off, NOW + HOUR)
-        );
     }
 }

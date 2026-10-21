@@ -127,7 +127,7 @@ fn what_is_not_an_object_is_unreadable_never_an_architecture() {
 #[test]
 fn the_reader_agrees_with_the_host_about_a_real_binary() {
     let Some(host) = Triple::host() else {
-        return;
+        aterm_spec::host::could_not_run("this host is no triple atpkg publishes for");
     };
     let (format, cpu) = arch::expect(host);
     let mut read = 0;

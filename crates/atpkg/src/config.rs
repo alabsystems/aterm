@@ -504,18 +504,12 @@ struct AbrewOnly {
 pub fn parse_abrew(text: &str) -> AbrewConfig {
     match aterm_toml::from_str::<AbrewOnly>(text) {
         Ok(root) => root.abrew.unwrap_or_default(),
-        Err(_) => {
-            // Fail closed: a config that names [abrew] but does not parse
-            // must not silently read as enabled (reroute on) — the same
-            // direction as every other escape in abrew.
-            if text.lines().any(|l| l.trim_start().starts_with("[abrew]")) {
-                AbrewConfig {
-                    enabled: Some(false),
-                }
-            } else {
-                AbrewConfig::default()
-            }
-        }
+        // A malformed document cannot establish the absence of an opt-out.
+        // Valid omitted tables still use the default; unknown input does not
+        // enable the reroute, regardless of how its keys were spelled.
+        Err(_) => AbrewConfig {
+            enabled: Some(false),
+        },
     }
 }
 
@@ -807,8 +801,19 @@ mod tests {
         assert!(!parse_abrew("[abrew]\nenabled = false\n").enabled());
         assert!(parse_abrew("[abrew]\nenabled = true\n").enabled());
         assert!(parse_abrew("").enabled());
-        // A malformed file that never mentions [abrew] keeps the default.
-        assert!(parse_abrew("[packages]\nbroken = [\n").enabled());
+        for malformed in [
+            "[ abrew ]\nenabled = maybe\n",
+            "['abrew']\nenabled = maybe\n",
+            "[\"abrew\"]\nenabled = maybe\n",
+            "abrew.enabled = maybe\n",
+            "[packages]\nbroken = [\n",
+        ] {
+            assert!(!parse_abrew(malformed).enabled());
+        }
+        // Valid unrelated tables and valid absent options retain the default.
+        assert!(parse_abrew("[packages]\nexclude = []\n").enabled());
+        assert!(parse_abrew("[ abrew ]\n").enabled());
+        assert!(!parse_abrew("['abrew']\nenabled = false\n").enabled());
     }
 
     use super::*;

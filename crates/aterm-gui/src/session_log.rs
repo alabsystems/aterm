@@ -23,9 +23,10 @@
 //! | control input (`send`, `key`, `paste`, `feed`, their binary twins; phase 3A) | the tracker's attribution by the connection's actor with its `cause=`, and `mark - input verb= by=` once per author's 30 s burst |
 //!
 //! THE WATCHERS' WAKE (phase 3A, `session_log_mark`): every producer site takes
-//! the owed wake ([`SessionLog::take_log_wake`]) in the timeline lock it holds and,
-//! once it is released, wakes the session's subscribers, so `await log` and
-//! `subscribe … log` never poll.
+//! the owed wake ([`SessionLog::take_log_wake`]) in the timeline lock it holds,
+//! through [`crate::session_timeline::SessionTimeline::slog_take_wake`], which
+//! rings the session's watchers there, so `await log` and `subscribe … log`
+//! never poll.
 //!
 //! The sweep writes the block read BEFORE the foreground move: a command's D
 //! closes the programs that ran under it at its own stamp, so no child closes
@@ -75,6 +76,7 @@
 //! `log @<sid>` and `brief @<sid>` answer from.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use aterm_slog::{
     Actor, Amend, Close, Conf, Cursor, Fields, Gap, GapWhy, IdCounters, Key, Kind, Limits, Log,
@@ -82,50 +84,160 @@ use aterm_slog::{
     Val, Verdict,
 };
 
-/// A session's first epoch: a fresh spawn's. Every adoption raises it: a
-/// carried one to the predecessor's plus one ([`LogCarry`]), and one told
-/// nothing of the predecessor's to [`adopted_epoch`].
+/// The floor of every epoch: a test's log (`SessionLog::for_test`) takes it,
+/// and no log this build starts in production takes it or anything below
+/// [`FIRST_EPOCH`] + 1 ([`Epochs::issue`]).
 pub(crate) const FIRST_EPOCH: u32 = 1;
 
-/// The epoch of a successor told nothing of its predecessor's (an older
-/// producer's or a rollback's manifest, which carries no `log_ids`; a crash
-/// recovery whose keeper tag names no epoch, [`crash_epoch`]): the wall
-/// clock's Unix seconds at the adoption, never below 2.
-///
-/// Why not [`FIRST_EPOCH`]: a reader's cursor from the predecessor
-/// (`since=13 ep=1`) would match the successor's epoch, and once the new log
-/// passed seq 13 the reader would read on into another process's records
-/// with no `gap`, skipping the `gap why=crash` and `open - adopt` that say
-/// so (design §5.1, "no silent loss"). The seconds are above every epoch a
-/// spawned chain reaches (1 plus one per handoff), and above an earlier such
-/// adoption's chain when at least one whole second, plus one per handoff that
-/// chain made, has passed on the wall clock since; the 32 bits last until
-/// 2106.
-pub(crate) fn adopted_epoch(at: Stamp) -> u32 {
-    u32::try_from(at.wall_ms / 1000)
-        .unwrap_or(u32::MAX)
-        .max(FIRST_EPOCH + 1)
+/// THE CEILING OF EVERY EPOCH THIS PROCESS IS TOLD (the review of 6A-2): an
+/// epoch read from outside it (a restore leaf's `log_ep`, a keeper tag's
+/// `slog_ep`, a claim's recorded epoch, a carried row's) above this is
+/// foreign or corrupt and is dropped, never noted, so the allocator keeps
+/// 2^20 issues of room below `u32::MAX` and one bad value cannot make every
+/// later log of the process share `u32::MAX`. Wall seconds reach it only in
+/// 2106, as the 32 bits do ([`Epochs`]).
+pub(crate) const EPOCH_CEILING: u32 = u32::MAX - (1 << 20);
+
+/// An epoch read from outside this process ([`EPOCH_CEILING`]), or `None`
+/// for one no producer of this build writes: 0 or above the ceiling.
+pub(crate) fn told_epoch(ep: u32) -> Option<u32> {
+    (FIRST_EPOCH..=EPOCH_CEILING).contains(&ep).then_some(ep)
 }
 
-/// THE EPOCH OF A CRASH RECOVERY (a shell the PTY keeper held after its
-/// window died): above the one the keeper's tag names for the crashed
-/// window's log (`tag_ep`, `keeper_link::Tag::slog_ep`), and no lower than
-/// [`adopted_epoch`]. Two recoveries of one shell within one wall second
-/// therefore take growing epochs: each window registers its own log's epoch
-/// with the keeper before it can crash.
+/// THE EPOCH ALLOCATOR (session log phase 6, step 6A-2, ruling U1): it
+/// issues the first epoch of every log this process starts, fresh or
+/// uncarried (a spawn's, a restore's, an adoption told nothing of its
+/// predecessor's, a crash recovery's) as
+/// `max(wall seconds, every epoch this process issued or noted + 1, floor,
+/// 2)`, where the floor is a crash recovery's keeper tag plus one
+/// ([`Epochs::crash`]) and the noted epochs are the ones this process
+/// adopted (a carried successor's, which stays its predecessor's plus one)
+/// and the ones its restore leaves recorded (`TerminalLeafRestore::log_ep`,
+/// noted before any session starts, [`Epochs::note_leaves`]) or an adopted
+/// id's claim recorded (`identity_claim::recorded_epoch_in`, noted once the
+/// claim is held, before the id's log starts).
 ///
-/// Why the larger of the two, and not the tag's plus one alone: a successor
-/// that crashes after its log was readable but before its registration
-/// reached the keeper leaves its predecessor's tag in the keeper's custody,
-/// and the tag's plus one would repeat that successor's epoch whatever the
-/// time. With the seconds as a floor, a repeat needs both a registration
-/// lost that way and two recoveries in the same wall second; a window older
-/// than the tag's key (`tag_ep` `None`) is slice 1's seconds alone. A wall
-/// clock stepped back is held off by the tag.
-pub(crate) fn crash_epoch(tag_ep: Option<u32>, at: Stamp) -> u32 {
-    tag_ep
-        .map_or(0, |ep| ep.saturating_add(1))
-        .max(adopted_epoch(at))
+/// WHY. An epoch names a seq space: a reader's cursor `since=<seq> ep=<e>`
+/// reads on only in a log whose space holds `e`, and a remote fold starts
+/// over only at a gap naming a LARGER epoch (`aterm_slog::starts_epoch`). A
+/// fresh log at a fixed first epoch (the 1 every log took before this step)
+/// gave every process the same number: a relaunch under the same sid (a
+/// `$ATERM_SESSION_ID` re-adoption) let its predecessor's cursor read on into
+/// it with no gap, the journal merged the two processes' records into one
+/// space, and one session's cursor read on in another's log. The wall
+/// seconds make a later process's epoch larger; the issued and noted epochs
+/// make two in one second distinct and keep a chain that ran ahead of the
+/// wall clock (handoffs less than a second apart) from being repeated by a
+/// later adoption in this build. A relaunch under an adopted id with no
+/// restore leaf (a headless one, restore off, a nested aterm with no kept
+/// desk) inside its predecessor's wall second, or after the wall clock
+/// stepped back, is held above the predecessor by the epoch recorded beside
+/// the id's claim (`identity_claim`'s module doc, "The epoch record"). THE
+/// REMAINING WINDOW: a build older than the leaf's `log_ep` and the claim's
+/// record adopts at the plain seconds, so it, or a relaunch after it, can
+/// repeat an epoch only within a chain's lead over the wall clock or the
+/// predecessor's wall second. The 32 bits last until 2106. An epoch
+/// a process is told above [`EPOCH_CEILING`] is dropped ([`told_epoch`]), so
+/// the allocator never saturates on one bad value.
+#[derive(Debug, Default)]
+pub(crate) struct Epochs {
+    /// The largest epoch issued or noted (0: none).
+    last: std::sync::atomic::AtomicU32,
+}
+
+impl Epochs {
+    /// An allocator that has issued nothing: a new process's.
+    pub(crate) const fn new() -> Epochs {
+        Epochs {
+            last: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// The process's allocator, every production log's.
+    pub(crate) fn process() -> &'static std::sync::Arc<Epochs> {
+        static PROCESS: std::sync::OnceLock<std::sync::Arc<Epochs>> = std::sync::OnceLock::new();
+        PROCESS.get_or_init(|| std::sync::Arc::new(Epochs::new()))
+    }
+
+    /// The next epoch at `at`, no lower than `floor`: above every epoch
+    /// issued or noted, never below the wall clock's Unix seconds or
+    /// [`FIRST_EPOCH`] + 1. Issued once: no other caller gets it.
+    pub(crate) fn issue(&self, at: Stamp, floor: u32) -> u32 {
+        use std::sync::atomic::Ordering;
+        let wall = u32::try_from(at.wall_ms / 1000).unwrap_or(u32::MAX);
+        let floor = floor.min(EPOCH_CEILING.saturating_add(1));
+        let base = wall.max(floor).max(FIRST_EPOCH + 1);
+        let mut last = self.last.load(Ordering::Acquire);
+        loop {
+            // Above every epoch issued or noted, which never pass the
+            // ceiling but by this process's own issues: 2^20 of them before
+            // the last would repeat.
+            let Some(next) = last.checked_add(1) else {
+                aterm_log::warn!(
+                    "session log: this process issued every epoch up to the last; a log repeats it"
+                );
+                return u32::MAX;
+            };
+            let ep = base.max(next);
+            match self
+                .last
+                .compare_exchange_weak(last, ep, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return ep,
+                Err(now) => last = now,
+            }
+        }
+    }
+
+    /// The epoch of a crash recovery (a shell the PTY keeper held after its
+    /// window died): above the one the keeper's tag names for the crashed
+    /// window's log (`tag_ep`, `keeper_link::Tag::slog_ep`), and issued as
+    /// every other ([`Self::issue`]). Two recoveries of one shell within one
+    /// wall second therefore take growing epochs: each window registers its
+    /// own log's epoch with the keeper before it can crash.
+    ///
+    /// Why the tag's plus one is a floor and not the epoch: a successor that
+    /// crashes after its log was readable but before its registration
+    /// reached the keeper leaves its predecessor's tag in the keeper's
+    /// custody, and the tag's plus one would repeat that successor's epoch
+    /// whatever the time. With the seconds and this process's issued epochs
+    /// as floors, a repeat needs both a registration lost that way and two
+    /// recoveries in the same wall second; a window older than the tag's key
+    /// (`tag_ep` `None`) is the seconds alone. A wall clock stepped back is
+    /// held off by the tag.
+    pub(crate) fn crash(&self, tag_ep: Option<u32>, at: Stamp) -> u32 {
+        self.issue(
+            at,
+            tag_ep
+                .and_then(told_epoch)
+                .map_or(0, |ep| ep.saturating_add(1)),
+        )
+    }
+
+    /// An epoch this process holds without issuing it (a carried successor's
+    /// predecessor-plus-one) or was told a predecessor held (a restore
+    /// leaf's, a claim's): every later issue is above it. One above
+    /// [`EPOCH_CEILING`] is dropped with a WARN ([`told_epoch`]).
+    pub(crate) fn note(&self, ep: u32) {
+        if ep > EPOCH_CEILING {
+            aterm_log::warn!(
+                "session log: an epoch above the ceiling was dropped, not noted ({ep})"
+            );
+            return;
+        }
+        self.last.fetch_max(ep, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Note every epoch `layout`'s terminal leaves recorded
+    /// (`TerminalLeafRestore::log_ep`): called before any session of this
+    /// process starts, so a restored sid's log, an adoption told nothing and
+    /// a crash recovery all take an epoch above the one its predecessor's
+    /// log was at when the layout was saved.
+    pub(crate) fn note_leaves(&self, layout: &crate::restore::RestoreManifest) {
+        if let Some(ep) = layout.max_log_ep() {
+            self.note(ep);
+        }
+    }
 }
 
 /// How far past its last issued id each numbered level's counter is carried
@@ -251,8 +363,10 @@ impl LogCarry {
     }
 
     /// A carried row read back, or `None`: four integers, an epoch of at least
-    /// one. Anything else carries nothing, and the successor starts at
-    /// [`adopted_epoch`] (its log still opens with `gap why=handoff`).
+    /// one and at most [`EPOCH_CEILING`] ([`told_epoch`]). Anything else
+    /// carries nothing, and the successor starts at
+    /// an epoch issued as for a log told nothing ([`Epochs::issue`]; its log
+    /// still opens with `gap why=handoff`).
     pub(crate) fn parse(row: &str) -> Option<LogCarry> {
         let mut it = row.split_ascii_whitespace().map(str::parse::<u32>);
         let (ep, run, turn, step) = (
@@ -261,9 +375,10 @@ impl LogCarry {
             it.next()?.ok()?,
             it.next()?.ok()?,
         );
-        if it.next().is_some() || ep == 0 {
+        if it.next().is_some() {
             return None;
         }
+        let ep = told_epoch(ep)?;
         Some(LogCarry {
             ep,
             ids: IdCounters { run, turn, step },
@@ -469,6 +584,11 @@ impl Typed {
 /// superseded anyway, gives way.
 const PENDING_NAMES_MAX: usize = 8;
 
+/// The most commands [`SessionLog::agent_cmds`] holds: the old agent's and
+/// the relaunched one's are two; past it the oldest, whose failure a later
+/// command's end has long replaced, gives way.
+const AGENT_CMDS_MAX: usize = 4;
+
 #[derive(Clone, Copy, Debug)]
 struct FgRun {
     pgid: i32,
@@ -509,6 +629,9 @@ struct AgentRun {
 pub(crate) struct SessionLog {
     log: Log,
     clock: Clock,
+    /// THE EPOCH ALLOCATOR this log's epochs come from ([`Epochs`]): the
+    /// process's, or a test's own (a simulated process).
+    epochs: std::sync::Arc<Epochs>,
     /// The consumer half's own state (phase 3A, `session_log_mark`): the
     /// mark limiter, the control-input bursts and the watchers' wake.
     consumers: mark::Consumers,
@@ -537,6 +660,12 @@ pub(crate) struct SessionLog {
     fg: Option<FgRun>,
     /// The agent run and its turn tracker.
     agent: Option<AgentRun>,
+    /// THE COMMANDS AN AGENT RAN UNDER (Phase 6 step 6C-1): the `cmd` runs
+    /// the session's newest agent runs hung under, oldest first, at most
+    /// [`AGENT_CMDS_MAX`] ([`Self::note_agent_cmd`]). A relaunch lifts a
+    /// failure only on one of them ([`Self::harness_saw_failure`]): an
+    /// agent's end, never a command's that ran no agent.
+    agent_cmds: Vec<Node>,
     /// Names given since the last block read, oldest first
     /// ([`Self::program_named`]).
     pending: Vec<PendingName>,
@@ -585,12 +714,6 @@ pub(crate) struct SessionLog {
     person_seen: u64,
     reached_seen: u64,
     marked_through: u64,
-    /// THE MAIL LATCH (session log phase 5, ruling T39): a `mail dir=in`
-    /// mark was written since the last `human` mark of an input that reached
-    /// the program, so the person's next such input writes one whatever its
-    /// burst ([`Self::person_input`]) and the fold can read "no person
-    /// between the mail and the turn" from records.
-    mail_since_human: bool,
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the
@@ -620,14 +743,43 @@ pub(crate) fn ring_limits() -> Limits {
 }
 
 impl Default for SessionLog {
+    /// A fresh log on the host's clocks, its first epoch the process
+    /// allocator's next ([`Epochs::process`]).
     fn default() -> Self {
-        let mut log = Log::with_limits(FIRST_EPOCH, ring_limits());
+        SessionLog::starting(std::sync::Arc::clone(Epochs::process()), host_stamp())
+    }
+}
+
+impl SessionLog {
+    /// A fresh log whose first epoch `epochs` issues at `at`
+    /// ([`Epochs::issue`]); a later adoption's comes from it too.
+    pub(crate) fn starting(epochs: std::sync::Arc<Epochs>, at: Stamp) -> SessionLog {
+        let ep = epochs.issue(at, 0);
+        SessionLog::at_epoch(epochs, ep)
+    }
+
+    /// THE TEST CONSTRUCTOR (ruling U46): a fresh log at [`FIRST_EPOCH`],
+    /// with an allocator of its own (a simulated process that issued
+    /// nothing else), so a unit test that sets its clock by hand reads
+    /// `ep=1` and an adoption it drives takes its hand clock's seconds. No
+    /// build pins the epoch: a debug build's and the dev seams' logs run the
+    /// process allocator, as a release's do.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> SessionLog {
+        let epochs = std::sync::Arc::new(Epochs::new());
+        epochs.note(FIRST_EPOCH);
+        SessionLog::at_epoch(epochs, FIRST_EPOCH)
+    }
+
+    fn at_epoch(epochs: std::sync::Arc<Epochs>, ep: u32) -> SessionLog {
+        let mut log = Log::with_limits(ep, ring_limits());
         // The journal writer's wake (ruling R6), when this process keeps a
         // journal: every append and eviction of this log rings it.
         log.set_notify(crate::session_log_journal::notify());
         SessionLog {
             log,
             clock: Clock::default(),
+            epochs,
             consumers: mark::Consumers::default(),
             origin: Kind::Spawn,
             opened_wall: None,
@@ -638,6 +790,7 @@ impl Default for SessionLog {
             root_pgid: 0,
             fg: None,
             agent: None,
+            agent_cmds: Vec::new(),
             pending: Vec::new(),
             arrivals: 0,
             typed: Typed::default(),
@@ -653,7 +806,6 @@ impl Default for SessionLog {
             person_seen: 0,
             reached_seen: 0,
             marked_through: 0,
-            mail_since_human: false,
         }
     }
 }
@@ -853,10 +1005,15 @@ impl SessionLog {
             by: clause.by,
             since_wall: now_wall.saturating_sub(clause.age_ms),
         };
+        // A shown label says whose it is (D6, ruling U22); no other row does.
+        let by = (clause.row == aterm_slog::ClauseRow::Label)
+            .then(|| crate::session_chrome::ClauseAuthor::of(&clause.by))
+            .flatten();
         let line = crate::session_chrome::ClauseLine {
             head,
             since_ms: now_ms.saturating_sub(clause.age_ms),
             until_ms,
+            by,
         };
         Some((key, line))
     }
@@ -898,8 +1055,10 @@ impl SessionLog {
     /// `gap why=handoff epoch=<ep+1>` continuing the carried node ids and,
     /// past the carried seq count, the seqs, or `gap why=crash` for a shell
     /// whose window died. A successor told nothing of the predecessor's epoch
-    /// takes [`adopted_epoch`], so no cursor of the predecessor's reads on
-    /// past the loss. Called before anything else is written.
+    /// takes one this log's allocator issues ([`Epochs::issue`], a crash
+    /// recovery's above its keeper tag's, [`Epochs::crash`]), so no cursor of
+    /// the predecessor's reads on past the loss. Called before anything else
+    /// is written.
     pub(crate) fn adopt(&mut self, carry: LogAdopt, keeper: bool, at: Stamp) {
         // A seq count no log reaches (`aterm_slog::SEQ_LIMIT`: a manifest
         // that is corrupt or another program's) is none: `Log::from_carry`
@@ -920,15 +1079,18 @@ impl SessionLog {
         let next_seq = carry.seq.saturating_add(1);
         let log = match (keeper, carry.ids) {
             (true, _) => {
-                let mut log = Log::with_limits(crash_epoch(carry.keeper_ep, at), ring_limits());
+                let ep = self.epochs.crash(carry.keeper_ep, at);
+                let mut log = Log::with_limits(ep, ring_limits());
                 log.gap(GapWhy::Crash, 0, at);
                 log
             }
             (false, Some(c)) => {
-                Log::after_handoff(c.ep.saturating_add(1), ring_limits(), c.ids, next_seq, at)
+                let ep = c.ep.saturating_add(1);
+                self.epochs.note(ep);
+                Log::after_handoff(ep, ring_limits(), c.ids, next_seq, at)
             }
             (false, None) => Log::after_handoff(
-                adopted_epoch(at),
+                self.epochs.issue(at, 0),
                 ring_limits(),
                 IdCounters::default(),
                 next_seq,
@@ -990,6 +1152,7 @@ impl SessionLog {
         self.cmd = None;
         self.fg = None;
         self.agent = None;
+        self.agent_cmds.clear();
         self.pending.clear();
         self.typed = Typed::default();
         self.last_blk = None;
@@ -1429,6 +1592,29 @@ impl SessionLog {
         false
     }
 
+    /// The agent run `node` opened (or was carried across an update): the
+    /// `cmd` run it hangs under, the nearest open one above it, joins
+    /// [`Self::agent_cmds`]. An agent hung under no command (the session
+    /// itself, past a cut) names none.
+    fn note_agent_cmd(&mut self, node: Node) {
+        let mut at = node;
+        for _ in 0..=aterm_slog::MAX_OPEN {
+            let Some(e) = self.log.open_entry(at) else {
+                return;
+            };
+            if e.kind == Kind::Cmd {
+                if !self.agent_cmds.contains(&at) {
+                    if self.agent_cmds.len() >= AGENT_CMDS_MAX {
+                        self.agent_cmds.remove(0);
+                    }
+                    self.agent_cmds.push(at);
+                }
+                return;
+            }
+            at = e.parent;
+        }
+    }
+
     /// Close the front runs (the agent run, then the program run) that ran
     /// under `parent`, at `at` or, when something open under `parent` opened
     /// later (a program the resolver named after the D, which the log could
@@ -1524,6 +1710,66 @@ impl SessionLog {
                 .by(Actor::Human),
             at,
         );
+    }
+
+    /// A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED, AND ONLY THAT ONE
+    /// (session log Phase 6, step 6C-1, ruling U3). Run right after the act
+    /// mark of a relaunch row whose step brought a new agent process up
+    /// ([`Self::observe_relaunch_act`] with `started`,
+    /// [`aterm_agent::harness::upgrade_drive::started`]); a row that typed a
+    /// turn into the running agent, stopped it with no start yet, or waited
+    /// never comes here. It writes `mark - seen by=harness src=aterm
+    /// conf=strong` when all five hold:
+    /// - the fold holds a `failure` need on a run N;
+    /// - that need is the session's only failure need, because a `seen`
+    ///   lifts every one (the fold's `seen` arm): with another standing the
+    ///   harness writes nothing, and the session still says it failed, which
+    ///   is true;
+    /// - N is closed;
+    /// - an agent ran under N ([`Self::agent_cmds`]): the failure is an
+    ///   agent's end, never a command's that ran none (a `make` that failed
+    ///   before the person started the agent);
+    /// - a run of N's kind that opened after N's close is open now: the
+    ///   relaunched program, so the failure is the old agent's end the
+    ///   restart replaced (the stop's 143, or the crash a crash relaunch
+    ///   answers), not one the new run reported.
+    ///
+    /// `seen` is bus class, so the mirror's fold lifts the need as the
+    /// local one does. No fold law moves, and 3B's rule (a later run of the
+    /// kind ending `ok` or `fail` lifts it, `lifts_failure`) stays the
+    /// shell's. Returns whether the mark was written.
+    pub(crate) fn harness_saw_failure(&mut self, at: Stamp) -> bool {
+        let mut failures = self
+            .log
+            .state()
+            .needs
+            .iter()
+            .flatten()
+            .filter(|n| n.word == "failure");
+        let (Some(need), None) = (failures.next(), failures.next()) else {
+            return false;
+        };
+        let (n, kind, closed_t) = (need.node, need.kind, need.t);
+        if n.lvl != Lvl::Run || self.log.is_open(n) || !self.agent_cmds.contains(&n) {
+            return false;
+        }
+        // Node ids rise in the order nodes open, so a run that opened after
+        // N closed has a larger number than N; `t` says it opened no earlier
+        // than N's close.
+        let relaunched =
+            self.log.open_nodes().iter().any(|e| {
+                e.node.lvl == Lvl::Run && e.kind == kind && e.node.n > n.n && e.t >= closed_t
+            });
+        relaunched
+            && self
+                .log
+                .mark(
+                    Mark::new(Kind::Seen, Src::Aterm, Conf::Strong)
+                        .at(Node::SESSION)
+                        .by(Actor::Harness),
+                    at,
+                )
+                .is_ok()
     }
 
     // ---- the program in front ----------------------------------------
@@ -1710,6 +1956,7 @@ impl SessionLog {
                 by_screen: false,
                 tracker,
             });
+            self.note_agent_cmd(node);
         }
     }
 
@@ -1820,6 +2067,7 @@ impl SessionLog {
                     by_screen: true,
                     tracker: TurnTracker::new(node),
                 });
+                self.note_agent_cmd(node);
             }
         }
         let word = Fields::new()
@@ -1872,9 +2120,11 @@ impl SessionLog {
     /// question step open now the person's to dismiss (ruling T1); and the
     /// first input of a burst writes `mark - human by=human` on the session
     /// (the bytes are never recorded), as does the first program-bound one
-    /// after a `mail dir=in` mark, whatever its burst (ruling T39,
-    /// [`Self::mail_since_human`]). A burst's mark that no program-bound
-    /// input is delivered with says so, `reached=0` (a view scroll, a
+    /// after a `mail dir=in` mark, whatever its burst (ruling T39; the mail
+    /// latch is [`aterm_slog::Fold::in_since_human`], the log's own fold's,
+    /// which a carry crosses an update with: 6C-5, ruling U19). A burst's
+    /// mark that no program-bound input is delivered with says so,
+    /// `reached=0` (a view scroll, a
     /// selection, a composition): the fold reads it as no answer to waiting
     /// mail, and the latch stays for the input that does reach the program.
     /// `own` is the calling gesture's ([`PersonGesture`]), `None` for
@@ -1949,7 +2199,9 @@ impl SessionLog {
                 let _ = a.tracker.person(log, at);
             }
         }
-        let after_mail = reached && std::mem::take(&mut self.mail_since_human);
+        // The latch is the fold's (6C-5, ruling U19): the mark written below
+        // clears it, as its record folds.
+        let after_mail = reached && self.log.fold().in_since_human();
         if burst || after_mail {
             let mut mark = Mark::new(Kind::Human, Src::Input, Conf::Strong)
                 .at(Node::SESSION)
@@ -1960,12 +2212,6 @@ impl SessionLog {
             let _ = self.log.mark(mark, at);
             self.marked_through = self.marked_through.max(seq);
         }
-    }
-
-    /// A `mail dir=in` mark was written (ruling T39): the person's next
-    /// input is marked.
-    pub(crate) fn note_mail_in(&mut self) {
-        self.mail_since_human = true;
     }
 
     /// A `ctl turn` exchange from `by`, ledger id `ledger`, handed its input to
@@ -2339,7 +2585,6 @@ impl crate::App {
     pub(crate) fn lift_session_log_fences(&mut self) {
         // The journal writer goes on past the fences, in a new segment.
         crate::session_log_journal::note_stood_down();
-        let mut owed = Vec::new();
         for session in self.pool.iter() {
             let mut timeline = session
                 .ctx
@@ -2347,14 +2592,9 @@ impl crate::App {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             timeline.slog_mut().lift_read_fence();
-            // The readers see past the overlap now (ruling R9): woken once the
-            // lock is released.
-            if timeline.slog_take_wake() {
-                owed.push(session.id);
-            }
-        }
-        for id in owed {
-            self.wake_log_watchers(id, true);
+            // The readers see past the overlap now (ruling R9): the owed wake
+            // rings them in this hold.
+            let _ = timeline.slog_take_wake();
         }
         // The bus mirror's closed sessions land again (`StoreMirror::past_draw`).
         self.store
@@ -2365,10 +2605,11 @@ impl crate::App {
     }
 
     /// What a footer read wakes when it moves a session's log (phase 3B,
-    /// `claude_footer::LogWake`): this instance's subscribers, and the
-    /// `[session_log] clause` switch.
+    /// `claude_footer::LogWake`): the loop, under the `[session_log] clause`
+    /// switch. The session's watchers were rung where the read took the log's
+    /// owed wake (`SessionTimeline::slog_take_wake`).
     pub(crate) fn footer_log_wake(&self) -> crate::claude_footer::LogWake {
-        crate::claude_footer::LogWake::new(&self.subscribers, self.config.session_log_clause())
+        crate::claude_footer::LogWake::new(self.config.session_log_clause())
     }
 
     /// Whether session `id`'s clause moved past what its tab's chrome was
@@ -2403,12 +2644,11 @@ impl crate::App {
         }
     }
 
-    /// `Wake::SessionLogMoved`: the footer thread moved session `id`'s log
-    /// (phase 3B) and already woke its watchers, or the render path moved
-    /// it and they are owed a wake now (`notify`); the loop notes the turn
-    /// tracker's settle wake, which only its tick keeps.
-    pub(crate) fn on_session_log_moved(&mut self, id: u64, notify: bool) {
-        self.wake_log_watchers(id, notify);
+    /// `Wake::SessionLogMoved`: the footer thread or the render path moved
+    /// session `id`'s log (phase 3B), and its watchers were rung where the
+    /// move took the log's owed wake; the loop notes the turn tracker's
+    /// settle wake, which only its tick keeps.
+    pub(crate) fn on_session_log_moved(&mut self, id: u64) {
         let Some(s) = self.pool.get(id) else {
             return;
         };
@@ -2424,18 +2664,6 @@ impl crate::App {
         self.follow_clause(id);
     }
 
-    /// Wake session `id`'s subscribers when its log's readers are `owed` a
-    /// wake ([`SessionLog::take_log_wake`], taken under the timeline lock the
-    /// caller has released): the content-less notify the sweep sends.
-    pub(crate) fn wake_log_watchers(&self, id: u64, owed: bool) {
-        if owed && self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(id);
-        }
-    }
-
     /// THE SESSION LOG's settle ticks: each session whose turn tracker's wake
     /// is due is ticked under its timeline's leaf lock (the lock the sweep
     /// takes on this thread), and its next wake replaces the entry. Nothing
@@ -2449,12 +2677,12 @@ impl crate::App {
         let now = crate::turn_ledger::now_ms();
         for id in self.session_status.slog_wakes.due(now) {
             // A settle closes a turn with no output: nothing else would wake a
-            // reader parked on it (`await log close=turn`), so the tick does.
+            // reader parked on it (`await log close=turn`), so the tick's owed
+            // wake rings it.
             let (wake, owed) = self.pool.get(id).map_or((None, false), |s| {
                 let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                 (timeline.slog_tick(), timeline.slog_take_wake())
             });
-            self.wake_log_watchers(id, owed);
             self.session_status
                 .slog_wakes
                 .note(id, wake.filter(|w| *w > now));
@@ -2733,14 +2961,15 @@ fn gap_line(g: &Gap) -> String {
 }
 
 /// What a `log` reply needs of a log, copied under the timeline's leaf lock:
-/// the records it shows and the header's numbers. The reply is rendered from
-/// the copy after the lock is released ([`crate::control::cmd_log`]), so a
-/// reader asking for the whole ring as JSON never holds the lock the event
-/// loop's status sweep takes, under the terminal guard, for the length of
-/// the encoding.
+/// the records it shows, shared with the ring (a count bump each, no field
+/// copied), and the header's numbers. The reply is rendered from the copy
+/// after the lock is released ([`crate::control::cmd_log`]), so a reader
+/// asking for the whole ring as JSON never holds the lock the event loop's
+/// status sweep takes, under the terminal guard, for the length of the
+/// encoding.
 #[derive(Clone, Debug)]
 pub(crate) struct LogCopy {
-    recs: Vec<Rec>,
+    recs: Vec<Arc<Rec>>,
     gap: Option<Gap>,
     /// Matching records left out by `n=`.
     more: usize,
@@ -2753,12 +2982,12 @@ pub(crate) struct LogCopy {
 }
 
 impl LogCopy {
-    /// The records `q` asks for, and the header: a filter and a clone of the
+    /// The records `q` asks for, and the header: a filter and a share of the
     /// records shown, nothing encoded. (Named apart from every other `of`:
     /// the lock-order census resolves a call by its name.)
     pub(crate) fn copied_from(log: &Log, q: &LogQuery) -> LogCopy {
-        let read = log.read(q.cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
-        let matching: Vec<&Rec> = read
+        let read = log.read_shared(q.cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
+        let matching: Vec<&Arc<Rec>> = read
             .recs
             .into_iter()
             .filter(|r| in_subtree(log, r.node, q.node))
@@ -2767,7 +2996,7 @@ impl LogCopy {
             .collect();
         let more = q.n.map_or(0, |n| matching.len().saturating_sub(n));
         LogCopy {
-            recs: matching[more..].iter().map(|r| (*r).clone()).collect(),
+            recs: matching.into_iter().skip(more).map(Arc::clone).collect(),
             gap: read.gap,
             more,
             as_of: log.reader_last_seq(),
@@ -2790,7 +3019,11 @@ impl LogCopy {
             .collect();
         let more = q.n.map_or(0, |n| matching.len().saturating_sub(n));
         LogCopy {
-            recs: matching[more..].iter().map(|r| (*r).clone()).collect(),
+            // The node log keeps its records by value: each shown is copied.
+            recs: matching[more..]
+                .iter()
+                .map(|r| Arc::new((*r).clone()))
+                .collect(),
             gap: read.gap,
             more,
             as_of: log.last_seq(),
@@ -2855,16 +3088,18 @@ pub(crate) fn render_log_copy(c: &LogCopy, q: &LogQuery) -> String {
 
 #[cfg(test)]
 thread_local! {
-    /// A test's probe, called as a `log` or `brief` reply starts encoding
-    /// ([`render_log_copy`], [`BriefCopy::brief`]) on this thread: what it
-    /// finds held there, the encoding runs under.
+    /// A test's probe, called as a `log`, `brief`, `history`, `timeline` or
+    /// `exits` reply starts encoding ([`render_log_copy`],
+    /// [`BriefCopy::brief`], [`render_brief_all`], and the ring verbs'
+    /// formatters in `control_session`) on this thread: what it finds held
+    /// there, the encoding runs under.
     pub(crate) static ENCODE_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Run this thread's [`ENCODE_PROBE`], if a test set one.
 #[cfg(test)]
-fn encode_probe() {
+pub(crate) fn encode_probe() {
     ENCODE_PROBE.with(|p| {
         if let Some(probe) = p.borrow().as_ref() {
             probe();
@@ -2880,29 +3115,33 @@ pub(crate) fn render_log(log: &Log, q: &LogQuery) -> String {
 }
 
 /// What a brief needs of a log, copied under the timeline's leaf lock (as
-/// [`LogCopy`]): the records the reader asked for, the gap that read
-/// crossed, and the fold's state.
+/// [`LogCopy`]): the records the reader asked for, shared with the ring, the
+/// gap that read crossed, the fold's state, and the fold's mail links.
 #[derive(Clone, Debug)]
 pub(crate) struct BriefCopy {
-    recs: Vec<Rec>,
+    recs: Vec<Arc<Rec>>,
     gap: Option<Gap>,
     state: aterm_slog::SessionState,
+    /// The fold's heuristic mail links, which the brief prints as
+    /// `mail=@<off>~` (Phase 6 step 6C-3, ruling U5).
+    links: Vec<(Node, aterm_slog::MailLink)>,
 }
 
 impl BriefCopy {
     /// The records past `cursor` (all of them: none) in `node`'s subtree, the
-    /// gap that read crossed, and the state.
+    /// gap that read crossed, the state, and the mail links.
     pub(crate) fn copied_from(log: &Log, node: Node, cursor: Option<Cursor>) -> BriefCopy {
-        let read = log.read(cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
+        let read = log.read_shared(cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
         BriefCopy {
             recs: read
                 .recs
                 .into_iter()
                 .filter(|r| in_subtree(log, r.node, node))
-                .cloned()
+                .map(Arc::clone)
                 .collect(),
             gap: read.gap,
             state: log.reader_state().clone(),
+            links: log.reader_fold().mail_links().to_vec(),
         }
     }
 
@@ -2914,11 +3153,21 @@ impl BriefCopy {
         self
     }
 
+    /// What its brief reads at any budget.
+    fn input(&self) -> aterm_slog::BriefInput<'_> {
+        aterm_slog::BriefInput::new(
+            self.recs.iter().map(|r| &**r),
+            self.gap,
+            &self.state,
+            &self.links,
+        )
+    }
+
     /// Its brief within `budget` tokens at `now_wall`.
     pub(crate) fn brief(&self, sid: &str, budget: usize, now_wall: u64) -> aterm_slog::Brief {
         #[cfg(test)]
         encode_probe();
-        aterm_slog::brief(sid, &self.recs, self.gap, &self.state, budget, now_wall)
+        self.input().scanned().fit(sid, budget, now_wall)
     }
 }
 
@@ -2963,17 +3212,13 @@ impl BriefPart {
             .map_or(u8::MAX, aterm_slog::need_precedence);
         (need, std::cmp::Reverse(self.copy.state.last_t))
     }
+}
 
-    /// Its brief with the `OK <n> ` prefix dropped, and its token estimate.
-    fn text(&self, budget: usize) -> (String, usize) {
-        let b = self.copy.brief(&self.sid, budget, self.now_wall);
-        let text = match b.text.split_once(' ') {
-            Some(("OK", tail)) => tail
-                .split_once(' ')
-                .map_or(tail.to_string(), |(_, t)| t.to_string()),
-            _ => b.text,
-        };
-        (text, b.used)
+/// A brief's text past its `OK <n> ` prefix.
+fn past_ok_count(text: &str) -> &str {
+    match text.split_once(' ') {
+        Some(("OK", tail)) => tail.split_once(' ').map_or(tail, |(_, t)| t),
+        _ => text,
     }
 }
 
@@ -2985,8 +3230,11 @@ impl BriefPart {
 /// whose one-line form fits their share, ranked by need then by recent
 /// activity ([`BriefPart::rank`]); each brief within its share sheds as one
 /// session's brief does. When not even one fits, the header and the trailer
-/// alone answer.
+/// alone answer. Each part's window is scanned once, for its floor and its
+/// share alike ([`aterm_slog::Briefing`]).
 pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
+    #[cfg(test)]
+    encode_probe();
     let n = parts.len();
     let fixed = aterm_slog::tokens(
         format!("OK {n:05} brief all sessions={n} v=2 budget={budget} used={budget:05}\n").len()
@@ -2995,8 +3243,15 @@ pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
     let avail = budget.saturating_sub(fixed);
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&i| (parts[i].rank(), i));
-    // Each part's one-line floor ([`aterm_slog::brief`] at budget 0).
-    let floor: Vec<usize> = parts.iter().map(|p| p.text(0).1).collect();
+    let inputs: Vec<aterm_slog::BriefInput<'_>> = parts.iter().map(|p| p.copy.input()).collect();
+    let briefings: Vec<aterm_slog::Briefing<'_>> =
+        inputs.iter().map(aterm_slog::BriefInput::scanned).collect();
+    // Each part's one-line floor (its brief at budget 0).
+    let floor: Vec<usize> = parts
+        .iter()
+        .zip(&briefings)
+        .map(|(p, b)| b.floor(&p.sid, p.now_wall).used)
+        .collect();
     // The most sessions, top-ranked, whose floors all fit an even share: then
     // each brief at that share uses at most it, and the sum fits.
     let kept = (1..=n)
@@ -3009,10 +3264,10 @@ pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
     let share = avail.checked_div(kept).unwrap_or(0);
     let mut keep: Vec<usize> = order[..kept].to_vec();
     keep.sort_unstable();
-    let texts: Vec<String> = keep.iter().map(|&i| parts[i].text(share).0).collect();
     let mut body = String::new();
-    for t in &texts {
-        body.push_str(t);
+    for &i in &keep {
+        let b = briefings[i].fit(&parts[i].sid, share, parts[i].now_wall);
+        body.push_str(past_ok_count(&b.text));
         body.push('\n');
     }
     if kept < n {

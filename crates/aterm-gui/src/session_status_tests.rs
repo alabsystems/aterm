@@ -39,7 +39,7 @@ fn policy() -> StatusPolicy {
 fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
     let now = Instant::now();
     let mut observer = StatusObserver::new(policy(), Duration::from_millis(50));
-    let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+    let timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
     {
         let mut current = timeline.lock().unwrap();
         current.note_foreground_group(42);
@@ -55,6 +55,7 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
         42,
         now,
         &crate::claude_footer::LogWake::default(),
+        false,
     );
     assert!(!observer.footer_asked.contains_key(&7));
 
@@ -70,8 +71,90 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
         42,
         now,
         &crate::claude_footer::LogWake::default(),
+        false,
     );
     assert!(!observer.footer_asked.contains_key(&7));
+}
+
+/// THE RE-ASK AT THE DRAWER'S EXEC EDGE (card engine §3.10). atpkg's shim
+/// is named `claude` and `exec`s the store build in place: the group and the
+/// name stay, so the sweep would not ask again for `RECHECK`, and its first
+/// ask may have fallen in the shim, whose environment macOS hides (no Claude
+/// dir, no registry watch). An edged visit whose group's published image is
+/// a store or Native Claude Code drawer the last ask was not made under asks
+/// at once, once per image (an ALab build the store's record names, too).
+/// CONTROLS: the shim's own image, an unclassified `claude` and a visit off
+/// the edge ask nothing.
+#[test]
+fn an_exec_into_a_store_or_native_claude_asks_for_the_footer_again() {
+    use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
+
+    use crate::holder_image::{EdgeKind, HolderImage};
+
+    let now = Instant::now();
+    let mut observer = StatusObserver::new(policy(), Duration::from_millis(50));
+    let timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
+    {
+        let mut current = timeline.lock().unwrap();
+        current.note_foreground_group(42);
+        current.set_program(42, Some("claude".into()));
+    }
+    let publish = |exe: &str, source: ImageSource, build: u64| {
+        let image = HolderImage::of(
+            42,
+            Some(5),
+            Some(std::path::PathBuf::from(exe)),
+            ImageBuild {
+                program: ProgramTag::new("claude"),
+                build,
+                source,
+            },
+            1,
+        );
+        timeline
+            .lock()
+            .unwrap()
+            .offer_holder_image(Arc::new(image), EdgeKind::Exec);
+    };
+    let mut visit = |ms: u64, edged: bool| {
+        observer.request_footer_if_due(
+            7,
+            &timeline,
+            Some("claude"),
+            42,
+            now + Duration::from_millis(ms),
+            &crate::claude_footer::LogWake::default(),
+            edged,
+        );
+        crate::claude_footer::CAPTURED_ASKS.with(|asks| asks.borrow().as_ref().map_or(0, Vec::len))
+    };
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = Some(Vec::new()));
+    publish("/p/agents/claude", ImageSource::Launcher, 0);
+    assert_eq!(visit(0, true), 1, "the first ask, in the shim");
+    assert_eq!(visit(1, true), 1, "the shim's image is no drawer");
+    publish(
+        "/p/pkg/store/claude/1000002000001000304/bin/claude",
+        ImageSource::Store,
+        1_000_002_000_001_000_304,
+    );
+    assert_eq!(visit(2, false), 1, "a visit off the edge does not look");
+    assert_eq!(visit(3, true), 2, "the exec edge asks inside RECHECK");
+    assert_eq!(visit(4, true), 2, "once per image");
+    publish(
+        "/h/.local/share/claude/versions/2.1.305",
+        ImageSource::Native,
+        1_000_002_000_001_000_305,
+    );
+    assert_eq!(visit(5, true), 3, "a Native drawer too");
+    publish(
+        "/p/pkg/store/claude/1000002000001000306/bin/claude",
+        ImageSource::StoreRecord,
+        1_000_002_000_001_000_306,
+    );
+    assert_eq!(visit(6, true), 4, "an ALab build from the store too");
+    publish("/opt/elsewhere/claude", ImageSource::Unknown, 0);
+    assert_eq!(visit(7, true), 4, "an unclassified claude asks nothing");
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = None);
 }
 
 fn blank(seq: u64) -> ActivitySample {
@@ -626,7 +709,7 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
                 .unwrap()
                 .since(None)
                 .filter(|e| e.kind == STATUS_CHANGE)
-                .map(|e| e.payload.clone())
+                .map(|e| e.payload.to_string())
                 .collect::<Vec<_>>()
         };
     // A command ran and failed: OSC 133 A, B, C, then the precmd's D with
@@ -1133,10 +1216,13 @@ fn the_badge_switch_quiets_chrome_without_stopping_classification() {
 /// stored, just before the screen's stamp on `status` and last on the
 /// roster's row. The task's face prints only for an agent session whose
 /// live claim THIS window's host holds — told through the host's own wake
-/// (`App::apply_harness_fact`) — and the instant only for an agent session,
-/// where `meta` prints what is stored. NEGATIVE CONTROLS: a face told with
-/// no claim, or under another holder's, prints `-`; a stored instant on a
-/// session that runs no agent prints `-` on `status` and the roster.
+/// (`App::apply_harness_fact`) — or a proven self-claim holds (FOREVER LAND
+/// §10.4: its own `landed@v1` act, told as `HarnessFact::SelfTask`), and the
+/// instant only for an agent session, where `meta` prints what is stored.
+/// NEGATIVE CONTROLS: a face told with no claim, or under another holder's,
+/// prints `-`, and so does the self-claim's face once its claim is gone; a
+/// stored instant on a session that runs no agent prints `-` on `status` and
+/// the roster.
 #[test]
 fn the_status_record_and_the_roster_carry_land_at_and_task() {
     use aterm_agent::harness::acts::TaskFace;
@@ -1159,7 +1245,7 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     assert!(
         record.contains(
             " flaps=0 land_at=- task=- pause=- task_state=- task_rev=0 log_seq=1 log_ep=1 run=- \
-             turn=- step=- need=- need_since_ms=- gen="
+             turn=- step=- need=- need_since_ms=- editing=0 gen="
         ),
         "{record}"
     );
@@ -1205,13 +1291,13 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     .unwrap();
     assert_eq!(field(&status(&app), "task="), "landed");
     assert_eq!(field(&roster(&app), "task="), "landed");
-    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Spent)));
-    assert_eq!(field(&status(&app), "task="), "spent");
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Theirs)));
+    assert_eq!(field(&status(&app), "task="), "theirs");
     app.apply_harness_fact(&sid, crate::HarnessFact::Task(None));
     assert_eq!(field(&status(&app), "task="), "-", "unknown again");
     // Another holder's claim: this host hears nothing from its loop.
-    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Done)));
-    assert_eq!(field(&status(&app), "task="), "done");
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Open)));
+    assert_eq!(field(&status(&app), "task="), "open");
     assert!(crate::session_timeline::release_supervisor(
         &ctx,
         None,
@@ -1228,6 +1314,42 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     .unwrap();
     assert_eq!(field(&status(&app), "task="), "-", "another holder's claim");
     assert_eq!(field(&roster(&app), "task="), "-", "another holder's claim");
+    // A proven self-claim: its own landed@v1 act's face prints, on both
+    // rows, and the hosted loop's facts beside it are no face of its.
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    crate::session_timeline::claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(1),
+        None,
+        Some(crate::self_claim::stand_in::running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proof takes a free session");
+    app.apply_harness_fact(&sid, crate::HarnessFact::SelfTask(TaskFace::Landed));
+    assert_eq!(field(&status(&app), "task="), "landed", "the self-claim's");
+    assert_eq!(field(&roster(&app), "task="), "landed", "the self-claim's");
+    app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Open)));
+    assert_eq!(
+        field(&status(&app), "task="),
+        "landed",
+        "the hosted loop tells no face beside a proven self-claim"
+    );
+    // NEGATIVE CONTROL: its claim gone, its face prints no more.
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(field(&status(&app), "task="), "-", "no live claim");
+    assert_eq!(field(&roster(&app), "task="), "-", "no live claim");
     // A fact for a sid this window does not hold is dropped.
     app.apply_harness_fact(
         "no-such-sid",
@@ -1416,6 +1538,53 @@ fn the_status_record_judges_the_launch_witness_by_its_own_count() {
         "{record}"
     );
     assert_stamp_rides_last(&record);
+}
+
+/// `editing=<n>` (amacs §6.7) counts the open `edit` tickets holding the
+/// session, just before the stamp: each ticket's hold adds one, and its
+/// resolve (or an orphan's lapse) takes it away again. A driver polling
+/// `status` learns why its `send` answers `ERR busy editing` without trying.
+#[test]
+fn status_reports_editing_count() {
+    use crate::control_edit::hold::{self, Hold};
+    use amacs::protocol::edit::Ticket;
+
+    let mut app = crate::App::headless_for_test();
+    // A session id no other test's App mints: the hold map is process-wide.
+    let sid = 1 << 44;
+    app.next_session_id = sid;
+    app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+    let editing = |app: &crate::App| {
+        let record = app.session_status_record(sid).expect("live session");
+        assert_stamp_rides_last(&record);
+        record
+            .split(' ')
+            .find_map(|word| word.strip_prefix("editing="))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no editing= in {record}"))
+    };
+    assert_eq!(editing(&app), "0", "nothing holds it");
+    hold::set(
+        sid,
+        Hold {
+            ticket: Ticket(1),
+            view: 10,
+        },
+    );
+    assert_eq!(editing(&app), "1");
+    hold::set(
+        sid,
+        Hold {
+            ticket: Ticket(2),
+            view: 20,
+        },
+    );
+    assert_eq!(editing(&app), "2", "two edits, counted apart");
+    hold::clear(sid, Ticket(2));
+    assert_eq!(editing(&app), "1", "the first resolve leaves the other");
+    hold::set_expiry(sid, Ticket(1), Some(Instant::now()));
+    assert_eq!(editing(&app), "0", "an orphan's hold lapsed");
+    hold::clear(sid, Ticket(1));
 }
 
 #[test]
@@ -1643,7 +1812,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
              journal journal_off integration_rev born render \
              resizes flaps land_at task pause task_state task_rev \
-             log_seq log_ep run turn step need need_since_ms gen seq hash"
+             log_seq log_ep run turn step need need_since_ms editing gen seq hash"
         ),
         "{observed}"
     );
@@ -1705,21 +1874,14 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     // OSC 7 is a separate question this fixture cannot ask.
     #[cfg(unix)]
     {
-        // HOME is process-global: the seamless tests point it at a scratch
-        // dir under ENV_LOCK, and this block reads it twice (the roots here,
-        // and the record's own consent check). Without the lock the two reads
-        // can see different homes and the token goes missing (seen
-        // 2026-10-11 in the round-fifteen land's gate: the cwd was under a
-        // seamless test's `conncarry` home, the record judged it against the
-        // real one).
-        let _env = crate::seamless::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The protected roots are RESOLVED DATA from the consent module —
         // this file writes no protected-folder literal of its own (rule B13).
-        let roots = aterm_containment::consent::protected_roots(&[]);
-        let Some(root) = roots.first() else {
-            return; // no $HOME resolved: nothing to assert against
+        // They are the App's published mirror, the same value the record's
+        // consent check reads, so a seamless test pointing the process-global
+        // HOME at a scratch dir cannot make the two disagree.
+        let policy = app.consent.policy();
+        let Some(root) = policy.protected_roots().first() else {
+            aterm_spec::host::could_not_run("no $HOME resolves here, so nothing is protected");
         };
         let cwd = root.join("aterm-consent-proof");
         {
@@ -2489,9 +2651,8 @@ fn the_status_record_carries_the_task_record() {
         "{none}"
     );
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-    let subscribers = crate::subscribe::new_registry();
-    mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Working), &subscribers).expect("unfenced");
-    mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Done), &subscribers).expect("unfenced");
+    mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    mark_session_task(&ctx, 0, &TaskMark::new(TaskState::Done)).expect("unfenced");
     let record = app.session_status_record(0).expect("live session");
     assert!(
         record.contains(" task=- pause=- task_state=done task_rev=2 log_seq="),
@@ -2533,4 +2694,61 @@ fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
     };
     assert!(record.contains(want), "{record}");
     assert_eq!(record.contains(" conpty="), cfg!(windows), "{record}");
+}
+
+/// ONE FOREGROUND READ PER LOOK. The group in front (`tcgetpgrp` on the PTY
+/// master, ~51k instructions per call on macOS) is read once, under the
+/// terminal hold, and the cwd witness, the job evidence and the program
+/// identity all take that answer: a sweep over N looked-at sessions asks the
+/// probe N times, however many readers each answer has, and the job verdict
+/// is the injected probe's. NEGATIVE CONTROL: the sweep as it was (a read
+/// under the hold, the job probe's own `tcgetpgrp`, and a third read for the
+/// program identity) asks the injected probe twice per look and fails the
+/// count, and its job verdict ignores the scripted group.
+#[test]
+fn a_look_reads_the_foreground_group_once() {
+    use std::cell::Cell;
+    thread_local! {
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+    // Groups no process holds: past every pid the kernel issues.
+    const SHELL: i32 = 2_000_000_201;
+    const JOB: i32 = 2_000_000_202;
+    /// The injected probe: a job in front of every session, counted.
+    fn counted(_master: i32) -> i32 {
+        READS.with(|r| r.set(r.get() + 1));
+        JOB
+    }
+    const STAGED: u64 = 8;
+    let mut app = crate::App::headless_for_test();
+    app.session_factory.fg_probe = counted;
+    for i in 0..STAGED {
+        let mut session = crate::stub_session(1000 + i);
+        // A descriptor number no file holds: the probe is scripted, and
+        // nothing below it touches the fd.
+        session.master = i32::MAX - i32::try_from(i).expect("small fixture");
+        session.pid = SHELL;
+        app.pool.insert(session);
+    }
+    let t0 = Instant::now();
+    let sweeps = 4u32;
+    for turn in 0..sweeps {
+        // One observation interval apart: every staged session is due.
+        let _ = app.observe_session_statuses(t0 + app.session_status.min_interval * turn);
+    }
+    assert_eq!(
+        READS.with(Cell::get),
+        STAGED * u64::from(sweeps),
+        "one foreground read per looked-at session per sweep"
+    );
+    for i in 0..STAGED {
+        assert_eq!(
+            app.session_status
+                .status(1000 + i)
+                .map(|s| s.phase.as_str()),
+            Some("quiet"),
+            "the job verdict is the read's: a group in front that is not the \
+             shell's, with no output, is a quiet job"
+        );
+    }
 }

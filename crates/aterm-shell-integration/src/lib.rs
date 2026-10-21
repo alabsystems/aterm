@@ -65,6 +65,21 @@ pub mod scripts {
     /// PowerShell / pwsh shell integration (OSC 7/133 + the readline key layer).
     pub const POWERSHELL: &str = include_str!("scripts/aterm_shell_integration.ps1");
 
+    /// What the zsh BODY sources from its own folder
+    /// (`aterm_shell_integration_old_bin.zsh`) once per shell where it reaches a
+    /// shell an older script loaded (`__aterm_old_bin_off` unset): AN OLDER
+    /// SCRIPT'S `~/.aterm/bin`, taken off. Apart from the body because no shell
+    /// this build starts runs it, and a fresh shell parses every line its body
+    /// holds: measured 2026-10-20 (bash 3.2.57, fish 4.9.3, a PTY, the captured
+    /// aterm spawn env, interleaved), in the body it cost a fresh bash about
+    /// 0.95 M of its 78 M instructions to the first prompt and a fresh fish
+    /// 0.45 M of 165 M; a zsh, which runs it compiled, little.
+    pub const ZSH_OLD_BIN: &str = include_str!("scripts/aterm_shell_integration_old_bin.zsh");
+    /// The bash twin of [`ZSH_OLD_BIN`].
+    pub const BASH_OLD_BIN: &str = include_str!("scripts/aterm_shell_integration_old_bin.bash");
+    /// The fish twin of [`ZSH_OLD_BIN`].
+    pub const FISH_OLD_BIN: &str = include_str!("scripts/aterm_shell_integration_old_bin.fish");
+
     /// The comment that opens the BODY of the zsh, bash and fish scripts:
     /// everything from the line it starts to
     /// the line [`BODY_END`] starts is the part a shell that is ALREADY RUNNING
@@ -856,11 +871,13 @@ fn ensure_cached(
 /// (`aterm_shell_integration_body.<ext>`, [`body_file`]): a running shell's
 /// loader sources it from a folder like this one when its host points it here.
 /// A body is part of the set, so it is part of the address, and a folder that
-/// names a body holds exactly the bytes that address says.
+/// names a body holds exactly the bytes that address says. So is the file each
+/// body sources from its own folder once per shell an older script loaded
+/// ([`scripts::ZSH_OLD_BIN`]).
 ///
 /// The zsh and bash loaders, and so their bodies, are written as the shell runs
 /// them: without their comment lines ([`installed_zsh`], [`installed_bash`]).
-fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 11] {
+fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 14] {
     [
         (
             "aterm_shell_integration.zsh",
@@ -882,6 +899,21 @@ fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 11] {
         (
             "aterm_shell_integration_body.fish",
             body_file(&lf_only(scripts::FISH)),
+        ),
+        // What each body sources once per shell an older script loaded
+        // ([`scripts::ZSH_OLD_BIN`]): read by so few shells that their comment
+        // lines stay.
+        (
+            "aterm_shell_integration_old_bin.zsh",
+            lf_only(scripts::ZSH_OLD_BIN),
+        ),
+        (
+            "aterm_shell_integration_old_bin.bash",
+            lf_only(scripts::BASH_OLD_BIN),
+        ),
+        (
+            "aterm_shell_integration_old_bin.fish",
+            lf_only(scripts::FISH_OLD_BIN),
         ),
         // No BOM on purpose: the script is ASCII-only so Windows PowerShell 5.1
         // (which decodes BOM-less source as ANSI) reads it correctly.

@@ -217,8 +217,8 @@ impl CursorGlow {
     /// `now` as the next tick's lazy decay will, plus the cadence credit this
     /// keystroke's echo is about to add. Pure read (see [`Self::cue_keystroke`]).
     ///
-    /// τ and gain come from the last drawing tick's snapshot (Fire's or a Trail
-    /// Pack's overrides included). A zero τ, unreachable behind `sound_live`,
+    /// τ and gain come from the last drawing tick's snapshot (Fire's overrides
+    /// included). A zero τ, unreachable behind `sound_live`,
     /// falls back to the standing heat instead of producing NaN.
     pub(super) fn keyed_blaze(&self, now: Instant) -> f32 {
         let (heat, flare) = self.cooled_blaze(now);

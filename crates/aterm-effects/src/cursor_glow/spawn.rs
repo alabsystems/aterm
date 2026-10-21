@@ -300,6 +300,52 @@ impl CursorGlow {
         now.saturating_duration_since(s.born).as_secs_f32() < s.life
     }
 
+    /// Fire's one-line rule (and the phaser's): every flame off the caret's
+    /// new row `cr` (and, after a leap back along it, right of the landing
+    /// `cc`) gutters out over [`Self::FLAME_SNUFF_S`], and every spark not
+    /// born on that row (all of them after a leap back) over
+    /// [`Self::SPARK_SNUFF_S`]: the line it flew over is printed text now
+    /// (an Enter at the bottom carries it onto the echoed command).
+    pub(super) fn snuff_off_line(
+        &mut self,
+        (cr, cc): (u16, u16),
+        back_leap: bool,
+        now: Instant,
+        geom: Geom,
+    ) {
+        let snuffed = |row: u16, col: u16| row != cr || (back_leap && col > cc.saturating_add(1));
+        for s in &mut self.sparks {
+            if snuffed(s.row, s.col) {
+                let age = now.saturating_duration_since(s.born).as_secs_f32();
+                s.life = s.life.min(age + Self::FLAME_SNUFF_S);
+            }
+        }
+        self.snuff_sparks_off_line(cr, back_leap, now, geom, Self::SPARK_SNUFF_S);
+    }
+
+    /// The flying half of [`Self::snuff_off_line`], for every style that
+    /// sheds grains: each one not born on the caret's new row `cr` (every
+    /// one after a leap back along it) goes out within `within_s` seconds
+    /// (a fire's sparks over [`Self::SPARK_SNUFF_S`], every other style's
+    /// grains at once).
+    pub(super) fn snuff_sparks_off_line(
+        &mut self,
+        cr: u16,
+        back_leap: bool,
+        now: Instant,
+        geom: Geom,
+        within_s: f32,
+    ) {
+        let (oy, chf) = (f32::from(geom.origin_y), geom.ch as f32);
+        for p in &mut self.particles {
+            let prow = ((p.y0 - oy) / chf).floor() as i32;
+            if prow != i32::from(cr) || back_leap {
+                let age = now.saturating_duration_since(p.born).as_secs_f32();
+                p.life = p.life.min(age + within_s);
+            }
+        }
+    }
+
     /// The per-move light: exactly one of the style arms (fire meteor, rainbow
     /// kitty jump, the navigation no-wake arm, the rainbow kitty backspace
     /// poof, or the swept comet/ribbon path). Returns how many hue steps this
@@ -341,6 +387,13 @@ impl CursorGlow {
         let water = matches!(cfg.style, GlowStyle::Water);
         let mut hue_advances: f32 = 1.0;
         if fire_meteor {
+            // A leap off the line (an Enter, which at the bottom of the pane
+            // arrives as a jump back along the same row) leaves no fire on
+            // the line it left, as the swept arm below does.
+            let back_leap = !typing && cc < pc && pr == cr;
+            if (dr_abs >= 1 || back_leap) && !reflow_licensed {
+                self.snuff_off_line((cr, cc), back_leap, now, geom);
+            }
             let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
             let (x1, y1) = geom.cell_center(cr, cc);
             // Multi-hop coalescing: shell repaints hop the cursor through parked
@@ -433,6 +486,17 @@ impl CursorGlow {
                     max_len,
                     false,
                 );
+                // A leap's trail starts past the cell it left: that cell was
+                // the caret's (a typed echo's origin holds the glyph just
+                // typed and keeps it), and a head laid there after the caret
+                // has gone stands as a stray mark after the line's last
+                // letter (a clipped half-disc, a dash).
+                if !echo_run
+                    && !typing
+                    && self.path_scratch.first() == Some(&(pr as i32, pc as i32))
+                {
+                    self.path_scratch.remove(0);
+                }
             }
             // Fire stays on one line: a row change (Enter, wrap, arrow down, a
             // click) leaves no fire on the line you left. The swept path keeps
@@ -459,9 +523,6 @@ impl CursorGlow {
                 && !phaser_wrap_follow
                 && !reflow_licensed
             {
-                /// Seconds an off-line flame gets to gutter out after the
-                /// cursor leaves it behind.
-                const SNUFF: f32 = 0.18;
                 if fire_back_leap || matches!(cfg.style, GlowStyle::Phaser) {
                     // The phaser keeps no landing segment on a row change: the
                     // band belongs to typed letters only.
@@ -469,23 +530,7 @@ impl CursorGlow {
                 } else {
                     self.path_scratch.retain(|&(r, _)| r == cr as i32);
                 }
-                let chf = geom.ch as f32;
-                let snuffed = |row: u16, col: u16| {
-                    row != cr || (fire_back_leap && col > cc.saturating_add(1))
-                };
-                for s in &mut self.sparks {
-                    if snuffed(s.row, s.col) {
-                        let age = now.saturating_duration_since(s.born).as_secs_f32();
-                        s.life = s.life.min(age + SNUFF);
-                    }
-                }
-                for p in &mut self.particles {
-                    let prow = (p.y0 / chf) as i32;
-                    if prow != cr as i32 || fire_back_leap {
-                        let age = now.saturating_duration_since(p.born).as_secs_f32();
-                        p.life = p.life.min(age + SNUFF);
-                    }
-                }
+                self.snuff_off_line((cr, cc), fire_back_leap, now, geom);
             }
             if !self.path_scratch.is_empty() {
                 // A coalesced typing run treats every swept cell as a typed head.
@@ -565,8 +610,40 @@ impl CursorGlow {
         hue_advances
     }
 
+    /// Admit one lightning onset at `now` (a jump strike, or a typing crackle
+    /// when `crackle`), recording it when admitted: lightning's flash limiter.
+    ///
+    /// Each bolt flashes once ([`bolt_flash`]), so bounding onsets bounds the
+    /// flashes any pixel sees. An onset is refused while the last
+    /// [`Self::BOLT_FLASHES_PER_S`] onsets all fell within the past second, so
+    /// no closed one-second window ever holds more than that many, wherever
+    /// the bolts land. A crackle is also refused within
+    /// [`Self::CRACKLE_REFRACTORY_S`] of the previous onset, which leaves a
+    /// jump strike its slot however hot the typing. A local limiter, not the
+    /// window-wide nova budget: crackles and novas must not starve each other.
+    pub(super) fn admit_bolt(&mut self, now: Instant, crackle: bool) -> bool {
+        #[cfg(test)]
+        if self.bolts_unlimited {
+            return true;
+        }
+        let age = |t: Instant| now.saturating_duration_since(t).as_secs_f32();
+        let n = Self::BOLT_FLASHES_PER_S;
+        let oldest = self.bolt_onsets[self.bolt_onset_next];
+        if oldest.is_some_and(|t| age(t) <= 1.0) {
+            return false;
+        }
+        let last = self.bolt_onsets[(self.bolt_onset_next + n - 1) % n];
+        if crackle && last.is_some_and(|t| age(t) < Self::CRACKLE_REFRACTORY_S) {
+            return false;
+        }
+        self.bolt_onsets[self.bolt_onset_next] = Some(now);
+        self.bolt_onset_next = (self.bolt_onset_next + 1) % n;
+        true
+    }
+
     /// Laser: a jump forges a strike along the jump vector; sustained hot
-    /// typing crackles short stray arcs off the charged trail.
+    /// typing crackles short stray arcs off the charged trail. Both pass
+    /// lightning's flash limiter ([`Self::admit_bolt`]).
     pub(super) fn spawn_lightning(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             pr,
@@ -588,14 +665,19 @@ impl CursorGlow {
         if matches!(cfg.style, GlowStyle::Laser) && !navigation {
             let chf = geom.ch as f32;
             if dist >= 2.0 {
-                self.spawn_bolt(
-                    geom.cell_center(pr, pc),
-                    geom.cell_center(cr, cc),
-                    chf,
-                    true,
-                    now,
-                );
-            } else if self.heat > 0.30 && self.frand() < 0.18 + 0.55 * self.heat {
+                if self.admit_bolt(now, false) {
+                    self.spawn_bolt(
+                        geom.cell_center(pr, pc),
+                        geom.cell_center(cr, cc),
+                        chf,
+                        true,
+                        now,
+                    );
+                }
+            } else if self.heat > 0.30
+                && self.frand() < 0.18 + 0.55 * self.heat
+                && self.admit_bolt(now, true)
+            {
                 // Crackle: a short stray arc in a random direction, only while
                 // hot, rooted at a random live typing spark among the last
                 // [`Self::CRACKLE_TRAIL_CELLS`], so the residual charge sparks
@@ -682,8 +764,29 @@ impl CursorGlow {
             geom,
             dist,
             navigation,
+            dr_abs,
+            typing,
             ..
         } = mv;
+        // A leap off the line (an Enter, which at the bottom of the pane
+        // arrives as a jump back along the same row) leaves the line it left
+        // printed text: the grains the run shed there go out at once, and the
+        // leap's own are born from a cell and a half along it, so none
+        // gathers on the cell the caret left after the line's last letter.
+        let leaves_line = dist >= 2.0 && (dr_abs >= 1 || (!typing && cc < pc && pr == cr));
+        if leaves_line && cfg.style.has_particles() && !matches!(cfg.style, GlowStyle::Fire) {
+            self.snuff_sparks_off_line(cr, true, now, geom, 0.0);
+        }
+        let leap_from = {
+            let (fx, fy) = geom.cell_center(pr, pc);
+            let (tx, ty) = geom.cell_center(cr, cc);
+            let k = if leaves_line {
+                (Self::LEAP_BIRTH_SKIP_CELLS / dist.max(1.0)).min(0.5)
+            } else {
+                0.0
+            };
+            (fx + (tx - fx) * k, fy + (ty - fy) * k)
+        };
         // Particles (sparkle / fire / water / laser): a burst scaled by jump
         // distance, or by heat when typing (a lone key sheds one ember or
         // droplet, a fast run a shower). Water has the widest range. Fire
@@ -769,7 +872,7 @@ impl CursorGlow {
                         // On a jump each ember is born along the leap (`r0` walks
                         // the vector), so the whole path catches fire.
                         let (bx, by) = if dist >= 2.0 {
-                            let (fx, fy) = geom.cell_center(pr, pc);
+                            let (fx, fy) = leap_from;
                             (fx + (ox - fx) * r0, fy + (oy - fy) * r0)
                         } else {
                             (ox + (r0 - 0.5) * geom.cw as f32, oy)
@@ -933,7 +1036,7 @@ impl CursorGlow {
                         let (bx, by) = if dist >= 2.0 {
                             // Window-absolute like `ox`/`oy`, so motes follow the
                             // real leap; adds 0.0 at origin (0,0).
-                            let (fx, fy) = geom.cell_center(pr, pc);
+                            let (fx, fy) = leap_from;
                             (
                                 fx + (ox - fx) * r0,
                                 fy + (oy - fy) * r0 + (r1 - 0.5) * 0.8 * cell,
@@ -963,7 +1066,7 @@ impl CursorGlow {
                         // swept vector. Window-absolute like `ox`/`oy`, so the
                         // drift vector below trails the real motion (adds 0.0 at
                         // origin (0,0)).
-                        let (fx, fy) = geom.cell_center(pr, pc);
+                        let (fx, fy) = leap_from;
                         let (bx, by) = if dist >= 2.0 {
                             // r0 walks the leap vector; grains sit ON the tail.
                             (fx + (ox - fx) * r0, fy + (oy - fy) * r0)
@@ -1004,7 +1107,7 @@ impl CursorGlow {
                         let a = r0 * std::f32::consts::TAU;
                         let speed = (0.35 + r1 * 1.3) * cell;
                         let (bx, by) = if dist >= 2.0 {
-                            let (fx, fy) = geom.cell_center(pr, pc);
+                            let (fx, fy) = leap_from;
                             (
                                 fx + (ox - fx) * r2,
                                 fy + (oy - fy) * r2 + (r4 - 0.5) * 0.6 * cell,
@@ -1037,7 +1140,7 @@ impl CursorGlow {
                         let a = r0 * std::f32::consts::TAU;
                         let speed = (0.4 + r1 * 1.6) * cell;
                         let (bx, by) = if dist >= 2.0 {
-                            let (fx, fy) = geom.cell_center(pr, pc);
+                            let (fx, fy) = leap_from;
                             (
                                 fx + (ox - fx) * r2,
                                 fy + (oy - fy) * r2 + (r4 - 0.5) * 0.6 * cell,
@@ -1065,6 +1168,16 @@ impl CursorGlow {
             }
         }
     }
+
+    /// A jump strike's main channel's shortest life, seconds: one flash that
+    /// is out well inside 120 ms (an Enter at the bottom strikes up through
+    /// the lines it just printed, and a strike that held a sixth of a second
+    /// read as a white bar over them, not a flash).
+    pub(super) const STRIKE_LIFE_S: f32 = 0.07;
+    /// A strike's forks' shortest life, seconds: they go out first.
+    pub(super) const FORK_LIFE_S: f32 = 0.05;
+    /// How much longer than its floor a strike or fork may live, seconds.
+    pub(super) const STRIKE_LIFE_SPREAD_S: f32 = 0.03;
 
     /// Forge one lightning bolt from `from` to `to`: midpoint-displacement
     /// jagging (amplitude halving each round) frozen at spawn, so the strike
@@ -1136,28 +1249,27 @@ impl CursorGlow {
                 let bolt = Bolt {
                     pts: vec![root, mid, tip],
                     born: now,
-                    life: 0.16 + self.frand() * 0.10,
-                    seed: self.frand(),
+                    life: Self::FORK_LIFE_S + self.frand() * Self::STRIKE_LIFE_SPREAD_S,
                     branch: true,
+                    crackle: false,
                 };
                 self.push_bolt(bolt);
             }
         }
         let life = if big {
-            0.30 + self.frand() * 0.14
+            Self::STRIKE_LIFE_S + self.frand() * Self::STRIKE_LIFE_SPREAD_S
         } else {
             0.14 + self.frand() * 0.08
         };
-        let seed = self.frand();
         self.push_bolt(Bolt {
             // The one buffer a `Bolt` owns; the jag's scratches return to the
             // pool on the next line.
             pts: pts.clone(),
             born: now,
             life,
-            seed,
             // Crackle arcs (small strikes off the typing head) render thin.
             branch: !big,
+            crackle: !big,
         });
         self.bolt_jag = (pts, next);
     }
@@ -1191,8 +1303,11 @@ impl CursorGlow {
             let r2 = self.frand();
             let r3 = self.frand();
             let r4 = self.frand();
-            // sqrt-skewed births: debris concentrates toward the impact.
-            let t = r0.sqrt();
+            // Debris is born over the impact's last third, concentrated
+            // toward it: the strike throws sparks where it lands, not back
+            // over the line it left (an Enter's leap starts on the command
+            // it just printed, under that line's decorations).
+            let t = 1.0 - Self::STRIKE_DEBRIS_REACH * (1.0 - r0.sqrt());
             let speed = (1.6 + 1.6 * m.mom) * cell * (0.4 + 0.6 * r2);
             self.particles.push(Particle {
                 x0: m.x0 + dx * t,
@@ -1384,9 +1499,15 @@ impl CursorGlow {
             self.bs_poof_hint = None;
             self.bs_baseline = None;
         }
-        // Rotate only when a fresh probe arrived this frame; an unprobed frame
-        // keeps the previous truth. The content witnesses' neighbour captures
-        // rotate with it, so metadata and buffers stay one unit.
+        self.rotate_row_probe();
+    }
+
+    /// Make this frame's row probe the one the emitters read
+    /// ([`Self::probed_text_spans`]). Rotate only when a fresh probe arrived
+    /// this frame; an unprobed frame keeps the previous truth. The content
+    /// witnesses' neighbour captures rotate with it, so metadata and buffers
+    /// stay one unit.
+    pub(super) fn rotate_row_probe(&mut self) {
         if self.row_cur_meta.is_some() {
             std::mem::swap(&mut self.row_prev, &mut self.row_cur);
             std::mem::swap(&mut self.row_above_prev, &mut self.row_above_cur);
@@ -1690,8 +1811,9 @@ impl CursorGlow {
     /// ([`Self::update_typing_thermals`]) and a killed span
     /// ([`Self::spawn_poof`]): `puffs` billowing puffs born at `x_at(k)` (±
     /// half a cell `cw`) on `oy`, every third a tiny bright short-lived hiss
-    /// speck. Expands fast, stalls under drag, dies young; bounded by
-    /// `MAX_VAPOR`.
+    /// speck. Expands fast, stalls under drag within about a third of a cell
+    /// (the cloud billows over the doused text, not onto the line above), dies
+    /// young; bounded by `MAX_VAPOR`.
     pub(super) fn spawn_quench_steam(
         &mut self,
         puffs: usize,
@@ -1711,7 +1833,7 @@ impl CursorGlow {
                 x0: x_at(k) + (r0 - 0.5) * cw,
                 y0: oy,
                 vx: (r1 - 0.5) * (if hiss { 1.6 } else { 0.5 }) * cell,
-                vy: -(0.9 + 0.7 * r2) * cell * (if hiss { 1.6 } else { 1.0 }),
+                vy: -(0.5 + 0.5 * r2) * cell * (if hiss { 1.6 } else { 1.0 }),
                 gy: 1.4 * cell, // drag: the rise stalls (steam disperses)
                 life: if hiss {
                     0.16 + 0.1 * r0
@@ -1725,3 +1847,22 @@ impl CursorGlow {
         }
     }
 }
+
+/// Lightning's flash law, checked at build time: the onset budget is within
+/// the crate's photosensitivity bound, and the crackle refractory leaves a
+/// second's last slot to a jump strike (crackles alone fill at most
+/// `BOLT_FLASHES_PER_S - 1`), which also holds them above one every third of
+/// a second.
+const _: () = assert!(
+    CursorGlow::BOLT_FLASHES_PER_S as f32 <= TWINKLE_FLASH_BOUND_HZ
+        && CursorGlow::CRACKLE_REFRACTORY_S > 1.0 / TWINKLE_FLASH_BOUND_HZ
+        && CursorGlow::CRACKLE_REFRACTORY_S * (CursorGlow::BOLT_FLASHES_PER_S - 1) as f32 > 1.0,
+    "lightning left the WCAG 2.3.1 flash envelope"
+);
+
+/// The laser streak's scintillation swells once per cycle; its rate stays
+/// under the same bound.
+const _: () = assert!(
+    CursorGlow::LASER_RIPPLE_OMEGA / std::f32::consts::TAU <= TWINKLE_FLASH_BOUND_HZ,
+    "the laser ripple flashes over the WCAG 2.3.1 general-flash bound"
+);

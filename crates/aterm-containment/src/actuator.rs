@@ -1065,9 +1065,12 @@ mod tests {
     /// PROOF 7 (TASK PORTS, FULL generated Containment profile) — a contained
     /// process cannot take any task port — control, read, inspect or name — of a
     /// process outside the sandbox (the `lldb`/`debugserver` escape, silent once
-    /// macOS developer mode is on), and keeps its own. The target is an ad-hoc copy of `/bin/sleep` signed with
-    /// `get-task-allow`, the one kind of target an unentitled requester is granted
-    /// with no prompt; the requester is this test binary, which carries no
+    /// macOS developer mode is on), and keeps its own. The target is an ad-hoc copy
+    /// of `/bin/cat` signed with `get-task-allow`, the one kind of target an
+    /// unentitled requester is granted with no prompt; its echo of a line is the
+    /// proof it runs, past macOS's assessment of the new file's first exec, and
+    /// until then its directory stays (`aterm_uds::deadline::KeptUntilRan`). The
+    /// requester is this test binary, which carries no
     /// debugger entitlement, so no path here is meant to raise the administrator
     /// dialog — but one did: on 2026-09-30, on a machine with developer mode off,
     /// the probe sat under an open SecurityAgent prompt until it was killed. So
@@ -1091,10 +1094,13 @@ mod tests {
             }
         }
 
-        let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        let sleeper = dir.path().join("sleep");
+        // Declared before the target, so dropped after it is killed and reaped.
+        let mut dir = aterm_uds::deadline::KeptUntilRan::new(
+            aterm_tempfile::tempdir().expect("scratch dir").keep(),
+        );
+        let catter = dir.path().join("cat");
         let entitlements = dir.path().join("get-task-allow.plist");
-        std::fs::copy("/bin/sleep", &sleeper).expect("copy /bin/sleep");
+        std::fs::copy("/bin/cat", &catter).expect("copy /bin/cat");
         std::fs::write(
             &entitlements,
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1110,7 +1116,7 @@ mod tests {
             aterm_uds::spawnfd::command("/usr/bin/codesign")
                 .args(["--force", "--sign", "-", "--entitlements"])
                 .arg(&entitlements)
-                .arg(&sleeper),
+                .arg(&catter),
             std::time::Instant::now() + aterm_uds::deadline::CODESIGN_HANG,
         )
         .expect("run codesign");
@@ -1119,12 +1125,16 @@ mod tests {
             "ad-hoc signing the target failed: {}",
             String::from_utf8_lossy(&signed.stderr)
         );
-        let target = Target(
-            aterm_uds::spawnfd::command(&sleeper)
-                .arg("60")
+        let mut target = Target(
+            aterm_uds::spawnfd::command(&catter)
+                .stdin(aterm_uds::spawnfd::Stdio::piped())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
                 .spawn()
                 .expect("start the target"),
         );
+        // It runs until this is dropped (before the target: EOF, then the kill and reap).
+        let _fed = aterm_uds::deadline::cat_echoes(&mut target.0);
+        dir.ran();
         let exe = std::env::current_exe().expect("this test binary");
         let probe = |profile: &str| {
             let exe = exe.to_str().expect("utf8 test binary path");
@@ -1544,7 +1554,11 @@ mod tests {
     /// build`. Each runs in a scratch directory under `$TMPDIR`, the one place a
     /// contained build may write. Every case this machine can run runs and must
     /// hold; then, if any case needs a tool this machine lacks, the test ends
-    /// COULD NOT RUN naming each one, never a pass over a skipped tool.
+    /// COULD NOT RUN naming each one, never a pass over a skipped tool. Three
+    /// cases run a new Mach-O they made there (a copy of `ls`, a clang build, a
+    /// targo build), which macOS assesses at its first exec: a case its hang
+    /// detector killed leaves the directory in place
+    /// (`aterm_uds::deadline::KeptUntilRan`).
     ///
     /// Not here, by decision (`docs/HARDCORE_BACKLOG.md` P1): `security`'s
     /// keychain listing (the security daemon is refused), `curl` to a loopback
@@ -1570,7 +1584,11 @@ mod tests {
                 let _ = std::fs::copy(std::path::Path::new(&real).join(rc), home.join(rc));
             }
         }
-        let work = aterm_tempfile::tempdir().expect("a scratch directory under $TMPDIR");
+        let mut work = aterm_uds::deadline::KeptUntilRan::new(
+            aterm_tempfile::tempdir()
+                .expect("a scratch directory under $TMPDIR")
+                .keep(),
+        );
         let temp = std::env::temp_dir();
         let profile =
             crate::sbpl::profile_for_home(home.to_str(), Some(&temp), FsCapability::TmpOnly);
@@ -1743,6 +1761,9 @@ mod tests {
         let mut failures = Vec::new();
         let mut lacking = Vec::new();
         let mut ran = 0;
+        // Whether a case's shell was killed (or not waited for) before it ended, a program it
+        // started from `work` with it.
+        let mut cut_short = false;
         for (what, needs, script, expect) in &cases {
             if let Some(reason) = lacks(needs) {
                 lacking.push(format!("{what}: {reason}"));
@@ -1760,8 +1781,15 @@ mod tests {
                         ));
                     }
                 }
-                Err(e) => failures.push(format!("{what}: {e:?}")),
+                Err(e) => {
+                    cut_short = true;
+                    failures.push(format!("{what}: {e:?}"));
+                }
             }
+        }
+        if !cut_short {
+            // Every case's shell ended on its own, and every program it started with it.
+            work.ran();
         }
         let _ = std::fs::remove_dir_all(&home);
         eprintln!("TOOLSET ran {ran} of {}", cases.len());

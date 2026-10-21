@@ -9,8 +9,10 @@
 //! A poke removes nothing: it asks for a measurement. What a pass then
 //! removes is decided by the measured free figure and the watch's
 //! witnesses, so a misread screen costs one `statvfs` and nothing else.
-//! The host registers the one handler ([`set_handler`]); without one a poke
-//! is only remembered ([`last`]), for `aterm harness disk` to show.
+//! The host registers the one handler ([`set_handler`]); without one (a
+//! process with no disk watch: the CLI) a poke does nothing. What the watch
+//! makes of a screen's poke is journalled into `disk.jsonl` by the host
+//! (`cli::disk_poke_journal`), where `aterm harness disk` reads it.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -55,17 +57,15 @@ impl Cause {
 pub type Handler = Arc<dyn Fn(&Cause) + Send + Sync>;
 
 static HANDLER: Mutex<Option<Handler>> = Mutex::new(None);
-static LAST: Mutex<Option<(Cause, i64)>> = Mutex::new(None);
 
 /// Register the one handler (the window's disk watch), replacing any.
 pub fn set_handler(handler: Handler) {
     *HANDLER.lock().unwrap_or_else(PoisonError::into_inner) = Some(handler);
 }
 
-/// Ask the disk watch to look now, for `cause`, at `now` (unix seconds).
-/// Remembered for [`last`]; handed to the handler when one is registered.
-pub fn poke(cause: Cause, now: i64) {
-    *LAST.lock().unwrap_or_else(PoisonError::into_inner) = Some((cause.clone(), now));
+/// Ask the disk watch to look now, for `cause`: handed to the handler when
+/// one is registered, and nothing otherwise.
+pub fn poke(cause: Cause) {
     let handler = HANDLER
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -73,21 +73,6 @@ pub fn poke(cause: Cause, now: i64) {
     if let Some(h) = handler {
         h(&cause);
     }
-}
-
-/// [`poke`] at the system's now: for a writer with no clock of its own to
-/// hand, the supervisor's journal ([`crate::supervise::Journal`]). Its loop
-/// reads every clock through its `Fx` door, and a poke's arrival time is not
-/// one of them: it is the host's, handed to the host's handler, and the loop
-/// never observes it — so it is read here, outside the loop's source.
-pub fn poke_now(cause: Cause) {
-    poke(cause, crate::supervise::journal::unix_ms() / 1000);
-}
-
-/// The last poke and when it came, if any.
-#[must_use]
-pub fn last() -> Option<(Cause, i64)> {
-    LAST.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 /// Is `e` the file system saying it is out of space or quota (`ENOSPC`,

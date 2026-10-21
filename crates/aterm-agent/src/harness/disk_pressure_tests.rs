@@ -85,11 +85,15 @@ fn surveyed_with(
 
 /// The real remover at `now`, on any device (a pressure row carries its own).
 fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
-    remover(Judge {
-        now,
-        threshold_days: DEFAULT_TARGET_STALE_DAYS,
-        device: None,
-    })
+    remover(
+        Judge {
+            now,
+            threshold_days: DEFAULT_TARGET_STALE_DAYS,
+            device: None,
+            volume: None,
+        },
+        idle::Sessions::default,
+    )
 }
 
 /// A re-measure that answers `script` in turn (its last figure after that),
@@ -536,11 +540,15 @@ fn with_a_zero_day_window_a_profile_built_minutes_ago_is_still_never_taken() {
     let done = apply_auto(
         &rep,
         survey.transcripts_root.as_deref(),
-        &mut remover(Judge {
-            now,
-            threshold_days: 0,
-            device: None,
-        }),
+        &mut remover(
+            Judge {
+                now,
+                threshold_days: 0,
+                device: None,
+                volume: None,
+            },
+            idle::Sessions::default,
+        ),
         &mut || Some(GIB),
         &mut |_| true,
     )
@@ -562,6 +570,7 @@ fn with_a_zero_day_window_a_profile_built_minutes_ago_is_still_never_taken() {
             now,
             threshold_days: 0,
             device: None,
+            volume: None,
         },
     )
     .expect_err("a minute old, under its locks too");

@@ -124,29 +124,76 @@
 //! a stopped member outside the session leader's process tree (reparented
 //! away) is not seen.
 
-/// One foreground change inside a gathered batch.
+/// One foreground change inside a gathered batch: the group in front changed
+/// ([`EdgeKind::Group`]), or its leader replaced its image in place
+/// ([`EdgeKind::Exec`], `from == to`; card engine §3.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FgEdge {
-    /// Byte offset in the batch at which the handback runs: after every byte
-    /// the old group wrote, before any byte the new group wrote.
+    /// Byte offset in the batch at which the handback runs and the old
+    /// holder's run ends: after every byte the old group (or image) wrote,
+    /// before any byte the new one wrote.
     pub(crate) at: usize,
+    /// Where the new holder's run begins, at or after `at`: `at` for a sampled
+    /// edge; for one a process event found, the offset of the poll that heard
+    /// it. The bytes between may be either image's (an `exec`'s new image can
+    /// write and be read before a poll hears the event, and its process can
+    /// write before the `exec`), so they are admitted to no holder.
+    pub(crate) lay: usize,
     /// The foreground group that lost the terminal.
     pub(crate) from: i32,
     /// The foreground group that holds it now.
     pub(crate) to: i32,
+    /// How the edge was found.
+    pub(crate) kind: crate::holder_image::EdgeKind,
+}
+
+impl FgEdge {
+    /// A sampled group change cut at `at`.
+    pub(crate) const fn group(at: usize, from: i32, to: i32) -> Self {
+        Self {
+            at,
+            lay: at,
+            from,
+            to,
+            kind: crate::holder_image::EdgeKind::Group,
+        }
+    }
+}
+
+/// One process event as the gather heard it (`aterm_uds::procwatch`): the
+/// process that `exec`ed, its group, and the foreground group sampled at the
+/// event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcSeen {
+    /// The process that replaced its image.
+    pub(crate) pid: i32,
+    /// Its group (`0`: gone before it was read).
+    pub(crate) pgid: i32,
+    /// `tcgetpgrp(master)` at the event.
+    pub(crate) fg: i32,
 }
 
 /// Turns the gather's foreground samples into at most one [`FgEdge`] per batch.
 ///
 /// `running` is the last valid sample (`0` = none yet); `cut` is the offset in
 /// the current batch at which a sample last equalled `running`.
+///
+/// With a process watch (card engine §3.3) it also keeps `clean`: the offset
+/// up to which every byte was read before a poll that found the watch quiet,
+/// so no watched process had `exec`ed when those bytes were read and none of
+/// them is a new image's. A pre-park sample's offset (`parked`) becomes clean
+/// when its park ends without the watch; a watch drained with no edge makes
+/// its own offset clean. Without a watch nothing reads `clean`.
 // Only the unix gather samples a foreground group (ConPTY has none), so on
 // Windows the cutter is compiled but never constructed.
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct FgCutter {
     running: i32,
     cut: usize,
+    clean: usize,
+    parked: Option<usize>,
     edge: Option<FgEdge>,
 }
 
@@ -160,14 +207,33 @@ impl FgCutter {
         Self {
             running: first.max(0),
             cut: 0,
+            clean: 0,
+            parked: None,
             edge: None,
         }
     }
 
-    /// Start a new batch: nothing read yet, no edge.
+    /// Start a new batch: nothing read yet, no edge. The poll that began it
+    /// heard the watch first, so its first byte is clean.
     pub(crate) fn begin(&mut self) {
         self.cut = 0;
+        self.clean = 0;
+        self.parked = None;
         self.edge = None;
+    }
+
+    /// The park after the last pre-park sample ended without the watch: that
+    /// sample's offset is clean.
+    fn settle(&mut self) {
+        if let Some(parked) = self.parked.take() {
+            self.clean = parked;
+        }
+    }
+
+    /// Whether this batch already carries its one edge (a process event heard
+    /// now waits for the next batch, or goes byte-free after this one).
+    pub(crate) fn carries_edge(&self) -> bool {
+        self.edge.is_some()
     }
 
     /// A sample `fg` taken after `filled` bytes of this batch were read.
@@ -182,10 +248,21 @@ impl FgCutter {
             project = "spawn::foreground_handback_conformance::project_ownership"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "foreground_handback",
+            action = "Park",
+            project = "foreground_handback::exec_conformance::project_exec"
+        )
+    )]
     pub(crate) fn sample(&mut self, fg: i32, filled: usize) -> bool {
+        self.settle();
         if self.edge.is_some() {
             return true;
         }
+        // A park follows every sample that does not deliver.
+        self.parked = Some(filled);
         if fg <= 0 {
             return false; // no information (tcgetpgrp failed, no foreground group)
         }
@@ -194,21 +271,122 @@ impl FgCutter {
             self.cut = filled;
             return false;
         }
-        self.edge = Some(FgEdge {
-            at: self.cut,
-            from: self.running,
-            to: fg,
-        });
+        self.parked = None;
+        self.edge = Some(FgEdge::group(self.cut, self.running, fg));
         self.running = fg;
         true
     }
 
+    /// Which edge a process event would be, before any image is read:
+    /// [`EdgeKind::Group`](crate::holder_image::EdgeKind::Group) when the
+    /// foreground sampled at the event names the `exec`ed process's group and
+    /// that is not the running one; [`EdgeKind::Exec`](crate::holder_image::EdgeKind::Exec)
+    /// when the running group is still in front and the process is its leader
+    /// (the shell's own `exec` at its prompt is one: the shell leads its
+    /// group). Anything else (a member that is no leader, a group in the
+    /// background, a gone process) is no edge: today's sampled cut covers it.
+    pub(crate) fn proc_kind(&self, ev: &ProcSeen) -> Option<crate::holder_image::EdgeKind> {
+        use crate::holder_image::EdgeKind;
+        if self.running <= 0 || ev.pgid <= 0 || ev.fg <= 0 {
+            return None;
+        }
+        if ev.fg == ev.pgid && ev.fg != self.running {
+            return Some(EdgeKind::Group);
+        }
+        (ev.fg == self.running && ev.pid == self.running).then_some(EdgeKind::Exec)
+    }
+
+    /// A process event heard after `filled` bytes of this batch were read: at
+    /// a park the watch ended, or before the batch's first byte. `relevant`
+    /// is asked, once, for a candidate's kind and new group; it reads that
+    /// group's image at the event and answers whether the edge enters or
+    /// leaves a card-relevant one (everything else folds into the sampled cut).
+    /// Returns `true` when the batch must be delivered NOW: it carries the edge.
+    ///
+    /// A Group edge cuts at `cut`, the last sample that still showed the old
+    /// group, as a sampled one would. An Exec edge cuts at `clean`, the last
+    /// offset no `exec` can have preceded: cutting at `filled`, the poll that
+    /// heard it, would hand the new image's first bytes, read in the spin
+    /// before that poll, to the old one (`ForegroundHandback`'s
+    /// `ExecCutBlind`). Either way the new holder's run begins at `filled`
+    /// (`FgEdge::lay`): the bytes between are admitted to no holder.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "foreground_handback",
+            action = "ObserveExec",
+            project = "foreground_handback::exec_conformance::project_exec"
+        )
+    )]
+    pub(crate) fn proc_seen(
+        &mut self,
+        ev: ProcSeen,
+        filled: usize,
+        relevant: impl FnOnce(crate::holder_image::EdgeKind, i32) -> bool,
+    ) -> bool {
+        use crate::holder_image::EdgeKind;
+        // The park after the last sample heard the watch: that sample's
+        // offset is not clean.
+        self.parked = None;
+        if self.edge.is_some() {
+            return true;
+        }
+        let Some(kind) = self.proc_kind(&ev) else {
+            return false;
+        };
+        let to = match kind {
+            EdgeKind::Group => ev.fg,
+            EdgeKind::Exec => self.running,
+        };
+        if !relevant(kind, to) {
+            return false;
+        }
+        let at = match kind {
+            EdgeKind::Group => self.cut,
+            EdgeKind::Exec => self.clean,
+        };
+        self.edge = Some(FgEdge {
+            at,
+            lay: filled.max(at),
+            from: self.running,
+            to,
+            kind,
+        });
+        self.running = to;
+        true
+    }
+
+    /// The watch was drained after `filled` bytes and none of its events was
+    /// an edge: every `exec` up to now was heard (and folded), so every byte
+    /// read so far is clean.
+    pub(crate) fn proc_drained(&mut self, filled: usize) {
+        if self.edge.is_none() {
+            self.clean = self.clean.max(filled);
+        }
+    }
+
+    /// This batch's edge, if any, with no batch-end sample: a byte-free
+    /// edge's (no byte was read, so there is nothing a sample could cut).
+    pub(crate) fn take_edge(&mut self) -> Option<FgEdge> {
+        self.parked = None;
+        self.edge.take()
+    }
+
     /// The batch-end sample (taken only when no park sample already found an
     /// edge) and this batch's edge, if any.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "foreground_handback",
+            action = "Deliver",
+            project = "foreground_handback::exec_conformance::project_exec"
+        )
+    )]
     pub(crate) fn finish(&mut self, fg: impl FnOnce() -> i32, filled: usize) -> Option<FgEdge> {
         if self.edge.is_none() {
             self.sample(fg(), filled);
         }
+        self.parked = None;
         self.edge.take()
     }
 
@@ -687,11 +865,10 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
             buffersize: libc::c_int,
         ) -> libc::c_int;
     }
-    /// `SSTOP` from `<sys/proc.h>` (`SIDL 1, SRUN 2, SSLEEP 3, SSTOP 4, SZOMB
-    /// 5`; the shim carries `SZOMB` alone). Pinned by
+    /// `SSTOP` from `<sys/proc.h>`. Pinned by
     /// `foreground_handback_a_stopped_member_of_a_leaderless_group_is_seen`,
     /// which stops a real process and reads it back.
-    const SSTOP: u32 = 4;
+    const SSTOP: u32 = aterm_uds::process::BsdShortInfo::SSTOP;
     /// A foreground job with more members than this is not one a terminal
     /// runs; past it the listing is read as far as it goes.
     const MAX_MEMBERS: usize = 4096;
@@ -718,36 +895,6 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
         .any(|pid| darwin_member_status(pid) == Some((SSTOP, pgid)))
 }
 
-/// `PROC_PIDT_SHORTBSDINFO` (`<sys/proc_info.h>`). Declared here, as
-/// `aterm-sysprobe` declares its own private copy, rather than in the
-/// first-party `libc` shim, which is generated and conformance-checked and
-/// whose reference `libc` does not export it.
-#[cfg(target_os = "macos")]
-const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
-
-/// `struct proc_bsdshortinfo` (`<sys/proc_info.h>`), 64 bytes.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ProcBsdShortInfo {
-    pbsi_pid: u32,
-    pbsi_ppid: u32,
-    pbsi_pgid: u32,
-    pbsi_status: u32,
-    pbsi_comm: [u8; 16],
-    pbsi_flags: u32,
-    pbsi_uid: u32,
-    pbsi_gid: u32,
-    pbsi_ruid: u32,
-    pbsi_rgid: u32,
-    pbsi_svuid: u32,
-    pbsi_svgid: u32,
-    pbsi_rfu: u32,
-}
-
-#[cfg(target_os = "macos")]
-const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
-
 /// macOS: one process's `(p_stat, pgid)`, `None` when it cannot be read (it
 /// exited mid-walk).
 ///
@@ -761,25 +908,7 @@ const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
 /// `foreground_handback_another_users_member_status_reads_back`.
 #[cfg(target_os = "macos")]
 fn darwin_member_status(pid: i32) -> Option<(u32, i32)> {
-    const SIZE: libc::c_int = std::mem::size_of::<ProcBsdShortInfo>() as libc::c_int;
-    let mut info = std::mem::MaybeUninit::<ProcBsdShortInfo>::uninit();
-    // SAFETY: `info` points at `SIZE` writable bytes of exactly the
-    // structure PROC_PIDT_SHORTBSDINFO fills (size asserted above); libproc
-    // returns the bytes written.
-    let read = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDT_SHORTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            SIZE,
-        )
-    };
-    if read != SIZE {
-        return None;
-    }
-    // SAFETY: the exact-size success above initialized the whole record.
-    let info = unsafe { info.assume_init() };
+    let info = aterm_uds::process::read_short_info(pid)?;
     Some((info.pbsi_status, i32::try_from(info.pbsi_pgid).ok()?))
 }
 
@@ -829,14 +958,21 @@ pub(crate) fn restored_payload(
     )
 }
 
+/// Tier-1 bind for `ForegroundHandback`'s `Exec` and `ObserveExec`: the
+/// cutter through every reachable state of the model.
+#[cfg(test)]
+#[path = "foreground_handback_exec_conformance.rs"]
+mod exec_conformance;
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use super::leader_gone;
     use super::{
-        FgCutter, FgEdge, FgOwners, FgRole, TREE_CAP, group_orphaned, parse_children,
+        FgCutter, FgEdge, FgOwners, FgRole, ProcSeen, TREE_CAP, group_orphaned, parse_children,
         proc_stat_is_stopped_in, restored_payload, splice_at, tree_any,
     };
+    use crate::holder_image::EdgeKind;
     use aterm_core::terminal::program_evidence::{
         ALT_SCREEN, CURSOR_HIDDEN, FOCUS, KITTY, MOUSE, SYNC, VT52,
     };
@@ -852,26 +988,12 @@ mod tests {
         assert!(!c.sample(JOB, 10));
         assert_eq!(c.finish(|| JOB, 20), None);
         c.begin();
-        assert_eq!(
-            c.finish(|| SHELL, 5),
-            Some(FgEdge {
-                at: 0,
-                from: JOB,
-                to: SHELL
-            })
-        );
+        assert_eq!(c.finish(|| SHELL, 5), Some(FgEdge::group(0, JOB, SHELL)));
 
         // A valid first sample is the holder (the adopted-session case).
         let mut c = FgCutter::new(JOB);
         c.begin();
-        assert_eq!(
-            c.finish(|| SHELL, 7),
-            Some(FgEdge {
-                at: 0,
-                from: JOB,
-                to: SHELL
-            })
-        );
+        assert_eq!(c.finish(|| SHELL, 7), Some(FgEdge::group(0, JOB, SHELL)));
     }
 
     #[test]
@@ -886,11 +1008,7 @@ mod tests {
                 || panic!("an edge already exists: no batch-end probe"),
                 6000
             ),
-            Some(FgEdge {
-                at: 4096,
-                from: SHELL,
-                to: JOB
-            })
+            Some(FgEdge::group(4096, SHELL, JOB))
         );
     }
 
@@ -903,11 +1021,7 @@ mod tests {
         assert!(!c.sample(JOB, 300));
         assert_eq!(
             c.finish(|| SHELL, 900),
-            Some(FgEdge {
-                at: 300,
-                from: JOB,
-                to: SHELL
-            })
+            Some(FgEdge::group(300, JOB, SHELL))
         );
         // The next batch starts from the new holder with a reset cut.
         c.begin();
@@ -922,24 +1036,10 @@ mod tests {
         assert!(!c.sample(SHELL, 10));
         assert!(c.sample(JOB, 20));
         assert!(c.sample(SHELL, 30), "still delivering: the edge is taken");
-        assert_eq!(
-            c.finish(|| SHELL, 30),
-            Some(FgEdge {
-                at: 10,
-                from: SHELL,
-                to: JOB
-            })
-        );
+        assert_eq!(c.finish(|| SHELL, 30), Some(FgEdge::group(10, SHELL, JOB)));
         // The later flip back is the NEXT batch's edge, seen from its first sample.
         c.begin();
-        assert_eq!(
-            c.finish(|| SHELL, 5),
-            Some(FgEdge {
-                at: 0,
-                from: JOB,
-                to: SHELL
-            })
-        );
+        assert_eq!(c.finish(|| SHELL, 5), Some(FgEdge::group(0, JOB, SHELL)));
     }
 
     #[test]
@@ -973,14 +1073,109 @@ mod tests {
         let mut c = FgCutter::new(JOB);
         c.begin();
         assert!(c.sample(SHELL, 0));
+        assert_eq!(c.finish(|| SHELL, 40), Some(FgEdge::group(0, JOB, SHELL)));
+    }
+
+    /// An `exec` heard at a park (card engine §3.3).
+    fn exec_of(pid: i32, pgid: i32, fg: i32) -> ProcSeen {
+        ProcSeen { pid, pgid, fg }
+    }
+
+    /// An Exec edge (the running leader replaced its image) cuts at the last
+    /// clean offset, not at the poll that heard it, and lays the new run at
+    /// that poll: the bytes between are no holder's.
+    #[test]
+    fn foreground_handback_cutter_cuts_an_exec_at_the_last_clean_poll() {
+        let mut c = FgCutter::new(JOB);
+        c.begin();
+        assert!(!c.sample(JOB, 100));
+        // The park after 100 ended quietly; the next one hears the watch.
+        assert!(!c.sample(JOB, 200));
+        let mut asked = None;
+        assert!(c.proc_seen(exec_of(JOB, JOB, JOB), 200, |kind, to| {
+            asked = Some((kind, to));
+            true
+        }));
+        assert_eq!(asked, Some((EdgeKind::Exec, JOB)));
+        let edge = c.finish(|| JOB, 200).expect("the exec edge");
         assert_eq!(
-            c.finish(|| SHELL, 40),
-            Some(FgEdge {
-                at: 0,
-                from: JOB,
-                to: SHELL
-            })
+            (edge.at, edge.lay, edge.from, edge.to, edge.kind),
+            (100, 200, JOB, JOB, EdgeKind::Exec),
+            "cut at the last clean poll, laid at the one that heard it"
         );
+        assert_eq!(c.holder(), JOB);
+
+        // A drained watch with no edge makes its own offset clean; the bytes
+        // the spin reads after it are not.
+        c.begin();
+        assert!(!c.sample(JOB, 100));
+        assert!(!c.proc_seen(exec_of(JOB, JOB, JOB), 100, |_, _| false));
+        c.proc_drained(100);
+        assert!(!c.sample(JOB, 300));
+        assert!(c.proc_seen(exec_of(JOB, JOB, JOB), 300, |_, _| true));
+        let edge = c.finish(|| JOB, 300).expect("the exec edge");
+        assert_eq!((edge.at, edge.lay), (100, 300));
+
+        // Before the batch's first byte (read_or_wake heard it): byte-free.
+        c.begin();
+        assert!(c.proc_seen(exec_of(JOB, JOB, JOB), 0, |_, _| true));
+        let edge = c.finish(|| JOB, 0).expect("the exec edge");
+        assert_eq!((edge.at, edge.lay), (0, 0));
+    }
+
+    /// A Group edge (the `exec`ed process leads the group now in front) cuts
+    /// where a sampled one would: the last sample that showed the old group.
+    #[test]
+    fn foreground_handback_cutter_cuts_a_kqueue_group_edge_at_the_last_same_sample() {
+        let mut c = FgCutter::new(SHELL);
+        c.begin();
+        assert!(!c.sample(SHELL, 40));
+        assert!(!c.sample(-1, 90)); // no information: the cut stays
+        assert!(c.proc_seen(exec_of(JOB, JOB, JOB), 90, |kind, to| {
+            assert_eq!((kind, to), (EdgeKind::Group, JOB));
+            true
+        }));
+        assert!(c.carries_edge());
+        let edge = c.finish(|| JOB, 90).expect("the group edge");
+        assert_eq!(
+            (edge.at, edge.lay, edge.from, edge.to, edge.kind),
+            (40, 90, SHELL, JOB, EdgeKind::Group)
+        );
+        assert_eq!(c.holder(), JOB);
+    }
+
+    /// Only an `exec` that enters or leaves the terminal's holder, and that the
+    /// gather calls card-relevant, is an edge; the rest fold into the sampled
+    /// cut, and a batch keeps at most one edge.
+    #[test]
+    fn foreground_handback_cutter_folds_every_other_process_event() {
+        const MEMBER: i32 = 201;
+        const BG: i32 = 300;
+        let mut c = FgCutter::new(JOB);
+        c.begin();
+        let never = |_: EdgeKind, _: i32| -> bool { panic!("no candidate") };
+        // A member of the running group that leads nothing.
+        assert!(!c.proc_seen(exec_of(MEMBER, JOB, JOB), 0, never));
+        // A background group's leader (the terminal is not its).
+        assert!(!c.proc_seen(exec_of(BG, BG, JOB), 0, never));
+        // Gone before its group was read; no foreground group.
+        assert!(!c.proc_seen(exec_of(JOB, 0, JOB), 0, never));
+        assert!(!c.proc_seen(exec_of(JOB, JOB, -1), 0, never));
+        // A candidate the gather finds irrelevant (no drawer either side).
+        assert!(!c.proc_seen(exec_of(JOB, JOB, JOB), 0, |_, _| false));
+        assert!(!c.carries_edge());
+        assert_eq!(c.finish(|| JOB, 10), None);
+        // No holder yet: nothing to cut against.
+        let mut c = FgCutter::new(-1);
+        c.begin();
+        assert!(!c.proc_seen(exec_of(JOB, JOB, JOB), 0, never));
+
+        // At most one edge per batch: a second event leaves the first alone.
+        let mut c = FgCutter::new(SHELL);
+        c.begin();
+        assert!(c.proc_seen(exec_of(JOB, JOB, JOB), 0, |_, _| true));
+        assert!(c.proc_seen(exec_of(JOB, JOB, JOB), 5, |_, _| true));
+        assert_eq!(c.finish(|| JOB, 5).map(|e| e.kind), Some(EdgeKind::Group));
     }
 
     #[test]
@@ -1415,11 +1610,7 @@ mod tests {
         assert_eq!(splice_at(b"abcd", 2, b"XY"), b"abXYcd");
         assert_eq!(splice_at(b"abcd", 4, b"XY"), b"abcdXY");
         assert_eq!(splice_at(b"abcd", 0, b"XY"), b"XYabcd");
-        let edge = FgEdge {
-            at: 3,
-            from: JOB,
-            to: SHELL,
-        };
+        let edge = FgEdge::group(3, JOB, SHELL);
         assert_eq!(
             restored_payload(edge, Some("claude"), &["alt", "kitty"], 42),
             "from=200 to=100 program=claude reverted=alt,kitty bytes=42"
@@ -1455,3 +1646,105 @@ mod tests {
               not an expect: rustc does not lint a fn the declarative anchors rebuild"
 )]
 fn ownership_scope_waivers() {}
+
+/// `foreground_handback` actions no one function of the host performs, each
+/// waived where its Tier-1 binds it.
+// The machine's other three actions carry `#[refines]` anchors on the
+// shipping code: `Park` on `FgCutter::sample`, `ObserveExec` on
+// `FgCutter::proc_seen`, `Deliver` on `FgCutter::finish`.
+#[cfg(all(any(test, debug_assertions), unix))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Launch",
+    reason = "zle's `2004l` and the shell's `tcsetpgrp` giving a job the terminal: an \
+              environment step. The PTY Tier-1 writes the bytes and moves the scripted \
+              foreground probe exactly there; the exec rig moves its scripted `tcgetpgrp`."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "OneShot",
+    reason = "A display-only one-shot (`tput smcup`) given the terminal: an environment step, \
+              scripted by the PTY Tier-1's one-shot schedule."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Adopt",
+    reason = "A reader attached while a job holds the terminal: the PTY Tier-1's adopted \
+              schedule feeds the job's screen first and seeds the probe with the job."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "JobWrite",
+    reason = "The job's write to the slave: an environment step the Tier-1 rigs perform."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Die",
+    reason = "The job's death: the PTY Tier-1 adds it to the scripted liveness probe's dead set."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Stop",
+    reason = "Ctrl-Z stopping the job: an environment step of the STOP_FG schedule."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Reclaim",
+    reason = "The shell's `tcsetpgrp` taking the terminal back: the Tier-1 rigs move the \
+              scripted foreground exactly there."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "ShellWrite",
+    reason = "The shell's post-reclaim output: an environment step the PTY Tier-1 writes."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Resume",
+    reason = "`fg` giving the stopped job the terminal back: an environment step of the \
+              STOP_FG schedule."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Exec",
+    reason = "The holder's `execve` and its `NOTE_EXEC`: an environment step. The exec rig \
+              marks the job's later bytes the new image's and the watch pending there; \
+              `ProcWatch`'s own tests drive a real `exec` through the kernel."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "ReadJob",
+    reason = "The gather's `read(2)` of the master inside `aterm_pty::drain_more_nonblocking`, \
+              whose polls name the process watch before the master \
+              (`the_process_watch_is_heard_before_the_master_in_every_poll`)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "ReadShell",
+    reason = "The same `read(2)` as `ReadJob`, of the shell's bytes behind the job's."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Parse",
+    reason = "The parse stage's slice and handback at the cut (`spawn::ingest` over \
+              `Terminal::foreground_handback`): the PTY Tier-1 projects its effect (`leak`, \
+              `paste`, `prompt`) after every schedule step."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Sweep",
+    reason = "The UI thread's status sweep, which touches no mode: no schedule needs it to run."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "foreground_handback",
+    action = "Restart",
+    reason = "`park_reader` then `attach_reader_inner` seeding a new cutter with the carried \
+              holder and a new process watch: the PTY Tier-1's PARKED schedule, and the exec \
+              rig's new cutter with a quiet watch."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, \
+              not an expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn handback_scope_waivers() {}

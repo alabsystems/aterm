@@ -410,31 +410,18 @@ pub(crate) const ZSTD_LANE: FloorLane = FloorLane {
 /// instructions, within 1.05x run to run). Time on the CPU, even the thread's own CPU time
 /// against the same reference, swung 1.55-1.75x between invocations at loads of 17 to 36 (the
 /// reference's 14.6 MB repaint follows the memory contention, the scenes' small kernels do
-/// not), which broke the same-box trend's 0.70; it is reported, not gated.
+/// not), which broke the same-box trend's 0.70; it is reported, not gated. The reference
+/// shares the presenter's text work with every scene, so `ref_text_gpu_rel` floors the
+/// reference itself against a blank full repaint drawn beside it.
 pub(crate) const EFFECTS_LANE: FloorLane = FloorLane {
     lane: "effects",
     example: "effects_harness",
-    keys: &[
-        "episode_gpu_rel",
-        "settled_gpu_rel",
-        "typing_gpu_rel",
-        "scroll_gpu_rel",
-        "episode_emit_per_ginsn",
-        "episode_raster_per_ginsn",
-        "episode_encode_per_ginsn",
-        "settled_raster_per_ginsn",
-        "settled_encode_per_ginsn",
-        "typing_emit_per_ginsn",
-        "typing_raster_per_ginsn",
-        "typing_encode_per_ginsn",
-        "scroll_emit_per_ginsn",
-        "scroll_raster_per_ginsn",
-        "scroll_encode_per_ginsn",
-    ],
+    keys: EFFECTS_KEYS,
     baseline_file: "perf-baseline-effects.json",
     comment: "aterm EFFECTS baseline (docs/DESIGN-card-engine-2026-10-19.md lane B0): per scene \
               (episode, settled, typing, scroll), the GPU time as a reference full-repaint \
-              frame's p50 over the scene's (_gpu_rel), and the CPU work of the producer, the \
+              frame's p50 over the scene's (_gpu_rel), the reference's own against a blank \
+              full repaint (ref_text_gpu_rel), and the CPU work of the producer, the \
               CPU raster and the GPU encode as frames per 10^9 instructions retired \
               (_per_ginsn). BIGGER-IS-BETTER. The absolute figures and the pass-economy \
               ablation are in docs/measured/effects-baseline-2026-10-19.md. Re-record with \
@@ -442,22 +429,25 @@ pub(crate) const EFFECTS_LANE: FloorLane = FloorLane {
     cli: "effects",
 };
 
-/// [`EFFECTS_LANE`]'s GPU keys alone: an arm with a GPU clock on a host with no instruction
-/// counter the harness reads (wgpu with timestamp queries off macOS).
-const EFFECTS_GPU_LANE: FloorLane = FloorLane {
-    keys: &[
+/// The effects lane's gated keys, each written once: the GPU keys (`_gpu_rel`) and the CPU
+/// work keys (`_per_ginsn`); the full lane is both.
+macro_rules! effects_keys {
+    (gpu: [$($gpu:literal),* $(,)?], cpu: [$($cpu:literal),* $(,)?] $(,)?) => {
+        const EFFECTS_GPU_KEYS: &[&str] = &[$($gpu),*];
+        const EFFECTS_CPU_KEYS: &[&str] = &[$($cpu),*];
+        const EFFECTS_KEYS: &[&str] = &[$($gpu,)* $($cpu),*];
+    };
+}
+
+effects_keys! {
+    gpu: [
+        "ref_text_gpu_rel",
         "episode_gpu_rel",
         "settled_gpu_rel",
         "typing_gpu_rel",
         "scroll_gpu_rel",
     ],
-    ..EFFECTS_LANE
-};
-
-/// [`EFFECTS_LANE`]'s CPU work keys alone: an arm with no GPU clock (a device without
-/// timestamp queries) on a host that counts instructions.
-const EFFECTS_CPU_LANE: FloorLane = FloorLane {
-    keys: &[
+    cpu: [
         "episode_emit_per_ginsn",
         "episode_raster_per_ginsn",
         "episode_encode_per_ginsn",
@@ -470,6 +460,19 @@ const EFFECTS_CPU_LANE: FloorLane = FloorLane {
         "scroll_raster_per_ginsn",
         "scroll_encode_per_ginsn",
     ],
+}
+
+/// [`EFFECTS_LANE`]'s GPU keys alone: an arm with a GPU clock on a host with no instruction
+/// counter the harness reads (wgpu with timestamp queries off macOS).
+const EFFECTS_GPU_LANE: FloorLane = FloorLane {
+    keys: EFFECTS_GPU_KEYS,
+    ..EFFECTS_LANE
+};
+
+/// [`EFFECTS_LANE`]'s CPU work keys alone: an arm with no GPU clock (a device without
+/// timestamp queries) on a host that counts instructions.
+const EFFECTS_CPU_LANE: FloorLane = FloorLane {
+    keys: EFFECTS_CPU_KEYS,
     ..EFFECTS_LANE
 };
 
@@ -563,9 +566,9 @@ fn measure_example_with(example: &str, features: &[&str]) -> Result<Value, Strin
         args.extend(["--features", features.as_str()]);
     }
     args.extend(["--example", example]);
-    eprintln!("  $ {}", driver.display("run", &args));
+    eprintln!("  $ {}", driver.display_workspace("run", &args));
     let out = driver
-        .command("run")
+        .workspace_command("run")
         .args(args)
         .current_dir(workspace_root())
         .output()
@@ -1250,34 +1253,6 @@ mod tests {
         }
     }
 
-    /// The partial lanes split the full one: every gated key is a GPU key or a CPU work key,
-    /// once.
-    #[test]
-    fn the_effects_partial_lanes_partition_the_full_one() {
-        let mut parts: Vec<&str> = EFFECTS_GPU_LANE
-            .keys
-            .iter()
-            .chain(EFFECTS_CPU_LANE.keys)
-            .copied()
-            .collect();
-        parts.sort_unstable();
-        let mut full = EFFECTS_LANE.keys.to_vec();
-        full.sort_unstable();
-        assert_eq!(parts, full);
-        assert!(
-            EFFECTS_GPU_LANE
-                .keys
-                .iter()
-                .all(|k| k.ends_with("_gpu_rel"))
-        );
-        assert!(
-            EFFECTS_CPU_LANE
-                .keys
-                .iter()
-                .all(|k| k.ends_with("_per_ginsn"))
-        );
-    }
-
     /// A host judges what it can measure and names the rest unjudged: no GPU clock, the CPU
     /// work keys; no instruction counter, the GPU keys; neither, a skip. Only a host with both
     /// may record (asked of the lane choice, which reads and writes no baseline).
@@ -1344,7 +1319,11 @@ mod tests {
             EFFECTS_LANE.keys,
             HEALTHY,
         );
-        for key in ["typing_gpu_rel", "scroll_encode_per_ginsn"] {
+        for key in [
+            "ref_text_gpu_rel",
+            "typing_gpu_rel",
+            "scroll_encode_per_ginsn",
+        ] {
             let mut partial = full.clone();
             if let Some(o) = partial.as_object_mut() {
                 o.remove(key);

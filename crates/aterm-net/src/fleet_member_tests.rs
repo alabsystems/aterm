@@ -3067,33 +3067,45 @@ fn a_book_the_deadline_cut_short_is_the_issuers_row() {
 /// A MEMBER NEVER READS ITSELF THROUGH ITS ISSUER'S BOOK: the issuer's person
 /// named this machine's own place by hand (as the loopback fleet does for a
 /// member past four an address), so the copy names no node; dialled, it
-/// answers as this machine, and it is left out of the read — the issuer and
-/// the other member read. NEGATIVE CONTROL: without `own` the copy is read as
-/// a peer.
+/// proves this machine's node under this machine's key, and it is left out
+/// of the read — the issuer and the other member read. NEGATIVE CONTROLS:
+/// only that proof leaves it out. A Mac there that names this machine's node
+/// without its key — that node id proved under a key of its own, or none
+/// proved and the node in its survey's header — is read as the claim it is,
+/// never left out as this machine (which would hide it from this machine's
+/// read); so is this machine's own answer to a read that proves no node key
+/// of its own; and without `own` the place is read as a peer.
 #[test]
 fn a_member_never_reads_itself_through_its_issuers_book() {
     let own = node_of(0xaa);
-    let self_state = State::new("self-member");
-    let itself = Issuing::start(secret(5), self_state.dir(), issuer(0xaa));
-    let other_state = State::new("self-other");
-    let other = Issuing::start(secret(5), other_state.dir(), issuer(0x22));
-    let issuer_state = State::new("self-issuer");
-    write_book(
-        issuer_state.dir(),
-        &[
-            manual("127.0.0.1", itself.port),
-            joined(0x22, "127.0.0.1", [127, 0, 0, 1], other.port),
-        ],
-    );
-    issue(issuer_state.dir());
-    let issuing = Issuing::start(secret(5), issuer_state.dir(), issuer(0x11));
-    let peers = [issuer_entry(0x11, issuing.port)];
-    let nodes = |own: Option<&str>| -> Vec<(Via, Option<String>)> {
+    let me = identity(&own, 1);
+    // The whole read, `proving` what answers at the place (its survey's
+    // header naming `own` whatever it proves): each row's entry, its node
+    // and whether that node is proven.
+    let read = |proving: Option<NodeIdentity>, own: Option<&str>, me: Option<&NodeIdentity>| {
+        let place_state = State::new("self-member");
+        let place = match proving {
+            Some(key) => Issuing::proving(secret(5), place_state.dir(), issuer(0xaa), key),
+            None => Issuing::start(secret(5), place_state.dir(), issuer(0xaa)),
+        };
+        let other_state = State::new("self-other");
+        let other = Issuing::start(secret(5), other_state.dir(), issuer(0x22));
+        let issuer_state = State::new("self-issuer");
+        write_book(
+            issuer_state.dir(),
+            &[
+                manual("127.0.0.1", place.port),
+                joined(0x22, "127.0.0.1", [127, 0, 0, 1], other.port),
+            ],
+        );
+        issue(issuer_state.dir());
+        let issuing = Issuing::start(secret(5), issuer_state.dir(), issuer(0x11));
+        let peers = [issuer_entry(0x11, issuing.port)];
         let (reads, book) = read_whole(
             &peers,
             &Keyring::of(&peers),
             own,
-            (&secret(5), None),
+            (&secret(5), me),
             HANG,
             "survey",
         );
@@ -3101,21 +3113,40 @@ fn a_member_never_reads_itself_through_its_issuers_book() {
         reads
             .into_iter()
             .map(|read| match read.read {
-                Ok(surveyed) => (read.peer.via, surveyed.node),
+                Ok(surveyed) => (read.peer.via, surveyed.node, surveyed.proven),
                 Err(e) => panic!("{} {e}", read.peer.target()),
             })
-            .collect()
+            .collect::<Vec<_>>()
     };
+    let the_issuer = (Via::Issuer, Some(issuer(0x11).node), false);
+    let the_other = (Via::IssuerBook, Some(issuer(0x22).node), false);
     assert_eq!(
-        nodes(Some(&own)),
-        [
-            (Via::Issuer, Some(issuer(0x11).node)),
-            (Via::IssuerBook, Some(issuer(0x22).node)),
-        ],
+        read(Some(me.clone()), Some(&own), Some(&me)),
+        [the_issuer.clone(), the_other.clone()],
         "this machine is no peer of its own read"
     );
+    let claim = (Via::IssuerBook, Some(own.clone()), false);
+    for (proving, me, why) in [
+        (
+            Some(identity(&own, 2)),
+            Some(&me),
+            "this machine's node id under another key",
+        ),
+        (None, Some(&me), "this machine's node id with no key"),
+        (
+            Some(me.clone()),
+            None,
+            "a read that proves no node key of its own",
+        ),
+    ] {
+        assert_eq!(
+            read(proving, Some(&own), me),
+            [the_issuer.clone(), claim.clone(), the_other.clone()],
+            "{why} is read as its claim, never left out as this machine"
+        );
+    }
     assert_eq!(
-        nodes(None).len(),
+        read(None, None, None).len(),
         3,
         "a machine that does not know its node reads the place as a peer"
     );
@@ -3561,7 +3592,8 @@ fn at_once_holds_its_limit_and_its_order() {
 }
 
 /// A fleet listener on `listener` that answers every `survey` with a header
-/// naming `node`; stopped on drop.
+/// naming `node` (or with the lines it is given, [`Naming::replying`]);
+/// stopped on drop.
 struct Naming {
     running: Arc<AtomicBool>,
     serving: Option<std::thread::JoinHandle<()>>,
@@ -3581,6 +3613,21 @@ impl Naming {
         secret: FleetSecret,
         node: String,
         me: Option<NodeIdentity>,
+    ) -> Self {
+        let header = format!(
+            "instance pid=1 host=m7 version=0.95.0 sessions=0 level=content cut=0 at_ms=1 \
+             node={node}"
+        );
+        Self::replying(listener, secret, me, vec![header])
+    }
+
+    /// [`Naming::proving`], answering every `survey` with `lines` after its
+    /// `OK <n>` head, whatever they say.
+    fn replying(
+        listener: TcpListener,
+        secret: FleetSecret,
+        me: Option<NodeIdentity>,
+        lines: Vec<String>,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let asked = Arc::new(AtomicUsize::new(0));
@@ -3607,7 +3654,10 @@ impl Naming {
                             if stream.read(&mut byte)? == 1 {
                                 asked.fetch_add(1, Ordering::AcqRel);
                             }
-                            answer_survey(stream, &node)
+                            while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {}
+                            let reply = format!("OK {}\n{}\n", lines.len(), lines.join("\n"));
+                            stream.write_all(reply.as_bytes())?;
+                            stream.flush()
                         })
                     },
                     |_: FleetEvent| {},
@@ -3915,6 +3965,137 @@ fn this_machine_named_by_hand_is_proven_by_its_own_key() {
         (Some(node), false),
         "this machine's node id under another key"
     );
+}
+
+/// A PROVEN PEER IS READ ONLY AS THE NODE IT PROVED: one whose survey's
+/// header names another node — this Mac's own, which would drop it from the
+/// menu bar's glance as this Mac and key its notices as this Mac's — is
+/// refused whole, naming both, however the claim is spelt for a reader to
+/// decode (a second header, a second `node=`, percent-encoded, in capitals),
+/// and whether or not the node it proved is bound here; at a recorded
+/// address, it gives way to the name. NEGATIVE CONTROLS: an honest proven
+/// peer's header (its node, `-` where it cannot read its node file, or no
+/// `node=`) is read, proven; a peer that proves no node is still read as its
+/// header's claim.
+#[test]
+fn a_proven_peer_is_read_only_as_the_node_it_proved() {
+    let real = identity(&node_of(0xaa), 1);
+    let node = real.node().to_owned();
+    let me = identity(&node_of(0xbc), 7);
+    let mine = me.node().to_owned();
+    let head = |fields: &str| {
+        format!(
+            "instance pid=1 host=m7 version=0.104.0 sessions=0 level=content cut=0 at_ms=1 \
+             {fields} instances=1"
+        )
+    };
+    let entry = |port: u16, node: Option<&str>, key: Option<NodeKey>| Target {
+        host: "127.0.0.1".to_owned(),
+        addr: Some(IpAddr::from([127, 0, 0, 1])),
+        port,
+        node: node.map(str::to_owned),
+        key,
+    };
+    let read = |proving: Option<&NodeIdentity>, lines: Vec<String>, bound: bool| {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _peer = Naming::replying(listener, secret(5), proving.cloned(), lines);
+        let target = match (proving, bound) {
+            (Some(_), true) => entry(port, Some(&node), Some(real.key())),
+            (Some(_), false) => entry(port, Some(&node), None),
+            (None, _) => entry(port, None, None),
+        };
+        survey_all(
+            &[target],
+            &Keyring::default(),
+            (&secret(5), Some(&me)),
+            HANG,
+        )
+        .remove(0)
+    };
+
+    for honest in [format!("node={node}"), "node=-".to_owned(), String::new()] {
+        match read(Some(&real), vec![head(&honest)], true) {
+            Ok(surveyed) => assert_eq!(
+                (surveyed.node.as_deref(), surveyed.proven),
+                (Some(node.as_str()), true),
+                "{honest:?}"
+            ),
+            Err(e) => panic!("an honest header ({honest:?}) was refused: {e}"),
+        }
+    }
+
+    let encoded = format!("%{:02x}{}", mine.as_bytes()[0], &mine[1..]);
+    let claims = [
+        (vec![head(&format!("node={mine}"))], mine.clone()),
+        (
+            vec![head(&format!("node={node}")), head(&format!("node={mine}"))],
+            mine.clone(),
+        ),
+        (
+            vec![head(&format!("node={node} node={mine}"))],
+            mine.clone(),
+        ),
+        (vec![head(&format!("node={encoded}"))], mine.clone()),
+        (
+            vec![head(&format!("node={}", mine.to_ascii_uppercase()))],
+            mine.to_ascii_uppercase(),
+        ),
+    ];
+    for bound in [true, false] {
+        for (lines, claim) in &claims {
+            let refused = read(Some(&real), lines.clone(), bound);
+            assert!(
+                matches!(&refused, Err(Unreached::Misnamed { at, proved, claimed })
+                    if at.is_ipv4() && *proved == node && claimed == claim),
+                "bound={bound} {lines:?}: {refused:?}"
+            );
+        }
+    }
+    let said = read(Some(&real), claims[0].0.clone(), true)
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        said.contains("proved node aaaaaaaa, its survey says node bcbcbcbc: not read"),
+        "{said}"
+    );
+
+    // A peer that proves no node: its header is its claim, as before.
+    match read(None, vec![head(&format!("node={mine}"))], false) {
+        Ok(surveyed) => assert_eq!(
+            (surveyed.node.as_deref(), surveyed.proven),
+            (Some(mine.as_str()), false)
+        ),
+        Err(e) => panic!("a claim from a peer that proved no node was refused: {e}"),
+    }
+
+    // At a recorded address, the name is asked, which reaches the real node.
+    let (v6, v4, port) = twin_listeners();
+    let _real = Naming::proving(v6, secret(5), node.clone(), Some(real.clone()));
+    let _misnamed = Naming::proving(v4, secret(5), mine.clone(), Some(real.clone()));
+    let recorded = Target {
+        host: "::1".to_owned(),
+        ..entry(port, Some(&node), Some(real.key()))
+    };
+    match survey_all(
+        &[recorded],
+        &Keyring::default(),
+        (&secret(5), Some(&me)),
+        HANG,
+    )
+    .remove(0)
+    {
+        Ok(surveyed) => assert_eq!(
+            (
+                surveyed.node.as_deref(),
+                surveyed.proven,
+                surveyed.addr.is_ipv6()
+            ),
+            (Some(node.as_str()), true, true)
+        ),
+        Err(e) => panic!("the name was never tried: {e}"),
+    }
 }
 
 /// THE PROVEN NODE OF A SERVED CONNECTION ([`proven_peer`]) is the node the

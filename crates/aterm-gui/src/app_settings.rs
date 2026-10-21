@@ -555,11 +555,11 @@ impl App {
 
     /// The Security page's half of [`Self::sync_settings_consent_posture`], over
     /// `views` (every Settings view): build the block once and hand it to each view
-    /// on the Security route. The DEVELOPER TOOLS card may start its `log show` only
-    /// while one of those views is on screen ([`Self::settings_view_on_screen`]);
-    /// otherwise it is served from its slot, so a Security page left in a
-    /// background tab or a hidden window starts nothing (debugger design §9.1,
-    /// O12).
+    /// on the Security route. The Full Disk Access probe and the DEVELOPER TOOLS
+    /// card's `log show` may start only while one of those views is on screen
+    /// ([`Self::settings_view_on_screen`]); otherwise both are served from their
+    /// slots, so a Security page left in a background tab or a hidden window starts
+    /// nothing (debugger design §9.1, O12).
     fn publish_security_page(&mut self, views: Vec<(crate::WindowId, crate::tab_model::ViewId)>) {
         // Only a view on the Security page carries the block, and this runs every park:
         // reading the route first keeps an open-but-elsewhere Settings tab at one enum
@@ -814,16 +814,21 @@ impl App {
     /// Assemble what the Security page renders: `App` state, the cached probe, and one
     /// `proc_pidpath` for the image anchor. It publishes `SpikeEvidence::MEASURED`, so
     /// each claim the panel makes stays gated on a named field. `on_screen` says whether
-    /// a Security view is visible, which alone lets the DEVELOPER TOOLS card dispatch.
+    /// a Security view is visible, which alone lets the Full Disk Access probe and the
+    /// DEVELOPER TOOLS card dispatch.
     fn macos_access_projection(&mut self, on_screen: bool) -> crate::native_settings::MacosAccess {
-        let facts = self.consent_panel_facts();
+        let facts = if on_screen {
+            self.consent_panel_facts()
+        } else {
+            self.consent_panel_facts_cached()
+        };
         let warmup_offered =
             self.config.privacy_enabled() && self.config.privacy_warmup().offered();
         let tccutil = tccutil_presence_once();
         let warmup_live = self.consent_warmup_live();
         let warmup_rows = self.consent_warmup_rows().to_vec();
         let evidence = aterm_containment::SpikeEvidence::MEASURED;
-        let split = crate::control_privacy::covers_split(facts.fda, evidence);
+        let split = crate::privacy_report::covers_split(facts.fda, evidence);
         let (claimants, _) = self
             .consent
             .claimants(facts.bundle_id.as_deref(), facts.enabled);
@@ -884,7 +889,7 @@ impl App {
     /// cached markers ([`devtools_helper::Lane::last_opened_at`],
     /// `Lane::declined_marker`): never a file read per park.
     ///
-    /// [`ConsentState::devtools_cached`]: crate::control_privacy::ConsentState::devtools_cached
+    /// [`ConsentState::devtools_cached`]: crate::consent_state::ConsentState::devtools_cached
     /// [`devtools_helper::Lane::last_opened_at`]: crate::devtools_helper::Lane::last_opened_at
     fn devtools_access_facts(&mut self, on_screen: bool) -> crate::native_settings::DevToolsFacts {
         let gate = self.config.privacy_probe_gate();
@@ -935,7 +940,7 @@ impl App {
     /// cached row without dispatching while it waits for its moment.
     pub(crate) fn debugger_access_facts_from(
         &mut self,
-        row: crate::control_privacy::DebuggerRow,
+        row: crate::consent_state::DebuggerRow,
     ) -> crate::debugger_access::DebuggerFacts {
         let gate = self.config.privacy_probe_gate();
         if !row.pending() {
@@ -1512,6 +1517,8 @@ impl App {
         // The open Autopilot menu (design §9.3.3), where the last paint drew it: a menu
         // of items in words, the highlighted row the tree's focus.
         let menu = self.autopilot_grid_menu(wid);
+        // The stats bars (the Deck or the sill): groups of meters, the core row a grid.
+        let stats = self.stats_a11y(wid);
         // The window's chrome title, so the accessible window is named as the titlebar.
         let window_title = self
             .windows
@@ -1529,6 +1536,7 @@ impl App {
                 messages: &messages,
                 chips: &chips,
                 menu: menu.as_ref(),
+                stats: stats.as_ref(),
                 window_title,
             },
         ))
@@ -2530,6 +2538,7 @@ mod tests {
                     &crate::cursor_droplet::DropletConfig {
                         enabled: true,
                         intensity: 1.0,
+                        ground: None,
                     },
                     &mut quads,
                 );
@@ -2551,6 +2560,7 @@ mod tests {
                         dark_theme: true,
                         theme_fg: 0x00C8_D3F5,
                         theme_bg: 0x001A_1B26,
+                        pinned: false,
                     },
                     &mut quads,
                     &mut Vec::new(),
@@ -2571,6 +2581,7 @@ mod tests {
                         dark_theme: true,
                         theme_fg: 0x00C8_D3F5,
                         theme_bg: 0x001A_1B26,
+                        pinned: false,
                     },
                     &mut quads,
                     &mut Vec::new(),
@@ -3079,30 +3090,113 @@ mod tests {
         );
     }
 
-    /// The DEVELOPER TOOLS card starts its `log show` only while a Security view
-    /// is on screen (debugger design §9.1, O12). A Security page in a background
-    /// tab, or in a window the OS reports occluded, is served from the slot and
-    /// starts nothing, however many parks publish it; the same view in its
-    /// window's active tab, in a window not occluded, dispatches once (the
-    /// positive control).
+    /// The wakes that land a consent fact (a probe answer, a warm-up row, a
+    /// *Move to Trash* report) leave the repaint to the park's publish step,
+    /// which repaints the window whose Security block changed and no other.
+    /// Window 0 shows Security, window 1 a terminal. A changed block clears
+    /// window 0's present key and keeps window 1's; the same block published
+    /// again clears nothing (the negative control).
     #[test]
-    fn a_hidden_security_page_starts_no_devtools_probe() {
-        use aterm_containment::{DevToolProbe, DevToolProbeLabel, ProbeGate};
+    fn a_consent_publication_repaints_only_the_changed_security_view() {
+        let mut app = App::headless_for_test();
+        let security = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
+        let (_, view) = app.active_native_view(security).expect("Settings view");
+        let terminal = crate::WindowId(1);
+        app.install_window_state(terminal, crate::stub_session(1), 24, 80);
+        let windows = [security, terminal];
+        let publish = |app: &mut App, access: &crate::native_settings::MacosAccess| {
+            app.publish_macos_access(
+                &[(security, view)],
+                access,
+                crate::native_settings::ConsentGestures::inert(),
+            );
+        };
+        // Every window presented its frame, as the redraw after a present stamps it.
+        let present = |app: &mut App| {
+            let mut term = aterm_core::terminal::Terminal::new(2, 3);
+            let key = crate::early_out_tests::frame_key(&mut term, false, false, None);
+            for wid in windows {
+                app.windows
+                    .get_mut(&wid)
+                    .expect("window")
+                    .stamp_present_decision(key);
+            }
+        };
+        let presented = |app: &App| windows.map(|wid| app.windows[&wid].last_present.is_some());
+
+        let before = app.macos_access_projection(true);
+        publish(&mut app, &before);
+        present(&mut app);
+        let after = crate::native_settings::MacosAccess {
+            fda: if before.fda == aterm_containment::FdaState::Granted {
+                aterm_containment::FdaState::Denied
+            } else {
+                aterm_containment::FdaState::Granted
+            },
+            ..before.clone()
+        };
+        publish(&mut app, &after);
+        assert_eq!(
+            presented(&app),
+            [false, true],
+            "the changed Security view repaints; the terminal window keeps its frame"
+        );
+        present(&mut app);
+        publish(&mut app, &after);
+        assert_eq!(
+            presented(&app),
+            [true, true],
+            "an unchanged block repaints nothing"
+        );
+    }
+
+    /// The Full Disk Access probe and the DEVELOPER TOOLS card's `log show` start
+    /// only while a Security view is on screen (debugger design §9.1, O12). A
+    /// Security page in a background tab, or in a window the OS reports occluded,
+    /// is served from the two slots and starts nothing, however many parks publish
+    /// it; the same view in its window's active tab, in a window not occluded,
+    /// dispatches each once (the positive control).
+    #[test]
+    fn a_hidden_security_page_starts_no_fda_or_devtools_probe() {
+        use crate::consent_state::SlotKind;
+        use aterm_containment::{DevToolProbe, DevToolProbeLabel, FdaProbe, ProbeGate};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        static RUNS: AtomicUsize = AtomicUsize::new(0);
-        fn counting(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
-            RUNS.fetch_add(1, Ordering::AcqRel);
+        static DEVTOOLS: AtomicUsize = AtomicUsize::new(0);
+        static FDA: AtomicUsize = AtomicUsize::new(0);
+        fn devtools(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+            DEVTOOLS.fetch_add(1, Ordering::AcqRel);
             DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest)
+        }
+        fn fda(_gate: ProbeGate) -> FdaProbe {
+            FDA.fetch_add(1, Ordering::AcqRel);
+            aterm_containment::consent::classify_probe(aterm_containment::ProbeOutcome::Ok)
         }
         fn subject() -> Option<&'static str> {
             Some("com.example.subject")
         }
         let mut app = App::headless_for_test();
-        app.consent.set_devtools_arms_for_test(counting, subject);
+        app.consent.set_devtools_arms_for_test(devtools, subject);
+        app.consent.set_fda_arm_for_test(fda);
         let (tx, rx) = std::sync::mpsc::channel();
-        app.consent.set_devtools_wake(std::sync::Arc::new(move || {
-            let _ = tx.send(());
-        }));
+        app.consent
+            .set_slot_wake(std::sync::Arc::new(move |kind: SlotKind| {
+                let _ = tx.send(kind);
+            }));
+        let runs = || {
+            [
+                FDA.load(Ordering::Acquire),
+                DEVTOOLS.load(Ordering::Acquire),
+            ]
+        };
+        let before = runs();
+        let ran = || {
+            let now = runs();
+            [now[0] - before[0], now[1] - before[1]]
+        };
+        let idle = |app: &App| {
+            app.consent.fda_slot_idle_for_test() && app.consent.devtools_slot_idle_for_test()
+        };
         let wid = crate::WindowId(0);
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
         let (settings, _, _, view) = app.settings_tab_in_window(wid).expect("a Settings tab");
@@ -3124,8 +3218,8 @@ mod tests {
         );
         assert!(!app.settings_view_on_screen(wid, view));
         publish(&mut app);
-        assert_eq!(RUNS.load(Ordering::Acquire), 0, "a background tab ran it");
-        assert!(app.consent.devtools_slot_idle_for_test());
+        assert_eq!(ran(), [0, 0], "a background tab ran one");
+        assert!(idle(&app));
 
         assert!(
             app.windows
@@ -3137,31 +3231,35 @@ mod tests {
         app.windows.get_mut(&wid).expect("window 0").occluded = true;
         assert!(!app.settings_view_on_screen(wid, view));
         publish(&mut app);
-        assert_eq!(RUNS.load(Ordering::Acquire), 0, "an occluded window ran it");
-        assert!(app.consent.devtools_slot_idle_for_test());
+        assert_eq!(ran(), [0, 0], "an occluded window ran one");
+        assert!(idle(&app));
 
-        // The positive control: on screen, one worker for every park.
+        // The positive control: on screen, one worker of each for every park.
         app.windows.get_mut(&wid).expect("window 0").occluded = false;
         assert!(app.settings_view_on_screen(wid, view));
         publish(&mut app);
-        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .expect("the worker publishes");
+        let mut published = Vec::new();
+        while !(published.contains(&SlotKind::Fda) && published.contains(&SlotKind::Devtools)) {
+            published.push(
+                rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("the workers publish"),
+            );
+        }
         publish(&mut app);
-        assert_eq!(RUNS.load(Ordering::Acquire), 1);
+        assert_eq!(ran(), [1, 1]);
         let Some(crate::native_app::AppViewState::Settings(state)) =
             app.native_runtime.view_state(view)
         else {
             panic!("a Settings view");
         };
+        let access = state.macos_access_for_test().expect("published");
         assert_eq!(
-            state
-                .macos_access_for_test()
-                .expect("published")
-                .devtools
-                .probe
-                .label,
-            DevToolProbeLabel::NoRecentRequest,
-            "the page reads the answer it got"
+            (access.fda, access.devtools.probe.label),
+            (
+                aterm_containment::FdaState::Granted,
+                DevToolProbeLabel::NoRecentRequest
+            ),
+            "the page reads the answers it got"
         );
     }
 

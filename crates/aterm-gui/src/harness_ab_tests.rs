@@ -47,11 +47,11 @@ fn day_at(book: &AbBook, now: u64, day: i64) -> Option<AbDay> {
 fn the_book_charges_each_stretch_to_the_arm_phase_and_cause_in_force() {
     let mut book = book_at(NOON_MS);
     // Session 1, Cruise: busy 0..1000, a box 1000..1500, busy 1500..2000,
-    // at its prompt, finished, 2000..5000.
+    // at its prompt, pausing, 2000..5000.
     book.observe(1, Some(Busy), None, Cruise, 0);
     book.observe(1, Some(AtBox), None, Cruise, 1_000);
     book.observe(1, Some(Busy), None, Cruise, 1_500);
-    book.observe(1, Some(AtPrompt), Some(AbCause::Finished), Cruise, 2_000);
+    book.observe(1, Some(AtPrompt), Some(AbCause::Pausing), Cruise, 2_000);
     // Its arm turns Off at the prompt: a cause passed for Off is not kept.
     book.observe(1, Some(AtPrompt), Some(AbCause::Pausing), Off, 5_000);
     assert_eq!(book.stretch(1), Some((AtPrompt, Off, None)));
@@ -65,7 +65,7 @@ fn the_book_charges_each_stretch_to_the_arm_phase_and_cause_in_force() {
             busy_ms: 1_500,
             at_box_ms: 500,
             at_prompt_ms: 3_000,
-            finished_ms: 3_000,
+            pausing_ms: 3_000,
             ..AbArmTotals::default()
         }
     );
@@ -143,18 +143,24 @@ fn each_word_is_its_phase_and_the_arms_are_the_designs() {
     }
 }
 
-/// A CAUSE ONLY UNDER CRUISE AND LAND AT THE PROMPT (§10.5.3 B.2):
-/// finished where the face says done or landed — first, an agent done with
-/// its work is not waiting on a pause — else pausing where a pause stands.
-/// NEGATIVE CONTROLS: Off and unsupervised time has none whatever the glass
-/// holds, nor does any other phase; and the book drops a cause passed for
-/// one, so Off's prompt time never reads "finished".
+/// A CAUSE ONLY UNDER CRUISE AND LAND AT THE PROMPT (§10.5.3 B.2): under
+/// Land, landed where the face says landed — first, an agent whose work
+/// landed is not waiting on a pause — else pausing where a pause stands;
+/// under Cruise pausing alone (Cruise takes nothing as the end). NEGATIVE
+/// CONTROLS: Off and unsupervised time has none whatever the glass holds,
+/// nor does any other phase; and the book drops a cause passed for one, so
+/// Off's prompt time never reads "landed".
 #[test]
 fn a_cause_is_kept_only_under_cruise_and_land_at_the_prompt() {
     for arm in [Cruise, Land] {
         let at = Some(AtPrompt);
-        assert_eq!(AbCause::of(arm, at, true, true), Some(AbCause::Finished));
-        assert_eq!(AbCause::of(arm, at, true, false), Some(AbCause::Finished));
+        let landed = (arm == Land).then_some(AbCause::Landed);
+        assert_eq!(
+            AbCause::of(arm, at, true, true),
+            landed.or(Some(AbCause::Pausing)),
+            "{arm:?}"
+        );
+        assert_eq!(AbCause::of(arm, at, true, false), landed, "{arm:?}");
         assert_eq!(AbCause::of(arm, at, false, true), Some(AbCause::Pausing));
         assert_eq!(AbCause::of(arm, at, false, false), None);
         for phase in [Some(Busy), Some(AtBox), Some(Asked), None] {
@@ -165,12 +171,12 @@ fn a_cause_is_kept_only_under_cruise_and_land_at_the_prompt() {
         assert_eq!(AbCause::of(arm, Some(AtPrompt), true, true), None);
     }
     let mut book = book_at(NOON_MS);
-    book.observe(1, Some(AtPrompt), Some(AbCause::Finished), Off, 0);
-    book.observe(2, Some(AtPrompt), Some(AbCause::Finished), Cruise, 0);
+    book.observe(1, Some(AtPrompt), Some(AbCause::Landed), Off, 0);
+    book.observe(2, Some(AtPrompt), Some(AbCause::Landed), Land, 0);
     book.observe(3, Some(Busy), Some(AbCause::Pausing), Cruise, 0);
     let week = book.week_at(1_000, &[]);
-    assert_eq!(week.arm(Off).finished_ms, 0);
-    assert_eq!(week.arm(Cruise).finished_ms, 1_000, "CONTROL: Cruise's");
+    assert_eq!(week.arm(Off).landed_ms, 0);
+    assert_eq!(week.arm(Land).landed_ms, 1_000, "CONTROL: Land's");
     assert_eq!(week.arm(Cruise).pausing_ms, 0, "busy is never pausing");
 }
 
@@ -554,8 +560,8 @@ fn drawn_week() -> AbWeek {
         at_box_ms: 3 * MIN,
         asked_ms: MIN,
         at_prompt_ms: 30 * MIN,
-        finished_ms: 12 * MIN,
         pausing_ms: 15 * MIN,
+        ..AbArmTotals::default()
     };
     week.arms[Off.index()] = AbArmTotals {
         busy_ms: 86 * MIN,
@@ -567,7 +573,7 @@ fn drawn_week() -> AbWeek {
         busy_ms: 28 * MIN,
         at_box_ms: 2 * MIN,
         at_prompt_ms: 70 * MIN,
-        finished_ms: 64 * MIN,
+        landed_ms: 64 * MIN,
         ..AbArmTotals::default()
     };
     week.holds[0] = [samples(1, 41), samples(4, 5)];
@@ -612,11 +618,11 @@ fn the_card_reads_as_the_design_draws_it() {
             ),
             s(
                 "At its prompt",
-                "Cruise 23% of 2h 10m: finished 9%, pausing 12% \u{b7} Off 17% of 2h"
+                "Cruise 23% of 2h 10m: pausing 12% \u{b7} Off 17% of 2h"
             ),
             s(
                 "Land",
-                "held 2% \u{b7} at its prompt 70%, finished 64% \u{b7} boxes about 0.4 s (12)"
+                "held 2% \u{b7} at its prompt 70%, landed 64% \u{b7} boxes about 0.4 s (12)"
             ),
             s("Ends", "none yet"),
             s("Unsupervised", "none"),
@@ -707,7 +713,7 @@ fn the_card_says_what_it_has_not_measured_yet() {
     land.holds[1][0] = samples(2, 1);
     assert_eq!(
         words(&land)[4],
-        "held 0% \u{b7} at its prompt 50%, finished 0%, pausing 10% \u{b7} boxes not enough yet (1)"
+        "held 0% \u{b7} at its prompt 50%, landed 0%, pausing 10% \u{b7} boxes not enough yet (1)"
     );
 }
 
@@ -800,54 +806,38 @@ fn the_held_row_gives_way_to_the_lead_alone() {
 }
 
 /// THE ENDS ROW (§11.6.1, §11.6.7): after Land, its parts only where they
-/// counted — Cruise's dones with the floor's words, Land's landings and
-/// quiet ends, the time from Land to landed with its n (`not enough yet
-/// (2)` under three) — and `none yet` with nothing to count. NEGATIVE
-/// CONTROL: the floor's words dropped from Cruise's count fails the first
-/// form.
+/// counted — Land's landings, the time from Land to landed with its n (`not
+/// enough yet (2)` under three) — and `none yet` with nothing to count.
+/// Under FOREVER CRUISE / FOREVER LAND a landing is the one end: no Cruise
+/// done and no quiet end is ever named. NEGATIVE CONTROL: nothing counted
+/// reads no words, and the card says `none yet`.
 #[test]
 fn the_ends_row_says_each_part_it_counted() {
-    let ends = |done, landed, quiet, landing: Hist| AbEnds {
-        done,
-        landed,
-        quiet,
-        landing,
-    };
+    let ends = |landed, landing: Hist| AbEnds { landed, landing };
     let none = [0; BUCKETS];
     assert_eq!(
-        ends_words(&ends(6, 5, 1, samples(bucket(6 * MIN), 5))).as_deref(),
-        Some(
-            "Cruise said done 6 times (30 s of work or more) \u{b7} Land landed 5, quiet 1 \
-             \u{b7} Land to landed: about 6m (5)"
-        )
+        ends_words(&ends(5, samples(bucket(6 * MIN), 5))).as_deref(),
+        Some("Land landed 5 \u{b7} Land to landed: about 6m (5)")
     );
     assert_eq!(
-        ends_words(&ends(1, 0, 0, none)).as_deref(),
-        Some("Cruise said done once (30 s of work or more)")
-    );
-    assert_eq!(
-        ends_words(&ends(0, 2, 0, samples(bucket(6 * MIN), 2))).as_deref(),
+        ends_words(&ends(2, samples(bucket(6 * MIN), 2))).as_deref(),
         Some("Land landed 2 \u{b7} Land to landed: not enough yet (2)")
     );
     assert_eq!(
-        ends_words(&ends(0, 1, 0, none)).as_deref(),
+        ends_words(&ends(1, none)).as_deref(),
         Some("Land landed 1"),
         "a landing with no span counts alone"
-    );
-    assert_eq!(
-        ends_words(&ends(0, 0, 3, none)).as_deref(),
-        Some("Land quiet 3")
     );
     assert_eq!(ends_words(&AbEnds::default()), None);
     // On the card: after Land, before Unsupervised and Measured.
     let mut week = drawn_week();
-    week.ends = ends(0, 5, 1, samples(bucket(6 * MIN), 5));
+    week.ends = ends(5, samples(bucket(6 * MIN), 5));
     let rows = ab_rows(&week, DAY);
     let at = |label: &str| rows.iter().position(|(l, _)| l == label);
     assert_eq!(at("Ends"), at("Land").map(|land| land + 1), "{rows:?}");
     assert_eq!(
         rows[at("Ends").unwrap()].1,
-        "Land landed 5, quiet 1 \u{b7} Land to landed: about 6m (5)"
+        "Land landed 5 \u{b7} Land to landed: about 6m (5)"
     );
     let quiet = ab_rows(&drawn_week(), DAY);
     assert_eq!(
@@ -923,8 +913,7 @@ fn note(book: &mut AbBook, session: u64, (arm, lands): (AbArm, bool), at_ms: u64
 /// (§11.6.3, item 4; §11.6.5 "The book"): the mode moved Cruise to Land at
 /// t0 and landed at t0 + 6 min is landed 1 and one sample in `bucket(6
 /// min)`, the start spent; a session whose mode is first read as Land is
-/// landed 1 and no sample; a quiet end and a done are counts alone; a mode
-/// that leaves Land drops the start; an end after midnight goes in its own
+/// landed 1 and no sample; a mode that leaves Land drops the start; an end after midnight goes in its own
 /// day; the session's end forgets its task. NEGATIVE CONTROLS: a book fed
 /// no calendar counts nothing; a second landing in the same Land stretch
 /// has no start (slice 2a's `task_opened` sets one), so it is a count with
@@ -938,7 +927,7 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
     assert_eq!(book.land_from(1), Some(t0));
     note(&mut book, 1, (Land, true), t0 + 5 * MIN);
     assert_eq!(book.land_from(1), Some(t0), "carried while Land stays");
-    book.end(1, AbEnd::Landed, t0 + 6 * MIN);
+    book.landed(1, t0 + 6 * MIN);
     assert_eq!(book.land_from(1), None, "spent by its landing");
     let today = |book: &AbBook| day_at(book, t0 + 6 * MIN, DAY).expect("today").ends;
     let mut want = AbEnds {
@@ -948,18 +937,14 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
     want.landing[bucket(6 * MIN)] = 1;
     assert_eq!(today(&book), want);
     // CONTROL: a second landing in the same Land stretch has no start.
-    book.end(1, AbEnd::Landed, t0 + 9 * MIN);
+    book.landed(1, t0 + 9 * MIN);
     want.landed = 2;
     assert_eq!(today(&book), want, "a count, no sample");
     // First read in Land: a count, no span.
     note(&mut book, 2, (Land, true), t0);
     assert_eq!(book.land_from(2), None, "first read");
-    book.end(2, AbEnd::Landed, t0 + 6 * MIN);
-    book.end(2, AbEnd::Quiet, t0 + 6 * MIN);
-    book.end(3, AbEnd::Done, t0 + 6 * MIN);
+    book.landed(2, t0 + 6 * MIN);
     want.landed = 3;
-    want.quiet = 1;
-    want.done = 1;
     assert_eq!(today(&book), want);
     // A mode that leaves Land drops the start, whatever comes back.
     note(&mut book, 4, (Off, false), 0);
@@ -970,7 +955,7 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
     assert_eq!(book.land_from(4), Some(3 * MIN), "a new move into Land");
     // Past midnight: the next day's.
     let midnight = u64::try_from(12 * HOUR_MS).unwrap();
-    book.end(4, AbEnd::Landed, midnight + MIN);
+    book.landed(4, midnight + MIN);
     let tomorrow = day_at(&book, midnight + MIN, DAY + 1)
         .expect("tomorrow")
         .ends;
@@ -991,10 +976,7 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
     );
     // The week sums them.
     let week = book.week_at(midnight + MIN, &[]);
-    assert_eq!(
-        (week.ends.landed, week.ends.quiet, week.ends.done),
-        (4, 1, 1)
-    );
+    assert_eq!(week.ends.landed, 4);
     // The session's end forgets its task.
     assert_eq!(book.tasks(), 3, "sessions 1, 2 and 4");
     book.retire(4, midnight + 2 * MIN);
@@ -1003,7 +985,7 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
     let mut unread = AbBook::default();
     note(&mut unread, 1, (Cruise, false), 0);
     note(&mut unread, 1, (Land, true), MIN);
-    unread.end(1, AbEnd::Landed, 7 * MIN);
+    unread.landed(1, 7 * MIN);
     assert_eq!(unread.week_at(7 * MIN, &[]).ends, AbEnds::default());
 }
 
@@ -1024,7 +1006,7 @@ fn a_walls_word_between_land_and_landed_keeps_the_span() {
     book.observe(1, None, None, Land, 2 * MIN);
     assert_eq!(book.stretch(1), None, "the wall dropped the stretch");
     note(&mut book, 1, (Land, true), 3 * MIN);
-    book.end(1, AbEnd::Landed, 7 * MIN);
+    book.landed(1, 7 * MIN);
     let ends = book.week_at(7 * MIN, &[]).ends;
     assert_eq!(ends.landed, 1);
     assert_eq!(ends.landing[bucket(6 * MIN)], 1, "{:?}", ends.landing);
@@ -1040,21 +1022,11 @@ fn two_days_ends_add() {
     mine.ends.landing[3] = 1;
     let mut theirs = busy_day(DAY, 20, HOUR);
     theirs.ends.landed = 1;
-    theirs.ends.quiet = 4;
-    theirs.ends.done = 7;
     theirs.ends.landing[3] = 2;
     let mut old = busy_day(DAY - 7, 1, HOUR);
     old.ends.landed = 100;
     let week = AbWeek::of_days([mine, theirs, old].iter(), DAY);
-    assert_eq!(
-        (
-            week.ends.landed,
-            week.ends.quiet,
-            week.ends.done,
-            week.ends.landing[3]
-        ),
-        (3, 4, 7, 3)
-    );
+    assert_eq!((week.ends.landed, week.ends.landing[3]), (3, 3));
     mine.plus(&theirs);
     assert_eq!(mine.ends, week.ends);
 }
@@ -1092,8 +1064,8 @@ fn the_start_follows_the_mode_never_the_claim() {
         note(8, (Land, true), MIN);
         note(8, (Unsupervised, true), 5 * MIN);
         note(8, (Land, true), 5 * MIN + 10_000);
-        book.end(7, AbEnd::Landed, 60_000);
-        book.end(8, AbEnd::Landed, 7 * MIN);
+        book.landed(7, 60_000);
+        book.landed(8, 7 * MIN);
         book.week_at(7 * MIN, &[]).ends
     };
     let ends = run(false);
@@ -1108,36 +1080,4 @@ fn the_start_follows_the_mode_never_the_claim() {
     let control = run(true);
     assert_eq!(control.landing[bucket(6 * MIN)], 0, "CONTROL");
     assert_eq!(control.landing.iter().sum::<u32>(), 2, "CONTROL");
-}
-
-/// A QUIET LANDING THAT LANDS AFTER ALL IS ONE END (its face spent →
-/// landed): the quiet count this book took is moved to landed, in the day
-/// each fell on, and the span is the landing's; a quiet end with no landing
-/// after it stays quiet. NEGATIVE CONTROL: the landing counted with
-/// `end` alone (the first build) leaves the quiet end standing beside it.
-#[test]
-fn a_quiet_landing_that_lands_after_all_is_one_end() {
-    let mut book = book_at(NOON_MS);
-    let midnight = u64::try_from(12 * HOUR_MS).unwrap();
-    note(&mut book, 1, (Cruise, false), 0);
-    note(&mut book, 1, (Land, true), midnight - 10 * MIN);
-    book.end(1, AbEnd::Quiet, midnight - MIN);
-    note(&mut book, 2, (Land, true), 0);
-    book.end(2, AbEnd::Quiet, midnight - MIN);
-    let quiet = book.week_at(midnight - MIN, &[]).ends;
-    assert_eq!((quiet.landed, quiet.quiet), (0, 2));
-    book.quiet_landed(1, midnight + MIN);
-    let today = day_at(&book, midnight + MIN, DAY).expect("today").ends;
-    let tomorrow = day_at(&book, midnight + MIN, DAY + 1)
-        .expect("tomorrow")
-        .ends;
-    assert_eq!((today.landed, today.quiet), (0, 1), "session 2 stays quiet");
-    assert_eq!((tomorrow.landed, tomorrow.quiet), (1, 0));
-    assert_eq!(tomorrow.landing[bucket(11 * MIN)], 1);
-    // Told once more, or with no quiet this book counted: a landing alone.
-    book.quiet_landed(1, midnight + 2 * MIN);
-    note(&mut book, 3, (Land, true), 0);
-    book.quiet_landed(3, midnight + 2 * MIN);
-    let week = book.week_at(midnight + 2 * MIN, &[]).ends;
-    assert_eq!((week.landed, week.quiet), (3, 1));
 }

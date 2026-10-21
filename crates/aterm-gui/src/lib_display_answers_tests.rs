@@ -3,7 +3,7 @@
 
 use super::{
     DisplayEndpoint, LinuxTrialStart, a_display_server_answers_from, display_endpoint_answers,
-    display_endpoints_from, linux_trial_start,
+    display_endpoints_from, linux_trial_start, loop_goes_first,
 };
 
 /// Leave at `path` the socket file a display server that exited leaves behind: one
@@ -141,6 +141,21 @@ fn a_wayland_display_is_asked_at_its_socket() {
     );
 }
 
+/// `WAYLAND_SOCKET` names a socket the session handed down by number: it answers when
+/// the number is an open socket, and not when it is open on anything else or not open at
+/// all. Read from the descriptor itself, so every platform's tests read it (a path of
+/// the number, `/proc/self/fd/N`, answered nothing off Linux).
+#[test]
+fn an_inherited_display_socket_answers_and_no_other_descriptor_does() {
+    use std::os::fd::AsRawFd as _;
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let answers = |fd| display_endpoint_answers(&DisplayEndpoint::Inherited(fd));
+    assert!(answers(socket.as_raw_fd()), "an open socket");
+    assert!(!answers(file.as_raw_fd()), "an open file that is no socket");
+    assert!(!answers(-1), "no descriptor");
+}
+
 /// ROUND EIGHT OF THE UPDATE AUDIT, THE REVIEW OF #82 — WINIT'S CHOICE OF DISPLAY
 /// DECIDES, NOT ANY DISPLAY THAT ANSWERS. A tmux server started in a Wayland session
 /// is attached from an X11 one: tmux refreshes `DISPLAY`, not `WAYLAND_DISPLAY`, so
@@ -213,6 +228,58 @@ fn winits_choice_of_display_decides_whether_a_start_is_counted() {
         start(&attached),
         LinuxTrialStart::Window,
         "the compositor winit opens answers"
+    );
+}
+
+/// LINUX-6 — A LAUNCH WHOSE DISPLAY ANSWERS FORKS SESSION 0 BEFORE THE EVENT LOOP.
+/// Session 0's shell waited for every free-unix window's event-loop build, which opens
+/// the display (9.3-9.9 ms on X11, 1.6-1.8 ms on Wayland in the Linux lane, 2026-10-20).
+/// Now the build goes first only where no display server answered where winit will
+/// connect, so a launch that cannot open its display still takes nothing single-use and
+/// forks no shell. A build that opens no display (macOS, a headless run with none
+/// named) asks no server; the dev seam puts the loop first everywhere.
+///
+/// FAILS WITHOUT THE FIX: every build that opens a display went first.
+///
+/// NEGATIVE CONTROL: the display named by a socket its server left answers nothing, and
+/// the loop goes first.
+#[test]
+fn a_launch_whose_display_answers_forks_session_zero_before_the_loop() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let live = root.path().join("X0");
+    let _server = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let gone = root.path().join("X1");
+    server_gone_socket(&gone);
+    // `:0`, answered at `at` in place of `/tmp/.X11-unix/X0`.
+    let answered_at = |at: &std::path::Path| {
+        let at = at.to_path_buf();
+        move || {
+            a_display_server_answers_from(only(&[("DISPLAY", ":0")]), |endpoint| {
+                matches!(endpoint, DisplayEndpoint::Socket(path)
+                    if path.as_path() == std::path::Path::new("/tmp/.X11-unix/X0"))
+                    && display_endpoint_answers(&DisplayEndpoint::Socket(at.clone()))
+            })
+        }
+    };
+    assert!(
+        !loop_goes_first(true, answered_at(&live), false),
+        "a display that answers: session 0 forks first"
+    );
+    assert!(
+        loop_goes_first(true, answered_at(&gone), false),
+        "a display named that nothing answers: the loop's build goes first"
+    );
+    assert!(
+        !loop_goes_first(
+            false,
+            || panic!("a build that opens no display asks no server"),
+            false
+        ),
+        "a build that opens no display"
+    );
+    assert!(
+        loop_goes_first(true, answered_at(&live), true),
+        "the dev seam puts the loop first"
     );
 }
 

@@ -29,6 +29,7 @@
 use aterm_phase::wall::WallKind;
 use aterm_phase::{LoginMethod, LoginPicker, LoginScreen, Program, PromptV2};
 
+use super::super::config::SupervisorConfig;
 use super::approval::{Choice, Decision};
 use super::guard::row_guard;
 use super::turn_end::{TurnEndAction, TurnEndState};
@@ -124,7 +125,12 @@ pub fn pick_method(
 pub fn dialog_act(state: &TurnEndState, screen: &LoginScreen) -> TurnEndAction {
     match screen {
         LoginScreen::Success { row }
-            if !state.login_confirmed() && state.wall_attempts(WallKind::Auth).is_some() =>
+            if !state.login_confirmed()
+                && (state.wall_attempts(WallKind::Auth).is_some()
+                    || state.wall_attempts(WallKind::UsageWeekly).is_some()
+                    || state
+                        .wall_attempts(WallKind::ModelBucket { consent: false })
+                        .is_some()) =>
         {
             TurnEndAction::Confirm {
                 rule_id: RULE_LOGIN_DONE,
@@ -137,6 +143,60 @@ pub fn dialog_act(state: &TurnEndState, screen: &LoginScreen) -> TurnEndAction {
         | LoginScreen::ConsoleMenu
         | LoginScreen::Failed => TurnEndAction::Nothing,
     }
+}
+
+/// WHOSE CLAUDE CODE'S `/login` METHOD PICKER IS ([`picker_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerGate {
+    /// Behind the `/login` this loop typed into a lost login: aterm's carry,
+    /// answered with the method the session's login already is
+    /// ([`pick_method`]).
+    Carried,
+    /// Behind that `/login`, the login came back in another tab since
+    /// ([`LoginShared::Back`]): nothing is left to sign in, so nobody answers
+    /// it — a method chosen would open a browser sign-in nobody needs (one
+    /// sign-in per login) — and the owner is told to close it.
+    Back,
+    /// Behind that `/login`, a renewal replaced the login it signs in, and
+    /// the tab moves onto the renewed one by itself once the dialog is left
+    /// ([`renewal_followed`]): nobody answers it — a method chosen would open
+    /// a browser sign-in nobody needs, bringing back the login the renewal
+    /// replaced — and the owner is told to close it (acct3-3).
+    Renewed,
+    /// A person's own `/login`: theirs whole.
+    Persons,
+}
+
+/// WHOSE THE METHOD PICKER IS: `typed`, the `/login` it belongs to is the
+/// one this loop typed into a lost login
+/// ([`super::turn_end::TurnEndState::login_typed_at`]); `shared`, the host's
+/// word on that login's one sign-in
+/// ([`crate::supervise::IdleHost::login_shared`]); `renewed`, a renewal the
+/// tab follows by itself stands over that login ([`renewal_followed`]). The
+/// approval loop's gate, and the one the login wall's conformance binds.
+#[must_use]
+pub fn picker_gate(typed: bool, shared: Option<&LoginShared>, renewed: bool) -> PickerGate {
+    match (typed, shared) {
+        (false, _) => PickerGate::Persons,
+        (true, Some(LoginShared::Back { .. })) => PickerGate::Back,
+        (true, _) if renewed => PickerGate::Renewed,
+        (true, _) => PickerGate::Carried,
+    }
+}
+
+/// WHETHER A RENEWAL STANDS OVER THE SESSION'S LOST LOGIN THAT THE TAB
+/// FOLLOWS BY ITSELF: the process holds a login a renewal replaced
+/// (`superseded`, [`crate::supervise::IdleHost::login_superseded`]: asked of
+/// a renewable row's login alone), the logins' lifecycle on, and a relaunch
+/// in reach (`relaunch` and `resume_limits` on, a host that relaunches the
+/// agent: `restartable`). Then the `/login` this loop typed has nothing left
+/// to sign in — its dialog is the owner's to close, and the tab moves onto
+/// the renewed login once it is left (the review of the login carry,
+/// acct3-3: the dialog's notice asked for a browser sign-in nobody needed).
+/// Out of reach, the sign-in in the tab is the owner's way on, as before.
+#[must_use]
+pub fn renewal_followed(superseded: bool, cfg: &SupervisorConfig, restartable: bool) -> bool {
+    superseded && cfg.logins && cfg.resume_limits && cfg.relaunch && restartable
 }
 
 /// Whether `program`'s lost login is carried here: Claude Code's, whose wall,

@@ -4,6 +4,8 @@
 //! The exceptions: a person is asked for only what only a person can do, with
 //! the one action, and a wait is never one.
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::supervise::phase::Phase;
 use crate::supervise::policy::notice;
@@ -37,17 +39,19 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         resumes_by_itself: false,
         composer: Composer::Empty,
         said_tail: Some("Suites are running.".to_string()),
+        said_cut: false,
+        turn_said: None,
+        opened_by: None,
         worked: Some(3 * MIN),
         rules: None,
         pending_input: false,
         interrupted: false,
         restartable: true,
+        relaunch_off: false,
         resume: None,
         upgrading: false,
         taskless: false,
         finished_record: None,
-        finished_at_check: false,
-        check_record: None,
         left_record: false,
         left_work: None,
         person: None,
@@ -73,8 +77,10 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         repo: None,
         login_screen: None,
         login_interrupted: false,
+        login_at_wall: None,
         login_method: None,
         login_shared: None,
+        roster: None,
     }
 }
 
@@ -129,7 +135,8 @@ fn typed_login(t: Instant) -> TurnEndState {
 /// opened, where nothing was typed. Nothing is told while aterm is still at
 /// it — `/login` about to go, a person's keys waited out — and `/login` held
 /// back is told with why: a draft, `retry_api_errors = false`, the hour's
-/// typing budget, no task, a finished task.
+/// typing budget, no task. The record's finish ends no task (only a landing
+/// or a person's exchange does), so a wall read with it gets `/login`.
 #[test]
 fn a_lost_logins_notice_is_what_the_point_decides() {
     let t = t0();
@@ -163,16 +170,23 @@ fn a_lost_logins_notice_is_what_the_point_decides() {
         let e = e.expect("told");
         assert!(e.notice.is_some_and(|n| n.did.contains(why)), "{why}");
     };
+    // A draft holds it: a notice of its own, whose step clears the draft
+    // first (the review of the login carry, 2026-10-20: told as
+    // `LOGIN_NOT_RUN`, its step typed `/login` onto the draft). NEGATIVE
+    // CONTROL: every other why is `LOGIN_NOT_RUN`'s, and its step is
+    // another.
     let drafted = TurnEndReading {
         composer: Composer::Typed,
         ..wall.clone()
     };
-    not_run(
-        &mut TurnEndState::default(),
-        &drafted,
-        &cfg(),
-        notice::WHY_DRAFT,
+    let (a, e) = point(&mut TurnEndState::default(), &drafted, &cfg(), t + MIN);
+    assert!(matches!(a, TurnEndAction::Escalate { .. }), "{a:?}");
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_NOT_RUN_DRAFT.id),
+        "{e:?}"
     );
+    assert_ne!(notice::LOGIN_NOT_RUN_DRAFT.todo, notice::LOGIN_NOT_RUN.todo);
     let off = SupervisorConfig {
         retry_api_errors: false,
         ..cfg()
@@ -197,12 +211,9 @@ fn a_lost_logins_notice_is_what_the_point_decides() {
         finished_record: Some(true),
         ..wall.clone()
     };
-    not_run(
-        &mut TurnEndState::default(),
-        &finished,
-        &cfg(),
-        notice::WHY_TASK_DONE,
-    );
+    let (a, e) = point(&mut TurnEndState::default(), &finished, &cfg(), t);
+    assert_eq!(a.rule_id(), Some(RULE_LOGIN), "{a:?}");
+    assert_eq!(e, None, "aterm is at it");
     // The hour's typing budget spent by a continuation the wall answered.
     let budget = SupervisorConfig {
         continue_per_hour: 1,
@@ -262,7 +273,7 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
         Some(notice::LOGIN_SIGN_IN_AS.id),
         "{e:?}"
     );
-    assert!(e.is_some_and(|e| e.notice.is_some_and(|n| n.did.contains("work-2"))));
+    assert!(e.is_some_and(|e| e.action.contains("work-2")));
     // The picker: aterm's to answer with the subscription; with nothing
     // known of the method, the owner's.
     let picker = dialog(LOGIN_PICKER);
@@ -277,15 +288,22 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
         Some(notice::LOGIN_CHOOSE.id),
         "{e:?}"
     );
+    // Console's own menu behind it (the picker moved onto Console): how to
+    // sign in is still the owner's choice, nothing stopped (the review of
+    // the login carry, 2026-10-20: it was told as a sign-in stopped).
+    let e = at(&mut typed_login(t), &dialog(LOGIN_CONSOLE_MENU), t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_CHOOSE.id),
+        "{e:?}"
+    );
     // Stopped on a state of the dialog's own.
-    for text in [LOGIN_ERROR, LOGIN_CONSOLE_MENU] {
-        let e = at(&mut typed_login(t), &dialog(text), t + MIN);
-        assert_eq!(
-            notice_id(e.as_ref()),
-            Some(notice::LOGIN_STOPPED.id),
-            "{text}"
-        );
-    }
+    let e = at(&mut typed_login(t), &dialog(LOGIN_ERROR), t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_STOPPED.id),
+        "{e:?}"
+    );
     // Left: `Login interrupted`, or the wall back with no dialog past
     // `/login`'s take window — and not inside it.
     let e = at(&mut typed_login(t), &dialog(LOGIN_INTERRUPTED), t + MIN);
@@ -294,6 +312,24 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
         Some(notice::LOGIN_CANCELLED.id),
         "{e:?}"
     );
+    assert_eq!(
+        e.map(|e| e.action),
+        Some(notice::LOGIN_CANCELLED.todo.to_string())
+    );
+    // On a roster row's login, the sign-in by hand names the row (the review
+    // of the login carry, 2026-10-20: nothing at the hand-off of the owner's
+    // own `/login` does). NEGATIVE CONTROL: the plain step above.
+    let rostered_left = TurnEndReading {
+        login_label: Some("work-2".to_string()),
+        ..dialog(LOGIN_INTERRUPTED)
+    };
+    let e = at(&mut typed_login(t), &rostered_left, t + MIN);
+    assert_eq!(
+        notice_id(e.as_ref()),
+        Some(notice::LOGIN_CANCELLED.id),
+        "{e:?}"
+    );
+    assert!(e.is_some_and(|e| e.action.contains("work-2")));
     let again = TurnEndReading {
         worked: None,
         ..wall.clone()
@@ -326,11 +362,13 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
 /// as aterm's (`login-cancelled`).
 #[test]
 fn a_persons_own_login_is_theirs() {
-    use aterm_phase::prompt::fixtures::{LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER};
+    use aterm_phase::prompt::fixtures::{
+        LOGIN_CONSOLE_MENU, LOGIN_HANDOFF, LOGIN_INTERRUPTED, LOGIN_PICKER,
+    };
     let t = t0();
     let wall = walled(WallKind::Auth, "Login expired · Please run /login");
     // On a working session: no lost login, nothing told.
-    for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
+    for text in [LOGIN_PICKER, LOGIN_CONSOLE_MENU, LOGIN_HANDOFF] {
         let mut st = TurnEndState::default();
         let r = TurnEndReading {
             wall: None,
@@ -340,8 +378,9 @@ fn a_persons_own_login_is_theirs() {
         assert_eq!(e, None, "{text}");
         assert_eq!(a.rule_id(), None, "{text}: {a:?}");
     }
-    // At a lost login, their dialog: nothing told.
-    for text in [LOGIN_PICKER, LOGIN_HANDOFF] {
+    // At a lost login, their dialog: nothing told, Console's menu they
+    // chose included.
+    for text in [LOGIN_PICKER, LOGIN_CONSOLE_MENU, LOGIN_HANDOFF] {
         let mut st = TurnEndState::default();
         st.observe(&wall, t);
         let (_, e) = point(&mut st, &dialog(text), &cfg(), t + Duration::from_secs(5));
@@ -987,4 +1026,807 @@ fn the_long_contexts_usage_credits_are_an_account_limit() {
     )
     .expect("told");
     assert_ne!(e.why, old.why);
+}
+
+/// A multi-day weekly usage limit with no account rotation available raises
+/// `notice::LIMIT_SIGN_IN` (`Now`, telling the owner to type `/login` in the
+/// tab), while one with an account move or wait advised raises nothing, and
+/// a short wait (<= 6 h) raises nothing.
+#[test]
+fn a_weekly_usage_limit_with_no_account_to_rotate_to_raises_limit_sign_in() {
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    weekly.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let e = exception_for(&st, &weekly, &cfg(), t).expect("told");
+    assert_eq!((e.kind, e.when), (ExceptionKind::Login, Urgency::Now));
+    assert_eq!(e.notice.as_ref().map(|n| n.id), Some("limit-sign-in"));
+    assert!(e.action.contains("/login"), "{e:?}");
+
+    // When an account move or wait is advised, nothing is raised.
+    let mut advised = weekly.clone();
+    advised.account = Some(crate::supervise::policy::turn_end::AccountAdvice::Move {
+        to: "work-2".to_string(),
+    });
+    assert_eq!(exception_for(&st, &advised, &cfg(), t), None);
+
+    // While the owner is in `/login` at the weekly limit, the picker/browser/success
+    // clears the notice, and a cancelled `/login` (`login_interrupted`) tells
+    // the limit's own sign-in (below).
+    let mut in_browser = weekly.clone();
+    in_browser.wall = None;
+    in_browser.login_screen = Some(LoginScreen::Browser);
+    assert_eq!(exception_for(&st, &in_browser, &cfg(), t), None);
+    // Console's own menu is the person's choice there too, nothing stopped;
+    // an error in the dialog is (the login-carry review's
+    // console-stopped-false, 2026-10-20).
+    let in_console = TurnEndReading {
+        login_screen: Some(LoginScreen::ConsoleMenu),
+        ..in_browser.clone()
+    };
+    assert_eq!(exception_for(&st, &in_console, &cfg(), t), None);
+    let failed = TurnEndReading {
+        login_screen: Some(LoginScreen::Failed),
+        ..in_browser.clone()
+    };
+    let e = exception_for(&st, &failed, &cfg(), t).expect("stopped");
+    assert_eq!(e.notice.as_ref().map(|n| n.id), Some("login-stopped"));
+
+    // A cancelled `/login` (`login_interrupted`) at the limit is told the
+    // limit's own sign-in, to ANOTHER account: a lost login's "sign in
+    // again" signs the same account in, whose limit still stands (the review
+    // of the login carry, r5h-4).
+    let mut interrupted = weekly;
+    interrupted.wall = None;
+    interrupted.login_interrupted = true;
+    let left = exception_for(&st, &interrupted, &cfg(), t).expect("login left");
+    assert_eq!(left.notice.as_ref().map(|n| n.id), Some("limit-sign-in"));
+    assert!(left.action.contains("another account"), "{left:?}");
+    // NEGATIVE CONTROL: a person's `/login` left at a LOST LOGIN is a lost
+    // login's, told to sign in again.
+    let lost = walled(WallKind::Auth, "Login expired · Please run /login");
+    let mut st = TurnEndState::default();
+    st.observe(&lost, t);
+    let left_lost = TurnEndReading {
+        wall: None,
+        login_interrupted: true,
+        ..lost
+    };
+    let e = exception_for(&st, &left_lost, &cfg(), t + MIN).expect("told");
+    assert_eq!(e.notice.as_ref().map(|n| n.id), Some("login-left"), "{e:?}");
+    assert!(!e.action.contains("another account"), "{e:?}");
+}
+
+/// A WEEKLY LIMIT'S NOTICE SAYS WHEN THE TAB GOES ON BY ITSELF (the review
+/// of the band, 2026-10-20): under `resume_limits` aterm continues the tab
+/// past the reset whatever the owner does, so the notice's expectation names
+/// the reset as the vendor's notice said it — whichever step the roster
+/// gives. NEGATIVE CONTROLS: a notice that named no clock, and a limit
+/// `resume_limits` does not continue past (the owner's own `/login` left at
+/// it), tell the expectation they always had.
+#[test]
+fn a_weekly_limits_notice_names_the_reset_the_tab_goes_on_after() {
+    use crate::supervise::limit::ResetClock;
+    use crate::supervise::policy::turn_end::{HeldBy, RosterWord, SignInNext};
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit \u{b7} resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    weekly.reset_clock = ResetClock::of(Some("Oct 23 at 8am (America/Los_Angeles)"));
+    weekly.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let expect = |r: &TurnEndReading, cfg: &SupervisorConfig| {
+        let e = exception_for(&st, r, cfg, t).expect("told");
+        let n = e.notice.expect("a notice");
+        (n.id, n.expect)
+    };
+    let row = |held: Option<HeldBy>| RosterWord::Row {
+        next: Some(SignInNext {
+            label: "m8-2".to_string(),
+            renew: true,
+        }),
+        ready: None,
+        held,
+    };
+    let none = RosterWord::Row {
+        next: None,
+        ready: None,
+        held: None,
+    };
+    for word in [
+        None,
+        Some(row(None)),
+        Some(row(Some(HeldBy::Earlier))),
+        Some(none),
+        Some(RosterWord::Unread),
+    ] {
+        let r = TurnEndReading {
+            roster: word.clone(),
+            ..weekly.clone()
+        };
+        let (id, said) = expect(&r, &cfg());
+        assert!(said.contains("on Oct 23 at 8am"), "{id}: {said:?}");
+        // NEGATIVE CONTROL: a notice that named no clock.
+        let unclocked = TurnEndReading {
+            reset_clock: None,
+            ..r.clone()
+        };
+        let (_, plain) = expect(&unclocked, &cfg());
+        assert!(!plain.contains("Oct 23"), "{id}: {plain:?}");
+        assert_ne!(plain, said, "{id}");
+    }
+    // NEGATIVE CONTROL: the person's own `/login` left at the limit, told
+    // the roster's step: with `resume_limits` off nothing continues the tab
+    // past the reset, and the notice says none.
+    let off = SupervisorConfig {
+        resume_limits: false,
+        ..cfg()
+    };
+    let left = TurnEndReading {
+        login_interrupted: true,
+        roster: Some(RosterWord::Row {
+            next: None,
+            ready: None,
+            held: None,
+        }),
+        ..weekly.clone()
+    };
+    let (id, said) = expect(&left, &cfg());
+    assert!(said.contains("on Oct 23 at 8am"), "{id}: {said:?}");
+    let (id, said) = expect(&left, &off);
+    assert!(!said.contains("Oct 23"), "{id}: {said:?}");
+}
+
+/// A WEEKLY LIMIT ON A ROSTER ROW'S LOGIN NEVER ASKS FOR `/login` IN THE TAB
+/// (the review's acct-1, acct-7): that would sign another account into the
+/// row's own login, and every session on it would follow. The roster's word
+/// chooses the step: another row ready to run now, by `accounts use` (acct3-5:
+/// the roster report said no listed account could take over while one could),
+/// another row to sign in by name (renewal for an email row, `accounts login`
+/// without), the roster report where no row is ready or left to sign in, and
+/// the same report where the roster or the state was unread — a person's own
+/// `/login` left at the limit included. A multi-day WAIT the
+/// roster advises is told the sign-in by name too, where one stands (acct-4:
+/// the tab waited silently for days). NEGATIVE CONTROLS: no roster word and
+/// an unlisted login are `/login` in the tab as before; a multi-day wait with
+/// no row to sign in, and a short one, tell nothing.
+#[test]
+fn a_weekly_limit_on_a_roster_row_names_the_rosters_step_never_login_in_the_tab() {
+    use crate::supervise::policy::turn_end::{
+        AccountAdvice, HeldBy, Ready, RosterWord, SignInNext,
+    };
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    weekly.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let with = |word: Option<RosterWord>| TurnEndReading {
+        roster: word,
+        ..weekly.clone()
+    };
+    let next = |renew: bool| RosterWord::Row {
+        next: Some(SignInNext {
+            label: "m8-2".to_string(),
+            renew,
+        }),
+        ready: None,
+        held: None,
+    };
+    let none = RosterWord::Row {
+        next: None,
+        ready: None,
+        held: None,
+    };
+    let ready = |next: Option<SignInNext>| RosterWord::Row {
+        next,
+        ready: Some(Ready {
+            label: "m8-3".to_string(),
+        }),
+        held: Some(HeldBy::Earlier),
+    };
+    for (word, id, step) in [
+        (ready(None), "limit-use", "aterm harness accounts use m8-3"),
+        (
+            ready(Some(SignInNext {
+                label: "m8-2".to_string(),
+                renew: true,
+            })),
+            "limit-use",
+            "aterm harness accounts use m8-3",
+        ),
+        (
+            next(true),
+            "limit-renew",
+            "aterm harness accounts renew m8-2",
+        ),
+        (
+            next(false),
+            "limit-login",
+            "aterm harness accounts login m8-2",
+        ),
+        (none.clone(), "limit-roster", "aterm harness accounts"),
+        (RosterWord::Unread, "limit-unread", "aterm harness accounts"),
+    ] {
+        let r = with(Some(word.clone()));
+        let e = exception_for(&st, &r, &cfg(), t).expect("told");
+        assert_eq!((e.kind, e.when), (ExceptionKind::Login, Urgency::Now));
+        assert_eq!(e.notice.as_ref().map(|n| n.id), Some(id), "{word:?}");
+        assert!(e.action.ends_with(step), "{word:?}: {e:?}");
+        assert!(!e.action.contains("/login"), "{word:?}: {e:?}");
+        // A person's own `/login` left there: the roster's step, not `/login`.
+        let left = TurnEndReading {
+            wall: None,
+            login_interrupted: true,
+            ..r.clone()
+        };
+        let e = exception_for(&st, &left, &cfg(), t).expect("told");
+        assert_eq!(e.notice.as_ref().map(|n| n.id), Some(id), "{word:?}");
+    }
+    // A multi-day wait with a row to sign in: that row's step.
+    let far = |word: Option<RosterWord>, days: u32| TurnEndReading {
+        account: Some(AccountAdvice::Wait {
+            until: t + days * 24 * 60 * MIN,
+        }),
+        ..with(word)
+    };
+    let e = exception_for(&st, &far(Some(next(true)), 6), &cfg(), t).expect("told");
+    assert_eq!(e.notice.as_ref().map(|n| n.id), Some("limit-renew"));
+    // NEGATIVE CONTROLS.
+    for word in [None, Some(RosterWord::Unlisted)] {
+        let e = exception_for(&st, &with(word.clone()), &cfg(), t).expect("told");
+        assert_eq!(e.notice.as_ref().map(|n| n.id), Some("limit-sign-in"));
+        assert!(e.action.contains("/login"), "{word:?}: {e:?}");
+    }
+    assert_eq!(exception_for(&st, &far(Some(none), 6), &cfg(), t), None);
+    assert_eq!(exception_for(&st, &far(None, 6), &cfg(), t), None);
+    assert_eq!(
+        exception_for(&st, &far(Some(next(true)), 0), &cfg(), t),
+        None,
+        "a wait under six hours tells nothing"
+    );
+}
+
+/// A SWITCH IS PROMISED ONLY WHERE ONE CAN FOLLOW (the review of the login
+/// carry, r3h-2: under `accounts = "off"` the owner ran the `accounts use`
+/// the notice asked for, which only pinned the account; the tab never moved,
+/// and the notice asked again). Where the owner's aterm.toml keeps aterm from
+/// switching the tab — `accounts = "off"`, `relaunch = false` as a window's
+/// host reads it (the loop's config always says it on there, and the host
+/// relaunches nothing: r4h-1), or `resume_limits = false` (at a person's
+/// `/login` left at the limit, where the notice stands with it off) — a
+/// roster row's limit with another row ready, or to sign in, is told the
+/// line that lets the tab switch, naming that row: never `accounts use`, nor
+/// a sign-in whose expectation is a switch. Where nothing here relaunches
+/// the tab whatever aterm.toml says, the roster report. NEGATIVE CONTROLS:
+/// the default switches tell `accounts use` and the sign-in by name as
+/// before; a row with nothing to switch to is the roster report under every
+/// switch.
+#[test]
+fn a_weekly_limit_promises_a_switch_only_where_one_can_follow() {
+    use crate::harness::accounts::Mode;
+    use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    weekly.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let told = |r: &TurnEndReading, cfg: &SupervisorConfig| {
+        let e = exception_for(&st, r, cfg, t).expect("told");
+        let n = e.notice.expect("a notice");
+        (n.id, e.action, n.did)
+    };
+    let ready = RosterWord::Row {
+        next: None,
+        ready: Some(Ready {
+            label: "m8-3".to_string(),
+        }),
+        held: Some(HeldBy::Pin),
+    };
+    let next = RosterWord::Row {
+        next: Some(SignInNext {
+            label: "m8-2".to_string(),
+            renew: true,
+        }),
+        ready: None,
+        held: None,
+    };
+    // What a window's host reads where the owner's `relaunch = false` holds
+    // the tab: its config's `relaunch` on, no restart, the switch off.
+    let relaunch_off = |r: &TurnEndReading| TurnEndReading {
+        restartable: false,
+        relaunch_off: true,
+        ..r.clone()
+    };
+    // The ready row is one the roster holds the tab off (the owner's pin):
+    // with the lines set, the next step is named rather than a switch by
+    // itself promised (r4h-4).
+    // A row still to sign in: with the lines set its sign-in is the next
+    // step, not a switch (r5h-2).
+    for (word, row, promised, stays) in [
+        (ready, "m8-3", "limit-use", "limit-stay-held"),
+        (next, "m8-2", "limit-renew", "limit-stay-held"),
+    ] {
+        let at_wall = TurnEndReading {
+            roster: Some(word.clone()),
+            ..weekly.clone()
+        };
+        // A person's own `/login` left at the limit: told whatever
+        // `resume_limits` says.
+        let left = TurnEndReading {
+            wall: None,
+            login_interrupted: true,
+            ..at_wall.clone()
+        };
+        let accounts_off = SupervisorConfig {
+            accounts: Mode::Off,
+            ..cfg()
+        };
+        let resume_off = SupervisorConfig {
+            resume_limits: false,
+            ..cfg()
+        };
+        for (r, cfg, line) in [
+            (&at_wall, &accounts_off, notice::STAY_WHYS[0]),
+            (&relaunch_off(&at_wall), &cfg(), notice::STAY_WHYS[1]),
+            (&left, &resume_off, notice::STAY_WHYS[3]),
+        ] {
+            let (id, action, did) = told(r, cfg);
+            assert_eq!(id, stays, "{word:?}, {line}");
+            assert!(action.contains(line), "{word:?}: {action:?}");
+            assert!(did.contains(row), "{word:?}: {did:?}");
+        }
+        // Nothing here relaunches the tab: the roster report, whatever
+        // aterm.toml says.
+        let unrestartable = TurnEndReading {
+            restartable: false,
+            ..at_wall.clone()
+        };
+        assert_eq!(told(&unrestartable, &cfg()).0, "limit-roster", "{word:?}");
+        assert_eq!(
+            told(
+                &unrestartable,
+                &SupervisorConfig {
+                    accounts: Mode::Off,
+                    ..cfg()
+                }
+            )
+            .0,
+            "limit-roster",
+            "{word:?}"
+        );
+        // NEGATIVE CONTROLS: a switch can follow.
+        assert_eq!(told(&at_wall, &cfg()).0, promised, "{word:?}");
+        assert_eq!(told(&left, &cfg()).0, promised, "{word:?}");
+    }
+    // NEGATIVE CONTROL: nothing to switch to is the roster report, held or
+    // not.
+    let none = TurnEndReading {
+        roster: Some(RosterWord::Row {
+            next: None,
+            ready: None,
+            held: None,
+        }),
+        ..weekly.clone()
+    };
+    let accounts_off = SupervisorConfig {
+        accounts: Mode::Off,
+        ..cfg()
+    };
+    for (r, cfg) in [
+        (none.clone(), cfg()),
+        (none.clone(), accounts_off),
+        (relaunch_off(&none), cfg()),
+    ] {
+        assert_eq!(told(&r, &cfg).0, "limit-roster");
+    }
+}
+
+/// EVERY SETTING THAT HOLDS THE TAB IS NAMED, together (the review of the
+/// login carry, r4h-2: named the first alone, the owner set it, and the next
+/// notice named another — the first notice's promise false): with two or
+/// three of `accounts = "off"`, `relaunch = false` and `resume_limits =
+/// false` holding a roster row's limit beside a ready row, the step names
+/// the line for each, and a clause the notice is raised with
+/// ([`NoticeText::whys`]). NEGATIVE CONTROL: one setting off names its line
+/// and no other.
+#[test]
+fn every_setting_that_holds_a_limits_tab_is_named() {
+    use crate::harness::accounts::Mode;
+    use crate::supervise::policy::turn_end::{Ready, RosterWord};
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    // A person's own `/login` left at the limit: the one point told with
+    // `resume_limits` off.
+    let left = TurnEndReading {
+        wall: None,
+        login_interrupted: true,
+        roster: Some(RosterWord::Row {
+            next: None,
+            ready: Some(Ready {
+                label: "m8-3".to_string(),
+            }),
+            held: None,
+        }),
+        ..weekly.clone()
+    };
+    let lines = [
+        "accounts = \"wall\"",
+        "relaunch = true",
+        "resume_limits = true",
+    ];
+    let mut told = BTreeSet::new();
+    for bits in 1..8_u8 {
+        let off = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0];
+        let cfg = SupervisorConfig {
+            accounts: if off[0] { Mode::Off } else { Mode::Early },
+            resume_limits: !off[2],
+            ..cfg()
+        };
+        let r = TurnEndReading {
+            restartable: !off[1],
+            relaunch_off: off[1],
+            ..left.clone()
+        };
+        let e = exception_for(&st, &r, &cfg, t).expect("told");
+        assert_eq!(
+            e.notice.as_ref().map(|n| n.id),
+            Some("limit-stay"),
+            "{off:?}"
+        );
+        for (line, held) in lines.iter().zip(off) {
+            assert_eq!(e.action.contains(line), held, "{off:?}: {}", e.action);
+        }
+        assert!(
+            notice::STAY_WHYS.iter().any(|why| e.action.contains(why)),
+            "{off:?}: {}",
+            e.action
+        );
+        told.insert(e.action);
+    }
+    assert_eq!(told.len(), 7, "each combination in its own words: {told:?}");
+}
+
+/// THE ROSTER'S REPORTS PROMISE NO CONTINUATION WHERE aterm MAKES NONE (the
+/// review of the login carry, r4h-3): at a person's `/login` left at a
+/// weekly limit with `resume_limits = false`, nothing continues the tab past
+/// its reset — no relaunch, no `keep going` — so a roster row's limit with
+/// no row to take over, or a roster aterm could not read, is told an
+/// expectation that says aterm does not continue the tab, whatever else
+/// holds it (the reset never named: the row is drawn over). NEGATIVE
+/// CONTROL: with `resume_limits` on, the reports say the session continues
+/// by itself, as before.
+#[test]
+fn a_limits_report_promises_no_continuation_where_aterm_makes_none() {
+    use crate::harness::accounts::Mode;
+    use crate::supervise::policy::turn_end::RosterWord;
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let none = RosterWord::Row {
+        next: None,
+        ready: None,
+        held: None,
+    };
+    for (word, open, kept) in [
+        (none, &notice::LIMIT_ROSTER, &notice::LIMIT_ROSTER_KEPT),
+        (
+            RosterWord::Unread,
+            &notice::LIMIT_UNREAD,
+            &notice::LIMIT_UNREAD_KEPT,
+        ),
+    ] {
+        let left = TurnEndReading {
+            wall: None,
+            login_interrupted: true,
+            roster: Some(word.clone()),
+            ..weekly.clone()
+        };
+        let unrestartable = TurnEndReading {
+            restartable: false,
+            ..left.clone()
+        };
+        let resume = |on: bool, accounts: Mode| SupervisorConfig {
+            resume_limits: on,
+            accounts,
+            ..cfg()
+        };
+        for (r, cfg) in [
+            (&left, resume(false, Mode::Early)),
+            (&left, resume(false, Mode::Off)),
+            (&unrestartable, resume(false, Mode::Early)),
+        ] {
+            let e = exception_for(&st, r, &cfg, t).expect("told");
+            let n = e.notice.expect("a notice");
+            assert_eq!(n.id, kept.id, "{word:?}");
+            assert_eq!(n.expect, kept.expect, "{word:?}");
+            assert_ne!(n.expect, open.expect, "{word:?}");
+        }
+        // NEGATIVE CONTROL: aterm continues the tab past its reset.
+        let e = exception_for(&st, &left, &resume(true, Mode::Early), t).expect("told");
+        let n = e.notice.expect("a notice");
+        assert_eq!(
+            (n.id, n.expect.as_str()),
+            (open.id, open.expect),
+            "{word:?}"
+        );
+    }
+}
+
+/// A SWITCH BY ITSELF IS PROMISED ONLY WHERE THE ROSTER MAKES ONE (the review
+/// of the login carry, r4h-4): where the roster's own advice holds the tab at
+/// its limit even once another row is ready (`held`: a limit from before
+/// this Claude Code under `accounts = "wall"`, the owner's pin, a limit
+/// reset kept), a sign-in by name and the line that lets the tab switch are
+/// told with an expectation that names the next step — the step and what
+/// aterm did unchanged. NEGATIVE CONTROL: nothing holding the tab, the same
+/// steps promise the switch by itself. (The line that lets the tab switch:
+/// [`the_lines_that_let_a_tab_switch_promise_one_only_beside_a_ready_row`].)
+#[test]
+fn a_switch_by_itself_is_promised_only_where_the_roster_makes_one() {
+    use crate::supervise::policy::turn_end::{HeldBy, RosterWord, SignInNext};
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let next = |renew: bool, held: Option<HeldBy>| RosterWord::Row {
+        next: Some(SignInNext {
+            label: "m8-2".to_string(),
+            renew,
+        }),
+        ready: None,
+        held,
+    };
+    for (renew, free, held_text) in [
+        (true, &notice::LIMIT_RENEW, &notice::LIMIT_RENEW_HELD),
+        (false, &notice::LIMIT_LOGIN, &notice::LIMIT_LOGIN_HELD),
+    ] {
+        let mut steps = BTreeSet::new();
+        for held in [HeldBy::Earlier, HeldBy::Pin, HeldBy::Reset] {
+            let r = TurnEndReading {
+                roster: Some(next(renew, Some(held))),
+                ..weekly.clone()
+            };
+            let e = exception_for(&st, &r, &cfg(), t).expect("told");
+            let n = e.notice.expect("a notice");
+            assert_eq!(n.id, held_text.id, "{held:?}");
+            assert_eq!(n.expect, held_text.fill(Some("m8-2"), None).expect);
+            assert_ne!(n.expect, free.fill(Some("m8-2"), None).expect);
+            steps.insert((e.action, n.did));
+        }
+        // NEGATIVE CONTROL: nothing holds the tab.
+        let r = TurnEndReading {
+            roster: Some(next(renew, None)),
+            ..weekly.clone()
+        };
+        let e = exception_for(&st, &r, &cfg(), t).expect("told");
+        let n = e.notice.expect("a notice");
+        assert_eq!(n.id, free.id);
+        steps.insert((e.action, n.did));
+        assert_eq!(
+            steps.len(),
+            1,
+            "{}: the step and the did: {steps:?}",
+            free.id
+        );
+    }
+}
+
+/// THE LINES THAT LET A TAB SWITCH PROMISE A SWITCH ONLY BESIDE A READY ROW
+/// NOTHING HOLDS THE TAB OFF (the review of the login carry, r5h-2): under
+/// `accounts = "off"`, with the only other row still to sign in, the owner
+/// read "Set accounts = \"wall\"." and "aterm then switches the tab…" — set,
+/// the next notice was that row's sign-in, no switch. Such a row, and a
+/// ready one the roster holds the tab off, are told the lines with the next
+/// step named (`limit-stay-held`), the reset known or not, and no
+/// expectation of theirs says the tab switches. NEGATIVE CONTROL: a ready
+/// row nothing holds the tab off is told the lines and the switch that
+/// follows them (`limit-stay`).
+#[test]
+fn the_lines_that_let_a_tab_switch_promise_one_only_beside_a_ready_row() {
+    use crate::harness::accounts::Mode;
+    use crate::supervise::limit::ResetClock;
+    use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    weekly.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let off = SupervisorConfig {
+        accounts: Mode::Off,
+        ..cfg()
+    };
+    let told = |word: RosterWord, clock: bool| {
+        let r = TurnEndReading {
+            roster: Some(word),
+            reset_clock: if clock {
+                ResetClock::of(Some("Oct 23 at 8am (America/Los_Angeles)"))
+            } else {
+                None
+            },
+            ..weekly.clone()
+        };
+        let e = exception_for(&st, &r, &off, t).expect("told");
+        assert!(e.action.contains(notice::STAY_WHYS[0]), "{e:?}");
+        let n = e.notice.expect("a notice");
+        (n.id, n.expect)
+    };
+    let next = |held: Option<HeldBy>| RosterWord::Row {
+        next: Some(SignInNext {
+            label: "m8-2".to_string(),
+            renew: true,
+        }),
+        ready: None,
+        held,
+    };
+    let ready = |held: Option<HeldBy>| RosterWord::Row {
+        next: None,
+        ready: Some(Ready {
+            label: "m8-3".to_string(),
+        }),
+        held,
+    };
+    for clock in [true, false] {
+        for word in [
+            next(None),
+            next(Some(HeldBy::Earlier)),
+            ready(Some(HeldBy::Pin)),
+        ] {
+            let (id, expect) = told(word.clone(), clock);
+            assert_eq!(id, notice::LIMIT_STAY_HELD.id, "{word:?} {clock}");
+            assert!(!expect.contains("switches"), "{word:?}: {expect:?}");
+            assert_eq!(expect.contains("Oct 23"), clock, "{expect:?}");
+        }
+        // NEGATIVE CONTROL: a ready row nothing holds the tab off.
+        let (id, expect) = told(ready(None), clock);
+        assert_eq!(id, notice::LIMIT_STAY.id, "{clock}");
+        assert!(expect.contains("switches"), "{expect:?}");
+    }
+}
+
+/// A READY ROW NOTHING HOLDS THE TAB OFF IS THE ROSTER'S OWN MOVE (the review
+/// of the login carry, r5h-3): its `held` is `None` where the roster would
+/// move the tab itself, and where the point was not asked about — a
+/// person's draft in the composer, an upgrade holding the point — the owner
+/// was told "this Claude Code started after the limit" (false: this process
+/// hit it) and the pin of every session that the roster's own move makes
+/// needless. Told nothing there; a relaunch onto the row the host refused
+/// (the latch) is the rotation failed, and named as such, never as the
+/// limit from before this Claude Code. NEGATIVE CONTROL: a row the roster
+/// holds the tab off (the limit from before this Claude Code) is still told
+/// `accounts use` naming that cause, over a draft too.
+#[test]
+fn a_ready_row_nothing_holds_the_tab_off_is_the_rosters_own_move() {
+    use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord};
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    weekly.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let row = |held: Option<HeldBy>| RosterWord::Row {
+        next: None,
+        ready: Some(Ready {
+            label: "m8-3".to_string(),
+        }),
+        held,
+    };
+    let draft = TurnEndReading {
+        roster: Some(row(None)),
+        composer: Composer::Typed,
+        ..weekly.clone()
+    };
+    let upgrading = TurnEndReading {
+        roster: Some(row(None)),
+        upgrading: true,
+        ..weekly.clone()
+    };
+    for r in [&draft, &upgrading] {
+        assert_eq!(exception_for(&st, r, &cfg(), t), None, "{r:?}");
+    }
+    // The host refused the relaunch onto the row: the rotation failed, and
+    // the notice says so.
+    let mut refused = st.clone();
+    refused.seed_account_unmade();
+    assert!(refused.account_refused());
+    let e = exception_for(&refused, &draft, &cfg(), t).expect("told");
+    let n = e.notice.expect("a notice");
+    assert_eq!(n.id, notice::LIMIT_USE.id);
+    assert!(n.did.contains(notice::WHY_USE_UNMADE), "{:?}", n.did);
+    assert!(!n.did.contains(notice::WHY_USE_EARLIER), "{:?}", n.did);
+    // NEGATIVE CONTROL: the roster holds the tab off the row.
+    let held = TurnEndReading {
+        roster: Some(row(Some(HeldBy::Earlier))),
+        ..draft.clone()
+    };
+    let e = exception_for(&st, &held, &cfg(), t).expect("told");
+    let n = e.notice.expect("a notice");
+    assert_eq!(n.id, notice::LIMIT_USE.id);
+    assert!(n.did.contains(notice::WHY_USE_EARLIER), "{:?}", n.did);
+}
+
+/// A ROW READY NOW THAT THE TAB WAS NOT MOVED TO IS TOLD WITH WHAT HELD THE
+/// TAB (the review of the band, ox4-5: "aterm does not switch this tab by
+/// itself" beside "ready to take over now" read as a fault, and named no
+/// cause): `accounts use`'s notice says, in what aterm did, which of the
+/// roster's reasons kept the tab where it is — the limit from before this
+/// Claude Code started, the owner's pin, a limit reset kept — each in words
+/// of its own, beside the row. NEGATIVE CONTROL: the step is the same
+/// whatever the cause, and so is what follows it.
+#[test]
+fn a_ready_row_the_tab_stayed_off_says_what_held_it() {
+    use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord};
+    let t = t0();
+    let mut weekly = walled(
+        WallKind::UsageWeekly,
+        "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
+    );
+    weekly.reset_at = Some(t + 6 * 24 * 60 * MIN);
+    weekly.resumes_by_itself = true;
+    let mut st = TurnEndState::default();
+    st.observe(&weekly, t);
+    let mut dids = std::collections::BTreeSet::new();
+    let mut steps = std::collections::BTreeSet::new();
+    for held in [HeldBy::Earlier, HeldBy::Pin, HeldBy::Reset] {
+        let r = TurnEndReading {
+            roster: Some(RosterWord::Row {
+                next: None,
+                ready: Some(Ready {
+                    label: "m8-3".to_string(),
+                }),
+                held: Some(held),
+            }),
+            ..weekly.clone()
+        };
+        let e = exception_for(&st, &r, &cfg(), t).expect("told");
+        let n = e.notice.expect("a notice");
+        assert_eq!(n.id, "limit-use", "{held:?}");
+        assert!(
+            n.did.contains(held.why()) && n.did.contains("m8-3"),
+            "{held:?}: {:?}",
+            n.did
+        );
+        assert!(notice::USE_WHYS.contains(&held.why()), "{held:?}");
+        dids.insert(n.did);
+        steps.insert((e.action, n.expect));
+    }
+    assert_eq!(dids.len(), 3, "each cause in its own words: {dids:?}");
+    assert_eq!(steps.len(), 1, "the control: {steps:?}");
 }

@@ -814,6 +814,27 @@ fn a_command_pairs_only_with_the_result_directly_under_it() {
     );
 }
 
+/// [`scan`] reads back to the floor: a row stamped in the floor's own second is
+/// the process's, and the first row stamped before it ends the scan as a
+/// predecessor's, so no row above it is read whatever its stamp (the file is in
+/// append order), and the scan says it met the floor (the read's `resumed`).
+#[test]
+fn the_floor_second_is_the_processs_and_the_first_row_before_it_ends_the_scan() {
+    let floor = crate::harness::upgrade_models::parse_utc("2026-09-28T15:00:00Z");
+    let at_floor = answer_at("claude-opus-5-5", "2026-09-28T15:00:00.900Z", Some("high"));
+    let before = answer_at("claude-fable-5-1", "2026-09-28T14:59:59.900Z", None);
+    let above = answer_at("claude-sonnet-5", "2026-09-28T15:10:00.000Z", Some("low"));
+    let read = |rows: &[&str]| {
+        let (facts, floored) = scan(body(rows).as_bytes(), floor);
+        (facts.model, facts.effort, floored)
+    };
+    assert_eq!(
+        read(&[&at_floor]),
+        (Said::Is("Opus 5.5".into()), Said::Is("high".into()), false)
+    );
+    assert_eq!(read(&[&above, &before]), (Said::Unsaid, Said::Unsaid, true));
+}
+
 /// One Claude Code process on disk for the resolver's tests: registry
 /// file, transcripts, and the read clock (its start until [`Self::at`]).
 #[cfg(unix)]
@@ -3057,6 +3078,54 @@ fn the_facts_are_set_as_a_line_of_type() {
     assert!(set_facts(&[]).glyphs.is_empty());
 }
 
+#[test]
+fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elided() {
+    for email in [
+        "jose\u{0301}@example.com",
+        "x\u{0301}\u{0323}@example.com",
+        "使用者👩‍💻@example.com",
+    ] {
+        let set = set_facts(&[Segment {
+            mark: ACCOUNT_MARK,
+            text: email.into(),
+        }]);
+        let mut actual = String::new();
+        for glyph in set.glyphs.iter().filter(|glyph| !glyph.mark) {
+            assert!(glyph.cell + glyph.cols <= set.cells);
+            if let Some((_, cluster)) = set.clusters.iter().find(|(col, _)| *col == glyph.cell) {
+                actual.push_str(cluster);
+            } else {
+                actual.push(glyph.ch);
+                if let Some((_, marks)) = set.combining.iter().find(|(col, _)| *col == glyph.cell) {
+                    actual.extend(marks.iter());
+                }
+            }
+        }
+        assert_eq!(actual, email);
+        if email.contains('👩') {
+            assert!(
+                set.glyphs.iter().all(|glyph| glyph.nudge == 0),
+                "full-size color emoji must leave adjacent text at native pitch"
+            );
+            let emoji = set.glyphs.iter().find(|glyph| glyph.ch == '👩').unwrap();
+            let at = set.glyphs.iter().find(|glyph| glyph.ch == '@').unwrap();
+            assert!(at.cell >= emoji.cell + emoji.cols);
+        }
+    }
+    for (email, expected) in [
+        ("123456e\u{0301}x@example.com", "123456e\u{0301}…"),
+        ("12345👩‍💻x@example.com", "12345👩‍💻…"),
+    ] {
+        let mut account = [Segment {
+            mark: ACCOUNT_MARK,
+            text: email.into(),
+        }];
+        assert!(shorten_subscription_account(&mut account, 8));
+        assert_eq!(account[0].text, expected);
+        assert_eq!(text_width(&account[0].text), 8);
+    }
+}
+
 /// The order of giving way ([`fit_rule`]): a light's transient title first
 /// (whole, then short, then none), then the path is cut to `…/<dir>`, the
 /// branch goes, the path, the effort, then the chips; the model last. A light's
@@ -3497,6 +3566,167 @@ fn the_account_costs_only_the_tokens() {
         unnamed_of(&walk_down(&named("work-2", &bare))),
         walk_down(&bare)
     );
+}
+
+#[test]
+fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() {
+    let facts = FooterFacts {
+        subscription: Some(super::super::profile::SubscriptionDisplay {
+            email: Some("owner@example.com".into()),
+            plan: Some("Max 5x".into()),
+            weekly: Some("weekly 29% left".into()),
+        }),
+        ..narrow_rule_facts()
+    };
+    let whole = segments(&facts);
+    assert!(
+        whole
+            .iter()
+            .any(|s| s.mark == PLAN_MARK && s.text == "Max 5x")
+    );
+    let short = fit_rule(&facts, 45, None);
+    assert!(
+        short
+            .segments
+            .iter()
+            .any(|s| s.mark == ACCOUNT_MARK && s.text == "owner@example.com")
+    );
+    assert!(
+        short
+            .segments
+            .iter()
+            .any(|s| s.mark == WEEKLY_MARK && s.text == "weekly 29% left")
+    );
+    assert!(
+        !short
+            .segments
+            .iter()
+            .any(|s| s.mark == PATH_MARK || s.mark == BRANCH_MARK)
+    );
+    for room in 0..=180 {
+        let fit = fit_rule(&facts, room, None);
+        assert!(fit.width(None) <= room, "{room}: {fit:?}");
+    }
+    let missing = FooterFacts {
+        subscription: Some(super::super::profile::SubscriptionDisplay::default()),
+        ..FooterFacts::default()
+    };
+    let shown = segments(&missing);
+    assert!(shown.iter().any(|s| s.text == "account unavailable"));
+    assert!(shown.iter().any(|s| s.text == "weekly unavailable"));
+}
+
+#[test]
+fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
+    for email in ["owner@example.com", "使用者與工作帳號在公司@example.com"] {
+        let facts = FooterFacts {
+            subscription: Some(super::super::profile::SubscriptionDisplay {
+                email: Some(email.into()),
+                plan: Some("Max 5x".into()),
+                weekly: Some("weekly 29% left".into()),
+            }),
+            ..narrow_rule_facts()
+        };
+        for columns in [80, 100, 120] {
+            let room = rule_room(&(0..columns));
+            let budget = chips_room(&facts, room);
+            // The GUI's faces at rest: `∞` (1 cell) and `⤓ land` (6); then
+            // `∞ ⏸ plan` and its wider light faces (3, 8, 10 and 14 were
+            // measured while a `⚙` chip, since removed, stood beside them, so
+            // they cover wider rows). The last case exercises a block that
+            // consumes its whole advertised budget.
+            for chips in [1, 3, 6, 8, 10, 14, budget] {
+                assert!(chips <= budget, "{columns}: {chips} > {budget}");
+                for reason in [false, true] {
+                    let lights = Some(LightsWidth {
+                        chips,
+                        title: 50,
+                        lean: [0; LEAN_FORMS],
+                        short: 20,
+                        reason,
+                    });
+                    let fit = fit_rule(&facts, room, lights);
+                    assert!(fit.width(lights) <= room, "{columns}/{chips}: {fit:?}");
+                    assert!(fit.chips, "{columns}/{chips}: controls stay available");
+                    assert!(
+                        fit.segments.iter().any(|s| s.mark == ACCOUNT_MARK),
+                        "{columns}/{chips}: selected account remains visible: {fit:?}"
+                    );
+                    assert!(
+                        fit.segments
+                            .iter()
+                            .any(|s| s.mark == WEEKLY_MARK && s.text == "weekly 29% left"),
+                        "{columns}/{chips}: weekly quota remains visible: {fit:?}"
+                    );
+                    if chips == budget {
+                        let account = fit
+                            .segments
+                            .iter()
+                            .find(|s| s.mark == ACCOUNT_MARK)
+                            .unwrap();
+                        assert!(text_width(&account.text) <= 8, "{fit:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn subscription_keeps_a_standing_limit_and_controls_before_secondary_facts() {
+    let facts = FooterFacts {
+        subscription: Some(super::super::profile::SubscriptionDisplay {
+            email: Some("owner@example.com".into()),
+            plan: Some("Max 5x".into()),
+            weekly: Some("weekly 0% left".into()),
+        }),
+        ..narrow_rule_walled()
+    };
+    let wall: Vec<_> = segments(&facts)
+        .into_iter()
+        .filter(|s| s.mark == WALL_MARK)
+        .collect();
+    assert_eq!(wall.len(), 1);
+    for chips in [1, 3, 8, 10, 14] {
+        let lights = Some(LightsWidth {
+            chips,
+            title: 0,
+            lean: [0; LEAN_FORMS],
+            short: 0,
+            reason: true,
+        });
+        let room = rule_width(&wall, TitleFit::None, true, lights);
+        let fit = fit_rule(&facts, room, lights);
+        assert!(fit.chips, "{room}/{chips}: controls remain usable");
+        assert_eq!(
+            fit.segments, wall,
+            "{room}/{chips}: the limit is actionable"
+        );
+        assert!(fit.width(lights) <= room);
+    }
+}
+
+#[test]
+fn subscription_control_glyph_outlasts_the_model_when_essentials_cannot_fit() {
+    let facts = FooterFacts {
+        subscription: Some(super::super::profile::SubscriptionDisplay::default()),
+        ..narrow_rule_facts()
+    };
+    for chips in [1, 3, 8, 10, 14] {
+        let lights = Some(LightsWidth {
+            chips,
+            title: 0,
+            lean: [0; LEAN_FORMS],
+            short: 0,
+            reason: true,
+        });
+        let room = chips + 2;
+        assert!(chips <= chips_room(&facts, room));
+        let fit = fit_rule(&facts, room, lights);
+        assert!(fit.chips, "{room}/{chips}: model must not hide controls");
+        assert!(fit.segments.is_empty());
+        assert!(fit.width(lights) <= room);
+    }
 }
 
 /// A light's reason and a live upgrade's note, short, each take the account's
@@ -4043,9 +4273,9 @@ fn the_acts_label_is_drawn_whole_or_not_at_all_never_at_a_facts_cost() {
         branch: Some("main".into()),
         ..FooterFacts::default()
     };
-    // `✓ approved` and its two-cell gap; the Autopilot chip and `⚙`.
+    // `✓ approved` and its two-cell gap; the Autopilot chip, `∞`.
     let label = Some(LightsWidth {
-        chips: 3,
+        chips: 1,
         title: "\u{2713} approved".chars().count() + 2,
         lean: [0; LEAN_FORMS],
         short: 0,
@@ -4119,8 +4349,8 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         ..FooterFacts::default()
     };
     let whole = segments(&facts);
-    // `∞ ⚙ ⏸ manual`: the Autopilot chip, `⚙` and Claude's mode light.
-    let chips = "\u{221e} \u{2699} \u{23f8} manual".chars().count();
+    // `∞ ⏸ manual`: the Autopilot chip and Claude's mode light.
+    let chips = "\u{221e} \u{23f8} manual".chars().count();
     let label = LightsWidth {
         chips,
         title: "\u{2713} approved".chars().count() + 2,

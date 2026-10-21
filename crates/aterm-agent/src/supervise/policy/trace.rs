@@ -17,11 +17,11 @@
 //! and a recording one decide through [`NoTrace`]: a step is built only
 //! behind [`Trace::on`] ([`note`]), so a live decision builds no string and
 //! allocates nothing for a trace it does not keep, and a tape holds no trace
-//! (a trace is a function of what the tape does hold). Diagnostic callers
-//! can collect approval steps by deciding again from the recorded facts and
-//! policy inputs. A turn-end reader would need to rebuild the fold through
-//! strict replay on the recording build. These public diagnostic APIs have
-//! no current CLI reader.
+//! (a trace is a function of what the tape does hold). `aterm drive replay
+//! --why` (`tape::explain`) collects an approval's steps by deciding again
+//! from the recorded facts and policy inputs, and a turn end's by rebuilding
+//! the fold in a strict replay on the recording build, the one replay that
+//! traces (`Fx::tracing`).
 //!
 //! **Named by rule id.** A step that decided by a rule names it
 //! ([`TraceStep::rule`]: `read-only@classify-v3`, `continue@v1`); a check

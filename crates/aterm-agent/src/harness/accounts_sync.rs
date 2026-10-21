@@ -39,6 +39,9 @@ use super::upgrade;
 /// Default Google Sheet CSV export URL for the fleet accounting sheet.
 pub const DEFAULT_SHEET_CSV_URL: &str = "https://docs.google.com/spreadsheets/d/1L9faHzjgBBubjDGrrptjzAi9OQCt-oOm7LvETIiR_xI/export?format=csv&gid=0";
 
+/// Default rclone remote path for the fleet accounting sheet on Google Drive.
+pub const DEFAULT_RCLONE_SHEET_CSV: &str = "gdrive:AI Email Accounting.csv";
+
 /// Default filename in `~/Downloads` exported from the Google Sheet.
 pub const DEFAULT_DOWNLOADS_CSV: &str = "AI Email Accounting - emails.csv";
 
@@ -627,6 +630,7 @@ pub fn find_default_home_standing_wall(
     let projects = claude_dir.join("projects");
     let entries = fs::read_dir(&projects).ok()?;
     let mut newest_wall: Option<upgrade::StandingWall> = None;
+    let mut newest_clear_at: u64 = 0;
     for proj in entries.flatten() {
         let Ok(ft) = proj.file_type() else {
             continue;
@@ -646,6 +650,9 @@ pub fn find_default_home_standing_wall(
                 continue;
             };
             let Some(wall) = upgrade::transcript_standing_wall(&tail) else {
+                if let Some(ans) = upgrade::transcript_last_answer(&tail, u64::MAX) {
+                    newest_clear_at = newest_clear_at.max(ans);
+                }
                 continue;
             };
             let until = wall.until.and_then(|u| i64::try_from(u).ok());
@@ -656,7 +663,7 @@ pub fn find_default_home_standing_wall(
             }
         }
     }
-    newest_wall
+    newest_wall.filter(|w| w.at >= newest_clear_at)
 }
 
 fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
@@ -768,7 +775,7 @@ pub fn load_fleet_source(env: &Env, source: Option<&str>) -> Result<FleetRoster,
         Some(s) if !s.trim().is_empty() => s.trim().to_owned(),
         _ => default_sync_source(env),
     };
-    let raw = fetch_source_text(&chosen)?;
+    let raw = fetch_source_text(env, &chosen)?;
     if chosen.ends_with(".toml") || raw.trim_start().starts_with('#') || raw.contains("[[account]]")
     {
         FleetRoster::from_toml(&raw, &chosen)
@@ -808,7 +815,39 @@ fn decode_source_text(bytes: Vec<u8>, source: &str) -> Result<String, String> {
         .map_err(|e| format!("account source at {source} is not valid UTF-8: {e}"))
 }
 
-fn fetch_source_text(source: &str) -> Result<String, String> {
+fn rclone_program() -> &'static str {
+    for candidate in [
+        "/opt/homebrew/bin/rclone",
+        "/usr/local/bin/rclone",
+        "/usr/bin/rclone",
+    ] {
+        if Path::new(candidate).is_file() {
+            return candidate;
+        }
+    }
+    "rclone"
+}
+
+fn fetch_rclone_csv(env: &Env, remote: &str) -> Result<String, String> {
+    let mut cmd = aterm_uds::spawnfd::command(rclone_program());
+    if let Some(home) = &env.home {
+        cmd.env("HOME", home);
+    }
+    cmd.args(["--drive-export-formats", "csv", "cat", "--", remote]);
+    let cap =
+        super::align::capture_bounded(cmd, Duration::from_secs(20), SOURCE_TEXT_MAX_BYTES + 1)
+            .map_err(|e| format!("failed to run rclone for {remote}: {e}"))?;
+    if cap.code != Some(0) {
+        let out = String::from_utf8_lossy(&cap.stdout);
+        return Err(format!("rclone failed for {remote}: {}", out.trim()));
+    }
+    decode_source_text(cap.stdout, remote)
+}
+
+fn fetch_source_text(env: &Env, source: &str) -> Result<String, String> {
+    if source.starts_with("gdrive:") {
+        return fetch_rclone_csv(env, source);
+    }
     if source.starts_with("http://") || source.starts_with("https://") {
         let url = normalize_google_sheet_url(source);
         let mut cmd = aterm_uds::spawnfd::command("/usr/bin/curl");
@@ -826,14 +865,25 @@ fn fetch_source_text(source: &str) -> Result<String, String> {
             "--",
             &url,
         ]);
-        let cap =
+        let curl_res =
             super::align::capture_bounded(cmd, Duration::from_secs(20), SOURCE_TEXT_MAX_BYTES + 1)
-                .map_err(|e| format!("failed to run curl for {url}: {e}"))?;
-        if cap.code != Some(0) {
-            let out = String::from_utf8_lossy(&cap.stdout);
-            return Err(format!("curl failed for {url}: {}", out.trim()));
+                .map_err(|e| format!("failed to run curl for {url}: {e}"))
+                .and_then(|cap| {
+                    if cap.code != Some(0) {
+                        let out = String::from_utf8_lossy(&cap.stdout);
+                        Err(format!("curl failed for {url}: {}", out.trim()))
+                    } else {
+                        decode_source_text(cap.stdout, &url)
+                    }
+                });
+        match curl_res {
+            Ok(text) => Ok(text),
+            Err(curl_err) if url.contains("docs.google.com/spreadsheets/") => {
+                fetch_rclone_csv(env, DEFAULT_RCLONE_SHEET_CSV)
+                    .map_err(|rclone_err| format!("{curl_err}; {rclone_err}"))
+            }
+            Err(curl_err) => Err(curl_err),
         }
-        decode_source_text(cap.stdout, &url)
     } else {
         let mut bytes = Vec::new();
         fs::File::open(source)
@@ -1999,7 +2049,10 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     ACCOUNTS_OWN_LABEL,
                     until,
                     "s-before-adoption",
-                    &accounts::ResetDone::Used { left: None },
+                    &accounts::ResetDone::Used {
+                        kind: aterm_phase::ResetKind::Full,
+                        left: None,
+                    },
                     now - 10,
                 ));
                 rows.extend(accounts::note_wall(
@@ -2183,5 +2236,36 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(normalize_machine_id("M109"), Some("m109".to_owned()));
         assert_eq!(normalize_machine_id("*m12"), None);
         assert_eq!(normalize_machine_id("macbook"), None);
+    }
+
+    #[test]
+    fn default_home_standing_wall_ignores_older_transcript_when_newer_answered() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-standing-wall-")
+            .tempdir()
+            .expect("tempdir");
+        let proj = dir.path().join("projects").join("ws");
+        fs::create_dir_all(&proj).unwrap();
+        let older = proj.join("older.jsonl");
+        fs::write(
+            &older,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-10-19T06:00:00Z\",\"isApiErrorMessage\":true,\"error\":\"rate_limit\",\"message\":{\"model\":\"<synthetic>\",\"content\":[{\"type\":\"text\",\"text\":\"You've hit your weekly limit · resets Oct 23 at 8am\"}]},\"quotaLimits\":{\"status\":\"rejected\",\"resetsAt\":1792767600,\"rateLimitType\":\"seven_day\"}}\n",
+        )
+        .unwrap();
+        let now = 1_792_400_000;
+        let wall = find_default_home_standing_wall(dir.path(), now).expect("standing wall");
+        assert_eq!(wall.until, Some(1_792_767_600));
+
+        let newer = proj.join("newer.jsonl");
+        fs::write(
+            &newer,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-10-20T07:00:00Z\",\"message\":{\"model\":\"claude-opus-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_default_home_standing_wall(dir.path(), now),
+            None,
+            "a newer model turn in another transcript clears the older transcript's wall"
+        );
     }
 }

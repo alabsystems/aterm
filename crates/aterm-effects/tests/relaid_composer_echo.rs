@@ -659,7 +659,7 @@ fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
 /// cohort without a hole or an expired prefix cell.
 #[test]
 fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift() {
-    for post_relay_idle_ms in [34, 600] {
+    for post_relay_idle_ms in [34, 350, 600] {
         let mut h = Host::new();
         h.type_str(" gaps ");
         // Pause past `SWOOSH_TOTAL_S` (920 ms) while still inside `RECENT_TYPED_RUN_TTL` (3.2 s).

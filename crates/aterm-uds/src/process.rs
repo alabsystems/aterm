@@ -145,6 +145,163 @@ pub fn read_process_path(pid: i32) -> Option<std::path::PathBuf> {
     )))
 }
 
+/// `struct proc_bsdshortinfo` (`<sys/proc_info.h>`): what
+/// `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)` answers for any process, another user's included
+/// (the long `PROC_PIDTBSDINFO` record is refused with `EPERM` for a process of another uid or
+/// a set-id one). 64 bytes on both Apple ABIs; the layout is pinned by the size assertion below
+/// and by the live test that reads this process's own record back.
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BsdShortInfo {
+    /// The process.
+    pub pbsi_pid: u32,
+    /// Its parent.
+    pub pbsi_ppid: u32,
+    /// Its process group.
+    pub pbsi_pgid: u32,
+    /// `p_stat`: `SIDL` 1, `SRUN` 2, `SSLEEP` 3, `SSTOP` 4, `SZOMB` 5.
+    pub pbsi_status: u32,
+    /// Its name, NUL-padded.
+    pub pbsi_comm: [u8; 16],
+    /// `PROC_FLAG_*`: [`BsdShortInfo::PROC_FLAG_EXEC`] among them.
+    pub pbsi_flags: u32,
+    /// Effective user.
+    pub pbsi_uid: u32,
+    /// Effective group.
+    pub pbsi_gid: u32,
+    /// Real user.
+    pub pbsi_ruid: u32,
+    /// Real group.
+    pub pbsi_rgid: u32,
+    /// Saved user.
+    pub pbsi_svuid: u32,
+    /// Saved group.
+    pub pbsi_svgid: u32,
+    /// Reserved.
+    pub pbsi_rfu: u32,
+}
+
+#[cfg(target_vendor = "apple")]
+const _: () = assert!(std::mem::size_of::<BsdShortInfo>() == 64);
+
+#[cfg(target_vendor = "apple")]
+impl BsdShortInfo {
+    /// `pbsi_status` of a zombie.
+    pub const SZOMB: u32 = 5;
+    /// `pbsi_status` of a stopped process.
+    pub const SSTOP: u32 = 4;
+    /// `pbsi_flags`: the process has replaced the image it was forked with (`P_EXEC`).
+    pub const PROC_FLAG_EXEC: u32 = 0x4000;
+}
+
+/// `pid`'s short BSD record ([`BsdShortInfo`]): an exact-size read that names `pid`, or `None`
+/// (gone, `pid <= 0`, a record about another pid). A zombie answers: callers that refuse one
+/// check [`BsdShortInfo::SZOMB`].
+#[cfg(target_vendor = "apple")]
+#[must_use]
+// Skip: bottoms out at the `proc_pidinfo` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn read_short_info(pid: i32) -> Option<BsdShortInfo> {
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+    const SIZE: i32 = std::mem::size_of::<BsdShortInfo>() as i32;
+    if pid <= 0 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<BsdShortInfo>::zeroed();
+    // SAFETY: `info` is SIZE writable bytes of exactly the structure this flavor fills (size
+    // asserted above); libproc returns the number of bytes it wrote.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            SIZE,
+        )
+    };
+    if read != SIZE {
+        return None;
+    }
+    // SAFETY: zero-initialised plain integers, and the exact-size read wrote the whole record.
+    let info = unsafe { info.assume_init() };
+    (info.pbsi_pid == pid.unsigned_abs()).then_some(info)
+}
+
+// libproc's child listing (`<libproc.h>`: `int proc_listchildpids(pid_t ppid, void *buffer, int
+// buffersize)`, answering the number of pids written or -1), in libSystem. Declared here
+// because `crates/aterm-libc` is generated and does not carry it.
+#[cfg(target_vendor = "apple")]
+unsafe extern "C" {
+    fn proc_listchildpids(ppid: i32, buffer: *mut core::ffi::c_void, buffersize: i32) -> i32;
+}
+
+/// How many children [`child_pids`] lists at most.
+#[cfg(target_vendor = "apple")]
+pub const CHILD_PIDS_MAX: usize = 64;
+
+/// `pid`'s live children, at most [`CHILD_PIDS_MAX`], from libproc, or `None` when the table
+/// cannot answer.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+// Skip: bottoms out at the `proc_listchildpids` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn child_pids(pid: i32) -> Option<Vec<i32>> {
+    let mut pids = [0i32; CHILD_PIDS_MAX];
+    let bytes = i32::try_from(std::mem::size_of_val(&pids)).ok()?;
+    // SAFETY: `pids` is `bytes` writable bytes of pid slots; libproc writes at most that many
+    // and answers how many pids it wrote, or -1.
+    let found = unsafe { proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
+    let found = usize::try_from(found).ok()?.min(CHILD_PIDS_MAX);
+    Some(pids[..found].iter().copied().filter(|p| *p > 0).collect())
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod short_info_tests {
+    use super::{BsdShortInfo, child_pids, read_short_info};
+
+    /// The layout read back: this process's record names it, its parent and its group, and
+    /// flags the `exec` that started this test binary; a child it spawns is listed among its
+    /// children. No pid, and a negative one, read nothing.
+    #[test]
+    fn this_process_reads_its_own_short_record_back() {
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let info = read_short_info(me).expect("this process reads");
+        assert_eq!(info.pbsi_pid, me.unsigned_abs());
+        // SAFETY: plain getters with no arguments.
+        let (ppid, pgid) = unsafe { (libc::getppid(), libc::getpgrp()) };
+        assert_eq!(info.pbsi_ppid, ppid.unsigned_abs());
+        assert_eq!(info.pbsi_pgid, pgid.unsigned_abs());
+        assert_ne!(info.pbsi_status, BsdShortInfo::SZOMB);
+        assert_ne!(
+            info.pbsi_flags & BsdShortInfo::PROC_FLAG_EXEC,
+            0,
+            "a test binary was exec'd"
+        );
+        assert!(read_short_info(0).is_none() && read_short_info(-1).is_none());
+        // Retain kill/wait custody before the process-table query can unwind.
+        // Child's Drop reaps a running child later but does not stop it.
+        struct StandIn(crate::spawnfd::Child);
+        impl Drop for StandIn {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = StandIn(
+            crate::spawnfd::command("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn"),
+        );
+        let pid = i32::try_from(child.0.id()).expect("pid");
+        let listed = child_pids(me).expect("the table answers").contains(&pid);
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+        assert!(listed, "a spawned child is listed");
+    }
+}
+
 /// See the Apple twin, whose contract this keeps: Linux reads the `/proc/<pid>/exe`
 /// link between two [`read_process_start`] reads that must agree, and answers `None`
 /// for a live process whose binary was deleted — the kernel then appends ` (deleted)`
@@ -254,9 +411,25 @@ fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
 /// reader may be let in. Exact to the microsecond (the record counts 100 ns).
 #[cfg(windows)]
 #[must_use]
+pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
+    birth_of_filetime(read_creation_filetime(pid)?)
+}
+
+/// The RAW creation `FILETIME` of `pid` — 100 ns ticks since 1601-01-01 UTC,
+/// as `GetProcessTimes` reports it, with no conversion. This is the exact
+/// integer Claude Code records as a session's `procStart` on Windows (measured:
+/// `134369042337562842`), so the harness pins a running Claude Code to its
+/// session record by this decimal without spawning `ps`
+/// (`aterm_agent::harness::upgrade_drive::kernel_start`). [`read_process_birth`]
+/// is this rounded to the microsecond; the pin needs the untruncated ticks.
+///
+/// `None` on the terms of [`read_process_birth`]: no such process this account
+/// may open, or one that has exited (its handle signalled).
+#[cfg(windows)]
+#[must_use]
 // Skip: bottoms out at the `OpenProcess`/`GetProcessTimes` FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
+pub fn read_creation_filetime(pid: i32) -> Option<u64> {
     use crate::win::ffi;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -279,10 +452,7 @@ pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
         && unsafe { ffi::GetProcessTimes(handle, created, exited, kernel, user) } != 0;
     // SAFETY: closes the one handle this function opened.
     let _ = unsafe { ffi::CloseHandle(handle) };
-    if !read {
-        return None;
-    }
-    birth_of_filetime(times[0].ticks())
+    read.then(|| times[0].ticks())
 }
 
 /// A Windows `FILETIME` (100 ns ticks since 1601-01-01 UTC) as a
@@ -558,6 +728,12 @@ pub fn continuous_ms() -> Option<u64> {
 ///
 /// `None` where no such pair is wired (Windows, the BSDs, 32-bit Linux): the
 /// caller has no measure of a sleep but its own clocks'.
+///
+/// The count starts over at a boot, so two readings compare only within one:
+/// the caller names the boot with `astream_sys::boot_session`, the reading
+/// aterm-link's broker opens its log in (the one that refuses the all-zero id
+/// a damaged answer reads as), not here: this crate stays dependency-free, as
+/// its manifest promises.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 // Skip: bottoms out at the `mach_*_time` FFI calls.
@@ -642,57 +818,6 @@ fn linux_clock_ns(clock: i32) -> Option<u64> {
 )))]
 #[must_use]
 pub fn asleep_since_boot() -> Option<std::time::Duration> {
-    None
-}
-
-/// THE BOOT THIS MACHINE IS IN, as the kernel names it: two readings of
-/// [`asleep_since_boot`] compare only under the same name (the count starts
-/// over at a boot).
-///
-/// * Apple: `kern.bootsessionuuid` (`sysctlbyname`).
-/// * Linux: `/proc/sys/kernel/random/boot_id`.
-///
-/// `None` where the kernel names none, or none is wired.
-#[cfg(target_vendor = "apple")]
-#[must_use]
-// Skip: bottoms out at the `sysctlbyname` FFI call.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn boot_session() -> Option<String> {
-    let mut buf = [0u8; 64];
-    let mut len = buf.len();
-    // SAFETY: a NUL-terminated name, a writable buffer and its length, all
-    // live for the call; nothing is written to the kernel (`newp` null).
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"kern.bootsessionuuid".as_ptr(),
-            buf.as_mut_ptr().cast(),
-            &raw mut len,
-            core::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    let name = buf.get(..len)?;
-    let name = name.split(|&b| b == 0).next().unwrap_or_default();
-    let name = std::str::from_utf8(name).ok()?.trim();
-    (!name.is_empty()).then(|| name.to_string())
-}
-
-/// See the Apple twin.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[must_use]
-pub fn boot_session() -> Option<String> {
-    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let id = id.trim();
-    (!id.is_empty()).then(|| id.to_string())
-}
-
-/// See the Apple twin: no boot is named here.
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-#[must_use]
-pub fn boot_session() -> Option<String> {
     None
 }
 
@@ -1009,102 +1134,160 @@ const PROCESS_ARGV_MAX: usize = 8 * 1024 * 1024;
 const PROCESS_ARGV_WORDS: usize = 65_536;
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(trust_verify, trust::skip)]
 fn read_process_argv_inner(pid: i32) -> Option<Vec<std::ffi::OsString>> {
-    // Local SDK sys/sysctl.h: CTL_KERN=1, KERN_ARGMAX=8, KERN_PROCARGS2=49.
-    unsafe extern "C" {
-        fn sysctl(
-            name: *mut i32,
-            namelen: u32,
-            oldp: *mut core::ffi::c_void,
-            oldlenp: *mut usize,
-            newp: *mut core::ffi::c_void,
-            newlen: usize,
-        ) -> i32;
-    }
-    let mut argmax = 0i32;
-    let mut len = std::mem::size_of::<i32>();
-    let mut key = [1, 8];
-    // SAFETY: owned exact-size buffers; null newp requests a read only.
-    let rc = unsafe {
-        sysctl(
-            key.as_mut_ptr(),
-            2,
-            (&raw mut argmax).cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || len != std::mem::size_of::<i32>() {
-        return None;
-    }
-    let cap = usize::try_from(argmax)
-        .ok()
-        .filter(|&n| n > std::mem::size_of::<i32>() && n <= PROCESS_ARGV_MAX)?;
-    let mut bytes = vec![0u8; cap];
-    let mut len = cap;
-    let mut key = [1, 49, pid];
-    // SAFETY: bytes owns cap writable bytes; only an in-bounds successful
-    // returned length reaches the parser. No environment bytes are returned.
-    let rc = unsafe {
-        sysctl(
-            key.as_mut_ptr(),
-            3,
-            bytes.as_mut_ptr().cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || len > cap {
-        return None;
-    }
-    argv_from_procargs2(bytes.get(..len)?)
+    argv_from_procargs2(&crate::procargs::read(u32::try_from(pid).ok()?)?)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_process_argv_inner(pid: i32) -> Option<Vec<std::ffi::OsString>> {
+    argv_from_cmdline(&read_cmdline(u32::try_from(pid).ok()?)?)
+}
+
+/// `pid`'s `/proc/<pid>/cmdline`, at most 8 MiB: a longer read is unknown, never
+/// a prefix. The limit is checked before dropping a translator's initial word, so
+/// [`read_process_argv`] and callers reading the raw words share that refusal.
+///
+/// Read through the opened `/proc/<pid>` directory, never by path. Rosetta answers a
+/// translated process's open of another translated process's `/proc/<pid>/cmdline` by
+/// opening that process's `/proc/<pid>/auxv` itself (to find the words its interpreter put
+/// first) and never closes it: one descriptor leaks per read, until none are left and
+/// Rosetta stops the process (`Failed to create temporary file`, SIGTRAP). aterm-agent's
+/// x86_64 tests, which read a stand-in agent's argv until it has exec'd, died that way on
+/// every run, and a translated aterm reading agents' argv would too (measured 2026-10-20,
+/// `docs/measured/linux-ports-2026-10-20.md`). Through the directory the kernel answers,
+/// with nothing leaked. Its answer for a translated program starts with the interpreter,
+/// which `binfmt_misc` puts first and Rosetta's own read leaves out, so under a translator
+/// ([`translator`]) the first word is dropped when it names the executable the kernel
+/// holds for both `pid` and this process ([`crate::holders::exe_of`]): the translator.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_cmdline(pid: u32) -> Option<Vec<u8>> {
+    cmdline_as_run(pid).map(|(bytes, _)| bytes)
+}
+
+/// The path `pid`'s program was exec'd from: its `/proc/<pid>/exe`, except where the
+/// translator that runs this process runs `pid` too. The kernel names the translator as
+/// both executables then ([`crate::holders::exe_of`]), and the program is the path
+/// `binfmt_misc` gave the translator: the word after its own, which [`read_cmdline`]
+/// leaves first (Rosetta is registered without `binfmt_misc`'s `P` flag, as `OCF`, so
+/// that word stands in for the program's own `argv[0]`). Read as `exec` was given it,
+/// not made canonical, as `KERN_PROCARGS2` names a Mac's. A translated program that
+/// rewrote its words no longer leads with the translator, and reads as the kernel's
+/// executable. aterm-agent's harness tells an agent by this path, and under Rosetta every
+/// translated agent read as `/mnt/lima-rosetta/rosetta` (measured 2026-10-20,
+/// `docs/measured/linux-ports-2026-10-20.md`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_exec_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    if own_interpreter().is_some()
+        && let Some((cmdline, true)) = cmdline_as_run(pid)
+        && let Some(program) = cmdline.split(|&b| b == 0).next().filter(|w| !w.is_empty())
+    {
+        return Some(std::ffi::OsString::from_vec(program.to_vec()).into());
+    }
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// [`read_cmdline`], and whether the word it dropped named the translator.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
     use std::io::Read as _;
-    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let dir = std::fs::File::open(format!("/proc/{pid}")).ok()?;
+    // SAFETY: `dir` is open for the call and the name is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c"cmdline".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `openat` just returned `fd`, which nothing else owns.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
     let mut bytes = Vec::new();
     file.take((PROCESS_ARGV_MAX + 1) as u64)
         .read_to_end(&mut bytes)
         .ok()?;
-    argv_from_cmdline(&bytes)
+    cmdline_from_read(bytes, PROCESS_ARGV_MAX, || shared_interpreter(pid))
 }
 
+/// Admit one whole bounded read before changing its words. `limit` is the reader's
+/// bound; captured controls use a small one. The executable observation is lazy:
+/// an oversized read is refused before another process read or any prefix removal.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn cmdline_from_read(
+    mut bytes: Vec<u8>,
+    limit: usize,
+    interpreter: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<(Vec<u8>, bool)> {
+    if bytes.len() > limit {
+        return None;
+    }
+    if let Some(interpreter) = interpreter()
+        && bytes.get(interpreter.len()) == Some(&0)
+        && bytes.starts_with(&interpreter)
+    {
+        bytes.drain(..=interpreter.len());
+        return Some((bytes, true));
+    }
+    Some((bytes, false))
+}
+
+/// The executable the kernel holds for this process when a translator runs it: the
+/// translator, which `binfmt_misc` names as every translated process's executable
+/// (`docs/measured/linux-rosetta-2026-10-17.md`). `None` natively.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn own_interpreter() -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static OURS: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    OURS.get_or_init(|| {
+        translator()?;
+        match crate::holders::exe_of(std::process::id()) {
+            crate::holders::Exe::At(path) => Some(path),
+            crate::holders::Exe::Unnamed | crate::holders::Exe::Exited => None,
+        }
+    })
+    .as_deref()
+}
+
+/// [`own_interpreter`], when the kernel holds it as `pid`'s executable too: the translator
+/// runs `pid`. `None` natively, and for a process the translator does not run.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn shared_interpreter(pid: u32) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let ours = own_interpreter()?;
+    match crate::holders::exe_of(pid) {
+        crate::holders::Exe::At(theirs) if theirs == ours => {
+            Some(theirs.into_os_string().into_vec())
+        }
+        _ => None,
+    }
+}
+
+/// The argument words of one `KERN_PROCARGS2` answer ([`crate::procargs::parse`]), all of
+/// them or none: refused when cut, when argc is 0 or past [`PROCESS_ARGV_WORDS`], when the
+/// exec path is empty, or when the buffer is past [`PROCESS_ARGV_MAX`]. The kernel's argc
+/// separates the words from the environment, which is never returned.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn argv_from_procargs2(bytes: &[u8]) -> Option<Vec<std::ffi::OsString>> {
     use std::os::unix::ffi::OsStringExt as _;
     if bytes.len() > PROCESS_ARGV_MAX {
         return None;
     }
-    let argc = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
-    let argc = usize::try_from(argc)
-        .ok()
-        .filter(|&n| n > 0 && n <= PROCESS_ARGV_WORDS)?;
-    let rest = bytes.get(4..)?;
-    let path_end = rest.iter().position(|&b| b == 0)?;
-    if path_end == 0 {
+    let p = crate::procargs::parse(bytes)?;
+    if !p.whole() || p.argc == 0 || p.argc > PROCESS_ARGV_WORDS || p.exec_path.is_empty() {
         return None;
     }
-    let mut at = path_end;
-    while rest.get(at) == Some(&0) {
-        at += 1;
-    }
-    if argc > rest.len().checked_sub(at)? {
-        return None;
-    }
-    let mut argv = Vec::with_capacity(argc);
-    for _ in 0..argc {
-        let tail = rest.get(at..)?;
-        let end = tail.iter().position(|&b| b == 0)?;
-        argv.push(std::ffi::OsString::from_vec(tail.get(..end)?.to_vec()));
-        at = at.checked_add(end)?.checked_add(1)?;
-    }
-    // The kernel's argc separates argv from its environment trailer.
-    Some(argv)
+    Some(
+        p.argv
+            .iter()
+            .map(|w| std::ffi::OsString::from_vec(w.to_vec()))
+            .collect(),
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
@@ -1400,35 +1583,79 @@ fn os_host_name() -> Option<String> {
 fn os_host_name() -> Option<String> {
     /// `COMPUTER_NAME_FORMAT::ComputerNameDnsHostname` (sysinfoapi.h).
     const COMPUTER_NAME_DNS_HOSTNAME: u32 = 1;
-    /// A DNS host label is at most 63 characters; this holds any name.
+    computer_name(COMPUTER_NAME_DNS_HOSTNAME)
+        .or_else(|| env_host_name(std::env::var_os("COMPUTERNAME")))
+}
+
+/// Windows: this machine's NetBIOS name, read from the OS
+/// (`GetComputerNameExW(ComputerNameNetBIOS)`: the name
+/// `[Environment]::MachineName` answers, so the one aterm's PowerShell
+/// integration writes into its OSC 7 URI) — the DNS host name upper-cased
+/// and cut to fifteen characters, so not [`host_name`]'s once that is
+/// longer. `%COMPUTERNAME%` only where the OS does not answer: a process
+/// started with an environment of its own (a launcher's, a test's) may have
+/// none, or another machine's. `None` when neither names one.
+#[cfg(windows)]
+#[must_use]
+pub fn netbios_host_name() -> Option<String> {
+    netbios_host_name_over(std::env::var_os("COMPUTERNAME"))
+}
+
+/// [`netbios_host_name`] with `%COMPUTERNAME%` passed in: no test may set it.
+#[cfg(windows)]
+fn netbios_host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
+    /// `COMPUTER_NAME_FORMAT::ComputerNameNetBIOS` (sysinfoapi.h).
+    const COMPUTER_NAME_NETBIOS: u32 = 0;
+    computer_name(COMPUTER_NAME_NETBIOS).or_else(|| env_host_name(env))
+}
+
+/// Windows: the machine's name in the `COMPUTER_NAME_FORMAT` `format`
+/// (`GetComputerNameExW`), trimmed; `None` when the call fails or the name is
+/// blank.
+#[cfg(windows)]
+fn computer_name(format: u32) -> Option<String> {
+    /// A DNS host label is at most 63 characters and a NetBIOS name 15; this
+    /// holds any name.
     const CAPACITY: usize = 256;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetComputerNameExW(name_type: u32, buffer: *mut u16, size: *mut u32) -> i32;
-    }
     let mut buf = [0u16; CAPACITY];
     let mut len = CAPACITY as u32;
     // SAFETY: `buf` is `len` writable UTF-16 units and outlives the call. On
     // success the API writes the name and its NUL inside them and sets `len` to
     // the name's length without the NUL; on failure nothing written is read.
-    let ok = unsafe { GetComputerNameExW(COMPUTER_NAME_DNS_HOSTNAME, buf.as_mut_ptr(), &mut len) };
-    let dns = (ok != 0)
+    let ok = unsafe { crate::win::ffi::GetComputerNameExW(format, buf.as_mut_ptr(), &mut len) };
+    (ok != 0)
         .then(|| buf.get(..len as usize).map(String::from_utf16_lossy))
         .flatten()
         .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty());
-    dns.or_else(|| {
-        std::env::var("COMPUTERNAME")
-            .ok()
-            .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty())
-    })
+        .filter(|name| !name.is_empty())
 }
 
 /// No OS answer wired here (the wasm32 hosts): `$HOSTNAME` alone.
 #[cfg(not(any(unix, windows)))]
 fn os_host_name() -> Option<String> {
     None
+}
+
+#[cfg(all(test, windows))]
+mod netbios_name_tests {
+    /// THE NETBIOS NAME IS THE OS'S, NOT THE ENVIRONMENT'S: with no
+    /// `%COMPUTERNAME%` at all (a process started with an environment of its
+    /// own) it is still read, at most fifteen characters, and it is the name
+    /// Windows set `%COMPUTERNAME%` to where this process's environment has
+    /// it. NEGATIVE CONTROL: another name in the environment is not taken
+    /// while the OS answers.
+    #[test]
+    fn the_netbios_name_is_read_from_the_os() {
+        let name = super::netbios_host_name_over(None).expect("the OS names this machine");
+        assert!(name.chars().count() <= 15, "{name}");
+        assert_eq!(
+            super::netbios_host_name_over(Some("elsewhere.example".into())).as_deref(),
+            Some(name.as_str())
+        );
+        if let Ok(env) = std::env::var("COMPUTERNAME") {
+            assert!(env.trim().eq_ignore_ascii_case(&name), "{env} / {name}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1847,6 +2074,30 @@ mod tests {
         assert_eq!(super::read_process_birth(0), None, "never pid 0");
         drop(child);
     }
+
+    /// The raw creation `FILETIME` (`read_creation_filetime`) is the untruncated
+    /// integer Claude Code records as `procStart`: it reads for this live
+    /// process, is past the Unix epoch, and rounds to the microsecond-rounded
+    /// [`super::read_process_birth`] — the exact decimal the harness compares
+    /// against a session record, not a value reconstructed from the rounded
+    /// birth. A gone pid, 1 and 0 read nothing.
+    #[test]
+    fn the_raw_creation_filetime_is_the_untruncated_procstart() {
+        const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+        let own = i32::try_from(std::process::id()).expect("a pid");
+        let ticks = super::read_creation_filetime(own).expect("this process's creation time");
+        assert!(ticks > UNIX_EPOCH_TICKS, "after 1970: {ticks}");
+        // The decimal is all digits (what `procStart` holds) and parses back.
+        let decimal = ticks.to_string();
+        assert_eq!(decimal.parse::<u64>(), Ok(ticks));
+        // It agrees with the rounded birth to within one microsecond.
+        let birth = super::read_process_birth(own).expect("birth");
+        let since = ticks - UNIX_EPOCH_TICKS;
+        assert_eq!(since / 10_000_000, birth.seconds);
+        assert_eq!(since % 10_000_000 / 10, birth.microseconds);
+        assert_eq!(super::read_creation_filetime(1), None, "never pid 1");
+        assert_eq!(super::read_creation_filetime(0), None, "never pid 0");
+    }
 }
 
 #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
@@ -1995,6 +2246,38 @@ mod argv_tests {
         );
         let over_limit = vec![0u8; PROCESS_ARGV_WORDS + 1];
         assert_eq!(argv_from_cmdline(&over_limit), None);
+
+        // The byte ceiling applies to the raw read, before its translator word
+        // is removed: otherwise a MAX+1 prefix could shrink into an admitted
+        // complete-looking vector. This small bound drives that same reader seam.
+        let raw = b"/i\0t\xff\0\0".to_vec();
+        let limit = raw.len();
+        let (words, translated) =
+            cmdline_from_read(raw.clone(), limit, || Some(b"/i".to_vec())).unwrap();
+        assert!(translated, "the exact translator word was removed");
+        assert_eq!(
+            argv_from_cmdline(&words),
+            Some(vec![OsString::from_vec(b"t\xff".to_vec()), OsString::new()])
+        );
+        assert!(words.len() < limit, "trimming could hide the sentinel");
+        assert!(words.ends_with(b"\0"), "the prefix would look complete");
+        assert_eq!(
+            cmdline_from_read(raw.clone(), limit - 1, || {
+                panic!("an oversized read must refuse before observing the interpreter")
+            }),
+            None
+        );
+        assert_eq!(
+            cmdline_from_read(raw.clone(), limit, || None),
+            Some((raw, false)),
+            "a native read at the bound keeps every word"
+        );
+        let other = b"/ix\0t\0".to_vec();
+        assert_eq!(
+            cmdline_from_read(other.clone(), other.len(), || Some(b"/i".to_vec())),
+            Some((other, false)),
+            "a byte prefix without the NUL boundary names no translator word"
+        );
     }
 
     #[test]
@@ -2051,6 +2334,61 @@ mod argv_tests {
             );
         }
     }
+
+    /// A child's program and argv read as it was given them, and reading them leaves no
+    /// descriptor behind ([`read_cmdline`], [`read_exec_path`]). The child is a parked copy
+    /// of this test binary, so under Rosetta it is translated as this process is: the case
+    /// where Rosetta's own read of `/proc/<pid>/cmdline` keeps a descriptor on the child's
+    /// `/proc/<pid>/auxv`, one per read (measured 2026-10-20), and where the kernel names
+    /// the translator as the child's executable and the first of its words. Natively all
+    /// three hold by construction.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_childs_program_and_argv_read_as_given_and_leave_no_descriptor_behind() {
+        const NAME: &str = "process::argv_tests::\
+            a_childs_program_and_argv_read_as_given_and_leave_no_descriptor_behind";
+        const PARK_ENV: &str = "ATERM_UDS_TEST_ARGV_PARK";
+        if std::env::var_os(PARK_ENV).is_some() {
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let args = ["--exact", NAME, "--nocapture", "--test-threads=1"];
+        let mut child = crate::spawnfd::command(&exe)
+            .args(args)
+            .env(PARK_ENV, "1")
+            .stdin(crate::spawnfd::Stdio::piped())
+            .stdout(crate::spawnfd::Stdio::null())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the parked copy");
+        let pid = i32::try_from(child.id()).expect("a pid");
+        let given: Vec<OsString> = std::iter::once(exe.clone().into_os_string())
+            .chain(args.iter().map(OsString::from))
+            .collect();
+        // The child's argv is its own once it has exec'd (a one-minute hang detector).
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut read = read_process_argv(pid);
+        while read.as_ref() != Some(&given) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            read = read_process_argv(pid);
+        }
+        let again = (0..64).all(|_| read_process_argv(pid) == read);
+        let program = read_exec_path(child.id());
+        let auxv = std::path::PathBuf::from(format!("/proc/{pid}/auxv"));
+        let kept = std::fs::read_dir("/proc/self/fd")
+            .expect("this process's descriptors")
+            .flatten()
+            .filter(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == auxv))
+            .count();
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(read, Some(given), "the parked copy's argv");
+        assert_eq!(program, Some(exe), "the parked copy's program");
+        assert!(again, "64 more reads answered the same");
+        assert_eq!(kept, 0, "descriptors left open on {}", auxv.display());
+    }
 }
 
 #[cfg(all(
@@ -2061,7 +2399,7 @@ mod argv_tests {
     )
 ))]
 mod sleep_probe_tests {
-    use super::{asleep_since_boot, boot_session, continuous_ms, last_sleep_ms};
+    use super::{asleep_since_boot, continuous_ms, last_sleep_ms};
     use std::time::Duration;
 
     /// The machine's sleep since boot reads where it is wired, never runs
@@ -2083,14 +2421,6 @@ mod sleep_probe_tests {
         );
     }
 
-    /// The boot is named, and the same name twice in one boot.
-    #[test]
-    fn the_boot_is_named_and_stays_named() {
-        let name = boot_session().expect("named on this platform");
-        assert!(!name.is_empty());
-        assert_eq!(boot_session(), Some(name));
-    }
-
     /// The last sleep, where the kernel keeps one, went to sleep before it
     /// woke, and woke no later than now.
     #[test]
@@ -2098,11 +2428,23 @@ mod sleep_probe_tests {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-        if let Some((slept, woke)) = last_sleep_ms() {
+        let last = last_sleep_ms();
+        if let Some((slept, woke)) = last {
             assert!(
                 0 < slept && slept < woke && woke <= now_ms + 1000,
                 "{slept} {woke} {now_ms}"
             );
+        }
+        // No sleep to place: on Apple the kernel still answered both reads, with
+        // no sleep since boot (zero) or none in order. A refused read is not
+        // "never slept".
+        #[cfg(target_vendor = "apple")]
+        if last.is_none() {
+            let slept = super::sysctl_timeval_ms(c"kern.sleeptime")
+                .expect("the kernel answers kern.sleeptime");
+            let woke = super::sysctl_timeval_ms(c"kern.waketime")
+                .expect("the kernel answers kern.waketime");
+            assert!(slept == 0 || slept >= woke, "{slept} {woke}");
         }
     }
 }

@@ -321,7 +321,8 @@ pub fn evict_full_model() -> Model {
     }
 }
 
-/// Forward-handshake liveness (proxy.rs `drain_buffered`/`connect_and_relay`): a blocking I/O
+/// Forward-handshake liveness (the `drain_buffered` bug; `control::try_proxy_forward`:
+/// `control_lanes::LaneReader::take_buffered`, then proxy.rs `relay_hop`): a blocking I/O
 /// deadlock no bad-state invariant can see. The cross-process forward is request → relay →
 /// reply: the reply bytes are already buffered past the request line, and the client is parked
 /// awaiting them. At `Buggy = 0` the server relays the buffered bytes (`reader.buffer()`) and

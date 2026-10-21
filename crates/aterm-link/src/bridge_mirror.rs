@@ -47,7 +47,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use super::{
-    past_the_budget, refused_for_good, Bridge, Fault, Opens, Then, DEADLINE_RETRY, PIPELINE_WINDOW,
+    past_the_budget, refused_for_good, Bridge, Opens, Then, DEADLINE_RETRY, PIPELINE_WINDOW,
 };
 use crate::ctl::Reply;
 use crate::mirror::{self, Bucket, LandedWord, LogMode, Pin, PinSlot};
@@ -144,7 +144,15 @@ impl MirrorRun {
     /// node's caps, so a renewed cap or a changed grant set aliases every
     /// edge as before. A pin that does not read is the hello's to judge (the
     /// mirror stops); its key is not trusted meanwhile.
-    pub(super) fn new(mode: LogMode, state: &StateDir) -> Option<Box<MirrorRun>> {
+    ///
+    /// `mint` draws a fresh key: [`mirror::mint_alias_key`] live, through the
+    /// bridge's door ([`crate::fx::Fx::alias_key`]).
+    pub(super) fn new(
+        mode: LogMode,
+        state: &StateDir,
+        now: Instant,
+        mint: impl FnOnce() -> Option<[u8; 16]>,
+    ) -> Option<Box<MirrorRun>> {
         (mode == LogMode::Turns).then(|| {
             let key = state
                 .logpin()
@@ -152,7 +160,7 @@ impl MirrorRun {
                 .flatten()
                 .and_then(|t| Pin::parse(&t).ok())
                 .and_then(|p| p.key)
-                .or_else(mirror::mint_alias_key);
+                .or_else(mint);
             Box::new(MirrorRun {
                 acked: false,
                 stopped: None,
@@ -168,7 +176,7 @@ impl MirrorRun {
                 sent_inc: 0,
                 repin: false,
                 bucket: Bucket::full(0),
-                clock: Instant::now(),
+                clock: now,
                 key: key.map_or_else(String::new, |k| aterm_codec::hex::encode_lower(&k)),
                 noticed: BTreeSet::new(),
                 recovered: 0,
@@ -181,7 +189,13 @@ impl MirrorRun {
     /// A mirror the endpoint has acknowledged, taking `batch` slots at a time.
     #[cfg(test)]
     pub(super) fn acked_for_tests(state: &StateDir, batch: usize) -> Box<MirrorRun> {
-        let mut m = MirrorRun::new(LogMode::Turns, state).unwrap_or_else(|| unreachable!());
+        let mut m = MirrorRun::new(
+            LogMode::Turns,
+            state,
+            Instant::now(),
+            mirror::mint_alias_key,
+        )
+        .unwrap_or_else(|| unreachable!());
         m.acked = true;
         m.owed = true;
         m.batch = batch;
@@ -231,8 +245,10 @@ impl MirrorRun {
         self.pin.total = total;
     }
 
-    fn now_ms(&self) -> u64 {
-        u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+    /// Milliseconds since this run began, at `now` (the bridge's door): the
+    /// rate bucket's clock.
+    fn now_ms(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.clock).as_millis()).unwrap_or(u64::MAX)
     }
 
     fn concluded(&self) -> bool {
@@ -295,7 +311,16 @@ impl Bridge {
             );
             return;
         }
-        match self.state.logpin().map(|t| t.map(|t| Pin::parse(&t))) {
+        let pinned = self.state.logpin().map(|t| t.map(|t| Pin::parse(&t)));
+        // NEGATIVE CONTROL (`crate::sim`): the predecessor's batch not
+        // recovered, so its records are taken again at fresh sequences.
+        #[cfg(test)]
+        let pinned = if self.fx.mutant(crate::sim::world::Mutant::FreshMirrorTake) {
+            Ok(None)
+        } else {
+            pinned
+        };
+        match pinned {
             Ok(None) => {}
             Ok(Some(Ok(mut pin))) => {
                 let k = pin.slots.len();
@@ -391,7 +416,7 @@ impl Bridge {
     /// ([`Bridge::mirror_send`]) or landed ([`Outcome::concluded`]) until it
     /// is, and it is tried again after [`DEADLINE_RETRY`].
     pub(super) fn mirror_step(&mut self) {
-        let now = Instant::now();
+        let now = self.fx.now();
         if self.mirror_due(now).is_none_or(|at| at > now) {
             return;
         }
@@ -426,8 +451,9 @@ impl Bridge {
     }
 
     pub(super) fn mirror_take(&mut self) {
+        let now = self.fx.now();
         let Some((total, n, key)) = self.mirror.as_deref_mut().map(|m| {
-            let now_ms = m.now_ms();
+            let now_ms = m.now_ms(now);
             let room = m.bucket.room(now_ms);
             let n = usize::try_from(room).unwrap_or(usize::MAX).min(m.batch);
             (m.pin.total, n, m.key.clone())
@@ -526,6 +552,7 @@ impl Bridge {
         }
         self.unsent = unsent;
         let inc = self.inc;
+        let now = self.fx.now();
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
@@ -540,34 +567,14 @@ impl Bridge {
         if let Err(e) = self.state.set_logpin(&m.pin.render()) {
             eprintln!("aterm-link: mirror: the pin could not be written ({e}); nothing sent");
             m.clear_batch();
-            m.retry_at = Some(Instant::now() + DEADLINE_RETRY);
-            return;
-        }
-        match self.fault {
-            Fault::KillAfterMirrorPin => self.fault.fire(Fault::KillAfterMirrorPin, &self.state),
-            Fault::ParkAfterMirrorPinWhileMarked => self.park_after_mirror_pin_while_marked(),
-            _ => {}
+            m.retry_at = Some(now + DEADLINE_RETRY);
         }
     }
 
     fn mirror_retry_in(&mut self, wait: Duration) {
+        let now = self.fx.now();
         if let Some(m) = self.mirror.as_deref_mut() {
-            m.retry_at = Some(Instant::now() + wait);
-        }
-    }
-
-    /// PARK WITH A PIN OUTSTANDING for as long as `<state>/park-mirror-pin`
-    /// exists (ruling Q12): one shot, `fault-fired` written so the test knows.
-    fn park_after_mirror_pin_while_marked(&mut self) {
-        const POLL: Duration = Duration::from_millis(10);
-        let marker = self.state.root().join("park-mirror-pin");
-        if !marker.exists() {
-            return;
-        }
-        self.fault = Fault::None;
-        Fault::ParkAfterMirrorPinWhileMarked.fired(&self.state);
-        while marker.exists() {
-            std::thread::sleep(POLL);
+            m.retry_at = Some(now + wait);
         }
     }
 
@@ -615,7 +622,7 @@ impl Bridge {
                 }
                 continue;
             }
-            let waiting = Instant::now();
+            let waiting = self.fx.now();
             while self
                 .conn
                 .as_ref()
@@ -623,10 +630,10 @@ impl Bridge {
                 && self.settle_one(waiting)
             {}
             let producer = self.producer_id;
+            let started = self.fx.now();
             let Some(link) = self.conn.as_mut() else {
                 return;
             };
-            let started = Instant::now();
             match link.send(
                 producer,
                 pseq,
@@ -634,6 +641,7 @@ impl Bridge {
                 &face,
                 body.as_bytes(),
                 Then::Mirror { slot: i },
+                started,
             ) {
                 Ok(()) => {
                     let inc = self.inc;
@@ -716,12 +724,6 @@ impl Bridge {
         if let Some(o) = m.outcome.get_mut(slot) {
             *o = outcome;
         }
-        if self.fault == Fault::KillMidMirrorBatch
-            && m.outcome.len() >= 2
-            && m.outcome.iter().filter(|o| o.concluded()).count() == 1
-        {
-            self.fault.fire(Fault::KillMidMirrorBatch, &self.state);
-        }
     }
 
     /// After a collision, on the connection the reattach brought: the
@@ -769,6 +771,7 @@ impl Bridge {
         }
         self.unsent = unsent;
         let inc = self.inc;
+        let now = self.fx.now();
         let Some(m) = self.mirror.as_deref_mut() else {
             return false;
         };
@@ -782,7 +785,7 @@ impl Bridge {
                 "aterm-link: mirror: the re-pin could not be written ({e}); nothing re-sent, the \
                  batch waits"
             );
-            m.retry_at = Some(Instant::now() + DEADLINE_RETRY);
+            m.retry_at = Some(now + DEADLINE_RETRY);
             return false;
         }
         m.pin = pin;
@@ -833,10 +836,11 @@ impl Bridge {
         let mut again = false;
         for (i, off, sid, body, pseq) in checks {
             let face = subject::session_face(&self.cfg.fleet, &self.node, &sid, "ev");
+            let fx = self.fx.clone();
             let Some(conn) = self.conn_now() else {
                 return;
             };
-            let started = Instant::now();
+            let started = fx.now();
             let answer = conn.fetch(off, &face, 1);
             let read = match self.observe(started, answer, Some("read")) {
                 Ok((rows, _)) => match rows.iter().find(|(at, f, _)| *at == off && *f == face) {
@@ -932,20 +936,18 @@ impl Bridge {
         if pairs.is_empty() {
             // Nothing of the batch may land: drop the pin, and wait before
             // the take that offers the refused sessions' records again.
+            let now = self.fx.now();
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.clear_batch();
                 m.owed = true;
                 if refused_any {
-                    m.retry_at = Some(Instant::now() + REFUSED_WAIT);
+                    m.retry_at = Some(now + REFUSED_WAIT);
                 }
                 if let Err(e) = self.state.set_logpin(&m.pin.render()) {
                     eprintln!("aterm-link: mirror: the emptied pin could not be written ({e})");
                 }
             }
             return;
-        }
-        if self.fault == Fault::KillBeforeLogLanded {
-            self.fault.fire(Fault::KillBeforeLogLanded, &self.state);
         }
         // A halt queued while the batch went out goes first (ruling Q10).
         self.service_urgent();
@@ -968,9 +970,6 @@ impl Bridge {
                 return;
             }
         };
-        if self.fault == Fault::KillAfterLogLanded {
-            self.fault.fire(Fault::KillAfterLogLanded, &self.state);
-        }
         for ((sid, _), w) in pairs.iter().zip(&words) {
             if *w == LandedWord::Done {
                 self.mirror_retire_face(sid);
@@ -1015,10 +1014,11 @@ impl Bridge {
     fn mirror_retire_face(&mut self, sid: &str) {
         let face = subject::session_face(&self.cfg.fleet, &self.node, sid, "ev");
         let producer = self.producer_id;
+        let fx = self.fx.clone();
         let Some(conn) = self.conn_now() else {
             return;
         };
-        let started = Instant::now();
+        let started = fx.now();
         let answer = conn.retire_subject(producer, &face);
         if let Err(e) = self.observe(started, answer, None) {
             eprintln!("aterm-link: mirror: retiring {face} failed: {e}");

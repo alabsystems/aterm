@@ -2618,10 +2618,14 @@ mod tests {
     }
 
     /// Publish muse `version` as `exe` on Meta's channel, the release manifest at the
-    /// client-built URL naming its sha256 and size; `false` where muse is not served.
-    fn publish_muse(f: &Fake, version: &str, exe: &[u8]) -> bool {
+    /// client-built URL naming its sha256 and size. Where muse is not served for this
+    /// host the calling test ends COULD NOT RUN, after whatever it checked before.
+    fn publish_muse(f: &Fake, version: &str, exe: &[u8]) {
         let Some((key, file)) = resolve::muse_platform(world::triple()) else {
-            return false;
+            aterm_uds::host::could_not_run(format!(
+                "muse is not served for {}, so the landing half did not run",
+                world::triple()
+            ));
         };
         let version = v(version);
         let url = resolve::muse_url(version, file);
@@ -2640,7 +2644,6 @@ mod tests {
         f.doc(muse().head_url, channel.as_bytes());
         f.doc(&manifest_url, manifest.as_bytes());
         f.payload(&url, exe);
-        true
     }
 
     /// agy end to end: the Run manifest and the bucket's copy agree, so the gzip tar's one
@@ -2706,9 +2709,7 @@ mod tests {
         assert!(f.gets.borrow().is_empty(), "no host was asked");
         assert!(ProgramStamp::read(&l, "muse").is_none(), "nothing recorded");
         let exe = native_exe("muse 1.4.9-R6298");
-        if !publish_muse(&f, "1.4.9-R6298", &exe) {
-            return;
-        }
+        publish_muse(&f, "1.4.9-R6298", &exe);
         let o = run(&l, &f, &Policy::default(), muse());
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
         let build = world::build_dir(&l, "muse", "1.4.9-R6298");
@@ -3742,9 +3743,7 @@ mod tests {
     fn a_muse_digest_is_logged_only_once_the_team_pin_passed_its_bytes() {
         let l = world::layout("muse-pin");
         let f = Fake::default();
-        if !publish_muse(&f, "1.4.9-R6298", &native_exe("not Meta's")) {
-            return;
-        }
+        publish_muse(&f, "1.4.9-R6298", &native_exe("not Meta's"));
         let refusing = world::trust_refusing_signers();
         let o = run_with(&l, &f, &Policy::default(), &refusing, muse(), false);
         assert!(o.line().contains("signer refused"), "{}", o.line());

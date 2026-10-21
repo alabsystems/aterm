@@ -11,8 +11,8 @@
 //! restart that types nothing first ([`Facts::unnoticed`]). One line follows
 //! only where the resumed build itself warns that something the session ran
 //! did not come back ([`resumed_build_warned`], [`restore_prompt`]) and its
-//! task is still open. A conversation whose record says its worker FINISHED
-//! its task ([`FinishedScan`]) moves the quiet way whatever the key says. The
+//! task is still open. A conversation whose record says its task LANDED
+//! ([`FinishedScan`]) moves the quiet way whatever the key says. The
 //! steps below are the `upgrade_ask = true` flow.
 //!
 //! A running Claude Code cannot have its binary replaced (the kernel mapped
@@ -65,10 +65,11 @@
 //!
 //! A conversation with no task ([`TaskScan`]) skips all of this: once idle it
 //! is ended and the new build started afresh in its tab ([`Step::Fresh`]).
-//! One whose worker FINISHED its task ([`FinishedScan`]: the token, or a done
-//! reply to the done check, with no prompt of a person's or an orchestrator's
-//! since) is asked nothing and told nothing: moved the quiet way, and any
-//! carry-on owed after a restart is left untyped (`done:finished`).
+//! One whose task LANDED ([`FinishedScan`]: a clean `Nothing left:` defense
+//! answering one of Autopilot Land's acts, with no prompt of a person's or an
+//! orchestrator's since — never a token or a done reply) is asked nothing
+//! and told nothing: moved the quiet way, and any carry-on owed after a
+//! restart is left untyped (`done:finished`).
 //!
 //! An agent the upgrade asked is never left stopped: it is restarted and
 //! told to carry on, or released. Whenever the upgrade abandons an
@@ -1727,15 +1728,17 @@ pub fn continue_prompt(from: &Version, to: &Version, ran: Option<&str>) -> Strin
 
 /// A restart's continuation `text` (the upgrade's [`continue_prompt`], a
 /// relaunch's `super::relaunch::resumed_prompt`) for a conversation whose
-/// last words are a done report ([`FinishedScan::said_done`]): its facts,
-/// then the done check in place of [`CARRY_ON`] — where the turn-end policy
-/// types only the check, never `keep going` (the live lab's LIVE-RL-1) —
-/// worded as the policy's ([`turn_end::done_check_text`]): where the report
-/// names an irreversible act (`irreversible`,
-/// [`FinishedScan::said_irreversible`]) the check's `otherwise continue`
-/// alone would read as consent to it, so
+/// last words claim the work is done ([`FinishedScan::said_done`]) under
+/// Cruise: its facts, then the Cruise prompt in place of [`CARRY_ON`] — where
+/// the turn-end policy types only that prompt at a done claim, never `keep
+/// going` (the live lab's LIVE-RL-1) — worded as the policy's
+/// ([`turn_end::done_check_text`]): where the report names an irreversible
+/// act (`irreversible`, [`FinishedScan::said_irreversible`]) the prompt's
+/// carry-on alone would read as consent to it, so
 /// [`turn_end::DONE_CHECK_REVERSIBLE`] follows (the review's RR4-RL-3). A
-/// text not ending so is kept as it is.
+/// text not ending so is kept as it is. Under Land a relaunch types nothing
+/// of its own at a done claim: the loop's next act is Land's
+/// (`super::relaunch`'s `done:landing`).
 #[must_use]
 pub fn checking(text: &str, irreversible: bool) -> String {
     text.strip_suffix(CARRY_ON).map_or_else(
@@ -1745,12 +1748,17 @@ pub fn checking(text: &str, irreversible: bool) -> String {
 }
 
 /// How every continuation after a restart ends (the upgrade's
-/// [`continue_prompt`] and a relaunch's `super::relaunch::resumed_prompt`):
-/// nobody is at the keyboard, so an agent waiting on the user decides for
-/// itself and keeps going (as `[harness] answer_text`).
-pub const CARRY_ON: &str = "Continue where you left off. If you were waiting on the user, \
-                            nobody is here to answer: decide for yourself, prefer reversible \
-                            steps, and keep going.";
+/// [`continue_prompt`] and a relaunch's `super::relaunch::resumed_prompt`,
+/// every lane's — Claude Code's, Gemini CLI's, agy's, Muse Code's): nobody
+/// is at the keyboard, so an agent waiting on the user decides for itself
+/// and keeps going (as `[harness] answer_text`), and what only a person can
+/// give goes on a NEEDS YOU line, which the loop puts on the person's screen
+/// ([`crate::supervise::policy::needs::NEEDS_HINT`]).
+pub const CARRY_ON: &str = concat!(
+    "Continue where you left off. If you were waiting on the user, nobody is here to answer: \
+     decide for yourself, prefer reversible steps, and keep going. ",
+    crate::supervise::policy::needs::needs_hint!()
+);
 
 /// THE ONE LINE A QUIET RESTART TYPES, and only where the resumed build
 /// itself warned that something did not come back ([`resumed_build_warned`])
@@ -2012,18 +2020,19 @@ pub fn directed_since_ready(jsonl: &str, markers: &[String]) -> bool {
     directed
 }
 
-/// WHETHER A CONVERSATION'S TASK IS FINISHED, BY ITS OWN RECORD: the worker
-/// ended it — its answer's last line is [`turn_end::FINISHED`]
-/// ([`turn_end::says_finished`]), or it answered the supervisor's done check
-/// ([`turn_end::DONE_CHECK`], or an earlier build's words: `is_done_check`)
-/// in its own word that it is done (`turn_end::says_done_outright`: the
-/// token on a line of its own, `DONE`, a done phrase — never an idle report
-/// or the check's words echoed back, which the screen's rule reads at the
-/// check as the work going on, so the record never ends there a task the
-/// screen continues) — and NOBODY HAS ASKED ANYTHING SINCE: no prompt of a
-/// person's or an orchestrator's, no command of theirs that started a turn,
-/// and no open-items challenge of the supervisor's ([`Asked::Challenge`]),
-/// which takes the token's finish back and is answered as the check is.
+/// WHETHER A CONVERSATION'S TASK IS FINISHED, BY ITS OWN RECORD — LANDED
+/// (FOREVER CRUISE / FOREVER LAND): the worker answered one of Autopilot
+/// Land's acts ([`Asked::Land`]: its instruction, a nudge, its answer to a
+/// question once the instruction was read — today's words or a build
+/// before's) with a CLEAN DEFENSE ([`turn_end::clean_defense`]: a `Nothing
+/// left:` line, no NEEDS YOU beside it, no open work in Land's strict
+/// reading) — and NOBODY HAS ASKED ANYTHING SINCE: no prompt of a person's
+/// or an orchestrator's, no command of theirs that started a turn. Nothing
+/// else finishes a task: not the retired `ATERM-TASK-DONE`, not a done
+/// reply to a check (today's Cruise prompt or an older build's done check),
+/// not an idle report. The record cannot see the session's repository, the
+/// policy's fourth condition of a landing: the loop holds a landing to it,
+/// and the record speaks only of the words.
 /// Folded over the transcript one line at a time ([`Self::line`]),
 /// oldest first, so a caller reads on from where it stopped
 /// (`upgrade_drive::Finished`). Unlike [`TaskScan`] it never settles: the
@@ -2039,6 +2048,10 @@ pub fn directed_since_ready(jsonl: &str, markers: &[String]) -> bool {
 /// agent's start-up, which writes no prompt at all. Neither do rows that ask
 /// nothing: compaction summaries (`isCompactSummary`), tool results,
 /// Claude Code's expansions (`isMeta`), Esc's `[Request interrupted…`.
+/// A check of the harness's — the Cruise prompt, an older build's done
+/// check or open-items challenge — opens the finish again: typed into a
+/// landed task, the task is open (a Land changed to Cruise reopens it, as the
+/// policy reads it).
 /// A PEER'S MESSAGE is someone's (`origin.kind` `peer`, which Claude Code
 /// records `isMeta`), and so is a row of any kind this fold does not know,
 /// `isMeta` or not: in doubt the task is opened, as the screen would open
@@ -2055,47 +2068,36 @@ pub fn directed_since_ready(jsonl: &str, markers: &[String]) -> bool {
 /// of them would be, someone's opens the task, and the turn it joined goes on.
 ///
 /// THE FINISH IS ITS TURN'S LAST WORD: a later text row of the session's own
-/// model in the SAME turn (no prompt row between) that does not end so takes
-/// it back, as the screen's rule reads only the last words (followed by more
-/// text is not it). A turn begins at a row that asks something — a prompt, a
-/// command, a check, one of the turns nobody asked above — and at a row that
-/// asks nothing which Claude Code numbered a turn of its own (a `promptId`
-/// other than the last row's: a `/loop`'s wake, known on a build that numbers
-/// no turn by its `scheduledTaskId`, its `turnOrigin` or, for a missed
-/// one-shot task's notice, its fixed words: [`begins_unnumbered`]). A row
-/// that asks nothing
-/// under the running turn's `promptId`, or under none, goes on that turn: a
-/// Stop hook's feedback (`Stop hook feedback: … not met`) or `/goal`'s
-/// check-in, after which the worker works on in the same turn because its
-/// own goal says the task is not done — its later words take the token back
-/// (MEASURED 2026-10-15: 39 hook-feedback and 16 check-in rows on this
-/// machine, each under its turn's id, a second after the model's text).
-/// Rows `<synthetic>` writes (API errors, `No response requested.`),
-/// `isApiErrorMessage` rows and subagents' rows say nothing.
+/// model in the SAME turn (no prompt row between) that is no clean defense
+/// takes it back, as the screen's rule reads only the last words. A turn
+/// begins at a row that asks something — a prompt, a command, a check, a
+/// land act, one of the turns nobody asked above — and at a row that asks
+/// nothing which Claude Code numbered a turn of its own (a `promptId` other
+/// than the last row's: a `/loop`'s wake, known on a build that numbers no
+/// turn by its `scheduledTaskId`, its `turnOrigin` or, for a missed one-shot
+/// task's notice, its fixed words: [`begins_unnumbered`]). A row that asks
+/// nothing under the running turn's `promptId`, or under none, goes on that
+/// turn: a Stop hook's feedback (`Stop hook feedback: … not met`) or
+/// `/goal`'s check-in, after which the worker works on in the same turn
+/// because its own goal says the task is not done — its later words take
+/// the finish back (MEASURED 2026-10-15: 39 hook-feedback and 16 check-in
+/// rows on this machine, each under its turn's id, a second after the
+/// model's text). Rows `<synthetic>` writes (API errors, `No response
+/// requested.`), `isApiErrorMessage` rows and subagents' rows say nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FinishedScan {
-    /// The record says the task is finished.
+    /// The record says the task is finished: landed.
     finished: bool,
-    /// That finish is a done reply in the worker's words to the done check
-    /// (or to a land act standing in for it), not its [`turn_end::FINISHED`]
-    /// ([`Self::finished_at_check`]).
-    at_check: bool,
     /// The finish was said in the turn running now: a later text row of the
     /// same turn says the turn's last word again.
     said: bool,
-    /// The turn running now was asked by the done check, by its kin the
-    /// open-items challenge ([`Asked::Challenge`]), or by one of Autopilot
-    /// Land's acts that stand in for it ([`Asked::Land`]): a reply saying
-    /// done in the worker's own word finishes the task.
-    check: bool,
-    /// That check is Land's ([`Asked::Land`]): a first-only done report
-    /// answering it stays the conversation's last words' done report
-    /// ([`Self::said_done`]), so a relaunch asks the check, never `keep
-    /// going`.
+    /// The turn running now was asked by one of Land's acts
+    /// ([`Asked::Land`]): a clean defense answering it lands the task.
     land: bool,
-    /// The model's last text row in the turn running now says its worker is
-    /// done, in words or by the token ([`turn_end::says_done`]): a done
-    /// report, a first one included ([`Self::said_done`]).
+    /// The model's last text row in the turn running now claims its worker
+    /// is done ([`turn_end::says_done`]: a done report, a defense, an idle
+    /// report, the retired token), whatever asked the turn
+    /// ([`Self::said_done`]).
     done_said: bool,
     /// The turn running now was asked by the live upgrade's notice
     /// ([`is_announcement`]): its answer — the stopping point it asked for,
@@ -2104,49 +2106,19 @@ pub struct FinishedScan {
     /// review's RR4-RL-2).
     notice: bool,
     /// That done report also names an irreversible act
-    /// ([`turn_end::Said::Irreversible`]): the check asked after it says to
-    /// approve nothing irreversible, as the turn-end policy's does
+    /// ([`turn_end::Said::Irreversible`]): the Cruise prompt asked after it
+    /// says to approve nothing irreversible, as the turn-end policy's does
     /// ([`turn_end::done_check_text`]; the review's RR4-RL-3).
     done_irreversible: bool,
-    /// The done check's answer, while the turn running now is the check's:
-    /// whether its worker's last text row says done in its own word
-    /// ([`turn_end::says_done_outright`]), as the record reads it — inline
-    /// code and fenced blocks are the record's own, which Claude Code draws
-    /// with no ticks and no fences ([`Self::check_answer`]; the review's
-    /// RR4-TE-1). `None` before the check's first text row.
-    check_said: Option<bool>,
-    /// A `turn_duration` row closed the check's turn after that answer: the
-    /// record holds the turn's last words.
-    check_closed: bool,
-    /// That answer is AN IDLE REPORT ALONE ([`turn_end::says_idle_report`]),
-    /// at the done check or the challenge (never a land act's): where the
-    /// check's turn's work ([`Self::check_work_ms`]) is within
-    /// [`turn_end::MIN_WORK`] it finishes the task at the check, as the
-    /// turn-end policy ends it there (ATERM-KI-1016-1, done-1).
-    check_idle: bool,
-    /// When the row that asked the check's turn was recorded (unix ms,
-    /// [`recorded_ms`]): the check's, or the wall's retry that delivered it
-    /// again. A `turn_duration` row that names no `durationMs` is measured
-    /// from it.
-    check_at_ms: Option<u64>,
-    /// THE CHECK'S TURN'S WORK (ms), by Claude Code's own measure: the
-    /// `durationMs` of each `turn_duration` row read since the check, a
-    /// wall's turn and its retry's summed, as the turn-end policy sums the
-    /// screen's busy work across the wall (`turn_end::check_answer_ends`).
-    /// Never the clock from the check's row: the retry's wait (a 529's
-    /// minutes, a limit's hours) is no work, and read as work the record's
-    /// `Some(false)` continued a task the screen ended (the review's DR-3).
-    /// `None` where a row was measured by neither.
-    check_work_ms: Option<u64>,
-    /// A WALL CUT THE CHECK'S TURN (or a land act's): Claude Code's own error
-    /// row (`isApiErrorMessage`: an API error, a limit) came while it ran,
-    /// and the worker has said nothing since. The turn-end policy's retry of
-    /// the wall, typed next, delivers the check again, so its answer is the
-    /// check's, as the policy reads it (`TurnEndState::cut_check`, its
-    /// `cut_land`; the merge review's M5-R1): the next row that asks
-    /// something keeps the check where it is the supervisor's plain text
-    /// ([`supervisors_plain`]: the wall's retry, the usage resume), and
-    /// clears this either way.
+    /// A WALL CUT A LAND ACT'S TURN: Claude Code's own error row
+    /// (`isApiErrorMessage`: an API error, a limit) came while it ran, and
+    /// the worker has said nothing since. The turn-end policy's retry of the
+    /// wall, typed next, delivers the act again, so its answer is the act's,
+    /// as the policy reads it (`TurnEndState::cut_land`; the merge review's
+    /// M5-R1): the next row that asks something keeps the act where it is the
+    /// supervisor's plain text ([`supervisors_plain`]: the wall's retry, the
+    /// usage resume) or Claude Code's own continuation of the limit
+    /// ([`vendor_continues`]), and clears this either way.
     cut: bool,
     /// A command of someone else's waits: the turn it starts opens the task.
     command: bool,
@@ -2160,70 +2132,14 @@ pub struct FinishedScan {
     turn_fold: TurnFold,
     /// LAND'S INSTRUCTION WAS READ (or a nudge, typed only after it) since
     /// the last prompt of someone's: Land's answer to a question
-    /// ([`lands_answer`]) is then Land's check too ([`Asked::Land`]), as
-    /// the turn-end policy lands its done reply once the instruction was
-    /// typed (`TurnEndState::acted`). Read as the harness's own line, the
-    /// done reply to it was a first done report, and a relaunch or the
-    /// upgrade asked the check once more (ATERM-KI-1016-1).
+    /// ([`lands_answer`]) is then a land act too ([`Asked::Land`]), as the
+    /// turn-end policy lands a defense answering it once the instruction was
+    /// typed (`TurnEndState::acted`).
     land_typed: bool,
     /// A row read SETTLES THE FINISH, whatever came before it
     /// ([`Self::settled`]).
     settled: bool,
 }
-
-/// The done check's words before 2026-09-29 (`3e34e2f6d`), which the
-/// records of conversations checked then still hold ([`FinishedScan`]).
-const DONE_CHECK_BEFORE: &str =
-    "If the task is finished and verified, reply DONE and stop; otherwise continue.";
-
-/// The done check's words from 2026-09-29 (`3e34e2f6d`) until the check asked
-/// for the token as the reply's LAST line (2026-10-15, `90caade5b`), which
-/// the records of conversations checked then still hold ([`FinishedScan`]).
-const DONE_CHECK_TOKEN_BEFORE: &str = "If the task is finished and verified, reply with \
-                                       ATERM-TASK-DONE on a line by itself and stop; \
-                                       otherwise continue.";
-
-/// The done check's words that asked for the token LAST (2026-10-15,
-/// `90caade5b`) until the check took the primer's definition of finished
-/// (the merge of `f09ef3b15`), which the records of conversations checked
-/// then still hold ([`FinishedScan`]).
-const DONE_CHECK_LAST_BEFORE: &str = "If the task is finished and verified, end your reply with \
-                                      ATERM-TASK-DONE on a line by itself and stop; \
-                                      otherwise continue.";
-
-/// The primer's definition of finished as main's check asked it (`d92d817dc`)
-/// before the merge of `f09ef3b15` asked for the token LAST, which the records
-/// of conversations checked then still hold ([`FinishedScan`]).
-const DONE_CHECK_OPEN_BEFORE: &str = "Before you stop: do every open item, skipped check, \
-     follow-up and next step you can still do yourself now, and verify it (build, test, \
-     measure where numbers were asked for, commit and land where this repository lands \
-     work). Reply with ATERM-TASK-DONE on a line by itself only when everything left needs \
-     a person (a credential, a decision, physical access) or cannot be done on this host, \
-     each item named with its blocker; a slow check is not a blocker. Otherwise continue.";
-
-/// The done check from `69a8f68178` (ordinary language) until the owner's
-/// rule of 2026-10-19 (an item left that names its blocker ended the job).
-const DONE_CHECK_ORDINARY_BEFORE: &str = turn_end::DONE_CHECK_ORDINARY_BEFORE;
-
-/// The last check that required a completion marker, from the merge of
-/// `f09ef3b15` until `69a8f68178`. Existing conversations still carry these
-/// words, including inside a restart's carry-on.
-const DONE_CHECK_MARKER_BEFORE: &str = turn_end::DONE_CHECK_MARKER_BEFORE;
-
-/// Historical Land prompts are still recognized when reading old transcripts.
-const LAND_MARKER_BEFORE: &str = concat!(
-    harness_mark!(),
-    " Autopilot is set to Land: wrap up this work cleanly. Finish only the step in hand and \
-     start nothing new. Make sure what is done is verified, and leave it committed (and pushed, \
-     if that is how this repository works). Then write a short summary of what is done and what \
-     is left, and reply with ATERM-TASK-DONE on a line by itself."
-);
-
-const LAND_NUDGE_MARKER_BEFORE: &str = concat!(
-    harness_mark!(),
-    " Still landing: finish only what leaves the work clean, then reply with ATERM-TASK-DONE on \
-     a line by itself."
-);
 
 /// What one user row asks, to [`FinishedScan`].
 enum Asked {
@@ -2231,31 +2147,23 @@ enum Asked {
     Theirs,
     /// A command of theirs: a turn only if it starts one.
     Command,
-    /// The supervisor's done check.
+    /// A check of the supervisor's on a done claim: today's Cruise prompt
+    /// (`turn_end::DONE_CHECK`, `continue-done-check@v1`) or an older
+    /// build's done check ([`turn_end::RETIRED_DONE_CHECKS`]). Its answer
+    /// lands nothing (Cruise never ends); typed into a landed task, the task
+    /// is open again.
     Check,
-    /// Autopilot Land's instruction or nudge (`turn_end::LAND`,
-    /// `turn_end::LAND_NUDGE`), which the turn-end policy reads as Land's done
-    /// check: the check to the record too, so a done reply to it in the
-    /// worker's own word finishes the task, and the record's closed answer
-    /// speaks at a land act's yield as at the check's (the merge review's
-    /// XM-LAND-RECORD). A first-only report answering it stays a done report.
-    /// So too Land's answer to a question (`turn_end::LAND_ANSWER`, by its
-    /// ledger rule: [`lands_answer`]) once the instruction was read since the
-    /// last prompt of someone's ([`FinishedScan::land_typed`]), as the policy
-    /// lands on it only once the instruction was typed; before it, the
-    /// harness's own line.
+    /// One of Autopilot Land's acts: its instruction or nudge
+    /// (`turn_end::LAND`, `turn_end::LAND_NUDGE`, or a build before's), or
+    /// Land's answer to a question (`turn_end::LAND_ANSWER`, by its ledger
+    /// rule: [`lands_answer`]) once the instruction was read since the last
+    /// prompt of someone's ([`FinishedScan::land_typed`]) — before it, the
+    /// harness's own line. A clean defense answering it lands the task.
     Land,
-    /// The supervisor's challenges (`turn_end::open_items_text`,
-    /// `turn_end::uncommitted_text`; [`turn_end::is_challenge_text`]), typed
-    /// where a done report's own words named open work or the session's
-    /// repository held work no remote has: the done check's kin, as the
-    /// turn-end policy reads it (`TurnEndState::acted`).
-    /// It TAKES BACK THE FINISH the token made — read as the harness's own
-    /// line, the finish stood through it, and a loop that reads the record
-    /// ended the job whatever the worker answered (the merge review's
-    /// MG7-A1) — and a done reply to it in the worker's own word
-    /// that names no open work finishes the task at the check, as the policy
-    /// ends it.
+    /// The challenges older builds' supervisors typed (retired:
+    /// [`turn_end::RULE_OPEN_ITEMS`], [`turn_end::RULE_UNCOMMITTED`], known by
+    /// [`turn_end::is_challenge_text`]): a check's kin, as older records hold
+    /// them, read as a check is.
     Challenge,
     /// A turn nobody asked: the harness's own, Claude Code's own wake, a
     /// local command's output.
@@ -2292,45 +2200,12 @@ impl FinishedScan {
             Some("assistant") => self.answered(&v),
             Some("user") => self.asked(&v),
             Some("attachment") => self.queued(&v),
-            Some("system") if v.get("subtype").and_then(Value::as_str) == Some("turn_duration") => {
-                self.check_closed = self.check && self.check_said.is_some();
-                if self.check {
-                    let worked = v.get("durationMs").and_then(Value::as_u64).or_else(|| {
-                        self.check_at_ms
-                            .zip(recorded_ms(&v))
-                            .map(|(asked, ended)| ended.saturating_sub(asked))
-                    });
-                    self.check_work_ms = self
-                        .check_work_ms
-                        .zip(worked)
-                        .map(|(sum, ms)| sum.saturating_add(ms));
-                }
-                // AN IDLE REPORT ALONE AS A SHORT CHECK TURN'S WHOLE ANSWER
-                // ends the task at the check, as the turn-end policy reads it
-                // (`turn_end::check_answer_ends`): its closed answer says so.
-                // Not where a wall closed the turn ([`Self::cut`]): the words
-                // before it were no whole answer, and the retry's is the
-                // check's.
-                let short = self
-                    .check_work_ms
-                    .is_some_and(|ms| u128::from(ms) < turn_end::MIN_WORK.as_millis());
-                if self.check_closed
-                    && !self.cut
-                    && self.check_said == Some(false)
-                    && self.check_idle
-                    && short
-                {
-                    self.check_said = Some(true);
-                    (self.finished, self.said, self.settled) = (true, true, true);
-                    self.at_check = true;
-                }
-            }
             _ => {}
         }
         self.finished
     }
 
-    /// Whether the record read so far says the task is finished.
+    /// Whether the record read so far says the task is finished: landed.
     #[must_use]
     pub fn finished(&self) -> bool {
         self.finished
@@ -2338,11 +2213,12 @@ impl FinishedScan {
 
     /// Whether a row read so far SETTLES THE FINISH whatever came before it:
     /// a prompt of someone's (a command of theirs once it starts a turn, one
-    /// typed while the worker worked), the open-items challenge, or an answer
-    /// that finishes the task. Every other row — Claude Code's own wakes and
-    /// their answers, the harness's own lines, a check not yet answered —
-    /// leaves the finish as it stood before it, so a read that begins after
-    /// the record's head and settles nothing cannot say it
+    /// typed while the worker worked), a check or a land act of the
+    /// harness's (each opens the finish, its answer the only one that can
+    /// land it), or an answer that lands the task. Every other row — Claude
+    /// Code's own wakes and their answers, the harness's own lines — leaves
+    /// the finish as it stood before it, so a read that begins after the
+    /// record's head and settles nothing cannot say it
     /// (`upgrade_drive::Finished`, which reads such a window from further
     /// back; ATERM-KI-1016-1).
     #[must_use]
@@ -2350,19 +2226,18 @@ impl FinishedScan {
         self.settled
     }
 
-    /// Whether the conversation's LAST WORDS are a done report: the model's
-    /// last text row says its worker is done ([`turn_end::says_done`]: a done
-    /// phrase, an idle report, the token) — a first one included, which
-    /// [`Self::finished`] does not end on; never an answer to the done check,
-    /// which says done only by finishing (an answer to a land act, which
-    /// stands in for the check, is one where it does not finish:
-    /// [`Asked::Land`]) — and nobody has asked the worker
-    /// anything since: a prompt of someone's opens it, a command of theirs
-    /// once it starts a turn, while a look at the tab (`/usage`, `/model`, a
-    /// `!` shell command, their output), the harness's own line and Claude
-    /// Code's own wake take nothing back until an answer with words does
-    /// (the review's RR4-RL-1). What a relaunch's carry-on asks the done
-    /// check after, never `keep going` (the live lab's LIVE-RL-1).
+    /// Whether the conversation's LAST WORDS claim the work is done: the
+    /// model's last text row says so ([`turn_end::says_done`]: a done
+    /// phrase, a `Nothing left:` defense, an idle report, the retired token),
+    /// whatever asked its turn — a check's answer included, as Cruise reads
+    /// every done claim — and nobody has asked the worker anything since: a
+    /// prompt of someone's opens it, a command of theirs once it starts a
+    /// turn, while a look at the tab (`/usage`, `/model`, a `!` shell
+    /// command, their output), the harness's own line and Claude Code's own
+    /// wake take nothing back until an answer with words does (the review's
+    /// RR4-RL-1). What a relaunch's carry-on answers under Cruise with the
+    /// Cruise prompt ([`checking`]), never `keep going` (the live lab's
+    /// LIVE-RL-1), and under Land leaves to the loop.
     #[must_use]
     pub fn said_done(&self) -> bool {
         self.done_said
@@ -2391,44 +2266,9 @@ impl FinishedScan {
         self.turn_fold.turn()
     }
 
-    /// WHAT THE DONE CHECK'S CLOSED ANSWER SAYS, by the record: where the
-    /// turn running now is the check's (the loop's own, a restart's carry-on
-    /// that asks it, or a land act that stands in for it, [`Asked::Land`])
-    /// and a `turn_duration` row has closed it,
-    /// whether its last text row says done in the worker's own word
-    /// ([`turn_end::says_done_outright`]). The screen draws inline code and
-    /// fenced blocks with no ticks and no fences, so a tool's quoted words
-    /// (`Build completed successfully …`) read there as the worker's own;
-    /// the record keeps them code, and at the check's yield its `Some(false)`
-    /// overrules the screen's done word (the review's RR4-TE-1). `None`
-    /// where no check runs, or its turn is not closed yet: a record that has
-    /// not caught up with the screen (Claude Code flushes its transcript on a
-    /// timer, 100 ms) says nothing of the check's answer.
-    #[must_use]
-    pub fn check_answer(&self) -> Option<bool> {
-        (self.check && self.check_closed)
-            .then_some(self.check_said)
-            .flatten()
-    }
-
-    /// WHETHER THE FINISH ([`Self::finished`]) IS A DONE REPLY TO THE DONE
-    /// CHECK IN THE WORKER'S WORDS, not its token: the check's answer says
-    /// done in its own word ([`turn_end::says_done_outright`]) with no
-    /// [`turn_end::FINISHED`] as its last line ([`turn_end::says_finished`]).
-    /// The task ends the same; what differs is the evidence — the turn-end
-    /// loop journals such an end under the check's rule, never as the worker
-    /// having reported the token (F2 of the live lab of 2026-10-16, Claude
-    /// Code 2.1.301: `DONE … rule=finished@v1 the worker reported
-    /// ATERM-TASK-DONE` over a reply that never said it). `false` where the
-    /// record says no finish.
-    #[must_use]
-    pub fn finished_at_check(&self) -> bool {
-        self.finished && self.at_check
-    }
-
     /// Whether that done report ([`Self::said_done`]) names an irreversible
-    /// act ([`turn_end::classify_said`]): the check asked after it adds
-    /// [`turn_end::DONE_CHECK_REVERSIBLE`] ([`checking`]).
+    /// act ([`turn_end::classify_said`]): the Cruise prompt asked after it
+    /// adds [`turn_end::DONE_CHECK_REVERSIBLE`] ([`checking`]).
     #[must_use]
     pub fn said_irreversible(&self) -> bool {
         self.done_said && self.done_irreversible
@@ -2440,14 +2280,14 @@ impl FinishedScan {
         // A command of someone else's that started a turn was a prompt of
         // theirs (any answer counts, `<synthetic>` included: [`TaskScan`]).
         if std::mem::take(&mut self.command) {
-            (self.finished, self.said, self.check, self.done_said) = (false, false, false, false);
-            (self.notice, self.land, self.cut) = (false, false, false);
+            (self.finished, self.said, self.land, self.done_said) = (false, false, false, false);
+            (self.notice, self.cut) = (false, false);
             self.settled = true;
         }
         if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
-            // A wall in the check's turn, whatever the check answered before
-            // it: the retry's answer is the check's ([`Self::cut`]).
-            self.cut = self.check;
+            // A wall in a land act's turn, whatever was answered before it:
+            // the retry's answer is the act's ([`Self::cut`]).
+            self.cut = self.land;
             return;
         }
         let Some(message) = row.get("message") else {
@@ -2465,40 +2305,22 @@ impl FinishedScan {
         let Some(words) = answer_words(message) else {
             return;
         };
-        // At the check only the worker's own word is a done report, as the
-        // turn-end policy reads it there (and that finishes the task): an
-        // idle report answering it is its work going on — unless it is the
-        // whole answer of a turn that closes short (`turn_duration`, below:
-        // `turn_end::check_answer_ends`). At a land act the
-        // worker's own word finishes the task the same, but an idle report
-        // answering one stays a done report, so a relaunch asks the check
-        // after it, never `keep going` into a landing (fail closed). The
-        // notice's answer says nothing of the task either way.
+        // A done claim at every yield, the Cruise prompt's too, as the
+        // turn-end policy reads one ([`turn_end::says_done`]). The notice's
+        // answer says nothing of the task either way.
         if !self.notice {
-            self.done_said = (!self.check || self.land) && turn_end::says_done(Some(&words));
+            self.done_said = turn_end::says_done(Some(&words));
             self.done_irreversible = self.done_said
                 && matches!(
                     turn_end::classify_said(Some(&words)),
                     turn_end::Said::Irreversible(_)
                 );
         }
-        // …and never over words that name open work, a blocked item among
-        // it (`turn_end::open_work`; the owner's rule of 2026-10-19): the
-        // turn-end policy challenges such a report at every token, so the
-        // record ends no task there either, and a relaunch or the upgrade
-        // reads the job as going on.
-        let ends = if self.check {
-            turn_end::says_done_outright(&words)
-        } else {
-            turn_end::says_finished(Some(&words))
-        } && turn_end::open_work(Some(&words)).is_empty();
-        if self.check {
-            (self.check_said, self.check_closed) = (Some(ends), false);
-            self.check_idle = !self.land && !ends && turn_end::says_idle_report(&words);
-        }
-        if ends {
+        // Only a clean defense at a land act's yield lands the task: never
+        // the token, never a check's answer, never a defense that names a
+        // need or open work.
+        if self.land && turn_end::clean_defense(Some(&words)) {
             (self.finished, self.said, self.settled) = (true, true, true);
-            self.at_check = self.check && !turn_end::says_finished(Some(&words));
         } else if self.said {
             (self.finished, self.said) = (false, false);
         }
@@ -2511,7 +2333,7 @@ impl FinishedScan {
         let id = row.get("promptId").and_then(Value::as_str);
         // A `/loop`'s wake is a turn of its own: by its new `promptId`, and
         // on a build that numbers no turn as [`begins_unnumbered`] reads it
-        // (ATERM-KI-1016-1: read as part of the token's turn, its answer
+        // (ATERM-KI-1016-1: read as part of the finish's turn, its answer
         // took the finish back).
         let anew = numbered_anew(id, self.turn.as_deref(), || begins_unnumbered(row));
         if anew {
@@ -2534,48 +2356,39 @@ impl FinishedScan {
         // shell command, a local command's output, the harness's own line
         // and Claude Code's wake ask it nothing (the review's RR4-RL-1: a
         // `/usage` at a done tab, then a crash, and the relaunch typed `keep
-        // going` into the done report). Nor does the done check take it back
-        // before its answer does (RR4-RL-4): a check the worker never
-        // answered (a crash, a stall, aterm's end) leaves the done report
-        // the last words, and the relaunch asks the check again.
+        // going` into the done report). Nor does a check take it back before
+        // its answer does (RR4-RL-4): a check the worker never answered (a
+        // crash, a stall, aterm's end) leaves the done report the last
+        // words, and the relaunch asks the Cruise prompt again.
         let notice = row.get("message").is_some_and(is_announcement);
-        // A WALL'S RETRY DELIVERS AGAIN THE CHECK THE WALL CUT ([`Self::cut`]):
-        // the check (or the land act) stands, its answer still to come. So
-        // does the vendor's own continuation of the limit that cut it
+        // A WALL'S RETRY DELIVERS AGAIN THE LAND ACT THE WALL CUT
+        // ([`Self::cut`]): the act stands, its answer still to come. So does
+        // the vendor's own continuation of the limit that cut it
         // ([`vendor_continues`]). Any other row that asks something ends the
         // cut.
         let retry = std::mem::take(&mut self.cut)
             && matches!(asked, Asked::Nobody)
             && (supervisors_plain(row, &self.ours) || vendor_continues(row));
         (self.said, self.notice) = (false, notice);
-        (self.check_said, self.check_closed, self.check_idle) = (None, false, false);
         if retry {
             self.command = false;
-            self.check_at_ms = recorded_ms(row);
             return;
         }
-        (self.check, self.land) = (false, false);
+        self.land = false;
         match asked {
             Asked::Theirs => {
                 (self.finished, self.command, self.done_said) = (false, false, false);
                 (self.land_typed, self.settled) = (false, true);
             }
             Asked::Command => self.command = true,
-            Asked::Check => {
-                (self.check, self.command) = (true, false);
-                (self.check_at_ms, self.check_work_ms) = (recorded_ms(row), Some(0));
+            // A check or a land act opens the finish: only the answer to a
+            // land act can land the task again.
+            Asked::Check | Asked::Challenge => {
+                (self.finished, self.command, self.settled) = (false, false, true);
             }
             Asked::Land => {
-                (self.check, self.land, self.command) = (true, true, false);
-                self.land_typed = true;
-            }
-            // The challenge opens the finish again and asks the check's
-            // answer; a done report it follows stays the last words until
-            // its answer says otherwise, as at the check (RR4-RL-4).
-            Asked::Challenge => {
-                (self.finished, self.check, self.command) = (false, true, false);
-                self.settled = true;
-                (self.check_at_ms, self.check_work_ms) = (recorded_ms(row), Some(0));
+                (self.finished, self.land, self.command) = (false, true, false);
+                (self.land_typed, self.settled) = (true, true);
             }
             Asked::Nobody => self.command = false,
             Asked::Nothing => {}
@@ -2608,9 +2421,9 @@ impl FinishedScan {
             }
         }
         if matches!(asked_by(&Value::Object(asked), &self.ours), Asked::Theirs) {
-            (self.finished, self.said, self.check, self.command) = (false, false, false, false);
-            (self.done_said, self.notice, self.land, self.cut) = (false, false, false, false);
-            self.settled = true;
+            (self.finished, self.said, self.land, self.command) = (false, false, false, false);
+            (self.done_said, self.notice, self.cut) = (false, false, false);
+            (self.land_typed, self.settled) = (false, true);
         }
     }
 }
@@ -3052,36 +2865,23 @@ fn asked_by(row: &Value, ours: &[Typed]) -> Asked {
 }
 
 /// Whether `text` is the supervisor's done check as typed: its words, with
-/// whatever rides after them (`turn_end::done_check_text`: the reversible
-/// clause, [`turn_end::DONE_CHECK_REVERSIBLE`], and the standing rules), or
-/// an earlier build's check, which records written then still hold
-/// ([`DONE_CHECK_ORDINARY_BEFORE`], [`DONE_CHECK_MARKER_BEFORE`],
-/// [`DONE_CHECK_OPEN_BEFORE`],
-/// [`DONE_CHECK_LAST_BEFORE`],
-/// [`DONE_CHECK_TOKEN_BEFORE`], [`DONE_CHECK_BEFORE`]). So too a restart's
-/// carry-on that asks the check ([`checking`], `continued:check`): the
-/// harness's mark, the restart's facts, then the check's words — its answer
-/// read as the check's, the worker's own word that it is done finishing the
-/// task (the review's RR4-RL-5: read as the harness's own line, a done
-/// answer finished nothing and the loop asked the check a second time). BY
-/// ITS WORDS ALONE, whoever typed them (ATERM-KI-1016-1, done-2): the ledger
-/// has no row of a real check in a hand `/resume` tab, or past
+/// whatever rides after them (`turn_end::done_check_text`: the open-work and
+/// repository suffixes, the reversible clause,
+/// [`turn_end::DONE_CHECK_REVERSIBLE`], and the standing rules), or an
+/// earlier build's check, which records written then still hold
+/// ([`turn_end::RETIRED_DONE_CHECKS`]). So too a restart's carry-on that asks
+/// the check ([`checking`], `continued:check`): the harness's mark, the
+/// restart's facts, then the check's words — its answer read as the check's
+/// yield. BY ITS WORDS ALONE, whoever typed them (ATERM-KI-1016-1, done-2):
+/// the ledger has no row of a real check in a hand `/resume` tab, or past
 /// [`TYPED_WITHIN_MS`] or the ledger's cut, and a person who types the check
 /// word for word asks what it asks.
 fn is_done_check(text: &str) -> bool {
-    let checks = [
-        turn_end::DONE_CHECK,
-        DONE_CHECK_ORDINARY_BEFORE,
-        DONE_CHECK_MARKER_BEFORE,
-        DONE_CHECK_OPEN_BEFORE,
-        DONE_CHECK_LAST_BEFORE,
-        DONE_CHECK_TOKEN_BEFORE,
-        DONE_CHECK_BEFORE,
-    ];
-    checks.iter().any(|check| opens_with(check, text))
+    let checks = || std::iter::once(turn_end::DONE_CHECK).chain(turn_end::RETIRED_DONE_CHECKS);
+    checks().any(|check| opens_with(check, text))
         || (text.starts_with(HARNESS_MARK) && {
             let words: Vec<&str> = text.split_whitespace().collect();
-            checks.iter().any(|check| {
+            checks().any(|check| {
                 let check: Vec<&str> = check.split_whitespace().collect();
                 words.windows(check.len()).any(|w| w == check.as_slice())
             })
@@ -3090,19 +2890,29 @@ fn is_done_check(text: &str) -> bool {
 
 /// Whether `text` is Land's instruction or nudge as the policy typed it
 /// ([`Asked::Land`]: `turn_end::land_text`, `turn_end::land_nudge_text`, the
-/// standing rules after it or not). By its opening words alone: a person's
-/// prompt that quotes them is theirs.
+/// standing rules after it or not), or as builds before typed it
+/// ([`turn_end::RETIRED_LANDS`], [`turn_end::RETIRED_LAND_NUDGES`]). By its
+/// opening words alone: a person's prompt that quotes them is theirs.
 fn is_land_check(text: &str) -> bool {
-    [
-        turn_end::LAND,
-        turn_end::LAND_NUDGE,
-        turn_end::LAND_BEFORE,
-        turn_end::LAND_NUDGE_BEFORE,
-        LAND_MARKER_BEFORE,
-        LAND_NUDGE_MARKER_BEFORE,
-    ]
-    .iter()
-    .any(|prompt| opens_with(prompt, text))
+    [turn_end::LAND, turn_end::LAND_NUDGE]
+        .into_iter()
+        .chain(turn_end::RETIRED_LANDS)
+        .chain(turn_end::RETIRED_LAND_NUDGES)
+        .any(|head| opens_with(head, text))
+}
+
+/// Whether `text` opens a LAND ACT, by its opening words as typed — Land's
+/// instruction or a nudge ([`is_land_check`]) or Land's answer to a question
+/// (`turn_end::LAND_ANSWER`), today's words or a build before's: the turns
+/// a worker's result reads as a landing (`super::result`). By the words
+/// alone, as the result reads the transcript with no ledger: a landing's
+/// reply is a defense whoever typed the act, and a person who types Land's
+/// words asks what they ask.
+pub(crate) fn is_land_act(text: &str) -> bool {
+    is_land_check(text)
+        || std::iter::once(turn_end::LAND_ANSWER)
+            .chain(turn_end::RETIRED_LAND_ANSWERS)
+            .any(|answer| opens_with(answer, text))
 }
 
 /// Whether user row `row` is CLAUDE CODE'S OWN CONTINUATION of a usage limit
@@ -3121,14 +2931,17 @@ fn vendor_continues(row: &Value) -> bool {
 }
 
 /// Whether user row `row` is LAND'S ANSWER TO A QUESTION the session's
-/// supervisor typed (`turn_end::LAND_ANSWER`): its words, by the ledger row
+/// supervisor typed (`turn_end::LAND_ANSWER`, or a build before's,
+/// [`turn_end::RETIRED_LAND_ANSWERS`]): its words, by the ledger row
 /// of its rule (`land-answer@v1`), never the words alone — a person may
 /// type them. Land's check to the record only once the instruction was read
 /// ([`FinishedScan::land_typed`]).
 fn lands_answer(row: &Value, ours: &[Typed]) -> bool {
     row.get("isMeta").and_then(Value::as_bool) != Some(true)
         && first_text(row).map(typed_words).is_some_and(|t| {
-            opens_with(turn_end::LAND_ANSWER, t)
+            std::iter::once(turn_end::LAND_ANSWER)
+                .chain(turn_end::RETIRED_LAND_ANSWERS)
+                .any(|answer| opens_with(answer, t))
                 && typed_by(ours, t, recorded_ms(row), |o| {
                     o.rule == turn_end::RULE_LAND_ANSWER
                 })
@@ -3136,29 +2949,25 @@ fn lands_answer(row: &Value, ours: &[Typed]) -> bool {
 }
 
 /// Whether user row `row` is a WALL'S RETRY the session's supervisor typed:
-/// a plain text (no mark of the harness's, no command) its ledger `ours`
-/// records under a wall's retry rule (`turn_end::is_wall_retry`) — the
-/// retry ([`turn_end::wall_retry_text`]) or the usage resume
-/// ([`turn_end::continuation_text`]), the acts that deliver again the check
+/// a text (no command's row) its ledger `ours` records under a wall's retry
+/// rule (`turn_end::is_wall_retry`) — the retry
+/// ([`turn_end::wall_retry_text`]) or the usage resume
+/// ([`turn_end::continuation_text`], which is the harness-marked Cruise
+/// continuation, [`HARNESS_MARK`]) — the acts that deliver again the land act
 /// a wall cut ([`FinishedScan::cut`]), as the turn-end policy reads them
 /// (`TurnEndState::acted`). By the ledger's rule, never the words alone:
-/// the usage resume's `keep going` is the continuation's too, and a `keep
-/// going` the continue policy typed after a wall in the check's turn
-/// (`continue@v1`) delivers no check — read as the retry, a done reply to
-/// it was the check's answer, and the record ended the task for a relaunch
-/// or the upgrade where the policy asks the check once more. Not
-/// `/compact` or `/login` (a command's row), nor a restart's marked
-/// carry-on, which no wall's retry is: their answers are no check's, and
-/// the next done report gets one (fail closed). Where a full context cut the
-/// check, the turn-end policy types the check itself as the `/compact`'s
-/// continuation (`TurnEndState::compact_owes`), which [`is_done_check`] reads
-/// as the check by its words (ATERM-KI-1016-1, done-3). A ledger row that
-/// names no rule is none either.
+/// the usage resume's words are the continuation's too, and the same words
+/// the continue policy typed after a wall (`continue@v1`) deliver no land
+/// act. Not `/compact` or `/login` (a command's row), nor a restart's
+/// marked carry-on, which no wall's retry rule records. Where a full context
+/// cut the act, the turn-end policy types the act itself as the
+/// `/compact`'s continuation (`TurnEndState::compact_owes`), which
+/// [`is_land_check`] reads by its words. A ledger row that names no rule is
+/// none either.
 fn supervisors_plain(row: &Value, ours: &[Typed]) -> bool {
     row.get("isMeta").and_then(Value::as_bool) != Some(true)
         && first_text(row).map(typed_words).is_some_and(|t| {
-            !t.starts_with(HARNESS_MARK)
-                && !t.starts_with('<')
+            !t.starts_with('<')
                 && typed_by(ours, t, recorded_ms(row), |o| {
                     turn_end::is_wall_retry(&o.rule)
                 })
@@ -3462,7 +3271,7 @@ fn is_auth_wall_row(v: &Value) -> bool {
         && v.get("error").and_then(Value::as_str) == Some("authentication_failed")
 }
 
-/// What one transcript row says of the login ([`login_rows`]).
+/// What one transcript row says of the login ([`login_row`], [`LoginScan`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginRow {
     /// The wall ([`is_auth_wall_row`]).
@@ -3480,37 +3289,88 @@ fn login_succeeded(text: &str) -> bool {
         .starts_with("<local-command-stdout>Login successful")
 }
 
-/// Every row of `jsonl` (a transcript's tail) that says something of the
-/// login, in order, with its time (unix seconds, `None` when it names none).
-fn login_rows(jsonl: &str) -> impl Iterator<Item = (LoginRow, Option<u64>)> + '_ {
-    jsonl.lines().filter_map(|line| {
-        if !line.contains("authentication_failed")
-            && !line.contains("Login successful")
-            && !line.contains("\"assistant\"")
-        {
-            return None;
-        }
-        let v = super::transcript::conversation(line).ok()?;
-        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            return None;
-        }
-        let at = v
-            .get("timestamp")
+/// What one transcript row says of the login, with its time (unix seconds,
+/// `None` when it names none); `None` for a row that says nothing of it, a
+/// subagent's and one that is no JSON ([`LoginScan`]).
+fn login_row(line: &str) -> Option<(LoginRow, Option<u64>)> {
+    if !line.contains("authentication_failed")
+        && !line.contains("Login successful")
+        && !line.contains("\"assistant\"")
+    {
+        return None;
+    }
+    let v = super::transcript::conversation(line).ok()?;
+    if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let at = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(super::upgrade_models::parse_utc);
+    if is_auth_wall_row(&v) {
+        return Some((LoginRow::Wall, at));
+    }
+    let lifted = match v.get("type").and_then(Value::as_str) {
+        Some("assistant") => v
+            .get("message")
+            .and_then(|m| m.get("model"))
             .and_then(Value::as_str)
-            .and_then(super::upgrade_models::parse_utc);
-        if is_auth_wall_row(&v) {
-            return Some((LoginRow::Wall, at));
+            .is_some_and(is_model_id),
+        _ => is_login_success_row(&v),
+    };
+    lifted.then_some((LoginRow::Lifted, at))
+}
+
+/// THE LOGIN WALL'S ONE SCAN, a transcript row at a time: what
+/// [`transcript_login_wall`] and [`login_lifted_at`] read of the rows folded
+/// in so far, each row's say ([`LoginRow`]) in order. A reader that reads a
+/// transcript row by row reads the login through it (`aterm-lab reduce`'s
+/// readings, session log ruling U7: the closed words a reduction keeps).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoginScan {
+    /// The last row that said something of the login.
+    last: Option<LoginRow>,
+    /// A wall stands that nothing lifted yet.
+    walled: bool,
+    /// When the last wall was lifted.
+    lifted: Option<u64>,
+}
+
+impl LoginScan {
+    /// The scan of every line of `jsonl`.
+    #[must_use]
+    pub fn of(jsonl: &str) -> Self {
+        let mut scan = Self::default();
+        for line in jsonl.lines() {
+            scan.line(line);
         }
-        let lifted = match v.get("type").and_then(Value::as_str) {
-            Some("assistant") => v
-                .get("message")
-                .and_then(|m| m.get("model"))
-                .and_then(Value::as_str)
-                .is_some_and(is_model_id),
-            _ => is_login_success_row(&v),
+        scan
+    }
+
+    /// Folds one transcript line in. Non-JSON lines are skipped.
+    pub fn line(&mut self, line: &str) {
+        let Some((row, at)) = login_row(line) else {
+            return;
         };
-        lifted.then_some((LoginRow::Lifted, at))
-    })
+        self.last = Some(row);
+        match row {
+            LoginRow::Wall => (self.walled, self.lifted) = (true, None),
+            LoginRow::Lifted if self.walled => (self.walled, self.lifted) = (false, at),
+            LoginRow::Lifted => {}
+        }
+    }
+
+    /// [`transcript_login_wall`] of the rows folded in.
+    #[must_use]
+    pub fn wall(&self) -> bool {
+        self.last == Some(LoginRow::Wall)
+    }
+
+    /// [`login_lifted_at`] of the rows folded in.
+    #[must_use]
+    pub fn lifted_at(&self) -> Option<u64> {
+        self.lifted
+    }
 }
 
 /// Whether one transcript row is a person's finished `/login`
@@ -3542,9 +3402,7 @@ fn is_login_success_row(v: &Value) -> bool {
 /// reads the wall until something typed into this session is answered.
 #[must_use]
 pub fn transcript_login_wall(jsonl: &str) -> bool {
-    login_rows(jsonl)
-        .last()
-        .is_some_and(|(row, _)| row == LoginRow::Wall)
+    LoginScan::of(jsonl).wall()
 }
 
 /// When the last login wall in `jsonl` was lifted (unix seconds): the time of
@@ -3554,15 +3412,7 @@ pub fn transcript_login_wall(jsonl: &str) -> bool {
 /// login went gets its whole window once the agent can answer again.
 #[must_use]
 pub fn login_lifted_at(jsonl: &str) -> Option<u64> {
-    let (mut walled, mut lifted) = (false, None);
-    for (row, at) in login_rows(jsonl) {
-        match row {
-            LoginRow::Wall => (walled, lifted) = (true, None),
-            LoginRow::Lifted if walled => (walled, lifted) = (false, at),
-            LoginRow::Lifted => {}
-        }
-    }
-    lifted
+    LoginScan::of(jsonl).lifted_at()
 }
 
 /// Whether the latest notice carrying `marker` never reached the model: the
@@ -3883,7 +3733,7 @@ fn is_spend_row(v: &Value) -> bool {
 /// [`login_lifted_at`] leaves it for the login wall.
 #[must_use]
 pub fn transcript_limit_until(jsonl: &str) -> Option<u64> {
-    standing_limit(jsonl, limit_holds_until)
+    StandingScan::of(jsonl).until()
 }
 
 /// The reset the session's standing usage limit names, by its transcript
@@ -3896,12 +3746,15 @@ pub fn transcript_limit_until(jsonl: &str) -> Option<u64> {
 /// [`LIMIT_GRACE_S`]: super::upgrade_drive::LIMIT_GRACE_S
 #[must_use]
 pub fn transcript_limit_reset(jsonl: &str) -> Option<u64> {
-    standing_limit(jsonl, |v| {
-        v.get("quotaLimits")
-            .and_then(|q| q.get("resetsAt"))
-            .and_then(Value::as_u64)
-            .filter(|&at| at > 0)
-    })
+    StandingScan::of(jsonl).reset()
+}
+
+/// The reset one limit row names alone ([`transcript_limit_reset`]).
+fn reset_named(v: &Value) -> Option<u64> {
+    v.get("quotaLimits")
+        .and_then(|q| q.get("resetsAt"))
+        .and_then(Value::as_u64)
+        .filter(|&at| at > 0)
 }
 
 /// Whether the session's standing usage limit is a spend or credit wall, by
@@ -3911,7 +3764,7 @@ pub fn transcript_limit_reset(jsonl: &str) -> Option<u64> {
 /// ends it, and the owner's view says so.
 #[must_use]
 pub fn transcript_limit_spend(jsonl: &str) -> bool {
-    standing_limit(jsonl, |v| is_spend_row(v).then_some(())).is_some()
+    StandingScan::of(jsonl).spend()
 }
 
 /// The longest limit type ([`StandingWall::window`]) that is kept, in bytes.
@@ -4021,29 +3874,33 @@ impl CreditsWord {
 /// (2026-10-01, ten rows of 2.1.273 and 2.1.283).
 #[must_use]
 pub fn transcript_standing_wall(jsonl: &str) -> Option<StandingWall> {
-    standing_limit(jsonl, |v| {
-        let quota = v.get("quotaLimits")?;
-        if quota.get("status").and_then(Value::as_str) != Some("rejected") || is_spend_row(v) {
-            return None;
-        }
-        let named = quota
-            .get("rateLimitType")
-            .and_then(Value::as_str)
-            .filter(|word| is_limit_type(word));
-        if named == Some(CREDIT_LIMIT_TYPE) {
-            return None;
-        }
-        Some(StandingWall {
-            at: row_time(v)?,
-            until: quota
-                .get("resetsAt")
-                .and_then(Value::as_u64)
-                .filter(|&at| at > 0),
-            window: named
-                .or_else(|| row_texts(v).find_map(super::usage::notice_window))
-                .map(str::to_owned),
-            credits: CreditsWord::of(quota),
-        })
+    StandingScan::of(jsonl).wall()
+}
+
+/// One limit row read as the quota wall it stands for
+/// ([`transcript_standing_wall`]).
+fn standing_wall_of(v: &Value) -> Option<StandingWall> {
+    let quota = v.get("quotaLimits")?;
+    if quota.get("status").and_then(Value::as_str) != Some("rejected") || is_spend_row(v) {
+        return None;
+    }
+    let named = quota
+        .get("rateLimitType")
+        .and_then(Value::as_str)
+        .filter(|word| is_limit_type(word));
+    if named == Some(CREDIT_LIMIT_TYPE) {
+        return None;
+    }
+    Some(StandingWall {
+        at: row_time(v)?,
+        until: quota
+            .get("resetsAt")
+            .and_then(Value::as_u64)
+            .filter(|&at| at > 0),
+        window: named
+            .or_else(|| row_texts(v).find_map(super::usage::notice_window))
+            .map(str::to_owned),
+        credits: CreditsWord::of(quota),
     })
 }
 
@@ -4076,61 +3933,118 @@ pub struct StandingLimit {
 /// read whole ([`StandingLimit`]). `None` wherever that is.
 #[must_use]
 pub fn transcript_standing_limit(jsonl: &str) -> Option<StandingLimit> {
-    standing_limit(jsonl, |v| {
-        let quota = v.get("quotaLimits");
-        Some(StandingLimit {
-            text: row_texts(v).collect::<Vec<_>>().join(" "),
-            until: quota
-                .and_then(|q| q.get("resetsAt"))
-                .and_then(Value::as_u64)
-                .filter(|&at| at > 0),
-            window: quota
-                .and_then(|q| q.get("rateLimitType"))
-                .and_then(Value::as_str)
-                .filter(|word| is_limit_type(word))
-                .map(str::to_owned),
-            at: row_time(v),
-            row: v.get("uuid").and_then(Value::as_str).map(str::to_owned),
-        })
+    StandingScan::of(jsonl).limit()
+}
+
+/// One limit row read whole ([`transcript_standing_limit`]).
+fn standing_limit_of(v: &Value) -> Option<StandingLimit> {
+    let quota = v.get("quotaLimits");
+    Some(StandingLimit {
+        text: row_texts(v).collect::<Vec<_>>().join(" "),
+        until: quota
+            .and_then(|q| q.get("resetsAt"))
+            .and_then(Value::as_u64)
+            .filter(|&at| at > 0),
+        window: quota
+            .and_then(|q| q.get("rateLimitType"))
+            .and_then(Value::as_str)
+            .filter(|word| is_limit_type(word))
+            .map(str::to_owned),
+        at: row_time(v),
+        row: v.get("uuid").and_then(Value::as_str).map(str::to_owned),
     })
 }
 
-/// The one scan of [`transcript_limit_until`], [`transcript_limit_reset`],
-/// [`transcript_limit_spend`], [`transcript_standing_wall`] and
-/// [`transcript_standing_limit`]: what `read`
-/// makes of the limit row that stands last — the last main-chain row saying
-/// whether the model can answer, no `/login` finished after it.
-fn standing_limit<T>(jsonl: &str, read: impl Fn(&Value) -> Option<T>) -> Option<T> {
-    let mut until = None;
-    for line in jsonl.lines() {
+/// THE STANDING LIMIT'S ONE SCAN, a transcript row at a time: the limit row
+/// the rows folded in so far stand at — the last main-chain row saying
+/// whether the model can answer is a limit row ([`is_limit_row`]), and no
+/// `/login` finished after it — which [`transcript_limit_until`],
+/// [`transcript_limit_reset`], [`transcript_limit_spend`],
+/// [`transcript_standing_wall`] and [`transcript_standing_limit`] each read.
+/// A reader that reads a transcript row by row reads the limit through it
+/// (`aterm-lab reduce`'s readings, session log ruling U7: the closed words a
+/// reduction keeps).
+#[derive(Clone, Debug, Default)]
+pub struct StandingScan {
+    /// That row, as the conversation reader reads it.
+    row: Option<Value>,
+}
+
+impl StandingScan {
+    /// The scan of every line of `jsonl`.
+    #[must_use]
+    pub fn of(jsonl: &str) -> Self {
+        let mut scan = Self::default();
+        for line in jsonl.lines() {
+            scan.line(line);
+        }
+        scan
+    }
+
+    /// Folds one transcript line in. Non-JSON lines are skipped.
+    pub fn line(&mut self, line: &str) {
         if !line.contains("assistant") && !line.contains("Login successful") {
-            continue;
+            return;
         }
         let Ok(v) = super::transcript::conversation(line) else {
-            continue;
+            return;
         };
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
+            return;
         }
         if is_login_success_row(&v) {
-            until = None;
-            continue;
+            self.row = None;
+            return;
         }
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
+            return;
         }
         if is_limit_row(&v) {
-            until = read(&v);
+            self.row = Some(v);
         } else if v
             .get("message")
             .and_then(|m| m.get("model"))
             .and_then(Value::as_str)
             .is_some_and(is_model_id)
         {
-            until = None;
+            self.row = None;
         }
     }
-    until
+
+    /// What `read` makes of the limit row that stands.
+    fn read<T>(&self, read: impl Fn(&Value) -> Option<T>) -> Option<T> {
+        self.row.as_ref().and_then(read)
+    }
+
+    /// [`transcript_limit_until`] of the rows folded in.
+    #[must_use]
+    pub fn until(&self) -> Option<u64> {
+        self.read(limit_holds_until)
+    }
+
+    /// [`transcript_limit_reset`] of the rows folded in.
+    #[must_use]
+    pub fn reset(&self) -> Option<u64> {
+        self.read(reset_named)
+    }
+
+    /// [`transcript_limit_spend`] of the rows folded in.
+    #[must_use]
+    pub fn spend(&self) -> bool {
+        self.read(|v| is_spend_row(v).then_some(())).is_some()
+    }
+
+    /// [`transcript_standing_wall`] of the rows folded in.
+    #[must_use]
+    pub fn wall(&self) -> Option<StandingWall> {
+        self.read(standing_wall_of)
+    }
+
+    /// [`transcript_standing_limit`] of the rows folded in.
+    #[must_use]
+    pub fn limit(&self) -> Option<StandingLimit> {
+        self.read(standing_limit_of)
+    }
 }
 
 /// WHEN THE SESSION'S NEWEST ANSWER CAME, by its transcript (`jsonl`, a
@@ -4210,7 +4124,8 @@ fn local_command_text(v: &Value) -> Option<&str> {
 ///
 /// MEASURED for this dialog's wait row (the owner's transcripts: the command
 /// row, then `<local-command-stdout>Claude Code will continue automatically
-/// at 6am`); READ in the 2.1.287 bundle for every other line — a result
+/// at 6am`); READ in the 2.1.287 and 2.1.304 bundles for every other line —
+/// 2.1.304 still answers under `/rate-limit-options` — a result
 /// drawn as `skip` writes no row at all. NO RESET LINE HAS BEEN SEEN in any
 /// transcript.
 ///

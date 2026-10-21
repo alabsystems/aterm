@@ -11,26 +11,38 @@
 //   -> {"gpu_clock":"metal","cpu_counter":"instructions",...,"episode_gpu_rel":...,
 //       "episode_raster_per_ginsn":...,"episode_gpu_p95_us":...,...}
 //
-// `dev-seams` compiles in the pass-economy ablation (`GpuRenderer::set_unorm_ablation`); a
-// release build without it refuses to run rather than report half a lane.
+// `dev-seams` compiles in the pass-economy ablation (`GpuRenderer::set_unorm_ablation`) and the
+// GPU clock's pause (`gpu_time::set_paused`); a release build without it refuses to run rather
+// than report half a lane. On macOS, `--features dev-seams,wgpu-oracle` and `--wgpu` draw on the
+// wgpu arm (the Windows and BSD presenter, its timestamp-query clock) instead of Metal; that run
+// is a record, never the lane's (the lane builds without the oracle).
 //
 // The scenes, at the desk's cell (JetBrains Mono at 30 px: 18x40) on a 26x190 grid (the
 // 3420x1040 drawable §5's pass costs are stated at), on the shipped dark theme with bloom and
 // shimmer on:
-//   episode  the harness card's arm-to-settle episode (`HarnessCard::draw_kept` on its 33 ms
-//            clock, the ride-in included), every frame the card asks for, the settled one last;
+//   episode  the harness card's arm-to-settle episode (`HarnessCard::draw` on its 33 ms clock,
+//            the ride-in included), every frame the card asks for, the settled one last;
 //   settled  the settled card replayed while a key a frame lands in the composer under it;
 //   typing   the shipped cursor glow (Rainbow Kitty) ticked at 120 Hz while 12 keys a second
 //            land at a shell prompt, then its run-out; a tick whose fingerprint did not move
 //            presents nothing, as in the app;
 //   scroll   inline streaming under a settled card: a line a frame scrolls the screen and the
-//            card with it (today a settled redraw, and a full repaint: a frame carrying card
-//            light refuses the scroll blit).
+//            card with it (since lane B3 the settled frame replayed at its new origin: the
+//            same two fx contents, a new layer offset).
+// and, reported but not gated, the other producers the B5 rule names, each a shorter typing run:
+//   bolt     the Laser style's lightning bolts;
+//   comet    the Comet style's slabs;
+//   classic  the classic wake (`classic_wake`, its comet beams);
+//   meteor   the Rainbow Kitty's meteors (`ribbon_beam`) on its nav flights: an 80-cell
+//            Ctrl-A / Ctrl-E ping-pong every 200 ms (the frame-cost suite's §21 scenario);
+//   flood    the Rainbow Kitty's ribbon at its `RIBBON_QUAD_BUDGET`: 400 keys at 120 a second,
+//            a hot line wrapped over three rows, the frame the budget caps.
 //
 // Per frame, each on its own clock:
 //   emit     the producer: the card's replay or draw, or the glow's witness feed and tick;
-//   splice   the host's copy of the produced quads into the frame's streams (the kitty's
-//            nova shift included) and the effect-damage refresh;
+//   splice   the host's put: the card's two fx layers (taken back by id, laid at its origin,
+//            clipped to the pane), or the glow's quads into the frame's streams, and the
+//            effect-damage refresh;
 //   raster   the CPU presenter: `Renderer::render_input_cached` on the frame;
 //   encode   the GPU presenter's present work up to its last commit
 //            (`WindowGpu::last_present_encode_ns`), with its `build` (instances and atlas) and
@@ -39,14 +51,17 @@
 //            clocks, wgpu timestamp queries; absent, with `gpu_clock` "none", on an arm with no
 //            clock); `present` is encode + gpu.
 //
-// The GPU presenter draws every frame three times, each on its own window of the one renderer
-// and in an order that rotates frame by frame, under the pass-economy seam
-// (`aterm_gpu::UnormAblation`): `off` (shipped), `thin` (every pass of the plan, each Unorm
-// item drawing one instance) and `drop` (no Unorm group: one pass). Paired per frame,
-// `pass_cost` = thin - drop is what the extra passes themselves cost, the figure the B6 go rule
-// reads as `pass_cost_pct` (its p50 over the present's p95), and `unorm_draw` = off - thin is
-// what the One/One draws cost, which merging the passes would not save. `build_stage_pct`
-// (instance build and upload, p50 over the present's p95) is the B5 rule's.
+// The GPU presenter draws every frame four times, each on its own window of the one renderer
+// and in an order that rotates frame by frame: under the pass-economy seam
+// (`aterm_gpu::UnormAblation`) `off` (shipped), `thin` (every pass of the plan, each Unorm
+// item drawing one instance) and `drop` (no Unorm group: one pass), and `untimed`, the shipped
+// plan with the GPU clock paused. Paired per frame, `pass_cost` = thin - drop is what the extra
+// passes themselves cost, the figure the B6 go rule reads as `pass_cost_pct` (its p50 over the
+// present's p95), `unorm_draw` = off - thin is what the One/One draws cost, which merging the
+// passes would not save, and `clock` = off - untimed is what timing a present costs its encode
+// (the completion handlers on Metal; the timestamp writes, the deferred resolve and the
+// readback harvest on wgpu). `build_stage_pct` (instance build and upload, p50 over the
+// present's p95) is the B5 rule's.
 //
 // RUNS runs follow WARMUP unmeasured ones, each scene on fresh windows. A key's p50/p95 pools
 // every run's frames; its `_spread` is the slowest run's p50 over the fastest's.
@@ -60,7 +75,10 @@
 //           median run reported: bigger is cheaper. The GPU one divides the device clock and
 //           holds; the CPU ones divide thread CPU time (`cpu_clock` "thread") and do not hold as
 //           well (the reference's 14.6 MB repaint follows the memory contention, a scene's
-//           small kernels do not).
+//           small kernels do not). The reference shares the presenter's text work with every
+//           scene, so a regression there moves both sides of a scene's ratio; `ref_text_gpu_rel`
+//           calibrates the reference itself, against a blank full repaint (cell backgrounds, no
+//           glyph) drawn beside it: the text's cost over the frame every present pays.
 //   work    `_kins` is the instructions the process retired per frame in the producer, the CPU
 //           raster and the GPU present call (`cpu_counter` "instructions": Apple's
 //           `proc_pid_rusage`, the read's own cost taken out; "none" elsewhere), and
@@ -69,18 +87,22 @@
 // Which keys gate is the `effects` lane's call (`aterm_verify::perf::floors::EFFECTS_LANE`). The
 // `_us` figures are the record, and the reference's own (`ref_*`) say what the desk was doing.
 //
-// Fail closed: a refused present, a GPU frame that fails or never settles, an ablation the plan
-// did not take (or that changed the instances built), or a scene that does not do what it says
-// ends the run with exit 1.
+// Fail closed: a refused present, a GPU frame that fails or never settles, a paused clock that
+// timed a present, an ablation the plan did not take (read off the plan the arm built: its mode,
+// a Unorm draw left by `drop` or an instance past one by `thin`, other passes or instances), or
+// a scene that does not do what it says (a glow that drew nothing, a card that did not scroll,
+// a flood that never reached the ribbon's budget) ends the run with exit 1.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use aterm_core::render::{FxSlot, PxRect};
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::harness_card::{
-    CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard, SettledFrame, dark_ground,
+    CardFrame, CardFrames, CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard,
+    card_layer_id, dark_ground,
 };
 use aterm_gpu::gpu_time::{self, Settled};
 use aterm_gpu::{FrameShape, GpuContext, GpuRenderer, UnormAblation, WindowGpu};
@@ -106,6 +128,15 @@ const TYPING_HZ: u32 = 120;
 const TYPING_KEYS: usize = 48;
 const KEY_TICKS: usize = 10;
 const RUNOUT_TICKS: usize = 120;
+/// Keys typed in each of the other producers' scenes (reported, not gated).
+const PRODUCER_KEYS: usize = 24;
+/// The flood: a key every tick, long enough to wrap the hot line over three rows.
+const FLOOD_KEYS: usize = 400;
+
+/// The meteor scene's flights: hops between two columns 80 apart, one every 200 ms.
+const HOPS: usize = 15;
+const HOP_TICKS: usize = 24;
+const HOP_COLS: (u16, u16) = (20, 100);
 /// Launches per scroll run: each scrolls a fresh card from near the bottom to the top row.
 const SCROLL_CYCLES: usize = 4;
 
@@ -276,8 +307,49 @@ fn set_ablation(_: &mut GpuRenderer, _: UnormAblation) {
     fail(NO_SEAM);
 }
 
-/// The three plans every frame is drawn under, in [`Sample::arms`] order.
-const MODES: [UnormAblation; 3] = [UnormAblation::Off, UnormAblation::Thin, UnormAblation::Drop];
+/// The GPU clock's pause, the same seam's.
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+fn set_clocked(clocked: bool) {
+    gpu_time::set_paused(!clocked);
+}
+
+#[cfg(not(any(debug_assertions, feature = "dev-seams")))]
+fn set_clocked(_: bool) {
+    fail(NO_SEAM);
+}
+
+/// One way the GPU presenter draws a frame: a plan of the pass-economy seam, timed or with the
+/// clock paused.
+#[derive(Clone, Copy, Debug)]
+struct Way {
+    ablation: UnormAblation,
+    clocked: bool,
+    name: &'static str,
+}
+
+/// The four ways every frame is drawn, in [`Sample::arms`] order.
+const WAYS: [Way; 4] = [
+    Way {
+        ablation: UnormAblation::Off,
+        clocked: true,
+        name: "off",
+    },
+    Way {
+        ablation: UnormAblation::Thin,
+        clocked: true,
+        name: "thin",
+    },
+    Way {
+        ablation: UnormAblation::Drop,
+        clocked: true,
+        name: "drop",
+    },
+    Way {
+        ablation: UnormAblation::Off,
+        clocked: false,
+        name: "untimed",
+    },
+];
 
 /// The host-owned effect streams the scenes fill.
 fn clear_streams(input: &mut RenderInput) {
@@ -331,8 +403,10 @@ struct Sample {
     splice_ns: u64,
     raster: Spent,
     fx_quads: u64,
-    /// The GPU presents, indexed like [`MODES`].
-    arms: [Arm; 3],
+    /// The `glow_under` stream's quads: the ribbon's body, the card's border and trail.
+    under_quads: u64,
+    /// The GPU presents, indexed like [`WAYS`].
+    arms: [Arm; 4],
 }
 
 impl Sample {
@@ -345,9 +419,13 @@ impl Sample {
     fn drop(&self) -> &Arm {
         &self.arms[2]
     }
+    fn untimed(&self) -> &Arm {
+        &self.arms[3]
+    }
 }
 
-/// One reference frame's costs, the calibration the `_rel` keys divide by.
+/// One reference frame's costs, the calibration the `_rel` keys divide by, and the GPU time of
+/// the blank full repaint drawn beside it (the reference's own calibration).
 #[derive(Clone, Copy, Debug, Default)]
 struct RefSample {
     raster: Spent,
@@ -355,6 +433,7 @@ struct RefSample {
     call_cpu_ns: u64,
     call_ins: Option<u64>,
     gpu_ns: Option<u64>,
+    blank_gpu_ns: Option<u64>,
 }
 
 /// One scene's frames in one run, and the reference frames drawn among them.
@@ -365,11 +444,14 @@ struct Run {
 }
 
 /// The calibration: two screens of plain text, each differing from the other in every row, so
-/// each reference frame is a full repaint, on windows of their own.
+/// each reference frame is a full repaint, on windows of their own; and two blank screens (cell
+/// backgrounds of two shades, no glyph), each a full repaint of what every present pays.
 struct Reference {
     inputs: [RenderInput; 2],
+    blanks: [RenderInput; 2],
     cpu: WindowCpu,
     gpu: WindowGpu,
+    blank_gpu: WindowGpu,
     next: usize,
 }
 
@@ -390,26 +472,39 @@ impl Reference {
             }
             term.cell_frame(ROWS, COLS)
         };
+        let blank = |n: usize| {
+            let mut term = Terminal::new(ROWS as u16, COLS as u16);
+            let shade = [236, 238][n];
+            let spaces = " ".repeat(COLS);
+            for row in 0..ROWS {
+                term.process(
+                    format!("{}\x1b[48;5;{shade}m{spaces}", cup(row as u16, 0)).as_bytes(),
+                );
+            }
+            term.cell_frame(ROWS, COLS)
+        };
         Self {
             inputs: [screen(0), screen(1)],
+            blanks: [blank(0), blank(1)],
             cpu: WindowCpu::new(),
             gpu: WindowGpu::new(),
+            blank_gpu: WindowGpu::new(),
             next: 0,
         }
     }
 }
 
-/// One scene's windows: the CPU presenter's, and one GPU window per plan in [`MODES`].
+/// One scene's windows: the CPU presenter's, and one GPU window per way in [`WAYS`].
 struct Win {
     cpu: WindowCpu,
-    gpu: [WindowGpu; 3],
+    gpu: [WindowGpu; 4],
 }
 
 impl Win {
     fn new() -> Self {
         Self {
             cpu: WindowCpu::new(),
-            gpu: [WindowGpu::new(), WindowGpu::new(), WindowGpu::new()],
+            gpu: std::array::from_fn(|_| WindowGpu::new()),
         }
     }
 }
@@ -434,6 +529,19 @@ struct Rig {
     reference: Reference,
     /// The reference frames drawn since the scene last took them.
     refs: Vec<RefSample>,
+}
+
+/// `--wgpu`: draw on the wgpu arm, the oracle a macOS build carries under `wgpu-oracle`.
+#[cfg(all(target_os = "macos", feature = "wgpu-oracle"))]
+fn on_wgpu(gpu: &mut GpuRenderer) {
+    gpu.disarm_metal_for_oracle();
+}
+
+#[cfg(not(all(target_os = "macos", feature = "wgpu-oracle")))]
+fn on_wgpu(_: &mut GpuRenderer) {
+    if cfg!(target_os = "macos") {
+        fail("--wgpu needs the wgpu arm: build with `--features dev-seams,wgpu-oracle`");
+    }
 }
 
 /// What `main` reports instead of a lane when the host has no GPU: the lane skips.
@@ -468,6 +576,10 @@ impl Rig {
         gpu.set_bloom(true);
         gpu.set_shimmer(true);
         gpu.debug_block_on_lazy_fallbacks();
+        let wgpu = std::env::args().skip(1).any(|a| a == "--wgpu");
+        if wgpu {
+            on_wgpu(&mut gpu);
+        }
         let (cw, ch) = cpu.cell_size();
         if gpu.cell_size() != (cw, ch) {
             fail("the two presenters disagree on the cell");
@@ -475,7 +587,7 @@ impl Rig {
         let (frame_w, frame_h) = cpu.frame_size(ROWS, COLS);
         let clock = if !gpu.gpu_time_supported() {
             "none"
-        } else if cfg!(target_os = "macos") {
+        } else if cfg!(target_os = "macos") && !wgpu {
             "metal"
         } else {
             "wgpu"
@@ -541,9 +653,9 @@ impl Rig {
         }
     }
 
-    /// The nova stream's shift: its pixels are grid-interior.
-    fn nova_shift(&self) -> (u16, u16) {
-        (self.pad, self.grid_top)
+    /// The grid's origin in window pixels: a grid-space layer's shift.
+    fn grid(&self) -> (i32, i32) {
+        (i32::from(self.pad), i32::from(self.grid_top))
     }
 
     fn glow_geom(&self) -> Geom {
@@ -604,34 +716,35 @@ impl Rig {
         drop(view);
         let raster = watch.stop();
 
-        let mut arms = [Arm::default(); 3];
-        // The order rotates so no plan always runs first, on a GPU the CPU raster left idle.
-        for k in 0..MODES.len() {
-            let i = (k + self.frames) % MODES.len();
-            set_ablation(&mut self.gpu, MODES[i]);
+        let mut arms = [Arm::default(); 4];
+        // The order rotates so no way always runs first, on a GPU the CPU raster left idle.
+        for k in 0..WAYS.len() {
+            let i = (k + self.frames) % WAYS.len();
+            let way = WAYS[i];
+            set_ablation(&mut self.gpu, way.ablation);
+            set_clocked(way.clocked);
             let watch = Stopwatch::start();
             if !self
                 .gpu
                 .present_virtual(&mut win.gpu[i], input, false, None, None)
             {
-                fail(format!(
-                    "the GPU presenter refused a frame ({})",
-                    MODES[i].name()
-                ));
+                fail(format!("the GPU presenter refused a frame ({})", way.name));
             }
             let call = watch.stop();
+            set_clocked(true);
             let shape = self.gpu.frame_shape();
-            if shape.ablation != MODES[i] {
-                fail(format!(
-                    "the frame plan did not take the {} ablation",
-                    MODES[i].name()
-                ));
-            }
+            let gpu_ns = if way.clocked {
+                self.gpu_time()
+            } else if self.gpu.last_gpu_time_serial().is_some() {
+                fail("a present with the GPU clock paused was timed")
+            } else {
+                None
+            };
             arms[i] = Arm {
                 encode_ns: win.gpu[i].last_present_encode_ns(),
                 call_cpu_ns: call.cpu_ns,
                 call_ins: call.ins,
-                gpu_ns: self.gpu_time(),
+                gpu_ns,
                 shape,
             };
         }
@@ -641,24 +754,60 @@ impl Rig {
             let reference = self.reference_frame();
             self.refs.push(reference);
         }
-        let [off, thin, dropped] = &arms;
-        if thin.shape.passes != off.shape.passes || dropped.shape.passes > off.shape.passes {
-            fail(format!(
-                "the ablated plans' passes are off: {} shipped, {} thinned, {} dropped",
-                off.shape.passes, thin.shape.passes, dropped.shape.passes
-            ));
-        }
-        if thin.shape.instances != off.shape.instances
-            || dropped.shape.instances != off.shape.instances
+        let [off, thin, dropped, untimed] = &arms;
+        Self::check_ablation(&off.shape, &thin.shape, &dropped.shape);
+        if (
+            untimed.shape.ablation,
+            untimed.shape.passes,
+            untimed.shape.instances,
+        ) != (off.shape.ablation, off.shape.passes, off.shape.instances)
         {
-            fail("an ablated plan built other instances than the shipped one");
+            fail("the untimed present drew another plan than the shipped one");
         }
         Sample {
             emit,
             splice_ns,
             raster,
             fx_quads: fx_quads(input),
+            under_quads: input.glow_under.len() as u64,
             arms,
+        }
+    }
+
+    /// The three plans of one frame did what their names say, read off the plans the arm built
+    /// (`FrameShape::unorm_draws`, counted from the plan, and the mode it was built under), so
+    /// an arm that ignored the seam ends the run instead of pricing the passes at nothing:
+    /// dropped, no Unorm draw is left and the all-sRGB plan is one pass; thinned, every Unorm
+    /// draw and every pass stays, each drawing at most one instance; and no plan built other
+    /// instances than the shipped one.
+    fn check_ablation(off: &FrameShape, thin: &FrameShape, dropped: &FrameShape) {
+        for (shape, way) in [off, thin, dropped].into_iter().zip(WAYS) {
+            if shape.ablation != way.ablation {
+                fail(format!(
+                    "the frame plan was built under {}, not the {} ablation",
+                    shape.ablation.name(),
+                    way.name
+                ));
+            }
+        }
+        if dropped.unorm_draws != 0 || dropped.passes != 1 {
+            fail(format!(
+                "the dropped plan kept {} Unorm draws in {} passes (want none, in one pass)",
+                dropped.unorm_draws, dropped.passes
+            ));
+        }
+        if thin.passes != off.passes
+            || thin.unorm_draws != off.unorm_draws
+            || thin.unorm_instances > u64::from(thin.unorm_draws)
+        {
+            fail(format!(
+                "the thinned plan is not the shipped one at one instance a Unorm draw: {} passes \
+                 and {} draws of {} instances, against {} passes and {} draws",
+                thin.passes, thin.unorm_draws, thin.unorm_instances, off.passes, off.unorm_draws
+            ));
+        }
+        if thin.instances != off.instances || dropped.instances != off.instances {
+            fail("an ablated plan built other instances than the shipped one");
         }
     }
 
@@ -680,12 +829,23 @@ impl Rig {
             fail("the GPU presenter refused the reference frame");
         }
         let call = watch.stop();
+        let encode_ns = reference.gpu.last_present_encode_ns();
+        let gpu_ns = self.gpu_time();
+        let reference = &mut self.reference;
+        let blank = &reference.blanks[reference.next];
+        if !self
+            .gpu
+            .present_virtual(&mut reference.blank_gpu, blank, false, None, None)
+        {
+            fail("the GPU presenter refused the blank reference frame");
+        }
         RefSample {
             raster,
-            encode_ns: reference.gpu.last_present_encode_ns(),
+            encode_ns,
             call_cpu_ns: call.cpu_ns,
             call_ins: call.ins,
-            gpu_ns: self.gpu_time(),
+            gpu_ns,
+            blank_gpu_ns: self.gpu_time(),
         }
     }
 
@@ -711,73 +871,59 @@ impl Rig {
     }
 }
 
-/// The card's host: the app's replay-or-draw (`claude_card.rs`), the kept settled frame, and
-/// the nova stream's shifted copy of the kitty and stars.
+/// The card's name in the frame's layers (the app names a card by its session).
+const CARD_ID: u64 = 1;
+
+/// The card's host: the app's replay-or-draw (`claude_card.rs`): the card's frames (its kept
+/// settled frame, the ring its episode frames are built in, its arts) and the frame the last
+/// emit made, which the splice lays as the card's two fx layers.
 #[derive(Default)]
 struct CardHost {
     card: HarnessCard,
-    kept: SettledFrame,
-    under: Vec<GlowQuad>,
-    over: Vec<GlowQuad>,
-    nova: Vec<GlowQuad>,
-    /// `nova` is the shifted copy of `kept.over()`.
-    nova_kept: bool,
+    frames: CardFrames,
+    frame: Option<CardFrame>,
 }
 
 impl CardHost {
-    /// The producer: replayed (`true`) when the card holds its kept settled frame for this very
-    /// scene, else drawn on `now`.
+    /// The producer: replayed (`true`) when the card holds its kept settled frame for a scene of
+    /// this shape (an inline scroll is the same shape at a new origin), else drawn on `now`.
     fn emit(&mut self, now: Instant, scene: &CardScene) -> (bool, Spent) {
         let watch = Stopwatch::start();
-        let replayed = self.card.replay(scene, true, &self.kept);
-        if !replayed {
-            self.under.clear();
-            self.over.clear();
-            self.card.draw_kept(
-                now,
-                scene,
-                true,
-                &mut self.kept,
-                &mut self.under,
-                &mut self.over,
-            );
-        }
+        let (frame, replayed) = match self.card.replay(scene, true, &self.frames) {
+            Some(frame) => (frame, true),
+            None => (self.card.draw(now, scene, true, &mut self.frames), false),
+        };
+        self.frame = Some(frame);
         (replayed, watch.stop())
     }
 
-    /// The splice: the border and trail into `glow_under` (window pixels), the kitty and stars
-    /// shifted into `nova_add` (grid-interior pixels).
-    fn splice(&mut self, replayed: bool, shift: (u16, u16), input: &mut RenderInput) -> u64 {
+    /// The splice, as the app's (`claude_card.rs`) does it: the card's two layers from the last
+    /// splice taken back by id, then this frame's laid at its origin and clipped to the pane
+    /// (`scene.clip`, `CardFrame::layers`): two `Arc`s, nothing copied.
+    fn splice(&mut self, scene: &CardScene, grid: (i32, i32), input: &mut RenderInput) -> u64 {
         let started = Instant::now();
         clear_streams(input);
-        if replayed {
-            if !self.nova_kept {
-                nova_of(self.kept.over(), shift, &mut self.nova);
-                self.nova_kept = true;
-            }
-            input.glow_under.extend_from_slice(self.kept.under());
-        } else {
-            nova_of(&self.over, shift, &mut self.nova);
-            self.nova_kept = !self.kept.over().is_empty();
-            input.glow_under.extend_from_slice(&self.under);
+        let ours = [
+            card_layer_id(CARD_ID, FxSlot::Under),
+            card_layer_id(CARD_ID, FxSlot::Over),
+        ];
+        input.fx_layers.retain(|l| !ours.contains(&l.id));
+        if let Some(frame) = self.frame.as_ref().filter(|f| !f.is_empty()) {
+            let (x0, y0, x1, y1) = scene.clip;
+            input
+                .fx_layers
+                .extend(frame.layers(CARD_ID, PxRect::new(x0, y0, x1, y1), grid));
         }
-        input.nova_add.extend_from_slice(&self.nova);
         input.refresh_cursor_effect_damage();
         elapsed_ns(started)
     }
-}
 
-/// `claude_card::nova_of`: window pixels to grid-interior ones, a quad left of or above the
-/// grid dropped.
-fn nova_of(over: &[GlowQuad], shift: (u16, u16), out: &mut Vec<GlowQuad>) {
-    out.clear();
-    out.extend(over.iter().filter_map(|quad| {
-        Some(GlowQuad {
-            x: quad.x.checked_sub(shift.0)?,
-            y: quad.y.checked_sub(shift.1)?,
-            ..*quad
-        })
-    }));
+    /// Whether the last frame drew the border and the kitty.
+    fn drew_whole(&self) -> bool {
+        self.frame
+            .as_ref()
+            .is_some_and(|f| !f.under.items().is_empty() && !f.over.items().is_empty())
+    }
 }
 
 /// The cursor glow's host: the content witness fed from the terminal's rows, then the tick, as
@@ -792,11 +938,11 @@ struct GlowHost {
 }
 
 impl GlowHost {
-    fn new(rig: &Rig) -> Self {
+    /// The shipped dark-theme glow config (the Rainbow Kitty's, as its frame-cost gate builds
+    /// it), on this theme's colours, in `style`.
+    fn new(rig: &Rig, style: GlowStyle) -> Self {
         Self {
             glow: CursorGlow::default(),
-            // The shipped dark-theme Rainbow Kitty, as the frame-cost gate builds it, on this
-            // theme's colours.
             cfg: GlowConfig {
                 classic_mono: false,
                 ribbon_tall: true,
@@ -805,7 +951,7 @@ impl GlowHost {
                 dark_theme: true,
                 theme_fg: rig.theme.fg,
                 theme_bg: rig.theme.bg,
-                style: GlowStyle::RainbowKitty,
+                style,
                 color: 0x00d0_d0d0,
                 accent: 0x0048_c9ff,
                 duration: Duration::from_millis(650),
@@ -814,7 +960,7 @@ impl GlowHost {
                 audible: true,
                 radius: 0.4,
                 ring: true,
-                beam: false,
+                beam: aterm_effects::cursor_glow::style_has_beam_of(style, ""),
                 head_dx: 0.5,
             },
             geom: rig.glow_geom(),
@@ -905,7 +1051,7 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run) {
         if replayed {
             fail("an episode frame replayed: the card was not armed");
         }
-        let splice_ns = host.splice(replayed, rig.nova_shift(), &mut input);
+        let splice_ns = host.splice(&scene, rig.grid(), &mut input);
         episode.push(rig.present(&mut win, &input, emit, splice_ns));
         match host.card.deadline(now) {
             Some(next) if episode.len() < most => now = next,
@@ -913,7 +1059,7 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run) {
             None => break,
         }
     }
-    if host.kept.under().is_empty() || host.kept.over().is_empty() {
+    if !host.drew_whole() {
         fail("the episode ended without a settled frame");
     }
     let episode = rig.take_run(episode);
@@ -926,14 +1072,50 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run) {
         if !replayed {
             fail("the settled card was drawn again rather than replayed");
         }
-        let splice_ns = host.splice(replayed, rig.nova_shift(), &mut input);
+        let splice_ns = host.splice(&scene, rig.grid(), &mut input);
         settled.push(rig.present(&mut win, &input, emit, splice_ns));
     }
     (episode, rig.take_run(settled))
 }
 
-/// The cursor glow under a typist at a shell prompt.
-fn typing_scene(rig: &mut Rig) -> Run {
+/// What the caret does in a glow scene, on the glow's 120 Hz clock, before the run-out.
+#[derive(Clone, Copy)]
+enum Script {
+    /// `keys` keys typed, one every `every` ticks.
+    Type { keys: usize, every: usize },
+    /// `hops` nav moves between [`HOP_COLS`] (a Ctrl-A or Ctrl-E), one every `every` ticks.
+    Hop { hops: usize, every: usize },
+}
+
+impl Script {
+    /// Its events and their ticks.
+    fn steps(self) -> (usize, usize) {
+        match self {
+            Self::Type { keys, every } | Self::Hop { hops: keys, every } => (keys, every),
+        }
+    }
+}
+
+/// The flood measures the frame the ribbon's budget caps, or it measures nothing it names: its
+/// fullest frame spends the budget, give or take the hand's two quads.
+fn at_the_ribbon_budget(flood: &Run) {
+    use aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET;
+    let fullest = flood
+        .samples
+        .iter()
+        .map(|s| s.under_quads)
+        .max()
+        .unwrap_or(0);
+    if fullest + 200 < RIBBON_QUAD_BUDGET as u64 {
+        fail(format!(
+            "the flood never brought the ribbon to its budget: {fullest} of \
+             {RIBBON_QUAD_BUDGET} under quads"
+        ));
+    }
+}
+
+/// The cursor glow in `style` at a shell prompt under `script`, then its run-out.
+fn typing_scene(rig: &mut Rig, style: GlowStyle, script: Script) -> Run {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     for i in 0..10 {
         term.process(
@@ -947,17 +1129,26 @@ fn typing_scene(rig: &mut Rig) -> Run {
     rig.settle_window(&mut win, &mut input);
     rig.refs.clear();
 
-    let mut host = GlowHost::new(rig);
+    let mut host = GlowHost::new(rig, style);
     let period = Duration::from_secs(1) / TYPING_HZ;
     let t0 = Instant::now();
     let mut samples = Vec::new();
-    for tick in 0..TYPING_KEYS * KEY_TICKS + RUNOUT_TICKS {
+    let (events, every) = script.steps();
+    let prompt_row = u16::try_from(term.cell_frame(ROWS, COLS).cursor_row).unwrap_or(0);
+    for tick in 0..events * every + RUNOUT_TICKS {
         let now = t0 + period * tick as u32;
-        let key =
-            (tick % KEY_TICKS == 0 && tick / KEY_TICKS < TYPING_KEYS).then_some(tick / KEY_TICKS);
-        if let Some(k) = key {
-            term.process(&[PROSE[k % PROSE.len()]]);
-            host.glow.note_synthetic_typed(now, 1);
+        let event = (tick % every == 0 && tick / every < events).then_some(tick / every);
+        match (event, script) {
+            (Some(k), Script::Type { .. }) => {
+                term.process(&[PROSE[k % PROSE.len()]]);
+                host.glow.note_synthetic_typed(now, 1);
+            }
+            (Some(k), Script::Hop { .. }) => {
+                let col = if k % 2 == 0 { HOP_COLS.1 } else { HOP_COLS.0 };
+                term.process(cup(prompt_row, col).as_bytes());
+                host.glow.note_synthetic_move(now);
+            }
+            (None, _) => {}
         }
         Rig::extract(&mut term, &mut input);
         let caret = (
@@ -965,7 +1156,7 @@ fn typing_scene(rig: &mut Rig) -> Run {
             u16::try_from(input.cursor_col).unwrap_or(u16::MAX),
         );
         let (fp, emit) = host.emit(&term, caret, now);
-        if key.is_none() && fp == host.last_fp {
+        if event.is_none() && fp == host.last_fp {
             // Nothing moved: the app presents nothing.
             continue;
         }
@@ -999,8 +1190,12 @@ fn scroll_scene(rig: &mut Rig) -> Run {
         let mut host = CardHost::default();
         let now = Instant::now();
         Rig::extract(&mut term, &mut input);
-        let (replayed, _) = host.emit(now, &rig.card_scene(SCROLL_TOP));
-        let _ = host.splice(replayed, rig.nova_shift(), &mut input);
+        let scene = rig.card_scene(SCROLL_TOP);
+        let (replayed, _) = host.emit(now, &scene);
+        if replayed || !host.drew_whole() {
+            fail("the unarmed card's first frame was not drawn whole");
+        }
+        let _ = host.splice(&scene, rig.grid(), &mut input);
         let _ = rig.present(&mut win, &input, Spent::default(), 0);
         let mut top = SCROLL_TOP;
         while top > 1 {
@@ -1012,11 +1207,12 @@ fn scroll_scene(rig: &mut Rig) -> Run {
                     "the streamed line did not scroll the card to row {top}"
                 ));
             }
-            let (replayed, emit) = host.emit(now, &rig.card_scene(top));
-            if replayed {
-                fail("a scrolled card replayed: its scene did not move");
+            let scene = rig.card_scene(top);
+            let (replayed, emit) = host.emit(now, &scene);
+            if !replayed {
+                fail("a scrolled settled card was drawn again: it is the same frame moved");
             }
-            let splice_ns = host.splice(replayed, rig.nova_shift(), &mut input);
+            let splice_ns = host.splice(&scene, rig.grid(), &mut input);
             samples.push(rig.present(&mut win, &input, emit, splice_ns));
         }
     }
@@ -1092,9 +1288,10 @@ impl Scene {
     fn require_cpu_samples(&self) -> Result<(), String> {
         for (run_index, run) in self.runs.iter().enumerate() {
             let frames_complete = run.samples.iter().all(|sample| {
+                // Every way's call: `clock` is the off and untimed calls' difference.
                 sample.emit.ins.is_some()
                     && sample.raster.ins.is_some()
-                    && sample.off().call_ins.is_some()
+                    && sample.arms.iter().all(|arm| arm.call_ins.is_some())
             });
             let refs_complete = run
                 .refs
@@ -1211,6 +1408,26 @@ impl Scene {
                     r.num(format!("{s}_pass_cost_pct_p50"), 100.0 * cost / present_p50);
                 }
             }
+            // What timing a present costs its encode: the shipped plan timed against the same
+            // plan with the clock paused, paired per frame.
+            let mut clock =
+                self.pooled(|x| Some(ns(x.off().encode_ns) - ns(x.untimed().encode_ns)));
+            let clock_p50 = pct(&mut clock, 50.0);
+            r.num(format!("{s}_clock_encode_p50_us"), us(clock_p50));
+            r.num(
+                format!("{s}_clock_encode_p95_us"),
+                us(pct(&mut clock, 95.0)),
+            );
+            r.num(format!("{s}_clock_pct"), 100.0 * clock_p50 / present_p95);
+            let mut untimed = self.pooled(|x| Some(ns(x.untimed().encode_ns)));
+            r.num(
+                format!("{s}_untimed_encode_p50_us"),
+                us(pct(&mut untimed, 50.0)),
+            );
+            r.num(
+                format!("{s}_untimed_encode_p95_us"),
+                us(pct(&mut untimed, 95.0)),
+            );
         }
         let mut build_stage =
             self.pooled(|x| Some(ns(x.off().shape.build_ns + x.off().shape.stage_ns)));
@@ -1219,15 +1436,25 @@ impl Scene {
             100.0 * pct(&mut build_stage, 50.0) / present_p95,
         );
         // The frame's shape.
-        let counts: [(&str, Figure); 5] = [
+        let counts: [(&str, Figure); 9] = [
             ("passes", |x| Some(f64::from(x.off().shape.passes))),
             ("drop_passes", |x| Some(f64::from(x.drop().shape.passes))),
             (
                 "instances",
                 |x| Some(x.off().shape.total_instances() as f64),
             ),
+            ("unorm_instances", |x| {
+                Some(ns(x.off().shape.unorm_instances))
+            }),
             ("instance_bytes", |x| Some(ns(x.off().shape.instance_bytes))),
             ("fx_quads", |x| Some(ns(x.fx_quads))),
+            ("under_quads", |x| Some(ns(x.under_quads))),
+            ("fx_instances", |x| {
+                Some(f64::from(x.off().shape.fx_instances))
+            }),
+            ("fx_upload_bytes", |x| {
+                Some(ns(x.off().shape.fx_upload_bytes))
+            }),
         ];
         for (what, f) in counts {
             let mut v = self.pooled(f);
@@ -1312,6 +1539,19 @@ impl Scene {
             }
             r.num(format!("{s}_{what}_per_ginsn"), 1e9 / p50.max(1.0));
         }
+        if clocked {
+            // The clock's work in the present call, paired per frame.
+            let mut clock =
+                self.pooled(|x| Some(ns(x.off().call_ins?) - ns(x.untimed().call_ins?)));
+            r.num(
+                format!("{s}_clock_kins_p50"),
+                pct(&mut clock, 50.0) / 1_000.0,
+            );
+            r.num(
+                format!("{s}_clock_kins_p95"),
+                pct(&mut clock, 95.0) / 1_000.0,
+            );
+        }
     }
 }
 
@@ -1350,6 +1590,35 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
             r.num(format!("ref_{what}_kins_p50"), pct(&mut v, 50.0) / 1_000.0);
         }
     }
+    if !clocked {
+        return;
+    }
+    // The reference's own calibration: per scene run, the blank full repaint's GPU p50 over the
+    // text reference's, drawn side by side, the median run reported. Bigger is cheaper text.
+    let mut blank: Vec<f64> = all().filter_map(|x| x.blank_gpu_ns.map(ns)).collect();
+    r.num("ref_blank_gpu_p50_us", us(pct(&mut blank, 50.0)));
+    r.num("ref_blank_gpu_p95_us", us(pct(&mut blank, 95.0)));
+    let mut rels: Vec<f64> = scenes
+        .iter()
+        .flat_map(|scene| &scene.runs)
+        .filter_map(|run| {
+            let mut text: Vec<f64> = run.refs.iter().filter_map(|x| x.gpu_ns.map(ns)).collect();
+            let mut blank: Vec<f64> = run
+                .refs
+                .iter()
+                .filter_map(|x| x.blank_gpu_ns.map(ns))
+                .collect();
+            (!text.is_empty() && !blank.is_empty())
+                .then(|| pct(&mut blank, 50.0) / pct(&mut text, 50.0).max(1.0))
+        })
+        .collect();
+    if rels.is_empty() {
+        fail("no run drew a reference frame to calibrate the reference against");
+    }
+    r.num("ref_text_gpu_rel", pct(&mut rels, 50.0));
+    let lo = rels.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = rels.iter().copied().fold(0.0, f64::max);
+    r.num("ref_text_gpu_rel_spread", hi / lo.max(f64::MIN_POSITIVE));
 }
 
 fn main() {
@@ -1370,36 +1639,51 @@ fn main() {
         "effects_harness: {}x{} cells of {}x{} px ({}x{} frame), GPU clock {}, CPU counter {}",
         COLS, ROWS, rig.cw, rig.ch, rig.frame_w, rig.frame_h, rig.clock, rig.counter
     );
+    let scene = |name, rate_emit| Scene {
+        name,
+        runs: Vec::new(),
+        rate_emit,
+    };
     let mut scenes = [
-        Scene {
-            name: "episode",
-            runs: Vec::new(),
-            rate_emit: true,
-        },
-        Scene {
-            name: "settled",
-            runs: Vec::new(),
-            rate_emit: false,
-        },
-        Scene {
-            name: "typing",
-            runs: Vec::new(),
-            rate_emit: true,
-        },
-        Scene {
-            name: "scroll",
-            runs: Vec::new(),
-            rate_emit: true,
-        },
+        scene("episode", true),
+        scene("settled", false),
+        scene("typing", true),
+        scene("scroll", true),
+        scene("bolt", true),
+        scene("comet", true),
+        scene("classic", true),
+        scene("meteor", true),
+        scene("flood", true),
     ];
     for run in 0..WARMUP + RUNS {
         let (episode, settled) = card_scenes(&mut rig, 0x00C0_FFEE + run as u64);
-        let typing = typing_scene(&mut rig);
+        let typed = |keys| Script::Type {
+            keys,
+            every: KEY_TICKS,
+        };
+        let typing = typing_scene(&mut rig, GlowStyle::RainbowKitty, typed(TYPING_KEYS));
         let scroll = scroll_scene(&mut rig);
+        let bolt = typing_scene(&mut rig, GlowStyle::Laser, typed(PRODUCER_KEYS));
+        let comet = typing_scene(&mut rig, GlowStyle::Comet, typed(PRODUCER_KEYS));
+        let classic = typing_scene(&mut rig, GlowStyle::Classic, typed(PRODUCER_KEYS));
+        let hops = Script::Hop {
+            hops: HOPS,
+            every: HOP_TICKS,
+        };
+        let meteor = typing_scene(&mut rig, GlowStyle::RainbowKitty, hops);
+        let flood = Script::Type {
+            keys: FLOOD_KEYS,
+            every: 1,
+        };
+        let flood = typing_scene(&mut rig, GlowStyle::RainbowKitty, flood);
+        at_the_ribbon_budget(&flood);
         if run < WARMUP {
             continue;
         }
-        for (scene, run) in scenes.iter_mut().zip([episode, settled, typing, scroll]) {
+        let runs = [
+            episode, settled, typing, scroll, bolt, comet, classic, meteor, flood,
+        ];
+        for (scene, run) in scenes.iter_mut().zip(runs) {
             scene.runs.push(run);
         }
         eprintln!("effects_harness: run {}/{RUNS} done", run + 1 - WARMUP);
@@ -1424,11 +1708,14 @@ fn main() {
     report.int("ref_every", REF_EVERY as u64);
     report_reference(&mut report, &scenes, clocked, counted);
     eprintln!(
-        "effects_harness: reference n={} raster {} us | encode {} us | gpu {} us (p50)",
+        "effects_harness: reference n={} raster {} us | encode {} us | gpu {} us (p50) | blank \
+         gpu {} us | text rel {}",
         report.get("ref_n"),
         report.get("ref_raster_p50_us"),
         report.get("ref_encode_p50_us"),
         report.get("ref_gpu_p50_us"),
+        report.get("ref_blank_gpu_p50_us"),
+        report.get("ref_text_gpu_rel"),
     );
     for scene in &scenes {
         scene.report(&mut report, clocked, counted);
@@ -1436,6 +1723,7 @@ fn main() {
         eprintln!(
             "effects_harness: {:<8} n={} emit {} us | raster {} us | encode {}/{} us | gpu {}/{} us \
              | passes {} (drop {}) | pass cost {} us = {}% of present p95 {} us | unorm draws {} us \
+             | build+stage {}% | instances max {} (under {}) | clock {} us, {} kins \
              | rel emit {} raster {} encode {} gpu {} | kins emit {} raster {} encode {}",
             scene.name,
             get("n"),
@@ -1451,6 +1739,11 @@ fn main() {
             get("pass_cost_pct"),
             get("present_p95_us"),
             get("unorm_draw_p50_us"),
+            get("build_stage_pct"),
+            get("instances_max"),
+            get("under_quads_max"),
+            get("clock_encode_p50_us"),
+            get("clock_kins_p50"),
             get("emit_rel"),
             get("raster_rel"),
             get("encode_rel"),

@@ -245,9 +245,10 @@ pub enum Reaction {
 ///
 /// Minted for every credited spawn: a same-row jump at or past
 /// `timing::JUMP_MIN_CELLS` (8 cells), and the Return-licensed vertical
-/// variant. The snap verdict is the placement follower's (it knows the
-/// previous rest, and keeps the `Δy > 2·ch` row-jump rule beside the `Δx`
-/// clause, so a one-row Enter still glides); the router hands over the cell.
+/// variant. The route rebases the placement follower on a horizontal flight
+/// (`EffectsPipeline::route_flying_head`), so the head snaps to the landing;
+/// the follower itself snaps only on a target more than two rows away
+/// (`Δy > 2·ch`) or a broken continuity, so a one-row Enter still glides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Flight {
     /// Travel direction, dominant axis — the existing `facing_left` bank.
@@ -260,9 +261,9 @@ pub struct Flight {
     pub land_at: Instant,
     /// The snap-to: the landing cell, i.e. the caret the head escorts on the
     /// frame the impulse was minted (the frame the caret was first observed
-    /// there). Where the follower's snap clause holds (`|Δx| > 8·cw`, or
-    /// `Δy > 2·ch`) the receiver sets the follower to this cell's rest instead
-    /// of gliding from the launch.
+    /// there). A horizontal flight rebases the follower, which then seats the
+    /// head at this cell's rest instead of gliding from the launch; a vertical
+    /// one keeps the follower's own rule (a snap past two rows).
     pub land: (u16, u16),
 }
 
@@ -443,6 +444,10 @@ pub struct SeatQuery {
     /// in by the emitter that owns the constant, so the mirror seat keeps the
     /// same clearance.
     pub lead_px: i32,
+    /// The head sat in the sky seat (step 3, clear) on this caret row last
+    /// frame: it keeps it while the sky stays clear and the shipped seat does
+    /// not ([`placement`]).
+    pub held_sky: bool,
 }
 
 /// The seat rule (§6.5 layer 13): where the flying head sits so it never
@@ -457,7 +462,13 @@ pub struct SeatQuery {
 ///    sits on the caret) and the mirror's is not. Text behind the caret is
 ///    already written; text ahead is being read.
 /// 3. Sky: one row up at the step-1 `x`, when both seats on the caret's row
-///    are inked. From row 1 only.
+///    are inked. From row 1 only. Taken before the mirror where the head
+///    already sits there ([`SeatQuery::held_sky`]), and where the margin clamp
+///    pushed the shipped seat onto the caret of a line being written (ink in
+///    the [`WRITTEN_REACH`] cells before the caret): the mirror there is the
+///    text the hand is typing, blank only until its echo lands, and the head
+///    glided back to it at the line's end and up into the sky at the next key,
+///    40 px back, 40 px on and a row up within 400 ms (2026-10-20).
 /// 4. Over: no yield cleared the ink, so the body draws over the words with
 ///    [`Seat::over_ink`] set: the sky seat on rows ≥ 1; on row 0 the ahead or
 ///    behind seat, whichever leaves the caret cell clear; and when the grid is
@@ -493,6 +504,28 @@ where
     let ahead = census(rest.x, w, caret_row, caret, cols, cw, &ink);
     if ahead.clear() {
         return seat(query, rest.x, rest.y, caret_row, caret_left, 0, false);
+    }
+
+    // Step 3 first, where the sky is held or the margin clamp put the shipped
+    // seat on the caret, and the sky is clear.
+    let written = (caret_col.saturating_sub(WRITTEN_REACH)..caret_col)
+        .any(|c| ink(caret_row, c) == Some(true));
+    if caret_row > 0
+        && ahead.probe != Probe::Blind
+        && (query.held_sky || (ahead.covers_caret && written))
+    {
+        let sky_row = caret_row - 1;
+        if census(rest.x, w, sky_row, caret, cols, cw, &ink).clear() {
+            return seat(
+                query,
+                rest.x,
+                rest.y.saturating_sub(ch),
+                sky_row,
+                caret_left,
+                1,
+                false,
+            );
+        }
     }
 
     // Step 2 — the mirror: the body's RIGHT edge `lead_px` before the caret
@@ -537,6 +570,11 @@ where
     }
     seat(query, rest.x, rest.y, 0, caret_left, 0, true)
 }
+
+/// Cells before the caret in which ink makes the caret's line one being
+/// written ([`placement`] step 3): wider than the mirror seat, so the last
+/// keys' glyphs still unechoed do not read as blank glass.
+const WRITTEN_REACH: u16 = 8;
 
 /// What the ink probe said about the cells a span would cover, less the caret
 /// cell, which needs no probe.
@@ -865,11 +903,98 @@ mod tests {
         }
     }
 
+    /// The head at a line's end, typed up to the margin: the line is written
+    /// up to the cells the mirror seat would cover, which are blank (spaces, or
+    /// keys whose echo has not landed), and the row above is blank. As
+    /// the caret walks the last ten columns the head never takes the mirror,
+    /// and once it has risen to the sky it stays there to the line's end, even
+    /// where the mirror is blank glass: no glide back and on again (until
+    /// 2026-10-20 it took the mirror from column 114). A line not written near
+    /// the caret still takes the mirror at the margin, the shipped L-D seat.
+    /// And mid-line, words ahead of the caret and the cells behind it blank
+    /// on one key and written on the next, a head in the sky stays there
+    /// (held), where it went down to the mirror and up again on every key.
+    #[test]
+    fn at_the_line_s_end_the_head_rises_once_and_stays() {
+        let walk = |held: bool, margin: bool| -> Vec<(u16, u16, Side)> {
+            let mut held_sky = false;
+            let mut seats = Vec::new();
+            for caret_col in 110..120_u16 {
+                let caret = (7_u16, caret_col);
+                // The mirror covers the seven cells before the caret.
+                let reach = if margin { 7 } else { 9 };
+                let ink = |r: u16, c: u16| Some(r == 7 && c + reach < caret_col);
+                let s = placement(
+                    caret,
+                    &SeatQuery {
+                        held_sky: held && held_sky,
+                        ..seat_query(caret, 120)
+                    },
+                    ink,
+                );
+                held_sky = s.lift_rows > 0 && !s.over_ink;
+                seats.push((caret_col, s.lift_rows, s.side));
+            }
+            seats
+        };
+        let seats = walk(true, true);
+        assert!(
+            seats
+                .iter()
+                .all(|&(_, lift, side)| lift == 1 || side == Side::Ahead),
+            "the head took the mirror at the line's end: {seats:?}"
+        );
+        let rose = seats.iter().position(|s| s.1 == 1).expect("it rises");
+        assert!(
+            seats[rose..].iter().all(|s| s.1 == 1),
+            "it came down again before the line's end: {seats:?}"
+        );
+        let far = walk(true, false);
+        assert!(
+            far.iter()
+                .any(|&(_, lift, side)| lift == 0 && side == Side::Behind),
+            "a line not written near the caret keeps the mirror at the margin: {far:?}"
+        );
+
+        let mid = |held: bool| -> Vec<u16> {
+            let mut held_sky = false;
+            let mut lifts = Vec::new();
+            for caret_col in 40..60_u16 {
+                let caret = (7_u16, caret_col);
+                let ink = |r: u16, c: u16| {
+                    Some(r == 7 && (c > caret_col || (caret_col % 2 == 1 && c < caret_col)))
+                };
+                let s = placement(
+                    caret,
+                    &SeatQuery {
+                        held_sky: held && held_sky,
+                        ..seat_query(caret, 120)
+                    },
+                    ink,
+                );
+                held_sky = s.lift_rows > 0 && !s.over_ink;
+                lifts.push(s.lift_rows);
+            }
+            lifts
+        };
+        let held = mid(true);
+        let first = held.iter().position(|&l| l == 1).expect("it rises");
+        assert!(
+            held[first..].iter().all(|&l| l == 1),
+            "mid-line, the held sky came down to the mirror: {held:?}"
+        );
+        assert!(
+            mid(false).windows(2).any(|w| w[0] != w[1]),
+            "negative control: unheld, the head goes down and up with the keys"
+        );
+    }
+
     fn seat_query(caret: (u16, u16), cols: usize) -> SeatQuery {
         SeatQuery {
             geom: geom_cols(cols),
             rest: footprint(caret, u16::try_from(cols).expect("fixture cols")),
             lead_px: LEAD_PX,
+            held_sky: false,
         }
     }
 

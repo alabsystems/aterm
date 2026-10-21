@@ -175,12 +175,18 @@ pub trait FabricSession: Send + Sync {
     fn fabric(&self) -> &SessionFabric;
     /// Record one event on the session's timeline. Called with the fabric
     /// lock held — the sanctioned fabric → timeline nesting — so the
-    /// implementation takes the timeline lock and nothing else.
+    /// implementation takes the timeline lock and, under it, rings the
+    /// session's watchers (a leaf lock whose ring never blocks), and nothing
+    /// else.
     fn record(&self, kind: &'static str, payload: String);
     /// [`Self::record`], with what the record says TYPED ([`FabricFact`]) for
     /// the session log's mark beside it, written in the same timeline hold.
-    /// `true` when the log's readers are owed a wake, which the caller gives
-    /// once the fabric lock is released. The default records and owes none.
+    /// When that mark owes the log's readers a wake, the implementation rings
+    /// the session's watchers for it in the same hold. `true` says one was
+    /// owed: a bridge verb handed a `wake` ([`cmd_deliver_waking`],
+    /// [`cmd_hold_waking`]) calls it with the session's id once the fabric
+    /// lock is released, and a session verb need not act on it. The default
+    /// records and owes none.
     fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
         let _ = fact;
         self.record(kind, payload);
@@ -654,6 +660,13 @@ pub struct InboxRow {
     /// false on an addressed row, and cleared by a `topic drop` of its topic,
     /// which takes the floor with it ([`cmd_topic`]).
     pub refill: bool,
+    /// WHETHER `off` STILL NAMES THIS ROW'S RECORD on the log the bridge reads
+    /// NOW: set when it is delivered, and cleared by the first log move that
+    /// does not keep the offset ([`Inbox::forget_bus_offsets`]) — another log,
+    /// or a moved generation that continues the old one only below it. Never
+    /// set again: an offset one move took names another record on every log
+    /// after it, whatever a later move keeps.
+    on_log: bool,
 }
 
 impl InboxRow {
@@ -765,9 +778,13 @@ pub struct PostRow {
     pub kind: String,
     /// The offset the record landed at, once the bridge says so.
     pub off: Option<u64>,
-    /// The endpoint log clock when `off` was reported. An unlanded post has
-    /// no record reference yet; its clock is set at retirement, not enqueue.
-    landed_epoch: u64,
+    /// Whether `off` still names THIS POST'S record on the log the bridge
+    /// reads now, as [`InboxRow::on_log`] says of a row's: set when the bridge
+    /// reports the landing (an unlanded post names no record yet) and cleared
+    /// by the first log move that does not keep the offset
+    /// ([`Inbox::forget_bus_offsets`]). A reply threads to the post by offset
+    /// only while it is set ([`deliver_row`]).
+    landed_on_log: bool,
     /// The offset this post ANSWERS, carried through to the bridge so the
     /// published record's body can say `re=`.
     pub re: Option<u64>,
@@ -1155,7 +1172,7 @@ impl PostRow {
     /// different, quieter kind of wrong answer. The rule is "every field a caller
     /// can make big", not "every field".
     ///
-    /// `to` IS in that second list ONLY BECAUSE [`cmd_post_waking`] BOUNDS IT. It is a
+    /// `to` IS in that second list ONLY BECAUSE [`cmd_post`] BOUNDS IT. It is a
     /// caller-typed token like the other two, and its grammar check used to
     /// begin `to.trim_start_matches('@')` — which strips a RUN of `@`, so
     /// `@@@…@s-b` validated as `s-b` and was stored, and retired, verbatim. See
@@ -1166,7 +1183,7 @@ impl PostRow {
 }
 
 /// [`PostRow::caller_sized_bytes`] BEFORE THE ROW EXISTS — the same fold, over
-/// the same two fields, for the post [`cmd_post_waking`] is deciding whether to admit.
+/// the same two fields, for the post [`cmd_post`] is deciding whether to admit.
 ///
 /// ONE FUNCTION BECAUSE IT IS ONE QUANTITY. The door and the fold are the two
 /// ends of [`OUTBOX_BYTES_MAX`], and they were computing different numbers: the
@@ -1277,15 +1294,11 @@ pub struct Inbox {
     /// second bus read). Bounded at [`FETCH_SLOTS`]: an answered slot is
     /// evicted to make room, a pending one never is.
     fetches: VecDeque<(u64, FetchSlot)>,
-    /// The highest row id this session had handed out when the
-    /// bridge said the bus log changed (`link log`, [`Inbox::forget_bus_offsets`]):
-    /// a row at or below it carries an offset on an EARLIER log, and
-    /// no offset this endpoint is handed now can name it. Zero until a log
-    /// changed under this process.
-    log_floor: u64,
-    /// Changes whenever this endpoint learns that its broker log changed.
-    /// Waiters retain the clock of the record they wait for, not just its offset.
-    log_epoch: u64,
+    /// The offsets the PARKED WAITS of this session hold ([`OffsetWatch`]):
+    /// every log move reaches each one while it sleeps, as it reaches the rows
+    /// and posts ([`Inbox::forget_bus_offsets`]). A wait that ended drops its
+    /// watch, and the next registration or move prunes the dead entry.
+    watches: Vec<Weak<OffsetWatch>>,
     /// The log this session's clock names. Carried through seamless restart;
     /// `None` with live offset references is an unknown historical clock.
     bus_log: Option<String>,
@@ -1310,6 +1323,31 @@ pub struct Inbox {
     /// The session ended — its program exited or its tab closed
     /// ([`SessionFabric::close`]). Never cleared.
     closed: bool,
+}
+
+/// ONE BUS OFFSET A PARKED WAIT HOLDS ACROSS LOG MOVES: the record a `post
+/// --wait-ack` waits for a receipt to ([`wait_receipt_on_log`]), and the post
+/// an `await inbox re=<off>` waits for a reply to ([`cmd_await_inbox`]). A
+/// wait sleeps without the session's lock, and any number of moves can come
+/// and go before it wakes, so it cannot tell from what it finds then which
+/// ones took its offset; registered with the session ([`Inbox::watch`]), each
+/// move reaches it as it reaches the session's rows and posts
+/// ([`Inbox::forget_bus_offsets`]) — the same rule, applied once per move,
+/// with no window on how many. The wait reads it under the session's lock,
+/// which every move holds while it clears one, so `Relaxed` is all the
+/// ordering it needs.
+#[derive(Debug)]
+struct OffsetWatch {
+    off: u64,
+    /// [`InboxRow::on_log`]'s meaning for `off`, cleared the same way.
+    on_log: AtomicBool,
+}
+
+impl OffsetWatch {
+    /// Whether `off` still names the record the wait was armed on.
+    fn on_log(&self) -> bool {
+        self.on_log.load(Ordering::Relaxed)
+    }
 }
 
 /// One receipt a session owes a sender (R8), HELD HERE — in the one process
@@ -1342,7 +1380,8 @@ struct OwedReceipt {
     from: String,
     /// `off` names a record of a log EARLIER than the one the bridge reads
     /// now: the row was delivered before `link log` said the log changed
-    /// ([`Inbox::forget_bus_offsets`]). Listed `log=earlier`, and the bridge
+    /// ([`Inbox::forget_bus_offsets`]) — on a moved generation, at or above
+    /// the fork it continues below. Listed `log=earlier`, and the bridge
     /// retires the receipt `unacked … reason=log-replaced` rather than put
     /// `re=<off>` on a log where that number is another record.
     earlier_log: bool,
@@ -1983,39 +2022,95 @@ impl Fetched {
 }
 
 impl Inbox {
-    /// FORGET EVERY BUS OFFSET THIS SESSION HOLDS: the bridge says the log
-    /// they index is not the one it reads now ([`cmd_link_log`]), and astream
-    /// gives another log's records the same numbers. So the `off=` dedup goes
-    /// (a new record at an old offset would be answered `OK <old id>` and
-    /// lost), the `bus_head=`/`oldest_on_bus=` span and the addressed refill
-    /// floor ([`addressed_floor`]) start again, every read
-    /// answered from the old log goes and every one still parked fails
-    /// `reason=log-replaced` (the bridge would answer it from the new log),
-    /// and the rows held so far are marked as an earlier log's
-    /// ([`Inbox::log_floor`]): no `re=` threads to old posts by offset and no
-    /// `inbox get @<off>` answers one. The rows themselves stay: they were
-    /// delivered, and what they say is still what was sent. So do the receipts
-    /// owed for them, each marked as an earlier log's
-    /// ([`OwedReceipt::earlier_log`]) — as is one a later verdict owes — so a
-    /// bridge that understands the mark retires it rather than publish its
-    /// `re=` here. Older bridges are not offered those receipts.
-    fn forget_bus_offsets(&mut self) -> Vec<u64> {
-        for r in &mut self.receipts {
-            r.earlier_log = true;
+    /// FORGET THE BUS OFFSETS THIS SESSION HOLDS THAT THE LOG NO LONGER
+    /// NAMES: the bridge says the log they index is not the one it reads now
+    /// ([`cmd_link_log`]), and astream gives another log's records the same
+    /// numbers. `keep_below` is `None` for ANOTHER LOG, and every offset goes;
+    /// `Some(f)` for a MOVED GENERATION of the same log that continues the old
+    /// one below `f` (`link log … continues=<f>`), and only what names an
+    /// offset at or above `f` goes — below it both generations hold the same
+    /// records, and forgetting them retired a session's reply, its verdict's
+    /// receipt and its reads over a move that never touched them.
+    ///
+    /// ONE MOVE AT A TIME, AND NO WINDOW. The bridge tells the endpoint every
+    /// move it attaches across, each as a fact about two identities: `f` is
+    /// already the lowest common over astream's lineage steps between them,
+    /// capped at the head — the very point the bridge's own clamp takes
+    /// (`aterm_link::state::LogWitness::continues`, which `FabricReaderResume`
+    /// binds), or no fork at all where astream's window has no step to go by.
+    /// So the endpoint keeps no lineage of its own. It applies each move once,
+    /// to every reference it holds, as the bridge clamps its own state at each
+    /// attach: an offset survives a chain of moves exactly when it is below
+    /// every fork in it, however long the chain, and one a move took stays
+    /// taken ([`InboxRow::on_log`]).
+    ///
+    /// WHAT GOES, offset by offset. The `off=` dedup entry (a new record at
+    /// that offset would be answered `OK <old id>` and lost); the
+    /// `bus_head=`/`oldest_on_bus=` span and the addressed refill floor
+    /// ([`addressed_floor`]), which start again from what is kept (the floor at
+    /// `f`, where the bridge's own `seen/` watermark resumes); every read
+    /// answered from the old log, and every one still parked fails
+    /// `reason=log-replaced` (the bridge would answer it from the new log);
+    /// and a queued reply whose `re=` names one is retired dead. A row, a
+    /// landed post or a parked wait ([`OffsetWatch`]) at such an offset is
+    /// marked an earlier log's: no `re=` threads to it, no `inbox get @<off>`
+    /// answers it, and the wait ends `log-replaced`. The rows themselves stay:
+    /// they were delivered, and what they say is still what was sent. So do
+    /// the receipts owed for them, each at such an offset marked as an earlier
+    /// log's ([`OwedReceipt::earlier_log`]) — as is one a later verdict owes —
+    /// so a bridge that understands the mark retires it rather than publish
+    /// its `re=` here. Older bridges are not offered those receipts.
+    fn forget_bus_offsets(&mut self, keep_below: Option<u64>) -> Vec<u64> {
+        let fork = keep_below.unwrap_or(0);
+        let kept = |off: u64| off < fork;
+        for r in &mut self.rows {
+            r.on_log &= kept(r.off);
         }
-        self.dedup.clear();
-        self.dedup_set.clear();
-        self.bus_head = 0;
-        self.addressed_head = None;
-        self.oldest_on_bus = None;
-        self.log_floor = self.last_msg_id;
-        self.log_epoch += 1;
-        // A queued new message can land on the new log. A queued reply cannot:
-        // its `re` names a record of the old log. Report that distinction as an
-        // explicit retirement instead of silently rebinding the reference.
+        for p in &mut self.posts {
+            p.landed_on_log &= p.off.is_some_and(kept);
+        }
+        self.watches.retain(|w| {
+            let Some(w) = w.upgrade() else {
+                return false;
+            };
+            if !kept(w.off) {
+                w.on_log.store(false, Ordering::Relaxed);
+            }
+            true
+        });
+        for r in &mut self.receipts {
+            r.earlier_log |= !kept(r.off);
+        }
+        self.dedup.retain(|off| kept(*off));
+        self.dedup_set.retain(|off| kept(*off));
+        self.oldest_on_bus = self.oldest_on_bus.filter(|off| kept(*off));
+        // The addressed lane is delivered in offset order, so a session that
+        // was handed one at or above the fork was handed every one below it:
+        // its refill resumes at the fork, as the bridge's `seen/` does.
+        self.addressed_head = self.addressed_head.and_then(|h| {
+            if kept(h) {
+                Some(h)
+            } else {
+                fork.checked_sub(1)
+            }
+        });
+        if !kept(self.bus_head) {
+            // The highest offset still known delivered here: never one the
+            // session was not handed.
+            let rows = self.rows.iter().filter(|r| r.on_log).map(|r| r.off);
+            self.bus_head = rows
+                .chain(self.dedup.iter().copied())
+                .chain(self.oldest_on_bus)
+                .max()
+                .unwrap_or(0);
+        }
+        // A queued new message can land on the new log. A queued reply whose
+        // `re` names a record the new log does not hold cannot. Report that
+        // distinction as an explicit retirement instead of silently rebinding
+        // the reference.
         let mut retired = Vec::new();
         for post in &mut self.posts {
-            if post.off.is_none() && !post.dead && post.re.is_some() {
+            if post.off.is_none() && !post.dead && post.re.is_some_and(|re| !kept(re)) {
                 post.dead = true;
                 post.dead_reason = "log-replaced".to_string();
                 post.body.clear();
@@ -2027,20 +2122,54 @@ impl Inbox {
         }
         self.outbox_moves += 1;
         self.trim_retired_posts();
-        self.fetches
-            .retain(|(_, slot)| matches!(slot, FetchSlot::Pending | FetchSlot::Partial(_)));
-        for (_, slot) in &mut self.fetches {
-            *slot = FetchSlot::Failed("log-replaced".to_string());
+        self.fetches.retain(|(off, slot)| {
+            kept(*off) || matches!(slot, FetchSlot::Pending | FetchSlot::Partial(_))
+        });
+        for (off, slot) in &mut self.fetches {
+            if !kept(*off) {
+                *slot = FetchSlot::Failed("log-replaced".to_string());
+            }
         }
         retired
     }
 
+    /// ARM A WATCH ON `off` for a wait about to park ([`OffsetWatch`]):
+    /// `on_log` is what the session knows of the offset now — true for one
+    /// the bridge just named on the log it reads, a landed post's
+    /// [`PostRow::landed_on_log`] for a post's — and every move from here on
+    /// reaches it. Prunes the watches whose waits have ended first, so the
+    /// list never holds more than the waits parked at the newest
+    /// registration, this one included.
+    fn watch(&mut self, off: u64, on_log: bool) -> Arc<OffsetWatch> {
+        self.watches.retain(|w| w.strong_count() > 0);
+        let watch = Arc::new(OffsetWatch {
+            off,
+            on_log: AtomicBool::new(on_log),
+        });
+        self.watches.push(Arc::downgrade(&watch));
+        watch
+    }
+
+    /// Whether this session holds any live reference into SOME bus log: a
+    /// delivery span, an owed receipt, a read, a landed post or a queued
+    /// reply. A session with none and no [`Self::bus_log`] has nothing for a
+    /// first identity to forget; one with some and no clock (a carry from a
+    /// build before the clock was carried) has an UNKNOWN old clock, which no
+    /// identity can claim.
+    fn holds_bus_references(&self) -> bool {
+        self.oldest_on_bus.is_some()
+            || !self.receipts.is_empty()
+            || !self.fetches.is_empty()
+            || self
+                .posts
+                .iter()
+                .any(|p| p.off.is_some() || (!p.dead && p.re.is_some()))
+    }
+
     /// The ring row delivered at `off` on the log the bridge reads NOW — never
-    /// one of an earlier log's ([`Inbox::log_floor`]).
+    /// one an earlier log's offset names ([`InboxRow::on_log`]).
     fn row_at(&self, off: u64) -> Option<&InboxRow> {
-        self.rows
-            .iter()
-            .find(|r| r.id > self.log_floor && r.off == off)
+        self.rows.iter().find(|r| r.off == off && r.on_log)
     }
 
     /// The outbound load `post` is refused against: how many posts still wait for
@@ -2307,6 +2436,14 @@ impl SessionFabric {
             high: inbox.last_msg_id,
             present: inbox.rows.iter().filter(|r| r.id > after).count() as u64,
         }
+    }
+
+    /// The id of the newest row ever delivered here, 0 before the first: the
+    /// [`Self::mail_since`] `high` any filter reports, read without a walk. A
+    /// live `subscribe … mail` watch starts from it.
+    #[must_use]
+    pub fn last_msg_id(&self) -> u64 {
+        self.lock().last_msg_id
     }
 
     /// The topics this session opted into with each one's `since=` token, in
@@ -2754,7 +2891,7 @@ impl SessionFabric {
         let refilled_broadcasts = inbox
             .rows
             .iter()
-            .filter(|r| r.refill && r.id > inbox.seen && r.id > inbox.log_floor)
+            .filter(|r| r.refill && r.id > inbox.seen && r.on_log)
             .filter(|r| remembered(r))
             .filter(|r| r.topic.as_deref().is_some_and(|t| self.opted_into(t)))
             .count();
@@ -2907,7 +3044,7 @@ impl SessionFabric {
                 to: post.to.clone(),
                 kind: post.kind.clone(),
                 off: None,
-                landed_epoch: 0,
+                landed_on_log: false,
                 re: post.re,
                 dl: post.dl,
                 via: post.via.clone(),
@@ -2930,7 +3067,7 @@ impl SessionFabric {
                 to: "-".to_string(),
                 kind: "note".to_string(),
                 off: None,
-                landed_epoch: 0,
+                landed_on_log: false,
                 re: None,
                 dl: None,
                 via: None,
@@ -3284,6 +3421,39 @@ struct MirrorReport {
     reason: String,
 }
 
+/// WHAT THE OWNING BRIDGE LAST SAID OF THE BUS LOG (`link log`): the
+/// identity its offsets index, and — when a bridge at lane 3 found a MOVED
+/// GENERATION — the earlier identity it continues and the offset below which
+/// the two name the same records (`continues=<f> was=<id>`). Kept beside the
+/// identity, not only applied to the sessions live at the switch, because a
+/// session registered later still carries the clock it was carried under
+/// ([`register_on_log`]): one on `was` keeps what is below `f` too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogClock {
+    /// `<32 hex>.<generation>`.
+    ident: String,
+    /// `(was, f)`: `ident` continues `was` below offset `f`.
+    continues: Option<(String, u64)>,
+}
+
+impl LogClock {
+    /// Where a session whose clock names `held` keeps its offsets on this
+    /// log: `None` — none (another log, or no clock at all) — or `Some(f)`,
+    /// below `f`. The same identity is never asked: it keeps everything.
+    /// The bridge's `f` is already the minimum common prefix over every
+    /// lineage step from `was` to `ident`, capped at the current head. A
+    /// session holding an intermediate generation therefore keeps that prefix
+    /// too. Generation ordering selects a member of that producer-attested
+    /// chain; ordering alone does not establish a common prefix.
+    fn keep_below(&self, held: Option<&str>) -> Option<u64> {
+        let (was, fork) = self.continues.as_ref()?;
+        let held = held?;
+        let in_chain = held == was.as_str()
+            || (is_earlier_generation(was, held) && is_earlier_generation(held, &self.ident));
+        in_chain.then_some(*fork)
+    }
+}
+
 /// The instance's view of its bridge. Process-global because the bridge is
 /// per-INSTANCE, not per-session: one child, one pair of inherited fds, whatever
 /// number of sessions it hosts.
@@ -3343,10 +3513,12 @@ struct FabricLink {
     /// compare and its store is the exact shape [`BridgeGeneration`] closes.
     link: Mutex<LinkReport>,
     /// The identity of the bus log the owning bridge last said its offsets
-    /// index (`link log <identity>`, astream's `<id>.<generation>`). `None`
-    /// until a bridge has said one; a change is a log switch, and every
-    /// session forgets its offsets ([`cmd_link_log`]).
-    log: Mutex<Option<String>>,
+    /// index (`link log <identity>`, astream's `<id>.<generation>`), and where
+    /// it continues an earlier generation when a lane-3 bridge said so
+    /// ([`LogClock`]). `None` until a bridge has said one; a change is a log
+    /// switch, and every session forgets the offsets the new log does not
+    /// hold ([`cmd_link_log`]).
+    log: Mutex<Option<LogClock>>,
     /// Orders a complete log switch before another bridge incarnation can
     /// attach or a newly registered session can become visible. Taken before
     /// the registry, session and link locks, never under any of them.
@@ -3460,7 +3632,9 @@ const fn state_word(state: u8) -> &'static str {
 /// either it includes this session, or registration first reconciles the session
 /// with its completed result. Carried offsets are never exposed between those
 /// two steps. This runs before publication, so no Commit can have fenced the
-/// newly created context's carry yet.
+/// newly created context's carry yet. A session carried on the generation the
+/// current log CONTINUES ([`LogClock`]) keeps what is below the fork, as the
+/// sessions the switch found live did.
 pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) -> T {
     let _transition = LINK
         .log_transition
@@ -3481,26 +3655,19 @@ pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) 
             LINK.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
         }
     };
-    if let Some(ident) = current {
+    if let Some(clock) = current {
         let mut inbox = ctx.fabric().lock();
-        let forget = inbox.bus_log.as_deref().map_or_else(
-            || {
-                inbox.oldest_on_bus.is_some()
-                    || !inbox.receipts.is_empty()
-                    || !inbox.fetches.is_empty()
-                    || inbox
-                        .posts
-                        .iter()
-                        .any(|p| p.off.is_some() || (!p.dead && p.re.is_some()))
-            },
-            |was| was != ident,
-        );
+        let forget = inbox
+            .bus_log
+            .as_deref()
+            .map_or_else(|| inbox.holds_bus_references(), |was| was != clock.ident);
         if forget {
-            for id in inbox.forget_bus_offsets() {
+            let keep_below = clock.keep_below(inbox.bus_log.as_deref());
+            for id in inbox.forget_bus_offsets(keep_below) {
                 ctx.record("post-landed", format!("{id} off=- reason=log-replaced"));
             }
         }
-        inbox.bus_log = Some(ident);
+        inbox.bus_log = Some(clock.ident);
         drop(inbox);
         ctx.fabric().changed.notify_all();
     }
@@ -4331,7 +4498,8 @@ pub fn fabric_bridge_facts() -> (Option<u32>, Option<String>, u64) {
 }
 
 const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>] | \
-                          link log <identity> | link bye <quit|handoff> | \
+                          link log <identity> [continues=<off> was=<identity>] | \
+                          link bye <quit|handoff> | \
                           link mirror on|stopped|capped [reason=<token>]\n";
 
 /// HOW MANY `bye`s THE LIVE BRIDGE HAS TAKEN — its `link bye <word>`, the
@@ -4411,10 +4579,30 @@ pub fn cmd_link_after_log_switch(
         Some("down") => false,
         Some("log") => {
             let ident = toks.next();
-            if toks.next().is_some() {
-                return LINK_USAGE.to_string();
+            // LANE 3's two tokens, both or neither, each once, in either order.
+            let (mut fork, mut was) = (None, None);
+            for tok in toks {
+                if let Some(v) = kv(tok, "continues")
+                    && fork.is_none()
+                {
+                    match v.parse::<u64>() {
+                        Ok(n) => fork = Some(n),
+                        Err(_) => return LINK_USAGE.to_string(),
+                    }
+                } else if let Some(v) = kv(tok, "was")
+                    && was.is_none()
+                {
+                    was = Some(v);
+                } else {
+                    return LINK_USAGE.to_string();
+                }
             }
-            return cmd_link_log(store, ident, generation, on_forgot);
+            let continues = match (was, fork) {
+                (None, None) => None,
+                (Some(was), Some(fork)) => Some((was, fork)),
+                _ => return LINK_USAGE.to_string(),
+            };
+            return cmd_link_log(store, ident, continues, generation, on_forgot);
         }
         Some("bye") => {
             let word = toks
@@ -4469,15 +4657,35 @@ pub fn cmd_link_after_log_switch(
 /// identity must match; live references without one are an unknown old clock
 /// and are retired conservatively. From a bridge that no
 /// longer owns the link, `OK stale=1` and nothing changes.
+///
+/// `continues=<f> was=<identity>` (LANE 3, `continues`): the new identity is
+/// a MOVED GENERATION of `was` — a power loss under a weak tier, a poisoned
+/// log's reopen, a repair's cut — and astream recorded that the two name the
+/// same records below `f` (the bridge's own clamp,
+/// `aterm_link::state::LogWitness::continues`, already capped at the head).
+/// A session whose clock is `was` forgets only what names an offset at or
+/// above `f`, so a reply it queued while the broker was down, a receipt its
+/// verdict owes and the dedup that keeps a refill from delivering a row twice
+/// survive the move; a session on any other clock forgets everything, as
+/// before. Still `forgot=1`: the clock moved, and the bus mirror's cursors
+/// start over as the bridge's own pinned batch does. `was` must be an earlier
+/// generation of the same log ([`is_earlier_generation`]): nothing else can
+/// be continued, and a line that says otherwise is a usage error, not a
+/// guess. The pair is kept with the identity ([`LogClock`]) for a session
+/// registered later.
 fn cmd_link_log(
     store: &Store,
     ident: Option<&str>,
+    continues: Option<(&str, u64)>,
     generation: Option<BridgeGeneration>,
     on_forgot: impl FnOnce(),
 ) -> String {
     let Some(ident) = ident.filter(|i| is_log_identity(i)) else {
         return LINK_USAGE.to_string();
     };
+    if continues.is_some_and(|(was, _)| !is_earlier_generation(was, ident)) {
+        return LINK_USAGE.to_string();
+    }
     // A new incarnation cannot deliver on a newer log while this incarnation
     // is still sweeping the old one. This lock is above both fabric and link
     // locks; the per-session wait below releases its fabric guard at the fence.
@@ -4492,7 +4700,19 @@ fn cmd_link_log(
         }
         LINK.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
     };
-    let mut changed = previous.as_deref().is_some_and(|was| was != ident);
+    let mut changed = previous.as_ref().is_some_and(|was| was.ident != ident);
+    // A bare identity the link already names keeps what was said of it: that
+    // it continues an earlier generation stays true of the pair.
+    let clock = LogClock {
+        ident: ident.to_string(),
+        continues: continues
+            .map(|(was, fork)| (was.to_string(), fork))
+            .or_else(|| {
+                previous
+                    .filter(|p| p.ident == ident)
+                    .and_then(|p| p.continues)
+            }),
+    };
     let live: Vec<_> = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         g.sessions()
@@ -4507,16 +4727,7 @@ fn cmd_link_log(
         // idempotent. A legacy carry with live references has an UNKNOWN old
         // clock; the first identity cannot simply claim those references.
         let forget = inbox.bus_log.as_deref().map_or_else(
-            || {
-                changed
-                    || inbox.oldest_on_bus.is_some()
-                    || !inbox.receipts.is_empty()
-                    || !inbox.fetches.is_empty()
-                    || inbox
-                        .posts
-                        .iter()
-                        .any(|p| p.off.is_some() || (!p.dead && p.re.is_some()))
-            },
+            || changed || inbox.holds_bus_references(),
             |was| was != ident,
         );
         if forget {
@@ -4525,7 +4736,8 @@ fn cmd_link_log(
                 return HOLD_BUSY.to_string();
             };
             inbox = guard;
-            let retired = inbox.forget_bus_offsets();
+            let keep_below = clock.keep_below(inbox.bus_log.as_deref());
+            let retired = inbox.forget_bus_offsets(keep_below);
             for id in retired {
                 ctx.record("post-landed", format!("{id} off=- reason=log-replaced"));
             }
@@ -4537,7 +4749,7 @@ fn cmd_link_log(
     }
     // Only a fully applied transition becomes the global witness. A busy
     // session keeps the old global witness and will be retried before delivery.
-    *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = Some(ident.to_string());
+    *LINK.log.lock().unwrap_or_else(|p| p.into_inner()) = Some(clock);
     if changed {
         on_forgot();
         "OK forgot=1\n"
@@ -4560,6 +4772,21 @@ fn is_log_identity(s: &str) -> bool {
             && generation.bytes().all(|b| b.is_ascii_digit())
             && generation.parse::<u64>().is_ok()
     })
+}
+
+/// Whether log identity `was` can be one `ident` CONTINUES (`link log <ident>
+/// continues=<f> was=<was>`): the same log (the 32 hex digits alike) at a
+/// lower generation — the only pair astream's `LogIdentity::continues` ever
+/// answers for. Another log, the same generation or a later one never is.
+fn is_earlier_generation(was: &str, ident: &str) -> bool {
+    fn split(s: &str) -> Option<(&str, u64)> {
+        let (id, generation) = s.split_once('.').filter(|_| is_log_identity(s))?;
+        Some((id, generation.parse().ok()?))
+    }
+    matches!(
+        (split(was), split(ident)),
+        (Some((log, before)), Some((now, after))) if log == now && before < after
+    )
 }
 
 /// A `link down reason=` token, kept to the shape every reader prints
@@ -4826,145 +5053,54 @@ fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> 
 // The hold gate
 // ---------------------------------------------------------------------------
 
-/// The verbs a fleet halt refuses (§5.3): every socket verb that can reach the
-/// PTY, signal the child, or retire a LIVE session.
+/// Whether a fleet halt refuses `verb` (§5.3): its verb row's
+/// [`Input::PTY`](aterm_types::control_verbs::Input::PTY) flag. Every row that can
+/// mutate declares its input class, and the argument for each member and each
+/// exemption is written at its row (`aterm_types::control_verbs::VERBS`), so a new
+/// writing verb is put inside the halt or argued outside it before it compiles,
+/// whatever its target. The `hold` row's help enumerates the set
+/// (`the_hold_help_enumerates_exactly_the_halt_set`, beside the table).
 ///
-/// A LITERAL: the answer must be available before a session is resolved. A verb
-/// added to [`aterm_types::control_verbs::VERBS`] that can write is decided here
-/// by hand, on the argument below: `focus` writes `\x1b[I` / `\x1b[O` to the
-/// PTY whenever DEC 1004 focus reporting is on (`input.rs`, the "SOLE
-/// focus-report egress"), and `tab close`, the App-lane twin of `close`, retires
-/// a session — both were once missing from this set.
+/// SEVEN MEMBERS ARE NOT `Target::Session` ROWS, and each has its own seam.
+/// `askpass` is Owner-only `Meta`, intercepted by the serve loop before dispatch.
+/// The other six — `confirm`, `hwkey`, `invoke`, `pane`, `pointer` and `tab` — are
+/// `Target::App`: `control::dispatch_app` resolves no session for their bare forms,
+/// so the session gate is structurally unreachable for them and
+/// [`app_halt_refusal`] is where they are refused instead.
 ///
-/// EXEMPT ON PURPOSE: `post`, `inbox seen`, `meta set`, `lease` and every read
-/// verb, because a halted agent must still be able to ask why it is halted, mark
-/// the notice seen, and escalate; and the physical keyboard is not on this seam
-/// at all, so a human at the glass keeps typing. A halt stops DRIVERS.
-///
-/// SIX MEMBERS ARE NOT `Target::Session` ROWS, and each has its own seam.
-///
-/// All six — `confirm`, `hwkey`, `invoke`, `pane`, `pointer` and `tab` — are
-/// `Target::App`: they are answered in `dispatch_before_session`, before any
-/// session exists, so the session gate is structurally unreachable for their
-/// bare forms and [`app_halt_refusal`] is where they are refused instead.
-///
-/// * `hwkey` is the most direct PTY-reaching verb in the table: it posts a real
-///   NSEvent onto the OS event queue, so it takes the SAME winit path a physical
-///   keypress takes. A halt that stopped `send` and `key` but let `hwkey` through
-///   would stop the polite routes and leave the one indistinguishable from
-///   fingers on the keyboard.
-/// * `invoke` belongs here because `invoke Paste` writes the OS clipboard into
-///   the front tab's PTY through `App::paste_clipboard` ->
-///   `deliver_paste(.., Source::Human)`, and because `invoke SelectAll` + `copy`
-///   lets the caller CHOOSE those bytes off the session's own screen first — a
-///   screen-content-to-PTY path, which is the one thing this design says must
-///   not exist.
-/// * `pane <left|right|up|down>` puts no bytes anywhere itself: `cmd_pane` ->
-///   `Wake::PaneFocus` -> `App::focus_pane_in` moves the focused leaf, re-syncs
-///   the tab model and repaints, and unlike `focus` it never reaches
-///   `App::input(.., InputEvent::Focus(..))`, the sole DEC 1004 focus-report
-///   egress. It is in the set anyway, for `tab`'s reason rather than `hwkey`'s:
-///   it RE-AIMS the seam that does write. Moving the focused pane changes which
-///   session the window's keyboard drives and which session every flagless,
-///   front-routed socket verb resolves to, so a halted driver could silently
-///   redirect the next keystrokes — the human's included — into a different
-///   session. `tab`'s cost sentence applies verbatim: a driver cannot navigate
-///   panes over the socket while a halt stands, and the human at the glass moves
-///   between panes from the keyboard as always, which the halt never touches.
-/// * `pointer` IS in this set, and was once wrongly exempted from it. The
-///   exemption read "it synthesizes no mouse event — `mouse` is the verb that
-///   writes one to the PTY". That is false: `pointer move` drives
-///   `App::on_cursor_moved`, the same entry point `WindowEvent::CursorMoved`
-///   calls, and under DEC 1000/1002/1003 the terminal REPORTS that motion to the
-///   program on the far side. `control_verbs.rs` says so at the row itself,
-///   which is why the row is `Write`. A halted driver could move the pointer
-///   across a session running vim with mouse reporting on and drive it. The two
-///   verbs differ in the path they take to the PTY, not in whether they reach
-///   it, and the halt asks only the second question.
-/// * `tab` belongs here for the THIRD clause of the sentence above: `tab close
-///   [N]` reaches `control_input::cmd_tab` -> `Wake::TabCmd` ->
-///   `App::close_tab_via_verb`, which retires the tab's session with
-///   `ExitReason::CtlClose` — the same act `close` is refused for. The WHOLE
-///   verb is refused rather than the `close` sub-form, because a set keyed on
-///   the verb NAME and a gate keyed on the ARGUMENTS is exactly the pair of
-///   literals that disagreed before. The cost is that a driver cannot navigate
-///   tabs over the socket while a halt stands — `app_halt_refusal`'s own "fail
-///   closed, and cheap in the case it exists for" argument — and the human at
-///   the glass switches tabs from the keyboard as always.
-/// * `confirm` belongs here for `tab`'s clause: `confirm yes` runs the close or
-///   quit that a control client's `invoke` parked in the window
-///   (`close_confirm`), retiring every session it closes. A question parked
-///   BEFORE the halt would otherwise be the one close a halted driver could
-///   still finish. `confirm no` closes nothing and is refused with it, one verb
-///   one answer, and the person at the glass answers the question as always.
-///
-/// TWO SEAMS FOR THE APP LANE, NOT ONE. `spawn` and `tab` also have an AIMED
-/// form (`@<sid> tab …`, design S3) which `control::aimed_app_lane` routes PAST
-/// `dispatch_before_session` — the selector is the verb's ARGUMENT, "the window
-/// hosting `<sid>`", and has to survive to the session resolver. The session
-/// dispatch it lands in gates on the AIMED session's hold, which is the wrong
+/// AN AIMED FORM ASKS BOTH. `spawn`, `tab` and `panes` also have an AIMED form
+/// (`@<sid> tab …`, design S3) — the selector is the verb's ARGUMENT, "the window
+/// hosting `<sid>`". Gating it on the AIMED session's hold alone is the wrong
 /// question: `cmd_tab_aimed` drives `hosting_window(sid)`, so `tab close N`
 /// retires whichever session tab N hosts. Under a PARTIAL halt — the ordinary
 /// case, since [`bridge_lost`] halts only the sids in `LINK.touched` —
-/// `@<unheld> tab close N` retired a HELD window-mate. The session dispatch
-/// therefore asks [`app_halt_refusal`] a SECOND time for every aimed App verb.
+/// `@<unheld> tab close N` retired a HELD window-mate. `control::dispatch_app`
+/// therefore asks an aimed App verb [`halt_refusal`] of the aimed session (so a
+/// held one answers with its own `reason=`) and then, as it asks every App verb,
+/// [`app_halt_refusal`].
 ///
-/// TWO RESIDUALS, NAMED RATHER THAN PROMISED AWAY. Neither is in this set and
-/// neither is refused, so the sentence at the top is scoped to a LIVE session
-/// rather than claiming more than the code does:
-///
-/// * `spawn` MINTS a session. The halt binds sessions, not the instance, and a
-///   session created after the halt carries no hold of its own — under
-///   `reason=fabric-lost` there is no bridge left to hold it either — so a
-///   driver refused on every held session can still open a fresh one and type
-///   into that. Halting `spawn` would refuse a human's `aterm new-tab`, which
-///   arrives on the same seam and is indistinguishable from a driver's, so this
-///   is a design question (§5.3) and not a gate this function may decide alone.
-/// * `update apply` re-execs the instance, which ends every session and with
-///   them every in-memory hold. It is Owner-only, is answered as
-///   `Access::AnyScopeMeta` before any session resolves, and needs a build
-///   already staged on disk; it is recorded here so a reader does not conclude
-///   from the first sentence that no verb can end a halted session.
+/// TWO RESIDUALS, argued at their rows: `spawn` MINTS a session the halt does not
+/// yet bind, and `update apply` re-execs the instance, which ends every session and
+/// every in-memory hold. Neither is refused, so the halt's sentence is scoped to a
+/// LIVE session rather than claiming that no verb can end a halted one.
+#[must_use]
 pub fn is_pty_reaching(verb: &str) -> bool {
-    matches!(
-        verb,
-        "send"
-            | "key"
-            | "ctrl"
-            | "feed"
-            | "feed-bin"
-            | "paste"
-            | "paste-bin"
-            | "mouse"
-            | "pointer"
-            | "resize"
-            | "focus"
-            | "signal"
-            // The explicit restart ends the agent in the tab: halted as
-            // `signal` is.
-            | "restart"
-            // The manual reset (2026-09-26): it moves the session's terminal
-            // modes out from under whatever runs there, and `reset flush`
-            // drops its input queue — a driver's act on the session, which a
-            // halt stops. The HUMAN's escape hatch is the menu row, which is
-            // not a socket verb and is never halted (its `invoke` twin is).
-            | "reset"
-            | "turn"
-            | "close"
-            | "invoke"
-            | "hwkey"
-            | "pane"
-            | "tab"
-            | "confirm"
-            // The sudo askpass relay: a held session must not escalate to root.
-            // Intercepted before dispatch, so the intercept enforces this itself
-            // (via the attributed session's hold) rather than the generic gate.
-            | "askpass"
-    )
+    aterm_types::control_verbs::input_of(verb).contains(aterm_types::control_verbs::Input::PTY)
 }
 
 /// The refusal a halted session answers `verb` with, or `None` when the verb may
-/// proceed. Transient class beside `ERR busy`, so a driver's existing back-off
+/// proceed ([`is_pty_reaching`], then [`hold_refusal`]): the halt asked of a verb
+/// by name; a dispatch asks its request's class (`control::admit`).
+#[must_use]
+pub fn halt_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<String> {
+    if !is_pty_reaching(verb) {
+        return None;
+    }
+    hold_refusal(ctx)
+}
+
+/// The refusal `ctx`'s standing hold answers a verb the halt binds, or `None` when
+/// no hold stands. Transient class beside `ERR busy`, so a driver's existing back-off
 /// already does the right thing.
 ///
 /// SCOPE-BLIND on purpose: the halt binds Owner, Edge and Bridge alike. A halt
@@ -4974,22 +5110,20 @@ pub fn is_pty_reaching(verb: &str) -> bool {
 /// the window says how many acts aimed at the tab its Take Over kept out. Only
 /// this session-grain gate counts: an app verb [`app_halt_refusal`] refuses
 /// instance-wide was aimed at no tab, so no tab's words claim it.
-pub fn halt_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<String> {
-    let (refusal, origin) = hold_refusal(ctx, verb)?;
+#[must_use]
+pub fn hold_refusal(ctx: &dyn FabricSession) -> Option<String> {
+    let (refusal, origin) = standing_refusal(ctx)?;
     if origin == PERSON_ORIGIN {
         ctx.fabric().person_refusals.fetch_add(1, Ordering::Relaxed);
     }
     Some(refusal)
 }
 
-/// [`halt_refusal`]'s words and the standing hold's origin, counting nothing.
+/// [`hold_refusal`]'s words and the standing hold's origin, counting nothing.
 /// A remote node's own hold does not refuse the drive connection that node
 /// serves on ([`serving_driver`], [`Holds::first_against`]); every other
 /// hold does, and its hold refuses everyone else.
-fn hold_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<(String, String)> {
-    if !is_pty_reaching(verb) {
-        return None;
-    }
+fn standing_refusal(ctx: &dyn FabricSession) -> Option<(String, String)> {
     let driver = serving_driver().map(|driver| driver.node);
     let hold = ctx.fabric().holds().first_against(driver.as_deref())?;
     Some((
@@ -5001,12 +5135,11 @@ fn hold_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<(String, String)>
 /// [`halt_refusal`] for an APP-TARGET verb, which has no session to check.
 ///
 /// `invoke <action>`, `hwkey <key>`, `pane <dir>`, `pointer <move|leave>`,
-/// `tab <sub-form>` and `confirm yes|no` — the six `Target::App` members of
-/// [`is_pty_reaching`] — are answered in `dispatch_before_session`, BEFORE any
-/// session is resolved, and
-/// what they touch is whatever window is frontmost at the time — which this thread cannot learn
-/// without a main-thread hop, and which can change between the check and the
-/// action anyway. So the question asked here is the only one that is both
+/// `tab <sub-form>` and `confirm yes|no` — the `Target::App` members of
+/// [`is_pty_reaching`] — are answered by `control::dispatch_app`, which resolves
+/// no session for them, and what they touch is whatever window is frontmost at
+/// the time — which this thread cannot learn without a main-thread hop, and
+/// which can change between the check and the action anyway. So the question asked here is the only one that is both
 /// answerable and honest: is ANY session on this instance held?
 ///
 /// FAIL CLOSED, and cheap in the case it exists for. A fleet halt is a fleet-wide
@@ -5020,16 +5153,22 @@ fn hold_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<(String, String)>
 /// `send` had just been refused, or that let `tab close` retire the very session
 /// `close` had just been refused on.
 ///
-/// ASKED TWICE. The AIMED forms (`@<sid> tab …`) reach the session dispatch
-/// instead of `dispatch_before_session`, and drive the window HOSTING that
-/// session rather than the session itself, so the session-grain gate there is
-/// not the right question for them. `control::handle` calls this function again
-/// for them; see the last paragraph of [`is_pty_reaching`]'s doc.
+/// The AIMED forms (`@<sid> tab …`) drive the window HOSTING that session rather
+/// than the session itself, so the aimed session's own hold is not the whole
+/// question for them: `control::dispatch_app` asks this function after it; see
+/// [`is_pty_reaching`]'s doc.
 pub fn app_halt_refusal(store: &impl AsStore, verb: &str) -> Option<String> {
-    let store = &store.as_store();
     if !is_pty_reaching(verb) {
         return None;
     }
+    any_hold_refusal(store)
+}
+
+/// The refusal of the first session on this instance a hold stands on, or `None`:
+/// the App lane's question ([`app_halt_refusal`]), asked once the verb is known to
+/// be one the halt binds.
+pub fn any_hold_refusal(store: &impl AsStore) -> Option<String> {
+    let store = &store.as_store();
     // Clone the ctxs out from under the registry guard: the fabric lock is a leaf
     // and is never taken while the store is held (`cmd_deliver` and
     // [`bridge_lost`] keep the same discipline).
@@ -5038,7 +5177,7 @@ pub fn app_halt_refusal(store: &impl AsStore, verb: &str) -> Option<String> {
         g.sessions()
     };
     ctxs.iter()
-        .find_map(|ctx| hold_refusal(ctx, verb))
+        .find_map(|ctx| standing_refusal(ctx.as_ref()))
         .map(|(refusal, _)| refusal)
 }
 
@@ -6418,7 +6557,6 @@ fn retire_post(
     else {
         return Err(HOLD_BUSY.to_string());
     };
-    let epoch = inbox.log_epoch;
     let Some(row) = inbox.posts.iter_mut().find(|p| p.id == post_id) else {
         return Err("ERR no such post\n".to_string());
     };
@@ -6429,7 +6567,7 @@ fn retire_post(
     match off {
         Some(n) => {
             if row.off.is_none() {
-                row.landed_epoch = epoch;
+                row.landed_on_log = true;
             }
             row.off = Some(n);
             // STICKY, like the offset: a retirement retried without the flag
@@ -6884,14 +7022,14 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
 
     inbox.last_msg_id += 1;
     let id = inbox.last_msg_id;
-    // Threaded by offset only to a post that landed on THIS log
-    // ([`Inbox::log_floor`]): an earlier log's post at the same number is
-    // another record.
+    // Threaded by offset only to a post whose landing THIS log still holds
+    // ([`PostRow::landed_on_log`]): an earlier log's post at the same number is
+    // another record, a moved generation's below its fork the same one.
     let re_id = re.and_then(|r| {
         inbox
             .posts
             .iter()
-            .find(|p| p.landed_epoch == inbox.log_epoch && p.off == Some(r))
+            .find(|p| p.off == Some(r) && p.landed_on_log)
             .map(|p| p.id)
     });
     let is_addressed = topic.is_none();
@@ -6915,6 +7053,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         topic,
         listed: false,
         refill,
+        on_log: true,
     };
     evict_for(&mut inbox);
     inbox.rows.push_back(row);
@@ -7031,17 +7170,17 @@ fn evict_for(inbox: &mut Inbox) {
 /// Owner scope: adding a topic changes what reaches an agent's inbox, which is
 /// the same authority class as the halt, not a read.
 ///
-/// Returns the reply and whether the set changed — the caller's cue to wake
-/// the session's `events` watchers for the record just written.
-pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> (String, bool) {
+/// A change records its `topic` row on the session's timeline, which wakes
+/// the session's `events` watchers.
+pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
     let mut words = rest.split_whitespace();
     match words.next() {
         Some("ls") | None => {
             if words.next().is_some() {
-                return (TOPIC_USAGE.to_string(), false);
+                return TOPIC_USAGE.to_string();
             }
             let topics = ctx.fabric().topics();
-            // `seen=` is the handled watermark ([`cmd_inbox_seen_waking`]'s
+            // `seen=` is the handled watermark ([`cmd_inbox_seen`]'s
             // event carries it too): a bridge reads it here, on every read of
             // the set, as the backstop for an `inbox-seen` it never heard, so
             // a broadcast the agent handled is not offered again.
@@ -7050,14 +7189,14 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> (String, bool) {
             for (t, e) in topics {
                 out.push_str(&format!("topic {t} since={}\n", e.since));
             }
-            (out, false)
+            out
         }
         Some("add") => {
             let Some(t) = words.next() else {
-                return (TOPIC_USAGE.to_string(), false);
+                return TOPIC_USAGE.to_string();
             };
             if !is_topic(t) {
-                return (TOPIC_USAGE.to_string(), false);
+                return TOPIC_USAGE.to_string();
             }
             let since = match words.next() {
                 None => "head".to_string(),
@@ -7065,11 +7204,11 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> (String, bool) {
                 // validator, so the two cannot disagree about what `@+5` is.
                 Some(tok) => match tok.strip_prefix("since=") {
                     Some(v) if valid_since(v) => v.to_string(),
-                    _ => return (TOPIC_USAGE.to_string(), false),
+                    _ => return TOPIC_USAGE.to_string(),
                 },
             };
             if words.next().is_some() {
-                return (TOPIC_USAGE.to_string(), false);
+                return TOPIC_USAGE.to_string();
             }
             // A COMMITTING UPDATE HOLDS THE CHANGE BACK (round eight of the
             // update audit, finding 751): the successor carries the set the
@@ -7080,7 +7219,7 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> (String, bool) {
                 .fabric()
                 .wait_unfenced(ctx.fabric().lock(), ctx.fabric().fence_wait())
             else {
-                return (HOLD_BUSY.to_string(), false);
+                return HOLD_BUSY.to_string();
             };
             // THE BRIDGE HEARS IT NOW, on the event lane it already holds:
             // nothing on the bus announces the change — the set is this
@@ -7091,30 +7230,24 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> (String, bool) {
             drop(unfenced);
             let Ok(added) = added else {
                 // Nothing changed, so nothing is pushed or woken.
-                return (
-                    format!("ERR topics full (max {MAX_TOPICS}): drop one first\n"),
-                    false,
-                );
+                return format!("ERR topics full (max {MAX_TOPICS}): drop one first\n");
             };
             ctx.fabric().changed.notify_all();
-            (
-                format!("OK {t} since={since} added={}\n", u8::from(added)),
-                added,
-            )
+            format!("OK {t} since={since} added={}\n", u8::from(added))
         }
         Some("drop") => {
             let Some(t) = words.next() else {
-                return (TOPIC_USAGE.to_string(), false);
+                return TOPIC_USAGE.to_string();
             };
             if words.next().is_some() || !is_topic(t) {
-                return (TOPIC_USAGE.to_string(), false);
+                return TOPIC_USAGE.to_string();
             }
             // Held back by a committing update, as `add` is.
             let Some(mut unfenced) = ctx
                 .fabric()
                 .wait_unfenced(ctx.fabric().lock(), ctx.fabric().fence_wait())
             else {
-                return (HOLD_BUSY.to_string(), false);
+                return HOLD_BUSY.to_string();
             };
             let dropped = ctx
                 .fabric()
@@ -7138,9 +7271,9 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> (String, bool) {
             }
             drop(unfenced);
             ctx.fabric().changed.notify_all();
-            (format!("OK {t} dropped={}\n", u8::from(dropped)), dropped)
+            format!("OK {t} dropped={}\n", u8::from(dropped))
         }
-        Some(_) => (TOPIC_USAGE.to_string(), false),
+        Some(_) => TOPIC_USAGE.to_string(),
     }
 }
 
@@ -7325,17 +7458,16 @@ const INBOX_USAGE: &str = "ERR usage: inbox [<n>] [since=<id>] [--peek] [--meta]
 /// rather than in the router's `match verb`, so the router keeps one arm per
 /// keyword and the sub-keywords never look like verbs of their own.
 ///
-/// `wake` is the session's subscriber notify, as for [`cmd_post_waking`]: the
-/// two forms that record a row the BRIDGE acts on — `inbox seen` (its
+/// The two forms that record a row the BRIDGE acts on — `inbox seen` (its
 /// `inbox-seen` event persists the refill floor and prompts a receipt's
 /// drain) and a parked `inbox get @<off>` (its `fetch` event prompts the
-/// bridge's read) — run it once that row is recorded, so the push lane
-/// carries the event now rather than on its 250 ms tick. The listing and
-/// `inbox get <id>` record nothing and never run it.
-pub fn cmd_inbox_verb(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn()) -> String {
+/// bridge's read) — wake the session's watchers with that record, so the
+/// push lane carries the event at once. The listing and `inbox get <id>`
+/// record nothing.
+pub fn cmd_inbox_verb(ctx: &dyn FabricSession, rest: &str) -> String {
     match rest.split_once(' ') {
-        Some(("get", tail)) => cmd_inbox_get_waking(ctx, tail, wake),
-        Some(("seen", tail)) => cmd_inbox_seen_waking(ctx, tail, wake),
+        Some(("get", tail)) => cmd_inbox_get(ctx, tail),
+        Some(("seen", tail)) => cmd_inbox_seen(ctx, tail),
         // A bare sub-keyword with no argument: usage, never a silent listing.
         _ if matches!(rest.trim(), "get" | "seen") => INBOX_USAGE.to_string(),
         _ => cmd_inbox(ctx, rest),
@@ -7521,16 +7653,16 @@ fn render_row_into(out: &mut String, row: &InboxRow, meta_only: bool) {
 /// without changing the framing. `glance.rs` established `"truncated": true` as
 /// this crate's way of saying an answer is not a complete one.
 ///
-/// `wake` runs only for a read by offset that PARKS, once its `fetch` row is
-/// recorded and before the park ([`inbox_get_at`]).
-pub fn cmd_inbox_get_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn()) -> String {
+/// A read by offset that PARKS records its `fetch` row first, which wakes the
+/// session's watchers before the park ([`inbox_get_at`]).
+pub fn cmd_inbox_get(ctx: &dyn FabricSession, rest: &str) -> String {
     let mut toks = rest.split_whitespace();
     let (Some(arg), None) = (toks.next(), toks.next()) else {
         return INBOX_USAGE.to_string();
     };
     if let Some(off) = arg.strip_prefix('@') {
         return match off.parse::<u64>() {
-            Ok(off) => inbox_get_at(ctx, off, wake),
+            Ok(off) => inbox_get_at(ctx, off),
             Err(_) => INBOX_USAGE.to_string(),
         };
     }
@@ -7548,13 +7680,6 @@ pub fn cmd_inbox_get_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn()
         Some(row) => format!("OK {}\n{}", row.body.len(), row.body),
         None => "ERR no such message\n".to_string(),
     }
-}
-
-/// [`cmd_inbox_get_waking`] with nothing to wake — the unit tests' spelling.
-/// A production seam must name its wake, so this exists only under `cfg(test)`.
-#[cfg(any(test, debug_assertions))]
-pub fn cmd_inbox_get(ctx: &dyn FabricSession, rest: &str) -> String {
-    cmd_inbox_get_waking(ctx, rest, &|| {})
 }
 
 /// `inbox get @<off>` — one record BY BROKER OFFSET, from the ring when it
@@ -7589,14 +7714,16 @@ pub fn cmd_inbox_get(ctx: &dyn FabricSession, rest: &str) -> String {
 ///
 /// A NEWLY PARKED READ WAKES THE PUSH LANE BEFORE IT PARKS. The `fetch` row is
 /// what becomes `EVENT <local> fetch`, the bridge's prompt to drain the
-/// `outbox` peek, and the bridge has no idle poll: without `wake` the event
-/// left on the push loop's next 250 ms tick, or on the 2 s roster round. A
-/// flag returned to the caller could not do it — the call parks until the
-/// very answer that event starts. Run with the fabric lock released, as
-/// [`cmd_post_waking`] runs its own, so the subscriber registry's lock never
-/// nests inside this one.
-fn inbox_get_at(ctx: &dyn FabricSession, off: u64, wake: &dyn Fn()) -> String {
-    let mut announced = false;
+/// `outbox` peek, and the bridge has no idle poll: the record wakes the
+/// session's watchers as it lands, before the park. A flag returned to the
+/// caller could not do it — the call parks until the very answer that event
+/// starts.
+fn inbox_get_at(ctx: &dyn FabricSession, off: u64) -> String {
+    inbox_get_at_within(ctx, off, std::time::Duration::from_millis(FETCH_WAIT_MS))
+}
+
+/// [`inbox_get_at`], parked at most `wait`.
+fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Duration) -> String {
     let mut inbox = ctx.fabric().lock();
     if let Some(row) = inbox.row_at(off)
         && (row.len <= row.body.len() || wait_is_futile())
@@ -7628,19 +7755,13 @@ fn inbox_get_at(ctx: &dyn FabricSession, off: u64, wake: &dyn Fn()) -> String {
             }
             inbox.fetches.push_back((off, FetchSlot::Pending));
             // The bridge's idle outbox poll is gone. A parked fetch is work
-            // owed now: the record is the push lane's `fetch` event, and the
-            // wake below sends it now. The roster round still finds a lost
-            // event.
+            // owed now: the record is the push lane's `fetch` event, and it
+            // rings the session's watchers as it lands, before the park. The
+            // roster round still finds a lost event.
             ctx.record("fetch", format!("off={off}"));
-            announced = true;
         }
     }
-    if announced {
-        drop(inbox);
-        wake();
-        inbox = ctx.fabric().lock();
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(FETCH_WAIT_MS);
+    let deadline = std::time::Instant::now() + wait;
     loop {
         let Some(i) = inbox.fetches.iter().position(|(o, _)| *o == off) else {
             // Evicted from under a parked read: only an answered slot is ever
@@ -7664,17 +7785,18 @@ fn inbox_get_at(ctx: &dyn FabricSession, off: u64, wake: &dyn Fn()) -> String {
             let why = format!("ERR fabric {} off={off}\n", fabric_state());
             return unfetched(&inbox, off, why);
         }
-        let now = std::time::Instant::now();
-        if now >= deadline || aterm_control::hangup::caller_hung_up() {
+        if std::time::Instant::now() >= deadline || aterm_control::hangup::caller_hung_up() {
             inbox.fetches.remove(i);
             return unfetched(&inbox, off, format!("ERR timeout off={off}\n"));
         }
-        let (next, _) = ctx
-            .fabric()
-            .changed
-            .wait_timeout(inbox, aterm_control::hangup::hangup_park(deadline - now))
-            .unwrap_or_else(|p| p.into_inner());
-        inbox = next;
+        // PARK NO LONGER THAN THE STALE HORIZON ([`park_until`]): the check
+        // above answers `ERR fabric stale` there instead of at the read's bound.
+        inbox = aterm_control::park::park_guarded(
+            &ctx.fabric().changed,
+            inbox,
+            park_until(deadline),
+            aterm_control::park::Lane::SERVED,
+        );
     }
 }
 
@@ -7724,12 +7846,11 @@ fn fetch_failure(why: &str, off: u64) -> String {
 /// still moves), a different word (`deferred`, later `handled`) is a new
 /// receipt. A `--peek` records nothing and so acks nothing.
 ///
-/// `wake` runs once for an answered `OK`, after the `inbox-seen` row is
-/// recorded and the fabric lock released ([`cmd_inbox_verb`]): that event is
-/// what the bridge persists the refill floor from and drains a receipt on, so
-/// without it a `--wait-ack` sender waited out the push loop's 250 ms tick. A
-/// bare `inbox seen` wakes too — it moves the floor.
-pub fn cmd_inbox_seen_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn()) -> String {
+/// An answered `OK` records the `inbox-seen` row, which wakes the session's
+/// watchers: that event is what the bridge persists the refill floor from and
+/// drains a receipt on, so a `--wait-ack` sender hears it at once. A bare
+/// `inbox seen` records it too — it moves the floor.
+pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
     let mut toks = rest.split_whitespace();
     let Some(id) = toks.next().and_then(|t| t.parse::<u64>().ok()) else {
         return INBOX_USAGE.to_string();
@@ -7756,9 +7877,10 @@ pub fn cmd_inbox_seen_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn(
         return "ERR no such message\n".to_string();
     };
     let off = inbox.rows[at].off;
-    // A row delivered before the bridge said the log changed: its `off` is an
-    // earlier log's ([`Inbox::log_floor`]), and so is its receipt's `re=`.
-    let earlier_log = inbox.rows[at].id <= inbox.log_floor;
+    // A row delivered before the bridge said the log changed, at an offset the
+    // log it reads now does not hold: its `off` is an earlier log's
+    // ([`InboxRow::on_log`]), and so is its receipt's `re=`.
+    let earlier_log = !inbox.rows[at].on_log;
     let decided = verdict.filter(|v| inbox.rows[at].decision.as_deref() != Some(v));
     let mut verdict_tail = String::new();
     if let Some(v) = decided {
@@ -7794,7 +7916,8 @@ pub fn cmd_inbox_seen_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn(
     let floor = addressed_floor(&inbox).map_or_else(|| "-".to_string(), |f| f.to_string());
     let payload = format!("{id} off={off} floor={floor} seen={seen}{verdict_tail}");
     // The session log's `mail-seen` mark when the act moved something (the
-    // watermark, or a verdict decided); `wake` below wakes its readers too.
+    // watermark, or a verdict decided). The record rings the session's
+    // watchers, the log's readers among them.
     if seen > seen_before || decided.is_some() {
         let fact = FabricFact::MailSeen {
             inbox: id,
@@ -7807,7 +7930,6 @@ pub fn cmd_inbox_seen_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn(
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
-    wake();
     format!("OK seen={seen}\n")
 }
 
@@ -7836,21 +7958,14 @@ pub fn cmd_inbox_seen_waking(ctx: &dyn FabricSession, rest: &str, wake: &dyn Fn(
 /// unread mail, and decided twice).
 fn addressed_floor(inbox: &Inbox) -> Option<u64> {
     // Only THIS log's rows: an earlier log's offset is no floor here
-    // ([`Inbox::log_floor`]), and its rows cannot be refilled from this log.
+    // ([`InboxRow::on_log`]), and its rows cannot be refilled from this log.
     inbox
         .rows
         .iter()
-        .filter(|r| r.topic.is_none() && r.id > inbox.seen && r.id > inbox.log_floor)
+        .filter(|r| r.topic.is_none() && r.id > inbox.seen && r.on_log)
         .map(|r| r.off)
         .min()
         .or_else(|| inbox.addressed_head.map(|h| h.saturating_add(1)))
-}
-
-/// [`cmd_inbox_seen_waking`] with nothing to wake — the unit tests' spelling.
-/// A production seam must name its wake, so this exists only under `cfg(test)`.
-#[cfg(any(test, debug_assertions))]
-pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
-    cmd_inbox_seen_waking(ctx, rest, &|| {})
 }
 
 // ---------------------------------------------------------------------------
@@ -7946,18 +8061,12 @@ const WAIT_MAX_MS: u64 = 600_000;
 /// `body` is `Some` only for the length-prefixed frame form, whose bytes the
 /// serve loop has already read off the stream.
 ///
-/// `wake` runs once for an accepted post, right after its `post` timeline
-/// record and BEFORE any `--wait` parks: the control seam passes the session's
-/// subscriber notify (`meta`'s and `topic`'s rule), so the push lane's `EVENT
-/// <sid> post` — the bridge's prompt trigger to drain the outbox — leaves now
-/// rather than on the push loop's 250 ms tick. After the wait would be too
-/// late: a `--wait` post is waiting for exactly the drain that trigger starts.
-pub fn cmd_post_waking(
-    ctx: &dyn FabricSession,
-    rest: &str,
-    body: Option<Vec<u8>>,
-    wake: &dyn Fn(),
-) -> String {
+/// An accepted post's `post` timeline record wakes the session's watchers,
+/// BEFORE any `--wait` parks, so the push lane's `EVENT <sid> post` — the
+/// bridge's prompt trigger to drain the outbox — leaves at once. After the
+/// wait would be too late: a `--wait` post is waiting for exactly the drain
+/// that trigger starts.
+pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> String {
     let mut to: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut re: Option<u64> = None;
@@ -8146,7 +8255,7 @@ pub fn cmd_post_waking(
         to: to_tok.clone(),
         kind: kind.clone(),
         off: None,
-        landed_epoch: 0,
+        landed_on_log: false,
         re,
         dl,
         via: via.clone(),
@@ -8170,23 +8279,29 @@ pub fn cmd_post_waking(
     if let Some(k) = &key {
         payload.push_str(&format!(" key={k}"));
     }
+    // THE BRIDGE NOW OWES AN ANSWER. The record below is what becomes the push
+    // lane's `EVENT <sid> post <id>`, so from here the endpoint has asked and
+    // the bridge has not yet moved it. A bridge that is working answers in
+    // milliseconds and [`settle_work_owed`] runs; one that is wedged says
+    // nothing, and [`STALE_AFTER`] later `fabric=` reads `stale`.
+    //
+    // ARMED BEFORE THE RECORD, under the guard that admitted the row: the
+    // record rings the bridge's push lane, and a bridge that drained, landed
+    // and settled the post before this ran would leave the clock armed with
+    // nothing owed, so `fabric=` would read `stale` and cut the next `--wait`
+    // short. `ctx.fabric()` → `LINK.link` is this file's one order.
+    note_work_owed();
     let fact = FabricFact::MailOut {
         kind: &kind,
         to: &to,
         post: id,
     };
-    // `wake` below wakes the session log's readers too.
+    // The record rings the session's watchers, the session log's readers
+    // among them, so the wake the hook owes is the record's own.
     let _ = ctx.record_fact("post", payload, fact);
     drop(inbox);
-    // THE BRIDGE NOW OWES AN ANSWER. This record is what becomes the push
-    // lane's `EVENT <sid> post <id>`, so from here the endpoint has asked and
-    // the bridge has not yet moved it. A bridge that is working answers in
-    // milliseconds and [`settle_work_owed`] runs; one that is wedged says
-    // nothing, and [`STALE_AFTER`] later `fabric=` reads `stale`.
-    note_work_owed();
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
-    wake();
 
     let Some(wait) = wait else {
         return format!("OK {id}\n");
@@ -8202,7 +8317,7 @@ pub fn cmd_post_waking(
     }
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(wait.unwrap_or(WAIT_DEFAULT_MS));
-    let (off, dup, epoch) = match wait_landing(ctx, id, deadline) {
+    let (off, dup, watch) = match wait_landing(ctx, id, deadline) {
         Ok(landed) => landed,
         Err(reply) => return reply,
     };
@@ -8222,23 +8337,18 @@ pub fn cmd_post_waking(
         None => dl.map_or(WAIT_DEFAULT_MS, |d| d.saturating_add(expiry_grace_ms())),
     }
     .min(WAIT_MAX_MS);
-    wait_receipt_on_log(ctx, id, off, dup, epoch, bound)
+    wait_receipt_on_log(ctx, id, dup, &watch, bound)
 }
 
-/// [`cmd_post_waking`] with nothing to wake — the unit tests' spelling. A
-/// production seam must name its wake, so this exists only under `cfg(test)`.
-#[cfg(any(test, debug_assertions))]
-pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> String {
-    cmd_post_waking(ctx, rest, body, &|| {})
-}
-
-/// Park until the post `id` LANDS: its offset, duplicate flag and log clock, or the reply to
-/// give instead — a verdict, a futile link, or the timeout.
+/// Park until the post `id` LANDS: its offset, duplicate flag and a watch on
+/// that offset armed under the same guard ([`OffsetWatch`], for the receipt
+/// wait that may follow, so no move between the two goes unseen), or the
+/// reply to give instead — a verdict, a futile link, or the timeout.
 fn wait_landing(
     ctx: &dyn FabricSession,
     id: u64,
     deadline: std::time::Instant,
-) -> Result<(u64, &'static str, u64), String> {
+) -> Result<(u64, &'static str, Arc<OffsetWatch>), String> {
     let mut guard = ctx.fabric().lock();
     loop {
         let row = guard.posts.iter().find(|p| p.id == id);
@@ -8249,7 +8359,8 @@ fn wait_landing(
             // re-used a sequence an earlier `key=` reserved, the broker deduped
             // it, and `off` is the ORIGINAL record's. One record on the bus.
             let dup = if row.dup { " dup=1" } else { "" };
-            return Ok((off, dup, row.landed_epoch));
+            let on_log = row.landed_on_log;
+            return Ok((off, dup, guard.watch(off, on_log)));
         }
         // A post the bridge retired as undeliverable releases its wait with a
         // verdict, not a timeout: the caller learns the difference between "the
@@ -8281,26 +8392,18 @@ fn wait_landing(
         if aterm_control::hangup::caller_hung_up() {
             return Err(aterm_control::hangup::HUNG_UP_REPLY.to_string());
         }
-        let now = std::time::Instant::now();
-        if now >= deadline {
+        if std::time::Instant::now() >= deadline {
             return Err(format!("ERR timeout id={id}\n"));
         }
-        // PARK NO LONGER THAN THE STALE HORIZON. Nothing signals this condvar
-        // when a bridge simply stops answering — that is what makes `stale`
-        // worth having — so the sleep is cut to the moment the futility check
-        // above would start returning true, and the next turn of the loop
-        // answers `ERR fabric stale id=<n> queued=1` instead of sitting out
-        // the remaining minutes.
-        let mut park = aterm_control::hangup::hangup_park(deadline - now);
-        if let Some(until_stale) = stale_in().filter(|d| !d.is_zero()) {
-            park = park.min(until_stale);
-        }
-        let (next, _) = ctx
-            .fabric()
-            .changed
-            .wait_timeout(guard, park)
-            .unwrap_or_else(|p| p.into_inner());
-        guard = next;
+        // PARK NO LONGER THAN THE STALE HORIZON ([`park_until`]): the next
+        // turn of the loop answers `ERR fabric stale id=<n> queued=1` instead
+        // of sitting out the remaining minutes.
+        guard = aterm_control::park::park_guarded(
+            &ctx.fabric().changed,
+            guard,
+            park_until(deadline),
+            aterm_control::park::Lane::SERVED,
+        );
     }
 }
 
@@ -8313,37 +8416,40 @@ fn wait_landing(
 /// here is a reason to re-post.
 #[cfg(test)]
 fn wait_receipt(ctx: &dyn FabricSession, id: u64, off: u64, dup: &str, bound_ms: u64) -> String {
-    let epoch = {
-        let inbox = ctx.fabric().lock();
-        inbox
+    let watch = {
+        let mut inbox = ctx.fabric().lock();
+        let on_log = inbox
             .posts
             .iter()
             .find(|p| p.id == id)
-            .map_or(inbox.log_epoch, |p| p.landed_epoch)
+            .is_none_or(|p| p.landed_on_log);
+        inbox.watch(off, on_log)
     };
-    wait_receipt_on_log(ctx, id, off, dup, epoch, bound_ms)
+    wait_receipt_on_log(ctx, id, dup, &watch, bound_ms)
 }
 
+/// [`wait_receipt`]'s wait, on the post's landing offset `post.off` as the
+/// watch [`wait_landing`] armed holds it.
 fn wait_receipt_on_log(
     ctx: &dyn FabricSession,
     id: u64,
-    off: u64,
     dup: &str,
-    epoch: u64,
+    post: &OffsetWatch,
     bound_ms: u64,
 ) -> String {
+    let off = post.off;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
     let mut guard = ctx.fabric().lock();
     loop {
-        if guard.log_epoch != epoch {
+        // The post's own record must still be on the log: a move that kept
+        // it (a moved generation, below the fork) keeps the wait.
+        if !post.on_log() {
             return format!("ERR log-replaced id={id} off={off}\n");
         }
         // The NEWEST word wins: `deferred` then `handled` is two receipts, and
         // the later one is the recipient's current answer.
         let reply = guard.rows.iter().rev().find(|r| {
-            r.id > guard.log_floor
-                && r.re == Some(off)
-                && matches!(r.kind.as_str(), "ack" | "expired")
+            r.on_log && r.re == Some(off) && matches!(r.kind.as_str(), "ack" | "expired")
         });
         if let Some(row) = reply {
             if row.kind == "expired" {
@@ -8358,28 +8464,39 @@ fn wait_receipt_on_log(
         if aterm_control::hangup::caller_hung_up() {
             return aterm_control::hangup::HUNG_UP_REPLY.to_string();
         }
-        let now = std::time::Instant::now();
-        if now >= deadline {
+        if std::time::Instant::now() >= deadline {
             return format!("ERR timeout id={id} off={off}\n");
         }
-        // PARK NO LONGER THAN THE STALE HORIZON, for the reason
-        // [`wait_landing`] gives: nothing signals this condvar when a bridge
-        // simply stops answering, so the sleep is cut to the moment the
-        // futility check above starts returning true. THIS WAIT IS THE LONGER
-        // OF THE TWO — its bound is the sender's `dl=` plus a grace, up to
-        // `WAIT_MAX_MS` — so sitting it out is the more expensive mistake, and
-        // round 21 shipped the cap on the landing wait alone.
-        let mut park = aterm_control::hangup::hangup_park(deadline - now);
-        if let Some(until_stale) = stale_in().filter(|d| !d.is_zero()) {
-            park = park.min(until_stale);
-        }
-        let (next, _) = ctx
-            .fabric()
-            .changed
-            .wait_timeout(guard, park)
-            .unwrap_or_else(|p| p.into_inner());
-        guard = next;
+        // PARK NO LONGER THAN THE STALE HORIZON ([`park_until`]). THIS WAIT
+        // IS THE LONGER OF THE TWO — its bound is the sender's `dl=` plus a
+        // grace, up to `WAIT_MAX_MS` — so sitting it out is the more expensive
+        // mistake, and round 21 shipped the cap on the landing wait alone.
+        guard = aterm_control::park::park_guarded(
+            &ctx.fabric().changed,
+            guard,
+            park_until(deadline),
+            aterm_control::park::Lane::SERVED,
+        );
     }
+}
+
+/// The instant a fabric wait that consults [`wait_is_futile`] parks to: its
+/// `deadline`, cut to the moment an owed answer goes stale ([`stale_in`]).
+/// Nothing signals the condvar when a bridge simply stops answering — that is
+/// what makes `stale` worth having — so the wait looks again exactly when the
+/// futility check starts returning true. A slice of a served lane asks only
+/// after the caller ([`aterm_control::park`]), so this bound is what brings the look.
+///
+/// WITH NOTHING OWED, THE BOUND IS [`STALE_AFTER`] FROM NOW. Arming the owed
+/// clock wakes no parked waiter: another session's `post` arms it under that
+/// session's own fabric lock and notifies only its own condvar, and a
+/// bridge's first `link up` with posts queued arms it with a presence wake.
+/// A debt armed after this instant goes stale no sooner than `STALE_AFTER`
+/// from now, so a wait that parked debt-free still looks by its horizon, at
+/// one look per `STALE_AFTER`.
+fn park_until(deadline: std::time::Instant) -> std::time::Instant {
+    let horizon = stale_in().filter(|d| !d.is_zero()).unwrap_or(STALE_AFTER);
+    deadline.min(std::time::Instant::now() + horizon)
 }
 
 /// The answer a `post --wait` gives when the link cannot report a landing.
@@ -8535,11 +8652,13 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         None => re.is_some() || topic.is_some() || kind != AWAIT_DEFAULT_SKIP,
     };
     // A reply named by `re=` is one to a post of this log: an earlier log's
-    // rows (at or under `floor`, [`Inbox::log_floor`]) share its offsets.
-    let latches = |r: &InboxRow, floor: u64| {
+    // rows ([`InboxRow::on_log`] false) share its offsets. One whose own
+    // offset the log still holds names the same record by its `re=`, which
+    // is always below it, whatever moves it was delivered across.
+    let latches = |r: &InboxRow| {
         r.id > since
             && accepts(&r.kind)
-            && re.is_none_or(|n| r.id > floor && r.re == Some(n))
+            && re.is_none_or(|n| r.on_log && r.re == Some(n))
             && (topic.is_none() || r.topic == topic)
     };
 
@@ -8557,21 +8676,18 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         return format!("ERR bad since high={}\n", guard.last_msg_id);
     }
     let hold_at_arm = guard.holds.is_held();
-    let epoch = guard.log_epoch;
+    // The offset `re=` names, as the log the bridge reads now holds it, for
+    // as long as this wait is parked ([`OffsetWatch`]).
+    let named = re.map(|off| guard.watch(off, true));
     loop {
-        if let Some(off) = re
-            && guard.log_epoch != epoch
+        // The named post's record must still be on the log: a moved
+        // generation that kept it (below the fork) keeps the wait.
+        if let Some(post) = &named
+            && !post.on_log()
         {
-            return format!("ERR log-replaced re={off}\n");
+            return format!("ERR log-replaced re={}\n", post.off);
         }
-        let floor = guard.log_floor;
-        if let Some(id) = guard
-            .rows
-            .iter()
-            .filter(|r| latches(r, floor))
-            .map(|r| r.id)
-            .max()
-        {
+        if let Some(id) = guard.rows.iter().filter(|r| latches(r)).map(|r| r.id).max() {
             return format!("OK inbox {id}\n");
         }
         if watch_hold && guard.holds.is_held() != hold_at_arm {
@@ -8584,16 +8700,15 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         if aterm_control::hangup::caller_hung_up() {
             return aterm_control::hangup::HUNG_UP_REPLY.to_string();
         }
-        let now = std::time::Instant::now();
-        if now >= deadline {
+        if std::time::Instant::now() >= deadline {
             return "OK timeout\n".to_string();
         }
-        let (next, _) = ctx
-            .fabric()
-            .changed
-            .wait_timeout(guard, aterm_control::hangup::hangup_park(deadline - now))
-            .unwrap_or_else(|p| p.into_inner());
-        guard = next;
+        guard = aterm_control::park::park_guarded(
+            &ctx.fabric().changed,
+            guard,
+            deadline,
+            aterm_control::park::Lane::SERVED,
+        );
     }
 }
 
@@ -8603,11 +8718,69 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
 #[cfg(test)]
 mod test_support {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, Condvar, Mutex, RwLock};
+    use std::time::{Duration, Instant};
 
     use aterm_session::SessionId;
 
     use super::{FabricFact, FabricSession, Registry, SessionFabric, Timeline};
+
+    /// What every record rings, as aterm-gui's timeline rings its session's
+    /// watchers on each append: the wake the push lane and the session log's
+    /// readers wait on. A count of rings under a condvar.
+    #[derive(Default)]
+    pub(crate) struct Watchers {
+        rung: Mutex<u64>,
+        changed: Condvar,
+    }
+
+    impl Watchers {
+        fn ring(&self) {
+            *self.rung.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+            self.changed.notify_all();
+        }
+    }
+
+    /// One watcher of a session's [`Watchers`]: its waits answer whether the
+    /// session rang since the last one answered (or since it subscribed), every
+    /// ring between two waits coalesced into one wake.
+    pub(crate) struct Subscription {
+        watchers: Arc<Watchers>,
+        seen: std::cell::Cell<u64>,
+    }
+
+    impl Subscription {
+        /// A watcher of `watchers`, rung from now on.
+        pub(crate) fn single(watchers: &Arc<Watchers>) -> Self {
+            let seen = *watchers.rung.lock().unwrap_or_else(|p| p.into_inner());
+            Self {
+                watchers: Arc::clone(watchers),
+                seen: std::cell::Cell::new(seen),
+            }
+        }
+
+        /// Whether the session rang, waiting at most `bound` for a ring.
+        pub(crate) fn wait(&self, bound: Duration) -> bool {
+            let until = Instant::now() + bound;
+            let mut rung = self.watchers.rung.lock().unwrap_or_else(|p| p.into_inner());
+            loop {
+                if *rung > self.seen.get() {
+                    self.seen.set(*rung);
+                    return true;
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                rung = self
+                    .watchers
+                    .changed
+                    .wait_timeout(rung, left)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+        }
+    }
 
     /// One timeline record.
     pub(crate) struct Event {
@@ -8650,11 +8823,13 @@ mod test_support {
         }
     }
 
-    /// A session: its id, its fabric endpoint and its timeline.
+    /// A session: its id, its fabric endpoint, its timeline and the watchers
+    /// every record rings.
     pub(crate) struct SessionCtx {
         pub(crate) self_id: SessionId,
         pub(crate) fabric: Arc<SessionFabric>,
         pub(crate) timeline: Arc<Mutex<TestTimeline>>,
+        pub(crate) watchers: Arc<Watchers>,
     }
 
     impl FabricSession for SessionCtx {
@@ -8669,12 +8844,16 @@ mod test_support {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .record(kind, payload);
+            self.watchers.ring();
         }
         fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
-            self.timeline
+            let owed = self
+                .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record_fact(kind, payload, fact)
+                .record_fact(kind, payload, fact);
+            self.watchers.ring();
+            owed
         }
         fn fabric_changed(&self) {}
         fn holder_token(&self) -> Option<String> {
@@ -8700,6 +8879,7 @@ mod test_support {
                 self_id: sid,
                 fabric: Arc::default(),
                 timeline: Arc::default(),
+                watchers: Arc::default(),
             }),
             local_id,
         }
@@ -9683,7 +9863,7 @@ mod inbox_hold {
         assert!(cmd_inbox(&ctx, "--peek").contains(" seen=2 "));
         // So does every read of the topic set: the bridge's backstop for an
         // `inbox seen` it never heard.
-        assert!(cmd_topic(&ctx, "ls").0.starts_with("OK 0 seen=2\n"));
+        assert!(cmd_topic(&ctx, "ls").starts_with("OK 0 seen=2\n"));
         // `since=` selects, `<n>` keeps the newest, and what a bounded reply did
         // not carry is `pending=`.
         assert_eq!(rows(&cmd_inbox(&ctx, "since=2 --peek")).len(), 1);
@@ -9718,12 +9898,14 @@ mod inbox_hold {
 
     /// THE SESSION LOG'S ONE TYPED HOOK (session log phase 3B, addendum A14):
     /// each fabric site hands its record's facts — ids, words and offsets,
-    /// never a body — to `record_fact` in the record's own call, and the
-    /// verb's wake follows exactly when the hook owes one, once per record.
-    /// NEGATIVE CONTROLS: a redelivered offset, a repeated `inbox seen` and a
-    /// hold that moves nothing hand no fact and wake nobody.
+    /// never a body — to `record_fact` in the record's own call. A bridge
+    /// verb's wake follows exactly when the hook owes one, once per record;
+    /// the session's own verbs (`post`, `inbox seen`) ring its watchers with
+    /// the record itself. NEGATIVE CONTROLS: a redelivered offset, a repeated
+    /// `inbox seen` and a hold that moves nothing hand no fact and wake nobody.
     #[test]
     fn every_fabric_site_hands_its_facts_to_the_one_hook() {
+        use std::time::Duration;
         let store = new_store();
         let (sid, ctx) = registered(&store);
         let woke = std::cell::Cell::new(0u32);
@@ -9734,18 +9916,16 @@ mod inbox_hold {
         let line = format!("{sid} off=7 from=h-a kind=task trust=human text=SECRET%20BODY");
         assert_eq!(cmd_deliver_waking(&store, &line, &wake), "OK 1\n");
         assert_eq!(cmd_deliver_waking(&store, &line, &wake), "OK 1\n");
-        let session_wake = || wake(&ctx.self_id);
-        let _ = cmd_post_waking(
-            &ctx,
-            "to=@s-peer kind=ask --wait=0 SECRET-POST",
-            None,
-            &session_wake,
-        );
+        let watcher = test_support::Subscription::single(&ctx.watchers);
+        let _ = cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 SECRET-POST", None);
+        assert!(watcher.wait(Duration::ZERO), "the post's record rang");
         let landed = format!("{sid} landed=1 off=9");
         assert_eq!(cmd_deliver_waking(&store, &landed, &wake), "OK\n");
         assert_eq!(cmd_deliver_waking(&store, &landed, &wake), "OK\n");
-        let _ = cmd_inbox_seen_waking(&ctx, "1 handled", &session_wake);
-        let _ = cmd_inbox_seen_waking(&ctx, "1 handled", &session_wake);
+        let _ = watcher.wait(Duration::ZERO);
+        let _ = cmd_inbox_seen(&ctx, "1 handled");
+        assert!(watcher.wait(Duration::ZERO), "the seen's record rang");
+        let _ = cmd_inbox_seen(&ctx, "1 handled");
         let hold = |rest: &str| {
             cmd_hold_waking(&store, &format!("{sid} {rest}"), HoldIssuer::Owner, &wake)
         };
@@ -9765,10 +9945,9 @@ mod inbox_hold {
             ]
         );
         assert!(facts.iter().all(|f| !f.contains("SECRET")), "{facts:?}");
-        // One wake per fact: the post's and the seen's own wakes run for
-        // every answered verb (their `events` wake), the others only when owed.
-        let seen_and_post_wakes = 1 + 2;
-        assert_eq!(woke.get(), 4 + seen_and_post_wakes, "{facts:?}");
+        // One bridge-verb wake per fact it owes: the delivery's, the landing's
+        // and the two holds'.
+        assert_eq!(woke.get(), 4, "{facts:?}");
     }
 
     /// `trust=` is the RECEIVER's verdict and the endpoint refuses a label it does
@@ -9836,12 +10015,17 @@ mod inbox_hold {
             "paste",
             "paste-bin",
             "mouse",
-            // `pointer` sits here with `mouse`: it was once exempted on the false
-            // premise that it "synthesizes no mouse event". `pointer move` drives
-            // `App::on_cursor_moved` — winit's own `CursorMoved` entry point — and
-            // under DEC 1000/1002/1003 that motion is reported straight to the
-            // program on the PTY. A halted driver could steer a mouse-reporting
-            // TUI with it.
+            // `pointer` sits here with `mouse`, and once spent a rung outside the
+            // halt on the false premise that it "synthesizes no mouse event".
+            // `pointer move` drives `App::on_cursor_moved` — winit's own
+            // `CursorMoved` entry point — and under DEC 1000/1002/1003 that motion
+            // is reported straight to the program on the PTY. A halted driver could
+            // steer a mouse-reporting TUI with it.
+            //
+            // The verb table's check passes with `pointer` on EITHER side: it proves
+            // every mutating row DECLARED an input class, not that the class is true.
+            // Whether a verb's effect is observable by the program on the far side of
+            // the PTY is no fact the table can check, so this row is the assertion.
             "pointer",
             "resize",
             // `focus` writes the DEC 1004 focus reports to the PTY (`input.rs`,
@@ -9896,7 +10080,7 @@ mod inbox_hold {
             "await",
             "subscribe",
             // `spawn` MINTS a session rather than driving or retiring one; the
-            // residual it leaves is named in `is_pty_reaching`'s doc.
+            // residual it leaves is argued at its verb row.
             "spawn",
         ] {
             assert!(
@@ -10352,6 +10536,113 @@ mod inbox_hold {
                 started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
                 "the receipt wait sat out its bound instead of waking at the \
                  stale horizon: {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
+    /// A PARKED FETCH LOOKS AGAIN AT THE STALE HORIZON, as the post waits do
+    /// ([`park_until`]). Nothing signals its condvar when a bridge in debt
+    /// simply stops answering, and a served lane's slices ask only after the
+    /// caller, so without the bound the fetch sat out its whole read. Parked
+    /// for the longest bound there is (`WAIT_MAX_MS`), the minute's hang
+    /// detector tells the horizon 300 ms out from the bound however loaded
+    /// the machine. NEGATIVE CONTROL: with nothing owed the horizon is a whole
+    /// [`STALE_AFTER`] out, and a fetch with a shorter bound sits it out and
+    /// answers `ERR timeout`.
+    #[test]
+    fn a_parked_fetch_wakes_at_the_stale_horizon_rather_than_at_its_bound() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            assert_eq!(
+                inbox_get_at_within(&ctx, 7, std::time::Duration::from_millis(50)),
+                "ERR timeout off=7\n",
+                "nothing owed: no debt can go stale inside the park"
+            );
+
+            // A queued post puts the bridge in debt.
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note one", None), "OK 1\n");
+            backdate_work_owed(STALE_AFTER - std::time::Duration::from_millis(300));
+            let started = std::time::Instant::now();
+            assert_eq!(
+                inbox_get_at_within(&ctx, 7, std::time::Duration::from_millis(WAIT_MAX_MS)),
+                "ERR fabric stale off=7\n"
+            );
+            assert!(
+                started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                "the fetch sat out its bound instead of waking at the stale \
+                 horizon: {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
+    /// A WAIT PARKED WITH NOTHING OWED LOOKS AGAIN BY THE HORIZON OF A DEBT
+    /// ARMED AFTER IT PARKED ([`park_until`]). Arming the owed clock wakes no
+    /// parked waiter — another session's `post` notifies only its own condvar
+    /// — so a park that ran to its bound sat out a `WAIT_MAX_MS` receipt wait
+    /// for an `ERR timeout` the link had made `ERR fabric stale` six seconds
+    /// in. The fetch is the waiter here because it lists itself and rings its
+    /// watchers under the guard it parks with: once the test holds that guard,
+    /// the fetch is parked, and every look it took saw nothing owed. It takes
+    /// one [`STALE_AFTER`]: no event ends the park, which is the case under
+    /// test, and a backdate cannot shorten a sleep already taken. Parked for
+    /// `WAIT_MAX_MS`, the minute's hang detector tells the horizon from the
+    /// bound. NEGATIVE CONTROL: with no debt armed, a short read answers `ERR
+    /// timeout`.
+    #[test]
+    fn a_wait_parked_with_nothing_owed_answers_stale_when_a_later_debt_goes_stale() {
+        use std::time::Duration;
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store);
+            let (_peer_sid, peer) = registered_as(&store, 2);
+            attach_up(&store, next_bridge_generation());
+            assert_eq!(
+                inbox_get_at_within(&ctx, 7, Duration::from_millis(50)),
+                "ERR timeout off=7\n",
+                "no debt armed: the read ends at its bound"
+            );
+
+            let watcher = test_support::Subscription::single(&ctx.watchers);
+            let started = std::time::Instant::now();
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    inbox_get_at_within(&ctx, 7, Duration::from_millis(WAIT_MAX_MS))
+                })
+            };
+            assert!(
+                watcher.wait(aterm_spec::wait::MUST_HAPPEN),
+                "the parked fetch woke its watchers"
+            );
+            {
+                let inbox = ctx.fabric.lock();
+                assert!(
+                    inbox
+                        .fetches
+                        .iter()
+                        .any(|(o, slot)| *o == 7 && matches!(slot, FetchSlot::Pending)),
+                    "the fetch released its guard, so it is parked"
+                );
+                assert_eq!(stale_in(), None, "and it parked with nothing owed");
+            }
+
+            // Another session hands the bridge work, and the bridge says
+            // nothing: the link goes stale with the fetch still parked.
+            assert_eq!(cmd_post(&peer, "to=h-andrew kind=note two", None), "OK 1\n");
+            backdate_work_owed(STALE_AFTER);
+            assert_eq!(fabric_state(), "stale");
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "ERR fabric stale off=7\n"
+            );
+            assert!(
+                started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                "the fetch sat out its bound instead of looking again by the \
+                 horizon of the debt armed after it parked: {:?}",
                 started.elapsed()
             );
         });
@@ -10858,7 +11149,7 @@ mod inbox_hold {
                 .unwrap()
                 .since(None)
                 .filter(|e| e.kind == "hold")
-                .map(|e| e.payload.clone())
+                .map(|e| e.payload.to_string())
                 .collect();
             assert_eq!(
                 events,
@@ -11091,63 +11382,39 @@ mod inbox_hold {
         );
     }
 
-    /// **AN ACCEPTED POST WAKES ITS WATCHERS ONCE, BEFORE ITS `--wait` PARKS;
-    /// A REFUSED ONE NEVER.** The control seam's `wake` is the session's
-    /// subscriber notify, and the bridge's push lane is one of those
-    /// subscribers: `EVENT <sid> post` is what makes it drain the outbox. A
-    /// wake that came after the wait would come after the landing the wait is
-    /// waiting for, so the parked post here receives its wake while it is still
-    /// parked, and only then is its landing reported.
+    /// **AN ACCEPTED POST WAKES ITS WATCHERS, BEFORE ITS `--wait` PARKS; A
+    /// REFUSED ONE NEVER.** The post's `post` record rings the session's
+    /// watchers, and the bridge's push lane is one of them: `EVENT <sid> post`
+    /// is what makes it drain the outbox. A wake that came after the wait
+    /// would come after the landing the wait is waiting for, so the parked
+    /// post here wakes its watcher while it is still parked, and only then is
+    /// its landing reported.
     #[test]
     fn an_accepted_post_wakes_before_its_wait_parks_and_a_refused_one_never() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
         with_link(|| {
             let store = new_store();
             let (sid, ctx) = registered(&store);
             attach_up(&store, next_bridge_generation());
-            let wakes = AtomicUsize::new(0);
-            let count = || {
-                wakes.fetch_add(1, Ordering::SeqCst);
-            };
-            assert!(
-                cmd_post_waking(&ctx, "to=@s-b kind=shout hi", None, &count)
-                    .starts_with("ERR usage")
-            );
-            assert_eq!(
-                wakes.load(Ordering::SeqCst),
-                0,
-                "a refused post wakes nobody"
-            );
-            assert_eq!(
-                cmd_post_waking(&ctx, "to=h-andrew kind=note hi", None, &count),
-                "OK 1\n"
-            );
-            assert_eq!(
-                wakes.load(Ordering::SeqCst),
-                1,
-                "an accepted post wakes once"
-            );
+            let watcher = test_support::Subscription::single(&ctx.watchers);
+            assert!(cmd_post(&ctx, "to=@s-b kind=shout hi", None).starts_with("ERR usage"));
+            assert!(!watcher.wait(Duration::ZERO), "a refused post wakes nobody");
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note hi", None), "OK 1\n");
+            assert!(watcher.wait(Duration::ZERO), "an accepted post wakes");
 
-            let (woke, heard) = std::sync::mpsc::channel();
             let poster = {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    cmd_post_waking(
-                        &ctx,
-                        "to=h-andrew kind=task --wait=30000 ship it",
-                        None,
-                        &move || {
-                            let _ = woke.send(());
-                        },
-                    )
+                    cmd_post(&ctx, "to=h-andrew kind=task --wait=30000 ship it", None)
                 })
             };
             // Inside the wait's own life: an unanswered post turns the link
             // `stale` at STALE_AFTER, which ends a parked wait — so a wake that
             // came only after the wait would come only after that.
-            heard
-                .recv_timeout(STALE_AFTER / 2)
-                .expect("the wake arrives while the post's wait is parked");
+            assert!(
+                watcher.wait(STALE_AFTER / 2),
+                "the wake arrives while the post's wait is parked"
+            );
             assert!(
                 !poster.is_finished(),
                 "nothing has landed, so the post is still parked in its wait"
@@ -11189,7 +11456,7 @@ mod inbox_hold {
                 .unwrap_or_else(|p| p.into_inner())
                 .since(None)
                 .rfind(|e| e.kind == "inbox-seen")
-                .map(|e| e.payload.clone())
+                .map(|e| e.payload.to_string())
                 .unwrap_or_default()
         };
         assert_eq!(broadcast(&store, &sid, 1000, "t", "b0"), "OK 1\n");
@@ -11224,44 +11491,54 @@ mod inbox_hold {
         );
     }
 
-    /// **`inbox seen` WAKES ITS WATCHERS ONCE, AFTER ITS `inbox-seen` ROW AND
-    /// WITH THE FABRIC LOCK RELEASED; A FORM THAT RECORDS NOTHING NEVER
-    /// DOES.** The bridge persists the refill floor and drains a receipt on
-    /// that event, and the push lane is the only road it takes — the bridge
-    /// has no idle poll — so without the wake a `--wait-ack` sender waited
-    /// out the push loop's 250 ms tick. Woken before the row, the woken pass
-    /// would find nothing and the row would wait for the tick again; woken
-    /// under the lock, the registry's lock would nest inside the fabric's.
-    ///
-    /// FAILS WITHOUT THE FIX: the seam took no wake, and `seen` woke nobody.
+    /// **A DELIVERY WAKES A `mail` WATCH.** The row's `inbox` record rings the
+    /// session's watchers under the inbox guard, so the push lane drains the
+    /// row on the wake its delivery causes, never on a liveness tick.
+    /// NEGATIVE CONTROL: a redelivery of the same offset is answered from the
+    /// dedup and records nothing, so it wakes nobody.
     #[test]
-    fn inbox_seen_wakes_its_watchers_after_its_row_and_a_refused_form_never() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    fn deliver_wakes_a_mail_watch() {
+        use std::time::Duration;
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let watcher = test_support::Subscription::single(&ctx.watchers);
+        assert_eq!(
+            deliver(&store, &sid, 10, "h-andrew", "task", "one"),
+            "OK 1\n"
+        );
+        assert!(watcher.wait(Duration::ZERO), "the delivery woke the watch");
+        assert_eq!(
+            deliver(&store, &sid, 10, "h-andrew", "task", "one"),
+            "OK 1\n"
+        );
+        assert!(!watcher.wait(Duration::ZERO), "a redelivery wakes nobody");
+    }
+
+    /// **`inbox seen` WAKES ITS WATCHERS WITH ITS `inbox-seen` ROW; A FORM
+    /// THAT RECORDS NOTHING NEVER DOES.** The bridge persists the refill floor
+    /// and drains a receipt on that event, and the push lane is the only road
+    /// it takes — the bridge has no idle poll. The record rings the session's
+    /// watchers, so a woken pass that reads the timeline finds the row.
+    ///
+    /// NEGATIVE CONTROL: the refused forms and the reads record nothing and
+    /// wake nobody.
+    #[test]
+    fn inbox_seen_wakes_its_watchers_with_its_row_and_a_refused_form_never() {
+        use std::time::Duration;
         let store = new_store();
         let (sid, ctx) = registered(&store);
         assert_eq!(
             deliver(&store, &sid, 10, "h-andrew", "task", "one"),
             "OK 1\n"
         );
-        let wakes = AtomicUsize::new(0);
-        let wake = || {
-            assert!(
-                ctx.fabric.inbox.try_lock().is_ok(),
-                "woken with the fabric lock held"
-            );
-            let last = ctx
-                .timeline
+        let watcher = test_support::Subscription::single(&ctx.watchers);
+        let last_kind = || {
+            ctx.timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .since(None)
                 .next_back()
-                .map(|e| e.kind);
-            assert_eq!(
-                last,
-                Some("inbox-seen"),
-                "woken before the row it announces"
-            );
-            wakes.fetch_add(1, Ordering::SeqCst);
+                .map(|e| e.kind)
         };
         for (form, reply) in [
             ("seen 9", "ERR no such message\n".to_string()),
@@ -11270,40 +11547,37 @@ mod inbox_hold {
             ("get 1", "OK 3\none".to_string()),
             ("--peek", cmd_inbox(&ctx, "--peek")),
         ] {
-            assert_eq!(cmd_inbox_verb(&ctx, form, &wake), reply, "{form}");
+            assert_eq!(cmd_inbox_verb(&ctx, form), reply, "{form}");
         }
-        assert_eq!(
-            wakes.load(Ordering::SeqCst),
-            0,
+        assert!(
+            !watcher.wait(Duration::ZERO),
             "nothing recorded, nobody woken"
         );
-        assert_eq!(cmd_inbox_verb(&ctx, "seen 1", &wake), "OK seen=1\n");
-        assert_eq!(
-            wakes.load(Ordering::SeqCst),
-            1,
-            "a bare seen moves the floor: one wake"
+        assert_eq!(cmd_inbox_verb(&ctx, "seen 1"), "OK seen=1\n");
+        assert!(
+            watcher.wait(Duration::ZERO),
+            "a bare seen moves the floor: woken"
         );
-        assert_eq!(cmd_inbox_verb(&ctx, "seen 1 handled", &wake), "OK seen=1\n");
-        assert_eq!(
-            wakes.load(Ordering::SeqCst),
-            2,
-            "a verdict owes a receipt: one wake"
+        assert_eq!(last_kind(), Some("inbox-seen"), "by the row it announces");
+        assert_eq!(cmd_inbox_verb(&ctx, "seen 1 handled"), "OK seen=1\n");
+        assert!(
+            watcher.wait(Duration::ZERO),
+            "a verdict owes a receipt: woken"
         );
     }
 
-    /// **A PARKED `inbox get @<off>` WAKES ITS WATCHERS AFTER QUEUEING ITS
-    /// FETCH AND BEFORE IT PARKS; ONE ANSWERED FROM THE RING NEVER DOES.** The
-    /// `fetch` row is the bridge's prompt to read the bus; the call parks
-    /// until that read is answered, so a wake that came after the park would
-    /// come only after the very answer it was to start — here, after the
-    /// read's own 10 s bound, as `ERR timeout`. The test answers the read
-    /// only once the wake has arrived, from inside it the outbox already lists
-    /// the fetch, and the fabric lock is free.
+    /// **A PARKED `inbox get @<off>` WAKES ITS WATCHERS WITH ITS `fetch` ROW,
+    /// BEFORE IT PARKS; ONE ANSWERED FROM THE RING NEVER DOES.** The `fetch`
+    /// row is the bridge's prompt to read the bus; the call parks until that
+    /// read is answered, so a wake that came after the park would come only
+    /// after the very answer it was to start — here, after the read's own 10 s
+    /// bound, as `ERR timeout`. The test answers the read only once the wake
+    /// has arrived and the outbox lists the fetch.
     ///
-    /// FAILS WITHOUT THE FIX: no wake arrives, and the hang detector fires
-    /// (or, with the wake after the park, the read answers `ERR timeout`).
+    /// NEGATIVE CONTROL: the ring read records nothing and wakes nobody.
     #[test]
     fn a_parked_fetch_wakes_its_watchers_before_it_parks_and_a_ring_read_never() {
+        use std::time::Duration;
         with_link(|| {
             let store = new_store();
             let (sid, ctx) = registered(&store);
@@ -11312,31 +11586,25 @@ mod inbox_hold {
                 deliver(&store, &sid, 10, "h-andrew", "task", "one"),
                 "OK 1\n"
             );
+            let watcher = test_support::Subscription::single(&ctx.watchers);
             assert_eq!(
-                cmd_inbox_verb(&ctx, "get @10", &|| panic!("a ring read woke the bridge")),
+                cmd_inbox_verb(&ctx, "get @10"),
                 "OK 3 off=10 from=h-andrew kind=task trust=agent\none"
             );
+            assert!(!watcher.wait(Duration::ZERO), "a ring read woke the bridge");
 
-            let (woke, heard) = std::sync::mpsc::channel();
             let reader = {
-                let (ctx, store, sid) = (ctx.clone(), store.clone(), sid.clone());
-                std::thread::spawn(move || {
-                    let probe = ctx.clone();
-                    cmd_inbox_verb(&ctx, "get @7", &move || {
-                        // The lock first: listing the outbox under it would
-                        // deadlock this thread rather than fail the test.
-                        let unlocked = probe.fabric.inbox.try_lock().is_ok();
-                        let queued = unlocked
-                            && cmd_outbox(&store, "").contains(&format!("fetch sid={sid} off=7\n"));
-                        let _ = woke.send((unlocked, queued));
-                    })
-                })
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_verb(&ctx, "get @7"))
             };
-            let (unlocked, queued) = heard
-                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                .expect("a parked fetch woke its watchers");
-            assert!(unlocked, "woken with the fabric lock held");
-            assert!(queued, "woken before the fetch was on the outbox peek");
+            assert!(
+                watcher.wait(aterm_spec::wait::MUST_HAPPEN),
+                "a parked fetch woke its watchers"
+            );
+            assert!(
+                cmd_outbox(&store, "").contains(&format!("fetch sid={sid} off=7\n")),
+                "woken with the fetch on the outbox peek"
+            );
             assert_eq!(
                 cmd_deliver(&store, &format!("{sid} fetched=7 err=no-record")),
                 "OK\n"
@@ -11551,7 +11819,7 @@ mod inbox_hold {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .since(None)
-                .map(|e| (e.kind.to_string(), e.payload.clone()))
+                .map(|e| (e.kind.to_string(), e.payload.to_string()))
                 .collect();
             // The lifecycle kinds a registered session already records (`spawned`)
             // are not this test's subject; the FABRIC kinds this scenario writes
@@ -11624,7 +11892,7 @@ mod inbox_hold {
                 .unwrap_or_else(|p| p.into_inner())
                 .since(None)
                 .filter(|e| e.kind == "inbox-seen")
-                .map(|e| e.payload.clone())
+                .map(|e| e.payload.to_string())
                 .collect();
             assert_eq!(
                 seen,
@@ -12241,7 +12509,7 @@ mod inbox_hold {
                     .unwrap_or_else(|p| p.into_inner())
                     .since(None)
                     .rfind(|e| e.kind == "inbox-seen")
-                    .map(|e| e.payload.clone())
+                    .map(|e| e.payload.to_string())
                     .unwrap_or_default()
             };
             assert_eq!(tell(format!("{}.0", "aa".repeat(16))), "OK\n");
@@ -12555,8 +12823,8 @@ mod inbox_hold {
             );
             assert_eq!(tell("b"), "OK forgot=1\n");
             assert_eq!(
-                wait_landing(&ctx, 1, std::time::Instant::now()),
-                Err("ERR log-replaced id=1\n".to_string()),
+                wait_landing(&ctx, 1, std::time::Instant::now()).err(),
+                Some("ERR log-replaced id=1\n".to_string()),
                 "the queued reply is reported dead, not published as a reply to B's unrelated offset"
             );
             assert!(!cmd_outbox(&store, "").contains("post sid="));
@@ -12812,11 +13080,11 @@ mod inbox_hold {
                 assert_eq!(outbox.contains("re=7"), same, "{name}: {outbox}");
                 assert!(outbox.contains("independent"), "{name}: {outbox}");
                 assert_eq!(
-                    wait_landing(&ctx, 1, std::time::Instant::now()),
+                    wait_landing(&ctx, 1, std::time::Instant::now()).err(),
                     if same {
-                        Err("ERR timeout id=1\n".to_string())
+                        Some("ERR timeout id=1\n".to_string())
                     } else {
-                        Err("ERR log-replaced id=1\n".to_string())
+                        Some("ERR log-replaced id=1\n".to_string())
                     },
                     "{name}"
                 );
@@ -12866,6 +13134,987 @@ mod inbox_hold {
                 .find(|l| l.contains(" re=70"))
                 .unwrap_or_else(|| panic!("no reply row: {listing}"));
             assert!(reply.contains(" re=70 re-id=2 "), "{reply}");
+        });
+    }
+
+    /// Wait, at most a minute (a hang detector), for the outbox peek to list
+    /// `sid`'s parked `inbox get @<off>`.
+    fn await_parked(store: &Store, sid: &str, off: u64) {
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        loop {
+            let peek = cmd_outbox(store, "");
+            if peek.contains(&format!("fetch sid={sid} off={off}\n")) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no `fetch off={off}` on the outbox peek within a minute; drain:\n{peek}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// The newest `inbox-seen` event's payload on `ctx`'s timeline.
+    fn last_inbox_seen(ctx: &SessionCtx) -> String {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .since(None)
+            .rfind(|e| e.kind == "inbox-seen")
+            .map(|e| e.payload.clone())
+            .unwrap_or_default()
+    }
+
+    /// **A MOVED GENERATION KEEPS WHAT NAMES A RECORD BELOW THE FORK, AND
+    /// ONLY THAT.** The bridge clamps at the fork `f` below which a moved
+    /// generation continues its log (a power loss under a weak tier, a
+    /// poisoned log's reopen), and a lane-3 bridge tells the endpoint so:
+    /// `link log <A.1> continues=20 was=<A.0>`. On A.0 the session was handed
+    /// two asks, at 7 (below the fork) and 40 (above it), decided both (a
+    /// receipt owed for each) and queued a reply to each while the broker was
+    /// down; two of its posts landed, at 9 and 41, and a receipt wait is armed
+    /// on the one at 9; two reads were answered off the bus (@3, @44) and two
+    /// more are parked (@5, @45). Told the move, everything that names 3, 5,
+    /// 7 and 9 STAYS — the reply `re=7` queued, receipt 1 owed on this log,
+    /// `@3` answered from what the bridge said, `@5` still parked for the
+    /// bridge, the wait on post 3 released by the ack the new generation
+    /// carries, and the dedup at 7 (a refill handing it again is the same
+    /// row) — and everything that names 40, 41, 44 and 45 GOES: the reply
+    /// `re=40` retired `log-replaced`, receipt 2 marked `log=earlier`, `@44`
+    /// read again, `@45` failed, post 4's wait `log-replaced`, and the new
+    /// generation's record at 40 a row of its own. The span is what is kept
+    /// and the refill floor resumes at the fork, where the bridge's own
+    /// `seen/` does.
+    ///
+    /// NEGATIVE CONTROL, run: the same move told BARE — all a lane-2 endpoint
+    /// is told — forgets everything, the reply, the receipt, the read and the
+    /// wait below the fork included, which is what every endpoint did before
+    /// lane 3.
+    #[test]
+    fn a_moved_generation_keeps_what_names_a_record_below_the_fork() {
+        let a0 = format!("{}.0", "aa".repeat(16));
+        let a1 = format!("{}.1", "aa".repeat(16));
+        for lineage in [true, false] {
+            with_link(|| {
+                let store = new_store();
+                let (sid, ctx) = registered(&store);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                let case = format!("lineage={lineage}");
+                let tell = |line: &str| cmd_link(&store, &format!("log {line}"), Some(generation));
+                let read = |off: u64| {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || cmd_inbox_get(&ctx, &format!("@{off}")))
+                };
+                let fetched = |off: u64, text: &str| {
+                    cmd_deliver(
+                        &store,
+                        &format!(
+                            "{sid} fetched={off} from=s-peer@n-lab kind=note trust=agent text={text}"
+                        ),
+                    )
+                };
+                let ack = |off: u64, re: u64| {
+                    cmd_deliver(
+                        &store,
+                        &format!(
+                            "{sid} off={off} from=s-peer@n-lab kind=ack trust=agent re={re} \
+                             verdict=handled text=ack"
+                        ),
+                    )
+                };
+                let reply_row = |re: u64| {
+                    let listing = cmd_inbox(&ctx, "--peek --meta");
+                    listing
+                        .lines()
+                        .find(|l| l.contains(&format!(" re={re}")))
+                        .unwrap_or_else(|| panic!("{case}: no row re={re}: {listing}"))
+                        .to_string()
+                };
+
+                // GENERATION 0 of log A.
+                assert_eq!(tell(&a0), "OK\n", "{case}");
+                assert_eq!(
+                    deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "below"),
+                    "OK 1\n"
+                );
+                assert_eq!(
+                    deliver(&store, &sid, 40, "s-peer@n-lab", "ask", "above"),
+                    "OK 2\n"
+                );
+                assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+                assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
+                assert_eq!(
+                    cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply-below", None),
+                    "OK 1\n"
+                );
+                assert_eq!(
+                    cmd_post(&ctx, "to=@s-peer kind=answer re=40 reply-above", None),
+                    "OK 2\n"
+                );
+                for (id, off) in [(3, 9), (4, 41)] {
+                    assert_eq!(
+                        cmd_post(&ctx, &format!("to=@s-peer kind=note landed-at-{off}"), None),
+                        format!("OK {id}\n")
+                    );
+                    assert_eq!(
+                        cmd_deliver(&store, &format!("{sid} landed={id} off={off}")),
+                        "OK\n"
+                    );
+                }
+                // Armed for as long as the hang detector: only an ack or the
+                // move ends it.
+                let hang_ms = u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis())
+                    .expect("a minute in milliseconds");
+                let waiter = {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || wait_receipt(&ctx, 3, 9, "", hang_ms))
+                };
+                for off in [3, 44] {
+                    let reader = read(off);
+                    await_parked(&store, &sid, off);
+                    assert_eq!(fetched(off, &format!("old-{off}")), "OK\n");
+                    let answer = reader.join().expect("the reader finished");
+                    assert!(answer.ends_with(&format!("\nold-{off}")), "{answer}");
+                }
+                let parked_below = read(5);
+                await_parked(&store, &sid, 5);
+                let parked_above = read(45);
+                await_parked(&store, &sid, 45);
+
+                // THE MOVE to generation 1, continuing generation 0 below 20.
+                let moved = if lineage {
+                    format!("{a1} continues=20 was={a0}")
+                } else {
+                    a1.clone()
+                };
+                assert_eq!(tell(&moved), "OK forgot=1\n", "{case}");
+                assert_eq!(tell(&a1), "OK\n", "{case}: the move is applied once");
+
+                // THE SPAN AND THE REFILL FLOOR, before any read below moves the
+                // span: what is kept of it, and the floor at the fork.
+                let header = cmd_inbox(&ctx, "0 --peek --meta");
+                let span = if lineage {
+                    " bus_head=7 oldest_on_bus=@3 "
+                } else {
+                    " bus_head=0 oldest_on_bus=- "
+                };
+                assert!(header.contains(span), "{case}: {header}");
+                assert_eq!(cmd_inbox_seen(&ctx, "2"), "OK seen=2\n");
+                assert_eq!(
+                    last_inbox_seen(&ctx),
+                    if lineage {
+                        "2 off=40 floor=20 seen=2"
+                    } else {
+                        "2 off=40 floor=- seen=2"
+                    },
+                    "{case}"
+                );
+
+                // THE READS.
+                assert_eq!(
+                    parked_above.join().expect("the reader finished"),
+                    "ERR fetch failed reason=log-replaced off=45\n",
+                    "{case}"
+                );
+                if lineage {
+                    await_parked(&store, &sid, 5);
+                    assert_eq!(fetched(5, "kept-5"), "OK\n");
+                    let answer = parked_below.join().expect("the reader finished");
+                    assert!(answer.ends_with("\nkept-5"), "{case}: {answer}");
+                    let cached = cmd_inbox_get(&ctx, "@3");
+                    assert!(
+                        cached.ends_with("\nold-3"),
+                        "{case}: answered once, kept: {cached}"
+                    );
+                } else {
+                    assert_eq!(
+                        parked_below.join().expect("the reader finished"),
+                        "ERR fetch failed reason=log-replaced off=5\n",
+                        "{case}"
+                    );
+                }
+                let again = read(44);
+                await_parked(&store, &sid, 44);
+                assert_eq!(fetched(44, "new-44"), "OK\n");
+                let answer = again.join().expect("the reader finished");
+                assert!(
+                    answer.ends_with("\nnew-44"),
+                    "{case}: read again on the new generation: {answer}"
+                );
+
+                // THE QUEUED REPLIES AND THE OWED RECEIPTS.
+                let outbox = cmd_outbox(&store, "");
+                assert_eq!(outbox.contains("reply-below"), lineage, "{case}: {outbox}");
+                assert!(!outbox.contains("reply-above"), "{case}: {outbox}");
+                assert_eq!(
+                    wait_landing(&ctx, 1, std::time::Instant::now()).err(),
+                    Some(if lineage {
+                        "ERR timeout id=1\n".to_string()
+                    } else {
+                        "ERR log-replaced id=1\n".to_string()
+                    }),
+                    "{case}"
+                );
+                assert_eq!(
+                    wait_landing(&ctx, 2, std::time::Instant::now()).err(),
+                    Some("ERR log-replaced id=2\n".to_string()),
+                    "{case}"
+                );
+                assert_eq!(
+                    outbox.contains(&format!("receipt sid={sid} rid=1 off=7 verdict=handled")),
+                    lineage,
+                    "{case}: {outbox}"
+                );
+                assert!(!outbox.contains(" rid=2 "), "{case}: {outbox}");
+                let earlier = cmd_outbox(&store, "earlier-receipts=1");
+                assert!(
+                    earlier.contains(
+                        " rid=2 off=40 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    ),
+                    "{case}: {earlier}"
+                );
+                assert_eq!(
+                    earlier.contains(
+                        " rid=1 off=7 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    ),
+                    !lineage,
+                    "{case}: {earlier}"
+                );
+
+                // THE LANDED POSTS: an ack on the new generation threads to the
+                // one below the fork and releases its wait; the one above it
+                // is another record's number now.
+                assert_eq!(ack(21, 9), "OK 3\n", "{case}");
+                assert_eq!(ack(22, 41), "OK 4\n", "{case}");
+                assert_eq!(
+                    reply_row(9).contains(" re=9 re-id=3 "),
+                    lineage,
+                    "{case}: {}",
+                    reply_row(9)
+                );
+                assert!(!reply_row(41).contains(" re-id="), "{}", reply_row(41));
+                assert_eq!(
+                    waiter.join().expect("the waiter finished"),
+                    if lineage {
+                        "OK 3 off=9 ack=handled msg=3\n"
+                    } else {
+                        "ERR log-replaced id=3 off=9\n"
+                    },
+                    "{case}"
+                );
+                assert_eq!(
+                    wait_receipt(&ctx, 4, 41, "", 0),
+                    "ERR log-replaced id=4 off=41\n",
+                    "{case}"
+                );
+
+                // THE DEDUP: 7 is the same record on both generations, 40 is not.
+                assert_eq!(
+                    deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "below"),
+                    if lineage { "OK 1\n" } else { "OK 5\n" },
+                    "{case}"
+                );
+                assert_eq!(
+                    deliver(&store, &sid, 40, "s-peer@n-lab", "ask", "new-40"),
+                    if lineage { "OK 5\n" } else { "OK 6\n" },
+                    "{case}"
+                );
+            });
+        }
+    }
+
+    /// **ACROSS TWO MOVES, AN OFFSET IS KEPT ONLY BELOW BOTH FORKS** — the
+    /// LOWEST of them, as astream's `LogIdentity::continues` takes the least
+    /// common over every step: each move is applied once, and what one took
+    /// stays taken. On A.0 post 1 lands at 40, a row is delivered at 40, and
+    /// an ask at 35 is decided (a receipt owed). A.1 continues A.0 below 30:
+    /// all three are another record's number now (the receipt `log=earlier`),
+    /// and on A.1 post 2 lands at 40 and a new row is delivered there. A.2
+    /// continues A.1 below 50, so A.1's 40 is A.2's 40 — but A.0's 40 and 35
+    /// are not, because A.0 and A.2 agree only below 30. A reply at `re=40` on
+    /// A.2 threads to post 2, `inbox get @40` answers A.1's row, A.1's record
+    /// at 40 handed again is the row it was, and the receipt for 35 is still
+    /// an earlier log's: never offered for A.2, where 35 is another record.
+    /// So with two waits parked on A.0's offsets ([`OffsetWatch`]): the one
+    /// on 35 ends, the one on 25 goes on.
+    ///
+    /// NEGATIVE CONTROL, run: a move that ASSIGNS what it keeps instead of
+    /// clearing only (`r.on_log = kept(r.off)`, `p.landed_on_log = …`,
+    /// `r.earlier_log = !kept(r.off)`, a watch stored `kept(w.off)` in
+    /// [`Inbox::forget_bus_offsets`]) judges by the NEWEST fork alone — the
+    /// mutant `Buggy == 2` of `aterm-models-session`'s
+    /// `fabric_reader_resume_model` — and keeps A.0's 40 and 35 (both below
+    /// 50): this test fails at the reply threading to A.0's post 1 (the
+    /// posts), the row at 40 answered from A.0 (the rows), the receipt
+    /// offered again at 35 (the receipts) and the wait on 35 going on (the
+    /// watches), whichever one of the four is the mutant.
+    #[test]
+    fn across_two_moves_an_offset_is_kept_only_below_both_forks() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let a = |g: u64| format!("{}.{g}", "aa".repeat(16));
+            let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+            let land = |id: u64, off: u64| {
+                assert_eq!(
+                    cmd_post(&ctx, &format!("to=@s-peer kind=note on-{id}"), None),
+                    format!("OK {id}\n")
+                );
+                assert_eq!(
+                    cmd_deliver(&store, &format!("{sid} landed={id} off={off}")),
+                    "OK\n"
+                );
+            };
+            let receipt_at_35 = || {
+                (
+                    cmd_outbox(&store, "").contains(" rid=1 off=35 "),
+                    cmd_outbox(&store, "earlier-receipts=1").contains(
+                        " rid=1 off=35 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n",
+                    ),
+                )
+            };
+
+            assert_eq!(tell(a(0)), "OK\n");
+            land(1, 40);
+            assert_eq!(
+                deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a0-at-40"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 35, "s-peer@n-lab", "ask", "a0-at-35"),
+                "OK 2\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
+            assert_eq!(receipt_at_35(), (true, false), "owed on A.0");
+            // What two parked waits hold ([`OffsetWatch`]): A.0's 35 and 25.
+            let (watch_35, watch_25) = {
+                let mut inbox = ctx.fabric.lock();
+                (inbox.watch(35, true), inbox.watch(25, true))
+            };
+            assert_eq!(
+                tell(format!("{} continues=30 was={}", a(1), a(0))),
+                "OK forgot=1\n"
+            );
+            assert_eq!(receipt_at_35(), (false, true), "35 is at or above 30");
+            land(2, 40);
+            assert_eq!(
+                deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a1-at-40"),
+                "OK 3\n",
+                "A.1's record at 40 is not A.0's"
+            );
+            assert_eq!(
+                tell(format!("{} continues=50 was={}", a(2), a(1))),
+                "OK forgot=1\n"
+            );
+
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off=55 from=s-peer@n-lab kind=answer trust=agent re=40 text=re"
+                    )
+                ),
+                "OK 4\n"
+            );
+            let listing = cmd_inbox(&ctx, "--peek --meta");
+            let reply = listing
+                .lines()
+                .find(|l| l.contains(" re=40"))
+                .unwrap_or_else(|| panic!("no reply row: {listing}"));
+            assert!(
+                reply.contains(" re=40 re-id=2 "),
+                "the reply answers A.1's post, which A.2 still holds: {reply}"
+            );
+            assert_eq!(
+                cmd_inbox_get(&ctx, "@40"),
+                "OK 8 off=40 from=s-peer@n-lab kind=note trust=agent\na1-at-40",
+                "A.1's row, not A.0's"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a1-at-40"),
+                "OK 3\n",
+                "A.1's record handed again on A.2 is the row it was"
+            );
+            assert_eq!(
+                receipt_at_35(),
+                (false, true),
+                "A.2 holds 35 below its own fork, but not A.0's record there"
+            );
+            assert!(!watch_35.on_log(), "a wait on A.0's 35 ends: taken at 30");
+            assert!(watch_25.on_log(), "a wait on A.0's 25 goes on: below both");
+            // A wait that ended drops its watch, and the next registration
+            // prunes it: the list holds the parked waits, never the history.
+            drop((watch_35, watch_25));
+            let _armed = ctx.fabric.lock().watch(1, true);
+            assert_eq!(ctx.fabric.lock().watches.len(), 1);
+        });
+    }
+
+    /// **A SESSION AHEAD OF THE BRIDGE'S WITNESS KEEPS WHAT ITS CHAIN KEEPS**
+    /// ([`LogClock::keep_below`]). A bridge told the endpoint of A.1 (fork
+    /// 50) and died before it recorded the move; the log moved again, to A.2,
+    /// and the next bridge — its witness still A.0 — names `was=A.0` and the
+    /// fork of the whole chain, 30. The session holds A.1: its row at 10 is
+    /// below 30 and is the row it was (a redelivery of 10 dedups), its row at
+    /// 40 is not (a record at 40 is a new row), and a receipt at 35 is an
+    /// earlier log's. NEGATIVE CONTROL, in the same test: a session carried
+    /// on ANOTHER log (`bb….0`) forgets everything under the same line.
+    #[test]
+    fn a_session_ahead_of_the_bridges_witness_keeps_below_the_chains_fork() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let a = |g: u64| format!("{}.{g}", "aa".repeat(16));
+            let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+            assert_eq!(tell(a(0)), "OK\n");
+            assert_eq!(
+                deliver(&store, &sid, 10, "s-peer@n-lab", "note", "a0-at-10"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 35, "s-peer@n-lab", "ask", "a0-at-35"),
+                "OK 2\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a0-at-40"),
+                "OK 3\n"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
+            // The move the dead bridge told: A.1, below 50 the same.
+            assert_eq!(
+                tell(format!("{} continues=50 was={}", a(1), a(0))),
+                "OK forgot=1\n"
+            );
+            // The next bridge's line, from its own (older) witness.
+            assert_eq!(
+                tell(format!("{} continues=30 was={}", a(2), a(0))),
+                "OK forgot=1\n"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 10, "s-peer@n-lab", "note", "a0-at-10"),
+                "OK 1\n",
+                "below the chain's fork: the row it was"
+            );
+            assert_eq!(
+                deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a2-at-40"),
+                "OK 4\n",
+                "at or above it: A.2's record at 40 is a new row"
+            );
+            assert!(
+                cmd_outbox(&store, "earlier-receipts=1").contains(
+                    " rid=1 off=35 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                ),
+                "the receipt at 35 is an earlier log's"
+            );
+
+            // The control: a session whose clock names another log.
+            let other = new_store();
+            let (other_sid, _other_ctx) = registered(&other);
+            let other_link =
+                |line: String| cmd_link(&other, &format!("log {line}"), Some(generation));
+            let b0 = format!("{}.0", "bb".repeat(16));
+            // The link's own clock is the instance's, one per process: moving it
+            // to another log is a change whatever this store held.
+            assert!(other_link(b0).starts_with("OK"));
+            assert_eq!(
+                deliver(&other, &other_sid, 10, "s-peer@n-lab", "note", "b0-at-10"),
+                "OK 1\n"
+            );
+            assert_eq!(
+                other_link(format!("{} continues=30 was={}", a(3), a(0))),
+                "OK forgot=1\n"
+            );
+            assert_eq!(
+                deliver(&other, &other_sid, 10, "s-peer@n-lab", "note", "a3-at-10"),
+                "OK 2\n",
+                "a session on another log keeps nothing"
+            );
+        });
+    }
+
+    /// **`link log … continues=` TAKES ONLY AN EARLIER GENERATION OF THE SAME
+    /// LOG**, both tokens or neither, each once, in either order — what
+    /// astream's `LogIdentity::continues` ever answers for. Every other form
+    /// is a usage error that changes nothing: the offset at 7 on A.0 still
+    /// dedups after each. From a bridge that no longer owns the link, `OK
+    /// stale=1` and nothing changes either. The control is the well-formed
+    /// line, tokens reversed: it is applied (`forgot=1`), and 7 is still the
+    /// row it was, below the fork.
+    #[test]
+    fn link_log_continues_takes_only_an_earlier_generation_of_the_same_log() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, _ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let a = |g: u64| format!("{}.{g}", "aa".repeat(16));
+            let b0 = format!("{}.0", "bb".repeat(16));
+            let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+            let at_seven = || deliver(&store, &sid, 7, "s-peer@n-lab", "note", "seven");
+            assert_eq!(tell(a(0)), "OK\n");
+            assert_eq!(at_seven(), "OK 1\n");
+            for line in [
+                format!("{} continues=20", a(1)),
+                format!("{} was={}", a(1), a(0)),
+                format!("{} continues=x was={}", a(1), a(0)),
+                format!("{} continues=-1 was={}", a(1), a(0)),
+                format!("{} continues=20 was={b0}", a(1)),
+                format!("{} continues=20 was={}", a(1), a(1)),
+                format!("{} continues=20 was={}", a(1), a(2)),
+                format!("{} continues=20 was=nope", a(1)),
+                format!("{} continues=20 continues=21 was={}", a(1), a(0)),
+                format!("{} continues=20 was={} was={}", a(1), a(0), a(0)),
+                format!("{} continues=20 was={} extra", a(1), a(0)),
+            ] {
+                assert_eq!(tell(line.clone()), LINK_USAGE, "{line}");
+                assert_eq!(at_seven(), "OK 1\n", "nothing forgotten by {line}");
+            }
+            let stale = next_bridge_generation();
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {} continues=20 was={}", a(1), a(0)),
+                    Some(stale)
+                ),
+                "OK stale=1\n"
+            );
+            assert_eq!(at_seven(), "OK 1\n", "a stale lane forgot nothing");
+            assert_eq!(
+                tell(format!("{} was={} continues=20", a(1), a(0))),
+                "OK forgot=1\n"
+            );
+            assert_eq!(at_seven(), "OK 1\n", "7 is below the fork");
+        });
+    }
+
+    /// **A SESSION CARRIED ON THE GENERATION A MOVE CONTINUES KEEPS WHAT IS
+    /// BELOW THE FORK** ([`register_on_log`], [`LogClock`]). A seamless
+    /// update carries a session's clock (A.0), its owed receipts (for asks at
+    /// 7 and 40) and its queued replies (`re=7`, `re=40`). The successor's
+    /// bridge has already said `A.1 continues=20 was=A.0` when the adopted
+    /// session registers — and has since re-told A.1 bare, as a bridge that
+    /// re-attaches to the same generation does, which keeps what was said of
+    /// it: the receipt at 7 and the reply `re=7` are kept for the first
+    /// drain, and the ones at 40 are retired as an earlier log's.
+    /// NEGATIVE CONTROLS, run: carried on another log (B.0), or carried from
+    /// a build before the clock was carried (no `bus_log`), nothing is kept —
+    /// the move continues A.0, not those. A bare re-tell that dropped the
+    /// lineage ([`cmd_link_log`]'s `or_else(previous …)` removed) fails the
+    /// A.0 case: the receipt at 7 is an earlier log's.
+    #[test]
+    fn a_session_carried_on_the_continued_generation_keeps_what_is_below_the_fork() {
+        let a0 = format!("{}.0", "aa".repeat(16));
+        let a1 = format!("{}.1", "aa".repeat(16));
+        let b0 = format!("{}.0", "bb".repeat(16));
+        let carry = |on: &str| {
+            with_link(|| {
+                let store = new_store();
+                let (sid, ctx) = registered(&store);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                assert_eq!(
+                    cmd_link(&store, &format!("log {on}"), Some(generation)),
+                    "OK\n"
+                );
+                for (id, off) in [(1, 7), (2, 40)] {
+                    assert_eq!(
+                        deliver(&store, &sid, off, "s-peer@n-lab", "ask", "ask"),
+                        format!("OK {id}\n")
+                    );
+                    assert_eq!(
+                        cmd_inbox_seen(&ctx, &format!("{id} handled")),
+                        format!("OK seen={id}\n")
+                    );
+                    assert_eq!(
+                        cmd_post(
+                            &ctx,
+                            &format!("to=@s-peer kind=answer re={off} reply-{off}"),
+                            None
+                        ),
+                        format!("OK {id}\n")
+                    );
+                }
+                ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone())
+            })
+        };
+        let on_a0 = aterm_toml::to_string(&carry(&a0)).expect("outgoing carry");
+        let on_b0 = aterm_toml::to_string(&carry(&b0)).expect("outgoing carry");
+        let legacy = on_a0
+            .lines()
+            .filter(|line| !line.starts_with("bus_log ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (name, source, kept) in [
+            ("carried on A.0", on_a0.as_str(), true),
+            ("carried on B.0", on_b0.as_str(), false),
+            ("carried with no clock", legacy.as_str(), false),
+        ] {
+            with_link(|| {
+                let store = new_store();
+                registered(&store);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                assert_eq!(
+                    cmd_link(&store, &format!("log {a0}"), Some(generation)),
+                    "OK\n"
+                );
+                assert_eq!(
+                    cmd_link(
+                        &store,
+                        &format!("log {a1} continues=20 was={a0}"),
+                        Some(generation)
+                    ),
+                    "OK forgot=1\n"
+                );
+                // A bridge that re-attaches to the same generation tells it
+                // BARE: that A.1 continues A.0 is still true of the pair.
+                assert_eq!(
+                    cmd_link(&store, &format!("log {a1}"), Some(generation)),
+                    "OK\n"
+                );
+                let late = test_handle(2);
+                let ctx = late.ctx.clone();
+                let incoming: FabricCarry = aterm_toml::from_str(source).expect("incoming carry");
+                ctx.fabric.seed_carry(&incoming, &ctx.timeline);
+                register_on_log(&ctx, || {
+                    store
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .register(late);
+                });
+                let outbox = cmd_outbox(&store, "");
+                assert_eq!(
+                    outbox.contains(" rid=1 off=7 verdict=handled"),
+                    kept,
+                    "{name}: {outbox}"
+                );
+                assert!(!outbox.contains(" rid=2 "), "{name}: {outbox}");
+                assert_eq!(outbox.contains("reply-7"), kept, "{name}: {outbox}");
+                assert!(!outbox.contains("reply-40"), "{name}: {outbox}");
+                assert_eq!(
+                    wait_landing(&ctx, 2, std::time::Instant::now()).err(),
+                    Some("ERR log-replaced id=2\n".to_string()),
+                    "{name}"
+                );
+            });
+        }
+    }
+
+    /// **WHAT A SESSION DECIDES AFTER THE MOVE GOES BY WHAT THE MOVE KEPT.**
+    /// On A.0 a note is delivered at 3 and read (`inbox seen 1`), and asks at
+    /// 7 and 40 wait unread. The bridge says `A.1 continues=20 was=A.0`, and
+    /// only then does the agent look again and decide. The refill floor its
+    /// bare `inbox seen` reports is the unread ask at 7, below the fork — not
+    /// the fork, which would start a successor's refill past it and never
+    /// offer it again. The verdict on 7 owes its receipt on A.1 (`receipt
+    /// rid=1 off=7`, which settles the deadline the asker's bridge kept below
+    /// the fork); the one on 40 is an earlier log's (`log=earlier`, retired by
+    /// the bridge rather than put on A.1, where 40 is another record).
+    ///
+    /// NEGATIVE CONTROL, run: the same move told BARE (all a lane-2 endpoint
+    /// is told) reports no floor and marks both receipts earlier. By hand,
+    /// each failing this test: the verdict rule before lineage (any move
+    /// makes a row's receipt an earlier log's), and a floor that counts only
+    /// the rows delivered after the move.
+    #[test]
+    fn a_verdict_given_after_the_move_owes_its_receipt_below_the_fork() {
+        let a0 = format!("{}.0", "aa".repeat(16));
+        let a1 = format!("{}.1", "aa".repeat(16));
+        for lineage in [true, false] {
+            with_link(|| {
+                let store = new_store();
+                let (sid, ctx) = registered(&store);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                let case = format!("lineage={lineage}");
+                let tell = |line: &str| cmd_link(&store, &format!("log {line}"), Some(generation));
+                assert_eq!(tell(&a0), "OK\n", "{case}");
+                assert_eq!(
+                    deliver(&store, &sid, 3, "s-peer@n-lab", "note", "read"),
+                    "OK 1\n"
+                );
+                assert_eq!(
+                    deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "below"),
+                    "OK 2\n"
+                );
+                assert_eq!(
+                    deliver(&store, &sid, 40, "s-peer@n-lab", "ask", "above"),
+                    "OK 3\n"
+                );
+                assert_eq!(cmd_inbox_seen(&ctx, "1"), "OK seen=1\n");
+                assert_eq!(last_inbox_seen(&ctx), "1 off=3 floor=7 seen=1", "{case}");
+
+                let moved = if lineage {
+                    format!("{a1} continues=20 was={a0}")
+                } else {
+                    a1.clone()
+                };
+                assert_eq!(tell(&moved), "OK forgot=1\n", "{case}");
+
+                assert_eq!(cmd_inbox_seen(&ctx, "1"), "OK seen=1\n");
+                assert_eq!(
+                    last_inbox_seen(&ctx),
+                    if lineage {
+                        "1 off=3 floor=7 seen=1"
+                    } else {
+                        "1 off=3 floor=- seen=1"
+                    },
+                    "{case}: the unread ask below the fork is still the floor"
+                );
+                assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
+                assert_eq!(cmd_inbox_seen(&ctx, "3 handled"), "OK seen=3\n");
+                let outbox = cmd_outbox(&store, "");
+                assert_eq!(
+                    outbox.contains(&format!("receipt sid={sid} rid=1 off=7 verdict=handled")),
+                    lineage,
+                    "{case}: {outbox}"
+                );
+                assert!(!outbox.contains(" rid=2 "), "{case}: {outbox}");
+                let earlier = cmd_outbox(&store, "earlier-receipts=1");
+                assert!(
+                    earlier.contains(
+                        " rid=2 off=40 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    ),
+                    "{case}: {earlier}"
+                );
+                assert_eq!(
+                    earlier.contains(
+                        " rid=1 off=7 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    ),
+                    !lineage,
+                    "{case}: {earlier}"
+                );
+            });
+        }
+    }
+
+    /// How many waits of `ctx` hold a live [`OffsetWatch`]: what says a
+    /// spawned `await inbox re=` has armed before the test moves the log.
+    fn armed_watches(ctx: &SessionCtx) -> usize {
+        ctx.fabric
+            .lock()
+            .watches
+            .iter()
+            .filter(|w| w.strong_count() > 0)
+            .count()
+    }
+
+    /// **`await inbox re=` FOLLOWS WHAT THE MOVE KEPT**, armed before it or
+    /// after. On A.0 post 1 lands at 9 and post 2 at 41, a reply to post 1
+    /// arrives at 15 (`re=9`, row 1), and two waits are parked: one on
+    /// `re=9` past that reply (`since=1`) and one on `re=41`. The bridge says
+    /// `A.1 continues=20 was=A.0`. The wait on 41 ends `ERR log-replaced
+    /// re=41`: its record is gone. The wait on 9 goes on, and a wait armed
+    /// AFTER the move on `re=9` latches the reply that came at 15 on A.0,
+    /// whose own offset A.1 still holds — and so the record its `re=` names.
+    /// An ack to post 1 then arrives on A.1, at 21, and releases the parked
+    /// wait on 9.
+    ///
+    /// NEGATIVE CONTROL, run: the move told BARE (a lane-2 endpoint) ends
+    /// both parked waits `log-replaced`, and the reply at 15 is an earlier
+    /// log's, which the wait armed after the move does not latch (`OK
+    /// timeout`). By hand, each failing this test: a wait ended by any move
+    /// (the rule before lineage), and a latch on the rows delivered after
+    /// the move alone.
+    #[test]
+    fn await_inbox_re_follows_what_the_move_kept() {
+        let a0 = format!("{}.0", "aa".repeat(16));
+        let a1 = format!("{}.1", "aa".repeat(16));
+        let hang_ms = u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis())
+            .expect("a minute in milliseconds");
+        for lineage in [true, false] {
+            with_link(|| {
+                let store = new_store();
+                let (sid, ctx) = registered(&store);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                let case = format!("lineage={lineage}");
+                let tell = |line: &str| cmd_link(&store, &format!("log {line}"), Some(generation));
+                let park = |args: &'static [&'static str]| {
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || cmd_await_inbox(&ctx, args, hang_ms))
+                };
+                assert_eq!(tell(&a0), "OK\n", "{case}");
+                for (id, off) in [(1, 9), (2, 41)] {
+                    assert_eq!(
+                        cmd_post(&ctx, &format!("to=@s-peer kind=note at-{off}"), None),
+                        format!("OK {id}\n")
+                    );
+                    assert_eq!(
+                        cmd_deliver(&store, &format!("{sid} landed={id} off={off}")),
+                        "OK\n"
+                    );
+                }
+                assert_eq!(
+                    cmd_deliver(
+                        &store,
+                        &format!(
+                            "{sid} off=15 from=s-peer@n-lab kind=answer trust=agent re=9 text=r"
+                        )
+                    ),
+                    "OK 1\n"
+                );
+                let on_nine = park(&["re=9", "since=1"]);
+                let on_forty_one = park(&["re=41"]);
+                let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                while armed_watches(&ctx) < 2 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{case}: the two waits did not arm within a minute"
+                    );
+                    std::thread::yield_now();
+                }
+
+                let moved = if lineage {
+                    format!("{a1} continues=20 was={a0}")
+                } else {
+                    a1.clone()
+                };
+                assert_eq!(tell(&moved), "OK forgot=1\n", "{case}");
+                assert_eq!(
+                    on_forty_one.join().expect("the wait finished"),
+                    "ERR log-replaced re=41\n",
+                    "{case}"
+                );
+                assert_eq!(
+                    cmd_await_inbox(&ctx, &["re=9", "since=0"], 0),
+                    if lineage {
+                        "OK inbox 1\n"
+                    } else {
+                        "OK timeout\n"
+                    },
+                    "{case}: the reply delivered on A.0"
+                );
+                if lineage {
+                    assert_eq!(
+                        cmd_deliver(
+                            &store,
+                            &format!(
+                                "{sid} off=21 from=s-peer@n-lab kind=ack trust=agent re=9 \
+                                 verdict=handled text=ack"
+                            )
+                        ),
+                        "OK 2\n"
+                    );
+                }
+                assert_eq!(
+                    on_nine.join().expect("the wait finished"),
+                    if lineage {
+                        "OK inbox 2\n"
+                    } else {
+                        "ERR log-replaced re=9\n"
+                    },
+                    "{case}"
+                );
+            });
+        }
+    }
+
+    /// **A CHAIN OF MOVES HAS NO WINDOW.** Each move is applied once, as the
+    /// bridge clamps its own state at each attach, so an offset below every
+    /// fork survives however many there are, and one a move took stays taken
+    /// however many keep it after. Nine moves of A, each continuing the last
+    /// above 20 (a failing disk's poisoned reopens can make as many within
+    /// one aterm's life): the ask at 7 delivered on A.0 is still A.9's record
+    /// 7 — a verdict on it after the ninth owes its receipt there (no
+    /// `log=earlier`, so no `expired` at the asker for an ask that was
+    /// answered), its redelivery is the row it was, and `inbox get @7`
+    /// answers it. And the note at 5 delivered on B.0 before a BARE move to
+    /// A.0 stays B's: nine moves of A that keep 5 do not make it A's, so A.9's
+    /// record at 5 is a row of its own, not a duplicate of it, lost.
+    ///
+    /// NEGATIVE CONTROL, run: the same nine moves told BARE (a lane-2
+    /// endpoint) make the row at 7 an earlier log's — the receipt
+    /// `log=earlier`, the redelivery a new row. By hand: a move that assigns
+    /// what it keeps (the mutant
+    /// [`across_two_moves_an_offset_is_kept_only_below_both_forks`] names)
+    /// makes B.0's 5 A.9's, and A.9's record at 5 is answered `OK 1`.
+    #[test]
+    fn a_chain_of_moves_keeps_what_is_below_every_fork_however_long() {
+        let a = |g: u64| format!("{}.{g}", "aa".repeat(16));
+        for lineage in [true, false] {
+            with_link(|| {
+                let store = new_store();
+                let (sid, ctx) = registered(&store);
+                let generation = next_bridge_generation();
+                attach_up(&store, generation);
+                let case = format!("lineage={lineage}");
+                let tell =
+                    |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+                assert_eq!(tell(a(0)), "OK\n", "{case}");
+                assert_eq!(
+                    deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "seven"),
+                    "OK 1\n"
+                );
+                for g in 1..=9 {
+                    let line = if lineage {
+                        format!("{} continues={} was={}", a(g), 20 + g, a(g - 1))
+                    } else {
+                        a(g)
+                    };
+                    assert_eq!(tell(line), "OK forgot=1\n", "{case}: move {g}");
+                }
+                assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
+                assert_eq!(
+                    cmd_outbox(&store, "")
+                        .contains(&format!("receipt sid={sid} rid=1 off=7 verdict=handled")),
+                    lineage,
+                    "{case}"
+                );
+                assert_eq!(
+                    cmd_outbox(&store, "earlier-receipts=1").contains(
+                        " rid=1 off=7 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    ),
+                    !lineage,
+                    "{case}"
+                );
+                assert_eq!(
+                    deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "seven"),
+                    if lineage { "OK 1\n" } else { "OK 2\n" },
+                    "{case}"
+                );
+                if lineage {
+                    assert_eq!(
+                        cmd_inbox_get(&ctx, "@7"),
+                        "OK 5 off=7 from=s-peer@n-lab kind=ask trust=agent\nseven",
+                        "{case}"
+                    );
+                }
+            });
+        }
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+            assert_eq!(tell(format!("{}.0", "bb".repeat(16))), "OK\n");
+            assert_eq!(
+                deliver(&store, &sid, 5, "s-peer@n-lab", "note", "b0"),
+                "OK 1\n"
+            );
+            assert_eq!(tell(a(0)), "OK forgot=1\n", "another log");
+            for g in 1..=9 {
+                assert_eq!(
+                    tell(format!("{} continues=100 was={}", a(g), a(g - 1))),
+                    "OK forgot=1\n",
+                    "move {g}"
+                );
+            }
+            assert_eq!(
+                deliver(&store, &sid, 5, "s-peer@n-lab", "note", "a9"),
+                "OK 2\n",
+                "A.9's record at 5 is not B.0's"
+            );
+            assert_eq!(
+                cmd_inbox_get(&ctx, "@5"),
+                "OK 2 off=5 from=s-peer@n-lab kind=note trust=agent\na9"
+            );
         });
     }
 

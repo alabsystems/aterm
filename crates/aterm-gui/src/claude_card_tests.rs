@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use aterm_agent::harness::footer::FooterFacts;
 use aterm_agent::supervise::Autopilot;
-use aterm_effects::harness_card::EPISODE_MS;
+use aterm_core::render::{FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace, PxRect};
+use aterm_core::terminal::{CutKind, HolderCut};
+use aterm_effects::harness_card::{EPISODE_MS, KITTY_W};
 
 /// The build the screens' card names, and the process the facts are for.
 const VERSION: &str = "2.1.283";
@@ -82,13 +84,55 @@ fn feed(app: &App, session: u64, rows: &[String]) {
     crate::term_lock(&term).process(out.as_bytes());
 }
 
+/// The image of a Claude Code of build `version` leading group `pgid`,
+/// started at `start`: a managed-store image, whose banner prints its build
+/// (the gate's Exact policy, card engine §3.8).
+fn claude_image(pgid: i32, version: &str, start: u64) -> crate::holder_image::HolderImage {
+    use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
+    let build = atpkg::vendor_direct::Version::parse(version)
+        .expect("a vendor build")
+        .build_id();
+    crate::holder_image::HolderImage::of(
+        pgid,
+        Some(start),
+        Some(std::path::PathBuf::from(format!(
+            "/p/pkg/store/claude/{build}/bin/claude"
+        ))),
+        ImageBuild {
+            program: ProgramTag::new("claude"),
+            build,
+            source: ImageSource::Store,
+        },
+        1,
+    )
+}
+
+/// The host's report of a change of `session`'s foreground holder to the
+/// drawer `to` (`None`: a shell, another command), as the PTY reader cuts the
+/// engine's holder fence (`spawn::note_cut`, card engine §3.7).
+fn cut(app: &App, session: u64, to: Option<u64>, kind: CutKind, from_alive: bool) {
+    let term = app.pool.get(session).expect("session").term.clone();
+    crate::term_lock(&term).note_holder_cut(HolderCut {
+        to,
+        kind,
+        from_alive,
+    });
+}
+
 /// The footer facts of a Claude Code process of build `version`, in front.
 fn publish(app: &App, session: u64, version: &str) {
+    publish_as(app, session, version, PGID);
+}
+
+/// [`publish`] for the process group `pgid`: its image published (a group
+/// edge, or an `exec` where the group's last image was another), the fence
+/// cut to it — what it paints after this is its own — and its facts.
+fn publish_as(app: &App, session: u64, version: &str, pgid: i32) {
+    launch(app, session, version, pgid, 1);
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-    timeline.note_foreground_group(PGID);
     timeline.set_claude_footer(
-        PGID,
+        pgid,
         None,
         Some(FooterFacts {
             model: Some("Opus 5.5".into()),
@@ -96,6 +140,33 @@ fn publish(app: &App, session: u64, version: &str) {
             ..FooterFacts::default()
         }),
     );
+}
+
+/// A Claude Code of build `version` started at `start` takes the front as
+/// group `pgid`: its image published and the fence cut to it, no facts. The
+/// drawer's token.
+fn launch(app: &App, session: u64, version: &str, pgid: i32, start: u64) -> u64 {
+    use crate::holder_image::EdgeKind;
+    let image = claude_image(pgid, version, start);
+    let token = image.token.expect("a token");
+    let exec = {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let exec = timeline
+            .holder_image()
+            .is_some_and(|last| last.pgid == pgid && last.token != Some(token));
+        timeline.note_foreground_group(pgid);
+        let kind = if exec {
+            EdgeKind::Exec
+        } else {
+            EdgeKind::Group
+        };
+        timeline.offer_holder_image(Arc::new(image), kind);
+        exec
+    };
+    let kind = if exec { CutKind::Exec } else { CutKind::Group };
+    cut(app, session, Some(token), kind, false);
+    token
 }
 
 /// This window's host, holding `session`'s live supervisor claim: the
@@ -129,8 +200,37 @@ fn frame(app: &mut App, wid: WindowId) {
     app.splice_claude_footer(wid, &plan, route);
 }
 
-/// A headless window `cols` wide and 24 rows tall, its front session, its
-/// card on the screen and the facts of its process published.
+/// The group of the shell the tests' Claude Code runs under.
+const SHELL_PGID: i32 = 4000;
+
+/// Claude Code leaves the front of `session` — stopped (`from_alive`) or
+/// gone: its facts dropped, the shell's group in front, the shell's image
+/// (no drawer) published and the fence cut to it.
+fn leave(app: &App, session: u64, from_alive: bool) {
+    use atpkg::image::{ImageBuild, ProgramTag};
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let pgid = timeline.agent().program_pgid;
+        timeline.set_claude_footer(pgid, None, None);
+        timeline.note_foreground_group(SHELL_PGID);
+        timeline.offer_holder_image(
+            Arc::new(crate::holder_image::HolderImage::of(
+                SHELL_PGID,
+                Some(1),
+                Some(std::path::PathBuf::from("/bin/zsh")),
+                ImageBuild::unknown(ProgramTag::new("zsh")),
+                1,
+            )),
+            crate::holder_image::EdgeKind::Group,
+        );
+    }
+    cut(app, session, None, CutKind::Group, from_alive);
+}
+
+/// A headless window `cols` wide and 24 rows tall, its front session, the
+/// facts of its process published and its card on the screen — painted by
+/// it, after it took the front.
 fn glass(cols: u16) -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -138,12 +238,12 @@ fn glass(cols: u16) -> (App, WindowId, u64) {
     if cols != 80 {
         assert!(app.apply_term_resize(wid, 24, cols));
     }
+    publish(&app, session, VERSION);
     feed(
         &app,
         session,
         &card_screen(24, usize::from(cols), MODEL, VERSION),
     );
-    publish(&app, session, VERSION);
     (app, wid, session)
 }
 
@@ -162,42 +262,234 @@ fn glass_text(app: &App, wid: WindowId, row: usize, cols: std::ops::Range<usize>
         .collect()
 }
 
-/// The card's record of what it put in the streams.
+/// The card's record of what it put on the frame.
 fn painted(app: &App, wid: WindowId) -> &CardPainted {
     &app.windows[&wid].claude_card.painted
 }
 
-/// A painted card's two light streams, `(under, over)`, as they stand.
-fn card_streams(app: &App, wid: WindowId) -> (Vec<GlowQuad>, Vec<GlowQuad>) {
-    let p = painted(app, wid);
-    (p.under.clone(), p.over.clone())
+/// The card's layer of `slot` as the last splice put it on the frame.
+fn card_layer(app: &App, wid: WindowId, slot: FxSlot) -> Option<FxLayer> {
+    painted(app, wid)
+        .layers
+        .iter()
+        .find(|l| l.slot == slot)
+        .cloned()
 }
 
-/// The kitty's left edge in a card's streams: its opaque quads' leftmost x.
-fn kitty_x((_, over): &(Vec<GlowQuad>, Vec<GlowQuad>)) -> Option<u16> {
-    over.iter().filter(|q| q.alpha == 255).map(|q| q.x).min()
+/// The card's layers as the last splice put them on the frame: compared as
+/// layers are, by IDENTITY (the same content `Arc`s at the same place: a
+/// replayed frame), never by their bytes ([`card_pic`] for those).
+fn card_layers(app: &App, wid: WindowId) -> Vec<FxLayer> {
+    painted(app, wid).layers.clone()
 }
 
-/// The span the trail's quads cover in a card's streams: its `under` quads
-/// clear of the border's stroke (which holds the stream's outermost
-/// pixels), left to right.
-fn trail_span((under, _): &(Vec<GlowQuad>, Vec<GlowQuad>)) -> Option<(u32, u32)> {
-    let end = |q: &GlowQuad| {
-        (
-            u32::from(q.x) + u32::from(q.w),
-            u32::from(q.y) + u32::from(q.h),
-        )
-    };
-    let x0 = under.iter().map(|q| u32::from(q.x)).min()?;
-    let y0 = under.iter().map(|q| u32::from(q.y)).min()?;
-    let x1 = under.iter().map(|q| end(q).0).max()?;
-    let y1 = under.iter().map(|q| end(q).1).max()?;
+/// The grid's origin in `wid`'s window pixels: the padding and the head,
+/// the renderers' shift of a grid-space layer.
+fn grid_origin(app: &App, wid: WindowId) -> (i32, i32) {
+    (
+        pixel(app.win_pad(wid)),
+        pixel(app.win_pad_top(wid) + app.win_head(wid)),
+    )
+}
+
+/// One item of a card's layer where it lands, in WINDOW pixels: its bounds
+/// at the layer's offset within the layer's clip (a grid-space layer's
+/// moved by the grid's origin), the palette entries it paints, and a
+/// sprite's art (its content id and width).
+#[derive(Clone, Debug, PartialEq)]
+struct Mark {
+    at: PxRect,
+    inks: Vec<FxInk>,
+    art: Option<(u128, u16)>,
+}
+
+impl Mark {
+    /// The mark moved by `(dx, dy)`.
+    fn moved(&self, dx: i32, dy: i32) -> Self {
+        Self {
+            at: self.at.translate(dx, dy),
+            ..self.clone()
+        }
+    }
+}
+
+/// The marks of the card's `slot` layer on `wid`'s last frame, in item
+/// order; none where the layer holds nothing or is not on the frame.
+fn marks(app: &App, wid: WindowId, slot: FxSlot) -> Vec<Mark> {
+    let grid = grid_origin(app, wid);
+    let mut out = Vec::new();
+    for layer in painted(app, wid).layers.iter().filter(|l| l.slot == slot) {
+        let shift = match layer.space {
+            FxSpace::Window => (0, 0),
+            FxSpace::Grid => grid,
+        };
+        let palette = layer.content.palette();
+        for item in layer.content.items() {
+            let at = item
+                .bounds()
+                .translate(layer.offset.0, layer.offset.1)
+                .intersect(layer.clip)
+                .translate(shift.0, shift.1);
+            if at.is_empty() {
+                continue;
+            }
+            let (base, n, art) = match item {
+                FxItem::Rect(r) => (r.ink, 2, None),
+                FxItem::Ramps(r) => (r.ink, 2 * usize::from(r.h), None),
+                FxItem::Sprite(s) => (
+                    s.ink,
+                    usize::from(s.art.max_index()),
+                    Some((s.art.id(), s.art.w())),
+                ),
+            };
+            let base = base as usize;
+            out.push(Mark {
+                at,
+                inks: palette[base..base + n].to_vec(),
+                art,
+            });
+        }
+    }
+    out
+}
+
+/// The card's under marks (the border and the trail) and over marks (the
+/// kitty, its rim and the stars), as they stand.
+fn card_marks(app: &App, wid: WindowId) -> (Vec<Mark>, Vec<Mark>) {
+    (
+        marks(app, wid, FxSlot::Under),
+        marks(app, wid, FxSlot::Over),
+    )
+}
+
+/// Whether `m` is the kitty: a sprite of the kitty's art width, every
+/// colour opaque.
+fn is_kitty(m: &Mark) -> bool {
+    m.art.is_some_and(|(_, w)| usize::from(w) == KITTY_W) && m.inks.iter().all(|i| i.alpha == 255)
+}
+
+/// The kitty's mark in a card's marks.
+fn kitty_mark((_, over): &(Vec<Mark>, Vec<Mark>)) -> Option<&Mark> {
+    over.iter().find(|m| is_kitty(m))
+}
+
+/// The kitty's left edge in a card's marks (window pixels).
+fn kitty_x(card: &(Vec<Mark>, Vec<Mark>)) -> Option<i32> {
+    kitty_mark(card).map(|m| m.at.x0)
+}
+
+/// The span the trail covers in a card's marks: its `under` marks clear of
+/// the border's stroke (which holds the layer's outermost pixels), left to
+/// right.
+fn trail_span((under, _): &(Vec<Mark>, Vec<Mark>)) -> Option<(i32, i32)> {
+    let x0 = under.iter().map(|m| m.at.x0).min()?;
+    let y0 = under.iter().map(|m| m.at.y0).min()?;
+    let x1 = under.iter().map(|m| m.at.x1).max()?;
+    let y1 = under.iter().map(|m| m.at.y1).max()?;
     let inside = under
         .iter()
-        .filter(|q| u32::from(q.x) > x0 && u32::from(q.y) > y0 && end(q).0 < x1 && end(q).1 < y1);
-    let a = inside.clone().map(|q| u32::from(q.x)).min()?;
-    let b = inside.map(|q| end(q).0).max()?;
+        .filter(|m| m.at.x0 > x0 && m.at.y0 > y0 && m.at.x1 < x1 && m.at.y1 < y1);
+    let a = inside.clone().map(|m| m.at.x0).min()?;
+    let b = inside.map(|m| m.at.x1).max()?;
     Some((a, b))
+}
+
+/// The smallest window-pixel rectangle holding `marks`.
+fn hull(marks: &[Mark]) -> PxRect {
+    marks.iter().fold(PxRect::EMPTY, |h, m| h.hull(m.at))
+}
+
+/// A card layer compared by VALUE: where it lies and every item and
+/// palette entry, a sprite's art by its content id — what a card drawn
+/// anew, or another window's card, must equal bit for bit.
+#[derive(Clone, Debug, PartialEq)]
+struct LayerPic {
+    slot: FxSlot,
+    space: FxSpace,
+    offset: (i32, i32),
+    clip: PxRect,
+    items: Vec<ItemPic>,
+    palette: Vec<FxInk>,
+}
+
+/// An fx item by value ([`LayerPic`]).
+#[derive(Clone, Debug, PartialEq)]
+enum ItemPic {
+    Rect(FxRect),
+    Ramps(FxRamps),
+    Sprite {
+        at: (i32, i32, u16, u16),
+        flip_x: bool,
+        art: u128,
+        ink: u32,
+        clip: PxRect,
+    },
+}
+
+fn layer_pic(layer: &FxLayer) -> LayerPic {
+    LayerPic {
+        slot: layer.slot,
+        space: layer.space,
+        offset: layer.offset,
+        clip: layer.clip,
+        items: layer
+            .content
+            .items()
+            .iter()
+            .map(|item| match item {
+                FxItem::Rect(r) => ItemPic::Rect(*r),
+                FxItem::Ramps(r) => ItemPic::Ramps(*r),
+                FxItem::Sprite(s) => ItemPic::Sprite {
+                    at: (s.x, s.y, s.dw, s.dh),
+                    flip_x: s.flip_x,
+                    art: s.art.id(),
+                    ink: s.ink,
+                    clip: s.clip,
+                },
+            })
+            .collect(),
+        palette: layer.content.palette().to_vec(),
+    }
+}
+
+/// The card's layers by value ([`LayerPic`]), in the order the splice put
+/// them on.
+fn card_pic(app: &App, wid: WindowId) -> Vec<LayerPic> {
+    painted(app, wid).layers.iter().map(layer_pic).collect()
+}
+
+/// The card's layers as the CPU renderer paints them over a black window
+/// (`aterm_render::fx::paint_layers`): through the frame's fx occluders
+/// (`occluded`) or not. Window pixels, row-major, and the window's width.
+fn card_pixels(app: &App, wid: WindowId, occluded: bool) -> (Vec<u32>, usize) {
+    let (cw, ch) = app.win_cell_size(wid);
+    let scratch = &app.windows[&wid].input_scratch;
+    let (pad, grid_top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
+    let cols = scratch.cells.first().map_or(0, Vec::len);
+    let fx = aterm_render::FxFrame {
+        w: 2 * pad + cols * cw,
+        h: 2 * grid_top + scratch.cells.len() * ch,
+        pad,
+        grid_top,
+        cell_h: ch,
+        rows: scratch.cells.len(),
+    };
+    let mut px = vec![0u32; fx.w * fx.h];
+    let occluders: &[PxRect] = if occluded { &scratch.fx_occluders } else { &[] };
+    aterm_render::fx::paint_layers(&mut px, &fx, &painted(app, wid).layers, occluders);
+    (px, fx.w)
+}
+
+/// A menu's rectangle in `wid`'s window pixels.
+fn menu_px(app: &App, wid: WindowId, rect: crate::tab_menu::MenuRect) -> PxRect {
+    let (cw, ch) = app.win_cell_size(wid);
+    let (x, y) = grid_origin(app, wid);
+    PxRect::new(
+        x + pixel(rect.col * cw),
+        y + pixel(rect.row * ch),
+        x + pixel((rect.col + rect.w) * cw),
+        y + pixel((rect.row + rect.h) * ch),
+    )
 }
 
 /// The line the card writes for `view` in a pane `cols` wide with its star at
@@ -211,13 +503,14 @@ fn expected_line(view: AutopilotView, at: usize, cols: usize) -> String {
 }
 
 /// THE WRAPPED CARD (§3): Cruise under this host's live claim — the border
-/// and the trail in `glow_under` (window pixels, additive on a dark ground,
-/// every quad on one of the box's frame rows or the blank rows over and
-/// under it, the border standing half a row into each: its air, §10.6.8),
-/// the kitty and the stars in `nova_add` (the kitty opaque art), and the
-/// line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise`
-/// written on the glass under the card at its text column, in the footer's
-/// value colour, inked, behind a drawn `Star4`.
+/// and the trail in the card's under layer (window space, additive on a
+/// dark ground, every item on one of the box's frame rows or the blank rows
+/// over and under it, the border standing half a row into each: its air,
+/// §10.6.8), the kitty and the stars in its over layer (grid space at the
+/// same origin, the same pane; the kitty opaque art), both on the frame's
+/// layers, and the line `✦ enhanced by aterm harness <version> · autopilot
+/// ∞ cruise` written on the glass under the card at its text column, in the
+/// footer's value colour, inked, behind a drawn `Star4`.
 #[test]
 fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
     let (mut app, wid, session) = glass(120);
@@ -232,53 +525,53 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
     // The card's banner is pane row 1: the box is rows 1..=4 (the line's),
     // blank rows 0 and 5 its air.
     let (top, text_col) = (1usize, 11usize);
-    let p = painted(&app, wid);
-    assert!(!p.under.is_empty(), "the border and the trail");
-    assert!(!p.over.is_empty(), "the kitty and the stars");
+    let (under, over) = card_marks(&app, wid);
+    assert!(!under.is_empty(), "the border and the trail");
+    assert!(!over.is_empty(), "the kitty and the stars");
+    let layers = card_layers(&app, wid);
     let scratch = &app.windows[&wid].input_scratch;
-    for q in &p.under {
-        assert!(scratch.glow_under.contains(q), "in the frame's stream");
-        assert_eq!(q.alpha, 0, "additive light on a dark ground");
-        let row = usize::from(q.row);
-        assert!(
-            (strip + top - 1..=strip + top + 4).contains(&row),
-            "row {row}: one of the box's frame rows, or its air's"
+    assert_eq!(layers.len(), 2, "two layers a card");
+    for l in &layers {
+        assert_eq!(
+            scratch.fx_layers.iter().filter(|o| *o == l).count(),
+            1,
+            "on the frame's layers, once"
         );
     }
-    for q in &p.over {
-        assert!(scratch.nova_add.contains(q), "in the frame's stream");
-    }
-    assert!(
-        p.over.iter().any(|q| q.alpha == u8::MAX),
-        "the kitty: opaque art"
-    );
-    // Window pixels under the ink, grid-interior pixels for the nova stream:
-    // the same frame row starts `grid_top` lower in the first.
     let (_, ch) = app.win_cell_size(wid);
-    let grid_top = app.win_pad_top(wid) + app.win_head(wid);
-    let y_of = |q: &GlowQuad| usize::from(q.y);
-    assert!(
-        p.under
-            .iter()
-            .all(|q| y_of(q) >= grid_top + usize::from(q.row) * ch)
+    let grid = grid_origin(&app, wid);
+    let grid_top = usize::try_from(grid.1).unwrap();
+    let y_px = |row: usize| pixel(grid_top + row * ch);
+    for m in &under {
+        assert!(
+            m.inks.iter().all(|i| i.alpha == 0),
+            "additive light on a dark ground"
+        );
+        assert!(
+            m.at.y0 >= y_px(strip + top - 1) && m.at.y1 <= y_px(strip + top + 5),
+            "{m:?}: on one of the box's frame rows, or its air's"
+        );
+    }
+    assert!(over.iter().any(is_kitty), "the kitty: opaque art");
+    // One origin and one pane, in the two spaces: the under layer in window
+    // pixels, the over layer in grid-interior pixels the renderers offset
+    // by the grid's origin.
+    let (u, o) = (
+        card_layer(&app, wid, FxSlot::Under).expect("the under layer"),
+        card_layer(&app, wid, FxSlot::Over).expect("the over layer"),
     );
+    assert_eq!((u.space, o.space), (FxSpace::Window, FxSpace::Grid));
+    assert_eq!((o.offset.0 + grid.0, o.offset.1 + grid.1), u.offset);
+    assert_eq!(o.clip.translate(grid.0, grid.1), u.clip);
     // The border half a row into the blank rows over and under the box.
-    let (y0, y1) = (
-        p.under.iter().map(y_of).min(),
-        p.under.iter().map(|q| y_of(q) + usize::from(q.h)).max(),
-    );
+    let border = hull(&under);
     assert_eq!(
-        (y0, y1),
+        (border.y0, border.y1),
         (
-            Some(grid_top + (strip + top) * ch - ch / 2),
-            Some(grid_top + (strip + top + 4) * ch + ch / 2)
+            y_px(strip + top) - pixel(ch / 2),
+            y_px(strip + top + 4) + pixel(ch / 2)
         ),
         "the border stands in the box's air"
-    );
-    assert!(
-        p.over
-            .iter()
-            .all(|q| y_of(q) >= usize::from(q.row) * ch && y_of(q) < (usize::from(q.row) + 1) * ch)
     );
     // The line.
     let line_row = strip + top + 3;
@@ -338,6 +631,104 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
     host.shutdown_and_join();
 }
 
+/// THE CARD'S GLASS IS THE RESIDENT PET'S OCCUPIED GROUND (owner-eye-6,
+/// 2026-10-20). The border, the trail, the kitty and the stars are glass over
+/// cells the grid reads as blank, so the pet's world could not see them: sent
+/// to clean ground off Claude's composer, the cat took the blank corner under
+/// the mascot, inside the border. The footer's splice now reserves the card's
+/// box — its rows, its air on either side and every column to the border's —
+/// for the pet (`crate::pet_chrome`), and nothing past it: the border's own
+/// column is reserved on every row of the box and its air, the column after
+/// it on none.
+///
+/// NEGATIVE CONTROLS (as run, each failing this test): the same card drawn
+/// bare (no claim) reserves nothing there (in-test); the box one column
+/// narrow (`lay.cols` columns, the border's left out), the border's column
+/// is the pet's; one column wide, the column past the border is reserved.
+#[test]
+fn the_cards_glass_is_the_pets_occupied_ground() {
+    let covered = |app: &App, wid: WindowId, row: usize, col: usize| {
+        let (r, c) = (row as f32 + 0.5, col as f32 + 0.5);
+        app.windows[&wid].pet_chrome.held().iter().any(|rect| {
+            rect.row <= r && r < rect.row + rect.rows && rect.col <= c && c < rect.col + rect.cols
+        })
+    };
+    // The footer's splice and the menu's, which ends the pet's pass.
+    let pass = |app: &mut App, wid: WindowId| {
+        frame(app, wid);
+        app.splice_autopilot_menu(wid);
+    };
+    let (mut app, wid, session) = glass(120);
+    let host = supervise(&mut app, session);
+    pass(&mut app, wid);
+    assert!(
+        app.windows[&wid]
+            .claude_card
+            .entries
+            .iter()
+            .any(|e| e.shown),
+        "fixture: the wrapped card is on the glass"
+    );
+    // The banner is pane row 1: the box is rows 1..=4, its air rows 0 and 5.
+    for row in 0..=5 {
+        for col in [0, 5, 11, 40] {
+            assert!(
+                covered(&app, wid, row, col),
+                "pane cell ({row}, {col}) is under the card's glass"
+            );
+        }
+    }
+    assert!(
+        !covered(&app, wid, 6, 40),
+        "the row under the card's air is the pane's own"
+    );
+    // The border is drawn in the box's last column (`CardScene::cols`).
+    let border = app.windows[&wid]
+        .claude_card
+        .entries
+        .iter()
+        .find(|e| e.shown)
+        .map(|e| usize::from(e.place.3))
+        .expect("the card on show");
+    assert!(
+        (41..119).contains(&border),
+        "fixture: the border stands inside the pane, past column 40: {border}"
+    );
+    for row in 0..=5 {
+        assert!(
+            covered(&app, wid, row, border),
+            "pane cell ({row}, {border}), the border's column, is under the card's glass"
+        );
+        assert!(
+            !covered(&app, wid, row, border + 1),
+            "pane cell ({row}, {}), past the border, is the pane's own",
+            border + 1
+        );
+    }
+    // Negative control: drawn bare, the card's cells are the pane's.
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    );
+    pass(&mut app, wid);
+    assert!(
+        !app.windows[&wid]
+            .claude_card
+            .entries
+            .iter()
+            .any(|e| e.shown),
+        "fixture: the card is bare"
+    );
+    assert!(
+        !covered(&app, wid, 0, 40) && !covered(&app, wid, 3, 5),
+        "a bare card reserves nothing"
+    );
+    host.shutdown_and_join();
+}
+
 /// THE WORKSPACE CARD (Claude Code 2.1.302 on `--effort workspace`, the
 /// measured screen): the mascot holds its wand `╱✦` between its blocks and
 /// the banner, and the card's text sits at column 13 — it wears the border,
@@ -362,18 +753,15 @@ fn the_workspace_card_wears_the_card_at_its_own_text_column() {
     let wid = WindowId(0);
     let session = app.focused_session_id(wid).expect("the front session");
     assert!(app.apply_term_resize(wid, 24, 120));
-    feed(&app, session, &screen);
     publish(&app, session, "2.1.302");
+    feed(&app, session, &screen);
     let host = supervise(&mut app, session);
     frame(&mut app, wid);
     let strip = strip_rows(&app, wid);
     let (top, text_col) = (0usize, 13usize);
-    let p = painted(&app, wid);
-    assert!(!p.under.is_empty(), "the border and the trail");
-    assert!(
-        p.over.iter().any(|q| q.alpha == u8::MAX),
-        "the kitty: opaque art"
-    );
+    let (under, over) = card_marks(&app, wid);
+    assert!(!under.is_empty(), "the border and the trail");
+    assert!(over.iter().any(is_kitty), "the kitty: opaque art");
     let line_row = strip + top + 3;
     let want = expected_line(AutopilotView::Cruise, text_col, 120);
     let start = text_col + LINE_LEAD;
@@ -437,8 +825,8 @@ fn entrance_glass(pose: &str) -> (App, WindowId, u64, crate::harness_host::HostH
     let wid = WindowId(0);
     let session = app.focused_session_id(wid).expect("the front session");
     assert!(app.apply_term_resize(wid, 40, 144));
-    feed(&app, session, &jump(pose));
     publish(&app, session, "2.1.302");
+    feed(&app, session, &jump(pose));
     let host = supervise(&mut app, session);
     (app, wid, session, host)
 }
@@ -451,7 +839,7 @@ fn decorated(app: &App, wid: WindowId) -> Option<CardPlace> {
         .entries
         .iter()
         .any(|e| e.shown)
-        && !painted(app, wid).under.is_empty();
+        && !marks(app, wid, FxSlot::Under).is_empty();
     on.then(|| laid_key(app, wid).place)
 }
 
@@ -580,18 +968,26 @@ fn a_held_card_goes_on_the_frame_its_banner_leaves() {
 fn land_wears_the_sunset_and_says_land() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    let blue = |q: &GlowQuad| (q.color & 0xff) > ((q.color >> 16) & 0xff);
+    let blue = |m: &Mark| {
+        m.inks
+            .iter()
+            .any(|i| (i.color & 0xff) > ((i.color >> 16) & 0xff))
+    };
     frame(&mut app, wid);
     assert!(
-        painted(&app, wid).under.iter().any(blue),
+        marks(&app, wid, FxSlot::Under).iter().any(blue),
         "Cruise: the spectrum"
     );
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Chip
+    ));
     frame(&mut app, wid);
-    let p = painted(&app, wid);
-    assert!(!p.under.is_empty());
+    let under = marks(&app, wid, FxSlot::Under);
+    assert!(!under.is_empty());
     assert!(
-        !p.under.iter().any(blue),
+        !under.iter().any(blue),
         "Land: a sunset, never bluer than red"
     );
     let strip = strip_rows(&app, wid);
@@ -604,27 +1000,21 @@ fn land_wears_the_sunset_and_says_land() {
     host.shutdown_and_join();
 }
 
-/// A TASK'S END ON THE CARD'S LINE (the Autopilot design's §9.4.1, §10.2.1):
-/// under Land and Cruise, the task's face told `landed` ends the line `·
-/// autopilot ✓ landed` and `done` ends it `· autopilot ✓ done` — the same
-/// words under both; spent, theirs, open and unknown keep the mode's own
-/// (`⤓ land`, `∞ cruise`). The words are made once per pair (a frame formats
-/// nothing), the narrower rungs say no mode, and a face's move re-lays the
-/// line and ARMS NO EPISODE. NEGATIVE CONTROL: Off, and no harness, say no
+/// A LANDING ON THE CARD'S LINE: under Land the task's face told `landed`
+/// ends the line `· autopilot ✓ landed`; theirs, open and unknown keep the
+/// mode's own (`⤓ land`). Cruise takes nothing as the end: every face keeps
+/// `∞ cruise`. The words are made once per pair (a frame formats nothing),
+/// the narrower rungs say no mode, and a face's move re-lays the line and
+/// ARMS NO EPISODE. NEGATIVE CONTROL: Cruise, Off, and no harness, say no
 /// end whatever is told.
 #[test]
-fn a_tasks_end_is_said_on_the_cards_line_under_land_and_cruise() {
+fn a_landing_is_said_on_the_cards_line_under_land_alone() {
     use aterm_agent::harness::acts::TaskFace;
     for view in AutopilotView::ALL {
         let faces = std::iter::once(None).chain(TaskFace::ALL.into_iter().map(Some));
         for task in faces {
             let want = match (view, task) {
-                (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Landed)) => {
-                    LineEnd::Landed
-                }
-                (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Done)) => {
-                    LineEnd::Done
-                }
+                (AutopilotView::Land, Some(TaskFace::Landed)) => LineEnd::Landed,
                 _ => LineEnd::Mode,
             };
             assert_eq!(LineEnd::of(view, task), want, "{view:?} {task:?}");
@@ -633,7 +1023,6 @@ fn a_tasks_end_is_said_on_the_cards_line_under_land_and_cruise() {
     for (end, tail) in [
         (LineEnd::Mode, "\u{2913} land"),
         (LineEnd::Landed, "\u{2713} landed"),
-        (LineEnd::Done, "\u{2713} done"),
     ] {
         let texts = line_texts(AutopilotView::Land, end);
         assert!(
@@ -649,20 +1038,16 @@ fn a_tasks_end_is_said_on_the_cards_line_under_land_and_cruise() {
             line_texts(AutopilotView::Land, LineEnd::Mode)[1..],
             "the narrower rungs"
         );
-        if end == LineEnd::Mode {
-            let cruise = line_texts(AutopilotView::Cruise, end);
-            assert!(
-                cruise[0].ends_with("\u{b7} autopilot \u{221e} cruise"),
-                "{cruise:?}"
-            );
-        } else {
-            assert_eq!(
-                line_texts(AutopilotView::Cruise, end),
-                texts,
-                "Cruise says the end in Land's words"
-            );
-        }
-        for view in [AutopilotView::Off, AutopilotView::MasterOff] {
+        let cruise = line_texts(AutopilotView::Cruise, end);
+        assert!(
+            cruise[0].ends_with("\u{b7} autopilot \u{221e} cruise"),
+            "Cruise says its mode: {cruise:?}"
+        );
+        for view in [
+            AutopilotView::Cruise,
+            AutopilotView::Off,
+            AutopilotView::MasterOff,
+        ] {
             assert_eq!(
                 line_texts(view, end),
                 line_texts(view, LineEnd::Mode),
@@ -689,7 +1074,7 @@ fn a_tasks_end_is_said_on_the_cards_line_under_land_and_cruise() {
             .self_id
             .as_str()
             .to_string();
-        assert!(app.set_session_autopilot(session, Some(word)));
+        assert!(app.set_session_autopilot(session, Some(word), crate::autopilot::Surface::Chip));
         let mut t = Instant::now();
         set_now(Some(t));
         frame(&mut app, wid);
@@ -700,8 +1085,6 @@ fn a_tasks_end_is_said_on_the_cards_line_under_land_and_cruise() {
         let strip = strip_rows(&app, wid);
         for (face, end) in [
             (Some(TaskFace::Landed), LineEnd::Landed),
-            (Some(TaskFace::Done), LineEnd::Done),
-            (Some(TaskFace::Spent), LineEnd::Mode),
             (Some(TaskFace::Theirs), LineEnd::Mode),
             (Some(TaskFace::Open), LineEnd::Mode),
             (Some(TaskFace::Landed), LineEnd::Landed),
@@ -710,7 +1093,7 @@ fn a_tasks_end_is_said_on_the_cards_line_under_land_and_cruise() {
             app.apply_harness_fact(&sid, crate::HarnessFact::Task(face));
             frame(&mut app, wid);
             let want = match (word, end) {
-                (Autopilot::Land, _) | (_, LineEnd::Landed | LineEnd::Done) => fits(end),
+                (Autopilot::Land, _) => fits(end),
                 _ => expected_line(AutopilotView::Cruise, 11, 120),
             };
             assert_eq!(
@@ -786,7 +1169,6 @@ fn the_cards_line_follows_an_armed_timer() {
     for (end, view) in [
         (LineEnd::Mode, AutopilotView::Land),
         (LineEnd::Landed, AutopilotView::Land),
-        (LineEnd::Done, AutopilotView::Land),
         (LineEnd::Mode, AutopilotView::Off),
     ] {
         assert_eq!(end.timed(view, at), end, "CONTROL: {view:?} {end:?}");
@@ -891,14 +1273,18 @@ fn a_cruise_cards_line_says_its_armed_timer() {
         None,
         "a timer's move arms no episode"
     );
-    let under = painted(&app, wid).under.clone();
+    let layers = card_layers(&app, wid);
     let row: Vec<RenderCell> = app.windows[&wid].input_scratch.cells[line_row].clone();
     let _ = crate::work_counts::take_card_line_inks();
     let _ = crate::work_counts::take_card_ticks();
     for i in 0..20u64 {
         set_now(Some(t + Duration::from_millis(1 + i * 7)));
         frame(&mut app, wid);
-        assert_eq!(painted(&app, wid).under, under, "constant bytes, frame {i}");
+        assert_eq!(
+            card_layers(&app, wid),
+            layers,
+            "the same contents, replayed: frame {i}"
+        );
         assert_eq!(
             app.windows[&wid].input_scratch.cells[line_row], row,
             "frame {i}"
@@ -950,7 +1336,11 @@ fn off_unsupervised_switched_off_another_build_or_scrolled_back_draw_nothing() {
     };
     let cases: [NegativeCase; 7] = [
         ("off", |app, session| {
-            assert!(app.set_session_autopilot(session, Some(Autopilot::Off)));
+            assert!(app.set_session_autopilot(
+                session,
+                Some(Autopilot::Off),
+                crate::autopilot::Surface::Chip
+            ));
         }),
         ("unsupervised", |app, session| {
             let ctx = app.pool.get(session).unwrap().ctx.clone();
@@ -1035,10 +1425,9 @@ fn the_grid_and_the_vendors_frame_are_untouched() {
     assert_ne!(app.windows[&wid].input_scratch.cells, vendor, "the line");
     assert_eq!(engine_text(&app, session), before, "the terminal's text");
     let ws = app.windows.get_mut(&wid).unwrap();
-    let (under, over) = (
-        ws.claude_card.painted.under.clone(),
-        ws.claude_card.painted.over.clone(),
-    );
+    let ours = ws.claude_card.painted.layers.clone();
+    assert_eq!(ours.len(), 2, "the card's two layers");
+    assert!(ours.iter().all(|l| ws.input_scratch.fx_layers.contains(l)));
     assert!(crate::claude_footer::undo(
         &mut ws.claude_footer_undo,
         &mut ws.input_scratch
@@ -1046,11 +1435,12 @@ fn the_grid_and_the_vendors_frame_are_untouched() {
     strip(&mut ws.claude_card, &mut ws.input_scratch);
     assert_eq!(ws.input_scratch.cells, vendor, "every cell the vendor's");
     assert!(
-        under
+        ws.input_scratch
+            .fx_layers
             .iter()
-            .all(|q| !ws.input_scratch.glow_under.contains(q))
+            .all(|l| ours.iter().all(|o| o.id != l.id)),
+        "no layer of the card's left"
     );
-    assert!(over.iter().all(|q| !ws.input_scratch.nova_add.contains(q)));
     assert!(
         ws.input_scratch
             .word_decorations
@@ -1063,22 +1453,29 @@ fn the_grid_and_the_vendors_frame_are_untouched() {
 /// C6: A CAPTURE'S RE-SPLICE never doubles the light. A capture re-splices a
 /// scratch whose effect streams still hold the last frame's light
 /// (`cell_frame_into` never writes them): the splice takes its own back
-/// first. Splicing the same scratch again, and running the whole capture
-/// again, leave every stream as long as once.
+/// first, and under a tab strip the capture's refill already has — the
+/// strip's prepend would move the card's grid-space layer a strip lower, out
+/// from under the record. Splicing the same scratch again, and running the
+/// whole capture again, bare and under a tab strip, leave every stream as
+/// long as once.
 #[test]
 fn a_capture_resplice_never_doubles_the_light() {
+    for tab_strip in [0, 1] {
+        capture_resplice(tab_strip);
+    }
+}
+
+/// [`a_capture_resplice_never_doubles_the_light`] under `tab_strip` strip
+/// rows.
+fn capture_resplice(tab_strip: u16) {
     let (mut app, wid, session) = glass(120);
+    app.tab_strip_rows = tab_strip;
     let host = supervise(&mut app, session);
     let t0 = Instant::now();
     TEST_NOW.with(|now| now.set(Some(t0)));
     let lens = |app: &App| {
         let s = &app.windows[&wid].input_scratch;
-        (
-            s.glow_under.len(),
-            s.nova_add.len(),
-            s.ink.len(),
-            s.word_decorations.len(),
-        )
+        (s.fx_layers.len(), s.ink.len(), s.word_decorations.len())
     };
     frame(&mut app, wid);
     let once = lens(&app);
@@ -1086,20 +1483,32 @@ fn a_capture_resplice_never_doubles_the_light() {
     let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
     for _ in 0..3 {
         app.splice_claude_footer(wid, &plan, route);
-        assert_eq!(lens(&app), once, "the same scratch, spliced again");
+        assert_eq!(
+            lens(&app),
+            once,
+            "strip {tab_strip}: the same scratch, spliced again"
+        );
     }
-    frame(&mut app, wid);
-    assert_eq!(lens(&app), once, "the whole capture, run again");
+    for _ in 0..3 {
+        frame(&mut app, wid);
+        assert_eq!(
+            lens(&app),
+            once,
+            "strip {tab_strip}: the whole capture, run again"
+        );
+    }
     let p = painted(&app, wid);
     let scratch = &app.windows[&wid].input_scratch;
-    for q in &p.under {
+    assert_eq!(p.layers.len(), 2, "the card's two layers");
+    for l in &p.layers {
         assert_eq!(
-            scratch.glow_under.iter().filter(|o| *o == q).count(),
+            scratch.fx_layers.iter().filter(|o| o.id == l.id).count(),
             1,
-            "each quad once"
+            "strip {tab_strip}: each layer once"
         );
     }
     let strip = strip_rows(&app, wid);
+    assert_eq!(strip, usize::from(tab_strip), "CONTROL: the strip's rows");
     assert_eq!(
         glass_text(&app, wid, strip + 4, 0..120)
             .matches("aterm harness")
@@ -1130,7 +1539,7 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     set_now(t0);
     assert_eq!(app.claude_card_deadline(t0), None, "nothing on show yet");
     frame(&mut app, wid);
-    let riding = card_streams(&app, wid);
+    let riding = card_marks(&app, wid);
     let mut last_fp = app.claude_footer_fp(wid, &plan);
     let mut t = 0;
     while t + FRAME_MS < EPISODE_MS {
@@ -1164,8 +1573,9 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     );
     frame(&mut app, wid);
     let settled = app.claude_footer_fp(wid, &plan);
-    let quads = painted(&app, wid).under.clone();
-    let at_rest = card_streams(&app, wid);
+    let layers = card_layers(&app, wid);
+    let settled_pic = card_pic(&app, wid);
+    let at_rest = card_marks(&app, wid);
     for i in 0..1000u64 {
         let t = end + Duration::from_millis(1 + i * 7);
         set_now(t);
@@ -1175,7 +1585,11 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     }
     for _ in 0..20 {
         frame(&mut app, wid);
-        assert_eq!(painted(&app, wid).under, quads, "constant bytes");
+        assert_eq!(
+            card_layers(&app, wid),
+            layers,
+            "the same contents, replayed"
+        );
         assert_eq!(app.claude_footer_fp(wid, &plan), settled);
     }
     // Focus regained: the episode again, its first frame wanted at once
@@ -1192,7 +1606,7 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
         Some(back + Duration::from_millis(FRAME_MS)),
         "drawn: the next frame a frame on"
     );
-    let replayed = card_streams(&app, wid);
+    let replayed = card_marks(&app, wid);
     assert_eq!(
         kitty_x(&replayed),
         kitty_x(&at_rest),
@@ -1215,7 +1629,7 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     app.windows.get_mut(&wid).unwrap().focused = false;
     frame(&mut app, wid);
     assert_eq!(app.claude_card_deadline(back), None);
-    assert_eq!(painted(&app, wid).under, quads, "the settled frame");
+    assert_eq!(card_pic(&app, wid), settled_pic, "the settled frame");
     TEST_NOW.with(|now| now.set(None));
     host.shutdown_and_join();
 }
@@ -1246,9 +1660,16 @@ fn a_light_theme_card_is_ink() {
         let host = supervise(&mut app, session);
         let _ = aterm_effects::harness_card::take_line_ink_solves();
         frame(&mut app, wid);
+        let (under, over) = card_marks(&app, wid);
+        assert!(!under.is_empty() && !over.is_empty(), "{osc}");
+        assert!(
+            under
+                .iter()
+                .chain(&over)
+                .all(|m| m.inks.iter().all(|i| i.alpha > 0)),
+            "{osc}: ink, never light"
+        );
         let p = painted(&app, wid);
-        assert!(!p.under.is_empty() && !p.over.is_empty(), "{osc}");
-        assert!(p.under.iter().chain(&p.over).all(|q| q.alpha > 0), "{osc}");
         assert!(
             !p.decos.is_empty()
                 && p.decos
@@ -1294,9 +1715,9 @@ fn a_narrow_pane_drops_the_kitty_and_keeps_the_border_and_line() {
         feed(&app, session, &card_screen(24, cols, model, VERSION));
         let host = supervise(&mut app, session);
         frame(&mut app, wid);
-        let p = painted(&app, wid);
-        assert!(!p.under.is_empty(), "{cols}: the border");
-        assert_eq!(!p.over.is_empty(), kitty, "{cols}: the kitty and its stars");
+        let (under, over) = card_marks(&app, wid);
+        assert!(!under.is_empty(), "{cols}: the border");
+        assert_eq!(!over.is_empty(), kitty, "{cols}: the kitty and its stars");
         let strip = strip_rows(&app, wid);
         let want = expected_line(AutopilotView::Cruise, 11, cols);
         assert_eq!(
@@ -1329,21 +1750,13 @@ fn a_split_pane_decorates_its_own_card_only() {
     let vendor = app.windows[&wid].input_scratch.cells.clone();
     let host = supervise(&mut app, session);
     frame(&mut app, wid);
-    let p = painted(&app, wid);
-    assert!(!p.under.is_empty());
+    let (under, over) = card_marks(&app, wid);
+    assert!(!under.is_empty() && !over.is_empty());
     let (cw, _) = app.win_cell_size(wid);
     let pad = app.win_pad(wid);
-    let right = pad + pane_cols * cw;
-    assert!(
-        p.under
-            .iter()
-            .all(|q| usize::from(q.x) + usize::from(q.w) <= right)
-    );
-    assert!(
-        p.over
-            .iter()
-            .all(|q| usize::from(q.x) + usize::from(q.w) <= pane_cols * cw)
-    );
+    let right = pixel(pad + pane_cols * cw);
+    assert!(under.iter().all(|m| m.at.x1 <= right), "the border");
+    assert!(over.iter().all(|m| m.at.x1 <= right), "the kitty and stars");
     let glass = &app.windows[&wid].input_scratch.cells;
     for (r, (now, was)) in glass.iter().zip(&vendor).enumerate() {
         assert_eq!(
@@ -1964,18 +2377,14 @@ fn the_kitty_stands_three_rows_tall_beside_a_short_path() {
         let (_, ch) = app.win_cell_size(wid);
         let p = (ch - (ch / 14).max(1)) / 7;
         assert!(p >= 1, "a kitty at {ch} px");
-        let art: Vec<&GlowQuad> = painted(&app, wid)
-            .over
-            .iter()
-            .filter(|q| q.alpha == u8::MAX)
-            .collect();
-        assert!(!art.is_empty(), "long path {long_path}: the kitty");
-        let y0 = art.iter().map(|q| usize::from(q.y)).min().unwrap();
-        let y1 = art
-            .iter()
-            .map(|q| usize::from(q.y) + usize::from(q.h))
-            .max()
-            .unwrap();
+        let card = card_marks(&app, wid);
+        let art = kitty_mark(&card).expect("the kitty");
+        // Grid-interior pixels, as the over layer is laid.
+        let grid_top = grid_origin(&app, wid).1;
+        let (y0, y1) = (
+            usize::try_from(art.at.y0 - grid_top).unwrap(),
+            usize::try_from(art.at.y1 - grid_top).unwrap(),
+        );
         // The card's banner is pane row 1: the head sits half the two-row
         // art above the line between the card's first two rows.
         assert_eq!(
@@ -2059,37 +2468,41 @@ fn the_strip_removes_only_its_own() {
     assert_eq!(twice, [4], "once each");
 }
 
-/// THE TWO PIXEL SPACES the card's streams are drawn in: `glow_under` is
+/// THE TWO PIXEL SPACES the card's layers are laid in: the under layer in
 /// window pixels (the border's left side reaching half a cell into the
-/// window's padding), `nova_add` grid-interior pixels the renderers offset
-/// by the padding themselves; in both, a quad's `row` is its frame row. A
-/// strip row moves every quad one band down and its row one on, exactly;
-/// window padding moves the window stream with it and leaves the nova
-/// stream alone.
+/// window's padding), the over layer in grid-interior pixels the renderers
+/// offset by the grid's origin themselves. A strip row moves the card one
+/// row down — its origin a row lower in both layers, every mark exactly
+/// one row down; window padding moves the
+/// window layer's marks with it and leaves the grid layer's where they
+/// were in its own space.
 #[test]
-fn the_streams_meet_the_renderers_pixel_spaces() {
+fn the_layers_meet_the_renderers_pixel_spaces() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
     TEST_NOW.with(|now| now.set(Some(Instant::now())));
     frame(&mut app, wid);
-    let (under, over) = {
-        let p = painted(&app, wid);
-        (p.under.clone(), p.over.clone())
-    };
+    let (under, over) = card_marks(&app, wid);
     assert!(!under.is_empty() && !over.is_empty());
+    let layers = card_layers(&app, wid);
     let (cw, ch) = app.win_cell_size(wid);
+    let ch = pixel(ch);
     // A strip row above the grid.
     app.tab_strip_rows = 1;
     frame(&mut app, wid);
     assert_eq!(strip_rows(&app, wid), 1);
-    let down = |q: &GlowQuad| GlowQuad {
-        row: q.row + 1,
-        y: q.y + u16_of(ch),
-        ..*q
-    };
-    let p = painted(&app, wid);
-    assert_eq!(p.under, under.iter().map(down).collect::<Vec<_>>());
-    assert_eq!(p.over, over.iter().map(down).collect::<Vec<_>>());
+    let down = |ms: &[Mark]| ms.iter().map(|m| m.moved(0, ch)).collect::<Vec<_>>();
+    let (u1, o1) = card_marks(&app, wid);
+    assert_eq!(u1, down(&under), "the border and the trail, a row down");
+    assert_eq!(o1, down(&over), "the kitty and the stars, a row down");
+    for (now, was) in card_layers(&app, wid).iter().zip(&layers) {
+        assert_eq!(
+            now.offset,
+            (was.offset.0, was.offset.1 + ch),
+            "{:?}: the origin a row down",
+            now.slot
+        );
+    }
     // Window padding, left and top.
     app.tab_strip_rows = 0;
     {
@@ -2102,24 +2515,18 @@ fn the_streams_meet_the_renderers_pixel_spaces() {
         (12, 8)
     );
     frame(&mut app, wid);
-    let p = painted(&app, wid);
-    assert_eq!(p.over, over, "grid-interior: the renderer adds the padding");
-    let left = |qs: &[GlowQuad]| qs.iter().map(|q| usize::from(q.x)).min().unwrap();
-    let right = |qs: &[GlowQuad]| qs.iter().map(|q| usize::from(q.x + q.w)).max().unwrap();
-    let top = |qs: &[GlowQuad]| qs.iter().map(|q| usize::from(q.y)).min().unwrap();
-    let bottom = |qs: &[GlowQuad]| qs.iter().map(|q| usize::from(q.y + q.h)).max().unwrap();
-    assert_eq!(right(&p.under), right(&under) + 12);
-    assert_eq!(top(&p.under), top(&under) + 8);
-    assert_eq!(bottom(&p.under), bottom(&under) + 8);
-    assert_eq!(left(&under), 0, "no padding: the border at the grid's edge");
-    assert_eq!(left(&p.under), 12 - cw / 2, "half a cell into the padding");
-    let rows = |qs: &[GlowQuad]| {
-        let mut rows: Vec<u16> = qs.iter().map(|q| q.row).collect();
-        rows.sort_unstable();
-        rows.dedup();
-        rows
-    };
-    assert_eq!(rows(&p.under), rows(&under), "frame rows either way");
+    let (u2, o2) = card_marks(&app, wid);
+    assert_eq!(
+        o2,
+        over.iter().map(|m| m.moved(12, 8)).collect::<Vec<_>>(),
+        "grid-interior: the renderer adds the padding"
+    );
+    let (was, now) = (hull(&under), hull(&u2));
+    assert_eq!(now.x1, was.x1 + 12);
+    assert_eq!(now.y0, was.y0 + 8);
+    assert_eq!(now.y1, was.y1 + 8);
+    assert_eq!(was.x0, 0, "no padding: the border at the grid's edge");
+    assert_eq!(now.x0, 12 - pixel(cw / 2), "half a cell into the padding");
     TEST_NOW.with(|now| now.set(None));
     host.shutdown_and_join();
 }
@@ -2134,24 +2541,21 @@ fn serious_mode_keeps_a_still_border_only() {
     let host = supervise(&mut app, session);
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
     frame(&mut app, wid);
-    let right = |app: &App| {
-        painted(app, wid)
-            .under
-            .iter()
-            .map(|q| usize::from(q.x + q.w))
-            .max()
-            .unwrap()
-    };
-    assert!(!painted(&app, wid).over.is_empty());
+    let right = |app: &App| hull(&marks(app, wid, FxSlot::Under)).x1;
+    assert!(!marks(&app, wid, FxSlot::Over).is_empty());
     app.serious_mode = true;
     frame(&mut app, wid);
-    let p = painted(&app, wid);
-    assert!(!p.under.is_empty(), "the border");
-    assert!(p.over.is_empty(), "no kitty, no stars");
+    let (under, over) = card_marks(&app, wid);
+    assert!(!under.is_empty(), "the border");
+    assert!(over.is_empty(), "no kitty, no stars");
     let (cw, _) = app.win_cell_size(wid);
     let line = expected_line(AutopilotView::Cruise, 11, 120);
     let line_end = 11 + LINE_LEAD + text_cells(&line);
-    assert_eq!(right(&app), (line_end + 1) * cw, "the box hugs the text");
+    assert_eq!(
+        right(&app),
+        pixel((line_end + 1) * cw),
+        "the box hugs the text"
+    );
     assert_eq!(app.claude_card_deadline(Instant::now()), None, "still");
     let strip = strip_rows(&app, wid);
     assert!(glass_text(&app, wid, strip + 4, 0..120).contains("aterm harness"));
@@ -2166,11 +2570,14 @@ fn set_now(t: Option<Instant>) {
 /// THE TAB MENU over the card (`App::splice_tab_menu`, topmost chrome,
 /// painted after the card, hanging from the first grid row where a fresh
 /// card sits): none of the card's light, ink or star shows on the menu's
-/// rectangle, what lies clear of it stays, and the record still matches the
-/// glass — framed again with the menu open, each entry of the card is in its
-/// stream exactly once. CONTROL: before the menu's splice, the border, the
-/// line's ink and its star (the menu at the card's text), and the kitty and
-/// its stars (the menu at the kitty) lay under the rectangle.
+/// rectangle — its layers are cut there by the occluder the menu's scrub
+/// pushes, painted through it by the CPU renderer's own slicer, and its ink
+/// and star are cut from their streams — what lies clear of it stays, pixel
+/// for pixel, and the record still matches the glass: framed again with the
+/// menu open, each of the card's layers is on the frame exactly once.
+/// CONTROL: painted without the occluder, the border, the kitty and its
+/// stars light pixels on the rectangle, and before the menu's splice the
+/// line's ink and its star (the menu at the card's text) lay under it.
 #[test]
 fn the_tab_menu_hides_the_card_under_it() {
     let (mut app, wid, session) = glass(120);
@@ -2180,41 +2587,26 @@ fn the_tab_menu_hides_the_card_under_it() {
     frame(&mut app, wid);
     let (cw, _) = app.win_cell_size(wid);
     let pad = app.win_pad(wid);
-    let kitty = painted(&app, wid)
-        .over
-        .iter()
-        .map(|q| usize::from(q.x) / cw)
-        .min()
-        .expect("the kitty and its stars");
+    let kitty = over_col(&app, wid, cw, pad);
     for (anchor, over_kitty) in [(3, false), (u16_of(kitty), true)] {
         assert!(app.open_tab_context_menu(wid, 0, anchor, false));
         frame(&mut app, wid);
-        let before = {
+        let (layers, ink, decos) = {
             let p = painted(&app, wid);
-            (
-                p.under.clone(),
-                p.over.clone(),
-                p.ink.clone(),
-                p.decos.clone(),
-            )
+            (p.layers.clone(), p.ink.clone(), p.decos.clone())
         };
+        let (under, over) = card_marks(&app, wid);
         app.splice_tab_menu(wid);
         let rect = app.windows[&wid].tab_menu_rect.expect("the menu is up");
-        let on = |q: &GlowQuad, origin: usize| {
-            let (x0, x1) = (usize::from(q.x), usize::from(q.x) + usize::from(q.w));
-            rect.contains(usize::from(q.row), rect.col)
-                && x1 > origin + rect.col * cw
-                && x0 < origin + (rect.col + rect.w) * cw
-        };
+        let menu = menu_px(&app, wid, rect);
         let cell_on = |row: u16, col: u16| rect.contains(usize::from(row), usize::from(col));
-        let (under, over, ink, decos) = &before;
         assert!(
-            under.iter().any(|q| on(q, pad)),
+            under.iter().any(|m| m.at.overlaps(menu)),
             "{anchor}: CONTROL, the border"
         );
         if over_kitty {
             assert!(
-                over.iter().any(|q| on(q, 0)),
+                over.iter().any(|m| m.at.overlaps(menu)),
                 "{anchor}: CONTROL, the kitty"
             );
         } else {
@@ -2230,13 +2622,10 @@ fn the_tab_menu_hides_the_card_under_it() {
         let p = painted(&app, wid);
         let s = &app.windows[&wid].input_scratch;
         assert!(
-            !p.under.iter().any(|q| on(q, pad)),
-            "{anchor}: no light on it"
+            s.fx_occluders.contains(&menu),
+            "{anchor}: the menu's rectangle occludes the layers"
         );
-        assert!(
-            !p.over.iter().any(|q| on(q, 0)),
-            "{anchor}: no kitty or star on it"
-        );
+        assert_eq!(p.layers, layers, "{anchor}: the layers are not cut here");
         assert!(
             !p.ink.iter().any(|c| cell_on(c.row, c.col)),
             "{anchor}: no ink"
@@ -2245,78 +2634,50 @@ fn the_tab_menu_hides_the_card_under_it() {
             !p.decos.iter().any(|d| cell_on(d.row, d.col)),
             "{anchor}: no star"
         );
-        for q in under.iter().filter(|q| on(q, pad)) {
-            assert!(
-                !s.glow_under.contains(q),
-                "{anchor}: cut from the glass too"
-            );
+        // On the glass: no pixel of the card's on the menu, the rest as it
+        // was. CONTROL: without the occluder, the card lights the menu.
+        let (shown, w) = card_pixels(&app, wid, true);
+        let (whole, _) = card_pixels(&app, wid, false);
+        let on_menu = |i: usize| {
+            let (x, y) = (pixel(i % w), pixel(i / w));
+            menu.x0 <= x && x < menu.x1 && menu.y0 <= y && y < menu.y1
+        };
+        assert!(
+            (0..whole.len()).any(|i| on_menu(i) && whole[i] != 0),
+            "{anchor}: CONTROL, the card lights the menu's rectangle"
+        );
+        for i in 0..shown.len() {
+            let want = if on_menu(i) { 0 } else { whole[i] };
+            assert_eq!(shown[i], want, "{anchor}: pixel ({}, {})", i % w, i / w);
         }
-        for q in over.iter().filter(|q| on(q, 0)) {
-            assert!(!s.nova_add.contains(q), "{anchor}: cut from the glass too");
-        }
-        for q in under.iter().filter(|q| !on(q, pad)) {
-            assert!(
-                p.under.contains(q) && s.glow_under.contains(q),
-                "{anchor}: the card clear of it stays"
-            );
-        }
-        // Framed again with the menu open: each of the card's entries once.
+        // Framed again with the menu open: each of the card's layers once.
         frame(&mut app, wid);
         app.splice_tab_menu(wid);
         let p = painted(&app, wid);
         let s = &app.windows[&wid].input_scratch;
-        let once = |stream: &[GlowQuad], ours: &[GlowQuad]| {
-            ours.iter().all(|q| {
-                stream.iter().filter(|o| *o == q).count() == ours.iter().filter(|o| *o == q).count()
-            })
-        };
-        assert!(
-            once(&s.glow_under, &p.under),
-            "{anchor}: the record is the glass"
-        );
-        assert!(
-            once(&s.nova_add, &p.over),
-            "{anchor}: the record is the glass"
-        );
+        assert_eq!(p.layers.len(), 2, "{anchor}");
+        for l in &p.layers {
+            assert_eq!(
+                s.fx_layers.iter().filter(|o| *o == l).count(),
+                1,
+                "{anchor}: the record is the glass"
+            );
+        }
         assert!(app.close_tab_menu(wid));
     }
     set_now(None);
     host.shutdown_and_join();
 }
 
-/// A QUAD CUT by a rectangle keeps its parts either side, on its own ramp:
-/// clear of the columns it is untouched; inside them it goes; straddling
-/// them it leaves a left and a right piece whose ends read the ramp at the
-/// cut (a flat quad's pieces flat).
-#[test]
-fn a_cut_quad_keeps_its_ramp_either_side() {
-    let ramp = GlowQuad::gradient(2, 100, 40, 100, 8, 0x00_00_00, 0, 0xc8_64_00, 0);
-    let mut out = Vec::new();
-    assert!(!cut_quad(&ramp, 200..300, &mut out), "clear of it");
-    assert!(!cut_quad(&ramp, 0..100, &mut out), "ends where it starts");
-    assert!(out.is_empty());
-    assert!(cut_quad(&ramp, 90..210, &mut out), "inside it");
-    assert!(out.is_empty(), "nothing left");
-    assert!(cut_quad(&ramp, 125..150, &mut out));
-    let [left, right] = out[..] else {
-        panic!("two pieces: {out:?}");
-    };
-    assert_eq!((left.x, left.w, right.x, right.w), (100, 25, 150, 50));
-    assert_eq!((left.row, left.y, left.h), (2, 40, 8));
-    assert_eq!((left.color, left.color2), (0x00_00_00, 0x32_19_00));
-    assert_eq!((right.color, right.color2), (0x64_32_00, 0xc8_64_00));
-    let flat = GlowQuad::flat(0, 10, 0, 30, 4, 0x12_34_56, 200);
-    out.clear();
-    assert!(cut_quad(&flat, 20..30, &mut out));
-    assert!(
-        out.iter()
-            .all(|q| (q.color, q.color2, q.alpha, q.alpha2) == (0x12_34_56, 0x12_34_56, 200, 200)),
-        "{out:?}"
-    );
-    assert_eq!(
-        out.iter().map(|q| (q.x, q.w)).collect::<Vec<_>>(),
-        [(10, 10), (30, 10)]
-    );
+/// The leftmost column the card's over layer (the kitty and its stars)
+/// reaches on `wid`'s last frame.
+fn over_col(app: &App, wid: WindowId, cw: usize, pad: usize) -> usize {
+    let x0 = marks(app, wid, FxSlot::Over)
+        .iter()
+        .map(|m| m.at.x0)
+        .min()
+        .expect("the kitty and its stars");
+    usize::try_from(x0).unwrap().saturating_sub(pad) / cw
 }
 
 /// THE ANCHORED FRAME: while an episode plays, the next frame is due a
@@ -2424,8 +2785,8 @@ fn a_pane_that_moves_in_the_plan_keeps_its_card() {
         };
         feed(app, session, &card_screen(rows, cols, MODEL, VERSION));
     };
-    paint(&app);
     publish(&app, session, VERSION);
+    paint(&app);
     let host = supervise(&mut app, session);
     let t0 = Instant::now();
     set_now(Some(t0));
@@ -2538,14 +2899,26 @@ fn an_autopilot_change_arms_an_episode() {
         app.claude_card_deadline(now) == Some(now + Duration::from_millis(FRAME_MS))
     };
     let now = settle(&mut app);
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Chip
+    ));
     frame(&mut app, wid);
     assert!(playing(&app, now), "Cruise to Land plays");
     let now = settle(&mut app);
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Chip
+    ));
     frame(&mut app, wid);
     assert!(painted(&app, wid).is_empty(), "Off: bare");
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Cruise)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Chip
+    ));
     frame(&mut app, wid);
     assert!(playing(&app, now), "Off to Cruise plays");
     set_now(None);
@@ -2600,19 +2973,35 @@ fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
     };
     // CONTROL: the arm works under a held claim.
     let now = settle(&mut app);
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Land)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Chip
+    ));
     frame(&mut app, wid);
     assert!(playing(&app, now), "Cruise to Land plays");
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Cruise)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Chip
+    ));
     frame(&mut app, wid);
     let now = settle(&mut app);
     // Off: the worker stops and gives back its claim.
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Off)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Chip
+    ));
     release();
     frame(&mut app, wid);
     assert!(painted(&app, wid).is_empty(), "Off: bare");
     // Back to Cruise: a frame in the gap before the new worker's claim.
-    assert!(app.set_session_autopilot(session, Some(Autopilot::Cruise)));
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Chip
+    ));
     frame(&mut app, wid);
     assert!(
         painted(&app, wid).is_empty(),
@@ -2673,12 +3062,14 @@ fn buffer<T>(v: &Vec<T>) -> (usize, usize) {
 
 /// A FRAME UNDER THE TAB MENU REALLOCATES NOTHING (`cut_out`, at the frame
 /// rate while an episode plays under the open menu): each cut is built in
-/// the window's spare and copied back, so the four streams, the card's record
-/// of them and the spares keep their buffers, frame after frame, once the
-/// first frame under the menu has grown the spares. CONTROL: each frame's cut
-/// takes something out — the border, the line's ink and its star (the menu
-/// at the card's text), the kitty (the menu at the kitty) — so the passes
-/// that rebuild a stream run.
+/// the window's spare and copied back, so the frame's layers and its ink
+/// and decoration streams, the card's record of them and the spares keep
+/// their buffers, frame after frame, once the first frame under the menu
+/// has grown the spares; the card's layers are not cut here at all (the
+/// menu's occluder cuts them in the renderer). CONTROL: each frame's cut
+/// takes something out — the line's ink and its star (the menu at the
+/// card's text) — and the menu's occluder lies on the border, and on the
+/// kitty with the menu at the kitty.
 #[test]
 fn a_frame_under_the_tab_menu_keeps_its_buffers() {
     let (mut app, wid, session) = glass(120);
@@ -2687,39 +3078,26 @@ fn a_frame_under_the_tab_menu_keeps_its_buffers() {
     set_now(Some(Instant::now()));
     frame(&mut app, wid);
     let (cw, _) = app.win_cell_size(wid);
-    let kitty = painted(&app, wid)
-        .over
-        .iter()
-        .map(|q| usize::from(q.x) / cw)
-        .min()
-        .expect("the kitty and its stars");
+    let kitty = over_col(&app, wid, cw, app.win_pad(wid));
     let buffers = |app: &App| {
         let (s, c) = (
             &app.windows[&wid].input_scratch,
             &app.windows[&wid].claude_card,
         );
         [
-            buffer(&s.glow_under),
-            buffer(&s.nova_add),
+            buffer(&s.fx_layers),
             buffer(&s.ink),
             buffer(&s.word_decorations),
-            buffer(&c.painted.under),
-            buffer(&c.painted.over),
+            buffer(&c.painted.layers),
             buffer(&c.painted.ink),
             buffer(&c.painted.decos),
-            buffer(&c.spare_quads),
             buffer(&c.spare_ink),
             buffer(&c.spare_decos),
         ]
     };
     let record = |app: &App| {
         let p = painted(app, wid);
-        (
-            p.under.clone(),
-            p.over.clone(),
-            p.ink.clone(),
-            p.decos.clone(),
-        )
+        (p.layers.clone(), p.ink.clone(), p.decos.clone())
     };
     for (anchor, over_kitty) in [(3, false), (u16_of(kitty), true)] {
         assert!(app.open_tab_context_menu(wid, 0, anchor, false));
@@ -2727,16 +3105,26 @@ fn a_frame_under_the_tab_menu_keeps_its_buffers() {
         app.splice_tab_menu(wid);
         for i in 0..3 {
             frame(&mut app, wid);
-            let (under, over, ink, decos) = record(&app);
+            let (layers, ink, decos) = record(&app);
+            let (under, over) = card_marks(&app, wid);
             let before = buffers(&app);
             app.splice_tab_menu(wid);
             let cut = record(&app);
-            assert_ne!(cut.0, under, "{anchor}/{i}: CONTROL, the border is cut");
+            let rect = app.windows[&wid].tab_menu_rect.expect("the menu is up");
+            let menu = menu_px(&app, wid, rect);
+            assert!(
+                under.iter().any(|m| m.at.overlaps(menu)),
+                "{anchor}/{i}: CONTROL, the occluder lies on the border"
+            );
+            assert_eq!(cut.0, layers, "{anchor}/{i}: the layers are not cut here");
             if over_kitty {
-                assert_ne!(cut.1, over, "{anchor}/{i}: CONTROL, the kitty is cut");
+                assert!(
+                    over.iter().any(|m| m.at.overlaps(menu)),
+                    "{anchor}/{i}: CONTROL, the occluder lies on the kitty's light"
+                );
             } else {
-                assert_ne!(cut.2, ink, "{anchor}/{i}: CONTROL, the ink is cut");
-                assert_ne!(cut.3, decos, "{anchor}/{i}: CONTROL, the star is cut");
+                assert_ne!(cut.1, ink, "{anchor}/{i}: CONTROL, the ink is cut");
+                assert_ne!(cut.2, decos, "{anchor}/{i}: CONTROL, the star is cut");
             }
             assert_eq!(buffers(&app), before, "{anchor}/{i}: nothing reallocated");
         }
@@ -2753,8 +3141,8 @@ fn a_frame_under_the_tab_menu_keeps_its_buffers() {
 /// in); and a REBUILD of the text (a repaint) under an unmoved card shares
 /// the last rebuild's reading too, under a new rebuild number (the layout's
 /// cells are compared once per rebuild). CONTROL: new text whose card names
-/// another build is a new reading; a process of another build leaves the
-/// card bare.
+/// another build is a new reading; a process of another build, under a card
+/// its own group painted, leaves the card bare by the build rung.
 #[test]
 fn a_reused_pane_text_shares_its_card_reading() {
     let (mut app, wid, session) = glass(120);
@@ -2767,14 +3155,22 @@ fn a_reused_pane_text_shares_its_card_reading() {
         rows: 24,
         cols: 120,
     };
-    // The process as the splice reads it, under its own timeline lock.
-    let leaf = |app: &App| {
-        let timeline = app.pool.get(session).unwrap().ctx.timeline.lock().unwrap();
-        let version = timeline.claude_footer().and_then(|f| f.version.clone());
-        let pgid = timeline.claude_footer_identity().map(|(pgid, _)| pgid);
-        drop(timeline);
+    // The gate as the splice reads it, under its own timeline lock, and the
+    // last frame's fence.
+    let judged = |app: &App| {
+        let gate = app
+            .pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .card_gate();
+        let ws = &app.windows[&wid];
+        let mut check = GateCheck::new(gate, FenceFrame::of(&ws.input_scratch));
         card_leaf(
-            &app.windows[&wid].claude_footer_texts.borrow(),
+            &ws.claude_footer_texts.borrow(),
             app.config.claude_footer_card(),
             0,
             session,
@@ -2782,15 +3178,18 @@ fn a_reused_pane_text_shares_its_card_reading() {
             RenderCell::default(),
             AutopilotView::Cruise,
             true,
-            pgid.zip(version.as_deref()),
+            &mut check,
         )
-        .card
     };
+    let leaf = |app: &App| judged(app).card;
     let (first, again) = (leaf(&app), leaf(&app));
-    let (Some((a, pgid, gen_a)), Some((b, _, gen_b))) = (&first, &again) else {
+    let (Some((a, token, gen_a)), Some((b, _, gen_b))) = (&first, &again) else {
         panic!("a decorated card: {first:?} {again:?}");
     };
-    assert_eq!((*pgid, &*a.version), (PGID, VERSION));
+    assert_eq!(
+        (Some(*token), &*a.version),
+        (claude_image(PGID, VERSION, 1).token, VERSION)
+    );
     assert!(Arc::ptr_eq(a, b), "one reading, shared");
     assert_eq!(gen_a, gen_b, "the same text");
     feed(&app, session, &card_screen(24, 120, MODEL, VERSION));
@@ -2801,8 +3200,8 @@ fn a_reused_pane_text_shares_its_card_reading() {
     };
     assert_ne!(gen_c, gen_a, "the text was rebuilt");
     assert!(Arc::ptr_eq(c, a), "the same card, the same reading");
-    feed(&app, session, &card_screen(24, 120, MODEL, "2.1.284"));
     publish(&app, session, "2.1.284");
+    feed(&app, session, &card_screen(24, 120, MODEL, "2.1.284"));
     frame(&mut app, wid);
     let fresh = leaf(&app);
     let Some((d, _, _)) = &fresh else {
@@ -2810,9 +3209,53 @@ fn a_reused_pane_text_shares_its_card_reading() {
     };
     assert!(!Arc::ptr_eq(d, a), "CONTROL: another card, a new reading");
     assert_eq!(&*d.version, "2.1.284");
+    // The process becomes another build while its card still names 2.1.284,
+    // painted after the cut: the token and the fence hold, the build alone
+    // refuses it.
     publish(&app, session, VERSION);
-    assert!(leaf(&app).is_none(), "CONTROL: another build stays bare");
+    feed(&app, session, &card_screen(24, 120, MODEL, "2.1.284"));
+    frame(&mut app, wid);
+    let other = judged(&app);
+    assert_eq!(
+        (other.card.is_none(), other.bare),
+        (true, Some(Bare::Build)),
+        "CONTROL: another build stays bare, by its build"
+    );
     host.shutdown_and_join();
+}
+
+/// A FENCE OF ANOTHER HOLDER READS NO CARD (card engine §3.8, cheapest
+/// first): once the front passes from the drawer to a shell (the drawer
+/// stopped, its image still current), a frame whose pane text was rebuilt
+/// judges the card by the token alone: bare, the card under it never read
+/// or laid out. CONTROL: under the drawer's own fence the same rebuilt text
+/// reads its card once and lays it at its new place. Mutation-checked: the
+/// card read before the token costs the shell's frame one read.
+#[test]
+fn a_fence_of_another_holder_reads_no_card() {
+    let base = card_screen(24, 120, MODEL, VERSION);
+    let mut lowered = vec![String::new()];
+    lowered.extend_from_slice(&base[..base.len() - 5]);
+    lowered.extend_from_slice(&base[base.len() - 4..]);
+    for drawer_front in [true, false] {
+        let (mut app, wid, session) = glass(120);
+        let host = supervise(&mut app, session);
+        frame(&mut app, wid);
+        if !drawer_front {
+            cut(&app, session, None, CutKind::Group, true);
+        }
+        feed(&app, session, &lowered);
+        app.capture_words(wid, Instant::now());
+        app.splice_tab_strip(wid);
+        let cost = pass_cost(&mut app, wid);
+        let n = usize::from(drawer_front);
+        assert_eq!(
+            (cost.text_rebuilds, cost.reads, cost.layouts),
+            (1, n, n),
+            "drawer in front {drawer_front}: {cost:?}"
+        );
+        host.shutdown_and_join();
+    }
 }
 
 /// THE CARDS BEFORE THE WINDOW SERVER (`crate::work_counts`): whether a
@@ -2891,6 +3334,9 @@ struct PassCost {
     line_inks: usize,
     /// Session timeline locks the splice took.
     timeline_locks: usize,
+    /// Session timeline locks the dev card probe took (its rows: one a pane
+    /// judged, none with the probe off).
+    probe_locks: usize,
     /// Rebuilds of a Claude Code pane's text (the footer's, card or none).
     text_rebuilds: usize,
     /// The footer's own clock reads (its lights').
@@ -2898,9 +3344,15 @@ struct PassCost {
     /// Sorts of the card's recorded keys to take its light back out of a
     /// stream (`remove_each_once`): none where the stream holds none of it.
     strip_sorts: usize,
-    /// Light quads moved into the nova stream's pixels (`nova_of`): none
-    /// for a card replayed at rest, whose moved kitty and stars are kept.
-    nova_moves: usize,
+    /// Fx contents sealed on this thread (`FxContent::new`/`edit`): none
+    /// for a card replayed at rest, whose kept contents go on as they are.
+    fx_builds: u64,
+    /// Fx contents copied on this thread (a `Clone` of the payload): none,
+    /// ever — a layer hands its content on by `Arc`.
+    fx_copies: u64,
+    /// Fx arts built (`aterm_render::fx::registry`): none per frame — a
+    /// card's arts are built once per cell height, off the frame path.
+    art_builds: usize,
     /// Window cell boxes the renderer derived off its face (the card's look
     /// asks the window's, `App::win_cell_size`): none while the window's
     /// px and font are what they were.
@@ -2920,12 +3372,14 @@ fn pass_cost(app: &mut App, wid: WindowId) -> PassCost {
         crate::work_counts::take_autopilot_reads(),
         crate::work_counts::take_card_line_inks(),
         crate::work_counts::take_footer_timeline_locks(),
+        crate::work_counts::take_card_probe_locks(),
         crate::work_counts::take_pane_text_rebuilds(),
         crate::work_counts::take_footer_clock_reads(),
         crate::work_counts::take_card_strip_sorts(),
-        crate::work_counts::take_card_nova_moves(),
         crate::work_counts::take_cell_geometry_derivations(),
+        aterm_render::test_counters::take_art_builds(),
     );
+    let (builds0, copies0) = aterm_core::render::fx_counts_here();
     let ((), allocations) = crate::work_counts::allocations_in(|| {
         let _ = app.claude_footer_fp(wid, &plan);
         app.splice_claude_footer(wid, &plan, route);
@@ -2941,10 +3395,13 @@ fn pass_cost(app: &mut App, wid: WindowId) -> PassCost {
         autopilot_reads: crate::work_counts::take_autopilot_reads(),
         line_inks: crate::work_counts::take_card_line_inks(),
         timeline_locks: crate::work_counts::take_footer_timeline_locks(),
+        probe_locks: crate::work_counts::take_card_probe_locks(),
         text_rebuilds: crate::work_counts::take_pane_text_rebuilds(),
         footer_clock_reads: crate::work_counts::take_footer_clock_reads(),
         strip_sorts: crate::work_counts::take_card_strip_sorts(),
-        nova_moves: crate::work_counts::take_card_nova_moves(),
+        fx_builds: aterm_core::render::fx_counts_here().0 - builds0,
+        fx_copies: aterm_core::render::fx_counts_here().1 - copies0,
+        art_builds: aterm_render::test_counters::take_art_builds(),
         cell_geometries: crate::work_counts::take_cell_geometry_derivations(),
     }
 }
@@ -3002,16 +3459,17 @@ fn bare_glass(cols: u16) -> (App, WindowId, u64) {
 /// line's ink kept, the session's Autopilot read once by the key and once by
 /// the splice (the chips and the card share each reading) and ONE timeline
 /// lock (the splice's own: the card takes the process from it). The glass
-/// is the settled frame, the same bytes every time, put on from where it is
-/// kept: no quad of it moved into the nova stream's pixels again
-/// (`nova_moves`), and the card's look reads the window's cell box from what
-/// the renderer kept, deriving none off the face (`cell_geometries`).
+/// is the settled frame, its two layers the same content `Arc`s at the same
+/// place every time, put on from where they are kept: no fx content sealed
+/// or copied and no art built (`fx_builds`, `fx_copies`, `art_builds`), and
+/// the card's look reads the window's cell box from what the renderer
+/// kept, deriving none off the face (`cell_geometries`).
 ///
 /// NEGATIVE CONTROLS: a window regaining focus re-arms the card, and its
-/// next pass DRAWS a frame on the clock, moves its kitty and stars and inks
-/// its line (`ticks`, `clock_reads`, `nova_moves`, `line_inks` move — the
+/// next pass DRAWS a frame on the clock, seals its two contents and inks
+/// its line (`ticks`, `clock_reads`, `fx_builds`, `line_inks` move — the
 /// counters see the work the rest skips; a line cache that never keeps its
-/// ink fails here, and so does a replay that moves its quads again,
+/// ink fails here, and so does a host that draws its card at rest,
 /// mutation-checked); and a card decorated for the first time allocates its
 /// buffers (the allocation counter sees the card's).
 #[test]
@@ -3019,13 +3477,10 @@ fn a_settled_card_at_rest_costs_the_frame_nothing() {
     let t0 = Instant::now();
     let (mut app, wid, _session, host) = settled_glass(120, t0);
     let (mut bare, bare_wid, _) = bare_glass(120);
-    let quads = painted(&app, wid).under.clone();
-    let kitty = painted(&app, wid).over.clone();
-    assert!(!quads.is_empty(), "the border is on the glass");
-    assert!(
-        !kitty.is_empty(),
-        "the kitty and its stars are on the glass"
-    );
+    let layers = card_layers(&app, wid);
+    let (under, over) = card_marks(&app, wid);
+    assert!(!under.is_empty(), "the border is on the glass");
+    assert!(!over.is_empty(), "the kitty and its stars are on the glass");
     let _ = pass_cost(&mut app, wid);
     let _ = pass_cost(&mut bare, bare_wid);
     let floor = pass_cost(&mut bare, bare_wid);
@@ -3041,8 +3496,7 @@ fn a_settled_card_at_rest_costs_the_frame_nothing() {
     for i in 0..50u64 {
         set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 100 + 7 * i)));
         assert_eq!(pass_cost(&mut app, wid), floor, "frame {i}");
-        assert_eq!(painted(&app, wid).under, quads, "frame {i}: the same glass");
-        assert_eq!(painted(&app, wid).over, kitty, "frame {i}: the same kitty");
+        assert_eq!(card_layers(&app, wid), layers, "frame {i}: the same glass");
     }
     assert_eq!(pass_cost(&mut bare, bare_wid), floor, "the floor holds");
     // NEGATIVE CONTROL: focus regained, the episode is drawn on the clock.
@@ -3053,10 +3507,12 @@ fn a_settled_card_at_rest_costs_the_frame_nothing() {
     assert_eq!(replayed.ticks, 1, "CONTROL: an episode frame is drawn");
     assert!(replayed.clock_reads > 0, "CONTROL: on the clock");
     assert_eq!(replayed.line_inks, 1, "CONTROL: its line inked anew");
-    assert!(
-        replayed.nova_moves > 0,
-        "CONTROL: a drawn frame's kitty and stars are moved into the nova stream"
+    assert_eq!(
+        (replayed.fx_builds, replayed.fx_copies, replayed.art_builds),
+        (2, 0, 0),
+        "CONTROL: a drawn frame seals its two contents, with the arts it had"
     );
+    assert_ne!(card_layers(&app, wid), layers, "CONTROL: new contents");
     // NEGATIVE CONTROL: a card decorated for the first time grows its
     // buffers — a first frame with the harness allocates more than the same
     // first frame without it.
@@ -3078,6 +3534,292 @@ fn a_settled_card_at_rest_costs_the_frame_nothing() {
     );
     set_now(None);
     host.shutdown_and_join();
+}
+
+/// AN INLINE SCROLL OF A SETTLED CARD DRAWS NOTHING (card engine §4.8):
+/// while Claude's inline output scrolls a card at rest up the screen a row
+/// a frame, the card is read and laid out anew at its new place — and
+/// REPLAYED there: the same two contents (`Arc::ptr_eq`) at an origin a row
+/// up, every mark exactly a row up, and the pass draws no frame, seals or
+/// copies no fx content, builds no art and reads no clock for the card.
+/// NEGATIVE CONTROL: a window regaining focus re-arms the card, and its
+/// next pass draws a frame and seals its two contents (mutation-checked: a
+/// host that draws instead of replaying fails the rows above).
+#[test]
+fn an_inline_scroll_replays_the_settled_card_at_its_new_place() {
+    let t0 = Instant::now();
+    let base = card_screen(24, 120, MODEL, VERSION);
+    // The card `down` rows lower, the composer kept at the bottom.
+    let lowered = |down: usize| {
+        let mut rows = vec![String::new(); down];
+        rows.extend_from_slice(&base[..base.len() - 4 - down]);
+        rows.extend_from_slice(&base[base.len() - 4..]);
+        rows
+    };
+    let (mut app, wid, session) = glass(120);
+    feed(&app, session, &lowered(3));
+    let host = supervise(&mut app, session);
+    for t in [0, FRAME_MS, EPISODE_MS + 1] {
+        set_now(Some(t0 + Duration::from_millis(t)));
+        frame(&mut app, wid);
+    }
+    assert!(
+        app.windows[&wid].claude_card.entries[0].card.at_rest(),
+        "settled"
+    );
+    let ch = pixel(app.win_cell_size(wid).1);
+    for down in (0..3).rev() {
+        let layers = card_layers(&app, wid);
+        let (under, over) = card_marks(&app, wid);
+        assert!(!under.is_empty() && !over.is_empty(), "down {down}: drawn");
+        feed(&app, session, &lowered(down));
+        set_now(Some(t0 + Duration::from_secs(10 + down as u64)));
+        app.capture_words(wid, Instant::now());
+        app.splice_tab_strip(wid);
+        let cost = pass_cost(&mut app, wid);
+        assert_eq!(
+            (cost.reads, cost.layouts),
+            (1, 1),
+            "down {down}: CONTROL, read and laid anew at its new place: {cost:?}"
+        );
+        assert_eq!(
+            (
+                cost.ticks,
+                cost.clock_reads,
+                cost.fx_builds,
+                cost.fx_copies,
+                cost.art_builds
+            ),
+            (0, 0, 0, 0, 0),
+            "down {down}: replayed, nothing drawn: {cost:?}"
+        );
+        let now = card_layers(&app, wid);
+        assert_eq!(now.len(), 2);
+        for (l, was) in now.iter().zip(&layers) {
+            assert!(
+                Arc::ptr_eq(&l.content, &was.content),
+                "down {down}: {:?}, the same contents",
+                l.slot
+            );
+            assert_eq!(l.offset, (was.offset.0, was.offset.1 - ch), "down {down}");
+        }
+        let up = |ms: &[Mark]| ms.iter().map(|m| m.moved(0, -ch)).collect::<Vec<_>>();
+        assert_eq!(
+            card_marks(&app, wid),
+            (up(&under), up(&over)),
+            "down {down}"
+        );
+    }
+    // NEGATIVE CONTROL: re-armed, the next pass draws.
+    let back = t0 + Duration::from_secs(60);
+    set_now(Some(back));
+    app.rearm_claude_cards(wid, || back);
+    let drawn = pass_cost(&mut app, wid);
+    assert_eq!(
+        (drawn.ticks, drawn.fx_builds, drawn.fx_copies),
+        (1, 2, 0),
+        "CONTROL: a drawn frame seals its two contents: {drawn:?}"
+    );
+    set_now(None);
+    host.shutdown_and_join();
+}
+
+/// THE CARD'S ARTS, AHEAD (card engine §4.3): a card drawer's image
+/// published for the session a window shows queues the card's arts at the
+/// window's cell height for the renderer's residency — every art the card
+/// can draw with (`CardArts::arts`) — when the status sweep visits the
+/// session off the edged inbox; the card's first frame then draws with
+/// those very arts. A cell metric change while the drawer is in front
+/// queues them again (`App::sync_cell_pixel_size`). CONTROLS: a shell's
+/// image queues nothing on its edge or on a metric change, and a drawer
+/// with the card switched off queues nothing.
+#[test]
+fn a_published_drawer_queues_the_cards_arts() {
+    use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
+    let shell = || {
+        Arc::new(crate::holder_image::HolderImage::of(
+            PGID,
+            Some(1),
+            Some(std::path::PathBuf::from("/bin/zsh")),
+            ImageBuild::unknown(ProgramTag::new("zsh")),
+            1,
+        ))
+    };
+    let drawer = || {
+        Arc::new(crate::holder_image::HolderImage::of(
+            PGID,
+            Some(2),
+            Some(std::path::PathBuf::from(
+                "/p/pkg/store/claude/1000002000001000304/bin/claude",
+            )),
+            ImageBuild {
+                program: ProgramTag::new("claude"),
+                build: 1_000_002_000_001_000_304,
+                source: ImageSource::Store,
+            },
+            1,
+        ))
+    };
+    let offer = |app: &App, session: u64, image| {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.offer_holder_image(image, crate::holder_image::EdgeKind::Group);
+    };
+    let edge = |app: &mut App, session: u64| {
+        app.session_factory.edge_inbox.push(session);
+        let _ = app.observe_session_statuses(Instant::now());
+    };
+    let pending = |app: &App, wid: WindowId| app.windows[&wid].fx_prefetch_pending.clone();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    // CONTROL: a shell's edge.
+    offer(&app, session, shell());
+    edge(&mut app, session);
+    assert!(
+        pending(&app, wid).is_empty(),
+        "CONTROL: a shell queues nothing"
+    );
+    app.windows.get_mut(&wid).unwrap().cell_px_reported = None;
+    app.sync_cell_pixel_size(wid);
+    assert!(
+        pending(&app, wid).is_empty(),
+        "CONTROL: nor does a metric change under it"
+    );
+    // A drawer's edge.
+    offer(&app, session, drawer());
+    assert!(app.card_drawer_published(session));
+    edge(&mut app, session);
+    let want = CardArts::for_cell(u16_of(app.win_cell_size(wid).1)).expect("ordinary cell height");
+    let want: Vec<_> = want.arts().cloned().collect();
+    assert!(want.len() > 6, "the kitty's, the rims' and the stars' arts");
+    let queued = |app: &App| {
+        // As sets: the registry interns equal arts as one `Arc`, and the
+        // queue holds each once.
+        let got = pending(app, wid);
+        want.iter().all(|a| got.iter().any(|g| Arc::ptr_eq(a, g)))
+            && got.iter().all(|g| want.iter().any(|a| Arc::ptr_eq(a, g)))
+    };
+    assert!(queued(&app), "the card's arts, queued");
+    // The card that comes draws with those very arts.
+    publish(&app, session, VERSION);
+    feed(&app, session, &card_screen(24, 80, MODEL, VERSION));
+    let host = supervise(&mut app, session);
+    frame(&mut app, wid);
+    let over = card_layer(&app, wid, FxSlot::Over).expect("the over layer");
+    let got = pending(&app, wid);
+    let sprites: Vec<_> = over
+        .content
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            FxItem::Sprite(s) => Some(Arc::clone(&s.art)),
+            _ => None,
+        })
+        .collect();
+    assert!(!sprites.is_empty(), "the kitty drawn");
+    assert!(
+        sprites
+            .iter()
+            .all(|a| got.iter().any(|g| Arc::ptr_eq(a, g))),
+        "every art the frame draws was queued"
+    );
+    // The renderer takes the queue; a metric change queues them again.
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .fx_prefetch_pending
+        .clear();
+    app.windows.get_mut(&wid).unwrap().cell_px_reported = None;
+    app.sync_cell_pixel_size(wid);
+    assert!(queued(&app), "a metric change with the drawer in front");
+    host.shutdown_and_join();
+    // CONTROL: the card switched off.
+    let mut off = App::headless_for_test();
+    let off_session = off.focused_session_id(wid).expect("the front session");
+    off.config.claude_footer = Some(crate::app_config::ClaudeFooterConfig {
+        card: Some(false),
+        ..Default::default()
+    });
+    offer(&off, off_session, drawer());
+    edge(&mut off, off_session);
+    assert!(
+        pending(&off, wid).is_empty(),
+        "CONTROL: the card switched off queues nothing"
+    );
+}
+
+/// THE PINNED CONSTELLATION (`card seed=`, a debug build's
+/// `crate::card_verb`): two cards of different processes — each card's
+/// stars seeded by its session and its process — draw the very same settled
+/// frame once pinned to one seed, and a pin re-arms the card on show, whose
+/// episode settles on the same frame again. CONTROLS: unpinned, the two
+/// cards' stars differ; pinned to two seeds, one card's differ.
+#[test]
+fn a_pinned_seed_gives_every_card_the_same_stars() {
+    use crate::card_verb::{Asked, line};
+    let settled = |app: &mut App, wid: WindowId, t0: Instant| {
+        for t in [0, FRAME_MS, EPISODE_MS + 1] {
+            set_now(Some(t0 + Duration::from_millis(t)));
+            frame(app, wid);
+        }
+        assert!(
+            app.windows[&wid]
+                .claude_card
+                .entries
+                .iter()
+                .all(|e| e.card.at_rest()),
+            "settled"
+        );
+        card_pic(app, wid)
+    };
+    let card = |pgid: i32, pin: Option<u64>| {
+        let (mut app, wid, session) = glass(120);
+        publish_as(&app, session, VERSION, pgid);
+        // Its own card, painted after it took the front.
+        feed(&app, session, &card_screen(24, 120, MODEL, VERSION));
+        let host = supervise(&mut app, session);
+        assert_eq!(
+            app.control_card_seed(Asked::Pin(pin)),
+            Ok(line(pin, 0)),
+            "no card on show yet"
+        );
+        assert_eq!(app.control_card_seed(Asked::Read), Ok(line(pin, 0)));
+        let t0 = Instant::now();
+        let first = settled(&mut app, wid, t0);
+        assert!(!first.is_empty(), "the card is on the glass");
+        let back = t0 + Duration::from_secs(60);
+        set_now(Some(back));
+        assert_eq!(
+            app.control_card_seed(Asked::Pin(pin)),
+            Ok(line(pin, 1)),
+            "the card on show, re-armed"
+        );
+        assert!(
+            !app.windows[&wid].claude_card.entries[0].card.at_rest(),
+            "an episode armed"
+        );
+        assert_eq!(settled(&mut app, wid, back), first, "the same stars again");
+        set_now(None);
+        host.shutdown_and_join();
+        first
+    };
+    assert_eq!(
+        card(PGID, Some(42)),
+        card(PGID + 1, Some(42)),
+        "pinned: one constellation"
+    );
+    assert_ne!(
+        card(PGID, None),
+        card(PGID + 1, None),
+        "CONTROL: unpinned, each card's own"
+    );
+    assert_ne!(
+        card(PGID, Some(42)),
+        card(PGID, Some(43)),
+        "CONTROL: the seed is the stars'"
+    );
+    crate::claude_card::pin_card_seed(None);
 }
 
 /// Feed both `app`'s and `bare`'s session the same bytes and frame them as
@@ -3169,8 +3911,16 @@ fn costs_the_floor(
         let _ = pass_cost(&mut app.0, wid);
         let _ = pass_cost(&mut bare.0, bare.1);
     }
-    let quads = painted(&app.0, wid).under.clone();
-    assert!(!quads.is_empty(), "{what}: the border");
+    let layers = card_layers(&app.0, wid);
+    // What the glass's layer stream holds once the card is on it: the card's
+    // light is there once a frame, never a copy left behind by the last
+    // (a capture's tab strip shifts what the splice left, so a record that
+    // missed it would leave one stale grid layer a pass).
+    let stream = app.0.windows[&wid].input_scratch.fx_layers.len();
+    assert!(
+        !marks(&app.0, wid, FxSlot::Under).is_empty(),
+        "{what}: the border"
+    );
     let line = glass_text(&app.0, wid, strip_rows(&app.0, wid) + 4, 0..120);
     assert!(line.contains("aterm harness"), "{what}: the line: {line:?}");
     for i in WARM..WARM + passes {
@@ -3183,10 +3933,19 @@ fn costs_the_floor(
             floor.text_rebuilds, 1,
             "{what} {i}: CONTROL, rebuilt: {floor:?}"
         );
-        assert_eq!(pass_cost(&mut app.0, wid), floor, "{what} {i}");
+        let cost = pass_cost(&mut app.0, wid);
+        // The stream first: a copy left behind is what a leak IS, while the
+        // pass's allocation count sees it only when the stream outgrows its
+        // capacity.
         assert_eq!(
-            painted(&app.0, wid).under,
-            quads,
+            app.0.windows[&wid].input_scratch.fx_layers.len(),
+            stream,
+            "{what} {i}: the card's light once, no copy of the last frame's"
+        );
+        assert_eq!(cost, floor, "{what} {i}");
+        assert_eq!(
+            card_layers(&app.0, wid),
+            layers,
             "{what} {i}: the same glass"
         );
         assert_eq!(
@@ -3284,8 +4043,8 @@ fn a_split_composed_every_frame_costs_the_card_nothing() {
             let term = crate::term_lock(&app.pool.get(session).unwrap().term);
             (usize::from(term.rows()), usize::from(term.cols()))
         };
-        feed(&app, session, &card_screen(rows, cols, MODEL, VERSION));
         publish(&app, session, VERSION);
+        feed(&app, session, &card_screen(rows, cols, MODEL, VERSION));
         let host = harness.then(|| supervise(&mut app, session));
         (app, wid, host)
     };
@@ -3298,10 +4057,10 @@ fn a_split_composed_every_frame_costs_the_card_nothing() {
         frame(&mut bare, bare_wid);
     }
     assert!(
-        !painted(&app, wid).under.is_empty(),
+        !marks(&app, wid, FxSlot::Under).is_empty(),
         "the card is on the glass"
     );
-    let quads = painted(&app, wid).under.clone();
+    let layers = card_layers(&app, wid);
     for i in 0..10u64 {
         set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 100 + 9 * i)));
         for (app, wid) in [(&mut app, wid), (&mut bare, bare_wid)] {
@@ -3311,7 +4070,7 @@ fn a_split_composed_every_frame_costs_the_card_nothing() {
         let floor = pass_cost(&mut bare, bare_wid);
         assert!(floor.text_rebuilds >= 1, "{i}: CONTROL, rebuilt: {floor:?}");
         assert_eq!(pass_cost(&mut app, wid), floor, "frame {i}");
-        assert_eq!(painted(&app, wid).under, quads, "frame {i}: the same glass");
+        assert_eq!(card_layers(&app, wid), layers, "frame {i}: the same glass");
     }
     set_now(None);
     if let Some(host) = host {
@@ -3333,16 +4092,8 @@ fn a_split_composed_every_frame_costs_the_card_nothing() {
 fn a_window_with_no_claude_session_costs_the_harness_nothing() {
     let t0 = Instant::now();
     let (mut app, wid, session, host) = settled_glass(120, t0);
-    // Claude Code leaves: a shell's screen, no footer facts.
-    {
-        let entry = app.pool.get(session).expect("session");
-        entry
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_claude_footer(PGID, None, None);
-    }
+    // Claude Code leaves: a shell in front, its screen, no footer facts.
+    leave(&app, session, false);
     feed(&app, session, &["$ ls".to_string()]);
     frame(&mut app, wid);
     assert!(
@@ -3440,8 +4191,11 @@ fn the_kept_layout_follows_the_cells() {
     let t0 = Instant::now();
     let (mut app, wid, session, host) = settled_glass(120, t0);
     set_now(Some(t0 + Duration::from_secs(10)));
-    let first = painted(&app, wid).over.clone();
-    assert!(!first.is_empty(), "the kitty and its stars");
+    let first = card_pic(&app, wid);
+    assert!(
+        !marks(&app, wid, FxSlot::Over).is_empty(),
+        "the kitty and its stars"
+    );
     assert_eq!(pass_cost(&mut app, wid).layouts, 0, "unchanged text: kept");
     // A word lands right of the card's banner: the kitty moves on past it.
     let mut moved = card_screen(24, 120, MODEL, VERSION);
@@ -3455,21 +4209,25 @@ fn the_kept_layout_follows_the_cells() {
         (1, 1),
         "laid out and drawn anew"
     );
-    let shifted = painted(&app, wid).over.clone();
-    assert_ne!(shifted, first, "CONTROL: the kitty moved");
+    let shifted = card_layers(&app, wid);
+    assert_ne!(card_pic(&app, wid), first, "CONTROL: the kitty moved");
     let again = pass_cost(&mut app, wid);
     assert_eq!(
         (again.layouts, again.ticks),
         (0, 0),
         "then kept and replayed"
     );
-    assert_eq!(painted(&app, wid).over, shifted);
+    assert_eq!(
+        card_layers(&app, wid),
+        shifted,
+        "the same contents, replayed"
+    );
     // The card's own text again: the first scene, bit for bit.
     feed(&app, session, &card_screen(24, 120, MODEL, VERSION));
     app.capture_words(wid, Instant::now());
     app.splice_tab_strip(wid);
     assert_eq!(pass_cost(&mut app, wid).layouts, 1);
-    assert_eq!(painted(&app, wid).over, first, "the first scene again");
+    assert_eq!(card_pic(&app, wid), first, "the first scene again");
     // A find bar up: laid out every pass, nothing kept past it.
     app.windows.get_mut(&wid).unwrap().search = Some(Default::default());
     for i in 0..3 {
@@ -3482,7 +4240,7 @@ fn the_kept_layout_follows_the_cells() {
         "the bar gone: laid anew"
     );
     assert_eq!(pass_cost(&mut app, wid).layouts, 0, "then kept");
-    assert_eq!(painted(&app, wid).over, first);
+    assert_eq!(card_pic(&app, wid), first);
     set_now(None);
     host.shutdown_and_join();
 }
@@ -3613,12 +4371,11 @@ fn a_kept_layout_reads_only_the_cells_its_layout_read() {
     assert_eq!(wide, narrow, "twice the width, the same cells");
 }
 
-/// What a card puts on the glass: its light, its ink and star, and each line
+/// What a card puts on the glass: its layers by value, its ink and star, and each line
 /// it writes (frame row, column, cells).
 #[derive(Debug, PartialEq)]
 struct CardGlass {
-    under: Vec<GlowQuad>,
-    over: Vec<GlowQuad>,
+    layers: Vec<LayerPic>,
     ink: Vec<InkCell>,
     decos: Vec<WordDecoration>,
     lines: Vec<(usize, usize, Vec<RenderCell>)>,
@@ -3627,8 +4384,7 @@ struct CardGlass {
 fn card_glass(app: &App, wid: WindowId) -> CardGlass {
     let p = painted(app, wid);
     CardGlass {
-        under: p.under.clone(),
-        over: p.over.clone(),
+        layers: card_pic(app, wid),
         ink: p.ink.clone(),
         decos: p.decos.clone(),
         lines: app.windows[&wid]
@@ -3931,8 +4687,8 @@ fn split_card(left: &str, right: &str) -> (App, WindowId, u64, u64, usize) {
     };
     let lines: Vec<String> = (0..rows).map(|r| format!("$ ls {r}")).collect();
     feed(&app, shell, &lines);
-    feed(&app, session, &card_screen(rows, cols, MODEL, VERSION));
     publish(&app, session, VERSION);
+    feed(&app, session, &card_screen(rows, cols, MODEL, VERSION));
     for (s, bytes) in [(shell, left), (session, right)] {
         let term = app.pool.get(s).expect("session").term.clone();
         crate::term_lock(&term).process(bytes.as_bytes());
@@ -3982,7 +4738,7 @@ fn a_change_in_a_split_lays_the_card_as_a_fresh_split_would() {
     }
     let settled = card_glass(&app, wid);
     assert!(
-        !settled.under.is_empty() && !settled.over.is_empty(),
+        settled.layers.len() == 2 && settled.layers.iter().all(|l| !l.items.is_empty()),
         "the card and its kitty"
     );
     let shell_cols = usize::from(crate::term_lock(&app.pool.get(shell).unwrap().term).cols());
@@ -4204,7 +4960,7 @@ fn an_episode_cut_off_by_lost_focus_rests_at_no_cost() {
             held.at_rest() && !held.is_still(),
             "held back, its clock kept"
         );
-        let quads = painted(&app, wid).under.clone();
+        let layers = card_layers(&app, wid);
         let _ = pass_cost(&mut bare, bare_wid);
         for i in 0..20u64 {
             set_now(Some(
@@ -4212,7 +4968,7 @@ fn an_episode_cut_off_by_lost_focus_rests_at_no_cost() {
             ));
             let floor = pass_cost(&mut bare, bare_wid);
             assert_eq!(pass_cost(&mut app, wid), floor, "a minute on, frame {i}");
-            assert_eq!(painted(&app, wid).under, quads, "frame {i}: the held frame");
+            assert_eq!(card_layers(&app, wid), layers, "frame {i}: the held frame");
         }
         set_now(None);
         host.shutdown_and_join();
@@ -4275,3 +5031,169 @@ fn a_timer_weekday_change_moves_the_footer_key_with_its_card_words() {
         "TIMER_WEEKDAY_DISPLAY_MUST_MOVE_FOOTER_KEY"
     );
 }
+
+/// DRIFT IS A FACT FOR LATER, NEVER A GATE (card engine §3.10, §3.8). The
+/// Store drawer image names one build — its banner prints it — and the
+/// registry row reports another: one exception entry, however many footer
+/// wakes follow, and the card is decorated exactly where, and as, it is
+/// where the two agree: the banner is held to its image's build, never to
+/// the row's. CONTROL: the image naming the row's own build raises nothing.
+#[test]
+fn a_build_drift_is_one_entry_and_leaves_the_decoration_alone() {
+    use aterm_agent::harness::footer::FactsOwner;
+
+    let run = |image: &str| {
+        let (mut app, wid, session) = glass(120);
+        let host = supervise(&mut app, session);
+        // The group's image `exec`s into the build `image`, which paints its
+        // own card.
+        launch(&app, session, image, PGID, 5);
+        feed(&app, session, &card_screen(24, 120, MODEL, image));
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap();
+            // The row the image wrote, read after its publication.
+            timeline.set_claude_footer(
+                PGID,
+                None,
+                Some(FooterFacts {
+                    model: Some("Opus 5.5".into()),
+                    version: Some(VERSION.into()),
+                    owner: Some(FactsOwner {
+                        floor: None,
+                        session_id: "00000000-0000-4000-8000-000000000a52".into(),
+                    }),
+                    ..FooterFacts::default()
+                }),
+            );
+        }
+        app.on_claude_footer_changed(session);
+        app.on_claude_footer_changed(session);
+        frame(&mut app, wid);
+        let strip = strip_rows(&app, wid);
+        let line = glass_text(&app, wid, strip + 4, 0..120).contains("aterm harness");
+        let entries = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .filter(|entry| entry.key.ends_with(".build-drift"))
+            .count();
+        let place = decorated(&app, wid);
+        host.shutdown_and_join();
+        (place, line, entries)
+    };
+    let (agreed, agreed_line, none) = run(VERSION);
+    assert!(
+        agreed.is_some() && agreed_line,
+        "CONTROL: the card decorates"
+    );
+    assert_eq!(none, 0, "CONTROL: agreeing builds raise nothing");
+    let (drifted, drifted_line, one) = run("2.1.299");
+    assert_eq!(one, 1, "one entry, however many wakes");
+    assert_eq!(
+        (drifted, drifted_line),
+        (agreed, agreed_line),
+        "the decoration is the same"
+    );
+}
+
+/// The real append/strip seams preserve another producer, even with the same
+/// id or an equal duplicate; menu occlusion uses the shared renderer path.
+#[test]
+fn a_card_layer_survives_a_menu_cut_and_is_withdrawn_once() {
+    use aterm_core::render::{FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace};
+    use aterm_effects::harness_card::CardFrame;
+    let content = |color, x, y, w, h| {
+        Arc::new(FxContent::new(
+            vec![FxItem::Rect(FxRect { x, y, w, h, ink: 0 })],
+            vec![FxInk::over(color, 255); 2],
+        ))
+    };
+    let frame = CardFrame {
+        under: content(0xe02014, 0, 0, 8, 6),
+        over: content(0xc0ae10, 2, 1, 4, 4),
+        origin: (0, 0),
+    };
+    let mut cards = WindowCards::default();
+    let mut input = RenderInput {
+        cells: vec![vec![RenderCell::default(); 8]; 3],
+        cols: 8,
+        ..RenderInput::default()
+    };
+    append_card_frame(
+        &mut cards.painted,
+        &mut input,
+        7,
+        frame,
+        PxRect::new(0, 0, 8, 6),
+        (0, 0),
+    );
+    assert_eq!(cards.painted.layers.len(), 2);
+    let equal_peer = cards.painted.layers[0].clone();
+    let same_id_peer = FxLayer::new(
+        equal_peer.id,
+        content(0x345678, 7, 5, 1, 1),
+        FxSlot::Under,
+        FxSpace::Window,
+        FxBlend::Exact,
+    );
+    input.fx_layers.insert(0, equal_peer.clone());
+    input.fx_layers.push(same_id_peer.clone());
+    let f = aterm_render::FxFrame {
+        w: 8,
+        h: 6,
+        pad: 0,
+        grid_top: 0,
+        cell_h: 2,
+        rows: 3,
+    };
+    let mut before = vec![0x010203; 48];
+    aterm_render::fx::paint_layers(&mut before, &f, &input.fx_layers, &[]);
+    let menu = crate::tab_menu::MenuRect {
+        row: 1,
+        col: 3,
+        w: 2,
+        h: 1,
+    };
+    cut_out(&mut cards, &mut input, menu);
+    crate::app_render::scrub_overlay_card(&mut input, menu, (1, 2), (0, 0));
+    let mut after = vec![0x010203; 48];
+    aterm_render::fx::paint_layers(&mut after, &f, &input.fx_layers, &input.fx_occluders);
+    for y in 0..6 {
+        for x in 0..8 {
+            assert_eq!(
+                after[y * 8 + x],
+                if (2..4).contains(&y) && (3..5).contains(&x) {
+                    0x010203
+                } else {
+                    before[y * 8 + x]
+                }
+            );
+        }
+    }
+    assert_ne!(
+        before[2 * 8 + 3],
+        0x010203,
+        "the occluder actually cuts painted pixels"
+    );
+    strip(&mut cards, &mut input);
+    assert!(cards.painted.is_empty());
+    assert_eq!(input.fx_layers, [equal_peer, same_id_peer]);
+    assert_eq!(
+        input.fx_occluders.len(),
+        1,
+        "chrome owns its occluder, not the card record"
+    );
+    let peers = input.fx_layers.clone();
+    strip(&mut cards, &mut input);
+    assert_eq!(
+        input.fx_layers, peers,
+        "a consumed record removes nothing again"
+    );
+}
+
+/// The gate switch's laws (card engine §7 "A, the gate"), on this module's
+/// fixtures.
+#[path = "claude_card_gate_tests.rs"]
+mod gate;

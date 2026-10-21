@@ -807,7 +807,7 @@ mod tests {
     }
 
     /// THE WATCH-ONLY WORKER'S IDLE POINT, live ([`idle_now`]): a real
-    /// stand-in process (a signed copy of `sleep`, its `CODEX_HOME` the
+    /// stand-in process (the kept signed `sleep`, its `CODEX_HOME` the
     /// test's directory) holding the session's PROVEN claim, with a PLANTED
     /// record saying `idle` and `draftEmpty: true`, is at its idle point; the
     /// record saying `busy` is not. NEGATIVE CONTROLS: the claim's process
@@ -819,8 +819,13 @@ mod tests {
         use crate::session_timeline::{claim_supervisor_as, release_supervisor};
         let dir = aterm_tempfile::TempDir::new().expect("dir");
         let home = std::fs::canonicalize(dir.path()).expect("canonical");
-        let sleep = home.join("sleep");
-        aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/sleep"), &sleep);
+        // The kept stand-in, run in place: never a copy in `home`, which goes
+        // when the test ends, while macOS may still assess its first exec
+        // (`aterm_uds::deadline::stand_in`).
+        let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
+            "/bin/sleep",
+        )))
+        .expect("the kept stand-in");
         let sleep_s = sleep.to_string_lossy().into_owned();
         let mut child = aterm_uds::spawnfd::command(&sleep)
             .arg("60")

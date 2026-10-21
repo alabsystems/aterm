@@ -30,7 +30,10 @@
 //! extension subtable never wraps another; a COLR walk stops at its depth
 //! limit and after 2^16 paint tables). The shaper (`aterm_font::shape`, TF.6)
 //! shapes a ligature run, an Arabic word, marks and an emoji sequence on the
-//! same face, with and without features, under the same property.
+//! same face, with and without features, under the same property, and
+//! parses every `GSUB` lookup of the face, before any applies, within
+//! aterm's own budget of 8 units per byte of the table (one unit per
+//! subtable and coverage entry parsed), however their offsets alias.
 
 #![no_main]
 
@@ -112,7 +115,14 @@ fuzz_target!(|data: &[u8]| {
                 let _ = sub.glyph_variation_index(0x41, 0xFE0F);
             }
         }
-        for table in [face.tables().gsub, face.tables().gpos]
+        // Every (lookup, subtable) pair, up to 2^16 of them: lookup and
+        // subtable offsets may alias, so the pairs a table names grow as the
+        // square of its size, and an unbounded walk spends the run's time on
+        // re-reading one subtable (slow units of 2.3-2.4 s, 2026-10-19). The
+        // library's own walks are bounded by its `GSUB` budget
+        // (`work::LayoutWork`).
+        let mut visits = 0u32;
+        'walk: for table in [face.tables().gsub, face.tables().gpos]
             .into_iter()
             .flatten()
         {
@@ -121,6 +131,10 @@ fuzz_target!(|data: &[u8]| {
                     continue;
                 };
                 for j in 0..lookup.subtables.len() {
+                    visits += 1;
+                    if visits > 1 << 16 {
+                        break 'walk;
+                    }
                     if let Some(s) = lookup
                         .subtables
                         .get::<aterm_font::gsub::SubstitutionSubtable>(j)

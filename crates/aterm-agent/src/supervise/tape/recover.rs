@@ -20,10 +20,23 @@
 //!   whole. A plain read ([`recover`]) refuses the tape, naming the offset;
 //!   [`salvage`] keeps the prefix before it, the explicit repair `tape cat
 //!   --salvage` asks for;
-//! * a frame that is whole but is not what its place holds — a first frame
-//!   that is not the header, a header after the first, items this build
-//!   cannot read — is a fault wherever it is: it is readable and wrong, which
-//!   no crash makes.
+//! * a frame that is whole but is not what its place holds — a frame whose sum
+//!   names another place ([`Why::OutOfPlace`]: repeated, dropped or moved), a
+//!   first frame that is not the header, a header after the first, items this
+//!   build cannot read — is a fault wherever it is: it is readable and wrong,
+//!   which no crash makes.
+//!
+//! A FRAME'S PLACE. A tape of frame format 2 ties each frame to its place:
+//! its sum names the place it was written at ([`super::frame`]), the header's
+//! 0, and a whole frame is read only at that place. So whole frames repeated,
+//! dropped or moved are refused where the first stands out of place
+//! (`SuperviseTapeRecovery`'s `Misplace`) — astream-wire's rule for its dense
+//! step records — where a format-1 tape, whose sums name no place, read them
+//! clean and decoded the moved frames' replies against the wrong bodies. What
+//! no frame can say is that frames are missing after the last: a tape cut at
+//! a frame's end, by a crash or at rest, is clean, and its items without the
+//! run's end are a run that stopped there. A format-1 tape is read exactly as
+//! before.
 //!
 //! "Whole after it" is looked for byte by byte, as the store does: a damaged
 //! head has no trustworthy length to skip by. A damaged LAST frame therefore
@@ -35,10 +48,13 @@
 //! A tape ends cleanly only after its header: the writer's first write is the
 //! magic and the header together, so bytes that stop at or inside it are a
 //! first write that tore. An empty file is a tape whose first write never
-//! happened: clean, and empty. Whole bytes that do not start with the magic
+//! happened: clean, and empty. Whole bytes that do not start with a magic
 //! are refused whatever follows them, even a whole header: a damaged magic
 //! cannot be told from a file that is no tape (`SuperviseTapeRecovery`'s
-//! `RotMagic`).
+//! `RotMagic`). Nor is a magic whose format byte the damage turned into the
+//! other format's read as that format, where every frame would fail and the
+//! tape would read as a first write that tore: a header that is whole only as
+//! the other format refuses the tape ([`Why::MagicFormat`]).
 //!
 //! THE READER'S OWN BOUNDS. A checksum that passes says a frame holds the
 //! bytes it was closed with, not that a tape's writer closed it: xxh64 is
@@ -76,8 +92,8 @@
 
 use astream_effects::EffectRecord;
 
-use super::codec::{CodecError, Decoder, End, Input, Item, Mark};
-use super::frame::{FRAME_FORMAT, FRAME_RAW_MAX, HEAD, Kind, MAGIC, checksum};
+use super::codec::{CodecError, Decoder, End, Input, Item, Mark, len64};
+use super::frame::{FRAME_RAW_MAX, Format, HEAD, Kind, MAGIC, checksum, place_named};
 
 /// The most a read holds in memory: every item and what it owns, the names it
 /// interned and the header ([module docs](self)). A tape past it is refused.
@@ -126,9 +142,16 @@ pub enum Why {
     NotATape,
     /// A tape of a frame format this build does not read: a newer build's.
     Format(u8),
+    /// A magic that names frame format `named` before a header frame that is
+    /// whole only as format `frames`: the magic's format byte is damaged, and
+    /// read as named, the tape would be a first write that tore.
+    MagicFormat { named: u8, frames: u8 },
     /// A frame that fails its checksum or its shape, with a whole frame after
     /// it.
     Damaged,
+    /// A whole frame at place `expected` (the header's is 0) whose sum names
+    /// the place `found` it was written at: frames repeated, dropped or moved.
+    OutOfPlace { expected: u64, found: u64 },
     /// A frame whose length runs past the end, with a whole frame after it: a
     /// damaged length, not a torn write.
     LengthPastEnd,
@@ -154,9 +177,21 @@ impl std::fmt::Display for Why {
             Self::NotATape => write!(f, "not a harness tape"),
             Self::Format(n) => write!(
                 f,
-                "a tape of frame format {n}: this build reads format {FRAME_FORMAT}"
+                "a tape of frame format {n}: this build reads formats {} and {}",
+                Format::One as u8,
+                Format::Two as u8
+            ),
+            Self::MagicFormat { named, frames } => write!(
+                f,
+                "a magic naming frame format {named} before a header of format {frames}: a \
+                 damaged magic"
             ),
             Self::Damaged => write!(f, "a damaged frame with whole frames after it"),
+            Self::OutOfPlace { expected, found } => write!(
+                f,
+                "frame {found} where frame {expected} belongs: whole frames repeated, dropped or \
+                 moved"
+            ),
             Self::LengthPastEnd => write!(
                 f,
                 "a frame whose length runs past the end with whole frames after it"
@@ -227,6 +262,14 @@ impl std::fmt::Display for Why {
         reason = "A byte of the magic damaged at rest runs no tape code. The Tier-1 bind flips every byte of the magic of tapes of one, two and three frames, under three masks (0x01, 0x80, 0xff)."
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SuperviseTapeRecovery",
+        action = "Misplace",
+        reason = "Whole frames repeated, dropped or moved at rest run no tape code. The Tier-1 bind reads every arrangement of the whole frames of tapes of one, two and three frames, at most one frame longer than the tape, that is not the tape or a prefix of it."
+    )
+)]
 #[must_use]
 pub fn recover(bytes: &[u8]) -> Recovered {
     read(bytes, Keep::Refuse, Check::Xxh64, Limits::TAPE)
@@ -246,13 +289,17 @@ pub(crate) enum Keep {
     Prefix,
 }
 
-/// Whether a frame's checksum is checked: always, but in the negative control
-/// of the Tier-1 bind, a reader that takes a damaged frame.
+/// Whether a frame's checksum is checked, and its place: always, but in the
+/// negative controls of the Tier-1 bind — a reader that takes a damaged frame,
+/// and one that takes a whole frame at any place, as a format-1 tape's sums
+/// let a reader do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Check {
     Xxh64,
     #[cfg(test)]
     Nothing,
+    #[cfg(test)]
+    Unplaced,
 }
 
 /// The reader's own bounds ([module docs](self)): what a read holds, and the
@@ -274,16 +321,26 @@ impl Limits {
 
 /// One frame as it stands at an offset.
 enum Frame {
-    /// Whole: its kind, raw bytes and where the next frame starts.
+    /// Whole: its kind, raw bytes, where the next frame starts, and the place
+    /// its sum names (`None` in a format-1 tape, whose sums name none).
     Whole {
         kind: Kind,
         raw: Vec<u8>,
         end: usize,
+        place: Option<u64>,
     },
     /// Its head or payload runs past the end of the bytes.
     Short,
     /// It fails its checksum or its shape.
     Bad,
+}
+
+/// How a read checks a frame's sum: by the tape's frame format, and (but in a
+/// negative control) in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sums {
+    format: Format,
+    check: Check,
 }
 
 /// A frame's head whose lengths are within the writer's bounds and whose
@@ -342,14 +399,30 @@ fn head_at(bytes: &[u8], at: usize) -> Result<Head<'_>, Frame> {
     })
 }
 
-/// The frame `head` heads: whole when it passes its checksum and its payload
-/// comes back to its raw length.
-fn whole(head: &Head<'_>, check: Check) -> Frame {
+/// The place `head`'s frame names: `Ok(None)` when its tape's sums name none
+/// (format 1, or a negative control), `Err` when it fails its checksum.
+fn place_of(head: &Head<'_>, sums: Sums) -> Result<Option<u64>, ()> {
+    let hashed = || checksum(head.kind, head.lengths, head.payload);
+    match (sums.check, sums.format) {
+        (Check::Xxh64, Format::One) => (hashed() == head.sum).then_some(None).ok_or(()),
+        (Check::Xxh64, Format::Two) => place_named(head.sum, hashed()).map(Some).ok_or(()),
+        #[cfg(test)]
+        (Check::Nothing, _) => Ok(None),
+        #[cfg(test)]
+        (Check::Unplaced, Format::One) => (hashed() == head.sum).then_some(None).ok_or(()),
+        #[cfg(test)]
+        (Check::Unplaced, Format::Two) => place_named(head.sum, hashed()).map(|_| None).ok_or(()),
+    }
+}
+
+/// The frame `head` heads: whole when it passes its checksum — its sum names a
+/// place, in a format-2 tape — and its payload comes back to its raw length.
+fn whole(head: &Head<'_>, sums: Sums) -> Frame {
     // The checksum first: a damaged frame is refused before anything in it
     // is decompressed.
-    if check == Check::Xxh64 && checksum(head.kind, head.lengths, head.payload) != head.sum {
+    let Ok(place) = place_of(head, sums) else {
         return Frame::Bad;
-    }
+    };
     let raw = if head.comp_len == 0 {
         head.payload.to_vec()
     } else {
@@ -362,13 +435,14 @@ fn whole(head: &Head<'_>, check: Check) -> Frame {
         kind: head.kind,
         raw,
         end: head.end,
+        place,
     }
 }
 
 /// The frame at `at` ([`Frame`]).
-fn frame_at(bytes: &[u8], at: usize, check: Check) -> Frame {
+fn frame_at(bytes: &[u8], at: usize, sums: Sums) -> Frame {
     match head_at(bytes, at) {
-        Ok(head) => whole(&head, check),
+        Ok(head) => whole(&head, sums),
         Err(frame) => frame,
     }
 }
@@ -387,8 +461,10 @@ enum After {
 /// Whether a whole records frame starts anywhere after `at` (never at `at`),
 /// hashing at most [`SEARCH_PER_BYTE`] times the bytes after `at`, and at
 /// least `floor`. Each would-be frame is charged its payload before it is
-/// hashed, so the bound holds whatever the bytes are.
-fn whole_frame_after(bytes: &[u8], at: usize, check: Check, floor: usize) -> After {
+/// hashed, so the bound holds whatever the bytes are. A whole frame at any
+/// place counts: the damage hides which place a frame after it should hold,
+/// and a whole frame out of place behind it is damage inside the tape too.
+fn whole_frame_after(bytes: &[u8], at: usize, sums: Sums, floor: usize) -> After {
     let rest = bytes.len().saturating_sub(at);
     let mut budget = rest.saturating_mul(SEARCH_PER_BYTE).max(floor);
     for q in at.saturating_add(1)..bytes.len() {
@@ -403,7 +479,7 @@ fn whole_frame_after(bytes: &[u8], at: usize, check: Check, floor: usize) -> Aft
         };
         budget = left;
         if matches!(
-            whole(&head, check),
+            whole(&head, sums),
             Frame::Whole {
                 kind: Kind::Records,
                 ..
@@ -426,10 +502,11 @@ pub(crate) fn read(bytes: &[u8], keep: Keep, check: Check, limits: Limits) -> Re
     if bytes.is_empty() {
         return out;
     }
-    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
+    let Some(format) = Format::of_magic(bytes) else {
         out.tail = magic_tail(bytes);
         return out;
-    }
+    };
+    let sums = Sums { format, check };
     let mut reader = Reader {
         decoder: Decoder::default(),
         held: 0,
@@ -445,15 +522,45 @@ pub(crate) fn read(bytes: &[u8], keep: Keep, check: Check, limits: Limits) -> Re
             };
         }
         let floor = limits.search_floor;
-        match frame_at(bytes, at, check) {
-            Frame::Whole { kind, raw, end } => {
+        match frame_at(bytes, at, sums) {
+            Frame::Whole {
+                kind,
+                raw,
+                end,
+                place,
+            } => {
+                // Its place before what it holds: a frame repeated, dropped
+                // or moved is refused before its items are decoded, against
+                // a decoder state that is not the one it was written after.
+                let expected = len64(out.frames);
+                if let Some(found) = place
+                    && found != expected
+                {
+                    break Tail::Fault {
+                        at,
+                        why: Why::OutOfPlace { expected, found },
+                    };
+                }
                 if let Err(why) = reader.take(&mut out, kind, &raw) {
                     break Tail::Fault { at, why };
                 }
                 at = end;
             }
-            Frame::Short => break broken(bytes, at, check, floor, Why::LengthPastEnd),
-            Frame::Bad => break broken(bytes, at, check, floor, Why::Damaged),
+            Frame::Short => break broken(bytes, at, sums, floor, Why::LengthPastEnd),
+            Frame::Bad => {
+                if out.frames == 0
+                    && let Some(frames) = header_reads_as_other(bytes, at, sums)
+                {
+                    break Tail::Fault {
+                        at: 0,
+                        why: Why::MagicFormat {
+                            named: format as u8,
+                            frames: frames as u8,
+                        },
+                    };
+                }
+                break broken(bytes, at, sums, floor, Why::Damaged);
+            }
         }
     };
     if matches!(tail, Tail::Fault { .. }) && keep == Keep::Refuse {
@@ -465,11 +572,28 @@ pub(crate) fn read(bytes: &[u8], keep: Keep, check: Check, limits: Limits) -> Re
     out
 }
 
+/// The other format, when the first frame at `at`, bad as the magic's format
+/// reads it, is whole as the other's: then the magic's format byte is what
+/// was damaged. A header frame is never whole as both: the place word of
+/// place 0 is not 0 ([`super::frame::place_word`]), and the word a format-1
+/// sum leaves names no place.
+fn header_reads_as_other(bytes: &[u8], at: usize, sums: Sums) -> Option<Format> {
+    let other = match sums.format {
+        Format::One => Format::Two,
+        Format::Two => Format::One,
+    };
+    let as_other = Sums {
+        format: other,
+        ..sums
+    };
+    matches!(frame_at(bytes, at, as_other), Frame::Whole { .. }).then_some(other)
+}
+
 /// What ends the prefix at a short or bad frame at `at`: the torn tail when
 /// nothing whole follows it, else the fault `why`, or [`Why::Unsearched`]
 /// when the search met its bound first.
-fn broken(bytes: &[u8], at: usize, check: Check, floor: usize, why: Why) -> Tail {
-    match whole_frame_after(bytes, at, check, floor) {
+fn broken(bytes: &[u8], at: usize, sums: Sums, floor: usize, why: Why) -> Tail {
+    match whole_frame_after(bytes, at, sums, floor) {
         After::Nothing => Tail::Torn { at },
         After::Whole => Tail::Fault { at, why },
         After::Unsearched => Tail::Fault {
@@ -479,11 +603,12 @@ fn broken(bytes: &[u8], at: usize, check: Check, floor: usize, why: Why) -> Tail
     }
 }
 
-/// The tail of bytes that do not start with the magic: the start of one, cut
-/// short, is a first write that tore; a tape of another frame format is
-/// refused by its number; anything else is no tape.
+/// The tail of bytes that do not start with a magic this build reads: the
+/// start of one, cut short, is a first write that tore; a tape of another
+/// frame format is refused by its number; anything else is no tape.
 fn magic_tail(bytes: &[u8]) -> Tail {
-    if bytes.len() < MAGIC.len() && MAGIC.starts_with(bytes) {
+    let magics = [Format::Two.magic(), Format::One.magic()];
+    if bytes.len() < MAGIC.len() && magics.iter().any(|m| m.starts_with(bytes)) {
         return Tail::Torn { at: 0 };
     }
     let why = match bytes.get(..MAGIC.len()) {

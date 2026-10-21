@@ -86,10 +86,14 @@ fn a_session_journaled_into_shared_memory_recovers_from_its_custody_descriptor()
     };
     assert!(restored.exact, "{:?}", restored.losses);
     assert_eq!(restored.replayed_records, 2);
+    // The replayed tail leaves its lineage's seed uncertainty to the host's adoption,
+    // which a live engine never has: no state a person sees.
+    assert!(restored.checkpoint.holder.seed_untrusted);
     let visible = |c| {
         Terminal::from_checkpoint(c)
             .checkpoint_journal(0)
             .expect("ground")
+            .without_seed_lineage()
     };
     assert_eq!(
         visible(&restored.checkpoint),

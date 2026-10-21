@@ -152,7 +152,7 @@ impl GpuRenderer {
         // caps decide, whatever the context reported.
         let raw = live.dev.caps().srgb_views;
         want.encode_srgb = if raw { 0.0 } else { 1.0 };
-        let want_bloom = self.enable_bloom && !input.cursor_glow_add.is_empty();
+        let want_bloom = self.enable_bloom && fx_gpu::bloom_source_live(input);
         let want_crown = run_hdr_glow || run_sdr_glow;
         let bloom_glow = (want_bloom || want_crown).then(|| self.build_bloom_glow(input));
         let bloom_state = bloom_glow.filter(|(count, _, _)| want_bloom && *count > 0);
@@ -306,7 +306,7 @@ impl GpuRenderer {
                     &bufs.bloom,
                     aterm_bits::bytes_of(&BloomUniform {
                         texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                        strength: self.bloom_strength,
+                        strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
                         radius: self.bloom_radius,
                         chroma_radius: bloom_chroma_radius(self.bloom_radius),
                         _pad: [0.0; 3],
@@ -724,7 +724,7 @@ impl GpuRenderer {
         (w, h): (u32, u32),
     ) -> Result<Frame, String> {
         let effect_frame =
-            (self.enable_bloom && !input.cursor_glow_add.is_empty()) || self.shimmer_live(input);
+            (self.enable_bloom && fx_gpu::bloom_source_live(input)) || self.shimmer_live(input);
         if !effect_frame {
             return self.gl_read_back_offscreen(win, w, h);
         }
@@ -750,13 +750,13 @@ impl GpuRenderer {
         crate::device_layer::gl_try_read_back(&live.dev, tex, w, h)
     }
 
-    /// The resident virtual destination's bytes, for
+    /// The resident virtual destination's bytes, as read back, for
     /// `virtual_presented_snapshot_current` (the caller checked the epoch).
     pub(crate) fn gl_virtual_snapshot(
         &self,
         win: &WindowGpu,
         t_us: u64,
-    ) -> Result<crate::video_tap::CapturedFrame, String> {
+    ) -> Result<crate::video_tap::RawCapture, String> {
         let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
         let tex = win
             .gl_virtual_off
@@ -765,13 +765,7 @@ impl GpuRenderer {
             .ok_or("presented snapshot: no virtual destination has been presented")?;
         let (w, h) = (tex.width, tex.height);
         let rgba = live.dev.read_rgba8(tex, w, h, w as usize * 4)?;
-        Ok(crate::video_tap::CapturedFrame {
-            seq: 1,
-            t_us,
-            w,
-            h,
-            rgba,
-        })
+        crate::video_tap::RawCapture::rgba8_srgb(rgba, w, h, t_us)
     }
 }
 

@@ -29,8 +29,8 @@ use aterm_spec::derive::Model;
 ///   the store or pool;
 /// - I2 `RunOnlyWhenEligible`: `run` is written, and a WARM-only spare booked,
 ///   only while the gate is open;
-/// - I3 `AdoptOnlyValid`: adoption only from Parked, Warming or Ready, never
-///   stale, never exited;
+/// - I3 `AdoptOnlyValid`: adoption only from Parked, Warming, Verifying or
+///   Ready, never stale, never exited;
 /// - I4 `OneSpare`: at most one spare, slot and transit together;
 /// - I5 `EveryExitAccounted`: a spare leaves the slot only by landing
 ///   (registered) or by retirement (killed and reaped), so the count of spares
@@ -110,7 +110,7 @@ pub fn spare_lifecycle_model() -> Model {
             action Exits when (state > 1 && state <= 6 && exited == 0) {
                 exited = 1;
             }
-            action Adopt when ((state == 3 || state == 4 || state == 6)
+            action Adopt when ((state == 3 || state == 4 || state == 5 || state == 6)
                 && (Buggy == 1 || stale == 0 && exited == 0 && (state == 3 || eligible == 1))) {
                 bad_adopt = if stale == 1 || exited == 1 { 1 } else { bad_adopt };
                 state = 7;

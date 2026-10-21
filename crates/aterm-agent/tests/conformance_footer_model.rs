@@ -11,8 +11,8 @@
 //! `FooterFacts::filled_from` with the real `footer::launch_card` over a
 //! recorded 2.1.283 screen: the host's whole chain minus painting. Transcripts
 //! are real rows in Claude Code 2.1.283's shapes, appended as the model acts,
-//! including readable and unreadable `/model` results and a 600 KiB `Flood`
-//! row larger than the reader's tail window. Conversations A (last answered by
+//! including readable and unreadable `/model` results and a `Flood` row 4 KiB
+//! larger than the reader's tail window (`footer::TAIL_BYTES`). Conversations A (last answered by
 //! `Pred`), B (by `Other`) and D (begun by another process at the floor) sit
 //! on disk. `Flag` and `LaunchResume` are launch argv (`footer::launch_facts`);
 //! `Clear` and `Resume`/`ResumeLate` rewrite `sessions/<pid>.json` as Claude
@@ -80,8 +80,9 @@ enum Reader {
     FloorOnly,
 }
 
-/// One replay's world: a Claude directory, its registry file, the
-/// transcripts, the screen and the reader's cache.
+/// A replay's world: a Claude directory, its registry file, the transcripts,
+/// the screen and the reader's cache. A replay starts from [`World::reset`]'s,
+/// so one world serves a replay thread's replays.
 struct World {
     _root: aterm_tempfile::TempDir,
     claude: PathBuf,
@@ -105,6 +106,10 @@ struct World {
     /// The conversations taken up (A, then B).
     resumed: u32,
     reader: Reader,
+    /// Every transcript written or appended to since the last reset.
+    wrote: BTreeSet<PathBuf>,
+    /// The session the registry names, once it is written.
+    named: Option<u32>,
 }
 
 fn stamp(secs: u64) -> String {
@@ -192,15 +197,61 @@ impl World {
         std::fs::create_dir_all(claude.join("sessions")).unwrap();
         let project = claude.join("projects").join(footer::project_slug(&cwd));
         std::fs::create_dir_all(&project).unwrap();
+        let mut world = Self {
+            _root: root,
+            claude,
+            transcript: project.clone(),
+            project,
+            cwd,
+            next_session: 4,
+            argv: Vec::new(),
+            launch: LaunchFacts::default(),
+            card: None,
+            cache: TailCache::default(),
+            clock: 1,
+            runs: 1,
+            chose: false,
+            restore_pinned: false,
+            resumed: 0,
+            reader,
+            wrote: BTreeSet::new(),
+            named: None,
+        };
+        world.reset();
+        world
+    }
+
+    /// The world at the process's launch: the project's transcripts only those
+    /// from before the floor, the registry naming a fresh launch's session, a
+    /// fresh cache, and nothing chosen, resumed or drawn. The directories are
+    /// made once ([`World::new`]): made and removed per replay, they were over
+    /// half the walk's time. Of the files, only what the last replay wrote is
+    /// undone: each transcript it wrote or appended to is removed (and written
+    /// afresh where it is one from before the floor), and the registry written
+    /// again where it switched; every other file is as the last reset left it.
+    fn reset(&mut self) {
+        let first = self.named.is_none();
+        let gone = std::mem::take(&mut self.wrote);
+        for path in &gone {
+            std::fs::remove_file(path).unwrap();
+        }
+        let project = &self.project;
+        // The conversation `n`'s transcript, where it is to be written.
+        let unwritten = |n: u32| {
+            let path = project.join(format!("{}.jsonl", session_id(n)));
+            (first || gone.contains(&path)).then_some(path)
+        };
         // The conversations on disk from before the floor: A last answered
         // with `Pred` (model 2) — a meta and a `<synthetic>` answer after it,
         // which Claude's restore skips — and B with `Other` (model 1), over
         // an older `Pred` answer. The resume-blind reader sees none of it.
-        if reader != Reader::ResumeBlind {
+        if self.reader != Reader::ResumeBlind {
             let before = |s: u64| stamp(START - s);
             let write = |n: u32, rows: &[String]| {
-                let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
-                std::fs::write(project.join(format!("{}.jsonl", session_id(n))), body).unwrap();
+                if let Some(path) = unwritten(n) {
+                    let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+                    std::fs::write(path, body).unwrap();
+                }
             };
             write(
                 1,
@@ -230,38 +281,34 @@ impl World {
         }
         // D: begun and answered by another process at the floor, after this one
         // started and before the reader first saw it.
-        let at_floor = stamp(START);
-        std::fs::write(
-            project.join(format!("{}.jsonl", session_id(LATE))),
-            format!("{}\n{}\n", prompt_row(&at_floor), answer_row(2, &at_floor)),
-        )
-        .unwrap();
-        // A fresh launch's session of its own, not written yet.
-        register(&claude, &cwd, 3);
-        let transcript = project.join(format!("{}.jsonl", session_id(3)));
-        let argv = vec!["claude".to_owned()];
-        Self {
-            _root: root,
-            claude,
-            project,
-            cwd,
-            transcript,
-            next_session: 4,
-            launch: footer::launch_facts(&argv),
-            argv,
-            card: None,
-            cache: TailCache::default(),
-            clock: 1,
-            runs: 1,
-            chose: false,
-            restore_pinned: false,
-            resumed: 0,
-            reader,
+        if let Some(path) = unwritten(LATE) {
+            let at_floor = stamp(START);
+            std::fs::write(
+                path,
+                format!("{}\n{}\n", prompt_row(&at_floor), answer_row(2, &at_floor)),
+            )
+            .unwrap();
         }
+        // A fresh launch's session of its own, not written yet.
+        if self.named != Some(3) {
+            self.switch_to(3);
+        }
+        self.transcript = self.project.join(format!("{}.jsonl", session_id(3)));
+        self.next_session = 4;
+        self.argv = vec!["claude".to_owned()];
+        self.launch = footer::launch_facts(&self.argv);
+        self.card = None;
+        self.cache = TailCache::default();
+        self.clock = 1;
+        self.runs = 1;
+        self.chose = false;
+        self.restore_pinned = false;
+        self.resumed = 0;
     }
 
     fn append(&mut self, rows: &[String]) {
         // A cleared session's transcript is written by its first row.
+        self.wrote.insert(self.transcript.clone());
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -281,6 +328,7 @@ impl World {
     /// The registry names session `n` now, whose transcript the rows go to.
     fn switch_to(&mut self, n: u32) {
         register(&self.claude, &self.cwd, n);
+        self.named = Some(n);
         self.transcript = self.project.join(format!("{}.jsonl", session_id(n)));
     }
 
@@ -382,7 +430,7 @@ impl World {
                 let at = self.next_stamp();
                 self.append(&[format!(
                     r#"{{"type":"user","timestamp":"{at}","message":{{"role":"user","content":[{{"type":"image","source":"{}"}}]}}}}"#,
-                    "A".repeat(600 * 1024)
+                    "A".repeat(usize::try_from(footer::TAIL_BYTES).unwrap() + 4096)
                 )]);
             }
             "Read" => return Some(self.read()),
@@ -614,18 +662,20 @@ fn judge_last(model: &Model, last: &Last) -> Result<(), String> {
     Ok(())
 }
 
-/// Replay `path` on a fresh world through `reader`; every `Read` is checked against
-/// the model, and the first disagreement returned. The last `Read` is judged by both
-/// tiers via `last` (a defective reader's only when the interpreter refuses it),
-/// earlier ones by the interpreter alone: paths are breadth-first, so every earlier
-/// `Read` is some prefix's last and is judged by both tiers there.
+/// Replay `path` on `world`, reset ([`World::reset`]), through its reader; every
+/// `Read` is checked against the model, and the first disagreement returned. The
+/// last `Read` is judged by both tiers via `last` (a defective reader's only when the
+/// interpreter refuses it), earlier ones by the interpreter alone: paths are
+/// breadth-first, so every earlier `Read` is some prefix's last and is judged by both
+/// tiers there.
 fn replay(
     model: &Model,
+    world: &mut World,
     path: &[&'static str],
-    reader: Reader,
     last: &mut dyn FnMut(Last) -> Result<(), String>,
 ) -> Result<usize, String> {
-    let mut world = World::new("replay", reader);
+    world.reset();
+    let reader = world.reader;
     let mut state = model.init_state();
     let mut reads = 0;
     for (at, &action) in path.iter().enumerate() {
@@ -664,16 +714,16 @@ fn replay(
 /// breadth-first parent's `Read`, and a flood out of a state just read is the plain
 /// read of the state it reaches, so replaying such a path again repeats its checks.
 ///
-/// The replays run on a pool ([`POOL`]), each on its own world and judging its own
-/// last `Read` ([`Judging`]), because both the worlds (directories, transcripts, a
-/// 600 KiB flood each) and the judge (one `ty` process per distinct transition) are
-/// slow. The calling thread takes the outcomes in walk order ([`in_walk_order`]), so
-/// the first disagreement in walk order is the `Err` and a panic is raised at its
-/// place, as if the replays ran in sequence; after a catch the pool stops taking
-/// paths. When the calling thread has an evidence window open ([`bind`]'s), each pool
-/// thread opens its own and hands it back (`xref::take_entered_anchors`,
-/// `xref::merge_entered_anchors`), so the bind sees every anchor its walk entered,
-/// and only those.
+/// The replays run on a pool ([`POOL`]), each thread on a world of its own reset per
+/// replay, and each replay judging its own last `Read` ([`Judging`]), because both
+/// the worlds (transcripts, a flood past the tail window each) and the judge (one `ty` process per
+/// distinct transition) are slow. The calling thread takes the outcomes in walk
+/// order ([`in_walk_order`]), so the first disagreement in walk order is the `Err`
+/// and a panic is raised at its place, as if the replays ran in sequence; after a
+/// catch the pool stops taking paths. When the calling thread has an evidence window
+/// open ([`bind`]'s), each pool thread opens its own and hands it back
+/// (`xref::take_entered_anchors`, `xref::merge_entered_anchors`), so the bind sees
+/// every anchor its walk entered, and only those.
 fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<usize, String> {
     let (model, space) = footer();
     let mut replayed = BTreeSet::new();
@@ -714,12 +764,15 @@ fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<u
                             "a replay thread's evidence window opens"
                         );
                     }
+                    let mut world = World::new("replay", reader);
                     while !stop.load(Ordering::Relaxed) {
                         let at = next.fetch_add(1, Ordering::Relaxed);
                         let Some(path) = walk.get(at) else { break };
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                replay(model, path, reader, &mut |last| judging.judge(model, &last))
+                                replay(model, &mut world, path, &mut |last| {
+                                    judging.judge(model, &last)
+                                })
                             }));
                         // A caller that stopped taking outcomes (a panic)
                         // dropped the receiver: nothing more is wanted.
@@ -751,8 +804,9 @@ fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<u
 }
 
 /// The most replay threads one [`enumerate`] runs (half the cores, at most this).
-/// Every world is directories made and removed, which does not scale: on 14 cores
-/// the replays took 1.3-1.6 s on 4 threads and 3.0 s on 7.
+/// Every replay is files written and removed, which does not scale: on 14 cores the
+/// replays (each then a world's directories made and removed) took 1.3-1.6 s on 4
+/// threads and 3.0 s on 7.
 const POOL: usize = 4;
 
 /// [`judge_last`] on many threads, one `before` state at a time: every judgement of a

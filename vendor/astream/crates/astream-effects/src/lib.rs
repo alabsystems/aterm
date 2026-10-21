@@ -10,7 +10,8 @@
 //!   consumption order and makes **no OS call at all** — so the program's output
 //!   is byte-identical, deterministically, from the tape alone. A tape that cannot
 //!   reproduce the run (short, wrong kind, different file) is refused with a typed
-//!   [`ReplayDivergence`], never answered from the real world.
+//!   [`ReplayDivergence`], never answered from the real world; one longer than the
+//!   run is refused where the program ends, by [`ReplaySeam::finish`].
 //!
 //! This is the dial one notch below Cognition. Where
 //! `astream_engine::effects::Effects` is the *pure seeded* seam the engine already
@@ -54,9 +55,12 @@
 //! [`LiveSeam`] runs the same program on the real world with no tape;
 //! [`RecordingSeam::with_sink`] streams records to a writer instead of keeping
 //! them; [`ReplaySeam::streaming`] replays from a reader instead of a `Vec`; and
-//! [`KeyedView`] answers "what did this door reply to this request, as of record
-//! N?" without consuming anything — the read-only second reader a counterfactual
-//! re-decision needs beside the replay that drives the program.
+//! [`KeyedView`] answers "what had this door replied to this request once the
+//! program had read N records?" without consuming anything — the read-only
+//! second reader a counterfactual re-decision needs beside the replay that
+//! drives the program — and [`KeyedIndex`] is that index over records it
+//! holds, built once and asked by every look of every decision re-decided on
+//! one tape.
 //!
 //! Still open: tracing a separately-exec'd unmodified binary, a seccomp-bpf
 //! pre-filter and full syscall neutralization for the foreign form, and durable
@@ -86,7 +90,7 @@ pub use demo::{
     converse, converse_oracle, converse_values, demo_clamp_poll_index, demo_poll_in_range, oracle,
     run, tape_values, ConverseValues,
 };
-pub use keyed::{keyed_clamp_cutoff, keyed_hit_within_cutoff, KeyedReply, KeyedView};
+pub use keyed::{keyed_clamp_cutoff, keyed_hit_within_cutoff, KeyedIndex, KeyedReply, KeyedView};
 pub use record::{
     record_mono_advance, record_seed_non_zero, LiveSeam, OsEffects, RealEffects, RecordSink,
     RecordingSeam,

@@ -22,9 +22,6 @@ libc = { workspace = true }
 aterm-durable = { workspace = true }
 
 [dev-dependencies]
-# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
-# build too.
-aterm-durable = { workspace = true, features = ["test-support"] }
 # The card's Tier-1 binds to its derived model.
 aterm-spec = { workspace = true }
 # Scratch config directories for the verified-host record's tests.

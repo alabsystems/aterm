@@ -106,7 +106,9 @@ enum Job {
     /// Set mouse tracking (an input mode), be answered, print `answered`,
     /// exit 0.
     MouseOneShot,
-    /// Run `vim -u NONE -c q`, be answered, print `answered`, exit 0.
+    /// Run `vim -u NONE -c q` (the vim the test resolved, which it exports as
+    /// `ATERM_TEST_VIM`), be answered, print `answered`, exit 0. A vim that did not run
+    /// cleanly prints `vim did not run` and exits 1, never `answered`.
     Vim,
     /// gdb's shape: arm the alternate screen, mouse and a hidden cursor, fork
     /// a child into its own group and hand it the terminal, take the terminal
@@ -179,13 +181,22 @@ impl Job {
                 standin::exit(0)
             }
             Job::Vim => {
-                #[expect(
-                    clippy::disallowed_types,
-                    reason = "test code: the stand-in job runs vim as a shell's job would"
-                )]
-                let _ = std::process::Command::new("vim")
-                    .args(["-u", "NONE", "-c", "q"])
-                    .status();
+                // Checked: a vim that did not run is never answered, so the lane cannot
+                // pass having run no vim (docs/DESIGN-init-system-2026-10-20.md §8,
+                // rule 5).
+                let ran = aterm_spec::host::find_tool("vim").map(|vim| {
+                    #[expect(
+                        clippy::disallowed_types,
+                        reason = "test code: the stand-in job runs vim as a shell's job would"
+                    )]
+                    std::process::Command::new(vim)
+                        .args(["-u", "NONE", "-c", "q"])
+                        .status()
+                });
+                if !matches!(&ran, Some(Ok(status)) if status.success()) {
+                    standin::put(format!("vim did not run: {ran:?}\n").as_bytes());
+                    standin::exit(1)
+                }
                 standin::answered();
                 standin::put(b"answered\n");
                 standin::exit(0)
@@ -445,14 +456,6 @@ impl Shell {
     }
 }
 
-/// `name` as this process's `PATH` finds it.
-fn on_path(name: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|file| file.is_file())
-}
-
 /// [`HANDED_BACK`] plus bracketed paste as the shell itself leaves it.
 fn handed_back(bracketed_paste: &'static str) -> Vec<(&'static str, &'static str)> {
     let mut want = HANDED_BACK.to_vec();
@@ -547,17 +550,19 @@ fn zsh_keeps_the_display_modes_a_one_shot_sets() {
 /// vim's exit reset as the shell's hands back at the cut: at most one.
 #[test]
 fn zsh_records_nothing_for_a_clean_vim_exit() {
-    if on_path("vim").is_none() {
-        aterm_spec::host::could_not_run("vim is not installed; this lane runs it as a job");
-    }
+    // One vim for the job and the bare line: the one the resolver names, exported so the
+    // job (a child of the shell) resolves the same file.
+    let vim = aterm_spec::host::need_tool("vim");
+    let vim = format!("'{}'", vim.display().to_string().replace('\'', r"'\''"));
     let mut sh = Shell::boot("zv", ZSH);
+    sh.type_line(&format!("export ATERM_TEST_VIM={vim}"));
     sh.start(Job::Vim);
     sh.ctl.expect_on_screen("answered");
     sh.settle();
     sh.assert_handbacks("a clean vim exit records nothing", 0);
     // vim reads the terminal while it runs, so nothing is typed until the
     // shell's own marker after it.
-    sh.type_line("vim -u NONE -c q; echo vim\"\"-done");
+    sh.type_line(&format!("{vim} -u NONE -c q && echo vim\"\"-done"));
     sh.ctl.expect_on_screen("vim-done");
     let bare = sh.handback_count();
     assert!(bare <= 1, "a bare vim exit records at most one: {bare}");
@@ -606,6 +611,17 @@ fn zsh_a_bgd_leaderless_pipeline_keeps_its_modes_beside_a_command() {
         Job::Armed(Arm::AltMouse, 3).line()
     ));
     sh.ctl.expect_on_screen("armed-3");
+    // Leaderless before its Ctrl-Z: `sleep 0` (the group's leader, its id) exits by itself
+    // and zsh reaps it. Until then it may still be exec'ing, and Darwin mishandles a stop
+    // that lands mid-exec (7d71bf733f); the job printed `armed-3` after its last exec.
+    let shell = sh.pgrp;
+    aterm_spec::wait::until_within(MUST_HAPPEN, "the pipeline's leader to exit", || {
+        let group = sh.ctl.fg_pgrp().filter(|g| *g > 0 && *g != shell)?;
+        // SAFETY: signal 0 sends nothing; `kill` only says whether `group`'s leader lives.
+        let gone = unsafe { libc::kill(group, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        gone.then_some(())
+    });
     sh.job_ctrl('z', "the pipeline to bg holds the terminal for its Ctrl-Z");
     sh.ctl.expect_on_screen("suspended");
     sh.type_line("bg");

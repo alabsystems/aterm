@@ -581,7 +581,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .since(None)
             .filter(|e| e.kind == "modes-restored")
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect();
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(

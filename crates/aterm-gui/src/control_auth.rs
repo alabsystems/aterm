@@ -113,6 +113,33 @@ pub(crate) fn random_token_hex() -> Option<String> {
     aterm_uds::rand::hex_token::<32>().ok()
 }
 
+/// That `dir` is a directory, following a symlink as `harden_private_dir`
+/// does on both platforms: nothing there is `NotFound`, and something there
+/// that is no directory is `NotADirectory`, a symlink to nothing included. A
+/// followed `stat` alone answers `NotFound` for that link, which a session
+/// identity's admission reads as a folder `identities forget` took
+/// (`agent_identity::harden_identity`), when the identity is there and only
+/// its agent folder is no folder.
+fn require_dir(dir: &Path) -> std::io::Result<()> {
+    let not_a_directory = |what: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{}: {what}", dir.display()),
+        )
+    };
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(not_a_directory("not a directory")),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(dir).is_ok() =>
+        {
+            Err(not_a_directory("a symlink to nothing"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Filename of the `latest` symlink in the per-user directory, pointing at
 /// the newest instance's `aterm-<pid>.sock`.
 pub(crate) const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
@@ -390,34 +417,11 @@ struct ArtifactLeaseState {
     video_retention: Option<crate::control::VideoRetentionPermit>,
 }
 
-const ARTIFACT_CLEANUP_QUEUE_LIMIT: usize = 32;
-
-/// The count a cleanup-queue permit is charged to: the process's one, or in a test build
-/// the calling test thread's own (`crate::control::test_thread_budget`), so a sibling
-/// test's backlog at the one cleanup worker never refuses this test's admission.
-fn artifact_cleanup_queue_live() -> &'static std::sync::atomic::AtomicUsize {
-    #[cfg(test)]
-    {
-        crate::control::test_thread_budget!(
-            std::sync::atomic::AtomicUsize,
-            std::sync::atomic::AtomicUsize::new(0)
-        )
-    }
-    #[cfg(not(test))]
-    {
-        static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        &LIVE
-    }
-}
-
+/// One reserved place in the cleanup queue, shared by every clone of the task
+/// that carries it (a panic's recovery copy) and given back when the last goes.
 #[derive(Clone, Debug)]
 struct ArtifactCleanupQueuePermit {
-    _inner: std::sync::Arc<ArtifactCleanupQueuePermitInner>,
-}
-
-#[derive(Debug)]
-struct ArtifactCleanupQueuePermitInner {
-    live: Option<&'static std::sync::atomic::AtomicUsize>,
+    _slot: std::sync::Arc<crate::budget::Slot>,
 }
 
 #[derive(Debug)]
@@ -439,16 +443,17 @@ impl DeferredImageCleanup {
         fresh: std::ffi::OsString,
         namespace_root: PathBuf,
         current: String,
+        budgets: &crate::control::ArtifactBudgets,
     ) -> Option<std::sync::Arc<Self>> {
         Some(std::sync::Arc::new(Self {
             image_dir,
             image_identity,
             fresh,
-            image_queue: Some(reserve_artifact_cleanup_queue()?),
+            image_queue: Some(reserve_artifact_cleanup_queue(budgets)?),
             image_armed: std::sync::atomic::AtomicBool::new(false),
             namespace_root,
             current,
-            namespace_queue: Some(reserve_artifact_cleanup_queue()?),
+            namespace_queue: Some(reserve_artifact_cleanup_queue(budgets)?),
         }))
     }
 
@@ -516,33 +521,10 @@ impl Drop for DeferredVideoCleanup {
 }
 
 impl ArtifactCleanupQueuePermit {
-    fn try_acquire() -> Option<Self> {
-        let live = artifact_cleanup_queue_live();
-        live.try_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |current| (current < ARTIFACT_CLEANUP_QUEUE_LIMIT).then_some(current + 1),
-        )
-        .ok()
-        .map(|_| Self {
-            _inner: std::sync::Arc::new(ArtifactCleanupQueuePermitInner { live: Some(live) }),
+    fn try_reserve(budgets: &crate::control::ArtifactBudgets) -> Option<Self> {
+        Some(Self {
+            _slot: std::sync::Arc::new(budgets.try_reserve_cleanup_queue()?),
         })
-    }
-
-    #[cfg(test)]
-    fn unmetered() -> Self {
-        Self {
-            _inner: std::sync::Arc::new(ArtifactCleanupQueuePermitInner { live: None }),
-        }
-    }
-}
-
-impl Drop for ArtifactCleanupQueuePermitInner {
-    fn drop(&mut self) {
-        if let Some(live) = self.live {
-            let previous = live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            debug_assert!(previous > 0, "artifact cleanup queue permit underflow");
-        }
     }
 }
 
@@ -712,6 +694,7 @@ fn artifact_cleanup_scheduler() -> Option<&'static ArtifactCleanupScheduler> {
                 &best_effort_receiver,
                 &wake_receiver,
                 &worker_best_effort,
+                crate::control::ArtifactBudgets::process(),
             );
         })
         .ok()?;
@@ -751,14 +734,19 @@ fn try_schedule_video_retention(task: VideoRetentionTask) -> bool {
     true
 }
 
-fn reserve_artifact_cleanup_queue() -> Option<ArtifactCleanupQueuePermit> {
+fn reserve_artifact_cleanup_queue(
+    budgets: &crate::control::ArtifactBudgets,
+) -> Option<ArtifactCleanupQueuePermit> {
     artifact_cleanup_scheduler()?;
-    ArtifactCleanupQueuePermit::try_acquire()
+    ArtifactCleanupQueuePermit::try_reserve(budgets)
 }
 
-fn reserve_video_retention(path: &Path) -> Option<crate::control::VideoRetentionPermit> {
+fn reserve_video_retention(
+    path: &Path,
+    budgets: &crate::control::ArtifactBudgets,
+) -> Option<crate::control::VideoRetentionPermit> {
     artifact_cleanup_scheduler()?;
-    crate::control::ReplyRetention::try_reserve_video_retention_for_path(path)
+    budgets.try_reserve_video_retention_for_path(path)
 }
 
 #[derive(Debug)]
@@ -1057,6 +1045,7 @@ fn run_video_retention_task(mut task: VideoRetentionTask) {
 fn run_best_effort_cleanup_task(
     task: ArtifactCleanupTask,
     sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+    budgets: &crate::control::ArtifactBudgets,
 ) {
     match task {
         ArtifactCleanupTask::AutomaticImages {
@@ -1065,9 +1054,7 @@ fn run_best_effort_cleanup_task(
             fresh,
             _queue,
         } => {
-            let Some(admission) =
-                crate::control::ReplyRetention::try_reserve_cleanup_for_path(&dir)
-            else {
+            let Some(admission) = budgets.try_reserve_cleanup_for_path(&dir) else {
                 let _ = sender.send(ArtifactCleanupTask::AutomaticImages {
                     dir,
                     expected_dir,
@@ -1079,6 +1066,8 @@ fn run_best_effort_cleanup_task(
             let Ok(pinned) = crate::pinned_dir::PinnedDir::open(&dir) else {
                 return;
             };
+            #[cfg(test)]
+            race_window(RaceWindow::ImagesPinned);
             if pinned.retained_identity().ok() != Some(expected_dir)
                 || pinned.validate_path_identity().is_err()
             {
@@ -1092,9 +1081,7 @@ fn run_best_effort_cleanup_task(
             current,
             _queue,
         } => {
-            let Some(admission) =
-                crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
-            else {
+            let Some(admission) = budgets.try_reserve_cleanup_for_path(&root) else {
                 let _ = sender.send(ArtifactCleanupTask::DeadNamespaces {
                     root,
                     current,
@@ -1135,9 +1122,7 @@ fn run_best_effort_cleanup_task(
             expected_root,
             _queue,
         } => {
-            let Some(admission) =
-                crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
-            else {
+            let Some(admission) = budgets.try_reserve_cleanup_for_path(&root) else {
                 let _ = sender.send(ArtifactCleanupTask::VideoTombstones {
                     root,
                     expected_root,
@@ -1193,6 +1178,7 @@ fn artifact_cleanup_worker(
     best_effort_receiver: &std::sync::mpsc::Receiver<ArtifactCleanupTask>,
     wake_receiver: &std::sync::mpsc::Receiver<()>,
     best_effort_sender: &std::sync::mpsc::Sender<ArtifactCleanupTask>,
+    budgets: &crate::control::ArtifactBudgets,
 ) {
     loop {
         // Correctness-critical retention is checked before every bounded GC
@@ -1211,7 +1197,7 @@ fn artifact_cleanup_worker(
         if let Ok(task) = best_effort_receiver.try_recv() {
             let recovery = task.panic_recovery();
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_best_effort_cleanup_task(task, best_effort_sender);
+                run_best_effort_cleanup_task(task, best_effort_sender, budgets);
             }))
             .is_err()
             {
@@ -1429,6 +1415,7 @@ pub(crate) fn retain_video_artifact_path(
     root: crate::pinned_dir::PinnedDir,
     fresh: std::ffi::OsString,
     recording: &crate::pinned_dir::PinnedDir,
+    budgets: &crate::control::ArtifactBudgets,
 ) -> std::io::Result<Option<ArtifactPathLease>> {
     let key = root.path().join(&fresh);
     if recording.path() != key {
@@ -1449,7 +1436,7 @@ pub(crate) fn retain_video_artifact_path(
         join_video_artifact_state(state, identity)?
     } else {
         drop(held);
-        let video_retention = reserve_video_retention(root.path()).ok_or_else(|| {
+        let video_retention = reserve_video_retention(root.path(), budgets).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "video retention cleanup lane is busy",
@@ -1694,6 +1681,52 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
+/// Test-only: a point between one of this module's checks and the re-check
+/// that repeats it before the use. The re-checks exist for a swap that lands
+/// in that window and nowhere else; [`race_window`] is where a test lands one.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RaceWindow {
+    /// [`ensure_canonical_direct_child`]: the child has been looked at.
+    ChildLooked,
+    /// [`open_private_namespace_lock`]: the lock has been looked at, not yet opened.
+    LockLooked,
+    /// [`open_private_namespace_lock`]: the lock is open, its path not yet re-checked.
+    LockOpened,
+    /// A sweep cursor's `begin`: its root is pinned and not yet listed.
+    CursorPinned,
+    /// The automatic-image sweep: its directory is pinned, its path not yet re-checked.
+    ImagesPinned,
+    /// `publish_marker`: the marker is visible and retention not yet armed.
+    MarkerVisible,
+}
+
+/// A window armed with the swap to run there once.
+#[cfg(test)]
+type ArmedRace = (RaceWindow, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+std::thread_local! {
+    /// The race armed on this thread.
+    static ARMED_RACE: std::cell::RefCell<Option<ArmedRace>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the swap armed for `at` on this thread, if one is, and disarm it.
+#[cfg(test)]
+fn race_window(at: RaceWindow) {
+    let swap = ARMED_RACE.with_borrow_mut(|armed| {
+        if armed.as_ref().is_some_and(|(window, _)| *window == at) {
+            armed.take().map(|(_, swap)| swap)
+        } else {
+            None
+        }
+    });
+    if let Some(swap) = swap {
+        swap();
+    }
+}
+
 /// Create/validate one real directory immediately below a canonical parent.
 /// Existing links/reparse redirections are rejected before hardening or use.
 ///
@@ -1711,7 +1744,10 @@ fn ensure_canonical_direct_child(parent: &Path, name: &str) -> std::io::Result<P
     }
     let parent = std::fs::canonicalize(parent)?;
     let child = parent.join(name);
-    match std::fs::symlink_metadata(&child) {
+    let looked = std::fs::symlink_metadata(&child);
+    #[cfg(test)]
+    race_window(RaceWindow::ChildLooked);
+    match looked {
         Ok(metadata) => {
             if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
                 return Err(std::io::Error::new(
@@ -1844,7 +1880,11 @@ fn open_private_namespace_lock(
             .custom_flags(0x0020_0000)
             .share_mode(0x0000_0001 | 0x0000_0002);
     }
+    #[cfg(test)]
+    race_window(RaceWindow::LockLooked);
     let file = options.open(&path)?;
+    #[cfg(test)]
+    race_window(RaceWindow::LockOpened);
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1981,6 +2021,8 @@ impl DeadNamespaceSweep {
             Ok(root) => root,
             Err(_) => return Err(queue),
         };
+        #[cfg(test)]
+        race_window(RaceWindow::CursorPinned);
         let entries = match std::fs::read_dir(&root_path) {
             Ok(entries) => entries,
             Err(_) => return Err(queue),
@@ -2163,8 +2205,9 @@ fn sweep_dead_instance_namespaces_with(
     current: &str,
     mut pid_alive: impl FnMut(u32) -> bool,
 ) {
-    let queue = ArtifactCleanupQueuePermit::unmetered();
-    let Some(admission) = crate::control::ReplyRetention::try_reserve_cleanup_for_path(root) else {
+    let budgets = crate::control::ArtifactBudgets::shipping();
+    let queue = ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("a fresh queue has room");
+    let Some(admission) = budgets.try_reserve_cleanup_for_path(root) else {
         return;
     };
     let Ok(mut sweep) = DeadNamespaceSweep::begin(root, current.to_string(), queue, admission)
@@ -2284,6 +2327,8 @@ impl VideoTombstoneSweep {
         if pinned_root.retained_identity().ok()? != expected_root {
             return None;
         }
+        #[cfg(test)]
+        race_window(RaceWindow::CursorPinned);
         let entries = std::fs::read_dir(&root_path).ok()?;
         pinned_root.validate_path_identity().ok()?;
         Some(Self {
@@ -2615,6 +2660,8 @@ impl ConfinedVideoDir {
             || {},
             || {
                 *published = true;
+                #[cfg(test)]
+                race_window(RaceWindow::MarkerVisible);
                 if let Err(error) = retention_lease.arm_video_retention_sweep(recording) {
                     arm_error = Some(error);
                 }
@@ -2690,45 +2737,42 @@ impl Drop for ConfinedVideoDir {
 #[must_use]
 #[cfg(test)]
 pub(crate) fn confine_video_dir(sock_dir: &Path) -> Option<ConfinedVideoDir> {
-    confine_video_dir_for_instance(sock_dir, process_instance_id())
+    confine_video_dir_with_admission(
+        sock_dir,
+        &crate::control::ArtifactBudgets::shipping(),
+        |_| true,
+    )
+    .ok()
 }
 
 pub(crate) fn confine_video_dir_with_admission(
     sock_dir: &Path,
+    budgets: &crate::control::ArtifactBudgets,
     admit: impl FnOnce(&Path) -> bool,
 ) -> Result<ConfinedVideoDir, ArtifactConfinementError> {
-    confine_video_dir_for_instance_with_admission(sock_dir, process_instance_id(), admit)
+    confine_video_dir_for_instance_with_admission(sock_dir, process_instance_id(), budgets, admit)
 }
 
-/// The tests' confinement, which waits out an ADMISSION refusal and answers
-/// every other one at once. A refusal there is capacity, not a verdict: each
-/// live recording holds two slots of the process-wide cleanup queue
-/// (`ARTIFACT_CLEANUP_QUEUE_LIMIT`, 32) until the one cleanup worker drains the
-/// sweeps its drop queued, and every test in the binary shares both. A
-/// parallel run's threads (sixteen on the Windows host) recording at once fill
-/// it while the worker is a few sweeps behind, which on Windows, where one
-/// sweep's opens cost tens of milliseconds, they did (2026-10-17: five or six
-/// video tests answered `None` here in four parallel runs of five; none did
-/// alone or single-threaded). The product's `video` answers that refusal as
-/// busy for its client to retry. The wait is a hang detector
-/// ([`aterm_spec::wait::MUST_HAPPEN`]): a queue that never frees is a leak.
+/// The tests' confinement, against a budget set of its own at the shipping
+/// caps ([`crate::control::ArtifactBudgets::shipping`]): no sibling test's
+/// recordings hold its cleanup-queue places, so its admission is never refused
+/// for capacity.
 #[must_use]
 #[cfg(test)]
 fn confine_video_dir_for_instance(sock_dir: &Path, instance: &str) -> Option<ConfinedVideoDir> {
-    aterm_spec::wait::within(
-        aterm_spec::wait::MUST_HAPPEN,
-        std::time::Duration::from_millis(5),
-        || match confine_video_dir_for_instance_with_admission(sock_dir, instance, |_| true) {
-            Err(ArtifactConfinementError::AdmissionRefused) => None,
-            result => Some(result.ok()),
-        },
+    confine_video_dir_for_instance_with_admission(
+        sock_dir,
+        instance,
+        &crate::control::ArtifactBudgets::shipping(),
+        |_| true,
     )
-    .unwrap_or_else(|| panic!("video admission never freed for {sock_dir:?}: a leak, not load"))
+    .ok()
 }
 
 fn confine_video_dir_for_instance_with_admission(
     sock_dir: &Path,
     instance: &str,
+    budgets: &crate::control::ArtifactBudgets,
     admit: impl FnOnce(&Path) -> bool,
 ) -> Result<ConfinedVideoDir, ArtifactConfinementError> {
     if !valid_instance_component(instance) {
@@ -2745,13 +2789,13 @@ fn confine_video_dir_for_instance_with_admission(
         .map_err(|_| ArtifactConfinementError::Invalid)?;
     hold_current_instance_lease(&canon).map_err(|_| ArtifactConfinementError::Invalid)?;
     let mut video_retention = Some(
-        reserve_video_retention(instance_dir.path())
+        reserve_video_retention(instance_dir.path(), budgets)
             .ok_or(ArtifactConfinementError::AdmissionRefused)?,
     );
-    let tombstone_queue =
-        reserve_artifact_cleanup_queue().ok_or(ArtifactConfinementError::AdmissionRefused)?;
-    let dead_queue =
-        reserve_artifact_cleanup_queue().ok_or(ArtifactConfinementError::AdmissionRefused)?;
+    let tombstone_queue = reserve_artifact_cleanup_queue(budgets)
+        .ok_or(ArtifactConfinementError::AdmissionRefused)?;
+    let dead_queue = reserve_artifact_cleanup_queue(budgets)
+        .ok_or(ArtifactConfinementError::AdmissionRefused)?;
     let deferred_cleanup = DeferredVideoCleanup {
         tombstone_root: instance_dir.path().to_path_buf(),
         tombstone_identity: instance_identity,
@@ -2821,12 +2865,19 @@ const AUTO_IMAGE_SCAN_BUDGET: usize = 256;
 #[must_use]
 #[cfg(test)]
 pub(crate) fn confine_automatic_image_path(sock_dir: &Path, stem: &str) -> Option<ConfinedImage> {
-    confine_automatic_image_path_with_admission(sock_dir, stem, |_| true).ok()
+    confine_automatic_image_path_with_admission(
+        sock_dir,
+        stem,
+        &crate::control::ArtifactBudgets::shipping(),
+        |_| true,
+    )
+    .ok()
 }
 
 pub(crate) fn confine_automatic_image_path_with_admission(
     sock_dir: &Path,
     stem: &str,
+    budgets: &crate::control::ArtifactBudgets,
     admit: impl FnOnce(&Path) -> bool,
 ) -> Result<ConfinedImage, ArtifactConfinementError> {
     if stem.is_empty()
@@ -2855,6 +2906,7 @@ pub(crate) fn confine_automatic_image_path_with_admission(
         file_name.clone(),
         auto,
         process_instance_id().to_string(),
+        budgets,
     )
     .ok_or(ArtifactConfinementError::AdmissionRefused)?;
     Ok(ConfinedImage {
@@ -4463,22 +4515,30 @@ mod tests {
         assert_eq!(plan.latest_link, Some(dir.join(SOCK_FILE)));
     }
 
-    /// The best-effort cleanup queue admits exactly its limit, and a released
-    /// slot is admitted again. The count is this test thread's own
-    /// (`artifact_cleanup_queue_live`), so it starts empty.
+    /// The best-effort cleanup queue admits exactly its limit
+    /// ([`crate::control::ARTIFACT_CLEANUP_QUEUE_LIMIT`]), a permit's clones (a
+    /// panic's recovery copy) hold one place between them, and the place is
+    /// admitted again once the last of them drops. The budgets are this test's
+    /// own ([`crate::control::ArtifactBudgets::shipping`]), so the queue starts
+    /// empty.
     #[test]
-    fn the_cleanup_queue_admits_exactly_its_limit() {
-        let live = artifact_cleanup_queue_live();
-        assert_eq!(live.load(std::sync::atomic::Ordering::Acquire), 0);
-        let mut permits: Vec<_> = (0..ARTIFACT_CLEANUP_QUEUE_LIMIT)
-            .map(|_| ArtifactCleanupQueuePermit::try_acquire().expect("within the limit"))
+    fn the_cleanup_queue_admits_exactly_its_limit_and_a_freed_place_again() {
+        let budgets = crate::control::ArtifactBudgets::shipping();
+        let reserve = || ArtifactCleanupQueuePermit::try_reserve(&budgets);
+        let mut permits: Vec<_> = (0..crate::control::ARTIFACT_CLEANUP_QUEUE_LIMIT)
+            .map(|_| reserve().expect("within the limit"))
             .collect();
-        assert!(ArtifactCleanupQueuePermit::try_acquire().is_none());
-        drop(permits.pop());
-        permits.push(ArtifactCleanupQueuePermit::try_acquire().expect("a freed slot"));
-        assert!(ArtifactCleanupQueuePermit::try_acquire().is_none());
-        drop(permits);
-        assert_eq!(live.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(reserve().is_none(), "one past the limit is refused");
+        let held = permits.pop().expect("an admitted place");
+        let recovery = held.clone();
+        drop(held);
+        assert!(
+            reserve().is_none(),
+            "the recovery copy still holds the place"
+        );
+        drop(recovery);
+        permits.push(reserve().expect("a freed place"));
+        assert!(reserve().is_none());
     }
 
     #[test]
@@ -5313,11 +5373,28 @@ mod tests {
 
         // An absolute path OUTSIDE the runtime dir (the attacker overwrite) is rejected.
         assert!(confine_proxy_sock(&dir, "/tmp/evil-attacker.sock").is_none());
-        // A `..` escape and a relative path are rejected.
+        // A `..` escape is rejected.
         let escape = dir.join("../evil.sock");
         assert!(confine_proxy_sock(&dir, &escape.to_string_lossy()).is_none());
+        // A relative path is refused even where this process's cwd would land
+        // it in the dir: what it names depends on whose cwd reads it. A
+        // subdirectory of the cwd stands in for the socket dir (the parallel
+        // test runner never changes cwd).
+        let cwd = std::env::current_dir().unwrap();
+        let sub = std::fs::read_dir(&cwd)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && entry.file_name().to_str().is_some()
+            })
+            .expect("the test's cwd has a subdirectory")
+            .file_name();
+        let relative = Path::new(&sub).join("aterm-42.sock");
+        let in_cwd = cwd.join(&sub);
+        assert!(confine_proxy_sock(&in_cwd, &cwd.join(&relative).to_string_lossy()).is_some());
         assert!(
-            confine_proxy_sock(&dir, "aterm-42.sock").is_none(),
+            confine_proxy_sock(&in_cwd, relative.to_str().unwrap()).is_none(),
             "relative rejected"
         );
         // A nested subdir under the runtime dir is rejected (single component only),
@@ -5343,11 +5420,10 @@ mod tests {
     fn peer_uid_of_socketpair_is_our_uid() {
         // A connected UnixStream pair: the peer of each end is us.
         let (a, _b) = CtlStream::pair().expect("socketpair");
-        if let Some(uid) = peer_uid(&a) {
-            assert_eq!(uid, our_uid());
-        }
-        // On platforms without a peer-cred primitive, peer_uid is None — the
-        // caller fails closed, which is the correct conservative behaviour.
+        // Every Unix aterm builds for has a peer-cred primitive (getpeereid,
+        // SO_PEERCRED); where one is missing peer_uid is None and the caller
+        // fails closed, which this test would then name rather than pass over.
+        assert_eq!(peer_uid(&a), Some(our_uid()));
         // And the accept gate accepts our own connection.
         assert_eq!(peer_check(&a), Ok(()));
         // The gate's decision: only our uid; another uid — root's too — or
@@ -5682,6 +5758,19 @@ mod tests {
         }
     }
 
+    /// Arm `window` on this thread: the next pass through it runs `swap`, once.
+    /// Unix only: Windows will not rename a directory a handle holds open.
+    #[cfg(unix)]
+    fn race_at(window: RaceWindow, swap: impl FnOnce() + 'static) {
+        ARMED_RACE.set(Some((window, Box::new(swap))));
+    }
+
+    /// Whether the swap [`race_at`] armed has run; disarms it either way.
+    #[cfg(unix)]
+    fn race_ran() -> bool {
+        ARMED_RACE.take().is_none()
+    }
+
     fn artifact_lease_count(path: &Path) -> Option<usize> {
         let (leases, _) = artifact_path_leases();
         let held = leases
@@ -5756,9 +5845,14 @@ mod tests {
         let root = crate::pinned_dir::PinnedDir::open_resolved(path.parent().unwrap()).unwrap();
         let name = path.file_name().expect("recording name").to_os_string();
         let reader_recording = root.child(&name).unwrap();
-        let reader = retain_video_artifact_path(root, name, &reader_recording)
-            .unwrap()
-            .expect("marker-visible reader lease");
+        let reader = retain_video_artifact_path(
+            root,
+            name,
+            &reader_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .unwrap()
+        .expect("marker-visible reader lease");
         reader.arm_video_retention_sweep(&reader_recording).unwrap();
         drop(reader_recording);
         assert_eq!(
@@ -5825,9 +5919,14 @@ mod tests {
         let reader_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
         let name = path.file_name().unwrap().to_os_string();
         let reader_recording = reader_root.child(&name).unwrap();
-        let reader = retain_video_artifact_path(reader_root, name, &reader_recording)
-            .unwrap()
-            .expect("reader overlaps the published producer");
+        let reader = retain_video_artifact_path(
+            reader_root,
+            name,
+            &reader_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .unwrap()
+        .expect("reader overlaps the published producer");
         drop(reader_recording);
         drop(reader);
         assert!(
@@ -5866,18 +5965,28 @@ mod tests {
 
         let first_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
         let first_recording = first_root.child(&fresh).unwrap();
-        let first = retain_video_artifact_path(first_root, fresh.clone(), &first_recording)
-            .unwrap()
-            .expect("first reader lease");
+        let first = retain_video_artifact_path(
+            first_root,
+            fresh.clone(),
+            &first_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .unwrap()
+        .expect("first reader lease");
         let key = first.key.clone().expect("reader owns its canonical key");
         first.arm_video_retention_sweep(&first_recording).unwrap();
         drop(first_recording);
 
         let second_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
         let second_recording = second_root.child(&fresh).unwrap();
-        let second = retain_video_artifact_path(second_root, fresh, &second_recording)
-            .unwrap()
-            .expect("overlapping reader lease");
+        let second = retain_video_artifact_path(
+            second_root,
+            fresh,
+            &second_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .unwrap()
+        .expect("overlapping reader lease");
         drop(second_recording);
 
         drop(first);
@@ -5935,15 +6044,28 @@ mod tests {
         let first_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
         let first_recording = first_root.child(&fresh).unwrap();
         let other_recording = first_root.child(&other).unwrap();
-        let first = retain_video_artifact_path(first_root, fresh.clone(), &first_recording)
-            .unwrap()
-            .expect("first reader lease");
+        let first = retain_video_artifact_path(
+            first_root,
+            fresh.clone(),
+            &first_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .unwrap()
+        .expect("first reader lease");
 
         // Another recording's handle is no capability for this one.
         let again = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
         let invalid = |result: std::io::Result<()>| result.unwrap_err().kind();
         assert_eq!(
-            invalid(retain_video_artifact_path(again, fresh.clone(), &other_recording).map(drop)),
+            invalid(
+                retain_video_artifact_path(
+                    again,
+                    fresh.clone(),
+                    &other_recording,
+                    &crate::control::ArtifactBudgets::shipping(),
+                )
+                .map(drop)
+            ),
             std::io::ErrorKind::InvalidInput
         );
         assert_eq!(
@@ -5977,8 +6099,13 @@ mod tests {
 
         let replacement_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
         let same_recording = replacement_root.child(&fresh).unwrap();
-        let error = retain_video_artifact_path(replacement_root, fresh, &same_recording)
-            .expect_err("the same recording inode cannot cross into a replacement root");
+        let error = retain_video_artifact_path(
+            replacement_root,
+            fresh,
+            &same_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .expect_err("the same recording inode cannot cross into a replacement root");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(artifact_lease_count(first.key.as_ref().unwrap()), Some(1));
         // Nor can it arm the original lease, whose root is no longer at the path.
@@ -6194,6 +6321,45 @@ mod tests {
         let mut exact = VideoPruneWork::new(VIDEO_SCAN_WORK);
         assert!(exact.scan() && !exact.scan());
 
+        // A tombstone that cannot be emptied pays for the entry it tried, never
+        // for the rmdir that cannot follow.
+        #[cfg(target_os = "macos")]
+        {
+            let stuck = std::ffi::OsString::from(".prune-stuck");
+            std::fs::create_dir(root.join(&stuck)).unwrap();
+            std::fs::write(root.join(&stuck).join("frame"), b"png").unwrap();
+            let undeletable = Immutable::set(&root.join(&stuck).join("frame"));
+            let tombstone = pinned.child(&stuck).unwrap();
+            let mut work = VideoPruneWork::new(VIDEO_PRUNE_WORK_LIMIT);
+            let cleanup = cleanup_video_tombstone(&pinned, &stuck, &tombstone, &mut work);
+            assert!(!cleanup.removed);
+            assert_eq!(work.deletes, 1);
+            drop((undeletable, tombstone));
+            std::fs::remove_dir_all(root.join(&stuck)).unwrap();
+        }
+
+        // A recording a reader holds keeps its place and is no candidate: the
+        // two oldest unheld ones are the only recordings renamed.
+        let held = std::ffi::OsString::from(format!("rec-{:020}-000", 0));
+        let lease_root = crate::pinned_dir::PinnedDir::open_resolved(&root).unwrap();
+        let held_recording = lease_root.child(&held).unwrap();
+        let lease = retain_video_artifact_path(
+            lease_root,
+            held.clone(),
+            &held_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .unwrap()
+        .expect("reader lease");
+        let mut work = VideoPruneWork::new(VIDEO_PRUNE_WORK_LIMIT);
+        prune_video_dirs_with_work(&pinned, &fresh_name, &mut work).unwrap();
+        drop((lease, held_recording));
+        assert_eq!(work.renames, 2);
+        assert!(root.join(&held).is_dir());
+        for taken in 1..=2 {
+            assert!(!root.join(format!("rec-{taken:020}-000")).exists());
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6330,10 +6496,14 @@ mod tests {
         write_completed_video_fixture(elsewhere.path(), same_name.to_str().unwrap());
         let elsewhere_root = crate::pinned_dir::PinnedDir::open_resolved(elsewhere.path()).unwrap();
         let elsewhere_recording = elsewhere_root.child(&same_name).unwrap();
-        let elsewhere_lease =
-            retain_video_artifact_path(elsewhere_root, same_name.clone(), &elsewhere_recording)
-                .unwrap()
-                .expect("reader lease elsewhere");
+        let elsewhere_lease = retain_video_artifact_path(
+            elsewhere_root,
+            same_name.clone(),
+            &elsewhere_recording,
+            &crate::control::ArtifactBudgets::shipping(),
+        )
+        .unwrap()
+        .expect("reader lease elsewhere");
         // A quarantine a crashed sweep left half done is finished first.
         let crashed = root.join(".prune-crashed");
         std::fs::create_dir(&crashed).unwrap();
@@ -6398,6 +6568,34 @@ mod tests {
         assert!(recording.batch_synced_for_test());
         drop(recording.publish_marker().unwrap());
         assert!(path.join(VIDEO_PUBLISHED_FILE).is_file());
+
+        // Retention refused at the marker (its namespace moved aside for that
+        // instant) fails the publication, though the marker stays visible.
+        #[cfg(unix)]
+        {
+            let mut raced = confine_video_dir_for_instance(temp.path(), &instance).unwrap();
+            let raced_path = raced.path().to_path_buf();
+            let index = raced
+                .write_batch_member_authorized(
+                    std::ffi::OsStr::new("index.json"),
+                    b"{\"frames\":[]}",
+                    || true,
+                )
+                .unwrap();
+            raced.publish(&[], &index).unwrap();
+            let namespace = raced_path.parent().unwrap().to_path_buf();
+            let aside = namespace.with_extension("aside");
+            race_at(RaceWindow::MarkerVisible, {
+                let (namespace, aside) = (namespace.clone(), aside.clone());
+                move || std::fs::rename(&namespace, &aside).unwrap()
+            });
+            let published = raced.publish_marker_with_test_hook(|| {
+                std::fs::rename(&aside, &namespace).unwrap();
+            });
+            assert!(race_ran());
+            assert!(published.is_err());
+            assert!(raced_path.join(VIDEO_PUBLISHED_FILE).is_file());
+        }
     }
 
     #[test]
@@ -6522,6 +6720,57 @@ mod tests {
             std::fs::canonicalize(&sibling).unwrap()
         );
         assert_eq!(mode(&sibling), 0o700);
+
+        // A swap that lands after the look. A real directory when looked at and
+        // a link to a stranger when resolved is refused before anything is
+        // hardened through the link.
+        let stranger = root.join("stranger");
+        std::fs::create_dir(&stranger).unwrap();
+        std::fs::set_permissions(&stranger, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(parent.join("raced")).unwrap();
+        race_at(RaceWindow::ChildLooked, {
+            let (raced, stranger) = (parent.join("raced"), stranger.clone());
+            move || {
+                std::fs::remove_dir(&raced).unwrap();
+                symlink(&stranger, &raced).unwrap();
+            }
+        });
+        let raced = ensure_canonical_direct_child(&parent, "raced");
+        assert!(race_ran());
+        assert_eq!(
+            raced.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(mode(&stranger), 0o755);
+        // Nothing there when looked at, then a link to the parent's own
+        // `sibling` planted before the create: its target is a direct child,
+        // but the link is not one, and it is never handed back.
+        race_at(RaceWindow::ChildLooked, {
+            let (planted, sibling) = (parent.join("planted"), sibling.clone());
+            move || symlink(&sibling, &planted).unwrap()
+        });
+        let planted = ensure_canonical_direct_child(&parent, "planted");
+        assert!(race_ran());
+        assert_eq!(
+            planted.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        // The parent itself moved behind a link after the look: the real
+        // directory made through it is no child of the parent that was resolved.
+        let behind = root.join("parent.behind");
+        race_at(RaceWindow::ChildLooked, {
+            let (parent, behind) = (parent.clone(), behind.clone());
+            move || {
+                std::fs::rename(&parent, &behind).unwrap();
+                symlink(&behind, &parent).unwrap();
+            }
+        });
+        let moved = ensure_canonical_direct_child(&parent, "moved");
+        assert!(race_ran());
+        assert_eq!(
+            moved.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6632,8 +6881,10 @@ mod tests {
         let replacement_namespace = ensure_canonical_direct_child(&replacement, name).unwrap();
         drop(open_instance_lease(&replacement_namespace, true).unwrap());
 
-        let queue = ArtifactCleanupQueuePermit::unmetered();
-        let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+        let budgets = crate::control::ArtifactBudgets::shipping();
+        let queue = ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue");
+        let admission = budgets
+            .try_reserve_cleanup_for_path(&root)
             .expect("test cleanup admission");
         let mut sweep = DeadNamespaceSweep::begin(&root, "p1-current".into(), queue, admission)
             .expect("pinned sweep");
@@ -6667,9 +6918,12 @@ mod tests {
         // The same swap under a launch that is gone: the namespace the sweep
         // proved abandoned is left alone once its root has moved away.
         let begin = |root: &Path| {
-            let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(root)
+            let budgets = crate::control::ArtifactBudgets::shipping();
+            let admission = budgets
+                .try_reserve_cleanup_for_path(root)
                 .expect("test cleanup admission");
-            let queue = ArtifactCleanupQueuePermit::unmetered();
+            let queue =
+                ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue");
             DeadNamespaceSweep::begin(root, "p1-current".into(), queue, admission)
                 .expect("pinned sweep")
         };
@@ -6700,6 +6954,26 @@ mod tests {
         assert!(sweep.run_batch(|_| false));
         assert!(moved.join(&tombstone).is_dir());
         drop(sweep);
+
+        // A root moved between its pin and its listing is not begun at all: the
+        // cursor would list the replacement while it acts on the pinned root.
+        std::fs::rename(&moved, &root).unwrap();
+        race_at(RaceWindow::CursorPinned, {
+            let (root, moved, replacement) = (root.clone(), moved.clone(), replacement.clone());
+            move || {
+                std::fs::rename(&root, &moved).unwrap();
+                std::fs::rename(&replacement, &root).unwrap();
+            }
+        });
+        let budgets = crate::control::ArtifactBudgets::shipping();
+        let admission = budgets
+            .try_reserve_cleanup_for_path(&root)
+            .expect("test cleanup admission");
+        let queue = ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue");
+        let raced = DeadNamespaceSweep::begin(&root, "p1-current".into(), queue, admission);
+        assert!(race_ran());
+        assert!(raced.is_err());
+        drop(raced);
 
         // The delete budget is a hard stop: one delete allowed, one of two dead
         // namespaces is taken and the other waits for a later batch.
@@ -6751,8 +7025,10 @@ mod tests {
         drop(open_instance_lease(&namespace, true).unwrap());
         let moved = aside.join(name);
 
-        let queue = ArtifactCleanupQueuePermit::unmetered();
-        let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+        let budgets = crate::control::ArtifactBudgets::shipping();
+        let queue = ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue");
+        let admission = budgets
+            .try_reserve_cleanup_for_path(&root)
             .expect("test cleanup admission");
         let mut sweep = DeadNamespaceSweep::begin(&root, "p1-current".into(), queue, admission)
             .expect("pinned sweep");
@@ -6806,12 +7082,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(root.clone(), PendingDeadNamespaceSweep { dirty: false });
 
-        let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(&root)
+        let budgets = crate::control::ArtifactBudgets::shipping();
+        let admission = budgets
+            .try_reserve_cleanup_for_path(&root)
             .expect("test cleanup admission");
         let mut sweep = DeadNamespaceSweep::begin(
             &root,
             "p1-current".into(),
-            ArtifactCleanupQueuePermit::unmetered(),
+            ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue"),
             admission,
         )
         .expect("initial cursor");
@@ -6822,7 +7100,7 @@ mod tests {
         schedule_dead_instance_namespace_sweep(
             &root,
             "p1-current",
-            ArtifactCleanupQueuePermit::unmetered(),
+            ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue"),
         );
         assert!(sweep.run_batch(|_| false));
 
@@ -6859,9 +7137,9 @@ mod tests {
         let task = ArtifactCleanupTask::DeadNamespaces {
             root: wide,
             current: "p1-current".into(),
-            _queue: ArtifactCleanupQueuePermit::unmetered(),
+            _queue: ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue"),
         };
-        run_best_effort_cleanup_task(task, &sender);
+        run_best_effort_cleanup_task(task, &sender, &budgets);
         assert!(matches!(
             receiver.try_recv(),
             Ok(ArtifactCleanupTask::DeadNamespaceContinuation(_))
@@ -6908,6 +7186,7 @@ mod tests {
                     &best_effort_receiver,
                     &wake_receiver,
                     &best_effort,
+                    &crate::control::ArtifactBudgets::shipping(),
                 );
                 let _ = returned.send(());
             })
@@ -6956,16 +7235,19 @@ mod tests {
         // survives the first panic to recover the second debt. The dead-
         // namespace sweep skips `video-tombstones`: it is neither a PID-shaped
         // instance name nor an instance tombstone.
+        let budgets = crate::control::ArtifactBudgets::shipping();
         drain_private_cleanup_worker(vec![
             ArtifactCleanupTask::PanicForTest(ArtifactCleanupPanicRecovery::DeadNamespaces {
                 root: root.clone(),
                 current: "p1-current".into(),
-                queue: ArtifactCleanupQueuePermit::unmetered(),
+                queue: ArtifactCleanupQueuePermit::try_reserve(&budgets)
+                    .expect("test cleanup queue"),
             }),
             ArtifactCleanupTask::PanicForTest(ArtifactCleanupPanicRecovery::VideoTombstones {
                 root: video_root.clone(),
                 expected_root,
-                queue: ArtifactCleanupQueuePermit::unmetered(),
+                queue: ArtifactCleanupQueuePermit::try_reserve(&budgets)
+                    .expect("test cleanup queue"),
             }),
         ]);
 
@@ -6992,6 +7274,74 @@ mod tests {
                 .any(|entry| { entry.root == video_root && entry.expected_root == expected_root }),
             "the recovered video sweep must reconcile its coalescing registry"
         );
+    }
+
+    /// A video producer's deferred cleanup asks for a tombstone sweep only when
+    /// its abort left a tombstone; a published recording's asks for none. The
+    /// dead-namespace sweep is asked for either way.
+    #[test]
+    fn only_an_armed_video_cleanup_asks_for_a_tombstone_sweep() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let identity = crate::pinned_dir::PinnedDir::open(&root)
+            .unwrap()
+            .retained_identity()
+            .unwrap();
+        let dead_root = root.join("dead");
+        // Pending entries this test owns coalesce the drop's requests, so each
+        // shows as `dirty` and no worker runs.
+        pending_video_tombstone_sweeps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(PendingVideoTombstoneSweep {
+                root: root.clone(),
+                expected_root: identity,
+                dirty: false,
+            });
+        pending_dead_namespace_sweeps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                dead_root.clone(),
+                PendingDeadNamespaceSweep { dirty: false },
+            );
+        let requested = || {
+            let video = pending_video_tombstone_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|entry| entry.root == root && entry.dirty);
+            let dead = pending_dead_namespace_sweeps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&dead_root)
+                .is_some_and(|entry| entry.dirty);
+            (video, dead)
+        };
+        let budgets = crate::control::ArtifactBudgets::shipping();
+        let queue = || ArtifactCleanupQueuePermit::try_reserve(&budgets);
+        let deferred = |armed: bool| {
+            let mut cleanup = DeferredVideoCleanup {
+                tombstone_root: root.clone(),
+                tombstone_identity: identity,
+                tombstone_queue: queue(),
+                tombstone_armed: false,
+                dead_root: dead_root.clone(),
+                current: "p1-current".into(),
+                dead_queue: queue(),
+            };
+            if armed {
+                cleanup.arm_tombstone();
+            }
+            cleanup
+        };
+
+        drop(deferred(false));
+        assert_eq!(requested(), (false, true));
+        drop(deferred(true));
+        assert_eq!(requested(), (true, true));
+        clear_pending_video_tombstone_sweep(&root, identity);
+        clear_pending_dead_namespace_sweep(&dead_root);
     }
 
     /// The automatic-image sweep prunes only the directory it was armed for:
@@ -7026,11 +7376,12 @@ mod tests {
         // oldest sequence, were its number read as one).
         let in_flight = dir.join(format!(".aterm-write-p1-{:020}", 0));
         std::fs::write(&in_flight, b"partial").unwrap();
+        let budgets = crate::control::ArtifactBudgets::shipping();
         let sweep = |expected_dir| ArtifactCleanupTask::AutomaticImages {
             dir: dir.clone(),
             expected_dir,
             fresh: fresh.clone(),
-            _queue: ArtifactCleanupQueuePermit::unmetered(),
+            _queue: ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue"),
         };
         let count = || {
             std::fs::read_dir(&dir)
@@ -7047,6 +7398,25 @@ mod tests {
             AUTO_IMAGE_KEEP + 3,
             "the replacement is left whole"
         );
+        // Moved between the sweep's pin and its look at the path: the pin is
+        // no longer what the path names, so nothing is pruned through it.
+        #[cfg(unix)]
+        {
+            let raced = auto.join("raced");
+            race_at(RaceWindow::ImagesPinned, {
+                let (dir, raced) = (dir.clone(), raced.clone());
+                move || {
+                    std::fs::rename(&dir, &raced).unwrap();
+                    std::fs::create_dir(&dir).unwrap();
+                }
+            });
+            let (requeue, _requeued) = std::sync::mpsc::channel();
+            run_best_effort_cleanup_task(sweep(identity(&dir)), &requeue, &budgets);
+            assert!(race_ran());
+            std::fs::remove_dir(&dir).unwrap();
+            std::fs::rename(&raced, &dir).unwrap();
+            assert_eq!(count(), AUTO_IMAGE_KEEP + 3);
+        }
         drain_private_cleanup_worker(vec![sweep(identity(&dir))]);
         assert_eq!(
             count(),
@@ -7075,10 +7445,11 @@ mod tests {
             std::fs::create_dir_all(root.join(entry)).unwrap();
             std::fs::write(root.join(entry).join("index.json"), b"{}").unwrap();
         }
+        let budgets = crate::control::ArtifactBudgets::shipping();
         let sweep = |expected_root| ArtifactCleanupTask::VideoTombstones {
             root: root.clone(),
             expected_root,
-            _queue: ArtifactCleanupQueuePermit::unmetered(),
+            _queue: ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue"),
         };
 
         drain_private_cleanup_worker(vec![sweep(armed_for)]);
@@ -7097,9 +7468,12 @@ mod tests {
         );
 
         let begin = |root: &Path| {
-            let admission = crate::control::ReplyRetention::try_reserve_cleanup_for_path(root)
+            let budgets = crate::control::ArtifactBudgets::shipping();
+            let admission = budgets
+                .try_reserve_cleanup_for_path(root)
                 .expect("test cleanup admission");
-            let queue = ArtifactCleanupQueuePermit::unmetered();
+            let queue =
+                ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue");
             VideoTombstoneSweep::begin(root, identity(root), queue, admission).expect("cursor")
         };
         // A root moved away from under a begun cursor ends it (Windows will not
@@ -7112,6 +7486,28 @@ mod tests {
             std::fs::rename(&root, &aside).unwrap();
             assert!(cursor.run_batch());
             assert!(aside.join(".prune-y").is_dir());
+            drop(cursor);
+
+            // Moved between its pin and its listing, it is not begun at all:
+            // the cursor would list the replacement while acting on the pin.
+            std::fs::rename(&aside, &root).unwrap();
+            let expected_root = identity(&root);
+            race_at(RaceWindow::CursorPinned, {
+                let (root, aside) = (root.clone(), aside.clone());
+                move || {
+                    std::fs::rename(&root, &aside).unwrap();
+                    std::fs::create_dir(&root).unwrap();
+                }
+            });
+            let budgets = crate::control::ArtifactBudgets::shipping();
+            let admission = budgets
+                .try_reserve_cleanup_for_path(&root)
+                .expect("test cleanup admission");
+            let queue =
+                ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue");
+            let raced = VideoTombstoneSweep::begin(&root, expected_root, queue, admission);
+            assert!(race_ran());
+            assert!(raced.is_none());
         }
 
         // A budget spent inside a tombstone stops the cursor short of EOF and
@@ -7166,7 +7562,7 @@ mod tests {
         schedule_video_tombstone_sweep(
             &short,
             short_identity,
-            ArtifactCleanupQueuePermit::unmetered(),
+            ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue"),
         );
         let dirty: Vec<bool> = pending()
             .iter()
@@ -7195,9 +7591,9 @@ mod tests {
         let task = ArtifactCleanupTask::VideoTombstones {
             expected_root: identity(&wide),
             root: wide,
-            _queue: ArtifactCleanupQueuePermit::unmetered(),
+            _queue: ArtifactCleanupQueuePermit::try_reserve(&budgets).expect("test cleanup queue"),
         };
-        run_best_effort_cleanup_task(task, &sender);
+        run_best_effort_cleanup_task(task, &sender, &budgets);
         assert!(matches!(
             receiver.try_recv(),
             Ok(ArtifactCleanupTask::VideoTombstoneContinuation(_))
@@ -7291,6 +7687,86 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied
             );
             assert_eq!(mode(&victim), victim_mode);
+
+            // A lease left loose is tightened by the open that takes it.
+            let loose = ensure_canonical_direct_child(&root, "p424248-looselease").unwrap();
+            let loose_lease = loose.join(INSTANCE_LEASE_FILE);
+            std::fs::write(&loose_lease, b"").unwrap();
+            std::fs::set_permissions(&loose_lease, std::fs::Permissions::from_mode(0o644)).unwrap();
+            drop(open_instance_lease(&loose, false).unwrap());
+            assert_eq!(mode(&loose_lease) & 0o7777, 0o600);
+
+            // A swap after the open: the lease renamed aside with another file
+            // put in its place, or its namespace moved behind a link. The file
+            // opened is no longer the lease its namespace names: refused.
+            race_at(RaceWindow::LockOpened, {
+                let lease = loose_lease.clone();
+                move || {
+                    std::fs::rename(&lease, lease.with_extension("aside")).unwrap();
+                    std::fs::write(&lease, b"").unwrap();
+                }
+            });
+            let swapped = open_instance_lease(&loose, false);
+            assert!(race_ran());
+            assert_eq!(
+                swapped.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            race_at(RaceWindow::LockOpened, {
+                let namespace = loose.clone();
+                move || {
+                    let behind = namespace.with_extension("behind");
+                    std::fs::rename(&namespace, &behind).unwrap();
+                    symlink(&behind, &namespace).unwrap();
+                }
+            });
+            let behind_link = open_instance_lease(&loose, false);
+            assert!(race_ran());
+            assert_eq!(
+                behind_link.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+
+            // A lease that is a FIFO by the time it is opened, and gone once it
+            // is: the object opened is refused, never reported as no lease.
+            let piped = ensure_canonical_direct_child(&root, "p424249-fifolease").unwrap();
+            let piped_lease = piped.join(INSTANCE_LEASE_FILE);
+            std::fs::write(&piped_lease, b"").unwrap();
+            race_at(RaceWindow::LockLooked, {
+                let lease = piped_lease.clone();
+                move || {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    std::fs::remove_file(&lease).unwrap();
+                    let fifo = std::ffi::CString::new(lease.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: a valid NUL-terminated path; mkfifo reads it and nothing else.
+                    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+                    race_at(RaceWindow::LockOpened, move || {
+                        std::fs::remove_file(&lease).unwrap();
+                    });
+                }
+            });
+            let piped_open = open_instance_lease(&piped, false);
+            assert!(race_ran());
+            assert_eq!(
+                piped_open.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+
+            // A lease this open creates is 0600 from its first instant, even
+            // when the open is then refused (a second name added after it).
+            let refused = ensure_canonical_direct_child(&root, "p424250-refusedlease").unwrap();
+            let refused_lease = refused.join(INSTANCE_LEASE_FILE);
+            race_at(RaceWindow::LockOpened, {
+                let (lease, second) = (refused_lease.clone(), refused.join("second"));
+                move || std::fs::hard_link(&lease, &second).unwrap()
+            });
+            let refused_open = open_instance_lease(&refused, true);
+            assert!(race_ran());
+            assert_eq!(
+                refused_open.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(mode(&refused_lease) & 0o7777, 0o600);
             let _ = std::fs::remove_dir_all(outside);
         }
 
@@ -7479,14 +7955,14 @@ mod tests {
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyChallengeBeforeBody",
-    reason = "Buggy=1 negative control only; the nonce trailer is written after the complete body \
-              in write_control_reply_with_timeout_arm, and the Tier-1 early trailer is rejected"
+    reason = "Buggy=1 negative control only; ControlReply::into_wire queues the nonce trailer after \
+              the complete body, and the Tier-1 early trailer is rejected"
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyOkBeforeRevalidation",
-    reason = "Buggy=1 negative control only; write_control_reply_with_timeout_arm revalidates the \
-              guard before any OK byte, and the Tier-1 OK-then-ERR wire is rejected"
+    reason = "Buggy=1 negative control only; Outbox::attach revalidates the guard before any OK \
+              byte is queued, and the Tier-1 OK-then-ERR wire is rejected"
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactReplyPublication",
@@ -7504,7 +7980,7 @@ mod tests {
     machine = "ArtifactHandoffCapacity",
     action = "BuggyOverbook",
     reason = "Buggy=1 negative control only; the real locked admission update refuses when the \
-              process-wide handoff count or descriptor-unit budget reaches its fixed limit"
+              descriptor budget's path count or descriptor units reach its cap"
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
@@ -7515,8 +7991,8 @@ mod tests {
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",
     action = "BuggyRefuseLeaksSlot",
-    reason = "Buggy=1 negative control only; try_acquire_from decides admission before it charges \
-              either counter, so a refusal leaves the pool untouched"
+    reason = "Buggy=1 negative control only; UnitBudget::try_take decides admission before it \
+              charges either counter, so a refusal leaves the pool untouched"
 )]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ArtifactHandoffCapacity",

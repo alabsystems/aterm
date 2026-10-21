@@ -41,14 +41,15 @@
 //! below [`Role::Responsive`], because a descheduled lock holder at a lower
 //! class is a priority inversion — the one hazard a QoS port can introduce.
 //!
-//! NO WORK INTERVAL (LAG-12, 2026-10-19). No role here, and no `os_workgroup`
-//! interval either, lifts a spawn out of the idle slow clock. An audio interval
-//! speeds the threads inside it but cannot hold the shell, another process,
-//! whose first prompt came no sooner with it in aterm's own coalition (44.1
-//! against 44.2 ms) and 3.7-5.3 ms later inside an agent's. A member thread
-//! with no open interval runs slower than a plain one, and control lanes inside
-//! one doubled a spawn's reply under load. The measurements are in
-//! `docs/DESIGN-warm-spare-2026-10-16.md` §16 D6.
+//! NO WORK INTERVAL (LAG-12, 2026-10-19; LAG-13, 2026-10-20). No role here, and
+//! no `os_workgroup` interval either, lifts a spawn out of the idle slow clock.
+//! An audio interval speeds the threads inside it but cannot hold the shell,
+//! another process, whose first prompt came no sooner with it in aterm.app's
+//! own band (28.60 against 28.54 ms) and 3.7-5.3 ms later inside an agent's.
+//! Real-time spawn threads and a `UI_FOCAL` shell did not lift it either. A
+//! member thread with no open interval runs slower than a plain one, and
+//! control lanes inside one doubled a spawn's reply under load. The
+//! measurements are in `docs/DESIGN-warm-spare-2026-10-16.md` §16 D6.
 
 /// What a thread's work is worth relative to the human at the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,10 +81,6 @@ pub(crate) enum Role {
     /// take [`Role::Background`]. (Pinned by experience — putting the
     /// artifact-reply quarantine reaper here, whose guards hold capture
     /// capacity, failed its reap by 60 s, 2026-09-30.)
-    #[cfg_attr(
-        not(any(unix, test)),
-        expect(dead_code, reason = "no Windows worker runs at it")
-    )]
     Housekeeping,
 }
 
@@ -760,6 +757,51 @@ pub(crate) fn class_for(role: Role) -> u32 {
     qos_class(role) as u32
 }
 
+/// The longest timer [`sleep_until`] asks for within [`COALESCE_MARGIN`] of its
+/// deadline.
+pub(crate) const PRECISE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// How far before its deadline [`sleep_until`] stops asking for one long timer
+/// and takes [`PRECISE_SLICE`]s: more than the coalescing measured below.
+pub(crate) const COALESCE_MARGIN: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Sleep until `deadline`, never asking for a timer that ends within
+/// [`COALESCE_MARGIN`] of it longer than [`PRECISE_SLICE`].
+///
+/// macOS coalesces a low-class thread's timers. Measured 2026-10-20 on an M4
+/// Max under macOS 27: a 20 or 100 ms `nanosleep` woke 61-75 ms late at UTILITY
+/// (what [`Role::Background`] runs at) and up to 100 ms late at BACKGROUND,
+/// against 5 ms at DEFAULT; the same waits taken in 2 ms slices woke 1.1-2.4 ms
+/// late at UTILITY. Use it where someone waits behind a low-class thread's
+/// deadline: the warm spare's verification sleeps out its scan window at its
+/// hold, and the spare is not ready, so not adoptable, until it wakes. Measured
+/// with an empty `.zshrc`/`.bash_profile`, n=20 each: a spare came back 343-345 ms
+/// after its adoption with one plain sleep, 283-289 ms with this one, and
+/// 180-188 ms before that wait existed (the rest is the 100 ms window itself). A
+/// wait nobody stands behind keeps a plain sleep.
+pub(crate) fn sleep_until(deadline: std::time::Instant) {
+    sleep_until_with(deadline, std::time::Instant::now, std::thread::sleep);
+}
+
+/// [`sleep_until`] over an injected clock and sleeper.
+fn sleep_until_with(
+    deadline: std::time::Instant,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut sleep: impl FnMut(std::time::Duration),
+) {
+    loop {
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() {
+            return;
+        }
+        sleep(if left > COALESCE_MARGIN {
+            left - COALESCE_MARGIN
+        } else {
+            left.min(PRECISE_SLICE)
+        });
+    }
+}
+
 /// The class a worker that declares no role runs at — what every silent `spawn`
 /// in this crate gets, and what a deleted `set_self` line leaves behind.
 #[cfg(all(test, target_os = "macos"))]
@@ -768,6 +810,43 @@ pub(crate) const UNDECLARED_CLASS: u32 = libc::qos_class_t::QOS_CLASS_DEFAULT as
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`sleep_until`] takes a long wait as one timer that ends a
+    /// [`COALESCE_MARGIN`] early and the rest in [`PRECISE_SLICE`]s, and returns
+    /// once the deadline has passed, never before. Over a fake clock: no real
+    /// time is slept. NEGATIVE CONTROL: one `sleep(left)` (the plain sleep a
+    /// low-class thread's timer coalescing makes up to 75 ms late) asks for a
+    /// timer that ends at the deadline itself and fails the slice assertion.
+    #[test]
+    fn a_precise_sleep_asks_for_no_long_timer_near_its_deadline() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        for wait_ms in [0u64, 1, 3, 100, 149, 151, 2_000] {
+            let deadline = start + Duration::from_millis(wait_ms);
+            let clock = Cell::new(start);
+            let asked = std::cell::RefCell::new(Vec::new());
+            sleep_until_with(
+                deadline,
+                || clock.get(),
+                |d| {
+                    asked.borrow_mut().push(d);
+                    clock.set(clock.get() + d);
+                },
+            );
+            assert!(clock.get() >= deadline, "{wait_ms} ms: returned early");
+            let mut at = start;
+            for d in asked.borrow().iter() {
+                let ends = at + *d;
+                assert!(
+                    ends + COALESCE_MARGIN <= deadline || *d <= PRECISE_SLICE,
+                    "{wait_ms} ms: a {d:?} timer ending {:?} before the deadline",
+                    deadline.saturating_duration_since(ends)
+                );
+                at = ends;
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // WHAT THE SCHEDULER ACTUALLY SEES

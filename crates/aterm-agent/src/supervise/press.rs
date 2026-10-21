@@ -1012,8 +1012,10 @@ impl<C: Ctl> Session<'_, C> {
     /// [`Pressing::Unconfirmed`]: the box is the manager's under the safe
     /// rules, and at full power read and tried again
     /// ([`Session::press_missed`]). The usage-limit dialog's grant row whose
-    /// fresh read no longer reads it as the one reset on offer
-    /// ([`aterm_phase::reset_row`]: another kind's row drawn under it) is
+    /// fresh read no longer reads it as the row the reset's rule takes
+    /// ([`aterm_phase::reset_row`] under the kinds it was chosen by,
+    /// [`Session::reset_take`]: another kind's row drawn on either side of it
+    /// makes two on offer, or a kind the owner lists first) is
     /// [`Press::Changed`]: decided again, never entered.
     ///
     /// `person`: the person count of the read the dialog was judged on, for
@@ -1124,15 +1126,18 @@ impl<C: Ctl> Session<'_, C> {
             }
             return unconfirmed("the focus did not land on the option it was moved to");
         };
-        // THE GRANT ROW IS ENTERED ONLY WHILE IT IS STILL THE ONE RESET ON
-        // OFFER ([`aterm_phase::reset_row`]), as on the read it was decided
-        // on. Claude Code 2.1.304 draws a row per kind of reset as its offers
-        // come in, while the dialog is up: one drawn under the row as the
-        // arrows moved makes it one of several, and which kind to spend is
-        // then the owner's (SPEC R2). The screen moved past the judged read:
-        // read and decided again, where the reset's rule takes nothing.
+        // THE GRANT ROW IS ENTERED ONLY WHILE IT IS STILL THE ROW THE RESET'S
+        // RULE TAKES ([`aterm_phase::reset_row`] under the kinds it was chosen
+        // by: the one reset on offer, or the first of the owner's list), as
+        // on the read it was decided on. Claude Code 2.1.304 draws a row per
+        // kind of reset as its offers come in, while the dialog is up, and its
+        // Select keeps the focus on the row's value (`sir`): another kind's row
+        // drawn above or under the row as the arrows moved makes two on offer,
+        // whose choice is the owner's (SPEC R2), or is a kind the owner lists
+        // first, and the focus check above still passes on the row. The screen
+        // moved past the judged read: read and decided again, on what is drawn.
         let grant = |q: &aterm_phase::PromptV2| {
-            aterm_phase::reset_row(q).is_some_and(|row| row.label == label)
+            aterm_phase::reset_row(q, &self.reset_kinds).is_some_and(|row| row.label == label)
         };
         if grant(prompt) && !reading.prompt.as_ref().is_some_and(grant) {
             return Ok(Pressing::Done(Press::Changed { seq: now.seq }));

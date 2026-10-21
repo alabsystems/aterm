@@ -81,13 +81,25 @@ pub use complete::{
     CompleteOutputError, output_until_complete_stdout, output_until_complete_stdout_from,
 };
 
+/// How long macOS may hold the first exec of a new file (a copy, a fresh build) at
+/// `_dyld_start` while `syspolicyd` assesses it: a hang detector, never a budget. A fresh 167 MB
+/// debug binary took 64 s to its first exec, and a backed-up `syspolicyd` held a fresh two-line
+/// script up to 600 s (`aterm_spec::wait::FIRST_EXEC` measured both). Killing the process does
+/// not end the assessment, and on macOS 27.0.1 `syspolicyd` crashes when the file is unlinked or
+/// renamed before it finishes, stranding every exec on the host: so a copy started and never
+/// shown to have run stays where it is until this has passed since its exec (or its kill).
+/// Shipped code reads it too (the updater, the keeper, the mug), not only tests.
+pub const FIRST_EXEC_HANG: Duration = Duration::from_secs(10 * 60);
+
 #[cfg(any(test, debug_assertions))]
 mod silent;
 #[cfg(any(test, debug_assertions))]
 pub use silent::{
-    CODESIGN_HANG, ad_hoc_copy, require_disk_image_service, require_trust_service, sign_ad_hoc,
-    trust_service_silent,
+    CODESIGN_HANG, ECHO_HANG, KeptUntilRan, ad_hoc_copy, require_disk_image_service,
+    require_trust_service, sign_ad_hoc, stand_in, trust_service_silent,
 };
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub use silent::{cat_echoes, prints};
 
 /// The gate for every in-process call that can wait on macOS's `trustd` (TLS certificate
 /// evaluation, the PTY keeper's peer and on-disk code checks): one process-wide gate, so a
@@ -361,6 +373,16 @@ pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunE
     output_until_from(cmd, Stdio::null(), deadline)
 }
 
+/// [`output_until`] with its deadline `within` from the call: for a caller that reads no
+/// clock of its own (the supervisor's probe bodies read time only through its `Fx`, and a
+/// hang bound on a child is no value the loop observes).
+///
+/// # Errors
+/// As [`output_until`].
+pub fn output_within(cmd: &mut Command, within: Duration) -> Result<Output, RunError> {
+    output_until(cmd, Instant::now() + within)
+}
+
 /// [`output_until`] with `stdin` as the child's standard input (a file the caller opened),
 /// for a tool that reads its request there.
 ///
@@ -507,6 +529,10 @@ fn output_by(
 ///     }
 /// }
 /// ```
+///
+/// A process that is not this one's child is waited on by pid
+/// ([`ExitWait::on_pid`]), with the caller's own witness of that process in
+/// `try_wait`'s place.
 #[derive(Debug)]
 pub struct ExitWait {
     /// Readable once the child has exited; `None` without such a descriptor, or once it has
@@ -518,20 +544,30 @@ pub struct ExitWait {
 }
 
 impl ExitWait {
-    /// A wait on `child`'s exit.
+    /// A wait on `child`'s exit. Its pid cannot be reissued while it is
+    /// unreaped, so the watch names it.
     #[must_use]
     pub fn new(child: &Child) -> Self {
+        Self::on_pid(child.id())
+    }
+
+    /// A wait on the exit of whatever holds `pid` at the call. A caller whose
+    /// pid may have been reissued proves after this returns that it still
+    /// names its process ([`crate::exitwatch::exit_fd`]).
+    #[must_use]
+    pub fn on_pid(pid: u32) -> Self {
         #[cfg(not(unix))]
-        let _ = child;
+        let _ = pid;
         Self {
             #[cfg(unix)]
-            fd: crate::exitwatch::exit_fd(child.id()),
+            fd: crate::exitwatch::exit_fd(pid),
             tick: POLL_MIN,
         }
     }
 
-    /// Block until the kernel reports the child's exit or `timeout` passes (without a
-    /// descriptor, for one backoff tick at most); the caller's `try_wait` says which.
+    /// Block until the kernel reports the process's exit or `timeout` passes
+    /// (without a descriptor, for one backoff tick at most), whichever is
+    /// first; the caller's `try_wait` (or its own witness) says which.
     pub fn wait(&mut self, timeout: Duration) {
         #[cfg(unix)]
         if let Some(fd) = &self.fd {

@@ -33,18 +33,81 @@ impl CargoDriver {
     /// `<targo> [--unverified] <verb>`, ready for the caller's own arguments.
     pub(crate) fn command(&self, verb: &str) -> Command {
         let mut cmd = command(&self.program);
-        cmd.args(Self::lane_args(verb)).arg(verb);
+        cmd.args(Self::lead(verb, None));
         cmd
     }
 
-    /// The command line [`Self::command`] builds, for the `$ …` log line.
-    pub(crate) fn display(&self, verb: &str, args: &[&str]) -> String {
+    /// [`Self::command`] for a build of THIS workspace, led by its build-dir
+    /// `--config` ([`workspace_build_dir`]) when the verb compiles, so a perf
+    /// build shares a shell build's cache and keeps its intermediates out of
+    /// Spotlight.
+    pub(crate) fn workspace_command(&self, verb: &str) -> Command {
+        let mut cmd = command(&self.program);
+        cmd.args(Self::lead(verb, workspace_build_dir()));
+        cmd
+    }
+
+    /// What goes before the caller's arguments: `--config <build_dir>` for a
+    /// compiling verb given one, the lane flag, the verb.
+    fn lead(verb: &str, build_dir: Option<&str>) -> Vec<String> {
+        let mut lead = Vec::new();
+        if let Some(value) = build_dir.filter(|_| LANE_VERBS.contains(&verb)) {
+            lead.extend(["--config".to_string(), value.to_string()]);
+        }
+        lead.extend(Self::lane_args(verb).iter().map(|s| (*s).to_string()));
+        lead.push(verb.to_string());
+        lead
+    }
+
+    /// The command line [`Self::workspace_command`] builds, for the `$ …` log line.
+    pub(crate) fn display_workspace(&self, verb: &str, args: &[&str]) -> String {
+        self.display_led(verb, workspace_build_dir(), args)
+    }
+
+    /// The command line led by `build_dir` ([`Self::lead`]).
+    fn display_led(&self, verb: &str, build_dir: Option<&str>, args: &[&str]) -> String {
         let mut parts: Vec<String> = vec![self.program.display().to_string()];
-        parts.extend(Self::lane_args(verb).iter().map(|s| (*s).to_string()));
-        parts.push(verb.to_string());
+        parts.extend(Self::lead(verb, build_dir));
         parts.extend(args.iter().map(|s| (*s).to_string()));
         parts.join(" ")
     }
+}
+
+/// The build-dir `--config` every perf build of this workspace leads with,
+/// resolved once: plain `targo`'s cache where atpkg's shim would hand one
+/// ([`crate::main_build_dir`]), else `<target>/build.noindex` under the target
+/// directory `targo metadata` names ([`crate::fallback_build_dir`]), so the
+/// intermediates stay out of Spotlight and the binaries still land in
+/// `<target>/<profile>/`. `None` where the caller chose a build directory.
+pub(crate) fn workspace_build_dir() -> Option<&'static str> {
+    static DIR: OnceLock<Option<String>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let env = crate::EnvSnapshot::capture();
+        let root = super::workspace_root();
+        crate::main_build_dir(&env, &root).or_else(|| {
+            let target = target_dir().ok()?;
+            crate::fallback_build_dir(&env, &root, &target)
+        })
+    })
+    .as_deref()
+}
+
+/// The target directory: `targo`'s own answer through `metadata`, since a
+/// caller's `CARGO_TARGET_DIR` (or the reroute's, or a cargo config) moves it.
+pub(crate) fn target_dir() -> Result<PathBuf, String> {
+    let driver = cargo_driver()?;
+    let out = driver
+        .command("metadata")
+        .args(["--no-deps", "--format-version", "1"])
+        .current_dir(super::workspace_root())
+        .output()
+        .map_err(|e| format!("could not run targo metadata: {e}"))?;
+    let meta: aterm_json::Value = aterm_json::from_slice(&out.stdout)
+        .map_err(|e| format!("targo metadata did not answer JSON: {e}"))?;
+    meta.get("target_directory")
+        .and_then(aterm_json::Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| "targo metadata names no target_directory".to_string())
 }
 
 /// The driver a discovered toolchain may be driven by, or why not.
@@ -103,12 +166,20 @@ mod tests {
             assert_eq!(CargoDriver::lane_args(verb), &["--unverified"], "{verb}");
         }
         assert_eq!(
-            d.display("metadata", &["--no-deps"]),
+            d.display_led("metadata", None, &["--no-deps"]),
             "/s/targo metadata --no-deps"
         );
         assert_eq!(
-            d.display("run", &["--release", "-p", "aterm-bench"]),
+            d.display_led("run", None, &["--release", "-p", "aterm-bench"]),
             "/s/targo --unverified run --release -p aterm-bench"
         );
+        // A workspace build leads with its build dir; a verb that compiles nothing
+        // never does.
+        let dir = Some("build.build-dir='/w/target/build.noindex'");
+        assert_eq!(
+            d.display_led("build", dir, &["--release"]),
+            "/s/targo --config build.build-dir='/w/target/build.noindex' --unverified build --release"
+        );
+        assert_eq!(d.display_led("metadata", dir, &[]), "/s/targo metadata");
     }
 }

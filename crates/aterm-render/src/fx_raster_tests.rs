@@ -187,31 +187,31 @@ fn frame(rng: &mut Rng) -> FxFrame {
 }
 
 /// [`stamp`] with the item's own column table, built fresh.
-fn stamp_own(px: &mut [u32], w: usize, s: Slice, item: &FxItem, o: (i64, i64), pal: &[FxInk]) {
+fn stamp_own(px: &mut [u32], w: usize, s: FxSlice, item: &FxItem, o: (i64, i64), pal: &[FxInk]) {
     let mut cols = Vec::new();
     if let FxItem::Sprite(sp) = item {
         sprite_cols(sp, &mut cols);
     }
-    stamp(px, w, s, item, o, pal, &cols);
+    stamp(&mut FramePx::new(px, w), s, item, o, pal, &cols);
 }
 
 /// `stamp_sprite` with the sprite's own column table, built fresh.
 fn stamp_sprite_own(
     px: &mut [u32],
     w: usize,
-    s: Slice,
+    s: FxSlice,
     o: (i64, i64),
     sp: &FxSprite,
     pal: &[FxInk],
 ) {
     let mut cols = Vec::new();
     sprite_cols(sp, &mut cols);
-    stamp_sprite(px, w, s, o, sp, pal, &cols);
+    stamp_sprite(&mut FramePx::new(px, w), s, o, sp, pal, &cols);
 }
 
 /// The slice covering all of `area` (inside the frame), uncut.
-fn whole(area: Area) -> Slice {
-    Slice {
+fn whole(area: Area) -> FxSlice {
+    FxSlice {
         x0: area.x0 as usize,
         x1: area.x1 as usize,
         y0: area.y0 as usize,
@@ -329,7 +329,7 @@ fn fx_run_lists_are_law_f() {
         // An arbitrary sub-rect of the drawable area.
         let x0 = rng.range(area.x0, area.x1 - 1);
         let y0 = rng.range(area.y0, area.y1 - 1);
-        let s = Slice {
+        let s = FxSlice {
             x0: x0 as usize,
             x1: rng.range(x0 + 1, area.x1) as usize,
             y0: y0 as usize,
@@ -406,7 +406,7 @@ fn fx_slicing_changes_no_byte() {
             let ys = cuts(&mut rng, d.y0, d.y1);
             for wy in ys.windows(2) {
                 for wx in xs.windows(2) {
-                    let s = Slice {
+                    let s = FxSlice {
                         x0: wx[0] as usize,
                         x1: wx[1] as usize,
                         y0: wy[0] as usize,
@@ -419,7 +419,7 @@ fn fx_slicing_changes_no_byte() {
             if f.band_of(d.y0 as usize) != f.band_of(d.y1 as usize - 1) {
                 sliced_items += 1;
             }
-            for_each_slice(&f, d, None, |s| {
+            for_each_slice(&f, d, &|_| true, |s, _| {
                 stamp_own(&mut from_slice, f.w, s, it, (s.x0 as i64, s.y0 as i64), pal);
             });
         }
@@ -521,7 +521,7 @@ fn fx_nearest_map_is_integer() {
                     ink: 0,
                     clip: PxRect::EVERYWHERE,
                 };
-                let s = Slice {
+                let s = FxSlice {
                     x0: 0,
                     x1: w,
                     y0: 0,
@@ -556,7 +556,7 @@ fn fx_nearest_map_is_integer() {
                 ink: 0,
                 clip: PxRect::EVERYWHERE,
             };
-            let s = Slice {
+            let s = FxSlice {
                 x0: 0,
                 x1: 1,
                 y0: 0,
@@ -601,7 +601,7 @@ fn fx_rects_and_ramps_are_the_glow_quad_law() {
             continue;
         }
         let x0 = rng.range(area.x0, area.x1 - 1);
-        let s = Slice {
+        let s = FxSlice {
             x0: x0 as usize,
             x1: rng.range(x0 + 1, area.x1) as usize,
             y0: area.y0 as usize,
@@ -675,7 +675,7 @@ fn fx_out_of_range_writes_nothing() {
     let (w, h) = (8usize, 4usize);
     let base: Vec<u32> = (0..(w * h) as u32).map(|i| 0x0101_0101 * (i % 7)).collect();
     let pal = vec![FxInk::over(0x00_80_40_20, 255); 2];
-    let all = Slice {
+    let all = FxSlice {
         x0: 0,
         x1: w,
         y0: 0,
@@ -1259,13 +1259,20 @@ fn placed_by_spec(
                             layer.id
                         );
                     }
-                    let s = Slice {
+                    let s = FxSlice {
                         x0: x,
                         x1: x + 1,
                         y0: y,
                         y1: y + 1,
                     };
-                    stamp(&mut out, f.w, s, item, o, layer.content.palette(), &cols);
+                    stamp(
+                        &mut FramePx::new(&mut out, f.w),
+                        s,
+                        item,
+                        o,
+                        layer.content.palette(),
+                        &cols,
+                    );
                 }
             }
         }
@@ -1492,4 +1499,211 @@ fn fx_mixed_content_draws_nothing() {
         draw(linear, FxBlend::Linear) != base,
         "CONTROL: the sprite alone draws"
     );
+}
+
+/// THE BLOOM SOURCE IS LAW F: an Exact bloom layer's [`fx_bloom_quads`],
+/// drawn through the [`GlowQuad`] law (each quad row a [`fill_glow_span`]
+/// from the quad's own left edge), paint exactly what [`draw_layers`] stamps
+/// for those layers with every band open, under the same clips and
+/// occluders. Every quad lies inside the frame and inside the band it is
+/// tagged with, and a layer without `bloom` adds none.
+///
+/// The corpus must cut gradients horizontally (per-column quads) and carry
+/// whole ones. (Mutation, run by hand: taking every cut gradient as one quad
+/// over its slice with the item's two ends fails the byte check.)
+#[test]
+fn fx_bloom_quads_are_law_f() {
+    let mut rng = Rng(0xb100_3c0d_5eed_0001);
+    let mut scratch = FxScratch::default();
+    let (mut slicer, mut cols, mut quads) = (FxSlicer::default(), Vec::new(), Vec::new());
+    let (mut columns, mut spans) = (0usize, 0usize);
+    for case in 0..1500 {
+        let f = frame(&mut rng);
+        let mut layers = random_layers(&mut rng, &f, FxSlot::Glow);
+        for layer in &mut layers {
+            layer.bloom = true;
+        }
+        let occluders: Vec<PxRect> = (0..rng.range(0, 3))
+            .map(|_| {
+                let x = rng.range(-10, f.w as i64) as i32;
+                let y = rng.range(-10, f.h as i64) as i32;
+                PxRect::at(x, y, rng.range(1, 40) as u32, rng.range(1, 30) as u32)
+            })
+            .collect();
+        let base = ground(f.w, f.h, &mut rng);
+        let mut engine = base.clone();
+        draw_layers(
+            &mut engine,
+            &f,
+            &layers,
+            &occluders,
+            FxSlot::Glow,
+            FxBlend::Exact,
+            None,
+            &mut scratch,
+        );
+        quads.clear();
+        fx_bloom_quads(&f, &layers, &occluders, &mut slicer, &mut cols, &mut quads);
+        let mut drawn = base.clone();
+        for q in &quads {
+            let (x, y, w, h) = (
+                usize::from(q.x),
+                usize::from(q.y),
+                usize::from(q.w),
+                usize::from(q.h),
+            );
+            let (by0, by1) = f.band(usize::from(q.row));
+            assert!(
+                x + w <= f.w && y >= by0 && y + h <= by1 && w > 0 && h > 0,
+                "case {case}: quad {q:?} leaves the frame or its band [{by0}, {by1})"
+            );
+            if w == 1 && q.color == q.color2 && q.alpha == q.alpha2 {
+                columns += 1;
+            } else {
+                spans += 1;
+            }
+            let (c0, c1) = (
+                FxInk {
+                    color: q.color,
+                    alpha: q.alpha,
+                },
+                FxInk {
+                    color: q.color2,
+                    alpha: q.alpha2,
+                },
+            );
+            for r in y..y + h {
+                fill_glow_span(
+                    &mut drawn[r * f.w + x..r * f.w + x + w],
+                    0,
+                    q.w.into(),
+                    c0,
+                    c1,
+                );
+            }
+        }
+        assert!(
+            drawn == engine,
+            "case {case}: the bloom quads paint other bytes than law F"
+        );
+        for layer in &mut layers {
+            layer.bloom = false;
+        }
+        quads.clear();
+        fx_bloom_quads(&f, &layers, &occluders, &mut slicer, &mut cols, &mut quads);
+        assert!(
+            quads.is_empty(),
+            "case {case}: a layer without bloom fed it"
+        );
+    }
+    assert!(
+        columns > 500 && spans > 1000,
+        "the corpus cuts gradients ({columns} columns) and keeps spans ({spans})"
+    );
+}
+
+/// THE FRAME ART BUDGET: the frame's distinct arts are admitted in draw order
+/// (layers in list order, items in content order) while their width's total
+/// stays within [`aterm_core::render::FX_FRAME_ART_TEXELS`]; a sprite whose
+/// art would pass it draws nothing. A repeated art is counted once, and the
+/// one-byte and four-byte arts keep separate totals.
+///
+/// CONTROL rendered here: the refused art drawn without the others draws, so
+/// the refusal is the frame total's, not the art's. Hand mutation (run when
+/// the law was written): counting every repeat refuses the second sprite of
+/// the first art and fails this test.
+#[test]
+fn fx_art_budget_refuses_past_the_frame_total() {
+    use aterm_core::render::{FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS};
+    let (aw, ah) = (FX_ART_MAX_SIDE, FX_ART_MAX_SIDE / 2);
+    let half = u64::from(aw) * u64::from(ah);
+    assert_eq!(2 * half, FX_FRAME_ART_TEXELS, "two arts fill the budget");
+    let index = |k: u8| {
+        let n = usize::from(aw) * usize::from(ah);
+        Arc::new(FxArt::new(aw, ah, FxTexels::Index8, vec![k; n]).expect("sized"))
+    };
+    let (a, b, c) = (index(1), index(2), index(3));
+    let rgba = Arc::new(
+        FxArt::new(
+            4,
+            4,
+            FxTexels::Rgba8Premul,
+            [0x40, 0x50, 0x60, 0xff].repeat(16),
+        )
+        .expect("sized"),
+    );
+    let sprite = |x: i32, art: &Arc<FxArt>| {
+        FxItem::Sprite(FxSprite {
+            x,
+            y: 2,
+            dw: 6,
+            dh: 6,
+            flip_x: false,
+            art: Arc::clone(art),
+            ink: 0,
+            clip: PxRect::EVERYWHERE,
+        })
+    };
+    let palette = vec![
+        FxInk::over(0x11_22_33, 255),
+        FxInk::over(0x44_55_66, 255),
+        FxInk::over(0x77_88_99, 255),
+    ];
+    let layer = |id, items| {
+        FxLayer::new(
+            id,
+            Arc::new(FxContent::new(items, palette.clone())),
+            FxSlot::Under,
+            FxSpace::Window,
+            FxBlend::Exact,
+        )
+    };
+    let f = FxFrame {
+        w: 64,
+        h: 16,
+        pad: 0,
+        grid_top: 0,
+        cell_h: 8,
+        rows: 2,
+    };
+    // `a`, `b` fill the one-byte budget; `c` (the next layer) would pass it;
+    // `a` again is already counted; the RGBA art has its own total.
+    let layers = vec![
+        layer(1, vec![sprite(0, &a), sprite(8, &b)]),
+        layer(2, vec![sprite(16, &c), sprite(24, &a), sprite(32, &rgba)]),
+    ];
+    let ground = vec![0x0101_0101u32; f.w * f.h];
+    let mut scratch = FxScratch::default();
+    let mut px = ground.clone();
+    draw_layers(
+        &mut px,
+        &f,
+        &layers,
+        &[],
+        FxSlot::Under,
+        FxBlend::Exact,
+        None,
+        &mut scratch,
+    );
+    let painted = |px: &[u32], x: usize| px[4 * f.w + x + 2] != ground[4 * f.w + x + 2];
+    assert!(painted(&px, 0) && painted(&px, 8), "the budget's arts draw");
+    assert!(!painted(&px, 16), "the art past the budget draws nothing");
+    assert!(painted(&px, 24), "a repeated art is counted once and draws");
+    assert!(painted(&px, 32), "the four-byte arts keep their own total");
+    assert_eq!(scratch.slicer.budget().refused_items(), 1);
+    // CONTROL: alone, the refused art draws.
+    let alone = vec![layer(3, vec![sprite(16, &c)])];
+    let mut px = ground.clone();
+    draw_layers(
+        &mut px,
+        &f,
+        &alone,
+        &[],
+        FxSlot::Under,
+        FxBlend::Exact,
+        None,
+        &mut scratch,
+    );
+    assert!(painted(&px, 16), "CONTROL: the refused art draws alone");
+    assert_eq!(scratch.slicer.budget().refused_items(), 0);
 }

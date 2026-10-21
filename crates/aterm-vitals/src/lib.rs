@@ -17,18 +17,22 @@
 //! * [`words`]: the sentences and compact figures.
 //! * [`ink`]: the load ramp and the scope ladder, solved in OkLab from the
 //!   ground they sit on.
+//! * [`jobs`]: stuck processes and jobs (§11): job units, progress, classes
+//!   and named waits, who waits for each job, φ and the closed verdict set.
 //!
 //! No clock, no platform, no dependencies: the host owns time and the OS.
 
 #![warn(missing_docs)]
 
 pub mod ink;
+pub mod jobs;
 pub mod model;
 pub mod trend;
 pub mod words;
 
 pub use model::{
-    ClusterSpec, ClusterView, CoreView, CpuView, GpuSample, GpuView, MemSample, MemView, Pressure,
-    ProcSample, Sample, ScopeView, Snapshot, TabRoot, TabView, Ticks, Vitals, VolumeSample,
+    COMMIT_NEAR_PCT, ClusterSpec, ClusterView, CommitSample, CoreView, CpuView, GpuSample, GpuView,
+    MemSample, MemView, Pressure, ProcSample, Sample, ScopeView, Snapshot, TabRoot, TabView, Ticks,
+    Vitals, VolumeSample,
 };
 pub use trend::{History, Motion, Trend, TrendView};

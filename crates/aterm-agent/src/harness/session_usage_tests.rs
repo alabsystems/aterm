@@ -289,13 +289,14 @@ fn any_split_of_the_appends_folds_to_the_one_pass_result() {
         let path = dir.join(&format!("s{step}.jsonl"));
         fs::write(&path, b"").expect("create");
         let mut cursor = TranscriptCursor::new(&path);
+        // One writer appending, as Claude Code's own: each append is on disk
+        // when `write` returns, before the cursor reads.
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
         for chunk in text.as_bytes().chunks(step) {
-            let mut f = fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("open");
             f.write_all(chunk).expect("append");
-            drop(f);
             let a = cursor.advance(BIG).expect("reads");
             assert!(!a.restarted, "step {step}: an append is never a restart");
         }

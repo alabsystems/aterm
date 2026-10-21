@@ -25,6 +25,14 @@ pub struct Formula {
     /// Tags whose API metadata needs no binary relocation, conditional platform
     /// resolution or post-install recipe. Others use the announced brew fallback.
     pub native_bottle_tags: Vec<String>,
+    /// `conflicts_with` names, evaluated against abrew's census at install.
+    pub conflicts: Vec<String>,
+    /// Requirements in the plain data forms abrew evaluates at install.
+    pub requirements: Vec<Requirement>,
+    /// `pour_bottle_only_if: :clt_installed`.
+    pub pour_requires_clt: bool,
+    /// Per-system deviations, resolved by `resolve_variations` before use.
+    pub variations: Vec<(String, FormulaVariation)>,
     pub dependencies: Vec<String>,
     pub build_dependencies: Vec<String>,
     pub keg_only: bool,
@@ -58,6 +66,221 @@ fn empty_metadata(value: Option<&Value>) -> bool {
     }
 }
 
+/// A present array must retain every supplied string; filtering cannot prove completeness.
+fn plain_strings(value: Option<&Value>) -> Option<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => Some(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect(),
+        _ => None,
+    }
+}
+
+fn plain_names(value: Option<&Value>) -> Option<Vec<String>> {
+    if empty_metadata(value) {
+        return Some(Vec::new());
+    }
+    let names = plain_strings(value)?;
+    names
+        .iter()
+        .all(|name| super::valid_name(name))
+        .then_some(names)
+}
+
+pub(super) fn numeric_macos_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.split('.').all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.parse::<u64>().is_ok()
+        })
+}
+
+/// The supported Generic destination mapping without a concrete prefix. Shared
+/// by dual-target admission and the actual cask destination producer.
+pub(super) fn generic_target_relative(
+    target: &str,
+) -> Option<std::borrow::Cow<'_, std::path::Path>> {
+    // $APPDIR is the cask appdir: brew's /Applications, abrew's
+    // prefix Applications (where app artifacts already land).
+    if let Some(rest) = target.strip_prefix("$APPDIR/") {
+        let rest_path = std::path::Path::new(rest);
+        if rest.is_empty()
+            || rest_path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        return Some(std::borrow::Cow::Owned(
+            std::path::PathBuf::from("Applications").join(rest_path),
+        ));
+    }
+    let relative = target
+        .strip_prefix("$HOMEBREW_PREFIX/")
+        .or_else(|| target.strip_prefix("~/"))
+        .or_else(|| target.strip_prefix("/$HOME/"))
+        .or_else(|| target.strip_prefix("$HOME/"))?;
+    let path = std::path::Path::new(relative);
+    if relative.is_empty()
+        || path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        || (!target.starts_with("$HOMEBREW_PREFIX/") && !relative.starts_with("Library/"))
+    {
+        return None;
+    }
+    Some(std::borrow::Cow::Borrowed(path))
+}
+
+/// One formula `variations` entry: the fields that can change what a
+/// pour needs. Build/test/head-only fields are pour-irrelevant and
+/// dropped at parse; anything else marks the entry unsupported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FormulaVariation {
+    pub dependencies: Option<Vec<String>>,
+    pub requirements: Option<Vec<Requirement>>,
+    pub requirements_unsupported: bool,
+    pub conflicts: Option<Vec<String>>,
+    pub unsupported: bool,
+}
+
+fn parse_formula_variations(v: Option<&Value>) -> Vec<(String, FormulaVariation)> {
+    let mut out = Vec::new();
+    let Some(Value::Object(map)) = v else {
+        if !empty_metadata(v) {
+            out.push((
+                String::new(),
+                FormulaVariation {
+                    unsupported: true,
+                    ..FormulaVariation::default()
+                },
+            ));
+        }
+        return out;
+    };
+    for (key, entry) in map {
+        let mut variation = FormulaVariation::default();
+        let Value::Object(fields) = entry else {
+            variation.unsupported = true;
+            out.push((key.clone(), variation));
+            continue;
+        };
+        for (field, value) in fields {
+            match field.as_str() {
+                "dependencies" => match plain_names(Some(value)) {
+                    Some(names) => variation.dependencies = Some(names),
+                    None => variation.unsupported = true,
+                },
+                "conflicts_with" => match plain_names(Some(value)) {
+                    Some(names) => variation.conflicts = Some(names),
+                    None => variation.unsupported = true,
+                },
+                "requirements" => match parse_requirements(Some(value)) {
+                    Ok(reqs) => variation.requirements = Some(reqs),
+                    Err(()) => variation.requirements_unsupported = true,
+                },
+                // Pour-irrelevant: build/test/head inputs and prose.
+                "build_dependencies"
+                | "head_dependencies"
+                | "test_dependencies"
+                | "caveats"
+                | "patches"
+                | "no_linkage_dependencies"
+                | "conflicts_with_reasons"
+                | "link_overwrites" => {}
+                _ => variation.unsupported = true,
+            }
+        }
+        out.push((key.clone(), variation));
+    }
+    out
+}
+
+/// The macOS release name for a major version, newest first elsewhere.
+fn macos_release(major: u64) -> Option<&'static str> {
+    Some(match major {
+        27 => "golden_gate",
+        26 => "tahoe",
+        15 => "sequoia",
+        14 => "sonoma",
+        13 => "ventura",
+        12 => "monterey",
+        11 => "big_sur",
+        10 => "catalina",
+        _ => return None,
+    })
+}
+
+/// A formula requirement in a form abrew can evaluate from data alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Requirement {
+    /// `depends_on :macos` with an optional numeric floor.
+    MacosMin(Option<String>),
+    /// `depends_on maximum_macos: X`.
+    MacosMax(String),
+    /// `depends_on arch: :arm64` / `:x86_64`.
+    Arch(String),
+    /// `depends_on xcode:` with an optional numeric floor, probed
+    /// with `xcodebuild -version` at preflight like brew probes it.
+    XcodeMin(Option<String>),
+}
+
+/// Parse the API `requirements` list. Build/test contexts and
+/// non-stable specs never gate a bottle pour and are dropped. `Err`
+/// (unit) marks any richer shape unsupported.
+fn parse_requirements(v: Option<&Value>) -> Result<Vec<Requirement>, ()> {
+    let mut out = Vec::new();
+    let Some(items) = v.and_then(Value::as_array) else {
+        return if empty_metadata(v) { Ok(out) } else { Err(()) };
+    };
+    for item in items {
+        let Value::Object(_) = item else {
+            return Err(());
+        };
+        let specs = plain_strings(item.get("specs")).ok_or(())?;
+        if !specs.is_empty() && !specs.iter().any(|s| s == "stable") {
+            continue;
+        }
+        let contexts = plain_strings(item.get("contexts")).ok_or(())?;
+        // Build and test contexts never gate a bottle pour: abrew
+        // neither builds from source nor runs `brew test`.
+        if !contexts.is_empty()
+            && contexts
+                .iter()
+                .all(|c| matches!(c.as_str(), "build" | "test"))
+        {
+            continue;
+        }
+        if !contexts.is_empty() {
+            return Err(());
+        }
+        let version = match item.get("version") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(version)) => Some(version.as_str()),
+            _ => return Err(()),
+        };
+        match item.get("name").and_then(Value::as_str) {
+            Some("macos") if version.is_none_or(numeric_macos_version) => {
+                out.push(Requirement::MacosMin(version.map(str::to_owned)));
+            }
+            Some("maximum_macos") if version.is_some_and(numeric_macos_version) => {
+                out.push(Requirement::MacosMax(version.ok_or(())?.to_string()));
+            }
+            Some("arch") if matches!(version, Some("arm64" | "x86_64")) => {
+                out.push(Requirement::Arch(version.unwrap_or_default().to_string()));
+            }
+            Some("xcode") if version.is_none_or(numeric_macos_version) => {
+                out.push(Requirement::XcodeMin(version.map(str::to_owned)));
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(out)
+}
+
 impl Formula {
     /// Parse one formulae.brew.sh formula object.
     pub fn from_api(v: &Value) -> Result<Formula, String> {
@@ -69,16 +292,20 @@ impl Formula {
         let stable = v.pointer("/urls/stable");
         let mut bottle_files = Vec::new();
         let mut native_bottle_tags = Vec::new();
+        let pour = v.get("pour_bottle_only_if").and_then(Value::as_str);
+        let pour_requires_clt = pour == Some("clt_installed");
+        let requirements = parse_requirements(v.get("requirements"));
+        let parsed_conflicts = plain_names(v.get("conflicts_with"));
+        let conflicts_plain = parsed_conflicts.is_some();
+        let conflicts = parsed_conflicts.unwrap_or_default();
         let no_conditions = matches!(
             v.get("post_install_defined"),
             None | Some(Value::Bool(false))
-        ) && v
-            .get("pour_bottle_only_if")
-            .is_none_or(|value| *value == Value::Null)
+        ) && (matches!(v.get("pour_bottle_only_if"), None | Some(Value::Null))
+            || pour_requires_clt)
             && empty_metadata(v.get("post_install_steps"))
-            && empty_metadata(v.get("requirements"))
-            && empty_metadata(v.get("conflicts_with"))
-            && empty_metadata(v.get("variations"));
+            && requirements.is_ok()
+            && conflicts_plain;
         if let Some(files) = v.pointer("/bottle/stable/files")
             && let Value::Object(map) = files
         {
@@ -107,6 +334,10 @@ impl Formula {
             stable_sha256: s(stable.and_then(|x| x.get("checksum"))),
             bottle_files,
             native_bottle_tags,
+            conflicts,
+            requirements: requirements.unwrap_or_default(),
+            pour_requires_clt,
+            variations: parse_formula_variations(v.get("variations")),
             dependencies: str_list(v.get("dependencies")),
             build_dependencies: str_list(v.get("build_dependencies")),
             keg_only: v.get("keg_only").and_then(Value::as_bool).unwrap_or(false),
@@ -133,6 +364,89 @@ impl Formula {
         self.bottle_files.iter().find(|(t, _, _)| t == "all")
     }
 
+    /// Apply the variation for this machine, mirroring cask selection:
+    /// the API's top-level fields are the default arm64-mac system, so
+    /// only an exact-system deviation applies (`arm64_<release>`, Intel
+    /// `x86_64_<release>`/bare `<release>`, `<arch>_linux`). An
+    /// applicable-but-unsupported entry clears the native bottle tags
+    /// (delegate), as does an unprobable system with variations present.
+    pub(super) fn resolve_variations(&mut self) -> bool {
+        if self.variations.is_empty() {
+            return true;
+        }
+        if self
+            .variations
+            .iter()
+            .any(|(key, entry)| key.is_empty() && entry.unsupported)
+        {
+            return self.resolve_variations_for_keys(&[]);
+        }
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let keys: Vec<String> = if cfg!(target_os = "linux") {
+            vec![format!("{arch}_linux")]
+        } else if cfg!(target_os = "macos") {
+            let release = macos_version()
+                .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u64>().ok()))
+                .and_then(macos_release);
+            let Some(release) = release else {
+                self.native_bottle_tags.clear();
+                self.variations.clear();
+                return false;
+            };
+            if arch == "arm64" {
+                vec![format!("arm64_{release}")]
+            } else {
+                vec![format!("{arch}_{release}"), release.to_string()]
+            }
+        } else {
+            self.native_bottle_tags.clear();
+            self.variations.clear();
+            return false;
+        };
+        self.resolve_variations_for_keys(&keys)
+    }
+
+    /// Apply already-classified system keys. False preserves unknown variation work
+    /// as a refusal for checked dependency readers, not an empty dependency set.
+    fn resolve_variations_for_keys(&mut self, keys: &[String]) -> bool {
+        if self
+            .variations
+            .iter()
+            .any(|(key, entry)| key.is_empty() && entry.unsupported)
+        {
+            self.native_bottle_tags.clear();
+            self.variations.clear();
+            return false;
+        }
+        let found = keys.iter().find_map(|key| {
+            self.variations
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, variation)| variation.clone())
+        });
+        self.variations.clear();
+        let Some(variation) = found else {
+            return true;
+        };
+        if variation.unsupported || variation.requirements_unsupported {
+            self.native_bottle_tags.clear();
+            return false;
+        }
+        if let Some(deps) = variation.dependencies {
+            self.dependencies = deps;
+        }
+        if let Some(reqs) = variation.requirements {
+            self.requirements = reqs;
+        }
+        if let Some(conflicts) = variation.conflicts {
+            self.conflicts = conflicts;
+        }
+        true
+    }
+
     /// `name`'s short form without a tap prefix.
     #[must_use]
     pub fn short_name(full: &str) -> &str {
@@ -155,19 +469,513 @@ pub struct Cask {
     pub sha256: Option<String>,
     pub artifacts: Vec<Artifact>,
     pub auto_updates: bool,
+    /// A top-level constraint the native resolver cannot evaluate.
+    pub unsupported_constraints: bool,
+    /// The `depends_on macos: ">= X"` floor, when the API states one in
+    /// plain numeric form. Evaluated against the running OS at install.
+    pub macos_min: Option<String>,
+    /// The `depends_on macos: "== X"` exact-release bound.
+    pub macos_exact: Option<String>,
+    /// `conflicts_with` cask/formula names; evaluated against abrew's
+    /// own installed census at install.
+    pub conflicts: Vec<String>,
+    /// The `depends_on arch:` requirement ("arm64"/"x86_64"), when the
+    /// API states exactly one plain architecture.
+    pub arch: Option<String>,
+    /// `depends_on formula:` names, installed before this cask.
+    pub depends_formula: Vec<String>,
+    /// `depends_on cask:` tokens, installed before this cask.
+    pub depends_cask: Vec<String>,
+    /// Per-system overrides (`variations`), selected at install time by
+    /// macOS release and architecture. Empty for most casks.
+    pub variations: Vec<(String, Variation)>,
+    /// `container type: :naked` — the download is the payload file itself.
+    pub naked: bool,
+    /// `container nested: "<path>"` — the real payload archive sits
+    /// at this path inside the downloaded outer archive.
+    pub nested: Option<String>,
+}
+
+/// One admitted `variations` entry: plain field overrides only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Variation {
+    /// This entry uses fields/shapes abrew cannot evaluate; it blocks
+    /// only when it is the entry selected for this machine.
+    pub unsupported: bool,
+    pub url: Option<String>,
+    /// Outer None: field absent. Inner None: the variation says `no_check`.
+    pub sha256: Option<Option<String>>,
+    pub version: Option<String>,
+    pub artifacts: Option<Vec<Artifact>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Artifact {
-    App(String),
-    Binary(String),
-    Font(String),
+    /// Source path inside the payload and the installed name the cask's
+    /// `target:` rename asks for, when it names a plain file name.
+    App(String, Option<String>),
+    Binary(String, Option<String>),
+    Font(String, Option<String>),
     Pkg(String),
-    Manpage(String),
+    Manpage(String, Option<String>),
+    Suite(String, Option<String>),
+    KeyboardLayout(String, Option<String>),
+    ScreenSaver(String, Option<String>),
+    PrefPane(String, Option<String>),
+    Service(String, Option<String>),
+    /// Generic `artifact` with its full stated target (mapped into the
+    /// prefix at install; unmappable targets delegate).
+    Generic(String, Option<String>),
+    /// `command_wrapper`: wrapper name, executable payload source,
+    /// fixed leading args, installed-name rename. The wrapper script
+    /// itself is generated inside the payload at install.
+    Wrapper(String, String, Vec<String>, Option<String>),
+    /// A plugin/completion artifact linked into a fixed prefix-relative
+    /// directory (`Library/QuickLook`, `share/zsh/site-functions`, …):
+    /// source, rename, directory.
+    Library(String, Option<String>, String),
     Other(String),
 }
 
+/// One cask `depends_on` in the plain data forms abrew evaluates.
+#[derive(Debug, Default)]
+struct Depends {
+    floor: Option<String>,
+    exact: Option<String>,
+    arch: Option<String>,
+    formula: Vec<String>,
+    cask: Vec<String>,
+}
+
+/// The admitted `depends_on` shapes: an optional `macos` floor
+/// (`{"macos": {">=": ["X"]}}` or an empty macos object), an optional
+/// single plain `arch` requirement, and plain `formula`/`cask`
+/// dependency name lists (installed first, like brew). None for
+/// every richer shape.
+fn parse_depends(v: Option<&Value>) -> Option<Depends> {
+    let Value::Object(map) = v? else {
+        return None;
+    };
+    let mut out = Depends::default();
+    for (key, value) in map {
+        match key.as_str() {
+            "macos" => {
+                let Value::Object(macos) = value else {
+                    return None;
+                };
+                if macos.is_empty() {
+                    continue;
+                }
+                if macos.len() != 1 {
+                    return None;
+                }
+                let (op, bounds) = match (macos.get(">="), macos.get("==")) {
+                    (Some(Value::Array(bounds)), None) => (">=", bounds),
+                    (None, Some(Value::Array(bounds))) => ("==", bounds),
+                    _ => return None,
+                };
+                let [Value::String(bound)] = bounds.as_slice() else {
+                    return None;
+                };
+                if !numeric_macos_version(bound) {
+                    return None;
+                }
+                if op == ">=" {
+                    out.floor = Some(bound.clone());
+                } else {
+                    out.exact = Some(bound.clone());
+                }
+            }
+            "arch" => {
+                let Value::Array(items) = value else {
+                    return None;
+                };
+                let [Value::Object(spec)] = items.as_slice() else {
+                    return None;
+                };
+                if spec.len() != 2 {
+                    return None;
+                }
+                let ty = spec.get("type").and_then(Value::as_str)?;
+                let bits = spec.get("bits").and_then(Value::as_u64)?;
+                out.arch = Some(
+                    match (ty, bits) {
+                        ("arm", 64) => "arm64",
+                        ("intel", 64) => "x86_64",
+                        _ => return None,
+                    }
+                    .to_string(),
+                );
+            }
+            "formula" | "cask" => {
+                let Value::Array(items) = value else {
+                    return None;
+                };
+                let names = if key == "formula" {
+                    &mut out.formula
+                } else {
+                    &mut out.cask
+                };
+                for item in items {
+                    let Value::String(name) = item else {
+                        return None;
+                    };
+                    if !super::valid_component(name) {
+                        return None;
+                    }
+                    names.push(name.clone());
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The admitted `conflicts_with` shape: `{"cask": [...], "formula": [...]}`
+/// with plain name strings (either key optional).
+fn parse_conflicts(v: Option<&Value>) -> Option<Vec<String>> {
+    let Value::Object(map) = v? else {
+        return None;
+    };
+    let mut names = Vec::new();
+    for (kind, vals) in map {
+        if !matches!(kind.as_str(), "cask" | "formula") {
+            return None;
+        }
+        let Value::Array(items) = vals else {
+            return None;
+        };
+        for item in items {
+            let Value::String(name) = item else {
+                return None;
+            };
+            if !super::valid_name(name) {
+                return None;
+            }
+            names.push(name.clone());
+        }
+    }
+    Some(names)
+}
+
+/// Parse one API `artifacts` array (shared by casks and their variations).
+fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
+    let mut artifacts = Vec::new();
+    if let Some(arr) = v.and_then(Value::as_array) {
+        for a in arr {
+            if !matches!(a, Value::Object(_))
+                || a.get("target")
+                    .is_some_and(|value| !matches!(value, Value::String(_)))
+            {
+                artifacts.push(Artifact::Other(
+                    "unsupported artifact row or target".to_string(),
+                ));
+                continue;
+            }
+            // `target` is brew's computed destination for the sibling
+            // artifact in the same object. Rename-only artifacts use its
+            // file name; Generic artifacts compare their full mapping below.
+            // `uninstall`/`zap` entries
+            // describe removing a real-brew install and are not
+            // artifacts to place, so they never block a native install.
+            let raw_target = a.get("target").and_then(Value::as_str).map(str::to_owned);
+            let dest_name = a.get("target").and_then(Value::as_str).map(|t| {
+                std::path::Path::new(t)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            });
+            if let Value::Object(map) = a {
+                for (kind, vals) in map {
+                    if matches!(kind.as_str(), "target" | "uninstall" | "zap") {
+                        continue;
+                    }
+                    if kind == "command_wrapper" {
+                        // ["name", {"executable": "…", "args": […]}]: the
+                        // wrapper script is generated at install; arbitrary
+                        // `content` wrappers delegate.
+                        let parsed = (|| {
+                            let items = vals.as_array()?;
+                            let [Value::String(name), Value::Object(opts)] = items.as_slice()
+                            else {
+                                return None;
+                            };
+                            if !opts
+                                .keys()
+                                .all(|k| matches!(k.as_str(), "executable" | "args"))
+                            {
+                                return None;
+                            }
+                            // Args may reference the install tree only
+                            // through the two rewritable markers.
+                            if let Some(Value::Array(items)) = opts.get("args") {
+                                for item in items {
+                                    let arg = item.as_str()?;
+                                    let scrubbed = arg
+                                        .replace("$HOMEBREW_PREFIX/", "")
+                                        .replace("$APPDIR/", "");
+                                    if scrubbed.contains('$') {
+                                        return None;
+                                    }
+                                }
+                            }
+                            let exe = opts.get("executable").and_then(Value::as_str)?;
+                            let exe = exe.strip_prefix("$APPDIR/").unwrap_or(exe);
+                            let args = match opts.get("args") {
+                                None => Vec::new(),
+                                Some(Value::Array(items)) => {
+                                    let mut out = Vec::new();
+                                    for item in items {
+                                        out.push(item.as_str()?.to_string());
+                                    }
+                                    out
+                                }
+                                Some(_) => return None,
+                            };
+                            let dest = match &dest_name {
+                                Some(Some(name))
+                                    if !name.is_empty()
+                                        && !name.contains('/')
+                                        && !name.contains('\\') =>
+                                {
+                                    Some(name.clone())
+                                }
+                                Some(_) => return None,
+                                None => None,
+                            };
+                            Some(Artifact::Wrapper(name.clone(), exe.to_string(), args, dest))
+                        })();
+                        artifacts.push(parsed.unwrap_or_else(|| {
+                            Artifact::Other(
+                                "command_wrapper: unsupported artifact options".to_string(),
+                            )
+                        }));
+                        continue;
+                    }
+                    let items = vals.as_array();
+                    let simple = items
+                        .and_then(|items| items.first())
+                        .and_then(Value::as_str);
+                    // The two-item form carries the rename in-line:
+                    // ["src", {"target": "name"}]. Only that one
+                    // option is data abrew can act on.
+                    let inline_target = items
+                        .and_then(|items| items.get(1))
+                        .and_then(|options| options.get("target"))
+                        .and_then(Value::as_str);
+                    if kind == "artifact"
+                        && raw_target.as_deref().zip(inline_target).is_some_and(|(sibling, inline)| {
+                            // Identical spellings cannot conflict;
+                            // whether the shared target maps into the
+                            // prefix is map_generic_target's question,
+                            // answered (and messaged) there.
+                            sibling != inline
+                                && !matches!((generic_target_relative(sibling), generic_target_relative(inline)),
+                                    (Some(a), Some(b)) if a == b)
+                        })
+                    {
+                        artifacts.push(Artifact::Other("artifact: conflicting full targets".to_string()));
+                        continue;
+                    }
+                    let raw_target = raw_target.clone().or_else(|| {
+                        items
+                            .and_then(|items| items.get(1))
+                            .and_then(|opts| opts.get("target"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                    let inline_dest = match items.map(Vec::as_slice) {
+                        Some([_]) => None,
+                        Some([_, Value::Object(opts)]) if opts.len() == 1 => {
+                            Some(opts.get("target").and_then(Value::as_str).and_then(|t| {
+                                std::path::Path::new(t)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                            }))
+                        }
+                        _ => Some(None),
+                    };
+                    let (Some(first), inline_dest) = (simple, inline_dest) else {
+                        artifacts.push(Artifact::Other(format!(
+                            "{kind}: unsupported artifact options"
+                        )));
+                        continue;
+                    };
+                    // $APPDIR names the staged .app of the same cask;
+                    // in the payload it is simply payload-relative.
+                    let first = first.strip_prefix("$APPDIR/").unwrap_or(first).to_owned();
+                    if matches!(inline_dest, Some(None))
+                        || matches!((&dest_name, &inline_dest), (Some(Some(a)), Some(Some(b))) if a != b)
+                    {
+                        artifacts.push(Artifact::Other(format!(
+                            "{kind}: unsupported artifact options"
+                        )));
+                        continue;
+                    }
+                    let dest = match dest_name.clone().or(inline_dest) {
+                        Some(Some(name))
+                            if !name.is_empty() && !name.contains('/') && !name.contains('\\') =>
+                        {
+                            Some(name)
+                        }
+                        Some(_) => {
+                            artifacts
+                                .push(Artifact::Other(format!("{kind}: unusable target rename")));
+                            continue;
+                        }
+                        None => None,
+                    };
+                    artifacts.push(match kind.as_str() {
+                        "app" => Artifact::App(first, dest),
+                        "binary" => Artifact::Binary(first, dest),
+                        "font" => Artifact::Font(first, dest),
+                        "pkg" => Artifact::Pkg(first),
+                        "manpage" => Artifact::Manpage(first, dest),
+                        "suite" => Artifact::Suite(first, dest),
+                        "keyboard_layout" => Artifact::KeyboardLayout(first, dest),
+                        "screen_saver" => Artifact::ScreenSaver(first, dest),
+                        "prefpane" => Artifact::PrefPane(first, dest),
+                        "service" => Artifact::Service(first, dest),
+                        "artifact" => Artifact::Generic(first, raw_target.clone()),
+                        "qlplugin" => Artifact::Library(first, dest, "Library/QuickLook".into()),
+                        "colorpicker" => {
+                            Artifact::Library(first, dest, "Library/ColorPickers".into())
+                        }
+                        "dictionary" => {
+                            Artifact::Library(first, dest, "Library/Dictionaries".into())
+                        }
+                        "input_method" => {
+                            Artifact::Library(first, dest, "Library/Input Methods".into())
+                        }
+                        "internet_plugin" => {
+                            Artifact::Library(first, dest, "Library/Internet Plug-Ins".into())
+                        }
+                        "mdimporter" => Artifact::Library(first, dest, "Library/Spotlight".into()),
+                        "audio_unit_plugin" => Artifact::Library(
+                            first,
+                            dest,
+                            "Library/Audio/Plug-Ins/Components".into(),
+                        ),
+                        "vst_plugin" => {
+                            Artifact::Library(first, dest, "Library/Audio/Plug-Ins/VST".into())
+                        }
+                        "vst3_plugin" => {
+                            Artifact::Library(first, dest, "Library/Audio/Plug-Ins/VST3".into())
+                        }
+                        "bash_completion" => Artifact::Library(
+                            first,
+                            dest,
+                            "share/bash-completion/completions".into(),
+                        ),
+                        "zsh_completion" => {
+                            Artifact::Library(first, dest, "share/zsh/site-functions".into())
+                        }
+                        "fish_completion" => {
+                            Artifact::Library(first, dest, "share/fish/vendor_completions.d".into())
+                        }
+                        other => Artifact::Other(format!("{other}:{first}")),
+                    });
+                }
+            }
+        }
+    }
+    artifacts
+}
+
+/// The admitted `variations` shape: an object whose every entry holds
+/// only plain overrides (url/sha256/version/artifacts; `skip_livecheck`
+/// is update metadata and ignored). Anything richer delegates.
+fn parse_variations(v: Option<&Value>) -> Option<Vec<(String, Variation)>> {
+    let Value::Object(map) = v? else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for (key, entry) in map {
+        // Per-entry admission: a rich entry for another system must not
+        // poison this machine's pour; it delegates only if selected.
+        let mut variation = Variation::default();
+        let Value::Object(fields) = entry else {
+            variation.unsupported = true;
+            out.push((key.clone(), variation));
+            continue;
+        };
+        for (field, value) in fields {
+            match field.as_str() {
+                "url" => match value.as_str() {
+                    Some(u) => variation.url = Some(u.to_string()),
+                    None => variation.unsupported = true,
+                },
+                "version" => match value.as_str() {
+                    Some(v) => variation.version = Some(v.to_string()),
+                    None => variation.unsupported = true,
+                },
+                "sha256" => match value.as_str() {
+                    Some("no_check") => variation.sha256 = Some(None),
+                    Some(raw) if raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                        variation.sha256 = Some(Some(raw.to_string()));
+                    }
+                    _ => variation.unsupported = true,
+                },
+                "artifacts" => variation.artifacts = Some(parse_artifacts(Some(value))),
+                "skip_livecheck" => {}
+                _ => variation.unsupported = true,
+            }
+        }
+        out.push((key.clone(), variation));
+    }
+    Some(out)
+}
+
+/// macOS release names from newest to oldest, for variation selection.
+pub const MACOS_RELEASES: [&str; 12] = [
+    "golden_gate",
+    "tahoe",
+    "sequoia",
+    "sonoma",
+    "ventura",
+    "monterey",
+    "big_sur",
+    "catalina",
+    "mojave",
+    "high_sierra",
+    "sierra",
+    "el_capitan",
+];
+
 impl Cask {
+    /// The variation Homebrew would pick for `major`/`arch`. The API's
+    /// top-level fields are generated for the default system (arm64,
+    /// newest macOS), so they already ARE that system's variation:
+    /// bare release keys hold the Intel deviations and `arm64_<release>`
+    /// keys the older-OS arm deviations. The API materializes an entry
+    /// for every differing system, so selection is exact-OS. None means the
+    /// top-level fields stand.
+    #[must_use]
+    pub fn variation_for(&self, major: u64, arch: &str) -> Option<&Variation> {
+        let release = match major {
+            27 => MACOS_RELEASES[0],
+            26 => MACOS_RELEASES[1],
+            15 => MACOS_RELEASES[2],
+            14 => MACOS_RELEASES[3],
+            13 => MACOS_RELEASES[4],
+            12 => MACOS_RELEASES[5],
+            11 => MACOS_RELEASES[6],
+            10 => MACOS_RELEASES[7],
+            _ => return None,
+        };
+        let keys: [Option<String>; 2] = if arch == "arm64" {
+            [Some(format!("arm64_{release}")), None]
+        } else {
+            [Some(format!("{arch}_{release}")), Some(release.to_string())]
+        };
+        keys.into_iter().flatten().find_map(|key| {
+            self.variations
+                .iter()
+                .find(|(k, _)| k == &key)
+                .map(|(_, variation)| variation)
+        })
+    }
+
     /// Parse one formulae.brew.sh cask object.
     pub fn from_api(v: &Value) -> Result<Cask, String> {
         let token = s(v.get("token"));
@@ -175,38 +983,73 @@ impl Cask {
             return Err("abrew: cask JSON has no token".to_string());
         }
         let sha_raw = s(v.get("sha256"));
-        let mut artifacts = Vec::new();
-        if let Some(arr) = v.get("artifacts").and_then(Value::as_array) {
-            for a in arr {
-                if let Value::Object(map) = a {
-                    for (kind, vals) in map {
-                        let simple = vals
-                            .as_array()
-                            .filter(|items| items.len() == 1)
-                            .and_then(|items| items.first())
-                            .and_then(Value::as_str);
-                        let Some(first) = simple else {
-                            artifacts.push(Artifact::Other(format!(
-                                "{kind}: unsupported artifact options"
-                            )));
-                            continue;
-                        };
-                        let first = first.to_owned();
-                        artifacts.push(match kind.as_str() {
-                            "app" => Artifact::App(first),
-                            "binary" => Artifact::Binary(first),
-                            "font" => Artifact::Font(first),
-                            "pkg" => Artifact::Pkg(first),
-                            "manpage" => Artifact::Manpage(first),
-                            other => Artifact::Other(format!("{other}:{first}")),
-                        });
-                    }
+        let mut artifacts = parse_artifacts(v.get("artifacts"));
+        // Only the complete one-field naked container and a plain
+        // `container nested:` naming a supported inner archive are
+        // data. A richer container must remain unsupported through
+        // artifact overrides.
+        let naked = matches!(v.get("container"), Some(Value::Object(fields))
+            if fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("naked"));
+        let nested = match v.get("container") {
+            Some(Value::Object(fields)) if fields.len() == 1 => fields
+                .get("nested")
+                .and_then(Value::as_str)
+                .filter(|p| {
+                    !p.is_empty()
+                        && std::path::Path::new(p)
+                            .components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_)))
+                        && super::fetch::archive_supported(p)
+                })
+                .map(str::to_owned),
+            _ => None,
+        };
+        let mut unsupported_constraints = false;
+        if !empty_metadata(v.get("container")) && !naked && nested.is_none() {
+            unsupported_constraints = true;
+            artifacts.push(Artifact::Other("unsupported container".to_string()));
+        }
+        // `depends_on`/`conflicts_with` are admitted only in the plain
+        // data forms abrew can evaluate itself; anything richer stays a
+        // delegation (Artifact::Other), exactly like before.
+        let mut macos_min = None;
+        let mut macos_exact = None;
+        let mut arch = None;
+        let mut depends_formula = Vec::new();
+        let mut depends_cask = Vec::new();
+        if !empty_metadata(v.get("depends_on")) {
+            match parse_depends(v.get("depends_on")) {
+                Some(deps) => {
+                    macos_min = deps.floor;
+                    macos_exact = deps.exact;
+                    arch = deps.arch;
+                    depends_formula = deps.formula;
+                    depends_cask = deps.cask;
+                }
+                None => {
+                    unsupported_constraints = true;
+                    artifacts.push(Artifact::Other("unsupported depends_on".to_string()));
                 }
             }
         }
-        for field in ["depends_on", "conflicts_with", "container", "variations"] {
-            if !empty_metadata(v.get(field)) {
-                artifacts.push(Artifact::Other(format!("unsupported {field}")));
+        let mut variations = Vec::new();
+        if !empty_metadata(v.get("variations")) {
+            match parse_variations(v.get("variations")) {
+                Some(parsed) => variations = parsed,
+                None => {
+                    unsupported_constraints = true;
+                    artifacts.push(Artifact::Other("unsupported variations".to_string()));
+                }
+            }
+        }
+        let mut conflicts = Vec::new();
+        if !empty_metadata(v.get("conflicts_with")) {
+            match parse_conflicts(v.get("conflicts_with")) {
+                Some(names) => conflicts = names,
+                None => {
+                    unsupported_constraints = true;
+                    artifacts.push(Artifact::Other("unsupported conflicts_with".to_string()));
+                }
             }
         }
         let sha256 = if sha_raw == "no_check" {
@@ -239,6 +1082,16 @@ impl Cask {
                 .get("auto_updates")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            unsupported_constraints,
+            macos_min,
+            macos_exact,
+            conflicts,
+            arch,
+            depends_formula,
+            depends_cask,
+            variations,
+            naked,
+            nested,
         })
     }
 }
@@ -246,6 +1099,51 @@ impl Cask {
 /// Compatible bottle tags for this machine. An unknown macOS version admits
 /// only the formula's `all` fallback; it never guesses a newer OS requirement.
 #[must_use]
+/// The running macOS version string (sw_vers), for requirement floors.
+pub(super) fn macos_version() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = super::fetch::run_capture("/usr/bin/sw_vers", &["-productVersion"]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let version = String::from_utf8(out.stdout).ok()?;
+        let version = version.trim().to_string();
+        (!version.is_empty()).then_some(version)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The installed Xcode version (`xcodebuild -version`'s first
+/// line), for `depends_on xcode:` floors. None off macOS, with no
+/// developer directory selected, or on any probe failure — an
+/// unmet requirement then delegates like the macOS floors do.
+pub(super) fn xcode_version() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = super::fetch::run_capture("/usr/bin/xcodebuild", &["-version"]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        let version = text
+            .lines()
+            .next()?
+            .strip_prefix("Xcode ")?
+            .split_whitespace()
+            .next()?
+            .to_string();
+        numeric_macos_version(&version).then_some(version)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 pub fn bottle_tags() -> Vec<String> {
     let arch = match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -279,6 +1177,7 @@ fn macos_bottle_tags(arch: &str, major: Option<u32>) -> Vec<String> {
         _ => return Vec::new(),
     };
     [
+        (27, "golden_gate"),
         (26, "tahoe"),
         (15, "sequoia"),
         (14, "sonoma"),
@@ -460,8 +1359,7 @@ mod tests {
         );
         for unsupported in [
             r#"{"name":"demo","post_install_defined":true,"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
-            r#"{"name":"demo","requirements":[{"name":"macos"}],"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
-            r#"{"name":"demo","variations":{"arm64_sonoma":{}},"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+            r#"{"name":"demo","requirements":[{"name":"linux"}],"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
             r#"{"name":"demo","pour_bottle_only_if":"condition","bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
         ] {
             value = aterm_json::from_str(unsupported).unwrap();
@@ -472,6 +1370,67 @@ mod tests {
                     .is_empty()
             );
         }
+        // Data-evaluable requirements and conflicts keep the native tag;
+        // they are enforced against the machine/census at preflight.
+        value = aterm_json::from_str(
+            r#"{"name":"demo","conflicts_with":["other"],"requirements":[{"name":"macos","version":"13","contexts":[],"specs":["stable","head"]},{"name":"xcode","contexts":["build","test"]},{"name":"xcode","version":"14.0","contexts":[],"specs":["stable"]}],"pour_bottle_only_if":"clt_installed","bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+        )
+        .unwrap();
+        let f = Formula::from_api(&value).unwrap();
+        assert_eq!(f.native_bottle_tags, ["all"]);
+        assert_eq!(f.conflicts, ["other"]);
+        // The build/test-context xcode row drops; the runtime xcode
+        // floor stays as data for the preflight probe.
+        assert_eq!(
+            f.requirements,
+            [
+                Requirement::MacosMin(Some("13".into())),
+                Requirement::XcodeMin(Some("14.0".into()))
+            ]
+        );
+        assert!(f.pour_requires_clt);
+        // Variations parse as data and resolve exact-system: a Linux-only
+        // deviation never touches a macOS pour, an arm64_<this OS> one does.
+        value = aterm_json::from_str(
+            r#"{"name":"demo","dependencies":["base"],"variations":{"arm64_linux":{"dependencies":["linuxonly"]},"x86_64_linux":{"dependencies":["linuxonly"]}},"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+        )
+        .unwrap();
+        let mut f = Formula::from_api(&value).unwrap();
+        assert_eq!(f.native_bottle_tags, ["all"]);
+        let mut mac = f.clone();
+        assert!(mac.resolve_variations_for_keys(&["arm64_tahoe".to_string()]));
+        assert_eq!(mac.dependencies, ["base"]);
+        assert_eq!(mac.native_bottle_tags, ["all"]);
+        assert!(f.resolve_variations_for_keys(&["arm64_linux".to_string()]));
+        assert_eq!(f.dependencies, ["linuxonly"]);
+        // A non-string condition/conflict is unknown metadata, not no condition.
+        for field in [
+            r#""pour_bottle_only_if":{"unknown":true}"#,
+            r#""conflicts_with":{"formula":["other"]}"#,
+            r#""requirements":[{"name":"macos","contexts":[42]}]"#,
+        ] {
+            let malformed: Value = aterm_json::from_str(&format!(
+                r#"{{"name":"demo",{field},"bottle":{{"stable":{{"files":{{"all":{{"cellar":":any_skip_relocation"}}}}}}}}}}"#
+            )).unwrap();
+            assert!(
+                Formula::from_api(&malformed)
+                    .unwrap()
+                    .native_bottle_tags
+                    .is_empty()
+            );
+        }
+        for variation in [r#"[42]"#, r#"{"arm64_tahoe":{"dependencies":[42]}}"#] {
+            let malformed: Value = aterm_json::from_str(&format!(
+                r#"{{"name":"demo","versions":{{"stable":"1"}},"revision":0,"dependencies":[],"variations":{variation},"bottle":{{"stable":{{"files":{{"all":{{"cellar":":any_skip_relocation"}}}}}}}}}}"#
+            )).unwrap();
+            let mut parsed = Formula::from_api(&malformed).unwrap();
+            assert!(!parsed.resolve_variations_for_keys(&["arm64_tahoe".to_string()]));
+            assert!(parsed.native_bottle_tags.is_empty());
+        }
+        let malformed: Value = aterm_json::from_str(r#"{"name":"demo","versions":{"stable":"1"},"revision":0,"dependencies":[],"variations":[42]}"#).unwrap();
+        assert!(super::super::api::dependency_formula(&malformed, "demo").is_err());
+        let complete: Value = aterm_json::from_str(r#"{"name":"demo","versions":{"stable":"1"},"revision":0,"dependencies":[],"variations":{}}"#).unwrap();
+        assert!(super::super::api::dependency_formula(&complete, "demo").is_ok());
         for cellar in [":any", "/opt/homebrew/Cellar", ""] {
             value = aterm_json::from_str(&format!(r#"{{"name":"demo","bottle":{{"stable":{{"files":{{"all":{{"cellar":"{cellar}"}}}}}}}}}}"#)).unwrap();
             assert!(
@@ -489,15 +1448,11 @@ mod tests {
             aterm_json::from_str(r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifacts":[{"app":["Demo.app"]}]}"#).unwrap();
         assert_eq!(
             Cask::from_api(&simple).unwrap().artifacts,
-            [Artifact::App("Demo.app".into())]
+            [Artifact::App("Demo.app".into(), None)]
         );
         for json in [
-            r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifacts":[{"app":["Demo.app",{"target":"Other.app"}]}]}"#,
-            r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifacts":[{"binary":["demo",{"target":"other"}]}]}"#,
             r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","depends_on":{"macos":[">= :sonoma"]}}"#,
-            r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conflicts_with":{"cask":["other"]}}"#,
             r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","container":{"type":"dmg"}}"#,
-            r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","variations":{"arm64_sonoma":{"url":"different"}}}"#,
         ] {
             let value: Value = aterm_json::from_str(json).unwrap();
             assert!(
@@ -517,6 +1472,170 @@ mod tests {
         ] {
             let value: Value = aterm_json::from_str(json).unwrap();
             assert!(Cask::from_api(&value).is_err());
+        }
+        // Plain-data depends_on/conflicts_with parse as evaluated fields,
+        // not unsupported work; richer shapes still refuse above.
+        let constrained: Value = aterm_json::from_str(&format!(
+            r#"{{"token":"demo","sha256":"{}","depends_on":{{"macos":{{">=":["12"]}}}},"conflicts_with":{{"cask":["other"],"formula":["wget"]}},"artifacts":[]}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let cask = Cask::from_api(&constrained).unwrap();
+        assert_eq!(cask.macos_min.as_deref(), Some("12"));
+        assert_eq!(cask.conflicts, ["other", "wget"]);
+        assert!(cask.artifacts.is_empty());
+        let unbounded: Value = aterm_json::from_str(&format!(
+            r#"{{"token":"demo","sha256":"{}","depends_on":{{"macos":{{}}}},"artifacts":[]}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let cask = Cask::from_api(&unbounded).unwrap();
+        assert_eq!(cask.macos_min, None);
+        assert!(cask.artifacts.is_empty());
+        let arched: Value = aterm_json::from_str(&format!(
+            r#"{{"token":"demo","sha256":"{}","depends_on":{{"arch":[{{"type":"arm","bits":64}}],"macos":{{">=":["14"]}}}},"artifacts":[{{"binary":["$APPDIR/Demo.app/Contents/MacOS/demo",{{"target":"demo"}}]}}]}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let cask = Cask::from_api(&arched).unwrap();
+        assert_eq!(cask.arch.as_deref(), Some("arm64"));
+        assert_eq!(cask.macos_min.as_deref(), Some("14"));
+        assert_eq!(
+            cask.artifacts,
+            [Artifact::Binary(
+                "Demo.app/Contents/MacOS/demo".into(),
+                Some("demo".into())
+            )]
+        );
+        // Variations select by release, walking down from the running OS.
+        let varied: Value = aterm_json::from_str(&format!(
+            r#"{{"token":"demo","sha256":"{}","url":"https://x/base.zip","artifacts":[],"variations":{{"arm64_sonoma":{{"url":"https://x/sonoma.zip"}},"tahoe":{{"url":"https://x/tahoe.zip","sha256":"{}"}}}}}}"#,
+            "a".repeat(64),
+            "b".repeat(64)
+        ))
+        .unwrap();
+        let cask = Cask::from_api(&varied).unwrap();
+        assert_eq!(cask.variations.len(), 2);
+        // Bare release keys are Intel deviations; arm64 keeps top-level
+        // unless an arm64_<release> deviation applies.
+        assert!(cask.variation_for(26, "arm64").is_none());
+        assert_eq!(
+            cask.variation_for(26, "x86_64")
+                .and_then(|v| v.url.as_deref()),
+            Some("https://x/tahoe.zip")
+        );
+        // Exact-OS only: a newer OS with no entry keeps the top-level.
+        assert!(cask.variation_for(27, "arm64").is_none());
+        assert_eq!(
+            cask.variation_for(14, "arm64")
+                .and_then(|v| v.url.as_deref()),
+            Some("https://x/sonoma.zip")
+        );
+        assert!(cask.variation_for(13, "x86_64").is_none());
+        // Real API artifacts carry a computed `target` (the rename) and
+        // casks carry uninstall/zap stanzas; neither blocks parsing.
+        let real: Value = aterm_json::from_str(&format!(
+            r#"{{"token":"demo","sha256":"{}","artifacts":[{{"uninstall":[{{"quit":"com.x"}}]}},{{"font":["ttf/F.ttf"],"target":"/$HOME/Library/Fonts/F.ttf"}},{{"zap":[{{"trash":["~/Library/Caches/x"]}}]}}]}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        assert_eq!(
+            Cask::from_api(&real).unwrap().artifacts,
+            [Artifact::Font("ttf/F.ttf".into(), Some("F.ttf".into()))]
+        );
+        let kinds: Value = aterm_json::from_str(&format!(
+            r#"{{"token":"demo","sha256":"{}","artifacts":[{{"suite":["SuiteDir"]}},{{"keyboard_layout":["K.bundle"]}},{{"screen_saver":["S.saver"]}},{{"prefpane":["P.prefPane"]}},{{"service":["W.workflow"]}},{{"artifact":["tree",{{"target":"$HOMEBREW_PREFIX/share/demo/tree"}}]}},{{"binary":["$HOMEBREW_PREFIX/share/demo/tree/bin/tool"]}}]}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let wrapper: Value = aterm_json::from_str(&format!(
+            r#"{{"token":"demo","sha256":"{}","artifacts":[{{"command_wrapper":["demo",{{"executable":"$APPDIR/Demo.app/Contents/MacOS/demo","args":["--fixed"]}}],"target":"$HOMEBREW_PREFIX/bin/demo"}}]}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        assert_eq!(
+            Cask::from_api(&wrapper).unwrap().artifacts,
+            [Artifact::Wrapper(
+                "demo".into(),
+                "Demo.app/Contents/MacOS/demo".into(),
+                vec!["--fixed".to_string()],
+                Some("demo".into())
+            )]
+        );
+        assert_eq!(
+            Cask::from_api(&kinds).unwrap().artifacts,
+            [
+                Artifact::Suite("SuiteDir".into(), None),
+                Artifact::KeyboardLayout("K.bundle".into(), None),
+                Artifact::ScreenSaver("S.saver".into(), None),
+                Artifact::PrefPane("P.prefPane".into(), None),
+                Artifact::Service("W.workflow".into(), None),
+                Artifact::Generic(
+                    "tree".into(),
+                    Some("$HOMEBREW_PREFIX/share/demo/tree".into())
+                ),
+                Artifact::Binary("$HOMEBREW_PREFIX/share/demo/tree/bin/tool".into(), None),
+            ]
+        );
+        for artifact in [
+            r#"42"#,
+            r#"{"artifact":["src",{"target":"$HOMEBREW_PREFIX/lib/x"}],"target":"$HOMEBREW_PREFIX/bin/x"}"#,
+            r#"{"binary":["tool",{"chmod":"0755"}]}"#,
+            r#"{"binary":["tool",{"target":42}]}"#,
+            r#"{"binary":["tool",{"chmod":"0755","extra":true}],"target":"renamed"}"#,
+            r#"{"binary":["tool"],"target":42}"#,
+            r#"{"binary":["tool",{"target":"first"}],"target":"second"}"#,
+        ] {
+            let unsupported: Value = aterm_json::from_str(&format!(
+                r#"{{"token":"demo","sha256":"no_check","artifacts":[{artifact}]}}"#
+            ))
+            .unwrap();
+            assert!(
+                Cask::from_api(&unsupported)
+                    .unwrap()
+                    .artifacts
+                    .iter()
+                    .any(|artifact| matches!(artifact, Artifact::Other(_)))
+            );
+        }
+        // Full Generic destinations compare after the same mapping used by
+        // installation; rename-only artifacts keep their basename convention.
+        let equivalent: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","artifacts":[{"artifact":["src",{"target":"$HOMEBREW_PREFIX/Library/Services/x"}],"target":"/$HOME/Library/Services/x"},{"binary":["tool",{"target":"x"}],"target":"$HOMEBREW_PREFIX/bin/x"}]}"#).unwrap();
+        assert_eq!(
+            Cask::from_api(&equivalent).unwrap().artifacts,
+            [
+                Artifact::Generic(
+                    "src".to_string(),
+                    Some("/$HOME/Library/Services/x".to_string())
+                ),
+                Artifact::Binary("tool".to_string(), Some("x".to_string())),
+            ]
+        );
+        // R5 keeps unsupported variation work local to the selected system.
+        let per_system: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","artifacts":[{"app":["Demo.app"]}],"variations":{"arm64_tahoe":{"unknown_recipe":true}}}"#).unwrap();
+        let per_system = Cask::from_api(&per_system).unwrap();
+        assert!(!per_system.unsupported_constraints);
+        assert!(per_system.variation_for(27, "arm64").is_none());
+        assert!(per_system.variation_for(26, "arm64").unwrap().unsupported);
+        let naked: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","container":{"type":"naked"},"artifacts":[{"binary":["tool"]}]}"#).unwrap();
+        let naked = Cask::from_api(&naked).unwrap();
+        assert!(naked.naked && !naked.unsupported_constraints);
+        assert_eq!(
+            naked.artifacts,
+            [Artifact::Binary("tool".to_string(), None)]
+        );
+        for container in [
+            r#"{"type":"naked","nested":"archive"}"#,
+            r#"{"type":"naked","custom":true}"#,
+        ] {
+            let rich: Value = aterm_json::from_str(&format!(r#"{{"token":"demo","sha256":"no_check","container":{container},"artifacts":[{{"binary":["tool"]}}]}}"#)).unwrap();
+            let rich = Cask::from_api(&rich).unwrap();
+            assert!(!rich.naked && rich.unsupported_constraints);
+            assert!(
+                rich.artifacts
+                    .iter()
+                    .any(|artifact| matches!(artifact, Artifact::Other(_)))
+            );
         }
         let waived: Value =
             aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","artifacts":[]}"#).unwrap();

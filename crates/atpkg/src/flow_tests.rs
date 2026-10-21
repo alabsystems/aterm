@@ -577,16 +577,11 @@ fn an_install_under_an_open_umask_leaves_nothing_others_can_write() {
 /// `--progress-file` pass. The hooks in `install_inner` must carry the row
 /// through the honest phase sequence and record the pinned build; the terminal
 /// snapshot must read "ended" (pid cleared), never a live-looking lie.
-///
-/// The ONE test in this binary that touches the process-global sink (every other
-/// path runs with it disabled, which is also what keeps this isolated).
 #[test]
 fn install_phases_land_in_the_progress_file() {
-    // The process-global sink has a thread owner; every test that begins a
-    // pass serializes on the shared gate (see progress.rs).
-    let _gate = crate::progress::PASS_TEST_GATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    // A process runs one pass at a time; this test's is its own, beside the
+    // others' (`progress::own_pass_slot`).
+    let _slot = crate::progress::own_pass_slot();
     let dir = scratch("phases");
     let fake = fixture(&dir);
     let layout = layout(&dir);
@@ -3174,12 +3169,19 @@ fn rollback_index_per_program(floor_ay: u64) -> Fake {
 /// channel must decide at least 24 of its 72 cases.
 #[test]
 fn the_removed_member_hold_is_exhaustively_safe() {
-    for (cname, make) in [
+    let channels = [
         ("clean", group_fixture as fn(&Path) -> Fake),
         ("yank-installed", group_fixture_yanking_ay17),
         ("yank-pin", group_fixture_yanking_ay18),
-    ] {
-        let checked = removed_member_hold_cases(cname, make);
+    ];
+    let decided = std::thread::scope(|s| {
+        let runs: Vec<_> = channels
+            .map(|(cname, make)| s.spawn(move || removed_member_hold_cases(cname, make)))
+            .into_iter()
+            .collect();
+        runs.into_iter().map(joined).collect::<Vec<_>>()
+    });
+    for ((cname, _), checked) in channels.iter().zip(decided) {
         assert!(
             checked >= 24,
             "{cname}: the enumeration ran only {checked} cases"
@@ -3190,206 +3192,237 @@ fn the_removed_member_hold_is_exhaustively_safe() {
 /// Every case of the removed-member hold on ONE channel; returns how many cases
 /// reached a report (a resolve/verify failure is not this predicate's business).
 fn removed_member_hold_cases(cname: &str, make: fn(&Path) -> Fake) -> usize {
-    #[derive(Clone, Copy, Debug)]
-    enum Ay {
-        Absent,
-        Safe,
-        Revoked,
-    }
     let fixture_dir = scratch(&format!("hold-fixture-{cname}"));
     let fake = make(&fixture_dir);
+    // The three `ay` states run side by side (as the three channels do), each over 24
+    // stores of its own: a case shares nothing with another but the read-only fixture.
+    // A case is a few hundred directory, link and rename calls; on a volume busy with
+    // other flushes each call waits its turn, and 216 cases in one sequence waited a
+    // minute where nine lanes of 24 wait seconds.
+    let checked = std::thread::scope(|s| {
+        let lanes: Vec<_> = [Ay::Absent, Ay::Safe, Ay::Revoked]
+            .into_iter()
+            .map(|ay| {
+                let fake = &fake;
+                std::thread::Builder::new()
+                    .name(format!("hold-{cname}-{ay:?}"))
+                    .spawn_scoped(s, move || removed_member_hold_lane(cname, fake, ay))
+                    .expect("spawn a hold lane")
+            })
+            .collect();
+        lanes.into_iter().map(joined).sum::<usize>()
+    });
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    eprintln!("removed-member hold, channel {cname}: {checked} of 72 cases decided");
+    checked
+}
+
+/// What `ay` is in the store before the pass: absent, at the pin (18), or at the build
+/// the `yank-installed` channel revokes (17).
+#[derive(Clone, Copy, Debug)]
+enum Ay {
+    Absent,
+    Safe,
+    Revoked,
+}
+
+/// A scoped lane's result, its panic re-raised as the test's own failure.
+fn joined<T>(lane: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    lane.join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// The 24 cases of [`removed_member_hold_cases`] with `ay` in one state.
+fn removed_member_hold_lane(cname: &str, fake: &Fake, ay: Ay) -> usize {
+    let lane = scratch(&format!("hold-{cname}-{ay:?}"));
     let mut checked = 0;
-    for ay in [Ay::Absent, Ay::Safe, Ay::Revoked] {
-        for trust_installed in [false, true] {
-            for removed in [&[][..], &["ay"][..], &["trust"][..], &["ay", "trust"][..]] {
-                // `[packages].exclude` rides the same deliberately-absent
-                // predicate as the removal record, so it gets the same
-                // exhaustive treatment — including the case where both
-                // name the same member, and where an exclusion names a
-                // PRESENT member (which must change nothing: exclude is
-                // "do not pull in", never "drop what is here").
-                for excluded in [&[][..], &["ay"][..], &["trust"][..]] {
-                    let excluded: Vec<String> = excluded.iter().map(|s| s.to_string()).collect();
-                    let label = format!(
-                        "{cname}-{ay:?}-t{trust_installed}-r{}-x{}",
-                        removed.len(),
-                        excluded.len()
-                    );
-                    let dir = scratch(&format!("hold-{label}"));
-                    let layout = layout(&dir);
-                    let mut installed = std::collections::BTreeMap::new();
-                    match ay {
-                        Ay::Absent => {}
-                        Ay::Safe => {
-                            seed_build(&layout, "ay", 18, true);
-                            installed.insert("ay".to_string(), 18u64);
-                        }
-                        Ay::Revoked => {
-                            seed_build(&layout, "ay", 17, true);
-                            installed.insert("ay".to_string(), 17u64);
-                        }
+    for trust_installed in [false, true] {
+        for removed in [&[][..], &["ay"][..], &["trust"][..], &["ay", "trust"][..]] {
+            // `[packages].exclude` rides the same deliberately-absent
+            // predicate as the removal record, so it gets the same
+            // exhaustive treatment — including the case where both
+            // name the same member, and where an exclusion names a
+            // PRESENT member (which must change nothing: exclude is
+            // "do not pull in", never "drop what is here").
+            for excluded in [&[][..], &["ay"][..], &["trust"][..]] {
+                let excluded: Vec<String> = excluded.iter().map(|s| s.to_string()).collect();
+                let label = format!(
+                    "{cname}-{ay:?}-t{trust_installed}-r[{}]-x[{}]",
+                    removed.join(","),
+                    excluded.join(",")
+                );
+                let dir = crate::testdir::dir_in(&lane, "case-");
+                let layout = layout(&dir);
+                let mut installed = std::collections::BTreeMap::new();
+                match ay {
+                    Ay::Absent => {}
+                    Ay::Safe => {
+                        seed_build(&layout, "ay", 18, true);
+                        installed.insert("ay".to_string(), 18u64);
                     }
-                    if trust_installed {
-                        seed_build(&layout, "trust", 4821, true);
-                        installed.insert("trust".to_string(), 4821u64);
+                    Ay::Revoked => {
+                        seed_build(&layout, "ay", 17, true);
+                        installed.insert("ay".to_string(), 17u64);
                     }
-                    if !removed.is_empty() {
-                        // The prefix exists only once something has been seeded, and
-                        // the absent/absent cases seed nothing.
-                        std::fs::create_dir_all(&layout.prefix).unwrap();
-                        std::fs::write(layout.removed(), removed.join("\n")).unwrap();
-                    }
-
-                    let report = apply_channel(
-                        &fake,
-                        &layout,
-                        &anchor(),
-                        "stable",
-                        TRIPLE,
-                        &installed,
-                        &excluded,
-                        fl(0),
-                        0,
-                    );
-                    let Ok(report) = report else {
-                        // A resolve/verify failure is not this predicate's business.
-                        continue;
-                    };
-                    checked += 1;
-                    let after = crate::ops::active_builds(&layout);
-
-                    // I1: a recorded-removed, ABSENT member is never installed.
-                    for program in removed {
-                        let was_absent = !installed.contains_key(*program);
-                        if was_absent {
-                            assert!(
-                                !after.contains_key(*program),
-                                "{label}: {program} was deleted on purpose and came back"
-                            );
-                        }
-                    }
-
-                    // I1x: an EXCLUDED, absent member is never pulled in — the
-                    // promise `uninstall` makes when it names `[packages].exclude`
-                    // as the way to drop one program and stay adopted (the
-                    // coherence pull-in would reinstall it, multi-GB, unannounced).
-                    for program in &excluded {
-                        if !installed.contains_key(program) {
-                            assert!(
-                                !after.contains_key(program),
-                                "{label}: excluded {program} was pulled back in"
-                            );
-                        }
-                    }
-
-                    // I1x-present: an exclusion naming a PRESENT member is not
-                    // license to drop or freeze it — asserted where the channel
-                    // gives survival a right answer. In `clean` nothing
-                    // legitimately kills a present member; in `yank-installed`
-                    // the excluded-but-present member must still UPGRADE to the
-                    // valid pin (exclusion never freezes). `yank-pin` proves
-                    // nothing here: it tombstones ay@18 with or without the
-                    // exclusion, and this invariant's first draft asserting
-                    // survival there was refuted by its own enumeration.
-                    if cname == "clean" {
-                        for program in &excluded {
-                            if installed.contains_key(program) {
-                                assert!(
-                                    after.contains_key(program),
-                                    "{label}: excluding present {program} dropped it"
-                                );
-                            }
-                        }
-                    }
-                    if cname == "yank-installed"
-                        && matches!(ay, Ay::Revoked)
-                        && excluded.iter().any(|p| p == "ay")
-                    {
-                        assert_eq!(
-                            after.get("ay").copied(),
-                            Some(18),
-                            "{label}: excluding present ay froze its upgrade"
-                        );
-                    }
-
-                    // I2: a revoked installed build is never left runnable.
-                    if matches!(ay, Ay::Revoked) && cname != "clean" {
-                        let live = after.get("ay").copied();
-                        let runnable = crate::ops::which(&layout, "ay").is_some();
-                        let safe = live.is_some_and(|b| b == 18);
-                        assert!(
-                            safe || !runnable,
-                            "{label}: revoked ay is still runnable at {live:?}"
-                        );
-                    }
-
-                    // I4: A MEMBER WITH A VALID REPLACEMENT IS NEVER LEFT DEAD.
-                    // I2 alone calls tombstoning "safe", and it is — but it is the
-                    // WRONG safe answer when the channel is offering a fix, and
-                    // that is exactly the shape that shipped: a routine yank
-                    // disabled a program that had a working upgrade waiting, and
-                    // the corpse then vanished from `active_builds` so no later
-                    // pass could see or repair it. An invariant set that only asks
-                    // "is anything unsafe running" cannot see this; it has to ask
-                    // "did anything that should live, die".
-                    if cname == "yank-installed"
-                        && matches!(ay, Ay::Revoked)
-                        && !(removed.contains(&"ay") && !installed.contains_key("ay"))
-                    {
-                        assert!(
-                            crate::ops::which(&layout, "ay").is_some(),
-                            "{label}: ay had a valid pin (18) and was killed instead \
-                         of upgraded"
-                        );
-                    }
-
-                    // I5: THE ORDINARY TICK STILL MOVES. The case this predicate
-                    // meets on almost every run is "nothing is revoked", and freezing
-                    // the members that ARE here — silently, forever — costs a lab
-                    // machine its updates: a publisher usually ships a fix as a NEW
-                    // PIN without yanking the old build.
-                    if cname == "clean" && matches!(ay, Ay::Safe) {
-                        // ay@18 is already the pin, so the assertion that matters is
-                        // that the pass did not DROP it while excluding a sibling.
-                        assert_eq!(
-                            after.get("ay").copied(),
-                            Some(18),
-                            "{label}: a present member was lost while holding for an \
-                         absent one"
-                        );
-                    }
-
-                    // I6: THE HOLD ONLY FIRES ON A REAL ABSENCE. A stale record for
-                    // a member that a signed `requires` pull-in has since
-                    // reinstalled must not hold anything: it is present, and the
-                    // promise the record encodes ("do not put it back") is already
-                    // kept.
-                    let stale_only =
-                        !removed.is_empty() && removed.iter().all(|m| installed.contains_key(*m));
-                    if stale_only && cname == "yank-installed" && matches!(ay, Ay::Revoked) {
-                        assert!(
-                            !crate::ops::which(&layout, "ay").is_some()
-                                || after.get("ay").copied() == Some(18),
-                            "{label}: a stale removal record froze a healthy tuple"
-                        );
-                    }
-
-                    // I3: never "up to date" over a revocation.
-                    if matches!(ay, Ay::Revoked) && cname != "clean" {
-                        for (_, outcome) in &report.groups {
-                            assert!(
-                                !matches!(outcome, TxnOutcome::UpToDate),
-                                "{label}: reported UpToDate over a revoked build"
-                            );
-                        }
-                    }
-                    let _ = std::fs::remove_dir_all(&dir);
                 }
+                if trust_installed {
+                    seed_build(&layout, "trust", 4821, true);
+                    installed.insert("trust".to_string(), 4821u64);
+                }
+                if !removed.is_empty() {
+                    // The prefix exists only once something has been seeded, and
+                    // the absent/absent cases seed nothing.
+                    std::fs::create_dir_all(&layout.prefix).unwrap();
+                    std::fs::write(layout.removed(), removed.join("\n")).unwrap();
+                }
+
+                let report = apply_channel(
+                    fake,
+                    &layout,
+                    &anchor(),
+                    "stable",
+                    TRIPLE,
+                    &installed,
+                    &excluded,
+                    fl(0),
+                    0,
+                );
+                let Ok(report) = report else {
+                    // A resolve/verify failure is not this predicate's business.
+                    continue;
+                };
+                checked += 1;
+                let after = crate::ops::active_builds(&layout);
+
+                // I1: a recorded-removed, ABSENT member is never installed.
+                for program in removed {
+                    let was_absent = !installed.contains_key(*program);
+                    if was_absent {
+                        assert!(
+                            !after.contains_key(*program),
+                            "{label}: {program} was deleted on purpose and came back"
+                        );
+                    }
+                }
+
+                // I1x: an EXCLUDED, absent member is never pulled in — the
+                // promise `uninstall` makes when it names `[packages].exclude`
+                // as the way to drop one program and stay adopted (the
+                // coherence pull-in would reinstall it, multi-GB, unannounced).
+                for program in &excluded {
+                    if !installed.contains_key(program) {
+                        assert!(
+                            !after.contains_key(program),
+                            "{label}: excluded {program} was pulled back in"
+                        );
+                    }
+                }
+
+                // I1x-present: an exclusion naming a PRESENT member is not
+                // license to drop or freeze it — asserted where the channel
+                // gives survival a right answer. In `clean` nothing
+                // legitimately kills a present member; in `yank-installed`
+                // the excluded-but-present member must still UPGRADE to the
+                // valid pin (exclusion never freezes). `yank-pin` proves
+                // nothing here: it tombstones ay@18 with or without the
+                // exclusion, and this invariant's first draft asserting
+                // survival there was refuted by its own enumeration.
+                if cname == "clean" {
+                    for program in &excluded {
+                        if installed.contains_key(program) {
+                            assert!(
+                                after.contains_key(program),
+                                "{label}: excluding present {program} dropped it"
+                            );
+                        }
+                    }
+                }
+                if cname == "yank-installed"
+                    && matches!(ay, Ay::Revoked)
+                    && excluded.iter().any(|p| p == "ay")
+                {
+                    assert_eq!(
+                        after.get("ay").copied(),
+                        Some(18),
+                        "{label}: excluding present ay froze its upgrade"
+                    );
+                }
+
+                // I2: a revoked installed build is never left runnable.
+                if matches!(ay, Ay::Revoked) && cname != "clean" {
+                    let live = after.get("ay").copied();
+                    let runnable = crate::ops::which(&layout, "ay").is_some();
+                    let safe = live.is_some_and(|b| b == 18);
+                    assert!(
+                        safe || !runnable,
+                        "{label}: revoked ay is still runnable at {live:?}"
+                    );
+                }
+
+                // I4: A MEMBER WITH A VALID REPLACEMENT IS NEVER LEFT DEAD.
+                // I2 alone calls tombstoning "safe", and it is — but it is the
+                // WRONG safe answer when the channel is offering a fix, and
+                // that is exactly the shape that shipped: a routine yank
+                // disabled a program that had a working upgrade waiting, and
+                // the corpse then vanished from `active_builds` so no later
+                // pass could see or repair it. An invariant set that only asks
+                // "is anything unsafe running" cannot see this; it has to ask
+                // "did anything that should live, die".
+                if cname == "yank-installed"
+                    && matches!(ay, Ay::Revoked)
+                    && !(removed.contains(&"ay") && !installed.contains_key("ay"))
+                {
+                    assert!(
+                        crate::ops::which(&layout, "ay").is_some(),
+                        "{label}: ay had a valid pin (18) and was killed instead \
+                         of upgraded"
+                    );
+                }
+
+                // I5: THE ORDINARY TICK STILL MOVES. The case this predicate
+                // meets on almost every run is "nothing is revoked", and freezing
+                // the members that ARE here — silently, forever — costs a lab
+                // machine its updates: a publisher usually ships a fix as a NEW
+                // PIN without yanking the old build.
+                if cname == "clean" && matches!(ay, Ay::Safe) {
+                    // ay@18 is already the pin, so the assertion that matters is
+                    // that the pass did not DROP it while excluding a sibling.
+                    assert_eq!(
+                        after.get("ay").copied(),
+                        Some(18),
+                        "{label}: a present member was lost while holding for an \
+                         absent one"
+                    );
+                }
+
+                // I6: THE HOLD ONLY FIRES ON A REAL ABSENCE. A stale record for
+                // a member that a signed `requires` pull-in has since
+                // reinstalled must not hold anything: it is present, and the
+                // promise the record encodes ("do not put it back") is already
+                // kept.
+                let stale_only =
+                    !removed.is_empty() && removed.iter().all(|m| installed.contains_key(*m));
+                if stale_only && cname == "yank-installed" && matches!(ay, Ay::Revoked) {
+                    assert!(
+                        !crate::ops::which(&layout, "ay").is_some()
+                            || after.get("ay").copied() == Some(18),
+                        "{label}: a stale removal record froze a healthy tuple"
+                    );
+                }
+
+                // I3: never "up to date" over a revocation.
+                if matches!(ay, Ay::Revoked) && cname != "clean" {
+                    for (_, outcome) in &report.groups {
+                        assert!(
+                            !matches!(outcome, TxnOutcome::UpToDate),
+                            "{label}: reported UpToDate over a revoked build"
+                        );
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&dir);
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&fixture_dir);
-    eprintln!("removed-member hold, channel {cname}: {checked} of 72 cases decided");
     checked
 }
 
@@ -6326,9 +6359,7 @@ fn a_claim_for_another_build_takes_nothing_and_that_download_never_starts() {
 // for the pass", never a download stuck short of its end (the `.part` poller's last look).
 #[test]
 fn a_download_the_lane_finished_waits_on_its_row_at_its_whole_size() {
-    let _gate = crate::progress::PASS_TEST_GATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _slot = crate::progress::own_pass_slot();
     let dir = scratch("ahead-row");
     let rec = Recorder::new(ahead_release(&dir, &[("sa", 1, 100)], &[]), &[]);
     let layout = layout(&dir);

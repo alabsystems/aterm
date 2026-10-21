@@ -92,7 +92,10 @@ impl Session {
             &mut glow,
             &mut trail,
             THEME_CURSOR,
-            knobs.color.is_some(),
+            false,
+            knobs
+                .color
+                .map_or(TrailColor::Automatic, TrailColor::Pinned),
             knobs.accent.is_some(),
         );
         Self {
@@ -109,6 +112,15 @@ impl Session {
     fn frame(&mut self, ms: u64, cur: (u16, u16), hash: &mut impl Hasher) {
         let now = self.t0 + std::time::Duration::from_millis(ms);
         self.fx.begin(true, true);
+        // As both hosts do every frame: the caret's row probed (blank, the
+        // script types no glyphs of its own) with its neighbours, so a light
+        // laid by the rows around the caret (a rail in the leading under it)
+        // is judged as a host would see it.
+        let blank = vec![' '; geom().cols];
+        self.fx.glow.observe_row(cur.0, cur.1, &blank, now);
+        self.fx
+            .glow
+            .observe_neighbor_rows(Some(&blank), Some(&blank));
         let frame = self.fx.tick(
             &CursorFxInput {
                 now,
@@ -121,7 +133,8 @@ impl Session {
                 default_bg: self.ground.1,
                 geom: geom(),
                 focused: true,
-                amplitude: 1.0,
+                cursor_cell_bg: None,
+                trail_brightness: 1.0,
                 shed_envelope: 1.0,
                 body_allowed: true,
                 momentum_glow: false,
@@ -240,18 +253,30 @@ fn the_knob_law_is_what_the_frame_reads() {
         let style = GlowSpelling::parse(raw).style.expect("a built-in style");
         for ground in [DARK, LIGHT] {
             for bar in [false, true] {
+                // A session is a function of its knobs: each distinct set runs
+                // once (a turn's "off" is often another turn's, or the base).
+                let mut scripted: Vec<(String, u64)> = Vec::new();
+                let mut session = |k: GlowKnobs| {
+                    let key = format!("{k:?}");
+                    if let Some(&(_, hash)) = scripted.iter().find(|(seen, _)| *seen == key) {
+                        return hash;
+                    }
+                    let hash = Session::new(raw, k, bar, ground).script();
+                    scripted.push((key, hash));
+                    hash
+                };
                 for ring in [true, false] {
                     for (knob, turn) in turns {
                         if knob == TrailKnob::Ring && !ring {
                             continue;
                         }
-                        let session = |on: bool| {
+                        let turned = |on: bool| {
                             let mut k = knobs();
                             k.ring = ring;
                             turn(&mut k, on);
-                            Session::new(raw, k, bar, ground).script()
+                            k
                         };
-                        let shows = session(true) != session(false);
+                        let shows = session(turned(true)) != session(turned(false));
                         let ctx = KnobContext {
                             dark: ground == DARK,
                             bar,
@@ -380,8 +405,8 @@ fn ink_mass(under: &[aterm_render::GlowQuad], x0: u16, x1: u16) -> f32 {
 /// least three quarters of the beam's ink behind the caret (it was about a
 /// third: a tail that tapered twice and a head dropped), and at rest it
 /// keeps a round head of ink past both edges of its block, as the dark coma
-/// is always there. Negative control: the beam's block has no round head
-/// (its aura hugs the block, full height to its edge).
+/// is always there. Negative control: the beam's emitter block lays no ink
+/// beside it on paper.
 #[test]
 fn the_light_comet_carries_a_body_and_a_round_head() {
     let g = geom();
@@ -436,8 +461,8 @@ fn the_light_comet_carries_a_body_and_a_round_head() {
     }
     let beam = rest("beam");
     let beam_edge = column_height(&beam, past(1));
-    assert!(
-        beam_edge == 0 || beam_edge >= g.ch as u16 - 1,
-        "the beam's aura hugs its block square, never a round head: {beam_edge}"
+    assert_eq!(
+        beam_edge, 0,
+        "control: the beam's block lays no head of ink beside it"
     );
 }

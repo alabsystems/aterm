@@ -25,6 +25,10 @@ use aterm_render::Theme;
 pub(crate) struct AppearancePreferences {
     pub(crate) high_contrast: bool,
     pub(crate) reduced_transparency: bool,
+    /// System Settings ▸ Accessibility ▸ Display ▸ Differentiate without
+    /// colour: the stats bars give falling a shape as well as a colour
+    /// (`crate::stats_paint`).
+    pub(crate) differentiate_without_color: bool,
     /// Native-app text scale, independent of terminal-cell zoom.
     pub(crate) text_scale: f32,
 }
@@ -34,6 +38,7 @@ impl Default for AppearancePreferences {
         Self {
             high_contrast: false,
             reduced_transparency: false,
+            differentiate_without_color: false,
             text_scale: 1.0,
         }
     }
@@ -43,6 +48,8 @@ impl Default for AppearancePreferences {
 const HIGH_CONTRAST: u8 = 1 << 0;
 #[cfg(not(test))]
 const REDUCED_TRANSPARENCY: u8 = 1 << 1;
+#[cfg(not(test))]
+const DIFFERENTIATE_WITHOUT_COLOR: u8 = 1 << 2;
 #[cfg(not(test))]
 static ACCESSIBILITY_FLAGS: AtomicU8 = AtomicU8::new(0);
 #[cfg(not(test))]
@@ -211,6 +218,7 @@ thread_local! {
         Cell::new(AppearancePreferences {
             high_contrast: false,
             reduced_transparency: false,
+            differentiate_without_color: false,
             text_scale: 1.0,
         })
     };
@@ -234,7 +242,8 @@ pub(crate) fn install_preferences(mut preferences: AppearancePreferences) -> boo
         #[cfg(not(test))]
         {
             let flags = (u8::from(preferences.high_contrast) * HIGH_CONTRAST)
-                | (u8::from(preferences.reduced_transparency) * REDUCED_TRANSPARENCY);
+                | (u8::from(preferences.reduced_transparency) * REDUCED_TRANSPARENCY)
+                | (u8::from(preferences.differentiate_without_color) * DIFFERENTIATE_WITHOUT_COLOR);
             let old_flags = ACCESSIBILITY_FLAGS.swap(flags, Ordering::AcqRel);
             let old_scale =
                 TEXT_SCALE_BITS.swap(preferences.text_scale.to_bits(), Ordering::AcqRel);
@@ -262,6 +271,7 @@ pub(crate) fn current_preferences() -> AppearancePreferences {
         AppearancePreferences {
             high_contrast: flags & HIGH_CONTRAST != 0,
             reduced_transparency: flags & REDUCED_TRANSPARENCY != 0,
+            differentiate_without_color: flags & DIFFERENTIATE_WITHOUT_COLOR != 0,
             text_scale: f32::from_bits(TEXT_SCALE_BITS.load(Ordering::Acquire)),
         }
         .normalized()
@@ -377,6 +387,7 @@ impl AppearancePreferences {
         Self {
             high_contrast: self.high_contrast,
             reduced_transparency: self.reduced_transparency,
+            differentiate_without_color: self.differentiate_without_color,
             text_scale: if self.text_scale.is_finite() && self.text_scale > 0.0 {
                 self.text_scale.clamp(0.85, 2.0)
             } else {
@@ -1045,6 +1056,7 @@ mod tests {
             high_contrast: !previous.high_contrast,
             reduced_transparency: !previous.reduced_transparency,
             text_scale: 1.25,
+            differentiate_without_color: previous.differentiate_without_color,
         };
         // The attach reads first and takes the edge.
         assert!(install_preferences(moved), "off → on is a change");
@@ -1063,6 +1075,28 @@ mod tests {
         );
 
         install_preferences(previous);
+        let _ = take_chrome_inputs_moved();
+    }
+
+    /// Differentiate Without Color is a paint input of its own: turning it on
+    /// moves the chrome (the stats bars add shapes beside their hues) and
+    /// reads back; turning it off again moves it back.
+    #[test]
+    fn differentiate_without_color_is_a_paint_input() {
+        let previous = current_preferences();
+        let _ = take_chrome_inputs_moved();
+        let on = AppearancePreferences {
+            differentiate_without_color: !previous.differentiate_without_color,
+            ..previous
+        };
+        assert!(install_preferences(on), "the setting moved the chrome");
+        assert_eq!(
+            current_preferences().differentiate_without_color,
+            on.differentiate_without_color
+        );
+        assert!(take_chrome_inputs_moved());
+        assert!(install_preferences(previous), "and back");
+        assert_eq!(current_preferences(), previous);
         let _ = take_chrome_inputs_moved();
     }
 
@@ -1156,6 +1190,22 @@ mod tests {
             contrast_ratio(r.on_accent, r.accent) >= 4.5,
             "{what}: ink on an accent fill"
         );
+        // The accent as small text (`accent_ink`): body-text contrast on every
+        // ground it is printed on, the pressed wash included.
+        for (ground, rgb) in [
+            ("surface", r.surface),
+            ("elevated", r.elevated),
+            (
+                "pressed wash",
+                mix_srgb(r.elevated, r.accent, ACCENT_WASH_PRESSED),
+            ),
+        ] {
+            let ratio = contrast_ratio(r.accent_ink, rgb);
+            assert!(
+                ratio >= 4.5,
+                "{what}: accent as small text on {ground} is {ratio:.2}:1"
+            );
+        }
         for (on, backdrop) in [("card", r.elevated), ("page", r.surface)] {
             let ratio = contrast_ratio(r.control_edge, backdrop);
             assert!(

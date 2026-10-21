@@ -29,6 +29,20 @@ fn every_layer() -> Vec<Vec<&'static str>> {
     layers
 }
 
+/// Every SET of faces a person can switch on — each single face and each 2-
+/// and 3-face mix once, in registry order. The layer is a function of the
+/// set: [`Renderer::set_display_faces`] keeps only [`display_layer_ids`] of
+/// what it is given, which sorts into registry order, so another order of the
+/// same faces is the same renderer, not another case
+/// (`the_order_faces_were_switched_on_in_changes_nothing` holds the order).
+fn every_set() -> Vec<Vec<&'static str>> {
+    let rank = |id: &&str| DISPLAY_FACES.iter().position(|face| face.id == *id);
+    every_layer()
+        .into_iter()
+        .filter(|ids| ids.is_sorted_by_key(rank))
+        .collect()
+}
+
 /// The primaries the layer is drawn over: the embedded DejaVu Sans Mono and
 /// the bundled Iosevka Term, whose cells differ (Iosevka's is narrower and
 /// shorter), so a fit that only works in one cell fails here.
@@ -61,13 +75,16 @@ fn layered(primary: &[u8], ids: &[&str], px: f32) -> Renderer {
 /// first face of a mix the primary, which gave each face its own `M` cell
 /// (Engraved 11 px wide against SF Mono's 7, a third of the columns gone) and
 /// made "engraved+pixel" and "pixel+engraved" two different grids.
+///
+/// Every set, over both primaries and three sizes; the order a set was
+/// switched on in is held by `the_order_faces_were_switched_on_in_changes_nothing`.
 #[test]
 fn a_display_face_never_changes_the_grid() {
     for (name, primary) in primaries() {
         for px in [12.0_f32, 16.0, 24.0] {
             let bare = Renderer::from_bytes(primary, px, Theme::default()).unwrap();
             let want = (bare.cell_size(), bare.baseline());
-            for ids in every_layer() {
+            for ids in every_set() {
                 let renderer = layered(primary, &ids, px);
                 assert_eq!(
                     (renderer.cell_size(), renderer.baseline()),
@@ -80,8 +97,8 @@ fn a_display_face_never_changes_the_grid() {
 }
 
 /// One set of faces draws ONE way: the layer is kept in registry order, so
-/// the order the switches were turned on in changes neither which face a
-/// letter takes nor the glyph it draws.
+/// the order the switches were turned on in changes neither the grid, nor
+/// which face a letter takes, nor the glyph it draws.
 #[test]
 fn the_order_faces_were_switched_on_in_changes_nothing() {
     let (_, primary) = primaries()[0];
@@ -92,6 +109,11 @@ fn the_order_faces_were_switched_on_in_changes_nothing() {
         let mut canonical = layered(primary, &sorted, 16.0);
         assert_eq!(written.display_faces(), sorted, "{ids:?}");
         assert_eq!(display_layer_ids(ids.iter().copied()), sorted);
+        assert_eq!(
+            (written.cell_size(), written.baseline()),
+            (canonical.cell_size(), canonical.baseline()),
+            "{ids:?}: the grid"
+        );
         for ch in '!'..='~' {
             let (a, b) = (written.glyph_key(ch), canonical.glyph_key(ch));
             assert_eq!(a, b, "{ids:?}: {ch:?} routes alike");
@@ -114,16 +136,28 @@ fn the_order_faces_were_switched_on_in_changes_nothing() {
 /// deleted the rows past the cell, so chunky+pixel+engraved read "CARGO.IOmL"
 /// (the T's crossbar gone) and "BULD".
 ///
-/// Every layer, over two primaries, across sizes and two line heights, for
-/// printable ASCII and accented capitals the ASCII measure does not cover.
+/// Every set of faces, over two primaries, across sizes and two line heights,
+/// for printable ASCII and accented capitals the ASCII measure does not cover.
 #[test]
 fn every_display_glyph_is_drawn_whole_inside_its_cell() {
+    // Each face's fit, once: a pure function of the registry's bytes (it
+    // parses the whole face, so asking it per glyph was most of this test).
+    let fits: std::collections::HashMap<&str, _> = DISPLAY_FACES
+        .iter()
+        .map(|face| {
+            let bytes = display_face_bytes(face.id).unwrap();
+            (face.id, (bytes, display_face_fit(bytes).unwrap()))
+        })
+        .collect();
     let mut owners = std::collections::HashMap::new();
     let mut own_rows = std::collections::HashMap::new();
     for (name, primary) in primaries() {
+        // Live for the loop, so every renderer below shares its parsed face
+        // (the store is weak), as the panes of one window do.
+        let _shared = Renderer::from_bytes(primary, 16.0, Theme::default()).unwrap();
         for line_height in [1.0_f32, 0.8] {
             for px in [12.0_f32, 14.0, 20.0, 48.0] {
-                for ids in every_layer() {
+                for ids in every_set() {
                     let mut renderer = layered(primary, &ids, px);
                     renderer.set_line_height(line_height);
                     let (cell_w, cell_h) = renderer.cell_size();
@@ -162,8 +196,7 @@ fn every_display_glyph_is_drawn_whole_inside_its_cell() {
                             .copied()
                             .find(|id| renderer_face_of(&renderer, ch) == *id)
                             .expect("the drawing face is in the layer");
-                        let bytes = display_face_bytes(id).unwrap();
-                        let fit = display_face_fit(bytes).unwrap();
+                        let (bytes, fit) = fits[id];
                         let scale = display_face_scale(&fit, px, cell_w, cell_h);
                         // The face's own raster at that size, by the same
                         // rasterizer: the face drawn as a primary.
@@ -382,7 +415,7 @@ fn the_chrome_face_is_the_primary_under_a_display_layer() {
 fn a_display_cell_is_never_ligated_by_the_primary() {
     let Some(iosevka) = aterm_render::bundled::face_for_id(aterm_render::bundled::IOSEVKA_ID)
     else {
-        return;
+        aterm_spec::host::could_not_run("this build bundles no Iosevka Term (embedded-font off)");
     };
     let text = "a => b";
     let mut terminal = aterm_core::terminal::Terminal::new(1, text.len() as u16);

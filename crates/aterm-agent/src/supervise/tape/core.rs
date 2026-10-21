@@ -65,7 +65,7 @@ use super::codec::{self, CodecError, End, Item, Mark, Stamp};
 use super::frame::{Hint, TapeWriter};
 use super::header::{Roots, escape};
 use crate::supervise::CtlReply;
-use crate::supervise::policy::sleeps::SleepStamp;
+use crate::supervise::policy::sleeps::{Boot, SleepStamp};
 
 /// A note's kind: a turn-end decision's fold and reading, as `Debug`.
 pub(crate) const NOTE_TURN_END: &str = "turn_end";
@@ -232,13 +232,25 @@ impl TapeValue for Option<i64> {
 }
 
 /// The machine's count of its sleep ([`SleepStamp`]): its milliseconds and,
-/// after a space, the boot's name; nothing for none.
+/// after a space, the boot's id in the kernel's spelling ([`Boot::text`]);
+/// nothing for none.
+///
+/// A boot's text reads back through astream's reader of it ([`Boot::of`]),
+/// its case kept, so a replay writes each act's ledger row exactly as the
+/// recorded run did, whichever host recorded it: a tape recorded before the
+/// boot was read as bytes (the kernel's text as it came: Linux's lower-case,
+/// macOS's upper-case) replays the same boot and the same rows. Text that
+/// names no boot — the all-zero id a damaged answer reads as — replays as a
+/// count on no named boot, which is what this build's own probe reads that
+/// answer as live: a replay decides as the loop would now, so an act a tape
+/// recorded on that answer writes its row with no count, and the replay
+/// reports the divergence that change of behaviour is.
 impl TapeValue for Option<SleepStamp> {
     fn to_tape(&self) -> Vec<u8> {
         self.as_ref().map_or_else(Vec::new, |s| {
             let ms = u64::try_from(s.asleep.as_millis()).unwrap_or(u64::MAX);
             match &s.boot {
-                Some(boot) => format!("{ms} {boot}"),
+                Some(boot) => format!("{ms} {}", boot.text()),
                 None => ms.to_string(),
             }
             .into_bytes()
@@ -255,7 +267,7 @@ impl TapeValue for Option<SleepStamp> {
         };
         let text = std::str::from_utf8(bytes).map_err(|_| bad.clone())?;
         let (ms, boot) = match text.split_once(' ') {
-            Some((ms, boot)) => (ms, Some(boot.to_string())),
+            Some((ms, boot)) => (ms, Boot::of(boot)),
             None => (text, None),
         };
         let ms: u64 = ms.parse().map_err(|_| bad)?;

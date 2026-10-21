@@ -919,6 +919,55 @@ pub(crate) mod install_resolved_colors {
         );
     }
 
+    /// A change of the engine projection rings every session's screen
+    /// readers: a styled frame's colours resolve against it, so the hold that
+    /// installs it moves the frame, and a content subscription pushes the
+    /// reload on that ring. Negative control: an unused theme file changes no
+    /// projection and rings nobody.
+    #[test]
+    fn a_projection_change_rings_every_sessions_watchers() {
+        let mut app = App::headless_for_test();
+        app.push_stub_tab(crate::WindowId(0), crate::stub_session(1));
+        app.config = aterm_toml::from_str("theme = \"Mine\"\n").expect("valid toml");
+        let mine = ColorScheme {
+            background: Rgb::new(0x10, 0x20, 0x30),
+            ..ColorScheme::default()
+        };
+        app.reload_theme_catalog(ThemeCatalog::from_schemes([(
+            "Mine".to_string(),
+            mine.clone(),
+        )]));
+        let watchers: Vec<_> = app
+            .pool
+            .iter()
+            .map(|session| {
+                let mut sub = crate::session_watch::Subscription::new();
+                let _ = sub.watch_frame(&session.ctx.watchers);
+                sub
+            })
+            .collect();
+        assert_eq!(watchers.len(), 2, "two sessions");
+        let rang = || {
+            watchers
+                .iter()
+                .map(|w| w.wait(std::time::Duration::ZERO))
+                .collect::<Vec<_>>()
+        };
+
+        app.reload_theme_catalog(ThemeCatalog::from_schemes([
+            ("Mine".to_string(), mine.clone()),
+            ("Unused".to_string(), ColorScheme::default()),
+        ]));
+        assert_eq!(rang(), [false, false], "an unused theme file rings nobody");
+
+        let edited = ColorScheme {
+            background: Rgb::new(0x11, 0x20, 0x30),
+            ..mine
+        };
+        app.reload_theme_catalog(ThemeCatalog::from_schemes([("Mine".to_string(), edited)]));
+        assert_eq!(rang(), [true, true], "every session's watchers rang");
+    }
+
     /// Two themes that differ only in an ANSI slot draw the same chrome but give
     /// different image-meta fingerprints. Negative control: installing the same
     /// theme again gives the same fingerprint.

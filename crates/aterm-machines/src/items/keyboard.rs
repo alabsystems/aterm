@@ -453,7 +453,7 @@ impl Item for SeenKeyboards {
             .iter()
             .filter_map(|(m, read)| revert_line(&self.target(*m), read, None))
             .collect();
-        (!lines.is_empty()).then(|| lines.join(" ; "))
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     fn effect(&self) -> Effect {
@@ -877,7 +877,7 @@ mod tests {
             revert.contains("delete -g com.apple.keyboard.modifiermapping.1133-49299-0"),
             "{revert}"
         );
-        assert!(revert.contains(" ; "), "{revert}");
+        assert_eq!(revert.lines().count(), 2, "{revert}");
         // 9456-321 is listed in [keyboard] models, so its own item covers it.
         assert!(!sys.calls().iter().any(|c| c.contains("9456-321")));
     }

@@ -159,8 +159,10 @@ const BLOCKED: &str = "blocked scheme";
 /// against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinkHover {
-    /// The PANE-LOCAL `(row, col)` the probe read, in the VIEWPORT rows the
-    /// frame is drawn in — the cell `Terminal::hyperlink_at_visible` addresses.
+    /// The PANE-LOCAL `(row, col)` the pointer is on, in the VIEWPORT rows the
+    /// frame is drawn in: the PAINTED cell. The probe reads the logical cell
+    /// under it (`app_mouse::pointer_cell`: a doubled line's halving, then the
+    /// BiDi permutation), the one `Terminal::hyperlink_at_visible` addresses.
     /// Re-read, not remembered as a URL.
     pub(crate) cell: (u16, u16),
     /// WINDOW terminal row of that cell. The placement may not cover it (a

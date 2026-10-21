@@ -566,8 +566,13 @@ pub fn uninstall(
             revert: None,
             effect: Effect::Now,
             detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside: None,
+            essential: false,
         };
-        let _ = aterm_json::to_string(&Line::Item(row.clone()))
+        let _ = aterm_json::to_string(&Line::Item(Box::new(row.clone())))
             .map(|l| writeln!(out, "{l}").and_then(|()| out.flush()));
         rows.push(row);
     };

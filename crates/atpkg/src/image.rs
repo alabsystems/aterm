@@ -35,10 +35,17 @@
 //!   and it names no build.
 //!
 //! [`image_build`] does the one read a StoreRecord needs; [`image_build_with`] takes it as
-//! a parameter. [`ImageRoots`] caches the prefix and known shim-directory spellings; a
-//! script parent not among them is still canonicalized per classification. Debug Store
-//! classification also reads a complete record for its consistency check. Callers must
-//! account for these file reads even when they inject the StoreRecord reader.
+//! a parameter. [`ImageRoots`] caches the prefix and known shim-directory spellings. A
+//! script spelled through another path to a shim directory (a symlinked prefix) is
+//! resolved only for an absolute first argument whose name is an entry of one of those
+//! directories. This skips parent resolution for names absent there. A matching name
+//! still canonicalizes the supplied parent, including a network path; these filesystem
+//! reads can block and describe the paths only when read. Injecting the StoreRecord reader
+//! does not replace them.
+//!
+//! A Store build needs no record cross-check: [`crate::vendor_direct::read_record`] already
+//! refuses a record whose version's build id is not its directory's, and the directory's
+//! id IS the version here.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -191,14 +198,28 @@ impl ImageRoots {
 
     /// Whether `script` is a file DIRECTLY in `agents/`, `bin/` or `reroute/`, its
     /// directory as spelled or as resolved. A deeper directory or a sibling never counts.
+    ///
+    /// Only an absolute path names the file the shell ran: a relative one would resolve
+    /// against this process's directory, not the shell's. A parent spelled as none of the
+    /// roots is resolved only when a shim directory holds an entry of the script's name
+    /// (one `lstat` inside the prefix per directory). An absent name skips resolution;
+    /// a matching name still canonicalizes that parent, including a network path. This
+    /// prefilter does not bound the filesystem calls or guard concurrent path changes.
     fn holds_shim(&self, script: &Path) -> bool {
-        let Some(parent) = script.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        if !script.is_absolute() {
+            return false;
+        }
+        let (Some(parent), Some(name)) = (script.parent(), script.file_name()) else {
             return false;
         };
         if self.shim_dirs.iter().any(|d| d == parent) {
             return true;
         }
-        std::fs::canonicalize(parent).is_ok_and(|resolved| self.shim_dirs.contains(&resolved))
+        self.shim_dirs
+            .iter()
+            .any(|d| d.join(name).symlink_metadata().is_ok())
+            && std::fs::canonicalize(parent)
+                .is_ok_and(|resolved| self.shim_dirs.contains(&resolved))
     }
 }
 
@@ -217,8 +238,8 @@ pub fn image_build(roots: Option<&ImageRoots>, exe: &Path, argv1: Option<&Path>)
 
 /// [`image_build`] with the StoreRecord read as a parameter: `record(program, build)` is
 /// the version aterm's record gives index build `build` of `program`, asked at most once.
-/// This replaces the stamp read, not the shim-parent resolution or debug Store record
-/// cross-check described in the module documentation.
+/// This replaces the stamp read, not the shim-parent resolution described in the module
+/// documentation.
 #[must_use]
 pub fn image_build_with(
     roots: Option<&ImageRoots>,
@@ -265,17 +286,11 @@ fn classify(
         let tag = ProgramTag::new(&program);
         if build >= VENDOR_BUILD_BASE {
             return match Version::from_build_id(build) {
-                Some(version) => {
-                    #[cfg(debug_assertions)]
-                    if let Some(roots) = roots {
-                        cross_check(roots, &program, build, version);
-                    }
-                    ImageBuild {
-                        program: tag,
-                        build: version.build_id(),
-                        source: ImageSource::Store,
-                    }
-                }
+                Some(version) => ImageBuild {
+                    program: tag,
+                    build: version.build_id(),
+                    source: ImageSource::Store,
+                },
                 None => ImageBuild::unknown(tag),
             };
         }
@@ -298,8 +313,10 @@ fn classify(
     ImageBuild::unknown(name.and_then(ProgramTag::new))
 }
 
-/// `exe` without Linux's ` (deleted)` suffix.
-fn strip_deleted(exe: &Path) -> &Path {
+/// `exe` without Linux's ` (deleted)` suffix: the image the process runs, which a
+/// self-updater unlinking it does not change.
+#[must_use]
+pub fn strip_deleted(exe: &Path) -> &Path {
     exe.to_str()
         .and_then(|s| s.strip_suffix(DELETED_SUFFIX))
         .map_or(exe, Path::new)
@@ -329,25 +346,6 @@ fn native_build(exe: &Path) -> Option<(&str, Version)> {
     }
     let tool = versions.parent()?.file_name()?.to_str()?;
     Some((tool, version))
-}
-
-/// The debug cross-check: a Store build the store holds as complete records the version
-/// its directory decodes to.
-#[cfg(debug_assertions)]
-fn cross_check(roots: &ImageRoots, program: &str, build: u64, version: Version) {
-    let dir = roots
-        .prefix
-        .join("store")
-        .join(program)
-        .join(build.to_string());
-    if let Some(record) = crate::vendor_direct::complete_record(&dir) {
-        debug_assert_eq!(
-            record.version,
-            version,
-            "{}: the record and the directory name different versions",
-            dir.display()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -567,7 +565,8 @@ mod tests {
 
     /// A shim directory reached through a symlinked prefix (macOS's `/tmp` →
     /// `/private/tmp`) is the same directory: the script is spelled through the link,
-    /// the roots resolve it.
+    /// the roots resolve it. NEGATIVE CONTROLS: a name no shim directory holds is never
+    /// resolved, however its parent resolves, and a relative script names no file.
     #[cfg(unix)]
     #[test]
     fn a_shim_spelled_through_a_link_is_a_launcher() {
@@ -575,18 +574,39 @@ mod tests {
         let links = crate::testdir::dir("atpkg-image-link-");
         let prefix = real.join("pkg");
         std::fs::create_dir_all(prefix.join("agents")).expect("agents/");
+        std::fs::write(prefix.join("agents/claude"), "#!/bin/sh\n").expect("the shim");
         let link = links.join("pkg");
         std::os::unix::fs::symlink(&prefix, &link).expect("link the prefix");
         let roots = ImageRoots::new(&Layout {
             prefix: prefix.clone(),
         });
-        let got = image_build_with(
-            Some(&roots),
-            Path::new("/bin/sh"),
-            Some(&link.join("agents/claude")),
-            &record,
+        let classify = |script: &Path| {
+            image_build_with(Some(&roots), Path::new("/bin/sh"), Some(script), &record)
+        };
+        assert_eq!(
+            classify(&link.join("agents/claude")),
+            build("claude", 0, ImageSource::Launcher)
         );
-        assert_eq!(got, build("claude", 0, ImageSource::Launcher));
+        assert_eq!(
+            classify(&link.join("agents/codex")),
+            unknown("sh"),
+            "no shim of that name: the parent is never resolved"
+        );
+        // A relative script names no file the shell ran, even spelled as a
+        // (relative) layout's shim directory is.
+        let relative = ImageRoots::new(&Layout {
+            prefix: PathBuf::from("rel/pkg"),
+        });
+        assert_eq!(
+            image_build_with(
+                Some(&relative),
+                Path::new("/bin/sh"),
+                Some(Path::new("rel/pkg/agents/claude")),
+                &record,
+            ),
+            unknown("sh"),
+            "a relative script resolves against no shell's directory"
+        );
     }
 
     /// The StoreRecord read is the program's stamp: none recorded is Unknown, and a

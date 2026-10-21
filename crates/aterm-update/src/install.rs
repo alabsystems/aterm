@@ -1859,6 +1859,7 @@ fn recover_orphaned_prepared_candidate(
     // Past this point `ready.toml` advertises bytes that are not at `staged_app`, and
     // the fixed path is the only place they could still be.
     let fixed = rollback_path(installed);
+    UnprovenCandidate::check(staging, &fixed, unix_now_secs())?;
     let recoverable = verified_bundle_identity(&fixed).is_ok_and(|(build, commit)| {
         same_volume(&fixed, installed)
             && build > current_build
@@ -2119,6 +2120,9 @@ fn prepare_fixed_swap_candidate(
 ) -> Result<PreparedSwapCandidate, String> {
     let staged = &staging.staged_app;
     let fixed = rollback_path(installed);
+    // A candidate an earlier apply's probe started there and killed before it exited
+    // stays until no assessment of it can still be going ([`UnprovenCandidate`]).
+    UnprovenCandidate::check(staging, &fixed, unix_now_secs())?;
     // A predecessor kept for the outgoing window is stale here like any other: this
     // transaction owns the path from now, so its record goes first.
     clear_kept_predecessor(staging);
@@ -3048,6 +3052,131 @@ fn stage_failure_is_a_verdict(error: &str) -> bool {
     !crate::is_passing_refusal(error)
 }
 
+/// Whether a failed start probe ([`verify::probe_bundle_starts`]) started the candidate
+/// and lost it before it exited: its ceiling ran out and it was killed, or the wait on
+/// it failed. macOS assesses a new file's first exec after the exec, while the process
+/// waits at `_dyld_start`, and killing the process does not end the assessment; on macOS
+/// 27.0.1 `syspolicyd` crashes when the file is unlinked or renamed before it does,
+/// stranding every exec on the host. A verdict ran the candidate to an exit, and a
+/// refused spawn (`spawn …`) started nothing, so only these leave it unproven.
+fn probe_left_unproven(error: &str) -> bool {
+    !stage_failure_is_a_verdict(error) && !error.starts_with("spawn ")
+}
+
+/// `Updates/fixed.unproven`: a candidate an apply's start probe started at the fixed
+/// path and killed before it exited, and when ([`keep_unproven_candidate`]). Until the
+/// first-exec hang ([`aterm_uds::deadline::FIRST_EXEC_HANG`]) has passed since, no
+/// preparation removes or replaces that path ([`UnprovenCandidate::holds`]).
+fn unproven_candidate_path(staging: &Staging) -> PathBuf {
+    staging.root.join("fixed.unproven")
+}
+
+/// The record at [`unproven_candidate_path`]: the bundle, and the Unix second its probe
+/// was killed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnprovenCandidate {
+    bundle: PathBuf,
+    killed_at: u64,
+}
+
+impl UnprovenCandidate {
+    /// Refuse preparation or orphan recovery while the fixed candidate stays held.
+    fn check(staging: &Staging, fixed: &Path, now: u64) -> Result<(), String> {
+        let Some(left) = Self::holds(staging, fixed, now) else {
+            return Ok(());
+        };
+        Err(verify::mark_passing(format!(
+            "the candidate at {} was started by a start probe killed before it exited, and \
+             macOS may still be assessing its first exec; it stays where it is for {left} s \
+             more",
+            fixed.display()
+        )))
+    }
+
+    fn read(staging: &Staging) -> Option<Self> {
+        Self::parse(&crate::read_ledger_text(&unproven_candidate_path(staging))?)
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut lines = text.lines();
+        let mut fields = lines.next()?.split_whitespace();
+        if fields.next()? != "v1" {
+            return None;
+        }
+        let killed_at = fields.next()?.parse().ok()?;
+        let bytes = aterm_codec::hex::decode_vec(lines.next()?.as_bytes())?;
+        if fields.next().is_some() || lines.next().is_some() || bytes.contains(&0) {
+            return None;
+        }
+        let bundle = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+        bundle.is_absolute().then_some(Self { bundle, killed_at })
+    }
+
+    fn encode(&self) -> String {
+        use std::os::unix::ffi::OsStrExt;
+
+        // A path is bytes, as in `KeptPredecessor::encode`.
+        format!(
+            "v1 {}\n{}\n",
+            self.killed_at,
+            aterm_codec::hex::encode_lower(self.bundle.as_os_str().as_bytes())
+        )
+    }
+
+    fn record(&self, staging: &Staging) -> std::io::Result<()> {
+        write_private_file(&unproven_candidate_path(staging), self.encode().as_bytes())
+    }
+
+    /// The seconds `fixed` stays as it is, when the record names it and the first-exec
+    /// hang has not passed since its probe was killed. A clock earlier than that instant
+    /// leaves the full hold intact. A record that has run its course, or does not parse,
+    /// is dropped; one naming another path stays until it has run its course.
+    fn holds(staging: &Staging, fixed: &Path, now: u64) -> Option<u64> {
+        let hang = aterm_uds::deadline::FIRST_EXEC_HANG.as_secs();
+        let Some(record) = Self::read(staging) else {
+            let _ = std::fs::remove_file(unproven_candidate_path(staging));
+            return None;
+        };
+        let since = now.saturating_sub(record.killed_at);
+        if since >= hang {
+            let _ = std::fs::remove_file(unproven_candidate_path(staging));
+            return None;
+        }
+        (record.bundle == fixed).then(|| hang - since)
+    }
+}
+
+/// Leave a prepared candidate whose start probe left it unproven
+/// ([`probe_left_unproven`]) exactly where it ran, recorded at `now`
+/// ([`UnprovenCandidate`]), instead of backing it out: neither removed (a copy across
+/// volumes) nor renamed back to the stage (a same-volume move). A moved stage's marker
+/// is retired instead, since it no longer names bytes at the stage path; the next check
+/// stages the build again, and its swap waits out the record. A record that cannot be
+/// written still leaves the candidate in place: the cost is a later preparation's
+/// removal, never this one's.
+fn keep_unproven_candidate(prepared: &PreparedSwapCandidate, staging: &Staging, now: u64) {
+    let kept = UnprovenCandidate {
+        bundle: prepared.fixed.clone(),
+        killed_at: now,
+    };
+    if let Err(error) = kept.record(staging) {
+        crate::warn(&format!(
+            "could not record the unproven candidate at {}: {error}",
+            prepared.fixed.display()
+        ));
+    }
+    if prepared.moved_from_stage {
+        staging.retire_published();
+    }
+    crate::warn(&format!(
+        "the start probe of {} was killed before it exited; it stays there while macOS may \
+         still be assessing its first exec",
+        prepared.fixed.display()
+    ));
+}
+
 /// The swap's second precondition, checked before the park: can the running bundle
 /// become the rollback source the swap installs at the fixed path? The boot apply
 /// asks the same at step 7 and still does; asking here, while every reader is live,
@@ -3570,6 +3699,40 @@ fn stage_withdrawn(staging: &Staging, ready: &Ready) -> Result<(), String> {
     Ok(())
 }
 
+/// One exclusive incoming path. A timed-out start probe may leave this bundle
+/// under assessment after its child is gone, so no later stage may reuse its path.
+/// Empty reservations are reclaimed on drop; nonempty bundles are never swept here.
+struct StageIncoming {
+    path: PathBuf,
+}
+
+impl StageIncoming {
+    fn create(staging: &Staging) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        let nonce = random_nonce()
+            .ok_or_else(|| verify::mark_passing("incoming bundle nonce unavailable".to_string()))?;
+        let path = staging
+            .staged_dir()
+            .join(format!(".aterm-incoming-{nonce}.app"));
+        // Exclusive creation owns an empty target for copy/extract promotion.
+        // Keep it flat under staged/: isolated ditto attempts stay at that same
+        // parent, where their existing copy reaper can still find them.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| verify::mark_passing(format!("reserve incoming bundle: {error}")))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for StageIncoming {
+    fn drop(&mut self) {
+        // Only an EMPTY reservation can go. A retained candidate keeps its exact
+        // path even after this stage returns; there is no assessment-end receipt.
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
 /// Stages a verified copy of the bundle from a downloaded (SHA-256-checked) DMG:
 /// mount, `ditto` the `.app` out, verify it (codesign/Team ID/spctl), publish
 /// `staged/aterm.app`, and write `ready.toml` last. The marker's presence is the
@@ -3609,8 +3772,8 @@ pub fn stage_from_dmg(
         Err(_) => return Err(format!("{} not found on mounted DMG", src.display())),
     }
 
-    let incoming = staging.staged_dir().join("aterm.app.incoming");
-    let _ = std::fs::remove_dir_all(&incoming);
+    let incoming_attempt = StageIncoming::create(staging)?;
+    let incoming = incoming_attempt.path.clone();
     // The mounted bundle's size is what the copy will write; refuse a volume that
     // cannot hold it before a byte lands (`refuse_without_room`).
     refuse_without_room(&staging.staged_dir(), tree_bytes(&src), "the update bundle")?;
@@ -4124,8 +4287,10 @@ pub fn stage_from_zip(
         }
     }
 
-    let incoming = staging.staged_dir().join("aterm.app.incoming");
-    let _ = std::fs::remove_dir_all(&incoming);
+    let incoming_attempt = StageIncoming::create(staging).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&extract);
+    })?;
+    let incoming = incoming_attempt.path.clone();
     // A rename inside `staged/` (same directory, so necessarily the same volume)
     // moves the bundle without re-copying it — nothing is re-materialized, so no
     // extended attribute or signature byte can be lost in transit.
@@ -4162,12 +4327,15 @@ fn staging_manifest_commit(manifest: &Manifest) -> Result<String, String> {
 /// [`stage_from_dmg`] and [`stage_from_zip`], so the container can never change what
 /// is proved.
 ///
-/// The start probe's child is started first, held at its exec
-/// ([`verify::hold_staged_start`]), so syspolicyd's first-exec assessment of it runs
-/// beside the gate's helpers; it runs only once the gate has passed.
+/// The stage's verification and publish tail: the tiered codesign/Gatekeeper gate, the
+/// manifest↔sealed CFBundleVersion rebind, the sealed-commit rebind, the start
+/// probe, then the ready marker written last. The single copy shared by
+/// [`stage_from_dmg`] and [`stage_from_zip`], so the container can never change what
+/// is proved.
 ///
-/// Every failure path kills the held probe unrun and then removes `incoming`, so a
-/// refused candidate leaves no half-staged bundle and no process.
+/// The start probe runs ONLY once the gate and `stage_withdrawn` have passed, so a
+/// refused or withdrawn candidate is never exec'd and its removal never unlinks a
+/// Mach-O while `syspolicyd` is assessing its first exec.
 ///
 /// `roster_read_at` (RFC3339; empty for a clock that could not be read) is when the
 /// check that authorized `manifest` began reading the machine roster it judged by:
@@ -4180,14 +4348,7 @@ fn verify_and_publish_incoming(
     expected_team: &str,
     roster_read_at: &str,
 ) -> Result<(), String> {
-    // The start probe, held at its exec: its assessment runs while the gate below
-    // does, and nothing of it runs unless the whole gate passes.
-    let held = verify::hold_staged_start(incoming);
-    // A refusal before the probe kills the held child unrun FIRST, then removes the
-    // bundle: removed while a process still has its executable, a network home keeps
-    // the file aside (NFS's `.nfs*` rename) and with it the refused bundle's directory.
-    let refuse = |held: verify::HeldStart, why: String| -> Result<(), String> {
-        held.kill();
+    let refuse = |why: String| -> Result<(), String> {
         let _ = std::fs::remove_dir_all(incoming);
         Err(why)
     };
@@ -4196,7 +4357,7 @@ fn verify_and_publish_incoming(
     // Its helpers and the sealed reads run at once, and are read in this order.
     let checks = verify::check_bundle(incoming, expected_team, false);
     if let Err(e) = checks.policy {
-        return refuse(held, format!("staged bundle failed verification: {e}"));
+        return refuse(format!("staged bundle failed verification: {e}"));
     }
     // Bind the (unauthenticated) manifest build_number to the number inside the
     // signed bundle, or a manifest could claim a high build_number while pointing at
@@ -4205,30 +4366,24 @@ fn verify_and_publish_incoming(
     let bundle_build = match checks.build {
         Ok(n) => n,
         Err(e) => {
-            return refuse(held, format!("staged bundle build number unreadable: {e}"));
+            return refuse(format!("staged bundle build number unreadable: {e}"));
         }
     };
     if bundle_build != manifest.build_number {
-        return refuse(
-            held,
-            format!(
-                "staged bundle CFBundleVersion {bundle_build} != manifest build_number {} — \
-                 refusing a manifest/bundle mismatch",
-                manifest.build_number
-            ),
-        );
+        return refuse(format!(
+            "staged bundle CFBundleVersion {bundle_build} != manifest build_number {} — \
+             refusing a manifest/bundle mismatch",
+            manifest.build_number
+        ));
     }
     let sealed_commit = match checks.commit {
         Ok(commit) => commit,
-        Err(error) => return refuse(held, format!("staged bundle commit unreadable: {error}")),
+        Err(error) => return refuse(format!("staged bundle commit unreadable: {error}")),
     };
     if !sealed_commit_matches(Some(manifest_commit), &sealed_commit) {
-        return refuse(
-            held,
-            format!(
-                "staged bundle ATermGitCommit {sealed_commit:?} does not match manifest commit"
-            ),
-        );
+        return refuse(format!(
+            "staged bundle ATermGitCommit {sealed_commit:?} does not match manifest commit"
+        ));
     }
     let team = match checks.team {
         Some(Ok(team)) => team,
@@ -4244,23 +4399,24 @@ fn verify_and_publish_incoming(
     // Start it once, now that every check above has passed, so its first exec's
     // Gatekeeper assessment is paid here and not by the apply's probe, before a
     // window (`verify::probe_staged_bundle_starts`). A candidate that cannot start
-    // is refused like any other stage verdict, before a marker exists; a probe that
-    // could not run to an answer (timed out on a loaded machine, refused a spawn
-    // just then) is no verdict and publishes: the apply's probe still gates the swap.
-    // A build the records already withdrew (`stage_withdrawn`) is not started (its
-    // held probe is killed unrun): the publish refuses it under its lock, with
-    // these words.
+    // is refused like any other stage verdict, before a marker exists; a probe whose
+    // spawn was refused just then (`EAGAIN`) started nothing and publishes so the
+    // apply's probe can judge it; a probe that spawned the candidate and timed out
+    // before it exited keeps `incoming` in place (never unlinked or renamed while
+    // `syspolicyd` may still be assessing its path) and returns the passing refusal.
+    // A build the records already withdrew (`stage_withdrawn`) is not started: the
+    // publish refuses it under its lock, with these words.
     let probed = match stage_withdrawn(staging, &ready) {
-        Ok(()) => verify::probe_staged_bundle_starts(incoming, bundle_build, held),
-        Err(_) => {
-            held.kill();
-            Ok(())
-        }
+        Ok(()) => verify::probe_staged_bundle_starts(incoming, bundle_build),
+        Err(_) => Ok(()),
     };
     if let Err(error) = probed {
         if stage_failure_is_a_verdict(&error) {
             let _ = std::fs::remove_dir_all(incoming);
             return Err(format!("staged bundle cannot start: {error}"));
+        }
+        if probe_left_unproven(&error) {
+            return Err(format!("staged bundle failed verification: {error}"));
         }
         crate::warn(&format!(
             "staged bundle start probe did not finish: {error}; publishing, and the \
@@ -4709,8 +4865,9 @@ fn apply_staged_if_ready_inner(
     // name). A launched successor never gets here, and neither does a window whose
     // `[update] auto_apply` is off. One LaunchServices started (the escape; a replaceable
     // launch through `open --args`) keeps a stale record (pid -1) for its life, which its
-    // own `launch record:` measure books. The crash-loop revert's re-exec is outside this
-    // lane (`revert_to_rollback`).
+    // own `launch record:` measure renews by a handoff to a fresh launch of its build, or
+    // books where nothing renews it. The crash-loop revert's re-exec is outside this lane
+    // (`revert_to_rollback`).
     crate::log(&format!(
         "applied update {} in {} ms{} → exec into the new binary",
         ready.version,
@@ -4978,7 +5135,15 @@ fn swap_admitted_stage(
     // dyld or Gatekeeper rejects before `main` would be swapped in and never
     // reverted. Start it once here, while OLD is installed and backing out is free.
     if let Err(error) = (seams.probe)(&prepared.fixed, ready.build_number) {
-        recover_prepared_candidate(&prepared, staging);
+        // A probe that started the candidate and was killed before it exited leaves
+        // macOS assessing its first exec, which the kill does not end: the candidate
+        // stays exactly where it ran ([`keep_unproven_candidate`]). Any other failure
+        // either ran it to an exit or never started it, and is backed out as before.
+        if probe_left_unproven(&error) {
+            keep_unproven_candidate(&prepared, staging, unix_now_secs());
+        } else {
+            recover_prepared_candidate(&prepared, staging);
+        }
         // A probe that could not run to an answer (timed out, or the kernel would
         // not start it) is not a candidate that cannot start: no failure memo, whose
         // backoff would suppress re-staging healthy bytes.
@@ -6552,7 +6717,7 @@ fn write_trial_launch_stamp(stamp: &Path, launch: TrialLauncher) -> std::io::Res
 /// The launch `stamp` names ([`write_trial_launch_stamp`]), or `None` when there
 /// is none, it is not a regular file, or it is not exactly one name: nothing is
 /// given back by it, and a launch it counted stays counted.
-fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
+pub(crate) fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     // Never followed, and never waited on: a FIFO at the name cannot park the
@@ -7661,3 +7826,7 @@ mod copy_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "install_stage_probe_tests.rs"]
 mod stage_probe_tests;
+
+#[cfg(debug_assertions)]
+#[path = "install_dmg_acceptance.rs"]
+pub mod dmg_acceptance;

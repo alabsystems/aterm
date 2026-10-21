@@ -33,11 +33,11 @@ pub const fn demo_clamp_poll_index(idx: u64, max_reads: u64) -> u64 {
 }
 
 /// `keyed_clamp_cutoff` as `keyed_island.rs` defines it in Clean:
-/// `if at_or_before < tape_len then at_or_before else tape_len`.
+/// `if seen < tape_len then seen else tape_len`.
 #[must_use]
-pub const fn keyed_clamp_cutoff(at_or_before: u64, tape_len: u64) -> u64 {
-    if at_or_before < tape_len {
-        at_or_before
+pub const fn keyed_clamp_cutoff(seen: u64, tape_len: u64) -> u64 {
+    if seen < tape_len {
+        seen
     } else {
         tape_len
     }

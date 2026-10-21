@@ -118,9 +118,82 @@ pub(crate) fn push_fx_quad(
     premul: u32,
     alpha: u8,
 ) {
+    push_fx_ramp(out, geom, x, y, w, h, (premul, alpha), (premul, alpha));
+}
+
+/// A soft round mark of ADDITIVE light at `(cx, cy)` with radii `(rx, ry)`:
+/// one radial profile, `(1 − ρ²)²` peaking at `peak` (coverage `0..=255`) at
+/// the centre and reaching nothing at the rim, laid one pixel row at a time
+/// as a few linear ramps a side ([`push_fx_ramp`]), so its edge never stands
+/// as a step (a bead, a drop or a glint of light that a stack of flat slabs
+/// drew in stairs).
+pub(crate) fn push_soft_disc(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    (rx, ry): (f32, f32),
+    color: u32,
+    peak: f32,
+) {
+    const SEGMENTS: usize = 4;
+    if peak < 1.0 || rx < 0.5 || ry < 0.5 {
+        return;
+    }
+    let (y0, y1) = ((cy - ry).floor() as i32, (cy + ry).ceil() as i32);
+    for y in y0..y1 {
+        let dy = (y as f32 + 0.5 - cy) / ry;
+        let rest = 1.0 - dy * dy;
+        if rest <= 0.0 {
+            continue;
+        }
+        let span = rx * rest.sqrt();
+        let level = |x: f32| {
+            let w = (1.0 - (x / rx) * (x / rx) - dy * dy).max(0.0);
+            let cov = (peak * w * w).round().clamp(0.0, 255.0) as u8;
+            premul_rgb(color, cov)
+        };
+        let knot = |k: usize| -span + 2.0 * span * k as f32 / (2 * SEGMENTS) as f32;
+        for k in 0..2 * SEGMENTS {
+            let (xa, xb) = (knot(k), knot(k + 1));
+            let (ia, ib) = ((cx + xa).round() as i32, (cx + xb).round() as i32);
+            let (a, b) = (level(xa), level(xb));
+            if ib <= ia || (a == 0 && b == 0) {
+                continue;
+            }
+            push_fx_ramp(out, geom, ia, y, ib - ia, 1, (a, 0), (b, 0));
+        }
+    }
+}
+
+/// [`push_fx_quad`] with a horizontal ramp: `(colour, alpha)` `left` at the
+/// rect's left edge and `right` at its right edge, by
+/// [`GlowQuad::color2`]'s law. Both ends are in one blend mode (both alphas
+/// `0`, additive, or both `> 0`, source-over). Where the effects box clips the
+/// rect, the cut edge takes the ramp's value at the cut, so a clipped ramp
+/// keeps its slope; equal ends pass through bit-exact, which is what keeps
+/// every flat caller byte-unchanged.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rect + both ramp ends IS the call, as in `push_fx_quad`"
+)]
+pub(crate) fn push_fx_ramp(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    left: (u32, u8),
+    right: (u32, u8),
+) {
     if w <= 0 || h <= 0 {
         return;
     }
+    debug_assert_eq!(
+        left.1 == 0,
+        right.1 == 0,
+        "a quad's blend mode is per quad, never per end"
+    );
     debug_assert!(
         geom.fx_right() <= i32::from(u16::MAX) && geom.fx_bot() <= i32::from(u16::MAX),
         "effects-box pixel extent exceeds u16 GlowQuad range"
@@ -134,6 +207,22 @@ pub(crate) fn push_fx_quad(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
+    // The ramp's value at window column `px` (an edge), for a clipped end.
+    let at = |px: i32| -> (u32, u8) {
+        if left == right {
+            return left;
+        }
+        let t = (px - x) as f32 / w as f32;
+        let lerp = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * t).round() as u32;
+        let ch = |sh: u32| lerp((left.0 >> sh) & 0xff, (right.0 >> sh) & 0xff).min(255) << sh;
+        let alpha = lerp(u32::from(left.1), u32::from(right.1)).min(255) as u8;
+        // A source-over end stays source-over (`alpha == 0` would switch
+        // the quad to additive).
+        let alpha = if left.1 > 0 { alpha.max(1) } else { 0 };
+        (ch(16) | ch(8) | ch(0), alpha)
+    };
+    let (c0, a0) = if x0 == x { left } else { at(x0) };
+    let (c1, a1) = if x1 == x + w { right } else { at(x1) };
     let ch = geom.ch as i32;
     let oy = i32::from(geom.origin_y);
     let mut yy = y0;
@@ -147,10 +236,10 @@ pub(crate) fn push_fx_quad(
             y: yy as u16,
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
-            color: premul,
-            alpha,
-            color2: premul,
-            alpha2: alpha,
+            color: c0,
+            alpha: a0,
+            color2: c1,
+            alpha2: a1,
         });
         yy = band_end;
     }
@@ -434,10 +523,9 @@ pub(crate) fn star_arm_px(arm: f32) -> i32 {
 /// reading as punctuation on the dust rather than texture, while some crosses
 /// remain. This constant reaches every dealt population on both themes: the
 /// dark and light ribbon starfields, the Beam/Comet/Sparkle wakes, the erase
-/// poof, and the fresh-ink spark. Measured by `cursor_glow`'s
-/// `stardust_is_the_body_the_plus_is_the_accent` (dark) and
-/// `the_fresh_ink_spark_is_stardust_with_a_dealt_plus` (light)
-/// (owner, 2026-08-09).
+/// poof, and the fresh-ink spark (owner, 2026-08-09). The Sparkle and Comet
+/// wakes are measured by `cursor_glow`'s
+/// `stardust_is_the_body_the_plus_is_the_accent`.
 pub(crate) const STAR_ACCENT_DEN: u32 = 16;
 
 /// Deal a stored particle seed into the accent (true → the 4-point star) or the
@@ -465,7 +553,7 @@ pub(crate) const STAR_STACK_ADD: f32 = 2.0 + STAR_CORE_ADD;
 
 /// The one pulse rule: angular frequency (rad/s) of every twinkling star.
 ///
-/// WCAG 2.3.1: this crate certifies a 3.2 Hz general-flash bound. The envelope
+/// WCAG 2.3.1: this crate certifies [`TWINKLE_FLASH_BOUND_HZ`]. The envelope
 /// is rectified (`|sin|`), peaking twice per sine cycle, so the bound applies
 /// to `ω/π`. At 9 rad/s that is [`TWINKLE_FLASH_HZ`] = 2.86 Hz.
 pub(crate) const TWINKLE_OMEGA: f32 = 9.0;
@@ -489,13 +577,19 @@ pub(crate) const TWINKLE_GLINT_FRAC: f32 = 0.92;
 /// `twinkle_law_stays_under_the_photosensitivity_bound`.
 pub(crate) const TWINKLE_FLASH_HZ: f32 = TWINKLE_OMEGA / std::f32::consts::PI;
 
-/// WCAG 2.3.1's general-flash threshold in Hz: three flashes in any second
-/// fails, so 3.2 is the bound certified against.
+/// WCAG 2.3.1's general-flash threshold in Hz: more than three flashes in any
+/// one-second period fails, so a rate of at most 3.0 is what this crate
+/// certifies.
 ///
-/// Also used by the kitty-command trick flash (`trick_flash.rs`), whose
-/// luminance-reversal rate is const-asserted under it; its measured test lives
-/// with that emitter (`the_flash_stays_under_the_photosensitivity_bound`).
-pub(crate) const TWINKLE_FLASH_BOUND_HZ: f32 = 3.2;
+/// Every flash-rate law in the crate is held under it by name: the twinkle
+/// (below), the kitty-command trick flash (`trick_flash.rs`, its
+/// luminance-reversal rate const-asserted, its measured test
+/// `the_flash_stays_under_the_photosensitivity_bound`), the rainbow cursor's
+/// flare scintillation, and lightning's onset limiter and streak ripple
+/// (`cursor_glow`) — and, outside the crate, the harness card's re-show
+/// bound (`aterm-gui`'s `claude_card::RESHOW_MS`), re-exported at the crate
+/// root for it.
+pub const TWINKLE_FLASH_BOUND_HZ: f32 = 3.0;
 
 /// The photosensitivity bound is checked at build time: retuning
 /// [`TWINKLE_OMEGA`] past it stops the build. (The test still measures the rate
@@ -545,11 +639,152 @@ pub(crate) fn star_body_px(arm: i32) -> i32 {
     ((arm as f32 * STAR_TAPER_BODY).round() as i32).clamp(1, arm)
 }
 
+/// Which paint a piece of the star takes ([`star_pieces`]): its coverage is
+/// the star's times the part's share, so a frame recolours a star by these
+/// alone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum StarPart {
+    /// A needle's full-coverage body through the crossing.
+    Body,
+    /// The nucleus.
+    Core,
+    /// Span `step` of a point, at `taper` of the body's coverage
+    /// ([`star_taper_cov`] at the span's midpoint).
+    Tip { step: u8, taper: f32 },
+    /// A diagonal glint dot.
+    Glint,
+}
+
+/// How many distinct paints a star's pieces take ([`StarPart::id`]): the
+/// body, the nucleus, each point span, the glints.
+pub(crate) const STAR_PAINTS: usize = 3 + STAR_TAPER_STEPS as usize;
+
+impl StarPart {
+    /// The part's paint id, `0..STAR_PAINTS`: the body `0`, the nucleus `1`,
+    /// point span `k` `2 + k`, a glint the last.
+    #[must_use]
+    pub(crate) const fn id(self) -> u8 {
+        match self {
+            Self::Body => 0,
+            Self::Core => 1,
+            Self::Tip { step, .. } => 2 + step,
+            Self::Glint => STAR_PAINTS as u8 - 1,
+        }
+    }
+}
+
+/// One piece of a star: a rectangle `[x, x + w) × [y, y + h)` relative to the
+/// star's centre, and its part.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StarPiece {
+    pub(crate) part: StarPart,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) w: i32,
+    pub(crate) h: i32,
+}
+
+/// The most pieces one star has: two body bars, the nucleus, four spans a
+/// point step, four glints.
+pub(crate) const STAR_PIECES_MAX: usize = 3 + 4 * STAR_TAPER_STEPS as usize + 4;
+
+/// A star's pieces in the order they are laid ([`star_pieces`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StarPieces {
+    pieces: [StarPiece; STAR_PIECES_MAX],
+    n: usize,
+}
+
+impl std::ops::Deref for StarPieces {
+    type Target = [StarPiece];
+
+    fn deref(&self) -> &[StarPiece] {
+        &self.pieces[..self.n]
+    }
+}
+
+/// THE STAR'S GEOMETRY, the one source of it: the pieces of the 4-point
+/// twinkle of half-length `arm` (glints when `gold`), relative to its centre,
+/// in the order every rasterizer lays them — the horizontal body, the
+/// vertical body, the nucleus, then per point step the horizontal and the
+/// vertical span right/down of the crossing and then left/up of it, then the
+/// four glints. Each needle is a full-coverage body through the crossing at
+/// the shared waist ([`STAR_TAPER_BODY`], [`star_waist_px`]) running into
+/// [`STAR_TAPER_STEPS`] spans at most that dim toward [`STAR_TIP_COV`] and
+/// thin with them. An even thickness is biased up-left by the integer half
+/// so the centre stays on the centre pixel; at the 1 px floor a needle is a
+/// hairline. No pieces for an arm under 1.
+///
+/// [`push_twinkle_star`] (the cursor family's stars), the harness card's
+/// stars and the card's art registry lay exactly these.
+#[must_use]
+pub(crate) fn star_pieces(arm: i32, gold: bool) -> StarPieces {
+    let none = StarPiece {
+        part: StarPart::Body,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+    };
+    let mut out = StarPieces {
+        pieces: [none; STAR_PIECES_MAX],
+        n: 0,
+    };
+    if arm < 1 {
+        return out;
+    }
+    let mut push = |part: StarPart, x: i32, y: i32, w: i32, h: i32| {
+        out.pieces[out.n] = StarPiece { part, x, y, w, h };
+        out.n += 1;
+    };
+    let t = star_waist_px(arm);
+    let half = (t - 1) / 2;
+    let b = star_body_px(arm);
+    push(StarPart::Body, -b, -half, 2 * b + 1, t);
+    push(StarPart::Body, -half, -b, t, 2 * b + 1);
+    // Nucleus: on additive light the crossing supplies part of it and this
+    // completes it. Laid before the points.
+    let c = star_core_px(arm);
+    let cc = (c - 1) / 2;
+    push(StarPart::Core, -cc, -cc, c, c);
+    // The points: each arm runs from the body to the tip in equal spans, each
+    // dimmer (and, with thickness to spare, thinner) than the last. Two spans
+    // per step, one per side of the crossing.
+    let run = arm - b;
+    let steps = run.clamp(0, STAR_TAPER_STEPS);
+    for k in 0..steps {
+        let d0 = b + run * k / steps; // last px of the previous span
+        let d1 = b + run * (k + 1) / steps; // last px of this one
+        // The ramp runs over the POINT — full where the body ends,
+        // [`STAR_TIP_COV`] at the tip — sampled at this span's midpoint.
+        let taper = star_taper_cov(((d0 + d1) as f32 * 0.5 - b as f32) / run as f32);
+        let tt = ((t as f32 * taper).round() as i32).max(1);
+        let th = (tt - 1) / 2;
+        let len = d1 - d0;
+        let part = StarPart::Tip {
+            step: k as u8,
+            taper,
+        };
+        // `d0 + 1` runs right/down from the body; `-d1` mirrors it.
+        for off in [d0 + 1, -d1] {
+            push(part, off, -th, len, tt);
+            push(part, -th, off, tt, len);
+        }
+    }
+    if gold {
+        let d = ((arm as f32 * STAR_GLINT).round() as i32).max(1);
+        for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
+            push(StarPart::Glint, ox, oy, 1, 1);
+        }
+    }
+    out
+}
+
 /// The one star: a 4-point twinkle, a horizontal and a vertical needle crossing
 /// at `(sx, sy)` on a small nucleus, plus four dim diagonal glint dots when
-/// `gold`. Each needle is a full-coverage body through the crossing
-/// ([`STAR_TAPER_BODY`]) running into points that dim toward [`STAR_TIP_COV`]
-/// and thin with them (see the taper notes above).
+/// `gold` ([`star_pieces`], the one geometry). Each needle is a full-coverage
+/// body through the crossing ([`STAR_TAPER_BODY`]) running into points that
+/// dim toward [`STAR_TIP_COV`] and thin with them (see the taper notes above).
 ///
 /// Every 4-point star goes through here (rainbow kitty typing starfield, glide
 /// stars, jump-landing burst, shooting-star heads, Beam's stardust, the comet's
@@ -558,10 +793,12 @@ pub(crate) fn star_body_px(arm: i32) -> i32 {
 /// ([`STAR_GLINT`]) are shared with `cursor_glow`'s source-over
 /// `push_twinkle_over`. This one is hard-edged and additive: the crossing
 /// supplies part of the nucleus, and the core rect at [`STAR_CORE_ADD`]
-/// finishes it without clipping to white.
+/// finishes it without clipping to white. A point span whose light rounds to
+/// nothing ends the points: no later span is laid.
 ///
 /// Window-absolute, via [`push_fx_rect`]. Returns `false` when the quad budget
-/// ran out.
+/// ran out: it is checked before every piece but the first, so a truncated
+/// star keeps its bodies and its nucleus and loses its faint tips.
 #[allow(
     clippy::too_many_arguments,
     reason = "output + geometry + centre + arm + coverage + glint + colour + budget; \
@@ -581,66 +818,26 @@ pub(crate) fn push_twinkle_star(
     if cov == 0 || arm < 1 {
         return true;
     }
-    let star = premul_rgb(color, cov);
-    // The body at the shared waist: the arm's full-coverage run through the
-    // crossing. An even thickness is biased up-left by the integer half so the
-    // centre stays on `(sx, sy)`; at the 1 px floor this is a hairline.
-    let t = star_waist_px(arm);
-    let half = (t - 1) / 2;
-    let b = star_body_px(arm);
-    push_fx_rect(out, geom, sx - b, sy - half, 2 * b + 1, t, star); // horizontal
-    if out.len() >= max_quads {
-        return false;
-    }
-    push_fx_rect(out, geom, sx - half, sy - b, t, 2 * b + 1, star); // vertical
-    if out.len() >= max_quads {
-        return false;
-    }
-    // Nucleus: the crossing supplies half, this completes it. Drawn before the
-    // points so a budget-truncated star loses its faint tips, not its centre.
-    let c = star_core_px(arm);
-    let ch = (c - 1) / 2;
-    let core = premul_rgb(color, (f32::from(cov) * STAR_CORE_ADD) as u8);
-    push_fx_rect(out, geom, sx - ch, sy - ch, c, c, core);
-    // The points: each arm runs from the body to the tip in equal spans, each
-    // dimmer (and, with thickness to spare, thinner) than the last. Two spans
-    // per step, one per side of the crossing.
-    let run = arm - b;
-    let steps = run.clamp(0, STAR_TAPER_STEPS);
-    for k in 0..steps {
-        let d0 = b + run * k / steps; // last px of the previous span
-        let d1 = b + run * (k + 1) / steps; // last px of this one
-        // The ramp runs over the POINT — full where the body ends, [`STAR_TIP_COV`]
-        // at the tip — sampled at this span's midpoint.
-        let ramp = star_taper_cov(((d0 + d1) as f32 * 0.5 - b as f32) / run as f32);
-        let tip = premul_rgb(color, (f32::from(cov) * ramp) as u8);
-        if tip == 0 {
-            break;
-        }
-        let tt = ((t as f32 * ramp).round() as i32).max(1);
-        let th = (tt - 1) / 2;
-        let len = d1 - d0;
-        // `d0 + 1` runs right/down from the body; `-d1` mirrors it.
-        for off in [d0 + 1, -d1] {
-            if out.len() >= max_quads {
-                return false;
+    let at = |share: f32| premul_rgb(color, (f32::from(cov) * share) as u8);
+    let mut ended = false;
+    for (i, p) in star_pieces(arm, gold).iter().enumerate() {
+        let paint = match p.part {
+            StarPart::Body => premul_rgb(color, cov),
+            StarPart::Core => at(STAR_CORE_ADD),
+            StarPart::Tip { taper, .. } => {
+                let tip = at(taper);
+                ended |= tip == 0;
+                if ended {
+                    continue;
+                }
+                tip
             }
-            push_fx_rect(out, geom, sx + off, sy - th, len, tt, tip); // horizontal
-            if out.len() >= max_quads {
-                return false;
-            }
-            push_fx_rect(out, geom, sx - th, sy + off, tt, len, tip); // vertical
+            StarPart::Glint => at(STAR_GLINT_COV),
+        };
+        if i > 0 && out.len() >= max_quads {
+            return false;
         }
-    }
-    if gold {
-        let d = ((arm as f32 * STAR_GLINT).round() as i32).max(1);
-        let dim = premul_rgb(color, (f32::from(cov) * STAR_GLINT_COV) as u8);
-        for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
-            if out.len() >= max_quads {
-                return false;
-            }
-            push_fx_rect(out, geom, sx + ox, sy + oy, 1, 1, dim);
-        }
+        push_fx_rect(out, geom, sx + p.x, sy + p.y, p.w, p.h, paint);
     }
     true
 }
@@ -655,6 +852,45 @@ pub(crate) fn ink(out: &[GlowQuad]) -> u64 {
             px * (((q.color >> 16) & 0xff) + ((q.color >> 8) & 0xff) + (q.color & 0xff)) as u64
         })
         .sum()
+}
+
+/// The worst WCAG contrast against `ground` over one caret cell, window px
+/// `(x, y, w, h)`: the block `fill` painted first, then every quad composited
+/// OVER it by its own mode (`alpha == 0` a saturating add, else source-over).
+/// Harsher than the renderer's usual order, which draws the opaque block
+/// last; it is the case a translucent cursor or the GPU bloom meets, so a
+/// body that passes here keeps its caret legible under either. Quads are read
+/// flat (`color`/`alpha`), as these emitters push them.
+#[cfg(test)]
+pub(crate) fn caret_cell_worst_contrast(
+    fill: u32,
+    quads: &[GlowQuad],
+    cell: (i32, i32, i32, i32),
+    ground: u32,
+) -> f32 {
+    let (cx, cy, cw, ch) = cell;
+    let mut px = vec![fill & 0x00FF_FFFF; (cw * ch) as usize];
+    for q in quads {
+        let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
+        let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
+        for y in qy0.max(cy)..qy1.min(cy + ch) {
+            for x in qx0.max(cx)..qx1.min(cx + cw) {
+                let d = &mut px[((y - cy) * cw + (x - cx)) as usize];
+                let blend = |sh: u32| {
+                    let (dc, sc) = ((*d >> sh) & 0xff, (q.color >> sh) & 0xff);
+                    if q.alpha == 0 {
+                        (dc + sc).min(255)
+                    } else {
+                        (sc + (dc * (255 - u32::from(q.alpha)) + 127) / 255).min(255)
+                    }
+                };
+                *d = (blend(16) << 16) | (blend(8) << 8) | blend(0);
+            }
+        }
+    }
+    px.iter()
+        .map(|&c| crate::color_math::contrast_ratio(c, ground))
+        .fold(f32::INFINITY, f32::min)
 }
 
 #[cfg(test)]

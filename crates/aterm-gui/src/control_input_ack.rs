@@ -10,14 +10,12 @@ use crate::SessionCtx;
 use crate::input::EgressReceipt;
 use crate::session_log::InputVerb;
 use crate::session_timeline::SessionTimeline;
-use crate::subscribe::{SubscriberRegistry, Subscribers};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Clone)]
 pub(crate) struct InputMark {
     timeline: Weak<Mutex<SessionTimeline>>,
-    subscribers: Option<Weak<SubscriberRegistry>>,
     session: u64,
     epoch: Option<u32>,
     actor: aterm_slog::Actor,
@@ -52,13 +50,8 @@ impl InputMark {
     /// A mark at the session timeline's current epoch. Not named `new`: the
     /// lock-order census resolves a call by its name, so a `fn new` that takes
     /// `timeline` would read every `X::new()` under a held lock as taking it.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the receipt follows the existing input capability handles"
-    )]
     pub(crate) fn at_epoch(
         ctx: &SessionCtx,
-        subscribers: Option<&Subscribers>,
         session: u64,
         actor: aterm_slog::Actor,
         verb: InputVerb,
@@ -74,7 +67,6 @@ impl InputMark {
         };
         Self {
             timeline: Arc::downgrade(&ctx.timeline),
-            subscribers: subscribers.map(Arc::downgrade),
             session,
             epoch: Some(epoch),
             actor,
@@ -147,7 +139,7 @@ impl InputCompletion {
         let Some(timeline) = self.mark.timeline.upgrade() else {
             return;
         };
-        let owed = {
+        {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             if self.mark.epoch != Some(timeline.slog().log().ep()) {
                 return;
@@ -180,22 +172,13 @@ impl InputCompletion {
                     at,
                 );
             }
-            timeline.slog_take_wake()
-        };
+            // An owed wake rings the session's watchers under this lock.
+            timeline.slog_take_wake();
+        }
         // Credit only after the same nonempty/epoch/once gate as the log, and
         // outside its leaf lock. Queue admission and a wire reply never come here.
         if let Some((stamp, session, caller)) = self.mark.typist {
             stamp.record(&session, caller);
-        }
-        // The timeline is a leaf; subscribers are reached after releasing it.
-        if owed
-            && let Some(subscribers) = self.mark.subscribers.and_then(|s| s.upgrade())
-            && subscribers.any()
-        {
-            subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(self.mark.session);
         }
     }
 }

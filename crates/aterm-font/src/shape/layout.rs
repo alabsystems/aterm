@@ -29,6 +29,9 @@ pub(crate) fn substitute_start(face: &ShapeFace, buffer: &mut Buffer) {
 
 /// Applies the plan's `GSUB` lookups, running each stage's pause after it.
 pub(crate) fn substitute(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
+    // The first `gsub_lookup` parses every lookup of the face, so a face
+    // whose `GSUB` runs past its parse budget is shaped with none of it
+    // rather than with the lookups before the cut (`ShapeFace::gsub_lookups`).
     let digest = buffer_digest(buffer);
     let mut ctx = ApplyContext::new(face, buffer, digest);
     for (stage_index, stage) in plan.map.stages().iter().enumerate() {

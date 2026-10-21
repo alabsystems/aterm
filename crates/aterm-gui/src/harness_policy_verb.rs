@@ -7,6 +7,8 @@
 //!
 //! ```text
 //! OK gen=<cfg_gen> effective=<on|off> why=<word> <key>=<pct value|-> … questions=<word>
+//!    done_check_text=<pct> land_text=<pct> land_nudge_text=<pct> land_answer_text=<pct>
+//!    needs_hint_text=<pct> needs_ack_text=<pct>
 //! ```
 //!
 //! - `gen=` is the policy cell's generation (`0`: the launch read); the
@@ -23,13 +25,35 @@
 //!   order ([`SupervisorConfig::texts`]), percent-encoded, `-` for an empty
 //!   value; `continue_text=` already composed with the `rules_file` text the
 //!   way aterm's own continuation is ([`continuation_text`]);
-//! - `questions=` last, resolved: the session's own `meta questions` word over
-//!   `answer_questions` (off reads `ask`) and `question_priority`.
+//! - `questions=`, resolved: the session's own `meta questions` word over
+//!   `answer_questions` (off reads `ask`) and `question_priority`;
+//! - then FOREVER CRUISE / FOREVER LAND's fixed words, ADDITIVE keys after
+//!   `questions=` (the codex-alab contract's §3; owner 2026-10-19, "we need
+//!   this functionality in ALL HARNESSES"), each the exact text aterm's own
+//!   loop types for this session ([`act_texts`]), so a self-supervising agent
+//!   types aterm's words and never a copy that drifts from them:
+//!   `done_check_text=` (Cruise's defend-and-find-more prompt,
+//!   `continue-done-check@v1`, without the open work, repository, reversible
+//!   and ack suffixes a point adds), `land_text=` (`land@v1`),
+//!   `land_nudge_text=` (`land-nudge@v1`) and `land_answer_text=`
+//!   (`land-answer@v1`), each composed with the `rules_file` text exactly as
+//!   the loop composes the act (the rules after the words, cut to fit the
+//!   composer's verbatim cap); and `needs_hint_text=` (the NEEDS YOU hint
+//!   after an answer) and `needs_ack_text=` (the ack once per new set of
+//!   needs), the two SUFFIXES, bare: the loop types them inside an act,
+//!   before that act's one copy of the standing rules, never with rules of
+//!   their own — a suffix composed with them would type the rules twice in
+//!   every act that carries it. The session's Autopilot word is no key here
+//!   (`autopilot=` is the `[harness]` table's default): an agent reads its
+//!   own from `status autopilot=`.
 //!
-//! An edge token reads only `OK effective=<on|off>`: the full policy is the
-//! owner's.
+//! An edge token reads only `OK effective=<on|off>`: the full policy, the
+//! texts included, is the owner's.
 
-use aterm_agent::supervise::policy::turn_end::continuation_text;
+use aterm_agent::supervise::policy::needs::{NEEDS_ACK, NEEDS_HINT};
+use aterm_agent::supervise::policy::turn_end::{
+    continuation_text, done_check_text, land_answer_text, land_nudge_text, land_text,
+};
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_phase::Program;
 
@@ -99,6 +123,34 @@ pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String
     }
 }
 
+/// The additive text keys after `questions=` (module doc), in their wire
+/// order.
+pub(crate) const ACT_TEXT_KEYS: [&str; 6] = [
+    "done_check_text",
+    "land_text",
+    "land_nudge_text",
+    "land_answer_text",
+    "needs_hint_text",
+    "needs_ack_text",
+];
+
+/// FOREVER CRUISE / FOREVER LAND's fixed words as aterm's own loop types them
+/// for a session whose standing rules read `rules` (module doc), keyed by
+/// [`ACT_TEXT_KEYS`]: the four whole acts through the turn-end policy's own
+/// composers (the rules after the words), the two suffixes bare.
+#[must_use]
+pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
+    let [done_check, land, nudge, answer, hint, ack] = ACT_TEXT_KEYS;
+    [
+        (done_check, done_check_text(rules, false)),
+        (land, land_text(rules)),
+        (nudge, land_nudge_text(rules)),
+        (answer, land_answer_text(rules)),
+        (hint, NEEDS_HINT.to_string()),
+        (ack, NEEDS_ACK.to_string()),
+    ]
+}
+
 /// The reply line (module doc), newline-terminated. `rules` is the standing
 /// rules' text as the loop reads it
 /// (`aterm_agent::supervise::run::standing_rules`); `owner` whether the
@@ -127,12 +179,16 @@ pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> St
         line.push_str(&format!(" {key}={}", enc(&value)));
     }
     line.push_str(&format!(
-        " questions={}\n",
+        " questions={}",
         enc(&questions(
             &facts.policy,
             facts.session_questions.as_deref()
         ))
     ));
+    for (key, value) in act_texts(rules) {
+        line.push_str(&format!(" {key}={}", enc(&value)));
+    }
+    line.push('\n');
     line
 }
 
@@ -199,16 +255,8 @@ impl crate::App {
     /// itself re-reads `harness policy` on it rather than on a clock.
     pub(crate) fn announce_harness_policy(&self) {
         let generation = self.harness_policy.generation();
-        let mut moved = Vec::new();
         for pooled in self.pool.iter() {
             record_policy_move(&pooled.ctx.timeline, generation);
-            moved.push(pooled.id);
-        }
-        if self.subscribers.any() {
-            let subscribers = self.subscribers.lock().unwrap_or_else(|p| p.into_inner());
-            for id in moved {
-                subscribers.notify(id);
-            }
         }
     }
 }
@@ -373,8 +421,9 @@ mod tests {
     }
 
     /// The owner's reply carries every key in the config's own spelling and
-    /// order, each read back by the config's own setter to the policy it was
-    /// printed from (the one reader: nothing is respelled here).
+    /// order, then `questions=`, then the six additive texts, each `[harness]`
+    /// key read back by the config's own setter to the policy it was printed
+    /// from (the one reader: nothing is respelled here).
     #[test]
     fn the_owners_reply_is_every_key_in_its_own_spelling_and_reads_back() {
         let mut cfg = SupervisorConfig::default();
@@ -388,7 +437,8 @@ mod tests {
             line.starts_with("OK gen=7 effective=on why=enabled "),
             "{line}"
         );
-        assert!(line.ends_with(" questions=recommended\n"), "{line}");
+        assert!(line.ends_with('\n') && !line.trim_end().contains('\n'));
+        assert_eq!(field(&line, "questions").as_deref(), Some("recommended"));
         let keys: Vec<&str> = line
             .trim_end()
             .split(' ')
@@ -399,6 +449,7 @@ mod tests {
             .iter()
             .copied()
             .chain(["questions"])
+            .chain(ACT_TEXT_KEYS)
             .collect();
         assert_eq!(keys, want);
         let mut back = SupervisorConfig::default();
@@ -416,18 +467,85 @@ mod tests {
         }
         assert_eq!(back.texts(), cfg.texts());
         assert_eq!(
-            field(&line, "continue_text").as_deref(),
-            Some("keep%20going")
+            field(&line, "continue_text").map(|v| aterm_control::wire::pct_decode(&v)),
+            Some(cfg.continue_text.clone())
         );
     }
 
+    /// NEGATIVE CONTROL beside it: the reply's text is the composed one, so
+    /// the bare `continue_text` with rules standing is not what it says.
     #[test]
     fn continue_text_carries_the_standing_rules_as_the_loops_continuation_does() {
         let cfg = SupervisorConfig::default();
         let line = reply(&facts(cfg.clone()), Some("never force-push"), true);
         let text = aterm_control::wire::pct_decode(&field(&line, "continue_text").expect("a text"));
         assert_eq!(text, continuation_text(&cfg, Some("never force-push")));
-        assert_eq!(text, "keep going (standing rules: never force-push)");
+        assert_ne!(text, cfg.continue_text);
+        assert!(text.ends_with("never force-push)"), "{text}");
+    }
+
+    /// The decoded value of every additive text key in `line`, in wire order.
+    fn act_texts_of(line: &str) -> Vec<(&'static str, String)> {
+        ACT_TEXT_KEYS
+            .iter()
+            .map(|key| {
+                let raw = field(line, key).unwrap_or_else(|| panic!("{key}: {line}"));
+                assert_ne!(raw, "-", "{key} is never empty");
+                (*key, aterm_control::wire::pct_decode(&raw))
+            })
+            .collect()
+    }
+
+    /// THE SIX ADDITIVE TEXTS ARE aterm's OWN WORDS, AS ITS LOOP TYPES THEM
+    /// (the codex-alab contract's §3, FOREVER CRUISE / FOREVER LAND): after
+    /// `questions=`, `done_check_text`, `land_text`, `land_nudge_text` and
+    /// `land_answer_text` are the turn-end policy's own acts — its constants
+    /// with no rules standing, and with rules standing composed exactly as
+    /// the loop composes them (the act's own suffix-free words, then the
+    /// rules once) — and `needs_hint_text` and `needs_ack_text` are the two
+    /// suffixes, bare. NEGATIVE CONTROLS: a suffix carries no rules (one
+    /// composed with them would type the rules twice in every act it
+    /// rides), the four acts do; Cruise's words are not Land's; and an edge
+    /// reads none of them.
+    #[test]
+    fn the_six_texts_are_the_loops_own_words_composed_as_it_composes_them() {
+        use aterm_agent::supervise::policy::turn_end::{DONE_CHECK, LAND, LAND_ANSWER, LAND_NUDGE};
+        let cfg = SupervisorConfig::default();
+        let bare = act_texts_of(&reply(&facts(cfg.clone()), None, true));
+        assert_eq!(
+            bare,
+            [
+                ("done_check_text", DONE_CHECK.to_string()),
+                ("land_text", LAND.to_string()),
+                ("land_nudge_text", LAND_NUDGE.to_string()),
+                ("land_answer_text", LAND_ANSWER.to_string()),
+                ("needs_hint_text", NEEDS_HINT.to_string()),
+                ("needs_ack_text", NEEDS_ACK.to_string()),
+            ]
+        );
+        let rules = "never force-push";
+        let ruled = act_texts_of(&reply(&facts(cfg.clone()), Some(rules), true));
+        assert_eq!(ruled, act_texts(Some(rules)).to_vec());
+        assert_eq!(ruled[0].1, done_check_text(Some(rules), false));
+        assert_eq!(ruled[1].1, land_text(Some(rules)));
+        assert_eq!(ruled[2].1, land_nudge_text(Some(rules)));
+        assert_eq!(ruled[3].1, land_answer_text(Some(rules)));
+        for ((key, with), (_, without)) in ruled.iter().zip(&bare) {
+            let suffix = matches!(*key, "needs_hint_text" | "needs_ack_text");
+            assert_eq!(with.contains(rules), !suffix, "{key}: {with}");
+            if suffix {
+                assert_eq!(with, without, "{key}");
+            } else {
+                assert!(with.starts_with(without.as_str()), "{key}: {with}");
+            }
+        }
+        assert_ne!(bare[0].1, bare[1].1, "Cruise's words are not Land's");
+        // The texts stay out of an edge's reply.
+        let edge = reply(&facts(cfg), Some(rules), false);
+        assert!(
+            ACT_TEXT_KEYS.iter().all(|k| field(&edge, k).is_none()),
+            "{edge}"
+        );
     }
 
     #[test]
@@ -488,7 +606,7 @@ mod tests {
             timeline
                 .since(None)
                 .filter(|e| e.kind == HARNESS_POLICY_EVENT)
-                .map(|e| e.payload.clone())
+                .map(|e| e.payload.to_string())
                 .collect::<Vec<_>>()
         };
         let line = |app: &crate::App| {

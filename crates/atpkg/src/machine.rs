@@ -30,7 +30,9 @@ pub const UNIVERSAL_CONTROL_REVERT: &str = "defaults -currentHost delete \
 /// The `machine-settings:` entry for a Universal Control change (contract string).
 pub const UNIVERSAL_CONTROL_ENTRY: &str = "universal-control disabled";
 
-/// What one `defaults -currentHost read` answered about one key.
+/// What one `defaults -currentHost read` answered about one key: the converge engine's
+/// tri-state read (docs/DESIGN-init-system-2026-10-20.md §3.1), which the machines
+/// families keep too.
 ///
 /// ABSENT AND UNUSABLE ARE NOT THE SAME ANSWER (2026-09-15). Both used to arrive as
 /// `None`, so a `defaults` that could not be run, was killed at its deadline, or
@@ -38,17 +40,8 @@ pub const UNIVERSAL_CONTROL_ENTRY: &str = "universal-control disabled";
 /// OS DEFAULT: "the cursor roams to other Macs and iPads", with Apply offered as if the
 /// machine had been measured. It had not been. A key that is absent is a measurement —
 /// `defaults` exits 1 with empty output to say "does not exist", which IS the OS
-/// default — and anything else is the absence of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyRead {
-    /// The key holds a value this module understands.
-    Value(bool),
-    /// The key is not set: the documented "does not exist" answer.
-    Absent,
-    /// Nothing could be learned: `defaults` would not run, took too long, or said
-    /// something unreadable.
-    Unusable,
-}
+/// default — and anything else is the absence of one: [`Read::Unusable`], with why.
+pub use aterm_converge::Read;
 
 /// Universal Control's two per-host switches, as read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,7 +51,7 @@ pub struct UniversalControlState {
     /// `DisableMagicEdges`: `Some(true)` = no screen-edge hand-off.
     pub magic_edges: Option<bool>,
     /// Both keys were actually MEASURED — a value, or a documented absence. `false`
-    /// when either read was [`KeyRead::Unusable`], and then neither `Option` above may
+    /// when either read was [`Read::Unusable`], and then neither `Option` above may
     /// be read as "the OS default".
     pub measured: bool,
 }
@@ -66,18 +59,18 @@ pub struct UniversalControlState {
 impl UniversalControlState {
     /// Fold the port's two answers.
     #[must_use]
-    pub const fn from_reads(reads: [KeyRead; 2]) -> Self {
-        const fn value(read: KeyRead) -> Option<bool> {
+    pub fn from_reads(reads: [Read<bool>; 2]) -> Self {
+        const fn value(read: &Read<bool>) -> Option<bool> {
             match read {
-                KeyRead::Value(v) => Some(v),
-                KeyRead::Absent | KeyRead::Unusable => None,
+                Read::Value(v) => Some(*v),
+                Read::Absent | Read::Unusable(_) => None,
             }
         }
         Self {
-            disable: value(reads[0]),
-            magic_edges: value(reads[1]),
-            measured: !matches!(reads[0], KeyRead::Unusable)
-                && !matches!(reads[1], KeyRead::Unusable),
+            disable: value(&reads[0]),
+            magic_edges: value(&reads[1]),
+            measured: !matches!(reads[0], Read::Unusable(_))
+                && !matches!(reads[1], Read::Unusable(_)),
         }
     }
 }
@@ -99,7 +92,14 @@ impl UniversalControlState {
     /// `warn` when the pass is about to change it, `ok` when the policy says leave.
     #[must_use]
     pub fn doctor_line(&self, policy: UniversalControlPolicy) -> String {
-        self.line(policy, true)
+        crate::doctor::spelled(&self.doctor_row(policy))
+    }
+
+    /// [`Self::doctor_line`] as the typed row `aterm pkg doctor`'s
+    /// `base.machine.universal-control` item reports.
+    #[must_use]
+    pub fn doctor_row(&self, policy: UniversalControlPolicy) -> crate::doctor::Row {
+        self.row(policy, true)
     }
 
     /// [`Self::doctor_line`] without its `now:` action: the state alone, for a read whose
@@ -107,10 +107,11 @@ impl UniversalControlState {
     /// `aterm pkg machine apply` twice.
     #[must_use]
     pub fn state_line(&self, policy: UniversalControlPolicy) -> String {
-        self.line(policy, false)
+        crate::doctor::spelled(&self.row(policy, false))
     }
 
-    fn line(&self, policy: UniversalControlPolicy, with_action: bool) -> String {
+    fn row(&self, policy: UniversalControlPolicy, with_action: bool) -> crate::doctor::Row {
+        use crate::doctor::{Level, Row};
         let now = if with_action {
             " — now: `aterm pkg machine apply`"
         } else {
@@ -120,14 +121,19 @@ impl UniversalControlState {
             // Never "the OS default": nothing was measured, and the remedy is the same
             // either way, so say what is true and what happens next.
             return match policy {
-                UniversalControlPolicy::Off => format!(
-                    "warn — Universal Control could not be read on this host; {DAILY_OFF}{now}"
-                ),
-                UniversalControlPolicy::Leave => {
-                    "ok — Universal Control could not be read on this host, and [machine] \
-                     universal_control = \"leave\" means nothing would be written either way"
-                        .to_string()
-                }
+                UniversalControlPolicy::Off => Row {
+                    level: Level::Warn,
+                    text: format!(
+                        "Universal Control could not be read on this host; {DAILY_OFF}{now}"
+                    ),
+                },
+                UniversalControlPolicy::Leave => Row {
+                    level: Level::Ok,
+                    text: "Universal Control could not be read on this host, and [machine] \
+                           universal_control = \"leave\" means nothing would be written either \
+                           way"
+                    .to_string(),
+                },
             };
         }
         if self.disabled() {
@@ -140,10 +146,13 @@ impl UniversalControlState {
                 UniversalControlPolicy::Off => "set [machine] universal_control = \"leave\" and ",
                 UniversalControlPolicy::Leave => "",
             };
-            return format!(
-                "ok — Universal Control is disabled on this host; to turn it back on, {keep}\
-                 run: {UNIVERSAL_CONTROL_REVERT}"
-            );
+            return Row {
+                level: Level::Ok,
+                text: format!(
+                    "Universal Control is disabled on this host; to turn it back on, {keep}\
+                     run: {UNIVERSAL_CONTROL_REVERT}"
+                ),
+            };
         }
         // A HALF-DISABLED HOST IS NOT AT THE OS DEFAULT. One key set is a state someone
         // (or a previous half-finished pass) made, and calling it the default while the
@@ -156,13 +165,19 @@ impl UniversalControlState {
                 .to_string()
         };
         match policy {
-            UniversalControlPolicy::Off => format!(
-                "warn — Universal Control is {posture}; {DAILY_OFF}, unless [machine] \
-                 universal_control = \"leave\"{now}"
-            ),
-            UniversalControlPolicy::Leave => format!(
-                "ok — Universal Control left {posture} ([machine] universal_control = \"leave\")"
-            ),
+            UniversalControlPolicy::Off => Row {
+                level: Level::Warn,
+                text: format!(
+                    "Universal Control is {posture}; {DAILY_OFF}, unless [machine] \
+                     universal_control = \"leave\"{now}"
+                ),
+            },
+            UniversalControlPolicy::Leave => Row {
+                level: Level::Ok,
+                text: format!(
+                    "Universal Control left {posture} ([machine] universal_control = \"leave\")"
+                ),
+            },
         }
     }
 
@@ -210,7 +225,7 @@ pub fn parse_defaults_bool(stdout: &[u8]) -> Option<bool> {
 /// testable against a fake and the tests never touch the machine.
 pub trait UniversalControlPort {
     /// `[Disable, DisableMagicEdges]` as [`crate::platform::universal_control_state`].
-    fn state(&self) -> [KeyRead; 2];
+    fn state(&self) -> [Read<bool>; 2];
     /// Write both keys true; `true` iff both writes succeeded.
     fn disable(&self) -> bool;
 }
@@ -220,7 +235,7 @@ pub trait UniversalControlPort {
 pub struct SystemDefaults;
 
 impl UniversalControlPort for SystemDefaults {
-    fn state(&self) -> [KeyRead; 2] {
+    fn state(&self) -> [Read<bool>; 2] {
         crate::platform::universal_control_state()
     }
     fn disable(&self) -> bool {
@@ -738,12 +753,12 @@ mod tests {
     }
 
     impl UniversalControlPort for Fake {
-        fn state(&self) -> [KeyRead; 2] {
+        fn state(&self) -> [Read<bool>; 2] {
             let read = |v: Option<bool>| {
                 if self.unusable {
-                    KeyRead::Unusable
+                    Read::Unusable("defaults timed out".into())
                 } else {
-                    v.map_or(KeyRead::Absent, KeyRead::Value)
+                    v.map_or(Read::Absent, Read::Value)
                 }
             };
             [read(self.disable.get()), read(self.edges.get())]
@@ -877,16 +892,25 @@ mod tests {
         // From the reads: both keys absent is the MEASURED OS default, one key set is a
         // half state, and a read that did not happen (the default value) is never the
         // OS default.
-        let read = UniversalControlState::from_reads([KeyRead::Absent, KeyRead::Absent]);
+        let read = UniversalControlState::from_reads([Read::Absent, Read::Absent]);
         assert!(read.measured);
         assert_eq!(read.posture(), UcPosture::Default);
         assert_eq!(
-            UniversalControlState::from_reads([KeyRead::Value(true), KeyRead::Absent]).posture(),
+            UniversalControlState::from_reads([Read::Value(true), Read::Absent]).posture(),
             UcPosture::Partial
         );
         let unread = UniversalControlState::default();
         assert!(!unread.measured);
         assert_eq!(unread.posture(), UcPosture::Unknown);
+        // Nor is a read that answered nothing usable, beside an absent key or a set one.
+        for other in [Read::Absent, Read::Value(true)] {
+            let unusable = Read::Unusable("defaults passed its deadline".into());
+            for reads in [[unusable.clone(), other.clone()], [other.clone(), unusable]] {
+                let state = UniversalControlState::from_reads(reads);
+                assert!(!state.measured);
+                assert_eq!(state.posture(), UcPosture::Unknown);
+            }
+        }
     }
 
     /// THE VERDICT TABLE — the read verb's `next —` line and the window's Apply button

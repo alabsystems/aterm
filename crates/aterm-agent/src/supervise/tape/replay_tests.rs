@@ -76,6 +76,149 @@ fn each_door_serves_its_record() {
     assert_eq!(st.lines, ["APPROVED seq=1 ls"]);
 }
 
+/// AN ACT'S ROW REPLAYS IN THE BOOT SPELLING ITS TAPE RECORDED: a tape a
+/// build before the boot was read as bytes recorded (the kernel's text as it
+/// came — Linux's lower-case `boot_id`, macOS's upper-case
+/// `kern.bootsessionuuid` — in the count and in the act's ledger row) is fed
+/// back through the probe door the loop reads ([`Fx::asleep_for_ledger`])
+/// and its validated counted writer
+/// (`approvals::Ledger::write_counted_with_boot_text`),
+/// and the row it writes is the recorded one, byte for byte: the boot keeps
+/// the case it was read in (`policy::sleeps::Boot`), while the count compares
+/// by the 16 bytes alone. A count whose boot text names no boot (the all-zero
+/// id, a test's old name) replays as no named boot, and its row holds no count.
+/// Broader accepted text (mixed case, missing or displaced hyphens, and a
+/// NUL-framed UUID) also retains its exact recorded JSON spelling, without
+/// changing this host's live boot form. These are admitted-reader controls,
+/// not claims about text a normal historical kernel produced.
+/// NEGATIVE CONTROL: the Linux tape against a row written upper-case — what a
+/// build that spells every boot as macOS does would emit — diverges at the
+/// ledger door.
+#[test]
+fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
+    use crate::supervise::approvals::{Ledger, Outcome, Row};
+    use crate::supervise::policy::sleeps::{Boot, SleepStamp};
+    const UPPER: &str = "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9";
+    const LOWER_ROW: &str = r#"{"ts":1790000000000,"sid":"s-1","rule_id":"limit-resume","decision":"typed","cmd_sha256":"e256ee8e7aff6957a781d8328f0f68e26996564c81fa458da59fbca2305138ad","command":"continue","reason":"the limit reset","box_seq":3,"slept_ms":1800003,"boot":"4d5a1b2c-3e4f-5061-7283-94a5b6c7d8e9"}"#;
+    const UPPER_ROW: &str = r#"{"ts":1790000000000,"sid":"s-1","rule_id":"limit-resume","decision":"typed","cmd_sha256":"e256ee8e7aff6957a781d8328f0f68e26996564c81fa458da59fbca2305138ad","command":"continue","reason":"the limit reset","box_seq":3,"slept_ms":1800003,"boot":"4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9"}"#;
+    const UNCOUNTED_ROW: &str = r#"{"ts":1790000000000,"sid":"s-1","rule_id":"limit-resume","decision":"typed","cmd_sha256":"e256ee8e7aff6957a781d8328f0f68e26996564c81fa458da59fbca2305138ad","command":"continue","reason":"the limit reset","box_seq":3}"#;
+    const LOWER: &[u8] = b"1800003 4d5a1b2c-3e4f-5061-7283-94a5b6c7d8e9";
+    let row = Row {
+        rule_id: "limit-resume",
+        outcome: Outcome::Typed,
+        command: "continue",
+        reason: "the limit reset",
+        box_seq: 3,
+    };
+    // The act as the loop writes it, replayed off a tape whose count is
+    // `reply` and whose ledger row is `recorded`.
+    let replay_act = |reply: &[u8], recorded: &str| {
+        let core = core_of(vec![
+            exchange(doors::PROBE_ASLEEP, b"", reply),
+            EffectRecord::Clock(1_790_000_000_000_000_000),
+            EffectRecord::Emit {
+                door: doors::LEDGER.to_string(),
+                bytes: recorded.as_bytes().to_vec(),
+            },
+        ]);
+        let fx = Fx::replay(Arc::clone(&core));
+        let (count, spelling) = fx.asleep_for_ledger();
+        let count = count.expect("the recorded count");
+        let mut ledger = Ledger::named(Some(Path::new("/not-opened/ledger")), Some("@s-1"));
+        let line = ledger
+            .write_counted_with_boot_text(
+                fx.stamp_ms(),
+                &row,
+                Some(&count),
+                spelling.as_deref(),
+                &mut io::sink(),
+            )
+            .expect("a named ledger returns its row without opening it");
+        let emitted = run(|| fx.emit(doors::LEDGER, || line.into_bytes()));
+        (count, emitted, core)
+    };
+    for (reply, recorded, named) in [
+        (LOWER, LOWER_ROW, true),
+        (
+            b"1800003 4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9".as_slice(),
+            UPPER_ROW,
+            true,
+        ),
+        (
+            b"1800003 00000000-0000-0000-0000-000000000000".as_slice(),
+            UNCOUNTED_ROW,
+            false,
+        ),
+        (b"1800003 test-boot".as_slice(), UNCOUNTED_ROW, false),
+    ] {
+        let (count, emitted, core) = replay_act(reply, recorded);
+        assert_eq!(
+            count.boot.map(|b| b.id()),
+            named.then(|| Boot::of(UPPER).expect("a boot").id())
+        );
+        assert_eq!(
+            count.since(&SleepStamp {
+                asleep: Duration::from_millis(1_800_000),
+                boot: Boot::of(UPPER),
+            }),
+            named.then(|| Duration::from_millis(3)),
+            "the spelling never decides the comparison"
+        );
+        assert!(emitted.is_ok(), "{:?}", core.diverged());
+        assert_eq!(core.consumed(), (3, 3));
+        assert!(core.diverged().is_none());
+    }
+    for (boot, recorded_boot) in [
+        (
+            "4D5a1B2C-3E4F-5061-7283-94A5B6C7D8E9",
+            "4D5a1B2C-3E4F-5061-7283-94A5B6C7D8E9",
+        ),
+        (
+            "4D5A1B2C3E4F5061728394A5B6C7D8E9",
+            "4D5A1B2C3E4F5061728394A5B6C7D8E9",
+        ),
+        (
+            "4D5A1B2C-3E4F-5061-72839-4A5B6C7D8E9-",
+            "4D5A1B2C-3E4F-5061-72839-4A5B6C7D8E9-",
+        ),
+        (
+            "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9\0a",
+            r"4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9\u0000a",
+        ),
+    ] {
+        let reply = format!("1800003 {boot}");
+        let recorded = UPPER_ROW.replace(UPPER, recorded_boot);
+        let (count, emitted, core) = replay_act(reply.as_bytes(), &recorded);
+        assert_eq!(count.boot, Boot::of(UPPER), "same typed boot: {boot:?}");
+        assert!(emitted.is_ok(), "{boot:?}: {:?}", core.diverged());
+        assert_eq!(core.consumed(), (3, 3));
+        assert!(core.diverged().is_none());
+        // Captured text cannot substitute another id or turn an unknown
+        // id into this count, even when it is passed directly to the writer.
+        let mut ledger = Ledger::named(Some(Path::new("/not-opened/ledger")), Some("s-1"));
+        for other in [
+            "00000000-0000-0000-0000-000000000000",
+            "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8EA",
+        ] {
+            assert_eq!(
+                ledger.write_counted_with_boot_text(
+                    1_790_000_000_000,
+                    &row,
+                    Some(&count),
+                    Some(other),
+                    &mut io::sink(),
+                ),
+                Some(row.to_json_counted(1_790_000_000_000, Some("s-1"), Some(&count))),
+                "CONTROL: another boot cannot be substituted",
+            );
+        }
+    }
+    let (_, emitted, core) = replay_act(LOWER, UPPER_ROW);
+    assert!(emitted.is_err(), "CONTROL: a respelt boot diverges");
+    let d = core.diverged().expect("latched");
+    assert_eq!(d.door.as_deref(), Some(doors::LEDGER), "CONTROL: {d:?}");
+}
+
 /// A divergence unwinds from the door it is found at, latched as the first:
 /// its place, its door and its class; and nothing is served after it — a
 /// door asked again (as a loop that caught the unwind would) unwinds again,

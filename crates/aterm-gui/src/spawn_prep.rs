@@ -18,8 +18,8 @@
 //!   (`aterm_pty::fill_spawn_kits`), whose fill also closes the channel ends
 //!   finished spawns left;
 //! * child provisions: a child identity minted, its edge-token file written
-//!   and locked under the control dir ([`take_provision`]), and registered only
-//!   by the spawn that takes it.
+//!   and locked under the control dir ([`take_provision`]), and owned only by
+//!   the spawn that takes it (its `proxy::ChildProxy`).
 //!
 //! Each fresh spawn tops both up ([`poke`]). A closed session's edge-token file
 //! is removed there too ([`retire_edge_file`]), in the same order as before:

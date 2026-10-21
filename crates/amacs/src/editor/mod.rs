@@ -10,28 +10,38 @@
 //!
 //! One module per concern, so slices that add commands touch different files:
 //!
-//! - `command`: the closed command table, M-x completion and the `C-u` argument;
+//! - `command`: the closed command table (names, authority, prompts), an
+//!   `Invocation`, M-x completion and the `C-u` argument;
 //! - `chord` and `keymap`: key chords and the keymap trie with its built-in tables;
 //! - `workspace`: shared state and the reducer's entry points (`execute`,
-//!   `handle_chord`, `insert_text`) and their effects and errors;
+//!   `invoke`, `handle_chord`, `insert_text`) and their effects and errors;
 //! - `view`: one view's selections, viewport and caret motion;
-//! - `minibuffer`: the modal queries;
+//! - `minibuffer`: the modal queries and command prompts;
 //! - `projection`: the visible-line projection and the line index;
 //! - `history`: undo and redo;
 //! - `search`: incremental search;
 //! - `kill`: the kill ring, kills and yanks;
+//! - `mark`: the mark ring and the commands that move by it;
+//! - `edit`: newline, open-line, transpose-chars and TAB;
+//! - `fill`: fill-paragraph;
 //! - `macros`: keyboard macros.
 //!
 //! Every public item is re-exported here, so `amacs::editor::X` (aterm-gui's
 //! `native_editor::X`) names it whichever module holds it. A module that
 //! gains its first public item adds its line below.
 
+// `trust_contract_fn!` and `verify_island!` are the crate's, defined in
+// lib.rs before the modules.
+
 mod chord;
 mod command;
+mod edit;
+mod fill;
 mod history;
 mod keymap;
 mod kill;
 mod macros;
+mod mark;
 mod minibuffer;
 mod projection;
 mod search;

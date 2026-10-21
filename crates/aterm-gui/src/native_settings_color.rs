@@ -34,6 +34,9 @@
 //! `#RRGGBB` saves through the hex row's own path, so a value that is not a
 //! colour becomes the row's repairable draft. The arrow keys turn the hue
 //! (Left, Right) and change the saturation (Up, Down) of a focused wheel.
+//! The trail colour's picker also holds Cursor color
+//! (`settings/color-cursor/<key>`), the choice of the one value beside a
+//! colour that key takes: the cursor's colour ([`prefs::TRAIL_COLOR_CURSOR`]).
 
 use super::*;
 use crate::native_ui::ColorWheelSpec;
@@ -216,8 +219,9 @@ fn theme_own_colors(state: &SettingsViewState) -> crate::resolved_colors::Resolv
 /// THE COLOUR AN UNSET COLOUR KEY DRAWS, the one its placeholder names: the
 /// theme's own foreground, background, cursor or selection, or its own
 /// selected-text colour; the saved cursor style's own trail colour (Laser's
-/// violet, its accent brighter); the automatic selected-tab colour the window
-/// paints. The row's chip shows it and the picker starts from it.
+/// violet), and the accent brighter than what a window brightens (that
+/// colour, or the trail colour chosen); the automatic selected-tab colour
+/// the window paints. The row's chip shows it and the picker starts from it.
 ///
 /// `None` where no single colour is true to the default: a trail colour that
 /// follows the cursor colour (which a program may recolour), or a selected
@@ -225,15 +229,31 @@ fn theme_own_colors(state: &SettingsViewState) -> crate::resolved_colors::Resolv
 pub(super) fn unset_color_swatch(state: &SettingsViewState, key: &str) -> Option<[u8; 3]> {
     let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
     match key {
-        prefs::EDIT_CURSOR_TRAIL_COLOR | prefs::EDIT_CURSOR_TRAIL_ACCENT => {
+        prefs::EDIT_CURSOR_TRAIL_COLOR => {
             let style = crate::app_config::resolve_trail_style(&saved_cursor_style(state)).style?;
-            let (color, _) = aterm_effects::cursor_fx::own_trail_color(style)?;
-            let color = if key == prefs::EDIT_CURSOR_TRAIL_ACCENT {
-                aterm_effects::cursor_fx::brighten(color, 1.5)
-            } else {
-                color
-            };
+            // The colour law the row's placeholder names
+            // (`prefs::editable_fields`): a saved cursor colour pins Beam,
+            // Comet and Sparkle to it.
+            let pinned = state.is_explicit(prefs::EDIT_CURSOR_COLOR);
+            let (color, _) = aterm_effects::cursor_fx::own_trail_color(style, pinned)?;
             Some(rgb(color))
+        }
+        // The accent brightens what a window brightens: the style's own
+        // colour (under the same law), or the trail colour chosen where the
+        // style draws it.
+        prefs::EDIT_CURSOR_TRAIL_ACCENT => {
+            use aterm_effects::cursor_fx::AccentBase;
+            let style = crate::app_config::resolve_trail_style(&saved_cursor_style(state)).style?;
+            let color = prefs::trail_color_setting(
+                state.raw_value(prefs::EDIT_CURSOR_TRAIL_COLOR).as_deref(),
+            );
+            let pinned = state.is_explicit(prefs::EDIT_CURSOR_COLOR);
+            match aterm_effects::cursor_fx::unset_accent_base(style, color, pinned) {
+                AccentBase::Own(base, _) | AccentBase::Trail(base) => {
+                    Some(rgb(aterm_effects::cursor_fx::brighten(base, 1.5)))
+                }
+                AccentBase::Cursor => None,
+            }
         }
         prefs::EDIT_ACTIVE_TAB_COLOR => Some(state.presented_motion.get().automatic_tab_color),
         prefs::EDIT_FOREGROUND => Some(rgb(theme_own_colors(state).theme().fg)),
@@ -261,12 +281,22 @@ pub(super) fn default_color_chip(state: &SettingsViewState, field: &EditField) -
 /// ([`unset_color_swatch`]); a saved value that is not a colour draws the
 /// default too. `None` while no single colour is known.
 pub(super) fn color_now(state: &SettingsViewState, key: &str) -> Option<[u8; 3]> {
-    state
-        .raw_value(key)
-        .as_deref()
+    let raw = state.raw_value(key);
+    if trail_color_is_cursor(key, raw.as_deref()) {
+        // The cursor's colour, which a program may recolour: no one colour.
+        return None;
+    }
+    raw.as_deref()
         .and_then(aterm_types::scheme::parse_hex)
         .map(|color| [color.r, color.g, color.b])
         .or_else(|| unset_color_swatch(state, key))
+}
+
+/// Whether `raw` is the trail colour's word for the cursor's colour
+/// ([`prefs::TRAIL_COLOR_CURSOR`]).
+fn trail_color_is_cursor(key: &str, raw: Option<&str>) -> bool {
+    key == prefs::EDIT_CURSOR_TRAIL_COLOR
+        && prefs::trail_color_setting(raw) == aterm_effects::cursor_fx::TrailColor::Cursor
 }
 
 /// The colour `target` draws now: a key's ([`color_now`]), or the open
@@ -369,6 +399,9 @@ impl ColorSubject {
 /// The colour a row names, in words: the saved `#RRGGBB`, or the default's
 /// words and the colour they name ("Automatic (default), #3A3A3E").
 fn color_words(state: &SettingsViewState, field: &EditField) -> String {
+    if trail_color_is_cursor(field.key, state.raw_value(field.key).as_deref()) {
+        return prefs::TRAIL_COLOR_CURSOR_LABEL.to_string();
+    }
     if let Some(color) = state
         .raw_value(field.key)
         .as_deref()
@@ -470,20 +503,132 @@ fn color_brightness_node(state: &SettingsViewState, subject: &ColorSubject) -> U
 }
 
 /// Brightness as a row of a column `column_width` wide, laid out the way a
-/// registry row is at `width`.
+/// registry row is at `width`. In the trail colour's picker its Cursor color
+/// ([`cursor_color_button`]) ends the row, so the picker is no taller for it
+/// and fits every list Brightness alone fits (80x24's Adjust card holds one
+/// row beside the wheel); where the slider beside it would be squeezed below
+/// its least, the button takes a line of its own under the slider.
 fn color_brightness_row(
     state: &SettingsViewState,
     subject: &ColorSubject,
     width: SettingsWidth,
     column_width: f32,
 ) -> (UiNode, f32) {
-    page_control_row(
-        &format!("settings/color/{}/brightness-row", subject.target.id()),
-        "Brightness",
-        color_brightness_node(state, subject),
-        width,
-        column_width,
+    let id = subject.target.id();
+    let key = format!("settings/color/{id}/brightness-row");
+    let slider = color_brightness_node(state, subject);
+    let Some((button, button_width)) = cursor_color_button(state, subject) else {
+        return page_control_row(&key, "Brightness", slider, width, column_width);
+    };
+    // The room the row gives its control: beside its label, or the column.
+    let (alone, height) = page_control_row(&key, "Brightness", slider.clone(), width, column_width);
+    let control_width = match alone.children.get(1).map(|control| control.layout.width) {
+        Some(Length::Fixed(room)) => room,
+        _ => column_width,
+    };
+    const GAP: f32 = 8.0;
+    if control_width - button_width - GAP >= PAGE_CONTROL_FLOOR * settings_text_scale().min(1.25) {
+        let mut slider = slider;
+        slider.layout = Layout::default().width(Length::Fill).height(Length::Fill);
+        let control = UiNode::new(
+            format!("settings/color/{id}/brightness-controls"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::row().gap(GAP))
+        .children(vec![slider, button]);
+        return page_control_row(&key, "Brightness", control, width, column_width);
+    }
+    let line = scaled_control_height();
+    let button_line = UiNode::new(
+        format!("settings/color/{id}/cursor-line"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
     )
+    .layout(Layout::row().height(Length::Fixed(line)))
+    .children(vec![button]);
+    let total = height + 4.0 + line;
+    (
+        UiNode::new(
+            format!("settings/color/{id}/brightness-block"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::column().height(Length::Fixed(total)).gap(4.0))
+        .children(vec![alone, button_line]),
+        total,
+    )
+}
+
+/// The node key of the trail colour picker's Cursor color.
+fn cursor_color_button_key(key: &str) -> String {
+    format!("settings/color/{key}/cursor")
+}
+
+/// THE TRAIL COLOUR'S CURSOR COLOR, in its picker, and its width: chosen
+/// (marked, Brightness idle with no one colour to brighten), the trail is
+/// drawn in the cursor's colour, following it as a program recolours it
+/// (`cursor`, [`prefs::TRAIL_COLOR_CURSOR`], what the old `classic mono` style
+/// says); pressed again, or a pick on the wheel, and the trail takes a colour
+/// of its own. So the word is a choice in the picker, not only something to
+/// type. `None` for every other target: no other colour takes the word.
+fn cursor_color_button(state: &SettingsViewState, subject: &ColorSubject) -> Option<(UiNode, f32)> {
+    let ColorTarget::Key(key) = subject.target else {
+        return None;
+    };
+    if key != prefs::EDIT_CURSOR_TRAIL_COLOR {
+        return None;
+    }
+    const VISUAL: &str = "Cursor color";
+    let button_key = cursor_color_button_key(key);
+    let chosen = trail_color_is_cursor(key, state.raw_value(key).as_deref());
+    let pending = subject.pending;
+    // The label, the check it wears while chosen, and the button's insets.
+    let width = crate::native_ui::native_button_label_width(VISUAL) + 26.0 + 22.0;
+    let button = UiNode::new(
+        button_key.clone(),
+        UiContent::Button(
+            Control::new(
+                ButtonSpec {
+                    label: if chosen {
+                        "Cursor color, chosen: the trail follows the cursor's color".to_string()
+                    } else {
+                        "Cursor color: draw the trail in the cursor's color".to_string()
+                    },
+                    visual_label: Some(VISUAL.to_string()),
+                    visual_icon: None,
+                    trailing_icon: chosen.then_some(ButtonIcon::Check),
+                    description: Some(
+                        "The trail follows the cursor's color, as programs change it; pressed \
+                         again, it keeps the color the cursor has now"
+                            .to_string(),
+                    ),
+                    badge: false,
+                    swatches: Vec::new(),
+                    chip: None,
+                },
+                ActionId::new(format!("settings/color-cursor/{key}")),
+            )
+            .value(SemanticValue::Text(
+                if chosen { "Chosen" } else { "Not chosen" }.to_string(),
+            ))
+            .state(ControlState {
+                enabled: !pending,
+                busy: pending,
+                selected: chosen,
+                focused: state
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .is_some_and(|focus| focus.as_str() == button_key),
+                ..ControlState::default()
+            })
+            .style(StyleRef::Secondary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(width))
+            .height(Length::Fill),
+    );
+    Some((button, width))
 }
 
 /// The wheel beside its controls, at least `floor` wide.
@@ -665,6 +810,9 @@ fn color_picker_card(
     };
     const PAD: f32 = 4.0;
     let inner = (room - 2.0 * PAD).max(scaled_control_height());
+    // The stack's padding is on every side: its rows have the card's width
+    // less both insets.
+    let text_width = text_width - 2.0 * PAD;
     let beside = |floor: f32, column: SettingsWidth| {
         color_picker_beside(
             state,
@@ -711,7 +859,7 @@ fn color_picker_card(
         Layout::column()
             .width(Length::Fill)
             .height(Length::Fixed(height))
-            .padding(Insets::symmetric(PAD, 0.0))
+            .padding(Insets::all(PAD))
             .gap(4.0),
     )
     .children(children);
@@ -857,13 +1005,20 @@ pub(super) fn page_owned_control_keys(
 }
 
 /// The keys an open picker under `key`'s row adds to the keyboard order,
-/// after the row's own: the wheel, then Brightness.
+/// after the row's own: the wheel, then Brightness, then the trail colour's
+/// Cursor color ([`cursor_color_button`]).
 pub(super) fn open_color_picker_keys(state: &SettingsViewState, key: &str) -> Vec<UiKey> {
     match state.open_color_picker().filter(|open| *open == key) {
-        Some(key) => vec![
-            UiKey::new(format!("settings/color/{key}/wheel")),
-            UiKey::new(format!("settings/color/{key}/brightness")),
-        ],
+        Some(key) => {
+            let mut keys = vec![
+                UiKey::new(format!("settings/color/{key}/wheel")),
+                UiKey::new(format!("settings/color/{key}/brightness")),
+            ];
+            if key == prefs::EDIT_CURSOR_TRAIL_COLOR {
+                keys.push(UiKey::new(cursor_color_button_key(key)));
+            }
+            keys
+        }
         None => Vec::new(),
     }
 }
@@ -982,6 +1137,9 @@ fn add_color_chooser(
             if let Length::Fixed(row_height) = row.layout.height {
                 row.layout.height = Length::Fixed(row_height + 4.0 + height);
             }
+            // On a line of its own the button is never wider than the column.
+            let mut button = button;
+            button.layout.width = Length::Fixed(button_width.min(text_width));
             row.children.push(
                 UiNode::new(
                     format!("settings/color/{key}/chooser-line"),
@@ -1014,6 +1172,7 @@ pub(super) fn tab_color_page(
     let text_width = settings_group_text_width(viewport, width);
     let gap = settings_page_gap(state, width, viewport);
     let (mut out, used) = pinned_heading(
+        state,
         width,
         viewport,
         gap,
@@ -1156,13 +1315,24 @@ impl SettingsApp {
         }
         let hsv = hsv.map(|part| part.clamp(0.0, 1.0));
         let rgb = view.keep_color(key, hsv);
+        self.commit_color_value(view, key, hex(rgb), cx);
+    }
+
+    /// Save `value` as `key`'s colour at once, replacing any draft in its
+    /// row's hex field; nothing is written where the key already holds it.
+    fn commit_color_value(
+        &mut self,
+        view: &mut SettingsViewState,
+        key: &'static str,
+        value: String,
+        cx: &mut UpdateCx<'_>,
+    ) {
         view.field_inputs.remove(key);
         view.field_errors.remove(key);
-        let hex = hex(rgb);
         let current = view.raw_value(key);
         if current
             .as_deref()
-            .is_some_and(|current| current.trim().eq_ignore_ascii_case(&hex))
+            .is_some_and(|current| current.trim().eq_ignore_ascii_case(&value))
         {
             cx.repaint(crate::native_app::DamageRegion::All);
             return;
@@ -1172,13 +1342,47 @@ impl SettingsApp {
             edits: vec![ConfigEdit {
                 key: key.to_string(),
                 expected: ExpectedConfigValue::Exact(current),
-                value: Some(hex),
+                value: Some(value),
             }],
         };
         if Self::submit_config(view, cx, patch).is_some() {
             view.feedback = Some("Applying…".to_string());
         }
         cx.repaint(crate::native_app::DamageRegion::All);
+    }
+
+    /// The trail colour's Cursor color ([`cursor_color_button`]): chosen,
+    /// it saves the cursor's colour by its word; unchosen, the colour the
+    /// cursor has now as the trail's own, so the trail looks the same and
+    /// the wheel starts from it. `wanted` is the state asked for; `None`
+    /// turns it over, as a press does.
+    fn commit_cursor_color(
+        &mut self,
+        view: &mut SettingsViewState,
+        key: &'static str,
+        wanted: Option<bool>,
+        cx: &mut UpdateCx<'_>,
+    ) {
+        let switch = UiKey::new(cursor_color_button_key(key));
+        view.common.last_focus = Some(switch.clone());
+        view.reveal_control(switch);
+        if Self::reject_pending_key(view, key, cx) {
+            return;
+        }
+        let on = trail_color_is_cursor(key, view.raw_value(key).as_deref());
+        if wanted.unwrap_or(!on) == on {
+            cx.repaint(crate::native_app::DamageRegion::All);
+            return;
+        }
+        let value = if on {
+            let Some(cursor) = color_now(view, prefs::EDIT_CURSOR_COLOR) else {
+                return;
+            };
+            hex(cursor)
+        } else {
+            prefs::TRAIL_COLOR_CURSOR.to_string()
+        };
+        self.commit_color_value(view, key, value, cx);
     }
 
     /// Make `target`'s colour the one at `brightness`, its hue and saturation
@@ -1217,8 +1421,9 @@ impl SettingsApp {
         view.reveal_control(UiKey::new(format!("settings/color/{}/wheel", target.id())));
     }
 
-    /// The colour picker's actions: a pick on the wheel, Brightness, and
-    /// Choose… (Done while open). `None` for any other action.
+    /// The colour picker's actions: a pick on the wheel, Brightness, the
+    /// trail colour's Cursor color, and Choose… (Done while open). `None` for
+    /// any other action.
     pub(super) fn reduce_color_action(
         &mut self,
         view: &mut SettingsViewState,
@@ -1284,6 +1489,13 @@ impl SettingsApp {
                 if let Some(SemanticInput::Number(value)) = invocation.value.as_ref() {
                     self.commit_color_brightness(view, target, *value, cx);
                 }
+            }
+            ("cursor", ColorTarget::Key(key)) if key == prefs::EDIT_CURSOR_TRAIL_COLOR => {
+                let wanted = match invocation.value.as_ref() {
+                    Some(SemanticInput::Bool(wanted)) => Some(*wanted),
+                    _ => None,
+                };
+                self.commit_cursor_color(view, key, wanted, cx);
             }
             ("open", ColorTarget::Key(key)) => {
                 if view.open_color_picker() == Some(key) {

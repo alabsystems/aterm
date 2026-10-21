@@ -330,6 +330,33 @@ extern "C" fn on_signal(sig: libc::c_int) {
     }
 }
 
+/// `sig`'s disposition now: `SIG_DFL`, `SIG_IGN` or a handler's address.
+///
+/// # Errors
+/// `sigaction` refused `sig`.
+pub fn disposition(sig: libc::c_int) -> io::Result<libc::sighandler_t> {
+    // SAFETY: a null new action only reads the current one into `old`, a zeroed
+    // `sigaction` (a valid value) that outlives the call.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(sig, std::ptr::null(), &raw mut old) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(old.sa_sigaction)
+    }
+}
+
+/// Set `sig` ignored (`ignore`) or at its default, as `nohup` (or its absence)
+/// starts a process: a test's probe of [`SignalPipe::install`].
+#[cfg(test)]
+pub fn start_signal(sig: libc::c_int, ignore: bool) {
+    let h = if ignore { libc::SIG_IGN } else { libc::SIG_DFL };
+    // SAFETY: SIG_IGN and SIG_DFL are dispositions, no handler of ours.
+    unsafe {
+        libc::signal(sig, h);
+    }
+}
+
 /// Signals delivered as bytes on a pipe: the handler writes the signal's
 /// number, and the reader takes it in ordinary code (a thread, a `poll`).
 /// One per process.
@@ -339,7 +366,11 @@ pub struct SignalPipe {
 }
 
 impl SignalPipe {
-    /// Install the handler for `signals` (`SA_RESTART`, an empty mask).
+    /// Install the handler for `signals` (`SA_RESTART`, an empty mask), except a
+    /// signal this process was started ignoring, which stays ignored: under
+    /// `nohup` a hang-up never reaches a lab that a closed terminal started, as
+    /// every program that respects `SIG_IGN` does (`if (signal(sig, SIG_IGN) !=
+    /// SIG_IGN) signal(sig, handler)`; `aterm-release`'s `interrupt::install`).
     ///
     /// # Errors
     /// `pipe` or `sigaction` failed.
@@ -358,6 +389,9 @@ impl SignalPipe {
         }
         SIGNAL_WR.store(fds[1], Ordering::Relaxed);
         for &sig in signals {
+            if disposition(sig)? == libc::SIG_IGN {
+                continue;
+            }
             // SAFETY: a zeroed `sigaction` is a valid starting value; the handler
             // is an `extern "C" fn(c_int)` that only calls async-signal-safe code.
             unsafe {
@@ -703,6 +737,275 @@ pub fn io_errname(e: &io::Error) -> String {
         Some(code) if code != 0 => errname(code),
         _ => format!("{:?}", e.kind()),
     }
+}
+
+// ------------------------------------------------------------------ the scheduling band (`crate::band`)
+
+/// `PRIO_DARWIN_ROLE` (`<sys/resource.h>`, private): `getpriority`'s darwin-role
+/// selector. Not in `libc` (aterm-pty names it the same way).
+#[cfg(target_os = "macos")]
+const PRIO_DARWIN_ROLE: libc::c_int = 6;
+
+/// A `posix_spawnattr_t` (an opaque pointer on Darwin; the workspace's libc
+/// has no spawn API, as aterm-uds's `pspawn` declares its own).
+#[cfg(target_os = "macos")]
+type SpawnAttr = *mut libc::c_void;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn posix_spawnattr_init(attr: *mut SpawnAttr) -> libc::c_int;
+    fn posix_spawnattr_destroy(attr: *mut SpawnAttr) -> libc::c_int;
+    fn posix_spawnattr_setflags(attr: *mut SpawnAttr, flags: libc::c_short) -> libc::c_int;
+    // <spawn_private.h>: what launchd and RunningBoard spawn an app with.
+    fn posix_spawnattr_setprocesstype_np(attr: *mut SpawnAttr, kind: libc::c_int) -> libc::c_int;
+    fn posix_spawnattr_set_darwin_role_np(attr: *mut SpawnAttr, role: u64) -> libc::c_int;
+    fn posix_spawn(
+        pid: *mut libc::pid_t,
+        path: *const libc::c_char,
+        actions: *const libc::c_void,
+        attr: *const SpawnAttr,
+        argv: *const *const libc::c_char,
+        envp: *const *const libc::c_char,
+    ) -> libc::c_int;
+}
+
+/// `POSIX_SPAWN_SETEXEC` and `POSIX_SPAWN_PROC_TYPE_APP_DEFAULT`
+/// (`<spawn.h>`, `<spawn_private.h>`): an exec in place, as an app's task type.
+#[cfg(target_os = "macos")]
+const SPAWN_SETEXEC: libc::c_short = 0x40;
+#[cfg(target_os = "macos")]
+const PROC_TYPE_APP_DEFAULT: libc::c_int = 0x100;
+
+/// Become `program` (`argv`, its first word included; exactly `env`) as an
+/// APP-type task at darwin role `role`, through `posix_spawn` with
+/// `POSIX_SPAWN_SETEXEC` (this pid, these descriptors 0-2). A launchd job is
+/// a DAEMON-type task, in which `setpriority(PRIO_DARWIN_ROLE)` fails with
+/// `ENOTSUP`: so neither a role set before an exec nor aterm-pty's UI role for
+/// each shell would take (read on macOS 27, 2026-10-20). An aterm.app is
+/// APP-type, and its shells inherit that. Not `spawnfd`: it sets neither
+/// attribute. Returns only on failure.
+#[cfg(target_os = "macos")]
+pub fn exec_as_app(
+    program: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    role: u64,
+) -> io::Error {
+    let c = |s: &str| CString::new(s).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
+    let made = (|| -> io::Result<(CString, Vec<CString>, Vec<CString>)> {
+        let args = argv.iter().map(|a| c(a)).collect::<io::Result<Vec<_>>>()?;
+        let vars = env
+            .iter()
+            .map(|(k, v)| c(&format!("{k}={v}")))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok((c(program)?, args, vars))
+    })();
+    let (prog, args, vars) = match made {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let ptrs = |v: &[CString]| -> Vec<*const libc::c_char> {
+        v.iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect()
+    };
+    let (argp, envp) = (ptrs(&args), ptrs(&vars));
+    let mut attr: SpawnAttr = std::ptr::null_mut();
+    // SAFETY: `attr` is initialized before use and destroyed after; every
+    // pointer passed (path, argv, envp: NULL-terminated arrays of C strings
+    // that outlive the call) is valid; on success the call does not return.
+    unsafe {
+        let rc = posix_spawnattr_init(&raw mut attr);
+        if rc != 0 {
+            return io::Error::from_raw_os_error(rc);
+        }
+        let set = [
+            posix_spawnattr_setflags(&raw mut attr, SPAWN_SETEXEC),
+            posix_spawnattr_setprocesstype_np(&raw mut attr, PROC_TYPE_APP_DEFAULT),
+            posix_spawnattr_set_darwin_role_np(&raw mut attr, role),
+        ];
+        let mut pid: libc::pid_t = 0;
+        let e = match set.iter().find(|&&r| r != 0) {
+            Some(&r) => r,
+            None => posix_spawn(
+                &raw mut pid,
+                prog.as_ptr(),
+                std::ptr::null(),
+                &raw const attr,
+                argp.as_ptr(),
+                envp.as_ptr(),
+            ),
+        };
+        posix_spawnattr_destroy(&raw mut attr);
+        io::Error::from_raw_os_error(e)
+    }
+}
+
+/// `dup2(fd, target)`: put `fd` at `target` (0-2, before an exec).
+///
+/// # Errors
+/// The kernel's refusal.
+pub fn dup_onto(fd: RawFd, target: RawFd) -> io::Result<()> {
+    // SAFETY: `dup2` on descriptors the caller owns; takes no pointers.
+    if unsafe { libc::dup2(fd, target) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// The darwin role of `pid` (`getpriority(PRIO_DARWIN_ROLE, pid)`).
+///
+/// # Errors
+/// The kernel's refusal (no such process, another user's).
+#[cfg(target_os = "macos")]
+pub fn darwin_role(pid: i32) -> io::Result<i32> {
+    let who =
+        libc::id_t::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `errno` is this thread's; `getpriority` takes no pointers. Its
+    // answer can be -1 legitimately, so errno (cleared first) tells a failure.
+    unsafe {
+        *libc::__error() = 0;
+        let role = libc::getpriority(PRIO_DARWIN_ROLE, who);
+        match *libc::__error() {
+            0 => Ok(role),
+            e => Err(io::Error::from_raw_os_error(e)),
+        }
+    }
+}
+
+/// Set the darwin role of `pid` (`setpriority(PRIO_DARWIN_ROLE, pid, role)`).
+///
+/// # Errors
+/// The kernel's refusal: `ENOTSUP` in a DAEMON-type task (a submitted launchd
+/// job that did not exec as an app), `EPERM` for another user's process.
+#[cfg(target_os = "macos")]
+pub fn set_darwin_role(pid: i32, role: i32) -> io::Result<()> {
+    let who =
+        libc::id_t::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `setpriority` takes no pointers.
+    if unsafe { libc::setpriority(PRIO_DARWIN_ROLE, who, role) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `pid`'s resource and jetsam coalition ids (`proc_pidinfo` flavour
+/// `PROC_PIDCOALITIONINFO`, 20: XNU-private, two `u64` ids then three
+/// reserved), or `None` when the kernel will not say.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn coalition_ids(pid: i32) -> Option<[u64; 2]> {
+    let mut buf = [0u64; 5];
+    let size = libc::c_int::try_from(std::mem::size_of_val(&buf)).ok()?;
+    // SAFETY: `buf` is a writable buffer of exactly `size` bytes for the call.
+    let got = unsafe { libc::proc_pidinfo(pid, 20, 0, buf.as_mut_ptr().cast(), size) };
+    (got == size).then_some([buf[0], buf[1]])
+}
+
+/// `proc_pidinfo` flavours (`<sys/proc_info.h>`) not in the workspace's libc:
+/// a process's thread ids, and one thread's info by its id.
+#[cfg(target_os = "macos")]
+const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
+#[cfg(target_os = "macos")]
+const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
+}
+
+/// The base priority of `pid`'s thread `tid` (`PROC_PIDTHREADID64INFO`).
+#[cfg(target_os = "macos")]
+fn thread_priority(pid: i32, tid: u64) -> Option<i32> {
+    // SAFETY: an all-zero `proc_threadinfo` is valid (integers and a byte array).
+    let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of_val(&info)).ok()?;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes for the call.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            PROC_PIDTHREADID64INFO,
+            tid,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info.pth_priority)
+}
+
+/// The base priority of `pid`'s main thread (its lowest thread id): 46-47 in
+/// aterm.app's band, 20 under launchd's utility clamp, 31 for an app without
+/// a role.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn main_thread_priority(pid: i32) -> Option<i32> {
+    let mut ids = [0u64; 512];
+    let size = libc::c_int::try_from(std::mem::size_of_val(&ids)).ok()?;
+    // SAFETY: `ids` is a writable buffer of exactly `size` bytes for the call.
+    let got =
+        unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, ids.as_mut_ptr().cast(), size) };
+    let n = usize::try_from(got).ok()? / std::mem::size_of::<u64>();
+    thread_priority(pid, *ids.get(..n)?.iter().min()?)
+}
+
+/// Ask for `QOS_CLASS_USER_INTERACTIVE` on the calling thread and return the
+/// base priority the kernel then gives it: 46-47 in an app's band, 20 in a
+/// task launchd clamped to utility (a `ProcessType` `Standard` job).
+///
+/// # Errors
+/// The request or the read-back was refused.
+#[cfg(target_os = "macos")]
+pub fn ui_request_lands() -> io::Result<i32> {
+    // SAFETY: sets this thread's own QoS class; takes no pointers.
+    let rc = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    let mut tid = 0u64;
+    // SAFETY: a null thread names the calling one; `tid` is a writable u64.
+    let rc = unsafe { pthread_threadid_np(0, &raw mut tid) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    let pid = i32::try_from(std::process::id())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    thread_priority(pid, tid).ok_or_else(io::Error::last_os_error)
+}
+
+/// `mkfifo(3)` at `path`, mode 0600.
+///
+/// # Errors
+/// The path holds a NUL, or `mkfifo` failed.
+pub fn make_fifo(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `c` is a valid NUL-terminated path.
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Clear `O_NONBLOCK` on `fd` (a FIFO end opened non-blocking so the open
+/// could not wait for a writer).
+///
+/// # Errors
+/// The kernel's refusal.
+pub fn set_blocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fcntl` on a descriptor the caller owns; takes no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ the scratch's files, through no link
@@ -1335,6 +1638,118 @@ pub fn phys_footprint(pid: i32) -> Option<u64> {
     (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
 }
 
+/// A shared read-only mapping of a whole regular file, unmapped when it drops;
+/// `None` for an empty file. Mapping takes no page fault, so it reads nothing.
+struct WholeMap {
+    addr: *mut libc::c_void,
+    len: usize,
+}
+
+impl WholeMap {
+    fn of(path: &std::path::Path) -> io::Result<Option<WholeMap>> {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large to map"))?;
+        if len == 0 {
+            return Ok(None);
+        }
+        // SAFETY: a fresh read-only shared mapping of an open file; the
+        // descriptor may close once it exists. Unmapped in `drop`.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(WholeMap { addr, len }))
+    }
+}
+
+impl Drop for WholeMap {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `of` made, of `len` bytes, unmapped once.
+        unsafe { libc::munmap(self.addr, self.len) };
+    }
+}
+
+/// How many of `path`'s pages are in the page cache, of how many: `mincore`
+/// over a fresh mapping. A directory counts every regular file under it
+/// (symbolic links are not followed). What `instance --pages cold` checks
+/// before and after its launch (r6 sweep #19).
+///
+/// # Errors
+/// A file could not be read, mapped or asked about.
+pub fn resident_pages(path: &std::path::Path) -> io::Result<(u64, u64)> {
+    unsafe extern "C" {
+        /// `<sys/mman.h>`: `int mincore(const void *, size_t, char *)`; the
+        /// first-party `libc` declares none.
+        fn mincore(addr: *const libc::c_void, len: usize, vec: *mut libc::c_char) -> libc::c_int;
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        let mut total = (0, 0);
+        for entry in std::fs::read_dir(path)? {
+            let (resident, pages) = resident_pages(&entry?.path())?;
+            total = (total.0 + resident, total.1 + pages);
+        }
+        return Ok(total);
+    }
+    if !meta.is_file() {
+        return Ok((0, 0));
+    }
+    let Some(map) = WholeMap::of(path)? else {
+        return Ok((0, 0));
+    };
+    // SAFETY: `sysconf` reads a constant.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .map_err(|_| io::Error::other("no page size"))?;
+    let mut vec = vec![0 as libc::c_char; map.len.div_ceil(page)];
+    // SAFETY: `vec` holds one byte per page of the live `map.len`-byte mapping.
+    if unsafe { mincore(map.addr, map.len, vec.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `MINCORE_INCORE` is bit 0.
+    let resident = vec.iter().filter(|&&b| b & 1 != 0).count();
+    Ok((resident as u64, vec.len() as u64))
+}
+
+/// Drop `path`'s clean pages from the page cache (every regular file under it,
+/// for a directory): `msync(MS_INVALIDATE)` over a fresh mapping. Nothing is
+/// written or renamed, either of which would void the verdict macOS keeps
+/// from an executable's first exec, so a launch after this pays only its page
+/// faults (r6 sweep #19: `instance --pages cold`).
+///
+/// # Errors
+/// A file could not be read, mapped or invalidated.
+pub fn evict_pages(path: &std::path::Path) -> io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            evict_pages(&entry?.path())?;
+        }
+        return Ok(());
+    }
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let Some(map) = WholeMap::of(path)? else {
+        return Ok(());
+    };
+    // SAFETY: the live mapping, its whole length.
+    if unsafe { libc::msync(map.addr, map.len, libc::MS_INVALIDATE) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The pids of every live process of this user in the jail that carries
 /// `mark`, sorted. The lab's profile denies `(mach-lookup (global-name
 /// MARK))`, a name nobody serves, random per lab and named by no other
@@ -1398,6 +1813,414 @@ pub fn jail_pids(mark: &str) -> Result<Vec<i32>, String> {
     out.sort_unstable();
     out.dedup();
     Ok(out)
+}
+
+// ------------------------------------------------------------ input sources
+
+/// HIToolbox's keyboard input sources (`TextInputSources.h`) and the Unicode key
+/// layout one carries (`UCKeyTranslate`): what `meta-keys` selects for its run,
+/// puts back after it, and derives each layout's characters from. HIToolbox wants
+/// its main thread, which is where the lab's verbs run; nothing here is called
+/// from another.
+pub mod tis {
+    use std::ffi::c_void;
+
+    use crate::input_sources::Pref;
+
+    type CfRef = *const c_void;
+
+    #[repr(C)]
+    struct CfRange {
+        location: isize,
+        length: isize,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: CfRef);
+        fn CFRetain(cf: CfRef) -> CfRef;
+        fn CFGetTypeID(cf: CfRef) -> usize;
+        fn CFStringGetTypeID() -> usize;
+        fn CFDataGetTypeID() -> usize;
+        fn CFArrayGetCount(array: CfRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CfRef, index: isize) -> CfRef;
+        fn CFStringGetLength(string: CfRef) -> isize;
+        fn CFStringGetCharacters(string: CfRef, range: CfRange, buffer: *mut u16);
+        fn CFDataGetBytePtr(data: CfRef) -> *const u8;
+        fn CFDataGetLength(data: CfRef) -> isize;
+        fn CFDataCreate(alloc: CfRef, bytes: *const u8, len: isize) -> CfRef;
+        fn CFStringCreateWithBytes(
+            alloc: CfRef,
+            bytes: *const u8,
+            len: isize,
+            encoding: u32,
+            external: u8,
+        ) -> CfRef;
+        fn CFPropertyListCreateData(
+            alloc: CfRef,
+            plist: CfRef,
+            format: isize,
+            options: usize,
+            error: *mut CfRef,
+        ) -> CfRef;
+        fn CFPropertyListCreateWithData(
+            alloc: CfRef,
+            data: CfRef,
+            options: usize,
+            format: *mut isize,
+            error: *mut CfRef,
+        ) -> CfRef;
+        fn CFPreferencesCopyAppValue(key: CfRef, app: CfRef) -> CfRef;
+        fn CFPreferencesSetAppValue(key: CfRef, value: CfRef, app: CfRef);
+        fn CFPreferencesAppSynchronize(app: CfRef) -> u8;
+    }
+
+    /// `kCFStringEncodingUTF8`.
+    const UTF8: u32 = 0x0800_0100;
+    /// `kCFPropertyListBinaryFormat_v1_0`.
+    const BINARY_PLIST: isize = 200;
+    /// The preferences domain HIToolbox keeps the input sources in.
+    const HITOOLBOX: &str = "com.apple.HIToolbox";
+    /// What HIToolbox writes there of its own when a source is selected, beside the
+    /// enabled list, and no TIS call puts back: the history of selected sources (the
+    /// one that would still name a layout the run selected) and the selection's own
+    /// record. Read as this process's HIToolbox has them, which serves the selection's
+    /// values even where the domain holds no key yet; written back, they land in the
+    /// domain. `AppleInputSourceUpdateTime` is left out: HIToolbox stamps it on its own
+    /// clock, about two seconds after a change, so nothing written before then holds.
+    pub const BOOKKEEPING: [&str; 3] = [
+        "AppleInputSourceHistory",
+        "AppleSelectedInputSources",
+        "AppleCurrentKeyboardLayoutInputSourceID",
+    ];
+
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        static kTISPropertyInputSourceID: CfRef;
+        static kTISPropertyUnicodeKeyLayoutData: CfRef;
+        fn TISCreateInputSourceList(properties: CfRef, include_all_installed: u8) -> CfRef;
+        fn TISCopyCurrentKeyboardInputSource() -> CfRef;
+        fn TISGetInputSourceProperty(source: CfRef, key: CfRef) -> CfRef;
+        fn TISEnableInputSource(source: CfRef) -> i32;
+        fn TISDisableInputSource(source: CfRef) -> i32;
+        fn TISSelectInputSource(source: CfRef) -> i32;
+        fn LMGetKbdType() -> u8;
+        fn UCKeyTranslate(
+            layout: *const u8,
+            key_code: u16,
+            key_action: u16,
+            modifier_key_state: u32,
+            keyboard_type: u32,
+            key_translate_options: u32,
+            dead_key_state: *mut u32,
+            max_string_length: usize,
+            actual_string_length: *mut usize,
+            unicode_string: *mut u16,
+        ) -> i32;
+    }
+
+    /// `kUCKeyActionDown`: the key pressed, dead-key state carried.
+    const KEY_ACTION_DOWN: u16 = 0;
+
+    /// One reference to a CoreFoundation object, released when it drops.
+    struct Owned(CfRef);
+
+    impl Owned {
+        /// `cf` from a Create or Copy call (or retained); `None` for null.
+        fn new(cf: CfRef) -> Option<Owned> {
+            (!cf.is_null()).then(|| Owned(cf))
+        }
+    }
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is non-null and this value owns one reference to it.
+            unsafe { CFRelease(self.0) }
+        }
+    }
+
+    /// The text of `s`, `None` unless it is a `CFString`.
+    fn string(s: CfRef) -> Option<String> {
+        if s.is_null() {
+            return None;
+        }
+        // SAFETY: `CFGetTypeID` reads any live CF object; a non-string is refused
+        // before it is read as one, and the buffer holds the string's whole length.
+        unsafe {
+            if CFGetTypeID(s) != CFStringGetTypeID() {
+                return None;
+            }
+            let n = CFStringGetLength(s);
+            let mut buf = vec![0u16; usize::try_from(n).ok()?];
+            CFStringGetCharacters(
+                s,
+                CfRange {
+                    location: 0,
+                    length: n,
+                },
+                buf.as_mut_ptr(),
+            );
+            Some(String::from_utf16_lossy(&buf))
+        }
+    }
+
+    /// A new `CFString` of `s`.
+    fn cf_string(s: &str) -> Option<Owned> {
+        // SAFETY: the bytes and their length are `s`'s; the result follows the
+        // Create rule.
+        Owned::new(unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                isize::try_from(s.len()).ok()?,
+                UTF8,
+                0,
+            )
+        })
+    }
+
+    /// HIToolbox's own bookkeeping ([`BOOKKEEPING`]) as it stands: each key with
+    /// its value as a binary property list, `None` where the key is absent.
+    ///
+    /// # Errors
+    /// A value cannot be read or written as a property list.
+    pub fn bookkeeping() -> Result<Vec<Pref>, String> {
+        let app = cf_string(HITOOLBOX).ok_or("cannot name com.apple.HIToolbox")?;
+        // SAFETY: `app` is a live CFString.
+        unsafe { CFPreferencesAppSynchronize(app.0) };
+        BOOKKEEPING
+            .iter()
+            .map(|key| {
+                let k = cf_string(key).ok_or_else(|| format!("cannot name {key}"))?;
+                // SAFETY: two live CFStrings; the value follows the Copy rule.
+                let Some(value) = Owned::new(unsafe { CFPreferencesCopyAppValue(k.0, app.0) })
+                else {
+                    return Ok(((*key).to_string(), None));
+                };
+                // SAFETY: `value` is a live property list; the data follows the Create
+                // rule, and its bytes are copied while it lives.
+                let data = Owned::new(unsafe {
+                    CFPropertyListCreateData(
+                        std::ptr::null(),
+                        value.0,
+                        BINARY_PLIST,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                })
+                .ok_or_else(|| format!("{key}: not a property list"))?;
+                // SAFETY: as above.
+                let bytes = unsafe {
+                    let len = usize::try_from(CFDataGetLength(data.0)).unwrap_or(0);
+                    std::slice::from_raw_parts(CFDataGetBytePtr(data.0), len).to_vec()
+                };
+                Ok(((*key).to_string(), Some(bytes)))
+            })
+            .collect()
+    }
+
+    /// Write `prefs` (what [`bookkeeping`] read) back into HIToolbox's domain, a
+    /// `None` by removing its key, and synchronize it.
+    ///
+    /// # Errors
+    /// A value is not a property list, or the domain did not synchronize.
+    pub fn put_bookkeeping(prefs: &[Pref]) -> Result<(), String> {
+        let app = cf_string(HITOOLBOX).ok_or("cannot name com.apple.HIToolbox")?;
+        for (key, bytes) in prefs {
+            let k = cf_string(key).ok_or_else(|| format!("cannot name {key}"))?;
+            let value = match bytes {
+                None => None,
+                Some(b) => {
+                    // SAFETY: the bytes and their length are `b`'s; both results follow
+                    // the Create rule.
+                    let len = isize::try_from(b.len()).map_err(|_| format!("{key}: too long"))?;
+                    let data =
+                        Owned::new(unsafe { CFDataCreate(std::ptr::null(), b.as_ptr(), len) })
+                            .ok_or_else(|| format!("{key}: cannot hold its value"))?;
+                    let value = Owned::new(unsafe {
+                        CFPropertyListCreateWithData(
+                            std::ptr::null(),
+                            data.0,
+                            0,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    })
+                    .ok_or_else(|| format!("{key}: the recorded value is not a property list"))?;
+                    Some(value)
+                }
+            };
+            // SAFETY: live CFStrings and a live property list, or null to remove the key.
+            unsafe {
+                CFPreferencesSetAppValue(
+                    k.0,
+                    value.as_ref().map_or(std::ptr::null(), |v| v.0),
+                    app.0,
+                );
+            }
+        }
+        // SAFETY: `app` is a live CFString.
+        if unsafe { CFPreferencesAppSynchronize(app.0) } == 0 {
+            return Err("com.apple.HIToolbox did not synchronize".into());
+        }
+        Ok(())
+    }
+
+    /// The input source's ID (`com.apple.keylayout.US`).
+    fn id_of(source: CfRef) -> Option<String> {
+        // SAFETY: `source` is a live input source; the property is a Get-rule
+        // CFString that `string` checks before reading.
+        string(unsafe { TISGetInputSourceProperty(source, kTISPropertyInputSourceID) })
+    }
+
+    /// HIToolbox's list of input sources: the enabled ones, or with `all` every
+    /// one installed.
+    fn list(all: bool) -> Option<Owned> {
+        // SAFETY: a null property dictionary asks for every source; the list
+        // follows the Create rule, so the owner releases it.
+        Owned::new(unsafe { TISCreateInputSourceList(std::ptr::null(), u8::from(all)) })
+    }
+
+    /// Each source of `list` with its ID, until `f` answers `Some`.
+    fn find<T>(list: &Owned, mut f: impl FnMut(CfRef, String) -> Option<T>) -> Option<T> {
+        // SAFETY: `list` is a live CFArray of input sources, read in bounds; each
+        // element is a Get-rule source the list keeps alive while `f` runs.
+        let n = unsafe { CFArrayGetCount(list.0) };
+        (0..n).find_map(|i| {
+            // SAFETY: as above.
+            let source = unsafe { CFArrayGetValueAtIndex(list.0, i) };
+            id_of(source).and_then(|id| f(source, id))
+        })
+    }
+
+    /// The IDs of the enabled input sources, in HIToolbox's order.
+    #[must_use]
+    pub fn enabled() -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(l) = list(false) {
+            find(&l, |_, id| {
+                out.push(id);
+                None::<()>
+            });
+        }
+        out
+    }
+
+    /// The ID of the selected keyboard input source.
+    #[must_use]
+    pub fn selected() -> Option<String> {
+        // SAFETY: a Copy-rule source, released when the owner drops.
+        let source = Owned::new(unsafe { TISCopyCurrentKeyboardInputSource() })?;
+        id_of(source.0)
+    }
+
+    /// `call` (one of the TIS setters) on the installed input source `id`.
+    fn on(id: &str, what: &str, call: unsafe extern "C" fn(CfRef) -> i32) -> Result<(), String> {
+        let l = list(true).ok_or_else(|| format!("{what} {id}: HIToolbox lists no sources"))?;
+        // SAFETY: `source` is a live input source of `l`, the argument every
+        // setter takes.
+        let status = find(&l, |source, sid| {
+            (sid == id).then(|| unsafe { call(source) })
+        });
+        match status {
+            Some(0) => Ok(()),
+            Some(s) => Err(format!("{what} {id}: OSStatus {s}")),
+            None => Err(format!("{what} {id}: no such input source is installed")),
+        }
+    }
+
+    /// Enable the installed input source `id` (`TISEnableInputSource`).
+    ///
+    /// # Errors
+    /// It is not installed, or HIToolbox refused.
+    pub fn enable(id: &str) -> Result<(), String> {
+        on(id, "TISEnableInputSource", TISEnableInputSource)
+    }
+
+    /// Disable the input source `id` (`TISDisableInputSource`).
+    ///
+    /// # Errors
+    /// It is not installed, or HIToolbox refused.
+    pub fn disable(id: &str) -> Result<(), String> {
+        on(id, "TISDisableInputSource", TISDisableInputSource)
+    }
+
+    /// Select the enabled input source `id` (`TISSelectInputSource`).
+    ///
+    /// # Errors
+    /// It is not installed, or HIToolbox refused.
+    pub fn select(id: &str) -> Result<(), String> {
+        on(id, "TISSelectInputSource", TISSelectInputSource)
+    }
+
+    /// The Unicode key layout of an input source, read for this Mac's keyboard type.
+    pub struct Layout {
+        /// The `kTISPropertyUnicodeKeyLayoutData`, retained.
+        data: Owned,
+        kbd: u32,
+    }
+
+    impl Layout {
+        /// The layout of the installed input source `id`, enabled or not.
+        ///
+        /// # Errors
+        /// It is not installed, or carries no Unicode key layout (an input method).
+        pub fn of(id: &str) -> Result<Layout, String> {
+            let l = list(true).ok_or_else(|| format!("{id}: HIToolbox lists no sources"))?;
+            let data = find(&l, |source, sid| {
+                if sid != id {
+                    return None;
+                }
+                // SAFETY: `source` is live; the property is a Get-rule CFData (checked
+                // by type before it is kept), retained here so it outlives the list.
+                unsafe {
+                    let d = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
+                    (!d.is_null() && CFGetTypeID(d) == CFDataGetTypeID())
+                        .then(|| Owned::new(CFRetain(d)))
+                        .flatten()
+                }
+            })
+            .ok_or_else(|| format!("{id}: not installed, or it has no Unicode key layout"))?;
+            // SAFETY: a plain read of HIToolbox's keyboard type, on the main thread.
+            let kbd = u32::from(unsafe { LMGetKbdType() });
+            Ok(Layout { data, kbd })
+        }
+
+        /// The keyboard type (`LMGetKbdType`) the layout is read for.
+        #[must_use]
+        pub fn keyboard_type(&self) -> u32 {
+            self.kbd
+        }
+
+        /// What `key_code` types pressed with `modifiers` (UCKeyTranslate's modifier
+        /// byte: Carbon's `EventModifiers` shifted right by 8, so 0x02 Shift and 0x08
+        /// Option) after the dead-key state `dead`, which it updates: a dead key
+        /// types nothing and leaves `dead` non-zero. `None` when UCKeyTranslate
+        /// refuses.
+        #[must_use]
+        pub fn press(&self, key_code: u16, modifiers: u32, dead: &mut u32) -> Option<String> {
+            let mut buf = [0u16; 8];
+            let mut len = 0usize;
+            // SAFETY: the layout bytes live while `self.data` holds the CFData; the
+            // output buffer and its length, the state and the count are valid
+            // for the call.
+            let status = unsafe {
+                UCKeyTranslate(
+                    CFDataGetBytePtr(self.data.0),
+                    key_code,
+                    KEY_ACTION_DOWN,
+                    modifiers,
+                    self.kbd,
+                    0,
+                    dead,
+                    buf.len(),
+                    &raw mut len,
+                    buf.as_mut_ptr(),
+                )
+            };
+            (status == 0).then(|| String::from_utf16_lossy(&buf[..len.min(buf.len())]))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1754,6 +2577,28 @@ mod tests {
         assert_eq!(entry_stat(&d.0.join("missing/f")).unwrap(), None);
         assert!(!remove_if_same(&d.0.join("missing/f"), es.dev, es.ino).unwrap());
         assert_eq!(entry_stat(&d.0.join("sub/none")).unwrap(), None);
+    }
+
+    /// A file just written and read is in the page cache; evicting it leaves none of its
+    /// pages there, and its bytes are unchanged (the eviction writes nothing).
+    #[test]
+    fn evicted_pages_leave_the_page_cache_and_the_file_unchanged() {
+        let d = dir("pages");
+        let f = d.0.join("sub/f");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        let bytes: Vec<u8> = (0..4 << 20).map(|i: u32| (i % 251) as u8).collect();
+        std::fs::write(&f, &bytes).unwrap();
+        // Written out, so its pages are clean; a test promises nothing past a crash.
+        aterm_durable::ordered(&std::fs::File::open(&f).unwrap()).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), bytes);
+        let (resident, pages) = resident_pages(&d.0).unwrap();
+        assert!(
+            pages > 0 && resident == pages,
+            "{resident}/{pages} after a read"
+        );
+        evict_pages(&d.0).unwrap();
+        assert_eq!(resident_pages(&d.0).unwrap(), (0, pages));
+        assert_eq!(std::fs::read(&f).unwrap(), bytes);
     }
 
     #[test]

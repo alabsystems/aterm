@@ -647,7 +647,8 @@ pub fn rebase_position(mut position: usize, deltas: &[EditDelta]) -> usize {
                 .saturating_add(delta.inserted_len);
         }
         let removed = delta.old.end.saturating_sub(delta.old.start);
-        growth = growth.saturating_add(delta.inserted_len as isize - removed as isize);
+        growth =
+            growth.saturating_add((delta.inserted_len as isize).saturating_sub(removed as isize));
     }
     position = original.saturating_add_signed(growth);
     position

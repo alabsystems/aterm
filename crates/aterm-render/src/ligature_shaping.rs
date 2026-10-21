@@ -85,23 +85,55 @@ pub(crate) fn engine_features(features: &[FontFeature]) -> Vec<Feature> {
         .collect()
 }
 
-/// Whether [`crate::Renderer::row_glyph_plan`] should run the shaping pass
-/// for a row, vs short-circuit to an all-[`ColumnGlyph::PerCell`] plan. Factored out
-/// as a PURE function so `tests/font_oracle.rs` asks the same gate the planner does.
-///
-/// Run shaping iff the primary-face bytes are retained AND there is OpenType work to
-/// do: either the user configured `font_features` (`has_user_features`), OR ligatures
-/// are on for a font that advertises `liga`/`calt`. When `has_user_features` is false
-/// this reduces EXACTLY to the legacy gate (`rb_present && !globally_off && font_has`),
-/// so the no-features path stays byte-identical.
-#[must_use]
-pub fn should_run_shaping(
-    rb_present: bool,
-    has_user_features: bool,
-    ligatures_globally_off: bool,
-    font_has_ligature_features: bool,
-) -> bool {
-    rb_present && (has_user_features || (!ligatures_globally_off && font_has_ligature_features))
+trust_contract_fn! {
+    /// Whether [`crate::Renderer::row_glyph_plan`] should run the shaping pass
+    /// for a row, vs short-circuit to an all-[`ColumnGlyph::PerCell`] plan. Factored out
+    /// as a PURE function so `tests/font_oracle.rs` asks the same gate the planner does.
+    ///
+    /// Run shaping iff the primary-face bytes are retained AND there is OpenType work to
+    /// do: either the user configured `font_features` (`has_user_features`), OR ligatures
+    /// are on for a font that advertises `liga`/`calt`. When `has_user_features` is false
+    /// this reduces EXACTLY to the legacy gate (`rb_present && !globally_off && font_has`),
+    /// so the no-features path stays byte-identical — proved for ALL inputs by
+    /// `should_run_shaping_no_features_is_legacy`.
+    ///
+    /// # Invariant (proven)
+    ///
+    /// `should_run_shaping(rb, u, off, lig) == (rb && (u || (!off && lig)))` for
+    /// every input, kernel-checked against the compiled body by
+    /// `should_run_shaping_is_gate`.
+    #[must_use]
+    pub fn should_run_shaping(
+        rb_present: bool,
+        has_user_features: bool,
+        ligatures_globally_off: bool,
+        font_has_ligature_features: bool,
+    ) -> bool
+    clauses [ensures result
+        == (rb_present && (has_user_features || (!ligatures_globally_off && font_has_ligature_features)))
+        by should_run_shaping_is_gate]
+    {
+        rb_present && (has_user_features || (!ligatures_globally_off && font_has_ligature_features))
+    }
+}
+
+// Spec `shaping-gate` (SPECS.md), the `should_run_shaping` half: for every flag
+// combination shaping runs iff the primary bytes are present and there is
+// OpenType work (user features, or ligatures on for a font that has them); with
+// no user features that is exactly the legacy gate. Kernel-checked against the
+// compiled body.
+verify_island! {
+    clean {
+        theorem should_run_shaping_is_gate (rb u off lig : Bool) :
+            trust_import_aterm_render__ligature_shaping__should_run_shaping rb u off lig
+              = (rb && (u || (!off && lig))) := by
+          simp only [trust_import_aterm_render__ligature_shaping__should_run_shaping]
+
+        theorem should_run_shaping_no_features_is_legacy (rb off lig : Bool) :
+            trust_import_aterm_render__ligature_shaping__should_run_shaping rb false off lig
+              = (rb && (!off && lig)) := by
+          simp only [trust_import_aterm_render__ligature_shaping__should_run_shaping]
+    }
 }
 
 /// The minimum run length the planner will attempt to shape: 1 when the user

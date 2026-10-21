@@ -345,8 +345,21 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     let (ladder, code) = repo.run(&land(), Scope::crate_only("aterm-grid"));
 
     assert_eq!(code, exit::PASS, "{ladder}");
-    assert!(ladder.contains("argv: --unverified test -p aterm-grid"));
-    assert!(ladder.contains("argv: --unverified test --doc -p aterm-grid"));
+    // Led by the main lane's build dir: the fixture's root is outside its HOME,
+    // so the shim's cache steps aside and the intermediates go to
+    // `<target>/build.noindex`, out of Spotlight.
+    let lead = format!(
+        "argv: --config build.build-dir='{}/target/build.noindex' ",
+        repo.root.display()
+    );
+    assert!(
+        ladder.contains(&format!("{lead}--unverified test -p aterm-grid")),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains(&format!("{lead}--unverified test --doc -p aterm-grid")),
+        "{ladder}"
+    );
     assert!(
         !ladder.contains("--workspace"),
         "nothing whole-tree was driven"
@@ -499,7 +512,9 @@ cfg=""; prev=""; seen=0; targs=""
 for a in "$@"; do
   if [ "$seen" = 1 ]; then targs="$targs $a"; fi
   [ "$a" = "--" ] && seen=1
-  [ "$prev" = "--config" ] && cfg="$a"
+  # cargo merges every --config; the runner is the one naming a runner (the
+  # main lane's build-dir --config rides beside it).
+  [ "$prev" = "--config" ] && case "$a" in *runner=*) cfg="$a" ;; esac
   prev="$a"
 done
 case "$*" in

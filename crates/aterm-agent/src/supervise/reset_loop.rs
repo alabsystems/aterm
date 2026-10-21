@@ -10,7 +10,7 @@
 //! at the top of every look, and no act of the turn-end policy's.
 //!
 //! NOTHING OF IT HAS BEEN SEEN. Every text the readers this stands on read
-//! (`aterm_phase::reset`) and every transition below is READ in the 2.1.287
+//! (`aterm_phase::reset`) and every transition below is READ in the 2.1.304
 //! bundle, never on a screen; `[harness] limit_reset` ships `false`, and with
 //! it off no row is taken — [`Session::reset_take`] is reached only through a
 //! decision the approval policy makes with the key on — and the only step
@@ -27,9 +27,13 @@
 //!   (`press_focused`, every key of it fenced on the judged read's person
 //!   count too), the confirmation's Enter is one fenced key, and everything
 //!   else is an Escape.
-//! * **A. The row** ([`Session::reset_take`]): the loop's gates, then the
-//!   host's word ([`IdleHost::reset_take`]) LAST, immediately before the
-//!   row's first key. Anything but its go passes the reset over for the
+//! * **A. The row** ([`Session::reset_take`]): the row the reader names
+//!   (`aterm_phase::reset_row`: the ONE reset on offer, a 5-hour, weekly or
+//!   full one, never a Fable one — or, under the owner's `[harness]
+//!   limit_reset_kinds`, the first listed kind on offer), the loop's gates, then
+//!   the host's word ([`IdleHost::reset_take`]) LAST, immediately before the
+//!   row's first key. The row's KIND rides in the ask and the go, and the
+//!   confirmation is held to it. Anything but its go passes the reset over for the
 //!   dialog's mount ([`Session::reset_passed`]), and the dialog is answered
 //!   with the decision made without the reset's rule on the same read — the
 //!   wait row, by the same keys a build without resets writes.
@@ -105,6 +109,11 @@ pub(super) const RESET_STALE: Duration = Duration::from_secs(RESET_CLAIM_S.unsig
 /// From which failed Escape on the host is told the dialog is stuck
 /// ([`IdleHost::inform`], once) while the tries go on: as the probe's.
 pub(super) const RESET_STUCK_AT: u32 = 2;
+
+/// What a `declined` row of the reset's rule names where no confirmation's
+/// title (`Use a <kind>?`) is on the screen and the step holds no go whose
+/// kind would name one: a successor's Escape on a box read by its parts.
+const RESET_UNTITLED: &str = "the reset confirmation";
 
 /// The one record a dialog that will not close leaves with the host: a title
 /// and what a person does about it. A record, never a badge.
@@ -244,7 +253,15 @@ fn named_year(when: &str) -> Option<i64> {
 /// The outcome as the journal's `RESET` line words it.
 fn outcome_words(outcome: &ResetOutcome, kept: Option<KeepWhy>) -> String {
     match outcome {
-        ResetOutcome::Spent { left: Some(n), .. } => format!("used ({n} left)"),
+        ResetOutcome::Spent {
+            kind,
+            left: Some(n),
+            ..
+        } => format!("used ({} left)", kind.resets(*n)),
+        ResetOutcome::Spent { kind, .. } => format!("used ({})", kind.name()),
+        ResetOutcome::Walled { kind, left } => {
+            format!("used ({} left), the wall still stands", kind.resets(*left))
+        }
         ResetOutcome::Kept => format!("kept ({})", kept.unwrap_or(KeepWhy::Closed)),
         ResetOutcome::Failed { login } => {
             format!("failed ({})", if *login { "login" } else { "answer" })
@@ -558,19 +575,21 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<ResetAsked, Fail> {
         let seq = turn.screen.seq;
         let shut = self.reset_gate(turn, opts, review)?;
+        // The kinds the row is chosen under, kept for its press's fresh read
+        // ([`Session::press_focused`]).
+        self.reset_kinds.clone_from(&opts.policy.limit_reset_kinds);
         let row = aterm_phase::parse_prompt_v2(&turn.screen.rows)
-            .as_ref()
-            .and_then(aterm_phase::reset_row);
+            .and_then(|p| aterm_phase::reset_row(&p, &self.reset_kinds));
         let (None, Some(row), Some(host)) = (shut, row, opts.idle_host.clone()) else {
             let gate = shut.unwrap_or("row");
             self.reset_pass(seq, &format!("gate={gate}"), opts, review);
             return Ok(ResetAsked::Pass);
         };
         let ask = ResetAsk {
+            kind: row.kind,
             left: row.left,
             day_start: self.reset_day_start(&row.day),
             day: row.day,
-            kind: row.kind,
         };
         if self.halted {
             self.park_on_hold("the session is held: no reset is claimed", seq, review)?;
@@ -686,7 +705,7 @@ impl<C: Ctl> Session<'_, C> {
             None if self.reset_owed().is_some_and(|owed| !owed.entered)
                 && rows
                     .iter()
-                    .any(|row| aterm_phase::is_confirm_title(row.trim())) =>
+                    .any(|row| aterm_phase::reset_title(row).is_some()) =>
             {
                 Shows::Confirm(ConfirmRead::Inexact("options"), None)
             }
@@ -726,8 +745,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.reset == ResetStep::Idle {
             let shows_row = || {
                 aterm_phase::parse_prompt_v2(&turn.screen.rows)
-                    .as_ref()
-                    .and_then(aterm_phase::reset_row)
+                    .and_then(|p| aterm_phase::reset_row(&p, &opts.policy.limit_reset_kinds))
                     .is_some()
             };
             if self.reset_taken.is_some() && !shows_row() {
@@ -1003,14 +1021,20 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<Flow, Fail> {
         let waits = self.setup.reset_waits;
         let (seq, rows) = (screen.seq, &screen.rows);
-        // The title as drawn (`Use your reset?`, 2.1.304's `Use a <kind>?`),
-        // the declined row's word in the ledger.
         let titled = rows
             .iter()
-            .position(|row| aterm_phase::is_confirm_title(row.trim()));
-        let title = titled.map_or(aterm_phase::anchor("reset.confirm.title"), |row| {
-            rows[row].trim()
-        });
+            .position(|row| aterm_phase::reset_title(row).is_some());
+        // What the ledger's `declined` row names: the title as drawn (`Use a
+        // weekly reset?`), else the title of the row taken's kind, else the
+        // kind-less name a successor with no go holds.
+        let title: String = titled
+            .map(|row| rows[row].trim().to_string())
+            .or_else(|| {
+                let owed = self.reset_owed()?;
+                owed.go.as_ref().map(|go| go.kind.title())
+            })
+            .unwrap_or_else(|| RESET_UNTITLED.to_string());
+        let title = title.as_str();
         let bound_to = titled.or_else(|| {
             let prompt = prompt?;
             let yes = prompt
@@ -1052,7 +1076,11 @@ impl<C: Ctl> Session<'_, C> {
             _ => None,
         };
         if let (ConfirmRead::Exact(confirm), Some(owed)) = (read, self.reset_owed_mut()) {
-            owed.offer = Some((confirm.left, placed));
+            owed.offer = Some(ResetOffer {
+                kind: confirm.kind,
+                left: confirm.left,
+                use_by: placed,
+            });
         }
         let why = match (self.reset_verdict(read, placed, opts), read) {
             (Judged::Keep(why), _) => why,
@@ -1089,7 +1117,7 @@ impl<C: Ctl> Session<'_, C> {
                     self.fenced_key(&row_guard(yes), "enter", generation, Some(&person))?;
                 return match self.refused_press(&r, &args)? {
                     None if !r.skipped() => {
-                        self.reset_yes_written(&confirm.head, seq, review);
+                        self.reset_yes_written(confirm.kind, &confirm.head, seq, review);
                         Ok(Flow::Again(waits.enter))
                     }
                     // A person keyed since the read: theirs now, until their
@@ -1118,7 +1146,7 @@ impl<C: Ctl> Session<'_, C> {
                         // Cut mid-exchange, the Enter may have been written:
                         // the books say so before the outage is ridden out.
                         if !r.untouched() {
-                            self.reset_yes_written(&confirm.head, seq, review);
+                            self.reset_yes_written(confirm.kind, &confirm.head, seq, review);
                         }
                         Err(Fail::Lost(why))
                     }
@@ -1147,10 +1175,18 @@ impl<C: Ctl> Session<'_, C> {
     /// AN ENTER WAS WRITTEN ON THE CONFIRMATION, or may have been (its
     /// answer never came): counted, the wait for what it opens runs from
     /// now, and — once a step, with the first — the session ledger's
-    /// `approved` row on the vendor's yes (`head`: the body and detail as
-    /// read) and the journal's `confirmed` line. A loop that follows reads
-    /// the row as an Enter written, and the host is told so.
-    fn reset_yes_written(&mut self, head: &str, seq: u64, review: &mut dyn Review) {
+    /// `approved` row on the vendor's yes of the confirmation's `kind`
+    /// (`Yes, use my weekly reset`; `head`: the body and detail as read) and
+    /// the journal's `confirmed` line. A loop that follows reads the row as
+    /// an Enter written ([`approvals::reset_owed`], which reads an older
+    /// build's `Yes, use my reset` too), and the host is told so.
+    fn reset_yes_written(
+        &mut self,
+        kind: aterm_phase::ResetKind,
+        head: &str,
+        seq: u64,
+        review: &mut dyn Review,
+    ) {
         let fx = self.fx.clone();
         let Some(owed) = self.reset_owed_mut() else {
             return;
@@ -1162,11 +1198,9 @@ impl<C: Ctl> Session<'_, C> {
         if std::mem::replace(&mut owed.yes_said, true) {
             return;
         }
-        // The ledger's one word for a yes taken, whatever build drew it
-        // (2.1.304's names its kind): what `approvals::reset_owed` reads back.
-        let yes = aterm_phase::anchor("reset.yes");
+        let yes = kind.yes();
         let approved = approvals::Outcome::Approved;
-        self.ledger_row(RULE_LIMIT_RESET, approved, yes, head, seq);
+        self.ledger_row(RULE_LIMIT_RESET, approved, &yes, head, seq);
         review.note(&format!(
             "RESET seq={seq} rule={RULE_LIMIT_RESET} confirmed ({})",
             clip(head)
@@ -1216,10 +1250,10 @@ impl<C: Ctl> Session<'_, C> {
             return Judged::Keep(why);
         }
         let ask = ResetAsk {
+            kind: go.kind,
             left: go.left,
             day_start: self.reset_day_start(&go.day),
             day: go.day.clone(),
-            kind: go.kind,
         };
         let word = match opts.idle_host.as_ref() {
             Some(host) if in_time => host.reset_take(&ask),
@@ -1342,9 +1376,10 @@ impl<C: Ctl> Session<'_, C> {
     ///   is what a later loop reads the step closed by;
     /// * the turn-end policy told what it owes ([`TurnEndState::reset_told`]:
     ///   one continuation, at once or after the vendor's own);
-    /// * the journal's `RESET seq=<n> rule=limit-reset@v1 used (<n> left)`,
-    ///   SAID — and `lifted`, `kept (<why>)`, `failed (<why>)`, `unread`,
-    ///   journal only.
+    /// * the journal's `RESET seq=<n> rule=limit-reset@v1 used (<kindResets>
+    ///   left)` (`used (1 weekly reset left)`; `…, the wall still stands`
+    ///   after the still-walled line), SAID — and `lifted`, `kept (<why>)`,
+    ///   `failed (<why>)`, `unread`, journal only.
     ///
     /// A step that ends UNTOLD ([`Self::reset_untold`]: `[harness]
     /// limit_reset = false`, or a stale open row) tells the host and the
@@ -1428,7 +1463,10 @@ impl<C: Ctl> Session<'_, C> {
             "RESET seq={seq} rule={RULE_LIMIT_RESET} {}",
             outcome_words(&outcome, kept)
         );
-        if matches!(outcome, ResetOutcome::Spent { .. }) {
+        if matches!(
+            outcome,
+            ResetOutcome::Spent { .. } | ResetOutcome::Walled { .. }
+        ) {
             review.say(&line)?;
         } else {
             review.note(&line);

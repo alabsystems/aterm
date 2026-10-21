@@ -88,6 +88,8 @@ pub(crate) struct PendingClose {
     /// gesture raised the question (`ctl`, or its sid), or [`ExitActor::Human`]
     /// for a gesture made at the window. Decides whether the wire may answer.
     pub(crate) asked_by: ExitActor,
+    /// This question's serial, never `0` (`App::question_key`).
+    serial: u64,
 }
 
 /// The banner is two rows: the question with the answer keys, then the body (three
@@ -186,7 +188,13 @@ impl PendingClose {
             prompt,
             replay,
             asked_by,
+            serial: crate::paste_banner::next_question_serial(),
         }
+    }
+
+    /// This question's serial (never `0`).
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Rows the banner wants in a window `cols` wide (the splice clamps to the

@@ -113,6 +113,45 @@ pub fn session_face(fleet: &str, node: &str, sid: &str, leaf: &str) -> String {
     format!("/f/{fleet}/pub/{node}/{sid}/{leaf}")
 }
 
+/// `/f/<F>/in/<node>/<sid>/<src>/<kind>` — a post onto one hosted session's
+/// inbox lane, from `src` (a session, a node, or a person posting as
+/// themself).
+#[must_use]
+pub fn post_lane(fleet: &str, node: &str, sid: &str, src: &str, kind: &str) -> String {
+    format!("/f/{fleet}/in/{node}/{sid}/{src}/{kind}")
+}
+
+/// `/f/<F>/in/p/<person>/<node>` — the route onto a person's (or a
+/// service's) own lane from `node`'s bridge; a record on it is
+/// `<route>/<kind>`: a session's `post to=<person>`, the receipt of a
+/// person's post, an `undeliverable`/`expired`/`refused` notice. What `inbox`
+/// reads and `notify --on ask:<person>` pages, and so a record the broker's
+/// escalation table flushes in full before its ack
+/// ([`crate::durability::escalation`]).
+#[must_use]
+pub fn person_lane(fleet: &str, person: &str, node: &str) -> String {
+    format!("/f/{fleet}/in/p/{person}/{node}")
+}
+
+/// Every record on a person's lane, as one filter: what `inbox` reads.
+#[must_use]
+pub fn person_mail_filter(fleet: &str, person: &str) -> String {
+    format!("/f/{fleet}/in/p/{person}/>")
+}
+
+/// `/f/<F>/fleet/<person>/halt` — a person's retained fleet halt row.
+#[must_use]
+pub fn person_halt(fleet: &str, person: &str) -> String {
+    format!("/f/{fleet}/fleet/{person}/halt")
+}
+
+/// The durable group a person's `inbox` commits under: their read mark, the
+/// one hidden record the escalation table's group rule exists for.
+#[must_use]
+pub fn person_inbox_group(fleet: &str, person: &str) -> String {
+    format!("/f/{fleet}/cur/p/{person}/inbox")
+}
+
 /// The durable group name the node's inbox drain commits under. `cur` is a name
 /// face, never published to or delivered, but the cap must grant it (the broker's
 /// `SubscribeGroup`/`Commit` arms), so it is built here beside the subjects.

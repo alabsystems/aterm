@@ -53,15 +53,15 @@ const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One headless instance whose shell is `shell` and whose harness supervises
 /// with `harness` as its `[harness]` table (`None`: the isolation config's,
-/// which switches it off), the stand-in first on its PATH, and `zshrc` the
-/// person's `~/.zshrc` when given.
+/// which switches it off), the stand-in first on its PATH, and `rc` the
+/// person's startup file (its name in the home, its text) when given.
 #[track_caller]
-fn boot(tag: &str, shell: &str, harness: Option<&str>, zshrc: Option<&str>) -> Instance {
+fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>) -> Instance {
     headless_boot::boot_with(
         &format!("atws{tag}"),
         |tmp, cmd| {
-            if let Some(rc) = zshrc {
-                std::fs::write(tmp.join("home/.zshrc"), rc).expect("write the zshrc");
+            if let Some((name, text)) = rc {
+                std::fs::write(tmp.join("home").join(name), text).expect("write the rc");
             }
             if let Some(harness) = harness {
                 let cfg = tmp.join("cfg/aterm/aterm.toml");
@@ -104,13 +104,15 @@ fn spawn_as(
     cmd.env("ATERM_PARENT_SESSION_ID", manager)
         .current_dir(cwd)
         .stdin(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn aterm ctl");
-    let mut stdin = child.stdin.take().expect("its stdin");
-    stdin.write_all(task).expect("write the task");
-    drop(stdin);
-    let out =
+    // Asked again while the instance has not yet accepted it, or answers it busy: nothing was sent.
+    let out = headless_boot::until_served(|| {
+        let mut child = cmd.spawn().expect("spawn aterm ctl");
+        let mut stdin = child.stdin.take().expect("its stdin");
+        stdin.write_all(task).expect("write the task");
+        drop(stdin);
         child_output::wait_and_read(child, Instant::now() + headless_boot::CLIENT_EXIT_DEADLINE)
-            .expect("aterm ctl exits");
+            .expect("aterm ctl exits")
+    });
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -217,6 +219,18 @@ fn run_worker(tag: &str, shell: &str, model: Option<&str>) {
         ),
         Some("-")
     );
+    // The newborn's own Autopilot word is Land, a spawn's default (FOREVER
+    // LAND: its task ends once all of its work is on the remote main
+    // branch); the manager's own word is untouched.
+    assert_eq!(field(&meta, "autopilot"), Some("land"), "{meta}");
+    assert_ne!(
+        field(
+            &ctl_ok(&inst, &[&format!("@{manager}"), "meta"]),
+            "autopilot"
+        ),
+        Some("land"),
+        "the manager's word"
+    );
 
     // The task file: 0600 in a 0700 folder, the task, a blank line, one line
     // of fact naming the manager.
@@ -274,7 +288,7 @@ fn run_worker(tag: &str, shell: &str, model: Option<&str>) {
 
 #[test]
 fn a_worker_runs_its_task_as_claudes_argv_in_a_background_tab_under_zsh() {
-    run_worker("z", "/bin/zsh", Some("claude-test.1_a"));
+    run_worker("z", headless_boot::need_zsh(), Some("claude-test.1_a"));
 }
 
 #[test]
@@ -288,7 +302,7 @@ fn a_worker_runs_its_task_as_claudes_argv_in_a_background_tab_under_bash() {
 /// `agent=codex` is reserved, and an empty task never leaves the client.
 #[test]
 fn a_worker_is_refused_unsupervised_and_spawns_nothing() {
-    let inst = boot("u", "/bin/zsh", None, None);
+    let inst = boot("u", headless_boot::login_shell().path, None, None);
     let (_, manager) = boot_session(&inst);
     let work = inst.tmp.join("work");
     let rows = || ctl_ok(&inst, &["sessions"]).lines().count();
@@ -333,14 +347,16 @@ fn a_worker_is_refused_unsupervised_and_spawns_nothing() {
 /// ends it (a worker's shell alone: the one `ATERM_TASK_FILE` names a task to)
 /// — has its task `stalled why=shell`, and nothing was typed: the stand-in
 /// never ran. Aimed at another session than its manager's, its `from=` is
-/// still the manager, the session that started it.
+/// still the manager, the session that started it. Any shell's rc can end it:
+/// the host's ([`headless_boot::login_shell`]).
 #[test]
 fn a_worker_whose_shell_draws_no_prompt_is_stalled_and_nothing_is_typed() {
+    let shell = headless_boot::login_shell();
     let inst = boot(
         "s",
-        "/bin/zsh",
+        shell.path,
         Some(SUPERVISED),
-        Some("[ -n \"$ATERM_TASK_FILE\" ] && exit 3\n"),
+        Some((shell.rc, "[ -n \"$ATERM_TASK_FILE\" ] && exit 3\n")),
     );
     let (_, manager) = boot_session(&inst);
     let other = sid_of(&ctl_ok(&inst, &["spawn", "raise=false"]));

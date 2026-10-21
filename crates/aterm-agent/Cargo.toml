@@ -49,7 +49,8 @@ aterm-ctl = { path = "../aterm-ctl" }
 aterm-digest = { workspace = true }
 # The workspace's one hex codec (digests) and the
 # control wire's one percent escape (`pct`, every `status`/`history` field the
-# supervisor decodes). First-party, dependency-free.
+# supervisor decodes). First-party; its one dependency is astream-wire
+# (dependency-free, vendor/astream), for the CRC-32.
 aterm-codec = { workspace = true }
 # The fleet document from a URL (src/ai/fleet.rs): its HTTPS-only, size-capped fetch
 # (`http::download_bytes`) and its Ed25519 check (`roster::verify_roster`), the verifier the
@@ -59,7 +60,8 @@ aterm-update-core = { workspace = true }
 # detached signature. The shipped binary already carries ring with these features (TLS).
 ring = { workspace = true, features = ["alloc"] }
 # The workspace's one FNV-1a/64 (the upgrade markers and still-prints, the bake
-# cache's file names, a dialog's answer key). First-party, dependency-free.
+# cache's file names, a dialog's answer key). First-party; its one dependency
+# is astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
 aterm-hash = { workspace = true }
 libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
@@ -98,8 +100,9 @@ atpkg = { workspace = true }
 aterm-toolchain = { workspace = true }
 # `aterm harness upgrade` reads another process's working directory and
 # executable in process (`process_cwd`, `process_path`: libproc on macOS,
-# procfs on Linux) instead of forking two `lsof`s per agent it inspects. Not a
-# new edge in the shipped graph — aterm-gui already links it.
+# procfs on Linux; on Windows the working directory from the process
+# environment block) instead of forking two `lsof`s per agent it inspects.
+# Not a new edge in the shipped graph — aterm-gui already links it.
 aterm-sysprobe = { workspace = true }
 # The ONE spelling of Claude Code's top-effort mode, `aterm_primer::CLAUDE_TOP_EFFORT_KEY`
 # (its settings key and the name `/effort` and the footer's effort results use): the
@@ -139,37 +142,45 @@ aterm-tempfile = { workspace = true }
 # broker), zero dependencies of its own; the framing, the codec and the
 # recovery are aterm's (the crate says recording never needs the wire frame).
 astream-effects = { path = "../../vendor/astream/crates/astream-effects" }
+# THE BOOT a count of the machine's sleep is on (`supervise::fx`'s `os_asleep`,
+# `policy::sleeps::Boot`): `boot_session`, the kernel's boot id as 16 bytes,
+# and `parse_boot_id`, astream's reader of its text (the UUID in either case;
+# the all-zero id refused), which the ledger's and the tape's `boot` go
+# through. The same reading aterm-link's broker opens its log in, so the
+# supervisor and the bus name a boot one way. Zero dependencies; its one
+# cordoned `unsafe` module is its Apple FFI calls (`fcntl` for the barrier,
+# `sysctlbyname` for the boot id, `poll` for a socket's hang-up). Not a new
+# edge where aterm ships its bus (Unix: aterm-link links it, and aterm-durable
+# on Apple); on Windows, where neither does, it is a new one, and a harmless
+# one: no dependencies, and no `unsafe` compiled there.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 # A tape's frames: LZ4 blocks for a frame that compression shrinks by an eighth
 # or more, and each frame's xxh64. Both first-party and dependency-free, and
 # neither a new edge in the shipped graph: aterm-scrollback's warm tier links
 # aterm-lz4, atpkg links aterm-zstd.
 aterm-lz4 = { workspace = true }
 aterm-zstd = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-# `aterm fleet init|join|peers|leave` (`fleet_member`): the fleet's key file,
-# join code, book of peers and the join's handshake and registration. Not a new
-# edge in the shipped graph — aterm-gui already links it — and unix-only, as
-# the key file's reader is.
-aterm-net = { workspace = true }
 # The disk reclaim (`harness::disk::target`) reaches every profile, lock and
 # cache of a build directory through directory handles it opened without
-# following a symlink, and deletes an idle profile's `incremental/` with the
-# fd-relative `*at` calls — the crate that owns them (and their `unsafe`), so
-# this one writes none. Not a new edge in the shipped graph: aterm-gui already
-# links it, under the same `cfg(unix)`. Unix-only, like the crate itself
-# (`#![cfg(unix)]`) and its one user here (`disk_target::fd`); elsewhere the
-# reclaim refuses. Declared for every target, the Windows cells would compile
-# its Unix-only tests.
+# following a link, and deletes with handle-relative calls — fd-relative `*at`
+# calls on unix, NT relative opens and POSIX-semantics deletes held to each
+# entry's listed identity on Windows — the crate that owns them (and their
+# `unsafe`), so this one writes none. One edge on every target: the crate has
+# a unix half and a Windows half under the same names (`disk_target::fd`), and
+# its tests are cfg'd per half. Not a new package in the shipped graph on
+# unix, where aterm-gui already links it; on Windows it is one, a workspace
+# crate with no dependencies (its FFI is kernel32, ntdll and advapi32).
 aterm-dirfd = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `aterm fleet init|join|peers|allow|leave` (`fleet_member`): the fleet's key
+# file, join code, book of peers and the join's handshake and registration. Not
+# a new edge in the shipped graph — aterm-gui already links it — and unix-only,
+# as the key file's reader is.
+aterm-net = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
-# The tests' stand-in programs (`stand_in`), in an optimized test build too.
-aterm-tempfile = { workspace = true, features = ["test-support"] }
-# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
-# build too.
-aterm-durable = { workspace = true, features = ["test-support"] }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-harness = { workspace = true }
 # The upgrade tests' pseudo-terminals, both ends close-on-exec from birth
@@ -177,6 +188,10 @@ aterm-models-harness = { workspace = true }
 # onto it kept a copy of its own master. No cycle (aterm-pty does not depend
 # on aterm-agent).
 aterm-pty = { workspace = true }
+# The session log's `word=` vocabulary, which every act word a self-claim's
+# act gets must hold (`harness::acts::self_claim_act`'s table test). No
+# cycle: aterm-slog depends on neither aterm-agent nor anything above it.
+aterm-slog = { workspace = true }
 
 # ---- integration tests (autotests = false above) ----------------------------
 

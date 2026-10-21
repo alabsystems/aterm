@@ -7,8 +7,9 @@
 //!
 //! The host seams (the crate's own contract):
 //! 1. [`predict_char`](crate::WebTerminal::predict_char) /
-//!    [`predict_backspace`](crate::WebTerminal::predict_backspace) on the keydown
-//!    whose bytes the host writes to the PTY, and
+//!    [`predict_edit_key`](crate::WebTerminal::predict_edit_key) (a bare `←`, `→`, or
+//!    Backspace, also [`predict_backspace`](crate::WebTerminal::predict_backspace))
+//!    on the keydown whose bytes the host writes to the PTY, and
 //!    [`predict_line_submit`](crate::WebTerminal::predict_line_submit) on a key that
 //!    writes a line terminator (Enter in any spelling, Ctrl+J, Ctrl+M), and
 //!    [`predict_unmodelled_input`](crate::WebTerminal::predict_unmodelled_input) on
@@ -17,7 +18,9 @@
 //! 2. [`predict_reconcile`](crate::WebTerminal::predict_reconcile) after `process()`
 //!    applies a chunk of child output to the grid,
 //! 3. [`predict_overlay`](crate::WebTerminal::predict_overlay) when composing a
-//!    frame (the tentative ghost cells the host paints), and
+//!    frame (the tentative ghost cells the host paints), with
+//!    [`predict_overlay_cursor`](crate::WebTerminal::predict_overlay_cursor) (an
+//!    edit's cursor, and the sign to paint its cells all or none), and
 //! 4. [`predict_reset`](crate::WebTerminal::predict_reset) when only the coordinate
 //!    space changes (`resize` calls it automatically), and
 //!    [`predict_session_reset`](crate::WebTerminal::predict_session_reset) when the
@@ -39,7 +42,7 @@
 //! [`WebTerminal`](crate::WebTerminal) is each crate's own terminal type.
 
 use aterm_core::terminal::{RenderCell, Terminal};
-use aterm_predict::{KeySample, PredictMode, Seen};
+use aterm_predict::{EditKey, EditOutcome, KeySample, PredictMode, Seen};
 use aterm_time::Instant;
 
 /// The predictor's resident row buffers on a web terminal: one extracted row
@@ -158,20 +161,89 @@ macro_rules! bind {
                     coords,
                     grid: (cols, 0),
                     row: has_row.then_some(rows.key.as_slice()),
+                    // The web host reads no signed prompt marks: no buffer start, so
+                    // no line is ever witnessed (Home, End, Ctrl-A, Ctrl-E and Delete
+                    // stay input the predictor does not model), and one editor context.
+                    input_start: None,
+                    // The engine's own deferred-wrap flag (a cursor on a filled
+                    // last column is parked only after the terminal wrote it).
+                    wrap_pending: Some(self.term.grid().pending_wrap()),
+                    ..KeySample::default()
                 };
                 self.predict.predict_glyph(ch, &sample, Instant::now())
             }
 
-            /// Register a Backspace: cancels our OWN trailing guess only (erasing
-            /// already-committed real content is left to the program's echo, and ends
-            /// the confirmation epoch). Returns whether a guess was cancelled.
+            /// Register a Backspace: it cancels our OWN trailing guess, or, on a line
+            /// that has proven it echoes, is predicted as an erase at the end of the
+            /// line (see [`predict_edit_key`](Self::predict_edit_key), code 3); erasing
+            /// anything else is left to the program's echo, and ends the confirmation
+            /// epoch. Returns whether a guess was cancelled.
             pub fn predict_backspace(&mut self) -> bool {
+                self.predict_edit_key(3) == 2
+            }
+
+            /// Register a line-editing key the host just wrote to the PTY: `code` 1
+            /// is a bare `←`, 2 a bare `→`, 3 Backspace (any other code is ignored and
+            /// answers 0). Hand it HERE, not to
+            /// [`predict_unmodelled_input`](Self::predict_unmodelled_input): every
+            /// outcome accounts for the key. On a line that has watched its own
+            /// echoes and proved them, the key is armed as an edit of the line the
+            /// predictor knows: in `adaptive` a Backspace shows on that proof, an
+            /// arrow once a motion of the line has also echoed exactly, and in
+            /// `always` both show at once; one it cannot place is declined, an
+            /// arrow with the guesses in flight kept. Answers 0 (declined), 1 (armed) or 2 (a Backspace that cancelled
+            /// our own trailing guess). The web host has no signed prompt marks, so
+            /// Home, End, Ctrl-A, Ctrl-E and Delete, which the predictor places only at
+            /// a prompt whose buffer start the shell authenticated, stay unmodelled
+            /// input (`predict_unmodelled_input`), as they always were.
+            pub fn predict_edit_key(&mut self, code: u32) -> u32 {
+                // ICF barrier (see `predict_reset`): keep this export's body distinct.
+                std::hint::black_box(3u8);
+                let key = match code {
+                    1 => EditKey::Left,
+                    2 => EditKey::Right,
+                    3 => EditKey::Backspace,
+                    _ => return 0,
+                };
                 if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
                     // Sent all the same, and owed (see `predict_char`).
                     self.predict.note_unmodelled_input(Instant::now());
-                    return false;
+                    return 0;
                 }
-                self.predict.predict_backspace(Instant::now())
+                let cur = self.term.cursor();
+                let cols = self.term.grid().cols();
+                let coords = self.term.content_scroll_state().coordinate_generation();
+                let rows = &mut self.pred_row_scratch;
+                // An edit key is placed only on a row the predictor can read, as
+                // `predict_char` reads it (never a scrolled-back history row).
+                let has_row = self.predict.mode() != PredictMode::Off
+                    && self.term.grid().display_offset() == 0;
+                if has_row {
+                    rows.read(&self.term, cur.row);
+                    let mut key = std::mem::take(&mut rows.key);
+                    key.clear();
+                    key.extend((0..usize::from(cols)).map(|c| rows.seen(c)));
+                    rows.key = key;
+                }
+                let sample = KeySample {
+                    cursor: (cur.row, cur.col),
+                    coords,
+                    grid: (cols, 0),
+                    row: has_row.then_some(rows.key.as_slice()),
+                    // The web host reads no signed prompt marks: no buffer start, so
+                    // no line is ever witnessed (Home, End, Ctrl-A, Ctrl-E and Delete
+                    // stay input the predictor does not model), and one editor context.
+                    input_start: None,
+                    // The engine's own deferred-wrap flag (a cursor on a filled
+                    // last column is parked only after the terminal wrote it).
+                    wrap_pending: Some(self.term.grid().pending_wrap()),
+                    ..KeySample::default()
+                };
+                match self.predict.predict_edit(key, &sample, Instant::now()) {
+                    EditOutcome::Declined => 0,
+                    EditOutcome::Armed => 1,
+                    EditOutcome::Cancelled => 2,
+                }
             }
 
             /// Register a line terminator going to the PTY: Enter (CR, or Shift+Enter's
@@ -257,6 +329,15 @@ macro_rules! bind {
             /// `always` ⇒ all pending; `adaptive` ⇒ all pending after an echo is confirmed
             /// on this line and measured RTT is high enough to help. Empty in app-owned
             /// Kitty composers and while scrolled into history.
+            ///
+            /// While [`predict_overlay_cursor`](Self::predict_overlay_cursor) is
+            /// non-empty these are the cells of an edit's displayed state (a typed
+            /// glyph; a glyph a SHIFT moved, typed inside the line, which the native
+            /// host paints as the cell it came from and the web paints as any
+            /// ghost, its text exact; or U+0020 where an erase vacated a cell: paint
+            /// it as the implicit blank): paint ALL of them or none, and draw the
+            /// cursor THERE, not past the last cell. A part of a state is a frame no
+            /// program draws.
             pub fn predict_overlay(&mut self) -> Vec<u32> {
                 if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
                     self.predict.reset();
@@ -271,6 +352,25 @@ macro_rules! bind {
                     out.extend([u32::from(p.row), u32::from(p.col), u32::from(p.ch)]);
                 }
                 out
+            }
+
+            /// The cursor of the frame [`predict_overlay`](Self::predict_overlay) last
+            /// composed when it shows an edit (`[row, col]`): the cursor its displayed
+            /// state leaves, which a motion moves with no cell to paint. Empty for
+            /// typed-ahead glyphs (draw the cursor past the last of them), when
+            /// nothing is shown, in app-owned Kitty composers and while scrolled into
+            /// history. Call after `predict_overlay`; draw it only when every cell of
+            /// that overlay was painted.
+            pub fn predict_overlay_cursor(&self) -> Vec<u32> {
+                // ICF barrier (see `predict_reset`): keep this export's body distinct.
+                std::hint::black_box(4u8);
+                let shown = !self.term.is_alternate_screen()
+                    && !self.term.kitty_suppresses_predictive_echo()
+                    && self.term.grid().display_offset() == 0;
+                self.predict
+                    .overlay_cursor()
+                    .filter(|_| shown)
+                    .map_or_else(Vec::new, |(row, col)| vec![u32::from(row), u32::from(col)])
             }
 
             /// Milliseconds until the oldest pending guess self-expires (the glitch
@@ -346,6 +446,86 @@ mod tests {
         t.predict_reconcile();
         assert!(t.predict_overlay().is_empty());
         assert!(t.predict_next_deadline_ms().is_none());
+    }
+
+    /// An edit key goes through `predict_edit_key`: on a line whose glyphs have
+    /// echoed, `←` is armed as an edit and paints no cell, its cursor handed over
+    /// by `predict_overlay_cursor` until its echo retires it; a Backspace at the
+    /// end of the line is an erase, its vacated cell a blank ghost; an unknown
+    /// code is ignored.
+    #[test]
+    fn an_edit_key_is_armed_and_its_cursor_handed_over() {
+        let mut t = terminal();
+        t.set_predictive_echo("always");
+        for ch in ['a', 'b'] {
+            assert!(t.predict_char(ch));
+            t.process(ch.to_string().as_bytes());
+            t.predict_reconcile();
+        }
+        assert_eq!(t.predict_edit_key(0), 0, "an unknown code is ignored");
+        assert_eq!(t.predict_edit_key(1), 1, "`←` armed on the proven line");
+        assert!(t.predict_overlay().is_empty(), "a motion paints no cell");
+        assert_eq!(t.predict_overlay_cursor(), vec![0, 1]);
+        t.process(b"\x08");
+        t.predict_reconcile();
+        assert!(t.predict_overlay().is_empty());
+        assert!(t.predict_overlay_cursor().is_empty(), "its echo retired it");
+        assert_eq!(t.predict_edit_key(2), 1, "`→` back to the end");
+        t.process(b"\x1b[C");
+        t.predict_reconcile();
+        assert_eq!(t.predict_edit_key(3), 1, "an erase at the end of the line");
+        assert_eq!(t.predict_overlay(), vec![0, 1, u32::from(' ')]);
+        assert_eq!(t.predict_overlay_cursor(), vec![0, 1]);
+        assert!(
+            !t.predict_backspace(),
+            "a second erase arms; it cancels nothing"
+        );
+        // Off is inert at once: no cursor for the flushed chain even before the
+        // next overlay, and an edit key arms nothing.
+        t.set_predictive_echo("off");
+        assert!(t.predict_overlay_cursor().is_empty());
+        assert_eq!(t.predict_edit_key(1), 0);
+        assert!(t.predict_next_deadline_ms().is_none());
+    }
+
+    /// A glyph typed inside a line whose glyphs have echoed is a SHIFT: the
+    /// overlay is the state it leaves, the typed glyph and the text it moved,
+    /// each a `[row, col, codepoint]` triple, with the state's cursor; the echo
+    /// that writes the glyph, the shifted tail and steps back retires it.
+    #[test]
+    fn a_shift_s_moved_text_comes_out_as_triples() {
+        let mut t = terminal();
+        t.set_predictive_echo("always");
+        for ch in ['a', 'b', 'c'] {
+            assert!(t.predict_char(ch));
+            t.process(ch.to_string().as_bytes());
+            t.predict_reconcile();
+        }
+        for _ in 0..2 {
+            assert_eq!(t.predict_edit_key(1), 1, "`←` armed");
+            t.process(b"\x08");
+            t.predict_reconcile();
+        }
+        assert!(t.predict_char('x'), "a shift, armed");
+        assert_eq!(
+            t.predict_overlay(),
+            vec![
+                0,
+                1,
+                u32::from('x'),
+                0,
+                2,
+                u32::from('b'),
+                0,
+                3,
+                u32::from('c')
+            ]
+        );
+        assert_eq!(t.predict_overlay_cursor(), vec![0, 2]);
+        t.process(b"xbc\x08\x08");
+        t.predict_reconcile();
+        assert!(t.predict_overlay().is_empty(), "its echo retired it");
+        assert!(t.predict_overlay_cursor().is_empty());
     }
 
     #[test]

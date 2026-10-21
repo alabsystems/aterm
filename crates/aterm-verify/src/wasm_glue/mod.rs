@@ -35,6 +35,9 @@ mod wasm;
 mod webgl;
 
 pub use js::Flavor;
+/// What `ship provision` acquires for the `wasm-glue` check's oracle row: the
+/// pinned CLI, into the machine-wide tooling the row reads.
+pub use oracle::{BINDGEN, BINDGEN_INSTALL, bindgen_root, reports_pin, tooling};
 
 /// The pass the shipping pipeline applies to a bound `<stem>_bg.wasm`, never
 /// before binding: `-O3` (speed, matching the cargo opt-3 build) with the
@@ -446,7 +449,7 @@ mod tests {
                 panic!(
                     "{}: node could not start ({e}); the generated glue runs under node; {}",
                     crate::libtest::COULD_NOT_RUN_SENTINEL,
-                    crate::install_fix("node", "node", "nodejs")
+                    aterm_uds::host::tool("node").remedy()
                 )
             });
         assert!(

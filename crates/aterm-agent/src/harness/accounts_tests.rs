@@ -618,6 +618,7 @@ fn full_state() -> State {
     assert!(note_offer(
         &mut s,
         "main",
+        None,
         2,
         Some(NOW + 2 * DAY),
         NOW - 9,
@@ -906,6 +907,7 @@ fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() 
         ..sample(5, 20)
     });
     main.offer = Some(Offer {
+        kind: Some(aterm_phase::ResetKind::Full),
         left: 1,
         use_by: Some(ahead + DAY),
         at: ahead,
@@ -1176,7 +1178,7 @@ fn the_transactions_keep_every_map_bounded() {
     assert!(note_wall(&mut s, "Not A Label", "five_hour", None, NOW, NOW).is_empty());
     assert!(note_wall(&mut s, "a10", " \n ", None, NOW, NOW).is_empty());
     assert!(note_sample(&mut s, "../x", sample(1, 1), NOW).is_empty());
-    assert!(!note_offer(&mut s, "", 1, None, NOW, NOW));
+    assert!(!note_offer(&mut s, "", None, 1, None, NOW, NOW));
     assert!(note_auth(&mut s, "A", Auth::Ok, NOW).is_empty());
     assert!(note_session(&mut s, "", "a10", None, NOW).is_empty());
     assert!(note_session(&mut s, "s-1", "A B", None, NOW).is_empty());
@@ -1274,6 +1276,44 @@ fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
         Condition::Limited { .. }
     ));
     assert_eq!(signed_out(&r, &s, &all(&r), NOW), Vec::<String>::new());
+}
+
+/// [`sign_in_next`]: the first OTHER row in roster order that is not signed
+/// in here — never enrolled, or signed out — with whether it signs in by
+/// renewal (an email) or `accounts login` (the review's acct-1, acct-4).
+/// NEGATIVE CONTROLS: the session's own row is never named, a limited row is
+/// no row to sign in, and every other row signed in names none.
+#[test]
+fn the_row_to_sign_in_next_is_the_first_other_one_not_signed_in() {
+    let mut r = three();
+    let here: BTreeSet<String> = ["work-2".to_string()].into();
+    // pool-a never enrolled: named, by `accounts login` (no email).
+    assert_eq!(
+        sign_in_next(&r, &state(), &here, Some("main"), NOW),
+        Some(("pool-a".to_string(), false))
+    );
+    // With an email, by renewal.
+    r.rows[2].email = Some("pool@example.com".to_string());
+    assert_eq!(
+        sign_in_next(&r, &state(), &here, Some("main"), NOW),
+        Some(("pool-a".to_string(), true))
+    );
+    // Signed out comes first in roster order.
+    let mut s = state();
+    note_auth(&mut s, "work-2", Auth::SignedOut, NOW);
+    assert_eq!(
+        sign_in_next(&r, &s, &here, Some("main"), NOW),
+        Some(("work-2".to_string(), false))
+    );
+    // NEGATIVE CONTROL: the session's own row is never the one to sign in.
+    assert_eq!(
+        sign_in_next(&r, &s, &here, Some("work-2"), NOW),
+        Some(("pool-a".to_string(), true))
+    );
+    // NEGATIVE CONTROL: every other row signed in (a limited one included).
+    let mut s = state();
+    limited(&mut s, "work-2", NOW + HOUR);
+    assert_eq!(sign_in_next(&r, &s, &all(&r), Some("main"), NOW), None);
 }
 
 #[test]
@@ -2027,7 +2067,7 @@ fn rule_4_does_not_leave_an_account_whose_reset_offer_is_about_to_expire() {
         (1, None, &ahead, "a deadline nobody read is not one"),
     ] {
         let mut s = s.clone();
-        assert!(note_offer(&mut s, "main", left, use_by, NOW - 5, NOW));
+        assert!(note_offer(&mut s, "main", None, left, use_by, NOW - 5, NOW));
         let advice = advise(
             &r,
             &s,
@@ -2093,6 +2133,7 @@ fn rule_4_leaves_a_limited_account_and_not_one_whose_low_window_is_about_to_rese
     assert!(note_offer(
         &mut offered,
         "main",
+        None,
         1,
         Some(NOW + HOUR),
         NOW,
@@ -3730,8 +3771,19 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
     assert_eq!(s, before);
 
     // The offer: the newer one, and no ledger row of its own.
-    assert!(note_offer(&mut s, "main", 2, Some(NOW + DAY), NOW, NOW));
-    assert!(!note_offer(&mut s, "main", 9, None, NOW - 1, NOW), "older");
+    assert!(note_offer(
+        &mut s,
+        "main",
+        None,
+        2,
+        Some(NOW + DAY),
+        NOW,
+        NOW
+    ));
+    assert!(
+        !note_offer(&mut s, "main", None, 9, None, NOW - 1, NOW),
+        "older"
+    );
     assert_eq!(
         s.accounts["main"]
             .offer
@@ -3739,7 +3791,7 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
             .map(|o| (o.left, o.by.as_str())),
         Some((2, "0a0b"))
     );
-    assert!(note_offer(&mut s, "main", 1, None, NOW + 1, NOW + 1));
+    assert!(note_offer(&mut s, "main", None, 1, None, NOW + 1, NOW + 1));
     assert_eq!(
         s.accounts["main"]
             .offer
@@ -3747,6 +3799,36 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
             .map(|o| (o.left, o.use_by)),
         Some((1, None))
     );
+    // A count of one kind keeps its kind, through the state file too; a row
+    // an earlier build wrote names none and still reads, and a kind no build
+    // names reads as none.
+    let weekly = Some(aterm_phase::ResetKind::Weekly);
+    assert!(note_offer(
+        &mut s,
+        "main",
+        weekly,
+        0,
+        None,
+        NOW + 2,
+        NOW + 2
+    ));
+    let kind_of = |s: &State| s.accounts["main"].offer.as_ref().map(|o| (o.kind, o.left));
+    assert_eq!(kind_of(&s), Some((weekly, 0)));
+    let json = s.to_json();
+    assert!(json.contains("\"kind\":\"weekly\""), "{json}");
+    assert_eq!(
+        kind_of(&State::from_json(&json, NOW).expect("reads")),
+        Some((weekly, 0))
+    );
+    for (from, to) in [("\"kind\":\"weekly\",", ""), ("\"weekly\"", "\"hourly\"")] {
+        let older = json.replacen(from, to, 1);
+        assert_ne!(older, json);
+        assert_eq!(
+            kind_of(&State::from_json(&older, NOW).expect("reads")),
+            Some((None, 0)),
+            "{older}"
+        );
+    }
 
     // Auth: a row only when the word changes; an older word is dropped;
     // `unseen` is nothing to observe.
@@ -3895,6 +3977,7 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     assert!(note_offer(
         &mut s,
         "main",
+        None,
         1,
         Some(ahead + HOUR),
         ahead,
@@ -3907,7 +3990,7 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     );
     for held in [&mut s, &mut read] {
         assert!(
-            note_offer(held, "main", 0, None, NOW, NOW),
+            note_offer(held, "main", None, 0, None, NOW, NOW),
             "a real offer is newer than one stamped ahead of the clock"
         );
         assert_eq!(
@@ -3918,7 +4001,7 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
             Some((0, None, NOW))
         );
         // The order among real offers is as it was: an older one is dropped.
-        assert!(!note_offer(held, "main", 5, None, NOW - 1, NOW));
+        assert!(!note_offer(held, "main", None, 5, None, NOW - 1, NOW));
     }
 
     // A WALL stamped tomorrow does not shadow a real one of that window…
@@ -4210,7 +4293,10 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     // claim changes nothing — another session, another wall, another
     // account — and neither does a second outcome for a claim that has one.
     let mut told = claimed.clone();
-    let used = ResetDone::Used { left: Some(1) };
+    let used = ResetDone::Used {
+        kind: aterm_phase::ResetKind::Weekly,
+        left: Some(1),
+    };
     for (account, wall, sid) in [
         ("main", until, "s-two"),
         ("main", until + 1, "s-one"),
@@ -4280,8 +4366,11 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
 /// A reset used or a limit found lifted clears only its claimed raw wall,
 /// with its timestamp retained in
 /// that wall's slot. Other walls still limit the account. The row is
-/// `reset-used` only for `Used`; a limit that lifted by itself is
-/// `reset-kept`. Each outcome is recorded once and wakes the waiting tabs.
+/// `reset-used` only for `Used`, its reason the count of the kind spent in
+/// the vendor's words (Claude Code 2.1.304 counts each kind apart); a limit
+/// that lifted by itself is `reset-kept`. Each outcome is recorded once and
+/// wakes the waiting tabs. Whatever the kind spent, only the claimed window
+/// is cleared: a full reset's line does not prove every other quota refilled.
 ///
 /// NEGATIVE CONTROLS: before any outcome the session at that row is rotated;
 /// a reset KEPT or FAILED changes no wall and clears nothing, and the same
@@ -4289,6 +4378,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
 /// or an address.
 #[test]
 fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
+    use aterm_phase::ResetKind;
     let r = three();
     let enrolled = all(&r);
     let written = NOW - HOUR;
@@ -4346,18 +4436,42 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
     assert!(limited_now(&walled));
     assert_eq!(ask(&walled), rotate);
 
-    for (done, kind) in [
-        (ResetDone::Used { left: Some(1) }, Kind::ResetUsed),
-        (ResetDone::Lifted, Kind::ResetKept),
+    let used = |kind: ResetKind, left: u32| ResetDone::Used {
+        kind,
+        left: Some(left),
+    };
+    for (done, kind, why) in [
+        (
+            used(ResetKind::Weekly, 1),
+            Kind::ResetUsed,
+            "1 weekly reset left",
+        ),
+        (
+            used(ResetKind::Session, 0),
+            Kind::ResetUsed,
+            "no five-hour resets left",
+        ),
+        (
+            used(ResetKind::Full, 2),
+            Kind::ResetUsed,
+            "2 full resets left",
+        ),
+        (ResetDone::Lifted, Kind::ResetKept, "lifted"),
     ] {
         let mut s = walled.clone();
         let rows = reset_outcome(&mut s, "main", until, "s-one", &done, NOW);
         assert_eq!(
             rows.iter()
-                .map(|e| (e.t, e.kind, e.account.as_str(), e.sid.as_deref()))
+                .map(|e| (
+                    e.t,
+                    e.kind,
+                    e.account.as_str(),
+                    e.sid.as_deref(),
+                    e.why.as_str()
+                ))
                 .collect::<Vec<_>>(),
-            [(NOW, kind, "main", Some("s-one"))],
-            "{done:?}"
+            [(NOW, kind, "main", Some("s-one"), why)],
+            "{done:?}: the count is its kind's, in the vendor's words"
         );
         assert!(rows[0].wakes(), "{done:?}");
         let main = &s.accounts["main"];
@@ -4457,7 +4571,10 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
         "main",
         until,
         "s-one",
-        &ResetDone::Used { left: None },
+        &ResetDone::Used {
+            kind: ResetKind::Full,
+            left: None,
+        },
         NOW,
     );
     assert_eq!(unscoped.accounts, walled.accounts);
@@ -4491,9 +4608,18 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
         assert_eq!(newer.accounts, accounts_before);
     }
 
-    // KEPT AND FAILED CHANGE NO WALL. The reason is the caller's word; a
-    // vendor line's head and no more.
+    // KEPT AND FAILED CHANGE NO WALL, and nor does a reset spent whose line
+    // says the wall still stands (recorded as used). The reason is the
+    // caller's word; a vendor line's head and no more.
     for (done, kind, why) in [
+        (
+            ResetDone::Walled {
+                kind: ResetKind::Fable,
+                left: 0,
+            },
+            Kind::ResetUsed,
+            "no Fable resets left, still walled",
+        ),
         (ResetDone::Kept("early"), Kind::ResetKept, "early"),
         (ResetDone::Failed("login"), Kind::ResetFailed, "login"),
         (
@@ -4961,6 +5087,7 @@ fn a_state_file_that_is_not_ours_is_a_refusal_and_never_an_empty_state() {
     // permission or an I/O error.
     let other = Store {
         dir: dir.path().join("odd"),
+        ..Store::at(dir.path())
     };
     std::fs::create_dir_all(other.state_file()).expect("mkdir");
     assert!(
@@ -7156,7 +7283,13 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
         let lines = windows_full(&r, &state, end + 10);
         (dir, store, lines, state.account(OWN))
     };
-    for done in [ResetDone::Used { left: Some(1) }, ResetDone::Lifted] {
+    for done in [
+        ResetDone::Used {
+            kind: aterm_phase::ResetKind::Weekly,
+            left: Some(1),
+        },
+        ResetDone::Lifted,
+    ] {
         let (_dir, store, lines, account) = run("reset-week", WEEK_LIMIT, &done, NOW + 40);
         assert!(lines.is_empty(), "{done:?}: {lines:?}");
         assert_eq!(account.warned_week, refilled(NOW + 40), "{done:?}");
@@ -7241,7 +7374,10 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
             OWN,
             until,
             "s-1",
-            &ResetDone::Used { left: None },
+            &ResetDone::Used {
+                kind: aterm_phase::ResetKind::Full,
+                left: None,
+            },
             NOW + 40,
         );
         let account = s.account(OWN);
@@ -7295,7 +7431,10 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
             OWN,
             until,
             "s-1",
-            &ResetDone::Used { left: None },
+            &ResetDone::Used {
+                kind: aterm_phase::ResetKind::Full,
+                left: None,
+            },
             NOW + 40,
         );
         assert_eq!(
@@ -7338,7 +7477,10 @@ fn a_warning_drawn_before_a_reset_says_nothing_after_it() {
                 OWN,
                 week_end,
                 "s-a",
-                &ResetDone::Used { left: None },
+                &ResetDone::Used {
+                    kind: aterm_phase::ResetKind::Weekly,
+                    left: None,
+                },
                 NOW + 10,
             ));
             Ok(rows)
@@ -7537,7 +7679,10 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
             OWN,
             week_end,
             "s-1",
-            &ResetDone::Used { left: None },
+            &ResetDone::Used {
+                kind: aterm_phase::ResetKind::Weekly,
+                left: None,
+            },
             NOW + 11 * MIN,
         ));
         rows

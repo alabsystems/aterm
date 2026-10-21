@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! WHO TYPED (`docs/DESIGN-owner-surfaces-2026-10-16.md` S9) against a real
-//! `aterm --headless`: the stamp the session dispatch makes on a typing
-//! verb's `OK`, past its halt gate (`control::handle`'s `stamp_typed`), read
-//! back through `status typed_by=`. An owner client outside every tab is its
+//! `aterm --headless`: the credit a typing verb's caller gets once the session
+//! accepts its nonempty input, past its halt gate
+//! (`control_input_ack::InputMark::typed_by`), read back through
+//! `status typed_by=`. An owner client outside every tab is its
 //! process; the same client run from a tab's shell is that tab, by its role;
 //! an edge minted for that tab and presented from outside it is whoever
 //! presented it, on the tab's edge, never the tab on the edge's word; and a

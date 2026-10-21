@@ -437,6 +437,19 @@ impl TerminalCheckpoint {
             carry.state == aterm_parser::State::OscString && osc_payload_is_shell_mark(&carry.osc)
         })
     }
+
+    /// This checkpoint less its lineage's seed uncertainty
+    /// ([`HolderRepr::seed_untrusted`]): what a restored engine shares with the
+    /// live one it continues. A restore that took output after its install
+    /// carries that bit by design (its old command start must not seed a range)
+    /// and a live engine never does, so a test comparing the two compares
+    /// everything else.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn without_seed_lineage(mut self) -> Self {
+        self.holder.seed_untrusted = false;
+        self
+    }
 }
 
 /// Whether `osc`, an OSC payload collected so far, is an OSC 133/633 mark past its
@@ -538,9 +551,24 @@ impl Terminal {
     /// `checkpoint`, it carries no shell-integration nonce.
     #[must_use]
     pub fn checkpoint_continuing(&self) -> Option<TerminalCheckpoint> {
+        self.checkpoint_continuing_bounded(usize::MAX)
+    }
+
+    /// [`Self::checkpoint_continuing`] with each grid's history bounded to its
+    /// most recent `max_history` lines, at a capture cost of
+    /// `O((rows + max_history) × cols)`: the primary's (the saved one while the
+    /// alternate screen is up) and the inactive grid's alike, as an engine whose
+    /// scrollback limit is `max_history` projects in full.
+    ///
+    /// For a keyframe of a live engine taken under its lock: the temporal
+    /// recorder's, after its reader dropped input, which must not cost work
+    /// proportional to the whole history and may find the parser inside a
+    /// sequence.
+    #[must_use]
+    pub fn checkpoint_continuing_bounded(&self, max_history: usize) -> Option<TerminalCheckpoint> {
         self.partial_sequence_uncarried()
             .is_none()
-            .then(|| self.project_bounded(usize::MAX, usize::MAX, self.parser_is_ground()))
+            .then(|| self.project_bounded(max_history, max_history, self.parser_is_ground()))
     }
 
     /// [`Self::checkpoint_continuing`] that never refuses: a hooked DCS query
@@ -1121,14 +1149,90 @@ impl Terminal {
         let on_alt = c.modes.alternate_screen;
         let mut active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
         active_grid.continue_absolute_numbering(c.absolute_row_counter);
-        let mut terminal = Terminal::with_grid(active_grid);
-
         // Saved grid (same restore path; alt buffer ⟺ we are not on alt), if present.
-        if let (Some(alt_bytes), Some(alt_cursor)) = (&c.alt_grid, &c.alt_cursor) {
-            let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt);
-            saved.continue_absolute_numbering(c.alt_absolute_row_counter);
-            terminal.alt_grid = Some(saved);
+        let saved_grid = match (&c.alt_grid, &c.alt_cursor) {
+            (Some(alt_bytes), Some(alt_cursor)) => {
+                let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt);
+                saved.continue_absolute_numbering(c.alt_absolute_row_counter);
+                Some(saved)
+            }
+            _ => None,
+        };
+        Self::restored(c, active_grid, saved_grid)
+    }
+
+    /// A copy of this engine that continues as it does: fed the same output and
+    /// resizes from here, the two show the same rows and cursor and project equal
+    /// checkpoints. For a replay whose variants share a prefix (`aterm_control`'s
+    /// `ReplayEngine::fork`): fold the prefix once, then each variant from a fork.
+    ///
+    /// It is [`Self::from_checkpoint`] of the full projection, except that each
+    /// grid is copied as this engine keeps it ([`Grid::replay_fork`]: the same
+    /// ring under the same cap, where a restore attaches an unlimited tiered
+    /// store), and the transient state later output reads that no checkpoint
+    /// carries comes along: the orphaned-screen leave's notes, the
+    /// synchronized-update timer, the last Kitty id assigned and the Kitty
+    /// serials, and the live-image budget. The holder fence is this engine's,
+    /// with the restore it continues: a fork is no restore of its own, so it
+    /// awaits a host's adoption ([`Self::adopt_holder_after_restore`]) only
+    /// where this engine does, untouched as long as this one would be, and a
+    /// checkpoint of either carries the same seed uncertainty. A host's leave
+    /// ([`Self::leave_alternate_screen`]) is taken inside the call that asks for
+    /// it, so none is pending here. Host bindings are `Terminal::new`'s, as a
+    /// restore's: a fork is exact for an engine set up as a fresh one, which a
+    /// replay is.
+    ///
+    /// `None` when this engine holds state no fork carries: a parser inside a
+    /// sequence (a picture or clipboard string would be swallowed), Kitty images,
+    /// image numbers or a chunked transmission (the store is not copied), an
+    /// open resize undo or a standing resize hand-back on either grid, or a
+    /// tiered history store.
+    #[must_use]
+    pub fn replay_fork(&self) -> Option<Terminal> {
+        let t = &self.transient;
+        let kitty_idle = t.kitty_images.is_empty()
+            && t.kitty_frames.is_empty()
+            && t.kitty_variants.is_empty()
+            && t.kitty_virtual.is_empty()
+            && t.kitty_relations.is_empty()
+            && t.kitty_floating.is_empty()
+            && t.kitty_numbers.is_empty()
+            && t.kitty_pending.is_none();
+        if !self.parser_is_ground() || self.carried_parser().is_some() || !kitty_idle {
+            return None;
         }
+        let active = self.grid.replay_fork()?;
+        let inactive = match &self.alt_grid {
+            Some(grid) => Some(grid.replay_fork()?),
+            None => None,
+        };
+        // The scalars, the shell marks of every line the grids carry included.
+        let scalars = self.project(usize::MAX, usize::MAX, true, false, MarksFrom::Carried);
+        let mut fork = Self::restored(&scalars, active, inactive);
+        // `restored` installs the projection's fence as a carry awaiting
+        // adoption, tainted where this engine's restore saw output first. The
+        // fork holds the fence as this engine holds it, and this engine's
+        // restore, if any, at the same distance behind its output count.
+        fork.holder_fence.clone_from(&self.holder_fence);
+        let since = |at: u64| t.screen_mutations.wrapping_sub(at);
+        fork.holder_carried_at = self
+            .holder_carried_at
+            .map(|at| fork.transient.screen_mutations.wrapping_sub(since(at)));
+        let to = &mut fork.transient;
+        to.alt_entered_without_cursor_save = t.alt_entered_without_cursor_save;
+        to.conhost_alt_screen_left_up = t.conhost_alt_screen_left_up;
+        to.sync_start = t.sync_start;
+        to.kitty_last_assigned_id = t.kitty_last_assigned_id;
+        to.kitty_serial = t.kitty_serial;
+        to.live_image_charge = t.live_image_charge;
+        Some(fork)
+    }
+
+    /// [`Self::from_checkpoint`] over grids already rebuilt: everything else
+    /// `c` carries, installed on a `Terminal::new`-configured engine.
+    fn restored(c: &TerminalCheckpoint, active_grid: Grid, saved_grid: Option<Grid>) -> Terminal {
+        let mut terminal = Terminal::with_grid(active_grid);
+        terminal.alt_grid = saved_grid;
 
         terminal.modes = c.modes;
         terminal.cursor_save.main = c.saved_cursor_main.map(SavedCursorRepr::into_saved);
@@ -1476,7 +1580,10 @@ where
     Ok(
         match <Wire as serde::Deserialize>::deserialize(deserializer)? {
             Wire::Holder(holder) => holder,
-            Wire::Unreadable(_) => HolderRepr::default(),
+            Wire::Unreadable(_) => HolderRepr {
+                seed_untrusted: true,
+                ..HolderRepr::default()
+            },
         },
     )
 }
@@ -1814,6 +1921,19 @@ mod tests {
         t
     }
 
+    /// A restored engine's checkpoint with its restore lineage asserted and taken
+    /// out: output reached the restore before any host adopted it, so it carries
+    /// that lineage's seed uncertainty (`HolderRepr::seed_untrusted`), which a
+    /// live engine never has and which is no session state. Every other field is
+    /// held to the live engine's.
+    fn lineage_taken(c: TerminalCheckpoint) -> TerminalCheckpoint {
+        assert!(
+            c.holder.seed_untrusted,
+            "a restore output reached before adoption carries its lineage"
+        );
+        c.without_seed_lineage()
+    }
+
     /// Read a cell's (char, flags, fg, bg) at (row, col) on the active grid.
     fn cell_signature(
         t: &Terminal,
@@ -1979,6 +2099,62 @@ mod tests {
         );
     }
 
+    /// The bounded continuing checkpoint is the full one of the same engine
+    /// under a scrollback limit of the bound: the primary keeps its newest `n`
+    /// lines whether it is the active grid or the one the alternate screen
+    /// saved, and a split sequence rides it. Negative control: the unbounded
+    /// projection carries every line.
+    #[test]
+    fn a_bounded_continuing_checkpoint_is_the_full_one_under_that_scrollback_limit() {
+        const BOUND: usize = 10;
+        let engine = |alt: bool| {
+            let mut t = Terminal::new(4, 20);
+            for i in 0..30 {
+                t.process(format!("line-{i}\r\n").as_bytes());
+            }
+            if alt {
+                t.process(b"\x1b[?1049hon the alt screen");
+            }
+            t.process(b"\x1b[1;3");
+            t
+        };
+        for alt in [false, true] {
+            let bounded = engine(alt)
+                .checkpoint_continuing_bounded(BOUND)
+                .expect("a split CSI is carried");
+            let mut limited = engine(alt);
+            limited.set_scrollback_line_limit(Some(BOUND));
+            assert_eq!(
+                Some(&bounded),
+                limited.checkpoint_continuing().as_ref(),
+                "alt: {alt}"
+            );
+            let primary = if alt {
+                bounded.alt_grid.as_deref().expect("the saved primary")
+            } else {
+                &bounded.grid[..]
+            };
+            assert_eq!(deserialize_lines(primary).len(), BOUND + 4, "alt: {alt}");
+            let full = engine(alt).checkpoint_continuing().expect("carried");
+            let full_primary = if alt {
+                full.alt_grid.as_deref().expect("the saved primary")
+            } else {
+                &full.grid[..]
+            };
+            assert!(
+                deserialize_lines(full_primary).len() > BOUND + 4,
+                "alt: {alt}"
+            );
+
+            let mut restored = Terminal::from_checkpoint(&bounded);
+            let mut live = engine(alt);
+            restored.process(b"1mX");
+            live.process(b"1mX");
+            assert!(restored.parser_is_ground(), "the tail ended the CSI");
+            assert_eq!(restored.visible_content(), live.visible_content());
+        }
+    }
+
     #[test]
     fn visible_checkpoint_is_live_frame_not_scrolled_viewport_and_continues() {
         let mut terminal = Terminal::new(4, 20);
@@ -2003,7 +2179,7 @@ mod tests {
         restored.process(b"tail");
         assert_eq!(
             terminal.checkpoint_visible(),
-            restored.checkpoint_visible(),
+            restored.checkpoint_visible().map(lineage_taken),
             "restored live frame continues identically after new PTY output"
         );
     }
@@ -2027,7 +2203,7 @@ mod tests {
         );
         assert_eq!(
             terminal.checkpoint_visible(),
-            restored.checkpoint_visible(),
+            restored.checkpoint_visible().map(lineage_taken),
             "DECRC and subsequent styled output must remain equivalent"
         );
     }
@@ -2058,7 +2234,7 @@ mod tests {
         // And re-checkpoints still agree after the identical follow-on writes.
         assert_eq!(
             t.checkpoint(),
-            h.checkpoint(),
+            lineage_taken(h.checkpoint()),
             "post-write re-checkpoint equality"
         );
     }
@@ -2092,7 +2268,7 @@ mod tests {
         }
         assert_eq!(
             t.checkpoint(),
-            h.checkpoint(),
+            lineage_taken(h.checkpoint()),
             "re-checkpoint equal after alt toggle"
         );
     }
@@ -2210,7 +2386,7 @@ mod tests {
         );
         assert_eq!(
             t.checkpoint(),
-            h.checkpoint(),
+            lineage_taken(h.checkpoint()),
             "restored alt screen stays in lockstep with the live engine after scrolling"
         );
     }
@@ -3479,7 +3655,7 @@ mod tests {
             live.process(tail);
             restored.process(tail);
             assert_eq!(
-                restored.checkpoint_continuing(),
+                restored.checkpoint_continuing().map(lineage_taken),
                 live.checkpoint_continuing(),
                 "{label}: the replayed tail lands where the live one did"
             );
@@ -3724,7 +3900,7 @@ mod tests {
             live.process(tail);
             restored.process(tail);
             assert_eq!(
-                restored.checkpoint_continuing(),
+                restored.checkpoint_continuing().map(lineage_taken),
                 live.checkpoint_continuing(),
                 "{label}: lossless parser state remains admitted"
             );
@@ -3838,3 +4014,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "replay_fork_tests.rs"]
+mod replay_fork_tests;

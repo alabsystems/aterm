@@ -361,7 +361,7 @@ fn a_stalled_watch_is_reported_only_while_it_runs() {
     let shelf = shelf_at(20 * GIB);
     let world = World::new(20 * GIB);
     let Some(old) = Instant::now().checked_sub(STALL + Duration::from_secs(1)) else {
-        return;
+        aterm_spec::host::could_not_run("the monotonic clock here cannot reach back a stall");
     };
     shelf.publish(|b| b.watch = Watch::Running { beat: old });
     let reply = run_in(&shelf, "sys free>=30GiB timeout=600000", &owner(), &world);
@@ -565,4 +565,138 @@ fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
         &same,
     );
     assert!(reply.starts_with("OK sys free_bytes="), "{reply}");
+}
+
+/// A WAIT SPELLS ONLY A TAB THE BOARD PLACES NOWHERE (rev6-l-2): before it
+/// asks the board, a wait from a tab that reports 8.3 short names spells
+/// them long ([`spell_owed`]) only while no look mapped the tab and no long
+/// spelling of that very spelling is kept for it — one kept that places on
+/// no row yet included. A tab a look mapped reads its row's mount, as it
+/// did before spellings were kept, and costs its wait no file-system call.
+/// NEGATIVE CONTROLS: an unmapped tab, and a spelled one once it moved, are
+/// owed a spelling.
+#[test]
+fn a_wait_spells_only_a_tab_the_board_places_nowhere() {
+    let (short, moved, long) = if cfg!(windows) {
+        (
+            r"C:\Users\ANDREW~1\repo",
+            r"C:\Users\ANDREW~1\other",
+            r"C:\Users\Andrew Yates\repo",
+        )
+    } else {
+        ("/tmp/REPO~1/x", "/tmp/REPO~1/y", "/tmp/a repo/x")
+    };
+    let (short, moved) = (Path::new(short), Path::new(moved));
+    let shelf = shelf_at(500 * GIB);
+    {
+        let b = shelf.board_lock();
+        assert!(b.row_of(7, short.to_str()).is_some(), "PREMISE: 7 mapped");
+        assert!(!spell_owed(&b, 7, short), "a look mapped the tab");
+        assert!(spell_owed(&b, 8, short), "no look mapped it");
+    }
+    shelf.publish(|b| b.spell(8, short.to_path_buf(), PathBuf::from(long)));
+    let b = shelf.board_lock();
+    assert!(b.row_of(8, short.to_str()).is_none(), "PREMISE: on no row");
+    assert!(!spell_owed(&b, 8, short), "spelled already");
+    assert!(spell_owed(&b, 8, moved), "the tab moved");
+}
+
+/// AN 8.3 SPELLING CARRIES ON ITS VOLUME'S ROW (live5 F1): a wait whose
+/// `vol=` — or whose tab's directory, before any look mapped the tab — is
+/// spelled with 8.3 short names gives no key on the board's table, and reads
+/// the volume itself (the product's reader spells short names long). It
+/// answers from the row the watch measured there: `free>=room` is met on
+/// its room, a demand from that tab registers on its `reclaimed_here`, and
+/// the row keeps both, so another tab's `free>=room` is met after it.
+/// PREMISES: the long spelling places on the row, the short one on none.
+/// NEGATIVE CONTROL (by hand): a `fresh` that builds the reading's row from
+/// nothing answers `why=room-unknown` and the demand `why=not-reclaimed`.
+#[cfg(windows)]
+#[test]
+fn an_8_3_spelling_carries_on_its_volumes_row() {
+    use aterm_sysprobe::volumes::{Mount, Table};
+    let c = Mount {
+        on: PathBuf::from(r"C:\"),
+        from: r"\Device\HarddiskVolume3".to_owned(),
+        fstype: String::new(),
+        local: true,
+        automounted: false,
+        read_only: false,
+        container: Some("Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}".to_owned()),
+    };
+    let key = c.key().expect("a volume key");
+    let read_at = |free: u64| Reading {
+        mount: PathBuf::from(r"C:\"),
+        key: key.clone(),
+        ..reading(free)
+    };
+    let shelf = shelf_at(500 * GIB);
+    shelf.publish(|b| {
+        b.table = Table {
+            mounts: vec![c],
+            complete: true,
+            firmlinks: Vec::new(),
+        };
+        b.volumes[0].reading = read_at(500 * GIB);
+        b.sessions.clear();
+    });
+    {
+        let b = shelf.board_lock();
+        assert!(
+            b.row_at(Path::new(r"C:\Program Files\x")).is_some(),
+            "PREMISE: long"
+        );
+        assert!(
+            b.row_at(Path::new(r"C:\PROGRA~1\x")).is_none(),
+            "PREMISE: 8.3"
+        );
+    }
+    let pokes = AtomicU32::new(0);
+    let read = |_: &Path| Ok(read_at(500 * GIB));
+    let poke = |_: u64| {
+        pokes.fetch_add(1, Ordering::SeqCst);
+    };
+    let env = Env {
+        read: &read,
+        poke: &poke,
+        settings: &|| (false, false, false),
+        lines: &default_lines,
+        hung_up: &|| false,
+        exited: &|| false,
+    };
+    let wait = |text: &str| parse(text).expect("parses");
+    let reply = run(
+        &shelf,
+        &wait(r"sys free>=room vol=C:\PROGRA~1\not-yet-made timeout=600000"),
+        &owner(),
+        &env,
+    );
+    assert!(reply.starts_with("OK sys "), "8.3 vol=: {reply}");
+    let tab = Who {
+        session: 8,
+        cwd: Some(PathBuf::from(r"C:\Users\ANDREW~1\repo")),
+        owner_class: true,
+    };
+    let reply = run(&shelf, &wait("sys free>=room timeout=600000"), &tab, &env);
+    assert!(reply.starts_with("OK sys "), "8.3 tab: {reply}");
+    let reply = run(&shelf, &wait("sys free>=600GiB timeout=50"), &tab, &env);
+    assert_eq!(reply, "OK timeout\n", "a demand, never not-reclaimed");
+    assert!(
+        pokes.load(Ordering::SeqCst) >= 1,
+        "the demand poked the watch"
+    );
+    let held = shelf
+        .board_lock()
+        .row_keyed(&key)
+        .cloned()
+        .expect("the row");
+    assert_eq!(held.room, Some(100 * GIB), "the watch's room");
+    assert!(held.reclaimed_here, "the watch's reclaim");
+    let reply = run(
+        &shelf,
+        &wait(r"sys free>=room vol=C:\work timeout=600000"),
+        &owner(),
+        &env,
+    );
+    assert!(reply.starts_with("OK sys "), "another tab: {reply}");
 }

@@ -17,14 +17,26 @@
 use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
 use aterm_render::{
-    CharFg, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput, Theme,
-    TrailCell, band_offset, band_offset_y, place_frame_bands, premul_rgb,
+    CharFg, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, PixelRect, RainHalo,
+    RenderInput, Theme, TrailCell, band_offset, band_offset_y, frame_placement, place_frame_bands,
+    premul_rgb,
 };
 
 // The wgpu present-theorem harness (its stand-in textures and taps are
 // wgpu-typed). The Metal twin is the armed differentials
 // (`metal_present_bytes_for_test` and the tap-ring differential).
 use crate::common::wgpu_oracle as gpu;
+
+/// The pixels of `rect` in a straight-RGBA8 surface `surface_w` pixels wide,
+/// rows packed: what a capture cut to that rect encodes.
+fn cut_rgba8(rgba: &[u8], surface_w: usize, rect: PixelRect) -> Vec<u8> {
+    (rect.y..rect.y + rect.height)
+        .flat_map(|y| {
+            let start = (y * surface_w + rect.x) * 4;
+            rgba[start..start + rect.width * 4].iter().copied()
+        })
+        .collect()
+}
 
 fn opts(half_res: bool) -> CaptureOpts {
     CaptureOpts {
@@ -329,6 +341,29 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     // pixel is magenta, not the live band colour.
     assert_eq!(source.pixels[fw * fh - 1] & 0x00ff_ffff, 0x00ff_00ff);
 
+    // The capture crop inverts the placement: the presented destination cut at
+    // the frame's placement is the source frame, byte for byte. Negative
+    // control: the same cut one pixel to the right misses it (the magenta
+    // sentinel makes the frame's last column differ from the band).
+    let place = frame_placement(dw, dh, fw, fh);
+    let cut = |place: aterm_render::FramePlacement| {
+        let rect = place
+            .visible_rect(dw, dh)
+            .expect("the destination is the placement's surface");
+        cut_rgba8(&frame.rgba, dw, rect)
+    };
+    assert!(
+        cut(place) == source.rgba_bytes(),
+        "the destination cut at the frame's placement is the frame"
+    );
+    let mut shifted = place;
+    shifted.x.band_before += 1;
+    shifted.x.band_after -= 1;
+    assert!(
+        cut(shifted) != source.rgba_bytes(),
+        "a cut one pixel off the placement is not the frame"
+    );
+
     // Tier-1 conformance: project this odd-band present onto the bounded
     // SurfaceCoverage model (frame=4, raw surface=5). The four raw corners
     // witness the live OSC-11 band.
@@ -366,6 +401,87 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     assert!(!model.check_invariant("RemainderUsesLiveBackground", &old_frame_viewport));
 }
 
+/// A destination smaller than its frame on both axes (a transient resize):
+/// the production present crops the frame centred, and the destination cut at
+/// the frame's placement is exactly the frame's visible intersection, the
+/// source sub-rect at the placement's leading crop. Negative control: the
+/// sub-rect one pixel further in is not what the glass shows.
+#[test]
+fn overflowing_frame_crop_is_the_visible_intersection() {
+    let theme = Theme::default();
+    let mut gpu = gpu(16.0, theme);
+    gpu.set_bloom(false);
+    gpu.set_sdr_glow_boost(0.0);
+    gpu.set_pad(0);
+
+    let (rows, cols) = (6usize, 28usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b]11;rgb:2222/4444/6666\x1b\\");
+    term.process(b"$ overflow crop |||| ####\r\n$ every column differs: abcdefghij");
+    let mut input = term.cell_frame(rows, cols);
+    input.default_bg = 0x0022_4466;
+
+    let mut source_win = aterm_gpu::WindowGpu::new();
+    let source = gpu.render_input(&mut source_win, &input, None);
+    let (fw, fh) = (source.width, source.height);
+    let (dw, dh) = (fw - 9, fh - 5);
+    let place = frame_placement(dw, dh, fw, fh);
+    assert_eq!((place.x.visible, place.y.visible), (dw, dh));
+    assert_eq!(
+        (place.x.crop_before, place.x.crop_after),
+        (5, 4),
+        "x: a -9 destination crops 5 leading / 4 trailing"
+    );
+    assert_eq!(
+        place.y.crop_before,
+        if cfg!(target_os = "linux") { 0 } else { 3 },
+        "y: platform policy"
+    );
+
+    let mut present_win = aterm_gpu::WindowGpu::new();
+    gpu.video_begin_standin_for_test(&mut present_win, dw as u32, dh as u32, opts(false))
+        .expect("standin tap");
+    gpu.present_swapchain_standin_for_test(
+        &mut present_win,
+        &input,
+        false,
+        None,
+        None,
+        (dw as u32, dh as u32),
+    );
+    gpu.video_after_present(&mut present_win, 1);
+    let take = gpu
+        .video_finish(&mut present_win)
+        .expect("production present take");
+    let frame = &take.frames[0];
+    assert_eq!((frame.w, frame.h), (dw as u32, dh as u32));
+
+    let source_rgba = source.rgba_bytes();
+    let sub_rect = |x0: usize, y0: usize| -> Vec<u8> {
+        (y0..y0 + dh)
+            .flat_map(|y| {
+                let start = (y * fw + x0) * 4;
+                source_rgba[start..start + dw * 4].iter().copied()
+            })
+            .collect()
+    };
+    let rect = place
+        .visible_rect(dw, dh)
+        .expect("the destination is the placement's surface");
+    let cut = cut_rgba8(&frame.rgba, dw, rect);
+    assert!(
+        cut == sub_rect(place.x.crop_before, place.y.crop_before),
+        "the cut is the frame's visible intersection (first diff byte {:?})",
+        cut.iter()
+            .zip(sub_rect(place.x.crop_before, place.y.crop_before).iter())
+            .position(|(got, want)| got != want)
+    );
+    assert!(
+        cut != sub_rect(place.x.crop_before + 1, place.y.crop_before),
+        "the sub-rect one pixel further in is not what the glass shows"
+    );
+}
+
 /// A one-shot exact-destination capture during an active video does not
 /// perturb the recorder: both copies are appended after the final pass in
 /// the same encoder and harvest identical bytes.
@@ -396,6 +512,7 @@ fn one_shot_presented_snapshot_is_independent_from_video() {
         .expect("one-shot finish");
     let snapshot = gpu
         .presented_snapshot_take(&mut win)
+        .and_then(aterm_gpu::video_tap::RawCapture::convert)
         .expect("one-shot take");
     let video = gpu.video_finish(&mut win).expect("video take");
 
@@ -408,6 +525,43 @@ fn one_shot_presented_snapshot_is_independent_from_video() {
         snapshot.rgba, video.frames[0].rgba,
         "the independent taps must observe the same final destination"
     );
+}
+
+/// A VIRTUAL DESTINATION'S SNAPSHOT HOLDS THE BYTES ITS WINDOW REPORTS
+/// BEFORE IT IS TAKEN. `WindowGpu::virtual_snapshot_bytes`, which a capture's
+/// admission reserves for it, is the allocation of the destination
+/// `virtual_presented_snapshot_current` returns: rows padded to the copy
+/// alignment, which a nine-cell frame (no multiple of 64 texels) exercises.
+/// NEGATIVE CONTROL: a window with no virtual destination reports none.
+#[test]
+fn a_virtual_snapshot_holds_the_bytes_its_window_reports() {
+    let mut gpu = gpu(16.0, Theme::default());
+    let (rows, cols) = (3usize, 9usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"$ sized");
+    let input = term.cell_frame(rows, cols);
+    let (fw, fh) = gpu.frame_size(rows, cols);
+    let (w, h) = (fw as u32, fh as u32);
+    let mut win = aterm_gpu::WindowGpu::new();
+    assert_eq!(win.virtual_snapshot_bytes(), None);
+
+    gpu.virtual_begin(&mut win, w, h, opts(false))
+        .expect("virtual tap");
+    assert!(
+        gpu.present_virtual(&mut win, &input, false, None, None),
+        "the virtual present cannot drop"
+    );
+    let reported = win.virtual_snapshot_bytes();
+    let raw = gpu
+        .virtual_presented_snapshot_current(&win, win.resident_input_epoch(), 1)
+        .expect("the virtual destination");
+    assert_eq!((raw.width(), raw.height()), (w, h));
+    assert_eq!(reported, Some(raw.allocation()));
+    assert!(
+        raw.allocation() > (w * h * 4) as usize,
+        "its rows are padded past the texels"
+    );
+    let _ = gpu.video_finish(&mut win);
 }
 
 /// The full fire stack at full res with GPU bloom and the SDR glow-boost crown

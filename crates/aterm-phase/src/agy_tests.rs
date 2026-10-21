@@ -2342,3 +2342,166 @@ fn the_not_signed_in_splash_is_no_box_and_no_evidence() {
     let signed_out = agy(SIGNED_OUT);
     assert_eq!(signed_out.wall.map(|w| w.kind), Some(WallKind::Auth));
 }
+
+/// A REPLY TALLER THAN THE SCREEN IS NO WHOLE REPLY ([`said_whole`]): its
+/// rows reach the top of the rows read, its last words are the rows in
+/// sight, and the need its first row said is not in them — so a reader of a
+/// landing knows to read the rest (the recheck of d88a7bf289 found only
+/// Claude Code's cut read, and a tall report here land on its last rows).
+/// Nor is one under a CARET ROW ON THE TOP ROW: the rule above it that makes
+/// it a person's message is not on the rows, and the rows the message
+/// wrapped onto read as the reply's — the land instruction's `NEEDS YOU:`
+/// hint among them. The read of the history above stops at that rule, never
+/// the caret row ([`said_history_stop`]). NEGATIVE CONTROLS: the rule on the
+/// rows, or the reply's first row under agy's own row, is whole, the
+/// person's words out of the reply's.
+#[test]
+fn a_reply_whose_top_is_off_the_rows_is_no_whole_reply() {
+    let rows = screen(END_OF_TURN);
+    let user = rows
+        .iter()
+        .position(|r| r.starts_with("> Write about"))
+        .expect("the message");
+    let composer = (user..rows.len())
+        .find(|&i| rows[i].starts_with('─'))
+        .expect("the composer's rule");
+    let mut drawn = rows[..user].to_vec();
+    drawn.extend([
+        "> Land it all in the remote main branch. Put what only a person can give on a line starting"
+            .to_string(),
+        "  NEEDS YOU: and carry on.".to_string(),
+        String::new(),
+        "  Merged the parser and its suites.".to_string(),
+    ]);
+    drawn.extend((0..40).map(|i| format!("  - merged item {i}")));
+    drawn.extend([
+        String::new(),
+        "  Nothing left: all of it is merged.".to_string(),
+        String::new(),
+    ]);
+    drawn.extend(rows[composer..].iter().cloned());
+    let reply = |rows: &[String]| said_tail(rows).expect("a reply");
+    assert!(said_whole(&drawn) && AgyReader.said_whole(&drawn));
+    assert!(reply(&drawn).starts_with("Merged the parser"));
+    // The reply's top off the rows.
+    let cut = drawn[drawn.len() - rows.len()..].to_vec();
+    assert!(!said_whole(&cut) && !AgyReader.said_whole(&cut));
+    assert!(reply(&cut).ends_with("Nothing left: all of it is merged."));
+    // The caret row on the top row: its rule above it not.
+    let caret = drawn[user..].to_vec();
+    assert!(!said_whole(&caret) && !AgyReader.said_whole(&caret));
+    assert!(reply(&caret).starts_with("NEEDS YOU: and carry on."));
+    assert!(!said_history_stop(&drawn[user]) && !AgyReader.said_history_stop(&drawn[user]));
+    assert!(said_history_stop(&drawn[user - 1]) && AgyReader.said_history_stop(&drawn[user - 1]));
+    assert!(!said_history_stop("  - merged item 3"));
+    // NEGATIVE CONTROL: the rule on the rows.
+    let ruled = drawn[user - 1..].to_vec();
+    assert!(said_whole(&ruled) && reply(&ruled).starts_with("Merged the parser"));
+    // NEGATIVE CONTROL: agy's own row on the top row.
+    let mut own = cut.clone();
+    own[0] = "● Ran git push".to_string();
+    own[1] = String::new();
+    assert!(said_whole(&own));
+}
+
+/// A NEED SAID BEFORE A TOOL CALL IS THE TURN'S ([`turn_said_before`]): the
+/// reply above a tool's `●` row, under the person's message, is read with
+/// the turn its last reply ends — a `NEEDS YOU:` there stands however the
+/// last reply says nothing is left (the recheck of ea564676a3 found the
+/// turn's earlier words read on Claude Code alone). The turn is whole with
+/// its message under its rule on the rows ([`turn_whole`]); with them above
+/// the rows it is not, and the history read above stops at the rule
+/// ([`turn_history_stop`]). Rows drawn right under a `●` row are its output,
+/// no words of the agent. NEGATIVE CONTROL: the same turn with no reply
+/// before the call holds no other words.
+#[test]
+fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
+    let rows = screen(END_OF_TURN);
+    let user = rows
+        .iter()
+        .position(|r| r.starts_with("> Write about"))
+        .expect("the message");
+    let composer = (user..rows.len())
+        .find(|&i| rows[i].starts_with('─'))
+        .expect("the composer's rule");
+    let turn = |before: &[&str]| {
+        let mut drawn = rows[..=user].to_vec();
+        drawn.push(String::new());
+        drawn.extend(before.iter().map(|r| (*r).to_string()));
+        drawn.extend(
+            [
+                "● Ran git push origin main (ctrl+o to expand)",
+                "",
+                "  Nothing left: all of it is merged.",
+                "",
+            ]
+            .map(str::to_string),
+        );
+        drawn.extend(rows[composer..].iter().cloned());
+        drawn
+    };
+    let drawn = turn(&[
+        "  NEEDS YOU: the signing credential, to sign the release.",
+        "  I will push the branch now.",
+        "",
+    ]);
+    let need =
+        "NEEDS YOU: the signing credential, to sign the release.\nI will push the branch now.";
+    assert_eq!(turn_said_before(&drawn).as_deref(), Some(need));
+    assert_eq!(AgyReader.turn_said_before(&drawn).as_deref(), Some(need));
+    assert_eq!(
+        said_tail(&drawn).as_deref(),
+        Some("Nothing left: all of it is merged.")
+    );
+    assert!(turn_whole(&drawn) && AgyReader.turn_whole(&drawn));
+    // The message above the rows: the turn is cut, and the read above stops
+    // at its rule.
+    let cut = drawn[user + 1..].to_vec();
+    assert!(said_whole(&cut) && !turn_whole(&cut) && !AgyReader.turn_whole(&cut));
+    assert!(turn_history_stop(&drawn[user - 1]) && AgyReader.turn_history_stop(&drawn[user - 1]));
+    for row in &drawn[user..user + 4] {
+        assert!(!turn_history_stop(row), "{row}");
+    }
+    // A tool row's output is no words of the agent.
+    let output = turn(&[
+        "● Ran cat NOTES.md (ctrl+o to expand)",
+        "  NEEDS YOU: the signing credential, to sign the release.",
+        "",
+    ]);
+    assert_eq!(turn_said_before(&output), None);
+    // NEGATIVE CONTROL: no reply before the call.
+    let plain = turn(&[]);
+    assert_eq!(turn_said_before(&plain), None);
+    assert!(turn_whole(&plain) && said_tail(&plain).is_some());
+}
+
+/// THE MESSAGE THAT OPENED THE TURN IS READ UNDER ITS RULE
+/// ([`turn_opened_by`]): the caret row's text past its `>`, and the rows it
+/// wrapped onto up to the blank row under it, joined — what tells a
+/// successor whether its land act opened the turn whose defense stands (the
+/// review of b8/residuals found a defense said under a person's earlier
+/// message landed on agy, nothing reading the message). NEGATIVE CONTROLS:
+/// the message above the rows, and Claude Code's reader, read none.
+#[test]
+fn the_message_that_opened_the_turn_is_read_under_its_rule() {
+    let rows = screen(END_OF_TURN);
+    let said = "Write about 300 words on how ocean tides work. Do not use any tools.";
+    assert_eq!(turn_opened_by(&rows).as_deref(), Some(said));
+    assert_eq!(AgyReader.turn_opened_by(&rows).as_deref(), Some(said));
+    let user = rows
+        .iter()
+        .position(|r| r.starts_with("> Write about"))
+        .expect("the message");
+    let mut wrapped = rows.clone();
+    wrapped.insert(user + 1, "  Keep it short.".to_string());
+    assert!(said_tail(&wrapped).is_some());
+    assert_eq!(
+        turn_opened_by(&wrapped).as_deref(),
+        Some(format!("{said} Keep it short.").as_str())
+    );
+    // NEGATIVE CONTROLS.
+    let cut = rows[user + 1..].to_vec();
+    assert!(said_tail(&cut).is_some());
+    assert_eq!(turn_opened_by(&cut), None);
+    assert_eq!(ClaudeReader.turn_opened_by(&rows), None);
+}

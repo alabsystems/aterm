@@ -8,7 +8,8 @@
 //!   inputs differ from HEAD unless `--allow-dirty` (recorded);
 //! * hold the lane's lock across build → swap → arm, so no run is torn down mid-publish;
 //! * build `atpkg-publish` with the store's `targo --unverified build --release --locked`
-//!   into `<state>/build/target`, copy it to a unique `<state>/lane.<stamp>.<suffix>/` and
+//!   into `<state>/build/target.noindex` (Spotlight skips it), copy it to a unique
+//!   `<state>/lane.<stamp>.<suffix>/` and
 //!   record `INSTALLED-FROM` (commit, dirty list, toolchain); only a successful arm swaps
 //!   the `lane` link (one rename) and prunes older snapshots, keeping the previous one for
 //!   rollback; `--no-arm` only builds and renders;
@@ -345,7 +346,7 @@ pub fn install_with(
     ));
     let built = machine
         .builder
-        .build(repo, &build_dir.join("target"), &log)?;
+        .build(repo, &build_dir.join("target.noindex"), &log)?;
     // The checkout is shared: an edit or commit that landed during the build was compiled
     // into the signer, and INSTALLED-FROM would name a tree it was not built from.
     if Inputs::read(repo)? != before {

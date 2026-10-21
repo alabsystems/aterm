@@ -721,6 +721,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // The holder fence: the alt-screen and full-clear dispatches mark it.
         holder_fence: _,
         // --- Session-only (not forwarded to handler) ---
+        // The output count at a carried fence's install: written by the
+        // restore, read by the adoption, never by a VT dispatch.
+        holder_carried_at: _,
         // Host config's last-applied values for the app-negotiated modes: an
         // escape sequence moves `modes`, never the host setting the reload diffs
         // against (see `ConfiguredModes`).
@@ -755,7 +758,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // Render-snapshot extraction-continuity tokens (engine identity nonce, take generation).
         extract_identity: _,
         extract_gen: _,
-        search_index: _,
+        search_slot: _,
         search_index_rebuilds: _,
         search_index_refreshes: _,
         budgeted_search: _,
@@ -766,6 +769,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // Lock-free publication of the encoder fold for the input seam:
         // derived from VT state under the lock, never an input to the handler.
         mode_mirror: _,
+        // The host's watchers of the frame: asked by the host's lock wrapper at
+        // the end of a hold, never by the engine or a VT dispatch.
+        frame_watchers: _,
         // Alt-screen scroll-off archive: observation-only, driven by `process_at`
         // between parser slices and at the epilogue, never by a VT dispatch.
         alt_archive: _,

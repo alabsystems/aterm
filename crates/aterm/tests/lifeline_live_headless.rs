@@ -19,7 +19,7 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use crate::{child_output, headless_boot, launch_isolation};
+use crate::{child_output, ctl_accept, headless_boot, launch_isolation};
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -121,28 +121,33 @@ fn wait_listening(child: &mut Child, ready: &mut aterm_agent::ready::Ready, log:
 }
 
 /// One `aterm ctl --sock <sock> <args…>` call, `stdin` piped in; its output.
+/// Asked again, a fresh client each time, while the instance has not yet
+/// accepted it or answers it busy ([`ctl_accept::until_served`]): the client's
+/// own 10 s accept budget is a person's, and a loaded machine can miss it.
 fn ctl(root: &Path, sock: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut cmd, root);
-    cmd.arg("ctl")
-        .arg("--sock")
-        .arg(sock)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn aterm ctl");
-    // Written and closed in one statement: the client reads its stdin to the end.
-    child
-        .stdin
-        .take()
-        .expect("ctl stdin")
-        .write_all(stdin)
-        .expect("write ctl stdin");
-    // A hang detector, and a read that ends at the client's exit
-    // (`support/child_output.rs`: a sibling's spawn can hold its pipes open).
-    child_output::wait_and_read(child, Instant::now() + Duration::from_secs(60))
-        .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+    ctl_accept::until_served(|| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        launch_isolation::apply(&mut cmd, root);
+        cmd.arg("ctl")
+            .arg("--sock")
+            .arg(sock)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn aterm ctl");
+        // Written and closed in one statement: the client reads its stdin to the end.
+        child
+            .stdin
+            .take()
+            .expect("ctl stdin")
+            .write_all(stdin)
+            .expect("write ctl stdin");
+        // A hang detector, and a read that ends at the client's exit
+        // (`support/child_output.rs`: a sibling's spawn can hold its pipes open).
+        child_output::wait_and_read(child, Instant::now() + Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
+    })
 }
 
 /// THE CONTRACT, end to end on the real binary. While the lifeline is held the

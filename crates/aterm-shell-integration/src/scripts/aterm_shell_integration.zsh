@@ -411,74 +411,31 @@ autoload -Uz add-zsh-hook
 # with the user's XTRACE on, and its body check puts that back at its return.
 : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
 
+# Enable agy's fast prompt editor by default (including in adopted shells when
+# this body is live-reloaded at the next prompt) so U+202F narrow no-break
+# spaces in macOS screenshot filenames do not desynchronize Bubble Tea's
+# textarea visual cursor.
+: "${AGY_CLI_FAST_PROMPT_EDITOR=true}"
+export AGY_CLI_FAST_PROMPT_EDITOR
+
 # ─── AN OLDER SCRIPT'S `~/.aterm/bin`, taken off (2026-10-19) ───
 #
-# Every script before 613305828c (2026-10-16) put `$HOME/.aterm/bin` FIRST on
-# PATH when it loaded a shell fresh and that folder existed; none since does
-# (the loader's package block says why). Such a shell kept the entry through an
-# upgrade in place — this body sourced at a prompt by its older loader, or this
-# loader sourced over it — until it exited. So the body takes it off, once per
-# shell, where the shell PROVES that such a script put it there, and nowhere
-# else: v0.106.0 and every build from 613305828c up to this one put none there
-# and set no mark, so in their shells a `~/.aterm/bin` on PATH is the user's
-# own. The proof has two halves:
-#
-#  1. The script that loaded this shell fresh carried the prepend. That is the
-#     loader in `__aterm_si_dir` when its own load was the fresh one
-#     (`__aterm_fresh_load` 1), or, when this build's loader came in place, the
-#     one it noted there (`__aterm_bin_from`, the loader's block says how; `-`
-#     for a shell from before loaders, whose every script prepended). The
-#     folder is content-addressed, so its loader still holds the bytes that
-#     loaded the shell, and the prepend line is looked for in it, spelled here
-#     so that this file never holds it. A folder already collected, or a loader
-#     an intermediate build sourced in place, leaves nothing to prove it with:
-#     the entry stays.
-#  2. The folder was there at that load: it is older than the shell process —
-#     its positive birth, or its last change only when birth is unavailable,
-#     by more than the whole seconds `stat`, `date` and `ps -o etime=` count in.
-#     A usable birth takes precedence even if mtime was preserved or backdated.
-#     The clock is read before the shell's age; mtime without a usable birth
-#     remains a fallback reading, not an independent creation-time witness.
-#
-# One `sh` asks both (grep, stat, ps and date: once per shell, and only where
-# PATH holds the entry and the folder exists). Then one copy goes — the first
-# equal to `$HOME/.aterm/bin`, where the old script put it — and nothing else
-# moves: an EMPTY entry ("here") keeps its place, and a copy the user's own
-# startup added keeps the folder on PATH. `(ie)` finds it by string equality,
-# never as a pattern, and under `emulate -L zsh`, so a user's ksh_arrays cannot
-# move the index.
+# Once per shell, in a shell an older script loaded that this body reaches in
+# place (`__aterm_old_bin_off` unset; a fresh load settles it in the loader):
+# `aterm_shell_integration_old_bin.zsh`, beside this file in its folder, says
+# what goes and when, and takes it off. Its own file (2026-10-20), as in the
+# bash script, where every fresh shell paid to parse it; compiled here with the
+# body it cost a fresh zsh little, and the three scripts keep one shape. The
+# folder is the one `%x` names (as `__aterm_si_dir`), this loader's or the body
+# file's alone; a copy with no such file beside it takes nothing off. Sourced
+# only when it is this user's (`-O`), as THE BODY CHECK sources a body.
 if (( ! ${+__aterm_old_bin_off} )); then
     typeset -g __aterm_old_bin_off=1
-    () {
-        emulate -L zsh
-        local from= bin=${HOME-}/.aterm/bin
-        if (( ${+__aterm_bin_from} )); then
-            from=$__aterm_bin_from
-        elif [[ ${__aterm_fresh_load-} == 1 && -n ${__aterm_si_dir-} ]]; then
-            from=$__aterm_si_dir/aterm_shell_integration.zsh
-        fi
-        local -i at=${path[(ie)$bin]}
-        if [[ -n $from && -d $bin ]] && (( at <= $#path )) &&
-            command sh -c '
-                [ "$1" = - ] || grep -qF -e "$2" -- "$1" || exit 1
-                t=$(stat -f "%B %m" -- "$3") || t=$(stat -c "%W %Y" -- "$3") || exit 1
-                b=${t%% *}; m=${t##* }
-                case $m in ""|*[!0-9]*) exit 1 ;; esac
-                case $b in ""|*[!0-9]*|0) b=$m ;; esac
-                n=$(date +%s) || exit 1
-                e=$(ps -o etime= -p "$4") || exit 1
-                e=${e##* }; d=0
-                case $e in *-*) d=${e%%-*}; d=${d#0}; e=${e#*-} ;; esac
-                case $d$e in ""|*[!0-9:]*) exit 1 ;; esac
-                s=0; IFS=:
-                for x in $e; do x=${x#0}; s=$((s * 60 + ${x:-0})); done
-                [ $((b + ${d:-0} * 86400 + s + 1)) -lt "$n" ]
-            ' sh "$from" "export PATH=\"\$HOME/.aterm/bin:\$PATH\"" "$bin" "$$" 2>/dev/null
-        then
-            path[at]=()
-        fi
-    }
-    unset __aterm_bin_from
+    typeset -g __aterm_old_bin_file="${${(%):-%x}:h}/aterm_shell_integration_old_bin.zsh"
+    if [[ -f "$__aterm_old_bin_file" && -O "$__aterm_old_bin_file" ]]; then
+        . "$__aterm_old_bin_file"
+    fi
+    unset __aterm_old_bin_file __aterm_bin_from
 fi
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
@@ -892,9 +849,21 @@ __aterm_mark_prompt_start() {
     __aterm_osc "133;A${__aterm_id_suffix_str}"
 }
 
-# Mark command line start (OSC 133;B)
+# Mark command line start (OSC 133;B). Sent from zle-line-init, after zle drew
+# the line: over an EMPTY buffer the cursor stands where the buffer starts, and
+# the mark says so (`aterm_input=start`, signed). A line pre-filled from the
+# buffer stack (push-line, accept-and-hold, accept-line-and-down-history,
+# `print -z`) is drawn first, so the mark lands after its text (measured on zsh
+# 5.9: `P> echo hi` with the mark at column 10), and it says nothing of where
+# the buffer starts. aterm's typing prediction places Home, End, Ctrl-A, Ctrl-E
+# and Delete only on a line started at a mark that says so
+# (`Terminal::input_region_start`).
 __aterm_mark_command_start() {
-    __aterm_osc "133;B${__aterm_id_suffix_str}"
+    if [[ -n "$__aterm_id_suffix_str" ]] && zle && (( ! ${#BUFFER} )); then
+        __aterm_osc "133;B${__aterm_id_suffix_str};aterm_input=start"
+    else
+        __aterm_osc "133;B${__aterm_id_suffix_str}"
+    fi
 }
 
 # Mark command execution start (OSC 133;C)

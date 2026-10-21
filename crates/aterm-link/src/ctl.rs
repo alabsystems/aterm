@@ -303,7 +303,7 @@ impl Ctl {
         })();
         self.guarded(sent)?;
         let verb = request_verb(line);
-        let reply = self.read_reply(&verb, line);
+        let reply = self.read_reply(verb, line);
         self.guarded(reply)
     }
 
@@ -368,14 +368,11 @@ fn misframing_char(line: &str) -> Option<char> {
         .find(|c| c.is_control() || (c.is_whitespace() && *c != ' '))
 }
 
-/// The verb keyword of a request line, selector stripped. `framing_of` wants the
-/// keyword and the whole request (it reads sub-forms out of the tail itself).
-fn request_verb(line: &str) -> String {
-    let no_sel = line
-        .strip_prefix('@')
-        .and_then(|r| r.split_once(' ').map(|x| x.1))
-        .unwrap_or(line);
-    no_sel.split_whitespace().next().unwrap_or("").to_string()
+/// The verb keyword of a request line, read by the wire's request grammar the
+/// server reads it by ([`aterm_types::control_request::head`]). `framing_of` wants
+/// the keyword and the whole request (it reads sub-forms out of the tail itself).
+fn request_verb(line: &str) -> &str {
+    aterm_types::control_request::head(line).verb
 }
 
 /// The number after `OK ` in a framed header, refused above `ceiling`.
@@ -436,7 +433,7 @@ mod tests {
             ("deliver s-a off=9 from=h-x kind=task", Framing::Status),
             ("sessions", Framing::Lines),
         ] {
-            assert_eq!(framing_of(&request_verb(line), line), want, "{line}");
+            assert_eq!(framing_of(request_verb(line), line), want, "{line}");
         }
     }
 

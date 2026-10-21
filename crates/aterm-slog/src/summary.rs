@@ -139,7 +139,8 @@ impl Log {
                 }
             }
         }
-        let snap = self.fold.snapshot();
+        // A closed session waits for no turn: no mail latch, no waiting mail.
+        let snap = self.fold.closed_snapshot();
         let mut fold: Vec<(usize, &str)> = Vec::new();
         // How it ended first: the fold's head, totals and the session's close.
         fold_within(&snap, 0..=2, &mut fold, &mut room);
@@ -264,6 +265,8 @@ impl Log {
         } else {
             Fold::from_snapshot(&fold_lines).map_err(CarryError::Fold)?
         };
+        // A closed session holds nothing open, so its fold tracks nothing.
+        fold.agrees_with_open(&[]).map_err(CarryError::Fold)?;
         let mut log = Log::with_limits(ep, Limits::SESSION);
         log.base_ep = base;
         log.first_seq = first;
@@ -284,7 +287,11 @@ impl Log {
             log.session_bytes = log.session_bytes.saturating_add(bytes);
             log.heap = log.heap.saturating_add(super::entry_heap(&rec));
             log.bump_chain(Node::SESSION, true);
-            log.ring.push_back(super::Entry { rec, bytes, ms: 0 });
+            log.ring.push_back(super::Entry {
+                rec: rec.into(),
+                bytes,
+                ms: 0,
+            });
             log.bytes = log.bytes.saturating_add(bytes);
         }
         if let Some(info) = log.nodes.get_mut(&Node::SESSION) {

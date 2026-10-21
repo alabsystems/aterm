@@ -291,12 +291,6 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-log/src/lib.rs",
     },
     GuardHelper {
-        // Returns the guard of the `SEARCH_SNAPSHOTS` ring static.
-        symbol: "search_cache_lock",
-        identity: "SEARCH_SNAPSHOTS",
-        def_file: "crates/aterm-gui/src/control_query.rs",
-    },
-    GuardHelper {
         // The session-connections record store: the per-instance
         // `(dst, src) -> ConnectionRecord` map behind one mutex. `records()`
         // is not a standard acquisition name, so its callers' holds need
@@ -305,13 +299,6 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "records",
         identity: "records",
         def_file: "crates/aterm-gui/src/connections.rs",
-    },
-    GuardHelper {
-        // The isearch prefix-narrowing frame stacks: a bare static `Mutex`
-        // whose guard escapes to callers, registered like `search_cache_lock`.
-        symbol: "narrow_sessions_lock",
-        identity: "NARROW_SESSIONS",
-        def_file: "crates/aterm-gui/src/control_query.rs",
     },
     GuardHelper {
         // `fabric attach`'s supervisor latch. `supervise` has no stop handle,
@@ -336,6 +323,19 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "posting_permit",
         identity: "posting",
         def_file: "crates/aterm-gui/src/askpass.rs",
+    },
+    GuardHelper {
+        // Agent identity directory admission/forget refcount table (`HOLDS`).
+        // Named `identity_holds` because a bare `holds(` matches predicates across the tree.
+        symbol: "identity_holds",
+        identity: "HOLDS",
+        def_file: "crates/aterm-gui/src/agent_identity.rs",
+    },
+    GuardHelper {
+        // Tombstone set currently being emptied by `identities forget` (`EMPTYING`).
+        symbol: "emptying",
+        identity: "EMPTYING",
+        def_file: "crates/aterm-gui/src/agent_identity.rs",
     },
 ];
 
@@ -2165,7 +2165,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         files.retain(|p| !is_test_file(p));
         files.sort();
         for file in files {
-            let Ok(text) = std::fs::read_to_string(&file) else {
+            let Ok(text) = crate::tree::read_to_string(&file) else {
                 continue;
             };
             let rel = file
@@ -2203,7 +2203,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
         // slice index (into v.platform_slices) -> scratch site count.
         let mut per_slice = vec![0usize; v.platform_slices.len()];
         for file in files {
-            let Ok(text) = std::fs::read_to_string(&file) else {
+            let Ok(text) = crate::tree::read_to_string(&file) else {
                 continue;
             };
             let in_crate = file
@@ -3072,14 +3072,6 @@ mod tests {
                 .to_string(),
         ));
         files.push((
-            "crates/aterm-gui/src/control_query.rs".to_string(),
-            "fn search_cache_lock() -> MutexGuard<'static, VecDeque<SearchSnapshot>> {\n    \
-             SEARCH_SNAPSHOTS.lock().unwrap()\n}\n\
-             fn narrow_sessions_lock() -> MutexGuard<'static, VecDeque<NarrowSession>> {\n    \
-             NARROW_SESSIONS.lock().unwrap_or_else(PoisonError::into_inner)\n}\n"
-                .to_string(),
-        ));
-        files.push((
             "crates/aterm-log/src/lib.rs".to_string(),
             "fn env_lock() -> MutexGuard<'static, ()> {\n    \
              ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n}\n"
@@ -3105,6 +3097,16 @@ mod tests {
              let posting = self.posting.lock().unwrap_or_else(|e| e.into_inner());\n        \
              if self.is_open() { Err(()) } else { Ok(posting) }\n    \
              }\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            // `identity_holds` and `emptying` share the file, as they do in
+            // the shipping agent_identity.rs.
+            "crates/aterm-gui/src/agent_identity.rs".to_string(),
+            "fn identity_holds() -> std::sync::MutexGuard<'static, HoldsByDir> {\n    \
+             HOLDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n\
+             fn emptying() -> std::sync::MutexGuard<'static, BTreeSet<PathBuf>> {\n    \
+             EMPTYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
         files.push((
@@ -3238,10 +3240,7 @@ mod tests {
             "crates/aterm-gui/src/extra.rs".to_string(),
             gui_extra.to_string(),
         ));
-        let root = synth_tree("aterm-lock-census", name, &files);
-        let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
-        out
+        run_lock_order_census(&synth_tree("aterm-lock-census", name, &files))
     }
 
     /// Like [`run_synth`] but with extra files planted anywhere in the tree
@@ -3255,10 +3254,7 @@ mod tests {
         for (rel, contents) in extra {
             files.push((rel.to_string(), contents.to_string()));
         }
-        let root = synth_tree("aterm-lock-census", name, &files);
-        let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
-        out
+        run_lock_order_census(&synth_tree("aterm-lock-census", name, &files))
     }
 
     // ------------------------------------------------------------------
@@ -4082,7 +4078,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-lock-census", "stalevocab", &files);
         let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             !out.ok,
             "a stale vocabulary entry must be RED:\n{}",
@@ -4104,7 +4099,6 @@ mod tests {
         );
         let root = synth_tree("aterm-lock-census", "driftvocab", &files);
         let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             !out.ok,
             "a drifted vocabulary entry must be RED:\n{}",
@@ -4857,7 +4851,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-lock-census", "empty", &files);
         let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             !out.ok,
             "a census that walked nothing must FAIL:\n{}",
@@ -4883,7 +4876,6 @@ mod tests {
             )],
         );
         let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "derivation must fail closed:\n{}", out.log);
         assert!(
             out.log.contains("SCAN-SET DERIVATION FAILED"),
@@ -4907,7 +4899,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-lock-census", "stalehelper", &files);
         let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             !out.ok,
             "a stale helper registration must be RED:\n{}",
@@ -4938,7 +4929,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-lock-census", "newdepgreen", &files);
         let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "GREEN expected:\n{}", out.log);
         // aterm-gui and aterm-types, the new dependency, and every helper crate.
         let crates = 3 + SYNTH_HELPER_CRATES.len();
@@ -4977,7 +4967,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-lock-census", "newdepabba", &files);
         let out = run_lock_order_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             !out.ok,
             "an ABBA half-planted in the new dependency must be RED:\n{}",

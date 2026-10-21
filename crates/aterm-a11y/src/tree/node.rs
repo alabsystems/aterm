@@ -493,7 +493,7 @@ impl<'a> Node<'a> {
     pub(crate) fn should_have_read_only_state_by_default(&self) -> bool {
         matches!(
             self.role(),
-            Role::Document | Role::List | Role::ProgressIndicator
+            Role::Document | Role::List | Role::ProgressIndicator | Role::Meter | Role::Grid
         )
     }
 

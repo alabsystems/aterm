@@ -587,9 +587,13 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
 }
 
 /// This machine's fleet node id for the header's `node=` — which a fleet
-/// reader checks against the node its book holds for the address it dialled
-/// (`aterm_net::fleet_member::survey_all`) — as `aterm fleet init|join`
-/// wrote it, never minted here; `-` for none, or one that cannot be read.
+/// reader checks against the node its book holds for the address it dialled,
+/// and against the node this listener proved, refusing a reply that names
+/// another (`aterm_net::fleet_member::survey_all`) — as `aterm fleet
+/// init|join` wrote it, never minted here; `-` for none, or one that cannot
+/// be read. Read fresh here and at the listener's start, from the one state
+/// directory: the listener binds again when the file changes
+/// (`fleet_listen::watch_fleet_key`).
 fn node_token() -> String {
     #[cfg(unix)]
     if let Some(node) = aterm_types::dirs::state_dir()

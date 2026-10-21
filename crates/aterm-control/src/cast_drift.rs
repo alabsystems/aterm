@@ -14,8 +14,9 @@
 //! (Claude Code, Node's `tty.WriteStream`) never sees a completed pair, so its
 //! later diff frames land on shifted content.
 //!
-//! The method: fold the recording through fresh headless engines, varying only
-//! how resize runs are applied.
+//! The method: fold the recording through fresh headless engines
+//! ([`ReplayEngine`], set up as the session's), varying only how resize runs
+//! are applied.
 //!
 //! - Faithful applies every resize as recorded and must reproduce the live
 //!   screen (the fidelity gate); otherwise nothing is attributed
@@ -44,16 +45,26 @@
 //! on the same screen and reads `clean`. A resize whose geometry never came back
 //! is the app's to repaint and is replayed as recorded.
 //!
+//! Every candidate lies after the anchor, so every variant (stable, ONLY)
+//! folds what faithful folds through the anchor event. Faithful forks its
+//! engine there ([`ReplayEngine::fork`]) and each variant folds only the events
+//! after it; with no anchor, or an engine that cannot be forked there, a
+//! variant folds from the start (`fold_events=` counts what was folded). The
+//! fidelity gate runs before any variant, so `unfaithful` folds none.
+//!
 //! Pure: no I/O, clock or GUI type. The server (`aterm-gui`, over its recorder
 //! and live engine) and the client path (over a fetched `cast` and `text`, or
-//! saved files) run this same code. It lives in this crate, the headless half
-//! of the control protocol, beside [`visible_row`] and [`pct_encode`].
+//! saved files) run this same code over the same values: the recording as
+//! [`crate::asciicast`] models it, which the server writes for `cast` and the
+//! client reads back. It lives in this crate, the headless half of the control
+//! protocol, beside [`visible_row`] and [`pct_encode`].
 
 /// The resize seam policy the replays apply, re-exported so a caller that
 /// links only this crate (the one binary's client path) can name it.
 pub use aterm_core::grid::{ResizeLaw, ResizePolicy};
-use aterm_core::terminal::Terminal;
 
+use crate::asciicast::{CastDrops, CastEvent, CastHeader, HandoffHeader};
+use crate::replay::ReplayEngine;
 use crate::wire::{pct_encode, visible_row};
 
 /// The request grammar, as the wire states it on a usage error.
@@ -62,125 +73,16 @@ pub const USAGE: &str = "ERR usage: cast drift [max_runs=<k>] [rows=<n>] [seed=a
 /// Candidate runs varied by default (newest first).
 pub const DEFAULT_MAX_RUNS: usize = 8;
 
-/// The most candidate runs one request may vary: each costs a fold of the whole
-/// recording, bounding work at `2 + MAX_RUNS` folds (one more when a saved
-/// screen must pick the seed).
+/// The most candidate runs one request may vary: each costs a fold of the
+/// recording (of its events after the anchor, from the anchor fork, when the
+/// replay could fork there), bounding work at `2 + MAX_RUNS` folds (one more
+/// when a saved screen must pick the seed).
 pub const MAX_RUNS: usize = 16;
 
 /// Two resizes closer than this are one run, whatever output lies between: the
 /// app's SIGWINCH handler may have read only the second size. A heuristic
 /// (flaps are typically under a millisecond apart).
 pub const RUN_GAP_SECS: f64 = 0.250;
-
-/// One recorded event. `D` is the output burst's storage: the server passes its
-/// recorder's shared `Arc<[u8]>`s; the asciicast reader owns `Vec<u8>`s.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CastEvent<D> {
-    /// `[t, "o", data]`: program output. `t` is seconds on the cast's own
-    /// timeline, exactly as `cast` prints it.
-    Output {
-        /// Seconds since the (possibly rebased) recording start.
-        t: f64,
-        /// The burst's bytes.
-        data: D,
-    },
-    /// `[t, "r", "<cols>x<rows>"]`: a geometry change the engine applied.
-    Resize {
-        /// Seconds since the (possibly rebased) recording start.
-        t: f64,
-        /// New width.
-        cols: u16,
-        /// New height.
-        rows: u16,
-    },
-}
-
-impl<D> CastEvent<D> {
-    /// The event's timestamp.
-    #[must_use]
-    pub fn t(&self) -> f64 {
-        match self {
-            CastEvent::Output { t, .. } | CastEvent::Resize { t, .. } => *t,
-        }
-    }
-}
-
-/// Bursts the reader could not hand to the recorder (a full writer queue), as
-/// the header's `aterm_dropped` object discloses them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CastDrops {
-    /// Bursts dropped.
-    pub bursts: u64,
-    /// Bytes in them.
-    pub bytes: u64,
-}
-
-/// The asciicast header facts the audit reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CastHeader {
-    /// Width at the recording's start (cols).
-    pub width: u16,
-    /// Height at the recording's start (rows).
-    pub height: u16,
-    /// Head events drop-oldest evicted (`aterm_truncated.evicted_events`): the
-    /// leading engine state is incomplete when this is non-zero.
-    pub evicted: u64,
-    /// `Some` when the recorder counts drops (0 included); `None` for a
-    /// recording whose producer does not say — a file from an older aterm.
-    pub dropped: Option<CastDrops>,
-    /// `Some(true)` when the recording says its engine kept the resize undo
-    /// (`aterm_resize_undo`: every aterm since the undo writes it); `None` for a
-    /// recording that does not say, a file from an aterm before it. A recording
-    /// that carries the key is replayed under the undo law only ([`Undo::Match`]
-    /// never second-guesses it), so an undo regression in the recording engine
-    /// still reads `unfaithful`.
-    pub resize_undo: Option<bool>,
-    /// The resize laws the recording's engine may have laid its rows out
-    /// under, the newest first ([`CastHeader::laws_named`] of its
-    /// `aterm_resize_undo`): each replay runs under one, the next only when
-    /// the ones before it do not reproduce the live screen. 3 names the
-    /// current law (a width change lays the rows out where the rows hand-back
-    /// puts them); 2 the rows hand-back, as two aterms wrote it (before and
-    /// after the pushed rows were owed back); 1 and a recording that does not
-    /// say, the law before it (what is owed forgotten before each resize).
-    pub resize_laws: &'static [ResizeLaw],
-}
-
-impl CastHeader {
-    /// The laws a recording whose header carries `aterm_resize_undo: value`
-    /// (`None`: no key) was made under, the newest first: the law before the
-    /// rows hand-back for no key and 0, and the newest law this aterm knows for
-    /// a value only a newer one writes.
-    #[must_use]
-    pub fn laws_named(value: Option<u64>) -> &'static [ResizeLaw] {
-        match value {
-            None | Some(0) => &[ResizeLaw::Undo],
-            Some(value) => match ResizeLaw::from_header(value) {
-                [] => &[ResizeLaw::Rewrap],
-                laws => laws,
-            },
-        }
-    }
-}
-
-/// A parsed asciicast v2 recording.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Asciicast {
-    /// The header line's facts.
-    pub header: CastHeader,
-    /// The `o` and `r` events, in file order (other kinds are skipped).
-    pub events: Vec<CastEvent<Vec<u8>>>,
-}
-
-impl Asciicast {
-    /// The recording cut at `until` seconds (later events dropped), to hold a
-    /// saved cast against a screen captured at that instant.
-    #[must_use]
-    pub fn until(mut self, until: f64) -> Self {
-        self.events.retain(|e| e.t() <= until);
-        self
-    }
-}
 
 /// The screen the recording is held against.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -463,8 +365,15 @@ pub struct DriftReport {
     pub evicted: u64,
     /// The header's drop count.
     pub dropped: Option<CastDrops>,
-    /// Engines folded over the recording.
+    /// The header's handoff: the recording starts at a seamless update, so
+    /// the screen before it is in no replay.
+    pub handoff: Option<HandoffHeader>,
+    /// Engines folded over the recording: each faithful replay, then each
+    /// variant (stable, ONLY), from the start or from the anchor fork.
     pub folds: usize,
+    /// Events those folds applied: every event for a fold from the start, the
+    /// events after the anchor for a variant folded from the anchor fork.
+    pub fold_events: usize,
     /// The live cursor (or the faithful replay's with no screen).
     pub cursor_live: Option<(u16, u16)>,
     /// The cursor the drift's `other` side has.
@@ -513,10 +422,13 @@ impl DriftReport {
     /// The wire form: `OK <n> <header k=v…>` then `n` lines: the candidate
     /// `run` lines (oldest first), the `row` lines (ascending, at most `rows=`)
     /// and one `cursor` line when there is a finding. `ms` is the caller's
-    /// timing (this module has no clock); ` law=ambiguous` follows when the
+    /// timing (this module has no clock), after `folds=` and `fold_events=`
+    /// ([`DriftReport::fold_events`]). After it come ` carried=0
+    /// from_build=<n|->` (the tail every text surface prints for a seamless
+    /// update) when the recording starts at one, ` law=ambiguous` when the
     /// replays under the header's resize laws disagreed, ` undo=off` when they
-    /// dropped the undo, and `computed` names where it ran when not the server
-    /// (`computed=client`).
+    /// dropped the undo, and `computed`, naming where it ran when not the
+    /// server (`computed=client`).
     #[must_use]
     pub fn render(&self, ms: u64, computed: Option<&str>) -> String {
         let mut body = String::new();
@@ -567,7 +479,7 @@ impl DriftReport {
         let mut head = format!(
             "OK {n} verdict={} fidelity={} against={} drift_rows={} runs={} candidates={} \
              capped={} culprit={} anchor={} seed={} seed_basis={} geom={} evicted={} dropped={} \
-             cut={} folds={} ms={ms}",
+             cut={} folds={} fold_events={} ms={ms}",
             self.verdict.word(),
             match self.fidelity {
                 Some(true) => "pass",
@@ -599,7 +511,15 @@ impl DriftReport {
                 .map_or_else(|| "-".to_string(), |d| d.bursts.to_string()),
             self.cut.map_or("-", Cut::word),
             self.folds,
+            self.fold_events,
         );
+        if let Some(handoff) = self.handoff {
+            head.push_str(" carried=0 from_build=");
+            match handoff.from_build {
+                Some(build) => head.push_str(&build.to_string()),
+                None => head.push('-'),
+            }
+        }
         if self.law_ambiguous {
             head.push_str(" law=ambiguous");
         }
@@ -828,6 +748,7 @@ fn return_chains<D>(
 }
 
 /// A replayed engine's facts.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct Replay {
     rows: Vec<String>,
     cursor: (u16, u16),
@@ -891,14 +812,13 @@ struct Engine {
     law: ResizeLaw,
 }
 
-/// Fold the recording through one fresh engine; `journal` also collects the
-/// lossy alt-screen resizes ([`Replay::lossy`]).
-///
-/// The engine's alt-screen archive is off: it only keeps scrollback text of
-/// committed alt frames (most of a fold's time on a Claude recording) and never
-/// touches the grid being read. Without the undo (`engine.keep_undo` false)
-/// the active grid's undo is dropped before every resize; the rows are laid
-/// out under `engine.law`.
+/// Fold the recording through one fresh [`ReplayEngine`] set up as the
+/// session's (its posture, and `engine.law`, the resize law the rows are laid
+/// out under); `journal` also collects the lossy alt-screen resizes
+/// ([`Replay::lossy`]). `fork_after` names the event after which a copy of
+/// the engine is taken ([`ReplayEngine::fork`]) for the variants that fold
+/// the same events up to there; it comes back beside the replay, `None` when
+/// the engine could not be forked there.
 fn fold<D: AsRef<[u8]>>(
     header: &CastHeader,
     events: &[CastEvent<D>],
@@ -906,60 +826,101 @@ fn fold<D: AsRef<[u8]>>(
     mask: Option<&[bool]>,
     engine: Engine,
     journal: bool,
-) -> Replay {
-    let mut term = Terminal::new(header.height.max(1), header.width.max(1));
-    term.set_resize_law(engine.law);
-    term.set_alt_archive_enabled(false);
-    // The live engine's console-host posture, from the policy it resizes
-    // under: a ConPTY session honors conhost's `?9001h`, which decides how an
-    // orphaned alternate screen is left, and under OpenConsole the screen is
-    // left by the `?1049l` the host forwarded, not at the prompt.
-    term.set_console_host_posture(engine.policy);
-    term.set_host_resyncs_alt_screen(engine.host_resyncs);
+    fork_after: Option<usize>,
+) -> (Replay, Option<ReplayEngine>) {
+    let mut replay = ReplayEngine::new(header.height, header.width, engine.policy)
+        .with_resize_law(engine.law)
+        .with_host_resyncs_alt_screen(engine.host_resyncs);
     if seed_alt {
-        term.process(b"\x1b[?1049h");
+        replay.process(b"\x1b[?1049h");
     }
     // Each alt-screen resize that took rows off, with how many are still gone;
     // a grow served by the undo hands the newest back (LIFO), so a quiet flap
     // leaves nothing here.
     let mut moved: Vec<(usize, u32)> = Vec::new();
+    let mut fork = None;
     for (i, ev) in events.iter().enumerate() {
-        match ev {
-            CastEvent::Output { data, .. } => term.process(data.as_ref()),
-            CastEvent::Resize { cols, rows, .. } => {
-                if mask.is_none_or(|m| m[i]) {
-                    if !engine.keep_undo {
-                        term.grid_mut().drop_resize_undo();
-                    }
-                    term.resize_with_policy(*rows, *cols, engine.policy);
-                    if journal {
-                        let (reports, _) =
-                            term.resize_journal_since(term.resize_ordinal().saturating_sub(1));
-                        for r in reports.iter().filter(|r| r.alt && !r.reflowed) {
-                            let off = u32::from(r.demoted) + u32::from(r.pushed);
-                            if off > 0 {
-                                moved.push((i, off));
-                            }
-                            let mut back = u32::from(r.restored_top) + u32::from(r.restored_bottom);
-                            while back > 0 {
-                                let Some(last) = moved.last_mut() else { break };
-                                let take = back.min(last.1);
-                                last.1 -= take;
-                                back -= take;
-                                if last.1 == 0 {
-                                    moved.pop();
-                                }
-                            }
-                        }
+        step(
+            &mut replay,
+            i,
+            ev,
+            mask,
+            engine,
+            journal.then_some(&mut moved),
+        );
+        if fork_after == Some(i) {
+            fork = replay.fork();
+        }
+    }
+    let mut lossy: Vec<usize> = moved.into_iter().map(|(i, _)| i).collect();
+    lossy.dedup();
+    (facts(&replay, lossy), fork)
+}
+
+/// Fold `events[from..]` through `replay`, an engine that has folded the
+/// events before `from` (a [`ReplayEngine::fork`]).
+fn fold_rest<D: AsRef<[u8]>>(
+    mut replay: ReplayEngine,
+    events: &[CastEvent<D>],
+    from: usize,
+    mask: Option<&[bool]>,
+    engine: Engine,
+) -> Replay {
+    for (i, ev) in events.iter().enumerate().skip(from) {
+        step(&mut replay, i, ev, mask, engine, None);
+    }
+    facts(&replay, Vec::new())
+}
+
+/// Apply event `i`: output is processed; a resize the mask keeps is applied
+/// (without the undo, `engine.keep_undo` false, after dropping the active
+/// grid's undo) and, with `moved`, its journal folded into the lossy ledger.
+fn step<D: AsRef<[u8]>>(
+    replay: &mut ReplayEngine,
+    i: usize,
+    ev: &CastEvent<D>,
+    mask: Option<&[bool]>,
+    engine: Engine,
+    moved: Option<&mut Vec<(usize, u32)>>,
+) {
+    match ev {
+        CastEvent::Output { data, .. } => replay.process(data.as_ref()),
+        CastEvent::Resize { cols, rows, .. } => {
+            if mask.is_some_and(|m| !m[i]) {
+                return;
+            }
+            if !engine.keep_undo {
+                replay.drop_resize_undo();
+            }
+            replay.resize(*rows, *cols);
+            let Some(moved) = moved else { return };
+            let term = replay.terminal();
+            let (reports, _) = term.resize_journal_since(term.resize_ordinal().saturating_sub(1));
+            for r in reports.iter().filter(|r| r.alt && !r.reflowed) {
+                let off = u32::from(r.demoted) + u32::from(r.pushed);
+                if off > 0 {
+                    moved.push((i, off));
+                }
+                let mut back = u32::from(r.restored_top) + u32::from(r.restored_bottom);
+                while back > 0 {
+                    let Some(last) = moved.last_mut() else { break };
+                    let take = back.min(last.1);
+                    last.1 -= take;
+                    back -= take;
+                    if last.1 == 0 {
+                        moved.pop();
                     }
                 }
             }
         }
     }
-    let mut lossy: Vec<usize> = moved.into_iter().map(|(i, _)| i).collect();
-    lossy.dedup();
+}
+
+/// What a folded engine shows.
+fn facts(replay: &ReplayEngine, lossy: Vec<usize>) -> Replay {
+    let term = replay.terminal();
     let rows = (0..term.rows() as usize)
-        .map(|r| visible_row(&term, r))
+        .map(|r| visible_row(term, r))
         .collect();
     let c = term.cursor();
     Replay {
@@ -967,6 +928,67 @@ fn fold<D: AsRef<[u8]>>(
         cursor: (c.row, c.col),
         geom: (term.cols(), term.rows()),
         lossy,
+    }
+}
+
+/// The variant folds of one audit (stable, and each ONLY(r)): from a fork of
+/// the faithful replay taken just after the anchor event when there is one
+/// (every candidate's first resize lies after the anchor, so up to there each
+/// variant folds exactly what faithful folded), else from the start.
+struct Variants<'a, D> {
+    header: &'a CastHeader,
+    events: &'a [CastEvent<D>],
+    seed_alt: bool,
+    engine: Engine,
+    /// The fork and the first event it has not folded.
+    fork: Option<(ReplayEngine, usize)>,
+}
+
+impl<D: AsRef<[u8]>> Variants<'_, D> {
+    /// Fold the variant `mask`, counted in `report`. `again`: another variant
+    /// will fold after this one, so it folds a copy of the fork and keeps the
+    /// fork for that one.
+    fn fold(&mut self, mask: &[bool], again: bool, report: &mut DriftReport) -> Replay {
+        report.folds += 1;
+        let start = match (self.fork.take(), again) {
+            (Some((fork, from)), true) => {
+                let copy = fork.fork();
+                self.fork = Some((fork, from));
+                copy.map(|copy| (copy, from))
+            }
+            (fork, _) => fork,
+        };
+        let Some((replay, from)) = start else {
+            report.fold_events += self.events.len();
+            let (full, _) = fold(
+                self.header,
+                self.events,
+                self.seed_alt,
+                Some(mask),
+                self.engine,
+                false,
+                None,
+            );
+            return full;
+        };
+        report.fold_events += self.events.len() - from;
+        let rest = fold_rest(replay, self.events, from, Some(mask), self.engine);
+        // Every fold in this crate's tests also folds the variant from the
+        // start: a fork must never change what a variant shows.
+        #[cfg(test)]
+        {
+            let (full, _) = fold(
+                self.header,
+                self.events,
+                self.seed_alt,
+                Some(mask),
+                self.engine,
+                false,
+                None,
+            );
+            assert_eq!(rest, full, "a forked variant folds what its full fold does");
+        }
+        rest
     }
 }
 
@@ -1056,6 +1078,7 @@ fn analyze_inner<D: AsRef<[u8]>>(
             for law in laws {
                 let other = under(keep_undo, law);
                 report.folds += other.folds;
+                report.fold_events += other.fold_events;
                 report.law_ambiguous |= (other.verdict, other.culprit_word(), &other.drift)
                     != (report.verdict, report.culprit_word(), &report.drift);
             }
@@ -1076,9 +1099,11 @@ fn analyze_inner<D: AsRef<[u8]>>(
             let mut older = under(keep_undo, law);
             if older.fidelity == Some(true) {
                 older.folds += report.folds;
+                older.fold_events += report.fold_events;
                 return older;
             }
             report.folds += older.folds;
+            report.fold_events += older.fold_events;
         }
         report
     };
@@ -1099,9 +1124,11 @@ fn analyze_inner<D: AsRef<[u8]>>(
             let mut dropped = seeded(false);
             if dropped.fidelity == Some(true) {
                 dropped.folds += kept.folds;
+                dropped.fold_events += kept.fold_events;
                 dropped
             } else {
                 kept.folds += dropped.folds;
+                kept.fold_events += dropped.fold_events;
                 kept
             }
         }
@@ -1141,6 +1168,7 @@ fn analyze_seeded<D: AsRef<[u8]>>(
             header, events, marks, None, !seed_alt, seed_basis, args, engine,
         );
         report.folds += other.folds;
+        report.fold_events += other.fold_events;
         if other.verdict != report.verdict {
             report.verdict = Verdict::Unknown;
             report.seed_ambiguous = true;
@@ -1185,7 +1213,9 @@ fn audit<D: AsRef<[u8]>>(
         geom: (header.width, header.height),
         evicted: header.evicted,
         dropped: header.dropped,
+        handoff: header.handoff,
         folds: 0,
+        fold_events: 0,
         cursor_live: live.and_then(|l| l.cursor),
         cursor_other: None,
         cut: None,
@@ -1207,18 +1237,32 @@ fn audit<D: AsRef<[u8]>>(
     let runs = group_runs(header, events, &marks.clears);
     report.runs_total = runs.len();
 
-    let mut faithful = fold(header, events, seed_alt, None, engine, true);
+    // The faithful replay also forks just after the anchor event, where the
+    // variants start to differ from it at the earliest. Every candidate holds
+    // two resizes after the anchor (a run of two or more, or a lossy resize
+    // and the later one restoring its geometry), so with fewer there is no
+    // variant to fork for.
+    let fork_after = anchor.filter(|&a| {
+        events[a + 1..]
+            .iter()
+            .filter(|ev| matches!(ev, CastEvent::Resize { .. }))
+            .nth(1)
+            .is_some()
+    });
+    let (mut faithful, mut fork) = fold(header, events, seed_alt, None, engine, true, fork_after);
     report.folds = 1;
+    report.fold_events = events.len();
     // No buffer information and no toggle: the fidelity gate picks the seed;
     // alt only when it alone reproduces the screen.
     if seed_basis == SeedBasis::Default
         && let Some(live) = live
         && !diff_rows(&live.rows, &faithful.rows).is_empty()
     {
-        let alt = fold(header, events, true, None, engine, true);
+        let (alt, alt_fork) = fold(header, events, true, None, engine, true, fork_after);
         report.folds += 1;
+        report.fold_events += events.len();
         if diff_rows(&live.rows, &alt.rows).is_empty() {
-            faithful = alt;
+            (faithful, fork) = (alt, alt_fork);
             seed_alt = true;
             seed_basis = SeedBasis::Fidelity;
             report.seed_alt = seed_alt;
@@ -1261,16 +1305,6 @@ fn audit<D: AsRef<[u8]>>(
     let eligible: Vec<&Run> = owned.iter().collect();
     report.eligible = eligible.len();
 
-    // Stable collapses every candidate: the verdict never depends on a cap.
-    let stable = if eligible.is_empty() {
-        None
-    } else {
-        report.folds += 1;
-        let mask = apply_mask(events, &eligible);
-        Some(fold(header, events, seed_alt, Some(&mask), engine, false))
-    };
-    let stable_ref = stable.as_ref().unwrap_or(&faithful);
-
     // The screen the finding is about: the live one, or the faithful replay.
     let live_rows: &[String] = live.map_or(&faithful.rows, |l| &l.rows);
     if report.cursor_live.is_none() && live.is_none() {
@@ -1311,6 +1345,26 @@ fn audit<D: AsRef<[u8]>>(
             return report;
         }
     }
+
+    // The faithful journal names every candidate holding a lossy alt-screen
+    // resize on the screen still showing. Known before any variant folds: it
+    // decides whether ONLY folds can follow the stable one.
+    let journal: Vec<bool> = eligible
+        .iter()
+        .map(|run| lossy.iter().any(|i| (run.first..=run.last).contains(i)))
+        .collect();
+    let may_vary = eligible.len() > 1 && newest < eligible.len() && !journal.contains(&true);
+    let mut variants = Variants {
+        header,
+        events,
+        seed_alt,
+        engine,
+        fork: fork.zip(fork_after).map(|(fork, a)| (fork, a + 1)),
+    };
+    // Stable collapses every candidate: the verdict never depends on a cap.
+    let stable = (!eligible.is_empty())
+        .then(|| variants.fold(&apply_mask(events, &eligible), may_vary, &mut report));
+    let stable_ref = stable.as_ref().unwrap_or(&faithful);
     let drift = diff_rows(live_rows, &stable_ref.rows);
     if drift.is_empty() {
         report.verdict = Verdict::Clean;
@@ -1328,393 +1382,52 @@ fn audit<D: AsRef<[u8]>>(
         .collect();
 
     // Attribution. A single candidate is the culprit by construction (its
-    // only fold is the stable one). Otherwise the faithful journal names every
-    // candidate holding a lossy alt-screen resize on the screen still showing.
+    // only fold is the stable one). Otherwise the journal's culprits, and when
+    // it names none, the ONLY folds'.
     let blame: Vec<bool> = if eligible.len() == 1 {
         vec![true]
+    } else if !may_vary {
+        journal
     } else {
-        let journal: Vec<bool> = eligible
+        // No lossy resize to point at: vary the newest `max_runs` alone.
+        // A run whose collapse alone explains every drift row is the
+        // culprit; failing a sole one, every run whose collapse alone
+        // changes a drift row (each contributes).
+        let tried: Vec<usize> = (newest..eligible.len()).collect();
+        let only: Vec<Replay> = tried
             .iter()
-            .map(|run| lossy.iter().any(|i| (run.first..=run.last).contains(i)))
+            .enumerate()
+            .map(|(k, &i)| {
+                let mask = apply_mask(events, &eligible[i..=i]);
+                variants.fold(&mask, k + 1 < tried.len(), &mut report)
+            })
             .collect();
-        if journal.iter().any(|b| *b) {
-            journal
+        let sole: Vec<bool> = only
+            .iter()
+            .map(|o| same_on(&o.rows, &stable_ref.rows, &drift))
+            .collect();
+        let hits: Vec<bool> = if sole.iter().any(|s| *s) {
+            sole
         } else {
-            // No lossy resize to point at: vary the newest `max_runs` alone.
-            // A run whose collapse alone explains every drift row is the
-            // culprit; failing a sole one, every run whose collapse alone
-            // changes a drift row (each contributes).
-            let tried: Vec<usize> = (newest..eligible.len()).collect();
-            let only: Vec<Replay> = tried
-                .iter()
-                .map(|&i| {
-                    let mask = apply_mask(events, &eligible[i..=i]);
-                    fold(header, events, seed_alt, Some(&mask), engine, false)
-                })
-                .collect();
-            report.folds += only.len();
-            let sole: Vec<bool> = only
-                .iter()
-                .map(|o| same_on(&o.rows, &stable_ref.rows, &drift))
-                .collect();
-            let hits: Vec<bool> = if sole.iter().any(|s| *s) {
-                sole
-            } else {
-                only.iter()
-                    .map(|o| !same_on(&o.rows, &faithful.rows, &drift))
-                    .collect()
-            };
-            let mut blame = none.clone();
-            for (i, hit) in tried.into_iter().zip(hits) {
-                blame[i] = hit;
-            }
-            blame
+            only.iter()
+                .map(|o| !same_on(&o.rows, &faithful.rows, &drift))
+                .collect()
+        };
+        let mut blame = none.clone();
+        for (i, hit) in tried.into_iter().zip(hits) {
+            blame[i] = hit;
         }
+        blame
     };
     report.candidates = listed(&blame);
     report.capped = eligible.len() - report.candidates.len();
     report
 }
 
-// ---------------------------------------------------------------------------
-// The asciicast v2 reader
-// ---------------------------------------------------------------------------
-
-/// Parse the text `cast` answers (and `asciinema rec` writes): a JSON header
-/// object on the first non-blank line, then one `[t, "<kind>", "<data>"]` array
-/// per line. `o` and `r` events are kept; any other kind (`i`, `m`) is skipped.
-/// The header's `aterm_truncated.evicted_events` and `aterm_dropped` are read
-/// when present. Errors name the 1-based line.
-pub fn parse_asciicast(text: &str) -> Result<Asciicast, String> {
-    let mut lines = text
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty());
-    let (hn, hl) = lines
-        .next()
-        .ok_or_else(|| "empty recording: no header line".to_string())?;
-    let header = parse_header(hl).map_err(|e| format!("line {}: {e}", hn + 1))?;
-    let mut events = Vec::new();
-    for (n, line) in lines {
-        if let Some(ev) = parse_event(line).map_err(|e| format!("line {}: {e}", n + 1))? {
-            events.push(ev);
-        }
-    }
-    Ok(Asciicast { header, events })
-}
-
-fn parse_header(line: &str) -> Result<CastHeader, String> {
-    let Json::Obj(fields) = parse_json(line)? else {
-        return Err("the header is not a JSON object".to_string());
-    };
-    let get = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v);
-    match get("version").and_then(Json::as_u64) {
-        Some(2) => {}
-        _ => return Err("not an asciicast v2 header (version != 2)".to_string()),
-    }
-    let dim = |key: &str| -> Result<u16, String> {
-        get(key)
-            .and_then(Json::as_u64)
-            .map(|v| v.clamp(1, u64::from(u16::MAX)) as u16)
-            .ok_or_else(|| format!("the header has no integer `{key}`"))
-    };
-    let evicted = get("aterm_truncated")
-        .and_then(|t| t.get("evicted_events"))
-        .and_then(Json::as_u64)
-        .unwrap_or(0);
-    let dropped = get("aterm_dropped").map(|d| CastDrops {
-        bursts: d.get("bursts").and_then(Json::as_u64).unwrap_or(0),
-        bytes: d.get("bytes").and_then(Json::as_u64).unwrap_or(0),
-    });
-    let law = get("aterm_resize_undo").and_then(Json::as_u64);
-    Ok(CastHeader {
-        width: dim("width")?,
-        height: dim("height")?,
-        evicted,
-        dropped,
-        resize_undo: law.map(|v| v != 0),
-        resize_laws: CastHeader::laws_named(law),
-    })
-}
-
-fn parse_event(line: &str) -> Result<Option<CastEvent<Vec<u8>>>, String> {
-    let Json::Arr(items) = parse_json(line)? else {
-        return Err("an event is not a JSON array".to_string());
-    };
-    let [t, kind, data] = items.as_slice() else {
-        return Err("an event is not a [time, kind, data] triple".to_string());
-    };
-    let t = t
-        .as_f64()
-        .filter(|t| t.is_finite() && *t >= 0.0)
-        .ok_or_else(|| "an event time is not a non-negative number".to_string())?;
-    let (Json::Str(kind), Json::Str(data)) = (kind, data) else {
-        return Err("an event kind or data is not a string".to_string());
-    };
-    match kind.as_str() {
-        "o" => Ok(Some(CastEvent::Output {
-            t,
-            data: data.clone().into_bytes(),
-        })),
-        "r" => {
-            let (cols, rows) = data
-                .split_once('x')
-                .and_then(|(c, r)| Some((c.parse::<u16>().ok()?, r.parse::<u16>().ok()?)))
-                .ok_or_else(|| format!("a resize is not <cols>x<rows>: {data:?}"))?;
-            Ok(Some(CastEvent::Resize { t, cols, rows }))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// The JSON the reader needs: a value tree with numbers kept as their literal
-/// (so a timestamp is parsed once, exactly).
-#[derive(Debug, Clone, PartialEq)]
-enum Json {
-    Null,
-    Bool,
-    Num(String),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-impl Json {
-    fn as_u64(&self) -> Option<u64> {
-        match self {
-            Json::Num(n) => n.parse::<u64>().ok(),
-            _ => None,
-        }
-    }
-
-    fn as_f64(&self) -> Option<f64> {
-        match self {
-            Json::Num(n) => n.parse::<f64>().ok(),
-            _ => None,
-        }
-    }
-
-    fn get(&self, key: &str) -> Option<&Json> {
-        match self {
-            Json::Obj(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-}
-
-/// Nesting deeper than this is refused: the reader recurses per level, and a
-/// hostile file must not be able to overflow the stack.
-const MAX_JSON_DEPTH: usize = 32;
-
-fn parse_json(text: &str) -> Result<Json, String> {
-    let mut p = JsonReader {
-        s: text.as_bytes(),
-        i: 0,
-    };
-    let v = p.value(0)?;
-    p.ws();
-    if p.i != p.s.len() {
-        return Err("trailing bytes after the JSON value".to_string());
-    }
-    Ok(v)
-}
-
-struct JsonReader<'a> {
-    s: &'a [u8],
-    i: usize,
-}
-
-impl JsonReader<'_> {
-    fn ws(&mut self) {
-        while self
-            .s
-            .get(self.i)
-            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-        {
-            self.i += 1;
-        }
-    }
-
-    fn eat(&mut self, b: u8) -> bool {
-        self.ws();
-        if self.s.get(self.i) == Some(&b) {
-            self.i += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        if depth > MAX_JSON_DEPTH {
-            return Err("JSON nested too deep".to_string());
-        }
-        self.ws();
-        match self.s.get(self.i) {
-            Some(b'{') => {
-                self.i += 1;
-                let mut fields = Vec::new();
-                if self.eat(b'}') {
-                    return Ok(Json::Obj(fields));
-                }
-                loop {
-                    self.ws();
-                    let key = self.string()?;
-                    if !self.eat(b':') {
-                        return Err("expected `:` in a JSON object".to_string());
-                    }
-                    let v = self.value(depth + 1)?;
-                    fields.push((key, v));
-                    if self.eat(b',') {
-                        continue;
-                    }
-                    if self.eat(b'}') {
-                        return Ok(Json::Obj(fields));
-                    }
-                    return Err("expected `,` or `}` in a JSON object".to_string());
-                }
-            }
-            Some(b'[') => {
-                self.i += 1;
-                let mut items = Vec::new();
-                if self.eat(b']') {
-                    return Ok(Json::Arr(items));
-                }
-                loop {
-                    items.push(self.value(depth + 1)?);
-                    if self.eat(b',') {
-                        continue;
-                    }
-                    if self.eat(b']') {
-                        return Ok(Json::Arr(items));
-                    }
-                    return Err("expected `,` or `]` in a JSON array".to_string());
-                }
-            }
-            Some(b'"') => self.string().map(Json::Str),
-            Some(b't') => self.word(b"true", Json::Bool),
-            Some(b'f') => self.word(b"false", Json::Bool),
-            Some(b'n') => self.word(b"null", Json::Null),
-            Some(b'-' | b'0'..=b'9') => {
-                let start = self.i;
-                while self
-                    .s
-                    .get(self.i)
-                    .is_some_and(|b| matches!(b, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
-                {
-                    self.i += 1;
-                }
-                // The span is ASCII by the loop's own filter.
-                let lit = String::from_utf8_lossy(&self.s[start..self.i]).into_owned();
-                if lit.parse::<f64>().is_err() {
-                    return Err(format!("bad JSON number {lit:?}"));
-                }
-                Ok(Json::Num(lit))
-            }
-            Some(_) => Err("unexpected byte in JSON".to_string()),
-            None => Err("unexpected end of JSON".to_string()),
-        }
-    }
-
-    fn word(&mut self, w: &[u8], v: Json) -> Result<Json, String> {
-        if self.s[self.i..].starts_with(w) {
-            self.i += w.len();
-            Ok(v)
-        } else {
-            Err("bad JSON literal".to_string())
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let digits = self
-            .s
-            .get(self.i..self.i + 4)
-            .ok_or_else(|| "truncated \\u escape".to_string())?;
-        let text = std::str::from_utf8(digits).map_err(|_| "bad \\u escape".to_string())?;
-        let v = u32::from_str_radix(text, 16).map_err(|_| "bad \\u escape".to_string())?;
-        self.i += 4;
-        Ok(v)
-    }
-
-    /// A JSON string at the cursor (on its `"`). Escapes decode, `\uXXXX`
-    /// included; a surrogate pair joins into one scalar and a lone surrogate
-    /// becomes U+FFFD.
-    fn string(&mut self) -> Result<String, String> {
-        if self.s.get(self.i) != Some(&b'"') {
-            return Err("expected a JSON string".to_string());
-        }
-        self.i += 1;
-        let mut out: Vec<u8> = Vec::new();
-        loop {
-            let start = self.i;
-            while self
-                .s
-                .get(self.i)
-                .is_some_and(|b| *b != b'"' && *b != b'\\')
-            {
-                self.i += 1;
-            }
-            out.extend_from_slice(&self.s[start..self.i]);
-            match self.s.get(self.i) {
-                None => return Err("unterminated JSON string".to_string()),
-                Some(b'"') => {
-                    self.i += 1;
-                    // The source is a `&str` and every escape pushes a whole
-                    // scalar, so this is valid UTF-8; lossy is the total form.
-                    return Ok(String::from_utf8_lossy(&out).into_owned());
-                }
-                Some(_) => {
-                    self.i += 1;
-                    let esc = *self
-                        .s
-                        .get(self.i)
-                        .ok_or_else(|| "unterminated JSON escape".to_string())?;
-                    self.i += 1;
-                    let ch = match esc {
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        b'/' => '/',
-                        b'b' => '\u{08}',
-                        b'f' => '\u{0C}',
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'u' => self.unicode_escape()?,
-                        _ => return Err("bad JSON escape".to_string()),
-                    };
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                }
-            }
-        }
-    }
-
-    /// The scalar a `\uXXXX` (cursor just past the `u`) names, joining a
-    /// high surrogate with the `\uXXXX` low surrogate that follows it.
-    fn unicode_escape(&mut self) -> Result<char, String> {
-        let hi = self.hex4()?;
-        if (0xD800..0xDC00).contains(&hi) {
-            if self.s[self.i..].starts_with(b"\\u") {
-                let save = self.i;
-                self.i += 2;
-                let lo = self.hex4()?;
-                if (0xDC00..0xE000).contains(&lo) {
-                    let scalar = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
-                    return Ok(char::from_u32(scalar).unwrap_or('\u{FFFD}'));
-                }
-                // Not a low surrogate: the high one stands alone, and the
-                // escape after it is read on its own.
-                self.i = save;
-            }
-            return Ok('\u{FFFD}');
-        }
-        Ok(char::from_u32(hi).unwrap_or('\u{FFFD}'))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_core::terminal::Terminal;
 
     /// A recording under construction, with the live engine driven by the same
     /// operations beside it: the screen the audit is held against.
@@ -1746,6 +1459,7 @@ mod tests {
                     // The live engine below lays its rows out under the
                     // current law.
                     resize_laws: CastHeader::laws_named(Some(ResizeLaw::default().header_value())),
+                    handoff: None,
                 },
                 events: Vec::new(),
                 live,
@@ -1985,7 +1699,8 @@ mod tests {
             fmt_t(flap)
         )));
         assert!(head.ends_with(
-            " seed=primary seed_basis=toggle geom=20x8 evicted=0 dropped=0 cut=- folds=2 ms=7"
+            " seed=primary seed_basis=toggle geom=20x8 evicted=0 dropped=0 cut=- folds=2 \
+             fold_events=10 ms=7"
         ));
         assert_eq!(
             lines.next().unwrap(),
@@ -2149,8 +1864,9 @@ mod tests {
                     .ends_with(" ms=3 undo=off computed=client"),
                 "{wire}"
             );
-            // Match folded both engines; Drop only its own.
-            let folds = if undo == Undo::Match { 4 } else { 2 };
+            // Match folded both engines (the kept one only its faithful
+            // replay: it failed the fidelity gate); Drop only its own.
+            let folds = if undo == Undo::Match { 3 } else { 2 };
             assert_eq!(report.folds, folds, "{undo:?}");
         }
 
@@ -2206,7 +1922,10 @@ mod tests {
             });
             assert_eq!(report.verdict, Verdict::Unfaithful, "{undo:?}: {report:?}");
             assert!(!report.undo_dropped, "{undo:?}");
-            assert_eq!(report.folds, 2, "{undo:?}: no second law was tried");
+            assert_eq!(
+                report.folds, 1,
+                "{undo:?}: no second law was tried, and no variant after the gate failed"
+            );
             let wire = report.render(3, Some("client"));
             assert!(!wire.contains("undo=off"), "{wire}");
             assert!(!report.candidates.iter().any(|c| c.culprit), "{report:?}");
@@ -2220,58 +1939,6 @@ mod tests {
         });
         assert_eq!(report.verdict, Verdict::Desync, "{report:?}");
         assert!(report.undo_dropped);
-    }
-
-    /// The header key: `3` reads the undo and the current law, `2` the undo and
-    /// the two laws aterms wrote it under (the newest first), `1` the undo
-    /// only, `0` `Some(false)`, absent `None` (a file from an aterm before the
-    /// undo), the last three under the law before the rows hand-back, a value
-    /// only a newer aterm writes under the newest law this one knows, and the
-    /// rest of the header is read as ever.
-    #[test]
-    fn the_resize_law_key_is_read_from_the_header() {
-        let read = |header: &str| {
-            parse_asciicast(&format!("{header}\n[0.1, \"o\", \"hi\"]\n"))
-                .expect("parses")
-                .header
-        };
-        let keyed = |value: u64| {
-            read(&format!(
-                "{{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_resize_undo\": {value}}}"
-            ))
-        };
-        let current = keyed(3);
-        assert_eq!(
-            (current.resize_undo, current.resize_laws),
-            (Some(true), &[ResizeLaw::Rewrap][..])
-        );
-        assert_eq!(current.resize_laws, &[ResizeLaw::default()]);
-        let handback = keyed(2);
-        assert_eq!(
-            (handback.resize_undo, handback.resize_laws),
-            (
-                Some(true),
-                &[ResizeLaw::PushedRows, ResizeLaw::HandBack][..]
-            )
-        );
-        let undo = keyed(1);
-        assert_eq!(
-            (undo.resize_undo, undo.resize_laws),
-            (Some(true), &[ResizeLaw::Undo][..])
-        );
-        assert_eq!((undo.width, undo.height), (80, 24));
-        let off = keyed(0);
-        assert_eq!(
-            (off.resize_undo, off.resize_laws),
-            (Some(false), &[ResizeLaw::Undo][..])
-        );
-        let plain = read("{\"version\": 2, \"width\": 80, \"height\": 24}");
-        assert_eq!(
-            (plain.resize_undo, plain.resize_laws),
-            (None, &[ResizeLaw::Undo][..])
-        );
-        let newer = keyed(9);
-        assert_eq!(newer.resize_laws, &[ResizeLaw::Rewrap]);
     }
 
     /// S2R-F4's flap in a recording: a primary screen with history and a blank
@@ -2794,6 +2461,79 @@ mod tests {
         );
     }
 
+    /// The variants fold from a fork of the faithful replay taken just after
+    /// the anchor event, and `Variants::fold` holds every such fold in this
+    /// module's tests to the variant's fold from the start. Here the fork is
+    /// taken: with a clear first, the stable fold and both ONLY folds fold only
+    /// the events after it; without one, every variant folds them all, to the
+    /// same answer. Negative control: past the first candidate's first resize
+    /// its hand-back stands, which a copy cannot hold, so no fork is taken
+    /// there.
+    #[test]
+    fn forked_variants_equal_full_folds() {
+        // Two primary-screen rotations, which the journal cannot name, so the
+        // ONLY folds run (`a_primary_rotation_is_attributed_by_the_only_folds`):
+        // a recording of an aterm before the rows hand-back, law 1.
+        let record = |clear: &str| {
+            let mut rec = Rec::new(20, 8, false);
+            rec.header.resize_laws = &[ResizeLaw::Undo];
+            rec.live.set_resize_law(ResizeLaw::Undo);
+            let mut paint = String::from(clear);
+            for r in 0..8 {
+                paint.push_str(&format!("\x1b[{};1HP{r}", r + 1));
+            }
+            paint.push_str("\x1b[H");
+            rec.out(0.1, paint.as_bytes());
+            rec.flap(1.0);
+            rec.out(0.005, b"\x1b[H");
+            rec.flap(1.0);
+            rec.out(0.005, b"\x1b[3;1H\x1b[KQ2\x1b[H");
+            rec
+        };
+        let anchored = record("\x1b[2J");
+        let n = anchored.events.len();
+        let forked = anchored.audit(&DriftArgs::default());
+        assert_eq!(forked.anchor, Some(anchored.events[0].t()), "{forked:?}");
+        assert_eq!(forked.folds, 4, "FAITHFUL + STABLE + ONLY x2: {forked:?}");
+        assert_eq!(
+            forked.fold_events,
+            n + 3 * (n - 1),
+            "each variant folds the events after the anchor"
+        );
+        let full = record("").audit(&DriftArgs::default());
+        assert_eq!(full.anchor, None);
+        assert_eq!((full.folds, full.fold_events), (4, 4 * n));
+        assert_eq!(
+            (forked.verdict, forked.culprit_word(), &forked.drift),
+            (full.verdict, full.culprit_word(), &full.drift)
+        );
+
+        let (header, events) = (&anchored.header, &anchored.events);
+        let engine = Engine {
+            policy: ResizePolicy::Native,
+            host_resyncs: false,
+            keep_undo: true,
+            law: ResizeLaw::Undo,
+        };
+        let runs = group_runs(header, events, &scan_marks(events).clears);
+        let mask = apply_mask(events, &runs.iter().collect::<Vec<_>>());
+        let (stable, _) = fold(header, events, false, Some(&mask), engine, false, None);
+        let first = runs[0].first;
+        let at = |k: usize| {
+            let (_, fork) = fold(header, events, false, None, engine, true, Some(k));
+            fold_rest(fork.expect("forks"), events, k + 1, Some(&mask), engine)
+        };
+        assert_eq!(at(first - 1), stable, "forked at the anchor");
+        // After the output between the flap's halves, which dropped the undo,
+        // the resize's hand-back still stands: a copy could not hold it, so no
+        // fork is taken there (`Grid::replay_fork`) and the variant folds whole.
+        let (_, past) = fold(header, events, false, None, engine, true, Some(first + 1));
+        assert!(
+            past.is_none(),
+            "no fork past a resize whose hand-back stands"
+        );
+    }
+
     /// A racy screen (`cut=racy`) is answered with the replays against each
     /// other (`against=replay fidelity=-`, seeded from the live buffer), and
     /// the racy cut does not make that verdict `unknown`.
@@ -2853,7 +2593,7 @@ mod tests {
             wire.lines()
                 .next()
                 .unwrap()
-                .ends_with(" cut=file folds=2 ms=0 computed=client")
+                .ends_with(" cut=file folds=2 fold_events=10 ms=0 computed=client")
         );
         // `rows=` caps the listing, never the count.
         let capped = DriftReport {
@@ -2874,6 +2614,7 @@ mod tests {
             dropped: None,
             resize_undo: None,
             resize_laws: &[ResizeLaw::Undo],
+            handoff: None,
         };
         let events: Vec<CastEvent<Vec<u8>>> = Vec::new();
         let report = analyze(
@@ -2932,111 +2673,53 @@ mod tests {
         }
     }
 
+    /// A recording that starts at a seamless update says so in its header, and
+    /// the report computed from the text alone (offline, or client-side)
+    /// carries it, after `ms=`, as the tail every text surface prints for a
+    /// handoff. Negative control: the same recording without the key prints no
+    /// tail.
     #[test]
-    fn parser_reads_events_with_every_escape() {
-        let text = concat!(
-            "{\"version\": 2, \"width\": 135, \"height\": 63, \"env\": {\"TERM\": \"xterm\"}}\n",
-            "[0.150484, \"o\", \"\\u001b[16t\\\"q\\\\ \\/ \\b\\f\\n\\r\\t\"]\n",
-            "\n",
-            "[1.655311, \"r\", \"135x64\"]\n",
-            "[1.7, \"i\", \"typed\"]\n",
-            "[1.8, \"o\", \"\\ud83d\\ude00 \\u00e9 ✻\"]\n",
-            "[1.9, \"o\", \"lone \\ud83d x \\ude00 y\"]\n",
-            "[2.0, \"o\", \"hi then \\ud83d\\u0041\"]\n",
-        );
-        let cast = parse_asciicast(text).expect("parses");
-        assert_eq!(
-            cast.header,
-            CastHeader {
-                width: 135,
-                height: 63,
-                evicted: 0,
-                dropped: None,
-                resize_undo: None,
-                resize_laws: &[ResizeLaw::Undo],
-            }
-        );
-        assert_eq!(cast.events.len(), 5, "the `i` event is skipped");
-        assert_eq!(
-            cast.events[0],
-            CastEvent::Output {
-                t: 0.150484,
-                data: b"\x1b[16t\"q\\ / \x08\x0c\n\r\t".to_vec(),
-            }
-        );
-        assert_eq!(
-            cast.events[1],
-            CastEvent::Resize {
-                t: 1.655311,
-                cols: 135,
-                rows: 64,
-            }
-        );
-        let text_of = |i: usize| match &cast.events[i] {
-            CastEvent::Output { data, .. } => String::from_utf8(data.clone()).unwrap(),
-            CastEvent::Resize { .. } => panic!("not output"),
+    fn offline_drift_sees_the_handoff() {
+        use crate::asciicast::{parse, write_into};
+        let mut rec = Rec::new(20, 8, false);
+        rec.out(0.1, &frame("A", 8));
+        rec.flap(1.0);
+        let offline = |handoff: Option<HandoffHeader>| {
+            let header = CastHeader {
+                resize_undo: Some(true),
+                handoff,
+                ..rec.header.clone()
+            };
+            let mut text = String::new();
+            write_into(&mut text, &header, &rec.events);
+            let cast = parse(&text).expect("parses");
+            let mut report = analyze(
+                &cast.header,
+                &cast.events,
+                None,
+                &DriftArgs::default(),
+                ResizePolicy::Native,
+            );
+            report.settle_cut(Cut::File);
+            let wire = report.render(0, Some("client"));
+            wire.lines().next().unwrap().to_string()
         };
-        assert_eq!(text_of(2), "😀 é ✻", "a surrogate pair joins");
-        assert_eq!(text_of(3), "lone \u{FFFD} x \u{FFFD} y", "lone surrogates");
-        assert_eq!(
-            text_of(4),
-            "hi then \u{FFFD}A",
-            "a high surrogate before a BMP escape"
+        let built = offline(Some(HandoffHeader {
+            from_build: Some(42),
+        }));
+        assert!(
+            built.ends_with(" ms=0 carried=0 from_build=42 computed=client"),
+            "{built}"
         );
-        assert_eq!(
-            fmt_t(cast.events[1].t()),
-            "1.655311",
-            "the time round-trips"
+        let unknown = offline(Some(HandoffHeader { from_build: None }));
+        assert!(
+            unknown.ends_with(" ms=0 carried=0 from_build=- computed=client"),
+            "{unknown}"
         );
-    }
-
-    #[test]
-    fn parser_reads_the_truncation_and_drop_disclosures() {
-        let text = concat!(
-            "{\"version\": 2, \"width\": 80, \"height\": 24, \"aterm_truncated\": ",
-            "{\"evicted_events\": 17, \"note\": \"drop-oldest evicted the head\"}, ",
-            "\"aterm_dropped\": {\"bursts\": 3, \"bytes\": 4096}}\n",
-            "[0.000000, \"o\", \"x\"]\n",
+        let plain = offline(None);
+        assert!(
+            plain.ends_with(" ms=0 computed=client") && !plain.contains("carried="),
+            "{plain}"
         );
-        let cast = parse_asciicast(text).expect("parses");
-        assert_eq!(cast.header.evicted, 17);
-        assert_eq!(
-            cast.header.dropped,
-            Some(CastDrops {
-                bursts: 3,
-                bytes: 4096,
-            })
-        );
-        assert_eq!(cast.clone().until(0.0).events.len(), 1);
-        assert_eq!(cast.until(-1.0).events.len(), 0);
-    }
-
-    #[test]
-    fn parser_names_the_bad_line() {
-        for (text, want) in [
-            ("", "no header"),
-            (
-                "{\"version\": 1, \"width\": 80, \"height\": 24}\n",
-                "line 1",
-            ),
-            ("{\"version\": 2, \"height\": 24}\n", "`width`"),
-            (
-                "{\"version\": 2, \"width\": 80, \"height\": 24}\n[0.1, \"o\", \"x\"]\n[0.2, \"r\", \"80by24\"]\n",
-                "line 3",
-            ),
-            (
-                "{\"version\": 2, \"width\": 80, \"height\": 24}\n[0.1, \"o\", \"\\q\"]\n",
-                "line 2",
-            ),
-            (
-                "{\"version\": 2, \"width\": 80, \"height\": 24}\n[0.1, \"o\", \"open\n",
-                "line 2",
-            ),
-        ] {
-            let err = parse_asciicast(text).expect_err(text);
-            assert!(err.contains(want), "{err} should name {want}");
-        }
-        let deep = format!("{}{}", "[".repeat(100), "]".repeat(100));
-        assert!(parse_json(&deep).is_err(), "nesting is bounded");
     }
 }

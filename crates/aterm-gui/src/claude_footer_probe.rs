@@ -140,6 +140,49 @@ pub(crate) fn publish(app: &App, session: u64, facts: FooterFacts) {
     assert!(timeline.set_claude_footer(4242, None, Some(facts)));
 }
 
+/// A card drawer (`program` of build `version`, from the managed store)
+/// takes the front of `session` as group `pgid`: its image published and
+/// the engine's holder fence cut to it (card engine §3.7-§3.8), so a launch
+/// card it paints from here — a full clear first, or under its cut — is its
+/// own: decorated, and kept for the footer's open facts. Its token. The
+/// tests' alone: the bench's pane judges no card.
+#[cfg(test)]
+pub(crate) fn drawer(app: &App, session: u64, pgid: i32, program: &str, version: &str) -> u64 {
+    use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
+    let build = atpkg::vendor_direct::Version::parse(version)
+        .expect("a vendor build")
+        .build_id();
+    let image = crate::holder_image::HolderImage::of(
+        pgid,
+        Some(1),
+        Some(std::path::PathBuf::from(format!(
+            "/p/pkg/store/{program}/{build}/bin/{program}"
+        ))),
+        ImageBuild {
+            program: ProgramTag::new(program),
+            build,
+            source: ImageSource::Store,
+        },
+        1,
+    );
+    let token = image.token.expect("a token");
+    let entry = app.pool.get(session).expect("session");
+    {
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.note_foreground_group(pgid);
+        timeline.offer_holder_image(
+            std::sync::Arc::new(image),
+            crate::holder_image::EdgeKind::Group,
+        );
+    }
+    crate::term_lock(&entry.term).note_holder_cut(aterm_core::terminal::HolderCut {
+        to: Some(token),
+        kind: aterm_core::terminal::CutKind::Group,
+        from_alive: false,
+    });
+    token
+}
+
 /// The window: one Claude Code pane `ROWS` × `COLS` showing `live`, `facts`
 /// published, two frames drawn (every buffer grown).
 pub(crate) fn glass_with(live: &Live<'_>, facts: FooterFacts) -> (App, WindowId, u64) {

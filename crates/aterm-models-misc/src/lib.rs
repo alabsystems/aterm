@@ -17,5 +17,7 @@
 //! and those tests, never a library.
 
 mod models_misc;
+mod models_vitals;
 
 pub use models_misc::*;
+pub use models_vitals::*;

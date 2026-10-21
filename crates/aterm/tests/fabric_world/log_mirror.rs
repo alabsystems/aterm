@@ -6,10 +6,17 @@
 //! broker. Off by default it writes nothing anywhere; with `--log turns`
 //! every session's bus-class records reach its `ev` face, each `(ep, seq)`
 //! once in the reader's view (ruling Q0), `ms` dense, with one exact cover
-//! per hole an eviction made (ruling Q2), through a kill at each step of a
-//! batch and a broker restart with a pin outstanding (ruling Q12), no host
-//! or content text crossing, and `aterm fabric brief` folding what the bus
-//! holds. Every wait is a one-minute hang detector.
+//! per hole an eviction made (ruling Q2), no host or content text crossing,
+//! and `aterm fabric brief` folding what the bus holds. Every wait is a
+//! one-minute hang detector.
+//!
+//! Ruling Q12's crashes — a bridge killed at each step of a batch, a broker
+//! restart (or a power loss that moves the log) with a pin outstanding — are
+//! `aterm-link`'s deterministic simulation's (`sim`): it kills the real bridge
+//! at every I/O step of every seed with the mirror on and holds the reader's
+//! view to the same laws, no raw duplicate where the log never moved among
+//! them. This world keeps the real instance's side: the GUI's take and
+//! landing, astream's own dedup, a real process tree.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -183,100 +190,6 @@ fn turns_land_once_with_ms_dense() {
         rows.iter().all(|(_, s, _)| *s != face).then_some(())
     });
     assert!(mirrored(&w, &b).v2 > 0, "the records stay");
-}
-
-/// RULING Q12's kill points: a bridge `SIGKILL`ed at `fault` comes back under
-/// its supervisor, recovers its pin, and the reader's view holds every record
-/// once and none missing.
-fn a_kill_loses_and_doubles_nothing(tag: &str, fault: &str) {
-    let w = turns(tag, &[("ATERM_LINK_FAULT", fault)]);
-    let (a, _) = w.two_sessions();
-    claims(&w, &a, 4);
-    // One shot across restarts: the bridge that comes back under the
-    // supervisor arms nothing, and completes what the killed one pinned.
-    until("the fault to fire", || {
-        w.state.join("fault-fired").exists().then_some(())
-    });
-    claims(&w, &a, 2);
-    let m = until("the mirror to be complete after the kill", || {
-        complete(&w, &a)
-    });
-    let (_, space) = m.spaces.iter().next_back().expect("a space");
-    assert!(space.holes().is_empty(), "{fault}: {:?}", space.holes());
-    let dups: usize = m.raw.values().map(|n| n - 1).sum();
-    eprintln!(
-        "MEASURED {fault}: {} bodies, {dups} raw duplicates on the bus",
-        m.v2
-    );
-    assert_eq!(
-        dups, 0,
-        "{fault}: the recovery republished at its pinned seqs"
-    );
-}
-
-#[test]
-fn a_kill_after_the_pin_loses_and_doubles_nothing() {
-    a_kill_loses_and_doubles_nothing("lm-k1", "kill-after-mirror-pin");
-}
-
-#[test]
-fn a_kill_mid_batch_loses_and_doubles_nothing() {
-    a_kill_loses_and_doubles_nothing("lm-k2", "kill-mid-mirror-batch");
-}
-
-#[test]
-fn a_kill_before_the_landing_loses_and_doubles_nothing() {
-    a_kill_loses_and_doubles_nothing("lm-k3", "kill-before-log-landed");
-}
-
-#[test]
-fn a_kill_after_the_landing_loses_and_doubles_nothing() {
-    a_kill_loses_and_doubles_nothing("lm-k4", "kill-after-log-landed");
-}
-
-/// RULING Q12: the broker restarts while a batch is pinned — the bridge held
-/// there by its one-shot park, waited for on its marker, never raced — and
-/// the reader's view holds every record once, none missing.
-#[test]
-fn a_broker_restart_with_a_pin_outstanding_doubles_nothing() {
-    let mut w = turns(
-        "lm-pk",
-        &[("ATERM_LINK_FAULT", "park-after-mirror-pin-while-marked")],
-    );
-    let (a, _) = w.two_sessions();
-    until("the first takes to land", || complete(&w, &a));
-    let marker = w.state.join("park-mirror-pin");
-    std::fs::write(&marker, b"1\n").expect("the park marker");
-    claims(&w, &a, 3);
-    until("the bridge to park with a pin outstanding", || {
-        w.state.join("fault-fired").exists().then_some(())
-    });
-    let pin = std::fs::read_to_string(w.state.join("logpin")).expect("the pin");
-    assert!(
-        !pin.starts_with("logpin v=1 inc=0 n=0"),
-        "a batch is pinned: {pin}"
-    );
-    // The broker goes away under the parked bridge (it cannot report the
-    // link while parked, so this does not wait for it to notice).
-    if let Some(mut h) = w.handle.take() {
-        h.shutdown();
-    }
-    w.broker.take();
-    let _ = std::fs::remove_file(&w.broker_sock);
-    std::fs::remove_file(&marker).expect("release the park");
-    w.start_broker();
-    claims(&w, &a, 1);
-    let m = until("the mirror to be complete after the restart", || {
-        complete(&w, &a)
-    });
-    let dups: usize = m.raw.values().map(|n| n - 1).sum();
-    eprintln!(
-        "MEASURED broker restart with a pin out: {} bodies, {dups} raw duplicates",
-        m.v2
-    );
-    let (_, space) = m.spaces.iter().next_back().expect("a space");
-    assert_eq!(space.dup, 0);
-    assert!(space.holes().is_empty());
 }
 
 /// RULING Q2: with the broker away, a small ring evicts the claims the mark

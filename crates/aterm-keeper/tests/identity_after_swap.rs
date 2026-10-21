@@ -15,9 +15,14 @@
 //! no copy behind.
 //!
 //! No WindowServer: every process is this binary (run by `exec`, never LaunchServices), `nc`,
-//! `codesign`, `ditto` or `launchctl`; stand-ins end by SIGKILL. Each test ends COULD NOT RUN
-//! if its initial `aterm_uds::deadline::trust_service_silent` probe finds no answer. A later unavailable
-//! identity check fails with `COULD NOT RUN`; it establishes no code-identity verdict.
+//! `codesign`, `ditto` or `launchctl`; stand-ins end by SIGKILL. Every copy of this binary (the
+//! builds, the bundles, the keepers' own copies) is a new file macOS assesses at its first exec,
+//! so the scratch directory goes only once each test saw every copy it started answer, and stays
+//! when a test fails before that ([`aterm_uds::deadline::KeptUntilRan`]).
+//!
+//! Each test ends COULD NOT RUN if its initial `aterm_uds::deadline::trust_service_silent` probe
+//! finds no answer. A later unavailable identity check fails with `COULD NOT RUN`; it establishes
+//! no code-identity verdict.
 //! The negative controls check Apple-signed code.
 
 #![cfg(target_vendor = "apple")]
@@ -36,7 +41,7 @@ use aterm_keeper::client::{KeeperClient, refused_identity};
 use aterm_keeper::identity::{Identity, IdentityPolicy};
 use aterm_keeper::job::{self, JobState};
 use aterm_spec::wait::{MUST_HAPPEN, within};
-use aterm_uds::deadline::output_until;
+use aterm_uds::deadline::{FIRST_EXEC_HANG, KeptUntilRan, output_until};
 
 /// What a child run of this binary does instead of its test.
 const ROLE: &str = "ATERM_KEEPER_SWAP_ROLE";
@@ -87,7 +92,9 @@ fn play_role_if_asked() {
 }
 
 struct Scratch {
-    dir: PathBuf,
+    /// Removed after the kids are killed and reaped, once the test said every copy it started
+    /// ran.
+    dir: KeptUntilRan,
     kids: Vec<Child>,
     /// A launchd job to remove, whatever happens.
     job: Option<String>,
@@ -103,18 +110,22 @@ impl Scratch {
         private_dir(&dir.join("run"));
         private_dir(&dir.join("home"));
         Self {
-            dir,
+            dir: KeptUntilRan::new(dir),
             kids: Vec::new(),
             job: None,
         }
     }
 
+    fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+
     fn sock(&self) -> PathBuf {
-        self.dir.join("run").join("k.sock")
+        self.dir().join("run").join("k.sock")
     }
 
     fn home(&self) -> PathBuf {
-        self.dir.join("home")
+        self.dir().join("home")
     }
 
     /// Where a keeper given [`Self::home`] keeps the copies it runs from.
@@ -124,12 +135,12 @@ impl Scratch {
     }
 
     fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.join("keeper.log")).unwrap_or_default()
+        std::fs::read_to_string(self.dir().join("keeper.log")).unwrap_or_default()
     }
 
     /// Run the keeper role from `exe` (a run of `test`), its stderr in `log`.
     fn start_keeper(&mut self, exe: &Path, test: &str, log: &str) {
-        let log = std::fs::File::create(self.dir.join(log)).expect("log");
+        let log = std::fs::File::create(self.dir().join(log)).expect("log");
         let kid = Command::new(exe)
             .args(["--exact", test, "--nocapture", "--test-threads", "1"])
             .env(ROLE, "keeper")
@@ -204,7 +215,7 @@ impl Drop for Scratch {
             let _ = kid.kill();
             let _ = kid.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // `dir` goes (or stays) next, as the fields drop.
     }
 }
 
@@ -215,6 +226,10 @@ fn private_dir(path: &Path) {
         .create(path)
         .expect("a private directory");
 }
+
+/// How long a keeper started from a new copy may take to answer: the system's first-exec wait
+/// for the copy and again for the keeper's own copy of it, a hang detector of its own.
+const FIRST_ANSWER: Duration = Duration::from_secs(2 * FIRST_EXEC_HANG.as_secs());
 
 /// `trustd` going silent after the one probe refuses every later code check
 /// through a process's gate: the machine's moment, never the code's verdict.
@@ -309,10 +324,10 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     aterm_uds::deadline::require_trust_service();
     let mut s = Scratch::new("akswap");
     // The build the keeper starts from: this binary, so this test dials as it.
-    let build = s.dir.join("build").join("aterm");
+    let build = s.dir().join("build").join("aterm");
     copy_of_this_binary(&build);
     s.start_keeper(&build, BARE, "keeper.log");
-    let before = within(MUST_HAPPEN, Duration::from_millis(10), || {
+    let before = within(FIRST_ANSWER, Duration::from_millis(10), || {
         s.dial_as_this_build().ok()
     })
     .unwrap_or_else(|| panic!("the keeper never answered this build: {}", s.log()));
@@ -327,12 +342,15 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     // it copies itself too, then removes its copy as `serve` returns, and
     // leaves the live keeper's alone.
     s.start_keeper(&build, BARE, "second.log");
-    within(MUST_HAPPEN, Duration::from_millis(10), || {
+    within(FIRST_EXEC_HANG, Duration::from_millis(10), || {
         s.kids[1].try_wait().ok().flatten()
     })
     .expect("the second keeper never ended");
-    let second = std::fs::read_to_string(s.dir.join("second.log")).unwrap_or_default();
+    let second = std::fs::read_to_string(s.dir().join("second.log")).unwrap_or_default();
     assert!(second.contains("a keeper already answers"), "{second}");
+    // Every copy started has run: the first keeper answered from its own copy, and the second
+    // said, from its own, why it could not serve.
+    s.dir.ran();
     let left: Vec<_> = std::fs::read_dir(s.copies())
         .expect("the copies' directory")
         .flatten()
@@ -344,7 +362,7 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     );
 
     // The update's boot-health confirmation deletes the build it ran from…
-    std::fs::remove_dir_all(s.dir.join("build")).expect("delete the build");
+    std::fs::remove_dir_all(s.dir().join("build")).expect("delete the build");
     let after = s.dial_as_this_build();
     assert!(
         after
@@ -354,7 +372,7 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     );
 
     // …and the next update puts a different build at the same path.
-    private_dir(&s.dir.join("build"));
+    private_dir(&s.dir().join("build"));
     std::fs::copy("/usr/bin/true", &build).expect("another program at the path");
     let reused = s.dial_as_this_build();
     assert!(
@@ -365,7 +383,7 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     );
 
     // Negative control: a "keeper" that runs other code is refused.
-    let fake = s.dir.join("run").join("f.sock");
+    let fake = s.dir().join("run").join("f.sock");
     s.kids.push(
         Command::new("/usr/bin/nc")
             .arg("-lU")
@@ -403,22 +421,22 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     let sock = s.sock();
     let sock_arg = sock.to_string_lossy().into_owned();
     let status = ["status", "--sock", &sock_arg, "--identity", "designated"];
-    let staged = s.dir.join("staged").join("aterm.app");
+    let staged = s.dir().join("staged").join("aterm.app");
     signed_bundle(&staged, "com.aterm.keeper.swaptest");
     let (a, b) = (
-        s.dir.join("a").join("aterm.app"),
-        s.dir.join("b").join("aterm.app"),
+        s.dir().join("a").join("aterm.app"),
+        s.dir().join("b").join("aterm.app"),
     );
     ditto(&staged, &a);
     ditto(&staged, &b);
     let in_bundle = Path::new("Contents/MacOS/aterm");
     let (a_exe, b_exe) = (a.join(in_bundle), b.join(in_bundle));
     // Other code: the same executable sealed with another Info.plist.
-    let other = s.dir.join("other").join("aterm.app");
+    let other = s.dir().join("other").join("aterm.app");
     let other_exe = signed_bundle(&other, "com.aterm.keeper.swaptest.other");
 
     s.start_keeper(&a_exe, BUNDLED, "keeper.log");
-    let before = within(MUST_HAPPEN, Duration::from_millis(100), || {
+    let before = within(FIRST_ANSWER, Duration::from_millis(100), || {
         let said = s.verb(&b_exe, BUNDLED, &status);
         said.starts_with("keeper=running").then_some(said)
     })
@@ -430,6 +448,9 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         )
     });
     assert!(before.starts_with("keeper=running"), "{before}");
+    // Every copy started so far has run (the keeper answered, from its own copy of `a`, a verb
+    // `b` ran); each verb below runs to its own exit, never killed.
+    s.dir.ran();
     let inner = s.runs_from_its_copy(s.kids[0].id());
     assert_eq!(
         inner,
@@ -473,7 +494,7 @@ fn a_stopped_keeper_leaves_no_copy_of_its_code() {
     let mut s = Scratch::new("akstop");
     let label = format!("{}.{}.stop", job::TEST_LABEL_PREFIX, std::process::id());
     assert_eq!(job::state(&label).expect("launchctl"), JobState::Absent);
-    let build = s.dir.join("build").join("aterm");
+    let build = s.dir().join("build").join("aterm");
     copy_of_this_binary(&build);
     let env = |k: &str, v: &Path| format!("{k}={}", v.display());
     let (home, role, sock) = (
@@ -499,15 +520,18 @@ fn a_stopped_keeper_leaves_no_copy_of_its_code() {
             "--test-threads",
             "1",
         ],
-        &s.dir.join("keeper.log"),
+        &s.dir().join("keeper.log"),
     )
     .expect("submit");
-    within(MUST_HAPPEN, Duration::from_millis(10), || {
+    within(FIRST_ANSWER, Duration::from_millis(10), || {
         s.dial_as_this_build()
             .ok()
             .filter(|t| t.starts_with("keeper=running"))
     })
     .unwrap_or_else(|| panic!("the keeper never answered: {}", s.log()));
+    // The one copy started has run: the keeper answered from its own copy of it. The verb
+    // below runs to its own exit.
+    s.dir.ran();
     let JobState::Loaded { pid: Some(pid) } = job::state(&label).expect("launchctl") else {
         panic!("the job runs nothing");
     };

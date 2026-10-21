@@ -196,11 +196,16 @@ impl ModeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Ground,
-    /// Inside a UTF-8 character: `need` more bytes, the next one in `lo..=hi`.
+    /// Inside a UTF-8 character, after its lead: `need` more bytes, the next one in
+    /// `lo..=hi` (the lead's second-byte range).
     Utf8 {
         need: u8,
         lo: u8,
         hi: u8,
+    },
+    /// Inside a UTF-8 character, past its second byte: `need` more trailing bytes.
+    Utf8Tail {
+        need: u8,
     },
     Esc,
     EscEsc,
@@ -273,7 +278,7 @@ impl Decoder {
             if self.state == (State::Paste { matched: 0 }) {
                 // The body runs to the next ESC: take it whole.
                 let run = rest.iter().position(|&b| b == ESC).unwrap_or(rest.len());
-                let (body, after) = rest.split_at(run);
+                let (body, after) = rest.split_at_checked(run).unwrap_or((rest, &[]));
                 self.paste_extend(body);
                 rest = after;
             }
@@ -366,29 +371,11 @@ impl Decoder {
     fn step(&mut self, b: u8, out: &mut Vec<Event>) {
         match self.state {
             State::Ground => self.ground(b, out),
-            State::Utf8 { need, lo, hi } => {
-                if !(lo..=hi).contains(&b) {
-                    self.abort(out);
-                    return self.ground(b, out);
-                }
-                self.seq.push(b);
-                if need > 1 {
-                    self.state = State::Utf8 {
-                        need: need - 1,
-                        lo: 0x80,
-                        hi: 0xBF,
-                    };
-                    return;
-                }
-                let start = usize::from(self.alt);
-                let c = self
-                    .seq
-                    .get(start..)
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                    .and_then(|s| s.chars().next())
-                    .unwrap_or(char::REPLACEMENT_CHARACTER);
-                out.push(if self.alt { alt_key(c) } else { plain_key(c) });
-                self.reset();
+            State::Utf8 { need, lo, hi } if (lo..=hi).contains(&b) => self.utf8_byte(need, b, out),
+            State::Utf8Tail { need } if is_utf8_continuation(b) => self.utf8_byte(need, b, out),
+            State::Utf8 { .. } | State::Utf8Tail { .. } => {
+                self.abort(out);
+                self.ground(b, out);
             }
             State::Esc => match b {
                 b'[' => self.enter(State::Csi, b),
@@ -427,25 +414,17 @@ impl Decoder {
                     self.ground(b, out);
                 }
             },
-            State::Csi => match b {
-                0x20..=0x3F => self.keep(b),
-                0x40..=0x7E => self.csi_final(b, out),
-                _ => {
-                    self.abort(out);
-                    self.ground(b, out);
-                }
-            },
-            State::Ss3 => match b {
-                b'0'..=b'9' | b';' => self.keep(b),
-                0x40..=0x7E => self.ss3_final(b, out),
-                _ => {
-                    self.abort(out);
-                    self.ground(b, out);
-                }
-            },
+            State::Csi if is_csi_body(b) => self.keep(b),
+            State::Csi if is_csi_final(b) => self.csi_final(b, out),
+            State::Ss3 if matches!(b, b'0'..=b'9' | b';') => self.keep(b),
+            State::Ss3 if is_csi_final(b) => self.ss3_final(b, out),
+            State::Csi | State::Ss3 => {
+                self.abort(out);
+                self.ground(b, out);
+            }
             // A DCS reply opens with a parameter or intermediate byte (`>|`, `!|`,
             // `1$r`), an OSC reply with its number; anything else was typed.
-            State::DcsStart if (0x20..=0x3F).contains(&b) => {
+            State::DcsStart if is_csi_body(b) => {
                 self.keep(b);
                 self.state = State::Dcs;
             }
@@ -472,7 +451,7 @@ impl Decoder {
                         self.keep(b);
                         self.finish_string(osc, out);
                     }
-                    0x00..=0x1F | 0x7F => {
+                    _ if is_string_control(b) => {
                         self.abort(out);
                         self.ground(b, out);
                     }
@@ -524,6 +503,25 @@ impl Decoder {
             }
             State::Paste { matched } => self.paste_byte(matched, b, out),
         }
+    }
+
+    /// Take `b`, which fits, into the UTF-8 character being read: `need` bytes were
+    /// still to come. Every byte after the second is one of Table 3-7's trailing bytes.
+    fn utf8_byte(&mut self, need: u8, b: u8, out: &mut Vec<Event>) {
+        self.seq.push(b);
+        if need > 1 {
+            self.state = State::Utf8Tail { need: need - 1 };
+            return;
+        }
+        let start = usize::from(self.alt);
+        let c = self
+            .seq
+            .get(start..)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|s| s.chars().next())
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        out.push(if self.alt { alt_key(c) } else { plain_key(c) });
+        self.reset();
     }
 
     fn ground(&mut self, b: u8, out: &mut Vec<Event>) {
@@ -636,10 +634,9 @@ impl Decoder {
 
     fn paste_byte(&mut self, matched: usize, b: u8, out: &mut Vec<Event>) {
         if PASTE_END.get(matched) == Some(&b) {
-            if matched + 1 < PASTE_END.len() {
-                self.state = State::Paste {
-                    matched: matched + 1,
-                };
+            let matched = matched.saturating_add(1);
+            if matched < PASTE_END.len() {
+                self.state = State::Paste { matched };
                 return;
             }
             return self.finish_paste(out);
@@ -682,11 +679,8 @@ fn lossy_paste(bytes: &[u8]) -> String {
     for chunk in bytes.utf8_chunks() {
         let valid = chunk.valid();
         let room = MAX_PASTE_BYTES.saturating_sub(text.len());
-        let mut end = valid.len().min(room);
-        while !valid.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.push_str(&valid[..end]);
+        let end = valid.floor_char_boundary(valid.len().min(room));
+        text.push_str(valid.get(..end).unwrap_or_default());
         if end < valid.len() {
             break;
         }
@@ -785,7 +779,7 @@ fn typed_keys(bytes: &[u8], out: &mut Vec<Event>) {
 
 /// The complete, valid UTF-8 character `bytes` starts with, and its length.
 fn first_char(bytes: &[u8]) -> Option<(char, usize)> {
-    let len = utf8_len(*bytes.first()?);
+    let len = usize::from(utf8_len(*bytes.first()?));
     let c = std::str::from_utf8(bytes.get(..len)?)
         .ok()?
         .chars()
@@ -793,13 +787,241 @@ fn first_char(bytes: &[u8]) -> Option<(char, usize)> {
     Some((c, len))
 }
 
-/// The length of the UTF-8 character a byte leads (1 for a byte that leads none).
-fn utf8_len(lead: u8) -> usize {
-    match lead {
-        0xC2..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF4 => 4,
-        _ => 1,
+// The byte classes below are the decoder's reading of two standards, each a Trust
+// contract whose cited theorem is about the compiled fn (SPECS.md): the UTF-8 rows of
+// Unicode Table 3-7 ("Well-Formed UTF-8 Byte Sequences") and the control-sequence
+// byte classes of ECMA-48 §5.4.
+
+trust_contract_fn! {
+    /// The length of the UTF-8 character a byte leads (1 for a byte that leads none):
+    /// Table 3-7's first column, which leaves out C0 and C1 (they could only lead
+    /// overlong forms) and F5-FF (they could only lead code points past U+10FFFF).
+    fn utf8_len(lead: u8) -> u8
+    clauses [ensures result == utf8_len_spec(lead) by utf8_len_is_table_3_7]
+    {
+        match lead {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 1,
+        }
+    }
+}
+
+trust_contract_fn! {
+    /// The least byte that may follow a multi-byte lead (Table 3-7's second column):
+    /// above 0x80 only after E0 and F0, whose smaller second bytes spell overlong
+    /// forms.
+    fn utf8_second_min(lead: u8) -> u8
+    clauses [ensures result == utf8_second_min_spec(lead) by utf8_second_min_is_table_3_7]
+    {
+        match lead {
+            0xE0 => 0xA0,
+            0xF0 => 0x90,
+            _ => 0x80,
+        }
+    }
+}
+
+trust_contract_fn! {
+    /// The greatest byte that may follow a multi-byte lead (Table 3-7's second column):
+    /// below 0xBF only after ED, whose larger second bytes spell the surrogates, and
+    /// F4, whose larger ones spell code points past U+10FFFF.
+    fn utf8_second_max(lead: u8) -> u8
+    clauses [ensures result == utf8_second_max_spec(lead) by utf8_second_max_is_table_3_7]
+    {
+        match lead {
+            0xED => 0x9F,
+            0xF4 => 0x8F,
+            _ => 0xBF,
+        }
+    }
+}
+
+trust_contract_fn! {
+    /// A byte that continues a UTF-8 character: Table 3-7's trailing bytes, 80-BF.
+    fn is_utf8_continuation(b: u8) -> bool
+    clauses [ensures result == (0x80 <= b && b <= 0xBF) by utf8_continuation_is_table_3_7]
+    {
+        matches!(b, 0x80..=0xBF)
+    }
+}
+
+trust_contract_fn! {
+    /// A byte that continues a control sequence's body (ECMA-48 §5.4): a parameter
+    /// byte (03/00-03/15) or an intermediate byte (02/00-02/15).
+    fn is_csi_body(b: u8) -> bool
+    clauses [ensures result == (0x20 <= b && b <= 0x3F) by csi_body_is_ecma_48]
+    {
+        matches!(b, 0x20..=0x3F)
+    }
+}
+
+trust_contract_fn! {
+    /// A byte of a parameter string's sub-strings (ECMA-48 §5.4.1: 03/00-03/11, the
+    /// digits, `:` and `;`).
+    fn is_csi_parameter(b: u8) -> bool
+    clauses [ensures result == (0x30 <= b && b <= 0x3B) by csi_parameter_is_ecma_48]
+    {
+        matches!(b, 0x30..=0x3B)
+    }
+}
+
+trust_contract_fn! {
+    /// A byte that opens a private parameter string (ECMA-48 §5.4.1: 03/12-03/15,
+    /// `<`, `=`, `>` and `?`).
+    fn is_csi_private_marker(b: u8) -> bool
+    clauses [ensures result == (0x3C <= b && b <= 0x3F) by csi_private_marker_is_ecma_48]
+    {
+        matches!(b, 0x3C..=0x3F)
+    }
+}
+
+trust_contract_fn! {
+    /// An intermediate byte (ECMA-48 §5.4: 02/00-02/15).
+    fn is_csi_intermediate(b: u8) -> bool
+    clauses [ensures result == (0x20 <= b && b <= 0x2F) by csi_intermediate_is_ecma_48]
+    {
+        matches!(b, 0x20..=0x2F)
+    }
+}
+
+trust_contract_fn! {
+    /// The byte that ends a control sequence (ECMA-48 §5.4: 04/00-07/14).
+    fn is_csi_final(b: u8) -> bool
+    clauses [ensures result == (0x40 <= b && b <= 0x7E) by csi_final_is_ecma_48]
+    {
+        matches!(b, 0x40..=0x7E)
+    }
+}
+
+trust_contract_fn! {
+    /// A C0 control or DEL: inside a DCS or OSC string it means the string was typed
+    /// keys (ECMA-48 §5.6 admits only 00/08-00/13 and 02/00-07/14 there; BEL ends an
+    /// OSC and ESC may start ST, and both are read before this).
+    fn is_string_control(b: u8) -> bool
+    clauses [ensures result == (b <= 0x1F || b == 0x7F) by string_control_is_c0_or_del]
+    {
+        matches!(b, 0x00..=0x1F | 0x7F)
+    }
+}
+
+spec_island! {
+    clean {
+        -- Unicode Table 3-7, Well-Formed UTF-8 Byte Sequences: the lead byte ranges of
+        -- its rows 2 to 9 and the sequence length each starts; any other byte leads none.
+        def utf8_len_spec (lead : UInt8) : UInt8 :=
+          if And (0xC2 <= lead) (lead <= 0xDF) then 2
+          else if And (0xE0 <= lead) (lead <= 0xEF) then 3
+          else if And (0xF0 <= lead) (lead <= 0xF4) then 4
+          else 1
+
+        -- Table 3-7, second column: the rows whose second byte does not start at 80.
+        def utf8_second_min_spec (lead : UInt8) : UInt8 :=
+          if lead = 0xE0 then 0xA0 else if lead = 0xF0 then 0x90 else 0x80
+
+        -- Table 3-7, second column: the rows whose second byte does not end at BF.
+        def utf8_second_max_spec (lead : UInt8) : UInt8 :=
+          if lead = 0xED then 0x9F else if lead = 0xF4 then 0x8F else 0xBF
+
+        -- A range pattern compiles to one test per bound, so a range condition splits.
+        -- The proof reduces each decision, so the dev seal checks it as the lane prover
+        -- does; the dev seal refuses a simp proof of it (SPECS.md).
+        theorem ite_and_split {t : Type} (P Q : Prop) [dp : Decidable P] [dq : Decidable Q] (a b : t) :
+            (if And P Q then a else b) = (if P then (if Q then a else b) else b) := by
+          cases dp <;> cases dq <;> rfl
+    }
+}
+
+// The theorems tie each contract to its spec, one island each, so a refusal names its
+// own theorem.
+verify_island! {
+    clean {
+        theorem utf8_len_is_table_3_7 :
+            forall (lead : UInt8), trust_import_aterm_tty__decode__utf8_len lead = utf8_len_spec lead := by
+          intro lead
+          simp only [trust_import_aterm_tty__decode__utf8_len, utf8_len_spec, ite_and_split]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem utf8_second_min_is_table_3_7 :
+            forall (lead : UInt8), trust_import_aterm_tty__decode__utf8_second_min lead = utf8_second_min_spec lead := by
+          intro lead
+          simp only [trust_import_aterm_tty__decode__utf8_second_min, utf8_second_min_spec]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem utf8_second_max_is_table_3_7 :
+            forall (lead : UInt8), trust_import_aterm_tty__decode__utf8_second_max lead = utf8_second_max_spec lead := by
+          intro lead
+          simp only [trust_import_aterm_tty__decode__utf8_second_max, utf8_second_max_spec]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem utf8_continuation_is_table_3_7 :
+            forall (b : UInt8), trust_import_aterm_tty__decode__is_utf8_continuation b = (decide (0x80 <= b) && decide (b <= 0xBF)) := by
+          intro b
+          simp only [trust_import_aterm_tty__decode__is_utf8_continuation]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem csi_body_is_ecma_48 :
+            forall (b : UInt8), trust_import_aterm_tty__decode__is_csi_body b = (decide (0x20 <= b) && decide (b <= 0x3F)) := by
+          intro b
+          simp only [trust_import_aterm_tty__decode__is_csi_body]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem csi_parameter_is_ecma_48 :
+            forall (b : UInt8), trust_import_aterm_tty__decode__is_csi_parameter b = (decide (0x30 <= b) && decide (b <= 0x3B)) := by
+          intro b
+          simp only [trust_import_aterm_tty__decode__is_csi_parameter]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem csi_private_marker_is_ecma_48 :
+            forall (b : UInt8), trust_import_aterm_tty__decode__is_csi_private_marker b = (decide (0x3C <= b) && decide (b <= 0x3F)) := by
+          intro b
+          simp only [trust_import_aterm_tty__decode__is_csi_private_marker]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem csi_intermediate_is_ecma_48 :
+            forall (b : UInt8), trust_import_aterm_tty__decode__is_csi_intermediate b = (decide (0x20 <= b) && decide (b <= 0x2F)) := by
+          intro b
+          simp only [trust_import_aterm_tty__decode__is_csi_intermediate]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem csi_final_is_ecma_48 :
+            forall (b : UInt8), trust_import_aterm_tty__decode__is_csi_final b = (decide (0x40 <= b) && decide (b <= 0x7E)) := by
+          intro b
+          simp only [trust_import_aterm_tty__decode__is_csi_final]
+    }
+}
+
+verify_island! {
+    clean {
+        theorem string_control_is_c0_or_del :
+            forall (b : UInt8), trust_import_aterm_tty__decode__is_string_control b = (decide (b <= 0x1F) || decide (b = 0x7F)) := by
+          intro b
+          simp only [trust_import_aterm_tty__decode__is_string_control]
     }
 }
 
@@ -807,26 +1029,25 @@ fn utf8_len(lead: u8) -> usize {
 /// must fall in (which rules out overlong forms, surrogates and code points past
 /// U+10FFFF, as the standard decoder does).
 fn utf8_lead(b: u8) -> Option<(u8, u8, u8)> {
-    Some(match b {
-        0xC2..=0xDF => (1, 0x80, 0xBF),
-        0xE0 => (2, 0xA0, 0xBF),
-        0xE1..=0xEC | 0xEE..=0xEF => (2, 0x80, 0xBF),
-        0xED => (2, 0x80, 0x9F),
-        0xF0 => (3, 0x90, 0xBF),
-        0xF1..=0xF3 => (3, 0x80, 0xBF),
-        0xF4 => (3, 0x80, 0x8F),
+    let need = match utf8_len(b) {
+        2 => 1,
+        3 => 2,
+        4 => 3,
         _ => return None,
-    })
+    };
+    Some((need, utf8_second_min(b), utf8_second_max(b)))
 }
 
 /// Drop a character the paste cap cut in two.
 fn trim_partial_char(bytes: &mut Vec<u8>) {
     let len = bytes.len();
     let lead = (1..=len.min(4))
-        .map(|back| len - back)
-        .find(|&at| bytes.get(at).is_some_and(|b| b & 0xC0 != 0x80));
+        .filter_map(|back| len.checked_sub(back))
+        .find(|&at| bytes.get(at).is_some_and(|&b| !is_utf8_continuation(b)));
     if let Some(at) = lead
-        && bytes.get(at).is_some_and(|&b| at + utf8_len(b) > len)
+        && bytes
+            .get(at)
+            .is_some_and(|&b| at.saturating_add(usize::from(utf8_len(b))) > len)
     {
         bytes.truncate(at);
     }
@@ -860,15 +1081,15 @@ fn csi(body: &[u8], fin: u8) -> Csi {
     }
     // A private marker, then parameters, then intermediates.
     let (marker, rest) = match body.split_first() {
-        Some((&m @ (b'<' | b'=' | b'>' | b'?'), rest)) => (Some(m), rest),
+        Some((&m, rest)) if is_csi_private_marker(m) => (Some(m), rest),
         _ => (None, body),
     };
     let end = rest
         .iter()
-        .position(|b| !matches!(b, b'0'..=b'9' | b';' | b':'))
+        .position(|&b| !is_csi_parameter(b))
         .unwrap_or(rest.len());
-    let (params, intermediates) = rest.split_at(end);
-    if !intermediates.iter().all(|b| (0x20..=0x2F).contains(b)) {
+    let (params, intermediates) = rest.split_at_checked(end).unwrap_or((rest, &[]));
+    if !intermediates.iter().all(|&b| is_csi_intermediate(b)) {
         return Csi::Unknown;
     }
     let fields = fields(params);

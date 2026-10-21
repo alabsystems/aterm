@@ -70,6 +70,7 @@
 //! holder rule for every suspect as its negative control.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -177,19 +178,46 @@ impl Rig {
     /// adopted session's screen); `fg` and `dead` back the two probes.
     fn attach(
         id: u64,
+        probe: (fn(i32) -> i32, &'static AtomicI32),
+        gone: (FgGone, &'static Dead),
+        pre: &[u8],
+    ) -> Self {
+        Self::attach_with(id, probe, gone, pre, false)
+    }
+
+    /// [`Self::attach`] with the temporal spine recording
+    /// (`temporal_recording`), seeded from the engine as a spawn seeds it.
+    fn attach_recording(
+        id: u64,
+        probe: (fn(i32) -> i32, &'static AtomicI32),
+        gone: (FgGone, &'static Dead),
+    ) -> Self {
+        Self::attach_with(id, probe, gone, b"", true)
+    }
+
+    fn attach_with(
+        id: u64,
         (probe, fg): (fn(i32) -> i32, &'static AtomicI32),
         (gone, dead): (FgGone, &'static Dead),
         pre: &[u8],
+        record: bool,
     ) -> Self {
         let mut app = App::headless_for_test();
         app.session_factory.fg_probe = probe;
         app.session_factory.fg_gone = gone;
+        app.session_factory.temporal_recording = record;
         dead.lock().unwrap_or_else(|p| p.into_inner()).clear();
         let (master, slave) = open_raw_pty();
         let mut session = crate::stub_session(id);
         session.master = master;
         if !pre.is_empty() {
             session.term.lock().expect("terminal lock").process(pre);
+        }
+        if record {
+            assert!(
+                super::seed_temporal_keyframe(&session.term, &session.ctx.temporal, id),
+                "the recording is seeded"
+            );
         }
         let mut rig = Self {
             session,
@@ -330,7 +358,7 @@ impl Rig {
             .unwrap_or_else(|p| p.into_inner())
             .since(None)
             .filter(|e| e.kind == "modes-restored")
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect()
     }
 }
@@ -717,8 +745,8 @@ fn foreground_handback_a_mixed_batch_is_cut_at_the_park() {
             let (more, dropped) = taps.drain();
             assert_eq!(dropped, 0);
             for b in more {
-                stream.extend_from_slice(&b);
-                bursts.push(b);
+                stream.extend_from_slice(&b.bytes);
+                bursts.push(b.bytes);
             }
             stream.len() >= FRAME_LEN + expected_handback.len() + RECLAIM.len()
         });
@@ -1785,7 +1813,7 @@ fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
     wait_for("the reset's bytes on the tap", || {
         let (bursts, _) = tap.drain();
         for b in bursts {
-            tapped.extend_from_slice(&b);
+            tapped.extend_from_slice(&b.bytes);
         }
         tapped.windows(8).any(|w| w == b"\x1b[?1049l")
     });
@@ -1817,6 +1845,230 @@ fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
         events[2].starts_with("reason=manual source=ctl reverted=mouse"),
         "{events:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// THE TEMPORAL SPINE through the real reader (`crate::temporal::SpineMark`):
+// each hold's `RawIn` is a range of the one copy the reader makes of its batch,
+// which the cast and `bytes` taps carry too; the bytes a handback or a manual
+// reset synthesizes are an allocation of their own, recorded at their offset.
+// ---------------------------------------------------------------------------
+
+/// What a replay must reproduce of `t`: every visible row, the screen in
+/// front, and the modes the handback and the reset move.
+fn seen(t: &Terminal) -> (Vec<String>, bool, bool, bool, bool) {
+    let rows = (0..usize::from(t.rows()))
+        .map(|r| t.row_text(r).unwrap_or_default())
+        .collect();
+    (
+        rows,
+        t.is_alternate_screen(),
+        t.modes().cursor_visible,
+        t.modes().bracketed_paste,
+        t.encode_mouse_motion(0, 10, 5, 0).is_some(),
+    )
+}
+
+/// `chunks` fed in order through a fresh engine of `like`'s geometry.
+fn folded(like: &Terminal, chunks: &[&[u8]]) -> Terminal {
+    let mut t = Terminal::new(like.rows(), like.cols());
+    for chunk in chunks {
+        t.process(chunk);
+    }
+    t
+}
+
+/// The rig's spine replayed to its end, read with the reader parked (which
+/// drains its writer), nothing dropped on the way.
+fn spine_replay(rig: &Rig) -> Terminal {
+    let rec = rig
+        .session
+        .ctx
+        .temporal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    assert_eq!(rec.dropped_input(), 0, "the reader queued every slice");
+    rec.replay_at(None).expect("the spine's end replays")
+}
+
+/// The ranges of the spine's retained `RawIn` slices whose batch is `burst`'s
+/// allocation (`Arc::ptr_eq`), oldest first.
+fn sharing(retained: &[(Arc<[u8]>, Range<usize>)], burst: &Arc<[u8]>) -> Vec<Range<usize>> {
+    retained
+        .iter()
+        .filter(|(batch, _)| Arc::ptr_eq(batch, burst))
+        .map(|(_, range)| range.clone())
+        .collect()
+}
+
+static FG_SPINE: AtomicI32 = AtomicI32::new(SHELL);
+fn probe_spine(_master: i32) -> i32 {
+    FG_SPINE.load(Ordering::SeqCst)
+}
+static DEAD_SPINE: Dead = Mutex::new(Vec::new());
+fn gone_spine(_master: i32, pgid: i32, _role: FgRole) -> bool {
+    is_dead(&DEAD_SPINE, pgid)
+}
+
+/// A recorded session's spine and byte taps hold the bytes a foreground
+/// handback and a manual reset synthesize where the engine processed them,
+/// between slices of the batches the reader copied once: a replay of the spine
+/// and a fold of the `bytes` tap each reach the live terminal, after the
+/// incident's handback and again after a reset on a reattached reader. Every
+/// burst the PTY wrote unchanged is the reader's one copy of its batch: the
+/// spine's retained slices of it are ranges of that allocation and tile it.
+///
+/// NEGATIVE CONTROLS, in-line: the handback's bytes past the batch they were
+/// cut into (the shell's reclaim is then drawn on the alternate screen they
+/// leave) do not reach the live terminal, and neither do the PTY's bytes
+/// without the synthesized ones. The two bursts a splice changed, the
+/// handback's and the reset's, are copies of their own that no retained slice
+/// shares.
+#[test]
+fn a_recording_holds_the_handback_and_reset_bytes_at_their_offsets() {
+    let model = foreground_handback_model();
+    FG_SPINE.store(SHELL, Ordering::SeqCst);
+    let mut rig = Rig::attach_recording(72, (probe_spine, &FG_SPINE), (gone_spine, &DEAD_SPINE));
+    let tap = rig.session.ctx.byte_fanout.subscribe();
+    run_incident(&mut rig, &model);
+    assert_one_handback(&rig, JOB, SHELL);
+    rig.park();
+    let term = rig.term();
+    let handback = {
+        let live = term.lock().expect("terminal lock");
+        assert_eq!(
+            seen(&spine_replay(&rig)),
+            seen(&live),
+            "the spine after the handback"
+        );
+        let mut twin = folded(&live, &[ZLE_PROMPT, ZLE_EXEC, INCIDENT]);
+        let handback = twin
+            .foreground_handback_scoped(true)
+            .expect("the job's modes are handed back");
+        let late = folded(
+            &live,
+            &[ZLE_PROMPT, ZLE_EXEC, INCIDENT, RECLAIM, &handback.bytes],
+        );
+        assert_ne!(
+            seen(&late),
+            seen(&live),
+            "the handback's bytes past their cut"
+        );
+        handback.bytes
+    };
+
+    rig.reattach();
+    rig.write(STUCK_UNDER_THE_SHELL, "the stuck prompt", |t| {
+        t.program_owns_terminal() && screen_has(t, "publication %")
+    });
+    let reply = crate::manual_reset::cmd_reset(rig.session.id, &term, &rig.session.ctx, "");
+    assert!(reply.starts_with("OK reset reverted="), "{reply:?}");
+    let reset_len: usize = reply
+        .trim_end()
+        .rsplit_once(" bytes=")
+        .and_then(|(_, n)| n.parse().ok())
+        .expect("the reply counts the reset's bytes");
+    rig.write(b"after\r\n", "output after the reset", |t| {
+        screen_has(t, "after")
+    });
+    rig.park();
+    // The reader recorded every burst into the cast recorder itself, the
+    // handback's and the reset's included: a cut of the screen it drew holds at
+    // once, without a wait, and the recording folds to that screen.
+    let cast = &rig.session.ctx.cast;
+    let watermark = cast.lock().unwrap_or_else(|p| p.into_inner()).watermark();
+    let (cut, drawn) = {
+        let live = term.lock().expect("terminal lock");
+        let rows: Vec<String> = (0..usize::from(live.rows()))
+            .map(|r| crate::control::visible_row(&live, r))
+            .collect();
+        (crate::cast::CastCut::take(&live, &watermark), rows)
+    };
+    let (recording, exact) = crate::cast::CastRecorder::snapshot_at(cast, &cut, Duration::ZERO);
+    assert!(exact, "the recording holds the screen the reader drew");
+    assert_eq!(
+        recording
+            .fold_frames(1, aterm_core::grid::ResizePolicy::Native)
+            .pop()
+            .map(|(_, rows)| rows),
+        Some(drawn),
+        "the recording folds to the screen"
+    );
+    let live = term.lock().expect("terminal lock");
+    assert!(
+        !live.program_owns_terminal(),
+        "the reset handed the modes back"
+    );
+    assert_eq!(
+        seen(&spine_replay(&rig)),
+        seen(&live),
+        "the spine after the reset"
+    );
+    let (taps, dropped) = tap.drain();
+    assert_eq!(dropped, 0, "the tap kept every burst");
+    let taps: Vec<std::sync::Arc<[u8]>> = taps.into_iter().map(|b| b.bytes).collect();
+    let bursts: Vec<&[u8]> = taps.iter().map(|b| &b[..]).collect();
+    assert_eq!(
+        seen(&folded(&live, &bursts)),
+        seen(&live),
+        "the taps' bytes"
+    );
+    let pty: [&[u8]; 6] = [
+        ZLE_PROMPT,
+        ZLE_EXEC,
+        INCIDENT,
+        RECLAIM,
+        STUCK_UNDER_THE_SHELL,
+        b"after\r\n",
+    ];
+    let raw = folded(&live, &pty);
+    assert_ne!(seen(&raw), seen(&live), "the PTY's bytes alone");
+
+    // One copy per batch: a hold queued a refcount on it, and the taps carried
+    // the same allocation. A burst the PTY wrote unchanged is a run of the
+    // PTY's bytes; a splice put bytes in the other two.
+    let retained = rig
+        .session
+        .ctx
+        .temporal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_inputs();
+    let stream = pty.concat();
+    let (plain, spliced): (Vec<_>, Vec<_>) = taps
+        .iter()
+        .partition(|b| stream.windows(b.len()).any(|w| w == &b[..]));
+    for burst in &plain {
+        let ranges = sharing(&retained, burst);
+        assert_eq!(
+            ranges
+                .iter()
+                .try_fold(0, |at, r| (r.start == at).then_some(r.end)),
+            Some(burst.len()),
+            "the spine's slices {ranges:?} tile the tap's burst {:?}",
+            String::from_utf8_lossy(burst)
+        );
+    }
+    let [handed_back, reset] = spliced[..] else {
+        panic!("two bursts carry synthesized bytes, not {}", spliced.len());
+    };
+    assert!(
+        handed_back
+            .windows(handback.len())
+            .any(|w| w == &handback[..]),
+        "the first carries the handback at its cut"
+    );
+    assert_eq!(
+        reset.len(),
+        reset_len,
+        "the second is the reset's bytes alone (an empty batch)"
+    );
+    for (burst, what) in [(handed_back, "the handback's"), (reset, "the reset's")] {
+        assert!(
+            sharing(&retained, burst).is_empty(),
+            "{what} burst is a copy of its own, a batch no slice shares"
+        );
+    }
 }
 
 // ---- ForegroundHandbackOwnership (2026-09-27, the lane at load 59-65) ------

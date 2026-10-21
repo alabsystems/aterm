@@ -28,7 +28,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::journal::{Journal, json_str};
-use super::policy::sleeps::SleepStamp;
+use super::policy::sleeps::{Boot, SleepStamp};
 use super::policy::turn_end::LimitTry;
 
 /// How much of a command a row keeps.
@@ -112,14 +112,29 @@ impl Row<'_> {
         sid: Option<&str>,
         count: Option<&SleepStamp>,
     ) -> String {
+        self.to_json_counted_with_boot_text(ts, sid, count, None)
+    }
+
+    /// A replay's validated captured spelling, including noncanonical forms
+    /// the boot reader admits. The typed id must still name this count's boot.
+    fn to_json_counted_with_boot_text(
+        &self,
+        ts: i64,
+        sid: Option<&str>,
+        count: Option<&SleepStamp>,
+        captured_boot: Option<&str>,
+    ) -> String {
         let sid = sid.map_or_else(
             || "null".to_string(),
             |s| json_str(s.trim_start_matches('@')),
         );
         let counted = count
-            .and_then(|c| Some((c.asleep.as_millis(), c.boot.as_deref()?)))
+            .and_then(|c| Some((c.asleep.as_millis(), c.boot.as_ref()?)))
             .map_or_else(String::new, |(ms, boot)| {
-                format!(",\"{SLEPT_MS}\":{ms},\"{BOOT}\":{}", json_str(boot))
+                let text = captured_boot
+                    .filter(|text| Boot::of(text).as_ref() == Some(boot))
+                    .map_or_else(|| boot.text(), str::to_owned);
+                format!(",\"{SLEPT_MS}\":{ms},\"{BOOT}\":{}", json_str(&text))
             });
         format!(
             "{{\"ts\":{ts},\"sid\":{sid},\"rule_id\":{},\"decision\":{},\"cmd_sha256\":{},\
@@ -139,7 +154,11 @@ impl Row<'_> {
 pub const SLEPT_MS: &str = "slept_ms";
 
 /// An act's row's field: the boot that count is on
-/// (`aterm_uds::process::boot_session`).
+/// (`astream_sys::boot_session`), in the kernel's own spelling ([`Boot::text`]:
+/// hyphenated, upper-case on a Mac and lower-case on Linux, as the text the
+/// builds before the bytes wrote, which compare it as text) and read back by
+/// astream's reader of it ([`Boot::of`]), so a row of either case names the
+/// same boot, and one that names no boot (the all-zero id) holds no count.
 pub const BOOT: &str = "boot";
 
 /// THE LAST ACT ON `sid`'s LEDGER TEXT `body` and the machine's count of its
@@ -170,7 +189,7 @@ pub fn last_act_count_in(body: &str, sid: Option<&str>) -> Option<(i64, Option<S
             let boot = v.get(BOOT).and_then(aterm_json::Value::as_str)?;
             Some(SleepStamp {
                 asleep: std::time::Duration::from_millis(ms),
-                boot: Some(boot.to_string()),
+                boot: Some(Boot::of(boot)?),
             })
         });
     Some((last, count))
@@ -778,7 +797,7 @@ pub fn books_through(own: &str, sid: Option<&str>, earlier: &[(String, String)])
 /// first) in their place. A loop writes one or two of them at every turn
 /// nobody here typed (Claude Code's own wakes, an orchestrator's turns), with
 /// no bound: kept whole, a thousand wakes cut the rows of the states that
-/// stand for days — a landing spent, a model fallback owed its return at the
+/// stand for days — a land episode in hand, a model fallback owed its return at the
 /// bucket's reset — and a loop that follows typed the land instruction anew
 /// where the loop before it types nothing (the verifier of 75b03ac6d, RS9-R1).
 // Returns the bytes discarded, including an incoming record folded away.
@@ -878,10 +897,24 @@ impl Ledger {
         count: Option<&SleepStamp>,
         warn: &mut dyn Write,
     ) -> Option<String> {
+        self.write_counted_with_boot_text(t_ms, row, count, None, warn)
+    }
+
+    /// The counted writer with a replay's validated captured boot text.
+    /// Ordinary live and recorded rows keep [`Boot::kernel`]'s host spelling.
+    pub(crate) fn write_counted_with_boot_text(
+        &mut self,
+        t_ms: i64,
+        row: &Row<'_>,
+        count: Option<&SleepStamp>,
+        captured_boot: Option<&str>,
+        warn: &mut dyn Write,
+    ) -> Option<String> {
         if !self.journal.is_on() {
             return None;
         }
-        let line = row.to_json_counted(t_ms, self.sid.as_deref(), count);
+        let line =
+            row.to_json_counted_with_boot_text(t_ms, self.sid.as_deref(), count, captured_boot);
         self.journal.append_raw(&line, warn);
         Some(line)
     }
@@ -1000,6 +1033,41 @@ pub fn typed_at_in(body: &str, sid: Option<&str>) -> Vec<i64> {
     out
 }
 
+/// THE `/login` A LOOP BEFORE THIS ONE TYPED, ITS ANSWER STILL TO COME: when
+/// (`ts`, unix ms) `sid`'s last act in the ledger text `body` was
+/// [`super::policy::turn_end::RULE_LOGIN`]'s `/login`, with no turn read
+/// running after it ([`RULE_TURN_RAN`]) — no other act since, `/login`'s
+/// success Enter included, which answers it. A loop that follows takes it up
+/// as its own where the screen shows that `/login` at a lost login
+/// ([`super::policy::turn_end::TurnEndState::seed_login`]). `None`: another
+/// act last, a turn run since, no such row.
+#[must_use]
+pub fn login_typed_last_in(body: &str, sid: Option<&str>) -> Option<i64> {
+    use super::policy::turn_end::RULE_LOGIN;
+    let want = sid.map(|s| s.trim_start_matches('@').to_string());
+    let mut last = None;
+    for line in body.lines() {
+        let typed = line.contains(",\"decision\":\"typed\",");
+        if !typed && !line.contains(RULE_TURN_RAN) {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("sid").map(str::to_string) != want {
+            continue;
+        }
+        match text("rule_id") {
+            Some(RULE_LOGIN) if typed => last = v.get("ts").and_then(aterm_json::Value::as_i64),
+            Some(RULE_TURN_RAN) => last = None,
+            _ if typed => last = None,
+            _ => {}
+        }
+    }
+    last
+}
+
 /// The reason a [`super::policy::turn_end::RULE_LEFT`] row carries: the
 /// turn its loop left to a person ([`open_left`]).
 pub const LEFT_REASON: &str = "a person's own exchange: nothing is typed until the next turn ends";
@@ -1093,6 +1161,26 @@ pub fn parse_left_before(key: &str) -> Option<u64> {
 pub fn words_hash(text: &str) -> u64 {
     aterm_hash::fnv1a_64(
         text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_bytes(),
+    )
+}
+
+/// How many of a message's first words [`words_lead`] hashes.
+pub const LEAD_WORDS: usize = 8;
+
+/// A text's FIRST WORDS ([`LEAD_WORDS`]), hashed however they are spaced or
+/// wrapped: what a message drawn on a screen that may cut or fold it
+/// (Gemini CLI's band, agy's and Muse Code's message rows) is matched to an
+/// act's words by ([`super::policy::turn_end::TurnEndReading::opened_by`]).
+/// A text of fewer words hashes them all, so no shorter message matches a
+/// longer act's lead.
+#[must_use]
+pub fn words_lead(text: &str) -> u64 {
+    aterm_hash::fnv1a_64(
+        text.split_whitespace()
+            .take(LEAD_WORDS)
             .collect::<Vec<_>>()
             .join(" ")
             .as_bytes(),
@@ -1233,12 +1321,19 @@ pub fn probe_owed(body: &str, sid: Option<&str>) -> bool {
         .is_some_and(|l| l.contains(",\"decision\":\"typed\","))
 }
 
+/// The vendor's yes as the session ledger's `approved` row named it before
+/// Claude Code 2.1.304 named a kind in it (2.1.287–2.1.303; a reset step an
+/// older aterm opened): read by [`reset_owed`] beside every kind's
+/// `Yes, use my <kind>` (`aterm_phase::ResetKind::yes`), never written.
+pub const RESET_YES_2_1_287: &str = "Yes, use my reset";
+
 /// A limit reset's step the session ledger says is still open
 /// ([`reset_owed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResetOpen {
     /// The confirmation's Enter was written since the row was taken (an
-    /// `approved` row on the vendor's yes).
+    /// `approved` row on the vendor's yes: any kind's `Yes, use my <kind>`,
+    /// or an older build's [`RESET_YES_2_1_287`]).
     pub entered: bool,
     /// When the grant row's `approved` row was written (`ts`, unix ms); `0`
     /// where the row carries no time.
@@ -1272,10 +1367,14 @@ pub fn reset_owed(body: &str, sid: Option<&str>) -> Option<ResetOpen> {
         ",\"rule_id\":{},",
         json_str(super::policy::approval::RULE_LIMIT_RESET)
     );
-    let yes = format!(
-        ",\"command\":{},",
-        json_str(aterm_phase::anchor("reset.yes"))
-    );
+    // Every yes a build has written, each a whole command: the bundle's
+    // other dialogs open their yes `Yes, use my …` too.
+    let yeses: Vec<String> = aterm_phase::ResetKind::ALL
+        .into_iter()
+        .map(aterm_phase::ResetKind::yes)
+        .chain([RESET_YES_2_1_287.to_string()])
+        .map(|yes| format!(",\"command\":{},", json_str(&yes)))
+        .collect();
     let mut owed: Option<ResetOpen> = None;
     for row in body
         .lines()
@@ -1284,7 +1383,7 @@ pub fn reset_owed(body: &str, sid: Option<&str>) -> Option<ResetOpen> {
         if row.contains(",\"decision\":\"waiting\",") {
             owed = None;
         } else if row.contains(",\"decision\":\"approved\",") {
-            let entered = row.contains(&yes);
+            let entered = yeses.iter().any(|yes| row.contains(yes.as_str()));
             owed = Some(match owed {
                 Some(open) => ResetOpen {
                     entered: open.entered || entered,
@@ -1708,10 +1807,10 @@ pub fn usage_attempt(path: &Path, sid: Option<&str>) -> Option<UsageAttempt> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckOwed {
     /// Which check: [`super::policy::turn_end::RULE_DONE_CHECK`], or its kin
-    /// a challenge ([`super::policy::turn_end::RULE_OPEN_ITEMS`],
-    /// [`super::policy::turn_end::RULE_UNCOMMITTED`]), whose done reply ends
-    /// the task as the check's does where nothing is left (the merge
-    /// review's MG7-A3).
+    /// an older build's challenge ([`super::policy::turn_end::RULE_OPEN_ITEMS`],
+    /// [`super::policy::turn_end::RULE_UNCOMMITTED`]), whose answer is read
+    /// as the check's yield (the merge review's MG7-A3); nothing it says ends
+    /// the task (FOREVER CRUISE).
     pub rule: &'static str,
     /// A WALL ANSWERED IT, its row after it: the wall's retry delivers it
     /// again (`TurnEndState::cut_check`). Else its answer is the check's.
@@ -1732,14 +1831,17 @@ pub struct CheckOwed {
     /// loop that typed it has not begun. A check typed at an ordinary turn
     /// end has no wall to write, and its rows never say.
     pub unread: bool,
-    /// ITS ANSWER WAS JUDGED: the task ended after it ([`RULE_TASK_DONE`]).
+    /// ITS ANSWER WAS JUDGED: an older build ended the task after it
+    /// ([`RULE_TASK_DONE`]; no check's answer ends one now). Nothing ends
+    /// here: a turn read busy since is a later one.
     pub answered: bool,
 }
 
 /// THE DONE CHECK `sid`'s LEDGER TEXT `body` SAYS IS OWED ITS ANSWER, as the
 /// loop that asked it awaits that answer: the last act is
-/// [`super::policy::turn_end::RULE_DONE_CHECK`] (or a challenge,
-/// [`super::policy::turn_end::is_challenge_rule`], the check's kin), or a wall's retry
+/// [`super::policy::turn_end::RULE_DONE_CHECK`] (or an older build's
+/// challenge, [`super::policy::turn_end::is_challenge_rule`], the check's
+/// kin), or a wall's retry
 /// (`is_wall_retry`) typed while a check a wall cut stood — a wall's row
 /// after the check, no take after it ([`WALL_TAKEN`]: that wall was the
 /// screen it was typed at) and no other end ([`RULE_WALL_WAIT_END`]: the
@@ -1875,38 +1977,35 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
     owed.filter(|o| judged == 0 || o.answered)
 }
 
-/// Whether a typed row's `command` is the done check or a challenge again,
-/// as a `/compact`'s continuation types the one a full context cut
-/// (`TurnEndState::compact_owes`, ATERM-KI-1016-1 done-3): by its opening
-/// words ([`super::policy::turn_end::DONE_CHECK`],
-/// [`super::policy::turn_end::is_challenge_text`]).
+/// Whether a typed row's `command` is the done check, or an older build's
+/// check or challenge, again, as a `/compact`'s continuation types the one a
+/// full context cut (`TurnEndState::compact_owes`, ATERM-KI-1016-1 done-3):
+/// by its opening words ([`super::policy::turn_end::DONE_CHECK`], every
+/// retired check's [`super::policy::turn_end::RETIRED_DONE_CHECKS`], every
+/// retired challenge's [`super::policy::turn_end::is_challenge_text`]).
 fn delivers_check(command: Option<&str>) -> bool {
-    use super::policy::turn_end::{
-        DONE_CHECK, DONE_CHECK_MARKER_BEFORE, DONE_CHECK_ORDINARY_BEFORE, is_challenge_text,
-    };
+    use super::policy::turn_end::{DONE_CHECK, RETIRED_DONE_CHECKS, is_challenge_text};
     command.is_some_and(|c| {
-        [
-            DONE_CHECK,
-            DONE_CHECK_ORDINARY_BEFORE,
-            DONE_CHECK_MARKER_BEFORE,
-        ]
-        .iter()
-        .any(|head| opens_with(head, c))
+        std::iter::once(DONE_CHECK)
+            .chain(RETIRED_DONE_CHECKS)
+            .any(|head| opens_with(head, c))
             || is_challenge_text(c)
     })
 }
 
 /// Whether a typed row's `command` is a land act again, as a `/compact`'s
 /// continuation types the one a full context cut ([`delivers_check`]): by
-/// its opening words ([`super::policy::turn_end::LAND`], the one before it
-/// [`super::policy::turn_end::LAND_BEFORE`],
-/// [`super::policy::turn_end::LAND_NUDGE`] and the one before it
-/// [`super::policy::turn_end::LAND_NUDGE_BEFORE`]).
+/// its opening words ([`super::policy::turn_end::LAND`],
+/// [`super::policy::turn_end::LAND_NUDGE`], or an older build's
+/// [`super::policy::turn_end::RETIRED_LANDS`] and
+/// [`super::policy::turn_end::RETIRED_LAND_NUDGES`]).
 fn delivers_land(command: Option<&str>) -> bool {
-    use super::policy::turn_end::{LAND, LAND_BEFORE, LAND_NUDGE, LAND_NUDGE_BEFORE};
+    use super::policy::turn_end::{LAND, LAND_NUDGE, RETIRED_LAND_NUDGES, RETIRED_LANDS};
     command.is_some_and(|c| {
-        [LAND, LAND_BEFORE, LAND_NUDGE, LAND_NUDGE_BEFORE]
-            .iter()
+        [LAND, LAND_NUDGE]
+            .into_iter()
+            .chain(RETIRED_LANDS)
+            .chain(RETIRED_LAND_NUDGES)
             .any(|head| opens_with(head, c))
     })
 }
@@ -1929,26 +2028,37 @@ pub struct LandSeed {
     /// The nudges typed since the instruction.
     pub nudges: u32,
     /// The last act is one of Land's, typed once the instruction was (or a
-    /// wall's retry that delivers one a wall cut again): its done reply ends
-    /// the task (`TurnEndState::landing`).
+    /// wall's retry that delivers one a wall cut again): its clean defense
+    /// lands the task (`TurnEndState::landing`).
     pub landing: bool,
     /// A WALL ANSWERED THAT ACT, its row after it and no take after that
     /// ([`WALL_TAKEN`]: the screen it was typed at): the wall's retry
     /// delivers it again (`TurnEndState::cut_land`), as for the done check
     /// ([`CheckOwed::cut`]).
     pub cut: bool,
-    /// That act's answer was judged: the task ended after it
+    /// That act's answer was judged: the task landed after it
     /// ([`RULE_TASK_DONE`]).
     pub answered: bool,
-    /// THE EPISODE ENDED QUIET: its nudges spent
-    /// ([`super::policy::turn_end::LAND_NUDGES`]) and the last land act's
-    /// answer judged ([`RULE_POINT`], no wall cutting it) with no task's end
-    /// there — as the loop that judged it holds it (`LandEpisode::quiet`,
-    /// which the task's face reads as spent). A land act typed in a quiet
-    /// episode (a question's land answer) leaves it quiet; its done reply
-    /// ends the quiet. Unseeded, a loop that followed told the window `open`
-    /// over a landing spent, where nothing more is typed.
-    pub quiet: bool,
+    /// THAT ACT, as its row holds it, while its clean defense would land the
+    /// task (`landing`): when it was typed and its words hashed
+    /// ([`LandAct`]). `None` where the row names no time or words. Set by
+    /// [`land_episode_in`] alone: the walk's own states leave it out, so a
+    /// ledger's cut keeps no row for each act ([`standing_path`]).
+    pub act: Option<LandAct>,
+}
+
+/// THE LAST ACT OF A LAND EPISODE IN HAND ([`LandSeed::act`]): what a loop
+/// that follows tells its taking by
+/// (`super::policy::turn_end::TurnEndState::seed_land_act`) — its own `❯`
+/// row over the reply, or the record's last turn opened by its words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandAct {
+    /// When it was typed (`ts`, unix ms).
+    pub at_ms: i64,
+    /// Its words (`command`), hashed ([`words_hash`]).
+    pub said: u64,
+    /// Its first words, hashed ([`words_lead`]).
+    pub lead: u64,
 }
 
 /// THE LAND EPISODE `sid`'s LEDGER TEXT `body` SAYS IS IN HAND, as the loop
@@ -1959,22 +2069,44 @@ pub struct LandSeed {
 /// and not one of Land's), no [`RULE_LAND_OVER`], no [`RULE_OFF_STOOD`] —
 /// and the nudges typed since. `None` where no episode is in hand. Kept in
 /// the loop's memory alone, every successor began the episode again: the
-/// instruction typed where the first loop nudged, and a landing spent
-/// landed again at each restart (the verifier of 341e1fa81, RS7-2).
+/// instruction typed where the first loop nudged (the verifier of 341e1fa81,
+/// RS7-2).
 #[must_use]
 pub fn land_episode_in(body: &str, sid: Option<&str>) -> Option<LandSeed> {
     let want = sid.map(|s| s.trim_start_matches('@'));
     let mut walk = LandWalk::default();
+    let mut act = None;
     for v in body
         .lines()
         .filter(|l| LandWalk::reads(l))
         .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
     {
-        if v.get("sid").and_then(aterm_json::Value::as_str) == want {
-            walk.step(&v);
+        if v.get("sid").and_then(aterm_json::Value::as_str) != want {
+            continue;
+        }
+        walk.step(&v);
+        // A typed row the walk leaves landing on is the episode's last act
+        // (one of Land's, or a wall's retry or `/compact` that delivers it).
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("decision") == Some("typed")
+            && text("rule_id") != Some(super::policy::turn_end::RULE_USAGE_PROBE)
+        {
+            act = walk
+                .ep
+                .filter(|e| e.landing)
+                .and(v.get("ts").and_then(aterm_json::Value::as_i64))
+                .zip(text("command"))
+                .map(|(at_ms, said)| LandAct {
+                    at_ms,
+                    said: words_hash(said),
+                    lead: words_lead(said),
+                });
         }
     }
-    walk.answer()
+    walk.answer().map(|e| LandSeed {
+        act: act.filter(|_| e.landing),
+        ..e
+    })
 }
 
 /// WHAT [`land_episode_in`] HOLDS AS IT WALKS ONE SESSION'S ROWS: the
@@ -2006,8 +2138,8 @@ impl LandWalk {
 
     fn read(&mut self, v: &aterm_json::Value) {
         use super::policy::turn_end::{
-            LAND_NUDGES, RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, RULE_USAGE_PROBE,
-            is_continue_rule, is_land_rule, is_wall_retry,
+            RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, RULE_USAGE_PROBE, is_continue_rule,
+            is_land_rule, is_wall_retry,
         };
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
         let rule = text("rule_id").unwrap_or("");
@@ -2016,27 +2148,24 @@ impl LandWalk {
                 if rule != RULE_USAGE_PROBE {
                     self.judged = 0;
                 }
-                let land = |nudges: u32, landing: bool, quiet: bool| LandSeed {
+                let land = |nudges: u32, landing: bool| LandSeed {
                     nudges,
                     landing,
                     cut: false,
                     answered: false,
-                    quiet,
+                    act: None,
                 };
                 self.ep = match (rule, self.ep) {
                     (RULE_USAGE_PROBE, ep) => ep,
-                    (RULE_LAND, _) => Some(land(0, true, false)),
-                    (r, Some(e)) if is_land_rule(r) => Some(land(
-                        e.nudges + u32::from(r == RULE_LAND_NUDGE),
-                        true,
-                        e.quiet,
-                    )),
+                    (RULE_LAND, _) => Some(land(0, true)),
+                    (r, Some(e)) if is_land_rule(r) => {
+                        Some(land(e.nudges + u32::from(r == RULE_LAND_NUDGE), true))
+                    }
                     (r, _) if is_continue_rule(r) => None,
                     (r, Some(e)) => Some(land(
                         e.nudges,
                         (e.cut && is_wall_retry(r))
                             || (r == RULE_COMPACT && delivers_land(text("command"))),
-                        e.quiet,
                     )),
                     (_, None) => None,
                 };
@@ -2050,22 +2179,10 @@ impl LandWalk {
         };
         match rule {
             RULE_LAND_OVER | RULE_OFF_STOOD => self.ep = None,
-            RULE_TASK_DONE => {
-                e.answered = true;
-                // The land act's done reply, at its own point: landed, so
-                // the episode did not end quiet.
-                if e.landing && self.judged == 1 {
-                    e.quiet = false;
-                }
-            }
+            RULE_TASK_DONE => e.answered = true,
             // The act's answer judged; a second point is a later turn's.
             RULE_POINT if e.landing && !e.cut => {
                 self.judged += 1;
-                if self.judged == 1 {
-                    // Its answer, no done yet: quiet where the nudges are
-                    // spent (a `task-done@v1` at this point takes it back).
-                    e.quiet = e.nudges >= LAND_NUDGES;
-                }
                 if self.judged > 1 {
                     e.landing = false;
                 }
@@ -2320,8 +2437,9 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
 
 /// THE CARRY THE LAST ACT GAVE IS OVER, by `sid`'s ledger text `body`
 /// (ATERM-KI-1016-1): after its last act (a `typed` row as [`typed_at`]
-/// counts them), the loop that kept it judged a point that ended the task
-/// ([`RULE_TASK_DONE`]) or left a person's exchange to them (a `skipped`
+/// counts them), the loop that kept it judged a point that landed the task
+/// ([`RULE_TASK_DONE`], or an older build's end there) or left a person's
+/// exchange to them (a `skipped`
 /// row under [`super::policy::turn_end::RULE_LEFT`]) — both end the carry
 /// (`TurnEndState::observe`: done twice) — or Off stood after the act's
 /// answer was judged ([`RULE_OFF_STOOD`] after a [`RULE_POINT`]: the park
@@ -2343,6 +2461,19 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
 /// written wherever a stop that is no Esc of the harness's stands at the
 /// point (`TurnEndState::persons_esc_stands`), which the act's arm reads
 /// as the person's. `false`: no such record since the last act, or no act.
+///
+/// AN OLDER BUILD'S [`RULE_TASK_DONE`] ROW — written at a done reply to its
+/// done check or at the retired token, and spelled as a landing's (the rule
+/// that made it is only in the journal's `DONE` note) — ends the carry too,
+/// and is kept so (FOREVER CRUISE / FOREVER LAND, decided 2026-10-19):
+/// ending the carry seeds no end — `TurnEndState::seed_carry_over` clears
+/// the carry alone, never the task's done, its landing or its face, and the
+/// first point is decided afresh, a done claim there getting Cruise's prompt
+/// or Land's act — and such a row marks a reply whose worker said it was
+/// done, after which the policy leaves a person's own exchange to them as
+/// well (`TurnEndState::observe` counts the carry only while no done claim
+/// stands). Read past, a successor would type `keep going` after a person's
+/// quick question where the policy, judging that reply itself, would not.
 #[must_use]
 pub fn carry_ended_in(body: &str, sid: Option<&str>) -> bool {
     use super::policy::turn_end::{RULE_ACCOUNT, RULE_LEFT, RULE_USAGE_PROBE};
@@ -3115,13 +3246,16 @@ pub const RULE_EARLIER_BOOKS: &str = "earlier-books@v1";
 pub const EARLIER_BOOKS: &str = "a cold restore reopened this tab: the books of the tabs it was \
      reopened from are this session's";
 
-/// The rule id of the record that THE TASK ENDED AT A POINT a loop judged
-/// (`Session::turn_end_execute`): the worker's done reply to the done check
-/// or to a land act, or its own finish token — nothing is typed until
-/// someone else's turn. A record: no act. A loop that follows reads the act
-/// awaited before it as answered ([`CheckOwed::answered`],
-/// [`LandSeed::answered`]): its answer's screen still ends the task, and a
-/// turn read busy since is a later one, whose done report is a first one.
+/// The rule id of the record that THE TASK LANDED AT A POINT a loop judged
+/// (`Session::task_edge`): a clean defense at a land act's yield (FOREVER
+/// LAND) — nothing is typed until someone else's turn. Older builds wrote it
+/// at a done reply to the done check or at the retired token too, which ends
+/// no task now: a loop takes a landing on only from the `DONE rule=land@v1`
+/// journal line and the task record (`run.rs`'s `landed_before`,
+/// `supervise::task_mark`), never from this row. A record: no act. A loop
+/// that follows reads the act awaited before it as answered
+/// ([`CheckOwed::answered`], [`LandSeed::answered`]): a turn read busy since
+/// is a later one, whose done report is a first one.
 /// Unwritten, a successor attached during a person's turn after the check's
 /// answer read that turn's done report as the check's answer and typed
 /// nothing, where the loop that asked it asked the check again (the verifier
@@ -3447,6 +3581,79 @@ fn cut(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
 
+    /// AN ACT'S ROW COUNTS ITS SLEEP ON A BOOT IN THE KERNEL'S SPELLING
+    /// ([`BOOT`]: hyphenated, upper-case as macOS spells it, lower-case as
+    /// Linux does) and a loop that follows reads the count back as the same
+    /// 16 bytes, from a row of either spelling. A boot read off a tape (a
+    /// replay's count) is written back exactly as it was spelled, so the act's
+    /// row a replay writes is the recorded one, byte for byte, whichever host
+    /// recorded it — and this host's boot is written as this host's kernel
+    /// spells it, the text a build before the bytes wrote, which compares the
+    /// text. NEGATIVE CONTROL: a row whose boot is the all-zero id a damaged
+    /// answer reads as, or the name a test once wrote, holds no count (the act
+    /// is still the last); a count that names no boot writes no count at all.
+    #[test]
+    fn an_acts_row_counts_its_sleep_on_a_boot_in_the_kernels_spelling() {
+        let id = [
+            0x4D, 0x5A, 0x1B, 0x2C, 0x3E, 0x4F, 0x50, 0x61, 0x72, 0x83, 0x94, 0xA5, 0xB6, 0xC7,
+            0xD8, 0xE9,
+        ];
+        let (upper, lower) = (
+            "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9",
+            "4d5a1b2c-3e4f-5061-7283-94a5b6c7d8e9",
+        );
+        let row = Row {
+            rule_id: super::super::policy::turn_end::RULE_LIMIT_RESUME,
+            outcome: Outcome::Typed,
+            command: "continue",
+            reason: "the limit reset",
+            box_seq: 3,
+        };
+        let at = 1_790_000_000_000;
+        let count = |boot: Option<Boot>| SleepStamp {
+            asleep: std::time::Duration::from_millis(1_800_003),
+            boot,
+        };
+        let tail = |text: &str| format!(",\"slept_ms\":1800003,\"boot\":\"{text}\"}}");
+        let read = |line: &str| last_act_count_in(&format!("{line}\n"), Some("s-1"));
+        for text in [upper, lower] {
+            let read_back = count(Boot::of(text));
+            assert_eq!(read_back.boot.map(|b| b.id()), Some(id), "{text}");
+            let line = row.to_json_counted(at, Some("@s-1"), Some(&read_back));
+            assert!(line.ends_with(&tail(text)), "written as read: {line}");
+            assert_eq!(read(&line), Some((at, Some(read_back.clone()))), "{text}");
+            // Either spelling is the one boot this loop counts on.
+            assert_eq!(
+                read(&line).and_then(|(_, c)| c?.since(&count(Some(Boot::kernel(id))))),
+                Some(std::time::Duration::ZERO),
+                "{text}"
+            );
+        }
+        let kernel = if cfg!(any(target_os = "linux", target_os = "android")) {
+            lower
+        } else {
+            upper
+        };
+        let live = count(Some(Boot::kernel(id)));
+        let line = row.to_json_counted(at, Some("@s-1"), Some(&live));
+        assert!(
+            line.ends_with(&tail(kernel)),
+            "this kernel's spelling: {line}"
+        );
+        for damaged in ["00000000-0000-0000-0000-000000000000", "test-boot", ""] {
+            assert_eq!(
+                read(&line.replace(kernel, damaged)),
+                Some((at, None)),
+                "CONTROL {damaged:?}"
+            );
+        }
+        assert_eq!(
+            row.to_json_counted(1, Some("@s-1"), Some(&count(None))),
+            row.to_json(1, Some("@s-1")),
+            "CONTROL: no boot, no count"
+        );
+    }
+
     /// The host's journal sits beside the session's ledger, and both are cut
     /// back past their bound. Negative control: a file within the bound is
     /// left byte for byte.
@@ -3671,6 +3878,70 @@ mod tests {
         assert_eq!(typed_at(&path, Some("s-2")), [4_000]);
         assert!(typed_at(&dir.join("none.jsonl"), Some("@s-1")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE `/login` A LOOP BEFORE THIS ONE TYPED, its answer still to come,
+    /// is read as the session's last act: no other act after it, its success
+    /// Enter included, and no turn read running. NEGATIVE CONTROLS: each of
+    /// those after it; another session's `/login`; a ledger with none.
+    #[test]
+    fn the_login_a_loop_before_typed_is_read_while_it_is_the_last_act() {
+        use super::super::policy::login::RULE_LOGIN_DONE;
+        use super::super::policy::turn_end::RULE_LOGIN;
+        let typed = |rule_id, command, ts, sid| {
+            Row {
+                rule_id,
+                outcome: Outcome::Typed,
+                command,
+                reason: "-",
+                box_seq: 1,
+            }
+            .to_json(ts, Some(sid))
+        };
+        let waiting = |rule_id, ts| {
+            Row {
+                rule_id,
+                outcome: Outcome::Waiting,
+                command: "",
+                reason: "-",
+                box_seq: 1,
+            }
+            .to_json(ts, Some("@s-1"))
+        };
+        let login = typed(RULE_LOGIN, "/login", 6_000, "@s-1");
+        let body = |after: &[String]| {
+            let mut rows = vec![
+                typed("continue@v1", "keep going", 1_000, "@s-1"),
+                waiting(RULE_POINT, 5_000),
+                login.clone(),
+                waiting(RULE_POINT, 7_000),
+            ];
+            rows.extend(after.iter().cloned());
+            rows.join("\n")
+        };
+        assert_eq!(login_typed_last_in(&body(&[]), Some("@s-1")), Some(6_000));
+        assert_eq!(
+            login_typed_last_in(
+                &body(&[typed(RULE_LOGIN, "/login", 9_000, "@s-2")]),
+                Some("s-1")
+            ),
+            Some(6_000),
+            "another session's /login is no act of this one's"
+        );
+        // NEGATIVE CONTROLS.
+        for after in [
+            typed(RULE_LOGIN_DONE, "enter", 8_000, "@s-1"),
+            typed("continue@v1", "keep going", 8_000, "@s-1"),
+            waiting(RULE_TURN_RAN, 8_000),
+        ] {
+            assert_eq!(
+                login_typed_last_in(&body(std::slice::from_ref(&after)), Some("@s-1")),
+                None,
+                "{after}"
+            );
+        }
+        assert_eq!(login_typed_last_in(&body(&[]), Some("@s-2")), None);
+        assert_eq!(login_typed_last_in("", Some("@s-1")), None);
     }
 
     /// THE AT-WALL ROW'S KEY CARRIES THE EXCHANGE'S WORK (the merge review's
@@ -3996,12 +4267,17 @@ mod tests {
     /// [`reset_owed`]: a grant row's `approved` row with no `waiting` row
     /// after it is a step owed, and says whether the confirmation's Enter
     /// was written since; the step's `waiting` row ends it, and a later row
-    /// taken owes one again. No row of the reset's is a `typed` act.
-    /// NEGATIVE CONTROLS: a ledger with no row of the rule owes nothing
-    /// (every ledger written with the key off); a press that did not land
-    /// (`skipped`, `deferred`) and a `declined` row open no step; another
-    /// session's rows owe this one nothing; another rule's row on the same
-    /// words, and a command that spells the rule's fields, forge nothing.
+    /// taken owes one again. No row of the reset's is a `typed` act. The
+    /// Enter is read in BOTH wordings a build has written: each 2.1.304
+    /// kind's `Yes, use my <kind>`, and an older aterm's `Yes, use my reset`
+    /// (2.1.287–2.1.303), so a successor never takes an Enter an older build
+    /// wrote for none. NEGATIVE CONTROLS: a ledger with no row of the rule
+    /// owes nothing (every ledger written with the key off); a press that
+    /// did not land (`skipped`, `deferred`) and a `declined` row open no
+    /// step; another session's rows owe this one nothing; another rule's row
+    /// on the same words, and a command that spells the rule's fields, forge
+    /// nothing; a yes of another dialog's (`Yes, use my browser`) or one that
+    /// only opens with a kind's is no Enter.
     #[test]
     fn a_reset_row_taken_and_not_ended_is_owed_and_says_whether_it_was_entered() {
         use super::super::policy::approval::{RULE_LIMIT_RESET, RULE_LIMIT_WAIT};
@@ -4019,8 +4295,8 @@ mod tests {
             }
             .to_json(1_000, Some("@s-1"))
         };
-        const GRANT: &str = "Use your reset now (2 left, until Oct 5)";
-        const YES: &str = "Yes, use my reset";
+        const GRANT: &str = "Use a weekly reset (2 left, until Oct 5)";
+        const YES: &str = "Yes, use my weekly reset";
         let taken = || {
             row(
                 RULE_LIMIT_RESET,
@@ -4068,11 +4344,39 @@ mod tests {
             row(
                 RULE_LIMIT_RESET,
                 Outcome::Declined,
-                "Use your reset?",
+                "Use a weekly reset?",
                 "focus",
             ),
         ]);
         assert_eq!(owed(), Some(false));
+        // Each yes a build has written is the Enter: every kind's, and the
+        // older wording's.
+        for yes in [
+            "Yes, use my 5-hour reset",
+            YES,
+            "Yes, use my full reset",
+            "Yes, use my Fable reset",
+            RESET_YES_2_1_287,
+        ] {
+            write(&[
+                taken(),
+                row(RULE_LIMIT_RESET, Outcome::Approved, yes, "Refills your …"),
+            ]);
+            assert_eq!(owed(), Some(true), "{yes}");
+        }
+        // CONTROL: a yes no build of the step writes is no Enter.
+        for yes in [
+            "Yes, use my browser",
+            "Yes, use my",
+            "Yes, use my weekly resets",
+            "Yes, use my resets",
+        ] {
+            write(&[
+                taken(),
+                row(RULE_LIMIT_RESET, Outcome::Approved, yes, "Refills your …"),
+            ]);
+            assert_eq!(owed(), Some(false), "CONTROL: {yes}");
+        }
         // The Enter written: owed, entered — and the step is as old as its
         // ROW's taking, whatever was written since.
         write(&[taken(), entered().replace("\"ts\":1000,", "\"ts\":9000,")]);
@@ -4103,7 +4407,7 @@ mod tests {
             row(
                 RULE_LIMIT_RESET,
                 Outcome::Declined,
-                "Use your reset?",
+                "Use a weekly reset?",
                 "focus",
             ),
             row(RULE_LIMIT_WAIT, Outcome::Approved, GRANT, "-"),
@@ -4847,94 +5151,14 @@ mod tests {
         );
     }
 
-    /// A LANDING SPENT QUIET IS READ BACK QUIET ([`LandSeed::quiet`]; the
-    /// merge of the ledger's land episode onto the task's face): the
-    /// instruction and both nudges typed, the last nudge's answer judged with
-    /// no task's end there — quiet, as the loop that judged it holds it; a
-    /// question's land answer typed after keeps it so. NEGATIVE CONTROLS: the
-    /// last nudge's done reply (`task-done@v1` at its point), its answer not
-    /// judged yet, the nudges not spent, a wall cutting the last nudge, and
-    /// the land answer's own done reply — none quiet.
-    #[test]
-    fn a_landing_spent_quiet_is_read_back_quiet() {
-        use super::super::policy::turn_end::{RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE};
-        let dir = crate::supervise::ScratchDir::new("apr-seed", "quiet");
-        let sid = Some("@s-9");
-        let act =
-            |ts: i64, rule: &'static str| (ts, rule, Outcome::Typed, "(land)", act_reason(None));
-        let point = |ts: i64| {
-            (
-                ts,
-                RULE_POINT,
-                Outcome::Waiting,
-                "",
-                point_reason(Carried::streak(0), false),
-            )
-        };
-        let done = |ts: i64| {
-            (
-                ts,
-                RULE_TASK_DONE,
-                Outcome::Waiting,
-                "",
-                TASK_DONE.to_string(),
-            )
-        };
-        let wall = |ts: i64| {
-            (
-                ts,
-                RULE_WALL_WAIT,
-                Outcome::Waiting,
-                "",
-                spend_wall_reason(),
-            )
-        };
-        let spent = vec![
-            act(1_000, RULE_LAND),
-            point(2_000),
-            act(3_000, RULE_LAND_NUDGE),
-            point(4_000),
-            act(5_000, RULE_LAND_NUDGE),
-        ];
-        let quiet = |name: &str, rows: &[(i64, &str, Outcome, &str, String)]| {
-            land_episode(&seed_ledger(&dir, name, rows), sid)
-                .expect("an episode")
-                .quiet
-        };
-        let with = |more: &[(i64, &'static str, Outcome, &'static str, String)]| {
-            let mut rows = spent.clone();
-            rows.extend(more.iter().cloned());
-            rows
-        };
-        assert!(quiet("quiet", &with(&[point(6_000)])));
-        assert!(quiet(
-            "quiet-answer",
-            &with(&[point(6_000), act(7_000, RULE_LAND_ANSWER)])
-        ));
-        // NEGATIVE CONTROLS.
-        assert!(!quiet("landed", &with(&[point(6_000), done(6_001)])));
-        assert!(!quiet("unjudged", &spent));
-        assert!(!quiet("unspent", &spent[..4]));
-        assert!(!quiet("cut", &with(&[wall(5_500), point(6_000)])));
-        assert!(!quiet(
-            "answer-landed",
-            &with(&[
-                point(6_000),
-                act(7_000, RULE_LAND_ANSWER),
-                point(8_000),
-                done(8_001),
-            ])
-        ));
-    }
-
     /// A CUT KEEPS WHAT THE READERS READ OF A RUN OF THE LOOP'S RECORDS
     /// ([`bound`], [`fold_records`]; the verifier of 75b03ac6d, RS9-R1). A
     /// tab's ledger past [`MAX_BYTES`]: older approvals, a model fallback
-    /// owed its return at the bucket's reset three days on, a landing spent
+    /// owed its return at the bucket's reset three days on, a land episode
     /// (the land instruction and two nudges, each answered), then 1100 wakes
     /// — a turn read running and its point judged, each — and a last turn
     /// read running. Every reader says after the cut what it said before:
-    /// the switch open, the landing spent, the streak's last word and the
+    /// the switch open, the land episode, the streak's last word and the
     /// turn after it, no check owed and no try awaited; of the run the last
     /// nudge's answer opens the cut keeps that first point, the last wake's
     /// and the turn after it.
@@ -5199,7 +5423,7 @@ mod tests {
             ));
         }
         let landed = held("land-held", &land);
-        assert!(landed.1.is_some_and(|e| e.quiet), "{landed:?}");
+        assert!(landed.1.is_some_and(|e| e.nudges == 2), "{landed:?}");
         // Its questions answered under Land, each answer judged at its point:
         // the episode back where it stood after each, and every row a move;
         // then a later turn's point, and approvals.
@@ -5225,7 +5449,7 @@ mod tests {
         }
         let landed = held("land-answered", &answered);
         assert!(
-            landed.1.is_some_and(|e| e.quiet && !e.landing),
+            landed.1.is_some_and(|e| e.nudges == 2 && !e.landing),
             "{landed:?}"
         );
         let mut switched: Vec<(i64, &str, Outcome, &str, String)> = vec![(

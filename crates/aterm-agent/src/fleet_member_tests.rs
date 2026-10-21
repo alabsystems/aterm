@@ -236,6 +236,26 @@ impl Listener {
     /// [`Listener::serve`] serving only `serves`: without `book`, an older
     /// aterm.
     fn serving(listener: TcpListener, state: &Path, serves: &'static [FleetOp]) -> Self {
+        Self::naming(listener, state, serves, None)
+    }
+
+    /// [`Listener::serve`], its survey's header naming `claim` in place of
+    /// its own node — what it proves is still its own.
+    fn claiming(listener: TcpListener, state: &Path, claim: &str) -> Self {
+        Self::naming(
+            listener,
+            state,
+            &[FleetOp::Survey, FleetOp::Book, FleetOp::Join],
+            Some(claim.to_owned()),
+        )
+    }
+
+    fn naming(
+        listener: TcpListener,
+        state: &Path,
+        serves: &'static [FleetOp],
+        claim: Option<String>,
+    ) -> Self {
         let port = listener.local_addr().unwrap().port();
         let running = Arc::new(AtomicBool::new(true));
         let listening = Listening {
@@ -278,7 +298,7 @@ impl Listener {
                                 let reply = format!(
                                     "OK 1\ninstance pid=1 host=127.0.0.1 version=0.95.0 \
                                      sessions=0 level=facts cut=0 at_ms=1 node={}\n",
-                                    issuer.node
+                                    claim.as_deref().unwrap_or(&issuer.node)
                                 );
                                 return stream.write_all(reply.as_bytes());
                             }
@@ -1073,6 +1093,71 @@ fn a_members_peers_reads_its_issuers_book_and_keeps_a_copy() {
     );
 }
 
+/// A PROVEN MAC THAT NAMES THIS ONE IN ITS SURVEY IS LISTED AS REFUSED,
+/// never read as this Mac: an issuer that proves the key this member binds
+/// it to and whose survey's header names the member's own node — which the
+/// menu bar's glance would drop as this Mac answering through its book — is
+/// the read's row with a reason naming both nodes, and nothing it sent is
+/// passed on. NEGATIVE CONTROL: the same issuer naming its own node is read,
+/// proven.
+#[test]
+fn a_proven_mac_that_names_this_one_in_its_survey_is_refused_not_hidden() {
+    let issuer = World::new("misnamed-issuer");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    ok(init(
+        &issuer.places,
+        &args(&["--host", "127.0.0.1", "--port", &port.to_string()]),
+    ));
+    let honest = Listener::serve(listener, &issuer.places.state);
+    let member = World::new("misnamed-member");
+    let opts = Opts {
+        port: Some(closed_port()),
+        ..Opts::default()
+    };
+    let code = std::fs::read_to_string(issuer.places.state.join(CODE_FILE)).unwrap();
+    ok(join(&member.places, &opts, &code));
+    let whole = aterm_ctl::FleetAsk {
+        host: None,
+        within: HANG,
+    };
+    let only = || {
+        let mut read =
+            survey_fleet_in(&member.places, &whole).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(read.peers.len(), 1, "{:?}", read.peers);
+        read.peers.remove(0)
+    };
+    let read = only();
+    assert!(read.answer.is_ok() && !read.unproven, "{read:?}");
+    drop(honest);
+
+    // The issuer's aterm, where the member's record of it points, proving
+    // its own key and naming the member's node in its survey.
+    let mine = member::node_id(&member.places.state).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let claiming_port = listener.local_addr().unwrap().port();
+    let _claiming = Listener::claiming(listener, &issuer.places.state, &mine);
+    member::update_peers(&member.places.state, |book| {
+        for peer in book.iter_mut().filter(|peer| peer.via == Via::Issuer) {
+            peer.port = claiming_port;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let issuer_node = member::node_id(&issuer.places.state).unwrap();
+    let read = only();
+    let why = read.answer.as_ref().err().cloned().unwrap_or_default();
+    assert!(
+        why.contains(&format!(
+            "proved node {}, its survey says node {}: not read",
+            &issuer_node[..8],
+            &mine[..8]
+        )),
+        "{read:?}"
+    );
+    assert!(!read.unproven, "refused, not read as a claim");
+}
+
 /// WHAT A READ IS SHORT OF ITS ISSUER'S BOOK: an issuer that answered with
 /// no book leaves a read that asked its copy of the last book, or — holding
 /// none (a first read, or one after a refusal took it away) — only the peers
@@ -1467,6 +1552,15 @@ fn every_reason_a_fleet_read_gives_fits_its_row() {
             },
             PeerFault::Other,
         ),
+        // A claim past any node id's length is cut, never the remedy.
+        (
+            Unreached::Misnamed {
+                at,
+                proved: node.clone(),
+                claimed: "w".repeat(120),
+            },
+            PeerFault::Other,
+        ),
     ];
     for (why, fault) in &reasons {
         let text = why.to_string();
@@ -1671,7 +1765,14 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
         &args(&["drive", "--from", "d2d2d2d2"]),
     ));
     assert!(said.contains("names no peer"), "{said}");
-    ok(peers(&world.places, &args(&["add", "lab-mini:7101"])));
+    // A peer named by hand under `.invalid`, which no resolver answers, so
+    // each grant's read of it fails at once; a bare name would wait out its
+    // multicast DNS lookup, the read's whole three seconds, at every grant.
+    // `lab-mini`, its first label, names it.
+    ok(peers(
+        &world.places,
+        &args(&["add", "lab-mini.invalid:7101"]),
+    ));
     for (word, why) in [("c1c1c1c1", "binds no key"), ("lab-mini", "named by hand")] {
         let said = refused(allow(&world.places, &args(&["drive", "--from", word])));
         assert!(said.contains(why), "{word}: {said}");
@@ -1724,7 +1825,10 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
     // A PEERS RM of a node takes its grant with it, and a drive level
     // left naming nobody reads as content; the NEGATIVE CONTROL: a peer
     // the grant does not name leaves it standing.
-    ok(peers(&world.places, &args(&["rm", "lab-mini:7101"])));
+    ok(peers(
+        &world.places,
+        &args(&["rm", "lab-mini.invalid:7101"]),
+    ));
     assert_eq!(fleet_table(&world.config()).unwrap().drive_from.len(), 1);
     let removed = ok(peers(&world.places, &args(&["rm", &bound])));
     assert!(removed.contains("its grant"), "{removed}");
@@ -2012,9 +2116,12 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             .any(|(peer, _)| peer.node.as_deref() == Some(node.as_str())),
         "a read dials the person's entry in the copy's stead"
     );
-    // Dialled, not refused before the dial: nothing listens there.
+    // Dialled, not refused before the dial: nothing listens there. The book's
+    // `lab-mini` is a bare name, whose lookup after the refused address waits
+    // out whatever is left of the drive's deadline: a tenth of a second here,
+    // a dial's outcome either way.
     for word in [node.as_str(), by_name.as_str()] {
-        let dialled = drive_fleet_in(&member.places, word, Duration::from_secs(1))
+        let dialled = drive_fleet_in(&member.places, word, Duration::from_millis(100))
             .err()
             .expect("nothing listens there");
         assert!(

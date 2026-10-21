@@ -1,11 +1,13 @@
 //! Chandy-Lamport consistent-cut lattice and causal-closure algebra over
 //! multi-stream offset frontiers.
 //!
-//! Both [`astream-engine`](../astream_engine/index.html) (per-session envelope logs
-//! indexed by `Partition(u64)`) and `aterm` fabric bridges (per-session or
-//! per-subject broker streams indexed by `String` session/subject identifiers)
-//! coordinate independent ordered streams connected by cross-stream causal edges
-//! (`cause: (K, Offset) -> effect: (K, Offset)`).
+//! [`astream-engine`](../astream_engine/index.html)'s `fleet.rs` (per-session envelope
+//! logs indexed by `Partition(u64)`, whose `Cut` and `CrossEdge` delegate here) and
+//! `astream-broker`'s `BrokerRecord::causal_edge_from` / `commit_causal_edge`
+//! (per-subject broker streams keyed by `String` subjects and group names) coordinate
+//! independent ordered streams connected by cross-stream causal edges
+//! (`cause: (K, Offset) -> effect: (K, Offset)`). No aterm code calls this module:
+//! aterm deleted its own consistent-cut auditor (aterm `06426ed3fa`).
 //!
 //! A [`CausalCut<K>`] assigns a frontier [`Offset`] to each stream `K`. By the
 //! Chandy-Lamport distributed snapshot criterion (1985), a cut `C` is **causally

@@ -736,6 +736,14 @@ mod tests {
             read_anchor(&text, FIXTURE).unwrap().members,
             vec![K1.to_string(), K2.to_string()]
         );
+
+        // A declaration on the last line with no newline after it gains none: the diff is
+        // the declaration and the entry and nothing else.
+        let last = "pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];";
+        let (text, members) =
+            changed(append_member(last, MASTER_ANCHOR, NEW, &[], MAX_MASTER_MEMBERS).unwrap());
+        assert_eq!(read_anchor(&text, MASTER_ANCHOR).unwrap().members, members);
+        assert!(text.ends_with("];"), "{text:?}");
     }
 
     /// TRAILING WHITESPACE ON A NEIGHBOURING LINE DOES NOT REACH THE APPENDED ONE.

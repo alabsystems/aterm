@@ -169,25 +169,43 @@ struct Shell {
     args: &'static [&'static str],
 }
 
-/// zsh and bash at their system paths — the shells a macOS login gives; only a shell
-/// that is not there is skipped, and bash never is.
-fn posix_shells() -> Vec<Shell> {
+/// The POSIX shells a test runs, each found by the one tool resolver
+/// (`aterm_spec::host::test_shell`); bash must be found. Iterated by reference only, and
+/// held for the whole test: when the test ends, a shell the host lacks ends it COULD NOT
+/// RUN naming its provider, once every loop has run the shells it has, so a missing zsh
+/// is never a pass that ran one dialect, and never stops a later loop's bash. (Iterated
+/// by value, the guard dropped at its first loop's end: a test with two loops never ran
+/// its second.)
+struct Lanes {
+    shells: Vec<Shell>,
+    absent: Vec<&'static str>,
+}
+
+impl<'a> IntoIterator for &'a Lanes {
+    type Item = &'a Shell;
+    type IntoIter = std::slice::Iter<'a, Shell>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.shells.iter()
+    }
+}
+
+impl Drop for Lanes {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            aterm_spec::host::could_not_run_without(&self.absent);
+        }
+    }
+}
+
+/// zsh and bash, the shells a macOS login gives.
+fn posix_shells() -> Lanes {
     let mut shells = Vec::new();
-    for (name, ext, args, candidates) in [
-        (
-            "bash",
-            "bash",
-            &["--noprofile", "--norc", "-c"][..],
-            &["/bin/bash", "/usr/bin/bash"][..],
-        ),
-        (
-            "zsh",
-            "zsh",
-            &["-f", "-c"][..],
-            &["/bin/zsh", "/usr/bin/zsh"][..],
-        ),
+    let mut absent = Vec::new();
+    for (name, ext, args) in [
+        ("bash", "bash", &["--noprofile", "--norc", "-c"][..]),
+        ("zsh", "zsh", &["-f", "-c"][..]),
     ] {
-        match candidates.iter().map(PathBuf::from).find(|p| p.is_file()) {
+        match aterm_spec::host::test_shell(name) {
             Some(exe) => shells.push(Shell {
                 name,
                 ext,
@@ -196,11 +214,11 @@ fn posix_shells() -> Vec<Shell> {
             }),
             None => {
                 assert_ne!(name, "bash", "bash must be runnable on a unix host");
-                eprintln!("{name} is not installed here; its dialect is not run");
+                absent.push(name);
             }
         }
     }
-    shells
+    Lanes { shells, absent }
 }
 
 /// Run `script` in `shell` from a clean environment: only `HOME`, `XDG_CONFIG_HOME`,
@@ -290,11 +308,11 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
             .collect()
     };
     let inherited: Vec<String> = fx.inherited_path().split(':').map(str::to_owned).collect();
-    for shell in posix_shells() {
+    for shell in &posix_shells() {
         let hook = fx.lay_hook(shell.ext);
         let who = shell.name;
         for &marker in atpkg::hooks::AGENTS_MARKERS {
-            let inside = sourced_path(&fx, &shell, &hook, 1, &[(marker, "1")]);
+            let inside = sourced_path(&fx, shell, &hook, 1, &[(marker, "1")]);
             assert_eq!(
                 inside[..2],
                 [Fixture::s(&fx.reroute), Fixture::s(&fx.agents)],
@@ -307,7 +325,7 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
             want.push(Fixture::s(&fx.bin).to_owned());
             assert_eq!(rest(&inside), want, "{who} with {marker}: {inside:?}");
             assert_eq!(
-                sourced_path(&fx, &shell, &hook, 2, &[(marker, "1")]),
+                sourced_path(&fx, shell, &hook, 2, &[(marker, "1")]),
                 inside,
                 "{who} with {marker}: sourcing twice is sourcing once"
             );
@@ -316,7 +334,7 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
         for value in ["", "0"] {
             let inside = sourced_path(
                 &fx,
-                &shell,
+                shell,
                 &hook,
                 1,
                 &[("ATERM_CHILD", "1"), (PASSTHROUGH_ENV, value)],
@@ -329,7 +347,7 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
         }
         // Outside aterm: neither, and bin/ still appended (an iTerm launched from an aterm
         // tab inherits both, and heals).
-        let outside = sourced_path(&fx, &shell, &hook, 1, &[]);
+        let outside = sourced_path(&fx, shell, &hook, 1, &[]);
         assert_eq!(count(&outside, &fx.reroute), 0, "{who}: {outside:?}");
         assert_eq!(count(&outside, &fx.agents), 0, "{who}: {outside:?}");
         assert_eq!(
@@ -337,13 +355,13 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
             Some(Fixture::s(&fx.bin))
         );
         assert_eq!(
-            sourced_path(&fx, &shell, &hook, 2, &[]),
+            sourced_path(&fx, shell, &hook, 2, &[]),
             outside,
             "{who}: idempotent outside aterm too"
         );
         // `aterm --no-reroute`: that session asked for every upstream tool.
         let passthrough = [("ATERM_CHILD", "1"), (PASSTHROUGH_ENV, "1")];
-        let escaped = sourced_path(&fx, &shell, &hook, 1, &passthrough);
+        let escaped = sourced_path(&fx, shell, &hook, 1, &passthrough);
         assert_eq!(
             escaped[0],
             Fixture::s(&fx.agents),
@@ -352,7 +370,7 @@ fn inside_aterm_the_hook_puts_reroute_then_agents_first_and_outside_neither() {
         assert_eq!(count(&escaped, &fx.reroute), 0, "{who}: {escaped:?}");
         assert_eq!(count(&escaped, &fx.agents), 1, "{who}: {escaped:?}");
         assert_eq!(
-            sourced_path(&fx, &shell, &hook, 2, &passthrough),
+            sourced_path(&fx, shell, &hook, 2, &passthrough),
             escaped,
             "{who}: idempotent under the passthrough marker"
         );
@@ -373,7 +391,7 @@ fn a_tty_session_whose_front_door_handed_no_agents_dir_still_leads_with_reroute(
     let script = ". \"$ATPKG_TEST_HOOK\"; . \"$ATPKG_TEST_HOOK\"; \
                   printf 'PATH=%s\\nAGENTS=%s\\n' \"$PATH\" \"${ATPKG_AGENTS-<unset>}\"";
     let upstream_ran = "homebrew-style cargo: build --x\n";
-    for shell in posix_shells() {
+    for shell in &posix_shells() {
         let hook = fx.lay_hook(shell.ext);
         let who = shell.name;
         let probe = |env: &[(&str, &str)]| -> (Vec<String>, String) {
@@ -481,7 +499,9 @@ fn inside_aterm_a_bare_cargo_is_announced_and_then_runs_upstream_with_its_exit_c
     let fx = Fixture::new("stub");
     let script = ". \"$ATPKG_TEST_HOOK\"; cargo build --x";
     let upstream_ran = "homebrew-style cargo: build --x\n";
-    for shell in posix_shells() {
+    // One guard for both loops: a shell the host lacks ends the test after both.
+    let lanes = posix_shells();
+    for shell in &lanes {
         let hook = fx.lay_hook(shell.ext);
         let who = shell.name;
         let cargo = |env: &[(&str, &str)]| -> (String, String, Option<i32>) {
@@ -522,7 +542,7 @@ fn inside_aterm_a_bare_cargo_is_announced_and_then_runs_upstream_with_its_exit_c
     }
     // `[reroute] announce = false`: the line is gone, the run is not.
     fx.silence_announcements();
-    for shell in posix_shells() {
+    for shell in &lanes {
         let hook = fx.lay_hook(shell.ext);
         let out = run(
             &fx,

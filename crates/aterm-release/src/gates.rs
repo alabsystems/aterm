@@ -4403,12 +4403,9 @@ mod published_commit_tests {
     /// A move with neither conflict succeeds and retains its ignored warm build.
     #[test]
     fn a_move_preserves_ignored_work_when_rules_or_tracked_paths_change() {
-        let mut failures = Vec::new();
-        for (case, leftovers, replacement) in [
-            ("clean move", false, false),
-            ("exposed ignored files", true, false),
-            ("ignored note becomes tracked", true, true),
-        ] {
+        // The cases share nothing (each its own repository and origin), so they run at once.
+        let run = |(case, leftovers, replacement): (&str, bool, bool)| {
+            let mut failures = Vec::new();
             let repo = Repo::new("leftovers");
             repo.commit(
                 "a tool with its own ignore file",
@@ -4494,7 +4491,22 @@ mod published_commit_tests {
                 rev_parse(&crate::ledger::GitCli::new(&tree), "HEAD").unwrap(),
                 actual_head
             );
-        }
+            failures
+        };
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let running: Vec<_> = [
+                ("clean move", false, false),
+                ("exposed ignored files", true, false),
+                ("ignored note becomes tracked", true, true),
+            ]
+            .into_iter()
+            .map(|each| scope.spawn(move || run(each)))
+            .collect();
+            running
+                .into_iter()
+                .flat_map(|ran| ran.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 

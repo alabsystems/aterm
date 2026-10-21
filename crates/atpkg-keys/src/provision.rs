@@ -717,6 +717,8 @@ fn complete_roster_transaction(path: &str) -> Result<(), String> {
             &e.to_string(),
         ])
     })?;
+    #[cfg(test)]
+    crate::fsio::window::reached("roster pair replayed", path);
     // Retirement is only legitimate once the pair is PROVED installed: retiring on the
     // strength of two Ok returns would drop the redo log on the word of the same
     // filesystem that just lost the pair.
@@ -895,6 +897,8 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
     })?;
     let guard = aterm_update_core::FileLock::lock_open(file)
         .map_err(|e| concat(&["lock roster ", path, ": ", &e.to_string()]))?;
+    #[cfg(test)]
+    crate::fsio::window::reached("read-only claim locked", &lock_path);
 
     // Refuse a raced unlink/replacement after open. Normal roster tooling never deletes
     // this rendezvous, but a read-only claim must not sit locking an orphaned inode while
@@ -1444,6 +1448,8 @@ pub fn write_pins(planned: &Planned) -> Result<(), String> {
         write_bytes_atomic(&planned.paths.pins, text.as_bytes())
             .map_err(|e| concat(&["write ", &planned.paths.pins, ": ", &e.to_string()]))?;
     }
+    #[cfg(test)]
+    crate::fsio::window::reached("anchor file written", &planned.paths.pins);
     let raw = read_bytes(&planned.paths.pins).map_err(|e| {
         concat(&[
             "re-read ",
@@ -2288,6 +2294,19 @@ mod tests {
             "the premise: a torn pair, which is what a verifier refuses"
         );
 
+        // A filesystem that acknowledged the replay but kept an old half, the body or the
+        // signature: the read-back catches either, and the redo log stays for the next lock
+        // to replay.
+        for (half, old) in [("", &b"old body"[..]), (".sig", &b"old sig"[..])] {
+            let lost = crate::fsio::window::with(
+                "roster pair replayed",
+                move |body| std::fs::write(concat(&[body, half]), old).unwrap(),
+                || lock_roster(roster).map(drop),
+            );
+            assert!(lost.is_err(), "a replay that lost {half:?} is not retired");
+            assert!(std::path::Path::new(&transaction).exists());
+        }
+
         let _ = recording.take();
         let _lock = lock_roster(roster).expect("lock acquisition replays the committed redo");
         let replayed = recording.take();
@@ -2411,6 +2430,18 @@ mod tests {
         // NEGATIVE CONTROL: with a rendezvous and no pending transaction, it succeeds —
         // so the refusals here are the policy and not a broken lock.
         drop(lock_roster_read_only(roster).expect("an existing clean rendezvous is readable"));
+        // A rendezvous replaced after the claim opened it is refused: the claim would hold
+        // a lock on an orphaned inode while a writer locks the new one.
+        let swapped = crate::fsio::window::with(
+            "read-only claim locked",
+            |lock| {
+                let fresh = concat(&[lock, ".new"]);
+                std::fs::write(&fresh, b"").unwrap();
+                std::fs::rename(&fresh, lock).unwrap();
+            },
+            || lock_roster_read_only(roster).map(drop),
+        );
+        assert!(swapped.is_err(), "a replaced rendezvous is refused");
 
         let predecessor = RosterSnapshot {
             raw: b"old body".to_vec(),
@@ -2990,6 +3021,25 @@ mod tests {
         let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
         let seed = seed_of(PAPER);
         let planned = plan(pre, &seed, NOW).unwrap();
+
+        // An edit that lands between the write and its read-back is reported even though
+        // the master's members are still the planned ones: the file must hold exactly the
+        // bytes written, or another change rides along unseen.
+        let landed = crate::fsio::window::with(
+            "anchor file written",
+            |pins| {
+                let ours = std::fs::read_to_string(pins).unwrap();
+                let theirs = ours.replace("therefore INERT.", "edited in the gap.");
+                assert_ne!(theirs, ours, "the edit must change the file");
+                std::fs::write(pins, theirs).unwrap();
+            },
+            || write_pins(&planned),
+        );
+        assert!(
+            landed.is_err(),
+            "a foreign edit after the write is reported"
+        );
+        std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
 
         // Honest first: the ordinary path succeeds.
         write_pins(&planned).expect("the ordinary write verifies");

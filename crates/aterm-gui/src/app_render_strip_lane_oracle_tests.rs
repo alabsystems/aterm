@@ -175,7 +175,16 @@ fn brute_force(prev: &RenderInput, cur: &RenderInput, dirty: &mut Vec<bool>) -> 
     let mut c = cur.clone();
     p.invalidate_row_revisions();
     c.invalidate_row_revisions();
-    compute_dirty_rows(&p, &c, false, None, false, None, CELL_H, dirty)
+    compute_dirty_rows(
+        &p,
+        &c,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        dirty,
+    )
 }
 
 fn corpus() -> Vec<Step> {
@@ -568,7 +577,7 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
                     None,
                     false,
                     None,
-                    CELL_H,
+                    aterm_render::RowBands::new(0, CELL_H),
                     &mut stamped_dirty,
                 );
                 let want = brute_force(prev, &composed, &mut brute_dirty);

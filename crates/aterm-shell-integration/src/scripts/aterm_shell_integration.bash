@@ -407,6 +407,13 @@ __aterm_ps0() {
 # switch with the user's XTRACE on. Put back at the body's end.
 { __aterm_body_flags=$-; set +xv; } 2>/dev/null
 
+# Enable agy's fast prompt editor by default (including in adopted shells when
+# this body is live-reloaded at the next prompt) so U+202F narrow no-break
+# spaces in macOS screenshot filenames do not desynchronize Bubble Tea's
+# textarea visual cursor.
+: "${AGY_CLI_FAST_PROMPT_EDITOR=true}"
+export AGY_CLI_FAST_PROMPT_EDITOR
+
 # The user's XTRACE and VERBOSE, as `$1` (a `$-`) holds them: put back where a
 # function of aterm's that turned them off returns, or runs the user's own code.
 # It returns `$2` (0 when not given), and its last argument is what `$_` reads
@@ -421,89 +428,26 @@ __aterm_flags_put() {
 
 # ─── AN OLDER SCRIPT'S `~/.aterm/bin`, taken off (2026-10-19) ───
 #
-# Every script before 613305828c (2026-10-16) put `$HOME/.aterm/bin` FIRST on
-# PATH when it loaded a shell fresh and that folder existed; none since does
-# (the loader's package block says why). Such a shell kept the entry through an
-# upgrade in place — this body sourced at a prompt by its older loader, or this
-# loader sourced over it — until it exited. So the body takes it off, once per
-# shell, where the shell PROVES that such a script put it there, and nowhere
-# else: v0.106.0 and every build from 613305828c up to this one put none there
-# and set no mark, so in their shells a `~/.aterm/bin` on PATH is the user's
-# own. The proof has two halves:
-#
-#  1. The script that loaded this shell fresh carried the prepend. That is the
-#     loader in `__aterm_si_dir` when its own load was the fresh one
-#     (`__aterm_fresh_load` 1), or, when this build's loader came in place, the
-#     one it noted there (`__aterm_bin_from`, the loader's block says how; `-`
-#     for a shell from before loaders, whose every script prepended). The
-#     folder is content-addressed, so its loader still holds the bytes that
-#     loaded the shell, and the prepend line is looked for in it, spelled here
-#     so that this file never holds it. A folder already collected, or a loader
-#     an intermediate build sourced in place, leaves nothing to prove it with:
-#     the entry stays.
-#  2. The folder was there at that load: it is older than the shell process —
-#     its positive birth, or its last change only when birth is unavailable,
-#     by more than the whole seconds `stat`, `date` and `ps -o etime=` count in.
-#     A usable birth takes precedence even if mtime was preserved or backdated.
-#     The clock is read before the shell's age; mtime without a usable birth
-#     remains a fallback reading, not an independent creation-time witness.
-#
-# One `sh` asks both (grep, stat, ps and date: once per shell, and only where
-# PATH holds the entry and the folder exists). Then one copy goes — the first
-# equal to `$HOME/.aterm/bin`, where the old script put it — and nothing else
-# moves: an EMPTY entry ("here") keeps its place, and a copy the user's own
-# startup added keeps the folder on PATH. Walked entry by entry and compared
-# with `[ = ]`, never a pattern: a user's `nocasematch` (a `.bashrc` runs before
-# this file) turns a pattern case-insensitive, and an entry spelled in another
-# case is not the one an older script added.
+# Once per shell, in a shell an older script loaded that this body reaches in
+# place (`__aterm_old_bin_off` unset; a fresh load settles it in the loader):
+# `aterm_shell_integration_old_bin.bash`, beside this file in its folder, says
+# what goes and when, and takes it off. Its own file (2026-10-20) because no
+# shell this build starts ever runs it, yet every one paid here to parse it:
+# 55 lines and two function definitions, about 0.95 M of the 78 M instructions
+# to the first prompt (2026-10-20, bash 3.2.57, a PTY, the captured aterm spawn
+# env, interleaved, n=100).
+# The folder is the one `BASH_SOURCE` names, this loader's or the body file's
+# alone; a copy with no such file beside it takes nothing off, the side that
+# never takes a user's own entry. The file is sourced only when it is this
+# user's (`-O`), as THE BODY CHECK sources a body: the body's own code, kept
+# beside it, is held to the body's rule.
 if [[ -z "${__aterm_old_bin_off-}" ]]; then
     __aterm_old_bin_off=1
-    __aterm_path_drop_first() {
-        local __aterm_left="" __aterm_right="$PATH" __aterm_entry
-        while :; do
-            __aterm_entry="${__aterm_right%%:*}"
-            if [ "$__aterm_entry" = "$1" ]; then
-                case "$__aterm_right" in
-                    *:*) export PATH="$__aterm_left${__aterm_right#*:}" ;;
-                    *) export PATH="${__aterm_left%:}" ;;
-                esac
-                return 0
-            fi
-            case "$__aterm_right" in *:*) ;; *) return 0 ;; esac
-            __aterm_left="$__aterm_left$__aterm_entry:"
-            __aterm_right="${__aterm_right#*:}"
-        done
-    }
-    __aterm_old_bin_take_off() {
-        local __aterm_from="" __aterm_bin="${HOME-}/.aterm/bin"
-        if [[ -n "${__aterm_bin_from+x}" ]]; then
-            __aterm_from="$__aterm_bin_from"
-        elif [[ "${__aterm_fresh_load-}" == 1 && -n "${__aterm_si_dir-}" ]]; then
-            __aterm_from="$__aterm_si_dir/aterm_shell_integration.bash"
-        fi
-        [[ -n "$__aterm_from" && -d "$__aterm_bin" && ":${PATH-}:" == *":$__aterm_bin:"* ]] &&
-            command sh -c '
-                [ "$1" = - ] || grep -qF -e "$2" -- "$1" || exit 1
-                t=$(stat -f "%B %m" -- "$3") || t=$(stat -c "%W %Y" -- "$3") || exit 1
-                b=${t%% *}; m=${t##* }
-                case $m in ""|*[!0-9]*) exit 1 ;; esac
-                case $b in ""|*[!0-9]*|0) b=$m ;; esac
-                n=$(date +%s) || exit 1
-                e=$(ps -o etime= -p "$4") || exit 1
-                e=${e##* }; d=0
-                case $e in *-*) d=${e%%-*}; d=${d#0}; e=${e#*-} ;; esac
-                case $d$e in ""|*[!0-9:]*) exit 1 ;; esac
-                s=0; IFS=:
-                for x in $e; do x=${x#0}; s=$((s * 60 + ${x:-0})); done
-                [ $((b + ${d:-0} * 86400 + s + 1)) -lt "$n" ]
-            ' sh "$__aterm_from" "export PATH=\"\$HOME/.aterm/bin:\$PATH\"" "$__aterm_bin" "$$" \
-                2>/dev/null &&
-            __aterm_path_drop_first "$__aterm_bin"
-        return 0
-    }
-    __aterm_old_bin_take_off
-    unset -f __aterm_old_bin_take_off __aterm_path_drop_first
-    unset __aterm_bin_from
+    __aterm_old_bin_file="${BASH_SOURCE[0]%/*}/aterm_shell_integration_old_bin.bash"
+    if [[ -f "$__aterm_old_bin_file" && -O "$__aterm_old_bin_file" ]]; then
+        . "$__aterm_old_bin_file"
+    fi
+    unset __aterm_old_bin_file __aterm_bin_from
 fi
 
 # ─── The reroute directory, FIRST — and the agents directory beside it ───
@@ -535,6 +479,16 @@ fi
 # older native install. It is moved to the front first, then the reroute directory,
 # so PATH reads reroute, agents, … — the spawn seam's own order.
 __aterm_path_front() {
+    # Byte by byte (`LC_ALL=C`, as `__aterm_urlencode`): in a UTF-8 locale bash
+    # 3.2 (macOS's /bin/bash) matches a pattern in wide characters, converting
+    # the string again for every place it tries, so the substitution below was
+    # quadratic in PATH's length. Measured 2026-10-20 (bash 3.2.57, a PATH of 13
+    # entries and 561 bytes, as a captured spawn env holds it; 400 calls): 1.06
+    # ms a call, 0.22 ms in bytes; 1.65 and 0.33 ms with 23 entries and 771
+    # bytes. Every fresh bash calls it once before its first prompt, as the
+    # reroute directory comes back to the front from where /etc/profile's
+    # path_helper put it. A quoted literal matches the same entries either way.
+    local LC_ALL=C
     local __aterm_dir="$1" __aterm_p=":$PATH:" __aterm_q
     # Fixpoint by POSIX equality, not by `[[ == pattern ]]`: under
     # `shopt -s nocasematch` (a user's .bashrc runs before this file) the
@@ -1559,12 +1513,17 @@ __aterm_body_prompt_command() {
     # time, so all subsequent reads come from $__aterm_shell_nonce).
     if [[ -z "${__aterm_prompt_has_mark_b:-}" ]]; then
         local __aterm_b_suffix=""
-        [[ -n "$__aterm_shell_nonce" ]] && __aterm_b_suffix=";id=${__aterm_shell_nonce}"
+        # Signed, it says it stands where the buffer starts (`aterm_input=start`):
+        # it ends the prompt, and readline draws the line after it (aterm's
+        # typing prediction places Home, End, Ctrl-A, Ctrl-E and Delete only on a
+        # line started at a mark that says so).
+        [[ -n "$__aterm_shell_nonce" ]] && __aterm_b_suffix=";id=${__aterm_shell_nonce};aterm_input=start"
         local __aterm_b="\[\033]133;B${__aterm_b_suffix}\a\]"
         # Strip every previous variant (with or without a nonce suffix) so
         # nonce rotation does not leave stale id= tails on PS1. Only a suffix
-        # that is a whole mark goes: the last `\[\033]133;B`, then `\a\]` or
-        # `;id=<hex>\a\]` and nothing else. Found with QUOTED globs and cut by
+        # that is a whole mark goes: the last `\[\033]133;B`, then `\a\]`,
+        # `;id=<hex>\a\]` or `;id=<hex>;aterm_input=start\a\]` (the word this
+        # body signs, older bodies none) and nothing else. Found with QUOTED globs and cut by
         # LENGTH, never `${PS1%…}` or a regex: unquoted, the mark's backslashes
         # read as glob escapes; a regex matches nothing in a PS1 holding a byte
         # the tab's UTF-8 locale cannot decode (a Latin-1 `Gruß`); and bash 5's
@@ -1574,13 +1533,17 @@ __aterm_body_prompt_command() {
         # body sheds them all at its next prompt; each pass removes a non-empty
         # suffix, so it ends.
         local __aterm_b_lead='\[\033]133;B' __aterm_b_end='\a\]'
+        local __aterm_b_word=';aterm_input=start'
         local __aterm_b_tail __aterm_b_id
         while [[ "$PS1" == *"$__aterm_b_lead"* ]]; do
             __aterm_b_tail="${PS1##*"$__aterm_b_lead"}"
             if [[ "$__aterm_b_tail" != "$__aterm_b_end" ]]; then
                 [[ "$__aterm_b_tail" == ";id="?*"$__aterm_b_end" ]] || break
                 __aterm_b_id="${__aterm_b_tail:4:${#__aterm_b_tail}-4-${#__aterm_b_end}}"
-                [[ "$__aterm_b_id" != *[!0-9a-fA-F]* ]] || break
+                # The word after the id, cut by length like the rest.
+                [[ "$__aterm_b_id" == *"$__aterm_b_word" ]] &&
+                    __aterm_b_id="${__aterm_b_id:0:${#__aterm_b_id}-${#__aterm_b_word}}"
+                [[ -n "$__aterm_b_id" && "$__aterm_b_id" != *[!0-9a-fA-F]* ]] || break
             fi
             PS1="${PS1:0:${#PS1}-${#__aterm_b_lead}-${#__aterm_b_tail}}"
         done
@@ -1649,7 +1612,9 @@ __aterm_set_prompt() {
     # the env var — the env var is unset at source time to prevent leaks
     # into subprocesses.
     local mark_b_id=""
-    [[ -n "$__aterm_shell_nonce" ]] && mark_b_id=";id=${__aterm_shell_nonce}"
+    # Signed, it also says it stands where the buffer starts (see the PS1
+    # suffix above).
+    [[ -n "$__aterm_shell_nonce" ]] && mark_b_id=";id=${__aterm_shell_nonce};aterm_input=start"
     local mark_b="\[\033]133;B${mark_b_id}\a\]"
 
     case "$style" in

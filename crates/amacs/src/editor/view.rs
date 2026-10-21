@@ -12,10 +12,11 @@ use aterm_buffer::Seq;
 use aterm_grapheme::GraphemeClusters;
 
 use super::chord::KeyChord;
-use super::command::PrefixArgument;
+use super::command::{EditorCommand, PrefixArgument};
 use super::minibuffer::Minibuffer;
 use super::projection::{
     EditorLines, byte_at_editor_display_column, clamp_to_char_boundary, line_end, line_start,
+    line_text_end,
 };
 use crate::store::{DocumentId, DocumentViewId, EditDelta, rebase_position};
 
@@ -84,6 +85,13 @@ pub struct EditorBufferView {
     pub(super) chord_prefix: Vec<KeyChord>,
     pub(super) prefix_argument: Option<PrefixArgument>,
     pub(super) anchor_seq: Seq,
+    /// The command this view ran last (Emacs's `last-command`): a kill after
+    /// a kill joins it, and `C-l` after `C-l` moves on to the next place.
+    /// Typed text and a pointer press clear it.
+    pub(super) last_command: Option<EditorCommand>,
+    /// Where `C-l` last put the caret's line: the middle, the top, then the
+    /// bottom.
+    pub(super) recenter_phase: u8,
 }
 
 impl EditorBufferView {
@@ -103,11 +111,19 @@ impl EditorBufferView {
             chord_prefix: Vec::new(),
             prefix_argument: None,
             anchor_seq,
+            last_command: None,
+            recenter_phase: 0,
         }
     }
 
+    /// The primary selection: the one `primary` names, the last when `primary`
+    /// is past the end, and a caret at the start when a host left the view
+    /// with none (`selections` is public), rather than a panic.
     pub fn primary_selection(&self) -> &Selection {
-        &self.selections[self.primary.min(self.selections.len().saturating_sub(1))]
+        const NO_SELECTION: Selection = Selection::caret(0);
+        self.selections
+            .get(self.primary.min(self.selections.len().saturating_sub(1)))
+            .unwrap_or(&NO_SELECTION)
     }
 
     /// The document sequence this view's coordinates are expressed at.
@@ -163,7 +179,7 @@ impl EditorBufferView {
     ) -> bool {
         let before_anchor = self.viewport_anchor;
         let before_lines = self.viewport_lines;
-        self.viewport_lines = visible_lines.clamp(1, 256);
+        self.viewport_lines = visible_line_capacity(visible_lines);
         if before_lines == self.viewport_lines {
             let last_full_viewport_anchor = lines.total().saturating_sub(self.viewport_lines);
             let anchor = lines
@@ -181,7 +197,7 @@ impl EditorBufferView {
     }
 
     pub fn ensure_primary_visible_with(&mut self, lines: &EditorLines<'_>, visible_lines: usize) {
-        let visible_lines = visible_lines.clamp(1, 256);
+        let visible_lines = visible_line_capacity(visible_lines);
         self.viewport_lines = visible_lines;
         let caret_line = lines.number_at(self.primary_selection().head);
         let total_lines = lines.total();
@@ -220,8 +236,10 @@ impl EditorBufferView {
         let before = self.selections.clone();
         let before_primary = self.primary;
         if extend && !self.selections.is_empty() {
-            self.primary = self.primary.min(self.selections.len() - 1);
-            self.selections[self.primary].head = position;
+            self.primary = self.primary.min(self.selections.len().saturating_sub(1));
+            if let Some(selection) = self.selections.get_mut(self.primary) {
+                selection.head = position;
+            }
         } else {
             self.selections.clear();
             self.selections.push(Selection::caret(position));
@@ -232,6 +250,7 @@ impl EditorBufferView {
         self.chord_prefix.clear();
         self.prefix_hud = None;
         self.prefix_argument = None;
+        self.last_command = None;
         self.ensure_primary_visible(text, visible_lines);
         before_primary != self.primary || before != self.selections
     }
@@ -250,6 +269,7 @@ impl EditorBufferView {
         self.prefix_argument = None;
         self.minibuffer = Minibuffer::Inactive;
         self.mark_active = false;
+        self.last_command = None;
     }
 
     pub fn minibuffer_active(&self) -> bool {
@@ -259,7 +279,53 @@ impl EditorBufferView {
                 | Minibuffer::Search { .. }
                 | Minibuffer::Buffer { .. }
                 | Minibuffer::GotoLine { .. }
+                | Minibuffer::Prompt { .. }
         )
+    }
+
+    /// `recenter-top-bottom` (C-l): scroll so the primary caret's line sits
+    /// at the middle of the view, then, as the key repeats (`again`), at the
+    /// top, then at the bottom. `C-u N C-l` puts it at row `N` from the top
+    /// (a negative `N` counts up from the bottom), and a bare `C-u` at the
+    /// middle. The view never scrolls past its last full screen, so near the
+    /// end of a document the line sits as low as that allows.
+    pub(super) fn recenter_top_bottom(
+        &mut self,
+        lines: &EditorLines<'_>,
+        argument: Option<PrefixArgument>,
+        again: bool,
+    ) {
+        let height = self.viewport_lines();
+        let last_row = height.saturating_sub(1);
+        let row = match argument {
+            Some(PrefixArgument::Numeric { value, .. }) => {
+                let from_edge = usize::try_from(value.unsigned_abs()).unwrap_or(usize::MAX);
+                if value >= 0 {
+                    from_edge.min(last_row)
+                } else {
+                    height.saturating_sub(from_edge)
+                }
+            }
+            Some(PrefixArgument::Raw(_)) => height / 2,
+            None => {
+                self.recenter_phase = if again {
+                    self.recenter_phase.saturating_add(1) % 3
+                } else {
+                    0
+                };
+                match self.recenter_phase {
+                    0 => height / 2,
+                    1 => 0,
+                    _ => last_row,
+                }
+            }
+        };
+        let caret_line = lines.number_at(self.primary_selection().head);
+        let last_full_viewport_anchor = lines.total().saturating_sub(height);
+        let anchor = caret_line
+            .saturating_sub(row)
+            .min(last_full_viewport_anchor);
+        self.viewport_anchor = lines.byte_of(anchor);
     }
 
     pub fn chord_pending(&self) -> bool {
@@ -440,7 +506,12 @@ pub(super) fn previous_line_position(text: &str, position: usize, desired_column
     }
     let previous_end = current_start.saturating_sub(1);
     let previous_start = line_start(text, previous_end);
-    byte_at_editor_display_column(text, previous_start, previous_end, desired_column)
+    byte_at_editor_display_column(
+        text,
+        previous_start,
+        line_text_end(text, previous_start),
+        desired_column,
+    )
 }
 
 pub(super) fn next_line_position(text: &str, position: usize, desired_column: usize) -> usize {
@@ -450,7 +521,7 @@ pub(super) fn next_line_position(text: &str, position: usize, desired_column: us
         return position;
     }
     let next_start = current_end.saturating_add(1);
-    let next_end = line_end(text, next_start);
+    let next_end = line_text_end(text, next_start);
     byte_at_editor_display_column(text, next_start, next_end, desired_column)
 }
 
@@ -473,11 +544,78 @@ pub(super) fn repeat_line_motion(
     at
 }
 
+trust_contract_fn! {
+    /// How many lines a viewport holds when the renderer offers
+    /// `visible_lines`: at least one and at most 256, the clamp the view has
+    /// always applied (`visible_lines.clamp(1, 256)`).
+    #[expect(
+        clippy::manual_clamp,
+        reason = "Trust kernel-imports a select, not a call to `Ord::clamp` (E6 refuses calls)"
+    )]
+    fn visible_line_capacity(visible_lines: usize) -> usize
+    clauses [ensures result >= 1 && result <= 256 by visible_line_capacity_within_bounds
+             ensures visible_lines < 1 || visible_lines > 256 || result == visible_lines by visible_line_capacity_keeps_an_in_range_value]
+    {
+        if visible_lines < 1 {
+            1
+        } else if visible_lines > 256 {
+            256
+        } else {
+            visible_lines
+        }
+    }
+}
+
+// Specs `viewport-capacity-bounds` and `viewport-capacity-identity`
+// (SPECS.md), kernel-checked against the compiled body. On this target Trust
+// reads a `usize` as a `UInt64`; the proofs are the two case splits the body
+// makes.
+verify_island! {
+    clean {
+        theorem visible_line_capacity_one_le_cap : Nat.le (UInt64.toNat 1) (UInt64.toNat 256) := by
+          decide
+
+        theorem visible_line_capacity_within_bounds (visible_lines : UInt64) :
+            And (Nat.le (UInt64.toNat 1) (UInt64.toNat (trust_import_amacs__editor__view__visible_line_capacity visible_lines)))
+                (Nat.le (UInt64.toNat (trust_import_amacs__editor__view__visible_line_capacity visible_lines)) (UInt64.toNat 256)) :=
+          @Decidable.casesOn (LT.lt visible_lines 1)
+            (fun (d : Decidable (LT.lt visible_lines 1)) =>
+              And (Nat.le (UInt64.toNat 1) (UInt64.toNat (@ite UInt64 (LT.lt visible_lines 1) d 1 (@ite UInt64 (LT.lt 256 visible_lines) (instDecidableUInt64Lt 256 visible_lines) 256 visible_lines))))
+                  (Nat.le (UInt64.toNat (@ite UInt64 (LT.lt visible_lines 1) d 1 (@ite UInt64 (LT.lt 256 visible_lines) (instDecidableUInt64Lt 256 visible_lines) 256 visible_lines))) (UInt64.toNat 256)))
+            (instDecidableUInt64Lt visible_lines 1)
+            (fun (at_least_one : Not (LT.lt visible_lines 1)) =>
+              @Decidable.casesOn (LT.lt 256 visible_lines)
+                (fun (e : Decidable (LT.lt 256 visible_lines)) =>
+                  And (Nat.le (UInt64.toNat 1) (UInt64.toNat (@ite UInt64 (LT.lt 256 visible_lines) e 256 visible_lines)))
+                      (Nat.le (UInt64.toNat (@ite UInt64 (LT.lt 256 visible_lines) e 256 visible_lines)) (UInt64.toNat 256)))
+                (instDecidableUInt64Lt 256 visible_lines)
+                (fun (at_most_cap : Not (LT.lt 256 visible_lines)) => And.intro (Nat.ge_of_not_lt at_least_one) (Nat.ge_of_not_lt at_most_cap))
+                (fun (_ : LT.lt 256 visible_lines) => And.intro visible_line_capacity_one_le_cap (Nat.le_refl (UInt64.toNat 256))))
+            (fun (_ : LT.lt visible_lines 1) => And.intro (Nat.le_refl (UInt64.toNat 1)) visible_line_capacity_one_le_cap)
+
+        theorem visible_line_capacity_keeps_an_in_range_value (visible_lines : UInt64) :
+            Or (Or (LT.lt visible_lines 1) (LT.lt 256 visible_lines)) (Eq (trust_import_amacs__editor__view__visible_line_capacity visible_lines) visible_lines) :=
+          @Decidable.casesOn (LT.lt visible_lines 1)
+            (fun (d : Decidable (LT.lt visible_lines 1)) =>
+              Or (Or (LT.lt visible_lines 1) (LT.lt 256 visible_lines))
+                 (Eq (@ite UInt64 (LT.lt visible_lines 1) d 1 (@ite UInt64 (LT.lt 256 visible_lines) (instDecidableUInt64Lt 256 visible_lines) 256 visible_lines)) visible_lines))
+            (instDecidableUInt64Lt visible_lines 1)
+            (fun (_ : Not (LT.lt visible_lines 1)) =>
+              @Decidable.casesOn (LT.lt 256 visible_lines)
+                (fun (e : Decidable (LT.lt 256 visible_lines)) =>
+                  Or (Or (LT.lt visible_lines 1) (LT.lt 256 visible_lines)) (Eq (@ite UInt64 (LT.lt 256 visible_lines) e 256 visible_lines) visible_lines))
+                (instDecidableUInt64Lt 256 visible_lines)
+                (fun (_ : Not (LT.lt 256 visible_lines)) => Or.inr (Eq.refl visible_lines))
+                (fun (above : LT.lt 256 visible_lines) => Or.inl (Or.inr above)))
+            (fun (below : LT.lt visible_lines 1) => Or.inl (Or.inl below))
+    }
+}
+
 /// Clamp an externally supplied editor position to the preceding user-visible
 /// character boundary. Pointer mapping already emits these boundaries; keeping
 /// the reducer seam defensive prevents accessibility or a future adapter from
 /// installing a caret between a base, combining mark, emoji joiner, or flag RI.
-fn clamp_to_grapheme_boundary(text: &str, position: usize) -> usize {
+pub(super) fn clamp_to_grapheme_boundary(text: &str, position: usize) -> usize {
     let position = clamp_to_char_boundary(text, position);
     if position == 0 || position == text.len() {
         return position;
@@ -504,6 +642,28 @@ mod tests {
     use crate::editor::{EditorCommand, editor};
     use aterm_models_native::native_editor_viewport_model;
     use aterm_spec::interp::admits;
+
+    #[test]
+    fn visible_line_capacity_is_the_clamp_it_replaced() {
+        for lines in [0, 1, 2, 255, 256, 257, usize::MAX] {
+            assert_eq!(visible_line_capacity(lines), lines.clamp(1, 256));
+        }
+    }
+
+    /// `selections` is public, so a host can empty it; the primary selection
+    /// is then a caret at 0 (it used to panic), and an out-of-range `primary`
+    /// still names the last selection.
+    #[test]
+    fn primary_selection_of_an_emptied_view_is_a_caret_at_zero() {
+        let (_, _, mut view, _) = editor("alpha\nbeta");
+        view.selections = vec![Selection::caret(2), Selection::caret(7)];
+        view.primary = 9;
+        assert_eq!(view.primary_selection(), &Selection::caret(7));
+        view.selections.clear();
+        assert_eq!(view.primary_selection(), &Selection::caret(0));
+        view.primary = 0;
+        assert_eq!(view.primary_selection(), &Selection::caret(0));
+    }
 
     /// THE PAINTED VIEW IS THE STORED VIEW: reconciling an unchanged capacity
     /// (what every frame does on a copy) keeps a view scrolled away from the

@@ -54,6 +54,13 @@ pub fn row_guard(row: &str) -> String {
     out
 }
 
+/// `text` as a literal in the server's pattern syntax, as [`row_guard`]
+/// writes each character of a row: what a tape's scrub takes a name in
+/// within a press guard (`tape::corpus::Scrub`).
+pub(crate) fn literal(text: &str) -> String {
+    text.chars().map(escape_char).collect()
+}
+
 /// One character as a literal in the server's pattern syntax.
 fn escape_char(c: char) -> String {
     if c.is_ascii_alphanumeric() || c == '_' {

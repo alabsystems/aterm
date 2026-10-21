@@ -71,7 +71,7 @@ use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
     STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of, descendants_in, exe_of,
-    exit_status, held, ids, is_generation, ledger, line_status, load, lsof_holders,
+    exit_status, file_holders, held, ids, is_generation, ledger, line_status, load,
     lsof_open_files, managed_agent_twin, now_s, registry_graph, registry_life, roster,
     running_block, said, save, screen, shell_dialect_of, squash, started_ms, state_dir,
     store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
@@ -156,7 +156,7 @@ impl AgyKernel for Live {
     }
 
     fn holders_of(&self, file: &Path) -> Option<Vec<u32>> {
-        lsof_holders(file)
+        file_holders(file)
     }
 
     fn agy_resuming(&self, conversation: &str) -> Option<Vec<u32>> {
@@ -187,7 +187,7 @@ impl AgyKernel for Live {
             .map(|(pid, _, _)| pid)
             .collect();
         let mut out = Vec::new();
-        for pid in lsof_holders(&ag::conversation_db(config, conversation))?
+        for pid in file_holders(&ag::conversation_db(config, conversation))?
             .into_iter()
             .filter(|pid| agys.contains(pid))
         {

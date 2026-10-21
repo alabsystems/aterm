@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl [@<sel>] await inbox|agent …`: the inbox and agent waits,
-//! RE-ARMED past the server's bound
-//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §4).
+//! `aterm ctl [@<sel>] await inbox|agent|edit …`: the inbox, agent and edit
+//! waits, RE-ARMED past the server's bound
+//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §4; `await edit`,
+//! `docs/DESIGN-amacs-2026-10-19.md` §6.4).
 //!
 //! The server parks one `await` for its `timeout=` — 30 s when none is given,
 //! at most 600 s — and answers `OK timeout` at its end. A session that listens
@@ -12,13 +13,15 @@
 //! would wake it for no news. This client sends the request in LEGS, every
 //! other word as given (`await inbox`'s `since=`, `re=`, `kinds=`, `topic=`;
 //! `await agent`'s words and `since=`: each predicate latches only on what is
-//! past `since`, else on what stands, so each leg waits for the same answer),
+//! past `since`, else on what stands; `await edit`'s `ticket=` or `uri=`
+//! latches on the edit's one outcome, so each leg waits for the same answer),
 //! each asking for what the whole wait has left, up to the server's bound,
 //! until a leg answers or the whole wait's deadline passes: the verb's
 //! `timeout=<ms>` (or `timeout <ms>`), else `--timeout`, else an hour
 //! ([`await_task::DEFAULT_TOTAL`]), as `await task` does. The answering leg's
 //! line is printed as one exchange prints it (`OK inbox <id>`, `OK inbox
-//! hold=<0|1>`, `OK agent <word> rev=<n>`) on stdout, exit 0; an `ERR …` on
+//! hold=<0|1>`, `OK agent <word> rev=<n>`, `OK edit done …`) on stdout, exit
+//! 0; an `ERR …` on
 //! stderr, exit 1; `OK timeout` on stdout, exit 124, at the deadline. A leg
 //! whose server hung up before it answered is judged as any blocking read's
 //! ([`replaced_before_reply`]): a successor is asked for the rest of the wait
@@ -34,7 +37,7 @@ use super::{
     stderr_line, validate_request_line_len,
 };
 
-/// A re-armed `[@<sel>] await inbox|agent …`: the request every leg sends,
+/// A re-armed `[@<sel>] await inbox|agent|edit …`: the request every leg sends,
 /// its timeout words taken out, and the whole wait the verb's own timeout
 /// names.
 #[derive(Debug, PartialEq, Eq)]
@@ -51,7 +54,7 @@ fn parse(parts: &[String]) -> Option<Wait> {
     if parts.get(at).map(String::as_str) != Some("await")
         || !matches!(
             parts.get(at + 1).map(String::as_str),
-            Some("inbox" | "agent")
+            Some("inbox" | "agent" | "edit")
         )
     {
         return None;
@@ -85,7 +88,7 @@ fn parse(parts: &[String]) -> Option<Wait> {
     })
 }
 
-/// Whether `parts` is an `await inbox|agent` this client re-arms
+/// Whether `parts` is an `await inbox|agent|edit` this client re-arms
 /// ([`parse`]).
 pub(crate) fn is_rearmed_await(parts: &[String]) -> bool {
     parse(parts).is_some()
@@ -253,7 +256,9 @@ fn wait_legs(
                 );
             }
             Leg::HostGone { pid, sock: host } => {
-                let policy = follow.host(&host, redial::target_sid(&wait.parts));
+                let joined = wait.parts.join(" ");
+                let sid = redial::target_sid(&joined);
+                let policy = follow.host(&host, sid.map(|sid| sid.as_str()));
                 let again = |next: &str| {
                     wait_legs(
                         wait,
@@ -278,7 +283,7 @@ fn wait_legs(
     }
 }
 
-/// `[@<sel>] await inbox|agent …`: the whole re-armed wait ([the
+/// `[@<sel>] await inbox|agent|edit …`: the whole re-armed wait ([the
 /// module](self)). `sock` is the socket the call resolves to and `origin`
 /// how, `total` the explicit `--timeout` when one was given (`Some(None)`:
 /// `--timeout 0`, no deadline).
@@ -292,7 +297,7 @@ pub(crate) fn run_rearmed_await(
     let wait = parse(parts).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "not an `await inbox|agent` request",
+            "not an `await inbox|agent|edit` request",
         )
     })?;
     let total = match (wait.timeout, total) {
@@ -320,7 +325,7 @@ mod tests {
         line.split_whitespace().map(String::from).collect()
     }
 
-    /// The re-armed forms: `await inbox` and `await agent`, a leading
+    /// The re-armed forms: `await inbox`, `await agent` and `await edit`, a leading
     /// selector or none, the timeout as `timeout=<ms>` or `timeout <ms>`
     /// taken out of the words every leg sends, the rest kept as given.
     /// NEGATIVE CONTROLS: another `await`, a timeout that is no number, and
@@ -356,6 +361,22 @@ mod tests {
             Some(Wait {
                 parts: parts("@s-ab await agent idle,prompt since=7"),
                 timeout: Some(Duration::from_secs(900)),
+            })
+        );
+        // An edit's wait, by ticket or by file (the `amacs` client runs its
+        // own legs, with no total limit: `crate::edit`).
+        assert_eq!(
+            parse(&parts("@s-ab await edit ticket=7 timeout=900000")),
+            Some(Wait {
+                parts: parts("@s-ab await edit ticket=7"),
+                timeout: Some(Duration::from_secs(900)),
+            })
+        );
+        assert_eq!(
+            parse(&parts("await edit uri=file:///tmp/x")),
+            Some(Wait {
+                parts: parts("await edit uri=file:///tmp/x"),
+                timeout: None,
             })
         );
         for refused in [

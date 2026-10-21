@@ -213,17 +213,18 @@ fn boot(tag: &str, harness: &str) -> Instance {
 /// reads and a shipped binary never compiles). They pin WHAT happens at the
 /// idle point (the notice, READY, the restart, the fresh start, the hand on
 /// the tab), and the product's 20 s was 20 of each one's 26-32 s run alone
-/// (2026-10-06). Twice the loop's own idle window (`supervise`'s `IDLE_MS`,
-/// 2 s), so a look at an idle point the session has just reached still waits
-/// `settling` and the look one first rung later takes the step, as in the
-/// product (the journal of
-/// [`a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed`]:
-/// `wait:settling`, then `done:fresh` 5.4 s later, one 4 s rung where the
-/// product's is 20 s). The settle's own length is the unit tests'
+/// (2026-10-06). Long enough that the look at an idle point the session has
+/// just reached still waits `settling` — that look comes under a second after
+/// the session's first idle verdict (the activation test's journal alone,
+/// 2026-10-19: 0.8 s, at a load of 40 and at 90) — and a look one rung later
+/// (the first rung is the settle, `upgrade_drive::first_look`) takes the
+/// step, as in the product, where every rung is 20 s. From that idle verdict
+/// to `announced:1` the activation test took 8.5 s at 4 s and takes 4.8 s
+/// here (the same journals). The settle's own length is the unit tests'
 /// (`aterm_agent::harness::upgrade`): a live race of a first prompt against
 /// the product's settle is timing-bound, and no live test runs one.
 #[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
-const SHORT_SETTLE_S: u64 = 4;
+const SHORT_SETTLE_S: u64 = 2;
 
 /// [`boot`] for a test of the live upgrade: its settle `settle_s` seconds
 /// ([`SHORT_SETTLE_S`]), or the product's for `None`.
@@ -350,7 +351,25 @@ fn boot_session(inst: &Instance) -> String {
 }
 
 fn status(inst: &Instance) -> String {
-    ctl_ok(inst, &[&format!("@{}", inst.sid), "status"])
+    status_of(inst, &inst.sid)
+}
+
+/// The `status` of the instance's session `sid` (a tab [`spawn_tab`] opened,
+/// or the boot session's).
+fn status_of(inst: &Instance, sid: &str) -> String {
+    ctl_ok(inst, &[&format!("@{sid}"), "status"])
+}
+
+/// Open a tab of the instance's own (`spawn`, its shell `SHELL=/bin/sh` as
+/// the boot session's) and return its sid: a session the host supervises as it
+/// does the boot session, so independent runs of the fake go side by side
+/// ([`start_fake_in`]).
+fn spawn_tab(inst: &Instance) -> String {
+    let body = ctl_ok(inst, &["spawn"]);
+    body.split_whitespace()
+        .find(|w| w.starts_with("s-"))
+        .unwrap_or_else(|| panic!("spawn names its sid: {body}"))
+        .to_string()
 }
 
 fn meta(inst: &Instance) -> String {
@@ -1055,6 +1074,11 @@ fn let_go_once_looked(inst: &Instance, keys: &str, mark: usize, blank: bool) -> 
 /// only once it reads `program=claude`: without the cell, that read held the
 /// run at its hang detector.
 fn start_fake(inst: &Instance, keys: &str, screens: &[&str]) {
+    start_fake_in(inst, &inst.sid, keys, screens);
+}
+
+/// [`start_fake`] in the instance's session `sid` ([`spawn_tab`]).
+fn start_fake_in(inst: &Instance, sid: &str, keys: &str, screens: &[&str]) {
     let tmp = inst.tmp.display();
     let scenes: Vec<String> = screens.iter().map(|s| format!("{tmp}/sc/{s}")).collect();
     let line = format!(
@@ -1063,7 +1087,7 @@ fn start_fake(inst: &Instance, keys: &str, screens: &[&str]) {
         fake_path(&inst.tmp).display(),
         scenes.join(" ")
     );
-    let sel = format!("@{}", inst.sid);
+    let sel = format!("@{sid}");
     ctl_ok(inst, &[&sel, "send", &line]);
     ctl_ok(inst, &[&sel, "key", "enter"]);
 }
@@ -1188,10 +1212,15 @@ fn keys_until(inst: &Instance, log: &str, want: &[&str], within: Duration) {
 
 /// Wait for the session's program to be `want` (the fake started or ended).
 fn program_is(inst: &Instance, want: &str, within: Duration) -> String {
+    program_in_is(inst, &inst.sid, want, within)
+}
+
+/// [`program_is`] of the instance's session `sid`.
+fn program_in_is(inst: &Instance, sid: &str, want: &str, within: Duration) -> String {
     until(
         within,
-        &format!("program={want}"),
-        || status(inst),
+        &format!("{sid}: program={want}"),
+        || status_of(inst, sid),
         |s| field(s, "program") == Some(want),
     )
 }
@@ -1699,41 +1728,65 @@ fn the_host_answers_what_the_policy_proves_safe() {
 /// survey: over a busy worker the server's verdict stays `busy` (the card used
 /// to hide the status row, so the worker read idle and the host typed into it),
 /// and the person's own key reaches the fake.
+///
+/// Each card is a run of its own in a tab of its own ([`spawn_tab`]), all
+/// side by side under the one host: each card's `0` waits out the card's own
+/// settle (`aterm_agent::supervise`'s `SURVEY_SETTLE`) and its landing, so in
+/// one tab, one after another, the seven runs waited out each in turn.
 #[test]
 fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_under_any_card() {
     // A tag of its own: two tests booting under one tag share a scratch world.
     let inst = boot("z", "");
-    for (log, screen) in [
+    let cards = [
         ("k1", "card-long.txt"),
         ("k2", "card-plugin.txt"),
         ("k3", "card-memory.txt"),
         ("k4", "card-busy.txt"),
-    ] {
-        run_fake(&inst, log, &[screen]);
-        keys_until(&inst, log, &["0"], HANG);
-        program_is(&inst, "sh", HANG);
-    }
+    ];
     // The drafts card, the transcript-share ask and the web-setup offer over a busy worker
     // (a workflow wait: no busy footer): the server's verdict is busy — the card
     // does not hide the status row — and the person's own key reaches the fake.
     // What the host does at a busy verdict (types nothing) is the supervise
     // loop's decision, judged in aterm-agent, not over a live window.
-    for (log, screen, what) in [
+    let busy = [
         ("k5", "drafts-busy.txt", "the drafts card"),
         ("k6", "ask-busy.txt", "the transcript-share ask"),
         ("k7", "web-setup-busy.txt", "the web-setup offer"),
-    ] {
-        run_fake(&inst, log, &[screen]);
-        until(
-            HANG,
-            &format!("agent=busy under {what}"),
-            || status(&inst),
-            |s| field(s, "agent") == Some("busy"),
-        );
-        ctl_ok(&inst, &[&format!("@{}", inst.sid), "key", "z"]);
-        keys_until(&inst, log, &["z"], HANG);
-        program_is(&inst, "sh", HANG);
-    }
+    ];
+    // The boot session takes the first run; every other run a tab of its own.
+    let tabs: Vec<String> = std::iter::once(inst.sid.clone())
+        .chain((1..cards.len() + busy.len()).map(|_| spawn_tab(&inst)))
+        .collect();
+    let (card_tabs, busy_tabs) = tabs.split_at(cards.len());
+    let inst = &inst;
+    std::thread::scope(|scope| {
+        let mut runs = Vec::new();
+        for ((log, screen), sid) in cards.into_iter().zip(card_tabs) {
+            runs.push(scope.spawn(move || {
+                start_fake_in(inst, sid, log, &[screen]);
+                keys_until(inst, log, &["0"], HANG);
+                program_in_is(inst, sid, "sh", HANG);
+            }));
+        }
+        for ((log, screen, what), sid) in busy.into_iter().zip(busy_tabs) {
+            runs.push(scope.spawn(move || {
+                start_fake_in(inst, sid, log, &[screen]);
+                until(
+                    HANG,
+                    &format!("agent=busy under {what}"),
+                    || status_of(inst, sid),
+                    |s| field(s, "agent") == Some("busy"),
+                );
+                ctl_ok(inst, &[&format!("@{sid}"), "key", "z"]);
+                keys_until(inst, log, &["z"], HANG);
+                program_in_is(inst, sid, "sh", HANG);
+            }));
+        }
+        for run in runs {
+            run.join()
+                .unwrap_or_else(|why| std::panic::resume_unwind(why));
+        }
+    });
 }
 
 /// Under the owner's `approve = "safe"` (full power, the default, answers
@@ -2460,22 +2513,24 @@ fn now_ms() -> u128 {
 }
 
 /// The stamp (`"t"`, [`now_ms`]'s clock) of the session journal's first
-/// record that contains `needle`: when the host did it. Panics, naming the
-/// journal, when no record does.
+/// record that contains `needle`: when the host did it. Waited for: the host
+/// journals a step after it acts (an approval's `APPROVED` follows its key,
+/// so the fake can read the key first), and a record that must come is a
+/// minute's hang detector. Panics, naming the journal, when none came.
 #[track_caller]
 fn journaled_at(inst: &Instance, needle: &str) -> u128 {
-    let journal = journal(inst);
-    journal
-        .lines()
-        .find(|l| l.contains(needle))
-        .and_then(|l| {
+    let mut last = String::new();
+    let at = aterm_spec::wait::within(HANG, Duration::from_millis(20), || {
+        last = journal(inst);
+        last.lines().find(|l| l.contains(needle)).and_then(|l| {
             l.strip_prefix("{\"t\":")?
                 .split(',')
                 .next()?
                 .parse::<u128>()
                 .ok()
         })
-        .unwrap_or_else(|| panic!("no journal record holds {needle:?}:\n{journal}"))
+    });
+    at.unwrap_or_else(|| panic!("no journal record holds {needle:?} within {HANG:?}:\n{last}"))
 }
 
 /// The session's loop journal (`<sid>.journal.jsonl`): a host's step is a

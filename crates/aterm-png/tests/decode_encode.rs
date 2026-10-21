@@ -129,13 +129,15 @@ fn corpus() -> Vec<PathBuf> {
 }
 
 /// Whether the corpus walk stays out of the directory `name` inside `parent`:
-/// `target` and `.git` at any depth, and at the repository root every
-/// `target-*` sibling build dir (`target-trust`, older lanes' leftovers) and a
-/// leftover `.aterm-verify` state dir, which the checked-in .gitignore names as
-/// `/target-*` and `/.aterm-verify/`.
+/// `target`, `.git` and every `*.noindex` build dir a tool chose
+/// (`libc-oracle/target.noindex`) at any depth, and at the repository root every
+/// `target-*` sibling build dir (`target-trust.noindex`, older lanes' leftovers)
+/// and a leftover `.aterm-verify` state dir, which the checked-in .gitignore names
+/// as `/target-*` and `/.aterm-verify/`.
 fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
     name == "target"
         || name == ".git"
+        || name.ends_with(".noindex")
         || (parent == root && (name.starts_with("target-") || name == ".aterm-verify"))
 }
 
@@ -960,6 +962,49 @@ fn illegal_chunk_orderings_are_refused() {
     assert_eq!(mine.pixels, vec![255, 0, 0, 0, 255, 0]);
 }
 
+/// Every chunk the encoder writes carries the CRC this file's own bitwise
+/// `crc32` computes. The encoder and decoder share one `Crc32` (astream-wire's
+/// fold), so a round trip alone could not see them agree on a wrong CRC; the
+/// independent reference can. A stored CRC one bit off is then refused as
+/// `BadCrc` naming its chunk, under every transform. Negative control: the same
+/// bytes with the CRC left alone decode to the pixels written.
+#[test]
+fn encoded_chunk_crcs_match_an_independent_crc_and_a_flipped_one_is_refused() {
+    let pixels: Vec<u8> = (0u8..18).map(|b| b.wrapping_mul(29)).collect();
+    let png = encode(aterm_png::ColorType::Rgb, 3, 2, &pixels);
+    let be32 = |at: usize| u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]);
+    let mut at = 8;
+    let mut kinds = Vec::new();
+    while at < png.len() {
+        let len = be32(at) as usize;
+        // The CRC covers the type tag and the data, not the length.
+        let tagged = &png[at + 4..at + 8 + len];
+        let kind = String::from_utf8_lossy(&tagged[..4]).into_owned();
+        assert_eq!(be32(at + 8 + len), crc32(tagged), "chunk {kind}");
+        kinds.push(kind);
+        at += 12 + len;
+    }
+    assert_eq!(at, png.len(), "the chunks tile the file");
+    assert_eq!(kinds.first().map(String::as_str), Some("IHDR"));
+    assert!(kinds.iter().any(|k| k == "IDAT"), "{kinds:?}");
+    assert_eq!(kinds.last().map(String::as_str), Some("IEND"));
+
+    let mine = decode_mine(&png, Mode::Identity).expect("the encoder's own output decodes");
+    assert_eq!(mine.pixels, pixels);
+
+    // IHDR's stored CRC starts at byte 29: the 8-byte signature, then its
+    // 4-byte length, 4-byte tag and 13 bytes of data.
+    let mut flipped = png.clone();
+    flipped[8 + 4 + 4 + 13] ^= 0x01;
+    for (mode, mode_name) in ALL_MODES {
+        assert_eq!(
+            decode_mine(&flipped, mode),
+            Err("CRC mismatch in chunk IHDR".to_string()),
+            "[{mode_name}]"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encoder round trips
 // ---------------------------------------------------------------------------
@@ -1090,5 +1135,137 @@ fn srgb_intent_round_trips() {
     assert_eq!(
         reader.info().srgb,
         Some(aterm_png::SrgbRenderingIntent::Perceptual),
+    );
+}
+
+/// Seeded RGBA8 pixels, `w` x `h`.
+fn seeded_rgba(w: u32, h: u32, seed: u32) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..w as usize * h as usize * 4)
+        .map(|i| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Half the bytes a gradient, half noise: both filter kinds win rows.
+            if (i / 4096) % 2 == 0 {
+                (i % 251) as u8
+            } else {
+                (state >> 24) as u8
+            }
+        })
+        .collect()
+}
+
+/// An RGBA8 sRGB encoder ready for its pixels.
+fn rgba_writer(out: &mut Vec<u8>, w: u32, h: u32) -> aterm_png::Writer<&mut Vec<u8>> {
+    let mut encoder = aterm_png::Encoder::new(out, w, h);
+    encoder.set_color(aterm_png::ColorType::Rgba);
+    encoder.set_depth(aterm_png::BitDepth::Eight);
+    encoder.set_source_srgb(aterm_png::SrgbRenderingIntent::Perceptual);
+    encoder.write_header().expect("header")
+}
+
+/// ROWS AND A SLICE ARE ONE ENCODER. Rows handed in one at a time write the
+/// same file, byte for byte, as the whole buffer, at widths 1, 3, 17 and 256
+/// (the last spans several `IDAT` chunks), and the file decodes to the pixels.
+/// NEGATIVE CONTROL: a row one byte short, or one byte long, is refused as
+/// `WrongDataSize` naming that row, and the writer then refuses to close the
+/// incomplete file.
+#[test]
+fn write_rows_is_byte_identical_to_write_image_data() {
+    for (w, h) in [(1u32, 5u32), (3, 7), (17, 33), (256, 300)] {
+        let rgba = seeded_rgba(w, h, w * 7919 + h);
+        let stride = w as usize * 4;
+
+        let mut sliced = Vec::new();
+        let mut writer = rgba_writer(&mut sliced, w, h);
+        writer.write_image_data(&rgba).expect("slice");
+        writer.finish().expect("finish");
+
+        let mut rowed = Vec::new();
+        let mut writer = rgba_writer(&mut rowed, w, h);
+        writer
+            .write_rows(|y, row| row.extend_from_slice(&rgba[y * stride..(y + 1) * stride]))
+            .expect("rows");
+        writer.finish().expect("finish");
+
+        assert_eq!(rowed, sliced, "{w}x{h}: rows and slice write one file");
+        let back = decode_mine(&rowed, Mode::Identity).expect("decodes");
+        assert_eq!(back.pixels, rgba, "{w}x{h}: the pixels round-trip");
+    }
+
+    for delta in [-1isize, 1] {
+        let (w, h) = (17u32, 4u32);
+        let rgba = seeded_rgba(w, h, 3);
+        let stride = w as usize * 4;
+        let mut out = Vec::new();
+        let mut writer = rgba_writer(&mut out, w, h);
+        let error = writer
+            .write_rows(|y, row| {
+                let mut len = stride;
+                if y == 2 {
+                    len = len.saturating_add_signed(delta);
+                }
+                row.extend_from_slice(&rgba[y * stride..][..len]);
+            })
+            .expect_err("a row of the wrong length is refused");
+        assert_eq!(
+            error,
+            aterm_png::EncodingError::WrongDataSize {
+                expected: stride,
+                got: stride.saturating_add_signed(delta),
+            },
+            "delta {delta}"
+        );
+        assert!(
+            matches!(writer.finish(), Err(aterm_png::EncodingError::Parameter(_))),
+            "delta {delta}: an incomplete file is not closed as if whole"
+        );
+    }
+}
+
+/// [`aterm_png::max_encoded_len`] bounds every file the encoder writes, and is
+/// not vacuous: incompressible noise, the worst case for a fixed-Huffman
+/// stream, lands within a tenth of it.
+#[test]
+fn max_encoded_len_bounds_every_encode() {
+    let mut state = 0xDEAD_BEEFu32;
+    for (w, h) in [(1u32, 1u32), (2, 3), (64, 64), (300, 200)] {
+        let noise: Vec<u8> = (0..w as usize * h as usize * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        for pixels in [noise, vec![0u8; w as usize * h as usize * 4]] {
+            let mut out = Vec::new();
+            let mut writer = rgba_writer(&mut out, w, h);
+            writer.write_image_data(&pixels).expect("data");
+            writer.finish().expect("finish");
+            let bound = aterm_png::max_encoded_len(w, h, aterm_png::ColorType::Rgba)
+                .expect("the geometry fits");
+            assert!(out.len() <= bound, "{w}x{h}: {} > {bound}", out.len());
+        }
+    }
+    let (w, h) = (300u32, 200u32);
+    let noise: Vec<u8> = (0..w as usize * h as usize * 4)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut writer = rgba_writer(&mut out, w, h);
+    writer.write_image_data(&noise).expect("data");
+    writer.finish().expect("finish");
+    let bound = aterm_png::max_encoded_len(w, h, aterm_png::ColorType::Rgba).unwrap();
+    assert!(
+        out.len() * 10 >= bound * 9,
+        "noise wrote {} of a {bound}-byte bound",
+        out.len()
     );
 }

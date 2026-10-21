@@ -287,6 +287,7 @@ impl Rig {
             line: None,
             create: false,
             for_word: None,
+            wait: true,
         }
     }
 

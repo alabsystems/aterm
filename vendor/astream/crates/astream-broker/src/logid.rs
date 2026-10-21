@@ -28,13 +28,14 @@
 //!
 //! # Where it lives, and when it changes
 //!
-//! In a sidecar beside the log, `<log>.id`: a CRC frame holding the identity and what
-//! the open that wrote it saw (the retention base, the head, and a fingerprint of the
-//! newest record's stored frame) — and, since FORMAT 2, how the run that wrote it stood
-//! with the log (serving, stopped cleanly, a flush failed, or cutting), the tier it
-//! served, its boot, whether the log was on the boot volume, the DURABLE FLOOR (a head
-//! the log is flushed in full through) and the lineage. It is written atomically (tmp
-//! file, fsync, rename, directory fsync) during [`BrokerLog`](crate::BrokerLog)'s open,
+//! In a sidecar beside the log, `<log>.id` ([`identity_path`]): a CRC frame holding the
+//! identity and what the open that wrote it saw (the retention base, the head, and a
+//! fingerprint of the newest record's stored frame) — and, since FORMAT 2, how the run
+//! that wrote it stood with the log (serving, stopped cleanly, a flush failed, or
+//! cutting), the tier it served, its boot, whether the log was on the boot volume, the
+//! DURABLE FLOOR (a head the log is flushed in full through) and the lineage. It is
+//! written atomically (tmp file, fsync, rename, directory fsync) during
+//! [`BrokerLog`](crate::BrokerLog)'s open,
 //! BEFORE the open returns, so no client can be told an identity that a crash then
 //! loses — in two phases: before a cut that removes written bytes (the moved identity,
 //! so the cut cannot outlive its announcement) and after the open's own fsync (the run
@@ -531,6 +532,41 @@ impl Lineage {
         &self.steps
     }
 
+    /// The lineage of these `(generation, common)` steps, oldest first: exactly the one a
+    /// `Hello` answer carrying them decodes to (`Client::log_lineage`), and `None` for
+    /// steps that decoder refuses — more than [`MAX`](Self::MAX), or generations that do
+    /// not rise. The two rules are the wire's own (`validate_lineage_wire`); nothing else
+    /// is checked, because the decoder checks nothing else: a `common` is any offset.
+    ///
+    /// WHY IT IS PUBLIC. A reader that keeps offsets outside the log — an embedder's
+    /// bridge, a cursor file — has to be tested against lineages no single real unclean
+    /// open makes: a chain longer than one reboot's, a step missing, a window outrun,
+    /// commons that fall. Without this the one door outside the crate was the `Hello`
+    /// answer, so such a test hand-encoded the extension block (tag `0x02`, its length,
+    /// the steps) and parsed it back through `proto::decode_response`, which pins a
+    /// private layout in someone else's test. This grants nothing new: any broker, or any
+    /// bytes a client parses, can already tell a client every lineage the decoder accepts.
+    /// What a lineage MEANS stays the broker's to say — only an open records one in
+    /// `<log>.id`, and nothing here writes it.
+    #[must_use]
+    pub fn from_steps(steps: &[(u64, u64)]) -> Option<Lineage> {
+        if steps.len() > Self::MAX {
+            return None;
+        }
+        let mut prev: Option<u64> = None;
+        for &(g, _) in steps {
+            if let Some(p) = prev {
+                if g <= p {
+                    return None;
+                }
+            }
+            prev = Some(g);
+        }
+        Some(Lineage {
+            steps: steps.to_vec(),
+        })
+    }
+
     /// This lineage with the step to `generation` added (`common` the recovered head):
     /// every older step is clamped to `common` too — the log now agrees with an older
     /// generation at most as far as it agrees with the newest — and only the newest
@@ -936,8 +972,19 @@ const fn split_sidecar_v2_ext(raw: &[u8]) -> Option<(SidecarV2ExtFields, &[u8])>
     Some((fields, lineage_wire))
 }
 
-/// The identity sidecar's path for a log at `path`: `<log>.id`.
-pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
+/// The identity sidecar beside the log at `path`: `<log>.id`, the file the module docs
+/// describe — what [`health_path`](crate::health_path) is to `<log>.health`.
+///
+/// Public so that nothing outside astream spells the name itself: a tool that copies or
+/// restores a log WITH its sidecar (the honest boundary above says what that keeps), and
+/// a test that reads its bytes to show an open refused before it rewrote anything. Its
+/// CONTENTS are astream's and change by FORMAT; read them through an open, never
+/// parse or write them. A test that needs a run that stopped uncleanly arms
+/// [`Broker::arm_unclean_stop`](crate::Broker::arm_unclean_stop) instead of writing the
+/// sidecar back, and one that needs a lineage builds it with
+/// [`Lineage::from_steps`].
+#[must_use]
+pub fn identity_path(path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     p.as_mut_os_string().push(".id");
     p
@@ -1145,7 +1192,7 @@ impl Prior {
 /// stderr, since the log then takes a new identity); an I/O error otherwise.
 pub(crate) fn read(dir: &Dir) -> io::Result<Prior> {
     let log = dir.log_path();
-    let path = sidecar_path(log);
+    let path = identity_path(log);
     let bytes = match dir.read_id() {
         Ok(Some(b)) => b,
         Ok(None) => return Ok(Prior::Absent),
@@ -1189,7 +1236,7 @@ pub(crate) fn write(dir: &Dir, sidecar: &Sidecar) -> io::Result<()> {
             format!(
                 "cannot record the identity of {} in {}: {e}",
                 dir.log_path().display(),
-                sidecar_path(dir.log_path()).display()
+                identity_path(dir.log_path()).display()
             ),
         )),
     }
@@ -1459,6 +1506,21 @@ impl<'a> Iterator for Frames<'a> {
 /// is the header's `u32` at bytes 4..8 (the layout `astream_wire::frame` documents).
 fn frames(bytes: &[u8]) -> Frames<'_> {
     Frames { bytes, pos: 0 }
+}
+
+/// The first of `bytes`' stored frames, header and payload as stored, or `None` when it
+/// holds none: what an interrupted compaction is judged by at the next open
+/// (`compact.rs`).
+#[cfg(feature = "retention")]
+pub(crate) fn first_frame(bytes: &[u8]) -> Option<&[u8]> {
+    frames(bytes).next()
+}
+
+/// A stored frame's [`fingerprint`], for the compaction intent's identities
+/// (`compact.rs`).
+#[cfg(feature = "retention")]
+pub(crate) fn frame_fingerprint(frame: &[u8]) -> [u8; 16] {
+    fingerprint(frame)
 }
 
 /// Where the last of `bytes`' stored frames starts, or `None` when it holds none.
@@ -1850,6 +1912,129 @@ mod tests {
         }
         .put(&mut falling);
         assert_eq!(Lineage::from_wire(&falling), None, "generations must rise");
+    }
+
+    /// Step lists for the `from_steps` sweep: EVERY list of up to four steps over
+    /// generations {0, 1, 2, u64::MAX} (equal, falling and rising neighbours, the ends of
+    /// the range), each with commons that rise, fall and sit at both ends; and, for every
+    /// length up to two past [`Lineage::MAX`], the rising chain `1..=n` alone and with
+    /// each neighbour made equal and made to fall — the only lists that reach the cap,
+    /// since a small alphabet cannot rise that far.
+    fn step_lists() -> Vec<Vec<(u64, u64)>> {
+        const GENS: [u64; 4] = [0, 1, 2, u64::MAX];
+        let commons = |i: usize| -> u64 {
+            match i % 3 {
+                0 => 0,
+                1 => u64::MAX,
+                _ => 7 - i as u64,
+            }
+        };
+        let mut lists: Vec<Vec<(u64, u64)>> = vec![Vec::new()];
+        let mut frontier: Vec<Vec<u64>> = vec![Vec::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for gens in &frontier {
+                for g in GENS {
+                    let mut longer = gens.clone();
+                    longer.push(g);
+                    lists.push(
+                        longer
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &g)| (g, commons(i)))
+                            .collect(),
+                    );
+                    next.push(longer);
+                }
+            }
+            frontier = next;
+        }
+        for n in 1..=Lineage::MAX + 2 {
+            let chain: Vec<(u64, u64)> = (1..=n as u64).map(|g| (g, 100 - g)).collect();
+            lists.push(chain.clone());
+            for i in 1..n {
+                let mut equal = chain.clone();
+                equal[i].0 = equal[i - 1].0;
+                lists.push(equal);
+                let mut falling = chain.clone();
+                falling[i].0 = 0;
+                lists.push(falling);
+            }
+        }
+        lists
+    }
+
+    /// The decoder's answer for `steps`: their wire form, built by hand from the layout
+    /// the extension block's table documents (`n u8`, then `n × (generation u64 LE,
+    /// common u64 LE)`) rather than by `Lineage::put`, read by `Lineage::from_wire` — the
+    /// function every `Hello` answer's lineage entry goes through.
+    fn decoded(steps: &[(u64, u64)]) -> Option<Lineage> {
+        let mut wire = vec![u8::try_from(steps.len()).unwrap()];
+        for &(g, c) in steps {
+            wire.extend_from_slice(&g.to_le_bytes());
+            wire.extend_from_slice(&c.to_le_bytes());
+        }
+        Lineage::from_wire(&wire)
+    }
+
+    /// `Lineage::from_steps` builds exactly the lineage the wire decoder reads from the
+    /// same steps, and refuses exactly what the decoder refuses, over every list of
+    /// [`step_lists`]: both of the decoder's rules are met (lists past the cap, lists whose
+    /// generations do not rise) and so are lists it accepts, short and at the cap.
+    ///
+    /// Negative controls, on the same sweep: a constructor that skips the cap and one
+    /// that skips the rising rule each disagree with the decoder, so the sweep reaches
+    /// both rules and a `from_steps` that lost either would fail it.
+    #[test]
+    fn from_steps_agrees_with_the_decoder() {
+        /// How many of `lists` `build` answers otherwise than the decoder.
+        fn disagreements(
+            lists: &[Vec<(u64, u64)>],
+            build: impl Fn(&[(u64, u64)]) -> Option<Lineage>,
+        ) -> usize {
+            lists
+                .iter()
+                .filter(|steps| build(steps) != decoded(steps))
+                .count()
+        }
+        let lists = step_lists();
+        assert_eq!(disagreements(&lists, Lineage::from_steps), 0);
+        let accepted = lists.iter().filter(|s| decoded(s).is_some()).count();
+        assert!(
+            accepted > 0 && accepted < lists.len(),
+            "the sweep holds lists the decoder accepts and lists it refuses"
+        );
+        assert!(
+            lists
+                .iter()
+                .any(|s| s.len() == Lineage::MAX && decoded(s).is_some()),
+            "a lineage at the cap is accepted"
+        );
+        for steps in &lists {
+            if let Some(l) = Lineage::from_steps(steps) {
+                assert_eq!(l.steps(), &steps[..], "the steps, as given");
+            }
+        }
+
+        let rises = |steps: &[(u64, u64)]| steps.windows(2).all(|w| w[0].0 < w[1].0);
+        let uncapped = |steps: &[(u64, u64)]| {
+            rises(steps).then(|| Lineage {
+                steps: steps.to_vec(),
+            })
+        };
+        let unordered = |steps: &[(u64, u64)]| {
+            (steps.len() <= Lineage::MAX).then(|| Lineage {
+                steps: steps.to_vec(),
+            })
+        };
+        assert!(
+            disagreements(&lists, uncapped) > 0,
+            "NEGATIVE CONTROL: without the cap, a list past it is accepted"
+        );
+        assert!(
+            disagreements(&lists, unordered) > 0,
+            "NEGATIVE CONTROL: without the rising rule, a falling list is accepted"
+        );
     }
 
     #[test]

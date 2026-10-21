@@ -465,4 +465,6 @@ for (const [name, init, warning] of forms) {
 end()
 
 console.error(`wasm-glue: ${failures === 0 ? 'every check held' : `${failures} checks FAILED`}`)
-process.exit(failures === 0 ? 0 : 1)
+// Ended by itself, never `process.exit()`, which can hang once a module ran
+// (crates/aterm-verify/perf/wasm/replay.mjs, where it was measured).
+process.exitCode = failures === 0 ? 0 : 1

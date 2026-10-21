@@ -1283,6 +1283,11 @@ mod tests {
             revert: None,
             effect: Effect::Now,
             detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside: None,
+            essential: false,
         }
     }
 

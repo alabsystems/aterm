@@ -173,6 +173,70 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
     }
 }
 
+/// amacs answers under each of its names: `aterm edit --help`, `aterm amacs --help` and
+/// `amacs --help` (the argv0 alias, a link onto the binary as every install lays it) print the
+/// editor's help and exit 0. The alias runs `Verb::Edit`, not the front door: inside a session
+/// with no terminal on stdin it says so and exits 2 (an agent's tool call never hangs), and
+/// outside any aterm window it says the terminal editor is not built yet and exits 1. None of
+/// these dials a socket: the face is decided before any handoff.
+#[test]
+fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
+    let root = private_root();
+    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("a bin dir");
+    let alias = bin.join("amacs");
+    std::os::unix::fs::symlink(aterm, &alias).expect("lay the amacs alias");
+    let file = root.path().join("COMMIT_EDITMSG");
+    std::fs::write(&file, "x\n").expect("a file to edit");
+    let file = file.to_str().expect("utf8 path");
+    let run = |program: &Path, args: &[&str], session: Option<&str>| {
+        let mut cmd = Command::new(program);
+        isolated(&mut cmd, root.path())
+            .args(args)
+            .env_remove("TMUX")
+            .env_remove("STY");
+        if let Some(sid) = session {
+            cmd.env("ATERM_PARENT_SESSION_ID", sid);
+        }
+        let out = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run amacs");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.status.code(), text)
+    };
+    for (program, args) in [
+        (aterm, &["edit", "--help"][..]),
+        (aterm, &["amacs", "--help"]),
+        (alias.as_path(), &["--help"]),
+    ] {
+        let (code, text) = run(program, args, None);
+        assert_eq!(code, Some(0), "{program:?} {args:?}: {text}");
+        assert!(
+            text.starts_with("amacs - aterm's editor"),
+            "{program:?} {args:?}: {text}"
+        );
+    }
+    for (program, args) in [(alias.as_path(), &[file][..]), (aterm, &["edit", file])] {
+        let (code, text) = run(program, args, Some("s-1"));
+        assert_eq!(code, Some(2), "{program:?} {args:?}: {text}");
+        assert!(
+            text.starts_with("amacs: no terminal to edit in"),
+            "{program:?} {args:?}: {text}"
+        );
+        let (code, text) = run(program, args, None);
+        assert_eq!(code, Some(1), "{program:?} {args:?}: {text}");
+        assert!(
+            text.contains("amacs: the terminal editor is not built yet"),
+            "{program:?} {args:?}: {text}"
+        );
+    }
+}
+
 /// A roster tool that is not installed says so, at a terminal and through a pipe —
 /// never a parser's "unknown command".
 #[test]

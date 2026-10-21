@@ -223,13 +223,15 @@ pub(crate) fn tape_holds(read: &Recovered, secret: &str) -> bool {
 
 /// `git <args>` in `dir`, hermetic, asserted ok.
 fn git(dir: &Path, args: &[&str]) {
-    let out = aterm_uds::spawnfd::command("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .expect("git");
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
     assert!(out.status.success(), "git {args:?}");
 }
 
@@ -457,4 +459,60 @@ fn what_the_shells_startup_and_the_settings_hold_never_reaches_the_tape() {
         tape_holds(&leaky.finish("done"), PLANTED_RC),
         "the detector sees a taped .zshenv"
     );
+}
+
+/// A KEYED PROBE ANSWERS FROM WHAT THE RECORDED LOOP HAD READ, bounded by
+/// astream-effects' keyed view's own bound — a COUNT of records read, never
+/// an index: a look recorded as the tape's second record is no answer to a
+/// probe standing where the loop had read none or one record (it had not
+/// learned it yet; the negative control of the bound), and is the answer
+/// once it has read two; of two answers to one request the latest read is
+/// taken, past the tape's end too; and a request the tape never holds — the
+/// same look asked of another path — is answered as a refused look and
+/// named among the misses, door and request as the tape writes them.
+#[test]
+fn a_keyed_probe_answers_from_what_the_loop_had_read() {
+    let roots = crate::supervise::tape::header::Roots::of(vec![("w", PathBuf::from("/w"))]);
+    let twin = |path: &str| {
+        let answer: Result<Option<String>, String> = Ok(Some(path.to_string()));
+        answer.to_tape()
+    };
+    let asked = |reply: Vec<u8>| EffectRecord::Exchange {
+        door: doors::PROBE_HIDDEN_TWIN.to_string(),
+        request: b"@w/a/b".to_vec(),
+        reply,
+    };
+    let records: Arc<[EffectRecord]> = vec![
+        EffectRecord::Mono(5),
+        asked(twin("/w/a/first")),
+        asked(twin("/w/a/second")),
+    ]
+    .into();
+    let comps: Vec<String> = ["w", "a", "b"].map(String::from).to_vec();
+    // One index, every probe: as a tape opened to explain its decisions.
+    let index = Arc::new(TapeIndex::new(records));
+    let at = |seen| KeyedProbe::at(Arc::clone(&index), seen, roots.clone(), 0);
+    for seen in [0, 1] {
+        let probe = at(seen);
+        let got = probe.hidden_twin(&comps);
+        assert!(got.is_err(), "seen={seen}: {got:?}");
+        assert_eq!(probe.misses(), vec!["probe.hidden_twin @w/a/b".to_string()]);
+    }
+    assert_eq!(
+        at(2).hidden_twin(&comps),
+        Ok(Some("/w/a/first".to_string()))
+    );
+    for seen in [3, usize::MAX] {
+        let probe = at(seen);
+        assert_eq!(
+            probe.hidden_twin(&comps),
+            Ok(Some("/w/a/second".to_string())),
+            "seen={seen}"
+        );
+        assert!(probe.misses().is_empty(), "seen={seen}");
+    }
+    let probe = at(3);
+    let other: Vec<String> = ["w", "c"].map(String::from).to_vec();
+    assert!(probe.hidden_twin(&other).is_err());
+    assert_eq!(probe.misses(), vec!["probe.hidden_twin @w/c".to_string()]);
 }

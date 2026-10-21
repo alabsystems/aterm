@@ -953,17 +953,14 @@ mod tests {
 
     /// After a record has failed, the stream is poisoned: every later read errors
     /// too (never `Ok(0)`, never bytes) — nothing past an unauthentic record is
-    /// ever yielded.
+    /// ever yielded. The error stays `InvalidData`, never a kind a caller resumes
+    /// on (a timeout), which would spin on the latch.
     fn assert_poisoned<S: Read>(r: &mut SealedStream<S>) {
         let mut buf = [0u8; 8];
-        assert!(
-            r.read(&mut buf).is_err(),
-            "a poisoned stream must keep erroring"
-        );
-        assert!(
-            r.read(&mut buf).is_err(),
-            "a poisoned stream must keep erroring"
-        );
+        for _ in 0..2 {
+            let kind = r.read(&mut buf).map_err(|e| e.kind());
+            assert_eq!(kind, Err(io::ErrorKind::InvalidData), "a poisoned stream");
+        }
     }
 
     // ---- the record layer, in memory ------------------------------------------
@@ -1018,6 +1015,24 @@ mod tests {
         let e = r.read(&mut buf).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         // Poisoned from here on: the stream never yields bytes again.
+        assert_poisoned(&mut r);
+
+        // A failed open wipes the ciphertext in place, so a record whose tag a
+        // keyed sender made for the WIPED (all-zero) ciphertext would open on a
+        // retry. The poison latch, not the bytes left in the buffer, refuses it.
+        let mut aad = Vec::new();
+        record_aad(&mut aad, &ss.recv, 0);
+        let nonce = [0x55; NONCE_LEN];
+        let zeros = [0u8; 16];
+        let keystream = &crate::seal_with_nonce(&KEY, &nonce, &aad, &zeros)[NONCE_LEN..][..16];
+        let mut sealed = crate::seal_with_nonce(&KEY, &nonce, &aad, keystream);
+        assert_eq!(sealed[NONCE_LEN..][..16], zeros, "the tag is for zeros");
+        sealed[NONCE_LEN..][..16].copy_from_slice(keystream);
+        let mut wire = (sealed.len() as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(&sealed);
+        let mut r = SealedStream::with_session(Cursor::new(wire), KEY, ss.clone());
+        let e = r.read(&mut buf).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert_poisoned(&mut r);
     }
 

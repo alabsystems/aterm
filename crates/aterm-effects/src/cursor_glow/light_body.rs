@@ -38,7 +38,14 @@ pub(crate) const BODY_CONTRAST_GUARD: f32 = 0.05;
 /// over it. A function of the foreground alone.
 #[must_use]
 pub(crate) fn light_body_floor(theme_fg: u32) -> f32 {
-    (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD) * (relative_luminance(theme_fg) + 0.05) - 0.05
+    light_floor_at(theme_fg, BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
+}
+
+/// The darkest a light-ground mark may composite, in WCAG relative
+/// luminance, for `theme_fg` to keep `bar` over it.
+#[must_use]
+pub(crate) fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
+    bar * (relative_luminance(theme_fg) + 0.05) - 0.05
 }
 
 /// A walk toward white by `w`: `c + w · (255 − c)`. Channel differences
@@ -58,6 +65,32 @@ fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
     aterm_render::over_premul(bg & 0x00FF_FFFF, premul_rgb(ink, a), a) & 0x00FF_FFFF
 }
 
+/// The opacity `0..=255` at which source-over `ink` on `theme_bg` leaves
+/// `theme_fg` `keep` of its contrast on the bare paper, composited as the
+/// renderer composites a quad. A light ground's ink darkens the paper with
+/// its opacity, so the answer is bisected; an ink that keeps it even opaque
+/// answers 255.
+#[must_use]
+pub(crate) fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
+    use crate::color_math::contrast_ratio;
+    let (fg, bg) = (theme_fg & 0x00FF_FFFF, theme_bg & 0x00FF_FFFF);
+    let want = contrast_ratio(fg, bg) * keep;
+    let holds = |a: u8| contrast_ratio(fg, over_at(bg, ink, a)) >= want;
+    if holds(u8::MAX) {
+        return f32::from(u8::MAX);
+    }
+    let (mut lo, mut hi) = (0u8, u8::MAX);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if holds(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    f32::from(lo)
+}
+
 /// THE LIGHT BODY'S INK: `rgb`'s vivid ink ([`light_ink_bold`], the most
 /// chroma one ink weight allows), walked toward white only as far as the
 /// body's composite at its strongest opacity `a_max` over `theme_bg` must be
@@ -73,11 +106,19 @@ fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
 /// given while the body shows.
 #[must_use]
 pub(crate) fn light_body_ink(rgb: u32, theme_fg: u32, theme_bg: u32, a_max: u8) -> u32 {
+    light_ink_over_floor(rgb, theme_bg, a_max, light_body_floor(theme_fg))
+}
+
+/// [`light_body_ink`]'s solve against any `floor` (a WCAG relative
+/// luminance the composite at `a_max` over `theme_bg` keeps): `rgb`'s vivid
+/// ink walked toward white only as far as that floor asks, with the same
+/// light exception. [`light_body_ink`] is this at [`light_body_floor`].
+#[must_use]
+pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
     let ink = light_ink_bold(rgb & 0x00FF_FFFF);
     if a_max == 0 {
         return ink;
     }
-    let floor = light_body_floor(theme_fg);
     let lum_at = |w: f32| relative_luminance(over_at(theme_bg, toward_white(ink, w), a_max));
     if lum_at(0.0) >= floor {
         return ink;
@@ -120,12 +161,14 @@ pub(crate) fn light_body_ink(rgb: u32, theme_fg: u32, theme_bg: u32, a_max: u8) 
 pub(crate) const LIGHT_MARK_QUADS: usize = 4096;
 
 /// A soft round mark of `ink` under the letters, centred on `(cx, cy)`:
-/// `half_w` either side, `reach` above and below (held inside the row that
-/// holds `cy`, so the lines around stay clean), `peak` opaque at the centre
-/// and melting to nothing at the rim. Eighth-cell slabs, so the falloff
-/// never shows as steps. The one round body every light glow shares (Lumen's
-/// crown, every style's crown, the comet's coma, the rod's aura, the typing
-/// glow), so two of them cannot drift apart.
+/// `left` and `right` of it (equal for a symmetric mark; Lumen's glow
+/// reaches further back over the letters just typed than ahead), `reach`
+/// above and below (held inside the row that holds `cy`, so the lines around
+/// stay clean), `peak` opaque at the centre and melting to nothing at the
+/// rim. Eighth-cell slabs, so the falloff never shows as steps. The one round
+/// body every light glow shares (Lumen's crown, the comet's coma and
+/// nucleus, the typing glow, the comet's debris), so two of them cannot
+/// drift apart.
 #[allow(
     clippy::too_many_arguments,
     reason = "stream + geometry + centre + both radii + ink + peak + budget: the ellipse IS this \
@@ -134,23 +177,159 @@ pub(crate) const LIGHT_MARK_QUADS: usize = 4096;
 pub(crate) fn push_ink_ellipse(
     under: &mut Vec<GlowQuad>,
     geom: Geom,
-    (cx, cy): (f32, f32),
-    half_w: f32,
+    centre: (f32, f32),
+    radii: (f32, f32),
     reach: f32,
     ink: u32,
     peak: f32,
     budget: usize,
 ) {
-    use aterm_render::{GlowBlend, RibbonVertex, ribbon_beam};
-    if peak < 1.0 || half_w < 0.5 || geom.ch == 0 || geom.cw == 0 {
+    push_ink_ellipse_shaped(
+        under,
+        geom,
+        centre,
+        radii,
+        reach,
+        ink,
+        peak,
+        budget,
+        |_, _| 1.0,
+    );
+}
+
+/// A round coma of `ink` around `(cx, cy)`, `r` px across its radius and held
+/// in its row: a disc at `fill` opacity inside a rim `rim_w` px wide at `rim`
+/// opacity, one scanline at a time, its outer edge anti-aliased. Source-over
+/// under the letters like every light body ([`push_ink_ellipse`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ring's parameter set: centre, radius, rim, ink, two opacities, budget"
+)]
+pub(crate) fn push_ink_ring(
+    under: &mut Vec<GlowQuad>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    r: f32,
+    rim_w: f32,
+    ink: u32,
+    (fill, rim): (f32, f32),
+    budget: usize,
+) {
+    if geom.ch == 0 || r <= 0.5 {
+        return;
+    }
+    let chf = geom.ch as f32;
+    let oy = f32::from(geom.origin_y);
+    let row_top = oy + ((cy - oy) / chf).floor() * chf;
+    let y0 = (cy - r).max(row_top).floor() as i32;
+    let y1 = (cy + r).min(row_top + chf).ceil() as i32;
+    // One horizontal span `[a, b)` at opacity `alpha`: its whole pixels as
+    // one quad, each part-covered end pixel at its covered share.
+    let span = |under: &mut Vec<GlowQuad>, y: i32, a: f32, b: f32, alpha: f32| {
+        if b <= a || alpha < 1.0 {
+            return;
+        }
+        let mut put = |x: i32, w: i32, share: f32| {
+            let al = (alpha * share).round().clamp(0.0, 255.0) as u8;
+            if al > 0 && under.len() < budget {
+                let pm = premul_rgb(ink, al);
+                crate::effect_util::push_fx_ramp(under, geom, x, y, w, 1, (pm, al), (pm, al));
+            }
+        };
+        let (ia, ib) = (a.ceil() as i32, b.floor() as i32);
+        if ib < ia {
+            put(a.floor() as i32, 1, b - a);
+            return;
+        }
+        if ia as f32 > a {
+            put(ia - 1, 1, ia as f32 - a);
+        }
+        if ib > ia {
+            put(ia, ib - ia, 1.0);
+        }
+        if b > ib as f32 {
+            put(ib, 1, b - ib as f32);
+        }
+    };
+    let ri = (r - rim_w).max(0.0);
+    for y in y0..y1 {
+        let dy = (y as f32 + 0.5 - cy).abs();
+        if dy >= r {
+            continue;
+        }
+        let outer = (r * r - dy * dy).sqrt();
+        let inner = if dy < ri {
+            (ri * ri - dy * dy).sqrt()
+        } else {
+            0.0
+        };
+        span(under, y, cx - outer, cx - inner, rim);
+        span(under, y, cx - inner, cx + inner, fill);
+        span(under, y, cx + inner, cx + outer, rim);
+    }
+}
+
+/// [`push_ink_ellipse`] with its opacity scaled along x: `share(x0, x1)` is
+/// the share `0..=1` of the mark kept at a sample whose neighbourhood spans
+/// window x `x0..x1` (one sample's spacing either side of it), so a sample
+/// next to anything held back is held back too and the slabs between two
+/// samples never ramp past the lower one's share inside it. The typing glow
+/// keeps its ink off the letters this way
+/// (`the_light_glow_keeps_the_newest_letter_within_half_a_point`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ellipse's parameter set and its share along x"
+)]
+pub(crate) fn push_ink_ellipse_shaped(
+    under: &mut Vec<GlowQuad>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    radii: (f32, f32),
+    reach: f32,
+    ink: u32,
+    peak: f32,
+    budget: usize,
+    share: impl Fn(f32, f32) -> f32,
+) {
+    if geom.ch == 0 {
         return;
     }
     let chf = geom.ch as f32;
     // Inside the row that holds the centre.
     let row_top = f32::from(geom.origin_y) + ((cy - f32::from(geom.origin_y)) / chf).floor() * chf;
     let available = (cy - row_top).min(row_top + chf - cy).max(0.0);
-    let reach = reach.min(available);
-    if reach < 0.5 {
+    soft_ellipse(
+        under,
+        geom,
+        (cx, cy),
+        radii,
+        reach.min(available),
+        ink,
+        peak,
+        budget,
+        share,
+        aterm_render::GlowBlend::Over,
+    );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ellipse's parameter set, its share along x and its blend"
+)]
+fn soft_ellipse(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    (left, right): (f32, f32),
+    reach: f32,
+    ink: u32,
+    peak: f32,
+    budget: usize,
+    share: impl Fn(f32, f32) -> f32,
+    blend: aterm_render::GlowBlend,
+) {
+    use aterm_render::{RibbonVertex, ribbon_beam};
+    if peak < 1.0 || left.max(right) < 0.5 || geom.ch == 0 || geom.cw == 0 || reach < 0.5 {
         return;
     }
     const STEPS: usize = 24;
@@ -166,28 +345,25 @@ pub(crate) fn push_ink_ellipse(
         lift: 0.0,
         lift_span: 0.0,
     }; STEPS + 1];
+    let x_at = |i: usize| {
+        let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
+        cx + u * if u < 0.0 { left } else { right }
+    };
     for (i, v) in verts.iter_mut().enumerate() {
         let u = i as f32 / STEPS as f32 * 2.0 - 1.0;
         // The ellipse's height at this x, and a falloff toward its rim.
         let round = (1.0 - u * u).max(0.0).sqrt();
         let r = (reach * round).max(0.5);
-        v.x = cx + u * half_w;
+        v.x = x_at(i);
         v.up = r;
         v.dn = r;
         v.core_up = r * 0.3;
         v.core_dn = r * 0.3;
-        v.cov = peak * round * round;
+        let kept = share(x_at(i.saturating_sub(1)), x_at((i + 1).min(STEPS))).clamp(0.0, 1.0);
+        v.cov = peak * round * round * kept;
     }
     let stride = (geom.cw / 8).max(1);
-    ribbon_beam(
-        under,
-        geom.beam_clip(),
-        &verts,
-        1.0,
-        stride,
-        budget,
-        GlowBlend::Over,
-    );
+    ribbon_beam(out, geom.beam_clip(), &verts, 1.0, stride, budget, blend);
 }
 
 /// Re-ink quads rasterized in WHITE (so each channel is the coverage that lit
@@ -212,48 +388,17 @@ pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&Glow
     }
 }
 
-/// THE INK-FIRE'S LIGHT-GROUND CEILING: the strongest coverage the flame
-/// field may lay on paper. The flames draw under the glyph ink, so the only
-/// legibility limit there is the theme's text over the flame: the largest
-/// alpha (up to [`LIGHT_BODY_ALPHA_CAP`]) at which the field's darkest ink
-/// ([`aterm_render::fire_field::FIRE_OVER_RIM_INK`]) composited over the
-/// ground keeps [`light_body_floor`] for `theme_fg`, the bar every body under
-/// the letters keeps. Where the theme cannot meet the bar even on bare paper,
-/// the light exception: the least coverage at which the rim still reads as a
-/// colour, so the flame shows.
-#[must_use]
-pub(crate) fn light_fire_cov_ceiling(theme_fg: u32, theme_bg: u32) -> u8 {
-    let rim = aterm_render::fire_field::FIRE_OVER_RIM_INK;
-    let floor = light_body_floor(theme_fg);
-    let cap = LIGHT_BODY_ALPHA_CAP as u8;
-    let keeps = |a: u8| relative_luminance(over_at(theme_bg, rim, a)) >= floor;
-    if keeps(cap) {
-        return cap;
-    }
-    if keeps(0) {
-        // The composite darkens monotonically with coverage.
-        let (mut lo, mut hi) = (0u8, cap);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if keeps(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        return lo;
-    }
-    (1..=cap)
-        .find(|&a| crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, rim, a), theme_bg))
-        .unwrap_or(cap)
-}
-
 /// The light ground one frame draws on: the theme's text and paper, which
 /// every under-letter body solves its ink against.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LightGround {
     pub(crate) fg: u32,
     pub(crate) bg: u32,
+    /// Test-only: answer the bare vivid ink ([`light_ink_bold`]), never
+    /// solved against the text (`CursorGlow::light_ground`'s negative
+    /// control).
+    #[cfg(test)]
+    pub(crate) unsolved: bool,
 }
 
 impl LightGround {
@@ -263,6 +408,8 @@ impl LightGround {
         Self {
             fg: cfg.theme_fg,
             bg: cfg.theme_bg,
+            #[cfg(test)]
+            unsolved: false,
         }
     }
 
@@ -272,6 +419,10 @@ impl LightGround {
     /// ink composites toward the ink itself, so the ink alone keeps the bar.
     #[must_use]
     pub(crate) fn body_ink(self, rgb: u32) -> u32 {
+        #[cfg(test)]
+        if self.unsolved {
+            return light_ink_bold(rgb & 0x00FF_FFFF);
+        }
         light_body_ink(rgb, self.fg, self.bg, LIGHT_BODY_ALPHA_CAP as u8)
     }
 }

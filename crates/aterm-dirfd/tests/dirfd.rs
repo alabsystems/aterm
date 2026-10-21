@@ -38,8 +38,8 @@
 //! being tested — link counts, rename atomicity, the resolution window — only
 //! exists on one.
 //!
-//! Unix only, as the crate is (`#![cfg(unix)]` in `src/lib.rs`): there is no
-//! descriptor-relative API to test elsewhere.
+//! Unix only, as the half it drives is (`src/unix.rs`); the Windows half is
+//! tested on real NTFS trees in `tests/windows.rs`.
 
 #![cfg(unix)]
 

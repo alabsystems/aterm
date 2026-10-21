@@ -52,10 +52,17 @@ aterm-uds = { workspace = true }
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# The Linux lane's steady clock is named by the kernel's boot id
+# (`linux::steady_clock`), judged by astream's reader of its text
+# (`parse_boot_id`: a UUID, the all-zero id refused), the reader aterm-link's
+# broker and the supervisor's sleep count use. Unix, as the lane is (`linux`
+# compiles on Linux and into macOS test builds). Zero dependencies, and not a
+# new edge in the shipped graph: aterm-durable above links it on Apple, and
+# aterm-link on every Unix.
+astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
+
 [dev-dependencies]
-# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
-# build too.
-aterm-durable = { workspace = true, features = ["test-support"] }
 # install.sh's tests build atpkg's shim from its own block (`build_cache::shim_block`),
 # so the shim writer and the installer's reader answer to one contract.
 atpkg = { workspace = true }
@@ -69,8 +76,14 @@ aterm-spec = { workspace = true }
 aterm-models-misc = { workspace = true }
 aterm-models-update = { workspace = true }
 # Test scratch directories removed on drop, and the shared-inode stand-ins the
-# install.sh tests lay as stub tools (`stand_in`, in an optimized test build too).
-aterm-tempfile = { workspace = true, features = ["test-support"] }
+# install.sh tests lay as stub tools (`stand_in`).
+aterm-tempfile = { workspace = true }
+
+# Explicit mounted-volume acceptance; not an ordinary test or a release dependency.
+[[bench]]
+name = "dmg_acceptance"
+harness = false
+test = false
 
 [lints]
 workspace = true

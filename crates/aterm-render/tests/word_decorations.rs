@@ -147,9 +147,16 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
     term.process(b"\x1b[5;1Hdirt");
     let mut cur = term.cell_frame(8, 12);
     cur.word_decorations.push(lifted_add_deco(4, 9, -5));
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, CELL_H, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -170,9 +177,16 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
     term.process(b"\x1b[5;1Hmore");
     let mut cur = term.cell_frame(8, 12);
     cur.word_decorations = prev.word_decorations.clone();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, CELL_H, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -190,9 +204,16 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
     // and the frame still gate-hits (the 0% steady state stays free).
     let prev = cur.clone();
     let cur2 = cur.clone();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur2, false, None, false, None, CELL_H, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur2,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, CELL_H),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(

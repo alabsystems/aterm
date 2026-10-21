@@ -258,12 +258,12 @@ fn cases() -> Vec<Case> {
         ("the pane's ground", nothing, |w| w.blank.bg = [10, 10, 40]),
         ("the theme's accent", nothing, |w| w.accent = [255, 0, 128]),
         ("the keyboard's chip", nothing, |w| {
-            w.focus.0 = Some(Chip::Settings);
+            w.focus.0 = Some(Chip::Autopilot);
         }),
         ("the pointer's chip", nothing, |w| {
-            w.focus.1 = Some(Chip::Settings);
+            w.focus.1 = Some(Chip::Autopilot);
         }),
-        ("the room", nothing, |w| w.room = 2),
+        ("the room", nothing, |w| w.room = 0),
         ("Autopilot's title built anew", titled, |w| {
             w.title("autopilot: cruise \u{2014} keeps the work moving \u{b7} last: \u{21bb} kept going 14:07");
         }),
@@ -471,15 +471,15 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
             },
         )
     };
-    let empty = built(AutopilotView::Cruise, None, None);
+    let empty = built(AutopilotView::Land, None, None);
     let landed = built(
-        AutopilotView::Cruise,
+        AutopilotView::Land,
         Some(TaskFace::Landed),
         Some(stamp(17 * 60 + 42)),
     );
-    let done = built(
-        AutopilotView::Cruise,
-        Some(TaskFace::Done),
+    let theirs = built(
+        AutopilotView::Land,
+        Some(TaskFace::Theirs),
         Some(stamp(17 * 60 + 42)),
     );
     let make = |built: (AutopilotView, ChipGlass), today| {
@@ -531,15 +531,15 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     // A first/restated stamp must not inherit None, or a previous day's
     // read. Clearing and restating are separate calls through the real seam.
     let moved_clock = built(
-        AutopilotView::Cruise,
+        AutopilotView::Land,
         Some(TaskFace::Landed),
         Some(stamp(18 * 60 + 5)),
     );
-    let moved_view = built(AutopilotView::Land, landed.1.task, landed.1.task_at);
+    let moved_view = built(AutopilotView::Cruise, landed.1.task, landed.1.task_at);
     let mut outcomes = Vec::new();
     for (from, to, day) in [
         (empty, landed, None),
-        (landed, done, Some(FRI)),
+        (landed, theirs, Some(FRI)),
         (landed, moved_clock, Some(FRI)),
         (landed, moved_view, Some(FRI)),
     ] {
@@ -694,7 +694,11 @@ fn script() -> Vec<Step> {
     };
     let word = |word: Autopilot| {
         step(move |app, _, session| {
-            assert!(app.set_session_autopilot(session, Some(word)));
+            assert!(app.set_session_autopilot(
+                session,
+                Some(word),
+                crate::autopilot::Surface::Chip
+            ));
         })
     };
     let resize = |cols: u16| {
@@ -722,14 +726,17 @@ fn script() -> Vec<Step> {
             "Claude in bypass",
             step(|app, _, s| mode_row(app, s, BYPASS)),
         ),
-        ("the keyboard on \u{2699}", select(Some(Chip::Settings))),
+        (
+            "the keyboard on the light",
+            select(Some(Chip::Light(Light::Mode))),
+        ),
         ("the keyboard on Autopilot", select(Some(Chip::Autopilot))),
         ("the keyboard gone", select(None)),
         ("a resize", resize(90)),
         ("a narrow resize", resize(40)),
         (
-            "the pointer on \u{2699}, narrow",
-            hover(Some(Chip::Settings)),
+            "the pointer on Autopilot, narrow",
+            hover(Some(Chip::Autopilot)),
         ),
         ("the pointer gone, narrow", hover(None)),
         ("the resize back", resize(120)),
@@ -774,7 +781,8 @@ fn script() -> Vec<Step> {
                 assert!(app.set_session_autopilot_timed(
                     s,
                     Some(Autopilot::Cruise),
-                    Some(wall_ms + 2 * 3_600_000)
+                    Some(wall_ms + 2 * 3_600_000),
+                    crate::autopilot::Surface::Chip
                 ));
             }),
         ),

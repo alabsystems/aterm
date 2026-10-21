@@ -143,7 +143,8 @@ USAGE
   targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]
                            ON A BARE MACHINE (no Trust toolchain) run
                            `aterm pkg install trust` first. A full run acquires
-                           rustup, stable's slices and the wasm32 pin itself.
+                           rustup, stable's slices, the wasm32 pin and the
+                           wasm-glue oracle's wasm-bindgen itself.
                            Makes THIS machine a publisher. Seeds the newest
                            master-signed roster pair from the channel release
                            into dist/, audits the WHOLE publishing stack — Trust
@@ -231,7 +232,8 @@ USAGE
                            library past it (aterm-agent) with exit 2 before
                            its Summary: give such a library --prover <the bin/
                            of a build that holds a40ddc8e9c>.
-                           --target-root defaults to <repo>/target-trust, or,
+                           --target-root defaults to
+                           <repo>/target-trust.noindex (Spotlight skips it), or,
                            where `targo trust` refuses a component of that (a
                            checkout made under umask 002 is 0775), to this
                            checkout's aterm-trust-lane/<dir>-<hash> in

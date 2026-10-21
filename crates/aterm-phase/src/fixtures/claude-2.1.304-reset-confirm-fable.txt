@@ -1,0 +1,14 @@
+# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (byte offsets into the store's 2.1.304 binary, docs/SPEC-claude-accounts-resets-2026-10-02.md §0: the confirmation `_Ae` @257466054: the Dialog titled `Ug.confirmTitle` @225876814 over a column of [body `confirmBody` @225876843, dim detail `confirmDetail` @225876938], then `sr` @234846790 with `hideIndexes`, yes `confirmYes` then `confirmNo`, the focus opening on yes; the kind's words `X()` @244629154, its count `ce()` @244629310; the Fable kind's `{returns}` `Ot()` @244629539 and `{limits}` `Yn` @244635663), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; the same Dialog component in 2.1.304), the values are invented · OPEN: replace with a capture (SPEC §6) · the Fable reset's confirmation: the one kind whose body draws a `{returns}` segment, and which the step never takes; the body wrapped onto a second row at the panel's width (a word wrap, assumed)
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Use a Fable reset?
+
+   Refills your Fable limit now · returns what Fable used to your weekly limit · your weekly reset day stays
+   Oct 9 at 5am
+   1 Fable reset left · use by Oct 5 at 3pm
+
+   ❯ Yes, use my Fable reset
+     No, keep it
+
+   Enter to confirm · Esc to cancel

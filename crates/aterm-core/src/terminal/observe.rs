@@ -114,9 +114,19 @@ impl RowRange {
     /// so `RowsClear` will not latch on it.
     #[must_use]
     pub fn covers_any(self, visible_rows: usize) -> bool {
+        self.on_grid(visible_rows).is_some()
+    }
+
+    /// The inclusive `(first, last)` of the rows this range covers on a grid of
+    /// `visible_rows` rows (the range intersected with `0..visible_rows`), or
+    /// `None` when it covers none.
+    #[must_use]
+    fn on_grid(self, visible_rows: usize) -> Option<(usize, usize)> {
         match self {
-            RowRange::All => visible_rows > 0,
-            RowRange::Span { start, end } => start <= end && start < visible_rows,
+            RowRange::All => visible_rows.checked_sub(1).map(|last| (0, last)),
+            RowRange::Span { start, end } => {
+                (start <= end && start < visible_rows).then(|| (start, end.min(visible_rows - 1)))
+            }
         }
     }
 }
@@ -170,10 +180,18 @@ pub enum WatcherSpec {
 impl WatcherSpec {
     #[inline]
     fn is_row(&self) -> bool {
-        matches!(
-            self,
-            WatcherSpec::RowMatches { .. } | WatcherSpec::RowsClear { .. }
-        )
+        self.row_range().is_some()
+    }
+
+    /// The visible rows a row predicate reads; `None` for the scalar predicates.
+    #[inline]
+    fn row_range(&self) -> Option<RowRange> {
+        match self {
+            WatcherSpec::RowMatches { rows, .. } | WatcherSpec::RowsClear { rows, .. } => {
+                Some(*rows)
+            }
+            _ => None,
+        }
     }
 
     /// Whether the predicate is level-triggered and so evaluated once at arm:
@@ -352,13 +370,19 @@ impl WatcherSet {
         alt != self.clock.alt || epoch != self.clock.epoch || seq > self.clock.last_seq
     }
 
-    /// Whether a row scan would do work this batch: some un-latched row watcher
-    /// is fresh or content advanced. The engine collects row text only then.
+    /// The inclusive `(first, last)` visible rows a row scan reads this batch on a
+    /// grid of `rows` rows: the hull of the on-grid ranges of every un-latched row
+    /// watcher that is fresh or sees content advance, exactly the watchers
+    /// [`observe_screen`](Self::observe_screen) scans. `None` when none of them
+    /// covers a row, so the scan reads nothing. The engine collects row text only
+    /// inside the hull: every row a scanning watcher reads lies in it.
     #[must_use]
-    pub fn wants_row_scan(&self, advanced: bool) -> bool {
+    pub fn row_scan_hull(&self, advanced: bool, rows: usize) -> Option<(usize, usize)> {
         self.watchers
             .iter()
-            .any(|w| w.latched.is_none() && w.spec.is_row() && (advanced || w.fresh))
+            .filter(|w| w.latched.is_none() && (advanced || w.fresh))
+            .filter_map(|w| w.spec.row_range()?.on_grid(rows))
+            .reduce(|(lo, hi), (first, last)| (lo.min(first), hi.max(last)))
     }
 
     /// Arm a watcher, returning its handle, or `None` (fail-closed) at capacity.
@@ -473,8 +497,9 @@ impl WatcherSet {
     /// latches every predicate that holds, in one pass. A change of grid or generation is a
     /// resync: the baseline is set, not raised, since the counter is not comparable across it
     /// (`ActivityClock::epoch`). `rows[idx]` is visible-row text for the row predicates; the
-    /// caller collects it only when [`wants_row_scan`](Self::wants_row_scan) holds, and an empty
-    /// `rows` is never read as a clear surface. Returns `true` if anything latched.
+    /// caller collects it only inside [`row_scan_hull`](Self::row_scan_hull) (`None` outside,
+    /// `rows` still one entry per grid row), and an empty `rows` is never read as a clear
+    /// surface. Returns `true` if anything latched.
     pub fn observe_screen(
         &mut self,
         content_seq: u64,
@@ -639,16 +664,22 @@ impl super::Terminal {
                     super::BlockState::PromptOnly | super::BlockState::Complete
                 )
             });
-        // Collect visible-row text only when a row scan will run, into a persistent scratch
-        // taken out of `self` (row reads borrow `&self` while `observe_screen` borrows
-        // `self.watchers`); the `Vec` and each `String`'s capacity are reused across batches.
+        // Collect visible-row text only when a row scan will run, and only for the rows a
+        // scanning watcher can read, into a persistent scratch taken out of `self` (row reads
+        // borrow `&self` while `observe_screen` borrows `self.watchers`); the `Vec` and each
+        // kept `String`'s capacity are reused across batches. The scratch keeps one entry per
+        // grid row, so every scanning watcher sees exactly what a full collection gives it.
         // The live screen's rows, as `text` serves them: a person scrolled back must not make
         // a live box look gone, nor an old copy of it in history look live.
-        if self.watchers.wants_row_scan(advanced) {
-            let rows = self.rows() as usize;
+        let rows = self.rows() as usize;
+        if let Some((lo, hi)) = self.watchers.row_scan_hull(advanced, rows) {
             let mut scratch = std::mem::take(&mut self.row_text_scratch);
             scratch.resize_with(rows, || None);
             for (i, slot) in scratch.iter_mut().enumerate() {
+                if i < lo || i > hi {
+                    *slot = None;
+                    continue;
+                }
                 let mut s = slot.take().unwrap_or_default();
                 *slot = self.live_row_text_into(i, &mut s).then_some(s);
             }
@@ -791,6 +822,15 @@ mod tests {
 
     /// No row text: the scalar predicates do not read rows.
     const NO_ROWS: &[Option<String>] = &[];
+
+    /// Matches a row containing the literal.
+    #[derive(Debug)]
+    struct Contains(&'static str);
+    impl RowMatch for Contains {
+        fn verdict(&self, row: &str) -> RowVerdict {
+            row.contains(self.0).into()
+        }
+    }
 
     /// Exactly the level-triggered predicates are evaluated at arm (`Terminal::watch`).
     #[test]
@@ -1030,13 +1070,6 @@ mod tests {
     /// at the same epoch scans and latches nothing.
     #[test]
     fn a_new_screen_generation_at_an_equal_seq_is_an_advance() {
-        #[derive(Debug)]
-        struct Contains(&'static str);
-        impl RowMatch for Contains {
-            fn verdict(&self, row: &str) -> RowVerdict {
-                row.contains(self.0).into()
-            }
-        }
         let base = t0();
         let box_b = [Some("rm -rf /tmp/work".to_string())];
         for (epoch, moves) in [(1, false), (2, true)] {
@@ -1278,14 +1311,6 @@ mod tests {
     fn observe_at_reuses_scratch_across_batches_and_still_latches() {
         use crate::terminal::Terminal;
 
-        #[derive(Debug)]
-        struct Contains(&'static str);
-        impl RowMatch for Contains {
-            fn verdict(&self, row: &str) -> RowVerdict {
-                row.contains(self.0).into()
-            }
-        }
-
         let now = t0();
         let mut term = Terminal::new(4, 40);
         let id = term
@@ -1304,5 +1329,170 @@ mod tests {
             term.watch_poll(id).is_some(),
             "RowMatches must latch once a visible row matches, even with scratch reuse",
         );
+    }
+
+    /// The hull is taken over exactly the watchers `observe_screen` scans, each range
+    /// intersected with the grid.
+    #[test]
+    fn row_scan_hull_covers_the_scanning_watchers_on_the_grid() {
+        let base = t0();
+        let span = |start, end| RowRange::Span { start, end };
+        let shown = |range| WatcherSpec::RowMatches {
+            matcher: Arc::new(Contains("never shown")),
+            rows: range,
+        };
+        let mut w = WatcherSet::default();
+        assert_eq!(w.row_scan_hull(true, 24), None, "no watcher, no scan");
+        let scalar = w.arm(WatcherSpec::SeqAdvanced { after: 0 }, base).unwrap();
+        assert_eq!(
+            w.row_scan_hull(true, 24),
+            None,
+            "a scalar watcher reads no row"
+        );
+        w.disarm(scalar);
+        // Ranges that meet no row of a 24-row grid contribute nothing.
+        w.arm(shown(span(40, 50)), base).unwrap();
+        w.arm(rows_clear(span(2, 1)), base).unwrap();
+        assert_eq!(w.row_scan_hull(true, 24), None);
+        w.arm(shown(span(20, 20)), base).unwrap();
+        w.arm(rows_clear(span(5, 99)), base).unwrap();
+        assert_eq!(
+            w.row_scan_hull(true, 24),
+            Some((5, 23)),
+            "rows 5..=99 is cut at the last grid row"
+        );
+        w.arm(shown(span(0, 0)), base).unwrap();
+        assert_eq!(w.row_scan_hull(true, 24), Some((0, 23)));
+        assert_eq!(
+            w.row_scan_hull(true, 0),
+            None,
+            "a grid with no rows has none to read"
+        );
+        // Once scanned (busy everywhere, so nothing latches), a watcher is no longer fresh:
+        // it reads rows only on an advance.
+        let busy = vec![Some("esc to interrupt".to_string()); 24];
+        w.observe(0, false, base, &busy);
+        assert_eq!(w.row_scan_hull(false, 24), None);
+        assert_eq!(w.row_scan_hull(true, 24), Some((0, 23)));
+        // A fresh arm on a quiet surface reads its own range alone; the others wait for an
+        // advance.
+        w.arm(rows_clear(RowRange::All), base).unwrap();
+        assert_eq!(w.row_scan_hull(false, 3), Some((0, 2)));
+        // A latched watcher reads nothing.
+        let mut once = WatcherSet::default();
+        let id = once.arm(shown(RowRange::All), base).unwrap();
+        once.observe(1, false, base, &[Some("never shown".to_string())]);
+        assert!(once.poll(id).is_some());
+        assert_eq!(once.row_scan_hull(true, 24), None);
+    }
+
+    /// `observe_at` renders only the armed rows' hull, and the scratch keeps one entry per
+    /// grid row.
+    #[test]
+    fn observe_at_renders_only_the_armed_span() {
+        use crate::terminal::Terminal;
+
+        let rendered = |t: &Terminal| -> Vec<usize> {
+            t.row_text_scratch
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.is_some().then_some(i))
+                .collect()
+        };
+        let now = t0();
+        let mut term = Terminal::new(24, 40);
+        let top = term
+            .watch_rows(
+                Arc::new(Contains("never shown")),
+                RowRange::Span { start: 0, end: 0 },
+                now,
+            )
+            .expect("arm rows 0..=0");
+        term.process(b"one\r\n");
+        assert_eq!(term.row_text_scratch.len(), 24, "one entry per grid row");
+        assert_eq!(
+            rendered(&term),
+            [0],
+            "a rows 0..=0 watcher reads row 0 alone"
+        );
+        // NEGATIVE CONTROL: an `All` watcher on the same batch shape reads every row.
+        let all = term
+            .watch_rows(Arc::new(Contains("never shown")), RowRange::All, now)
+            .expect("arm all rows");
+        term.process(b"two\r\n");
+        assert_eq!(rendered(&term), (0..24).collect::<Vec<_>>());
+        // Disarmed, the hull narrows again and keeps no text from the rows it left.
+        term.watch_disarm(all);
+        term.process(b"three\r\n");
+        assert_eq!(rendered(&term), [0]);
+        assert!(term.watch_poll(top).is_none());
+    }
+
+    /// Watchers on disjoint spans latch at the same seqs whether the scan reads only their
+    /// hull or, with an extra `All` watcher armed, every row.
+    #[test]
+    fn disjoint_spans_latch_exactly_as_a_full_scan() {
+        use crate::terminal::Terminal;
+
+        // Row 5 is busy before the arm; row 23 shows READY outside every range.
+        const SETUP: &[u8] = b"\x1b[6;1Hbusy\x1b[24;1HREADY";
+        const CORPUS: [&[u8]; 6] = [
+            b"\x1b[22;1HREADY",     // row 21: outside every range
+            b"\x1b[21;1HREADY",     // row 20: the second span latches
+            b"\x1b[7;1Hstill busy", // row 6: rows 5..=7 stay busy
+            b"\x1b[6;1H\x1b[2K",    // row 5 clears, row 6 is still busy
+            b"\x1b[7;1H\x1b[2K",    // row 6 clears: rows 5..=7 are clear
+            b"\x1b[1;1HREADY",      // row 0: the first span latches
+        ];
+        let run = |full_scan: bool| {
+            let now = t0();
+            let mut term = Terminal::new(24, 40);
+            term.process(SETUP);
+            if full_scan {
+                term.watch_rows(Arc::new(Contains("never shown")), RowRange::All, now)
+                    .expect("arm the full-scan watcher");
+            }
+            let ids = [
+                term.watch_rows(
+                    Arc::new(Contains("READY")),
+                    RowRange::Span { start: 0, end: 0 },
+                    now,
+                ),
+                term.watch_rows(
+                    Arc::new(Contains("READY")),
+                    RowRange::Span { start: 20, end: 20 },
+                    now,
+                ),
+                term.watch_rows_gone(
+                    Arc::new(Contains("busy")),
+                    RowRange::Span { start: 5, end: 7 },
+                    now,
+                ),
+            ]
+            .map(|id| id.expect("arm"));
+            let mut latches = Vec::new();
+            let mut read_last_row = false;
+            for batch in CORPUS {
+                term.process(batch);
+                read_last_row |= term.row_text_scratch.get(23).is_some_and(Option::is_some);
+                latches.push(ids.map(|id| term.watch_poll(id).map(|s| s.seq)));
+            }
+            (latches, read_last_row)
+        };
+        let (hull, hull_read_last) = run(false);
+        let (full, full_read_last) = run(true);
+        // NEGATIVE CONTROL: the two runs really read different rows, so their agreement is
+        // not two full scans agreeing.
+        assert!(full_read_last, "the full scan reads row 23");
+        assert!(
+            !hull_read_last,
+            "the hull of 0..=0, 20..=20 and 5..=7 never reads row 23"
+        );
+        assert_eq!(hull, full, "the hull latches exactly as the full scan");
+        // Each watcher latches on its own batch, and `gone` not before rows 5..=7 clear.
+        let first_latch: Vec<Option<usize>> = (0..3)
+            .map(|w| hull.iter().position(|step| step[w].is_some()))
+            .collect();
+        assert_eq!(first_latch, [Some(5), Some(1), Some(4)]);
     }
 }

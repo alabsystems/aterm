@@ -37,3 +37,18 @@ pub(crate) fn count_script_census() {
 pub fn take_script_censuses() -> usize {
     SCRIPT_CENSUSES.with(|n| n.replace(0))
 }
+
+thread_local! {
+    /// Arts built by the registry's builders (`fx::indexed`, `fx::pieces`,
+    /// `fx::rgba`), interned or not: the work a producer's memo spares.
+    static ART_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn count_art_build() {
+    ART_BUILDS.with(|n| n.set(n.get() + 1));
+}
+
+/// This thread's art builds since the last take, zeroed.
+pub fn take_art_builds() -> usize {
+    ART_BUILDS.with(|n| n.replace(0))
+}

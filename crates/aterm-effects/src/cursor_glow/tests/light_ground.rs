@@ -20,8 +20,9 @@ fn light(style: GlowStyle) -> GlowConfig {
 }
 
 /// Type `keys` cells along row 2 from column 4 at a steady typing cadence,
-/// and return the glow and the last frame's additive stream.
-fn typed(c: &GlowConfig, keys: u16) -> (CursorGlow, Vec<GlowQuad>) {
+/// and return the glow, the last frame's additive stream and that frame's
+/// instant.
+fn typed(c: &GlowConfig, keys: u16) -> (CursorGlow, Vec<GlowQuad>, Instant) {
     let g = geom();
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
@@ -32,33 +33,39 @@ fn typed(c: &GlowConfig, keys: u16) -> (CursorGlow, Vec<GlowQuad>) {
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, col)), t, c, g, &mut out);
     }
-    (glow, out)
+    (glow, out, t)
 }
 
-/// [`typed`], then the same instant again with the grains cleared: the body
-/// alone, for the tests that read its shape.
-fn typed_body(c: &GlowConfig, keys: u16) -> CursorGlow {
-    let g = geom();
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    let mut t = Instant::now();
-    glow.tick(Some((2, 4)), t, c, g, &mut out);
-    for col in 5..5 + keys {
-        t += Duration::from_millis(60);
-        glow.note_synthetic_typed(t, 1);
-        glow.tick(Some((2, col)), t, c, g, &mut out);
-    }
-    glow.particles.clear();
-    glow.tick(Some((2, 4 + keys)), t, c, g, &mut out);
-    glow
+/// The streak's body alone at `at` with the caret at `cur`, into fresh
+/// streams: its under-ink stream. Laser's crackle bolts, which the full tick
+/// also paints under the ink (and which may leave the row, as a strike
+/// does), are not the body, so they stay out of the row and band probes.
+fn body(
+    glow: &mut CursorGlow,
+    c: &GlowConfig,
+    g: Geom,
+    at: Instant,
+    cur: (u16, u16),
+) -> Vec<GlowQuad> {
+    let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+    glow.emit_comet(at, c, g, Some(cur), &mut out, &mut halos, &mut under);
+    under
 }
 
-/// Nonzero one-pixel cells are a valid effects canvas too: a light beam may
-/// round away, but must not panic or grow outside its row to meet a half-pixel
-/// minimum. Ordinary light cells still draw, and a dark ground stays additive.
+/// Nonzero one-pixel cells are a valid effects canvas too: a beam's
+/// under-ink body (the light ground's ink, the dark ground's bed) may round
+/// away, but must not panic or grow outside its row to meet a half-pixel
+/// minimum. Ordinary cells still draw on both grounds.
 #[test]
 fn light_beams_fit_one_pixel_high_cells_without_panicking() {
-    for (height, dark) in [(20, true), (20, false), (2, false), (1, false)] {
+    for (height, dark) in [
+        (20, true),
+        (2, true),
+        (1, true),
+        (20, false),
+        (2, false),
+        (1, false),
+    ] {
         for style in [
             GlowStyle::Comet,
             GlowStyle::Beam,
@@ -73,27 +80,33 @@ fn light_beams_fit_one_pixel_high_cells_without_panicking() {
             let mut out = Vec::new();
             let t0 = Instant::now();
             glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+            let mut now = t0;
             for step in 1..=6_u16 {
-                let now = t0 + Duration::from_millis(60 * u64::from(step));
+                now = t0 + Duration::from_millis(60 * u64::from(step));
                 glow.note_synthetic_typed(now, 1);
                 glow.tick(Some((2, 4 + step)), now, &c, g, &mut out);
             }
-            let under = glow.under_quads();
-            if dark {
-                assert!(under.is_empty(), "dark {style:?} keeps its additive body");
+            let under = body(&mut glow, &c, g, now, (2, 10));
+            let top = 2 * height as u16;
+            let bottom = top + height as u16;
+            // On a dark ground a style's vivid rail lies in the leading under
+            // the row, at most a fifth of a cell deep; nothing else leaves it.
+            let rail = if dark {
+                (height as f32 * 0.2).ceil() as u16
             } else {
-                let top = 2 * height as u16;
-                let bottom = top + height as u16;
+                0
+            };
+            assert!(
+                under
+                    .iter()
+                    .all(|q| q.y >= top && q.y + q.h <= bottom + rail),
+                "{style:?} (dark {dark}) fits its {height}-pixel row"
+            );
+            if height >= 2 {
                 assert!(
-                    under.iter().all(|q| q.y >= top && q.y + q.h <= bottom),
-                    "{style:?} fits its {height}-pixel row"
+                    !under.is_empty(),
+                    "{style:?} (dark {dark}) still draws at height {height}"
                 );
-                if height >= 2 {
-                    assert!(
-                        !under.is_empty(),
-                        "{style:?} still draws at height {height}"
-                    );
-                }
             }
         }
     }
@@ -113,21 +126,23 @@ fn ink_heights(under: &[GlowQuad]) -> std::collections::BTreeMap<u16, u16> {
 /// The beam family's body on a light ground is source-over ink in the
 /// under-ink stream (letters draw over it at full contrast) and never leaves
 /// the row it swept, so the lines above and below stay clean; the comet and
-/// the beam ink nothing over the letters. A dark ground keeps the additive
-/// beam and draws nothing under the letters.
+/// the beam ink nothing over the letters. Negative control: a dark ground
+/// keeps the additive beam over the air around the run.
 #[test]
 fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
     let g = geom();
-    let row = 0..g.ch as u16;
-    let row = row.start + 2 * g.ch as u16..row.end + 2 * g.ch as u16;
+    let row = 2 * g.ch as u16..3 * g.ch as u16;
     for style in [
         GlowStyle::Comet,
         GlowStyle::Beam,
         GlowStyle::Laser,
         GlowStyle::Phaser,
+        GlowStyle::Sparkle,
+        GlowStyle::Lumen,
     ] {
-        let (glow, out) = typed(&light(style), 6);
-        let under = glow.under_quads();
+        let c = light(style);
+        let (mut glow, out, t) = typed(&c, 6);
+        let under = glow.under_quads().to_vec();
         assert!(
             !under.is_empty(),
             "{style:?} draws a body on a light ground"
@@ -136,9 +151,10 @@ fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
             under.iter().all(|q| q.alpha > 0 && q.alpha2 > 0),
             "{style:?}: the body is source-over ink"
         );
+        let body = body(&mut glow, &c, g, t, (2, 10));
+        assert!(!body.is_empty(), "{style:?}: the streak's body is drawn");
         assert!(
-            under
-                .iter()
+            body.iter()
                 .all(|q| row.contains(&q.y) && q.y + q.h <= row.end),
             "{style:?}: the body stays inside its row"
         );
@@ -147,45 +163,74 @@ fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
             "{style:?}: no additive light on a light ground"
         );
         if matches!(style, GlowStyle::Comet | GlowStyle::Beam) {
-            // Their body is their look: no dust is inked over the letters.
+            // Their body is their look: no dust is inked over the letters
+            // (the comet's ice glints are ink under them).
             assert!(
                 glow.halos().is_empty(),
                 "{style:?}: nothing over the letters"
             );
         }
-        // Negative control: the same typing on a dark ground lays nothing
-        // under the letters for the beam family.
-        let (dark, _) = typed(&cfg(style, true), 6);
+        // Negative control: the same typing on a dark ground lays additive
+        // light (over the air around the run, its bed under the letters).
+        let (_, dark, _) = typed(&cfg(style, true), 6);
         assert!(
-            dark.under_quads().is_empty(),
+            dark.iter().any(|q| q.alpha == 0),
             "{style:?}: a dark ground keeps its additive beam"
+        );
+    }
+}
+
+/// Sparkle's stars and the fire's embers scatter on a light ground too, as
+/// ink marks, not additive light that white would swallow.
+#[test]
+fn light_sparkles_and_embers_are_ink() {
+    for style in [GlowStyle::Sparkle, GlowStyle::Fire] {
+        let (glow, out, _) = typed(&light(style), 10);
+        let halos = glow.halos();
+        assert!(
+            halos.iter().any(|h| h.mode == HaloMode::Over)
+                || glow.under_quads().iter().any(|q| q.alpha > 0),
+            "{style:?} scatters ink marks on a light ground"
+        );
+        assert!(
+            halos.iter().all(|h| h.mode == HaloMode::Over) && out.iter().all(|q| q.alpha > 0),
+            "{style:?}: no additive light on a light ground"
         );
     }
 }
 
 /// The comet and the beam no longer draw one shape in two colours on a light
 /// ground: the comet's ink swells toward the caret, the beam's tube is even.
+/// The comet is measured along its tail's spine band (its ice glints hang
+/// above and below the tail, off it).
 #[test]
 fn light_comet_tapers_and_light_beam_is_even() {
     let g = geom();
+    let spine = 2.0 * g.ch as f32 + g.ch as f32 * 0.54;
+    let reach = g.ch as f32 * 0.2;
     let spread = |style| {
-        let glow = typed_body(&light(style), 6);
-        let heights = ink_heights(glow.under_quads());
+        let c = light(style);
+        let (mut glow, _, t) = typed(&c, 6);
+        let under = body(&mut glow, &c, g, t, (2, 10));
+        let heights = ink_heights(&under);
         // Two cells behind the caret (col 10) and one cell behind it.
-        let at = |col: u16| {
-            heights
-                .get(&(col * g.cw as u16 + g.cw as u16 / 2))
-                .copied()
-                .unwrap_or(0)
+        let x = |col: u16| col * g.cw as u16 + g.cw as u16 / 2;
+        let at = |col: u16| heights.get(&x(col)).copied().unwrap_or(0);
+        let ink = |col: u16| {
+            column_darkness(&under, x(col))
+                .iter()
+                .filter(|(y, _)| (f32::from(**y) + 0.5 - spine).abs() <= reach)
+                .map(|(_, d)| *d)
+                .sum::<f32>()
         };
-        (at(8), at(9))
+        ((at(8), at(9)), (ink(8), ink(9)))
     };
-    let (comet_far, comet_near) = spread(GlowStyle::Comet);
+    let (_, (comet_far, comet_near)) = spread(GlowStyle::Comet);
     assert!(
         comet_near > comet_far,
-        "the comet swells toward its head: {comet_far} then {comet_near}"
+        "the comet swells toward its head: {comet_far:.0} then {comet_near:.0}"
     );
-    let (beam_far, beam_near) = spread(GlowStyle::Beam);
+    let ((beam_far, beam_near), _) = spread(GlowStyle::Beam);
     assert_eq!(beam_far, beam_near, "the beam's tube is even");
 }
 
@@ -231,11 +276,9 @@ fn light_beam_is_a_band_around_the_letters_never_a_strike() {
     };
     let third = g.ch as u16 / 3;
     let c = light(GlowStyle::Beam);
-    let mut glow = typed_body(&c, 6);
-    let mut out = Vec::new();
-    let mut t = Instant::now() + Duration::from_millis(60 * 7);
+    let (mut glow, mut out, mut t) = typed(&c, 6);
     for frame in 0..4 {
-        let (peak, rows) = peak_rows(&column_darkness(glow.under_quads(), x));
+        let (peak, rows) = peak_rows(&column_darkness(&body(&mut glow, &c, g, t, (2, 10)), x));
         if peak < 4.0 {
             break;
         }
@@ -247,134 +290,437 @@ fn light_beam_is_a_band_around_the_letters_never_a_strike() {
         glow.particles.clear();
         glow.tick(Some((2, 10)), t, &c, g, &mut out);
     }
-    let (laser, _) = typed(&light(GlowStyle::Laser), 6);
-    let (peak, rows) = peak_rows(&column_darkness(laser.under_quads(), x));
+    let laser_cfg = light(GlowStyle::Laser);
+    let (mut laser, _, t) = typed(&laser_cfg, 6);
+    let laser_body = body(&mut laser, &laser_cfg, g, t, (2, 10));
+    let (peak, rows) = peak_rows(&column_darkness(&laser_body, x));
     assert!(peak > 4.0 && rows < third, "laser: {rows} px at its peak");
 }
 
-/// Sparkle's stars and the fire's embers scatter on a light ground too, as
-/// ink marks, not additive light that white would swallow.
+/// Lumen's look shows on a light ground as a tracer, not a lamp: soft ink
+/// under the letters behind the caret (the glow over the letters just typed
+/// and the tracer under the run), and nothing ahead of the caret's own cell.
+/// Negative control: the same glow centred on the caret (a lamp reaching a
+/// cell and a half either side) lays ink ahead of it.
 #[test]
-fn light_sparkles_and_embers_are_ink() {
-    for style in [GlowStyle::Sparkle, GlowStyle::Fire] {
-        let (glow, _) = typed(&light(style), 10);
-        let halos = glow.halos();
-        assert!(
-            halos.iter().any(|h| h.mode == HaloMode::Over),
-            "{style:?} scatters ink marks on a light ground"
-        );
-        assert!(
-            halos.iter().all(|h| h.mode == HaloMode::Over),
-            "{style:?}: no additive halos on a light ground"
-        );
-    }
-}
-
-/// Lumen's glow, its whole look, shows on a light ground: soft ink under the
-/// letters on both sides of the caret.
-#[test]
-fn light_lumen_glows_around_the_caret() {
+fn light_lumen_traces_behind_the_caret_and_not_ahead() {
     let g = geom();
-    let (glow, _) = typed(&light(GlowStyle::Lumen), 4);
+    let c = light(GlowStyle::Lumen);
+    let (glow, _, _) = typed(&c, 4);
     let heights = ink_heights(glow.under_quads());
-    let caret_x = 8 * g.cw as u16 + g.cw as u16 / 2;
-    let left = heights.range(..caret_x - g.cw as u16).count();
-    let right = heights.range(caret_x + g.cw as u16..).count();
-    assert!(
-        left > 0 && right > 0,
-        "a glow on both sides: {left} / {right}"
-    );
+    let cw = g.cw as u16;
+    let caret_x = 8 * cw + cw / 2;
+    let behind = heights.range(..caret_x - cw).count();
+    let ahead = heights.range(caret_x + cw..).count();
+    assert!(behind > 0, "no ink behind the caret");
+    assert_eq!(ahead, 0, "ink ahead of the caret's cell: {ahead} columns");
     assert!(glow.under_quads().iter().all(|q| q.alpha > 0));
+    // Control: a lamp around the caret reaches ahead of it.
+    let mut lamp = Vec::new();
+    push_ink_ellipse(
+        &mut lamp,
+        g,
+        g.cell_center(2, 8),
+        (g.cw as f32 * 1.6, g.cw as f32 * 1.6),
+        g.ch as f32 * 0.46,
+        0x0000_5599,
+        120.0,
+        LIGHT_MARK_QUADS,
+    );
+    let lamp_ahead = ink_heights(&lamp).range(caret_x + cw..).count();
+    assert!(
+        lamp_ahead > 0,
+        "control: a lamp lays nothing ahead of the caret"
+    );
 }
 
-/// EVERY CROWN IS INK ON PAPER: typed on a light ground, each style with a
-/// crown wears it as source-over ink under the letters around the caret
-/// (inside its row), never as additive light. Negative control: on a dark
-/// ground the same typing lays the additive crown halo.
+/// The light comet's head stays in the caret's cell and wears a nucleus:
+/// after a typed burst on GitHub Light, no comet ink lies in the typed row
+/// past the caret cell's leading edge but its round coma (where a cap
+/// stood a few pixels past the block caret as a nub): nothing reaches past
+/// the coma's radius from the caret's centre, and the head behind the caret is
+/// a dense round nucleus: the comet's ink over the newest letter's cell is
+/// markedly deeper than over the tail two cells back, while the newest
+/// letter keeps the light body's bar over it. Negative control: lumen's
+/// even tracer, judged the same way, shows no nucleus.
 #[test]
-fn every_crown_is_ink_on_a_light_ground() {
-    let g = geom();
-    let caret_x = 10 * g.cw as u16 + g.cw as u16 / 2;
-    let row = 2 * g.ch as u16..3 * g.ch as u16;
-    for style in [
-        GlowStyle::Lumen,
-        GlowStyle::Comet,
-        GlowStyle::Phaser,
-        GlowStyle::Sparkle,
-        GlowStyle::Laser,
-        GlowStyle::Water,
-        GlowStyle::Fire,
-    ] {
-        let glow = typed_body(&light(style), 6);
-        let near: Vec<&GlowQuad> = glow
-            .under_quads()
-            .iter()
-            .filter(|q| {
-                let mid = q.x + q.w / 2;
-                mid.abs_diff(caret_x) <= g.cw as u16 / 2
-            })
-            .collect();
-        assert!(!near.is_empty(), "{style:?}: a crown of ink at the caret");
+fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
+    let g = tall_geom();
+    let mut c = light(GlowStyle::Comet);
+    c.theme_fg = 0x001F_2328;
+    let (row, start) = (3u16, 4u16);
+    let keys = 10u16;
+    let caret = start + keys;
+    let burst = |c: &GlowConfig| {
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((row, start)), t, c, g, &mut out);
+        for k in 1..=keys {
+            t += Duration::from_millis(60);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((row, start + k)), t, c, g, &mut out);
+        }
+        let ink = body(&mut glow, c, g, t, (row, caret));
+        (glow, ink)
+    };
+    let row_top = i32::from(row) * g.ch as i32;
+    let lead = i32::from(caret + 1) * g.cw as i32;
+    let (glow, ink) = burst(&c);
+    assert!(!ink.is_empty(), "the comet draws");
+    let coma =
+        (g.cell_center(row, caret).0 + g.ch as f32 * CursorGlow::COMET_LIGHT_COMA_R).ceil() as i32;
+    for q in ink
+        .iter()
+        .filter(|q| i32::from(q.y) < row_top + g.ch as i32 && i32::from(q.y + q.h) > row_top)
+    {
         assert!(
-            near.iter()
-                .all(|q| q.alpha > 0 && row.contains(&q.y) && q.y + q.h <= row.end),
-            "{style:?}: source-over, inside the caret's row"
+            i32::from(q.x + q.w) <= lead.max(coma),
+            "comet ink past the caret's leading edge ({lead}) and its coma ({coma}): {q:?}"
+        );
+    }
+    // The ink's depth over a cell: the darkest of its middle row on white.
+    let depth = |ink: &[GlowQuad], col: u16| -> f32 {
+        let mut glass = Glass::new(g, 0x00FF_FFFF);
+        glass.add_quads(ink);
+        let (x0, y0, x1, _) = glass.cell_rect(row, col);
+        let y = y0 + g.ch as i32 / 2;
+        (x0..x1)
+            .map(|x| 1.0 - crate::color_math::relative_luminance(glass.at(y, x) & 0x00FF_FFFF))
+            .fold(0.0f32, f32::max)
+    };
+    let (head, tail) = (depth(&ink, caret - 1), depth(&ink, caret - 3));
+    assert!(
+        head >= 1.3 * tail && head > 0.2,
+        "a nucleus: the head's ink {head:.3} against the tail's {tail:.3}"
+    );
+    let mut lumen = light(GlowStyle::Lumen);
+    lumen.theme_fg = c.theme_fg;
+    let (_, even) = burst(&lumen);
+    let (lh, lt) = (depth(&even, caret - 1), depth(&even, caret - 3));
+    assert!(
+        lh < 1.3 * lt,
+        "control: lumen's even tracer reads as a nucleus ({lh:.3} against {lt:.3})"
+    );
+    // The newest letter keeps the light body's bar over the head.
+    let mut lit = Glass::new(g, 0x00FF_FFFF);
+    lit.add_quads(glow.under_quads());
+    let (strokes, counters) = glyph(g, row, caret - 1);
+    for &(y, x) in &strokes {
+        lit.px[y as usize * lit.w + x as usize] = c.theme_fg;
+    }
+    let r = ratio(&lit, &strokes, &counters);
+    assert!(
+        r >= 5.25,
+        "the newest letter over the nucleus reads at {r:.2}:1"
+    );
+}
+
+/// On a light ground no grain stands half under the block caret: a grain
+/// whose mark would reach into the caret's cell is not drawn (a half-disc
+/// standing off the caret's edge read as a nub stuck to it), while the same
+/// grain two cells out is.
+#[test]
+fn light_grains_keep_off_the_block_caret() {
+    let g = tall_geom();
+    for style in [GlowStyle::Comet, GlowStyle::Sparkle, GlowStyle::Water] {
+        let c = light(style);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        let (row, col) = (3u16, 10u16);
+        glow.tick(Some((row, col)), t, &c, g, &mut out);
+        let (x0, y0, x1, _) = Glass::new(g, c.theme_bg).cell_rect(row, col);
+        let drawn = |glow: &mut CursorGlow, x: f32| {
+            glow.particles.clear();
+            glow.particles.push(Particle {
+                x0: x,
+                y0: (y0 + g.ch as i32 / 2) as f32,
+                vx: 0.0,
+                vy: 0.0,
+                gy: 0.0,
+                life: 1.0,
+                hue: 0.5,
+                cov_scale: 1.0,
+                born: t,
+            });
+            let (mut q, mut h, mut u) = (Vec::new(), Vec::new(), Vec::new());
+            glow.emit_particles(t, &c, g, &mut q, &mut h, &mut u);
+            !q.is_empty() || !h.is_empty() || !u.is_empty()
+        };
+        assert!(
+            !drawn(&mut glow, (x1 + 2) as f32),
+            "{style:?}: a grain at the caret's edge is drawn"
         );
         assert!(
-            glow.halos().iter().all(|h| h.mode == HaloMode::Over),
-            "{style:?}: no additive halo on paper"
+            drawn(&mut glow, (x1 + 2 * g.cw as i32) as f32),
+            "control: {style:?}'s grain two cells out is not drawn"
         );
-        let dark = typed_body(&cfg(style, true), 6);
-        assert!(
-            dark.halos().iter().any(|h| h.mode == HaloMode::Add),
-            "{style:?}: a dark ground lays the additive crown"
-        );
+        let _ = x0;
     }
 }
 
-/// THE LIGHT FIRE BURNS ON THE PAPER: the ink-fire's coverage ceiling is set
-/// by the theme's text over the flame's darkest ink, not the dark ground's
-/// additive cap. On GitHub Light the darkest flame reads clearly on the
-/// paper (at least 2:1) while the text keeps the bar over it; a theme with
-/// paler text gets a lower ceiling that still keeps it. Negative control:
-/// the old shared cap (34) left the darkest flame at under 1.3:1.
+/// A light band is ink under the letters of the row it lies in, so a run
+/// that leaps rows (an Enter onto the next prompt, a jump) draws only its
+/// stretch on the landing row: for the beam, sparkle and comet, a
+/// jump from the end of row 2 down to the start of row 5 leaves every under
+/// quad of the body inside row 5's band, and the rows it crossed (the output
+/// an Enter just printed) take no ink. Negative control: the laser's
+/// lightning strike, which keeps its whole path, does reach the rows the
+/// jump crossed, so the jump really spans them.
 #[test]
-fn light_fire_flames_ink_the_paper_and_keep_text_legible() {
-    let contrast = |a: u32, b: u32| {
-        let luma = crate::color_math::relative_luminance;
-        let (x, y) = (luma(a), luma(b));
-        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
-        (hi + 0.05) / (lo + 0.05)
+fn a_light_band_that_leaps_rows_stays_on_the_landing_row() {
+    let g = geom();
+    let landing = 5u16;
+    let band = |row: u16| {
+        let y0 = u32::from(row) * g.ch as u32;
+        y0..y0 + g.ch as u32
     };
-    let rim = aterm_render::fire_field::FIRE_OVER_RIM_INK;
-    let over = |bg: u32, a: u8| aterm_render::over_premul(bg, premul_rgb(rim, a), a) & 0x00FF_FFFF;
-    let (fg, bg) = (0x001F_2328, 0x00FF_FFFF);
-    let ceiling = light_fire_cov_ceiling(fg, bg);
-    let flame = over(bg, ceiling);
+    let leap = |style: GlowStyle| {
+        let c = light(style);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 30)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
+        glow.tick(Some((landing, 2)), t0, &c, g, &mut out);
+        body(&mut glow, &c, g, t0, (landing, 2))
+    };
+    for style in [GlowStyle::Beam, GlowStyle::Sparkle, GlowStyle::Comet] {
+        let under = leap(style);
+        assert!(!under.is_empty(), "{style:?}: the landing still draws");
+        for q in &under {
+            let (y0, y1) = (u32::from(q.y), u32::from(q.y) + u32::from(q.h));
+            assert!(
+                y0 >= band(landing).start && y1 <= band(landing).end,
+                "{style:?}: a quad at rows {y0}..{y1} left the landing row"
+            );
+        }
+    }
+    let strike = {
+        let c = light(GlowStyle::Laser);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 30)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
+        glow.tick(Some((landing, 2)), t0, &c, g, &mut out);
+        let mut bolts = Vec::new();
+        glow.emit_bolts(t0, &c, g, &mut bolts, &mut Vec::new(), &mut Vec::new());
+        bolts
+    };
     assert!(
-        contrast(flame, bg) >= 2.0,
-        "the flame reads: {:.2}:1",
-        contrast(flame, bg)
+        strike
+            .iter()
+            .any(|q| u32::from(q.y) + u32::from(q.h) <= band(landing).start),
+        "control: the laser's strike crosses the rows the jump spans"
     );
+}
+
+/// OVER WIDE GLYPHS A LIGHT BAND KEEPS ITS SHAPE AND HUE, LIGHTER. A band
+/// fills a wide glyph's whole box (CJK, emoji), the gaps between its strokes
+/// included, where a Latin letter keeps paper above and below its x-height.
+/// Typing four wide glyphs from column 4 of row 2, with the host's row probe
+/// marking them, the beam, phaser and sparkle lay their band under the typed
+/// glyphs' cells (the sparkle's in its gold), the newest beside the caret
+/// included (the caret's cell past a wide glyph is held too, or the band's
+/// ramp up to it crossed that glyph), holding the paper there to
+/// what leaves the theme's text [`LIGHT_WIDE_BED_KEEP`] of its contrast, the
+/// row's top and bottom pixel rows stay paper (no rail, no hard-edged band
+/// at a cell's edge), and no veil is laid. Negative control: the same keys
+/// over a probe of narrow letters darken those cells past the keep for a
+/// style whose band is deeper than it (the beam's quiet tube is not).
+#[test]
+fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
+    let g = geom();
+    let row = 2u16;
+    let start = 4u16;
+    let keys = 4u16;
+    let run = |style: GlowStyle, wide: bool| {
+        let mut c = light(style);
+        if style == GlowStyle::Sparkle {
+            c.color = crate::cursor_glow::SPARKLE_DEFAULT_COLOR;
+        }
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        let mut chars = vec![' '; g.cols];
+        glow.observe_row(row, start, &chars, t);
+        glow.tick(Some((row, start)), t, &c, g, &mut out);
+        for k in 0..keys {
+            t += Duration::from_millis(60);
+            let col = usize::from(start + 2 * k);
+            if wide {
+                chars[col] = '你';
+                chars[col + 1] = '\0';
+            } else {
+                chars[col] = 'a';
+                chars[col + 1] = 'b';
+            }
+            let caret = start + 2 * (k + 1);
+            glow.note_synthetic_typed(t, 2);
+            glow.observe_row(row, caret, &chars, t);
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+        }
+        (c, glow.under_quads().to_vec(), glow.halos().to_vec())
+    };
+    // The typed glyphs' cells, the newest one beside the caret included.
+    let x0 = i32::from(start) * g.cw as i32;
+    let x1 = i32::from(start + 2 * keys) * g.cw as i32;
+    let (y0, y1) = (
+        i32::from(row) * g.ch as i32,
+        i32::from(row + 1) * g.ch as i32,
+    );
+    let inside = |q: &GlowQuad| {
+        let (qx0, qx1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
+        qx0 < x1 && qx1 > x0 && q.alpha.max(q.alpha2) > 0
+    };
+    // The least contrast the text keeps over the typed cells' paper, and
+    // over the row's top and bottom pixel rows there.
+    let reading = |c: &GlowConfig, under: &[GlowQuad]| {
+        let mut glass = Glass::new(g, c.theme_bg);
+        glass.add_quads(under);
+        let read = |y: i32| {
+            (x0..x1)
+                .map(|x| crate::color_math::contrast_ratio(c.theme_fg, glass.at(y, x)))
+                .fold(f32::INFINITY, f32::min)
+        };
+        let body = (y0..y1).map(read).fold(f32::INFINITY, f32::min);
+        (body, read(y0).min(read(y1 - 1)))
+    };
+    let mut held = false;
+    for style in [GlowStyle::Beam, GlowStyle::Phaser, GlowStyle::Sparkle] {
+        let (c, under, halos) = run(style, true);
+        let clean = crate::color_math::contrast_ratio(c.theme_fg, c.theme_bg);
+        let keep = clean * LIGHT_WIDE_BED_KEEP;
+        assert!(
+            under.iter().any(inside),
+            "{style:?}: no band lies under the wide glyphs"
+        );
+        let (body, edges) = reading(&c, &under);
+        assert!(
+            body >= keep * 0.98,
+            "{style:?}: the band over the wide glyphs leaves the text {body:.2}:1 (keep {keep:.2}:1)"
+        );
+        assert!(
+            body < clean * 0.9,
+            "{style:?}: the band over the wide glyphs does not show ({body:.2}:1 of {clean:.2}:1)"
+        );
+        assert!(
+            edges >= clean * 0.95,
+            "{style:?}: the band stands hard at the row's edge ({edges:.2}:1 of {clean:.2}:1)"
+        );
+        if style == GlowStyle::Sparkle {
+            for q in under.iter().filter(|q| inside(q) && q.alpha >= 24) {
+                let (h, s, _) = crate::color_math::rgb2hsv(q.color & 0x00FF_FFFF);
+                assert!(
+                    (22.0..=58.0).contains(&h) && s >= 0.35,
+                    "the sparkle band over a wide glyph left gold: {:06x}",
+                    q.color & 0x00FF_FFFF
+                );
+            }
+        }
+        let (c, narrow, narrow_halos) = run(style, false);
+        assert!(
+            halos.len() <= narrow_halos.len(),
+            "{style:?}: veils stand in for the band over the wide glyphs ({} against {})",
+            halos.len(),
+            narrow_halos.len()
+        );
+        let (narrow_body, _) = reading(&c, &narrow);
+        held |= narrow_body < keep * 0.98;
+    }
     assert!(
-        contrast(fg, flame) >= BODY_CONTRAST_BAR,
-        "the text keeps the bar"
+        held,
+        "control: no style's band over narrow letters darkens them past the keep"
     );
-    let paler = light_fire_cov_ceiling(0x0040_4040, bg);
+}
+
+/// ON PAPER SPARKLE'S BAND STAYS GOLD AT THE HEAD: over a 24-key run on
+/// GitHub Light, every frame's band under the two newest letters is ink of
+/// the gold family (whatever hue its wheel has rolled to), so the bed behind
+/// the letter just typed never turns leaf-green or salmon. Negative control:
+/// the phaser's band over the same run, its spectrum, leaves the family.
+#[test]
+fn the_light_sparkle_band_stays_gold_at_the_head() {
+    let g = geom();
+    let strays = |style: GlowStyle| {
+        let mut c = light(style);
+        c.color = crate::cursor_glow::SPARKLE_DEFAULT_COLOR;
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((2, 4)), t, &c, g, &mut out);
+        let (mut seen, mut off) = (0usize, Vec::new());
+        for col in 5..29u16 {
+            t += Duration::from_millis(60);
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((2, col)), t, &c, g, &mut out);
+            let x0 = (col - 2) * g.cw as u16;
+            let x1 = col * g.cw as u16;
+            for q in glow.under_quads() {
+                if q.x + q.w <= x0 || q.x >= x1 || q.alpha < 24 {
+                    continue;
+                }
+                seen += 1;
+                let (h, s, _) = crate::color_math::rgb2hsv(q.color & 0x00FF_FFFF);
+                if !((22.0..=58.0).contains(&h) && s >= 0.35) {
+                    off.push((col, q.color & 0x00FF_FFFF));
+                }
+            }
+        }
+        (seen, off)
+    };
+    let (seen, off) = strays(GlowStyle::Sparkle);
     assert!(
-        paler < ceiling,
-        "paler text, a lower ceiling: {paler} vs {ceiling}"
+        seen > 20,
+        "fixture: the band lies under the newest letters ({seen})"
     );
-    assert!(contrast(0x0040_4040, over(bg, paler)) >= BODY_CONTRAST_BAR);
-    assert!(contrast(over(bg, 34), bg) < 1.3, "the old cap's flame");
-    // The emitted field carries the ceiling: a hot run's patches reach it.
-    let mut c = light(GlowStyle::Fire);
-    c.theme_fg = fg;
-    c.theme_bg = bg;
-    let (glow, _) = typed(&c, 30);
-    let top = glow.patches().iter().map(|p| p.cov_cap).max().unwrap_or(0);
+    assert!(off.is_empty(), "the band left gold at the head: {off:06x?}");
+    let (_, phaser) = strays(GlowStyle::Phaser);
     assert!(
-        f32::from(top) >= f32::from(ceiling) * 0.45,
-        "the light field's cap {top} rides the ceiling {ceiling}"
+        !phaser.is_empty(),
+        "control: the phaser's spectrum band never left the gold family"
     );
+}
+
+/// A LIGHT BAND'S TAIL FADES OUT: after a leap back along its row on paper
+/// (the Settings preview's demo does this), the beam's and sparkle's band
+/// rises from the paper over its oldest cell and a half, so
+/// along its spine no pixel column steps by more than a fifth of the band's
+/// depth (a cut at the tail's end stepped from paper to the whole band in
+/// one column). Control: the band is there, deep in its middle.
+#[test]
+fn a_light_bands_tail_fades_out() {
+    let g = geom();
+    for style in [GlowStyle::Beam, GlowStyle::Sparkle] {
+        let c = light(style);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 30)), t0, &c, g, &mut out);
+        let t = t0 + Duration::from_millis(16);
+        glow.note_synthetic_move(t);
+        glow.tick(Some((2, 4)), t, &c, g, &mut out);
+        let mut glass = Glass::new(g, c.theme_bg);
+        glass.add_quads(glow.under_quads());
+        let paper = crate::color_math::relative_luminance(c.theme_bg);
+        let y = 2 * g.ch as i32 + g.ch as i32 / 2;
+        let depth: Vec<f32> = (6 * g.cw as i32..g.win_w as i32)
+            .map(|x| 1.0 - crate::color_math::relative_luminance(glass.at(y, x)) / paper)
+            .collect();
+        let deep = depth.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            deep > 0.08,
+            "{style:?}: control: the band lies on the row ({deep:.3})"
+        );
+        let step = depth
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            step <= 0.2 * deep,
+            "{style:?}: the band steps {step:.3} in one column (depth {deep:.3})"
+        );
+    }
 }

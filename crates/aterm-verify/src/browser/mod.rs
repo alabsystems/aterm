@@ -44,13 +44,22 @@
 //! session after the first is also held to the first's CPU frames, which
 //! must not move (the CPU module draws in wasm), and its GPU frames' distance
 //! from the first's is reported. Each session's GPU frames are written to
-//! `<target>/verify/cells/browser/<session>/gpu-frames/` (the worker's to
+//! `<target>/verify/cells.noindex/browser/<session>/gpu-frames/` (the worker's to
 //! `worker-frames/`), and the timings each page measured, each frame's
 //! readback timed apart from its render, are printed and written to
-//! `<target>/verify/cells/browser/<session>/timings.json`.
+//! `<target>/verify/cells.noindex/browser/<session>/timings.json`.
 //!
 //! No browser or no stable wasm32 std is COULD NOT RUN with the fix, never a
 //! pass. In no set.
+//!
+//! The check is two halves a host without Trust can run apart, each a verb
+//! of its own that needs no `targo`: `verify browser-site DIR` builds and
+//! binds both modules and lays the site in DIR ([`site_main`]), and `verify
+//! browser-drive SITE OUT [--engine NAME]...` runs the sessions on a site
+//! laid before, judged as above, their frames and timings in OUT
+//! ([`drive_main`]). The Linux lane's guest (`targo --unverified lab linux
+//! browser`, docs/LINUX-RUNTIME-LANE.md) drives this Mac's site that way:
+//! the same module bytes, another OS and CPU.
 
 pub(crate) mod cdp;
 pub(crate) mod chromium;
@@ -63,15 +72,14 @@ pub use chromium::fetch_main;
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
 use aterm_uds::spawnfd::{ChildStdio, LaneChild, LaneCommand, spawn, spawn_with_two_fds};
 
-use crate::Ctx;
 use crate::ladder::Report;
 use crate::perf::Status;
-use crate::plan::{Lane, lane_dir};
+use crate::{Ctx, EnvSnapshot, exit};
 
 const LABEL: &str =
     "browser (both web modules in headless browsers: a WebGL2 boot, GPU vs CPU pixels)";
@@ -243,6 +251,10 @@ impl Engine {
     }
 }
 
+/// Every session's name ([`Engine::name`]), as `browser-drive --engine` takes
+/// it: Chromium's ANGLE backends, then Firefox.
+pub(crate) const ENGINES: [&str; 3] = ["metal", "swiftshader", "firefox"];
+
 /// Build, bind and serve both modules once, then boot the pages in each
 /// browser session: Chromium on each ANGLE backend
 /// ([`chromium::angle_backends`]), then Firefox. Two rows per session.
@@ -255,6 +267,25 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
+    let work = crate::plan::cells_dir(ctx).join("browser");
+    let site = work.join("site");
+    let Some(cost) = build_site(ctx, r, &site, t0) else {
+        return;
+    };
+    let built = Built {
+        site,
+        work,
+        cost: Some(cost),
+        scratch: ctx.scratch.clone(),
+        ceiling: ctx.child_ceiling,
+    };
+    sessions(r, &built, &chromium, &firefox, &[]);
+}
+
+/// Build both modules (`wasm-smoke`'s dev build) and lay the site in `site`
+/// ([`assemble`]): what that cost, counted from `t0`, or `None` with the row
+/// that says why in `r`.
+fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cost> {
     let rustup = match crate::perf::wasm::build_tools(false) {
         Ok(rustup) => rustup,
         Err(refused) => {
@@ -268,48 +299,73 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
                 }
                 _ => r.cannot_run(format!("{LABEL} — its tools answered no verdict")),
             }
-            return;
+            return None;
         }
     };
-    let Some(modules) = crate::wasm_smoke::build_dev(ctx, r, &rustup, "browser", LABEL) else {
-        return;
-    };
+    let modules = crate::wasm_smoke::build_dev(ctx, r, &rustup, "browser", LABEL)?;
     let built_s = t0.elapsed().as_secs_f64();
-    let work = lane_dir(ctx, Lane::CellsTarget)
-        .unwrap_or_else(|| ctx.state_dir().join("cells"))
-        .join("browser");
-    let site = work.join("site");
     let t_bind = Instant::now();
-    if let Err(why) = assemble(&ctx.root, &modules, &site) {
+    if let Err(why) = assemble(&ctx.root, &modules, site) {
         r.fail(format!("{LABEL} — {why}"));
-        return;
+        return None;
     }
-    let built = Built {
-        site,
-        work,
+    Some(Cost {
         built_s,
         bind_ms: ms(t_bind),
-    };
+    })
+}
+
+/// Boot the pages in each browser session `wanted` names ([`ENGINES`];
+/// empty is every session this host runs): Chromium on each of its ANGLE
+/// backends, then Firefox. Two rows per session; a wanted session with no
+/// browser, or one this host does not run, is NOT RUN.
+fn sessions(
+    r: &mut Report,
+    built: &Built,
+    chromium: &Result<chromium::Browser, String>,
+    firefox: &Result<firefox::Firefox, String>,
+    wanted: &[String],
+) {
+    let wants = |name: &str| wanted.is_empty() || wanted.iter().any(|w| w == name);
+    for name in wanted {
+        let here = chromium::angle_backends().iter().any(|a| a.name() == name);
+        if name != "firefox" && !here {
+            r.cannot_run(format!(
+                "{LABEL}, WebGL2 on ANGLE {name} — this host's Chromium sessions are {}",
+                chromium::angle_backends()
+                    .iter()
+                    .map(|a| a.name())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ));
+        }
+    }
+    let angles: Vec<chromium::Angle> = chromium::angle_backends()
+        .iter()
+        .copied()
+        .filter(|a| wants(a.name()))
+        .collect();
     let mut first: Option<(&'static str, Session)> = None;
     let mut run_one = |r: &mut Report, engine: Engine| {
-        let session = session(ctx, r, &built, &engine, first.as_ref());
+        let session = session(r, built, &engine, first.as_ref());
         if first.is_none() {
             first = session.map(|s| (engine.name(), s));
         }
     };
-    match &chromium {
+    match chromium {
+        _ if angles.is_empty() => {}
         Ok(browser) => {
             r.raw(format!(
                 "browser: {} ({}), WebGL2 on ANGLE {}",
                 browser.path.display(),
                 browser.source,
-                chromium::angle_backends()
+                angles
                     .iter()
                     .map(|a| a.name())
                     .collect::<Vec<_>>()
                     .join(" then ")
             ));
-            for &angle in chromium::angle_backends() {
+            for &angle in &angles {
                 run_one(r, Engine::Chromium(browser.clone(), angle));
             }
         }
@@ -318,7 +374,10 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             chromium::FETCH_FIX
         )),
     }
-    match &firefox {
+    if !wants("firefox") {
+        return;
+    }
+    match firefox {
         Ok(f) => {
             r.raw(format!("firefox: {} ({})", f.path.display(), f.source));
             run_one(r, Engine::Firefox(f.clone()));
@@ -330,13 +389,160 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-/// What every session shares: the served site, the lane's directory and
-/// what building and binding cost.
+/// What building the modules and binding them cost.
+#[derive(Clone, Copy)]
+struct Cost {
+    built_s: f64,
+    bind_ms: f64,
+}
+
+/// What every session shares: the served site, the lane's directory, what
+/// building and binding cost (`None` for a site `browser-site` laid), the
+/// scratch the browsers' profiles go in, and the ceiling on one session.
 struct Built {
     site: PathBuf,
     work: PathBuf,
-    built_s: f64,
-    bind_ms: f64,
+    cost: Option<Cost>,
+    scratch: PathBuf,
+    ceiling: Option<Duration>,
+}
+
+/// The pages, spec, font and module glue directories a laid site holds
+/// ([`assemble`]).
+const SITE_FILES: [&str; 9] = [
+    "cpu.html",
+    "gpu.html",
+    "worker.html",
+    "lane.mjs",
+    "worker.mjs",
+    "spec.json",
+    "font.ttf",
+    "cpu",
+    "gpu",
+];
+
+/// The entry of [`SITE_FILES`] `site` lacks, if it lacks one: a directory
+/// `browser-site` never laid.
+fn site_lacks(site: &Path) -> Option<&'static str> {
+    SITE_FILES.into_iter().find(|f| !site.join(f).exists())
+}
+
+/// A verb's report, printed, and its exit status: 1 when a row failed, else
+/// 3 when a row could not run or none ran, else 0.
+fn finish(r: &Report) -> i32 {
+    print!("{}", r.render());
+    let t = crate::ladder::tally(std::slice::from_ref(r));
+    if !t.gate_failures.is_empty() {
+        exit::FAILED
+    } else if !t.could_not_run.is_empty() || r.outcomes().next().is_none() {
+        exit::COULD_NOT_RUN
+    } else {
+        exit::PASS
+    }
+}
+
+/// `verify browser-site DIR`: both modules built (`wasm-smoke`'s dev build,
+/// rustup stable: a STOCK EXCEPTION) and bound, and the lane's site laid in
+/// DIR: the pages, the spec, the font and each module's glue. Exit 0, 1 on a
+/// failed build or bind, 3 when it could not run.
+pub fn site_main(args: &[String], cwd: &Path) -> i32 {
+    let [dir] = args else {
+        eprintln!("verify browser-site: takes one argument, the directory to lay the site in");
+        return exit::USAGE;
+    };
+    let site = cwd.join(dir);
+    let Some(root) = crate::checkout_root(cwd) else {
+        eprintln!(
+            "verify browser-site: COULD NOT RUN — {} is not inside a git checkout",
+            cwd.display()
+        );
+        return exit::COULD_NOT_RUN;
+    };
+    let scratch = match crate::mktemp_dir("atv") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("verify browser-site: COULD NOT RUN — no scratch directory: {e}");
+            return exit::COULD_NOT_RUN;
+        }
+    };
+    let ctx = Ctx::new(
+        root,
+        crate::scope::Scope::workspace(),
+        EnvSnapshot::capture(),
+        scratch.clone(),
+    );
+    let mut r = Report::new("browser-site");
+    if let Some(cost) = build_site(&ctx, &mut r, &site, Instant::now()) {
+        r.pass(format!(
+            "{LABEL}: the site laid in {} (built in {:.1} s, bound in {:.0} ms)",
+            site.display(),
+            cost.built_s,
+            cost.bind_ms
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    finish(&r)
+}
+
+/// `verify browser-drive SITE OUT [--engine NAME]...`: the lane's sessions
+/// on a site `browser-site` laid ([`sessions`]), judged as `verify browser`
+/// judges, each session's frames and timings in `OUT/<session>/`. It builds
+/// nothing and needs no toolchain: what the Linux lane's guest runs. Exit 0,
+/// 1 when a row failed, 3 when a row could not run.
+pub fn drive_main(args: &[String]) -> i32 {
+    let usage = |why: String| {
+        eprintln!(
+            "verify browser-drive: {why} (verify browser-drive SITE OUT [--engine {}]...)",
+            ENGINES.join("|")
+        );
+        exit::USAGE
+    };
+    let mut paths = Vec::new();
+    let mut wanted: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--engine" {
+            let Some(name) = it.next().filter(|n| ENGINES.contains(&n.as_str())) else {
+                return usage("--engine names a session".to_string());
+            };
+            if !wanted.contains(name) {
+                wanted.push(name.clone());
+            }
+        } else if a.starts_with('-') {
+            return usage(format!("unknown option `{a}`"));
+        } else {
+            paths.push(PathBuf::from(a));
+        }
+    }
+    let [site, work] = &paths[..] else {
+        return usage("takes a site and an output directory".to_string());
+    };
+    if let Some(missing) = site_lacks(site) {
+        eprintln!(
+            "verify browser-drive: COULD NOT RUN — {} holds no {missing}: lay it with `verify \
+             browser-site`",
+            site.display()
+        );
+        return exit::COULD_NOT_RUN;
+    }
+    let scratch = match crate::mktemp_dir("atv") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("verify browser-drive: COULD NOT RUN — no scratch directory: {e}");
+            return exit::COULD_NOT_RUN;
+        }
+    };
+    let built = Built {
+        site: site.clone(),
+        work: work.clone(),
+        cost: None,
+        scratch: scratch.clone(),
+        ceiling: Some(crate::exec::DEFAULT_CHILD_CEILING),
+    };
+    let mut r = Report::new(format!("browser-drive ({})", site.display()));
+    sessions(&mut r, &built, &chromium::find(), &firefox::find(), &wanted);
+    let _ = std::fs::remove_dir_all(&scratch);
+    finish(&r)
 }
 
 /// One session: the pages booted in `engine`'s browser, judged, their frames
@@ -346,7 +552,6 @@ struct Built {
 /// browser), and its GPU frames' distance from `first`'s is reported. The
 /// session, when one ran.
 fn session(
-    ctx: &Ctx,
     r: &mut Report,
     built: &Built,
     engine: &Engine,
@@ -364,8 +569,8 @@ fn session(
     }
     let (session_engine, session_site, session_dir) =
         (engine.clone(), built.site.clone(), dir.clone());
-    let profile = ctx.scratch.join(format!("browser-profile-{name}"));
-    let driven = crate::exec::bounded(ctx.child_ceiling, move || {
+    let profile = built.scratch.join(format!("browser-profile-{name}"));
+    let driven = crate::exec::bounded(built.ceiling, move || {
         session_engine.drive(&session_site, &session_dir, &profile)
     });
     let not_run = format!("{worker_label} — the session's pages did not run (above)");
@@ -396,8 +601,8 @@ fn session(
         "adapter": gpu.adapter,
         "user_agent": gpu.user_agent,
         "build": "dev (wasm32, rustup stable)",
-        "build_and_tools_s": (built.built_s * 1e3).round() / 1e3,
-        "bind_ms": built.bind_ms,
+        "build_and_tools_s": built.cost.map_or(Value::Null, |c| json!((c.built_s * 1e3).round() / 1e3)),
+        "bind_ms": built.cost.map_or(Value::Null, |c| json!(c.bind_ms)),
         "browser_ready_ms": session.ready_ms.map_or(Value::Null, |v| json!(v)),
         "requests_served": session.served,
         "cpu": page_timings(&session.cpu),
@@ -821,6 +1026,11 @@ fn drive_firefox(
     work: &Path,
     profile: &Path,
 ) -> Result<Session, Stop> {
+    if let Some(why) =
+        firefox::display_missing(std::env::consts::OS, std::env::var_os("DISPLAY").as_deref())
+    {
+        return Err(Stop::CouldNotRun(why));
+    }
     firefox::make_profile(profile).map_err(Stop::CouldNotRun)?;
     let log = work.join("browser.log");
     let (out, err) = log_stdio(&log)?;
@@ -1027,6 +1237,41 @@ mod tests {
             timing_line("gpu", &page)
         );
         assert!(readback_split(&json!({})).is_none());
+    }
+
+    /// A site is what `browser-site` lays, every entry of it; `browser-drive`
+    /// refuses a directory that lacks one, and its arguments, before any
+    /// browser starts.
+    #[test]
+    fn a_drive_needs_a_laid_site_and_named_sessions() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(&site).expect("site");
+        assert_eq!(site_lacks(&site), Some("cpu.html"));
+        for f in SITE_FILES {
+            if f == "cpu" || f == "gpu" {
+                std::fs::create_dir_all(site.join(f)).expect("glue dir");
+            } else {
+                std::fs::write(site.join(f), "x").expect("file");
+            }
+        }
+        assert_eq!(site_lacks(&site), None);
+        std::fs::remove_dir_all(site.join("gpu")).expect("rm gpu");
+        assert_eq!(site_lacks(&site), Some("gpu"));
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let site_arg = site.display().to_string();
+        assert_eq!(drive_main(&s(&[&site_arg])), exit::USAGE);
+        assert_eq!(
+            drive_main(&s(&[&site_arg, "/o", "--engine", "webkit"])),
+            exit::USAGE
+        );
+        assert_eq!(drive_main(&s(&[&site_arg, "/o", "--fast"])), exit::USAGE);
+        assert_eq!(
+            drive_main(&s(&[&site_arg, "/o", "--engine", "firefox"])),
+            exit::COULD_NOT_RUN,
+            "a site without its gpu glue"
+        );
+        assert_eq!(site_main(&s(&[]), dir.path()), exit::USAGE);
     }
 
     /// A posted answer parses, and a page's error is a finding naming it.

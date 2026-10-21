@@ -99,6 +99,47 @@
 //! again — told twice, never untold. The one loss: a retention trim that
 //! removed a clear below this notifier's cursor before it read it. The budget is
 //! still what bounds a storm of distinct escalations.
+//!
+//! ## On a broker that serves ordered, a page waits until its record is durable
+//!
+//! A push leaves the machine; a power loss on the broker's host can then take
+//! the record it was about ([`crate::durability`]: an ordered broker acks
+//! after an ordering barrier, and flushes in full at most its horizon plus a
+//! batch and a full flush later).
+//! A human paged at 3 a.m. for an escalation the log no longer holds is told
+//! of something nobody can find. So on a broker whose `Hello` says it SERVES
+//! ordered (tag 0x01), a record is paged only once a `Mark` this notifier read
+//! says the broker's durable head is past it — the catch-up `Fetch`'s closing
+//! mark, or the DURABLE MARK astream sends a subscription that asked for idle
+//! marks when a full flush covers what it was delivered. The records the
+//! broker escalates (a halt, mail to a person: `ask:<person>` and `halt`) are
+//! durable before anyone can see them, so they page at once; an `attention=`
+//! row waits at most the horizon plus one batch and one full flush.
+//!
+//! WHILE IT WAITS, nothing moves past it: the record is held in memory in
+//! read order with every later record of its selector, and the selector's
+//! cursor stays AT it, so a notifier killed while holding re-reads it. A
+//! `--once` run leaves a record no full flush covers yet, and everything after
+//! it on that selector, for the next run, and says so. A first record held
+//! says so on stderr too. Held records are bounded ([`HOLD_MAX`] bytes): past
+//! the bound they are paged as they were read, said on stderr — the module's
+//! chosen failure, a page about a record a power loss may still take, never a
+//! page withheld. A broker that LATCHES from ordered to strict while this
+//! notifier is connected (its device refused the barrier while serving) keeps
+//! sending durable marks for the rest of its open — astream sends them to every
+//! idle-marks tail of a log that served ordered at its open, and after the
+//! latch every batch is flushed in full — so what is held pages at the next
+//! batch, not at the idle mark ten seconds of quiet later. A reconnect to the
+//! same log keeps what it holds (the new connection's first mark says how far
+//! it is durable) — unless its broker no longer serves ordered, which sends no
+//! durable mark for it: then it pages at once, in read order, ahead of the new
+//! connection's records. A reconnect to ANOTHER log drops it, and the reader
+//! re-reads from that log's cursor, which never passed it.
+//!
+//! A strict broker's records are durable when visible, and a relaxed broker's
+//! durable head does not move between its opens: waiting there would never
+//! page, and relaxed is the operator's choice of exactly that cost. Both, and a
+//! broker too old to report its tier, page as they always did.
 
 use aterm_uds::spawnfd::Stdio;
 use std::io::{self, Write};
@@ -156,6 +197,14 @@ const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LIMIT: u32 = 10;
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 
+/// How many bytes of records (subject and body) a follow-mode notifier holds
+/// back while it waits for an ordered broker to say they are durable (the
+/// module doc). The horizon (aterm's is 100 ms), the batch in hand and a
+/// full flush bound the normal wait. This cap bounds memory even when traffic
+/// outruns that wait or a broker stops flushing. Past it every held record
+/// is paged as it was read, before durability is known, with a warning.
+const HOLD_MAX: usize = 4 << 20;
+
 #[derive(Debug)]
 enum Notice {
     Record(usize, u64, String, Vec<u8>),
@@ -168,17 +217,34 @@ enum Notice {
     /// any record of that connection, so the executor files each record's
     /// verdict and cursor under the log it was read from ([`Store::for_log`]).
     Log(usize, ReadLog),
+    /// The broker's DURABLE head as a `Mark` on this reader's connection told
+    /// it ([`astream_broker::Event::Mark`]): every record below it is on
+    /// stable media. Sent after the page or the deliveries the mark follows,
+    /// so a record it covers is already in the executor's hands. What
+    /// releases a record held on a broker that serves ordered (the module
+    /// doc).
+    Durable(usize, u64),
 }
 
 /// The log a connection reached: its identity (`None`: a broker that predates
 /// identity) and the lineage the same `Hello` told beside it (`None`: a broker
 /// before lineage, or a log astream recorded none for) — what
 /// [`Store::for_log`] files a reader's cursors and verdicts under, and carries
-/// a moved generation's store over by.
+/// a moved generation's store over by — and whether that `Hello` said the
+/// broker SERVES ordered, which is when a page waits for durability.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ReadLog {
     id: Option<astream_broker::LogIdentity>,
     lineage: Option<astream_broker::Lineage>,
+    ordered: bool,
+}
+
+/// A record a follow-mode notifier holds until its broker says it is durable.
+#[derive(Debug)]
+struct Held {
+    off: u64,
+    subject: String,
+    body: Vec<u8>,
 }
 
 /// A broker reader hands one row directly to the serial notification executor.
@@ -968,12 +1034,30 @@ struct Notifier {
     suppressed: u64,
     fault: Fault,
     counts: Counts,
+    /// Whether a page waits for its record to be durable on a broker that
+    /// serves ordered (the module doc). `false` only under the negative
+    /// control's dev seam, `ATERM_LINK_NOTIFY_PAGE_EARLY` — the notifier
+    /// before the wait.
+    wait_durable: bool,
+    /// By selector index, the records held for durability, in read order
+    /// ([`Notifier::take`]).
+    held: Vec<std::collections::VecDeque<Held>>,
+    /// The bytes [`Self::held`] holds, against [`HOLD_MAX`].
+    held_bytes: usize,
+    /// By selector index, the highest page checkpoint not yet written because
+    /// a held record lies below it: the cursor it moves to once the last held
+    /// record is paged.
+    scanned: Vec<Option<u64>>,
+    /// By selector index, the durable head the reader's current connection
+    /// last told ([`Notice::Durable`]).
+    durable: Vec<u64>,
 }
 
 impl Notifier {
     fn new(cfg: Config) -> io::Result<Self> {
         let store = Store::open(&cfg.state_dir)?;
         let fault = Fault::from_env(&store);
+        let n = cfg.on.len();
         Ok(Self {
             journal: store.journal(),
             standing: store.standing(),
@@ -981,11 +1065,16 @@ impl Notifier {
             suppressed: store.suppressed(),
             log_store: store.clone(),
             log_now: None,
-            reader_log: vec![ReadLog::default(); cfg.on.len()],
+            reader_log: vec![ReadLog::default(); n],
             store,
             cfg,
             fault,
             counts: Counts::default(),
+            wait_durable: aterm_types::dev_seam!("ATERM_LINK_NOTIFY_PAGE_EARLY").is_none(),
+            held: (0..n).map(|_| std::collections::VecDeque::new()).collect(),
+            held_bytes: 0,
+            scanned: vec![None; n],
+            durable: vec![0; n],
         })
     }
 
@@ -1344,17 +1433,36 @@ impl Notifier {
 
     /// Catch up to the head, once, and stop. This is the whole of `--once`, and
     /// it is also what a follow-mode reader's first subscription replays.
+    ///
+    /// On a broker that serves ordered, a selector's scan STOPS at its first
+    /// record the page's closing `Mark` does not say is durable, its cursor
+    /// left at that record for the next run (the module doc).
     fn catch_up(&mut self) -> io::Result<()> {
         let mut conn = self.connect()?;
         let log = log_of(&mut conn, &self.cfg)?;
         self.scope_to(&log)?;
-        for sel in self.cfg.on.clone() {
+        'selectors: for sel in self.cfg.on.clone() {
             let filter = sel.filter(&self.cfg.fleet);
             let key = sel.key();
             let mut from = self.start_offset(&mut conn, &sel)?;
             loop {
                 let (rows, (next, head)) = conn.fetch(from, &filter, PAGE)?;
+                // The page's own mark: how far the broker was durable when it
+                // read it. A broker new enough to serve ordered always says;
+                // one that did not would be paged, never withheld.
+                let durable = conn.seen_durable();
                 for (off, subject, body) in rows {
+                    if self.wait_durable && log.ordered && durable.is_some_and(|d| off >= d) {
+                        self.log_store.set_cursor(&key, off)?;
+                        eprintln!(
+                            "aterm-link notify: {} off={off} is not durable yet (the broker \
+                             serves ordered, and flushes it in full within its horizon plus a \
+                             batch and a full flush): it and what follows it wait for the next \
+                             run",
+                            sel.label()
+                        );
+                        continue 'selectors;
+                    }
                     self.on_record(&sel, off, &subject, &body)?;
                 }
                 self.log_store.set_cursor(&key, next)?;
@@ -1383,29 +1491,7 @@ impl Notifier {
         }
         drop(tx);
         while let Ok(notice) = rx.recv() {
-            match notice {
-                Notice::Log(idx, log) => {
-                    if let Some(slot) = self.reader_log.get_mut(idx) {
-                        *slot = log;
-                    }
-                }
-                Notice::Record(idx, off, subject, body) => {
-                    let Some(sel) = self.cfg.on.get(idx).cloned() else {
-                        continue;
-                    };
-                    let log = self.reader_log[idx].clone();
-                    self.scope_to(&log)?;
-                    self.on_record(&sel, off, &subject, &body)?;
-                    self.log_store.set_cursor(&sel.key(), off + 1)?;
-                }
-                Notice::Checkpoint(idx, next) => {
-                    if let Some(key) = self.cfg.on.get(idx).map(Sel::key) {
-                        let log = self.reader_log[idx].clone();
-                        self.scope_to(&log)?;
-                        self.log_store.set_cursor(&key, next)?;
-                    }
-                }
-            }
+            self.take(notice)?;
         }
         // Every reader gave up, which only happens when they all failed to
         // reconnect for good. Say so rather than exiting 0.
@@ -1413,6 +1499,133 @@ impl Notifier {
             io::ErrorKind::ConnectionAborted,
             "every subscription ended",
         ))
+    }
+
+    /// THE EXECUTOR: one notice from a follow-mode reader, in the order its
+    /// reader sent it.
+    ///
+    /// A record read from a broker that serves ordered and not yet durable is
+    /// HELD, with every later record of its selector, until a
+    /// [`Notice::Durable`] covers it (the module doc); its selector's cursor
+    /// stays at the first held record — a page checkpoint past it is kept in
+    /// [`Self::scanned`] and written once the held records are paged. Every
+    /// other record is paged as it is read, and its cursor moves past it.
+    fn take(&mut self, notice: Notice) -> io::Result<()> {
+        match notice {
+            Notice::Log(idx, log) => {
+                let Some(slot) = self.reader_log.get(idx) else {
+                    return Ok(());
+                };
+                if slot.id != log.id {
+                    // Held from ANOTHER log: offsets that name nothing here. The
+                    // reader re-reads this log from its own cursor, which never
+                    // passed them (a moved generation's carried store clamps it
+                    // at the fork, below which the records are the same).
+                    let dropped: usize = self.held[idx]
+                        .drain(..)
+                        .map(|h| h.subject.len() + h.body.len())
+                        .sum();
+                    self.held_bytes -= dropped;
+                    self.scanned[idx] = None;
+                }
+                // A new connection's own marks say how far it is durable.
+                self.durable[idx] = 0;
+                let ordered = log.ordered;
+                self.reader_log[idx] = log;
+                // THE SAME LOG, NOW SERVED BY A BROKER THAT DOES NOT SERVE
+                // ORDERED (restarted strict or relaxed, or latched): it sends no
+                // durable mark for what is held, and the new connection's
+                // records would page ahead of it. What is held is as durable
+                // as this broker will ever say (its open flushed the log in
+                // full), so it pages now, in read order, before any record of
+                // the new connection.
+                if !ordered && !self.held[idx].is_empty() {
+                    self.release(idx, u64::MAX)?;
+                }
+            }
+            Notice::Record(idx, off, subject, body) => {
+                let Some(sel) = self.cfg.on.get(idx).cloned() else {
+                    return Ok(());
+                };
+                let log = self.reader_log[idx].clone();
+                self.scope_to(&log)?;
+                let waits = self.wait_durable
+                    && log.ordered
+                    && (!self.held[idx].is_empty() || off >= self.durable[idx]);
+                if waits {
+                    let size = subject.len() + body.len();
+                    if self.held_bytes + size <= HOLD_MAX {
+                        if self.held[idx].is_empty() {
+                            eprintln!(
+                                "aterm-link notify: {} off={off} waits until the broker says it \
+                                 is durable (it serves ordered: its horizon plus one batch \
+                                 and one full flush)",
+                                sel.label()
+                            );
+                        }
+                        self.held_bytes += size;
+                        self.held[idx].push_back(Held { off, subject, body });
+                        return Ok(());
+                    }
+                    // THE BOUND: page what is held, as it was read, then this.
+                    eprintln!(
+                        "aterm-link notify: {} holds {} bytes the broker has not said are \
+                         durable — past {HOLD_MAX}, so they are paged now, before it does",
+                        sel.label(),
+                        self.held_bytes + size
+                    );
+                    self.release(idx, u64::MAX)?;
+                }
+                self.on_record(&sel, off, &subject, &body)?;
+                self.log_store.set_cursor(&sel.key(), off + 1)?;
+            }
+            Notice::Checkpoint(idx, next) => {
+                let Some(key) = self.cfg.on.get(idx).map(Sel::key) else {
+                    return Ok(());
+                };
+                if self.held[idx].is_empty() {
+                    let log = self.reader_log[idx].clone();
+                    self.scope_to(&log)?;
+                    self.log_store.set_cursor(&key, next)?;
+                } else {
+                    self.scanned[idx] = Some(self.scanned[idx].map_or(next, |s| s.max(next)));
+                }
+            }
+            Notice::Durable(idx, durable) => {
+                let Some(slot) = self.durable.get_mut(idx) else {
+                    return Ok(());
+                };
+                *slot = (*slot).max(durable);
+                let durable = *slot;
+                self.release(idx, durable)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Page selector `idx`'s held records below `durable`, oldest first, each
+    /// cursor moved past it as it goes; once none is held, write the page
+    /// checkpoint they held back.
+    fn release(&mut self, idx: usize, durable: u64) -> io::Result<()> {
+        let Some(sel) = self.cfg.on.get(idx).cloned() else {
+            return Ok(());
+        };
+        let log = self.reader_log[idx].clone();
+        self.scope_to(&log)?;
+        while self.held[idx].front().is_some_and(|h| h.off < durable) {
+            let Some(h) = self.held[idx].pop_front() else {
+                break;
+            };
+            self.held_bytes -= h.subject.len() + h.body.len();
+            self.on_record(&sel, h.off, &h.subject, &h.body)?;
+            self.log_store.set_cursor(&sel.key(), h.off + 1)?;
+        }
+        if self.held[idx].is_empty() {
+            if let Some(next) = self.scanned[idx].take() {
+                self.log_store.set_cursor(&sel.key(), next)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1471,6 +1684,13 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                     // zero-buffer handoff. Once accepted, those rows have all
                     // been processed, even if the checkpoint's fsync is pending.
                     seen = Some(seen.map_or(next, |s| s.max(next)));
+                    // And the page's mark: how far the broker was durable when
+                    // it read the page (what releases a record held for it).
+                    if let Some(durable) = conn.seen_durable() {
+                        if tx.send(Notice::Durable(idx, durable)).is_err() {
+                            return;
+                        }
+                    }
                     let made_progress = next > from;
                     from = next;
                     if next >= head || !made_progress {
@@ -1485,16 +1705,36 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                             // back as a LIVENESS bound on the broker's first
                             // idle mark — so a link that went silent without a
                             // FIN ends the subscription and is redialled,
-                            // instead of parking this reader for good.
+                            // instead of parking this reader for good. Every
+                            // mark re-arms it: astream's `recv_live` rule,
+                            // read event by event (`recv_live_event`) because
+                            // a mark also carries the durable head — the
+                            // durable mark an ordered broker (or one that
+                            // latched from ordered to strict since) sends when
+                            // a full flush covers what this subscription was
+                            // delivered.
                             let _ = closer.set_read_timeout(None);
                             loop {
-                                match sub.recv_live(&closer, astream_broker::IDLE_MARK_DEADLINE) {
-                                    Ok(Some((off, subject, body))) => {
+                                match sub
+                                    .recv_live_event(&closer, astream_broker::IDLE_MARK_DEADLINE)
+                                {
+                                    Ok(Some(astream_broker::Event::Delivery {
+                                        offset: off,
+                                        subject,
+                                        body,
+                                    })) => {
                                         if tx.send(Notice::Record(idx, off, subject, body)).is_err()
                                         {
                                             return; // the executor is gone
                                         }
                                         seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
+                                    }
+                                    Ok(Some(astream_broker::Event::Mark { durable, .. })) => {
+                                        if let Some(durable) = durable {
+                                            if tx.send(Notice::Durable(idx, durable)).is_err() {
+                                                return;
+                                            }
+                                        }
                                     }
                                     Ok(None) => break,
                                     Err(e) => {
@@ -1586,7 +1826,17 @@ fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
     let lineage = conn.log_lineage().cloned();
     #[cfg(test)]
     let lineage = lineage.filter(|_| !FORGET_LINEAGE.with(std::cell::Cell::get));
-    Ok(ReadLog { id, lineage })
+    // The tier IN FORCE, as the same answer told it: only a broker that
+    // serves ordered makes a page wait (one asked for ordered and serving
+    // strict has durable records the moment they are visible).
+    let ordered = conn
+        .served_durability()
+        .is_some_and(|s| s.served == astream_broker::Tier::Ordered);
+    Ok(ReadLog {
+        id,
+        lineage,
+        ordered,
+    })
 }
 
 #[cfg(test)]
@@ -1625,7 +1875,12 @@ aterm-link notify — run a command when the fabric needs a human
 The command runs once per matching offset, deduped across restarts, and for
 attention once per escalation: a session's row republished with the attention
 it was told of pages nobody; a clear and a raise pages again. A crash during
-the exec re-fires it with ATERM_NOTIFY_DUP=1: twice, never zero times.
+the exec re-fires it with ATERM_NOTIFY_DUP=1: twice, never zero times. On a
+broker that serves ordered a record pages once the broker says it is durable
+(a halt or mail to a person at once; an attention row after its horizon plus
+one batch and one full flush). If the bounded holding buffer fills, the
+notifier warns and pages held records before durability is known; those can
+still be lost in a power loss. --once leaves one not durable yet for the next run.
 ";
 
 /// `aterm-link notify`.
@@ -2358,8 +2613,8 @@ mod tests {
             assert_eq!(off, 0);
             (sock.to_string_lossy().into_owned(), broker, handle)
         };
-        let (a, broker_a, _a) = serve("a");
-        let (b, broker_b, _b) = serve("b");
+        let (a, broker_a, mut server_a) = serve("a");
+        let (b, broker_b, mut server_b) = serve("b");
         let fired = base.join("fired");
         let mut c = cfg(&dir);
         c.since = Since::Start;
@@ -2399,6 +2654,9 @@ mod tests {
             .join(broker_b.log_identity().to_string())
             .join("cur/attention")
             .exists());
+        // Before the dir goes, while their names still reach the acceptors.
+        server_a.shutdown();
+        server_b.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2511,11 +2769,15 @@ mod tests {
             now.id, before.id,
             "{tag}: the same log, whatever its generation"
         );
-        let _server = reopened.broker.serve(&sock).unwrap();
+        let mut server = reopened.broker.serve(&sock).unwrap();
         let off = escalate("help-9");
         FORGET_LINEAGE.with(|f| f.set(forget));
         let after = run().lines().skip(4).map(str::to_string).collect();
         FORGET_LINEAGE.with(|f| f.set(false));
+        // Shut down while the socket's names still reach its acceptor: with the
+        // dir removed first, shutdown dials nobody and abandons the acceptor after
+        // astream's ten unanswered 100 ms rounds, a second per stop.
+        server.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             moved,
@@ -2683,6 +2945,252 @@ mod tests {
             .unwrap();
         assert_eq!(foreign.cursor("attention"), None, "another id: a first run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE EXECUTOR HOLDS A RECORD UNTIL A DURABLE MARK COVERS IT, on a
+    /// broker that serves ordered — the follow-mode notices, fed in the
+    /// order a reader sends them. An attention row at offset 5 is held (no
+    /// page, no cursor), and so is the one at 7 behind it; the page
+    /// checkpoint past both (9) waits too. A durable head of 5 releases
+    /// nothing (5 is not below it); 6 pages 5 and moves the cursor to 6; 8
+    /// pages 7 and writes the held-back checkpoint, 9. A reconnect to ANOTHER
+    /// log drops what is held there, unpaged; a reconnect to the same log
+    /// whose broker no longer serves ordered pages what is held at once, ahead
+    /// of its own first record; a record past [`HOLD_MAX`] is paged with
+    /// everything held before it, in order.
+    ///
+    /// NEGATIVE CONTROLS: the same notices from a broker that serves strict,
+    /// and from an ordered one with the wait turned off (the dev seam the
+    /// end-to-end control uses), page every record the moment it is read.
+    #[test]
+    fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
+        let presence = |sid: &str| format!("/f/f1/pub/n-a/{sid}/presence");
+        let raise = |text: &str| format!("v=1 t=1 attention={text}").into_bytes();
+        let log = |ordered: bool, generation: u64| ReadLog {
+            id: Some(astream_broker::LogIdentity {
+                id: [7; 16],
+                generation,
+            }),
+            lineage: None,
+            ordered,
+        };
+        let feed = |n: &mut Notifier, notices: Vec<Notice>| {
+            for notice in notices {
+                n.take(notice).expect("take");
+            }
+        };
+        let cursor = |n: &Notifier| n.log_store.cursor(&Sel::Attention.key());
+
+        let dir = scratch("held");
+        let (mut n, fired) = appending(&dir, 100, "");
+        feed(
+            &mut n,
+            vec![
+                Notice::Log(0, log(true, 0)),
+                Notice::Record(0, 5, presence("s-a"), raise("key")),
+                Notice::Record(0, 7, presence("s-b"), raise("disk")),
+                Notice::Checkpoint(0, 9),
+            ],
+        );
+        assert!(fired_offsets(&fired).is_empty(), "held, not paged");
+        assert_eq!(cursor(&n), None, "and nothing moves past them");
+        n.take(Notice::Durable(0, 5)).unwrap();
+        assert!(
+            fired_offsets(&fired).is_empty(),
+            "5 is not below a durable 5"
+        );
+        n.take(Notice::Durable(0, 6)).unwrap();
+        assert_eq!(fired_offsets(&fired), [5]);
+        assert_eq!(cursor(&n), Some(6), "past the paged one, at the held one");
+        n.take(Notice::Durable(0, 8)).unwrap();
+        assert_eq!(fired_offsets(&fired), [5, 7]);
+        assert_eq!(cursor(&n), Some(9), "the held-back checkpoint");
+        assert_eq!(n.held_bytes, 0);
+
+        // A reconnect to another log drops what it held there.
+        feed(
+            &mut n,
+            vec![
+                Notice::Record(0, 10, presence("s-c"), raise("lost")),
+                Notice::Log(0, log(true, 1)),
+                Notice::Durable(0, 99),
+            ],
+        );
+        assert_eq!(
+            fired_offsets(&fired),
+            [5, 7],
+            "another log's offset pages nothing"
+        );
+        assert_eq!(n.held_bytes, 0);
+
+        // The same log, its broker restarted without ordered: what is held pages
+        // at once, in order, ahead of the new connection's first record.
+        feed(
+            &mut n,
+            vec![
+                Notice::Log(0, log(true, 1)),
+                Notice::Record(0, 20, presence("s-f"), raise("held")),
+                Notice::Log(0, log(false, 1)),
+                Notice::Record(0, 21, presence("s-g"), raise("strict")),
+            ],
+        );
+        assert_eq!(fired_offsets(&fired), [5, 7, 20, 21], "in read order");
+        assert_eq!(n.held_bytes, 0);
+        n.take(Notice::Log(0, log(true, 1))).unwrap();
+
+        // THE BOUND: past it, every held record pages, in order, then the new one.
+        feed(
+            &mut n,
+            vec![
+                Notice::Record(0, 30, presence("s-d"), raise("first")),
+                Notice::Record(0, 31, presence("s-e"), {
+                    let mut body = raise("big");
+                    body.resize(HOLD_MAX, b' ');
+                    body
+                }),
+            ],
+        );
+        assert_eq!(fired_offsets(&fired), [5, 7, 20, 21, 30, 31]);
+        assert_eq!(n.held_bytes, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (tag, ordered, wait) in [("strict", false, true), ("early", true, false)] {
+            let dir = scratch(tag);
+            let (mut n, fired) = appending(&dir, 100, "");
+            n.wait_durable = wait;
+            feed(
+                &mut n,
+                vec![
+                    Notice::Log(0, log(ordered, 0)),
+                    Notice::Record(0, 5, presence("s-a"), raise("key")),
+                    Notice::Checkpoint(0, 9),
+                ],
+            );
+            assert_eq!(fired_offsets(&fired), [5], "{tag}: paged as read");
+            assert_eq!(cursor(&n), Some(9), "{tag}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A broker opened as aterm opens an ordered one, but with NO HORIZON, so
+    /// its durable head moves only for an escalated record or a
+    /// `flush_durable` — what this file's ordered tests depend on, and
+    /// nothing else. `None` where astream serves ordered strict (off macOS):
+    /// there every record is durable when visible, and the tests say so.
+    fn ordered_broker(log: &Path) -> Option<astream_broker::Broker> {
+        let mut opts = crate::durability::Durability::Ordered.options();
+        opts.durability = astream_broker::Durability::Ordered { horizon: None };
+        let broker =
+            astream_broker::Broker::open_opts(log, opts, || Ok(astream_broker::Prepared::Nothing))
+                .expect("open");
+        (broker.served_durability().served == astream_broker::Tier::Ordered).then_some(broker)
+    }
+
+    /// **ON A BROKER THAT SERVES ORDERED, `--once` PAGES A RECORD ONLY ONCE IT
+    /// IS DURABLE** (the module doc). An attention row (a presence record:
+    /// not escalated) is not durable when the first run reads it, so the run
+    /// pages nothing and leaves the selector's cursor AT it; once the broker
+    /// has flushed in full (`flush_durable`), the next run pages it, once. A
+    /// halt row IS escalated (aterm's table, `Subject("/f/*/fleet/>")`): it
+    /// is durable before it is visible, and pages on the first run.
+    ///
+    /// NEGATIVE CONTROL: the notifier before the wait (its dev seam's field
+    /// off) pages the attention row on the first run, before any full flush
+    /// — the page a power loss could leave pointing at nothing.
+    #[cfg(unix)]
+    #[test]
+    fn an_ordered_broker_pages_a_record_only_once_it_is_durable() {
+        for wait in [true, false] {
+            let dir = scratch(&format!("ord-{wait}"));
+            let base = PathBuf::from(&dir);
+            std::fs::create_dir_all(&base).expect("scratch");
+            let log = base.join("o.log");
+            let sock = base.join("o.sock");
+            let Some(broker) = ordered_broker(&log) else {
+                eprintln!("ordered is served strict here: nothing waits, nothing to prove");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            };
+            let _server = broker.serve(&sock).unwrap();
+            let fired = base.join("fired");
+            let mut c = cfg(&dir);
+            c.broker = sock.to_string_lossy().into_owned();
+            c.since = Since::Start;
+            c.limit = 10;
+            c.on = vec![Sel::Attention, Sel::Halt];
+            c.exec = format!(
+                "printf '%s %s\\n' \"$ATERM_NOTIFY_ON\" \"$ATERM_NOTIFY_OFFSET\" >> {}",
+                fired.display()
+            );
+            let run = || {
+                let mut n = Notifier::new(c.clone()).expect("open");
+                n.wait_durable = wait;
+                n.catch_up().expect("catch up");
+                (
+                    std::fs::read_to_string(&fired).unwrap_or_default(),
+                    n.log_store.cursor(&Sel::Attention.key()),
+                )
+            };
+            let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+            let raised = conn
+                .publish(
+                    7,
+                    1,
+                    "/f/f1/pub/n-a/s-x/presence",
+                    b"v=1 t=1 attention=needs%20a%20key",
+                )
+                .unwrap()
+                .0;
+            let halt = conn
+                .publish(
+                    8,
+                    1,
+                    "/f/f1/fleet/h-x/halt",
+                    b"v=1 t=1 state=on reason=stop",
+                )
+                .unwrap()
+                .0;
+            assert!(broker.durable_head() > halt, "the halt is escalated");
+            // The escalated halt's full flush covered the row before it: a
+            // later row is what waits.
+            let waits = conn
+                .publish(
+                    7,
+                    2,
+                    "/f/f1/pub/n-b/s-y/presence",
+                    b"v=1 t=1 attention=disk",
+                )
+                .unwrap()
+                .0;
+            assert!(raised < halt && broker.durable_head() <= waits);
+            let (first, at) = run();
+            if wait {
+                assert_eq!(
+                    first,
+                    format!("attention {raised}\nhalt {halt}\n"),
+                    "only what is durable pages"
+                );
+                assert_eq!(at, Some(waits), "the cursor stays AT the row that waits");
+                broker.flush_durable().expect("a full flush");
+                assert!(broker.durable_head() > waits);
+                let (second, at) = run();
+                assert_eq!(
+                    second,
+                    format!("attention {raised}\nhalt {halt}\nattention {waits}\n"),
+                    "durable now: paged, once"
+                );
+                assert_eq!(at, Some(waits + 1));
+                assert_eq!(run().0, second, "and never again");
+            } else {
+                assert_eq!(
+                    first,
+                    format!("attention {raised}\nattention {waits}\nhalt {halt}\n"),
+                    "NEGATIVE CONTROL: paged before any full flush covered it"
+                );
+            }
+            drop(conn);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A lineage of these steps ([`crate::durability::lineage_of`]).

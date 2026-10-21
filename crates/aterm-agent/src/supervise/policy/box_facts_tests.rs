@@ -55,6 +55,8 @@ fn every_fact() -> BoxFacts {
         }),
         box_call: Some("Bash".to_string()),
         login_carry: true,
+        login_back: true,
+        login_renewed: true,
         login_method: Some(aterm_phase::LoginMethod::Subscription),
     }
 }

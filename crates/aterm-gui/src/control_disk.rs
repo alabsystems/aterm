@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::disk::Level;
 use aterm_sysprobe::volumes::{Reading, Unread, VolumeKey};
 
-use crate::disk_board::{PassSummary, Shelf, VolumeRow, Watch};
+use crate::disk_board::{Board, PassSummary, Shelf, VolumeRow, Watch};
 
 /// The usage line.
 pub(crate) const USAGE: &str = "ERR usage: await sys <free>=<size>|free><size>|free>=room|\
@@ -422,6 +422,20 @@ fn row_of(
     }
 }
 
+/// Whether a wait from session `session`, whose tab reports `cwd` with 8.3
+/// short names, spells it long before it asks the board
+/// (`cmd_await_sys`): only where board `b` places the session nowhere — no
+/// look mapped it ([`Board::row_of`]'s sessions) and no long spelling of
+/// that very spelling is kept for it ([`Board::spelled`], which may place
+/// on no row yet). A tab the board places costs its wait no file-system
+/// call (rev6-l-2). Pure.
+fn spell_owed(b: &Board, session: u64, cwd: &Path) -> bool {
+    b.row_of(session, cwd.to_str()).is_none()
+        && b.spelled
+            .get(&session)
+            .is_none_or(|(short, _)| short != cwd)
+}
+
 /// The unix clock now.
 fn unix_now() -> i64 {
     aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX))
@@ -450,7 +464,15 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
     let Some(path) = path else {
         return "ERR unavailable free why=unreadable\n".to_owned();
     };
-    // A reading at most ARM_FRESH old.
+    // A reading at most ARM_FRESH old, carried on from the row the board
+    // holds for the volume it READ — its room, its lines and whether a pass
+    // removes there. A spelling the board could not place (an 8.3 `vol=`,
+    // or an 8.3 tab not spelled long yet) gave no key, and the reader places
+    // it where the board's table cannot (it spells short names long): a row
+    // built from nothing there answered `free>=room` `why=room-unknown` and
+    // a demand `why=not-reclaimed` on a volume the watch measured (live5
+    // F1). A path that now names another volume carries on that volume's
+    // row, if any — never the one its spelling named before.
     let fresh = |key: Option<&VolumeKey>| -> Result<VolumeRow, String> {
         let old = key.and_then(|k| shelf.board_lock().row_keyed(k).cloned());
         if let Some(o) = old.as_ref().filter(|o| o.as_of.elapsed() <= ARM_FRESH) {
@@ -458,6 +480,10 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
         }
         let reading =
             (env.read)(&path).map_err(|u| format!("ERR unavailable free why={}\n", u.word()))?;
+        let old = match old {
+            Some(o) if o.reading.key == reading.key => Some(o),
+            _ => shelf.board_lock().row_keyed(&reading.key).cloned(),
+        };
         let row = row_of(reading, old.as_ref(), unix_now(), env.lines);
         let published = row.clone();
         shelf.publish(|b| b.refresh(published));
@@ -683,9 +709,8 @@ pub(crate) fn cmd_await_sys(
         Ok(w) => w,
         Err(reply) => return reply.to_owned(),
     };
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        return "ERR unavailable free why=unsupported\n".to_owned();
-    }
+    // Every platform with a volume reader waits (macOS, Linux, Windows); one
+    // without answers `why=unsupported` from its reader's refusal.
     let cwd = {
         use crate::cwd_native::ReportedCwd as _;
         term.try_lock()
@@ -697,6 +722,24 @@ pub(crate) fn cmd_await_sys(
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
+    // A directory reported with 8.3 short names, which the board places
+    // nowhere for this session — no look mapped the tab, and it is not
+    // spelled long yet — is spelled long here, on the wait's own thread,
+    // before the board is asked where it is (`harness_host::disk_spell_now`):
+    // the wait then carries on its volume's row, and `status disk=` places
+    // the tab too (live5 F2). A tab the board places already is not asked
+    // about (rev6-l-2): its wait reads its row's mount, as it did before
+    // spellings were kept. The spelling's one file-system call waits at
+    // most `harness_host::DISK_SPELL_DEADLINE`, outside this wait's own
+    // `timeout=` and hang-up checks, and once stuck answers at once.
+    if let Some(c) = cwd.as_deref().filter(|c| {
+        crate::harness_host::disk_short_spelled(c)
+            && spell_owed(&crate::disk_board::SHELF.board_lock(), session, c)
+    }) {
+        let _quiet = aterm_sysprobe::quiet_errors();
+        let table = aterm_sysprobe::volumes::table();
+        crate::harness_host::disk_spell_now(&crate::disk_board::SHELF, &table, session, c);
+    }
     let who = Who {
         session,
         cwd,
@@ -721,13 +764,10 @@ pub(crate) fn cmd_await_sys(
         |p: &Path| aterm_agent::harness::disk::volume_of(p, &aterm_sysprobe::volumes::table());
     let sid = session.to_string();
     let poke = |need: u64| {
-        aterm_agent::harness::disk::poke::poke(
-            aterm_agent::harness::disk::poke::Cause::Demand {
-                sid: sid.clone(),
-                need,
-            },
-            unix_now(),
-        );
+        aterm_agent::harness::disk::poke::poke(aterm_agent::harness::disk::poke::Cause::Demand {
+            sid: sid.clone(),
+            need,
+        });
     };
     let settings = || {
         let r = aterm_agent::harness::cli::disk_config_read(

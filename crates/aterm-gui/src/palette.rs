@@ -310,6 +310,9 @@ pub(crate) struct PaletteLive {
     /// View ▸ Show Needs in Windows' checkmark (`[presence] rim`, as the App
     /// currently applies it).
     pub needs_in_windows: bool,
+    /// View ▸ Stats Bars' radio: the form the App applies (`[sys]
+    /// stats_bars`); `None` in a pure test that names none.
+    pub stats_bars: Option<crate::stats_deck::StatsBars>,
     /// The Agents rows' live bits: a local need (Next That Needs You), a
     /// fleet (Read the Fleet, Fleet Machines), a window (Overview), and why
     /// Summarize cannot start, `None` when it can.
@@ -735,6 +738,24 @@ impl PaletteState {
                     row.enabled = live.terminal_front && live.front_person_hold;
                 }
                 MenuAction::ToggleNeedsInWindows => row.checked = Some(live.needs_in_windows),
+                MenuAction::StatsBarsDeck
+                | MenuAction::StatsBarsSill
+                | MenuAction::StatsBarsOff => {
+                    row.checked = Some(
+                        live.stats_bars
+                            .unwrap_or(crate::stats_deck::StatsBars::Deck)
+                            == action
+                                .stats_bars_form()
+                                .unwrap_or(crate::stats_deck::StatsBars::Deck),
+                    );
+                }
+                // The lens hangs from the bars: none to hang from, nothing to open.
+                MenuAction::ToggleStatsLens => {
+                    row.enabled = live
+                        .stats_bars
+                        .unwrap_or(crate::stats_deck::StatsBars::Deck)
+                        .shown();
+                }
                 _ => {}
             }
         }

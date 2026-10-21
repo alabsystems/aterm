@@ -19,10 +19,21 @@
 //!   `decision`, `help`). They close when the step closes, on `seen` (a
 //!   failure), or on a `clear` from whoever raised them or from the owner
 //!   (a claim's `clear`, src=mark, lifts only needs a claim raised:
-//!   [`clear_lifts`]);
-//!   a run's failure also closes when a later run of its kind ends `ok` or
-//!   `fail`, the newest command's outcome being the one that counts
-//!   ([`lifts_failure`]).
+//!   [`clear_lifts`]).
+//!   A `seen` lifts EVERY failure need, whoever wrote it and whichever run
+//!   failed: the person's (`by=human`, a failure looked at) or the
+//!   harness's after a relaunch (`by=harness`). The fold does not scope it,
+//!   so its producer does: the harness writes one only beside a relaunch
+//!   row whose step brought a new agent process up (never a turn it typed
+//!   into the running agent, a stop or a wait), and only when the session's
+//!   only failure need is on a closed run an agent ran under and a run of
+//!   its kind that opened after that close is open: the agent's end the
+//!   restart replaced (session log Phase 6 step 6C-1,
+//!   `SessionLog::harness_saw_failure`).
+//!   A run's failure also closes when a later run of its kind ends `ok` or
+//!   `fail` ([`lifts_failure`]). That is the log's own rule, not `status
+//!   outcome=`'s: status clears its outcome when the next unit of work
+//!   starts, while the need stands until a later run ENDS or a `seen`.
 //!   A `need` mark raises only `review`, `decision` or `help` (`escalated`
 //!   only from `src=meta`, the owner's attention flag): a claim never
 //!   raises an observed need's word. A need is its raiser's: one raised
@@ -683,8 +694,17 @@ pub struct Fold {
     /// The shell phase, kept apart from the agent word.
     shell_phase: Option<Phase>,
     /// The delivered `kind=task` mails no turn has taken, oldest first
-    /// (phase 5, [`mail`]): not carried.
+    /// (phase 5, [`mail`]), at most [`MAX_MAIL_WAITING`]: carried in the
+    /// local carry since Phase 6 (6C-5, ruling U19).
     mail: Vec<MailWaiting>,
+    /// THE MAIL LATCH (phase 5's T39, held here since Phase 6 step 6C-5,
+    /// ruling U19): a `mail dir=in` record since the last `human` mark of an
+    /// input that reached the program (one without `reached=0`). The host
+    /// reads it ([`Fold::in_since_human`]) to mark the person's next such
+    /// input whatever its burst, so the fold can read "no person between the
+    /// mail and the turn" from records; it is the one source, and it crosses
+    /// a seamless update in the local carry with the waiting mails.
+    in_since_human: bool,
     /// The heuristic mail links of the open turns and the newest closed
     /// one ([`Fold::mail_link`]).
     links: Vec<(Node, MailLink)>,
@@ -784,16 +804,35 @@ impl Fold {
     /// THE HEURISTIC MAIL LINK of turn `node` (phase 5, [`mail`]): the
     /// delivered mail it most likely acted on, always
     /// [`Conf::Heuristic`]; held for the open turns and the newest closed
-    /// one. No wire prints it (rulings T10b, T36).
+    /// one. Only the local `brief` prints it, as `mail=@<off>~` on the
+    /// turn's line; `log`, the bus and the ledger never do (rulings T10b,
+    /// T36; Phase 6 step 6C-3, ruling U5).
     #[must_use]
     pub fn mail_link(&self, node: Node) -> Option<MailLink> {
         self.links.iter().find(|(n, _)| *n == node).map(|(_, l)| *l)
+    }
+
+    /// Every heuristic mail link the fold holds ([`Fold::mail_link`]), for
+    /// the local `brief` to print (6C-3, U5). A bus fold holds none: the
+    /// waiting mails it would link are never on the bus.
+    #[must_use]
+    pub fn mail_links(&self) -> &[(Node, MailLink)] {
+        &self.links
     }
 
     /// The delivered `kind=task` mails no turn has taken, oldest first.
     #[must_use]
     pub fn mail_waiting(&self) -> &[MailWaiting] {
         &self.mail
+    }
+
+    /// THE MAIL LATCH ([`Fold`]'s `in_since_human`): mail was delivered
+    /// (`mail dir=in`) since the last `human` mark of an input that reached
+    /// the program. Set by the mail's record, cleared by such a mark and by a
+    /// reset, never by a `reached=0` mark.
+    #[must_use]
+    pub const fn in_since_human(&self) -> bool {
+        self.in_since_human
     }
 
     /// A turn opened: link it to the one mail waiting in its window, or
@@ -1258,6 +1297,8 @@ impl Fold {
                 // observed need closes by observation alone.
                 self.drop_needs(|n| clear_lifts(src, by, word, n));
             }
+            // Every failure need, unscoped: the harness's `seen` is guarded
+            // at its producer (module doc, 6C-1).
             Kind::Seen => self.drop_needs(|n| n.word == "failure"),
             // Claims are stored as made, whoever made them (every one stays
             // in the ring and in `log`); a trusted author's newest is kept
@@ -1293,6 +1334,9 @@ impl Fold {
                 Some("in") => {
                     self.st.totals.mail_in = self.st.totals.mail_in.saturating_add(1);
                     self.st.mail_open = self.st.mail_open.saturating_add(1);
+                    // The person's next input that reaches the program is
+                    // marked (T39), whatever its burst.
+                    self.in_since_human = true;
                     // A task waits for the turn it may have started (phase 5).
                     if let (Some("task"), Some(off)) =
                         (r.f.get_word(Key::MailKind), r.f.get_u(Key::Off))
@@ -1328,6 +1372,7 @@ impl Fold {
                 // view scroll, a selection) answered nothing.
                 if r.f.get_u(Key::Reached) != Some(0) {
                     self.mail.clear();
+                    self.in_since_human = false;
                 }
             }
             Kind::Agent => {
@@ -1406,7 +1451,9 @@ impl Fold {
             // is unknown now, and a step's need cannot be closed any more.
             self.tracked.clear();
             self.drop_needs(|n| n.node.lvl == Lvl::Step);
+            // What waited for a turn of the old space waits for none now.
             self.mail.clear();
+            self.in_since_human = false;
             self.prune_links();
             self.reproject();
         }
@@ -1444,12 +1491,16 @@ impl Fold {
 }
 
 /// Whether the close of run `closed` (kind `kind`, outcome `out`) lifts
-/// `need`: THE failure-supersede rule. A shell command's failure is the
-/// newest command's outcome, as `status outcome=` holds it, so a later run
-/// of the same kind that ends `ok` or `fail` replaces it (a `fail` raises
-/// its own). A run that ended `unknown` (interrupted, its block gone) says
-/// nothing about the earlier failure, and a run of another kind (a program
-/// in front) is not the next command.
+/// `need`: THE failure-supersede rule. A later run of the same kind that
+/// ends `ok` or `fail` replaces a run's failure (a `fail` raises its own),
+/// so the session's failure is the newest finished run's. It is the log's
+/// own rule, not `status outcome=`'s: status clears its remembered outcome
+/// as soon as the next unit of work starts (`session_status`'s publish
+/// step), while this need stands until a later run of the kind ENDS, or a
+/// `seen` lifts it (every failure need at once, see the module doc). A run
+/// that ended `unknown` (interrupted, its block gone) says nothing about
+/// the earlier failure, and a run of another kind (a program in front) is
+/// not the next command.
 #[must_use]
 pub fn lifts_failure(kind: Kind, out: &str, closed: Node, need: &Need) -> bool {
     matches!(out, "ok" | "fail")

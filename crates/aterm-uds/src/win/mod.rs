@@ -517,16 +517,21 @@ impl io::Read for &CtlStream {
     }
 }
 
-impl io::Write for &CtlStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+/// The most slices one [`io::Write::write_vectored`] hands `WSASend`, the
+/// same bound as `IOV_MAX` on Unix; the rest is a short write.
+const MAX_SEND_BUFS: usize = 1024;
+
+impl CtlStream {
+    /// Run `attempt`, one non-blocking `send`/`WSASend` answering the bytes it
+    /// sent or `None` on `SOCKET_ERROR`, until it sends: parked on the
+    /// readiness event while the socket has no room, under the write timeout.
+    fn send_with(&self, mut attempt: impl FnMut() -> Option<usize>) -> io::Result<usize> {
         let inner = &self.0;
         let timeout = inner.write_timeout_ms.load(Ordering::Relaxed);
         let deadline = (timeout != 0).then(|| Instant::now() + Duration::from_millis(timeout));
-        let len = buf.len().min(i32::MAX as usize) as i32;
         loop {
-            let n = unsafe { ffi::send(inner.raw, buf.as_ptr(), len, 0) };
-            if n != ffi::SOCKET_ERROR {
-                return Ok(n as usize);
+            if let Some(n) = attempt() {
+                return Ok(n);
             }
             let err = last_wsa_error();
             match err.raw_os_error() {
@@ -557,6 +562,42 @@ impl io::Write for &CtlStream {
             }
         }
     }
+}
+
+impl io::Write for &CtlStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let raw = self.0.raw;
+        let len = buf.len().min(i32::MAX as usize) as i32;
+        self.send_with(|| {
+            let n = unsafe { ffi::send(raw, buf.as_ptr(), len, 0) };
+            (n != ffi::SOCKET_ERROR).then_some(n as usize)
+        })
+    }
+
+    /// One `WSASend` of up to [`MAX_SEND_BUFS`] slices, where std's default
+    /// would make one `send` per slice.
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let bufs = &bufs[..bufs.len().min(MAX_SEND_BUFS)];
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        let raw = self.0.raw;
+        self.send_with(|| {
+            let mut sent = 0u32;
+            let rc = unsafe {
+                ffi::WSASend(
+                    raw,
+                    bufs.as_ptr(),
+                    bufs.len() as u32,
+                    &mut sent,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            (rc != ffi::SOCKET_ERROR).then_some(sent as usize)
+        })
+    }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(()) // sends are unbuffered; nothing to push
@@ -572,6 +613,10 @@ impl io::Read for CtlStream {
 impl io::Write for CtlStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         (&*self).write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        (&*self).write_vectored(bufs)
     }
 
     fn flush(&mut self) -> io::Result<()> {

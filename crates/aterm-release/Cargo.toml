@@ -64,7 +64,8 @@ aterm-digest = { workspace = true }
 # deliberately external/owner-only, but trusting its exit status would not bind
 # the bytes uploaded to the public key compiled into clients.
 ring = { workspace = true }
-# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# Standard padded Base64 — first-party; its one dependency is astream-wire
+# (dependency-free, vendor/astream). `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }

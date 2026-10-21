@@ -92,10 +92,32 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
     }
 
     /// Pure serving syntax only; the secret's bytes remain the execution
-    /// lane's check. A bare argv runs the build's default
-    /// ([`crate::durability::resolve`]).
+    /// lane's check. A bare argv runs the build's default for a broker whose
+    /// argv names a mint secret or not ([`crate::durability::resolve`]): the
+    /// same words the broker verb judges itself by.
     pub fn serving_durability(&self) -> Option<crate::durability::Durability> {
-        self.named_durability().map(crate::durability::resolve)
+        let guarded = self.secret_file.is_some();
+        self.named_durability()
+            .map(|named| crate::durability::resolve(named, guarded))
+    }
+
+    /// The LOG a recognised serving invocation serves, as the broker verb
+    /// reads its words: the second word, or the socket's `<socket>.log` when
+    /// there is none. Only an ABSOLUTE path: a relative one names a file under
+    /// the broker's working directory, which a reader of its argv does not
+    /// know. `None` for anything else (a repair serves nothing).
+    pub fn log_path(&self) -> Option<std::path::PathBuf> {
+        self.named_durability()?;
+        let path = match self.words.as_slice() {
+            [_, log] => std::path::PathBuf::from(log.as_ref()),
+            [sock] => {
+                let mut log = sock.as_ref().to_os_string();
+                log.push(".log");
+                std::path::PathBuf::from(log)
+            }
+            _ => return None,
+        };
+        path.is_absolute().then_some(path)
     }
 
     /// What a recognised serving invocation NAMES: `Some(None)` for no
@@ -126,9 +148,10 @@ mod tests {
             .expect("accepted broker syntax");
         assert_eq!(parsed.secret_file.copied(), Some("--durability"));
         assert_eq!(parsed.words, vec![&"socket", &"relaxed"]);
+        // A bare guarded socket argv: the build's default for a guarded broker.
         assert_eq!(
             parsed.serving_durability(),
-            Some(crate::durability::Durability::Strict)
+            Some(crate::durability::default_for(true))
         );
         assert!(parsed.serves_endpoint("socket"));
         assert!(!parsed.serves_endpoint("relaxed"));
@@ -163,5 +186,46 @@ mod tests {
             BrokerArgs::parse(&["sock", "--help"]),
             Err(ParseError::Help)
         ));
+    }
+
+    /// **THE LOG IS READ AS THE BROKER VERB READS IT** — where astream's
+    /// `<log>.health` is looked for: the second word, or the socket's
+    /// `<socket>.log` without one, whatever flags sit between. NEGATIVE
+    /// CONTROLS: a relative log (the broker's working directory's, not the
+    /// reader's), a repair, and an argv the verb would refuse name no log it
+    /// serves.
+    #[test]
+    fn the_log_is_the_one_the_broker_verb_serves() {
+        let log = |args: &[&str]| BrokerArgs::parse(args).ok().and_then(|a| a.log_path());
+        let p = std::path::PathBuf::from;
+        assert_eq!(log(&["/r/bus.sock", "/r/bus.log"]), Some(p("/r/bus.log")));
+        assert_eq!(log(&["/r/bus.sock"]), Some(p("/r/bus.sock.log")));
+        assert_eq!(
+            log(&[
+                "/r/bus.sock",
+                "--secret-file",
+                "/r/mint.secret",
+                "/r/bus.log",
+                "--durability",
+                "relaxed"
+            ]),
+            Some(p("/r/bus.log"))
+        );
+        assert_eq!(log(&["bus.sock", "bus.log"]), None, "relative");
+        assert_eq!(
+            log(&["--repair", "/r/bus.log"]),
+            None,
+            "a repair serves nothing"
+        );
+        assert_eq!(
+            log(&["/r/a", "/r/b", "/r/c"]),
+            None,
+            "a surplus word is refused"
+        );
+        assert_eq!(
+            log(&["/r/bus.sock", "--durability", "fast"]),
+            None,
+            "a tier the verb refuses"
+        );
     }
 }

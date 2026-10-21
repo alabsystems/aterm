@@ -33,6 +33,46 @@ fn registered_modules() -> Vec<SpecModule> {
         .collect()
 }
 
+/// Each collected list as one line per record, sorted, digested (FNV-1a 64): the line SP.2
+/// compares across hosts, whose load-time constructor sections differ (Mach-O
+/// `__mod_init_func`, ELF `.init_array`, PE `.CRT$XCU`; `aterm_spec_anchor::registry`).
+/// Printed, never pinned: every new anchor moves it.
+fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]) -> String {
+    fn digest(mut lines: Vec<String>) -> String {
+        lines.sort_unstable();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in lines.iter().flat_map(|l| l.bytes().chain(*b"\n")) {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("{}={hash:016x}", lines.len())
+    }
+    let anchors = refs.iter().map(|r| {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            r.machine, r.action, r.rust_method, r.location, r.project, r.entry_id
+        )
+    });
+    let waived = waivers.iter().map(|w| {
+        format!(
+            "{}\t{}\t{}\t{}\t{}",
+            w.machine, w.action, w.rust_method, w.location, w.reason
+        )
+    });
+    let models = xref::model_registry()
+        .into_iter()
+        .map(|m| format!("{}\n{}\n{}", m.name, m.to_tla(), m.to_cfg()));
+    let liveness = xref::liveness_registry()
+        .into_iter()
+        .map(|(m, l)| format!("{}\n{}", m.name, l.to_tla(&m)));
+    format!(
+        "collected digests (records=fnv1a64): refinements {} waivers {} models {} liveness {}",
+        digest(anchors.collect()),
+        digest(waived.collect()),
+        digest(models.collect()),
+        digest(liveness.collect()),
+    )
+}
+
 #[test]
 fn spec_xref_closure() {
     // LINK every anchored crate and every model. The registry sees only object code the
@@ -88,6 +128,7 @@ fn spec_xref_closure() {
         let w = waivers.iter().filter(|x| x.machine == *m).count();
         eprintln!("    {m:<16} refinements={r:<3} waivers={w}");
     }
+    eprintln!("spec_xref_closure: {}", collected_digests(&refs, &waivers));
 
     // Phase 0 not regressed: the terminal_modes anchors (from aterm-core, expanded in
     // its debug build) must still be collected here.

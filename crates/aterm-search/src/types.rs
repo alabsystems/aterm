@@ -62,12 +62,15 @@ pub struct SearchResults {
     /// Matches below this line have been evicted. When `incomplete` is false
     /// this is 0 and the full indexed range was searched.
     pub lowest_retained_line: usize,
-    /// How many lines a regex scan could not finish within the line's scan
-    /// budget — a line long enough, for a pattern costly enough, that the scan
-    /// stopped part-way (a soft-wrapped run of megabytes, say). The matches it
-    /// found before it stopped are in `matches`; any after that point on that
-    /// line are missing. Non-zero implies `incomplete`. Always 0 for a literal
-    /// search.
+    /// How many lines were not searched to their end: a regex scan that could
+    /// not finish the line within its scan budget (a line long enough, for a
+    /// pattern costly enough, that the scan stopped part-way: a soft-wrapped run
+    /// of megabytes, say), or a line whose text was read only up to a byte bound
+    /// ([`LineCells::is_truncated`](crate::LineCells::is_truncated): aterm-core
+    /// reads the first MiB of a stored history line). The matches found before
+    /// that point are in `matches`; any after it on that line are missing. A line
+    /// both apply to counts once. Non-zero implies `incomplete`. Always 0 for a
+    /// literal search over lines read whole.
     pub cut_short_lines: usize,
 }
 
@@ -83,8 +86,8 @@ impl SearchResults {
         }
     }
 
-    /// Record `lines` lines a regex scan could not finish, which makes the
-    /// results incomplete when there are any.
+    /// Record `lines` lines not searched to their end, which makes the results
+    /// incomplete when there are any.
     #[must_use]
     pub fn with_cut_short_lines(mut self, lines: usize) -> Self {
         self.cut_short_lines = lines;

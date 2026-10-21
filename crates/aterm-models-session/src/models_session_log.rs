@@ -771,7 +771,7 @@ pub fn session_log_cursor_model() -> Model {
 /// conformance binding reads off the real close), 2 a person's, 3 one
 /// accepted more than `STEP_ACT_MS` before now (`Age`: it dismisses
 /// nothing). `pd` is the one input in flight: 1 admitted under the open step
-/// (`Admit` while a step is open; `Accept` binds it), 2 admitted with none
+/// (`AdmitCtl` or `AdmitHarness` while a step is open; `Accept` binds it), 2 admitted with none
 /// open (the lead: the first approval or question step to open inside
 /// `STEP_INPUT_LEAD_MS` with no close between is the step it was admitted
 /// under, so such an open turns 2 into 1), 3 accepted on the lead (the next
@@ -786,7 +786,23 @@ pub fn session_log_cursor_model() -> Model {
 /// `bk = 2`, or `PersonLeadOut` drops once the lead passed); it is the latest
 /// input, so it takes the lead from an act accepted on it (`pd` 3 to 0), and
 /// an act accepted on the lead after it takes the lead back (`Accept` from
-/// `pd = 2`). Ghosts: `gn`, an input bound to a step that was
+/// `pd = 2`).
+///
+/// WHO SENT AN ACT (phase 6, 6A-5). Two acting actors beside the person:
+/// `ctl` and the harness, which the real tracker tells apart on the bound
+/// input (`by=ctl` closes `out=passed`, an unproven author; `by=harness`
+/// reads its `act=`). `pa` is the sender of the input in flight or on the
+/// lead (0 none, 1 ctl, 2 harness), set by `AdmitCtl`/`AdmitHarness` and
+/// cleared when the input leaves (`pd` to 0); `ba` is the actor the binding
+/// names when `bk = 1`, and `bs` the GHOST of who sent the bound act. A
+/// binding names the actor who sent it (`ActorKeepsItsAct`), and a
+/// harness act is never read as ctl's (`HarnessActNotCtl`): the law is
+/// split by direction so each is the one law a swap from its side breaks.
+/// At `Buggy = 1` only the harness admits (`AdmitCtl` is off): no law of
+/// that family reads who sent an input, and a second sender would double
+/// its walk (80 319 states to 177 652) past the interpreter's bound.
+///
+/// Ghosts: `gn`, an input bound to a step that was
 /// neither open at its admission nor the lead's first; `ab`, a binding still
 /// held after it attributed a close; `ga`, a close read
 /// `approved|declined|answered` with no fresh, proven, acted input bound to
@@ -809,8 +825,10 @@ pub fn session_log_cursor_model() -> Model {
 /// person's input that leaves the harness's act bound (`ActOverPerson`:
 /// `PersonSupersedesAct`), a person's input on the lead that leaves an act
 /// waiting on it to bind the next box (`ActLeadOverPerson`, the same law: a
-/// person's lead and an act's never stand together) and a close that keeps
-/// its binding for the next box (`ActTwice`: `AttributesOnce`).
+/// person's lead and an act's never stand together), a close that keeps
+/// its binding for the next box (`ActTwice`: `AttributesOnce`) and a
+/// binding that names the other acting actor (`ActorSwap`: from a ctl act
+/// `ActorKeepsItsAct`, from a harness act `HarnessActNotCtl`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn turn_tracker_model() -> Model {
@@ -836,9 +854,14 @@ pub fn turn_tracker_model() -> Model {
             var gn = 0;
             var ga = 0;
             var pl = 0;
+            var pa = 0;
+            var ba = 0;
+            var bs = 0;
 
             action SeeBusy {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
+                ba = if (step == 1 || step == 2) { 0 } else { ba };
+                bs = if (step == 1 || step == 2) { 0 } else { bs };
                 pp = if (step == 1 || step == 2) { 0 } else { pp };
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
@@ -852,8 +875,11 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeDialog {
                 bk = if step == 1 { 0 } else { if (1 > step || step > 2) && pd == 3 { 1 } else { if (1 > step || step > 2) && pl == 1 { 2 } else { bk } } };
+                ba = if step == 1 { 0 } else { if (1 > step || step > 2) && pd == 3 { pa } else { if (1 > step || step > 2) && pl == 1 { 0 } else { ba } } };
+                bs = if step == 1 { 0 } else { if (1 > step || step > 2) && pd == 3 { pa } else { if (1 > step || step > 2) && pl == 1 { 0 } else { bs } } };
                 pp = if step == 1 || ((1 > step || step > 2) && pd == 3) { 0 } else { if (1 > step || step > 2) && pl == 1 { 1 } else { pp } };
                 ab = if step == 1 || ((1 > step || step > 2) && (pd == 3 || pl == 1)) { 0 } else { ab };
+                pa = if (1 > step || step > 2) && pd == 3 { 0 } else { pa };
                 pd = if step == 1 && pd == 1 { 4 } else { if (1 > step || step > 2) && pd == 2 { 1 } else { if (1 > step || step > 2) && pd == 3 { 0 } else { pd } } };
                 pl = 0;
                 rf = 0;
@@ -866,8 +892,11 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeBox {
                 bk = if step == 2 { 0 } else { if (1 > step || step > 2) && pd == 3 { 1 } else { if (1 > step || step > 2) && pl == 1 { 2 } else { bk } } };
+                ba = if step == 2 { 0 } else { if (1 > step || step > 2) && pd == 3 { pa } else { if (1 > step || step > 2) && pl == 1 { 0 } else { ba } } };
+                bs = if step == 2 { 0 } else { if (1 > step || step > 2) && pd == 3 { pa } else { if (1 > step || step > 2) && pl == 1 { 0 } else { bs } } };
                 pp = if step == 2 || ((1 > step || step > 2) && pd == 3) { 0 } else { if (1 > step || step > 2) && pl == 1 { 1 } else { pp } };
                 ab = if step == 2 || ((1 > step || step > 2) && (pd == 3 || pl == 1)) { 0 } else { ab };
+                pa = if (1 > step || step > 2) && pd == 3 { 0 } else { pa };
                 pd = if step == 2 && pd == 1 { 4 } else { if (1 > step || step > 2) && pd == 2 { 1 } else { if (1 > step || step > 2) && pd == 3 { 0 } else { pd } } };
                 pl = 0;
                 rf = 0;
@@ -880,6 +909,8 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeNextBox when (step == 1) {
                 bk = 0;
+                ba = 0;
+                bs = 0;
                 pp = 0;
                 ab = 0;
                 pd = if pd == 1 { 4 } else { pd };
@@ -893,6 +924,8 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeWall {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
+                ba = if (step == 1 || step == 2) { 0 } else { ba };
+                bs = if (step == 1 || step == 2) { 0 } else { bs };
                 pp = if (step == 1 || step == 2) { 0 } else { pp };
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
@@ -905,6 +938,8 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeStall {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
+                ba = if (step == 1 || step == 2) { 0 } else { ba };
+                bs = if (step == 1 || step == 2) { 0 } else { bs };
                 pp = if (step == 1 || step == 2) { 0 } else { pp };
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
@@ -917,6 +952,8 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeSurvey {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
+                ba = if (step == 1 || step == 2) { 0 } else { ba };
+                bs = if (step == 1 || step == 2) { 0 } else { bs };
                 pp = if (step == 1 || step == 2) { 0 } else { pp };
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
@@ -929,6 +966,8 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeIdle {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
+                ba = if (step == 1 || step == 2) { 0 } else { ba };
+                bs = if (step == 1 || step == 2) { 0 } else { bs };
                 pp = if (step == 1 || step == 2) { 0 } else { pp };
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
@@ -941,6 +980,8 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeQuestion {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
+                ba = if (step == 1 || step == 2) { 0 } else { ba };
+                bs = if (step == 1 || step == 2) { 0 } else { bs };
                 pp = if (step == 1 || step == 2) { 0 } else { pp };
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
@@ -953,6 +994,8 @@ pub fn turn_tracker_model() -> Model {
             }
             action SeeGone {
                 bk = if (step == 1 || step == 2) { 0 } else { bk };
+                ba = if (step == 1 || step == 2) { 0 } else { ba };
+                bs = if (step == 1 || step == 2) { 0 } else { bs };
                 pp = if (step == 1 || step == 2) { 0 } else { pp };
                 ab = if (step == 1 || step == 2) { 0 } else { ab };
                 pd = if (step == 1 || step == 2) && pd == 1 { 4 } else { pd };
@@ -1009,30 +1052,44 @@ pub fn turn_tracker_model() -> Model {
                 rf = 1;
             }
 
-            action Admit when (pd == 0) {
+            action AdmitCtl when (pd == 0 && (1 > Buggy || Buggy > 1)) {
+                pa = 1;
+                pd = if (step == 1 || step == 2) { 1 } else { 2 };
+            }
+            action AdmitHarness when (pd == 0) {
+                pa = 2;
                 pd = if (step == 1 || step == 2) { 1 } else { 2 };
             }
             action Accept when (pd == 1 || pd == 2 || pd == 4) {
                 bk = if pd == 1 { 1 } else { bk };
+                ba = if pd == 1 { pa } else { ba };
+                bs = if pd == 1 { pa } else { bs };
                 pp = if pd == 1 { 0 } else { pp };
                 ab = if pd == 1 { 0 } else { ab };
                 pl = if pd == 2 { 0 } else { pl };
+                pa = if pd == 2 { pa } else { 0 };
                 pd = if pd == 2 { 3 } else { 0 };
             }
             action Person when (step == 1 || step == 2) {
                 bk = 2;
+                ba = 0;
+                bs = 0;
                 pp = 1;
                 ab = 0;
             }
             action PersonLeads when (1 > step || step > 2) {
                 pl = 1;
+                pa = if pd == 3 { 0 } else { pa };
                 pd = if pd == 3 { 0 } else { pd };
             }
             action Age when (bk == 1 || bk == 2) {
                 bk = 3;
+                ba = 0;
+                bs = 0;
                 pp = 0;
             }
             action LeadOut when (pd == 2 || pd == 3) {
+                pa = if pd == 2 { pa } else { 0 };
                 pd = if pd == 2 { 4 } else { 0 };
             }
             action PersonLeadOut when (pl == 1) {
@@ -1103,13 +1160,18 @@ pub fn turn_tracker_model() -> Model {
 
             action ActBindsNextBox when (Buggy == 2 && pd == 4 && step == 1) {
                 bk = 1;
+                ba = pa;
+                bs = pa;
                 pp = 0;
                 ab = 0;
+                pa = 0;
                 pd = 0;
                 gn = 1;
             }
             action AttributeStaleInput when (Buggy == 2 && bk == 3 && step == 1) {
                 bk = 0;
+                ba = 0;
+                bs = 0;
                 pp = 0;
                 ab = 0;
                 ga = 1;
@@ -1139,6 +1201,9 @@ pub fn turn_tracker_model() -> Model {
                 ticks = 0;
                 word = 4;
             }
+            action ActorSwap when (Buggy == 2 && bk == 1) {
+                ba = 3 - ba;
+            }
 
             invariant AtMostOneOpenTurn: turn + extra <= 1;
             invariant UnknownNeverClosesATurn: cw > 0;
@@ -1152,6 +1217,8 @@ pub fn turn_tracker_model() -> Model {
             invariant AttributesOnce: ab == 0;
             invariant ApprovalByObservedInput: ga == 0;
             invariant PersonSupersedesAct: (bk == 2 || pp == 0) && (pl == 0 || 3 > pd || pd > 3);
+            invariant ActorKeepsItsAct: 1 > bk || bk > 1 || bs == 2 || ba == bs;
+            invariant HarnessActNotCtl: 1 > bk || bk > 1 || 2 > bs || bs > 2 || ba == 2;
         }
     }
 }

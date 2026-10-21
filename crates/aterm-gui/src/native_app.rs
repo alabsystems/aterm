@@ -6700,6 +6700,7 @@ fn editor_minibuffer_projection(
         Minibuffer::Search { query, .. } => ("I-search: ", query),
         Minibuffer::Buffer { query } => ("Switch buffer: ", query),
         Minibuffer::GotoLine { query, .. } => ("Goto line: ", query),
+        Minibuffer::Prompt { query, .. } => (view.minibuffer.prompt_label().unwrap_or(""), query),
     };
     let (label, caret) =
         editor_prompt_projection(prefix, query, preedit, preedit_caret, max_chars, max_width);

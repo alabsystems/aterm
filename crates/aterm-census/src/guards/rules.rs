@@ -474,11 +474,14 @@ fn input_probe(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 // ---------------------------------------------------------------------------
 
 /// aterm-gui's source (the window crate's and its split-out libraries',
-/// `crates/aterm-gui-*`) and aterm-cli's.
+/// `crates/aterm-gui-*`), aterm-cli's, and amacs's host crates
+/// (`crates/amacs-*`: its file admission and its terminal program), which run
+/// in those two processes. The `amacs` engine names no path.
 const PROTECTED_SCOPE: &[&str] = &[
     "crates/aterm-gui/src/",
     "crates/aterm-gui-",
     "crates/aterm-cli/src/",
+    "crates/amacs-",
 ];
 const PROTECTED_HOME_DIRS: &[&str] = &[
     "Documents",
@@ -731,8 +734,16 @@ fn keeper_no_mmap(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 const RESTORE_OWN: &[&str] = &["crates/aterm-restore/src/"];
 /// The crash restore's crate, as a closure names it.
 const RESTORE_CRATE: &str = "crates/aterm-restore";
-/// The crates that carry bytes off the host: the fabric's link.
-const OFF_HOST_CRATES: &[&str] = &["crates/aterm-link"];
+/// The crates that carry bytes off the host: the fabric's link, the fleet's TLS proof,
+/// listener and relay, the HTTP stream, and the window's fabric endpoint. `aterm-gui`, which
+/// links the restore, also runs the fleet's listener: there no closure can keep a region
+/// local, and what does is that no control verb reads one (status reports counts).
+const OFF_HOST_CRATES: &[&str] = &[
+    "crates/aterm-link",
+    "crates/aterm-net",
+    "crates/aterm-http",
+    "crates/aterm-gui-fabric",
+];
 
 /// What reaches a socket: std's and aterm-uds's socket types, the calls by name, and
 /// the off-host crates themselves.
@@ -757,9 +768,10 @@ const SOCKET_APIS: &[(&str, Bound)] = &[
 pub(super) const RESTORE_STAYS_LOCAL: Rule = Rule {
     id: "restore-stays-local",
     why: "a crash-restore region is the window's memory (screens, scrollback, and the nonce a \
-          shell prints in its marks) and never leaves the host: the fabric's crate (aterm-link) may \
-          not have aterm-restore in its closure, and aterm-restore's own source names no socket \
-          (the plan's privacy claim 5; status reports counts only)",
+          shell prints in its marks) and never leaves the host: no crate that carries bytes off \
+          it (aterm-link, aterm-net, aterm-http, aterm-gui-fabric) may have aterm-restore in its \
+          closure, and aterm-restore's own source names no socket (the plan's privacy claim 5; \
+          status reports counts only, and no control verb reads a region)",
     scope: RESTORE_OWN,
     check: restore_stays_local,
 };
@@ -1186,8 +1198,9 @@ enum ClockShape {
     Named,
     /// A free reader: called (`unix_ms(`) or named by a path (`limit::unix_now`,
     /// passed as a fn item) — never a local or a field of the same name
-    /// (`Due::unix_ms`, `settle.unix_ms`). The reader's own `fn` is its home
-    /// ([`reader_homes`]).
+    /// (`Due::unix_ms`, `settle.unix_ms`), nor a `fn` line of that name (a
+    /// definition: its body is read line by line). The reader's own `fn`, in
+    /// its own file, is the wall clock's home ([`reader_homes`]).
     Reader,
     /// A method: called on a receiver (`t.elapsed()`) or named by a path
     /// (`Instant::elapsed`), never a field of the same name.
@@ -1206,10 +1219,34 @@ enum ClockShape {
 
 /// Each direct clock read or sleep, its shape, and what it is. Read on the
 /// CODE view, so a comment or a string naming one is no finding.
+///
+/// A line names each by its path, so an IMPORT that binds one under a name
+/// the line view cannot see is read on its own ([`use_leaves`],
+/// [`imported_read`]): a group (`use std::thread::{self, sleep};`, then a
+/// bare `sleep(d)`), a rename (`Instant as Mono`, `std::thread as t`), a glob
+/// (`std::thread::*`), a reader imported to be passed bare
+/// (`journal::{json_str, unix_ms}`, then `unwrap_or_else(unix_ms)`), and a
+/// `type` alias of a clock's type. What a lexical guard still cannot see is
+/// said where the rule is ([`SUPERVISE_FX`]).
 const SUPERVISE_CLOCKS: &[(&str, ClockShape, &str)] = &[
     ("Instant::now", ClockShape::Named, "the monotonic clock"),
     ("SystemTime::now", ClockShape::Named, "the wall clock"),
     ("thread::sleep", ClockShape::Named, "a sleep"),
+    (
+        "thread::sleep_until",
+        ClockShape::Named,
+        "a sleep (`thread::sleep_until`)",
+    ),
+    (
+        "thread::sleep_ms",
+        ClockShape::Named,
+        "a sleep (`thread::sleep_ms`)",
+    ),
+    (
+        "thread::park_timeout",
+        ClockShape::Named,
+        "a sleep (`thread::park_timeout`)",
+    ),
     (
         "elapsed",
         ClockShape::Method,
@@ -1325,10 +1362,28 @@ const SUPERVISE_READS: &[(&str, ClockShape, &str)] = &[
     ),
 ];
 
-/// The `fn`s a phase-2 read belongs in, by name and needle: the holder's
-/// resolution (`claim::default_holder`, read where a setup is made, so a
-/// replay names the recorded holder and never this process).
-const SUPERVISE_READ_HOMES: &[(&str, &str)] = &[("default_holder", "process::id")];
+/// The `fn`s a phase-2 read belongs in, by file (under the supervisor), name
+/// and needle: the holder's resolution (`claim::default_holder`, read where a
+/// setup is made, so a replay names the recorded holder and never this
+/// process). A home is its own `fn` in its own file, for its own read: a `fn`
+/// of the same name elsewhere is none, as phase 3's homes are not.
+const SUPERVISE_READ_HOMES: &[(&str, &str, &str)] =
+    &[("claim.rs", "default_holder", "process::id")];
+
+/// The wall readers' own `fn`s, by file (under the supervisor) and name:
+/// `limit::unix_now{,_ms}` and `journal::unix_ms` wrap the system's wall
+/// clock — that is what each is for, and the crate's callers outside the
+/// supervisor read them too — so each body is the WALL clock's home, and the
+/// rule is about their callers. A home for the wall read alone
+/// ([`wall_read`]): a sleep or a monotonic read in a reader's body is a read
+/// past the door like any other, and a `fn` of a reader's name in another
+/// file (a method `unix_ms` on some type) is no home at all — a home by name
+/// alone excused whatever such a body read.
+const SUPERVISE_READER_HOMES: &[(&str, &str)] = &[
+    ("journal.rs", "unix_ms"),
+    ("limit.rs", "unix_now"),
+    ("limit.rs", "unix_now_ms"),
+];
 
 /// PHASE 3 (the policy probe, the replay plan's T5): the looks at the
 /// machine itself — the filesystem, a process, the kernel, the zone, the
@@ -1726,25 +1781,257 @@ fn module_path(code: &str, r: &LiveReader<'_>) -> bool {
         .is_some()
 }
 
-/// Each `use` statement of `file`'s shipped code, joined across its lines,
-/// with its first line's number: a live body imported into a file outside the
-/// door is called there bare, which [`live_call`] cannot tell from a local of
-/// the same name, so the import is what is named ([`live_import`]).
-fn use_statements(file: &SourceFile) -> Vec<(usize, String)> {
-    let mut out: Vec<(usize, String)> = Vec::new();
+/// The imports of a file, and the code outside their actual spans.
+struct UseStatements {
+    /// Each statement, joined across its lines, with its first line's number.
+    statements: Vec<(usize, String)>,
+    /// Only lines containing imports, with those spans blanked in place.
+    /// Executable statements after their semicolons keep their byte positions.
+    executable: std::collections::BTreeMap<usize, String>,
+}
+
+/// Each `use` statement of `file`'s shipped code: a live body imported into a
+/// file outside the door is called there bare, which [`live_call`] cannot
+/// tell from a local of the same name, so the import is what is named
+/// ([`live_import`]); and so is a clock bound under a name the lines cannot
+/// see ([`use_leaves`]). Only its span through its semicolon is an import:
+/// `use std::thread; thread::sleep(d);` still calls a clock door on that line.
+fn use_statements(file: &SourceFile) -> UseStatements {
+    let mut out = UseStatements {
+        statements: Vec::new(),
+        executable: std::collections::BTreeMap::new(),
+    };
     let mut open = false;
     for line in file.shipped_lines() {
-        if !open && starts_use(line.code) {
-            out.push((line.no, String::new()));
-            open = true;
-        }
-        if open && let Some((_, text)) = out.last_mut() {
-            text.push_str(line.code);
-            text.push(' ');
-            open = !line.code.contains(';');
+        let mut rest = line.code;
+        let mut start = 0;
+        loop {
+            if !open {
+                if !starts_use(rest) {
+                    break;
+                }
+                out.statements.push((line.no, String::new()));
+            }
+            let end = rest.find(';').map(|at| at + 1);
+            let len = end.unwrap_or(rest.len());
+            if let Some((_, text)) = out.statements.last_mut() {
+                text.push_str(&rest[..len]);
+                text.push(' ');
+            }
+            let code = out
+                .executable
+                .entry(line.no)
+                .or_insert_with(|| line.code.to_string());
+            code.replace_range(start..start + len, &" ".repeat(len));
+            open = end.is_none();
+            if open {
+                break;
+            }
+            start += len;
+            rest = &rest[len..];
         }
     }
     out
+}
+
+/// One name a `use` statement — or a `type` alias ([`type_alias`]) — binds.
+struct UseLeaf<'s> {
+    /// Its whole path, the group prefixes above it joined: `std::thread::sleep`
+    /// from `use std::{thread::{self, sleep}};`, and `std::thread` from that
+    /// `self`.
+    path: Vec<&'s str>,
+    /// The name it is bound to when renamed (`as Mono`); `as _` binds nothing
+    /// a call can name.
+    alias: Option<&'s str>,
+    /// A glob (`std::thread::*`): `path` is the module's, and every item of it
+    /// is bound bare.
+    glob: bool,
+}
+
+/// THE NAMES ONE `use` STATEMENT BINDS, each with its whole path: the line
+/// view sees `thread::sleep` in `use std::thread::sleep;` but not in
+/// `use std::thread::{self, sleep};`, nor `Instant::now` in `Mono::now()`
+/// after `use std::time::Instant as Mono;` — a group splits the path from its
+/// item, a rename hides it — so the statement is read as the tree it is,
+/// however it wraps.
+fn use_leaves(stmt: &str) -> Vec<UseLeaf<'_>> {
+    let mut out = Vec::new();
+    if let Some(at) = hits(stmt, "use", Bound::Word).next() {
+        let tree = stmt[at + 3..].split(';').next().unwrap_or("");
+        use_tree(tree, &[], &mut out);
+    }
+    out
+}
+
+/// One use tree below the path `prefix`: a group (`head::{a, b::{c}}`) is
+/// each of its members below `prefix::head`; a leaf is a path, a glob or
+/// `self`, renamed or not.
+fn use_tree<'s>(tree: &'s str, prefix: &[&'s str], out: &mut Vec<UseLeaf<'s>>) {
+    let tree = tree.trim();
+    if let Some(open) = tree.find('{') {
+        let mut path = prefix.to_vec();
+        path.extend(segments(&tree[..open]));
+        let close = tree.rfind('}').filter(|&c| c > open).unwrap_or(tree.len());
+        for member in top_level_members(&tree[open + 1..close]) {
+            use_tree(member, &path, out);
+        }
+        return;
+    }
+    let (body, alias) = match hits(tree, "as", Bound::Word).next() {
+        Some(at) => (
+            &tree[..at],
+            Some(tree[at + 2..].trim()).filter(|a| !a.is_empty()),
+        ),
+        None => (tree, None),
+    };
+    let mut path = prefix.to_vec();
+    let mut glob = false;
+    for segment in segments(body) {
+        match segment {
+            "*" => glob = true,
+            // `{self}` is the module the group is in.
+            "self" if !path.is_empty() => {}
+            s => path.push(s),
+        }
+    }
+    if !path.is_empty() {
+        out.push(UseLeaf { path, alias, glob });
+    }
+}
+
+/// A path's segments (`std :: thread` and `::std::thread` alike).
+fn segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split("::").map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// A group's members: split at its own commas, never a nested group's.
+fn top_level_members(group: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in group.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&group[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&group[start..]);
+    out
+}
+
+/// A `type` alias of a plain path, read as the import it amounts to
+/// (`type Mono = std::time::Instant;` binds `Instant` as `Mono`, as
+/// `use std::time::Instant as Mono;` does). An alias of anything but a path
+/// (`fn() -> Instant`, a tuple, a generic) binds no clock to call.
+fn type_alias(code: &str) -> Option<UseLeaf<'_>> {
+    let at = hits(code, "type", Bound::Word).next()?;
+    let head = code[..at].trim();
+    if !(head.is_empty() || head.starts_with("pub")) {
+        return None;
+    }
+    let rest = code[at + 4..].trim_start();
+    let len = rest.bytes().take_while(|&b| is_word(b)).count();
+    let rhs = after_ws(&rest[len..], "=")?
+        .trim()
+        .strip_suffix(';')?
+        .trim();
+    if len == 0 || rhs.is_empty() || !rhs.bytes().all(|b| is_word(b) || b == b':') {
+        return None;
+    }
+    Some(UseLeaf {
+        path: segments(rhs).collect(),
+        alias: Some(&rest[..len]),
+        glob: false,
+    })
+}
+
+/// THE CLOCK READ, SLEEP OR PHASE-2 READ ONE IMPORTED NAME BINDS where the
+/// line view cannot see it, if any: the needle, and the finding's detail.
+/// For a needle `a::b` (a [`SUPERVISE_CLOCKS`] or [`SUPERVISE_READS`] name):
+/// - the whole of it imported (`std::thread::sleep`, `std::process::id`,
+///   `approvals::typed_at`), renamed or not: named bare from then on, never
+///   as `a::b`;
+/// - a one-word wall reader imported (`journal::unix_ms`): a bare CALL is
+///   seen, but the reader passed bare as a fn item (`unwrap_or_else(unix_ms)`)
+///   is not, so the import is what is named; any other one-word name only
+///   when renamed;
+/// - a head of it renamed (`std::thread as t`, `Instant as Mono`,
+///   `approvals as ledger`): `t::sleep`, `Mono::now`;
+/// - its module globbed in (`std::thread::*`): `sleep` bare.
+///
+/// A method (`.elapsed()`, `.try_recv()`) is not imported. A reader of the
+/// ledger by its path ([`ledger_by_path`]) imported is named as phase 2's
+/// call is. `as _` binds nothing to call, and an import under its own name
+/// (`use std::thread;`, `use std::time::Instant;`) keeps the path the lines
+/// are read for.
+fn imported_read(
+    leaf: &UseLeaf<'_>,
+    by_path: &std::collections::BTreeSet<&str>,
+) -> Option<(&'static str, String)> {
+    if leaf.alias == Some("_") {
+        return None;
+    }
+    let shown = leaf.path.join("::");
+    let renamed = |name: &str| leaf.alias.is_some_and(|a| a != name);
+    let as_written = leaf
+        .alias
+        .map_or_else(|| shown.clone(), |a| format!("{shown} as {a}"));
+    for &(needle, shape, what) in SUPERVISE_CLOCKS.iter().chain(SUPERVISE_READS) {
+        if matches!(shape, ClockShape::Method) {
+            continue;
+        }
+        let parts: Vec<&str> = needle.split("::").collect();
+        let ends = |k: usize| leaf.path.ends_with(&parts[..k]);
+        if leaf.glob {
+            if parts.len() > 1 && ends(parts.len() - 1) {
+                return Some((
+                    needle,
+                    format!(
+                        "imports `{shown}::*`, so {what} is named bare past the session's `Fx`"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if ends(parts.len()) {
+            let unseen = parts.len() > 1 || matches!(shape, ClockShape::Reader);
+            if unseen || renamed(parts[parts.len() - 1]) {
+                return Some((
+                    needle,
+                    format!(
+                        "binds {what} to a bare name (`{as_written}`), past the session's `Fx` \
+                         and out of the guard's sight: name it by its path"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if let Some(k) = (1..parts.len()).find(|&k| ends(k) && renamed(parts[k - 1])) {
+            return Some((
+                needle,
+                format!(
+                    "renames `{}` (`{as_written}`), so {what} is read past the session's `Fx` \
+                     under a name the guard cannot see",
+                    parts[k - 1]
+                ),
+            ));
+        }
+    }
+    match leaf.path.as_slice() {
+        [.., "approvals", reader] if !leaf.glob && by_path.contains(reader) => Some((
+            "approvals::",
+            format!(
+                "imports the approval ledger's reader by its path (`{as_written}`) to be called \
+                 bare, past the session's `Fx`: read the text through `Fx::read_text` and hand \
+                 it to `approvals::{reader}_in`"
+            ),
+        )),
+        _ => None,
+    }
 }
 
 /// The free live body of another file a `use` statement imports, if any: by
@@ -1790,12 +2077,25 @@ fn live_name(r: &LiveReader<'_>) -> String {
     }
 }
 
+/// The rule. WHAT IT READS, AND WHERE ITS SIGHT ENDS: the supervisor's own
+/// shipped files, line by line on the code view, and each import there as the
+/// names it binds ([`use_leaves`]) — so a clock read is found by its path, in
+/// a group, renamed, globbed in (`std::thread::*`) or aliased as a type. It
+/// is lexical, and does not see: a macro that expands to a read; a glob of a
+/// wall reader's module (`use aterm_time::*;`, then a reader passed bare as a
+/// fn item — a bare call is still seen); a qualified path (`<Instant>::now()`);
+/// and a clock read inside a helper OUTSIDE the supervisor's files that the
+/// loop calls (the harness's), which is put behind a door where one is found
+/// — the retired Codex lane's process-age reader (`started_ms`) was moved
+/// into a derived door's live body (`Fx::codex_records`) for that reason.
 pub(super) const SUPERVISE_FX: Rule = Rule {
     id: "supervise-fx",
     why: "a harness tape holds every value the supervising loop observed, in order, so a clock \
           read or a sleep that skips the session's `Fx` (supervise/fx.rs) is a hole a recorder \
           misses and a replay answers from the real clock: read it through `self.fx` (`mono`, \
-          `since`, `wall_ms`, `wall_s`, `stamp_ms`, `sleep`), or take `now` from the caller; \
+          `since`, `wall_ms`, `wall_s`, `stamp_ms`, `sleep`), or take `now` from the caller — \
+          and name it by its path, never imported bare, renamed or globbed in, where the guard \
+          cannot follow it; \
           and so is this process's id, a delivery from another thread and the approval ledger \
           by its path: through `Fx` (`try_recv_mail`, `recv_mail_timeout`, `read_text` and an \
           `approvals::*_in` reader, `bound`), or resolved once into the setup; and so \
@@ -1826,6 +2126,15 @@ fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .chain(SUPERVISE_LOOKS)
         .map(|c| c.0)
         .collect();
+    // Each segment too: an import that binds a clock under a name the line
+    // view cannot see names a segment of it (`use std::thread::{self,
+    // sleep};` names `thread`, `Instant as Mono` names `Instant`).
+    needles.extend(
+        SUPERVISE_CLOCKS
+            .iter()
+            .chain(SUPERVISE_READS)
+            .flat_map(|c| c.0.split("::")),
+    );
     needles.push("approvals::");
     let by_path = ledger_by_path(tree);
     let readers = live_readers(tree);
@@ -1836,6 +2145,14 @@ fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
         let homes = reader_homes(file);
         let read_homes = read_homes(file);
+        // A clock read on line `no` is at home: a wall read in a wall
+        // reader's own body, or a phase-2 read in its own home `fn`.
+        let at_home = |no: usize, needle: &str| {
+            (homes.contains(&no) && wall_read(needle)) || read_homes.get(&no) == Some(&needle)
+        };
+        // Imports are read whole, as the names they bind ([`use_leaves`]);
+        // only their spans are blanked in the executable view below.
+        let uses = use_statements(file);
         let mut look_homes = look_homes(file);
         if file.rel == SUPERVISE_LEDGER {
             look_homes.extend(
@@ -1848,21 +2165,22 @@ fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         let looks_home = SUPERVISE_LOOK_FILES.contains(&file.rel.as_str());
         let live_file = readers.iter().any(|r| r.rel == file.rel);
         for line in file.shipped_lines() {
-            if let Some((needle, what)) = supervise_clock(line.code) {
-                let home = homes.contains(&line.no)
-                    || read_homes
-                        .get(&line.no)
-                        .is_some_and(|func| SUPERVISE_READ_HOMES.contains(&(*func, needle)));
-                if !home {
-                    out.push(file.finding(
-                        SUPERVISE_FX.id,
-                        line.no,
-                        format!("reads {what} past the session's `Fx`"),
-                    ));
-                    continue;
-                }
+            let code = uses
+                .executable
+                .get(&line.no)
+                .map_or(line.code, String::as_str);
+            let read = supervise_clock(code, |needle| !at_home(line.no, needle))
+                .map(|(needle, what)| (needle, format!("reads {what} past the session's `Fx`")))
+                .or_else(|| {
+                    type_alias(code)
+                        .and_then(|leaf| imported_read(&leaf, &by_path))
+                        .filter(|(needle, _)| !at_home(line.no, needle))
+                });
+            if let Some((_, detail)) = read {
+                out.push(file.finding(SUPERVISE_FX.id, line.no, detail));
+                continue;
             }
-            if let Some(reader) = ledger_read(line.code, &by_path) {
+            if let Some(reader) = ledger_read(code, &by_path) {
                 out.push(file.finding(
                     SUPERVISE_FX.id,
                     line.no,
@@ -1877,7 +2195,7 @@ fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             if looks_home || look_homes.contains(&line.no) {
                 continue;
             }
-            if let Some((_, what)) = supervise_look(line.code) {
+            if let Some((_, what)) = supervise_look(code) {
                 out.push(file.finding(
                     SUPERVISE_FX.id,
                     line.no,
@@ -1887,19 +2205,30 @@ fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             }
             // In a live body's own file, a fn that calls one IS one
             // ([`live_readers`]): the call is named where that fn is called.
-            if starts_use(line.code) || live_file {
+            if starts_use(code) || live_file {
                 continue;
             }
-            if let Some(r) = live_call(line.code, &file.rel, &readers) {
+            if let Some(r) = live_call(code, &file.rel, &readers) {
                 out.push(file.finding(SUPERVISE_FX.id, line.no, live_bypass(r, "calls")));
+            }
+        }
+        // Each import, as the names it binds: one that binds a clock read, a
+        // sleep or a phase-2 read under a name the lines cannot see is named
+        // at its first line, where the name is bound.
+        for (no, stmt) in &uses.statements {
+            let bound = use_leaves(stmt).iter().find_map(|leaf| {
+                imported_read(leaf, &by_path).filter(|(needle, _)| !at_home(*no, needle))
+            });
+            if let Some((_, detail)) = bound {
+                out.push(file.finding(SUPERVISE_FX.id, *no, detail));
             }
         }
         if looks_home {
             continue;
         }
-        for (no, stmt) in use_statements(file) {
-            if let Some(r) = live_import(&stmt, &file.rel, &readers) {
-                out.push(file.finding(SUPERVISE_FX.id, no, live_bypass(r, "imports")));
+        for (no, stmt) in &uses.statements {
+            if let Some(r) = live_import(stmt, &file.rel, &readers) {
+                out.push(file.finding(SUPERVISE_FX.id, *no, live_bypass(r, "imports")));
             }
         }
     }
@@ -1977,38 +2306,49 @@ fn look_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
         .collect()
 }
 
-/// The lines of a file that belong to a phase-2 read's home `fn`
-/// ([`SUPERVISE_READ_HOMES`]), each with that `fn`'s name.
+/// The lines of a file that belong to a phase-2 read's home `fn` in its own
+/// file ([`SUPERVISE_READ_HOMES`]), each with the needle that home is for.
 fn read_homes(file: &SourceFile) -> std::collections::BTreeMap<usize, &'static str> {
+    let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
     super::graph::attribute(file)
         .iter()
         .filter_map(|l| {
             let func = l.func?;
             SUPERVISE_READ_HOMES
                 .iter()
-                .find(|(home, _)| *home == func)
-                .map(|(home, _)| (l.line.no, *home))
+                .find(|(home, name, _)| *home == rel && *name == func)
+                .map(|(_, _, needle)| (l.line.no, *needle))
         })
         .collect()
 }
 
-/// The lines of a file that belong to a wall reader's own `fn` (`fn unix_ms`,
-/// `fn unix_now`: [`ClockShape::Reader`] names), signature and body: the
-/// reader wraps the system's clock — that is what it is for, and the crate's
-/// callers outside the supervisor read it too — so it is the clock's home, and
-/// the rule is about its callers.
+/// The lines of a file that belong to a wall reader's own `fn` in its own
+/// file ([`SUPERVISE_READER_HOMES`]), signature and body: the wall clock's
+/// home, for a [`wall_read`] alone.
 fn reader_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
+    let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
     super::graph::attribute(file)
         .iter()
         .filter(|l| {
             l.func.is_some_and(|f| {
-                SUPERVISE_CLOCKS
+                SUPERVISE_READER_HOMES
                     .iter()
-                    .any(|(name, shape, _)| matches!(shape, ClockShape::Reader) && *name == f)
+                    .any(|(home, name)| *home == rel && *name == f)
             })
         })
         .map(|l| l.line.no)
         .collect()
+}
+
+/// Whether the [`SUPERVISE_CLOCKS`] needle `needle` reads the WALL clock (the
+/// system's time, `SystemTime::now` or a one-word wall reader), which is all a
+/// wall reader's own body is the home of: never a sleep, nor the monotonic
+/// clock.
+fn wall_read(needle: &str) -> bool {
+    needle == "SystemTime::now"
+        || SUPERVISE_CLOCKS
+            .iter()
+            .any(|(name, shape, _)| matches!(shape, ClockShape::Reader) && *name == needle)
 }
 
 /// The direct clock read, sleep or phase-2 read one line of code makes, if
@@ -2017,8 +2357,15 @@ fn reader_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
 /// `self.fx.sleep(…)` is no hit: `sleep` counts only as `thread::sleep`; nor
 /// is `self.fx.try_recv_mail(…)` or an `approvals::typed_at_in(…)`: a name is
 /// a word, never the start of a longer one.
-fn supervise_clock(code: &str) -> Option<(&'static str, &'static str)> {
-    first_hit(code, SUPERVISE_CLOCKS.iter().chain(SUPERVISE_READS))
+fn supervise_clock(
+    code: &str,
+    include: impl Fn(&str) -> bool,
+) -> Option<(&'static str, &'static str)> {
+    first_hit(
+        code,
+        SUPERVISE_CLOCKS.iter().chain(SUPERVISE_READS),
+        include,
+    )
 }
 
 /// The look at the machine one line of code makes past a derived door, if
@@ -2029,7 +2376,7 @@ fn supervise_look(code: &str) -> Option<(&'static str, &'static str)> {
     if starts_use(code) {
         return None;
     }
-    first_hit(code, SUPERVISE_LOOKS.iter())
+    first_hit(code, SUPERVISE_LOOKS.iter(), |_| true)
 }
 
 /// Whether a line of code begins a `use` statement.
@@ -2040,10 +2387,12 @@ fn starts_use(code: &str) -> bool {
         .any(|u| head.starts_with(u))
 }
 
-/// The first of `names` that sits in `code` in its shape.
+/// The first included name that sits in `code` in its shape. An allowed
+/// home read cannot hide another name later on the same line.
 fn first_hit<'a>(
     code: &str,
     names: impl Iterator<Item = &'a (&'static str, ClockShape, &'static str)>,
+    include: impl Fn(&str) -> bool,
 ) -> Option<(&'static str, &'static str)> {
     for (needle, shape, what) in names {
         for at in hits(code, needle, Bound::Word) {
@@ -2053,14 +2402,16 @@ fn first_hit<'a>(
             let called = after.starts_with('(');
             let read = match shape {
                 ClockShape::Named => true,
-                ClockShape::Reader => called || pathed,
+                // A `fn` of the reader's name is a definition, not a read: its
+                // body is what is read, line by line.
+                ClockShape::Reader => pathed || (called && !ends_with_word(before, "fn")),
                 ClockShape::Method => pathed || (called && before.ends_with('.')),
                 ClockShape::Free => {
                     pathed || (called && !before.ends_with('.') && !ends_with_word(before, "fn"))
                 }
                 ClockShape::PathCall => !before.ends_with('.') && path_called(after),
             };
-            if read {
+            if read && include(needle) {
                 return Some((needle, what));
             }
         }
@@ -2410,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn a_protected_folder_literal_is_found_in_gui_and_cli_shipped_code() {
+    fn a_protected_folder_literal_is_found_in_gui_cli_and_amacs_host_shipped_code() {
         let src = "let a = home.join(\"Documents\");\nlet b = \"~/Downloads/x\";\n\
                    let c = Path::new(\"/Volumes/Ext\");\nlet d = \"Library/CloudStorage\";\n\
                    // ~/Desktop in prose\nlet e = DocumentsView::new();\n\
@@ -2423,11 +2774,18 @@ mod tests {
                 ("crates/aterm-gui/src/lib.rs", src),
                 ("crates/aterm-gui/src/lib_tests.rs", src),
                 ("crates/aterm-containment/src/consent.rs", src),
+                ("crates/amacs-files/src/host.rs", src),
+                ("crates/amacs/src/store.rs", src),
             ],
         );
         assert_eq!(
             spots(&found),
             [
+                "crates/amacs-files/src/host.rs:1",
+                "crates/amacs-files/src/host.rs:2",
+                "crates/amacs-files/src/host.rs:3",
+                "crates/amacs-files/src/host.rs:4",
+                "crates/amacs-files/src/host.rs:8",
                 "crates/aterm-gui/src/lib.rs:1",
                 "crates/aterm-gui/src/lib.rs:2",
                 "crates/aterm-gui/src/lib.rs:3",
@@ -2540,10 +2898,10 @@ mod tests {
 
     #[test]
     fn no_off_host_crate_has_the_crash_restore_in_its_closure() {
-        use crate::scan_set::test_fixtures::{synth_tree, workspace_manifests};
-        let closure = |link_deps: &str, session_deps: &str, label: &str| {
+        use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
+        let closure_of = |off_host: (&str, &str), session_deps: &str, label: &str| {
             let mut files = workspace_manifests(&[
-                ("aterm-link", link_deps),
+                off_host,
                 ("aterm-session", session_deps),
                 ("aterm-uds", ""),
                 (
@@ -2554,7 +2912,7 @@ mod tests {
             for dir in [
                 "aterm-gui",
                 "aterm-types",
-                "aterm-link",
+                off_host.0,
                 "aterm-session",
                 "aterm-uds",
                 "aterm-restore",
@@ -2562,7 +2920,7 @@ mod tests {
                 files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
             }
             files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
-            let root = synth_tree("aterm-census-guards", label, &files);
+            let root = disk_tree("aterm-census-guards", label, &files);
             let corpus = super::super::Corpus::of(&[]);
             let tree = Tree {
                 root: &root,
@@ -2573,6 +2931,32 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             found
         };
+        let closure = |link_deps: &str, session_deps: &str, label: &str| {
+            closure_of(("aterm-link", link_deps), session_deps, label)
+        };
+        // Every crate that carries bytes off the host is held to it, the fleet's TLS crate,
+        // the HTTP stream and the window's fabric endpoint as the fabric's link is.
+        for off_host in ["aterm-net", "aterm-http", "aterm-gui-fabric"] {
+            let found = closure_of(
+                (
+                    off_host,
+                    "[dependencies]\naterm-restore = { workspace = true }\n",
+                ),
+                "",
+                &format!("restore-local-{off_host}"),
+            );
+            assert_eq!(found.len(), 1, "{off_host}: {found:?}");
+            assert_eq!(found[0].path, format!("crates/{off_host}/Cargo.toml"));
+            let found = closure_of(
+                (
+                    off_host,
+                    "[dependencies]\naterm-uds = { workspace = true }\n",
+                ),
+                "",
+                &format!("restore-local-{off_host}-clean"),
+            );
+            assert!(found.is_empty(), "{off_host}: {found:?}");
+        }
         let link_via_session = "[dependencies]\naterm-uds = { workspace = true }\naterm-session = { workspace = true }\n";
         let found = closure(link_via_session, "", "restore-local-clean");
         assert!(found.is_empty(), "{found:?}");
@@ -2602,7 +2986,7 @@ mod tests {
 
     #[test]
     fn the_keepers_closure_holds_no_gui_crate() {
-        use crate::scan_set::test_fixtures::{synth_tree, workspace_manifests};
+        use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
         let mut files = workspace_manifests(&[
             (
                 "aterm-keeper",
@@ -2614,7 +2998,7 @@ mod tests {
             files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
         }
         files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
-        let root = synth_tree("aterm-census-guards", "keeper-deps", &files);
+        let root = disk_tree("aterm-census-guards", "keeper-deps", &files);
         let corpus = super::super::Corpus::of(&[]);
         let tree = Tree {
             root: &root,
@@ -2649,7 +3033,7 @@ mod tests {
             files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
         }
         files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
-        let root = synth_tree("aterm-census-guards", "keeper-gui-crate", &files);
+        let root = disk_tree("aterm-census-guards", "keeper-gui-crate", &files);
         let tree = Tree {
             root: &root,
             corpus: &corpus,
@@ -2679,7 +3063,7 @@ mod tests {
             files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
         }
         files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
-        let root = synth_tree("aterm-census-guards", "keeper-renamed-gui", &files);
+        let root = disk_tree("aterm-census-guards", "keeper-renamed-gui", &files);
         let tree = Tree {
             root: &root,
             corpus: &corpus,
@@ -2698,7 +3082,7 @@ mod tests {
     /// lists) are not followed; a dependency the lock lacks is a finding.
     #[test]
     fn the_keepers_closure_is_walked_through_cargo_lock() {
-        use crate::scan_set::test_fixtures::{synth_tree, workspace_manifests};
+        use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
         let lock = "version = 4\n\n\
                     [[package]]\nname = \"aterm-uds\"\nversion = \"0.1.0\"\n\
                     dependencies = [\n \"helper\",\n]\n\n\
@@ -2740,7 +3124,7 @@ mod tests {
                 files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
             }
             files.push(("Cargo.lock".to_string(), lock.to_string()));
-            synth_tree("aterm-census-guards", name, &files)
+            disk_tree("aterm-census-guards", name, &files)
         };
         let run_on = |root: &std::path::Path| {
             let corpus = super::super::Corpus::of(&[]);
@@ -2922,6 +3306,87 @@ mod tests {
             ),
             ("a sleep", "std::thread::sleep(BACKOFF);\n", 1),
             ("a sleep imported", "use std::thread::sleep;\n", 1),
+            (
+                "a sleep after an own-name import",
+                "fn f() {\n    use std::thread; thread::sleep(D);\n}\n",
+                2,
+            ),
+            (
+                "a monotonic read after a multiline import closes",
+                "fn f() {\n    use std::{\n        thread,\n    }; let _ = Instant::now();\n}\n",
+                4,
+            ),
+            (
+                "a renamed sleep in the second import on one line",
+                "use std::fmt; use std::thread::sleep as nap;\n",
+                1,
+            ),
+            (
+                "a process read after an own-name import",
+                "fn f() {\n    use std::process; let _ = process::id();\n}\n",
+                2,
+            ),
+            (
+                "a sleep until an instant",
+                "std::thread::sleep_until(at);\n",
+                1,
+            ),
+            ("a park with a timeout", "thread::park_timeout(d);\n", 1),
+            // A name brought in by an import the line view cannot follow: a
+            // group, a rename, a glob, a type alias. Each is named at its
+            // statement's first line, where the name is bound.
+            (
+                "a sleep imported in a group with its module, then called bare",
+                "use std::thread::{self, sleep};\nfn f() {\n    sleep(BUSY_SINK_BACKOFF);\n}\n",
+                1,
+            ),
+            (
+                "a sleep imported alone in braces",
+                "use std::thread::{sleep};\n",
+                1,
+            ),
+            (
+                "a sleep renamed in a nested group across lines",
+                "use std::{\n    thread::{sleep as nap, spawn},\n    time::Duration,\n};\n",
+                1,
+            ),
+            (
+                "the thread module renamed",
+                "use std::thread as t;\nfn f() {\n    t::sleep(D);\n}\n",
+                1,
+            ),
+            ("the thread module globbed in", "use std::thread::*;\n", 1),
+            (
+                "the monotonic clock renamed",
+                "use std::time::Instant as Mono;\nfn f() {\n    let t = Mono::now();\n}\n",
+                1,
+            ),
+            (
+                "the monotonic clock renamed in a group",
+                "use std::time::{Duration, Instant as Mono};\n",
+                1,
+            ),
+            (
+                "the wall clock's type renamed",
+                "use std::time::SystemTime as Wall;\n",
+                1,
+            ),
+            (
+                "the monotonic clock aliased as a type",
+                "pub(crate) type Mono = std::time::Instant;\n",
+                1,
+            ),
+            (
+                "the journal's wall reader imported in a group, passed bare",
+                "use super::journal::{json_str, unix_ms};\nfn f() {\n    \
+                 let t = x.unwrap_or_else(unix_ms);\n}\n",
+                1,
+            ),
+            (
+                "aterm_time's wall reader renamed",
+                "use aterm_time::{unix_millis as now_ms};\n",
+                1,
+            ),
             // Phase 2: the recorder's other doors.
             (
                 "this process's id",
@@ -2954,6 +3419,21 @@ mod tests {
                 1,
             ),
             ("the ledger cut", "approvals::bound(path);\n", 1),
+            (
+                "this process's id imported bare",
+                "use std::process::{self, id};\n",
+                1,
+            ),
+            (
+                "a reader of the ledger by its path imported bare",
+                "use super::approvals::{Ledger, typed_at};\n",
+                1,
+            ),
+            (
+                "the ledger's module renamed",
+                "use super::approvals as ledger;\n",
+                1,
+            ),
         ];
         for (why, src, line) in cases {
             let found = run(
@@ -2978,32 +3458,39 @@ mod tests {
                    // Instant::now() and t.elapsed() in prose\n\
                    let s = \"thread::sleep(1)\";\nlet unix_ms = d.unix_ms;\nsettle.unix_ms = unix_ms;\n\
                    fn wall_reset_at(unix_ms: i64, elapsed: Duration) {}\nlet x = r.elapsed;\n\
-                   pub fn unix_now() -> i64 {\n    aterm_time::unix_secs().map_or(0, |s| s as i64)\n}\n\
-                   pub fn unix_ms() -> i64 {\n    aterm_time::unix_millis().map_or(0, |m| m as i64)\n}\n\
                    #[cfg(test)]\nmod tests {\n    fn t() { let _ = Instant::now(); std::thread::sleep(D); }\n}\n";
-        assert!(
-            run(
-                &SUPERVISE_FX,
-                &[("crates/aterm-agent/src/supervise/run.rs", src)]
-            )
-            .is_empty()
+        // The wall readers' own definitions, each in its own file.
+        let limit = "pub fn unix_now() -> i64 {\n    \
+                     aterm_time::unix_secs().map_or(0, |s| s as i64)\n}\n\
+                     pub fn unix_now_ms() -> i64 {\n    \
+                     aterm_time::unix_millis().map_or(0, |m| m as i64)\n}\n";
+        let journal = "pub fn unix_ms() -> i64 {\n    \
+                       aterm_time::unix_millis().map_or(0, |m| m as i64)\n}\n";
+        let found = run(
+            &SUPERVISE_FX,
+            &[
+                ("crates/aterm-agent/src/supervise/run.rs", src),
+                ("crates/aterm-agent/src/supervise/limit.rs", limit),
+                ("crates/aterm-agent/src/supervise/journal.rs", journal),
+            ],
         );
+        assert!(found.is_empty(), "{:?}", spots(&found));
         // Phase 2's doors, their homes, and names a door's are the start of.
         let doors = "match self.fx.try_recv_mail(&m.rx) {\n    _ => {}\n}\n\
                      let got = self.fx.recv_mail_timeout(&m.rx, slice);\n\
                      let typed = approvals::typed_at_in(&body, sid);\n\
                      let w = approvals::open_wall_in(&body, sid);\nself.fx.bound(path);\n\
-                     let r = approvals::relaunch_waiting_in(body, sid);\n\
-                     pub(super) fn default_holder() -> String {\n    \
-                     format!(\"aterm-supervise:{}\", std::process::id())\n}\n\
-";
-        assert!(
-            run(
-                &SUPERVISE_FX,
-                &[("crates/aterm-agent/src/supervise/run.rs", doors)]
-            )
-            .is_empty()
+                     let r = approvals::relaunch_waiting_in(body, sid);\n";
+        let holder = "pub(super) fn default_holder() -> String {\n    \
+                      format!(\"aterm-supervise:{}\", std::process::id())\n}\n";
+        let found = run(
+            &SUPERVISE_FX,
+            &[
+                ("crates/aterm-agent/src/supervise/run.rs", doors),
+                ("crates/aterm-agent/src/supervise/claim.rs", holder),
+            ],
         );
+        assert!(found.is_empty(), "{:?}", spots(&found));
         // A home is a home for its own read alone.
         let elsewhere = "fn output_within() {\n    let _ = std::process::id();\n}\n\
                          fn default_holder() {\n    let _ = rx.try_recv();\n}\n";
@@ -3049,6 +3536,122 @@ mod tests {
                 "crates/aterm-agent/src/supervise/policy/turn_end.rs:3",
             ]
         );
+    }
+
+    /// A WALL READER'S HOME IS ITS OWN `fn`, IN ITS OWN FILE, FOR THE WALL
+    /// READ ALONE: `limit::unix_now{,_ms}` and `journal::unix_ms` read the
+    /// system's wall clock in their bodies, and nothing else there is
+    /// excused — a sleep or a monotonic read in a reader's body is a read past
+    /// the door — and a `fn` of a reader's name anywhere else (a method of
+    /// that name on some type) is no home at all, whatever it reads.
+    #[test]
+    fn a_wall_readers_home_is_its_own_fn_in_its_own_file_for_the_wall_alone() {
+        let limit = "pub fn unix_now() -> i64 {\n    \
+                     aterm_time::unix_secs().map_or(0, |s| s as i64)\n}\n\
+                     pub fn unix_now_ms() -> i64 {\n    std::thread::sleep(D);\n    \
+                     let _ = std::time::Instant::now();\n    \
+                     aterm_time::unix_millis().map_or(0, |m| m as i64)\n}\n";
+        let journal = "pub fn unix_ms() -> i64 {\n    \
+                       let _ = std::time::SystemTime::now();\n    \
+                       aterm_time::unix_millis().map_or(0, |m| m as i64)\n}\n";
+        let elsewhere = "impl Waiter {\n    fn unix_ms(&self) -> i64 {\n        \
+                         std::thread::sleep(Duration::from_secs(5));\n        \
+                         let _ = std::time::Instant::now();\n        \
+                         aterm_time::unix_millis().map_or(0, |m| m as i64)\n    }\n}\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[
+                    ("crates/aterm-agent/src/supervise/limit.rs", limit),
+                    ("crates/aterm-agent/src/supervise/journal.rs", journal),
+                    ("crates/aterm-agent/src/supervise/probe2.rs", elsewhere),
+                    // The journal's reader by name, in the limit's file.
+                    ("crates/aterm-agent/src/supervise/policy/limit.rs", journal),
+                ]
+            )),
+            [
+                "crates/aterm-agent/src/supervise/limit.rs:5",
+                "crates/aterm-agent/src/supervise/limit.rs:6",
+                "crates/aterm-agent/src/supervise/policy/limit.rs:2",
+                "crates/aterm-agent/src/supervise/policy/limit.rs:3",
+                "crates/aterm-agent/src/supervise/probe2.rs:3",
+                "crates/aterm-agent/src/supervise/probe2.rs:4",
+                "crates/aterm-agent/src/supervise/probe2.rs:5",
+            ]
+        );
+        // The holder's resolution is a home in the claim's file alone, and
+        // for this process's id alone.
+        let holder = "pub(super) fn default_holder() -> String {\n    \
+                      format!(\"aterm-supervise:{}\", std::process::id())\n}\n\
+                      fn default_holder_too() {\n    let _ = std::process::id();\n}\n";
+        let wrong = "fn default_holder() {\n    let _ = rx.try_recv();\n}\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[
+                    ("crates/aterm-agent/src/supervise/claim.rs", holder),
+                    ("crates/aterm-agent/src/supervise/run.rs", holder),
+                    ("crates/aterm-agent/src/supervise/escalate.rs", wrong),
+                ]
+            )),
+            [
+                "crates/aterm-agent/src/supervise/claim.rs:5",
+                "crates/aterm-agent/src/supervise/escalate.rs:2",
+                "crates/aterm-agent/src/supervise/run.rs:2",
+                "crates/aterm-agent/src/supervise/run.rs:5",
+            ]
+        );
+        // An allowed read on a line excuses only itself, never a second
+        // clock or delivery on that line, in either kind of home.
+        let mixed_wall = "fn unix_now() {\n    \
+                          let _ = SystemTime::now(); thread::sleep(D);\n    \
+                          let _ = SystemTime::now(); let _ = process::id();\n    \
+                          let _ = aterm_time::unix_secs(); let _ = rx.recv_timeout(D);\n    \
+                          let _ = SystemTime::now(); let _ = aterm_time::unix_secs();\n}\n";
+        let mixed_holder = "fn default_holder() {\n    \
+                            let _ = process::id(); let _ = rx.try_recv();\n}\n";
+        assert_eq!(
+            spots(&run(
+                &SUPERVISE_FX,
+                &[
+                    ("crates/aterm-agent/src/supervise/limit.rs", mixed_wall),
+                    ("crates/aterm-agent/src/supervise/claim.rs", mixed_holder),
+                ]
+            )),
+            [
+                "crates/aterm-agent/src/supervise/claim.rs:2",
+                "crates/aterm-agent/src/supervise/limit.rs:2",
+                "crates/aterm-agent/src/supervise/limit.rs:3",
+                "crates/aterm-agent/src/supervise/limit.rs:4",
+            ]
+        );
+    }
+
+    /// AN IMPORT THAT KEEPS A CLOCK'S NAME IS SILENT: the module or the type
+    /// brought in under its own name (`use std::thread;`, `Instant`,
+    /// `SystemTime`, the ledger's module and its `_in` readers), a group of
+    /// them, `self` in a group, `as _` (which binds nothing to call), a
+    /// rename of something no clock is named through, a type alias of a
+    /// type that is not a clock, and an import in test code.
+    #[test]
+    fn an_import_that_keeps_a_clocks_name_is_silent() {
+        let src = "use std::thread;\nuse std::time::{Duration, Instant};\n\
+                   use std::time::SystemTime;\nuse std::fmt::Write as _;\n\
+                   use std::thread::sleep as _;\n\
+                   use super::approvals::{self, Ledger, typed_at_in};\n\
+                   use super::journal::{Journal, json_str, unix_ms_of};\n\
+                   use std::{\n    process,\n    thread::{self, spawn},\n};\n\
+                   use aterm_phase::prompt::fixtures as f;\n\
+                   use std::os::unix::fs::OpenOptionsExt;\n\
+                   type Clocked = fn() -> Instant;\ntype Mark = (Instant, u64);\n\
+                   pub(crate) type Stamp = super::policy::sleeps::SleepStamp;\n\
+                   #[cfg(test)]\nmod tests {\n    use std::thread::{self, sleep};\n    \
+                   use std::time::Instant as Mono;\n}\n";
+        let found = run(
+            &SUPERVISE_FX,
+            &[("crates/aterm-agent/src/supervise/run.rs", src)],
+        );
+        assert!(found.is_empty(), "{:?}", spots(&found));
     }
 
     /// PHASE 3: each look at the machine made past a derived door is a
@@ -3371,7 +3974,9 @@ mod tests {
                       pub fn rogue(path: &Path) {\n    let _ = std::fs::read(path);\n}\n";
         let lp = "let t = approvals::awaited_try(path, sid);\n\
                   let u = approvals::awaited_try_in(&body, sid);\n\
-                  let v = super::approvals::awaited_try(path, sid);\n";
+                  let v = super::approvals::awaited_try(path, sid);\n\
+                  use super::approvals::{awaited_try_in, awaited_try};\n\
+                  use super::approvals::awaited_try_in;\n";
         assert_eq!(
             spots(&run(
                 &SUPERVISE_FX,
@@ -3384,6 +3989,9 @@ mod tests {
                 "crates/aterm-agent/src/supervise/approvals.rs:8",
                 "crates/aterm-agent/src/supervise/turn_end_loop.rs:1",
                 "crates/aterm-agent/src/supervise/turn_end_loop.rs:3",
+                // Imported bare in a group, beside its `_in` form; the `_in`
+                // form imported alone is silent.
+                "crates/aterm-agent/src/supervise/turn_end_loop.rs:4",
             ]
         );
     }

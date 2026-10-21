@@ -4,20 +4,21 @@
 //! Media-capture verbs: `image` (terminal-content framebuffer PNG), `image read`
 //! (structured inline-image payloads, headless/cross-session-safe), `window`
 //! (whole-window composited PNG), and `chrome` (native macOS UI readout). Moved
-//! verbatim from `control.rs` (behavior-preserving). The `ImageReq`/`ImageQueue`
-//! types and the `AUDIT_SUBSYSTEM` name stay in `control.rs`, reached via `super::`.
+//! verbatim from `control.rs` (behavior-preserving). The `ImageReq` type and the
+//! `AUDIT_SUBSYSTEM` name stay in `control.rs`, reached via `super::`.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aterm_containment::log_denial;
-use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+use aterm_core::grid::extra::{ImageData, ImageRef};
 use aterm_core::terminal::Terminal;
 use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 
-use super::{AUDIT_SUBSYSTEM, ImageQueue, ImageReq};
+use super::{AUDIT_SUBSYSTEM, ImageReq};
 use crate::control_auth;
+use crate::image_payload_memo::{ImagePayload, image_payloads};
 use crate::platform::AppRt as _;
 use crate::{Wake, term_lock};
 
@@ -57,12 +58,12 @@ impl std::fmt::Display for MainHopError {
 /// nobody reads, so its words are for a trace, not a driver.
 pub(crate) const CLIENT_HUNG_UP: &str = "client hung up before the request reached the main thread";
 
-/// The main-thread hops in flight: posted by [`call_main`] or
-/// [`call_main_within`], not yet TAKEN by the main thread and not given up on,
-/// and since when some have been. [`main_thread_refusal`] reads it. A hop that
-/// has waited the stall bar on a main thread that has not beaten in that time
-/// means the thread is stuck past its idle park (inside AppKit, say), which
-/// the heartbeat alone cannot tell from a thread that is only idle.
+/// The main-thread hops in flight: posted by [`post_main`], not yet TAKEN by
+/// the main thread and not given up on, and since when some have been.
+/// [`main_thread_refusal`] reads it. A hop that has waited the stall bar on a
+/// main thread that has not beaten in that time means the thread is stuck
+/// past its idle park (inside AppKit, say), which the heartbeat alone cannot
+/// tell from a thread that is only idle.
 ///
 /// The count alone is not enough. A main thread idle at its park for ten
 /// minutes has a ten-minute-old heartbeat, and the hop that wakes it is
@@ -204,43 +205,116 @@ pub(crate) fn take_hop(ev: Wake) -> Wake {
     }
 }
 
-/// Post `make(tx)` as a counted hop: wrapped in [`Wake::Hop`] with the mark
-/// that counts it out when the main thread takes it. `Err` is the one
-/// `send_event` failure a hop has, the event loop being gone.
-fn post_hop(
+/// THE ONE main-thread RPC's post. Every verb the control thread cannot answer
+/// itself (it cannot touch `App`/AppKit) needs the same hop: refused first,
+/// before its request is built ([`main_thread_refusal`]); then a one-shot
+/// reply channel and a reply-bearing `Wake`, posted as a counted [`Wake::Hop`].
+/// The caller blocks on the returned receiver and holds the guard while it
+/// waits: the hop counts from the post until the main thread takes it or the
+/// guard drops, however the wait ends, so the next verb can tell a hop that
+/// has waited too long for the main thread. [`call_main`] and
+/// [`call_main_within`] add a bounded receive; the pixel verbs (`image`,
+/// `window`, a `video` recording) keep their own, which cancel publication on
+/// a give-up. [`MainPost::ask`] is the same counted post for a lane written
+/// against an injected send (`edit`, `await edit`), which asks its refusal
+/// itself. `askpass` alone posts its request uncounted
+/// (`control_askpass::serve`). `Err` is a wire-ready reason.
+pub(crate) fn post_main<T>(
     proxy: &EventLoopProxy<Wake>,
-    hop: &HopGuard<'static>,
-    wake: Wake,
-) -> Result<(), MainHopError> {
-    let wake = Wake::Hop {
-        mark: hop.mark(),
-        wake: Box::new(wake),
-    };
-    proxy
-        .send_event(wake)
-        .map_err(|_| MainHopError::Reason("event loop gone"))
+    make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
+) -> Result<(std::sync::mpsc::Receiver<T>, HopGuard<'static>), MainHopError> {
+    post_counted(
+        &HOPS,
+        main_thread_refusal(),
+        |wake| proxy.send_event(wake).is_ok(),
+        make,
+    )
 }
 
-/// The ONE main-thread RPC. Every UI-mutating / aux-window verb (controls, open,
-/// settings, invoke, spawn, close, chrome) needs the same hop: build a one-shot
-/// reply channel, post a reply-bearing `Wake` to the event loop, and BLOCK on the
-/// answer (the control thread cannot touch `App`/AppKit). This collapses that
-/// channel + event-gone guard + recv — previously copy-pasted into ~8 verbs — into
-/// one call, so the surface never grows a bespoke RPC ceremony per verb. `Err` is a
-/// wire-ready reason; callers format the `Ok(T)` into their own reply shape.
+/// [`post_main`] on a given count, with the refusal already asked and the
+/// event loop's `send_event` as `send`, which answers whether the loop took
+/// the wake: a test can build no `EventLoopProxy`. A refusal returns before
+/// `make` runs, so the request's guards drop unbuilt and nothing is posted or
+/// counted. A wake the loop gives back is dropped in `send`, which drops the
+/// guards it carries, and its hop counts itself out with the guard.
+fn post_counted<T>(
+    hops: &'static Hops,
+    refusal: Option<MainHopError>,
+    send: impl FnOnce(Wake) -> bool,
+    make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
+) -> Result<(std::sync::mpsc::Receiver<T>, HopGuard<'static>), MainHopError> {
+    if let Some(refusal) = refusal {
+        return Err(refusal);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hop = hops.post(crate::metrics::now_ns());
+    let delivered = send(Wake::Hop {
+        mark: hop.mark(),
+        wake: Box::new(make(tx)),
+    });
+    if !delivered {
+        return Err(MainHopError::Reason("event loop gone"));
+    }
+    Ok((rx, hop))
+}
+
+/// The main thread as a lane whose logic is written against an injected send
+/// reaches it: a unit test can build no `EventLoopProxy`, so it hands the lane
+/// a closure instead. [`Self::ask`] posts a reply-bearing request as
+/// [`post_main`]'s counted hop, [`Self::tell`] a notice that waits for
+/// nothing (a cancel, a withdrawal) as it is.
+pub(crate) struct MainPost<'a> {
+    send: Box<dyn FnMut(Wake) -> bool + 'a>,
+    hops: &'static Hops,
+}
+
+impl<'a> MainPost<'a> {
+    /// Through `proxy`'s `send_event`, counted on the process's [`Hops`],
+    /// which [`main_thread_refusal`] reads.
+    pub(crate) fn new(proxy: &'a EventLoopProxy<Wake>) -> Self {
+        Self {
+            send: Box::new(|wake| proxy.send_event(wake).is_ok()),
+            hops: &HOPS,
+        }
+    }
+
+    /// Through `send`, which answers whether the main thread took the wake,
+    /// counted on `hops`: a test's own of both.
+    #[cfg(test)]
+    pub(crate) fn injected(send: impl FnMut(Wake) -> bool + 'a, hops: &'static Hops) -> Self {
+        Self {
+            send: Box::new(send),
+            hops,
+        }
+    }
+
+    /// [`post_counted`] with no refusal: a lane asks [`main_thread_refusal`]
+    /// itself, before it builds its request, where its verb is refused at
+    /// all. The caller holds the guard while it waits for the reply.
+    pub(crate) fn ask<T>(
+        &mut self,
+        make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
+    ) -> Result<(std::sync::mpsc::Receiver<T>, HopGuard<'static>), MainHopError> {
+        post_counted(self.hops, None, &mut self.send, make)
+    }
+
+    /// Post `wake` uncounted; whether the main thread took it.
+    pub(crate) fn tell(&mut self, wake: Wake) -> bool {
+        (self.send)(wake)
+    }
+}
+
+/// [`post_main`] and a bounded wait for the answer, which every UI-mutating /
+/// aux-window verb (controls, open, settings, invoke, spawn, close, chrome)
+/// needs: the channel + event-gone guard + recv once copy-pasted into ~8
+/// verbs, in one call, so the surface never grows a bespoke RPC ceremony per
+/// verb. `Err` is a wire-ready reason; callers format the `Ok(T)` into their
+/// own reply shape.
 pub(crate) fn call_main<T>(
     proxy: &EventLoopProxy<Wake>,
     make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
 ) -> Result<T, MainHopError> {
-    if let Some(refusal) = main_thread_refusal() {
-        return Err(refusal);
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    // Counted from before the post until the main thread takes it or this
-    // worker stops waiting, however that ends, so the next verb can tell a hop
-    // that has waited too long for the main thread.
-    let hop = HOPS.post(crate::metrics::now_ns());
-    post_hop(proxy, &hop, make(tx))?;
+    let (rx, _hop) = post_main(proxy, make)?;
     // These RPCs answer within one event-loop turn; the deadline only fires when
     // that turn cannot finish within the generous cold-render allowance. Timing
     // out frees THIS fixed worker lane instead of retaining it forever.
@@ -279,12 +353,7 @@ pub(crate) fn call_main_within<T>(
     within: std::time::Duration,
     make: impl FnOnce(std::sync::mpsc::Sender<T>) -> Wake,
 ) -> Result<T, MainHopError> {
-    if let Some(refusal) = main_thread_refusal() {
-        return Err(refusal);
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let hop = HOPS.post(crate::metrics::now_ns());
-    post_hop(proxy, &hop, make(tx))?;
+    let (rx, _hop) = post_main(proxy, make)?;
     recv_within(&rx, within).map_err(MainHopError::Reason)
 }
 
@@ -318,7 +387,7 @@ pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
         aterm_log::debug!(
             "control: main-thread request refused; stalled {}s at {}{returned}",
             stall.stalled.as_secs(),
-            stall.root.name()
+            stall.root.ident()
         );
         return Some(MainHopError::Stalled(stall));
     }
@@ -368,12 +437,6 @@ fn recv_within<T>(
     }
 }
 
-/// One `image read` result line:
-/// `<row> <col> <img_cols> <img_rows> <cell_row> <cell_col> <format> <nbytes> <base64>`.
-/// `row`/`col` are the image's TOP-LEFT anchor on the grid; `cell_row`/`cell_col`
-/// are the tile of interest (0/0 for a whole-image report, the queried tile in
-/// cell mode); `nbytes` is the raw (pre-base64) length; the trailing base64 is the
-/// image's full raw payload (PNG bytes etc.), independent of the GUI framebuffer.
 /// Per-image payload cap for the line + JSON image channels (audit finding F4). An
 /// inline image is USER-supplied (the inner TUI emits OSC 1337), so a hostile or
 /// careless inner could embed a multi-megabyte image and force a large base64
@@ -383,44 +446,46 @@ fn recv_within<T>(
 /// and how big it is, then fetches it deliberately, without the per-frame blowup.
 pub(crate) const MAX_IMAGE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024; // 4 MiB raw (~5.3 MiB base64)
 
-/// `(format, base64)` for an image, applying the F4 cap: oversized images report
-/// `("truncated", "")` instead of encoding their bytes.
-pub(crate) fn image_payload(img: &ImageData) -> (&'static str, String) {
-    let fmt = match img.format {
-        ImageFormat::Png => "png",
-        ImageFormat::RawRgba8 { .. } => "rgba",
-        _ => "unknown",
-    };
-    if img.bytes.len() > MAX_IMAGE_PAYLOAD_BYTES {
-        ("truncated", String::new())
-    } else {
-        // `base64::encode` is fallible only above `aterm_codec::MAX_INPUT_LEN`
-        // (64 MiB); bytes are already capped at MAX_IMAGE_PAYLOAD_BYTES (4 MiB)
-        // above, so this branch never errors in practice. Report it like the cap
-        // path (omit the payload, mark truncated) rather than panic on oversized
-        // input.
-        match aterm_codec::base64::encode(&img.bytes) {
-            Ok(b64) => (fmt, b64),
-            Err(_) => ("truncated", String::new()),
-        }
-    }
+/// One image's wire payload under the F4 cap, through the process's payload
+/// memo ([`crate::image_payload_memo`]): `png`/`rgba`/`unknown` and the
+/// base64 of its bytes, or `truncated` and an empty payload when they exceed
+/// [`MAX_IMAGE_PAYLOAD_BYTES`].
+pub(crate) fn image_payload(img: &Arc<ImageData>) -> ImagePayload {
+    // A batch answers every image it is asked about.
+    image_payloads(&[img])
+        .pop()
+        .unwrap_or(ImagePayload::TRUNCATED)
 }
 
+/// Append one `image read` result line, without its newline:
+/// `<row> <col> <img_cols> <img_rows> <cell_row> <cell_col> <format> <nbytes> <base64>`.
+/// `row`/`col` are the image's TOP-LEFT anchor on the grid; `cell_row`/`cell_col`
+/// are the tile of interest (0/0 for a whole-image report, the queried tile in
+/// cell mode); `nbytes` is the raw (pre-base64) length; the trailing base64 is the
+/// image's full raw payload (PNG bytes etc.), independent of the GUI framebuffer.
+/// The base64 is pushed from the payload, never formatted through a temporary.
 pub(crate) fn image_read_line(
+    out: &mut String,
     anchor_r: usize,
     anchor_c: usize,
     tile_row: u16,
     tile_col: u16,
     img: &ImageData,
-) -> String {
-    let (fmt, b64) = image_payload(img);
-    format!(
-        "{anchor_r} {anchor_c} {} {} {tile_row} {tile_col} {fmt} {} {b64}",
+    payload: &ImagePayload,
+) {
+    let _ = write!(
+        out,
+        "{anchor_r} {anchor_c} {} {} {tile_row} {tile_col} {} {} ",
         img.cols,
         img.rows,
+        payload.format(),
         img.bytes.len(),
-    )
+    );
+    out.push_str(payload.b64());
 }
+
+/// Bytes an `image read` line takes besides its base64.
+const IMAGE_READ_LINE_BYTES: usize = 96;
 
 /// `image read [<r> [<c>]]` -> the structured inline-image payloads (iTerm2 OSC
 /// 1337) as base64, readable HEADLESS and CROSS-SESSION (unlike the framebuffer
@@ -477,10 +542,14 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
         let Some((anchor_r, anchor_c, cell_row, cell_col, img)) = hit else {
             return "ERR none\n".to_string();
         };
-        return format!(
-            "OK 1\n{}\n",
-            image_read_line(anchor_r, anchor_c, cell_row, cell_col, &img)
+        let payload = image_payload(&img);
+        let mut out = String::with_capacity(8 + IMAGE_READ_LINE_BYTES + payload.b64().len());
+        out.push_str("OK 1\n");
+        image_read_line(
+            &mut out, anchor_r, anchor_c, cell_row, cell_col, &img, &payload,
         );
+        out.push('\n');
+        return out;
     }
 
     // Row mode (one row) or screen mode (all rows): distinct images, anchored.
@@ -522,10 +591,18 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
         }
     }
     drop(t);
-    let mut out = format!("OK {}\n", hits.len());
-    for (anchor_r, anchor_c, img) in hits {
+    let images: Vec<&Arc<ImageData>> = hits.iter().map(|(_, _, img)| img).collect();
+    let payloads = image_payloads(&images);
+    let mut out = String::with_capacity(
+        16 + payloads
+            .iter()
+            .map(|payload| IMAGE_READ_LINE_BYTES + payload.b64().len())
+            .sum::<usize>(),
+    );
+    let _ = writeln!(out, "OK {}", hits.len());
+    for ((anchor_r, anchor_c, img), payload) in hits.iter().zip(&payloads) {
         // Whole-image report: anchor + tile 0/0 (the full payload is carried).
-        out.push_str(&image_read_line(anchor_r, anchor_c, 0, 0, &img));
+        image_read_line(&mut out, *anchor_r, *anchor_c, 0, 0, img, payload);
         out.push('\n');
     }
     out
@@ -637,6 +714,7 @@ fn prepare_image_target(
     clean: bool,
     requested: &str,
     sock_dir: &std::path::Path,
+    budgets: &crate::control::ArtifactBudgets,
     handoff: &mut crate::control::ReplyRetentionPermit,
 ) -> Result<(control_auth::ConfinedImage, Option<String>), ImageTargetError> {
     if want_bytes {
@@ -649,7 +727,7 @@ fn prepare_image_target(
         } else {
             "aterm-control"
         };
-        control_auth::confine_automatic_image_path_with_admission(sock_dir, stem, |path| {
+        control_auth::confine_automatic_image_path_with_admission(sock_dir, stem, budgets, |path| {
             handoff.try_reconcile_for_resolved_path(path)
         })
         .map_err(|error| match error {
@@ -678,7 +756,6 @@ fn prepare_image_target(
 
 pub(crate) fn cmd_image(
     proxy: &EventLoopProxy<Wake>,
-    queue: &ImageQueue,
     rest: &str,
     sock_dir: &std::path::Path,
     session: Option<u64>,
@@ -703,63 +780,58 @@ pub(crate) fn cmd_image(
             _ => (false, t),
         }
     };
+    let budgets = crate::control::ArtifactBudgets::process();
     let permit = if want_bytes {
-        crate::control::ReplyRetention::try_reserve_in_memory()
+        budgets.try_reserve_in_memory()
     } else {
-        crate::control::ReplyRetention::try_reserve_for_path(sock_dir)
+        budgets.try_reserve_for_path(sock_dir)
     };
     let Some(mut handoff) = permit else {
         return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
     };
-    let (target, path) = match prepare_image_target(want_bytes, clean, rest, sock_dir, &mut handoff)
-    {
-        Ok(prepared) => prepared,
-        Err(ImageTargetError::AdmissionRefused) => {
-            return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
-        }
-        Err(ImageTargetError::AutomaticUnavailable) => {
-            return "ERR image: could not create the automatic capture path\n".into();
-        }
-        Err(ImageTargetError::InvalidRequested) => {
-            log_denial(
-                AUDIT_SUBSYSTEM,
-                &format!("image write '{rest}'"),
-                aterm_containment::mode_or_containment(),
-                "path escapes images/ subdir or names a nested target",
-            );
-            return "ERR path: give a bare filename (no '/'), or omit it to auto-name one\n".into();
-        }
-    };
-    // A capture is a main-thread photograph: refused while the main thread is
-    // stalled or a dialog stands, as every main-thread verb is (ruling 267).
-    if let Some(refusal) = main_thread_refusal() {
-        return format!("ERR {refusal}\n").into();
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (target, path) =
+        match prepare_image_target(want_bytes, clean, rest, sock_dir, budgets, &mut handoff) {
+            Ok(prepared) => prepared,
+            Err(ImageTargetError::AdmissionRefused) => {
+                return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
+            }
+            Err(ImageTargetError::AutomaticUnavailable) => {
+                return "ERR image: could not create the automatic capture path\n".into();
+            }
+            Err(ImageTargetError::InvalidRequested) => {
+                log_denial(
+                    AUDIT_SUBSYSTEM,
+                    &format!("image write '{rest}'"),
+                    aterm_containment::mode_or_containment(),
+                    "path escapes images/ subdir or names a nested target",
+                );
+                return "ERR path: give a bare filename (no '/'), or omit it to auto-name one\n"
+                    .into();
+            }
+        };
     let cancel = crate::control::CaptureCancellation::new();
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
     let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
-    let mut pending = queue
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending.push_back(ImageReq {
-        handoff,
-        target,
-        clean,
-        session,
-        want_bytes,
-        want_metadata,
-        frame_metadata: std::sync::Arc::clone(&frame_metadata),
-        cancel,
-        reply: tx,
+    // A capture is a main-thread photograph: refused while the main thread is
+    // stalled or a dialog stands, as every main-thread verb is (ruling 267),
+    // and counted as a hop until the main thread takes it.
+    let posted = post_main(proxy, |reply| {
+        Wake::Image(Box::new(ImageReq {
+            handoff,
+            target,
+            clean,
+            session,
+            want_bytes,
+            want_metadata,
+            frame_metadata: std::sync::Arc::clone(&frame_metadata),
+            cancel,
+            reply,
+        }))
     });
-    if proxy.send_event(Wake::Control).is_err() {
-        pending
-            .pop_back()
-            .expect("queue lock keeps the just-pushed image request last");
-        return "ERR event loop gone\n".into();
-    }
-    drop(pending);
+    let (rx, _hop) = match posted {
+        Ok(posted) => posted,
+        Err(refusal) => return format!("ERR {refusal}\n").into(),
+    };
     // Generous ceiling: the render + encode is tens of ms; the deadline only fires
     // when the event loop or worker is wedged, where blocking the control thread for
     // the client's whole 900 s exchange window would wedge the verb too.
@@ -808,7 +880,7 @@ pub(crate) fn cmd_image(
 fn image_metadata_fields(metadata: Option<&crate::control::ImageFrameMetadata>) -> String {
     metadata.map_or_else(
         || {
-            "image-meta-version=2 frame-kind=unknown frame-phase=rendered identity=unavailable"
+            "image-meta-version=3 frame-kind=unknown frame-phase=unknown identity=unavailable"
                 .to_string()
         },
         crate::control::ImageFrameMetadata::wire_fields,
@@ -826,42 +898,6 @@ fn image_byte_reply_png_fits(png_len: usize) -> bool {
     png_len <= MAX_IMAGE_BYTE_REPLY_PNG_BYTES
 }
 
-fn padded_base64_len(input_len: usize) -> Option<usize> {
-    input_len
-        .checked_add(2)
-        .and_then(|rounded| (rounded / 3).checked_mul(4))
-}
-
-fn append_padded_base64(output: &mut String, input: &[u8]) {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let (chunks, remainder) = input.as_chunks::<3>();
-    for &[a, b, c] in chunks {
-        let value = (u32::from(a) << 16) | (u32::from(b) << 8) | u32::from(c);
-        output.push(char::from(ALPHABET[((value >> 18) & 0x3f) as usize]));
-        output.push(char::from(ALPHABET[((value >> 12) & 0x3f) as usize]));
-        output.push(char::from(ALPHABET[((value >> 6) & 0x3f) as usize]));
-        output.push(char::from(ALPHABET[(value & 0x3f) as usize]));
-    }
-    match remainder {
-        [a] => {
-            let value = u32::from(*a) << 16;
-            output.push(char::from(ALPHABET[((value >> 18) & 0x3f) as usize]));
-            output.push(char::from(ALPHABET[((value >> 12) & 0x3f) as usize]));
-            output.push('=');
-            output.push('=');
-        }
-        [a, b] => {
-            let value = (u32::from(*a) << 16) | (u32::from(*b) << 8);
-            output.push(char::from(ALPHABET[((value >> 18) & 0x3f) as usize]));
-            output.push(char::from(ALPHABET[((value >> 12) & 0x3f) as usize]));
-            output.push(char::from(ALPHABET[((value >> 6) & 0x3f) as usize]));
-            output.push('=');
-        }
-        _ => {}
-    }
-}
-
 fn image_bytes_reply(
     width: u32,
     height: u32,
@@ -869,11 +905,11 @@ fn image_bytes_reply(
     want_metadata: bool,
     metadata: Option<&crate::control::ImageFrameMetadata>,
 ) -> Result<String, String> {
+    let too_large = || "ERR image: PNG too large to return as bytes\n".to_string();
     if !image_byte_reply_png_fits(png.len()) {
-        return Err("ERR image: PNG too large to return as bytes\n".to_string());
+        return Err(too_large());
     }
-    let encoded_len = padded_base64_len(png.len())
-        .ok_or_else(|| "ERR image: PNG too large to return as bytes\n".to_string())?;
+    let encoded_len = aterm_codec::base64::encoded_len(png.len()).ok_or_else(too_large)?;
     if want_metadata {
         let metadata = image_metadata_fields(metadata);
         if metadata.len().saturating_add("image-meta \n".len())
@@ -893,14 +929,14 @@ fn image_bytes_reply(
             png.len(),
         )
         .expect("writing to a String cannot fail");
-        append_padded_base64(&mut body, png);
+        aterm_codec::base64::encode_into(&mut body, png).map_err(|_| too_large())?;
         body.push('\n');
         Ok(body)
     } else {
         let mut body = String::with_capacity(encoded_len.saturating_add(IMAGE_BYTE_ROW_OVERHEAD));
         write!(&mut body, "OK 1\n{width} {height} {} ", png.len())
             .expect("writing to a String cannot fail");
-        append_padded_base64(&mut body, png);
+        aterm_codec::base64::encode_into(&mut body, png).map_err(|_| too_large())?;
         body.push('\n');
         Ok(body)
     }
@@ -942,6 +978,15 @@ fn unknown_window_target(first: &str) -> Option<String> {
          `window {first}.png`\n",
         aterm_types::control_verbs::WINDOW_TARGETS
     ))
+}
+
+/// The name a `window <target>` capture is written under when no path is
+/// given: `aterm-<keyword>`, and `aterm-window` for the front window.
+fn default_stem(aux: crate::app_introspect::AuxTarget) -> String {
+    match aux {
+        crate::app_introspect::AuxTarget::Front => "aterm-window".to_string(),
+        target => format!("aterm-{}", target.keyword()),
+    }
 }
 
 /// `window [<target>] [path]` -> capture a full-window artifact to a PNG,
@@ -1003,29 +1048,20 @@ pub(crate) fn cmd_window(
             (AuxTarget::Front, rest.trim())
         }
     };
-    let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
+    let budgets = crate::control::ArtifactBudgets::process();
+    let Some(mut handoff) = budgets.try_reserve_for_path(sock_dir) else {
         return format!(
             "ERR window capture: {}\n",
             crate::control::ARTIFACT_HANDOFF_BUSY
         )
         .into();
     };
-    let default_stem = match aux {
-        AuxTarget::Front => "aterm-window",
-        AuxTarget::Prefs => "aterm-prefs",
-        AuxTarget::About => "aterm-about",
-        AuxTarget::Menu => "aterm-menu",
-        AuxTarget::TabMenu => "aterm-tab-menu",
-        AuxTarget::AutopilotMenu => "aterm-autopilot-menu",
-        AuxTarget::SessionPicker => "aterm-session-picker",
-        AuxTarget::Overview => "aterm-overview",
-        AuxTarget::Update => "aterm-update",
-    };
     let p = path_arg.trim();
     let confined = if p.is_empty() {
         match control_auth::confine_automatic_image_path_with_admission(
             sock_dir,
-            default_stem,
+            &default_stem(aux),
+            budgets,
             |path| handoff.try_reconcile_for_resolved_path(path),
         ) {
             Ok(target) => target,
@@ -1066,34 +1102,31 @@ pub(crate) fn cmd_window(
     };
     // For the reply only — the writer re-opens via the dir fd, not this string.
     let path = confined.display_path().to_string_lossy().into_owned();
-    // Refused while the main thread is stalled or a dialog stands, as every
-    // main-thread verb is (ruling 267).
-    if let Some(refusal) = main_thread_refusal() {
-        return format!("ERR {refusal}\n").into();
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
     let cancel = crate::control::CaptureCancellation::new();
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
-    // Front uses the unchanged `CaptureWindow` (sacred path); aux windows use the new
-    // `CaptureAuxWindow` (resolved by their own window number on the main thread).
-    let wake = match aux {
+    // Refused while the main thread is stalled or a dialog stands, as every
+    // main-thread verb is (ruling 267). Front uses the unchanged `CaptureWindow`
+    // (sacred path); aux windows use `CaptureAuxWindow` (resolved by their own
+    // window number on the main thread).
+    let posted = post_main(proxy, |reply| match aux {
         AuxTarget::Front => Wake::CaptureWindow {
             path: confined,
             handoff,
             cancel,
-            reply: tx,
+            reply,
         },
         _ => Wake::CaptureAuxWindow {
             target: aux,
             path: confined,
             handoff,
             cancel,
-            reply: tx,
+            reply,
         },
+    });
+    let (rx, _hop) = match posted {
+        Ok(posted) => posted,
+        Err(refusal) => return format!("ERR {refusal}\n").into(),
     };
-    if proxy.send_event(wake).is_err() {
-        return "ERR event loop gone\n".into();
-    }
     // Same wedge guard as `cmd_image`: the photograph + encode is fast; only a
     // stuck main thread or dead worker reaches the deadline.
     match recv_capture_reply(
@@ -1114,19 +1147,17 @@ pub(crate) fn cmd_window(
     }
 }
 
-/// The platforms `capture_aux_window` photographs on (its one caller), plus tests.
+/// The platforms a `window` photograph is taken on (`App::run_capture`, its one
+/// caller), plus tests.
 #[cfg(any(target_os = "macos", windows, test))]
 impl crate::App {
     /// `window <target>`'s refusal when the front window is not SHOWING `target`,
     /// or `None` when it is (always for `front`). Asked on the main thread in the
-    /// same turn as the capture attempt (`capture_aux_window`), so a photograph
-    /// taken in that turn cannot outlive the answer. One is not: when the GPU
-    /// drawable is still pending, `capture_window` queues the request and a LATER
-    /// turn replays it (`resume_deferred_gpu_captures`), and that replay re-checks
-    /// only that the front window is the same one, not this answer. An overlay
-    /// dismissed in the frame between the two can still be photographed under the
-    /// target's name. Closing that needs the target carried in the deferred
-    /// request; the window is one GPU acquire wide, so it is named here instead.
+    /// same turn as the capture attempt (`App::run_capture`), so a photograph
+    /// taken in that turn cannot outlive the answer. A photograph deferred for its
+    /// GPU drawable carries its target and re-enters the same door in the LATER
+    /// turn that replays it (`resume_deferred_gpu_captures`), so the question is
+    /// asked again there: an overlay dismissed while it waited is refused.
     ///
     /// WHY: the keyword selects nothing to photograph — every target lives in the
     /// front frame, and the capture is the front window's whatever it is called. A
@@ -1185,25 +1216,14 @@ impl crate::App {
 /// `window <target>` refuses a target the front window is not showing and
 /// photographs one it is. Driven through [`crate::App::window_target_refusal`],
 /// the question the main thread asks, because the photograph itself needs a live
-/// window a unit test cannot construct.
+/// window a unit test cannot construct; the last test drives `capture_aux_window`
+/// through the capture door to show the question is asked before admission.
 #[cfg(test)]
 mod window_target_refusal_tests {
     use crate::app_introspect::AuxTarget;
     use crate::native_settings::SettingsRoute;
     use crate::session_picker::PickerIntent;
     use crate::{App, WindowId};
-
-    /// Every target `window` takes except `front`.
-    const OVERLAYS: [AuxTarget; 8] = [
-        AuxTarget::Prefs,
-        AuxTarget::About,
-        AuxTarget::Update,
-        AuxTarget::Menu,
-        AuxTarget::TabMenu,
-        AuxTarget::AutopilotMenu,
-        AuxTarget::SessionPicker,
-        AuxTarget::Overview,
-    ];
 
     /// `window bogus` answered `OK` and wrote a PNG named `bogus` on 0.95.0
     /// (measured 2026-09-27). A bare word that is no target is refused, listing
@@ -1213,6 +1233,19 @@ mod window_target_refusal_tests {
     fn a_bare_word_that_is_no_target_is_refused_not_written() {
         let refusal = super::unknown_window_target("bogus").expect("a bare word is refused");
         assert!(refusal.starts_with("ERR "), "{refusal}");
+        // In the table's order, and exactly the parser's targets.
+        let listed: Vec<&str> = refusal
+            .split_once("(targets: ")
+            .and_then(|(_, tail)| tail.split_once(')'))
+            .map(|(list, _)| list.split(" | ").collect())
+            .expect("the refusal lists the targets");
+        assert_eq!(
+            listed,
+            AuxTarget::ALL
+                .iter()
+                .map(|target| target.keyword())
+                .collect::<Vec<_>>()
+        );
         for operand in ["", "shot.png", "front.png", "sub/x", r"sub\x"] {
             assert_eq!(super::unknown_window_target(operand), None, "{operand:?}");
         }
@@ -1290,9 +1323,10 @@ mod window_target_refusal_tests {
         app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
         app.splice_tab_strip(wid);
         let shown = |app: &App| {
-            OVERLAYS
-                .into_iter()
-                .filter(|&t| app.window_target_refusal(t).is_none())
+            AuxTarget::ALL
+                .iter()
+                .copied()
+                .filter(|&t| t != AuxTarget::Front && app.window_target_refusal(t).is_none())
                 .collect::<Vec<_>>()
         };
         assert_eq!(shown(&app), vec![], "nothing is open yet");
@@ -1348,6 +1382,44 @@ mod window_target_refusal_tests {
             app.window_target_refusal(AuxTarget::Prefs).is_some(),
             "but the front window shows the terminal"
         );
+    }
+
+    /// The photograph asks the question before it is taken: a target the front
+    /// window does not show is answered with the refusal before the capture is
+    /// admitted, so no body runs. The negative control
+    /// is the same request once the target is shown: it passes the door and its
+    /// body runs (and, headless, answers that there is no window to photograph).
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn aux_capture_refuses_before_admission() {
+        let photograph = |app: &mut App, target| {
+            let bodies = crate::app_introspect::capture_bodies();
+            let (reply, rx) = std::sync::mpsc::channel();
+            app.capture_aux_window(
+                target,
+                crate::control::ReplyRetentionPermit::from_own_budget(),
+                crate::control_auth::ConfinedImage::in_memory(),
+                crate::control::CaptureCancellation::new(),
+                reply,
+            );
+            let answer = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the capture answers")
+                .expect_err("a headless app photographs nothing");
+            (answer, crate::app_introspect::capture_bodies() - bodies)
+        };
+        let mut app = App::headless_for_test();
+        let (refused, admitted) = photograph(&mut app, AuxTarget::Prefs);
+        assert_eq!(
+            refused,
+            "prefs is not open in the front window; use `open prefs` first"
+        );
+        assert_eq!(admitted, 0, "refused before admission");
+
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let (answer, admitted) = photograph(&mut app, AuxTarget::Prefs);
+        assert_eq!(admitted, 1, "shown, the capture is admitted: {answer}");
+        assert_eq!(answer, "no window to capture (headless)");
     }
 }
 
@@ -1768,6 +1840,7 @@ mod confined_video_reader {
         sock_dir: &std::path::Path,
         instance: &str,
         count: usize,
+        budgets: &crate::control::ArtifactBudgets,
         mut permit: crate::control::ReplyRetentionPermit,
         mut hook: impl FnMut(ReadStage),
     ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
@@ -1814,15 +1887,19 @@ mod confined_video_reader {
             return Ok(None);
         };
 
-        let Some(lease) =
-            control_auth::retain_video_artifact_path(instance_dir, recording_name, &recording)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::WouldBlock {
-                        crate::control::ARTIFACT_HANDOFF_BUSY
-                    } else {
-                        "recording namespace changed while acquiring retention"
-                    }
-                })?
+        let Some(lease) = control_auth::retain_video_artifact_path(
+            instance_dir,
+            recording_name,
+            &recording,
+            budgets,
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                crate::control::ARTIFACT_HANDOFF_BUSY
+            } else {
+                "recording namespace changed while acquiring retention"
+            }
+        })?
         else {
             return Err("recording retention sweep is in progress");
         };
@@ -1857,24 +1934,25 @@ mod confined_video_reader {
         sock_dir: &std::path::Path,
         instance: &str,
         count: usize,
+        budgets: &crate::control::ArtifactBudgets,
         hook: impl FnMut(ReadStage),
     ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
-        #[cfg(test)]
-        let permit = crate::control::ReplyRetentionPermit::unmetered_for_test();
-        #[cfg(not(test))]
-        let permit = crate::control::ReplyRetention::try_reserve_for_path(sock_dir)
+        let permit = budgets
+            .try_reserve_for_path(sock_dir)
             .ok_or(crate::control::ARTIFACT_HANDOFF_BUSY)?;
-        read_with_permit_and_hook(sock_dir, instance, count, permit, hook)
+        read_with_permit_and_hook(sock_dir, instance, count, budgets, permit, hook)
     }
 
     pub(super) fn read(
         sock_dir: &std::path::Path,
         instance: &str,
         count: usize,
+        budgets: &crate::control::ArtifactBudgets,
     ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
-        read_with_hook(sock_dir, instance, count, |_| {})
+        read_with_hook(sock_dir, instance, count, budgets, |_| {})
     }
 
+    /// A read with `hook` at each stage, on a budget of its own.
     #[cfg(all(test, unix))]
     pub(super) fn read_for_test(
         sock_dir: &std::path::Path,
@@ -1882,18 +1960,13 @@ mod confined_video_reader {
         count: usize,
         hook: impl FnMut(ReadStage),
     ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
-        read_with_hook(sock_dir, instance, count, hook)
-    }
-
-    #[cfg(all(test, unix))]
-    pub(super) fn read_metered_for_test(
-        sock_dir: &std::path::Path,
-        instance: &str,
-        count: usize,
-    ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
-        let permit = crate::control::ReplyRetention::try_reserve_for_path(sock_dir)
-            .ok_or(crate::control::ARTIFACT_HANDOFF_BUSY)?;
-        read_with_permit_and_hook(sock_dir, instance, count, permit, |_| {})
+        read_with_hook(
+            sock_dir,
+            instance,
+            count,
+            &crate::control::ArtifactBudgets::shipping(),
+            hook,
+        )
     }
 }
 
@@ -1903,6 +1976,7 @@ mod confined_video_reader {
         _sock_dir: &std::path::Path,
         _instance: &str,
         _count: usize,
+        _budgets: &crate::control::ArtifactBudgets,
     ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
         Err("safe recording reads are unsupported on this platform")
     }
@@ -1910,20 +1984,26 @@ mod confined_video_reader {
 
 /// `video frames [count=N]` — read the newest finished recording's `index.json`
 /// and emit its N highest-`delta` frames as `OK <n>` + n `frame …` rows. The
-/// `delta` (fingerprint movement from the previous captured frame) is already in
-/// the index, so this is a cheap read that hands an AI just the eventful frames
-/// (the visual key moments) instead of the whole PNG sequence.
+/// `delta` (the 8×8 tiles that differ from the previous captured frame) is
+/// already in the index, so this is a cheap read that hands an AI just the
+/// eventful frames (the visual key moments) instead of the whole PNG sequence.
 fn video_frames<'a>(
     sock_dir: &std::path::Path,
     args: impl Iterator<Item = &'a str>,
 ) -> crate::control::ControlReply {
-    video_frames_for_instance(sock_dir, control_auth::process_instance_id(), args)
+    video_frames_for_instance(
+        sock_dir,
+        control_auth::process_instance_id(),
+        args,
+        crate::control::ArtifactBudgets::process(),
+    )
 }
 
 fn video_frames_for_instance<'a>(
     sock_dir: &std::path::Path,
     instance: &str,
     args: impl Iterator<Item = &'a str>,
+    budgets: &crate::control::ArtifactBudgets,
 ) -> crate::control::ControlReply {
     let mut count = VIDEO_FRAMES_DEFAULT;
     for t in args {
@@ -1942,7 +2022,7 @@ fn video_frames_for_instance<'a>(
             .into();
         }
     }
-    match confined_video_reader::read(sock_dir, instance, count) {
+    match confined_video_reader::read(sock_dir, instance, count, budgets) {
         Ok(Some(output)) => {
             let (body, retention) = output.into_parts();
             crate::control::ControlReply::with_handoff(body, retention)
@@ -2125,10 +2205,11 @@ pub(crate) fn cmd_video(
     if args.keys && !owner {
         return "ERR video: keys is owner-only\n".into();
     }
-    let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
+    let budgets = crate::control::ArtifactBudgets::process();
+    let Some(mut handoff) = budgets.try_reserve_for_path(sock_dir) else {
         return format!("ERR video: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
     };
-    let dir = match control_auth::confine_video_dir_with_admission(sock_dir, |path| {
+    let dir = match control_auth::confine_video_dir_with_admission(sock_dir, budgets, |path| {
         handoff.try_reconcile_for_resolved_path(path)
     }) {
         Ok(dir) => dir,
@@ -2141,31 +2222,30 @@ pub(crate) fn cmd_video(
     };
     let cancel = crate::VideoCancellation::new();
     let mut cancel_on_drop = CancelVideoRequestOnDrop(Some(cancel.clone()));
-    let (tx, rx) = std::sync::mpsc::channel();
     // The main thread keeps `wire` and a seamless update's Commit waits on it:
     // this request's reply, whatever it turns out to be, is written before
     // that `_exit` (round six of the update audit, finding 31).
     let (wire, written) = crate::control::ReplyWire::new();
-    if proxy
-        .send_event(Wake::Video {
-            dur_ms: (args.secs * 1000.0) as u64,
-            full_res: args.full_res,
-            keys: args.keys,
-            pace: args.pace,
-            fps: args.fps,
-            budget_bytes: args.budget_bytes,
-            handoff,
-            dir,
-            cancel,
-            reply: tx,
-            wire,
-        })
-        .is_err()
-    {
-        // `send_event` returns the unsent `Wake`; dropping it drops the
-        // unforgeable directory guard and removes the unpublished directory.
-        return "ERR event loop gone\n".into();
-    }
+    // Refused while the main thread is stalled or a dialog stands, as every
+    // main-thread verb is (ruling 267). A refused or unsent request drops the
+    // unforgeable directory guard, which removes the unpublished directory.
+    let posted = post_main(proxy, |reply| Wake::Video {
+        dur_ms: (args.secs * 1000.0) as u64,
+        full_res: args.full_res,
+        keys: args.keys,
+        pace: args.pace,
+        fps: args.fps,
+        budget_bytes: args.budget_bytes,
+        handoff,
+        dir,
+        cancel,
+        reply,
+        wire,
+    });
+    let (rx, _hop) = match posted {
+        Ok(posted) => posted,
+        Err(refusal) => return format!("ERR video: {refusal}\n").into(),
+    };
     // The reply arrives only after index.json is on disk (recording duration +
     // the PNG encode burst) — wait generously (scaled with the recording so a
     // long take cannot falsely time out mid-encode), but never forever.
@@ -2405,7 +2485,8 @@ fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::S
         // Its AI CLIs sub-page answers to the AI words (an agent's own
         // names are the Harness page's, which holds its switch).
         "ai cli" | "ai reviews" | "ai logins" => Some(SettingsRoute::Ai),
-        "tabs" | "tab control" | "control panel" | "fleet" => Some(SettingsRoute::Tabs),
+        "tabs" | "tab control" | "control panel" | "fleet" | "monitor" | "fleet monitor"
+        | "system monitor" => Some(SettingsRoute::Tabs),
         // Settings ▸ Themes answers to its own names, never to "theme" (the
         // theme setting lives on Appearance).
         "showcase" | "theme showcase" | "themes gallery" | "gallery" => Some(SettingsRoute::Themes),
@@ -2516,10 +2597,11 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
     (action.invoke_authority() == crate::menu::InvokeAuthority::PersonOnly
         && !person_invoke_act(name))
     .then(|| {
-        format!(
-            "ERR denied: {name} is the person's own act at the window (Agents \u{25b8} Take \
-             Over This Tab / Hand Back This Tab)\n"
-        )
+        let at = match action {
+            crate::menu::MenuAction::ToggleStatsLens => "View \u{25b8} Stats Lens, \u{2318}I",
+            _ => "Agents \u{25b8} Take Over This Tab / Hand Back This Tab",
+        };
+        format!("ERR denied: {name} is the person's own act at the window ({at})\n")
     })
 }
 
@@ -2993,7 +3075,7 @@ pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
             // catalog, so the status form answers `OK 1` + its single row
             // rather than the bare `OK <line>` of a natively Status-framed
             // verb like `rain`. A sub-form that flipped framing would need a
-            // matching `framing_of` special case or the shipping client would
+            // framing form on the verb's table row or the shipping client would
             // read the row as a count — the `temporal status` footgun.
             return match call_main(proxy, |tx| Wake::TrailStatus { reply: tx }) {
                 Ok(Ok(msg)) => format!("OK 1\n{msg}\n"),
@@ -3155,18 +3237,21 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
 /// The `spawn` verb's usage line — one string for every malformed form, naming
 /// the whole grammar (plain + aimed + connected + worker) so a caller who got
 /// one token wrong sees the complete contract.
-pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [identity=<name>|-] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=claude [model=<m>] [from=<sid>] len=<n>]\n";
+pub(crate) const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [identity=<name>|-] [theme=<name>] [connected=controlled|controller place=window|tab of=<sid> | agent=claude [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>]\n";
 
 /// `agent=<word>` (a WORKER, `task_launch`): which agent the newborn's shell
 /// starts at its first prompt, its task the frame the request carried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentSpec {
-    /// `agent=claude`, with `model=` its `--model` when given, and `from=`
-    /// the session that starts it (the client's own): the task's `from=`, and
-    /// the Claude Code whose program, home and login the worker's line
-    /// carries. Without it the task is `from=ctl`.
+    /// `agent=claude`, with `model=` its `--model` when given, `autopilot=`
+    /// the newborn's own Autopilot word (`land` or `cruise`; `None`: land,
+    /// [`crate::task_launch::WORKER_AUTOPILOT`]), and `from=` the session that
+    /// starts it (the client's own): the task's `from=`, and the Claude Code
+    /// whose program, home and login the worker's line carries. Without it
+    /// the task is `from=ctl`.
     Claude {
         model: Option<String>,
+        autopilot: Option<aterm_agent::supervise::Autopilot>,
         from: Option<aterm_session::SessionId>,
     },
     /// `agent=<codex|agy|muse|gemini>`: another agent aterm reads
@@ -3186,6 +3271,7 @@ fn agent_spec(word: &str) -> Option<AgentSpec> {
     match program {
         Program::Claude => Some(AgentSpec::Claude {
             model: None,
+            autopilot: None,
             from: None,
         }),
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini => {
@@ -3295,14 +3381,16 @@ enum SpawnForm {
 /// a misspelt verdict can never be read as "use the default".
 ///
 /// `agent=claude|codex` makes the plain form a WORKER's (`task_launch`):
-/// `model=`, `from=` and the frame's `len=` (read by the serve loop,
-/// `control::spawn_frame_len`) come only with it, and it never joins the
-/// connected form.
+/// `model=`, `autopilot=<land|cruise>` (the newborn's own word; never `off`,
+/// which would start a worker nothing sees through), `from=` and the frame's
+/// `len=` (read by the serve loop, `control::spawn_frame_len`) come only with
+/// it, and it never joins the connected form.
 fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
     let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
     let (mut window, mut raise, mut identity, mut theme) = (None, None, None, None);
     let (mut agent, mut model, mut from, mut framed) = (None, None, None, false);
+    let mut autopilot = None;
     let Some(tokens) = split_quoted_tokens(rest) else {
         return Err(());
     };
@@ -3367,6 +3455,17 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
                 return Err(());
             }
             model = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("autopilot=") {
+            // The worker's own word: Land (the default) or Cruise. Off, a
+            // word given twice or any other word is the usage line.
+            let word = match v {
+                "land" => aterm_agent::supervise::Autopilot::Land,
+                "cruise" => aterm_agent::supervise::Autopilot::Cruise,
+                _ => return Err(()),
+            };
+            if autopilot.replace(word).is_some() {
+                return Err(());
+            }
         } else if let Some(v) = tok.strip_prefix("from=") {
             // A session id, as a task record's `from=` reads one.
             if v == crate::task_record::FROM_CTL || !crate::task_record::valid_from(v) {
@@ -3380,11 +3479,17 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             return Err(());
         }
     }
-    // `model=`, `from=` and a frame are a worker's alone.
+    // `model=`, `autopilot=`, `from=` and a frame are a worker's alone.
     let agent = match agent {
-        Some(AgentSpec::Claude { .. }) => Some(AgentSpec::Claude { model, from }),
+        Some(AgentSpec::Claude { .. }) => Some(AgentSpec::Claude {
+            model,
+            autopilot,
+            from,
+        }),
         Some(AgentSpec::Reserved(program)) => Some(AgentSpec::Reserved(program)),
-        None if model.is_some() || from.is_some() || framed => return Err(()),
+        None if model.is_some() || autopilot.is_some() || from.is_some() || framed => {
+            return Err(());
+        }
         None => None,
     };
     match (kind, place, origin) {
@@ -3484,6 +3589,23 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
     }
 }
 
+/// A WORKER'S ORDER from its spawn — `agent=claude`'s `model=`,
+/// `autopilot=` and `from=`, the line's `cwd=`, and the frame the serve loop
+/// read after it: the task under the spawn's own Autopilot word, Land unless
+/// it says cruise ([`crate::task_launch::TaskOrder::under`]). `Err` is the
+/// reply. One door for [`cmd_spawn`] and a test, so the spawn's word cannot
+/// be dropped with every test green.
+fn worker_order(
+    frame: Option<Vec<u8>>,
+    model: Option<String>,
+    autopilot: Option<aterm_agent::supervise::Autopilot>,
+    from: Option<aterm_session::SessionId>,
+    cwd: Option<&str>,
+) -> Result<crate::task_launch::TaskOrder, String> {
+    crate::task_launch::TaskOrder::of_frame(frame, model, cwd, from)
+        .map(|order| order.under(autopilot))
+}
+
 /// `spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>]` ->
 /// mint ONE new session and reply `OK <sid>` — birth as a socket primitive.
 /// The sid is live in the registry before the reply is sent, so `@<sid> …`
@@ -3497,7 +3619,7 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
 /// that selector's resolved local id, `None` for a flagless request, exactly
 /// as `image` receives it; only an Owner reaches here WITH a selector — the
 /// aimed forms keep the App authority verdict every other App-target selector
-/// gets (`control::aimed_app_lane`). `window=` wins over `@<sid>`. `split=` on an
+/// gets (`control::app_route`). `window=` wins over `@<sid>`. `split=` on an
 /// aimed spawn divides THAT window's focused pane. The main thread answers
 /// `ERR no such window <id>` for an id no window carries; a headless instance
 /// owns logical window 0 (the one `ls`/`dims` name), so `window=0` and `@<sid>`
@@ -3531,17 +3653,19 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
 ///
 /// `spawn connected=controlled|controller place=window|tab of=<sid> [cwd=…]`
 /// (design §6) additionally mints the `both` SESSION CONNECTION binding the
-/// newborn to `of=` — Owner-only (the `escalated_op` fence runs before this
+/// newborn to `of=` — Owner-only (the `argument_escalation` fence runs before this
 /// dispatch). The handler resolves `of=` on the main thread and refuses
 /// `place=window` under headless with the NEW `ERR headless` reply (§1.4#7);
 /// `place=tab` works headless. cwd default for the connected form is the
 /// ORIGIN session's cwd.
 ///
-/// `spawn … agent=claude [model=<m>] [from=<sid>] len=<n>` starts a WORKER
-/// (`task_launch`; Owner-only, the `escalated_op` fence): the task is the
-/// frame the serve loop read after the line
-/// ([`crate::task_launch::take_frame`]), and `from=` — the client's own
-/// session, which the `@<sid>` aim need not be — is the task's `from=`.
+/// `spawn … agent=claude [model=<m>] [autopilot=<land|cruise>] [from=<sid>]
+/// len=<n>` starts a WORKER (`task_launch`; Owner-only, the
+/// `argument_escalation` fence): the task is the frame the serve loop read
+/// after the line ([`crate::task_launch::take_frame`]), `autopilot=` the
+/// newborn's own Autopilot word (land unless it says cruise), and `from=` — the
+/// client's own session, which the `@<sid>` aim need not be — is the task's
+/// `from=`.
 /// `agent=codex` is `ERR agent codex: not yet`.
 pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Option<u64>) -> String {
     let Ok(form) = parse_spawn_args(rest) else {
@@ -3565,17 +3689,20 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
                 Some(AgentSpec::Reserved(program)) => {
                     return format!("ERR agent {}: not yet\n", program.name());
                 }
-                Some(AgentSpec::Claude { model, from }) => {
-                    match crate::task_launch::TaskOrder::of_frame(
-                        crate::task_launch::take_frame(),
-                        model,
-                        cwd.as_deref(),
-                        from,
-                    ) {
-                        Ok(order) => Some(order),
-                        Err(refusal) => return refusal,
-                    }
-                }
+                Some(AgentSpec::Claude {
+                    model,
+                    autopilot,
+                    from,
+                }) => match worker_order(
+                    crate::task_launch::take_frame(),
+                    model,
+                    autopilot,
+                    from,
+                    cwd.as_deref(),
+                ) {
+                    Ok(order) => Some(order),
+                    Err(refusal) => return refusal,
+                },
             };
             let aim = SpawnAim::from_request(window, session);
             let raise = raise_after_spawn(aim.is_aimed(), raise);
@@ -3721,7 +3848,11 @@ impl WorkerStart {
     /// ([`crate::task_launch::TaskOrder::fact_line`]).
     fn seed(&self) -> crate::task_launch::TaskSeed {
         let from = self.order.fact_line.then_some(self.from.as_str());
-        crate::task_launch::TaskSeed::new(crate::task_launch::task_text(&self.order.task, from))
+        crate::task_launch::TaskSeed::new(crate::task_launch::task_text(
+            &self.order.task,
+            from,
+            self.order.autopilot,
+        ))
     }
 }
 
@@ -4228,8 +4359,10 @@ impl crate::App {
     }
 
     /// The newborn `sid` is a worker: its folder trusted for it alone (the
-    /// window harness's folder-trust rule reads `meta`'s `trusted_cwd=`), and
-    /// its task record `working` with its `from=` — on the main thread, so
+    /// window harness's folder-trust rule reads `meta`'s `trusted_cwd=`), its
+    /// own Autopilot word written (`land` unless the spawn said `cruise`:
+    /// FOREVER LAND, a worker's one wake at the end is its landing), and its
+    /// task record `working` with its `from=` — on the main thread, so
     /// with no wait on a Commit's fence (`task_record::mark_session_task_within`)
     /// — before the reply; what its launcher needs is returned
     /// ([`crate::task_launch::launch_worker`]). The line carries the starter's
@@ -4265,23 +4398,26 @@ impl crate::App {
             .unwrap_or_else(|p| p.into_inner())
             .trusted_cwd
             .clone_from(&worker.order.trusted_cwd);
+        // The newborn's word, beside its trusted folder and before its agent
+        // runs: its loop's first read is the worker's own Autopilot. aterm's
+        // write, not a person's.
+        crate::session_timeline::apply_autopilot(
+            &ctx,
+            Some(worker.order.autopilot.word().to_string()),
+            None,
+            aterm_slog::Actor::Aterm,
+            None,
+        );
         let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
         mark.from = Some(worker.from);
-        crate::task_record::mark_session_task_within(
-            &ctx,
-            local,
-            &mark,
-            &self.subscribers,
-            std::time::Duration::ZERO,
-        )
-        .map_err(|_| "busy update-committing".to_string())?;
+        crate::task_record::mark_session_task_within(&ctx, local, &mark, std::time::Duration::ZERO)
+            .map_err(|_| "busy update-committing".to_string())?;
         let human = ctx.human_input.seq();
         Ok(crate::task_launch::Launch {
             local,
             term,
             ctx,
             store: self.store.clone(),
-            subscribers: self.subscribers.clone(),
             proxy: self.proxy.clone(),
             human,
             shell: worker.shell,
@@ -4810,11 +4946,13 @@ mod spawn_parse_tests {
         }
     }
 
-    /// A WORKER's spawn (`agent=claude [model=<m>] [from=<sid>] len=<n>`):
-    /// `agent=` is claude, or another agent aterm reads (codex, agy, muse,
-    /// gemini: reserved), `model=` is `[A-Za-z0-9._-]{1,64}`, `from=` a sid,
-    /// and they and the frame's `len=` come only with `agent=`, which never
-    /// joins the connected form. Everything else is the usage line.
+    /// A WORKER's spawn (`agent=claude [model=<m>] [autopilot=<land|cruise>]
+    /// [from=<sid>] len=<n>`): `agent=` is claude, or another agent aterm
+    /// reads (codex, agy, muse, gemini: reserved), `model=` is
+    /// `[A-Za-z0-9._-]{1,64}`, `autopilot=` land or cruise once (never off),
+    /// `from=` a sid, and they and the frame's `len=` come only with
+    /// `agent=`, which never joins the connected form. Everything else is the
+    /// usage line.
     #[test]
     fn a_worker_spawn_parses_agent_model_and_its_frame() {
         let agent_of = |rest: &str| match parse_spawn_args(rest) {
@@ -4826,6 +4964,7 @@ mod spawn_parse_tests {
             agent_of("agent=claude len=12"),
             Some(AgentSpec::Claude {
                 model: None,
+                autopilot: None,
                 from: None
             })
         );
@@ -4833,6 +4972,7 @@ mod spawn_parse_tests {
             agent_of("cwd=/w raise=false agent=claude model=claude-opus-4.1 from=s-ab12 len=3"),
             Some(AgentSpec::Claude {
                 model: Some("claude-opus-4.1".to_string()),
+                autopilot: None,
                 from: Some(aterm_session::SessionId::new("s-ab12")),
             })
         );
@@ -4841,9 +4981,24 @@ mod spawn_parse_tests {
             agent_of(&format!("model={longest} agent=claude len=1 split=v")),
             Some(AgentSpec::Claude {
                 model: Some(longest.clone()),
+                autopilot: None,
                 from: None,
             })
         );
+        // The worker's own word: land or cruise, once.
+        for (word, autopilot) in [
+            ("land", aterm_agent::supervise::Autopilot::Land),
+            ("cruise", aterm_agent::supervise::Autopilot::Cruise),
+        ] {
+            assert_eq!(
+                agent_of(&format!("agent=claude autopilot={word} len=1")),
+                Some(AgentSpec::Claude {
+                    model: None,
+                    autopilot: Some(autopilot),
+                    from: None,
+                })
+            );
+        }
         for program in [
             aterm_phase::Program::Codex,
             aterm_phase::Program::Agy,
@@ -4870,13 +5025,22 @@ mod spawn_parse_tests {
             "agent=claude model=a/b",
             "agent=claude model=a$b",
             "agent=claude model=a\u{e9}",
+            "agent=claude autopilot=off len=1",
+            "agent=claude autopilot= len=1",
+            "agent=claude autopilot=Land len=1",
+            "agent=claude autopilot=land autopilot=cruise len=1",
+            "autopilot=land",
             too_long.as_str(),
             "agent=claude connected=controlled place=tab of=s-a",
             "connected=controlled place=tab of=s-a len=3",
         ] {
             assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
         }
-        assert!(super::SPAWN_USAGE.contains("agent=claude [model=<m>] [from=<sid>] len=<n>"));
+        assert!(
+            super::SPAWN_USAGE.contains(
+                "agent=claude [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>"
+            )
+        );
     }
 
     #[test]
@@ -5204,8 +5368,7 @@ mod wire_tab_close_guard_tests {
         let g = app.store.read().unwrap_or_else(|p| p.into_inner());
         let row = g
             .roster_since(0)
-            .filter(|r| r.change == RosterChange::Exited)
-            .last()
+            .rfind(|r| r.change == RosterChange::Exited)
             .expect("an exit row after the close");
         (row.reason, row.actor.as_wire().to_string())
     }
@@ -5544,6 +5707,7 @@ mod worker_start_app_tests {
                 caller: None,
                 trusted_cwd: None,
                 fact_line: true,
+                autopilot: crate::task_launch::WORKER_AUTOPILOT,
             },
             from: crate::task_record::FROM_CTL.to_string(),
             caller: None,
@@ -5554,7 +5718,11 @@ mod worker_start_app_tests {
 
     /// The seed of `sid`'s task file, written where the state home says.
     fn seeded(sid: &str) -> (TaskSeed, PathBuf) {
-        let seed = TaskSeed::new(task_text(b"the task", Some(crate::task_record::FROM_CTL)));
+        let seed = TaskSeed::new(task_text(
+            b"the task",
+            Some(crate::task_record::FROM_CTL),
+            crate::task_launch::WORKER_AUTOPILOT,
+        ));
         let path = seed.write_for(&SessionId::new(sid)).expect("written");
         (seed, path)
     }
@@ -5636,6 +5804,66 @@ mod worker_start_app_tests {
             app.close_confirm = crate::app_window::CloseConfirm::Programmatic;
             assert!(app.close_session_by_id(2).is_ok(), "it closes");
             assert!(!path.exists(), "a closed worker's task file goes with it");
+        });
+    }
+
+    /// A SPAWN'S OWN AUTOPILOT WORD IS THE WORKER'S (FOREVER LAND §1.4):
+    /// `spawn agent=claude autopilot=cruise` parsed, ordered and started
+    /// writes the newborn's `autopilot=cruise` and seeds its task file with
+    /// the Cruise fact line. NEGATIVE CONTROL: the same spawn with no word is
+    /// a Land worker with the Land fact line.
+    #[test]
+    fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
+        use aterm_agent::supervise::Autopilot;
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-word")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            for (local, args, word) in [
+                (1, "agent=claude autopilot=cruise len=8", Autopilot::Cruise),
+                (2, "agent=claude len=8", Autopilot::Land),
+            ] {
+                app.push_stub_tab(wid, crate::stub_session(local));
+                let Ok(super::SpawnForm::Plain {
+                    agent:
+                        Some(super::AgentSpec::Claude {
+                            model,
+                            autopilot,
+                            from,
+                        }),
+                    cwd,
+                    ..
+                }) = super::parse_spawn_args(args)
+                else {
+                    panic!("{args}: a worker's spawn");
+                };
+                let order = super::worker_order(
+                    Some(b"the task".to_vec()),
+                    model,
+                    autopilot,
+                    from,
+                    cwd.as_deref(),
+                )
+                .expect("an order");
+                let start = WorkerStart { order, ..worker() };
+                let sid = sid_of(&app, local);
+                let seed = start.seed();
+                let path = seed.write_for(&SessionId::new(&sid)).expect("written");
+                assert_eq!(
+                    std::fs::read(&path).expect("the task file"),
+                    task_text(b"the task", Some(crate::task_record::FROM_CTL), word),
+                    "{args}: the fact line under {word:?}"
+                );
+                let _pending = app.ready_worker(&sid, start, seed, None).expect("a worker");
+                assert_eq!(
+                    ctx_of(&app, local).meta.lock().unwrap().autopilot_word(),
+                    Some(word),
+                    "{args}: the newborn's own word"
+                );
+            }
         });
     }
 
@@ -5867,30 +6095,60 @@ mod video_parse_tests {
         }
     }
 
+    /// The `--bytes` reply is one allocation: its up-front reservation holds
+    /// the header, the base64 row and the newline, so the base64 is appended in
+    /// place, never built in a buffer of its own and copied.
     #[test]
-    fn image_reply_base64_matches_the_codec_at_every_length() {
+    fn image_reply_base64_appends_without_a_second_buffer() {
+        let metadata = image_metadata_fields(None);
         for len in 0..=257 {
-            let bytes = (0..len)
+            let png = (0..len)
                 .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
                 .collect::<Vec<_>>();
-            let expected = aterm_codec::base64::encode(&bytes).expect("bounded test input");
-            let encoded_len = padded_base64_len(bytes.len()).expect("bounded test input");
-            assert_eq!(encoded_len, expected.len());
-
-            let mut appended = String::new();
-            append_padded_base64(&mut appended, &bytes);
-            assert_eq!(appended, expected, "base64 parity at input length {len}");
+            let encoded = aterm_codec::base64::encode(&png).expect("bounded test input");
+            for want_metadata in [false, true] {
+                let reply = image_bytes_reply(7, 5, &png, want_metadata, None)
+                    .expect("a short PNG fits a byte reply");
+                let (head, reserved) = if want_metadata {
+                    (
+                        format!("OK 2\nimage-meta {metadata}\n"),
+                        encoded.len()
+                            + IMAGE_BYTE_ROW_OVERHEAD
+                            + metadata.len()
+                            + "image-meta \n".len(),
+                    )
+                } else {
+                    (
+                        "OK 1\n".to_string(),
+                        encoded.len() + IMAGE_BYTE_ROW_OVERHEAD,
+                    )
+                };
+                assert_eq!(
+                    reply,
+                    format!("{head}7 5 {len} {encoded}\n"),
+                    "base64 parity at input length {len}",
+                );
+                assert_eq!(
+                    reply.capacity(),
+                    reserved,
+                    "the reply must not reallocate at input length {len} (meta={want_metadata})",
+                );
+            }
         }
     }
 
     #[test]
     fn image_bytes_target_bypasses_filesystem_confinement() {
-        let mut permit = crate::control::ReplyRetentionPermit::unmetered_for_test();
+        let budgets = crate::control::ArtifactBudgets::shipping();
+        let mut permit = budgets
+            .try_reserve_in_memory()
+            .expect("a fresh budget has room");
         let (_target, display_path) = prepare_image_target(
             true,
             false,
             "nested/paths-are-invalid-for-file-output.png",
             std::path::Path::new("missing-socket-directory"),
+            &budgets,
             &mut permit,
         )
         .expect("inline output needs no filesystem target");
@@ -5926,9 +6184,9 @@ mod video_parse_tests {
             "OK 800 600 /tmp/legacy.png\n",
         );
         let file = image_file_reply(800, 600, "/tmp/frame.png", true, Some(&metadata));
-        assert!(file.starts_with("OK 800 600 image-meta image-meta-version=2 frame-kind=native "));
+        assert!(file.starts_with("OK 800 600 image-meta image-meta-version=3 frame-kind=native "));
         for field in [
-            "image-meta-version=2",
+            "image-meta-version=3",
             "frame-phase=presented",
             "view=42",
             "generation=7",
@@ -5956,7 +6214,7 @@ mod video_parse_tests {
         let lines = bytes.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "OK 2");
-        assert!(lines[1].starts_with("image-meta image-meta-version=2 frame-kind=native "));
+        assert!(lines[1].starts_with("image-meta image-meta-version=3 frame-kind=native "));
         assert!(lines[1].contains("capture-serial=23"));
         assert_eq!(lines[2], "2 3 4 iVBORw==");
         assert!(image_byte_reply_png_fits(MAX_IMAGE_BYTE_REPLY_PNG_BYTES));
@@ -5967,7 +6225,7 @@ mod video_parse_tests {
 
         let unavailable = image_file_reply(4, 5, "/tmp/unknown.png", true, None);
         assert!(unavailable.contains(
-            "image-meta-version=2 frame-kind=unknown frame-phase=rendered identity=unavailable"
+            "image-meta-version=3 frame-kind=unknown frame-phase=unknown identity=unavailable"
         ));
     }
 
@@ -6196,7 +6454,12 @@ mod video_parse_tests {
         write_fake_recording(&tmp, SIBLING, "rec-9999999999-000", &[(999, 99)]);
 
         // count=2 -> the two highest deltas (40 then 7), most-changed first.
-        let out = video_frames_for_instance(&tmp, INSTANCE, "count=2".split_whitespace());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            "count=2".split_whitespace(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(out.starts_with("OK 2\n"), "framed header: {out:?}");
         let body: Vec<&str> = out.lines().skip(1).collect();
         assert!(
@@ -6215,17 +6478,32 @@ mod video_parse_tests {
         assert!(!out.contains(SIBLING), "no sibling path disclosed: {out:?}");
 
         // No count -> default cap, all four frames, still delta-ordered.
-        let all = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let all = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(all.starts_with("OK 4\n"), "all frames: {all:?}");
 
         // Bad count / unknown arg are rejected.
         assert!(
-            video_frames_for_instance(&tmp, INSTANCE, "count=0".split_whitespace())
-                .starts_with("ERR ")
+            video_frames_for_instance(
+                &tmp,
+                INSTANCE,
+                "count=0".split_whitespace(),
+                &crate::control::ArtifactBudgets::shipping()
+            )
+            .starts_with("ERR ")
         );
         assert!(
-            video_frames_for_instance(&tmp, INSTANCE, "bogus".split_whitespace())
-                .starts_with("ERR ")
+            video_frames_for_instance(
+                &tmp,
+                INSTANCE,
+                "bogus".split_whitespace(),
+                &crate::control::ArtifactBudgets::shipping()
+            )
+            .starts_with("ERR ")
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6267,7 +6545,12 @@ mod video_parse_tests {
             "the second rank is genuinely an untrusted symlink"
         );
 
-        let out = video_frames_for_instance(&tmp, INSTANCE, "count=2".split_whitespace());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            "count=2".split_whitespace(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(out.starts_with("OK 2\n"), "backfill result: {out:?}");
         let body = out.lines().skip(1).collect::<Vec<_>>();
         assert_eq!(body.len(), 2, "backfill rows: {out:?}");
@@ -6308,17 +6591,15 @@ mod video_parse_tests {
             .min(super::super::ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT / units_per_reply);
         assert!(expected > 0, "the fixture path must fit one admitted reply");
 
+        let budgets = crate::control::ArtifactBudgets::shipping();
         let mut replies = Vec::new();
         while replies.len() < super::super::ARTIFACT_HANDOFF_LIMIT {
-            let mut retained = match super::confined_video_reader::read_metered_for_test(
-                temp.path(),
-                INSTANCE,
-                64,
-            ) {
-                Ok(Some(retained)) => retained,
-                Err(error) if error == super::super::ARTIFACT_HANDOFF_BUSY => break,
-                result => panic!("unexpected confined read result: {result:?}"),
-            };
+            let mut retained =
+                match super::confined_video_reader::read(temp.path(), INSTANCE, 64, &budgets) {
+                    Ok(Some(retained)) => retained,
+                    Err(error) if error == super::super::ARTIFACT_HANDOFF_BUSY => break,
+                    result => panic!("unexpected confined read result: {result:?}"),
+                };
             assert!(retained.value.starts_with("OK 64\n"), "{}", retained.value);
             retained
                 .retention
@@ -6335,7 +6616,7 @@ mod video_parse_tests {
         );
         assert!(
             matches!(
-                super::confined_video_reader::read_metered_for_test(temp.path(), INSTANCE, 64),
+                super::confined_video_reader::read(temp.path(), INSTANCE, 64, &budgets),
                 Err(error) if error == super::super::ARTIFACT_HANDOFF_BUSY
             ),
             "one more read must fail before doing descriptor-heavy work"
@@ -6351,7 +6632,12 @@ mod video_parse_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         write_fake_recording(&tmp, INSTANCE, "rec-1000000000-000", &[(9, 10)]);
 
-        let mut reply = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let mut reply = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(reply.starts_with("OK 1\n"));
         let recording = instance_root(&tmp, INSTANCE).join("rec-1000000000-000");
         let frame = recording.join("frame_0001.png");
@@ -6390,44 +6676,18 @@ mod video_parse_tests {
         drop(index);
         drop(frame);
         drop(oldest);
+        // The last lease's drop hands the recording's retention sweep to the
+        // cleanup worker, and a reader that arrives while it runs is refused
+        // ("retention sweep is in progress"): wait for the sweep to end.
+        super::control_auth::wait_for_artifact_cleanup_for_test(&oldest_path);
 
-        // BOUNDED BACK-OFF on the transient budget class, not a bare call. The
-        // retention budget is a process-global 32-slot counter under cfg(test)
-        // (`ARTIFACT_CLEANUP_TEST_LIMIT`), so under full-suite parallelism a
-        // sibling test can transiently hold the last slot and this reserve
-        // answers "retention sweep is in progress". Measured 2026-09-01:
-        // 2/2 failures under the parallel suite, 31/31 green module-alone,
-        // 4265/0 green single-threaded — a race, not a leak. The catalog files
-        // this reply beside `ERR busy` as a TRANSIENT class where "existing
-        // back-off code already does the right thing"; this is that back-off,
-        // doing the right thing.
-        // A hang detector, not a 10 s budget: a sibling's hold ends, so a slot
-        // that never frees within the minute is a leak.
-        let mut last = String::new();
-        let mut reply = aterm_spec::wait::within(
-            aterm_spec::wait::MUST_HAPPEN,
-            std::time::Duration::from_millis(50),
-            || {
-                let r = video_frames_for_instance(
-                    &tmp,
-                    super::control_auth::process_instance_id(),
-                    std::iter::empty(),
-                );
-                let transient = r.contains("retention sweep is in progress")
-                    || r.contains(crate::control::ARTIFACT_HANDOFF_BUSY);
-                if transient {
-                    last = format!("{r:?}");
-                    return None;
-                }
-                Some(r)
-            },
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "the retention budget never freed — that is a leak, not the race this \
-                 loop absorbs: {last}"
-            )
-        });
+        // A budget of the test's own: no sibling holds its retention slots.
+        let mut reply = video_frames_for_instance(
+            &tmp,
+            super::control_auth::process_instance_id(),
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(reply.starts_with("OK 1\n"), "{reply:?}");
         assert!(reply.contains(oldest_path.to_string_lossy().as_ref()));
 
@@ -6486,7 +6746,12 @@ mod video_parse_tests {
             );
         }
 
-        let mut reply = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let mut reply = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(reply.starts_with("OK 1\n"), "{reply:?}");
         reply
             .prepare_retention_for_test()
@@ -6642,7 +6907,12 @@ mod video_parse_tests {
         let tmp = video_test_dir("empty");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(instance_root(&tmp, INSTANCE)).unwrap();
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(out.starts_with("ERR video frames:"), "{out:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -6661,11 +6931,21 @@ mod video_parse_tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert_eq!(out, NONE_YET, "no `video/` yet");
 
         std::fs::create_dir_all(instance_root(&tmp, "p306-sibling")).unwrap();
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert_eq!(
             out, NONE_YET,
             "`video/` exists, this launch's namespace does not"
@@ -6675,7 +6955,12 @@ mod video_parse_tests {
         let _ = std::fs::remove_dir_all(&not_a_dir);
         std::fs::create_dir_all(&not_a_dir).unwrap();
         std::fs::write(not_a_dir.join(super::control_auth::VIDEO_DIR), b"not a dir").unwrap();
-        let out = video_frames_for_instance(&not_a_dir, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &not_a_dir,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(
             out.contains("recording namespace is not confined"),
             "a `video` that is not a directory is refused: {out:?}"
@@ -6704,7 +6989,12 @@ mod video_parse_tests {
         )
         .unwrap();
 
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(
             out.starts_with("OK 1\n") && out.contains("delta=17"),
             "oversized newest index is skipped for the valid prior recording: {out:?}"
@@ -6734,7 +7024,12 @@ mod video_parse_tests {
             "fixture is a fully encoded reply still queued before wire publication"
         );
 
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(
             out.starts_with("OK 1\n") && out.contains("delta=17"),
             "the reader falls back to the newest marker-visible recording: {out:?}"
@@ -6761,7 +7056,12 @@ mod video_parse_tests {
             std::fs::create_dir(root.join(format!("junk-{index:04}"))).unwrap();
         }
 
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(
             out.contains("recording namespace has too many entries"),
             "bounded scan fails closed: {out:?}"
@@ -6793,7 +7093,12 @@ mod video_parse_tests {
         )
         .unwrap();
 
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(out.starts_with("OK 1\n"), "only one safe row: {out:?}");
         assert!(
             out.contains("frame_0001.png"),
@@ -6825,7 +7130,12 @@ mod video_parse_tests {
             linked_root.join(super::control_auth::VIDEO_DIR),
         )
         .unwrap();
-        let out = video_frames_for_instance(&linked_root, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &linked_root,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(
             out.contains("recording namespace is not confined"),
             "linked root refused: {out:?}"
@@ -6862,7 +7172,12 @@ mod video_parse_tests {
             b"published",
         )
         .unwrap();
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert!(
             out.starts_with("OK 1\n") && out.contains("delta=7"),
             "linked recording and index fall back safely: {out:?}"
@@ -6886,7 +7201,12 @@ mod video_parse_tests {
             b"published",
         )
         .unwrap();
-        let out = video_frames_for_instance(&tmp, INSTANCE, std::iter::empty());
+        let out = video_frames_for_instance(
+            &tmp,
+            INSTANCE,
+            std::iter::empty(),
+            &crate::control::ArtifactBudgets::shipping(),
+        );
         assert_eq!(
             out, "OK 0\n",
             "a linked frame is never returned even from a valid completion index"
@@ -7091,7 +7411,7 @@ mod video_parse_tests {
 
 #[cfg(test)]
 mod call_main_within_tests {
-    use std::sync::mpsc;
+    use std::sync::{Arc, OnceLock, mpsc};
     use std::time::Duration;
 
     use super::recv_within;
@@ -7237,5 +7557,144 @@ mod call_main_within_tests {
             format!("ERR {}\n", super::MainHopError::Stalled(stall)),
             "ERR main thread stalled 12s; retry\n"
         );
+    }
+
+    /// An `image` request for these tests, answered on `reply`. Its frame
+    /// metadata cell is the caller's, whose strong count tells whether the
+    /// request still lives.
+    fn image_request(
+        reply: mpsc::Sender<crate::control::ImageReply>,
+        frame_metadata: &Arc<OnceLock<crate::control::ImageFrameMetadata>>,
+    ) -> crate::Wake {
+        crate::Wake::Image(Box::new(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+            target: crate::control_auth::ConfinedImage::in_memory(),
+            clean: false,
+            session: None,
+            want_bytes: true,
+            want_metadata: false,
+            frame_metadata: Arc::clone(frame_metadata),
+            cancel: crate::control::CaptureCancellation::new(),
+            reply,
+        }))
+    }
+
+    /// A pixel capture is a main-thread hop like every other: the `image`
+    /// request [`super::post_main`] posts is counted from the post until the
+    /// main thread takes it, so the stall refusal sees a capture that waits on
+    /// a stuck main thread, and the main thread answers it on the request's own
+    /// channel. Negative control: the same request handed to the loop raw, as
+    /// `image` handed its queue's `Wake::Control` before, leaves the count
+    /// empty, so what the count sees is the hop.
+    #[test]
+    fn capture_hops_are_counted_until_taken() {
+        let hops: &'static super::Hops = Box::leak(Box::new(super::Hops::new()));
+        let metadata = Arc::new(OnceLock::new());
+        let mut posted = vec![image_request(mpsc::channel().0, &metadata)];
+        assert_eq!(hops.since_ns(), None, "a raw post is not counted");
+        posted.clear();
+
+        let (rx, guard) = super::post_counted(
+            hops,
+            None,
+            |wake| {
+                posted.push(wake);
+                true
+            },
+            |reply| image_request(reply, &metadata),
+        )
+        .expect("an unrefused capture is posted");
+        assert!(
+            hops.since_ns().is_some(),
+            "the posted capture waits on the main thread"
+        );
+        let [wake] = <[crate::Wake; 1]>::try_from(posted).expect("one wake posted");
+        let crate::Wake::Image(request) = super::take_hop(wake) else {
+            panic!("the main thread handles the image request itself");
+        };
+        assert_eq!(hops.since_ns(), None, "taken: the main thread has it");
+        request
+            .reply
+            .send(Err("answered".to_string()))
+            .expect("the worker still waits");
+        let reply = rx.recv().expect("the main thread's answer");
+        assert_eq!(reply.err().as_deref(), Some("answered"));
+        drop(guard);
+        assert_eq!(hops.since_ns(), None, "the take counted it out once");
+    }
+
+    /// A refused hop is answered before its request is built, posted or
+    /// counted: [`super::post_main`] asks [`super::main_thread_refusal`]
+    /// first, so a stalled main thread or a standing dialog is never handed a
+    /// request it cannot answer, a `video` recording now as much as `image`.
+    /// A loop that is gone gives the wake back: the request drops with its
+    /// guards and its hop counts itself out. Negative control: unrefused, the
+    /// same call builds once, posts one `Wake::Hop` and counts it.
+    #[test]
+    fn post_main_refuses_before_posting() {
+        use crate::watchdog::{Breadcrumb, MainStall};
+        let hops: &'static super::Hops = Box::leak(Box::new(super::Hops::new()));
+        let stalled = super::MainHopError::Stalled(MainStall {
+            stalled: Duration::from_secs(6),
+            root: Breadcrumb::NewEvents,
+            returned: false,
+        });
+        let (mut built, mut sent) = (0, 0);
+        let refused = super::post_counted::<u8>(
+            hops,
+            Some(stalled),
+            |_| {
+                sent += 1;
+                true
+            },
+            |_| {
+                built += 1;
+                crate::Wake::WarmupResult
+            },
+        );
+        assert_eq!(refused.err(), Some(stalled));
+        assert_eq!((built, sent), (0, 0), "never built, never posted");
+        assert_eq!(hops.since_ns(), None, "never counted");
+
+        let metadata = Arc::new(OnceLock::new());
+        let gone = super::post_counted(
+            hops,
+            None,
+            |_| false,
+            |reply| image_request(reply, &metadata),
+        );
+        assert_eq!(
+            gone.err(),
+            Some(super::MainHopError::Reason("event loop gone"))
+        );
+        assert_eq!(
+            Arc::strong_count(&metadata),
+            1,
+            "the unsent request dropped with its guards"
+        );
+        assert_eq!(hops.since_ns(), None, "its hop counted itself out");
+
+        let mut posted = Vec::new();
+        let (_rx, guard) = super::post_counted::<u8>(
+            hops,
+            None,
+            |wake| {
+                posted.push(wake);
+                true
+            },
+            |_| {
+                built += 1;
+                crate::Wake::WarmupResult
+            },
+        )
+        .expect("unrefused, the hop is posted");
+        assert_eq!(built, 1, "built once");
+        assert!(
+            matches!(posted.as_slice(), [crate::Wake::Hop { .. }]),
+            "one counted hop posted: {posted:?}"
+        );
+        assert!(hops.since_ns().is_some(), "and counted");
+        drop(guard);
+        assert_eq!(hops.since_ns(), None);
     }
 }

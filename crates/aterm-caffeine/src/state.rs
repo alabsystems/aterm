@@ -50,20 +50,15 @@ pub fn boot_text(boot: u128) -> String {
     )
 }
 
-/// The boot id `text` spells: a UUID, `8-4-4-4-12` hex digits of either case; `None` for
-/// anything else (an older stamp too, which [`restore`] then reads as another boot).
+/// The boot id `text` spells, by astream's reader of the kernel's boot id text
+/// (`astream_sys::parse_boot_id`, the one aterm-link's broker reads its boot with): the UUID
+/// [`boot_text`] writes, in either case. `None` for an older stamp (the boot time in seconds),
+/// for the all-zero id, which names no boot, and for anything else astream refuses — so a file
+/// whose `boot` line holds one does not parse ([`decode`]) and [`restore`] turns the mode off:
+/// the safe direction.
 #[must_use]
 pub fn parse_boot(text: &str) -> Option<u128> {
-    let groups: Vec<&str> = text.split('-').collect();
-    let shaped = groups.len() == 5
-        && groups
-            .iter()
-            .zip([8, 4, 4, 4, 12])
-            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()));
-    if !shaped {
-        return None;
-    }
-    u128::from_str_radix(&groups.concat(), 16).ok()
+    astream_sys::parse_boot_id(text.as_bytes()).map(u128::from_be_bytes)
 }
 
 /// The file's text for `saved`.
@@ -251,11 +246,15 @@ mod tests {
         );
     }
 
+    /// A boot is a UUID, read by astream's reader of the kernel's boot id text in either
+    /// case. Nothing else is a boot — and the all-zero id is none either: a file stamped with
+    /// it does not parse, so [`restore`] turns the mode off, the safe direction. NEGATIVE
+    /// CONTROL: the same file stamped with this boot restores its mode.
     #[test]
     fn a_boot_is_a_uuid_and_nothing_else() {
         assert_eq!(boot_text(BOOT), "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9");
         assert_eq!(boot_text(1), "00000000-0000-0000-0000-000000000001");
-        for boot in [0, 1, BOOT, u128::MAX] {
+        for boot in [1, BOOT, u128::MAX] {
             assert_eq!(parse_boot(&boot_text(boot)), Some(boot), "{boot:x}");
         }
         assert_eq!(
@@ -266,17 +265,27 @@ mod tests {
         for bad in [
             "",
             "1789990000",
-            "4D5A1B2C3E4F5061728394A5B6C7D8E9",
             "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E",
-            "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9-",
-            "4D5A1B2C-3E4F-5061-72839-4A5B6C7D8E9",
+            "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9A",
             "+D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9",
             "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8EG",
+            "00000000-0000-0000-0000-000000000000",
         ] {
             assert_eq!(parse_boot(bad), None, "{bad:?}");
         }
         // A stamp of an older build (the boot time in seconds) is not this boot's.
         assert_eq!(decode("mode=forever\nboot=1789990000\n"), None);
+        // The all-zero id names no boot: the file does not parse, and the mode is off even
+        // where this boot read as the all-zero id too.
+        let zero = format!("mode=forever\nboot={}\n", boot_text(0));
+        assert_eq!(decode(&zero), None);
+        assert_eq!(restore(decode(&zero), Some(0), NOW), Mode::Off);
+        let this = format!("mode=forever\nboot={}\n", boot_text(BOOT));
+        assert_eq!(
+            restore(decode(&this), Some(BOOT), NOW),
+            Mode::Forever,
+            "CONTROL"
+        );
     }
 
     #[test]

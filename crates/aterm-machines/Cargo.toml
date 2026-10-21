@@ -30,6 +30,9 @@ aterm-codec = { workspace = true }
 libc = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
+# The engine every family runs on, re-exported as `converge` (docs/DESIGN-init-system-
+# 2026-10-20.md §3): the model, the ordered run and the journal `init` and `here` keep.
+aterm-converge = { workspace = true }
 
 # Dev only (AGENTS.md: `aterm` is the one shipped executable): the crate as a standalone
 # executable, `aterm-machines-dev machines <verb>`, so the agent can be enrolled into a test VM

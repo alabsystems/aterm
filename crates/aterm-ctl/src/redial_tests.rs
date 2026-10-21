@@ -1436,9 +1436,9 @@ fn a_self_stream_moves_only_on_the_fixed_socket_the_call_named() {
         at("aterm-4242.sock"),
     );
     std::os::unix::fs::symlink(dir.join("a.sock"), &link).unwrap();
-    let flagless = |self_sid: Option<&str>| Follow::Flagless {
+    let flagless = |sid: Option<&str>| Follow::Flagless {
         dir: dir.clone(),
-        self_sid: self_sid.map(String::from),
+        sid: sid.map(String::from),
     };
     for (case, follow, answered_at, arrival) in [
         ("fixed", Follow::Path(fixed.clone()), &fixed, Arrival::Fresh),
@@ -2088,6 +2088,8 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         // does (5F-1); any list with `since=` reads from its cursor.
         "await log need,need",
         "@s-a await log need,close=turn since=4 ep=1 timeout=600000",
+        // An edit's wait by file: the successor waits on the file's views.
+        "@s-a await edit uri=file:///tmp/x timeout=600000",
     ] {
         assert!(retries_across_replacement(&parts(yes)), "{yes}");
         assert!(is_blocking_read(&parts(yes)), "{yes}");
@@ -2121,6 +2123,8 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await log need,close=turn",
         "@s-a await log close=turn,need timeout=600000",
         "await log need,kind=note timeout=5000",
+        // A ticket the old process minted, which no successor knows.
+        "@s-a await edit ticket=7 timeout=600000",
         // A local number names a session of the old process.
         "@3 text",
         "@3 await match DONE",
@@ -2161,6 +2165,18 @@ fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
             "{request}: {note}"
         );
     }
+}
+
+/// A cut `await edit ticket=` is not asked again (no successor knows the
+/// ticket), and its note says to wait by the file, which a successor does.
+#[test]
+fn a_cut_edit_wait_by_ticket_says_to_wait_by_the_file() {
+    let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+    let cut = parts("@s-a await edit ticket=7 timeout=600000");
+    assert!(reports_replacement(&cut));
+    assert!(!retries_across_replacement(&cut));
+    let note = not_asked_again_note(&cut);
+    assert!(note.contains("await edit uri=<file-uri>"), "{note}");
 }
 
 /// A cut `turn` or `post` is reported as a replacement (exit 75, a note that it
@@ -2865,7 +2881,7 @@ fn a_flagless_call_follows_its_session_to_the_successors_own_socket() {
 
     let in_session = Redial::new(Follow::Flagless {
         dir: dir.clone(),
-        self_sid: Some(sid.to_string()),
+        sid: Some(sid.to_string()),
     })
     .with_bound(REACHED);
     assert_eq!(
@@ -2880,7 +2896,7 @@ fn a_flagless_call_follows_its_session_to_the_successors_own_socket() {
     std::os::unix::fs::symlink(&new_sock, &alias).unwrap();
     let outside = Redial::new(Follow::Flagless {
         dir: dir.clone(),
-        self_sid: None,
+        sid: None,
     })
     .with_bound(REACHED);
     assert_eq!(
@@ -2925,7 +2941,7 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
     publish_graph_entry(&dir, sid, &old_sock);
     let follow = Redial::new(Follow::Flagless {
         dir: dir.clone(),
-        self_sid: Some(sid.to_string()),
+        sid: Some(sid.to_string()),
     })
     .with_bound(Duration::from_millis(400));
     assert!(matches!(
@@ -2948,7 +2964,7 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
     // Outside any session the alias is what the call followed: taken.
     let outside = Redial::new(Follow::Flagless {
         dir: dir.clone(),
-        self_sid: None,
+        sid: None,
     })
     .with_bound(REACHED);
     assert!(matches!(
@@ -2959,42 +2975,155 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
     stranger.join().unwrap();
 }
 
-/// Where a redial looks follows how the call resolved: a `--pid` pin follows no
-/// successor, `--sock` its path, and the flagless default the calling session's
-/// graph entry or the alias (`Nothing` with no rendezvous dir).
+/// The session a request is dialled for, and whose host a forward's hang-up
+/// follows, is read by the wire's grammar: a leading `@<sid>` (SP or HT after
+/// it), or the one `@<sid>` a selectorless `subscribe` names second. Self, a
+/// local number, `@*`, a list and a body that is no sid name none.
+#[test]
+fn the_session_a_request_names_is_read_by_the_wire_grammar() {
+    let named = |line: &str| target_sid(line).map(|sid| sid.as_str().to_string());
+    for (line, sid) in [
+        ("@s-ab focus in\n", "s-ab"),
+        ("@s-ab\tfocus in", "s-ab"),
+        ("subscribe @s-ab screen\n", "s-ab"),
+        ("subscribe\t@s-ab screen", "s-ab"),
+        ("@s-ab subscribe @s-cd screen", "s-ab"),
+    ] {
+        assert_eq!(named(line).as_deref(), Some(sid), "{line:?}");
+    }
+    for line in [
+        "@. focus in",
+        "@ focus in",
+        "@1 focus in",
+        "@S-AB focus in",
+        "subscribe @s-ab,@s-cd screen",
+        "subscribe @* screen",
+        "subscribe screen",
+        "focus in",
+    ] {
+        assert_eq!(named(line), None, "{line:?}");
+    }
+}
+
+/// A request naming another instance's session is dialled at that session's
+/// host ([`super::super::targets_in`]), so a hang-up there follows that
+/// session's graph entry: the caller's own instance, alive throughout and named
+/// by the caller's own entry, is no successor of the peer's host; the host's
+/// successor is, once it republishes the peer's entry. Control: the caller's
+/// own target, where a request goes when the peer's entry is stale, follows
+/// the caller's entry and takes its own instance.
+#[cfg(unix)]
+#[test]
+fn a_call_to_a_peer_follows_the_peers_host_not_its_own() {
+    let (_scratch, dir) = scratch_rendezvous("rd-peer");
+    let gone = gone_pid();
+    let live = std::process::id();
+    let old_sock = dir.join(format!("aterm-{gone}.sock"));
+    let old = old_sock.to_str().unwrap();
+    let own_sock = dir.join("aterm-1.sock");
+    let new_sock = dir.join("aterm-2.sock");
+    let (peer, me) = ("s-0a1b", "s-2c3d");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mine = fake_server(
+        aterm_uds::CtlListener::bind(&own_sock).unwrap(),
+        own_sock.clone(),
+        "",
+        false,
+        tx.clone(),
+    );
+    publish_graph_entry(&dir, me, &own_sock);
+    publish_graph_entry(&dir, peer, &old_sock);
+    let targets = super::super::targets_in(
+        Some(dir.clone()),
+        None,
+        None,
+        Some(me.to_string()),
+        aterm_types::control_request::Sid::parse(peer),
+    )
+    .expect("targets");
+    let [to_peer, to_me] = targets.hosting.as_slice() else {
+        panic!("the peer's host, then the caller's own: {targets:?}");
+    };
+    assert_eq!(to_peer.path, old);
+
+    let peers_host = Redial::new(to_peer.follow.clone()).with_bound(Duration::from_millis(400));
+    assert!(matches!(
+        peers_host.after_hangup(old, Some(gone), None, None),
+        Hangup::Gone { .. }
+    ));
+    let own_host = Redial::new(to_me.follow.clone()).with_bound(REACHED);
+    assert_eq!(
+        own_host.after_hangup(old, Some(gone), None, None),
+        Hangup::Successor {
+            path: own_sock.to_str().unwrap().to_string(),
+            pid: live
+        }
+    );
+
+    let successor = fake_server(
+        aterm_uds::CtlListener::bind(&new_sock).unwrap(),
+        new_sock.clone(),
+        "",
+        false,
+        tx,
+    );
+    publish_graph_entry(&dir, peer, &new_sock);
+    let peers_host = Redial::new(to_peer.follow.clone()).with_bound(REACHED);
+    assert_eq!(
+        peers_host.after_hangup(old, Some(gone), None, None),
+        Hangup::Successor {
+            path: new_sock.to_str().unwrap().to_string(),
+            pid: live
+        }
+    );
+    stop(&own_sock);
+    stop(&new_sock);
+    mine.join().unwrap();
+    successor.join().unwrap();
+}
+
+/// Where a redial looks follows how the call resolved
+/// ([`super::super::targets_in`]): a `--pid` pin follows no successor but its
+/// own process, `--sock` its path, and the flagless rule the calling session's
+/// graph entry or the alias. With no rendezvous dir only `--sock` names a socket.
 #[test]
 fn a_redial_follows_what_the_call_resolved_through() {
-    use super::super::redial_follow_in as follow;
+    use super::super::targets_in;
     let dir = PathBuf::from("/r");
     let sid = Some("s-ab".to_string());
+    let follow = |sock: Option<&str>, pid: Option<u32>, sid: Option<String>| {
+        targets_in(Some(dir.clone()), sock.map(String::from), pid, sid, None)
+            .expect("targets")
+            .last_target()
+            .follow
+    };
     assert_eq!(
-        follow(Some(dir.clone()), Some("/x.sock"), Some(42), sid.clone()),
+        follow(None, Some(42), sid.clone()),
         Follow::Nothing(Unfollowed::PidPin(42)),
         "--pid"
     );
     assert_eq!(
-        follow(Some(dir.clone()), Some("/x.sock"), None, sid.clone()),
+        follow(Some("/x.sock"), None, sid.clone()),
         Follow::Path("/x.sock".to_string()),
         "--sock"
     );
     assert_eq!(
-        follow(Some(dir.clone()), None, None, sid.clone()),
+        follow(None, None, sid.clone()),
         Follow::Flagless {
             dir: dir.clone(),
-            self_sid: sid.clone()
+            sid: sid.clone()
         }
     );
     assert_eq!(
-        follow(Some(dir.clone()), None, None, None),
+        follow(None, None, None),
         Follow::Flagless {
-            dir,
-            self_sid: None
+            dir: dir.clone(),
+            sid: None
         },
         "outside a session the flagless rule follows the alias alone"
     );
-    assert_eq!(
-        follow(None, None, None, sid),
-        Follow::Nothing(Unfollowed::NoRendezvousDir),
+    assert!(
+        targets_in(None, None, None, sid, None).is_err(),
         "no rendezvous dir"
     );
 }

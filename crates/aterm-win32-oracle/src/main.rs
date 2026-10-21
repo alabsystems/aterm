@@ -17,7 +17,7 @@ use std::process::{ExitCode, Output};
 type Result<T> = std::result::Result<T, String>;
 const VERSION: &str = "0.61.2";
 const TRIPLES: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
-const HELP: &str = "aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle\n\nusage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|oracle-052> [options]\n\n  --root <checkout>     containing win32-oracle/ (default: ancestor of cwd)\n  --upstream <dir>      pinned registry windows-sys0.61.2 source (not oracle-052)\n  --out <dir>           gen only: write a checkout-shaped private output tree\n  --target-dir <dir>    oracle builds (default: <root>/win32-oracle/target; oracle-052:\n                        <root>/crates/aterm-windows-sys-052/tests/oracle/target)\n  --stock <toolchain>   foreign oracle toolchain (default: stable)\n  --no-format          gen only: leave emitted Rust unformatted\n\nThe driver, graph and host recorder use Trust. oracle and oracle-052 are a STOCK\nEXCEPTION: absolute stock Cargo/RUSTC compile Windows std, no Windows program runs.\nThe reference workspaces have no patch table; gen/check read its pinned registry\nsource and Cargo's actual consumer/feature graph. record explicitly rewrites\nrecorded.json from the reference's host answers. check never blesses drift.\noracle-052 holds crates/aterm-windows-sys-052 (WB.1) to registry windows-sys 0.52.0:\nconformance, imports, and every planted mismatch caught.\nExit:0 pass,1 finding,2 usage,3 could not run; no proof or Windows-runtime claim.\n";
+const HELP: &str = "aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle\n\nusage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|oracle-052> [options]\n\n  --root <checkout>     containing win32-oracle/ (default: ancestor of cwd)\n  --upstream <dir>      pinned registry windows-sys0.61.2 source (not oracle-052;\n                        default: the Cargo registry's copy, fetched when absent)\n  --out <dir>           gen only: write a checkout-shaped private output tree\n  --target-dir <dir>    oracle builds (default: <root>/win32-oracle/target; oracle-052:\n                        <root>/crates/aterm-windows-sys-052/tests/oracle/target)\n  --stock <toolchain>   foreign oracle toolchain (default: stable)\n  --no-format          gen only: leave emitted Rust unformatted\n\nThe driver, graph and host recorder use Trust. oracle and oracle-052 are a STOCK\nEXCEPTION: absolute stock Cargo/RUSTC compile Windows std, no Windows program runs.\nThe reference workspaces have no patch table; gen/check read its pinned registry\nsource and Cargo's actual consumer/feature graph. record explicitly rewrites\nrecorded.json from the reference's host answers. check never blesses drift.\noracle-052 holds crates/aterm-windows-sys-052 (WB.1) to registry windows-sys 0.52.0:\nconformance, imports, and every planted mismatch caught.\nExit:0 pass,1 finding,2 usage,3 could not run; no proof or Windows-runtime claim.\n";
 #[derive(Clone)]
 struct Tools {
     targo: PathBuf,
@@ -98,6 +98,22 @@ fn upstream() -> Result<PathBuf> {
         .next()
         .ok_or("no cached windows-sys0.61.2; use --upstream".into())
 }
+/// `targo fetch --locked` of the reference workspace (win32-oracle/), whose
+/// lock pins registry windows-sys 0.61.2: Cargo unpacks it under
+/// `$CARGO_HOME/registry/src`, where [`upstream`] looks. No aterm build
+/// fetches it, as the workspace's `windows-sys` row is the path facade, so a
+/// host that never ran the oracle has no copy.
+fn fetch_reference(root: &Path) -> Result<()> {
+    let manifest = root.join("win32-oracle/Cargo.toml");
+    let manifest = manifest.to_str().ok_or("checkout path is not UTF-8")?;
+    run(
+        &which("targo")?,
+        &["fetch", "--locked", "--manifest-path", manifest],
+        root,
+        None,
+    )
+    .map(drop)
+}
 /// rustup: on PATH, else where its installer puts it ($CARGO_HOME/bin, then
 /// ~/.cargo/bin).
 fn rustup() -> Result<PathBuf> {
@@ -129,12 +145,7 @@ fn tools(root: &Path, stock: Option<&str>) -> Result<Tools> {
         targo: which("targo")?,
         trustfmt: which("trustfmt")?,
         stock: None,
-        nm: match std::env::var_os("NM") {
-            Some(nm) => PathBuf::from(nm),
-            None => which("llvm-nm")
-                .or_else(|_| which("nm"))
-                .unwrap_or_else(|_| PathBuf::from("nm")),
-        },
+        nm: PathBuf::from("nm"),
     };
     if let Some(name) = stock {
         let rustup = rustup()?;
@@ -155,7 +166,41 @@ fn tools(root: &Path, stock: Option<&str>) -> Result<Tools> {
         }
         out.stock = Some((paths.remove(0), paths.remove(0)));
     }
+    out.nm = match std::env::var_os("NM") {
+        Some(nm) => PathBuf::from(nm),
+        None => which("llvm-nm")
+            .ok()
+            .or_else(|| {
+                out.stock
+                    .as_ref()
+                    .and_then(|(_, rustc)| toolchain_llvm_nm(rustc))
+            })
+            .or_else(|| which("nm").ok())
+            .unwrap_or_else(|| PathBuf::from("nm")),
+    };
     Ok(out)
+}
+
+/// The `llvm-nm` the stock toolchain's `llvm-tools` component installs
+/// (`<sysroot>/lib/rustlib/<host>/bin/llvm-nm`), where it has one, after any
+/// on PATH: an `nm` that reads the Windows objects these oracles inspect. A
+/// Linux host's GNU `nm` reads none of their imports (every row then COULD
+/// NOT RUN), and macOS's `nm` is LLVM's already.
+fn toolchain_llvm_nm(rustc: &Path) -> Option<PathBuf> {
+    let rustlib = rustc.parent()?.parent()?.join("lib").join("rustlib");
+    let name = if cfg!(windows) {
+        "llvm-nm.exe"
+    } else {
+        "llvm-nm"
+    };
+    let mut found: Vec<PathBuf> = std::fs::read_dir(rustlib)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().join("bin").join(name))
+        .filter(|candidate| candidate.is_file())
+        .collect();
+    found.sort();
+    found.into_iter().next()
 }
 fn formatted(
     root: &Path,
@@ -431,7 +476,13 @@ fn start() -> Result<u8> {
     }
     let up = match up {
         Some(p) => p,
-        None => upstream()?,
+        None => match upstream() {
+            Ok(p) => p,
+            Err(_) => {
+                fetch_reference(&root)?;
+                upstream()?
+            }
+        },
     };
     let manifest: aterm_toml::Value =
         aterm_toml::from_str(&read(&up.join("Cargo.toml"))?).map_err(|e| e.to_string())?;
@@ -498,5 +549,28 @@ mod tests {
         for bad in ["garbage", "offset\tA\tx\t0", "value\tB\t1\nvalue\tB\t2"] {
             assert!(parse_record(bad).is_err(), "{bad}")
         }
+    }
+
+    /// The stock toolchain's `llvm-nm` is the one under its host's rustlib
+    /// `bin`, beside cross targets' std-only directories; a toolchain without
+    /// the `llvm-tools` component has none.
+    #[test]
+    fn the_stock_toolchains_llvm_nm_is_its_llvm_tools_one() {
+        let sysroot = aterm_tempfile::tempdir().expect("scratch sysroot");
+        let rustc = sysroot.path().join("bin").join("rustc");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::write(&rustc, b"").unwrap();
+        let rustlib = sysroot.path().join("lib").join("rustlib");
+        std::fs::create_dir_all(rustlib.join("x86_64-pc-windows-msvc").join("lib")).unwrap();
+        assert_eq!(toolchain_llvm_nm(&rustc), None, "no llvm-tools component");
+        let name = if cfg!(windows) {
+            "llvm-nm.exe"
+        } else {
+            "llvm-nm"
+        };
+        let host_bin = rustlib.join("aarch64-unknown-linux-gnu").join("bin");
+        std::fs::create_dir_all(&host_bin).unwrap();
+        std::fs::write(host_bin.join(name), b"").unwrap();
+        assert_eq!(toolchain_llvm_nm(&rustc), Some(host_bin.join(name)));
     }
 }

@@ -2,14 +2,21 @@
 // Copyright 2026 Andrew Yates
 
 //! A live sample of the system-awareness readers on this host, and what each
-//! costs: every reader once (its answer printed), then the median, 90th
-//! percentile and worst wall time of `--calls N` back-to-back calls (default
-//! 200). Dev only; nothing ships it.
+//! costs: every reader once (its answer printed, with the capability report
+//! of what this OS can give), then the median, 90th percentile and worst wall
+//! time of `--calls N` back-to-back calls (default 200; the process sweep at
+//! most 20). Dev only; nothing ships it. On Linux and Windows this is the
+//! live check of those arms.
 //!
 //! ```sh
 //! targo --unverified run -q -p aterm-sysprobe --example live
 //! targo --unverified run -q -p aterm-sysprobe --example live -- --qos-check
 //! ```
+//!
+//! The network links are read twice a second apart, and each link that
+//! counts toward the machine's traffic prints what it moved in that second;
+//! the process sweep prints the disk bytes of this example and of the shell
+//! that ran it, up its parent chain.
 //!
 //! `--qos-check` (macOS) checks that the layout's logical ids are the CPU
 //! numbers the kernel runs threads on: threads at each QoS class spin for
@@ -40,6 +47,17 @@ fn main() {
     println!("core_ticks   {:?}", probe.core_ticks());
     println!("memory       {:?}", aterm_sysprobe::memory_detail());
     println!("gpu          {:?}", aterm_sysprobe::gpu());
+    println!("throttle     {:?}", probe.throttle());
+    println!("withdrawn    {:?}", aterm_sysprobe::withdrawn_cores());
+    println!("capacity     {:?}", aterm_sysprobe::capacity());
+    println!(
+        "processes    {:?}",
+        aterm_sysprobe::processes().map(|s| s.procs.len())
+    );
+    println!("caps");
+    for (name, word) in aterm_sysprobe::caps().rows() {
+        println!("  {name:<18} {word}");
+    }
     println!("volume /     {:?}", aterm_sysprobe::volume(Path::new("/")));
     if let Some(home) = std::env::var_os("HOME") {
         println!(
@@ -47,6 +65,10 @@ fn main() {
             aterm_sysprobe::volume(Path::new(&home))
         );
     }
+    println!("load         {:?}", aterm_sysprobe::load_average());
+    println!("limits       {:?}", aterm_sysprobe::process_limits());
+    links_check();
+    disk_check();
 
     println!("\ncost over {calls} calls (median / p90 / max):");
     report(
@@ -56,13 +78,109 @@ fn main() {
     report("cpu_layout", cost(calls, aterm_sysprobe::cpu_layout));
     report("memory_detail", cost(calls, aterm_sysprobe::memory_detail));
     report("gpu", cost(calls, aterm_sysprobe::gpu));
+    report("throttle", cost(calls, || probe.throttle()));
+    report("withdrawn", cost(calls, aterm_sysprobe::withdrawn_cores));
+    report("capacity", cost(calls, aterm_sysprobe::capacity));
+    report("caps", cost(calls, aterm_sysprobe::caps));
+    report(
+        "processes",
+        cost(calls.min(20), || {
+            aterm_sysprobe::processes().map(|s| s.procs.len())
+        }),
+    );
     report(
         "volume /",
         cost(calls, || aterm_sysprobe::volume(Path::new("/"))),
     );
+    report("net_links", cost(calls, aterm_sysprobe::net_links));
+    report(
+        "process_limits",
+        cost(calls, aterm_sysprobe::process_limits),
+    );
+    report("load_average", cost(calls, aterm_sysprobe::load_average));
+    report(
+        "processes",
+        cost(calls.min(50), || {
+            aterm_sysprobe::processes().map(|s| s.procs.len())
+        }),
+    );
 
     if args.iter().any(|a| a == "--qos-check") {
         qos_check(&layout);
+    }
+}
+
+/// Every link, then what each link that counts toward the machine's
+/// traffic moved over one second.
+fn links_check() {
+    let Some(first) = aterm_sysprobe::net_links() else {
+        println!("net_links    None");
+        return;
+    };
+    for l in &first {
+        println!(
+            "link         {:<10} #{:<3} {:<8} up={:<5} loopback={:<5} rate={:?} rx={} tx={} \
+             errors={}/{} drops={}/{} counts={}",
+            l.name,
+            l.index,
+            l.kind.as_str(),
+            l.up,
+            l.loopback,
+            l.rate_bps,
+            l.rx.bytes,
+            l.tx.bytes,
+            l.rx.errors,
+            l.tx.errors,
+            l.rx.drops,
+            l.tx.drops,
+            aterm_sysprobe::counts_toward_machine(l),
+        );
+    }
+    let t = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    let Some(second) = aterm_sysprobe::net_links() else {
+        return;
+    };
+    let secs = t.elapsed().as_secs_f64();
+    for b in second
+        .iter()
+        .filter(|l| aterm_sysprobe::counts_toward_machine(l))
+    {
+        let Some(a) = first
+            .iter()
+            .find(|a| a.name == b.name && a.index == b.index)
+        else {
+            continue;
+        };
+        println!(
+            "link delta   {} over {secs:.2} s: rx +{} B, tx +{} B",
+            b.name,
+            b.rx.bytes.saturating_sub(a.rx.bytes),
+            b.tx.bytes.saturating_sub(a.tx.bytes),
+        );
+    }
+}
+
+/// The disk bytes of this process and its ancestors (the shell that ran
+/// it, and that shell's).
+fn disk_check() {
+    let Some(sweep) = aterm_sysprobe::processes() else {
+        println!("processes    None");
+        return;
+    };
+    let mut pid = std::process::id();
+    for _ in 0..4 {
+        let Some(p) = sweep.procs.iter().find(|p| p.pid == pid) else {
+            break;
+        };
+        println!(
+            "disk         pid {:<6} {:<16} read={:?} written={:?}",
+            p.pid, p.name, p.disk_read, p.disk_written
+        );
+        if p.ppid <= 1 {
+            break;
+        }
+        pid = p.ppid;
     }
 }
 

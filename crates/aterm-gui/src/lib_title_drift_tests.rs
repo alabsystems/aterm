@@ -16,7 +16,7 @@ fn timeline_events(app: &App, session: u64) -> Vec<(&'static str, String)> {
     let tl = app.pool.get(session).expect("session").ctx.timeline.clone();
     let tl = tl.lock().unwrap();
     tl.since(None)
-        .map(|e| (e.kind, e.payload.clone()))
+        .map(|e| (e.kind, e.payload.to_string()))
         .collect()
 }
 
@@ -218,4 +218,68 @@ fn final_view_detach_retires_per_session_chrome_state_exactly_once() {
     assert!(!window.tab_chrome_titles.contains_key(&0));
     assert!(!window.tab_chrome_titles_by_tab.contains_key(&tab_id));
     assert!(!app.detach_session_view(0), "a repeated detach is a no-op");
+}
+
+/// THE DRIFT OBSERVER HANDS AN 8.3 DIRECTORY TO THE DISK BOARD (live5 F2,
+/// rev6-l-1): a session's OSC 7 report spelled with 8.3 short names, seen
+/// by the real drift path (`observe_title_drift`, `flush_title_drift`),
+/// reaches `harness_host::disk_cwd_reported`, whose speller spells it long
+/// onto the process's board (`disk_board::Board::spelled`): `status disk=`
+/// then places the tab with no look and no watch. A session labelling no
+/// tab is handed over too. PREMISE, stated where it fails: the volume
+/// generates short names. NEGATIVE CONTROL (by hand): with the hook taken
+/// out of `flush_title_drift` the board never holds the session's spelling,
+/// and the one-minute hang detector fails the test.
+#[cfg(windows)]
+#[test]
+fn an_8_3_cwd_change_reaches_the_disk_boards_speller() {
+    let tmp = aterm_tempfile::TempDir::new().expect("scratch");
+    let folder = std::fs::canonicalize(tmp.path())
+        .expect("canonical")
+        .join("a folder with a long name");
+    std::fs::create_dir(&folder).expect("the long-named folder");
+    let short = aterm_sysprobe::short_spelling(&folder).unwrap_or_else(|| {
+        panic!(
+            "PREMISE: the volume generates 8.3 short names; none for {}",
+            folder.display()
+        )
+    });
+    let short = aterm_sysprobe::paths::plain(&short).into_owned();
+    let reported = short.to_str().expect("text").replace('\\', "/");
+    let mut app = App::headless_for_test();
+    // A session id no other test reports to the process's board with.
+    let sid = 0x83_0000_0001;
+    app.pool.insert(stub_session(sid));
+    let term = app.pool.get(sid).expect("session").term.clone();
+    term.lock()
+        .unwrap()
+        .process(format!("\x1b]7;file:///{reported}\x07").as_bytes());
+    app.observe_title_drift(sid, Instant::now());
+    let events = timeline_events(&app, sid);
+    assert!(
+        events.iter().any(|(k, _)| *k == "cwd-change"),
+        "PREMISE: the cd was recorded: {events:?}"
+    );
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let (said, long) = loop {
+        if let Some(spelled) = crate::disk_board::SHELF
+            .board_lock()
+            .spelled
+            .get(&sid)
+            .cloned()
+        {
+            break spelled;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the drift observer never handed {reported} to the disk board's speller"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(said, short, "the spelling the tab reports");
+    assert_eq!(
+        aterm_sysprobe::paths::windows_key(&long),
+        aterm_sysprobe::paths::windows_key(&folder),
+        "spelled long: {long:?}"
+    );
 }

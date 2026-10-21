@@ -410,6 +410,40 @@ pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A zlib stream (RFC 1950) of `len` zero bytes, `len >= 1`: a literal zero, then
+/// 258-byte back-references at distance 1 (about 13 bits per 258 bytes). An `o=z`
+/// payload for tests that need large rasters from little output.
+#[cfg(test)]
+pub(crate) fn zlib_zeros(len: usize) -> Vec<u8> {
+    // Deflate packs fields low bit first; a Huffman code goes out most
+    // significant bit first.
+    let mut bits: Vec<u8> = Vec::new();
+    let mut field = |value: u32, n: u32| bits.extend((0..n).map(|i| ((value >> i) & 1) as u8));
+    let code = |code: u32, n: u32| (0..n).fold(0, |r, i| r | ((code >> i) & 1) << (n - 1 - i));
+    field(0b011, 3); // BFINAL, fixed Huffman
+    field(code(0x30, 8), 8); // literal 0
+    let mut left = len - 1;
+    while left >= 258 {
+        field(code(0b1100_0101, 8), 8); // length 258
+        field(0, 5); // distance 1
+        left -= 258;
+    }
+    for _ in 0..left {
+        field(code(0x30, 8), 8);
+    }
+    field(0, 7); // end of block
+    let mut out = vec![0x78, 0x01];
+    out.extend(bits.chunks(8).map(|byte| {
+        byte.iter()
+            .enumerate()
+            .fold(0u8, |acc, (i, &bit)| acc | (bit << i))
+    }));
+    // Adler-32 of zeros: `a` stays 1, `b` counts the bytes.
+    let b = u32::try_from(len % 65521).expect("below 65521");
+    out.extend_from_slice(&((b << 16) | 1).to_be_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

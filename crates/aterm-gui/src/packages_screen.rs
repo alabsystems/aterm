@@ -891,31 +891,6 @@ pub(crate) fn activity_text_lines(text: &str, width: usize) -> Vec<String> {
     }
 }
 
-/// The lines one of the page's own sentences paints at `width`: whole when it fits, else
-/// broken first between its ` · ` parts (a part that fits a line is never split, and the
-/// separator a break falls on is not painted) and word-wrapped within a part that does not.
-/// Every line is kept: the Background service line and the retired `auto_update` note end
-/// with what to do. Only for bounded sentences the page or atpkg writes; a recorded reason
-/// is [`reason_lines`]' and an event [`activity_text_lines`]'. Counted the way both count.
-pub(crate) fn note_lines(text: &str, width: usize) -> Vec<String> {
-    const SEP: &str = " \u{b7} ";
-    let width = width.max(MIN_REASON_WIDTH);
-    if fits(text, width) {
-        return vec![text.to_string()];
-    }
-    let mut lines: Vec<String> = Vec::new();
-    for part in text.split(SEP) {
-        match lines.last_mut() {
-            Some(line) if fits(&format!("{line}{SEP}{part}"), width) => {
-                line.push_str(SEP);
-                line.push_str(part);
-            }
-            _ => lines.extend(wrap_words(part, width)),
-        }
-    }
-    lines
-}
-
 /// atpkg's status ledger names its whole-toolset pseudo-program `*toolset*`, emphasis a
 /// native page would paint as literal asterisks: the meta-row gets its product name, and
 /// any other emphasis-wrapped name unwraps. Real names pass through, and node keys keep the
@@ -1030,10 +1005,11 @@ pub(crate) fn attention_headline(items: &[String]) -> Option<String> {
         .take(ATTENTION_NAMED)
         .cloned()
         .collect::<Vec<_>>()
-        .join(" \u{b7} ");
+        .join(crate::native_ui::FACT_SEPARATOR);
     if items.len() > ATTENTION_NAMED {
         named.push_str(&format!(
-            " \u{b7} and {} more",
+            "{}and {} more",
+            crate::native_ui::FACT_SEPARATOR,
             items.len() - ATTENTION_NAMED
         ));
     }
@@ -2647,7 +2623,7 @@ pub(crate) struct PackagesProjection {
     pub(crate) auto_install: bool,
     pub(crate) loop_running: bool,
     /// What is actually running now, plus any saved-vs-live mismatch. The page wraps it
-    /// ([`note_lines`]), never leaving it to the ellipsis.
+    /// to the column it is drawn in, never leaving it to the ellipsis.
     pub(crate) loop_status: String,
     /// atpkg's sentence for a retired `[packages] auto_update = false` that holds Keep ALab
     /// tools up to date off (`atpkg::config::auto_update_note`), painted wrapped under the
@@ -2750,7 +2726,7 @@ pub(crate) fn activity_sentences(
                     1 => "failed",
                     _ => "ended",
                 };
-                text.push_str(" \u{b7} ");
+                text.push_str(crate::native_ui::FACT_SEPARATOR);
                 text.push_str(said);
                 let outcome = get("outcome");
                 if !outcome.is_empty() && !(exit == CONTENDED && outcome.starts_with("did not run"))
@@ -2763,7 +2739,7 @@ pub(crate) fn activity_sentences(
                 if let Ok(secs) = get("secs").parse::<u64>()
                     && secs > 0
                 {
-                    text.push_str(&format!(" \u{b7} {secs} s"));
+                    text.push_str(&format!("{}{secs} s", crate::native_ui::FACT_SEPARATOR));
                 }
                 (text, !matches!(exit, 0 | OFFLINE | CONTENDED))
             }
@@ -2798,7 +2774,7 @@ fn program_activity(
     let name = package_program_display_name(program);
     let with_source = |mut text: String| {
         if !source.is_empty() {
-            text.push_str(" \u{b7} ");
+            text.push_str(crate::native_ui::FACT_SEPARATOR);
             text.push_str(source);
         }
         text
@@ -3070,45 +3046,6 @@ mod tests {
         let busy = service.state(true, true, true).projection();
         assert_eq!(busy.busy, Some(PackagesBusy::Install));
         assert!(!busy.actions_enabled);
-    }
-
-    /// The page's own sentences wrap whole ([`note_lines`]): at the narrowest measure the
-    /// retired key's note and the longest service line keep every word, in order, each line
-    /// within the measure, and a ` · ` part that fits a line stays whole on one.
-    #[test]
-    fn note_lines_keep_every_word_within_the_measure() {
-        let words = |text: &str| -> Vec<String> {
-            text.split_whitespace()
-                .filter(|word| *word != "\u{b7}")
-                .map(str::to_string)
-                .collect()
-        };
-        let note = atpkg::config::auto_update_note(false, Some(true));
-        let service = "Off \u{2014} [packages] auto_update = false holds it off \
-                       (turning on Keep ALab tools up to date removes it); Check & Update Now still works \
-                       \u{b7} last full check 3 h ago";
-        for text in [note.as_str(), service] {
-            for width in [MIN_REASON_WIDTH, 56] {
-                let lines = note_lines(text, width);
-                assert!(lines.len() > 1, "{width}: wrapped");
-                assert!(
-                    lines.iter().all(|line| fits(line, width)),
-                    "{width}: {lines:?}"
-                );
-                assert_eq!(
-                    words(&lines.join(" ")),
-                    words(text),
-                    "{width}: every word, in order"
-                );
-            }
-        }
-        assert!(
-            note_lines(service, 36)
-                .last()
-                .is_some_and(|line| line.ends_with("last full check 3 h ago")),
-            "the last full check is one part, whole on its line"
-        );
-        assert_eq!(note_lines("On", 36), vec!["On".to_string()]);
     }
 
     /// A report whose program rows are `rows` (name, state), as a pass wrote them.

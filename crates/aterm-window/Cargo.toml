@@ -196,7 +196,8 @@ default-features = false
 # right one (aterm-hash's own rule), and it is what the retired `ahash` row already ran: it had
 # pinned ahash to fixed seeds (`no-rng`). Every iteration over them was read for order
 # dependence; none has any beyond what upstream's randomly seeded default already left
-# arbitrary. FIRST-PARTY and path-only, zero dependencies.
+# arbitrary. FIRST-PARTY and path-only; its one dependency is astream-wire (path-only,
+# dependency-free, vendor/astream), whose FNV byte loop aterm-hash runs.
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies.aterm-hash]
 path = "../aterm-hash"
 optional = true
@@ -215,6 +216,15 @@ optional = true
 
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_os = "ios", target_os = "macos"))))'.dependencies.libc]
 version = "0.2.64"
+
+# LOCAL PATCH (aterm), 2026-10-19 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the Wayland
+# seat's capability-removal test (`seat/retire_tests.rs`) starts `lane-bus seat` and paces it
+# through files in a scratch directory. FIRST-PARTY, path-only, test builds only.
+[target.'cfg(target_os = "linux")'.dev-dependencies.aterm-uds]
+workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies.aterm-tempfile]
+workspace = true
 
 # LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): libxkbcommon
 # (and libxkbcommon-x11) through first-party `aterm-xkb`, read at run time, and its keysym

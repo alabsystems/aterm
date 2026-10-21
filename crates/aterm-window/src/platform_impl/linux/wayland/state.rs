@@ -63,10 +63,12 @@ pub(crate) struct Connection {
 unsafe impl Sync for Connection {}
 
 impl Connection {
-    /// Connect to `$WAYLAND_DISPLAY` (or `$WAYLAND_SOCKET`, as libwayland reads them) and make
-    /// the loop's queue.
-    pub(crate) fn connect() -> Result<Connection, aterm_wayland::proxy::Error> {
-        let display = aterm_wayland::proxy::OwnedDisplay::connect(None)?;
+    /// Connect to the compositor `name` names, else to `$WAYLAND_DISPLAY` (or
+    /// `$WAYLAND_SOCKET`, as libwayland reads them), and make the loop's queue.
+    pub(crate) fn connect(
+        name: Option<&std::ffi::CStr>,
+    ) -> Result<Connection, aterm_wayland::proxy::Error> {
+        let display = aterm_wayland::proxy::OwnedDisplay::connect(name)?;
         // SAFETY: the owner moves into Connection after its queue, so the queue is
         // destroyed first. Dispatch is confined to the event-loop thread; window
         // object destruction is serialized there, or follows its final dispatch.

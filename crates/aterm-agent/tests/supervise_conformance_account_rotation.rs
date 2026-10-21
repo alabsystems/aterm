@@ -89,6 +89,7 @@ use aterm_agent::supervise::policy::turn_end::{
 use aterm_models_harness::supervisor_account_rotation_model;
 use aterm_phase::WallKind;
 use aterm_spec::derive::Model;
+use aterm_spec::interp::Resolved;
 
 use crate::common::cnst;
 
@@ -359,10 +360,44 @@ fn project(w: &World, m: &Model, st: &State, soon: Option<i64>) -> accounts::Sta
     real
 }
 
+/// The [`SEEN`] variables' values, in that order: the real state read back
+/// ([`abstraction`]), or a model state's ([`seen`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Seen([i64; SEEN.len()]);
+
+/// Where `var` sits in [`SEEN`].
+fn seen_at(var: &str) -> usize {
+    (SEEN.iter().position(|seen| *seen == var))
+        .unwrap_or_else(|| panic!("`{var}` is no variable the real state carries"))
+}
+
+impl Seen {
+    fn insert(&mut self, var: &str, value: i64) {
+        self.0[seen_at(var)] = value;
+    }
+}
+
+impl std::ops::Index<&str> for Seen {
+    type Output = i64;
+
+    fn index(&self, var: &str) -> &i64 {
+        &self.0[seen_at(var)]
+    }
+}
+
+/// Written as the model state of just those variables, in their names' order.
+impl std::fmt::Debug for Seen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut by_name: Vec<_> = SEEN.iter().zip(self.0).collect();
+        by_name.sort_unstable();
+        f.debug_map().entries(by_name).finish()
+    }
+}
+
 /// The read back: the real state onto the model's variables, through the real
 /// `condition` at `now`.
-fn abstraction(w: &World, m: &Model, real: &accounts::State, now: i64) -> State {
-    let mut out = State::new();
+fn abstraction(w: &World, m: &Model, real: &accounts::State, now: i64) -> Seen {
+    let mut out = Seen([0; SEEN.len()]);
     for (var, account) in CONDS.iter().zip(1..) {
         let cond = accounts::condition(w.row(w.named(account)), real, true, now);
         let value = match cond {
@@ -371,7 +406,7 @@ fn abstraction(w: &World, m: &Model, real: &accounts::State, now: i64) -> State 
             Condition::Limited { .. } => 2,
             other => panic!("a condition the model has no value for: {other:?}"),
         };
-        out.insert(*var, value);
+        out.insert(var, value);
     }
     let active = real.active.as_deref();
     let act = w.account(active);
@@ -409,14 +444,14 @@ fn abstraction(w: &World, m: &Model, real: &accounts::State, now: i64) -> State 
 }
 
 /// The model state's variables the real state carries.
-fn seen(st: &State) -> State {
-    SEEN.iter().map(|var| (*var, st[var])).collect()
+fn seen(st: &State) -> Seen {
+    Seen(SEEN.map(|var| st[var]))
 }
 
-/// `read == seen(st)` without building [`seen`]'s map (asked at every state and edge):
-/// `read` names exactly the [`SEEN`] variables, each with `st`'s value.
-fn read_is_seen(read: &State, st: &State) -> bool {
-    read.len() == SEEN.len() && SEEN.iter().all(|var| read.get(var) == Some(&st[var]))
+/// `read == seen(st)` for the model state `st` the real code is shown as `key`
+/// ([`SHOWN`], whose first variables are [`SEEN`]): asked at every state and edge.
+fn read_is_seen(read: &Seen, key: &Shown) -> bool {
+    read.0 == key[..SEEN.len()]
 }
 
 /// The model variables the real code is shown: [`SEEN`], which [`project`] builds the
@@ -688,35 +723,77 @@ fn freed(st: &State, i: usize) -> State {
     free
 }
 
+/// A model, and how a step of it is taken: by name ([`Model`]), or on its
+/// resolved form ([`Resolving`]), where the graph asks it of every state.
+trait Rule {
+    fn model(&self) -> &Model;
+
+    /// The state `action` steps `st` to, where it is enabled ([`Model::fire`]).
+    fn fired(&self, action: &str, st: &State) -> Option<State>;
+}
+
+impl Rule for Model {
+    fn model(&self) -> &Model {
+        self
+    }
+
+    fn fired(&self, action: &str, st: &State) -> Option<State> {
+        let mut next = st.clone();
+        self.fire(action, &mut next).then_some(next)
+    }
+}
+
+/// A model with its [`Resolution`]: the same first successor, without the
+/// string-keyed environment a step by name builds.
+struct Resolving<'m> {
+    m: &'m Model,
+    at: &'m Resolution,
+}
+
+impl Rule for Resolving<'_> {
+    fn model(&self) -> &Model {
+        self.m
+    }
+
+    fn fired(&self, action: &str, st: &State) -> Option<State> {
+        let a = (self.m.actions.iter().position(|a| a.name == action))
+            .unwrap_or_else(|| panic!("no action `{action}` in model `{}`", self.m.name));
+        let r = &self.at.resolved;
+        let next = r.successors(a, &flat(st)).into_iter().next()?;
+        Some(r.state(&next))
+    }
+}
+
 /// The move the model's `action` makes for session `i` from `free`, where it
 /// is enabled: a rotation where the model counts one, a take of the canary's
 /// place where the account moved onto has not served a response.
 fn the_models_move(
-    m: &Model,
+    rule: &(impl Rule + ?Sized),
     action: &str,
     free: &State,
     i: usize,
     ahead: bool,
 ) -> Option<Verdict> {
-    let mut moved = free.clone();
-    let rotates = |moved: &State| moved["rot"] != free["rot"];
-    m.fire(action, &mut moved).then(|| Verdict::Move {
+    let moved = rule.fired(action, free)?;
+    let rotates = moved["rot"] != free["rot"];
+    Some(Verdict::Move {
         to: moved[SESSIONS[i]],
-        rotates: rotates(&moved),
-        takes: !rotates(&moved) && free["prov"] == 0,
+        rotates,
+        takes: !rotates && free["prov"] == 0,
         ahead,
     })
 }
 
 /// What the model tells session `i` at `st`, with the host free and awake: read off
 /// its own guards (`Move…`, `Wait…`), never restated here.
-fn expected(m: &Model, st: &State, i: usize) -> Verdict {
+fn expected(rule: &(impl Rule + ?Sized), st: &State, i: usize) -> Verdict {
+    let m = rule.model();
     let free = freed(st, i);
     if m.action_enabled(RESUMES[i], &free) {
         return Verdict::Resume;
     }
     let at_wall = walled(st, i);
-    if let Some(moved) = the_models_move(m, MOVES[i], &free, i, !at_wall) {
+    if let Some(moved) = the_models_move(rule, MOVES[i], &free, i, !at_wall) {
         return moved;
     }
     if !at_wall {
@@ -740,8 +817,8 @@ fn expected(m: &Model, st: &State, i: usize) -> Verdict {
 
 /// What the model tells session `i` at a plain turn end on a limited account
 /// (`Leave…`): the move, or a stay.
-fn expected_leaving(m: &Model, st: &State, i: usize) -> Verdict {
-    the_models_move(m, LEAVES[i], &freed(st, i), i, true).unwrap_or(Verdict::Stay)
+fn expected_leaving(rule: &(impl Rule + ?Sized), st: &State, i: usize) -> Verdict {
+    the_models_move(rule, LEAVES[i], &freed(st, i), i, true).unwrap_or(Verdict::Stay)
 }
 
 /// The same move, or no move on either side. What is compared on a real
@@ -862,17 +939,19 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         resumes_by_itself: false,
         composer: Composer::Empty,
         said_tail: Some("Suites are running.".to_string()),
+        said_cut: false,
+        turn_said: None,
+        opened_by: None,
         worked,
         rules: None,
         pending_input: false,
         interrupted: false,
         restartable: true,
+        relaunch_off: false,
         resume: None,
         upgrading: false,
         taskless: false,
         finished_record: None,
-        finished_at_check: false,
-        check_record: None,
         left_record: false,
         left_work: None,
         login_back: false,
@@ -892,8 +971,10 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         login_notice: None,
         login_screen: None,
         login_interrupted: false,
+        login_at_wall: None,
         login_method: None,
         login_shared: None,
+        roster: None,
         wall_remembered: false,
         answered: None,
         worked_doubt: Duration::ZERO,
@@ -1833,6 +1914,9 @@ struct Walk {
     /// …and the wall's own continuation, at the notice of one the owner
     /// lifted.
     resumes: usize,
+    /// The moves the real decider asked of a session at a plain turn end on a
+    /// limited account (`Leave…`).
+    leaving_moves: usize,
     /// How many of the model's moves were made on the policy's side.
     made: usize,
     /// The asks the session's own bounds were tried around.
@@ -1882,6 +1966,7 @@ impl Walk {
         self.waits += found.waits;
         self.todays += found.todays;
         self.resumes += found.resumes;
+        self.leaving_moves += found.leaving_moves;
         self.made += found.made;
         self.bounds.at_a_wall += found.bounds.at_a_wall;
         self.bounds.ahead += found.bounds.ahead;
@@ -2150,14 +2235,14 @@ impl Lane<'_> {
 
     /// The real code at the projection `st`. A disagreement is collected here
     /// (`note(false, ..)`) and fails a strict walk where it is added.
-    fn at_state(&self, st: State) -> AtState {
+    fn at_state(&self, key: &Shown) -> AtState {
         let (w, m, advisor) = (self.w, self.m, self.advisor);
-        let st = Arc::new(st);
+        let st = Arc::new(shown_state(key));
         let mut found = Walk::default();
         let base = project(w, m, &st, None);
         found.note(
             false,
-            read_is_seen(&abstraction(w, m, &base, NOW), &st),
+            read_is_seen(&abstraction(w, m, &base, NOW), key),
             &st,
             None,
             || "the projection does not read back".to_string(),
@@ -2183,6 +2268,11 @@ impl Lane<'_> {
         // …and at a plain turn end on a limited account (`Leave…`).
         let decided_leaving =
             [0, 1].map(|i| walled(&st, i).then(|| self.decide_at(&base, i, Ask::TurnEnd, NOW)));
+        found.leaving_moves = decided_leaving
+            .iter()
+            .flatten()
+            .filter(|d| matches!(d.asked, Asked::Move { .. }))
+            .count();
         AtState {
             st,
             found,
@@ -2290,9 +2380,13 @@ impl Lane<'_> {
             // near the reset is: low to the last minute, never fresh.
             let near = project(w, m, st, Some(account_of(name)));
             let read = abstraction(w, m, &near, NOW);
-            out.note(false, read_is_seen(&read, st), st, Some(name), || {
-                format!("about to reset, the real state reads back {read:?}")
-            });
+            out.note(
+                false,
+                read_is_seen(&read, &edge.from),
+                st,
+                Some(name),
+                || format!("about to reset, the real state reads back {read:?}"),
+            );
             // A session with nothing usable is decided again by the
             // instant this reset wakes the model's: its wait ends when
             // the window does, its own or another account's.
@@ -2351,7 +2445,7 @@ impl Lane<'_> {
                 // `next` is the model's state as the real code is shown it, so a
                 // row names those variables alone; an edge's memo is shared by the
                 // model states that differ only in the others.
-                out.note(false, read_is_seen(&read, next), st, Some(name), || {
+                out.note(false, read_is_seen(&read, &edge.to), st, Some(name), || {
                     format!("the real state reads back {read:?}, the model {next:?}")
                 });
                 if let Some(after) = &edge.after {
@@ -2415,7 +2509,7 @@ impl Lane<'_> {
             // so the rest can be read.
             ended.sessions.clone_from(&base.sessions);
             let read = abstraction(w, m, &ended, NOW);
-            let same = forgot && read_is_seen(&read, next);
+            let same = forgot && read_is_seen(&read, &edge.to);
             out.note(false, same, st, Some(name), || {
                 format!("the canary forgotten, the real state reads back {read:?}")
             });
@@ -2461,6 +2555,17 @@ struct Node {
     /// Each action enabled here, in the model's order, and its edge (an index
     /// into [`Graph::edges`]).
     steps: Vec<(&'static str, usize)>,
+}
+
+/// The steps of `node` (of `g`) that are no defect's, each with its edge.
+fn sound_steps<'g>(
+    g: &'g Graph,
+    node: &'g Node,
+) -> impl Iterator<Item = (&'static str, &'g Edge)> + 'g {
+    node.steps
+        .iter()
+        .filter(|(action, _)| !DEFECTS.contains(action))
+        .map(|&(action, e)| (action, &g.edges[e].1))
 }
 
 /// A map key and its hash, computed where the graph's work is spread over the cores,
@@ -2543,29 +2648,54 @@ enum Reaches {
     New(Box<(State, Hashed<Vec<i64>>)>),
 }
 
+/// A model resolved once ([`Resolved`]: its successors and laws, case for case
+/// and in the same order, on a state's values), and where its [`SHOWN`]
+/// variables sit in a state's values.
+struct Resolution {
+    resolved: Resolved,
+    shown: [usize; SHOWN.len()],
+}
+
+impl Resolution {
+    fn of(m: &Model) -> Resolution {
+        let resolved = Resolved::new(m).expect("the rotation model binds every variable it writes");
+        let shown = SHOWN.map(|var| resolved.slot(var));
+        Resolution { resolved, shown }
+    }
+}
+
 /// The model at `st`: its laws, and its first successor by each action — by
 /// its index, where it is among the states `reached` so far.
-fn expand(m: &Model, st: &State, reached: &HashedMap<Vec<i64>, usize>) -> Expansion {
-    let env = m.eval_env(st);
+fn expand(
+    m: &Model,
+    at: &Resolution,
+    st: &State,
+    reached: &HashedMap<Vec<i64>, usize>,
+) -> Expansion {
+    let r = &at.resolved;
+    // The state's values in its names' order, which is the resolved model's.
+    let values = flat(st);
     let broken = m
         .invariants
         .iter()
-        .find(|inv| !m.check_invariant_in(inv, &env))
-        .map(|inv| inv.name);
+        .enumerate()
+        .find(|&(i, _)| !r.holds(i, &values))
+        .map(|(_, inv)| inv.name);
     let steps = m
         .actions
         .iter()
-        .filter_map(|action| {
-            let next = m.successors_in(action, &env, st).into_iter().next()?;
-            let jobs_hold =
-                st["jobs"] == 1 && decision(action.name, st, &next).is_some_and(|(i, ..)| i == 0);
+        .enumerate()
+        .filter_map(|(a, action)| {
+            let next = r.successors(a, &values).into_iter().next()?;
+            let jobs_hold = st["jobs"] == 1
+                && decision(action.name, st, &r.state(&next)).is_some_and(|(i, ..)| i == 0);
             let reaches = if DEFECTS.contains(&action.name) {
-                Reaches::Defect(Box::new(shown(&next)))
+                Reaches::Defect(Box::new(at.shown.map(|k| next[k])))
             } else {
-                let key = Hashed::of(flat(&next));
+                let key = Hashed::of(next);
                 match reached.get(&key) {
                     Some(&k) => Reaches::Reached(k),
-                    None => Reaches::New(Box::new((next, key))),
+                    None => Reaches::New(Box::new((r.state(&key.key), key))),
                 }
             };
             Some(Step {
@@ -2592,6 +2722,7 @@ impl Graph {
     fn of(m: Model, strict: bool) -> Graph {
         // Every state reached, in the order first reached, which is the
         // order popped; and each one's index.
+        let at = Resolution::of(&m);
         let init = m.init_state();
         let mut reached: HashedMap<Vec<i64>, usize> = HashedMap::default();
         reached.insert(Hashed::of(flat(&init)), 0);
@@ -2602,7 +2733,7 @@ impl Graph {
         'search: while popped.len() < states.len() {
             let level = popped.len()..states.len();
             let expansions = pooled(level.len(), |k| {
-                Some(expand(&m, &states[level.start + k], &reached))
+                Some(expand(&m, &at, &states[level.start + k], &reached))
             });
             for expansion in expansions {
                 let Expansion { broken, mut steps } = expansion.into_value();
@@ -2637,12 +2768,13 @@ impl Graph {
         // Every state reached as the real code is shown it; what the model
         // tells both sessions there ([`expected`]), and at a plain turn end on
         // a limited account ([`expected_leaving`]).
+        let resolving = Resolving { m: &m, at: &at };
         let shown_at: Vec<_> = pooled(states.len(), |k| {
             let st = &states[k];
             Some((
                 shown(st),
-                [0, 1].map(|i| expected(&m, st, i)),
-                [0, 1].map(|i| walled(st, i).then(|| expected_leaving(&m, st, i))),
+                [0, 1].map(|i| expected(&resolving, st, i)),
+                [0, 1].map(|i| walled(st, i).then(|| expected_leaving(&resolving, st, i))),
             ))
         })
         .into_iter()
@@ -2835,10 +2967,32 @@ fn pooled<T: Send>(n: usize, job: impl Fn(usize) -> Option<T> + Sync) -> Vec<Slo
     slots
 }
 
-/// Walk the graph `g` with the real code. `strict` asserts the model's laws and every
-/// agreement; otherwise each disagreement is collected. `advisor` answers for the
-/// roster (the real `advise`, or today's rule in its place) and `host` is whether the
-/// session's host hands that answer to the decider at all.
+/// What a walk asks of the real code: the projections it judges and the edges it
+/// takes. A part the walk leaves is not asked at all.
+#[derive(Clone, Copy)]
+struct Part {
+    /// Every projection judged against the model's answers at its states (and,
+    /// in a strict walk, the model's laws there and the bounds tried around
+    /// it); else only the projections the edges taken leave, as those edges
+    /// read them.
+    states: bool,
+    /// The actions whose edges are taken. Every action's firings are counted
+    /// all the same.
+    edges: fn(&str) -> bool,
+}
+
+impl Part {
+    /// Everything: the Tier-1 walk's.
+    const WHOLE: Part = Part {
+        states: true,
+        edges: |_| true,
+    };
+}
+
+/// Walk the graph `g` with the real code, the `part` of it asked. `strict` asserts the
+/// model's laws and every agreement; otherwise each disagreement is collected.
+/// `advisor` answers for the roster (the real `advise`, or today's rule in its place)
+/// and `host` is whether the session's host hands that answer to the decider at all.
 ///
 /// What the real code finds at a projection and on an edge ([`Lane`]) depends on
 /// nothing else, so all of it is asked first, spread over the cores ([`pooled`]), and
@@ -2847,7 +3001,7 @@ fn pooled<T: Send>(n: usize, job: impl Fn(usize) -> Option<T> + Sync) -> Vec<Slo
 /// where a one-state-at-a-time walk would have met it, with the same message. A panic
 /// of the model's own side ([`expected`], a successor) is raised while the [`Graph`]
 /// is built, before any real code is asked.
-fn walk(w: &World, g: &Graph, advisor: Advisor, host: Host, strict: bool) -> Walk {
+fn walk(w: &World, g: &Graph, advisor: Advisor, host: Host, strict: bool, part: Part) -> Walk {
     let lane = Lane {
         w,
         m: &g.m,
@@ -2857,31 +3011,55 @@ fn walk(w: &World, g: &Graph, advisor: Advisor, host: Host, strict: bool) -> Wal
         clock: Clock::start(),
     };
     let clock = lane.clock;
+    // The projections asked: every one, or those an edge taken leaves.
+    let mut asked = vec![part.states; g.shown.len()];
+    for (from, edge) in &g.edges {
+        asked[*from] |= (part.edges)(edge.action);
+    }
     let at_state = pooled(g.shown.len(), |k| {
-        Some(lane.at_state(shown_state(&g.shown[k])))
+        Some(asked[k].then(|| lane.at_state(&g.shown[k])))
     });
     // What a strict walk tries around a state, met after the model's answer
     // to the state has been judged.
-    let around = if strict {
+    let around = if strict && part.states {
         pooled(g.shown.len(), |k| {
-            at_state[k].done().map(|here| lane.around(here))
+            at_state[k]
+                .done()
+                .map(|here| here.as_ref().map(|here| lane.around(here)))
         })
     } else {
         Vec::new()
     };
     let at_edge = pooled(g.edges.len(), |e| {
         let (from, edge) = &g.edges[e];
-        at_state[*from].done().map(|here| lane.at_edge(here, edge))
+        if !(part.edges)(edge.action) {
+            return Some(None);
+        }
+        at_state[*from]
+            .done()
+            .map(|here| here.as_ref().map(|here| lane.at_edge(here, edge)))
     });
     let mut out = Walk::default();
     for node in &g.nodes {
         let st = &node.st;
+        if !part.states {
+            for &(action, e) in &node.steps {
+                *out.fired.entry(action).or_default() += 1;
+                if let Some(found) = at_edge[e].get() {
+                    out.add(found, strict, st);
+                }
+            }
+            continue;
+        }
         // The model's own laws are read at every model state, whatever the
         // real code was shown of it.
         if strict && let Some(law) = node.broken {
             panic!("{law} at {st:?}");
         }
-        let here = at_state[node.projection].get();
+        let here = at_state[node.projection]
+            .get()
+            .as_ref()
+            .expect("every projection is asked");
         out.add(&here.found, strict, st);
         // Each session's own point, as the model has it there: what the real
         // advice is.
@@ -2943,11 +3121,14 @@ fn walk(w: &World, g: &Graph, advisor: Advisor, host: Host, strict: bool) -> Wal
             });
         }
         if strict {
-            out.add(around[node.projection].get(), strict, st);
+            let tried = around[node.projection].get();
+            out.add(tried.as_ref().expect("tried around"), strict, st);
         }
         for &(action, e) in &node.steps {
             *out.fired.entry(action).or_default() += 1;
-            out.add(at_edge[e].get(), strict, st);
+            if let Some(found) = at_edge[e].get() {
+                out.add(found, strict, st);
+            }
         }
     }
     out.states = g.reached;
@@ -2965,7 +3146,7 @@ fn tier1_the_real_advice_and_transactions_are_the_models_at_every_reachable_stat
         // The model's hour is the end of the real one: the rest of the real bound
         // is already spent when it opens.
         assert_eq!(spent_before(&w, m), w.bound() - cnst(m, "Budget"));
-        let walked = walk(&w, g, advise, Host::Roster, true);
+        let walked = walk(&w, g, advise, Host::Roster, true, Part::WHOLE);
         eprintln!(
             "account rotation Tier-1 ({reading}): {} states walked; the real decider asked \
              {} moves, {} waits, {} of today's acts and {} continuations at a notice the \
@@ -3055,7 +3236,14 @@ fn the_defects_and_todays_rule_disagree_with_the_real_code() {
             .unwrap_or_else(|payload| resume_unwind(payload));
         (buggy, sound)
     });
-    let walked = walk(&w, &buggy, advise, Host::Roster, false);
+    // Only the defects' steps, and the projections they leave, are asked of the
+    // real code: every other step and state is the committed model's (below),
+    // which the Tier-1 walk judges by the same world, advice and host.
+    let defects = Part {
+        states: false,
+        edges: |action| DEFECTS.contains(&action),
+    };
+    let walked = walk(&w, &buggy, advise, Host::Roster, false, defects);
     eprintln!(
         "account rotation Tier-1 (Buggy = 1): {} states walked, {} disagreements",
         walked.states,
@@ -3089,18 +3277,39 @@ fn the_defects_and_todays_rule_disagree_with_the_real_code() {
             assert_eq!(parted, fired, "{defect}: decided otherwise at every firing");
         }
     }
-    // …and nothing else parts: the sound steps of the same walk all agree.
-    let other = walked
-        .off
-        .iter()
-        .find(|off| !off.action.is_some_and(|action| DEFECTS.contains(&action)));
-    assert!(other.is_none(), "{other:?}");
+    // …and nothing else parts: the buggy model's graph with its defects' steps
+    // taken out is the committed model's, state for state and step for step,
+    // with the same answers at each, so its sound steps and states are the ones
+    // `tier1_the_real_advice_and_transactions_are_the_models_at_every_reachable_
+    // state` finds the real code agrees at (strictly, by label, with the real
+    // advice and the roster host, as here).
+    assert_eq!(
+        (buggy.nodes.len(), buggy.reached),
+        (sound.nodes.len(), sound.reached)
+    );
+    for (b, s) in buggy.nodes.iter().zip(&sound.nodes) {
+        assert!(
+            (&b.st, &b.held, &b.leaving, b.broken) == (&s.st, &s.held, &s.leaving, s.broken),
+            "the buggy model parts from the committed one at {:?}",
+            b.st
+        );
+        assert!(
+            sound_steps(&buggy, b).eq(sound_steps(sound, s)),
+            "the buggy model steps otherwise from {:?}",
+            b.st
+        );
+    }
 
     // Today's rule: a wall is waited out. At a wall with a usable account the model
     // moves the session and today's rule does not. Walked once for both: a wall
     // waited out in the place of `advise`, and a host that hands the real decider no
     // advice at all.
-    let today = walk(&w, sound, todays_rule, Host::NoRoster, false);
+    // Every projection is judged; of the edges, the windows' resets.
+    let resets = Part {
+        states: true,
+        edges: |action| action.starts_with("Reset"),
+    };
+    let today = walk(&w, sound, todays_rule, Host::NoRoster, false, resets);
     assert_eq!(today.states, walked.states);
     let parted = today
         .off
@@ -3173,8 +3382,10 @@ fn the_defects_and_todays_rule_disagree_with_the_real_code() {
         lifted.what.contains("decided: Waits") && lifted.what.contains("the model Resume"),
         "{lifted:?}"
     );
-    // It asks for no move anywhere, and no move of the model's is made.
-    assert_eq!((today.moves, today.made), (0, 0));
+    // It asks for no move anywhere, at a session's own point or at a plain turn
+    // end on a limited account, so no move of the model's is made on any edge
+    // (a move is made only where the decider asked the model's).
+    assert_eq!((today.moves, today.leaving_moves, today.made), (0, 0, 0));
     assert_eq!(today.waits + today.todays, 2 * today.states);
     assert_eq!(today.resumes, 0, "nor is a lifted notice continued");
     // And it sleeps through the reset of another account, which wakes the model's

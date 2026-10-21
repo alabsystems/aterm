@@ -31,8 +31,10 @@
 //!   `organizationType`, `userRateLimitTier`, `organizationRateLimitTier`,
 //!   `seatTier`, `billingType`, `subscriptionCreatedAt`,
 //!   `hasExtraUsageEnabled`, `planDisplayName`, `profileFetchedAt`. Never its
-//!   `emailAddress`, `displayName`, `fullName`, `organizationName` or
-//!   `organizationUuid`.
+//!   `displayName`, `fullName`, `organizationName` or `organizationUuid`,
+//!   and its `emailAddress` only in the in-memory login check [`answers_to`]
+//!   and the explicitly requested, volatile footer display [`subscription_for`].
+//!   The general [`Profile`] and account-stat records retain no email.
 //! * `cachedExtraUsageDisabledReason`: [`Credits`].
 //! * `cachedUsageUtilization`: `fetchedAtMs`, `accountUuid` (hashed, and the
 //!   body is dropped unless it names the profile's own account, as Claude
@@ -60,7 +62,9 @@
 //!
 //! What this module answers is a record (design §8.2): it reads and
 //! decides nothing, and nothing that decides — no supervisor, no rotation —
-//! reads it, but for TWO keys: the method `/login`'s picker is answered with
+//! reads it, but for THREE keys: whether a login signed in again in its tab
+//! is its roster row's own account ([`answers_to`], a yes or a no), the
+//! method `/login`'s picker is answered with
 //! ([`login_method`], a plan word and nothing else), and under `[harness]
 //! usage_credits = false` which models it bills to usage credits
 //! ([`FablePlan`], [`Profile::consented`], [`Profile::credits_only`]): such a
@@ -671,7 +675,8 @@ pub struct Context {
     pub records: PathBuf,
     /// The filename choice from its own captured exec environment.
     pub selection: Selection,
-    /// The captured HOME (unset/empty remain distinct).
+    /// The captured HOME, USERPROFILE on Windows ([`super::accounts::HOMEDIR_ENV`];
+    /// unset/empty remain distinct).
     pub home: Option<String>,
     /// The captured CLAUDE_CONFIG_DIR (unset/empty remain distinct).
     pub config: Option<String>,
@@ -705,7 +710,7 @@ impl Context {
     pub(super) fn of_exec_env(user_home: &Path, records: &Path, env: &[String]) -> Option<Self> {
         let vars = HomeVars {
             config: exec_var(env, super::accounts::HOME_ENV)?,
-            home: exec_var(env, "HOME")?,
+            home: exec_var(env, super::accounts::HOMEDIR_ENV)?,
         };
         let selection = Selection::of_exec_env(env);
         if selection == Selection::Unknown {
@@ -739,7 +744,7 @@ impl Context {
         let mut values = Vec::new();
         let mut unset = Vec::new();
         for (name, captured) in [
-            ("HOME", self.home.as_deref()),
+            (super::accounts::HOMEDIR_ENV, self.home.as_deref()),
             (super::accounts::HOME_ENV, self.config.as_deref()),
             (super::accounts::LOGIN_ENV, self.login.as_deref()),
         ] {
@@ -754,7 +759,7 @@ impl Context {
             }
         }
         if required.iter().any(|(name, _)| {
-            !matches!(*name, "HOME")
+            *name != super::accounts::HOMEDIR_ENV
                 && *name != super::accounts::HOME_ENV
                 && *name != super::accounts::LOGIN_ENV
         }) {
@@ -769,7 +774,7 @@ impl Context {
             .collect();
         let vars = HomeVars {
             config: exec_var(&env, super::accounts::HOME_ENV)?,
-            home: exec_var(&env, "HOME")?,
+            home: exec_var(&env, super::accounts::HOMEDIR_ENV)?,
         };
         let records = Records::at(user_home, vars, || {
             Path::new(cwd).is_absolute().then(|| PathBuf::from(cwd))
@@ -871,6 +876,16 @@ pub fn login_method(
     if renewable {
         return Some(aterm_phase::LoginMethod::Subscription);
     }
+    let path = effective_of(env, user_home)?;
+    let plan = read(&path).ok()?.plan.word?;
+    (plan != PlanWord::Other).then_some(aterm_phase::LoginMethod::Subscription)
+}
+
+/// The profile Claude Code reads for the home a process's exec environment
+/// `env` names ([`effective`] over [`path_of`]'s home), for a user whose
+/// home is `user_home`; `None` where the records cannot be named (a
+/// relative or empty config directory with no working directory).
+fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     let var = |name: &str| {
         env.iter()
             .filter_map(|kv| kv.split_once('='))
@@ -881,18 +896,159 @@ pub fn login_method(
         user_home,
         HomeVars {
             config: var(super::accounts::HOME_ENV),
-            home: var("HOME"),
+            home: var(super::accounts::HOMEDIR_ENV),
         },
         || None,
     );
     let plain = records.profile(user_home)?;
-    let path = effective(
+    Some(effective(
         &plain,
         Some(records.dir()?),
         custom_oauth(var("CLAUDE_CODE_CUSTOM_OAUTH_URL").map(std::ffi::OsStr::new)),
+    ))
+}
+
+/// WHETHER THE LOGIN A CLAUDE CODE PROCESS'S HOME HOLDS ANSWERS TO `email`,
+/// a roster row's address ([`super::accounts::email_matches`]): the identity
+/// check of a login signed in again in its tab, as a renewal's check is of
+/// its staging login — so a row is restored only for its own account
+/// (`accounts::note_signed_back`; the review's acct-6). `env` is the
+/// process's own exec environment, `user_home` the user's home; the profile
+/// is the one [`effective`] selects. This login check reads
+/// `oauthAccount.emailAddress` by a reader of that key alone:
+/// compared in memory and its bytes zeroed, never returned, kept, logged or
+/// printed. `None`: no profile read, or none that names an address.
+#[must_use]
+pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool> {
+    let path = effective_of(env, user_home)?;
+    read_with(&path, |bytes| {
+        let Obj(raw) =
+            aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        let Some(Address(Some(address))) = raw.and_then(|who| who.oauth.0).map(|o| o.address)
+        else {
+            return Ok(None);
+        };
+        let answers = super::accounts::email_matches(email, &address);
+        let mut kept = address.into_bytes();
+        wipe(&mut kept);
+        Ok(Some(answers))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Facts for the requested on-screen account/subscription display. These are volatile
+/// presentation values, never account-stat records, settings or authentication material.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SubscriptionDisplay {
+    /// The email the selected profile actually names; never a configured roster guess.
+    pub email: Option<String>,
+    /// The selected account's subscription plan.
+    pub plan: Option<String>,
+    /// Its weekly quota, only while the selected account's cached sample is current.
+    pub weekly: Option<String>,
+}
+
+/// Read the on-screen subscription facts from this process's selected profile. The
+/// address, plan and account-validated usage come from the same bounded file read.
+/// An environment credential route, unknown selector or unreadable profile answers nothing;
+/// callers replace their previous display rather than retaining another account's facts.
+/// The caller must also verify the process's settings and provider/profile-store sources
+/// leave its stored login selected; this reader inspects the captured environment only.
+/// Named secure-storage logins share their home's profile: its email must match the
+/// roster binding for this exact login. The default login needs the same check when
+/// its home lists several logins. A roster email gates the read, never supplies text.
+/// `Some(empty)` means no logins are configured; `None` means the roster is unknown,
+/// so the default shared home cannot establish which login the profile describes.
+#[must_use]
+pub fn subscription_for(
+    env: &[String],
+    user_home: &Path,
+    records: &Path,
+    roster: Option<&super::accounts::Roster>,
+    now: i64,
+) -> Option<SubscriptionDisplay> {
+    let who = super::accounts::ProcessLogin::of_exec_env(env)?;
+    if !who.stored_login {
+        return None;
+    }
+    let context = Context::of_exec_env(user_home, records, env)?;
+    let file = effective(
+        &context.plain,
+        Some(&context.records),
+        context.selection == Selection::CustomOauth,
     );
-    let plan = read(&path).ok()?.plan.word?;
-    (plan != PlanWord::Other).then_some(aterm_phase::LoginMethod::Subscription)
+    let display = read_with(&file, |bytes| parse_subscription(bytes, now)).ok()?;
+    // CLAUDE_SECURESTORAGE_CONFIG_DIR changes the keychain item, not this file.
+    // A different login can overwrite the shared profile while this tab stays open.
+    let selected = (who.default_home || who.login.is_some())
+        .then(|| {
+            roster.and_then(|listed| {
+                listed
+                    .row_for_login(who.login.as_deref())
+                    .or_else(|| listed.row_left(who.login.as_deref()))
+            })
+        })
+        .flatten();
+    if let Some(expected) = selected.and_then(|row| row.email.as_deref()) {
+        if !display
+            .email
+            .as_deref()
+            .is_some_and(|email| super::accounts::email_matches(expected, email))
+        {
+            return None;
+        }
+    } else if who.login.is_some()
+        || (who.default_home && roster.is_none())
+        || (who.default_home && roster.is_some_and(super::accounts::Roster::several))
+    {
+        return None;
+    }
+    Some(display)
+}
+
+fn parse_subscription(bytes: &[u8], now: i64) -> Result<SubscriptionDisplay, NoProfile> {
+    let profile = parse(bytes)?;
+    // This second typed allowlist reads only the address. The general Profile stays
+    // unchanged, and unrelated values (including credential strings) remain skipped.
+    let Obj(raw) =
+        aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+    let email = raw
+        .and_then(|who| who.oauth.0)
+        .and_then(|oauth| oauth.address.0)
+        .filter(|email| super::accounts::email_refusal(email).is_none());
+    // The underlying parser discards cached usage with a different accountUuid.
+    // Expired windows and a cache older than fifteen minutes cannot say what remains.
+    let weekly = profile.usage.as_ref().and_then(|usage| {
+        let observed = usage.fetched_at_ms.checked_div(1000)?;
+        if observed > now || now.saturating_sub(observed) > 15 * 60 {
+            return None;
+        }
+        let window = usage
+            .windows
+            .iter()
+            .find(|row| row.bucket == Bucket::SevenDay)?;
+        if window.resets_at.is_none_or(|reset| reset <= now) {
+            return None;
+        }
+        let left = 1000_u16.saturating_sub(window.used_pct_x10?);
+        Some(if left.is_multiple_of(10) {
+            format!("weekly {}% left", left / 10)
+        } else {
+            format!("weekly {}.{}% left", left / 10, left % 10)
+        })
+    });
+    let plan = profile
+        .plan
+        .display
+        .as_ref()
+        .map(|name| name.as_str().to_owned())
+        .or_else(|| profile.plan.title());
+    Ok(SubscriptionDisplay {
+        email,
+        plan,
+        weekly,
+    })
 }
 
 /// READ THE PROFILE AT `path` ([`parse`]). Opened without blocking (a FIFO
@@ -904,6 +1060,15 @@ pub fn login_method(
 ///
 /// [`NoProfile`]: why nothing was read.
 pub fn read(path: &Path) -> Result<Profile, NoProfile> {
+    read_with(path, parse)
+}
+
+/// [`read`]'s file handling, its bytes handed to `parse` before they are
+/// zeroed.
+fn read_with<T>(
+    path: &Path,
+    parse: impl FnOnce(&[u8]) -> Result<T, NoProfile>,
+) -> Result<T, NoProfile> {
     let mut file = match open_nonblocking(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(NoProfile::Missing),
@@ -1431,6 +1596,65 @@ macro_rules! lenient_scalars {
             Ok($none)
         }
     };
+}
+
+/// The email-only allowlist shared by the login check and volatile footer display.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawWho {
+    #[serde(rename = "oauthAccount")]
+    oauth: Obj<RawAddress>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawAddress {
+    #[serde(rename = "emailAddress")]
+    address: Address,
+}
+
+/// An address: a string, else nothing (any other value read past, unkept).
+#[derive(Default)]
+struct Address(Option<String>);
+
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Address;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Address, E> {
+                Ok(Address(Some(s.to_owned())))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Address, E> {
+                Ok(Address(None))
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Address, E> {
+                Ok(Address(None))
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Address, E> {
+                Ok(Address(None))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Address, E> {
+                Ok(Address(None))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Address, E> {
+                Ok(Address(None))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Address, E> {
+                Ok(Address(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Address, A::Error> {
+                drain_map(map).map(|()| Address(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Address, A::Error> {
+                drain_seq(seq).map(|()| Address(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// AN OBJECT OF THE ALLOWLIST: `T` where the value is an object, `None`

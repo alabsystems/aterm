@@ -23,7 +23,7 @@ fn events_text(plant: bool) -> String {
     let mut out = String::new();
     for (name, wm) in [("none", None), ("6", Some(6))] {
         let mut frames = String::new();
-        let high = drain_timeline_events(&h.ctx.timeline, "5", wm, true, &mut frames);
+        let high = drain_timeline_events(&h.ctx.timeline.lock().unwrap(), "5", wm, &mut frames);
         out.push_str(&format!("> watermark={name} -> {high:?}\n{frames}"));
     }
     // A watcher fallen behind the ring: TIMELINE_CAP rows the digest skips,
@@ -73,7 +73,7 @@ fn events_text(plant: bool) -> String {
     assert_eq!(reply, "OK 1\n", "the delivery");
     let behind = &b.ctx.timeline;
     let mut frames = String::new();
-    let high = drain_timeline_events(behind, "6", Some(1), true, &mut frames);
+    let high = drain_timeline_events(&behind.lock().unwrap(), "6", Some(1), &mut frames);
     out.push_str(&format!(
         "> watermark=1 (below the low) -> {high:?}\n{frames}"
     ));

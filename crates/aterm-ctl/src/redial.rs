@@ -61,16 +61,18 @@ pub(crate) enum Follow {
     /// A socket path the call pinned (`--sock`): a successor rebinds that
     /// same path.
     Path(String),
-    /// Flagless: inside a session, the instance hosting it (its graph entry,
-    /// `<dir>/graph/<sid>`) and nothing else; outside any session, the
+    /// Nothing pinned: with a session to follow, the instance hosting it (its
+    /// graph entry, `<dir>/graph/<sid>`) and nothing else; with none, the
     /// `latest` alias `<dir>/aterm.sock`. A successor republishes both and
     /// binds a new per-instance socket (`aterm-<its pid>.sock`), so the socket
     /// dialled never answers again.
     Flagless {
         /// The rendezvous dir the call resolved against.
         dir: PathBuf,
-        /// `$ATERM_PARENT_SESSION_ID`: the session hosting the caller.
-        self_sid: Option<String>,
+        /// The session whose host the call reached: the one its request names
+        /// when that instance was dialled directly, else the caller's own
+        /// (`$ATERM_PARENT_SESSION_ID`).
+        sid: Option<String>,
     },
     /// Behind a forward: the server this call dialled only relayed the request
     /// to the aterm hosting its session, and that host went away under it
@@ -101,9 +103,6 @@ pub(crate) enum Unfollowed {
     PidPin(u32),
     /// The redialled leg of a blocking read: this was already the one retry.
     AskedOnce,
-    /// No rendezvous dir (`$HOME` and `$XDG_RUNTIME_DIR` unset): nowhere to
-    /// look for a successor.
-    NoRendezvousDir,
 }
 
 /// The redial policy of one call.
@@ -253,23 +252,21 @@ impl Redial {
     }
 
     /// Every path a successor of the server reached at `dialed` may answer on,
-    /// in order, resolved now. A call made inside a session follows only that
-    /// session's graph entry: the dialled path and the alias can name another
-    /// live window, and only the entry is republished by the hosting
-    /// instance's successor.
+    /// in order, resolved now. A call that reached a session's host follows
+    /// only that session's graph entry: the dialled path and the alias can name
+    /// another live window, and only the entry is republished by the hosting
+    /// instance's successor. Nothing is dialled here; the wait's own probe
+    /// asks each candidate.
     fn candidates(&self, dialed: &str) -> Vec<String> {
         match &self.follow {
             Follow::Path(path) => vec![dialed.to_string(), path.clone()],
             Follow::Flagless {
                 dir,
-                self_sid: Some(sid),
+                sid: Some(sid),
             } => super::self_instance_sock_in(dir, Some(sid))
                 .into_iter()
                 .collect(),
-            Follow::Flagless {
-                dir,
-                self_sid: None,
-            } => vec![
+            Follow::Flagless { dir, sid: None } => vec![
                 dialed.to_string(),
                 dir.join(super::SOCK_FILE).to_string_lossy().into_owned(),
             ],
@@ -491,20 +488,27 @@ fn is_the_same_server(pid: u32, path: &str, old: u32, listener: Option<ListenerI
     pid == old && aterm_uds::listener::still_names(path, listener)
 }
 
-/// The one session a request names by id (`@s-<hex>`): the first word of a
-/// verb's request, the second of a `subscribe` — the only shapes a server
-/// forwards to the aterm hosting the session, so the one whose host a hang-up
-/// behind a forward follows ([`Follow::Host`]). `None` for anything else:
-/// self, a local number, `@*`, a list.
-pub(crate) fn target_sid<S: AsRef<str>>(request_parts: &[S]) -> Option<&str> {
-    let selector = match request_parts {
-        [verb, selector, ..] if verb.as_ref() == "subscribe" => selector.as_ref(),
-        [selector, ..] => selector.as_ref(),
-        [] => return None,
-    };
-    let sid = selector.strip_prefix('@')?;
-    let hex = sid.strip_prefix("s-")?;
-    (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sid)
+/// The one session the request `line` names by id, read by the wire's one
+/// grammar ([`aterm_types::control_request::head`]): a leading `@s-<hex>`, or
+/// the single `@s-<hex>` a selectorless `subscribe` names second
+/// ([`aterm_types::control_request::subscribe_target`]) — the shapes a server
+/// relays to the aterm hosting the session. So it is the instance this client
+/// dials for the request ([`super::targets`]) and the one whose host a hang-up
+/// behind a forward follows ([`Follow::Host`]); and the connection a
+/// persistent client (aterm-agent's `RelayCtl`) sends it on. `None` for
+/// anything else: self, a local number, `@*`, a list. A trailing line end is
+/// no part of it.
+#[must_use]
+pub fn target_sid(line: &str) -> Option<aterm_types::control_request::Sid<'_>> {
+    use aterm_types::control_request::{self, Selector};
+    let head = control_request::head(line.trim_end_matches(['\r', '\n']));
+    match head.selector {
+        Some(Selector::Sid(sid)) => Some(sid),
+        None if head.verb == "subscribe" => {
+            control_request::subscribe_target(head.rest).map(|(sid, _)| sid)
+        }
+        _ => None,
+    }
 }
 
 /// A moment as this machine's clocks read it: what a hang-up and a
@@ -604,7 +608,8 @@ pub(crate) fn is_hangup(e: &io::Error) -> bool {
 /// * `await seq <n>`, `await inbox since=<id>`, `await agent … since=<rev>`,
 ///   `inbox get <id>` and `inbox since=<id>`: a successor restarts grid
 ///   counters and agent verdict revs, and numbers the rows it re-delivers
-///   afresh;
+///   afresh; `await edit ticket=<t>`: a successor knows no ticket the old
+///   process minted (`await edit uri=` is retried: it waits on the file);
 /// * waits anchored at the moment they were armed (`await block`, a bare
 ///   `await seq`, `await consent`, an `await log` with no `since=` other than
 ///   the latching `need`): what they wait for may be what a parked producer
@@ -632,6 +637,7 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
         Some("await") => match args.first() {
             Some(&("seq" | "block" | "consent")) => false,
             Some(&("inbox" | "agent")) => !args.iter().any(|a| a.starts_with("since=")),
+            Some(&"edit") => !args.iter().any(|a| a.starts_with("ticket=")),
             Some(&"log") => log_wait_resumes(&args),
             Some(_) => true,
             None => false,
@@ -685,6 +691,10 @@ pub(crate) fn old_process_anchor(request_parts: &[String]) -> Option<String> {
             Some(&("inbox" | "agent")) => args
                 .iter()
                 .find(|a| a.starts_with("since="))
+                .map(|a| (*a).to_string()),
+            Some(&"edit") => args
+                .iter()
+                .find(|a| a.starts_with("ticket="))
                 .map(|a| (*a).to_string()),
             _ => None,
         },
@@ -770,6 +780,12 @@ pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
             "`await block` and `await consent` wait for a change after they were armed, and it \
              may have happened during the update — read the session (`status`, `text`) before \
              waiting again"
+                .to_owned()
+        }
+        // An edit's ticket: the successor waits on the file's views instead.
+        _ if old_process_anchor(request_parts).is_some_and(|a| a.starts_with("ticket=")) => {
+            "an edit's `ticket=` names a ticket of the old process — wait again by the file: \
+             `await edit uri=<file-uri>`"
                 .to_owned()
         }
         // The anchor itself, when the request names one ([`old_process_anchor`]);
@@ -1704,8 +1720,7 @@ pub(crate) fn relay_subscription(
         // follows that host's successor, not the relay.
         let hangup = match tracker.take_host_gone() {
             Some((pid, sock)) => {
-                let parts: Vec<&str> = request.split_whitespace().collect();
-                redial = redial.host(&sock, target_sid(&parts));
+                redial = redial.host(&sock, target_sid(&request).map(|sid| sid.as_str()));
                 server = Some(pid);
                 listener = None;
                 dialed = sock;
@@ -1893,10 +1908,6 @@ pub(crate) fn gone_note(
         }
         Some(Unfollowed::PidPin(_)) => "; a --pid call follows no other instance".to_owned(),
         Some(Unfollowed::AskedOnce) => "; this was already the one retry".to_owned(),
-        Some(Unfollowed::NoRendezvousDir) => {
-            "; with $HOME and $XDG_RUNTIME_DIR unset there is nowhere to find a successor"
-                .to_owned()
-        }
         None => format!(" and nothing replaced it within {within}"),
     };
     format!(

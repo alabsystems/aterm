@@ -14,9 +14,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod complete_input;
+mod read_owned_file;
 mod relay;
+mod rename_noreplace;
 mod scratch;
 mod screen_lock;
+mod scroll_direction;
 mod secret;
 mod staged_child;
 mod stops;
@@ -336,6 +340,26 @@ pub trait Relaying {
 
 /// The operating system, as items see it.
 pub trait System: Sync {
+    /// Natural scrolling through the same native getter used by System Settings.
+    /// Apple's getter synchronizes and reads preferences; it does not independently
+    /// query WindowServer's active input state. No preference write or UI prompt.
+    ///
+    /// # Errors
+    /// The native framework or getter is unavailable, or returned an unknown value.
+    fn natural_scrolling(&self) -> Result<bool, String> {
+        Err("native scroll direction is not implemented by this backend".into())
+    }
+
+    /// Apply Natural scrolling in this process's current macOS login session with
+    /// the native System Settings setter, including its normal change notification.
+    /// The caller also verifies the persistent global preference.
+    ///
+    /// # Errors
+    /// The native setter is unavailable or the native preference read-back does not match.
+    fn set_natural_scrolling(&self, _natural: bool) -> Result<(), String> {
+        Err("native scroll direction is not implemented by this backend".into())
+    }
+
     /// Allocate an exclusive owned directory. `None` selects the backend's temporary
     /// parent; `Some` keeps staging on the caller's filesystem. Prefer [`Scratch`]'s
     /// constructors; an implementation that cannot prove exclusive creation refuses.
@@ -361,6 +385,19 @@ pub trait System: Sync {
     fn run_complete_stdout(&self, _cmd: &Cmd) -> Result<Ran, RunFailed> {
         Err(RunFailed::Refused(
             "complete stdout is not implemented by this backend".into(),
+        ))
+    }
+
+    /// Send exactly `input` through a private stdin pipe while capturing complete,
+    /// bounded stdout. Input is never a file, argument, environment variable or log
+    /// record. The concurrent writer shares the child's deadline and is joined before
+    /// return, including when spawn or capture fails. `cmd.stdin` must be absent.
+    ///
+    /// # Errors
+    /// Unsupported backend, incomplete input, timeout or unproven stdout capture.
+    fn run_complete_stdout_input(&self, _cmd: &Cmd, _input: &[u8]) -> Result<Ran, RunFailed> {
+        Err(RunFailed::Refused(
+            "complete stdout with piped input is not implemented by this backend".into(),
         ))
     }
 
@@ -402,6 +439,25 @@ pub trait System: Sync {
     /// The underlying I/O error.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
 
+    /// Read one bounded regular file through the descriptor whose metadata was
+    /// admitted. The final path must not be a link; ownership must match `uid`,
+    /// set-id/group/other write bits are refused, and `private` also refuses every
+    /// group/other permission. File contents never belong in admission errors.
+    ///
+    /// # Errors
+    /// Unavailable safe reads, unsafe metadata, an I/O failure, or more than `max`
+    /// bytes. A backend without this operation refuses rather than using read_file.
+    fn read_owned_file(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<Vec<u8>> {
+        let _ = (path, uid, max, private);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Write `bytes` to `path` atomically (a sibling temporary, then a rename), with
     /// `mode`, as this process's own user. Never follows a link at `path`.
     ///
@@ -416,6 +472,15 @@ pub trait System: Sync {
     /// # Errors
     /// The underlying I/O error, or a refusal as [`io::ErrorKind::PermissionDenied`].
     fn write_user_file(&self, user: &User, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>;
+
+    /// Make directory-entry changes in `path` durable before later writes.
+    ///
+    /// # Errors
+    /// The directory cannot be opened or flushed. An unsupported backend refuses.
+    fn durable_dir(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
     /// Remove `path` (a file or an empty directory); absent is success.
     ///
@@ -480,6 +545,19 @@ pub trait System: Sync {
     /// # Errors
     /// The underlying I/O error.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Atomically rename `from` to an absent `to`. Any existing destination,
+    /// including an empty directory or a dangling link, is preserved.
+    /// Backends must provide an exclusive OS primitive, never a prior existence
+    /// check followed by an ordinary rename.
+    ///
+    /// # Errors
+    /// The underlying I/O error, [`io::ErrorKind::AlreadyExists`] on collision,
+    /// or [`io::ErrorKind::Unsupported`] when atomic exclusion is unavailable.
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let _ = (from, to);
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
     /// This process's effective uid.
     fn euid(&self) -> u32;
@@ -659,17 +737,23 @@ impl Live {
     /// The argv `cmd` really runs: wrapped in `sudo -u … env -i …` and `launchctl asuser`
     /// as asked (design §3.5).
     fn argv(&self, cmd: &Cmd) -> Result<(PathBuf, Vec<OsString>), RunFailed> {
+        Self::argv_from(self.euid(), cmd)
+    }
+
+    /// [`Live::argv`] for a process whose effective uid is `euid`: a function of the
+    /// two alone, so both the root wrapping and the refusal without root are checked
+    /// on whatever account runs the tests.
+    fn argv_from(euid: u32, cmd: &Cmd) -> Result<(PathBuf, Vec<OsString>), RunFailed> {
         let Some(user) = &cmd.user else {
             return Ok((cmd.program.clone(), cmd.args.clone()));
         };
-        if self.euid() != 0 {
-            if self.euid() == user.uid {
+        if euid != 0 {
+            if euid == user.uid {
                 return Ok((cmd.program.clone(), cmd.args.clone()));
             }
             return Err(RunFailed::Refused(format!(
-                "running as {} needs root (this is uid {})",
+                "running as {} needs root (this is uid {euid})",
                 user.name,
-                self.euid()
             )));
         }
         let mut args: Vec<OsString> = Vec::new();
@@ -872,6 +956,14 @@ impl Default for Live {
 }
 
 impl System for Live {
+    fn natural_scrolling(&self) -> Result<bool, String> {
+        scroll_direction::get()
+    }
+
+    fn set_natural_scrolling(&self, natural: bool) -> Result<(), String> {
+        scroll_direction::set(natural)
+    }
+
     fn scratch_dir(&self, parent: Option<&Path>, label: &str) -> io::Result<Scratch<'_>> {
         Scratch::live(parent, label)
     }
@@ -958,6 +1050,10 @@ impl System for Live {
         })
     }
 
+    fn run_complete_stdout_input(&self, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed> {
+        complete_input::run(self, cmd, input)
+    }
+
     fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
         if !cmd.program.is_absolute() {
             return Err(RunFailed::Refused(format!(
@@ -1025,6 +1121,16 @@ impl System for Live {
         std::fs::read(path)
     }
 
+    fn read_owned_file(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<Vec<u8>> {
+        read_owned_file::read(path, uid, max, private)
+    }
+
     fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         write_atomic(path, bytes, mode)
     }
@@ -1058,6 +1164,10 @@ impl System for Live {
                 ran.describe()
             )))
         }
+    }
+
+    fn durable_dir(&self, path: &Path) -> io::Result<()> {
+        aterm_durable::durable_dir(path)
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
@@ -1177,6 +1287,10 @@ impl System for Live {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        rename_noreplace::rename(from, to)
     }
 
     fn euid(&self) -> u32 {
@@ -1412,6 +1526,9 @@ pub fn staging_file<'s>(sys: &'s dyn System, bytes: &[u8]) -> io::Result<Staged<
 
 /// Write `bytes` to `path` through a sibling temporary and a rename, with `mode`. A link
 /// at `path` is replaced, never followed; a link at the temporary's name fails the open.
+/// Flush the payload before rename and the destination directory after it. Callers
+/// that create ancestors must also publish those directory entries before relying on
+/// the new name surviving a power interruption. A flush error can leave `path` replaced.
 ///
 /// # Errors
 /// The underlying I/O error.
@@ -1439,7 +1556,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     f.set_permissions(std::fs::Permissions::from_mode(mode))?;
     aterm_durable::durable(&f)?;
     drop(f);
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    aterm_durable::durable_dir(parent)
 }
 
 #[cfg(test)]
@@ -1461,6 +1579,9 @@ mod fake {
     /// reply fails as [`RunFailed::Spawn`], so a test notices a command it did not expect.
     #[derive(Default)]
     pub struct Fake {
+        scroll_natural: Mutex<Option<bool>>,
+        scroll_set_error: Mutex<Option<String>>,
+        scroll_set_readback: Mutex<Option<bool>>,
         replies: Mutex<BTreeMap<String, Vec<Ran>>>,
         outputs: Mutex<BTreeMap<String, Vec<Output>>>,
         strict_refusals: Mutex<BTreeMap<String, String>>,
@@ -1474,6 +1595,7 @@ mod fake {
         files: Mutex<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
         stats: Mutex<BTreeMap<PathBuf, Stat>>,
         stat_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
+        directory_flush_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         links: Mutex<BTreeMap<PathBuf, PathBuf>>,
         alive: Mutex<Vec<u32>>,
         /// The effective uid the fake reports (0 = root, the agent's case).
@@ -1643,6 +1765,24 @@ mod fake {
     }
 
     impl Fake {
+        /// Script the native session's current scroll direction without touching HID.
+        pub fn scroll_state(&self, natural: bool) -> &Self {
+            *self.scroll_natural.lock().unwrap() = Some(natural);
+            self
+        }
+
+        /// Make the native setter refuse before changing the scripted state.
+        pub fn refuse_scroll_set(&self, why: &str) -> &Self {
+            *self.scroll_set_error.lock().unwrap() = Some(why.into());
+            self
+        }
+
+        /// The state a synthetic setter leaves, to exercise failed read-back.
+        pub fn scroll_readback_after_set(&self, natural: bool) -> &Self {
+            *self.scroll_set_readback.lock().unwrap() = Some(natural);
+            self
+        }
+
         /// A fake running as root at a fixed time.
         #[must_use]
         pub fn root() -> Self {
@@ -1778,6 +1918,17 @@ mod fake {
             self
         }
 
+        /// Refuse a directory flush without opening a host path; `None` permits it again.
+        pub fn durable_dir_fails(&self, path: &Path, kind: Option<io::ErrorKind>) -> &Self {
+            let mut errors = self.directory_flush_errors.lock().unwrap();
+            if let Some(kind) = kind {
+                errors.insert(path.to_owned(), kind);
+            } else {
+                errors.remove(path);
+            }
+            self
+        }
+
         /// What the commands scripted under `key` leave behind ([`Fake::on_write`],
         /// [`Fake::on_stat`]), once one of them ran.
         fn produce(&self, key: &str) {
@@ -1843,6 +1994,35 @@ mod fake {
     }
 
     impl System for Fake {
+        fn natural_scrolling(&self) -> Result<bool, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("scroll-direction get".into());
+            self.scroll_natural
+                .lock()
+                .unwrap()
+                .ok_or_else(|| "fake: native scroll direction was not scripted".into())
+        }
+
+        fn set_natural_scrolling(&self, natural: bool) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("scroll-direction set {natural}"));
+            if let Some(why) = self.scroll_set_error.lock().unwrap().clone() {
+                return Err(why);
+            }
+            let readback = self.scroll_set_readback.lock().unwrap().unwrap_or(natural);
+            *self.scroll_natural.lock().unwrap() = Some(readback);
+            if readback != natural {
+                return Err(
+                    "native scroll direction did not match after applying the setting".into(),
+                );
+            }
+            Ok(())
+        }
+
         fn scratch_dir(&self, parent: Option<&Path>, label: &str) -> io::Result<Scratch<'_>> {
             prefix(label)?;
             let mut sequence = self.scratch_sequence.lock().unwrap();
@@ -1929,6 +2109,13 @@ mod fake {
             Ok(reply)
         }
 
+        fn run_complete_stdout_input(&self, cmd: &Cmd, _input: &[u8]) -> Result<Ran, RunFailed> {
+            super::complete_input::admit(cmd)?;
+            // No input copy is retained, even by the injected backend. The ordinary
+            // command key scripts the complete reply; calls records only that key.
+            self.run_complete_stdout(cmd)
+        }
+
         fn run_fed(&self, cmd: &Cmd, input: &Secret) -> Result<Ran, RunFailed> {
             let key = format!("fed {}", cmd.display());
             self.calls.lock().unwrap().push(key.clone());
@@ -1990,6 +2177,35 @@ mod fake {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
         }
 
+        fn read_owned_file(
+            &self,
+            path: &Path,
+            uid: u32,
+            max: usize,
+            private: bool,
+        ) -> io::Result<Vec<u8>> {
+            if path.as_os_str().as_encoded_bytes().contains(&0) || max.checked_add(1).is_none() {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let stat = self.stat(path)?;
+            super::read_owned_file::admit(
+                stat.uid,
+                uid,
+                stat.mode,
+                !stat.dir && !stat.symlink,
+                private,
+            )?;
+            if stat.len > max as u64 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let files = self.files.lock().unwrap();
+            let (bytes, _) = files.get(path).ok_or(io::ErrorKind::NotFound)?;
+            if bytes.len() > max {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            Ok(bytes.clone())
+        }
+
         fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
             self.calls
                 .lock()
@@ -2021,7 +2237,29 @@ mod fake {
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), (bytes.to_vec(), mode));
+            self.stats.lock().unwrap().insert(
+                path.to_path_buf(),
+                Stat {
+                    uid: user.uid,
+                    gid: user.gid,
+                    mode,
+                    dir: false,
+                    symlink: false,
+                    len: bytes.len() as u64,
+                },
+            );
             Ok(())
+        }
+
+        fn durable_dir(&self, path: &Path) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("durable-dir {}", path.display()));
+            match self.directory_flush_errors.lock().unwrap().get(path) {
+                Some(kind) => Err(io::Error::from(*kind)),
+                None => Ok(()),
+            }
         }
 
         fn remove(&self, path: &Path) -> io::Result<()> {
@@ -2031,6 +2269,7 @@ mod fake {
                 .push(format!("remove {}", path.display()));
             self.files.lock().unwrap().remove(path);
             self.links.lock().unwrap().remove(path);
+            self.stats.lock().unwrap().remove(path);
             Ok(())
         }
 
@@ -2039,6 +2278,33 @@ mod fake {
                 .lock()
                 .unwrap()
                 .push(format!("mkdir {} {mode:o}", path.display()));
+            let parents: Vec<_> = path.ancestors().collect();
+            let mut gid = 0;
+            for parent in parents
+                .into_iter()
+                .rev()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                match self.stat(parent) {
+                    Ok(stat) if stat.dir && !stat.symlink => gid = stat.gid,
+                    Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        let root = parent.is_absolute() && parent.parent().is_none();
+                        self.stats.lock().unwrap().insert(
+                            parent.to_path_buf(),
+                            Stat {
+                                uid: if root { 0 } else { self.euid },
+                                gid,
+                                mode: if root { 0o755 } else { mode },
+                                dir: true,
+                                symlink: false,
+                                len: 0,
+                            },
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             Ok(())
         }
 
@@ -2153,6 +2419,58 @@ mod fake {
                     files.insert(to.join(rest), v);
                 }
             }
+            Ok(())
+        }
+
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "rename-noreplace {} {}",
+                from.display(),
+                to.display(),
+            ));
+            if [from, to]
+                .iter()
+                .any(|p| p.as_os_str().as_encoded_bytes().contains(&0))
+            {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            // Hold all modeled filesystem maps across both admission and movement.
+            // A competing exclusive publisher cannot observe a check/move gap.
+            let mut files = self.files.lock().unwrap();
+            let mut stats = self.stats.lock().unwrap();
+            let mut links = self.links.lock().unwrap();
+            if files
+                .keys()
+                .chain(stats.keys())
+                .chain(links.keys())
+                .any(|p| p.starts_with(to))
+            {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            if !files.contains_key(from) && !stats.contains_key(from) && !links.contains_key(from) {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            if to.starts_with(from) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            fn move_tree<V>(map: &mut BTreeMap<PathBuf, V>, from: &Path, to: &Path) {
+                let paths: Vec<_> = map
+                    .keys()
+                    .filter(|p| p.starts_with(from))
+                    .cloned()
+                    .collect();
+                for path in paths {
+                    if let Some(value) = map.remove(&path) {
+                        let relative = path
+                            .strip_prefix(from)
+                            .expect("the selected path is under from");
+                        map.insert(to.join(relative), value);
+                    }
+                }
+            }
+            move_tree(&mut files, from, to);
+            move_tree(&mut stats, from, to);
+            move_tree(&mut links, from, to);
             Ok(())
         }
 
@@ -2394,6 +2712,64 @@ mod tests {
     }
 
     #[test]
+    fn fake_recursive_creation_recreates_removed_directories_and_preserves_user_ownership() {
+        let who = alice();
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        let home = Path::new(&who.home);
+        let home_stat = Stat {
+            uid: who.uid,
+            gid: who.gid,
+            mode: 0o755,
+            dir: true,
+            symlink: false,
+            len: 0,
+        };
+        sys.stat_of(home.to_str().unwrap(), home_stat);
+        let state = home.join("Library/Application Support/aterm/init-activation");
+        sys.create_dir_all(&state, 0o700).unwrap();
+        assert_eq!(
+            sys.stat(home).unwrap(),
+            home_stat,
+            "mkdir must preserve existing directory metadata"
+        );
+        let directory = sys.stat(&state).unwrap();
+        assert!(directory.dir && !directory.symlink);
+        assert_eq!(
+            (directory.uid, directory.gid, directory.mode),
+            (who.uid, who.gid, 0o700)
+        );
+        sys.remove(&state).unwrap();
+        assert_eq!(
+            sys.stat(&state).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        sys.create_dir_all(&state, 0o700).unwrap();
+        assert_eq!(sys.stat(&state).unwrap(), directory);
+        let marker = state.join("dock.pending");
+        sys.write_user_file(&who, &marker, b"pending", 0o600)
+            .unwrap();
+        let stat = sys.stat(&marker).unwrap();
+        assert_eq!(
+            (stat.uid, stat.gid, stat.mode, stat.len),
+            (who.uid, who.gid, 0o600, 7)
+        );
+        sys.remove(&marker).unwrap();
+        assert_eq!(
+            sys.stat(&marker).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let conflict = home.join("conflict");
+        sys.file(
+            conflict.to_str().unwrap(),
+            b"a file cannot contain a child directory",
+        );
+        assert!(sys.create_dir_all(&conflict.join("child"), 0o700).is_err());
+        assert!(sys.stat(&conflict.join("child")).is_err());
+    }
+
+    #[test]
     fn display_names_the_user_and_quotes_each_word() {
         let cmd = Cmd::new("/usr/bin/defaults")
             .args([
@@ -2412,21 +2788,15 @@ mod tests {
 
     #[test]
     fn from_root_a_user_run_scrubs_the_environment_and_a_session_run_goes_through_launchctl() {
-        // Only the argv shape is checked here; nothing runs.
-        let live = Live {
-            agent_exe: PathBuf::from("/x"),
-        };
-        if live.euid() != 0 {
-            return; // The wrapping is root's; a non-root run checks the refusal below.
-        }
-        let (program, args) = live
-            .argv(
-                &Cmd::new("/usr/bin/open")
-                    .arg("u")
-                    .as_user(&alice())
-                    .in_session(),
-            )
-            .unwrap();
+        // Only the argv shape is checked here, for a root euid on any account; nothing runs.
+        let (program, args) = Live::argv_from(
+            0,
+            &Cmd::new("/usr/bin/open")
+                .arg("u")
+                .as_user(&alice())
+                .in_session(),
+        )
+        .unwrap();
         assert_eq!(program, PathBuf::from("/bin/launchctl"));
         let args: Vec<String> = args
             .iter()
@@ -2459,25 +2829,33 @@ mod tests {
 
     #[test]
     fn without_root_a_run_as_another_user_is_refused_before_anything_starts() {
-        let live = Live {
-            agent_exe: PathBuf::from("/x"),
-        };
-        if live.euid() == 0 {
-            return;
-        }
+        let euid = 502;
         let mut other = alice();
-        other.uid = live.euid().wrapping_add(1);
-        let err = live
-            .argv(&Cmd::new("/usr/bin/true").as_user(&other))
-            .unwrap_err();
+        other.uid = euid + 1;
+        let err = Live::argv_from(euid, &Cmd::new("/usr/bin/true").as_user(&other)).unwrap_err();
         assert!(matches!(err, RunFailed::Refused(_)), "{err:?}");
+        // Its own account it runs unwrapped.
+        let (program, args) = Live::argv_from(
+            euid,
+            &Cmd::new("/usr/bin/true").as_user(&User {
+                uid: euid,
+                ..alice()
+            }),
+        )
+        .unwrap();
+        assert_eq!(program, PathBuf::from("/usr/bin/true"));
+        assert!(args.is_empty(), "{args:?}");
     }
 
     #[test]
     fn a_run_as_this_processs_own_account_gets_that_accounts_home_and_names() {
         let live = Live::new();
         if live.euid() == 0 {
-            return; // From root the run is wrapped; the argv test above covers it.
+            // From root the run is wrapped in sudo to an account that does not exist; the
+            // argv tests above check that wrapping on any account.
+            aterm_uds::host::could_not_run(
+                "as root a run as this account is wrapped; the unwrapped run needs a non-root uid",
+            );
         }
         // Our own uid under a name and home of the test's making: what the child sees must
         // come from the account, not from this process's environment, and be the list a

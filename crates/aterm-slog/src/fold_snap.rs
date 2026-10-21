@@ -16,7 +16,7 @@
 //! ```text
 //! fold v=1 as_of=<seq> ep=<e> rev=<n> last_t=<ms> mail_open=<n>
 //! fold phase word=<w> src=<s> conf=<c> t=<ms>        (and `fold shell …`)
-//! fold totals turns=<n> done=<n> … appr_by=<a,b,c,d> tools=<10 counts> … [mail_amb=<n>]
+//! fold totals turns=<n> done=<n> … appr_by=<a,b,c,d> tools=<10 counts> … [mail_amb=<n>] [mlh=1] [mlw=<off>:<t>,…]
 //! fold open <node> <kind> [par=<node>] by=<a> src=<s> conf=<c> t=<ms> [mloff=<off> mlconf=<c>]
 //! fold last <slot> <node> <kind> out=<w> dur_ms=<n> [opened_t=<ms>] t=<ms> by=<a> opened_by=<a> src=<s> conf=<c> [mloff=<off> mlconf=<c>]
 //! fold closed <node> <kind> out=<w> …                (the session's own close)
@@ -41,7 +41,22 @@
 //! turns that found mail ambiguous ride the totals line as `mail_amb=`
 //! (T10c), both only when there is one: a reader that does not know them
 //! skips them (the R13 rule), and a snapshot without them reads with no link
-//! and no ambiguity. The waiting mails do not cross.
+//! and no ambiguity.
+//!
+//! THE MAIL LATCH AND THE WAITING MAILS (Phase 6 step 6C-5, rulings U19,
+//! T10a) ride the totals line too, as `ml`-prefixed tokens and only when
+//! there is something to say: `mlh=1` while mail was delivered since the last
+//! `human` mark of an input that reached the program, and `mlw=<off>:<t>,…`
+//! for the delivered `kind=task` mails no turn has taken, oldest first, at
+//! most [`MAX_MAIL_WAITING`]. So mail delivered before a seamless update is
+//! still answered by the person's next keystroke after it, and still links
+//! the successor's next turn. An older build skips them (the R13 rule) and
+//! reads a fold that holds neither, as before; this build reads a snapshot
+//! without them (3B's, 6C-4's) the same way. Waiting mail implies the latch
+//! (the record that queues one sets the other, and what clears the latch
+//! clears the mail), so `mlw=` without `mlh=1` refuses the snapshot. A
+//! closed session's summary keeps neither ([`Fold::closed_snapshot`]): it
+//! waits for no turn.
 //!
 //! Reading back is bounded and fail-closed: a line this build does not read,
 //! a value of the wrong shape, more needs, open nodes or fields than a fold
@@ -52,8 +67,8 @@ use std::fmt::Write as _;
 use aterm_codec::pct;
 
 use super::{
-    Claim, ClosedNode, Fold, Held, MAX_NEEDS, MAX_TRACKED, MailLink, Need, NodeFields, OpenNode,
-    Phase, SessionState, Totals,
+    Claim, ClosedNode, Fold, Held, MAX_MAIL_WAITING, MAX_NEEDS, MAX_TRACKED, MailLink, MailWaiting,
+    Need, NodeFields, OpenNode, Phase, SessionState, Totals,
 };
 use crate::field::{Key, MAX_FIELDS, Tier};
 use crate::line::{decode_val, push_val};
@@ -71,6 +86,9 @@ pub enum SnapError {
     Line,
     /// More needs, open nodes, closed slots or fields than a fold holds.
     Bound,
+    /// An open node the log the fold crossed with does not hold open as
+    /// the fold says (phase 6, ruling U2): refused, never repaired.
+    Log,
 }
 
 /// The `k=v` tokens after the first `skip` words of a line.
@@ -171,6 +189,50 @@ fn read_link(line: &str, skip: usize) -> Result<Option<MailLink>, SnapError> {
             Ok(Some(MailLink { off, conf }))
         }
     }
+}
+
+/// ` mlh=1 mlw=<off>:<t>,…`: the mail latch and the waiting mails, each only
+/// when there is one (this module's doc).
+fn push_mail(s: &mut String, latch: bool, waiting: &[MailWaiting]) {
+    if latch {
+        s.push_str(" mlh=1");
+    }
+    for (i, m) in waiting.iter().enumerate() {
+        let _ = write!(s, "{}{}:{}", if i == 0 { " mlw=" } else { "," }, m.off, m.t);
+    }
+}
+
+/// The mail latch and the waiting mails from the totals line's `ml` tokens.
+/// `mlh=` says `1` and nothing else, and `mlw=` holds one to
+/// [`MAX_MAIL_WAITING`] `<off>:<t>` pairs: any other shape is no line this
+/// build wrote, and refuses the snapshot, as every malformed token does.
+/// So does waiting mail without the latch: the `mail dir=in` that queues a
+/// task mail sets the latch, and a reached `human` mark or a reset clears
+/// both, so no fold holds one without the other, and a successor handed it
+/// would link a mail its person already answered (T39).
+fn read_mail(line: &str) -> Result<(bool, Vec<MailWaiting>), SnapError> {
+    let latch = match get(line, 2, "mlh") {
+        None => false,
+        Some("1") => true,
+        Some(_) => return Err(SnapError::Line),
+    };
+    let mut waiting = Vec::new();
+    if let Some(raw) = get(line, 2, "mlw") {
+        for pair in raw.split(',') {
+            if waiting.len() >= MAX_MAIL_WAITING {
+                return Err(SnapError::Bound);
+            }
+            let (off, t) = pair.split_once(':').ok_or(SnapError::Line)?;
+            waiting.push(MailWaiting {
+                off: off.parse().map_err(|_| SnapError::Line)?,
+                t: t.parse().map_err(|_| SnapError::Line)?,
+            });
+        }
+    }
+    if !waiting.is_empty() && !latch {
+        return Err(SnapError::Line);
+    }
+    Ok((latch, waiting))
 }
 
 fn counts(v: &[u32]) -> String {
@@ -359,9 +421,21 @@ fn read_claim_line(line: &str, label: bool) -> Result<ClaimSlots, SnapError> {
 
 impl Fold {
     /// The fold as `fold …` lines, deterministic (the snapshot this module
-    /// documents).
+    /// documents): what a carry crosses a seamless update with.
     #[must_use]
     pub fn snapshot(&self) -> Vec<String> {
+        self.snapshot_lines(true)
+    }
+
+    /// [`Fold::snapshot`] without the mail latch and the waiting mails: a
+    /// closed session's summary (`Log::closed_summary`), which waits for no
+    /// turn.
+    #[must_use]
+    pub(crate) fn closed_snapshot(&self) -> Vec<String> {
+        self.snapshot_lines(false)
+    }
+
+    fn snapshot_lines(&self, mail: bool) -> Vec<String> {
         let st = &self.st;
         let mut out = vec![format!(
             "fold v=1 as_of={} ep={} rev={} last_t={} mail_open={}",
@@ -394,10 +468,13 @@ impl Fold {
             t.human,
             t.lost
         ));
-        if t.mail_amb > 0
-            && let Some(line) = out.last_mut()
-        {
-            let _ = write!(line, " mail_amb={}", t.mail_amb);
+        if let Some(line) = out.last_mut() {
+            if t.mail_amb > 0 {
+                let _ = write!(line, " mail_amb={}", t.mail_amb);
+            }
+            if mail {
+                push_mail(line, self.in_since_human, &self.mail);
+            }
         }
         for (i, o) in self.tracked.iter().enumerate() {
             let mut s = format!("fold open {} {}", o.node, o.kind.word());
@@ -512,6 +589,7 @@ impl Fold {
                         lost: num(line, 2, "lost")?,
                         mail_amb: opt_num(line, 2, "mail_amb")?.unwrap_or(0),
                     };
+                    (fold.in_since_human, fold.mail) = read_mail(line)?;
                 }
                 "open" => {
                     if fold.tracked.len() >= MAX_TRACKED {
@@ -623,5 +701,33 @@ impl Fold {
         fold.links.dedup_by_key(|(n, _)| *n);
         fold.reproject();
         Ok(fold)
+    }
+
+    /// WHETHER THIS FOLD AGREES WITH ITS LOG'S OPEN PATH (phase 6, ruling
+    /// U2), as a carry or a closed summary crosses the two: every node the
+    /// fold tracks open is open in `open` (the log's open path), of the same
+    /// kind and so at its level, at most once, and under the parent the log
+    /// holds it under — the deepest open node above it, or the session. A
+    /// fold that says more than its log holds would outlive the log's close
+    /// (the close finds the first copy and leaves the other, or finds none),
+    /// so it is refused whole and the successor starts over after its
+    /// handoff gap; nothing is guessed. A node the log holds open that the
+    /// fold does not track is no disagreement: a fold may drop one past its
+    /// bound.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapError::Log`] at the first open node that disagrees.
+    pub(crate) fn agrees_with_open(&self, open: &[crate::log::OpenEntry]) -> Result<(), SnapError> {
+        for (i, o) in self.tracked.iter().enumerate() {
+            let held = open
+                .iter()
+                .find(|e| e.node == o.node)
+                .is_some_and(|e| e.kind == o.kind && o.par.unwrap_or(Node::SESSION) == e.parent);
+            if !held || self.tracked[..i].iter().any(|p| p.node == o.node) {
+                return Err(SnapError::Log);
+            }
+        }
+        Ok(())
     }
 }

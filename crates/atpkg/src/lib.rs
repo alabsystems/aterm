@@ -117,6 +117,9 @@ pub(crate) mod clone;
 /// `bin/` shims take through them.
 pub mod compat;
 pub mod config;
+/// `aterm pkg doctor`'s checks as converge items (docs/DESIGN-init-system-2026-10-20.md
+/// §4.2): the rows its text and `--json` are both rendered from.
+pub mod converge;
 /// Stale copies of aterm beside the installed release (macOS): what `aterm doctor` moves
 /// to the Trash, and the one move the Settings panel's *Move to Trash* makes too.
 pub mod copies;
@@ -124,6 +127,9 @@ pub mod cost;
 /// The Developer Tools list (macOS): whether macOS holds each new program aterm starts
 /// for its first-run check, and the `devtools:` row both doctors print.
 pub mod devtools;
+/// Blocking directory and file watches (kqueue on macOS, inotify on Linux) for a thread that
+/// sleeps until what it reads may have moved (`docs/DESIGN-card-engine-2026-10-19.md` §3.10).
+pub mod dirwatch;
 pub mod discovery;
 pub mod dispatch;
 pub mod doctor;

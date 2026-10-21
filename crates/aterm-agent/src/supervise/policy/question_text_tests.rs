@@ -1600,10 +1600,12 @@ struct ModelReads {
 }
 
 /// [`ModelReads`] of the committed model at `Text = 1`, `Multi = multi`: its
-/// whole bounded space walked once, breadth first (the interpreter's own
-/// successor function, its environment built once a state). The states met
-/// are kept in a hash set: a `BTreeSet` of value vectors cost 40% of the
-/// test's time.
+/// whole bounded space walked once, breadth first, resolved
+/// ([`aterm_spec::interp::Resolved::successors`]: the interpreter's own
+/// successors in the same order, without a string-keyed environment per
+/// state; walked by name it was 88% of the test's time). The states met are
+/// kept in a hash set: a `BTreeSet` of value vectors cost 40% of the test's
+/// time.
 fn model_reads(multi: bool) -> ModelReads {
     let committed = aterm_models_harness::supervisor_question_text_model();
     let model = aterm_spec::interp::with_consts(&committed, &[("Multi", i64::from(multi))]);
@@ -1616,34 +1618,43 @@ fn model_reads(multi: bool) -> ModelReads {
     for dial in ["Text", "Multi", "OwnTextRemembered", "EnterWhereTyped"] {
         assert!(model.consts.iter().any(|(n, _)| *n == dial), "no {dial}");
     }
-    let key = |s: &ModelState| -> Vec<i64> { s.values().copied().collect() };
-    let init = model.init_state();
-    let mut seen = std::collections::HashSet::from([key(&init)]);
+    let r = aterm_spec::interp::Resolved::new(&model).expect("the text model resolves");
+    let [fresh, tab, focus, typed, own, exact, fallback] = [
+        "fresh",
+        "seen_tab",
+        "seen_focus",
+        "seen_typed",
+        "seen_own",
+        "seen_exact",
+        "seen_fallback",
+    ]
+    .map(|name| r.slot(name));
+    let init = r.init();
+    let mut seen = std::collections::HashSet::from([init.clone()]);
     let mut queue = VecDeque::from([init]);
     let mut judged = BTreeSet::new();
     let mut reads = Vec::new();
     while let Some(st) = queue.pop_front() {
-        let env = model.eval_env(&st);
-        for a in &model.actions {
-            for next in model.successors_in(a, &env, &st) {
-                if seen.insert(key(&next)) {
+        for a in 0..model.actions.len() {
+            for next in r.successors(a, &st) {
+                if seen.insert(next.clone()) {
                     queue.push_back(next);
                 }
             }
         }
-        if st["fresh"] != 1 || st["seen_tab"] > tabs {
+        if st[fresh] != 1 || st[tab] > tabs {
             continue;
         }
         let read = (
-            st["seen_tab"],
-            st["seen_focus"],
-            st["seen_typed"],
-            st["seen_own"],
-            st["seen_exact"],
-            st["seen_fallback"],
+            st[tab],
+            st[focus],
+            st[typed],
+            st[own],
+            st[exact],
+            st[fallback],
         );
         if judged.insert(read) {
-            reads.push((read, decision_of(&model, &st)));
+            reads.push((read, decision_of(&model, &r.state(&st))));
         }
     }
     ModelReads { multi, tabs, reads }

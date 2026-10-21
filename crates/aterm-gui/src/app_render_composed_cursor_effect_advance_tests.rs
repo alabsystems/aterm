@@ -923,9 +923,11 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
     );
     {
         let window = app.windows.get(&wid).expect("test window");
+        // The comet's tail is its streak's bed under the swept cells (the
+        // cadence comet's cell tint is retired beside it).
         assert!(
             !window.fx.cursor().glow_scratch.is_empty()
-                && !window.fx.cursor().trail_scratch.is_empty(),
+                && !window.fx.cursor().glow.under_quads().is_empty(),
             "negative control retains a genuinely charged composed cursor frame"
         );
         assert!(window.composed_cursor_effect_valid);
@@ -956,6 +958,7 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
             && !window.fx.cursor().glow.is_active()
             && !window.fx.cursor().trail.is_active()
             && window.fx.cursor().glow_scratch.is_empty()
+            && window.fx.cursor().glow.under_quads().is_empty()
             && window.fx.cursor().trail_scratch.is_empty(),
         "exact history extraction retires both retained engines and their frame vectors"
     );
@@ -997,7 +1000,12 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
     assert!(!ok, "Retain may not resurrect a previous live cursor frame");
 }
 
-fn run_alt_reanchor(with_repaint_blink: bool) -> (Vec<aterm_render::TrailCell>, Option<Instant>) {
+/// How many cells the comet's streak lights after a licensed alt-screen
+/// relocation of 17 columns (a sweep lights the cells it crossed; a
+/// re-anchor only the caret's), and the repaint-blink epoch the host
+/// consumed. The comet's tail is its streak (the cadence comet's cells are
+/// retired beside it), so the streak's live samples are the witness.
+fn run_alt_reanchor(with_repaint_blink: bool) -> (usize, Option<Instant>) {
     let (mut app, wid, session) = mixed_fixture("comet");
     let term = app.pool.get(session).expect("terminal leaf").term.clone();
     let t0 = Instant::now();
@@ -1027,31 +1035,27 @@ fn run_alt_reanchor(with_repaint_blink: bool) -> (Vec<aterm_render::TrailCell>, 
     let tick = t0 + Duration::from_millis(16);
     assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(tick)));
     let window = app.windows.get(&wid).expect("test window");
-    (
-        window.fx.cursor().trail_scratch.clone(),
-        window.last_blink_at,
-    )
+    (window.fx.cursor().glow.live_sparks(), window.last_blink_at)
 }
 
 #[test]
 fn mixed_advance_feeds_alt_repaint_blink_to_both_cursor_engines() {
     let (claude_like, blink_at) = run_alt_reanchor(true);
     assert!(
-        claude_like.is_empty(),
-        "alt + synchronized repaint blink re-anchors instead of sweeping a fake comet"
-    );
-    assert!(
         blink_at.is_some(),
         "the host consumed the focused terminal's repaint-blink epoch"
     );
-
     let (vim_like, blink_at) = run_alt_reanchor(false);
-    assert!(
-        !vim_like.is_empty(),
-        "without the blink the same licensed move keeps its comet — the blink IS \
-         the discriminator, which is what makes the arm above non-vacuous"
-    );
     assert_eq!(blink_at, None);
+    // The same licensed 17-column move: without the blink the comet sweeps
+    // the cells it crossed; with it, it re-anchors and lights none of them
+    // (both runs share the earlier frames' light).
+    assert!(
+        vim_like >= claude_like + 10,
+        "alt + synchronized repaint blink re-anchors instead of sweeping a fake comet, \
+         and without the blink the same move keeps its comet — the blink IS the \
+         discriminator ({claude_like} cells lit with it, {vim_like} without)"
+    );
 }
 
 #[test]
@@ -1104,6 +1108,7 @@ fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
         &term,
         true,
         v2_owns_frame,
+        v2_owns_frame,
         (0, 0),
         &[],
         None,
@@ -1125,6 +1130,7 @@ fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
         session,
         &term,
         true,
+        v2_owns_frame,
         v2_owns_frame,
         (0, 0),
         &[],
@@ -1372,6 +1378,53 @@ fn a_relocated_input_box_carries_its_band_with_its_text_on_a_composed_frame() {
     }
 }
 
+/// A box redrawn in place under a scroll, as Claude Code's composer is when a tool result
+/// lands under a full transcript (the owner, 2026-10-20: "the rainbow cursor trail broke
+/// when I pasted in this link here"): one synchronized write scrolls the pane three rows,
+/// writes other text where the scroll put the line, and redraws the line on its own row.
+/// The scroll's own frame reads the witness's rows after the translation
+/// (`CursorEffectScrollChange::translated_only`), so on that frame the band already
+/// stands under its text, never on the row the scroll carried it to, and nothing melts.
+#[test]
+fn a_box_redrawn_in_place_under_a_scroll_keeps_its_band_on_the_scroll_s_own_frame() {
+    for shape in [
+        ComposedShape::Split(crate::tab_model::SplitAxis::Horizontal),
+        ComposedShape::ThreePane,
+        ComposedShape::Zoomed,
+    ] {
+        let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
+        let t = composed_idle(&mut app, wid, t, 160);
+        let last = term_lock(&term).grid().rows();
+        // Pane row 5 is 1-based row 6; the scroll carries it to pane row 2.
+        term_lock(&term).process(
+            format!(
+                "\x1b[?2026h\x1b[{last};1H\r\n\r\n\r\n\x1b[3;1H\x1b[2Kother text\
+                 \x1b[6;1H\x1b[2Khello world\x1b[?2026l"
+            )
+            .as_bytes(),
+        );
+        let t = composed_idle(&mut app, wid, t, 16);
+        let lit: Vec<(u16, bool)> = (0..11).map(|k| (win_col + k, false)).collect();
+        assert_eq!(
+            composed_ribbon_row(&app, wid, win_row),
+            lit,
+            "{shape:?}: on the scroll's own frame the band stands under its text"
+        );
+        assert!(
+            composed_ribbon_row(&app, wid, win_row - 3).is_empty(),
+            "{shape:?}: nothing on the row the scroll carried it to: {:?}",
+            composed_ribbon_row(&app, wid, win_row - 3)
+        );
+        let _ = composed_idle(&mut app, wid, t, 200);
+        assert_eq!(
+            composed_ribbon_row(&app, wid, win_row),
+            lit,
+            "{shape:?}: the band stays under its text 200 ms on"
+        );
+        assert_eq!(composed_ribbon_retired(&app, wid), 0, "{shape:?}");
+    }
+}
+
 /// The witness reads the focused pane's own cells, with its row and column offsets, on every
 /// composed shape, for a band on a row the caret has left. Also the shape law: a lone glyph
 /// changed strictly inside the band is not evidence; the same change at its last cell retires.
@@ -1500,6 +1553,7 @@ fn composed_far_witness_never_reads_rows_changed_after_cell_extraction() {
             &term_lock(&term),
             true,
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
+            app.windows[&wid].fx.cursor().glow.reads_neighbor_rows(),
             origin,
             &requested[..n],
             None,
@@ -1590,6 +1644,7 @@ fn composed_neighbor_witness_uses_its_captured_change_after_later_pty_output() {
             &term_lock(&term),
             true,
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
+            app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
             (0, 0),
             &[],
             None,
@@ -1635,6 +1690,7 @@ fn composed_witness_generation_model_matches_real_terminal_mutations() {
             session,
             &term_lock(&term),
             true,
+            app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
             app.windows[&wid].fx.cursor().glow.v2_owns_frame(),
             (0, 0),
             &[],
@@ -1686,7 +1742,8 @@ struct CoherenceObservation {
     cursor_color: u32,
     cursor_fill: Option<u32>,
     glow: Vec<aterm_render::GlowQuad>,
-    trail: Vec<aterm_render::TrailCell>,
+    /// The streak's bed under the letters (the comet's tail).
+    under: Vec<aterm_render::GlowQuad>,
 }
 
 fn set_coherence_state(
@@ -2066,17 +2123,22 @@ fn capture_preparation_reports_exact_hold_unavailable_and_clean_reopen() {
         .term
         .clone();
     term_lock(&mixed_term).process(b"\x1b[?2026hpartial");
+    let (mixed_plan, _) = mixed
+        .active_visible_frame_layout(mixed_wid)
+        .expect("mixed layout");
     assert!(matches!(
-        mixed.prepare_heterogeneous_input_scratch_with_cursor_fx_outcome(
+        mixed.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
             mixed_wid,
             Some(ComposedCursorFxClock::Advance(t0)),
+            &mixed_plan,
         ),
         CapturePreparation::Held { .. }
     ));
     assert!(matches!(
-        mixed.prepare_heterogeneous_input_scratch_with_cursor_fx_outcome(
+        mixed.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
             WindowId(u64::MAX),
             Some(ComposedCursorFxClock::Advance(t0)),
+            &mixed_plan,
         ),
         CapturePreparation::Unavailable
     ));
@@ -2326,7 +2388,7 @@ fn coherence_observation(app: &App, wid: WindowId) -> CoherenceObservation {
         cursor_color: window.input_scratch.cursor_color,
         cursor_fill: window.input_scratch.cursor_fill_override,
         glow: window.fx.cursor().glow_scratch.clone(),
-        trail: window.fx.cursor().trail_scratch.clone(),
+        under: window.fx.cursor().glow.under_quads().to_vec(),
     }
 }
 

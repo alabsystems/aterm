@@ -12,7 +12,7 @@
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, IoSlice, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,24 @@ fn roundtrip_auth_handshake_over_a_bound_socket() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A gather write is one call that carries every slice in order: `writev` on
+/// Unix and `WSASend` on Windows, where std's default would send the first
+/// slice alone. `fdpass::send_vectored`, the push stream's gather, likewise.
+#[test]
+fn a_gather_write_carries_every_slice_in_one_call() {
+    let (a, mut b) = CtlStream::pair().expect("pair");
+    let bufs = [IoSlice::new(b"ab"), IoSlice::new(b""), IoSlice::new(b"cde")];
+    assert_eq!((&a).write_vectored(&bufs).unwrap(), 5, "write_vectored");
+    assert_eq!(
+        aterm_uds::fdpass::send_vectored(&a, &bufs).unwrap(),
+        5,
+        "send_vectored"
+    );
+    let mut buf = [0u8; 10];
+    b.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"abcdeabcde");
 }
 
 /// One relay direction: pump `r` into `w` until EOF/error (the proxy.rs

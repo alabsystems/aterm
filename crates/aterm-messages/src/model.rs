@@ -400,21 +400,25 @@ pub enum Intent {
         /// The session the paste is going to.
         session: u64,
     },
-    /// Show tab `tab` (1-based) of window `window`, raising it: a row's
-    /// navigation to the program it names (design ruling 440). The
-    /// band is app-wide, so the row names the window the tab is in and a
-    /// press from any window's band lands on that one (ruling 247). A
-    /// navigation, never consequential.
-    ///
-    /// scope-waiver: "app-wide" describes where this addressed navigation
-    /// may be shown. Each intent carries its destination window and tab;
-    /// duplicating the data neither multiplies an enforced budget nor changes
-    /// that destination. This variant owns no scope-enforcing state.
+    /// Legacy ordinal-only navigation retained for persisted record decoding.
+    /// The host refuses to execute it: an ordinal cannot identify a tab after
+    /// reorder/removal. New producers use [`Self::ShowSession`].
     ShowTab {
         /// The tab's number in its window, 1-based.
         tab: u16,
         /// The host's id of the window the tab is in.
         window: u64,
+    },
+    /// Navigate to the exact session a row named, using the host's current
+    /// session index and tab/pane tree. The ordinal is only the snapshot label;
+    /// `window` is a preference when the session has more than one view.
+    ShowSession {
+        /// The snapshot's human tab number, never a selection index.
+        tab: u16,
+        /// Prefer this window if it still shows the session.
+        window: u64,
+        /// The lossless stable session identity, preserved through handoff.
+        session: String,
     },
     /// THE OWNER'S WORD on the live agent upgrade in tab `tab` — the row's
     /// press of what `aterm harness upgrade <tab> --now|--defer|--skip`
@@ -503,7 +507,9 @@ impl Intent {
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "New window",
             Self::StopPaste { .. } => "Stop paste",
-            Self::ShowTab { tab, .. } => SHOW_TAB[usize::from(*tab).min(10) % 10],
+            Self::ShowTab { tab, .. } | Self::ShowSession { tab, .. } => {
+                SHOW_TAB[usize::from(*tab).min(10) % 10]
+            }
             Self::AgentUpgrade { word, .. } => word.label(),
             Self::EndRecovered => "End sessions",
         }
@@ -531,7 +537,9 @@ impl Intent {
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "Window",
             Self::StopPaste { .. } => "Stop",
-            Self::ShowTab { tab, .. } => TAB_N[usize::from(*tab).min(10) % 10],
+            Self::ShowTab { tab, .. } | Self::ShowSession { tab, .. } => {
+                TAB_N[usize::from(*tab).min(10) % 10]
+            }
             Self::AgentUpgrade { word, .. } => match word {
                 // What the press does, not when: a bare `Now` beside
                 // `Tomorrow` says neither what nor to whom (D6).
@@ -564,6 +572,7 @@ impl Intent {
             Self::NotNow { .. }
                 | Self::StopPaste { .. }
                 | Self::ShowTab { .. }
+                | Self::ShowSession { .. }
                 | Self::EndRecovered
         )
     }
@@ -649,6 +658,13 @@ impl Intent {
             Self::NewWindow => "new-window".to_string(),
             Self::StopPaste { session } => format!("stop-paste:{session}"),
             Self::ShowTab { tab, window } => format!("show-tab:{tab}:{window}"),
+            Self::ShowSession {
+                tab,
+                window,
+                session,
+            } => {
+                format!("show-session:{tab}:{window}:{}", escape_field(session))
+            }
             Self::AgentUpgrade { tab, to, word } => format!(
                 "agent-upgrade:{}:{}:{}",
                 word.as_str(),
@@ -696,6 +712,19 @@ impl Intent {
                 Some(Self::ShowTab {
                     tab: tab.parse().ok().filter(|t| *t > 0)?,
                     window: window.parse().ok()?,
+                })
+            }
+            "show-session" => {
+                let (tab, rest) = payload.split_once(':')?;
+                let (window, session) = rest.split_once(':')?;
+                let session = unescape_payload(session);
+                if session.is_empty() {
+                    return None;
+                }
+                Some(Self::ShowSession {
+                    tab: tab.parse().ok().filter(|t| *t > 0)?,
+                    window: window.parse().ok()?,
+                    session,
                 })
             }
             "not-now" => match payload.split_once(':').unwrap_or((payload, "")) {
@@ -770,6 +799,16 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         Intent::EndRecovered,
         Intent::StopPaste { session: 3 },
         Intent::ShowTab { tab: 2, window: 7 },
+        Intent::ShowSession {
+            tab: 2,
+            window: 7,
+            session: "s-b5cf2faabac5ce5127bd".into(),
+        },
+        Intent::ShowSession {
+            tab: 1,
+            window: 0,
+            session: "s-a:b%\t".into(),
+        },
         Intent::AgentUpgrade {
             tab: "s-b5cf2faabac5ce5127bd".into(),
             to: "2.1.282".into(),
@@ -1385,6 +1424,14 @@ pub struct Message {
     pub glyph: Glyph,
     /// ≤ [`TITLE_CAP`] chars, one line, sanitized.
     pub title: String,
+    /// THE TITLE'S SHORT FORM, the band's only: two or three words that say
+    /// what happened (`Usage limit` for `Claude usage limit reached in tab
+    /// 1`), which the band paints in the title's place where the whole title
+    /// does not fit, so a narrow band reads what happened, never a cut stub
+    /// of the title ([`crate::glass`]'s width law). Details, Settings ▸ Messages, the log and the spoken row keep
+    /// the whole title. A title change drops it (it shortened the old one).
+    /// `None`: the title elides, as every title did before.
+    pub short_title: Option<String>,
     /// ≤ [`DETAIL_LINES_CAP`] × [`DETAIL_LINE_CAP`], no line empty; `[0]`
     /// is the excerpt source.
     pub detail: Vec<String>,
@@ -1455,6 +1502,7 @@ impl Message {
             glyph: severity.default_glyph(),
             severity,
             title: clip(title.as_ref(), TITLE_CAP),
+            short_title: None,
             detail: Vec::new(),
             actions: Vec::new(),
             hold: Hold::Default,
@@ -1728,6 +1776,15 @@ impl Message {
         self
     }
 
+    /// The title's short form for the band (the `short_title` field:
+    /// sanitized, capped; empty clears it).
+    #[must_use]
+    pub fn short_title(mut self, words: impl AsRef<str>) -> Self {
+        let w = clip(words.as_ref(), TITLE_CAP);
+        self.short_title = (!w.is_empty()).then_some(w);
+        self
+    }
+
     /// The title a Complete echo paints: the declared finished words, else
     /// the title's participle read finished, else the title itself.
     #[must_use]
@@ -1865,6 +1922,11 @@ impl Message {
     #[must_use]
     pub fn normalized(mut self) -> Self {
         self.title = clip(&self.title, TITLE_CAP);
+        self.short_title = self
+            .short_title
+            .as_deref()
+            .map(|w| clip(w, TITLE_CAP))
+            .filter(|w| !w.is_empty());
         for line in &mut self.detail {
             *line = clip(line, DETAIL_LINE_CAP);
         }
@@ -2045,6 +2107,11 @@ mod tests {
             "not-now:maybe",
             "teleport:home",
             "new-window:1",
+            "show-session:0:1:s-x",
+            "show-session:1:no:s-x",
+            "show-session:1:1:",
+            "show-session:1:1",
+            "show-session:65536:1:s-x",
         ] {
             assert_eq!(Intent::decode(junk), None, "{junk:?}");
         }
@@ -2052,6 +2119,18 @@ mod tests {
             Intent::decode("open-config-editor:-"),
             Some(Intent::OpenConfigEditor { line: None })
         );
+        // Legacy records keep their readable action; the host will not
+        // infer a current destination from its ordinal.
+        assert_eq!(
+            Intent::decode("show-tab:2:7"),
+            Some(Intent::ShowTab { tab: 2, window: 7 })
+        );
+        let stable = Intent::ShowSession {
+            tab: 2,
+            window: 7,
+            session: "s-a:b%\t".into(),
+        };
+        assert_eq!(Intent::decode(&stable.encode()), Some(stable));
         // The retired admin step's intents, carried by an older window,
         // decode to nothing: the loader drops them.
         for retired in ["not-now:admin-step:clt,brew", "install-elevated:clt,brew"] {
@@ -2196,6 +2275,7 @@ mod tests {
             severity: Severity::Warn,
             glyph: Glyph::FALLBACK,
             title: "a\u{1b}[31mb\u{7}".into(),
+            short_title: Some("\u{1b}Short".into()),
             detail: vec!["ok".into()],
             actions: vec![
                 Intent::Details,
@@ -2217,6 +2297,7 @@ mod tests {
         }
         .normalized();
         assert_eq!(literal.finished.as_deref(), Some("Done"));
+        assert_eq!(literal.short_title.as_deref(), Some("Short"));
         assert_eq!(
             literal.title, "a[31mb",
             "the ESC and BEL go; the printable bytes stay"

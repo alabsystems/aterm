@@ -125,18 +125,28 @@ impl Watch {
     }
 
     fn follow_with(&self, on: &str, exec: &str, extra: &[&str]) -> Follower {
+        self.follow_env(on, exec, extra, &[])
+    }
+
+    /// [`Watch::follow_with`] with extra environment: a dev seam a control arms.
+    fn follow_env(&self, on: &str, exec: &str, extra: &[&str], env: &[(&str, &str)]) -> Follower {
         let out = std::fs::File::create(self.state.join("follow.out")).expect("stdio");
         let err = out.try_clone().expect("stdio clone");
-        Follower(Some(
-            aterm_uds::spawnfd::command(harness::aterm_to_launch())
-                .arg("link")
-                .args(self.argv(on, exec, extra))
-                .stdin(aterm_uds::spawnfd::Stdio::null())
-                .stdout(out)
-                .stderr(err)
-                .spawn()
-                .expect("spawn aterm link notify"),
-        ))
+        let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
+        cmd.arg("link")
+            .args(self.argv(on, exec, extra))
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(out)
+            .stderr(err);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        Follower(Some(cmd.spawn().expect("spawn aterm link notify")))
+    }
+
+    /// What a follower has written to stdout and stderr so far.
+    fn follow_out(&self) -> String {
+        std::fs::read_to_string(self.state.join("follow.out")).unwrap_or_default()
     }
 
     /// The lines the notification command has appended.
@@ -860,4 +870,74 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
         "the count reached the human on the first notification that worked"
     );
     assert_eq!(w.suppressed(), 0, "and only then is it cleared");
+}
+
+/// **ON A BROKER THAT SERVES ORDERED, A FOLLOWER PAGES AN ATTENTION ROW ONLY
+/// ONCE IT IS DURABLE** (`aterm_link::notify`'s module doc). The fleet's
+/// broker opens as aterm opens an ordered one, with aterm's table, but with
+/// NO HORIZON, so nothing moves its durable head but an escalated record or
+/// a flush asked for. An attention row (a presence record: not escalated) is
+/// read and HELD — the follower says so on stderr, and that line is the
+/// event this waits on — and nothing has paged when it is said; once the
+/// broker flushes in full (`flush_durable`), its durable mark reaches the
+/// subscription and the row pages, once.
+///
+/// NEGATIVE CONTROL, the notifier before the wait (the
+/// `ATERM_LINK_NOTIFY_PAGE_EARLY` dev seam): a second follower on the same
+/// broker pages its row with no flush at all — while the record is NOT on
+/// stable media, the page a power loss on the broker's host could leave
+/// pointing at nothing.
+///
+/// Where astream serves ordered strict (off Apple) every record is durable
+/// when visible: the test says so and stops.
+#[test]
+fn an_ordered_brokers_attention_pages_once_it_is_durable() {
+    let mut opts = harness::broker_opts(aterm_link::durability::Durability::Ordered);
+    opts.durability = astream_broker::Durability::Ordered { horizon: None };
+    let fleet = Fleet::boot_opts("notify-ordered", opts);
+    let broker = fleet.broker();
+    if broker.served_durability().served != astream_broker::Tier::Ordered {
+        eprintln!("ordered is served strict here: nothing waits, nothing to prove");
+        return;
+    }
+    let w = Watch::attention(&fleet, "ordered");
+    let _daemon = w.follow("attention");
+    let held = raise_attention(&fleet, "s-one", 1, "one");
+    let said = format!("off={held} waits until the broker says it is durable");
+    until("the follower to hold the row for its durable mark", || {
+        w.follow_out().contains(&said).then_some(())
+    });
+    assert!(w.fired().is_empty(), "held, not paged: {:?}", w.fired());
+    assert!(broker.durable_head() <= held, "and not durable");
+    let durable = broker.flush_durable().expect("a full flush");
+    assert!(durable > held);
+    until("the durable mark to page the held row", || {
+        w.journal()
+            .iter()
+            .any(|l| l.starts_with(&format!("{held} fired")))
+            .then_some(())
+    });
+    assert_eq!(w.fired(), vec![format!("{held} dup=0 sup=0")]);
+
+    // NEGATIVE CONTROL: the wait turned off pages before any full flush.
+    let early = Watch::attention(&fleet, "early");
+    let _control = early.follow_env(
+        "attention",
+        &early.appender(),
+        &[],
+        &[("ATERM_LINK_NOTIFY_PAGE_EARLY", "1")],
+    );
+    let raised = raise_attention(&fleet, "s-two", 2, "two");
+    until("the control to page the row", || {
+        early
+            .journal()
+            .iter()
+            .any(|l| l.starts_with(&format!("{raised} fired")))
+            .then_some(())
+    });
+    assert!(
+        broker.durable_head() <= raised,
+        "the control paged @{raised} while the broker's durable head was {}",
+        broker.durable_head()
+    );
 }

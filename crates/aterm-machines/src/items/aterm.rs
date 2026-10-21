@@ -23,9 +23,13 @@
 //!   records `[packages] auto_install = false` for the user) and lays down the link alone
 //!   (VM: it printed that `~/.local/bin` is not on PATH).
 //! * **`aterm.toolset@<user>`**: `aterm pkg install --default-set --wait-lock 1800` as the
-//!   user. Done is `aterm pkg doctor` exiting 0: doctor alone checks the store against the
-//!   signed index's default set (its cached copy, offline), where `aterm pkg list` can only
-//!   say what is installed. atpkg's exits 75 (another run holds the store lock past the
+//!   user. Done is `aterm pkg doctor --json` complete (exit 0) with its toolset row ok:
+//!   doctor alone checks the store against the signed index's default set (its cached
+//!   copy, offline), where `aterm pkg list` can only say what is installed. Not done is a
+//!   change named by each doctor row that fails it (a broken shim as much as a missing
+//!   set), or by the toolset row of a set removed on purpose, a decline the owner's
+//!   baseline lifts; a report that contradicts its exit, one at another schema, or no
+//!   report, is no answer. atpkg's exits 75 (another run holds the store lock past the
 //!   wait) and 69 (offline) stand aside as `Blocked`.
 
 use super::apps::{
@@ -34,8 +38,9 @@ use super::apps::{
     verify_team, vet_bundle,
 };
 use super::{Ctx, Item};
-use crate::model::{Effect, Probe, Read, User};
-use crate::port::{Cmd, System};
+use crate::model::{Effect, Outcome, Probe, Read, User};
+use crate::port::{Cmd, Ran, System};
+use aterm_converge::StoodAside;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -517,7 +522,7 @@ impl Item for Cli {
 struct Toolset {
     user: User,
     /// Why the last apply stood aside, if it did.
-    aside: Mutex<Option<String>>,
+    aside: Mutex<Option<StoodAside>>,
 }
 
 impl Toolset {
@@ -528,7 +533,7 @@ impl Toolset {
             .as_user(&self.user)
     }
 
-    fn set_aside(&self, why: Option<String>) {
+    fn set_aside(&self, why: Option<StoodAside>) {
         *self
             .aside
             .lock()
@@ -565,37 +570,19 @@ impl Item for Toolset {
                 };
             }
         }
-        let ran = match sys.run(&self.pkg(&["doctor"]).budget(Duration::from_secs(300))) {
+        let ran = match sys.run(
+            &self
+                .pkg(&["doctor", "--json"])
+                .budget(Duration::from_secs(300)),
+        ) {
             Ok(ran) => ran,
             Err(e) => {
                 return Probe::Unusable {
-                    why: format!("aterm pkg doctor as {}: {e}", self.user.name),
+                    why: format!("aterm pkg doctor --json as {}: {e}", self.user.name),
                 };
             }
         };
-        let out = ran.out();
-        let first = out.lines().next().unwrap_or("").trim();
-        let first = first.strip_prefix("doctor: ").unwrap_or(first);
-        // Doctor exits 1 for a store that is not the default set, and also for a doctor
-        // that could not look (HOME unset, says nothing): only a PROBLEM line, on either
-        // stream, is the answer "not done".
-        let err = ran.err();
-        let problem = out
-            .lines()
-            .chain(err.lines())
-            .find_map(|l| l.trim().strip_prefix("doctor: PROBLEM — "));
-        match (ran.status, problem) {
-            (Some(0), _) => Probe::Ok {
-                now: first.to_owned(),
-            },
-            (Some(1), Some(problem)) => Probe::Change {
-                from: problem.to_owned(),
-                to,
-            },
-            _ => Probe::Unusable {
-                why: format!("aterm pkg doctor as {}: {}", self.user.name, ran.describe()),
-            },
-        }
+        doctor_says(&ran, &self.user.name, to)
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
@@ -609,17 +596,17 @@ impl Item for Toolset {
         match ran.status {
             Some(0) => Ok(()),
             Some(ATPKG_CONTENDED) => {
-                self.set_aside(Some(format!(
+                self.set_aside(Some(StoodAside::Lock(format!(
                     "another atpkg run held {}'s store lock past the 30-minute wait (atpkg exit 75); the next apply retries",
                     self.user.name
-                )));
+                ))));
                 Ok(())
             }
             Some(ATPKG_OFFLINE) => {
-                self.set_aside(Some(
+                self.set_aside(Some(StoodAside::Offline(
                     "the ALab index could not be reached (atpkg exit 69, offline); the next apply retries"
                         .into(),
-                ));
+                )));
                 Ok(())
             }
             _ => Err(format!(
@@ -646,11 +633,122 @@ impl Item for Toolset {
         ]
     }
 
-    fn stood_aside(&self) -> Option<String> {
+    fn stood_aside(&self) -> Option<StoodAside> {
         self.aside
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+}
+
+/// The id of atpkg's toolset row in `aterm pkg doctor --json` (`atpkg::converge`), whose
+/// value says how many programs are active.
+const DOCTOR_TOOLSET_ROW: &str = "base.pkg.toolset";
+
+/// The toolset's state from what `aterm pkg doctor --json` answered as `user` (design §4.5,
+/// A29). Exit 0 with a report whose rule held and whose toolset row is ok is done. A toolset
+/// doctor does not count against its exit, one removed on purpose (a decline, a note), is a
+/// change: the fleet's consent is the owner's baseline, which lifts a decline (§3.2). Exit 1
+/// with a report whose rule failed is a change, named by each row that fails it
+/// ([`aterm_converge::ItemReport::fails_surface`]), a broken shim as much as a missing set.
+/// Anything else is no answer: a doctor that could not look (HOME unset), a report that
+/// contradicts its own exit, one this agent cannot read (another schema, not a check, no
+/// toolset row), or an aterm older than `--json`, which refuses the flag as usage (exit 2).
+fn doctor_says(ran: &Ran, user: &str, to: String) -> Probe {
+    let unusable = |what: String| Probe::Unusable {
+        why: format!("aterm pkg doctor --json as {user}: {what}"),
+    };
+    if ran.status == Some(2) {
+        return unusable(format!(
+            "{} — an aterm older than `pkg doctor --json` refuses it; the fleet reads no prose",
+            ran.describe()
+        ));
+    }
+    let Ok(report) = aterm_json::from_str::<aterm_converge::Report>(ran.out().trim()) else {
+        return unusable(format!(
+            "{}; what it printed is not its report",
+            ran.describe()
+        ));
+    };
+    // Unknown keys parse, so a later schema would be judged by this one's rules: refused.
+    if report.schema != aterm_converge::SCHEMA {
+        return unusable(format!(
+            "{}; its report is schema {}, and this agent reads schema {}",
+            ran.describe(),
+            report.schema,
+            aterm_converge::SCHEMA
+        ));
+    }
+    if report.mode != aterm_converge::ReportMode::Check {
+        return unusable(format!("{}; its report is not a check", ran.describe()));
+    }
+    let why = |row: &aterm_converge::ItemReport| {
+        let why = row
+            .explain
+            .as_ref()
+            .map(|e| e.why.as_str())
+            .or(row.why.as_deref())
+            .or(row.from.as_deref())
+            .unwrap_or(row.title.as_str());
+        format!("{}: {why}", row.id)
+    };
+    match (ran.status, report.complete) {
+        (Some(0), true) => {
+            let Some(toolset) = report.items.iter().find(|row| row.id == DOCTOR_TOOLSET_ROW) else {
+                return unusable(format!(
+                    "{}, but its report has no toolset row",
+                    ran.describe()
+                ));
+            };
+            if toolset.outcome != Outcome::Ok {
+                return Probe::Change {
+                    from: why(toolset),
+                    to,
+                };
+            }
+            let active = toolset.to.clone().unwrap_or_else(|| toolset.title.clone());
+            let flagged = report
+                .items
+                .iter()
+                .filter(|row| {
+                    !matches!(
+                        row.outcome,
+                        Outcome::Ok | Outcome::Changed | Outcome::NotApplicable | Outcome::Deferred
+                    )
+                })
+                .count();
+            Probe::Ok {
+                now: if flagged == 0 {
+                    active
+                } else {
+                    format!("{active}; {flagged} thing(s) to look at")
+                },
+            }
+        }
+        (Some(1), false) => {
+            let failing: Vec<String> = report
+                .items
+                .iter()
+                .filter(|row| row.fails_surface())
+                .map(why)
+                .collect();
+            if failing.is_empty() {
+                unusable(format!(
+                    "{}, and its report names no row that fails it",
+                    ran.describe()
+                ))
+            } else {
+                Probe::Change {
+                    from: failing.join("; "),
+                    to,
+                }
+            }
+        }
+        (_, complete) => unusable(format!(
+            "{}, but its report says the toolset is {}",
+            ran.describe(),
+            if complete { "complete" } else { "not complete" }
+        )),
     }
 }
 
@@ -671,11 +769,20 @@ mod tests {
     /// install.sh `--no-app --no-toolchain` as admin from a root-only stdin, VM, stdout.
     const INSTALL_SH_OUT: &str = "install.sh: linked aterm 0.105.0 -> /Users//admin/.local/bin/aterm (follows the app's updates)\ninstall.sh: --no-toolchain: /Users//admin/.config/aterm/aterm.toml already says `auto_install = false` — left as it is\n";
 
-    /// `aterm pkg doctor` as admin over an empty store, VM: exit 1.
-    const DOCTOR_EMPTY: &str = "doctor: found 1 problem(s)\ndoctor: warn — managed bin/ is not on PATH here; a new aterm shell adds it, or add: export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\"\ndoctor: warn — shell.d hooks not generated yet (an install writes them)\ndoctor: warn — no index update pass has completed yet — run: aterm pkg update\ndoctor: PROBLEM — no ALab programs are installed\ndoctor: next — aterm pkg install --default-set\ndoctor: the full report: aterm pkg doctor --verbose\n";
+    /// `aterm pkg doctor --json` as admin over an empty store: exit 1, the toolset row the
+    /// one that fails it beside three advisories.
+    const DOCTOR_EMPTY: &str = r#"{"schema":1,"mode":"check","complete":false,"items":[{"id":"base.pkg.path","family":"pkg","title":"the managed bin/ on PATH","outcome":"planned","from":"managed bin/ is not on PATH here","to":"on PATH","effect":"now","layer":"base","class":"person","explain":{"why":"managed bin/ is not on PATH here; a new aterm shell adds it, or add: export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\"","remedy":{"command":"export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\""}}},{"id":"base.shell.hooks","family":"shell","title":"the shell.d hooks","outcome":"planned","from":"shell.d hooks not generated yet (an install writes them)","to":"present","effect":"now","layer":"base","class":"relay","explain":{"why":"shell.d hooks not generated yet (an install writes them)","remedy":"repair"}},{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"planned","from":"no ALab programs are installed","to":"the ALab default set, installed","effect":"now","layer":"base","class":"install","explain":{"why":"no ALab programs are installed","remedy":{"command":"aterm pkg install --default-set"}},"essential":true}]}"#;
 
-    /// `aterm pkg doctor` over this Mac's full toolset: exit 0.
-    const DOCTOR_FULL: &str = "doctor: working — 12 program(s) installed; 1 thing(s) to look at\ndoctor: the full report: aterm pkg doctor --verbose\n";
+    /// `aterm pkg doctor --json` over this Mac's full toolset: exit 0, one advisory.
+    const DOCTOR_FULL: &str = r#"{"schema":1,"mode":"check","complete":true,"items":[{"id":"base.pkg.path","family":"pkg","title":"the managed bin/ on PATH","outcome":"planned","from":"managed bin/ is not on PATH here","to":"on PATH","effect":"now","layer":"base","class":"person","explain":{"why":"managed bin/ is not on PATH here; a new aterm shell adds it, or add: export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\"","remedy":{"command":"export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\""}}},{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"ok","to":"12 program(s) active","effect":"now","detail":"12","layer":"base","class":"install","essential":true}]}"#;
+
+    /// `aterm pkg doctor --json` over a full toolset with one shim whose build is gone:
+    /// exit 1 with the toolset row ok, the shim row the one that fails it.
+    const DOCTOR_BROKEN_SHIM: &str = r#"{"schema":1,"mode":"check","complete":false,"items":[{"id":"base.pkg.shims@cargo","family":"pkg","title":"the bin/ shim cargo","outcome":"planned","from":"broken bin shim /Users//admin/Library/Application Support/aterm/pkg/bin/cargo","to":"forwarding to a build in the store","effect":"now","layer":"base","class":"relay","explain":{"why":"broken bin shim /Users//admin/Library/Application Support/aterm/pkg/bin/cargo","remedy":"repair"},"essential":true},{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"ok","to":"12 program(s) active","effect":"now","detail":"12","layer":"base","class":"install","essential":true}]}"#;
+
+    /// `aterm pkg doctor --json` over a store whose toolset was removed on purpose (`aterm pkg
+    /// uninstall --all`, Settings): exit 0, the toolset row a note.
+    const DOCTOR_DECLINED: &str = r#"{"schema":1,"mode":"check","complete":true,"items":[{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"not-applicable","why":"the ALab toolset was removed on this machine (`aterm pkg install --default-set` reinstalls it)","effect":"now","layer":"base","class":"install","explain":{"why":"the ALab toolset was removed on this machine (`aterm pkg install --default-set` reinstalls it)","remedy":{"command":"aterm pkg install --default-set"}},"essential":true}]}"#;
 
     fn plistbuddy(bundle: &str, key: &str) -> String {
         format!("/usr/libexec/PlistBuddy -c 'Print :{key}' {bundle}/Contents/Info.plist")
@@ -1005,7 +1112,7 @@ mod tests {
     fn the_toolset_is_done_when_atpkg_s_doctor_is_and_a_held_lock_blocks_rather_than_fails() {
         let sys = Fake::root();
         sys.file(EXE, b"");
-        let doctor = "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor";
+        let doctor = "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor --json";
         sys.on(doctor, out_status(1, DOCTOR_EMPTY));
         let install = "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg install --default-set --wait-lock 1800";
         sys.on(
@@ -1031,7 +1138,8 @@ mod tests {
         assert_eq!(rows[0].outcome, Outcome::Planned);
         assert_eq!(
             rows[0].from.as_deref(),
-            Some("no ALab programs are installed")
+            Some("base.pkg.toolset: no ALab programs are installed"),
+            "the row that fails doctor, by its id; the advisories are not why"
         );
         let rows = crate::engine::run(
             toolset,
@@ -1060,26 +1168,145 @@ mod tests {
         assert_eq!(
             items[2].probe(&sys, &ctx),
             Probe::Ok {
-                now: "working — 12 program(s) installed; 1 thing(s) to look at".into()
+                now: "12 program(s) active; 1 thing(s) to look at".into()
             }
         );
     }
 
+    /// A29: doctor exits 1 for a broken shim with the toolset row itself ok. Read as prose
+    /// that was no answer (no `PROBLEM` line); read as rows it is a change of this item,
+    /// named by the doctor row that fails, which the next apply's install re-lays.
     #[test]
-    fn a_doctor_exit_1_with_no_problem_line_is_no_answer() {
-        // atpkg's doctor exits 1 without a word when HOME is unset: that is not "not done".
+    fn a_broken_shim_is_a_change_of_the_toolset_row_not_no_answer() {
         let sys = Fake::root();
         sys.file(EXE, b"");
         sys.on(
-            "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor",
-            err(1, ""),
+            "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor --json",
+            out_status(1, DOCTOR_BROKEN_SHIM),
         );
         let ctx = ctx_with(&sys, &[], true);
         let mut t = table();
         t.toolset = Some(true);
         let items = expand(&t, &ctx).unwrap();
+        assert_eq!(
+            items[2].probe(&sys, &ctx),
+            Probe::Change {
+                from: "base.pkg.shims@cargo: broken bin shim /Users//admin/Library/Application Support/aterm/pkg/bin/cargo".into(),
+                to: "the ALab default set, complete".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_doctor_exit_1_with_no_failing_row_is_no_answer() {
+        // atpkg's doctor exits 1 without a word when HOME is unset: that is not "not done".
+        let doctor = "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor --json";
+        let mut t = table();
+        t.toolset = Some(true);
+        // Nothing on stdout, and a report that claims the exit rule held, or names no row
+        // that fails it: each is no answer, never "not done".
+        let complete = DOCTOR_FULL;
+        let unnamed = DOCTOR_FULL.replace(r#""complete":true"#, r#""complete":false"#);
+        for (ran, says) in [
+            (err(1, ""), "exit 1"),
+            (out_status(1, complete), "exit 1"),
+            (out_status(1, &unnamed), "names no row"),
+            (out_status(0, DOCTOR_EMPTY), "exit 0"),
+            (out_status(0, "doctor: healthy\n"), "not its report"),
+        ] {
+            let sys = Fake::root();
+            sys.file(EXE, b"");
+            sys.on(doctor, ran);
+            let ctx = ctx_with(&sys, &[], true);
+            let items = expand(&t, &ctx).unwrap();
+            let probe = items[2].probe(&sys, &ctx);
+            assert!(
+                matches!(&probe, Probe::Unusable { why } if why.contains(says)),
+                "{says}: {probe:?}"
+            );
+        }
+    }
+
+    /// Doctor's rule holds over a toolset removed on purpose (a decline is a note, exit 0),
+    /// but the fleet's consent is the owner's baseline, which lifts a decline (design §3.2):
+    /// a change, named by the toolset row, whose install clears it — never done.
+    #[test]
+    fn a_declined_toolset_is_a_change_the_owner_s_baseline_lifts() {
+        let sys = Fake::root();
+        sys.file(EXE, b"");
+        sys.on(
+            "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor --json",
+            ok(DOCTOR_DECLINED),
+        );
+        let ctx = ctx_with(&sys, &[], true);
+        let mut t = table();
+        t.toolset = Some(true);
+        let items = expand(&t, &ctx).unwrap();
+        assert_eq!(
+            items[2].probe(&sys, &ctx),
+            Probe::Change {
+                from: "base.pkg.toolset: the ALab toolset was removed on this machine (`aterm pkg install --default-set` reinstalls it)".into(),
+                to: "the ALab default set, complete".into(),
+            }
+        );
+    }
+
+    /// A report this agent cannot read is no answer, never judged by schema 1's rules: one
+    /// at another schema, one that is not a check, and one with no toolset row to say the
+    /// toolset is there.
+    #[test]
+    fn a_report_of_another_schema_or_without_the_toolset_row_is_no_answer() {
+        let doctor = "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor --json";
+        let mut t = table();
+        t.toolset = Some(true);
+        let schema_2 = DOCTOR_FULL.replace(r#""schema":1"#, r#""schema":2"#);
+        let planned = DOCTOR_FULL.replace(r#""mode":"check""#, r#""mode":"plan""#);
+        let no_toolset =
+            DOCTOR_FULL.replace(r#""id":"base.pkg.toolset""#, r#""id":"base.pkg.other""#);
+        for (ran, says) in [
+            (out_status(0, &schema_2), "schema 2"),
+            (
+                out_status(
+                    1,
+                    &schema_2.replace(r#""complete":true"#, r#""complete":false"#),
+                ),
+                "schema 2",
+            ),
+            (out_status(0, &planned), "not a check"),
+            (out_status(0, &no_toolset), "no toolset row"),
+        ] {
+            let sys = Fake::root();
+            sys.file(EXE, b"");
+            sys.on(doctor, ran);
+            let ctx = ctx_with(&sys, &[], true);
+            let items = expand(&t, &ctx).unwrap();
+            let probe = items[2].probe(&sys, &ctx);
+            assert!(
+                matches!(&probe, Probe::Unusable { why } if why.contains(says)),
+                "{says}: {probe:?}"
+            );
+        }
+    }
+
+    /// An aterm older than `pkg doctor --json` refuses the flag (usage, exit 2): no answer
+    /// that says so, never a guess from its prose.
+    #[test]
+    fn an_aterm_without_doctor_json_is_no_answer_that_says_so() {
+        let sys = Fake::root();
+        sys.file(EXE, b"");
+        sys.on(
+            "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor --json",
+            err(2, "atpkg: doctor takes no arguments (got --json)"),
+        );
+        let ctx = ctx_with(&sys, &[], true);
+        let mut t = table();
+        t.toolset = Some(true);
+        let items = expand(&t, &ctx).unwrap();
+        let probe = items[2].probe(&sys, &ctx);
         assert!(
-            matches!(items[2].probe(&sys, &ctx), Probe::Unusable { why } if why.contains("exit 1")),
+            matches!(&probe, Probe::Unusable { why } if why.contains("exit 2")
+                && why.contains("an aterm older than `pkg doctor --json`")),
+            "{probe:?}"
         );
     }
 

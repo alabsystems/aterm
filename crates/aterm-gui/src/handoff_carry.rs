@@ -66,6 +66,15 @@
 //! not a list of lines, or more of them than a carry holds, reads as no log,
 //! and the ledger and archive adopt as they would have.
 //!
+//! # The crash carry
+//!
+//! An unplanned death of the window leaves no process to export anything, so the
+//! ledger half of this sidecar is also written ahead of time, into the control slot of
+//! the session's crash-restore region ([`CrashLedger`], `crash_restore`'s increment 7),
+//! and a keeper recovery adopts it as an update adopts a sidecar
+//! ([`decode_crash_carry`]). It carries the ledger and the dead process's turn-id count,
+//! no archive and no log; the region is anonymous shared memory, never on disk.
+//!
 //! # Privacy
 //!
 //! The archive was built to live in memory. Carrying it puts scrolled-off text
@@ -102,7 +111,8 @@ pub(crate) const MAX_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
 /// The most sidecar bytes one handoff writes, and one receiver reads, across
 /// every session — the receiver decodes them in early `main`, inside the
 /// freeze the user sees. Every session's ledger and counters are set aside
-/// first; past it, sessions carry fewer rows (then no differ state) — and
+/// first, then its differ's state; past it, sessions carry fewer rows, alike
+/// and their newest kept (then no differ state) — and
 /// only a desk whose ledgers alone overflow it sheds ledger records, every
 /// session its oldest, the longest ledgers alike ([`export`]).
 pub(crate) const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -263,9 +273,9 @@ impl StatusWords {
     /// The words of the successor at `target_build`, keyed on the first build
     /// that reads `hangup` and not on whether the target is older than this
     /// build, as the screen carry's ceilings (`seamless::WireCaps::for_hop`)
-    /// and the history carry (`handoff_history::exports_for_target`) are: a
-    /// rollback to v0.100.0 or later reads `hangup`, carried it as it is
-    /// before this export respelled any word, and still does.
+    /// and the history carry (`handoff_history::exports_for_target`) are keyed
+    /// on theirs: a rollback to v0.100.0 or later reads `hangup`, carried it
+    /// as it is before this export respelled any word, and still does.
     #[must_use]
     pub(crate) fn for_target(target_build: u64) -> Self {
         if target_build < READS_HANGUP_FROM_BUILD {
@@ -368,10 +378,12 @@ pub(crate) fn export(sources: &[CarrySource], turn_id_ceiling: u64) -> Vec<(u64,
 /// THE AGGREGATE IS SPENT BY PRIORITY, not first come, first served (round
 /// seven, finding 37): every session's CORE — its ledger and the archive's
 /// counters, what `history`, `offscreen since=` and a resumed `since-turn=`
-/// stand on — is set aside first, and the differ's state and the archive's
-/// rows share what is left, in pool order. Spent greedily, a crowded desk's
-/// first sessions carried their optional rows and its last ones lost their
-/// whole ledger, the same sessions on every update. When the cores ALONE
+/// stand on — is set aside first, then each session's differ state (all or
+/// none), and the archive's rows share what is left alike, each session's
+/// newest first: first every session's rows after its newest turn's mark,
+/// then the older ones (ATERM-KI-1015-2, U30). Spent greedily, a crowded
+/// desk's first sessions carried their optional rows and its last ones lost
+/// their whole ledger, the same sessions on every update. When the cores ALONE
 /// overflow it, they share it ([`core_shares`]): every session keeps its
 /// newest records, the longest ledgers are cut alike, and each carry names
 /// the turn ids it shed (round eight, finding 41).
@@ -660,18 +672,48 @@ pub(crate) fn export_noting(
         .zip(&skeletons)
         .map(|(granted, want)| if granted >= *want { *want } else { 0 })
         .collect();
-    // What the differs and the rows may spend, over every session's share.
-    let mut spare = after_cores.saturating_sub(skeleton_grants.iter().sum());
+    // THE DIFFERS' STATE from what the skeletons left, before any row
+    // (ATERM-KI-1015-2, U30): a sidecar sheds its rows before it, so it is
+    // granted first, or the rows' grants would leave no room for it.
+    // Screen-sized; all or none.
+    let after_skeletons = after_cores.saturating_sub(skeleton_grants.iter().sum());
+    let differs: Vec<u64> = taken
+        .iter()
+        .map(|(_, _, _, archive, _)| differ_len(archive))
+        .collect();
+    let differ_grants: Vec<u64> = core_shares(&differs, after_skeletons)
+        .into_iter()
+        .zip(&differs)
+        .map(|(granted, want)| if granted >= *want { *want } else { 0 })
+        .collect();
+    // THE ROWS share what the differs left, in two tiers, each split alike
+    // (`core_shares`) and each session's newest rows first (ATERM-KI-1015-2,
+    // U30): every session's rows after its newest turn's mark (what `drive
+    // report` reads back), then its older rows. Spent in pool order, the first
+    // sessions carried their whole tails and the later ones none, the same
+    // sessions on every update.
+    let spare = after_skeletons.saturating_sub(differ_grants.iter().sum());
+    let (newest, older): (Vec<u64>, Vec<u64>) = taken
+        .iter()
+        .map(|(_, turns, _, archive, _)| row_tiers(turns, archive))
+        .unzip();
+    let newest_grants = core_shares(&newest, spare);
+    let after_newest = spare.saturating_sub(newest_grants.iter().sum());
+    let older_grants = core_shares(&older, after_newest);
+    // What no grant took, and what each session leaves of its own, goes to
+    // the sessions after it.
+    let mut unspent = after_newest.saturating_sub(older_grants.iter().sum());
     let mut total = 0_u64;
     let (mut shed_sessions, mut shed_records) = (0_usize, 0_usize);
     // Each chosen sidecar keeps its source's index: its log take is that
     // source's (`log_takes` is in source order).
     let mut chosen: Vec<(usize, u64, Vec<TurnRecord>, Chosen, u64)> =
         Vec::with_capacity(taken.len());
-    for (index, (((local_id, turns, floors, archive, _), share), skeleton)) in taken
+    for (index, ((((local_id, turns, floors, archive, _), share), skeleton), differ)) in taken
         .into_iter()
         .zip(shares)
         .zip(&skeleton_grants)
+        .zip(differ_grants)
         .enumerate()
     {
         let member = if log_priors[index].is_some() {
@@ -679,21 +721,27 @@ pub(crate) fn export_noting(
         } else {
             0
         };
+        let granted = share
+            .saturating_add(differ)
+            .saturating_add(newest_grants[index])
+            .saturating_add(older_grants[index])
+            .saturating_add(unspent);
         let room = MAX_SIDECAR_BYTES
             .saturating_sub(member)
             .saturating_sub(*skeleton)
-            .min(share.saturating_add(spare))
+            .min(granted)
             .min(control_budget.saturating_sub(total));
         if let Some((pick, shed)) = encode_within(&turns, floors, archive, room) {
             let len = pick.bytes.len() as u64;
             total = total.saturating_add(len);
-            spare = spare.saturating_sub(len.saturating_sub(share));
+            unspent = granted.saturating_sub(len);
             if shed > 0 {
                 shed_sessions += 1;
                 shed_records += shed;
             }
             chosen.push((index, local_id, turns, pick, *skeleton));
         } else {
+            unspent = granted;
             // SAID, not silent (round seven, finding 44): the session adopts
             // with an empty ledger and a fresh archive.
             aterm_log::warn!(
@@ -797,8 +845,15 @@ fn with_log(
             total: total.min(aterm_slog::CARRY_TOTAL_BYTES),
             ..aterm_slog::CarryBudget::SESSION
         };
-        let lines = take.source.encode(budget)?.lines;
-        let bytes = sidecar(&lines)?;
+        // A cut the budget refuses (one taken below the skeleton's own
+        // bytes) still leaves the skeleton, which was granted.
+        let Some(bytes) = take
+            .source
+            .encode(budget)
+            .and_then(|cut| sidecar(&cut.lines))
+        else {
+            break;
+        };
         let len = bytes.len() as u64;
         if len <= room {
             return Some(bytes);
@@ -866,6 +921,127 @@ pub(crate) fn adopted_ledger(control: Option<&mut ControlCarry>) -> TurnLedger {
     }
 }
 
+/// A SESSION'S CRASH CARRY (the crash-restore plan's increment 7): the turn-ledger half of
+/// this module's sidecar, for the control slot of the session's crash-restore region
+/// (`crash_restore`: the window's journal worker writes it at most every two seconds while
+/// the ledger moves). After an unplanned death of this window the next one adopts it as an
+/// update's successor adopts a sidecar, so `history` there still finds the turns driven into
+/// the session, `carried=1`.
+///
+/// The alt-screen archive stays out: it changes with every frame and is up to a MiB, and a
+/// carry of it would describe a screen other than the one the crash restore brings back. A
+/// carried record's `arch=` mark names this process's archive origin, which no later
+/// archive takes (`spawn::alt_archive_origin`), so `offscreen since=` with it reads from the
+/// start and says why. The session log stays out too.
+///
+/// Taken under the ledger's lock ([`Self::of`]: a clone of its records, as the update's
+/// export takes them), encoded with no lock held ([`Self::encode`]).
+#[cfg(any(unix, test))]
+pub(crate) struct CrashLedger {
+    turns: Vec<TurnRecord>,
+    floors: Floors,
+    turn_ids: u64,
+}
+
+#[cfg(any(unix, test))]
+impl CrashLedger {
+    /// `ledger` as it stands, with `turn_ids`, this process's turn-id count now
+    /// (`control::turn_ids_minted`): the floor carried is the export's own
+    /// ([`TurnLedger::carry_floor`]), raised past every turn still open.
+    pub(crate) fn of(ledger: &TurnLedger, turn_ids: u64) -> Self {
+        Self {
+            turns: ledger.records().cloned().collect(),
+            floors: Floors {
+                unheld_below: ledger.carry_floor(turn_ids),
+                shed_below: ledger.shed_below(),
+            },
+            turn_ids,
+        }
+    }
+
+    /// The carry's bytes: the sidecar's JSON holding the ledger and the turn-id count
+    /// alone, every record in this build's words, and how many records it left out. When
+    /// the whole ledger does not `fit` (the slot's record, compressed, past the slot), its
+    /// OLDEST records are shed, the fewest that let the rest fit (a binary search: the
+    /// records are encoded a handful of times, never once per record shed), and the carry
+    /// no longer vouches for their ids (`unheld_below` raised past the newest one shed), as
+    /// an update's export sheds them; the count shed is returned beside the bytes, so the
+    /// writer can say the slot does not hold them (`status journal_ledger_lag=`). `None`
+    /// only when not even the floors alone fit.
+    pub(crate) fn encode(&self, fits: impl Fn(&[u8]) -> bool) -> Option<(Vec<u8>, usize)> {
+        let at = |cut: usize| -> Option<Vec<u8>> {
+            let unheld_below = cut
+                .checked_sub(1)
+                .and_then(|newest_shed| self.turns.get(newest_shed))
+                .map_or(self.floors.unheld_below, |t| {
+                    self.floors.unheld_below.max(t.id.saturating_add(1))
+                });
+            let floors = Floors {
+                unheld_below,
+                ..self.floors
+            };
+            encode_ledger(self.turns.get(cut..)?, floors, self.turn_ids)
+        };
+        let whole = at(0)?;
+        if fits(&whole) {
+            return Some((whole, 0));
+        }
+        // `best` is the carry at `hi`, which fits; the one at `lo - 1` does not.
+        let mut best = at(self.turns.len()).filter(|bytes| fits(bytes))?;
+        let (mut lo, mut hi) = (1, self.turns.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match at(mid) {
+                Some(bytes) if fits(&bytes) => {
+                    best = bytes;
+                    hi = mid;
+                }
+                _ => lo = mid + 1,
+            }
+        }
+        Some((best, hi))
+    }
+
+    /// How many records it holds.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.turns.len()
+    }
+}
+
+/// The sidecar of a crash carry: the ledger, its floors and the turn-id count, no archive
+/// and no log.
+#[cfg(any(unix, test))]
+fn encode_ledger(turns: &[TurnRecord], floors: Floors, turn_ids: u64) -> Option<Vec<u8>> {
+    let wire = Wire {
+        version: WIRE_VERSION,
+        turns: turns.iter().map(turn_wire).collect(),
+        unheld_below: floors.unheld_below,
+        shed_below: floors.shed_below,
+        turn_ids,
+        ..Wire::default()
+    };
+    aterm_json::to_vec(&wire).ok()
+}
+
+/// Decode a CRASH CARRY ([`CrashLedger`], read out of a dead window's region) exactly as an
+/// update's sidecar is decoded ([`decode_why`]: its version, every record's status word and
+/// id, the floors), with what no crash carry holds left out: an archive or a session log in
+/// one is no writing of this build's, and an archive would describe a screen other than the
+/// restored one.
+///
+/// # Errors
+///
+/// [`decode_why`]'s.
+#[cfg(any(unix, test))]
+pub(crate) fn decode_crash_carry(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
+    let mut carry = decode_why(bytes)?;
+    carry.archive = None;
+    carry.log = None;
+    carry.log_mirror = None;
+    Ok(carry)
+}
+
 /// Where the carried tail starts: after the EARLIEST mark among the newest
 /// [`TAIL_TURNS`] submitted turns (the newest turn when none was submitted)
 /// that were minted under this archive's origin, and no later than the rows
@@ -877,11 +1053,24 @@ fn tail_from(
     fence: AltArchiveFence,
     differ: Option<&AltArchiveDiffer>,
 ) -> u64 {
+    rows_after_marks(turns, TAIL_TURNS, fence.origin, fence.first, differ)
+}
+
+/// [`tail_from`] over the newest `count` submitted turns, for the archive of
+/// `origin` whose oldest row is `first`.
+#[cfg(any(unix, test))]
+fn rows_after_marks(
+    turns: &[TurnRecord],
+    count: usize,
+    origin: u64,
+    first: u64,
+    differ: Option<&AltArchiveDiffer>,
+) -> u64 {
     let mut marks: Vec<ArchMark> = turns
         .iter()
         .rev()
         .filter(|t| t.submitted)
-        .take(TAIL_TURNS)
+        .take(count)
         .map(|t| t.arch)
         .collect();
     if marks.is_empty() {
@@ -889,14 +1078,34 @@ fn tail_from(
     }
     let mut from = marks
         .iter()
-        .filter(|m| m.origin == fence.origin)
+        .filter(|m| m.origin == origin)
         .map(|m| m.last.saturating_add(1))
         .min()
-        .unwrap_or(fence.first);
+        .unwrap_or(first);
     if let Some(d) = differ.filter(|d| d.debt > 0) {
         from = from.min(d.debt_at);
     }
     from
+}
+
+/// The bytes a carry's rows add to its sidecar (each row's JSON string and a
+/// comma), in two tiers: the rows after the newest turn's mark, and the rows
+/// the screen shows again ([`rows_after_marks`] over one turn: what `drive
+/// report` reads back), then the older ones.
+#[cfg(any(unix, test))]
+fn row_tiers(turns: &[TurnRecord], archive: &AltArchiveCarry) -> (u64, u64) {
+    let from = rows_after_marks(
+        turns,
+        1,
+        archive.origin,
+        archive.first,
+        archive.differ.as_ref(),
+    );
+    let older = usize::try_from(from.saturating_sub(archive.first))
+        .unwrap_or(usize::MAX)
+        .min(archive.rows.len());
+    let len = |rows: &[Arc<str>]| -> u64 { rows.iter().map(|row| json_string_len(row) + 1).sum() };
+    (len(&archive.rows[older..]), len(&archive.rows[..older]))
 }
 
 /// A `try_lock` (`attempt`, which names the lock so the lock-order census
@@ -930,14 +1139,21 @@ struct Chosen {
     bytes: Vec<u8>,
 }
 
-/// Encode, shedding what does not fit `room`: the rows first (counters
-/// only), then the differ's state, then the ledger's OLDEST records, no more
-/// of them than the room needs (the ids shed are ones the carried ledger no
-/// longer vouches for). With the records shed, if any.
+/// Encode, shedding what does not fit `room`: the archive's OLDEST rows
+/// first, no more of them than the room needs, then the differ's state, then
+/// the ledger's OLDEST records, likewise (the ids shed are ones the carried
+/// ledger no longer vouches for). With the records shed, if any.
 ///
-/// Each record's bytes are measured once, and the cut moves past as many as
-/// the last encode ran over (at least one): an encode or two, where shedding
-/// half the ledger at a time left up to half the room unspent.
+/// Each row's and record's bytes are measured once, and the cut moves past as
+/// many as the last encode ran over (at least one): an encode or two, where
+/// shedding half the ledger at a time left up to half the room unspent.
+///
+/// THE ROWS ARE SHED A FEW AT A TIME TOO (ATERM-KI-1015-2, U30). They went
+/// all at once: a tail a few bytes past its room crossed as counters alone,
+/// so on a crowded desk the first session whose whole tail did not fit what
+/// the aggregate had left lost every row — the few KB after its newest turn's
+/// mark that `drive report` reads included — on every update, and what it
+/// left went unspent.
 #[cfg(any(unix, test))]
 fn encode_within(
     turns: &[TurnRecord],
@@ -945,30 +1161,40 @@ fn encode_within(
     archive: AltArchiveCarry,
     room: u64,
 ) -> Option<(Chosen, usize)> {
-    let fits = |b: &Vec<u8>| b.len() as u64 <= room;
     let mut archive = archive;
-    if let Some(bytes) = encode(turns, floors, &archive).filter(fits) {
-        return Some((
-            Chosen {
-                cut: 0,
-                floors,
-                archive,
-                bytes,
-            },
-            0,
-        ));
-    }
-    archive = counters_only(archive);
-    if let Some(bytes) = encode(turns, floors, &archive).filter(fits) {
-        return Some((
-            Chosen {
-                cut: 0,
-                floors,
-                archive,
-                bytes,
-            },
-            0,
-        ));
+    // A row's bytes in the array: its JSON string and a comma.
+    let row_lens: Vec<u64> = archive
+        .rows
+        .iter()
+        .map(|row| json_string_len(row) + 1)
+        .collect();
+    let mut left_out = 0_usize;
+    loop {
+        let bytes = encode(turns, floors, &archive)?;
+        let over = (bytes.len() as u64).saturating_sub(room);
+        if over == 0 {
+            return Some((
+                Chosen {
+                    cut: 0,
+                    floors,
+                    archive,
+                    bytes,
+                },
+                0,
+            ));
+        }
+        if archive.rows.is_empty() {
+            break;
+        }
+        let mut freed = 0_u64;
+        let carried = archive.rows.len();
+        let mut shed = 0_usize;
+        while shed < carried && (freed == 0 || freed < over) {
+            freed = freed.saturating_add(row_lens[left_out + shed]);
+            shed += 1;
+        }
+        archive = newest_rows(archive, carried - shed);
+        left_out += shed;
     }
     archive.differ = None;
     let mut lens: Option<Vec<u64>> = None;
@@ -1017,12 +1243,21 @@ fn encode_within(
 
 /// The carry with its rows left out: counted lost, the indices unchanged.
 #[cfg(any(unix, test))]
-fn counters_only(mut c: AltArchiveCarry) -> AltArchiveCarry {
-    let last = c.last();
-    c.lost = c.lost.saturating_add(c.rows.len() as u64);
-    c.first = last + 1;
-    c.rows = Vec::new();
-    c.gaps.retain(|g| g.after >= last);
+fn counters_only(c: AltArchiveCarry) -> AltArchiveCarry {
+    newest_rows(c, 0)
+}
+
+/// The carry with only its `keep` newest rows: the older ones left out and
+/// counted lost, with the gaps only they needed (as `AltArchive::carry_rows`
+/// leaves out the gaps before its first row); the indices unchanged.
+#[cfg(any(unix, test))]
+fn newest_rows(mut c: AltArchiveCarry, keep: usize) -> AltArchiveCarry {
+    let left_out = c.rows.len().saturating_sub(keep);
+    c.rows.drain(..left_out);
+    c.first = c.first.saturating_add(left_out as u64);
+    c.lost = c.lost.saturating_add(left_out as u64);
+    let first = c.first;
+    c.gaps.retain(|g| g.after.saturating_add(1) >= first);
     c
 }
 
@@ -1032,10 +1267,12 @@ fn counters_only(mut c: AltArchiveCarry) -> AltArchiveCarry {
 /// skipped, so a newer sender's additions cost an older receiver nothing.
 /// Numbers are `u64` on the wire whatever they are in memory, so a value out
 /// of its in-memory range spoils only its own part (the differ's state is
-/// then dropped whole by `AltArchive::import`), never the parse.
+/// then dropped whole by `AltArchive::import`), never the parse. The
+/// cross-version fixtures' field cover reads a desk's sidecars as this
+/// (`seamless_fixture_cover.rs`).
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 #[serde(default)]
-struct Wire {
+pub(crate) struct Wire {
     version: u64,
     turns: Vec<TurnWire>,
     /// Turn ids below this may have named records `turns` does not hold (a
@@ -1048,6 +1285,15 @@ struct Wire {
     /// resume below it is not told of the harness records it misses.
     #[serde(skip_serializing_if = "is_zero")]
     shed_below: u64,
+    /// The turn-id count of the process that wrote it
+    /// (`control::turn_ids_minted`), as of the write; 0: none, and then
+    /// absent. Only a CRASH carry writes it ([`CrashLedger`]): its process
+    /// left no manifest to carry the count, and the restoring window
+    /// continues its own count above every carry's
+    /// (`crash_restore::continue_carried_turns`). An update's sidecar never
+    /// does, so its bytes are what they were.
+    #[serde(skip_serializing_if = "is_zero")]
+    turn_ids: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive: Option<ArchiveWire>,
     /// THE SESSION LOG (phase 2A): its carry lines, oldest part first
@@ -1189,7 +1435,7 @@ fn turn_wire(t: &TurnRecord) -> TurnWire {
         dur_ms: t.dur_ms,
         submitted: t.submitted,
         status: if pressed { "timeout" } else { t.status }.to_string(),
-        text: t.text.clone(),
+        text: t.text.to_string(),
         screen_hash: t.screen_hash,
         seq: t.seq,
         arch_origin: t.arch.origin,
@@ -1218,6 +1464,7 @@ fn encode_wire(
         version: WIRE_VERSION,
         unheld_below: floors.unheld_below,
         shed_below: floors.shed_below,
+        turn_ids: 0,
         turns: turns.iter().map(turn_wire).collect(),
         archive: Some(ArchiveWire {
             origin: archive.origin,
@@ -1235,21 +1482,37 @@ fn encode_wire(
                 })
                 .collect(),
             rows: archive.rows.iter().map(|r| r.to_string()).collect(),
-            differ: archive.differ.as_ref().map(|d| DifferWire {
-                prev: d.prev.as_ref().map(|(cols, rows)| FrameWire {
-                    cols: u64::from(*cols),
-                    rows: rows.clone(),
-                }),
-                chrome: d.chrome.map(|c| c as u64),
-                pin: d.pin as u64,
-                debt: d.debt as u64,
-                debt_at: d.debt_at,
-                below: d.below.clone(),
-                esu_seen: d.esu_seen,
-            }),
+            differ: archive.differ.as_ref().map(differ_wire),
         }),
     };
     aterm_json::to_vec(&wire).ok()
+}
+
+/// The differ's state as the sidecar carries it.
+#[cfg(any(unix, test))]
+fn differ_wire(d: &AltArchiveDiffer) -> DifferWire {
+    DifferWire {
+        prev: d.prev.as_ref().map(|(cols, rows)| FrameWire {
+            cols: u64::from(*cols),
+            rows: rows.clone(),
+        }),
+        chrome: d.chrome.map(|c| c as u64),
+        pin: d.pin as u64,
+        debt: d.debt as u64,
+        debt_at: d.debt_at,
+        below: d.below.clone(),
+        esu_seen: d.esu_seen,
+    }
+}
+
+/// The bytes the differ's state adds to a sidecar (`,"differ":` and its
+/// JSON); 0 when it carries none. Screen-sized, so encoded alone: what
+/// [`export_noting`] sets aside for it before any session's rows.
+#[cfg(any(unix, test))]
+fn differ_len(archive: &AltArchiveCarry) -> u64 {
+    archive.differ.as_ref().map_or(0, |d| {
+        aterm_json::to_vec(&differ_wire(d)).map_or(0, |json| json.len() as u64 + 10)
+    })
 }
 
 /// A decoded sidecar, ready to install into the adopted session.
@@ -1263,6 +1526,13 @@ pub(crate) struct ControlCarry {
     /// Turn ids below this may have named a harness record the sender's
     /// ring evicted from inside ([`TurnLedger::with_shed_below`]); 0: none.
     pub shed_below: u64,
+    /// A crash carry's turn-id count, as its process had minted it when the
+    /// carry was written ([`Wire::turn_ids`]); 0 for an update's sidecar.
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(dead_code, reason = "only a unix keeper recovery reads a crash carry")
+    )]
+    pub turn_ids: u64,
     /// The carried archive.
     pub archive: Option<AltArchiveCarry>,
     /// The carried session log's lines, when the sender wrote them and they
@@ -1416,6 +1686,7 @@ pub(crate) fn decode_why(bytes: &[u8]) -> Result<ControlCarry, &'static str> {
         turns,
         unheld_below: unheld_below.min(MAX_TURN_ID.saturating_add(1)),
         shed_below: wire.shed_below.min(MAX_TURN_ID.saturating_add(1)),
+        turn_ids: wire.turn_ids.min(MAX_TURN_ID),
         archive,
         log,
         log_mirror,

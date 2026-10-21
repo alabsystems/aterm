@@ -13,6 +13,9 @@
 #[path = "support/child_output.rs"]
 mod child_output;
 #[cfg(unix)]
+#[path = "support/ctl_accept.rs"]
+mod ctl_accept;
+#[cfg(unix)]
 #[path = "support/headless_boot.rs"]
 mod headless_boot;
 #[path = "support/launch_isolation.rs"]
@@ -24,6 +27,8 @@ mod live_ctl;
 #[path = "support/standin.rs"]
 mod standin;
 
+#[cfg(unix)]
+mod agent_prime_live_headless;
 #[cfg(unix)]
 mod agent_verdict_live_headless;
 #[cfg(unix)]
@@ -62,6 +67,8 @@ mod render_desync_live_headless;
 #[cfg(unix)]
 mod reply_grammar_live_headless;
 #[cfg(unix)]
+mod restore_take_live_headless;
+#[cfg(unix)]
 mod retired_hook_shape;
 #[cfg(unix)]
 mod selector_live_headless;
@@ -69,6 +76,10 @@ mod selector_live_headless;
 mod session0_before_loop_live_headless;
 #[cfg(unix)]
 mod session_bin_path;
+#[cfg(unix)]
+mod session_log_journal_live_headless;
+#[cfg(unix)]
+mod session_log_prev_end_live_headless;
 #[cfg(unix)]
 mod session_log_transcript_live_headless;
 #[cfg(unix)]

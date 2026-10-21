@@ -8,12 +8,20 @@
 //! names. The model is `aterm_keeper::code` (the keeper runs from its own copy for another
 //! reason); this one is simpler, as one mug runs at a time.
 //!
-//! The copy is `<code dir>/<label>/X.app`, made as `<label>.partial` and renamed whole, so a
-//! half-made copy is never run. Only the holder of the one-mug lock ([`crate::instance`])
-//! makes one, so it removes everything else in the directory first: an earlier copy, a half
-//! made one, another build's. Files are copied with `std::fs::copy` (an APFS clone, the mode
-//! kept), symbolic links recreated as they read, and anything else refused, so the bundle's
-//! signature still seals the copy.
+//! The copy is `<code dir>/<label>/<id>/X.app`, its `<id>` the serve's pid and the time it
+//! was made, made as `<id>.partial` and renamed whole, so a half-made copy is never run. Only
+//! the holder of the one-mug lock ([`crate::instance`]) makes one, so it removes everything
+//! else in the directory first: an earlier copy, a half made one, another build's. Files are
+//! copied with `std::fs::copy` (an APFS clone, the mode kept), symbolic links recreated as
+//! they read, and anything else refused, so the bundle's signature still seals the copy.
+//!
+//! A copy goes only once it RAN. The re-exec is the copy's first exec, which macOS assesses
+//! after the exec while the process waits at `_dyld_start`; killing the process (`quit`'s
+//! bootout) does not end the assessment, and on macOS 27.0.1 `syspolicyd` crashes when the file
+//! is removed before it ends, stranding every exec on the host. So a mug running from its copy
+//! writes [`RAN`] into it first thing ([`mark_ran`]), and a copy without it stays until the
+//! first-exec hang has passed since it was made ([`sweep`]); each copy has an `<id>` of its own
+//! so a kept one never stands in the next one's way.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +32,33 @@ pub const ORIGIN_ENV: &str = "ATERM_CAFFEINE_ORIGIN";
 
 /// The largest `Info.plist` read: aterm's is a few KiB.
 const PLIST_CAP: u64 = 1 << 20;
+
+/// The file a mug running from its copy writes into the copy's directory first thing
+/// ([`mark_ran`]): the copy's exec is over, so it may go ([`sweep`]).
+pub const RAN: &str = "ran";
+
+/// Say, in the directory of the copy under `code_dir` this process runs from
+/// (`<code dir>/<label>/<id>`), that it runs from it. Best effort: a copy without it is kept
+/// for the first-exec hang, never removed early.
+pub fn mark_ran(code_dir: &Path) {
+    let (Some(exe), Ok(dir)) = (own_exe(), code_dir.canonicalize()) else {
+        return;
+    };
+    let Ok(rest) = exe.strip_prefix(&dir) else {
+        return;
+    };
+    let mut parts = rest.components();
+    let (Some(label), Some(id)) = (parts.next(), parts.next()) else {
+        return;
+    };
+    let home = dir.join(label).join(id);
+    if let Err(e) = std::fs::write(home.join(RAN), b"") {
+        eprintln!(
+            "aterm caffeine: cannot mark {} as run from: {e}",
+            home.display()
+        );
+    }
+}
 
 /// The `.app` bundle `exe` is the main executable of (`X.app/Contents/MacOS/<exe>`), if it is
 /// one.
@@ -130,14 +165,34 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
         .file_name()
         .ok_or_else(|| io::Error::other("the bundle has no name"))?;
     private_dir(code_dir)?;
-    sweep(code_dir)?;
-    let home = code_dir.join(label);
-    let partial = code_dir.join(format!("{label}.partial"));
+    sweep(code_dir, std::time::SystemTime::now())?;
+    let slot = code_dir.join(label);
+    match std::fs::create_dir(&slot) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    if !std::fs::symlink_metadata(&slot)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", slot.display()),
+        ));
+    }
+    let id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let home = slot.join(&id);
+    let partial = slot.join(format!("{id}.partial"));
     let made = std::fs::create_dir(&partial)
         .and_then(|()| copy_tree(bundle, &partial.join(top)))
         .and_then(|()| std::fs::rename(&partial, &home));
     if let Err(e) = made {
         let _ = std::fs::remove_dir_all(&partial);
+        // The label's directory goes with it when it holds nothing else (a kept copy stays).
+        let _ = std::fs::remove_dir(&slot);
         return Err(io::Error::new(
             e.kind(),
             format!(
@@ -248,20 +303,125 @@ fn exclude_from_backup(dir: &Path) {
     }
 }
 
-/// Remove every entry of `dir`: a link or a file as itself, a directory with all it holds.
+/// Remove `code_dir` and every copy in it that may go ([`sweep`]): a mug that ends takes its
+/// copy with it, since once an update retires the bundle it was cloned from, the copy's
+/// blocks are its own (about the app's size). Only the holder of the one-mug lock calls this.
+/// A missing `code_dir` is nothing to remove; a link, a non-directory or another user's
+/// directory at its name is refused and left as it is; a copy the sweep keeps keeps
+/// `code_dir` too.
+///
+/// # Errors
+///
+/// `code_dir` is not this user's directory, or an entry in it cannot be removed.
 #[cfg(unix)]
-fn sweep(dir: &Path) -> io::Result<()> {
+pub fn discard_copies(code_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = match std::fs::symlink_metadata(code_dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !meta.file_type().is_dir() || meta.uid() != aterm_uds::peer::our_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not this user's directory", code_dir.display()),
+        ));
+    }
+    sweep(code_dir, std::time::SystemTime::now())?;
+    if std::fs::read_dir(code_dir)?.next().is_some() {
+        return Ok(());
+    }
+    std::fs::remove_dir(code_dir)
+}
+
+/// How long [`serves_caffeine`] waits for `help caffeine`. The answer comes from a table, so
+/// the time is the exec of a new build (slowest on its first run, while macOS assesses it);
+/// the mug's menu waits meanwhile, and not knowing in time restarts as before.
+#[cfg(unix)]
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the executable `origin` still has the `caffeine` verb: `<origin> help caffeine`
+/// exits 0. `None` when that is unknown (it could not run, or did not answer in
+/// [`PROBE_WAIT`]); `Some(false)` when it ran and refused, as a build from before the verb
+/// does (it exits 2 on an unknown help topic).
+#[cfg(unix)]
+#[must_use]
+// Skip: spawns a child and waits on the wall clock.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn serves_caffeine(origin: &Path) -> Option<bool> {
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command(origin).args(["help", "caffeine"]),
+        std::time::Instant::now() + PROBE_WAIT,
+    )
+    .ok()?;
+    // A signal (no code) says nothing about the verb.
+    out.status.code().map(|code| code == 0)
+}
+
+/// Remove every entry of the code directory `dir` at `now` but a copy that may still be under
+/// its first exec's assessment: a link or a file as itself, a label's directory once it holds
+/// nothing else, and in it every copy that may go ([`may_go`]) and every other entry. A copy
+/// kept is said on stderr.
+#[cfg(unix)]
+fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let removed = if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        removed.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        if !entry.file_type()?.is_dir() {
+            remove_entry(&path, false)?;
+            continue;
+        }
+        if path.extension().is_some_and(|e| e == "partial") {
+            remove_entry(&path, true)?;
+            continue;
+        }
+        let mut kept = false;
+        for copy in std::fs::read_dir(&path)? {
+            let copy = copy?;
+            let at = copy.path();
+            let dir = copy.file_type()?.is_dir();
+            if dir && !may_go(&at, now) {
+                eprintln!(
+                    "aterm caffeine: kept {}: no mug said it ran from it, so macOS may still be \
+                     assessing its first exec",
+                    at.display()
+                );
+                kept = true;
+                continue;
+            }
+            remove_entry(&at, dir)?;
+        }
+        if !kept {
+            remove_entry(&path, true)?;
+        }
     }
     Ok(())
+}
+
+/// Whether the copy at `home` (a label directory's entry) may go at `now`: it was never run
+/// (a half-made copy, `<id>.partial`, is renamed whole before its exec), a mug said it ran
+/// from it ([`RAN`]), or the first-exec hang has passed since it was made.
+#[cfg(unix)]
+fn may_go(home: &Path, now: std::time::SystemTime) -> bool {
+    home.extension().is_some_and(|e| e == "partial")
+        || home.join(RAN).exists()
+        || std::fs::symlink_metadata(home)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| {
+                now.duration_since(at)
+                    .is_ok_and(|age| age >= aterm_uds::deadline::FIRST_EXEC_HANG)
+            })
+}
+
+/// Remove `path`: a directory with all it holds, anything else as itself.
+#[cfg(unix)]
+fn remove_entry(path: &Path, dir: bool) -> io::Result<()> {
+    let removed = if dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    removed.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
 /// Copy `src` to `dst`: directories recreated (their mode set once filled), symbolic links
@@ -577,6 +737,19 @@ mod tests {
         }
     }
 
+    /// The copy's home (`<code>/<label>/<id>`) of the executable `copy` names.
+    #[cfg(unix)]
+    fn home_of(code: &Path, copy: &Path) -> PathBuf {
+        let rest = copy.strip_prefix(code).expect("under the code directory");
+        let mut parts = rest.components();
+        let (label, id) = (parts.next().expect("label"), parts.next().expect("id"));
+        assert_eq!(
+            parts.as_path(),
+            Path::new("Fake (dev).app/Contents/MacOS/aterm")
+        );
+        code.join(label).join(id)
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_bundle_is_copied_exactly_and_replaces_every_other_entry() {
@@ -588,12 +761,16 @@ mod tests {
         // A directory that exists with a looser mode is held to 0700.
         std::fs::create_dir_all(&code).expect("code");
         std::fs::set_permissions(&code, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        // Leftovers: an earlier copy of this label, a half-made one, another build's copy, a
-        // stray file and a link (removed as itself, its target kept).
+        // Leftovers: earlier copies of this label and another build's (each run from), an
+        // older layout's half-made one, a stray file and a link (removed as itself, its target
+        // kept).
         let target = root.path().join("kept");
         std::fs::create_dir_all(&target).expect("target");
-        for dir in ["lbl", "lbl.partial", "com.other"] {
+        for dir in ["lbl/1-1", "lbl/1-2.partial", "lbl.partial", "com.other/2-1"] {
             std::fs::create_dir_all(code.join(dir).join("Old.app")).expect("old");
+        }
+        for ran in ["lbl/1-1", "com.other/2-1"] {
+            std::fs::write(code.join(ran).join(RAN), "").expect("ran");
         }
         std::fs::write(code.join(".DS_Store"), "x").expect("stray");
         std::os::unix::fs::symlink(&target, code.join("link")).expect("link");
@@ -601,20 +778,18 @@ mod tests {
         let copy = prepare_copy(&origin, &code, "lbl")
             .expect("copy")
             .expect("a bundle");
-        assert_eq!(
-            copy,
-            code.join("lbl")
-                .join("Fake (dev).app")
-                .join("Contents")
-                .join("MacOS")
-                .join("aterm")
-        );
-        assert_same_tree(&app, &code.join("lbl").join("Fake (dev).app"));
+        let home = home_of(&code, &copy);
+        assert_same_tree(&app, &home.join("Fake (dev).app"));
         let entries: Vec<_> = std::fs::read_dir(&code)
             .expect("list")
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(entries, [std::ffi::OsString::from("lbl")]);
+        let copies: Vec<_> = std::fs::read_dir(code.join("lbl"))
+            .expect("list")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(copies, std::slice::from_ref(&home), "the new copy alone");
         assert!(target.is_dir(), "a link's target is not swept");
         let mode = std::fs::metadata(&code).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
@@ -626,29 +801,50 @@ mod tests {
             assert!(backup_excluded(&name), "{}", code.display());
         }
 
-        // A second prepare replaces the first copy: a file added to it is gone.
-        std::fs::write(code.join("lbl").join("marker"), "m").expect("marker");
+        // A COPY NO MUG SAID IT RAN FROM IS KEPT (r4g-4): its mug may have been killed in its
+        // first exec, which macOS may still be assessing. The next prepare makes its copy
+        // beside it, at an id of its own.
         std::fs::write(app.join("Contents").join("new.txt"), "new").expect("new");
         let again = prepare_copy(&origin, &code, "lbl")
             .expect("copy")
             .expect("a bundle");
-        assert_eq!(again, copy);
-        assert!(!code.join("lbl").join("marker").exists());
-        assert_same_tree(&app, &code.join("lbl").join("Fake (dev).app"));
-        assert!(!code.join("lbl.partial").exists());
+        let next = home_of(&code, &again);
+        assert_ne!(next, home, "an id of its own");
+        assert!(
+            home.join("Fake (dev).app").is_dir(),
+            "the unproven copy is kept"
+        );
+        assert_same_tree(&app, &next.join("Fake (dev).app"));
+        // NEGATIVE CONTROLS: once its mug said it ran, the next prepare replaces it; so it does
+        // a copy the first-exec hang has passed since.
+        std::fs::write(home.join(RAN), "").expect("ran");
+        let third = prepare_copy(&origin, &code, "lbl")
+            .expect("copy")
+            .expect("a bundle");
+        assert!(!home.exists(), "it ran: replaced");
+        assert!(next.is_dir(), "the second copy, unproven, stays");
+        sweep(
+            &code,
+            std::time::SystemTime::now() + aterm_uds::deadline::FIRST_EXEC_HANG,
+        )
+        .expect("sweep");
+        assert!(!next.exists(), "past the first-exec hang: removed");
+        assert!(
+            !home_of(&code, &third).exists(),
+            "and so is the third, by then"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn a_bundle_with_a_fifo_is_refused_and_leaves_no_partial_copy() {
+        use std::os::unix::ffi::OsStrExt as _;
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let app = stand_in_bundle(root.path(), "com.example.fake");
         let fifo = app.join("Contents").join("pipe");
-        let made = aterm_uds::spawnfd::command("/usr/bin/mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo");
-        assert!(made.success());
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: a NUL-terminated path the call reads and does not retain.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
         let code = root.path().join("code");
         let origin = app.join("Contents").join("MacOS").join("aterm");
         let err = prepare_copy(&origin, &code, "lbl").expect_err("a fifo");
@@ -687,6 +883,49 @@ mod tests {
         std::fs::write(&file, "x").expect("file");
         assert!(prepare_copy(&origin, &file, "lbl").is_err());
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "x");
+    }
+
+    /// The probe's answer is the exit status: 0 serves, any other code does not, and a program
+    /// that cannot run says nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_reads_the_verb_from_the_exit_status() {
+        assert_eq!(serves_caffeine(Path::new("/usr/bin/true")), Some(true));
+        assert_eq!(serves_caffeine(Path::new("/usr/bin/false")), Some(false));
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        assert_eq!(serves_caffeine(&root.path().join("missing")), None);
+    }
+
+    /// An ended mug's copy goes whole once it said it ran from it, the directory with it;
+    /// nothing there is nothing to do, and a link at the name is refused with what it points at
+    /// untouched. NEGATIVE CONTROL: a copy no mug said it ran from stays, and the directory
+    /// with it, without an error.
+    #[cfg(unix)]
+    #[test]
+    fn discarding_removes_the_copies_and_never_follows_a_link() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let app = stand_in_bundle(root.path(), "com.example.fake");
+        let origin = app.join("Contents").join("MacOS").join("aterm");
+        let code = root.path().join("code");
+        let copy = prepare_copy(&origin, &code, "lbl")
+            .expect("copy")
+            .expect("a bundle");
+        let home = home_of(&code, &copy);
+        discard_copies(&code).expect("an unproven copy is kept, not an error");
+        assert!(home.join("Fake (dev).app").is_dir(), "kept while unproven");
+        std::fs::write(home.join(RAN), "").expect("ran");
+        discard_copies(&code).expect("discard");
+        assert!(!code.exists(), "the copy and its directory are gone");
+        discard_copies(&code).expect("nothing to discard");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("keep")).expect("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &code).expect("link");
+        let err = discard_copies(&code).expect_err("a link");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            elsewhere.join("keep").is_dir(),
+            "nothing removed through it"
+        );
     }
 
     #[test]
@@ -862,7 +1101,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod handover {
         use std::path::{Path, PathBuf};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         use crate::code;
         use crate::instance::{self, Instance};
@@ -881,6 +1120,8 @@ mod tests {
             let lock = dir.join("caffeine.lock");
             let code_dir = dir.join("code");
             if code::runs_from_copy(&code_dir) {
+                // What `serve` does first from its copy.
+                code::mark_ran(&code_dir);
                 let origin = code::origin_exe(&code_dir);
                 let adopted = Instance::adopt(&lock);
                 let stdin_null = {
@@ -940,13 +1181,20 @@ mod tests {
 
         /// Run the child from a fresh stand-in bundle, in `mode`: its pid before the exec, the
         /// copy's report, the stand-in's executable (canonical) and the scratch directory.
-        fn run_child(mode: &str) -> (String, String, PathBuf, aterm_tempfile::TempDir) {
-            let root = aterm_tempfile::tempdir().expect("tempdir");
+        ///
+        /// Both executables the child runs are new copies of this test binary (the stand-in,
+        /// then the bundle copy it re-executes from), which macOS assesses at their first exec:
+        /// the scratch directory goes only once each wrote its file (`first`, `report`), and a
+        /// child killed before that leaves it in place ([`aterm_uds::deadline::KeptUntilRan`]).
+        fn run_child(mode: &str) -> (String, String, PathBuf, aterm_uds::deadline::KeptUntilRan) {
+            let mut root = aterm_uds::deadline::KeptUntilRan::new(
+                aterm_tempfile::tempdir().expect("tempdir").keep(),
+            );
             let exe = stand_in(root.path());
             let work = root.path().join("work");
             std::fs::create_dir_all(&work).expect("work");
             std::fs::write(work.join("mode"), mode).expect("mode");
-            // A minute is a hang detector.
+            // A hang detector: the system's first-exec wait, once for each of the two copies.
             let out = aterm_uds::deadline::output_until(
                 aterm_uds::spawnfd::command(&exe)
                     .args([
@@ -955,20 +1203,29 @@ mod tests {
                         "--test-threads=1",
                     ])
                     .env(DIR_ENV, &work),
-                Instant::now() + Duration::from_secs(60),
-            )
-            .expect("child");
+                Instant::now() + 2 * aterm_uds::deadline::FIRST_EXEC_HANG,
+            );
+            let first = std::fs::read_to_string(work.join("first"));
+            let report = std::fs::read_to_string(work.join("report"));
+            if first.is_ok() && report.is_ok() {
+                root.ran();
+            }
+            let out = out.unwrap_or_else(|e| {
+                panic!(
+                    "the child from {}: {e}; its copies stay under {} unless both ran",
+                    exe.display(),
+                    root.path().display()
+                )
+            });
             assert!(
                 out.status.success(),
                 "{}\n{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            let first = std::fs::read_to_string(work.join("first")).expect("first");
-            let report = std::fs::read_to_string(work.join("report")).expect("the copy ran");
             (
-                first,
-                report,
+                first.expect("first"),
+                report.expect("the copy ran"),
                 std::fs::canonicalize(&exe).expect("origin"),
                 root,
             )
@@ -985,16 +1242,23 @@ mod tests {
                 )
             );
             let work = root.path().join("work");
-            // The copy is where prepare_copy put it, and the lock went with the process.
+            // The copy is where prepare_copy put it, it said it ran from it (`code::mark_ran`
+            // found its own copy's home), and the lock went with the process.
+            let copies: Vec<_> = std::fs::read_dir(work.join("code").join("lbl"))
+                .expect("the label's copies")
+                .map(|e| e.expect("entry").path())
+                .collect();
+            let [home] = copies.as_slice() else {
+                panic!("one copy: {copies:?}");
+            };
             assert!(
-                work.join("code")
-                    .join("lbl")
-                    .join("T.app")
+                home.join("T.app")
                     .join("Contents")
                     .join("MacOS")
                     .join("handover")
                     .is_file()
             );
+            assert!(home.join(code::RAN).is_file(), "the copy said it ran");
             assert_eq!(instance::running_pid(&work.join("caffeine.lock")), None);
             drop(root);
         }

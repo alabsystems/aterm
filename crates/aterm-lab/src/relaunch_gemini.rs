@@ -411,7 +411,7 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     crate::gemini::need(&run, Agent::Gemini).map_err(|f| could_not(&f.msg.unwrap_or_default()))?;
     if !crate::sys::executable(PATH_GEMINI) {
         return Err(could_not(&format!(
-            "no {PATH_GEMINI} (brew install gemini-cli)"
+            "no {PATH_GEMINI}, where this lane's shell runs the Gemini CLI; aterm installs none"
         )));
     }
     println!(

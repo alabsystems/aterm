@@ -1080,7 +1080,7 @@ fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
 
 /// atpkg's macOS `targo` shim runs aterm's build-dir block before its exec (the block is
 /// atpkg's own, `build_cache::shim_block`, so the shim writer and this reader answer to
-/// one contract): about seventy lines of builtins, the exec last. With no `aterm` to
+/// one contract): about a hundred and twenty lines of builtins, the exec last. With no `aterm` to
 /// ask, that shim on PATH still names the store. Only the decided shape is followed
 /// (`gate_shim_target`): a second exec (atpkg's compat route guard), an exec that is not
 /// last, a relative or unquoted target, a file that is not `#!/bin/sh`, a

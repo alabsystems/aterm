@@ -353,9 +353,7 @@ impl Grid {
             }
 
             if cell.is_complex() {
-                if let Some(cs) = self.complex_char_str_at(row, col) {
-                    s.push_str(&cs);
-                } else {
+                if !self.push_complex_char_at(row, col, &mut s) {
                     s.push('\u{FFFD}');
                 }
                 if cell.has_extras()

@@ -8,7 +8,8 @@
 //! [`Terminal::keyboard_mode`](super::Terminal::keyboard_mode),
 //! [`Terminal::mouse_mode`](super::Terminal::mouse_mode) and
 //! [`Terminal::focus_reporting_enabled`](super::Terminal::focus_reporting_enabled), plus the
-//! alternate-screen flag and DEC 1007 (alternate scroll). The input seam reads it on every key
+//! alternate-screen flag, DEC 1007 (alternate scroll) and DEC 2004 (bracketed paste). The input
+//! seam reads it on every key
 //! press without the terminal mutex; so do the DEC 1004 gate at the window's tab/pane
 //! re-stabilization point, which may not take the engine mutex, and the wheel route
 //! (`input::wheel_route_mirrored`, twin of the locked `wheel_route_for`).
@@ -37,6 +38,10 @@ pub struct ModeMirror {
     /// DEC 1007 (alternate scroll) — `modes.alternate_scroll`: on the alternate
     /// screen, a wheel nobody tracks becomes arrow keys.
     alternate_scroll: AtomicBool,
+    /// DEC 2004 (bracketed paste) — `modes.bracketed_paste`: a paste framed
+    /// by the live mode is wrapped in its markers, so it writes the program
+    /// bytes whatever its text.
+    bracketed_paste: AtomicBool,
 }
 
 impl ModeMirror {
@@ -94,22 +99,28 @@ impl ModeMirror {
         self.alternate_scroll.load(Ordering::Acquire)
     }
 
-    /// Publish a fresh fold. Called only by the terminal, under its mutex.
-    pub(crate) fn publish(
-        &self,
-        keyboard: KeyboardMode,
-        mouse: MouseMode,
-        focus: bool,
-        alternate_screen: bool,
-        alternate_scroll: bool,
-    ) {
-        self.keyboard.store(keyboard.bits(), Ordering::Release);
-        self.mouse.store(mouse as u8, Ordering::Release);
-        self.focus.store(focus, Ordering::Release);
+    /// Lock-free twin of `Terminal::modes().bracketed_paste` (DEC 2004): the
+    /// framing a paste that reads the live mode gets
+    /// ([`super::Terminal::format_paste`]).
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste.load(Ordering::Acquire)
+    }
+
+    /// Publish a fresh fold of `term`. Called only by the terminal, under its
+    /// mutex ([`super::Terminal::refresh_mode_mirror`]).
+    fn publish(&self, term: &super::Terminal) {
+        self.keyboard
+            .store(term.keyboard_mode().bits(), Ordering::Release);
+        self.mouse.store(term.mouse_mode() as u8, Ordering::Release);
+        self.focus
+            .store(term.focus_reporting_enabled(), Ordering::Release);
         self.alternate_screen
-            .store(alternate_screen, Ordering::Release);
+            .store(term.is_alternate_screen(), Ordering::Release);
         self.alternate_scroll
-            .store(alternate_scroll, Ordering::Release);
+            .store(term.modes.alternate_scroll, Ordering::Release);
+        self.bracketed_paste
+            .store(term.modes.bracketed_paste, Ordering::Release);
     }
 }
 
@@ -137,13 +148,7 @@ impl super::Terminal {
     /// Re-publish the fold. Called by every site outside `process()` that can move one of its
     /// inputs, and once per batch by `process_at` after the parser runs.
     pub(crate) fn refresh_mode_mirror(&self) {
-        self.mode_mirror.publish(
-            self.keyboard_mode(),
-            self.mouse_mode(),
-            self.focus_reporting_enabled(),
-            self.is_alternate_screen(),
-            self.modes.alternate_scroll,
-        );
+        self.mode_mirror.publish(self);
     }
 
     /// Asserts the published word equals the live fold. Run at the start of every `process()`
@@ -174,6 +179,11 @@ impl super::Terminal {
             self.mode_mirror.alternate_scroll(),
             self.modes.alternate_scroll,
             "alternate-scroll mirror out of sync: a mutation site forgot refresh_mode_mirror()"
+        );
+        debug_assert_eq!(
+            self.mode_mirror.bracketed_paste(),
+            self.modes.bracketed_paste,
+            "bracketed-paste mirror out of sync: a mutation site forgot refresh_mode_mirror()"
         );
     }
 }
@@ -213,6 +223,11 @@ mod tests {
             m.alternate_scroll(),
             term.modes().alternate_scroll,
             "alternate scroll after {what}"
+        );
+        assert_eq!(
+            m.bracketed_paste(),
+            term.modes().bracketed_paste,
+            "bracketed paste after {what}"
         );
     }
 
@@ -262,6 +277,11 @@ mod tests {
             ("leave alt screen 47", b"\x1b[?47l"),
             ("enter alt screen 1047", b"\x1b[?1047h"),
             ("leave alt screen 1047", b"\x1b[?1047l"),
+            // DEC 2004 (a paste's live framing), both edges, and DECSTR's reset of it.
+            ("bracketed paste on", b"\x1b[?2004h"),
+            ("bracketed paste off", b"\x1b[?2004l"),
+            ("bracketed paste on again", b"\x1b[?2004h"),
+            ("DECSTR clears bracketed paste", b"\x1b[!p"),
             ("VT52 enter", b"\x1b[?2l"),
             // In VT52 neither CSI nor `ESC c` parse: leave it before RIS.
             ("VT52 exit", b"\x1b<"),
@@ -289,6 +309,10 @@ mod tests {
         assert!(term.mode_mirror().alternate_screen() && term.mode_mirror().alternate_scroll());
         term.process(b"\x1b[?1049l\x1b[?1007l");
         assert!(!term.mode_mirror().alternate_screen() && !term.mode_mirror().alternate_scroll());
+        term.process(b"\x1b[?2004h");
+        assert!(term.mode_mirror().bracketed_paste());
+        term.process(b"\x1b[?2004l");
+        assert!(!term.mode_mirror().bracketed_paste());
     }
 
     #[test]
@@ -321,6 +345,14 @@ mod tests {
         let _ = term.apply_config(&config);
         assert!(term.focus_reporting_enabled(), "the host armed DEC 1004");
         assert_in_sync(&term, "apply_config(focus_reporting = true)");
+        // ... and seeds DEC 2004 from the host's setting, both edges.
+        config.bracketed_paste = true;
+        let _ = term.apply_config(&config);
+        assert!(term.modes().bracketed_paste, "the host seeded DEC 2004");
+        assert_in_sync(&term, "apply_config(bracketed_paste = true)");
+        config.bracketed_paste = false;
+        let _ = term.apply_config(&config);
+        assert_in_sync(&term, "apply_config(bracketed_paste = false)");
         term.process(b"x");
         assert_in_sync(&term, "one output byte after apply_config");
         term.process(b"\x1b[?1004h");

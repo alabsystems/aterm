@@ -16,7 +16,7 @@
 //! whitespace rather than send a line the other end would read differently.
 //! Each `parse` takes what its `format` writes, and `parse(format(x)) == x`.
 //!
-//! - `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>]` →
+//! - `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]` →
 //!   `OK edit ticket=<t> view=<v> doc=<d> uri=<canonical-uri>`
 //! - `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]` →
 //!   `OK edit done result=finished|closed|aborted saved=0|1 seq=<n>`
@@ -72,13 +72,13 @@ impl std::fmt::Display for EditError {
 impl std::error::Error for EditError {}
 
 /// The `edit` request's usage line.
-pub const EDIT_USAGE: &str = "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>]";
+pub const EDIT_USAGE: &str = "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]";
 
 /// The `await edit` request's usage line.
 pub const AWAIT_EDIT_USAGE: &str = "await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]";
 
-/// `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>]`: open a fresh
-/// Editor view of the file beside the asking session.
+/// `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`: open
+/// a fresh Editor view of the file beside the asking session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditRequest {
     /// The file, as a `file://` URI ([`super::uri::path_to_file_uri`]).
@@ -90,6 +90,11 @@ pub struct EditRequest {
     /// The program the edit is for (`git`), shown in the view's header row:
     /// `[A-Za-z0-9._-]`, at most 32 characters.
     pub for_word: Option<String>,
+    /// Whether the asker will wait on the ticket (`await edit`). `wait=0`
+    /// (`amacs --no-wait`) says nobody will, so the asking session is not
+    /// held while the view is open (design §6.7). On the wire only when
+    /// false: a waiting request reads as it always has.
+    pub wait: bool,
 }
 
 impl EditRequest {
@@ -105,6 +110,7 @@ impl EditRequest {
             line: None,
             create: false,
             for_word: None,
+            wait: true,
         };
         let mut seen = Vec::new();
         for word in words {
@@ -129,6 +135,13 @@ impl EditRequest {
                         return Err(EditError::BadField("for", value.to_string()));
                     }
                     request.for_word = Some(value.to_string());
+                }
+                "wait" => {
+                    request.wait = match value {
+                        "1" => true,
+                        "0" => false,
+                        _ => return Err(EditError::BadField("wait", value.to_string())),
+                    };
                 }
                 _ => return Err(EditError::UnknownOption(word.to_string())),
             }
@@ -160,6 +173,9 @@ impl EditRequest {
             }
             args.push_str(" for=");
             args.push_str(word);
+        }
+        if !self.wait {
+            args.push_str(" wait=0");
         }
         Ok(args)
     }
@@ -379,10 +395,45 @@ fn format_line(line: u32, col: Option<u32>) -> String {
 
 /// `[A-Za-z0-9._-]{1,32}`: what a client may name the program it edits for.
 fn is_for_word(word: &str) -> bool {
-    (1..=32).contains(&word.len())
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    (1..=32).contains(&word.len()) && word.bytes().all(for_word_byte)
+}
+
+trust_contract_fn! {
+    /// Whether `byte` may appear in a `for=` word: an ASCII letter or digit,
+    /// `.`, `_` or `-`. No space and no `=` is among them, so the word stays
+    /// one `key=value` wire field.
+    #[expect(
+        clippy::manual_range_contains,
+        reason = "Trust kernel-imports a bool tree of comparisons, not a call to `RangeInclusive::contains` (E6 refuses calls)"
+    )]
+    fn for_word_byte(byte: u8) -> bool
+    clauses [ensures result == ((byte >= 48 && byte <= 57)
+        || ((byte >= 65 && byte <= 90)
+        || ((byte >= 97 && byte <= 122)
+        || (byte == 46 || (byte == 95 || byte == 45)))))
+        by for_word_byte_is_exactly_the_word_set]
+    {
+        (byte >= b'0' && byte <= b'9')
+            || (byte >= b'A' && byte <= b'Z')
+            || (byte >= b'a' && byte <= b'z')
+            || byte == b'.'
+            || byte == b'_'
+            || byte == b'-'
+    }
+}
+
+// Spec `for-word-byte-set` (SPECS.md), kernel-checked against the compiled
+// body: the set is the clause, byte for byte.
+verify_island! {
+    clean {
+        theorem for_word_byte_is_exactly_the_word_set (byte : UInt8) :
+            trust_import_amacs__protocol__edit__for_word_byte byte =
+              ((decide (48 <= byte) && decide (byte <= 57))
+                || ((decide (65 <= byte) && decide (byte <= 90))
+                || ((decide (97 <= byte) && decide (byte <= 122))
+                || (decide (byte = 46) || (decide (byte = 95) || decide (byte = 45)))))) := by
+          simp only [trust_import_amacs__protocol__edit__for_word_byte]
+    }
 }
 
 /// `value` is one non-empty, whitespace-free wire token.
@@ -427,7 +478,7 @@ fn keyed<'a, const N: usize>(
         return Err(EditError::Usage(form));
     }
     let mut values = [""; N];
-    for (slot, (field, key)) in fields.iter().zip(keys).enumerate() {
+    for (slot, (field, key)) in values.iter_mut().zip(fields.iter().zip(keys)) {
         let value = field
             .strip_prefix(key)
             .and_then(|rest| rest.strip_prefix('='))
@@ -435,7 +486,7 @@ fn keyed<'a, const N: usize>(
         if value.is_empty() {
             return Err(EditError::BadField(key, String::new()));
         }
-        values[slot] = value;
+        *slot = value;
     }
     Ok(values)
 }
@@ -443,6 +494,14 @@ fn keyed<'a, const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_word_byte_is_the_set_it_replaced() {
+        for byte in u8::MIN..=u8::MAX {
+            let before = byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-');
+            assert_eq!(for_word_byte(byte), before, "byte {byte:#04x}");
+        }
+    }
 
     const URI: &str = "file:///private/tmp/x%20y/COMMIT_EDITMSG";
 
@@ -454,23 +513,42 @@ mod tests {
                 line: None,
                 create: false,
                 for_word: None,
+                wait: true,
             },
             EditRequest {
                 uri: URI.to_string(),
                 line: Some((3, None)),
                 create: false,
                 for_word: Some("git".to_string()),
+                wait: true,
             },
             EditRequest {
                 uri: URI.to_string(),
                 line: Some((12, Some(7))),
                 create: true,
                 for_word: Some("claude-code_2.1".to_string()),
+                wait: true,
+            },
+            EditRequest {
+                uri: URI.to_string(),
+                line: None,
+                create: false,
+                for_word: Some("git".to_string()),
+                wait: false,
             },
         ] {
             let args = request.format().unwrap();
             assert_eq!(EditRequest::parse(&args).unwrap(), request, "{args}");
+            assert_eq!(
+                args.contains("wait="),
+                !request.wait,
+                "only `wait=0` is written: {args}"
+            );
         }
+        assert!(
+            EditRequest::parse(&format!("{URI} wait=1")).unwrap().wait,
+            "`wait=1` is the default spelled out"
+        );
         assert_eq!(
             EditRequest::parse(&format!("{URI}   for=git line=2:1 ")).unwrap(),
             EditRequest {
@@ -478,6 +556,7 @@ mod tests {
                 line: Some((2, Some(1))),
                 create: false,
                 for_word: Some("git".to_string()),
+                wait: true,
             },
             "options in any order, any spacing"
         );
@@ -508,6 +587,7 @@ mod tests {
             line: Some((0, None)),
             create: false,
             for_word: None,
+            wait: true,
         };
         assert!(matches!(zero.format(), Err(EditError::BadLine(_))));
     }
@@ -523,6 +603,8 @@ mod tests {
             "place=split",
             "line=1 line=2",
             "create=yes",
+            "wait=no",
+            "wait=0 wait=0",
             "for=a/b",
             "bare",
         ] {
@@ -542,6 +624,7 @@ mod tests {
             line: None,
             create: false,
             for_word: None,
+            wait: true,
         };
         assert_eq!(spaced.format(), Err(EditError::Whitespace("uri")));
         let word = EditRequest {
@@ -549,6 +632,7 @@ mod tests {
             line: None,
             create: false,
             for_word: Some("git commit".to_string()),
+            wait: true,
         };
         assert_eq!(word.format(), Err(EditError::Whitespace("for")));
         let ok = EditOk {

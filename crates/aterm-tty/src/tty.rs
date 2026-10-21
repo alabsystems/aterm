@@ -650,13 +650,13 @@ mod mem {
                 return Ok(Readiness::Closed);
             };
             Ok(match item {
-                Scripted::Bytes(mut bytes) => {
+                Scripted::Bytes(bytes) => {
                     let n = bytes.len().min(buf.len());
                     buf[..n].copy_from_slice(&bytes[..n]);
-                    if n < bytes.len() {
+                    if let Some(rest) = bytes.get(n..).filter(|rest| !rest.is_empty()) {
                         state
                             .script
-                            .push_front((at, Scripted::Bytes(bytes.split_off(n))));
+                            .push_front((at, Scripted::Bytes(rest.to_vec())));
                     }
                     Readiness::Bytes(n)
                 }
@@ -729,7 +729,7 @@ mod mem {
             for mode in set_order(modes, kitty) {
                 state.output.extend(mode.set_bytes());
             }
-            state.suspended += 1;
+            state.suspended = state.suspended.saturating_add(1);
             state.signals = state.signals.union(Signals::CONT);
             Ok(())
         }

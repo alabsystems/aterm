@@ -328,7 +328,7 @@ struct DisplayRowCache {
     /// resolved at. The main and alt grids keep INDEPENDENT `content_gen`
     /// counters (both seeded at 1), so a screen swap landing on a coinciding
     /// `content_gen`+`display_offset`+`row` must still invalidate — hence the
-    /// alt-screen bit (mirrors `CachedSearchIndex`'s key).
+    /// alt-screen bit (mirrors `SearchKey::alt`, the search index's key).
     key: Option<(bool, u64, usize, u16)>,
     /// `(grapheme, is_wide)` per display column of `key.row`.
     cells: Vec<(String, bool)>,
@@ -1391,7 +1391,7 @@ pub fn encode_key_with_mode(
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
 
-/// A detected link under a cell: its text/URL, the half-open display-column span
+/// A detected link under a cell: its text/URL, the half-open grid-column span
 /// it covers, and a `kind` discriminant (0=osc8, 1=url, 2=file_path, 3=other).
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct LinkHit {
@@ -1409,13 +1409,16 @@ impl LinkHit {
         self.url.clone()
     }
 
-    /// Inclusive start display column of the link span.
+    /// Inclusive start column of the link span: a grid column in logical order,
+    /// the painted cell on a single-width left-to-right row (a DEC double-width
+    /// line paints grid column `c` at cells `2c` and `2c + 1`; a BiDi row is
+    /// painted in visual order).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn start_col(&self) -> u16 {
         self.start_col
     }
 
-    /// Exclusive end display column of the link span.
+    /// Exclusive end column of the link span, a grid column as `start_col` is.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn end_col(&self) -> u16 {
         self.end_col
@@ -2402,6 +2405,70 @@ mod tests {
                 ("https://example.com/a".to_string(), 5, 26, 1),
                 "link at column {col}"
             );
+        }
+    }
+
+    /// The link `link_at` names is the one painted under the cell the host
+    /// passes: a BiDi row is painted in visual order, and a DEC double-width
+    /// line paints grid column `c` at cells `2c` and `2c + 1`. Read as a grid
+    /// column, painted cell 5 named link A over link B's painted `ה` on the BiDi
+    /// row, and link B over link A's `X` on the doubled one. An LTR
+    /// single-width row, where painted is logical, is the control.
+    #[test]
+    fn a_link_is_named_by_the_cell_it_is_painted_in() {
+        let osc8 = |url: &str, text: &str| format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\");
+        let (a, b) = ("https://a.example/", "https://b.example/");
+        let rows = [
+            // `see אבג דהו end`, painted `see והד גבא end`: painted v in
+            // 4..=10 shows logical 14 - v.
+            (
+                format!(
+                    "see {} {} end",
+                    osc8(a, "\u{5d0}\u{5d1}\u{5d2}"),
+                    osc8(b, "\u{5d3}\u{5d4}\u{5d5}")
+                ),
+                [
+                    (4, Some(b)),
+                    (5, Some(b)),
+                    (7, None),
+                    (9, Some(a)),
+                    (10, Some(a)),
+                    (12, None),
+                ],
+            ),
+            // `ab XY ZW` doubled: X is grid 2, painted 4 and 5; Z is grid 5.
+            (
+                format!("\x1b#6ab{} {}", osc8(a, "XY"), osc8(b, "ZW")),
+                [
+                    (4, Some(a)),
+                    (5, Some(a)),
+                    (7, Some(a)),
+                    (8, None),
+                    (10, Some(b)),
+                    (13, Some(b)),
+                ],
+            ),
+            // The control: painted is logical.
+            (
+                format!("ab{} {}", osc8(a, "XY"), osc8(b, "ZW")),
+                [
+                    (2, Some(a)),
+                    (3, Some(a)),
+                    (4, None),
+                    (5, Some(b)),
+                    (6, Some(b)),
+                    (7, None),
+                ],
+            ),
+        ];
+        for (row, cells) in rows {
+            let mut t = AtermTerminal::new(4, 40, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
+                .expect("the bundled face parses");
+            t.process(format!("{row}\r\n").as_bytes());
+            for (col, want) in cells {
+                let got = t.link_at(0, col).map(|hit| hit.url());
+                assert_eq!(got.as_deref(), want, "{row:?}: painted cell {col}");
+            }
         }
     }
 

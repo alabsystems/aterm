@@ -96,3 +96,9 @@ path = "tests/scoped_extract_alloc.rs"
 [[test]]
 name = "conformance_shared_budget"
 path = "tests/conformance_shared_budget.rs"
+
+# Alone: asserts the process-wide fx engine counters (`fx_layer_builds`,
+# `fx_payload_copies`) exactly, which no other test may move meanwhile.
+[[test]]
+name = "fx_counters"
+path = "tests/fx_counters.rs"

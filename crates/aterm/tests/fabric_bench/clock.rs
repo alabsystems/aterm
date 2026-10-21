@@ -12,15 +12,28 @@
 //! unit-tested on synthetic timelines.
 //!
 //! WHEN A RECORD LANDED is the one moment the outside cannot see, and the
-//! broker serving every world here is IN THIS PROCESS. Its subscriber-visible
-//! head ([`astream_broker::Broker::visible_head`]) is one atomic load — no
-//! request, no lock, nothing that competes with the bridge — and it moves only
-//! once a batch is durable (a guarded broker is Strict: the fsync comes first,
-//! then the head, then the acks). [`sample_heads`] reads it every
-//! [`SAMPLE_GAP`] and keeps each change, so after the run "the record at offset
-//! `s` was durable and visible by `t`" is a lookup ([`Timeline::landed`]):
-//! the first change seen past `s`, at most one gap (plus scheduling) after the
-//! fact. Which offset a given message took is read off the log once the broker
+//! broker serving every world here is IN THIS PROCESS. It has two heads, each
+//! one atomic load — no request, no lock, nothing that competes with the
+//! bridge — and [`sample_heads`] reads both every [`SAMPLE_GAP`] and keeps
+//! each change, so after the run "the record at offset `s` had passed that
+//! head by `t`" is a lookup ([`Timeline::landed`]): the first change seen past
+//! `s`, at most one gap (plus scheduling) after the fact.
+//!
+//! * The ACKED head ([`astream_broker::Broker::visible_head`]): a record below
+//!   it is visible to subscribers and its publish is acked. On a strict broker
+//!   it moves after the batch's full flush; on an ordered one after its
+//!   barrier (an escalated record's after its full flush); on a relaxed one
+//!   after the page-cache write. The bench's "acked" is this head. (Before the
+//!   ordered arm existed every entry called it "durable": on the strict broker
+//!   every entry measured, the two heads are one.)
+//! * The DURABLE head ([`astream_broker::Broker::durable_head`]): a record
+//!   below it is on stable media by a full flush the broker saw succeed. On a
+//!   strict broker it moves with the acked head; on an ordered one at each
+//!   full flush (an escalated record's, the horizon's); on a relaxed one only
+//!   at the open and a clean close, so no record of a run is ever seen durable
+//!   there, and the tables say "not seen".
+//!
+//! Which offset a given message took is read off the log once the broker
 //! has stopped (`census.rs`), so no timed window spends a request on the
 //! broker. Two things touch it inside one, both named where they happen: the
 //! messaging phases' own posts, which are the traffic being measured, and the
@@ -57,19 +70,20 @@ pub fn ms(a: u64, b: u64) -> f64 {
 /// How often [`sample_heads`] looks. NOT A SYNCHRONISATION SLEEP: nothing waits
 /// on the sampler — it is a stopwatch beside the run, and the gap only bounds
 /// how late it can stamp a change (one Strict fsync on this hardware is
-/// milliseconds, so a tenth of one is resolution to spare) while keeping it off
-/// a core.
+/// milliseconds, and an ordered barrier a few tenths of one, so a tenth of a
+/// millisecond is the resolution both need) while keeping it off a core.
 pub const SAMPLE_GAP: Duration = Duration::from_micros(100);
 
-/// The head over time: `(us, head)`, both ascending, one entry per change
+/// A head over time: `(us, head)`, both ascending, one entry per change
 /// [`sample_heads`] saw (the first entry is the head when it started).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Timeline(Vec<(u64, u64)>);
 
 impl Timeline {
-    /// When the record at offset `seq` was first seen durable: the first entry
-    /// whose head is past it. `None` when the sampler never saw it land (it
-    /// stopped first) — or when it had already landed before the sampler
+    /// When the record at offset `seq` was first seen below the head: the
+    /// first entry whose head is past it. `None` when the sampler never saw it
+    /// pass (it stopped first, or — the durable head of a relaxed broker — the
+    /// head never moved) — or when it had already passed before the sampler
     /// started, which no measured record here has.
     #[must_use]
     pub fn landed(&self, seq: u64) -> Option<u64> {
@@ -87,19 +101,38 @@ impl Timeline {
     }
 }
 
-/// Watch `head` until `stop` is set, keeping each change, stamped on `clock`.
-///
-/// `head` is [`astream_broker::Broker::visible_head`] in the run: an atomic
-/// load, monotone because the log only grows (no retention runs here).
-pub fn sample_heads(clock: Clock, head: impl Fn() -> u64, stop: &AtomicBool) -> Timeline {
-    let mut entries: Vec<(u64, u64)> = Vec::with_capacity(4096);
+/// The two heads over one run: the acked (visible) and the durable one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Heads {
+    /// [`astream_broker::Broker::visible_head`]'s changes.
+    pub acked: Timeline,
+    /// [`astream_broker::Broker::durable_head`]'s changes.
+    pub durable: Timeline,
+}
+
+/// Watch both heads until `stop` is set, keeping each one's changes, stamped
+/// on `clock`. `heads` answers `(acked, durable)`: in the run, two atomic
+/// loads of the in-process broker ([`astream_broker::Broker::visible_head`]
+/// and [`astream_broker::Broker::durable_head`]), each monotone because the
+/// log only grows (no retention runs here). Read in one call, so the two
+/// timelines share their stamps.
+pub fn sample_heads(clock: Clock, heads: impl Fn() -> (u64, u64), stop: &AtomicBool) -> Heads {
+    let mut acked: Vec<(u64, u64)> = Vec::with_capacity(4096);
+    let mut durable: Vec<(u64, u64)> = Vec::with_capacity(4096);
     loop {
-        let h = head();
-        if entries.last().is_none_or(|&(_, last)| last != h) {
-            entries.push((clock.us(), h));
+        let (a, d) = heads();
+        let now = clock.us();
+        if acked.last().is_none_or(|&(_, last)| last != a) {
+            acked.push((now, a));
+        }
+        if durable.last().is_none_or(|&(_, last)| last != d) {
+            durable.push((now, d));
         }
         if stop.load(Ordering::Relaxed) {
-            return Timeline(entries);
+            return Heads {
+                acked: Timeline(acked),
+                durable: Timeline(durable),
+            };
         }
         std::thread::sleep(SAMPLE_GAP);
     }
@@ -129,6 +162,10 @@ mod tests {
         assert_eq!(t.landed(13), None, "not yet seen");
         assert_eq!(t.landed(9), None, "landed before the sampler started");
         assert_eq!(Timeline::default().landed(0), None);
+        // A head that never moved (a relaxed broker's durable head): nothing
+        // is ever seen past it.
+        let still = Timeline(vec![(0, 10)]);
+        assert_eq!(still.landed(10), None);
     }
 
     #[test]
@@ -136,27 +173,45 @@ mod tests {
         use super::*;
 
         use std::sync::atomic::AtomicU64;
-        let head = AtomicU64::new(5);
+        let acked = AtomicU64::new(5);
+        let durable = AtomicU64::new(3);
         let stop = AtomicBool::new(false);
         let clock = Clock::start();
-        let timeline = std::thread::scope(|s| {
-            let sampler = s.spawn(|| sample_heads(clock, || head.load(Ordering::Relaxed), &stop));
+        let heads = std::thread::scope(|s| {
+            let sampler = s.spawn(|| {
+                sample_heads(
+                    clock,
+                    || {
+                        (
+                            acked.load(Ordering::Relaxed),
+                            durable.load(Ordering::Relaxed),
+                        )
+                    },
+                    &stop,
+                )
+            });
             let _stop = StopOnDrop(&stop);
-            head.store(6, Ordering::Relaxed);
-            head.store(8, Ordering::Relaxed);
+            acked.store(6, Ordering::Relaxed);
+            acked.store(8, Ordering::Relaxed);
+            durable.store(8, Ordering::Relaxed);
             drop(_stop);
             sampler.join().expect("the sampler returns")
         });
-        // Whatever interleaving the scheduler chose, the entries are changes
-        // only, ascending in both fields, starting at a value the head held.
-        let entries = &timeline.0;
-        assert!(!entries.is_empty());
-        assert!([5, 6, 8].contains(&entries[0].1));
-        assert!(
-            entries
-                .windows(2)
-                .all(|w| w[0].0 <= w[1].0 && w[0].1 < w[1].1)
-        );
-        assert!(timeline.len() <= 3);
+        // Whatever interleaving the scheduler chose, each timeline is changes
+        // only, ascending in both fields, starting at a value its head held.
+        for (timeline, held) in [
+            (&heads.acked, &[5, 6, 8][..]),
+            (&heads.durable, &[3, 8][..]),
+        ] {
+            let entries = &timeline.0;
+            assert!(!entries.is_empty());
+            assert!(held.contains(&entries[0].1));
+            assert!(
+                entries
+                    .windows(2)
+                    .all(|w| w[0].0 <= w[1].0 && w[0].1 < w[1].1)
+            );
+            assert!(timeline.len() <= held.len());
+        }
     }
 }

@@ -74,36 +74,25 @@ impl<C: Ctl> Session<'_, C> {
         if !claude || screen.first != 0 || screen.generation.is_none() || self.alt_screen_now()? {
             return Ok(None);
         }
-        let r = self.call(&["search", TOP_RULE, "regex"])?;
+        let r = self.call(&SEARCH)?;
         if self.unserved(&r) {
             return Err(Fail::Lost(format!("search failed: {}", r.stderr.trim())));
         }
-        if !r.ok() || unsearched(&r) == Unsearched::Anywhere {
-            return Ok(None);
-        }
-        let Some(first) = search_screen_first(&r) else {
+        let Some(rows) = head_rows(&r) else {
             return Ok(None);
         };
-        let Some(top) = hit_rows(&r.stdout).filter(|&h| h < first).max() else {
-            return Ok(None);
-        };
-        if first - top > HEAD_ROWS {
-            return Ok(None);
-        }
         let mut head = Vec::new();
-        for row in top..first {
+        for row in rows {
             let r = self.call(&["line", &row.to_string()])?;
             if self.unserved(&r) {
                 return Err(Fail::Lost(format!("line failed: {}", r.stderr.trim())));
             }
             // `ERR evicted`, `ERR unreadable`, `ERR out of range`, a host
             // without the verb: no head.
-            if !r.ok() {
+            let Some(text) = head_row(&r) else {
                 return Ok(None);
-            }
-            let line = r.stdout.lines().next().unwrap_or("");
-            let text = line.strip_prefix("OK").unwrap_or(line);
-            head.push(text.strip_prefix(' ').unwrap_or(text).to_string());
+            };
+            head.push(text);
         }
         // The screen unchanged under the reads: the history read is the one
         // drawn with it, and the press is fenced on that generation.
@@ -124,6 +113,38 @@ impl<C: Ctl> Session<'_, C> {
         }
         Ok(!(r.ok() && r.stdout.lines().any(|l| l.trim() == "alt_screen=false")))
     }
+}
+
+/// The request [`Session::box_from_history`] finds a box's top rule with.
+pub(crate) const SEARCH: [&str; 3] = ["search", TOP_RULE, "regex"];
+
+/// The history's rows a box's head is read from, by what the reply to
+/// [`SEARCH`] says: from the top rule nearest above the screen down to the
+/// row above the screen's first. `None` where the reply proves no such
+/// rule — refused, a reply that may have left out newer rows, no screen's
+/// first row named, no rule above it, or one more than [`HEAD_ROWS`] up —
+/// and the cut is held. The loop's one reader of the reply, and a tape
+/// reader's (`tape::explain`, which rebuilds the loop's join from the
+/// replies a tape holds).
+pub(crate) fn head_rows(search: &CtlReply) -> Option<std::ops::Range<u64>> {
+    if !search.ok() || unsearched(search) == Unsearched::Anywhere {
+        return None;
+    }
+    let first = search_screen_first(search)?;
+    let top = hit_rows(&search.stdout).filter(|&h| h < first).max()?;
+    (first - top <= HEAD_ROWS).then_some(top..first)
+}
+
+/// The row a `line` reply reads: its text, or `None` for a reply that read
+/// none (`ERR evicted`, `ERR unreadable`, `ERR out of range`, a host without
+/// the verb), where the join is given up. Shared as [`head_rows`] is.
+pub(crate) fn head_row(line: &CtlReply) -> Option<String> {
+    if !line.ok() {
+        return None;
+    }
+    let first = line.stdout.lines().next().unwrap_or("");
+    let text = first.strip_prefix("OK").unwrap_or(first);
+    Some(text.strip_prefix(' ').unwrap_or(text).to_string())
 }
 
 /// The absolute rows of a `search` reply's hits (`<row> <col> <len>` each).
@@ -147,7 +168,7 @@ fn hit_rows(stdout: &str) -> impl Iterator<Item = u64> + '_ {
 /// ending where the cut ends, the options it draws on the screen the cut's
 /// own, on the cut's rows (an option above the screen is the head's).
 #[must_use]
-pub(super) fn joined_box(
+pub(crate) fn joined_box(
     head: &[String],
     screen: &[String],
     cut: &aterm_phase::PromptV2,

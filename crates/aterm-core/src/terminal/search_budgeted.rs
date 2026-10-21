@@ -15,8 +15,9 @@
 //! content or pattern, a dropped or forged cursor) starts over from row zero and the step
 //! says `reset`. A completed search is consistent because every slice saw the same key.
 
-use super::Terminal;
+use super::search_index::ONE_SHOT_SEARCH;
 use super::search_rows::history_row_for_search;
+use super::{SearchKey, Terminal};
 use crate::search::{BudgetedSearch, SearchOptionsError, SearchResults};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -281,8 +282,17 @@ impl Terminal {
             let oldest = usize::try_from(grid.oldest_absolute_row()).unwrap_or(usize::MAX);
             let scrollback = grid.scrollback_lines();
             let total_rows = scrollback.saturating_add(usize::from(self.rows()));
-            let engine = BudgetedSearch::new(query, case_sensitive, is_regex, oldest, total_rows)?
-                .with_ambiguous_width(self.ambiguous_width());
+            // The one-shot index's window: the rows past it are fed unverified.
+            let window = SearchKey::capture(self, ONE_SHOT_SEARCH.depth_cap).max_lines;
+            let engine = BudgetedSearch::with_max_cached_lines(
+                query,
+                case_sensitive,
+                is_regex,
+                oldest,
+                total_rows,
+                window,
+            )?
+            .with_ambiguous_width(self.ambiguous_width());
             let cursor = allocate_cursor(&NEXT_BUDGETED_SEARCH_CURSOR)
                 .ok_or(BudgetedSearchError::CursorSpaceExhausted)?;
             self.budgeted_search = Some(BudgetedSearchState {
@@ -361,7 +371,8 @@ impl Terminal {
     }
 
     /// Feed the history rows below `end`. The results-equality contract needs the same row
-    /// sources as the one-shot `build_search_index`: the same dense walk (item `k` is
+    /// sources (and bounded history read) as the one-shot build, which copies its rows
+    /// through `Terminal::read_search_rows`: the same dense walk (item `k` is
     /// `get_history_line(start + k)`, an unreadable line a `None` placeholder, empty text),
     /// padded with placeholders should the walk be shorter than the keyed retained count.
     fn feed_budgeted_history(&self, state: &mut BudgetedSearchState, end: usize) {

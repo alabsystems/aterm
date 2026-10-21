@@ -19,7 +19,7 @@
 //! decider's own act, recorded with `acted`; `Met` is the next point observed
 //! with the wall on the screen again, `Taken` a point with none after real
 //! work. At every state the model's invariant holds and the decider TYPES
-//! exactly where `Act` is enabled (`usage-resume@v1`, `keep going`), and
+//! exactly where `Act` is enabled (`usage-resume@v1`, the continuation), and
 //! otherwise WAITS until exactly the tick `Act` becomes enabled.
 //!
 //! The reset the decider is handed is the REAL placement's, kept on the real
@@ -699,7 +699,7 @@ fn expected(m: &Model, st: &State) -> Verdict {
 fn verdict(a: &TurnEndAction, now: Instant) -> Verdict {
     match a {
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_LIMIT_RESUME => {
-            assert_eq!(text, "keep going");
+            assert_eq!(*text, SupervisorConfig::default().continue_text);
             Verdict::Act
         }
         TurnEndAction::Type { rule_id, .. } => Verdict::Typed(rule_id),
@@ -944,6 +944,12 @@ struct Walked {
 }
 
 fn walk(m: &Model, strict: bool, run: Run) -> Walked {
+    walk_until(m, strict, run, false)
+}
+
+/// [`walk`], ended at the first disagreement where `first_off`: a defect
+/// needs one state to be caught, and the rest of its walk is the sound one's.
+fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
     let cfg = SupervisorConfig::default();
     let base = Instant::now() + Duration::from_secs(24 * 3600);
     let init = Real {
@@ -959,6 +965,9 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     let mut off_after: BTreeMap<&'static str, Vec<State>> = BTreeMap::new();
     let mut early: BTreeMap<&'static str, usize> = BTreeMap::new();
     while let Some((st, real)) = queue.pop_front() {
+        if first_off && !disagree.is_empty() {
+            break;
+        }
         if !seen.insert(st.clone()) {
             continue;
         }
@@ -978,6 +987,9 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
                 "the real decider disagrees at {st:?}: {got:?}, not {want:?}"
             );
             disagree.push(st.clone());
+            if first_off {
+                break;
+            }
         }
         for action in &m.actions {
             let mut next = st.clone();
@@ -1246,7 +1258,7 @@ fn the_buggy_model_and_every_past_loop_disagree_with_the_real_code() {
         for (name, m, run) in cases {
             scope.spawn(move || {
                 assert!(
-                    !walk(m, false, run).off.is_empty(),
+                    !walk_until(m, false, run, true).off.is_empty(),
                     "{name}: agreed with the real code everywhere"
                 );
             });

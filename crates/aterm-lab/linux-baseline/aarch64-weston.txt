@@ -1,31 +1,22 @@
 # aterm Linux lane baseline (LW.4): aarch64 (native) under weston (Wayland)
 # = behaviour, compared exactly by the replay; ~ measured, shown when it moves; @ the stack
 # replay: targo --unverified lab linux baseline --arch aarch64 --screen weston (add --record to rewrite this file)
-# not-driven.resize.os no-resize-tool: no headless Wayland compositor here resizes a client from outside (no window manager tooling)
-# not-driven.clipboard no-seat: weston's headless backend advertises no wl_seat, and a Wayland selection is set with a seat's serial (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
-# not-driven.keyrepeat no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
-# not-driven.compose no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
-# not-driven.text-input-v3 v1-only: weston 13 offers zwp_text_input_manager_v1 only, which the winit fork does not bind
-# not-driven.header.gestures no-seat: the frame's move, resize and window menu take a press's serial from a seat, and weston's headless backend has none (header.maximize is driven: maximize takes no serial)
-# not-driven.dnd no-seat: weston's headless backend advertises no wl_seat, and a drag starts from a seat's pointer (weston's x11 backend, nested in Xvfb, has a seat XTEST could drive: not tried)
-@ crate.calloop 0.13.0
-@ crate.calloop-wayland-source 0.3.0
-@ crate.rustix 0.38.44 (path)
-@ crate.rustix.2 1.1.4
-@ crate.smithay-client-toolkit 0.19.2
+# not-driven.resize.os no-resize-tool: weston's headless backend has no seat, so no binding of its own reaches the window, and no tool here resizes a Wayland client from outside (Mutter's is driven, resize.os.tiled-left, and weston-x11's, resize.os.maximized from its seat)
+# not-driven.clipboard no-seat: weston's headless backend advertises no wl_seat, and a Wayland selection is set with a seat's serial (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.keyrepeat no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.compose no-seat: weston's headless backend advertises no wl_seat, so no key reaches a client (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.text-input-v3 v1-only: weston 13 offers zwp_text_input_manager_v1 only, which aterm-window does not bind
+# not-driven.header.gestures no-seat: the frame's move, resize and window menu take a press's serial from a seat, and weston's headless backend has none (header.maximize is driven: maximize takes no serial; the weston-x11 screen drives the gestures from its x11 backend's seat)
+# not-driven.dnd no-seat: weston's headless backend advertises no wl_seat, and a drag starts from a seat's pointer (the weston-x11 screen drives it: weston's x11 backend, nested in Xvfb, has a seat that XTEST on the Xvfb drives)
+# not-driven.touch no-seat: weston's headless backend advertises no wl_seat, so no touch reaches a client; Mutter's is driven, through a RemoteDesktop finger
+@ crate.aterm-dl 0.106.0 (path)
+@ crate.aterm-wayland 0.106.0 (path)
+@ crate.aterm-window 0.30.13 (path)
+@ crate.aterm-x11 0.106.0 (path)
+@ crate.aterm-xkb 0.106.0 (path)
 @ crate.softbuffer 0.4.8
-@ crate.tiny-xlib 0.2.5
-@ crate.wayland-backend 0.3.15
-@ crate.wayland-client 0.31.14
-@ crate.wayland-cursor 0.31.14
-@ crate.wayland-protocols 0.32.12
 @ crate.wgpu 29.0.3
 @ crate.wgpu-hal 29.0.3
-@ crate.winit 0.30.13 (path)
-@ crate.x11-dl 2.21.0
-@ crate.x11rb 0.13.2
-@ crate.x11rb-protocol 0.13.2
-@ crate.xkbcommon-dl 0.4.2
 = start.dims 24x80 scale=1.00 cell_w=9 cell_h=20 font_px=15.00 window_rows=24 window_cols=80 grid_w=720 grid_h=480 frame_w=744 frame_h=528 surface_w=744 surface_h=528 offset_x=0 offset_y=0 band_left=0 band_right=0 band_top=0 band_bottom=0 crop_left=0 crop_right=0 crop_top=0 crop_bottom=0 pad=12 pad_top=2 pad_bottom=12 head=14 tab_rows=1
 = echo typed `echo LANE-$((6*7))`, LANE-42 appeared
 = atspi.walk.start apps 1
@@ -42,13 +33,13 @@
 = status render=ok resizes=4
 ~ status.flaps 0
 = resizes.1 1 ord=1 from=80x24 to=100x30 alt=0 sync=0 site=input win=100x30 chrome=1
-~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=input win=100x30 chrome=1
+~ resizes.1.rows 1 run=1 ord=1 from=80x24 to=100x30 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=100x30 chrome=1
 = resizes.2 2 ord=2 from=100x30 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
-~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=input win=80x24 chrome=1
+~ resizes.2.rows 2 run=2 ord=2 from=100x30 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
 = resizes.3 3 ord=3 from=80x24 to=80x23 alt=0 sync=0 site=input win=80x23 chrome=1
-~ resizes.3.rows 3 run=3 ord=3 from=80x24 to=80x23 alt=0 sync=0 trimmed=1 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 site=input win=80x23 chrome=1
+~ resizes.3.rows 3 run=3 ord=3 from=80x24 to=80x23 alt=0 sync=0 trimmed=1 demoted=0 pushed=0 revealed=0 appended=0 restored=0 shift=+0 cut=0 site=input win=80x23 chrome=1
 = resizes.4 4 ord=4 from=80x23 to=80x24 alt=0 sync=0 site=input win=80x24 chrome=1
-~ resizes.4.rows 4 run=4 ord=4 from=80x23 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=1 restored=0 shift=+0 site=input win=80x24 chrome=1
+~ resizes.4.rows 4 run=4 ord=4 from=80x23 to=80x24 alt=0 sync=0 trimmed=0 demoted=0 pushed=0 revealed=0 appended=1 restored=0 shift=+0 cut=0 site=input win=80x24 chrome=1
 ~ runs.1 1 n=1 alt=0 geom=80x24>100x30 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
 ~ runs.2 2 n=1 alt=0 geom=100x30>80x24 net=changed displaced=+0 verdict=reflow first_out_ms=- healed_ms=-
 ~ runs.3 3 n=1 alt=0 geom=80x24>80x23 net=changed displaced=+0 verdict=none first_out_ms=- healed_ms=-
@@ -71,6 +62,7 @@
 = not-driven.text-input-v3 v1-only
 = not-driven.header.gestures no-seat
 = not-driven.dnd no-seat
+= not-driven.touch no-seat
 = atspi.walk.end apps 1
 = atspi.walk.end.1 depth=0 role=application name="aterm-gui" description="" states=- interfaces=Accessible,Application attributes=ERR(org.freedesktop.DBus.Error.UnknownMethod:_Unknown_method_'GetAttributes') children=1 child_count=1
 ~ atspi.path.end.1 /org/a11y/atspi/accessible/root
@@ -79,29 +71,27 @@
 = atspi.walk.end.3 depth=2 role=terminal name="aterm terminal" description="" states=enabled,focusable,sensitive,showing,visible interfaces=Accessible,Component,Text attributes=- characters=60 caret=38 text="lane$ echo LANE-$((6*7))\nLANE-42\nlane$\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n" extents_window=12,36,720,480 extents_screen=12,36,720,480 children=0 child_count=0
 ~ atspi.path.end.3 /org/a11y/atspi/accessible/0/18446744073709551616
 @ gpu llvmpipe (LLVM 20.1.2, 128 bits) (Gl)
-~ present.software software rendering (llvmpipe (LLVM 20.1.2, 128 bits) (Gl)): n_present=8 present_p50/p95/p99_ms=5.24/335.54/335.54
+~ present.software software rendering (llvmpipe (LLVM 20.1.2, 128 bits) (Gl)): n_present=8 present_p50/p95/p99_ms=4.19/335.54/335.54
 ~ input.software n_input=2 input_p50/p95/p99_ms=41.94/335.54/335.54
 = atspi.events.kinds Object.BoundsChanged@terminal Object.ChildrenChanged:add@application Object.TextChanged:delete@terminal Object.TextChanged:insert@terminal
 = atspi.events.text the text changes undo cleanly from the end walk's text; no caret event
-~ atspi.events.count 18
+~ atspi.events.count 16
 ~ atspi.event.1 Object.ChildrenChanged <application> detail="add" d1=0 d2=0 any=ref(<frame>)
 ~ atspi.event.2 Object.TextChanged <terminal> detail="insert" d1=5 d2=19 any=" echo LANE-$((6*7))"
 ~ atspi.event.3 Object.TextChanged <terminal> detail="insert" d1=25 d2=7 any="LANE-42"
-~ atspi.event.4 Object.PropertyChange <frame> detail="accessible-name" d1=0 d2=0 any="echo LANE-$((6*7))"
-~ atspi.event.5 Object.PropertyChange <frame> detail="accessible-name" d1=0 d2=0 any="~"
-~ atspi.event.6 Object.TextChanged <terminal> detail="insert" d1=33 d2=5 any="lane$"
-~ atspi.event.7 Object.TextChanged <terminal> detail="insert" d1=60 d2=6 any="\n\n\n\n\n\n"
-~ atspi.event.8 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,900,600)
-~ atspi.event.9 Object.TextChanged <terminal> detail="delete" d1=60 d2=6 any="\n\n\n\n\n\n"
-~ atspi.event.10 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,480)
-~ atspi.event.11 Object.TextChanged <terminal> detail="delete" d1=59 d2=1 any="\n"
-~ atspi.event.12 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,460)
-~ atspi.event.13 Object.TextChanged <terminal> detail="insert" d1=59 d2=1 any="\n"
-~ atspi.event.14 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,480)
-~ atspi.event.15 Object.TextChanged <terminal> detail="insert" d1=60 d2=12 any="\n\n\n\n\n\n\n\n\n\n\n\n"
-~ atspi.event.16 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,1251,720)
-~ atspi.event.17 Object.TextChanged <terminal> detail="delete" d1=60 d2=12 any="\n\n\n\n\n\n\n\n\n\n\n\n"
-~ atspi.event.18 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,480)
+~ atspi.event.4 Object.TextChanged <terminal> detail="insert" d1=33 d2=5 any="lane$"
+~ atspi.event.5 Object.TextChanged <terminal> detail="insert" d1=60 d2=6 any="\n\n\n\n\n\n"
+~ atspi.event.6 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,900,600)
+~ atspi.event.7 Object.TextChanged <terminal> detail="delete" d1=60 d2=6 any="\n\n\n\n\n\n"
+~ atspi.event.8 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,480)
+~ atspi.event.9 Object.TextChanged <terminal> detail="delete" d1=59 d2=1 any="\n"
+~ atspi.event.10 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,460)
+~ atspi.event.11 Object.TextChanged <terminal> detail="insert" d1=59 d2=1 any="\n"
+~ atspi.event.12 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,480)
+~ atspi.event.13 Object.TextChanged <terminal> detail="insert" d1=60 d2=12 any="\n\n\n\n\n\n\n\n\n\n\n\n"
+~ atspi.event.14 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,1251,720)
+~ atspi.event.15 Object.TextChanged <terminal> detail="delete" d1=60 d2=12 any="\n\n\n\n\n\n\n\n\n\n\n\n"
+~ atspi.event.16 Object.BoundsChanged <terminal> detail="" d1=0 d2=0 any=(12,36,720,480)
 @ server.globals weston_capture_v1@1,weston_desktop_shell@1,wl_compositor@5,wl_data_device_manager@3,wl_output@4,wl_shm@1,wl_subcompositor@1,wp_presentation@1,wp_single_pixel_buffer_manager_v1@1,wp_tearing_control_manager_v1@1,wp_viewporter@1,xdg_wm_base@5,zwp_input_panel_v1@1,zwp_input_timestamps_manager_v1@1,zwp_linux_dmabuf_v1@3,zwp_linux_explicit_synchronization_v1@2,zwp_pointer_constraints_v1@1,zwp_relative_pointer_manager_v1@1,zwp_text_input_manager_v1@1,zxdg_output_manager_v1@2
 @ guest.at-spi2-core:arm64 2.52.0-1build1
 @ guest.dbus:arm64 1.14.10-4ubuntu4.1
@@ -120,5 +110,5 @@
 @ guest.mesa-vulkan-drivers:arm64 25.2.8-0ubuntu0.24.04.4
 @ guest.mutter:arm64 46.2-1ubuntu0.24.04.18
 @ guest.weston:arm64 13.0.0-4build3
-@ guest.xvfb:arm64 2:21.1.12-1ubuntu1.8
+@ guest.xvfb:arm64 2:21.1.12-1ubuntu1.9
 @ guest.xwayland:arm64 2:23.2.6-1ubuntu0.8

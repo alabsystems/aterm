@@ -7,8 +7,7 @@
 //!
 //! BEFORE the seam (2026-06-16), human input (the winit `on_key`/`on_mouse_*`/
 //! `on_cursor_moved`/`on_resize`/`on_focus` handlers) and controller input (the
-//! control verbs `cmd_key`/`cmd_ctrl`/`cmd_mouse`/`cmd_scroll`/`cmd_paste`/
-//! `cmd_resize`/...) flowed through TWO parallel code paths that drifted: only the
+//! control verbs `key`/`ctrl`/`mouse`/`scroll`/`paste`/`resize`/...) flowed through TWO parallel code paths that drifted: only the
 //! human path read real modifiers, ran the click-count FSM, emitted intermediate
 //! motion reports, snapped-to-bottom + cleared-selection on a keystroke, carried
 //! the Kitty base-layout key, reported focus, and reset the cursor blink. The
@@ -783,36 +782,118 @@ pub(crate) const MAX_WHEEL_BURST: i32 = 512;
 /// the app receives real wheel reports and applies its own notch->lines conversion
 /// (vim's `mousescroll`, default 3), so scaling would compound to nine lines a
 /// notch.
-pub(crate) fn wheel_platform_lines(lines: i32, page_rows: u16, detent: bool) -> i32 {
+///
+/// `platform` is the rule a detent scrolls by ([`WheelPlatform`]): production
+/// passes [`WheelPlatform::Host`], a test any platform's arm.
+pub(crate) fn wheel_platform_lines(
+    platform: WheelPlatform,
+    lines: i32,
+    page_rows: u16,
+    detent: bool,
+) -> i32 {
     if detent {
-        wheel_detent_lines(lines, page_rows)
+        platform.detent_lines(lines, page_rows)
     } else {
         lines
     }
 }
 
-/// [`wheel_platform_lines`] for a detent, on Windows: the live Mouse setting.
-#[cfg(windows)]
-fn wheel_detent_lines(notch_lines: i32, page_rows: u16) -> i32 {
-    wheel_scaled_lines(
-        notch_lines,
-        crate::platform_win::wheel_notch_scroll(),
-        page_rows,
+/// How far ONE wheel notch travels, per the user's Windows mouse settings
+/// (`platform_win::wheel_notch_scroll` reads it). [`WheelNotch::Page`] is the
+/// "One screen at a time" slider position, which has no line count — the
+/// consumer supplies its own viewport height. Platform-neutral, so Windows'
+/// arm of [`WheelPlatform`] runs on every host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(test, windows)),
+    expect(
+        dead_code,
+        reason = "read from the Mouse setting on Windows and injected by tests; no other host \
+                  builds one"
     )
+)]
+pub(crate) enum WheelNotch {
+    /// `n` lines a detent; `0` is "wheel scrolling off", honoured as no motion.
+    Lines(u32),
+    /// A page a detent.
+    Page,
 }
 
-/// [`wheel_platform_lines`] for a detent, on the free desktops: VTE's distance
-/// ([`vte_lines_per_detent`]).
+/// THE PLATFORM'S WHEEL RULE (session log phase 6, 6A-4): how many lines one
+/// wheel detent scrolls a surface that scrolls without an app's help
+/// ([`wheel_platform_lines`]: the local viewport and alternate scroll's
+/// arrows). INJECTED, as AGENTS.md has platform probes: the seam's core and
+/// [`crate::human_input::reaches_program`] take it as a value, production
+/// passes [`WheelPlatform::Host`], which reads this host's rule only where a
+/// detent needs it, and a test passes any platform's arm, which reads nothing.
+/// So Windows' "wheel scrolling off", the one arm under which a vertical
+/// wheel on alternate scroll sends a pager nothing, runs on every host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "each host builds only its own arm (`host_wheel_platform`); the other \
+                  platforms' arms are the ones a test injects"
+    )
+)]
+pub(crate) enum WheelPlatform {
+    /// This host's own rule, read where a detent needs it: Windows' live Mouse
+    /// setting, the free desktops' VTE distance, macOS's final delta.
+    Host,
+    /// macOS: AppKit folds the user's scroll speed into the delta before winit
+    /// sees it, so the gesture's line count is final.
+    Mac,
+    /// Linux and the BSDs: VTE's distance ([`vte_lines_per_detent`]).
+    Vte,
+    /// Windows, on the Mouse setting `notch` ([`wheel_scaled_lines`]).
+    Windows(WheelNotch),
+}
+
+impl WheelPlatform {
+    /// The lines `notch_lines` detents scroll a surface `page_rows` tall, by
+    /// this rule ([`wheel_platform_lines`] for a detent).
+    pub(crate) fn detent_lines(self, notch_lines: i32, page_rows: u16) -> i32 {
+        let rule = if self == WheelPlatform::Host {
+            host_wheel_platform()
+        } else {
+            self
+        };
+        match rule {
+            WheelPlatform::Host | WheelPlatform::Mac => notch_lines,
+            WheelPlatform::Vte => notch_lines.saturating_mul(vte_lines_per_detent(page_rows)),
+            WheelPlatform::Windows(notch) => wheel_scaled_lines(notch_lines, notch, page_rows),
+        }
+    }
+
+    /// Every arm a test injects: macOS, the free desktops, and Windows on the
+    /// default three lines, "wheel scrolling off" and "One screen at a time".
+    #[cfg(test)]
+    pub(crate) const ARMS: [WheelPlatform; 5] = [
+        WheelPlatform::Mac,
+        WheelPlatform::Vte,
+        WheelPlatform::Windows(WheelNotch::Lines(3)),
+        WheelPlatform::Windows(WheelNotch::Lines(0)),
+        WheelPlatform::Windows(WheelNotch::Page),
+    ];
+}
+
+/// [`WheelPlatform::Host`] on Windows: the live Mouse setting.
+#[cfg(windows)]
+fn host_wheel_platform() -> WheelPlatform {
+    WheelPlatform::Windows(crate::platform_win::wheel_notch_scroll())
+}
+
+/// [`WheelPlatform::Host`] on the free desktops: VTE's distance.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn wheel_detent_lines(notch_lines: i32, page_rows: u16) -> i32 {
-    notch_lines.saturating_mul(vte_lines_per_detent(page_rows))
+fn host_wheel_platform() -> WheelPlatform {
+    WheelPlatform::Vte
 }
 
-/// [`wheel_platform_lines`] for a detent, on macOS: the platform already delivered
-/// the user's scroll speed in the delta, so the gesture's line count is final.
+/// [`WheelPlatform::Host`] on macOS: the delta is final.
 #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
-fn wheel_detent_lines(notch_lines: i32, _page_rows: u16) -> i32 {
-    notch_lines
+fn host_wheel_platform() -> WheelPlatform {
+    WheelPlatform::Mac
 }
 
 /// The lines one wheel detent scrolls in a VTE terminal (GNOME Terminal, Tilix,
@@ -820,7 +901,6 @@ fn wheel_detent_lines(notch_lines: i32, _page_rows: u16) -> i32 {
 /// VTE's `Terminal::widget_mouse_scroll` takes it from the vertical adjustment's
 /// page increment, which is the row count; one detent is 3 lines at 24 rows, 5 at
 /// 50, and 1 below 11.
-#[cfg(all(unix, not(target_os = "macos")))]
 fn vte_lines_per_detent(page_rows: u16) -> i32 {
     i32::from(page_rows.div_ceil(10)).max(1)
 }
@@ -977,35 +1057,35 @@ pub(crate) fn alt_scroll_arrow(
 /// `ceil(rows / 10)`, Windows' page), so the page height never decides whether
 /// the count is zero, and the mode mirror, which holds no height, answers that
 /// question with any ([`alt_scroll_sends`]).
-pub(crate) fn alt_scroll_repeat(lines: i32, page_rows: u16, detent: bool) -> i32 {
-    wheel_platform_lines(lines, page_rows, detent).clamp(0, MAX_WHEEL_BURST)
+pub(crate) fn alt_scroll_repeat(
+    platform: WheelPlatform,
+    lines: i32,
+    page_rows: u16,
+    detent: bool,
+) -> i32 {
+    wheel_platform_lines(platform, lines, page_rows, detent).clamp(0, MAX_WHEEL_BURST)
 }
 
 /// Whether one wheel of `lines` (as the event carries it; clamped here as the
 /// seam clamps it) sends a pager any [`alt_scroll_arrow`] press at all:
 /// [`alt_scroll_repeat`] is positive, for any page height (its docs).
-pub(crate) fn alt_scroll_sends(lines: i32, detent: bool) -> bool {
-    alt_scroll_repeat(lines.clamp(1, MAX_WHEEL_BURST), 1, detent) > 0
+pub(crate) fn alt_scroll_sends(platform: WheelPlatform, lines: i32, detent: bool) -> bool {
+    alt_scroll_repeat(platform, lines.clamp(1, MAX_WHEEL_BURST), 1, detent) > 0
 }
 
-/// The pure arithmetic of Windows' [`wheel_detent_lines`], split out so the multiply
-/// can be tested without a live `SystemParametersInfoW` (whose answer belongs to
-/// whoever's machine runs the suite, and so can never be asserted).
+/// The pure arithmetic of Windows' arm of [`WheelPlatform`], split out so the
+/// multiply can be tested without a live `SystemParametersInfoW` (whose answer
+/// belongs to whoever's machine runs the suite, and so can never be asserted).
 ///
 /// [`WheelNotch::Page`] is the slider's "One screen at a time" position: a detent is
 /// then a PAGE, sized as the viewport so a wheel and PgUp/PgDn cannot disagree about
 /// what a page is. `Lines(0)` — "wheel scrolling off" in Mouse settings — is
 /// honoured as zero rather than clamped up to one: a user who turned the wheel off
 /// means it.
-#[cfg(windows)]
-fn wheel_scaled_lines(
-    notch_lines: i32,
-    notch: crate::platform_win::WheelNotch,
-    page_rows: u16,
-) -> i32 {
+fn wheel_scaled_lines(notch_lines: i32, notch: WheelNotch, page_rows: u16) -> i32 {
     let per_notch = match notch {
-        crate::platform_win::WheelNotch::Lines(n) => i32::try_from(n).unwrap_or(i32::MAX),
-        crate::platform_win::WheelNotch::Page => i32::from(page_rows).max(1),
+        WheelNotch::Lines(n) => i32::try_from(n).unwrap_or(i32::MAX),
+        WheelNotch::Page => i32::from(page_rows).max(1),
     };
     notch_lines.saturating_mul(per_notch)
 }
@@ -1120,7 +1200,16 @@ pub(crate) fn seam_egress(
         "an encode-only seam is `seam_encode`"
     );
     let mut accepted = Accepted::default();
-    seam_egress_inner(term, modes, sink, ev, mode, &mut accepted, None)
+    seam_egress_inner(
+        term,
+        modes,
+        sink,
+        ev,
+        mode,
+        &mut accepted,
+        None,
+        WheelPlatform::Host,
+    )
 }
 
 /// THE source-blind byte-producing core of the seam (design A.2 / A.7). It is the
@@ -1181,7 +1270,16 @@ pub(crate) fn seam_egress_receipt_metered(
         "an encode-only seam is `seam_encode`"
     );
     let mut accepted = Accepted::default();
-    let egress = seam_egress_inner(term, modes, sink, ev, mode, &mut accepted, meter);
+    let egress = seam_egress_inner(
+        term,
+        modes,
+        sink,
+        ev,
+        mode,
+        &mut accepted,
+        meter,
+        WheelPlatform::Host,
+    );
     EgressReceipt {
         egress,
         accepted_order: accepted.order,
@@ -1202,6 +1300,19 @@ pub(crate) fn seam_encode(
     sink: &SinkWriter,
     ev: &InputEvent,
 ) -> (Egress, Vec<u8>) {
+    seam_encode_on(WheelPlatform::Host, term, modes, sink, ev)
+}
+
+/// [`seam_encode`] on the wheel rule `platform` ([`WheelPlatform`]): the one
+/// seam, its detents scrolled by an injected platform's arm, so a test drives
+/// every platform's wheel through it on any host.
+pub(crate) fn seam_encode_on(
+    platform: WheelPlatform,
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+) -> (Egress, Vec<u8>) {
     let mut accepted = Accepted::default();
     let egress = seam_egress_inner(
         term,
@@ -1211,10 +1322,16 @@ pub(crate) fn seam_encode(
         EgressMode::Encode,
         &mut accepted,
         None,
+        platform,
     );
     (egress, accepted.encoded)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the seam's six handles, the paste's meter and the injected wheel rule; \
+              bundling them would add a per-event struct on the keystroke path"
+)]
 fn seam_egress_inner(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -1223,6 +1340,7 @@ fn seam_egress_inner(
     mode: EgressMode,
     accepted_order: &mut Accepted,
     meter: Option<&BulkMeter>,
+    platform: WheelPlatform,
 ) -> Egress {
     // PAIRING OBLIGATION (debug builds): `modes` must be THIS terminal's mirror.
     // A mirror derived from some other terminal (or a bare `Default`) would
@@ -1487,7 +1605,7 @@ fn seam_egress_inner(
                     } else {
                         WheelPlan::Write {
                             bytes,
-                            repeat: alt_scroll_repeat(lines, t.rows(), *detent),
+                            repeat: alt_scroll_repeat(platform, lines, t.rows(), *detent),
                         }
                     }
                 } else {
@@ -2318,7 +2436,7 @@ mod tests {
     /// 24 rows ([`wheel_platform_lines`]): one on macOS, VTE's three on Linux.
     #[cfg(unix)]
     fn detent_arrows(arrow: &[u8], notches: i32) -> Vec<u8> {
-        let lines = wheel_platform_lines(notches, 24, true);
+        let lines = wheel_platform_lines(WheelPlatform::Host, notches, 24, true);
         arrow.repeat(usize::try_from(lines).expect("a non-negative count"))
     }
 
@@ -2724,16 +2842,29 @@ mod tests {
         assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, -7)), one);
     }
 
-    /// THE WHEEL MULTIPLY ITSELF (Windows). The live
-    /// `SPI_GETWHEELSCROLLLINES` read cannot be asserted — its answer belongs to
-    /// whoever's machine runs the suite — so the arithmetic every wheel gesture
-    /// goes through is pinned here instead, on all three of the setting's shapes.
-    /// Both surfaces that scroll without an app's help route through this: the
-    /// scrollback viewport (`App::input_wheel`) and the DEC-1007 alt-scroll arrows.
-    #[cfg(windows)]
+    /// THE WHEEL MULTIPLY ITSELF (Windows' arm, on every host: 6A-4). The
+    /// live `SPI_GETWHEELSCROLLLINES` read cannot be asserted — its answer
+    /// belongs to whoever's machine runs the suite — so the arithmetic every
+    /// wheel gesture goes through is pinned here instead, on all three of the
+    /// setting's shapes, and through [`WheelPlatform::Windows`] as the seam
+    /// reads it. Both surfaces that scroll without an app's help route through
+    /// this: the scrollback viewport (`App::input_wheel`) and the DEC-1007
+    /// alt-scroll arrows.
     #[test]
     fn wheel_scale_is_the_platform_distance_not_one_line() {
-        use crate::platform_win::WheelNotch;
+        let windows = |notch| WheelPlatform::Windows(notch);
+        assert_eq!(
+            wheel_platform_lines(windows(WheelNotch::Lines(3)), 1, 24, true),
+            3
+        );
+        assert_eq!(
+            wheel_platform_lines(windows(WheelNotch::Page), 2, 50, true),
+            100
+        );
+        assert_eq!(
+            wheel_platform_lines(windows(WheelNotch::Lines(0)), 9, 24, true),
+            0
+        );
         // The Windows default, and the whole point: one detent is THREE lines, not
         // the one that winit's `LineDelta` literally reports.
         assert_eq!(wheel_scaled_lines(1, WheelNotch::Lines(3), 24), 3);
@@ -2759,14 +2890,15 @@ mod tests {
     /// protocol has a lines-per-detent setting, so the desktop's distance is the
     /// one its terminal scrolls: VTE's `ceil(rows / 10)`, at least one. A wheel that
     /// moves one line a notch makes long scrollback three times slower to reach
-    /// than in GNOME Terminal at the usual 24 rows.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// than in GNOME Terminal at the usual 24 rows. On every host, through
+    /// [`WheelPlatform::Vte`] (6A-4).
     #[test]
     fn a_free_desktop_wheel_detent_is_vtes_distance() {
+        let vte = WheelPlatform::Vte;
         // The 80x24 default: three lines, VTE's adjustment 377 -> 374 per notch.
         assert_eq!(vte_lines_per_detent(24), 3);
-        assert_eq!(wheel_platform_lines(1, 24, true), 3);
-        assert_eq!(wheel_platform_lines(4, 24, true), 12);
+        assert_eq!(wheel_platform_lines(vte, 1, 24, true), 3);
+        assert_eq!(wheel_platform_lines(vte, 4, 24, true), 12);
         // The ceiling, at its edges, and the floor of one for a short grid (and a
         // degenerate zero-row one, which must still move).
         assert_eq!(vte_lines_per_detent(20), 2);
@@ -2777,23 +2909,27 @@ mod tests {
         assert_eq!(vte_lines_per_detent(0), 1);
         assert_eq!(vte_lines_per_detent(u16::MAX), 6554);
         // Absurd counts saturate instead of wrapping into a negative scroll.
-        assert_eq!(wheel_platform_lines(i32::MAX, 24, true), i32::MAX);
+        assert_eq!(wheel_platform_lines(vte, i32::MAX, 24, true), i32::MAX);
+        // macOS's delta is final.
+        assert_eq!(wheel_platform_lines(WheelPlatform::Mac, 4, 24, true), 4);
     }
 
     /// [`alt_scroll_sends`] answers, with no page height, what
     /// [`alt_scroll_repeat`] answers at every height: whether a wheel sends a
     /// pager any arrow (`human_input::reaches_program` asks it from the mode
-    /// mirror, which holds no height).
+    /// mirror, which holds no height), on every platform's wheel rule.
     #[test]
     fn whether_alternate_scroll_sends_an_arrow_needs_no_page_height() {
-        for rows in [0, 1, 10, 11, 24, 50, u16::MAX] {
-            for lines in [1, 2, 7, MAX_WHEEL_BURST] {
-                for detent in [true, false] {
-                    assert_eq!(
-                        alt_scroll_repeat(lines, rows, detent) > 0,
-                        alt_scroll_sends(lines, detent),
-                        "{lines} line(s) at {rows} rows, detent={detent}"
-                    );
+        for platform in WheelPlatform::ARMS.into_iter().chain([WheelPlatform::Host]) {
+            for rows in [0, 1, 10, 11, 24, 50, u16::MAX] {
+                for lines in [1, 2, 7, MAX_WHEEL_BURST] {
+                    for detent in [true, false] {
+                        assert_eq!(
+                            alt_scroll_repeat(platform, lines, rows, detent) > 0,
+                            alt_scroll_sends(platform, lines, detent),
+                            "{lines} line(s) at {rows} rows, detent={detent}, {platform:?}"
+                        );
+                    }
                 }
             }
         }
@@ -2849,8 +2985,11 @@ mod tests {
                             px_off: PixelOffset::CELL_ORIGIN,
                         };
                         let route = wheel_route_for(&term.lock().unwrap(), mods);
-                        let reaches =
-                            crate::human_input::reaches_program(&ev, &crate::mode_mirror_of(&term));
+                        let reaches = crate::human_input::reaches_program(
+                            &ev,
+                            &crate::mode_mirror_of(&term),
+                            WheelPlatform::Host,
+                        );
                         let sent = !egress_bytes(&term, &ev).is_empty();
                         assert_eq!(
                             reaches, sent,
@@ -2879,9 +3018,11 @@ mod tests {
     /// (VTE's, or Windows' live setting, which this never reads) multiplies it.
     #[test]
     fn a_precise_wheel_row_is_never_multiplied() {
-        for rows in [0, 1, 24, 50, u16::MAX] {
-            for lines in [0, 1, 2, 7, MAX_WHEEL_BURST] {
-                assert_eq!(wheel_platform_lines(lines, rows, false), lines);
+        for platform in WheelPlatform::ARMS.into_iter().chain([WheelPlatform::Host]) {
+            for rows in [0, 1, 24, 50, u16::MAX] {
+                for lines in [0, 1, 2, 7, MAX_WHEEL_BURST] {
+                    assert_eq!(wheel_platform_lines(platform, lines, rows, false), lines);
+                }
             }
         }
     }
@@ -2890,10 +3031,21 @@ mod tests {
     /// under DEC 1007 gets a detent's three arrows at 24 rows (a precise row gets
     /// one), while a mouse-tracking app still gets exactly ONE report per notch, the
     /// app applying its own notch->lines conversion. The viewport fallback carries
-    /// the notch count, unscaled, for `App::input_wheel` to scale.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// the notch count, unscaled, for `App::input_wheel` to scale. On every
+    /// host: the pager's arrows through [`WheelPlatform::Vte`] (6A-4).
     #[test]
     fn a_free_desktop_detent_is_three_pager_arrows_but_one_tracking_report() {
+        let vte = |term: &Mutex<Terminal>, ev: &InputEvent| {
+            let sink = SinkWriter::new(-1);
+            seam_encode_on(
+                WheelPlatform::Vte,
+                term,
+                &crate::mode_mirror_of(term),
+                &sink,
+                ev,
+            )
+            .1
+        };
         let precise = |dir| InputEvent::Wheel {
             dir,
             lines: 1,
@@ -2905,14 +3057,11 @@ mod tests {
         };
         let pager = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
         assert_eq!(
-            egress_bytes(&pager, &wheel(WheelDir::Down, 1)),
+            vte(&pager, &wheel(WheelDir::Down, 1)),
             b"\x1b[B\x1b[B\x1b[B"
         );
-        assert_eq!(
-            egress_bytes(&pager, &wheel(WheelDir::Up, 2)),
-            b"\x1b[A".repeat(6)
-        );
-        assert_eq!(egress_bytes(&pager, &precise(WheelDir::Down)), b"\x1b[B");
+        assert_eq!(vte(&pager, &wheel(WheelDir::Up, 2)), b"\x1b[A".repeat(6));
+        assert_eq!(vte(&pager, &precise(WheelDir::Down)), b"\x1b[B");
         let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
         assert_eq!(
             egress_bytes(&tracking, &wheel(WheelDir::Down, 1)),
@@ -3026,7 +3175,7 @@ mod tests {
             side: SelectionSide::Right,
             block: true,
             // parse_mouse itself (scope-blind) never sets suppression — the
-            // scoped-edge policy is applied by cmd_mouse AFTER parsing — so the
+            // scoped-edge policy is applied by the verb's arm AFTER parsing — so the
             // pure parser output stays struct-identical to the human builder.
             suppress_copy_on_select: false,
             // The control verb carries no real pointer, so it (and the human

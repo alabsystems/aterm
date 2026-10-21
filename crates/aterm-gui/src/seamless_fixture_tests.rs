@@ -28,6 +28,16 @@
 //! A red here is never fixed by regenerating a fixture: the bytes are what that
 //! release's producer sends, forever. It is fixed by making the consumer admit
 //! them again (law L3: consumer changes only ever become more lenient).
+//!
+//! ONE DIRECTION, the only one an update hands in: an older producer's bytes
+//! into this consumer. No update authority names a build at or below the
+//! running one (`native_updater_service`'s
+//! `no_update_authority_names_a_build_at_or_below_the_running_one`), so no
+//! lane hands this producer's bytes to an older consumer (the fixture
+//! README's "The other direction"). What the desks cover is held by the
+//! fields each release's desks write (`fields.toml`,
+//! `seamless_fixture_cover.rs`), which the generator, and with it the cut,
+//! keeps from shrinking.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -194,6 +204,19 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.106.0", "shell-integration"),
     ("v0.106.0", "stalled-sequence"),
     ("v0.106.0", "twelve-panes"),
+    ("v0.107.0", "claude-code-1049"),
+    ("v0.107.0", "colour-and-shell"),
+    ("v0.107.0", "held-pane"),
+    ("v0.107.0", "history"),
+    ("v0.107.0", "history-carry"),
+    ("v0.107.0", "incident-55x149"),
+    ("v0.107.0", "link-dense"),
+    ("v0.107.0", "link-dense-history"),
+    ("v0.107.0", "policy-repaint"),
+    ("v0.107.0", "policy-visible"),
+    ("v0.107.0", "shell-integration"),
+    ("v0.107.0", "stalled-sequence"),
+    ("v0.107.0", "twelve-panes"),
 ];
 
 /// THE DESK SET, one `("vX.Y.0", "<desk>")` row per desk: from that release on,

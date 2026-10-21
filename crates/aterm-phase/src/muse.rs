@@ -960,6 +960,34 @@ const TOOL_HEADS: [&str; 3] = [
     anchor_text("muse.tool.edited"),
 ];
 
+/// Whether a reply's head row `head` (its `◆` and indent stripped) is Muse
+/// Code's own tool row ([`TOOL_HEADS`]), no word of the agent's. A `Ran `
+/// head is the binary's whatever follows (a command is any words). A
+/// `Wrote ` or `Edited ` head names a path ([`names_a_path`]), where the
+/// agent's own sentence goes on in words: `Wrote the parser module and its
+/// unit tests in this turn.` is the agent's report (measured 2026-10-20,
+/// `docs/measured/forever-lab-2026-10-20.md` P2: read as a tool row, it left
+/// the turn no last words, and a need, defense or done claim in it unread).
+fn tool_row(head: &str) -> bool {
+    let [ran, wrote, edited] = TOOL_HEADS;
+    head.starts_with(ran)
+        || [wrote, edited]
+            .iter()
+            .any(|h| head.strip_prefix(h).is_some_and(names_a_path))
+}
+
+/// Whether the words after a `Wrote `/`Edited ` head are a tool row's (every
+/// one the 1.4.10 captures measured): a first word holding a `/`, a `.` or
+/// the cut's `…` (`.agents/probe-write.md (+1)`, a path cut at the row's
+/// end), a lone word, or one the row's own tail follows (`(+1)`, `— denied`).
+fn names_a_path(rest: &str) -> bool {
+    let (first, after) = rest.split_once(' ').unwrap_or((rest, ""));
+    first.contains(['/', '.', '…'])
+        || after.is_empty()
+        || after.starts_with("(+")
+        || after.starts_with("— ")
+}
+
 /// The agent's last words: the reply the last turn ended on, its `◆` and
 /// indent stripped, one line per row. `None` while a box is up or a turn
 /// runs, before any turn, where [`phase`] cannot say the turn ended, and
@@ -971,13 +999,126 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     let head = *lines.first()?;
     let message = lines.join(" ");
     if head == const { anchor_text("muse.turn.interrupted") }
-        || TOOL_HEADS.iter().any(|t| head.starts_with(t))
+        || tool_row(head)
         || wall_of(&message).is_some()
         || is_fault(&message)
     {
         return None;
     }
     Some(lines.join("\n"))
+}
+
+/// WHETHER THE REPLY [`said_tail`] READS IS WHOLE ON `rows`: its `◆` head is
+/// one of them ([`Turn::Ended`]). `false` for a reply taller than the rows,
+/// its head and its message above them ([`Turn::Tail`]: its tail is then the
+/// rows in sight, and what stood above them — a need, an open item — is not
+/// in it), and where there are no last words.
+#[must_use]
+pub fn said_whole(rows: &[String]) -> bool {
+    said_tail(rows).is_some()
+        && open_frame(rows).is_some_and(|f| matches!(turn(rows, f.top), Turn::Ended(..)))
+}
+
+/// THE AGENT'S OTHER WORDS IN THE TURN ITS LAST WORDS END ([`said_tail`]):
+/// every `◆` reply of the same turn above its last — the words it said
+/// before a tool call, say — oldest first, each as [`said_tail`] reads one
+/// (its `◆` and indent stripped, one line per row, blank rows left out),
+/// joined by a blank line. Muse Code's own blocks are passed over as
+/// [`said_tail`] passes them: a tool's row (`◆ Ran command · …`), the
+/// interrupt, a wall, a fault, a recap or a turn's time
+/// ([`is_own_row_head`]), and its pointer to the panel and its abnormal-end
+/// warning under a reply. The turn is the rows under the person's last
+/// message (`❯`), or from the session's banner or the rows' top where it is
+/// above them. `None` where the turn holds no other reply on `rows`, or the
+/// last reply's head is not on them.
+#[must_use]
+pub fn turn_said_before(rows: &[String]) -> Option<String> {
+    let (_, said) = turn_before(rows)?;
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+/// WHETHER THE TURN [`said_tail`]'s REPLY ENDS IS WHOLE ON `rows`: the reply
+/// is ([`said_whole`]), and so is the person's message that opened the turn
+/// (its `❯` row). `false` where the turn reaches the rows' top: an earlier
+/// reply of the turn, and a need said in it, may stand above them.
+#[must_use]
+pub fn turn_whole(rows: &[String]) -> bool {
+    turn_before(rows).is_some_and(|(opened, _)| opened)
+}
+
+/// A row a read of the history above the screen stops at, for a turn
+/// [`turn_whole`] finds cut: the person's message that opened it (`❯` in
+/// column 0), or the session's banner over it, read walking up.
+#[must_use]
+pub fn turn_history_stop(row: &str) -> bool {
+    row.starts_with('❯') || is_banner_row(row)
+}
+
+/// THE MESSAGE THAT OPENED THE TURN [`said_tail`]'s REPLY ENDS: the person's
+/// last message (`❯` in column 0, the `❯` stripped) and the rows it wrapped
+/// onto (indented, up to a blank row or a row in column 0), joined by a
+/// space. `None` where there are no last words, and where that message is
+/// not on `rows`.
+#[must_use]
+pub fn turn_opened_by(rows: &[String]) -> Option<String> {
+    said_tail(rows)?;
+    let f = open_frame(rows)?;
+    let (_, user, _) = scope(rows, f.top);
+    let user = user?;
+    let end = (user + 1..f.top)
+        .find(|&i| blank(&rows[i]) || leading_spaces(&rows[i]) == 0)
+        .unwrap_or(f.top);
+    let first = rows[user].strip_prefix('❯').unwrap_or(&rows[user]);
+    let text: Vec<&str> = std::iter::once(first)
+        .chain(rows[user + 1..end].iter().map(String::as_str))
+        .map(crate::text::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    Some(text.join(" "))
+}
+
+/// The turn [`turn_said_before`] reads: whether the person's message that
+/// opened it is on `rows` ([`turn_whole`]), and the words of its other
+/// replies, oldest first. `None` where the last reply's head is not on
+/// `rows` ([`said_whole`]), or there are no last words.
+fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
+    if !said_whole(rows) {
+        return None;
+    }
+    let f = open_frame(rows)?;
+    let Turn::Ended(head, _) = turn(rows, f.top) else {
+        return None;
+    };
+    let (_, user, from) = scope(rows, f.top);
+    let mut said = Vec::new();
+    for h in (from..head).filter(|&h| is_reply_head(&rows[h]) && !is_own_row_head(&rows[h])) {
+        // The block's rows: up to the next row in column 0.
+        let end = (h + 1..head)
+            .find(|&k| leading_spaces(&rows[k]) == 0 && !blank(&rows[k]))
+            .unwrap_or(head);
+        let first = rows[h].strip_prefix('◆').unwrap_or(&rows[h]);
+        let lines: Vec<&str> = std::iter::once(crate::text::trim(first))
+            .chain(
+                (h + 1..end)
+                    .filter(|&k| !is_view_hint(rows, k) && !in_abnormal_end(rows, k))
+                    .map(|k| crate::text::trim(&rows[k])),
+            )
+            .filter(|t| !t.is_empty())
+            .collect();
+        let Some(&top) = lines.first() else {
+            continue;
+        };
+        let message = lines.join(" ");
+        if top == const { anchor_text("muse.turn.interrupted") }
+            || tool_row(top)
+            || wall_of(&message).is_some()
+            || is_fault(&message)
+        {
+            continue;
+        }
+        said.push(lines.join("\n"));
+    }
+    Some((user.is_some(), said))
 }
 
 /// The faults a turn can stop on that only a person can fix (the binary's
@@ -2220,6 +2361,15 @@ fn muse_banner_version(row: &str) -> Option<&str> {
     .then_some(version)
 }
 
+/// Muse Code's banner is not known to print its running build: no recorded
+/// card of a store build has been matched to the store's version
+/// (`crate::BannerBuild::ProvenanceOnly`).
+pub const LAUNCH_CARD_BUILD: crate::BannerBuild = crate::BannerBuild::ProvenanceOnly;
+
+/// The rows [`launch_card_scan`] reads of a card from its banner down: the
+/// banner row alone.
+pub const LAUNCH_CARD_ROWS: usize = 1;
+
 fn muse_card_at(rows: &[String], top: usize) -> Option<CardPlace> {
     let row0 = rows.get(top)?;
     muse_banner_version(row0)?;
@@ -2309,32 +2459,61 @@ fn parse_muse_footer_model(row: &str) -> Option<(String, Option<String>)> {
 /// Muse Code's launch banner and live footer model/effort for the harness footer.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
+    launch_card_read(rows).map(|read| read.card)
+}
+
+/// [`launch_card`] with the rows it was read from
+/// ([`crate::LaunchCardRead`]): the banner's row where its version came from
+/// the banner, and the live footer's row where the model came from there.
+/// Never panics, on any rows.
+#[must_use]
+pub fn launch_card_read(rows: &[String]) -> Option<crate::LaunchCardRead> {
     let f = frame(rows)?;
-    let footer_model = rows.get(f.footer).and_then(|r| parse_muse_footer_model(r));
+    let footer_model = rows
+        .get(f.footer)
+        .and_then(|r| parse_muse_footer_model(r))
+        .map(|model| (f.footer, model));
     let (_, place) = launch_card_scan(&rows[..f.top]);
-    let version = place
+    let banner = place
         .as_ref()
-        .and_then(|p| launch_card_version(rows, p))
-        .map(str::to_owned)
-        .unwrap_or_default();
-    match (version.is_empty(), footer_model) {
-        (false, Some((model, effort))) => Some(LaunchCard {
-            version,
-            model,
-            effort,
-        }),
-        (false, None) => Some(LaunchCard {
-            version,
-            model: String::new(),
-            effort: None,
-        }),
-        (true, Some((model, effort))) => Some(LaunchCard {
-            version: String::new(),
-            model,
-            effort,
-        }),
-        (true, None) => None,
-    }
+        .and_then(|p| Some((p.top, launch_card_version(rows, p)?)))
+        .filter(|(_, version)| !version.is_empty())
+        .map(|(top, version)| (top, version.to_owned()));
+    let (card, banner, status) = match (banner, footer_model) {
+        (Some((top, version)), Some((row, (model, effort)))) => (
+            LaunchCard {
+                version,
+                model,
+                effort,
+            },
+            Some(top),
+            Some(row),
+        ),
+        (Some((top, version)), None) => (
+            LaunchCard {
+                version,
+                model: String::new(),
+                effort: None,
+            },
+            Some(top),
+            None,
+        ),
+        (None, Some((row, (model, effort)))) => (
+            LaunchCard {
+                version: String::new(),
+                model,
+                effort,
+            },
+            None,
+            Some(row),
+        ),
+        (None, None) => return None,
+    };
+    Some(crate::LaunchCardRead {
+        card,
+        banner,
+        status,
+    })
 }
 
 /// Muse Code's screens, measured, for this crate's tests and a dependent

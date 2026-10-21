@@ -147,6 +147,8 @@ impl NodeWrapper<'_> {
             Role::MenuItemRadio => AtspiRole::RadioMenuItem,
             Role::Navigation => AtspiRole::Landmark,
             Role::ProgressIndicator => AtspiRole::ProgressBar,
+            Role::Meter => AtspiRole::LevelBar,
+            Role::Grid => AtspiRole::Table,
             Role::Slider => AtspiRole::Slider,
             Role::Label => AtspiRole::Label,
             Role::Status => AtspiRole::StatusBar,

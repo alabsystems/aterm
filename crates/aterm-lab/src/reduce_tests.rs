@@ -6,12 +6,9 @@
 //! controls (a reducer that keeps content, one that replaces `type`, one that
 //! blanks a notice's text) each fail the check they break.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use aterm_agent::harness::steps::{
-    COMPACT, End, Step, StepEvent, StepFold, StepId, USER_MARKERS, tool_class,
-};
-use aterm_phase::WallKind;
+use aterm_agent::harness::steps::{COMPACT, StepEvent, USER_MARKERS, tool_class};
 
 use super::*;
 
@@ -19,17 +16,6 @@ const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aterm-agent/src/supervise/fixtures"
 );
-const FP: u64 = 0x5eed_0000_0000_0007;
-const ID: Option<(u64, u64)> = Some((16_777_220, 7));
-
-/// One screen wall of each class, as the step fold's `confirms` is asked.
-const CLASSES: [WallKind; 5] = [
-    WallKind::UsageSession,
-    WallKind::Context,
-    WallKind::Auth,
-    WallKind::Overloaded,
-    WallKind::Memory,
-];
 
 /// Every transcript fixture: its name and text.
 fn fixtures() -> Vec<(String, String)> {
@@ -48,250 +34,18 @@ fn fixtures() -> Vec<(String, String)> {
     out
 }
 
-/// Whether a line is a row (no `#` header, not blank).
-fn is_row(line: &str) -> bool {
-    let t = line.trim();
-    !t.is_empty() && !t.starts_with('#')
-}
-
-/// A file folded as the tap folds it: bound at its start (floor 0), every
-/// line pushed, then taken twice (a held prompt's release); each step with
-/// the ordinal of the row its offset lies in.
-struct Folded {
-    steps: Vec<(usize, Step)>,
-    lost: u64,
-    overflow: u64,
-    end: End,
-}
-
-fn fold(text: &str) -> Folded {
-    let mut f = StepFold::new(0, None);
-    f.read_at(FP, ID, 0, false);
-    let (mut end, mut rows) = (0u64, Vec::new());
-    for line in text.lines() {
-        end += line.len() as u64 + 1;
-        f.push(line.as_bytes(), end);
-        rows.push((end, is_row(line)));
-    }
-    let a = f.take();
-    let b = f.take();
-    let ordinal = |off: u64| {
-        let line = rows.partition_point(|&(e, _)| e < off);
-        rows[..line.min(rows.len())]
-            .iter()
-            .filter(|(_, r)| *r)
-            .count()
-    };
-    let steps = a
-        .steps
-        .iter()
-        .chain(b.steps.iter())
-        .map(|s| (ordinal(s.pos.off), *s))
-        .collect();
-    Folded {
-        steps,
-        lost: a.lost + b.lost,
-        overflow: a.overflow + b.overflow,
-        end: b.end,
-    }
-}
-
-/// One to one: `a` always maps to `b` and `b` from `a`.
-#[derive(Default)]
-struct OneToOne {
-    fwd: HashMap<String, String>,
-    back: HashMap<String, String>,
-}
-
-impl OneToOne {
-    fn same(&mut self, a: &StepId, b: &StepId) -> Result<(), String> {
-        self.pair(a.as_str(), b.as_str())
-    }
-
-    fn pair(&mut self, a: &str, b: &str) -> Result<(), String> {
-        let (a, b) = (a.to_string(), b.to_string());
-        let f = self.fwd.entry(a.clone()).or_insert_with(|| b.clone());
-        let g = self.back.entry(b.clone()).or_insert_with(|| a.clone());
-        if *f == b && *g == a {
-            Ok(())
-        } else {
-            Err(format!("ids {a} and {b} are not one to one"))
-        }
-    }
-}
-
-fn kind(e: &StepEvent) -> &'static str {
-    match e {
-        StepEvent::Bind { .. } => "bind",
-        StepEvent::Prompt { .. } => "prompt",
-        StepEvent::Interrupt => "interrupt",
-        StepEvent::ToolUse { .. } => "tool",
-        StepEvent::ToolResult { .. } => "result",
-        StepEvent::TurnEnd { .. } => "end",
-        StepEvent::EndWall { .. } => "endwall",
-        StepEvent::Compact => "compact",
-        StepEvent::Model { .. } => "model",
-        StepEvent::Off { .. } => "off",
-    }
-}
-
-/// The step events of two folds agree: kinds in order and at the same
-/// rows, the same states, closed words and numbers, ids one to one, and
-/// times one shift apart.
-fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), String> {
-    use StepEvent as E;
-    match (a, b) {
-        (E::Bind { len: x }, E::Bind { len: y }) if x == y => Ok(()),
-        (E::Prompt { vref: x }, E::Prompt { vref: y }) => ids.same(x, y),
-        (E::Interrupt, E::Interrupt) | (E::Compact, E::Compact) => Ok(()),
-        (
-            E::ToolUse {
-                id: i,
-                tool: t,
-                cls: c,
-                subagent: s,
-            },
-            E::ToolUse {
-                id: j,
-                tool: u,
-                cls: d,
-                subagent: r,
-            },
-        ) => {
-            ids.same(i, j)?;
-            let named = !t.as_str().starts_with("mcp__") && tool_class(t.as_str()).0 != "other";
-            if c != d || s != r || (named && t.as_str() != u.as_str()) {
-                return Err(format!("tool {t:?} {c} became {u:?} {d}"));
-            }
-            Ok(())
-        }
-        (E::ToolResult { id: i, error: x }, E::ToolResult { id: j, error: y }) if x == y => {
-            ids.same(i, j)
-        }
-        (E::TurnEnd { .. }, E::TurnEnd { .. })
-        | (E::EndWall { .. }, E::EndWall { .. })
-        | (E::Model { .. }, E::Model { .. })
-        | (E::Off { .. }, E::Off { .. })
-            if a == b =>
-        {
-            Ok(())
-        }
-        _ => Err(format!("{a:?} became {b:?}")),
-    }
-}
-
-/// Claude Code's notices in a file, by row ordinal: an `isApiErrorMessage`
-/// row's joined text, and a local command's output in its tags (the text
-/// `wall_confirm` classes).
-fn notices(text: &str) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    for (n, line) in text.lines().filter(|l| is_row(l)).enumerate() {
-        let row = parse(line.trim()).expect("a row");
-        let kind = row.get("type").and_then(Node::as_str);
-        if kind == Some("assistant") && row.get("isApiErrorMessage") == Some(&Node::Bool(true)) {
-            out.push((n, notice_text(&row).0));
-        }
-        if kind == Some("system")
-            && row.get("subtype").and_then(Node::as_str) == Some("local_command")
-            && let Some(c) = row.get("content").and_then(Node::as_str)
-        {
-            let t = c.trim();
-            // `command_notice`: only an output that reads as a full context
-            // is a notice.
-            if let Some(inner) = ["<local-command-stderr>", "<local-command-stdout>"]
-                .iter()
-                .find_map(|o| t.strip_prefix(o))
-                .map(|i| {
-                    i.split("</local-command-")
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                })
-                .filter(|i| aterm_phase::classify_wall(i) == Some(WallKind::Context))
-            {
-                out.push((n, inner.to_string()));
-            }
-        }
-    }
-    out
-}
-
-/// THE FOLD CHECK (T7): the reduction folds as its source.
+/// THE FOLD CHECK (T7): the reduction folds as its source, as the reducer
+/// itself reads it ([`readings`], [`reads_as`]): the same steps at the same
+/// rows in the same states, closed words and numbers, ids one to one, times
+/// one shift apart, the same end after every row and at the last, the same
+/// walls, and every notice read as its source's.
 fn check_folds(name: &str, source: &str, r: &Reduction) -> Result<(), String> {
-    let (a, b) = (fold(source), fold(&r.text));
-    let kinds =
-        |f: &Folded| -> Vec<&'static str> { f.steps.iter().map(|(_, s)| kind(&s.ev)).collect() };
-    if a.steps.len() != b.steps.len() {
-        return Err(format!(
-            "{name}: {} steps became {}: {:?} / {:?}",
-            a.steps.len(),
-            b.steps.len(),
-            kinds(&a),
-            kinds(&b)
-        ));
-    }
-    let shift = r.shift_days * 86_400_000;
-    let mut ids = OneToOne::default();
-    for ((ra, sa), (rb, sb)) in a.steps.iter().zip(&b.steps) {
-        let at = |s: &Step| i64::try_from(s.pos.at_ms).unwrap_or(i64::MAX);
-        let timed = !matches!(sa.ev, StepEvent::Bind { .. });
-        if ra != rb || sa.state != sb.state || (timed && at(sb) - at(sa) != shift) {
-            return Err(format!(
-                "{name}: {:?} at row {ra} ({}) became {:?} at row {rb} ({})",
-                sa.ev, sa.pos.at_ms, sb.ev, sb.pos.at_ms
-            ));
-        }
-        same_event(&sa.ev, &sb.ev, &mut ids).map_err(|e| format!("{name}: row {ra}: {e}"))?;
-    }
-    if (a.lost, a.overflow) != (b.lost, b.overflow) {
-        return Err(format!(
-            "{name}: lost/overflow {:?} became {:?}",
-            (a.lost, a.overflow),
-            (b.lost, b.overflow)
-        ));
-    }
-    let shifted = a.end.at_ms.map(|t| i64::try_from(t).unwrap_or(0) + shift);
-    let ends_agree = a.end.last == b.end.last
-        && a.end.closed == b.end.closed
-        && shifted == b.end.at_ms.map(|t| i64::try_from(t).unwrap_or(0))
-        && a.end.wall() == b.end.wall()
-        && CLASSES
-            .iter()
-            .all(|&k| a.end.confirms(k) == b.end.confirms(k));
-    if !ends_agree {
-        return Err(format!("{name}: the end {:?} became {:?}", a.end, b.end));
-    }
-    let (na, nb) = (notices(source), notices(&r.text));
-    if na.len() != nb.len() {
-        return Err(format!("{name}: {} notices became {}", na.len(), nb.len()));
-    }
-    for ((ra, ta), (rb, tb)) in na.iter().zip(&nb) {
-        let (ka, kb) = (
-            aterm_phase::classify_wall(ta),
-            aterm_phase::classify_wall(tb),
-        );
-        if ra != rb || ka != kb || Reading::of(ta) != Reading::of(tb) {
-            return Err(format!(
-                "{name}: the notice at row {ra} classed {ka:?} became {kb:?} ({:?})",
-                Reading::of(tb)
-            ));
-        }
-    }
-    let walls = |f: &Folded| -> Vec<StepEvent> {
-        f.steps
-            .iter()
-            .map(|(_, s)| s.ev)
-            .filter(|e| matches!(e, StepEvent::EndWall { .. }))
-            .collect()
-    };
-    if walls(&a) != walls(&b) {
-        return Err(format!(
-            "{name}: walls {:?} became {:?}",
-            walls(&a),
-            walls(&b)
-        ));
-    }
-    Ok(())
+    reads_as(
+        &readings(source, Program::Claude),
+        &readings(&r.text, Program::Claude),
+        r.shift_days,
+    )
+    .map_err(|e| format!("{name}: {e}"))
 }
 
 /// The words a reduction may hold that are no source's text: the markers,
@@ -393,7 +147,7 @@ fn check_no_text(name: &str, source: &str, r: &Reduction, program: Program) -> R
     // The reduction's own line: fixed words, numbers, and the build a row
     // named (a closed word).
     let head = lines.next().unwrap_or_default();
-    if head != header(program, r.build.as_deref(), r.shift_days, r.rows)
+    if head != header(program, r.build.as_deref(), r.moved_days, r.rows, r.again)
         || !r.build.as_deref().is_none_or(is_word)
     {
         return Err(format!("{name}: the header {head:?} is no reduction's own"));
@@ -434,8 +188,7 @@ fn check_no_text(name: &str, source: &str, r: &Reduction, program: Program) -> R
 
 /// A key the reducer named (`k<n>`): it holds nothing of the key.
 fn renamed(k: &str) -> bool {
-    k.strip_prefix('k')
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    is_key_name(k)
 }
 
 /// The ids of a file's calls, found by their SHAPE: the `id` of any object
@@ -732,23 +485,12 @@ fn a_reduction_folds_as_its_source() {
     // Not vacuous: the fixtures hold walls, notices, calls and turn ends.
     let (mut walls, mut notes, mut tools, mut ends) = (0, 0, 0, 0);
     for (_, text) in fixtures() {
-        let f = fold(&text);
-        walls += f
-            .steps
-            .iter()
-            .filter(|(_, s)| matches!(s.ev, StepEvent::EndWall { .. }))
-            .count();
-        tools += f
-            .steps
-            .iter()
-            .filter(|(_, s)| matches!(s.ev, StepEvent::ToolUse { .. }))
-            .count();
-        ends += f
-            .steps
-            .iter()
-            .filter(|(_, s)| matches!(s.ev, StepEvent::TurnEnd { .. }))
-            .count();
-        notes += notices(&text).len();
+        let f = readings(&text, Program::Claude);
+        let count = |p: fn(&StepEvent) -> bool| f.steps.iter().filter(|s| p(&s.ev)).count();
+        walls += count(|e| matches!(e, StepEvent::EndWall { .. }));
+        tools += count(|e| matches!(e, StepEvent::ToolUse { .. }));
+        ends += count(|e| matches!(e, StepEvent::TurnEnd { .. }));
+        notes += f.notices.len();
     }
     assert!(
         walls >= 10 && notes >= 15 && tools >= 5 && ends >= 10,
@@ -872,7 +614,8 @@ const CLAUDE_PLANT_KEPT: [(usize, &str); 12] = [
 /// and a string under a time key that is no whole stamp is replaced whole,
 /// so the planted words survive nowhere and the text check passes; a whole
 /// stamp is still rebased, and an attachment's `type` and a queued prompt's
-/// `origin` are kept. NEGATIVE CONTROL: each planted row as an earlier rule
+/// `origin`, closed words the harness's readers read, are kept (ruling U7).
+/// NEGATIVE CONTROL: each planted row as an earlier rule
 /// reduced it (its keys as written, the stamp's tail and the attachment's
 /// word kept) fails the text check, naming the words.
 #[test]
@@ -1000,11 +743,24 @@ fn a_reduction_keeps_no_key_or_stamp_tail_anyone_wrote() {
     }
 }
 
-/// The committed 2.1.303 reduction (5H-2b), made by an earlier rule.
+/// The committed 2.1.303 reduction (5H-2b), reduced again by ruling U7's
+/// rule (6D-2, ruling U8).
 const STEPS_2_1_303: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aterm-agent/src/harness/testdata/steps/2.1.303.jsonl"
 );
+
+/// The committed Codex 0.163.0 reductions (5G), reduced again the same way.
+const STEPS_CODEX: [&str; 2] = [
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../aterm-agent/src/harness/testdata/steps/codex-0.163.0.jsonl"
+    ),
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../aterm-agent/src/harness/testdata/steps/codex-0.163.0-subagent.jsonl"
+    ),
+];
 
 /// A file's rows.
 fn rows_of(text: &str) -> Vec<Node> {
@@ -1015,11 +771,13 @@ fn rows_of(text: &str) -> Vec<Node> {
 }
 
 /// T7, THE ARGUMENT CHECK, which finds a tool's arguments by their shape
-/// and not by the reducer's rule: the committed 2.1.303 reduction, made
-/// before `api-request-shape` was a free subtree, keeps the argument names
-/// of the tools that row lists, and the check names them there (and Bash's
-/// `command` in its calls); reduced again by [`P11`] it keeps none, and
-/// passes the whole text check. NEGATIVE CONTROLS, each apart from
+/// and not by the reducer's rule, over the committed 2.1.303 reduction as
+/// ruling U8 re-reduced it: no row keeps a tool's argument name as written
+/// (its `api-request-shape` row's tool list and Bash's input are renamed
+/// whole), and the file is the reducer's fixed point, reduced again it is
+/// itself, its `#` line too; so are the committed Codex reductions. The
+/// file made before `api-request-shape` was a free subtree fails both
+/// (scratch-reverted). NEGATIVE CONTROLS, each apart from
 /// [`opens_free`]: the planted `api-request-shape`, `tool_addition` (its
 /// argument name, and with that renamed, its `$defs` name), `wireToolInputs`
 /// and `parameters` rows as an earlier rule reduced them fail the argument
@@ -1039,25 +797,30 @@ fn a_tool_argument_name_is_never_kept_as_written() {
         calls: &calls,
         check: &keys_only,
     };
-    let kept = |r: &Node| check_tool_arguments(r, r, Arg::ROW, &args).err();
-    let shape = src
+    let kept: Vec<String> = src
         .iter()
-        .find(|r| r.get("type").and_then(Node::as_str) == Some("api-request-shape"))
-        .expect("its api-request-shape row");
-    let e = kept(shape).expect("its tool list keeps its argument names");
-    assert!(e.contains(r#""description""#), "{e}");
-    let calls: Vec<String> = src.iter().filter_map(kept).collect();
+        .filter_map(|r| check_tool_arguments(r, r, Arg::ROW, &args).err())
+        .collect();
+    assert!(kept.is_empty(), "every argument name renamed: {kept:#?}");
+    // Not vacuous: the file holds the places the check reads, its tool list
+    // (the `api-request-shape` row's `shape`, whose `type` no reader reads)
+    // and a call's input.
     assert!(
-        calls.iter().any(|e| e.contains(r#""command""#)),
-        "{calls:?}"
+        committed.contains(r#""shape":{"#) && committed.contains(r#""type":"tool_use""#),
+        "the tool list and a call are committed"
     );
     let again = reduce(&committed, Program::Claude).expect("reduced");
-    let red = rows_of(&again.text);
-    assert_eq!(src.len(), red.len());
-    for (a, b) in src.iter().zip(&red) {
-        check_tool_arguments(a, b, Arg::ROW, &args).expect("every argument name renamed");
-    }
+    assert!(again.again, "its own line says it is a reduction");
+    assert!(again.text == committed, "2.1.303 is reduced as it was");
+    // Its header's form, its rows, ids one to one across keys and values,
+    // and no 8-byte run of anyone's words: held on each committed file.
     check_no_text("2.1.303", &committed, &again, Program::Claude).expect("no text");
+    for path in STEPS_CODEX {
+        let text = std::fs::read_to_string(path).expect("a committed reduction");
+        let again = reduce(&text, Program::Codex).expect("reduced");
+        assert!(again.text == text, "{path} is reduced as it was");
+        check_no_text(path, &text, &again, Program::Codex).expect("no text");
+    }
     // Planted row `n` and an earlier rule's reduction of it, `edit` (a
     // `from` written as `to`) made to it.
     let earlier = |n: usize, edit: Option<(&str, &str)>| {
@@ -1177,8 +940,10 @@ fn a_codex_reduction_keeps_no_text() {
     check_no_text("codex", &src, &r, Program::Codex).expect("no text");
     assert!(!r.text.contains("quokka"), "{}", r.text);
     let rows: Vec<&str> = r.text.lines().collect();
+    // A parsed command's `type` is a closed word no reader reads (ruling
+    // U7); a call's namespace the step fold reads.
     assert!(
-        rows[2].contains(r#""parsed_cmd":[{"type":"read","cmd":"","name":"","path":""}]"#),
+        rows[2].contains(r#""parsed_cmd":[{"type":"","cmd":"","name":"","path":""}]"#),
         "{}",
         rows[2]
     );
@@ -1206,7 +971,9 @@ impl Rules for KeepsContent {
     }
 }
 
-/// A reducer that replaces every `type`.
+/// A reducer that replaces every `type`, past the reducer's own check that
+/// its reduction reads as its source (which refuses it): every candidate it
+/// leaves is kept.
 struct ReplacesType;
 
 impl Rules for ReplacesType {
@@ -1217,9 +984,14 @@ impl Rules for ReplacesType {
             P11.string(at, s)
         }
     }
+
+    fn words(&self, c: &Candidates<'_>) -> Result<Vec<bool>, String> {
+        Ok(c.every())
+    }
 }
 
-/// A reducer that blanks a notice's text.
+/// A reducer that blanks a notice's text, past the reducer's own check as
+/// [`ReplacesType`] is.
 struct BlanksNotices;
 
 impl Rules for BlanksNotices {
@@ -1227,6 +999,58 @@ impl Rules for BlanksNotices {
         match P11.string(at, s) {
             Treat::Notice => Treat::Replace,
             t => t,
+        }
+    }
+
+    fn words(&self, c: &Candidates<'_>) -> Result<Vec<bool>, String> {
+        Ok(c.every())
+    }
+}
+
+/// A reducer that keeps EVERY candidate closed word, read or not (the rule
+/// before ruling U7).
+struct KeepsEveryCandidate;
+
+impl Rules for KeepsEveryCandidate {
+    fn string(&self, at: &At<'_>, s: &str) -> Treat {
+        P11.string(at, s)
+    }
+
+    fn words(&self, c: &Candidates<'_>) -> Result<Vec<bool>, String> {
+        Ok(c.every())
+    }
+}
+
+/// A reducer that blanks the words a reader reads under the keys it names
+/// (`subtype`: a turn's end, a compaction, a local command; a notice's
+/// `error`, its quota's `status` and `rateLimitType`), the readers' choice
+/// otherwise, past the reducer's own check.
+struct BlanksRead(&'static [&'static str]);
+
+impl Rules for BlanksRead {
+    fn string(&self, at: &At<'_>, s: &str) -> Treat {
+        P11.string(at, s)
+    }
+
+    fn words(&self, c: &Candidates<'_>) -> Result<Vec<bool>, String> {
+        let mut keep = c.by_readings()?;
+        for (k, (key, _)) in keep.iter_mut().zip(c.pairs()) {
+            *k &= !self.0.contains(&key.as_str());
+        }
+        Ok(keep)
+    }
+}
+
+/// A rule that replaces a word a reader reads (every `subtype`), with the
+/// readers' choice and its check.
+struct ReplacesSubtype;
+
+impl Rules for ReplacesSubtype {
+    fn string(&self, at: &At<'_>, s: &str) -> Treat {
+        if at.key == "subtype" {
+            Treat::Replace
+        } else {
+            P11.string(at, s)
         }
     }
 }
@@ -1262,6 +1086,172 @@ fn a_reducer_that_blanks_notice_text_fails_the_wall_check() {
         with >= 15 && bad.len() == with,
         "{} of {with}: {bad:#?}",
         bad.len()
+    );
+}
+
+/// A transcript holding a closed word no reader reads and one a reader
+/// reads (ruling U7): a prompt; a `mode` row, whose `type` and `mode` no
+/// reader opens, the mode a word someone wrote; the model's reply; and the
+/// turn's end, a `system` row whose `subtype` the step fold reads.
+const WORDS_PLANT: [&str; 4] = [
+    r#"{"type":"user","timestamp":"2026-10-16T10:00:00.000Z","uuid":"11111111-1111-4111-8111-111111111111","promptId":"12111111-1111-4111-8111-111111111111","message":{"role":"user","content":"hello"},"version":"2.1.303"}"#,
+    r#"{"type":"mode","mode":"quokkaledger","sessionId":"71111111-1111-4111-8111-111111111111"}"#,
+    r#"{"type":"assistant","timestamp":"2026-10-16T10:00:01.000Z","uuid":"21111111-1111-4111-8111-111111111111","parentUuid":"11111111-1111-4111-8111-111111111111","message":{"id":"msg_01","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn"},"version":"2.1.303"}"#,
+    r#"{"type":"system","subtype":"turn_duration","durationMs":1200,"timestamp":"2026-10-16T10:00:02.000Z","uuid":"31111111-1111-4111-8111-111111111111","parentUuid":"21111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
+];
+
+/// RULING U7: a closed word is kept only where a reader reads it. The
+/// planted `"mode":"quokkaledger"` (a word under a closed key, which the
+/// rule before U7 kept as written) is emptied, while its row's `type`, which
+/// the harness reads of every row, is kept; so is the turn end's `subtype`,
+/// which the step fold reads, and the reply's `stop_reason`; and every
+/// word kept is read (the output-side check, [`unread_words`]). NEGATIVE
+/// CONTROLS: a reducer that keeps every candidate keeps the planted word
+/// and fails the output-side check, naming it; one that blanks the read
+/// `subtype` fails the fold check (the turn's end is gone).
+#[test]
+fn a_closed_word_is_kept_only_where_a_reader_reads_it() {
+    let src: String = WORDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
+    let r = reduce(&src, Program::Claude).expect("reduced");
+    let rows: Vec<&str> = r.text.lines().collect();
+    assert_eq!(
+        rows[2], r#"{"type":"mode","mode":"","sessionId":"00000000-0000-4000-8000-000000000003"}"#,
+        "{}",
+        r.text
+    );
+    assert!(
+        rows[4].contains(r#""subtype":"turn_duration""#)
+            && rows[3].contains(r#""stop_reason":"end_turn""#),
+        "{}",
+        r.text
+    );
+    assert!(!r.text.contains("quokka"), "{}", r.text);
+    check_folds("plant", &src, &r).expect("it folds as its source");
+    check_no_text("plant", &src, &r, Program::Claude).expect("no text");
+    assert_eq!(unread_words(&r.text, Program::Claude), Ok(vec![]));
+    assert!(r.words.1 < r.words.0, "{:?}", r.words);
+    // NEGATIVE CONTROLS.
+    let every = reduce_with(&src, Program::Claude, &KeepsEveryCandidate).expect("reduced");
+    assert!(
+        every.text.contains(r#""mode":"quokkaledger""#),
+        "{}",
+        every.text
+    );
+    let unread = unread_words(&every.text, Program::Claude).expect("read");
+    assert!(
+        unread.contains(&("mode".to_string(), "quokkaledger".to_string())),
+        "{unread:?}"
+    );
+    let blanked = reduce_with(&src, Program::Claude, &BlanksRead(&["subtype"])).expect("reduced");
+    assert!(blanked.text.contains(r#""subtype":"""#), "{}", blanked.text);
+    let e = check_folds("plant", &src, &blanked).expect_err("its turn end is gone");
+    assert!(e.contains("steps became"), "{e}");
+}
+
+/// THE OUTPUT-SIDE CHECK (ruling U7) over every `supervise/fixtures`
+/// transcript and the planted Codex rollout: each closed word a reduction
+/// keeps, blanked alone, changes its readings. NEGATIVE CONTROL: a reducer
+/// that keeps every candidate keeps an unread word in every fixture.
+#[test]
+fn every_closed_word_a_reduction_keeps_is_read() {
+    let mut kept = 0;
+    for (n, text) in fixtures() {
+        let r = reduce(&text, Program::Claude).expect("reduced");
+        assert_eq!(unread_words(&r.text, Program::Claude), Ok(vec![]), "{n}");
+        kept += r.words.1;
+    }
+    let src: String = CODEX_PLANT.iter().map(|l| format!("{l}\n")).collect();
+    let r = reduce(&src, Program::Codex).expect("reduced");
+    assert_eq!(unread_words(&r.text, Program::Codex), Ok(vec![]));
+    assert!(kept >= 100, "{kept} words kept: the check is not vacuous");
+    // NEGATIVE CONTROL.
+    let unread = fixtures()
+        .iter()
+        .filter(|(_, text)| {
+            let r = reduce_with(text, Program::Claude, &KeepsEveryCandidate).expect("reduced");
+            !unread_words(&r.text, Program::Claude)
+                .expect("read")
+                .is_empty()
+        })
+        .count();
+    assert_eq!(
+        unread,
+        fixtures().len(),
+        "every fixture keeps an unread word"
+    );
+}
+
+/// NEGATIVE CONTROL (ruling U7): a reducer that blanks a word a reader
+/// reads (each `subtype` the readers keep: a turn's `turn_duration`, a
+/// compaction's `compact_boundary`) fails the fold check on every fixture
+/// whose reduction keeps one.
+#[test]
+fn a_reducer_that_blanks_a_read_word_fails_the_fold_check() {
+    let with = fixtures()
+        .iter()
+        .filter(|(_, text)| {
+            let r = reduce(text, Program::Claude).expect("reduced");
+            r.text
+                .match_indices(r#""subtype":""#)
+                .any(|(i, m)| !r.text[i + m.len()..].starts_with('"'))
+        })
+        .count();
+    let bad = failures(&BlanksRead(&["subtype"]), &folds);
+    assert!(
+        with >= 10 && bad.len() == with,
+        "{} of {with}: {bad:#?}",
+        bad.len()
+    );
+}
+
+/// A file no choice of words can make read as its source is refused (ruling
+/// U7): a rule that empties every `subtype` loses the turn's end, which no
+/// word put back restores. NEGATIVE CONTROL: the plant itself reduces.
+#[test]
+fn a_reduction_nothing_restores_is_refused() {
+    let src: String = WORDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
+    let e = reduce_with(&src, Program::Claude, &ReplacesSubtype).expect_err("refused");
+    assert!(e.contains("refused") && e.contains("steps became"), "{e}");
+    assert!(reduce(&src, Program::Claude).is_ok());
+}
+
+/// A reduction reduced again is itself (ruling U8): the readers keep the
+/// same words, each id and key keeps its name, the times move no further
+/// and the header says the source was a reduction, its day count the whole
+/// move from the first source. NEGATIVE CONTROL: the first reduction's own
+/// header says no such thing.
+#[test]
+fn a_reduction_reduced_again_is_itself() {
+    for (n, text) in fixtures() {
+        let once = reduce(&text, Program::Claude).expect("reduced");
+        let twice = reduce(&once.text, Program::Claude).expect("reduced again");
+        let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(body(&twice.text), body(&once.text), "{n}");
+        assert!(twice.again && !once.again, "{n}");
+        assert_eq!(
+            (twice.shift_days, twice.moved_days),
+            (0, once.moved_days),
+            "{n}"
+        );
+        let thrice = reduce(&twice.text, Program::Claude).expect("reduced a third time");
+        assert_eq!(thrice.text, twice.text, "{n}");
+        assert!(
+            !once
+                .text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("reduced again")
+        );
+    }
+    let src: String = CODEX_PLANT.iter().map(|l| format!("{l}\n")).collect();
+    let once = reduce(&src, Program::Codex).expect("reduced");
+    let twice = reduce(&once.text, Program::Codex).expect("reduced again");
+    assert!(twice.again && twice.text.starts_with("# codex 0.163.0 "));
+    assert!(twice.text.lines().skip(1).eq(once.text.lines().skip(1)));
+    assert_eq!(
+        reduce(&twice.text, Program::Codex).expect("again").text,
+        twice.text
     );
 }
 
@@ -1430,8 +1420,9 @@ fn a_user_row_keeps_its_marker_and_nothing_past_it() {
     );
 }
 
-/// A Codex rollout keeps its closed words, ids one to one and numbers, its
-/// reset epoch rebased with its stamps, and none of its text.
+/// A Codex rollout keeps the closed words its readers read, ids one to one
+/// and numbers, its reset epoch rebased with its stamps, and none of its
+/// text.
 #[test]
 fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
     let src = concat!(
@@ -1450,6 +1441,9 @@ fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
         "{}",
         rows[0]
     );
+    // A `session_meta`'s `type` and its build are words the harness reads
+    // (the limits reader's first line, the step fold's build: ruling U7);
+    // its path and instructions go.
     assert_eq!(
         rows[1],
         r#"{"timestamp":"2000-01-01T10:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000001","cwd":"","cli_version":"0.163.0","instructions":""}}"#
@@ -1471,7 +1465,11 @@ fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
 }
 
 /// THE LAB'S CODEX 0.163.0 ROLLOUTS (session log 5G): a call's `namespace`
-/// and an abort's `reason` are closed words kept; the millisecond stamps
+/// is a closed word kept, the step fold reading it (a `spawn_agent` in
+/// `collaboration` starts a subagent), and so is the `session_meta` that
+/// makes the call, 10 ms on, the thread's own, its build and an event's
+/// `type` the step fold reads; an abort's `reason` and an item's own `type`,
+/// which no reader reads, go (ruling U7); the millisecond stamps
 /// (`started_at_ms`) and an item's fractional `create_time` move with the
 /// stamps; a call's free-form `arguments` and a message's `content` go.
 /// NEGATIVE CONTROL: the source's own epochs appear nowhere in the
@@ -1479,6 +1477,8 @@ fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
 #[test]
 fn a_codex_rollout_keeps_its_namespace_and_moves_its_millisecond_times() {
     let src = concat!(
+        r#"{"timestamp":"2026-10-19T12:00:00.000Z","type":"session_meta","payload":{"id":"0199a0b1-0000-7000-8000-000000000abc","cli_version":"0.163.0"}}"#,
+        "\n",
         r#"{"timestamp":"2026-10-19T12:00:00.010Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","namespace":"collaboration","arguments":"{\"message\":\"say hi pelicanhinge\"}","call_id":"call_lab0004"}}"#,
         "\n",
         r#"{"timestamp":"2026-10-19T12:00:00.020Z","type":"event_msg","payload":{"type":"item_completed","started_at_ms":1792411200015,"item":{"type":"AgentMessage","content":[{"type":"Text","text":"hello pelicanhinge"}]}}}"#,
@@ -1493,25 +1493,29 @@ fn a_codex_rollout_keeps_its_namespace_and_moves_its_millisecond_times() {
     let rows: Vec<&str> = r.text.lines().collect();
     assert_eq!(
         rows[1],
-        r#"{"timestamp":"2000-01-01T12:00:00.010Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","namespace":"collaboration","arguments":"","call_id":"call_r0001"}}"#
+        r#"{"timestamp":"2000-01-01T12:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000001","cli_version":"0.163.0"}}"#
     );
     assert_eq!(
         rows[2],
-        format!(
-            r#"{{"timestamp":"2000-01-01T12:00:00.020Z","type":"event_msg","payload":{{"type":"item_completed","started_at_ms":{},"item":{{"type":"AgentMessage","content":[{{"type":"Text","text":""}}]}}}}}}"#,
-            1_792_411_200_015 + day_s * 1000
-        )
+        r#"{"timestamp":"2000-01-01T12:00:00.010Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","namespace":"collaboration","arguments":"","call_id":"call_r0002"}}"#
     );
     assert_eq!(
         rows[3],
         format!(
-            r#"{{"timestamp":"2000-01-01T12:00:00.030Z","type":"compacted","payload":{{"replacement_history":[{{"type":"message","role":"user","internal_chat_message_metadata_passthrough":{{"create_time":{}.025125}}}}]}}}}"#,
-            1_792_411_200 + day_s
+            r#"{{"timestamp":"2000-01-01T12:00:00.020Z","type":"event_msg","payload":{{"type":"item_completed","started_at_ms":{},"item":{{"type":"","content":[{{"type":"","text":""}}]}}}}}}"#,
+            1_792_411_200_015 + day_s * 1000
         )
     );
     assert_eq!(
         rows[4],
-        r#"{"timestamp":"2000-01-01T12:00:01.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted","duration_ms":4311}}"#
+        format!(
+            r#"{{"timestamp":"2000-01-01T12:00:00.030Z","type":"compacted","payload":{{"replacement_history":[{{"type":"","role":"","internal_chat_message_metadata_passthrough":{{"create_time":{}.025125}}}}]}}}}"#,
+            1_792_411_200 + day_s
+        )
+    );
+    assert_eq!(
+        rows[5],
+        r#"{"timestamp":"2000-01-01T12:00:01.000Z","type":"event_msg","payload":{"type":"turn_aborted","reason":"","duration_ms":4311}}"#
     );
     // NEGATIVE CONTROL: no epoch of the source's day survives.
     for epoch in ["1792411200", "pelicanhinge"] {
@@ -1559,4 +1563,289 @@ fn the_verb_never_writes_over_a_file() {
         "{text}"
     );
     assert_eq!(cmd_reduce(&["x".to_string()]).expect_err("usage").code, 2);
+}
+
+/// What the harness's whole-text readers make of `jsonl` (a file's first
+/// rows), its times moved back by `shift_s` so a reduction's reads as its
+/// source's: the login wall and when it lifted; the standing limit (when it
+/// holds until, the reset it names, whether it is money, the quota wall's
+/// time, reset, window and credits, the limit row's reset, window, time and
+/// words as their [`Reading`]); the model; the newest answer; the build's
+/// warning after a resume; and a task's finish and asking.
+fn harness_reads(jsonl: &str, build: &str, shift_s: i64) -> String {
+    use aterm_agent::harness::upgrade as up;
+    let back = |t: Option<u64>| t.map(|t| i64::try_from(t).unwrap_or(i64::MAX) - shift_s);
+    let wall = up::transcript_standing_wall(jsonl).map(|w| {
+        let credits = match w.credits {
+            Some(CreditsWord::Off { reason, until }) => format!("off {reason:?} {:?}", back(until)),
+            c => format!("{c:?}"),
+        };
+        (back(Some(w.at)), back(w.until), w.window, credits)
+    });
+    let limit = up::transcript_standing_limit(jsonl)
+        .map(|l| (back(l.until), l.window, back(l.at), Reading::of(&l.text)));
+    format!(
+        "login {} {:?}; limit {:?} {:?} {}; wall {wall:?}; row {limit:?}; model {:?}; answer {:?}; warned {}; finished {}; tasked {}",
+        up::transcript_login_wall(jsonl),
+        back(up::login_lifted_at(jsonl)),
+        back(up::transcript_limit_until(jsonl)),
+        back(up::transcript_limit_reset(jsonl)),
+        up::transcript_limit_spend(jsonl),
+        up::transcript_model(jsonl),
+        back(up::transcript_last_answer(jsonl, u64::MAX)),
+        up::resumed_build_warned(jsonl, build, 0, u64::MAX),
+        up::transcript_finished(jsonl, &[]),
+        up::transcript_tasked(jsonl, &[]),
+    )
+}
+
+/// THE HARNESS'S READERS READ THE REDUCTION `red` OF `source` AS THEY READ
+/// IT, apart from the reducer's own [`readings`]: every prefix of its rows
+/// to the whole-text readers ([`harness_reads`]), and each row to the wall
+/// check's read of a notice ([`notice_read`]: its typed fields, wall,
+/// confirmations and the limit it names; its words as their [`Reading`]).
+fn harness_reads_as(source: &str, red: &Reduction) -> Result<(), String> {
+    let a: Vec<&str> = source.lines().filter(|l| is_row(l)).collect();
+    let b: Vec<&str> = red.text.lines().filter(|l| is_row(l)).collect();
+    if a.len() != b.len() {
+        return Err(format!("{} rows became {}", a.len(), b.len()));
+    }
+    let build = red.build.as_deref().unwrap_or_default();
+    let shift_s = red.shift_days * 86_400;
+    let notice = |l: &str| {
+        notice_read(l).map(|mut n| {
+            let r = Reading::of(&n.text);
+            n.text.clear();
+            (r, n)
+        })
+    };
+    for n in 0..a.len() {
+        let (x, y) = (notice(a[n]), notice(b[n]));
+        if x != y {
+            return Err(format!("row {n}'s notice {x:?} became {y:?}"));
+        }
+        let (x, y) = (
+            harness_reads(&a[..=n].join("\n"), build, 0),
+            harness_reads(&b[..=n].join("\n"), build, shift_s),
+        );
+        if x != y {
+            return Err(format!("after row {n}: {x} became {y}"));
+        }
+    }
+    Ok(())
+}
+
+/// THE HARNESS'S OWN READERS (the review of 6D-1: ruling U7's readings are
+/// the committed readers', and a notice's typed words, its quota's and the
+/// login's are theirs), held apart from the reducer's [`readings`]: over
+/// every `supervise/fixtures` transcript, each prefix of the reduction
+/// reads to the harness's whole-text readers as the source's does, and
+/// each notice row to the wall check as its source's ([`harness_reads_as`]).
+/// Not vacuous: the fixtures hold a login wall, standing quota walls and
+/// notices typed by `error`. NEGATIVE CONTROLS: a reducer that blanks the
+/// words those readers read (a notice's `error`, its quota's `status` and
+/// `rateLimitType`) fails it on every fixture whose reduction keeps one,
+/// and so fails the reducer's own fold check there; and (scratch-reverted)
+/// readings cut back to 6D-1's (no standing limit, login wall or row
+/// shapes, a notice read by its wall and confirmations alone) fail it on
+/// every fixture whose notice is typed, 18 of them.
+#[test]
+fn the_harness_reads_every_reduction_as_its_source() {
+    let (mut login, mut walls, mut typed) = (0, 0, 0);
+    let mut bad = Vec::new();
+    for (n, text) in fixtures() {
+        let r = reduce(&text, Program::Claude).expect("reduced");
+        if let Err(e) = harness_reads_as(&text, &r) {
+            bad.push(format!("{n}: {e}"));
+        }
+        login += usize::from(text.contains("authentication_failed"));
+        walls += usize::from(text.contains(r#""status":"rejected""#));
+        typed += usize::from(r.text.contains(r#""error":"rate_limit""#));
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+    assert!(
+        login >= 2 && walls >= 5 && typed >= 5,
+        "{login} {walls} {typed}"
+    );
+    // NEGATIVE CONTROLS.
+    let keys: &[&str] = &["error", "status", "rateLimitType"];
+    let with = fixtures()
+        .iter()
+        .filter(|(_, text)| {
+            let r = reduce(text, Program::Claude).expect("reduced");
+            keys.iter().any(|k| {
+                r.text
+                    .match_indices(&format!("\"{k}\":\""))
+                    .any(|(i, m)| !r.text[i + m.len()..].starts_with('"'))
+            })
+        })
+        .count();
+    let blanks = BlanksRead(&["error", "status", "rateLimitType"]);
+    let harness =
+        |n: &str, t: &str, r: &Reduction| harness_reads_as(t, r).map_err(|e| format!("{n}: {e}"));
+    let bad = failures(&blanks, &harness);
+    assert!(
+        with >= 7 && bad.len() == with,
+        "{} of {with}: {bad:#?}",
+        bad.len()
+    );
+    assert_eq!(failures(&blanks, &folds).len(), with);
+}
+
+/// A FILE OF TWO TURNS, each a prompt, a call, its result and the model's
+/// words, closed: the end after the first turn's words is read nowhere but
+/// in the ends after its rows (the second turn's entries end the file).
+const ENDS_PLANT: [&str; 10] = [
+    r#"{"type":"user","timestamp":"2026-10-16T10:00:00.000Z","uuid":"11111111-1111-4111-8111-111111111111","promptId":"12111111-1111-4111-8111-111111111111","message":{"role":"user","content":"hello"},"version":"2.1.303"}"#,
+    r#"{"type":"assistant","timestamp":"2026-10-16T10:00:01.000Z","uuid":"21111111-1111-4111-8111-111111111111","parentUuid":"11111111-1111-4111-8111-111111111111","message":{"id":"msg_01","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls"}}],"stop_reason":"tool_use"},"version":"2.1.303"}"#,
+    r#"{"type":"user","timestamp":"2026-10-16T10:00:02.000Z","uuid":"31111111-1111-4111-8111-111111111111","parentUuid":"21111111-1111-4111-8111-111111111111","promptId":"12111111-1111-4111-8111-111111111111","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"x"}]},"version":"2.1.303"}"#,
+    r#"{"type":"assistant","timestamp":"2026-10-16T10:00:03.000Z","uuid":"41111111-1111-4111-8111-111111111111","parentUuid":"31111111-1111-4111-8111-111111111111","message":{"id":"msg_02","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"},"version":"2.1.303"}"#,
+    r#"{"type":"system","subtype":"turn_duration","durationMs":4000,"timestamp":"2026-10-16T10:00:04.000Z","uuid":"51111111-1111-4111-8111-111111111111","parentUuid":"41111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
+    r#"{"type":"user","timestamp":"2026-10-16T10:00:05.000Z","uuid":"61111111-1111-4111-8111-111111111111","parentUuid":"51111111-1111-4111-8111-111111111111","promptId":"62111111-1111-4111-8111-111111111111","message":{"role":"user","content":"again"},"version":"2.1.303"}"#,
+    r#"{"type":"assistant","timestamp":"2026-10-16T10:00:06.000Z","uuid":"71111111-1111-4111-8111-111111111111","parentUuid":"61111111-1111-4111-8111-111111111111","message":{"id":"msg_03","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":{"command":"ls"}}],"stop_reason":"tool_use"},"version":"2.1.303"}"#,
+    r#"{"type":"user","timestamp":"2026-10-16T10:00:07.000Z","uuid":"81111111-1111-4111-8111-111111111111","parentUuid":"71111111-1111-4111-8111-111111111111","promptId":"62111111-1111-4111-8111-111111111111","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"x"}]},"version":"2.1.303"}"#,
+    r#"{"type":"assistant","timestamp":"2026-10-16T10:00:08.000Z","uuid":"91111111-1111-4111-8111-111111111111","parentUuid":"81111111-1111-4111-8111-111111111111","message":{"id":"msg_04","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"},"version":"2.1.303"}"#,
+    r#"{"type":"system","subtype":"turn_duration","durationMs":4000,"timestamp":"2026-10-16T10:00:09.000Z","uuid":"a1111111-1111-4111-8111-111111111111","parentUuid":"91111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
+];
+
+/// THE ENDS AFTER EVERY ROW ARE A READING (ruling U7's fold check): a
+/// reduction whose only fault is the time of the first turn's last words
+/// (an hour late) keeps every step, the losses, the last end and every
+/// notice, and fails the fold check by the end after that row. NEGATIVE
+/// CONTROL: the plant's own reduction passes it.
+#[test]
+fn an_end_after_a_row_is_read() {
+    let src: String = ENDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
+    let r = reduce(&src, Program::Claude).expect("reduced");
+    check_folds("plant", &src, &r).expect("it folds as its source");
+    let late = Reduction {
+        text: r
+            .text
+            .replace("2000-01-01T10:00:03.000Z", "2000-01-01T11:00:03.000Z"),
+        ..r.clone()
+    };
+    assert_ne!(late.text, r.text);
+    let (a, b) = (
+        readings(&src, Program::Claude),
+        readings(&late.text, Program::Claude),
+    );
+    assert_eq!(a.steps.len(), b.steps.len());
+    let e = check_folds("plant", &src, &late).expect_err("the end after row 3 moved");
+    assert!(e.contains("the end after row 3"), "{e}");
+}
+
+/// THE CHOICE ([`choose`], ruling U7) on readings made to need each of its
+/// legs: two pairs read redundantly (either restores the reading, so
+/// blanking each alone changes nothing) are put back the first-seen one
+/// first, until the choice reads as every pair kept; and a pair put back
+/// that makes a pair kept before it needless leaves that pair blanked
+/// again. Each choice reads as every pair kept, and no pair it keeps is
+/// needless. NEGATIVE CONTROLS (scratch-reverted): a choice with no put-back
+/// keeps neither redundant pair and reads otherwise; one with no last pass
+/// keeps the needless pair.
+#[test]
+fn the_choice_puts_back_and_then_drops_what_is_needless() {
+    let redundant = |k: &[bool]| (k[0] || k[1], k[2]);
+    let chosen = choose(4, redundant);
+    assert_eq!(chosen, vec![true, false, true, false]);
+    assert_eq!(redundant(&chosen), redundant(&[true; 4]));
+    // Read `B` with every pair kept; pair 0 alone is needed, and put back
+    // beside it, pair 1 reads `B` without it.
+    let table = |k: &[bool]| match (k[0], k[1], k[2]) {
+        (true, true, _) | (true, false, true) | (false, true, false) => 'B',
+        _ => 'X',
+    };
+    let chosen = choose(3, table);
+    assert_eq!(chosen, vec![false, true, false]);
+    assert_eq!(table(&chosen), 'B');
+    for (i, kept) in chosen.iter().enumerate() {
+        if *kept {
+            let mut fewer = chosen.clone();
+            fewer[i] = false;
+            assert_ne!(table(&fewer), 'B', "pair {i} is needless");
+        }
+    }
+}
+
+/// THE VERB WRITES ONLY WHAT ITS CHECK PASSES ([`check_written`]): what
+/// reads as its source and keeps no word no reader reads. NEGATIVE
+/// CONTROLS: the verb reducing by a rule that keeps every candidate refuses,
+/// naming the unread word, and so does one reducing by a rule that blanks a
+/// word a reader reads (a turn end's `subtype`), the reduction not reading
+/// as its source; neither writes anything.
+#[test]
+fn the_verb_writes_only_what_reads_as_its_source() {
+    let src: String = WORDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
+    let r = reduce(&src, Program::Claude).expect("reduced");
+    check_written(&src, &r, Program::Claude).expect("it passes");
+    let every = reduce_with(&src, Program::Claude, &KeepsEveryCandidate).expect("reduced");
+    let e = check_written(&src, &every, Program::Claude).expect_err("an unread word");
+    assert!(
+        e.contains("no reader reads") && e.contains("quokkaledger"),
+        "{e}"
+    );
+    let blanked = reduce_with(&src, Program::Claude, &BlanksRead(&["subtype"])).expect("reduced");
+    let e = check_written(&src, &blanked, Program::Claude).expect_err("not as its source");
+    assert!(e.contains("does not read as its source"), "{e}");
+    let dir = aterm_tempfile::tempdir().expect("a scratch dir");
+    let file = dir.path().join("t.jsonl");
+    std::fs::write(&file, &src).expect("source");
+    let args = |out: &std::path::Path| {
+        vec![
+            file.to_string_lossy().into_owned(),
+            "--program".to_string(),
+            "claude".to_string(),
+            "--out".to_string(),
+            out.to_string_lossy().into_owned(),
+        ]
+    };
+    let every: fn(&str, Program) -> Result<Reduction, String> =
+        |s, p| reduce_with(s, p, &KeepsEveryCandidate);
+    let blanks: fn(&str, Program) -> Result<Reduction, String> =
+        |s, p| reduce_with(s, p, &BlanksRead(&["subtype"]));
+    for (n, by) in [(1, every), (2, blanks)] {
+        let out = dir.path().join(format!("r{n}.jsonl"));
+        let e = reduce_verb(&args(&out), by).expect_err("refused");
+        assert_eq!(e.code, 1, "{n}");
+        assert!(!out.exists(), "{n}: nothing written");
+    }
+    let out = dir.path().join("r0.jsonl");
+    assert_eq!(reduce_verb(&args(&out), reduce).expect("written"), 0);
+    assert_eq!(std::fs::read_to_string(&out).expect("written"), r.text);
+}
+
+/// THE COMMITTED 2.1.303 REDUCTION READS ITS LIMIT AS THE HARNESS DOES (the
+/// review of 6D-2): cut at its usage limit's notice, the quota wall stands
+/// for the session window (`five_hour`) until its reset, the limit row
+/// names that window, and the notice keeps its typed words (`rate_limit`,
+/// `usage_limit_reached`, `five_hour`). NEGATIVE CONTROL (scratch-reverted):
+/// 6D-2's first file, which emptied them, fails it.
+#[test]
+fn the_committed_2_1_303_reduction_keeps_its_limit_words() {
+    use aterm_agent::harness::upgrade as up;
+    let committed = std::fs::read_to_string(STEPS_2_1_303).expect("the committed reduction");
+    let rows: Vec<&str> = committed.lines().filter(|l| is_row(l)).collect();
+    let at = rows
+        .iter()
+        .position(|l| notice_read(l).is_some_and(|n| n.wall == Some(WallKind::UsageSession)))
+        .expect("its usage limit's notice");
+    let cut = rows[..=at].join("\n");
+    let wall = up::transcript_standing_wall(&cut).expect("the quota wall stands");
+    assert_eq!(wall.window.as_deref(), Some("five_hour"));
+    assert!(wall.until.is_some(), "{wall:?}");
+    let limit = up::transcript_standing_limit(&cut).expect("the limit row stands");
+    assert_eq!(limit.window.as_deref(), Some("five_hour"));
+    let n = notice_read(rows[at]).expect("a notice");
+    assert_eq!(
+        (
+            n.error.as_deref(),
+            n.api_error.as_deref(),
+            n.limit.as_deref()
+        ),
+        (
+            Some("rate_limit"),
+            Some("usage_limit_reached"),
+            Some("five_hour")
+        )
+    );
 }

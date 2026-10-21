@@ -41,7 +41,7 @@
 //!   client left in the old queue is told nothing by a stuck socket, and
 //!   `aterm ctl`'s connect deadline names that failure within seconds.
 //!
-//! The health of all of this is published on `metrics` ([`fields_text`]).
+//! The health of all of this is published on `metrics` ([`emit_metrics`]).
 //!
 //! **Retired before a cold `exec`** ([`Endpoint`], measured 2026-09-29). An
 //! `exec` from a multi-threaded process completes on macOS only once every
@@ -137,48 +137,24 @@ pub(crate) fn note_busy_reply() {
     HEALTH.busy_replies.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The listener fields of the `metrics` summary line — a leading space, so it
-/// splices straight onto the line. `control_last_accept_age_ms` is `-` until
-/// the supervisor has started. (Read over the socket, the age is the reading
-/// connection's own accept; the fields that tell a wedge are `rebinds`,
-/// `rebind_failures` and `queue_pending`, which a caller that reached the
-/// instance some other way — the file log, a later healthy read — can trust.)
-#[must_use]
-pub(crate) fn fields_text() -> String {
-    let h = snapshot();
-    format!(
-        " control_accepts={} control_last_accept_age_ms={} control_queue_pending={} \
-         control_rebinds={} control_rebind_failures={} control_accept_errors={} \
-         control_busy_replies={}",
-        h.accepts,
-        h.last_accept_age_ms
-            .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
-        h.queue_pending,
-        h.rebinds,
-        h.rebind_failures,
-        h.accept_errors,
-        h.busy_replies,
-    )
-}
-
-/// The JSON twin of [`fields_text`]: a leading comma, field-for-field.
-#[must_use]
-pub(crate) fn fields_json() -> String {
-    let h = snapshot();
-    format!(
-        ",\"control_accepts\":{},\"control_last_accept_age_ms\":{},\
-         \"control_queue_pending\":{},\"control_rebinds\":{},\
-         \"control_rebind_failures\":{},\"control_accept_errors\":{},\
-         \"control_busy_replies\":{}",
-        h.accepts,
-        h.last_accept_age_ms
-            .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
-        h.queue_pending,
-        h.rebinds,
-        h.rebind_failures,
-        h.accept_errors,
-        h.busy_replies,
-    )
+/// The listener fields of the `metrics` summary. `control_last_accept_age_ms`
+/// is `-` (JSON `null`) until the supervisor has started. (Read over the
+/// socket, the age is the reading connection's own accept; the fields that
+/// tell a wedge are `rebinds`, `rebind_failures` and `queue_pending`, which a
+/// caller that reached the instance some other way — the file log, a later
+/// healthy read — can trust.)
+pub(crate) fn emit_metrics(
+    ctx: &crate::metrics::wire::ReadCtx,
+    s: &mut dyn crate::metrics::wire::FieldSink,
+) {
+    let h = snapshot(ctx.now_ns / 1000);
+    s.count("control_accepts", h.accepts);
+    s.opt_count("control_last_accept_age_ms", h.last_accept_age_ms, "-");
+    s.count("control_queue_pending", h.queue_pending);
+    s.count("control_rebinds", h.rebinds);
+    s.count("control_rebind_failures", h.rebind_failures);
+    s.count("control_accept_errors", h.accept_errors);
+    s.count("control_busy_replies", h.busy_replies);
 }
 
 struct HealthSnapshot {
@@ -191,12 +167,13 @@ struct HealthSnapshot {
     busy_replies: u64,
 }
 
-fn snapshot() -> HealthSnapshot {
+/// The published health, with the last accept's age measured at `now_us` (the
+/// `metrics::now_us` clock).
+fn snapshot(now_us: u64) -> HealthSnapshot {
     let last = HEALTH.last_accept_us.load(Ordering::Relaxed);
     HealthSnapshot {
         accepts: HEALTH.accepts.load(Ordering::Relaxed),
-        last_accept_age_ms: (last != 0)
-            .then(|| crate::metrics::now_us().saturating_sub(last) / 1000),
+        last_accept_age_ms: (last != 0).then(|| now_us.saturating_sub(last) / 1000),
         queue_pending: HEALTH.queue_pending.load(Ordering::Relaxed),
         rebinds: HEALTH.rebinds.load(Ordering::Relaxed),
         rebind_failures: HEALTH.rebind_failures.load(Ordering::Relaxed),

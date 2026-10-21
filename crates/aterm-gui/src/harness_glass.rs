@@ -165,6 +165,26 @@ impl Stamp {
         })
     }
 
+    /// THE WALL TIME (unix ms) ITS MINUTE STARTS AT, [`Self::at`]'s inverse
+    /// to the minute: the local minute and day placed by the zone's offset
+    /// at that instant, read twice, so a minute within the zone's offset of
+    /// a change of offset is placed by the offset it fell under (one read,
+    /// at the local reading taken as an instant, places it an hour off
+    /// there); `None` where the platform cannot say. Read where an end's
+    /// instant is no longer on the timeline: the menu bar's Done for you row
+    /// ages from it (`app_tabs::end_wall_ms`).
+    #[must_use]
+    pub(crate) fn unix_ms(self) -> Option<i64> {
+        let local = self
+            .day
+            .checked_mul(86_400)?
+            .checked_add(i64::from(self.clock.minute()) * 60)?;
+        let guess = local.checked_sub(crate::presence::local_offset_at(local)?)?;
+        local
+            .checked_sub(crate::presence::local_offset_at(guess)?)?
+            .checked_mul(1000)
+    }
+
     /// The day it fell on as a builder names it against `today` (§10.2.3,
     /// item 3): nothing on `today` itself, or with no day read for the build
     /// (`None`: the clock stands alone); its weekday within the six days
@@ -387,9 +407,144 @@ pub(crate) struct SessionGlass {
     /// Nothing lights again before this: [`QUIET`] after the last label
     /// began.
     quiet_until: Option<Instant>,
+    /// THE TASK'S END (§11.2.3, item 4), while it stands: told once by
+    /// `App::note_harness_end` (`harness_task::is_a_task_end`), KEPT across
+    /// the host's "unknown" (`on_task(None)`, so it never flickers between
+    /// loop runs) and cleared at a move to a known face that is no end —
+    /// open, theirs ([`on_task`]): an end never outlives the work it
+    /// names.
+    end: Option<EndGlass>,
+    /// How many ends this session told: the next end's [`EndGlass::serial`].
+    ends: u32,
+}
+
+/// THE KIND OF A TASK'S END (§11.2.3, item 1): under FOREVER CRUISE /
+/// FOREVER LAND only Land's landing, the face moved to `landed`. Cruise never
+/// ends, so it has no end to tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum EndFace {
+    /// `landed`.
+    Landed,
+}
+
+impl EndFace {
+    /// The end `face` would be: `landed`; `None` for every face that ends no
+    /// task (open, theirs).
+    #[must_use]
+    pub(crate) const fn of(face: TaskFace) -> Option<Self> {
+        match face {
+            TaskFace::Landed => Some(Self::Landed),
+            TaskFace::Open | TaskFace::Theirs => None,
+        }
+    }
+
+    /// The task face this end is ([`Self::of`]'s inverse): the face whose
+    /// time the timeline holds for it (`SessionTimeline::task_face_at`).
+    #[must_use]
+    pub(crate) const fn task_face(self) -> TaskFace {
+        match self {
+            Self::Landed => TaskFace::Landed,
+        }
+    }
+}
+
+/// ONE END ON THE GLASS (§11.2.3, items 4 to 6): its face, the local clock
+/// time and day the face moved there (the task's own stamp), its serial —
+/// the session's count of ends told, so a second end is news again — and the
+/// serial last looked at (`App::note_done_seen`, the one looking rule).
+/// Unseen while `seen != serial`: the tab's `•` (`App::done_unseen`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EndGlass {
+    /// Landed.
+    pub(crate) face: EndFace,
+    /// When the face moved there, as the chip's clock reads it.
+    pub(crate) at: Option<Stamp>,
+    /// This end's serial (1 for the session's first): `EndGlass::gen` in the
+    /// design, renamed since `gen` is a reserved word in edition 2024.
+    pub(crate) serial: u32,
+    /// The serial last looked at.
+    pub(crate) seen: u32,
+    /// The serial last cheered (§11.3.3, items 1 to 3): the first frame that
+    /// shows this pane to someone hands the end back
+    /// (`aterm_effects::companion::PetTick::landed_seen`) and the pet cheers
+    /// it there. The latch is the glass's, not the pet's: a switch onto the
+    /// landed tab IS the sighting, and of two windows the first pet to see it
+    /// takes it. Kept apart from `seen`, which the strip's looking rule moves
+    /// (an end seen as it lands in the front tab is still cheered on its first
+    /// frame); a cheer a fresh key wiped is spent, never replayed.
+    pub(crate) cheered: u32,
+}
+
+impl EndGlass {
+    /// Whether nobody has looked at it yet.
+    #[must_use]
+    pub(crate) const fn unseen(self) -> bool {
+        self.seen != self.serial
+    }
+
+    /// Whether no pet has cheered it yet.
+    #[must_use]
+    pub(crate) const fn uncheered(self) -> bool {
+        self.cheered != self.serial
+    }
 }
 
 impl SessionGlass {
+    /// The task's end standing on the glass, if one does.
+    #[must_use]
+    pub(crate) const fn end(&self) -> Option<EndGlass> {
+        self.end
+    }
+
+    /// AN END IS TOLD (`App::note_harness_end`): `face`, at the task face's
+    /// own stamp, with the next serial, unseen. Replaces an end that
+    /// stood. What now stands.
+    pub(crate) fn tell_end(&mut self, face: EndFace) -> EndGlass {
+        self.ends = self.ends.saturating_add(1);
+        let end = EndGlass {
+            face,
+            at: self.task.and_then(|(_, at)| at),
+            serial: self.ends,
+            seen: self.end.map_or(0, |was| was.seen),
+            cheered: self.end.map_or(0, |was| was.cheered),
+        };
+        self.end = Some(end);
+        end
+    }
+
+    /// THE END THE PET HAS YET TO CHEER (§11.3.3, item 1): its serial, the
+    /// room's `landed`; `None` when no end stands or it was cheered. Read on
+    /// a frame already being drawn, one map lookup.
+    #[must_use]
+    pub(crate) fn landed(&self) -> Option<u32> {
+        self.end.filter(|end| end.uncheered()).map(|end| end.serial)
+    }
+
+    /// THE END WAS ON SCREEN (`PetTick::landed_seen`): `serial` cheered,
+    /// where it is the end that stands. Whether that moved anything; a serial
+    /// handed again, or one an end told since replaced, moves nothing.
+    pub(crate) fn cheer_end(&mut self, serial: u32) -> bool {
+        match self.end.as_mut() {
+            Some(end) if end.serial == serial && end.uncheered() => {
+                end.cheered = serial;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// THE END IS LOOKED AT (`App::note_done_seen`, the menu bar's Go): its
+    /// serial seen. Whether that moved anything (an end stood unseen).
+    pub(crate) fn see_end(&mut self) -> bool {
+        match self.end.as_mut() {
+            Some(end) if end.unseen() => {
+                end.seen = end.serial;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// What the Autopilot chip reads of it this frame: a copy.
     #[must_use]
     pub(crate) fn chip(&self) -> ChipGlass {
@@ -638,15 +793,20 @@ pub(crate) fn on_act_at(app: &mut App, session: u64, act: Act, at: Arrival) {
 /// with its local clock time and day ([`Stamp`]), read here once. An
 /// unknown face clears only the task face; any act trail remains. A face
 /// that keeps its kind and moves its clock moves only the title's words
-/// (`✓ done 17:42` to `✓ done 18:05`), which the footer's term keys only
+/// (`landed 17:42` to `landed 18:05`), which the footer's term keys only
 /// through the trail's generation while someone reads the title: the
-/// generation moves with it, so that title is built again. Whether the
-/// frame's glass moved.
+/// generation moves with it, so that title is built again. The task's END
+/// (§11.2.3, item 4) is kept through unknown and through a landed face
+/// (whose end, if it is one, `App::note_harness_end` tells next), and
+/// cleared at open or theirs. Whether the frame's glass moved.
 pub(crate) fn on_task(app: &mut App, session: u64, face: Option<TaskFace>, at_ms: i64) -> bool {
     let task = face.map(|face| (face, Stamp::at(at_ms.div_euclid(1000))));
     let was = app.harness_glass.get(&session).copied().unwrap_or_default();
     let mut now = was;
     now.task = task;
+    if face.is_some_and(|face| EndFace::of(face).is_none()) {
+        now.end = None;
+    }
     if now == was {
         return false;
     }
@@ -764,6 +924,36 @@ impl App {
     }
 }
 
+impl SessionGlass {
+    /// A SEAMLESS UPDATE'S CARRIED END (§11.2.3, item 8; slice 2b,
+    /// `App::adopt_end_carry`): the end the outgoing process held, `face` at
+    /// its own clock `at`, put back as it stood — the session's first end in
+    /// this process, seen where it was seen — where none stands (an end told
+    /// here since is newer, and wins). It comes in CHEERED (§11.3.4): the
+    /// kitty's cheer is the outgoing process's, and one it had not played
+    /// by the update is not played after it (§11.3.6: no cheer for a carried
+    /// end), so [`SessionGlass::landed`] hands the successor's pet nothing
+    /// for it. Whether it was put.
+    pub(crate) fn carry_end(&mut self, face: EndFace, at: Option<Stamp>, seen: bool) -> bool {
+        if self.end.is_some() {
+            return false;
+        }
+        self.ends = self.ends.saturating_add(1);
+        self.end = Some(EndGlass {
+            face,
+            at,
+            serial: self.ends,
+            seen: if seen { self.ends } else { 0 },
+            cheered: self.ends,
+        });
+        true
+    }
+}
+
 #[cfg(test)]
 #[path = "harness_glass_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "harness_cheer_tests.rs"]
+mod cheer_tests;

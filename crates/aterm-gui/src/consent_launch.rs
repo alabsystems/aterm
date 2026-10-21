@@ -261,7 +261,7 @@ pub(crate) fn every_folder_answered(rows: &[(Folder, WarmupRow)]) -> bool {
 #[derive(Clone, Copy)]
 pub(crate) struct LaunchReach {
     /// The running bundle's id, once the window has read its identity off the event
-    /// loop (`control_privacy::running_bundle_id_if_warm`).
+    /// loop (`signing_identity::running_bundle_id_if_warm`).
     pub(crate) bundle_id: fn() -> Option<&'static str>,
     /// Every folder was answered for this bundle id before.
     pub(crate) answered: fn(&str) -> Option<bool>,
@@ -275,7 +275,7 @@ impl LaunchReach {
     /// line.
     pub(crate) const fn live() -> Self {
         Self {
-            bundle_id: crate::control_privacy::running_bundle_id_if_warm,
+            bundle_id: crate::signing_identity::running_bundle_id_if_warm,
             answered: live_answered,
             note_answered: live_note_answered,
             live: true,

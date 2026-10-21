@@ -292,8 +292,7 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
 }
 
 /// [`probe_bundle_starts`] at STAGE time, on the checker thread, before the ready
-/// marker: the same run, of the child [`hold_staged_start`] started before the
-/// stage's gate.
+/// marker.
 ///
 /// WHY START IT TWICE. The first exec of a binary this machine has never run pays
 /// syspolicyd's assessment — measured 0.75 s (0.75-0.95, n=5) for the 90 MB `aterm`
@@ -308,121 +307,46 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
 /// it is the TOCTOU check, now at the warm cost. A cross-volume install copies the
 /// bundle (new inodes) and pays at its apply, as before.
 ///
-/// Only after the stage's whole gate has passed (codesign, team, Gatekeeper, the
-/// sealed build and commit rebinds): nothing of the candidate is executed before
-/// that. The held child was exec'd and stopped before its first instruction; this
-/// resumes it, and a stage refused before this call killed it unrun. `--version`
-/// answers before any lane starts, so the candidate never reaches its updater,
-/// trial counters or state roots.
+/// NEVER STARTED BEFORE THE GATE PASSES. macOS assesses the first exec of a file
+/// AFTER the exec, by path, while the process waits at `_dyld_start`, and killing the
+/// child does not end the assessment; on macOS 27.0.1 `syspolicyd` crashes (`SIGSEGV`)
+/// when a Mach-O it began assessing is unlinked before the assessment finishes, which
+/// strands every exec on the host at `_dyld_start`. Starting the candidate before the
+/// gate (`POSIX_SPAWN_START_SUSPENDED`) and unlinking `incoming` on a gate refusal or
+/// withdrawal unlinks an assessed file before it ever ran. Running the probe only
+/// AFTER the whole gate (`check_bundle`, `CFBundleVersion`, `ATermGitCommit`, and
+/// `stage_withdrawn`) has passed means a refused bundle was never exec'd at all.
+/// `--version` answers before any lane starts, so the candidate never reaches its
+/// updater, trial counters or state roots.
 #[cfg(target_os = "macos")]
-pub(crate) fn probe_staged_bundle_starts(
-    app: &Path,
-    expected_build: u64,
-    held: HeldStart,
-) -> Result<(), String> {
+pub(crate) fn probe_staged_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String> {
     #[cfg(test)]
     if let Some(errno) = STAGE_PROBE_SPAWN_REFUSAL.with(std::cell::Cell::take) {
-        drop(held);
         return Err(spawn_refusal(
             START_PROBE,
             &std::io::Error::from_raw_os_error(errno),
         ));
     }
-    match held.0 {
-        Some(held) => probe_starts(app, expected_build, |_| {
-            let (deadline, bound_by_budget) = helper_deadline();
-            held.output_until(deadline, HELPER_REAP).map_err(|error| {
-                run_refusal(START_PROBE, error, timed_out(START_PROBE, bound_by_budget))
-            })
-        }),
-        None => probe_bundle_starts(app, expected_build),
+    #[cfg(test)]
+    if STAGE_PROBE_TIMED_OUT.with(std::cell::Cell::take) {
+        return Err(timed_out(START_PROBE, false));
     }
-}
-
-/// The stage's start probe STARTED BEFORE THE STAGE'S GATE, held at its exec
-/// ([`hold_staged_start`]) for [`probe_staged_bundle_starts`] to run once the gate
-/// has passed; empty when it could not be held, and the probe then starts the
-/// candidate itself after the gate, as it always did. Killed or dropped unrun —
-/// every refusal before the probe kills it — the child dies without ever running.
-#[cfg(target_os = "macos")]
-pub(crate) struct HeldStart(Option<aterm_uds::deadline::Held>);
-
-/// Non-macOS: there is no bundle to start.
-#[cfg(not(target_os = "macos"))]
-pub(crate) struct HeldStart;
-
-/// Start `app`'s executable with `--version` STOPPED AT ITS EXEC, before the stage's
-/// gate runs ([`aterm_uds::deadline::Held`]).
-///
-/// WHY. The first-exec assessment is syspolicyd's work, not the candidate's: the
-/// child sits in the kernel, using no CPU, for ~0.9 s while syspolicyd scans the
-/// 96 MB universal `aterm` (measured: Gatekeeper's scan, then the verdict reaching
-/// the kernel ~0.5 s later), and the gate's helpers take ~0.4 s more. A child
-/// started stopped at its exec has that assessment begun at the spawn and runs as
-/// soon as it answers once resumed (measured: resumed 400 ms after the spawn, it
-/// exited 485 ms later, against 880 ms for a plain exec). Held here, the assessment
-/// runs beside the gate's helpers and the stage pays the slower of the two instead
-/// of their sum.
-///
-/// NOTHING OF THE CANDIDATE RUNS BEFORE THE GATE PASSES. Stopped at its exec, not
-/// one instruction of it — nor of dyld before it — runs until the probe resumes it,
-/// and it dies unrun if this process dies holding it (`aterm_uds::deadline::Held`);
-/// the kernel has only mapped it and checked its signature, which it does for any
-/// file anyone execs. The image it holds is the bytes the gate then verifies:
-/// nothing writes the bundle in between (its private staging parent, under the
-/// stage lock: the exclusion the gate's own concurrent reads rest on).
-///
-/// Never a verdict: a candidate that cannot be held (a missing executable, a spawn
-/// refused just then) holds nothing, and the probe meets the same refusal itself
-/// after the gate, with the words and the passing classification it always had.
-///
-/// No `taskpolicy -c utility` clamp, which the probe had: `taskpolicy` execs its
-/// program in place, so a held `taskpolicy` would hold back the very exec this
-/// overlaps. What it clamped is the candidate's `--version`, ~5 ms of CPU beside the
-/// gate's `codesign`, which hashes the whole bundle unclamped, and the assessment
-/// does not move with it (measured with the clamp set on the held spawn instead:
-/// 850.0 vs 850.0 ms median, n=10 each).
-#[cfg(target_os = "macos")]
-pub(crate) fn hold_staged_start(app: &Path) -> HeldStart {
-    let exe = app.join("Contents/MacOS/aterm");
-    HeldStart(
-        aterm_uds::deadline::Held::start(aterm_uds::spawnfd::command(exe).arg("--version")).ok(),
-    )
-}
-
-/// Non-macOS: there is no bundle to start.
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn hold_staged_start(_app: &Path) -> HeldStart {
-    HeldStart
-}
-
-impl HeldStart {
-    /// Kill the held child without ever running it, and reap it: the stage will not
-    /// start this build (a refusal before the probe, or the records withdrew it).
-    /// Dropping it does the same.
-    pub(crate) fn kill(self) {
-        #[cfg(target_os = "macos")]
-        drop(self.0);
-    }
-}
-
-#[cfg(all(test, target_os = "macos"))]
-impl HeldStart {
-    /// The held child's pid, or `None` when nothing is held.
-    pub(crate) fn id(&self) -> Option<u32> {
-        self.0.as_ref().map(aterm_uds::deadline::Held::id)
-    }
+    probe_bundle_starts(app, expected_build)
 }
 
 #[cfg(all(test, target_os = "macos"))]
 thread_local! {
     /// The `errno` the next stage probe on this thread is refused its spawn with, instead
-    /// of starting the candidate (a held one is killed unrun): how a test stages a probe
-    /// that runs to no answer (`EAGAIN`, the process table full just then) or to a
-    /// lasting refusal (`EACCES`) without racing a deadline against the gate in front
-    /// of it.
+    /// of starting the candidate: how a test stages a probe that runs to no answer
+    /// (`EAGAIN`, the process table full just then) or to a lasting refusal (`EACCES`)
+    /// without racing a deadline against the gate in front of it.
     pub(crate) static STAGE_PROBE_SPAWN_REFUSAL: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
+    /// Whether the next stage probe on this thread reports a helper timeout
+    /// ([`timed_out`]), standing in for a spawned candidate still waiting at
+    /// `_dyld_start` when its ceiling expires.
+    pub(crate) static STAGE_PROBE_TIMED_OUT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// What the start probe is called in its refusals.
@@ -431,11 +355,7 @@ const START_PROBE: &str = "candidate --version probe";
 
 /// Non-macOS: there is no bundle to start.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn probe_staged_bundle_starts(
-    _app: &Path,
-    _expected_build: u64,
-    _held: HeldStart,
-) -> Result<(), String> {
+pub(crate) fn probe_staged_bundle_starts(_app: &Path, _expected_build: u64) -> Result<(), String> {
     Ok(())
 }
 

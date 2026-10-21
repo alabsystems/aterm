@@ -877,24 +877,43 @@ impl VersionedConfigService {
                 keys: conflicts,
             };
         }
-        let inverse = record
-            .before
-            .iter()
-            .map(|(key, before)| (key.as_str(), before.clone()))
-            .collect::<Vec<_>>();
-        let replay = match crate::prefs::apply_prefs_edits(&self.text, &inverse) {
-            Ok(replay) => replay,
-            Err(error) => return self.rejected(error.to_string()),
-        };
         let next = if *self.text == *record.after_text {
+            // Still the patch's result: the text before it, exactly, whatever
+            // it spelled — a value only a file holds (an old style alias the
+            // writer reads but never writes) comes back as it was, so Undo
+            // never needs the writer to take it.
             record.before_text.to_string()
         } else {
-            merge_reverting(&record.after_text, &record.before_text, &self.text)
+            // The merge stands where it reads as the file now with the
+            // patch taken back, whatever the patch's lines spelled: an old
+            // style alias comes back as the file held it, not as the name the
+            // writer would give it, and a key the writer wrote beside the
+            // edit (the style Off replaced, the trail colour an old `classic
+            // mono` says) goes back with it.
+            let merged = merge_reverting(&record.after_text, &record.before_text, &self.text)
                 .filter(|merged| {
                     parse_config(merged).is_ok()
-                        && leaf_values(merged).ok() == leaf_values(&replay).ok()
-                })
-                .unwrap_or(replay)
+                        && reads_as_reverted(
+                            merged,
+                            &record.after_text,
+                            &record.before_text,
+                            &self.text,
+                        )
+                });
+            match merged {
+                Some(merged) => merged,
+                None => {
+                    let inverse = record
+                        .before
+                        .iter()
+                        .map(|(key, before)| (key.as_str(), before.clone()))
+                        .collect::<Vec<_>>();
+                    match crate::prefs::apply_prefs_edits(&self.text, &inverse) {
+                        Ok(replay) => replay,
+                        Err(error) => return self.rejected(error.to_string()),
+                    }
+                }
+            }
         };
         let touched = record.before.iter().map(|(key, _)| key.clone()).collect();
         self.admit_text(next, &touched)
@@ -1051,6 +1070,34 @@ fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
         project_item(&mut values, &join_config_key_path("", key), item);
     }
     Ok(values)
+}
+
+/// Whether `merged` reads as `current` with the patch from `before` to
+/// `after` taken back out: every leaf the patch moved as `before` held it,
+/// every other leaf as `current` holds it ([`leaf_values`]). A text that does
+/// not parse reads as nothing.
+fn reads_as_reverted(merged: &str, after: &str, before: &str, current: &str) -> bool {
+    let (Ok(merged), Ok(after), Ok(before), Ok(current)) = (
+        leaf_values(merged),
+        leaf_values(after),
+        leaf_values(before),
+        leaf_values(current),
+    ) else {
+        return false;
+    };
+    merged
+        .keys()
+        .chain(after.keys())
+        .chain(before.keys())
+        .chain(current.keys())
+        .all(|key| {
+            let wanted = if after.get(key) == before.get(key) {
+                current.get(key)
+            } else {
+                before.get(key)
+            };
+            merged.get(key) == wanted
+        })
 }
 
 /// The values of `text`'s leaves — every key whose value is not a table —
@@ -1337,6 +1384,58 @@ mod tests {
             )),
             ConfigPatchResult::Applied { .. }
         ));
+    }
+
+    /// `aterm ctl settings set cursor_trail_style …` and a Settings re-commit
+    /// reduce through this service: an alias released configs carry (`rainbow
+    /// kitty`), a hidden canonical (`classic mono`) and the Settings label
+    /// `lightning` all apply and save as their canonical name; a near miss is
+    /// refused without a write.
+    #[test]
+    fn settings_set_accepts_trail_aliases() {
+        for (input, written) in [
+            ("rainbow kitty", "rainbow kitty pet"),
+            ("Rainbow Kitty Tall", "rainbow kitty pet"),
+            ("nyan", "rainbow kitty flying"),
+            // The owner's own spelling.
+            ("nyan rainbow", "rainbow kitty flying"),
+            ("lightning", "laser"),
+            ("rainbow dog", "rainbow dog pet"),
+            // The one alias that draws differently from its row is written
+            // as authored, so the file keeps drawing the one-colour face.
+            ("classic mono", "classic mono"),
+            ("classic lumen", "classic mono"),
+            ("rainbow kitty flat", "rainbow kitty flat"),
+            ("beam", "beam"),
+        ] {
+            let mut service = VersionedConfigService::new(String::new()).unwrap();
+            let base = service.snapshot().revision;
+            let ConfigPatchResult::Applied { snapshot, .. } = service.patch(edit(
+                base,
+                crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+                ExpectedValue::Any,
+                Some(input),
+            )) else {
+                panic!("{input:?} must apply");
+            };
+            assert_eq!(
+                snapshot.config.cursor_trail_style.as_deref(),
+                Some(written),
+                "{input:?}"
+            );
+        }
+        let mut service = VersionedConfigService::new(String::new()).unwrap();
+        let before = service.snapshot();
+        assert!(matches!(
+            service.patch(edit(
+                before.revision,
+                crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+                ExpectedValue::Any,
+                Some("lightnin"),
+            )),
+            ConfigPatchResult::Rejected { .. }
+        ));
+        assert_eq!(service.snapshot(), before);
     }
 
     #[test]

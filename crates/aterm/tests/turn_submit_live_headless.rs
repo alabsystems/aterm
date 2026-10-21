@@ -193,39 +193,55 @@ fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
     start(&inst, &takes, &script, true, "takes");
     start(&inst, &plain, &script, false, "ignores");
 
-    // Claude Code that ignores the Enter: the line stays, nothing verified.
-    let verdict = follow_up(&inst, &ignores, 1, 2_000);
-    assert!(
-        verdict.contains("submitted=0 status=timeout"),
-        "{verdict}\n{}",
-        ctl_ok(&inst, &[&format!("@{ignores}"), "text"])
-    );
-    assert_eq!(composer(&inst, &ignores), "❯ carry on");
+    // The three follow-ups are three sessions' own turns, asked side by side:
+    // each one's verdict is its session's alone, and the composer's animation
+    // never lets a turn's echo settle, so each runs to the echo's cap (5 s,
+    // the same in every one) before its press.
+    std::thread::scope(|scope| {
+        // Claude Code that ignores the Enter: the line stays, nothing verified.
+        let ignored = scope.spawn(|| {
+            let verdict = follow_up(&inst, &ignores, 1, 2_000);
+            assert!(
+                verdict.contains("submitted=0 status=timeout"),
+                "{verdict}\n{}",
+                ctl_ok(&inst, &[&format!("@{ignores}"), "text"])
+            );
+            assert_eq!(composer(&inst, &ignores), "❯ carry on");
+        });
 
-    // Claude Code that takes it: the composer empties, the turn answers.
-    let verdict = follow_up(&inst, &takes, 1, 60_000);
-    assert!(
-        verdict.contains("submitted=1 status=submitted"),
-        "{verdict}\n{}",
-        ctl_ok(&inst, &[&format!("@{takes}"), "text"])
-    );
-    assert_eq!(composer(&inst, &takes), "❯");
-    let screen = ctl_ok(&inst, &[&format!("@{takes}"), "text"]);
-    assert!(
-        screen.lines().any(|r| r == "❯ carry on"),
-        "the line moved above: {screen}"
-    );
+        // Claude Code that takes it: the composer empties, the turn answers.
+        let taken = scope.spawn(|| {
+            let verdict = follow_up(&inst, &takes, 1, 60_000);
+            assert!(
+                verdict.contains("submitted=1 status=submitted"),
+                "{verdict}\n{}",
+                ctl_ok(&inst, &[&format!("@{takes}"), "text"])
+            );
+            assert_eq!(composer(&inst, &takes), "❯");
+            let screen = ctl_ok(&inst, &[&format!("@{takes}"), "text"]);
+            assert!(
+                screen.lines().any(|r| r == "❯ carry on"),
+                "the line moved above: {screen}"
+            );
+        });
 
-    // NEGATIVE CONTROL: no agent read, AUTO's `seq`: the animation answers.
-    let verdict = follow_up(&inst, &plain, 1, 60_000);
-    assert!(
-        verdict.contains("submitted=1 status=submitted"),
-        "{verdict}\n{}",
-        ctl_ok(&inst, &[&format!("@{plain}"), "text"])
-    );
-    assert_eq!(
-        composer(&inst, &plain),
-        "❯ carry on",
-        "the repaint alone verified a line still in the composer"
-    );
+        // NEGATIVE CONTROL: no agent read, AUTO's `seq`: the animation answers.
+        let plained = scope.spawn(|| {
+            let verdict = follow_up(&inst, &plain, 1, 60_000);
+            assert!(
+                verdict.contains("submitted=1 status=submitted"),
+                "{verdict}\n{}",
+                ctl_ok(&inst, &[&format!("@{plain}"), "text"])
+            );
+            assert_eq!(
+                composer(&inst, &plain),
+                "❯ carry on",
+                "the repaint alone verified a line still in the composer"
+            );
+        });
+        for run in [ignored, taken, plained] {
+            run.join()
+                .unwrap_or_else(|why| std::panic::resume_unwind(why));
+        }
+    });
 }

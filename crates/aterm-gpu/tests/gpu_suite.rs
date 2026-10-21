@@ -27,8 +27,10 @@ mod blit_bands;
 #[cfg(wgpu_arm)]
 mod blit_invert;
 mod capture_tap_conformance;
+mod card_parity;
 mod cat_parity;
 mod conformance_gpuencode;
+mod conformance_tray_card_ring;
 mod cursor_shapes_gpu;
 mod dirty_gate;
 // The wgpu arm's effect-pipeline ledger: `--features wgpu-oracle` only on macOS.
@@ -39,6 +41,7 @@ mod fire_halo_gpu;
 mod fire_patch_parity;
 mod free_parity;
 mod free_sprite_gpu;
+mod fx_parity;
 mod glow_halo_parity;
 mod glow_under_parity;
 mod gpu_matches_cpu;

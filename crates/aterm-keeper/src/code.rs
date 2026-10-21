@@ -21,6 +21,13 @@
 //! `$TMPDIR` is swept of anything older than three days (`com.apple.bsd.dirhelper`), and a copy
 //! keeps its original's dates.
 //!
+//! A copy goes only once it RAN. The re-exec is the copy's first exec, which macOS assesses after
+//! the exec while the process waits at `_dyld_start`; killing the process (launchd's SIGKILL past
+//! its exit timeout) does not end the assessment, and on macOS 27.0.1 `syspolicyd` crashes when
+//! the file is removed before it ends, stranding every exec on the host. So a keeper running from
+//! its copy writes [`RAN`] into it first thing ([`mark_ran`]), and a gone keeper's copy without
+//! it stays until the first-exec hang has passed since its exec.
+//!
 //! Only a keeper whose peers check its code (`--identity designated`, the default) copies
 //! itself: under the same-uid floor nothing reads it.
 
@@ -34,6 +41,23 @@ use crate::wire::Birth;
 /// re-executes from its own copy: its socket, label and relaunch bundle are
 /// still that executable's.
 pub const ORIGIN_ENV: &str = "ATERM_KEEPER_ORIGIN";
+
+/// The file a keeper running from its copy writes into the copy's directory
+/// first thing ([`mark_ran`]): the copy's exec is over, so it may go once its
+/// keeper is gone ([`sweep`]).
+pub const RAN: &str = "ran";
+
+/// Say, in `copy` (the directory [`own_copy`] names), that this keeper runs
+/// from it. Best effort: a copy without it is kept for the first-exec hang
+/// after its keeper is gone, never removed early.
+pub fn mark_ran(copy: &Path) {
+    if let Err(e) = std::fs::write(copy.join(RAN), b"") {
+        eprintln!(
+            "aterm keeper: cannot mark {} as run from: {e}",
+            copy.display()
+        );
+    }
+}
 
 /// Where keepers keep the copies they run from:
 /// `$HOME/Library/Application Support/aterm/keeper-code`. `None` without an
@@ -87,7 +111,12 @@ pub fn run_from_own_copy(exe: &Path, dir: &Path, identity: &Identity) -> String 
         Ok(copy) => copy,
         Err(why) => return why,
     };
+    // The copy's age, which a sweep reads when its keeper ends before it says it ran, counts
+    // from its exec, not from the copy and its check.
+    let _ = std::fs::File::open(&copy.home)
+        .and_then(|home| home.set_modified(std::time::SystemTime::now()));
     let failed = reexec(&copy.exe, exe);
+    // A failed exec loaded nothing from the copy, so nothing assesses it.
     let _ = std::fs::remove_dir_all(&copy.home);
     format!("re-running from {}: {failed}", copy.exe.display())
 }
@@ -205,23 +234,55 @@ fn reexec(copy: &Path, origin: &Path) -> io::Error {
 }
 
 /// Remove every copy in `dir` whose keeper is gone: no process with its pid,
-/// or another one than the start time names (`born` reads a pid's). Anything
-/// else in `dir` is left alone. Returns how many were removed.
+/// or another one than the start time names (`born` reads a pid's), once the
+/// copy may go ([`may_go`]). Anything else in `dir` is left alone. Returns how
+/// many were removed.
 pub fn sweep(dir: &Path, born: impl Fn(u32) -> Option<Birth>) -> usize {
+    sweep_at(dir, born, std::time::SystemTime::now())
+}
+
+/// [`sweep`] at `now`.
+fn sweep_at(dir: &Path, born: impl Fn(u32) -> Option<Birth>, now: std::time::SystemTime) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     entries
         .flatten()
         .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(owner_of)
-                .is_some_and(|(pid, birth)| born(pid) != Some(birth))
-                && std::fs::remove_dir_all(entry.path()).is_ok()
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            if !owner_of(name).is_some_and(|(pid, birth)| born(pid) != Some(birth)) {
+                return false;
+            }
+            if !may_go(&entry.path(), name.ends_with(".partial"), now) {
+                eprintln!(
+                    "aterm keeper: kept {}: its keeper ended before it said it ran from it, so \
+                     macOS may still be assessing its first exec",
+                    entry.path().display()
+                );
+                return false;
+            }
+            std::fs::remove_dir_all(entry.path()).is_ok()
         })
         .count()
+}
+
+/// Whether a gone keeper's copy at `home` may go at `now`: it was never run
+/// (a half-made copy, `partial`, is renamed whole before its exec), its keeper
+/// said it ran from it ([`RAN`]), or the first-exec hang has passed since its
+/// exec (the directory's modification time, set just before it,
+/// [`run_from_own_copy`]).
+fn may_go(home: &Path, partial: bool, now: std::time::SystemTime) -> bool {
+    partial
+        || home.join(RAN).exists()
+        || std::fs::symlink_metadata(home)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| {
+                now.duration_since(at)
+                    .is_ok_and(|age| age >= aterm_uds::deadline::FIRST_EXEC_HANG)
+            })
 }
 
 #[cfg(test)]
@@ -256,9 +317,12 @@ mod tests {
     }
 
     /// The sweep removes exactly the copies whose keeper is gone (a dead pid, a reused pid, a
-    /// half-made copy of either) and keeps a live keeper's copy and anything not a copy.
+    /// half-made copy of either) and that said they ran, and keeps a live keeper's copy and
+    /// anything not a copy (r4g-4: a keeper killed in its first exec never said it ran, so its
+    /// copy stays while macOS may still be assessing it). NEGATIVE CONTROL: the same unproven
+    /// copy goes once the first-exec hang has passed since its exec.
     #[test]
-    fn the_sweep_removes_only_copies_whose_keeper_is_gone() {
+    fn the_sweep_removes_only_copies_whose_keeper_is_gone_and_ran() {
         let dir = std::env::temp_dir().join(format!("akcopies-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -266,21 +330,32 @@ mod tests {
             seconds: 100,
             micros: 1,
         };
+        // (name, said it ran, kept now, kept past the first-exec hang)
         let names = [
-            ("7-100-1", true),          // its keeper, pid 7, lives
-            ("7-100-2", false),         // pid 7 is another process now
-            ("8-100-1", false),         // pid 8 is gone
-            ("8-100-1.partial", false), // half made, its keeper gone
-            ("7-100-1.partial", true),  // half made by a live keeper
-            ("notes", true),            // not a copy
+            ("7-100-1", false, true, true),           // its keeper, pid 7, lives
+            ("7-100-2", true, false, false),          // pid 7 is another process now
+            ("8-100-1", true, false, false),          // pid 8 is gone
+            ("9-100-1", false, true, false),          // pid 9 is gone, its copy never said it ran
+            ("8-100-1.partial", false, false, false), // half made, its keeper gone
+            ("7-100-1.partial", false, true, true),   // half made by a live keeper
+            ("notes", false, true, true),             // not a copy
         ];
-        for (name, _) in names {
+        for (name, ran, _, _) in names {
             std::fs::create_dir_all(dir.join(name).join("aterm.app")).expect("copy");
+            if ran {
+                mark_ran(&dir.join(name));
+            }
         }
-        let removed = sweep(&dir, |pid| (pid == 7).then_some(live));
-        assert_eq!(removed, 3);
-        for (name, kept) in names {
+        let born = |pid| (pid == 7).then_some(live);
+        let now = std::time::SystemTime::now();
+        assert_eq!(sweep_at(&dir, born, now), 3);
+        for (name, _, kept, _) in names {
             assert_eq!(dir.join(name).exists(), kept, "{name}");
+        }
+        let later = now + aterm_uds::deadline::FIRST_EXEC_HANG;
+        assert_eq!(sweep_at(&dir, born, later), 1);
+        for (name, _, _, kept) in names {
+            assert_eq!(dir.join(name).exists(), kept, "{name}, later");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

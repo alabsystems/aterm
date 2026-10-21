@@ -3,10 +3,12 @@
 
 //! The session log's clause in a tab's tooltip and context menu (phase 3B,
 //! plan §5; addendum A12, A30; rulings S10, S11, S16), behind
-//! `[session_log] clause`, which ships off: off, the chrome is today's byte
-//! for byte and no lock is taken for it; on, a move of the clause recomposes
-//! the tab once, a shown label leaves at its `until`, and a `ctl` label
-//! neither shows nor hides the step beneath it.
+//! `[session_log] clause`, on by default since D6 (Phase 6 step 6B-2, ruling
+//! U22): `clause = false`, the chrome is as it was before the clause, byte
+//! for byte, and no lock is taken for it; on, a move of the clause
+//! recomposes the tab once, a shown label leaves at its `until` and names
+//! its author, a `ctl` label neither shows nor hides the step beneath it,
+//! and an open need comes before any label.
 
 use std::sync::{Arc, Mutex};
 
@@ -193,18 +195,63 @@ fn a_log_move_recomposes_the_tabs_clause_with_the_switch_on() {
     assert!(tooltip(&edit).contains("\nnow: editing"), "{edit:?}");
 }
 
+/// D6 ON (Phase 6 step 6B-2, ruling U22): an app on the default config,
+/// with no `[session_log]` table, shows the clause in the tooltip and the
+/// menu; the tab's label stays its identity title.
+///
+/// NEGATIVE CONTROL: the old default (`unwrap_or(false)`) composes no
+/// `now:` line.
+#[test]
+fn the_default_config_shows_the_clause() {
+    let mut app = App::headless_for_test();
+    assert_eq!(app.config.session_log, None, "the default config");
+    let timeline = Arc::clone(&app.pool.get(0).expect("session 0").ctx.timeline);
+    let titles = app.tab_titles(WindowId(0));
+    let turn = open_turn(&timeline);
+    open_step(&timeline, turn, "shell");
+    let ext = chrome(&mut app);
+    assert!(tooltip(&ext).contains("\nnow: running shell"), "{ext:?}");
+    assert!(
+        menu_words(&ext)
+            .iter()
+            .any(|w| w.starts_with("now: running shell \u{b7} ")),
+        "{:?}",
+        menu_words(&ext)
+    );
+    assert_eq!(
+        app.tab_titles(WindowId(0)),
+        titles,
+        "the label is the title"
+    );
+}
+
 /// RULING S10: a shown label leaves at its `until`, and the composition's
 /// expiry is that instant (no upgrade on the tab), so the scheduler's due
-/// batch recomposes the tab there and the step beneath shows again.
+/// batch recomposes the tab there and the step beneath shows again. The
+/// label names its author while it shows (D6, ruling U22): the harness's
+/// says `by the harness`.
+///
+/// NEGATIVE CONTROL: a `ClauseLine` without its author fails the author
+/// assertion.
 #[test]
 fn a_shown_label_leaves_the_chrome_at_its_until() {
     let (mut app, timeline, hand) = hand_app(true);
     let turn = open_turn(&timeline);
     open_step(&timeline, turn, "shell");
-    label(&app, Actor::Human, "compiling", 10);
+    label(&app, Actor::Harness, "compiling", 10);
     let now = crate::turn_ledger::now_ms();
     let shown = chrome(&mut app);
-    assert!(tooltip(&shown).contains("\nnow: compiling"), "{shown:?}");
+    assert!(
+        tooltip(&shown).contains("\nnow: compiling \u{b7} by the harness"),
+        "{shown:?}"
+    );
+    assert!(
+        menu_words(&shown)
+            .iter()
+            .any(|w| w.starts_with("now: compiling \u{b7} by the harness \u{b7} ")),
+        "{:?}",
+        menu_words(&shown)
+    );
     let until = app.session_chrome[&0]
         .expires_ms
         .expect("a shown label arms its until");
@@ -256,7 +303,144 @@ fn a_ctl_label_is_absent_from_the_chrome_and_present_in_the_log() {
     // Negative control.
     label(&app, Actor::Human, "humanwords", 60);
     let ext = chrome(&mut app);
-    assert!(tooltip(&ext).contains("\nnow: humanwords"), "{ext:?}");
+    assert!(
+        tooltip(&ext).contains("\nnow: humanwords \u{b7} by you"),
+        "{ext:?}"
+    );
+}
+
+/// §7.3'S ORDER STANDS (D6, ruling U22): a harness label written while a
+/// usage wall is open is the log's and not the chrome's: the wall's need
+/// row comes first, `now: limit · <its detail>`, and a need row names no
+/// author. Once the wall closes, the label shows, attributed.
+///
+/// NEGATIVE CONTROL: a clause that puts the label row before the need rows
+/// shows the label under the wall.
+#[test]
+fn a_harness_label_under_an_open_usage_wall_shows_the_wall() {
+    let (mut app, timeline, _hand) = hand_app(true);
+    let turn = open_turn(&timeline);
+    let wall = {
+        let mut g = timeline.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut()
+            .log_mut_for_journal()
+            .open(
+                Open::new(Kind::Wall, Src::Screen, Conf::Strong)
+                    .under(turn)
+                    .fields(
+                        Fields::new()
+                            .word(Key::Wall, "usage-session")
+                            .expect("a wall")
+                            .tok(Key::Detail, "resets 14:05")
+                            .expect("its reset"),
+                    ),
+                now,
+            )
+            .expect("the wall opens")
+    };
+    label(&app, Actor::Harness, "resuming", 60);
+    let ext = chrome(&mut app);
+    assert!(
+        tooltip(&ext).contains("\nnow: limit \u{b7} resets 14:05\n")
+            || tooltip(&ext).ends_with("\nnow: limit \u{b7} resets 14:05"),
+        "{ext:?}"
+    );
+    assert!(!tooltip(&ext).contains("resuming"), "{ext:?}");
+    assert!(
+        !tooltip(&ext).contains("\u{b7} by "),
+        "a need names no author"
+    );
+    assert!(
+        super::tests::lines_of(&timeline)
+            .iter()
+            .any(|l| l.contains(" label ") && l.contains("resuming") && l.contains(" by=harness ")),
+        "the label is the log's: {:?}",
+        super::tests::lines_of(&timeline)
+    );
+    // The wall closes: the label shows, attributed.
+    close_step(&timeline, wall);
+    let ext = chrome(&mut app);
+    assert!(
+        tooltip(&ext).contains("\nnow: resuming \u{b7} by the harness"),
+        "{ext:?}"
+    );
+}
+
+/// ONLY A LABEL NAMES ITS AUTHOR (D6, ruling U22): a turn a person prompted
+/// (`by=human`), a step a person's turn ran and a wall the harness raised
+/// each show in the tooltip and the menu with no `· by` suffix, though each
+/// record has an author a label row would print.
+///
+/// NEGATIVE CONTROL: a clause that names every row's author shows `by you`
+/// on the turn and the step, and `by the harness` on the wall.
+#[test]
+fn a_need_or_work_row_names_no_author() {
+    let (mut app, timeline, _hand) = hand_app(true);
+    let open = |under: Node, kind: Kind, src: Src, by: Actor, fields: Fields| {
+        let mut g = timeline.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut()
+            .log_mut_for_journal()
+            .open(
+                Open::new(kind, src, Conf::Strong)
+                    .under(under)
+                    .by(by)
+                    .fields(fields),
+                now,
+            )
+            .expect("opens")
+    };
+    let run = {
+        let mut g = timeline.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut()
+            .log_mut_for_journal()
+            .open(Open::new(Kind::Agent, Src::Status, Conf::Strong), now)
+            .expect("a run opens")
+    };
+    let no_author = |app: &mut App, row: &str| {
+        let ext = chrome(app);
+        assert!(
+            tooltip(&ext).contains(&format!("\nnow: {row}")),
+            "the {row} row shows: {ext:?}"
+        );
+        assert!(
+            !tooltip(&ext).contains("\u{b7} by "),
+            "the {row} row names no author: {ext:?}"
+        );
+        let menu = menu_words(&ext);
+        assert!(
+            menu.iter().any(|w| w.starts_with(&format!("now: {row}"))),
+            "{menu:?}"
+        );
+        assert!(
+            menu.iter().all(|w| !w.contains("\u{b7} by ")),
+            "the menu's {row} row names no author: {menu:?}"
+        );
+    };
+    let turn = open(run, Kind::Turn, Src::Screen, Actor::Human, Fields::new());
+    no_author(&mut app, "working");
+    open(
+        turn,
+        Kind::Tool,
+        Src::Transcript,
+        Actor::Human,
+        Fields::new().word(Key::Cls, "shell").expect("a class"),
+    );
+    no_author(&mut app, "running shell");
+    open(
+        turn,
+        Kind::Wall,
+        Src::Screen,
+        Actor::Harness,
+        Fields::new()
+            .word(Key::Wall, "usage-session")
+            .expect("a wall")
+            .tok(Key::Detail, "resets 14:05")
+            .expect("its reset"),
+    );
+    no_author(&mut app, "limit \u{b7} resets 14:05");
 }
 
 /// THE CLAUSE IS THE TOOLTIP'S AND THE MENU'S ALONE (D6): a move of it adds

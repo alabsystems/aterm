@@ -21,11 +21,11 @@ wait 1000
 expect close p1 wall out=gone src=screen at=2050
 expect close t1 turn out=wall:usage-session steps=1 walls=1 src=screen at=2050
 expect open p2 wall par=r1 wall=usage-session cont=p1 orphan=1 src=screen
-at 3600 tx prompt v1 dated=0 off=37526 slice=2.1.303:36-40
+at 3600 tx prompt v1 dated=0 off=27679 slice=2.1.303:36-40
 expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact
-at 3600 tx end vdur=2051 in=0 out=0 dated=2048 off=40212 slice=2.1.303:36-40
+at 3600 tx end vdur=2051 in=0 out=0 dated=2048 off=30299 slice=2.1.303:36-40
 expect amend t1 turn vdur_ms=2051 tok_in=0 tok_out=0 by=vendor src=transcript conf=exact
-at 3600 tx endwall usage-session dated=2048 off=40213 slice=2.1.303:36-40
+at 3600 tx endwall usage-session dated=2048 off=30300 slice=2.1.303:36-40
 expect amend t1 turn out=wall:usage-session by=vendor src=transcript conf=exact
 at 3600 tx wall usage-session confirm
 expect amend p2 wall confirmed=1 by=vendor src=transcript conf=exact

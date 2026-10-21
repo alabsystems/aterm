@@ -247,6 +247,8 @@ Run aterm's checks in place, offline, alone or in any combination.
   verify release --app <APP>      everything publication requires
   verify list                     every check: sets, needs, what it runs
   verify perf [LANE...]           the performance lanes (`verify perf --list`)
+  verify soak [--ledger PATH]     the crash restore's soak (keeper P4): this
+                                  machine's recovery ledger, not the tree
   verify glue <in.wasm> <out> --flavor web|nodejs
                                   a wasm module's JS glue (`--record-toy`: the
                                   wasm-glue check's goldens; `--record-replay`:
@@ -254,6 +256,12 @@ Run aterm's checks in place, offline, alone or in any combination.
   verify fetch-browser            the pinned chrome-headless-shell and Firefox
                                   the browser check drives, into this
                                   machine's cache
+  verify browser-site DIR         the browser check's first half: both web
+                                  modules built and the site laid in DIR
+  verify browser-drive SITE OUT [--engine metal|swiftshader|firefox]...
+                                  its second half: the sessions run on a laid
+                                  site, frames in OUT (no targo: the Linux
+                                  lane's guest)
 
 Sets:
   dev      fmt census lint test doc (the default)

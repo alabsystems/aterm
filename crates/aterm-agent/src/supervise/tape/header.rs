@@ -24,26 +24,52 @@
 //! owner's file — never through a second encoding of the fields that could
 //! drift from it. `exact` says whether that rebuild gave back the very policy
 //! the run had, checked as the header was captured (a policy no file can
-//! spell, as a test builds one, says `false`).
+//! spell, as a test builds one, says `false`). A header that says `true` is
+//! rebuilt strictly, a value the reader refuses there being damage; one that
+//! says `false` is rebuilt to its nearest — a value the reader refuses is
+//! read as the owner's file reads it — and the decode names each such value
+//! and the inexactness itself in [`Header::supplied`], so a replay says it
+//! ran a policy the run never had instead of refusing the tape whole over
+//! one such value. (A value the reader takes but reads differently — a
+//! trust root with a comma, split in two — was always read, under its mark.)
 //!
-//! THE ROOTS are the directories the run's own files live in: the ledger's,
-//! the journal's, the standing rules', the state root and the home directory
-//! ([`Roots`]; an older build's header may name a `notes` root too). Every path the
-//! loop opens is written under the most specific one, `@ledger/s-1.jsonl`,
-//! so a replay can move every root to a directory that does not exist
-//! ([`Header::decode_remapped`]) and the same paths still come out under
-//! them: whatever the replay would open that no record answers then fails.
-//! A file the run was given by a RELATIVE path (`--journal run.jsonl`) is
-//! one the loop opens from its own directory, so the header names it from
-//! there ([`Header::capture`]): the same file, by a path a root can hold —
-//! never written relative, where a replay started in the recording's
-//! directory would open the live one. A remapped decode refuses any opened
-//! file path that names no root, or leaves its root (`..`, an absolute
-//! rest): a hand-made or damaged header cannot point a replay back at the
-//! live ledger or journal. This is lexical relocation; a replay must still own its base and handle filesystem effects. The
-//! approval policy's own home and `$TMPDIR` ([`super::super::run::ApprovalEnv`])
-//! are VALUES it compares the screen's text with, not places it opens, and
-//! are written as they are.
+//! THE ROOTS are the directories the run's own files live in — the
+//! ledger's, the journal's, the standing rules' and the state root — and
+//! the home directory, which names the values under it that a probe asks
+//! about ([`Roots`]; an older build's header may name a `notes` root too).
+//! Every path the loop opens is written under the most specific one,
+//! `@ledger/s-1.jsonl`, so a replay can move every root to a directory that
+//! does not exist ([`Header::decode_remapped`]) and the same paths still
+//! come out under them: whatever the replay would open that no record
+//! answers then fails. A file the run was given by a RELATIVE path
+//! (`--journal run.jsonl`) is one the loop opens from its own directory, so
+//! the header names it from there ([`Header::capture`]): the same file, by a
+//! path a root can hold — never written relative, where a replay started in
+//! the recording's directory would open the live one. A remapped decode
+//! refuses any opened file path that names no root, or leaves its root
+//! (`..`, an absolute rest): a hand-made or damaged header cannot point a
+//! replay back at the live ledger or journal. This is lexical relocation; a
+//! replay must still own its base and handle filesystem effects.
+//!
+//! THE APPROVAL POLICY'S HOME AND `$TMPDIR`
+//! ([`super::super::run::ApprovalEnv`]) are written as they are, and a remap
+//! leaves them so. The policy reads the screen with them: a box's `~/…`
+//! resolves against the home, the owner's `~/` trust roots and the secret
+//! rules are built under it, and `$TMPDIR` is a scratch root the rm rule may
+//! clear — each compared with the paths the screen draws, which name the
+//! recorded run's directories. Moved under a replay's base, a `~/proj` trust
+//! root would no longer hold the `/Users//a/proj/x` a Read box drew, and the
+//! replay would judge the box another way than the run did.
+//!
+//! The policy DOES look at the disk under them — where a Read's links lead,
+//! whether a folder on its way holds a hidden twin, where an `rm` operand
+//! leads — but only through its probe (`policy::probe`), and a replay's
+//! probe answers every look from the tape: it has no live look to make. Each
+//! look is asked by its path as the recorded run's roots write it
+//! (`@home/proj/x`: a replay writes a value under the recorded roots,
+//! `ReplayCore::path`), so it is asked as the run asked it. The `home` root
+//! is therefore a name for values, never a place a replay opens: remapped,
+//! it holds nothing.
 //!
 //! OLDER AND NEWER TAPES. Keys are added every week (a `[harness]` key, a
 //! supervisable agent, a setup knob), and a later build must still replay a
@@ -76,6 +102,7 @@
 //! hand-over flag's value (each written as its presence), and the clock — a
 //! tape's records answer every read of it.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -125,8 +152,10 @@ impl Entry {
 const ROOT_IDS: [&str; 6] = ["ledger", "journal", "notes", "rules", "state", "home"];
 
 /// No roots: a path written as it is — a root's own directory, and the
-/// approval policy's home and `$TMPDIR`, values it compares the screen's
-/// text with and never a place the loop opens.
+/// approval policy's home and `$TMPDIR`, values it reads the screen with,
+/// which a remap leaves as recorded; the policy looks at the disk under them
+/// only through its probe, which a replay answers from the tape
+/// ([module docs](self)).
 pub(crate) const VERBATIM: Roots = Roots(Vec::new());
 
 /// THE RUN'S ROOTS: each directory its own files live in, by a fixed name
@@ -554,6 +583,20 @@ struct Line {
 #[derive(Debug)]
 pub(crate) struct Reader {
     lines: Vec<Line>,
+    /// Each line's place in [`Self::lines`], by its section and key: how a
+    /// key is found ([`Self::find`]) and a key said twice is caught.
+    ///
+    /// WHY AN INDEX: a header is read from tapes that come from elsewhere
+    /// (the corpus, an incident tape someone shared), whose header frame may
+    /// hold up to `frame::FRAME_RAW_MAX` bytes — millions of lines. Checked
+    /// against every earlier line, as each key once was, a damaged or hostile
+    /// header of half a million distinct keys cost ~10^11 comparisons before
+    /// its first unknown key was refused: `aterm drive replay`, the one verb
+    /// that decodes a header (`tape cat|show|stats` keep its text as it is),
+    /// hung instead of refusing it. Indexed, reading a header is linear in
+    /// its lines (times a logarithm), so a header is refused as fast as it
+    /// can be read.
+    index: BTreeMap<String, BTreeMap<String, usize>>,
     section: String,
     remapped_io: bool,
     /// Each `[section] key` the header did not name that this build
@@ -566,6 +609,7 @@ impl Reader {
     /// `key`; a key said twice in one section is refused.
     fn parse(body: &str) -> Result<Self, String> {
         let mut lines: Vec<Line> = Vec::new();
+        let mut index: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
         let mut section = String::new();
         for (i, line) in body.split_terminator('\n').enumerate() {
             let at = i + 2;
@@ -584,11 +628,13 @@ impl Reader {
             {
                 return Err(format!("atape header line {at}: not a key: {line:?}"));
             }
-            if lines.iter().any(|l| l.section == section && l.key == key) {
+            let keys = index.entry(section.clone()).or_default();
+            if keys.contains_key(key) {
                 return Err(format!(
                     "atape header line {at}: [{section}] {key} said twice"
                 ));
             }
+            keys.insert(key.to_string(), lines.len());
             lines.push(Line {
                 section: section.clone(),
                 key: key.to_string(),
@@ -599,10 +645,16 @@ impl Reader {
         }
         Ok(Self {
             lines,
+            index,
             section: String::new(),
             remapped_io: false,
             supplied: Vec::new(),
         })
+    }
+
+    /// Where the section last named holds `key` in [`Self::lines`].
+    fn find(&self, key: &str) -> Option<usize> {
+        self.index.get(&self.section)?.get(key).copied()
     }
 
     /// `key` read by `read` where the section names it. Where it does not,
@@ -618,15 +670,10 @@ impl Reader {
         shipped: T,
         read: impl FnOnce(&mut Self, &str) -> Result<T, String>,
     ) -> Result<T, String> {
-        let section = &self.section;
-        if self
-            .lines
-            .iter()
-            .any(|l| l.section == *section && l.key == key)
-        {
+        if self.find(key).is_some() {
             read(self, key)
         } else {
-            self.supplied.push(format!("[{section}] {key}"));
+            self.supplied.push(format!("[{}] {key}", self.section));
             Ok(shipped)
         }
     }
@@ -634,11 +681,7 @@ impl Reader {
     /// A retired duration, if present: validate its old wire type and consume
     /// it, without supplying a value or reviving a removed setup field.
     pub(crate) fn retired_duration(&mut self, key: &str) -> Result<(), String> {
-        if self
-            .lines
-            .iter()
-            .any(|line| line.section == self.section && line.key == key)
-        {
+        if self.find(key).is_some() {
             let _ = self.duration(key)?;
         }
         Ok(())
@@ -647,11 +690,7 @@ impl Reader {
     /// A retired text (a value, an empty one or none), if present: validate
     /// its old wire type and consume it, as [`Self::retired_duration`] does.
     pub(crate) fn retired_text(&mut self, key: &str) -> Result<(), String> {
-        if self
-            .lines
-            .iter()
-            .any(|line| line.section == self.section && line.key == key)
-        {
+        if self.find(key).is_some() {
             let _ = self.opt_text(key)?;
         }
         Ok(())
@@ -660,11 +699,7 @@ impl Reader {
     /// A retired switch or number, if present, read by its old type `T`, as
     /// [`Self::retired_duration`] does.
     pub(crate) fn retired_parsed<T: std::str::FromStr>(&mut self, key: &str) -> Result<(), String> {
-        if self
-            .lines
-            .iter()
-            .any(|line| line.section == self.section && line.key == key)
-        {
+        if self.find(key).is_some() {
             let _ = self.parsed::<T>(key)?;
         }
         Ok(())
@@ -677,14 +712,10 @@ impl Reader {
 
     /// `key`'s value, unescaped (`None`: the key alone), and its line.
     fn take(&mut self, key: &str) -> Result<(Option<Vec<u8>>, usize), String> {
-        let section = &self.section;
-        let Some(line) = self
-            .lines
-            .iter_mut()
-            .find(|l| l.section == *section && l.key == key)
-        else {
-            return Err(format!("atape header: [{section}] names no {key}"));
+        let Some(at) = self.find(key) else {
+            return Err(format!("atape header: [{}] names no {key}", self.section));
         };
+        let line = &mut self.lines[at];
         line.taken = true;
         let value = line
             .value
@@ -844,11 +875,15 @@ pub struct Header {
     /// The policy's rebuild gave back the very policy the run had
     /// ([module docs](self)).
     pub policy_exact: bool,
-    /// What this build supplied that the tape did not say — a tape from a
-    /// build before a key ([module docs](self)): each `[section] key` read
-    /// at this build's value, and each policy key retired since with the
-    /// note its reading gave. Empty for a header this build captured; never
-    /// written.
+    /// What this build supplied where the header did not give it the run's
+    /// own: for a tape from a build before a key ([module docs](self)), each
+    /// `[section] key` the header does not say, read at this build's value,
+    /// and each policy key retired since with the note its reading gave; for
+    /// a policy the header marked inexact, each value it said that the
+    /// owner's reader refused, with the note and the value read in its
+    /// place, and the inexactness itself (the replay runs the nearest
+    /// policy). Empty for a header this build captured from a policy its
+    /// texts give back; never written.
     pub supplied: Vec<String>,
 }
 
@@ -1099,11 +1134,24 @@ impl Header {
             }
         }
         r.finish()?;
-        let rebuilt = SupervisorConfig::rebuild(&PolicyTexts {
+        // A policy the header says rebuilds exactly is read strictly: a value
+        // the owner's reader refuses there is damage. One it marked inexact
+        // (`exact=false`, a policy no file spells, as a test builds one) is
+        // read to its nearest, each value the reader refused named
+        // ([`SupervisorConfig::rebuild_nearest`]). Read strictly, such a
+        // header was refused whole when one of its values was one `set`
+        // refuses (an `autocompact_offer` off the ladder); one whose values
+        // `set` only reads differently (a comma in a trust root) always read.
+        let texts = PolicyTexts {
             keys,
             agents,
             withheld,
-        })
+        };
+        let rebuilt = if policy_exact {
+            SupervisorConfig::rebuild(&texts)
+        } else {
+            SupervisorConfig::rebuild_nearest(&texts)
+        }
         .map_err(|e| format!("atape header: [policy] {e}"))?;
         let mut supplied = r.supplied;
         supplied.extend(rebuilt.supplied.iter().map(|key| format!("[policy] {key}")));
@@ -1111,8 +1159,14 @@ impl Header {
             rebuilt
                 .retired
                 .iter()
+                .chain(&rebuilt.refused)
                 .map(|note| format!("[policy] {note}")),
         );
+        if !policy_exact {
+            // Said, so a replay's report never passes the rebuild off as the
+            // run's own policy (`Report::render` lists what was supplied).
+            supplied.push(format!("[policy] {INEXACT}"));
+        }
         Ok(Self {
             tape,
             build,
@@ -1152,6 +1206,11 @@ const RULES_FILE: &str = "rules_file";
 
 /// The prefix of a withheld rule's line in `[policy]`.
 const WITHHELD: &str = "withheld.";
+
+/// What [`Header::supplied`] says of a policy its header marked inexact
+/// (`exact=false`): the replay runs this build's nearest rebuild of it.
+const INEXACT: &str = "exact=false: the run's policy is one no owner's file spells; \
+                       the replay runs the nearest policy its texts rebuild";
 
 #[cfg(test)]
 #[path = "header_tests.rs"]

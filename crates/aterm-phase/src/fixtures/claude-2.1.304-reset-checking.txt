@@ -1,0 +1,9 @@
+# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (byte offsets into the store's 2.1.304 binary, docs/SPEC-claude-accounts-resets-2026-10-02.md §0: the pending line `jVe` @244652675 under the wall dialog's title @257511359 (the Dialog with one dim child and its input guide, @257511467)), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; the same Dialog component in 2.1.304), the values are invented · OPEN: replace with a capture (SPEC §6) · the row taken: the wall dialog's title over `Checking for a reset…`
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   Checking for a reset…
+
+   Enter to confirm · Esc to cancel

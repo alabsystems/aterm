@@ -1167,7 +1167,7 @@ fn a_headless_instance_never_offers_the_macos_access_card() {
 fn access_card_windowed() -> App {
     let mut app = App::headless_for_test();
     app.headless = false;
-    app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
         aterm_containment::consent::FdaProbe {
             state: aterm_containment::consent::FdaState::Denied,
             label: aterm_containment::consent::ProbeLabel::OpenEperm,
@@ -1441,7 +1441,7 @@ fn open_settings_answers_the_entry_and_only_a_verified_grant_ends_it() {
     assert!(fda_entries(&app).is_empty(), "answered: no second entry");
     // The owner turns the switch on: the window's own probe reads
     // `granted`, the watch notices with nothing further pressed.
-    app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
         aterm_containment::consent::FdaProbe {
             state: aterm_containment::consent::FdaState::Granted,
             label: aterm_containment::consent::ProbeLabel::OpenOk,
@@ -1476,7 +1476,7 @@ fn a_grant_ends_the_entry_and_is_a_record() {
     let t0 = Instant::now();
     let mut app = access_card_windowed();
     let id = access_card_posted(&mut app, t0);
-    app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
+    app.consent = crate::consent_state::ConsentState::with_cached_probe_for_test(
         aterm_containment::consent::FdaProbe {
             state: aterm_containment::consent::FdaState::Granted,
             label: aterm_containment::consent::ProbeLabel::OpenOk,
@@ -1706,7 +1706,7 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
             .iter()
             .any(|tab| tab.presentation.indicators.attention)
     };
-    let roots = |app: &App| app.config.privacy_protected_roots();
+    let roots = |app: &App| app.consent.policy().protected_roots().to_vec();
 
     // Outside every protected root: nothing.
     let mut app = App::headless_for_test();
@@ -1728,8 +1728,7 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
     // sentinel leaves the tab alone — the access card's one question
     // carries the action.
     let Some(root) = roots(&app).first().cloned() else {
-        // No resolvable $HOME in this environment: nothing is protected.
-        return;
+        aterm_spec::host::could_not_run("no $HOME resolves here, so nothing is protected");
     };
     app.note_protected_read(sid, &root.join("project"));
     assert!(
@@ -1751,13 +1750,27 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
         marked(&full),
         "Full mode: the session's tab carries the mark"
     );
+    // The master switch turns Full off, the EPERM path's mark included.
+    let mut stopped = App::headless_for_test();
+    stopped.config.privacy = Some(crate::app_config::PrivacyConfig {
+        observer: Some(true),
+        enabled: Some(false),
+        ..Default::default()
+    });
+    let sid = session(&stopped);
+    stopped.note_protected_read(sid, &root.join("project"));
+    assert!(
+        !marked(&stopped),
+        "enabled = false: no Full mode, so no mark"
+    );
 }
 
 /// THE SENTINEL IS THE DEFAULT, AND IT IS QUIET (plan-tcc §3.4). Which
-/// observer an instance actually runs is the config's tri-state with two
-/// facts applied: the sentinel exists only to feed the access card, so it
-/// needs both of the card's switches and a windowed macOS instance; Full is
-/// an explicit opt-in that runs wherever it is asked for.
+/// observer an instance actually runs is the config's tri-state with the
+/// master switch and two facts applied: `enabled = false` turns every mode
+/// off; the sentinel exists only to feed the access card, so it needs both
+/// of the card's switches and a windowed macOS instance; Full is an explicit
+/// opt-in that runs wherever it is asked for.
 #[test]
 fn the_effective_observer_mode_follows_the_config_and_the_cards_switches() {
     use super::consent_observer::ObserverMode;
@@ -1777,15 +1790,17 @@ fn the_effective_observer_mode_follows_the_config_and_the_cards_switches() {
     } else {
         ObserverMode::Off
     };
-    // (observer, enabled, notice, bundled) -> mode. The sentinel needs both of
-    // the card's switches and a bundle id to judge a dialog against; Full is
-    // an explicit opt-in that needs neither.
+    // (observer, enabled, notice, bundled) -> mode. `enabled = false` is the
+    // master switch and turns every mode off; the sentinel needs both of the
+    // card's switches and a bundle id to judge a dialog against; Full is an
+    // explicit opt-in that needs neither.
     for (observer, enabled, notice, bundled, mode) in [
         (None, true, true, true, sentinel_here),
         (None, true, false, true, ObserverMode::Off),
         (None, false, true, true, ObserverMode::Off),
         (Some(false), true, true, true, ObserverMode::Off),
         (Some(true), true, false, true, ObserverMode::Full),
+        (Some(true), false, true, true, ObserverMode::Off),
         (None, true, true, false, ObserverMode::Off),
         (Some(true), true, true, false, ObserverMode::Full),
     ] {
@@ -1799,14 +1814,550 @@ fn the_effective_observer_mode_follows_the_config_and_the_cards_switches() {
     let mut headless = App::headless_for_test();
     assert_eq!(headless.effective_observer_mode(), ObserverMode::Off);
     assert_eq!(
-        headless.start_consent_observer(),
-        super::consent_observer::StartOutcome::Disabled
+        headless.reconcile_consent_observer(),
+        None,
+        "a fresh observer already has what Off asks for"
     );
     headless.config.privacy = Some(crate::app_config::PrivacyConfig {
         observer: Some(true),
         ..Default::default()
     });
     assert_eq!(headless.effective_observer_mode(), ObserverMode::Full);
+    let mut stopped = App::headless_for_test();
+    stopped.config.privacy = Some(crate::app_config::PrivacyConfig {
+        observer: Some(true),
+        enabled: Some(false),
+        ..Default::default()
+    });
+    assert_eq!(stopped.effective_observer_mode(), ObserverMode::Off);
+    assert_eq!(
+        headless.reconcile_consent_observer(),
+        Some(super::consent_observer::StartOutcome::Started),
+        "Full runs where it is asked for: the inert arm here"
+    );
+}
+
+/// What the test observer arms report. A `fn` arm can speak only through a
+/// static, so the tests that install one hold [`OBSERVER_ARM_LOCK`].
+struct ObserverArmLog {
+    /// The mode of every worker an arm was started for, in order.
+    starts: Vec<super::consent_observer::ObserverMode>,
+    /// How many `Started` messages [`streaming_observer_arm`] has posted.
+    posted: usize,
+    /// Set by the test: every standing worker may end.
+    release: bool,
+    /// Per ended worker: whether the host had dropped its receiver.
+    receiver_gone: Vec<bool>,
+}
+
+static OBSERVER_ARM: (std::sync::Mutex<ObserverArmLog>, std::sync::Condvar) = (
+    std::sync::Mutex::new(ObserverArmLog {
+        starts: Vec::new(),
+        posted: 0,
+        release: false,
+        receiver_gone: Vec::new(),
+    }),
+    std::sync::Condvar::new(),
+);
+
+static OBSERVER_ARM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The arm log, emptied for a new test. Call with [`OBSERVER_ARM_LOCK`] held.
+fn reset_observer_arm() {
+    let mut log = OBSERVER_ARM.0.lock().unwrap_or_else(|p| p.into_inner());
+    log.starts.clear();
+    log.posted = 0;
+    log.release = false;
+    log.receiver_gone.clear();
+}
+
+/// Every standing test worker may end. Call with [`OBSERVER_ARM_LOCK`] held.
+fn release_observer_arm() {
+    let (log, changed) = &OBSERVER_ARM;
+    log.lock().unwrap_or_else(|p| p.into_inner()).release = true;
+    changed.notify_all();
+}
+
+/// Wait until `ready` holds over the arm log: a one-minute hang detector.
+fn await_observer_arm(what: &str, ready: impl Fn(&ObserverArmLog) -> bool) {
+    let (log, changed) = &OBSERVER_ARM;
+    let log = log.lock().unwrap_or_else(|p| p.into_inner());
+    let (_log, waited) = changed
+        .wait_timeout_while(log, std::time::Duration::from_secs(60), |log| !ready(log))
+        .unwrap_or_else(|p| p.into_inner());
+    assert!(
+        !waited.timed_out(),
+        "the observer arm never reached: {what}"
+    );
+}
+
+/// A stream that stands like a live one: it records its mode, posts
+/// `Started`, and holds its sender until the test releases it, then reports
+/// whether the host still held the receiver.
+fn streaming_observer_arm(
+    sink: &super::consent_observer::StreamSink,
+    mode: super::consent_observer::ObserverMode,
+) {
+    let (log, changed) = &OBSERVER_ARM;
+    log.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .starts
+        .push(mode);
+    sink.post_for_test(super::consent_observer::ObserverEvent::Started);
+    let mut held = log.lock().unwrap_or_else(|p| p.into_inner());
+    held.posted += 1;
+    changed.notify_all();
+    // Bounded, so a test that failed before its release leaks no thread.
+    let (held, _) = changed
+        .wait_timeout_while(held, std::time::Duration::from_secs(60), |log| !log.release)
+        .unwrap_or_else(|p| p.into_inner());
+    drop(held);
+    let kept = sink.post_for_test(super::consent_observer::ObserverEvent::Started);
+    log.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .receiver_gone
+        .push(!kept);
+    changed.notify_all();
+}
+
+/// A stream that cannot read the log: it records its mode, says so and ends.
+fn log_refused_observer_arm(
+    sink: &super::consent_observer::StreamSink,
+    mode: super::consent_observer::ObserverMode,
+) {
+    OBSERVER_ARM
+        .0
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .starts
+        .push(mode);
+    sink.post_for_test(super::consent_observer::ObserverEvent::Unavailable(
+        super::consent_observer::UnavailableReason::NoLogAccess,
+    ));
+}
+
+fn observer_arm_starts() -> Vec<super::consent_observer::ObserverMode> {
+    OBSERVER_ARM
+        .0
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .starts
+        .clone()
+}
+
+/// RECONCILED AT THE EVENTS THAT CHANGE IT. An admitted config generation
+/// starts the stream it asks for and stops the one it no longer wants, so
+/// `observer log=` reads `off` after an owner turns the observer off, both
+/// from a live stream and from one that already ended. A generation that
+/// leaves the wish alone starts and stops nothing (the negative control),
+/// and that includes a stream that ended by itself: it is not respawned.
+/// A cold `exec` that returned restarts what its preparation stopped.
+///
+/// A worker records its start on its own thread, so a start is awaited on
+/// the arm log; "nothing changed" is read synchronously off the observer,
+/// since a stop clears the running mode and a start takes a receiver at once.
+#[test]
+fn a_reload_reconciles_the_observer() {
+    use super::consent_observer::ObserverMode;
+    use crate::app_colorscheme::install_resolved_colors::apply_config_text;
+    let _arm = OBSERVER_ARM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    reset_observer_arm();
+    let dir = std::env::temp_dir().join(format!("aterm-observer-reconcile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let full = "[privacy]\nobserver = true\n";
+    let off = "[privacy]\nobserver = false\n";
+    let unrelated = "[privacy]\nobserver = true\n[claude_footer]\nusage = false\n";
+
+    let mut app = App::headless_for_test();
+    app.consent_observer
+        .set_arm_for_test(streaming_observer_arm);
+    apply_config_text(&mut app, &dir, full);
+    assert!(
+        app.consent_observer.is_live(),
+        "the reload started a stream"
+    );
+    await_observer_arm("the first Started", |log| log.posted == 1);
+    assert_eq!(observer_arm_starts(), [ObserverMode::Full]);
+    app.poll_consent_observer(std::time::Instant::now());
+    assert_eq!(app.consent_observer.running(), ObserverMode::Full);
+    assert_eq!(app.privacy_observer_log(), "ok");
+
+    apply_config_text(&mut app, &dir, unrelated);
+    assert_eq!(
+        app.config.claude_footer.as_ref().and_then(|f| f.usage),
+        Some(false),
+        "the unrelated generation was admitted"
+    );
+    assert_eq!(
+        app.consent_observer.running(),
+        ObserverMode::Full,
+        "an unchanged wish stops nothing, so it starts nothing"
+    );
+    assert!(app.consent_observer.is_live());
+
+    #[cfg(unix)]
+    {
+        app.prepare_cold_exec(7, true, false);
+        assert_eq!(app.consent_observer.running(), ObserverMode::Off);
+        assert!(!app.consent_observer.is_live());
+        app.resume_after_cold_exec();
+        assert!(
+            app.consent_observer.is_live(),
+            "a returned exec restarts the stream"
+        );
+        await_observer_arm("the second Started", |log| log.posted == 2);
+        assert_eq!(
+            observer_arm_starts(),
+            [ObserverMode::Full, ObserverMode::Full]
+        );
+        app.poll_consent_observer(std::time::Instant::now());
+        assert_eq!(app.consent_observer.running(), ObserverMode::Full);
+    }
+    let workers = if cfg!(unix) { 2 } else { 1 };
+
+    apply_config_text(&mut app, &dir, off);
+    assert_eq!(app.consent_observer.running(), ObserverMode::Off);
+    assert!(!app.consent_observer.is_live());
+    assert_eq!(app.privacy_observer_log(), "off");
+    // The master switch outranks the opt-in: nothing starts.
+    apply_config_text(
+        &mut app,
+        &dir,
+        "[privacy]\nobserver = true\nenabled = false\n",
+    );
+    assert!(
+        !app.consent_observer.is_live(),
+        "enabled = false starts nothing"
+    );
+    assert_eq!(app.consent_observer.requested(), ObserverMode::Off);
+    assert_eq!(app.privacy_observer_log(), "off");
+    release_observer_arm();
+    await_observer_arm("every worker ended", |log| {
+        log.receiver_gone.len() == workers
+    });
+    let log = OBSERVER_ARM.0.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(log.starts.len(), workers, "{:?}", log.starts);
+    assert!(
+        log.receiver_gone.iter().all(|gone| *gone),
+        "every stopped worker's sender is disconnected"
+    );
+    drop(log);
+
+    // A stream that ended by itself (no log access) keeps its request: an
+    // unrelated generation does not respawn it, and turning the observer off
+    // reads `off`, not the stale `unavailable`.
+    reset_observer_arm();
+    let mut ended = App::headless_for_test();
+    ended
+        .consent_observer
+        .set_arm_for_test(log_refused_observer_arm);
+    apply_config_text(&mut ended, &dir, full);
+    await_observer_arm("the refused start", |log| log.starts.len() == 1);
+    // A hang detector for the worker's end, which only a drain can see.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while ended.consent_observer.is_live() && std::time::Instant::now() < deadline {
+        ended.poll_consent_observer(std::time::Instant::now());
+        std::thread::yield_now();
+    }
+    assert!(
+        !ended.consent_observer.is_live(),
+        "the refused worker ended"
+    );
+    assert_eq!(ended.privacy_observer_log(), "unavailable");
+    apply_config_text(&mut ended, &dir, unrelated);
+    assert!(
+        !ended.consent_observer.is_live(),
+        "an ended stream is not respawned by an unchanged wish"
+    );
+    assert_eq!(ended.privacy_observer_log(), "unavailable");
+    apply_config_text(&mut ended, &dir, off);
+    assert_eq!(ended.privacy_observer_log(), "off");
+    assert_eq!(observer_arm_starts(), [ObserverMode::Full]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pid the observer tests give every session's shell, so a request from
+/// it is attributable without asking the OS for a process group.
+const OBSERVED_SHELL: i32 = 4711;
+
+/// A pid no process has (above every platform's pid ceiling), so `getpgid`
+/// answers nothing and a request from it is nobody's.
+const UNOWNED_PID: i32 = 0x7FFF_FFF0;
+
+/// A headless instance whose sessions' shell is [`OBSERVED_SHELL`], with the
+/// standing test arm installed.
+fn app_with_observed_shell() -> App {
+    let mut app = App::headless_for_test();
+    set_shell_pid(&mut app, OBSERVED_SHELL);
+    app.consent_observer
+        .set_arm_for_test(streaming_observer_arm);
+    app
+}
+
+/// Give every pooled session's shell `pid`, in place: no insert, so the
+/// roster generation does not move.
+fn set_shell_pid(app: &mut App, pid: i32) {
+    for pooled in app.pool.sessions.values_mut() {
+        pooled.session.pid = pid;
+    }
+}
+
+/// Whether a tab of the headless window carries the attention mark.
+fn a_tab_is_marked(app: &App) -> bool {
+    app.windows[&WindowId(0)]
+        .tab_set
+        .tabs()
+        .iter()
+        .any(|tab| tab.presentation.indicators.attention)
+}
+
+/// Feed `app`'s observer a Documents request from [`OBSERVED_SHELL`] that
+/// opened ten seconds ago and has no result: past the prompt threshold, so a
+/// running Full stream announces it at its next poll.
+fn feed_open_request(app: &mut App, msg_id: &str) {
+    let opened = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(10))
+        .expect("the monotonic clock reads past ten seconds");
+    feed_request_opened_at(app, msg_id, OBSERVED_SHELL, opened);
+}
+
+/// Feed `app`'s observer a Documents request from `accessing_pid` that
+/// opened at `opened` and has no result.
+fn feed_request_opened_at(
+    app: &mut App,
+    msg_id: &str,
+    accessing_pid: i32,
+    opened: std::time::Instant,
+) {
+    use super::consent_observer::{ObserverEvent, TccEvent};
+    for line in [
+        TccEvent::Ctx {
+            msg_id: msg_id.to_owned(),
+            service: "kTCCServiceSystemPolicyDocumentsFolder".to_owned(),
+            preflight: Some(false),
+        },
+        TccEvent::Attribution {
+            msg_id: msg_id.to_owned(),
+            accessing_pid: Some(accessing_pid),
+            requesting_pid: None,
+        },
+    ] {
+        app.consent_observer
+            .feed_for_test(ObserverEvent::Line(line), opened);
+    }
+}
+
+/// The park's announcement follows the stream that is RUNNING, not the
+/// config: a Full stream announces a prompt it observed even when the config
+/// was edited behind the reconcile's back, after a reload to Off nothing is
+/// announced, and a running sentinel announces nothing either.
+///
+/// No case here tells `running` from `requested`: with Full requested, no
+/// state a real worker can reach has them differ with anything to announce.
+/// Before the stream's `Started` its table is empty (emptied at the spawn,
+/// and lines follow `Started`), and after its end the availability is not
+/// `ok`, so `take_new_verdicts` returns nothing.
+#[test]
+fn the_park_reads_the_running_mode_not_the_config() {
+    use super::consent_observer::ObserverMode;
+    use crate::app_colorscheme::install_resolved_colors::apply_config_text;
+    use std::time::Instant;
+    let _arm = OBSERVER_ARM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    reset_observer_arm();
+    let dir = std::env::temp_dir().join(format!("aterm-observer-park-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let mut app = app_with_observed_shell();
+    apply_config_text(&mut app, &dir, "[privacy]\nobserver = true\n");
+    await_observer_arm("Started", |log| log.posted == 1);
+    app.poll_consent_observer(Instant::now());
+    assert_eq!(app.consent_observer.running(), ObserverMode::Full);
+
+    // Behind the reconcile's back: the park must not re-derive the mode.
+    let reloaded = app.config.privacy.take();
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        observer: Some(false),
+        ..Default::default()
+    });
+    feed_open_request(&mut app, "7.1");
+    assert!(!a_tab_is_marked(&app), "precondition");
+    app.poll_consent_observer(Instant::now());
+    assert!(
+        a_tab_is_marked(&app),
+        "the running Full stream announces its prompt"
+    );
+    // Undone, so the reload below is a change the admission path applies.
+    app.config.privacy = reloaded;
+
+    app.windows
+        .get_mut(&WindowId(0))
+        .and_then(|window| window.tab_set.tab_at_mut(0))
+        .expect("the headless instance has tab 0")
+        .presentation
+        .indicators
+        .attention = false;
+    assert!(!a_tab_is_marked(&app), "precondition");
+    apply_config_text(&mut app, &dir, "[privacy]\nobserver = false\n");
+    assert_eq!(app.consent_observer.running(), ObserverMode::Off);
+    feed_open_request(&mut app, "7.2");
+    app.poll_consent_observer(Instant::now());
+    assert!(
+        !a_tab_is_marked(&app),
+        "after a reload to Off nothing is announced"
+    );
+
+    // A running sentinel with an attributable open request in its table: the
+    // availability is `ok`, so only the mode check keeps the tab unmarked.
+    assert_eq!(
+        app.consent_observer.start(ObserverMode::Sentinel, || {}),
+        super::consent_observer::StartOutcome::Started
+    );
+    await_observer_arm("the sentinel's Started", |log| log.posted == 2);
+    app.poll_consent_observer(Instant::now());
+    assert_eq!(app.consent_observer.running(), ObserverMode::Sentinel);
+    assert_eq!(app.privacy_observer_log(), "ok");
+    feed_open_request(&mut app, "7.3");
+    app.poll_consent_observer(Instant::now());
+    assert!(
+        !a_tab_is_marked(&app),
+        "a running sentinel announces nothing"
+    );
+    app.consent_observer.stop();
+
+    release_observer_arm();
+    await_observer_arm("every worker ended", |log| log.receiver_gone.len() == 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE THRESHOLD CROSSING WAKES THE PARK. A request a running Full stream
+/// observed is announced when it reaches the prompt threshold with nothing
+/// else moving: the poll that folded it arms the crossing as the consent
+/// lanes' park deadline, under its own owner; a poll before it judges
+/// nothing and the poll at it announces. A passed crossing is not armed
+/// again, and a stopped stream leaves nothing armed.
+///
+/// An older request from a pid nobody owns stands past the threshold. For
+/// the poll before the crossing, the shell takes that pid in place, which
+/// moves no roster generation: a judging pass there would find it an owner
+/// and mark the tab, so an unmarked tab says the poll judged nothing.
+#[test]
+fn the_threshold_crossing_is_a_park_deadline() {
+    use super::consent_observer::{ObserverMode, PENDING_PROMPT_THRESHOLD};
+    use crate::app_colorscheme::install_resolved_colors::apply_config_text;
+    use crate::metrics::DeadlineOwner;
+    use std::time::{Duration, Instant};
+    let fold = |app: &App, now: Instant| {
+        let (mut deadline, mut owner) = (None, DeadlineOwner::None);
+        app.fold_consent_lane_deadlines(now, &mut deadline, &mut owner);
+        (deadline, owner)
+    };
+    let _arm = OBSERVER_ARM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    reset_observer_arm();
+    let dir = std::env::temp_dir().join(format!("aterm-observer-crossing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let mut app = app_with_observed_shell();
+    apply_config_text(&mut app, &dir, "[privacy]\nobserver = true\n");
+    await_observer_arm("Started", |log| log.posted == 1);
+    let opened = Instant::now();
+    app.poll_consent_observer(opened);
+    assert_eq!(app.consent_observer.running(), ObserverMode::Full);
+    assert_eq!(fold(&app, opened).0, None, "nothing open arms nothing");
+
+    let opened_before = opened
+        .checked_sub(PENDING_PROMPT_THRESHOLD + Duration::from_secs(1))
+        .expect("the monotonic clock reads past the threshold");
+    feed_request_opened_at(&mut app, "9.0", UNOWNED_PID, opened_before);
+    feed_request_opened_at(&mut app, "9.1", OBSERVED_SHELL, opened);
+    app.poll_consent_observer(opened);
+    assert!(
+        !a_tab_is_marked(&app),
+        "a request nobody owns marks nothing"
+    );
+    let crossing = opened + PENDING_PROMPT_THRESHOLD;
+    assert_eq!(
+        fold(&app, opened),
+        (Some(crossing), DeadlineOwner::ConsentObserver)
+    );
+    set_shell_pid(&mut app, UNOWNED_PID);
+    app.poll_consent_observer(crossing - Duration::from_millis(1));
+    assert!(!a_tab_is_marked(&app), "nothing is judged before it");
+    set_shell_pid(&mut app, OBSERVED_SHELL);
+    app.poll_consent_observer(crossing);
+    assert!(a_tab_is_marked(&app), "the crossing announces on its own");
+    assert_eq!(
+        fold(&app, crossing).0,
+        None,
+        "a passed crossing is not armed"
+    );
+
+    feed_request_opened_at(&mut app, "9.2", OBSERVED_SHELL, crossing);
+    app.poll_consent_observer(crossing);
+    assert!(fold(&app, crossing).0.is_some(), "precondition");
+    apply_config_text(&mut app, &dir, "[privacy]\nobserver = false\n");
+    assert_eq!(
+        fold(&app, crossing).0,
+        None,
+        "a stopped stream arms nothing"
+    );
+
+    release_observer_arm();
+    await_observer_arm("the worker ended", |log| log.receiver_gone.len() == 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A RESTARTED STREAM STARTS WITH NOTHING IN FLIGHT. A request the stopped
+/// stream was correlating can no longer see its result: its dialog may have
+/// been answered while the observer was off. So after a reload Full -> Off
+/// -> Full the poll announces none of it, though it is attributable and
+/// past its threshold; a request the new stream observes is announced (the
+/// negative control).
+#[test]
+fn a_restarted_stream_announces_nothing_the_stopped_one_was_correlating() {
+    use super::consent_observer::ObserverMode;
+    use crate::app_colorscheme::install_resolved_colors::apply_config_text;
+    use std::time::Instant;
+    let _arm = OBSERVER_ARM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    reset_observer_arm();
+    let dir = std::env::temp_dir().join(format!("aterm-observer-restart-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let full = "[privacy]\nobserver = true\n";
+
+    let mut app = app_with_observed_shell();
+    apply_config_text(&mut app, &dir, full);
+    await_observer_arm("the first Started", |log| log.posted == 1);
+    app.poll_consent_observer(Instant::now());
+    assert_eq!(app.consent_observer.running(), ObserverMode::Full);
+    // Observed by the first stream, which stops before a park announces it.
+    feed_open_request(&mut app, "8.1");
+    apply_config_text(&mut app, &dir, "[privacy]\nobserver = false\n");
+    assert_eq!(app.consent_observer.running(), ObserverMode::Off);
+
+    apply_config_text(&mut app, &dir, full);
+    await_observer_arm("the restart's Started", |log| log.posted == 2);
+    app.poll_consent_observer(Instant::now());
+    assert_eq!(app.consent_observer.running(), ObserverMode::Full);
+    assert!(
+        !a_tab_is_marked(&app),
+        "the stopped stream's request is not announced"
+    );
+    feed_open_request(&mut app, "8.2");
+    app.poll_consent_observer(Instant::now());
+    assert!(
+        a_tab_is_marked(&app),
+        "the restarted stream announces what it observes"
+    );
+
+    apply_config_text(&mut app, &dir, "[privacy]\nobserver = false\n");
+    release_observer_arm();
+    await_observer_arm("every worker ended", |log| log.receiver_gone.len() == 2);
+    let log = OBSERVER_ARM.0.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(
+        log.receiver_gone.iter().all(|gone| *gone),
+        "every stopped worker's sender is disconnected"
+    );
+    drop(log);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// THE LINK FROM THE SENTINEL TO THE CARD. A dialog the observer saw for
@@ -1844,7 +2395,12 @@ fn an_observed_app_data_dialog_for_this_bundle_is_a_need_and_nothing_else_is() {
         .feed_for_test(prompt("1.1", app_data, bundle, Some(i32::MAX - 1)), now);
     // The identity is not warm in a test binary, so the poll takes nothing
     // and drops nothing: the dialog waits for the moment it can be judged.
-    app.consent_observer_started = true;
+    // A requested stream is what makes the park poll at all.
+    assert_eq!(
+        app.consent_observer
+            .start(super::consent_observer::ObserverMode::Sentinel, || {}),
+        super::consent_observer::StartOutcome::Started
+    );
     app.poll_consent_observer(now);
     assert_eq!(app.consent_card_host.needs, 0, "nothing judged while cold");
     app.note_observed_prompts(Some(bundle), now);

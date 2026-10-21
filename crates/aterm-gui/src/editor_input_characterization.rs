@@ -18,8 +18,9 @@
 //! holds the GUI to the same behaviour whichever layer translates the key. It
 //! was written against the host's own translation, before an Editor's keys
 //! moved into amacs's shared input reducer (`EditorWorkspace::handle_input`);
-//! the rows that move changed on purpose say CHANGED: Tab indents, F6 moves
-//! focus, and ESC is Meta for the next key.
+//! the rows that move changed on purpose say CHANGED: Tab indents and F6
+//! moves focus. Escape is what it was: it quits, and the key after it is
+//! itself (ESC as Meta is the terminal face's alone, `Profile::escape_is_meta`).
 
 use crate::input::InputEvent;
 use crate::native_app::{AppEvent, AppKind, AppViewState};
@@ -91,20 +92,20 @@ struct Row {
     name: &'static str,
     before: Vec<InputEvent>,
     press: InputEvent,
-    expect: &'static str,
+    expect: String,
 }
 
 fn row(
     name: &'static str,
     before: Vec<InputEvent>,
     press: InputEvent,
-    expect: &'static str,
+    expect: impl Into<String>,
 ) -> Row {
     Row {
         name,
         before,
         press,
-        expect,
+        expect: expect.into(),
     }
 }
 
@@ -138,6 +139,25 @@ fn editor(
         .common_mut()
         .last_focus = Some(crate::native_ui::UiKey::new("editor/buffer"));
     (app, view, document)
+}
+
+/// How many whole document rows `app`'s editor shows: what its window
+/// leaves the file under the toolbar, as the host sizes the editor's view
+/// (`App::reconcile_active_editor_viewport`). The window is 24 rows of the
+/// platform's default font, so the count is the platform's: 10 at macOS's
+/// 12 px, 16 at Linux's 15 px. The rows that page or scroll read it.
+fn screen(app: &App) -> usize {
+    let wid = WindowId(0);
+    let (instance, _) = app.active_native_view(wid).expect("the editor tab");
+    let Some(crate::native_app::NativeApp::Editor(editor)) = app.native_runtime.app(instance)
+    else {
+        panic!("the active tab is not an editor");
+    };
+    crate::native_ui::editor_visible_line_capacity_with_palette(
+        app.native_ui_viewport(wid).expect("the editor's viewport"),
+        crate::native_ui::EditorPalette::None,
+        editor.toolbar(),
+    )
 }
 
 /// What the editor shows after a key, as one line. Fields at their starting
@@ -196,6 +216,9 @@ fn seen(
         crate::native_editor::Minibuffer::GotoLine { query, .. } => {
             out.push(format!("mb=goto:{query:?}"));
         }
+        crate::native_editor::Minibuffer::Prompt { invocation, query } => {
+            out.push(format!("mb={}:{query:?}", invocation.command.name()));
+        }
     }
     let focus = state
         .common
@@ -217,8 +240,25 @@ fn seen(
     out.join(" ")
 }
 
-fn rows() -> Vec<Row> {
+/// The table, for an editor that shows `screen` whole rows ([`screen`]).
+fn rows(screen: usize) -> Vec<Row> {
     use NamedKey as N;
+    let text = long();
+    let line_start = |line: usize| {
+        text.split_inclusive('\n')
+            .take(line)
+            .map(str::len)
+            .sum::<usize>()
+    };
+    // The document's lines, the empty one after its last newline included.
+    let lines = text.matches('\n').count() + 1;
+    // Page Down's page: a screen less two lines. It must move the view and
+    // stop short of the last screen, or the rows below read a clamp.
+    let page = screen.saturating_sub(2);
+    assert!(
+        page > 0 && page <= lines - screen.min(lines),
+        "the fixture's editor shows {screen} of {lines} rows"
+    );
     let shift = Modifiers::SHIFT;
     let mac = cfg!(target_os = "macos");
     let windows = cfg!(windows);
@@ -302,25 +342,17 @@ fn rows() -> Vec<Row> {
             press(Key::Named(N::Enter), shift),
             r#"text="alpha ⏎beta⏎" dirty sel=7"#,
         ),
-        // CHANGED by the shared input reducer (design §4.4): ESC is Meta for
-        // the next key in every profile, as in Emacs, so `ESC x` is M-x. A
-        // GUI's Escape still quits first (`Profile::escape_quits`: the
-        // region and a C-u argument go, the status says Quit), so the Escape
-        // row only adds the pending ESC, and the key after it differs only
-        // where ESC can spell it as an M- chord (`Escape x`, `Escape
-        // Shift+Tab`). A key it cannot spell (Down, a ⌘ key) ends the ESC
-        // and does what it did. One Escape still closes an open minibuffer.
-        row(
-            "Escape",
-            vec![],
-            named(N::Escape),
-            r#"sel=6 pending hud=ESC status="Quit""#,
-        ),
+        // A GUI's Escape quits (the region and a C-u argument go, the
+        // status says Quit) and leaves nothing pending, so the key after it
+        // is itself: `Escape x` types x. ESC as Meta (`ESC x` is M-x) is the
+        // terminal face's alone (`Profile::escape_is_meta`), where Alt types
+        // characters. One Escape still closes an open minibuffer.
+        row("Escape", vec![], named(N::Escape), r#"sel=6 status="Quit""#),
         row(
             "C-Space Escape drops the region",
             vec![press(Key::Named(N::Space), Modifiers::CTRL)],
             named(N::Escape),
-            r#"sel=6 pending hud=ESC status="Quit""#,
+            r#"sel=6 status="Quit""#,
         ),
         row(
             "Escape Escape",
@@ -332,7 +364,7 @@ fn rows() -> Vec<Row> {
             "Escape x",
             vec![named(N::Escape)],
             ch('x'),
-            r##"sel=6 mb=M-x:""#0 status="Type a command name""##,
+            r#"text="alpha xbeta⏎gamma⏎" dirty sel=7 status="Quit""#,
         ),
         row(
             "Escape Down",
@@ -356,12 +388,17 @@ fn rows() -> Vec<Row> {
             "Escape Shift+Tab",
             vec![named(N::Escape)],
             press(Key::Named(N::Tab), shift),
-            r#"sel=6 status="M-S-tab is not bound""#,
+            r#"sel=6 focus=editor/commands-button status="Quit""#,
         ),
         // Page Down pages the caret with the view, a screen less two lines
         // (main's scroll-up-command, merged after the table was written; it
         // used to scroll the view eight lines and leave the caret).
-        row("PageDown", vec![], named(N::PageDown), "sel=65 top=8"),
+        row(
+            "PageDown",
+            vec![],
+            named(N::PageDown),
+            format!("sel={} top={page}", line_start(page) + CARET),
+        ),
         row(
             "PageUp after PageDown",
             vec![named(N::PageDown)],
@@ -449,7 +486,12 @@ fn rows() -> Vec<Row> {
             cmd('s'),
             r#"text="alpha xbeta⏎gamma⏎" sel=7 status="Saved""#,
         ),
-        row("⌘A selects all", vec![], cmd('a'), "sel=0..314 top=31"),
+        row(
+            "⌘A selects all",
+            vec![],
+            cmd('a'),
+            format!("sel=0..{} top={}", text.len(), lines - screen),
+        ),
         row(
             "⌘Z undoes",
             vec![ch('x')],
@@ -564,11 +606,97 @@ fn rows() -> Vec<Row> {
             r#"sel=6 mark status="Mark set""#,
         ),
         row("C-g", vec![], ctrl('g'), r#"sel=6 status="Quit""#),
+        // CHANGED (S5): off macOS C-Backspace is backward-kill-word, the
+        // platform's spelling of macOS's ⌥⌫.
         row(
             "C-Backspace",
             vec![],
             press(Key::Named(N::Backspace), Modifiers::CTRL),
-            r#"sel=6 status="C-backspace is not bound""#,
+            if mac {
+                r#"sel=6 status="C-backspace is not bound""#
+            } else {
+                r#"text="beta⏎gamma⏎" dirty sel=0"#
+            },
+        ),
+        // The P0 commands' keys (slice S5).
+        row(
+            "M-d kills a word",
+            vec![],
+            alt('d'),
+            r#"text="alpha ⏎gamma⏎" dirty sel=6"#,
+        ),
+        row(
+            "M-Backspace kills a word back",
+            vec![],
+            press(Key::Named(N::Backspace), Modifiers::ALT),
+            r#"text="beta⏎gamma⏎" dirty sel=0"#,
+        ),
+        row(
+            "C-Space M-f M-w copies",
+            vec![press(Key::Named(N::Space), Modifiers::CTRL), alt('f')],
+            alt('w'),
+            r#"sel=10 status="Mark set""#,
+        ),
+        row(
+            "C-o opens a line",
+            vec![],
+            ctrl('o'),
+            r#"text="alpha ⏎beta⏎" dirty sel=6"#,
+        ),
+        row(
+            "C-t transposes",
+            vec![],
+            ctrl('t'),
+            r#"text="alphab eta⏎gamma⏎" dirty sel=7"#,
+        ),
+        row(
+            "M-< is the buffer's start",
+            vec![],
+            press(Key::Character(','), Modifiers::ALT | shift),
+            r#"sel=0 status="Mark set""#,
+        ),
+        row(
+            "M-> is the buffer's end",
+            vec![],
+            press(Key::Character('.'), Modifiers::ALT | shift),
+            r#"sel=314 top=31 status="Mark set""#,
+        ),
+        row(
+            "C-? redoes",
+            vec![ch('x'), ctrl('/')],
+            press(Key::Character('/'), Modifiers::CTRL | shift),
+            r#"text="alpha xbeta⏎gamma⏎" dirty sel=7 status="No unsaved changes""#,
+        ),
+        row("M-3 C-f", vec![alt('3')], ctrl('f'), "sel=9"),
+        row(
+            "C-x h marks the buffer",
+            vec![ctrl('x')],
+            ch('h'),
+            r#"sel=314..0 mark status="Mark set""#,
+        ),
+        row(
+            "C-x C-x without a mark",
+            vec![ctrl('x')],
+            ctrl('x'),
+            r#"sel=6 status="No mark set in this buffer""#,
+        ),
+        row(
+            "C-x k asks which buffer",
+            vec![ctrl('x')],
+            ch('k'),
+            r#"sel=6 mb=kill-buffer:"""#,
+        ),
+        row(
+            "C-c C-c with no client waiting",
+            vec![ctrl('c')],
+            ctrl('c'),
+            r#"sel=6 status="nothing is waiting on this file; C-x C-s saves""#,
+        ),
+        row(
+            "C-c C-k with no client waiting",
+            vec![ctrl('c')],
+            ctrl('k'),
+            r#"sel=6 status="nothing is waiting on this file; C-x C-s saves""#,
         ),
         row(
             "M-Enter",
@@ -804,8 +932,12 @@ fn editor_keys_do_what_the_table_says() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let wid = WindowId(0);
+    let screen = {
+        let (app, _, _) = editor(&dir.join("screen.txt"));
+        screen(&app)
+    };
     let mut wrong = Vec::new();
-    for (index, row) in rows().into_iter().enumerate() {
+    for (index, row) in rows(screen).into_iter().enumerate() {
         let (mut app, view, document) = editor(&dir.join(format!("row-{index}.txt")));
         for key in &row.before {
             assert!(app.native_input_event(wid, key), "{}: before key", row.name);
@@ -833,8 +965,8 @@ fn editor_keys_do_what_the_table_says() {
 }
 
 /// Escape, then a minibuffer opened by a button rather than a key (Find, Go
-/// to Line, Commands): the minibuffer takes the next keys. The pending ESC
-/// ends as it opens; it once held every key but C-g.
+/// to Line, Commands): the minibuffer takes the next keys. (A pending ESC,
+/// when a GUI's Escape was Meta, once held every key but C-g.)
 #[test]
 fn escape_then_find_still_types() {
     let dir = std::env::temp_dir().join(format!("aterm-editor-esc-find-{}", std::process::id()));

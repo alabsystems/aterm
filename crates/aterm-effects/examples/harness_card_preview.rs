@@ -6,9 +6,8 @@
 //! §3, §10.6) for visual iteration and the owner's eye — pictures to look at,
 //! not checks.
 //!
-//! Each panel is the emitter's real quads composited with the renderer's own
-//! gradient law and blend functions (`aterm_render::glow_lerp_rgb`,
-//! `glow_lerp`, `add_sat`, `over_premul`) over stand-in text bars where the
+//! Each panel is the card's real fx layers painted by the renderers' own CPU
+//! path (`aterm_render::fx::paint_layers`) over stand-in text bars where the
 //! card's three rows sit, Claude's block mascot left of them (the measured
 //! 2.1.303 glyphs, drawn as the font draws block elements: whole cells and
 //! their quadrants), plus the line under the card one block per letter in
@@ -36,6 +35,11 @@
 //!   the tail flick (the episode's second of each) — and six rows: a black,
 //!   a grey and the launch kitty's orange coat, each two rows tall then
 //!   three.
+//! * `glints.png` (2×, at a retina cell): the rainbow's glints (§10.6.11)
+//!   on the longest trail, cropped to the trail and the kitty, the tall and
+//!   the two-row kitty on Aterm Night then Aterm Day across, and down them
+//!   the settled frame and a re-armed episode's shimmer pass, each glint
+//!   flaring as the sheen reaches it.
 //! * `ground_<theme>.png` (1×, drawn at a retina cell of [`HI_CW`] ×
 //!   [`HI_CH`] device pixels, as the glass draws it), one per built-in ground
 //!   the card is judged on — Aterm Night for reference, then every light
@@ -66,9 +70,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use aterm_core::render::{FxLayer, PxRect};
 use aterm_effects::cat_baker::ResolvedFills;
 use aterm_effects::harness_card::{
-    CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard, RIDE_MS, kitty_cols,
+    CardFrames, CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard, RIDE_MS, kitty_cols,
 };
 use aterm_time::Instant;
 use aterm_types::scheme::{Appearance, builtin};
@@ -256,6 +261,8 @@ fn main() -> ExitCode {
             zoom,
         ));
     }
+    let (gw, glints) = glint_sheet(&grounds);
+    pictures.push(("glints.png".to_string(), gw, GLINT_SCALE, glints));
     let (zw, zoom) = zoom_sheet(&grounds, &fonts);
     pictures.push(("grounds_zoom.png".to_string(), zw, ZOOM_SCALE, zoom));
     let inks_path = out.join("line_contrast.tsv");
@@ -395,6 +402,79 @@ fn rearm_sheet() -> Vec<u32> {
         draw_card(panel, scene, *at, true);
     }
     img
+}
+
+/// The glint sheet's moments, ms into an episode armed again on a card shown
+/// at rest: the trail's shimmer on its second pass (`harness_card`'s
+/// `SHIMMER_MS`), from before the trail's start to past the kitty, so each
+/// glint flares as the sheen reaches it and cools as it moves on.
+const GLINT_AT: [u64; 7] = [1500, 1700, 1900, 2100, 2300, 2500, 2700];
+
+/// The glint sheet's scale.
+const GLINT_SCALE: usize = 2;
+
+/// The rainbow's glints (§10.6.11) at a retina cell ([`HI_CW`] ×
+/// [`HI_CH`]) on the longest trail (20 cells, three glints), cropped to the
+/// trail and the kitty: four columns — the tall and the two-row kitty on
+/// Aterm Night, then on Aterm Day — and down them the settled frame, then
+/// the [`GLINT_AT`] moments of an episode armed again on a card shown at
+/// rest (the kitty seated, the shimmer sweeping): its width in pixels, and
+/// its pixels. The card's words are left out; the crop starts past them.
+fn glint_sheet(grounds: &[Ground]) -> (usize, Vec<u32>) {
+    let (pw, ph) = hi_panel();
+    let grounds: Vec<&Ground> = grounds
+        .iter()
+        .filter(|g| g.slug == "aterm_night" || g.slug == "aterm_day")
+        .collect();
+    let Some(first) = grounds.first() else {
+        return (0, Vec::new());
+    };
+    let probe = hi_scene(first, CardPalette::Cruise, true);
+    let (t0, _) = probe.trail.unwrap_or((1, 1));
+    let kitty = probe.kitty_col.map_or(0, usize::from);
+    let kc = usize::from(kitty_cols(HI_CW as u16, HI_CH as u16));
+    let x0 = HI_ORIGIN + (usize::from(t0) - 1) * HI_CW;
+    let x1 = HI_ORIGIN + (kitty + kc + 1) * HI_CW;
+    let (y0, y1) = (
+        HI_ORIGIN + HI_TOP * HI_CH - 4,
+        HI_ORIGIN + (HI_TOP + 3) * HI_CH + 4,
+    );
+    let (w, h) = (x1 - x0, y1 - y0);
+    let cols: Vec<(&Ground, bool)> = grounds
+        .iter()
+        .flat_map(|&g| [(g, true), (g, false)])
+        .collect();
+    let rows = 1 + GLINT_AT.len();
+    let gap = 4;
+    let sheet_w = cols.len() * (w + gap) - gap;
+    let mut img = vec![0x0080_8080; sheet_w * rows * (h + gap)];
+    let mut panel = vec![0u32; pw * ph];
+    for (c, &(g, tall)) in cols.iter().enumerate() {
+        let s = hi_scene(g, CardPalette::Cruise, tall);
+        for r in 0..rows {
+            panel.fill(g.bg);
+            let t0 = Instant::now();
+            let mut card = HarnessCard::default();
+            // Shown at rest, then armed again: the kitty seated throughout.
+            let mut frames = CardFrames::default();
+            card.draw(t0, &s, false, &mut frames);
+            card.arm(t0, 7);
+            let at = r.checked_sub(1).map_or(EPISODE_MS + 1, |k| GLINT_AT[k]);
+            let frame = card.draw(t0 + Duration::from_millis(at), &s, true, &mut frames);
+            for layer in frame.layers(1, PxRect::EVERYWHERE, (0, 0)) {
+                paint(&mut panel, pw, HI_CH, layer);
+            }
+            blit(
+                &panel,
+                pw,
+                (x0, y0, w, h),
+                &mut img,
+                sheet_w,
+                (c * (w + gap), r * (h + gap)),
+            );
+        }
+    }
+    (sheet_w, img)
 }
 
 /// The kitty sheet on a dark or a light ground ([`COATS`] × both heights
@@ -658,20 +738,21 @@ fn line_colours(card: &HarnessCard, now: Instant, len: usize, g: &Ground) -> Vec
 }
 
 /// One hi-fi panel: the ground, the card `at` ms into its first episode
-/// stacked as the renderers stack it — its `under` stream (the border, the
-/// trail, the rim), then the glyphs (Claude's mascot, the card's words in
+/// stacked as the renderers stack it — its `under` layer (the border and
+/// the trail), then the glyphs (Claude's mascot, the card's words in
 /// the theme's foreground, the banner's name bold and the rest dimmed as
 /// Claude Code dims them, and the line: the drawn `✦` and its letters in
-/// their inks), then its `over` stream (the kitty and its stars).
+/// their inks), then its `over` layer (the kitty, its rim and its stars).
 fn draw_hi(img: &mut [u32], w: usize, fonts: &Fonts, s: &CardScene, g: &Ground, at: u64) {
     img.fill(g.bg);
     let t0 = Instant::now();
     let mut card = HarnessCard::default();
     card.arm(t0, 7);
     let now = t0 + Duration::from_millis(at);
-    let (mut under, mut over) = (Vec::new(), Vec::new());
-    card.tick(now, s, true, &mut under, &mut over);
-    composite(img, w, under.iter());
+    let [under, over] =
+        card.draw(now, s, true, &mut CardFrames::default())
+            .layers(1, PxRect::EVERYWHERE, (0, 0));
+    paint(img, w, HI_CH, under);
     draw_mascot_on(img, w, (HI_CW, HI_CH), HI_ORIGIN, HI_TOP);
     let dim = mix_px(g.fg, g.bg, 0.45);
     let tall = s.kitty_rows >= 3;
@@ -721,38 +802,22 @@ fn draw_hi(img: &mut [u32], w: usize, fonts: &Fonts, s: &CardScene, g: &Ground, 
             };
         }
     }
-    composite(img, w, over.iter());
+    paint(img, w, HI_CH, over);
 }
 
-/// Composite `quads` onto a `w`-wide panel with the renderers' own gradient
-/// law and blends.
-fn composite<'q>(
-    img: &mut [u32],
-    w: usize,
-    quads: impl Iterator<Item = &'q aterm_render::GlowQuad>,
-) {
+/// Paint one of a card frame's layers onto a `w`-wide panel of `ch`-high
+/// cells by the renderers' own CPU path (`aterm_render::fx::paint_layers`).
+fn paint(img: &mut [u32], w: usize, ch: usize, layer: FxLayer) {
     let h = img.len() / w;
-    for q in quads {
-        for dy in 0..usize::from(q.h) {
-            for dx in 0..usize::from(q.w) {
-                let (x, y) = (usize::from(q.x) + dx, usize::from(q.y) + dy);
-                if x >= w || y >= h {
-                    continue;
-                }
-                let qw = u32::from(q.w);
-                let c = aterm_render::glow_lerp_rgb(q.color, q.color2, dx as u32, qw);
-                let a =
-                    aterm_render::glow_lerp(u32::from(q.alpha), u32::from(q.alpha2), dx as u32, qw)
-                        as u8;
-                let px = &mut img[y * w + x];
-                *px = if a == 0 {
-                    aterm_render::add_sat(*px, c)
-                } else {
-                    aterm_render::over_premul(*px, c, a)
-                };
-            }
-        }
-    }
+    let frame = aterm_render::FxFrame {
+        w,
+        h,
+        pad: 0,
+        grid_top: 0,
+        cell_h: ch,
+        rows: h / ch + 1,
+    };
+    aterm_render::fx::paint_layers(img, &frame, &[layer], &[]);
 }
 
 /// The hi-fi moments, top to bottom: `(palette, tall kitty, ms in)`.
@@ -931,7 +996,7 @@ fn line_report(grounds: &[Ground]) -> String {
             let mut at = 0;
             while at <= EPISODE_MS + FRAME_MS {
                 let now = t0 + Duration::from_millis(at);
-                card.tick(now, &s, true, &mut Vec::new(), &mut Vec::new());
+                card.draw(now, &s, true, &mut CardFrames::default());
                 for (i, ink) in line_colours(&card, now, letters.len(), g)
                     .into_iter()
                     .enumerate()
@@ -1001,33 +1066,15 @@ fn draw_card_on(img: &mut [u32], s: &CardScene, at: u64, shown: bool, (bg, fg): 
     let t0 = Instant::now();
     let mut card = HarnessCard::default();
     if shown {
-        card.tick(t0, s, false, &mut Vec::new(), &mut Vec::new());
+        card.draw(t0, s, false, &mut CardFrames::default());
     }
     card.arm(t0, 7);
     let now = t0 + Duration::from_millis(at);
-    let (mut under, mut over) = (Vec::new(), Vec::new());
-    card.tick(now, s, true, &mut under, &mut over);
-    for q in under.iter().chain(&over) {
-        for dy in 0..usize::from(q.h) {
-            for dx in 0..usize::from(q.w) {
-                let (x, y) = (usize::from(q.x) + dx, usize::from(q.y) + dy);
-                if x >= PANEL_W || y >= PANEL_H {
-                    continue;
-                }
-                // The renderers' own gradient law and blends.
-                let qw = u32::from(q.w);
-                let c = aterm_render::glow_lerp_rgb(q.color, q.color2, dx as u32, qw);
-                let a =
-                    aterm_render::glow_lerp(u32::from(q.alpha), u32::from(q.alpha2), dx as u32, qw)
-                        as u8;
-                let px = &mut img[y * PANEL_W + x];
-                *px = if a == 0 {
-                    aterm_render::add_sat(*px, c)
-                } else {
-                    aterm_render::over_premul(*px, c, a)
-                };
-            }
-        }
+    let layers =
+        card.draw(now, s, true, &mut CardFrames::default())
+            .layers(1, PxRect::EVERYWHERE, (0, 0));
+    for layer in layers {
+        paint(img, PANEL_W, CH, layer);
     }
     // The line, one block per letter in its ink.
     let line = TOP + 3;

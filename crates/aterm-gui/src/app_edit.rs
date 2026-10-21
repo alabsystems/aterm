@@ -1098,13 +1098,20 @@ mod tests {
     /// test's App mints: the process-wide hold map is keyed by session, and
     /// tests run in parallel.
     pub(super) fn caller(app: &mut App, wid: WindowId) -> u64 {
-        // Each caller reserves a block, so the sessions its App mints after it
-        // (a split's terminal) meet no other test's.
+        let sid = fresh_session(app);
+        app.push_stub_tab(wid, crate::stub_session(sid));
+        app.next_session_id = sid + 1;
+        sid
+    }
+
+    /// A session id no other test's App mints, made `app`'s next: each call
+    /// reserves a block, so the sessions its App mints after it (a split's
+    /// terminal) meet no other test's either. An edit on a session another
+    /// test feeds (`@1 feed-bin`) would refuse that test's typing.
+    pub(super) fn fresh_session(app: &mut App) -> u64 {
         static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
         let sid = NEXT.fetch_add(1 << 12, Ordering::Relaxed);
         app.next_session_id = sid;
-        app.push_stub_tab(wid, crate::stub_session(sid));
-        app.next_session_id = sid + 1;
         sid
     }
 
@@ -1114,6 +1121,7 @@ mod tests {
             line,
             create: false,
             for_word: None,
+            wait: true,
         }
     }
 
@@ -1353,7 +1361,7 @@ mod tests {
         let f = fixture("window", b"x\n");
         let mut app = app();
         let front = WindowId(0);
-        let sid = app.next_session_id;
+        let sid = fresh_session(&mut app);
         let other = app.insert_logical_window(crate::stub_session(sid), 24, 80);
         app.frontmost_window = Some(front);
         let front_tabs = tab_ids(&app, front);
@@ -1895,6 +1903,7 @@ mod tests {
     /// person saves and closes that view.
     #[test]
     fn edit_and_await_edit_answer_on_the_wire() {
+        use crate::control::control_media::{Hops, MainPost, take_hop};
         fn slice(left: Duration) -> Duration {
             left.min(Duration::from_millis(5))
         }
@@ -1907,17 +1916,22 @@ mod tests {
         let sid = caller(&mut app, wid);
         let caller_tab = active_tab(&app, wid);
 
+        // A count of hops of this test's own.
+        let hops: &'static Hops = Box::leak(Box::new(Hops::new()));
         let line = crate::control_edit::serve_edit(
             crate::control::Scope::Owner,
             Some(sid),
             &format!("{} line=3", f.uri),
-            &mut |wake| match wake {
-                crate::Wake::EditRequest(call) => {
-                    app.begin_edit(*call);
-                    true
-                }
-                other => panic!("unexpected {other:?}"),
-            },
+            &mut MainPost::injected(
+                |wake| match take_hop(wake) {
+                    crate::Wake::EditRequest(call) => {
+                        app.begin_edit(*call);
+                        true
+                    }
+                    other => panic!("unexpected {other:?}"),
+                },
+                hops,
+            ),
             &mut || false,
             HANG,
             slice,
@@ -1944,12 +1958,12 @@ mod tests {
             crate::control_edit::serve_await_edit(
                 crate::control::Scope::Owner,
                 &rest,
-                &mut |wake| wakes.send(wake).is_ok(),
+                &mut MainPost::injected(|wake| wakes.send(wake).is_ok(), hops),
                 &mut || false,
                 slice,
             )
         });
-        let deliver = |app: &mut App, wake| match wake {
+        let deliver = |app: &mut App, wake| match take_hop(wake) {
             crate::Wake::EditAwait(call) => app.await_edit(*call),
             crate::Wake::EditAwaitWithdraw { waiter } => app.withdraw_edit_waiter(waiter),
             other => panic!("unexpected {other:?}"),

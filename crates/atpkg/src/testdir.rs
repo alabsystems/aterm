@@ -129,3 +129,33 @@ impl Deref for ScratchLayout {
         &self.layout
     }
 }
+
+/// Run `case` on every item of `items` from up to eight threads, each taking the next
+/// item: cases that share no file, and whose time is the file system's latency (a
+/// durable write waits for its flush), overlap instead of queueing end to end. The
+/// first panic is raised again once every thread has ended.
+pub(crate) fn each_side_by_side<T: Sync>(items: &[T], case: impl Fn(usize, &T) + Sync) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..items.len().min(8))
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        case(i, item);
+                    }
+                })
+            })
+            .collect();
+        let mut first = None;
+        for worker in workers {
+            if let Err(panic) = worker.join() {
+                first.get_or_insert(panic);
+            }
+        }
+        if let Some(panic) = first {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}

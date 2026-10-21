@@ -5,10 +5,12 @@
 //! R11): claims hold at most a quarter of a ring, taken oldest first and
 //! never an observation or a fenced record; one author marks at most its
 //! burst plus one a second, and the trusted authors' buckets are their own.
+//! What an author was short of is its own to say (rulings T1, U18), past
+//! the owed-only table the shared pool's, said as the pool's.
 
 use aterm_slog::{
-    Actor, Conf, Fields, Key, Kind, Limits, Log, MARK_ACTORS, MARK_BURST, MARK_REFILL_MS, Mark,
-    MarkLimiter, Node, ShortId, Src, mark_quota,
+    Actor, Conf, Fields, Key, Kind, Limits, Log, MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS,
+    MARK_REFILL_MS, Mark, MarkLimiter, Node, Owed, ShortId, Src, mark_quota,
 };
 use aterm_spec::rng::XorShift;
 
@@ -197,21 +199,24 @@ fn a_flood_of_minted_edges_never_delays_a_trusted_author() {
     }
 }
 
-/// THE SHORT COUNT RIDES ITS OWN BUCKET (phase 5, ruling T1): session A
-/// was short of 79 marks and session B of none; B's next mark owes
-/// nothing, A's owes the 79, and A saying them leaves the rest alone. The
-/// overflow's authors (an unattributed author, `aterm`, a vendor) share
-/// its one count; a trusted actor's is its own. A named slot owing a count
-/// is not given away while an idle slot owing nothing is left, and is when
-/// none is: its count goes with it, unsaid. A session that would take a
-/// slot owes nothing and says nothing: not the overflow's count while a
-/// slot is free, nor the count of the idle slot it would take from A, which
-/// A keeps until the new session spends. NEGATIVE CONTROLS (by scratch
-/// revert): a slot given away whatever it owes goes first, A's count with
-/// it; and without `owed`'s and `said`'s guard for a slot not yet held, the
-/// new session reads, then clears, the overflow's count and A's.
-/// (aterm-gui's `an_edges_dropped_count_rides_only_its_own_mark` is the
-/// host's, against 5D-2's one count for every session.)
+/// THE SHORT COUNT IS ITS OWN AUTHOR'S (phase 5, ruling T1; Phase 6 step
+/// 6C-6, ruling U18): session A was short of 79 marks and session B of
+/// none; B's next mark owes nothing, A's owes the 79, and A saying them
+/// leaves the rest alone. The overflow's authors (an unattributed author,
+/// `aterm`, a vendor) each keep their own count, as a trusted actor does;
+/// one with none of its own reads the shared pool's, as the pool's. A
+/// named slot owing a count is not given away while an idle slot owing
+/// nothing is left, and is when none is: its count goes with its last
+/// holder, to that author's own entry, and the slot's new holder owes none
+/// of it. A session that would take a slot says no other author's count:
+/// not the pool's while a slot is free, nor the count of the idle slot it
+/// would take from A. A session whose entry holds a count brings it into
+/// the slot it takes. NEGATIVE CONTROLS (by scratch revert): the 5D-2/T1
+/// limiter (one count in the overflow for every author past the table)
+/// fails at the unattributed author's count, `aterm` reading it; a slot
+/// given away whatever it owes goes first, A's count with it.
+/// (aterm-gui's `an_edges_dropped_count_rides_only_its_own_mark` and
+/// `overflowed_edges_each_say_their_own_dropped_count` are the host's.)
 #[test]
 fn a_short_count_rides_only_its_own_bucket() {
     let mut lim = MarkLimiter::new(0);
@@ -224,24 +229,47 @@ fn a_short_count_rides_only_its_own_bucket() {
         assert!(lim.peek(&a, 0).is_err(), "A is short");
         lim.note_short(&a, 0);
     }
-    assert_eq!(lim.owed(&b, 0), 0, "B was short of nothing");
-    assert_eq!(lim.owed(&minted(3), 0), 0, "a session with no slot yet");
-    assert_eq!(lim.owed(&a, 0), 79);
+    assert_eq!(lim.owed(&b, 0), Owed::Own(0), "B was short of nothing");
+    assert_eq!(
+        lim.owed(&minted(3), 0),
+        Owed::Own(0),
+        "a session with no slot yet"
+    );
+    assert_eq!(lim.owed(&a, 0), Owed::Own(79));
     lim.said(&b, 0);
-    assert_eq!(lim.owed(&a, 0), 79, "B saying its own leaves A's");
+    assert_eq!(
+        lim.owed(&a, 0),
+        Owed::Own(79),
+        "B saying its own leaves A's"
+    );
     lim.said(&a, 0);
-    assert_eq!(lim.owed(&a, 0), 0, "said once");
-    // The overflow's authors share its count; the trusted keep their own.
+    assert_eq!(lim.owed(&a, 0), Owed::Own(0), "said once");
+    // The overflow's authors each keep their own; so do the trusted.
     for _ in 0..3 {
         lim.note_short(&Actor::Nobody, 0);
     }
-    assert_eq!(lim.owed(&Actor::Aterm, 0), 3, "the overflow is shared");
+    assert_eq!(
+        lim.owed(&Actor::Aterm, 0),
+        Owed::Shared(0),
+        "the unattributed author's count is its own, not aterm's"
+    );
+    assert_eq!(lim.owed(&Actor::Nobody, 0), Owed::Own(3));
     lim.said(&Actor::Vendor, 0);
-    assert_eq!(lim.owed(&Actor::Nobody, 0), 0, "one said it for all");
-    assert_eq!(lim.owed(&Actor::Harness, 0), 0);
+    assert_eq!(
+        lim.owed(&Actor::Nobody, 0),
+        Owed::Own(3),
+        "the vendor saying the pool leaves it"
+    );
+    lim.said(&Actor::Nobody, 0);
+    assert_eq!(lim.owed(&Actor::Nobody, 0), Owed::Shared(0), "said once");
+    assert_eq!(lim.owed(&Actor::Harness, 0), Owed::Own(0));
     lim.note_short(&Actor::Harness, 0);
-    assert_eq!(lim.owed(&Actor::Harness, 0), 1);
-    assert_eq!(lim.owed(&Actor::Ctl, 0), 0, "the harness's is its own");
+    assert_eq!(lim.owed(&Actor::Harness, 0), Owed::Own(1));
+    assert_eq!(
+        lim.owed(&Actor::Ctl, 0),
+        Owed::Own(0),
+        "the harness's is its own"
+    );
     // Slot reuse: A owes again; every slot is taken, then all fall idle.
     lim.note_short(&a, 0);
     for i in 4..MARK_ACTORS + 2 {
@@ -253,16 +281,19 @@ fn a_short_count_rides_only_its_own_bucket() {
     }
     assert_eq!(
         lim.owed(&a, idle),
-        1,
+        Owed::Own(1),
         "an idle slot owing nothing went first"
     );
     lim.spend(&minted(500), idle);
-    // A holds no slot now and none is free: it reads the overflow's count,
-    // nothing; its own 1 went with its slot.
     assert_eq!(
         lim.owed(&a, idle),
-        0,
-        "the last slot went, its count unsaid"
+        Owed::Own(1),
+        "the last slot went, its count with A"
+    );
+    assert_eq!(
+        lim.owed(&minted(500), idle),
+        Owed::Own(0),
+        "the slot's new holder owes none of A's count"
     );
 
     // A session that would take a slot says no other author's count.
@@ -272,9 +303,17 @@ fn a_short_count_rides_only_its_own_bucket() {
         lim.note_short(&Actor::Nobody, 0);
     }
     lim.spend(&a, 0);
-    assert_eq!(lim.owed(&fresh, 0), 0, "a free slot owes nothing");
+    assert_eq!(
+        lim.owed(&fresh, 0),
+        Owed::Own(0),
+        "a free slot owes nothing"
+    );
     lim.said(&fresh, 0);
-    assert_eq!(lim.owed(&Actor::Nobody, 0), 3, "the overflow's still owed");
+    assert_eq!(
+        lim.owed(&Actor::Nobody, 0),
+        Owed::Own(3),
+        "the unattributed author's still owed"
+    );
     // A's slot idle and owing 5; every other slot in debt.
     for _ in 0..MARK_BURST - 1 {
         lim.spend(&a, 0);
@@ -292,16 +331,157 @@ fn a_short_count_rides_only_its_own_bucket() {
     );
     assert_eq!(
         lim.owed(&fresh, idle),
-        0,
+        Owed::Own(0),
         "A's count is not the new session's"
     );
     lim.said(&fresh, idle);
-    assert_eq!(lim.owed(&a, idle), 5, "nor did the new session clear it");
-    lim.spend(&fresh, idle);
-    assert_eq!(lim.owed(&fresh, idle), 0, "the slot it took owes nothing");
     assert_eq!(
         lim.owed(&a, idle),
-        3,
-        "A's 5 went unsaid; A shares the overflow"
+        Owed::Own(5),
+        "nor did the new session clear it"
+    );
+    lim.spend(&fresh, idle);
+    assert_eq!(
+        lim.owed(&fresh, idle),
+        Owed::Own(0),
+        "the slot it took owes nothing"
+    );
+    assert_eq!(
+        lim.owed(&a, idle),
+        Owed::Own(5),
+        "A's 5 went with A, past the table"
+    );
+    // A takes a slot again (one falls idle): its count comes with it.
+    let later = idle * 2;
+    lim.spend(&a, later);
+    assert_eq!(lim.owed(&a, later), Owed::Own(5), "brought into its slot");
+    lim.said(&a, later);
+    assert_eq!(lim.owed(&a, later), Owed::Own(0), "said once");
+}
+
+/// PAST THE OWED-ONLY TABLE, THE POOL (Phase 6 step 6C-6, ruling U18):
+/// every named slot in debt and the overflow's tokens spent, each of
+/// [`MARK_OWED_AUTHORS`] + 1 sessions past the slots is short of a count of
+/// its own (the k-th of k + 1). The first, noted least recently, spills its
+/// count into the shared pool: it has none of its own now, and reads the
+/// pool's, as the pool's ([`Owed::Shared`]); every other reads its own. An
+/// entry noted again is the newest, so the next new author spills the next
+/// oldest, not it. An author saying its own leaves the pool; one with none
+/// says the pool's, and clears it for all. `aterm`, a vendor and the
+/// unattributed author keep theirs as a session does.
+/// NEGATIVE CONTROLS (by scratch revert): the 5D-2/T1 limiter's one shared
+/// count reads the sum for every author; an unbounded table keeps the
+/// first author's count its own.
+#[test]
+fn an_overflowed_authors_count_is_its_own_and_past_the_table_the_pools() {
+    let mut lim = MarkLimiter::new(0);
+    // Every named slot spent out: in debt, none free for a second at least.
+    for i in 0..MARK_ACTORS {
+        for _ in 0..MARK_BURST {
+            lim.spend(&minted(i), 0);
+        }
+    }
+    for _ in 0..MARK_BURST {
+        lim.spend(&minted(1000), 0);
+    }
+    let past: Vec<Actor> = (0..=MARK_OWED_AUTHORS).map(|i| minted(2000 + i)).collect();
+    for (k, by) in past.iter().enumerate() {
+        for _ in 0..=k {
+            assert!(lim.peek(by, 0).is_err(), "the overflow's tokens are spent");
+            lim.note_short(by, 0);
+        }
+    }
+    assert_eq!(
+        lim.owed(&past[0], 0),
+        Owed::Shared(1),
+        "the least recently noted spilled into the pool"
+    );
+    for (k, by) in past.iter().enumerate().skip(1) {
+        let own = u64::try_from(k + 1).expect("small");
+        assert_eq!(lim.owed(by, 0), Owed::Own(own), "author {k}");
+    }
+    // Noted again, an entry is the newest: the next new one spills past[2].
+    lim.note_short(&past[1], 0);
+    lim.note_short(&minted(3000), 0);
+    assert_eq!(lim.owed(&past[1], 0), Owed::Own(3));
+    assert_eq!(lim.owed(&past[2], 0), Owed::Shared(1 + 3));
+    assert_eq!(lim.owed(&minted(3000), 0), Owed::Own(1));
+    // Saying its own leaves the pool; saying the pool clears it for all.
+    lim.said(&past[1], 0);
+    assert_eq!(lim.owed(&past[1], 0), Owed::Shared(4), "its own was said");
+    lim.said(&past[0], 0);
+    assert_eq!(lim.owed(&past[2], 0), Owed::Shared(0), "the pool was said");
+    assert_eq!(lim.owed(&past[3], 0), Owed::Own(4), "its own stands");
+    // The server's, the vendor's and the unattributed author's are theirs.
+    for (n, by) in [Actor::Aterm, Actor::Vendor, Actor::Nobody]
+        .iter()
+        .enumerate()
+    {
+        for _ in 0..=n {
+            lim.note_short(by, 0);
+        }
+    }
+    for (n, by) in [Actor::Aterm, Actor::Vendor, Actor::Nobody]
+        .iter()
+        .enumerate()
+    {
+        let own = u64::try_from(n + 1).expect("small");
+        assert_eq!(lim.owed(by, 0), Owed::Own(own), "{by:?}");
+    }
+    // The tokens stay shared: none of the table's counts is a token.
+    assert!(lim.peek(&minted(4000), 0).is_err());
+    assert!(lim.peek(&minted(4000), MARK_REFILL_MS).is_ok());
+}
+
+/// A SESSION TAKING A SLOT FROM A FULL TABLE BRINGS ITS OWN COUNT (Phase 6
+/// step 6C-6, ruling U18): every named slot owes 1 and the owed-only table
+/// is full, each of its [`MARK_OWED_AUTHORS`] authors owing 1, the first
+/// noted least recently. When the slots fall idle and that first author
+/// takes one, its own entry leaves the table before the displaced holder's
+/// count enters it, so nothing spills: the new holder says its own 1 from
+/// the slot, the displaced holder its own 1 from the table, and the pool
+/// holds nothing. NEGATIVE CONTROL (by scratch revert of `MarkLimiter::slot`):
+/// the displaced holder owed first spills the new holder's count into the
+/// pool, and the new holder reads `Own(0)`.
+#[test]
+fn a_session_taking_a_slot_from_a_full_table_brings_its_own_count() {
+    let mut lim = MarkLimiter::new(0);
+    for i in 0..MARK_ACTORS {
+        for _ in 0..MARK_BURST {
+            lim.spend(&minted(i), 0);
+        }
+        lim.note_short(&minted(i), 0);
+    }
+    for _ in 0..MARK_BURST {
+        lim.spend(&minted(1000), 0);
+    }
+    let past: Vec<Actor> = (0..MARK_OWED_AUTHORS).map(|i| minted(2000 + i)).collect();
+    for by in &past {
+        assert!(lim.peek(by, 0).is_err(), "the overflow's tokens are spent");
+        lim.note_short(by, 0);
+    }
+    assert_eq!(lim.owed(&past[0], 0), Owed::Own(1), "the table is full");
+    assert_eq!(
+        lim.owed(&Actor::Aterm, 0),
+        Owed::Shared(0),
+        "nothing spilled"
+    );
+    // Every slot falls idle; the least recently noted author takes slot 0.
+    let later = MARK_REFILL_MS * u64::from(MARK_BURST) * 2;
+    lim.spend(&past[0], later);
+    assert_eq!(
+        lim.owed(&past[0], later),
+        Owed::Own(1),
+        "its own count came into the slot"
+    );
+    assert_eq!(
+        lim.owed(&minted(0), later),
+        Owed::Own(1),
+        "the displaced holder's went with it"
+    );
+    assert_eq!(
+        lim.owed(&Actor::Aterm, later),
+        Owed::Shared(0),
+        "and nothing spilled into the pool"
     );
 }

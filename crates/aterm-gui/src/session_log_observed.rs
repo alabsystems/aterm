@@ -568,7 +568,6 @@ impl SessionLog {
             }
             f
         };
-        let mail_in = matches!(fact, F::MailIn { .. });
         let (kind, by, f) = match fact {
             F::MailIn {
                 kind,
@@ -610,17 +609,15 @@ impl SessionLog {
                 (Kind::Hold, by, f)
             }
         };
-        let written = self.log.mark(
+        // A `mail dir=in` mark sets the fold's mail latch as it folds: the
+        // person's next input is marked (rulings T39, U19).
+        let _ = self.log.mark(
             Mark::new(kind, Src::Fabric, Conf::Exact)
                 .at(Node::SESSION)
                 .by(by)
                 .fields(f),
             at,
         );
-        // The person's next input is marked (ruling T39).
-        if mail_in && written.is_ok() {
-            self.note_mail_in();
-        }
     }
 
     /// `mark - meta field=<f> value=<v>` by its writer (`value=` absent for
@@ -755,20 +752,34 @@ impl SessionLog {
     /// pid, conversation and versions stay in the row. The turn the pass
     /// typed keeps its transport's `by=ctl`; this mark says the pass was the
     /// harness's. Counted in `brief`'s one `acts N` line, as every act is.
-    pub(crate) fn observe_relaunch_act(&mut self, rule: &str, at: Stamp) {
+    ///
+    /// Once the act is written, and only when the row's step brought a new
+    /// agent process up (`started`,
+    /// [`aterm_agent::harness::upgrade_drive::started`]: never a turn typed
+    /// into the running agent, a stop or a wait), the failure the restart
+    /// caused is lifted with `mark - seen by=harness` when it is the
+    /// session's only one, an agent ran under its run, and the relaunched
+    /// run is open ([`SessionLog::harness_saw_failure`], Phase 6 step 6C-1).
+    pub(crate) fn observe_relaunch_act(&mut self, rule: &str, started: bool, at: Stamp) {
         let Ok(f) = Fields::new()
             .word(Key::Word, aterm_agent::harness::acts::RELAUNCH_WORD)
             .and_then(|f| f.id(Key::Rule, rule))
         else {
             return;
         };
-        let _ = self.log.mark(
-            Mark::new(Kind::Act, Src::Aterm, Conf::Strong)
-                .at(Node::SESSION)
-                .by(aterm_slog::Actor::Harness)
-                .fields(f),
-            at,
-        );
+        let acted = self
+            .log
+            .mark(
+                Mark::new(Kind::Act, Src::Aterm, Conf::Strong)
+                    .at(Node::SESSION)
+                    .by(aterm_slog::Actor::Harness)
+                    .fields(f),
+                at,
+            )
+            .is_ok();
+        if acted && started {
+            self.harness_saw_failure(at);
+        }
     }
 
     /// `mark - in-doubt verb=<w>`: a keyed write whose outcome nobody knows

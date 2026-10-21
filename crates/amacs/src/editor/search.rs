@@ -34,9 +34,10 @@ impl EditorWorkspace {
         let found = if query.is_empty() {
             Some(origin..origin)
         } else {
-            snapshot.text[start..]
-                .find(&query)
-                .map(|offset| start + offset..start + offset + query.len())
+            snapshot.text[start..].find(&query).map(|offset| {
+                let at = start.saturating_add(offset);
+                at..at.saturating_add(query.len())
+            })
         };
         view.mark_active = false;
         if let Some(range) = found {

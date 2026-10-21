@@ -45,7 +45,7 @@
 //! minus the host), and `libc 0.2.186` in the registry cache: every build is
 //! `--offline`, so a run without it exits 3 naming the one fetch to make
 //! (`targo fetch --manifest-path <work>/reference/Cargo.toml`). The scratch
-//! `<work>` is `libc-oracle/target/regen` unless `--work` names another.
+//! `<work>` is `libc-oracle/target.noindex/regen` unless `--work` names another.
 //! To document a cell on the box native to it instead, run `targo --unverified
 //! rustdoc -q -p libc --manifest-path <work>/reference/Cargo.toml --
 //! -Zunstable-options --output-format json` there and pass the resulting

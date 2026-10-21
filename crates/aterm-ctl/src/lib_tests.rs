@@ -298,7 +298,7 @@ fn the_exchange_backstop_refuses_an_older_servers_bare_cast() {
     let _ = std::fs::remove_dir(&dir);
 }
 
-/// `search`'s header is `OK <n> incomplete[ capped][ rewrapping][ long-line][ older]`
+/// `search`'s header is `OK <n> incomplete[ capped][ rewrapping][ long-line][ moving][ older]`
 /// when the list is not exhaustive; the count parser reads only the first
 /// token, so the matches are kept, and stderr names every cause.
 #[test]
@@ -307,16 +307,32 @@ fn stream_count_ignores_incomplete_marker() {
     assert_eq!(stream_count("3 incomplete"), Some(3));
     assert_eq!(stream_count("100000 incomplete capped"), Some(100_000));
     let note = search_incomplete_note;
-    // `changed` and a cause this client does not know are each said in their
-    // own words; `screen_first=` is a coordinate, not a cause.
-    let depth = note("3 incomplete").expect("the depth cause");
-    let changed = note("3 incomplete changed screen_first=21").expect("changed");
-    let unknown = note("3 incomplete future-cause screen_first=21").expect("unknown");
-    assert!(
-        changed != depth && unknown != depth && changed != unknown,
-        "{changed} / {unknown} / {depth}"
+    let depth = "older history not searched (search_history_lines)";
+    let limit = "results stop at 100000 matches";
+    let long_line = "a long line was not searched to its end";
+    assert_eq!(note("3 incomplete").as_deref(), Some(depth));
+    assert_eq!(note("100000 incomplete capped").as_deref(), Some(limit));
+    assert_eq!(
+        note("0 incomplete rewrapping").as_deref(),
+        Some("screen only: the history is rewrapping")
     );
-    assert_eq!(note("3 incomplete screen_first=21"), Some(depth));
+    assert_eq!(note("7 incomplete long-line").as_deref(), Some(long_line));
+    // A moved frame alone is not the depth cap.
+    assert_eq!(
+        note("1 incomplete moving screen_first=21").as_deref(),
+        Some("the screen's rows moved during the search; search again")
+    );
+    assert_eq!(note("100000 incomplete").as_deref(), Some(limit));
+    // A server whose search compared its whole snapshot names `changed`.
+    assert_eq!(
+        note("2 incomplete changed").as_deref(),
+        Some("the terminal changed while the search ran")
+    );
+    // A cause this client does not know is said in its own words;
+    // `screen_first=` is a coordinate, not a cause.
+    let unknown = note("3 incomplete future-cause screen_first=21").expect("unknown");
+    assert!(unknown != depth, "{unknown}");
+    assert_eq!(note("3 incomplete screen_first=21").as_deref(), Some(depth));
     assert_eq!(note("3 screen_first=21"), None);
     // Every cause the server names is said, not only the first.
     let both = note("1 incomplete long-line older").expect("two causes");
@@ -1008,6 +1024,436 @@ fn self_location_refuses_a_sid_that_is_not_server_shaped() {
     }
 }
 
+/// A stand-in instance on `listener`: it records each connection's first line,
+/// an empty one for a connection closed with nothing sent (what a probe is),
+/// and answers a line `OK`, until a `stop` line ([`stop_recording`]).
+#[cfg(unix)]
+fn recording_instance(listener: aterm_uds::CtlListener) -> std::thread::JoinHandle<Vec<String>> {
+    std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        loop {
+            let Ok((conn, _)) = listener.accept() else {
+                return lines;
+            };
+            let mut line = String::new();
+            let _ = BufReader::new(&conn).read_line(&mut line);
+            if line == "stop\n" {
+                return lines;
+            }
+            if !line.is_empty() {
+                let _ = (&conn).write_all(b"OK\n");
+            }
+            lines.push(line);
+        }
+    })
+}
+
+/// End the [`recording_instance`] at `sock` and take what it recorded; its
+/// listener is dropped, leaving the socket file nothing accepts on.
+#[cfg(unix)]
+fn stop_recording(sock: &Path, instance: std::thread::JoinHandle<Vec<String>>) -> Vec<String> {
+    let conn = CtlStream::connect(sock).expect("connect to stop");
+    (&conn).write_all(b"stop\n").expect("stop");
+    instance.join().expect("instance thread")
+}
+
+/// Publish `sid`'s graph entry in `dir` naming `sock`, as an instance does for
+/// each session it hosts.
+#[cfg(unix)]
+fn publish_entry(dir: &Path, sid: &str, sock: &Path) {
+    std::fs::write(
+        dir.join("graph").join(sid),
+        format!("sock {}\n", sock.display()),
+    )
+    .expect("graph entry");
+}
+
+/// A request naming `@<sid>` is dialled at the instance hosting that session,
+/// on the one connection that carries it: the host records the line and no
+/// probe, and neither the caller's own instance nor the `latest` alias's sees a
+/// connection. A stale entry, a socket nothing accepts on (ECONNREFUSED) or no
+/// socket file (ENOENT), is no failure: the request goes to the caller's own
+/// instance, again with no probe, or outside a session to the flagless target,
+/// which answers or relays. Negative control: `--pid` pins the alias's
+/// instance, so it takes the line and the host nothing.
+#[cfg(unix)]
+#[test]
+fn a_peer_selector_dials_its_host() {
+    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let dir = scratch.path().to_path_buf();
+    std::fs::create_dir(dir.join("graph")).expect("graph dir");
+    let host = dir.join(control_socket::instance_sock_name(4001));
+    let own = dir.join(control_socket::instance_sock_name(4002));
+    let other = dir.join(control_socket::instance_sock_name(4003));
+    let alias = dir.join(control_socket::LATEST_SOCK_FILE);
+    let (peer, me) = ("s-c8a1", "s-c8b2");
+    publish_entry(&dir, peer, &host);
+    publish_entry(&dir, me, &own);
+    aterm_uds::latest::publish(&alias, other.to_str().expect("utf8"));
+    let named = aterm_types::control_request::Sid::parse(peer);
+    let hosted = recording_instance(aterm_uds::CtlListener::bind(&host).expect("bind host"));
+    let mine = recording_instance(aterm_uds::CtlListener::bind(&own).expect("bind own"));
+    let aliased = recording_instance(aterm_uds::CtlListener::bind(&other).expect("bind other"));
+    let ask = |targets: &Targets, leg: &str| {
+        let line = format!("@{peer} focus {leg}\n");
+        let code = targets
+            .run(|t| {
+                exchange(
+                    &t.path,
+                    t.origin,
+                    &line,
+                    "focus",
+                    Some(HANG_DETECTOR),
+                    false,
+                    &redial::Redial::new(t.follow),
+                )
+            })
+            .expect("answered");
+        assert_eq!(code, ExitCode::SUCCESS, "{leg}");
+    };
+    let in_session = |pid: Option<u32>| {
+        targets_in(Some(dir.clone()), None, pid, Some(me.to_string()), named).expect("targets")
+    };
+
+    ask(&in_session(None), "live");
+    ask(&in_session(Some(4003)), "pinned");
+    assert_eq!(
+        stop_recording(&host, hosted),
+        [format!("@{peer} focus live\n")],
+        "the host took the request on its one connection"
+    );
+    // The host crashed: its socket file is left and refuses, the entry stale.
+    std::fs::remove_file(&host).expect("remove the host's socket");
+    abandon_socket(&host);
+    ask(&in_session(None), "refused");
+    std::fs::remove_file(&host).expect("remove the host's socket");
+    ask(&in_session(None), "missing");
+    ask(
+        &targets_in(Some(dir.clone()), None, None, None, named).expect("targets"),
+        "flagless",
+    );
+    assert_eq!(
+        stop_recording(&own, mine),
+        [
+            format!("@{peer} focus refused\n"),
+            format!("@{peer} focus missing\n")
+        ],
+        "a stale entry falls over to the caller's own instance, unprobed"
+    );
+    // The flagless rule's own look at the alias (`flagless_target`) is no part
+    // of this; only the lines it was sent are.
+    let aliased: Vec<String> = stop_recording(&other, aliased)
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        aliased,
+        [
+            format!("@{peer} focus pinned\n"),
+            format!("@{peer} focus flagless\n")
+        ]
+    );
+}
+
+/// A host that took the request is the call's answer whatever comes of it, so
+/// the request never reaches a second instance: a host that hangs up before
+/// replying fails the call, and so does one that answers `cast drift` with the
+/// bare cast (it predates the verb) and is gone when the client-side reads
+/// connect (a self-update removed its socket). The caller's own instance, the
+/// next target, is sent nothing; a run that moved past either outcome would
+/// hand it the request.
+#[cfg(unix)]
+#[test]
+fn a_host_that_took_the_request_ends_the_call() {
+    const CAST: &str = "{\"version\": 2, \"width\": 20, \"height\": 8}\n";
+    fn unreached(_: &CastDriftJob<'_>) -> Result<String, String> {
+        Err("no read reached the analyzer".to_string())
+    }
+    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let dir = scratch.path().to_path_buf();
+    std::fs::create_dir(dir.join("graph")).expect("graph dir");
+    let host = dir.join(control_socket::instance_sock_name(4011));
+    let own = dir.join(control_socket::instance_sock_name(4012));
+    let (peer, me) = ("s-c8d1", "s-c8d2");
+    publish_entry(&dir, peer, &host);
+    publish_entry(&dir, me, &own);
+    let listener = aterm_uds::CtlListener::bind(&host).expect("bind host");
+    let gone = host.clone();
+    let hosted = std::thread::spawn(move || {
+        let take = || {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            BufReader::new(&conn).read_line(&mut line).expect("request");
+            (conn, line)
+        };
+        let (conn, focus) = take();
+        drop(conn);
+        // Its socket is removed before the answer goes out, so every read
+        // after the probe finds nothing there.
+        let (conn, drift) = take();
+        std::fs::remove_file(&gone).expect("remove the host's socket");
+        (&conn)
+            .write_all(format!("OK {}\n{CAST}", CAST.len()).as_bytes())
+            .expect("the bare cast");
+        [focus, drift]
+    });
+    let mine = recording_instance(aterm_uds::CtlListener::bind(&own).expect("bind own"));
+    let targets = targets_in(
+        Some(dir.clone()),
+        None,
+        None,
+        Some(me.to_string()),
+        aterm_types::control_request::Sid::parse(peer),
+    )
+    .expect("targets");
+
+    let focus = format!("@{peer} focus\n");
+    let hung_up = targets
+        .run(|t| {
+            exchange(
+                &t.path,
+                t.origin,
+                &focus,
+                "focus",
+                Some(HANG_DETECTOR),
+                false,
+                &redial::Redial::new(t.follow),
+            )
+        })
+        .expect_err("the host hung up");
+    assert_eq!(
+        hung_up.to_string(),
+        "server closed the connection without responding"
+    );
+
+    let selector = format!("@{peer}");
+    let local = LocalVerbs {
+        cast_drift: Some(unreached),
+        ..LocalVerbs::NONE
+    };
+    let reads = targets
+        .run(|t| {
+            drift::live(
+                &t.path,
+                t.origin,
+                Some(&selector),
+                &[],
+                Some(HANG_DETECTOR),
+                &local,
+            )
+        })
+        .expect_err("the host went away under the reads");
+    assert!(!is_no_host(&reads), "{reads}");
+    assert_eq!(reads.kind(), io::ErrorKind::NotFound, "{reads}");
+    let words = format!("connect {}: ", host.display());
+    assert!(reads.to_string().starts_with(&words), "{reads}");
+
+    assert_eq!(
+        hosted.join().expect("host thread"),
+        [focus.clone(), format!("{selector} cast drift\n")]
+    );
+    assert_eq!(
+        stop_recording(&own, mine),
+        Vec::<String>::new(),
+        "the caller's own instance was sent nothing"
+    );
+}
+
+/// On a graph entry's socket only nothing listening (`ENOENT`,
+/// `ECONNREFUSED`) is [`NoHost`], in the connect's words and kind with no
+/// remedy. Any other connect error, a permission refusal among them, is the
+/// call's, in the words it has on any socket.
+#[test]
+fn only_nothing_listening_on_a_graph_entry_is_no_host() {
+    let path = "/tmp/aterm-test/aterm-4021.sock";
+    let denied = io::Error::new(io::ErrorKind::PermissionDenied, "Permission denied");
+    let e = connect_error(path, &denied, TargetOrigin::Hosting);
+    assert!(!is_no_host(&e), "{e}");
+    assert_eq!(e.to_string(), format!("connect {path}: {denied}"));
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    for (kind, oserr) in [
+        (
+            io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ),
+        (
+            io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 61)",
+        ),
+    ] {
+        let e = connect_error(path, &io::Error::new(kind, oserr), TargetOrigin::Hosting);
+        assert!(is_no_host(&e), "{e}");
+        assert_eq!(e.to_string(), format!("connect {path}: {oserr}"));
+        assert_eq!(e.kind(), kind);
+    }
+}
+
+/// The named session's host is dialled only where the relay would forward:
+/// an absolute socket path whose parent is the rendezvous dir, no symlink
+/// there. Anywhere else the session is left to the flagless target (the relay
+/// answers it `ERR no such session`). Negative control: the same live listener
+/// moved into the dir is the host.
+#[cfg(unix)]
+#[test]
+fn hosting_sock_holds_an_entry_to_the_rendezvous_dir() {
+    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let (dir, away) = (scratch.path().join("rv"), scratch.path().join("away"));
+    for d in [&dir.join("graph"), &dir.join("sub"), &away] {
+        std::fs::create_dir_all(d).expect("scratch dirs");
+    }
+    let sid = aterm_types::control_request::Sid::parse("s-c8c3").expect("sid");
+    let host = |entry: &str| {
+        std::fs::write(dir.join("graph").join(sid.as_str()), entry).expect("entry");
+        hosting_sock(&dir, sid)
+    };
+    let inside = dir.join("aterm-4004.sock");
+    let _listener = aterm_uds::CtlListener::bind(&inside).expect("bind");
+    let inside_s = inside.to_str().expect("utf8").to_string();
+    assert_eq!(host(&format!("sock {inside_s}\n")), Some(inside_s.clone()));
+    let elsewhere = away.join("aterm-4004.sock");
+    let _away = aterm_uds::CtlListener::bind(&elsewhere).expect("bind away");
+    assert_eq!(host(&format!("sock {}\n", elsewhere.display())), None);
+    assert_eq!(host("sock aterm-4004.sock\n"), None, "relative");
+    let nested = dir.join("sub").join("aterm-4004.sock");
+    assert_eq!(host(&format!("sock {}\n", nested.display())), None);
+    let link = dir.join("aterm-4005.sock");
+    std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+    assert_eq!(
+        host(&format!("sock {}\n", link.display())),
+        None,
+        "a symlink"
+    );
+    assert_eq!(host("nonce ab\n"), None, "no sock line");
+    std::fs::remove_file(dir.join("graph").join(sid.as_str())).expect("remove entry");
+    assert_eq!(hosting_sock(&dir, sid), None, "no entry");
+    // Out of reach, the request is the flagless target's: no hosting target.
+    std::fs::write(
+        dir.join("graph").join(sid.as_str()),
+        format!("sock {}\n", elsewhere.display()),
+    )
+    .expect("entry");
+    let targets = targets_in(Some(dir.clone()), None, None, None, Some(sid)).expect("targets");
+    assert!(targets.hosting.is_empty(), "{targets:?}");
+}
+
+/// Each target is followed where its own successor answers: a session's host
+/// to that session's graph entry (the request's peer for the peer's host, the
+/// caller's own for its own), `--sock` to its path, `--pid` to nothing but its
+/// own process, and the flagless rule to the caller's entry or, outside a
+/// session, the alias. A session named twice is dialled once. Flags conflict
+/// and need a rendezvous dir as before.
+#[cfg(unix)]
+#[test]
+fn a_target_is_followed_to_where_its_successor_answers() {
+    use redial::{Follow, Unfollowed};
+    let at = PathBuf::from("/r");
+    let me = Some("s-ab".to_string());
+    let only = |targets: Targets| {
+        assert!(targets.hosting.is_empty(), "{targets:?}");
+        let last = targets.last_target();
+        (last.path, last.origin, last.follow)
+    };
+    let pid = only(targets_in(Some(at.clone()), None, Some(42), me.clone(), None).unwrap());
+    assert_eq!(
+        pid,
+        (
+            "/r/aterm-42.sock".to_string(),
+            TargetOrigin::Pinned,
+            Follow::Nothing(Unfollowed::PidPin(42))
+        )
+    );
+    let sock = only(targets_in(None, Some("/x.sock".into()), None, me.clone(), None).unwrap());
+    assert_eq!(
+        sock,
+        (
+            "/x.sock".to_string(),
+            TargetOrigin::Pinned,
+            Follow::Path("/x.sock".to_string())
+        )
+    );
+    let both = targets_in(
+        Some(at.clone()),
+        Some("/x.sock".into()),
+        Some(42),
+        None,
+        None,
+    );
+    assert_eq!(both.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    let no_dir = targets_in(None, None, None, me.clone(), None);
+    assert_eq!(no_dir.unwrap_err().kind(), io::ErrorKind::NotFound);
+    let (path, origin, follow) =
+        only(targets_in(Some(at.clone()), None, None, me.clone(), None).unwrap());
+    assert_eq!(
+        (path.as_str(), origin),
+        ("/r/aterm.sock", TargetOrigin::Flagless)
+    );
+    assert_eq!(
+        follow,
+        Follow::Flagless {
+            dir: at.clone(),
+            sid: me.clone()
+        }
+    );
+    let outside = only(targets_in(Some(at.clone()), None, None, None, None).unwrap()).2;
+    assert_eq!(
+        outside,
+        Follow::Flagless {
+            dir: at.clone(),
+            sid: None
+        },
+        "outside a session the flagless rule follows the alias"
+    );
+
+    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let dir = scratch.path().to_path_buf();
+    std::fs::create_dir(dir.join("graph")).expect("graph dir");
+    let (peer, own) = (dir.join("aterm-4006.sock"), dir.join("aterm-4007.sock"));
+    publish_entry(&dir, "s-cd", &peer);
+    publish_entry(&dir, "s-ab", &own);
+    let hosted = |named: &str| {
+        let named = aterm_types::control_request::Sid::parse(named);
+        targets_in(Some(dir.clone()), None, None, me.clone(), named)
+            .unwrap()
+            .hosting
+            .into_iter()
+            .map(|t| (t.path, t.origin, t.follow))
+            .collect::<Vec<_>>()
+    };
+    let entry = |sock: &Path, sid: &str| {
+        (
+            sock.to_str().expect("utf8").to_string(),
+            TargetOrigin::Hosting,
+            Follow::Flagless {
+                dir: dir.clone(),
+                sid: Some(sid.to_string()),
+            },
+        )
+    };
+    assert_eq!(
+        hosted("s-cd"),
+        [entry(&peer, "s-cd"), entry(&own, "s-ab")],
+        "the peer's host, then the caller's own"
+    );
+    assert_eq!(
+        hosted("s-ab"),
+        [entry(&own, "s-ab")],
+        "named twice, dialled once"
+    );
+    // A caller that keeps one path probes: nothing listens, so the flagless
+    // target; once its own instance listens, that one.
+    let targets = targets_in(Some(dir.clone()), None, None, me.clone(), None).unwrap();
+    assert_eq!(targets.probed().1, TargetOrigin::Flagless);
+    assert_ne!(targets.probed().0, own.to_str().expect("utf8"));
+    let _listener = aterm_uds::CtlListener::bind(&own).expect("bind own");
+    assert_eq!(
+        targets.probed(),
+        (
+            own.to_str().expect("utf8").to_string(),
+            TargetOrigin::Flagless
+        )
+    );
+}
+
 /// `read_bounded_line`'s success path is byte-identical to
 /// `BufRead::read_line` (headers, CRLF body rows, blank rows, clean EOF and
 /// std's invalid-UTF-8 error). A cut row is an incomplete framed reply.
@@ -1065,6 +1511,19 @@ fn read_bounded_line_caps_newlineless_floods() {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(out.is_empty(), "must not leak a partial line");
     }
+}
+
+/// A server that hangs up inside a counted reply's last row (no newline yet) cut the
+/// reply: it is the same early end as a missing row, never a complete answer.
+#[test]
+fn a_row_cut_before_its_newline_is_an_early_end() {
+    let mut cut = io::Cursor::new(b"first\nsec");
+    let error = collect_reply_lines(2, usize::MAX, |line| read_bounded_line(&mut cut, line))
+        .expect_err("the second row has no newline");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    let error = read_guarded_payload(&mut io::Cursor::new(b"/tmp/a.png\n/tmp/b"), 2, 1 << 20)
+        .expect_err("the guarded reply's last row is cut");
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 }
 
 /// Short, individually valid rows still consume one shared body allowance.
@@ -1233,6 +1692,80 @@ fn a_server_that_stalls_is_a_named_wait_not_eagain() {
     );
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_dir(&dir);
+}
+
+/// A `turn` whose verdict arrived was typed (`submitted=1` here), so a server
+/// that then hangs up inside its screen rows, in the last row or before it,
+/// ends it with 75 and what to do instead, as a `turn` cut before its reply
+/// does: never 1, the code a caller retries, which would type the turn twice.
+/// NEGATIVE CONTROL: a `text` cut the same way keeps its error (exit 1), since
+/// it typed nothing. Unix only: the stand-in instance is a `UnixListener`.
+#[cfg(unix)]
+#[test]
+fn a_turn_cut_after_its_verdict_exits_75_never_1() {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+
+    // A private dir holding only the socket, so no token is read and the
+    // request line is the first line the mock sees.
+    let scratch = aterm_tempfile::tempdir().expect("private dir");
+    let sock = scratch.path().join("turn.sock");
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    let verdict =
+        "OK 2 turn submitted=1 status=settled seq=3 id=1 dur_ms=5 hash=0000000000000000\n";
+    let replies = [
+        format!("{verdict}row one\nrow t"),
+        format!("{verdict}row one\n"),
+        "OK 2\nrow one\nrow t".to_owned(),
+    ];
+    // Answer each request with its cut reply, then hang up.
+    let srv = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for reply in replies {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut first = String::new();
+            std::io::BufReader::new(&conn)
+                .read_line(&mut first)
+                .expect("request line");
+            (&conn).write_all(reply.as_bytes()).expect("the cut reply");
+            seen.push(first);
+        }
+        seen
+    });
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let ask = |request: &str, verb: &str| {
+        exchange(
+            &path,
+            TargetOrigin::Pinned,
+            request,
+            verb,
+            Some(HANG_DETECTOR),
+            false,
+            &redial::Redial::none(),
+        )
+    };
+    for cut in ["inside its last row", "before its last row"] {
+        assert_eq!(
+            ask("turn hi\n", "turn").expect("a reported outcome"),
+            ExitCode::from(redial::EXIT_REPLACED),
+            "a turn cut {cut} after its verdict"
+        );
+    }
+    let text = ask("text\n", "text").expect_err("a cut read is an error");
+    assert_eq!(text.kind(), io::ErrorKind::UnexpectedEof, "{text}");
+    assert_eq!(exit_for(&text), ExitCode::FAILURE);
+    assert_eq!(
+        srv.join().expect("server"),
+        ["turn hi\n", "turn hi\n", "text\n"]
+    );
+    // The line it ends with keeps the verdict's fact and says what to do.
+    let parts: Vec<String> = ["turn", "hi"].map(String::from).to_vec();
+    let line = turn_rows_cut_line(&text, &parts);
+    assert!(
+        line.contains(&redial::not_asked_again_note(&parts)),
+        "{line}"
+    );
+    assert!(line.ends_with(" (exit 75)"), "{line}");
 }
 
 /// A server-reported timeout maps to 124: a bare `OK timeout` and a `turn`
@@ -1777,7 +2310,7 @@ fn help_is_answered_client_side_only_for_what_the_client_knows() {
         "autopilot=<off|cruise|land|->",
         "path_evidence=",
         "upgrade=<-|<state>/<to>/<why>/<age>>",
-        "land_at=<unix-s|-> task=<open|landed|done|spent|theirs|->",
+        "land_at=<unix-s|-> task=<open|landed|theirs|->",
         "pause=<unix-s|-> task_state=<working|done|exited|stalled|->",
         "task_rev=<n>[ *]",
     ];
@@ -2686,12 +3219,12 @@ fn the_front_door_probe_dials_through_the_latest_alias() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A front-door forward that times out after the request was written is
-/// `front_door_delivered` (the running aterm may still open the tab, so
-/// the launcher must not open a second window), as is an unreadable
-/// reply; a connect failure or a hang-up with no reply is not. The
-/// request follows the connect phase's `AUTH` and probe, and a refusal of
-/// the connect phase is the reply, with nothing sent after it.
+/// A front-door forward with no readable reply after the request was written
+/// is `front_door_delivered` (the running aterm may still open the tab, so
+/// the launcher must not open a second window), including an EOF. A connect
+/// failure or a hang-up before the probe answered is not. The request follows
+/// the connect phase's `AUTH` and probe, and a refusal of the connect phase is
+/// the reply, with nothing sent after it.
 #[cfg(unix)]
 #[test]
 fn a_front_door_failure_after_the_send_is_delivered() {
@@ -2733,11 +3266,29 @@ fn a_front_door_failure_after_the_send_is_delivered() {
     };
     let served = ["AUTH deadbeef\n", "version\n", "spawn\n"];
 
-    // Read the request, hang up without a reply.
+    // Close in the connect phase, before answering the probe: the request
+    // never follows it, so local fallback remains safe.
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    let srv = std::thread::spawn(move || {
+        let (conn, _) = listener.accept().expect("accept");
+        let mut reader = std::io::BufReader::new(conn);
+        let mut heard = String::new();
+        for _ in 0..2 {
+            reader.read_line(&mut heard).expect("auth and probe");
+        }
+        heard
+    });
+    let not_taken = send(HANG_DETECTOR).expect_err("probe was not answered");
+    assert_eq!(srv.join().expect("mock server"), "AUTH deadbeef\nversion\n");
+    assert!(!front_door_delivered(&not_taken), "{not_taken}");
+
+    // Read the complete request, then hang up without a reply: an admitted
+    // action could already have happened, so local fallback is unsafe.
     let srv = instance(b"", false);
     let hung_up = send(HANG_DETECTOR).expect_err("no reply");
     assert_eq!(srv.join().expect("mock server"), served);
-    assert!(!front_door_delivered(&hung_up), "{hung_up}");
+    assert!(front_door_delivered(&hung_up), "{hung_up}");
 
     // Read the request, answer nothing: it was taken, so it is delivered.
     let srv = instance(b"", true);

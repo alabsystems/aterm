@@ -160,7 +160,7 @@ pub(crate) fn set_semantic_ready_wake(wake: impl Fn() + Send + Sync + 'static) {
 
 impl SemanticPrewarmWorker {
     fn spawn() -> Option<Self> {
-        Self::spawn_serialized_by(&SEMANTIC_PREWARM_GATE)
+        Self::spawn_serialized_by(&SEMANTIC_PREWARM_GATE, crate::qos::Role::Background)
     }
 
     /// `gate` is the serialization mutex for heavyweight warmups — the
@@ -169,102 +169,106 @@ impl SemanticPrewarmWorker {
     /// bounded landing waits never queue behind another test's warmup (nor
     /// stall anyone else's): the worker protocol under test is identical, the
     /// serialization domain is per-test.
-    fn spawn_serialized_by(gate: &'static Mutex<()>) -> Option<Self> {
+    ///
+    /// `role` is the worker's class: [`crate::qos::Role::Background`] in
+    /// production, where nothing waits on a warmup. Those tests wait on it and
+    /// pass [`crate::qos::Role::Responsive`]: the job asks a few CPU-ms, and at
+    /// UTILITY a loaded machine left it unscheduled for seconds (2026-10-20,
+    /// load 245-280, alone: the three tests 1.3-12 s each, 0.1-0.4 s at
+    /// Responsive; in the test binary the replacement test was the last to
+    /// finish in five runs of six, 1.9-16 s, its CPU 0.06 s).
+    fn spawn_serialized_by(gate: &'static Mutex<()>, role: crate::qos::Role) -> Option<Self> {
         let queue = Arc::new(SemanticPrewarmQueue {
             semantic_job: Mutex::new(None),
             ready: Condvar::new(),
         });
         let worker_queue = Arc::clone(&queue);
         let (tx, results) = std::sync::mpsc::channel();
-        crate::qos::spawn_lane_thread(
-            "aterm-semantic-font-prewarm",
-            crate::qos::Role::Background,
-            move || {
-                // QoS (port of 61a6c8b62): cosmetic — it warms a PRIVATE renderer
-                // clone. The process-global font interns it publishes into parse
-                // OUTSIDE their locks (`intern_parsed_font_keyed`), the job queue
-                // mutex is dropped before any work, and `SEMANTIC_PREWARM_GATE`
-                // serialises only prewarm workers; the UI thread contends none of
-                // them for longer than a scan, so demotion is safe here.
-                let mut base: Option<(u64, Renderer)> = None;
-                let mut faces = CandidateFaceCache::new();
-                loop {
-                    let mut slot = worker_queue
-                        .semantic_job
-                        .lock()
+        crate::qos::spawn_lane_thread("aterm-semantic-font-prewarm", role, move || {
+            // QoS (port of 61a6c8b62): cosmetic — it warms a PRIVATE renderer
+            // clone. The process-global font interns it publishes into parse
+            // OUTSIDE their locks (`intern_parsed_font_keyed`), the job queue
+            // mutex is dropped before any work, and `SEMANTIC_PREWARM_GATE`
+            // serialises only prewarm workers; the UI thread contends none of
+            // them for longer than a scan, so demotion is safe here.
+            let mut base: Option<(u64, Renderer)> = None;
+            let mut faces = CandidateFaceCache::new();
+            loop {
+                let mut slot = worker_queue
+                    .semantic_job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while slot.is_none() {
+                    slot = worker_queue
+                        .ready
+                        .wait(slot)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    while slot.is_none() {
-                        slot = worker_queue
-                            .ready
-                            .wait(slot)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    }
-                    let Some(job) = slot.take() else {
-                        continue;
-                    };
-                    drop(slot);
-
-                    let _serial = gate
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // A newer reload may have arrived while this job waited behind a
-                    // prior parse. Drop it before the heavyweight fallback discovery;
-                    // the one-slot queue already contains the latest replacement.
-                    if worker_queue
-                        .semantic_job
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_ref()
-                        .is_some_and(|newer| newer.generation != job.generation)
-                    {
-                        continue;
-                    }
-                    let started = std::time::Instant::now();
-                    if let Some(mut renderer) = job.base {
-                        renderer.prepare_semantic_typography(
-                            "Input→present λ π √ ✓ 你好世界 日本語 한글 🚀 😀 🐈‍⬛ e\u{301}",
-                        );
-                        base = Some((job.generation, renderer));
-                        // A renderer generation owns its configured cascade.
-                        // Paths may still resolve to the same interned bytes,
-                        // but a new base must never inherit an old candidate's
-                        // success/failure verdict accidentally.
-                        faces.clear();
-                    }
-                    let (renderer, resolution) = base
-                        .as_ref()
-                        .filter(|(generation, _)| *generation == job.generation)
-                        .map_or_else(
-                            || {
-                                (
-                                    None,
-                                    SemanticFontResolution::Fallback(vec![
-                                        "committed renderer unavailable".to_string(),
-                                    ]),
-                                )
-                            },
-                            |(_, base)| build_semantic_candidate(base, &job.candidate, &mut faces),
-                        );
-                    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                    if tx
-                        .send(SemanticPrewarmResult {
-                            generation: job.generation,
-                            request: job.request,
-                            candidate: job.candidate,
-                            renderer,
-                            resolution,
-                            elapsed_ms,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                    if let Some(wake) = SEMANTIC_READY_WAKE.get() {
-                        wake();
-                    }
                 }
-            },
-        )
+                let Some(job) = slot.take() else {
+                    continue;
+                };
+                drop(slot);
+
+                let _serial = gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A newer reload may have arrived while this job waited behind a
+                // prior parse. Drop it before the heavyweight fallback discovery;
+                // the one-slot queue already contains the latest replacement.
+                if worker_queue
+                    .semantic_job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|newer| newer.generation != job.generation)
+                {
+                    continue;
+                }
+                let started = std::time::Instant::now();
+                if let Some(mut renderer) = job.base {
+                    renderer.prepare_semantic_typography(
+                        "Input→present λ π √ ✓ 你好世界 日本語 한글 🚀 😀 🐈‍⬛ e\u{301}",
+                    );
+                    base = Some((job.generation, renderer));
+                    // A renderer generation owns its configured cascade.
+                    // Paths may still resolve to the same interned bytes,
+                    // but a new base must never inherit an old candidate's
+                    // success/failure verdict accidentally.
+                    faces.clear();
+                }
+                let (renderer, resolution) = base
+                    .as_ref()
+                    .filter(|(generation, _)| *generation == job.generation)
+                    .map_or_else(
+                        || {
+                            (
+                                None,
+                                SemanticFontResolution::Fallback(vec![
+                                    "committed renderer unavailable".to_string(),
+                                ]),
+                            )
+                        },
+                        |(_, base)| build_semantic_candidate(base, &job.candidate, &mut faces),
+                    );
+                let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                if tx
+                    .send(SemanticPrewarmResult {
+                        generation: job.generation,
+                        request: job.request,
+                        candidate: job.candidate,
+                        renderer,
+                        resolution,
+                        elapsed_ms,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                if let Some(wake) = SEMANTIC_READY_WAKE.get() {
+                    wake();
+                }
+            }
+        })
         .ok()?;
         Some(Self { queue, results })
     }
@@ -432,6 +436,49 @@ use aterm_render::chrome_metrics::{baseline_in_row_q, px_to_q, q_round_to_px, q_
 
 use crate::widget::{DrawPrim, SpecimenTextBlending, TerminalSpecimenSpec, TextFace, TextWeight};
 
+/// How the chrome turns a char into a glyph of a [`ChromeFont`]: through the
+/// face's UNICODE cmap subtables ([`ChromeFont::unicode_glyph_index`]), as the
+/// terminal grid draws its primary face, never through `lookup_glyph_index`.
+/// That map is fontdue's enumeration, where a Macintosh subtable listed after
+/// the Unicode one wins: Monaco's last is Mac Central European, so every Mono
+/// run drew `·` as `∑` and `×` as `◊`, and nearly all of Latin-1 wrong. Every
+/// char the chrome asks a face about (coverage, advance, kern, raster) is
+/// asked through these — here and in the strip band's variable-semibold tab
+/// label pen ([`crate::tab_bar`]), which resolves its glyph ids and kern pairs
+/// through the same answer — so what is measured is what is drawn.
+pub(crate) trait UnicodeChars {
+    /// Whether the face maps `ch` to a real (non-`.notdef`) glyph.
+    fn maps(&self, ch: char) -> bool;
+    /// The layout metrics of the glyph `ch` maps to, at `px`.
+    fn char_metrics(&self, ch: char, px: f32) -> ChromeMetrics;
+    /// The metrics and coverage mask of the glyph `ch` maps to, at `px`.
+    fn char_raster(&self, ch: char, px: f32) -> (ChromeMetrics, Vec<u8>);
+    /// The `kern` adjustment between the glyphs `left` and `right` map to.
+    fn char_kern(&self, left: char, right: char, px: f32) -> Option<f32>;
+}
+
+impl UnicodeChars for ChromeFont {
+    fn maps(&self, ch: char) -> bool {
+        self.unicode_glyph_index(ch) != 0
+    }
+
+    fn char_metrics(&self, ch: char, px: f32) -> ChromeMetrics {
+        self.metrics_indexed(self.unicode_glyph_index(ch), px)
+    }
+
+    fn char_raster(&self, ch: char, px: f32) -> (ChromeMetrics, Vec<u8>) {
+        self.rasterize_indexed(self.unicode_glyph_index(ch), px)
+    }
+
+    fn char_kern(&self, left: char, right: char, px: f32) -> Option<f32> {
+        self.horizontal_kern_indexed(
+            self.unicode_glyph_index(left),
+            self.unicode_glyph_index(right),
+            px,
+        )
+    }
+}
+
 /// One loaded chrome face: the parsed fontdue font plus its cap-height ratio
 /// (OS/2 `sCapHeight`, measured-'H' fallback) and a per-char em-advance memo
 /// for [`measure_text`].
@@ -479,7 +526,7 @@ impl ChromeFace {
 
     /// Whether this face has a real (non-`.notdef`) glyph for `ch`.
     fn has(&self, ch: char) -> bool {
-        self.font.lookup_glyph_index(ch) != 0
+        self.font.maps(ch)
     }
 
     /// The advance of `ch` per em (memoized; multiply by the run's px).
@@ -487,7 +534,7 @@ impl ChromeFace {
         if let Some(&a) = self.advances.get(&ch) {
             return a;
         }
-        let a = self.font.metrics(ch, ADVANCE_REF_PX).advance_width / ADVANCE_REF_PX;
+        let a = self.font.char_metrics(ch, ADVANCE_REF_PX).advance_width / ADVANCE_REF_PX;
         self.advances.insert(ch, a);
         a
     }
@@ -859,7 +906,7 @@ impl UiCjkFaces {
                 {
                     let (font, fresh) = face.materialise();
                     landed += usize::from(fresh);
-                    if font.is_some_and(|font| font.lookup_glyph_index(ch) != 0) {
+                    if font.is_some_and(|font| font.maps(ch)) {
                         continue 'chars;
                     }
                 }
@@ -885,7 +932,7 @@ impl UiCjkFaces {
         {
             match face.font.get() {
                 None => return None,
-                Some(Some(font)) if font.lookup_glyph_index(ch) != 0 => return Some(true),
+                Some(Some(font)) if font.maps(ch) => return Some(true),
                 Some(_) => {}
             }
         }
@@ -1277,6 +1324,22 @@ pub(crate) fn font_store_visits() -> u64 {
     FONT_STORE_VISITS.with(std::cell::Cell::get)
 }
 
+// TEST-ONLY WORK CENSUS: the linear-light source-over composites this thread
+// has run (`Canvas::composite_at`'s general arm, three EOTF lookups and three
+// OETF quantizations each), the raster's per-pixel cost in a unit a loaded
+// machine cannot stretch. Read through `linear_composites`.
+#[cfg(test)]
+thread_local! {
+    static LINEAR_COMPOSITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The linear-light composites this thread has run so far (test-only; see
+/// `LINEAR_COMPOSITES`): a raster's blend work is the difference across it.
+#[cfg(test)]
+pub(crate) fn linear_composites() -> u64 {
+    LINEAR_COMPOSITES.with(std::cell::Cell::get)
+}
+
 /// Unit tests construct independent `App`s in parallel. Each app may install a
 /// different resolved terminal face, while layout assertions measure and paint
 /// in separate calls. Production has one process-global renderer context, but a
@@ -1649,8 +1712,7 @@ pub(crate) fn cjk_chain_face_path_for_test() -> Option<&'static str> {
 /// Install a SETTLED semantic chrome font whose chain holds the host's CJK
 /// face, already parsed — the state the store reaches once the terminal has
 /// drawn an ideograph — plus the host UI faces. `false` means the host has no
-/// such face; the caller has nothing to assert and skips, as `with_ui_faces()`
-/// does.
+/// such face; the caller has nothing to assert and ends COULD NOT RUN.
 #[cfg(test)]
 pub(crate) fn install_chrome_fonts_with_cjk_chain_for_test() -> bool {
     let Some(path) = cjk_chain_face_path_for_test() else {
@@ -1679,8 +1741,7 @@ pub(crate) fn install_chrome_fonts_with_cjk_chain_for_test() -> bool {
 /// window's own order (configure, seal, fork the seed) with the cell shared
 /// between the sealed generation and the seed — plus the host UI faces.
 /// Answers the sealed generation, which keeps the cells alive beside the seed;
-/// `None` when the host has no such face (the caller skips, as
-/// `with_ui_faces()` does).
+/// `None` when the host has no such face (the caller ends COULD NOT RUN).
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn install_unparsed_cjk_chain_for_test() -> Option<Renderer> {
     let path = cjk_chain_face_path_for_test()?;
@@ -2022,9 +2083,7 @@ impl ChromeFonts {
                 .as_ref()
                 .is_some_and(|store| store.settled(weight, ch).is_none());
             let drawn = ch == ' '
-                || ui
-                    .as_deref()
-                    .is_some_and(|font| font.lookup_glyph_index(ch) != 0)
+                || ui.as_deref().is_some_and(|font| font.maps(ch))
                 || (!unsettled && self.ui_miss_face(face, TextWeight::Regular, ch).is_some())
                 || (!unsettled && synthesized::covers(ch));
             if !drawn && !misses.contains(&ch) {
@@ -2489,9 +2548,10 @@ pub(crate) struct UiVariableSemibold {
     /// semibold (600), clamped onto the face's own axis; every other axis
     /// (`opsz`) stays at its default, the Text optical size.
     pub(crate) coords: Vec<(u32, f32)>,
-    /// The SAME regular face parsed from `bytes`: its cmap resolves glyph ids
-    /// for the varied raster (identical glyph numbering — one file), and its
-    /// `kern` pairs are the static kerning a weight instance shares.
+    /// The SAME regular face parsed from `bytes`: its Unicode cmap answer
+    /// ([`UnicodeChars`]) resolves glyph ids for the varied raster (identical
+    /// glyph numbering — one file), and its `kern` pairs are the static
+    /// kerning a weight instance shares.
     pub(crate) cmap: Arc<ChromeFont>,
 }
 
@@ -3217,8 +3277,8 @@ fn ui_text_wrap_walk(
         }
         let (advance, ui_covers) = match font.as_ref() {
             None => (px * 0.6, false),
-            Some(f) if f.lookup_glyph_index(character) != 0 => (
-                f.metrics(character, px).advance_width + UI_TRACKING_EM * px,
+            Some(f) if f.maps(character) => (
+                f.char_metrics(character, px).advance_width + UI_TRACKING_EM * px,
                 true,
             ),
             Some(_) => (
@@ -3226,7 +3286,7 @@ fn ui_text_wrap_walk(
                     .ui_miss_face(TextFace::Ui, TextWeight::Regular, character)
                     .map_or_else(
                         || synthesized::advance(character, px).unwrap_or(px * 0.6),
-                        |cface| cface.font.metrics(character, px).advance_width,
+                        |cface| cface.font.char_metrics(character, px).advance_width,
                     ),
                 false,
             ),
@@ -3256,7 +3316,7 @@ fn ui_text_wrap_walk(
         for character in piece.chars() {
             let (advance, ui_covers) = charged(character);
             if ui_covers && let (Some(font), Some(previous)) = (font, previous) {
-                width += font.horizontal_kern(previous, character, px).unwrap_or(0.0);
+                width += font.char_kern(previous, character, px).unwrap_or(0.0);
             }
             width += advance;
             // A fallback char is drawn by another face: no kern out of it.
@@ -3451,10 +3511,10 @@ impl UiPen {
         px: f32,
         fits: &impl Fn(f32, f32) -> bool,
     ) -> bool {
-        if f.lookup_glyph_index(ch) != 0 {
-            let advance = f.metrics(ch, px).advance_width + UI_TRACKING_EM * px;
+        if f.maps(ch) {
+            let advance = f.char_metrics(ch, px).advance_width + UI_TRACKING_EM * px;
             let kept = if let Some((p, before)) = self.prev {
-                let kern = f.horizontal_kern(p, ch, px).unwrap_or(0.0);
+                let kern = f.char_kern(p, ch, px).unwrap_or(0.0);
                 self.w += kern;
                 fits(advance, kern) && fits(before, kern)
             } else {
@@ -3470,7 +3530,7 @@ impl UiPen {
             .ui_miss_face(face, TextWeight::Regular, ch)
             .map_or_else(
                 || synthesized::advance(ch, px).unwrap_or(px * 0.6),
-                |cface| cface.font.metrics(ch, px).advance_width,
+                |cface| cface.font.char_metrics(ch, px).advance_width,
             );
         self.w += advance;
         fits(advance, 0.0)
@@ -3608,6 +3668,35 @@ fn linear_to_srgb_u8(l: f32) -> u8 {
 type GlyphCacheKey = (usize, u32, char);
 type GlyphCacheEntry = (ChromeMetrics, std::sync::Arc<[u8]>);
 
+/// The last few composites of one rounded box, so of one colour
+/// ([`Canvas::blend_rim`], [`Canvas::blend_span`]): `(pixel under, coverage
+/// bits)` to the pixel it became, replaced oldest first. Eight hold a side's
+/// antialiasing ramp and the interior's first pixel from row to row.
+#[derive(Default)]
+struct RimMemo {
+    entries: [Option<RimComposite>; 8],
+    next: usize,
+}
+
+/// One [`RimMemo`] entry: `(pixel under, coverage bits)` and the pixel it
+/// became.
+type RimComposite = ((u32, u32), [u8; 4]);
+
+impl RimMemo {
+    fn get(&self, key: (u32, u32)) -> Option<[u8; 4]> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|(held, _)| *held == key)
+            .map(|(_, became)| *became)
+    }
+
+    fn put(&mut self, key: (u32, u32), became: [u8; 4]) {
+        self.entries[self.next] = Some((key, became));
+        self.next = (self.next + 1) % self.entries.len();
+    }
+}
+
 struct Canvas {
     /// Device-pixel origin of this retained tile in the full tray. Raster math
     /// stays in full-surface coordinates so a regional pass makes the exact
@@ -3708,7 +3797,7 @@ impl Canvas {
         if let Some((metrics, bitmap)) = self.glyphs.get(&key) {
             return (*metrics, std::sync::Arc::clone(bitmap));
         }
-        let (metrics, bitmap) = font.rasterize(character, px);
+        let (metrics, bitmap) = font.char_raster(character, px);
         let bitmap: std::sync::Arc<[u8]> = bitmap.into();
         self.glyphs
             .insert(key, (metrics, std::sync::Arc::clone(&bitmap)));
@@ -3736,12 +3825,7 @@ impl Canvas {
 
     /// Intersect device-px rect `(x, y, w, h)` with the current clip and push it.
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        let mut r = (
-            x.floor() as i32,
-            y.floor() as i32,
-            (x + w).ceil() as i32,
-            (y + h).ceil() as i32,
-        );
+        let mut r = device_clip_rect(x, y, w, h);
         if let Some(&(cx0, cy0, cx1, cy1)) = self.clip.last() {
             r.0 = r.0.max(cx0);
             r.1 = r.1.max(cy0);
@@ -3804,6 +3888,123 @@ impl Canvas {
             return;
         }
         let i = ((local_y as u32 * self.w + local_x as u32) * 4) as usize;
+        self.composite_at(i, c, cov, a);
+    }
+
+    /// [`Self::blend`] at one coverage across `x0..x1` of row `y` (a rounded
+    /// box's interior, or the straight run of its top or bottom rim), byte for
+    /// byte what blending each pixel of it gives: the span is cut to the canvas
+    /// and the clip stack as each pixel would be.
+    ///
+    /// Typing into Settings search re-rastered the whole page on every key,
+    /// and three quarters of that raster was this interior: every card, row and
+    /// field is a panel, translucent over the panel under it, and each of its
+    /// pixels paid a linear-light source-over (three EOTF lookups and three
+    /// OETF quantizations) for the same answer as its neighbour. The fade is a
+    /// function of the row and the result one of the pixel under it alone, so
+    /// a run of equal pixels under the panel (a flat fill — the common case)
+    /// costs one composite and copies, and an opaque full-strength panel is a
+    /// plain fill.
+    fn blend_span(&mut self, x0: i32, x1: i32, y: i32, c: [u8; 4], cov: f32, memo: &mut RimMemo) {
+        let (canvas_x0, canvas_y0, canvas_x1, canvas_y1) = self.device_bounds();
+        let (mut x0, mut x1) = (x0.max(canvas_x0), x1.min(canvas_x1));
+        if y < canvas_y0 || y >= canvas_y1 {
+            return;
+        }
+        if let Some(&(clip_x0, clip_y0, clip_x1, clip_y1)) = self.clip.last() {
+            if y < clip_y0 || y >= clip_y1 {
+                return;
+            }
+            (x0, x1) = (x0.max(clip_x0), x1.min(clip_x1));
+        }
+        if x0 >= x1 {
+            return;
+        }
+        let local_y = y - self.origin_y;
+        let (local_x0, local_x1) = (x0 - self.origin_x, x1 - self.origin_x);
+        let cov = cov.clamp(0.0, 1.0) * self.fade_at(y);
+        let a = (f32::from(c[3]) / 255.0) * cov;
+        if a <= 0.0 {
+            return;
+        }
+        let row = (local_y as u32 * self.w) as usize;
+        let start = (row + local_x0 as usize) * 4;
+        let end = (row + local_x1 as usize) * 4;
+        if c[3] == u8::MAX && cov >= 1.0 {
+            let (pixels, _) = self.px[start..end].as_chunks_mut::<4>();
+            pixels.fill(c);
+            return;
+        }
+        let mut last: Option<(u32, [u8; 4])> = None;
+        for i in (start..end).step_by(4) {
+            let under = self.pixel_word(i);
+            if let Some((was, became)) = last
+                && was == under
+            {
+                self.px[i..i + 4].copy_from_slice(&became);
+                continue;
+            }
+            let key = (under, cov.to_bits());
+            if let Some(became) = memo.get(key) {
+                self.px[i..i + 4].copy_from_slice(&became);
+            } else {
+                self.composite_at(i, c, cov, a);
+                memo.put(
+                    key,
+                    [self.px[i], self.px[i + 1], self.px[i + 2], self.px[i + 3]],
+                );
+            }
+            last = Some((
+                under,
+                [self.px[i], self.px[i + 1], self.px[i + 2], self.px[i + 3]],
+            ));
+        }
+    }
+
+    /// [`Self::blend`] for one pixel of a rounded box's antialiased rim, where
+    /// `memo` holds the box's recent rim results: a pixel whose coverage and
+    /// whose pixel under it repeat one of them takes that one's result. A
+    /// box's side repeats the same few coverages over the same ground on every
+    /// row, so after its first row its sides composite nothing; byte for byte
+    /// [`Self::blend`] all the same.
+    fn blend_rim(&mut self, x: i32, y: i32, c: [u8; 4], cov: f32, memo: &mut RimMemo) {
+        let local_x = x.saturating_sub(self.origin_x);
+        let local_y = y.saturating_sub(self.origin_y);
+        if local_x < 0 || local_y < 0 || local_x as u32 >= self.w || local_y as u32 >= self.h {
+            return;
+        }
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clip.last()
+            && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
+        {
+            return;
+        }
+        let cov = cov.clamp(0.0, 1.0) * self.fade_at(y);
+        let a = (f32::from(c[3]) / 255.0) * cov;
+        if a <= 0.0 {
+            return;
+        }
+        let i = ((local_y as u32 * self.w + local_x as u32) * 4) as usize;
+        let key = (self.pixel_word(i), cov.to_bits());
+        if let Some(became) = memo.get(key) {
+            self.px[i..i + 4].copy_from_slice(&became);
+            return;
+        }
+        self.composite_at(i, c, cov, a);
+        memo.put(
+            key,
+            [self.px[i], self.px[i + 1], self.px[i + 2], self.px[i + 3]],
+        );
+    }
+
+    /// The pixel at byte `i` as one word, for comparing pixels whole.
+    fn pixel_word(&self, i: usize) -> u32 {
+        u32::from_ne_bytes([self.px[i], self.px[i + 1], self.px[i + 2], self.px[i + 3]])
+    }
+
+    /// Source-over of `c` at coverage `cov` (`a` its effective alpha, above
+    /// zero) onto the pixel at byte `i`: [`Self::blend`]'s arithmetic once the
+    /// pixel is known to be on the canvas and inside the clip.
+    fn composite_at(&mut self, i: usize, c: [u8; 4], cov: f32, a: f32) {
         // A fully covered opaque source replaces the destination exactly. The
         // general linear-light source-over equation reduces to this copy, so do
         // not pay three lookup/searches for the large opaque surfaces used by
@@ -3816,11 +4017,13 @@ impl Canvas {
         // Equal straight-alpha colours remain that colour under source-over;
         // only alpha changes. This is the common full-coverage shadow case
         // (black over transparent/black) and avoids needless colour transfer.
-        if cov >= 1.0 && self.px[i..i + 3] == c[..3] {
+        if cov >= 1.0 && self.px[i] == c[0] && self.px[i + 1] == c[1] && self.px[i + 2] == c[2] {
             let out_a = a + da * (1.0 - a);
             self.px[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
             return;
         }
+        #[cfg(test)]
+        LINEAR_COMPOSITES.with(|n| n.set(n.get() + 1));
         // STRAIGHT-alpha src-over: out_a = a + da·(1−a); the RGB mix is done in
         // LINEAR LIGHT — out_lin = (s_lin·a + d_lin·da·(1−a))/out_a — then re-encoded
         // to sRGB. This both fixes the premultiplied-over-sub-opaque-backdrop darkening
@@ -4079,6 +4282,39 @@ fn specimen_renderer_key(spec: &TerminalSpecimenSpec, scale: f32) -> u64 {
 /// `spec`, forking only when no held fork matches the renderer key and fork
 /// source, then play the cursor scene (if any) onto the snapshot at the fork's
 /// own cell metrics.
+/// The finished frame of a terminal specimen at `scale`: the retained one
+/// where the same computation ran before, else rendered (and retained for a
+/// still sample).
+///
+/// This is by far the most expensive prim in the tray: the fork is a full
+/// `fontdue` re-parse of the primary face (and a second one for its real bold
+/// sibling) inside `fork_semantic_surface`, and `render_input` then renders a
+/// whole mini terminal frame from cold glyph/layout caches. A still preview
+/// re-rasterizes with every one of those inputs unchanged, so the finished
+/// frame is memoized; a moving one keeps its configured fork, so only
+/// `render_input` runs per frame.
+///
+/// A hit is the same computation replayed: the key is total over what
+/// reaches the renderer, the fork source is matched by POINTER identity
+/// rather than by value, and the frame itself does not depend on where it
+/// is placed.
+fn specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<Rc<aterm_render::Frame>> {
+    let key = terminal_specimen_frame_key(spec, scale);
+    let source = spec.prepared_font.renderer.as_ref();
+    if let Some(frame) = cached_specimen_frame(key, source) {
+        return Some(frame);
+    }
+    let frame = Rc::new(render_specimen_frame(spec, scale)?);
+    // A typing scene never repeats a frame soon enough to pay for a slot,
+    // and holding one would evict the still cards sharing the page.
+    if let Some(source) = source
+        && spec.motion.as_ref().is_none_or(|scene| !scene.is_moving())
+    {
+        retain_specimen_frame(key, source, &frame);
+    }
+    Some(frame)
+}
+
 fn render_specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<aterm_render::Frame> {
     type HeldFork = (u64, std::rc::Weak<Renderer>, Renderer);
     thread_local! {
@@ -4213,6 +4449,18 @@ fn retain_specimen_frame(key: u64, source: &Rc<Renderer>, frame: &Rc<aterm_rende
     });
 }
 
+/// One specimen frame as [`Canvas::terminal_specimen`] renders it, bypassing
+/// the frame memo: the shipping renderer's own output for `spec` at `scale`
+/// (on this thread's configured fork), the cursor scene played on that
+/// renderer's cells, for tests that compare the tray blit against it.
+#[cfg(test)]
+pub(crate) fn render_specimen_frame_for_test(
+    spec: &TerminalSpecimenSpec,
+    scale: f32,
+) -> Option<aterm_render::Frame> {
+    render_specimen_frame(spec, scale)
+}
+
 impl Canvas {
     fn round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, c: [u8; 4]) {
         let (cx, cy, hx, hy) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
@@ -4234,6 +4482,7 @@ impl Canvas {
         let inner_r = (r - inset).max(0.0).min(inner_w / 2.0).min(inner_h / 2.0);
         let inner_x = x + inset;
         let inner_y = y + inset;
+        let mut rim = RimMemo::default();
         for py in y0..y1 {
             let py_center = py as f32 + 0.5;
             let full_span = if inner_w > 0.0
@@ -4266,18 +4515,48 @@ impl Canvas {
             };
 
             let (left_end, right_start) = full_span.unwrap_or((x1, x1));
-            for px in x0..left_end {
-                let d = sd_round_box(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hx, hy, r);
-                self.blend(px, py, c, cov(d));
-            }
+            self.round_rect_rim(x0, left_end, py, (cx, cy, hx, hy, r), c, &mut rim);
             if let Some((start, end)) = full_span {
-                for px in start..end {
-                    self.blend(px, py, c, 1.0);
-                }
+                self.blend_span(start, end, py, c, 1.0, &mut rim);
             }
-            for px in right_start..x1 {
-                let d = sd_round_box(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hx, hy, r);
-                self.blend(px, py, c, cov(d));
+            self.round_rect_rim(right_start, x1, py, (cx, cy, hx, hy, r), c, &mut rim);
+        }
+    }
+
+    /// The antialiased rim of a rounded box (`(cx, cy, hx, hy, r)`, as
+    /// [`sd_round_box`] takes it) across `x0..x1` of row `py`. Between the
+    /// box's corners, wherever a pixel is no nearer a side than the row is to
+    /// the top or bottom (`qx <= min(qy, 0)`: the top and bottom rims, and the
+    /// whole width of a hairline too thin for an interior), the distance does
+    /// not read `x`: that run is one coverage, blended as a span. The corners
+    /// and the sides take the distance pixel by pixel. Byte for byte the
+    /// per-pixel rim.
+    fn round_rect_rim(
+        &mut self,
+        x0: i32,
+        x1: i32,
+        py: i32,
+        (cx, cy, hx, hy, r): (f32, f32, f32, f32, f32),
+        c: [u8; 4],
+        rim: &mut RimMemo,
+    ) {
+        let pyc = py as f32 + 0.5;
+        let qy = (pyc - cy).abs() - (hy - r);
+        let straight = |px: i32| ((px as f32 + 0.5) - cx).abs() - (hx - r) <= qy.min(0.0);
+        let mut px = x0;
+        while px < x1 {
+            if straight(px) {
+                let mut end = px + 1;
+                while end < x1 && straight(end) {
+                    end += 1;
+                }
+                let d = sd_round_box(px as f32 + 0.5, pyc, cx, cy, hx, hy, r);
+                self.blend_span(px, end, py, c, cov(d), rim);
+                px = end;
+            } else {
+                let d = sd_round_box(px as f32 + 0.5, pyc, cx, cy, hx, hy, r);
+                self.blend_rim(px, py, c, cov(d), rim);
+                px += 1;
             }
         }
     }
@@ -4511,12 +4790,9 @@ impl Canvas {
         let mut pen = x;
         let mut prev_ui: Option<char> = None;
         for ch in s.chars() {
-            if let Some(font) = ui
-                .as_deref()
-                .filter(|font| font.lookup_glyph_index(ch) != 0)
-            {
+            if let Some(font) = ui.as_deref().filter(|font| font.maps(ch)) {
                 if let Some(previous) = prev_ui {
-                    pen += font.horizontal_kern(previous, ch, px).unwrap_or(0.0);
+                    pen += font.char_kern(previous, ch, px).unwrap_or(0.0);
                 }
                 let (m, bitmap) = self.raster_glyph(font, ch, px);
                 self.blit_fontdue_glyph(pen, baseline_i, &m, &bitmap, c);
@@ -4544,39 +4820,9 @@ impl Canvas {
     /// Render a complete bounded terminal snapshot with the shipping CPU
     /// renderer, then composite its exact opaque frame into the semantic card.
     fn terminal_specimen(&mut self, x: f32, y: f32, spec: &TerminalSpecimenSpec, scale: f32) {
-        // This is by far the most expensive prim in the tray: the fork below is
-        // a full `fontdue` re-parse of the primary face (and a second one for
-        // its real bold sibling) inside `fork_semantic_surface`, and
-        // `render_input` then renders a whole mini terminal frame from cold
-        // glyph/layout caches. A still preview re-rasterizes with every one of
-        // those inputs unchanged, so the finished frame is memoized; a moving
-        // one keeps its configured fork, so only `render_input` runs per frame.
-        //
-        // A hit is the same computation replayed: the key is total over what
-        // reaches the renderer, the fork source is matched by POINTER identity
-        // rather than by value, and the frame itself does not depend on `x`/`y`
-        // (the blit below is a pure read that places it).
-        let key = terminal_specimen_frame_key(spec, scale);
-        let source = spec.prepared_font.renderer.as_ref();
-        if let Some(frame) = cached_specimen_frame(key, source) {
-            self.blit_terminal_frame(
-                &frame,
-                (x * scale).round() as i32,
-                (y * scale).round() as i32,
-            );
-            return;
-        }
-        let Some(frame) = render_specimen_frame(spec, scale) else {
+        let Some(frame) = specimen_frame(spec, scale) else {
             return;
         };
-        let frame = Rc::new(frame);
-        // A typing scene never repeats a frame soon enough to pay for a slot,
-        // and holding one would evict the still cards sharing the page.
-        if let Some(source) = source
-            && spec.motion.as_ref().is_none_or(|scene| !scene.is_moving())
-        {
-            retain_specimen_frame(key, source, &frame);
-        }
         self.blit_terminal_frame(
             &frame,
             (x * scale).round() as i32,
@@ -4887,9 +5133,228 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
     // One lock for the whole raster: the chrome font stack (user primary +
     // bold sibling over the DejaVu coverage fallback).
     let mut fonts = lock_fonts();
+    // OCCLUSION: where a terminal specimen (an opaque frame) covers most of
+    // the tile, nothing drawn before it shows where it lands, so what comes
+    // before it is drawn only in the strips of the tile around it, under
+    // those prims' own clips; then everything from it on over the whole
+    // tile. The bytes are the same as drawing every prim everywhere (the
+    // frame replaces what is under it, `blit_terminal_frame`): a preview
+    // tick of a cursor specimen no longer re-blends the backdrop, the
+    // section and card panels and the terminal panel under the frame.
+    let mut frames: Vec<(usize, Rc<aterm_render::Frame>)> = Vec::new();
+    match occluding_specimen(prims, scale, &cv, &mut frames) {
+        Some((cover, covered)) => {
+            let tile = cv.device_bounds();
+            for (x0, y0, x1, y1) in tile_around(tile, covered) {
+                let (clips, fades) = (cv.clip.len(), cv.fade.len());
+                cv.push_clip(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32);
+                let mut skipped = 0;
+                replay_tray(
+                    &mut cv,
+                    &mut fonts,
+                    prims,
+                    0..cover,
+                    scale,
+                    true,
+                    &frames,
+                    &mut skipped,
+                );
+                cv.clip.truncate(clips);
+                cv.fade.truncate(fades);
+            }
+            let mut skipped = 0;
+            replay_tray(
+                &mut cv,
+                &mut fonts,
+                prims,
+                0..cover,
+                scale,
+                false,
+                &frames,
+                &mut skipped,
+            );
+            replay_tray(
+                &mut cv,
+                &mut fonts,
+                prims,
+                cover..prims.len(),
+                scale,
+                true,
+                &frames,
+                &mut skipped,
+            );
+        }
+        None => {
+            let mut skipped = 0;
+            replay_tray(
+                &mut cv,
+                &mut fonts,
+                prims,
+                0..prims.len(),
+                scale,
+                true,
+                &frames,
+                &mut skipped,
+            );
+        }
+    }
+    cv.px
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many prims [`replay_tray`] drew on this thread: a test's evidence
+    /// that the prims an opaque specimen covers were not drawn under it.
+    pub(crate) static DRAWN_PRIMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A device-pixel rect as (left, top, right, bottom), the shape
+/// [`Canvas::device_bounds`] answers in.
+type DeviceRect = (i32, i32, i32, i32);
+
+/// A device-space clip, using the canvas's exact floor/ceil arithmetic.
+/// Callers scale the origin and size separately before converting: adding
+/// in logical space first can round a fractional edge to a different pixel.
+fn device_clip_rect(x: f32, y: f32, w: f32, h: f32) -> DeviceRect {
+    (
+        x.floor() as i32,
+        y.floor() as i32,
+        (x + w).ceil() as i32,
+        (y + h).ceil() as i32,
+    )
+}
+
+/// The specimen prim that covers at least half of `cv`'s tile, as its frame
+/// lands under the clips active there (the most such area; the later on a
+/// tie), and the device rect it covers. Its frame (and those of the specimens
+/// before it that were rendered to measure them) go in `frames`, so the
+/// raster blits them rather than rendering them again. `None` where no
+/// specimen covers that much.
+fn occluding_specimen(
+    prims: &[DrawPrim],
+    scale: f32,
+    cv: &Canvas,
+    frames: &mut Vec<(usize, Rc<aterm_render::Frame>)>,
+) -> Option<(usize, DeviceRect)> {
+    let tile = cv.device_bounds();
+    let tile_area = i64::from(tile.2 - tile.0) * i64::from(tile.3 - tile.1);
+    if tile_area <= 0 {
+        return None;
+    }
+    let intersect =
+        |a: DeviceRect, b: DeviceRect| (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
+    let mut clips: Vec<DeviceRect> = Vec::new();
+    let mut skipped = 0_u32;
+    let mut fades = 0_usize;
+    let mut best: Option<(usize, DeviceRect, i64)> = None;
+    for (index, prim) in prims.iter().enumerate() {
+        match prim {
+            DrawPrim::ClipPush { .. } if skipped > 0 => skipped += 1,
+            DrawPrim::ClipPush { x, y, w, h } => {
+                let mut rect = device_clip_rect(x * scale, y * scale, w * scale, h * scale);
+                if let Some(&top) = clips.last() {
+                    rect = intersect(rect, top);
+                }
+                clips.push(rect);
+                let meets =
+                    rect.2 > tile.0 && rect.3 > tile.1 && rect.0 < tile.2 && rect.1 < tile.3;
+                if !meets {
+                    skipped = 1;
+                }
+            }
+            DrawPrim::ClipPop if skipped > 1 => skipped -= 1,
+            DrawPrim::ClipPop if skipped == 1 => {
+                skipped = 0;
+                clips.pop();
+            }
+            DrawPrim::ClipPop => {
+                clips.pop();
+            }
+            _ if skipped > 0 => {}
+            DrawPrim::FadePush { .. } => fades += 1,
+            DrawPrim::FadePop => fades = fades.saturating_sub(1),
+            DrawPrim::TerminalSpecimen { x, y, spec } if fades == 0 => {
+                let Some(frame) = specimen_frame(spec, scale) else {
+                    continue;
+                };
+                let rows = frame.pixels.len().checked_div(frame.width).unwrap_or(0);
+                let (fx, fy) = ((x * scale).round() as i32, (y * scale).round() as i32);
+                let mut rect = (
+                    fx,
+                    fy,
+                    fx.saturating_add(i32::try_from(frame.width).unwrap_or(i32::MAX)),
+                    fy.saturating_add(i32::try_from(rows).unwrap_or(i32::MAX)),
+                );
+                if let Some(&top) = clips.last() {
+                    rect = intersect(rect, top);
+                }
+                rect = intersect(rect, tile);
+                frames.push((index, frame));
+                if rect.0 >= rect.2 || rect.1 >= rect.3 {
+                    continue;
+                }
+                let area = i64::from(rect.2 - rect.0) * i64::from(rect.3 - rect.1);
+                if best.is_none_or(|(_, _, most)| area >= most) {
+                    best = Some((index, rect, area));
+                }
+            }
+            _ => {}
+        }
+    }
+    best.filter(|(_, _, area)| area * 2 >= tile_area)
+        .map(|(index, rect, _)| (index, rect))
+}
+
+/// The device rect the occluding specimen covers of `region`
+/// ([`occluding_specimen`]), for a test that rasters exactly that rect.
+#[cfg(test)]
+pub(crate) fn occluded_rect_for_test(
+    prims: &[DrawPrim],
+    scale: f32,
+    region: RasterRect,
+) -> Option<DeviceRect> {
+    let cv = Canvas::with_origin(
+        region.x as i32,
+        region.y as i32,
+        region.width,
+        region.height,
+        [0, 0, 0, 0],
+    );
+    let mut frames = Vec::new();
+    occluding_specimen(prims, scale, &cv, &mut frames).map(|(_, rect)| rect)
+}
+
+/// `tile` less `covered` (inside it), as up to four rects: the bands above
+/// and below, and the two sides between.
+fn tile_around(tile: DeviceRect, covered: DeviceRect) -> impl Iterator<Item = DeviceRect> {
+    [
+        (tile.0, tile.1, tile.2, covered.1),
+        (tile.0, covered.3, tile.2, tile.3),
+        (tile.0, covered.1, covered.0, covered.3),
+        (covered.2, covered.1, tile.2, covered.3),
+    ]
+    .into_iter()
+    .filter(|rect| rect.0 < rect.2 && rect.1 < rect.3)
+}
+
+/// Draw `range` of `prims` onto `cv` (only their clip and fade pushes and
+/// pops where `draw` is false), carrying the depth of clips that miss the
+/// tile in `skipped`. A specimen whose frame is in `frames` is blitted from
+/// it.
+#[allow(clippy::too_many_arguments)]
+fn replay_tray(
+    cv: &mut Canvas,
+    fonts: &mut std::sync::MutexGuard<'static, ChromeFonts>,
+    prims: &[DrawPrim],
+    range: std::ops::Range<usize>,
+    scale: f32,
+    draw: bool,
+    frames: &[(usize, Rc<aterm_render::Frame>)],
+    skipped: &mut u32,
+) {
     let s = scale;
-    let mut skipped_clip_depth = 0_u32;
-    for p in prims {
+    let mut skipped_clip_depth = *skipped;
+    for (index, p) in prims.iter().enumerate().take(range.end).skip(range.start) {
         match p {
             DrawPrim::ClipPush { .. } if skipped_clip_depth > 0 => {
                 skipped_clip_depth = skipped_clip_depth.saturating_add(1);
@@ -4926,6 +5391,11 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
             }
             _ => {}
         }
+        if !draw {
+            continue;
+        }
+        #[cfg(test)]
+        DRAWN_PRIMS.with(|drawn| drawn.set(drawn.get() + 1));
         match p {
             DrawPrim::Panel {
                 x,
@@ -4981,7 +5451,7 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                 weight,
                 face,
             } => cv.text(
-                &mut fonts,
+                fonts,
                 x * scale,
                 baseline * scale,
                 txt,
@@ -4991,7 +5461,14 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
                 *color,
             ),
             DrawPrim::TerminalSpecimen { x, y, spec } => {
-                cv.terminal_specimen(*x, *y, spec, scale);
+                match frames.iter().find(|(at, _)| *at == index) {
+                    Some((_, frame)) => cv.blit_terminal_frame(
+                        frame,
+                        (x * scale).round() as i32,
+                        (y * scale).round() as i32,
+                    ),
+                    None => cv.terminal_specimen(*x, *y, spec, scale),
+                }
             }
             DrawPrim::Stroke {
                 x,
@@ -5023,7 +5500,7 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
             | DrawPrim::FadePop => unreachable!("handled above"),
         }
     }
-    cv.px
+    *skipped = skipped_clip_depth;
 }
 
 /// Copy a tightly packed regional raster into an existing full retained RGBA8
@@ -5073,6 +5550,239 @@ mod tests {
     use super::*;
     use crate::widget::DrawPrim;
     use aterm_render::Theme;
+
+    /// A PANEL'S INTERIOR IS BLENDED ONCE A RUN, BYTE FOR BYTE AS EACH PIXEL
+    /// (r8 D3). Typing into Settings search re-rastered the page on every key,
+    /// and three quarters of it was panels' interiors: each pixel of a
+    /// translucent card paid its own linear-light composite for the answer its
+    /// neighbour had. `blend_span` gives the span the bytes `blend` gives each
+    /// of its pixels — under every fade, clip and tile origin, over pixels that
+    /// vary and pixels that repeat, opaque and translucent — and composites a
+    /// run of equal pixels once.
+    #[test]
+    fn a_span_blends_byte_for_byte_as_each_of_its_pixels() {
+        // A deterministic mix of runs and singles under the span.
+        let ground = |w: u32, h: u32| {
+            let mut px = Vec::with_capacity((w * h * 4) as usize);
+            for i in 0..w * h {
+                let run = (i / 7) % 5;
+                px.extend_from_slice(&match run {
+                    0 => [0, 0, 0, 0],
+                    1 => [30, 40, 50, 255],
+                    2 => [200, 10, 90, 128],
+                    3 => [(i % 251) as u8, (i % 13) as u8 * 19, 7, (i % 256) as u8],
+                    _ => [255, 255, 255, 64],
+                });
+            }
+            px
+        };
+        let colours = [
+            [10, 20, 30, 255],
+            [250, 250, 250, 40],
+            [30, 40, 50, 128],
+            [0, 0, 0, 1],
+            [123, 45, 67, 0],
+        ];
+        let (w, h) = (64_u32, 6_u32);
+        for origin in [(0, 0), (-5, -2), (17, 3)] {
+            for fade in [None, Some((2.0_f32, 5.0_f32, 0.3_f32, 1.0_f32))] {
+                for clip in [
+                    None,
+                    Some((origin.0 + 9, origin.1 + 1, origin.0 + 50, origin.1 + 5)),
+                ] {
+                    for (c, coverage) in colours
+                        .into_iter()
+                        .flat_map(|c| [1.0_f32, 0.999, 0.4, 0.0].map(|coverage| (c, coverage)))
+                    {
+                        for (x0, x1) in [(0, 64), (-10, 30), (12, 13), (40, 90), (30, 30)] {
+                            let fresh = || {
+                                let mut cv = Canvas::with_origin(origin.0, origin.1, w, h, [0; 4]);
+                                cv.px = ground(w, h);
+                                if let Some(fade) = fade {
+                                    cv.fade.push(fade);
+                                }
+                                if let Some(clip) = clip {
+                                    cv.clip.push(clip);
+                                }
+                                cv
+                            };
+                            let (mut span, mut each) = (fresh(), fresh());
+                            for y in origin.1 - 1..origin.1 + h as i32 + 1 {
+                                span.blend_span(
+                                    origin.0 + x0,
+                                    origin.0 + x1,
+                                    y,
+                                    c,
+                                    coverage,
+                                    &mut RimMemo::default(),
+                                );
+                                for x in origin.0 + x0..origin.0 + x1 {
+                                    each.blend(x, y, c, coverage);
+                                }
+                            }
+                            assert!(
+                                span.px == each.px,
+                                "origin {origin:?} fade {fade:?} clip {clip:?} colour {c:?} at {coverage} span {x0}..{x1}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A ROUNDED BOX DRAWS THE BYTES ITS PIXELS DREW ONE BY ONE (r8 D3): the
+    /// interior span and the rim memo against the per-pixel rounded box they
+    /// replace (every pixel through `blend`, the SDF on the rim), for boxes at
+    /// fractional positions, of every radius, opaque and translucent, under a
+    /// fade and a clip, on tiles with an origin, over pixels that vary and
+    /// pixels that repeat.
+    #[test]
+    fn a_rounded_box_draws_the_bytes_its_pixels_drew_one_by_one() {
+        fn reference(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, c: [u8; 4]) {
+            let (cx, cy, hx, hy) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+            let r = r.min(hx).min(hy);
+            let (x0, y0, x1, y1) = cv.clipped_bounds(
+                (x - 1.0).floor() as i32,
+                (y - 1.0).floor() as i32,
+                (x + w + 1.0).ceil() as i32,
+                (y + h + 1.0).ceil() as i32,
+            );
+            let inset = 1.0_f32;
+            let (inner_w, inner_h) = (w - inset * 2.0, h - inset * 2.0);
+            let inner_r = (r - inset).max(0.0).min(inner_w / 2.0).min(inner_h / 2.0);
+            let (inner_x, inner_y) = (x + inset, y + inset);
+            for py in y0..y1 {
+                let pyc = py as f32 + 0.5;
+                let span =
+                    (inner_w > 0.0 && inner_h > 0.0 && pyc >= inner_y && pyc <= inner_y + inner_h)
+                        .then(|| {
+                            let (left, right) = if inner_r <= 0.0
+                                || (pyc >= inner_y + inner_r && pyc <= inner_y + inner_h - inner_r)
+                            {
+                                (inner_x, inner_x + inner_w)
+                            } else {
+                                let corner = if pyc < inner_y + inner_r {
+                                    inner_y + inner_r
+                                } else {
+                                    inner_y + inner_h - inner_r
+                                };
+                                let dy = (pyc - corner).abs();
+                                let e = (inner_r * inner_r - dy * dy).max(0.0).sqrt();
+                                (inner_x + inner_r - e, inner_x + inner_w - inner_r + e)
+                            };
+                            let start = ((left - 0.5).ceil() as i32).clamp(x0, x1);
+                            let end =
+                                (((right - 0.5).floor() as i32).saturating_add(1)).clamp(x0, x1);
+                            (start < end).then_some((start, end))
+                        })
+                        .flatten();
+                for px in x0..x1 {
+                    let inside = span.is_some_and(|(start, end)| px >= start && px < end);
+                    let coverage = if inside {
+                        1.0
+                    } else {
+                        cov(sd_round_box(px as f32 + 0.5, pyc, cx, cy, hx, hy, r))
+                    };
+                    cv.blend(px, py, c, coverage);
+                }
+            }
+        }
+        let (w, h) = (90_u32, 60_u32);
+        let ground = |origin: (i32, i32)| {
+            let mut cv = Canvas::with_origin(origin.0, origin.1, w, h, [0; 4]);
+            for (n, pixel) in cv.px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let band = (n as u32 / w) / 9 + (n as u32 % w) / 23;
+                *pixel = match band % 4 {
+                    0 => [0, 0, 0, 0],
+                    1 => [24, 28, 36, 255],
+                    2 => [(n % 256) as u8, 90, (n % 7) as u8 * 30, 200],
+                    _ => [240, 240, 245, 96],
+                };
+            }
+            cv
+        };
+        let boxes = [
+            (3.3_f32, 2.6_f32, 70.4_f32, 40.2_f32, 9.5_f32),
+            (-4.5, 10.0, 50.0, 30.0, 0.0),
+            (20.25, -3.75, 30.5, 70.0, 15.0),
+            (10.0, 10.0, 2.5, 2.5, 1.0),
+            (40.7, 30.1, 60.0, 8.0, 4.0),
+            // Hairlines and rules: no interior, the whole width a rim.
+            (5.0, 20.3, 80.0, 1.0, 0.0),
+            (2.5, 33.6, 70.0, 2.0, 1.0),
+            (-3.2, 44.5, 100.0, 0.5, 0.25),
+            (30.0, 5.0, 1.0, 50.0, 0.0),
+        ];
+        let colours = [[250, 250, 250, 153], [12, 14, 16, 255], [90, 160, 255, 30]];
+        for origin in [(0, 0), (-6, 4), (11, -3)] {
+            for fade in [None, Some((5.0_f32, 40.0_f32, 0.2_f32, 1.0_f32))] {
+                for clip in [
+                    None,
+                    Some((origin.0 + 7, origin.1 + 5, origin.0 + 70, origin.1 + 52)),
+                ] {
+                    for &(x, y, bw, bh, r) in &boxes {
+                        for c in colours {
+                            let fresh = || {
+                                let mut cv = ground(origin);
+                                if let Some(fade) = fade {
+                                    cv.fade.push(fade);
+                                }
+                                if let Some(clip) = clip {
+                                    cv.clip.push(clip);
+                                }
+                                cv
+                            };
+                            let (mut fast, mut slow) = (fresh(), fresh());
+                            let (x, y) = (x + origin.0 as f32, y + origin.1 as f32);
+                            fast.round_rect(x, y, bw, bh, r, c);
+                            reference(&mut slow, x, y, bw, bh, r, c);
+                            assert!(
+                                fast.px == slow.px,
+                                "origin {origin:?} fade {fade:?} clip {clip:?} box {:?} colour {c:?}",
+                                (x, y, bw, bh, r)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A TRANSLUCENT CARD OVER A FLAT ONE COMPOSITES A HANDFUL OF TIMES, NOT
+    /// ONCE A PIXEL (r8 D3): a 600x400 card at 60% over a flat card, the shape of every
+    /// row on a native page. The two were 521,464 linear-light composites; now
+    /// a dozen, the rims' few coverages and one for each interior, whatever
+    /// the size.
+    #[test]
+    fn a_translucent_panel_over_a_flat_one_composites_a_handful_of_times() {
+        let panel = |x: f32, y: f32, w: f32, h: f32, fill: [u8; 4]| DrawPrim::Panel {
+            x,
+            y,
+            w,
+            h,
+            radius: 10.0,
+            fill,
+        };
+        let prims = [
+            panel(0.0, 0.0, 640.0, 440.0, [40, 44, 52, 230]),
+            panel(20.0, 20.0, 600.0, 400.0, [250, 250, 250, 153]),
+        ];
+        let before = linear_composites();
+        let rgba = rasterize_tray_pixels(&prims, 640, 440, 1.0, [0, 0, 0, 0]);
+        let spent = linear_composites() - before;
+        assert_eq!(rgba.len(), 640 * 440 * 4);
+        assert!(
+            spent < 100,
+            "{spent} linear composites for two panels of 280,000 and 240,000 pixels"
+        );
+        // The card's middle is the card over the ground, as a pixel blend says.
+        let mut cv = Canvas::new(1, 1, [0; 4]);
+        cv.blend(0, 0, [40, 44, 52, 230], 1.0);
+        cv.blend(0, 0, [250, 250, 250, 153], 1.0);
+        let middle = ((220 * 640 + 320) * 4) as usize;
+        assert_eq!(rgba[middle..middle + 4], cv.px[..4]);
+    }
 
     /// A WORD THE UI FACE DRAWS WHOLE IS MEASURED ONCE ([`MeasureMemo`]):
     /// measured again at the same size (its width) or the same width (its
@@ -5378,7 +6088,7 @@ mod tests {
         if !strip_band_ui_ready() {
             // Host without a resolvable system UI face (CI): the decline
             // branch above is the whole contract.
-            return;
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         assert_ne!(
             strip_band_font_epoch(),
@@ -5612,6 +6322,151 @@ mod tests {
         );
     }
 
+    /// The baseline, canvas and size the Mono glyph tests below draw at.
+    const MONO_GLYPH_BASELINE: f32 = 40.0;
+    const MONO_GLYPH_CANVAS: (u32, u32) = (64, 56);
+    const MONO_GLYPH_PX: f32 = 26.0;
+
+    /// `s` drawn as a Mono run with `primary` as the chrome's primary face,
+    /// white over black: the RGBA buffer.
+    fn mono_run_image(primary: &Arc<[u8]>, s: &str) -> Vec<u8> {
+        set_chrome_fonts(Some((Arc::clone(primary), 0)), None, None);
+        let prims = vec![crate::widget::text_prim(
+            4.0,
+            MONO_GLYPH_BASELINE,
+            s.to_string(),
+            crate::type_scale::TypeStep::Body.px(MONO_GLYPH_PX),
+            TextWeight::Regular,
+            TextFace::Mono,
+            [255, 255, 255, 255],
+        )];
+        let (width, height) = MONO_GLYPH_CANVAS;
+        rasterize_tray(&prims, width, height, 1.0, [0, 0, 0, 255]).0
+    }
+
+    /// Whether a Regular Mono run draws `ch` from the chrome's PRIMARY face —
+    /// the one [`mono_run_image`] last installed — and not from the embedded
+    /// DejaVu fallback or a coverage face under it, which a primary that
+    /// declined `ch` would hand it to.
+    fn primary_draws(ch: char) -> bool {
+        let mut fonts = lock_fonts();
+        let Some(primary) = fonts.primary.as_ref().map(|face| Arc::clone(&face.font)) else {
+            return false;
+        };
+        fonts
+            .face_for(TextWeight::Regular, ch)
+            .is_some_and(|face| Arc::ptr_eq(&face.font, &primary))
+    }
+
+    /// A MONO RUN DRAWS LATIN-1 AS ITS FACE'S UNICODE SUBTABLE MAPS IT. Mono
+    /// text is set in the terminal's face, and on Monaco the Stats Deck drew
+    /// `·` as `∑` and `×` as `◊`: the chrome looked chars up in the enumerated
+    /// cmap, where a Macintosh subtable listed after the Unicode one wins. The
+    /// embedded DejaVu Sans Mono with its Mac Roman record moved last has that
+    /// shape on every host, so it must draw each char itself — not hand it to
+    /// the embedded DejaVu under it, whose texels are the same — texel for
+    /// texel as the shipped face (whose Unicode subtables come last) does, and
+    /// not as the Mac Roman glyph of the char's byte (`∑ ◊ ∞ È`), which it
+    /// drew before.
+    #[test]
+    fn a_mono_run_draws_latin_1_by_the_unicode_cmap() {
+        let shipped: Arc<[u8]> = Arc::from(aterm_render::embedded_font());
+        let moved: Arc<[u8]> = aterm_render::font::with_cmap_record_last(&shipped, 1, 0)
+            .expect("DejaVu Sans Mono carries a Mac Roman (1,0) subtable")
+            .into();
+        for (ch, mac) in [
+            ('\u{B7}', '\u{2211}'),
+            ('\u{D7}', '\u{25CA}'),
+            ('\u{B0}', '\u{221E}'),
+            ('\u{E9}', '\u{C8}'),
+        ] {
+            let drawn = mono_run_image(&moved, &ch.to_string());
+            assert!(
+                primary_draws(ch),
+                "the reordered face draws {ch} itself, not the fallback under it"
+            );
+            let (texels, _) = drawn.as_chunks::<4>();
+            assert!(texels.iter().any(|texel| texel[0] > 0), "{ch} inks");
+            assert!(
+                drawn == mono_run_image(&shipped, &ch.to_string()),
+                "{ch} draws as the shipped face draws it"
+            );
+            assert!(
+                drawn != mono_run_image(&shipped, &mac.to_string()),
+                "{ch} is not drawn as {mac}, the Mac Roman glyph of its byte"
+            );
+        }
+        set_chrome_fonts(None, None, None);
+    }
+
+    /// ON MONACO `·` IS A SMALL DOT AND `×` IS NOT `◊`. The face the defect
+    /// was seen on, read from the system: Monaco itself draws both (not the
+    /// embedded DejaVu under it, whose `·` is a small raised dot too, so the
+    /// dot is checked to be Monaco's), and its middle dot inks a small box
+    /// above the baseline, a fraction of what `∑` inks.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mono_run_on_monaco_draws_the_middle_dot_as_a_dot() {
+        let path = "/System/Library/Fonts/Monaco.ttf";
+        let Ok(monaco) = std::fs::read(path) else {
+            aterm_spec::host::could_not_run(format!("no {path} on this Mac"));
+        };
+        let monaco: Arc<[u8]> = monaco.into();
+        let (width, height) = MONO_GLYPH_CANVAS;
+        // Inked texels, and the ink's box `(x0, y0, x1, y1)`, exclusive.
+        let ink = |image: &[u8]| {
+            let mut count = 0u32;
+            let mut bounds = (u32::MAX, u32::MAX, 0, 0);
+            for y in 0..height {
+                for x in 0..width {
+                    if image[((y * width + x) * 4) as usize] > 0 {
+                        count += 1;
+                        bounds = (
+                            bounds.0.min(x),
+                            bounds.1.min(y),
+                            bounds.2.max(x + 1),
+                            bounds.3.max(y + 1),
+                        );
+                    }
+                }
+            }
+            (count, bounds)
+        };
+        let dot_image = mono_run_image(&monaco, "\u{B7}");
+        assert!(
+            primary_draws('\u{B7}'),
+            "Monaco draws · itself, not the fallback under it"
+        );
+        let (dot, (x0, y0, x1, y1)) = ink(&dot_image);
+        let (sum, _) = ink(&mono_run_image(&monaco, "\u{2211}"));
+        assert!(dot > 0 && dot * 4 < sum, "· inks {dot} texels, ∑ {sum}");
+        let side = MONO_GLYPH_PX * 0.25;
+        assert!(
+            ((x1 - x0) as f32) < side && ((y1 - y0) as f32) < side,
+            "· inks a small box: {x0}..{x1} × {y0}..{y1}"
+        );
+        let raised = MONO_GLYPH_BASELINE - (y0 + y1) as f32 / 2.0;
+        assert!(
+            (MONO_GLYPH_PX * 0.15..MONO_GLYPH_PX * 0.5).contains(&raised),
+            "· sits {raised} px above the baseline"
+        );
+        let dejavu: Arc<[u8]> = Arc::from(aterm_render::embedded_font());
+        assert!(
+            dot_image != mono_run_image(&dejavu, "\u{B7}"),
+            "· is Monaco's dot, not the embedded DejaVu's"
+        );
+        let times = mono_run_image(&monaco, "\u{D7}");
+        assert!(
+            primary_draws('\u{D7}'),
+            "Monaco draws × itself, not the fallback under it"
+        );
+        assert!(
+            times != mono_run_image(&monaco, "\u{25CA}"),
+            "× is not drawn as ◊"
+        );
+        set_chrome_fonts(None, None, None);
+    }
+
     /// Inked column clusters of a raster over a black ground: `(x0, y0, x1, y1)`
     /// (exclusive) per run of inked columns, split on an empty column — one
     /// entry per glyph for a run whose side bearings leave a gap.
@@ -5652,7 +6507,7 @@ mod tests {
     #[test]
     fn a_chain_face_char_draws_on_the_run_baseline_not_its_own_ascent() {
         if !install_chrome_fonts_with_cjk_chain_for_test() {
-            return;
+            aterm_spec::host::could_not_run("no CJK chain face here to install");
         }
         let px = 16.0_f32;
         let row_h = 28.0_f32;
@@ -5719,7 +6574,7 @@ mod tests {
     fn ui_measure_agrees_with_the_pen_for_a_chain_face_char() {
         if !install_chrome_fonts_with_cjk_chain_for_test() || !strip_band_ui_ready() {
             clear_ui_fonts_for_test();
-            return;
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let s = "A日B";
         let px = 13.0_f32;
@@ -5732,9 +6587,9 @@ mod tests {
             let mut prev: Option<char> = None;
             for ch in s.chars() {
                 if let Some(p) = prev {
-                    w += f.horizontal_kern(p, ch, px).unwrap_or(0.0);
+                    w += f.char_kern(p, ch, px).unwrap_or(0.0);
                 }
-                w += f.metrics(ch, px).advance_width + UI_TRACKING_EM * px;
+                w += f.char_metrics(ch, px).advance_width + UI_TRACKING_EM * px;
                 prev = Some(ch);
             }
             w
@@ -5783,7 +6638,7 @@ mod tests {
     #[test]
     fn coverage_rung_is_consulted_only_after_the_embedded_fallback_misses() {
         if !install_chrome_fonts_with_cjk_chain_for_test() {
-            return;
+            aterm_spec::host::could_not_run("no CJK chain face here to install");
         }
         let mut fonts = lock_fonts();
         let dejavu = fonts
@@ -5799,11 +6654,11 @@ mod tests {
             .expect("the parsed CJK face is admitted")
             .font
             .clone();
-        assert!(chain.lookup_glyph_index('日') != 0);
+        assert!(chain.maps('日'));
         // A char BOTH carry: the gate's pick wins.
         let shared = ['\u{2713}', 'λ', 'π', '√', 'A']
             .into_iter()
-            .find(|&ch| dejavu.lookup_glyph_index(ch) != 0 && chain.lookup_glyph_index(ch) != 0)
+            .find(|&ch| dejavu.maps(ch) && chain.maps(ch))
             .expect("Latin at least is in both");
         let face = fonts
             .face_for(TextWeight::Regular, shared)
@@ -5853,7 +6708,7 @@ mod tests {
     #[test]
     fn strip_band_font_epoch_moves_when_a_chain_face_lands() {
         let Some(path) = cjk_chain_face_path_for_test() else {
-            return;
+            aterm_spec::host::could_not_run("no CJK chain face here");
         };
         let theme = aterm_render::Theme::default();
         let mut live = Renderer::from_bytes(aterm_render::embedded_font(), 14.0, theme)
@@ -5938,12 +6793,12 @@ mod tests {
     #[test]
     fn a_cjk_label_has_its_chain_face_parsed_when_the_band_asks() {
         let Some(_live) = install_unparsed_cjk_chain_for_test() else {
-            return;
+            aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
         };
         set_ui_cjk_faces_for_test(None);
         if !strip_band_ui_ready() {
             clear_ui_fonts_for_test();
-            return;
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         assert!(strip_band_run_coverable("alpha"));
         assert_eq!(ready_chain_faces(), 0, "a Latin label parses nothing");
@@ -5971,7 +6826,7 @@ mod tests {
     #[test]
     fn the_startup_warm_parses_the_cjk_and_hangul_faces_only() {
         let Some(live) = install_unparsed_cjk_chain_for_test() else {
-            return;
+            aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
         };
         assert_eq!(ready_chain_faces(), 0, "CONTROL: nothing parsed yet");
         assert!(warm_chrome_coverage(Some(&live.fallback_coverage()), None) >= 1);
@@ -5984,9 +6839,7 @@ mod tests {
         assert!(!parsed.is_empty());
         for face in &parsed {
             assert!(
-                CHROME_COVERAGE_WARM
-                    .chars()
-                    .any(|ch| face.lookup_glyph_index(ch) != 0),
+                CHROME_COVERAGE_WARM.chars().any(|ch| face.maps(ch)),
                 "the warm parsed a face that maps none of {CHROME_COVERAGE_WARM:?}"
             );
         }
@@ -6039,8 +6892,8 @@ mod tests {
     /// Windows chain's East Asian faces, PARSED: Microsoft YaHei Bold and
     /// Malgun Gothic Bold, the weight-matched siblings `aterm_render` puts
     /// beside Iosevka Term SemiBold. Plus the host UI faces and a cold store
-    /// of the UI faces' own East Asian fallback. `None` (the caller skips)
-    /// where the host lacks any of them.
+    /// of the UI faces' own East Asian fallback. `None` (the caller ends COULD
+    /// NOT RUN) where the host lacks any of them.
     #[cfg(windows)]
     fn install_bold_cjk_chain_and_cold_ui_cjk_for_test() -> Option<Arc<UiCjkFaces>> {
         let root = std::path::PathBuf::from(
@@ -6106,7 +6959,9 @@ mod tests {
     fn a_quiet_labels_east_asian_text_inks_like_its_latin_and_the_selected_ones_is_semibold() {
         let Some(store) = install_bold_cjk_chain_and_cold_ui_cjk_for_test() else {
             clear_ui_fonts_for_test();
-            return;
+            aterm_spec::host::could_not_run(
+                "no Microsoft YaHei Bold, Malgun Gothic Bold or UI face here to install",
+            );
         };
         let px = 26.0;
         for (text, latin) in [("日本語", "notes"), ("한국어", "logs")] {
@@ -6159,7 +7014,7 @@ mod tests {
                             .ui_miss_face(face, TextWeight::Regular, ch)
                             .expect("a face")
                             .font
-                            .metrics(ch, px)
+                            .char_metrics(ch, px)
                             .advance_width
                     })
                     .sum();
@@ -6191,7 +7046,7 @@ mod tests {
     #[test]
     fn a_semibold_run_never_borrows_the_regular_east_asian_face() {
         let Some(store) = host_ui_cjk_faces_for_test() else {
-            return;
+            aterm_spec::host::could_not_run("no host UI CJK faces here");
         };
         prepare_ui_fonts_for_direct_view_test();
         set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
@@ -6217,7 +7072,7 @@ mod tests {
             store.rung(weight)[0]
                 .parsed()
                 .expect("Yu Gothic UI")
-                .metrics('の', 1000.0)
+                .char_metrics('の', 1000.0)
                 .advance_width
                 .round()
         };
@@ -6243,16 +7098,16 @@ mod tests {
     #[test]
     fn a_cjk_label_has_its_weights_own_ui_faces_parsed_when_the_band_asks() {
         let Some(_live) = install_unparsed_cjk_chain_for_test() else {
-            return;
+            aterm_spec::host::could_not_run("no CJK fallback chain could be installed here");
         };
         let Some(store) = host_ui_cjk_faces_for_test() else {
             clear_ui_fonts_for_test();
-            return;
+            aterm_spec::host::could_not_run("no host UI CJK faces here");
         };
         set_ui_cjk_faces_for_test(Some(Arc::clone(&store)));
         if !strip_band_ui_ready() {
             clear_ui_fonts_for_test();
-            return;
+            aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         let parsed = |weight: UiCjkWeight, script: UiCjkScript| {
             store
@@ -6299,7 +7154,7 @@ mod tests {
     #[test]
     fn the_startup_warm_parses_the_ui_faces_east_asian_faces_at_both_weights() {
         let Some(store) = host_ui_cjk_faces_for_test() else {
-            return;
+            aterm_spec::host::could_not_run("no host UI CJK faces here");
         };
         assert_eq!(store.parsed_count(), 0, "CONTROL: a cold store");
         assert_eq!(warm_chrome_coverage(None, Some(&store)), 4);
@@ -6538,15 +7393,17 @@ mod tests {
     /// parse, and the current result disarms after landing.
     /// Poll `fonts` until its pending semantic candidate LANDS (the worker's
     /// result disarms `semantic_pending`), then poll once more. The wait ends
-    /// on that fact, 5 ms after it at most; its bound is a hang detector and
-    /// measures nothing. It was 20 s, and the worker's first job settles the
-    /// whole Unicode specimen in a debug build: at background QoS beside 72
-    /// spinners (a loaded machine at load 100-170) that outran 20 s in 2 of 3
-    /// runs, and the test that waits here
-    /// (`rapid_candidate_replacement_carries_base_and_cached_views_do_not_cross_contaminate`)
-    /// then read the pre-landing identity as a wrong one.
+    /// on that fact, 5 ms after it at most; its bound is the one-minute hang
+    /// detector ([`aterm_spec::wait::MUST_HAPPEN`]) and measures nothing. It
+    /// was 20 s, then ten minutes while the worker ran at background QoS: the
+    /// first job settles the whole Unicode specimen in a debug build, and
+    /// beside 72 spinners (load 100-170) that outran 20 s in 2 of 3 runs. Every
+    /// worker this waits on now runs at `Role::Responsive`
+    /// ([`SemanticPrewarmWorker::spawn_serialized_by`]): the three tests that
+    /// wait here took 0.03-0.15 s each, twenty runs alone and five beside a
+    /// whole `-p aterm-gui --lib` run, at load 70 (2026-10-20).
     fn await_semantic_landing(fonts: &mut ChromeFonts) {
-        const HANG: std::time::Duration = std::time::Duration::from_secs(600);
+        const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
         let started = std::time::Instant::now();
         while fonts.semantic_pending.is_some() && started.elapsed() < HANG {
             fonts.poll_semantic_renderer();
@@ -6572,7 +7429,8 @@ mod tests {
         });
         let gate: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
         let mut fonts = default_chrome_fonts();
-        fonts.semantic_worker = SemanticPrewarmWorker::spawn_serialized_by(gate);
+        fonts.semantic_worker =
+            SemanticPrewarmWorker::spawn_serialized_by(gate, crate::qos::Role::Responsive);
         fonts.semantic_generation = 1;
         let mut renderer = Renderer::from_bytes(
             aterm_render::embedded_font(),
@@ -6701,7 +7559,8 @@ mod tests {
         let mut fonts = default_chrome_fonts();
         // Backend startup parks the one worker (`set_chrome_fonts`); candidate
         // requests never demand-spawn it.
-        fonts.semantic_worker = SemanticPrewarmWorker::spawn_serialized_by(gate);
+        fonts.semantic_worker =
+            SemanticPrewarmWorker::spawn_serialized_by(gate, crate::qos::Role::Responsive);
         fonts.semantic_generation = 1;
         fonts.semantic = Some(renderer());
         fonts.semantic_identity = Some(crate::widget::SemanticFontCandidate::default());
@@ -6946,7 +7805,8 @@ mod tests {
         let mut fonts = default_chrome_fonts();
         // Backend startup parks the one worker (`set_chrome_fonts`); candidate
         // requests never demand-spawn it.
-        fonts.semantic_worker = SemanticPrewarmWorker::spawn_serialized_by(gate);
+        fonts.semantic_worker =
+            SemanticPrewarmWorker::spawn_serialized_by(gate, crate::qos::Role::Responsive);
         fonts.semantic_generation = 7;
         fonts.semantic = Some(renderer);
         fonts.semantic_identity = Some(crate::widget::SemanticFontCandidate::default());
@@ -7225,11 +8085,9 @@ mod tests {
             0,
         )
         .expect("the committed kerned face parses");
-        let left = kerned.metrics('A', px).advance_width + UI_TRACKING_EM * px;
-        let right = kerned.metrics('U', px).advance_width + UI_TRACKING_EM * px;
-        let kern = kerned
-            .horizontal_kern('A', 'U', px)
-            .expect("the pair is kerned");
+        let left = kerned.char_metrics('A', px).advance_width + UI_TRACKING_EM * px;
+        let right = kerned.char_metrics('U', px).advance_width + UI_TRACKING_EM * px;
+        let kern = kerned.char_kern('A', 'U', px).expect("the pair is kerned");
         let pair_floor = (left + (left + kern)) * 0.5;
         assert!(kern < 0.0 && left >= pair_floor && right + kern >= pair_floor);
         fonts.ui_regular = Some(kerned);

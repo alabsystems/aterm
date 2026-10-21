@@ -10,6 +10,31 @@
 > Status 2026-10-15: this is the crate's migration worklist. Each of the 14 specs below is
 > proved through Trust/Clean, and then the tests it subsumes are deleted. The one test in §4
 > that samples no spec is deleted now.
+>
+> **Tried 2026-10-19 on seal `150efe4a`: `rgb-percent` and `hls-range` are blocked, not proved.**
+> The crate is not refused by PM-1; the seal compiles it and reports a row for each fn. Each of
+> `scale_pct`, `rgb_percent` and `hls_to_rgb` was given a contract through `trust_contract_fn!`
+> in two forms. (1) A theorem over the kernel import (`trust_import_aterm_sixel__scale_pct v <= 255`,
+> `trust_import_aterm_sixel__rgb_percent r g b <= 16777215`,
+> `trust_import_aterm_sixel__hls_to_rgb h l s <= 16777215`): each is refused with
+> `AutoBoundHeadOverApplied`, because E6 mints none of the three imports. (2)
+> `ensures result == <Clean spec def>(args)`, with `scale_pct_spec`/`rgb_percent_spec` stating the
+> row's formula for every input: the defs kernel-check, and the seal names the reason (gap 3, E6
+> shapes), all at the FACET gate:
+> - `scale_pct`: "the construct outside the E6 fragment is the call to `<u32 as core::cmp::Ord>::min`
+>   (E6 reads only the marker-authenticated `wrapping_*`/signed `checked_*` core methods and a
+>   forwarding call to a Clean island definition) (and 4 further construct(s) outside it)", i.e. the
+>   `saturating_mul`/`saturating_add` calls and the `/ 100`.
+> - `rgb_percent`: "the call to `aterm_sixel::scale_pct` … (and 10 further construct(s) outside it)":
+>   a call (no callee composition) plus the shifts and `|`.
+> - `hls_to_rgb`: "Pure (not established: local _6 has type Float { width: 64 }, outside the v1 scalar
+>   fragment)", then the `min` call "(and 39 further construct(s) outside it)". No gap row covers f64.
+>
+> The native clause lane refuses the def-calling clause too (`unsupported contract predicate
+> expression`). The code is unchanged, and `rgb_percent_scales_correctly` and `hls_primaries_are_sane`
+> stay. `rgb-percent` is unblocked by an E6 reader (or the proven-core route) for `min`,
+> unsigned `saturating_*`, division by a constant, shifts, `|` and a call to an admitted fn;
+> `hls-range` additionally needs f64 locals and `mul_add`/`round`/float-to-int casts.
 
 Source: `crates/aterm-sixel` (read only). I read every `#[test]` (all 25 are in
 `src/tests.rs`) and the code each one reaches in `src/lib.rs`. Nothing was compiled or run.

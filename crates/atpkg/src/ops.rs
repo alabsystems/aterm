@@ -720,10 +720,11 @@ mod tests {
         std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o000)).unwrap();
         let stat = std::fs::metadata(&target);
         if stat.is_ok() {
-            // root (or a filesystem that ignores mode) — the probe could not be armed.
             std::fs::set_permissions(&holder, saved).unwrap();
             let _ = std::fs::remove_dir_all(&l.prefix);
-            return;
+            aterm_uds::host::could_not_run(
+                "a stat through a mode-0 folder succeeded: root, or a file system that ignores modes",
+            );
         }
         assert_eq!(
             stat.unwrap_err().kind(),

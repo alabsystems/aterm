@@ -9,10 +9,15 @@
 //!
 //! This module is the card's pure emitter. The host finds the card
 //! (`aterm_phase::launch_card_place`), resolves its geometry into a
-//! [`CardScene`] in the target stream's pixel space, and calls
-//! [`HarnessCard::tick`] each frame; the emitter appends [`GlowQuad`]s to two
-//! streams and returns a fingerprint. It reads no clock (time comes in as
-//! `now`), no terminal and no config, so the same inputs give the same bytes.
+//! [`CardScene`] in window pixels, and each frame asks
+//! [`HarnessCard::replay`] for the settled frame it keeps, else
+//! [`HarnessCard::draw`]s one: two fx contents (`docs/DESIGN-card-engine-2026-10-19.md`
+//! §4.8), card-local — the border and the trail under the glyph ink, the
+//! kitty, its rim and the stars over it — which it lays at the card's origin
+//! as two layers ([`CardFrame::layers`]). Pictures are drawn once per cell
+//! height ([`CardArts`]) and a frame is their palettes. It reads no clock
+//! (time comes in as `now`), no terminal and no config, so the same inputs
+//! give the same bytes.
 //!
 //! # The five marks
 //!
@@ -27,33 +32,26 @@
 //!   cell wide; the sides are flat slices, one per row band they cross.
 //! * **Rainbow trail** (into `under`): six stripes from the text's end to the
 //!   kitty's back, as tall as the kitty's BODY (§10.6: the cat leads, the
-//!   rainbow trails), split at the row bands it crosses. It runs on under the
+//!   rainbow trails). It runs on under the
 //!   art to the haunch's outline ([`KittyArt::rear`]), so the rainbow meets
 //!   the cat flush on every row it spans. Settled, a stripe is one quad end
 //!   to end; during an episode it steps and shimmers in segments, but for
-//!   the stretch that reaches under the cat, which holds still.
-//! * **Kitty** (into `over`): authored pixel art, a chibi kitten in the
-//!   spirit of Claude's block mascot — a big round head on a small body,
-//!   glossy eyes (a dark pupil, a white catch-light, the iris a band at its
-//!   foot), pink ears, nose and blush, an `ω` mouth on a chin of coat, and
-//!   white socks on the front paws under it — [`KITTY_W`] pixels wide with
-//!   square pixels, each rectangle of one colour (a run of a pixel row,
-//!   carried down the rows that repeat it) one opaque source-over quad. Two
-//!   heights: [`KITTY_H`] pixels laid two cell rows tall, the cat lying with
-//!   its paws tucked, and — where the host found the card's third row blank,
-//!   [`CardScene::kitty_rows`] — [`KITTY_TALL_H`] pixels laid three rows
-//!   tall, the height of Claude's mascot, the same face under a taller head
-//!   on longer legs. Three frames each: eyes open, a happy blink (the eyes
-//!   closed in `^ ^` arcs), a tail flick.
+//!   the stretch the cat's rim could reach, which holds still.
+//! * **Kitty** (into `over`): a blocky cat with pink-lined pointed ears,
+//!   an iris beside a dark pupil, a pale muzzle and belly, four legs and
+//!   its tail up. Each of its six authored frames is one opaque sprite,
+//!   two or three cell rows tall. It blinks and flicks its tail back over
+//!   the rainbow; the tall cat keeps a white catch-light over each pupil.
 //! * **Rim** (into `over`): a one-pixel outline of the border's spectrum just
 //!   outside the kitty's silhouette ([`rim_px`]), so a black or grey coat reads
 //!   on a dark ground: additive light on dark, opaque print ink on light, its
 //!   hue running round the cat as the border's runs round the box. It is cut
 //!   where it would lie on the trail, and runs under each paw but not under
 //!   the toes' gaps, which open onto the ground.
-//! * **Stars** (into `over`): five to nine four-point twinkles at seeded spots
-//!   round the kitty and the trail, sparkles the kitty sheds on its ride, and
-//!   a burst of [`BURST_STARS`] thrown out from the kitty where it lands.
+//! * **Stars** (into `over`): one to three glints on the rainbow, flaring
+//!   as its sheen passes; five to nine field stars, the ride's sparkles,
+//!   and a burst of [`BURST_STARS`] where the kitty lands. All use the same
+//!   cached star arts. The glints are small and steady once settled.
 //!
 //! # Episodes, then stillness
 //!
@@ -65,8 +63,8 @@
 //! it to its back, the field's stars coming up as it passes them and
 //! sparkles shed as it goes — and lands with the burst; once the glass has
 //! shown it seated it plays every later episode in its seat, the burst at
-//! the start ([`Ride`]); the trail steps and shimmers; the kitty blinks and flicks its
-//! tail; the stars twinkle.
+//! the start ([`Ride`]); the trail steps and shimmers, its glints flaring
+//! under the sheen; the kitty blinks and flicks its tail; the stars twinkle.
 //! When it ends the frame is the settled one: constant bytes, a constant
 //! fingerprint and no deadline ([`HarnessCard::deadline`] asks for the
 //! settled frame — `now`, until a tick draws it or [`SETTLE_GRACE_MS`] past
@@ -90,12 +88,10 @@
 //!
 //! # Laws the host can rely on
 //!
-//! * **One band per quad.** Every quad lies inside exactly one cell-row band,
-//!   `[origin_y + r·ch, origin_y + (r + 1)·ch)` for grid row `r`, and is tagged
-//!   `row = row_base + r` (the renderers' row gate and the CPU/GPU parity
-//!   invariant of [`GlowQuad`]). Side slices, stripes, kitty pixel rows and
-//!   star arms are split or laid so none straddles a row boundary.
-//! * **Inside the box.** Every quad lies inside the border's outer rectangle
+//! * **One band per slice.** The engine cuts every item at the cell-row
+//!   bands and draws a slice only where its row is repainted (design §4.3),
+//!   so the card splits nothing and the law cannot be broken by it.
+//! * **Inside the box.** Every pixel lies inside the border's outer rectangle
 //!   (its air included) and inside the scene's [`clip`](CardScene::clip) (the
 //!   pane); the kitty lies inside the border's stroke as it stands with no
 //!   air, wherever its ride has it; the stars, the sparkles and the burst
@@ -104,13 +100,11 @@
 //!   the kitty, its rim and the stars are laid inside the boxed rows' stroke,
 //!   so a card that gains or loses its air (a notice drawn under it, a launch
 //!   line over it) keeps every one of them where it was.
-//! * **Budget.** At most [`MAX_CARD_QUADS`] quads per tick across both streams,
-//!   spent border → trail → kitty → rim → burst → stars → sparkles (the
-//!   burst before the field: a frame over the cap loses a twinkling field
-//!   star, never one of the burst's ring); a star is drawn whole or not at
-//!   all, to the quad (one the budget cannot finish is taken back).
+//! * **Bounded.** At most [`CARD_ITEMS_MAX`] items a frame across both
+//!   contents, whatever the art's detail, and every mark of every frame is
+//!   drawn: nothing is cut to the bound.
 //! * **Themes.** On a dark theme the border, trail, rim and stars are additive
-//!   light (`alpha == 0`); on a light theme every quad is source-over
+//!   light (`alpha == 0`); on a light theme every item is source-over
 //!   (`alpha > 0`), since additive light is invisible on white. There the
 //!   border, trail and rim are opaque card art in print inks
 //!   ([`PRINT_CRUISE`], [`PRINT_LAND`]), as a printer lays a rainbow on
@@ -125,24 +119,34 @@
 //!   (`alpha == 255`) on both.
 //! * **Photosensitivity.** Every twinkle runs on `effect_util::twinkle_env`,
 //!   under the crate's certified 3.2 Hz bound; the trail's step wave cycles
-//!   below it too (both const-asserted here). The burst only fades, and the
+//!   below it too; a glint flares once a shimmer pass (all const-asserted
+//!   here). The burst only fades, and the
 //!   blink comes once per 2.5 s.
 
-use aterm_render::{GlowQuad, InkCell, premul_rgb};
+use std::sync::Arc;
+
+use aterm_render::{InkCell, premul_rgb};
 use aterm_time::Instant;
 use std::time::Duration;
 
 use crate::color_math::relative_luminance;
 use crate::effect_util::{
-    STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE_ADD, STAR_GLINT,
-    STAR_GLINT_COV, STAR_TAPER_STEPS, TWINKLE_FLASH_BOUND_HZ, TWINKLE_FLASH_HZ, mix_rgb, star_arm,
-    star_arm_px, star_body_px, star_core_px, star_taper_cov, star_waist_px, twinkle_env,
+    STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE_ADD, STAR_GLINT_COV,
+    TWINKLE_FLASH_BOUND_HZ, TWINKLE_FLASH_HZ, mix_rgb, star_arm, star_arm_px, twinkle_env,
     twinkle_peak, twinkle_rgb,
 };
 use crate::genome::mix;
 use crate::rainbow_kitty::meteor::tri;
 use crate::rainbow_kitty::ribbon::paper_mark_ink;
 use crate::spectrum::{SPECTRUM_ANCHOR_AT, SPECTRUM_LUT_LEN, spectrum, spectrum_stop};
+
+#[cfg(test)]
+mod layer_tests;
+mod layers;
+#[cfg(test)]
+mod oracle;
+
+pub use layers::{CardArts, CardFrame, CardFrames, CardShape, SettledFrame, card_layer_id};
 
 // ─── the clock ──────────────────────────────────────────────────────────────
 
@@ -179,37 +183,65 @@ pub const SETTLE_GRACE_MS: u64 = 500;
 /// one.
 pub const OWED_MAX_MS: u64 = 45_000;
 
-/// The most quads one [`HarnessCard::tick`] appends across both streams.
+/// The deepest a star's pieces stack over one pixel: the two bodies'
+/// crossing, the nucleus on it and, on a gold star, a glint where one meets
+/// them. The depth of a star's peeled art ([`aterm_render::fx::PieceArt`]),
+/// one sprite a layer of it on a light ground, held at every star the card
+/// registers and over every arm `1..=32`
+/// (`a_stars_pieces_stack_at_most_four_deep`).
+pub const STAR_DEPTH_MAX: usize = 4;
+
+/// The most tone rectangles one light star is laid in. Where the trail's
+/// ink crosses it, a light star is the paper's white on the print and its
+/// ink off it, pixel by pixel (§10.6.10): each trail segment under the star
+/// cuts its box into the white over the segment and the ink above and below
+/// it, and the box either side of the trail is one rectangle more.
+const TONE_RECTS_MAX: usize = 3 * MAX_TRAIL_SEGMENTS as usize + 2;
+
+/// The most items one frame of the card holds across its two contents.
 ///
-/// The parts: the border ≤ 96 edge segments plus two side slices per row
-/// band it crosses (the boxed rows, and one either side in each half row of
-/// air over and under them: four more at most); the trail six stripes
-/// settled, ≤ 16 segments of six (each split at the row bands it crosses)
-/// during an episode; the kitty's rectangles (about 95 two rows tall, 110 to
-/// 120 three: the chibi face's detail repeats down few rows) and its rim
-/// (about 55); and up to seventeen stars (the field's nine and the burst's
-/// eight: the ride's five sparkles are out before the burst opens). Each
-/// quad is a GPU instance (a rectangle on the CPU raster).
+/// Under: the border's two edges of at most [`MAX_EDGE_SEGMENTS`] ramps
+/// each and its two sides (each ONE stack of one-row ramps, every pixel row
+/// its band's colour), and the trail's six stripes in at most
+/// [`MAX_TRAIL_SEGMENTS`] segments. Over: the kitty (one sprite), its rim
+/// (one art laid in at most [`RIM_COVER_MAX`] rectangles, each cut round
+/// the trail's hole into at most four), and every
+/// star — the field's [`STARS_MAX`], the burst's [`BURST_STARS`] and the
+/// rainbow's [`GLINTS_MAX`] and the ride's [`SHED_SPARKLES`] — one folded sprite on dark, at most
+/// [`STAR_DEPTH_MAX`] peeled ones a tone rectangle ([`TONE_RECTS_MAX`]) on
+/// light.
 ///
-/// Measured (2026-10-19, launch cards on an 8- and a 20-cell trail, two rows
-/// tall then three): the settled frame — what a card at rest replays into
-/// every frame, typing included — is 316 to 335 quads at 9 × 18 and 356 to
-/// 384 at 16 × 33 and 17 × 35, 37 to 56 more than the kitty before (279 to
-/// 286 and 319 to 327), all of it the art's rectangles and rim; its air
-/// over and under the box adds the four side slices (320 to 339, 360 to
-/// 388). The busiest frame (the burst opening as the ride ends, beside the
-/// field and the stepping trail) wants at most 552 at 9 × 18, 634 at 16 ×
-/// 33 and 645 at 17 × 35 over 300 seeds, three rows on a 20-cell trail in
-/// air (548, 630 and 641 without), so the cap leaves a whole star (34
-/// quads) to spare at the shipping cell sizes (`the_quad_budget_holds`); at
-/// any cell size (8 to 96 px tall) no launch card wants more than 674, in
-/// air at 25 × 53 (670 without), so the cap binds on none and no field star
-/// waits on it. It is the backstop for a pathological scene (hundreds of
-/// boxed rows), spent in the order border → trail → kitty → rim → burst →
-/// stars → sparkles, each star whole or not at all: a frame over it loses a
-/// field star, never one of the burst's ring
-/// (`the_burst_stays_whole_under_the_cap`).
-pub const MAX_CARD_QUADS: usize = 680;
+/// It has NO ART TERM: the kitty is one sprite and the rim one art laid in
+/// at most [`RIM_COVER_MAX`] rectangles, however detailed their art
+/// (`the_card_is_bounded_without_its_art`), and a box of any height has the
+/// same two sides. Nothing is ever cut to it: it is the
+/// bound every frame is held to (debug-asserted as it is built), never a
+/// budget a frame spends. The quad cap it replaces (680 quads, spent border
+/// → trail → kitty → rim → burst → stars → sparkles) grew with the art's
+/// detail and took field stars back on a pathological scene.
+pub const CARD_ITEMS_MAX: usize = CARD_UNDER_ITEMS_MAX + CARD_OVER_ITEMS_MAX;
+
+/// [`CARD_ITEMS_MAX`]'s under content: the border's edges and sides, the
+/// trail's stripes.
+const CARD_UNDER_ITEMS_MAX: usize =
+    2 * MAX_EDGE_SEGMENTS as usize + 2 + TRAIL_STOPS.len() * MAX_TRAIL_SEGMENTS as usize;
+
+/// [`CARD_ITEMS_MAX`]'s over content: the kitty, its rim (each rectangle of
+/// its cover cut round the trail's hole into at most four), the stars.
+const CARD_OVER_ITEMS_MAX: usize = 1
+    + 4 * RIM_COVER_MAX
+    + STAR_DEPTH_MAX * TONE_RECTS_MAX * (STARS_MAX + BURST_STARS + GLINTS_MAX + SHED_SPARKLES);
+
+/// The most rectangles the rim art is laid in. This fixed bound contributes
+/// four items per rectangle when the trail cuts its hole.
+pub(crate) const RIM_COVER_MAX: usize = 32;
+
+const _: () = assert!(
+    CARD_UNDER_ITEMS_MAX == 2 * 48 + 2 + 6 * 16
+        && CARD_ITEMS_MAX == CARD_UNDER_ITEMS_MAX + CARD_OVER_ITEMS_MAX
+        && CARD_ITEMS_MAX < u16::MAX as usize,
+    "the card's item bound is the design's under content and a star term, no art term"
+);
 
 /// The border's hue drift at an episode's start: one trip through the palette
 /// (`φ` moves by 1) per this many ms, easing to a stop at the episode's end.
@@ -485,154 +517,160 @@ type KittyTallFrame = [&'static str; KITTY_TALL_H];
 /// colours (see [`KittyInk::of`]).
 const KITTY_PALETTE: &[u8] = b".ocbkenw";
 
-/// The kitty at rest, eyes open, tail up: a chibi kitten facing right, riding
-/// the rainbow — a big round head over a small body, its haunch on the
-/// trail. `o` outline, `c` coat, `k` pupil and eye ring, `w` catch-light,
-/// `e` iris, `n` inner ears, nose and blush, `b` the front paws' socks. Each
-/// eye is mostly pupil, a white catch-light at its top left and the iris a
-/// band near its foot, so at three or four device pixels an art pixel it
-/// reads as a glossy eye rather than a ring (goggles); the `ω` mouth sits
-/// under the nose on the chin, a row of coat between it and the front paws,
-/// which peek out below in their socks — the cat lies on the rainbow, its
-/// paws tucked under its chin, since a sock right under the mouth reads as a
-/// fang ([`mouth_on_coat`]); the tail is two pixels of coat wide, its tip
-/// hooked back toward the trail.
+/// The kitty at rest, eyes open, tail up: a flying cat facing right, the
+/// rainbow arriving at its haunch — a blocky head in the spirit of Claude's
+/// block mascot, pointed ears lined pink, a long body with a belly patch,
+/// four legs and the tail raised behind. `o` outline, `c` coat, `b` belly
+/// and muzzle, `e` eye, `k` pupil, `n` inner ears and nose. Each eye is a
+/// block of two pixels a row, the eye's own colour behind and a dark pupil
+/// in front ([`PUPIL`]): the iris stops are about as light as a grey coat,
+/// and an eye of iris alone goes on one.
 const KITTY_OPEN: KittyFrame = [
-    ".........o...........o..",
-    ".........oo.........oo..",
-    "oo.......ono.......ono..",
-    "oco......onnooooooonno..",
-    "occo....occccccccccccco.",
-    "occo...occckkccccckkccco",
-    ".occoooocckwkkccckwkkcco",
-    ".occcccocckkkkccckkkkcco",
-    ".occcccocckeekccckeekcco",
-    ".occcccoccckkccncckkccco",
-    ".occcccocnnccocococcnnco",
-    ".occccccooccccococcccoo.",
-    "..occccccooccccccccco...",
-    "...oo..oo...obbo.obbo...",
+    "..............o......o..",
+    ".oo..........ono....ono.",
+    "oco.........onnoooooonno",
+    "oco.........occcccccccco",
+    ".ocoooooooooocccccccccco",
+    "..occcccccccocekccccekco",
+    "..occcccccccocekccccekco",
+    "..occcccccccoccbbnnbbcco",
+    "..ocbbbbbbccoccbbbbbbcco",
+    "..ocbbbbbbcccoooooooooo.",
+    "..occccccccccccco.......",
+    "..occoccoccoccoo........",
+    "..occoccoccocco.........",
+    "...oo.oo.oo.oo..........",
 ];
 
-/// The blink: [`KITTY_OPEN`] with its eyes closed in happy arcs, `^ ^`, a
-/// row of coat (the nose's) between them and the mouth.
+/// The blink: [`KITTY_OPEN`] with the eyes shut to a line.
 const KITTY_BLINK: KittyFrame = [
-    ".........o...........o..",
-    ".........oo.........oo..",
-    "oo.......ono.......ono..",
-    "oco......onnooooooonno..",
-    "occo....occccccccccccco.",
-    "occo...occccccccccccccco",
-    ".occooooccccccccccccccco",
-    ".occcccocccoocccccooccco",
-    ".occcccoccoccocccoccocco",
-    ".occcccocccccccnccccccco",
-    ".occcccocnnccocococcnnco",
-    ".occccccooccccococcccoo.",
-    "..occccccooccccccccco...",
-    "...oo..oo...obbo.obbo...",
+    "..............o......o..",
+    ".oo..........ono....ono.",
+    "oco.........onnoooooonno",
+    "oco.........occcccccccco",
+    ".ocoooooooooocccccccccco",
+    "..occcccccccocccccccccco",
+    "..occcccccccocooccccooco",
+    "..occcccccccoccbbnnbbcco",
+    "..ocbbbbbbccoccbbbbbbcco",
+    "..ocbbbbbbcccoooooooooo.",
+    "..occccccccccccco.......",
+    "..occoccoccoccoo........",
+    "..occoccoccocco.........",
+    "...oo.oo.oo.oo..........",
 ];
 
-/// The tail flick: [`KITTY_OPEN`] with the tail swept flat back into the
-/// trail.
+/// The tail flick: [`KITTY_OPEN`] with the tail swept straight back over
+/// the trail.
 const KITTY_FLICK: KittyFrame = [
-    ".........o...........o..",
-    ".........oo.........oo..",
-    ".........ono.......ono..",
-    ".........onnooooooonno..",
-    "........occccccccccccco.",
-    ".......occckkccccckkccco",
-    "oooooooocckwkkccckwkkcco",
-    "cccccccocckkkkccckkkkcco",
-    "cccccccocckeekccckeekcco",
-    "oocccccoccckkccncckkccco",
-    ".occcccocnnccocococcnnco",
-    ".occccccooccccococcccoo.",
-    "..occccccooccccccccco...",
-    "...oo..oo...obbo.obbo...",
+    "..............o......o..",
+    ".............ono....ono.",
+    "............onnoooooonno",
+    "............occcccccccco",
+    "...oooooooooocccccccccco",
+    "ooocccccccccocekccccekco",
+    "ccccccccccccocekccccekco",
+    "ooocccccccccoccbbnnbbcco",
+    "..ocbbbbbbccoccbbbbbbcco",
+    "..ocbbbbbbcccoooooooooo.",
+    "..occccccccccccco.......",
+    "..occoccoccoccoo........",
+    "..occoccoccocco.........",
+    "...oo.oo.oo.oo..........",
 ];
 
 /// The tall kitty at rest (§10.6): [`KITTY_OPEN`]'s cat stood three rows
-/// tall — the same ears, the head four rows taller above the same face (its
-/// eyes, nose, blush and mouth row for row the two-row cat's), and a body
-/// that stands: the haunch under the head, longer legs, white socks on the
-/// front paws alone (the hind paws plain coat, quieter on a black coat over
-/// a dark ground), and between the legs the ground.
+/// tall — the same head twelve pixels wide with its pink-lined ears a row
+/// taller, eyes a pixel taller with a white catch-light (`w`) over the
+/// pupil, the nose and muzzle where the two-row cat has them; a deeper body
+/// with the same belly patch, legs a row longer, and the tail a row longer,
+/// up.
 const KITTY_TALL_OPEN: KittyTallFrame = [
-    ".........o...........o..",
-    ".........oo.........oo..",
-    "oo.......ono.......ono..",
-    "oco......onnooooooonno..",
-    "occo....occccccccccccco.",
-    "occo....occccccccccccco.",
-    "occo....occccccccccccco.",
-    "occo...occccccccccccccco",
-    "occo...occccccccccccccco",
-    "occo...occckkccccckkccco",
-    ".occoooocckwkkccckwkkcco",
-    ".occcccocckkkkccckkkkcco",
-    ".occcccocckeekccckeekcco",
-    ".occcccoccckkccncckkccco",
-    ".occcccocnnccocococcnnco",
-    ".occccccooccccococcccoo.",
-    ".occcccccooccccccccco...",
-    "..occcccccccocco.occo...",
-    "...occcoccccobbo.obbo...",
-    "...occo.occo.oo...oo....",
-    "....oo...oo.............",
+    "..............o......o..",
+    ".oo..........ono....ono.",
+    "oco.........onno....onno",
+    "oco.........onnoooooonno",
+    "oco.........occcccccccco",
+    "oco.........occcccccccco",
+    ".ocoooooooooocccccccccco",
+    "..occcccccccocewccccewco",
+    "..occcccccccocekccccekco",
+    "..occcccccccocekccccekco",
+    "..occcccccccoccbbnnbbcco",
+    "..occcccccccoccbbbbbbcco",
+    "..ocbbbbbbccoccbbbbbbcco",
+    "..ocbbbbbbcccoooooooooo.",
+    "..ocbbbbbbcccccco.......",
+    "..occccccccccccco.......",
+    "..occccccccccccco.......",
+    "..occoccoccoccoo........",
+    "..occoccoccocco.........",
+    "..occoccoccocco.........",
+    "...oo.oo.oo.oo..........",
 ];
 
-/// The tall blink: [`KITTY_TALL_OPEN`] with its eyes closed in happy arcs,
-/// as [`KITTY_BLINK`] closes them.
+/// The tall blink: [`KITTY_TALL_OPEN`] with the eyes shut to a line across
+/// their middle row.
 const KITTY_TALL_BLINK: KittyTallFrame = [
-    ".........o...........o..",
-    ".........oo.........oo..",
-    "oo.......ono.......ono..",
-    "oco......onnooooooonno..",
-    "occo....occccccccccccco.",
-    "occo....occccccccccccco.",
-    "occo....occccccccccccco.",
-    "occo...occccccccccccccco",
-    "occo...occccccccccccccco",
-    "occo...occccccccccccccco",
-    ".occooooccccccccccccccco",
-    ".occcccocccoocccccooccco",
-    ".occcccoccoccocccoccocco",
-    ".occcccocccccccnccccccco",
-    ".occcccocnnccocococcnnco",
-    ".occccccooccccococcccoo.",
-    ".occcccccooccccccccco...",
-    "..occcccccccocco.occo...",
-    "...occcoccccobbo.obbo...",
-    "...occo.occo.oo...oo....",
-    "....oo...oo.............",
+    "..............o......o..",
+    ".oo..........ono....ono.",
+    "oco.........onno....onno",
+    "oco.........onnoooooonno",
+    "oco.........occcccccccco",
+    "oco.........occcccccccco",
+    ".ocoooooooooocccccccccco",
+    "..occcccccccocccccccccco",
+    "..occcccccccocooccccooco",
+    "..occcccccccocccccccccco",
+    "..occcccccccoccbbnnbbcco",
+    "..occcccccccoccbbbbbbcco",
+    "..ocbbbbbbccoccbbbbbbcco",
+    "..ocbbbbbbcccoooooooooo.",
+    "..ocbbbbbbcccccco.......",
+    "..occccccccccccco.......",
+    "..occccccccccccco.......",
+    "..occoccoccoccoo........",
+    "..occoccoccocco.........",
+    "..occoccoccocco.........",
+    "...oo.oo.oo.oo..........",
 ];
 
-/// The tall tail flick: [`KITTY_TALL_OPEN`] with the tail swept flat back
-/// into the trail, as [`KITTY_FLICK`] sweeps it.
+/// The tall tail flick: [`KITTY_TALL_OPEN`] with the tail swept straight
+/// back over the trail at the top of the body, as [`KITTY_FLICK`] sweeps it.
 const KITTY_TALL_FLICK: KittyTallFrame = [
-    ".........o...........o..",
-    ".........oo.........oo..",
-    ".........ono.......ono..",
-    ".........onnooooooonno..",
-    "........occccccccccccco.",
-    "........occccccccccccco.",
-    "........occccccccccccco.",
-    ".......occccccccccccccco",
-    ".......occccccccccccccco",
-    ".......occckkccccckkccco",
-    "oooooooocckwkkccckwkkcco",
-    "cccccccocckkkkccckkkkcco",
-    "cccccccocckeekccckeekcco",
-    "oocccccoccckkccncckkccco",
-    ".occcccocnnccocococcnnco",
-    ".occccccooccccococcccoo.",
-    ".occcccccooccccccccco...",
-    "..occcccccccocco.occo...",
-    "...occcoccccobbo.obbo...",
-    "...occo.occo.oo...oo....",
-    "....oo...oo.............",
+    "..............o......o..",
+    ".............ono....ono.",
+    "............onno....onno",
+    "............onnoooooonno",
+    "............occcccccccco",
+    "............occcccccccco",
+    "...oooooooooocccccccccco",
+    "ooocccccccccocewccccewco",
+    "ccccccccccccocekccccekco",
+    "ooocccccccccocekccccekco",
+    "..occcccccccoccbbnnbbcco",
+    "..occcccccccoccbbbbbbcco",
+    "..ocbbbbbbccoccbbbbbbcco",
+    "..ocbbbbbbcccoooooooooo.",
+    "..ocbbbbbbcccccco.......",
+    "..occccccccccccco.......",
+    "..occccccccccccco.......",
+    "..occoccoccoccoo........",
+    "..occoccoccocco.........",
+    "..occoccoccocco.........",
+    "...oo.oo.oo.oo..........",
 ];
+
+/// Which frame of its art the kitty wears ([`kitty_frame`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KittyPose {
+    /// Eyes open, tail up.
+    Open = 0,
+    /// The happy blink.
+    Blink = 1,
+    /// The tail flick.
+    Flick = 2,
+}
 
 /// One height of the kitty: its three frames — open, blink, flick — its eye
 /// rows, `[first, end)` (the only rows the blink changes), and its body band,
@@ -648,6 +686,15 @@ struct KittyArt {
 }
 
 impl KittyArt {
+    /// The art's frame in `pose`.
+    const fn frame(&self, pose: KittyPose) -> &'static [&'static str] {
+        match pose {
+            KittyPose::Open => self.open,
+            KittyPose::Blink => self.blink,
+            KittyPose::Flick => self.flick,
+        }
+    }
+
     /// The art's height in pixels.
     const fn h(&self) -> usize {
         self.open.len()
@@ -658,26 +705,27 @@ impl KittyArt {
         self.h() / KITTY_HALF
     }
 
-    /// The face's last pixel row, the `ω`'s feet: the face is the
-    /// [`KITTY_HALF`] rows from the eyes' top, at both heights the same.
-    const fn mouth_row(&self) -> usize {
-        self.eyes.0 + KITTY_HALF - 1
-    }
-
     /// The column the trail runs to under the art ([`KittyAt::rear`]): the
-    /// furthest in of the body band's rows' first pixels in the open frame,
-    /// so the rainbow meets the haunch flush on every row it spans. The
-    /// art's own opaque pixels hide the stripes left of it on a row that
-    /// starts sooner ([`trail_meets_flush`]).
+    /// furthest in of the body band's rows' first pixels in ANY of its
+    /// frames, so the rainbow meets the haunch flush on every row it spans
+    /// whichever frame shows — the flick's back, its tail swept down, starts
+    /// a pixel further in than the open frame's. The art's own opaque pixels
+    /// hide the stripes left of it on a row that starts sooner
+    /// ([`trail_meets_flush`]).
     const fn rear(&self) -> usize {
+        let frames = [self.open, self.blink, self.flick];
         let mut rear = 0;
-        let mut r = self.body.0;
-        while r < self.body.0 + self.body.1 {
-            let first = first_art(self.open[r].as_bytes());
-            if first > rear {
-                rear = first;
+        let mut f = 0;
+        while f < frames.len() {
+            let mut r = self.body.0;
+            while r < self.body.0 + self.body.1 {
+                let first = first_art(frames[f][r].as_bytes());
+                if first > rear {
+                    rear = first;
+                }
+                r += 1;
             }
-            r += 1;
+            f += 1;
         }
         rear
     }
@@ -688,8 +736,8 @@ const KITTY_SHORT: KittyArt = KittyArt {
     open: &KITTY_OPEN,
     blink: &KITTY_BLINK,
     flick: &KITTY_FLICK,
-    eyes: (5, 10),
-    body: (6, 7),
+    eyes: (5, 7),
+    body: (4, 7),
 };
 
 /// The tall kitty (§10.6).
@@ -697,8 +745,8 @@ const KITTY_TALL: KittyArt = KittyArt {
     open: &KITTY_TALL_OPEN,
     blink: &KITTY_TALL_BLINK,
     flick: &KITTY_TALL_FLICK,
-    eyes: (9, 14),
-    body: (10, 8),
+    eyes: (7, 10),
+    body: (6, 12),
 };
 
 /// The flick changes only the columns left of this one: the tail.
@@ -768,14 +816,18 @@ const fn first_art(row: &[u8]) -> usize {
     c
 }
 
-/// Whether, on every row of `body` in `frame`, the pixels from the row's
-/// first to column `rear` are all art: the trail laid to `rear` under the
-/// cat shows left of its silhouette only, never through a hole inside it.
+/// Whether, on every row of `body` in `frame`, the row's first pixel is at
+/// or left of column `rear` and the pixels from it to `rear` are all art:
+/// the trail laid to `rear` under the cat shows left of its silhouette only,
+/// never through a hole inside it nor across a strip of ground short of it.
 const fn trail_meets_flush(frame: &[&str], body: (usize, usize), rear: usize) -> bool {
     let mut r = body.0;
     while r < body.0 + body.1 {
         let row = frame[r].as_bytes();
         let mut c = first_art(row);
+        if c > rear {
+            return false;
+        }
         while c < rear {
             if row[c] == b'.' {
                 return false;
@@ -785,27 +837,6 @@ const fn trail_meets_flush(frame: &[&str], body: (usize, usize), rear: usize) ->
         r += 1;
     }
     true
-}
-
-/// Whether the mouth on `frame`'s row `r` stands on coat: under each of its
-/// pixels — the row's outline pixels with coat either side, the `ω`'s feet —
-/// and under the coat either side of it, row `r + 1` is coat, neither a sock
-/// nor an outline, so nothing under the mouth reads as a tooth. False where
-/// the row holds no mouth, so a check pointed at the wrong row fails.
-const fn mouth_on_coat(frame: &[&str], r: usize) -> bool {
-    let (row, under) = (frame[r].as_bytes(), frame[r + 1].as_bytes());
-    let mut mouth = 0;
-    let mut c = 1;
-    while c + 1 < KITTY_W {
-        if row[c] == b'o' && row[c - 1] == b'c' && row[c + 1] == b'c' {
-            if under[c - 1] != b'c' || under[c] != b'c' || under[c + 1] != b'c' {
-                return false;
-            }
-            mouth += 1;
-        }
-        c += 1;
-    }
-    mouth > 0
 }
 
 /// How many times palette character `ch` appears in `frame`'s rows `rows`.
@@ -824,17 +855,54 @@ const fn count_in(frame: &[&str], rows: (usize, usize), ch: u8) -> usize {
     n
 }
 
+/// Whether `frame`'s rows `rows` hold two eyes, each an iris (`e`) and a
+/// pupil (`k`): the columns holding any pixel of an eye there (iris, pupil
+/// or the catch-light `w`) fall in exactly two runs, and each run holds both
+/// an iris and a pupil. An eye of iris alone goes into a grey coat
+/// ([`PUPIL`]), so one drawn without its pupil stops the build, as does a
+/// face with one eye, or with the two run together.
+const fn two_eyes_of_iris_and_pupil(frame: &[&str], rows: (usize, usize)) -> bool {
+    let mut eyes = 0;
+    let (mut in_eye, mut iris, mut pupil) = (false, false, false);
+    let mut c = 0;
+    while c <= KITTY_W {
+        let (mut e, mut k, mut any) = (false, false, false);
+        let mut r = rows.0;
+        while c < KITTY_W && r < rows.1 {
+            let b = frame[r].as_bytes()[c];
+            e = e || b == b'e';
+            k = k || b == b'k';
+            any = any || b == b'e' || b == b'k' || b == b'w';
+            r += 1;
+        }
+        if any {
+            if !in_eye {
+                (in_eye, iris, pupil) = (true, false, false);
+            }
+            iris = iris || e;
+            pupil = pupil || k;
+        } else if in_eye {
+            if !(iris && pupil) {
+                return false;
+            }
+            eyes += 1;
+            in_eye = false;
+        }
+        c += 1;
+    }
+    eyes == 2
+}
+
 /// THE SHAPE CHECKS, at both heights: every frame [`KITTY_W`] palette
 /// characters by its art's height, a whole number of cell rows; the blink is
 /// the open frame with its eyes closed (the eye rows alone change, and no
 /// pixel of an eye — pupil, catch-light or iris — is left); the flick is the
 /// open frame with its tail moved (the columns left of [`KITTY_TAIL_COLS`]
-/// alone change); the open cat has eyes, pupils and irises; the mouth
-/// stands on a row of coat in every frame ([`mouth_on_coat`]), so the front
-/// paws never stand right under it; the body band lies inside the art and
-/// holds the trail's six stripes; and the trail laid to the art's
-/// [`rear`](KittyArt::rear) meets the cat flush in every frame, within the
-/// tail's columns.
+/// alone change); the open cat has two eyes, each an iris and a pupil
+/// ([`two_eyes_of_iris_and_pupil`]); the body
+/// band lies inside the art and holds the trail's six stripes; and the trail
+/// laid to the art's [`rear`](KittyArt::rear) meets the cat flush in every
+/// frame, within the tail's columns.
 const _: () = {
     let arts = [KITTY_SHORT, KITTY_TALL];
     let heights = [KITTY_H, KITTY_TALL_H];
@@ -856,22 +924,16 @@ const _: () = {
             differ_only_in(art.open, art.blink, art.eyes, (0, KITTY_W))
                 && count_in(art.blink, art.eyes, b'e') == 0
                 && count_in(art.blink, art.eyes, b'k') == 0
-                && count_in(art.blink, art.eyes, b'w') == 0
-                && count_in(art.open, art.eyes, b'e') > 0
-                && count_in(art.open, art.eyes, b'k') > 0,
+                && count_in(art.blink, art.eyes, b'w') == 0,
             "the blink is the open frame with its eyes closed"
+        );
+        assert!(
+            two_eyes_of_iris_and_pupil(art.open, art.eyes),
+            "the open cat has two eyes, each an iris and a pupil"
         );
         assert!(
             differ_only_in(art.open, art.flick, (0, h), (0, KITTY_TAIL_COLS)),
             "the flick is the open frame with its tail moved"
-        );
-        let mouth = art.mouth_row();
-        assert!(
-            mouth + 1 < h
-                && mouth_on_coat(art.open, mouth)
-                && mouth_on_coat(art.blink, mouth)
-                && mouth_on_coat(art.flick, mouth),
-            "the mouth stands on a row of coat, the front paws a row below"
         );
         assert!(
             art.body.0 + art.body.1 <= h && art.body.1 >= 6,
@@ -914,17 +976,16 @@ const _: () = assert!(
     "a blink and a flick never share a frame"
 );
 
-/// The kitty's nose, inner ears and blush.
+/// The kitty's nose and inner ears.
 const NOSE_PINK: u32 = 0x00FF_8FAB;
 
-/// The kitty's pupils and eye rings (`k`), on every coat and both grounds:
-/// a near-black a shade under `cat_baker::COAT_RAMP`'s blackest coat, so
-/// the eye is a dark gloss on a grey or an orange coat (the grey coat's
-/// iris is about as light as its fur, and without a dark pupil the eye
-/// goes), and not the very fur of the blackest one, whose eyes the
-/// catch-light and the iris band carry. Not the outline's colour: on a
-/// near-black coat over a dark ground the outline turns light grey, which
-/// would ring each eye like goggles.
+/// The kitty's pupils (`k`), on every coat and both grounds: a near-black a
+/// shade under `cat_baker::COAT_RAMP`'s blackest coat, so the eye reads on
+/// a grey or an orange coat (the grey coat's iris is about as light as its
+/// fur, and an eye of iris alone goes on it), and not the very fur of the
+/// blackest one, whose eyes the iris beside the pupil (and, three rows
+/// tall, the catch-light over it) carry. Not the outline's colour: on a
+/// near-black coat over a dark ground the outline turns light grey.
 const PUPIL: u32 = 0x000A_0A0E;
 
 /// The dark rim's coverage (additive light), the border's own.
@@ -986,14 +1047,47 @@ const _: () = assert!(
 /// A burst star's coverage at launch.
 const BURST_COV: f32 = 255.0;
 
-/// An upper bound on one star's quads: two body bars, the nucleus and up to
-/// [`STAR_TAPER_STEPS`] spans on each of four points, every one of them
-/// possibly split at the row boundary (a star is shorter than a cell, so it
-/// crosses at most one), plus four one-pixel glints. The headroom a frame at
-/// shipping sizes keeps (`the_quad_budget_holds`); a star itself is laid
-/// whole or taken back, to the quad ([`push_star`]).
-#[cfg(test)]
-const STAR_QUADS_MAX: usize = 2 * (3 + 4 * STAR_TAPER_STEPS as usize) + 4;
+// ─── the rainbow's glints ───────────────────────────────────────────────────
+//
+// Claude Code's mascot holds a wand tipped with a sparkle, `╱✦` (2.1.302 on,
+// a session at `--effort workspace`: `crates/aterm-phase/src/fixtures/`
+// `claude-2.1.302-launch-workspace-*`). Read off the 2.1.304 bundle: the `✦`
+// is one glyph that never changes shape. At rest it is a steady gold (dark
+// `#FFCC68`, light `#F07618`), and so it stays on the inline renderer and
+// wherever motion is off. Only on the fullscreen renderer, focused, in true
+// colour, does it animate, on a 3.072 s cycle of 128 ms ticks: a 256 ms
+// flare to near white (bold), 384 ms cooling back to gold, an ember flicker,
+// and a 512 ms wind-up to the next flare — while a crest of light runs out
+// from the wand's tip across the mascot. (Its entrance's dust, `·` then `~`
+// beside its feet, is a separate 60 ms puff as it lands.)
+//
+// The card's rainbow wears the same sparkle, in the card's own star (the
+// crate's one four-point silhouette, `effect_util`): a few GLINTS sit ON
+// the trail's stripes, wholly inside its band, clear of the kitty and of
+// the field. Settled they are steady and gold, the family's standard star —
+// Claude's `✦` at rest — so the card at rest stays constant bytes. During
+// an episode they twinkle on the family law, and each FLARES as the trail's
+// shimmer runs over it (the crest): it grows to the family's hero grain,
+// whitens, and throws its diffraction glints, then cools back as the sheen
+// moves on. On the ride each comes up once the kitty has
+// passed it. On a light ground a glint on the print is the paper's white
+// (the trail's print ink), as every star on the trail is.
+
+/// The most glints one trail wears.
+const GLINTS_MAX: usize = 3;
+
+/// One glint per this many cells of the trail's free stretch (left of the
+/// kitty), one at least where the band has room: one on a launch card's
+/// shortest trail (8 cells), three on its longest (20).
+const GLINT_CELLS: i64 = 6;
+
+/// A glint's coverage at the twinkle's peak; settled it holds
+/// [`STAR_STEADY_ENV`] of it, as the field does.
+const GLINT_COV: f32 = 235.0;
+
+/// The share of the shimmer's peak past which a flaring glint throws its
+/// diffraction glints (Claude's flare goes bold).
+const GLINT_FLARE_DOTS: f32 = 0.5;
 
 // ─── the line ───────────────────────────────────────────────────────────────
 
@@ -1107,6 +1201,10 @@ const _: () = {
     assert!(
         1000.0 / (2.0 * WAVE_STEP_MS as f32) <= TWINKLE_FLASH_BOUND_HZ,
         "the trail's step wave cycles under the photosensitivity bound"
+    );
+    assert!(
+        1000.0 / SHIMMER_MS <= TWINKLE_FLASH_BOUND_HZ,
+        "a glint flares under the photosensitivity bound"
     );
 };
 
@@ -1242,8 +1340,9 @@ pub struct CardScene {
     pub cw: u16,
     /// Cell height in pixels.
     pub ch: u16,
-    /// The stream's row index of grid row 0: a quad in grid row `r` is tagged
-    /// `row_base + r` (the [`GlowQuad::row`] damage hint).
+    /// The stream's row index of grid row 0. The fx layers need none (the
+    /// engine finds the bands); the tests' quad oracle tags a quad in grid
+    /// row `r` with `row_base + r`.
     pub row_base: u16,
     /// Pixels available left of column 0 (the pane's padding): the border's
     /// left side sits up to half a cell into it.
@@ -1400,36 +1499,6 @@ enum Ride {
     Done,
 }
 
-/// One card's last SETTLED frame — its scene and its quads — kept by the
-/// host beside the card so that a card at rest is replayed rather than drawn
-/// again ([`HarnessCard::tick_or_replay`], [`HarnessCard::replay`]); its
-/// fingerprint is the quads' ([`HarnessCard::tick`]), made only when asked.
-/// `Default` holds nothing. Its buffers are reused, so a host that keeps one
-/// per card allocates nothing for it once the first settled frame is in.
-#[derive(Clone, Debug, Default)]
-pub struct SettledFrame {
-    /// The scene the frame was drawn for; `None` while it holds no frame.
-    scene: Option<CardScene>,
-    under: Vec<GlowQuad>,
-    over: Vec<GlowQuad>,
-}
-
-impl SettledFrame {
-    /// The settled frame's border and trail ([`HarnessCard::tick`]'s
-    /// `under`); empty while it holds no frame.
-    #[must_use]
-    pub fn under(&self) -> &[GlowQuad] {
-        &self.under
-    }
-
-    /// The settled frame's kitty and stars ([`HarnessCard::tick`]'s `over`);
-    /// empty while it holds no frame.
-    #[must_use]
-    pub fn over(&self) -> &[GlowQuad] {
-        &self.over
-    }
-}
-
 /// Where the card's episode stands ([`HarnessCard`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Episode {
@@ -1543,6 +1612,17 @@ impl Rect {
     fn contains(self, x: i64, y: i64) -> bool {
         (self.x0..self.x1).contains(&x) && (self.y0..self.y1).contains(&y)
     }
+
+    /// `self` moved by `(dx, dy)`.
+    #[cfg(test)]
+    fn shift(self, dx: i64, dy: i64) -> Self {
+        Self {
+            x0: self.x0 + dx,
+            y0: self.y0 + dy,
+            x1: self.x1 + dx,
+            y1: self.y1 + dy,
+        }
+    }
 }
 
 /// The scene resolved to pixels (`i64`, so no product of `u16`s overflows).
@@ -1554,6 +1634,8 @@ struct Geo {
     oy: i64,
     top: i64,
     rows: i64,
+    /// The stream's row of grid row 0: the quad oracle's row tags.
+    #[cfg(test)]
     row_base: i64,
     /// The boxed rows' rectangle: the border's outer rectangle as it stands
     /// with no air, from the banner row's band to the last boxed row's, its
@@ -1619,6 +1701,7 @@ impl Geo {
             oy,
             top,
             rows,
+            #[cfg(test)]
             row_base: i64::from(s.row_base),
             core,
             outer,
@@ -1657,68 +1740,29 @@ struct Paint {
     alpha: u8,
 }
 
-/// The one way a quad leaves this module: clipped, split at every row band,
-/// tagged, and charged against the tick's budget.
-struct Sink {
-    geo: Geo,
-    left: usize,
+/// Where the border's and the trail's ramps go: the fx under content, or
+/// the tests' quad oracle.
+trait Ramps {
+    /// Lay `r`, clipped to `clip` and the box, as a horizontal ramp from `l`
+    /// at its left edge to `rt` at its right.
+    fn ramp(&mut self, clip: Rect, r: Rect, l: Paint, rt: Paint);
+
+    /// Lay one slice of a border side, flat `p` over `r` clipped to `clip`
+    /// and the box. A side's slices come one after another down the side,
+    /// one a band.
+    fn side(&mut self, clip: Rect, r: Rect, p: Paint);
 }
 
-impl Sink {
-    /// Push `r` (clipped to `clip` and the box) as a horizontal ramp from `l`
-    /// at its left edge to `rt` at its right; split at every row band.
-    /// Returns `false` where the budget could not take a quad `r` needs: a
-    /// rectangle that spends the last of it is laid whole, and the next one
-    /// that needs a quad is refused.
-    fn push(&mut self, out: &mut Vec<GlowQuad>, clip: Rect, r: Rect, l: Paint, rt: Paint) -> bool {
-        // Additive zero light adds nothing; a source-over quad still darkens.
-        if l.alpha == 0 && l.color == 0 && rt.color == 0 {
-            return true;
-        }
-        let c = r.meet(clip).meet(self.geo.clip);
-        if c.is_empty() {
-            return true;
-        }
-        // A horizontal clip moves a ramp's ends: read them off the ramp.
-        let (l, rt) = if (c.x0, c.x1) == (r.x0, r.x1) {
-            (l, rt)
-        } else {
-            let span = (r.x1 - r.x0) as f32;
-            let at = |x: i64| ramp(l, rt, (x - r.x0) as f32 / span);
-            (at(c.x0), at(c.x1))
-        };
-        let g = self.geo;
-        let mut y = c.y0;
-        while y < c.y1 {
-            let band = (y - g.oy).div_euclid(g.ch);
-            let end = g.band(band + 1).min(c.y1);
-            if let Ok(row) = u16::try_from(g.row_base + band) {
-                if self.left == 0 {
-                    return false;
-                }
-                self.left -= 1;
-                // In range: `c` lies inside the u16 pixel space.
-                let q = GlowQuad::gradient(
-                    row,
-                    c.x0 as u16,
-                    y as u16,
-                    (c.x1 - c.x0) as u16,
-                    (end - y) as u16,
-                    l.color,
-                    l.alpha,
-                    rt.color,
-                    rt.alpha,
-                );
-                out.push(q);
-            }
-            y = end;
-        }
-        true
-    }
-
-    /// [`Self::push`] for one flat colour.
-    fn flat(&mut self, out: &mut Vec<GlowQuad>, clip: Rect, r: Rect, p: Paint) -> bool {
-        self.push(out, clip, r, p, p)
+/// The ends of the ramp `l` → `rt` over `r` once a clip has cut it to `c`:
+/// read off the ramp at `c`'s edges where the clip moved them (a horizontal
+/// clip keeps a ramp's colours where it cuts it), else `l` and `rt`.
+fn clip_ramp(r: Rect, c: Rect, l: Paint, rt: Paint) -> (Paint, Paint) {
+    if (c.x0, c.x1) == (r.x0, r.x1) {
+        (l, rt)
+    } else {
+        let span = (r.x1 - r.x0) as f32;
+        let at = |x: i64| ramp(l, rt, (x - r.x0) as f32 / span);
+        (at(c.x0), at(c.x1))
     }
 }
 
@@ -1767,14 +1811,14 @@ fn ink(rgb: u32, alpha: f32) -> Paint {
 struct KittyInk {
     outline: u32,
     coat: u32,
-    /// The front paws' socks: the coat lifted toward white.
-    socks: u32,
-    /// The pupils and eye rings ([`PUPIL`]).
+    /// The belly and muzzle: the coat lifted toward white.
+    belly: u32,
+    /// The pupils ([`PUPIL`]).
     pupil: u32,
     /// The iris.
     eye: u32,
     nose: u32,
-    /// The eyes' catch-light.
+    /// The tall kitty's catch-light.
     glint: u32,
 }
 
@@ -1792,7 +1836,7 @@ impl KittyInk {
         Self {
             outline,
             coat,
-            socks: mix_rgb(coat, WHITE, 0.55),
+            belly: mix_rgb(coat, WHITE, 0.55),
             pupil: PUPIL,
             eye: eye & 0x00FF_FFFF,
             nose: NOSE_PINK,
@@ -1805,7 +1849,7 @@ impl KittyInk {
         match c {
             b'o' => Some(self.outline),
             b'c' => Some(self.coat),
-            b'b' => Some(self.socks),
+            b'b' => Some(self.belly),
             b'k' => Some(self.pupil),
             b'e' => Some(self.eye),
             b'n' => Some(self.nose),
@@ -1815,19 +1859,20 @@ impl KittyInk {
     }
 }
 
-/// The frame of `art` shown `t_ms` into an episode (the open frame when
-/// settled): a blink every [`BLINK_PERIOD_MS`], a tail flick between them.
-fn kitty_frame(art: &KittyArt, clock: Clock) -> &'static [&'static str] {
+/// Which frame of its art the kitty shows `t_ms` into an episode (the open
+/// frame when settled): a blink every [`BLINK_PERIOD_MS`], a tail flick
+/// between them. [`KittyArt::frame`] reads it.
+fn kitty_frame(clock: Clock) -> KittyPose {
     let Some(t) = clock.t_ms else {
-        return art.open;
+        return KittyPose::Open;
     };
     let in_window = |at: u64, period: u64, len: u64| t >= at && (t - at) % period < len;
     if in_window(BLINK_AT_MS, BLINK_PERIOD_MS, BLINK_MS) {
-        art.blink
+        KittyPose::Blink
     } else if in_window(FLICK_AT_MS, FLICK_PERIOD_MS, FLICK_MS) {
-        art.flick
+        KittyPose::Flick
     } else {
-        art.open
+        KittyPose::Open
     }
 }
 
@@ -1940,10 +1985,40 @@ fn rim_solid(frame: &[&str], r: i64, c: i64) -> bool {
 /// three rows and the box holds them, else the two-row kitty.
 fn kitty_art(g: &Geo, s: &CardScene) -> KittyArt {
     if s.kitty_rows >= 3 && g.rows >= 3 {
-        KITTY_TALL
+        kitty_tall()
     } else {
         KITTY_SHORT
     }
+}
+
+/// The tall kitty ([`KITTY_TALL`]), or in a test the art standing in for it
+/// ([`stand_in`]).
+fn kitty_tall() -> KittyArt {
+    #[cfg(test)]
+    if let Some(art) = TALL_STAND_IN.with(std::cell::Cell::get) {
+        return art;
+    }
+    KITTY_TALL
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The tall kitty this thread's tests draw in its place ([`stand_in`]).
+    static TALL_STAND_IN: std::cell::Cell<Option<KittyArt>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test seam: draw `art` as the tall kitty on this thread (`None`: the real
+/// one again). While one stands in, [`CardArts::for_cell`] builds afresh.
+#[cfg(test)]
+fn stand_in(art: Option<KittyArt>) {
+    TALL_STAND_IN.with(|c| c.set(art));
+}
+
+/// Whether a stand-in tall kitty is drawn on this thread ([`stand_in`]).
+#[cfg(test)]
+fn stand_in_active() -> bool {
+    TALL_STAND_IN.with(|c| c.get().is_some())
 }
 
 /// Where the kitty's art sits at pixel size `p` with its left edge at `x0`,
@@ -2095,9 +2170,122 @@ fn across_trail(b: Rect, (t, amp): (Rect, i64)) -> bool {
     !b.meet(outer).is_empty() && !inside
 }
 
+/// One glint on the rainbow ([`glint_spots`]): its centre and twinkle phase.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GlintSpot {
+    x: i64,
+    y: i64,
+    phase: f32,
+}
+
+/// The rainbow's glints for a scene ([`glint_spots`]): up to [`GLINTS_MAX`]
+/// spots, and their arm at rest and at a flare's peak (px).
+#[derive(Clone, Copy, Debug, Default)]
+struct Glints {
+    spots: [GlintSpot; GLINTS_MAX],
+    n: usize,
+    rest: i64,
+    flare: i64,
+}
+
+impl Glints {
+    /// The glints laid.
+    fn spots(&self) -> &[GlintSpot] {
+        &self.spots[..self.n]
+    }
+}
+
+/// A glint's arm at rest and at its flare's peak (px) on a trail band `h`
+/// pixels tall whose edges the wave steps by `amp`: the family's standard
+/// star at rest and its hero grain flaring (by the ink tax on a light
+/// ground), each held to the largest whose reach lies inside the band at
+/// every step of the wave, so a glint never pokes off the rainbow; `0`, no
+/// glint, where not even a one-pixel arm fits.
+fn glint_arms(g: &Geo, dark: bool, h: i64, amp: i64) -> (i64, i64) {
+    let tax = if dark { 1.0 } else { STAR_ARM_INK };
+    // A reach of `2·(arm + 1) + 1` rows inside `h − 2·amp`.
+    let fits = ((h - 2 * amp - 1) / 2 - 1).max(0);
+    let arm = |ratio: f32| i64::from(star_arm_px(star_arm(g.ch as f32, ratio * tax))).min(fits);
+    (arm(STAR_ARM_STD), arm(STAR_ARM_HERO))
+}
+
+/// The glints' spots for this seed and geometry (§10.6.11): one per
+/// [`GLINT_CELLS`] of the trail's free stretch, at most [`GLINTS_MAX`], each
+/// in its own slice of it, ON a stripe — the four inner ones by turns from
+/// a seeded start, so neighbours sit on different stripes — and, at its
+/// flare's reach, wholly inside the band in every step of the wave (on a
+/// light ground, one tone: the paper's white), clear of the kitty by that
+/// reach, inside the star region (never over the card's text) and inside
+/// one row band where the band has room on the stripe's side of the line.
+/// None where the band is too short to hold a glint. A pure function of its
+/// inputs, recomputed each tick.
+fn glint_spots(g: &Geo, s: &CardScene, seed: u64) -> Glints {
+    let mut out = Glints::default();
+    let Some(region) = star_region(g, s) else {
+        return out;
+    };
+    let seat = kitty_rect(g, s);
+    let Some((t, amp)) = trail_rect(g, s, seat) else {
+        return out;
+    };
+    let (rest, flare) = glint_arms(g, s.dark, t.y1 - t.y0, amp);
+    if rest < 1 {
+        return out;
+    }
+    let m = flare + 1;
+    // The free stretch: the trail left of the kitty's art.
+    let free = seat.map_or(t.x1, |at| at.rect.x0.min(t.x1));
+    let room = Rect {
+        x0: t.x0.max(region.x0) + m,
+        y0: (t.y0 + amp).max(region.y0) + m,
+        x1: free.min(region.x1) - m,
+        y1: (t.y1 - amp).min(region.y1) - m,
+    };
+    if room.is_empty() {
+        return out;
+    }
+    let cells = (free - t.x0) / g.cw.max(1);
+    let n = usize::try_from(cells / GLINT_CELLS)
+        .unwrap_or(0)
+        .clamp(1, GLINTS_MAX);
+    let stripes = TRAIL_STOPS.len() as i64;
+    let first = (mix(seed ^ 0x474C_494E) % 4) as usize;
+    for (i, spot) in out.spots[..n].iter_mut().enumerate() {
+        let span = room.x1 - room.x0;
+        let at = (i as f32 + 0.2 + 0.6 * unit(seed, 0x474C_0000 | i as u64)) / n as f32;
+        let x = room.x0 + (span as f32 * at) as i64;
+        // Stripes 1 to 4 by turns, two apart: upper, lower, upper.
+        let k = 1 + [0i64, 2, 1, 3][(first + i) % 4];
+        let centre = t.y0 + (t.y1 - t.y0) * (2 * k + 1) / (2 * stripes);
+        let mut y = centre.clamp(room.y0, room.y1 - 1);
+        // Off the line between two rows where the band leaves room on the
+        // stripe's side of it: a star laid across it is split in two.
+        let row_of = |py: i64| (py - g.oy).div_euclid(g.ch);
+        if row_of(y - m) != row_of(y + m) {
+            let line = g.band(row_of(y + m));
+            let (above, below) = (line - m - 1, line + m);
+            let side = if centre < line { above } else { below };
+            if (room.y0..room.y1).contains(&side) {
+                y = side;
+            }
+        }
+        *spot = GlintSpot {
+            x,
+            y,
+            phase: unit(seed, 0x474C_5048 ^ i as u64) * std::f32::consts::PI,
+        };
+    }
+    Glints {
+        n,
+        rest,
+        flare,
+        ..out
+    }
+}
+
 /// The field's spots for this seed and geometry: up to [`STARS_MAX`], one per
-/// slice of the region's width where there is room, clear of the kitty and of
-/// each other, and on a light ground clear of the trail's edge
+/// slice of the region's width where there is room, clear of the kitty, the
+/// rainbow's glints and each other, and on a light ground clear of the trail's edge
 /// ([`across_trail`]). A pure function of its inputs, recomputed each tick.
 fn field_spots(
     g: &Geo,
@@ -2122,6 +2310,7 @@ fn field_spots(
     } else {
         None
     };
+    let glints = glint_spots(g, s, seed);
     let want = (STARS_MIN + mix(seed ^ 0x5354_4152) % STARS_SPAN) as usize;
     let gap = g.cw.max(g.ch / 2);
     let mut n = 0;
@@ -2164,7 +2353,9 @@ fn field_spots(
             });
             let crowded = spots[..n]
                 .iter()
-                .any(|o| (o.x - x).abs() < gap && (o.y - y).abs() < gap);
+                .map(|o| (o.x, o.y))
+                .chain(glints.spots().iter().map(|o| (o.x, o.y)))
+                .any(|(ox, oy)| (ox - x).abs() < gap && (oy - y).abs() < gap);
             let reach = Rect {
                 x0: x - m,
                 y0: y - m,
@@ -2186,202 +2377,6 @@ fn field_spots(
         }
     }
     (spots, n)
-}
-
-/// One four-point star ([`lay_star`]), WHOLE OR NOT AT ALL, to the quad: a
-/// star the budget cannot finish is taken back — its quads and its spend —
-/// and `false` returned, so a frame near the cap loses a star only when the
-/// star truly does not fit, and never shows part of one.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "output + sink + clip + centre + arm + coverage + glint + colour + the \
-              trail's ink + theme: the push_twinkle_star call with its clip, tones and theme"
-)]
-fn push_star(
-    out: &mut Vec<GlowQuad>,
-    sink: &mut Sink,
-    clip: Rect,
-    centre: (i64, i64),
-    arm: i64,
-    cov: f32,
-    gold: bool,
-    color: u32,
-    on_trail: &[Rect],
-    dark: bool,
-) -> bool {
-    let (n, left) = (out.len(), sink.left);
-    if lay_star(
-        out, sink, clip, centre, arm, cov, gold, color, on_trail, dark,
-    ) {
-        return true;
-    }
-    out.truncate(n);
-    sink.left = left;
-    false
-}
-
-/// Lay the flat piece `r`, clipped to `clip`, in `paint`, but where it lies
-/// on `on_trail` (a light frame's trail ink, segment by segment:
-/// [`Emit::trail_ink`]) in `glint`: so a light mark that crosses the trail's
-/// edge is whole, the paper's white on the print and its ink on the paper,
-/// never cut where print meets paper (§10.6.10). On the trail one quad a run
-/// of segments that share the piece's rows, off it the piece less every
-/// segment ([`lay_cut`]): a piece clear of the trail is laid as one quad, as
-/// with no trail at all. `on_trail` runs left to right, each segment
-/// starting where the last ends, so only the segments under the piece's
-/// columns are visited. `false` once the budget is spent.
-fn lay_toned(
-    out: &mut Vec<GlowQuad>,
-    sink: &mut Sink,
-    clip: Rect,
-    r: Rect,
-    (paint, glint): (Paint, Paint),
-    on_trail: &[Rect],
-) -> bool {
-    if on_trail.is_empty() {
-        return sink.flat(out, clip, r, paint);
-    }
-    let q = r.meet(clip);
-    if q.is_empty() {
-        return true;
-    }
-    let lo = on_trail.partition_point(|c| c.x1 <= q.x0);
-    let span = on_trail[lo..].partition_point(|c| c.x0 < q.x1);
-    let on_trail = &on_trail[lo..lo + span];
-    let Some(last) = on_trail.len().checked_sub(1) else {
-        return sink.flat(out, clip, q, paint);
-    };
-    let mut run: Option<Rect> = None;
-    for c in on_trail.iter().map(|c| c.meet(q)).filter(|c| !c.is_empty()) {
-        run = match run {
-            Some(p) if (p.y0, p.y1, p.x1) == (c.y0, c.y1, c.x0) => Some(Rect { x1: c.x1, ..p }),
-            Some(p) => {
-                if !sink.flat(out, clip, p, glint) {
-                    return false;
-                }
-                Some(c)
-            }
-            None => Some(c),
-        };
-    }
-    if let Some(p) = run
-        && !sink.flat(out, clip, p, glint)
-    {
-        return false;
-    }
-    lay_cut(q, 0, last as i64, &|k| on_trail[k as usize], &mut |piece| {
-        sink.flat(out, clip, piece, paint)
-    })
-}
-
-/// One four-point star: the crate's one silhouette (`effect_util`'s
-/// `push_twinkle_star`: a body through the crossing at the shared waist, the
-/// nucleus, tapered points, glints when `gold`), clipped to `clip`. Additive
-/// light on dark; on light `color` is the print ink it is laid in, every
-/// piece source-over, opaque from a settled star's coverage up
-/// ([`STAR_PRINT_FULL`]) and the nucleus with the body, and the paper's white
-/// where a piece lies on the trail's ink (`on_trail`, [`lay_toned`]; empty
-/// on dark). Returns `false` once the budget is spent, with the star in part
-/// ([`push_star`] takes it back).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "output + sink + clip + centre + arm + coverage + glint + colour + the \
-              trail's ink + theme: the push_twinkle_star call with its clip, tones and theme"
-)]
-fn lay_star(
-    out: &mut Vec<GlowQuad>,
-    sink: &mut Sink,
-    clip: Rect,
-    (sx, sy): (i64, i64),
-    arm: i64,
-    cov: f32,
-    gold: bool,
-    color: u32,
-    on_trail: &[Rect],
-    dark: bool,
-) -> bool {
-    if cov < 1.0 || arm < 1 {
-        return true;
-    }
-    // One piece of the star at coverage `c` (0..255): in its colour, and in
-    // the paper's white where it lies on the trail's ink.
-    let tone = |rgb: u32, c: f32| {
-        if dark {
-            light(rgb, c)
-        } else {
-            ink(rgb, c * 255.0 / STAR_PRINT_FULL)
-        }
-    };
-    let paint = |c: f32| (tone(color, c), tone(WHITE, c));
-    let rect = |x: i64, y: i64, w: i64, h: i64| Rect {
-        x0: x,
-        y0: y,
-        x1: x + w,
-        y1: y + h,
-    };
-    let mut lay =
-        |sink: &mut Sink, r: Rect, p: (Paint, Paint)| lay_toned(out, sink, clip, r, p, on_trail);
-    let arm32 = i32::try_from(arm).unwrap_or(i32::MAX);
-    let t = i64::from(star_waist_px(arm32));
-    let half = (t - 1) / 2;
-    let b = i64::from(star_body_px(arm32));
-    let full = paint(cov.floor());
-    if !lay(sink, rect(sx - b, sy - half, 2 * b + 1, t), full) {
-        return false;
-    }
-    if !lay(sink, rect(sx - half, sy - b, t, 2 * b + 1), full) {
-        return false;
-    }
-    let c = i64::from(star_core_px(arm32));
-    let cc = (c - 1) / 2;
-    // Additive, the crossing supplies part of the nucleus; ink lays it whole.
-    let core = if dark {
-        paint((cov * STAR_CORE_ADD).floor())
-    } else {
-        full
-    };
-    if !lay(sink, rect(sx - cc, sy - cc, c, c), core) {
-        return false;
-    }
-    let run = arm - b;
-    let steps = run.clamp(0, i64::from(STAR_TAPER_STEPS));
-    for k in 0..steps {
-        let d0 = b + run * k / steps;
-        let d1 = b + run * (k + 1) / steps;
-        let taper = star_taper_cov(((d0 + d1) as f32 * 0.5 - b as f32) / run as f32);
-        let tip_cov = (cov * taper).floor();
-        if dark && premul_rgb(color, tip_cov as u8) == 0 {
-            break;
-        }
-        let tip = paint(tip_cov);
-        let tt = ((t as f32 * taper).round() as i64).max(1);
-        let th = (tt - 1) / 2;
-        let len = d1 - d0;
-        for off in [d0 + 1, -d1] {
-            if !lay(sink, rect(sx + off, sy - th, len, tt), tip) {
-                return false;
-            }
-            if !lay(sink, rect(sx - th, sy + off, tt, len), tip) {
-                return false;
-            }
-        }
-    }
-    if gold {
-        let d = ((arm as f32 * STAR_GLINT).round() as i64).max(1);
-        // Dim light on dark. On paper the star's own ink at the body's
-        // strength: a third of it let the paper through, a pale halo.
-        let dim = if dark {
-            paint((cov * STAR_GLINT_COV).floor())
-        } else {
-            full
-        };
-        for (gx, gy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
-            if !lay(sink, rect(sx + gx, sy + gy, 1, 1), dim) {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 impl HarnessCard {
@@ -2426,123 +2421,62 @@ impl HarnessCard {
         !matches!(self.episode, Episode::Armed(_) | Episode::Playing(_))
     }
 
-    /// Whether a tick on `scene` with motion verdict `animate` draws the
-    /// SETTLED frame and leaves the episode where it is, at any instant: the
-    /// card has no episode, or owes or plays one that this tick holds back
-    /// (it may not animate — the window lost focus, Reduce Motion, the load
-    /// latch — or has nothing to draw, and the scene is not serious, which
-    /// would end it). Such a tick draws a function of the scene and
-    /// the seed alone (`the_card_is_deterministic`), so its host may replay
-    /// the last one ([`Self::tick_or_replay`]). An owed episode whose debt
-    /// lapsed meanwhile ([`OWED_MAX_MS`]) is let go by the next tick that
-    /// draws, which starts nothing either way.
-    fn holds(&self, scene: &CardScene, animate: bool) -> bool {
+    /// Whether a frame with motion verdict `animate` on a scene that is
+    /// `serious` or not, and has something to draw or not (`drawable`),
+    /// draws the SETTLED frame and leaves the episode where it is, at any
+    /// instant: the card has no episode, or owes or plays one that this
+    /// frame holds back (it may not animate — the window lost focus, Reduce
+    /// Motion, the load latch — or has nothing to draw, and the scene is not
+    /// serious, which would end it). Such a frame is a function of the
+    /// scene's shape and the seed alone (`the_card_is_deterministic`), so
+    /// its host may replay the last one ([`Self::replay`]). An owed episode
+    /// whose debt lapsed meanwhile ([`OWED_MAX_MS`]) is let go by the next
+    /// frame that draws, which starts nothing either way.
+    fn holds(&self, serious: bool, drawable: bool, animate: bool) -> bool {
         match self.episode {
             Episode::Idle => true,
-            Episode::Owed(_) | Episode::Playing(_) => {
-                !scene.serious && !(animate && Geo::new(scene).is_some())
-            }
+            Episode::Owed(_) | Episode::Playing(_) => !serious && !(animate && drawable),
             Episode::Armed(_) => false,
         }
     }
 
-    /// [`Self::tick`], or — where the tick would draw the same settled frame
-    /// as the last one `kept` holds for this very `scene` ([`Self::holds`]) —
-    /// that frame replayed from `kept`: the same quads appended, the same
-    /// fingerprint returned and the card left as the tick would leave it,
-    /// with no frame computed and NO CLOCK READ (`now` is called only to
-    /// tick). The settled frame of a card at rest is then a copy, frame
-    /// after frame: what a host's present costs while the card sits still.
+    /// The settled frame `frames` keeps, REPLAYED: where a frame on `scene`
+    /// with motion verdict `animate` would draw the very settled frame
+    /// `frames` holds — the card holds still ([`Self::holds`]) and the
+    /// scene's [`CardShape`] is the kept frame's — the card is left as that
+    /// frame would leave it and the kept contents come back at the scene's
+    /// origin: the SAME `Arc`s frame after frame, so the renderer compares
+    /// two pointers and builds nothing, and a scene that only moved (an
+    /// inline scroll under a settled card) is the same contents at a new
+    /// offset. `None`, the card untouched, where a frame must be drawn
+    /// ([`Self::draw`]). No clock is read.
     ///
-    /// `kept` serves ONE card: every way into a state that replays (no
-    /// episode, or one owed) is a tick — an arm leaves both — and every tick
-    /// that draws the settled frame refills `kept`, so what it holds is this
-    /// card's settled frame at its current seed whenever it is replayed. An
-    /// episode frame empties it (its buffers kept).
-    ///
-    /// Returns the frame's fingerprint and the instant it was ticked at
-    /// (`None`: replayed).
-    pub fn tick_or_replay(
+    /// `frames` serves ONE card: every way into a state that replays (no
+    /// episode, or one owed) is a [`Self::draw`] — an arm leaves both — and
+    /// every draw of the settled frame keeps it, so what `frames` holds is
+    /// this card's settled frame at its current seed whenever it is
+    /// replayed. An episode frame lets it go.
+    pub fn replay(
         &mut self,
-        now: impl FnOnce() -> Instant,
         scene: &CardScene,
         animate: bool,
-        kept: &mut SettledFrame,
-        under: &mut Vec<GlowQuad>,
-        over: &mut Vec<GlowQuad>,
-    ) -> (u64, Option<Instant>) {
-        if self.replay(scene, animate, kept) {
-            under.extend_from_slice(&kept.under);
-            over.extend_from_slice(&kept.over);
-            return (frame_fp(&kept.under, &kept.over, Clock::SETTLED), None);
+        frames: &CardFrames,
+    ) -> Option<CardFrame> {
+        let kept = frames.kept()?;
+        let (shape, origin) = CardShape::of(scene);
+        if kept.shape != shape {
+            return None;
         }
-        let now = now();
-        let (u0, o0) = (under.len(), over.len());
-        let fp = self
-            .draw_keeping(now, scene, animate, kept, under, over)
-            .map_or(0, |clock| frame_fp(&under[u0..], &over[o0..], clock));
-        (fp, Some(now))
-    }
-
-    /// [`Self::tick_or_replay`]'s tick, with no fingerprint: the frame
-    /// appended to `under` and `over` ([`Self::tick`]'s), and `kept`
-    /// refilled with it when it is the settled frame (emptied by an episode
-    /// frame). What a host that never reads the fingerprint calls where
-    /// [`Self::replay`] said no.
-    pub fn draw_kept(
-        &mut self,
-        now: Instant,
-        scene: &CardScene,
-        animate: bool,
-        kept: &mut SettledFrame,
-        under: &mut Vec<GlowQuad>,
-        over: &mut Vec<GlowQuad>,
-    ) {
-        let _ = self.draw_keeping(now, scene, animate, kept, under, over);
-    }
-
-    /// [`Self::draw_kept`], and the frame's clock — `None` when the scene had
-    /// nothing to draw.
-    fn draw_keeping(
-        &mut self,
-        now: Instant,
-        scene: &CardScene,
-        animate: bool,
-        kept: &mut SettledFrame,
-        under: &mut Vec<GlowQuad>,
-        over: &mut Vec<GlowQuad>,
-    ) -> Option<Clock> {
-        let (u0, o0) = (under.len(), over.len());
-        let clock = self.draw(now, scene, animate, under, over);
-        kept.under.clear();
-        kept.over.clear();
-        if self.drew_episode {
-            kept.scene = None;
-        } else {
-            kept.scene = Some(*scene);
-            kept.under.extend_from_slice(&under[u0..]);
-            kept.over.extend_from_slice(&over[o0..]);
+        let drawable = shape.drawable();
+        if !self.holds(scene.serious, drawable, animate) {
+            return None;
         }
-        clock
-    }
-
-    /// [`Self::tick_or_replay`]'s replay, with the quads left where they
-    /// are: where a tick would draw the settled frame `kept` holds for this
-    /// very `scene`, the card is left as that tick would leave it and `true`
-    /// is returned — the frame's quads are `kept`'s ([`SettledFrame::under`],
-    /// [`SettledFrame::over`]), for a host that puts them on the glass
-    /// itself; `false`, the card untouched, where a tick must draw
-    /// ([`Self::draw_kept`]). No clock is read.
-    pub fn replay(&mut self, scene: &CardScene, animate: bool, kept: &SettledFrame) -> bool {
-        if kept.scene.as_ref() != Some(scene) || !self.holds(scene, animate) {
-            return false;
-        }
-        // The state change of the tick it replays: `tick`'s own, with
+        // The state change of the frame it replays: `step`'s own, with
         // `advance` leaving the episode where it is.
         self.palette = scene.palette;
-        self.still = !(animate && Geo::new(scene).is_some()) || scene.serious;
+        self.still = !(animate && drawable) || scene.serious;
         self.drew_episode = false;
-        true
+        Some(kept.at(origin))
     }
 
     /// How far into a running episode `now` falls, in ms; `None` when no
@@ -2558,25 +2492,25 @@ impl HarnessCard {
     }
 
     /// The next wake: one [`FRAME_MS`] ahead while an episode animates;
-    /// `now` itself when the last tick drew an episode frame and the episode
-    /// has run out since — so the settled frame is drawn promptly rather
-    /// than on the host's next unrelated wake — but only until
-    /// [`SETTLE_GRACE_MS`] past the playing episode's end: the tick that
+    /// `now` itself when the last frame drawn was an episode frame and the
+    /// episode has run out since — so the settled frame is drawn promptly
+    /// rather than on the host's next unrelated wake — but only until
+    /// [`SETTLE_GRACE_MS`] past the playing episode's end: the frame that
     /// draws the settled frame ends the asking, and a host that stopped
-    /// ticking yet asks each loop is let idle after the grace instead of
+    /// drawing yet asks each loop is let idle after the grace instead of
     /// spinning; `None` otherwise (settled, unarmed, an episode owed, after
-    /// a tick with `animate == false`, a serious scene or nothing to draw),
+    /// a frame with `animate == false`, a serious scene or nothing to draw),
     /// so a settled card idles at zero.
     ///
-    /// THE HOST'S CONTRACT: ask this only of a card the host TICKED THIS
-    /// FRAME. The answer describes the card as its last tick left it, and
-    /// only the host knows whether that tick still stands on the glass: a
-    /// card the host did not tick — a frame scrolled back, the pane hidden,
-    /// the card shown bare (Off, the master switch, `card = false`) or its
-    /// version not the process's — registers no deadline, else the last
-    /// episode's frames would be asked for after the card left the screen.
-    /// [`SETTLE_GRACE_MS`] is the backstop for a host that breaks this, not
-    /// the rule.
+    /// THE HOST'S CONTRACT: ask this only of a card the host DREW THIS
+    /// FRAME ([`Self::draw`] or [`Self::replay`]). The answer describes the
+    /// card as its last frame left it, and only the host knows whether that
+    /// frame still stands on the glass: a card the host did not draw — a
+    /// frame scrolled back, the pane hidden, the card shown bare (Off, the
+    /// master switch, `card = false`) or its version not the process's —
+    /// registers no deadline, else the last episode's frames would be asked
+    /// for after the card left the screen. [`SETTLE_GRACE_MS`] is the
+    /// backstop for a host that breaks this, not the rule.
     #[must_use]
     pub fn deadline(&self, now: Instant) -> Option<Instant> {
         if self.at_rest() {
@@ -2592,89 +2526,85 @@ impl HarnessCard {
         (self.drew_episode && ask_until.is_some_and(|end| now < end)).then_some(now)
     }
 
-    /// Append this frame's quads: the border and the trail to `under` (drawn
-    /// beneath glyph ink), the kitty and the stars to `over`. `animate` is the
-    /// motion policy's verdict ([`crate::motion::MotionEffect::HarnessCard`]).
+    /// Draw this frame: the border and the trail into its `under` content
+    /// (drawn beneath the glyph ink), the kitty, its rim and the stars into
+    /// its `over` content, card-local, laid at the scene's origin
+    /// ([`CardFrame`], [`card_layers`]). `animate` is the motion policy's
+    /// verdict ([`crate::motion::MotionEffect::HarnessCard`]).
     ///
     /// `false` gives the settled frame and holds the episode: one not yet
     /// drawn animating is OWED ([`Episode::Owed`]) and plays from the first
-    /// tick with `animate == true`, from that tick's `now` (within
+    /// frame with `animate == true`, from that frame's `now` (within
     /// [`OWED_MAX_MS`] of the arm); one already playing keeps its clock.
     /// A scene with nothing to draw (an empty or inverted clip, no rows,
     /// columns or cell size: a pane mid-layout) is held back the same way,
     /// whatever `animate` says, so an episode is never spent on frames
-    /// nobody saw. `scene.serious` gives the settled frame and ends any
-    /// episode.
+    /// nobody saw; its frame holds nothing. `scene.serious` gives the
+    /// settled frame and ends any episode.
     ///
-    /// Returns the frame's fingerprint: `0` when nothing was drawn; otherwise
-    /// a hash of every quad appended, folded with the frame index while an
-    /// episode animates, so it changes every frame then and is constant once
-    /// the card has settled (for the same scene and seed).
-    pub fn tick(
+    /// The settled frame is kept in `frames`, which [`Self::replay`] hands
+    /// back while the card holds still; an episode frame is built in
+    /// `frames`' ring, refilled in place, so an episode allocates nothing
+    /// once the ring is warm.
+    pub fn draw(
         &mut self,
         now: Instant,
         scene: &CardScene,
         animate: bool,
-        under: &mut Vec<GlowQuad>,
-        over: &mut Vec<GlowQuad>,
-    ) -> u64 {
-        let (u0, o0) = (under.len(), over.len());
-        self.draw(now, scene, animate, under, over)
-            .map_or(0, |clock| frame_fp(&under[u0..], &over[o0..], clock))
+        frames: &mut CardFrames,
+    ) -> CardFrame {
+        let (shape, origin) = CardShape::of(scene);
+        let local = shape.scene();
+        let geo = Geo::new(local).filter(|_| CardArts::dimensions(local.ch).is_some());
+        let clock = self.step(now, scene, animate, geo.is_some());
+        let (under, over) = match geo.zip(clock) {
+            Some((geo, clock)) => frames.fill(&Emit::new(local, geo, clock, self.seed)),
+            None => CardFrames::nothing(),
+        };
+        frames.keep((!self.drew_episode).then(|| SettledFrame {
+            shape,
+            under: Arc::clone(&under),
+            over: Arc::clone(&over),
+        }));
+        CardFrame {
+            under,
+            over,
+            origin,
+        }
     }
 
-    /// [`Self::tick`] without its fingerprint: the frame appended, the card
-    /// stepped, and the frame's clock returned — `None` when the scene had
-    /// nothing to draw.
-    fn draw(
+    /// Step the card for a frame at `now` on `scene` (`drawable`: whether it
+    /// has anything to draw): the palette its line wears, the light line's
+    /// inks, the motion verdict, the episode ([`Self::advance`]) and the
+    /// ride. Returns the frame's clock; `None` when the scene has nothing to
+    /// draw, which holds the episode back rather than starting its clock.
+    fn step(
         &mut self,
         now: Instant,
         scene: &CardScene,
         animate: bool,
-        under: &mut Vec<GlowQuad>,
-        over: &mut Vec<GlowQuad>,
+        drawable: bool,
     ) -> Option<Clock> {
         self.palette = scene.palette;
         if !scene.dark {
             self.inks.solve(scene.palette, scene.ground & 0x00FF_FFFF);
         }
-        // The geometry first: a tick with nothing to draw holds the episode
-        // back rather than starting its clock.
-        let geo = Geo::new(scene);
-        let animate = animate && geo.is_some();
+        let animate = animate && drawable;
         self.still = !animate || scene.serious;
         let clock = self.advance(now, animate, scene.serious);
         self.drew_episode = clock.t_ms.is_some();
-        let geo = geo?;
+        if !drawable {
+            return None;
+        }
         if clock.t_ms.is_none() {
             // The settled frame goes on the glass: the kitty is seated there,
             // and stays seated through every episode after ([`Ride`]).
             self.ride = Ride::Done;
         }
-        let mut sink = Sink {
-            geo,
-            left: MAX_CARD_QUADS,
-        };
-        let cx = Emit::new(scene, geo, clock, self.seed);
-        // The spend order: each mark runs only while the budget lasts. The
-        // burst goes before the field: where a frame wants more than the cap
-        // (the burst opening on a long trail at a large cell, three rows
-        // tall), a field star — which twinkles anyway — waits a frame or two,
-        // never a star of the burst's ring.
-        if cx.border(&mut sink, under)
-            && !scene.serious
-            && cx.trail(&mut sink, under)
-            && cx.kitty(&mut sink, over)
-            && cx.rim(&mut sink, over)
-            && cx.burst(&mut sink, over)
-            && cx.stars(&mut sink, over)
-        {
-            cx.sparkles(&mut sink, over);
-        }
         Some(clock)
     }
 
-    /// Step the episode for a tick at `now` and say where in it the frame
+    /// Step the episode for a frame at `now` and say where in it the frame
     /// falls ([`Episode`]'s transitions): serious mode ends it; a debt
     /// older than [`OWED_MAX_MS`] lapses; a held-back tick owes an episode
     /// not yet drawn and keeps a playing one's clock; a tick that may
@@ -2861,34 +2791,6 @@ pub fn dark_ground(bg: u32) -> bool {
     relative_luminance(bg) < 0.5
 }
 
-/// A frame's fingerprint ([`HarnessCard::tick`]): `0` when it holds no
-/// quad; otherwise a hash of every quad, `under`'s then `over`'s, folded
-/// with the frame index while an episode animates (`clock`).
-fn frame_fp(under: &[GlowQuad], over: &[GlowQuad], clock: Clock) -> u64 {
-    #[cfg(test)]
-    FRAME_FPS.with(|n| n.set(n.get() + 1));
-    if under.is_empty() && over.is_empty() {
-        return 0;
-    }
-    let mut h = mix(0x4841_524E_4553_5321 ^ under.len() as u64);
-    for q in under.iter().chain(over) {
-        for w in q.damage_words() {
-            h = mix(h ^ w);
-        }
-    }
-    if let Some(t) = clock.t_ms {
-        h = mix(h ^ (1 + t / FRAME_MS));
-    }
-    h
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Frame fingerprints made ([`frame_fp`]): the work a host that never
-    /// reads one is spared.
-    static FRAME_FPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// How a frame lays the trail ([`Emit::trail_lay`]): from `tx0` to where it
 /// is drawn to (`drawn`, the kitty's rear on its ride) of its whole `len`, in
 /// segments of `seg` pixels from `tx0`, its stripes spanning `[ya, yb)` and
@@ -2956,7 +2858,7 @@ struct Emit<'a> {
     seed: u64,
     /// The kitty where it is this frame ([`ridden`]) and the frame of its
     /// art it wears.
-    kitty: Option<(KittyAt, &'static [&'static str])>,
+    kitty: Option<(KittyAt, KittyPose)>,
     /// Where it sits once its ride is done ([`kitty_rect`]).
     seat: Option<KittyAt>,
 }
@@ -2971,7 +2873,7 @@ impl<'a> Emit<'a> {
             geo,
             clock,
             seed,
-            kitty: seat.map(|at| (ridden(&geo, scene, at, clock), kitty_frame(&at.art, clock))),
+            kitty: seat.map(|at| (ridden(&geo, scene, at, clock), kitty_frame(clock))),
             seat,
         }
     }
@@ -3012,10 +2914,10 @@ impl<'a> Emit<'a> {
     /// The border: top edge left → right, right side down, bottom edge right
     /// → left, left side up; arc fraction measured from the top-left corner.
     /// Laid on the OUTER rectangle, its air included: a top edge with air
-    /// lies in the band of the row over the box and is tagged with it, a
-    /// bottom edge in the band of the row under it, and each side gains a
-    /// slice in each of those bands — one band a quad, as everywhere.
-    fn border(&self, sink: &mut Sink, out: &mut Vec<GlowQuad>) -> bool {
+    /// lies in the band of the row over the box, a bottom edge in the band
+    /// of the row under it, and each side gains a slice in each of those
+    /// bands, every slice one flat colour ([`Ramps::side`]).
+    fn border(&self, out: &mut impl Ramps) {
         let g = self.geo;
         let o = g.outer;
         let (w, h, t) = (o.x1 - o.x0, o.y1 - o.y0, g.t);
@@ -3046,9 +2948,7 @@ impl<'a> Emit<'a> {
                     y1: y0 + t,
                 };
                 let pb = self.border_paint(arc(xb) / per);
-                if !sink.push(out, all, r, pa, pb) {
-                    return false;
-                }
+                out.ramp(all, r, pa, pb);
                 pa = pb;
             }
         }
@@ -3079,12 +2979,9 @@ impl<'a> Emit<'a> {
                     x1: x0 + t,
                     y1: yb,
                 };
-                if !sink.flat(out, all, slice, p) {
-                    return false;
-                }
+                out.side(all, slice, p);
             }
         }
-        true
     }
 
     /// The step wave's displacement (px, `+` up) for segment `k` of the
@@ -3138,20 +3035,18 @@ impl<'a> Emit<'a> {
 
     /// The rainbow trail: six stripes from the text's end to the kitty's
     /// rear, under its art to the haunch ([`KittyAt::rear`]), as tall as the
-    /// kitty's body ([`trail_band`]: the cat leads, the rainbow trails),
-    /// split at the row bands they cross. During an episode
-    /// it steps and shimmers in segments; settled, every segment of a stripe
-    /// would wear the same paint, so each stripe is one quad end to end — a
-    /// card at rest replays six quads of trail into every frame, not ninety
-    /// six.
+    /// kitty's body ([`trail_band`]: the cat leads, the rainbow trails).
+    /// During an episode it steps and shimmers in segments; settled, every
+    /// segment of a stripe would wear the same paint, so each stripe is one
+    /// ramp end to end: six items of trail, not ninety six.
     ///
     /// The step wave moves the ribbon's outline, not its stripes: a segment
     /// stepped up `d` px grows the top stripe up by `d` and shrinks the bottom
     /// stripe by as much (and the reverse stepped down), so the silhouette
     /// steps while the stripes between keep their places.
-    fn trail(&self, sink: &mut Sink, out: &mut Vec<GlowQuad>) -> bool {
+    fn trail(&self, out: &mut impl Ramps) {
         let Some(lay) = self.trail_lay() else {
-            return true;
+            return;
         };
         let TrailLay {
             tx0,
@@ -3194,15 +3089,12 @@ impl<'a> Emit<'a> {
                 };
                 // Inside the stroke: light stacked on the border would double.
                 let pb = self.stripe_paint(s, wb);
-                if !sink.push(out, inner, r, *end, pb) {
-                    return false;
-                }
+                out.ramp(inner, r, *end, pb);
                 *end = pb;
             }
             xa = xb;
             k += 1;
         }
-        true
     }
 
     /// How this frame lays the trail ([`TrailLay`]); `None` where it draws
@@ -3226,9 +3118,13 @@ impl<'a> Emit<'a> {
             Some(at) if ride(self.clock) < 1.0 => tx1.min(at.rear()),
             _ => tx1,
         };
+        // Held from a rim's width short of the cat: every segment its rim
+        // could touch holds still, so the rim's art is one picture a frame
+        // of the kitty and the trail cuts it in one hole ([`Emit::rim_hole`]).
         let held = kitty
-            .filter(|at| drawn > at.rect.x0)
-            .map_or(i64::MAX, |at| at.rect.x0);
+            .map(|at| at.rect.x0 - rim_px(at.p, g.t))
+            .filter(|&held| drawn > held)
+            .unwrap_or(i64::MAX);
         let seg = if self.clock.t_ms.is_some() {
             (TRAIL_SEG_CELLS * g.cw).max((len + MAX_TRAIL_SEGMENTS - 1) / MAX_TRAIL_SEGMENTS)
         } else {
@@ -3260,59 +3156,6 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// The kitty: its frame's art as opaque source-over rectangles — each run
-    /// of one colour along a pixel row, carried down the rows under it that
-    /// repeat it exactly (the same columns and colour, neither neighbour
-    /// that colour) — split at the row bands they cross. About ninety-five
-    /// quads two rows tall and a hundred and ten three, where a quad a run
-    /// would be a hundred and eighteen and a hundred and sixty-two: the
-    /// face's detail (glossy eyes, blush, the `ω` mouth) repeats down few
-    /// rows.
-    fn kitty(&self, sink: &mut Sink, out: &mut Vec<GlowQuad>) -> bool {
-        let Some((at, frame)) = self.kitty else {
-            return true;
-        };
-        let inks = KittyInk::new(self.scene.coat, self.scene.eye, self.scene.dark);
-        let p = at.p;
-        for (r, row) in frame.iter().enumerate() {
-            let px = row.as_bytes();
-            let mut c = 0;
-            while c < px.len() {
-                let ch = px[c];
-                let run = px[c..].iter().take_while(|&&b| b == ch).count();
-                // Row `other` holds this very run.
-                let repeats = |other: &str| {
-                    let o = other.as_bytes();
-                    o[c..c + run].iter().all(|&b| b == ch)
-                        && (c == 0 || o[c - 1] != ch)
-                        && o.get(c + run).is_none_or(|&b| b != ch)
-                };
-                let carried = r > 0 && repeats(frame[r - 1]);
-                if let (false, Some(rgb)) = (carried, inks.of(ch)) {
-                    let down = frame[r + 1..]
-                        .iter()
-                        .take_while(|other| repeats(other))
-                        .count();
-                    let q = Rect {
-                        x0: at.rect.x0 + c as i64 * p,
-                        y0: at.rect.y0 + r as i64 * p,
-                        x1: at.rect.x0 + (c + run) as i64 * p,
-                        y1: at.rect.y0 + (r + 1 + down) as i64 * p,
-                    };
-                    let paint = Paint {
-                        color: rgb,
-                        alpha: 255,
-                    };
-                    if !sink.flat(out, self.geo.clip, q, paint) {
-                        return false;
-                    }
-                }
-                c += run;
-            }
-        }
-        true
-    }
-
     /// The rim's paint for a strip centred at `(x, y)`: the border's spectrum
     /// at the strip's angle round the kitty's centre `(cx, cy)`, measured
     /// from straight up — `palette(tri(2s + φ))`, the border's own sweep and
@@ -3332,117 +3175,27 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// The rim (§10.6): a [`rim_px`]-wide outline just outside the kitty's
-    /// silhouette ([`rim_solid`]: the art, its toes' one-pixel gaps closed),
-    /// along every pixel edge with the silhouette on one side and nothing on
-    /// the other, in the border's spectrum ([`Self::rim_paint`]),
-    /// so a black or grey coat reads on a dark ground. Horizontal strips run
-    /// along the art's rows and reach a rim's width past an outer corner to
-    /// close it; vertical strips run down its columns and stop a rim's width
-    /// short where a horizontal strip turns an inner corner — so no two
-    /// strips overlap (a rim is at most half a kitty pixel, so none reaches
-    /// another across one transparent pixel) and no light is doubled.
-    /// Clipped to the box inside the border's stroke, and cut where it would
-    /// lie on the trail (where the tail meets the rainbow: the rainbow is no
-    /// dark ground to set the coat off, and light on light doubles to white).
-    fn rim(&self, sink: &mut Sink, out: &mut Vec<GlowQuad>) -> bool {
-        let Some((at, frame)) = self.kitty else {
-            return true;
-        };
-        let (p, rim) = (at.p, rim_px(at.p, self.geo.t));
-        if rim == 0 {
-            return true;
-        }
-        let (h, w) = (frame.len() as i64, KITTY_W as i64);
-        let solid = |r: i64, c: i64| rim_solid(frame, r, c);
-        let r0 = at.rect;
-        let centre = ((r0.x0 + r0.x1) as f32 * 0.5, (r0.y0 + r0.y1) as f32 * 0.5);
-        let clip = self.geo.inner();
-        let trail = self.trail_lay();
-        let mut strip = |sink: &mut Sink, q: Rect| {
-            let mid = ((q.x0 + q.x1) as f32 * 0.5, (q.y0 + q.y1) as f32 * 0.5);
-            let paint = self.rim_paint(mid, centre);
-            let mut lay = |piece: Rect| sink.flat(out, clip, piece, paint);
-            // The trail's segments under the strip, if any.
-            match trail {
-                Some(t) if q.x0 < t.drawn && q.x1 > t.tx0 => {
-                    let first = (q.x0 - t.tx0).max(0) / t.seg;
-                    let last = (q.x1.min(t.drawn) - 1 - t.tx0) / t.seg;
-                    lay_cut(q, first, last, &|k| self.trail_cover(&t, k), &mut lay)
-                }
-                _ => lay(q),
-            }
-        };
-        // Horizontal strips at row boundary `b`: over the art (art at row
-        // `b`, nothing `solid` at `b - 1`), then under it (art at `b - 1`,
-        // nothing at `b`) — over and under art itself, never a toe's gap.
-        for b in 0..=h {
-            for (art_row, open_row, y0) in
-                [(b, b - 1, r0.y0 + b * p - rim), (b - 1, b, r0.y0 + b * p)]
-            {
-                let edge = |c: i64| art_at(frame, art_row, c) && !solid(open_row, c);
-                let mut c = 0;
-                while c < w {
-                    if !edge(c) {
-                        c += 1;
-                        continue;
-                    }
-                    let c0 = c;
-                    while c < w && edge(c) {
-                        c += 1;
-                    }
-                    // An outer corner at either end: nothing beside the run on
-                    // either row, so the strip reaches round it.
-                    let outer = |e: i64| !solid(art_row, e) && !solid(open_row, e);
-                    let q = Rect {
-                        x0: r0.x0 + c0 * p - if outer(c0 - 1) { rim } else { 0 },
-                        y0,
-                        x1: r0.x0 + c * p + if outer(c) { rim } else { 0 },
-                        y1: y0 + rim,
-                    };
-                    if !strip(sink, q) {
-                        return false;
-                    }
-                }
-            }
-        }
-        // Vertical strips at column boundary `v`: left of the art (`solid` at
-        // column `v`, not at `v - 1`), then right of it.
-        for v in 0..=w {
-            for (art_col, open_col, x0) in
-                [(v, v - 1, r0.x0 + v * p - rim), (v - 1, v, r0.x0 + v * p)]
-            {
-                let edge = |r: i64| solid(r, art_col) && !solid(r, open_col);
-                let mut r = 0;
-                while r < h {
-                    if !edge(r) {
-                        r += 1;
-                        continue;
-                    }
-                    let top = r;
-                    while r < h && edge(r) {
-                        r += 1;
-                    }
-                    // An inner corner at either end: the open column's pixel
-                    // past the run is art, whose own strip turns the corner.
-                    let q = Rect {
-                        x0,
-                        y0: r0.y0 + top * p + if solid(top - 1, open_col) { rim } else { 0 },
-                        x1: x0 + rim,
-                        y1: r0.y0 + r * p - if solid(r, open_col) { rim } else { 0 },
-                    };
-                    if q.y1 > q.y0 && !strip(sink, q) {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
+    /// Where the trail cuts the rim this frame: the trail as it is drawn,
+    /// `[tx0, drawn) × [ya, yb)`. Every segment the rim could touch holds
+    /// still ([`TrailLay::held`]: from a rim's width short of the cat), so
+    /// the segments under the rim lie flat in the trail's band and the cut
+    /// is one rectangle, whatever the wave does behind the cat: the rim
+    /// never lies on the trail (the rainbow is no dark ground to set the
+    /// coat off, and light on light doubles to white). `None` where no trail
+    /// is drawn.
+    fn rim_hole(&self) -> Option<Rect> {
+        let t = self.trail_lay()?;
+        Some(Rect {
+            x0: t.tx0,
+            y0: t.ya,
+            x1: t.drawn,
+            y1: t.yb,
+        })
     }
 
     /// The trail's ink this frame on a light ground, segment by segment as
     /// [`Self::trail`] lays it ([`Self::trail_cover`]): where a light mark is
-    /// the paper's white ([`lay_toned`]). None on dark, and where no trail
+    /// the paper's white (each pixel its own tone). None on dark, and where no trail
     /// is drawn.
     fn trail_ink(&self) -> TrailInk {
         let mut ink = TrailInk::default();
@@ -3461,7 +3214,7 @@ impl<'a> Emit<'a> {
 
     /// The colour the `k`th mark of its set is laid in: `dark` on a dark
     /// ground (added light), on a light one its print ink
-    /// ([`CardPalette::star_ink`]), which [`lay_toned`] turns the paper's
+    /// ([`CardPalette::star_ink`]), which each pixel its own tone turns the paper's
     /// white where it lies on the trail.
     fn mark_ink(&self, k: usize, dark: u32) -> u32 {
         if self.scene.dark {
@@ -3471,14 +3224,61 @@ impl<'a> Emit<'a> {
         }
     }
 
+    /// The rainbow's glints: steady at rest, flaring as the sheen passes.
+    fn glints(&self, lay: &mut impl FnMut(StarCall)) {
+        let Some(region) = star_region(&self.geo, self.scene) else {
+            return;
+        };
+        let glints = glint_spots(&self.geo, self.scene, self.seed);
+        let Some(trail) = self.trail_lay().filter(|_| glints.n > 0) else {
+            return;
+        };
+        let (rest, flare) = (glints.rest, glints.flare);
+        let u = self.clock.u();
+        let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) / STAR_SETTLE_SPAN);
+        let riding = self
+            .seat
+            .and_then(|seat| ride_span(&self.geo, self.scene, &seat));
+        for (i, s) in glints.spots().iter().enumerate() {
+            let up = match (self.clock.ride_ms, riding) {
+                (Some(t), Some((from, dist))) => {
+                    let passed = ride_at((s.x + flare + 1 - from) as f32 / dist as f32);
+                    smooth((t as f32 - passed) / STAR_REVEAL_MS)
+                }
+                _ => 1.0,
+            };
+            if up <= 0.0 {
+                continue;
+            }
+            let (env, w) = match self.clock.t_ms {
+                Some(t) => {
+                    let e = twinkle_env(t as f32 / 1000.0, s.phase);
+                    let w =
+                        self.shimmer((s.x - trail.tx0) as f32 / trail.len as f32) / SHIMMER_GAIN;
+                    ((e + (STAR_STEADY_ENV - e) * settle) * up, w.clamp(0.0, 1.0))
+                }
+                None => (STAR_STEADY_ENV, 0.0),
+            };
+            let arm = rest + ((flare - rest) as f32 * w).round() as i64;
+            let gold = twinkle_rgb(true);
+            lay(StarCall {
+                clip: region,
+                centre: (s.x, s.y),
+                arm,
+                cov: GLINT_COV * env,
+                gold: w >= GLINT_FLARE_DOTS,
+                color: self.mark_ink(i, mix_rgb(gold, WHITE, w)),
+            });
+        }
+    }
+
     /// The steady field: twinkling during an episode (easing onto a steady
     /// brightness over its last fifth), fixed once settled.
-    fn stars(&self, sink: &mut Sink, out: &mut Vec<GlowQuad>) -> bool {
+    fn field(&self, lay: &mut impl FnMut(StarCall)) {
         let Some(region) = star_region(&self.geo, self.scene) else {
-            return true;
+            return;
         };
         let dark = self.scene.dark;
-        let trail = self.trail_ink();
         let (spots, n) = field_spots(&self.geo, self.scene, self.seed, !dark);
         let u = self.clock.u();
         let settle = smooth((u - (1.0 - STAR_SETTLE_SPAN)) / STAR_SETTLE_SPAN);
@@ -3517,22 +3317,15 @@ impl<'a> Emit<'a> {
                     }
                 }
             };
-            if !push_star(
-                out,
-                sink,
-                region,
-                (s.x, s.y),
+            lay(StarCall {
+                clip: region,
+                centre: (s.x, s.y),
                 arm,
-                STAR_COV * env,
+                cov: STAR_COV * env,
                 gold,
-                self.mark_ink(i, light_rgb),
-                trail.covers(),
-                dark,
-            ) {
-                return false;
-            }
+                color: self.mark_ink(i, light_rgb),
+            });
         }
-        true
     }
 
     /// The sparkles the kitty sheds on its ride: the `k`th where its back
@@ -3540,33 +3333,32 @@ impl<'a> Emit<'a> {
     /// height in its body band the seed picks, fading over [`SHED_MS`] as its
     /// arm draws in. Each sits whole in the star region; none outlives the
     /// ride (the last is shed at 0.54 s and out by 0.99 s).
-    fn sparkles(&self, sink: &mut Sink, out: &mut Vec<GlowQuad>) -> bool {
+    fn shed(&self, lay: &mut impl FnMut(StarCall)) {
         let (Some(t), Some(seat)) = (self.clock.ride_ms, self.seat) else {
-            return true;
+            return;
         };
         if t >= RIDE_MS {
-            return true;
+            return;
         }
         let (Some((from, dist)), Some(region)) = (
             ride_span(&self.geo, self.scene, &seat),
             star_region(&self.geo, self.scene),
         ) else {
-            return true;
+            return;
         };
         let dark = self.scene.dark;
-        let trail = self.trail_ink();
         // On a light ground the trail's ink at every step of the wave, so far
         // laid: a sparkle shed on it lies wholly there, one white glint on the
-        // print ([`lay_toned`]), never across the band's edge in two tones.
+        // print (each pixel its own tone), never across the band's edge in two tones.
         let band = if dark {
             None
         } else {
-            self.trail_lay().map(|lay| {
+            self.trail_lay().map(|t| {
                 Rect {
-                    x0: lay.tx0,
-                    y0: lay.ya + lay.amp,
-                    x1: lay.drawn,
-                    y1: lay.yb - lay.amp,
+                    x0: t.tx0,
+                    y0: t.ya + t.amp,
+                    x1: t.drawn,
+                    y1: t.yb - t.amp,
                 }
                 .meet(region)
             })
@@ -3592,7 +3384,7 @@ impl<'a> Emit<'a> {
                 (region.x1 - m, region.y1 - m),
             );
             if hi.0 <= lo.0 || hi.1 <= lo.1 {
-                return true;
+                return;
             }
             let mut centre = (x.clamp(lo.0, hi.0 - 1), y.clamp(lo.1, hi.1 - 1));
             // Wholly on the trail's ink, where the band has room.
@@ -3602,22 +3394,15 @@ impl<'a> Emit<'a> {
                     centre.1.clamp(b.y0 + m, b.y1 - m - 1),
                 );
             }
-            if !push_star(
-                out,
-                sink,
-                region,
+            lay(StarCall {
+                clip: region,
                 centre,
                 arm,
-                SHED_COV * (1.0 - tau).powf(1.5),
-                false,
-                self.mark_ink(k, self.scene.palette.mark(k)),
-                trail.covers(),
-                dark,
-            ) {
-                return false;
-            }
+                cov: SHED_COV * (1.0 - tau).powf(1.5),
+                gold: false,
+                color: self.mark_ink(k, self.scene.palette.mark(k)),
+            });
         }
-        true
     }
 
     /// The burst: [`BURST_STARS`] stars on a ring thrown out from the kitty
@@ -3625,29 +3410,30 @@ impl<'a> Emit<'a> {
     /// fading as they fly ([`Self::burst_ring`]). Only during an episode's
     /// first [`BURST_MS`]. On a light ground a star that crosses the trail's
     /// edge, or reaches past its end onto the kitty, is whole in two tones
-    /// ([`lay_toned`]).
-    fn burst(&self, sink: &mut Sink, out: &mut Vec<GlowQuad>) -> bool {
+    /// (each pixel its own tone).
+    fn burst_stars(&self, lay: &mut impl FnMut(StarCall)) {
         let Some(ring) = self.burst_ring() else {
-            return true;
+            return;
         };
-        let trail = self.trail_ink();
         for (k, &centre) in ring.centres.iter().enumerate() {
-            if !push_star(
-                out,
-                sink,
-                ring.region,
+            lay(StarCall {
+                clip: ring.region,
                 centre,
-                ring.arm,
-                ring.cov,
-                true,
-                self.mark_ink(k, self.scene.palette.mark(k)),
-                trail.covers(),
-                self.scene.dark,
-            ) {
-                return false;
-            }
+                arm: ring.arm,
+                cov: ring.cov,
+                gold: true,
+                color: self.mark_ink(k, self.scene.palette.mark(k)),
+            });
         }
-        true
+    }
+
+    /// Every star this frame lays, in the order it lays them: the burst's
+    /// ring, the rainbow's glints, the steady field, the ride's sparkles.
+    fn each_star(&self, lay: &mut impl FnMut(StarCall)) {
+        self.burst_stars(lay);
+        self.glints(lay);
+        self.field(lay);
+        self.shed(lay);
     }
 
     /// Where this frame's burst lies ([`BurstRing`]): `None` outside its
@@ -3695,6 +3481,94 @@ impl<'a> Emit<'a> {
     }
 }
 
+/// One star a frame lays ([`Emit::each_star`]): the region it is clipped
+/// to, its centre, arm and coverage, whether it glints, and its colour —
+/// added light on dark, its print ink on light.
+#[derive(Clone, Copy, Debug)]
+struct StarCall {
+    clip: Rect,
+    centre: (i64, i64),
+    arm: i64,
+    cov: f32,
+    gold: bool,
+    color: u32,
+}
+
+/// The rim's strips (§10.6) round `frame` at kitty pixel `p`, `rim` wide,
+/// relative to the art's top-left, in the order they are laid: a
+/// [`rim_px`]-wide outline just outside the kitty's silhouette
+/// ([`rim_solid`]: the art, its toes' one-pixel gaps closed), along every
+/// pixel edge with the silhouette on one side and nothing on the other.
+/// Horizontal strips run along the art's rows and reach a rim's width past
+/// an outer corner to close it; vertical strips run down its columns and
+/// stop a rim's width short where a horizontal strip turns an inner corner —
+/// so no two strips overlap (a rim is at most half a kitty pixel, so none
+/// reaches another across one transparent pixel) and no light is doubled.
+/// One picture for each frame of the kitty and pixel size ([`CardArts`]),
+/// each strip painted in the border's spectrum at its midpoint
+/// ([`Emit::rim_paint`]), so a black or grey coat reads on a dark ground.
+fn rim_strips(frame: &[&str], p: i64, rim: i64, mut strip: impl FnMut(Rect)) {
+    let (h, w) = (frame.len() as i64, KITTY_W as i64);
+    let solid = |r: i64, c: i64| rim_solid(frame, r, c);
+    // Horizontal strips at row boundary `b`: over the art (art at row `b`,
+    // nothing `solid` at `b - 1`), then under it (art at `b - 1`, nothing at
+    // `b`) — over and under art itself, never a toe's gap.
+    for b in 0..=h {
+        for (art_row, open_row, y0) in [(b, b - 1, b * p - rim), (b - 1, b, b * p)] {
+            let edge = |c: i64| art_at(frame, art_row, c) && !solid(open_row, c);
+            let mut c = 0;
+            while c < w {
+                if !edge(c) {
+                    c += 1;
+                    continue;
+                }
+                let c0 = c;
+                while c < w && edge(c) {
+                    c += 1;
+                }
+                // An outer corner at either end: nothing beside the run on
+                // either row, so the strip reaches round it.
+                let outer = |e: i64| !solid(art_row, e) && !solid(open_row, e);
+                strip(Rect {
+                    x0: c0 * p - if outer(c0 - 1) { rim } else { 0 },
+                    y0,
+                    x1: c * p + if outer(c) { rim } else { 0 },
+                    y1: y0 + rim,
+                });
+            }
+        }
+    }
+    // Vertical strips at column boundary `v`: left of the art (`solid` at
+    // column `v`, not at `v - 1`), then right of it.
+    for v in 0..=w {
+        for (art_col, open_col, x0) in [(v, v - 1, v * p - rim), (v - 1, v, v * p)] {
+            let edge = |r: i64| solid(r, art_col) && !solid(r, open_col);
+            let mut r = 0;
+            while r < h {
+                if !edge(r) {
+                    r += 1;
+                    continue;
+                }
+                let top = r;
+                while r < h && edge(r) {
+                    r += 1;
+                }
+                // An inner corner at either end: the open column's pixel
+                // past the run is art, whose own strip turns the corner.
+                let q = Rect {
+                    x0,
+                    y0: top * p + if solid(top - 1, open_col) { rim } else { 0 },
+                    x1: x0 + rim,
+                    y1: r * p - if solid(r, open_col) { rim } else { 0 },
+                };
+                if q.y1 > q.y0 {
+                    strip(q);
+                }
+            }
+        }
+    }
+}
+
 /// One frame's burst ([`Emit::burst_ring`]): its stars' centres, their arm
 /// and coverage, and the region they are clipped to.
 #[derive(Clone, Copy, Debug)]
@@ -3737,15 +3611,17 @@ impl TrailInk {
 
 #[cfg(test)]
 mod tests {
+    use super::oracle::{QuadSink, Sink, kitty_quads, lay_star, rim_quads};
     use super::*;
     use crate::cursor_glow::Geom;
     use crate::cursor_glow::InkRole;
-    use crate::effect_util::push_twinkle_star;
+    use crate::effect_util::{STAR_GLINT, push_twinkle_star, star_core_px, star_waist_px};
+    use aterm_render::GlowQuad;
 
     /// A launch card at a 9 × 18 cell: text to column 31, the trail to the
     /// kitty at column 40, the box 60 columns wide, four boxed rows (the card's
     /// three and the line's), in a pane whose grid starts below a tab strip.
-    fn scene() -> CardScene {
+    pub(super) fn scene() -> CardScene {
         CardScene {
             origin_x: 10,
             origin_y: 46,
@@ -3788,7 +3664,7 @@ mod tests {
     /// [`scene`]'s pane, cut short of the box: the right border's column and
     /// the left padding fall outside it, and the line's row is cut through
     /// its middle. The kitty (columns 40 to 46) still fits.
-    fn clipped() -> CardScene {
+    pub(super) fn clipped() -> CardScene {
         let s = scene();
         let (cw, ch) = (i32::from(s.cw), i32::from(s.ch));
         CardScene {
@@ -3812,7 +3688,7 @@ mod tests {
     /// where the air over it is ignored — each at BOTH HEIGHTS (§10.6): the
     /// two-row kitty ([`scenes_two_rows`]), then the same scenes with the
     /// tall kitty.
-    fn scenes() -> Vec<CardScene> {
+    pub(super) fn scenes() -> Vec<CardScene> {
         let two = scenes_two_rows();
         let tall = two.iter().map(|s| CardScene {
             kitty_rows: 3,
@@ -3903,7 +3779,7 @@ mod tests {
 
     /// `s` with a row of blank pane over and under its box: the border
     /// stands half a row clear of the boxed rows on both sides.
-    fn aired(s: CardScene) -> CardScene {
+    pub(super) fn aired(s: CardScene) -> CardScene {
         CardScene {
             pad_above: s.ch,
             pad_below: s.ch,
@@ -3959,8 +3835,8 @@ mod tests {
         frame(&mut card, t0 + ms(EPISODE_MS + 1), s, true)
     }
 
-    /// One frame's marks, each drawn alone into its own stream (the budget
-    /// never binding): what [`HarnessCard::tick`] lays, mark by mark.
+    /// One frame's marks, each drawn alone into its own stream: what the
+    /// quad oracle ([`oracle`]) lays, mark by mark.
     #[derive(Debug, Default)]
     struct Parts {
         border: Vec<GlowQuad>,
@@ -3970,6 +3846,7 @@ mod tests {
         stars: Vec<GlowQuad>,
         sparkles: Vec<GlowQuad>,
         burst: Vec<GlowQuad>,
+        glints: Vec<GlowQuad>,
     }
 
     /// [`Parts`] of the frame of `s` at `clock`, with the test seed.
@@ -3977,23 +3854,47 @@ mod tests {
         parts_seeded(s, clock, 7)
     }
 
-    /// [`Parts`] of the frame of `s` at `clock` for `seed`, each mark laid
-    /// with no budget.
+    /// Lay `cx`'s star calls as the oracle does into `out`.
+    fn lay_calls(cx: &Emit<'_>, out: &mut Vec<GlowQuad>) -> impl FnMut(StarCall) {
+        let sink = Sink { geo: cx.geo };
+        let trail = cx.trail_ink();
+        let dark = cx.scene.dark;
+        move |st: StarCall| {
+            lay_star(
+                out,
+                &sink,
+                st.clip,
+                st.centre,
+                st.arm,
+                st.cov,
+                st.gold,
+                st.color,
+                trail.covers(),
+                dark,
+            );
+        }
+    }
+
+    /// [`Parts`] of the frame of `s` at `clock` for `seed`.
     fn parts_seeded(s: &CardScene, clock: Clock, seed: u64) -> Parts {
         let geo = Geo::new(s).expect("a scene");
         let cx = Emit::new(s, geo, clock, seed);
         let mut out = Parts::default();
-        let sink = || Sink {
-            geo,
-            left: usize::MAX,
-        };
-        assert!(cx.border(&mut sink(), &mut out.border));
-        assert!(cx.trail(&mut sink(), &mut out.trail));
-        assert!(cx.kitty(&mut sink(), &mut out.kitty));
-        assert!(cx.rim(&mut sink(), &mut out.rim));
-        assert!(cx.stars(&mut sink(), &mut out.stars));
-        assert!(cx.sparkles(&mut sink(), &mut out.sparkles));
-        assert!(cx.burst(&mut sink(), &mut out.burst));
+        let sink = Sink { geo };
+        cx.border(&mut QuadSink {
+            sink,
+            out: &mut out.border,
+        });
+        cx.trail(&mut QuadSink {
+            sink,
+            out: &mut out.trail,
+        });
+        kitty_quads(&cx, &sink, &mut out.kitty);
+        rim_quads(&cx, &sink, &mut out.rim);
+        cx.field(&mut lay_calls(&cx, &mut out.stars));
+        cx.shed(&mut lay_calls(&cx, &mut out.sparkles));
+        cx.burst_stars(&mut lay_calls(&cx, &mut out.burst));
+        cx.glints(&mut lay_calls(&cx, &mut out.glints));
         out
     }
 
@@ -4035,20 +3936,21 @@ mod tests {
 
     /// The bitmaps are the art the module documents, at both heights: every
     /// frame [`KITTY_W`] palette characters by its art's height, the blink
-    /// touching only the eye rows (and closing every eye: no pupil,
-    /// catch-light or iris left), the flick only the tail's columns, the
-    /// mouth on a row of coat (the review of the cuter kitty: the two-row
-    /// cat's white socks stood right under its `ω` and read as two fangs),
-    /// and the body band's rows solid from their first pixel to the art's
-    /// rear, where the trail ends under it; the tall cat is the two-row cat
-    /// stood taller — the same ears, and the same face row for row (its eyes,
-    /// nose, blush and mouth) under a taller head. The const shape checks
-    /// hold this at build time; this test reads them back, so a check
-    /// weakened to pass reads wrong here. NEGATIVE CONTROL: the shape checks
-    /// refuse a blink that moves a pixel off the eye rows, a flick that moves
-    /// one right of the tail, a ragged row, a hole in the haunch the trail
-    /// would show through, the socks under the mouth as first drawn, and a
-    /// mouth looked for on a row that has none.
+    /// touching only the eye rows (and shutting every eye: no iris, pupil or
+    /// catch-light left), the flick only the tail's columns, the open cat's
+    /// two eyes each an iris and a pupil, and the body band's rows, in every
+    /// frame, starting at or left of the art's rear and solid from there to
+    /// it, where the trail ends under the cat; the tall cat is the two-row
+    /// cat stood taller — the same ears' tips, the eyes, pupils, ears' pink
+    /// and nose on the same columns, and the same legs a row longer and
+    /// paws. The const shape checks hold this at build time; this test reads
+    /// them back, so a check weakened to pass reads wrong here. NEGATIVE
+    /// CONTROL: the shape checks refuse a blink that moves a pixel off the
+    /// eye rows, a flick that moves one right of the tail, an eye of iris
+    /// alone, one eye, two eyes run together, a ragged row, a hole in the
+    /// haunch the trail would show through, and a rear read off the open
+    /// frame alone (the flick's back, its tail swept down, starts a pixel
+    /// further in: ground between).
     #[test]
     fn kitty_frames_are_rectangular_and_drawn_in_the_palette() {
         for (art, h) in [(KITTY_SHORT, KITTY_H), (KITTY_TALL, KITTY_TALL_H)] {
@@ -4082,13 +3984,30 @@ mod tests {
                     "the flick is the tail alone"
                 );
             }
-            assert!(art.open.iter().any(|r| r.contains('e')), "the cat has eyes");
-            for f in [art.open, art.blink, art.flick] {
+            assert!(
+                two_eyes_of_iris_and_pupil(art.open, art.eyes),
+                "the cat has two eyes, each an iris and a pupil"
+            );
+            // NEGATIVE CONTROL: a right eye of iris alone, one eye, and the
+            // two eyes run together are refused.
+            for (what, pupil_row, catch_row) in [
+                ("a right eye without its pupil", "ekccccee", "ewccccew"),
+                ("one eye", "ekcccccc", "ewcccccc"),
+                ("the eyes run together", "ekkkkkek", "ewkkkkew"),
+            ] {
+                let rows: Vec<String> = art
+                    .open
+                    .iter()
+                    .map(|r| {
+                        r.replace("ekccccek", pupil_row)
+                            .replace("ewccccew", catch_row)
+                    })
+                    .collect();
+                let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+                assert_ne!(rows, art.open, "CONTROL: {what} is drawn");
                 assert!(
-                    mouth_on_coat(f, art.mouth_row()),
-                    "the mouth stands on coat: {:?} under {:?}",
-                    f[art.mouth_row() + 1],
-                    f[art.mouth_row()]
+                    !two_eyes_of_iris_and_pupil(&rows, art.eyes),
+                    "CONTROL: {what} passes the eye check"
                 );
             }
             let rear = art.rear();
@@ -4103,9 +4022,9 @@ mod tests {
             }
         }
         // The same cat: the tall head's columns hold the two-row head's
-        // features — the ears, the eyes, the blush and the nose on the same
-        // columns — and its face, a cell row of pixels from the eyes' top, is
-        // the two-row cat's row for row, open and blinking.
+        // features — the ears' tips, the eyes and pupils, the ears' pink and
+        // the nose on the same columns — and the legs and paws are the
+        // two-row cat's, a row longer.
         let cols_of = |f: &[&str], ch: char| -> std::collections::BTreeSet<usize> {
             f.iter()
                 .flat_map(|r| {
@@ -4123,18 +4042,12 @@ mod tests {
             );
         }
         assert_eq!(KITTY_SHORT.open[0], KITTY_TALL.open[0], "the ears' tips");
-        let face =
-            |art: KittyArt, f: &'static [&'static str]| &f[art.eyes.0..art.eyes.0 + KITTY_HALF];
-        for (short, tall) in [
-            (KITTY_SHORT.open, KITTY_TALL.open),
-            (KITTY_SHORT.blink, KITTY_TALL.blink),
-        ] {
-            assert_eq!(
-                face(KITTY_SHORT, short),
-                face(KITTY_TALL, tall),
-                "the same face"
-            );
-        }
+        let (short, tall) = (KITTY_SHORT.open, KITTY_TALL.open);
+        assert_eq!(
+            [short[11], short[12], short[12], short[13]],
+            [tall[17], tall[18], tall[19], tall[20]],
+            "the legs, a row longer, and the paws"
+        );
         // NEGATIVE CONTROL: the const checks see a mis-drawn frame.
         let mut stray: Vec<&str> = KITTY_TALL.blink.to_vec();
         stray[0] = "..............o......oo.";
@@ -4158,16 +4071,23 @@ mod tests {
         let rear = KITTY_TALL.rear();
         assert!(trail_meets_flush(KITTY_TALL.open, KITTY_TALL.body, rear));
         let mut holed: Vec<&str> = KITTY_TALL.open.to_vec();
-        holed[KITTY_TALL.body.0 + 1] = "o.cccccocckkkkccckkkkcco";
+        holed[KITTY_TALL.body.0 + 1] = "o.occcccccccocewccccewco";
         assert!(!trail_meets_flush(&holed, KITTY_TALL.body, rear));
-        let mouth = KITTY_SHORT.mouth_row();
-        let mut fangs: Vec<&str> = KITTY_SHORT.open.to_vec();
-        fangs[mouth + 1] = "..occoocccooobbooobbo...";
-        assert!(!mouth_on_coat(&fangs, mouth), "socks under the mouth");
-        assert!(
-            !mouth_on_coat(KITTY_SHORT.open, mouth + 1),
-            "no mouth there"
-        );
+        // The open frame's own rear is a pixel short of the flick's back.
+        let open_rear = |art: KittyArt| {
+            art.open[art.body.0..art.body.0 + art.body.1]
+                .iter()
+                .map(|r| r.find(|c| c != '.').expect("a body row"))
+                .max()
+                .expect("body rows")
+        };
+        for art in [KITTY_SHORT, KITTY_TALL] {
+            assert!(trail_meets_flush(art.open, art.body, open_rear(art)));
+            assert!(
+                !trail_meets_flush(art.flick, art.body, open_rear(art)),
+                "CONTROL: the flick's back past the open frame's rear"
+            );
+        }
         assert!(frame_is_well_formed(KITTY_TALL.open, KITTY_TALL_H));
         assert!(
             !frame_is_well_formed(KITTY_TALL.open, KITTY_H),
@@ -4666,13 +4586,10 @@ mod tests {
         let (ya, yb) = trail_band(&geo, &s);
         let centre = (geo.col(34), (ya + yb) / 2);
         let mut old = Vec::new();
-        let mut sink = Sink {
-            geo,
-            left: usize::MAX,
-        };
-        assert!(push_star(
+        let sink = Sink { geo };
+        lay_star(
             &mut old,
-            &mut sink,
+            &sink,
             region,
             centre,
             4,
@@ -4680,8 +4597,8 @@ mod tests {
             false,
             s.palette.star_ink(0),
             &[],
-            false
-        ));
+            false,
+        );
         assert!(!print_breaches(&old, &p.trail).is_empty(), "CONTROL");
     }
 
@@ -4948,17 +4865,14 @@ mod tests {
             .expect("a segment");
         let centre = (x, edge.y0);
         let mut two = Vec::new();
-        let mut sink = Sink {
-            geo,
-            left: usize::MAX,
-        };
+        let sink = Sink { geo };
         let arm = i64::from(star_arm_px(star_arm(
             geo.ch as f32,
             STAR_ARM_FINE * STAR_ARM_INK,
         )));
-        assert!(push_star(
+        lay_star(
             &mut two,
-            &mut sink,
+            &sink,
             region,
             centre,
             arm,
@@ -4966,8 +4880,8 @@ mod tests {
             false,
             s.palette.star_ink(0),
             trail.covers(),
-            false
-        ));
+            false,
+        );
         assert!(
             two.iter().any(|q| q.color == premul_rgb(WHITE, q.alpha))
                 && two.iter().any(|q| q.color != premul_rgb(WHITE, q.alpha)),
@@ -4999,13 +4913,10 @@ mod tests {
         for k in 0..TRAIL_STOPS.len() {
             let ink_rgb = s.palette.star_ink(k);
             let mut out = Vec::new();
-            let mut sink = Sink {
-                geo,
-                left: usize::MAX,
-            };
-            assert!(push_star(
+            let sink = Sink { geo };
+            lay_star(
                 &mut out,
-                &mut sink,
+                &sink,
                 region,
                 centre,
                 arm,
@@ -5013,8 +4924,8 @@ mod tests {
                 true,
                 ink_rgb,
                 &[],
-                false
-            ));
+                false,
+            );
             // Every quad that touches the nucleus is opaque ink.
             let arm32 = i32::try_from(arm).expect("a small arm");
             let (c, t) = (
@@ -5154,12 +5065,9 @@ mod tests {
                             continue;
                         };
                         frames += 1;
-                        let mut sink = Sink {
-                            geo,
-                            left: usize::MAX,
-                        };
+                        let sink = Sink { geo };
                         let mut burst = Vec::new();
-                        assert!(cx.burst(&mut sink, &mut burst));
+                        cx.burst_stars(&mut lay_calls(&cx, &mut burst));
                         let (mut whole, mut before) = (Vec::new(), Vec::new());
                         for (k, &c) in ring.centres.iter().enumerate() {
                             let rgb = s.palette.star_ink(k);
@@ -5167,9 +5075,9 @@ mod tests {
                                 (&mut whole, ring.region),
                                 (&mut before, one_sided(&cx, ring.region, c)),
                             ] {
-                                assert!(push_star(
+                                lay_star(
                                     out,
-                                    &mut sink,
+                                    &sink,
                                     clip,
                                     c,
                                     ring.arm,
@@ -5177,8 +5085,8 @@ mod tests {
                                     true,
                                     rgb,
                                     &[],
-                                    false
-                                ));
+                                    false,
+                                );
                             }
                         }
                         let want = pixels(&whole);
@@ -5796,7 +5704,7 @@ mod tests {
     fn whole(s: &CardScene, clock: Clock) -> (Vec<GlowQuad>, Vec<GlowQuad>) {
         let p = parts(s, clock);
         let under = [p.border, p.trail].concat();
-        let over = [p.kitty, p.rim, p.burst, p.stars, p.sparkles].concat();
+        let over = [p.kitty, p.rim, p.burst, p.glints, p.stars, p.sparkles].concat();
         (under, over)
     }
 
@@ -5968,7 +5876,7 @@ mod tests {
                     assert_eq!(at.rect.y0, seat.rect.y0, "{what}: on the seat's rows");
                     assert_eq!(
                         drawn_kitty(&p.kitty, &at, inks),
-                        art(kitty_frame(&at.art, clock)),
+                        art(at.art.frame(kitty_frame(clock))),
                         "{what}: {t} ms, whole where the ride has it"
                     );
                     for q in p.kitty.iter().chain(&p.rim).chain(&p.trail) {
@@ -6045,12 +5953,13 @@ mod tests {
 
     /// On the ride the field comes up behind the kitty: no star is drawn on
     /// the kitty where the ride has it, nor ahead of it on the way to its
-    /// seat, and every star is up a [`STAR_REVEAL_MS`] after the ride. The
-    /// sparkles it sheds sit behind its back, in the star region and their
-    /// bands, and are gone by the ride's end, before the burst opens; none
-    /// when settled or with nothing to ride. NEGATIVE CONTROL: before the kitty starts, stars
-    /// the field holds left of the seat are not drawn, and are once it is
-    /// seated.
+    /// seat, and every star is up a [`STAR_REVEAL_MS`] after the ride; the
+    /// rainbow's glints come up behind its back as it passes them, on the
+    /// trail laid so far. The sparkles it sheds sit behind its back, in the
+    /// star region and their bands, and are gone by the ride's end, before
+    /// the burst opens; none when settled or with nothing to ride. NEGATIVE
+    /// CONTROL: before the kitty starts, stars the field holds left of the
+    /// seat, and the glints, are not drawn, and are once it is seated.
     #[test]
     fn the_field_and_the_sparkles_come_up_behind_the_kitty() {
         for kitty_rows in [2u8, 3] {
@@ -6083,8 +5992,20 @@ mod tests {
                         let ahead = x0 < seat.rect.x0 - reach && x1 > at.x0;
                         assert!(!ahead, "{what}: {t} ms, a star ahead of the kitty {q:?}");
                     }
+                    let laid = trail_reach(&p.trail, &s).map_or(i64::MIN, |r| r.1);
+                    for q in &p.glints {
+                        let x1 = i64::from(q.x) + i64::from(q.w);
+                        assert!(
+                            x1 <= at.x0,
+                            "{what}: {t} ms, a glint ahead of the kitty {q:?}"
+                        );
+                        assert!(
+                            x1 <= laid,
+                            "{what}: {t} ms, a glint past the trail laid {q:?}"
+                        );
+                    }
                     if t >= RIDE_MS {
-                        // Out before the burst opens (`MAX_CARD_QUADS`' count).
+                        // Out before the burst opens (`CARD_ITEMS_MAX`' count).
                         assert!(p.sparkles.is_empty(), "{what}: {t} ms, the sparkles gone");
                     }
                     shed += p.sparkles.len();
@@ -6118,6 +6039,11 @@ mod tests {
                 );
                 assert_eq!(left_of_seat(&parts(&s, Clock::riding(0))), 0, "{what}");
                 assert!(left_of_seat(&up) > 0, "{what}: up after the ride");
+                assert!(
+                    parts(&s, Clock::riding(0)).glints.is_empty(),
+                    "{what}: glints"
+                );
+                assert!(!up.glints.is_empty(), "{what}: glints up after the ride");
                 assert!(settled.sparkles.is_empty(), "{what}: settled, none shed");
             }
         }
@@ -6296,6 +6222,271 @@ mod tests {
         assert!(counts.len() > 1, "the seed varies the count: {counts:?}");
     }
 
+    /// [`scenes`], and launch cards on the longest trail (20 cells) at the
+    /// shipping cell sizes, on both grounds and at both heights: the scenes
+    /// the rainbow's glints are checked on.
+    fn glint_scenes() -> Vec<CardScene> {
+        let mut v = scenes();
+        for (cw, ch) in [(9u16, 18u16), (16, 33), (17, 35)] {
+            for kitty_rows in [2u8, 3] {
+                for dark in [true, false] {
+                    v.push(CardScene {
+                        cw,
+                        ch,
+                        kitty_rows,
+                        dark,
+                        trail: Some((32, 52)),
+                        kitty_col: Some(52),
+                        cols: 63,
+                        ..scene()
+                    });
+                }
+            }
+        }
+        v
+    }
+
+    /// The pixel rectangle of quad `q`.
+    fn rect_of(q: &GlowQuad) -> Rect {
+        Rect {
+            x0: i64::from(q.x),
+            y0: i64::from(q.y),
+            x1: i64::from(q.x) + i64::from(q.w),
+            y1: i64::from(q.y) + i64::from(q.h),
+        }
+    }
+
+    /// THE RAINBOW'S GLINTS LIE ON ITS STRIPES (§10.6.11): on every scene
+    /// with a trail, settled and through a whole episode, riding in and
+    /// seated, every glint's quad lies inside the trail's band less the
+    /// wave's step (so on the rainbow in every frame, the stripes' edges
+    /// stepping round it), right of the trail's start (never over the
+    /// card's text) and left of the kitty's art; on a light ground each is
+    /// the paper's white on the print, in one tone. One glint per
+    /// [`GLINT_CELLS`] cells of the trail's free stretch, three at most and
+    /// one at least, and the settled frame draws them all. NEGATIVE CONTROL:
+    /// a glint laid on the band's edge leaves it.
+    #[test]
+    fn the_rainbows_glints_lie_on_its_stripes() {
+        let mut counts = std::collections::BTreeSet::new();
+        let mut laid = 0;
+        for s in glint_scenes() {
+            let what = format!("{}x{} {} rows dark {}", s.cw, s.ch, s.kitty_rows, s.dark);
+            let g = Geo::new(&s).expect("a scene");
+            let seat = kitty_rect(&g, &s);
+            let glints = glint_spots(&g, &s, 7);
+            let Some((t, amp)) = trail_rect(&g, &s, seat) else {
+                assert_eq!(glints.n, 0, "{what}: no trail, no glints");
+                continue;
+            };
+            let free = seat.map_or(t.x1, |at| at.rect.x0.min(t.x1));
+            if glints.n > 0 {
+                let cells = (free - t.x0) / g.cw;
+                let want = usize::try_from(cells / GLINT_CELLS).expect("cells");
+                assert_eq!(glints.n, want.clamp(1, GLINTS_MAX), "{what}: the count");
+                assert!(glints.rest >= 1 && glints.rest <= glints.flare, "{what}");
+            }
+            counts.insert(glints.n);
+            let band = Rect {
+                x0: t.x0.max(g.col(s.trail.expect("a trail").0)),
+                y0: t.y0 + amp,
+                x1: free,
+                y1: t.y1 - amp,
+            };
+            let clocks = std::iter::once(Clock::SETTLED).chain(
+                (0..EPISODE_MS)
+                    .step_by(FRAME_MS as usize)
+                    .flat_map(|t| [Clock::riding(t), Clock::seated(t)]),
+            );
+            for clock in clocks {
+                let p = parts(&s, clock);
+                if clock.t_ms.is_none() {
+                    assert_eq!(
+                        p.glints.is_empty(),
+                        glints.n == 0,
+                        "{what}: the settled frame's glints"
+                    );
+                }
+                for q in &p.glints {
+                    assert_in_band_and_box(q, &s, &what);
+                    let r = rect_of(q);
+                    assert_eq!(
+                        r.meet(band),
+                        r,
+                        "{what} at {clock:?}: off the rainbow {q:?}"
+                    );
+                    if !s.dark {
+                        let c = q.color;
+                        assert!(
+                            q.alpha > 0
+                                && (c >> 16) & 0xff == c & 0xff
+                                && (c >> 8) & 0xff == c & 0xff,
+                            "{what} at {clock:?}: not the paper's white {q:?}"
+                        );
+                    }
+                }
+                laid += p.glints.len();
+            }
+        }
+        assert!(laid > 0, "glints laid");
+        assert!(
+            counts.contains(&1) && counts.contains(&GLINTS_MAX),
+            "one on a short trail, the most on a long one: {counts:?}"
+        );
+        // NEGATIVE CONTROL: a glint centred on the band's top edge pokes
+        // off the rainbow.
+        let s = scene();
+        let g = Geo::new(&s).expect("a scene");
+        let (t, amp) = trail_rect(&g, &s, kitty_rect(&g, &s)).expect("a trail");
+        let mut out = Vec::new();
+        let sink = Sink { geo: g };
+        let edge = (t.x0 + 2 * g.cw, t.y0 + amp);
+        lay_star(
+            &mut out,
+            &sink,
+            g.clip,
+            edge,
+            glint_spots(&g, &s, 7).rest,
+            GLINT_COV,
+            false,
+            WHITE,
+            &[],
+            true,
+        );
+        let band = Rect {
+            y0: t.y0 + amp,
+            y1: t.y1 - amp,
+            ..t
+        };
+        assert!(
+            out.iter().any(|q| rect_of(q).meet(band) != rect_of(q)),
+            "CONTROL: a glint on the band's edge leaves it"
+        );
+    }
+
+    /// A GLINT FLARES AS THE SHEEN PASSES — Claude's `✦` flaring as its
+    /// crest runs out from the wand: in a seated episode each glint, at rest
+    /// the standard star, grows to its flare's arm and throws its four
+    /// diffraction glints when the trail's shimmer reaches it, and is back
+    /// at its rest size between passes; it flares on every pass the episode
+    /// holds (the shimmer's, under the photosensitivity bound), and the
+    /// episode's last frame lays the settled glints' very pixels, so the
+    /// settled frame follows without a jump. At the shipping cell sizes, on
+    /// both grounds and at both heights. NEGATIVE CONTROL: away from the
+    /// sheen a glint is its settled size and throws no glints.
+    #[test]
+    fn a_glint_flares_as_the_sheen_passes() {
+        for s in glint_scenes()
+            .into_iter()
+            .filter(|s| s.trail == Some((32, 52)))
+        {
+            let what = format!("{}x{} {} rows dark {}", s.cw, s.ch, s.kitty_rows, s.dark);
+            let g = Geo::new(&s).expect("a scene");
+            let glints = glint_spots(&g, &s, 7);
+            assert_eq!(glints.n, GLINTS_MAX, "{what}");
+            assert!(glints.flare > glints.rest, "{what}: room to flare");
+            let reach = glints.flare + 1;
+            // A glint's half-width in a frame, and whether it throws its
+            // diffraction glints (one-pixel quads off its arms' line).
+            let read = |p: &Parts, spot: &GlintSpot| {
+                let mine: Vec<Rect> = p
+                    .glints
+                    .iter()
+                    .map(rect_of)
+                    .filter(|r| (r.x0 - spot.x).abs() <= reach && (r.y0 - spot.y).abs() <= reach)
+                    .collect();
+                let half = mine
+                    .iter()
+                    .map(|r| (r.x1 - 1 - spot.x).max(spot.x - r.x0))
+                    .max();
+                let dots = mine.iter().any(|r| {
+                    r.x1 - r.x0 == 1 && r.y1 - r.y0 == 1 && r.x0 != spot.x && r.y0 != spot.y
+                });
+                (half, dots)
+            };
+            let settled = parts(&s, Clock::SETTLED);
+            for spot in glints.spots() {
+                assert_eq!(
+                    read(&settled, spot),
+                    (Some(glints.rest), false),
+                    "{what}: at rest"
+                );
+                let mut flares = 0;
+                let mut was_flaring = false;
+                let mut rest_between = false;
+                for t in (0..EPISODE_MS).step_by(FRAME_MS as usize / 3) {
+                    let (half, dots) = read(&parts(&s, Clock::seated(t)), spot);
+                    let half = half.expect("a glint");
+                    assert!(
+                        (glints.rest..=glints.flare).contains(&half),
+                        "{what}: {t} ms, arm {half}"
+                    );
+                    let flaring = half == glints.flare;
+                    if flaring && !was_flaring {
+                        flares += 1;
+                        assert!(dots, "{what}: {t} ms, a flare throws its glints");
+                    }
+                    if half == glints.rest && flares > 0 {
+                        assert!(!dots, "{what}: CONTROL, {t} ms, at rest, no glints");
+                        rest_between = true;
+                    }
+                    was_flaring = flaring;
+                }
+                // The shimmer sweeps the trail once a SHIMMER_MS, from past
+                // its start to past its end, faded in and out at the
+                // episode's ends: every pass inside it reaches each glint.
+                let passes = (EPISODE_MS as f32 / SHIMMER_MS) as usize;
+                assert!(
+                    flares >= passes - 1 && flares <= passes + 1,
+                    "{what}: {flares} flares for {passes} passes"
+                );
+                assert!(rest_between, "{what}: CONTROL, back at rest between passes");
+            }
+            // The episode's last frame lays the settled glints' very
+            // pixels: the same quads, colour and coverage included, not only
+            // the same rectangles, so neither a size nor a brightness pops
+            // when the settled frame replaces it.
+            let last = parts(&s, Clock::seated(EPISODE_MS - 1));
+            assert_eq!(
+                last.glints, settled.glints,
+                "{what}: no jump into the settled frame"
+            );
+        }
+    }
+
+    /// The field keeps clear of the rainbow's glints: no field star sits
+    /// within a star's gap of a glint, on either ground, over many seeds,
+    /// where a field star on the trail would otherwise often land on one.
+    #[test]
+    fn the_field_keeps_clear_of_the_glints() {
+        let mut near_trail = 0;
+        for seed in 0..200u64 {
+            for s in glint_scenes()
+                .into_iter()
+                .filter(|s| s.cw == 9 && s.trail == Some((32, 52)))
+            {
+                let g = Geo::new(&s).expect("a scene");
+                let glints = glint_spots(&g, &s, seed);
+                let (field, n) = field_spots(&g, &s, seed, !s.dark);
+                let gap = g.cw.max(g.ch / 2);
+                for f in &field[..n] {
+                    for o in glints.spots() {
+                        assert!(
+                            (f.x - o.x).abs() >= gap || (f.y - o.y).abs() >= gap,
+                            "seed {seed}: a field star {f:?} on a glint {o:?}"
+                        );
+                    }
+                    let (t, _) = trail_rect(&g, &s, kitty_rect(&g, &s)).expect("a trail");
+                    near_trail += usize::from(t.contains(f.x, f.y));
+                }
+            }
+        }
+        assert!(
+            near_trail > 0,
+            "CONTROL: field stars on the trail, beside the glints"
+        );
+    }
+
     /// The card's dark star is the crate's one star: the same quads
     /// `push_twinkle_star` lays, given the same centre, arm and coverage.
     #[test]
@@ -6316,13 +6507,10 @@ mod tests {
         for (arm, cov, gold) in [(2i64, 235.0f32, false), (3, 200.0, true), (6, 255.0, true)] {
             let (sx, sy) = (g.col(45), g.band(g.top + 1) + 1);
             let mut ours = Vec::new();
-            let mut sink = Sink {
-                geo: g,
-                left: MAX_CARD_QUADS,
-            };
-            assert!(push_star(
+            let sink = Sink { geo: g };
+            lay_star(
                 &mut ours,
-                &mut sink,
+                &sink,
                 g.clip,
                 (sx, sy),
                 arm,
@@ -6330,8 +6518,8 @@ mod tests {
                 gold,
                 WHITE,
                 &[],
-                true
-            ));
+                true,
+            );
             let mut family = Vec::new();
             assert!(push_twinkle_star(
                 &mut family,
@@ -6349,244 +6537,6 @@ mod tests {
             }
             assert_eq!(ours, family, "arm {arm} cov {cov} gold {gold}");
         }
-    }
-
-    /// The budget holds on a pathological scene: hundreds of columns, many
-    /// boxed rows, a long trail and tall cells, through the burst; and at the
-    /// shipping cell sizes it never binds, with a whole star to spare.
-    #[test]
-    fn the_quad_budget_holds() {
-        let s = CardScene {
-            cw: 20,
-            ch: 44,
-            cols: 3000,
-            rows: 40,
-            trail: Some((12, 2900)),
-            kitty_col: Some(2900),
-            origin_y: 0,
-            origin_x: 0,
-            top: 0,
-            ..scene()
-        };
-        for dark in [true, false] {
-            let s = CardScene { dark, ..s };
-            let t0 = Instant::now();
-            let mut card = HarnessCard::default();
-            card.arm(t0, 1);
-            for at in [0, 100, 450, RIDE_MS + 100, 2000, EPISODE_MS + 1] {
-                let (under, over, _) = frame(&mut card, t0 + ms(at), &s, true);
-                assert!(
-                    under.len() + over.len() <= MAX_CARD_QUADS,
-                    "{} quads at {at} ms",
-                    under.len() + over.len()
-                );
-            }
-        }
-        // At shipping sizes the cap never binds: the busiest frame (the burst
-        // at its widest) leaves room for one more whole star.
-        for s in scenes() {
-            let t0 = Instant::now();
-            let mut card = HarnessCard::default();
-            card.arm(t0, 1);
-            let worst = (0..=EPISODE_MS)
-                .step_by(11)
-                .map(|at| {
-                    let (under, over, _) = frame(&mut card, t0 + ms(at), &s, true);
-                    under.len() + over.len()
-                })
-                .max()
-                .unwrap_or(0);
-            assert!(
-                worst + STAR_QUADS_MAX < MAX_CARD_QUADS,
-                "{worst} quads at {} × {}",
-                s.cw,
-                s.ch
-            );
-        }
-        // The busiest frame a launch card draws — the burst opening as the
-        // ride ends beside the field, the rim and the stepping trail — on its
-        // longest trail (20 cells), its border standing in air over and under
-        // the box, at both heights, at the shipping cell sizes and over many
-        // seeds: the frame it wants is under the cap with a whole star to
-        // spare.
-        for (cw, ch) in [(9u16, 18u16), (16, 33), (17, 35)] {
-            for kitty_rows in [2u8, 3] {
-                let s = aired(CardScene {
-                    cw,
-                    ch,
-                    kitty_rows,
-                    trail: Some((32, 52)),
-                    kitty_col: Some(52),
-                    cols: 63,
-                    ..scene()
-                });
-                for seed in 0..40u64 {
-                    for t in (RIDE_MS..RIDE_MS + BURST_MS).step_by(FRAME_MS as usize) {
-                        let p = parts_seeded(&s, Clock::riding(t), seed);
-                        let want = [
-                            &p.border,
-                            &p.trail,
-                            &p.kitty,
-                            &p.rim,
-                            &p.burst,
-                            &p.stars,
-                            &p.sparkles,
-                        ]
-                        .iter()
-                        .map(|v| v.len())
-                        .sum::<usize>();
-                        assert!(
-                            want + STAR_QUADS_MAX < MAX_CARD_QUADS,
-                            "{cw}x{ch}, {kitty_rows} rows, seed {seed}, {t} ms: {want} quads"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// A STAR IS LAID WHOLE OR TAKEN BACK, TO THE QUAD: with the budget
-    /// one quad short of a star, [`push_star`] lays nothing, spends nothing
-    /// and says the budget is spent; with exactly enough it lays the whole
-    /// star and spends it all — a light star the trail's edge crosses, laid
-    /// in two tones ([`lay_toned`]), too. NEGATIVE CONTROL: [`lay_star`]
-    /// alone, one short, leaves part of a star behind.
-    #[test]
-    fn a_star_is_laid_whole_or_taken_back() {
-        let s = scene();
-        let geo = Geo::new(&s).expect("a scene");
-        let region = star_region(&geo, &s).expect("a region");
-        let centre = ((region.x0 + region.x1) / 2, (region.y0 + region.y1) / 2);
-        // A trail's ink whose top edge runs through the star's middle, in
-        // two segments stepped a pixel apart.
-        let edge = [
-            Rect {
-                x0: centre.0 - 40,
-                y0: centre.1,
-                x1: centre.0,
-                y1: centre.1 + 40,
-            },
-            Rect {
-                x0: centre.0,
-                y0: centre.1 + 1,
-                x1: centre.0 + 40,
-                y1: centre.1 + 40,
-            },
-        ];
-        for (arm, gold, dark, on_trail) in [
-            (3, false, true, &[][..]),
-            (6, true, true, &[][..]),
-            (5, true, false, &[][..]),
-            (5, true, false, &edge[..]),
-        ] {
-            let star = |left: usize, whole: bool| {
-                let mut sink = Sink { geo, left };
-                let mut out = Vec::new();
-                let laid = if whole {
-                    push_star(
-                        &mut out,
-                        &mut sink,
-                        region,
-                        centre,
-                        arm,
-                        200.0,
-                        gold,
-                        0x00E3_141B,
-                        on_trail,
-                        dark,
-                    )
-                } else {
-                    lay_star(
-                        &mut out,
-                        &mut sink,
-                        region,
-                        centre,
-                        arm,
-                        200.0,
-                        gold,
-                        0x00E3_141B,
-                        on_trail,
-                        dark,
-                    )
-                };
-                (laid, out.len(), sink.left)
-            };
-            let (laid, need, _) = star(usize::MAX, true);
-            assert!(laid && need > 4, "arm {arm}: {need} quads");
-            assert_eq!(
-                star(need, true),
-                (true, need, 0),
-                "arm {arm}: exactly enough"
-            );
-            assert_eq!(
-                star(need - 1, true),
-                (false, 0, need - 1),
-                "arm {arm}: one short"
-            );
-            let (laid, part, _) = star(need - 1, false);
-            assert!(!laid && part > 0, "arm {arm}: CONTROL, part of a star");
-        }
-    }
-
-    /// THE BURST STAYS WHOLE UNDER THE CAP: where the burst opens at the
-    /// ride's end on a 20-cell trail at a large cell, three rows tall, in a
-    /// box of two dozen rows (a pathological scene: the border's sides cost
-    /// two quads a row), a frame can want more than [`MAX_CARD_QUADS`],
-    /// which no launch card does; it is held to the cap,
-    /// the burst's ring is drawn whole in every such frame, and what the
-    /// frame drops is whole field stars only, no more of them than the
-    /// overflow needs (a star's worth of quads). NEGATIVE CONTROL: some of
-    /// these frames do want more than the cap.
-    #[test]
-    fn the_burst_stays_whole_under_the_cap() {
-        let mut over_cap = 0;
-        for (cw, ch) in [(20u16, 44u16), (22, 48)] {
-            let s = CardScene {
-                cw,
-                ch,
-                kitty_rows: 3,
-                rows: 24,
-                trail: Some((32, 52)),
-                kitty_col: Some(52),
-                cols: 63,
-                ..scene()
-            };
-            for seed in 0..40u64 {
-                let t0 = Instant::now();
-                let mut card = HarnessCard::default();
-                card.arm(t0, seed);
-                for t in (RIDE_MS..RIDE_MS + BURST_MS).step_by(FRAME_MS as usize) {
-                    let p = parts_seeded(&s, Clock::riding(t), seed);
-                    let want: usize = [
-                        &p.border,
-                        &p.trail,
-                        &p.kitty,
-                        &p.rim,
-                        &p.burst,
-                        &p.stars,
-                        &p.sparkles,
-                    ]
-                    .iter()
-                    .map(|v| v.len())
-                    .sum();
-                    let (under, over, _) = frame(&mut card, t0 + ms(t), &s, true);
-                    let got = under.len() + over.len();
-                    let what = format!("{cw}x{ch}, seed {seed}, {t} ms: {got} of {want}");
-                    assert!(got <= MAX_CARD_QUADS, "{what}");
-                    let head = p.kitty.len() + p.rim.len();
-                    assert_eq!(over[head..head + p.burst.len()], p.burst[..], "{what}");
-                    if want > MAX_CARD_QUADS {
-                        over_cap += 1;
-                        let field = &over[head + p.burst.len()..];
-                        assert!(p.stars.starts_with(field), "{what}: whole field stars");
-                        assert!(got + STAR_QUADS_MAX > MAX_CARD_QUADS, "{what}: no waste");
-                    } else {
-                        assert_eq!(got, want, "{what}: all of it");
-                    }
-                }
-            }
-        }
-        assert!(over_cap > 0, "CONTROL: frames that want more than the cap");
     }
 
     /// Equal inputs give equal bytes, and the seed moves the stars.
@@ -6643,21 +6593,31 @@ mod tests {
         seen
     }
 
-    /// A CARD AT REST IS REPLAYED, BIT FOR BIT (`tick_or_replay`): beside a
-    /// twin that ticks every step, a card that ticks through its kept
-    /// settled frame appends the same quads, returns the same fingerprint
-    /// and shows its host the same card (its deadlines, its line, at rest
-    /// and still) after every step of a life — an episode, its end, still
-    /// frames, a scene that changes, serious mode, a window that loses
-    /// motion and an episode owed until motion comes back, and an owed
-    /// debt that lapses. Every step that replays reads no clock. So does a
-    /// card driven the host's way (`replay`, else `draw_kept`, the quads read
-    /// off `kept` where it replays), which makes no fingerprint at all.
-    /// CONTROL: every episode frame, every first frame of a new scene and
-    /// every step out of an owed episode is ticked (the clock read), the
-    /// replays happen — on every still step after the first — and
-    /// `tick_or_replay` makes the fingerprint it returns (the counter sees
-    /// the work the host's way skips).
+    /// A frame's contents as text: every item and palette entry, the arts
+    /// by their content ids, and the origin.
+    fn frame_text(f: &CardFrame) -> String {
+        format!(
+            "under {:?} {:?} over {:?} {:?} at {:?}",
+            f.under.items(),
+            f.under.palette(),
+            f.over.items(),
+            f.over.palette(),
+            f.origin
+        )
+    }
+
+    /// A CARD AT REST IS REPLAYED, BIT FOR BIT ([`HarnessCard::replay`]):
+    /// beside a twin that draws every step, a card driven the host's way
+    /// (`replay`, else `draw`) hands back the same contents at the same
+    /// origin and shows its host the same card (its deadlines, its line, at
+    /// rest and still) after every step of a life — an episode, its end,
+    /// still frames, a scene that changes, serious mode, a window that loses
+    /// motion and an episode owed until motion comes back, and an owed debt
+    /// that lapses. A replay takes no clock, and hands back the kept `Arc`s
+    /// themselves: it seals nothing and copies nothing. CONTROL: every
+    /// episode frame, every first frame of a new scene and every step out
+    /// of an owed episode is drawn (and seals its contents), and the
+    /// replays happen — on every still step after the first.
     #[test]
     fn a_card_at_rest_is_replayed_bit_for_bit() {
         for s in scenes() {
@@ -6704,59 +6664,47 @@ mod tests {
                 (3 * EPISODE_MS + OWED_MAX_MS + 20, s, true, false, false),
                 (3 * EPISODE_MS + OWED_MAX_MS + 30, s, true, false, true),
             ];
-            let (mut twin, mut card) = (HarnessCard::default(), HarnessCard::default());
-            let mut kept = SettledFrame::default();
-            // The host's way (`claude_card`): `replay`, else `draw_kept`.
-            let (mut host, mut host_kept) = (HarnessCard::default(), SettledFrame::default());
+            let (mut twin, mut twin_frames) = (HarnessCard::default(), CardFrames::default());
+            let (mut host, mut frames) = (HarnessCard::default(), CardFrames::default());
+            let mut last: Option<CardFrame> = None;
             for (at, scene, animate, arm, replays) in steps {
                 let now = t0 + ms(at);
                 if arm {
                     twin.arm(now, 9);
-                    card.arm(now, 9);
                     host.arm(now, 9);
                 }
-                let want = frame(&mut twin, now, &scene, animate);
-                let _ = FRAME_FPS.with(|n| n.replace(0));
-                let hosted = if host.replay(&scene, animate, &host_kept) {
-                    (host_kept.under().to_vec(), host_kept.over().to_vec(), true)
-                } else {
-                    let (mut under, mut over) = (Vec::new(), Vec::new());
-                    host.draw_kept(now, &scene, animate, &mut host_kept, &mut under, &mut over);
-                    (under, over, false)
+                let want = twin.draw(now, &scene, animate, &mut twin_frames);
+                let before = aterm_core::render::fx_counts_here();
+                let replayed = host.replay(&scene, animate, &frames);
+                let spent = aterm_core::render::fx_counts_here();
+                assert_eq!(
+                    (spent.0 - before.0, spent.1 - before.1),
+                    (0, 0),
+                    "{at} ms: a replay builds nothing and copies nothing"
+                );
+                assert_eq!(replayed.is_some(), replays, "{at} ms: replayed?");
+                let got = match replayed {
+                    Some(f) => {
+                        let prev = last.as_ref().expect("a frame before a replay");
+                        assert!(
+                            Arc::ptr_eq(&f.under, &prev.under) && Arc::ptr_eq(&f.over, &prev.over),
+                            "{at} ms: the kept Arcs themselves"
+                        );
+                        f
+                    }
+                    None => {
+                        let f = host.draw(now, &scene, animate, &mut frames);
+                        let built = aterm_core::render::fx_counts_here().0 - spent.0;
+                        assert!(
+                            built > 0 || f.is_empty(),
+                            "{at} ms: CONTROL, a draw seals its contents"
+                        );
+                        f
+                    }
                 };
-                assert_eq!(
-                    FRAME_FPS.with(|n| n.replace(0)),
-                    0,
-                    "{at} ms: the host's way makes no fingerprint"
-                );
-                assert_eq!(
-                    (&hosted.0, &hosted.1, hosted.2),
-                    (&want.0, &want.1, replays),
-                    "{at} ms: the host's frame"
-                );
+                assert_eq!(frame_text(&got), frame_text(&want), "{at} ms: the frame");
                 assert_eq!(observed(&host, now), observed(&twin, now), "{at} ms: host");
-                let (mut under, mut over) = (Vec::new(), Vec::new());
-                let mut read = 0;
-                let (fp, ticked) = card.tick_or_replay(
-                    || {
-                        read += 1;
-                        now
-                    },
-                    &scene,
-                    animate,
-                    &mut kept,
-                    &mut under,
-                    &mut over,
-                );
-                assert_eq!(
-                    FRAME_FPS.with(|n| n.replace(0)),
-                    1,
-                    "{at} ms: CONTROL, the fingerprint is made where it is asked for"
-                );
-                assert_eq!((under, over, fp), want, "{at} ms: the same frame");
-                assert_eq!(ticked.is_none(), replays, "{at} ms: replayed?");
-                assert_eq!(read, usize::from(!replays), "{at} ms: clock reads");
-                assert_eq!(observed(&card, now), observed(&twin, now), "{at} ms");
+                last = Some(got);
             }
         }
     }
@@ -7865,7 +7813,7 @@ mod tests {
                             t_ms,
                             ride_ms: t_ms,
                         };
-                        let frame = kitty_frame(&at.art, clock);
+                        let frame = at.art.frame(kitty_frame(clock));
                         // The first flick falls on the ride.
                         let at = ridden(&g, &s, at, clock);
                         let drawn = parts(&s, clock);
@@ -7966,7 +7914,7 @@ mod tests {
                     let flick = Clock::seated(FLICK_AT_MS + 10);
                     let ring = rim_ring(
                         &seat,
-                        kitty_frame(&seat.art, flick),
+                        seat.art.frame(kitty_frame(flick)),
                         rim_px(seat.p, g.t),
                         g.inner(),
                     );
@@ -7984,9 +7932,8 @@ mod tests {
     /// under each paw and stops at a toe's gap, lining neither its sides nor
     /// its foot, so on a light ground the gap reads as the ground between
     /// paws, not as a hole boxed in by a coloured line. At both heights, on
-    /// both grounds, in every frame, at three cell sizes — the tall art's
-    /// one-pixel gaps (between its legs, the front legs' two rows deep) and
-    /// the two-row art's one, between the front paws under its chin.
+    /// both grounds, in every frame, at three cell sizes — the one-pixel
+    /// gaps between the four paws, the same at both heights.
     /// NEGATIVE CONTROL: the pixels under the paws beside each gap, where
     /// the paw's foot is on the ground, are lit.
     #[test]
@@ -8010,7 +7957,7 @@ mod tests {
                         Clock::seated(BLINK_AT_MS + 10),
                         Clock::seated(FLICK_AT_MS + 10),
                     ] {
-                        let frame = kitty_frame(&seat.art, clock);
+                        let frame = seat.art.frame(kitty_frame(clock));
                         let lit = coverage(&parts(&s, clock).rim);
                         let what = format!("{cw}x{ch}, {kitty_rows} rows, dark {dark}");
                         let under = |r: i64, c: i64| {
@@ -8029,8 +7976,12 @@ mod tests {
                                     under(r, c).all(|px| !lit.contains_key(&px)),
                                     "{what}: the gap at ({r}, {c}) is lined beneath"
                                 );
-                                // A leg beside a gap two rows deep goes on
-                                // down: only a foot wears the rim under it.
+                                // The paw on each side wears the rim under
+                                // its foot. Every gap of the shipped art is
+                                // on the paws' last row; the skip is for art
+                                // whose gap opened higher up the legs, where
+                                // the leg beside it goes on down and wears
+                                // no rim under that row.
                                 for side in [c - 1, c + 1] {
                                     if rim_solid(frame, r + 1, side) {
                                         continue;

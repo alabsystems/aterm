@@ -7,7 +7,7 @@
 //! so the property pinned here is exact: `decode_strict` accepts a string iff
 //! it is the canonical encoding of what it decodes to.
 
-use aterm_codec::base64::{decode, decode_strict, encode};
+use aterm_codec::base64::{decode, decode_strict, encode, encode_into, encoded_len};
 use aterm_spec::rng::XorShift;
 
 /// Strict accepts `text` exactly when the lenient decode succeeds AND
@@ -64,6 +64,71 @@ fn every_short_length_and_every_byte_value_round_trips() {
             round_trips(&vec![b as u8; len]);
         }
     }
+}
+
+/// `encode_into` appends exactly what `encode` returns, onto an empty and onto
+/// a non-empty buffer, and `encoded_len` is the length it appends: every input
+/// length from 0 to 1023.
+#[test]
+fn encode_into_appends_exactly_encode() {
+    let mut rng = XorShift::new(0x2545_F491_4F6C_DD1D);
+    for len in 0..1024usize {
+        let raw: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+        let expected = encode(&raw).expect("encode within MAX_INPUT_LEN");
+        assert_eq!(encoded_len(len), Some(expected.len()), "length {len}");
+
+        let mut fresh = String::new();
+        encode_into(&mut fresh, &raw).expect("encode_into within MAX_INPUT_LEN");
+        assert_eq!(fresh, expected, "length {len}");
+
+        let mut appended = String::from("OK 1 ");
+        encode_into(&mut appended, &raw).expect("encode_into within MAX_INPUT_LEN");
+        assert_eq!(
+            appended.strip_prefix("OK 1 "),
+            Some(expected.as_str()),
+            "length {len}"
+        );
+    }
+}
+
+/// A destination already sized by `encoded_len` takes the whole encoding in
+/// place. Negative control: one byte short, the same append reallocates, so
+/// an unchanged capacity is evidence of no second buffer.
+#[test]
+fn a_destination_sized_by_encoded_len_never_reallocates() {
+    for len in 1..=300usize {
+        let raw = vec![0xA5u8; len];
+        let need = encoded_len(len).expect("short input");
+
+        let mut sized = String::with_capacity(need);
+        let reserved = sized.capacity();
+        encode_into(&mut sized, &raw).expect("short input");
+        assert_eq!(sized.capacity(), reserved, "length {len}");
+
+        let mut short = String::with_capacity(need - 1);
+        let short_reserved = short.capacity();
+        encode_into(&mut short, &raw).expect("short input");
+        assert_ne!(short.capacity(), short_reserved, "control at length {len}");
+        assert_eq!(short, sized);
+    }
+}
+
+/// Above `MAX_INPUT_LEN` both refuse, and `encode_into` leaves its destination
+/// as it was. The oversized input is a zeroed allocation nothing reads.
+#[test]
+fn oversized_input_is_refused_and_appends_nothing() {
+    let max = aterm_codec::MAX_INPUT_LEN;
+    assert_eq!(encoded_len(max), Some(max.div_ceil(3) * 4));
+    assert_eq!(encoded_len(max + 1), None);
+
+    let oversized = vec![0u8; max + 1];
+    let mut out = String::from("kept");
+    assert_eq!(
+        encode_into(&mut out, &oversized),
+        Err(aterm_codec::base64::EncodeError::InputTooLarge(max + 1)),
+    );
+    assert_eq!(out, "kept");
+    assert_eq!(out.capacity(), "kept".len());
 }
 
 /// EXHAUSTIVE over short strings from an alphabet that hits every sharp edge:

@@ -62,13 +62,13 @@
 //! after the turn the tab goes under Land — a tab under Land already (a
 //! config default) cannot run, exit 3: its restored Land would prove nothing
 //! of the layout — and the run waits until the crash journal carries the
-//! word, as `--hold` waits for its hold. The stub's answers become done
-//! replies ending on the worker's own token, and the run waits (6 min) until
-//! the tab's `status` says `task=landed` — the short turn's back-off, the land
-//! instruction typed, its done reply. After the restart the restored tab is
-//! watched for [`LAND_WATCH`], past the back-off an attach waits before it
-//! types: its task must end `landed` or `done` (a cold restore is a new
-//! session, which reads its done reply back as done), with no land
+//! word, as `--hold` waits for its hold. The stub's answers become clean
+//! defenses, a few lines starting `Nothing left:` (the lab's project is no
+//! repository, so its probe finds nothing unlanded), and the run waits (6
+//! min) until the tab's `status` says `task=landed` — the short turn's
+//! back-off, the land instruction typed, its defense. After the restart the
+//! restored tab is watched for [`LAND_WATCH`], past the back-off an attach
+//! waits before it types: its task must end `landed`, with no land
 //! instruction typed since the relaunch (the ledger's `land@v1` rows), the
 //! tab under Land (`status` `autopilot=land`), and the relaunch's carry-on
 //! settled with nothing typed (the restored tab's journal's carry-on settles
@@ -105,14 +105,13 @@ use crate::stop;
 use crate::util::now_ms;
 use crate::{Fail, Res};
 
-/// `--land`'s stub mode: every answer a done reply ending on the worker's
-/// own token, as Land's instruction asks for it — so the instruction's answer
-/// LANDS the task.
+/// `--land`'s stub mode: every answer a clean defense, as Land's instruction
+/// asks for it — so the instruction's answer LANDS the task.
 const LANDED_MODE: &str = "landed";
 
-/// …its words.
-const LANDED_TEXT: &str =
-    "Committed and pushed the lab's work; nothing is left to do.\nATERM-TASK-DONE";
+/// …its words: a `Nothing left:` defense with no need and no open work in
+/// Land's strict reading (`turn_end::clean_defense`).
+const LANDED_TEXT: &str = "Nothing left: the lab's work is committed and pushed to origin/main.";
 
 /// How long `--land` watches the restored tab: past the 2-minute back-off a
 /// loop that attaches to an idle agent waits before its first act, so a land
@@ -135,8 +134,8 @@ fn land_typed(door: &Door<'_>, sid: &str) -> Vec<String> {
         .collect()
 }
 
-/// `--land`, before aterm ends: tab `sid` under Land, the stub's answers done
-/// replies, until its `status` says `task=landed` (6 min). The land
+/// `--land`, before aterm ends: tab `sid` under Land, the stub's answers
+/// clean defenses, until its `status` says `task=landed` (6 min). The land
 /// instructions typed by then.
 fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail> {
     let spec = J::obj([("stream", J::Bool(true)), ("text", J::s(LANDED_TEXT))]);
@@ -1194,7 +1193,7 @@ fn run_restore(
                     &status_word(&door, "autopilot"),
                 );
                 let task = seen.last().map_or("?", String::as_str);
-                if !matches!(task, "landed" | "done")
+                if task != "landed"
                     || !typed.is_empty()
                     || carry_on.is_err()
                     || continued_typed(&rows) > 0
@@ -1811,5 +1810,17 @@ mod tests {
         assert_eq!(message_keyed(messages, "harness.restored-held.s-2"), None);
         assert_eq!(lift_named(&["lift it with the menu".to_string()]), None);
         assert_eq!(pct_decode("%4"), "%4", "a % without two hex digits stays");
+    }
+
+    /// `--land`'s stub answer LANDS the work under Land's own reading: a
+    /// clean defense. NEGATIVE CONTROL: the retired token reply it once gave
+    /// lands nothing.
+    #[test]
+    fn the_land_drills_stub_answer_is_a_clean_defense() {
+        use aterm_agent::supervise::policy::turn_end::clean_defense;
+        assert!(clean_defense(Some(LANDED_TEXT)), "{LANDED_TEXT}");
+        assert!(!clean_defense(Some(
+            "Committed and pushed the lab's work; nothing is left to do.\nATERM-TASK-DONE"
+        )));
     }
 }

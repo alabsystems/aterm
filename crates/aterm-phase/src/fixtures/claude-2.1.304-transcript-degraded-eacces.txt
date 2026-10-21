@@ -1,0 +1,23 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (144x50, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the pinned transcript-writer-degraded notice at idle: the session's transcript file made read-only (chmod 444) after the first turn, then a second turn; Claude Code draws it under the composer's bottom rule, the vendor's ⚠ glyph and one space before its words
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.48dP/proj
+
+
+❯ hello there
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Crunched for 0s · done 1:25 AM
+
+❯ second turn
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Worked for 0s · done 1:25 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript writes are failing (permission denied — EACCES) · recent messages may not be saved for resume
+  ⏵⏵ auto mode on (shift+tab to cycle)

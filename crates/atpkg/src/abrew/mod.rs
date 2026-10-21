@@ -5,7 +5,7 @@
 //!
 //! The intended product is native Homebrew compatibility. The implemented
 //! subset admits relocation-free bottles and simple cask artifacts; source
-//! recipes, replacements, services and unsupported arguments delegate before
+//! recipes, services and unsupported arguments delegate before
 //! effects. `brew --real …`, `ABREW_REAL=1` and `abrew off` select real brew.
 //! One argument-admission function preserves this boundary for every entry.
 
@@ -39,6 +39,17 @@ pub(crate) fn valid_component(name: &str) -> bool {
         && name
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"._+@-".contains(&c))
+}
+
+/// A package version as a single directory name. Brew versions use
+/// commas (`4.2.1,20260531.1`), which are path-safe everywhere abrew
+/// runs; separators, colons and leading dots still refuse.
+pub(crate) fn valid_cask_version(version: &str) -> bool {
+    !version.is_empty()
+        && !version.starts_with('.')
+        && version
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._+@-,".contains(&c))
 }
 
 pub(crate) fn valid_name(name: &str) -> bool {
@@ -109,12 +120,6 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     if let Some(w) = prefix::prefix_env_warning() {
         eprintln!("abrew: warning: {w}");
     }
-    if prefix::overlaps_real_brew_prefix(&prefix.root) {
-        return failed(&format!(
-            "abrew: refusing ABREW_PREFIX {}: it overlaps a real Homebrew prefix; abrew and real brew must own disjoint trees",
-            prefix.root.display()
-        ));
-    }
     // Escapes (design §1) win before anything else, except turning
     // abrew back on.
     let first = args.first().map(String::as_str).unwrap_or("");
@@ -132,6 +137,14 @@ pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     }
     if prefix.is_disabled() && !matches!(first, "on" | "status") {
         return passthrough(&prefix, args, Some("abrew is off (abrew on re-enables)"));
+    }
+    // Only native work needs an abrew-owned tree. Explicit and disabled
+    // delegation above must remain usable even for a refused native prefix.
+    if prefix::overlaps_real_brew_prefix(&prefix.root) {
+        return failed(&format!(
+            "abrew: refusing ABREW_PREFIX {}: it overlaps a real Homebrew prefix or its physical location is uncertain; abrew and real brew must own disjoint trees",
+            prefix.root.display()
+        ));
     }
     if via_reroute && crate::config::cached_reroute().announce() {
         eprintln!("brew → abrew (aterm) — `brew --real …` runs real Homebrew");
@@ -205,6 +218,16 @@ fn from_install(prefix: &Prefix, args: &[String], r: Result<(), InstallError>) -
     }
 }
 
+/// A later fallback must not replay earlier successful native work in another prefix.
+fn after_native_progress(error: InstallError, completed: bool) -> InstallError {
+    match error {
+        InstallError::PassThrough(reason) if completed => InstallError::Failed(format!(
+            "{reason}; an earlier native step succeeded; refusing whole-command delegation"
+        )),
+        error => error,
+    }
+}
+
 /// True for commands that mutate the prefix (they take the lock).
 fn mutates(cmd: &str) -> bool {
     matches!(
@@ -235,15 +258,59 @@ fn mutates(cmd: &str) -> bool {
     )
 }
 
+/// brew spells the kind switches two ways (`--formula`/`--formulae`,
+/// `--cask`/`--casks`) on every kind-taking command. Admission and
+/// handlers read only the singular tokens, so plural spellings are
+/// canonicalized in the `rest` copy they see. The original `args`
+/// keep the user's spelling for passthrough to real brew. Exact
+/// tokens only: these switches take no `=value`, and a leading-dash
+/// token was never an operand.
+fn canonical_kind_switches(rest: &[String]) -> Vec<String> {
+    rest.iter()
+        .map(|s| match s.as_str() {
+            "--formulae" => "--formula".to_string(),
+            "--casks" => "--cask".to_string(),
+            _ => s.clone(),
+        })
+        .collect()
+}
+
 /// Admit only argument forms whose meaning is implemented. Unsupported forms
 /// reach real brew unchanged before locking or creating anything in the prefix.
 fn native_args(
     cmd: &str,
     rest: &[String],
 ) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+    let canonical = canonical_kind_switches(rest);
+    let rest: &[String] = &canonical;
     let unsupported = || InstallError::PassThrough(format!("'{cmd}' arguments are not native yet"));
     let unknown = || {
-        if COMMANDS.contains(&cmd) {
+        // Real brew verbs abrew delegates whole (developer commands,
+        // zap, the shell/ruby escapes) are KNOWN, just not native:
+        // the message must not call them unknown commands. They stay
+        // out of COMMANDS, which is the natively-dispatched roster
+        // shell completions are generated from.
+        const DELEGATED_KNOWN: &[&str] = &[
+            "audit",
+            "bottle",
+            "bump",
+            "bump-cask-pr",
+            "bump-formula-pr",
+            "bump-revision",
+            "create",
+            "edit",
+            "extract",
+            "irb",
+            "livecheck",
+            "postinstall",
+            "ruby",
+            "sh",
+            "style",
+            "test",
+            "unpack",
+            "zap",
+        ];
+        if COMMANDS.contains(&cmd) || DELEGATED_KNOWN.contains(&cmd) {
             unsupported()
         } else {
             InstallError::PassThrough(format!("'{cmd}' is not a command abrew knows natively"))
@@ -253,7 +320,7 @@ fn native_args(
         return bundle_args(rest);
     }
     let (flags, min, max, names): (&[&str], usize, usize, bool) = match cmd {
-        "install" | "reinstall" | "upgrade" => (
+        "install" | "reinstall" => (
             &[
                 "--formula",
                 "--cask",
@@ -264,9 +331,34 @@ fn native_args(
                 "-n",
                 "--quiet",
                 "-q",
+                "--verbose",
+                "-v",
+                "--debug",
+                "-d",
+                "--no-quarantine",
             ],
             1,
-            1,
+            usize::MAX,
+            true,
+        ),
+        // Bare `upgrade` (all outdated formulae) is brew's common form
+        // and stays native; it must never delegate to a real brew that
+        // would upgrade a different prefix.
+        "upgrade" => (
+            &[
+                "--formula",
+                "--cask",
+                "--ignore-dependencies",
+                "--force",
+                "-f",
+                "--dry-run",
+                "-n",
+                "--quiet",
+                "-q",
+                "--greedy",
+            ],
+            0,
+            usize::MAX,
             true,
         ),
         "uninstall" | "remove" | "rm" => (
@@ -278,46 +370,157 @@ fn native_args(
                 "-n",
             ],
             1,
-            1,
+            usize::MAX,
             true,
         ),
         "search" | "-S" => (&["--desc", "--formula", "--cask"], 1, usize::MAX, false),
-        "info" => (&["--cask"], 0, usize::MAX, true),
-        "desc" | "uses" | "dependents" | "options" | "linkage" => (&[], 1, usize::MAX, true),
+        "info" => (
+            &[
+                "--cask",
+                "--formula",
+                "--json",
+                "--json=v1",
+                "--json=v2",
+                "--installed",
+            ],
+            0,
+            usize::MAX,
+            true,
+        ),
+        // Search-mode operands are free text, not package names;
+        // named-mode operands are validated by the desc rule below.
+        "desc" => (
+            &[
+                "--formula",
+                "--cask",
+                "--search",
+                "-s",
+                "--name",
+                "-n",
+                "--description",
+                "-d",
+            ],
+            1,
+            usize::MAX,
+            false,
+        ),
+        "options" => (&["--compact", "--installed"], 0, usize::MAX, true),
+        "linkage" => (&[], 1, usize::MAX, true),
+        // Native uses scans the installed census, so --installed is
+        // exactly its semantics; --recursive still delegates.
+        "uses" | "dependents" => (&["--installed"], 1, usize::MAX, true),
         "home" | "homepage" => (&[], 0, usize::MAX, true),
-        "cat" => (&[], 1, 1, true),
-        "outdated" => (&["--formula", "--cask"], 0, 0, false),
-        "cleanup" | "autoremove" => (&["--dry-run", "-n"], 0, 1, true),
+        "cat" => (&["--cask", "--formula"], 1, 1, true),
+        "outdated" => (
+            &[
+                "--formula",
+                "--cask",
+                "--greedy",
+                "--verbose",
+                "-v",
+                "--quiet",
+                "-q",
+                "--json",
+                "--json=v1",
+                "--json=v2",
+            ],
+            0,
+            usize::MAX,
+            true,
+        ),
+        "missing" => (&[], 0, usize::MAX, true),
+        "cleanup" => (&["--dry-run", "-n", "-s", "--scrub"], 0, usize::MAX, true),
+        "autoremove" => (&["--dry-run", "-n"], 0, 1, true),
         "pin" | "unpin" | "link" | "ln" | "unlink" => (&[], 1, 1, true),
         "switch" => (&[], 2, 2, true),
         "list" | "ls" => (
-            &["--formula", "--cask", "--versions", "--pinned"],
+            &[
+                "--formula",
+                "--cask",
+                "--versions",
+                "--pinned",
+                "--full-name",
+                "--long",
+                "-l",
+                "-1",
+                "--multiple",
+                "--json",
+            ],
             0,
-            1,
+            usize::MAX,
             true,
         ),
-        "fetch" => (&["--cask"], 1, 1, true),
-        "deps" => (&["--tree", "--installed", "--direct"], 0, usize::MAX, true),
+        "fetch" => (&["--cask", "--formula", "--deps"], 1, usize::MAX, true),
+        // brew spells the direct switch four ways (-1, --direct,
+        // --declared, --1); all four are the one admitted meaning.
+        "deps" => (
+            &[
+                "--tree",
+                "--installed",
+                "--direct",
+                "--1",
+                "-1",
+                "--declared",
+                "--for-each",
+                "--union",
+                "--topological",
+                "-n",
+            ],
+            0,
+            usize::MAX,
+            true,
+        ),
         "log" => (&[], 0, 1, true),
-        "tap" => (&[], 0, 2, false),
+        "tap" => (&["--list-official"], 0, 2, false),
         "untap" => (&[], 1, 1, false),
         "tap-info" => (&[], 0, usize::MAX, false),
         "help" | "--help" | "-h" => (&[], 0, 1, false),
         "completions" => (&[], 1, 1, false),
-        "--prefix" => (&[], 0, 1, true),
+        "--prefix" | "--cellar" | "--caskroom" => (&[], 0, 1, true),
+        // The named forms answer for this prefix's own cache/taps;
+        // brew's platform spellings (--os/--arch/-s/--HEAD and kin)
+        // are not in the flag set and keep delegating.
+        "--cache" => (&["--formula", "--cask"], 0, usize::MAX, true),
+        "--repository" | "--repo" => (&[], 0, 1, false),
         "analytics" => (&[], 0, 1, false),
-        "on" | "off" | "status" | "--version" | "-v" | "--cellar" | "--caskroom" | "--cache"
-        | "--repository" | "--env" | "env" | "formulae" | "casks" | "commands" | "config"
-        | "shellenv" | "doctor" | "dr" | "developer" | "update" | "leaves" | "missing" => {
-            (&[], 0, 0, false)
-        }
+        "doctor" | "dr" => (&["--quiet", "-q"], 0, 0, false),
+        "shellenv" => (&[], 0, 1, false),
+        "on" | "off" | "status" | "--version" | "-v" | "--env" | "env" | "formulae" | "casks"
+        | "commands" | "config" | "developer" | "update" => (&[], 0, 0, false),
+        "leaves" => (
+            &["--installed-on-request", "--installed-as-dependency"],
+            0,
+            0,
+            false,
+        ),
         _ => return Err(unknown()),
     };
-    if rest
-        .iter()
-        .any(|arg| arg.starts_with('-') && !flags.contains(&arg.as_str()))
-    {
+    let flag_ok = |arg: &str| {
+        flags.contains(&arg)
+            || (cmd == "cleanup"
+                && arg.strip_prefix("--prune=").is_some_and(|v| {
+                    v == "all" || (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                }))
+            || (cmd == "missing"
+                && arg.strip_prefix("--hide=").is_some_and(|v| {
+                    !v.is_empty()
+                        && v.split(',').all(|part| {
+                            // Short or tap-qualified names only: every
+                            // segment a safe component (no `..` travel).
+                            let part = part.trim();
+                            !part.is_empty()
+                                && part.split('/').all(valid_component)
+                                && matches!(part.matches('/').count(), 0 | 2)
+                        })
+                }))
+    };
+    if rest.iter().any(|arg| arg.starts_with('-') && !flag_ok(arg)) {
         return Err(unsupported());
+    }
+    if cmd == "cleanup" {
+        // Recognized numeric ages must fit before layout/locking or cleanup;
+        // they are a native refusal, never a reason to run a different prefix.
+        cleanup_max_age(rest).map_err(|error| InstallError::Failed(error.to_string()))?;
     }
     let ops = operands(rest);
     if cmd == "completions"
@@ -327,37 +530,101 @@ fn native_args(
     {
         return Err(unsupported());
     }
-    if !(min..=max).contains(&ops.len()) || (names && !ops.iter().all(|s| valid_component(s))) {
+    // Keep an explicit tap's kind through admission. Most handlers shorten
+    // names and infer their kind from flags or the installed census; a cask
+    // qualifier must never become permission to mutate a same-named formula,
+    // or vice versa. Without a matching flag, delegate before metadata or
+    // locking. The core --prefix query is already formula-only.
+    let want_formula = has_flag(rest, "--formula", "");
+    let want_cask = has_flag(rest, "--cask", "");
+    let valid_package_name = |s: &String| {
+        valid_component(s)
+            || ((want_formula || matches!(cmd, "--prefix" | "--cellar"))
+                && s.strip_prefix("homebrew/core/")
+                    .is_some_and(valid_component))
+            || ((want_cask || cmd == "--caskroom")
+                && s.strip_prefix("homebrew/cask/")
+                    .is_some_and(valid_component))
+    };
+    if !(min..=max).contains(&ops.len()) || (names && !ops.iter().all(valid_package_name)) {
         return Err(unsupported());
     }
     if has_flag(rest, "--cask", "") && has_flag(rest, "--formula", "") {
         return Err(unsupported());
     }
-    if matches!(cmd, "install" | "reinstall" | "upgrade") {
-        if cmd != "install" && !has_flag(rest, "--formula", "") {
-            // Native cask replacement is not transactional; selecting formula
-            // scope is required for native upgrade/reinstall.
+    if matches!(cmd, "install" | "reinstall" | "upgrade")
+        && !has_flag(rest, "--formula", "")
+        && (has_flag(rest, "--quiet", "-q") || has_flag(rest, "--ignore-dependencies", ""))
+    {
+        return Err(unsupported());
+    }
+    if matches!(cmd, "list" | "ls") && !ops.is_empty() && has_flag(rest, "--pinned", "") {
+        return Err(unsupported());
+    }
+    // Multi-name list is native only in the versions spellings;
+    // --multiple conflicts with --cask/--pinned in brew, and brew's
+    // --full-name branch would swallow it, so those delegate.
+    if matches!(cmd, "list" | "ls") {
+        let versions = has_flag(rest, "--versions", "") || has_flag(rest, "--multiple", "");
+        if ops.len() > 1 && !versions {
             return Err(unsupported());
         }
-        if !has_flag(rest, "--formula", "")
-            && (has_flag(rest, "--quiet", "-q") || has_flag(rest, "--ignore-dependencies", ""))
+        if has_flag(rest, "--multiple", "")
+            && (has_flag(rest, "--cask", "")
+                || has_flag(rest, "--pinned", "")
+                || has_flag(rest, "--full-name", ""))
+        {
+            return Err(unsupported());
+        }
+        // brew's --json list is the fast path only: --versions,
+        // no names, no other modifiers. Everything else delegates.
+        if has_flag(rest, "--json", "")
+            && (!has_flag(rest, "--versions", "")
+                || !ops.is_empty()
+                || has_flag(rest, "--multiple", "")
+                || has_flag(rest, "--pinned", "")
+                || has_flag(rest, "--full-name", "")
+                || has_flag(rest, "--long", "-l")
+                || rest.iter().any(|s| s == "-1"))
         {
             return Err(unsupported());
         }
     }
-    if matches!(cmd, "list" | "ls")
-        && !ops.is_empty()
-        && (has_flag(rest, "--versions", "") || has_flag(rest, "--pinned", ""))
-    {
-        return Err(unsupported());
-    }
     if cmd == "autoremove" && !ops.is_empty() {
         return Err(unsupported());
     }
-    if cmd == "deps"
-        && ((has_flag(rest, "--installed", "") && (!ops.is_empty() || rest.len() != 1))
-            || (!has_flag(rest, "--installed", "") && ops.is_empty())
-            || (has_flag(rest, "--tree", "") && has_flag(rest, "--direct", "")))
+    // With no root, only the installed inventory (plain, --direct or
+    // --tree over every installed formula) is implemented.
+    if cmd == "deps" && !has_flag(rest, "--installed", "") && ops.is_empty() {
+        return Err(unsupported());
+    }
+    // desc's three search modes conflict in brew (it errors there,
+    // so combined spellings delegate), and named mode keeps the
+    // package-name validation the row's `names` flag would have done.
+    let desc_modes = if cmd == "desc" {
+        [
+            has_flag(rest, "--search", "-s"),
+            has_flag(rest, "--name", "-n"),
+            has_flag(rest, "--description", "-d"),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count()
+    } else {
+        0
+    };
+    if desc_modes > 1 || (cmd == "desc" && desc_modes == 0 && !ops.iter().all(valid_package_name)) {
+        return Err(unsupported());
+    }
+    // brew's `/regex/` search form runs natively when the bounded
+    // first-party engine accepts the pattern. Constructs it refuses
+    // keep delegating: substring-matching the literal pattern would
+    // print a wrong "no matches", and search reads the upstream
+    // catalog, not prefix state, so delegating those spellings is
+    // safe. Detection mirrors brew: the space-joined query.
+    if (matches!(cmd, "search" | "-S") || desc_modes == 1)
+        && let Some(pattern) = search_regex_pattern(&ops.join(" "))
+        && compile_search_regex(pattern).is_err()
     {
         return Err(unsupported());
     }
@@ -372,7 +639,9 @@ fn native_args(
         {
             return Err(unsupported());
         }
-        "untap" | "tap-info" if !ops.iter().all(|s| tap::parse_tap_name(s).is_some()) => {
+        "untap" | "tap-info" | "--repository" | "--repo"
+            if !ops.iter().all(|s| tap::parse_tap_name(s).is_some()) =>
+        {
             return Err(unsupported());
         }
         "analytics"
@@ -392,7 +661,28 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
         InstallError::PassThrough("bundle arguments or Brewfile rows are not native yet".to_owned())
     };
     match rest.first().map(String::as_str) {
-        Some("status" | "remove" | "dump") if rest.len() == 1 => Ok(None),
+        Some("status" | "remove") if rest.len() == 1 => Ok(None),
+        Some("dump") => {
+            // dump [--file <path>|--file=<path>] [--force]
+            let mut file = false;
+            let mut force = false;
+            let mut it = rest[1..].iter();
+            while let Some(arg) = it.next() {
+                if arg == "--file" && !file {
+                    file = true;
+                    if !it.next().is_some_and(|s| !s.is_empty()) {
+                        return Err(unsupported());
+                    }
+                } else if arg.strip_prefix("--file=").is_some_and(|s| !s.is_empty()) && !file {
+                    file = true;
+                } else if matches!(arg.as_str(), "--force" | "-f") && !force {
+                    force = true;
+                } else {
+                    return Err(unsupported());
+                }
+            }
+            Ok(None)
+        }
         Some("check" | "install") => {
             let mut file = None;
             let mut it = rest[1..].iter();
@@ -413,7 +703,7 @@ fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, In
             }
             let text = bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
             let (entries, skipped) = bundle::parse_brewfile(&text);
-            if !skipped.is_empty() || (rest[0] == "install" && entries.len() > 1) {
+            if !skipped.is_empty() {
                 return Err(unsupported());
             }
             Ok(Some(entries))
@@ -455,23 +745,41 @@ fn prelock_delegation(
     args: &[String],
     rest: &[String],
 ) -> Option<ExitCode> {
-    let name = rest.iter().find(|s| !s.starts_with('-'))?;
     let want_cask = rest.iter().any(|s| s == "--cask");
     let want_formula = rest.iter().any(|s| s == "--formula");
-    let result = if want_cask || (!want_formula && api.formula(name).is_err()) {
-        match api.cask(name) {
-            Ok(c) => cask::preflight(&c),
-            Err(_) => return None,
-        }
-    } else {
-        let opts = install::InstallOpts {
-            ignore_dependencies: rest.iter().any(|s| s == "--ignore-dependencies"),
-            dry_run: false,
-            force: rest.iter().any(|s| matches!(s.as_str(), "--force" | "-f")),
-            quiet: true,
-        };
-        install::preflight_plan(api, prefix, name, &opts)
+    let opts = install::InstallOpts {
+        ignore_dependencies: rest.iter().any(|s| s == "--ignore-dependencies"),
+        dry_run: false,
+        force: rest.iter().any(|s| matches!(s.as_str(), "--force" | "-f")),
+        quiet: true,
+        upgrade: args.first().is_some_and(|a| a == "upgrade"),
+        reinstall: args.first().is_some_and(|a| a == "reinstall"),
+        as_dependency: false,
     };
+    // Every operand is planned: a batch delegates whole (before any
+    // effect) if any member would, so a multi-name install can never
+    // half-land natively and then replay in another prefix.
+    let mut result = Ok(());
+    let mut any = false;
+    for name in rest.iter().filter(|s| !s.starts_with('-')) {
+        any = true;
+        result = if want_cask || (!want_formula && api.formula(name).is_err()) {
+            match api.cask(name) {
+                Ok(c) => {
+                    cask::preflight(prefix, &c).and_then(|()| cask::preflight_deps(api, prefix, &c))
+                }
+                Err(_) => continue,
+            }
+        } else {
+            install::preflight_plan(api, prefix, name, &opts)
+        };
+        if result.is_err() {
+            break;
+        }
+    }
+    if !any {
+        return None;
+    }
     match result {
         Ok(()) => None,
         Err(e @ InstallError::PassThrough(_)) => Some(from_install(prefix, args, Err(e))),
@@ -479,7 +787,20 @@ fn prelock_delegation(
     }
 }
 
-fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
+fn dispatch(prefix: &Prefix, args_in: &[String], via_reroute: bool) -> ExitCode {
+    // Brew's leading global verbosity flags (`brew -v install x`) are
+    // no-ops here; drop them when a command follows (a bare `-v` is
+    // still the version spelling handled below).
+    let stripped: Vec<String>;
+    let args: &[String] = if args_in.len() > 1
+        && matches!(args_in[0].as_str(), "--verbose" | "-v" | "--debug" | "-d")
+        && !args_in[1].starts_with('-')
+    {
+        stripped = args_in[1..].to_vec();
+        &stripped
+    } else {
+        args_in
+    };
     // Typed `brew bundle` means Brewfile-install in brew, not abrew's
     // lay-the-fallback spelling: a rerouted bare `bundle` delegates.
     if via_reroute && args.len() == 1 && args.first().is_some_and(|a| a == "bundle") {
@@ -498,6 +819,18 @@ fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
     {
         return passthrough(prefix, args, None);
     }
+    // Typed `brew --env` asks for Homebrew's BUILD environment
+    // (CC, MAKEFLAGS, CMAKE paths under its prefix) to build
+    // against real brew; abrew's two ABREW_ lines would silently
+    // give a build the wrong environment. Direct `abrew --env`
+    // keeps the native answer.
+    if via_reroute
+        && args
+            .first()
+            .is_some_and(|a| matches!(a.as_str(), "--env" | "env"))
+    {
+        return passthrough(prefix, args, None);
+    }
     if args.is_empty() {
         print!("{HELP_MAIN}");
         return ExitCode::SUCCESS;
@@ -506,6 +839,10 @@ fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
         Some((c, r)) => (c.as_str(), r),
         None => ("", &[]),
     };
+    // Handlers see the same canonical kind switches admission saw;
+    // `args` above stays byte-identical for passthrough.
+    let canonical = canonical_kind_switches(rest);
+    let rest: &[String] = &canonical;
     let prepared = match native_args(cmd, rest) {
         Ok(prepared) => prepared,
         Err(error) => return from_install(prefix, args, Err(error)),
@@ -523,27 +860,43 @@ fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
             );
             return ExitCode::SUCCESS;
         }
-        "--prefix" => {
+        "--prefix" | "--cellar" | "--caskroom" => {
             if let Some(name) = rest.first() {
-                println!("{}", prefix.opt(Formula::short_name(name)).display());
-            } else {
-                println!("{}", prefix.root.display());
+                let api0 = api::Api::new(prefix.clone());
+                return commands::cmd_prefix_query(prefix, &api0, cmd, name);
             }
-            return ExitCode::SUCCESS;
-        }
-        "--cellar" => {
-            println!("{}", prefix.cellar().display());
-            return ExitCode::SUCCESS;
-        }
-        "--caskroom" => {
-            println!("{}", prefix.caskroom().display());
+            let bare = match cmd {
+                "--prefix" => prefix.root.clone(),
+                "--cellar" => prefix.cellar(),
+                _ => prefix.caskroom(),
+            };
+            println!("{}", bare.display());
             return ExitCode::SUCCESS;
         }
         "--cache" => {
-            println!("{}", prefix.cache().display());
-            return ExitCode::SUCCESS;
+            if operands(rest).is_empty() {
+                println!("{}", prefix.cache().display());
+                return ExitCode::SUCCESS;
+            }
+            let api0 = api::Api::new(prefix.clone());
+            return commands::cmd_cache_query(prefix, &api0, args, rest);
         }
-        "--repository" => {
+        "--repository" | "--repo" => {
+            // Admission validated the operand as a tap name. Like
+            // brew, the path prints whether or not the tap stands.
+            if let Some(name) = rest.first()
+                && let Some((user, repo)) = tap::parse_tap_name(name)
+            {
+                println!(
+                    "{}",
+                    prefix
+                        .taps_dir()
+                        .join(user)
+                        .join(format!("homebrew-{repo}"))
+                        .display()
+                );
+                return ExitCode::SUCCESS;
+            }
             println!("{}", prefix.homebrew_bundle().display());
             return ExitCode::SUCCESS;
         }
@@ -572,6 +925,53 @@ fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
             return code;
         }
     }
+    // A multi-entry `bundle install` is a batch like multi-name
+    // install: plan every not-yet-installed entry read-only, so a
+    // non-native member delegates the whole Brewfile before any
+    // entry lands in this prefix.
+    if cmd == "bundle"
+        && rest.first().is_some_and(|s| s == "install")
+        && let Some(entries) = &prepared
+    {
+        let api0 = api::Api::new(prefix.clone());
+        let opts = install::InstallOpts {
+            quiet: true,
+            ..install::InstallOpts::default()
+        };
+        let mut plan = Ok(());
+        for entry in entries {
+            plan = match entry {
+                bundle::BrewfileEntry::Tap(_) => Ok(()),
+                bundle::BrewfileEntry::Brew(n) => {
+                    if prefix
+                        .installed_one(prefix::Kind::Formula, Formula::short_name(n))
+                        .is_some()
+                    {
+                        Ok(())
+                    } else {
+                        install::preflight_plan(&api0, prefix, n, &opts)
+                    }
+                }
+                bundle::BrewfileEntry::Cask(n) => {
+                    if prefix.installed_one(prefix::Kind::Cask, n).is_some() {
+                        Ok(())
+                    } else {
+                        match api0.cask(n) {
+                            Ok(c) => cask::preflight(prefix, &c)
+                                .and_then(|()| cask::preflight_deps(&api0, prefix, &c)),
+                            Err(e) => Err(InstallError::Failed(e)),
+                        }
+                    }
+                }
+            };
+            if plan.is_err() {
+                break;
+            }
+        }
+        if let Err(e @ InstallError::PassThrough(_)) = plan {
+            return from_install(prefix, args, Err(e));
+        }
+    }
     let _lock = if mutates(cmd) && !read_only {
         match prefix::Lock::acquire(prefix) {
             Ok(l) => Some(l),
@@ -580,6 +980,10 @@ fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
     } else {
         None
     };
+    if _lock.is_some() {
+        // Recover only an owned aside's payload; anonymous scratch stays.
+        prefix.restore_stale_asides();
+    }
     let api = if dry_run {
         api::Api::read_only(prefix.clone())
     } else {
@@ -609,8 +1013,8 @@ fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         "config" => cmd_config(prefix),
-        "shellenv" => cmd_shellenv(prefix),
-        "doctor" | "dr" => cmd_doctor(prefix),
+        "shellenv" => cmd_shellenv(prefix, rest),
+        "doctor" | "dr" => cmd_doctor(prefix, rest),
         "analytics" => {
             println!("abrew: analytics are always off; abrew records nothing");
             ExitCode::SUCCESS
@@ -638,9 +1042,9 @@ fn dispatch(prefix: &Prefix, args: &[String], via_reroute: bool) -> ExitCode {
         // graphs
         "deps" => cmd_deps(prefix, &api, rest),
         "uses" | "dependents" => cmd_uses(prefix, &api, rest),
-        "leaves" => cmd_leaves(prefix, &api),
-        "missing" => cmd_missing(prefix, &api),
-        "options" => cmd_options(&api, rest),
+        "leaves" => cmd_leaves(prefix, &api, rest),
+        "missing" => cmd_missing(prefix, &api, rest),
+        "options" => cmd_options(prefix, &api, args, rest),
         "linkage" => cmd_linkage(prefix, rest),
         "log" => cmd_log(prefix, rest),
         // taps and bundle
@@ -764,11 +1168,11 @@ Usage: abrew <command> [args]
 
 Common commands:
   install [--cask] <name>         install a supported bottle or cask
-  uninstall [--cask] <name>       remove one (multi-name delegates)
+  uninstall [--cask] <name>…      remove installed packages
   reinstall, upgrade, outdated    refresh installed packages
   update                          refresh formula data and taps
   search <text>, info <name>      look packages up
-  list [--cask] [--versions]      what is installed
+  list [--cask] [--versions] [-l] what is installed
   doctor                          what needs attention
   deps, uses, leaves, missing     the dependency graph
   pin, unpin, link, unlink        manage kegs
@@ -778,20 +1182,41 @@ Common commands:
   completions bash|zsh|fish       shell discovery
 
 Real Homebrew, unchanged:  brew --real <command>…   ABREW_REAL=1   abrew off
-Native installs are limited to relocation-free bottles and simple App/Binary
-zip/tar casks. Source builds, replacements, services, batch installs and
+Native installs are limited to relocation-free bottles and zip/tar casks
+whose artifacts and constraints are plain data. Source builds, services and
 unsupported flags/recipes run real brew with a notice, using its own prefix.
 ";
 
 fn help_for(cmd: &str) -> &'static str {
     match cmd {
         "install" => {
-            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] <name>\n  Source (-s), --HEAD and multi-name forms run real Homebrew.\n"
+            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] [--no-quarantine] <name>…\n  Source (-s) and --HEAD forms run real Homebrew. Multi-name installs plan\n  every name first; a batch with a non-native member delegates whole.\n"
         }
         "uninstall" | "remove" => {
-            "Usage: abrew uninstall [--formula|--cask] [--ignore-dependencies] [--dry-run|-n] <name>\n"
+            "Usage: abrew uninstall [--formula|--cask] [--ignore-dependencies] [--dry-run|-n] <name>…\n"
         }
-        "list" | "ls" => "Usage: abrew list [--cask] [--versions] [--pinned] [name]\n",
+        "list" | "ls" => {
+            "Usage: abrew list [--formula|--cask] [--versions] [--multiple] [--pinned] [--full-name] [-l|--long] [name…]\n       abrew list --versions --json [--formula|--cask]\n"
+        }
+        "outdated" => {
+            "Usage: abrew outdated [--formula|--cask] [--greedy] [--verbose|-v|--quiet|-q] [--json[=v1|v2]] [name…]\n"
+        }
+        "options" => {
+            "Usage: abrew options [--compact] [--installed] [name…]\n  No names evaluates every formula, as in brew; tapped formulae run real Homebrew.\n"
+        }
+        "cleanup" => {
+            "Usage: abrew cleanup [--dry-run|-n] [--prune=<days>|--prune=all|--scrub|-s] [name…]\n  With names, old-version cleanup is scoped and shared cached downloads are kept.\n  Omit names to prune downloads with --prune or --scrub.\n"
+        }
+        "missing" => "Usage: abrew missing [--hide=<name>,…] [name…]\n",
+        "deps" => {
+            "Usage: abrew deps [--tree] [--direct|--declared|-1|--1] [--installed] [--for-each] [--union] [--topological|-n] [name…]\n"
+        }
+        "desc" => {
+            "Usage: abrew desc [--formula|--cask] <name>…\n       abrew desc [--formula|--cask] (--search|-s|--name|-n|--description|-d) <text>|/<regex>/\n"
+        }
+        "search" => {
+            "Usage: abrew search [--formula|--cask] [--desc] <text>|/<regex>/\n  Regex search is case-sensitive, like brew; patterns the native engine refuses run real Homebrew.\n"
+        }
         "bundle" => {
             "Usage: abrew bundle [--version T --sha256 H] [--force] | status | remove | dump | install|check [--file Brewfile] (cleanup delegates to real brew)\n  With no subcommand (direct abrew only), lays the pinned Homebrew under the abrew prefix (design §5). Typed as `brew bundle`, it runs real Homebrew.\n"
         }
@@ -815,24 +1240,62 @@ mod admission_tests {
         for (cmd, args) in [
             ("install", vec!["--HEAD", "wget"]),
             ("install", vec!["-s", "wget"]),
-            ("install", vec!["wget", "curl"]),
             (
                 "install",
                 vec!["--cask", "--ignore-dependencies", "firefox"],
             ),
-            ("info", vec!["--json", "wget"]),
+            ("info", vec!["--analytics", "wget"]),
             ("link", vec!["--overwrite", "wget"]),
             ("services", vec!["start", "wget"]),
             ("uninstall", vec!["--zap", "firefox"]),
             ("completions", vec!["powershell"]),
             ("completions", vec![]),
             ("postinstall", vec!["wget"]),
-            ("cleanup", vec!["--prune=all"]),
-            ("outdated", vec!["wget"]),
-            ("list", vec!["--versions", "wget"]),
+            ("cleanup", vec!["--prune=soon"]),
+            // brew's platform spellings for --cache stay delegated,
+            // as does a non-tap repository operand.
+            ("--cache", vec!["--os=all", "wget"]),
+            ("--cache", vec!["-s", "wget"]),
+            ("--cache", vec!["--HEAD", "wget"]),
+            ("--repository", vec!["notatap"]),
+            ("--repo", vec!["a/b/c"]),
+            // desc's search modes conflict in brew; combined modes
+            // and refused regex constructs delegate whole.
+            ("desc", vec!["-s", "-n", "wget"]),
+            ("desc", vec!["--search", "--description", "wget"]),
+            ("desc", vec!["-s", "/(?=http)client/"]),
+            ("missing", vec!["--hide="]),
+            ("missing", vec!["--hide=../outside"]),
+            ("list", vec!["--pinned", "wget"]),
+            // Multi-name file listing and brew's --multiple
+            // conflicts delegate whole.
+            ("list", vec!["wget", "curl"]),
+            ("list", vec!["--multiple", "--cask"]),
+            ("list", vec!["--multiple", "--pinned"]),
+            ("list", vec!["--multiple", "--full-name"]),
+            ("list", vec!["--json"]),
+            ("list", vec!["--versions", "--json", "wget"]),
+            ("list", vec!["--versions", "--json", "-l"]),
+            ("list", vec!["--versions", "--json", "--pinned"]),
+            // Regex constructs the bounded native engine refuses
+            // (look-around, backreferences, \p{…}) delegate whole.
+            ("search", vec!["/(?=http)client/"]),
+            ("search", vec![r"/(\w)\1/"]),
+            ("search", vec![r"/\p{L}+/"]),
             ("pin", vec!["../outside"]),
             ("install", vec!["other/tap/wget"]),
-            ("--prefix", vec!["homebrew/core/wget"]),
+            // Even when only the opposite kind is installed, its short name
+            // must not reach a mutating handler's census-based inference.
+            ("uninstall", vec!["homebrew/cask/wget"]),
+            ("uninstall", vec!["homebrew/core/firefox"]),
+            ("uninstall", vec!["--formula", "homebrew/cask/wget"]),
+            ("uninstall", vec!["--cask", "homebrew/core/firefox"]),
+            ("pin", vec!["homebrew/cask/wget"]),
+            ("link", vec!["homebrew/cask/wget"]),
+            ("reinstall", vec!["homebrew/cask/wget"]),
+            ("install", vec!["homebrew/core/wget"]),
+            ("--prefix", vec!["homebrew/cask/wget"]),
+            ("uninstall", vec!["--formula", "wget", "homebrew/cask/wget"]),
         ] {
             assert!(
                 matches!(
@@ -847,15 +1310,191 @@ mod admission_tests {
                 "install",
                 vec!["--formula", "--ignore-dependencies", "wget"],
             ),
+            ("install", vec!["wget", "curl"]),
+            ("uninstall", vec!["wget", "curl"]),
+            ("upgrade", vec!["wget", "curl"]),
+            ("upgrade", vec!["--cask", "firefox", "vlc"]),
+            ("reinstall", vec!["--formula", "--force", "wget", "curl"]),
+            ("reinstall", vec!["--cask", "--dry-run", "firefox", "vlc"]),
             ("install", vec!["--cask", "--dry-run", "firefox"]),
             ("cleanup", vec!["--dry-run", "wget"]),
+            ("cleanup", vec!["wget", "tree"]),
             ("deps", vec!["--tree", "wget"]),
+            ("deps", vec!["--installed"]),
+            ("deps", vec!["--installed", "--tree", "wget"]),
+            ("deps", vec!["--installed", "--direct", "wget"]),
+            ("deps", vec!["--installed", "--tree"]),
+            ("deps", vec!["--installed", "--direct"]),
+            ("deps", vec!["--installed", "--tree", "--direct"]),
+            ("deps", vec!["--tree", "--direct", "wget"]),
+            // brew's four spellings of the one direct switch.
+            ("deps", vec!["--1", "wget"]),
+            ("deps", vec!["-1", "wget"]),
+            ("deps", vec!["--declared", "wget"]),
+            ("deps", vec!["--installed", "--1"]),
+            ("deps", vec!["--installed", "-1", "wget"]),
+            ("deps", vec!["--for-each", "wget", "curl"]),
+            ("deps", vec!["--for-each", "--direct", "wget"]),
+            ("deps", vec!["--for-each", "--installed"]),
+            ("deps", vec!["--union", "wget", "curl"]),
+            ("deps", vec!["-n", "wget"]),
+            ("deps", vec!["--topological", "--direct", "wget"]),
+            ("deps", vec!["--union", "-n", "wget", "curl"]),
             ("completions", vec!["bash"]),
             ("completions", vec!["zsh"]),
             ("completions", vec!["fish"]),
             ("--prefix", vec!["wget"]),
+            ("--prefix", vec!["homebrew/core/wget"]),
+            ("--cache", vec![]),
+            ("--cache", vec!["wget"]),
+            ("--cache", vec!["wget", "curl"]),
+            ("--cache", vec!["--cask", "firefox"]),
+            ("--cache", vec!["--formulae", "homebrew/core/wget"]),
+            ("--repository", vec![]),
+            ("--repository", vec!["homebrew/core"]),
+            ("--repo", vec!["me/tools"]),
+            ("install", vec!["--formula", "homebrew/core/wget"]),
+            ("uninstall", vec!["--formula", "homebrew/core/wget"]),
+            ("uninstall", vec!["--cask", "homebrew/cask/firefox"]),
+            ("install", vec!["--cask", "homebrew/cask/firefox"]),
+            ("fetch", vec!["--formula", "--deps", "homebrew/core/wget"]),
+            ("fetch", vec!["--cask", "homebrew/cask/firefox"]),
+            ("--cellar", vec!["wget"]),
+            ("--cellar", vec!["homebrew/core/wget"]),
+            ("list", vec!["--versions", "wget"]),
+            ("list", vec!["--versions", "wget", "curl"]),
+            ("list", vec!["--multiple"]),
+            ("list", vec!["--multiple", "wget", "curl"]),
+            ("list", vec!["--versions", "--multiple"]),
+            ("list", vec!["--versions", "--json"]),
+            ("list", vec!["--versions", "--json", "--formula"]),
+            ("list", vec!["--versions", "--json", "--casks"]),
+            ("list", vec!["--full-name"]),
+            ("list", vec!["--full-name", "--versions"]),
+            ("outdated", vec!["wget"]),
+            ("outdated", vec!["--json=v2", "wget", "tree"]),
+            ("list", vec!["-l"]),
+            ("list", vec!["--long", "wget"]),
+            ("missing", vec!["wget"]),
+            ("missing", vec!["--hide=openssl@3,icu4c"]),
+            ("cat", vec!["--cask", "firefox"]),
+            ("cat", vec!["--cask", "homebrew/cask/firefox"]),
+            ("--caskroom", vec!["firefox"]),
+            ("--caskroom", vec!["homebrew/cask/firefox"]),
+            ("desc", vec!["--cask", "firefox"]),
+            ("desc", vec!["--formula", "wget"]),
+            ("desc", vec!["--search", "http", "client"]),
+            ("desc", vec!["-s", "/^lib.*@\\d$/"]),
+            ("desc", vec!["--name", "wget"]),
+            ("desc", vec!["-n", "/wget/"]),
+            ("desc", vec!["--description", "retriever"]),
+            ("desc", vec!["-d", "--casks", "browser"]),
+            ("leaves", vec!["--installed-as-dependency"]),
+            ("options", vec![]),
+            ("options", vec!["--compact", "wget"]),
+            ("options", vec!["--installed"]),
+            ("options", vec!["--installed", "wget"]),
+            ("outdated", vec!["--json=v2"]),
+            ("outdated", vec!["--json", "--formula"]),
+            ("info", vec!["--json=v2", "wget"]),
+            ("info", vec!["--installed", "--json"]),
+            ("doctor", vec!["--quiet"]),
+            ("shellenv", vec!["fish"]),
+            ("tap", vec!["--list-official"]),
+            ("cleanup", vec!["--prune=all"]),
+            ("cleanup", vec!["--prune=30", "-n"]),
+            ("cleanup", vec!["-s"]),
+            // brew's plural kind spellings canonicalize to the
+            // singular switches admission and handlers read.
+            ("list", vec!["--formulae"]),
+            ("list", vec!["--casks", "-1"]),
+            ("search", vec!["--casks", "firefox"]),
+            ("search", vec!["--formulae", "/^wget$/"]),
+            ("install", vec!["--formulae", "wget"]),
+            ("install", vec!["--casks", "firefox"]),
+            ("uninstall", vec!["--casks", "firefox"]),
+            ("outdated", vec!["--formulae"]),
+            ("upgrade", vec!["--casks", "firefox"]),
+            ("search", vec!["/wget.+/"]),
+            ("search", vec!["--desc", "/http.*/"]),
+            ("search", vec!["/^lib.*@\\d$/"]),
+            // brew joins operands before detecting the /regex/ form.
+            ("search", vec!["/http", "client/"]),
+            ("-S", vec!["/(?i)WGET/"]),
         ] {
             assert!(native_args(cmd, &argv(&args)).is_ok(), "{cmd} {args:?}");
+        }
+
+        // The last representable day count remains exact; the next one and
+        // an overflowing decimal refuse before native dispatch can take a lock.
+        let max_days = 213_503_982_334_601u64;
+        let max_arg = format!("--prune={max_days}");
+        assert_eq!(
+            cleanup_max_age(&argv(&[&max_arg])),
+            Ok(Some(Some(std::time::Duration::from_secs(
+                18_446_744_073_709_526_400
+            ))))
+        );
+        assert!(native_args("cleanup", &argv(&[&max_arg])).is_ok());
+        for args in [
+            vec![],
+            vec!["--prune=0"],
+            vec!["--prune=30"],
+            vec!["--prune=all"],
+            vec!["--scrub"],
+            vec!["-s", "--prune=30"],
+        ] {
+            assert!(native_args("cleanup", &argv(&args)).is_ok(), "{args:?}");
+        }
+        assert_eq!(cleanup_max_age(&[]), Ok(None));
+        assert_eq!(
+            cleanup_max_age(&argv(&["--prune=0"])),
+            Ok(Some(Some(std::time::Duration::ZERO)))
+        );
+        assert_eq!(
+            cleanup_max_age(&argv(&["--prune=30"])),
+            Ok(Some(Some(std::time::Duration::from_secs(2_592_000))))
+        );
+        for args in [
+            vec!["--prune=all"],
+            vec!["--scrub"],
+            vec!["-s", "--prune=30"],
+        ] {
+            assert_eq!(cleanup_max_age(&argv(&args)), Ok(Some(None)), "{args:?}");
+        }
+        assert_eq!(
+            cleanup_max_age(&argv(&["--prune=0", "--prune=30"])),
+            Ok(Some(Some(std::time::Duration::ZERO))),
+            "the first valid prune value keeps its existing precedence"
+        );
+        for bad in [
+            "--prune=213503982334602",
+            "--prune=18446744073709551615",
+            "--prune=18446744073709551616",
+        ] {
+            for args in [vec![bad], vec!["-s", bad], vec!["--prune=all", bad]] {
+                let args = argv(&args);
+                assert!(cleanup_max_age(&args).is_err(), "{args:?}");
+                assert!(
+                    matches!(native_args("cleanup", &args), Err(InstallError::Failed(_))),
+                    "{args:?}"
+                );
+            }
+        }
+        for bad in ["--prune=", "--prune=-1", "--prune=+1", "--prune=soon"] {
+            assert!(cleanup_max_age(&argv(&[bad])).is_err(), "{bad}");
+        }
+
+        let later = InstallError::PassThrough("later recipe needs brew".to_string());
+        assert_eq!(after_native_progress(later.clone(), false), later);
+        let refused = after_native_progress(later, true);
+        assert!(matches!(
+            refused,
+            InstallError::Failed(reason) if reason.contains("later recipe needs brew")
+        ));
+        for completed in [false, true] {
+            let native = InstallError::Failed("native refusal".to_string());
+            assert_eq!(after_native_progress(native.clone(), completed), native);
         }
     }
 
@@ -866,6 +1505,15 @@ mod admission_tests {
         let file = temp.path().join("Brewfile");
         let path = file.to_str().unwrap();
         std::fs::write(&file, "brew \"wget\"\ncask \"firefox\"\ntap \"me/tools\"\n").unwrap();
+        // Multi-entry bundle install is admitted (prelock plans the
+        // whole batch; a non-native member delegates before effects).
+        assert!(
+            matches!(
+                bundle_args(&argv(&["install", "--file", path])),
+                Ok(Some(entries)) if entries.len() == 3
+            ),
+            "multi-entry bundle install must admit"
+        );
         assert_eq!(
             dispatch(&prefix, &argv(&["bundle", "check", "--file", path]), false),
             ExitCode::from(1)
@@ -894,6 +1542,28 @@ mod admission_tests {
     }
 
     #[test]
+    fn plural_kind_switches_canonicalize_exact_tokens_only() {
+        assert_eq!(
+            canonical_kind_switches(&argv(&["--formulae", "wget", "--casks"])),
+            argv(&["--formula", "wget", "--cask"])
+        );
+        // Idempotent, and only the exact switch tokens change: a
+        // value-carrying or operand-shaped token is untouched.
+        let once = canonical_kind_switches(&argv(&["--formula", "--hide=--casks", "casks"]));
+        assert_eq!(canonical_kind_switches(&once), once);
+        // Canonicalization never manufactures admission: a command
+        // that takes no kind switch still delegates with plurals.
+        assert!(matches!(
+            native_args("tap", &argv(&["--formulae"])),
+            Err(InstallError::PassThrough(_))
+        ));
+        assert!(matches!(
+            native_args("doctor", &argv(&["--casks"])),
+            Err(InstallError::PassThrough(_))
+        ));
+    }
+
+    #[test]
     fn escape_and_admission_messages_are_precise() {
         use std::ffi::OsString;
         let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
@@ -911,6 +1581,11 @@ mod admission_tests {
             }
         };
         assert!(msg(&["services", "list"]).contains("not native yet"));
+        assert!(valid_cask_version("4.2.1,20260531.1"));
+        assert!(valid_cask_version("1.0"));
+        assert!(!valid_cask_version("../1.0"));
+        assert!(!valid_cask_version("1.0/2"));
+        assert!(!valid_cask_version(""));
         // Read-only dispatches on a fresh prefix create nothing.
         let temp = aterm_tempfile::tempdir().unwrap();
         let fresh = Prefix::at(&temp.path().join("never-created"));
@@ -921,6 +1596,24 @@ mod admission_tests {
             ExitCode::SUCCESS
         );
         assert!(!fresh.root.exists());
+        // Named global queries answer from paths alone, creating
+        // nothing: bare and tap-named repository, bare cache.
+        for q in [
+            &["--repository"][..],
+            &["--repository", "homebrew/core"][..],
+            &["--repo", "me/tools"][..],
+            &["--cache"][..],
+        ] {
+            assert_eq!(
+                dispatch(&fresh, &argv(q), false),
+                ExitCode::SUCCESS,
+                "{q:?}"
+            );
+            assert!(!fresh.root.exists(), "{q:?}");
+        }
         assert!(msg(&["frobnicate"]).contains("not a command abrew knows"));
+        // Known brew verbs that delegate whole are not "unknown".
+        assert!(msg(&["zap"]).contains("arguments are not native yet"));
+        assert!(msg(&["audit"]).contains("arguments are not native yet"));
     }
 }

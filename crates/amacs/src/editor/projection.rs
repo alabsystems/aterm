@@ -25,6 +25,33 @@ pub(super) fn line_end(text: &str, position: usize) -> usize {
         .map_or(text.len(), |relative| position.saturating_add(relative))
 }
 
+/// Where the text of `position`'s line ends: at its `\n`, or before the
+/// `\r` of a CRLF ending. amacs keeps CRLF byte-exact (design §2.2) and
+/// UAX #29 makes `\r\n` one character, so end-of-line motion, column
+/// motion and kill-line stop here and never park a caret between the two,
+/// where a typed character would split the ending. A caret already past
+/// the `\r` (an outside selection) keeps [`line_end`].
+pub(super) fn line_text_end(text: &str, position: usize) -> usize {
+    let end = line_end(text, position);
+    let before = end.saturating_sub(1);
+    if end < text.len() && before >= position && text.as_bytes().get(before) == Some(&b'\r') {
+        before
+    } else {
+        end
+    }
+}
+
+/// The line ending a document's lines use, which a command that breaks a
+/// line puts in: `"\r\n"` when its first line ends in one, else `"\n"`.
+/// amacs keeps a CRLF file's endings byte-exact (design §2.2), so a newline
+/// it adds to one is a CRLF too.
+pub(super) fn document_line_break(text: &str) -> &'static str {
+    match text.find('\n') {
+        Some(newline) if text[..newline].ends_with('\r') => "\r\n",
+        _ => "\n",
+    }
+}
+
 pub(super) fn clamp_to_char_boundary(text: &str, mut position: usize) -> usize {
     position = position.min(text.len());
     while position > 0 && !text.is_char_boundary(position) {
@@ -66,7 +93,7 @@ pub(super) fn byte_of_line(text: &str, line: usize) -> usize {
     text.as_bytes()
         .iter()
         .enumerate()
-        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index.saturating_add(1)))
         .nth(line - 1)
         .unwrap_or(text.len())
 }
@@ -89,7 +116,7 @@ pub fn line_starts(text: &str) -> Vec<usize> {
         text.as_bytes()
             .iter()
             .enumerate()
-            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1)),
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index.saturating_add(1))),
     );
     starts
 }
@@ -164,7 +191,13 @@ impl<'a> EditorLines<'a> {
     /// a line, and an empty document is one line.
     pub fn total(&self) -> usize {
         self.starts.map_or_else(
-            || self.text.bytes().filter(|byte| *byte == b'\n').count() + 1,
+            || {
+                self.text
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    .saturating_add(1)
+            },
             <[usize]>::len,
         )
     }
@@ -294,7 +327,7 @@ pub fn project_viewport_with(
     let first_line = lines_index.number_at(anchor);
     let total_lines = lines_index.total();
     let line_limit = requested_lines.clamp(1, MAX_PROJECTED_LINES);
-    let column_limit = requested_columns.clamp(4, 4_096);
+    let column_limit = projected_column_limit(requested_columns);
     let primary_caret = clamp_to_char_boundary(text, view.primary_selection().head);
     let primary_line_start = line_start(text, primary_caret);
     let horizontal_anchor = horizontal_window_anchor(
@@ -369,6 +402,73 @@ pub fn project_viewport_with(
         first_line,
         total_lines,
         lines,
+    }
+}
+
+trust_contract_fn! {
+    /// How many display columns a projected line spans when the renderer
+    /// offers `requested_columns`: at least 4 and at most 4096, the clamp the
+    /// projection has always applied (`requested_columns.clamp(4, 4_096)`).
+    #[expect(
+        clippy::manual_clamp,
+        reason = "Trust kernel-imports a select, not a call to `Ord::clamp` (E6 refuses calls)"
+    )]
+    fn projected_column_limit(requested_columns: usize) -> usize
+    clauses [ensures result >= 4 && result <= 4096 by projected_column_limit_within_bounds
+             ensures requested_columns < 4 || requested_columns > 4096 || result == requested_columns by projected_column_limit_keeps_an_in_range_value]
+    {
+        if requested_columns < 4 {
+            4
+        } else if requested_columns > 4_096 {
+            4_096
+        } else {
+            requested_columns
+        }
+    }
+}
+
+// Specs `projected-column-limit-bounds` and `projected-column-limit-identity`
+// (SPECS.md), kernel-checked against the compiled body. On this target Trust
+// reads a `usize` as a `UInt64`; the proofs are the two case splits the body
+// makes.
+verify_island! {
+    clean {
+        theorem projected_column_limit_floor_le_cap : Nat.le (UInt64.toNat 4) (UInt64.toNat 4096) := by
+          decide
+
+        theorem projected_column_limit_within_bounds (requested_columns : UInt64) :
+            And (Nat.le (UInt64.toNat 4) (UInt64.toNat (trust_import_amacs__editor__projection__projected_column_limit requested_columns)))
+                (Nat.le (UInt64.toNat (trust_import_amacs__editor__projection__projected_column_limit requested_columns)) (UInt64.toNat 4096)) :=
+          @Decidable.casesOn (LT.lt requested_columns 4)
+            (fun (d : Decidable (LT.lt requested_columns 4)) =>
+              And (Nat.le (UInt64.toNat 4) (UInt64.toNat (@ite UInt64 (LT.lt requested_columns 4) d 4 (@ite UInt64 (LT.lt 4096 requested_columns) (instDecidableUInt64Lt 4096 requested_columns) 4096 requested_columns))))
+                  (Nat.le (UInt64.toNat (@ite UInt64 (LT.lt requested_columns 4) d 4 (@ite UInt64 (LT.lt 4096 requested_columns) (instDecidableUInt64Lt 4096 requested_columns) 4096 requested_columns))) (UInt64.toNat 4096)))
+            (instDecidableUInt64Lt requested_columns 4)
+            (fun (at_least_floor : Not (LT.lt requested_columns 4)) =>
+              @Decidable.casesOn (LT.lt 4096 requested_columns)
+                (fun (e : Decidable (LT.lt 4096 requested_columns)) =>
+                  And (Nat.le (UInt64.toNat 4) (UInt64.toNat (@ite UInt64 (LT.lt 4096 requested_columns) e 4096 requested_columns)))
+                      (Nat.le (UInt64.toNat (@ite UInt64 (LT.lt 4096 requested_columns) e 4096 requested_columns)) (UInt64.toNat 4096)))
+                (instDecidableUInt64Lt 4096 requested_columns)
+                (fun (at_most_cap : Not (LT.lt 4096 requested_columns)) => And.intro (Nat.ge_of_not_lt at_least_floor) (Nat.ge_of_not_lt at_most_cap))
+                (fun (_ : LT.lt 4096 requested_columns) => And.intro projected_column_limit_floor_le_cap (Nat.le_refl (UInt64.toNat 4096))))
+            (fun (_ : LT.lt requested_columns 4) => And.intro (Nat.le_refl (UInt64.toNat 4)) projected_column_limit_floor_le_cap)
+
+        theorem projected_column_limit_keeps_an_in_range_value (requested_columns : UInt64) :
+            Or (Or (LT.lt requested_columns 4) (LT.lt 4096 requested_columns)) (Eq (trust_import_amacs__editor__projection__projected_column_limit requested_columns) requested_columns) :=
+          @Decidable.casesOn (LT.lt requested_columns 4)
+            (fun (d : Decidable (LT.lt requested_columns 4)) =>
+              Or (Or (LT.lt requested_columns 4) (LT.lt 4096 requested_columns))
+                 (Eq (@ite UInt64 (LT.lt requested_columns 4) d 4 (@ite UInt64 (LT.lt 4096 requested_columns) (instDecidableUInt64Lt 4096 requested_columns) 4096 requested_columns)) requested_columns))
+            (instDecidableUInt64Lt requested_columns 4)
+            (fun (_ : Not (LT.lt requested_columns 4)) =>
+              @Decidable.casesOn (LT.lt 4096 requested_columns)
+                (fun (e : Decidable (LT.lt 4096 requested_columns)) =>
+                  Or (Or (LT.lt requested_columns 4) (LT.lt 4096 requested_columns)) (Eq (@ite UInt64 (LT.lt 4096 requested_columns) e 4096 requested_columns) requested_columns))
+                (instDecidableUInt64Lt 4096 requested_columns)
+                (fun (_ : Not (LT.lt 4096 requested_columns)) => Or.inr (Eq.refl requested_columns))
+                (fun (above : LT.lt 4096 requested_columns) => Or.inl (Or.inr above)))
+            (fun (below : LT.lt requested_columns 4) => Or.inl (Or.inl below))
     }
 }
 
@@ -582,6 +682,13 @@ fn bounded_line_window(
 mod tests {
     use super::*;
     use crate::editor::{EditorSelectionSpan, Selection, editor};
+
+    #[test]
+    fn projected_column_limit_is_the_clamp_it_replaced() {
+        for columns in [0, 3, 4, 5, 80, 4_095, 4_096, 4_097, usize::MAX] {
+            assert_eq!(projected_column_limit(columns), columns.clamp(4, 4_096));
+        }
+    }
 
     /// The indexed line oracle must answer EXACTLY what the scanning one does —
     /// it is the substitution the editor render path makes on every frame, so any

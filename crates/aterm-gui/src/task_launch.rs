@@ -3,7 +3,7 @@
 
 //! A WORKER'S START: `spawn agent=claude` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md`
 //! §2.1). The newborn is the ordinary integrated login shell the spawn path
-//! opens for every tab; three facts make it a worker:
+//! opens for every tab; four facts make it a worker:
 //!
 //! * its TASK — the bytes the request's frame carried, 1 byte to [`TASK_MAX`]
 //!   — is written, with one line of fact, to a 0600 file under
@@ -12,6 +12,10 @@
 //! * its task record reads `working`, `from=` its starter, before the spawn
 //!   answers (`App::spawn_session_aimed`), so a manager's `await task` has a
 //!   record to wait on from the reply on;
+//! * its own Autopilot word is written beside its trusted folder: `land`
+//!   ([`WORKER_AUTOPILOT`]) unless the spawn says `autopilot=cruise`, so the
+//!   window harness lands all of its work on the remote main branch and the
+//!   record reads `done why=landed` at that landing (FOREVER LAND);
 //! * at the shell's FIRST prompt (OSC 133 `B`: its line editor reads), ONE
 //!   line is typed through the session's canonical egress ([`launch_worker`]):
 //!   the window harness's relaunch builder's fresh start of Claude Code, its
@@ -43,12 +47,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::upgrade::Dialect;
+use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::Terminal;
 use aterm_session::SessionId;
 
 use crate::SessionCtx;
 use crate::session_store::{SessionState, Store};
-use crate::subscribe::Subscribers;
 use crate::task_record::{TaskMark, TaskState};
 
 /// The longest task a worker is given: 64 KiB, raw, the client's cap too. One
@@ -140,9 +144,32 @@ pub(crate) struct TaskOrder {
     /// since no client starts it or waits on its result, and its brief says
     /// so itself.
     pub(crate) fact_line: bool,
+    /// The newborn's own Autopilot word (`spawn … autopilot=<land|cruise>`),
+    /// written beside its trusted folder before its agent runs
+    /// ([`WORKER_AUTOPILOT`] where the spawn names none): under Land the
+    /// worker's one wake at the end is its landing (`done why=landed`), under
+    /// Cruise it works on and publishes no `done`.
+    pub(crate) autopilot: Autopilot,
 }
 
+/// A WORKER'S AUTOPILOT where its spawn names none: Land (FOREVER LAND). A
+/// tasked worker's natural end is "land it", which keeps the manager's one
+/// wake at the end (`await task`, then `result`): the record reads `done
+/// why=landed` once all of its work is on the remote main branch. Cruise is
+/// the spawn's `autopilot=cruise`, for open-ended work that no report ends.
+pub(crate) const WORKER_AUTOPILOT: Autopilot = Autopilot::Land;
+
 impl TaskOrder {
+    /// This order under the spawn's `autopilot=` word (`None`:
+    /// [`WORKER_AUTOPILOT`]).
+    #[must_use]
+    pub(crate) fn under(self, autopilot: Option<Autopilot>) -> Self {
+        Self {
+            autopilot: autopilot.unwrap_or(WORKER_AUTOPILOT),
+            ..self
+        }
+    }
+
     /// The order a worker's spawn makes of its `frame` ([`take_frame`]):
     /// `Err` is the reply. An absent or empty task is refused, and so is one
     /// holding a NUL byte, which no argument can carry.
@@ -176,31 +203,48 @@ impl TaskOrder {
             caller,
             trusted_cwd,
             fact_line: true,
+            autopilot: WORKER_AUTOPILOT,
         })
     }
 }
 
 /// The ONE LINE OF FACT a worker's task gains (design §2.1; never an order —
-/// the primer's rule): who started it, and what becomes of its last message.
-pub(crate) fn fact_line(from: &str) -> String {
+/// the primer's rule): who started it, under which Autopilot, what ends it
+/// and what becomes of its report, and where a need goes. Under Land the
+/// work ends once all of it is on the remote main branch, defended in a few
+/// lines starting `Nothing left:`, and that report is the result; under
+/// Cruise no report ends it. No retired token (FOREVER CRUISE / FOREVER
+/// LAND).
+pub(crate) fn fact_line(from: &str, autopilot: Autopilot) -> String {
+    let end = match autopilot {
+        Autopilot::Cruise => format!(
+            "under Autopilot Cruise: no report ends the work, and `{from}` reads its progress \
+             from this session"
+        ),
+        Autopilot::Land | Autopilot::Off => format!(
+            "under Autopilot Land: the work ends once all of it is on the remote main branch \
+             and a reply defends that in a few lines starting `Nothing left:`, and that report \
+             is returned verbatim to `{from}` as your result"
+        ),
+    };
     format!(
-        "(Started by `{from}` with `spawn agent=claude`. Your final report \
-         is returned verbatim to `{from}` as your result.)"
+        "(Started by `{from}` with `spawn agent=claude`, {end}. A line starting `NEEDS YOU:` \
+         reaches `{from}` and the person while the work goes on.)"
     )
 }
 
 /// What a worker's task file holds: the task as given, its last line ended,
 /// then — with a starter `from` — a blank line and the [`fact_line`] naming
-/// it. The shell's `$(…)` trims the trailing newline, so the agent's argv is
-/// the task, the blank line and the fact.
-pub(crate) fn task_text(task: &[u8], from: Option<&str>) -> Vec<u8> {
+/// it and its `autopilot`. The shell's `$(…)` trims the trailing newline, so
+/// the agent's argv is the task, the blank line and the fact.
+pub(crate) fn task_text(task: &[u8], from: Option<&str>, autopilot: Autopilot) -> Vec<u8> {
     let mut text = task.to_vec();
     if !text.ends_with(b"\n") {
         text.push(b'\n');
     }
     if let Some(from) = from {
         text.push(b'\n');
-        text.extend_from_slice(fact_line(from).as_bytes());
+        text.extend_from_slice(fact_line(from, autopilot).as_bytes());
         text.push(b'\n');
     }
     text
@@ -462,7 +506,6 @@ pub(crate) struct Launch {
     pub(crate) term: Arc<Mutex<Terminal>>,
     pub(crate) ctx: Arc<SessionCtx>,
     pub(crate) store: Store,
-    pub(crate) subscribers: Subscribers,
     /// The main-thread endpoint for the final launch admission, if one exists.
     pub(crate) proxy: Option<aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
     /// The person's count when the worker was registered, before its reply.
@@ -485,17 +528,12 @@ pub(crate) struct Launch {
 /// first prompt mark and type the one line ([module](self)). A thread that
 /// cannot start stalls the task at once.
 pub(crate) fn launch_worker(work: Launch) {
-    let (ctx, local, subscribers) = (Arc::clone(&work.ctx), work.local, work.subscribers.clone());
+    let (ctx, local) = (Arc::clone(&work.ctx), work.local);
     let started = std::thread::Builder::new()
         .name(format!("aterm-worker-{local}"))
         .spawn(move || run_worker_launch(&work));
     if started.is_err() {
-        stall_task(
-            &ctx,
-            local,
-            &subscribers,
-            "its launcher thread could not start",
-        );
+        stall_task(&ctx, local, "its launcher thread could not start");
     }
 }
 
@@ -595,7 +633,7 @@ fn note_launch(ctx: &SessionCtx, note: String) {
 /// query) would take part of a line typed then.
 fn await_first_prompt(work: &Launch) -> Result<PromptFence, &'static str> {
     let deadline = Instant::now() + FIRST_PROMPT_WAIT;
-    let sub = crate::subscribe::SubscriberSet::register(&work.subscribers, &[work.local]);
+    let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
     loop {
         let alive = work
             .store
@@ -668,7 +706,7 @@ pub(crate) fn type_launch_line(
     let Some((term, ctx)) = target else {
         return Err("its live launch is gone".to_string());
     };
-    if ctx.update_parked.load(std::sync::atomic::Ordering::Acquire) {
+    if ctx.update_parked.is_parked() {
         return Err("its session is parked for an update".to_string());
     }
     if let Some(why) = crate::fabric::halt_refusal(ctx.as_ref(), "send") {
@@ -704,15 +742,15 @@ pub(crate) fn type_launch_line(
 /// the log and on its timeline ([`note_launch`]).
 fn stall(work: &Launch, why: &str) {
     note_launch(&work.ctx, format!("never typed ({why})"));
-    stall_task(&work.ctx, work.local, &work.subscribers, why);
+    stall_task(&work.ctx, work.local, why);
 }
 
 /// [`stall`] of session `local` by its parts.
-pub(crate) fn stall_task(ctx: &SessionCtx, local: u64, subscribers: &Subscribers, why: &str) {
+pub(crate) fn stall_task(ctx: &SessionCtx, local: u64, why: &str) {
     aterm_log::warn!("worker session {local}: {why}; its task is stalled and nothing was typed");
     let mut mark = TaskMark::new(TaskState::Stalled);
     mark.why = Some("shell");
-    if crate::task_record::mark_session_task(ctx, local, &mark, subscribers).is_err() {
+    if crate::task_record::mark_session_task(ctx, local, &mark).is_err() {
         aterm_log::warn!(
             "worker session {local}: the stall was not marked (an update was committing)"
         );

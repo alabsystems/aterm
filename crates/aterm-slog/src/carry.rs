@@ -158,6 +158,7 @@ impl CarryError {
             | CarryError::Record(w)
             | CarryError::Shape(w) => w,
             CarryError::Version => "a carry version this build does not read",
+            CarryError::Fold(SnapError::Log) => "a fold that disagrees with its log",
             CarryError::Fold(_) => "a fold snapshot this build does not read",
         }
     }
@@ -379,7 +380,7 @@ impl Log {
             .map(|&i| {
                 let e = &self.ring[i];
                 Victim {
-                    rec: e.rec.clone(),
+                    rec: Rec::clone(&e.rec),
                     target: self.loss_target(e.rec.node),
                     est: e.bytes + "r ".len() + 1 + ms_cost(e),
                 }
@@ -418,7 +419,10 @@ impl Log {
                 self.session_roll,
             ),
             fold_lines: self.fold.snapshot(),
-            keep: keep.into_iter().map(|i| self.ring[i].rec.clone()).collect(),
+            keep: keep
+                .into_iter()
+                .map(|i| Rec::clone(&self.ring[i].rec))
+                .collect(),
             victims,
             ms_head: self.ms_head,
             mirror: self.mirror.as_deref().cloned(),
@@ -850,6 +854,7 @@ impl Log {
             return Err(CarryError::Shape("a carry missing records"));
         }
         let fold = Fold::from_snapshot(&fold_lines).map_err(CarryError::Fold)?;
+        fold.agrees_with_open(&open).map_err(CarryError::Fold)?;
         if fold.state().closed.is_some()
             || recs
                 .iter()
@@ -924,7 +929,11 @@ impl Log {
             };
             log.index_carried(&rec, bytes);
             log.heap = log.heap.saturating_add(super::entry_heap(&rec));
-            log.ring.push_back(super::Entry { rec, bytes, ms });
+            log.ring.push_back(super::Entry {
+                rec: rec.into(),
+                bytes,
+                ms,
+            });
             log.bytes = log.bytes.saturating_add(bytes);
         }
         log.ms_head = ms_head.unwrap_or(dense);

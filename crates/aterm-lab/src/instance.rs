@@ -7,32 +7,40 @@
 //!
 //! Its [`World`] is one `0700` directory under `/tmp` (a socket path must fit
 //! `sun_path`) holding a scratch `HOME`, an `XDG_CONFIG_HOME` whose
-//! `aterm.toml` turns the automatic lanes off, and the `XDG_RUNTIME_DIR` its
-//! control socket and token live in. Nothing of the caller's environment
+//! `aterm.toml` turns the automatic lanes and the audible bell off
+//! ([`bell_off`]), and the `XDG_RUNTIME_DIR` its control socket and token
+//! live in. Nothing of the caller's environment
 //! reaches it, and the control socket is its only door: every `ctl` call
 //! names that socket. It ends by its process group (`SIGTERM`, then
 //! `SIGKILL`), never by name, and it holds a lifeline (a headless aterm reads
 //! it, a windowed one's [`keeper_main`] does), so a launcher killed any way at
 //! all takes it along. The world is removed when it drops.
 //!
-//! `instance [--window] [--columns N] [--lines N] [--font-px N] [--scale N]
-//! [--toml LINE]… [--pre VERB]… [--image PNG] [--post VERB]… [--keep]
-//! [-- PROGRAM ARGS…]` starts one headless (windowed with `--window`) and
-//! prints its socket; drive it with `aterm ctl --sock <sock> <verb>` (`image`,
-//! `text`, `send --stdin`, `metrics percentiles`, …) until this command ends
+//! `instance [--window] [--band app|agent] [--columns N] [--lines N]
+//! [--font-px N] [--scale N] [--toml LINE]… [--pre VERB]… [--image PNG]
+//! [--post VERB]… [--keep] [-- PROGRAM ARGS…]` starts one headless (windowed
+//! with `--window`) and prints its socket and band; drive it with
+//! `aterm ctl --sock <sock> <verb>` (`image`, `text`, `send --stdin`,
+//! `metrics percentiles`, …) until this command ends
 //! (Ctrl-C or `SIGTERM`). A headless instance never presents (its pixels are
 //! offscreen captures), so what only a present publishes (`present_*`,
 //! `gpu_time_*`, `passes_last`) needs `--window`. `--toml` lines head its
 //! `aterm.toml` (top-level keys, such as `theme = "Aterm Day"`); each `--pre`
 //! verb runs once it is ready (`open app settings /themes`), each `--post`
 //! after the frame, and each reply is printed. With `--image`, it captures
-//! one frame once the screen has settled, writes it there and ends.
+//! one frame once the band (no row still in its reveal's grace) and then
+//! the screen have settled, writes it there and ends. A headless instance
+//! runs in aterm.app's scheduling band by default (`--band app`: its own
+//! launchd job, coalition and role `UI_FOCAL`, [`crate::band`]), so what it
+//! measures is what the owner's app meets; `--band agent` keeps it a child of
+//! this command, inside the caller's coalition.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd::{Child, Stdio};
 
+use crate::band::{Band, Job};
 use crate::paths::{from_caller, paths};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
@@ -44,6 +52,32 @@ pub const CONFIG_OFF: &str = "agents_auto_prime = false\n\
                               [packages]\nenabled = false\n\
                               [harness]\nenabled = false\n\
                               [machine]\nuniversal_control = \"leave\"\n";
+
+/// `config` with the audible bell off (`bell_sound = false` at its head)
+/// unless the document sets a root `bell_sound` itself (`--toml 'bell_sound =
+/// true'`, which then stands alone: a key twice is invalid TOML, and aterm
+/// reads none of such a file). A document that does not parse is returned as
+/// it is: aterm reads none of it either way.
+///
+/// A lab instance is never the owner's terminal, yet the BEL its programs
+/// ring (zsh on a completion with no match, readline at the end of its
+/// history, vim's Escape in normal mode) played the owner's alert sound
+/// through the Mac's speakers with nothing on screen to say why. A headless
+/// aterm built since 2026-10-20 never beeps (`App::on_bell`), but a windowed
+/// one does (`instance --window`, `meta-keys --window`, `presence-flap
+/// --window`), and so does a headless build from before that gate that
+/// `--aterm` names: measured from systemsoundserverd's log on 2026-10-20, a
+/// windowed `instance --window -- /bin/zsh -f` driven through Ctrl-R and
+/// Escape played two. `bell_sound` has been a key since 2026-08-09, so the
+/// line silences every build a lab runs; the visual bell and the `bell`
+/// event stay.
+#[must_use]
+pub fn bell_off(config: &str) -> String {
+    match aterm_toml::from_str::<aterm_toml::Value>(config) {
+        Ok(doc) if doc.get("bell_sound").is_none() => format!("bell_sound = false\n{config}"),
+        _ => config.to_owned(),
+    }
+}
 
 /// How long an instance may take to listen: a hang detector, never a budget
 /// (a debug build on a loaded machine can take well past ten seconds).
@@ -62,7 +96,8 @@ pub struct World {
 }
 
 impl World {
-    /// Lay out a fresh world whose `aterm.toml` is `config`.
+    /// Lay out a fresh world whose `aterm.toml` is `config` with the audible
+    /// bell off ([`bell_off`]).
     ///
     /// # Errors
     /// A directory or file could not be made.
@@ -94,7 +129,7 @@ impl World {
                 std::fs::create_dir_all(d)?;
                 std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
             }
-            std::fs::write(w.cfg.join("aterm/aterm.toml"), config)?;
+            std::fs::write(w.cfg.join("aterm/aterm.toml"), bell_off(config))?;
             // A two-column `/bin/sh` prompt, so typed text never wraps on a long host name.
             std::fs::write(w.home.join(".profile"), "PS1='$ '\n")?;
             std::fs::write(w.home.join(".shrc"), "PS1='$ '\n")
@@ -172,9 +207,16 @@ pub struct Launch {
     pub sandbox: Option<String>,
 }
 
+/// An instance's process: this lab's child (the agent band), or its own
+/// launchd job (the app band).
+enum Proc {
+    Child(Child),
+    Job(Job),
+}
+
 /// A running private instance. Dropping it stops it.
 pub struct Instance {
-    child: Child,
+    child: Proc,
     lifeline: Option<aterm_uds::lifeline::Lifeline>,
     /// The instance's pid; a windowed one's keeper's ([`keeper_main`]).
     pub pid: i32,
@@ -277,9 +319,49 @@ impl Instance {
             .map_err(|e| format!("cannot start {program}: {e}"))?;
         let pid = i32::try_from(child.id()).unwrap_or(0);
         Ok(Instance {
-            child,
+            child: Proc::Child(child),
             lifeline: Some(lifeline),
             pid,
+            client: l.aterm.clone(),
+            aterm: l.aterm,
+            sock: world.sock.clone(),
+            log,
+            env: world.env(),
+        })
+    }
+
+    /// [`Instance::start`] in `band`: [`Band::App`] starts the headless `l` as
+    /// its own launchd job ([`Job::start`]), so it heads a coalition of its
+    /// own at role `UI_FOCAL`, as aterm.app does; its lifeline is the job's
+    /// FIFO, held here.
+    ///
+    /// # Errors
+    /// As [`Instance::start`]; a windowed or sandboxed `l` in the app band; the
+    /// job could not start.
+    pub fn start_in(world: &World, l: Launch, band: Band) -> Result<Instance, String> {
+        if band == Band::Agent {
+            return Instance::start(world, l);
+        }
+        if !l.headless || l.sandbox.is_some() {
+            return Err("the app band starts a headless, unsandboxed instance only".into());
+        }
+        let log = world.dir.join("aterm.log");
+        std::fs::File::create(&log).map_err(|e| format!("cannot create {}: {e}", log.display()))?;
+        let mut line = vec![
+            l.aterm.to_string_lossy().into_owned(),
+            "--headless".to_string(),
+            aterm_uds::lifeline::FLAG.to_string(),
+            aterm_uds::lifeline::STDIN.to_string(),
+            "--no-reroute".to_string(),
+            "--control-sock".to_string(),
+            world.sock.to_string_lossy().into_owned(),
+        ];
+        line.extend(l.args);
+        let job = Job::start(&world.dir, &line, &l.env, &l.cwd, &log)?;
+        Ok(Instance {
+            pid: job.pid,
+            child: Proc::Job(job),
+            lifeline: None,
             client: l.aterm.clone(),
             aterm: l.aterm,
             sock: world.sock.clone(),
@@ -298,7 +380,7 @@ impl Instance {
             if self.sock.exists() && self.ctl(&["version"]).code == 0 {
                 return Ok(());
             }
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Some(status) = self.exited() {
                 return Err(Fail::die(format!(
                     "the instance exited ({status}) before its socket answered; its log:\n{}",
                     self.log_tail(20)
@@ -392,7 +474,18 @@ impl Instance {
 
     /// Whether it still runs.
     pub fn running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        self.exited().is_none()
+    }
+
+    /// How it ended, once it has.
+    fn exited(&mut self) -> Option<String> {
+        match &mut self.child {
+            Proc::Child(c) => match c.try_wait() {
+                Ok(Some(status)) => Some(status.to_string()),
+                _ => None,
+            },
+            Proc::Job(j) => (!j.running()).then(|| format!("launchd job {}", j.label)),
+        }
     }
 
     /// The last `n` lines of its log.
@@ -403,13 +496,26 @@ impl Instance {
         lines[lines.len().saturating_sub(n)..].join("\n")
     }
 
-    /// End it: cut its lifeline, then `SIGTERM` and `SIGKILL` to its process
-    /// group, each after a grace; reaped either way. The group (it is a
-    /// `setsid` leader) holds a windowed instance's keeper and its aterm, so
-    /// the window goes even when the keeper cannot end it.
+    /// End it: cut its lifeline, then end an app-band job by its owned
+    /// launchd label after a cooperative grace. launchd reaps that process,
+    /// so its cached pid is only a liveness observation, never signal authority.
+    /// A child instance keeps its `SIGTERM`/`SIGKILL` group escalation and
+    /// handle-based kill/reap; its `setsid` group holds the windowed keeper
+    /// and its aterm.
     pub fn stop(&mut self) {
         if let Some(l) = self.lifeline.take() {
             l.cut();
+        }
+        if let Proc::Job(j) = &mut self.child {
+            j.cut();
+            let end = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < end && j.running() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The label belongs to this world's loaded job. launchd may
+            // already have reaped its pid, which must never name a signal target.
+            j.remove();
+            return;
         }
         for (grace, sig) in [(8, libc::SIGTERM), (5, libc::SIGKILL)] {
             let end = Instant::now() + Duration::from_secs(grace);
@@ -421,8 +527,14 @@ impl Instance {
             }
             let _ = crate::sys::kill_group(self.pid, sig);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.child {
+            Proc::Child(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            // Removed by its label, so launchd never starts it again.
+            Proc::Job(j) => j.remove(),
+        }
     }
 }
 
@@ -525,6 +637,16 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let post = take_values(&mut a, "--post")?;
     let keep = take_flag(&mut a, "--keep");
     let window = take_flag(&mut a, "--window");
+    let band = Band::pick(take_value(&mut a, "--band")?.as_deref(), window)?;
+    let cold = match take_value(&mut a, "--pages")?.as_deref() {
+        None | Some("warm") => false,
+        Some("cold") => true,
+        Some(other) => {
+            return Err(Fail::usage(format!(
+                "instance: --pages takes cold or warm, not '{other}'"
+            )));
+        }
+    };
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
             "instance: unexpected '{extra}' ({LAB} help)"
@@ -543,6 +665,12 @@ pub fn cmd_instance(args: &[String]) -> Res {
     if let Some(home) = home {
         world.rehome(Path::new(&home))?;
     }
+    let cold = if cold {
+        Some(cold_copy(&mut world, &aterm)?)
+    } else {
+        None
+    };
+    let aterm = cold.as_ref().map_or(aterm, |c| c.exe.clone());
     let mut flags = vec![
         "--columns".to_string(),
         columns,
@@ -559,7 +687,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
         flags.push("-e".to_string());
         flags.extend(program);
     }
-    let mut inst = Instance::start(
+    let mut inst = Instance::start_in(
         &world,
         Launch {
             aterm,
@@ -569,6 +697,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
             cwd: world.home.clone(),
             sandbox: None,
         },
+        band,
     )?;
     inst.await_socket(BOOT)?;
     let ready = inst.ctl(&["ready"]);
@@ -577,7 +706,10 @@ pub fn cmd_instance(args: &[String]) -> Res {
     }
     run_verbs(&inst, &pre);
     if let Some(dest) = image {
-        // The screen settles (half a second without output) before the frame is taken.
+        // The band settles — every row a `--pre` verb raised past its
+        // reveal's grace — and then the screen (half a second without
+        // output) before the frame is taken.
+        await_band(&inst)?;
         let _ = inst.ctl(&["await", "idle", "500", "timeout=60000"]);
         let shot = inst.ctl(&["image", "frame.png"]);
         let path = shot
@@ -594,11 +726,25 @@ pub fn cmd_instance(args: &[String]) -> Res {
         run_verbs(&inst, &post);
         return Ok(0);
     }
+    let coalition = crate::sys::coalition_ids(inst.pid)
+        .map_or_else(|| "?".to_string(), |[resource, _]| resource.to_string());
+    let role =
+        crate::sys::darwin_role(inst.pid).map_or_else(|_| "?".to_string(), |r| r.to_string());
+    let main_pri = crate::sys::main_thread_priority(inst.pid)
+        .map_or_else(|| "?".to_string(), |p| p.to_string());
+    // What the launch paged in by `ready`, of its copy's pages, all out of the cache before.
+    let pages = cold.as_ref().map_or_else(String::new, |c| {
+        crate::sys::resident_pages(&c.root).map_or_else(
+            |e| format!(" pages=cold resident_at_ready=? ({e})"),
+            |(resident, pages)| format!(" pages=cold resident_at_ready={resident}/{pages}"),
+        )
+    });
     println!(
-        "instance pid={} sock={}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
+        "instance pid={} sock={} band={} coalition={coalition} role={role} main_pri={main_pri}{pages}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
          world:    {}{}\n  it ends when this command does (Ctrl-C, SIGTERM)",
         inst.pid,
         inst.sock.display(),
+        band.name(),
         inst.aterm.display(),
         inst.sock.display(),
         world.dir.display(),
@@ -619,6 +765,102 @@ pub fn cmd_instance(args: &[String]) -> Res {
             println!("instance: ended (signal {sig})");
             return Ok(0);
         }
+    }
+}
+
+/// `instance --pages cold`'s copy of the aterm it launches.
+struct ColdCopy {
+    /// The executable to launch, inside [`ColdCopy::root`].
+    exe: PathBuf,
+    /// The copy: the bundle's when the aterm was a bundle's executable, else the file.
+    root: PathBuf,
+}
+
+/// `--pages cold`: `aterm` copied into the world (its whole bundle when it is a bundle's
+/// executable), run once with `--version`, then every page of the copy dropped from the page
+/// cache ([`crate::sys::evict_pages`]) and checked gone, so the launch pays aterm's own page-ins
+/// and nothing else. The run is the proof the copy ran from its file: macOS scans a new file at
+/// its first exec (0.5 s for a 66 MB build, more for the universal app) and keeps the verdict,
+/// which no write or rename has voided by the launch. The dyld shared cache and the system's
+/// own files stay as warm as they were (r6 sweep #19, `docs/measured/cold-pages-2026-10-20.md`).
+///
+/// # Errors
+/// The copy, its run or its eviction failed, or a page of it stayed resident (or it had none,
+/// which proves nothing). A copy whose run gave no proof keeps the world (removing a file
+/// macOS may still be assessing strands every exec waiting on that assessment).
+fn cold_copy(world: &mut World, aterm: &Path) -> Result<ColdCopy, Fail> {
+    // The file a link names, not the link: a copied link (`~/.local/bin/aterm`) would launch
+    // the original with its pages warm, and hold no page of its own to check.
+    let aterm = std::fs::canonicalize(aterm)
+        .map_err(|e| format!("instance: cannot resolve {}: {e}", aterm.display()))?;
+    let aterm = aterm.as_path();
+    let bundle = aterm
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"));
+    let source = bundle.unwrap_or(aterm);
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("instance: {} has no file name", source.display()))?;
+    let root = world.dir.join(name);
+    copy_tree(source, &root)
+        .map_err(|e| format!("instance: cannot copy {}: {e}", source.display()))?;
+    let exe = match bundle {
+        Some(bundle) => root.join(aterm.strip_prefix(bundle).unwrap_or(aterm)),
+        None => root.clone(),
+    };
+    let ran = aterm_uds::spawnfd::command(&exe)
+        .arg("--version")
+        .env_clear()
+        .envs(world.env())
+        .stdin(Stdio::null())
+        .output();
+    if !ran
+        .as_ref()
+        .is_ok_and(|out| out.stdout.starts_with(b"aterm "))
+    {
+        world.keep();
+        return Err(Fail::die(format!(
+            "instance: the copy {} never printed its version ({}); the world is kept",
+            exe.display(),
+            ran.map_or_else(
+                |e| e.to_string(),
+                |out| String::from_utf8_lossy(&out.stderr).trim().to_string()
+            )
+        )));
+    }
+    crate::sys::evict_pages(&root)
+        .map_err(|e| format!("instance: cannot evict {}: {e}", root.display()))?;
+    match crate::sys::resident_pages(&root) {
+        Ok((0, pages)) if pages > 0 => Ok(ColdCopy { exe, root }),
+        Ok((0, _)) => Err(Fail::die(format!(
+            "instance: the copy {} holds no page to put out of the page cache",
+            root.display()
+        ))),
+        Ok((resident, pages)) => Err(Fail::die(format!(
+            "instance: {resident} of {pages} pages of {} stayed in the page cache",
+            root.display()
+        ))),
+        Err(e) => Err(Fail::die(format!(
+            "instance: cannot read {}'s pages: {e}",
+            root.display()
+        ))),
+    }
+}
+
+/// Copy `from` to the new path `to`: a directory's tree, its symbolic links as links.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(from)?, to)
+    } else if meta.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(drop)
     }
 }
 
@@ -654,6 +896,41 @@ pub fn config_after(config: &str, harness: bool, after: &[String]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Whether a `messages live` reply names a row still in its reveal's grace
+/// (`reveal=pending`: a standing ask's two seconds), not yet on the band.
+fn reveal_pending(rows: &str) -> bool {
+    rows.lines()
+        .any(|row| row.starts_with("message ") && row.split(' ').any(|w| w == "reveal=pending"))
+}
+
+/// THE BAND SETTLED: no live row still in its reveal's grace, read through
+/// `messages live` (the review of the login carry, 2026-10-20: `--pre
+/// 'login-notice si' --image` waited half a second of quiet and imaged a
+/// band with no ask on it, the ask's two-second grace still running). A
+/// one-minute hang detector, never a budget; an instance whose `messages`
+/// does not answer has no band to wait for.
+///
+/// # Errors
+/// A row still pending after a minute, or the run interrupted.
+fn await_band(inst: &Instance) -> Result<(), Fail> {
+    let start = Instant::now();
+    loop {
+        let rows = inst.ctl(&["messages", "live"]);
+        if rows.code != 0 || !reveal_pending(&rows.stdout) {
+            return Ok(());
+        }
+        if start.elapsed() >= BOOT {
+            return Err(Fail::die(format!(
+                "instance: a band row is still in its reveal's grace after {}s: {}",
+                BOOT.as_secs(),
+                rows.first()
+            )));
+        }
+        stop::sleep(Duration::from_millis(100))
+            .map_err(|Stopped(sig)| Fail::die(format!("instance: ended (signal {sig})")))?;
+    }
 }
 
 /// Run each control verb (split on whitespace: a quoted multi-word value is
@@ -838,6 +1115,127 @@ mod owned_world_store_tests {
                 && tapes[0].path == tape
                 && tapes[0].bytes == 22),
             "a newly owned Lab World must publish a HOME whose hosted store admits its private tape: {admitted:?}"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod cold_copy_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// `--pages cold` given a link (`~/.local/bin/aterm`) copies the file it names, which then
+    /// holds every page out of the cache; a copied link would launch the original warm and hold
+    /// no page of its own. A script stands in for aterm: it prints the `aterm ` line the copy's
+    /// run must show.
+    #[test]
+    fn a_cold_copy_of_a_link_is_the_file_it_names_with_no_page_resident() {
+        let world_source = World::new(CONFIG_OFF).expect("fixture world");
+        let real = world_source.dir.join("aterm-real");
+        let script = b"#!/bin/sh\necho 'aterm 0.0.0'\n";
+        std::fs::write(&real, script).expect("stand-in");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let link = world_source.dir.join("aterm");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let mut world = World::new(CONFIG_OFF).expect("fresh private world");
+        let copy = cold_copy(&mut world, &link).expect("a cold copy");
+        let meta = std::fs::symlink_metadata(&copy.exe).expect("the copy");
+        assert!(meta.is_file(), "a file, not a link: {meta:?}");
+        assert!(copy.exe.starts_with(&world.dir), "{}", copy.exe.display());
+        assert_eq!(std::fs::read(&copy.exe).expect("read"), script);
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::reveal_pending;
+
+    /// A row in its reveal's grace holds the frame; none, or only revealed
+    /// rows, let it go. NEGATIVE CONTROL: the words in a title or a detail
+    /// are no marker.
+    #[test]
+    fn a_row_in_its_grace_holds_the_frame_and_nothing_else_does() {
+        let row = |tail: &str| {
+            format!(
+                "message 7 at=1 ago_ms=5 tag=harness sev=warn origin=host state=live glass=- \
+                 rep=0 key=k title=t detail=d actions=-{tail}"
+            )
+        };
+        assert!(reveal_pending(&row(" reveal=pending need=now")));
+        assert!(!reveal_pending(&row(" need=now")));
+        assert!(!reveal_pending(""));
+        assert!(!reveal_pending(
+            &row(" need=now").replace("title=t", "title=reveal=pending")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod bell_off_tests {
+    use super::*;
+
+    /// The root `bell_sound` of an `aterm.toml` text, as aterm's own TOML
+    /// parser reads it (`None`: no such key, or no document at all).
+    fn root_bell(text: &str) -> Option<bool> {
+        aterm_toml::from_str::<aterm_toml::Value>(text)
+            .ok()?
+            .get("bell_sound")
+            .and_then(aterm_toml::Value::as_bool)
+    }
+
+    /// Every lab world's `aterm.toml` starts with the audible bell off, and
+    /// keeps the lanes-off tables it was given. Non-vacuous: the base the
+    /// world is given sets no `bell_sound` (so aterm's default, on, would
+    /// rule), so the `false` read back is the world's writer at work.
+    #[test]
+    fn a_lab_world_starts_with_the_audible_bell_off() {
+        assert_eq!(
+            root_bell(CONFIG_OFF),
+            None,
+            "the base sets no bell_sound: aterm's default (on) would rule it",
+        );
+        let world = World::new(CONFIG_OFF).expect("fresh private world");
+        let text = std::fs::read_to_string(world.cfg.join("aterm/aterm.toml")).expect("written");
+        assert_eq!(root_bell(&text), Some(false), "{text}");
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(&text).expect("one document");
+        assert_eq!(
+            doc.get("update")
+                .and_then(|t| t.get("enabled"))
+                .and_then(aterm_toml::Value::as_bool),
+            Some(false),
+            "the lanes stay off: {text}",
+        );
+    }
+
+    /// A `bell_sound` the caller sets at the root (`instance --toml`) is the
+    /// one the file holds, once. Negative control: the same caller line with
+    /// the bell line written in front regardless is two keys, which aterm's
+    /// parser refuses, so aterm would read none of that file.
+    #[test]
+    fn a_bell_the_caller_sets_stands_alone() {
+        let asked = config_with(&["bell_sound = true".to_string()]);
+        assert!(
+            aterm_toml::from_str::<aterm_toml::Value>(&format!("bell_sound = false\n{asked}"))
+                .is_err(),
+            "a key written twice is no document",
+        );
+        assert_eq!(root_bell(&bell_off(&asked)), Some(true));
+        assert_eq!(bell_off(&asked), asked, "the caller's file, unchanged");
+    }
+
+    /// Only the root key is the caller's choice: a `bell_sound` inside a
+    /// table is some other key, and the root one still goes in, ahead of
+    /// every table, where TOML files it at the root.
+    #[test]
+    fn a_bell_sound_inside_a_table_is_not_the_root_key() {
+        let text = bell_off("[x]\nbell_sound = true\n");
+        assert_eq!(root_bell(&text), Some(false), "{text}");
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(&text).expect("one document");
+        assert_eq!(
+            doc.get("x")
+                .and_then(|t| t.get("bell_sound"))
+                .and_then(aterm_toml::Value::as_bool),
+            Some(true),
         );
     }
 }

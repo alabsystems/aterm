@@ -167,17 +167,20 @@ pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
 /// `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> sev=<sev>
 /// origin=<host|wire|carried> state=<…> glass=<row|-> rep=<n> key=<pct|->
 /// title=<pct> detail=<pct> actions=<pct|-> [progress=<n>/100|busy=1]
-/// [load=<network|disk|cpu>] [since_ms=<ms>] [need=<class>]`. `at=` is
+/// [load=<network|disk|cpu>] [reveal=pending] [since_ms=<ms>]
+/// [need=<class>]`. `at=` is
 /// the wall clock at ingress; `ago_ms=` and `since_ms=` are both read off the one
 /// `now_unix_ms` of the reply (the retirement's wall time is the posting wall
 /// plus the row's monotonic life, [`Live::wall_at`]), so `since_ms <= ago_ms`
 /// always; `since_ms=` is present only for rows retired in this process.
 /// `detail=` is the lines joined by `\n` before encoding; `actions=` the full
 /// capsule labels joined by `,`. A live row with a fill says `progress=`, a
-/// busy one `busy=1`, and
+/// busy one `busy=1`,
 /// `load=` only while the row says its load words on the glass
-/// ([`Live::said_load`]). No ETA, elapsed or frame state reaches the line:
-/// motion is the glass's.
+/// ([`Live::said_load`]), and `reveal=pending` while its reveal's grace runs
+/// (`Message::reveal_after`: a standing ask's, a job's), not yet eligible
+/// for the band. No ETA, elapsed or frame state reaches the line: motion is
+/// the glass's.
 #[must_use]
 pub(crate) fn message_row(
     rec: &LogRecord,
@@ -230,6 +233,12 @@ pub(crate) fn message_row(
         if let Some(load) = l.said_load() {
             row.push_str(" load=");
             row.push_str(load.word());
+        }
+        // Posted with a grace and not on the band yet ([`Live::revealed`]):
+        // a reader imaging the band waits for it, never for a clock of its
+        // own.
+        if !l.revealed {
+            row.push_str(" reveal=pending");
         }
     }
     if let (Some(_), Some(retired_ms)) = (rec.retired_at, rec.retired_unix_ms) {

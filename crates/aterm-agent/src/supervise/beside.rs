@@ -36,6 +36,15 @@
 //! [`super::stall::refusal_lifts`]) refuse it UNCOUNTED, and the next step
 //! asks again; one it can never carry (any other `restart unavailable`) is
 //! counted, and the warning's row names the person's restart from then on.
+//!
+//! THE WORKER'S NEEDS YOU IS THE SELF-CLAIM'S OWN beside it (the contract's
+//! §5 NEEDS YOU row, FOREVER CRUISE / FOREVER LAND): codex-alab raises and
+//! takes down `meta set attention owner=needs` itself, so this loop never
+//! writes or unsets that owner's entry — not at a point, not at the loop's
+//! start (a standing entry is codex-alab's, never one a loop before this one
+//! left), not at an Off park and not at the loop's end
+//! ([`Session::needs_not_ours`]), whatever the claim's state at that moment
+//! (an Off park gives it back, the loop's end releases it).
 
 use super::stall::{refusal_lifts, reply_line};
 use super::*;
@@ -45,6 +54,15 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`Self::set_beside`]).
     pub(super) fn beside_self_claim(&self) -> bool {
         self.setup.beside.is_some()
+    }
+
+    /// Whether the worker's NEEDS YOU entry (`owner=needs`) is another's to
+    /// keep, so this loop neither writes nor unsets it (`escalate.rs`'s
+    /// `sync_needs` and `needs_down`, `lifecycle.rs`'s `reconcile`): beside
+    /// a proven self-claim, whose agent raises its own (module header), and
+    /// behind another supervisor's claim, which answers for the session.
+    pub(super) fn needs_not_ours(&self) -> bool {
+        self.beside_self_claim() || self.claim.watching_behind().is_some()
     }
 
     /// THE MEMORY CEILING'S RESTART BESIDE A PROVEN SELF-CLAIM (module

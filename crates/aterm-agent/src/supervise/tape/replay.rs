@@ -68,8 +68,21 @@
 //!
 //! A run that had a WINDOW HOST (a hosted run's, or a test's watch given one)
 //! is replayed with the replay's host in its place (`super::host::ReplayHost`):
-//! every answer the tape's, every notification compared, no host asked. Not
-//! here yet (the plan's later increments): the acts and shadow modes, `why`.
+//! every answer the tape's, every notification compared, no host asked.
+//!
+//! **A counterfactual** ([`Options::candidate`]): the same driver over the
+//! acts cursor ([`super::acts`]) in place of astream's strict seam, the loop
+//! rebuilt under the candidate policy; the report says the first divergent
+//! act, or STALE ([`ReplayCore::report_acts`]). **A shadow's turn ends**
+//! ([`replay_shadowed`], `super::shadow`): a strict replay in which the loop
+//! decides each turn end again under the candidate beside its own decision.
+//!
+//! **A decision's trace** ([`replay_traced`], what `aterm drive replay --why`
+//! asks of a turn end): with [`Options::trace_at`] the replayed loop decides
+//! the turn end at that mark with its rule trace kept (`Fx::tracing`, true
+//! only here), on the fold the replay rebuilt, and the core keeps the steps
+//! the decision handed it when its mark is the one asked for. A running loop
+//! never keeps one.
 
 use std::any::Any;
 use std::io;
@@ -82,17 +95,23 @@ use std::time::{Duration, Instant};
 use astream_effects::{EffectRecord, EffectSeam, EffectsLog, ReplayDivergence, ReplaySeam};
 use aterm_types::MutexExt;
 
-use super::codec::{self, End, Item, Mark};
+use super::acts::{ActsCursor, Candidate, Refusal};
+use super::codec::{self, End, Item, Mark, Stamp};
 use super::core::{
-    DecideMark, NOTE_UNREPLAYABLE, NOTE_UNWOUND_IN, Screens, offset_from, unwound_in_of,
+    DecideMark, NOTE_UNREPLAYABLE, NOTE_UNWOUND_IN, Screens, TapeValue, instants_as_offsets,
+    offset_from, unwound_in_of,
 };
 use super::ctl::{ReplayCtl, is_act};
 use super::header::{Entry, Header, Roots};
 use super::host::ReplayHost;
-use super::report::{Cause, Class, Divergence, Report, Verdict};
+use super::report::{
+    ActSide, ActsReport, Cause, Class, Decided, Divergence, Mode, Report, Verdict,
+};
 use super::{doors, show};
 use crate::supervise::fx::Fx;
+use crate::supervise::policy::trace::{Outcome, TraceStep};
 use crate::supervise::run::{IdleHost, Session, SuperviseOpts};
+use crate::supervise::{CtlReply, SupervisorConfig};
 
 /// How many flag reads in a row may consume no record before the replay is
 /// called stuck (the plan's progress guard): far past any loop's honest run
@@ -143,21 +162,50 @@ pub(crate) struct ReplayCore {
     recorded: Roots,
     /// The seed of the worker's digest, the recording's ([`Self::seed`]).
     seed: u64,
+    /// A COUNTERFACTUAL: the acts cursor serves in place of astream's strict
+    /// seam ([`super::acts`]).
+    acts: bool,
 }
 
 impl std::fmt::Debug for ReplayCore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let st = self.lock();
         f.debug_struct("ReplayCore")
-            .field("consumed", &st.seam.position())
+            .field("acts", &self.acts)
+            .field("consumed", &st.cursor.position())
             .field("effects", &st.effects)
             .field("diverged", &st.diverged)
             .finish_non_exhaustive()
     }
 }
 
+/// What serves the replayed loop: astream's strict seam, or the
+/// counterfactual's acts cursor.
+enum Cursor {
+    Strict(ReplaySeam),
+    Acts(Box<ActsCursor>),
+}
+
+impl Cursor {
+    /// Records consumed (or, in acts mode, consumed or dropped).
+    fn position(&self) -> usize {
+        match self {
+            Self::Strict(seam) => seam.position(),
+            Self::Acts(c) => c.position(),
+        }
+    }
+
+    /// The record under the cursor.
+    fn peek(&mut self) -> Option<&EffectRecord> {
+        match self {
+            Self::Strict(seam) => seam.peek(),
+            Self::Acts(c) => c.records().get(c.position()),
+        }
+    }
+}
+
 struct Replayer {
-    seam: ReplaySeam,
+    cursor: Cursor,
     effects: usize,
     /// The first divergence, once found: nothing is served after it.
     diverged: Option<Divergence>,
@@ -182,12 +230,34 @@ struct Replayer {
     /// `Exhausted`), its door and request: where a run that died inside a
     /// door's live call is reached again (`core::NOTE_UNWOUND_IN`).
     past_end: Option<(String, Vec<u8>)>,
+    /// A counterfactual's refusal came where its tape was SPENT
+    /// ([`ActsCursor::spent`]): no round trip or file read left at or past
+    /// the cursor — on a tape with no end, everything on it taken.
+    acts_spent: bool,
     /// The door and request the tape says the recorded run died inside
     /// (`core::NOTE_UNWOUND_IN`), when it says one ([`ReplayCore::died_inside`]).
     unwound_in: Option<(String, Vec<u8>)>,
     /// The notification the recorded run died telling its host, once the
     /// replay has told it as the tape's last record ([`ReplayCore::emit`]).
     died_in: Option<String>,
+    /// The decision's mark whose RULE TRACE the replay is asked for (the
+    /// ordinal of its record: `Options::trace_at`), the steps of the decision
+    /// about to be marked, and the trace kept once that mark is reached.
+    trace_at: Option<u64>,
+    pending: Vec<TraceStep>,
+    traced: Option<Vec<TraceStep>>,
+    /// A counterfactual's: the record of the last screen the loop parsed,
+    /// and the loop's decisions in the segment it stands in (`decided_in`,
+    /// that segment's first record).
+    last_screen: Option<u64>,
+    decided: Vec<Decided>,
+    decided_in: usize,
+    /// A SHADOW replay's candidate policy (`super::shadow`), the candidate's
+    /// decision on the turn end about to be marked, and each one kept with
+    /// its mark's ordinal.
+    shadow: Option<SupervisorConfig>,
+    pending_shadow: Option<Decided>,
+    shadowed: Vec<(u64, Decided)>,
 }
 
 impl ReplayCore {
@@ -202,11 +272,40 @@ impl ReplayCore {
         tape: &str,
         until: Option<u64>,
     ) -> Arc<Self> {
+        let effects = records.len();
+        let cursor = Cursor::Strict(ReplaySeam::new(EffectsLog(records)));
+        Self::with(cursor, effects, roots, recorded, tape, until)
+    }
+
+    /// The core of a COUNTERFACTUAL replay of `records`, each stamped as
+    /// `stamps` says ([`super::acts`]); otherwise as [`Self::start`].
+    pub(crate) fn start_acts(
+        records: Vec<EffectRecord>,
+        stamps: Vec<Option<Stamp>>,
+        roots: Roots,
+        recorded: Roots,
+        tape: &str,
+        until: Option<u64>,
+    ) -> Arc<Self> {
+        let effects = records.len();
+        let cursor = Cursor::Acts(Box::new(ActsCursor::new(records, stamps)));
+        Self::with(cursor, effects, roots, recorded, tape, until)
+    }
+
+    fn with(
+        cursor: Cursor,
+        effects: usize,
+        roots: Roots,
+        recorded: Roots,
+        tape: &str,
+        until: Option<u64>,
+    ) -> Arc<Self> {
         let now = Instant::now();
+        let acts = matches!(cursor, Cursor::Acts(_));
         Arc::new(Self {
             state: Mutex::new(Replayer {
-                effects: records.len(),
-                seam: ReplaySeam::new(EffectsLog(records)),
+                effects,
+                cursor,
                 diverged: None,
                 until,
                 reached: None,
@@ -219,13 +318,24 @@ impl ReplayCore {
                 told: Vec::new(),
                 lines: Vec::new(),
                 past_end: None,
+                acts_spent: false,
                 unwound_in: None,
                 died_in: None,
+                trace_at: None,
+                pending: Vec::new(),
+                traced: None,
+                last_screen: None,
+                decided: Vec::new(),
+                decided_in: 0,
+                shadow: None,
+                pending_shadow: None,
+                shadowed: Vec::new(),
             }),
             origin: now.checked_add(ORIGIN_AHEAD).unwrap_or(now),
             roots,
             recorded,
             seed: super::header::digest_seed(tape),
+            acts,
         })
     }
 
@@ -245,7 +355,7 @@ impl ReplayCore {
     )]
     pub(crate) fn left(&self) -> usize {
         let st = self.lock();
-        st.effects.saturating_sub(st.seam.position())
+        st.effects.saturating_sub(st.cursor.position())
     }
 
     /// The first divergence, once latched.
@@ -258,7 +368,7 @@ impl ReplayCore {
     #[cfg(test)]
     pub(crate) fn consumed(&self) -> (usize, usize) {
         let st = self.lock();
-        (st.seam.position(), st.effects)
+        (st.cursor.position(), st.effects)
     }
 
     /// The seed of the worker's digest on this tape: the recording's, so the
@@ -298,6 +408,13 @@ impl ReplayCore {
     /// last monotonic read and the last wall read, in Unix milliseconds.
     pub(crate) fn peek(&self) -> (Instant, i64) {
         let st = self.lock();
+        if let Cursor::Acts(c) = &st.cursor {
+            let (mono, wall) = c.now();
+            return (
+                self.origin + Duration::from_nanos(mono),
+                wall.div_euclid(1_000_000),
+            );
+        }
         (
             self.origin + Duration::from_nanos(st.mono_ns),
             st.wall_ns.div_euclid(1_000_000),
@@ -347,6 +464,22 @@ impl ReplayCore {
             project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskRepeat",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskClosingAct",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
     fn step<T>(
         &self,
         door: Option<&str>,
@@ -360,10 +493,13 @@ impl ReplayCore {
                 // or the place the recorded run died).
                 None
             } else {
-                let at = st.seam.position() as u64;
-                match take(&mut st.seam) {
+                let at = st.cursor.position() as u64;
+                let Cursor::Strict(seam) = &mut st.cursor else {
+                    unreachable!("a strict step on a counterfactual's cursor")
+                };
+                match take(seam) {
                     Ok(value) => {
-                        if st.seam.position() as u64 > at {
+                        if st.cursor.position() as u64 > at {
                             st.idle = 0;
                             at_door(at);
                             if st.until == Some(at) {
@@ -380,7 +516,7 @@ impl ReplayCore {
                         {
                             st.past_end = Some(((*door).to_string(), request.to_vec()));
                         }
-                        let class = class_of(&asked, st.seam.peek(), door);
+                        let class = class_of(&asked, st.cursor.peek(), door);
                         st.diverged = Some(Divergence {
                             at,
                             door: door.map(str::to_string),
@@ -389,6 +525,139 @@ impl ReplayCore {
                         });
                         None
                     }
+                }
+            }
+        };
+        match served {
+            Some(served) => served,
+            None => self.halt(),
+        }
+    }
+
+    /// A COUNTERFACTUAL's step ([`super::acts`]): `take` asks the acts cursor
+    /// at `door` for what the loop `asked`. A refusal — a read the segment
+    /// never answered (STALE), an act it does not close with — is the
+    /// replay's first divergence, and unwinds the loop from here; so does the
+    /// progress guard, a loop served on and on with no record consumed.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskNext",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskOtherRead",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskRepeat",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskClosingAct",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskOtherAct",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskPastEnd",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskAfterDivergence",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    fn step_acts<T>(
+        &self,
+        door: Option<&str>,
+        asked: Asked<'_>,
+        take: impl FnOnce(&mut ActsCursor) -> Result<T, Refusal>,
+    ) -> T {
+        let served = {
+            let mut st = self.lock();
+            if st.diverged.is_some() || st.reached.is_some() || st.died_in.is_some() {
+                // Nothing is served after the first divergence (or the stop,
+                // or the place the recorded run died).
+                None
+            } else {
+                let Cursor::Acts(c) = &mut st.cursor else {
+                    unreachable!("a counterfactual's step on a strict seam")
+                };
+                let before = c.position();
+                let result = take(c);
+                let (after, idle) = (c.position(), c.idle);
+                // What a refusal says, read off the cursor before it is let
+                // go: the divergence, whether it came in the tape's last
+                // segment (no act left), and whether the tape is spent there.
+                let refused = result.as_ref().err().map(|refusal| {
+                    let last_segment = c.closing().is_none();
+                    (
+                        acts_divergence(c, refusal, door, &asked),
+                        last_segment,
+                        c.spent(),
+                    )
+                });
+                match (result, refused) {
+                    (Ok(value), _) => {
+                        if after > before {
+                            at_door((after - 1) as u64);
+                            if let Some(until) = st.until
+                                && (before as u64..after as u64).contains(&until)
+                            {
+                                st.reached = Some(until);
+                            }
+                        }
+                        if idle > PROGRESS_READS {
+                            st.diverged = Some(Divergence {
+                                at: after as u64,
+                                door: door.map(str::to_string),
+                                class: Class::Drift,
+                                cause: Cause::NoProgress { reads: idle },
+                            });
+                            None
+                        } else {
+                            st.reached.is_none().then_some(value)
+                        }
+                    }
+                    (Err(_), Some((divergence, last_segment, spent))) => {
+                        // Asked in the last segment: where a run that died
+                        // inside a door's live call is reached again.
+                        if last_segment && let Asked::Exchange { door, request } = &asked {
+                            st.past_end = Some(((*door).to_string(), request.to_vec()));
+                        }
+                        st.acts_spent = spent;
+                        st.diverged = Some(divergence);
+                        None
+                    }
+                    (Err(_), None) => None,
                 }
             }
         };
@@ -442,6 +711,22 @@ impl ReplayCore {
             project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskRepeat",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "SuperviseReplayCursor",
+            action = "AskClosingAct",
+            project = "aterm_agent::supervise::tape::conformance_tests::project_cursor"
+        )
+    )]
     fn halt(&self) -> ! {
         if std::thread::panicking() {
             eprintln!(
@@ -455,6 +740,10 @@ impl ReplayCore {
 
     /// A monotonic read.
     pub(crate) fn mono(&self) -> Instant {
+        if self.acts {
+            let ns = self.step_acts(None, Asked::Read, |c| Ok(c.mono()));
+            return self.origin + Duration::from_nanos(ns);
+        }
         let (ns, _) = self.step(None, Asked::Read, |seam| seam.mono_nanos());
         self.lock().mono_ns = ns;
         self.origin + Duration::from_nanos(ns)
@@ -462,6 +751,9 @@ impl ReplayCore {
 
     /// A wall read: nanoseconds since the epoch (negative before it).
     pub(crate) fn clock(&self) -> i64 {
+        if self.acts {
+            return self.step_acts(None, Asked::Read, |c| Ok(c.clock())) as i64;
+        }
         let (ns, _) = self.step(None, Asked::Read, |seam| seam.now_nanos());
         let ns = ns as i64;
         self.lock().wall_ns = ns;
@@ -478,11 +770,18 @@ impl ReplayCore {
         )
     )]
     pub(crate) fn exchange(&self, door: &str, request: &[u8]) -> Vec<u8> {
-        let (reply, at) = self.step(Some(door), Asked::Exchange { door, request }, |seam| {
-            seam.exchange(door, request, &mut |_: &[u8]| Vec::new())
-        });
+        let asked = Asked::Exchange { door, request };
+        let (reply, at) = if self.acts {
+            let served = self.step_acts(Some(door), asked, |c| c.exchange(door, request));
+            (served.reply, served.at.map(|at| at as u64))
+        } else {
+            let (reply, at) = self.step(Some(door), asked, |seam| {
+                seam.exchange(door, request, &mut |_: &[u8]| Vec::new())
+            });
+            (reply, Some(at))
+        };
         let mut st = self.lock();
-        st.last_exchange = Some(at);
+        st.last_exchange = at;
         if door == doors::CTL || door == doors::TELLER {
             let words = codec::ctl_args(request).unwrap_or_default();
             if door == doors::CTL {
@@ -518,7 +817,9 @@ impl ReplayCore {
         self.lock().unwound_in = Some((door, request));
     }
 
-    /// An output at `door`: compared with the recorded one.
+    /// An output at `door`: compared with the recorded one — never, in a
+    /// counterfactual, where the record under the cursor is taken when it is
+    /// one of that door ([`super::acts`]).
     ///
     /// The output that is the tape's LAST record, where the tape says the
     /// recorded run died inside that door asking those very bytes, is a
@@ -527,12 +828,17 @@ impl ReplayCore {
     /// die at itself, for it tells no host — and stops there, as it stops at
     /// a query asked again past the tape's end (the driver's PANICKED).
     pub(crate) fn emit(&self, door: &str, bytes: &[u8]) {
-        // `step` returned, so the output was the recorded one, and no
-        // divergence or stop is latched.
-        self.step(Some(door), Asked::Emit, |seam| seam.emit(door, bytes));
+        // The step returned, so the output was the recorded one (or, in a
+        // counterfactual, was not compared), and no divergence or stop is
+        // latched.
+        if self.acts {
+            self.step_acts(Some(door), Asked::Emit, |c| Ok(c.emit(door)));
+        } else {
+            self.step(Some(door), Asked::Emit, |seam| seam.emit(door, bytes));
+        }
         let died = {
             let mut st = self.lock();
-            let last = st.seam.position() >= st.effects;
+            let last = st.cursor.position() >= st.effects;
             let named = st
                 .unwound_in
                 .as_ref()
@@ -547,7 +853,8 @@ impl ReplayCore {
         }
     }
 
-    /// A flag read at `door`: true from its recorded first true read on.
+    /// A flag read at `door`: true from its recorded first true read on (in
+    /// a counterfactual, once the cursor has passed it: [`super::acts`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -557,11 +864,14 @@ impl ReplayCore {
         )
     )]
     pub(crate) fn raised(&self, door: &str) -> bool {
+        if self.acts {
+            return self.step_acts(Some(door), Asked::Read, |c| Ok(c.raised(door)));
+        }
         let (up, at) = self.step(Some(door), Asked::Read, |seam| {
             seam.raised(door, &mut || false)
         });
         let mut st = self.lock();
-        if st.seam.position() as u64 > at {
+        if st.cursor.position() as u64 > at {
             return up;
         }
         st.idle += 1;
@@ -581,6 +891,13 @@ impl ReplayCore {
     /// A file read at `path`: the recorded bytes or error kind.
     pub(crate) fn file(&self, path: &Path) -> io::Result<Vec<u8>> {
         let path = self.path(path);
+        if self.acts {
+            let asked = Asked::Exchange {
+                door: "file",
+                request: path.as_bytes(),
+            };
+            return self.step_acts(None, asked, |c| c.file(&path));
+        }
         self.step(None, Asked::Read, |seam| seam.try_read_file(&path))
             .0
     }
@@ -591,11 +908,61 @@ impl ReplayCore {
         let mut st = self.lock();
         if let Some(record) = st.last_exchange {
             st.screens.push(seq, generation, record);
+            st.last_screen = Some(record);
         }
     }
 
+    /// Whether this replay keeps the trace of a decision ([`Options::trace_at`]).
+    pub(crate) fn tracing(&self) -> bool {
+        self.lock().trace_at.is_some()
+    }
+
+    /// The trace of the decision about to be marked (`Fx::traced`, right
+    /// before its mark): kept until that mark,
+    /// every `Instant` in what each says written as an offset from this
+    /// replay's origin, as a tape writes every instant.
+    pub(crate) fn traced(&self, steps: Vec<TraceStep>) {
+        let origin = self.origin;
+        self.lock().pending.extend(steps.into_iter().map(|mut s| {
+            s.outcome = match s.outcome {
+                Outcome::Decided(t) => Outcome::Decided(instants_as_offsets(&t, origin)),
+                Outcome::Overruled(t) => Outcome::Overruled(instants_as_offsets(&t, origin)),
+                Outcome::Unproven(t) => Outcome::Unproven(instants_as_offsets(&t, origin)),
+                Outcome::Passed => Outcome::Passed,
+            };
+            s
+        }));
+    }
+
+    /// The trace kept at the mark the replay was asked for, once reached.
+    fn trace(&self) -> Option<Vec<TraceStep>> {
+        self.lock().traced.clone()
+    }
+
+    /// Keep the trace of the decision whose mark is effect `#n`.
+    fn trace_at(&self, n: u64) {
+        self.lock().trace_at = Some(n);
+    }
+
+    /// The candidate policy this SHADOW replay decides each turn end again
+    /// under, if it is one (`Fx::shadow_policy`).
+    pub(crate) fn shadow_policy(&self) -> Option<SupervisorConfig> {
+        self.lock().shadow.clone()
+    }
+
+    /// The candidate's decision on the turn end about to be marked
+    /// (`Fx::shadowed`): kept with that mark.
+    pub(crate) fn shadowed(&self, rule: Option<&str>, outcome: String) {
+        self.lock().pending_shadow = Some(Decided {
+            door: String::new(),
+            rule: rule.map(str::to_string),
+            outcome,
+        });
+    }
+
     /// A decision's mark at `door`: built as the recorder built it, and
-    /// compared with the recorded one.
+    /// compared with the recorded one (a counterfactual keeps the last one
+    /// for its report, and compares none).
     pub(crate) fn decide(
         &self,
         door: &str,
@@ -605,7 +972,36 @@ impl ReplayCore {
         outcome: &str,
         facts: Option<String>,
     ) {
-        let screen = self.lock().screens.find(seq, generation);
+        let screen = {
+            // The steps the decision handed in are this mark's: kept where it
+            // is the mark asked for (the record its emit is about to
+            // consume), dropped otherwise.
+            let mut st = self.lock();
+            let pending = std::mem::take(&mut st.pending);
+            if st.trace_at == Some(st.cursor.position() as u64) {
+                st.traced = Some(pending);
+            }
+            // A shadow's decision on this point, kept with the mark's ordinal
+            // (the record its emit is about to consume).
+            if let Some(mut candidate) = st.pending_shadow.take() {
+                candidate.door = door.to_string();
+                let at = st.cursor.position() as u64;
+                st.shadowed.push((at, candidate));
+            }
+            if let Cursor::Acts(c) = &st.cursor {
+                let segment = c.segment_start();
+                if st.decided_in != segment {
+                    st.decided.clear();
+                    st.decided_in = segment;
+                }
+                st.decided.push(Decided {
+                    door: door.to_string(),
+                    rule: rule.map(str::to_string),
+                    outcome: outcome.to_string(),
+                });
+            }
+            st.screens.find(seq, generation)
+        };
         let mark = DecideMark {
             screen,
             seq,
@@ -615,6 +1011,89 @@ impl ReplayCore {
             facts,
         };
         self.emit(door, mark.encode().as_bytes());
+    }
+}
+
+/// A counterfactual's divergence for `refusal` at `door`, the loop having
+/// `asked` what it asked, read off the cursor `c` where it refused.
+fn acts_divergence(
+    c: &ActsCursor,
+    refusal: &Refusal,
+    door: Option<&str>,
+    asked: &Asked<'_>,
+) -> Divergence {
+    let at = c.position() as u64;
+    let asked_side = match asked {
+        Asked::Exchange { door, request } => Some(act_side(None, door, request)),
+        Asked::Read | Asked::Emit => None,
+    };
+    // The act the tape holds at `n`, as a report names it.
+    let act_at = |n: usize| match c.records().get(n) {
+        Some(EffectRecord::Exchange { door, request, .. }) => {
+            Some(act_side(Some(n as u64), door, request))
+        }
+        _ => None,
+    };
+    match refusal {
+        Refusal::Skipped { closing, .. } => {
+            let recorded = act_at(*closing).unwrap_or_else(|| ActSide {
+                at: Some(*closing as u64),
+                door: String::new(),
+                words: String::new(),
+            });
+            Divergence {
+                at: *closing as u64,
+                door: Some(recorded.door.clone()),
+                class: Class::Decision,
+                cause: Cause::ActSkipped {
+                    recorded,
+                    asked: asked_side.unwrap_or_else(|| ActSide {
+                        at: None,
+                        door: door.unwrap_or_default().to_string(),
+                        words: String::new(),
+                    }),
+                },
+            }
+        }
+        Refusal::Stale { class } => Divergence {
+            at,
+            door: door.map(str::to_string),
+            class: Class::Drift,
+            cause: Cause::Stale {
+                class: class.word(),
+                request: asked_side.map_or_else(String::new, |s| s.words),
+            },
+        },
+        Refusal::ActDiffers { closing } => {
+            let recorded = closing.and_then(act_at);
+            Divergence {
+                at: closing.map_or(at, |n| n as u64),
+                door: door.map(str::to_string),
+                class: Class::Decision,
+                cause: Cause::ActDiffers {
+                    recorded,
+                    asked: asked_side,
+                },
+            }
+        }
+    }
+}
+
+/// An act (or any round trip) as a report names it: a control request's
+/// words, a host call's arguments as text.
+fn act_side(at: Option<u64>, door: &str, request: &[u8]) -> ActSide {
+    let words = if door == doors::CTL || door == doors::TELLER {
+        codec::ctl_args(request).map_or_else(
+            |_| String::from_utf8_lossy(request).into_owned(),
+            |w| w.join(" "),
+        )
+    } else {
+        String::from_utf8_lossy(request).into_owned()
+    };
+    ActSide {
+        at,
+        door: door.to_string(),
+        words,
     }
 }
 
@@ -685,6 +1164,15 @@ pub struct Options {
     /// The directory every root is remapped under, which must not exist; by
     /// default `<tmp>/aterm-replay-<tape>/absent`.
     pub base: Option<PathBuf>,
+    /// Keep the RULE TRACE of the decision whose mark is effect `#trace_at`
+    /// ([`replay_traced`]): the turn-end decision made again on the fold the
+    /// replay rebuilt, its every check said (`aterm drive replay --why` at a
+    /// turn end, which stops the replay there with [`Self::until`]).
+    pub trace_at: Option<u64>,
+    /// A COUNTERFACTUAL: replay in ACTS MODE ([`super::acts`]) under this
+    /// candidate policy (`--set k=v`, `--policy FILE`), up to the first act
+    /// it takes otherwise. `None`: a strict replay.
+    pub candidate: Option<Candidate>,
 }
 
 /// How a `watch` run's end is said on its tape (`drive_cli`'s recorder and
@@ -739,6 +1227,52 @@ pub fn panic_message(panic: &(dyn Any + Send)) -> String {
 /// a run that recorded something no replay can make — named; `aterm drive
 /// replay` exits 2.
 pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
+    replay_traced(bytes, options).map(|(report, _)| report)
+}
+
+/// [`replay`], and the RULE TRACE of the decision at [`Options::trace_at`]
+/// when one is asked for and the replay reached its mark: the decision made
+/// again, on the very state the replay rebuilt, with every check it
+/// consulted said (`policy::trace`). Only a turn end's decision hands the
+/// replay a trace (an approval is traced from its mark's facts, with no
+/// replay: `tape::explain`).
+///
+/// # Errors
+///
+/// As [`replay`].
+pub fn replay_traced(
+    bytes: &[u8],
+    options: &Options,
+) -> Result<(Report, Option<Vec<TraceStep>>), String> {
+    run_replay(bytes, options, None).map(|(report, core)| (report, core.trace()))
+}
+
+/// A STRICT replay that decides each turn end again under `candidate` beside
+/// the loop's own decision (`super::shadow`): its report, and the
+/// candidate's decision at each turn end's mark the replay reached, by the
+/// mark's ordinal.
+///
+/// # Errors
+///
+/// As [`replay`].
+pub(crate) fn replay_shadowed(
+    bytes: &[u8],
+    candidate: SupervisorConfig,
+) -> Result<(Report, Vec<(u64, Decided)>), String> {
+    run_replay(bytes, &Options::default(), Some(candidate)).map(|(report, core)| {
+        let rows = std::mem::take(&mut core.lock().shadowed);
+        (report, rows)
+    })
+}
+
+/// [`replay_traced`]'s body: the report, and the core it ran on (its trace,
+/// its shadow's rows), a shadow's candidate given to the core before the
+/// loop runs.
+fn run_replay(
+    bytes: &[u8],
+    options: &Options,
+    shadow: Option<SupervisorConfig>,
+) -> Result<(Report, Arc<ReplayCore>), String> {
     let tape = show::open(bytes, false)?;
     let text = tape
         .header
@@ -758,7 +1292,7 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
             base.display()
         ));
     }
-    let header = Header::decode_remapped(text, &base)?;
+    let mut header = Header::decode_remapped(text, &base)?;
     // `aterm drive watch|supervise` are gone: their tapes read (`tape cat`,
     // `tape show`), and only this crate's tests, which run those loops still,
     // replay them.
@@ -773,11 +1307,19 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
     // The items are MOVED into what the replay keeps — the records into the
     // seam, the end, the cap and the notes it reads beside them — never
     // copied: the decoded tape (up to the reader's held-item bound,
-    // `recover::HELD_MAX`) is held once.
-    let (mut records, mut end, mut capped, mut unwound_in) = (Vec::new(), None, None, None);
+    // `recover::HELD_MAX`) is held once. A counterfactual keeps each
+    // record's stamp beside it: its virtual clock runs on them.
+    let acts = options.candidate.is_some();
+    let (mut records, mut stamps) = (Vec::new(), Vec::new());
+    let (mut end, mut capped, mut unwound_in) = (None, None, None);
     for item in tape.items {
         match item {
-            Item::Effect { record, .. } => records.push(record),
+            Item::Effect { record, stamp } => {
+                records.push(record);
+                if acts {
+                    stamps.push(stamp);
+                }
+            }
             Item::End(e) => end = end.or(Some(e)),
             Item::Mark(Mark::Truncated { door }) => capped = capped.or(Some(door)),
             Item::Note { kind, text } if kind == NOTE_UNREPLAYABLE => {
@@ -791,16 +1333,35 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
             Item::Note { .. } | Item::Mark(_) => {}
         }
     }
-    let core = ReplayCore::start(
-        records,
-        header.roots.clone(),
-        recorded.roots,
-        &header.tape,
-        options.until,
-    );
+    // A counterfactual runs the recorded loop under the candidate's policy.
+    if let Some(candidate) = &options.candidate {
+        header.opts.policy = candidate.policy(&header.opts.policy)?;
+    }
+    let core = if acts {
+        ReplayCore::start_acts(
+            records,
+            stamps,
+            header.roots.clone(),
+            recorded.roots,
+            &header.tape,
+            options.until,
+        )
+    } else {
+        ReplayCore::start(
+            records,
+            header.roots.clone(),
+            recorded.roots,
+            &header.tape,
+            options.until,
+        )
+    };
     if let Some((door, request)) = unwound_in.clone() {
         core.died_inside(door, request);
     }
+    if let Some(n) = options.trace_at {
+        core.trace_at(n);
+    }
+    core.lock().shadow = shadow;
     let fx = Fx::replay(Arc::clone(&core));
     let run = run_entry(&header, &fx);
     if let Some(door) = capped {
@@ -808,7 +1369,13 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
             "the run reached its cap: effect #{door} on are not on the tape"
         ));
     }
-    Ok(core.report(&header, run, end.as_ref(), unwound_in, tail))
+    let report = match &options.candidate {
+        Some(candidate) => {
+            core.report_acts(&header, run, end.as_ref(), unwound_in, tail, candidate)
+        }
+        None => core.report(&header, run, end.as_ref(), unwound_in, tail),
+    };
+    Ok((report, core))
 }
 
 /// A tape's id as a path's word: what it may hold besides letters and digits
@@ -871,8 +1438,8 @@ impl ReplayCore {
     ) -> Report {
         let left = self.left();
         let mut st = self.lock();
-        let at = st.seam.position() as u64;
-        let found = st.seam.peek().cloned();
+        let at = st.cursor.position() as u64;
+        let found = st.cursor.peek().cloned();
         let next_door = match &found {
             Some(
                 EffectRecord::Exchange { door, .. }
@@ -1013,7 +1580,7 @@ impl ReplayCore {
             entry: header.entry.word().to_string(),
             recorded_by: header.build.clone(),
             replayed_by: aterm_types::version::build_id(),
-            consumed: st.seam.position(),
+            consumed: st.cursor.position(),
             effects: st.effects,
             requests: st.requests.clone(),
             told: st.told.clone(),
@@ -1021,6 +1588,223 @@ impl ReplayCore {
             returned,
             supplied: header.supplied.clone(),
             tail,
+            mode: Mode::Strict,
+            acts: None,
+        }
+    }
+
+    /// The report of a COUNTERFACTUAL whose run ended `run` under
+    /// `candidate` ([`super::acts`]), the rest as [`Self::report`]'s: the
+    /// first divergent act (or the act the candidate went on without, or its
+    /// end with acts left), a STALE read, the place the recorded run died in
+    /// the last segment, a tape with no end spent (ENDED), else REPRODUCED —
+    /// every act the tape holds taken as recorded, whatever was read, printed
+    /// or decided on the way. Wherever the candidate did not take the act the
+    /// recorded run took next, that act and the recorded decisions before it
+    /// are said.
+    fn report_acts(
+        &self,
+        header: &Header,
+        run: std::thread::Result<String>,
+        end: Option<&End>,
+        unwound_in: Option<(String, Vec<u8>)>,
+        tail: Option<String>,
+        candidate: &Candidate,
+    ) -> Report {
+        let st = self.lock();
+        let Cursor::Acts(c) = &st.cursor else {
+            unreachable!("a counterfactual's report over a strict seam")
+        };
+        let records = c.records();
+        let (next_act, _) = c.acts_left();
+        let recorded_end = |end: Option<&End>| match end {
+            Some(End::Returned { how }) => how.clone(),
+            Some(End::Suspended) => "suspended".to_string(),
+            Some(End::Unwound { message }) => format!("unwound: {message}"),
+            None => "(no end on the tape)".to_string(),
+        };
+        let as_verdict = |d: &Divergence| match d.cause {
+            Cause::Stale { .. } => Verdict::Stale(d.clone()),
+            _ => Verdict::Diverged(d.clone()),
+        };
+        let mut returned = None;
+        let verdict = match run {
+            Ok(how) => {
+                returned = Some(how);
+                match next_act {
+                    // The candidate ended with an act the recorded run took
+                    // still ahead of it.
+                    Some(n) => Verdict::Diverged(Divergence {
+                        at: n as u64,
+                        door: None,
+                        class: Class::Decision,
+                        cause: Cause::ActDiffers {
+                            recorded: match &records[n] {
+                                EffectRecord::Exchange { door, request, .. } => {
+                                    Some(act_side(Some(n as u64), door, request))
+                                }
+                                _ => None,
+                            },
+                            asked: None,
+                        },
+                    }),
+                    None => Verdict::Reproduced,
+                }
+            }
+            Err(payload) if payload.is::<Halted>() => match (&st.reached, &st.diverged) {
+                (Some(door), _) => Verdict::Reached { door: *door },
+                (None, None) if st.died_in.is_some() => match end {
+                    Some(End::Unwound { message }) => Verdict::Panicked {
+                        message: message.clone(),
+                        door: st.died_in.clone(),
+                    },
+                    None => Verdict::Ended,
+                    other => Verdict::Diverged(Divergence {
+                        at: c.position() as u64,
+                        door: st.died_in.clone(),
+                        class: Class::Drift,
+                        cause: Cause::OtherEnd {
+                            recorded: recorded_end(other),
+                            replayed: "stopped where the tape says the run died".to_string(),
+                        },
+                    }),
+                },
+                // A tape with no end, refused where it is SPENT — no round
+                // trip or file read left on it: everything on it was taken,
+                // and what the recorded run asked next is not on it. Refused
+                // with records left (an act, a read the candidate does not
+                // ask as the recorded run did), it is what it is: a tape
+                // with no end is a killed run or one still running, never a
+                // licence to call the rest of it taken.
+                (None, Some(_)) if end.is_none() && st.acts_spent => Verdict::Ended,
+                // The recorded run died inside this door's live call asking
+                // this request, asked again in the tape's last segment.
+                (None, Some(d)) if st.past_end.is_some() => match end {
+                    Some(End::Unwound { message }) if unwound_in == st.past_end => {
+                        Verdict::Panicked {
+                            message: message.clone(),
+                            door: st.past_end.as_ref().map(|(door, _)| door.clone()),
+                        }
+                    }
+                    _ => as_verdict(d),
+                },
+                (None, Some(d)) => as_verdict(d),
+                (None, None) => Verdict::Diverged(Divergence {
+                    at: c.position() as u64,
+                    door: None,
+                    class: Class::Drift,
+                    cause: Cause::Unreplayable {
+                        why: "the replay stopped with no divergence said".to_string(),
+                    },
+                }),
+            },
+            Err(payload) => {
+                let message = panic_message(payload.as_ref());
+                match end {
+                    Some(End::Unwound { message: recorded }) if *recorded == message => {
+                        Verdict::Panicked {
+                            message,
+                            door: None,
+                        }
+                    }
+                    other => Verdict::Diverged(Divergence {
+                        at: c.position() as u64,
+                        door: None,
+                        class: Class::Drift,
+                        cause: Cause::OtherEnd {
+                            recorded: recorded_end(other),
+                            replayed: format!("unwound: {message}"),
+                        },
+                    }),
+                }
+            }
+        };
+        // The act the recorded run took where the candidate did not: a
+        // divergent act's recorded side, the act it went on without, and —
+        // where it stopped short otherwise (STALE, the progress guard, an
+        // end of its own) — its segment's closing act.
+        let named = |side: &ActSide| side.at.and_then(|n| usize::try_from(n).ok());
+        let (untaken, said_by_cause) = match &verdict {
+            Verdict::Diverged(Divergence {
+                cause: Cause::ActDiffers { recorded, .. },
+                ..
+            }) => (recorded.as_ref().and_then(named), true),
+            Verdict::Diverged(Divergence {
+                cause: Cause::ActSkipped { recorded, .. },
+                ..
+            }) => (named(recorded), true),
+            Verdict::Diverged(_) | Verdict::Stale(_) => (c.closing(), false),
+            _ => (None, false),
+        };
+        let recorded_next = untaken
+            .filter(|_| !said_by_cause)
+            .and_then(|n| match records.get(n) {
+                Some(EffectRecord::Exchange { door, request, .. }) => {
+                    Some(act_side(Some(n as u64), door, request))
+                }
+                _ => None,
+            });
+        // The decisions the recorded run made in that segment before it
+        // acted: its marks there, in order.
+        let recorded_decisions = untaken.map_or_else(Vec::new, |n| {
+            let n = n.min(records.len());
+            records[c.segment_start().min(n)..n]
+                .iter()
+                .filter_map(|r| match r {
+                    EffectRecord::Emit { door, bytes } if door.starts_with("decide.") => {
+                        let mark = DecideMark::decode(std::str::from_utf8(bytes).ok()?)?;
+                        Some(Decided {
+                            door: door.clone(),
+                            rule: mark.rule,
+                            outcome: mark.outcome,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        });
+        // The candidate's, in the segment it stands in.
+        let candidate_decisions = if st.decided_in == c.segment_start() {
+            st.decided.clone()
+        } else {
+            Vec::new()
+        };
+        let last_screen = st
+            .last_screen
+            .and_then(|n| records.get(usize::try_from(n).ok()?))
+            .and_then(|r| match r {
+                EffectRecord::Exchange { door, reply, .. } if door == doors::CTL => {
+                    <Result<CtlReply, String> as TapeValue>::from_tape(reply)
+                        .ok()?
+                        .ok()
+                }
+                _ => None,
+            })
+            .and_then(|reply| crate::supervise::screen::parse_text_json(&reply.stdout).ok())
+            .map(|screen| screen.rows);
+        Report {
+            verdict,
+            tape: header.tape.clone(),
+            entry: header.entry.word().to_string(),
+            recorded_by: header.build.clone(),
+            replayed_by: aterm_types::version::build_id(),
+            consumed: c.position(),
+            effects: st.effects,
+            requests: st.requests.clone(),
+            told: st.told.clone(),
+            lines: st.lines.clone(),
+            returned,
+            supplied: header.supplied.clone(),
+            tail,
+            mode: Mode::Acts,
+            acts: Some(ActsReport {
+                candidate: candidate.said(),
+                account: c.account.clone(),
+                last_screen,
+                recorded_next,
+                recorded_decisions,
+                candidate_decisions,
+            }),
         }
     }
 }

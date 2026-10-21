@@ -386,7 +386,7 @@ impl Agent {
     /// [`Self::visit`], the agent its shell's foreground job for the first
     /// `foreground` job reads and suspended after ([`Script`]).
     fn visit_with(&self, opts: &Opts, shell: u32, foreground: usize) -> Report {
-        let table = vec![(shell, 1, "zsh".to_string())];
+        let table = vec![(shell, 1, "zsh".into())];
         let args = atpkg::caller_shell::process_args(self.sf.pid).expect("agent argv");
         let files = session_files(&opts.home);
         visit_with_claim(
@@ -1032,7 +1032,7 @@ fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
             save(&opts, SESSION, &moved);
         }
         let shell = dead_pid();
-        let table = vec![(shell, 1, "zsh".to_string())];
+        let table = vec![(shell, 1, "zsh".into())];
         let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
         let files = session_files(&opts.home);
         let r = visit_with_claim(
@@ -1106,7 +1106,7 @@ fn a_dropped_release_leaves_no_owed_wait_behind() {
         unanswered: false,
     };
     let shell = dead_pid();
-    let table = vec![(shell, 1, "zsh".to_string())];
+    let table = vec![(shell, 1, "zsh".into())];
     let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
     let files = session_files(&opts.home);
     let visit = || {
@@ -1823,10 +1823,11 @@ fn defective() -> Vec<(&'static str, Model)> {
 #[test]
 fn the_real_upgrade_conforms_to_the_never_strands_model() {
     let model = harness_upgrade_never_strands_model();
-    let defective = defective();
+    // Each defect is caught by one place where it disagrees: a defective model
+    // is judged until then.
+    let mut uncaught = defective();
     let states = reachable(&model);
     assert!(states.len() > 50, "{} states", states.len());
-    let mut disagree: BTreeMap<&str, usize> = defective.iter().map(|(n, _)| (*n, 0)).collect();
     let mut taken = std::collections::BTreeSet::new();
     let mut histories = 0;
     // At a break: the late READYs decided there, and those the model voids.
@@ -1879,22 +1880,14 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
                     d.next
                 );
                 taken.extend(d.actions.iter().copied());
-                for (name, m) in &defective {
-                    if !agrees(m, s, holds, &d) {
-                        *disagree.get_mut(name).expect("a knob") += 1;
-                    }
-                }
+                uncaught.retain(|(_, m)| agrees(m, s, holds, &d));
             }
             for action in ["Direct", "AgentReady", "AgentGoesOn"] {
                 if let Some(reads) = reads_as(&model, s, action, history) {
                     assert!(reads, "{action} at {s:?} (history {history})");
                     taken.insert(action);
                 }
-                for (name, m) in &defective {
-                    if reads_as(m, s, action, history) == Some(false) {
-                        *disagree.get_mut(name).expect("a knob") += 1;
-                    }
-                }
+                uncaught.retain(|(_, m)| reads_as(m, s, action, history) != Some(false));
             }
         }
         // The clocks. An announced upgrade's window runs out only off the
@@ -1904,11 +1897,7 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
             let held = upgrade::clock_held(&st.phase, &f, now + upgrade::REASK_S);
             let runs = matches!(held, Phase::Announced { at_s, .. } if at_s == T0);
             assert_eq!(runs, model.action_enabled("Elapse", s), "Elapse at {s:?}");
-            for (name, m) in &defective {
-                if runs != m.action_enabled("Elapse", s) {
-                    *disagree.get_mut(name).expect("a knob") += 1;
-                }
-            }
+            uncaught.retain(|(_, m)| runs == m.action_enabled("Elapse", s));
         }
         // A stopped round's rest runs out RETRY_S after its stop, limited or
         // not (`Rests`): the look that finds it so re-arms it, or, with a
@@ -1934,13 +1923,9 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
                 model.action_enabled("Rearm", &rested),
                 "Rearm after the rest at {rested:?}"
             );
-            for (name, m) in &defective {
-                if runs != m.action_enabled("Rests", s)
-                    || rearms != m.action_enabled("Rearm", &rested)
-                {
-                    *disagree.get_mut(name).expect("a knob") += 1;
-                }
-            }
+            uncaught.retain(|(_, m)| {
+                runs == m.action_enabled("Rests", s) && rearms == m.action_enabled("Rearm", &rested)
+            });
         }
         // A limit the window's loop saw holds it too: its close starts the
         // window again, as `LimitResets` does.
@@ -1957,12 +1942,10 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
             let mut reset = s.clone();
             assert!(model.fire("LimitResets", &mut reset));
             assert_eq!(window, reset["window"], "LimitResets at {s:?}");
-            for (name, m) in &defective {
+            uncaught.retain(|(_, m)| {
                 let mut t = s.clone();
-                if m.fire("LimitResets", &mut t) && t["window"] != window {
-                    *disagree.get_mut(name).expect("a knob") += 1;
-                }
-            }
+                !(m.fire("LimitResets", &mut t) && t["window"] != window)
+            });
         }
     }
     assert!(histories > 0, "the second review's history is decided");
@@ -1980,12 +1963,11 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
         "every step of the upgrade, and every move of the conversation, is taken by the real \
          code: {taken:?}"
     );
-    for (name, n) in &disagree {
-        assert!(
-            *n > 0,
-            "the real code has the `{name}` defect: {disagree:?}"
-        );
-    }
+    let uncaught: Vec<&str> = uncaught.iter().map(|(name, _)| *name).collect();
+    assert!(
+        uncaught.is_empty(),
+        "the real code has these defects: {uncaught:?}"
+    );
 }
 
 // ------------------------------------------ no stop is for good
@@ -2140,8 +2122,8 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
         let shell = dead_pid();
         // A shell the agent left running, under it: its own work.
         let table = vec![
-            (shell, 1, "zsh".to_string()),
-            (agent.sf.pid + 100_000, agent.sf.pid, "zsh".to_string()),
+            (shell, 1, "zsh".into()),
+            (agent.sf.pid + 100_000, agent.sf.pid, "zsh".into()),
         ];
         let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
         let files = session_files(&opts.home);

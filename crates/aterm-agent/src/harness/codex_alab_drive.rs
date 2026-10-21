@@ -39,8 +39,8 @@ use super::registry_vouches_for_state;
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
-    SAME_PROGRAM, STALE_S, St, TabLife, alive, base_name, connect, cwd_of, exe_of, first_word, ids,
-    ledger, load, lsof_holders, lsof_open_files, now_s, process_in_tab, registry_graph,
+    SAME_PROGRAM, STALE_S, St, TabLife, alive, base_name, connect, cwd_of, exe_of, file_holders,
+    first_word, ids, ledger, load, lsof_open_files, now_s, process_in_tab, registry_graph,
     registry_life, roster, said, save, squash, state_dir, table, type_relaunch_line_with, upgrade,
     wait_until,
 };
@@ -110,7 +110,7 @@ impl AlabKernel for Live {
     }
 
     fn holders_of(&self, file: &Path) -> Option<Vec<u32>> {
-        lsof_holders(file)
+        file_holders(file)
     }
 
     fn shell_has_terminal(&self, shell: u32) -> bool {
@@ -240,7 +240,7 @@ pub(super) fn find_rollout(home: &Path, thread: &str) -> Option<PathBuf> {
 pub(super) fn shell_dialect(
     shell: u32,
     k: &dyn AlabKernel,
-    read_table: impl FnOnce() -> Vec<(u32, u32, String)>,
+    read_table: impl FnOnce() -> Vec<super::ProcRow>,
 ) -> Option<Dialect> {
     k.args(shell)
         .map(|a| a.exec_path)
@@ -248,7 +248,7 @@ pub(super) fn shell_dialect(
             read_table()
                 .into_iter()
                 .find(|(p, _, _)| *p == shell)
-                .map(|(_, _, n)| n)
+                .map(|(_, _, n)| n.to_string())
         })
         .as_deref()
         .map(base_name)

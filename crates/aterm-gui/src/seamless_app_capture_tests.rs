@@ -2092,7 +2092,7 @@ fn a_held_panes_turn_ledger_crosses_the_update() {
             dur_ms: 2,
             submitted: true,
             status: "settled",
-            text: "run the build".to_string(),
+            text: "run the build".into(),
             screen_hash: 9,
             seq: 3,
             arch: crate::turn_ledger::ArchMark::default(),
@@ -2531,10 +2531,9 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
     // Session 0: a finished `ctl` worker its owner looked at, now asking,
     // told by a windowed herald.
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
-    let subscribers = app.subscribers.clone();
     for state in [TaskState::Working, TaskState::Done] {
         let mark = crate::task_record::TaskMark::new(state);
-        crate::task_record::mark_session_task(&ctx, 0, &mark, &subscribers).expect("marked");
+        crate::task_record::mark_session_task(&ctx, 0, &mark).expect("marked");
     }
     app.on_task_changed(0);
     // The owner looks at its tab once (in front, the window on screen), then
@@ -2617,5 +2616,136 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
         "{at}: the told fleet need"
     );
     drop(incoming);
+    ptys.release(app);
+}
+
+/// THE AUTOPILOT'S END RIDES THE PARK, THE WIRE AND THE INTAKE TO THE
+/// SUCCESSOR'S GLASS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3,
+/// item 8; the review of `c5af3a7507`): an end nobody saw, standing on
+/// session 0's glass, is stamped by the test park (the fork lane's mirror,
+/// `park_desk_for_test`), written by the shipping writer and read back by
+/// the successor's real intake (`take_incoming_as`): the App's carry by sid
+/// (`IncomingHandoff::end_carry`, `seamless::end_carry_of`) and the adopted
+/// shell's row (`Adopted::autopilot_end`). The successor is built from what
+/// the intake produced — the adopted shell under its sid, its timeline
+/// seeded through the helper `spawn_session` calls (`spawn::seed_adopted_end`),
+/// the App's carry the intake's map — and its first publication spends it:
+/// the `•` stands. A shell carries nothing. NEGATIVE CONTROLS, as run (each
+/// fails this test): the intake's map left empty; the adopted shell's row
+/// dropped at the intake; the test park's stamp dropped; the park carrying
+/// the end's own minute, not the timeline's instant.
+#[test]
+fn the_autopilot_end_rides_the_park_and_the_intake_to_the_successor() {
+    use crate::harness_end_carry::{CarriedEnd, EndCarry};
+    use crate::harness_glass::EndFace;
+    use aterm_agent::harness::acts::TaskFace;
+    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _restore = restore_env();
+    let _scratch = enter_scratch("autopilot-end");
+    let mut app = crate::App::headless_for_test();
+    let wid = WindowId(0);
+    let quiet = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(quiet));
+    let mut ptys = DeskPtys::default();
+    ptys.attach_rest(&mut app);
+    // Session 0: its task's face moved to landed at `at_ms`, an end nobody
+    // saw — as the Task arm leaves the timeline and the glass. Off the
+    // minute (37.123 s past it), so the instant the park carries (the
+    // timeline's) is told apart from the end's own minute (its glass stamp).
+    let at_ms: i64 = 1_760_978_557_123;
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_task_face(Some(TaskFace::Landed), at_ms);
+    crate::harness_glass::on_task(&mut app, 0, Some(TaskFace::Landed), at_ms);
+    app.harness_glass
+        .entry(0)
+        .or_default()
+        .tell_end(EndFace::Landed);
+    assert!(app.end_unseen(0), "PRECONDITION: an end nobody saw");
+    let sid_of = |app: &crate::App, id: u64| {
+        app.store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_local(id)
+            .expect("registered")
+            .sid
+            .as_str()
+            .to_string()
+    };
+    let (ended, untouched) = (sid_of(&app, 0), sid_of(&app, quiet));
+    let at = "an unseen end";
+    let (_parked, mut incoming, _nonce, _expected) =
+        hand_over_held(&mut app, ReceiverShape::Current, HeldPlan::Export, at);
+
+    // THE INTAKE.
+    let carried = EndCarry {
+        end: Some(CarriedEnd {
+            face: EndFace::Landed,
+            at_ms,
+            seen: false,
+        }),
+        worked_ms: 0,
+    };
+    let end_carry = std::mem::take(&mut incoming.end_carry);
+    let mut adopted = std::mem::take(&mut incoming.adopted);
+    drop(incoming);
+    assert_eq!(
+        end_carry.get(&ended),
+        Some(&carried),
+        "{at}: the App's carry"
+    );
+    assert!(
+        !end_carry.contains_key(&untouched),
+        "{at}: nothing for a shell"
+    );
+    let shell = crate::app_restore::take_handed_off_shell(&mut adopted, Some(0))
+        .expect("session 0 adopted");
+    drop(adopted);
+    assert_eq!(shell.sid.as_str(), ended, "{at}: under its sid");
+    assert_eq!(
+        shell.autopilot_end.as_deref(),
+        Some(format!("end=landed@{at_ms} seen=0 worked=0").as_str()),
+        "{at}: the adopted shell's row"
+    );
+
+    // THE SUCCESSOR, from what the intake produced.
+    let mut next = crate::App::headless_for_test();
+    next.end_carry = end_carry;
+    let id = next.next_session_id;
+    crate::prime_test_timing();
+    let session = crate::ptyless_session(
+        id,
+        shell.sid.clone(),
+        aterm_core::terminal::Terminal::new(24, 80),
+        std::sync::Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+    );
+    *session
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .slog_mut() = crate::session_log::SessionLog::for_test();
+    crate::spawn::seed_adopted_end(&session.ctx.timeline, shell.autopilot_end.as_deref());
+    drop(shell);
+    assert_eq!(
+        session
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .task_face_at(TaskFace::Landed),
+        Some(at_ms),
+        "{at}: the face's time held for the loop's restate"
+    );
+    next.push_stub_tab(wid, session);
+    assert!(
+        !next.end_unseen(id),
+        "PRECONDITION: not before its first publication"
+    );
+    next.refresh_presence_session(id);
+    assert!(next.end_unseen(id), "{at}: the `•` crossed");
+    assert!(next.end_carry.is_empty(), "{at}: spent once");
     ptys.release(app);
 }

@@ -510,32 +510,37 @@ mod tests {
             "the explorer reached the space: {}",
             paths.len()
         );
-        let mut steps = 0;
+        let mut steps = Vec::new();
         for (state, path) in &paths {
             for action in &model.actions {
                 let mut next = state.clone();
-                if !model.fire(action.name, &mut next) {
-                    continue;
+                if model.fire(action.name, &mut next) {
+                    steps.push((state, path, action.name, next));
                 }
-                let l = layout(&format!("refines-{steps}"));
-                let mut hosts = Hosts::new(&l);
-                for step in path {
-                    hosts.act(step);
-                }
-                assert_eq!(&hosts.project(), state, "reached by {path:?}");
-                hosts.act(action.name);
-                assert_eq!(
-                    hosts.project(),
-                    next,
-                    "{} from {state:?} (reached by {path:?})",
-                    action.name
-                );
-                steps += 1;
-                drop(hosts);
-                let _ = std::fs::remove_dir_all(&l.prefix);
             }
         }
-        assert!(steps >= 100, "every reachable step was taken: {steps}");
+        assert!(
+            steps.len() >= 100,
+            "every reachable step is taken: {}",
+            steps.len()
+        );
+        // Each step on its own store: side by side.
+        crate::testdir::each_side_by_side(&steps, |i, (state, path, action, next)| {
+            let l = layout(&format!("refines-{i}"));
+            let mut hosts = Hosts::new(&l);
+            for step in *path {
+                hosts.act(step);
+            }
+            assert_eq!(&hosts.project(), *state, "reached by {path:?}");
+            hosts.act(action);
+            assert_eq!(
+                &hosts.project(),
+                next,
+                "{action} from {state:?} (reached by {path:?})"
+            );
+            drop(hosts);
+            let _ = std::fs::remove_dir_all(&l.prefix);
+        });
 
         // The probe design: the session found the rendezvous free and let it go; a window
         // took it since; the buggy session rounds on its stale answer beside the window.

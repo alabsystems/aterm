@@ -18,14 +18,15 @@
 //! in a `status` reply, a file in the bridge's state dir — bounded by a generous
 //! deadline that is a HANG DETECTOR, not a performance assertion.
 //!
-//! ## Where a crash is timed from the inside
+//! ## Where a crash between two steps is tested
 //!
-//! One property is about what survives a `SIGKILL` BETWEEN two specific steps:
-//! a post's `Publish` and its `outbox sent`. That window is microseconds wide
-//! and racing it from outside would be exactly the flake this codebase
-//! refuses, so the bridge kills itself at the named point under
-//! `$ATERM_LINK_FAULT`. The signal is real and the crash is real; only the
-//! timing is chosen, by the process whose progress defines it.
+//! Not here. What survives a `SIGKILL` between a post's `Publish` and its
+//! `outbox sent`, or between a burst's deliveries and its group commit, is
+//! `aterm-link`'s deterministic simulation's (`sim`): it kills the real
+//! bridge at every I/O step of every seed and replays a failing one exactly,
+//! where this world could only time two named steps from the inside. The
+//! `SIGKILL`s left here are real signals from outside, at moments a person
+//! could pick.
 
 #![cfg(unix)]
 
@@ -421,151 +422,6 @@ fn no_bus_record_ever_reaches_a_pty() {
         "an inbox record moved the terminal — no `in` kind may ever reach a PTY"
     );
     assert!(!after.contains("PWNED"), "{after}");
-}
-
-/// **`SIGKILL` between `Publish` and `outbox sent`: the peer sees the message
-/// ONCE, and the relaunch does not accuse it.**
-///
-/// The reason `outbox` is a PEEK.
-/// The bridge dies holding a published record the endpoint still lists as in
-/// flight, so on restart it re-reads the same post and publishes it again — and
-/// the second publish carries the SAME `(producer_id, producer_seq)`, because
-/// the sequence is reserved against the POST and persisted before the first
-/// attempt. The broker deduplicates it, appends nothing, and answers the
-/// ORIGINAL offset, which is the offset the sender is finally told.
-///
-/// THE KILL IS AT THE WINDOW'S EARLIEST POINT: the ack is in, and the offset
-/// is not yet remembered as this node's own. The post went to a session on
-/// this node, so it sits on the node's own lane, and the relaunch's attach
-/// refills B's lane before its drain republishes anything — a record there at
-/// an offset `acked` does not hold is what the self-lane check calls a
-/// forgery. The in-flight entry written before the publish is what lets the
-/// attach re-learn the offset first; without it the relaunch published
-/// `undeliverable reason=forged-self` and `cap-compromised` over the node's
-/// own post, inside the attach, before the row this test waits for.
-#[test]
-fn a_kill_between_publish_and_outbox_sent_leaves_one_record_on_the_bus() {
-    let w = World::boot_with(
-        "republish",
-        &[],
-        &[("ATERM_LINK_FAULT", "kill-after-publish")],
-    );
-    w.wait_ready();
-    let (a, b) = w.two_sessions();
-    let first_pid = w.bridge_pid();
-
-    // No `--wait`: the point is what the BUS holds, and the wait would park on a
-    // bridge that is about to kill itself.
-    let posted = w.verb(&format!("@{a} post to=@{b} kind=note only once please"));
-    assert!(posted.ok(), "post: {}", posted.header());
-
-    until("the bridge to die mid-publish and be relaunched", || {
-        let pid = std::fs::read_to_string(w.state.join("pid")).ok()?;
-        let pid: i32 = pid.trim().parse().ok()?;
-        (pid != first_pid).then_some(())
-    });
-    until("the peer to see the message", || {
-        w.inbox(&b)
-            .into_iter()
-            .any(|r| r.contains("text=only%20once%20please"))
-            .then_some(())
-    });
-
-    // ONE record on B's lane, and one row in B's inbox. The lane is the sharper
-    // assertion: the ring would have deduped a second delivery on `off=`, so a
-    // duplicate PUBLISH could hide there — on the log it cannot.
-    let lane = format!("/f/{FLEET}/in/{}/{b}/{}/note", w.node, w.node);
-    let mut c = w.god();
-    let (rows, _) = c.fetch(0, &lane, 64).expect("fetch B's lane");
-    assert_eq!(
-        rows.len(),
-        1,
-        "the republish must be deduped away: {rows:#?}"
-    );
-    let seen: Vec<String> = w
-        .inbox(&b)
-        .into_iter()
-        .filter(|r| r.contains("text=only%20once%20please"))
-        .collect();
-    assert_eq!(seen.len(), 1, "{seen:#?}");
-    // And nothing called it a forgery: an accusation would have been
-    // published by the attach, before the delivery waited on above.
-    let ev = w.ev();
-    assert!(
-        !ev.iter()
-            .any(|e| e.starts_with("cap-compromised") || e.contains("reason=forged-self")),
-        "the relaunch accused the node's own post: {ev:#?}"
-    );
-}
-
-/// **A KILL AFTER A BURST WAS DELIVERED AND BEFORE ITS GROUP COMMIT LOSES
-/// NOTHING AND DOUBLES NOTHING.** The bridge commits the inbox group once per
-/// burst rather than once per record, which widens the window between a
-/// `deliver` and the commit that accounts for it from one record to a burst.
-/// `ATERM_LINK_FAULT=kill-before-inbox-commit` kills the bridge at the widest
-/// point of it — every record of the burst delivered, the commit about to go
-/// out — once (`fault-fired` in the state dir), so the relaunch runs clean.
-///
-/// The relaunch's group subscription starts where the LAST commit left the
-/// durable cursor, so it hands over every record of the burst again, and the
-/// endpoint — the same instance, which outlived its bridge — answers each
-/// offset it already took with the row it gave it: one row per message, no
-/// gap, no double. That idempotency on `off=` is the whole reason the commit
-/// may wait.
-#[test]
-fn a_kill_before_the_inbox_bursts_commit_redelivers_and_aterm_keeps_one_row_of_each() {
-    const BURST: u64 = 6;
-    let w = World::boot_with(
-        "burstkill",
-        &[],
-        &[("ATERM_LINK_FAULT", "kill-before-inbox-commit")],
-    );
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-    let first = w.bridge_pid();
-
-    // Sent together, so they reach the bridge as one burst more often than
-    // not; whether they do is the broker's timing and changes nothing here —
-    // the kill lands after the first burst's deliveries, whatever it held.
-    let subject = format!("/f/{FLEET}/in/{}/{a}/h-sender/note", w.node);
-    let records: Vec<harness::Record> = (1..=BURST)
-        .map(|i| {
-            (
-                6_300,
-                i,
-                subject.clone(),
-                format!("v=1 t=1 text=burst{i}").into_bytes(),
-            )
-        })
-        .collect();
-    harness::publish_pipelined(&mut w.god(), &records);
-
-    until("the bridge to kill itself before the commit", || {
-        std::fs::read_to_string(w.state.join("fault-fired"))
-            .ok()
-            .map(|_| ())
-    });
-    until("the bridge to be relaunched", || {
-        let pid: i32 = std::fs::read_to_string(w.state.join("pid"))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        (pid != first).then_some(())
-    });
-    let rows = until("every record of the burst in the inbox", || {
-        let rows = w.inbox(&a);
-        (1..=BURST)
-            .all(|i| rows.iter().any(|r| r.contains(&format!("text=burst{i}"))))
-            .then_some(rows)
-    });
-    for i in 1..=BURST {
-        let copies = rows
-            .iter()
-            .filter(|r| r.contains(&format!("text=burst{i}")))
-            .count();
-        assert_eq!(copies, 1, "burst{i} is one row, not {copies}: {rows:#?}");
-    }
 }
 
 /// **EVERY CONNECTION CARRIES ITS OWN WILL.** A broker restart fires the will

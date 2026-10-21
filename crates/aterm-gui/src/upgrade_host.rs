@@ -1538,7 +1538,11 @@ impl App {
                         ),
                         nav: u16::try_from(index + 1)
                             .ok()
-                            .map(|tab| Intent::ShowTab { tab, window: wid.0 }),
+                            .map(|tab| Intent::ShowSession {
+                                tab,
+                                window: wid.0,
+                                session: sid.to_string(),
+                            }),
                     };
                 }
             }
@@ -2032,9 +2036,10 @@ mod tests {
         assert!(one.title.ends_with("in tab 2"), "{}", one.title);
         assert_eq!(
             one.actions,
-            [Intent::ShowTab {
+            [Intent::ShowSession {
                 tab: 2,
-                window: wid.0
+                window: wid.0,
+                session: b.clone(),
             }]
         );
         // The same look again: the row and its button stand as they are.
@@ -2047,9 +2052,10 @@ mod tests {
             .expect("the second tab moves");
         app.apply_agent_upgrades(vec![ended(&b)]);
         let (id, two) = row_of(&app, &b).expect("b's row, restated");
-        let show = Intent::ShowTab {
+        let show = Intent::ShowSession {
             tab: 1,
             window: moved.0,
+            session: b.clone(),
         };
         assert!(two.title.ends_with("in window 2, tab 1"), "{}", two.title);
         assert_eq!(app.upgrade_place(&split), "in window 1, tab 1");
@@ -2100,9 +2106,11 @@ mod tests {
         app.apply_agent_upgrades(vec![ended.clone()]);
         let (id, stall) = row_of(&app, &c).expect("c's row");
         assert!(
-            stall
-                .actions
-                .contains(&Intent::ShowTab { tab: 3, window: 0 }),
+            stall.actions.contains(&Intent::ShowSession {
+                tab: 3,
+                window: 0,
+                session: c.clone()
+            }),
             "{:?}",
             stall.actions
         );
@@ -2135,9 +2143,10 @@ mod tests {
         assert_ne!(there.title, refused.title);
         assert_eq!(
             there.actions,
-            [Intent::ShowTab {
+            [Intent::ShowSession {
                 tab: 1,
-                window: moved.0
+                window: moved.0,
+                session: c.clone(),
             }]
         );
     }
@@ -4511,7 +4520,11 @@ mod tests {
         let first = &lines[&format!("harness.upgrade.{a}.suspended")];
         assert_eq!(
             first.actions,
-            [Intent::ShowTab { tab: 1, window: 0 }],
+            [Intent::ShowSession {
+                tab: 1,
+                window: 0,
+                session: a.clone()
+            }],
             "the line takes the owner to the tab"
         );
         assert_eq!(app.messages.live_rows().count(), 0, "no row");

@@ -9,6 +9,10 @@
 //!   the beam reads as light leaving the cursor. At rest the fill is a whisper
 //!   of the beam hue over the cursor's own colour ([`PhaserConfig::base`]: OSC
 //!   12 / `cursor_color`); under the keys it saturates to the vivid beam colour.
+//!   On a light page with no pinned colour the block IS the beam's hue, clean
+//!   and saturated, deepened by lightness to read clearly on the page, on a
+//!   wheel that steps over the hues paper can only show as khaki
+//!   (`color_math::light_spectrum_hue`); the bar it fires does the same.
 //! * **Beam-axis energy wings**: an additive pair of lens-shaped side lobes on
 //!   the horizontal axis, spanning the cell height and tapering sideways, at a
 //!   dim static floor while idle and swelling with the typing cadence.
@@ -16,10 +20,12 @@
 //!   (trailing spectrum left, leading right), unlike the rainbow kitty's banded
 //!   ring.
 //!
-//! Text-safe as [`crate::cursor_rainbow`] is: the fill goes through the renderer's
-//! `floor_cursor_fill` contrast floor, and the wings are additive [`GlowQuad`] light with capped
-//! coverage; only the dim outer tint reaches over neighbouring glyphs. Pure in the injected
-//! `now`, it settles to inactive when the charge dies (then rides the blink cadence).
+//! Text-safe: the host floors the fill against the page (`crate::cursor_fx::floor_block_fill`,
+//! unless it wears a pinned cursor colour) and the renderer's `floor_cursor_fill` adds the user's
+//! `minimum_contrast` on top (off by default). The wings are additive [`GlowQuad`] light with
+//! capped coverage, drawn on dark pages only; only the dim outer tint reaches over neighbouring
+//! glyphs. Pure in the injected `now`, it settles to inactive when the charge dies (then rides
+//! the blink cadence).
 
 use aterm_time::Instant;
 
@@ -29,12 +35,29 @@ use crate::cursor_glow::{Geom, hsv2rgb};
 use crate::effect_util::push_fx_rect as push_rect;
 use crate::effect_util::{lerp, mix_rgb};
 
-/// The block base the beam hue tints from when the host names none: white on a
-/// dark theme, soft near-black on a light theme (the rainbow cursor's pair). A
-/// host that knows the resolved cursor colour passes it as
-/// [`PhaserConfig::base`] instead.
+/// The block base the beam hue tints from on a dark theme when the host names
+/// none: white. A light theme's block is the beam's hue itself
+/// ([`light_emitter_fill`]). A host that knows a pinned cursor colour passes
+/// it as [`PhaserConfig::base`] instead.
 const BASE_DARK_THEME: u32 = 0x00FF_FFFF;
-const BASE_LIGHT_THEME: u32 = 0x0016_161C;
+
+/// The emitter block on a light page with no pinned cursor colour: the beam's
+/// own hue, clean and fully saturated (the wheel stepping over the hues that
+/// can only read on paper as khaki or olive,
+/// [`crate::color_math::light_spectrum_hue`]), deepening with the charge
+/// ([`crate::color_math::light_body_fill`]) and held by lightness alone to
+/// the light emitter's contrast on white
+/// ([`crate::cursor_beam::LIGHT_EMITTER_CONTRAST`]), so it reads as the
+/// emitter rather than a drab near-black. The host still floors it against
+/// the cell it sits on.
+fn light_emitter_fill(hue: f32, e: f32) -> u32 {
+    let clean = hsv2rgb(crate::color_math::light_spectrum_hue(hue), 1.0, 1.0);
+    crate::color_math::floor_contrast_keeping_hue(
+        crate::color_math::light_body_fill(clean, e),
+        0x00FF_FFFF,
+        crate::cursor_beam::LIGHT_EMITTER_CONTRAST,
+    )
+}
 
 /// Charged breath (turns/sec of the wing pulse) and its depth. The phase freezes
 /// below [`SETTLED_ENERGY`], so an unrelated present after a long idle never
@@ -97,17 +120,18 @@ pub struct PhaserConfig {
     /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded in
     /// by the host exactly like the aurora. 0 ⇒ fully inert (plain themed cursor).
     pub intensity: f32,
-    /// The block's colour at rest, `0x00RRGGBB`: the terminal's resolved cursor colour (OSC 12,
-    /// else the configured theme cursor, else the live OSC 10 foreground). The beam hue is a
-    /// tint over it, so a settled caret is the user's cursor colour. The fill leaves the tick as
+    /// The block's colour at rest, `0x00RRGGBB`: a PINNED cursor colour (a configured
+    /// `cursor_color` or a program's OSC 12). The beam hue is a tint over it that comes in with
+    /// the charge, so a settled caret is exactly the user's cursor colour. The fill leaves the tick as
     /// [`aterm_render::RenderInput::cursor_fill_override`], which replaces the frame cursor
-    /// colour, so it must carry the host's colour, as the comet and beam rod do. `None` uses the
-    /// theme-polar base ([`BASE_DARK_THEME`] / [`BASE_LIGHT_THEME`]).
+    /// colour, so it must carry the host's colour, as the comet and beam rod do. `None` uses
+    /// white on a dark theme ([`BASE_DARK_THEME`]) and the beam's own hue on a light one
+    /// ([`light_emitter_fill`]).
     pub base: Option<u32>,
 }
 
-/// What a tick produced: the beam-hued block fill to hand the renderer (it floors it for
-/// contrast) and a fingerprint that changes on every visible step (0 when off).
+/// What a tick produced: the beam-hued block fill to hand the renderer and a fingerprint that
+/// changes on every visible step (0 when off).
 #[derive(Clone, Copy, Debug)]
 pub struct PhaserFrame {
     /// The beam-hued block-fill colour `0x00RRGGBB`, or `None` when the emitter
@@ -187,14 +211,22 @@ impl CursorPhaser {
         let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin(); // 0..1
 
         // The block fill: the cursor's own colour tinted toward the beam's hue with charge. The
-        // renderer floors it against the cell bg, so the glyph stays sharp.
+        // host floors it against the page, so the glyph stays sharp, unless it wears a pinned
+        // cursor colour.
         let beam = hsv2rgb(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
-        let base = cfg.base.unwrap_or(if dark_theme {
-            BASE_DARK_THEME
-        } else {
-            BASE_LIGHT_THEME
-        });
-        let fill = mix_rgb(base, beam, lerp(MIX_IDLE, MIX_MAX, e));
+        let fill = match cfg.base {
+            // A pinned cursor colour is the settled emitter itself: the beam's
+            // hue tints it only with the charge
+            // ([`crate::color_math::wear_pinned`]).
+            Some(pinned) => crate::color_math::wear_pinned(
+                pinned,
+                mix_rgb(pinned, beam, lerp(MIX_IDLE, MIX_MAX, e)),
+                e,
+                SETTLED_ENERGY,
+            ),
+            None if dark_theme => mix_rgb(BASE_DARK_THEME, beam, lerp(MIX_IDLE, MIX_MAX, e)),
+            None => light_emitter_fill(hue, e),
+        };
 
         // The additive wings, drawn only over a visible in-grid cursor cell,
         // with a small breathing idle floor. Dark themes only: additive lobes
@@ -226,7 +258,7 @@ impl CursorPhaser {
     }
 
     /// Emit the two lens-shaped wings as premultiplied additive quads. Bounded by construction:
-    /// ≤ 4 layers × (cell_h / slab) slabs × 2 sides.
+    /// `WING_LAYERS.len()` layers × (cell_h / slab) slabs × 2 sides.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + charge/hue + geometry/config; one internal call site"
@@ -411,7 +443,8 @@ mod tests {
 
     /// With no host cursor colour ([`PhaserConfig::base`] `None`), the fill
     /// blooms from the theme base (near-white on dark) toward the saturated beam
-    /// hue under charge, and a light theme starts near-black.
+    /// hue under charge; on a light theme it is the beam's hue itself, clean
+    /// and saturated, deep enough to read clearly on white at rest.
     #[test]
     fn fill_blooms_from_theme_base() {
         let g = geom();
@@ -446,22 +479,57 @@ mod tests {
             spread(f_hot) > spread(f_idle) + 60,
             "charge saturates the fill toward the beam hue"
         );
-        let mut light = CursorPhaser::default();
-        let f_light = light
-            .tick(Some((1, 1)), t, 0.0, 0.0, false, g, &c, &mut out)
-            .fill
-            .unwrap();
-        let maxch = [
-            (f_light >> 16) & 0xff,
-            (f_light >> 8) & 0xff,
-            f_light & 0xff,
-        ]
-        .into_iter()
-        .max()
-        .unwrap();
+        for hue in [0.0, 0.33, 0.6, 0.8] {
+            let mut light = CursorPhaser::default();
+            let f_light = light
+                .tick(Some((1, 1)), t, hue, 0.0, false, g, &c, &mut out)
+                .fill
+                .unwrap();
+            let ratio = crate::color_math::contrast_ratio(f_light, 0x00FF_FFFF);
+            let (_, sat, _) = crate::color_math::rgb2hsv(f_light);
+            assert!(
+                ratio >= crate::cursor_beam::LIGHT_EMITTER_CONTRAST - 0.05 && sat > 0.9,
+                "hue {hue}: the idle light block is a clean deep hue, got {f_light:#08x} \
+                 ({ratio:.2}:1, saturation {sat:.2})"
+            );
+        }
+    }
+
+    /// ON PAPER THE EMITTER AND ITS BAR STEP OVER THE MUDDY HUES: every beam
+    /// phase gives a light block whose hue lies outside
+    /// [`crate::color_math::LIGHT_MUDDY_HUES`], and every hue on the light
+    /// wheel is one of the others, in order. Negative control: the whole
+    /// wheel's yellow, deepened to the same contrast, is the khaki the
+    /// judges saw.
+    #[test]
+    fn the_light_emitter_steps_over_the_muddy_hues() {
+        use crate::color_math::{LIGHT_MUDDY_HUES, light_spectrum_hue, rgb2hsv};
+        let (b0, b1) = LIGHT_MUDDY_HUES;
+        let mut last = -1.0;
+        for i in 0..360 {
+            let h = light_spectrum_hue(i as f32 / 360.0);
+            assert!(
+                !(b0..b1).contains(&h),
+                "{i} degrees lands in the band at {h}"
+            );
+            assert!(h > last, "the light wheel keeps the hues in order");
+            last = h;
+            let fill = light_emitter_fill(i as f32 / 360.0, 0.0);
+            let (deg, _, _) = rgb2hsv(fill);
+            assert!(
+                !(b0 * 360.0 + 1.0..b1 * 360.0 - 1.0).contains(&deg),
+                "{i} degrees: the block {fill:06x} is a muddy hue"
+            );
+        }
+        let yellow = crate::color_math::floor_contrast_keeping_hue(
+            hsv2rgb(60.0 / 360.0, 1.0, 1.0),
+            0x00FF_FFFF,
+            crate::cursor_beam::LIGHT_EMITTER_CONTRAST,
+        );
+        let (r, g, b) = ((yellow >> 16) & 0xff, (yellow >> 8) & 0xff, yellow & 0xff);
         assert!(
-            maxch < 110,
-            "idle block near black on a light theme, got {f_light:#08x}"
+            r.max(g) < 0x80 && b == 0,
+            "control: yellow deepened to read on white is khaki, got {yellow:06x}"
         );
     }
 

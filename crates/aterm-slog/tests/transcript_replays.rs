@@ -613,7 +613,7 @@ pub(crate) fn a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step() {
 /// The worst rollup (every counter but `lost=`) leaves `tools=` on the
 /// close, where the three numbers would have cut it (MAX_FIELDS 12).
 #[test]
-fn a_turn_end_closes_the_turn_and_then_amends_its_numbers() {
+pub(crate) fn a_turn_end_closes_the_turn_and_then_amends_its_numbers() {
     let mut r = Rig::bound();
     r.see(Verdict::Busy);
     let t1 = r.turn();
@@ -1497,7 +1497,7 @@ fn the_worst_tracker_line_fits_a_carry_line() {
 /// The run closed: the join writes nothing more, and the transcript steps
 /// it had open closed with the run's cascade, `out=gone`.
 #[test]
-fn a_closed_run_takes_no_transcript_row() {
+pub(crate) fn a_closed_run_takes_no_transcript_row() {
     let mut r = Rig::bound();
     r.see(Verdict::Busy);
     r.tx(prompt("v1"));

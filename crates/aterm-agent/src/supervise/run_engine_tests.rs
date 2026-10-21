@@ -765,13 +765,15 @@ fn loop_scratch(tag: &str) -> PathBuf {
 /// `git <args>` in `dir`, hermetic, asserted ok.
 #[cfg(unix)]
 fn loop_git(dir: &Path, args: &[&str]) {
-    let out = aterm_uds::spawnfd::command("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .expect("git");
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
     assert!(out.status.success(), "git {args:?}");
 }
 
@@ -1143,8 +1145,10 @@ fn the_sessions_foreground_group_is_read_off_the_roster() {
 }
 
 /// A loop addressing its session by its `s-…` id binds the worker by that id, not by the
-/// local id `status` answered, which another instance's session may hold. Negative control:
-/// by local id alone it takes the stranger's row. Unix only (a stand-in worker).
+/// local id `status` answered, which another instance's session may hold, and asks the roster
+/// of the instance hosting that id ([`Ctl::call_at_host_of`]), which need not be the one a
+/// request naming no session reaches. Negative control: by local id alone it takes the
+/// stranger's row, from the roster such a request reaches. Unix only (a stand-in worker).
 #[cfg(unix)]
 #[test]
 fn a_loop_addressing_its_session_binds_the_worker_by_that_id() {
@@ -1190,19 +1194,24 @@ fn a_loop_addressing_its_session_binds_the_worker_by_that_id() {
         s.supervise(&opts).expect("supervise");
         let rows = ledger_rows(&ledger);
         let _ = std::fs::remove_dir_all(&ldir);
-        (m.presses().len(), rows)
+        (m.presses().len(), rows, m.aimed.clone())
     };
-    let (presses, rows) = run(Some(format!("@{ours}")));
+    let (presses, rows, aimed) = run(Some(format!("@{ours}")));
     assert_eq!(presses, 0, "{rows:?}");
     assert!(
         rows.iter().any(|r| r.contains("core.fsmonitor")),
         "the addressed session's worker is the one judged: {rows:?}"
     );
-    let (presses, rows) = run(None);
+    assert!(
+        !aimed.is_empty() && aimed.iter().all(|sid| *sid == ours),
+        "the roster is asked of the addressed session's host: {aimed:?}"
+    );
+    let (presses, rows, aimed) = run(None);
     assert_eq!(
         presses, 1,
         "by local id the stranger's row is taken: {rows:?}"
     );
+    assert_eq!(aimed, Vec::<String>::new(), "no id to aim the roster at");
     drop(worker);
     drop(stranger);
     let _ = std::fs::remove_dir_all(&repo);
@@ -3400,6 +3409,77 @@ fn behind_another_supervisors_claim_the_loop_only_watches() {
     assert!(!m.presses().is_empty(), "{:?}", m.requests);
 }
 
+/// CLAIM AT NAMING (card engine §8, lane A4): the hosted loop's supervisor claim is its first
+/// request, ahead of its first look at the screen and of its approval ledger's read — the
+/// harness card wraps a pane only under a live claim, so a claim taken after the agent's first
+/// paint leaves that paint's card bare. What the take found is still said once, at the loop's
+/// start: one claim request, no second take. Read off the run's own tape, in order.
+/// Mutation-checked: without the early take the claim comes after the loop's first look.
+#[test]
+fn the_hosted_loop_takes_its_claim_before_it_reads_anything() {
+    use astream_effects::EffectRecord;
+    let mut m = fenced(vec![bash_one_row(), bash_one_row()]);
+    let (ldir, ledger) = ledger_file("claim-first");
+    let (_, lines, bytes) = host_stops_taped(&mut m, Some("@s-1"), ledger, &auto(30), false);
+    let _ = std::fs::remove_dir_all(&ldir);
+    assert!(lines.iter().any(|l| l.starts_with("APPROVED")), "{lines:?}");
+    let read = crate::supervise::tape::recover::recover(&bytes);
+    let records: Vec<&EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(crate::supervise::tape::codec::Item::record)
+        .collect();
+    let ctl = |r: &EffectRecord| match r {
+        EffectRecord::Exchange { door, request, .. }
+            if door == crate::supervise::tape::doors::CTL =>
+        {
+            crate::supervise::tape::codec::ctl_args(request).ok()
+        }
+        _ => None,
+    };
+    let claims: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            ctl(r).is_some_and(|a| a.windows(3).any(|w| w == ["meta", "set", "supervisor"]))
+        })
+        .map(|(n, _)| n)
+        .collect();
+    // The first request through any door (the ledger's bound, the host's
+    // probes, the server's), and the first file read: the ledger (the tape
+    // names it by its root, `@ledger/…`) or the journal.
+    let first_request = records
+        .iter()
+        .position(|r| matches!(r, EffectRecord::Exchange { .. }));
+    let first_read = records
+        .iter()
+        .position(|r| matches!(r, EffectRecord::File { .. } | EffectRecord::FileErr { .. }));
+    let ledger_read = records.iter().position(|r| {
+        matches!(r, EffectRecord::File { path, .. } | EffectRecord::FileErr { path, .. }
+            if path.starts_with("@ledger/"))
+    });
+    assert!(ledger_read.is_some(), "the ledger is read on the tape");
+    assert_eq!(
+        claims.first().copied(),
+        first_request,
+        "the claim is the loop's first request: {:?}",
+        records.iter().take(6).collect::<Vec<_>>()
+    );
+    assert!(
+        first_read.is_some_and(|at| claims[0] < at),
+        "the claim before any read: the ledger's at {ledger_read:?} ({claims:?})"
+    );
+    assert_eq!(
+        m.claims
+            .iter()
+            .filter(|c| c.contains("meta set supervisor"))
+            .count(),
+        1,
+        "taken once: {:?}",
+        m.claims
+    );
+}
+
 /// The hosted loop yields (`SuperviseOpts::yield_when_held`): behind another holder's claim
 /// it ends with `CLAIM_HELD` + the holder, nothing pressed, so the host parks the session.
 /// Negative control: with the claim free the box is approved under the host's one claim.
@@ -4352,30 +4432,68 @@ fn resumed_answer(said: &str) -> Vec<String> {
     r
 }
 
-/// THE TASK'S END AT A WITHHELD POINT IS ASKED AS ITS WAIT BEGINS (F1 of the
-/// live lab of 2026-10-16; F1-R4): the agent reports its task finished at a
+/// THE TASK'S END AT A WITHHELD POINT IS SETTLED ONCE ITS DONE IS SAID (F1
+/// of the live lab of 2026-10-16; F1-R4): the agent lands its task at a
 /// point a guard withholds from the host — here the Mac's wake, inside its
-/// settle (`guard=wake-settle`) — and the loop says `DONE` there. The host
-/// is asked at that point before the decision, and again — `wake` false —
-/// as its wait begins, the `DONE` said: what it owed there that types
-/// nothing and reads the task's end (a relaunch's carry-on into a finished
-/// task, `done:finished`) is settled then, journaled once (`HOST seq=<n>
-/// …`), nothing typed. NEGATIVE CONTROL: a turn end the loop neither ends
-/// nor acts on (the continue policy off) says no `DONE`, and the host's
-/// settle that waits on one settles nothing.
+/// settle (`guard=wake-settle`): the clean defense answering Land's
+/// instruction a loop before this one typed (its ledger beside) — and the
+/// loop says `DONE` there, right after the point's own line
+/// (`Session::say_point`). The host is asked at that point, the `DONE` said:
+/// what it owed there that types nothing and reads the task's end (a
+/// relaunch's carry-on into a finished task, `done:finished`) is settled
+/// then, journaled once after the `DONE` (`HOST seq=<n> …`), nothing typed,
+/// and its wait asks nothing more. (A `DONE` said at the point's act was
+/// settled only as its wait began, a second ask: the claim of 2026-10-20
+/// moved it to the point's line.) NEGATIVE CONTROL: a turn end the loop
+/// neither ends nor acts on (the continue policy off) says no `DONE`, and
+/// the host's settle that waits on one settles nothing, asked at the point
+/// and again as its wait begins.
 #[test]
-fn the_tasks_end_at_a_withheld_point_is_asked_as_its_wait_begins() {
-    use crate::supervise::policy::turn_end::FINISHED;
+fn the_tasks_end_at_a_withheld_point_is_settled_once_its_done_is_said() {
     for done in [true, false] {
-        let (dir, path) = journal_file(&format!("end-asks-host-{done}"));
+        let (dir, _) = journal_file(&format!("end-asks-host-{done}"));
+        let ledger = dir.join("approvals.jsonl");
+        let path = crate::supervise::approvals::journal_beside(&ledger);
         let host = QuietHost::owed(&path);
         *host.done_word.lock().unwrap() = Some("done:finished");
+        let word = if done { "land" } else { "cruise" };
+        if done {
+            // Land's instruction, typed by a loop before this one into the
+            // end of the turn of work.
+            let mut first = Mock::new(vec![
+                busy_screen(),
+                resumed_answer("Fixed the parser; pushing it next."),
+            ]);
+            first.autopilot = Some(word);
+            first.vanish_after = Some(4);
+            first.cursor_on_caret = true;
+            let opts = SuperviseOpts {
+                policy: SupervisorConfig {
+                    human_grace_s: 0,
+                    ..owners_policy()
+                },
+                journal: Some(path.clone()),
+                ..auto(30)
+            };
+            let (lines, _) = watch_lines_with(&mut first, &opts, |s| {
+                s.set_approval_ledger(Some(ledger.clone()));
+                s.set_turn_end_timing(TurnEndTiming {
+                    short_backoff: Duration::from_millis(30),
+                    short_backoff_max: Duration::from_millis(60),
+                    ..TurnEndTiming::default()
+                });
+            });
+            assert_eq!(count(&first, "turn"), 1, "the instruction: {lines:#?}");
+        }
         let said = if done {
-            FINISHED
+            "Fixed the parser and pushed it.\nNothing left: all of it is merged into the \
+             remote main branch."
         } else {
             "Fixed the parser; the suite is green."
         };
         let mut m = Mock::new(vec![busy_screen(), resumed_answer(said)]);
+        m.history_served();
+        m.autopilot = Some(word);
         m.vanish_after = Some(3);
         m.cursor_on_caret = true;
         let mut opts = SuperviseOpts {
@@ -4386,6 +4504,7 @@ fn the_tasks_end_at_a_withheld_point_is_asked_as_its_wait_begins() {
         };
         opts.policy.continue_policy = done;
         let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
             // The Mac woke a moment ago: its settle holds every point.
             s.settle_wake(TEST_NOW, Instant::now());
             s.seeds_learned_state("the Mac's wake settled before the run");
@@ -4419,9 +4538,12 @@ fn the_tasks_end_at_a_withheld_point_is_asked_as_its_wait_begins() {
             );
             assert_eq!(
                 asks,
-                [(Some("wake-settle"), false), (Some("wake-settle"), false)],
-                "at the point, then as the DONE's wait began"
+                [(Some("wake-settle"), false)],
+                "at the point, the DONE said: nothing asked once settled"
             );
+            let end = records.iter().position(|l| l.starts_with("DONE "));
+            let host_line = records.iter().position(|l| l.starts_with("HOST "));
+            assert!(end < host_line, "the DONE, then the host's: {records:#?}");
         } else {
             assert!(asks.len() >= 2, "asked, settled nothing: {asks:?}");
         }
@@ -5452,22 +5574,68 @@ fn a_break_after_the_loops_own_taken_act_is_offered_to_the_host() {
     }
 }
 
-/// When [`hosted_with_host_ledger`] stops the loop it runs. A condition, not a
-/// fixed window: mock round trips with stalls and back-offs stretch on a
-/// loaded machine.
+/// When [`hosted_with_host_ledger`] stops the loop it runs: judged after every request the
+/// loop makes ([`Mock::after_call`]), on the run's clock, which moves only by what the run
+/// skips ([`crate::supervise::fx::ScriptedClock::run_virtual`]: the waits on a sitting screen, the
+/// loop's own sleeps). So a run waits out no real time, and stops at the same step of the
+/// loop however loaded the machine.
 enum Stop {
-    /// After a fixed window: only for arms that assert something did not happen, where a
-    /// longer run can only find more.
+    /// After a window of the run's clock: only for arms that assert something did not happen,
+    /// where a longer run can only find more.
     After(Duration),
-    /// Once the host shows `reached`, then `tail` more for the steps it cannot
-    /// see (a journal line, a typed turn). Bounded at 60 s, so a loop that
-    /// never gets there still ends and fails on what it did.
-    Reached(Box<dyn Fn(&TestHost) -> bool + Send>, Duration),
+    /// Once the host shows `reached` (handed the run's clock now), then `tail` more of the
+    /// run's clock for the steps it cannot see (a journal line, a typed turn). A loop that
+    /// never gets there ends at its `--max`, or at a minute of real time (a hang
+    /// detector), and fails on what it did.
+    Reached(Reach, Duration),
 }
+
+/// A [`Stop::Reached`] condition: the host, and the run's clock now.
+type Reach = Box<dyn FnMut(&TestHost, Instant) -> bool + Send>;
 
 impl Stop {
     fn reached(reached: impl Fn(&TestHost) -> bool + Send + 'static, tail: Duration) -> Self {
+        Self::Reached(Box::new(move |h, _| reached(h)), tail)
+    }
+
+    /// [`Self::reached`], the condition handed the run's clock.
+    fn reached_at(
+        reached: impl FnMut(&TestHost, Instant) -> bool + Send + 'static,
+        tail: Duration,
+    ) -> Self {
         Self::Reached(Box::new(reached), tail)
+    }
+
+    /// The judge [`hosted_with_host_at`] runs after every request: it raises `halt` once
+    /// this stop is due on `clock` (or a minute of real time has passed).
+    fn judge(
+        self,
+        host: Arc<TestHost>,
+        clock: Arc<crate::supervise::fx::ScriptedClock>,
+        halt: Arc<AtomicBool>,
+    ) -> Box<dyn FnMut() + Send> {
+        let start = clock.mono();
+        let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let mut stop = self;
+        let mut since: Option<Instant> = None;
+        Box::new(move || {
+            if halt.load(Ordering::SeqCst) {
+                return;
+            }
+            let now = clock.mono();
+            let due = match &mut stop {
+                Stop::After(window) => now.saturating_duration_since(start) >= *window,
+                Stop::Reached(reached, tail) => {
+                    if since.is_none() && reached(&host, now) {
+                        since = Some(now);
+                    }
+                    since.is_some_and(|at| now.saturating_duration_since(at) >= *tail)
+                }
+            };
+            if due || Instant::now() >= hang {
+                halt.store(true, Ordering::SeqCst);
+            }
+        })
     }
 }
 
@@ -5508,8 +5676,8 @@ fn hosted_with_host_ledger(
 }
 
 /// [`hosted_with_host`] with the loop's wall clock set to `clock` (unix seconds, PDT,
-/// [`test_zones`]) and running from it: a limit's reset is read against it and waited for in
-/// real time.
+/// [`test_zones`]) and running from it on the run's clock: a limit's reset is read against it
+/// and waited for as the run skips its waits.
 fn hosted_with_host_clocked(
     m: &mut Mock,
     opts: &SuperviseOpts,
@@ -5539,31 +5707,25 @@ fn hosted_with_host_at(
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
         ..opts.clone()
     };
-    let halt = Arc::clone(&stop);
-    let watched = Arc::clone(host);
-    let setter = std::thread::spawn(move || {
-        match stop_at {
-            Stop::After(window) => std::thread::sleep(window),
-            Stop::Reached(reached, tail) => {
-                let backstop = Instant::now() + Duration::from_secs(60);
-                while !reached(&watched) && Instant::now() < backstop {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                std::thread::sleep(tail);
-            }
-        }
-        halt.store(true, Ordering::SeqCst);
-    });
     let mut out: Vec<u8> = Vec::new();
     // Recorded, as every whole run here ([`taped_session`]), and replayed
     // from the tape alone (below): the host's every answer and notification
-    // crossed its door, and the stop the setter's thread raised at a moment
-    // of its own is the loop's own read of it — so the replay asks no host,
-    // waits on no thread, and must reproduce the run.
+    // crossed its door, and the stop the judge raised after a request is the
+    // loop's own read of it — so the replay asks no host and must reproduce
+    // the run.
     let from = m.order.len();
-    // The setter stops the run on the system's clock: the loop's waits nap it.
-    m.real_time = true;
-    let (tape, mut taped) = memory_tape(m);
+    // The run's clock moves only as the run skips ([`Stop`]); the system's
+    // wall clock where the test fixes none, running from now.
+    let run_clock = Arc::new(crate::supervise::fx::ScriptedClock::default());
+    run_clock.run_virtual();
+    if clock.is_none() {
+        // On a whole second: a reset `in 4s` is as far off on every run.
+        let now_ms = crate::supervise::journal::unix_ms();
+        run_clock.set_at_ms(now_ms - now_ms.rem_euclid(1000));
+        run_clock.set_running();
+    }
+    m.after_call = Some(stop_at.judge(Arc::clone(host), Arc::clone(&run_clock), Arc::clone(&stop)));
+    let (tape, mut taped) = memory_tape_on(m, run_clock);
     let mut s = session(&mut taped, Some("@s-1".to_string()));
     s.set_fx(tape.fx.clone());
     s.set_approval_ledger(Some(ledger.to_path_buf()));
@@ -5578,9 +5740,9 @@ fn hosted_with_host_at(
     let header = hosted_header(&s, &opts);
     tape.core().reroot(header.roots.clone());
     let r = s.run_hosted(&opts, stop, &mut out);
-    setter.join().expect("setter");
     drop(s);
     drop(taped);
+    m.after_call = None;
     tape.finish(&crate::supervise::tape::replay::hosted_end(&r));
     let lines: Vec<String> = String::from_utf8(out)
         .expect("utf-8")
@@ -6044,7 +6206,6 @@ const WEEKLY_RESET_AT: i64 = AFTER_RESET - 30;
 /// staying acted on continues nothing.
 #[test]
 fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
-    use std::sync::atomic::AtomicUsize;
     /// How the measure moves once the point is decided on it.
     #[derive(Clone, Copy, PartialEq)]
     enum Then {
@@ -6084,14 +6245,14 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
         let mut m = Mock::new(vec![busy_screen(), weekly_limited()]);
         m.stall_sleep = Some(Duration::from_millis(5));
         // The asks at which the measure crossed (0: not yet).
-        let crossed_at = Arc::new(AtomicUsize::new(0));
-        // When the measure moved (or, for a control, would have).
-        let moved: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        let mut crossed_at = 0;
+        // When the measure moved on the run's clock (or, for a control, would have).
+        let mut moved: Option<Instant> = None;
         let watched = journal.clone();
-        let stop = Stop::reached(
-            move |h| {
-                if let Some(at) = *moved.lock().unwrap() {
-                    return at.elapsed() >= window
+        let stop = Stop::reached_at(
+            move |h, now| {
+                if let Some(at) = moved {
+                    return now.saturating_duration_since(at) >= window
                         || std::fs::read_to_string(&watched)
                             .is_ok_and(|j| j.contains("rule=usage-resume@v1"));
                 }
@@ -6102,13 +6263,12 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
                 if crossing {
                     // Decided healthy with the reset seconds off: the memory crosses, is
                     // decided on, and falls back under.
-                    let at = crossed_at.load(Ordering::SeqCst);
-                    if at == 0 {
+                    if crossed_at == 0 {
                         h.memory_mib.store(RUNAWAY_MIB, Ordering::SeqCst);
-                        crossed_at.store(asks.max(1), Ordering::SeqCst);
+                        crossed_at = asks.max(1);
                         return false;
                     }
-                    if asks < at + 3 {
+                    if asks < crossed_at + 3 {
                         return false;
                     }
                 }
@@ -6116,7 +6276,7 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
                     Then::Stays => {}
                     Then::Drops => h.memory_mib.store(HEALTHY_MIB, Ordering::SeqCst),
                 }
-                *moved.lock().unwrap() = Some(Instant::now());
+                moved = Some(now);
                 false
             },
             Duration::from_millis(200),
@@ -6228,7 +6388,6 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
 /// host that makes none): the trouble stays, and so does the badge.
 #[test]
 fn a_plain_idle_point_the_memory_escalated_is_handed_back_when_the_mac_recovers() {
-    use std::sync::atomic::AtomicUsize;
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Way {
         /// The host makes no restart (`can_restart` false).
@@ -6257,13 +6416,14 @@ fn a_plain_idle_point_the_memory_escalated_is_handed_back_when_the_mac_recovers(
         let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
         m.stall_sleep = Some(Duration::from_millis(5));
         // The memory asks at which the point was reached (0: not yet).
-        let reached_at = Arc::new(AtomicUsize::new(0));
-        let moved: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        let mut reached_at = 0;
+        // When the trouble lifted on the run's clock (or, for the control, would have).
+        let mut moved: Option<Instant> = None;
         let watched = journal.clone();
-        let stop = Stop::reached(
-            move |h| {
-                if let Some(at) = *moved.lock().unwrap() {
-                    return at.elapsed() >= window
+        let stop = Stop::reached_at(
+            move |h, now| {
+                if let Some(at) = moved {
+                    return now.saturating_duration_since(at) >= window
                         || std::fs::read_to_string(&watched)
                             .is_ok_and(|j| j.contains("rule=continue@v1"));
                 }
@@ -6274,18 +6434,17 @@ fn a_plain_idle_point_the_memory_escalated_is_handed_back_when_the_mac_recovers(
                 }
                 // The point escalated, and a few steps waited past it.
                 let asks = h.memory_asks.load(Ordering::SeqCst);
-                let at = reached_at.load(Ordering::SeqCst);
-                if at == 0 {
-                    reached_at.store(asks.max(1), Ordering::SeqCst);
+                if reached_at == 0 {
+                    reached_at = asks.max(1);
                     return false;
                 }
-                if asks < at + 3 {
+                if asks < reached_at + 3 {
                     return false;
                 }
                 if recovers {
                     h.trouble.store(false, Ordering::SeqCst);
                 }
-                *moved.lock().unwrap() = Some(Instant::now());
+                moved = Some(now);
                 false
             },
             Duration::from_millis(200),
@@ -7680,101 +7839,15 @@ fn a_session_its_host_says_nobody_asked_anything_gets_nothing_typed() {
     }
 }
 
-/// A SESSION WHOSE RECORD SAYS ITS TASK IS FINISHED GETS NOTHING TYPED
-/// ([`IdleHost::finished`], [`TurnEndReading::finished_record`]): a new loop
-/// whose first screen's last words are not the worker's — Claude Code's
-/// post-resume paragraph — backs off into no `keep going`, and a turn Claude
-/// Code woke the agent for is not continued: the host's record is read at
-/// each. NEGATIVE CONTROL: the same points on a host whose record says
-/// someone asked since are continued (the screen moves once the turn is
-/// typed, and the point after it, where the loop says a turn ran, is the
-/// hang detector's mark).
-#[test]
-fn a_session_whose_record_says_finished_gets_nothing_typed() {
-    let full = SuperviseOpts {
-        max: Duration::from_secs(30),
-        ..SuperviseOpts::hosted()
-    };
-    let resumed = || {
-        let mut r = rows(&[
-            "⏺ Auto mode lets Claude handle permission prompts automatically for this session.",
-            "",
-        ]);
-        r.extend(composer("  ? for shortcuts"));
-        r
-    };
-    // (what, the script, the screen that sits until a turn is typed, the
-    // busy reads once it was)
-    for (what, script, sits, ran) in [
-        (
-            "a new loop's first point",
-            vec![resumed(), busy_screen(), resumed()],
-            0,
-            1,
-        ),
-        (
-            "a turn Claude Code woke it for",
-            vec![busy_screen(), resumed(), busy_screen(), resumed()],
-            1,
-            2,
-        ),
-    ] {
-        let run = |finished: Option<bool>| {
-            let host = Arc::new(TestHost::default());
-            *host.finished.lock().unwrap() = finished;
-            let mut m = Mock::new(script.clone());
-            m.stall_sleep = Some(Duration::from_millis(5));
-            m.turn_releases = Some(sits);
-            let stop = if finished == Some(true) {
-                Stop::reached(
-                    |h| h.finished_asks.load(Ordering::SeqCst) >= 1,
-                    Duration::from_millis(300),
-                )
-            } else {
-                Stop::reached(
-                    move |h| h.turns_ran.load(Ordering::SeqCst) >= ran,
-                    Duration::from_millis(50),
-                )
-            };
-            let (r, _) = hosted_with_host(
-                &mut m,
-                &full,
-                &host,
-                stop,
-                Some(TurnEndTiming {
-                    short_backoff: Duration::from_millis(10),
-                    ..TurnEndTiming::default()
-                }),
-            );
-            assert_eq!(r, Ok(()), "{what}");
-            assert!(
-                host.finished_asks.load(Ordering::SeqCst) >= 1,
-                "{what}: the record is read"
-            );
-            m
-        };
-        let m = run(Some(true));
-        assert_eq!(
-            count(&m, "@s-1 turn") + count(&m, "@s-1 send"),
-            0,
-            "{what}: nothing typed: {:?}",
-            m.requests
-        );
-        // At least one: the point after the typed turn is the next one's.
-        let m = run(Some(false));
-        assert!(count(&m, "@s-1 turn") >= 1, "{what}: {:?}", m.requests);
-    }
-}
-
 /// THE RECORD IS READ AT EVERY POINT A TURN RAN, NOT ONLY AT A NEW LOOP'S
-/// FIRST ([`TurnEndState::reads_record`]): a loop that continued its worker
-/// once, the record saying the task open then, reads the record again at the
-/// next point a turn ran — where the worker said the token while a shell
-/// kept the screen busy, and the point's last words are a background job's
-/// line, never the token — and types no second turn. NEGATIVE CONTROL: the
-/// record still saying the task is open there is continued again (the
-/// point after that turn, where the loop says a third turn ran, is the hang
-/// detector's mark).
+/// FIRST ([`TurnEndState::reads_record`]), AND ITS FINISH ENDS NOTHING: a
+/// loop that continued its worker once, the record saying the task open
+/// then, reads the record again at the next point a turn ran — where the
+/// worker said the retired token while a shell kept the screen busy, and
+/// the record reads it as a finish — and continues it again (FOREVER
+/// CRUISE: only a landing or a person's exchange ends a task). The point
+/// after that turn, where the loop says a third turn ran, is the hang
+/// detector's mark.
 #[test]
 fn the_record_is_read_at_every_point_a_turn_ran() {
     let full = SuperviseOpts {
@@ -7802,17 +7875,10 @@ fn the_record_is_read_at_every_point_a_turn_ran() {
         m.stall_sleep = Some(Duration::from_millis(5));
         // Each point sits until the loop types its turn.
         m.turn_gates = vec![1, 3];
-        let stop = if later == Some(true) {
-            Stop::reached(
-                |h| h.turns_ran.load(Ordering::SeqCst) >= 2,
-                Duration::from_millis(300),
-            )
-        } else {
-            Stop::reached(
-                |h| h.turns_ran.load(Ordering::SeqCst) >= 3,
-                Duration::from_millis(50),
-            )
-        };
+        let stop = Stop::reached(
+            |h| h.turns_ran.load(Ordering::SeqCst) >= 3,
+            Duration::from_millis(50),
+        );
         let (r, _) = hosted_with_host(
             &mut m,
             &full,
@@ -7830,17 +7896,10 @@ fn the_record_is_read_at_every_point_a_turn_ran() {
         );
         m
     };
-    let m = run(Some(true));
-    assert_eq!(
-        count(&m, "@s-1 turn"),
-        1,
-        "one turn, then none: {:?}",
-        m.requests
-    );
-    assert_eq!(count(&m, "@s-1 send"), 0, "{:?}", m.requests);
-    // NEGATIVE CONTROL: still open at the second point.
-    let m = run(Some(false));
-    assert!(count(&m, "@s-1 turn") >= 2, "{:?}", m.requests);
+    for later in [Some(true), Some(false)] {
+        let m = run(later);
+        assert!(count(&m, "@s-1 turn") >= 2, "{later:?}: {:?}", m.requests);
+    }
 }
 
 /// A point read before the agent drew itself (its launch line at the shell prompt) is waited
@@ -11931,6 +11990,7 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     // World 1, the whole path: the row's two keys (`TakeRow`), the Enter, and the host's
     // `Claim` and `ReadLine`.
     let host = ResetHost::reading(ResetOutcome::Spent {
+        kind: aterm_phase::ResetKind::Weekly,
         asks: false,
         left: Some(1),
         cleared_at: TEST_NOW,
@@ -11981,10 +12041,10 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = early(&host);
     let ask = ResetAsk {
+        kind: aterm_phase::ResetKind::Weekly,
         left: 2,
         day: "Oct 5".to_string(),
         day_start: None,
-        kind: None,
     };
     assert!(m.call(&["text", "--json"]).expect("served").ok());
     assert!(
@@ -12287,18 +12347,24 @@ fn a_model_fallback_the_host_keeps_deferring_is_asked_again_and_nothing_is_typed
 
 /// The same deferred fallback at a bucket that names its reset: asked again until the
 /// reset, then the continuation goes first (the wall may have lifted) while the host still
-/// answers `wait:changed`.
+/// answers `wait:changed` — and the fallback is not asked past the reset ahead of it.
 #[test]
 fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_reset() {
     const FABLE: &str = include_str!(
         "../../../aterm-phase/src/fixtures/claude-2.1.283-wall-fable-goal-rate-limited-shell.txt"
     );
+    // The reset the bucket names, the fallback's back-off, and the run's tail past the
+    // continuation: the bound on the asks below is read off these three.
+    let reset = Duration::from_secs(1);
+    let backoff = Duration::from_millis(20);
+    let tail = Duration::from_millis(300);
+    let resets = format!("· resets in {}s", reset.as_secs());
     let named: Vec<String> = aterm_phase::prompt::fixtures::screen(FABLE)
         .into_iter()
         .map(|r| {
             r.replace(
                 "Run /usage-credits to continue or switch models with /model.",
-                "· resets in 4s",
+                &resets,
             )
         })
         .collect();
@@ -12317,12 +12383,9 @@ fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_rese
         &mut m,
         &opts,
         &host,
-        Stop::reached(
-            move |_| continued_on_usage(&watched),
-            Duration::from_millis(300),
-        ),
+        Stop::reached(move |_| continued_on_usage(&watched), tail),
         Some(TurnEndTiming {
-            restart_backoff: vec![Duration::from_millis(20)],
+            restart_backoff: vec![backoff],
             reset_grace: Duration::ZERO,
             reset_jitter: Duration::ZERO,
             limit_backoff: vec![Duration::from_secs(600)],
@@ -12335,6 +12398,15 @@ fn a_fallback_the_host_keeps_deferring_gives_way_to_the_continuation_at_the_rese
     let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
     let asked = host.restarted.lock().unwrap().len();
     assert!(asked >= 2, "asked again before the reset: {lines:#?}");
+    // On the run's clock: one ask a back-off until the reset, and the run's tail after the
+    // continuation. A fallback still asked past the reset, ahead of the continuation, runs
+    // far over.
+    let room = usize::try_from((reset + tail).as_millis() / backoff.as_millis()).unwrap() + 2;
+    assert!(
+        asked <= room,
+        "asked {asked} times, where the reset and the run's tail leave room for {room}: {:#?}",
+        &lines[..lines.len().min(40)]
+    );
     assert!(
         lines
             .iter()
@@ -13150,6 +13222,152 @@ fn the_autocompact_offer_steps_to_400k_before_its_enter_and_off_is_the_owners() 
         badge.starts_with("claude autocompact-offer: ")
             && badge.contains("autocompact_offer is off"),
         "{badge:?}"
+    );
+}
+
+/// A SERVED SIZE LIST OFF THE LADDER (Claude Code accepts any ascending list
+/// under 1M that holds its default): 500k → `left` → 450k → `left` → 400k →
+/// Enter, each step on a fresh read — the 450k dialog read and stepped past,
+/// not lost unread with the walk stalled (before: a ladder-only reader, no
+/// key, no word). Nothing asked of the owner.
+#[test]
+fn the_autocompact_offer_steps_through_a_served_size_off_the_ladder() {
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
+    };
+    // Each key is followed by the read that sees it land and the read that
+    // decides the next.
+    let mut m = fenced(vec![
+        autocompact_offer(true, "500k"),
+        autocompact_offer(true, "450k"),
+        autocompact_offer(true, "450k"),
+        autocompact_offer(true, "400k"),
+        autocompact_offer(true, "400k"),
+        autocompact_offer(true, "400k"),
+        idle_screen(),
+    ]);
+    m.human_seq = Some(0);
+    m.vanish_after = Some(0);
+    watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_autocompact_settle(Duration::ZERO);
+    });
+    let at = |size: &str| {
+        crate::supervise::policy::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
+    };
+    let presses = m.presses();
+    assert_eq!(presses.len(), 3, "{:?}", m.requests);
+    for (press, (size, key)) in
+        presses
+            .iter()
+            .zip([("500k", "left"), ("450k", "left"), ("400k", "enter")])
+    {
+        assert!(
+            press.ends_with(&format!("if={} {key}", at(size))),
+            "{press} at {size}: {presses:?}"
+        );
+    }
+    assert_eq!(m.attention, None, "nothing asked of the owner");
+}
+
+/// TWO OFFERS, AN IDLE READ BETWEEN (the first left unanswered mid-walk —
+/// a person's Esc, a restart): the second, drawn with the same title and
+/// keep row, is stepped afresh — `left` at 400k toward a 300k target, then
+/// Enter at 300k — never escalated as "the stepper did not move past it" on
+/// the key pressed on the first (before: the record outlived the offer).
+/// Nothing asked of the owner.
+#[test]
+fn a_later_autocompact_offer_is_stepped_afresh_after_an_idle_read() {
+    let mut cfg = crate::supervise::SupervisorConfig::default();
+    cfg.set("autocompact_offer", "300k").expect("a size");
+    cfg.set("continue", "false").expect("a switch");
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&cfg)
+    };
+    let mut m = fenced(vec![
+        autocompact_offer(true, "400k"),
+        idle_screen(),
+        idle_screen(),
+        autocompact_offer(true, "400k"),
+        autocompact_offer(true, "300k"),
+        autocompact_offer(true, "300k"),
+        autocompact_offer(true, "300k"),
+        idle_screen(),
+    ]);
+    m.human_seq = Some(0);
+    m.vanish_after = Some(0);
+    watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_autocompact_settle(Duration::ZERO);
+    });
+    let at = |size: &str| {
+        crate::supervise::policy::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
+    };
+    let presses = m.presses();
+    assert_eq!(presses.len(), 3, "{:?}", m.requests);
+    for (press, (size, key)) in
+        presses
+            .iter()
+            .zip([("400k", "left"), ("400k", "left"), ("300k", "enter")])
+    {
+        assert!(
+            press.ends_with(&format!("if={} {key}", at(size))),
+            "{press} at {size}: {presses:?}"
+        );
+    }
+    assert_eq!(
+        m.attention, None,
+        "nothing asked of the owner: {:?}",
+        m.requests
+    );
+}
+
+/// CONTROL for [`a_later_autocompact_offer_is_stepped_afresh_after_an_idle_read`]:
+/// a read with neither a box nor the composer (a frame torn mid-draw) is no
+/// sign the offer left — the record holds across it, so a list without the
+/// 400k target (500k `left` → 300k) is still not stepped back `right`: the
+/// offer is the owner's.
+#[test]
+fn a_torn_frame_between_stepper_keys_keeps_the_record() {
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
+    };
+    let torn = rows(&["⏺ Done.", "", " We recommend compacting earlier"]);
+    assert!(!aterm_phase::phase::has_composer_frame(&torn));
+    // The key's own read sees the box leave; the loop's next read is the
+    // torn frame again.
+    let mut m = fenced(vec![
+        autocompact_offer(true, "500k"),
+        torn.clone(),
+        torn,
+        autocompact_offer(true, "300k"),
+        autocompact_offer(true, "300k"),
+        autocompact_offer(true, "300k"),
+    ]);
+    m.human_seq = Some(0);
+    m.stall_sleep = Some(Duration::from_millis(50));
+    m.exit_when = Some(|m| {
+        m.presses().len() >= 2
+            || m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention owner=supervisor"))
+    });
+    watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_autocompact_settle(Duration::ZERO);
+    });
+    let presses = m.presses();
+    assert_eq!(presses.len(), 1, "{:?}", m.requests);
+    assert!(presses[0].ends_with(" left"), "{presses:?}");
+    let badge = m.attention.clone().unwrap_or_default();
+    assert!(
+        badge.starts_with("claude autocompact-offer: ")
+            && badge.contains("is not among the sizes this offer steps through"),
+        "{badge:?} {:?}",
+        m.requests
     );
 }
 

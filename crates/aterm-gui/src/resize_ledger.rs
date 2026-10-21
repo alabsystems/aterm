@@ -2826,7 +2826,9 @@ mod tests {
                 )
             });
             // The engine's debt in rows (`debt`), and the geometry the epoch that
-            // owes it began at (`eg`, 0 while nothing is owed).
+            // owes it began at (`eg`, 0 while nothing is owed). The rig never changes
+            // the width, so the column debt (`RenderDebt::cut`) is abstracted: the
+            // model has no term for it (see `resize_render_model`'s doc).
             let (shift, pushed) = self.term.render_debt().rows();
             let debt = i64::from(pushed) - i64::from(shift);
             let eg = if debt == 0 {

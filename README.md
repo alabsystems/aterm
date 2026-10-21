@@ -89,8 +89,9 @@ This is the same installer, served by alab.systems as of the latest release;
 whose architecture the release serves. It supports `aarch64-unknown-linux-gnu`
 and `x86_64-unknown-linux-gnu` when the release carries their signed
 executables (`aterm-<version>-linux-aarch64`, `aterm-<version>-linux-x86_64`),
-and says so when there is none for your architecture. It needs Python 3.11+, curl and
-OpenSSL with Ed25519 support. It verifies the signature chain and the
+and says so when there is none for your architecture. It needs curl, `timeout`,
+OpenSSL with Ed25519 support, and Python 3.11+ with `hashlib.file_digest` and
+`os.memfd_create`. It verifies the signature chain and the
 executable before running anything, then installs the binary under `~/.local`
 and enrolls it for signed updates:
 
@@ -171,7 +172,8 @@ terminal.
 The same binary answers the platform verbs (`ctl`, `pkg`, `fleet`, `drive`,
 `update`, `agents`, …), `help`, the diagnostic subcommands (`doctor`,
 `show-config`, …) and managed-tool dispatch; `aterm --help` lists them.
-`aterm-ctl`, `atpkg`, `abrew`, `aterm-fleet` and `aterm-drive` are symlinks onto it.
+`aterm-ctl`, `atpkg`, `abrew`, `aterm-fleet`, `aterm-drive` and `amacs` (aterm's
+editor, `aterm edit`) are symlinks onto it. <!-- From aterm_types::argv0::ALIASES. -->
 Window and headless modes serve the control socket by default
 (`--no-control-sock` turns it off) and fail closed when a secure socket cannot
 be created.
@@ -247,10 +249,11 @@ its own cat, and View ▸ Favourite This Kitty pins one.
   <img src="assets/aterm-rainbow-kitty.png" width="880" alt="Close-up from a real aterm frame: the rainbow kitty and its ribbon under a typed command">
 </p>
 
-- **Trails**: `rainbow kitty pet` (also `kitty`), `rainbow kitty flying`,
-  `rainbow dog pet`, `phaser`, `comet`, `lumen`, `sparkle`, `fire`, `laser`,
-  `water`, `beam`, `classic` or `off`. Settings ▸ Cursor & Motion picks the
-  typing sound.
+- **Trails**: `rainbow kitty pet` (also `rainbow kitty`, `kitty`),
+  `rainbow kitty underline`, `rainbow dog pet`, `rainbow kitty flying`,
+  `rainbow kitty flat`, `phaser`, `fire`, `water`, `laser` (shown as
+  Lightning), `comet`, `sparkle`, `lumen`, `beam`, `classic` or `off`.
+  Settings ▸ Cursor & Motion picks the typing sound.
 - **Sparkle Words** give typed words animated ink; TOML Toy Packs add your own.
   They are purely visual: copied text and logs read the exact bytes.
 - **Matrix rain** in empty cells (View ▸ Matrix Rain, `aterm ctl rain toggle`).
@@ -425,9 +428,11 @@ Bounded protocols and state machines are written once as Rust-derived models
 that generate both a checkable specification and an executable interpreter. An
 embedded exhaustive checker verifies their invariants, deadlock-freedom and
 transitions on every test run; the few function-valued models only `ty` can
-check say so. Where `ty` is installed the same obligations get a second,
-independent check, and `ay` re-checks the development line's SMT certificate
-bundles. A missing tool prints a "did not run" notice rather than passing.
+check end `NotRun` there, never a pass. The release checks (`verify spec`,
+`verify checkers`) give the same obligations a second, independent check under
+`ty`, and `ay` re-checks the development line's SMT certificate bundles; both
+fail closed without their tool, and a test whose tool is missing ends COULD
+NOT RUN naming what provides it, never a pass.
 Conformance tests project real subsystem state onto the models so the specs
 stay tied to shipping code; a model with no such tie is labelled as one.
 
@@ -438,6 +443,9 @@ verifying compiler" does not mean "verified". The public snapshot pins the same
 toolchain and carries the embedded checker, the conformance, property and fuzz
 tests and the CPU/GPU parity suites (the `ay` bundles stay internal). These
 prove or test named, bounded contracts, not the whole emulator, renderer or OS.
+Windows-only runtime tests (`windows_smoke`, the Windows half of the PowerShell
+key tests) run on no lane; `verify cells` type-checks them for both Windows
+targets and runs none of them.
 There is no hosted CI and no push gate: every release runs the release checks
 (`targo --unverified verify release`) before it claims a build number.
 [CONTRIBUTING.md](CONTRIBUTING.md) says what you can run here.
@@ -476,13 +484,17 @@ runs it once in the background so it refreshes your account's model list.
 
 On macOS aterm turns Universal Control off for this Mac by default;
 `[machine] universal_control = "leave"` in `aterm.toml` (Settings ▸ Security)
-stops that, and `aterm pkg machine` prints the line that turns it back on.
+stops that, and `aterm pkg machine` prints the line that turns it back on. Once
+a day that same pass also removes the Rust build-cache folders under
+`~/Library/Caches/aterm/cargo-build.noindex` that nothing builds into any more.
 
 On macOS, builds and tests can stall while macOS checks each new program aterm
 starts before its first run. `aterm doctor`'s `devtools:` row says whether that
 happens: adding aterm under System Settings ▸ Privacy & Security ▸ Developer
 Tools ends those checks. That choice is yours, since it also skips macOS's
-first-run malware scan for everything run in aterm.
+first-run malware scan for everything run in aterm. Bare `aterm doctor` brings
+you to that page when aterm is not on the list, and moves stale copies of aterm
+to the Trash; `aterm doctor --read-only` changes nothing.
 
 ## Community and license
 

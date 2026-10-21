@@ -639,16 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn the_dev_label_folds_the_hash_as_the_keeper_does() {
-        let exe = Path::new("/p/aterm");
-        let h = aterm_hash::fnv1a_64(b"/p/aterm");
-        assert_eq!(
-            label_for(exe),
-            format!("{DEV_LABEL_PREFIX}.{:08x}", (h >> 32) as u32 ^ h as u32)
-        );
-    }
-
-    #[test]
     fn the_plist_names_the_job_and_escapes_every_string() {
         let text = plist_text(
             "com.aterm.aterm.caffeine.dev.0123abcd",

@@ -313,6 +313,32 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     multiply_mix(s0, s1) ^ (len as u64)
 }
 
+/// [`FxHasher`] over `bytes` alone: `write(bytes)`, then `finish()`.
+///
+/// OUT OF LINE ON PURPOSE, for a caller hashing a large buffer at once (the
+/// running executable's content signature, `aterm-gui`'s `build_info`). An
+/// `#[inline]` hasher is compiled into its caller at the caller's opt-level, so
+/// a debug `aterm` hashed its 245 MB self at opt-level 0: about 0.7 s of one
+/// core on every instance's start, which every `aterm ctl` waits on through
+/// `version` (the first answered 0.66 s after connect; ~0.04 s optimized).
+/// Here the loop is this crate's code, which a debug build compiles optimized
+/// (the root `Cargo.toml`'s `[profile.dev.package.aterm-hash]`).
+///
+/// ```
+/// use std::hash::Hasher;
+/// use aterm_hash::{FxHasher, fx_hash_bytes};
+/// let mut h = FxHasher::default();
+/// h.write(b"the same bytes");
+/// assert_eq!(fx_hash_bytes(b"the same bytes"), h.finish());
+/// ```
+#[inline(never)]
+#[must_use]
+pub fn fx_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h = FxHasher::default();
+    h.write(bytes);
+    h.finish()
+}
+
 /// A zero-sized [`BuildHasher`] that produces [`FxHasher`]s.
 ///
 /// ```

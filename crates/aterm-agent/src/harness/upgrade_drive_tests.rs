@@ -37,6 +37,87 @@ const STATUS: &str = "OK schema=1 sid=0 subject=%E2%97%90%20Git%20commit%20and%2
     fabric_rtt_ms=- fabric_link_age_ms=- identity=- hand=- level=quiet story=0 seq=232803 \
     hash=7adef2d5e8547a9e";
 
+/// [`file_holders`] (the holder scan) names the holders `lsof -t` names, of a lock held through
+/// descriptors: this process and two children, one given the file through a symlink, asked by
+/// the file's path and by the link's (both follow it to the file); nobody once each lets go;
+/// neither reads a path that is not there.
+///
+/// The test runs ALONE, in a re-run of this binary: `lsof` and the scan each read every process
+/// at their own instant, and beside the other tests a sibling's child forked short of its exec
+/// holds every descriptor of this process, the lock's included (`disk_target_tests`'
+/// `Parked::fork` keeps one there on purpose), for one read and not the other. The landing
+/// check of 2026-10-20 caught it: the scan named 44480 beside this process and its two
+/// children, `lsof` did not.
+#[cfg(target_os = "macos")]
+#[test]
+fn file_holders_are_lsof_s() {
+    const NAME: &str = "harness::upgrade_drive::tests::file_holders_are_lsof_s";
+    const ALONE: &str = "ATERM_AGENT_FILE_HOLDERS_ALONE";
+    const DONE: &str = "ALONE holders compared";
+    if std::env::var_os(ALONE).is_none() {
+        let out = aterm_uds::deadline::output_until(
+            Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(ALONE, "1"),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .expect("the test, alone, within the hang detector");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(DONE),
+            "{:?}\nstdout: {stdout}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let dir = scratch("file-holders");
+    let lock = dir.join("writer.lock");
+    std::fs::write(&lock, b"").expect("write the lock");
+    let link = dir.join("link.lock");
+    std::os::unix::fs::symlink(&lock, &link).expect("link the lock");
+    let mine = std::fs::File::open(&lock).expect("open the lock");
+    let holder = |path: &std::path::Path| {
+        aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .stdin(std::fs::File::open(path).expect("open"))
+            .spawn()
+            .expect("spawn a holder")
+    };
+    let mut children = [holder(&lock), holder(&link)];
+    let mut held = vec![std::process::id(), children[0].id(), children[1].id()];
+    held.sort_unstable();
+    let sorted = |h: Option<Vec<u32>>| {
+        h.map(|mut h| {
+            h.sort_unstable();
+            h
+        })
+    };
+    let while_held = [
+        sorted(lsof_holders(&lock)),
+        sorted(file_holders(&lock)),
+        sorted(file_holders(&link)),
+    ];
+    for child in &mut children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop(mine);
+    let held = Some(held);
+    assert_eq!(while_held[0], held, "lsof, the oracle");
+    assert_eq!(while_held[1], held, "the scan, by the file's path");
+    assert_eq!(while_held[2], held, "the scan, by a link to it");
+    assert_eq!(
+        file_holders(&lock),
+        Some(Vec::new()),
+        "the scan, once let go"
+    );
+    let gone = dir.join("gone.lock");
+    assert_eq!(lsof_holders(&gone), None, "lsof, no such file");
+    assert_eq!(file_holders(&gone), None, "the scan, no such file");
+    println!("{DONE}");
+}
+
 #[cfg(unix)]
 #[test]
 fn an_unreadable_lock_census_never_says_the_lock_is_free() {
@@ -627,9 +708,9 @@ fn a_state_main_wrote_reads_with_the_owners_fields_at_their_defaults() {
 }
 
 /// `(pid, ppid, comm)` rows as [`table`] reads them, basenames already taken.
-fn ps_rows(rows: &[(u32, u32, &str)]) -> Vec<(u32, u32, String)> {
+fn ps_rows(rows: &[(u32, u32, &str)]) -> Vec<ProcRow> {
     rows.iter()
-        .map(|(p, pp, n)| (*p, *pp, (*n).to_string()))
+        .map(|(p, pp, n)| (*p, *pp, (*n).into()))
         .collect()
 }
 
@@ -648,7 +729,7 @@ fn the_agents_own_keep_awake_does_not_hold_the_restart() {
         ..Facts::default()
     };
     let asked = Phase::Announced { at_s: 100, asks: 1 };
-    let restart = |t: &[(u32, u32, String)]| {
+    let restart = |t: &[ProcRow]| {
         let mut found = background(4163, t);
         found.sort();
         let f = Facts {
@@ -750,7 +831,7 @@ fn an_unreadable_process_table_is_never_read_as_nothing_running() {
         background_or_unreadable(4163, &[]),
         vec![UNREADABLE_TABLE.to_string()]
     );
-    assert!(background_or_unreadable(4163, &[(1, 0, "launchd".to_string())]).is_empty());
+    assert!(background_or_unreadable(4163, &[(1, 0, "launchd".into())]).is_empty());
     // The live table is never empty: it holds this very process.
     assert!(!table().is_empty());
     assert!(!live_background(std::process::id()).contains(&UNREADABLE_TABLE.to_string()));
@@ -763,7 +844,7 @@ fn a_sweep_never_signals_its_own_ancestry() {
     if let Some((parent, _, _)) = ids(std::process::id()) {
         assert!(is_our_ancestor(parent, &t));
     }
-    let synthetic = vec![(10, 1, "a".to_string()), (11, 10, "b".to_string())];
+    let synthetic = vec![(10, 1, "a".into()), (11, 10, "b".into())];
     assert!(!is_our_ancestor(11, &synthetic));
 }
 
@@ -2011,7 +2092,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
         std::fs::create_dir_all(state_dir(&opts)).expect("state");
         std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("state file");
         let shell = dead_pid();
-        let table = vec![(shell, 1, "zsh".to_string())];
+        let table = vec![(shell, 1, "zsh".into())];
         let args = atpkg::caller_shell::process_args(b.id()).expect("B's argv");
         let visit_as = |opts: &Opts| {
             let files = session_files(&opts.home).expect("complete session scan");
@@ -2189,7 +2270,7 @@ fn a_gone_notices_row_promises_no_ask_to_a_holder_already_current() {
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("state file");
     let shell = dead_pid();
-    let table = vec![(shell, 1, "zsh".to_string())];
+    let table = vec![(shell, 1, "zsh".into())];
     let args = atpkg::caller_shell::process_args(b.id()).expect("B's argv");
     let visit_b = || {
         let files = session_files(&opts.home).expect("complete session scan");
@@ -2859,11 +2940,13 @@ fn the_roster_names_another_supervisors_tabs_and_the_off_ones_never_the_windows_
     assert_eq!(server.join().expect("server"), vec!["sessions"]);
     let (mut c, _) = fake_tab(vec!["ERR denied"]);
     assert_eq!(roster_aside(&mut c, &[]), None, "no roster");
-    // An instance that takes the request and never answers.
+    // An instance that takes the request and never answers: given up on at
+    // the bound (here 50 ms, not the product's two seconds).
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(roster_aside(&mut RelayClient::new(ours), &[]));
+        let wait = Duration::from_millis(50);
+        let _ = tx.send(roster_aside_within(&mut RelayClient::new(ours), &[], wait));
     });
     let given_up = rx.recv_timeout(Duration::from_secs(60));
     drop(theirs);
@@ -3203,9 +3286,10 @@ fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
         let sf = register(&opts.home, agent, SESSION);
         let got = visit(&opts, &sf, &table(), &newer(), &Live);
         let again = visit(&opts, &sf, &table(), &newer(), &Live);
-        let _ = Command::new("kill")
-            .args(["-9", &agent.to_string()])
-            .status();
+        let _ = aterm_uds::deadline::output_until(
+            Command::new("kill").args(["-9", &agent.to_string()]),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        );
         let _ = script.kill();
         let _ = script.wait();
         assert_eq!(got.step, "held-back:terminal:script", "{in_shell}: {got:?}");
@@ -3951,7 +4035,7 @@ fn stale_preliminary_roster_cannot_authorize_an_announcement() {
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
     let shell = dead_pid();
-    let table = vec![(shell, 1, "zsh".to_string())];
+    let table = vec![(shell, 1, "zsh".into())];
     let args = atpkg::caller_shell::process_args(a.id()).expect("agent argv");
     let run = || {
         visit_with_claim(
@@ -4607,7 +4691,7 @@ fn every_look_at_the_job_stands_between_a_ctrl_z_and_the_act() {
     // The shell: a pid no process holds now, so its name comes from the table
     // the sweep is handed.
     let shell = dead_pid();
-    let t = vec![(shell, 1, "zsh".to_string())];
+    let t = vec![(shell, 1, "zsh".into())];
     let now = now_s();
     let put = |phase: Phase| {
         let st = St {
@@ -4775,7 +4859,7 @@ fn an_agent_its_pane_runs_as_its_own_program_is_refused_before_the_announce_and_
     )
     .expect("transcript");
     let shell = dead_pid();
-    let t = vec![(shell, PTY_OWNER, "zsh".to_string())];
+    let t = vec![(shell, PTY_OWNER, "zsh".into())];
     let now = now_s();
     let put = |phase: Phase| {
         let st = St {
@@ -6302,7 +6386,7 @@ fn the_owners_now_probes_a_blind_build_again() {
         let r = visit(
             &h.opts,
             &h.sf,
-            &[(dead_pid(), 1, "zsh".to_string())],
+            &[(dead_pid(), 1, "zsh".into())],
             &targets,
             &Script::new(dead_pid(), usize::MAX, None),
         );
@@ -13369,9 +13453,10 @@ fn a_relaunch_of_a_task_done_under_land_is_carried_on_with_nothing() {
     assert!(!st.confirming(), "no model is owed: {st:?}");
     assert_eq!(st.relaunched_pid, pid, "adopted first: {st:?}");
     assert!(!owed(&opts), "owed no more");
-    assert_eq!(
-        st.outcome,
-        "claude restarted on 9.9.9 · nothing typed: under Land, its last reply said done"
+    assert!(
+        st.outcome
+            .starts_with("claude restarted on 9.9.9 · nothing typed"),
+        "{st:?}"
     );
     assert_eq!(typing(&asked), Vec::<String>::new(), "nothing typed");
     let rows: Vec<String> = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl"))
@@ -13617,6 +13702,22 @@ fn turn_by(model: &str, text: &str) -> String {
 fn user_row(text: &str) -> String {
     format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#)
 }
+
+/// Land's instruction as a [`user_row`], its words escaped for JSON.
+#[cfg(unix)]
+fn land_row() -> String {
+    let json = aterm_json::to_string(&aterm_json::Value::from(
+        crate::supervise::policy::turn_end::land_text(None),
+    ))
+    .expect("json");
+    user_row(&json[1..json.len() - 1])
+}
+
+/// A clean defense, escaped for [`turn_by`]: what lands a task answering
+/// Land's instruction ([`land_row`]; FOREVER LAND).
+#[cfg(unix)]
+const LANDED_JSON: &str =
+    "Landed and verified.\\nNothing left: it is merged into the remote main branch.";
 
 /// [`user_row`], recorded `at` (Claude Code's `timestamp`).
 #[cfg(unix)]
@@ -14392,6 +14493,11 @@ fn a_move_onto_a_build_that_fails_only_at_a_real_start_is_taken_back_onto_the_bu
         h.opts.hand_back = true;
         // The waits end on what they wait for: the bound only stops a hang.
         h.opts.timings.held = HANG_DETECTOR;
+        // Whether a line ends is the script's count of lines typed, never the clock's
+        // (`EachLineEnds`): the shell is looked at every 10 ms and its hold read over 20 ms,
+        // not the 300 ms a real shell is given.
+        h.opts.timings.shell_look = Duration::from_millis(10);
+        h.opts.timings.ended_at_once = Duration::from_millis(20);
         transcript_says(&h, &format!("Saved; nothing is running.\\n{marker}"));
         let announced = St {
             seq_since_s: now_s() - 3_600,
@@ -14424,7 +14530,7 @@ fn a_move_onto_a_build_that_fails_only_at_a_real_start_is_taken_back_onto_the_bu
         let r = visit(
             &h.opts,
             &h.sf,
-            &[(shell.id(), 1, "zsh".to_string())],
+            &[(shell.id(), 1, "zsh".into())],
             &newer(),
             &k,
         );
@@ -14653,7 +14759,7 @@ fn a_restart_records_the_model_its_ready_answer_ran_and_where_that_read_ended() 
         + "\n";
     std::fs::write(&path, &body).expect("transcript");
     let shell = dead_pid();
-    let t = vec![(shell, 1, "zsh".to_string())];
+    let t = vec![(shell, 1, "zsh".into())];
     let now = now_s();
     let st = St {
         phase: Phase::Announced {
@@ -15096,7 +15202,7 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             home: None,
             homedir,
         };
-        crate::harness::relaunch::plan(opts, &launch, 999_999, &[(999_999, 1, "zsh".to_string())])
+        crate::harness::relaunch::plan(opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
             .unwrap_or_else(|_| panic!("a plan"))
             .line
     };
@@ -15158,7 +15264,7 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             home: None,
             homedir: None,
         };
-        crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".to_string())])
+        crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
             .unwrap_or_else(|_| panic!("a plan"))
             .line
     };
@@ -15273,7 +15379,7 @@ fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
             home: None,
             homedir: None,
         };
-        crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".to_string())])
+        crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
             .unwrap_or_else(|_| panic!("a plan"))
             .line
     };
@@ -16149,8 +16255,8 @@ impl Parked {
     }
 
     /// [`Self::visit_under`], the process table holding `more` too.
-    fn visit_with(&self, shell: u32, more: &[(u32, u32, String)]) -> Report {
-        let mut table = vec![(shell, 1, "zsh".to_string())];
+    fn visit_with(&self, shell: u32, more: &[ProcRow]) -> Report {
+        let mut table = vec![(shell, 1, "zsh".into())];
         table.extend(more.iter().cloned());
         visit(
             &self.opts,
@@ -16247,11 +16353,14 @@ fn zsh_executable() -> &'static Path {
         }
         std::fs::create_dir_all(&dir).expect("the stand-in's folder");
         let laying = dir.join(format!("zsh.{}", std::process::id()));
-        let copied = aterm_uds::spawnfd::command("cp")
-            .arg("/bin/sh")
-            .arg(&laying)
-            .status()
-            .expect("run cp");
+        let copied = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command("cp")
+                .arg("/bin/sh")
+                .arg(&laying),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_or_else(|e| panic!("cp within the hang detector: {e}"))
+        .status;
         assert!(copied.success(), "copy /bin/sh to {laying:?}: {copied}");
         std::fs::rename(&laying, &zsh).expect("lay the stand-in");
         zsh
@@ -16349,9 +16458,12 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
         // An unset Claude home is the process's own `HOME`'s: a stand-in's is
         // the sweep's user home unless a test names one.
         .env_remove("HOME")
+        // The terminal on stdin alone, as `TIOCSCTTY` needs: libtest's banner
+        // left unread on the slave would hold the stand-in's exit in the
+        // kernel's close-time drain (0.6 s on macOS) for every kill and reap.
         .stdin(tty(&slave))
-        .stdout(tty(&slave))
-        .stderr(tty(&slave));
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     for (key, value) in env {
         agent.env(key, value);
     }
@@ -17508,10 +17620,14 @@ fn the_wait_log_keeps_each_change_of_wait_with_the_facts_that_decided_it() {
 }
 
 /// The product's 300 ms probe deadline covers a child that keeps running
-/// and one that exits while its finite child holds stdout. The sleeps end
-/// by themselves even if the test unwinds; only the probe owns a signalable
-/// Child. Read-only retirement checks name only PIDs these scripts recorded,
-/// with a one-minute hang detector. Positive and silent probes run once each.
+/// and one that exits while its finite child holds stdout. The sleeps outlast
+/// the retirement check's one-minute hang detector
+/// ([`aterm_spec::wait::PARKED_SECS`]), so only the probe's group kill retires
+/// them inside it (a `sleep 2` retired itself, and a probe that killed only
+/// its direct child passed), and they still end by themselves if the test
+/// unwinds; only the probe owns a signalable Child. Read-only retirement checks
+/// name only PIDs these scripts recorded. Positive and silent probes run once
+/// each.
 #[cfg(unix)]
 #[test]
 fn a_version_probe_is_bounded_whole() {
@@ -17529,13 +17645,18 @@ fn a_version_probe_is_bounded_whole() {
     };
     // No warm-up exec and no global process census. Both descendants are
     // finite even if a probe or an assertion fails before normal cleanup.
+    let parked = aterm_spec::wait::PARKED_SECS;
     let hang = script(
         "hang",
-        "printf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sleep 2 &\nprintf '%s\n' \"$!\" > \"$0.child\"\nwait",
+        &format!(
+            "printf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sleep {parked} &\nprintf '%s\n' \"$!\" > \"$0.child\"\nwait"
+        ),
     );
     let lingers = script(
         "lingers",
-        "printf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sleep 2 &\nprintf '%s\n' \"$!\" > \"$0.child\"\nprintf '%s\n' '2.1.282 (Claude Code)'\nexit 0",
+        &format!(
+            "printf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sleep {parked} &\nprintf '%s\n' \"$!\" > \"$0.child\"\nprintf '%s\n' '2.1.282 (Claude Code)'\nexit 0"
+        ),
     );
     let results = [&hang, &lingers].map(|exe| version_within(exe, Duration::from_millis(300)));
     let mut observed = Vec::new();
@@ -18624,6 +18745,103 @@ fn typeahead_before_the_first_read_is_never_the_mark() {
     assert!(mark.is_some());
 }
 
+/// A WIDE PROMPT GLYPH IS TWO CELLS TO THE PROMPT READ: the cursor's column
+/// (`text --json`'s `cursor.col`) and the shell's input start (`cmdcol`) count
+/// cells, while a row's text holds one char per glyph drawn (a wide glyph's
+/// second cell is no char). Read by char count, the cursor after `🦀 % x` sat
+/// past the row's end, the text left of it ended in a blank, and the relaunch
+/// line was pasted onto the person's `x`. No integration: `x` after `🦀 % `
+/// and `ls` after `~/文档 % ` wait `typing`. The shell's mark at the input's
+/// start: a caret moved home onto `x` waits `typing`, at the first read and at
+/// a read after the bare prompt was marked. POSITIVE CONTROL: the clean wide
+/// prompt, marked by the shell or not, and one with a right prompt near the
+/// cursor, is typed at.
+#[cfg(unix)]
+#[test]
+fn a_wide_prompt_glyph_never_hides_a_persons_typing() {
+    let settled = "OK 0 id=2 submitted=1 status=settled";
+    let entering = r#"OK {"blocks":[{"id":3,"state":"entering","exit":null,"prompt":10,"cmd":10,"cmdcol":5,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
+    // One attempt: the screen (and the one every read after the first
+    // answers), and the `line 10` reply where the shell marked its input.
+    let attempt = |name: &str, screens: (String, Option<String>), marked: Option<&'static str>| {
+        let (blocks, line) = marked.map_or(("ERR unscripted", "ERR unscripted"), |l| (entering, l));
+        let mut mark = None;
+        let (got, typed) = relaunch_attempt(
+            name,
+            Answers {
+                screen: screens.0,
+                after: screens.1.map(|s| (1, s)),
+                help: FENCED_HELP,
+                turn: vec![settled],
+                blocks,
+                line,
+                ..Answers::default()
+            },
+            &mut mark,
+            |_, _, _| true,
+        );
+        (got, typed.len(), mark.map(|m| (m.col, m.left)))
+    };
+    let typing = (Err(RelaunchLineError::Wait("typing")), 0, None);
+    for (name, row, col) in [("wide-emoji", "🦀 % x", 6), ("wide-cjk", "~/文档 % ls", 11)] {
+        let screen = prompt_screen(row, col, 77);
+        assert_eq!(attempt(name, (screen, None), None), typing, "{name}");
+    }
+    let home = prompt_screen("🦀 % x", 5, 77);
+    assert_eq!(
+        attempt("wide-home", (home, None), Some("OK 🦀 % x")),
+        typing,
+        "a caret home onto `x`"
+    );
+    let (got, typed, _) = attempt(
+        "wide-home-after-mark",
+        (
+            prompt_screen("🦀 %", 5, 77),
+            Some(prompt_screen("🦀 % x", 5, 78)),
+        ),
+        Some("OK 🦀 %"),
+    );
+    assert_eq!(
+        (got, typed),
+        (Err(RelaunchLineError::Wait("typing")), 0),
+        "`x` typed under the caret after the bare prompt's mark"
+    );
+    // A right prompt past wide glyphs: `x` typed under the caret after the
+    // mark, in the gap the mark saw blank. The gap ends at the right prompt's
+    // grid column (11); read as a char index (9), the `x` at cell 9 lay past it.
+    let (got, typed, _) = attempt(
+        "wide-right-home-after-mark",
+        (
+            prompt_screen("🦀🦀🦀 %   ok", 9, 77),
+            Some(prompt_screen("🦀🦀🦀 % x ok", 9, 78)),
+        ),
+        None,
+    );
+    assert_eq!(
+        (got, typed),
+        (Err(RelaunchLineError::Wait("typing")), 0),
+        "`x` typed under the caret before a right prompt"
+    );
+    // POSITIVE CONTROL: the clean wide prompt, marked by the shell or not;
+    // one whose right prompt begins fewer cells past the cursor (two) than
+    // wide glyphs stand left of it (three: by char count, its first letter
+    // ended the text left of the cursor, and the clean prompt read as
+    // typing); and a prompt whose last blank holds a ZWSP, which the grid
+    // stores in that cell and draws in none.
+    for (marked, row, col, left) in [
+        (None, "🦀 %", 5, "🦀 %"),
+        (Some("OK 🦀 %"), "🦀 %", 5, "🦀 %"),
+        (None, "🦀🦀🦀 %   ok", 9, "🦀🦀🦀 % "),
+        (None, "% \u{200B}", 2, "% \u{200B}"),
+    ] {
+        assert_eq!(
+            attempt("wide-clean", (prompt_screen(row, col, 77), None), marked),
+            (Ok(()), 1, Some((col, left.to_string()))),
+            "{row:?} {marked:?}"
+        );
+    }
+}
+
 /// A LINE A HAND HELD IS NEVER TYPED INTO A SHELL A PERSON USED MEANWHILE
 /// (the review of LC-7 of the 2026-10-15 sweep). A restart's line waits out
 /// a hold for as long as it stands, with no mark taken (the hand is asked
@@ -19129,7 +19347,7 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
     let shell = dead_pid();
-    let table = vec![(shell, 1, "zsh".to_string())];
+    let table = vec![(shell, 1, "zsh".into())];
     let run = || {
         visit(
             &opts,
@@ -19225,7 +19443,7 @@ fn the_real_look_climbs_the_ladder_on_claude_code() {
         std::fs::create_dir_all(state_dir(&opts)).expect("state");
         std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
         let shell = dead_pid();
-        let table = vec![(shell, 1, "zsh".to_string())];
+        let table = vec![(shell, 1, "zsh".into())];
         let mut steps = Vec::new();
         for n in 0..looks {
             if n > 0 {
@@ -19333,7 +19551,7 @@ fn the_owners_word_waives_nothing_in_a_tab_it_did_not_name() {
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     let shell = dead_pid();
-    let table = vec![(shell, 1, "zsh".to_string())];
+    let table = vec![(shell, 1, "zsh".into())];
     let run = |named: &str| {
         std::fs::write(state_path(&opts, SESSION), settling(named).to_json()).expect("write");
         visit(
@@ -21023,10 +21241,10 @@ fn own_record(h: &Parked) {
 /// The process table's rows for two shells under `h`'s agent that never end
 /// (a widowed `tail -f … | grep -m1 …`, its `grep` long gone).
 #[cfg(unix)]
-fn shells_under(h: &Parked) -> Vec<(u32, u32, String)> {
+fn shells_under(h: &Parked) -> Vec<ProcRow> {
     vec![
-        (999_901, h.sf.pid, "zsh".to_string()),
-        (999_902, h.sf.pid, "zsh".to_string()),
+        (999_901, h.sf.pid, "zsh".into()),
+        (999_902, h.sf.pid, "zsh".into()),
     ]
 }
 
@@ -21916,7 +22134,7 @@ fn visit_launched_probed<K: Kernel>(
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
     seed(&opts);
-    let table = vec![(kernel.shell, 1, "zsh".to_string())];
+    let table = vec![(kernel.shell, 1, "zsh".into())];
     let files = session_files(&opts.home);
     let mut args = atpkg::caller_shell::process_args(agent.id()).expect("agent argv");
     args.argv.extend(launch.iter().map(|w| (*w).to_string()));
@@ -22064,7 +22282,7 @@ fn a_restart_never_resumes_a_conversation_whose_transcript_went_after_its_step()
             .join(format!(".claude/projects/p/{SESSION}.jsonl"));
         let ended = h.reaped();
         let mut shell = tty_zsh();
-        let table = vec![(shell.id(), 1, "zsh".to_string())];
+        let table = vec![(shell.id(), 1, "zsh".into())];
         // The visit's first job read is the step's; the second, after it.
         let kernel = Racing {
             script: Script::new(shell.id(), usize::MAX, None),
@@ -22617,7 +22835,11 @@ fn a_pending_round_that_owes_its_agent_a_release_is_carried_on_not_quiet() {
 #[test]
 fn what_the_tabs_own_supervisor_typed_is_no_task() {
     let shell = dead_pid();
-    let cfg = crate::supervise::SupervisorConfig::default();
+    // The owner's own continuation words (the default's carry the mark).
+    let cfg = crate::supervise::SupervisorConfig {
+        continue_text: "keep going".to_string(),
+        ..crate::supervise::SupervisorConfig::default()
+    };
     let rows = vec![
         harness_row("Claude Code 2.1.283 (managed) is installed"),
         turn_by("claude-haiku-4-5", "I cannot stop now."),
@@ -22655,7 +22877,11 @@ fn what_the_tabs_own_supervisor_typed_is_no_task() {
 #[test]
 fn the_loops_words_in_another_conversation_are_no_turn_of_this_one() {
     let shell = dead_pid();
-    let cfg = crate::supervise::SupervisorConfig::default();
+    // The owner's own continuation words (the default's carry the mark).
+    let cfg = crate::supervise::SupervisorConfig {
+        continue_text: "keep going".to_string(),
+        ..crate::supervise::SupervisorConfig::default()
+    };
     // The ledger's rows are written at 1970 + 1 s ([`visit_launched`]).
     let rows = vec![
         user_row_at(&cfg.continue_text, "2026-09-30T12:00:00.000Z"),
@@ -23194,7 +23420,7 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
             &mut c,
             TAB,
             &h.sf,
-            &[(shell, 1, "zsh".to_string())],
+            &[(shell, 1, "zsh".into())],
             &kernel,
             &how,
         );
@@ -23363,7 +23589,7 @@ fn a_refused_signal_takes_back_the_model_it_asked() {
         &opts,
         &sf,
         files.as_deref(),
-        &[(shell, 1, "zsh".to_string())],
+        &[(shell, 1, "zsh".into())],
         &newer(),
         &Script::new(shell, usize::MAX, None),
         Some(&args),
@@ -23752,10 +23978,8 @@ fn a_cold_restored_tab_reads_its_earlier_tabs_loop_turns_as_the_harnesss() {
         * 1000;
     let rows = vec![
         user_row("Fix the lexer and land it."),
-        turn_by(
-            "claude-opus-5-5",
-            "Landed and verified.\\n\\nATERM-TASK-DONE",
-        ),
+        land_row(),
+        turn_by("claude-opus-5-5", LANDED_JSON),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -23811,10 +24035,8 @@ fn a_cold_restores_note_of_its_earlier_tab_is_read_with_no_record() {
         * 1000;
     let rows = vec![
         user_row("Fix the lexer and land it."),
-        turn_by(
-            "claude-opus-5-5",
-            "Landed and verified.\\n\\nATERM-TASK-DONE",
-        ),
+        land_row(),
+        turn_by("claude-opus-5-5", LANDED_JSON),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -23876,10 +24098,8 @@ fn an_older_restores_tab_is_linked_to_its_earlier_tab_by_the_upgrade_ledger() {
     let t_ms = i64::try_from(t_s).expect("seconds") * 1000;
     let rows = vec![
         user_row("Fix the lexer and land it."),
-        turn_by(
-            "claude-opus-5-5",
-            "Landed and verified.\\n\\nATERM-TASK-DONE",
-        ),
+        land_row(),
+        turn_by("claude-opus-5-5", LANDED_JSON),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -24105,10 +24325,11 @@ fn a_moved_agents_finish_is_read_where_it_wrote_it_after_its_process_is_gone() {
         std::fs::create_dir_all(&project).expect("the worktree's project");
         std::fs::write(
             project.join(format!("{SESSION}.jsonl")),
-            at(
-                turn_by(M, "Landed and verified.\\n\\nATERM-TASK-DONE"),
-                finished_at,
-            ) + "\n",
+            at(land_row(), finished_at)
+                + "
+" + &at(turn_by(M, LANDED_JSON), finished_at)
+                + "
+",
         )
         .expect("the worktree's transcript");
         let snap = users_agent(SESSION);
@@ -24196,10 +24417,11 @@ fn a_moved_agents_finish_is_found_by_its_relaunch_when_the_host_never_noted_it()
         std::fs::create_dir_all(&project).expect("the worktree's project");
         std::fs::write(
             project.join(format!("{SESSION}.jsonl")),
-            at(
-                turn_by(M, "Landed and verified.\\n\\nATERM-TASK-DONE"),
-                finished_at,
-            ) + "\n",
+            at(land_row(), finished_at)
+                + "
+" + &at(turn_by(M, LANDED_JSON), finished_at)
+                + "
+",
         )
         .expect("the worktree's transcript");
         let snap = Snapshot {
@@ -24257,10 +24479,8 @@ fn an_earlier_tabs_loop_turns_count_only_until_the_conversation_left_it() {
     let t_ms = i64::try_from(t_s).expect("seconds") * 1000;
     let rows = vec![
         user_row("Fix the lexer and land it."),
-        turn_by(
-            "claude-opus-5-5",
-            "Landed and verified.\\n\\nATERM-TASK-DONE",
-        ),
+        land_row(),
+        turn_by("claude-opus-5-5", LANDED_JSON),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -24331,10 +24551,8 @@ fn an_earlier_tabs_loop_turns_count_only_until_the_conversation_left_it() {
 fn finished_rows() -> Vec<String> {
     vec![
         user_row("Fix the lexer and land it."),
-        turn_by(
-            "claude-opus-5-5",
-            "Landed and verified.\\n\\nATERM-TASK-DONE",
-        ),
+        land_row(),
+        turn_by("claude-opus-5-5", LANDED_JSON),
         own_row(
             "task-notification",
             false,
@@ -24546,6 +24764,30 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
         assert!(typed[0].contains(DONE_CHECK), "{what}: {typed:?}");
         assert!(!typed[0].contains(upgrade::CARRY_ON), "{what}: {typed:?}");
     }
+    // THE CRUISE PROMPT ANSWERED WITH A DONE CLAIM (FOREVER CRUISE: done is
+    // never the end) — an idle report, the defense itself — is asked it
+    // again.
+    for (what, answer) in [
+        (
+            "an idle report",
+            "No lander is running, so I'm not re-arming that watch. All queued work has landed.",
+        ),
+        ("the defense", LANDED_JSON),
+    ] {
+        let rows: Vec<String> = done
+            .iter()
+            .cloned()
+            .chain([user_row(DONE_CHECK), turn_by("claude-opus-5-5", answer)])
+            .collect();
+        let rig = Rig::new(&format!("carry-claimed-{}", what.len()), &rows);
+        let mut st = rig.st.clone();
+        st.cause = CAUSE_HOST.to_string();
+        let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+        assert_eq!(r.step, "continued:check", "{what}: {r:?}");
+        let typed = rig.typed();
+        assert_eq!(typed.len(), 1, "{what}: {typed:?}");
+        assert!(typed[0].contains(DONE_CHECK), "{what}: {typed:?}");
+    }
     // A DONE REPORT THAT NAMES AN IRREVERSIBLE ACT (the review's RR4-RL-3):
     // the check says to approve nothing irreversible, as the policy's does
     // (`done_check_text`); the plain report's check does not.
@@ -24625,15 +24867,14 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
                 .collect(),
         ),
         (
-            "the done check answered with an idle report",
+            "the Cruise prompt answered with work going on",
             done.iter()
                 .cloned()
                 .chain([
                     user_row(DONE_CHECK),
                     turn_by(
                         "claude-opus-5-5",
-                        "No lander is running, so I'm not re-arming that watch. All queued work \
-                         has landed.",
+                        "Ran the suite again: two tests fail. Fixing them now.",
                     ),
                 ])
                 .collect(),
@@ -24700,8 +24941,18 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
 /// (someone's words), and an idle report answering LAND, get the check, as
 /// before — never the continuation.
 #[cfg(unix)]
+/// A RELAUNCH INTO A TASK LAND'S ACT LANDED TYPES NOTHING (the merge
+/// review's M5-R1 and XM-LAND-RECORD; FOREVER LAND): the turn-end policy
+/// lands the task on the clean defense answering [`LAND`], and on the one
+/// answering the retry of a wall that cut its turn; the record
+/// (`FinishedScan`) reads both the same, so the carry-on is
+/// `done:finished`, nothing typed. NEGATIVE CONTROLS: the same retry with no
+/// ledger row (someone's words), an idle report answering LAND, and the
+/// Cruise prompt's retry answered with the defense (a claim: Cruise never
+/// ends) get the Cruise prompt — never the continuation.
+#[cfg(unix)]
 #[test]
-fn a_relaunch_into_a_task_a_land_act_or_a_cut_checks_retry_ended_types_nothing() {
+fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
     use crate::supervise::policy::turn_end::{DONE_CHECK, LAND, RULE_API_RETRY, wall_retry_text};
     let at = "2026-10-15T10:00:00.000Z";
     let t_ms = i64::try_from(super::super::upgrade_models::parse_utc(at).expect("a time"))
@@ -24725,17 +24976,19 @@ fn a_relaunch_into_a_task_a_land_act_or_a_cut_checks_retry_ended_types_nothing()
         .chain(more.iter().cloned())
         .collect::<Vec<_>>()
     };
-    let done = turn_by("claude-opus-5-5", "All done. Nothing left to do.");
+    let done = turn_by("claude-opus-5-5", LANDED_JSON);
     let idle = turn_by(
         "claude-opus-5-5",
         "No lander is running, so I'm not re-arming that watch.",
     );
-    let cut = asked(&[
-        user_row(DONE_CHECK),
-        wall,
-        user_row_at(&retry, at),
-        done.clone(),
-    ]);
+    let cut = |act: &str| {
+        asked(&[
+            user_row(act),
+            wall.clone(),
+            user_row_at(&retry, at),
+            done.clone(),
+        ])
+    };
     let case = |name: &str, rows: &[String], ledgered: bool| {
         let mut rig = Rig::new(name, rows);
         let root = rig.dir.join("aterm-state");
@@ -24749,18 +25002,18 @@ fn a_relaunch_into_a_task_a_land_act_or_a_cut_checks_retry_ended_types_nothing()
         (r.step, rig.typed().len())
     };
     assert_eq!(
-        case("land-done", &asked(&[user_row(LAND), done]), false),
+        case("land-done", &asked(&[user_row(LAND), done.clone()]), false),
         ("done:finished".to_string(), 0),
-        "LAND answered done"
+        "LAND answered with the clean defense"
     );
     assert_eq!(
-        case("cut-check-retried", &cut, true),
+        case("cut-land-retried", &cut(LAND), true),
         ("done:finished".to_string(), 0),
-        "the cut check's retry answered done"
+        "the cut LAND's retry answered with the clean defense"
     );
-    // NEGATIVE CONTROLS: the check, never the continuation.
+    // NEGATIVE CONTROLS: the Cruise prompt, never the continuation.
     assert_eq!(
-        case("cut-check-unledgered", &cut, false),
+        case("cut-land-unledgered", &cut(LAND), false),
         ("continued:check".to_string(), 1),
         "no ledger: the retry is someone's words"
     );
@@ -24768,6 +25021,11 @@ fn a_relaunch_into_a_task_a_land_act_or_a_cut_checks_retry_ended_types_nothing()
         case("land-idle", &asked(&[user_row(LAND), idle]), false),
         ("continued:check".to_string(), 1),
         "an idle report answering LAND"
+    );
+    assert_eq!(
+        case("cut-check-retried", &cut(DONE_CHECK), true),
+        ("continued:check".to_string(), 1),
+        "the Cruise prompt's retry answered with the defense"
     );
 }
 
@@ -25793,74 +26051,6 @@ fn a_restored_tabs_loop_reads_the_exchange_its_earlier_tab_left() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE DONE CHECK'S CLOSED ANSWER, AS THE LOOP'S FINISHED READ LEFT IT
-/// ([`Finished::check_answer`], the review's RR4-TE-1): the check answered
-/// with a tool's words quoted in code says `Some(false)` once a
-/// `turn_duration` closes its turn, and nothing before (the record lags the
-/// screen). NEGATIVE CONTROLS: a done word of the worker's own says
-/// `Some(true)`; a person's prompt after the check says nothing (no check
-/// runs); a transcript gone since the last read says nothing.
-#[cfg(unix)]
-#[test]
-fn the_done_checks_closed_answer_is_read_from_the_finished_memo() {
-    use crate::supervise::policy::turn_end::DONE_CHECK;
-    let dir = scratch("finished-check-answer");
-    let claude = dir.join(".claude");
-    let project = claude.join("projects/p");
-    std::fs::create_dir_all(&project).expect("project");
-    let path = project.join(format!("{SESSION}.jsonl"));
-    let closed = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":4000,"messageCount":4,"isMeta":false}"#;
-    let append = |rows: &[&str]| {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("append");
-        for row in rows {
-            writeln!(f, "{row}").expect("row");
-        }
-    };
-    let checked = |answer: &str| {
-        [
-            user_row("Fix the lexer and land it."),
-            turn_by("claude-opus-5-5", "All done."),
-            user_row(DONE_CHECK),
-            turn_by("claude-opus-5-5", answer),
-        ]
-    };
-    let quoted = checked("Stage 2 is up: `Build completed successfully in 0:59:34`. Push running.");
-    append(&quoted.iter().map(String::as_str).collect::<Vec<_>>());
-    let mut memo = Finished::default();
-    assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(false));
-    assert_eq!(memo.check_answer(), None, "not closed yet");
-    append(&[closed]);
-    assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(false));
-    assert_eq!(
-        memo.check_answer(),
-        Some(false),
-        "closed: the code is no done word"
-    );
-    // NEGATIVE CONTROLS.
-    append(&[&user_row("Now add the flag.")]);
-    assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(false));
-    assert_eq!(
-        memo.check_answer(),
-        None,
-        "a person's prompt: no check runs"
-    );
-    std::fs::remove_file(&path).expect("rm");
-    let done = checked("All done: `targo test` passes on main.");
-    append(&done.iter().map(String::as_str).collect::<Vec<_>>());
-    append(&[closed]);
-    let mut memo = Finished::default();
-    assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(true));
-    assert_eq!(memo.check_answer(), Some(true), "the worker's own word");
-    std::fs::remove_file(&path).expect("rm");
-    assert_eq!(memo.of_in(&claude, SESSION, &[]), None);
-    assert_eq!(memo.check_answer(), None, "a transcript gone says nothing");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A FINISHED TASK'S RECORD IS READ ON FROM WHERE THE LAST READ ENDED
 /// ([`Finished`]): the token folded at one read stays folded however much
 /// Claude Code's own wakes write after it — 300 KiB of them, past a fresh
@@ -25888,7 +26078,7 @@ fn a_finished_task_is_read_on_from_where_the_last_read_ended() {
             writeln!(f, "{row}").expect("row");
         }
     };
-    write(&finished_rows()[..2]);
+    write(&finished_rows()[..3]);
     let mut memo = Finished::default();
     assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(true));
     // Claude Code's own wakes, past a fresh read's tail.
@@ -25925,7 +26115,7 @@ fn a_finished_task_is_read_on_from_where_the_last_read_ended() {
     // Someone asks: open. The worker ends it again: finished.
     append(&[user_row("Now add the flag.")]);
     assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(false));
-    append(&[turn_by("claude-opus-5-5", "Added.\\n\\nATERM-TASK-DONE")]);
+    append(&[land_row(), turn_by("claude-opus-5-5", LANDED_JSON)]);
     assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(true));
     // A fresh first read longer than the tail starts on a line's start and
     // reads the token at the end.
@@ -25949,7 +26139,7 @@ fn a_finished_task_is_read_on_from_where_the_last_read_ended() {
 fn a_new_loops_first_read_reaches_a_token_behind_long_wakes() {
     let dir = scratch("finished-new-loop");
     let pad = "x".repeat(1000);
-    let mut rows = finished_rows()[..2].to_vec();
+    let mut rows = finished_rows()[..3].to_vec();
     rows.extend((0..300).flat_map(|_| {
         [
             own_row(
@@ -26009,7 +26199,7 @@ fn a_token_behind_more_wakes_than_a_restarts_read_ends_the_task() {
         })
         .collect();
     let then = |head: &[String]| -> Vec<String> { head.iter().chain(&wakes).cloned().collect() };
-    let finished = then(&finished_rows()[..2]);
+    let finished = then(&finished_rows()[..3]);
     assert!(finished.iter().map(String::len).sum::<usize>() as u64 > FINISHED_ONCE_BYTES + 100_000);
     let rig = Rig::new("carry-finished-behind-more-wakes", &finished);
     assert!(
@@ -26022,7 +26212,7 @@ fn a_token_behind_more_wakes_than_a_restarts_read_ends_the_task() {
     assert_eq!(r.step, "done:finished", "{r:?}");
     assert!(rig.typed().is_empty(), "{:?}", rig.typed());
     drop(rig);
-    let mut reopened = finished_rows()[..2].to_vec();
+    let mut reopened = finished_rows()[..3].to_vec();
     reopened.extend([
         user_row("Now add the flag."),
         turn_by("claude-opus-5-5", "Started on the flag."),
@@ -26260,7 +26450,7 @@ fn a_token_behind_long_wakes_is_moved_quietly_under_upgrade_ask() {
     for (name, head, announced) in [
         (
             "ask-finished-behind-wakes",
-            finished_rows()[..2].to_vec(),
+            finished_rows()[..3].to_vec(),
             false,
         ),
         ("ask-open-behind-wakes", open, true),
@@ -26322,7 +26512,7 @@ fn the_looks_memo_reads_on_and_a_carry_ons_readers_share_one_read() {
         Some(true),
         "the first look"
     );
-    rewrite("ATERM-TASK-DONE", "xxxxxxxxxxxxxxx");
+    rewrite("Nothing left:", "Nothing more ");
     assert_eq!(
         records.finished_in(&memos, SESSION, &[]),
         Some(true),
@@ -26358,6 +26548,11 @@ fn the_looks_memo_reads_on_and_a_carry_ons_readers_share_one_read() {
 /// `harness_upgrade_never_strands_model`.
 #[path = "upgrade_stall_tests.rs"]
 mod stall;
+
+// The process reads held to the `ps` reads they replaced, on the live machine.
+#[cfg(target_os = "macos")]
+#[path = "upgrade_drive_kproc_tests.rs"]
+mod kproc;
 
 /// A stop that repeats rests longer, never for good: the same reason in a row doubles the
 /// rest up to four times `RETRY_S`; a new reason starts over, and the rest still ends.
@@ -27061,7 +27256,7 @@ fn the_reset_line_is_read_from_the_named_transcripts_bounded_tail() {
     let home = dir.join("home");
     // 2026-09-30T19:02:11Z.
     let claimed = 1_790_794_931;
-    let said = "Reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
+    let said = "Weekly reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
     let row = |content: &str| {
         format!(
             r#"{{"isSidechain":false,"type":"user","timestamp":"2026-09-30T19:02:40.500Z","message":{{"role":"user","content":"{content}"}}}}"#
@@ -27100,7 +27295,7 @@ fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
     std::fs::create_dir_all(user_home.join(".claude/projects/p")).expect("the user's projects");
     // 2026-09-30T19:02:11Z.
     let claimed = 1_790_794_931;
-    let said = "Reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
+    let said = "Weekly reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
     let wall = r#"{"isSidechain":false,"type":"assistant","timestamp":"2026-09-30T19:02:11.123Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your weekly limit · resets Oct 1 at 9am (America/Los_Angeles)"}]},"quotaLimits":{"status":"rejected","resetsAt":1790870400,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"error":"rate_limit","isApiErrorMessage":true}"#;
     let row = |content: &str| {
         format!(
@@ -27774,7 +27969,8 @@ fn a_moved_agents_finish_is_read_where_it_writes_now() {
     std::fs::write(
         &wt_file,
         lines(&[
-            turn_by(M, "Landed and verified.\\n\\nATERM-TASK-DONE"),
+            land_row(),
+            turn_by(M, LANDED_JSON),
             own_row(
                 "task-notification",
                 false,
@@ -27875,10 +28071,11 @@ fn a_live_moved_agents_finish_is_read_where_it_writes_now() {
     std::fs::create_dir_all(&now_dir).expect("projects");
     std::fs::write(
         now_dir.join(format!("{SESSION}.jsonl")),
-        turn_by(
-            "claude-opus-5-5",
-            "Landed and verified.\\n\\nATERM-TASK-DONE",
-        ) + "\n",
+        land_row()
+            + "
+" + &turn_by("claude-opus-5-5", LANDED_JSON)
+            + "
+",
     )
     .expect("transcript");
     let snap = Snapshot {
@@ -28181,7 +28378,7 @@ fn an_agent_whose_records_a_worktree_split_waits_and_is_asked_nothing() {
         let r = visit(
             &opts,
             &sf,
-            &[(shell, 1, "zsh".to_string())],
+            &[(shell, 1, "zsh".into())],
             &newer(),
             &Script::new(shell, usize::MAX, None),
         );
@@ -28480,19 +28677,18 @@ fn a_crash_is_never_moved_onto_a_newer_build_not_proved_to_start() {
             ),
         );
         // The stand-in's first exec is macOS's to assess, one at a time
-        // machine-wide ([`sh_script`]): paid here, unbounded, so the
-        // relaunch's bounded reads of the build (its `--version`, the probe's
-        // `--help`, five seconds each) read the build and not the queue (the
-        // review of the r20 relaunch lane: under the dev set's parallel test
-        // binaries the ledger here named no `build-probe:exited`).
-        let warmed = aterm_uds::spawnfd::command(versions.join("99.9.9"))
-            .arg("--version")
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .status()
-            .expect("the stand-in runs");
-        assert!(warmed.success(), "{warmed:?}");
+        // machine-wide ([`sh_script`]): paid here, under the first exec's own
+        // hang detector (`aterm_spec::wait::FIRST_EXEC`), so the relaunch's
+        // bounded reads of the build (its `--version`, the probe's `--help`,
+        // five seconds each) read the build and not the queue (the review of
+        // the r20 relaunch lane: under the dev set's parallel test binaries
+        // the ledger here named no `build-probe:exited`).
+        let warmed = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command(versions.join("99.9.9")).arg("--version"),
+            std::time::Instant::now() + aterm_spec::wait::FIRST_EXEC,
+        )
+        .unwrap_or_else(|e| panic!("the stand-in's first exec within its hang detector: {e}"));
+        assert!(warmed.status.success(), "{warmed:?}");
         std::fs::create_dir_all(opts.home.join(".local/bin")).expect("bin");
         std::os::unix::fs::symlink(versions.join("99.9.9"), opts.home.join(".local/bin/claude"))
             .expect("the native link");

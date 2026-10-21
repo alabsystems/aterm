@@ -51,8 +51,8 @@
 //!
 //! ## Test and debug builds
 //!
-//! (And any build with the `test-support` feature, which a dependent's tests turn
-//! on from its dev-dependencies, so its optimized test targets build.)
+//! (And any build with the `test-support` feature, which a `--release` test run of a
+//! dependent names on its command line, `--features aterm-durable/test-support`.)
 //! [`seam::Recording`] records which of the two each operation on this thread asked
 //! for, so a test asserts the tier a site chose with no timing. It records and changes
 //! nothing else: [`ordered`] issues the real `F_BARRIERFSYNC` in every build, test,
@@ -60,8 +60,8 @@
 //! `opt-test` perf lane measures the flush that ships. That costs a test run little:
 //! measured on the crash journal's conformance test, the heaviest user, 3.8-7.5 s
 //! against 2.2-4.2 s with a plain `fsync(2)` in its place (load 27-47). What a crate's
-//! own unit tests may swap is the DURABLE flush ([`seam::durable_fsync`]), whose
-//! `F_FULLFSYNC` costs a step of about 4.2 ms and stalls the whole volume.
+//! own unit tests may swap is the DURABLE flush (`seam::durable_fsync`, Unix only),
+//! whose `F_FULLFSYNC` costs a step of about 4.2 ms and stalls the whole volume.
 
 use std::fs::File;
 use std::io;
@@ -239,9 +239,13 @@ pub fn durable_data(file: &File) -> io::Result<()> {
 
 /// ORDER everything written to `file`, and everything else this process or another
 /// flushed on its device, ahead of every write issued after this call. Nothing is
-/// promised durable on return. Apple: `fcntl(F_BARRIERFSYNC)`; a volume that refuses
-/// the barrier (a network home, FAT, some FUSE volumes) gets [`durable`]'s full flush
-/// instead, which orders by persisting. Elsewhere `fsync(2)`, as [`durable`].
+/// promised durable on return. Apple: `fcntl(F_BARRIERFSYNC)`; a filesystem or device
+/// that refuses the barrier gets [`durable`]'s full flush instead, which orders by
+/// persisting. Measured on macOS 27.0.1: devfs and autofs refuse it, while APFS, HFS+,
+/// and FAT and exFAT (both through FSKit) take it, so an ordered write to a FAT or
+/// exFAT stick is ordered on return, not persisted. Any other barrier error is
+/// returned, never covered by a full flush that happens to succeed after it
+/// ([`primitive::barrier`]). Elsewhere `fsync(2)`, as [`durable`].
 ///
 /// # Errors
 /// The flush's own error (the full flush's, when the barrier was refused).
@@ -327,14 +331,14 @@ pub mod primitive {
     /// where the volume refuses the barrier or the platform has none.
     ///
     /// # Errors
-    /// The flush's own error (the full flush's, when the barrier was refused).
+    /// The barrier's own error when it failed, and the full flush's when the volume
+    /// refused the barrier (astream-sys's `barrier_refused`, an Apple-only dependency,
+    /// so a plain name here: this doc is built on every target). Off Apple targets,
+    /// the full flush's.
     pub fn barrier(file: &File) -> io::Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            match astream_sys::barrier_sync(file) {
-                Ok(()) => Ok(()),
-                Err(_refused) => full(file),
-            }
+            barrier_or_full(file, astream_sys::barrier_sync, full)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -342,18 +346,51 @@ pub mod primitive {
         }
     }
 
-    /// `barrier`, answered by the full flush when it fails. astream-sys's contract: a
-    /// filesystem or device that cannot honour the barrier answers an error, which
-    /// promises no ordering. The full flush orders by persisting, and it reports a
-    /// real I/O error (`EIO`, `ENOSPC`) the barrier hit just as well.
-    #[cfg(test)]
+    /// `barrier`, answered by the full flush only when the volume REFUSED it. This is
+    /// the one body [`barrier`] runs on Apple targets. Tests hand it a barrier and a
+    /// full flush of their own to see which errors reach which; another runs
+    /// [`barrier`] itself on `/dev/null`, whose barrier and full flush devfs both
+    /// refuse, to pin the pair production passes in (a full flush that skipped the
+    /// flush would answer `Ok` there).
+    ///
+    /// WHY ONLY A REFUSAL. astream-sys's contract ([`astream_sys::barrier_refused`]):
+    /// `F_BARRIERFSYNC` answers `ENOTSUP`, `ENODEV`, `EINVAL` or `ENOTTY` when the
+    /// filesystem or device cannot take a barrier at all. Nothing was ordered, and
+    /// the full flush orders by persisting. Every other error (`EIO`, `ENOSPC`, ...) is
+    /// a FAILED flush, and is returned as a failed `fsync` is. A full flush that then
+    /// succeeds says nothing about what the failed one was to cover: the device has
+    /// nothing dirty left to rewrite for those bytes, so it returns 0 whether or not
+    /// they are on media. astream's own log refuses that mask for the same reason:
+    /// its `issue_flush` (`astream-broker` `store.rs`) sends only a refused barrier
+    /// to the full flush and returns every other barrier error, and claim
+    /// `broker.ordered-tier` says why ("a later flush that succeeds says nothing about
+    /// what the failed one was to cover"). What the log does next is its own: a failed
+    /// flush inside a commit rolls the batch back, and poisons the open too only when
+    /// earlier acks rode barriers that no full flush has covered. The rule this
+    /// replaced, "any error gets the full flush, which reports a real I/O error just
+    /// as well", was written against astream c6ee512, before astream 87140e5 added
+    /// `barrier_refused`.
+    ///
+    /// WHY NO LATCH. astream's log serves Strict, full flushes only, for the rest of
+    /// an open after one refusal (`BrokerLog::settle_issued` latches it through
+    /// `latch_strict`; `issue_flush` itself only falls back for the one call), because
+    /// a log is one file on one device and reports the tier it serves. This crate
+    /// keeps no state: [`barrier`] takes whatever descriptor a site holds, on whatever
+    /// volume. A process-wide latch would turn every later barrier on the APFS home
+    /// into a full flush after one refusal on another volume (devfs, autofs). A latch
+    /// per device would add an `fstat` and a
+    /// lock to every barrier on the common path, to skip one `fcntl` on the volumes
+    /// that refuse. So every call asks the barrier first.
+    #[cfg(target_vendor = "apple")]
     pub(crate) fn barrier_or_full(
         file: &File,
         barrier: impl FnOnce(&File) -> io::Result<()>,
+        full: impl FnOnce(&File) -> io::Result<()>,
     ) -> io::Result<()> {
         match barrier(file) {
             Ok(()) => Ok(()),
-            Err(_refused) => full(file),
+            Err(refused) if astream_sys::barrier_refused(&refused) => full(file),
+            Err(failed) => Err(failed),
         }
     }
 
@@ -386,8 +423,8 @@ pub mod primitive {
 }
 
 /// THE COUNTING SEAM (test and debug builds, and the `test-support` feature): which
-/// flush each operation asked for,
-/// recorded per thread while a [`Recording`] lives, so a test asserts the tier a site
+/// flush each operation asked for, recorded per thread while a
+/// [`Recording`](crate::seam::Recording) lives, so a test asserts the tier a site
 /// chose without timing anything. A thread with no recording pays one thread-local
 /// read per flush; a release build without `test-support` compiles none of this.
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
@@ -616,24 +653,129 @@ mod tests {
         }
     }
 
+    /// What [`primitive::barrier_or_full`] did with one injected barrier answer: its
+    /// result, and how many times it asked the barrier and the full flush. The full
+    /// flush it is handed is the real one ([`primitive::full`]) unless `full_fails`,
+    /// which stands in a full flush that answers `EIO`.
+    #[cfg(target_vendor = "apple")]
+    fn barrier_answering(
+        answer: std::io::Error,
+        full_fails: bool,
+    ) -> (std::io::Result<()>, usize, usize) {
+        let dir = scratch();
+        let mut file = std::fs::File::create(dir.path().join("f")).unwrap();
+        file.write_all(b"ordered").unwrap();
+        let (mut barriers, mut fulls) = (0, 0);
+        let result = primitive::barrier_or_full(
+            &file,
+            |_| {
+                barriers += 1;
+                Err(answer)
+            },
+            |f| {
+                fulls += 1;
+                if full_fails {
+                    Err(std::io::Error::from_raw_os_error(5))
+                } else {
+                    primitive::full(f)
+                }
+            },
+        );
+        (result, barriers, fulls)
+    }
+
+    /// The four errnos astream-sys reads as a REFUSED barrier (`ENODEV`, `EINVAL`,
+    /// `ENOTTY`, `ENOTSUP`) promise no ordering, so each gets the full flush, whose
+    /// own answer is the result. A barrier that succeeds gets no full flush.
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn a_refused_barrier_is_answered_by_the_full_flush() {
+        for errno in [19, 22, 25, 45] {
+            let (result, barriers, fulls) =
+                barrier_answering(std::io::Error::from_raw_os_error(errno), false);
+            result.unwrap_or_else(|e| panic!("errno {errno}: the full flush failed: {e}"));
+            assert_eq!((barriers, fulls), (1, 1), "errno {errno}");
+        }
+        let (result, _, fulls) = barrier_answering(std::io::Error::from_raw_os_error(45), true);
+        assert_eq!(
+            result.map_err(|e| e.raw_os_error()),
+            Err(Some(5)),
+            "a refused barrier answers with the full flush's own error"
+        );
+        assert_eq!(fulls, 1);
+
         let dir = scratch();
         let file = std::fs::File::create(dir.path().join("f")).unwrap();
-        let mut asked = false;
-        primitive::barrier_or_full(&file, |_| {
-            asked = true;
-            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
-        })
-        .expect("the full flush answers a refused barrier");
-        assert!(asked, "the barrier is asked first");
-        let mut calls = 0;
-        primitive::barrier_or_full(&file, |_| {
-            calls += 1;
-            Ok(())
-        })
+        let mut fulls = 0;
+        primitive::barrier_or_full(
+            &file,
+            |_| Ok(()),
+            |_| {
+                fulls += 1;
+                Ok(())
+            },
+        )
         .unwrap();
-        assert_eq!(calls, 1);
+        assert_eq!(fulls, 0, "a barrier that succeeds owes no full flush");
+    }
+
+    /// THE NEGATIVE CONTROL of the test above: the same harness, with a barrier that
+    /// FAILED rather than was refused. Its error is returned, and the full flush is
+    /// never called, since one that succeeds afterwards would answer `Ok` for bytes
+    /// the failed flush may have lost. An error that carries no errno is no refusal
+    /// either: astream-sys reads a refusal only from the OS's own number.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_failed_barrier_is_returned_and_never_covered_by_a_full_flush() {
+        for errno in [5, 28, 9, 1] {
+            // EIO, ENOSPC, EBADF, EPERM.
+            let (result, barriers, fulls) =
+                barrier_answering(std::io::Error::from_raw_os_error(errno), false);
+            assert_eq!(
+                result.map_err(|e| e.raw_os_error()),
+                Err(Some(errno)),
+                "errno {errno} is the barrier's own failure"
+            );
+            assert_eq!((barriers, fulls), (1, 0), "errno {errno}");
+        }
+        for kind in [std::io::ErrorKind::Unsupported, std::io::ErrorKind::Other] {
+            let (result, _, fulls) = barrier_answering(std::io::Error::from(kind), false);
+            assert_eq!(result.map_err(|e| e.kind()), Err(kind));
+            assert_eq!(fulls, 0, "{kind:?} carries no errno, so it is no refusal");
+        }
+    }
+
+    /// The pair [`primitive::barrier`] itself hands [`primitive::barrier_or_full`] on
+    /// Apple: astream-sys's barrier and this crate's real full flush. The two tests
+    /// above inject both, so they pin the rule but not what production passes it: a
+    /// full-flush argument that answered `Ok` without flushing would pass them, and the
+    /// shipped barrier would then answer `Ok` for a refused barrier with nothing on
+    /// media. `/dev/null` is a descriptor whose answers the OS fixes: devfs refuses
+    /// `F_BARRIERFSYNC` on it and fails `F_FULLFSYNC` too, both with `ENODEV` (measured
+    /// on macOS 27.0.1), so the shipped barrier must answer with the full flush's own
+    /// error. Both answers are asserted first, so a macOS that changed either fails
+    /// this test by name instead of letting it pass with nothing checked.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_shipped_barrier_answers_a_refusal_with_the_real_full_flush() {
+        let null = std::fs::File::open("/dev/null").expect("/dev/null opens");
+        let barrier = astream_sys::barrier_sync(&null);
+        assert!(
+            barrier.as_ref().is_err_and(astream_sys::barrier_refused),
+            "devfs no longer refuses F_BARRIERFSYNC on /dev/null ({barrier:?}): this test \
+             needs another descriptor whose barrier is refused"
+        );
+        let full = primitive::full(&null).map_err(|e| e.raw_os_error());
+        assert!(
+            full.is_err(),
+            "devfs's full flush on /dev/null succeeded, so a shipped barrier that skipped \
+             it would pass here: this test needs a descriptor whose full flush fails"
+        );
+        assert_eq!(
+            primitive::barrier(&null).map_err(|e| e.raw_os_error()),
+            full,
+            "a refused barrier answers with the real full flush's own result"
+        );
     }
 
     #[test]

@@ -142,7 +142,7 @@ mod tests {
         let link = dir.join("evil.png");
         if std::os::windows::fs::symlink_file(&victim, &link).is_err() {
             let _ = std::fs::remove_dir_all(&dir);
-            return; // no symlink privilege — nothing to assert
+            aterm_spec::host::could_not_run("no symlink privilege here (Developer Mode is off)");
         }
         assert!(
             write_private(&link, b"attack").is_err(),

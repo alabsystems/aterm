@@ -78,6 +78,7 @@ use aterm_messages::{
 use aterm_messages::{Decision, HOLD_GESTURE};
 
 use crate::crash_journal::PanesWithoutFolder;
+use crate::harness_host::DiskPrivate;
 use crate::native_settings::SettingsRoute;
 
 /// What earns a row on the glass (the owner's attention rule, 2026-09-23). The
@@ -2078,6 +2079,29 @@ pub(crate) fn presence_not_saved(
     .key(format!("fabric.presence-save.{leaf}").as_str())
 }
 
+/// View ▸ Stats Bars' choice did not reach aterm.toml: the write was
+/// refused, conflicted with a hand edit, or could not be confirmed. The bars
+/// keep the form the file holds.
+pub(crate) fn stats_bars_not_saved(form: &str, detail: &str, indeterminate: bool) -> Message {
+    let title = if indeterminate {
+        format!("Couldn't confirm the stats bars were set to {form}")
+    } else {
+        format!("Couldn't set the stats bars to {form}")
+    };
+    gesture_failure(
+        tags::FABRIC,
+        if indeterminate {
+            Severity::Warn
+        } else {
+            Severity::Error
+        },
+        &title,
+        detail,
+        Then::step("Choose it again in View \u{25B8} Stats Bars"),
+    )
+    .key("sys.stats-bars-save")
+}
+
 /// A theme chosen in the command palette (Enter on a Theme row, View ▸
 /// Choose Theme…) did not reach aterm.toml: the write was refused, conflicted
 /// with a hand edit, or could not be confirmed. The preview it left standing
@@ -3348,7 +3372,10 @@ pub(crate) fn supervisor_note(sid: &str, place: &str, text: &str) -> Message {
 /// and saying what that mode does, its second whether the mode is the
 /// session's own word (`own`) or the table's default it was handed back to,
 /// and, where the change dropped an armed timer (`cancelled`), a third that
-/// says so (`the 18:00 landing time is cancelled`, §10.2.1). Keyed per
+/// says so (`the 18:00 landing time is cancelled`, §10.2.1). Its last line
+/// says who set it (`set_by`, composed by the caller from the stored setter:
+/// `set from the chip`, `set over aterm ctl`; §11.7.1) — on a line, never in
+/// the title, which the glass title rule holds to six words. Keyed per
 /// session: the next one replaces it.
 pub(crate) fn autopilot_set(
     sid: &str,
@@ -3356,6 +3383,7 @@ pub(crate) fn autopilot_set(
     view: crate::autopilot::AutopilotView,
     own: bool,
     cancelled: Option<crate::claude_lights::LandAtGlass>,
+    set_by: Option<&str>,
 ) -> Message {
     use crate::autopilot::AutopilotView;
     let agent_off;
@@ -3396,15 +3424,28 @@ pub(crate) fn autopilot_set(
             aterm_messages::DETAIL_LINE_CAP,
         ))
         .line(whose);
-    match cancelled {
+    let message = match cancelled {
         Some(at) => message.line(format!(
             "the {} landing time is cancelled",
             crate::autopilot_menu::when(at)
         )),
         None => message,
+    };
+    set_by_line(message, set_by)
+        .record()
+        .key(format!("harness.autopilot.{sid}").as_str())
+}
+
+/// An Autopilot record's last line, who set it (§11.7.1), where the caller
+/// has one: sanitized and cut as every detail line is.
+fn set_by_line(message: Message, set_by: Option<&str>) -> Message {
+    match set_by {
+        Some(set_by) => message.line(atpkg::progress::sanitize_for_tty(
+            set_by,
+            aterm_messages::DETAIL_LINE_CAP,
+        )),
+        None => message,
     }
-    .record()
-    .key(format!("harness.autopilot.{sid}").as_str())
 }
 
 /// A TIMED CRUISE SET FROM THE WINDOW (the Autopilot menu, Settings ▸
@@ -3413,13 +3454,15 @@ pub(crate) fn autopilot_set(
 /// keyed per session like [`autopilot_set`], titled with the time it lands
 /// under the glass title rule (`Autopilot cruises until 18:00`; `… until Sat
 /// 16:00` where it falls on another day, §10.2.1), its line led by the tab
-/// and saying what happens at the time.
+/// and saying what happens at the time, its last who set it (`set_by`, as
+/// [`autopilot_set`]'s).
 pub(crate) fn autopilot_timer_set(
     sid: &str,
     place: &str,
     until: crate::claude_lights::LandAtGlass,
+    set_by: Option<&str>,
 ) -> Message {
-    Message::new(
+    let message = Message::new(
         tags::HARNESS,
         Severity::Info,
         format!(
@@ -3433,9 +3476,10 @@ pub(crate) fn autopilot_timer_set(
             "the harness keeps the work moving, then wraps it up at that time",
         ),
         aterm_messages::DETAIL_LINE_CAP,
-    ))
-    .record()
-    .key(format!("harness.autopilot.{sid}").as_str())
+    ));
+    set_by_line(message, set_by)
+        .record()
+        .key(format!("harness.autopilot.{sid}").as_str())
 }
 
 /// What a timed Cruise's fire found the session doing (§10.2.3, item 8):
@@ -3443,12 +3487,10 @@ pub(crate) fn autopilot_timer_set(
 /// land — only work the harness carries is wrapped up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FireOver {
-    /// Work the harness carries: it wraps it up at its next point.
+    /// Work the harness carries: it lands it at its next point. (Cruise
+    /// takes nothing as the end, and the turn to Land starts a landing
+    /// whatever the face said, so the fire never finds a task already over.)
     Work,
-    /// The agent had said it was finished, at this stamp where it was read.
-    Done(Option<crate::harness_glass::Stamp>),
-    /// A landing had ended the task, at this stamp where it was read.
-    Landed(Option<crate::harness_glass::Stamp>),
     /// The master switch is off: nothing is supervised.
     MasterOff,
     /// This agent's own switch is off.
@@ -3466,17 +3508,16 @@ pub(crate) enum FireOver {
 /// `land` (`App::expire_autopilot_timers`). A `harness` RECORD, never a row:
 /// nothing is asked of the person, and the chip already says it. Titled
 /// `Autopilot switched to land` (the glass title rule, §10.2.1) — true
-/// whatever the fire found, where `began landing` was untrue over a task
-/// with nothing to land (owner-eye-8 of the post-landing check) — in the
+/// whatever the fire found (owner-eye-8 of the post-landing check) — in the
 /// words the chip, the menu and its sibling records use (`autopilot: land`,
 /// `Autopilot set to land`); its line says when Autopilot switched and what
-/// that does to what the fire found (`over`): the work wrapped up, or
-/// nothing to land — a done or landed task (with its stamp, its weekday
-/// where it is not on `today`), the harness or the agent's switch off, no
-/// host, no agent in the pane or the tab. Where the time passed while aterm,
-/// or only the tab, was closed (a restore found it behind), its line says
-/// which instead. `clock` is the time it landed at (`None`: the zone could
-/// not be read). Keyed per session like [`autopilot_set`]: it replaces the
+/// that does to what the fire found (`over`): the work landed, or nothing to
+/// land — the harness or the agent's switch off, no host, no agent in the
+/// pane or the tab. Where the time passed while aterm, or only the tab, was
+/// closed (a restore found it behind), its line says which instead. `clock`
+/// is the time it landed at (`None`: the zone could not be read). Its last
+/// line says who set it: the timer (`set_by`, `set at the 18:00 timer`,
+/// §11.7.1). Keyed per session like [`autopilot_set`]: it replaces the
 /// record of the set.
 pub(crate) fn autopilot_timer_ended(
     sid: &str,
@@ -3484,7 +3525,7 @@ pub(crate) fn autopilot_timer_ended(
     clock: Option<&str>,
     passed_while: Option<crate::autopilot_timers::ClosedOver>,
     over: FireOver,
-    today: i64,
+    set_by: Option<&str>,
 ) -> Message {
     use crate::autopilot_timers::ClosedOver;
     let time = clock.map_or_else(
@@ -3501,15 +3542,10 @@ pub(crate) fn autopilot_timer_ended(
                 || "Autopilot switched to land".to_string(),
                 |c| format!("at {c} Autopilot switched to land"),
             );
-            let at = |stamp: Option<crate::harness_glass::Stamp>| {
-                stamp.map_or_else(String::new, |s| format!(" at {}", s.words(Some(today))))
-            };
             let then = match over {
-                FireOver::Work => {
-                    "the harness wraps the work up at its next point, then stops".to_string()
-                }
-                FireOver::Done(stamp) => format!("nothing to land, the task was done{}", at(stamp)),
-                FireOver::Landed(stamp) => format!("nothing to land, the task landed{}", at(stamp)),
+                FireOver::Work => "the harness lands all of the work on the remote main branch, \
+                                   then stops"
+                    .to_string(),
                 FireOver::MasterOff => {
                     "the harness is off in Settings, so nothing is landed".to_string()
                 }
@@ -3530,11 +3566,10 @@ pub(crate) fn autopilot_timer_ended(
             format!("{turned}; {then}")
         }
     };
-    Message::new(tags::HARNESS, Severity::Info, "Autopilot switched to land")
-        .line(atpkg::progress::sanitize_for_tty(
-            &tab_led(place, &what),
-            aterm_messages::DETAIL_LINE_CAP,
-        ))
+    let message = Message::new(tags::HARNESS, Severity::Info, "Autopilot switched to land").line(
+        atpkg::progress::sanitize_for_tty(&tab_led(place, &what), aterm_messages::DETAIL_LINE_CAP),
+    );
+    set_by_line(message, set_by)
         .record()
         .key(format!("harness.autopilot.{sid}").as_str())
 }
@@ -5129,36 +5164,214 @@ pub(crate) fn disk_freed_entry(bytes: u64, went: &[String]) -> Entry {
 /// The key of the disk-full alert ([`disk_full`]).
 pub(crate) const DISK_FULL_KEY: &str = "system.disk.full";
 
-/// THE DISK IS FULL AND ATERM CAN FREE NOTHING MORE SAFELY — the one disk
+/// The disk-full alert's leading lines that are its sentence
+/// ([`sentence_lines`]): the step, the cause, what to expect.
+const DISK_FULL_SENTENCE: usize = 3;
+
+/// What holds the disk-full alert ([`disk_full`]) up: what aterm did about
+/// the full home volume, or why it did nothing. Each case says only what is
+/// true of it, so the alert states its fact once and never says aterm "can
+/// free nothing more" where it was kept from trying (review ox-17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiskFullCause {
+    /// A pass took every build cache aterm may remove.
+    Spent,
+    /// A pass was kept from removing a build cache: its write-ahead record
+    /// could not be written on the full volume, and aterm removes nothing
+    /// without one (`disk::Refusal::Unjournalled`), so it removed no more.
+    Unrecorded,
+    /// No session is supervised, so a pass reclaims only aterm's own build
+    /// cache, and only while `[disk] dead_build_dirs` lets a whole build
+    /// directory go (`whole`).
+    Unsupervised { whole: bool },
+    /// Every removal is off: `[disk] auto_free_gib` is 0, as the owner wrote
+    /// it or (`fault`) because a `[disk]` value aterm cannot read turned it
+    /// off.
+    CleanupOff { fault: bool },
+    /// The volume is out of inodes, not bytes: no build cache's size is the
+    /// cause.
+    Inodes,
+    /// This process is not the owner's disk watch, by the rule named (a
+    /// private state root, a scratch home, ...): it measures and removes
+    /// nothing.
+    Private(DiskPrivate),
+}
+
+impl DiskFullCause {
+    /// The log's words for the cause, settings named as aterm.toml spells
+    /// them (the log is read beside the file; the glass is not).
+    pub(crate) fn log_words(self) -> &'static str {
+        match self {
+            Self::Spent => {
+                "aterm reclaimed every build cache it may and nothing more is safe to remove"
+            }
+            Self::Unrecorded => {
+                "the disk ledger took no write-ahead row, so the pass removed no build cache \
+                 without one"
+            }
+            Self::Unsupervised { whole: true } => {
+                "no supervised session: only aterm's own build cache is reclaimed"
+            }
+            Self::Unsupervised { whole: false } => {
+                "no supervised session, and [disk] dead_build_dirs is off: no whole build cache \
+                 is reclaimed"
+            }
+            Self::CleanupOff { fault: false } => {
+                "the automatic removal is off ([disk] auto_free_gib is 0)"
+            }
+            Self::CleanupOff { fault: true } => {
+                "the automatic removal is off (a [disk] value aterm cannot read)"
+            }
+            Self::Inodes => {
+                "the volume is out of inodes, not bytes: no build cache aterm may remove is the \
+                 cause"
+            }
+            Self::Private(rule) => rule.why(),
+        }
+    }
+
+    /// The alert's reason and its one step: `free` the bytes left (`None`:
+    /// not measured), `freed` what aterm freed this episode, `hogs` whether
+    /// the alert lists the largest folders it could not reclaim. The step is
+    /// the band's excerpt beside `Disk full`, short enough to stand whole in a
+    /// narrow window (the review of the owner's notices, 2026-10-20: the band
+    /// showed the facts and no step); the bytes left lead every reason but the
+    /// inodes', the first line of Details. Every reason is the owner's to act
+    /// on ([`StandingWhy::OnlyYou`]: aterm deletes none of their files), which
+    /// lets the figure lead where `Spent`'s words open on what aterm did.
+    fn ask(self, free: Option<u64>, freed: u64, hogs: bool) -> (StandingWhy, Then) {
+        let human = aterm_agent::harness::disk::human_bytes;
+        let left = free.map_or_else(
+            || "little space left".to_owned(),
+            |f| format!("{} left", human(f)),
+        );
+        let reason = match self {
+            Self::Spent if freed > 0 => format!(
+                "{left}; aterm already deleted every unused build cache ({})",
+                human(freed)
+            ),
+            Self::Spent => format!("{left}; aterm found no unused build cache to delete"),
+            Self::Unrecorded if freed > 0 => format!(
+                "{left}; aterm removed {}, then could not log a removal on the full disk",
+                human(freed)
+            ),
+            Self::Unrecorded => {
+                format!(
+                    "{left}; aterm removed nothing: it could not log a removal on the full disk"
+                )
+            }
+            Self::Unsupervised { whole: true } => format!(
+                "{left}; aterm removes only its own build cache while no session is supervised"
+            ),
+            Self::Unsupervised { whole: false } => {
+                format!("{left}; aterm.toml keeps aterm from removing build caches")
+            }
+            Self::CleanupOff { fault: false } => {
+                format!("{left}; automatic cleanup is off in aterm.toml")
+            }
+            Self::CleanupOff { fault: true } => {
+                format!("{left}; a disk setting aterm cannot read turned cleanup off")
+            }
+            Self::Inodes => {
+                "the home volume has room for no more files: it is out of inodes, not bytes"
+                    .to_owned()
+            }
+            // The owner's own window can be the one that removes nothing
+            // (its home's disk unnamed, its account home unread): it is
+            // told so, never called a private aterm.
+            Self::Private(rule) => match rule {
+                DiskPrivate::StateRoot | DiskPrivate::ScratchHome => {
+                    format!("{left}; a private aterm like this one removes nothing")
+                }
+                DiskPrivate::DeviceUnnamed => {
+                    format!("{left}; aterm cannot identify this home's disk, so it removes nothing")
+                }
+                DiskPrivate::NoAccountHome => {
+                    format!("{left}; aterm cannot read your account's home, so it removes nothing")
+                }
+            },
+        };
+        let why = StandingWhy::OnlyYou(Reason::new(reason));
+        let then = if self == Self::Inodes {
+            "Delete folders full of small files you no longer need"
+        } else if hogs {
+            "Free up space, starting with the largest folder in Details"
+        } else {
+            "Free up space: aterm harness disk lists what fills it"
+        };
+        (why, Then::step(then))
+    }
+
+    /// WHAT TO EXPECT (the owner, 2026-10-19: *"what to do about it or what
+    /// to expect"*): what ends the alert, as a figure the owner can free up
+    /// to, and what aterm does then. The watch ends it once the volume is
+    /// out of its emergency (`thresholds`: [`Thresholds::emergency`] free
+    /// bytes, or [`Thresholds::files_emergency`] free files where the volume
+    /// is out of inodes), and resumes the tabs whose agents the full disk
+    /// stopped (`harness_host::disk_owed`). The review of the band,
+    /// 2026-10-20: an owner who freed 2 GiB still saw `Disk full`, with no
+    /// target and no word that the tabs would go on.
+    ///
+    /// [`Thresholds::emergency`]: aterm_agent::harness::disk::Thresholds::emergency
+    /// [`Thresholds::files_emergency`]: aterm_agent::harness::disk::Thresholds::files_emergency
+    fn expect(self, thresholds: &aterm_agent::harness::disk::Thresholds) -> String {
+        let free = if self == Self::Inodes {
+            format!(
+                "there is room for {} more files",
+                grouped(thresholds.files_emergency)
+            )
+        } else {
+            format!(
+                "{} is free",
+                aterm_agent::harness::disk::human_bytes(thresholds.emergency)
+            )
+        };
+        format!("Once {free}, this alert ends and aterm resumes the tabs the full disk stopped.")
+    }
+}
+
+/// `n` with its thousands grouped (`50,000`), as a person reads a count.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// THE HOME VOLUME IS FULL AND ONLY THE OWNER CAN FREE IT — the one disk
 /// alert on the glass: writes are failing or about to (agents' tool calls,
-/// their transcripts), aterm already took what it may (`freed` this
-/// episode), and only the owner can free the rest. One action changes the
-/// outcome, so it stands ([`Ask::standing`]) until the volume is out of its
-/// emergency. `hogs` say where the space is and what frees each.
+/// their transcripts), and aterm already took what it may or was kept from
+/// taking anything (`cause`, which `freed` this episode and `free` the bytes
+/// left figure in). One action changes the outcome, so it stands
+/// ([`Ask::standing`]) until the volume is out of its emergency. THE STEP
+/// LEADS, as a tab's notice's does ([`resume_ask`]): it is the band's
+/// excerpt beside `Disk full`, which the band's width law keeps whole before
+/// the rest of the row; the cause follows, stated once, then the largest
+/// folders aterm could not reclaim (`hogs`, each fitted to its line), each
+/// with what frees it (the review of the owner's notices, 2026-10-20: led by
+/// the cause, the band showed facts and never the step). Between them, what
+/// to expect: the free space that ends the alert (`thresholds`), and that
+/// aterm then resumes the tabs it stopped ([`DiskFullCause::expect`]).
 pub(crate) fn disk_full(
-    free: u64,
-    volume: &std::path::Path,
+    free: Option<u64>,
     freed: u64,
     hogs: &[String],
-    why: &str,
+    cause: DiskFullCause,
+    thresholds: &aterm_agent::harness::disk::Thresholds,
 ) -> Message {
-    let human = aterm_agent::harness::disk::human_bytes;
+    let (why, then) = cause.ask(free, freed, !hogs.is_empty());
+    let cause_words = Why::from(why.clone()).words();
     Message::new(tags::SYSTEM, Severity::Error, "Disk full")
-        .line(format!(
-            "{} left on {}; aterm freed {} and can free nothing more safely",
-            human(free),
-            volume.display(),
-            human(freed)
-        ))
-        .line(why)
+        .line(then.words())
+        .line(cause_words)
+        .line(cause.expect(thresholds))
+        .now(Ask::standing(why, then))
         .lines(hogs.iter().take(3).map(|h| format!("Largest: {h}")))
-        .now(Ask::standing(
-            StandingWhy::Spent {
-                tried: Reason::new(format!("freed {} of rebuildable caches", human(freed))),
-                reason: Reason::new("nothing more on the volume is safe for aterm to remove"),
-            },
-            Then::step("Free up space on the home volume"),
-        ))
         .key(DISK_FULL_KEY)
 }
 
@@ -5412,19 +5625,19 @@ pub(crate) fn accounts_signed_out_entry(labels: &[String]) -> Option<Entry> {
         "signed-out",
         &what,
         Why::OnlyYou(Reason::new(&filled.happened)),
-        Then::step(&filled.todo),
+        notice_then(&filled.todo, filled.short),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
     // Its words move only with the roster (an account signed out or back in),
     // never every look: each is shown as it moves, as its notice is.
     .restated_at_once();
-    // The labels first (the step may point at them), then what aterm did and
-    // what follows, as the detail's room allows.
+    // The labels first, then what aterm did and what follows, as the
+    // detail's room allows ([`notice_tail`]).
     for line in accounts_signed_out_lines(labels) {
         entry = entry.more(line);
     }
-    entry = entry.more(filled.did).more(filled.expect);
+    entry = notice_tail(entry, filled);
     Some(entry.log_line(format!("accounts need=signed-out n={}", labels.len())))
 }
 
@@ -5437,6 +5650,18 @@ fn accounts_signed_out_lines(labels: &[String]) -> Vec<String> {
 /// The label lines of an accounts notice's entry: what aterm did and what
 /// follows take the rest of the lines an entry keeps.
 const NOTICE_LABEL_LINES: usize = aterm_messages::exceptions::MORE_LINES - 2;
+
+/// An accounts notice's entry closed by what aterm did and what follows —
+/// or, where its step points at Details for its command
+/// ([`notice::COMMAND_UNDER_DETAILS`]), by that command, whole, and what
+/// follows: the one thing to do outranks what aterm did in the lines an
+/// entry keeps.
+fn notice_tail(entry: Entry, filled: notice::Filled) -> Entry {
+    match filled.command {
+        Some(command) => entry.more(command).more(filled.expect),
+        None => entry.more(filled.did).more(filled.expect),
+    }
+}
 
 /// `lead` and the labels, `a, b, …`, on at most `room` of the lines an entry
 /// keeps. A label joins the line while the line stays within
@@ -5637,7 +5862,8 @@ pub(crate) fn accounts_none_soon_entry() -> Entry {
 /// RENEWALS THAT SIGNED IN ANOTHER ACCOUNT (`labels`:
 /// `aterm_agent::harness::accounts::wrong_accounts`), or `None`: nothing
 /// live changed, and the row's login renews only in the account's own
-/// browser profile. Named by label alone.
+/// browser profile. Named by label alone: the row's email is never shown
+/// (owner ruling R-2).
 pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
     let first = labels.first()?;
     let filled = notice::RENEWAL_WRONG_ACCOUNT.fill(Some(first), None);
@@ -5647,7 +5873,7 @@ pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
         "wrong-account",
         notice::RENEWAL_WRONG_ACCOUNT.title,
         Why::OnlyYou(Reason::new(&filled.happened)),
-        Then::step(&filled.todo),
+        notice_then(&filled.todo, filled.short),
     )
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
@@ -5656,7 +5882,7 @@ pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
     for line in labels_lines("Wrong account: ", labels, NOTICE_LABEL_LINES) {
         entry = entry.more(line);
     }
-    entry = entry.more(filled.did).more(filled.expect);
+    entry = notice_tail(entry, filled);
     Some(entry.log_line(format!("accounts need=wrong-account n={}", labels.len())))
 }
 
@@ -5689,6 +5915,36 @@ pub(crate) fn accounts_refused_entry() -> Entry {
     .log_line("accounts need=roster-refused")
 }
 
+/// The key of [`accounts_logins_unread_entry`].
+pub(crate) const ACCOUNTS_LOGINS_UNREAD_KEY: &str = "harness.accounts.logins-unread";
+
+/// THIS MACHINE'S CLAUDE LOGINS CANNOT BE READ ([`Family::Accounts`],
+/// `harness.accounts.logins-unread`): the roster admits, but `logins.json` —
+/// which binds each row to the login a renewal made it — is torn, another
+/// build's, or unreadable, so which login is whose is not known and no
+/// session changes account until it reads again. It stands in the
+/// signed-out line's place, as the roster's refusal does, and names its own
+/// file (the review of the login carry, r3h-7: told as that refusal, it sent
+/// the owner to an accounts.toml that admits). WHY it cannot be read is
+/// neither said here nor logged: that reason names the file's path, and
+/// `aterm harness accounts` prints it at the owner's own terminal.
+pub(crate) fn accounts_logins_unread_entry() -> Entry {
+    Entry::new(
+        Family::Accounts,
+        "",
+        "logins-unread",
+        "Claude account logins cannot be read",
+        Why::OnlyYou(Reason::new(format!(
+            "{} cannot be read, so no session changes account until it can",
+            aterm_agent::harness::accounts::LOGINS_FILE
+        ))),
+        Then::step("Run aterm harness accounts to read why"),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .log_line("accounts need=logins-unread")
+}
+
 /// The key of [`usage_tap_silent_entry`].
 pub(crate) const USAGE_TAP_SILENT_KEY: &str = "harness.accounts.no-tap";
 
@@ -5712,6 +5968,51 @@ pub(crate) fn usage_tap_silent_entry() -> Entry {
     .resurface(Resurface::WAIT)
     .more("An untrusted folder, disableAllHooks, a managed statusLine or a moved aterm stops it")
     .log_line("accounts need=no-tap")
+}
+
+/// A Claude Code whose registry row reports a build its image does not name
+/// (card engine §3.10, [`crate::session_timeline::RegistryDrift`]): the file
+/// it runs from sits in a folder named for one build, and the program says it
+/// is another. A fact for later, never a gate (the card's decoration does not
+/// read it): an EVENT of [`Family::UpgradeHost`]
+/// (`harness.upgrade-host.<tab>.build-drift`), raised once per image and
+/// reported build. The step checks what the store holds, or puts the vendor's
+/// own install back.
+pub(crate) fn claude_build_drift_entry(
+    sid: &str,
+    spot: &UpgradeSpot,
+    drift: &crate::session_timeline::RegistryDrift,
+) -> Entry {
+    let (folder, then) = match drift.source {
+        atpkg::image::ImageSource::Native => {
+            ("installer", "Reinstall Claude Code with its own installer")
+        }
+        _ => ("store", "Run aterm pkg verify claude"),
+    };
+    let mut entry = Entry::new(
+        Family::UpgradeHost,
+        sid,
+        "build-drift",
+        "Claude Code reports another build",
+        Why::OnlyYou(Reason::new(format!(
+            "it runs from the {} {folder} folder but says it is {}",
+            drift.image, drift.reported
+        ))),
+        Then::step(then),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .log_line(format!(
+        "claude build-drift sid={sid} image={} source={} reported={}",
+        drift.image,
+        drift.source.word(),
+        drift.reported
+    ))
+    .more(format!("The Claude Code {}", spot.place));
+    if let Some(nav) = &spot.nav {
+        entry = entry.show(nav.clone());
+    }
+    entry
 }
 
 /// A repaint the render stream gave up on: the tab may be drawn one row off
@@ -6092,13 +6393,22 @@ pub(crate) fn notice_ask_key(sid: &str, notice: Option<&str>) -> String {
 /// worker ended.
 ///
 /// THE OWNER'S FOUR PARTS (the owner, 2026-10-19: *"clear and simple
-/// instructions on what to do about it or what to expect"*): what happened
-/// (the band's excerpt, under the title that says it short), the one thing to
-/// do now, what aterm already did, and what to expect after — one line each
-/// ([`notice`]), the reason and the step leading as every ask's do (a row an
-/// older build carries over is adopted by its second line), and all four the
-/// expanded row's sentence ([`sentence_lines`]). An exception with no notice
-/// says its why and its action.
+/// instructions on what to do about it or what to expect"*): the one thing
+/// to do now (the band's excerpt, under the title that already says what
+/// happened), what happened, what aterm already did, and what to expect
+/// after — one line each ([`notice`]), all four the expanded row's sentence
+/// ([`sentence_lines`]), and after them, where the step starts what outlasts
+/// the notice, how to end it (`accounts use`'s pin: r3h-3). The step leads
+/// where every other ask's reason does: led by the happening, the band said
+/// the title twice and never the step, which only Details showed, in
+/// Settings, away from the tab where it is taken (the review of the login
+/// carry, 2026-10-20). A row an older build
+/// carries over is adopted by its second line (`Ask::adopted`): an older
+/// build's step, or this build's happening for the moment until the
+/// reporter re-asserts the ask. An exception with no notice says its action
+/// and its why. Where the tab was found the row offers `Show tab N`
+/// ([`UpgradeSpot::nav`]), as the digest's line for the tab does
+/// ([`resume_tab_entry`]): the step is taken there.
 ///
 /// A notice declares its fix words ([`notice::BACK`], the tab's place fitted
 /// on): the login back resolves it, or closes its record, `✓` in them
@@ -6108,31 +6418,62 @@ pub(crate) fn resume_ask(sid: &str, spot: &UpgradeSpot, exception: &Exception) -
     let clean = |line: &str| atpkg::progress::sanitize_for_tty(line, 240);
     let notice = exception.notice.as_ref();
     let title = notice.map_or("Claude needs you", |n| n.title);
+    // The band's title where the whole one does not fit: the notice's short
+    // form, no tab in it (`Show tab N` names the tab), else the title with
+    // its place left off ([`notice::NoticeText::short_title`]).
+    let short_title = notice.map_or(title, |n| n.short_title);
     let mut message = Message::new(
         tags::HARNESS,
         Severity::Warn,
         fitted_title(title, &spot.place),
     )
-    .line(clean(&exception.why))
-    .line(clean(&exception.action));
+    .short_title(short_title)
+    .line(clean(&exception.action))
+    .line(clean(&exception.why));
     if let Some(n) = notice {
         message = message
             .line(clean(&n.did))
             .line(clean(&n.expect))
             .finished_as(fitted_title(notice::BACK, &spot.place));
+        // The command a step points at Details for, whole
+        // ([`notice::COMMAND_UNDER_DETAILS`]).
+        if let Some(command) = &n.command {
+            message = message.line(clean(command));
+        }
+        // How to end what the step starts, where it outlasts the notice
+        // ([`notice::NoticeText::undo`]: the pin `accounts use` sets).
+        if let Some(undo) = &n.undo {
+            message = message.line(clean(undo));
+        }
+    }
+    if let Some(nav) = &spot.nav {
+        message = message.action(nav.clone());
     }
     message
         .now(Ask::standing(
             StandingWhy::OnlyYou(Reason::new(&exception.why)),
-            Then::step(&exception.action),
+            notice_then(&exception.action, notice.and_then(|n| n.short)),
         ))
         .key(&notice_ask_key(sid, notice.map(|n| n.code)))
 }
 
+/// A notice's one step, with the words the band shows in its place where it
+/// cannot show it whole ([`notice::Filled::short`]): a step that runs a
+/// command is shown whole or replaced, never cut — a cut label is another
+/// account's command (the review of the band, 2026-10-20).
+fn notice_then(step: &str, short: Option<&str>) -> Then {
+    let then = Then::step(step);
+    match short {
+        Some(short) => then.or_short(short),
+        None => then,
+    }
+}
+
 /// A tab's OWN entry (`harness.resume.<tab>.<kind>`) for what the owner does IN
 /// that tab: a screen no reader names, or the agent's own background work,
-/// stalled for hours (open the tab and type; the title names `agent`,
-/// [`resume_agent_word`]), a dialog no reader names, stood at for an hour
+/// stalled for hours, or a background call the jobs reading says made no
+/// progress (open the tab and type, or tell the agent; the title names
+/// `agent`, [`resume_agent_word`]), a dialog no reader names, stood at for an hour
 /// (answer it), a context no `/compact` lowers (go back a few messages in
 /// it), or a request the API refuses (the remedy its notice names:
 /// `/rewind`, `/model`, …).
@@ -6151,12 +6492,10 @@ fn resume_tab_entry(
             Severity::Warn,
             " for over an hour",
         ),
-        _ => (
-            resume_agent_word(agent),
-            " has stalled",
-            Severity::Warn,
-            " for over 3 hours",
-        ),
+        // No length: today's canary raises at six units (3 h), one whose
+        // jobs reading named the call (`Exception::no_progress`) one unit
+        // past its `STALLED`, and the kind does not say which.
+        _ => (resume_agent_word(agent), " has stalled", Severity::Warn, ""),
     };
     let title = placed_title(head, &spot.place, tail);
     let title = if aterm_messages::text::glass_title_fault(&title).is_none() {
@@ -6242,6 +6581,33 @@ pub(crate) fn stall_on_work_record(
     .line(format!(
         "{name}'s turn ended, and its own background work has run {minutes} min under words \
          that stood still"
+    ))
+    .record()
+    .key(&stall_record_key(sid))
+}
+
+/// The record at the canary's second rung where the jobs reading explains the
+/// screen (`StallSeen::NoProgress`, the hung-call design's R1): a background
+/// call of `agent`'s own, process `pid`, has made no progress for `minutes`.
+/// The screen is read and the kernel named the call, so nothing here says
+/// otherwise: Warn, in the log, under the same key as [`stall_unread_record`]
+/// (one record per episode). Never a mark on the tab, and not yet a line of
+/// the digest. The pid and the minutes are its only variable words.
+pub(crate) fn stall_no_progress_record(
+    sid: &str,
+    place: &str,
+    agent: aterm_phase::Program,
+    pid: u32,
+    minutes: u64,
+) -> Message {
+    let name = resume_agent_word(agent);
+    Message::new(
+        tags::HARNESS,
+        Severity::Warn,
+        fitted_title(&format!("{name} has stalled"), place),
+    )
+    .line(format!(
+        "{name} waits on a background call (pid {pid}) that has made no progress for {minutes} min"
     ))
     .record()
     .key(&stall_record_key(sid))
@@ -6556,10 +6922,17 @@ pub(crate) fn sentence_lines(key: Option<&str>, detail: &[String]) -> usize {
     // A lost login's ask ([`resume_ask`]; an earlier build's machine renew
     // ask, [`RENEW_ASK_KEY`]) and the two accounts notices
     // ([`accounts_signed_out_entry`], [`accounts_wrong_entry`]): every line is
-    // the owner's sentence — what happened, the step, what aterm did, what
-    // follows (or the accounts it names).
+    // the owner's sentence — the step and what happened (a tab's ask leads
+    // with the step), what aterm did, what follows (or the accounts it
+    // names).
     if key.is_some_and(is_notice_key) {
         return detail.len().max(1);
+    }
+    // The disk-full alert ([`disk_full`]): its step, its cause and what to
+    // expect are the owner's sentence, as a notice's four parts are; the
+    // largest folders under them are its technical lines.
+    if key == Some(DISK_FULL_KEY) {
+        return DISK_FULL_SENTENCE.min(detail.len()).max(1);
     }
     if key == Some(KEY_INTEGRATION_LOST) || key == Some(KEY_HARNESS_NO_SOCKET) {
         // Past more tabs than the first line names, the count of the rest

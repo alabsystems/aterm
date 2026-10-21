@@ -87,9 +87,10 @@ fn typed_wake_pins_cursor_fx_focus() {
     );
 }
 
-/// `cursor_frame` on an unfocused window with a live typed wake emits comet
-/// cells into `trail_scratch`, and an idle tick past the wake's expiry drains
-/// back to the demoted state with no resident trail.
+/// `cursor_frame` on an unfocused window with a live typed wake lays the
+/// comet's tail (its streak's bed under the swept cells), and an idle tick
+/// past the wake's expiry drains back to the demoted state with no resident
+/// trail.
 #[test]
 fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     use std::time::{Duration, Instant};
@@ -135,7 +136,7 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     assert_eq!(live_tick.motion, MotionPolicy::Full);
     let ws = app.windows.get(&wid).expect("window");
     assert!(
-        !ws.fx.cursor().trail_scratch.is_empty(),
+        !ws.fx.cursor().glow.under_quads().is_empty(),
         "an unfocused window paints the trail its typing earned \
          (the v0.48–v0.50 real-window blackout frame)"
     );
@@ -153,7 +154,7 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     );
     let ws = app.windows.get(&wid).expect("window");
     assert!(
-        ws.fx.cursor().trail_scratch.is_empty(),
+        ws.fx.cursor().glow.under_quads().is_empty() && ws.fx.cursor().glow_scratch.is_empty(),
         "the drained unfocused window holds no resident trail"
     );
 }

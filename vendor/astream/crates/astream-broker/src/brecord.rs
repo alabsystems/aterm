@@ -7,7 +7,7 @@
 //! ONE `encode`/`from_payload` pair is used by BOTH append and recover, so a
 //! restart reconstructs records and the dedup map byte-for-byte (round-trip test).
 
-use astream_wire::{Frame, FrameError, Offset, MAX_PAYLOAD_LEN};
+use astream_wire::{CausalEdge, Frame, FrameError, Offset, MAX_PAYLOAD_LEN};
 
 #[cfg(clean_islands)]
 #[path = "brecord_island.rs"]
@@ -101,6 +101,16 @@ pub const SEAL_LEN: usize = 5;
 /// The one byte every record of a batch but its last carries after its last field:
 /// the batch continues past it. See [`BREC_VERSION`].
 pub const CONTINUES_TAG: u8 = 0xB4;
+/// The commit-tag byte on a writer-staged `/a/retire` record (`DESIGN-aterm-fabric`
+/// §5.2): an older build's `from_payload_marked` knows only `0` (none) and `1` (group
+/// commit) and refuses `2` as malformed (`_ => return None`), failing closed rather than
+/// silently reading a retired subject as live.
+pub const COMMIT_TAG_RETIRE: u8 = 2;
+/// Sentinel `producer_seq` carried by a writer-staged `/a/retire` record (`u64::MAX`):
+/// outside the incarnation-derived range `< ACK_SEQ_BASE` (`1 << 63`) that ordinary
+/// publishes use, so an unmarked `/a/retire` record written by an older client before
+/// `/a/retire` was reserved is distinguished from a marked retire record.
+pub const RETIRE_PRODUCER_SEQ: u64 = u64::MAX;
 
 /// What a stored record carries after its last field (see [`BREC_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +374,31 @@ pub(crate) const fn newer_format(p: &[u8], offset: Option<u64>) -> Option<u8> {
 }
 
 impl BrokerRecord {
+    /// Construct a marked `/a/retire` record (`DESIGN-aterm-fabric` §5.2) for
+    /// `target_subject` charged to `producer_id` at offset `seq`.
+    #[must_use]
+    pub fn marked_retire(seq: Offset, producer_id: u64, target_subject: &str) -> Self {
+        Self {
+            seq,
+            producer_id,
+            producer_seq: RETIRE_PRODUCER_SEQ,
+            subject: crate::store::RETIRE_SUBJECT.to_string(),
+            body: target_subject.as_bytes().to_vec(),
+            commit: None,
+        }
+    }
+
+    /// Whether this record is a writer-staged marked `/a/retire` record (`DESIGN-aterm-fabric` §5.2).
+    /// This identifies the explicit wire marker only. The store separately recognizes
+    /// the previous retirement writer's seq-zero, no-commit header; other unmarked
+    /// `/a/retire` records remain ordinary visible legacy data.
+    #[must_use]
+    pub fn is_marked_retire(&self) -> bool {
+        self.subject == crate::store::RETIRE_SUBJECT
+            && self.producer_seq == RETIRE_PRODUCER_SEQ
+            && self.commit.is_none()
+    }
+
     /// Serialize to a CRC [`Frame`]'s bytes. A field exceeding `u32`, or a payload
     /// over [`MAX_RECORD_PAYLOAD`], is [`FrameError::TooLarge`] (never panics).
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
@@ -425,6 +460,7 @@ impl BrokerRecord {
         p.extend_from_slice(&encode_u32_le_bytes(bl));
         p.extend_from_slice(&self.body);
         match &self.commit {
+            None if self.is_marked_retire() => p.push(COMMIT_TAG_RETIRE),
             None => p.push(0),
             Some(c) => {
                 p.push(1);
@@ -489,7 +525,12 @@ impl BrokerRecord {
         let body = body_bytes.to_vec();
         let (commit_tag, mut rest) = take_u8(rest)?;
         let commit = match commit_tag {
-            0 => None,
+            0 => {
+                if subject == crate::store::RETIRE_SUBJECT && producer_seq == RETIRE_PRODUCER_SEQ {
+                    return None;
+                }
+                None
+            }
             1 => {
                 let (gl_u32, after_gl) = take_u32_le(rest)?;
                 let gl = gl_u32 as usize;
@@ -507,6 +548,12 @@ impl BrokerRecord {
                 rest = after_upto;
                 Some(GroupCommit { group, upto })
             }
+            COMMIT_TAG_RETIRE => {
+                if subject != crate::store::RETIRE_SUBJECT || producer_seq != RETIRE_PRODUCER_SEQ {
+                    return None;
+                }
+                None
+            }
             _ => return None,
         };
         let mark = decode_mark(rest)?;
@@ -519,6 +566,35 @@ impl BrokerRecord {
             commit,
         };
         Some((rec, mark))
+    }
+
+    /// Project this broker record as a [`CausalEdge<String>`] for [`astream_wire::CausalCut`]
+    /// consistency verification, linking `cause_subject` at `cause_offset` to this
+    /// record's `(self.subject, self.seq)`.
+    #[must_use]
+    pub fn causal_edge_from(
+        &self,
+        cause_subject: &str,
+        cause_offset: Offset,
+    ) -> CausalEdge<String> {
+        CausalEdge {
+            cause: (cause_subject.to_owned(), cause_offset),
+            effect: (self.subject.clone(), self.seq),
+        }
+    }
+
+    /// When this record carries an atomic consumer-group commit (`ProcessAndProduce` /
+    /// `asb ack`), project the transaction's causal dependency (`(commit.group, commit.upto) -> (self.subject, self.seq)`)
+    /// as a [`CausalEdge<String>`].
+    #[must_use]
+    pub fn commit_causal_edge(&self) -> Option<CausalEdge<String>> {
+        match &self.commit {
+            Some(c) => Some(CausalEdge {
+                cause: (c.group.clone(), Offset(c.upto)),
+                effect: (self.subject.clone(), self.seq),
+            }),
+            None => None,
+        }
     }
 }
 
@@ -735,5 +811,30 @@ mod tests {
         // The at-rest layer's nonce and tag: 40 bytes.
         assert!(sealed.len() + 40 <= MAX_PAYLOAD_LEN);
         assert!(Frame::new(vec![0u8; sealed.len() + 40]).encode().is_ok());
+    }
+
+    #[test]
+    fn broker_record_causal_edges_project_into_causal_cut() {
+        let rec = BrokerRecord {
+            seq: Offset(12),
+            producer_id: 9,
+            producer_seq: 4,
+            subject: "/f/F/ack/s-1".to_string(),
+            body: b"handled".to_vec(),
+            commit: Some(GroupCommit {
+                group: "/f/F/in/s-1".to_string(),
+                upto: 7,
+            }),
+        };
+        let edge1 = rec.causal_edge_from("/f/F/in/s-1", Offset(7));
+        let edge2 = rec.commit_causal_edge().unwrap();
+        assert_eq!(edge1, edge2);
+
+        let mut cut = crate::CausalCut::new();
+        cut.set("/f/F/ack/s-1".to_string(), Offset(12));
+        cut.set("/f/F/in/s-1".to_string(), Offset(6));
+        assert!(!cut.is_consistent(std::slice::from_ref(&edge1)));
+        assert_eq!(cut.heal(&[edge1]), 1);
+        assert!(cut.includes(&"/f/F/in/s-1".to_string(), Offset(7)));
     }
 }

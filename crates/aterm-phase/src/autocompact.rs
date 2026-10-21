@@ -14,9 +14,9 @@
 //! the focused row) of two options in a server-chosen order —
 //!
 //! * the ACCEPT row, `Autocompact at ‹ <size> › tokens` (`‹`/`›` are U+2039 and
-//!   U+203A; ←/→ step `<size>` along 300k…900k), optionally over a
-//!   description `This conversation is at <n>, so it will be summarized on
-//!   your next message.`;
+//!   U+203A; ←/→ step `<size>` along the server's size list, 300k…900k by
+//!   default), optionally over a description `This conversation is at <n>, so
+//!   it will be summarized on your next message.`;
 //! * the KEEP row, `Keep auto (<w> tokens)` or `Keep <w> tokens` —
 //!
 //! and the footer `↑/↓ choose · ←/→ change size · enter confirm · esc not now`
@@ -43,13 +43,25 @@
 //!    with the accept row's own size.
 //!
 //! The `Press <key> again to exit` footer (an exit pending), a screen-reader
-//! render (no footer at all), a size off the ladder or a label in any other
-//! words is no such dialog: a person's.
+//! render (no footer at all), a size in words the vendor never draws
+//! ([`accept_size`]) or a label in any other words is no such dialog: a
+//! person's.
+//!
+//! THE SIZES ARE THE SERVER'S. 2.1.304 reads the list from a served flag
+//! (`tengu_binary_music`): any ascending integers under 1M that hold its
+//! default, up to two more than the built-in [`LADDER`] — so a served list
+//! of eight or nine sizes holds one off the ladder. Each is drawn in the
+//! vendor's compact words (`mr`: `350k`, `350.5k`, `1m`), and every one of
+//! them is read; a reader of the ladder alone left a dialog showing `450k`
+//! unread, its walk stalled with no word to anyone.
 
 use crate::prompt::{Opt, PromptKind, PromptV2, Role, Select};
 
-/// The sizes Claude Code's stepper offers, in kilo-tokens (2.1.302: the
-/// payload's `sizes`, 300k to 900k, only those under the model's window).
+/// The sizes Claude Code's stepper offers BY DEFAULT, in kilo-tokens
+/// (2.1.302: the default of the payload's `sizes`, 300k to 900k, only those
+/// under the model's window). A served list may hold others ([`accept_size`]
+/// reads them all); this ladder bounds what `[harness] autocompact_offer`
+/// may name.
 pub const LADDER: [u32; 7] = [300, 400, 500, 600, 700, 800, 900];
 
 /// Which of the offer's two options the `❯` is on.
@@ -68,18 +80,14 @@ pub struct Offer {
     pub accept: usize,
     /// The keep option's index in [`PromptV2::options`].
     pub keep: usize,
-    /// The size the accept row offers now, in kilo-tokens (`400` of `‹ 400k ›`).
-    pub size: u32,
+    /// The size the accept row offers now, in TOKENS as drawn (`400000` of
+    /// `‹ 400k ›`, `350500` of `‹ 350.5k ›`): [`size_words`] draws it back.
+    pub tokens: u32,
     pub focused: OfferFocus,
-    /// The accept row says the conversation is past that size already: the
-    /// next message compacts it.
-    pub compacts_next: bool,
-    /// What the keep row keeps, as drawn (`auto (1m tokens)`, `500k tokens`).
-    pub current: String,
 }
 
-/// `Autocompact at ‹ 400k › tokens` → `Some(400)`: the accept row's label
-/// exactly, its size one of [`LADDER`]'s.
+/// `Autocompact at ‹ 400k › tokens` → `Some(400000)`: the accept row's label
+/// exactly, its size in tokens ([`size_tokens`]).
 #[must_use]
 pub fn accept_size(label: &str) -> Option<u32> {
     let accept = const { crate::anchors::anchor_text("autocompact.accept") };
@@ -87,13 +95,49 @@ pub fn accept_size(label: &str) -> Option<u32> {
         .strip_prefix(accept)?
         .strip_prefix(" \u{2039} ")?
         .strip_suffix(" \u{203A} tokens")?;
-    kilo(size)
+    size_tokens(size)
 }
 
-/// `400k` → `Some(400)`, a size on [`LADDER`] only.
-fn kilo(text: &str) -> Option<u32> {
-    let n: u32 = text.strip_suffix('k')?.parse().ok()?;
-    (LADDER.contains(&n) && text.len() == 4).then_some(n)
+/// A size in the words Claude Code draws it in, as tokens: `400k` →
+/// `400000`, `350.5k` → `350500`, `1m` → `1000000`. 2.1.304 draws a size
+/// (an integer under 1M) as the en-US compact number, one decimal, `.0`
+/// dropped, lower-cased (`mr`): one to three digits, no leading zero, an
+/// optional one-digit decimal other than `0`, then `k` — or `1m`, the
+/// rounding of 999950 and up. Any other words are `None`.
+#[must_use]
+pub fn size_tokens(text: &str) -> Option<u32> {
+    if text == "1m" {
+        return Some(1_000_000);
+    }
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let number = text.strip_suffix('k')?;
+    let (whole, tenth) = match number.split_once('.') {
+        Some((w, t)) => (w, Some(t)),
+        None => (number, None),
+    };
+    if !digits(whole) || whole.len() > 3 || whole.starts_with('0') {
+        return None;
+    }
+    let tenth: u32 = match tenth {
+        None => 0,
+        Some(t) if t.len() == 1 && digits(t) && t != "0" => t.parse().ok()?,
+        Some(_) => return None,
+    };
+    Some(whole.parse::<u32>().ok()? * 1000 + tenth * 100)
+}
+
+/// `tokens` in the words Claude Code draws a size in ([`size_tokens`]'s
+/// inverse on its words): `400000` → `400k`, `350500` → `350.5k`, a million
+/// or more → `1m`.
+#[must_use]
+pub fn size_words(tokens: u32) -> String {
+    if tokens >= 1_000_000 {
+        return "1m".to_string();
+    }
+    match (tokens / 1000, tokens % 1000 / 100) {
+        (k, 0) => format!("{k}k"),
+        (k, tenth) => format!("{k}.{tenth}k"),
+    }
 }
 
 /// `Keep auto (1m tokens)` → `auto (1m tokens)`; `Keep 500k tokens` →
@@ -119,10 +163,8 @@ fn keep_current(label: &str) -> Option<&str> {
     ok.then_some(rest)
 }
 
-/// How the description the vendor draws under the accept row opens, and
-/// how it ends.
+/// How the description the vendor draws under the accept row opens.
 const DESCRIPTION: &str = "This conversation is at ";
-const DESCRIPTION_END: &str = "so it will be summarized on your next message.";
 
 /// An option's label less a description drawn on its own row after two
 /// spaces or more: `(label, description)`.
@@ -277,7 +319,7 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         .collect();
     let prose = body.join(" ");
     let question = const { crate::anchors::anchor_text("autocompact.question") };
-    if !prose.contains(&format!("{question} {size}k tokens instead?")) {
+    if !prose.contains(&format!("{question} {} tokens instead?", size_words(size))) {
         return None;
     }
     let description = if described.is_empty() {
@@ -340,13 +382,8 @@ impl PromptV2 {
         Some(Offer {
             accept,
             keep,
-            size: accept_size(&self.options[accept].label)?,
+            tokens: accept_size(&self.options[accept].label)?,
             focused,
-            compacts_next: self
-                .description
-                .split_once('\n')
-                .is_some_and(|(_, d)| d.starts_with(DESCRIPTION) && d.ends_with(DESCRIPTION_END)),
-            current: keep_current(&self.options[keep].label)?.to_string(),
         })
     }
 }

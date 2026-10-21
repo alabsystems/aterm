@@ -229,7 +229,7 @@ fn bool_encoding_matches_what_foundation_itself_emits() {
 fn the_struct_encodings_match_what_foundation_itself_emits() {
     // `-[NSValue rectValue]` gives the platform's own spelling of `CGRect`.
     let Some(enc) = platform_encoding(c"NSValue", c"rectValue") else {
-        return;
+        aterm_spec::host::could_not_run("Foundation here has no -[NSValue rectValue] to read");
     };
     assert!(
         enc.starts_with(CGRect::ENCODING),

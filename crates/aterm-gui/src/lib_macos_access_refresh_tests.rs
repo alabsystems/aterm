@@ -3,13 +3,13 @@
 
 use super::App;
 use super::consent_card::{CardPhase, GRANTED_CAPTION, Marker, Verdict, WATCH_FOR};
-use super::control_privacy::ConsentState;
+use super::consent_state::ConsentState;
 use super::message_reporters::KEY_FILE_ACCESS;
 use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
 use std::time::{Duration, Instant};
 
 /// Real App/card glue over synthetic published observations; never a live OS probe. The
-/// cache's own publication and invalidation are tested in `control_privacy`.
+/// cache's own publication and invalidation are tested in `consent_state`.
 pub(super) fn windowed(probe: FdaProbe) -> App {
     let mut app = App::headless_for_test();
     app.headless = false;
@@ -662,7 +662,7 @@ fn the_automatic_page_is_on_record_for_the_next_process_to_confirm() {
 /// `probe`, read by a window macOS holds responsible for itself: its own grant.
 fn own(probe: FdaProbe) -> ConsentState {
     let mut consent = ConsentState::with_cached_probe_for_test(probe);
-    consent.set_responsible_for_test(Ok);
+    consent.set_responsible_for_test(|pids| pids.iter().map(|&pid| Ok(pid)).collect());
     consent
 }
 
@@ -670,7 +670,7 @@ fn own(probe: FdaProbe) -> ConsentState {
 /// (here launchd's pid) responsible, and the probe reads ITS grant.
 fn foreign(probe: FdaProbe) -> ConsentState {
     let mut consent = ConsentState::with_cached_probe_for_test(probe);
-    consent.set_responsible_for_test(|_| Ok(1));
+    consent.set_responsible_for_test(|pids| pids.iter().map(|_| Ok(1)).collect());
     consent
 }
 
@@ -1649,6 +1649,41 @@ fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
         "ended with no key: no host to record"
     );
     HOST_READ.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// THE RECORD IS READ OFF THE EVENT LOOP: on a launch, a look that finds this Mac's
+/// line in the record unread starts its read on a thread of its own and waits, the
+/// ask still queued, instead of reading the home folder in the window's turn (a home
+/// on a network volume that stopped answering held the window there until the
+/// server came back); once that read has ended, the next look acts on it — here a
+/// record that names this Mac already, so the ask drops with no alert. NEGATIVE
+/// CONTROL: read in the look, the first look drops the ask.
+#[test]
+fn the_launch_asks_record_is_read_off_the_event_loop() {
+    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let config = root.path().join("aterm.toml");
+    crate::debugger_access::note_asked(&config, "READY-MAC", 1).expect("this Mac recorded");
+    let mut t = Instant::now();
+    let mut app = ready_to_ask(root.path(), owner_says_no);
+    app.debugger_launch =
+        crate::debugger_access::LaunchAskQueue::reading_record_for_test(|| Some("READY-MAC"));
+    let before = debugger_alerts().len();
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    assert!(app.debugger_launch.queued(), "the look waits for the read");
+    let began = Instant::now();
+    while app.debugger_launch.asked("READY-MAC").is_none() {
+        assert!(
+            began.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the record's read never ended"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    app.look_for_debugger_moment(later(&mut t), quiet);
+    assert!(
+        !app.debugger_launch.queued(),
+        "asked on this Mac already: dropped"
+    );
+    assert_eq!(debugger_alerts().len(), before, "no alert");
 }
 
 /// A headless instance never queues the ask, and one queued on it by hand drops at its

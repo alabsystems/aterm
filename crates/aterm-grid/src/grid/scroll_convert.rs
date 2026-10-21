@@ -1578,11 +1578,22 @@ pub(in crate::grid) fn next_complex_char<'a>(
     cursors: &mut RowToLineCursorState,
     col_u16: u16,
 ) -> Option<&'a Arc<str>> {
-    let (_, value) = extras
-        .complex_chars
-        .get(cursors.complex_idx)
-        .filter(|(col, _)| *col == col_u16)?;
-    cursors.complex_idx += 1;
+    next_keyed(&extras.complex_chars, &mut cursors.complex_idx, col_u16)
+}
+
+/// The value a history row's column-keyed extras list (ascending by column)
+/// holds for `col_u16`, if the cursor `idx` is on it, advancing past it.
+///
+/// The one column cursor every reader of a stored row's extras advances: the
+/// Line serializer, the ring fast materializer and the holder fence's row
+/// fingerprint, which visit a row's columns in ascending order.
+pub(in crate::grid) fn next_keyed<'a, T>(
+    entries: &'a [(u16, T)],
+    idx: &mut usize,
+    col_u16: u16,
+) -> Option<&'a T> {
+    let (_, value) = entries.get(*idx).filter(|(col, _)| *col == col_u16)?;
+    *idx += 1;
     Some(value)
 }
 
@@ -1595,12 +1606,7 @@ pub(in crate::grid) fn next_combining<'a>(
     cursors: &mut RowToLineCursorState,
     col_u16: u16,
 ) -> Option<&'a [char]> {
-    let (_, combining) = extras
-        .combining
-        .get(cursors.combining_idx)
-        .filter(|(col, _)| *col == col_u16)?;
-    cursors.combining_idx += 1;
-    Some(combining.as_slice())
+    next_keyed(&extras.combining, &mut cursors.combining_idx, col_u16).map(|marks| marks.as_slice())
 }
 
 /// Resolve one channel of a cell's colour the way the Line serializer does:
@@ -1619,15 +1625,8 @@ pub(in crate::grid) fn resolve_cell_color(
         return inline_raw;
     }
 
-    if let Some((_, [r, g, b])) = stored_colors
-        .get(*color_idx)
-        .filter(|(col, _)| *col == col_u16)
-    {
-        *color_idx += 1;
-        PackedColor::rgb(*r, *g, *b).0
-    } else {
-        default_raw
-    }
+    next_keyed(stored_colors, color_idx, col_u16)
+        .map_or(default_raw, |&[r, g, b]| PackedColor::rgb(r, g, b).0)
 }
 
 /// Accumulates a materializing line's attribute runs, allocating nothing until

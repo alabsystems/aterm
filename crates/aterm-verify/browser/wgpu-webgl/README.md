@@ -22,10 +22,9 @@ Recorded on 2026-10-16 on mac-arm (Apple M4 Pro, macOS), in the pinned
 chrome-headless-shell 155.0.8059.84 with WebGL2 on ANGLE's Metal backend, by
 `targo --unverified verify browser` on devendor/lgpu at the commit that added
 this directory, whose module was still the wgpu one. Every run writes its own
-frames in this layout, then to `target/verify/cells/browser/gpu-frames/` and
-since the lane runs more than one ANGLE backend to
-`target/verify/cells/browser/<backend>/gpu-frames/`; this directory is a copy
-of one such run. Two more runs on the same machine matched it byte for byte.
+frames in this layout, today to
+`target/verify/cells.noindex/browser/<backend>/gpu-frames/` (one per ANGLE backend);
+this directory is a copy of one such run. Two more runs on the same machine matched it byte for byte.
 
 On the recording's adapter the differential is byte for byte; on another it
 holds each frame within the CPU parity tolerance, and says so. The lane's

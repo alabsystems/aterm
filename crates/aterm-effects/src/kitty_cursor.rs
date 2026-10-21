@@ -87,8 +87,8 @@ const EXIT_FACE_FADE: f32 = 0.25;
 pub const CURSOR_FOLD_DURATION: Duration = Duration::from_millis(280);
 /// Scintillation rate of the exit star wink, in radians across the fade-out.
 ///
-/// Invariant: `EXIT_STAR_SCINT / FADE_OUT / TAU <= 3.2` Hz, the bound
-/// [`crate::cursor_rainbow`]'s `TWINKLE_SCINT` certifies. Pinned by
+/// Invariant: `EXIT_STAR_SCINT / FADE_OUT / TAU` Hz stays at or under the
+/// crate's [`crate::effect_util::TWINKLE_FLASH_BOUND_HZ`]. Pinned by
 /// `cat_exit_starwink_flash_rate_stays_under_the_photosensitivity_bound`.
 const EXIT_STAR_SCINT: f32 = 13.0;
 /// A newly unlocked collectible gets one guaranteed, bounded hello. This is
@@ -197,6 +197,27 @@ const STRIDE_PER_KEY: f32 = 0.5;
 /// Idle drift (cycles/sec) between keystrokes, so a pause eases the cat
 /// through its step instead of freezing it mid-stride.
 const STRIDE_IDLE_HZ: f32 = 1.4;
+/// Time constant (seconds) of the drawn stride phase's follow of the pump.
+///
+/// A key adds [`STRIDE_PER_KEY`] (half a cycle) at once, and half a cycle is
+/// `sin(θ + π) = −sin θ`: drawn directly, every key flipped the hover bob from
+/// one side to the other in a single present, up to 0.18 of a row (5 px at a
+/// 28 px cell), the jitter of a typing head. The drawn phase follows the pump
+/// at first order instead (never overshooting it), so a key's step lands over
+/// a few frames: typing at 9 keys a second, at most a tenth of a cycle per 8 ms
+/// present, under 0.06 of a row (1.7 px), while 89 % of each key's step still
+/// lands before the next key.
+const STRIDE_TAU: f32 = 0.05;
+/// The fastest (cycles/s) the drawn stride phase follows the pump, whatever the
+/// display's rate. The follow alone moves a share of the gap per present, and
+/// a present is twice as long at 60 Hz: a key's step there still moved the bob
+/// 0.1 of a row in one present. Capped at this rate, no present at 60 Hz or
+/// faster moves the bob more than `2π · BOB_AMP · STRIDE_RATE_MAX / 60`, about
+/// 0.05 of a row, and 9 keys a second (4.5 cycles a second of steps) are still
+/// kept up with. Faster typing than the cap is drawn a whole cycle short where
+/// the phase falls a cycle behind (the bob is the same there), so the head
+/// never steps on after the hand has stopped.
+const STRIDE_RATE_MAX: f32 = 5.5;
 /// Body compression on each footfall. Small: the step should read as weight, not
 /// as a bounce competing with the sing dance or the landing settle.
 const STRIDE_SQUASH: f32 = 0.05;
@@ -508,6 +529,10 @@ pub struct CursorCat {
     /// `None` re-seeds without integrating, so a resumed or foreign clock cannot
     /// fling the phase forward.
     stride_at: Option<Instant>,
+    /// The stride phase the pose draws (the bob, the footfall squash),
+    /// following [`Self::stride`] at [`STRIDE_TAU`], never faster than
+    /// [`STRIDE_RATE_MAX`].
+    stride_shown: f32,
     /// The collected identity currently accompanying the cursor.
     look: KittyLook,
     /// Appearance latch: a look change arriving while the companion is on
@@ -588,6 +613,7 @@ impl Default for CursorCat {
             flight: None,
             stride: 0.0,
             stride_at: None,
+            stride_shown: 0.0,
             // Toastbyte is designed for the cursor's 16–32 px band and pairs
             // with the rainbow kitty trail; the first collectible replaces it.
             look: KittyLook {
@@ -623,13 +649,17 @@ impl Default for CursorCat {
 }
 
 impl CursorCat {
-    /// Retire an ordinary cursor-following flight after the host observes a
-    /// cursor relocation that no authored movement candidate owned.
+    /// Retire an ordinary cursor-following flight when the caret it follows
+    /// stops being one coordinate: the host calls this on a torn coordinate
+    /// fence (`retire_torn_cursor_fx_host`), on a front-terminal switch, and
+    /// when the head's owner goes away (`retire_kitty_cursor_without_owner`).
+    /// A program's own cursor moves on a finished frame are no such fence (the
+    /// head escorts the caret the pet escorts, `PetTick::escort_caret`).
     ///
     /// Collection hellos and the sing-along are explicit presentations and are
     /// left alone. An earned flight is positioned from the live caret, so
-    /// letting it survive a program-owned CUP would make the sprite jump to an
-    /// unrelated cell even though the trail engine denied the move.
+    /// letting it survive the fence would make the sprite jump to an unrelated
+    /// cell.
     pub fn retire_unowned_cursor_motion(&mut self) {
         if self.collection_hello || self.sing > 0.0 || matches!(self.state, State::Hidden) {
             return;
@@ -643,6 +673,7 @@ impl CursorCat {
         self.flight = None;
         self.stride = 0.0;
         self.stride_at = None;
+        self.stride_shown = 0.0;
         self.reaction = CatReaction::Cruise;
         self.reaction_until = None;
         self.discovery_until = None;
@@ -1173,6 +1204,16 @@ impl CursorCat {
         self.stride_at = Some(now);
         if dt > 0.0 {
             self.stride = (self.stride + dt * STRIDE_IDLE_HZ).rem_euclid(1024.0);
+            // The pump only runs forward; the shortest way round its 1024-cycle
+            // wrap is the gap still to draw.
+            let mut gap = (self.stride - self.stride_shown + 512.0).rem_euclid(1024.0) - 512.0;
+            if gap >= 1.0 {
+                self.stride_shown = (self.stride_shown + gap.floor()).rem_euclid(1024.0);
+                gap = gap.fract();
+            }
+            let k = 1.0 - (-dt / STRIDE_TAU).exp();
+            let step = (gap * k).clamp(-STRIDE_RATE_MAX * dt, STRIDE_RATE_MAX * dt);
+            self.stride_shown = (self.stride_shown + step).rem_euclid(1024.0);
         }
     }
 
@@ -1185,7 +1226,7 @@ impl CursorCat {
     /// companion only gets happy eyes (owner, 2026-08-04).
     fn bob(&self) -> f32 {
         match self.flight {
-            Some(_) => (std::f32::consts::TAU * self.stride).sin() * BOB_AMP,
+            Some(_) => (std::f32::consts::TAU * self.stride_shown).sin() * BOB_AMP,
             None => 0.0,
         }
     }
@@ -1266,7 +1307,7 @@ impl CursorCat {
         // the cadence where in the step it is.
         self.stride_advance(now);
         if self.flight.is_some() {
-            let foot = (std::f32::consts::TAU * self.stride).cos().max(0.0) * bank;
+            let foot = (std::f32::consts::TAU * self.stride_shown).cos().max(0.0) * bank;
             scale_y *= 1.0 - STRIDE_SQUASH * foot;
             scale_x *= 1.0 + STRIDE_SQUASH * 0.7 * foot;
         }
@@ -1609,6 +1650,11 @@ impl CursorCat {
     pub fn frame(&mut self, now: Instant) -> CatFrame {
         let now = self.collection_sample_time(now);
         let s = self.decayed(now);
+        // The stride phase is advanced to `now` before the bob reads it. Read
+        // first, the bob drew the last frame's phase on an ordinary frame and
+        // this frame's on a key's (whose note advanced it), two frames' steps
+        // in one present: a tenth of a row at 60 Hz.
+        self.stride_advance(now);
         let bob = {
             let cruise = self.bob();
             if self.sing > 0.0 {
@@ -1884,7 +1930,7 @@ pub fn emit_exit_fx(
         }
         CatExit::StarWink => {
             // Photosensitivity: `EXIT_STAR_SCINT` keeps this 40%-amplitude
-            // swing on a white star under the 3.2 Hz bound (~2.76 Hz).
+            // swing on a white star under the flash bound (~2.76 Hz).
             let twinkle = 0.6 + 0.4 * (fade_out * EXIT_STAR_SCINT).sin();
             let sx = ax + geom.cw as i32; // by the cat's face
             let sy = ay - ch / 3;
@@ -2103,12 +2149,15 @@ mod tests {
     }
 
     /// Photosensitivity: the exit star wink (a 255-coverage white star with a
-    /// 40% swing) stays under the 3.2 Hz bound [`crate::cursor_rainbow`]
-    /// certifies for its own twinkle.
+    /// 40% swing) stays under the crate's flash bound.
     #[test]
     fn cat_exit_starwink_flash_rate_stays_under_the_photosensitivity_bound() {
         let hz = EXIT_STAR_SCINT / FADE_OUT / std::f32::consts::TAU;
-        assert!(hz <= 3.2, "the exit wink flashes at {hz} Hz");
+        let bound = crate::effect_util::TWINKLE_FLASH_BOUND_HZ;
+        assert!(
+            hz <= bound,
+            "the exit wink flashes at {hz} Hz (bound {bound})"
+        );
         // Anti-vacuity: `EXIT_STAR_SCINT = 0` would pass by deleting the wink.
         // Compile-time, because both operands are constants.
         const { assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints") };
@@ -2607,10 +2656,12 @@ mod tests {
         cat.set_look(KittyLook::for_launch(11));
         cat.on_summon(t, 1);
         let rest = cat.frame(t).bob;
-        // What was the apex of the hop: the anchor must not move there.
+        // What was the apex of the hop: the anchor must not move there. The
+        // cruise hover goes on through the reaction (the stride's idle drift),
+        // so the bob is that hover and nothing more.
         let apex = cat.frame(t + Duration::from_secs_f32(DELIGHT_HOLD / 2.0));
         assert!(
-            (apex.bob - rest).abs() < 0.05,
+            rest.abs() <= BOB_AMP && apex.bob.abs() <= BOB_AMP + 1e-6,
             "the companion holds its anchor through a delight: rest {rest}, \
              mid-reaction {}",
             apex.bob
@@ -3209,6 +3260,63 @@ mod tests {
     }
 
     // ───────────────────── living-cartoon pose animation ─────────────────────
+
+    /// A key steps the hover bob over a few frames, never in one: typing at
+    /// 9 and at 15 keys a second on a 120 Hz and on a 60 Hz display, no present
+    /// moves the bob by more than 0.06 of a row, and it still moves with the
+    /// keys. Negative control: the pump itself (what the bob drew until
+    /// 2026-10-20) jumps half a cycle on a key, flipping the bob by up to 0.18
+    /// of a row in one present. (With the follow alone, 60 Hz moved it 0.097
+    /// to 0.113 of a row in a present.)
+    #[test]
+    fn a_key_steps_the_hover_bob_over_frames_not_in_one() {
+        for (frame_us, key_us) in [
+            (8_333u64, 111_000u64),
+            (8_333, 66_000),
+            (16_667, 111_000),
+            (16_667, 66_000),
+        ] {
+            let label = format!("a present every {frame_us} µs, a key every {key_us} µs");
+            let t = Instant::now();
+            let mut cat = CursorCat::default();
+            cat.on_collect(t, KittyLook::default());
+            let bob_of = |stride: f32| (std::f32::consts::TAU * stride).sin() * BOB_AMP;
+            let (mut prev, mut prev_pump) = (None::<f32>, None::<f32>);
+            let (mut step, mut pump_step) = (0.0f32, 0.0f32);
+            let mut drawn = std::collections::BTreeSet::new();
+            let mut next_key = 40_000;
+            for i in 0..(3_000_000 / frame_us) {
+                let at = 40_000 + i * frame_us;
+                let ti = t + Duration::from_micros(at);
+                if at >= next_key {
+                    cat.on_key(ti, true);
+                    next_key += key_us;
+                }
+                let f = cat.frame(ti);
+                let pump = bob_of(cat.stride);
+                if let Some(p) = prev {
+                    step = step.max((f.bob - p).abs());
+                }
+                if let Some(p) = prev_pump {
+                    pump_step = pump_step.max((pump - p).abs());
+                }
+                drawn.insert((f.bob * 4096.0) as i64);
+                (prev, prev_pump) = (Some(f.bob), Some(pump));
+            }
+            assert!(
+                step <= 0.06,
+                "{label}: a present moved the bob {step} of a row"
+            );
+            assert!(
+                drawn.len() > 20,
+                "{label}: the bob still moves with the keys"
+            );
+            assert!(
+                pump_step > 0.1,
+                "{label}: control: the pump jumps a key's half cycle ({pump_step})"
+            );
+        }
+    }
 
     /// Stride pump: the pose moves as you type, driven by the keys rather than
     /// the rate-normalized level (which pins at 1.0 while the cat is visible).

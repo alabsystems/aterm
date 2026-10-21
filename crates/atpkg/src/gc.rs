@@ -2787,41 +2787,49 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn runs_from_sees_a_symlinked_launch_and_not_a_prefix_sibling() {
-        let scratch = layout("runs-from");
+        // Removed below, once the copy has run; never by an unwind before that.
+        let scratch = std::mem::ManuallyDrop::new(layout("runs-from"));
         let root = scratch.prefix.clone();
         let app = root.join("A.app");
         let macos = app.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).expect("layout");
-        let sleepy = macos.join("sleepy");
+        let exe = macos.join("A");
         // A copy of a platform binary off the system volume keeps Apple's signature
         // but not its standing: the kernel SIGKILLs it (Code Signature Invalid)
         // within about a second, and `runs_from` does not count the dead child. The
         // test passed only when its first poll beat that kill, and every run wrote a
-        // `sleepy` crash report (measured 2026-09-27: alive at +260 ms, killed by
-        // +1.3 s). Signed ad hoc, the copy sleeps for as long as it is told to.
-        aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/sleep"), &sleepy);
+        // crash report (measured 2026-09-27: alive at +260 ms, killed by +1.3 s).
+        // Signed ad hoc, the copy runs for as long as it is let. A copy of `cat`:
+        // the bundle is removed only once it has echoed a line, which a run of it
+        // proves is past macOS's assessment of its first exec (`runs_from`'s
+        // kernel path shows from the exec on, while the child may still wait on
+        // it; `aterm_uds::deadline::ad_hoc_copy` says why that matters).
+        aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), &exe);
         let link = root.join("via-link");
-        std::os::unix::fs::symlink(&sleepy, &link).expect("symlink");
+        std::os::unix::fs::symlink(&exe, &link).expect("symlink");
         std::fs::create_dir_all(root.join("A.app.rollback")).expect("sibling");
 
         assert_eq!(runs_from(&app), Some(false), "nothing runs from it yet");
-        // It outlives the minute's hang detector below; it is killed once seen.
-        // `spawnfd`'s: it holds its stdio and nothing else of this process, not
-        // another test thread's pipe while it lives.
+        // It runs until its stdin closes or it is killed once seen. `spawnfd`'s:
+        // it holds its stdio and nothing else of this process, not another test
+        // thread's pipe while it lives.
         let mut child = aterm_uds::spawnfd::command(&link)
-            .arg("120")
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
             .expect("spawn through the symlink");
+        let stdin = aterm_uds::deadline::cat_echoes(&mut child);
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while runs_from(&app) != Some(true) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let seen = runs_from(&app);
         let sibling = runs_from(&root.join("A.app.rollback"));
-        let alive = child.try_wait().expect("poll the sleeper").is_none();
+        let alive = child.try_wait().expect("poll the cat").is_none();
         let _ = child.kill();
         let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&root);
+        drop(stdin);
+        drop(std::mem::ManuallyDrop::into_inner(scratch));
         assert!(
             alive,
             "the process seen is running, not a dead one awaiting its reap"

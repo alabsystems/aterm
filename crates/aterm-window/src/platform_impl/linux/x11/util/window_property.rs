@@ -50,7 +50,7 @@ impl PropertyItem for u32 {
     const FORMAT: u8 = 32;
 
     fn extend_from(bytes: &[u8], out: &mut Vec<Self>) {
-        out.extend(bytes.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])));
+        out.extend(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_ne_bytes(*c)));
     }
 
     fn to_bytes(items: &[Self]) -> Vec<u8> {

@@ -102,6 +102,7 @@ use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 use aterm_window::keyboard::ModifiersState;
 use aterm_window::window::WindowId as WinitWindowId;
 
+use crate::agent_identity::{self, SpawnAdmit};
 use crate::platform::AppRt as _;
 use crate::{App, Session, Wake, WindowId};
 
@@ -363,10 +364,11 @@ pub(crate) enum IdentityPrep {
     /// Admit it as a request's spawn does
     /// ([`crate::agent_identity::check_for_spawn`]): an `inherited` one must
     /// exist; one the request named is made first, the verb's only create
-    /// path. Its folders are private before the fork, and its primer writes
-    /// off this thread. Refused, the waiter hears why in the words the
-    /// request's turn refused it with, and no failure row is posted
-    /// ([`Refusal`]).
+    /// path. Its folders are private before the fork, its primer writes off
+    /// this thread, and the admission holds it against `identities forget`
+    /// until the shell's own does ([`provision`]). Refused, the waiter hears
+    /// why in the words the request's turn refused it with, and no failure row
+    /// is posted ([`Refusal`]).
     Admit { inherited: bool },
     /// Make it first, if it does not exist (the picker's new-identity row), and
     /// admit it as a named one: a failure is the tab's failure row.
@@ -1104,28 +1106,35 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
         let cwd = resolved.unwrap_or_else(|| {
             cwd.or_else(|| crate::spawn_folder::PaneFolder::first_taken(pane_folders))
         });
-        let session = provision(identity.as_deref(), identity_prep).and_then(|()| {
-            // Forked once the event loop parks, bounded, waited at the fork
-            // itself (`watchdog::forks_wait_for_park`): the turn that booked
-            // this tab and the sweep after it would otherwise wait out the
-            // fork's malloc locks.
-            crate::watchdog::forks_wait_for_park(park_wait, || {
-                crate::spawn::spawn_session(
-                    id,
-                    window,
-                    rows,
-                    cols,
-                    cell_px,
-                    &factory,
-                    &proxy,
-                    cwd.as_deref(),
-                    observe.as_ref(),
-                    identity.as_deref(),
-                    task.as_ref(),
-                    None,
-                )
-            })
-        });
+        let session = state_answers()
+            .and_then(|()| provision(identity.as_deref(), identity_prep))
+            .and_then(|admission| {
+                // Forked once the event loop parks, bounded, waited at the fork
+                // itself (`watchdog::forks_wait_for_park`): the turn that booked
+                // this tab and the sweep after it would otherwise wait out the
+                // fork's malloc locks.
+                let session = crate::watchdog::forks_wait_for_park(park_wait, || {
+                    crate::spawn::spawn_session(
+                        id,
+                        window,
+                        rows,
+                        cols,
+                        cell_px,
+                        &factory,
+                        &proxy,
+                        cwd.as_deref(),
+                        observe.as_ref(),
+                        identity.as_deref(),
+                        task.as_ref(),
+                        None,
+                    )
+                });
+                // Held until here: the session holds its identity itself from the
+                // shell's own check on (`agent_identity::admit_existing`), so no
+                // forget lands between this admission and the fork.
+                drop(admission);
+                session
+            });
         park_reader(session, window, &proxy, &factory)
     }))
     .unwrap_or_else(|_| (Err(std::io::Error::other("the spawn panicked")), None));
@@ -1141,11 +1150,50 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
     );
 }
 
+/// Whether aterm's own folder ([`aterm_types::dirs::state_dir`]) answers, for
+/// a spawn about to write there before its fork (the shell integration's
+/// loader, the child's edge file), whose shell then starts from the home folder
+/// it is in. On a network volume that stopped answering the spawn is refused
+/// by name instead of holding this thread, and every tab asked after it, for
+/// the mount's whole timeout: a home that stopped answering mid-run held New
+/// Tab and each spawn after it until the server came back (a macOS 27 guest,
+/// 2026-10-20). [`state_answers_with`] over this process's folder, judged
+/// local once: a local one costs a spawn a load.
+fn state_answers() -> std::io::Result<()> {
+    static LOCAL: OnceLock<bool> = OnceLock::new();
+    state_answers_with(
+        aterm_types::dirs::state_dir().as_deref(),
+        |state| *LOCAL.get_or_init(|| !crate::spawn_folder::on_network_volume(state)),
+        crate::spawn_folder::volume_answers,
+    )
+}
+
+/// [`state_answers`], PURE over the folder, whether its volume is local, and
+/// whether a look at it answered ([`crate::spawn_folder::volume_answers`]),
+/// asked only of a folder that is not local.
+fn state_answers_with(
+    state: Option<&std::path::Path>,
+    local: impl FnOnce(&std::path::Path) -> bool,
+    answers: impl FnOnce(&std::path::Path) -> bool,
+) -> std::io::Result<()> {
+    match state {
+        Some(state) if !local(state) && !answers(state) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{} did not answer", state.display()),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Ready agent identity `identity` for the spawn as `prep` says: admit it, or
-/// make it first. With [`IdentityPrep::Exists`] the spawn's own check that it
-/// exists is all.
-fn provision(identity: Option<&str>, prep: IdentityPrep) -> std::io::Result<()> {
-    provision_with(identity, prep, crate::agent_identity::check_for_spawn)
+/// make it first, and hand back the admission, which holds the identity
+/// against `identities forget` while the spawner keeps it. With
+/// [`IdentityPrep::Exists`] the spawn's own check that it exists is all.
+fn provision(
+    identity: Option<&str>,
+    prep: IdentityPrep,
+) -> std::io::Result<Option<agent_identity::Admission>> {
+    provision_with(identity, prep, agent_identity::check_for_spawn)
 }
 
 /// [`provision`] through `admit` ([`crate::agent_identity::check_for_spawn`]
@@ -1153,26 +1201,25 @@ fn provision(identity: Option<&str>, prep: IdentityPrep) -> std::io::Result<()> 
 fn provision_with(
     identity: Option<&str>,
     prep: IdentityPrep,
-    admit: impl FnOnce(&str, crate::agent_identity::SpawnAdmit) -> std::io::Result<std::path::PathBuf>,
-) -> std::io::Result<()> {
-    use crate::agent_identity::SpawnAdmit;
+    admit: impl FnOnce(&str, SpawnAdmit) -> std::io::Result<agent_identity::Admission>,
+) -> std::io::Result<Option<agent_identity::Admission>> {
     let Some(name) = identity else {
-        return Ok(());
+        return Ok(None);
     };
     match prep {
-        IdentityPrep::Exists => Ok(()),
+        IdentityPrep::Exists => Ok(None),
         IdentityPrep::Admit { inherited } => {
             let how = if inherited {
                 SpawnAdmit::Inherited
             } else {
                 SpawnAdmit::Named
             };
-            admit(name, how).map(drop).map_err(|e| {
+            admit(name, how).map(Some).map_err(|e| {
                 std::io::Error::new(e.kind(), Refusal(format!("identity {name}: {e}")))
             })
         }
         IdentityPrep::Create => admit(name, SpawnAdmit::Named)
-            .map(drop)
+            .map(Some)
             .map_err(|e| std::io::Error::new(e.kind(), format!("identity {name}: {e}"))),
     }
 }
@@ -3548,6 +3595,36 @@ pub(crate) mod tests {
         assert_eq!(held_status_wake(Some(past), None), Some(past));
     }
 
+    /// A SPAWN WHOSE STATE FOLDER DID NOT ANSWER IS REFUSED BY NAME, before
+    /// anything is written or forked: on a volume that is not local whose look
+    /// did not answer, the spawner says which folder (`TimedOut`, a failure
+    /// row's words, never a [`Refusal`]) and goes on to the next tab, where it
+    /// waited out the mount; a local folder is never looked at, and one that
+    /// answered, or none at all, lets the spawn go on. NEGATIVE CONTROL: a gate
+    /// that does not ask the look lets the silent folder through.
+    #[test]
+    fn a_spawn_whose_state_folder_did_not_answer_is_refused_by_name() {
+        let state = std::path::Path::new("/aterm-test/net-home/Library/Application Support/aterm");
+        let refused = state_answers_with(Some(state), |_| false, |_| false)
+            .expect_err("a silent network folder");
+        assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            refused.to_string(),
+            format!("{} did not answer", state.display())
+        );
+        assert_eq!(refusal(&refused), None, "a failure, said in a row");
+        assert!(state_answers_with(Some(state), |_| false, |_| true).is_ok());
+        assert!(
+            state_answers_with(
+                Some(state),
+                |_| true,
+                |_| panic!("a local folder is not looked at")
+            )
+            .is_ok()
+        );
+        assert!(state_answers_with(None, |_| false, |_| false).is_ok());
+    }
+
     /// The spawner makes the identity a request names (`spawn identity=<name>`,
     /// `Admit` with nothing inherited) or a new-identity row names (`Create`)
     /// before the shell that wears it, so nothing is made for a spawn the main
@@ -3557,7 +3634,7 @@ pub(crate) mod tests {
     /// NEGATIVE CONTROL: the inherited admission of a missing name is refused.
     #[test]
     fn the_spawner_makes_a_named_identity_before_its_shell() {
-        use crate::agent_identity::{SpawnAdmit, check_for_spawn_in};
+        use crate::agent_identity::check_for_spawn_in;
         let state = aterm_tempfile::tempdir().expect("scratch state root");
         let root = state.path().join("identities");
         let primed = std::cell::RefCell::new(Vec::new());

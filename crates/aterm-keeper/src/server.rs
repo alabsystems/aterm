@@ -182,8 +182,9 @@ impl KeeperEnv for Env<'_> {
 
 /// What the crash marker of window `pid` says now (§5.4 row 3). The keeper builds the file names
 /// itself from the kernel's pid for the connection and the start the HELLO named: both
-/// `crash-marker-<pid>-<nanos>-<app|other>.log` (an update's candidate renames `-other` to `-app`
-/// at its Commit) and the `.seen` name a later start gives a dead marker it read. So a window can
+/// `crash-marker-<pid>-<nanos>-<app|other|lab>.log` (an update's candidate renames `-other` to
+/// `-app` at its Commit; a lab desk's is `-lab`, `aterm-gui`'s `crash_signal::MarkerOwner::Lab`)
+/// and the `.seen` name a later start gives a dead marker it read. So a window can
 /// point the keeper at nothing but its own marker. Only an absolute directory of ours counts: a
 /// marker missing from a directory the keeper cannot see is no evidence. Nothing is written, and
 /// a found marker is opened read-only, never following a symlink, only to try its lock.
@@ -198,7 +199,7 @@ pub fn read_marker(pid: u32, marker: &MarkerRef) -> MarkerEvidence {
         Ok(m) if m.file_type().is_dir() && m.uid() == aterm_uds::peer::our_uid() => {}
         _ => return MarkerEvidence::Unknown,
     }
-    for owner in ["app", "other"] {
+    for owner in ["app", "other", "lab"] {
         let name = format!("crash-marker-{pid}-{}-{owner}.log", marker.nanos);
         for (file, seen) in [(name.clone(), false), (format!("{name}.seen"), true)] {
             let path = dir.join(file);
@@ -968,6 +969,41 @@ mod tests {
     use super::*;
     use crate::core::RecordState;
     use crate::wire::{CAP_SENDS_BYE, PeerClass};
+
+    /// A LAB DESK'S MARKER IS READ AS ANY MARKER IS (session log Phase 6, step 6C-4): `aterm-gui`'s
+    /// lab desk names its marker `crash-marker-<pid>-<nanos>-lab.log`, and the keeper reads it as
+    /// it reads an `app` or `other` one: missing, the exit path ran (Released); there with its
+    /// lock free, a death with no exit path (Dead), and so its consumed `.seen` name; held, a live
+    /// owner (Held). NEGATIVE CONTROL (scratch revert): with `lab` out of the owners the keeper
+    /// builds names for, the dead marker reads Released, as a quit would.
+    #[test]
+    fn a_lab_desks_marker_is_read_as_any_marker_is() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::env::temp_dir().join(format!("akk-unit-{}-lab-marker", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch log dir");
+        let pid = 4242;
+        let m = MarkerRef {
+            nanos: 7,
+            dir: dir.as_os_str().as_bytes().to_vec(),
+        };
+        assert_eq!(read_marker(pid, &m), MarkerEvidence::Released, "none yet");
+        let marker = dir.join(format!("crash-marker-{pid}-7-lab.log"));
+        std::fs::write(&marker, b"").expect("a dead lab marker");
+        assert_eq!(read_marker(pid, &m), MarkerEvidence::Dead);
+        let held = std::fs::File::open(&marker).expect("open the marker");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the owner lock a live lab desk holds, let go when the file drops below"
+        )]
+        held.try_lock().expect("the owner lock");
+        assert_eq!(read_marker(pid, &m), MarkerEvidence::Held);
+        drop(held);
+        let seen = dir.join(format!("crash-marker-{pid}-7-lab.log.seen"));
+        std::fs::rename(&marker, &seen).expect("consumed");
+        assert_eq!(read_marker(pid, &m), MarkerEvidence::Dead, "a consumed one");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn a_status_limit_inside_a_multibyte_character_keeps_valid_utf8() {

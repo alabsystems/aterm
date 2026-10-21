@@ -112,9 +112,12 @@ fn check_every_cell(root: &Path) -> (bool, String) {
 // The fixture workspace
 // ---------------------------------------------------------------------------
 
-/// A miniature aterm workspace, rebuilt from scratch for each test.
+/// A miniature aterm workspace, rebuilt from scratch for each test in a directory of its own
+/// under the cargo target tmpdir, removed with it: two runs of this binary at once (a check
+/// beside a hand run) never build in, or remove, one another's.
 struct Fixture {
     root: PathBuf,
+    _dir: aterm_tempfile::TempDir,
 }
 
 impl Fixture {
@@ -122,15 +125,20 @@ impl Fixture {
     /// live in every cell, named in NOTICE and in the fork ledger, with no
     /// carve rows and no ratchet file.
     fn baseline(name: &str) -> Self {
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("forge-red-{name}"));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = env!("CARGO_TARGET_TMPDIR");
+        std::fs::create_dir_all(tmp).expect("the target tmpdir");
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("forge-red-{name}-"))
+            .tempdir_in(tmp)
+            .expect("fixture root");
+        let root = dir.path().to_path_buf();
         // `target/` exists so nested `targo tree` runs keep cargo's rustc info
         // cache (`target/.rustc_info.json`, written only into an EXISTING
         // target dir): 0.75 s per `tree` cold against 0.01 s warm. The real
         // checkout has a `target/` too, and forge never reads the root
         // listing, so no obligation sees it.
         std::fs::create_dir_all(root.join("target")).expect("fixture root");
-        let fx = Self { root };
+        let fx = Self { root, _dir: dir };
 
         let upstream =
             aterm_forge::loc::package_dir(&repo_root(), &PkgId::new(FORK, fork_version()), None)

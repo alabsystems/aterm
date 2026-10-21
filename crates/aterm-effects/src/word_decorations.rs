@@ -355,6 +355,11 @@ pub struct PetCursorFrame {
     pub coat: u8,
     pub iris: u8,
     pub pet: crate::kitty_pet::PetFrame,
+    /// The light page under the pet: the terminal ground where it is no dark
+    /// theme (`aterm_render::theme_is_dark`), `None` on a dark one. Its ♪ and
+    /// ♥ then take the paper law's point-mark ink
+    /// ([`crate::rainbow_kitty::ribbon::paper_mark_ink`]).
+    pub page: Option<u32>,
 }
 
 /// One resolved cursor-companion emission (grouped so the render call does not
@@ -365,6 +370,8 @@ pub struct KittyCursorFrame {
     pub look: KittyLook,
     pub colors: CatColorKey,
     pub bob: f32,
+    /// Whole rows the seat raises the head ([`KittyCursorLayout::lift`]).
+    pub lift: f32,
     pub alpha: u8,
     /// The pose ([`crate::kitty_cursor::CatPose`]): squash/stretch and lean
     /// applied to the dest rect, plus the baked eye frame. The cat bakes at
@@ -405,7 +412,13 @@ pub struct KittyCursorLayout {
     pub geom: EffectGeom,
     pub cursor: (u16, u16),
     pub look: KittyLook,
+    /// The hover bob, in cell heights: drawn as it is, never smoothed.
     pub bob: f32,
+    /// Whole rows the companion router's seat raises the head off its rest (the
+    /// one-row-up seat of `rainbow_kitty::companion::placement`). Unlike the bob
+    /// it moves the rest position itself, which the settled follower glides
+    /// ([`WordDecorations::kitty_cursor_at_placement`]).
+    pub lift: f32,
 }
 
 /// The cursor companion's prospective pixel footprint, resolved by the same
@@ -2740,6 +2753,7 @@ impl WordDecorations {
             cursor: (crow, ccol),
             look,
             bob,
+            lift,
         } = layout;
         if self.kitty_disabled || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
@@ -2785,7 +2799,8 @@ impl WordDecorations {
         } else {
             0
         };
-        let y = rest_top - rise + (bob * ch_i as f32).round() as i32;
+        let y = rest_top - rise - (lift * ch_i as f32).round() as i32
+            + (bob * ch_i as f32).round() as i32;
         Some(CatFootprint { x, y, w, h })
     }
 
@@ -2967,6 +2982,7 @@ impl WordDecorations {
             cursor: frame.cursor,
             look: frame.look,
             bob: frame.bob,
+            lift: frame.lift,
         })?;
         self.kitty_cursor_at_placement(frame, KittyCursorPlacement::settled(footprint), free)
     }
@@ -2986,6 +3002,7 @@ impl WordDecorations {
             look,
             colors,
             bob,
+            lift: seat_lift,
             alpha,
             pose,
             sing,
@@ -3007,6 +3024,7 @@ impl WordDecorations {
                 cursor,
                 look,
                 bob,
+                lift: seat_lift,
             }),
             "cursor-kitty placement must match the frame it is emitted with"
         );
@@ -3101,9 +3119,9 @@ impl WordDecorations {
         };
         let (sprite_x, sprite_y) = match placement.leg {
             // Settled leg: one exponential rest-position follower
-            // ([`Self::PLACE_TAU`]) smooths the per-key x hop, margin-rise steps
-            // and unauthenticated wraps. The target excludes the hover bob
-            // (re-added after, keeping full amplitude and phase). It snaps
+            // ([`Self::PLACE_TAU`]) smooths the per-key x hop, margin-rise steps,
+            // the seat's lift and unauthenticated wraps. The target excludes the
+            // hover bob (re-added after, keeping full amplitude and phase). It snaps
             // instead when continuity is dead (first emission, or a gap at or
             // past `CURSOR_FOLD_DURATION`) or the target jumped more than two
             // rows.
@@ -3335,6 +3353,7 @@ impl WordDecorations {
             coat,
             iris,
             pet,
+            page,
         } = frame;
         // Keyed on presence (`lane_alpha`), not the composed body alpha: the
         // arrival multiply can round a faint body's `alpha` to 0 while its
@@ -3427,12 +3446,10 @@ impl WordDecorations {
         // fresh mote emerges from behind the cat.
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [None; crate::kitty_pet::PET_MOTES_MAX];
-        let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
-        // Vertical bound: a mote born at the pet's `head_anchor` (~0.6 rows
-        // above its row) would have negative y on row 0, and the tab-strip
-        // splice shifts free sprites down into the strip, painting over the tab
-        // titles.
-        let grid_h = i32::from(geom.rows).saturating_mul(i32::from(geom.cell_h));
+        // Held inside the grid on both axes ([`crate::kitty_pet::mote_box_px`]):
+        // a mote born at the pet's `head_anchor` (~0.6 rows above its row)
+        // would have negative y on row 0, and the tab-strip splice shifts free
+        // sprites down into the strip, painting over the tab titles.
         for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
             // `pet.alpha` (presence × arrival), not `lane_alpha`: motes are the
             // live body's accents and dim with it. Ghosts own no motes.
@@ -3440,7 +3457,7 @@ impl WordDecorations {
             if alpha == 0 {
                 continue;
             }
-            let side = Self::pet_mote_side(geom.cell_h);
+            let side = crate::kitty_pet::mote_tile_side(geom.cell_h);
             let bucket = Self::pet_mote_rot_bucket(m.rot);
             let host = Self::pet_mote_host_id(m.kind, bucket, side);
             // Cache first: `host_peek` is `host_tile`'s hit branch (same lookup
@@ -3453,18 +3470,19 @@ impl WordDecorations {
             }) else {
                 continue; // budget spent; this mote lands next frame
             };
-            let dest =
-                ((f32::from(side) * m.scale).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
-            if i32::from(dest) > grid_w || i32::from(dest) > grid_h {
+            // The box the brain's ♪/♥ lanes are judged by
+            // ([`crate::kitty_pet::mote_box_px`]): one placement, two readers.
+            let Some((x, y, dest)) = crate::kitty_pet::mote_box_px(
+                (m.col, m.row),
+                m.scale,
+                (geom.cell_w, geom.cell_h),
+                (geom.cols, geom.rows),
+            ) else {
                 continue;
-            }
-            let cx = (m.col * f32::from(geom.cell_w)).round() as i32;
-            let cy = (m.row * f32::from(geom.cell_h)).round() as i32;
+            };
             *slot = Some(FreeSprite {
-                x: (cx - i32::from(dest) / 2).clamp(0, (grid_w - i32::from(dest)).max(0)),
-                // The y twin of the x clamp: a drifting mote hugs the grid edge
-                // and never reaches the tab strip.
-                y: (cy - i32::from(dest) / 2).clamp(0, (grid_h - i32::from(dest)).max(0)),
+                x,
+                y,
                 w: dest,
                 h: dest,
                 ax: tile.ax,
@@ -3474,8 +3492,12 @@ impl WordDecorations {
                 // A ♪/♥ born over a lit ribbon wears the ribbon colour offered
                 // at that cell ([`crate::kitty_pet::PetMoteSprite::rgb`]),
                 // already snapped to one of the seven stops; other motes keep
-                // the per-kind tint.
-                tint: m.rgb.unwrap_or_else(|| Self::pet_mote_tint(m.kind, colors)),
+                // the per-kind tint. On paper either takes the mark's ink.
+                tint: Self::pet_mote_on_page(
+                    m.kind,
+                    m.rgb.unwrap_or_else(|| Self::pet_mote_tint(m.kind, colors)),
+                    page,
+                ),
                 alpha,
                 flip_x: false,
                 z: FreeZ::OverText,
@@ -3761,12 +3783,6 @@ impl WordDecorations {
         0x0096_98A6,
     ];
 
-    /// Natural (square) mote tile side for a cell of height `cell_h`: a bit
-    /// over half a cell — an accent, never a character-sized mark.
-    fn pet_mote_side(cell_h: u16) -> u16 {
-        ((f32::from(cell_h.max(4)) * 0.55).round() as u16).max(6)
-    }
-
     /// Quantize a rotation to its bake bucket.
     fn pet_mote_rot_bucket(rot: f32) -> u32 {
         let turn = rot.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
@@ -3808,6 +3824,23 @@ impl WordDecorations {
             }
             crate::kitty_pet::PetMoteKind::Note => mix_rgb(0x00FF_C24D, accent, 0.15),
             crate::kitty_pet::PetMoteKind::Heart => mix_rgb(0x00FF_6B9A, accent, 0.15),
+        }
+    }
+
+    /// THE PAPER LAW FOR THE PET'S ♪ AND ♥: on a light page each keeps its
+    /// hue at the point mark's contrast
+    /// ([`crate::rainbow_kitty::ribbon::paper_mark_ink`], 4.5:1 against the
+    /// page), so a cheer's gold note reads as amber and its pink heart as rose
+    /// on white or cream, never as a pale smudge. Dust and the z's are
+    /// neutral and keep their tint (the law bends a hue, and a grey has
+    /// none); a dark ground changes nothing.
+    fn pet_mote_on_page(kind: crate::kitty_pet::PetMoteKind, tint: u32, page: Option<u32>) -> u32 {
+        match (kind, page) {
+            (
+                crate::kitty_pet::PetMoteKind::Note | crate::kitty_pet::PetMoteKind::Heart,
+                Some(bg),
+            ) => crate::rainbow_kitty::ribbon::paper_mark_ink(tint, bg),
+            _ => tint,
         }
     }
 
@@ -8665,10 +8698,30 @@ enum PeekDir {
 /// carrying a visible glyph.
 ///
 /// A ceiling, not a veto, so a `kitty` inside a TUI prompt box (`╭─╮ │ ╰─╯`)
-/// still gets its cat. Cats are [`FreeZ::UnderText`] sprites, so glyphs in the
-/// band stay legible; only a near-solid wall of text is rejected, because fur
-/// behind it reads as noise.
+/// still gets its cat: a frame's lines are not letters. A band with a letter
+/// in it is no home at all ([`band_has_letter`]): cats are
+/// [`FreeZ::UnderText`] sprites, but a light letter over white fur reads at
+/// 1.4:1 (a fox's head over the line an Enter just printed).
 const CAT_MAX_BAND_OCCUPANCY: f32 = 0.75;
+
+/// Whether any cell of `[r0, r1] × [c0, c1]` holds a letter: a visible glyph
+/// that is not a box-drawing or block element (a frame's line, which a head
+/// may sit behind). A head never lands on a letter, so a band holding one is
+/// not a side it can enter from.
+fn band_has_letter(cells: &[Vec<RenderCell>], r0: usize, r1: usize, c0: usize, c1: usize) -> bool {
+    (r0..=r1).any(|r| {
+        cells.get(r).is_some_and(|line| {
+            (c0..=c1).any(|c| {
+                line.get(c).is_some_and(|cell| {
+                    cell.wide
+                        || (!cell.ch.is_whitespace()
+                            && cell.ch != '\0'
+                            && !('\u{2500}'..='\u{259F}').contains(&cell.ch))
+                })
+            })
+        })
+    })
+}
 
 /// Fraction of the sampled cells in `[r0, r1] × [c0, c1]` carrying a visible
 /// glyph, or `None` when the span is degenerate or exceeds the 64-cell
@@ -8710,10 +8763,11 @@ fn band_occupancy(
 }
 
 /// Resolve the head's entry direction for one prospective cat, or `None` when
-/// neither side can host it. Both bands are scored by [`band_occupancy`] (the
-/// word's own row folded in) and the clearer wins, ties to [`PeekDir::Up`]. A
-/// band off the viewport is unavailable (so the top row peeks down); both
-/// over [`CAT_MAX_BAND_OCCUPANCY`] is a text wall and no cat draws.
+/// neither side can host it. A band holding a letter is unavailable
+/// ([`band_has_letter`]), as is one off the viewport (so the top row peeks
+/// down); the rest are scored by [`band_occupancy`] (the word's own row
+/// folded in) and the clearer wins, ties to [`PeekDir::Up`]; both over
+/// [`CAT_MAX_BAND_OCCUPANCY`] is a wall and no cat draws.
 fn cat_peek_plan(
     cells: &[Vec<RenderCell>],
     geom: EffectGeom,
@@ -8765,12 +8819,14 @@ fn cat_peek_plan(
         // three-row silhouette and the chin slice is mostly behind the word.
         Some(own.map_or(band, |o| (band * 2.0 + o) / 3.0))
     };
-    let up = (trigger >= band_rows)
-        .then(|| side(trigger - band_rows, trigger - 1))
-        .flatten();
-    let down = (trigger + band_rows < rows)
-        .then(|| side(trigger + 1, trigger + band_rows))
-        .flatten();
+    let up = (trigger >= band_rows
+        && !band_has_letter(cells, trigger - band_rows, trigger - 1, c0, c1))
+    .then(|| side(trigger - band_rows, trigger - 1))
+    .flatten();
+    let down = (trigger + band_rows < rows
+        && !band_has_letter(cells, trigger + 1, trigger + band_rows, c0, c1))
+    .then(|| side(trigger + 1, trigger + band_rows))
+    .flatten();
     match (up, down) {
         (Some(u), Some(d)) => {
             let (score, dir) = if d < u {
@@ -9008,6 +9064,109 @@ mod tests {
         );
     }
 
+    /// THE PAPER LAW FOR THE PET'S ♪ AND ♥ (the cheer's motes,
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3): on white paper
+    /// (Aterm Day's ground) and on cream (Linen's) each ♪/♥ of a cheer is
+    /// drawn at 4.5:1 or more against the page with its hue kept; on a dark
+    /// ground each keeps its per-kind tint, untouched. NEGATIVE CONTROL (run
+    /// by hand, files restored): the page ignored (`pet_mote_on_page`
+    /// returning the tint) draws the gold ♪ at under 2:1 on white.
+    #[test]
+    fn a_cheers_motes_on_paper_keep_their_hue_at_the_marks_contrast() {
+        use crate::kitty_pet::{PetMoteKind, PetMoteSprite};
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 12,
+            cols: 40,
+        };
+        let mut pet =
+            crate::kitty_pet::PetBrain::default().tick_static_capture(crate::kitty_pet::PetSense {
+                caret_drawn: true,
+                now: Instant::now(),
+                caret: Some((6, 10)),
+                rows: geom.rows,
+                cols: geom.cols,
+                cell_w: geom.cell_w,
+                cell_h: geom.cell_h,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+                wrapped: false,
+            });
+        assert!(pet.alpha > 0, "fixture: the pet is on glass");
+        for (k, kind) in [PetMoteKind::Note, PetMoteKind::Heart, PetMoteKind::Note]
+            .into_iter()
+            .enumerate()
+        {
+            pet.motes[k] = Some(PetMoteSprite {
+                kind,
+                col: 14.0 + k as f32,
+                row: 4.0,
+                scale: 1.0,
+                rot: 0.4,
+                alpha: 255,
+                rgb: None,
+            });
+        }
+        let tints = |page: Option<u32>| {
+            let mut wd = WordDecorations::default();
+            let mut free = Vec::new();
+            // A frame's bake budget takes one new tile family at a time: the
+            // third frame draws every mote from warm tiles.
+            for _ in 0..3 {
+                free.clear();
+                wd.begin_host_frame();
+                let _ = wd.pet_cursor(
+                    PetCursorFrame {
+                        geom,
+                        colors: CatColorKey::default(),
+                        coat: 0,
+                        iris: 0,
+                        pet,
+                        page,
+                    },
+                    &mut free,
+                );
+            }
+            // The body is the one white-tinted sprite; the rest are motes.
+            free.iter()
+                .filter(|s| s.tint != 0x00FF_FFFF)
+                .map(|s| s.tint)
+                .collect::<Vec<_>>()
+        };
+        let contrast = |a: u32, b: u32| {
+            let (ya, yb) = (relative_luminance(a), relative_luminance(b));
+            (ya.max(yb) + 0.05) / (ya.min(yb) + 0.05)
+        };
+        let hue = |rgb: u32| crate::color_math::rgb2hsv(rgb).0;
+        let dark = tints(None);
+        assert_eq!(dark.len(), 3, "fixture: the three motes drew: {dark:06x?}");
+        for (k, &tint) in dark.iter().enumerate() {
+            let kind = pet.motes[k].map(|m| m.kind).unwrap();
+            let want = WordDecorations::pet_mote_tint(kind, CatColorKey::default());
+            assert_eq!(tint, want, "a dark ground keeps the per-kind tint");
+        }
+        for (name, bg) in [("white", 0x00F8_FAFDu32), ("cream", 0x00F9_F3E6)] {
+            let paper = tints(Some(bg));
+            assert_eq!(paper.len(), 3, "{name}");
+            for (&ink, &tint) in paper.iter().zip(&dark) {
+                assert!(
+                    contrast(ink, bg) >= 4.5 - 1e-3,
+                    "{name}: {ink:06x} on {bg:06x} reads at {:.2}:1",
+                    contrast(ink, bg)
+                );
+                let d = (hue(ink) - hue(tint)).rem_euclid(360.0);
+                assert!(
+                    d.min(360.0 - d) <= 12.0,
+                    "{name}: {ink:06x} keeps {tint:06x}'s hue ({} vs {})",
+                    hue(ink),
+                    hue(tint)
+                );
+            }
+        }
+    }
+
     /// The one-body law: the first companion body to land owns the host frame
     /// and the second is refused.
     #[test]
@@ -9064,6 +9223,7 @@ mod tests {
                     coat: 0,
                     iris: 0,
                     pet,
+                    page: None,
                 },
                 &mut free,
             )
@@ -11964,6 +12124,49 @@ mod tests {
         assert!(occ.cat_peek_down, "it takes the clear side instead");
     }
 
+    /// A HEAD NEVER LANDS ON LETTERS: a word on the bottom row (no room
+    /// below) under a line of text that runs through where its head would
+    /// rise gets no head (ink only), as the fox an Enter at the bottom of a
+    /// full screen printed did, its head over the echoed command's letters
+    /// (1.4:1). Negative controls: the same word with the line above blank
+    /// peeks up; a frame's box-drawing lines there still host it.
+    #[test]
+    fn a_head_never_lands_on_letters() {
+        let (rows, cols) = (4usize, 20usize);
+        let c = cfg();
+        let g = EffectGeom {
+            rows: rows as u16,
+            ..geom20()
+        };
+        let t0 = Instant::now();
+        let plan = |above: &[u8]| {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            let mut bytes = b"\r\n\r\n".to_vec();
+            bytes.extend_from_slice(above);
+            bytes.extend_from_slice(b"\r\nsee my kitty");
+            term.process(&bytes);
+            let wd = scan_grid(&mut term, &c, g, t0, None);
+            let occ = feline(&wd);
+            assert_eq!(occ.row, 3, "fixture: the word is on the bottom row");
+            (occ.cat_text_clear, occ.cat_peek_down)
+        };
+        assert_eq!(
+            plan(b"the quick brown fox jumps"),
+            (false, false),
+            "a head rose over the letters above"
+        );
+        assert_eq!(
+            plan(b""),
+            (true, false),
+            "control: a blank line above hosts it"
+        );
+        assert_eq!(
+            plan("\u{2500}".repeat(cols).as_bytes()),
+            (true, false),
+            "control: a frame's lines above host it"
+        );
+    }
+
     /// A feline occurrence with a hand-picked ordinary genome; idents keyed off
     /// (row, start) so multi-cat tests get distinct identities.
     fn cat_occ(row: u16, start: u16, end: u16, gkey: u64, now: Instant) -> Occurrence {
@@ -12063,6 +12266,7 @@ mod tests {
             look: KittyLook::default(),
             colors: CatColorKey::default(),
             bob: 0.0,
+            lift: 0.0,
             alpha: 255,
             pose: crate::kitty_cursor::CatPose::STILL,
             sing: 0.0,
@@ -12077,6 +12281,7 @@ mod tests {
             cursor,
             look: KittyLook::default(),
             bob: 0.0,
+            lift: 0.0,
         }
     }
 
@@ -17510,6 +17715,86 @@ mod tests {
         );
     }
 
+    /// The seat's lift glides: the companion router raising the head a row
+    /// (its seat over inked text) and setting it back down moves the drawn body
+    /// by at most the follower's step per 8 ms present, and it lands on the raw
+    /// placement each time. Negative control: the same lift carried in the hover
+    /// bob (as it was until 2026-10-20), which the follower excludes, moves the
+    /// body a whole row in one present.
+    #[test]
+    fn a_seat_lift_glides_instead_of_jumping_a_row() {
+        let g = geom20();
+        let cursor = (3, 5);
+        let raw = |wd: &WordDecorations, lift: f32| {
+            wd.kitty_cursor_footprint(KittyCursorLayout {
+                lift,
+                ..still_layout(g, cursor)
+            })
+            .expect("raw law")
+            .y
+        };
+        let run = |as_bob: bool| {
+            let mut wd = WordDecorations::default();
+            let mut at = Instant::now();
+            let mut emit = |lifted: f32, at| {
+                let (bob, lift) = if as_bob {
+                    (-lifted, 0.0)
+                } else {
+                    (0.0, lifted)
+                };
+                let layout = KittyCursorLayout {
+                    bob,
+                    lift,
+                    ..still_layout(g, cursor)
+                };
+                let placement = wd
+                    .resolve_kitty_cursor_placement(layout, settled_at(at))
+                    .expect("placeable companion");
+                let mut free = Vec::new();
+                wd.kitty_cursor_at_placement(
+                    KittyCursorFrame {
+                        bob,
+                        lift,
+                        ..still_frame(g, cursor)
+                    },
+                    placement,
+                    &mut free,
+                )
+                .expect("companion emitted");
+                free.last().expect("the body emits last").y
+            };
+            let mut prev = emit(0.0, at);
+            let (mut max_step, mut landed) = (0, Vec::new());
+            for lifted in [1.0f32, 0.0] {
+                for _ in 0..40 {
+                    at += Duration::from_millis(8);
+                    let y = emit(lifted, at);
+                    max_step = max_step.max((y - prev).abs());
+                    prev = y;
+                }
+                landed.push(prev);
+            }
+            (max_step, landed)
+        };
+        let wd = WordDecorations::default();
+        let (step, landed) = run(false);
+        assert!(
+            step <= 3,
+            "a seat lift moved the body {step} px in one present (cell {} px)",
+            g.cell_h
+        );
+        assert_eq!(
+            landed,
+            vec![raw(&wd, 1.0), raw(&wd, 0.0)],
+            "it lands on the law"
+        );
+        assert_eq!(
+            run(true).0,
+            i32::from(g.cell_h),
+            "control: a lift in the bob jumps a whole row"
+        );
+    }
+
     /// A fold started mid-glide exits from the body drawn last frame (the
     /// shared `last_sprite`), not the raw settled target.
     #[test]
@@ -18200,6 +18485,7 @@ mod pet_handoff_emission_tests {
                     coat,
                     iris,
                     pet: pet_frame(),
+                    page: None,
                 },
                 free,
             );
@@ -18359,6 +18645,7 @@ mod pet_stays_inside_the_grid_tests {
                     coat: 3,
                     iris: 1,
                     pet,
+                    page: None,
                 },
                 &mut free,
             );
@@ -18421,6 +18708,7 @@ mod pet_stays_inside_the_grid_tests {
                     coat: 3,
                     iris: 1,
                     pet,
+                    page: None,
                 },
                 &mut free,
             );

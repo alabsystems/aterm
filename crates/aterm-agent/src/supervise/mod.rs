@@ -28,6 +28,7 @@
 //! * [`limit`]: when a limit notice says it resets, as a Unix time.
 
 pub mod approvals;
+pub mod background;
 pub mod blocks;
 pub mod classify;
 pub mod config;
@@ -48,6 +49,7 @@ pub mod screen;
 pub mod tape;
 pub mod transport;
 
+pub use background::{BackgroundCall, BackgroundEvidence};
 pub use blocks::View;
 pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
 pub use config::{Autopilot, LandAt, SupervisorConfig};
@@ -66,10 +68,10 @@ pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
     ATTENTION_OWNER, ATTENTION_PREFIX, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl,
     CtlReply, EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Guard, HELD_HEAD, HostStep,
-    IdleHost, IdlePoint, Interrupter, ProbeMiss, ProbeNo, RELAUNCH_ATTENTION_OWNER, STARTUP_HEAD,
-    Session, SessionSetup, StallSeen, StuckSurvey, SuperviseOpts, Turn, UNBOUNDED, UsageSeen,
-    WaitPlan, WorkerSource, deadline_attention, event_line, exit_reason, mark_task_exited,
-    render_phase, render_phase_and_survey,
+    IdleHost, IdlePoint, Interrupter, NEEDS_ATTENTION_OWNER, ProbeMiss, ProbeNo,
+    RELAUNCH_ATTENTION_OWNER, STARTUP_HEAD, Session, SessionSetup, StallSeen, StuckSurvey,
+    SuperviseOpts, Turn, UNBOUNDED, UsageSeen, WaitPlan, WorkerSource, deadline_attention,
+    event_line, exit_reason, mark_task_exited, render_phase, render_phase_and_survey,
 };
 pub use transport::{Endpoint, RelayCtl};
 

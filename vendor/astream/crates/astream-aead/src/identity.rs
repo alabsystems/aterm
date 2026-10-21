@@ -625,6 +625,14 @@ mod tests {
                 impostor,
                 Err(io::ErrorKind::PermissionDenied),
             ),
+            // PermissionDenied names an identity that proved its key; a forgery
+            // is InvalidData whatever it names.
+            (
+                "a forged unlisted client",
+                impostor.public(),
+                client,
+                Err(io::ErrorKind::InvalidData),
+            ),
         ] {
             let (near, far) = tcp_pair();
             let allowed = vec![client.public()];

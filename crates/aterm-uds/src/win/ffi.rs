@@ -4,10 +4,24 @@
 //! Raw Win32 declarations for the AF_UNIX-over-winsock transport — the ONLY
 //! FFI in this crate, kept in one auditable file. `ws2_32` (sockets),
 //! `kernel32` (short-path fallback + pid liveness and start + console presence for
-//! `crate::spawn`), `advapi32` (this process's token, for
-//! `crate::elevation`), `bcrypt` (CSPRNG). All
-//! import libraries ship with every Windows SDK, so `#[link]` is clean on
-//! stable with zero dependencies.
+//! `crate::spawn`; the path-user scan's process, module and handle reads; the
+//! machine's own names for `crate::process`),
+//! `advapi32` (this process's token, for `crate::elevation` and the scan's
+//! owner test), `ntdll` (the scan's handle-table and object-name reads),
+//! `wtsapi32` (the scan's listing of every process with its owner),
+//! `bcrypt` (CSPRNG). All import libraries ship with every Windows SDK, so
+//! `#[link]` is clean on stable with zero dependencies.
+//!
+//! The path-user scan (`crate::holders`: `holders_paths.rs`, its `mod win`, and
+//! `holders.rs`'s `mod win_pids`) reads other processes of this account: what
+//! they run, where they work, which modules they map and which files they hold
+//! open. What one runs and where it works — its image and its process
+//! environment block — it reads through `aterm_sysprobe::peb`, the one reader
+//! of a process's parameters, whose declarations and layouts live there. Every
+//! structure the scan reads itself is declared here with its 64-bit layout,
+//! and pinned by a size/offset test at the bottom of this file. The scan's
+//! tests' child processes map a module, block in a directory watch and refuse
+//! the scan's reads of them through the `#[cfg(test)]` declarations below.
 
 #![allow(non_snake_case, reason = "Win32 API names are camel-case by contract")]
 
@@ -105,6 +119,17 @@ unsafe extern "system" {
     pub(crate) fn connect(s: RawSocket, name: *const SockaddrUn, namelen: i32) -> i32;
     pub(crate) fn recv(s: RawSocket, buf: *mut u8, len: i32, flags: i32) -> i32;
     pub(crate) fn send(s: RawSocket, buf: *const u8, len: i32, flags: i32) -> i32;
+    /// `lpBuffers` is an `LPWSABUF`: std guarantees an `IoSlice` is laid out
+    /// as a `WSABUF`, and a send only reads the array. No overlapped I/O.
+    pub(crate) fn WSASend(
+        s: RawSocket,
+        lpBuffers: *const std::io::IoSlice<'_>,
+        dwBufferCount: u32,
+        lpNumberOfBytesSent: *mut u32,
+        dwFlags: u32,
+        lpOverlapped: *mut core::ffi::c_void,
+        lpCompletionRoutine: *mut core::ffi::c_void,
+    ) -> i32;
     pub(crate) fn shutdown(s: RawSocket, how: i32) -> i32;
     pub(crate) fn closesocket(s: RawSocket) -> i32;
     pub(crate) fn WSACreateEvent() -> WsaEvent;
@@ -139,6 +164,9 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub(crate) fn GetLastError() -> u32;
+    /// Clears the thread's error before a call whose failure only the error
+    /// tells apart (`GetFileType`'s `FILE_TYPE_UNKNOWN`).
+    pub(crate) fn SetLastError(dwErrCode: u32);
     pub(crate) fn GetShortPathNameW(
         lpszLongPath: *const u16,
         lpszShortPath: *mut u16,
@@ -166,6 +194,166 @@ unsafe extern "system" {
     pub(crate) fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
     /// This process's pseudo-handle (`crate::elevation`).
     pub(crate) fn GetCurrentProcess() -> RawHandle;
+    /// One of this machine's names (`crate::process`: its DNS host name, its
+    /// NetBIOS name), by `COMPUTER_NAME_FORMAT` (`name_type`). `size` is the
+    /// buffer's length in UTF-16 units, NUL included; on success it is set to
+    /// the name's length without the NUL.
+    pub(crate) fn GetComputerNameExW(name_type: u32, buffer: *mut u16, size: *mut u32) -> i32;
+    /// psapi's `EnumProcessModulesEx`, exported by kernel32 under this name.
+    pub(crate) fn K32EnumProcessModulesEx(
+        hProcess: RawHandle,
+        lphModule: *mut usize,
+        cb: u32,
+        lpcbNeeded: *mut u32,
+        dwFilterFlag: u32,
+    ) -> i32;
+    /// psapi's `GetModuleFileNameExW`, exported by kernel32 under this name.
+    pub(crate) fn K32GetModuleFileNameExW(
+        hProcess: RawHandle,
+        hModule: usize,
+        lpFilename: *mut u16,
+        nSize: u32,
+    ) -> u32;
+    /// psapi's `GetMappedFileNameW`, exported by kernel32 under this name: the
+    /// kernel's name (`\Device\HarddiskVolume3\…`) of the file mapped at
+    /// `lpv` in `hProcess` — the file the section was made from, its path
+    /// as the open resolved it (a junction or link followed), unlike the
+    /// loader's record of a module, which keeps the path as it was asked for.
+    /// The characters copied, 0 on failure.
+    pub(crate) fn K32GetMappedFileNameW(
+        hProcess: RawHandle,
+        lpv: *const core::ffi::c_void,
+        lpFilename: *mut u16,
+        nSize: u32,
+    ) -> u32;
+    pub(crate) fn DuplicateHandle(
+        hSourceProcessHandle: RawHandle,
+        hSourceHandle: RawHandle,
+        hTargetProcessHandle: RawHandle,
+        lpTargetHandle: *mut RawHandle,
+        dwDesiredAccess: u32,
+        bInheritHandle: i32,
+        dwOptions: u32,
+    ) -> i32;
+    /// What kind of object a file handle names (`FILE_TYPE_DISK` for a file or
+    /// directory on a volume), answered from its device, never from its name.
+    pub(crate) fn GetFileType(hFile: RawHandle) -> u32;
+    pub(crate) fn GetFinalPathNameByHandleW(
+        hFile: RawHandle,
+        lpszFilePath: *mut u16,
+        cchFilePath: u32,
+        dwFlags: u32,
+    ) -> u32;
+    /// Maps a module into this process (the scan's tests: a child that maps a
+    /// module from under a directory, `DONT_RESOLVE_DLL_REFERENCES` so none of
+    /// its code runs). 0 on failure.
+    #[cfg(test)]
+    pub(crate) fn LoadLibraryExW(
+        lpLibFileName: *const u16,
+        hFile: RawHandle,
+        dwFlags: u32,
+    ) -> isize;
+    /// Waits for a change under the directory `hDirectory` (the scan's tests: a
+    /// child that blocks in a synchronous watch, holding its file object's lock).
+    #[cfg(test)]
+    pub(crate) fn ReadDirectoryChangesW(
+        hDirectory: RawHandle,
+        lpBuffer: *mut core::ffi::c_void,
+        nBufferLength: u32,
+        bWatchSubtree: i32,
+        dwNotifyFilter: u32,
+        lpBytesReturned: *mut u32,
+        lpOverlapped: *mut core::ffi::c_void,
+        lpCompletionRoutine: *mut core::ffi::c_void,
+    ) -> i32;
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    /// One class of facts about any object, read through a handle: here its
+    /// kernel name (`ObjectNameInformation`, a [`UnicodeString`] followed by
+    /// its characters), for a file handle no file name query answers. Returns
+    /// an NTSTATUS.
+    pub(crate) fn NtQueryObject(
+        Handle: RawHandle,
+        ObjectInformationClass: u32,
+        ObjectInformation: *mut core::ffi::c_void,
+        ObjectInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
+    /// One class of system-wide facts: here every open handle of every process
+    /// (`SystemExtendedHandleInformation`). Returns an NTSTATUS.
+    pub(crate) fn NtQuerySystemInformation(
+        SystemInformationClass: u32,
+        SystemInformation: *mut core::ffi::c_void,
+        SystemInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
+}
+
+#[link(name = "wtsapi32")]
+unsafe extern "system" {
+    /// Every process of every session with its owner's SID, read without
+    /// opening any of them (the session manager answers).
+    pub(crate) fn WTSEnumerateProcessesExW(
+        hServer: RawHandle,
+        pLevel: *mut u32,
+        SessionId: u32,
+        ppProcessInfo: *mut *mut WtsProcessInfoExW,
+        pCount: *mut u32,
+    ) -> i32;
+    pub(crate) fn WTSFreeMemoryExW(
+        WTSTypeClass: u32,
+        pMemory: *mut core::ffi::c_void,
+        NumberOfEntries: u32,
+    ) -> i32;
+}
+
+/// `WTS_PROCESS_INFO_EXW`: one process of a `WTSEnumerateProcessesExW` listing
+/// at level 1.
+#[repr(C)]
+pub(crate) struct WtsProcessInfoExW {
+    pub SessionId: u32,
+    pub ProcessId: u32,
+    pub pProcessName: *mut u16,
+    /// The owner's SID, inside the listing's own allocation; null when the
+    /// session manager could not read it.
+    pub pUserSid: *mut core::ffi::c_void,
+    pub NumberOfThreads: u32,
+    pub HandleCount: u32,
+    pub PagefileUsage: u32,
+    pub PeakPagefileUsage: u32,
+    pub WorkingSetSize: u32,
+    pub PeakWorkingSetSize: u32,
+    pub UserTime: i64,
+    pub KernelTime: i64,
+}
+
+/// `UNICODE_STRING` (64-bit layout): a counted UTF-16 string, as
+/// `NtQueryObject(ObjectNameInformation)` answers a name (`Length` in bytes,
+/// `Buffer` pointing into the caller's own buffer, after this header).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UnicodeString {
+    pub Length: u16,
+    pub MaximumLength: u16,
+    pub Buffer: usize,
+}
+
+/// `SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX`: one open handle of one process
+/// (`SystemExtendedHandleInformation`); the listing is a two-word header
+/// (`NumberOfHandles`, a reserved word) and then these.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SystemHandleEntryEx {
+    pub Object: usize,
+    pub UniqueProcessId: usize,
+    pub HandleValue: usize,
+    pub GrantedAccess: u32,
+    pub CreatorBackTraceIndex: u16,
+    pub ObjectTypeIndex: u16,
+    pub HandleAttributes: u32,
+    pub Reserved: u32,
 }
 
 #[link(name = "advapi32")]
@@ -182,6 +370,26 @@ unsafe extern "system" {
         TokenInformationLength: u32,
         ReturnLength: *mut u32,
     ) -> i32;
+    pub(crate) fn EqualSid(pSid1: *const core::ffi::c_void, pSid2: *const core::ffi::c_void)
+    -> i32;
+    pub(crate) fn IsValidSid(pSid: *const core::ffi::c_void) -> i32;
+    /// A security descriptor from its SDDL text (the scan's tests: a child
+    /// that refuses the scan's reads of it), allocated with `LocalAlloc`.
+    #[cfg(test)]
+    pub(crate) fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        StringSecurityDescriptor: *const u16,
+        StringSDRevision: u32,
+        SecurityDescriptor: *mut *mut core::ffi::c_void,
+        SecurityDescriptorSize: *mut u32,
+    ) -> i32;
+    /// Replaces part of an object's security (the scan's tests: the DACL of
+    /// the child's own process object).
+    #[cfg(test)]
+    pub(crate) fn SetKernelObjectSecurity(
+        Handle: RawHandle,
+        SecurityInformation: u32,
+        SecurityDescriptor: *const core::ffi::c_void,
+    ) -> i32;
 }
 
 #[link(name = "bcrypt")]
@@ -192,4 +400,26 @@ unsafe extern "system" {
         cbBuffer: u32,
         dwFlags: u32,
     ) -> i32;
+}
+
+/// The hand-declared structures the path-user scan reads have the sizes and
+/// field offsets of their SDK definitions on a 64-bit Windows.
+#[cfg(all(test, target_pointer_width = "64"))]
+mod layout_tests {
+    use super::{SystemHandleEntryEx, UnicodeString, WtsProcessInfoExW};
+    use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn the_scan_structures_have_their_sdk_layouts() {
+        assert_eq!(size_of::<WtsProcessInfoExW>(), 64);
+        assert_eq!(offset_of!(WtsProcessInfoExW, ProcessId), 4);
+        assert_eq!(offset_of!(WtsProcessInfoExW, pUserSid), 16);
+        assert_eq!(offset_of!(WtsProcessInfoExW, UserTime), 48);
+        assert_eq!(size_of::<SystemHandleEntryEx>(), 40);
+        assert_eq!(offset_of!(SystemHandleEntryEx, UniqueProcessId), 8);
+        assert_eq!(offset_of!(SystemHandleEntryEx, HandleValue), 16);
+        assert_eq!(offset_of!(SystemHandleEntryEx, ObjectTypeIndex), 30);
+        assert_eq!(size_of::<UnicodeString>(), 16);
+        assert_eq!(offset_of!(UnicodeString, Buffer), 8);
+    }
 }

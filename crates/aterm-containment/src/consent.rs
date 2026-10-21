@@ -41,15 +41,17 @@
 //!   macOS keeps no user store (macOS 27), closed unread, by a child of this process
 //!   (`aterm __tcc-open`); prompt-free, as `kTCCServiceSystemPolicyAllFiles` does not allow
 //!   prompting.
-//! * [`responsible_pid`], [`responsible_app`]: the responsibility SPI (through `dlsym`),
-//!   `proc_pidpath`, and at most one bounded `Info.plist` read outside the protected roots.
+//! * [`responsible_pid`], [`responsible_pids_detailed`], [`responsible_app`]: the
+//!   responsibility SPI (through `dlsym`, once per call), `proc_pidpath`, and at most one
+//!   bounded `Info.plist` read outside the protected roots.
 //! * [`tccutil_presence`]: one `stat` of `/usr/bin/tccutil`.
 //! * [`probe_debugger`]: at most one `DevToolsSecurity -status`, which raises no dialog.
 //! * [`debugger_membership`], [`self_hardening`], [`process_birth`]: directory and kernel
 //!   queries, no spawn.
 //! * [`probe_devtool`]: at most one `/usr/bin/log show`; [`probe_devtool_list`]: one `open` of
-//!   the system `TCC.db` (by a child, as for [`probe_fda`]), then at most one
-//!   `sqlite3 -readonly`; both with a constant argv.
+//!   the system `TCC.db` (by a child, as for [`probe_fda`]), then `sqlite3 -readonly` on it as
+//!   an immutable URI, which takes no lock tccd's writes could meet (once; up to three times
+//!   while a read meets a write); both with a constant argv.
 //! * [`run_devtools_change`], the one actuator: a fresh `-status` read, then at most one
 //!   `DevToolsSecurity -enable` or `-disable`.
 //!
@@ -402,18 +404,36 @@ const OPEN_PROBE_CEILING: std::time::Duration = std::time::Duration::from_secs(1
 /// attributed to the window's own image, and the answer it gets is the one sandboxd keeps.
 #[cfg(target_os = "macos")]
 fn open_probe_in_child(exe: Option<&Path>, db: &Path) -> ProbeOutcome {
-    let program = exe.and_then(Path::to_str);
-    program
-        .and_then(|program| {
-            run_bounded(
-                program,
-                &[OPEN_PROBE_VERB.as_ref(), db.as_os_str()],
-                OPEN_PROBE_CEILING,
-            )
-        })
-        .filter(|(ok, _, _)| *ok)
-        .and_then(|(_, out, _)| parse_open_probe_line(&out))
-        .unwrap_or_else(|| imp::open_probe(db))
+    open_probe_in_child_bounded(exe, db, OPEN_PROBE_CEILING)
+}
+
+#[cfg(target_os = "macos")]
+fn open_probe_in_child_bounded(
+    exe: Option<&Path>,
+    db: &Path,
+    ceiling: std::time::Duration,
+) -> ProbeOutcome {
+    if let Some(program) = exe.and_then(Path::to_str) {
+        match run_bounded_exit(
+            program,
+            &[OPEN_PROBE_VERB.as_ref(), db.as_os_str()],
+            ceiling,
+            TOOL_OUTPUT_MAX_BYTES,
+        ) {
+            ToolRun::TimedOut => return ProbeOutcome::Errno(libc::ETIMEDOUT),
+            ToolRun::Exited {
+                code: Some(0),
+                stdout,
+                ..
+            } => {
+                if let Some(outcome) = parse_open_probe_line(&stdout) {
+                    return outcome;
+                }
+            }
+            _ => {}
+        }
+    }
+    imp::open_probe(db)
 }
 
 /// The one line [`run_open_probe_verb`] prints for `outcome`: `ok`, or `errno <n>`.
@@ -800,14 +820,43 @@ pub fn responsible_pid(pid: i32) -> Option<i32> {
 
 /// [`responsible_pid`], keeping the reason a `-1` carries.
 pub fn responsible_pid_detailed(pid: i32) -> Result<i32, ResponsibleError> {
+    // One answer per pid asked about, so the fallback is never taken.
+    responsible_pids_detailed(&[pid])
+        .pop()
+        .unwrap_or(Err(ResponsibleError::Unsupported))
+}
+
+/// [`responsible_pid_detailed`] for each of `pids`, in order: the SPI is resolved through
+/// `dlsym` once for the whole slice, then asked once per pid. An empty slice resolves nothing.
+#[must_use]
+pub fn responsible_pids_detailed(pids: &[i32]) -> Vec<Result<i32, ResponsibleError>> {
     #[cfg(target_os = "macos")]
     {
-        imp::responsible_pid_detailed(pid)
+        ask_each(pids, imp::responsibility_spi)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = pid;
-        Err(ResponsibleError::Unsupported)
+        vec![Err(ResponsibleError::Unsupported); pids.len()]
+    }
+}
+
+/// Ask `resolve`'s function about each pid, in order, resolving it at most once: only when
+/// there is a pid to ask about. No function means [`ResponsibleError::SymbolUnavailable`] for
+/// every pid.
+#[cfg(any(target_os = "macos", test))]
+fn ask_each<F>(
+    pids: &[i32],
+    resolve: impl FnOnce() -> Option<F>,
+) -> Vec<Result<i32, ResponsibleError>>
+where
+    F: FnMut(i32) -> Result<i32, ResponsibleError>,
+{
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    match resolve() {
+        Some(mut ask) => pids.iter().map(|&pid| ask(pid)).collect(),
+        None => vec![Err(ResponsibleError::SymbolUnavailable); pids.len()],
     }
 }
 
@@ -1008,7 +1057,7 @@ fn without_quoted_strings(text: &str) -> String {
 // Code identity of a bundle on disk
 // ---------------------------------------------------------------------------
 //
-// Shared by the claimant census below and `aterm_gui::control_privacy`'s
+// Shared by the claimant census below and `aterm_gui::signing_identity`'s
 // self-report, so the two cannot disagree about a bundle's requirement.
 
 /// A bounded read of a text plist. A non-file, a file over
@@ -1230,10 +1279,14 @@ fn run_bounded_exit(
     // can outlive the tool (a background grandchild, or a child another thread
     // spawned inside std's non-atomic `pipe()`-then-`FIOCLEX` on macOS). A
     // reader left unjoined is detached and ends when the last copy closes.
+    #[cfg(test)]
+    let mut deadline = deadline;
     while !(out.is_finished() && err.is_finished()) {
         if std::time::Instant::now() >= deadline {
             return ToolRun::TimedOut;
         }
+        #[cfg(test)]
+        tests::readers_pending(&mut deadline);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let (Ok(Some(stdout)), Ok(Some(stderr))) = (out.join(), err.join()) else {
@@ -4022,13 +4075,17 @@ pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
 // as `client` (`client_type` 0), `auth_value` 2 for on and 0 for off, and `last_modified` in
 // unix seconds.
 //
-// [`probe_devtool_list`] reads it without a prompt and without writing: one
+// [`probe_devtool_list`] reads it without a prompt, without writing and WITH NO LOCK: one
 // `open(…, O_RDONLY)` first, the call [`probe_fda`] makes (`EPERM` without Full Disk Access,
-// which cannot prompt), then one bounded `/usr/bin/sqlite3` with a constant argv
-// ([`DEVTOOL_DB_ARGS`]): read-only, no `~/.sqliterc`, safe mode, no symbolic link, and every
+// which cannot prompt), then a bounded `/usr/bin/sqlite3` with a constant argv
+// ([`devtool_db_args`]): read-only, no `~/.sqliterc`, safe mode, no symbolic link, and every
 // client hex-encoded so no app's name can forge a row. The subject is matched in Rust, never
-// put into an argv. sqlite takes a reader's lock only, and the database is in rollback-journal
-// mode, so no `-wal` or `-shm` file appears beside it.
+// put into an argv. sqlite3 opens the database through [`aterm_uds::foreign_db::read`], as an
+// immutable URI, never by its path: tccd writes it in rollback-journal mode with no busy
+// timeout, so a reader's `SHARED` lock that tccd's `COMMIT` meets fails that `COMMIT` and
+// loses the write (measured: a loop of the old `sqlite3 -readonly <path>` read cost a writer
+// shaped as tccd 323 of 5 000 writes). An answer read while the file changed, or beside a
+// journal with a write in it, is read again, up to [`DEVTOOL_DB_READS`] times.
 //
 // The row is the switch, not tccd's decision: it holds the code requirement of the copy that
 // was added, and a copy that does not meet it is not answered as the switch says. So
@@ -4051,12 +4108,12 @@ const DEVTOOL_DB_QUERY: &str = "SELECT hex(client), client_type, auth_value, las
                                 FROM access WHERE service = 'kTCCServiceDeveloperTool' \
                                 ORDER BY rowid;";
 
-/// The one argv the list probe runs after [`SQLITE_TOOL`]. `-init /dev/null` because the shell
-/// otherwise reads `~/.sqliterc`, which could change the output mode or run commands; `-safe`
-/// refuses every command that touches another file; `-bail` exits non-zero on the first error;
-/// one `|`-separated line per row, no header.
+/// The options the list probe passes [`SQLITE_TOOL`] before the database. `-init /dev/null`
+/// because the shell otherwise reads `~/.sqliterc`, which could change the output mode or run
+/// commands; `-safe` refuses every command that touches another file; `-bail` exits non-zero
+/// on the first error; one `|`-separated line per row, no header.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const DEVTOOL_DB_ARGS: [&str; 13] = [
+const DEVTOOL_DB_OPTIONS: [&str; 11] = [
     "-init",
     "/dev/null",
     "-readonly",
@@ -4068,12 +4125,21 @@ const DEVTOOL_DB_ARGS: [&str; 13] = [
     "-list",
     "-separator",
     "|",
-    SYSTEM_TCC_DB,
-    DEVTOOL_DB_QUERY,
 ];
 
-/// The read takes about 10 ms. A lock tccd holds makes sqlite answer `SQLITE_BUSY` at once (no
-/// busy timeout is set), so the ceiling bounds only a wedged process.
+/// The one argv the list probe runs after [`SQLITE_TOOL`] to read `target`:
+/// [`DEVTOOL_DB_OPTIONS`], the database, [`DEVTOOL_DB_QUERY`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn devtool_db_args(target: &str) -> Vec<&str> {
+    DEVTOOL_DB_OPTIONS
+        .iter()
+        .copied()
+        .chain([target, DEVTOOL_DB_QUERY])
+        .collect()
+}
+
+/// The read takes about 10 ms and waits on no lock (an immutable open takes none), so the
+/// ceiling bounds only a wedged process.
 #[cfg(target_os = "macos")]
 const DEVTOOL_DB_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -4325,22 +4391,35 @@ pub fn classify_devtool_db(run: &ToolRun, subject: &str) -> DevToolList {
     }
 }
 
-/// The list probe with the executable, the `open` and the spawn injected. Each refusal calls
-/// neither closure; then `open_db` runs once on [`SYSTEM_TCC_DB`] (`EPERM` is
-/// [`DevToolListLabel::NoFullDiskAccess`], another errno [`DevToolListLabel::OpenFailed`],
-/// each without a spawn), and only then `spawn`, once, with [`SQLITE_TOOL`] and
-/// [`DEVTOOL_DB_ARGS`].
+/// How many times the list probe reads the database while each read meets a write (the file
+/// changed during it, or a journal with a write in it stood beside it), [`DEVTOOL_DB_PAUSE`]
+/// apart: a write passes in milliseconds.
+#[cfg(any(target_os = "macos", test))]
+const DEVTOOL_DB_READS: usize = 3;
+
+/// The pause between two of [`DEVTOOL_DB_READS`].
+#[cfg(any(target_os = "macos", test))]
+const DEVTOOL_DB_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The list probe with the executable, the database (production: [`SYSTEM_TCC_DB`]), the
+/// `open` and the spawn injected. Each refusal calls neither closure; then `open_db` runs once
+/// on `db` (`EPERM` is [`DevToolListLabel::NoFullDiskAccess`], another errno
+/// [`DevToolListLabel::OpenFailed`], each without a spawn), and only then `spawn` with
+/// [`SQLITE_TOOL`] and [`devtool_db_args`] of the target [`aterm_uds::foreign_db::read`]
+/// names: once, or up to [`DEVTOOL_DB_READS`] times while each read meets a write (then
+/// [`DevToolListLabel::ToolFailed`]).
 #[cfg(any(target_os = "macos", test))]
 pub fn probe_devtool_list_with<O, S>(
     gate: ProbeGate,
     exe: Option<&Path>,
     subject: &str,
+    db: &Path,
     open_db: O,
     spawn: S,
 ) -> DevToolList
 where
     O: FnOnce(&Path) -> ProbeOutcome,
-    S: FnOnce(&str, &[&str]) -> ToolRun,
+    S: FnMut(&str, &[&str]) -> ToolRun,
 {
     if !gate.permits() {
         return DevToolList::refused(DevToolListLabel::RefusedDisabled);
@@ -4354,8 +4433,8 @@ where
     if !devtool_subject_is_usable(subject) {
         return DevToolList::refused(DevToolListLabel::RefusedNoSubject);
     }
-    match open_db(Path::new(SYSTEM_TCC_DB)) {
-        ProbeOutcome::Ok => classify_devtool_db(&spawn(SQLITE_TOOL, &DEVTOOL_DB_ARGS), subject),
+    match open_db(db) {
+        ProbeOutcome::Ok => read_devtool_db(db, subject, spawn),
         ProbeOutcome::Errno(ERRNO_EPERM) => {
             DevToolList::refused(DevToolListLabel::NoFullDiskAccess)
         }
@@ -4363,9 +4442,34 @@ where
     }
 }
 
+/// The list probe's read of `db` once its open passed: `spawn` runs sqlite3 on the target
+/// [`aterm_uds::foreign_db::read`] names, which takes no lock on the live file, read again
+/// while a read meets a write.
+#[cfg(any(target_os = "macos", test))]
+fn read_devtool_db<S>(db: &Path, subject: &str, mut spawn: S) -> DevToolList
+where
+    S: FnMut(&str, &[&str]) -> ToolRun,
+{
+    use aterm_uds::foreign_db::{Unread, read};
+    for attempt in 0..DEVTOOL_DB_READS {
+        if attempt > 0 {
+            std::thread::sleep(DEVTOOL_DB_PAUSE);
+        }
+        match read(db, |target| {
+            Some(spawn(SQLITE_TOOL, &devtool_db_args(target)))
+        }) {
+            Ok(run) => return classify_devtool_db(&run, subject),
+            Err(Unread::Changed | Unread::Writing) => {}
+            Err(Unread::Missing) => return DevToolList::refused(DevToolListLabel::OpenFailed),
+            Err(Unread::Failed) => break,
+        }
+    }
+    DevToolList::refused(DevToolListLabel::ToolFailed)
+}
+
 /// Read the Developer Tools list's row for `subject`, the running bundle's identifier: one
-/// `open` of [`SYSTEM_TCC_DB`] by a child ([`open_probe_in_child`]) and at most one
-/// `/usr/bin/sqlite3`, within a 5 s ceiling and a
+/// `open` of [`SYSTEM_TCC_DB`] by a child ([`open_probe_in_child`]) and a `/usr/bin/sqlite3`
+/// that takes no lock on it ([`read_devtool_db`]), each within a 5 s ceiling and a
 /// 1 MiB output cap. Refuses, opening and spawning nothing, when the gate is off, the running
 /// executable is not inside a `.app`, or `subject` is unusable. Off macOS it is
 /// [`unsupported_devtool_list`].
@@ -4378,6 +4482,7 @@ pub fn probe_devtool_list(gate: ProbeGate, subject: &str) -> DevToolList {
             gate,
             exe.as_deref(),
             subject,
+            Path::new(SYSTEM_TCC_DB),
             |db| open_probe_in_child(exe.as_deref(), db),
             |program, args| {
                 let args: Vec<&std::ffi::OsStr> = args.iter().map(std::ffi::OsStr::new).collect();
@@ -4944,6 +5049,14 @@ fn run_to_exit_keeping_heads<F: FnOnce(u32)>(argv: &[&str], on_spawn: F) -> Devt
                 .as_ref()
                 .is_none_or(std::thread::JoinHandle::is_finished))
     {
+        #[cfg(test)]
+        tests::reader_grace_poll(&mut polls, &|| {
+            out.as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+                && err
+                    .as_ref()
+                    .is_none_or(std::thread::JoinHandle::is_finished)
+        });
         std::thread::sleep(std::time::Duration::from_millis(10));
         polls += 1;
     }
@@ -5228,31 +5341,6 @@ impl ConsentPosture {
             fda: inputs.fda,
             fda_scope: inputs.evidence.fda_scope,
             prompt_possible,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Cache
-// ---------------------------------------------------------------------------
-
-/// What a cached probe is keyed on: the bundle, and the designated requirement it presented.
-/// A grant is bound to the DR, so a rebuild that changes it must invalidate a cached `granted`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConsentKey {
-    /// The `.app` bundle root, or the executable path when there is no bundle.
-    pub bundle: PathBuf,
-    /// The designated requirement string, verbatim.
-    pub dr: String,
-}
-
-impl ConsentKey {
-    /// A key.
-    #[must_use]
-    pub fn new(bundle: impl Into<PathBuf>, dr: impl Into<String>) -> Self {
-        Self {
-            bundle: bundle.into(),
-            dr: dr.into(),
         }
     }
 }
@@ -5560,8 +5648,9 @@ mod imp {
         unsafe { *libc::__error() }
     }
 
-    /// Resolve the responsibility SPI, or `None`. Per call, not cached in a `static`: it runs at
-    /// most once per probe interval per session, and this crate keeps lazy-init statics off
+    /// Resolve the responsibility SPI, or `None`. Once per [`super::responsible_pids_detailed`]
+    /// call, which asks it about every pid in its slice (a `privacy` report asks about all its
+    /// sessions in one call). Not cached in a `static`: this crate keeps lazy-init statics off
     /// paths a GUI main thread can reach.
     fn responsibility_symbol() -> Option<ResponsibilityGetPid> {
         // SAFETY: `RESPONSIBILITY_SYMBOL` is NUL-terminated; `RTLD_DEFAULT` is
@@ -5581,20 +5670,22 @@ mod imp {
         Some(unsafe { std::mem::transmute::<*mut libc::c_void, ResponsibilityGetPid>(sym) })
     }
 
-    pub(super) fn responsible_pid_detailed(pid: i32) -> Result<i32, ResponsibleError> {
-        let Some(func) = responsibility_symbol() else {
-            return Err(ResponsibleError::SymbolUnavailable);
-        };
-        // `-1` is overloaded, so errno is the only way to tell "not ours"
-        // from "gone"; clear it first so a stale value cannot be read back.
-        // SAFETY: `__error()` returns a valid pointer to this thread's errno.
-        unsafe {
-            *libc::__error() = 0;
-        }
-        // SAFETY: `func` has the signature dyld resolved it to, and the argument is a plain
-        // `pid_t`.
-        let ret = unsafe { func(pid) };
-        responsible_answer(ret, errno())
+    /// The responsibility SPI resolved, as a question about one pid at a time, or `None` when
+    /// the symbol is absent.
+    pub(super) fn responsibility_spi() -> Option<impl FnMut(i32) -> Result<i32, ResponsibleError>> {
+        let func = responsibility_symbol()?;
+        Some(move |pid: i32| {
+            // `-1` is overloaded, so errno is the only way to tell "not ours"
+            // from "gone"; clear it first so a stale value cannot be read back.
+            // SAFETY: `__error()` returns a valid pointer to this thread's errno.
+            unsafe {
+                *libc::__error() = 0;
+            }
+            // SAFETY: `func` has the signature dyld resolved it to, and the argument is a
+            // plain `pid_t`.
+            let ret = unsafe { func(pid) };
+            responsible_answer(ret, errno())
+        })
     }
 
     pub(super) fn responsible_app_with_roots(
@@ -5806,13 +5897,6 @@ mod imp {
     const VALUE_MAX_UNITS: isize = 1024;
 }
 
-/// The bundle half of a [`ConsentKey`] for an executable: its `.app` root when
-/// it has one, else the executable path itself.
-#[must_use]
-pub fn cache_bundle_for(exe: &Path) -> PathBuf {
-    app_bundle_root(exe).unwrap_or_else(|| exe.to_path_buf())
-}
-
 /// Explicit mounted-volume acceptance for the census boundary. The same bundle
 /// must be refused while a volume is mounted inside it and admitted after detach.
 /// Run the `dmg_acceptance` bench with `--profile test`; macOS may request consent.
@@ -5903,6 +5987,117 @@ pub fn a_real_volume_mounted_in_the_bundle_is_not_crossed(dir: &Path) -> std::io
 mod tests {
     use super::*;
 
+    /// An act for one poll of [`run_bounded_exit`]'s wait for its readers, given that
+    /// wait's deadline.
+    #[cfg(target_os = "macos")]
+    type ReadersAct = Box<dyn FnOnce(&mut std::time::Instant)>;
+
+    #[cfg(target_os = "macos")]
+    thread_local! {
+        static READERS_PENDING: std::cell::RefCell<std::collections::VecDeque<ReadersAct>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+
+    /// One poll of [`run_bounded_exit`]'s wait for readers that outlive the tool: run the
+    /// next act this thread armed, once, on the wait's `deadline`.
+    #[cfg(target_os = "macos")]
+    pub(super) fn readers_pending(deadline: &mut std::time::Instant) {
+        if let Some(act) = READERS_PENDING.with(|acts| acts.borrow_mut().pop_front()) {
+            act(deadline);
+        }
+    }
+
+    /// An act for one of [`run_to_exit_keeping_heads`]'s reader grace polls: the poll's
+    /// number, and what runs there, given the poll counter (an act may spend the rest of
+    /// the grace) and whether both readers are done.
+    #[cfg(unix)]
+    type GracePollAct = (u32, Box<dyn FnOnce(&mut u32, &dyn Fn() -> bool)>);
+
+    #[cfg(unix)]
+    thread_local! {
+        static GRACE_POLL: std::cell::RefCell<Option<GracePollAct>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// [`run_to_exit_keeping_heads`]'s grace poll number `*poll`: run the act this thread
+    /// armed for that poll, once.
+    #[cfg(unix)]
+    pub(super) fn reader_grace_poll(poll: &mut u32, readers_done: &dyn Fn() -> bool) {
+        let act = GRACE_POLL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(at, _)| *at == *poll) {
+                slot.take().map(|(_, act)| act)
+            } else {
+                None
+            }
+        });
+        if let Some(act) = act {
+            act(poll, readers_done);
+        }
+    }
+
+    /// A stand-in that prints `early` and exits, leaving a grandchild that holds its stdout
+    /// and stderr and prints `late` once the FIFO `$1` ([`fifo_gate`]) is released, then the
+    /// line that released it: nothing for a test's own [`release_gate`],
+    /// [`HANG_DETECTOR_RELEASE`] for [`gate_hang_detector`]'s, so a run the detector let go
+    /// never reads as the run its test expects.
+    #[cfg(target_os = "macos")]
+    const GATED_GRANDCHILD: &str =
+        "exec 3<>\"$1\"; (read line <&3; printf 'late%s' \"$line\") & printf early";
+
+    /// What [`gate_hang_detector`] writes to the gate, and so what a grandchild it let go
+    /// prints after `late`.
+    #[cfg(target_os = "macos")]
+    const HANG_DETECTOR_RELEASE: &str = "+released-by-the-hang-detector";
+
+    /// A FIFO at `dir/gate` for [`GATED_GRANDCHILD`] to wait on.
+    #[cfg(target_os = "macos")]
+    fn fifo_gate(dir: &Path) -> PathBuf {
+        let gate = dir.join("gate");
+        let fifo = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `fifo` is a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        gate
+    }
+
+    /// Let the grandchild waiting on `gate` go. Non-blocking, so a gate nobody holds open
+    /// any more is a refusal, never a hang.
+    #[cfg(target_os = "macos")]
+    fn release_gate(gate: &Path) -> std::io::Result<()> {
+        release_gate_saying(gate, "")
+    }
+
+    /// [`release_gate`], the grandchild printing `said` after `late`.
+    #[cfg(target_os = "macos")]
+    fn release_gate_saying(gate: &Path, said: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(gate)
+            .and_then(|mut gate| gate.write_all(format!("{said}\n").as_bytes()))
+    }
+
+    /// The [`HANG_DETECTOR`] of a run [`fifo_gate`] holds: the gate is released if the test
+    /// still runs then, so a wait that never gives the grandchild up ends and fails its
+    /// assertions instead of hanging: what the grandchild then prints carries
+    /// [`HANG_DETECTOR_RELEASE`], which no expected run does. Dropping what this returns
+    /// stands it down.
+    #[cfg(target_os = "macos")]
+    fn gate_hang_detector(gate: &Path) -> std::sync::mpsc::Sender<()> {
+        let (stand_down, detector) = std::sync::mpsc::channel::<()>();
+        let gate = gate.to_path_buf();
+        std::thread::spawn(move || {
+            if detector.recv_timeout(HANG_DETECTOR)
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                let _ = release_gate_saying(&gate, HANG_DETECTOR_RELEASE);
+            }
+        });
+        stand_down
+    }
+
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
     }
@@ -5962,12 +6157,6 @@ mod tests {
             assert_eq!(app_bundle_root(exe_path), bundle.map(p), "{exe}");
             assert_eq!(path_is_in_app_bundle(exe_path), bundle.is_some(), "{exe}");
             assert_eq!(bundle_layout_root(exe_path), layout.map(p), "{exe}");
-            // The consent cache keys on the `.app`, else on the executable itself.
-            assert_eq!(
-                cache_bundle_for(exe_path),
-                bundle.map_or_else(|| exe_path.to_path_buf(), p),
-                "{exe}"
-            );
         }
     }
 
@@ -6876,8 +7065,10 @@ mod tests {
             std::fs::create_dir_all(folder_plist.join("Contents/Info.plist")).unwrap();
             assert!(bundle_reaches_protected(&folder_plist, &[]));
         }
-        // SAFETY: `geteuid` has no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
+        // Root reads through permission bits. `apps` was made by this process, so its
+        // owner is the effective uid, and asking it needs no FFI: `libc` is a dependency
+        // here only on macOS, and this test runs on every Unix.
+        if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&apps).unwrap()) != 0 {
             use std::os::unix::fs::PermissionsExt as _;
             let shut = apps.join("shut.app");
             std::fs::create_dir_all(shut.join("Contents")).unwrap();
@@ -7203,42 +7394,41 @@ mod tests {
     const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// A grandchild holding the tool's stdout and stderr keeps both readers short of EOF; the
-    /// run gives up at its ceiling. The holder lives ten minutes, so a run that waits it out
-    /// fails the [`HANG_DETECTOR`].
+    /// run gives up at its ceiling. The tool gets the [`HANG_DETECTOR`] to exit, and the
+    /// readers' first wait spends the ceiling (moves it to now), so the run must answer
+    /// `TimedOut` at the next poll, with the grandchild still holding the pipes. A wait that
+    /// ignored its ceiling reaches the second act, which lets the grandchild go, and reads
+    /// the run whole; a run that never waits on its readers is let go by the gate's hang
+    /// detector ([`gate_hang_detector`]) and reads the run whole too.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pipe_held_open_past_the_tool_cannot_outlast_the_ceiling() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-run-bounded-hold-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pid_file = dir.join("holder.pid");
-        let script = format!("sleep 600 & echo $! > '{}'", pid_file.display());
-        let started = std::time::Instant::now();
-        let ran = run_bounded(
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let gate = fifo_gate(dir.path());
+        let _detector = gate_hang_detector(&gate);
+        let armed = gate.clone();
+        READERS_PENDING.with(|acts| {
+            let mut acts = acts.borrow_mut();
+            acts.push_back(Box::new(|deadline| *deadline = std::time::Instant::now()));
+            acts.push_back(Box::new(move |_| release_gate(&armed).unwrap()));
+        });
+        let run = run_bounded_exit(
             "/bin/sh",
-            &["-c".as_ref(), script.as_ref()],
-            std::time::Duration::from_secs(2),
+            &[
+                "-c".as_ref(),
+                GATED_GRANDCHILD.as_ref(),
+                "sh".as_ref(),
+                gate.as_os_str(),
+            ],
+            HANG_DETECTOR,
+            TOOL_OUTPUT_MAX_BYTES,
         );
-        let took = started.elapsed();
-        let holder = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok());
-        if let Some(pid) = holder {
-            // SAFETY: kill(2) of the background `sleep` this test started.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            holder.is_some(),
-            "the tool ran to its end and left a holder"
-        );
-        assert_eq!(ran, None, "a stream still open at the ceiling is no report");
-        assert!(
-            took < HANG_DETECTOR,
-            "the run outlasted its ceiling waiting on the holder: {took:?}"
-        );
+        let unrun = READERS_PENDING.with(|acts| acts.borrow_mut().drain(..).count());
+        // Let the grandchild the run gave up on go; refused once it is gone.
+        let held = release_gate(&gate);
+        assert_eq!(run, ToolRun::TimedOut);
+        assert_eq!(unrun, 1, "the wait ended at the poll past its ceiling");
+        assert!(held.is_ok(), "the grandchild held the pipes: {held:?}");
     }
 
     /// The FDA probe's descriptor is close-on-exec from its open, so a child
@@ -7339,6 +7529,20 @@ mod tests {
             ProbeOutcome::Errno(13)
         );
         assert_eq!(open_probe_in_child(Some(&fails), &path), ProbeOutcome::Ok);
+        // A child that times out (tccd/syspolicyd unresponsive) must NOT fall back to opening
+        // the database inside the parent process, which would wedge the parent's thread in
+        // uninterruptible kernel open(2).
+        let hangs = {
+            use std::os::unix::fs::PermissionsExt as _;
+            let exe = scratch.path().join("hangs");
+            std::fs::write(&exe, "#!/bin/sh\nexec /bin/sleep 10\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            exe
+        };
+        assert_eq!(
+            open_probe_in_child_bounded(Some(&hangs), &path, std::time::Duration::from_millis(50),),
+            ProbeOutcome::Errno(libc::ETIMEDOUT)
+        );
         let folder = scratch.path().to_str().expect("utf-8 scratch");
         assert_eq!(
             run_bounded_exit(folder, &[], HANG_DETECTOR, TOOL_OUTPUT_MAX_BYTES),
@@ -7913,6 +8117,50 @@ mod tests {
     }
 
     // -- responsibility ------------------------------------------------------
+
+    /// One resolution per slice, however many pids it asks about, and each pid's answer in
+    /// its place. The negative control is an absent symbol: every pid reads
+    /// `SymbolUnavailable` and nothing is asked. An empty slice resolves nothing.
+    #[test]
+    fn responsible_pids_detailed_resolves_once() {
+        let resolutions = std::cell::Cell::new(0_usize);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolve = || {
+            resolutions.set(resolutions.get() + 1);
+            Some(|pid: i32| {
+                asked.borrow_mut().push(pid);
+                if pid == 3 {
+                    Err(ResponsibleError::Gone)
+                } else {
+                    Ok(pid * 10)
+                }
+            })
+        };
+        assert_eq!(
+            ask_each(&[1, 2, 3], resolve),
+            [Ok(10), Ok(20), Err(ResponsibleError::Gone)]
+        );
+        assert_eq!(resolutions.get(), 1, "the SPI is resolved once per slice");
+        assert_eq!(
+            *asked.borrow(),
+            [1, 2, 3],
+            "and asked once per pid, in order"
+        );
+
+        let absent = || {
+            resolutions.set(resolutions.get() + 1);
+            None::<fn(i32) -> Result<i32, ResponsibleError>>
+        };
+        assert_eq!(
+            ask_each(&[1, 2, 3], absent),
+            [Err(ResponsibleError::SymbolUnavailable); 3]
+        );
+        assert_eq!(resolutions.get(), 2);
+
+        assert!(ask_each(&[], resolve).is_empty());
+        assert_eq!(resolutions.get(), 2, "an empty slice resolves nothing");
+        assert_eq!(asked.borrow().len(), 3, "the absent symbol asked nothing");
+    }
 
     #[test]
     fn responsible_answers_are_a_table() {
@@ -8927,6 +9175,111 @@ mod tests {
         assert!(stdout_head.starts_with("in=0\n"), "{stdout_head:?}");
         assert_eq!(stdout_head.len(), DEVTOOLS_CHANGE_HEAD_BYTES);
         assert_eq!(stderr_head, "nope\n");
+    }
+
+    /// A reader still running when the change exits is waited for past the first grace poll:
+    /// what a grandchild holding the change's stdout writes after the exit is in the head.
+    /// The grandchild waits on a gate the second poll releases, and that poll holds the loop
+    /// until both readers are done (a hang detector, not a budget), so no clock decides it.
+    /// A run that joins its readers without the grace wait is let go by the gate's hang
+    /// detector ([`gate_hang_detector`]), and its head says so.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_change_reader_that_lags_the_exit_still_reaches_the_head() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let gate = fifo_gate(dir.path());
+        let _detector = gate_hang_detector(&gate);
+        let armed = gate.clone();
+        GRACE_POLL.with(|slot| {
+            let act = move |_: &mut u32, readers_done: &dyn Fn() -> bool| {
+                release_gate(&armed).unwrap();
+                let released = std::time::Instant::now();
+                while !readers_done() {
+                    assert!(
+                        released.elapsed() < HANG_DETECTOR,
+                        "the readers never ended"
+                    );
+                    std::thread::yield_now();
+                }
+            };
+            *slot.borrow_mut() = Some((1, Box::new(act)));
+        });
+        let run = run_to_exit_keeping_heads(
+            &[
+                "/bin/sh",
+                "-c",
+                GATED_GRANDCHILD,
+                "sh",
+                gate.to_str().unwrap(),
+            ],
+            |_| {},
+        );
+        // Let a grandchild the grace gave up on go too; once it is gone this is refused.
+        let _ = release_gate(&gate);
+        assert_eq!(
+            run,
+            DevtoolsChangeRun::Exited {
+                code: Some(0),
+                stdout_head: "earlylate".to_string(),
+                stderr_head: String::new(),
+            }
+        );
+    }
+
+    /// A reader still running when the grace runs out is left detached, its head empty:
+    /// the grandchild holds both pipes past the grace, and the first poll spends the rest of
+    /// it (the count moves to the last poll), so no clock decides it. The grandchild is let
+    /// go only once the run has returned, and still held the gate then. A wait that ignored
+    /// the grace's end would hold the run until the gate's hang detector let the grandchild
+    /// go, and read a head saying so; one that ran a poll past the last (a `<=`, a longer
+    /// grace) takes the act the first poll arms for the poll after the last.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_change_reader_still_running_past_the_grace_leaves_an_empty_head() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let gate = fifo_gate(dir.path());
+        let _detector = gate_hang_detector(&gate);
+        GRACE_POLL.with(|slot| {
+            let act = |polls: &mut u32, readers_done: &dyn Fn() -> bool| {
+                assert!(!readers_done(), "the grandchild holds both pipes");
+                *polls = CHANGE_READER_GRACE_POLLS - 1;
+                GRACE_POLL.with(|slot| {
+                    *slot.borrow_mut() = Some((CHANGE_READER_GRACE_POLLS, Box::new(|_, _| {})));
+                });
+            };
+            *slot.borrow_mut() = Some((0, Box::new(act)));
+        });
+        let run = run_to_exit_keeping_heads(
+            &[
+                "/bin/sh",
+                "-c",
+                GATED_GRANDCHILD,
+                "sh",
+                gate.to_str().unwrap(),
+            ],
+            |_| {},
+        );
+        let armed = GRACE_POLL.with(|slot| slot.borrow_mut().take().map(|(at, _)| at));
+        // Let the grandchild the grace gave up on go; refused once it is gone.
+        let held = release_gate(&gate);
+        assert_eq!(
+            armed,
+            Some(CHANGE_READER_GRACE_POLLS),
+            "the first grace poll ran its act (it left Some(0) armed), and no poll ran past \
+             the last (it would have taken the act, None)"
+        );
+        assert_eq!(
+            run,
+            DevtoolsChangeRun::Exited {
+                code: Some(0),
+                stdout_head: String::new(),
+                stderr_head: String::new(),
+            }
+        );
+        assert!(
+            held.is_ok(),
+            "the grandchild still held the pipes when the run returned: {held:?}"
+        );
     }
 
     /// A missing program is `Absent` and never calls `on_spawn`.
@@ -10369,6 +10722,7 @@ mod tests {
     #[test]
     fn the_list_probe_refuses_without_opening_or_spawning() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
+        let tcc = Path::new(SYSTEM_TCC_DB);
         let never_open = |_: &Path| -> ProbeOutcome { panic!("a refusal opens nothing") };
         let never_spawn =
             |_: &str, _: &[&str]| -> ToolRun { panic!("a refusal must spawn nothing") };
@@ -10378,11 +10732,11 @@ mod tests {
         };
         let refused = |label| DevToolList::refused(label);
         assert_eq!(
-            probe_devtool_list_with(off, Some(&bundled), ATERM, never_open, never_spawn),
+            probe_devtool_list_with(off, Some(&bundled), ATERM, tcc, never_open, never_spawn),
             refused(DevToolListLabel::RefusedDisabled)
         );
         assert_eq!(
-            probe_devtool_list_with(ProbeGate::on(), None, ATERM, never_open, never_spawn),
+            probe_devtool_list_with(ProbeGate::on(), None, ATERM, tcc, never_open, never_spawn),
             refused(DevToolListLabel::RefusedNoExe)
         );
         assert_eq!(
@@ -10392,6 +10746,7 @@ mod tests {
                     "/private/tmp/x/target/debug/deps/aterm_containment-abc"
                 )),
                 ATERM,
+                tcc,
                 never_open,
                 never_spawn
             ),
@@ -10402,6 +10757,7 @@ mod tests {
                 ProbeGate::on(),
                 Some(&bundled),
                 "com.aterm.aterm|0|2",
+                tcc,
                 never_open,
                 never_spawn
             ),
@@ -10417,6 +10773,7 @@ mod tests {
                     ProbeGate::on(),
                     Some(&bundled),
                     ATERM,
+                    tcc,
                     |_| ProbeOutcome::Errno(errno),
                     never_spawn
                 ),
@@ -10426,19 +10783,24 @@ mod tests {
         }
     }
 
-    /// Past the refusals the probe opens the system database once, then runs
-    /// exactly `SQLITE_TOOL` with the constant argv: read-only, no rc file,
-    /// safe mode, and the subject in no argument.
+    /// Past the refusals the probe opens the database once, then runs exactly
+    /// `SQLITE_TOOL` with the constant argv on the database as an immutable URI
+    /// (no lock on it): read-only, no rc file, safe mode, and the subject in no
+    /// argument.
     #[test]
     fn the_list_probe_opens_once_and_spawns_only_the_sqlite_argv() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
         let subject = "com.example.subject";
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("TCC.db");
+        std::fs::write(&db, b"SQLite format 3\0").expect("db");
         let mut opened: Vec<PathBuf> = Vec::new();
         let mut seen: Vec<(String, Vec<String>)> = Vec::new();
         let got = probe_devtool_list_with(
             ProbeGate::on(),
             Some(&bundled),
             subject,
+            &db,
             |db| {
                 opened.push(db.to_path_buf());
                 ProbeOutcome::Ok
@@ -10452,7 +10814,7 @@ mod tests {
             },
         );
         assert_eq!(got, listed(DevToolListing::Off, Some(7)));
-        assert_eq!(opened, vec![p(SYSTEM_TCC_DB)]);
+        assert_eq!(opened, vec![db.clone()]);
         assert_eq!(
             SYSTEM_TCC_DB,
             "/Library/Application Support/com.apple.TCC/TCC.db"
@@ -10460,7 +10822,13 @@ mod tests {
         assert_eq!(seen.len(), 1, "exactly one run");
         let (program, args) = &seen[0];
         assert_eq!(program, "/usr/bin/sqlite3");
-        assert_eq!(args, &DEVTOOL_DB_ARGS.map(str::to_string));
+        let target = aterm_uds::foreign_db::immutable_uri(&db);
+        assert!(target.ends_with("/TCC.db?immutable=1"), "{target}");
+        let expected: Vec<String> = devtool_db_args(&target)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(args, &expected);
         for flag in ["-readonly", "-safe", "-nofollow", "-bail"] {
             assert!(args.iter().any(|a| a == flag), "{flag}");
         }
@@ -10479,6 +10847,122 @@ mod tests {
                 && DEVTOOL_DB_QUERY.starts_with("SELECT "),
             "a read of the Developer Tools rows only"
         );
+    }
+
+    /// A read that meets a write (the file changed under it) is read again, up to
+    /// `DEVTOOL_DB_READS` times, then `ToolFailed`; a read that meets none is
+    /// kept. NEGATIVE CONTROL: one write only, and the second read answers.
+    #[test]
+    fn a_list_read_that_meets_a_write_is_read_again() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("TCC.db");
+        std::fs::write(&db, b"SQLite format 3\0").expect("db");
+        let subject = "com.example.subject";
+        let write = || {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&db)
+                .expect("open");
+            std::io::Write::write_all(&mut f, b"x").expect("write");
+        };
+        let mut runs = 0;
+        let got = read_devtool_db(&db, subject, |_, _| {
+            runs += 1;
+            write();
+            db_of(&[db_row(subject, 0, 2, 9)])
+        });
+        assert_eq!(got, DevToolList::refused(DevToolListLabel::ToolFailed));
+        assert_eq!(
+            runs, DEVTOOL_DB_READS,
+            "read again while each read met a write"
+        );
+        let mut runs = 0;
+        let got = read_devtool_db(&db, subject, |_, _| {
+            runs += 1;
+            if runs == 1 {
+                write();
+            }
+            db_of(&[db_row(subject, 0, 2, 9)])
+        });
+        assert_eq!(got, listed(DevToolListing::On, Some(9)));
+        assert_eq!(runs, 2);
+    }
+
+    /// THE LIST READ NEVER LOCKS OUT tccd. tccd writes the system TCC.db in
+    /// rollback-journal mode with no busy timeout (`BEGIN`, `UPDATE`, `COMMIT`):
+    /// a reader's lock its `COMMIT` meets fails that `COMMIT` at once, and the
+    /// write is lost (`docs/measured/real-claude-lab-2026-10-15.md`, 2026-10-20).
+    /// A scratch database shaped as TCC.db is read by the probe while the witness
+    /// watches its lock bytes: a reader caught holding one is frozen while a
+    /// writer shaped as tccd commits. The probe holds none, answers the row, and
+    /// the write lands. RED before the fix: the caught `sqlite3 -readonly` cost the
+    /// writer its `COMMIT` (`database is locked`).
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[test]
+    fn the_list_read_never_locks_out_a_writer_with_no_busy_timeout() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let db = std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .join("TCC.db");
+        let subject = "com.example.subject";
+        let sqlite = |sql: &str| {
+            aterm_uds::spawnfd::command(SQLITE_TOOL)
+                .arg(&db)
+                .arg(sql)
+                .output()
+                .expect("sqlite3 runs")
+        };
+        // A table scan long enough for the witness to see a reader's lock.
+        let made = sqlite(
+            "CREATE TABLE access (service TEXT NOT NULL, client TEXT NOT NULL, \
+             client_type INTEGER NOT NULL, auth_value INTEGER NOT NULL, csreq BLOB, \
+             last_modified INTEGER NOT NULL DEFAULT 0); \
+             INSERT INTO access VALUES ('kTCCServiceDeveloperTool', 'com.example.subject', \
+             0, 0, NULL, 7); \
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000) \
+             INSERT INTO access SELECT 'kTCCServiceAccessibility', 'com.example.app' || i, \
+             0, 2, randomblob(1000), 0 FROM n;",
+        );
+        assert!(made.status.success(), "{made:?}");
+        let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
+        let switch_on = "BEGIN; UPDATE access SET auth_value = 2, last_modified = 8 \
+                         WHERE service = 'kTCCServiceDeveloperTool'; COMMIT;";
+        let (read, caught) = aterm_uds::foreign_db::witness::while_read(
+            &db,
+            0x4000_0000,
+            512,
+            || {
+                probe_devtool_list_with(
+                    ProbeGate::on(),
+                    Some(&bundled),
+                    subject,
+                    &db,
+                    |_| ProbeOutcome::Ok,
+                    |program, args| {
+                        let args: Vec<&std::ffi::OsStr> =
+                            args.iter().map(std::ffi::OsStr::new).collect();
+                        run_bounded_exit(program, &args, DEVTOOL_DB_CEILING, TOOL_OUTPUT_MAX_BYTES)
+                    },
+                )
+            },
+            || sqlite(switch_on),
+        );
+        let caught = caught.map(|(pid, out)| {
+            (
+                pid,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        });
+        assert_eq!(caught, None, "the read held a lock a writer met");
+        assert_eq!(read, listed(DevToolListing::Off, Some(7)));
+        let wrote = sqlite(switch_on);
+        assert!(wrote.status.success(), "{wrote:?}");
+        let after = sqlite(
+            "SELECT auth_value, last_modified FROM access \
+             WHERE service = 'kTCCServiceDeveloperTool';",
+        );
+        assert_eq!(String::from_utf8_lossy(&after.stdout), "2|8\n");
     }
 
     /// The join, as a table: the switch decides unless tccd answered after it
@@ -10727,6 +11211,40 @@ mod tests {
                 CODESIGN_CEILING
             ),
             Some((false, String::new(), String::new()))
+        );
+
+        // A copy of the pipes that outlives the tool (a background grandchild here) is
+        // waited for, up to the ceiling: what it writes after the tool exited is in the
+        // report. It holds the pipes until the readers' wait lets it go through a FIFO it
+        // opened before the tool exited, so that wait starts with the readers running.
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let gate = fifo_gate(dir.path());
+        let _detector = gate_hang_detector(&gate);
+        let armed = gate.clone();
+        READERS_PENDING.with(|acts| {
+            acts.borrow_mut()
+                .push_back(Box::new(move |_| release_gate(&armed).unwrap()));
+        });
+        let run = run_bounded_exit(
+            "/bin/sh",
+            &[
+                "-c".as_ref(),
+                GATED_GRANDCHILD.as_ref(),
+                "sh".as_ref(),
+                gate.as_os_str(),
+            ],
+            HANG_DETECTOR,
+            TOOL_OUTPUT_MAX_BYTES,
+        );
+        // Let a grandchild the wait gave up on go too; once it is gone this is refused.
+        let _ = release_gate(&gate);
+        assert_eq!(
+            run,
+            ToolRun::Exited {
+                code: Some(0),
+                stdout: "earlylate".to_string(),
+                stderr: String::new(),
+            }
         );
     }
 

@@ -518,8 +518,8 @@ pub(crate) trait AppRt {
     /// Query the OS motion preference. macOS reads
     /// `NSWorkspace.accessibilityDisplayShouldReduceMotion`; Windows reads
     /// `SPI_GETCLIENTAREAANIMATION`; Linux reads GNOME's `enable-animations`
-    /// through a bounded `gsettings get`, answering `false` wherever that key
-    /// cannot be read. The explicit `motion = "reduced"` override works
+    /// from the Settings portal in a bounded read, answering `false` wherever
+    /// that key cannot be read. The explicit `motion = "reduced"` override works
     /// everywhere. Feeds [`crate::motion::MotionPolicy`] (W11).
     fn reduce_motion(&self) -> bool;
 
@@ -1200,6 +1200,7 @@ impl AppRt for AppRtMacOS {
         crate::native_appearance::AppearancePreferences {
             high_contrast: reduce_motion::increase_contrast(),
             reduced_transparency: reduce_motion::reduce_transparency(),
+            differentiate_without_color: reduce_motion::differentiate_without_color(),
             text_scale: 1.0,
         }
     }
@@ -1331,6 +1332,39 @@ pub(crate) fn set_option_as_alt(window: &aterm_window::window::Window, alt: bool
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (window, alt);
+}
+
+/// Where an Option chord that Meta mode would send as ESC and the key types a character
+/// instead: the one its layout reaches only with Option (`App::on_key`; German Option+L is
+/// `@`, Option+7 `|`, Option+N `~`, French Option+( `{`, British Option+3 `#`), as
+/// [`aterm_window::platform::macos::option_only_character`] reads the selected layout. A
+/// function of the key and Shift; `None` on every other chord, and on every chord of the
+/// U.S. layout.
+pub(crate) type OptionOnly = fn(aterm_window::keyboard::PhysicalKey, bool) -> Option<char>;
+
+/// The [`OptionOnly`] source an `App` holds: the selected layout's windowed on macOS,
+/// [`no_option_only`] headless, in unit tests and off macOS (no other backend reads Alt
+/// chords as Meta past a layout's level-3 characters: X11 and Wayland report AltGr as a
+/// level, and Windows encodes the composed key).
+pub(crate) fn option_only_source(headless: bool) -> OptionOnly {
+    #[cfg(target_os = "macos")]
+    if !headless {
+        return aterm_window::platform::macos::option_only_character;
+    }
+    let _ = headless;
+    no_option_only
+}
+
+/// [`OptionOnly`] for HEADLESS instances and unit tests: never. A headless `App` has no
+/// keyboard layout of its own, and a unit test must encode the same bytes on every machine
+/// whatever layout its desk has selected, so neither reads one (which also keeps a test
+/// binary off the input-source server).
+#[must_use]
+pub(crate) fn no_option_only(
+    _key: aterm_window::keyboard::PhysicalKey,
+    _shift: bool,
+) -> Option<char> {
+    None
 }
 
 /// Whether an Option chord's key-event text is what Option composed rather than the
@@ -2213,10 +2247,10 @@ impl AppRt for AppRtLinux {
     /// No `terminate:`-style app-quit gesture to intercept off macOS: a no-op.
     fn install_quit_confirm(&self) {}
 
-    /// The desktop's motion preference, read through GNOME's
+    /// The desktop's motion preference, GNOME's
     /// `org.gnome.desktop.interface enable-animations` key (the key GTK desktops
-    /// share) with the `gsettings` CLI — see [`gnome_reduce_motion`]. Any failure
-    /// answers `false`, so config `motion` alone decides.
+    /// share) read through the Settings portal — see [`gnome_reduce_motion`].
+    /// Any failure answers `false`, so config `motion` alone decides.
     fn reduce_motion(&self) -> bool {
         self.probe_preferences && gnome_reduce_motion()
     }
@@ -2445,35 +2479,34 @@ fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
     token
 }
 
-/// How long the Linux motion read may take. It runs once per window attach, on
-/// the main thread, so it is bounded well under a frame budget's worth of
-/// visible delay; a desktop whose `gsettings` is slower than this simply
+/// How long the Linux motion read may take, the session bus's handshake
+/// included. It runs once per window attach, on the main thread, so it is
+/// bounded well under a frame budget's worth of visible delay; a desktop whose
+/// portal is slower than this (one being started by its first call) simply
 /// answers "not reduced" and config `motion` decides.
-#[cfg(all(not(target_os = "macos"), not(windows)))]
-const GSETTINGS_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(target_os = "linux")]
+const MOTION_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// The GNOME motion preference, read through the `gsettings` CLI. aterm now
-/// has a first-party D-Bus client (aterm-dbus: the AT-SPI publisher and
-/// desktop notifications use it), so reading
-/// `org.freedesktop.portal.Settings` over the session bus instead is the
-/// a11y ruling's optional step 7 (`docs/AUDIT-third-party-2026-10-15.md`,
-/// unit a11y), not done. A missing binary, a non-zero exit, a timeout or any
-/// value but `false` answers `false` (not reduced).
-#[cfg(all(not(target_os = "macos"), not(windows)))]
+/// The GNOME motion preference, read from the desktop's Settings portal over
+/// aterm-dbus ([`crate::portal_settings`]): the a11y ruling's optional step 7
+/// (`docs/AUDIT-third-party-2026-10-15.md`, unit a11y), which replaced the
+/// `gsettings get` child this read spawned. No session bus, no running portal
+/// (the read never starts one), a timeout or any value but `false` answers
+/// `false` (not reduced).
+#[cfg(target_os = "linux")]
 fn gnome_reduce_motion() -> bool {
-    read_bounded_stdout(
-        "gsettings",
-        &["get", "org.gnome.desktop.interface", "enable-animations"],
-        GSETTINGS_READ_BOUND,
+    use crate::portal_settings::{ENABLE_ANIMATIONS, GNOME_INTERFACE};
+    crate::portal_settings::animations_disabled(
+        crate::portal_settings::read(GNOME_INTERFACE, ENABLE_ANIMATIONS, MOTION_READ_BOUND)
+            .as_ref(),
     )
-    .is_some_and(|out| gnome_animations_disabled(&out))
 }
 
-/// `enable-animations` prints `true` or `false`; only `false` means the user
-/// asked for reduced motion. Empty or unexpected output is NOT a preference.
-#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
-fn gnome_animations_disabled(stdout: &str) -> bool {
-    stdout.trim() == "false"
+/// The other unixes aterm-gui builds for have no portal reader (aterm-dbus is
+/// a Linux dependency): no preference, so config `motion` decides.
+#[cfg(all(not(target_os = "macos"), not(windows), not(target_os = "linux")))]
+fn gnome_reduce_motion() -> bool {
+    false
 }
 
 /// Run `program args…` and return its stdout if it exits successfully within
@@ -2516,32 +2549,20 @@ pub(crate) fn read_bounded_stdout(
 }
 
 #[cfg(test)]
-mod linux_reduce_motion_tests {
-    use super::gnome_animations_disabled;
+mod bounded_read_tests {
     // `read_bounded_stdout`'s own tests are unix's: they run `/bin/sh` and
     // `/bin/sleep`. On Windows the spawn fails, so the first asserted a stdout it
     // could not get and the second passed without a child.
     #[cfg(unix)]
     use super::read_bounded_stdout;
 
-    #[test]
-    fn only_a_false_enable_animations_means_reduced() {
-        assert!(gnome_animations_disabled("false\n"));
-        assert!(gnome_animations_disabled("  false "));
-        for not_reduced in ["true\n", "", "\n", "garbage", "'false'", "No such key"] {
-            assert!(
-                !gnome_animations_disabled(not_reduced),
-                "{not_reduced:?} must not read as reduced motion"
-            );
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn the_bounded_read_returns_stdout_of_a_successful_child() {
-        // The bound is a hang detector here: `GSETTINGS_READ_BOUND` (200 ms) is the
-        // product's latency budget for a desktop's gsettings, and a child spawned on a
-        // loaded machine can take longer than that to print one word.
+        // The bound is a hang detector here: the appearance reader's 200 ms is the
+        // product's latency budget for a desktop's `gdbus` and `gsettings`, and a
+        // child spawned on a loaded machine can take longer than that to print one
+        // word.
         assert_eq!(
             read_bounded_stdout(
                 "/bin/sh",
@@ -2886,6 +2907,10 @@ mod reduce_motion {
 
     pub(crate) fn reduce_transparency() -> bool {
         workspace_flag(sel!(accessibilityDisplayShouldReduceTransparency))
+    }
+
+    pub(crate) fn differentiate_without_color() -> bool {
+        workspace_flag(sel!(accessibilityDisplayShouldDifferentiateWithoutColor))
     }
 
     /// Register a workspace-notification observer for the accessibility

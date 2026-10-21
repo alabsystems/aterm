@@ -349,6 +349,21 @@ pub(crate) enum MenuAction {
     /// (`App::user_toggle_needs_in_windows`). It replaces Presence Band and
     /// Presence Rim; `TogglePresenceRim` (the same key) is its alias.
     ToggleNeedsInWindows,
+    /// View ▸ Stats Bars: Deck — one of three radio rows
+    /// (`docs/DESIGN-system-awareness-2026-10-16.md` §12.2): the three bars
+    /// at full size under the titlebar, the default. Persisted as
+    /// `[sys] stats_bars = "deck"` through the one serialized config lane
+    /// (`App::user_set_stats_bars`); a change into or out of the Deck
+    /// re-grids every window once.
+    StatsBarsDeck,
+    /// View ▸ Stats Bars: Sill — the compact form, three light lanes in the
+    /// window's bottom pad that take no terminal row (`"sill"`).
+    StatsBarsSill,
+    /// View ▸ Stats Bars: Off — no bars (`"off"`).
+    StatsBarsOff,
+    /// View ▸ Stats Lens (⌘I): open the keyboard lens, the bars' close-up,
+    /// on the front window, or close the open one (`App::toggle_stats_lens`).
+    ToggleStatsLens,
     /// Open Settings AT the Packages route (the batteries-included toolchain
     /// surface: install/update the ALab toolset, posture, consent switches).
     /// The app-menu Packages… item beneath Settings… — the menu-bar path to the
@@ -486,8 +501,8 @@ pub(crate) enum MenuAction {
     /// View ▸ Coding Agent Harness… (`docs/DESIGN-harness-autopilot-2026-10-15.md`
     /// §1): the one Settings tab, at Settings ▸ Harness — the harness's
     /// switches, the default Autopilot, each session's Autopilot and what the
-    /// harness did. The menu and palette twin of the footer's `⚙` chip
-    /// (`App::open_harness_settings`). Instance-level: no session needed.
+    /// harness did. The menu and palette twin of the Autopilot menu's
+    /// `Harness settings…` (`App::open_harness_settings`). Instance-level: no session needed.
     HarnessSettings,
     /// Minimise the window.
     Minimize,
@@ -596,6 +611,10 @@ impl MenuAction {
             MenuAction::ReadFleet => 81,
             MenuAction::SummarizeFleet => 82,
             MenuAction::FleetMachines => 83,
+            MenuAction::StatsBarsDeck => 84,
+            MenuAction::StatsBarsSill => 85,
+            MenuAction::StatsBarsOff => 86,
+            MenuAction::ToggleStatsLens => 87,
             // Per-session themes (palette-256-session).
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
@@ -682,6 +701,10 @@ impl MenuAction {
             81 => MenuAction::ReadFleet,
             82 => MenuAction::SummarizeFleet,
             83 => MenuAction::FleetMachines,
+            84 => MenuAction::StatsBarsDeck,
+            85 => MenuAction::StatsBarsSill,
+            86 => MenuAction::StatsBarsOff,
+            87 => MenuAction::ToggleStatsLens,
             _ => return None,
         })
     }
@@ -925,6 +948,49 @@ pub(crate) fn set_needs_in_windows(on: bool) {
     NEEDS_IN_WINDOWS.published(|bit| bit.store(on, std::sync::atomic::Ordering::Relaxed));
 }
 
+menu_static! {
+    /// View ▸ Stats Bars' LIVE form (`[sys] stats_bars` as the App applies
+    /// it: 0 Deck, 1 Sill, 2 Off), so `validateMenuItem:` can stamp the
+    /// radio's checkmark synchronously. Published through
+    /// [`set_stats_bars_form`] by the config apply (load, reload, the
+    /// radio's own write), `App::publish_menu_live` on the way to every wait
+    /// and `App::sync_active_session`.
+    static STATS_BARS_FORM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+}
+
+/// Publish View ▸ Stats Bars' radio.
+pub(crate) fn set_stats_bars_form(form: crate::stats_deck::StatsBars) {
+    let bits = crate::stats_deck::StatsBars::ALL
+        .iter()
+        .position(|f| *f == form)
+        .unwrap_or(0) as u8;
+    STATS_BARS_FORM.published(|bit| bit.store(bits, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// The published Stats Bars form ([`set_stats_bars_form`]); the Deck before
+/// any publish, as the config defaults. Read by the native menu's checkmark
+/// ([`native_menu_checked`]), so it exists where that does.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn stats_bars_form() -> crate::stats_deck::StatsBars {
+    let bits = STATS_BARS_FORM.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed));
+    crate::stats_deck::StatsBars::ALL
+        .get(usize::from(bits))
+        .copied()
+        .unwrap_or(crate::stats_deck::StatsBars::Deck)
+}
+
+impl MenuAction {
+    /// The Stats Bars form a radio row names, or `None` for any other row.
+    pub(crate) const fn stats_bars_form(self) -> Option<crate::stats_deck::StatsBars> {
+        match self {
+            MenuAction::StatsBarsDeck => Some(crate::stats_deck::StatsBars::Deck),
+            MenuAction::StatsBarsSill => Some(crate::stats_deck::StatsBars::Sill),
+            MenuAction::StatsBarsOff => Some(crate::stats_deck::StatsBars::Off),
+            _ => None,
+        }
+    }
+}
+
 /// THE AGENTS MENU'S LIVE BITS, as `validateMenuItem:` needs them when the
 /// menu opens (it cannot reach the App): Next That Needs You is live while a
 /// local need stands, Overview while a window exists, Read the Fleet and
@@ -1118,6 +1184,9 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
         MenuAction::ToggleNeedsInWindows => {
             Some(NEEDS_IN_WINDOWS.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed)))
         }
+        MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
+            Some(action.stats_bars_form() == Some(stats_bars_form()))
+        }
         MenuAction::ToggleSeriousMode => Some(menu_live().serious_mode),
         MenuAction::ToggleMatrixRain => Some(menu_live().rain_on),
         MenuAction::FavouriteKitty => Some(menu_live().kitty_favourited),
@@ -1215,8 +1284,8 @@ pub(crate) const TAKE_OVER_TIP: &str = concat!(
 /// `invoke <action>` verb (and its `open <surface>` twins). The `invoke` verb's BASE op
 /// is the benign `WriteInput` (it drives the human input vocabulary), but several menu
 /// actions reach a strictly-greater capability that a plain child `WriteInput` edge must
-/// NOT inherit — this is the classification the control layer's `escalated_op` reads to
-/// fence those indirect seams. Compiler-EXHAUSTIVE over every variant (see
+/// NOT inherit — this is the classification the control layer's `argument_escalation`
+/// reads to fence those indirect seams. Compiler-EXHAUSTIVE over every variant (see
 /// [`MenuAction::invoke_authority`]): a new `MenuAction` cannot compile until it is
 /// classified here, so the fence can never silently miss a newly-added privileged action.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1241,6 +1310,8 @@ pub(crate) enum InvokeAuthority {
     /// the held agent invoke its own Hand Back. Take Over and Hand Back
     /// (`invoke TakeOver|HandBack`, and their aliases) answer `ERR denied`;
     /// the window's menu, palette, tab menu, Overview and pill reach them.
+    /// The stats lens (`invoke ToggleStatsLens`) is the person's too: the
+    /// window's View menu and ⌘I reach it.
     PersonOnly,
 }
 
@@ -1312,6 +1383,16 @@ impl MenuAction {
             // durable config, the `ConfigWrite` fine op, exactly as Serious
             // Mode is classified.
             MenuAction::ToggleNeedsInWindows => ConfigWrite,
+            // The Stats Bars radio writes `[sys] stats_bars` in aterm.toml:
+            // durable config, as Show Needs in Windows is.
+            MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
+                ConfigWrite
+            }
+            // The lens is the person's close-up, summoned by their hand
+            // (design §12.2: agents never summon the lens). Every in-session
+            // client holds Owner, so only the person's own class keeps agents
+            // from opening it.
+            MenuAction::ToggleStatsLens => PersonOnly,
             // The theme palette writes `theme` to aterm.toml on Enter, and a
             // caller that may open it may also press that Enter: the
             // `settings set theme` class, not the palette gateway's Owner-only
@@ -1355,7 +1436,7 @@ impl MenuAction {
             // is also the class the `kitty` control verb carries.
             | MenuAction::NextKitty
             // Opens the inline pin editor. Its eventual write is `meta set title`,
-            // which the control layer's own `escalated_op` already classifies as
+            // which the control verb table's `meta` form already classifies as
             // `WriteInput` (not `ConfigWrite` — nothing durable on disk is
             // rewritten), so this matches rather than tunnels under it.
             | MenuAction::RenameSession
@@ -1382,7 +1463,7 @@ impl MenuAction {
     }
 
     /// Whether firing this action writes INPUT BYTES to a session's PTY — the
-    /// question the unread-input gate (`crate::input_stall::is_input_writing`)
+    /// question the unread-input gate (`crate::input_stall::gate`)
     /// asks of `invoke <action>`. EXHAUSTIVE for the reason
     /// [`Self::invoke_authority`] is: a new action that pastes must be
     /// classified here, not default to "writes nothing" and slip past the gate.
@@ -1392,6 +1473,11 @@ impl MenuAction {
     pub(crate) const fn writes_pty_input(self) -> bool {
         match self {
             MenuAction::Paste => true,
+            // The stats bars' form is config; the lens is a view.
+            MenuAction::StatsBarsDeck
+            | MenuAction::StatsBarsSill
+            | MenuAction::StatsBarsOff
+            | MenuAction::ToggleStatsLens => false,
             MenuAction::About
             | MenuAction::SoftwareUpdate
             | MenuAction::Version
@@ -1597,6 +1683,19 @@ impl MenuAction {
                 "Show or hide the border and the titlebar pill that say a window's tab needs \
                  you; saved in aterm.toml."
             }
+            MenuAction::StatsBarsDeck => {
+                "Show the Global, aterm and Tab bars at full size under the titlebar; saved in \
+                 aterm.toml."
+            }
+            MenuAction::StatsBarsSill => {
+                "Show the Global, aterm and Tab bars as light lanes in the window's bottom \
+                 padding, which takes no terminal row; saved in aterm.toml."
+            }
+            MenuAction::StatsBarsOff => "Hide the stats bars; saved in aterm.toml.",
+            MenuAction::ToggleStatsLens => {
+                "Open the stats bars' close-up, or close it: arrows move between instruments \
+                 and bars, Escape closes."
+            }
             MenuAction::Help => "Open the aterm guide.",
         }
     }
@@ -1693,6 +1792,10 @@ impl MenuAction {
             "NewWindowWithIdentity" => Some(MenuAction::NewWindowWithIdentity),
             "NewTabWithIdentity" => Some(MenuAction::NewTabWithIdentity),
             "ToggleNeedsInWindows" => Some(MenuAction::ToggleNeedsInWindows),
+            "StatsBarsDeck" => Some(MenuAction::StatsBarsDeck),
+            "StatsBarsSill" => Some(MenuAction::StatsBarsSill),
+            "StatsBarsOff" => Some(MenuAction::StatsBarsOff),
+            "ToggleStatsLens" => Some(MenuAction::ToggleStatsLens),
             "ResetTerminal" => Some(MenuAction::ResetTerminal),
             "ChooseTabTheme" => Some(MenuAction::ChooseTabTheme),
             "ClearTabTheme" => Some(MenuAction::ClearTabTheme),
@@ -2105,6 +2208,33 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
+    // The stats bars' form (design §12.2): a radio of three, the Deck by
+    // default, persisted as `[sys] stats_bars`; then the lens, ⌘I.
+    Item {
+        label: "Stats Bars: Deck",
+        action: MenuAction::StatsBarsDeck,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Stats Bars: Sill",
+        action: MenuAction::StatsBarsSill,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Stats Bars: Off",
+        action: MenuAction::StatsBarsOff,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Stats Lens",
+        action: MenuAction::ToggleStatsLens,
+        key: "i",
+        mods: MenuMods::Command,
+    },
+    Separator,
     Item {
         label: "Serious Mode",
         action: MenuAction::ToggleSeriousMode,
@@ -2132,7 +2262,8 @@ const VIEW_MENU: &[MenuEntry] = &[
     Separator,
     // Settings at the /harness route (the Autopilot design, §1): the coding
     // agent harness's switches (Claude Code's, Codex's), Autopilot and what
-    // it did — the bar twin of the footer's `⚙` chip, named as the page is.
+    // it did — the bar twin of the Autopilot menu's `Harness settings…`,
+    // named as the page is.
     Item {
         label: "Coding Agent Harness…",
         action: MenuAction::HarnessSettings,
@@ -2672,7 +2803,7 @@ fn chrome_lines_for(
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     MenuHandle, choose_local_file, choose_local_image, confirm, confirm_owner,
-    defer_quit_for_terminate, install, notify, open_file_in_workspace, open_help_url,
+    defer_quit_for_terminate, install, notify, ok_alert, open_file_in_workspace, open_help_url,
     order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
     update_version_menu,
 };
@@ -3860,29 +3991,40 @@ mod macos {
         // `-runModal` below spins a nested run loop until the user dismisses
         // the alert; park the main-thread watchdog for exactly that long.
         let _park = crate::watchdog::park_modal();
+        autoreleasepool(|_| {
+            let Some(alert) = ok_alert(title, body) else {
+                return;
+            };
+            // SAFETY: main thread (checked above); `-runModal` is
+            // `-(NSModalResponse)` on the live alert.
+            let _ = unsafe { appkit::send_isize(alert.id(), sel!(runModal)) };
+        });
+    }
+
+    /// [`notify`]'s alert, built and not yet run: also the launch-fatal alert's
+    /// (`launch_alert`), which puts its panel in before asking to be the active
+    /// app. Main thread only, as every caller checks first. `None` when AppKit
+    /// builds none.
+    pub(crate) fn ok_alert(title: &str, body: &str) -> Option<Obj> {
         let (Some(title), Some(body), Some(ok)) = (
             appkit::nsstring(title),
             appkit::nsstring(body),
             appkit::nsstring("OK"),
         ) else {
-            return;
+            return None;
         };
-        // SAFETY: standard `NSAlert` construction + setters + `runModal`, all on
-        // the main thread. `+new` is +1 (alloc+init) and lands in `Obj`;
+        // SAFETY: standard `NSAlert` construction + setters on the main thread.
+        // `+new` is +1 (alloc+init) and lands in `Obj`;
         // `-setMessageText:`/`-setInformativeText:` are `-(void)(NSString *)`;
         // `-addButtonWithTitle:` is `-(id)` returning a BORROWED button this
-        // caller does not keep; `-runModal` is `-(NSModalResponse)`.
-        autoreleasepool(|_| unsafe {
-            let Some(alert) =
-                Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new)))
-            else {
-                return;
-            };
+        // caller does not keep.
+        unsafe {
+            let alert = Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new)))?;
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), ok.id());
-            let _ = appkit::send_isize(alert.id(), sel!(runModal));
-        });
+            Some(alert)
+        }
     }
 
     /// Whether the `terminate:` AppKit is asking about now is the SYSTEM's —
@@ -4877,7 +5019,7 @@ mod tests {
     /// integer its `NSMenuItem` carries, and no two share one, so a press
     /// dispatches exactly its own command. It also decodes from its `invoke`
     /// name, the token the control socket's authority fence classifies
-    /// (`control::escalated_op`): a name the fence cannot decode escalates
+    /// (`control::argument_escalation`): a name the fence cannot decode escalates
     /// nothing, while the palette still dispatches it, so an Owner-only
     /// action would run under the base `WriteInput` gate. The default tag (0)
     /// and any unknown tag or name decode to `None`, so an untagged item never

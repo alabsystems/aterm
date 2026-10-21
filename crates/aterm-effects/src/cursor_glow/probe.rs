@@ -138,6 +138,80 @@ impl CursorGlow {
         }
     }
 
+    /// Host observation: the cells of the frame about to be presented
+    /// (window rows, as `cur` is), for the dark streak's split between the
+    /// bed and the beam ([`TextView`]) and its over-ink account: the text of
+    /// every row its light can reach this frame that the row probe does not
+    /// read, from the rows of its live samples to the leap from the caret's
+    /// last cell to `cur`, and a row either side. Each row is reduced to the
+    /// span from its first glyph to one past its last (a wide glyph's
+    /// continuation is glyph), so a leap over rows a clear left blank is
+    /// drawn as light, not as a bed, and each cell's ink and ground are kept
+    /// for the over-ink account, which holds a letter to the bar against the
+    /// colours it is really drawn in (a selection, a coloured prompt).
+    /// Read only by the tick at `now`; a host that hands none leaves those
+    /// rows unknown (text, to the bed). Call it right before the tick.
+    pub fn observe_frame_text(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        cells: &[Vec<aterm_core::terminal::RenderCell>],
+        now: Instant,
+    ) {
+        /// The most rows one frame reads: a leap longer than this keeps its
+        /// far rows unknown.
+        const MAX_ROWS: i32 = 256;
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        let mut take = |row: u16| {
+            lo = lo.min(i32::from(row));
+            hi = hi.max(i32::from(row));
+        };
+        for s in &self.sparks {
+            take(s.row);
+        }
+        for (row, _) in cur.into_iter().chain(self.last) {
+            take(row);
+        }
+        if let Some((a, b)) = self.classic.row_range() {
+            take(a);
+            take(b);
+        }
+        let ft = &mut self.frame_text;
+        ft.rows.clear();
+        ft.pairs.clear();
+        ft.cols = 0;
+        ft.at = Some(now);
+        if lo > hi {
+            return;
+        }
+        // The rows flanking them too: the head's light and the account
+        // reach a row either side, and a fire's flames rise a few rows
+        // over its line (their ceiling over a row nobody read is the text's).
+        let lo = (lo - 1 - Self::FRAME_TEXT_RISE).max(0);
+        let hi = (hi + 1).min(cells.len() as i32 - 1).min(lo + MAX_ROWS - 1);
+        ft.lo = lo;
+        // The widest row read sets the stride (a frame's rows need not all
+        // carry every column; a missing cell reads as unread).
+        ft.cols = (lo..=hi)
+            .map(|r| cells[r as usize].len())
+            .max()
+            .unwrap_or(0);
+        let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+        for row in lo..=hi {
+            let line = &cells[row as usize];
+            let glyph = |c: &aterm_core::terminal::RenderCell| c.ch != ' ' || c.wide;
+            let first = line.iter().position(glyph);
+            let last = line.iter().rposition(glyph);
+            ft.rows
+                .push(first.zip(last).map(|(f, l)| (f as i32, l as i32 + 1)));
+            // A blank cell has a ground and no letter: its ink is `None`.
+            ft.pairs.extend((0..ft.cols).map(|c| {
+                line.get(c)
+                    .map(|cell| (glyph(cell).then(|| rgb(cell.fg)), rgb(cell.bg)))
+            }));
+        }
+    }
+
     /// Host observation: whether DECTCEM draws the caret handed to
     /// [`Self::tick`] this frame (the single-pane window hands over hidden
     /// carets too). Feeds only the minibuffer gate of [`Self::echo_anchor_pass`].
@@ -217,7 +291,10 @@ impl CursorGlow {
     /// ribbon faded: a copy of its glyph beside it is a twin only if that row is
     /// seen (`tests/erased_under_its_twin.rs`). The list is recorded
     /// (`witness_asked`) so the follow pass counts only undelivered rows as
-    /// withheld.
+    /// withheld. The first row captured this frame is the caret's: a caret
+    /// that moved past the follow offsets from the row it last stood on names
+    /// the rows its box's lines stand on if they went with it
+    /// ([`rk::Engine::ribbon_rows_at_caret`]).
     pub fn ribbon_rows(&self, out: &mut [u16]) -> usize {
         if !self.v2.engaged() || out.is_empty() {
             return 0;
@@ -236,7 +313,12 @@ impl CursorGlow {
                 .map(|(row, _)| row)
             })
             .or_else(|| self.insert.armed.and_then(|licence| licence.row));
-        let n = self.v2.ribbon_rows_for(source, out);
+        let caret_move = self
+            .last
+            .or_else(|| self.last_visible.map(|(cell, _)| cell))
+            .zip(self.witness_rows[..self.witness_rows_n.min(self.witness_rows.len())].first())
+            .map(|((from, _), to)| (from, to.row));
+        let n = self.v2.ribbon_rows_at_caret(source, caret_move, out);
         let mut asked = [0u16; RIBBON_LIST_ROWS];
         let kept = n.min(asked.len());
         asked[..kept].copy_from_slice(&out[..kept]);

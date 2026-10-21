@@ -17,18 +17,17 @@
 //!    immutable);
 //! 3. publish: create the release, or upload exactly what is missing (never replacing); a
 //!    public release that serves no manifest (an orphaned draft) is refused;
-//! 4. confirm every asset answers on the download host.
+//! 4. confirm every asset answers on the download host ([`super::probe_served`]).
 //!
 //! An answer the download host does not give ([`Probe::Unknown`]) is never read as
 //! "absent": nothing is decided about that pack, and the run stops.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use atpkg::net::MANIFEST_CAP;
 
-use super::{Log, download_retried, flag_value, host_error};
+use super::{Log, download_retried, flag_value, host_error, probe_served};
 use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
@@ -40,31 +39,19 @@ use crate::quad::{self, VerifiedQuad};
 pub struct MirrorOptions {
     /// Verify and plan; write nothing to any host.
     pub dry_run: bool,
-    /// How many times an upload is confirmed on the download host before it is called
-    /// unserved: a fresh asset can take a moment to answer.
-    pub confirm_attempts: usize,
-    /// The pause between two confirmations.
-    pub confirm_pause: Duration,
 }
 
 impl MirrorOptions {
     /// Publish what is missing.
     #[must_use]
     pub fn publish() -> Self {
-        Self {
-            dry_run: false,
-            confirm_attempts: 3,
-            confirm_pause: Duration::from_secs(5),
-        }
+        Self { dry_run: false }
     }
 
     /// Verify and plan only.
     #[must_use]
     pub fn dry_run() -> Self {
-        Self {
-            dry_run: true,
-            ..Self::publish()
-        }
+        Self { dry_run: true }
     }
 }
 
@@ -416,16 +403,7 @@ fn one(
 
     // 4. Confirm, as a client would fetch it.
     for name in &written {
-        let mut answer = Probe::Absent;
-        for attempt in 0..opts.confirm_attempts.max(1) {
-            if attempt > 0 {
-                std::thread::sleep(opts.confirm_pause);
-            }
-            answer = channel.probe_public(&public, &tag, name);
-            if answer == Probe::Present {
-                break;
-            }
-        }
+        let answer = probe_served(channel, &public, &tag, name);
         if answer != Probe::Present {
             return Err(Error::refused(format!(
                 "{} answers {answer:?} after the upload — the public repo is private, or the \

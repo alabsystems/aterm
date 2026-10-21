@@ -86,15 +86,24 @@ pub(crate) const LOCAL_STAND_IN: &str = "/";
 /// How long a spawn waits for the folder check. A local folder answers in
 /// microseconds; a hung network mount would hold the thread for its whole
 /// timeout.
-#[cfg(unix)]
+#[cfg(all(unix, not(test)))]
 const CHECK_BUDGET: Duration = Duration::from_millis(250);
+
+/// This crate's tests judge local scratch folders, whose check must answer:
+/// they wait it as a hang detector, since a loaded parallel run starved a
+/// check of 250 ms and read its folder as kept (the restore and spawn suites
+/// on the Linux lane). What the budget does is tested on budgets and counts of
+/// those tests' own ([`within`]).
+#[cfg(all(unix, test))]
+const CHECK_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The most checks left waiting on a hung volume at once: past this, a spawn
 /// does not start another and judges its folder as one that did not answer
 /// ([`start_fault`]), so a mount that stopped answering costs a bounded number
-/// of parked threads.
+/// of parked threads. In this crate's tests, as many as its test threads run
+/// at once ([`CHECK_BUDGET`]'s reason).
 #[cfg(unix)]
-const CHECKS_IN_FLIGHT_MAX: usize = 4;
+const CHECKS_IN_FLIGHT_MAX: usize = if cfg!(test) { 64 } else { 4 };
 
 #[cfg(unix)]
 static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -108,6 +117,8 @@ static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// lane, 2026-10-17), and none for every New Tab after the first. A worker's
 /// canonical read of a folder ([`canonical_folder`]) is one of these checks
 /// too: either still running past the budget says the folder did not answer.
+/// So is every other folder on that folder's volume, when it is not local
+/// ([`beside_silent`]).
 #[cfg(unix)]
 static CHECKS_RUNNING: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
@@ -118,28 +129,12 @@ static CHECKS_RUNNING: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 pub(crate) fn folder_fault(dir: &str) -> Option<Fault> {
     #[cfg(unix)]
     {
-        within(&CHECKS_IN_FLIGHT, CHECK_BUDGET, dir, fault_now).flatten()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        None
-    }
-}
-
-/// Why a fresh shell cannot start in `dir`: [`folder_fault`], except that a
-/// check that did not answer in time — or was not started, the cap being
-/// reached — is [`Fault::Unresponsive`] for a folder on a volume that is not
-/// local ([`remote_volume`]). A folder on a local volume still stands.
-pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
-    #[cfg(unix)]
-    {
-        start_fault_in(
+        folder_fault_in(
             &CHECKS_IN_FLIGHT,
             CHECK_BUDGET,
             dir,
             fault_now,
-            remote_volume,
+            remote_mount_here(),
         )
     }
     #[cfg(not(unix))]
@@ -149,17 +144,163 @@ pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
     }
 }
 
-/// [`start_fault`] over its check, its cap and its mount table.
+/// [`folder_fault`] over its check, its cap and its mount table: not judged,
+/// at once, for a folder beside a check that did not answer
+/// ([`beside_silent`]).
+#[cfg(unix)]
+fn folder_fault_in(
+    in_flight: &'static AtomicUsize,
+    budget: Duration,
+    dir: &str,
+    check: fn(&str) -> Option<Fault>,
+    mount: impl Fn(&str) -> Option<PathBuf>,
+) -> Option<Fault> {
+    if beside_silent(dir, budget, mount) {
+        return None;
+    }
+    within(in_flight, budget, dir, check).flatten()
+}
+
+/// Why a fresh shell cannot start in `dir`: [`folder_fault`], except that a
+/// check that did not answer in time — or was not started, the cap being
+/// reached, or not needed, another folder's check on the same volume having
+/// run past the budget ([`beside_silent`]) — is [`Fault::Unresponsive`] for a
+/// folder on a volume that is not local ([`remote_volume`]). A folder on a
+/// local volume still stands.
+pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
+    #[cfg(unix)]
+    {
+        start_fault_in(
+            &CHECKS_IN_FLIGHT,
+            CHECK_BUDGET,
+            dir,
+            fault_now,
+            remote_mount_here(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// [`start_fault`] over its check, its cap and its mount table (`mount`: the
+/// mount point holding a folder on a volume that is not local).
 #[cfg(unix)]
 fn start_fault_in(
     in_flight: &'static AtomicUsize,
     budget: Duration,
     dir: &str,
     check: fn(&str) -> Option<Fault>,
-    remote: impl FnOnce(&str) -> bool,
+    mount: impl Fn(&str) -> Option<PathBuf>,
 ) -> Option<Fault> {
+    if beside_silent(dir, budget, &mount) {
+        return Some(Fault::Unresponsive);
+    }
     within(in_flight, budget, dir, check)
-        .unwrap_or_else(|| remote(dir).then_some(Fault::Unresponsive))
+        .unwrap_or_else(|| mount(dir).is_some().then_some(Fault::Unresponsive))
+}
+
+/// Whether reading `dir` can go ahead without holding its reader on a network
+/// volume that stopped answering: `dir` is on a local volume (read whatever a
+/// look would say — a starved CPU can hold a local disk past the budget, and a
+/// local folder that did not answer stands for a spawn — so none is made), or
+/// a look at it (`lstat`) answered within the folder check's budget. `false`
+/// only for a folder on a volume
+/// that is not local whose look did not answer in time, could not start with
+/// the cap full, or sits beside another check that did not answer
+/// ([`beside_silent`]). For a reader that must not wait out a network
+/// volume's own timeout — the agent identities' folder, read on the spawner
+/// ahead of every later tab and on the event loop for the identity picker and
+/// a restore (`agent_identity`). A look that answered says nothing of the
+/// next read: a volume that stops answering between the two still holds it.
+/// Off unix nothing is judged: `true`.
+pub(crate) fn volume_answers(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        // A folder named in bytes that are not UTF-8 is not judged.
+        dir.to_str().is_none_or(|dir| {
+            answers_in(
+                &CHECKS_IN_FLIGHT,
+                CHECK_BUDGET,
+                dir,
+                look_now,
+                remote_mount_here(),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        true
+    }
+}
+
+/// Whether `dir` is on a volume that is not local, by the kernel's mount
+/// table ([`remote_volume`]): a name in bytes that are not UTF-8 is judged
+/// local, and off unix every folder is.
+pub(crate) fn on_network_volume(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        dir.to_str().is_some_and(remote_volume)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
+/// [`volume_answers`] over its look, its cap and its mount table.
+#[cfg(unix)]
+fn answers_in(
+    in_flight: &'static AtomicUsize,
+    budget: Duration,
+    dir: &str,
+    look: fn(&str),
+    mount: impl Fn(&str) -> Option<PathBuf>,
+) -> bool {
+    // A local volume is read whatever a look would say: none is made.
+    mount(dir).is_none()
+        || !(beside_silent(dir, budget, &mount) || within(in_flight, budget, dir, look).is_none())
+}
+
+/// [`volume_answers`]'s look without the time limit: what it finds is not the
+/// question, only that the volume answered.
+#[cfg(unix)]
+fn look_now(dir: &str) {
+    let _ = std::fs::symlink_metadata(dir);
+}
+
+/// Whether `dir` sits on a volume that is not local (`mount` names the mount
+/// point holding a folder on one, `None` for a local one) beside a check that
+/// has run past `budget`: a check of another folder on that same mount,
+/// still running. The mount stopped answering, not the folder, so its other
+/// folders are answered at once instead of each waiting out a budget of its
+/// own: a restore of four tabs in four folders of one hung NFS share waited
+/// the budget once per folder, on the event loop (four turns of 262 ms;
+/// reopened from a crash journal, the launch's first frame came 1012 ms
+/// late), and each New Tab into another folder there waited it again (340-410
+/// ms), measured in a macOS 27 guest, 2026-10-20. The mount table is not read
+/// while no check has run past the budget, so a machine whose volumes answer
+/// pays nothing for this.
+#[cfg(unix)]
+fn beside_silent(dir: &str, budget: Duration, mount: impl Fn(&str) -> Option<PathBuf>) -> bool {
+    let silent: Vec<String> = CHECKS_RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, since)| since.elapsed() >= budget)
+        .map(|(at, _)| at.clone())
+        .collect();
+    if silent.is_empty() {
+        return false;
+    }
+    let Some(here) = mount(dir) else {
+        return false;
+    };
+    silent.iter().any(|at| mount(at).as_ref() == Some(&here))
 }
 
 /// The canonical form of `dir` (`realpath`), or `None` when it has none or
@@ -172,7 +313,13 @@ fn start_fault_in(
 pub(crate) fn canonical_folder(dir: &str) -> Option<String> {
     #[cfg(unix)]
     {
-        canonical_in(&CHECKS_IN_FLIGHT, CHECK_BUDGET, dir, canonical_now)
+        canonical_in(
+            &CHECKS_IN_FLIGHT,
+            CHECK_BUDGET,
+            dir,
+            canonical_now,
+            remote_mount_here(),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -180,16 +327,21 @@ pub(crate) fn canonical_folder(dir: &str) -> Option<String> {
     }
 }
 
-/// [`canonical_folder`] over its check, its cap and its budget: `None` where
-/// the check found no canonical form, did not answer within `budget`, or
-/// could not start with the cap full.
+/// [`canonical_folder`] over its check, its cap, its budget and its mount
+/// table: `None` where the check found no canonical form, did not answer
+/// within `budget`, could not start with the cap full, or sits beside a check
+/// that did not answer ([`beside_silent`]).
 #[cfg(unix)]
 fn canonical_in(
     in_flight: &'static AtomicUsize,
     budget: Duration,
     dir: &str,
     check: fn(&str) -> Option<String>,
+    mount: impl Fn(&str) -> Option<PathBuf>,
 ) -> Option<String> {
+    if beside_silent(dir, budget, mount) {
+        return None;
+    }
     within(in_flight, budget, dir, check).flatten()
 }
 
@@ -310,33 +462,45 @@ fn fault_now(dir: &str) -> Option<Fault> {
 /// that cannot hang too.
 #[cfg(unix)]
 fn remote_volume(dir: &str) -> bool {
-    let table = mount_table();
-    on_remote_mount(
-        dir,
-        table.iter().map(|(on, local)| (on.as_path(), *local)),
-        Aliases::here(),
-    )
+    remote_mount_here()(dir).is_some()
 }
 
-/// PURE: whether the mount that holds `dir` — the longest mount point that is
-/// a whole-component prefix of it, both spelled one way by `aliases`, and of
-/// equal ones the last listed, the one mounted on top — is not
-/// local. A symlink of the person's own into a network volume is judged by the
-/// folder it is in (resolving it would ask the volume), and a path no mount
-/// holds is local.
+/// The mount point holding a folder on a volume that is not local, by this
+/// machine's mount table ([`mount_table`], read at the first ask and kept for
+/// the rest of the closure's life) and path aliases ([`remote_mount_of`]).
 #[cfg(unix)]
-fn on_remote_mount<'a>(
+fn remote_mount_here() -> impl Fn(&str) -> Option<PathBuf> {
+    let table = std::cell::OnceCell::new();
+    move |dir| {
+        let table: &Vec<(PathBuf, bool)> = table.get_or_init(mount_table);
+        remote_mount_of(
+            dir,
+            table.iter().map(|(on, local)| (on.as_path(), *local)),
+            Aliases::here(),
+        )
+    }
+}
+
+/// PURE: the mount point, spelled one way by `aliases`, of the mount that
+/// holds `dir` — the longest mount point that is a whole-component prefix of
+/// it, both so spelled, and of equal ones the last listed, the one mounted on
+/// top — when that mount is not local; `None` for a folder on a local one. A
+/// symlink of the person's own into a network volume is judged by the folder
+/// it is in (resolving it would ask the volume), and a path no mount holds is
+/// local.
+#[cfg(unix)]
+fn remote_mount_of<'a>(
     dir: &str,
     mounts: impl IntoIterator<Item = (&'a Path, bool)>,
     aliases: &Aliases,
-) -> bool {
+) -> Option<PathBuf> {
     let dir = aliases.spelled(Path::new(dir));
     mounts
         .into_iter()
         .map(|(on, local)| (aliases.spelled(on), local))
         .filter(|(on, _)| dir.starts_with(on))
         .max_by_key(|(on, _)| on.components().count())
-        .is_some_and(|(_, local)| !local)
+        .and_then(|(on, local)| (!local).then_some(on))
 }
 
 /// THE PATH ALIASES MACOS FIXES AT BOOT, so a folder and the mount that holds
@@ -544,7 +708,7 @@ fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
 /// read — proves no folder local: a share mounted after the cut is not in it,
 /// and the mount listed below it would judge a folder on it local. Every mount
 /// it lists is judged not local then. Mounts stacked on one point keep their
-/// order, the one on top last, which [`on_remote_mount`] keeps.
+/// order, the one on top last, which [`remote_mount_of`] keeps.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn judged(table: aterm_sysprobe::volumes::Table) -> Vec<(PathBuf, bool)> {
     let whole = table.complete;
@@ -995,8 +1159,7 @@ impl RowFolders {
 mod tests {
     #[cfg(unix)]
     use super::{
-        Aliases, PaneFolder, canonical_in, folder_fault, on_remote_mount, remote_volume,
-        start_fault_in, within,
+        Aliases, PaneFolder, canonical_in, remote_mount_of, remote_volume, start_fault_in, within,
     };
     use super::{
         Fault, LOCAL_STAND_IN, StartFolder, inherited_in, retarget_folder_in, retarget_in,
@@ -1004,6 +1167,8 @@ mod tests {
     };
     use super::{canonical_now, without_verbatim};
     use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::time::{Duration, Instant};
 
@@ -1045,7 +1210,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn each_folder_a_shell_cannot_start_in_is_judged_and_a_folder_is_not() {
+        use super::fault_now;
         use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::atomic::AtomicUsize;
+        /// This test's own in-flight count: the process-wide one is shared
+        /// with every test that spawns a shell in a folder.
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        // `folder_fault`'s check on its thread, waited for under the one-minute
+        // hang detector: the verdict is what this test judges, and under a
+        // loaded parallel run the product's 250 ms budget ran out first.
+        let folder_fault =
+            |dir: &str| within(&IN_FLIGHT, Duration::from_secs(60), dir, fault_now).flatten();
         let scratch = aterm_tempfile::Builder::new()
             .prefix("aterm-start-folder")
             .tempdir()
@@ -1067,21 +1242,14 @@ mod tests {
         std::fs::set_permissions(at("shut"), std::fs::Permissions::from_mode(0o600)).unwrap();
         let shut = folder_fault(&at("shut"));
         std::fs::set_permissions(at("shut"), std::fs::Permissions::from_mode(0o700)).unwrap();
-        // root enters any folder: the verdict is the kernel's, not the mode bits'.
-        if !is_root() {
-            assert_eq!(
-                shut,
-                Some(Fault::Shut),
-                "a folder with no search permission"
-            );
-        }
         assert_eq!(folder_fault(&at("shut")), None, "the same folder, opened");
-    }
-
-    #[cfg(unix)]
-    fn is_root() -> bool {
-        // SAFETY: getuid has no failure mode and takes no arguments.
-        unsafe { libc::getuid() == 0 }
+        // root enters any folder: the verdict is the kernel's, not the mode bits'.
+        aterm_uds::host::could_not_run_as_root("a folder with no search permission");
+        assert_eq!(
+            shut,
+            Some(Fault::Shut),
+            "a folder with no search permission"
+        );
     }
 
     /// A CHECK THAT DOES NOT ANSWER KEEPS A LOCAL FOLDER: `within` gives up on
@@ -1130,12 +1298,14 @@ mod tests {
         );
         let budget = Duration::from_millis(50);
         assert_eq!(
-            start_fault_in(&IN_FLIGHT, budget, "/x", hangs, |_| false),
+            start_fault_in(&IN_FLIGHT, budget, "/x", hangs, |_| None),
             None,
             "a local folder that did not answer stands"
         );
         assert_eq!(
-            start_fault_in(&IN_FLIGHT, budget, "/x", hangs, |_| true),
+            start_fault_in(&IN_FLIGHT, budget, "/x", hangs, |_| {
+                Some(PathBuf::from("/aterm-test/budget-share"))
+            }),
             Some(Fault::Unresponsive),
             "a folder on a volume that is not local, silent, is no place to start"
         );
@@ -1155,7 +1325,9 @@ mod tests {
             "a check that answers is heard"
         );
         assert_eq!(
-            start_fault_in(&IN_FLIGHT, Duration::from_secs(60), "/x", answers, |_| true),
+            start_fault_in(&IN_FLIGHT, Duration::from_secs(60), "/x", answers, |_| {
+                Some(PathBuf::from("/aterm-test/budget-share"))
+            }),
             Some(Fault::Missing),
             "an answer wins over the volume"
         );
@@ -1177,11 +1349,13 @@ mod tests {
         }
         let budget = Duration::from_secs(60);
         assert_eq!(
-            start_fault_in(&IN_FLIGHT, budget, "/Volumes/share/x", answers, |_| true),
+            start_fault_in(&IN_FLIGHT, budget, "/Volumes/share/x", answers, |_| {
+                Some(PathBuf::from("/aterm-test/cap-share"))
+            }),
             Some(Fault::Unresponsive)
         );
         assert_eq!(
-            start_fault_in(&IN_FLIGHT, budget, "/Users//me/x", answers, |_| false),
+            start_fault_in(&IN_FLIGHT, budget, "/Users//me/x", answers, |_| None),
             None
         );
         assert_eq!(
@@ -1220,7 +1394,9 @@ mod tests {
         assert_eq!(within(&IN_FLIGHT, budget, hung, hangs), None);
         assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 1, "the first check waits");
         assert_eq!(
-            start_fault_in(&IN_FLIGHT, budget, hung, hangs, |_| true),
+            start_fault_in(&IN_FLIGHT, budget, hung, hangs, |_| {
+                Some(PathBuf::from("/aterm-test/hung-share"))
+            }),
             Some(Fault::Unresponsive),
             "judged as a folder that did not answer"
         );
@@ -1252,6 +1428,194 @@ mod tests {
                 .all(|(at, _)| !at.starts_with("/aterm-test/hung-share/")),
             "an ended check leaves no record"
         );
+    }
+
+    /// A CHECK PAST THE BUDGET ANSWERS FOR ITS WHOLE VOLUME WHEN THAT VOLUME IS
+    /// NOT LOCAL: once one folder's check on a network share has run past the
+    /// budget, every other folder there is judged at once — a spawn's as one
+    /// that did not answer, the restore's count and `spawn cwd=`'s refusal as
+    /// not judged, a worker's folder as not trusted, the identities' folder as
+    /// not answering — and no check starts beside it. A folder on another
+    /// share, and one on a local volume, are not judged by it; and once the
+    /// silent check ends, its share's folders are checked again. The mount
+    /// table is injected. NEGATIVE CONTROL: without the volume's answer each of
+    /// those four asks started a check of its own and waited out the budget on
+    /// it (five in flight).
+    #[cfg(unix)]
+    #[test]
+    fn a_check_past_the_budget_answers_for_its_whole_volume_when_it_is_not_local() {
+        use super::{answers_in, beside_silent, folder_fault_in, remote_mount_of};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex, PoisonError};
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+        // Each check waits until the test has its verdicts, or for the minute
+        // that is this test's hang detector.
+        fn gate() {
+            let (open, bell) = &GATE;
+            let open = open.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = bell
+                .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        fn hangs(_: &str) -> Option<Fault> {
+            gate();
+            Some(Fault::Missing)
+        }
+        fn hangs_reading(_: &str) -> Option<String> {
+            gate();
+            Some("/aterm-test/silent-share/second".to_string())
+        }
+        fn hangs_looking(_: &str) {
+            gate();
+        }
+        let table: Vec<(PathBuf, bool)> = vec![
+            (PathBuf::from("/"), true),
+            (PathBuf::from("/aterm-test/silent-share"), false),
+            (PathBuf::from("/aterm-test/live-share"), false),
+        ];
+        let mount = |dir: &str| {
+            remote_mount_of(
+                dir,
+                table.iter().map(|(on, local)| (on.as_path(), *local)),
+                &Aliases::default(),
+            )
+        };
+        let budget = Duration::from_millis(50);
+        // `within` returns once the check has run the budget: it is silent now.
+        assert_eq!(
+            within(&IN_FLIGHT, budget, "/aterm-test/silent-share/first", hangs),
+            None
+        );
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 1, "the first check waits");
+        let beside = "/aterm-test/silent-share/second";
+        assert_eq!(
+            start_fault_in(&IN_FLIGHT, budget, beside, hangs, mount),
+            Some(Fault::Unresponsive),
+            "a spawn there starts in the home folder"
+        );
+        assert_eq!(
+            folder_fault_in(&IN_FLIGHT, budget, beside, hangs, mount),
+            None
+        );
+        assert_eq!(
+            canonical_in(&IN_FLIGHT, budget, beside, hangs_reading, mount),
+            None
+        );
+        assert!(!answers_in(
+            &IN_FLIGHT,
+            budget,
+            beside,
+            hangs_looking,
+            mount
+        ));
+        assert_eq!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            1,
+            "no check started beside the silent one"
+        );
+        assert!(beside_silent(beside, budget, mount));
+        assert!(
+            !beside_silent("/aterm-test/live-share/x", budget, mount),
+            "another share is not judged by it"
+        );
+        assert!(
+            !beside_silent("/aterm-test/local/x", budget, mount),
+            "nor is a local folder"
+        );
+        *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        GATE.1.notify_all();
+        let opened = Instant::now();
+        while IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+            assert!(
+                opened.elapsed() < Duration::from_secs(60),
+                "the opened check never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !beside_silent(beside, budget, mount),
+            "with the silent check ended, its share is checked again"
+        );
+    }
+
+    /// A VOLUME ANSWERS BY A LOOK IN TIME, AND A LOCAL ONE IS READ ANYWAY
+    /// (`volume_answers`, the agent identities' folder): a look that answers —
+    /// whatever it found — says a network volume answers; one that does not
+    /// answer in time says it does not, and the same question again is
+    /// answered at once, with no second look; a local volume is read with no
+    /// look made, since its silence would be a starved CPU's. The mount table
+    /// is injected. NEGATIVE CONTROL: a gate that only asks the look (or the
+    /// volume) fails the local (or the silent) case.
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_answers_by_a_look_in_time_and_a_local_one_is_read_anyway() {
+        use super::{answers_in, remote_mount_of};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex, PoisonError};
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+        fn hangs(_: &str) {
+            let (open, bell) = &GATE;
+            let open = open.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = bell
+                .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        let table: Vec<(PathBuf, bool)> = vec![
+            (PathBuf::from("/"), true),
+            (PathBuf::from("/aterm-test/ids-share"), false),
+        ];
+        let mount = |dir: &str| {
+            remote_mount_of(
+                dir,
+                table.iter().map(|(on, local)| (on.as_path(), *local)),
+                &Aliases::default(),
+            )
+        };
+        let minute = Duration::from_secs(60);
+        let budget = Duration::from_millis(50);
+        let shared = "/aterm-test/ids-share/state/identities";
+        assert!(
+            answers_in(&IN_FLIGHT, minute, shared, |_| {}, mount),
+            "a look that answers"
+        );
+        assert!(
+            !answers_in(&IN_FLIGHT, budget, shared, hangs, mount),
+            "a silent look on a volume that is not local"
+        );
+        let looking = IN_FLIGHT.load(Ordering::SeqCst);
+        assert!(
+            answers_in(
+                &IN_FLIGHT,
+                budget,
+                "/aterm-test/ids-local/identities",
+                hangs,
+                mount
+            ),
+            "a local volume is read anyway"
+        );
+        assert_eq!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            looking,
+            "with no look made"
+        );
+        assert!(!answers_in(&IN_FLIGHT, budget, shared, hangs, mount));
+        assert_eq!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            looking,
+            "asked again: answered at once, no second look"
+        );
+        *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        GATE.1.notify_all();
+        let opened = Instant::now();
+        while IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+            assert!(
+                opened.elapsed() < Duration::from_secs(60),
+                "the opened looks never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A WORKER'S FOLDER IS TRUSTED ONLY AS READ IN TIME: its canonical form
@@ -1289,14 +1653,20 @@ mod tests {
         }
         let minute = Duration::from_secs(60);
         assert_eq!(
-            canonical_in(&FULL, minute, "/w/proj", answers),
+            canonical_in(&FULL, minute, "/w/proj", answers, |_| None),
             None,
             "the cap full"
         );
         // The check CANNOT answer before the gate opens below: this `None` is
         // the read giving up on a check still running.
         assert_eq!(
-            canonical_in(&IN_FLIGHT, Duration::from_millis(50), "/w/proj", hangs),
+            canonical_in(
+                &IN_FLIGHT,
+                Duration::from_millis(50),
+                "/w/proj",
+                hangs,
+                |_| None
+            ),
             None,
             "read late"
         );
@@ -1312,7 +1682,7 @@ mod tests {
         GATE.1.notify_all();
         // NEGATIVE CONTROL.
         assert_eq!(
-            canonical_in(&IN_FLIGHT, minute, "/w/proj", answers).as_deref(),
+            canonical_in(&IN_FLIGHT, minute, "/w/proj", answers, |_| None).as_deref(),
             Some("/w/proj")
         );
     }
@@ -1331,11 +1701,12 @@ mod tests {
         ];
         let none = Aliases::default();
         let remote = |dir: &str| {
-            on_remote_mount(
+            remote_mount_of(
                 dir,
                 table.iter().map(|(on, local)| (Path::new(on), *local)),
                 &none,
             )
+            .is_some()
         };
         assert!(remote("/Volumes/share"));
         assert!(remote("/Volumes/share/proj/src"));
@@ -1346,7 +1717,10 @@ mod tests {
         assert!(!remote("/Volumes/share/disk/proj"));
         assert!(!remote("/Volumes/shared/proj"));
         assert!(!remote("/Users//me/src"));
-        assert!(!on_remote_mount("/Volumes/share/x", [], &none), "no table");
+        assert!(
+            remote_mount_of("/Volumes/share/x", [], &none).is_none(),
+            "no table"
+        );
     }
 
     /// A FOLDER BEHIND MACOS'S FIXED ALIASES IS JUDGED BY THE MOUNT BEHIND
@@ -1377,7 +1751,7 @@ mod tests {
             ("/Users//me/disk", true),
         ];
         let mounts = || table.iter().map(|(on, local)| (Path::new(on), *local));
-        let remote = |dir: &str| on_remote_mount(dir, mounts(), &aliases);
+        let remote = |dir: &str| remote_mount_of(dir, mounts(), &aliases).is_some();
         assert!(remote("/home/me"), "a network home under the automounter");
         assert!(remote("/home/me/src"));
         assert!(remote("/work/proj"), "a root link through another");
@@ -1391,7 +1765,7 @@ mod tests {
         assert!(!remote("/Users//you"));
         assert!(!remote("/homework"), "whole components only");
         assert!(
-            !on_remote_mount("/home/me", mounts(), &Aliases::default()),
+            remote_mount_of("/home/me", mounts(), &Aliases::default()).is_none(),
             "lexically, `/` holds `/home`"
         );
     }
@@ -1428,11 +1802,12 @@ mod tests {
 ";
         let none = Aliases::default();
         let remote = |dir: &str, table: &[(std::path::PathBuf, bool)]| {
-            on_remote_mount(
+            remote_mount_of(
                 dir,
                 table.iter().map(|(on, local)| (on.as_path(), *local)),
                 &none,
             )
+            .is_some()
         };
         let table = super::judged(aterm_sysprobe::volumes::parse_mountinfo(text, false));
         for local in ["/etc", "/run/user/1000", "/home/me/proj", "/data/x"] {

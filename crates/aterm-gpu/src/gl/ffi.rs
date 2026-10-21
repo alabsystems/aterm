@@ -100,6 +100,7 @@ pub(crate) const GL_RGBA16F: GLenum = 0x881A;
 pub(crate) const GL_RED: GLenum = 0x1903;
 pub(crate) const GL_RGBA: GLenum = 0x1908;
 pub(crate) const GL_UNSIGNED_BYTE: GLenum = 0x1401;
+pub(crate) const GL_SHORT: GLenum = 0x1402;
 pub(crate) const GL_UNSIGNED_SHORT: GLenum = 0x1403;
 pub(crate) const GL_UNSIGNED_INT: GLenum = 0x1405;
 pub(crate) const GL_FLOAT: GLenum = 0x1406;

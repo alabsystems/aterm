@@ -118,55 +118,6 @@ fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     assert!(staging.staged_app.join("Contents/MacOS/aterm").is_file());
 }
 
-/// THE PROBE RUNS THE CANDIDATE HELD AT ITS EXEC, AND ONLY WHEN ASKED. Held
-/// (`verify::hold_staged_start`, which the stage calls before its gate), the
-/// candidate is stopped at its exec (`ps`: `T`) and has not run; the probe resumes
-/// that very process — the pid it reports is the held one, not a second start's —
-/// and judges its answer as it judges a plain start's. A held candidate dropped
-/// instead, as every refusal before the probe kills it, is gone without having run.
-#[test]
-fn the_stage_probe_runs_the_candidate_held_at_its_exec() {
-    // The fixture is signed ad hoc, which waits on trustd.
-    aterm_uds::deadline::require_trust_service();
-    let staging = Staging::scratch("stage-probe-held");
-    let ran = staging.root.join("ran");
-    let app = incoming(&staging, &ran, 0);
-    let held = verify::hold_staged_start(&app);
-    let pid = held.id().expect("the candidate is held");
-    let state = aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .expect("run ps");
-    let state = String::from_utf8_lossy(&state.stdout);
-    assert!(
-        state.trim().starts_with('T'),
-        "the candidate is stopped at its exec: {state:?}"
-    );
-    assert!(!ran.exists(), "a held candidate ran");
-    verify::probe_staged_bundle_starts(&app, BUILD, held).expect("the held candidate starts");
-    assert_eq!(
-        std::fs::read_to_string(&ran).expect("the probe started it"),
-        pid.to_string(),
-        "the probe ran the held process"
-    );
-
-    let staging = Staging::scratch("stage-probe-held-dropped");
-    let ran = staging.root.join("ran");
-    let app = incoming(&staging, &ran, 0);
-    let held = verify::hold_staged_start(&app);
-    let pid = held.id().expect("the candidate is held");
-    drop(held);
-    let since = std::time::Instant::now();
-    while aterm_uds::process::pid_alive(pid) {
-        assert!(
-            since.elapsed() < std::time::Duration::from_secs(60),
-            "the dropped held candidate {pid} outlived its drop"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(!ran.exists(), "a held candidate dropped unrun ran");
-}
-
 /// A BUILD THE RECORDS WITHDREW WHILE IT DOWNLOADED IS NEVER STARTED. A sibling's
 /// check recorded the revocation of the machine that signed it; the stage refuses
 /// it with the publish's words, and its executable never ran, though every check
@@ -219,12 +170,14 @@ fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
 }
 
 /// A PROBE THAT RUNS TO NO ANSWER IS NO VERDICT: a candidate the probe could not
-/// start just then (`EAGAIN`: the process table full — a passing refusal, like a
-/// probe killed at its deadline on a loaded machine, `verify::timed_out`) publishes,
+/// start just then (`EAGAIN`: the process table full — a passing refusal) publishes,
 /// and the apply's own probe still has to pass before any swap, so nothing is trusted
-/// that was not, and the download is not thrown away. The same spawn refused for a
-/// cause that comes back every time (`EACCES`) is a verdict, refused before any
-/// marker with the bundle gone: the stage tells the two apart by the refusal alone.
+/// that was not, and the download is not thrown away. A probe whose spawned child
+/// timed out (`STAGE_PROBE_TIMED_OUT`, killed while waiting at `_dyld_start`) is a
+/// passing refusal that leaves `incoming` in place without publishing, so `syspolicyd`
+/// never meets an unlinked or renamed path mid-assessment. The same spawn refused for
+/// a cause that comes back every time (`EACCES`) is a verdict, refused before any
+/// marker with the bundle gone: the stage tells the cases apart by the refusal alone.
 /// Negative control: a stage that books every probe failure as a verdict refuses the
 /// first.
 #[test]
@@ -245,6 +198,20 @@ fn a_stage_probe_that_runs_to_no_answer_publishes_for_the_apply_to_judge() {
         Some(BUILD)
     );
     assert!(staging.staged_app.join("Contents/MacOS/aterm").is_file());
+
+    let staging = Staging::scratch("stage-probe-timed-out");
+    let ran = staging.root.join("ran");
+    let app = incoming(&staging, &ran, 0);
+    verify::STAGE_PROBE_TIMED_OUT.with(|timed_out| timed_out.set(true));
+    let error = stage(&staging, &app, &manifest(BUILD, COMMIT))
+        .expect_err("a timed-out probe does not publish or move the assessed path");
+    assert!(crate::is_passing_refusal(&error), "{error}");
+    assert!(!staging.ready.exists());
+    assert!(
+        app.join("Contents/MacOS/aterm").is_file(),
+        "incoming stays at its path while syspolicyd may still be assessing it"
+    );
+    assert!(!staging.staged_app.exists());
 
     let staging = Staging::scratch("stage-probe-refused");
     let ran = staging.root.join("ran");

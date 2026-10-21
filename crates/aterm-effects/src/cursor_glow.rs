@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use aterm_hash::{FNV64_OFFSET, fnv_mix_u64};
 use aterm_render::{
-    BeamClip, BeamVertex, CharFg, CometSample, FireHaloCell, FireMode, FirePatch, GlowQuad,
-    HaloMode, RainHalo, beam_glow_quads, comet_beam, comet_glow_quads, phaser_streak_quads,
+    BEAM_LAYERS, BeamClip, BeamScratch, BeamVertex, COMET_LAYERS, CharFg, CometSample,
+    FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, LASER_LAYERS, PHASER_LAYERS, RainHalo,
+    SPARKLE_LAYERS, comet_beam, comet_beam_over, layer_stack_lift, layered_beam_quads_with,
     premul_rgb,
 };
 // The profile is the rasterizer's, and the ribbon reaches it only through
@@ -48,11 +49,11 @@ pub const CURSOR_WITNESS_ROWS: usize = RIBBON_LIST_ROWS + 1;
 const RIBBON_LIST_ROWS: usize = rk::witness::WITNESS_ROWS + rk::witness::ARMING_ROWS;
 
 use crate::effect_util::{
-    STAR_ARM_FINE, STAR_ARM_STD, STAR_CORE, STAR_GLINT, STAR_GLINT_COV, STAR_STACK_ADD, dust_r,
-    fire_ramp, lerp_rgb, push_fx_rect as push_rect, push_twinkle_star, star_accent, star_arm,
-    star_arm_px, twinkle_env, twinkle_peak, water_ramp,
+    STAR_ARM_FINE, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_GLINT, STAR_GLINT_COV,
+    TWINKLE_FLASH_BOUND_HZ, dust_r, fire_ramp, lerp_rgb, push_fx_quad, push_fx_rect as push_rect,
+    push_twinkle_star, star_accent, star_arm, star_arm_px, twinkle_env, twinkle_peak, water_ramp,
 };
-// The one colour law (`docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2): every mark
+// The one colour law (`docs/design/RAINBOW-KITTY-V2.md` §2.3, C1): every mark
 // of the rainbow family resolves colour through `spectrum` and every point-mark
 // snaps to a name through `spectrum_snap`.
 use crate::spectrum::{SPECTRUM_STOPS, spectrum, spectrum_snap};
@@ -62,9 +63,11 @@ use crate::typing_momentum::TypingMomentum;
 // The engine's parts. A part with public items is re-exported whole, so every
 // `cursor_glow::X` path resolves at its visibility here; parts with none are
 // `impl CursorGlow` blocks.
+mod bed;
 mod companion;
 mod custody;
 mod emit;
+mod ink_ledger;
 mod light_body;
 mod probe;
 mod raster;
@@ -72,11 +75,21 @@ mod scroll;
 mod seam;
 mod sound;
 mod spawn;
+// The `cursor_trail_style` vocabulary, public as a module: hosts read
+// `cursor_glow::spellings::canonical` and its tables by path.
+pub mod spellings;
 mod status;
 mod style;
 mod thermal;
+pub(crate) use bed::{
+    BedScratch, BedShape, clip_quads_to, dark_bed_budget, dark_bed_ink, lay_dark_bed,
+    split_air_runs,
+};
 pub use companion::*;
 pub use custody::*;
+use ink_ledger::BandLifts;
+pub(crate) use ink_ledger::InkLedger;
+pub use ink_ledger::OverInkTier;
 pub(crate) use light_body::*;
 pub use probe::*;
 pub use raster::*;
@@ -116,6 +129,12 @@ struct Spark {
 #[derive(Clone, Copy)]
 struct WaterSample {
     surface: BeamVertex,
+    /// The swell at this sample, so the curve between two samples is the
+    /// same swell, not a straight chord: its phase (radians), its height
+    /// (px), and the waterline it rides (window px).
+    phase: f32,
+    amp: f32,
+    line_y: f32,
     row: u16,
     col: u16,
     drip_cov: u8,
@@ -222,19 +241,21 @@ struct Vapor {
     born: Instant,
 }
 
-/// One lightning bolt: a jagged midpoint-displaced polyline (grid-interior
-/// pixels) frozen at spawn so the channel holds its shape; only brightness
-/// animates (attack → dip → restrike → collapse). `branch` forks are thinner
-/// and dimmer.
+/// One lightning bolt: a jagged midpoint-displaced polyline (window pixels)
+/// frozen at spawn so the channel holds its shape; only brightness animates,
+/// one flash per bolt ([`bolt_flash`]: born at full strength, then a monotone
+/// burn-out). `branch` forks are thinner and dimmer.
 struct Bolt {
     /// Jagged channel points, origin → tip.
     pts: Vec<(f32, f32)>,
     born: Instant,
     life: f32,
-    /// Per-bolt strobe phase so simultaneous bolts never pulse in lockstep.
-    seed: f32,
     /// Branch fork: thinner, dimmer, no white-hot core.
     branch: bool,
+    /// A typing crackle (a stray arc off the charged trail, over the newest
+    /// letters), not a jump strike or one of its forks: on a dark ground it
+    /// spends the streak's over-ink budget.
+    crackle: bool,
 }
 
 /// One outgoing style crossfade: the complete animated state live when the
@@ -330,7 +351,8 @@ pub struct CursorGlow {
     /// This frame's per-pixel fire: [`FirePatch`]es evaluated at every device
     /// pixel by the shared integer field (CPU sampler and WGSL twin,
     /// byte-exact), the flame body. Drawn at the under-ink seam so the dark
-    /// cores work. Mode is Add on dark themes, Over (ink-fire) on light ones.
+    /// cores work. Dark themes only (Add); a light theme's fire is ink
+    /// tongues in the under-ink stream ([`Self::emit_flames_light`]).
     patch_out: Vec<FirePatch>,
     /// This frame's under-ink light (the flame body), drawn between cell
     /// backgrounds and glyph ink (`RenderInput.glow_under`) so engulfed letters
@@ -431,6 +453,10 @@ pub struct CursorGlow {
     /// rendering it under its old config behind a ramp-down, while coordinate
     /// tracking and typing warmth stay live.
     last_style: Option<GlowStyle>,
+    /// Whether the last tick's classic wake wore its mono face, whose bed and
+    /// over-ink account read the rows flanking the caret's
+    /// ([`Self::reads_neighbor_rows`]).
+    last_classic_mono: bool,
     /// Rolling hue phase (turns) for rainbow/sparkle, advanced per spawn.
     hue: f32,
     /// Typing-cadence heat 0..1: sustained fast typing brightens and lengthens
@@ -727,6 +753,9 @@ pub struct CursorGlow {
     /// ([`Self::forge_fill`]). Fire-only; zero for other styles so its arm in
     /// [`Self::is_active`] is inert there.
     cursor_temp: f32,
+    /// The forge fill's span of the ramp for the page the last tick saw
+    /// ([`Self::refresh_forge_band`]); `None` before the first tick.
+    forge_band: Option<thermal::ForgeBand>,
     /// Last typing advance (single-cell move), for the inter-key cadence.
     last_type: Option<Instant>,
     /// Deterministic spark/ember PRNG state.
@@ -746,26 +775,103 @@ pub struct CursorGlow {
     /// and its analytically derived falling beads. Keeping this resident makes
     /// the fluid path allocation-free after its first growth.
     water_samples: Vec<WaterSample>,
-    /// Fixed-size open-address owner table for [`Self::emit_water`]. A
+    /// Fixed-size open-address owner table for [`Self::emit_water`], and for
+    /// the light rails of the beam family ([`Self::emit_comet`]), which never
+    /// run in the same frame; each emitter resets it on entry, and Water draws
+    /// no beam. A
     /// repaint-heavy TUI can revisit the same cell hundreds of times before
     /// the old samples expire; newest-visible-wins here prevents those owners
-    /// from compositing into an opaque reflection. Fixed to twice the resident
-    /// spark cap, so clearing it is O(MAX_SPARKS), never O(grid area).
+    /// from compositing into an opaque reflection (or a veil past its cap).
+    /// Fixed to twice the resident spark cap, so clearing it is
+    /// O(MAX_SPARKS), never O(grid area).
     water_seen: Vec<u64>,
+    /// Reused by [`Self::emit_water`]'s light arm for one run's polyline, so a
+    /// light-ground water frame allocates nothing after the first growth.
+    water_run: Vec<BeamVertex>,
     /// Reused by [`Self::emit_bolts`] (Laser strikes) for the per-bolt polyline,
     /// so a strike frame allocates nothing after the first growth.
     bolt_verts: Vec<BeamVertex>,
+    /// Reused by [`Self::emit_bolts`] for each strike's channel resampled
+    /// along its length (`(x, y, place, over text)`), so a strike frame
+    /// allocates nothing after the first growth.
+    bolt_channel: Vec<(f32, f32, f32, bool)>,
     /// Ping-pong scratch for [`Self::spawn_bolt`]'s midpoint-displacement
     /// rounds, so a strike allocates nothing. Taken out of `self` around the
     /// jag (the loop calls [`Self::frand`]) and handed back.
     bolt_jag: BoltJag,
-    /// Reused by [`Self::emit_comet`]'s Laser arm for the per-layer filament
-    /// polyline, so a laser frame allocates nothing after the first growth.
-    comet_verts: Vec<BeamVertex>,
+    /// The layered beam rasterizer's working buffers (style colours, RDP
+    /// work space and kept indices, per-layer vertices), reused by every
+    /// [`Self::emit_comet`] arm so a streak frame allocates nothing after the
+    /// first growth, and simplifies each run once for its whole layer stack.
+    beam_scratch: BeamScratch,
+    /// This frame's over-ink account over the probed text
+    /// ([`InkLedger`]): Fire's lights on a dark ground spend one budget per
+    /// text cell.
+    ink_ledger: InkLedger,
+    /// Test-only: draw the dark streak without its over-ink budget, and fire
+    /// without its over-ink ledger and steam budget, the negative control of
+    /// the contrast tests.
+    #[cfg(test)]
+    streak_unbudgeted: bool,
+    /// Test-only: lay the dark bed in each stop at its full value instead of
+    /// the luminance the bar allows, the negative control of the bed's bar.
+    #[cfg(test)]
+    bed_unsolved: bool,
+    /// Test-only: keep the dark bed but no over-ink account, so every light
+    /// over a letter lands whole: the negative control of the account.
+    #[cfg(test)]
+    over_ink_idle: bool,
+    /// Test-only: spend every masked light of the over-ink account as one
+    /// light, cut to its least-room cell's share everywhere (the account
+    /// before it kept the light whole over blank cells), the negative
+    /// control of the bloom-over-air test.
+    #[cfg(test)]
+    over_ink_uniform: bool,
+    /// The last [`Self::BOLT_FLASHES_PER_S`] lightning onsets (strikes and
+    /// crackles), a ring whose slot at [`Self::bolt_onset_next`] is the
+    /// oldest: lightning's flash limiter ([`Self::admit_bolt`]).
+    bolt_onsets: [Option<Instant>; Self::BOLT_FLASHES_PER_S],
+    /// The [`Self::bolt_onsets`] slot the next onset overwrites.
+    bolt_onset_next: usize,
+    /// Test-only: forge every strike and crackle the dice ask for, the
+    /// negative control of the lightning flash-rate test.
+    #[cfg(test)]
+    bolts_unlimited: bool,
+    /// Test-only: stand the dark flame's tongues on one flat base (no curl
+    /// at their feet), the negative control of the scalloped-feet test.
+    #[cfg(test)]
+    fire_flat_feet: bool,
+    /// Test-only: straighten a one-row streak run into one chord, as every
+    /// built-in but the phaser once did, the negative control of the typing
+    /// streak's flash-rate test.
+    #[cfg(test)]
+    streak_chords_rows: bool,
     /// Reused by the light-ground body ([`Self::emit_comet_light`]) for its
     /// ribbon polyline, so a light frame allocates nothing after the first
     /// growth.
     light_verts: Vec<aterm_render::RibbonVertex>,
+    /// The dark bed's working buffers ([`Self::emit_dark_bed`]), so a bed
+    /// frame allocates nothing after the first growth.
+    bed_scratch: BedScratch,
+    /// The dark streak's beam runs over air ([`Self::emit_comet`]), split
+    /// from the swept runs where they cross text; pooled as `comet_runs` is.
+    air_runs: Vec<Vec<CometSample>>,
+    /// A wedge bed's runs, laid by distance from each head
+    /// ([`Self::emit_dark_bed`]); pooled as `comet_runs` is.
+    wedge_runs: Vec<Vec<CometSample>>,
+    /// The text of the rows this frame presents where the streak may run,
+    /// from the frame's own cells ([`Self::observe_frame_text`]); read only
+    /// by the frame it was handed for.
+    frame_text: FrameText,
+    /// Test-only: lay the light-ground bodies in their unsolved vivid ink
+    /// ([`Self::light_ground`]) and lift the light fire's ceilings, the
+    /// negative control of the light-body legibility tests.
+    #[cfg(test)]
+    light_body_unsolved: bool,
+    /// Test-only: the centres of the ice glints the last light comet frame
+    /// laid ([`Self::emit_comet_light`]).
+    #[cfg(test)]
+    light_glints: Vec<(f32, f32)>,
     /// Live outgoing style crossfades (≤ [`Self::FADE_CAP`], oldest dropped);
     /// see [`OutgoingFade`] and the style-switch contract in [`Self::tick`].
     /// Empty in steady state, where the tick pays one `is_empty` test.
@@ -811,6 +917,26 @@ pub struct CursorGlow {
     /// `witness_rows_n` is zeroed by every tick so a stale sample is never read.
     witness_rows: Vec<WitnessRowBuf>,
     witness_rows_n: usize,
+    /// The rows whole-grid scrolls carried the grid since the last tick
+    /// ([`Self::note_scroll`]); `0` on a frame with no scroll. A scroll's
+    /// frame feeds its witness rows, read after the translation
+    /// (`ScrollChange::translated_only`), to the follow pass and the hand's
+    /// seam, so a box redrawn in place under the scroll keeps its band on the
+    /// very frame it is drawn, and a caret left on its screen row is judged in
+    /// its line's own frame: no move, and a key in flight keeps its press for
+    /// its echo. The walk waits for the next frame, as it did when a scroll's
+    /// frame sampled nothing: a copy on a row the scroll brought in is dated
+    /// from the walk before the scroll ([`rk::witness::Witness::translate`]),
+    /// and a walk now would take a torn relocation for a twin. A held
+    /// foreign-row park's source check does not wait: the park rode the
+    /// scroll with its row ([`Self::carry_held_park`]), so the carried row is
+    /// read where the scroll put it, and an echo that returns on the scroll's
+    /// own frame to a composer the scroll carried with it is paid. A box
+    /// redrawn in place on its screen row (Claude Code under a full screen)
+    /// leaves transcript text on the carried row: the check fails there, the
+    /// park is flushed and that echo stays dark, as it did when the check
+    /// waited for the next frame.
+    scroll_rows: u16,
     /// The rows the host was asked for this frame (what [`Self::ribbon_rows`]
     /// last handed out, and how many), so the follow pass counts as withheld
     /// only rows asked for and not delivered ([`rk::Engine::follow_rows`]).
@@ -1174,6 +1300,19 @@ impl CursorGlow {
     /// (oldest evicted first). A jump strike spawns 1 main + up to 4 branches,
     /// so this comfortably holds several overlapping strikes plus crackle.
     const MAX_BOLTS: usize = 24;
+    /// Lightning's flash law (WCAG 2.3.1: no more than three flashes in any
+    /// one second; the owner asked for "a lightning bolt or flashing yellow",
+    /// 2026-07-14, so lightning keeps its flash and counts it). Every bolt
+    /// flashes once ([`bolt_flash`]) and a strike's forks are born with it, so
+    /// a pixel can flash no more often than bolts are born: at most this many
+    /// onsets, strikes and crackles together, in any one second
+    /// ([`Self::admit_bolt`]).
+    const BOLT_FLASHES_PER_S: usize = 3;
+    /// A typing crackle's refractory: the least time after the previous
+    /// lightning onset (strike or crackle) before a crackle may fire. Over half
+    /// a second, so crackles alone fill at most two of a second's
+    /// [`Self::BOLT_FLASHES_PER_S`] and a jump strike always finds a slot.
+    const CRACKLE_REFRACTORY_S: f32 = 0.55;
     /// Bloom-crown fade window (the crown follows the head for this long post-move).
     const CROWN_MS: u64 = 200;
     /// Typing crown window: a single-cell advance keeps the crown lit this long,
@@ -1344,7 +1483,9 @@ impl CursorGlow {
     /// Release τ: cools much slower than it heats (forged metal holds heat);
     /// the quench meter divides it, so deleting cools faster.
     const TEMP_RELEASE_TAU: f32 = 1.4;
-    /// Below this metal temperature the cursor fill is untouched (pure theme).
+    /// Below this metal temperature the forge is at rest: the fill holds its
+    /// resting ember ([`thermal::ForgeBand`]'s `lo`), the dressing is dark and
+    /// the fill is not folded into the fingerprint.
     const FORGE_MIN_TEMP: f32 = 0.12;
     /// Coarse wake cadence for the forge-ember-only cooling tail: the ember's
     /// u8 colour barely changes between these, and the present gate dedups
@@ -1365,10 +1506,29 @@ impl CursorGlow {
     /// — the tail then finishes retracting into the eruption.
     const METEOR_STRIKE_FRAC: f32 = 0.62;
     /// Hard cap on per-frame radial halos (embers dominate; well above any
-    /// real frame — both backends see the identical truncated snapshot).
-    const MAX_HALOS: usize = 512;
+    /// real frame — both backends see the identical truncated snapshot). The
+    /// classic engine fills the same stream on a light ground and caps it here
+    /// too.
+    pub(crate) const MAX_HALOS: usize = 512;
     /// Hard cap on live vapor puffs (steam + smoke).
     const MAX_VAPOR: usize = 128;
+    /// Steam's stacking budget, in fresh puffs: the whole live steam cloud
+    /// lays at most this much light, so a backspace run widens the cloud
+    /// rather than brightening it (`emit_vapor`). Two fresh puffs overlapping
+    /// on a letter of the line above leave it 3:1 on the default dark theme.
+    const STEAM_STACK: f32 = 2.0;
+    /// How much of a steam puff's light is gone once it has climbed 0.6 cell
+    /// past the top of the row it rose from: the cloud stays over the doused
+    /// text instead of settling on the line above.
+    const STEAM_ABOVE_DIM: f32 = 0.65;
+    /// How many cells either side of the typed run the over-ink ledger holds
+    /// on a neighbouring row the host did not probe
+    /// ([`Self::begin_ink_ledger`]): about as far as the ember shower and the
+    /// steam drift sideways.
+    const INK_LEDGER_REACH: i32 = 3;
+    /// The most steam puffs one deletion echo releases at full quench (two at
+    /// the first delete, one more as the quench builds).
+    const STEAM_ECHO_PUFFS_MAX: usize = 3;
     /// The cursor metal smokes above this temperature (the brief's "heats up
     /// over use and starts smoking").
     const SMOKE_TEMP: f32 = 0.35;
@@ -1387,14 +1547,273 @@ impl CursorGlow {
     /// Lightning trail residual: the fraction of beam power an aged trail cell
     /// holds after its discharge bleed, the dim static charge before the fade.
     const LASER_RESIDUAL: f32 = 0.30;
-    /// Fire streak text-safety caps (the occupied-cell coverage discipline
-    /// shared with `cursor_phaser::WING_STACK_BUDGET`). The flame comet's head
-    /// stacks with the crown, body and bloom over the freshest glyph cells;
-    /// [`Self::FIRE_STREAK_COV_CAP`] bounds per-sample coverage over occupied
-    /// cells so letters keep contrast. The bridge sample on the empty cursor
-    /// cell keeps [`Self::FIRE_HEAD_COV_CAP`].
+    /// The most opacity a light-ground bolt paints with (`emit_bolts`'s light
+    /// arm, beneath the glyph ink): where a fork crosses the channel the two
+    /// stack, and a dark foreground drawn over that pixel still keeps 4.5:1
+    /// on the default violet (`laser_on_a_light_ground_is_ink_never_light`).
+    const LIGHT_BOLT_ALPHA_CAP: f32 = 144.0;
+    /// The laser streak's scintillation, rad/s: one swell per cycle, so its
+    /// flash rate is `ω / 2π` (2.86 Hz), held under the crate's flash bound at
+    /// build time.
+    const LASER_RIPPLE_OMEGA: f32 = 18.0;
+    /// Fire streak caps. [`Self::FIRE_STREAK_COV_CAP`] bounds every swept
+    /// sample; over a text cell on a dark ground a sample also spends the
+    /// fire's over-ink account ([`InkLedger`]) with the crown, forge, embers
+    /// and steam that stack on the same letters, which holds the freshest
+    /// glyphs' contrast. The bridge onto the empty cursor cell keeps
+    /// [`Self::FIRE_HEAD_COV_CAP`].
     const FIRE_STREAK_COV_CAP: f32 = 108.0;
     const FIRE_HEAD_COV_CAP: f32 = 168.0;
+    /// The dark flame field's columns per cell ([`Self::emit_flames`]): the
+    /// heat smoothed along the line is sampled this finely (two pixels or
+    /// so on a shipped cell).
+    const FIRE_SUBCOLS: i32 = 6;
+    /// The dark flame field's slice height, px: its ceiling thins toward the
+    /// tips, and eases from the air's to the text's, in steps this fine.
+    const FIRE_SLICE_PX: i32 = 2;
+    /// How many rows over the topmost live row the frame's text is read
+    /// ([`Self::observe_frame_text`]): a dark fire burns brighter over a
+    /// blank row only where it knows the row is blank.
+    const FRAME_TEXT_RISE: i32 = 3;
+    /// The dark flame field's ceiling over a blank row, cold
+    /// ([`Self::emit_flames`]): light with no letter under it.
+    const FIRE_DARK_AIR_CAP_COLD: f32 = 96.0;
+    /// How far the dark air ceiling climbs at full blaze.
+    const FIRE_DARK_AIR_CAP_HEAT: f32 = 64.0;
+    /// The dark flame over a blank row ([`Self::emit_flames`]): the newest
+    /// burning cells' share of the head's strength, newest first, so the last
+    /// few letters each carry a tongue falling away behind the caret however
+    /// cool the fire still is.
+    const FIRE_DARK_AIR_RANKS: [f32; 6] = [1.0, 0.92, 0.82, 0.68, 0.5, 0.32];
+    /// The least tongue envelope over a blank row, in cell heights: a cool
+    /// fire still stands about a row tall there.
+    const FIRE_DARK_AIR_PEAK: f32 = 2.4;
+    /// The least display temperature a burn over a blank row runs at: its
+    /// tongues' cores reach orange and yellow, not only the deep red of a
+    /// cool tip.
+    const FIRE_DARK_AIR_TEMP: f32 = 0.72;
+    /// The least ceiling a burn over a blank row runs at in the air: its
+    /// tongues are lit flames, not a dim tint (no letter lies under them).
+    const FIRE_DARK_AIR_TONGUE_CAP: f32 = 208.0;
+    /// Where the dark flame roots, as a share of the cell height below the
+    /// burning row's top: inside the row's ascender band, where the field's
+    /// root lift fades it in over the letters' tint, so no unlit line stands
+    /// between the letters and the flame.
+    const FIRE_DARK_ROOT: f32 = 0.20;
+    /// How far a dark flame over a blank row fades in from its root (the
+    /// burning row's top edge), in cell heights: a soft foot, no edge.
+    const FIRE_DARK_AIR_FOOT: f32 = 0.5;
+    /// A dark tongue's half-width at its foot, in cells: a little over half
+    /// a cell, so neighbours merge at their feet and part above them.
+    const FIRE_DARK_TONGUE_HALF_W: f32 = 1.05;
+    /// How far a dark tongue's foot curls up at its sides, in cell heights:
+    /// the line of feet is scalloped, never one flat base.
+    const FIRE_DARK_FOOT_CURL: f32 = 0.25;
+    /// How much shorter a tongue over a blank row may stand than its
+    /// tallest neighbour, by its cell's hash: the tongues are a fire's, not a
+    /// comb's teeth.
+    const FIRE_DARK_AIR_SIZES: f32 = 0.22;
+    /// The tongue over the caret, ahead of the head, as a share of the
+    /// head's strength over a blank row: the flames taper off past the
+    /// newest letter rather than standing cut at its edge.
+    const FIRE_DARK_AIR_LEAD: f32 = 0.45;
+    /// How far along a leap off the line its grains start being born, in
+    /// cells ([`Self::spawn_burst_particles`]).
+    const LEAP_BIRTH_SKIP_CELLS: f32 = 1.5;
+    /// Seconds an off-line flame gets to gutter out after the cursor leaves
+    /// it behind ([`Self::snuff_off_line`]).
+    const FLAME_SNUFF_S: f32 = 0.18;
+    /// …and a spark, sooner.
+    const SPARK_SNUFF_S: f32 = 0.08;
+    /// How far back along a fire meteor's flight, as a share of it, its
+    /// strike's debris is born ([`Self::meteor_strike_fountain`]).
+    const STRIKE_DEBRIS_REACH: f32 = 0.35;
+    /// A dark ember's coverage, as a share of its grain's
+    /// ([`Self::emit_particles`]): a spark is small, so it burns near full
+    /// strength without whiting anything out.
+    const FIRE_EMBER_COV: f32 = 0.85;
+    /// A dark ember's core radius in cell heights, coolest, and what the
+    /// hottest adds: a point of light, not a blob.
+    const FIRE_EMBER_R: f32 = 0.04;
+    const FIRE_EMBER_R_HOT: f32 = 0.05;
+    /// The least saturation a light landing veil's ink wears
+    /// ([`Self::light_veil_ink`]).
+    const LIGHT_VEIL_SAT: f32 = 0.75;
+    /// The gap a light tongue keeps under a line of text above its own, in
+    /// cell heights ([`Self::flame_light_headroom`]).
+    const FIRE_LIGHT_HEADROOM: f32 = 0.08;
+    /// The light ink-fire ([`Self::emit_flames_light`]): its peak opacity
+    /// (over air; a letter it reaches holds its own ceiling).
+    const FIRE_LIGHT_ALPHA: f32 = 240.0;
+    /// The light ink-fire's root, as a share of the cell height below the
+    /// burning row's top: at the foot of the letters' x-height, so the
+    /// tongues stand up out of the line, most of each one above the
+    /// letters' tops (rooted under the baseline they barely cleared them,
+    /// and behind the letters a flame is held to the letters' ceiling).
+    const FIRE_LIGHT_ROOT: f32 = 0.70;
+    /// The light ink-fire's height at full strength, in cell heights: cold,
+    /// and how much a full blaze adds.
+    const FIRE_LIGHT_RISE_COLD: f32 = 2.3;
+    /// See [`Self::FIRE_LIGHT_RISE_COLD`].
+    const FIRE_LIGHT_RISE_HOT: f32 = 0.85;
+    /// The light ink-fire's tongue spacing, in cells: far enough apart that
+    /// each tongue reads as its own flame, not a stripe of a fence.
+    const FIRE_LIGHT_SPACING: f32 = 0.85;
+    /// A light tongue's half-width at its widest, in cells.
+    const FIRE_LIGHT_HALF_W: f32 = 0.62;
+    /// The light ink-fire's sampling: knots across, px, and slab height, px.
+    const FIRE_LIGHT_KNOT_PX: f32 = 2.0;
+    /// See [`Self::FIRE_LIGHT_KNOT_PX`].
+    const FIRE_LIGHT_SLAB_PX: f32 = 2.0;
+    /// The coloured letter a row nobody read is held for under the light
+    /// ink-fire, at 3:1 ([`Self::flame_light_cap`]): GitHub Light's red.
+    const FIRE_LIGHT_REF_RED: u32 = 0x00CF_222E;
+    /// The most opacity a light-ground fire meteor paints with
+    /// ([`Self::emit_fire_meteors`]'s light arm, beneath the glyph ink): over
+    /// its deepest colour a default-foreground letter keeps 4.5:1.
+    const LIGHT_METEOR_ALPHA_CAP: f32 = 144.0;
+    /// The ramp span a light-ground meteor is painted in: the dark ground's
+    /// tail-to-head walk folded into deep red through burnt orange.
+    const LIGHT_METEOR_RAMP: (f32, f32) = (0.25, 0.50);
+    /// Fire's landing veil on paper: a soft warm orange (the grey a
+    /// white-hot flash inks to read as a stain).
+    const FIRE_LIGHT_LANDING: u32 = 0x00F2_9A4A;
+    /// A light-ground ember's deep rim (an ember's dull red) and hot core
+    /// (burnt orange): a round bead of ink, never a square fleck (and never
+    /// over the letters: a light ember is not drawn on a line of text).
+    const LIGHT_EMBER_INKS: (u32, u32) = (0x00B4_3A0C, 0x00F2_8420);
+    /// The over-ink contrast floor of a light laid straight across a letter:
+    /// the least contrast a glyph stroke keeps on the reference pair
+    /// ([`Self::STREAK_REF_INK`] on [`Self::STREAK_REF_GROUND`]) where Fire's
+    /// streak or a laser crackle crosses it, WCAG's text minimum.
+    ///
+    /// Such a light composites over the glyphs it crosses (`cursor_glow_add`,
+    /// saturating add), lifting ink and ground together until the ink clips
+    /// and only the ground keeps climbing, so its coverage ceiling is the most
+    /// at which its whole stack, in its own colour, still leaves the stroke
+    /// this much. Fire spends it through its over-ink account ([`InkLedger`]),
+    /// shared with its other lights over the letters; a crackle solves it
+    /// alone. The rest of the beam family lays no light on a letter: its
+    /// streak lies under the text as its bed ([`Self::emit_dark_bed`]).
+    const STREAK_INK_FLOOR: f32 = 4.5;
+    /// The reference ink [`Self::STREAK_INK_FLOOR`] is solved against: the
+    /// shipping default dark theme's foreground (`aterm_render::Theme::default`).
+    /// A fixed pair rather than the live theme's, so fire looks the same on
+    /// every dark theme and a theme whose own contrast sits near the floor
+    /// still gets a streak over its text.
+    const STREAK_REF_INK: u32 = 0x00D0_D0D0;
+    /// The reference ground: the shipping default dark theme's background.
+    const STREAK_REF_GROUND: u32 = 0x0011_1318;
+    /// Water's per-cell wake ceiling: saturated ocean stops carry less
+    /// luminance than pale cyan, and newest-owner dedup keeps claims from
+    /// stacking past it.
+    const WATER_WAKE_COV_CAP: f32 = 88.0;
+    /// The most opacity water's light-ground crest paints with
+    /// ([`Self::emit_water`]'s light arm), reached by a fresh crest. The wake
+    /// lies beneath the glyph ink, so the bar is the letters on it: crest over
+    /// undertow at this opacity leaves a dark foreground about 6.5:1 on white
+    /// (`water_on_light_is_ink_under_the_letters` measures it).
+    const LIGHT_WATER_ALPHA_CAP: f32 = 160.0;
+    /// The particle law's dark-ground dimming of a grain over a probed line of
+    /// text: the ember's occupied-cell factor, so a grain crossing a letter
+    /// stays a faint glint and the letter stays readable.
+    const GRAIN_OVER_GLYPH_DIM: f32 = 0.30;
+    /// A light-ground grain's opacity per unit of its dark coverage request:
+    /// a fresh grain (coverage 230 at the default 0.7 intensity, 161)
+    /// reaches the may-touch-text ceiling, and a fading one thins with it.
+    const LIGHT_GRAIN_GAIN: f32 = 1.2;
+    /// Sparkle's crescent moon radius as a multiple of the grain's stardust
+    /// radius (`dust_r`): a small moon among the dust, well under a glyph.
+    const MOON_DUST_RATIO: f32 = 2.0;
+    /// A dark sparkle grain's coverage over the family's, and its size
+    /// ([`Self::emit_particles`]): the gold comet's shower reads as sparks.
+    const SPARKLE_DARK_LIFT: f32 = 1.35;
+    /// See [`Self::SPARKLE_DARK_LIFT`].
+    const SPARKLE_DARK_GROW: f32 = 1.3;
+    /// The comet's ice glints on a light ground ([`Self::emit_comet_light`]):
+    /// each one's distance behind the head in cells (clear of the letter just
+    /// typed, which reads as it would with no glint), and whether it hangs in
+    /// the leading above the letters (else under the baseline, where the
+    /// letter over it has no descender, and above it where it has).
+    const COMET_LIGHT_GLINTS: [(f32, bool); 3] = [(1.5, true), (2.3, false), (3.1, true)];
+    /// How far a light band (beam, phaser, sparkle) rises from nothing over
+    /// its oldest cells, in cells: a leap's tail (the Settings preview's
+    /// demo leaps back along its line) fades out instead of ending in a cut.
+    const LIGHT_BAND_TAIL_CELLS: f32 = 1.5;
+    /// A light comet glint's horizontal arm, from its centre, in cell
+    /// heights.
+    const COMET_LIGHT_GLINT_ARM: f32 = 0.19;
+    /// A light comet's coma ([`push_ink_ring`]): its radius and its rim's
+    /// width, in cell heights.
+    const COMET_LIGHT_COMA_R: f32 = 0.5;
+    const COMET_LIGHT_COMA_RIM: f32 = 0.11;
+    /// A light comet glint's vertical arm, from its centre, in cell heights,
+    /// above the letters and under them: short, so the star stays in the
+    /// leading it hangs in.
+    const COMET_LIGHT_GLINT_RISE: (f32, f32) = (0.072, 0.10);
+    /// Where a high glint hangs, from the row's top, in cell heights: in the
+    /// leading above the ascenders' tops (about 0.15 of the row down at the
+    /// gallery's 22 px), its vertical arm reaching no lower than they start.
+    const COMET_LIGHT_GLINT_HIGH: f32 = 0.075;
+    /// A text row's glyph band, as shares of the cell height from its top:
+    /// from above its ascenders' tops to its descenders' feet
+    /// ([`Self::emit_particles`]).
+    const GLYPH_BAND: (f32, f32) = (0.12, 0.86);
+    /// Where a dark comet's high dust hangs, from the row's top, in cell
+    /// heights: at the row's very top, clear of the ascenders (a grain at
+    /// their height reads as an apostrophe).
+    const COMET_DARK_DUST_HIGH: f32 = 0.02;
+    /// Where a dark comet's low dust hangs, from the row's top, in cell
+    /// heights: along the tail under the letters.
+    const COMET_DARK_DUST_LOW: f32 = 0.95;
+    /// The share of a dark comet's dust that hangs in a text row's leading
+    /// (the rest waits off the row, unseen), and the spread of its heights
+    /// there, in cell heights.
+    const COMET_DARK_DUST_SHARE: f32 = 0.4;
+    const COMET_DARK_DUST_JITTER: f32 = 0.04;
+    /// Where a low glint hangs, from the row's top, in cell heights: under
+    /// the baseline (about 0.77 down), where only a descender reaches.
+    const COMET_LIGHT_GLINT_LOW: f32 = 0.885;
+    /// The water's line below its row's middle, in cell heights: the swell
+    /// rides the lower half of the letters, a waterline rather than a line
+    /// struck through them.
+    const WATER_LINE_DY: f32 = 0.10;
+    /// The swell's height at rest and how much a hot run adds, in cell
+    /// heights.
+    const WATER_SWELL: (f32, f32) = (0.08, 0.12);
+    /// The knots each cell of a water run is drawn through: the swell's
+    /// curve, not a polyline of chords whose corners read as carets.
+    const WATER_KNOTS: usize = 4;
+    /// A light water drop's ink: a clear deep blue rim round a clear sky
+    /// blue core (a slate mote read as grey grit, not water).
+    const LIGHT_WATER_DROP_INKS: (u32, u32) = (0x0010_6EB4, 0x0036_A8E2);
+    /// A dark water droplet's radial falloff reaches this many times its
+    /// body's half-size, so its soft rim carries about the light the hard
+    /// chip it replaced did.
+    const WATER_DROP_SOFT: f32 = 1.6;
+    /// Sparkle's moon tint on a dark ground: a saturated warm gold, the
+    /// comet's own family (a silver moon read as a grey smudge beside it, and
+    /// a pale gold one fading to ash-brown).
+    const MOON_GOLD: u32 = 0x00FF_BE3C;
+    /// How slowly a dark sparkle moon fades: its coverage follows its life's
+    /// remaining share to this power, so a moon reads gold, not ash, until
+    /// it is nearly gone.
+    const MOON_FADE_POW: f32 = 0.4;
+    /// Sparkle's shower on paper: a bead's (and a star's and a dash's) deep
+    /// gold rim, the mark's definition on white (4:1).
+    const SPARKLE_PAPER_RIM: u32 = 0x00B8_6E00;
+    /// The bright gold core of a sparkle bead on paper, inside its rim.
+    const SPARKLE_PAPER_CORE: u32 = 0x00F5_B618;
+    /// A sparkle star on paper: the rim's gold a shade deeper, since the
+    /// star twin's thin arms are laid at a may-touch-text opacity.
+    const SPARKLE_PAPER_STAR: u32 = 0x00A6_6000;
+    /// A sparkle moon on paper: one gold between the rim and the core.
+    const SPARKLE_PAPER_MOON: u32 = 0x00C4_7C00;
+    /// A sparkle bead's radius on paper over its dark grain's: a solid gold
+    /// bead needs less area than a halo of light to read.
+    const SPARKLE_PAPER_BEAD: f32 = 0.85;
+    /// The laser aura's peak as a fraction of its sample's coverage.
+    const LASER_AURA_COV: f32 = 0.42;
     /// How far back along the charged trail (live typing sparks, newest first)
     /// a crackle arc may root — the stray arcs dance over the whole lingering
     /// trail, not just off the write head.
@@ -1521,8 +1940,8 @@ impl CursorGlow {
     /// idle. Bounded by [`Self::KILL_HINT_FRESH`] and paced coarsely
     /// ([`Self::next_change_deadline`]).
     pub fn is_active(&self) -> bool {
-        self.classic.is_active()
-            || self.has_live_motion()
+        // The classic wake's light is moving light (`has_live_motion`).
+        self.has_live_motion()
             || self.ember_live()
             || self.poof_hint_pending().is_some()
             // §17.2: `is_active` follows the v2 fingerprint while it owns
@@ -1591,6 +2010,15 @@ impl CursorGlow {
     /// armed across a style switch (via `is_active` → `has_live_motion`).
     #[must_use]
     pub fn needs_frame_cadence(&self) -> bool {
+        // The classic wake's comet, crown and ring all move every frame. Each
+        // engine is live only while it owns the frame: any other style resets
+        // the classic one, and the classic branch settles this one.
+        self.classic.is_active() || self.modern_needs_frame_cadence()
+    }
+
+    /// [`Self::needs_frame_cadence`] for this engine's own light, without the
+    /// classic wake's.
+    fn modern_needs_frame_cadence(&self) -> bool {
         !self.sparks.is_empty()
             || !self.particles.is_empty()
             || !self.fire_meteors.is_empty()
@@ -1706,8 +2134,21 @@ impl CursorGlow {
     /// Left to the callers, the four things the paths differ on: `sound_live`,
     /// the sound ledger ([`Self::clear_sound_ledger`]; a load-shed frame is
     /// dark but heard and keeps its credits), cursor-position tracking
-    /// (`last` / `last_visible` / `last_move`), and `ctx_alt`.
+    /// (`last` / `last_visible` / `last_move`), and `ctx_alt`. The classic
+    /// engine is the exception: its tracking is cleared with its light.
     fn clear_transient_state(&mut self) {
+        self.clear_modern_transient_state();
+        // The classic engine keeps its own light and its own cursor memory, and
+        // they go together: with no memory, the first classic tick after the
+        // lights come back (or in a new coordinate space) only re-observes,
+        // so no comet spawns from where the caret stood when they went out.
+        self.classic.reset();
+    }
+
+    /// [`Self::clear_transient_state`] for this engine alone, leaving the
+    /// classic wake's light and memory: the teardown the classic branch runs
+    /// when it takes the frame from a style whose light is still live.
+    fn clear_modern_transient_state(&mut self) {
         self.recent_typed_run = None;
         self.park_source_intact = None;
         self.carried_key_move = None;
@@ -1830,6 +2271,27 @@ impl CursorGlow {
         self.v2.engaged()
     }
 
+    /// Whether this engine reads the rows above and below the caret's, so a
+    /// host must capture them with its row probe: v2's occupancy and content
+    /// witnesses while it owns the frame, and every other lit style's
+    /// over-text rules ([`Self::probed_text_spans`]: the over-ink ledger, the
+    /// dark bed's split between bed and beam, Fire's light flame cap, the
+    /// particles that keep off the text). An unread
+    /// row counts as text to the ledger and the bed and as air to the light
+    /// rules, so a style that reads them but is handed none either dims over
+    /// blank rows or brightens over old output. The classic wake's mono face
+    /// reads them too (its bed's rail and its over-ink account); only its
+    /// spectrum face, which reads neither, lets a host skip the two row
+    /// reads.
+    #[must_use]
+    pub fn reads_neighbor_rows(&self) -> bool {
+        self.v2_owns_frame()
+            || self.last_classic_mono
+            || self
+                .last_style
+                .is_some_and(|s| !matches!(s, GlowStyle::Classic))
+    }
+
     /// Whether a one-frame hide is armed and not yet taken — the twins'
     /// witness that no non-ticking path left one standing.
     #[must_use]
@@ -1857,9 +2319,7 @@ impl CursorGlow {
         self.clear_transient_state();
         self.clear_sound_ledger();
         self.clear_thermals();
-        // The classic engine keeps its own cursor memory and light in the old
-        // space, so it resets too.
-        self.classic.reset();
+        // The classic engine's own memory went with `clear_transient_state`.
         self.last = None;
         self.last_visible = None;
         self.hide_bridge_shown = None;
@@ -1911,6 +2371,15 @@ impl CursorGlow {
         self.under_out.clear();
         self.char_out.clear();
         self.fire_halo_out.clear();
+        // The over-ink account is this frame's: closed until the emit phase
+        // opens it, so a dark tick leaves none for the host's bodies to spend.
+        self.ink_ledger.close();
+        // The frame's cells are this frame's: a tick the host handed none
+        // reads every row the probe missed as unknown.
+        if self.frame_text.at != Some(now) {
+            self.frame_text.rows.clear();
+            self.frame_text.pairs.clear();
+        }
         // The momentum pulse is a per-tick signal: clear it up front so the
         // host reads only this tick's correlated advance (set in `spawn`).
         self.momentum_pulse = None;
@@ -1935,6 +2404,8 @@ impl CursorGlow {
         };
         self.park_source_intact = park_source.filter(|_| self.carried_key_move.is_none());
         self.park_source_confirmed = false;
+        let scroll_rows = std::mem::take(&mut self.scroll_rows);
+        let scroll_frame = scroll_rows > 0;
         if let Some(p) = self.held_park.filter(|p| p.cross_row)
             && let Some(sample) = self.witness_rows[..self.witness_rows_n]
                 .iter()
@@ -2033,8 +2504,12 @@ impl CursorGlow {
         // spawns on observed cursor motion, so it runs before the licensed
         // spawn/admission/emit machinery (whose shape gates would draw nothing
         // for a screen-crossing jump, `DECLINE_OFF_SHAPE`) and returns in its
-        // place. It touches none of this engine's animation state.
+        // place. It draws none of this engine's light, and settles whatever
+        // light another style left live (below).
         if matches!(cfg.style, GlowStyle::Classic) {
+            // The mono face reads the rows flanking the caret's (its rail and
+            // its over-ink account), so its host captures them.
+            self.last_classic_mono = cfg.classic_mono;
             // The erase licences expire only in `poof_scan`, which this branch
             // never reaches, and the classic engine never consumes them; left
             // armed they would keep `is_active` and the poof poll waking for the
@@ -2042,22 +2517,71 @@ impl CursorGlow {
             self.kill_hint = None;
             self.bs_poof_hint = None;
             self.bs_baseline = None;
+            // The mirror of the reset below: this engine's light, warmth and
+            // crossfades, forged under the style that held the frame before
+            // classic, decay only past this branch, so left here they would
+            // hold `is_active`, the frame train and `trail status`'s
+            // `sparks=` for as long as classic draws. A switch to classic
+            // snaps them off (a style switch is a reset); once settled,
+            // nothing on this branch lights them again, so the check is all
+            // a classic frame pays. (The poof licences just went; v2 let go
+            // of the frame above.)
+            if self.modern_needs_frame_cadence() || !self.vapor.is_empty() || self.ember_live() {
+                self.clear_modern_transient_state();
+                self.clear_thermals();
+            }
+            // Cursor tracking follows the caret here as on the dark path, so
+            // a return to another style spawns no comet from where the caret
+            // stood before classic took the frame.
+            self.last = cur;
+            self.last_visible = cur.map(|c| (c, now));
+            self.hide_bridge_shown = None;
             // The classic wake sounds (the phaser's `pew`) and its key seam
             // obeys the common law. It mints no echo cues, so the key-time click
             // is its only sound; the timbre snapshot uses the same config.
             self.store_key_timbre(cfg);
             self.settle_key_seam(cfg, cfg.intensity > 0.0);
-            let fp = self.classic.tick(cur, now, cfg, geom, out);
+            // A light ground's wake is ink under the letters and a veil
+            // ring, so the classic engine fills the under-ink and halo
+            // streams the host splices for every style (already cleared
+            // above).
+            // The mono face's dark bed spends one over-ink account with the
+            // bodies and the glow the host lays after this tick, over the
+            // text this frame's probe shows (the poof scan, which rotates it
+            // for the other styles, is not the classic wake's).
+            self.rotate_row_probe();
+            self.begin_ink_ledger(cfg, geom, cur);
+            let spans = self.probed_text_spans();
+            let fp = self.classic.tick(
+                cur,
+                now,
+                cfg,
+                geom,
+                out,
+                &mut self.halo_out,
+                &mut self.under_out,
+                crate::classic_wake::WakeInk {
+                    text: TextView::new(spans, Some(&self.frame_text)),
+                    ledger: &mut self.ink_ledger,
+                },
+            );
             // Its spawns count and log like every style's, so `trail` and
             // `trail status` show what it drew.
             if let Some((from, to)) = self.classic.take_spawn() {
                 self.spawns += 1;
                 self.log_licensed_as(now, from, to, AdmissionRecord::LICENCE_MOTION);
             }
-            // A light ground's ink: the tracer and crown under the letters.
-            self.under_out.extend_from_slice(self.classic.under());
-            self.halo_out.extend_from_slice(self.classic.halos());
             return fp;
+        }
+        // Any other style owns this frame, so the classic engine's light and
+        // its cursor memory go: its decay runs only in its own tick, so light
+        // left here would hold `is_active` (and the frame train) for good, and
+        // a stale `last` would draw a comet from the old caret when classic
+        // returns. A style switch away from classic snaps it off rather than
+        // crossfading it (a style switch is a reset). `last_style` never
+        // records Classic, so the `style_changed` edge below cannot see this.
+        if self.classic.is_active() || self.classic.has_last() {
+            self.classic.reset();
         }
 
         if self.rng == 0 {
@@ -2085,6 +2609,7 @@ impl CursorGlow {
             self.begin_style_fade(now);
         }
         self.last_style = Some(cfg.style);
+        self.last_classic_mono = false;
         // Compare-on-write: `last_cfg` backs one cold read (the fade snapshot
         // in `begin_style_fade`). After every enabled tick
         // `last_cfg == Some(*cfg)` holds; the steady state pays a compare
@@ -2185,6 +2710,8 @@ impl CursorGlow {
             }
         }
         self.heat_at = Some(now);
+        // The forge fill reads its band of the ramp for this page.
+        self.refresh_forge_band(cfg);
         // The key-time click's timbre inputs, written by every tick past the
         // master switch (the degenerate-grid return and the classic wake store
         // them through [`Self::store_key_timbre`] too), including ticks about to
@@ -2240,17 +2767,55 @@ impl CursorGlow {
         // glyphs with the caret as a second witness. If so the move is judged
         // in the text's own frame: the key's same-row echo. A relocation with
         // no key behind it is the program's, and keeps its own judgment.
+        // On a scroll's frame the neighbouring row is the caret's own screen
+        // row, the scroll's rows below where the scroll carried the hand: a
+        // box redrawn in place under a tool result. Its line returned with
+        // it, key or no key, and the caret did not move: nothing is judged, a
+        // key between press and echo keeps its press for the echo instead of
+        // buying the scroll's carry, and the hand's run returns with the hand
+        // however short (one glyph, the caret its second witness), where the
+        // follow pass alone wants two. A line that scrolled away with the grid
+        // still holds the hand's glyphs where the scroll put them, so the
+        // witness names no return for it.
+        // A caret moved past the follow offsets with no scroll to say so (the
+        // caret's carry, [`rk::Engine::carry_caret`]: a box pushed down by a
+        // transcript that has not filled the screen, or pushed to the bottom
+        // and scrolled the rest) is asked the same, key or no key: a key
+        // between press and echo keeps its press for the echo instead of
+        // buying the push, and a one-glyph line rides the box.
         // The move starts at the last caret seen, or, after a repaint's hidden
         // frames, at the last one shown (the hide bridge's own anchor).
         let key_in_flight = self.key_in_flight(now);
         let shown = self
             .last
             .or_else(|| self.last_visible.map(|(cell, _)| cell));
+        // THE CARET'S CARRY: the rows the caret moved from where it last
+        // stood, which the follow pass searches when that is past its offsets
+        // and not the scroll's return. Set before the hand's line is asked
+        // here, and again for the follow pass below, which ends it.
+        let caret_carry = match (shown, cur) {
+            (Some((pr, _)), Some((cr, _))) => {
+                i16::try_from(i32::from(cr) - i32::from(pr)).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let carried = caret_carry.unsigned_abs() > 2
+            && (!scroll_frame || i32::from(caret_carry) != i32::from(scroll_rows));
+        if witness_n > 0 {
+            self.v2.carry_caret(caret_carry);
+        }
+        let mut lifted = false;
         if self.v2.engaged()
             && witness_n > 0
             && let (Some((pr, _)), Some((cr, _))) = (shown, cur)
-            && key_in_flight
-            && pr.abs_diff(cr) == 1
+            && (key_in_flight || scroll_frame || carried)
+            && if carried {
+                true
+            } else if scroll_frame {
+                cr.checked_sub(pr) == Some(scroll_rows)
+            } else {
+                pr.abs_diff(cr) == 1
+            }
         {
             let (samples, n) = witness_samples(&self.witness_rows, witness_n);
             if let Some(run) = self.v2.hand_line_follow(&samples[..n], Some(cr))
@@ -2259,12 +2824,33 @@ impl CursorGlow {
             {
                 self.lift_hand_row(pr, cr);
                 self.v2.lift_hand(run);
+                lifted = true;
             }
+        }
+        // A delivered insert echoed in a scroll's frame (a paste drawn in the
+        // same update as a tool result) returns on its own evidence, which
+        // holds in an empty composer too, with no typed glyph to follow: the
+        // caret back on its screen row exactly the priced insert's width right
+        // of where the scroll carried it from, on the row the insert was armed
+        // on. The echo is then judged in its line's own frame, the same-row
+        // sweep the insert pays for.
+        if !lifted
+            && self.v2.engaged()
+            && let (Some((pr, pc)), Some((cr, cc))) = (shown, cur)
+            && scroll_frame
+            && cr.checked_sub(pr) == Some(scroll_rows)
+            && let Some(ins) = self.insert.fresh(now)
+            && ins.known
+            && ins.row == Some(pr)
+            && cc.checked_sub(pc) == Some(ins.cells)
+        {
+            self.lift_hand_row(pr, cr);
+            self.v2.lift_caret(pr, cr);
         }
         if !key_in_flight
             && let (Some((pr, pc)), Some((cr, cc))) = (shown, cur)
             && pc == cc
-            && pr.abs_diff(cr) == 1
+            && (1..=2).contains(&pr.abs_diff(cr))
             && self
                 .row_cur_meta
                 .is_some_and(|m| m.row == cr && m.at == now)
@@ -2433,9 +3019,22 @@ impl CursorGlow {
         // and truncation must shed beam haze, never a strike. Lightning (Laser
         // only) reuses the resident bolt scratch via `mem::take`.
         let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
-        self.emit_bolts(now, cfg, geom, out, &mut bolt_verts);
-        // No-op for Water/rainbow kitty (beam=false); on light themes the beam family
-        // emits source-over veil halos instead of additive quads.
+        let mut bolt_channel = std::mem::take(&mut self.bolt_channel);
+        // Lightning composites over the ink on a dark ground and paints
+        // beneath it on a light one (`emit_bolts`).
+        let bolt_out = if cfg.dark_theme {
+            &mut *out
+        } else {
+            &mut under
+        };
+        self.emit_bolts(now, cfg, geom, bolt_out, &mut bolt_verts, &mut bolt_channel);
+        self.bolt_channel = bolt_channel;
+        // Fire's over-ink account opens before its first light (the
+        // streak) and every later fire emitter spends from it.
+        self.begin_ink_ledger(cfg, geom, cur);
+        // No-op for Water/rainbow kitty (beam=false); on light themes the
+        // beam family draws its body as ink under the letters
+        // (`emit_comet_light`) instead of additive quads.
         self.emit_comet(now, cfg, geom, cur, out, &mut halos, &mut under);
         out.truncate(Self::MAX_QUADS);
         // Per-pixel fire (Fire only): FirePatches render at the under-ink
@@ -2450,15 +3049,21 @@ impl CursorGlow {
             &mut charred,
             &mut halo_cells,
             &mut engulf,
-            &mut halos,
+            &mut under,
         );
-        if out.len() < Self::MAX_QUADS {
-            self.emit_fire_meteors(now, cfg, geom, out); // jump streaks (Fire only)
+        // Jump streaks (Fire only): over the ink on a dark ground,
+        // beneath it on a light one, like the lightning.
+        if cfg.dark_theme {
+            if out.len() < Self::MAX_QUADS {
+                self.emit_fire_meteors(now, cfg, geom, out);
+            }
+        } else if under.len() < Self::MAX_QUADS {
+            self.emit_fire_meteors(now, cfg, geom, &mut under);
         }
         if under.len() < Self::MAX_QUADS {
             // Water's broad reflection belongs below glyph ink. Its crown,
             // landing ripple and free droplets remain over-ink accents.
-            self.emit_water(now, cfg, geom, cur, &mut under, &mut halos);
+            self.emit_water(now, cfg, geom, cur, &mut under);
         }
         if self.v2.engaged() {
             // Seam point 3 (§17.2, D14): v2 owns the rainbow's whole emit
@@ -2489,6 +3094,7 @@ impl CursorGlow {
             // feed the witness after the tick.
             if witness_n > 0 {
                 let (samples, n) = witness_samples(&self.witness_rows, witness_n);
+                self.v2.carry_caret(caret_carry);
                 let park = self.held_park.filter(|p| !p.cross_row && p.fresh(now));
                 let pair = park.map(|p| ((p.row, p.origin), (p.landing_row, p.landing)));
                 // A key in flight under a withheld caret (a torn present, a
@@ -2548,8 +3154,9 @@ impl CursorGlow {
             // restoring the same text is the same text, D2) and retire on
             // the fast melt the cells whose glyph changed or went
             // (`rk::witness`). This is where the absolute-cell ribbon
-            // learns its text has moved.
-            if witness_n > 0 {
+            // learns its text has moved. A scroll's frame fed the follow
+            // pass and the hand's seam alone ([`Self::scroll_rows`]).
+            if witness_n > 0 && !scroll_frame {
                 let (samples, n) = witness_samples(&self.witness_rows, witness_n);
                 self.v2.witness_rows(&samples[..n], now);
             }
@@ -2566,11 +3173,31 @@ impl CursorGlow {
         if out.len() < Self::MAX_QUADS {
             self.emit_forge_cursor(cfg, geom, cur, out, &mut halos);
         }
+        // The landing ring and the flying grains spend the over-ink
+        // account where they cross a letter (Fire's embers spend it in
+        // their own emitter; an idle account admits everything): the
+        // ring as one light, each grain on its own.
+        let flying = !matches!(cfg.style, GlowStyle::Fire);
         if out.len() < Self::MAX_QUADS {
+            let (q0, h0) = (out.len(), halos.len());
             self.emit_ring(now, cfg, geom, out, &mut halos);
+            if flying {
+                let to = out.len();
+                self.ink_ledger
+                    .admit_masked(out, q0..to, InkLedger::FLYING_FLOOR);
+                self.ink_ledger
+                    .admit_halos_masked(&mut halos, h0, InkLedger::FLYING_FLOOR);
+            }
         }
         if out.len() < Self::MAX_QUADS {
+            let (q0, h0) = (out.len(), halos.len());
             self.emit_particles(now, cfg, geom, out, &mut halos, &mut under);
+            if flying {
+                self.ink_ledger
+                    .admit_each_quad(&mut out[q0..], InkLedger::FLYING_FLOOR);
+                self.ink_ledger
+                    .admit_halos_masked(&mut halos, h0, InkLedger::FLYING_FLOOR);
+            }
         }
         self.emit_vapor(now, cfg, geom, &mut halos);
         self.bolt_verts = bolt_verts;
@@ -2613,7 +3240,7 @@ impl CursorGlow {
 
         // The forge cursor fill is visible state (`cursor_fill_override`), so
         // fold it in while the metal is changing, until its quantized colour
-        // settles. At rest the fill is a constant dull ember that stays drawn,
+        // settles. At rest the fill is a constant ember that stays drawn,
         // so it is not folded and the idle fingerprint returns to 0.
         // Fire-gated.
         if matches!(cfg.style, GlowStyle::Fire)

@@ -45,7 +45,7 @@ fn record(id: u64, submitted: bool, arch: ArchMark) -> TurnRecord {
         dur_ms: 5,
         submitted,
         status: "settled",
-        text: format!("turn {id}"),
+        text: format!("turn {id}").into(),
         screen_hash: id,
         seq: id,
         arch,
@@ -388,6 +388,150 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     assert!(encode_within(&turns_v, whole, archive, 10).is_none());
 }
 
+/// A ROOM SHORT OF THE WHOLE TAIL STILL CARRIES ITS NEWEST ROWS
+/// (ATERM-KI-1015-2, U30). The rows were all or nothing: one byte short of
+/// the whole tail, a session crossed with its counters alone, and `drive
+/// report` read the rows after its newest turn's mark as lost although they
+/// would have fit many times over. Now the oldest rows go first, no more of
+/// them than the room needs, and the differ's state only once no row is left.
+///
+/// RED before the fix: a room one byte short carried no row.
+#[test]
+fn a_room_short_of_the_whole_tail_carries_its_newest_rows() {
+    let (term, turns) = session(150);
+    let src = capture(&term, &turns, true);
+    let turns_v: Vec<TurnRecord> = turns.lock().unwrap().records().cloned().collect();
+    let mut archive = src.head.clone();
+    assert!(
+        term.lock()
+            .unwrap()
+            .alt_archive_carry_rows(&mut archive, src.fence, 0, usize::MAX)
+    );
+    let whole = Floors::default();
+    let full = encode(&turns_v, whole, &archive).unwrap().len() as u64;
+    let counters = encode(&turns_v, whole, &counters_only(archive.clone()))
+        .unwrap()
+        .len() as u64;
+    for room in [full - 1, counters + (full - counters) / 2, counters + 64] {
+        let (pick, shed) = encode_within(&turns_v, whole, archive.clone(), room).unwrap();
+        assert_eq!(shed, 0, "room {room}: no record shed");
+        assert!(pick.bytes.len() as u64 <= room, "room {room}: it fits");
+        let c = decode(&pick.bytes).unwrap();
+        assert_eq!(
+            c.turns.len(),
+            turns_v.len(),
+            "room {room}: the whole ledger"
+        );
+        let a = c.archive.unwrap();
+        assert!(
+            !a.rows.is_empty() && a.rows.len() < archive.rows.len(),
+            "room {room}: a room short of the whole tail carries its newest rows ({} of {})",
+            a.rows.len(),
+            archive.rows.len()
+        );
+        assert!(
+            a.differ.is_some(),
+            "room {room}: the differ's state goes only after every row"
+        );
+        // The newest rows: the tail's end, its older rows counted lost.
+        let left_out = archive.rows.len() - a.rows.len();
+        assert_eq!(a.last(), archive.last(), "room {room}");
+        assert_eq!(a.rows[..], archive.rows[left_out..], "room {room}");
+        assert_eq!(a.lost, archive.lost + left_out as u64, "room {room}");
+        // As many as fit: one more row would not.
+        let one_more = encode(
+            &turns_v,
+            whole,
+            &newest_rows(archive.clone(), a.rows.len() + 1),
+        )
+        .unwrap()
+        .len() as u64;
+        assert!(one_more > room, "room {room}: one row more would not fit");
+    }
+}
+
+/// A CROWDED DESK SHARES ITS ROWS ALIKE, EVERY SESSION'S NEWEST FIRST
+/// (ATERM-KI-1015-2, U30): every session carries the rows after its newest
+/// turn's mark (what `drive report` reads back), then as many of its older
+/// rows as every other session, and keeps the differ's state, which is shed
+/// only after the rows. Spent in pool order, the first sessions carried their
+/// whole tails and every session after the one the rows ran out on crossed
+/// with its counters alone, the same sessions on every update.
+///
+/// RED before the fix: sessions 28 to 63 carried no row (and with the rows
+/// spent in pool order a few at a time, sessions 29 to 63).
+#[test]
+fn a_crowded_desk_shares_its_rows_alike_each_sessions_newest_first() {
+    let (term, turns) = session_every(8000, 2000);
+    let last = term.lock().unwrap().alt_archive().last();
+    // The tail reaches back to the eighth newest submitted turn's mark, and
+    // the newest turn's mark is 1500 rows from the end.
+    let mark = |back: u64| ArchMark {
+        origin: 7,
+        last: last - back,
+    };
+    let newest = mark(1500);
+    {
+        let mut ledger = turns.lock().unwrap();
+        *ledger = TurnLedger::default();
+        for id in 1..=200 {
+            let arch = match id {
+                193 => mark(6000),
+                200 => newest,
+                _ => ArchMark::default(),
+            };
+            let mut r = record(id, true, arch);
+            r.text = "x".repeat(480).into();
+            ledger.push(r);
+        }
+    }
+    let sources: Vec<CarrySource> = (0..64).map(|_| capture(&term, &turns, true)).collect();
+    let alone = decode(&export(std::slice::from_ref(&sources[0]), ceiling())[0].1)
+        .unwrap()
+        .archive
+        .unwrap();
+    assert!(
+        alone.differ.is_some() && alone.first == last - 6000 + 1 && alone.last() == last,
+        "PRECONDITION: a session alone carries its whole tail and the differ's state"
+    );
+    let out = export(&sources, ceiling());
+    assert_eq!(out.len(), 64, "every session carries a sidecar");
+    let total: u64 = out.iter().map(|(_, b)| b.len() as u64).sum();
+    assert!(total <= MAX_AGGREGATE_BYTES, "{total}");
+    let archives: Vec<AltArchiveCarry> = out
+        .iter()
+        .map(|(_, bytes)| decode(bytes).unwrap().archive.unwrap())
+        .collect();
+    let rows: Vec<usize> = archives.iter().map(|a| a.rows.len()).collect();
+    let (fewest, most) = (*rows.iter().min().unwrap(), *rows.iter().max().unwrap());
+    assert!(
+        rows.iter().sum::<usize>() < 64 * alone.rows.len(),
+        "PRECONDITION: the aggregate does not hold every whole tail"
+    );
+    for (i, a) in archives.iter().enumerate() {
+        assert!(a.differ.is_some(), "session {i} keeps the differ's state");
+        assert!(
+            a.last() == last && a.first <= newest.last + 1,
+            "session {i} carries the rows after its newest turn's mark ({} rows from {})",
+            a.rows.len(),
+            a.first
+        );
+        assert!(
+            a.first < newest.last + 1,
+            "session {i} carries older rows too"
+        );
+    }
+    assert!(
+        most - fewest <= most / 50,
+        "every session carries about as many rows ({fewest} to {most})"
+    );
+    assert!(
+        MAX_AGGREGATE_BYTES - total < 4096,
+        "what the aggregate had left is spent ({} bytes unspent)",
+        MAX_AGGREGATE_BYTES - total
+    );
+}
+
 /// The codec keeps every carried field, unknown fields are skipped and
 /// missing ones default, and an unknown version is dropped whole.
 #[test]
@@ -610,7 +754,7 @@ fn a_record_the_receiver_cannot_read_is_not_vouched_for() {
         (last.id, last.submitted, last.status),
         (21, true, "timeout")
     );
-    assert_eq!(last.text, "turn 21");
+    assert_eq!(&*last.text, "turn 21");
     // (c) v0.100.0, every build after it, this build and a newer successor
     // read `hangup` and get it as it is: a rollback from this build to v0.100.0
     // carries the record exactly, as it did before.
@@ -764,6 +908,7 @@ fn an_adopted_ledger_says_which_turn_ids_it_cannot_vouch_for() {
         turns: vec![record(40, true, ArchMark::default())],
         unheld_below: 30,
         shed_below: 0,
+        turn_ids: 0,
         archive: None,
         log: None,
         log_mirror: None,
@@ -876,7 +1021,7 @@ fn a_desk_whose_ledgers_overflow_the_aggregate_keeps_every_sessions_newest_turns
         let mut l = TurnLedger::default();
         for id in 1..=n {
             let mut r = record(id, true, ArchMark::default());
-            r.text = "x".repeat(480);
+            r.text = "x".repeat(480).into();
             l.push(r);
         }
         Arc::new(Mutex::new(l))
@@ -931,7 +1076,7 @@ fn a_crowded_desk_keeps_every_sessions_ledger() {
         *ledger = TurnLedger::default();
         for id in 1..=200 {
             let mut r = record(id, true, ArchMark::default());
-            r.text = "x".repeat(480);
+            r.text = "x".repeat(480).into();
             ledger.push(r);
         }
     }
@@ -1287,9 +1432,9 @@ fn the_log_never_costs_the_turn_ledger() {
 
 /// LOG DETAIL IS SHED BEFORE ANY SESSION'S ARCHIVE ROWS: a desk whose rows
 /// overflow the aggregate carries each log's skeleton (the open path, the
-/// state) and no detail, while every session keeps the rows it keeps
-/// without logs (less what the skeletons take). CONTROL: a single session,
-/// the aggregate unpressed, carries its log's detail too.
+/// state) and no detail, while the desk keeps the rows it keeps without
+/// logs, less only what the skeletons take. CONTROL: a single session, the
+/// aggregate unpressed, carries its log's detail too.
 #[test]
 fn log_detail_is_shed_before_any_sessions_archive_rows() {
     let (term, turns) = session_every(8000, 2000);
@@ -1308,9 +1453,16 @@ fn log_detail_is_shed_before_any_sessions_archive_rows() {
     let total_with: u64 = with.iter().map(|(_, b)| b.len() as u64).sum();
     assert!(total_with <= MAX_AGGREGATE_BYTES, "{total_with}");
     let rows = |b: &[u8]| decode(b).unwrap().archive.unwrap().rows.len();
-    for (i, ((_, w), (_, p))) in with.iter().zip(&without).enumerate() {
+    // The rows' bytes in a sidecar's JSON.
+    let row_bytes = |b: &[u8]| -> u64 {
+        let archive = decode(b).unwrap().archive.unwrap();
+        archive.rows.iter().map(|r| json_string_len(r) + 1).sum()
+    };
+    let mut skeletons = 0_u64;
+    for (i, (_, w)) in with.iter().enumerate() {
         let c = decode(w).unwrap();
         let lines = c.log.expect("the skeleton crossed");
+        skeletons += log_json_len(&lines);
         let head = &lines[0];
         let carried: u64 = head
             .split(' ')
@@ -1321,11 +1473,14 @@ fn log_detail_is_shed_before_any_sessions_archive_rows() {
             carried < 100,
             "session {i}: the detail is shed (only what the rows left): {head}"
         );
-        assert!(
-            rows(w) + 64 >= rows(p),
-            "session {i}: about as many rows as without logs"
-        );
     }
+    let rows_without: u64 = without.iter().map(|(_, p)| row_bytes(p)).sum();
+    let rows_with: u64 = with.iter().map(|(_, w)| row_bytes(w)).sum();
+    assert!(
+        rows_with + skeletons + 4096 >= rows_without,
+        "the rows the logs cost are what their skeletons take ({rows_with} + {skeletons} of \
+         {rows_without})"
+    );
     assert!(rows(&with[0].1) > 0, "the rows crossed");
     // CONTROL: one session alone carries its detail.
     tl.lock().unwrap().slog_mut().lift_read_fence();
@@ -1509,7 +1664,7 @@ fn mirrored_cursors_are_reserved_before_the_control_carry_spends_its_budget() {
     let mut records: Vec<TurnRecord> = (1..=LEDGER_CAP as u64)
         .map(|id| {
             let mut r = record(id, true, ArchMark::default());
-            r.text.clear();
+            r.text = Arc::from("");
             r
         })
         .collect();
@@ -1520,7 +1675,7 @@ fn mirrored_cursors_are_reserved_before_the_control_carry_spends_its_budget() {
     for r in &mut records {
         let bytes = left.min(3000);
         let controls = bytes.saturating_sub(512).div_ceil(5);
-        r.text = "\u{1}".repeat(controls) + &"x".repeat(bytes - controls * 6);
+        r.text = Arc::from("\u{1}".repeat(controls) + &"x".repeat(bytes - controls * 6));
         assert!(r.text.len() <= 512);
         left -= bytes;
     }
@@ -1587,4 +1742,143 @@ fn mirrored_cursors_are_reserved_before_the_control_carry_spends_its_budget() {
         total <= MAX_AGGREGATE_BYTES,
         "MIRROR_MEMBER_MUST_SHARE_THE_CONTROL_BUDGET: {total}"
     );
+}
+
+/// A ledger of the records `ids`, as a session holds one.
+fn ledger_with(ids: impl IntoIterator<Item = u64>) -> TurnLedger {
+    let mut ledger = TurnLedger::default();
+    for id in ids {
+        ledger.push(record(
+            id,
+            id % 2 == 0,
+            ArchMark {
+                origin: 7,
+                last: id,
+            },
+        ));
+    }
+    ledger
+}
+
+/// THE CRASH CARRY (`crash_restore`'s increment 7) round-trips through the decoder an
+/// update's sidecar goes through: every record (its text, caller, archive mark, words),
+/// the floors and the writer's turn-id count, each record read as carried; no archive and
+/// no log, whatever the bytes held.
+#[test]
+fn a_crash_carry_round_trips_the_ledger_alone() {
+    let mut ledger = ledger_with(1..=20);
+    ledger.begin(21);
+    let carry = CrashLedger::of(&ledger, 30);
+    assert_eq!(carry.len(), 20);
+    let (bytes, shed) = carry.encode(|_| true).expect("fits");
+    assert_eq!(shed, 0, "a ledger that fits is carried whole");
+    let back = decode_crash_carry(&bytes).expect("decodes");
+    assert_eq!(back.turns.len(), 20);
+    for (got, id) in back.turns.iter().zip(1..=20) {
+        let want = record(
+            id,
+            id % 2 == 0,
+            ArchMark {
+                origin: 7,
+                last: id,
+            },
+        );
+        assert_eq!(
+            TurnRecord {
+                carried: false,
+                ..got.clone()
+            },
+            want,
+            "record {id}"
+        );
+        assert!(got.carried);
+    }
+    assert_eq!(back.turn_ids, 30);
+    assert_eq!(
+        back.unheld_below, 22,
+        "the export's floor: past the turn still open"
+    );
+    assert!(back.archive.is_none() && back.log.is_none() && back.log_mirror.is_none());
+
+    // An update's sidecar decoded as a crash carry keeps its ledger and loses the rest: a
+    // crash carry never installs an archive.
+    let update = encode(
+        &ledger.records().cloned().collect::<Vec<_>>(),
+        Floors::default(),
+        &archive_of(3),
+    )
+    .expect("an update's sidecar");
+    assert!(decode_why(&update).expect("decodes").archive.is_some());
+    let crash = decode_crash_carry(&update).expect("decodes");
+    assert!(crash.archive.is_none());
+    assert_eq!(crash.turns.len(), 20);
+}
+
+/// An update's sidecar names no turn-id count: its bytes are what they were before the
+/// crash carry's field.
+#[test]
+fn an_update_sidecar_carries_no_turn_id_count() {
+    let ledger = ledger_with(1..=3);
+    let bytes = encode(
+        &ledger.records().cloned().collect::<Vec<_>>(),
+        Floors::default(),
+        &archive_of(3),
+    )
+    .expect("encodes");
+    let text = String::from_utf8(bytes.clone()).expect("JSON");
+    assert!(!text.contains("turn_ids"), "{text}");
+    assert_eq!(decode_why(&bytes).expect("decodes").turn_ids, 0);
+}
+
+/// A ledger too large for the slot sheds its OLDEST records, the fewest that let the rest
+/// fit, and no longer vouches for their ids; when not even its floors fit, nothing.
+#[test]
+fn a_crash_carry_sheds_its_oldest_records_to_fit() {
+    let ledger = ledger_with(1..=50);
+    let carry = CrashLedger::of(&ledger, 50);
+    // The size the newest ten take: exactly forty must be shed.
+    let newest_ten = ledger_with(41..=50);
+    let (ten, _) = CrashLedger::of(&newest_ten, 50)
+        .encode(|_| true)
+        .expect("fits");
+    let limit = ten.len() + "turn".len();
+    let (bytes, shed) = carry
+        .encode(|bytes| bytes.len() <= limit)
+        .expect("the newest fit");
+    assert_eq!(shed, 40, "the count shed rides beside the bytes");
+    assert!(bytes.len() <= limit);
+    let back = decode_crash_carry(&bytes).expect("decodes");
+    let ids: Vec<u64> = back.turns.iter().map(|t| t.id).collect();
+    assert_eq!(
+        ids,
+        (41..=50).collect::<Vec<_>>(),
+        "the newest, as few shed as fit"
+    );
+    assert_eq!(back.unheld_below, 41, "no id it shed is vouched for");
+    assert_eq!(back.turn_ids, 50);
+    assert!(carry.encode(|_| false).is_none(), "nothing fits: no carry");
+    // Room for the floors alone: every record shed, the floor past the newest.
+    let floors_only = encode_ledger(
+        &[],
+        Floors {
+            unheld_below: 4,
+            shed_below: 0,
+        },
+        9,
+    )
+    .expect("encodes");
+    let (bytes, shed) = CrashLedger::of(&ledger_with(1..=3), 9)
+        .encode(|bytes| bytes.len() <= floors_only.len())
+        .expect("the floors fit");
+    assert_eq!((bytes, shed), (floors_only, 3));
+}
+
+/// An archive carry under `origin`, one row.
+fn archive_of(origin: u64) -> AltArchiveCarry {
+    AltArchiveCarry {
+        origin,
+        first: 1,
+        rows: vec![Arc::from("a row")],
+        ..AltArchiveCarry::default()
+    }
 }

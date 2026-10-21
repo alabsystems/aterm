@@ -126,7 +126,7 @@ struct DayFile {
     /// When its first counted stretch began, unix ms.
     first_unix_ms: i64,
     /// Per arm (Cruise, Land, Off, Unsupervised): busy, at a box, asked, at
-    /// its prompt, finished, pausing — milliseconds.
+    /// its prompt, landed (an older build's finished), pausing — milliseconds.
     arms: [[u64; 6]; 4],
     /// Per compared arm (Cruise, Land, Off) and kind (box, question): the
     /// hold histogram.
@@ -138,18 +138,14 @@ struct DayFile {
     ends: EndsFile,
 }
 
-/// One day's ends on disk ([`AbEnds`]).
+/// One day's ends on disk ([`AbEnds`]). An older build's `done` and `quiet`
+/// counts (Cruise's dones, Land's quiet ends, both gone under FOREVER CRUISE /
+/// FOREVER LAND) are unknown fields here, passed over.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct EndsFile {
-    /// Cruise's dones past the work floor.
-    #[serde(default)]
-    done: u32,
     /// Land's landings.
     #[serde(default)]
     landed: u32,
-    /// Land's quiet ends.
-    #[serde(default)]
-    quiet: u32,
     /// The time from Land to landed: the histogram.
     #[serde(default)]
     landing: [u32; BUCKETS],
@@ -158,18 +154,14 @@ struct EndsFile {
 impl EndsFile {
     fn of(ends: &AbEnds) -> Self {
         Self {
-            done: ends.done,
             landed: ends.landed,
-            quiet: ends.quiet,
             landing: ends.landing,
         }
     }
 
     fn ends(&self) -> AbEnds {
         AbEnds {
-            done: self.done,
             landed: self.landed,
-            quiet: self.quiet,
             landing: self.landing,
         }
     }
@@ -193,7 +185,7 @@ impl DayFile {
                 t.at_box_ms,
                 t.asked_ms,
                 t.at_prompt_ms,
-                t.finished_ms,
+                t.landed_ms,
                 t.pausing_ms,
             ]
         };
@@ -212,7 +204,7 @@ impl DayFile {
             at_box_ms,
             asked_ms,
             at_prompt_ms,
-            finished_ms,
+            landed_ms,
             pausing_ms,
         ]: [u64; 6]| {
             AbArmTotals {
@@ -220,7 +212,7 @@ impl DayFile {
                 at_box_ms,
                 asked_ms,
                 at_prompt_ms,
-                finished_ms,
+                landed_ms,
                 pausing_ms,
             }
         };

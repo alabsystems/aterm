@@ -1209,16 +1209,19 @@ pub fn main(sys: &dyn System, paths: &Paths, args: &[String], tty: bool) -> Exit
         .parallel
         .unwrap_or_else(|| inv.parallel())
         .clamp(1, macs.len().max(1));
-    let mut stdout = std::io::stdout();
-    let sink: Sink<'_> = Mutex::new(&mut stdout as &mut (dyn Write + Send));
-    let summary = match enroll_macs(sys, paths, &args, &macs, &exe, parallel, &sink) {
+    // The enrollments' shared sink lends them stdout and ends with them.
+    let done = {
+        let mut stdout = std::io::stdout();
+        let sink: Sink<'_> = Mutex::new(&mut stdout as &mut (dyn Write + Send));
+        enroll_macs(sys, paths, &args, &macs, &exe, parallel, &sink)
+    };
+    let summary = match done {
         Ok(s) => s,
         Err(why) => {
             eprintln!("aterm machines enroll: {}", shown(&why));
             return ExitCode::FAILURE;
         }
     };
-    drop(sink);
     // A Mac enrolled already is nothing left to do, never a failure: the same command run
     // again after a skip finishes the rest and exits 0.
     let ok = summary.skipped.is_empty();
@@ -3265,17 +3268,18 @@ mod tests {
     /// Run `enroll` of `args` on `sys`, one Mac at a time: the summary and what it printed.
     fn run_batch(sys: &Fake, args: &Args) -> (Result<Summary, String>, String) {
         let mut out: Vec<u8> = Vec::new();
-        let sink: Sink<'_> = Mutex::new(&mut out as &mut (dyn Write + Send));
-        let done = enroll_macs(
-            sys,
-            &ctl(),
-            args,
-            &args.requests(),
-            Path::new(EXE),
-            1,
-            &sink,
-        );
-        drop(sink);
+        let done = {
+            let sink: Sink<'_> = Mutex::new(&mut out as &mut (dyn Write + Send));
+            enroll_macs(
+                sys,
+                &ctl(),
+                args,
+                &args.requests(),
+                Path::new(EXE),
+                1,
+                &sink,
+            )
+        };
         (done, String::from_utf8(out).unwrap())
     }
 

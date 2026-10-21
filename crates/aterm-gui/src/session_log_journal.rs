@@ -6,12 +6,14 @@
 //! `aterm-session-log`, so `log @<sid>` and `brief @<sid>` answer for a
 //! session from an earlier run or a crash (`session_log_journal_read`).
 //!
-//! OFF BY DEFAULT (D3, decided 2026-10-19: opt-in; ruling R10). With `[session_log]
-//! journal = false`, the default, [`Lane::new`] makes an inert lane: no
-//! directory, no file, no thread, no wake installed in any log, no read, no
-//! deletion, on every path. `journal = true` opts in, and then the journal
+//! ON BY DEFAULT (D3, ruled 2026-10-19; Phase 6 ruling U21): the journal
 //! follows the desk ([`gate`]: `restore_session` and `Desk::kept`, whose lab
-//! seam gives a private headless instance a window's desk).
+//! seam gives a private headless instance a window's desk), on macOS and
+//! Linux. `[session_log] journal = false` is the opt-out (ruling R10): then,
+//! as headless, with `restore_session` off and on Windows, [`Lane::new`]
+//! makes an inert lane: no directory, no file, no thread, no wake installed
+//! in any log, no read, no deletion, on every path. No data migration: an
+//! older build after a downgrade neither writes nor prunes the folder.
 //!
 //! THE WRITER pulls. A producer's append does no I/O and touches no channel:
 //! the log rings the lane's [`aterm_slog::Notify`] (ruling R6: inside the
@@ -379,6 +381,10 @@ struct Shared {
     report: Arc<Report>,
     ack: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
     finish_budget_ms: AtomicU64,
+    /// The armed lane's passes that found no Commit and parked: how a test
+    /// knows the lane chose to wait, not merely that it has yet to run.
+    #[cfg(test)]
+    armed_waits: AtomicU64,
 }
 
 impl Shared {
@@ -394,6 +400,8 @@ impl Shared {
             report: Arc::new(Report::default()),
             ack: Mutex::new(None),
             finish_budget_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            armed_waits: AtomicU64::new(0),
         })
     }
 
@@ -476,7 +484,7 @@ pub(crate) struct Lane {
 }
 
 impl Lane {
-    /// A lane that does nothing: the default (`journal = false`), headless,
+    /// A lane that does nothing: `journal = false`, headless,
     /// `restore_session` off, Windows.
     pub(crate) fn inert() -> Lane {
         Lane {
@@ -635,6 +643,8 @@ fn run(
         }
         if armed {
             if req & REQ_COMMIT == 0 {
+                #[cfg(test)]
+                shared.armed_waits.fetch_add(1, Ordering::AcqRel);
                 std::thread::park_timeout(Duration::from_secs(60));
                 continue;
             }

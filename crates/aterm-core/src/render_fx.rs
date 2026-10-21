@@ -27,6 +27,7 @@
 //! premultiplied by its own opacity, the [`GlowQuad`](crate::render::GlowQuad)
 //! paint: `alpha == 0` is additive light, `alpha > 0` is source-over.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// A half-open pixel rectangle `[x0, x1) × [y0, y1)` in signed pixels.
@@ -314,6 +315,25 @@ impl FxRowRuns {
     }
 }
 
+/// The longest side, in texels, an [`FxArt`] may have: [`FxArt::new`] refuses
+/// a longer one. With [`FX_FRAME_ART_TEXELS`] it is what lets every backend
+/// draw every art a frame admits (design §4.6).
+pub const FX_ART_MAX_SIDE: u16 = 2048;
+
+/// The art one frame may draw per texel width (the one-byte Index8 arts, and
+/// the four-byte RGBA ones): at most this many texels of DISTINCT arts, each
+/// counted once however many sprites draw it.
+///
+/// The renderers walk the frame's sprites in draw order (layers in list
+/// order, items in content order) and refuse a sprite whose art would take its
+/// width's total past this: it draws nothing, on every backend alike, so the
+/// CPU and the GPU agree on every frame. The bound is the GPU atlas's: arts of
+/// sides at most [`FX_ART_MAX_SIDE`] totalling at most 2²² texels always
+/// shelf-pack, tallest first, into one 4096² texture (each shelf is opened by
+/// an art that fit on no earlier one, so the packing's height stays below
+/// `h_max + 2·area / 4096 <= 2048 + 2048`).
+pub const FX_FRAME_ART_TEXELS: u64 = 1 << 22;
+
 /// An image the engine draws: `w × h` texels of one [`FxTexels`] kind,
 /// content-addressed.
 ///
@@ -339,11 +359,16 @@ impl FxArt {
     /// An art of `w × h` texels of kind `texels`, row-major, top row first.
     ///
     /// `None` when `data` is not exactly `w · h ·`
-    /// [`bytes_per_texel`](FxTexels::bytes_per_texel) bytes long. A zero-size
-    /// art (`w == 0` or `h == 0`, no bytes) is accepted and draws nothing;
-    /// [`FxContent`]'s seal refuses one in a debug build.
+    /// [`bytes_per_texel`](FxTexels::bytes_per_texel) bytes long, or when a
+    /// side is longer than [`FX_ART_MAX_SIDE`] (no backend is bound to hold
+    /// it; a producer tiles a larger image). A zero-size art (`w == 0` or
+    /// `h == 0`, no bytes) is accepted and draws nothing; [`FxContent`]'s seal
+    /// refuses one in a debug build.
     #[must_use]
     pub fn new(w: u16, h: u16, texels: FxTexels, data: impl Into<Box<[u8]>>) -> Option<Self> {
+        if w > FX_ART_MAX_SIDE || h > FX_ART_MAX_SIDE {
+            return None;
+        }
         let data = data.into();
         let need = usize::from(w)
             .checked_mul(usize::from(h))?
@@ -583,12 +608,81 @@ enum FxClass {
 /// blends, a zero-size art and any palette index past the end. So the extent
 /// the damage tracker reads can never be stale. Shared by `Arc`; a settled
 /// layer hands the renderer the same `Arc` frame after frame.
-#[derive(Debug, Clone)]
+///
+/// Every seal is booked on [`fx_layer_builds`] and every deep copy (a
+/// [`Clone`], as `Arc::make_mut` makes of a shared payload) on
+/// [`fx_payload_copies`]: the engine's cost at rest is both counters standing
+/// still (design §7).
+#[derive(Debug)]
 pub struct FxContent {
     items: Vec<FxItem>,
     palette: Vec<FxInk>,
     extent: PxRect,
     class: FxClass,
+}
+
+/// [`fx_layer_builds`]'s counter.
+static FX_LAYER_BUILDS: AtomicU64 = AtomicU64::new(0);
+/// [`fx_payload_copies`]'s counter.
+static FX_PAYLOAD_COPIES: AtomicU64 = AtomicU64::new(0);
+
+/// How many [`FxContent`] payloads this process has sealed: one per
+/// [`FxContent::new`] and one per [`FxContent::edit`], a layer's content being
+/// (re)built. A settled layer hands the renderer the same `Arc` and seals
+/// nothing, so this stands still at rest (`metrics`' `fx_layer_builds`).
+#[must_use]
+pub fn fx_layer_builds() -> u64 {
+    FX_LAYER_BUILDS.load(Ordering::Relaxed)
+}
+
+/// How many deep copies of an [`FxContent`] payload this process has made
+/// (`metrics`' `fx_payload_copies`): a producer that edits a payload some
+/// frame still holds pays a copy of its items and palette here, so a nonzero
+/// count at rest names a producer that should keep its own ring.
+#[must_use]
+pub fn fx_payload_copies() -> u64 {
+    FX_PAYLOAD_COPIES.load(Ordering::Relaxed)
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// This thread's share of the two counters, `(builds, copies)`: a test
+    /// runs beside others that seal and copy contents of their own.
+    static FX_COUNTS_HERE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Book `(builds, copies)` on this thread's counters.
+fn count_here(builds: u64, copies: u64) {
+    #[cfg(any(test, debug_assertions))]
+    FX_COUNTS_HERE.with(|c| {
+        let (b, k) = c.get();
+        c.set((b + builds, k + copies));
+    });
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = (builds, copies);
+}
+
+/// [`fx_layer_builds`] and [`fx_payload_copies`] booked on THIS thread: the
+/// cost tests' counters, which the work of tests running beside them on
+/// other threads does not move.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn fx_counts_here() -> (u64, u64) {
+    FX_COUNTS_HERE.with(std::cell::Cell::get)
+}
+
+impl Clone for FxContent {
+    fn clone(&self) -> Self {
+        FX_PAYLOAD_COPIES.fetch_add(1, Ordering::Relaxed);
+        count_here(0, 1);
+        Self {
+            items: self.items.clone(),
+            palette: self.palette.clone(),
+            extent: self.extent,
+            class: self.class,
+        }
+    }
 }
 
 impl Default for FxContent {
@@ -705,6 +799,8 @@ impl FxContent {
     }
 
     fn seal(&mut self, refuse: bool) {
+        FX_LAYER_BUILDS.fetch_add(1, Ordering::Relaxed);
+        count_here(1, 0);
         let mut extent = PxRect::EMPTY;
         let mut class = FxClass::Empty;
         let pal = self.palette.len() as u64;
@@ -945,12 +1041,21 @@ mod tests {
         assert!(FxArt::new(1, 1, FxTexels::Rgba8Premul, vec![0; 3]).is_none());
         assert!(FxArt::new(0, 5, FxTexels::Index8, Vec::new()).is_some_and(|a| a.is_empty()));
         // The byte count cannot wrap before the length refusal on 32-bit.
-        assert!(FxArt::new(u16::MAX, u16::MAX, FxTexels::Rgba8Premul, Vec::new()).is_none());
-        assert!(FxArt::new(u16::MAX, u16::MAX, FxTexels::Rgba8Straight, Vec::new()).is_none());
+        let max = FX_ART_MAX_SIDE;
+        assert!(FxArt::new(max, max, FxTexels::Rgba8Premul, Vec::new()).is_none());
+        assert!(FxArt::new(max, max, FxTexels::Rgba8Straight, Vec::new()).is_none());
         assert!(
-            FxArt::new(u16::MAX, 0, FxTexels::Rgba8Straight, Vec::new())
+            FxArt::new(max, 0, FxTexels::Rgba8Straight, Vec::new())
                 .is_some_and(|art| art.is_empty())
         );
+        // A side past the cap is refused whatever its bytes: no backend is
+        // bound to hold it. Its largest neighbour is an art.
+        let side = usize::from(max);
+        assert!(FxArt::new(max, 1, FxTexels::Index8, vec![1; side]).is_some());
+        assert!(FxArt::new(max + 1, 1, FxTexels::Index8, vec![1; side + 1]).is_none());
+        assert!(FxArt::new(1, max + 1, FxTexels::Index8, vec![1; side + 1]).is_none());
+        assert!(FxArt::new(max + 1, 0, FxTexels::Index8, Vec::new()).is_none());
+        assert!(FxArt::new(u16::MAX, u16::MAX, FxTexels::Rgba8Premul, Vec::new()).is_none());
     }
 
     /// The run lists, expanded, are exactly the drawing texels: every

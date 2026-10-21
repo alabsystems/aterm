@@ -6,8 +6,10 @@
 //! capture the CURRENT app-owned route (terminal, native, or heterogeneous,
 //! including host chrome/effects). A windowed SIGUSR1 snapshot copies the exact
 //! successful application-present client destination, including swapchain-only
-//! transforms and remainder bands. Headless capture has no presentation target
-//! and is explicitly a semantic-renderer artifact. `read_native_chrome` and
+//! transforms and remainder bands, and a windowed `image` copies the same
+//! destination cut back to its frame (`capture_source_kind` says when it
+//! rerenders instead). Headless capture has no presentation target and is
+//! explicitly a semantic-renderer artifact. `read_native_chrome` and
 //! `capture_window` form the distinct OS-chrome boundary; full-window capture
 //! binds that chrome to a successful application-present client destination.
 //! None of these client-frame paths claims compositor visibility or scanout.
@@ -20,8 +22,7 @@ use aterm_render::Frame;
 
 use crate::WindowId;
 use crate::app_render::{
-    OverlayGlow, apply_bell_invert, apply_host_chrome_at, apply_overlay_at, composite_tray_quad_at,
-    sync_cursor_effect_coordinate_space, tray_quad_below_y,
+    apply_host_chrome_at, sync_cursor_effect_coordinate_space, tray_quad_below_y,
 };
 use crate::control::{DimsSnapshot, ImageReq};
 use crate::platform::AppRt;
@@ -54,7 +55,7 @@ pub(crate) struct DeferredGpuCapture {
     surface: u64,
     exact_tap: bool,
     budget: CapturePresentBudget,
-    request: DeferredGpuCaptureRequest,
+    request: CaptureRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,27 +79,104 @@ impl CapturePresentBudget {
     }
 }
 
-pub(crate) enum DeferredGpuCaptureRequest {
+/// One pixel capture: the `image` verb, a SIGUSR1 snapshot, or the `window`
+/// verb. Every capture enters [`App::run_capture`] as one of these; one deferred
+/// for its GPU drawable waits as the same value and re-enters there when the
+/// drawable is ready.
+pub(crate) enum CaptureRequest {
     Image(ImageReq),
     Snapshot {
         path: String,
     },
     #[cfg(any(target_os = "macos", windows))]
-    Window {
-        target: control_auth::ConfinedImage,
-        cancel: crate::control::CaptureCancellation,
-        reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
-        handoff: crate::control::ReplyRetentionPermit,
-    },
+    Window(WindowReq),
 }
 
-impl DeferredGpuCaptureRequest {
-    fn cancelled(&self) -> bool {
+/// A `window` photograph: platform chrome stitched around the exact presented
+/// client frame.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) struct WindowReq {
+    /// The logical window to photograph; `None` is the front window. A deferred
+    /// macOS photograph names the window it waited on (`CaptureRequest::bound_to`).
+    target: Option<WindowId>,
+    /// The surface the caller named (`window <target>`): refused unless the front
+    /// window shows it ([`App::window_target_refusal`]), asked again when a
+    /// deferred photograph resumes.
+    aux: AuxTarget,
+    handoff: crate::control::ReplyRetentionPermit,
+    path: control_auth::ConfinedImage,
+    cancel: crate::control::CaptureCancellation,
+    reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
+}
+
+impl CaptureRequest {
+    /// The window this capture photographs: for `@<sid> image` the window whose
+    /// active tab displays that session, otherwise the front window.
+    fn target_window(&self, app: &App) -> Option<WindowId> {
         match self {
-            Self::Image(request) => request.cancel.is_cancelled(),
-            Self::Snapshot { .. } => false,
+            Self::Image(request) => match request.session {
+                Some(session) => app.windows_displaying(session).next(),
+                None => app.frontmost_window,
+            },
+            Self::Snapshot { .. } => app.frontmost_window,
             #[cfg(any(target_os = "macos", windows))]
-            Self::Window { cancel, .. } => cancel.is_cancelled(),
+            Self::Window(request) => request.target.or(app.frontmost_window),
+        }
+    }
+
+    /// What the capture may be made from, which sizes its admission
+    /// ([`App::capture_bytes_estimate`]).
+    fn charge(&self) -> CaptureCharge {
+        match self {
+            Self::Image(request) => {
+                CaptureCharge::Frame(DestinationDemand::of_image(request.clean))
+            }
+            Self::Snapshot { .. } => CaptureCharge::Frame(DestinationDemand::Required),
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Window(_) => CaptureCharge::Window,
+        }
+    }
+
+    /// The verb's answer once its caller has cancelled (its deadline passed);
+    /// `None` while the caller still waits. A snapshot has no caller to cancel.
+    fn cancellation(&self) -> Option<&'static str> {
+        match self {
+            Self::Image(request) => request
+                .cancel
+                .is_cancelled()
+                .then_some("image request cancelled before render"),
+            Self::Snapshot { .. } => None,
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Window(request) => request
+                .cancel
+                .is_cancelled()
+                .then_some("window capture request cancelled before photograph"),
+        }
+    }
+
+    /// Whether this capture copies its window's presented destination when it
+    /// can: a snapshot and `window` always, an `image` unless plain. A deferred
+    /// one that armed the tap owns it while it waits for its drawable.
+    fn takes_client_tap(&self) -> bool {
+        match self {
+            Self::Image(request) => !request.clean,
+            Self::Snapshot { .. } => true,
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Window(_) => true,
+        }
+    }
+
+    /// A deferred macOS photograph stays bound to the window it waited on, even
+    /// if another came to the front meanwhile. A named overlay is a surface of
+    /// the FRONT window, so that photograph stays bound to the front window.
+    #[cfg(target_os = "macos")]
+    fn bound_to(self, window: WindowId) -> Self {
+        match self {
+            Self::Window(request) if request.aux == AuxTarget::Front => Self::Window(WindowReq {
+                target: Some(window),
+                ..request
+            }),
+            request => request,
         }
     }
 
@@ -111,10 +189,57 @@ impl DeferredGpuCaptureRequest {
                 crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
             }
             #[cfg(any(target_os = "macos", windows))]
-            Self::Window { reply, .. } => {
-                let _ = reply.send(Err(error.to_string()));
+            Self::Window(request) => {
+                let _ = request.reply.send(Err(error.to_string()));
             }
         }
+    }
+
+    /// Answer busy: the encoder already holds its byte budget
+    /// ([`App::admit_capture`]), so nothing is captured. A refused snapshot's
+    /// generation is begun and left unpublished: a stale `.done` from an earlier
+    /// snapshot must not answer a requester's stat for this one.
+    fn reject_busy(self) {
+        match self {
+            Self::Image(request) => {
+                crate::control_auth::cleanup_failed_automatic_image(&request.target);
+                let _ = request
+                    .reply
+                    .send(Err(format!("image {ENCODE_QUEUE_FULL}")));
+            }
+            Self::Snapshot { path } => {
+                match begin_snapshot_generation(std::path::Path::new(&path)) {
+                    Ok(unpublished) => drop(unpublished),
+                    Err(error) => {
+                        crate::logging::stderr_line!(
+                            "aterm-gui: snapshot refused for {path}: {error}"
+                        );
+                        return;
+                    }
+                }
+                crate::logging::stderr_line!(
+                    "aterm-gui: snapshot rejected for {path}: {ENCODE_QUEUE_FULL}"
+                );
+            }
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Window(request) => {
+                crate::control_auth::cleanup_failed_automatic_image(&request.path);
+                let _ = request
+                    .reply
+                    .send(Err(format!("window capture {ENCODE_QUEUE_FULL}")));
+            }
+        }
+    }
+
+    /// Answer that the window this capture waited on is no longer its target.
+    fn reject_retargeted(self) {
+        let error = match &self {
+            Self::Image(_) => "image target changed while waiting for GPU acquisition",
+            Self::Snapshot { .. } => "snapshot target changed while waiting for GPU acquisition",
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Window(_) => "window capture target changed while waiting",
+        };
+        self.reject(error);
     }
 }
 
@@ -162,12 +287,7 @@ impl App {
             .any(|capture| capture.window == window)
     }
 
-    fn queue_gpu_capture(
-        &mut self,
-        window: WindowId,
-        request: DeferredGpuCaptureRequest,
-        first: bool,
-    ) {
+    fn queue_gpu_capture(&mut self, window: WindowId, request: CaptureRequest, first: bool) {
         self.prune_deferred_gpu_captures();
         let surface = self
             .windows
@@ -178,7 +298,7 @@ impl App {
             return;
         };
         let exact_tap = first
-            && !matches!(request, DeferredGpuCaptureRequest::Image(_))
+            && request.takes_client_tap()
             && self
                 .windows
                 .get(&window)
@@ -222,7 +342,7 @@ impl App {
                 && deferred_capture_identity_matches(
                     capture.surface,
                     current,
-                    capture.request.cancelled(),
+                    capture.request.cancellation().is_some(),
                 )
             {
                 index += 1;
@@ -239,6 +359,54 @@ impl App {
                 "capture cancelled, window closed, or surface became unavailable while waiting",
             );
         }
+    }
+
+    /// THE door every pixel capture enters: the `image` verb, a SIGUSR1
+    /// snapshot, the `window` verb, and a deferred capture once its GPU drawable
+    /// is ready ([`Self::resume_deferred_gpu_captures`]). It asks, in order:
+    /// whether a `window <target>` names a surface the front window shows
+    /// (`window_target_refusal`); whether the encoder has room for its bytes
+    /// ([`Self::admit_capture`]);
+    /// whether its caller still waits; and whether an earlier capture of the
+    /// same window already waits for a drawable, in which case this one queues
+    /// behind it to keep control order. Only then does the verb's body run, with
+    /// a fresh present budget, except a deferred capture's replay, which keeps
+    /// the budget it waited with.
+    pub(crate) fn run_capture(&mut self, request: CaptureRequest) {
+        #[cfg(any(target_os = "macos", windows))]
+        if let CaptureRequest::Window(window) = &request
+            && let Some(refusal) = self.window_target_refusal(window.aux)
+        {
+            request.reject(&refusal);
+            return;
+        }
+        let wid = request.target_window(self);
+        if !self.admit_capture(wid, request.charge()) {
+            request.reject_busy();
+            return;
+        }
+        self.prune_deferred_gpu_captures();
+        if let Some(cancelled) = request.cancellation() {
+            request.reject(cancelled);
+        } else if let Some(window) = wid
+            && self.replaying_gpu_capture != wid
+            && self.has_deferred_gpu_capture(window)
+        {
+            self.queue_gpu_capture(window, request, false);
+        } else {
+            if wid.is_none() || self.replaying_gpu_capture != wid {
+                self.capture_present_budget = CapturePresentBudget::default();
+            }
+            match request {
+                CaptureRequest::Image(request) => self.image_body(wid, request),
+                CaptureRequest::Snapshot { path } => self.snapshot_body(wid, path),
+                #[cfg(any(target_os = "macos", windows))]
+                CaptureRequest::Window(request) => self.window_body(wid, request),
+            }
+        }
+        // A body that deferred, refused or replied without an encode job
+        // leaves its permit here: release it.
+        self.capture_permit = None;
     }
 
     /// Consume waiting control demand before an ordinary ready redraw can take
@@ -263,7 +431,11 @@ impl App {
                 .windows
                 .get(&window)
                 .and_then(|state| state.current_gpu_acquire_id());
-            if !deferred_capture_identity_matches(surface, current, capture.request.cancelled()) {
+            if !deferred_capture_identity_matches(
+                surface,
+                current,
+                capture.request.cancellation().is_some(),
+            ) {
                 if deferred_capture_owns_current_tap(capture.exact_tap, surface, current) {
                     self.discard_presented_client_capture(window);
                 }
@@ -278,51 +450,13 @@ impl App {
                 .windows
                 .get(&window)
                 .map_or(0, |state| state.capture_present_serial);
-            match capture.request {
-                DeferredGpuCaptureRequest::Image(request) => {
-                    let resolved = match request.session {
-                        Some(session) => self.windows_displaying(session).next(),
-                        None => self.frontmost_window,
-                    };
-                    if resolved == Some(window) {
-                        self.render_image(request);
-                    } else {
-                        DeferredGpuCaptureRequest::Image(request)
-                            .reject("image target changed while waiting for GPU acquisition");
-                    }
-                }
-                DeferredGpuCaptureRequest::Snapshot { path } => {
-                    if self.frontmost_window == Some(window) {
-                        self.snapshot_at_path(path);
-                    } else {
-                        DeferredGpuCaptureRequest::Snapshot { path }
-                            .reject("snapshot target changed while waiting for GPU acquisition");
-                    }
-                }
-                #[cfg(target_os = "macos")]
-                DeferredGpuCaptureRequest::Window {
-                    handoff,
-                    target,
-                    cancel,
-                    reply,
-                } => {
-                    self.capture_window_of(Some(window), handoff, target, cancel, reply);
-                }
-                #[cfg(windows)]
-                DeferredGpuCaptureRequest::Window {
-                    handoff,
-                    target,
-                    cancel,
-                    reply,
-                } => {
-                    if self.frontmost_window == Some(window) {
-                        self.capture_window(handoff, target, cancel, reply);
-                    } else {
-                        let _ = reply.send(Err(
-                            "window capture target changed while waiting".to_string()
-                        ));
-                    }
-                }
+            let request = capture.request;
+            #[cfg(target_os = "macos")]
+            let request = request.bound_to(window);
+            if request.target_window(self) == Some(window) {
+                self.run_capture(request);
+            } else {
+                request.reject_retargeted();
             }
             self.replaying_gpu_capture = None;
             // The replay either consumed its tap or requeued that same owner.
@@ -372,51 +506,73 @@ const CAPTURE_BIRTH_MAX_AGE: Duration = Duration::from_secs(10);
 /// surface whose redraw was occluded.
 const CAPTURE_PREVIEW_AGE: Duration = Duration::from_millis(450);
 
-/// One terminal capture authorized by an application present submission that
-/// completed in the same synchronous main-thread call. The owned input is cloned only for
-/// an explicit capture (never on the present hot path), before any terminal,
-/// layout, cursor-effect, resize, or DPI state can be staged again.
-struct PresentedTerminalCapture {
-    input: aterm_render::RenderInput,
-    grid: crate::app_render::TerminalCaptureGrid,
-    invert: bool,
-    overlay: Option<OverlayGlow>,
-    serial: u64,
-    cell_size: (usize, usize),
-    theme_fingerprint: u64,
-    overlay_fingerprint: u64,
+/// What a capture takes from the present its barrier forces
+/// ([`App::present_before_capture`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentTake {
+    /// The serial and the host visuals: the capture reads the window's model
+    /// (text, hashes) or rerenders it.
+    Model,
+    /// Also the exact client destination that present submitted, copied by
+    /// the one-shot tap armed for it. A tap that cannot be armed or taken
+    /// fails the attempt.
+    ClientTap,
+    /// The client destination when the tap copies it, else the model: a tap
+    /// that cannot be armed lets the present run without it, and one that
+    /// cannot be taken binds the present without its destination, so the
+    /// capture rerenders the presented model instead of failing.
+    ClientTapOrModel,
 }
 
-#[derive(Clone, Copy)]
-struct PresentedTerminalAuthority {
-    invert: bool,
-    overlay: Option<OverlayGlow>,
-    serial: u64,
-    cell_size: (usize, usize),
-    theme_fingerprint: u64,
-    overlay_fingerprint: u64,
+/// Whether a capture of a window can force a present of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureTarget {
+    /// It presents to a surface: a capture is bound to a present it forces.
+    Windowed,
+    /// No surface: a capture stages its own frame.
+    Headless,
 }
 
-/// Route-neutral owned projection of one application present submission. Native and
-/// heterogeneous captures have no all-terminal leaf inventory, but they share
-/// the same serial, pixel input, host effects, and renderer geometry authority.
-#[derive(Clone)]
-struct PresentedFrameCapture {
-    input: aterm_render::RenderInput,
-    invert: bool,
-    overlay: Option<OverlayGlow>,
+/// One successful application present a capture is bound to: its serial and
+/// the host visuals committed beside it, plus the exact destination when the
+/// barrier tapped it. It owns no model. A barrier's present and the capture
+/// that reads it run in one synchronous main-thread turn, so the window's
+/// `input_scratch` is the presented model until that turn yields: text and
+/// hashes borrow it, and only a rerender takes an owned copy
+/// ([`App::take_rerender_input`]). A recording's still carries the recorded
+/// present's serial and visuals here and its resident model beside it
+/// ([`RecordingPresentedFrame`]).
+#[derive(Debug)]
+struct PresentedCapture {
     serial: u64,
+    visuals: crate::app_render::HostVisualState,
+    /// `Some` for [`PresentTake::ClientTap`], and for
+    /// [`PresentTake::ClientTapOrModel`] when its tap copied the destination:
+    /// the whole client destination, as the present's surface holds it.
+    client: Option<CapturePixels>,
 }
 
 /// One recording-owned successful-present tuple resolved against the GPU's
 /// still-resident input epoch. Every validation happens before the input clone;
 /// callers then own an immutable model while this main-thread request renders.
 struct RecordingPresentedFrame {
-    frame: PresentedFrameCapture,
+    presented: PresentedCapture,
+    /// The model the recorded present rendered, cloned from the GPU's resident
+    /// copy: the window's scratch may already hold a newer one.
+    input: aterm_render::RenderInput,
     terminal_grid: Option<crate::app_render::TerminalCaptureGrid>,
+    facts: RecordedFacts,
+}
+
+/// What a headless recording froze at its present, which a still of it reads
+/// in place of the live values: the window's renderer state may have moved on
+/// since, and the still describes the recorded frame.
+struct RecordedFacts {
     cell_size: (usize, usize),
     theme_fingerprint: u64,
     overlay_fingerprint: u64,
+    /// The native or mixed frame's metadata, built when the still asked for it;
+    /// the encoded frame's size and pixel fingerprint are filled in later.
     native_metadata: Option<crate::control::ImageFrameMetadata>,
 }
 
@@ -425,21 +581,211 @@ struct RecordingPresentedFrame {
 /// independent of the semantic resident model: later renderer/card state may
 /// change while these already-presented bytes remain authoritative.
 struct RecordingPresentedDestination {
-    frame: Frame,
+    pixels: CapturePixels,
     route: crate::VisibleContentRoute,
     serial: u64,
 }
 
-/// Full-window capture authority produced by one successful surface
-/// transaction: the serial proves ordering, while `client` is the exact raw
-/// destination copied from that same CPU softbuffer or GPU swapchain present.
-struct PresentedWindowCapture {
-    /// Re-checked against the window's live present serial by the macOS and
-    /// Windows photograph paths; Linux has no platform photograph.
+/// What a capture asks of its source ([`App::resolve_capture_source`]).
+#[derive(Clone, Copy, Debug)]
+struct SourcePolicy {
+    /// Whether the frame is the destination a present submitted
+    /// ([`capture_source_kind`]).
+    destination: DestinationDemand,
+    /// The sink encodes the frame, not the surface around it: a window's
+    /// tapped destination is cut back to the frame its present placed
+    /// (`image`). A snapshot writes the whole client destination, bands
+    /// included.
+    frame_only: bool,
+    /// The sink reads the frame's model beside its pixels (snapshot text,
+    /// image metadata), so a headless recording's destination also brings the
+    /// resident model the recording validated.
+    model: bool,
+    /// The sink builds `image --meta`: a recorded frame's metadata is frozen
+    /// with it, and a presented terminal frame brings its inventory.
+    metadata: bool,
+}
+
+/// Whether a capture's frame is the destination a present submitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DestinationDemand {
+    /// Never: the frame is a rerender with the host bling layers emptied
+    /// (`image plain`).
+    Never,
+    /// Whenever the destination shows what the window shows and can be
+    /// copied as it is; otherwise, or when the tap fails, a rerender
+    /// (`image`).
+    Preferred,
+    /// Always: a window the platform guards refuse is refused (the SIGUSR1
+    /// snapshot).
+    Required,
+}
+
+impl DestinationDemand {
+    /// An `image`'s: `image plain` (`clean`) never takes the destination, any
+    /// other `image` prefers it.
+    fn of_image(clean: bool) -> Self {
+        if clean { Self::Never } else { Self::Preferred }
+    }
+}
+
+/// What a capture may be made from, which sizes the bytes it is admitted with
+/// ([`App::capture_bytes_estimate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureCharge {
+    /// A frame of the window (`image`, a SIGUSR1 snapshot): a rerender, or,
+    /// unless the demand is [`DestinationDemand::Never`], the destination a
+    /// present submitted.
+    Frame(DestinationDemand),
+    /// `window`: the platform photograph with the presented client stitched
+    /// in ([`WindowStitch`]).
     #[cfg(any(target_os = "macos", windows))]
-    serial: u64,
-    client: crate::PresentedClientFrame,
-    frame: PresentedFrameCapture,
+    Window,
+}
+
+/// What a capture's frame is made from ([`capture_source_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceKind {
+    /// The destination a present submitted: the barrier's tap of a window's
+    /// own present, or a headless recording's virtual target.
+    Destination,
+    /// A rerender of the model.
+    Rerender,
+}
+
+/// The facts of a capture's window that choose its source
+/// ([`capture_source_kind`]).
+#[derive(Clone, Copy, Debug)]
+struct SourceFacts {
+    /// The window presents to a surface ([`CaptureTarget::Windowed`]).
+    windowed: bool,
+    /// The window presents a translucent client layer
+    /// ([`App::client_is_translucent`]): on every platform its destination is
+    /// the layer before anything is put behind its alpha, not what the window
+    /// shows.
+    translucent: bool,
+    /// The platform guards on a copy of the window's client layer
+    /// ([`App::client_capture_guards`]): `Err` when the compositor blends it
+    /// with what is behind the window, or with a backdrop material.
+    guards: Result<(), &'static str>,
+    /// The window's present can be tapped: its surface offers a copy of its
+    /// destination ([`App::client_tap_is_copyable`]).
+    copyable: bool,
+    /// A recording of this window is running.
+    recording: bool,
+}
+
+/// THE source decision for every capture that does not photograph the
+/// platform window (`image`, the SIGUSR1 snapshot). A window's own present is
+/// tapped when the capture wants its destination, the copy shows what the
+/// window shows (an opaque client the platform guards admit) and the surface
+/// offers one; a capture that requires the destination is
+/// refused by the guards instead, and leaves a failed copy to the barrier. A
+/// headless window's glass is its recording's virtual target, when one runs.
+/// Anything else is a rerender. `Err` is a required destination the guards
+/// refuse.
+fn capture_source_kind(
+    demand: DestinationDemand,
+    facts: SourceFacts,
+) -> Result<SourceKind, &'static str> {
+    let destination = match demand {
+        DestinationDemand::Never => false,
+        _ if !facts.windowed => facts.recording,
+        DestinationDemand::Required => {
+            facts.guards?;
+            true
+        }
+        DestinationDemand::Preferred => {
+            !facts.translucent && facts.guards.is_ok() && facts.copyable
+        }
+    };
+    Ok(if destination {
+        SourceKind::Destination
+    } else {
+        SourceKind::Rerender
+    })
+}
+
+/// Where a capture's pixels come from, chosen once per capture
+/// ([`App::resolve_capture_source`]).
+enum CaptureSource {
+    /// Pixels a present already produced, encoded as they are: the client
+    /// destination the barrier tapped, or a headless recording's virtual
+    /// target. They already hold the tray, the host visuals and the GPU-only
+    /// passes, so nothing is layered on them again.
+    Destination { pixels: CapturePixels, serial: u64 },
+    /// The model, rasterized by [`App::rerender_capture`] under `visuals`:
+    /// those retained beside the present `serial` names, or, for a frame
+    /// staged in this turn (`serial: None`), the host policy sampled then.
+    Rerender {
+        serial: Option<u64>,
+        visuals: crate::app_render::HostVisualState,
+    },
+}
+
+impl CaptureSource {
+    /// The present this frame is bound to; `None` for a frame staged in this
+    /// turn.
+    fn serial(&self) -> Option<u64> {
+        match *self {
+            Self::Destination { serial, .. } => Some(serial),
+            Self::Rerender { serial, .. } => serial,
+        }
+    }
+
+    /// `frame-phase`: `destination` for the pixels a present submitted,
+    /// `presented` for a rerender of the model a present rendered, `staged`
+    /// for a rerender of a frame staged in this turn.
+    fn phase(&self) -> &'static str {
+        match self {
+            Self::Destination { .. } => "destination",
+            Self::Rerender {
+                serial: Some(_), ..
+            } => "presented",
+            Self::Rerender { serial: None, .. } => "staged",
+        }
+    }
+}
+
+/// The layout and facts a capture's sink reads beside its pixels.
+struct CaptureContext {
+    /// The plan and route the frame was laid out from: the request layout, or
+    /// the plan a headless staging returned. A recording's destination taken
+    /// without its model (an `image` without metadata) is encoded as it is,
+    /// and its sink reads neither.
+    plan: crate::tab_model::VisibleLeafPlan,
+    route: crate::VisibleContentRoute,
+    /// A terminal frame's inventory: the staging's, the recording's, or, for
+    /// a sink that builds metadata, the one the barrier's present filled.
+    terminal_grid: Option<crate::app_render::TerminalCaptureGrid>,
+    /// Facts frozen at a headless recording's present; `None` reads them live.
+    recorded: Option<RecordedFacts>,
+}
+
+/// One capture resolved to its source ([`App::resolve_capture_source`]).
+struct ResolvedCapture {
+    source: CaptureSource,
+    /// The model the frame shows. `None`: the window's `input_scratch`, which
+    /// the barrier's present or this turn's staging filled, and which a
+    /// rerender copies ([`App::take_rerender_input`]). `Some`: the model a
+    /// headless recording presented, owned.
+    model: Option<aterm_render::RenderInput>,
+    context: CaptureContext,
+}
+
+/// Why a capture has no source this turn. Each verb answers in its own words.
+#[derive(Debug)]
+enum CaptureDeferral {
+    /// Nothing to capture this frame: no visible layout, or a staging that
+    /// found nothing to draw (`image` answers `0 0`).
+    Nothing,
+    /// A synchronized terminal update holds the staging until `retry_at`.
+    Held { retry_at: Instant },
+    /// The barrier waits for its GPU drawable: the caller queues its request
+    /// ([`App::queue_gpu_capture`]).
+    PendingGpu,
+    /// The capture cannot be taken.
+    Refused(String),
 }
 
 /// Borrowed visible-layout authority valid only for one synchronous main-loop
@@ -451,92 +797,457 @@ type VisibleFrameLayoutRef<'a> = (
     crate::VisibleContentRoute,
 );
 
+/// What an `image --meta` reads of the frame it describes, beside the model
+/// and layout: its pixels' fingerprint is the encode worker's to fill in
+/// ([`PendingMetadata`]).
 #[derive(Clone, Copy)]
 struct ImageFrameFacts {
     phase: &'static str,
     capture_serial: Option<u64>,
     width: u32,
     height: u32,
-    pixel_fingerprint: u64,
 }
 
-/// One `image` request already resolved to the window it renders, on its way to
-/// the compiled native/heterogeneous route.
-///
-/// Every field but `front` and `presented` is carried verbatim from [`ImageReq`]
-/// and documented there. They travel as one value because they ARE one request:
-/// `render_image` only chooses the route and forwards them, so nothing here may
-/// be re-derived or reordered on the way through.
-struct NativeImageRequest<'a> {
-    /// The window `render_image` resolved — the frontmost one, or the window
-    /// whose active tab displays a cross-session `@<sid> image`.
-    front: WindowId,
-    clean: bool,
-    /// The successful application present this capture is bound to. `None` means
-    /// no present authority exists, so the route stages its own input scratch.
-    presented: Option<PresentedFrameCapture>,
-    /// Canonical layout already resolved by `render_image` in this same
-    /// synchronous control turn. Direct test callers and presented-authority
-    /// captures leave it absent and resolve or ignore geometry as appropriate.
-    request_layout: Option<(
-        crate::tab_model::VisibleLeafPlan,
-        crate::VisibleContentRoute,
-    )>,
-    /// Success-time template carried only by a headless recording artifact.
-    /// Windowed synchronous captures build metadata immediately from the same
-    /// successful-present turn and therefore leave this `None`.
-    presented_metadata: Option<crate::control::ImageFrameMetadata>,
-    /// Exact current VirtualTarget pixels for a non-clean headless recording
-    /// image. Semantic `presented` data may still supply metadata, but these
-    /// bytes bypass every reraster and host-chrome recomposition step.
-    exact_frame: Option<Frame>,
-    target: crate::control_auth::ConfinedImage,
-    want_bytes: bool,
-    want_metadata: bool,
-    cancel: crate::control::CaptureCancellation,
-    frame_metadata: &'a std::sync::Arc<std::sync::OnceLock<crate::control::ImageFrameMetadata>>,
-    reply: std::sync::mpsc::Sender<crate::control::ImageReply>,
-    /// Last so whole-request teardown releases every accounted buffer and
-    /// filesystem capability before returning admission capacity.
-    handoff: crate::control::ReplyRetentionPermit,
+/// An `image --meta` built on the main thread from the model, layout and
+/// rasters its frame was made from, which the encode worker completes with
+/// the `pixel-fingerprint` of the pixels it encodes and publishes before it
+/// answers ([`run_encode_job`]): the control thread reads it once the reply
+/// arrives.
+pub(crate) struct PendingMetadata {
+    metadata: crate::control::ImageFrameMetadata,
+    /// The frame's raster is its encoded pixels (a terminal frame): its
+    /// `raster-fingerprint`, and its singular leaf's, are the
+    /// `pixel-fingerprint`. A native frame's raster is the retained card,
+    /// hashed apart.
+    raster_is_pixels: bool,
+    cell: std::sync::Arc<std::sync::OnceLock<crate::control::ImageFrameMetadata>>,
 }
 
-/// Convert an exact straight-RGBA client destination into the renderer Frame
-/// container used by the snapshot encoder without changing dimensions or bytes.
-fn snapshot_frame_from_presented_client(
-    client: &crate::PresentedClientFrame,
-) -> Result<Frame, String> {
-    let width = usize::try_from(client.width)
-        .map_err(|_| "snapshot destination width does not fit memory".to_string())?;
-    let height = usize::try_from(client.height)
-        .map_err(|_| "snapshot destination height does not fit memory".to_string())?;
+impl PendingMetadata {
+    /// Fill in the encoded pixels' fingerprint and publish the metadata.
+    /// `Err` when the request's metadata was already published.
+    fn publish(self, pixel_fingerprint: u64) -> Result<(), String> {
+        let Self {
+            mut metadata,
+            raster_is_pixels,
+            cell,
+        } = self;
+        metadata.pixel_fingerprint = pixel_fingerprint;
+        if raster_is_pixels {
+            metadata.raster_fingerprint = pixel_fingerprint;
+            for leaf in &mut metadata.leaves {
+                if leaf.raster_fingerprint.is_some() {
+                    leaf.raster_fingerprint = Some(pixel_fingerprint);
+                }
+            }
+        }
+        cell.set(metadata)
+            .map_err(|_| "image metadata was already initialized".to_string())
+    }
+}
+
+/// A capture's pixels as their producer made them, moved to the encode worker
+/// as they are ([`EncodeJob`]): no producer converts one form into another, and
+/// the worker reads any form a row at a time ([`Self::rgba_row`]). A tapped
+/// destination is cut back to its frame by narrowing the part that is read
+/// ([`Self::cut_to`]), so the thread that took it moves no pixel.
+pub(crate) struct CapturePixels {
+    store: PixelStore,
+    /// The part of `store` that is the capture, in its pixels: all of it, or
+    /// the frame a present placed in its destination.
+    view: aterm_render::PixelRect,
+}
+
+impl std::fmt::Debug for CapturePixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let form = match &self.store {
+            PixelStore::Rgba8 { .. } => "rgba8",
+            PixelStore::Packed(_) => "packed",
+            PixelStore::Raw(_) => "raw",
+            PixelStore::Softbuffer { .. } => "softbuffer",
+        };
+        f.debug_struct("CapturePixels")
+            .field("form", &form)
+            .field("view", &self.view)
+            .finish()
+    }
+}
+
+/// The buffer a capture's pixels live in, in the form their producer made.
+enum PixelStore {
+    /// Straight-alpha RGBA8, tightly packed: a `window` photograph stitched on
+    /// the encode worker. Only [`CapturePixels::rgba8`] makes one; stock
+    /// rustc counts that expected-dead constructor as live, so the variant is
+    /// live there and an `expect` here goes unfulfilled, hence `allow`.
+    #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
+    Rgba8 { width: usize, bytes: Vec<u8> },
+    /// The renderer's packed `0xTTRRGGBB` frame: a rerender (the CPU raster or
+    /// the GPU readback).
+    Packed(Frame),
+    /// A GPU present's destination as its staging buffer mapped it, in the
+    /// swapchain's format and colour space: a windowed tap, or a headless
+    /// recording's virtual target.
+    Raw(aterm_gpu::video_tap::RawCapture),
+    /// A CPU present's softbuffer, packed `0x__RRGGBB`. The surface is opaque,
+    /// so the high byte never reached it: every pixel's alpha is 255.
+    Softbuffer { width: usize, pixels: Vec<u32> },
+}
+
+/// `Err` unless a buffer of `len` units is exactly `width · height` pixels of
+/// `per_pixel` units each.
+fn exact_pixels(
+    what: &str,
+    len: usize,
+    width: usize,
+    height: usize,
+    per_pixel: usize,
+) -> Result<(), String> {
     let expected = width
         .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "snapshot destination dimensions overflow".to_string())?;
-    if client.rgba.len() != expected {
+        .and_then(|pixels| pixels.checked_mul(per_pixel))
+        .ok_or_else(|| format!("{what} dimensions overflow"))?;
+    if len != expected {
         return Err(format!(
-            "snapshot destination has {} bytes, expected {expected}",
-            client.rgba.len()
+            "{what} holds {len} units, expected {expected} for {width}x{height}"
         ));
     }
-    let pixels = client
-        .rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|rgba| {
-            (u32::from(255 - rgba[3]) << 24)
-                | (u32::from(rgba[0]) << 16)
-                | (u32::from(rgba[1]) << 8)
-                | u32::from(rgba[2])
-        })
-        .collect();
-    Ok(Frame {
-        width,
-        height,
-        pixels,
-    })
+    Ok(())
+}
+
+impl CapturePixels {
+    fn whole(store: PixelStore, width: usize, height: usize) -> Self {
+        Self {
+            store,
+            view: aterm_render::PixelRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        }
+    }
+
+    /// Tightly packed straight RGBA8. `Err` unless `bytes` is
+    /// `4 · width · height` long.
+    #[cfg_attr(
+        not(any(target_os = "macos", windows, test)),
+        expect(dead_code, reason = "a window photograph is macOS's and Windows'")
+    )]
+    pub(crate) fn rgba8(width: u32, height: u32, bytes: Vec<u8>) -> Result<Self, String> {
+        let (width, height) = (width as usize, height as usize);
+        exact_pixels("capture RGBA", bytes.len(), width, height, 4)?;
+        Ok(Self::whole(
+            PixelStore::Rgba8 { width, bytes },
+            width,
+            height,
+        ))
+    }
+
+    /// A rerender's frame. `Err` unless it holds `width · height` pixels.
+    pub(crate) fn packed(frame: Frame) -> Result<Self, String> {
+        let (width, height) = (frame.width, frame.height);
+        exact_pixels("capture frame", frame.pixels.len(), width, height, 1)?;
+        Ok(Self::whole(PixelStore::Packed(frame), width, height))
+    }
+
+    /// A GPU present's destination as mapped, whose geometry its tap checked.
+    pub(crate) fn raw(raw: aterm_gpu::video_tap::RawCapture) -> Self {
+        let (width, height) = (raw.width() as usize, raw.height() as usize);
+        Self::whole(PixelStore::Raw(raw), width, height)
+    }
+
+    /// A CPU present's `width`×`height` softbuffer. `Err` unless it holds
+    /// `width · height` pixels.
+    pub(crate) fn softbuffer(
+        pixels: Vec<u32>,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, String> {
+        exact_pixels("capture softbuffer", pixels.len(), width, height, 1)?;
+        Ok(Self::whole(
+            PixelStore::Softbuffer { width, pixels },
+            width,
+            height,
+        ))
+    }
+
+    /// Narrow the capture to `rect` of its pixels. `Err` when `rect` is not
+    /// inside them.
+    fn cut_to(mut self, rect: aterm_render::PixelRect) -> Result<Self, String> {
+        let inside = |start: usize, len: usize, bound: usize| {
+            start.checked_add(len).is_some_and(|end| end <= bound)
+        };
+        if !inside(rect.x, rect.width, self.view.width)
+            || !inside(rect.y, rect.height, self.view.height)
+        {
+            return Err(format!(
+                "capture cut {rect:?} is outside its {}x{} pixels",
+                self.view.width, self.view.height
+            ));
+        }
+        self.view = aterm_render::PixelRect {
+            x: self.view.x + rect.x,
+            y: self.view.y + rect.y,
+            ..rect
+        };
+        Ok(self)
+    }
+
+    /// Width and height in pixels.
+    fn dims(&self) -> (usize, usize) {
+        (self.view.width, self.view.height)
+    }
+
+    /// What encoding this capture holds at most on the encode worker, for
+    /// [`CapturePermit::recharge`]: the pixels' allocation as they travel (a
+    /// destination cut to its frame keeps its surface's), the PNG they grow
+    /// into and the encoder's scratch ([`capture_encode_overhead`]). The
+    /// fingerprint's one row is read before the encode, inside that scratch.
+    fn peak_bytes(&self) -> usize {
+        let (width, height) = self.dims();
+        self.allocation()
+            .saturating_add(capture_encode_overhead(width, height))
+    }
+
+    /// The bytes the pixels' buffer holds: its allocation, whatever part of
+    /// it the capture is.
+    fn allocation(&self) -> usize {
+        match &self.store {
+            PixelStore::Rgba8 { bytes, .. } => bytes.capacity(),
+            PixelStore::Packed(frame) => frame
+                .pixels
+                .capacity()
+                .saturating_mul(std::mem::size_of::<u32>()),
+            PixelStore::Raw(raw) => raw.allocation(),
+            PixelStore::Softbuffer { pixels, .. } => {
+                pixels.capacity().saturating_mul(std::mem::size_of::<u32>())
+            }
+        }
+    }
+
+    /// Append row `y` as straight RGBA8: a packed pixel's alpha is
+    /// `255 - transmittance`, a softbuffer pixel's 255, a raw destination's
+    /// its conversion to sRGB. A row outside the capture appends nothing,
+    /// which the encoder refuses as a short row.
+    fn rgba_row(&self, y: usize, row: &mut Vec<u8>) {
+        let aterm_render::PixelRect {
+            x: x0,
+            y: y0,
+            width,
+            height,
+        } = self.view;
+        if y >= height {
+            return;
+        }
+        let y = y0 + y;
+        match &self.store {
+            PixelStore::Rgba8 {
+                width: stride,
+                bytes,
+            } => {
+                let start = (y * stride + x0) * 4;
+                if let Some(scanline) = bytes.get(start..start + width * 4) {
+                    row.extend_from_slice(scanline);
+                }
+            }
+            PixelStore::Packed(frame) => {
+                let start = y * frame.width + x0;
+                let Some(scanline) = frame.pixels.get(start..start + width) else {
+                    return;
+                };
+                for &pixel in scanline {
+                    // `as u8` keeps each channel's byte.
+                    row.extend_from_slice(&[
+                        (pixel >> 16) as u8,
+                        (pixel >> 8) as u8,
+                        pixel as u8,
+                        255 - (pixel >> 24) as u8,
+                    ]);
+                }
+            }
+            PixelStore::Raw(raw) => raw.rgba_row(y, x0, width, row),
+            PixelStore::Softbuffer {
+                width: stride,
+                pixels,
+            } => {
+                let start = y * stride + x0;
+                let Some(scanline) = pixels.get(start..start + width) else {
+                    return;
+                };
+                for &pixel in scanline {
+                    row.extend_from_slice(&[
+                        (pixel >> 16) as u8,
+                        (pixel >> 8) as u8,
+                        pixel as u8,
+                        u8::MAX,
+                    ]);
+                }
+            }
+        }
+    }
+
+    /// `pixel-fingerprint`: SipHash of the width, the height and the packed
+    /// `0xTTRRGGBB` pixels as one `[u32]`, whichever form the pixels travel
+    /// in. A packed frame's rows are hashed in place; any other form is
+    /// converted a row at a time and packed a block at a time into the same
+    /// hasher input, never as a copy of the frame. Runs on the encode worker.
+    fn pixel_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        note_pixel_work();
+        let (width, height) = self.dims();
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        width.hash(&mut hash);
+        height.hash(&mut hash);
+        // `<[u32]>::hash`: the length, then every pixel's bytes in one stream,
+        // which the hasher folds the same however it is split.
+        width.saturating_mul(height).hash(&mut hash);
+        if let PixelStore::Packed(frame) = &self.store {
+            for y in self.view.y..self.view.y + height {
+                let start = y * frame.width + self.view.x;
+                u32::hash_slice(&frame.pixels[start..start + width], &mut hash);
+            }
+            return hash.finish() | 1;
+        }
+        let mut row = Vec::with_capacity(width.saturating_mul(4));
+        let mut block = [0u32; 1024];
+        for y in 0..height {
+            row.clear();
+            self.rgba_row(y, &mut row);
+            for pixels in row.as_chunks::<4>().0.chunks(block.len()) {
+                for (packed, &[r, g, b, a]) in block.iter_mut().zip(pixels) {
+                    *packed = (u32::from(255 - a) << 24)
+                        | (u32::from(r) << 16)
+                        | (u32::from(g) << 8)
+                        | u32::from(b);
+                }
+                u32::hash_slice(&block[..pixels.len()], &mut hash);
+            }
+        }
+        hash.finish() | 1
+    }
+}
+
+/// What a `width` x `height` capture's encode holds beside its pixels: the
+/// PNG, which the encoder writes into a buffer reserved to its bound
+/// ([`aterm_png::max_encoded_len`]), and the encoder's scratch
+/// ([`aterm_png::encoder_scratch_len`]). Geometry no PNG can hold charges
+/// everything: its encode is refused, but nothing is admitted beside it.
+fn capture_encode_overhead(width: usize, height: usize) -> usize {
+    let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+        return usize::MAX;
+    };
+    let png = aterm_png::max_encoded_len(width, height, aterm_png::ColorType::Rgba);
+    let scratch = aterm_png::encoder_scratch_len(width, aterm_png::ColorType::Rgba);
+    png.zip(scratch)
+        .and_then(|(png, scratch)| png.checked_add(scratch))
+        .unwrap_or(usize::MAX)
+}
+
+/// What a capture of a `width`×`height` frame holds until its encode is done,
+/// as [`CapturePixels::peak_bytes`] counts it: the larger of its rerender's
+/// packed frame (four bytes a pixel) and `destination`, the allocation of a
+/// destination a present submitted, which travels whole however it is cut to
+/// the frame (an f16 swapchain's eight bytes a pixel, padded rows); plus the
+/// frame's encode ([`capture_encode_overhead`]).
+fn frame_capture_peak(width: usize, height: usize, destination: Option<usize>) -> usize {
+    width
+        .saturating_mul(height)
+        .saturating_mul(4)
+        .max(destination.unwrap_or(0))
+        .saturating_add(capture_encode_overhead(width, height))
+}
+
+/// One encoded capture: the PNG and the size it shows, which the reply and a
+/// snapshot's `.done` marker name once the pixels, and the capture bytes they
+/// held, are gone (the encode worker drops both before it answers:
+/// [`run_encode_job`]).
+pub(crate) struct CapturePng {
+    width: u32,
+    height: u32,
+    png: Vec<u8>,
+}
+
+impl CapturePng {
+    /// THE capture encoder: 8-bit RGBA with an `sRGB` chunk (intent
+    /// Perceptual; a frame's RGB is non-linear sRGB, so wide-gamut viewers need
+    /// not guess), converted, filtered and compressed a row at a time from the
+    /// pixels as they travel. Runs on the encode worker. An error is an answer,
+    /// never a worker panic.
+    pub(crate) fn encode(pixels: &CapturePixels) -> Result<Self, String> {
+        note_pixel_work();
+        let (width, height) = pixels.dims();
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+            return Err("capture is larger than a PNG can describe".to_string());
+        };
+        let png = encode_srgb_rgba8(width, height, |writer| {
+            writer.write_rows(|y, row| pixels.rgba_row(y, row))
+        })?;
+        Ok(Self { width, height, png })
+    }
+}
+
+/// A fixture frame encoded as a rerender's capture is.
+#[cfg(test)]
+pub(crate) fn encode_frame_png(frame: &Frame) -> CapturePng {
+    CapturePixels::packed(frame.clone())
+        .and_then(|pixels| CapturePng::encode(&pixels))
+        .expect("a fixture frame encodes")
+}
+
+/// Run `write` on an 8-bit RGBA sRGB (Perceptual) PNG writer whose sink is
+/// reserved to the file's bound, so the encode never reallocates it and holds
+/// at most [`capture_encode_overhead`] beside its pixels.
+fn encode_srgb_rgba8(
+    width: u32,
+    height: u32,
+    write: impl FnOnce(&mut aterm_png::Writer<&mut Vec<u8>>) -> Result<(), aterm_png::EncodingError>,
+) -> Result<Vec<u8>, String> {
+    let bound = aterm_png::max_encoded_len(width, height, aterm_png::ColorType::Rgba)
+        .ok_or_else(|| "capture is larger than a PNG can describe".to_string())?;
+    let mut out = Vec::with_capacity(bound);
+    {
+        let mut encoder = aterm_png::Encoder::new(&mut out, width, height);
+        encoder.set_color(aterm_png::ColorType::Rgba);
+        encoder.set_depth(aterm_png::BitDepth::Eight);
+        encoder.set_source_srgb(aterm_png::SrgbRenderingIntent::Perceptual);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        write(&mut writer).map_err(|e| e.to_string())?;
+        writer.finish().map_err(|e| e.to_string())?;
+    }
+    out.shrink_to_fit();
+    Ok(out)
+}
+
+/// `raster-fingerprint` of a retained RGBA raster: its size and its bytes.
+fn hash_raster(width: u32, height: u32, rgba: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hash);
+    height.hash(&mut hash);
+    rgba.hash(&mut hash);
+    hash.finish() | 1
+}
+
+impl crate::SettingsCard {
+    /// This card's `raster-fingerprint`, hashed once per card: every capture
+    /// of an unchanged card reads the first hash.
+    pub(crate) fn raster_fingerprint(&self) -> u64 {
+        *self
+            .raster_fingerprint_once
+            .get_or_init(|| hash_raster(self.pw, self.ph, &self.rgba))
+    }
+}
+
+impl crate::NativeLeafRaster {
+    /// This raster's `raster-fingerprint`, hashed once per raster pass: every
+    /// capture until the next pass reads the first hash.
+    fn raster_fingerprint(&self) -> u64 {
+        *self
+            .raster_fingerprint_once
+            .get_or_init(|| hash_raster(self.width, self.height, &self.rgba))
+    }
 }
 
 fn bounded_capture_birth(now: Instant, pending: Option<Instant>) -> Option<Instant> {
@@ -730,20 +1441,33 @@ fn strip_version_chrome_line(
     }
 }
 
-/// A finished capture handed OFF the winit event-loop thread for PNG encode +
-/// confined write. A Retina-sized deflate is a 50–150 ms stall, so the encode
+/// A captured frame handed OFF the winit event-loop thread, which only took its
+/// pixels, for every pixel pass after that: the conversion of a mapped
+/// destination, the cut, the fingerprint, the PNG encode, and the confined
+/// write. A Retina-sized deflate alone is a 50–150 ms stall, so the encode
 /// worker owns it. Only after the write completes does the worker transfer a
 /// guarded result to the control thread. File guards are revalidated and
 /// retained through the complete response and explicit client ACK; inline PNG
 /// memory is retained through the bounded write and flush.
+#[cfg_attr(
+    not(any(target_os = "macos", windows)),
+    expect(
+        clippy::large_enum_variant,
+        reason = "without a window photograph's variant (macOS, Windows) an image job is the \
+                  largest by far; a job is one per capture, moved once"
+    )
+)]
 pub(crate) enum EncodeJob {
-    /// The `image` verb's fully-composited application framebuffer (every
-    /// app-owned splice/overlay is baked in before the `Frame` is moved here). A failed
+    /// The `image` verb's fully-composited application frame (every app-owned
+    /// splice/overlay is baked in before the pixels are moved here). A failed
     /// encode/write replies `Err` so the client is never told `OK` for a file
     /// that does not exist ("OK means the file is on disk" is the protocol
     /// contract). `Ok((0, 0))` stays the render's no-window sentinel.
     Image {
-        frame: Frame,
+        pixels: CapturePixels,
+        /// `image --meta`: published with the pixels' fingerprint before the
+        /// reply is sent.
+        metadata: Option<PendingMetadata>,
         target: control_auth::ConfinedImage,
         /// `image --bytes`: return the PNG in the reply instead of writing `target`.
         want_bytes: bool,
@@ -754,23 +1478,22 @@ pub(crate) enum EncodeJob {
         handoff: crate::control::ReplyRetentionPermit,
     },
     /// SIGUSR1 `snapshot` output (PNG + parallel .txt + .done marker). The frame
-    /// is fully composited on the main thread; only the deflate + writes run
-    /// here — the same 50–150 ms Retina stall the `image` verb already routes
-    /// around. No reply channel: the `.done` marker file IS the completion
+    /// is fully composited before it is moved here; its conversion, deflate and
+    /// writes run here — the same 50–150 ms Retina stall the `image` verb
+    /// already routes around. No reply channel: the `.done` marker file IS the completion
     /// signal (requesters stat() for it; stderr is unreliable for GUIs).
     Snapshot {
-        frame: Frame,
+        pixels: CapturePixels,
         text: String,
         transaction: SnapshotTransaction,
     },
-    /// A `window`/`window <aux>` capture: tightly-packed RGBA8 pixels photographed
-    /// on the main thread (macOS: CGWindowList; Windows: `PrintWindow` — both need
-    /// main-thread window state); only the encode + write run here.
+    /// A `window`/`window <aux>` capture: the platform photograph taken on the
+    /// main thread (macOS: CGWindowList; Windows: `PrintWindow` — both need
+    /// main-thread window state) with the presented client it frames; the
+    /// stitch ([`WindowStitch::finish`]), the encode and the write run here.
     #[cfg(any(target_os = "macos", windows))]
-    WindowRgba {
-        rgba: Vec<u8>,
-        width: u32,
-        height: u32,
+    Window {
+        stitch: WindowStitch,
         target: control_auth::ConfinedImage,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
@@ -836,21 +1559,26 @@ pub(crate) enum EncodeJob {
 const ENCODE_QUEUE_CAPACITY: usize = 4;
 
 /// THE CAPTURE BYTE BUDGET (docs/AUDIT-performance-quality-2026-08-29.md P2):
-/// the most full-frame capture bytes that may be held between the event loop's
-/// decision to photograph and the encode worker finishing with the pixels. The
-/// count bound above admits five framebuffers whatever their size — five 5K
-/// Retina frames are ~280 MiB — and was checked only AFTER the event loop had
-/// already captured and read back the frame it then threw away. This budget is
-/// checked BEFORE the capture: a saturated encoder answers busy without taking
-/// the photograph at all. Sized for about two full-screen Retina frames; one
-/// capture larger than the whole budget is still admitted when nothing else is
-/// in flight, so no window is ever too big to photograph.
+/// the most capture bytes that may be held between the event loop's decision
+/// to photograph and the encode worker finishing with the pixels, each capture
+/// charged its pixels plus its encode's working set
+/// ([`CapturePixels::peak_bytes`]: the PNG at its worst-case size and the
+/// encoder's scratch). The count bound above admits five framebuffers whatever
+/// their size — five 5K Retina frames are ~280 MiB — and was checked only AFTER
+/// the event loop had already captured and read back the frame it then threw
+/// away. This budget is checked BEFORE the capture: a saturated encoder answers
+/// busy without taking the photograph at all. A full-screen Retina capture
+/// (2880x1800) charges about 45 MB, so one fills most of it while several
+/// window-sized ones fit; one capture larger than the whole budget is still
+/// admitted when nothing else is in flight, so no window is ever too big to
+/// photograph.
 const CAPTURE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
-/// One capture's framebuffer bytes, reserved from the App's in-flight counter
-/// BEFORE the photograph ([`App::admit_capture`]) and released when the
-/// permit drops — after the encode worker finishes the job it rides with, or
-/// on any path that rejects, cancels or abandons it, so none can leak.
+/// One capture's bytes ([`CapturePixels::peak_bytes`]), reserved from the
+/// App's in-flight counter BEFORE the photograph ([`App::admit_capture`]) and
+/// released when the permit drops — after the encode worker finishes the job
+/// it rides with, or on any path that rejects, cancels or abandons it, so none
+/// can leak.
 pub(crate) struct CapturePermit {
     held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     bytes: usize,
@@ -905,14 +1633,14 @@ pub(crate) struct EncodeWork {
 }
 
 impl EncodeJob {
-    /// The framebuffer bytes this job carries, for [`CapturePermit::recharge`].
-    fn frame_bytes(&self) -> usize {
+    /// What this job holds at most until its encode is done, for
+    /// [`CapturePermit::recharge`] ([`CapturePixels::peak_bytes`]). A video
+    /// dump is budgeted at its recording.
+    fn peak_bytes(&self) -> usize {
         match self {
-            Self::Image { frame, .. } | Self::Snapshot { frame, .. } => {
-                frame.width.saturating_mul(frame.height).saturating_mul(4)
-            }
+            Self::Image { pixels, .. } | Self::Snapshot { pixels, .. } => pixels.peak_bytes(),
             #[cfg(any(target_os = "macos", windows))]
-            Self::WindowRgba { rgba, .. } => rgba.len(),
+            Self::Window { stitch, .. } => stitch.peak_bytes(),
             Self::VideoDump { .. } => 0,
         }
     }
@@ -929,10 +1657,47 @@ thread_local! {
 static ENCODE_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
     std::sync::Mutex::new(Vec::new());
 
+/// The threads that ran a whole-frame pixel pass of a capture (a conversion,
+/// fingerprint, stitch or encode) — the test seam that proves the thread
+/// that took the capture ran none.
+#[cfg(test)]
+static PIXEL_WORK_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that this thread runs a capture's whole-frame pixel pass (tests
+/// only; a no-op in shipping builds).
+fn note_pixel_work() {
+    #[cfg(test)]
+    {
+        let id = std::thread::current().id();
+        let mut threads = PIXEL_WORK_THREADS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !threads.contains(&id) {
+            threads.push(id);
+        }
+    }
+}
+
+/// Whether `thread` ran a capture's whole-frame pixel pass.
+#[cfg(test)]
+pub(crate) fn ran_pixel_work(thread: std::thread::ThreadId) -> bool {
+    PIXEL_WORK_THREADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&thread)
+}
+
 /// Count an admitted capture body (tests only; a no-op in shipping builds).
 fn note_capture_body() {
     #[cfg(test)]
     CAPTURE_BODIES.with(|bodies| bodies.set(bodies.get() + 1));
+}
+
+/// The capture bodies admitted on this thread so far.
+#[cfg(test)]
+pub(crate) fn capture_bodies() -> u64 {
+    CAPTURE_BODIES.with(std::cell::Cell::get)
 }
 
 const ENCODE_QUEUE_FULL: &str = "encode queue full; retry";
@@ -953,7 +1718,7 @@ fn reject_encode_job(mut job: EncodeJob, reason: &str) {
             );
         }
         #[cfg(any(target_os = "macos", windows))]
-        EncodeJob::WindowRgba { target, reply, .. } => {
+        EncodeJob::Window { target, reply, .. } => {
             crate::control_auth::cleanup_failed_automatic_image(target);
             let _ = reply.send(Err(format!("window capture {reason}")));
         }
@@ -1128,31 +1893,11 @@ pub(crate) fn begin_snapshot_generation(
     )
 )]
 pub(crate) fn write_snapshot_artifacts(
-    encoded: &SnapshotPng,
+    encoded: &CapturePng,
     text: &str,
     transaction: &SnapshotTransaction,
 ) -> Result<(), String> {
     write_snapshot_artifacts_with_hook(encoded, text, transaction, || {})
-}
-
-/// A snapshot's frame, encoded: the PNG and the size its `.done` marker
-/// names — all the transaction needs once the raw framebuffer, and the
-/// capture bytes it held, are gone (the encode worker drops both before
-/// `.done` can answer: [`run_encode_job`]).
-pub(crate) struct SnapshotPng {
-    width: usize,
-    height: usize,
-    png: Vec<u8>,
-}
-
-impl SnapshotPng {
-    pub(crate) fn encode(frame: &Frame) -> Self {
-        Self {
-            width: frame.width,
-            height: frame.height,
-            png: frame.to_png(),
-        }
-    }
 }
 
 /// Transactional implementation with a seam used by the deterministic
@@ -1160,7 +1905,7 @@ impl SnapshotPng {
 /// lock; every shared-path write happens after the generation check and while
 /// the lock remains held through `.done`.
 fn write_snapshot_artifacts_with_hook(
-    encoded: &SnapshotPng,
+    encoded: &CapturePng,
     text: &str,
     transaction: &SnapshotTransaction,
     before_done: impl FnOnce(),
@@ -1650,7 +2395,7 @@ pub(crate) fn queue_capture_reply_for_test(
             target,
             file,
             lease,
-            permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            permit: crate::control::ReplyRetentionPermit::from_own_budget(),
         },
         &reply,
         (),
@@ -1699,22 +2444,45 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             cancel,
             target,
             want_bytes,
-            frame,
+            pixels,
+            metadata,
         } => {
-            let (w, h) = (frame.width as u32, frame.height as u32);
-            if want_bytes {
-                if cancel.is_cancelled() {
-                    drop((frame, permit));
-                    let _ =
-                        reply.send(Err("image request cancelled before byte reply".to_string()));
+            if cancel.is_cancelled() {
+                drop((pixels, permit));
+                let _ = reply.send(Err(if want_bytes {
+                    "image request cancelled before byte reply".to_string()
+                } else {
+                    "image request cancelled before encoding".to_string()
+                }));
+                return;
+            }
+            // The metadata is published before any reply: the control thread
+            // reads it once the reply arrives.
+            if let Some(metadata) = metadata
+                && let Err(error) = metadata.publish(pixels.pixel_fingerprint())
+            {
+                drop((pixels, permit));
+                let _ = reply.send(Err(error));
+                return;
+            }
+            let encoded = CapturePng::encode(&pixels);
+            // A receiver may release admission as soon as `send` exposes the
+            // retained PNG. Destroy the raw pixels first so the old and newly
+            // admitted jobs cannot overlap unaccounted RAM, and their capture
+            // bytes with them.
+            drop((pixels, permit));
+            let CapturePng {
+                width: w,
+                height: h,
+                png,
+            } = match encoded {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let _ = reply.send(Err(format!("image PNG encode failed: {error}")));
                     return;
                 }
-                let png = frame.to_png();
-                // A receiver may release admission as soon as `send` exposes
-                // the retained PNG. Destroy the raw framebuffer first so the
-                // old and newly admitted jobs cannot overlap unaccounted RAM,
-                // and its capture bytes with it.
-                drop((frame, permit));
+            };
+            if want_bytes {
                 // `--bytes`: hand the PNG back over the wire; write no file (a remote
                 // driver cannot read the server's filesystem). Retain admission
                 // through base64 construction and the bounded socket flush. The
@@ -1726,13 +2494,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 )));
                 return;
             }
-            if cancel.is_cancelled() {
-                drop((frame, permit));
-                let _ = reply.send(Err("image request cancelled before encoding".to_string()));
-                return;
-            }
-            let png = frame.to_png();
-            drop((frame, permit));
             let lease = match crate::control_auth::acquire_capture_name_lease(&target, || {
                 cancel.is_cancelled()
             }) {
@@ -1782,14 +2543,18 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             }
         }
         EncodeJob::Snapshot {
-            frame,
+            pixels,
             text,
             transaction,
         } => {
             let path = transaction.target.path.display();
-            let encoded = SnapshotPng::encode(&frame);
-            drop((frame, permit));
-            match write_snapshot_artifacts(&encoded, &text, &transaction) {
+            let encoded = CapturePng::encode(&pixels);
+            drop((pixels, permit));
+            // A failed encode leaves the attempt unpublished, as a failed write
+            // does: `begin_snapshot_generation` already removed `.done`.
+            match encoded
+                .and_then(|encoded| write_snapshot_artifacts(&encoded, &text, &transaction))
+            {
                 Ok(()) => crate::logging::stderr_line!(
                     "aterm-gui: snapshot written to {path} (+ .txt, .done)"
                 ),
@@ -1799,26 +2564,32 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             }
         }
         #[cfg(any(target_os = "macos", windows))]
-        EncodeJob::WindowRgba {
+        EncodeJob::Window {
             handoff,
             reply,
             cancel,
             target,
-            width,
-            height,
-            rgba,
+            stitch,
         } => {
             if cancel.is_cancelled() {
-                drop((rgba, permit));
+                drop((stitch, permit));
                 let _ = reply.send(Err(
                     "window capture request cancelled before encoding".to_string()
                 ));
                 return;
             }
-            let encoded = encode_rgba8_png(&rgba, width, height);
-            drop((rgba, permit));
-            let png = match encoded {
-                Ok(png) => png,
+            let pixels = match stitch.finish() {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    drop(permit);
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            let encoded = CapturePng::encode(&pixels);
+            drop((pixels, permit));
+            let CapturePng { width, height, png } = match encoded {
+                Ok(encoded) => encoded,
                 Err(error) => {
                     let _ = reply.send(Err(format!(
                         "window capture failed (PNG encode error: {error})"
@@ -1923,10 +2694,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             //
             // WHOLE frame, not a fixed band: the typed line lives wherever the
             // screen has scrolled to (the top-band v1 went blind after one scroll).
-            let frame_fp = |f: &aterm_gpu::video_tap::CapturedFrame| -> u64 {
-                // Sampled sum — cheap, stable, sensitive to any visible change.
-                f.rgba.iter().step_by(64).map(|&b| b as u64).sum()
-            };
             let mut fps = if inputs.is_empty() {
                 Vec::new()
             } else {
@@ -1938,26 +2705,27 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             let mut frame_lines = String::with_capacity(take.frames.len().saturating_mul(112));
             let mut written = 0usize;
             let mut frame_seals = Vec::with_capacity(take.frames.len());
-            // `delta` = how much this frame's sampled fingerprint moved from the
-            // previous captured frame. A multimodal AI reads index.json and pulls
-            // only the high-`delta` frames (the visually eventful moments) instead
-            // of downloading every PNG. Compute the fingerprint beside PNG
-            // encoding so the large frame store is streamed once; retain it for
-            // key analysis only when that ledger is non-empty. `prev_fp` tracks
-            // capture order. Any encode/write error aborts the whole export, so
-            // every adjacent fingerprint also has an adjacent PNG.
-            let mut prev_fp: Option<u64> = None;
+            // `fp` = the frame's content hash; `delta` = the 8×8 tiles that differ
+            // from the previous captured frame (`crate::video_key_analysis`). A
+            // multimodal AI reads index.json and pulls only the high-`delta`
+            // frames (the visually eventful moments) instead of downloading every
+            // PNG. Both are computed beside PNG encoding so the large frame store
+            // is streamed once; the fingerprint is retained for key analysis only
+            // when that ledger is non-empty. `prev` tracks capture order. Any
+            // encode/write error aborts the whole export, so every adjacent
+            // `delta` also has an adjacent PNG.
+            let mut prev: Option<&aterm_gpu::video_tap::CapturedFrame> = None;
             for (i, f) in take.frames.iter().enumerate() {
                 if cancel.is_cancelled() {
                     fail_video_dump(dir, &reply, "request cancelled during export");
                     return;
                 }
-                let fp = frame_fp(f);
+                let fp = crate::video_key_analysis::frame_fingerprint(f);
                 if !inputs.is_empty() {
                     fps.push((f.t_us, fp));
                 }
-                let delta = prev_fp.map_or(0, |p| fp.abs_diff(p));
-                prev_fp = Some(fp);
+                let delta = crate::video_key_analysis::changed_tiles(prev, f);
+                prev = Some(f);
                 let name = format!("frame_{:04}.png", i + 1);
                 let png = match encode_rgba8_png(&f.rgba, f.w, f.h) {
                     Ok(png) => png,
@@ -2200,7 +2968,7 @@ fn image_req_for_test(
     reply: std::sync::mpsc::Sender<crate::control::ImageReply>,
 ) -> crate::control::ImageReq {
     crate::control::ImageReq {
-        handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+        handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
         target,
         clean,
         session: None,
@@ -2283,18 +3051,19 @@ fn observe_capture_pet_world(
     } else {
         &ws.input_scratch
     };
-    let (exclusions, count) = crate::app_render::pet_console_exclusions(
+    let exclusions = crate::app_render::pet_console_exclusions(
         input,
         !ws.preedit.is_empty(),
         ws.predictor.pending_bounds(),
         ws.search.is_some(),
         ws.pet_chrome.held(),
+        ws.pet_chrome.held_overlays(),
     );
-    let observed = ws.fx.companion_mut().observe_console(
+    let observed = ws.fx.companion_mut().observe_console_reserved(
         input,
         &exact_focus.pet_world,
         PetPane::full(input),
-        &exclusions[..count],
+        exclusions.reserve(),
     );
     crate::metrics::note_pet_world_observation(observed);
 }
@@ -2440,39 +3209,19 @@ fn capture_mode(windowless: bool) -> aterm_effects::host::CaptureMode {
     }
 }
 
-/// Present-time placement of one frame axis inside one raw surface axis.
-/// Positive remainder becomes leading/trailing background bands; negative
-/// remainder becomes leading/trailing crop. The HORIZONTAL axis uses exactly
-/// the shared CPU/GPU centred [`aterm_render::band_offset`] rule; the vertical
-/// one takes [`dims_axis_y`] (the platform [`aterm_render::band_offset_y`],
-/// top-pinned on Linux) so `dims` reports the placement the presenters used.
-fn dims_axis(surface: u32, frame: u32) -> (i64, u32, u32, u32, u32) {
-    dims_axis_at(
-        aterm_render::band_offset(surface as usize, frame as usize),
-        surface,
-        frame,
+/// One axis of `dims`: `(offset, band_before, band_after, crop_before,
+/// crop_after)` of the frame's present-time placement
+/// ([`aterm_render::frame_placement`], the law both presenters use), so `dims`
+/// reports the placement the glass has.
+fn dims_axis(axis: aterm_render::AxisPlacement) -> (i64, u32, u32, u32, u32) {
+    let px = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+    (
+        axis.origin,
+        px(axis.band_before),
+        px(axis.band_after),
+        px(axis.crop_before),
+        px(axis.crop_after),
     )
-}
-
-/// [`dims_axis`]'s vertical twin: same band/crop algebra over the platform
-/// vertical placement offset.
-fn dims_axis_y(surface: u32, frame: u32) -> (i64, u32, u32, u32, u32) {
-    dims_axis_at(
-        aterm_render::band_offset_y(surface as usize, frame as usize),
-        surface,
-        frame,
-    )
-}
-
-fn dims_axis_at(offset: i64, surface: u32, frame: u32) -> (i64, u32, u32, u32, u32) {
-    let surface = i64::from(surface);
-    let frame = i64::from(frame);
-    let end = offset + frame;
-    let band_before = offset.clamp(0, surface) as u32;
-    let band_after = (surface - end).clamp(0, surface) as u32;
-    let crop_before = (-offset).clamp(0, frame) as u32;
-    let crop_after = (end - surface).clamp(0, frame) as u32;
-    (offset, band_before, band_after, crop_before, crop_after)
 }
 
 fn dims_px(cells: u32, cell_px: u32, extra_px: u32) -> u32 {
@@ -2549,22 +3298,42 @@ fn native_settings_effective_value(value: &crate::native_ui::SemanticValue) -> S
     }
 }
 
-fn native_settings_controls_lines(
+pub(crate) fn native_settings_controls_lines(
     state: &crate::native_settings::SettingsViewState,
     compiled: &crate::native_ui::CompiledUi,
 ) -> Vec<String> {
     // A legacy `field` record exists only when the exact compiled native tree
-    // contains that setting control. Navigation, actions, status cards, and
-    // previews remain available in the additive canonical `ui` records below.
-    let fields = compiled
-        .semantics
-        .iter()
-        .filter_map(|node| {
-            let key = node.key.as_str().strip_prefix("settings/control/")?;
-            let field = state.legacy.fields.iter().find(|field| field.key == key)?;
-            Some((node, field))
-        })
-        .collect::<Vec<_>>();
+    // contains a control that edits that setting: one record per config key,
+    // bound by the Settings builder ([`crate::native_settings::edited_setting_key`]:
+    // a row's `settings/control/<key>`, the theme card's slots and Follow
+    // system switch for `theme`), in the order the page shows them. The
+    // setting's own row is its control where the page draws one, else the
+    // first control that holds its value (a slot), else the first that edits
+    // it (the switch). Navigation, actions, status cards, and previews remain
+    // available in the additive canonical `ui` records below.
+    let rank = |node: &crate::native_ui::SemanticNode| {
+        if node.key.as_str().starts_with("settings/control/") {
+            0
+        } else if matches!(node.value, crate::native_ui::SemanticValue::Text(_)) {
+            1
+        } else {
+            2
+        }
+    };
+    let mut fields: Vec<(&crate::native_ui::SemanticNode, &crate::prefs::EditField)> = Vec::new();
+    for node in &compiled.semantics {
+        let Some(key) = crate::native_settings::edited_setting_key(&node.key) else {
+            continue;
+        };
+        let Some(field) = state.legacy.fields.iter().find(|field| field.key == key) else {
+            continue;
+        };
+        match fields.iter_mut().find(|(_, bound)| bound.key == key) {
+            Some(bound) if rank(node) < rank(bound.0) => bound.0 = node,
+            Some(_) => {}
+            None => fields.push((node, field)),
+        }
+    }
     let status = state.feedback.as_deref().unwrap_or("");
     let mut out = Vec::with_capacity(3 + fields.len() + compiled.semantics.len());
     out.push(native_settings_state_line(state, fields.len(), status));
@@ -2575,7 +3344,15 @@ fn native_settings_controls_lines(
         // `effective` is the value the native control actually presents after
         // defaults and live policy projection.
         let value = field.seed.as_deref().unwrap_or("");
-        let effective = native_settings_effective_value(&node.value);
+        // A control that is the setting's own row presents its value; one of
+        // several that edit it together (the theme card) gives the setting's
+        // words.
+        let effective = if node.key.as_str().starts_with("settings/control/") {
+            native_settings_effective_value(&node.value)
+        } else {
+            crate::native_settings::setting_effective_words(state, field.key)
+                .unwrap_or_else(|| native_settings_effective_value(&node.value))
+        };
         let kind = native_settings_field_kind(field, &state.config_assets().themes);
         let action = node
             .action
@@ -2907,10 +3684,23 @@ impl App {
             )
         };
 
-        let (offset_x, band_left, band_right, crop_left, crop_right) =
-            dims_axis(surface_w, frame_w);
-        let (offset_y, band_top, band_bottom, crop_top, crop_bottom) =
-            dims_axis_y(surface_h, frame_h);
+        let (deck_y, deck_h) =
+            selected
+                .and_then(|wid| self.deck_rows_px(wid))
+                .map_or((0, 0), |rows| {
+                    (
+                        u32::try_from(rows.start).unwrap_or(u32::MAX),
+                        u32::try_from(rows.len()).unwrap_or(u32::MAX),
+                    )
+                });
+        let place = aterm_render::frame_placement(
+            surface_w as usize,
+            surface_h as usize,
+            frame_w as usize,
+            frame_h as usize,
+        );
+        let (offset_x, band_left, band_right, crop_left, crop_right) = dims_axis(place.x);
+        let (offset_y, band_top, band_bottom, crop_top, crop_bottom) = dims_axis(place.y);
         let (
             present_retry_state,
             present_retry_count,
@@ -2975,6 +3765,8 @@ impl App {
             pad_bottom: pad,
             head,
             tab_rows,
+            deck_y,
+            deck_h,
             viewers: u32::try_from(windows.len()).unwrap_or(u32::MAX),
             visible_viewers: u32::try_from(visible_viewers).unwrap_or(u32::MAX),
             geometry,
@@ -3855,6 +4647,9 @@ impl App {
     /// content-clock twin were filled in the exact pane extraction loop that
     /// built `input_scratch`; the synchronous present barrier guarantees no
     /// later staged frame can replace either half before this function runs.
+    /// A capture reads it from its request layout
+    /// ([`Self::presented_terminal_capture_grid_from_layout`]).
+    #[cfg(test)]
     pub(crate) fn presented_terminal_capture_grid(
         &self,
         wid: crate::WindowId,
@@ -4113,59 +4908,6 @@ impl App {
         }
     }
 
-    /// Clone the staged model only when a successful-present serial proves it
-    /// was the model consumed by a completed submission after `before`.
-    fn presented_terminal_capture_after(
-        &self,
-        wid: crate::WindowId,
-        before: u64,
-        frame_layout: Option<(
-            &crate::tab_model::VisibleLeafPlan,
-            crate::VisibleContentRoute,
-        )>,
-    ) -> Option<PresentedTerminalCapture> {
-        let presented = self.presented_frame_capture_after(wid, before)?;
-        let grid = match frame_layout {
-            Some((plan, route)) => {
-                self.presented_terminal_capture_grid_from_layout(wid, plan, route)?
-            }
-            None => self.presented_terminal_capture_grid(wid)?,
-        };
-        Some(PresentedTerminalCapture {
-            input: presented.input,
-            grid,
-            invert: presented.invert,
-            overlay: presented.overlay,
-            serial: presented.serial,
-            cell_size: self.win_cell_size(wid),
-            theme_fingerprint: self.image_theme_fingerprint(),
-            overlay_fingerprint: self.windows.get(&wid)?.overlay_fp(),
-        })
-    }
-
-    /// Clone the staged renderer model only after a successful-present serial
-    /// advances. Unlike the terminal-specific projection above, this accepts
-    /// every zoom-aware visible route; the route's redraw already populated
-    /// `input_scratch` and committed the exact host visual state beside the
-    /// serial.
-    fn presented_frame_capture_after(
-        &self,
-        wid: crate::WindowId,
-        before: u64,
-    ) -> Option<PresentedFrameCapture> {
-        let window = self.windows.get(&wid)?;
-        let serial = window.capture_present_serial;
-        if serial == before {
-            return None;
-        }
-        Some(PresentedFrameCapture {
-            input: window.input_scratch.clone(),
-            invert: window.capture_present_invert,
-            overlay: window.capture_present_overlay,
-            serial,
-        })
-    }
-
     /// Resolve the recording loop's latest successful application present.
     ///
     /// The lightweight metadata is committed only after video submission
@@ -4274,7 +5016,6 @@ impl App {
                     capture_serial: Some(presented.serial),
                     width: 0,
                     height: 0,
-                    pixel_fingerprint: 0,
                 },
             )?)
         } else {
@@ -4308,19 +5049,24 @@ impl App {
             }
         }
         Ok(RecordingPresentedFrame {
-            frame: PresentedFrameCapture {
-                input,
-                invert: presented.invert,
-                overlay: presented.overlay,
+            presented: PresentedCapture {
                 serial: presented.serial,
+                visuals: crate::app_render::HostVisualState {
+                    invert: presented.invert,
+                    overlay: presented.overlay,
+                },
+                client: None,
             },
+            input,
             terminal_grid: include_terminal_grid
                 .then(|| presented.terminal_grid.clone())
                 .flatten(),
-            cell_size: presented.cell_size,
-            theme_fingerprint: self.image_theme_fingerprint(),
-            overlay_fingerprint: presented.overlay_fingerprint,
-            native_metadata,
+            facts: RecordedFacts {
+                cell_size: presented.cell_size,
+                theme_fingerprint: self.image_theme_fingerprint(),
+                overlay_fingerprint: presented.overlay_fingerprint,
+                native_metadata,
+            },
         })
     }
 
@@ -4380,13 +5126,8 @@ impl App {
             input_epoch,
             crate::metrics::now_us(),
         )?;
-        let client = crate::PresentedClientFrame {
-            width: captured.w,
-            height: captured.h,
-            rgba: captured.rgba,
-        };
         Ok(RecordingPresentedDestination {
-            frame: snapshot_frame_from_presented_client(&client)?,
+            pixels: CapturePixels::raw(captured),
             route,
             serial,
         })
@@ -4397,8 +5138,9 @@ impl App {
     ///
     /// The redraw's present is marked as a capture's, so a minimized Windows
     /// window, whose ordinary presents park, still presents it
-    /// ([`aterm_gpu::WindowGpu::parks_while_minimized`]).
-    fn redraw_capture_frame(
+    /// ([`aterm_gpu::WindowGpu::parks_while_minimized`]): a capture, and a
+    /// `pointer` reply (`App::pointer_cmd`), wait on it.
+    pub(crate) fn redraw_capture_frame(
         &mut self,
         wid: crate::WindowId,
         frame_layout: Option<VisibleFrameLayoutRef<'_>>,
@@ -4424,128 +5166,544 @@ impl App {
         }
     }
 
-    /// Route-neutral successful-present barrier. Windowed terminal, native and
-    /// heterogeneous captures all authorize pixels through the same serial.
-    /// Headless callers receive `None` and stage one explicit present-real frame.
-    fn present_before_frame_capture(
-        &mut self,
-        wid: crate::WindowId,
-        frame_layout: Option<VisibleFrameLayoutRef<'_>>,
-    ) -> Result<Option<PresentedFrameCapture>, String> {
-        let has_os_window = self
-            .windows
-            .get(&wid)
-            .is_some_and(|window| window.os_window.is_some());
-        if !has_os_window {
-            return Ok(None);
+    /// Whether a capture of `wid` can force a present of it: it has an OS
+    /// window to present to. A test's scripted CPU surface counts too, as it
+    /// does for the present itself (`redraw_window_with_layout`), so a headless
+    /// test drives the windowed capture path end to end.
+    fn capture_target(&self, wid: WindowId) -> CaptureTarget {
+        let Some(window) = self.windows.get(&wid) else {
+            return CaptureTarget::Headless;
+        };
+        #[cfg(test)]
+        if !self.backend.is_gpu()
+            && matches!(
+                &window.present,
+                Some(crate::PresentTarget::Cpu { surface }) if surface.scripted().is_some()
+            )
+        {
+            return CaptureTarget::Windowed;
         }
-
-        let mut captured = None;
-        let mut acquire_pending = false;
-        let presented =
-            crate::run_capture_present_barrier(self.capture_present_budget.remaining, || {
-                if acquire_pending {
-                    return false;
-                }
-                let before = self
-                    .windows
-                    .get(&wid)
-                    .map_or(0, |window| window.capture_present_serial);
-                let Some(window) = self.windows.get_mut(&wid) else {
-                    return false;
-                };
-                let _ = window.present_retry.on_external_stimulus();
-                window.last_present = None;
-                self.redraw_capture_frame(wid, frame_layout);
-                acquire_pending = self
-                    .windows
-                    .get(&wid)
-                    .is_some_and(|window| window.gpu_acquire_pending());
-                if let Some(window) = self.windows.get(&wid) {
-                    self.capture_present_budget.record_attempt(
-                        acquire_pending,
-                        window.capture_present_serial != before,
-                        !window.present_retry.present_attempt_allowed(),
-                    );
-                }
-                captured = self.presented_frame_capture_after(wid, before);
-                captured.is_some()
-            });
-        if acquire_pending {
-            return Err(GPU_CAPTURE_PENDING.to_string());
-        }
-        if presented {
-            Ok(captured)
+        if window.os_window.is_some() {
+            CaptureTarget::Windowed
         } else {
-            Err(format!(
-                "frame capture could not synchronize a coherent presented frame after {} present attempts",
-                crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
-            ))
+            CaptureTarget::Headless
         }
     }
 
-    /// Synchronize a windowed pure-terminal capture with one application-present
-    /// submission. Each attempt is an explicit external presentation stimulus:
-    /// it reopens a parked/backoff retry episode and clears the optimistic
-    /// repaint stamp so the redraw cannot early-out. Only a serial advance may
-    /// authorize the immediate owned snapshot. Three dropped/held attempts fail
-    /// closed; pre-first-present follows this same path.
-    fn present_before_terminal_capture(
+    /// Make screenshot ordering match control ordering: force one successful
+    /// application present of `wid` and bind the capture to it.
+    ///
+    /// GUI mutations (`open`, `act`, tab selection, Settings edits) run on this
+    /// same main loop and reply after changing the model, while their
+    /// `request_redraw` is asynchronous. Without this barrier, an immediately
+    /// following `image`/`window` can photograph the prior composited frame even
+    /// though `inspect` already reports the new semantic tree. A present can also
+    /// be dropped while acquiring the GPU surface, so one blind redraw is not a
+    /// sufficient barrier: authorize capture only when the window's real-present
+    /// serial advances after redrawing the CURRENT composite. The serial belongs to
+    /// the whole window rather than one focused native leaf, so this remains correct
+    /// for every route, heterogeneous terminal/native splits and native leaves with
+    /// sub-viewports included. Each attempt is an explicit external presentation
+    /// stimulus: it reopens a parked/backoff retry episode and clears the
+    /// optimistic repaint stamp so the redraw cannot early-out. Actual drops retry
+    /// at most three times, then fail closed. Async acquisition answers
+    /// [`GPU_CAPTURE_PENDING`] at once, so the caller yields its original owned
+    /// request to the bounded completion queue, preserving its tap and
+    /// cancellation deadline across the wait.
+    ///
+    /// `frame_layout` is the caller's synchronous layout authority, used for
+    /// every attempt; `None` resolves the ordinary redraw layout. `Ok(None)`:
+    /// the window has no surface ([`CaptureTarget::Headless`]), so the caller
+    /// stages its own frame. The result owns no model ([`PresentedCapture`]).
+    fn present_before_capture(
         &mut self,
-        wid: crate::WindowId,
+        wid: WindowId,
         frame_layout: Option<VisibleFrameLayoutRef<'_>>,
-    ) -> Result<Option<PresentedTerminalCapture>, String> {
-        let has_os_window = self
-            .windows
-            .get(&wid)
-            .is_some_and(|window| window.os_window.is_some());
-        if !has_os_window {
+        take: PresentTake,
+    ) -> Result<Option<PresentedCapture>, String> {
+        if self.capture_target(wid) == CaptureTarget::Headless {
             return Ok(None);
         }
-
+        let tap = take != PresentTake::Model;
+        let tap_required = take == PresentTake::ClientTap;
         let mut captured = None;
         let mut acquire_pending = false;
+        let mut last_capture_error = None;
+        // The presents forced here run on the caller's schedule, not the
+        // terminal's: they book their latency as tainted.
+        self.capture_barrier = Some(wid);
         let presented =
             crate::run_capture_present_barrier(self.capture_present_budget.remaining, || {
                 if acquire_pending {
                     return false;
                 }
+                // A replay resumes the tap its wait kept armed.
+                let resumed_tap = tap
+                    && self
+                        .windows
+                        .get(&wid)
+                        .is_some_and(|window| window.capture_acquire_armed);
+                if tap && !resumed_tap {
+                    self.discard_presented_client_capture(wid);
+                }
                 let before = self
                     .windows
                     .get(&wid)
                     .map_or(0, |window| window.capture_present_serial);
+                // Whether this attempt's present carries the tap: a resumed
+                // one, or one armed now. An optional tap that cannot be armed
+                // lets the present run without it.
+                let armed = resumed_tap
+                    || (tap
+                        && match self.arm_presented_client_capture(wid) {
+                            Ok(()) => true,
+                            Err(error) if tap_required => {
+                                last_capture_error = Some(error);
+                                return false;
+                            }
+                            Err(_) => false,
+                        });
                 let Some(window) = self.windows.get_mut(&wid) else {
+                    last_capture_error = Some("capture lost its window".to_string());
                     return false;
                 };
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
                 self.redraw_capture_frame(wid, frame_layout);
-                acquire_pending = self
-                    .windows
-                    .get(&wid)
-                    .is_some_and(|window| window.gpu_acquire_pending());
-                if let Some(window) = self.windows.get(&wid) {
-                    self.capture_present_budget.record_attempt(
-                        acquire_pending,
-                        window.capture_present_serial != before,
-                        !window.present_retry.present_attempt_allowed(),
-                    );
+                let Some(window) = self.windows.get_mut(&wid) else {
+                    last_capture_error = Some("capture lost its window".to_string());
+                    return false;
+                };
+                acquire_pending = window.gpu_acquire_pending();
+                let serial = window.capture_present_serial;
+                self.capture_present_budget.record_attempt(
+                    acquire_pending,
+                    serial != before,
+                    !window.present_retry.present_attempt_allowed(),
+                );
+                if acquire_pending {
+                    if armed {
+                        window.capture_acquire_armed = true;
+                    }
+                    return false;
                 }
-
-                captured = self.presented_terminal_capture_after(wid, before, frame_layout);
-                captured.is_some()
+                if serial == before {
+                    last_capture_error = Some("the capture's present did not complete".to_string());
+                    return false;
+                }
+                let visuals = crate::app_render::HostVisualState {
+                    invert: window.capture_present_invert,
+                    overlay: window.capture_present_overlay,
+                };
+                let client = if armed {
+                    match self.take_presented_client_capture(wid) {
+                        Ok(client) => Some(client),
+                        Err(error) if tap_required => {
+                            last_capture_error = Some(error);
+                            return false;
+                        }
+                        // The present succeeded without its destination: bind
+                        // it, and leave no tap armed for a later present.
+                        Err(_) => {
+                            self.discard_presented_client_capture(wid);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                captured = Some(PresentedCapture {
+                    serial,
+                    visuals,
+                    client,
+                });
+                true
             });
+        self.capture_barrier = None;
         if acquire_pending {
             return Err(GPU_CAPTURE_PENDING.to_string());
         }
-        if presented {
-            Ok(captured)
-        } else {
-            Err(format!(
-                "terminal capture could not synchronize a coherent presented frame after {} present attempts",
-                crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
-            ))
+        if presented && captured.is_some() {
+            return Ok(captured);
         }
+        if tap {
+            self.discard_presented_client_capture(wid);
+        }
+        let detail = last_capture_error
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        Err(format!(
+            "capture could not synchronize a presented frame after {} present attempts{detail}",
+            crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
+        ))
+    }
+
+    /// An owned copy of `wid`'s staged model for a capture that rasterizes it
+    /// itself (`image`, and a headless snapshot). It is the only copy a capture
+    /// takes: the rasterization and `image plain`'s overlay stripping then run
+    /// on the copy, never on the scratch a later present or capture reuses.
+    fn take_rerender_input(&self, wid: WindowId) -> aterm_render::RenderInput {
+        #[cfg(test)]
+        crate::work_counts::capture_input_cloned();
+        self.windows
+            .get(&wid)
+            .map(|window| window.input_scratch.clone())
+            .unwrap_or_default()
+    }
+
+    /// Choose where a capture of `front` takes its pixels and its model from,
+    /// once, for every capture that does not photograph the platform window
+    /// (`image`, the SIGUSR1 snapshot).
+    ///
+    /// The kind of frame is decided once ([`capture_source_kind`]). A window
+    /// with a surface is bound to the present its barrier forces
+    /// ([`Self::present_before_capture`]), with the request layout as that
+    /// present's authority: the destination the barrier tapped, or a rerender
+    /// of the presented model under the visuals committed beside it. A headless
+    /// window has no glass. Under a recording of it the recording's virtual
+    /// target is its glass, so the still is bound to the recording's last
+    /// present: that destination, or a rerender of the recording's resident
+    /// model (`image plain`). Otherwise the frame is staged in this turn
+    /// ([`Self::stage_headless_capture`]) and rerendered under the host visuals
+    /// sampled after the staging.
+    fn resolve_capture_source(
+        &mut self,
+        front: WindowId,
+        policy: SourcePolicy,
+    ) -> Result<ResolvedCapture, CaptureDeferral> {
+        // A capture is a PIXEL demand: redeem a headless launch's deferred GPU
+        // intent before any capture geometry or renderer state is read, so the
+        // capture is served by the backend a boot-built one would have been.
+        // No-op windowed, and once redeemed or declined.
+        self.ensure_pixel_backend();
+        let (plan, route) = self
+            .active_visible_frame_layout(front)
+            .ok_or(CaptureDeferral::Nothing)?;
+        let windowed = self.capture_target(front) == CaptureTarget::Windowed;
+        let wants_destination = policy.destination != DestinationDemand::Never;
+        let facts = SourceFacts {
+            windowed,
+            translucent: windowed && wants_destination && self.client_is_translucent(front),
+            guards: if windowed && wants_destination {
+                self.client_capture_guards(front)
+            } else {
+                Ok(())
+            },
+            copyable: windowed && wants_destination && self.client_tap_is_copyable(front),
+            recording: self
+                .video_rec
+                .as_ref()
+                .is_some_and(|recording| recording.window == front),
+        };
+        let kind = capture_source_kind(policy.destination, facts)
+            .map_err(|error| CaptureDeferral::Refused(error.to_string()))?;
+        if windowed {
+            let take = match (kind, policy.destination) {
+                (SourceKind::Rerender, _) => PresentTake::Model,
+                (SourceKind::Destination, DestinationDemand::Required) => PresentTake::ClientTap,
+                (SourceKind::Destination, _) => PresentTake::ClientTapOrModel,
+            };
+            return self.presented_capture_source(front, plan, route, policy, take);
+        }
+        if facts.recording {
+            return self.recorded_capture_source(front, plan, route, policy, kind);
+        }
+        let (plan, terminal_grid) = self.stage_headless_capture(front, plan, route)?;
+        Ok(ResolvedCapture {
+            source: CaptureSource::Rerender {
+                serial: None,
+                visuals: self.host_visual_state(front, Instant::now()),
+            },
+            model: None,
+            context: CaptureContext {
+                plan,
+                route,
+                terminal_grid,
+                recorded: None,
+            },
+        })
+    }
+
+    /// The windowed arm of [`Self::resolve_capture_source`]: the present the
+    /// barrier forces, laid out from the request layout, and what the capture
+    /// takes from it.
+    fn presented_capture_source(
+        &mut self,
+        front: WindowId,
+        plan: crate::tab_model::VisibleLeafPlan,
+        route: crate::VisibleContentRoute,
+        policy: SourcePolicy,
+        take: PresentTake,
+    ) -> Result<ResolvedCapture, CaptureDeferral> {
+        let presented = self
+            .present_before_capture(front, Some((&plan, route)), take)
+            .map_err(|error| {
+                if error == GPU_CAPTURE_PENDING {
+                    CaptureDeferral::PendingGpu
+                } else {
+                    CaptureDeferral::Refused(error)
+                }
+            })?;
+        // The barrier binds nothing only for a window without a surface, which
+        // `capture_target` excluded.
+        let presented = presented.ok_or(CaptureDeferral::Nothing)?;
+        let terminal_grid = match route {
+            // The present filled the leaf inventory in this same turn.
+            crate::VisibleContentRoute::Terminal { .. } if policy.metadata => Some(
+                self.presented_terminal_capture_grid_from_layout(front, &plan, route)
+                    .ok_or_else(|| {
+                        CaptureDeferral::Refused(
+                            "image: the presented frame has no terminal inventory".to_string(),
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        let pixels = presented.client.map(|client| {
+            if policy.frame_only {
+                self.presented_frame_of(front, client)
+            } else {
+                Ok(client)
+            }
+        });
+        let source = match pixels {
+            Some(Ok(pixels)) => CaptureSource::Destination {
+                pixels,
+                serial: presented.serial,
+            },
+            Some(Err(error)) if take == PresentTake::ClientTap => {
+                return Err(CaptureDeferral::Refused(error));
+            }
+            // A destination that cannot be cut back to its frame falls back
+            // to the rerender of the same present, as a failed tap does.
+            Some(Err(_)) | None => CaptureSource::Rerender {
+                serial: Some(presented.serial),
+                visuals: presented.visuals,
+            },
+        };
+        Ok(ResolvedCapture {
+            source,
+            model: None,
+            context: CaptureContext {
+                plan,
+                route,
+                terminal_grid,
+                recorded: None,
+            },
+        })
+    }
+
+    /// The headless-recording arm of [`Self::resolve_capture_source`]: the
+    /// recording's last successful present, its destination or a rerender of
+    /// its resident model as `kind` says.
+    fn recorded_capture_source(
+        &mut self,
+        front: WindowId,
+        plan: crate::tab_model::VisibleLeafPlan,
+        route: crate::VisibleContentRoute,
+        policy: SourcePolicy,
+        kind: SourceKind,
+    ) -> Result<ResolvedCapture, CaptureDeferral> {
+        let destination = match kind {
+            SourceKind::Rerender => None,
+            SourceKind::Destination => Some(
+                self.recording_presented_destination_capture(front)
+                    .map_err(CaptureDeferral::Refused)?,
+            ),
+        };
+        if !policy.model
+            && let Some(destination) = destination
+        {
+            // The common live-repro path: the destination as it is, with no
+            // semantic clone, hash or reraster.
+            return Ok(ResolvedCapture {
+                source: CaptureSource::Destination {
+                    pixels: destination.pixels,
+                    serial: destination.serial,
+                },
+                model: None,
+                context: CaptureContext {
+                    plan,
+                    route: destination.route,
+                    terminal_grid: None,
+                    recorded: None,
+                },
+            });
+        }
+        // The validation holds the current layout, geometry and chrome to the
+        // recorded present's, so the request layout is the recorded frame's.
+        let recorded = self
+            .recording_presented_frame_capture(front, policy.metadata, policy.metadata)
+            .map_err(CaptureDeferral::Refused)?;
+        let source = match destination {
+            Some(destination) => {
+                debug_assert_eq!(destination.serial, recorded.presented.serial);
+                CaptureSource::Destination {
+                    pixels: destination.pixels,
+                    serial: destination.serial,
+                }
+            }
+            None => CaptureSource::Rerender {
+                serial: Some(recorded.presented.serial),
+                visuals: recorded.presented.visuals,
+            },
+        };
+        Ok(ResolvedCapture {
+            source,
+            model: Some(recorded.input),
+            context: CaptureContext {
+                plan,
+                route,
+                terminal_grid: recorded.terminal_grid,
+                recorded: Some(recorded.facts),
+            },
+        })
+    }
+
+    /// Stage a headless capture's frame in this turn from the request layout:
+    /// the route's preparation into the window's scratch, then its chrome in
+    /// the order the glass layers it ([`crate::route_chrome`]). A staging is a
+    /// read: it consumes no damage and stamps no present. Returns the plan the frame was
+    /// laid out from and, for a terminal route, its inventory.
+    ///
+    /// A terminal-only split stages the divider grid and the per-pane
+    /// composite, each pane keeping its own live default background, never the
+    /// front pane stretched over the window; a single pane keeps the front
+    /// terminal refill.
+    fn stage_headless_capture(
+        &mut self,
+        wid: WindowId,
+        plan: crate::tab_model::VisibleLeafPlan,
+        route: crate::VisibleContentRoute,
+    ) -> Result<
+        (
+            crate::tab_model::VisibleLeafPlan,
+            Option<crate::app_render::TerminalCaptureGrid>,
+        ),
+        CaptureDeferral,
+    > {
+        use crate::app_render::CapturePreparation;
+        let (plan, terminal_grid) = match route {
+            crate::VisibleContentRoute::Terminal { .. } => {
+                let capture_now = Instant::now();
+                // The band's motion at the capture instant (design §10.8): a
+                // capture is a pure function of the center and `capture_now`.
+                self.prepare_band_motion(wid, capture_now);
+                let clock = self.composed_capture_cursor_fx_clock(wid, capture_now);
+                let (grid, plan) = match self
+                    .prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(wid, plan, clock)
+                {
+                    CapturePreparation::Ready(prepared) => prepared,
+                    CapturePreparation::Held { retry_at } => {
+                        return Err(CaptureDeferral::Held { retry_at });
+                    }
+                    CapturePreparation::Unavailable => return Err(CaptureDeferral::Nothing),
+                };
+                let focus = grid.focus.ok_or(CaptureDeferral::Nothing)?;
+                // The decoration splice dispatches on one-pane versus composed
+                // geometry itself, and owns the capture/recording clock
+                // boundary: it retains rather than advances under a recording.
+                self.capture_words_sampled(wid, capture_now, focus);
+                self.refresh_pane_headers(wid, &plan);
+                self.paint_pane_headers(wid);
+                self.splice_tab_strip(wid);
+                // The overlay scrollbar's and hollow cursors' facts at the
+                // capture instant, which the chrome's pane overlay paints.
+                self.refresh_pane_overlay_for_capture(wid, &plan, capture_now);
+                (plan, Some(grid))
+            }
+            crate::VisibleContentRoute::Native { .. } => {
+                if !self.prepare_native_input_scratch_from_capture_plan(wid, &plan) {
+                    return Err(CaptureDeferral::Nothing);
+                }
+                (plan, None)
+            }
+            crate::VisibleContentRoute::Heterogeneous => {
+                let clock = self.composed_capture_cursor_fx_clock(wid, Instant::now());
+                match self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
+                    wid,
+                    Some(clock),
+                    &plan,
+                ) {
+                    CapturePreparation::Ready(_) => {}
+                    CapturePreparation::Held { retry_at } => {
+                        return Err(CaptureDeferral::Held { retry_at });
+                    }
+                    CapturePreparation::Unavailable => return Err(CaptureDeferral::Nothing),
+                }
+                (plan, None)
+            }
+        };
+        // The window's chrome in the order the glass layers it: a capture that
+        // omitted a layer would tell a driving AI it is absent while a human
+        // looks at it.
+        // The link caption it composes is the present's to publish, never a
+        // capture's.
+        if self.compose_route_chrome(wid, route, &plan).is_none() {
+            return Err(CaptureDeferral::Nothing);
+        }
+        Ok((plan, terminal_grid))
+    }
+
+    /// Rasterize a capture's model into the frame it encodes, composed as the
+    /// glass composes it: the window's renderer context bound, the backend
+    /// tray card ([`crate::WindowState::present_card`]) cropped below the
+    /// paste banner, and `visuals`, the bell invert and the host overlay, over
+    /// it ([`apply_host_chrome_at`]). The one rerender every capture that
+    /// rasterizes its own frame ends in: `image`, and the headless snapshot.
+    /// `input` is the capture's own copy, never the window's scratch.
+    fn rerender_capture(
+        &mut self,
+        wid: WindowId,
+        input: &mut aterm_render::RenderInput,
+        visuals: crate::app_render::HostVisualState,
+    ) -> Result<Frame, String> {
+        let tray_floor_y = self.paste_banner_tray_floor_y(wid);
+        self.bind_window_renderer_state(wid);
+        // Timed so `metrics` observes offscreen rasters, headless included, on
+        // their own counters (`metrics::record_offscreen_raster`).
+        let render_t0 = Instant::now();
+        // Disjoint borrows: the renderer, the introspection GPU scratch and the
+        // window's tray cards are separate fields.
+        let App {
+            backend,
+            introspect_gpu,
+            windows,
+            ..
+        } = self;
+        let window = windows
+            .get(&wid)
+            .ok_or_else(|| "capture lost its window".to_string())?;
+        // The GPU arm bakes the card into its offscreen, as the present does;
+        // the CPU arm composites it below.
+        let tray = window
+            .present_card()
+            .and_then(|card| tray_quad_below_y(card, tray_floor_y));
+        let destination_height = window.win_px.map(|size| size.height.max(1) as usize);
+        let mut frame = backend.render_input_for_destination(
+            introspect_gpu,
+            input,
+            tray,
+            destination_height,
+        )?;
+        let cpu_tray = (!backend.is_gpu()).then_some(tray).flatten();
+        let (width, height) = (frame.width, frame.height);
+        apply_host_chrome_at(
+            &mut frame.pixels,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height,
+            // The frame is the surface here: no remainder band to continue.
+            0..0,
+            cpu_tray,
+            visuals.invert,
+            visuals.overlay,
+        );
+        crate::metrics::record_offscreen_raster(render_t0.elapsed().as_nanos() as u64);
+        Ok(frame)
     }
 
     /// Introspect the current visible route and write PNG + semantic text.
@@ -4562,51 +5720,42 @@ impl App {
         &self,
         wid: WindowId,
         route: crate::VisibleContentRoute,
-        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+        plan: &crate::tab_model::VisibleLeafPlan,
         input: &aterm_render::RenderInput,
         strip_rows: usize,
         cols: usize,
     ) -> String {
         let terminal = terminal_capture_text(input, strip_rows, cols);
         let native = if route.has_visible_native() {
-            let project = |plan: &crate::tab_model::VisibleLeafPlan| {
-                self.windows.get(&wid).map(|window| {
-                    let mut native = String::new();
-                    for leaf in &plan.leaves {
-                        if !matches!(
-                            self.view_store.get(leaf.view),
-                            Some(crate::tab_model::View::Native(_))
-                        ) {
-                            continue;
-                        }
-                        native.push_str(&format!(
-                            "[native view={} focused={}]\n",
-                            leaf.view.get(),
-                            leaf.focused
-                        ));
-                        let Some(raster) = window
-                            .leaf_render_cache
-                            .get(&leaf.view)
-                            .and_then(|cache| cache.native.as_ref())
-                        else {
-                            native.push_str("semantics unavailable\n");
-                            continue;
-                        };
-                        for line in crate::app_control::semantic_text_lines(&raster.compiled) {
-                            native.push_str(&line);
-                            native.push('\n');
-                        }
+            self.windows.get(&wid).map(|window| {
+                let mut native = String::new();
+                for leaf in &plan.leaves {
+                    if !matches!(
+                        self.view_store.get(leaf.view),
+                        Some(crate::tab_model::View::Native(_))
+                    ) {
+                        continue;
                     }
-                    native
-                })
-            };
-            match frame_plan {
-                Some(plan) => project(plan),
-                None => self
-                    .active_visible_leaf_plan(wid)
-                    .as_ref()
-                    .and_then(project),
-            }
+                    native.push_str(&format!(
+                        "[native view={} focused={}]\n",
+                        leaf.view.get(),
+                        leaf.focused
+                    ));
+                    let Some(raster) = window
+                        .leaf_render_cache
+                        .get(&leaf.view)
+                        .and_then(|cache| cache.native.as_ref())
+                    else {
+                        native.push_str("semantics unavailable\n");
+                        continue;
+                    };
+                    for line in crate::app_control::semantic_text_lines(&raster.compiled) {
+                        native.push_str(&line);
+                        native.push('\n');
+                    }
+                }
+                native
+            })
         } else {
             None
         };
@@ -4640,41 +5789,16 @@ impl App {
         self.snapshot_at_path(path);
     }
 
-    fn snapshot_at_path(&mut self, path: String) {
-        // THE CAPTURE BYTE PERMIT, before any capture (see `admit_capture`): a
-        // saturated encoder refuses this snapshot exactly as a full queue
-        // does — the generation is begun (a stale `.done` from an earlier
-        // snapshot must not answer a requester's stat for this one) and left
-        // unpublished, and nothing is photographed.
-        if !self.admit_capture(self.frontmost_window) {
-            match begin_snapshot_generation(std::path::Path::new(&path)) {
-                Ok(unpublished) => drop(unpublished),
-                Err(error) => {
-                    crate::logging::stderr_line!("aterm-gui: snapshot refused for {path}: {error}");
-                    return;
-                }
-            }
-            crate::logging::stderr_line!(
-                "aterm-gui: snapshot rejected for {path}: {ENCODE_QUEUE_FULL}"
-            );
-            return;
-        }
-        self.snapshot_at_path_admitted(path);
-        self.capture_permit = None;
+    // Only the SIGUSR1 snapshot (`snapshot`, unix) and tests call it; Windows
+    // captures through the `image` verb.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn snapshot_at_path(&mut self, path: String) {
+        self.run_capture(CaptureRequest::Snapshot { path });
     }
 
-    fn snapshot_at_path_admitted(&mut self, path: String) {
-        self.prune_deferred_gpu_captures();
-        if let Some(window) = self.frontmost_window
-            && self.replaying_gpu_capture != Some(window)
-            && self.has_deferred_gpu_capture(window)
-        {
-            self.queue_gpu_capture(window, DeferredGpuCaptureRequest::Snapshot { path }, false);
-            return;
-        }
-        if self.replaying_gpu_capture != self.frontmost_window || self.frontmost_window.is_none() {
-            self.capture_present_budget = CapturePresentBudget::default();
-        }
+    /// The snapshot's body, once [`Self::run_capture`] has admitted it:
+    /// `front` is the front window it photographs.
+    fn snapshot_body(&mut self, front: Option<WindowId>, path: String) {
         let transaction = match begin_snapshot_generation(std::path::Path::new(&path)) {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -4682,354 +5806,82 @@ impl App {
                 return;
             }
         };
-        let Some(front) = self.frontmost_window else {
+        let Some(front) = front else {
             return;
         };
-        let Some((request_plan, request_route)) = self.active_visible_frame_layout(front) else {
-            return;
-        };
-        // A snapshot is a PIXEL demand: redeem a headless launch's deferred GPU
-        // intent before anything reads the renderer, so the artifact this writes
-        // is the one a boot-built device would have written. No-op everywhere
-        // else (windowed, and headless once redeemed or declined).
-        self.ensure_pixel_backend();
         let strip_rows = usize::from(self.chrome_rows(front));
-        let has_os_window = self
+        let policy = SourcePolicy {
+            destination: DestinationDemand::Required,
+            frame_only: false,
+            model: true,
+            metadata: false,
+        };
+        let capture = match self.resolve_capture_source(front, policy) {
+            Ok(capture) => capture,
+            Err(CaptureDeferral::PendingGpu) => {
+                self.queue_gpu_capture(front, CaptureRequest::Snapshot { path }, true);
+                return;
+            }
+            Err(CaptureDeferral::Refused(error)) => {
+                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
+                return;
+            }
+            Err(CaptureDeferral::Nothing | CaptureDeferral::Held { .. }) => return,
+        };
+        self.snapshot_tail(front, capture, strip_rows, transaction);
+    }
+
+    /// Finish a snapshot from its resolved source: the text of the model the
+    /// frame shows, and the frame, a destination as it is or the one rerender.
+    /// Deflate and writes run on the encode worker, which writes the `.done`
+    /// marker last, so the requester's stat() contract holds.
+    fn snapshot_tail(
+        &mut self,
+        front: WindowId,
+        capture: ResolvedCapture,
+        strip_rows: usize,
+        transaction: SnapshotTransaction,
+    ) {
+        let ResolvedCapture {
+            source,
+            model,
+            context,
+        } = capture;
+        let Some(cols) = self
             .windows
             .get(&front)
-            .is_some_and(|window| window.os_window.is_some());
-        let recording_presented = if !has_os_window
-            && self
-                .video_rec
-                .as_ref()
-                .is_some_and(|recording| recording.window == front)
-        {
-            match self.recording_presented_frame_capture(front, false, false) {
-                Ok(presented) => Some(presented),
-                Err(error) => {
-                    crate::logging::stderr_line!("aterm-gui: snapshot deferred: {error}");
-                    return;
-                }
-            }
-        } else {
-            None
+            .map(|window| usize::from(window.cols))
+        else {
+            return;
         };
-        let recording_destination = if recording_presented.is_some() {
-            match self.recording_presented_destination_capture(front) {
-                Ok(destination) => Some(destination),
-                Err(error) => {
-                    crate::logging::stderr_line!("aterm-gui: snapshot deferred: {error}");
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let route = recording_destination
-            .as_ref()
-            .map_or(request_route, |presented| presented.route);
-        let request_layout_authoritative =
-            recording_destination.is_none() && route == request_route;
-        let exact_presented = if has_os_window {
-            let has_gpu_surface = self.windows.get(&front).is_some_and(|window| {
-                matches!(window.present, Some(crate::PresentTarget::Gpu { .. }))
-            });
-            if let Err(error) = crate::window_capture_translucency_guard(
-                self.render_knobs.background_opacity,
-                cfg!(target_os = "macos"),
-                self.backend.is_gpu(),
-                has_gpu_surface,
-            ) {
-                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
-                return;
-            }
-            if let Err(error) = crate::window_capture_material_guard(
-                self.render_knobs.background_material,
-                !cfg!(windows),
-            ) {
-                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
-                return;
-            }
-            match self.present_before_window_capture(
-                front,
-                request_layout_authoritative.then_some((&request_plan, request_route)),
-            ) {
-                Ok(presented) => Some(presented),
-                Err(error) => {
-                    if error == GPU_CAPTURE_PENDING {
-                        self.queue_gpu_capture(
-                            front,
-                            DeferredGpuCaptureRequest::Snapshot { path },
-                            true,
-                        );
-                    } else {
-                        crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
-                    }
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let presented = exact_presented
-            .as_ref()
-            .map(|presented| presented.frame.clone())
-            .or_else(|| recording_presented.map(|presented| presented.frame));
-        // Keep the request plan as semantic authority whenever it also
-        // authorized the synchronous present. Headless terminal preparation
-        // temporarily consumes it and returns the exact capture plan; native
-        // routes only borrow it. Either way text projection and link hover reuse
-        // one plan instead of walking the visible tree again.
-        let mut frame_plan = request_layout_authoritative.then_some(request_plan);
-        if presented.is_none() {
-            // Headless has no surface destination to copy. Stage one
-            // zoom-aware semantic-renderer artifact; this path intentionally
-            // makes no byte-identity claim about present-only transforms.
-            match route {
-                crate::VisibleContentRoute::Terminal { .. } => {
-                    // SPLIT TABS: the SIGUSR1 snapshot shares the `image` verb's
-                    // composed-capture recipe — a terminal-only multi-pane tab writes
-                    // the divider grid + per-pane composite (each pane keeping its OWN
-                    // live default background), never the front pane stretched over the
-                    // window. Single-pane keeps the historical front-terminal refill,
-                    // byte-for-byte. The pass takes the presentation path's grid without
-                    // its semantics: it reconciles no predictions and stamps no
-                    // glass present. The advancing headless arm consumes exactly
-                    // the damage paired with this explicit present-real capture.
-                    let capture_now = Instant::now();
-                    // The band's motion at the capture instant (design §10.8):
-                    // a capture is a pure function of the center and `capture_now`.
-                    self.prepare_band_motion(front, capture_now);
-                    let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
-                    let prepared = if let Some(plan) = frame_plan.take() {
-                        self.prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
-                            front, plan, clock,
-                        )
-                    } else {
-                        self.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
-                            front, clock,
-                        )
-                    };
-                    let (capture_grid, capture_plan) = match prepared {
-                        crate::app_render::CapturePreparation::Ready(prepared) => prepared,
-                        crate::app_render::CapturePreparation::Held { .. }
-                        | crate::app_render::CapturePreparation::Unavailable => return,
-                    };
-                    let Some(capture_focus) = capture_grid.focus else {
-                        return;
-                    };
-                    // Both one-pane and composed captures need the companion
-                    // splice. The helper dispatches the split path itself and
-                    // retains (rather than advances) under a recording owner.
-                    self.capture_words_sampled(front, capture_now, capture_focus);
-                    self.refresh_pane_headers(front, &capture_plan);
-                    self.paint_pane_headers(front);
-                    self.splice_tab_strip(front);
-                    self.refresh_pane_overlay_for_capture(front, &capture_plan, capture_now);
-                    self.splice_pane_overlay(front);
-                    self.splice_find_bar(front);
-                    self.splice_settings_panel(front);
-                    self.splice_build_badge(front);
-                    self.splice_stats_deck(front);
-                    self.fold_stats_deck(front);
-                    frame_plan = Some(capture_plan);
-                }
-                crate::VisibleContentRoute::Native { .. } => {
-                    let prepared = if let Some(plan) = frame_plan.as_ref() {
-                        self.prepare_native_input_scratch_from_capture_plan(front, plan)
-                    } else {
-                        self.prepare_native_input_scratch(front)
-                    };
-                    if !prepared {
-                        return;
-                    }
-                    self.splice_find_bar(front);
-                    self.splice_build_badge(front);
-                    if !self.compose_native_route_card(front) {
-                        return;
-                    }
-                    self.splice_stats_deck(front);
-                    self.fold_stats_deck(front);
-                }
-                crate::VisibleContentRoute::Heterogeneous => {
-                    let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
-                    let prepared = if let Some(plan) = frame_plan.as_ref() {
-                        self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
-                            front,
-                            Some(clock),
-                            plan,
-                        )
-                    } else {
-                        self.prepare_heterogeneous_input_scratch_with_cursor_fx_outcome(
-                            front,
-                            Some(clock),
-                        )
-                    };
-                    if !matches!(prepared, crate::app_render::CapturePreparation::Ready(_)) {
-                        return;
-                    }
-                    self.splice_find_bar(front);
-                    self.splice_build_badge(front);
-                    if !self.compose_native_route_card(front) {
-                        return;
-                    }
-                    self.splice_stats_deck(front);
-                    self.fold_stats_deck(front);
-                }
-            }
-            // The Claude Code footer, as on the presentation routes: `image`
-            // must show the row the window shows (`crate::claude_footer`).
-            if let Some(plan) = frame_plan.as_ref() {
-                self.splice_claude_footer(front, plan, route);
-            }
-            // The Autopilot menu hangs from the chip the footer just drew
-            // (`crate::autopilot_menu`), as on the presentation routes.
-            self.splice_autopilot_menu(front);
-            self.splice_paste_banner(front);
-            // A capture that omitted the link caption would tell a driving AI a
-            // hyperlink is undisclosed while a human is reading its destination.
-            // Last of the row bands, as on the presentation routes: it takes
-            // only a row no other band declared.
-            if let Some(plan) = frame_plan.as_ref() {
-                self.splice_link_target_from_plan(front, plan);
-            } else {
-                self.splice_link_target(front);
-            }
-            // C5: the open tab context menu is the topmost chrome on the glass,
-            // so it must be the topmost chrome in the capture too — an
-            // introspection frame that omits it would tell a driving AI the
-            // menu is closed while a human is looking at it. Same last-of-all
-            // position as the presentation routes. A no-op with none open.
-            self.splice_tab_menu(front);
-        }
-        let cols = match self.windows.get(&front) {
-            Some(ws) => ws.cols as usize,
-            None => return,
-        };
-        let presented_visuals =
-            presented
-                .as_ref()
-                .map(|presented| crate::app_render::HostVisualState {
-                    invert: presented.invert,
-                    overlay: presented.overlay,
-                });
-        let mut capture_input = match presented {
-            Some(presented) => presented.input,
-            None => self.windows[&front].input_scratch.clone(),
-        };
+        // Terminal rows share the accessibility serializer; native rows come
+        // from the exact retained `CompiledUi` that supplied the route's raster.
         let text = self.snapshot_visible_text(
             front,
-            route,
-            frame_plan.as_ref(),
-            &capture_input,
+            context.route,
+            &context.plan,
+            model
+                .as_ref()
+                .unwrap_or(&self.windows[&front].input_scratch),
             strip_rows,
             cols,
         );
-        if let Some(recording_destination) = recording_destination {
-            self.submit_encode_job(EncodeJob::Snapshot {
-                frame: recording_destination.frame,
-                text,
-                transaction,
-            });
-            return;
-        }
-        if let Some(exact) = exact_presented.as_ref() {
-            let frame = match snapshot_frame_from_presented_client(&exact.client) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
-                    return;
+        let pixels = match source {
+            CaptureSource::Destination { pixels, .. } => pixels,
+            CaptureSource::Rerender { visuals, .. } => {
+                let mut input = model.unwrap_or_else(|| self.take_rerender_input(front));
+                let frame = self.rerender_capture(front, &mut input, visuals);
+                match frame.and_then(CapturePixels::packed) {
+                    Ok(pixels) => pixels,
+                    Err(error) => {
+                        crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
+                        return;
+                    }
                 }
-            };
-            self.submit_encode_job(EncodeJob::Snapshot {
-                frame,
-                text,
-                transaction,
-            });
-            return;
-        }
-        // A retained frame owns even an absent overlay. Only an unpresented
-        // capture samples current host policy, once before the disjoint borrow.
-        let visuals =
-            presented_visuals.unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
-        let tray_floor_y = self.paste_banner_tray_floor_y(front);
-        self.bind_window_renderer_state(front);
-        // Disjoint borrows: `self.backend` (renderer), the introspection GPU
-        // scratch, and the front window's input_scratch are separate fields.
-        let App {
-            backend,
-            introspect_gpu,
-            windows,
-            ..
-        } = self;
-        let Some(ws) = windows.get_mut(&front) else {
-            return;
-        };
-        // Headless semantic-renderer pixels. `backend.render_input_for_destination`
-        // returns an owned Frame on both backends; no surface exists, so this
-        // branch does not claim swapchain byte identity.
-        // P3 settings card → raw bytes + device-px rect for the GPU tray quad (same
-        // builder application-present uses). The GPU arm bakes it into the offscreen so
-        // app-present and capture share composition; the CPU arm ignores it here
-        // (composited below, gated on !is_gpu).
-        // Modal card FIRST, else the connection wire, else the build/version badge.
-        let tray_arg = ws
-            .deck_fold
-            .as_ref()
-            .or(ws.route_card.as_ref())
-            .or(ws.settings_card.as_ref())
-            .or(ws.badge_card.as_ref())
-            .or(ws.deck_card.as_ref())
-            .and_then(|card| tray_quad_below_y(card, tray_floor_y));
-        let destination_height = ws.win_px.map(|size| size.height.max(1) as usize);
-        let mut frame = match backend.render_input_for_destination(
-            introspect_gpu,
-            &mut capture_input,
-            tray_arg,
-            destination_height,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
-                return;
             }
         };
-        if !backend.is_gpu()
-            && let Some(quad) = ws
-                .deck_fold
-                .as_ref()
-                .or(ws.route_card.as_ref())
-                .or(ws.settings_card.as_ref())
-                .or(ws.badge_card.as_ref())
-                .or(ws.deck_card.as_ref())
-                .and_then(|card| tray_quad_below_y(card, tray_floor_y))
-        {
-            composite_tray_quad_at(&mut frame.pixels, frame.width, frame.height, 0, 0, quad);
-        }
-        // Preserve the retained or shared host visual policy, including the
-        // functional charging rim over modal overlays. This matches app-owned
-        // composition; the compositor and scanout remain outside the comparison.
-        apply_bell_invert(&mut frame, visuals.invert);
-        if let Some(overlay) = visuals.overlay {
-            apply_overlay_at(
-                &mut frame.pixels,
-                frame.width,
-                frame.height,
-                0,
-                0,
-                frame.width,
-                frame.height,
-                overlay,
-            );
-        }
-        // `text` was projected before the disjoint renderer borrow. Terminal
-        // rows share the accessibility serializer; native rows come from the
-        // exact retained `CompiledUi` that supplied this route's raster.
-        // Deflate + writes belong on the encode worker (the same 50–150 ms Retina
-        // stall the `image` verb routes around); the `.done` marker is written by
-        // the worker LAST, so the requester's stat() contract is unchanged.
         self.submit_encode_job(EncodeJob::Snapshot {
-            frame,
+            pixels,
             text,
             transaction,
         });
@@ -5037,11 +5889,12 @@ impl App {
 
     /// Hand a capture to the single PNG encode/write worker, spawning it lazily
     /// on first use (a run that never screenshots pays nothing). EXACTLY ONE
-    /// worker by design: queued `image` requests drained in one [`crate::Wake::Control`]
-    /// turn must reply in FIFO queue order, and a single mpsc consumer preserves
-    /// submission order. Admission is bounded and non-blocking: a saturated or
-    /// unavailable worker rejects and cleans the job instead of stalling the
-    /// event-loop thread or accumulating full-frame buffers without limit.
+    /// worker by design: `image` requests, one per [`crate::Wake::Image`] in the
+    /// order winit delivers them, must reply in that order, and a single mpsc
+    /// consumer preserves submission order. Admission is bounded and
+    /// non-blocking: a saturated or unavailable worker rejects and cleans the
+    /// job instead of stalling the event-loop thread or accumulating full-frame
+    /// buffers without limit.
     pub(crate) fn submit_encode_job(&mut self, mut job: EncodeJob) {
         // A VIDEO dump can hold the shared worker for seconds-to-minutes (hundreds of
         // full-frame PNG encodes); run it on its own ONE-SHOT lane so a subsequent
@@ -5081,7 +5934,7 @@ impl App {
             None
         } else {
             self.capture_permit.take().map(|mut permit| {
-                permit.recharge(job.frame_bytes());
+                permit.recharge(job.peak_bytes());
                 permit
             })
         };
@@ -5136,35 +5989,121 @@ impl App {
         }
     }
 
-    /// The framebuffer bytes a capture of `wid` will hold, estimated BEFORE it
-    /// is taken: the window's device-pixel size, or headless the grid plus its
-    /// chrome at this window's cell size. [`CapturePermit::recharge`] corrects
-    /// it to the frame actually produced.
-    fn capture_bytes_estimate(&self, wid: WindowId) -> usize {
+    /// The bytes a capture of `wid` will hold until its encode is done,
+    /// estimated BEFORE it is taken, as its job's `peak_bytes` will count
+    /// them, from what the capture may be made of (`charge`) and the window's
+    /// geometry: its frame's size (the window's device-pixel size, or headless
+    /// the grid plus its chrome at this window's cell size) and the destination
+    /// its present can be tapped for ([`Self::destination_capture_bytes`]).
+    /// A frame charges [`frame_capture_peak`]; a `window`, its photograph and
+    /// stitch ([`Self::window_capture_estimate`]). [`CapturePermit::recharge`]
+    /// corrects it to the capture actually produced.
+    fn capture_bytes_estimate(&self, wid: WindowId, charge: CaptureCharge) -> usize {
         let Some(ws) = self.windows.get(&wid) else {
             return 0;
         };
-        if let Some(px) = ws.win_px {
-            return (px.width as usize)
-                .saturating_mul(px.height as usize)
-                .saturating_mul(4);
+        let (width, height) = match ws.win_px {
+            Some(px) => (px.width as usize, px.height as usize),
+            None => {
+                let (cw, ch) = self.win_cell_size(wid);
+                let rows = usize::from(ws.rows).saturating_add(usize::from(self.chrome_rows(wid)));
+                (
+                    usize::from(ws.cols).saturating_mul(cw),
+                    rows.saturating_mul(ch),
+                )
+            }
+        };
+        let destination = self.destination_capture_bytes(wid, width, height);
+        match charge {
+            CaptureCharge::Frame(DestinationDemand::Never) => {
+                frame_capture_peak(width, height, None)
+            }
+            CaptureCharge::Frame(_) => frame_capture_peak(width, height, destination),
+            #[cfg(any(target_os = "macos", windows))]
+            CaptureCharge::Window => {
+                self.window_capture_estimate(wid, (width, height), destination)
+            }
         }
-        let (cw, ch) = self.win_cell_size(wid);
-        let rows = usize::from(ws.rows).saturating_add(usize::from(self.chrome_rows(wid)));
-        usize::from(ws.cols)
-            .saturating_mul(cw)
-            .saturating_mul(rows.saturating_mul(ch))
-            .saturating_mul(4)
     }
 
-    /// ADMIT a capture of `wid` BEFORE taking it: reserve its framebuffer bytes
-    /// from the encoder's in-flight budget ([`CAPTURE_BYTE_BUDGET`]) and park
+    /// The allocation of a destination tapped from `wid`'s present, as it
+    /// travels to the encode worker ([`CapturePixels::peak_bytes`] counts the
+    /// whole of it however it is cut): a GPU swapchain's mapped copy, its
+    /// format's texels in rows padded to the copy alignment
+    /// ([`aterm_gpu::GpuSurface::snapshot_bytes`]); a CPU present's softbuffer
+    /// of the `width`×`height` window, four bytes a pixel; a headless
+    /// recording's virtual target as mapped
+    /// ([`aterm_gpu::WindowGpu::virtual_snapshot_bytes`]). `None` when nothing
+    /// can be tapped.
+    fn destination_capture_bytes(
+        &self,
+        wid: WindowId,
+        width: usize,
+        height: usize,
+    ) -> Option<usize> {
+        match self.windows.get(&wid)?.present.as_ref()? {
+            crate::PresentTarget::Gpu { gpu_surface, .. } => gpu_surface.snapshot_bytes(),
+            crate::PresentTarget::Cpu { .. } => {
+                Some(width.saturating_mul(height).saturating_mul(4))
+            }
+            crate::PresentTarget::Virtual { window_gpu } => window_gpu.virtual_snapshot_bytes(),
+        }
+    }
+
+    /// A `window` capture's estimate ([`StitchCharge`]): the photograph at
+    /// the platform window's outer size (the frame's size when there is no
+    /// platform window), the presented client (`destination`, or the frame's
+    /// packed size), and on macOS the titlebar chrome as wide as the
+    /// photograph and as tall as the window's chrome headroom, handed over as
+    /// an 8-bit bitmap.
+    #[cfg(any(target_os = "macos", windows))]
+    fn window_capture_estimate(
+        &self,
+        wid: WindowId,
+        (width, height): (usize, usize),
+        destination: Option<usize>,
+    ) -> usize {
+        let ws = self.windows.get(&wid);
+        let (photo_width, photo_height) =
+            ws.and_then(|ws| ws.os_window.as_ref())
+                .map_or((width, height), |window| {
+                    let outer = window.outer_size();
+                    (outer.width as usize, outer.height as usize)
+                });
+        #[cfg(target_os = "macos")]
+        let chrome = ws.map_or(0, |ws| {
+            let chrome_height = ws.metrics.head.min(photo_height);
+            let bitmap = photo_width.saturating_mul(chrome_height).saturating_mul(4);
+            chrome_peak_bytes(photo_width, chrome_height, bitmap)
+        });
+        #[cfg(not(target_os = "macos"))]
+        let chrome = 0;
+        StitchCharge {
+            width: photo_width,
+            height: photo_height,
+            photograph: photo_width.saturating_mul(photo_height).saturating_mul(4),
+            client: destination.unwrap_or_else(|| width.saturating_mul(height).saturating_mul(4)),
+            client_width: width,
+            chrome,
+            outer_shape: ShotEncoding::NATIVE.carries_outer_shape(),
+        }
+        .peak_bytes()
+    }
+
+    /// ADMIT a capture of `wid` BEFORE taking it: reserve its estimated bytes
+    /// ([`Self::capture_bytes_estimate`]) from the encoder's in-flight budget
+    /// ([`CAPTURE_BYTE_BUDGET`]) and park
     /// the permit where the capture's [`Self::submit_encode_job`] picks it up.
     /// `false` means the encoder already holds too much: the caller answers
     /// busy (`encode queue full; retry`) WITHOUT capturing — no photograph, no
     /// readback, nothing thrown away on the event loop.
-    fn admit_capture(&mut self, wid: Option<WindowId>) -> bool {
-        let bytes = wid.map_or(0, |wid| self.capture_bytes_estimate(wid));
+    fn admit_capture(&mut self, wid: Option<WindowId>, charge: CaptureCharge) -> bool {
+        let bytes = wid.map_or(0, |wid| self.capture_bytes_estimate(wid, charge));
+        self.admit_capture_bytes(bytes)
+    }
+
+    /// [`Self::admit_capture`] for a capture estimated at `bytes`.
+    fn admit_capture_bytes(&mut self, bytes: usize) -> bool {
         match CapturePermit::try_reserve(&self.capture_bytes, bytes) {
             Some(permit) => {
                 self.capture_permit = Some(permit);
@@ -5175,243 +6114,151 @@ impl App {
         }
     }
 
-    /// Capture a native tab app from the exact retained UI tree used for its
-    /// application-present render. Native views have no terminal to snapshot; their semantic
-    /// tray is nevertheless a first-class framebuffer and must remain visible
-    /// through the canonical `image` verb.
-    ///
-    /// The request travels as one value ([`NativeImageRequest`]) rather than as
-    /// nine positional arguments: the capture, authority, cancellation, metadata
-    /// and reply state are independent, so naming them at every call site is
-    /// what keeps them from being silently reordered.
-    fn render_native_image(&mut self, request: NativeImageRequest<'_>) {
-        let NativeImageRequest {
-            handoff,
-            reply,
-            frame_metadata,
-            cancel,
-            target,
-            want_metadata,
-            want_bytes,
-            front,
-            clean,
-            request_layout,
-            presented_metadata,
-            presented,
-            exact_frame,
-        } = request;
-        if cancel.is_cancelled() {
-            let _ = reply.send(Err("image request cancelled before render".to_string()));
-            return;
-        }
-        // PIXEL demand — see `render_image`. Redeemed here too rather than only at
-        // the caller: this is the entry the direct (test) callers use, and a second
-        // call from `render_image` is a no-op.
-        self.ensure_pixel_backend();
-        let exact_frame = (!clean).then_some(exact_frame).flatten();
-        let mut resolved_layout = request_layout;
-        if presented.is_none() && exact_frame.is_none() {
-            if resolved_layout.is_none() {
-                resolved_layout = self.active_visible_frame_layout(front);
-            }
-            let prepared = match resolved_layout.as_ref() {
-                Some((plan, crate::VisibleContentRoute::Heterogeneous)) => {
-                    let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
-                    match self.prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan_outcome(
-                        front,
-                        Some(clock),
-                        plan,
-                    ) {
-                        crate::app_render::CapturePreparation::Ready(_) => true,
-                        crate::app_render::CapturePreparation::Held { retry_at } => {
-                            let retry_ms = retry_at
-                                .saturating_duration_since(Instant::now())
-                                .as_millis()
-                                .max(1);
-                            let _ = reply.send(Err(format!(
-                                "image deferred: synchronized terminal update in progress; retry after {retry_ms} ms"
-                            )));
-                            return;
-                        }
-                        crate::app_render::CapturePreparation::Unavailable => false,
-                    }
-                }
-                Some((plan, crate::VisibleContentRoute::Native { .. })) => {
-                    self.prepare_native_input_scratch_from_capture_plan(front, plan)
-                }
-                Some((_, crate::VisibleContentRoute::Terminal { .. })) | None => false,
-            };
-            if !prepared {
-                let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-                return;
-            }
-            self.splice_find_bar(front);
-            self.splice_build_badge(front);
-            if !self.compose_native_route_card(front) {
-                let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-                return;
-            }
-            self.splice_stats_deck(front);
-            self.fold_stats_deck(front);
-            // Native preparation leaves the semantic surface in the tray. Paint
-            // the paste question afterward, exactly like the application-present path.
-            if let Some((plan, route)) = resolved_layout.as_ref() {
-                self.splice_claude_footer(front, plan, *route);
-            }
-            self.splice_autopilot_menu(front);
-            self.splice_paste_banner(front);
-            if let Some((plan, _)) = resolved_layout.as_ref() {
-                self.splice_link_target_from_plan(front, plan);
-            } else {
-                self.splice_link_target(front);
-            }
-            // C5 — topmost chrome; see the `chrome`-capture route above.
-            self.splice_tab_menu(front);
-        }
-        let (presented_visuals, capture_serial, mut capture_input) = match presented {
-            Some(presented) => (
-                Some(crate::app_render::HostVisualState {
-                    invert: presented.invert,
-                    overlay: presented.overlay,
-                }),
-                Some(presented.serial),
-                presented.input,
-            ),
-            None => (None, None, self.windows[&front].input_scratch.clone()),
-        };
-        let visuals =
-            presented_visuals.unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
-        let phase = if presented_visuals.is_some() {
-            "presented"
-        } else {
-            "staged"
-        };
-        if clean {
-            capture_input.clear_overlays();
-        }
-        let frame = if let Some(frame) = exact_frame {
-            // Already post-blit/post-crown/post-chrome. Re-applying any live
-            // renderer or host state here would corrupt exact-present semantics.
-            frame
-        } else {
-            let tray_floor_y = self.paste_banner_tray_floor_y(front);
-            self.bind_window_renderer_state(front);
-            let render_t0 = Instant::now();
-            let App {
-                backend,
-                introspect_gpu,
-                windows,
-                ..
-            } = self;
-            let Some(ws) = windows.get_mut(&front).map(Box::as_mut) else {
-                let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-                return;
-            };
-            let crate::WindowState {
-                route_card,
-                settings_card,
-                badge_card,
-                deck_card,
-                deck_fold,
-                win_px,
-                ..
-            } = ws;
-            let tray_arg = deck_fold
-                .as_ref()
-                .or(route_card.as_ref())
-                .or(settings_card.as_ref())
-                .or(badge_card.as_ref())
-                .or(deck_card.as_ref())
-                .and_then(|card| tray_quad_below_y(card, tray_floor_y));
-            let destination_height = win_px.map(|size| size.height.max(1) as usize);
-            let mut frame = match backend.render_input_for_destination(
-                introspect_gpu,
-                &mut capture_input,
-                tray_arg,
-                destination_height,
-            ) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-            };
-            let cpu_tray = (!backend.is_gpu()).then_some(tray_arg).flatten();
-            let (frame_width, frame_height) = (frame.width, frame.height);
-            apply_host_chrome_at(
-                &mut frame.pixels,
-                frame_width,
-                frame_height,
-                0,
-                0,
-                frame_width,
-                frame_height,
-                cpu_tray,
-                visuals.invert,
-                visuals.overlay,
-            );
-            let render_ns = render_t0.elapsed().as_nanos() as u64;
-            crate::metrics::record_offscreen_raster(render_ns);
-            frame
-        };
-        if want_metadata {
-            let Ok(width) = u32::try_from(frame.width) else {
-                let _ = reply.send(Err("native image metadata width overflow".to_string()));
-                return;
-            };
-            let Ok(height) = u32::try_from(frame.height) else {
-                let _ = reply.send(Err("native image metadata height overflow".to_string()));
-                return;
-            };
-            let pixel_fingerprint =
-                Self::image_pixel_fingerprint(frame.width, frame.height, &frame.pixels);
-            let facts = ImageFrameFacts {
-                phase,
-                capture_serial,
-                width,
-                height,
-                pixel_fingerprint,
-            };
-            let metadata = if let Some(mut metadata) = presented_metadata {
-                metadata.width = width;
-                metadata.height = height;
-                metadata.pixel_fingerprint = pixel_fingerprint;
-                Ok(metadata)
-            } else {
-                match resolved_layout.as_ref() {
-                    Some((plan, _)) => self.native_image_metadata_from_plan(front, plan, facts),
-                    None => self.native_image_metadata(front, facts),
-                }
-            };
-            match metadata {
-                Ok(metadata) => {
-                    let _ = frame_metadata.set(metadata);
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-            }
-        }
-        self.submit_encode_job(EncodeJob::Image {
-            frame,
-            handoff,
-            target,
-            want_bytes,
-            cancel,
-            reply,
-        });
-    }
-
-    fn native_image_metadata(
+    /// The `--meta` identity of one encoded `image` frame, for every route: a
+    /// terminal frame's from its inventory and the model it shows
+    /// ([`Self::terminal_image_metadata`]), a native or mixed frame's from the
+    /// retained rasters of its plan ([`Self::native_image_metadata_from_plan`]),
+    /// or the facts a headless recording froze at its present. The encode
+    /// worker fills in the pixels' fingerprint and publishes it into `cell`.
+    fn image_metadata(
         &self,
         front: WindowId,
+        context: &CaptureContext,
+        model: &aterm_render::RenderInput,
         facts: ImageFrameFacts,
+        cell: std::sync::Arc<std::sync::OnceLock<crate::control::ImageFrameMetadata>>,
+    ) -> Result<PendingMetadata, String> {
+        if matches!(context.route, crate::VisibleContentRoute::Terminal { .. }) {
+            let grid = context
+                .terminal_grid
+                .as_ref()
+                .ok_or_else(|| "image: the frame has no terminal inventory".to_string())?;
+            return Ok(PendingMetadata {
+                metadata: self.terminal_image_metadata(
+                    front,
+                    grid,
+                    model,
+                    facts,
+                    context.recorded.as_ref(),
+                )?,
+                raster_is_pixels: true,
+                cell,
+            });
+        }
+        let metadata = match context
+            .recorded
+            .as_ref()
+            .and_then(|recorded| recorded.native_metadata.clone())
+        {
+            Some(mut metadata) => {
+                metadata.phase = facts.phase;
+                metadata.width = facts.width;
+                metadata.height = facts.height;
+                metadata
+            }
+            None => self.native_image_metadata_from_plan(front, &context.plan, facts)?,
+        };
+        Ok(PendingMetadata {
+            metadata,
+            raster_is_pixels: false,
+            cell,
+        })
+    }
+
+    /// The metadata of a terminal frame: the fingerprints of its engine
+    /// snapshot and geometry, and one leaf per visible pane. A single pane is
+    /// the frame's one view, and its leaf carries the frame's size; a split
+    /// names no singular view. The frame's raster is its encoded pixels, whose
+    /// fingerprint the encode worker fills in ([`PendingMetadata::publish`]).
+    fn terminal_image_metadata(
+        &self,
+        front: WindowId,
+        grid: &crate::app_render::TerminalCaptureGrid,
+        model: &aterm_render::RenderInput,
+        facts: ImageFrameFacts,
+        recorded: Option<&RecordedFacts>,
     ) -> Result<crate::control::ImageFrameMetadata, String> {
-        let plan = self
-            .active_visible_leaf_plan(front)
-            .ok_or_else(|| "native image metadata has no visible leaf plan".to_string())?;
-        self.native_image_metadata_from_plan(front, &plan, facts)
+        let ImageFrameFacts {
+            phase,
+            capture_serial,
+            width,
+            height,
+        } = facts;
+        let window = self
+            .windows
+            .get(&front)
+            .ok_or_else(|| "image metadata lost its window".to_string())?;
+        let (cell_w, cell_h) =
+            recorded.map_or_else(|| self.win_cell_size(front), |recorded| recorded.cell_size);
+        let snapshot_fingerprint = Self::terminal_capture_fingerprint(grid, model);
+        let geometry = Self::terminal_geometry_fingerprint(width as usize, height as usize, model);
+        let singular = (grid.leaves.len() == 1).then(|| grid.leaves[0]);
+        let leaves = grid
+            .leaves
+            .iter()
+            .map(|leaf| {
+                let leaf_width = singular.map_or_else(
+                    || u32::try_from(leaf.cols.saturating_mul(cell_w)).unwrap_or(u32::MAX),
+                    |_| width,
+                );
+                let leaf_height = singular.map_or_else(
+                    || u32::try_from(leaf.rows.saturating_mul(cell_h)).unwrap_or(u32::MAX),
+                    |_| height,
+                );
+                crate::control::ImageLeafFrameMetadata {
+                    kind: "terminal",
+                    view: leaf.view.get(),
+                    session: Some(leaf.session),
+                    focused: leaf.focused,
+                    width: leaf_width,
+                    height: leaf_height,
+                    snapshot_seq: Some(leaf.snapshot_seq),
+                    instance: None,
+                    generation: None,
+                    geometry: singular.map(|_| geometry),
+                    config_revision: None,
+                    update_revision: None,
+                    document_seq: None,
+                    presentation_revision: None,
+                    paint_revision: None,
+                    compiled_fingerprint: None,
+                    raster_fingerprint: singular.map(|_| 0),
+                }
+            })
+            .collect();
+        Ok(crate::control::ImageFrameMetadata {
+            frame_kind: if singular.is_some() {
+                "terminal"
+            } else {
+                "composite"
+            },
+            phase,
+            window: front.0,
+            view: singular.map(|leaf| leaf.view.get()),
+            generation: None,
+            config_revision: None,
+            update_revision: None,
+            document_seq: None,
+            presentation_revision: None,
+            paint_revision: None,
+            capture_serial: capture_serial.unwrap_or(window.capture_present_serial),
+            width,
+            height,
+            pixel_fingerprint: 0,
+            compiled_fingerprint: None,
+            raster_fingerprint: 0,
+            raster_model_fingerprint: snapshot_fingerprint,
+            raster_geometry: geometry,
+            overlay_fingerprint: recorded.map_or_else(
+                || window.overlay_fp(),
+                |recorded| recorded.overlay_fingerprint,
+            ),
+            theme_fingerprint: recorded.map_or_else(
+                || self.image_theme_fingerprint(),
+                |recorded| recorded.theme_fingerprint,
+            ),
+            leaves,
+        })
     }
 
     fn native_image_metadata_from_plan(
@@ -5420,23 +6267,13 @@ impl App {
         plan: &crate::tab_model::VisibleLeafPlan,
         facts: ImageFrameFacts,
     ) -> Result<crate::control::ImageFrameMetadata, String> {
-        use std::hash::{Hash, Hasher};
-
         let ImageFrameFacts {
             phase,
             capture_serial,
             width,
             height,
-            pixel_fingerprint,
         } = facts;
 
-        let fingerprint = |width: u32, height: u32, rgba: &[u8]| {
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            width.hash(&mut hash);
-            height.hash(&mut hash);
-            rgba.hash(&mut hash);
-            hash.finish() | 1
-        };
         let window = self
             .windows
             .get(&front)
@@ -5502,11 +6339,7 @@ impl App {
                         presentation_revision: Some(stamp.presentation_revision),
                         paint_revision: Some(stamp.paint_revision),
                         compiled_fingerprint: Some(raster.compiled.fingerprint()),
-                        raster_fingerprint: Some(fingerprint(
-                            raster.width,
-                            raster.height,
-                            &raster.rgba,
-                        )),
+                        raster_fingerprint: Some(raster.raster_fingerprint()),
                     });
                 }
                 None => {
@@ -5541,9 +6374,9 @@ impl App {
             capture_serial: capture_serial.unwrap_or(window.capture_present_serial),
             width,
             height,
-            pixel_fingerprint,
+            pixel_fingerprint: 0,
             compiled_fingerprint: primary.and_then(|leaf| leaf.compiled_fingerprint),
-            raster_fingerprint: fingerprint(card.pw, card.ph, &card.rgba),
+            raster_fingerprint: card.raster_fingerprint(),
             raster_model_fingerprint: card.fp,
             raster_geometry: card.geom,
             overlay_fingerprint: window.overlay_fp(),
@@ -5832,6 +6665,10 @@ impl App {
         geometry.finish() | 1
     }
 
+    /// `pixel-fingerprint` of packed pixels hashed in one piece: the reference
+    /// [`CapturePixels::pixel_fingerprint`] streams to, which the tests hold it
+    /// to.
+    #[cfg(test)]
     fn image_pixel_fingerprint<T: std::hash::Hash>(
         width: usize,
         height: usize,
@@ -5965,78 +6802,35 @@ impl App {
 
     /// Render the CURRENT terminal for the control socket's `image` verb (the
     /// same renderer the window uses, GPU path if active). Runs on the main
-    /// thread per [`crate::Wake::Control`] — but ONLY the render + app-composition
+    /// thread per [`crate::Wake::Image`] — but ONLY the render + app-composition
     /// composites: the PNG encode + confined write are handed to the encode
     /// worker, which transfers guarded `(width, height)` after the write. The
     /// control writer revalidates file replies and retains them through response
     /// ACK/quarantine; inline PNG memory is retained through write and flush.
     pub(crate) fn render_image(&mut self, req: ImageReq) {
-        // THE CAPTURE BYTE PERMIT, before anything is captured (see
-        // `admit_capture`). The window is resolved exactly as the body does.
-        let window = match req.session {
-            Some(session) => self.windows_displaying(session).next(),
-            None => self.frontmost_window,
-        };
-        if !self.admit_capture(window) {
-            crate::control_auth::cleanup_failed_automatic_image(&req.target);
-            let _ = req.reply.send(Err(format!("image {ENCODE_QUEUE_FULL}")));
-            return;
-        }
-        self.render_image_admitted(req);
-        // A body that deferred, refused or replied without an encode job
-        // leaves its permit here: release it.
-        self.capture_permit = None;
+        self.run_capture(CaptureRequest::Image(req));
     }
 
-    fn render_image_admitted(&mut self, req: ImageReq) {
-        self.prune_deferred_gpu_captures();
-        let requested_window = match req.session {
-            Some(session) => self.windows_displaying(session).next(),
-            None => self.frontmost_window,
-        };
-        if let Some(window) = requested_window
-            && self.replaying_gpu_capture != Some(window)
-            && self.has_deferred_gpu_capture(window)
-        {
-            self.queue_gpu_capture(window, DeferredGpuCaptureRequest::Image(req), false);
-            return;
-        }
-        if self.replaying_gpu_capture != requested_window || requested_window.is_none() {
-            self.capture_present_budget = CapturePresentBudget::default();
-        }
-        let ImageReq {
-            handoff,
-            target,
-            clean,
-            session,
-            want_bytes,
-            want_metadata,
-            frame_metadata,
-            cancel,
-            reply,
-        } = req;
-        if cancel.is_cancelled() {
-            let _ = reply.send(Err("image request cancelled before render".to_string()));
-            return;
-        }
-        // THE headless pixel demand. Redeem the deferred GPU intent before any
-        // capture geometry or renderer state is read, so this capture is served by
-        // the same backend a boot-built one would have been — the parity the
-        // deferral is only allowed to exist under. No-op windowed, and after the
-        // first capture of a headless run.
-        self.ensure_pixel_backend();
-        // Cross-session (`@<sid> image`): render the window whose ACTIVE tab
-        // displays the target session — the frame that session's viewer actually
-        // sees (splits, decorations, tab strip included). Self keeps the frontmost
-        // window byte-for-byte. No displaying window (background tab / no windows)
-        // is its own `Err`; every later (0,0) reply is a window with nothing to
-        // capture this frame.
-        let win = match session {
-            Some(id) => self.windows_displaying(id).next(),
-            None => self.frontmost_window,
-        };
+    /// The `image` body, once [`Self::run_capture`] has admitted it. Cross-session
+    /// (`@<sid> image`), `win` is the window whose ACTIVE tab displays the target
+    /// session — the frame that session's viewer actually sees (splits,
+    /// decorations, tab strip included); self keeps the frontmost window
+    /// byte-for-byte ([`CaptureRequest::target_window`]). No displaying window
+    /// (background tab / no windows) is its own `Err`; every later (0,0) reply is
+    /// a window with nothing to capture this frame.
+    ///
+    /// `image` is deliberately the application's own frame, never a
+    /// platform-window photograph: only the distinct `window` verb includes
+    /// title bars, traffic lights and OS chrome. A WINDOWED capture is bound to
+    /// the real present it forces, without acquiring Screen Recording
+    /// permission or changing image dimensions when focus crosses a
+    /// terminal/native split: an opaque window's `image` is the destination
+    /// that present submitted, cut to the frame, so the picture cannot diverge
+    /// from the glass; `image plain`, a translucent window and a headless one
+    /// are renderer artifacts ([`capture_source_kind`]).
+    fn image_body(&mut self, win: Option<WindowId>, req: ImageReq) {
         let Some(front) = win else {
-            let _ = reply.send(Err(if session.is_some() {
+            let _ = req.reply.send(Err(if req.session.is_some() {
                 "image: no window shows that session; raise its tab (or end the pane zoom in it) first"
                     .to_string()
             } else {
@@ -6044,17 +6838,108 @@ impl App {
             }));
             return;
         };
-        let Some((request_plan, request_route)) = self.active_visible_frame_layout(front) else {
-            let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-            return;
+        let policy = SourcePolicy {
+            destination: DestinationDemand::of_image(req.clean),
+            frame_only: true,
+            model: req.want_metadata,
+            metadata: req.want_metadata,
         };
-        let recording_here = self
-            .video_rec
-            .as_ref()
-            .is_some_and(|recording| recording.window == front);
-        let mut recording_destination = if recording_here && !clean {
-            match self.recording_presented_destination_capture(front) {
-                Ok(destination) => Some(destination),
+        let capture = match self.resolve_capture_source(front, policy) {
+            Ok(capture) => capture,
+            Err(CaptureDeferral::PendingGpu) => {
+                self.queue_gpu_capture(front, CaptureRequest::Image(req), true);
+                return;
+            }
+            Err(CaptureDeferral::Nothing) => {
+                let _ = req
+                    .reply
+                    .send(Ok(crate::control::Retained::plain((0, 0, None))));
+                return;
+            }
+            Err(CaptureDeferral::Held { retry_at }) => {
+                let retry_ms = retry_at
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .max(1);
+                let _ = req.reply.send(Err(format!(
+                    "image deferred: synchronized terminal update in progress; retry after {retry_ms} ms"
+                )));
+                return;
+            }
+            Err(CaptureDeferral::Refused(error)) => {
+                let _ = req.reply.send(Err(error));
+                return;
+            }
+        };
+        self.image_tail(front, capture, req);
+    }
+
+    /// Finish an `image` from its resolved source: the frame (a destination as
+    /// it is, or the one rerender of an owned copy of the model, which `image
+    /// plain` strips of its bling layers), its metadata, and the encode.
+    fn image_tail(&mut self, front: WindowId, capture: ResolvedCapture, req: ImageReq) {
+        let ImageReq {
+            handoff,
+            target,
+            clean,
+            session: _,
+            want_bytes,
+            want_metadata,
+            frame_metadata,
+            cancel,
+            reply,
+        } = req;
+        let ResolvedCapture {
+            source,
+            model,
+            context,
+        } = capture;
+        let capture_serial = source.serial();
+        let phase = source.phase();
+        let (pixels, model) = match source {
+            CaptureSource::Destination { pixels, .. } => (pixels, model),
+            CaptureSource::Rerender { visuals, .. } => {
+                // CLEAN capture (`image plain`): drop every host-owned bling
+                // LAYER so the AI reads the bare terminal (cursor trail, LUMEN
+                // glow, sparkle-word decorations, the animated Scene). They
+                // live in separate `RenderInput` fields of this copy, so the
+                // cell grid is untouched, and so is the scratch a later present
+                // or capture reuses.
+                let mut input = model.unwrap_or_else(|| self.take_rerender_input(front));
+                if clean {
+                    input.clear_overlays();
+                }
+                let frame = self.rerender_capture(front, &mut input, visuals);
+                match frame.and_then(CapturePixels::packed) {
+                    Ok(pixels) => (pixels, Some(input)),
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        };
+        // The metadata is built here, from the model and layout of this turn;
+        // the encode worker hashes the pixels it encodes into it.
+        let metadata = if want_metadata {
+            let (width, height) = pixels.dims();
+            let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+                let _ = reply.send(Err(
+                    "image metadata dimensions exceed the wire format".to_string()
+                ));
+                return;
+            };
+            let facts = ImageFrameFacts {
+                phase,
+                capture_serial,
+                width,
+                height,
+            };
+            let model = model
+                .as_ref()
+                .unwrap_or(&self.windows[&front].input_scratch);
+            match self.image_metadata(front, &context, model, facts, frame_metadata) {
+                Ok(metadata) => Some(metadata),
                 Err(error) => {
                     let _ = reply.send(Err(error));
                     return;
@@ -6063,447 +6948,6 @@ impl App {
         } else {
             None
         };
-        let route = recording_destination
-            .as_ref()
-            .map_or(request_route, |destination| destination.route);
-        if !want_metadata && let Some(destination) = recording_destination.take() {
-            // The common live-repro path: no semantic clone, hash or reraster.
-            // The explicit request pays one destination copy/readback only.
-            self.submit_encode_job(EncodeJob::Image {
-                frame: destination.frame,
-                handoff,
-                target,
-                want_bytes,
-                cancel,
-                reply,
-            });
-            return;
-        }
-        let request_layout_authoritative =
-            recording_destination.is_none() && route == request_route;
-        if matches!(
-            route,
-            crate::VisibleContentRoute::Native { .. } | crate::VisibleContentRoute::Heterogeneous
-        ) {
-            // `image` is deliberately the route-neutral renderer framebuffer,
-            // never a platform-window photograph. Native and heterogeneous
-            // routes compile into that same semantic surface; only the distinct
-            // `window` verb includes title bars, traffic lights, and OS chrome.
-            // Synchronize windowed callers through the ordinary present serial
-            // without acquiring Screen Recording permission or changing image
-            // dimensions when focus crosses a terminal/native split.
-            let presented = match self.present_before_frame_capture(
-                front,
-                request_layout_authoritative.then_some((&request_plan, request_route)),
-            ) {
-                Ok(presented) => presented,
-                Err(error) => {
-                    if error == GPU_CAPTURE_PENDING {
-                        self.queue_gpu_capture(
-                            front,
-                            DeferredGpuCaptureRequest::Image(ImageReq {
-                                handoff,
-                                target,
-                                clean,
-                                session,
-                                want_bytes,
-                                want_metadata,
-                                frame_metadata,
-                                cancel,
-                                reply,
-                            }),
-                            true,
-                        );
-                    } else {
-                        let _ = reply.send(Err(error));
-                    }
-                    return;
-                }
-            };
-            let mut presented_metadata = None;
-            let presented = if presented.is_some() || !recording_here {
-                presented
-            } else {
-                let resolved =
-                    match self.recording_presented_frame_capture(front, false, want_metadata) {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            let _ = reply.send(Err(error));
-                            return;
-                        }
-                    };
-                presented_metadata = resolved.native_metadata;
-                Some(resolved.frame)
-            };
-            self.render_native_image(NativeImageRequest {
-                front,
-                clean,
-                presented,
-                request_layout: request_layout_authoritative
-                    .then_some((request_plan, request_route)),
-                presented_metadata,
-                exact_frame: recording_destination.map(|destination| destination.frame),
-                handoff,
-                target,
-                want_bytes,
-                want_metadata,
-                cancel,
-                frame_metadata: &frame_metadata,
-                reply,
-            });
-            return;
-        }
-        // A WINDOWED capture routes through the real present and then reuses THAT
-        // frame's composed grid, so the picture can never diverge from the glass.
-        // A glass-less window has no such authority, so the fallback below builds
-        // the terminal band without entering the present decision path: a
-        // pure-terminal split is one composite capture, not a full-window refill of
-        // only its focused terminal, and every pane keeps its OWN live default
-        // background instead of inheriting the front pane's. That path stays a READ
-        // — no damage consumed, no present stamped.
-        let presented = match self.present_before_terminal_capture(
-            front,
-            request_layout_authoritative.then_some((&request_plan, request_route)),
-        ) {
-            Ok(presented) => presented,
-            Err(error) => {
-                if error == GPU_CAPTURE_PENDING {
-                    self.queue_gpu_capture(
-                        front,
-                        DeferredGpuCaptureRequest::Image(ImageReq {
-                            handoff,
-                            target,
-                            clean,
-                            session,
-                            want_bytes,
-                            want_metadata,
-                            frame_metadata,
-                            cancel,
-                            reply,
-                        }),
-                        true,
-                    );
-                } else {
-                    let _ = reply.send(Err(error));
-                }
-                return;
-            }
-        };
-        let presented = if presented.is_some() || !recording_here {
-            presented
-        } else {
-            let resolved = match self.recording_presented_frame_capture(front, true, false) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-            };
-            let Some(grid) = resolved.terminal_grid else {
-                let _ = reply.send(Err(
-                    "image deferred: recorded terminal inventory is unavailable".to_string(),
-                ));
-                return;
-            };
-            Some(PresentedTerminalCapture {
-                input: resolved.frame.input,
-                grid,
-                invert: resolved.frame.invert,
-                overlay: resolved.frame.overlay,
-                serial: resolved.frame.serial,
-                cell_size: resolved.cell_size,
-                theme_fingerprint: resolved.theme_fingerprint,
-                overlay_fingerprint: resolved.overlay_fingerprint,
-            })
-        };
-        let mut presented_authority = None;
-        let mut presented_input = None;
-        let capture_grid = if let Some(presented) = presented {
-            presented_authority = Some(PresentedTerminalAuthority {
-                invert: presented.invert,
-                overlay: presented.overlay,
-                serial: presented.serial,
-                cell_size: presented.cell_size,
-                theme_fingerprint: presented.theme_fingerprint,
-                overlay_fingerprint: presented.overlay_fingerprint,
-            });
-            presented_input = Some(presented.input);
-            presented.grid
-        } else {
-            // A window without an OS presentation target has no prior
-            // application-present artifact. Its explicit image is the one
-            // present-real tick, built from current terminals.
-            let capture_now = Instant::now();
-            // The band's motion at the capture instant (design §10.8).
-            self.prepare_band_motion(front, capture_now);
-            let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
-            let prepared = if request_layout_authoritative {
-                self.prepare_terminal_capture_grid_with_cursor_fx_for_plan_outcome(
-                    front,
-                    request_plan,
-                    clock,
-                )
-            } else {
-                self.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(front, clock)
-            };
-            let (capture_grid, capture_plan) = match prepared {
-                crate::app_render::CapturePreparation::Ready(prepared) => prepared,
-                crate::app_render::CapturePreparation::Held { retry_at } => {
-                    let retry_ms = retry_at
-                        .saturating_duration_since(Instant::now())
-                        .as_millis()
-                        .max(1);
-                    let _ = reply.send(Err(format!(
-                        "image deferred: synchronized terminal update in progress; retry after {retry_ms} ms"
-                    )));
-                    return;
-                }
-                crate::app_render::CapturePreparation::Unavailable => {
-                    let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-                    return;
-                }
-            };
-            let Some(capture_focus) = capture_grid.focus else {
-                let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-                return;
-            };
-            // Unlike the cursor light extractor, the decoration splice already
-            // dispatches on one-pane versus composed geometry. It also owns the
-            // capture/recording clock boundary, so this is safe in both modes.
-            self.capture_words_sampled(front, capture_now, capture_focus);
-            self.refresh_pane_headers(front, &capture_plan);
-            self.paint_pane_headers(front);
-            self.splice_tab_strip(front);
-            // The overlay scrollbar and hollow cursors (`crate::pane_chrome`).
-            self.refresh_pane_overlay_for_capture(front, &capture_plan, capture_now);
-            self.splice_pane_overlay(front);
-            self.splice_find_bar(front);
-            self.splice_settings_panel(front);
-            self.splice_build_badge(front);
-            self.splice_stats_deck(front);
-            self.fold_stats_deck(front);
-            self.splice_claude_footer(
-                front,
-                &capture_plan,
-                crate::VisibleContentRoute::Terminal {
-                    composed: capture_grid.composed,
-                },
-            );
-            self.splice_autopilot_menu(front);
-            self.splice_paste_banner(front);
-            self.splice_link_target_from_plan(front, &capture_plan);
-            // C5 — topmost chrome; see the `chrome`-capture route above.
-            self.splice_tab_menu(front);
-            capture_grid
-        };
-        // Always rasterize an owned explicit-capture snapshot. In particular,
-        // `image plain` clears overlays on this clone, never on the retained
-        // window scratch that a later present/capture reuses.
-        let mut capture_input =
-            presented_input.unwrap_or_else(|| self.windows[&front].input_scratch.clone());
-        // Preserve retained absence as authority; only the unpresented fallback
-        // samples the shared phase-aware host policy before the disjoint borrow.
-        let visuals = presented_authority
-            .map(|presented| crate::app_render::HostVisualState {
-                invert: presented.invert,
-                overlay: presented.overlay,
-            })
-            .unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
-        let tray_floor_y = self.paste_banner_tray_floor_y(front);
-        let theme_fingerprint = presented_authority.map_or_else(
-            || self.image_theme_fingerprint(),
-            |presented| presented.theme_fingerprint,
-        );
-        let capture_cell_size = presented_authority.map_or_else(
-            || self.win_cell_size(front),
-            |presented| presented.cell_size,
-        );
-        if let (Some(destination), Some(authority)) =
-            (recording_destination.as_ref(), presented_authority)
-        {
-            debug_assert_eq!(destination.serial, authority.serial);
-        }
-        let exact_frame = recording_destination.map(|destination| destination.frame);
-        let exact_destination = exact_frame.is_some();
-        if !exact_destination {
-            self.bind_window_renderer_state(front);
-        }
-        // Disjoint borrows: `self.backend` (renderer), the introspection GPU
-        // scratch, and the front window's input_scratch are separate fields.
-        let App {
-            backend,
-            introspect_gpu,
-            windows,
-            ..
-        } = self;
-        let Some(ws) = windows.get_mut(&front) else {
-            let _ = reply.send(Ok(crate::control::Retained::plain((0, 0, None))));
-            return;
-        };
-        // CLEAN capture (`image plain`): drop every host-owned bling LAYER so the AI reads
-        // the bare terminal — cursor trail + LUMEN glow + sparkle-word decorations + the
-        // animated Scene. They live in separate `RenderInput` fields, so this is just those
-        // layers emptied; the cell grid (text) is untouched.
-        if clean {
-            capture_input.clear_overlays();
-        }
-        // Time the rasterization so the `metrics` verb reports a real
-        // `last_frame_render_ms` in HEADLESS mode too. Windowed application frames are timed in
-        // `redraw_window`; without this, headless (no OS surface → no
-        // RedrawRequested → no `record_present`) leaves every counter frozen at 0,
-        // so a perf audit driven over the control socket could measure nothing.
-        // Present latency is recorded as 0 — honest: the `image` verb rasterizes to
-        // a buffer; it does not submit to an OS presentation target.
-        let render_t0 = (!exact_destination).then(Instant::now);
-        // P3 settings card → raw bytes + device-px rect for the GPU tray quad (same
-        // builder application-present uses). The GPU arm bakes it into the
-        // offscreen so capture and application-present share composition; the
-        // CPU arm ignores it here (composited below, gated on !is_gpu).
-        // Modal card FIRST, else the connection wire, else the build/version badge.
-        let tray_arg = ws
-            .present_card()
-            .and_then(|card| tray_quad_below_y(card, tray_floor_y));
-        let destination_height = ws.win_px.map(|size| size.height.max(1) as usize);
-        let mut frame = if let Some(frame) = exact_frame {
-            // Exact current VirtualTarget destination. It already contains the
-            // success-time crop, tray, bell/overlay and GPU-only crown passes.
-            frame
-        } else {
-            match backend.render_input_for_destination(
-                introspect_gpu,
-                &mut capture_input,
-                tray_arg,
-                destination_height,
-            ) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                    return;
-                }
-            }
-        };
-        if !exact_destination
-            && !backend.is_gpu()
-            && let Some(quad) = ws
-                .present_card()
-                .and_then(|card| tray_quad_below_y(card, tray_floor_y))
-        {
-            composite_tray_quad_at(&mut frame.pixels, frame.width, frame.height, 0, 0, quad);
-        }
-        if let Some(render_t0) = render_t0 {
-            let render_ns = render_t0.elapsed().as_nanos() as u64;
-            crate::metrics::record_offscreen_raster(render_ns);
-        }
-        // Match app-owned visual composition, including the charging rim over
-        // overlays. Exact destinations already contain these passes and must
-        // not receive them twice; compositor/scanout are outside this boundary.
-        if !exact_destination {
-            apply_bell_invert(&mut frame, visuals.invert);
-            if let Some(overlay) = visuals.overlay {
-                apply_overlay_at(
-                    &mut frame.pixels,
-                    frame.width,
-                    frame.height,
-                    0,
-                    0,
-                    frame.width,
-                    frame.height,
-                    overlay,
-                );
-            }
-        }
-        if want_metadata {
-            let Ok(width) = u32::try_from(frame.width) else {
-                let _ = reply.send(Err(
-                    "terminal image metadata width exceeds the wire format".to_string()
-                ));
-                return;
-            };
-            let Ok(height) = u32::try_from(frame.height) else {
-                let _ = reply.send(Err(
-                    "terminal image metadata height exceeds the wire format".to_string(),
-                ));
-                return;
-            };
-            let pixel_fingerprint =
-                Self::image_pixel_fingerprint(frame.width, frame.height, &frame.pixels);
-            let snapshot_fingerprint =
-                Self::terminal_capture_fingerprint(&capture_grid, &capture_input);
-            let geometry =
-                Self::terminal_geometry_fingerprint(frame.width, frame.height, &capture_input);
-            let singular = (capture_grid.leaves.len() == 1).then(|| capture_grid.leaves[0]);
-            let (cell_w, cell_h) = capture_cell_size;
-            let leaves = capture_grid
-                .leaves
-                .iter()
-                .map(|leaf| {
-                    let leaf_width = singular.map_or_else(
-                        || u32::try_from(leaf.cols.saturating_mul(cell_w)).unwrap_or(u32::MAX),
-                        |_| width,
-                    );
-                    let leaf_height = singular.map_or_else(
-                        || u32::try_from(leaf.rows.saturating_mul(cell_h)).unwrap_or(u32::MAX),
-                        |_| height,
-                    );
-                    crate::control::ImageLeafFrameMetadata {
-                        kind: "terminal",
-                        view: leaf.view.get(),
-                        session: Some(leaf.session),
-                        focused: leaf.focused,
-                        width: leaf_width,
-                        height: leaf_height,
-                        snapshot_seq: Some(leaf.snapshot_seq),
-                        instance: None,
-                        generation: None,
-                        geometry: singular.map(|_| geometry),
-                        config_revision: None,
-                        update_revision: None,
-                        document_seq: None,
-                        presentation_revision: None,
-                        paint_revision: None,
-                        compiled_fingerprint: None,
-                        raster_fingerprint: singular.map(|_| pixel_fingerprint),
-                    }
-                })
-                .collect();
-            let metadata = crate::control::ImageFrameMetadata {
-                frame_kind: if singular.is_some() {
-                    "terminal"
-                } else {
-                    "composite"
-                },
-                phase: "rendered",
-                window: front.0,
-                view: singular.map(|leaf| leaf.view.get()),
-                generation: None,
-                config_revision: None,
-                update_revision: None,
-                document_seq: None,
-                presentation_revision: None,
-                paint_revision: None,
-                capture_serial: presented_authority
-                    .map_or(ws.capture_present_serial, |presented| presented.serial),
-                width,
-                height,
-                pixel_fingerprint,
-                compiled_fingerprint: None,
-                raster_fingerprint: pixel_fingerprint,
-                raster_model_fingerprint: snapshot_fingerprint,
-                raster_geometry: geometry,
-                overlay_fingerprint: presented_authority.map_or_else(
-                    || ws.overlay_fp(),
-                    |presented| presented.overlay_fingerprint,
-                ),
-                theme_fingerprint,
-                leaves,
-            };
-            if frame_metadata.set(metadata).is_err() {
-                let _ = reply.send(Err(
-                    "terminal image metadata was already initialized".to_string()
-                ));
-                return;
-            }
-        }
         // `confine_image_path` (control thread) produced `target` as a canonical
         // `images/` dir + a SINGLE filename, forbidding nested target dirs. The
         // worker writes by opening THAT directory `O_DIRECTORY|O_NOFOLLOW` and
@@ -6516,16 +6960,57 @@ impl App {
         //
         // The PNG deflate (50–150 ms on a Retina-sized frame) + write run on the
         // encode worker, NOT this event-loop thread. Every app-owned splice/overlay
-        // above is already baked into the moved `frame`, and the worker replies
+        // above is already baked into the moved `pixels`, and the worker replies
         // only after the write — the client reads the file the moment it sees OK.
         self.submit_encode_job(EncodeJob::Image {
-            frame,
+            pixels,
+            metadata,
             handoff,
             target,
             want_bytes,
             cancel,
             reply,
         });
+    }
+
+    /// THE FRONT WINDOW'S TAB LINE WHERE NO NATIVE STRIP DRAWS IT (a macOS
+    /// `--headless` instance builds no toolbar): `toolbar-tabs …` as
+    /// [`crate::toolbar::format_tab_chrome`] formats the native strip's, from
+    /// the App's own model — the labels `inspect app/v1 tabs` reads (the
+    /// refresh's cached chrome titles), the marks
+    /// [`Self::tab_strip_metadata`] stamps (a background tab's `done` among
+    /// them, `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.1) and the
+    /// tooltips. A pure read, made only when `chrome` is asked. `None` with no
+    /// window or no tab.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn stripless_tab_chrome(&self) -> Option<String> {
+        let wid = self
+            .frontmost_window
+            .or_else(|| self.windows.keys().next().copied())?;
+        let ws = self.windows.get(&wid)?;
+        let titles: Vec<String> = ws
+            .tab_set
+            .tabs()
+            .iter()
+            .map(|tab| {
+                ws.tab_chrome_titles_by_tab.get(&tab.id).map_or_else(
+                    || {
+                        if tab.presentation.title.is_empty() {
+                            "aterm".to_string()
+                        } else {
+                            tab.presentation.title.clone()
+                        }
+                    },
+                    |(_, title)| title.clone(),
+                )
+            })
+            .collect();
+        crate::toolbar::format_tab_chrome(
+            &titles,
+            &self.tab_strip_metadata(wid),
+            &self.tab_tooltips(wid),
+            ws.tab_set.active_index().unwrap_or(0),
+        )
     }
 
     /// Read the frontmost window's NATIVE macOS chrome — the window's `NSToolbar`
@@ -6548,6 +7033,10 @@ impl App {
     /// ([`crate::app_menu_bar`] says what happened when it did).
     ///
     /// Off macOS there is no native chrome, so it returns a single explanatory line.
+    ///
+    /// A front window with no native strip (a `--headless` instance's) prints
+    /// the `toolbar-tabs` line its strip would show
+    /// ([`Self::stripless_tab_chrome`]).
     #[cfg(target_os = "macos")]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
         use aterm_objc::{autoreleasepool, sel};
@@ -6682,6 +7171,10 @@ impl App {
                 // exactly the items (and greyed states) a human would. Empty at ≤1
                 // tab, like the switcher line above.
                 out.extend(self.apprt.read_toolbar_tab_menus(handle));
+            } else if let Some(line) = self.stripless_tab_chrome() {
+                // No native strip (a headless instance): the line its strip
+                // would show, so a tab's marks stay readable there too.
+                out.push(line);
             }
 
             // --- The application menu bar (NSApplication.mainMenu) ------------
@@ -6800,127 +7293,85 @@ impl App {
         )
     }
 
-    #[cfg(target_os = "macos")]
+    /// The `window` verb: the front window's platform chrome stitched around
+    /// its exact presented client frame.
+    #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn capture_window(
         &mut self,
         handoff: crate::control::ReplyRetentionPermit,
-        target: control_auth::ConfinedImage,
+        path: control_auth::ConfinedImage,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
     ) {
-        self.capture_window_of(self.frontmost_window, handoff, target, cancel, reply);
+        self.capture_aux_window(AuxTarget::Front, handoff, path, cancel, reply);
     }
 
-    /// The body of [`Self::capture_window`], parameterized on which logical window to
-    /// photograph. A capture failure replies
-    /// `Err` immediately; captured pixels are handed to the encode worker.
-    #[cfg(target_os = "macos")]
-    fn capture_window_of(
-        &mut self,
-        wid: Option<WindowId>,
-        handoff: crate::control::ReplyRetentionPermit,
-        target: control_auth::ConfinedImage,
-        cancel: crate::control::CaptureCancellation,
-        reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
-    ) {
-        // THE CAPTURE BYTE PERMIT, before the photograph (see `admit_capture`).
-        if !self.admit_capture(wid) {
-            crate::control_auth::cleanup_failed_automatic_image(&target);
-            let _ = reply.send(Err(format!("window capture {ENCODE_QUEUE_FULL}")));
+    /// The `window` body, once [`Self::run_capture`] has admitted it: `wid` is
+    /// the logical window to photograph. The platforms differ only in their
+    /// photograph ([`Self::photograph`]). A capture failure replies `Err`
+    /// immediately; captured pixels are handed to the encode worker.
+    ///
+    /// The platform photograph supplies the window frame; its client rows are
+    /// replaced with the exact successful-present destination. A successful
+    /// Metal `present()` means the drawable was accepted, not that the
+    /// out-of-process WindowServer has already promoted it, so CoreGraphics can
+    /// photograph the previous client frame for one compositor interval right
+    /// after an `open`/`act`, even though the titlebar and semantic inspection
+    /// are current. The one-shot surface capture is already the final raw
+    /// client layer (letterbox bands/crops, tray, bell/overlay, SDR crown and
+    /// HDR conversion included), so it is authoritative below the overlapping
+    /// titlebar; the photograph stays authoritative only for platform-owned
+    /// title/toolbar chrome. No timing guess or offscreen lookalike enters
+    /// full-window introspection.
+    #[cfg(any(target_os = "macos", windows))]
+    fn window_body(&mut self, wid: Option<WindowId>, request: WindowReq) {
+        let Some(wid) = wid else {
+            let _ = request
+                .reply
+                .send(Err("no window to capture (headless)".to_string()));
+            return;
+        };
+        if let Err(error) = self.client_capture_guards(wid) {
+            let _ = request.reply.send(Err(error.to_string()));
             return;
         }
-        self.capture_window_admitted(wid, handoff, target, cancel, reply);
-        self.capture_permit = None;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn capture_window_admitted(
-        &mut self,
-        wid: Option<WindowId>,
-        handoff: crate::control::ReplyRetentionPermit,
-        target: control_auth::ConfinedImage,
-        cancel: crate::control::CaptureCancellation,
-        reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
-    ) {
-        self.prune_deferred_gpu_captures();
-        if cancel.is_cancelled() {
-            let _ = reply.send(Err(
-                "window capture request cancelled before photograph".to_string()
-            ));
-            return;
-        }
-        if let Some(wid) = wid {
-            let has_gpu_surface = self.windows.get(&wid).is_some_and(|window| {
-                matches!(window.present, Some(crate::PresentTarget::Gpu { .. }))
-            });
-            if let Err(error) = crate::window_capture_translucency_guard(
-                self.render_knobs.background_opacity,
-                true,
-                self.backend.is_gpu(),
-                has_gpu_surface,
-            ) {
-                let _ = reply.send(Err(error.to_string()));
+        let (serial, client) = match self.present_before_capture(wid, None, PresentTake::ClientTap)
+        {
+            Ok(Some(PresentedCapture {
+                serial,
+                client: Some(client),
+                ..
+            })) => (serial, client),
+            Ok(_) => {
+                let _ = request
+                    .reply
+                    .send(Err("no window to capture (headless)".to_string()));
                 return;
             }
-        }
-        if let Some(window) = wid
-            && self.replaying_gpu_capture != Some(window)
-            && self.has_deferred_gpu_capture(window)
-        {
-            self.queue_gpu_capture(
-                window,
-                DeferredGpuCaptureRequest::Window {
-                    handoff,
-                    target,
-                    cancel,
-                    reply,
-                },
-                false,
-            );
-            return;
-        }
-        if self.replaying_gpu_capture != wid || wid.is_none() {
-            self.capture_present_budget = CapturePresentBudget::default();
-        }
-        let presented = match wid {
-            Some(wid) => match self.present_before_window_capture(wid, None) {
-                Ok(presented) => Some(presented),
-                Err(error) => {
-                    if error == GPU_CAPTURE_PENDING {
-                        self.queue_gpu_capture(
-                            wid,
-                            DeferredGpuCaptureRequest::Window {
-                                handoff,
-                                target,
-                                cancel,
-                                reply,
-                            },
-                            true,
-                        );
-                    } else {
-                        let _ = reply.send(Err(error));
-                    }
-                    return;
+            Err(error) => {
+                if error == GPU_CAPTURE_PENDING {
+                    self.queue_gpu_capture(wid, CaptureRequest::Window(request), true);
+                } else {
+                    let _ = request.reply.send(Err(error));
                 }
-            },
-            None => None,
+                return;
+            }
         };
-        let captured = match wid {
-            Some(wid) => self.current_window_rgba_of(
-                wid,
-                presented
-                    .as_ref()
-                    .expect("a concrete window has a presented client"),
-            ),
-            None => self.window_rgba_of(None),
-        };
+        let WindowReq {
+            handoff,
+            path,
+            cancel,
+            reply,
+            ..
+        } = request;
+        let captured = self
+            .photograph(wid)
+            .and_then(|shot| self.window_stitch(wid, serial, client, shot));
         match captured {
-            Ok((rgba, width, height)) => self.submit_encode_job(EncodeJob::WindowRgba {
-                rgba,
-                width,
-                height,
+            Ok(stitch) => self.submit_encode_job(EncodeJob::Window {
+                stitch,
                 handoff,
-                target,
+                target: path,
                 cancel,
                 reply,
             }),
@@ -6930,138 +7381,101 @@ impl App {
         }
     }
 
-    /// Make screenshot ordering match control ordering.
-    ///
-    /// GUI mutations (`open`, `act`, tab selection, Settings edits) run on this
-    /// same main loop and reply after changing the model, while their
-    /// `request_redraw` is asynchronous. Without this barrier, an immediately
-    /// following `image`/`window` can photograph the prior composited frame even
-    /// though `inspect` already reports the new semantic tree. A present can also
-    /// be dropped while acquiring the GPU surface, so one blind redraw is not a
-    /// sufficient barrier: authorize capture only when the window's real-present
-    /// serial advances after redrawing the CURRENT composite. The serial belongs to
-    /// the whole window rather than one focused native leaf, so this remains correct
-    /// for heterogeneous terminal/native splits and native leaves with sub-viewports.
-    /// Actual drops retry at most three times. Async acquisition yields the
-    /// original owned request to the bounded completion queue immediately,
-    /// preserving its tap and cancellation deadline across the wait.
-    fn present_before_window_capture(
-        &mut self,
+    /// The `window` body's same-turn half: the window still shows the present
+    /// its barrier bound and has the client geometry it presented at. The
+    /// stitch itself, a pixel pass, is the encode worker's
+    /// ([`WindowStitch::finish`]).
+    #[cfg(any(target_os = "macos", windows))]
+    fn window_stitch(
+        &self,
         wid: WindowId,
-        frame_layout: Option<VisibleFrameLayoutRef<'_>>,
-    ) -> Result<PresentedWindowCapture, String> {
-        let has_os_window = self
+        serial: u64,
+        client: CapturePixels,
+        shot: PlatformShot,
+    ) -> Result<WindowStitch, String> {
+        let state = self
             .windows
             .get(&wid)
-            .is_some_and(|window| window.os_window.is_some());
-        if !has_os_window {
-            return Err("no window to capture (headless)".to_string());
+            .ok_or_else(|| "window capture lost its logical window".to_string())?;
+        if state.capture_present_serial != serial {
+            return Err("window capture client serial is no longer current".to_string());
         }
+        let rect = self.window_client_rect_of(wid, &client)?;
+        Ok(WindowStitch { shot, client, rect })
+    }
 
-        let mut captured = None;
-        let mut acquire_pending = false;
-        let mut last_capture_error = None;
-        let presented =
-            crate::run_capture_present_barrier(self.capture_present_budget.remaining, || {
-                if acquire_pending {
-                    return false;
-                }
-                let resumed_tap = self
-                    .windows
-                    .get(&wid)
-                    .is_some_and(|window| window.capture_acquire_armed);
-                if !resumed_tap {
-                    self.discard_presented_client_capture(wid);
-                }
-                let before = self
-                    .windows
-                    .get(&wid)
-                    .map_or(0, |window| window.capture_present_serial);
-                if !resumed_tap && let Err(error) = self.arm_presented_client_capture(wid) {
-                    last_capture_error = Some(error);
-                    return false;
-                }
-                let Some(window) = self.windows.get_mut(&wid) else {
-                    last_capture_error = Some("window capture lost its window".to_string());
-                    return false;
-                };
-                // Each capture attempt is an explicit external stimulus. Reopen
-                // a parked retry episode and invalidate the optimistic repaint
-                // stamp so attempts two and three cannot be swallowed by the
-                // failed-present gate or a steady-frame early-out.
-                let _ = window.present_retry.on_external_stimulus();
-                window.last_present = None;
-                self.redraw_capture_frame(wid, frame_layout);
-                acquire_pending = self
-                    .windows
-                    .get(&wid)
-                    .is_some_and(|window| window.gpu_acquire_pending());
-                if let Some(window) = self.windows.get(&wid) {
-                    self.capture_present_budget.record_attempt(
-                        acquire_pending,
-                        window.capture_present_serial != before,
-                        !window.present_retry.present_attempt_allowed(),
-                    );
-                }
-                if acquire_pending {
-                    if let Some(window) = self.windows.get_mut(&wid) {
-                        window.capture_acquire_armed = true;
-                    }
-                    return false;
-                }
-                let serial = self
-                    .windows
-                    .get(&wid)
-                    .map_or(before, |window| window.capture_present_serial);
-                if serial == before {
-                    last_capture_error =
-                        Some("window capture did not complete the present path".to_string());
-                    return false;
-                }
-                match self.take_presented_client_capture(wid) {
-                    Ok(client) => {
-                        let Some(frame) = self.presented_frame_capture_after(wid, before) else {
-                            last_capture_error = Some(
-                                "window capture present had no matching semantic frame".to_string(),
-                            );
-                            return false;
-                        };
-                        if frame.serial != serial {
-                            last_capture_error =
-                                Some("window capture client/semantic serial mismatch".to_string());
-                            return false;
-                        }
-                        captured = Some(PresentedWindowCapture {
-                            #[cfg(any(target_os = "macos", windows))]
-                            serial,
-                            client,
-                            frame,
-                        });
-                        true
-                    }
-                    Err(error) => {
-                        last_capture_error = Some(error);
-                        false
-                    }
-                }
-            });
-        if acquire_pending {
-            return Err(GPU_CAPTURE_PENDING.to_string());
+    /// The platform guards for a capture that copies `wid`'s presented client
+    /// layer (`window`, a windowed snapshot): one the compositor blends with
+    /// what is behind the window, or with a backdrop material the photograph
+    /// omits, is not what the window shows ([`crate::platform_capture_guards`]).
+    fn client_capture_guards(&self, wid: WindowId) -> Result<(), &'static str> {
+        crate::platform_capture_guards(
+            crate::HOST_CAPTURE,
+            &self.render_knobs,
+            self.backend.is_gpu(),
+            self.presents_to_gpu_surface(wid),
+        )
+    }
+
+    /// Whether `wid` presents a translucent client layer, on any platform
+    /// ([`crate::translucent_gpu_client`]).
+    fn client_is_translucent(&self, wid: WindowId) -> bool {
+        crate::translucent_gpu_client(
+            &self.render_knobs,
+            self.backend.is_gpu(),
+            self.presents_to_gpu_surface(wid),
+        )
+    }
+
+    /// Whether `wid` presents through a GPU swapchain.
+    fn presents_to_gpu_surface(&self, wid: WindowId) -> bool {
+        self.windows
+            .get(&wid)
+            .is_some_and(|window| matches!(window.present, Some(crate::PresentTarget::Gpu { .. })))
+    }
+
+    /// Whether `wid`'s present can be tapped: a CPU surface always (its opaque
+    /// softbuffer), a GPU swapchain when it offers `COPY_SRC`
+    /// ([`aterm_gpu::GpuSurface::snapshot_is_copyable`]). A Display-P3 or f16
+    /// swapchain's tap is converted to sRGB on the encode worker, like any
+    /// other.
+    fn client_tap_is_copyable(&self, wid: WindowId) -> bool {
+        match self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.present.as_ref())
+        {
+            Some(crate::PresentTarget::Cpu { .. }) => true,
+            Some(crate::PresentTarget::Gpu { gpu_surface, .. }) => {
+                gpu_surface.snapshot_is_copyable()
+            }
+            Some(crate::PresentTarget::Virtual { .. }) | None => false,
         }
-        if presented {
-            captured.ok_or_else(|| {
-                "window capture barrier succeeded without a presented client frame".to_string()
-            })
-        } else {
-            self.discard_presented_client_capture(wid);
-            let detail = last_capture_error
-                .map(|error| format!(": {error}"))
-                .unwrap_or_default();
-            Err(format!(
-                "window capture could not synchronize the requested frame after {} present attempts{detail}",
-                crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
-            ))
-        }
+    }
+
+    /// Cut a destination tapped from `wid`'s present back to the frame that
+    /// present placed in it, by the placement law the present used
+    /// ([`aterm_render::frame_placement`]): the whole frame when it fits the
+    /// surface, its visible intersection while it overflows (a transient
+    /// resize). Only the part read narrows; the encode worker reads it.
+    fn presented_frame_of(
+        &self,
+        wid: WindowId,
+        client: CapturePixels,
+    ) -> Result<CapturePixels, String> {
+        let (frame_w, frame_h) = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.capture_present_frame)
+            .ok_or_else(|| "capture: the present recorded no frame size".to_string())?;
+        let (width, height) = client.dims();
+        let visible =
+            aterm_render::frame_placement(width, height, frame_w as usize, frame_h as usize)
+                .visible_rect(width, height)
+                .ok_or_else(|| {
+                    "capture: the destination is not the surface of its present".to_string()
+                })?;
+        client.cut_to(visible)
     }
 
     /// Arm one exact destination copy for the next successful surface
@@ -7094,13 +7508,12 @@ impl App {
         }
     }
 
-    /// Drain the exact destination armed above. This runs only after the
-    /// successful-present serial advances, so blocking for the explicit GPU
-    /// readback is off the ordinary present hot path.
-    fn take_presented_client_capture(
-        &mut self,
-        wid: WindowId,
-    ) -> Result<crate::PresentedClientFrame, String> {
+    /// Drain the exact destination armed above, as the surface holds it: a CPU
+    /// softbuffer's copy, or a GPU staging buffer's mapped bytes, which the
+    /// encode worker converts. This runs only after the successful-present
+    /// serial advances, so blocking for the explicit GPU readback is off the
+    /// ordinary present hot path.
+    fn take_presented_client_capture(&mut self, wid: WindowId) -> Result<CapturePixels, String> {
         let App {
             backend, windows, ..
         } = self;
@@ -7121,12 +7534,8 @@ impl App {
                     .ok_or_else(|| "window capture GPU target/backend mismatch".to_string())?;
                 gpu.presented_snapshot_after_present(window_gpu, crate::metrics::now_us())?;
                 gpu.presented_snapshot_finish(window_gpu)?;
-                let frame = gpu.presented_snapshot_take(window_gpu)?;
-                Ok(crate::PresentedClientFrame {
-                    width: frame.w,
-                    height: frame.h,
-                    rgba: frame.rgba,
-                })
+                gpu.presented_snapshot_take(window_gpu)
+                    .map(CapturePixels::raw)
             }
             Some(crate::PresentTarget::Virtual { .. }) | None => {
                 Err("window capture lost its window application-present target".to_string())
@@ -7157,9 +7566,10 @@ impl App {
     /// The MAIN-THREAD half of a window capture: resolve the logical window's
     /// `NSWindow` → `windowNumber()` (AppKit objects are main-thread-only) and
     /// photograph its composited on-screen pixels, returning tightly-packed
-    /// RGBA8 + dims. The encode/write half lives on the encode worker.
+    /// premultiplied RGBA8 + dims. The stitch, encode and write half lives on
+    /// the encode worker.
     #[cfg(target_os = "macos")]
-    fn window_rgba_of(&self, wid: Option<WindowId>) -> Result<(Vec<u8>, u32, u32), String> {
+    fn window_rgba_of(&self, wid: WindowId) -> Result<(Vec<u8>, u32, u32), String> {
         use aterm_objc::sel;
 
         #[cfg(test)]
@@ -7171,10 +7581,7 @@ impl App {
         // `toolbar::install_window_toolbar` do: winit Window -> content NSView.
         // `None` here means there is no attached OS surface — i.e. headless — so
         // the capture has no window to photograph.
-        let Some(os_window) = wid
-            .and_then(|id| self.windows.get(&id))
-            .and_then(|ws| ws.os_window.as_ref())
-        else {
+        let Some(os_window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) else {
             return Err("no window to capture (headless)".to_string());
         };
         let view = crate::platform::ns_view_of(os_window);
@@ -7221,7 +7628,7 @@ impl App {
     fn window_client_rect_of(
         &self,
         wid: WindowId,
-        client: &crate::PresentedClientFrame,
+        client: &CapturePixels,
     ) -> Result<WindowClientRect, String> {
         let state = self
             .windows
@@ -7232,10 +7639,15 @@ impl App {
             .as_ref()
             .ok_or_else(|| "no window to capture (headless)".to_string())?;
         let inner_size = window.inner_size();
-        if (inner_size.width, inner_size.height) != (client.width, client.height) {
+        let (width, height) = client.dims();
+        let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+            return Err("window capture client is larger than a window".to_string());
+        };
+        if (inner_size.width, inner_size.height) != (width, height) {
             return Err(format!(
-                "window client geometry changed during capture: presented {}x{}px, current {}x{}px",
-                client.width, client.height, inner_size.width, inner_size.height
+                "window client geometry changed during capture: presented {width}x{height}px, \
+                 current {}x{}px",
+                inner_size.width, inner_size.height
             ));
         }
         let inner = window
@@ -7253,8 +7665,8 @@ impl App {
         Ok(WindowClientRect {
             x,
             y,
-            width: client.width,
-            height: client.height,
+            width,
+            height,
         })
     }
 
@@ -7279,15 +7691,15 @@ impl App {
         wid: WindowId,
         window_width: u32,
         window_height: u32,
-    ) -> Result<Option<RgbaOverlay>, String> {
+    ) -> Result<Option<ChromeLayer>, String> {
         use aterm_objc::autoreleasepool;
 
         // ONE POOL AROUND THE WHOLE SNAPSHOT. Every AppKit object this function
         // touches after the first two is +0 — `-bitmapImageRepForCachingDisplayInRect:`,
-        // `+sRGBColorSpace`, the converted rep and the PNG `NSData` are all
-        // autoreleased returns — and the two it OWNS (`chrome_root` and the empty
-        // properties dictionary) release inside it, which is where a `dealloc`'s own
-        // autoreleases land. `objc2` retained each of these into a `Retained` and
+        // `+sRGBColorSpace`, the converted rep, its `CGImage` and a fallback PNG
+        // `NSData` are all autoreleased or rep-owned — and the ones it OWNS
+        // (`chrome_root`, a fallback's empty properties dictionary) release inside
+        // it, which is where a `dealloc`'s own autoreleases land. `objc2` retained each of these into a `Retained` and
         // relied on the caller's pool for the same drops; the scope is stated here
         // instead of assumed.
         autoreleasepool(|_| self.native_chrome_overlay_pooled(wid, window_width, window_height))
@@ -7303,14 +7715,11 @@ impl App {
         wid: WindowId,
         window_width: u32,
         window_height: u32,
-    ) -> Result<Option<RgbaOverlay>, String> {
-        use aterm_objc::{Id, Obj, class, sel};
+    ) -> Result<Option<ChromeLayer>, String> {
+        use aterm_objc::{Id, class, sel};
 
         use crate::appkit;
-        use crate::appkit::consts::{
-            NS_BITMAP_IMAGE_FILE_TYPE_PNG, NS_COLOR_RENDERING_INTENT_PERCEPTUAL,
-            NS_WINDOW_CLOSE_BUTTON,
-        };
+        use crate::appkit::consts::{NS_COLOR_RENDERING_INTENT_PERCEPTUAL, NS_WINDOW_CLOSE_BUTTON};
 
         let state = self
             .windows
@@ -7479,52 +7888,9 @@ impl App {
         if bitmap.is_null() {
             return Err("window capture could not convert AppKit chrome to sRGB".to_string());
         }
-        // An EMPTY properties dictionary, exactly as the `objc2` form built. `+new`
-        // rather than `+dictionary` so the +1 is owned by this frame outright and its
-        // lifetime does not depend on which pool is innermost.
-        // SAFETY: `+[NSDictionary new]` is `+(instancetype)` and +1.
-        let Some(properties) = (unsafe {
-            Obj::from_owned(appkit::send_id(class(c"NSDictionary").as_id(), sel!(new)))
-        }) else {
-            return Err("window capture could not allocate AppKit chrome properties".to_string());
-        };
-        // PNG standardizes the NSBitmapImageRep's implementation-defined channel
-        // order and premultiplication into straight RGBA before Rust reads it.
-        //
-        // SAFETY: `-representationUsingType:properties:` is
-        // `-(NSData *)(NSBitmapImageFileType, NSDictionary *)` — the file type is an
-        // NSUInteger — on the live converted rep, with a live dictionary. +0.
-        let png = unsafe {
-            appkit::send_id_usize_id(
-                bitmap,
-                sel!(representationUsingType:properties:),
-                NS_BITMAP_IMAGE_FILE_TYPE_PNG,
-                properties.id(),
-            )
-        };
-        if png.is_null() {
-            return Err("window capture could not encode the AppKit chrome bitmap".to_string());
-        }
-        // SAFETY: `-[NSData length]` is `-(NSUInteger)` on the live PNG data.
-        let png_len = unsafe { appkit::send_usize(png, sel!(length)) };
-        let mut png_bytes = vec![0_u8; png_len];
-        if png_len != 0 {
-            // SAFETY: `-getBytes:length:` is `-(void)(void *, NSUInteger)` and WRITES
-            // through the pointer, which is why the helper's argument is `*mut` and
-            // its encoding `^v` rather than the const `r^v`. The Vec owns exactly
-            // `png_len` initialized bytes, so the destination is valid and correctly
-            // sized for NSData's bounded copy — and `png_len` came from the receiver
-            // itself, so it cannot exceed the receiver's own length.
-            unsafe {
-                appkit::send_v_ptr_usize(
-                    png,
-                    sel!(getBytes:length:),
-                    png_bytes.as_mut_ptr().cast(),
-                    png_len,
-                );
-            }
-        }
-        let (rgba, width, height) = decode_native_chrome_png(&png_bytes)?;
+        // The converted rep's own bytes, copied once; the encode worker turns
+        // them into straight RGBA ([`ChromeLayer::overlay`]).
+        let (pixels, width, height) = chrome_pixels_of(bitmap)?;
 
         let expected_width = backing_rect.size.width.round();
         let expected_height = backing_rect.size.height.round();
@@ -7557,188 +7923,50 @@ impl App {
         {
             return Err("window capture AppKit chrome lies outside the window".to_string());
         }
-        Ok(Some(RgbaOverlay {
+        Ok(Some(ChromeLayer {
             x,
             y,
             width,
             height,
-            rgba,
+            pixels,
         }))
     }
 
-    /// Capture the platform-owned window frame, then replace its visible client
-    /// rows with the exact successful-present destination.
-    ///
-    /// A successful Metal `present()` means the drawable was accepted, not that the
-    /// out-of-process WindowServer has already promoted it. CoreGraphics can therefore
-    /// photograph the previous client frame for one compositor interval immediately
-    /// after an `open`/`act`, even though the titlebar and semantic inspection are
-    /// current. The one-shot surface capture is already the final raw client layer
-    /// (letterbox bands/crops, tray, bell/overlay, SDR crown and HDR conversion
-    /// included), so it is authoritative below the overlapping titlebar. CoreGraphics
-    /// remains authoritative only for platform-owned title/toolbar chrome. This
-    /// removes timing guesses and offscreen lookalikes from full-window introspection.
+    /// The macOS photograph of `wid`: CoreGraphics' composited window,
+    /// premultiplied as its bitmap context drew it (its alpha is the outer
+    /// shape mask), and the AppKit titlebar subtree as a transparent overlay.
     #[cfg(target_os = "macos")]
-    fn current_window_rgba_of(
-        &self,
-        wid: WindowId,
-        presented: &PresentedWindowCapture,
-    ) -> Result<(Vec<u8>, u32, u32), String> {
-        let (mut rgba, width, height) = self.window_rgba_of(Some(wid))?;
-        // The platform photograph is tightly-packed RGBA8 (`width * height * 4`
-        // bytes), so the chunk remainder is empty and the mask keeps exactly one
-        // alpha byte per platform pixel — the length
-        // `multiply_platform_outer_shape_alpha` fails closed on below.
-        let platform_shape_alpha = rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|pixel| pixel[3])
-            .collect::<Vec<_>>();
-        let state = self
-            .windows
-            .get(&wid)
-            .ok_or_else(|| "window capture lost its logical window".to_string())?;
-        if state.capture_present_serial != presented.serial {
-            return Err("window capture client serial is no longer current".to_string());
-        }
-        let rect = self.window_client_rect_of(wid, &presented.client)?;
-        stitch_presented_client_into_window_rgba(
-            &mut rgba,
+    fn photograph(&self, wid: WindowId) -> Result<PlatformShot, String> {
+        let (pixels, width, height) = self.window_rgba_of(wid)?;
+        let chrome = self.native_chrome_overlay_of(wid, width, height)?;
+        Ok(PlatformShot {
+            pixels,
             width,
             height,
-            rect,
-            &presented.client,
-        )?;
-        if let Some(chrome) = self.native_chrome_overlay_of(wid, width, height)? {
-            composite_straight_rgba_overlay(&mut rgba, width, height, &chrome, rect)?;
-        }
-        multiply_platform_outer_shape_alpha(&mut rgba, width, height, &platform_shape_alpha)?;
-        Ok((rgba, width, height))
+            encoding: ShotEncoding::PremultipliedRgba,
+            chrome,
+        })
     }
 
+    /// The Windows photograph of `wid`: `PrintWindow`'s window, non-client
+    /// frame included, as GDI wrote it. Windows draws that frame outside the
+    /// client rect, in place in the photograph, so no chrome overlay is taken;
+    /// nor is a shape mask.
     #[cfg(windows)]
-    pub(crate) fn capture_window(
-        &mut self,
-        handoff: crate::control::ReplyRetentionPermit,
-        target: control_auth::ConfinedImage,
-        cancel: crate::control::CaptureCancellation,
-        reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
-    ) {
-        // THE CAPTURE BYTE PERMIT, before the photograph — the same admission
-        // as the macOS body (see `admit_capture`).
-        if !self.admit_capture(self.frontmost_window) {
-            crate::control_auth::cleanup_failed_automatic_image(&target);
-            let _ = reply.send(Err(format!("window capture {ENCODE_QUEUE_FULL}")));
-            return;
-        }
-        self.capture_window_admitted(handoff, target, cancel, reply);
-        self.capture_permit = None;
-    }
-
-    #[cfg(windows)]
-    fn capture_window_admitted(
-        &mut self,
-        handoff: crate::control::ReplyRetentionPermit,
-        target: control_auth::ConfinedImage,
-        cancel: crate::control::CaptureCancellation,
-        reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
-    ) {
-        self.prune_deferred_gpu_captures();
-        if cancel.is_cancelled() {
-            let _ = reply.send(Err(
-                "window capture request cancelled before photograph".to_string()
-            ));
-            return;
-        }
-        if let Err(error) =
-            crate::window_capture_material_guard(self.render_knobs.background_material, false)
-        {
-            let _ = reply.send(Err(error.to_string()));
-            return;
-        }
-        let Some(wid) = self.frontmost_window else {
-            let _ = reply.send(Err("no window to capture (headless)".to_string()));
-            return;
-        };
-        if self.replaying_gpu_capture != Some(wid) && self.has_deferred_gpu_capture(wid) {
-            self.queue_gpu_capture(
-                wid,
-                DeferredGpuCaptureRequest::Window {
-                    handoff,
-                    target,
-                    cancel,
-                    reply,
-                },
-                false,
-            );
-            return;
-        }
-        if self.replaying_gpu_capture != Some(wid) {
-            self.capture_present_budget = CapturePresentBudget::default();
-        }
-        let presented = match self.present_before_window_capture(wid, None) {
-            Ok(presented) => presented,
-            Err(error) => {
-                if error == GPU_CAPTURE_PENDING {
-                    self.queue_gpu_capture(
-                        wid,
-                        DeferredGpuCaptureRequest::Window {
-                            handoff,
-                            target,
-                            cancel,
-                            reply,
-                        },
-                        true,
-                    );
-                } else {
-                    let _ = reply.send(Err(error));
-                }
-                return;
-            }
-        };
-        let Some(window) = self
+    fn photograph(&self, wid: WindowId) -> Result<PlatformShot, String> {
+        let window = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.os_window.as_deref())
-        else {
-            let _ = reply.send(Err("no window to capture (headless)".to_string()));
-            return;
-        };
-        let captured = crate::platform_win::capture_window_rgba(window).and_then(
-            |(mut rgba, width, height)| {
-                let state = self
-                    .windows
-                    .get(&wid)
-                    .ok_or_else(|| "window capture lost its logical window".to_string())?;
-                if state.capture_present_serial != presented.serial {
-                    return Err("window capture client serial is no longer current".to_string());
-                }
-                let rect = self.window_client_rect_of(wid, &presented.client)?;
-                stitch_presented_client_into_window_rgba(
-                    &mut rgba,
-                    width,
-                    height,
-                    rect,
-                    &presented.client,
-                )?;
-                Ok((rgba, width, height))
-            },
-        );
-        match captured {
-            Ok((rgba, width, height)) => self.submit_encode_job(EncodeJob::WindowRgba {
-                rgba,
-                width,
-                height,
-                handoff,
-                target,
-                cancel,
-                reply,
-            }),
-            Err(e) => {
-                let _ = reply.send(Err(format!("window capture failed: {e}")));
-            }
-        }
+            .ok_or_else(|| "no window to capture (headless)".to_string())?;
+        let (pixels, width, height) = crate::platform_win::capture_window_bgrx(window)
+            .map_err(|error| format!("window capture failed: {error}"))?;
+        Ok(PlatformShot {
+            pixels,
+            width,
+            height,
+            encoding: ShotEncoding::Bgrx,
+        })
     }
 
     /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so
@@ -7764,10 +7992,13 @@ impl App {
     /// (main thread, per
     /// [`crate::Wake::CaptureAuxWindow`]).
     ///
-    /// Every supported target lives in the front aterm frame, so this delegates to the
-    /// ordinary capture path and preserves its confinement and encoding behavior —
+    /// Every supported target lives in the front aterm frame, so this is the
+    /// ordinary `window` photograph with its confinement and encoding behavior —
     /// once the front window is SHOWING the target; one it is not showing is refused
     /// ([`App::window_target_refusal`]) instead of photographed as a plain front frame.
+    /// [`Self::run_capture`] asks before admission, and asks again when a capture
+    /// deferred for its GPU drawable resumes, so an overlay dismissed while it
+    /// waited is refused too.
     ///
     /// Windows takes the same arm: Settings renders INSIDE the frame there too,
     /// and `capture_window` is fully implemented (`PrintWindow` + the presented
@@ -7783,11 +8014,14 @@ impl App {
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
     ) {
-        if let Some(refusal) = self.window_target_refusal(target) {
-            let _ = reply.send(Err(refusal));
-            return;
-        }
-        self.capture_window(handoff, confined, cancel, reply);
+        self.run_capture(CaptureRequest::Window(WindowReq {
+            target: None,
+            aux: target,
+            handoff,
+            path: confined,
+            cancel,
+            reply,
+        }));
     }
 
     /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so
@@ -8258,7 +8492,138 @@ fn macos_rect_is_finite(rect: aterm_objc::CGRect) -> bool {
         && rect.size.height.is_finite()
 }
 
-/// Decode AppKit's in-memory PNG normalization into tightly packed straight RGBA8.
+/// The pixels of AppKit's sRGB chrome bitmap `rep`, and its size, taken on the
+/// main thread with one copy: its `CGImage`'s own bytes when their layout is
+/// one [`normalize_bitmap`] reads, else AppKit's PNG of the rep. The encode
+/// worker turns either into straight RGBA8 ([`ChromeLayer::overlay`]).
+#[cfg(target_os = "macos")]
+fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), String> {
+    use aterm_cg::*;
+    use aterm_objc::cf::{CFDataGetBytePtr, CFDataGetLength, CFDataRef, CFRelease};
+    use aterm_objc::sel;
+
+    use crate::appkit;
+
+    // SAFETY: `-[NSBitmapImageRep CGImage]` is `-(CGImageRef)` on the live
+    // converted rep; the image is +0 and the rep owns it, and the caller's
+    // autorelease pool keeps the rep alive through every read below.
+    let image: CGImageRef = unsafe { appkit::send_id(rep, sel!(CGImage)) }
+        .as_ptr()
+        .cast();
+    if image.is_null() {
+        return Err("window capture could not read the AppKit chrome bitmap".to_string());
+    }
+    // SAFETY: side-effect-free accessors on the live CGImage. Its colour
+    // space is +0, owned by the image.
+    let desc = unsafe {
+        let space = CGImageGetColorSpace(image);
+        BitmapDesc {
+            width: CGImageGetWidth(image),
+            height: CGImageGetHeight(image),
+            bytes_per_row: CGImageGetBytesPerRow(image),
+            bits_per_component: CGImageGetBitsPerComponent(image),
+            bits_per_pixel: CGImageGetBitsPerPixel(image),
+            bitmap_info: CGImageGetBitmapInfo(image),
+            rgb: !space.is_null() && CGColorSpaceGetModel(space) == kCGColorSpaceModelRGB,
+        }
+    };
+    let (Ok(width), Ok(height)) = (u32::try_from(desc.width), u32::try_from(desc.height)) else {
+        return Err("window capture AppKit chrome bitmap is too large".to_string());
+    };
+    if desc.direct_layout().is_ok() {
+        // SAFETY: the data provider is +0, owned by the live image.
+        let provider = unsafe { CGImageGetDataProvider(image) };
+        if provider.is_null() {
+            return Err("window capture could not reach the AppKit chrome bytes".to_string());
+        }
+        // SAFETY: `CGDataProviderCopyData` returns a new CFData (+1) holding
+        // the provider's bytes, or NULL; the guard releases it exactly once.
+        let data = unsafe { CGDataProviderCopyData(provider) };
+        if data.is_null() {
+            return Err("window capture could not copy the AppKit chrome bytes".to_string());
+        }
+        struct DataGuard(CFDataRef);
+        impl Drop for DataGuard {
+            fn drop(&mut self) {
+                // SAFETY: the CFData copied above, released exactly once.
+                unsafe { CFRelease(self.0.cast()) };
+            }
+        }
+        let _data_guard = DataGuard(data);
+        // SAFETY: length and byte pointer of the live CFData, which owns
+        // `len` bytes at `ptr` until the guard releases it after this copy.
+        let bytes = unsafe {
+            let len = usize::try_from(CFDataGetLength(data)).unwrap_or(0);
+            let ptr = CFDataGetBytePtr(data);
+            if len == 0 || ptr.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(ptr, len).to_vec()
+            }
+        };
+        return Ok((ChromePixels::Bitmap { bytes, desc }, width, height));
+    }
+    // PNG standardizes a layout `normalize_bitmap` does not read into
+    // straight RGBA, which the encode worker decodes.
+    Ok((ChromePixels::Png(chrome_png_of(rep)?), width, height))
+}
+
+/// AppKit's PNG of the chrome bitmap `rep`: straight RGBA whatever the rep's
+/// layout, 8 or 16 bits a sample ([`decode_native_chrome_png`] reads either).
+#[cfg(target_os = "macos")]
+fn chrome_png_of(rep: aterm_objc::Id) -> Result<Vec<u8>, String> {
+    use aterm_objc::{Obj, class, sel};
+
+    use crate::appkit;
+    use crate::appkit::consts::NS_BITMAP_IMAGE_FILE_TYPE_PNG;
+
+    // An EMPTY properties dictionary, exactly as the `objc2` form built. `+new`
+    // rather than `+dictionary` so the +1 is owned by this frame outright and its
+    // lifetime does not depend on which pool is innermost.
+    // SAFETY: `+[NSDictionary new]` is `+(instancetype)` and +1.
+    let Some(properties) =
+        (unsafe { Obj::from_owned(appkit::send_id(class(c"NSDictionary").as_id(), sel!(new))) })
+    else {
+        return Err("window capture could not allocate AppKit chrome properties".to_string());
+    };
+    // SAFETY: `-representationUsingType:properties:` is
+    // `-(NSData *)(NSBitmapImageFileType, NSDictionary *)` — the file type is an
+    // NSUInteger — on the live converted rep, with a live dictionary. +0.
+    let png = unsafe {
+        appkit::send_id_usize_id(
+            rep,
+            sel!(representationUsingType:properties:),
+            NS_BITMAP_IMAGE_FILE_TYPE_PNG,
+            properties.id(),
+        )
+    };
+    if png.is_null() {
+        return Err("window capture could not encode the AppKit chrome bitmap".to_string());
+    }
+    // SAFETY: `-[NSData length]` is `-(NSUInteger)` on the live PNG data.
+    let png_len = unsafe { appkit::send_usize(png, sel!(length)) };
+    let mut png_bytes = vec![0_u8; png_len];
+    if png_len != 0 {
+        // SAFETY: `-getBytes:length:` is `-(void)(void *, NSUInteger)` and WRITES
+        // through the pointer, which is why the helper's argument is `*mut` and
+        // its encoding `^v` rather than the const `r^v`. The Vec owns exactly
+        // `png_len` initialized bytes, so the destination is valid and correctly
+        // sized for NSData's bounded copy — and `png_len` came from the receiver
+        // itself, so it cannot exceed the receiver's own length.
+        unsafe {
+            appkit::send_v_ptr_usize(
+                png,
+                sel!(getBytes:length:),
+                png_bytes.as_mut_ptr().cast(),
+                png_len,
+            );
+        }
+    }
+    Ok(png_bytes)
+}
+
+/// Decode AppKit's in-memory PNG of a chrome bitmap into tightly packed
+/// straight RGBA8.
 #[cfg(target_os = "macos")]
 fn decode_native_chrome_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     const MAX_CHROME_BYTES: usize = 256 * 1024 * 1024;
@@ -8306,15 +8671,17 @@ fn decode_native_chrome_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String>
 }
 
 /// Photograph the on-screen window with CoreGraphics window id `window_id` and
-/// return its `(tightly-packed RGBA8 bytes, width, height)`. Runs on the MAIN
-/// thread (called from the `capture_window`/`capture_aux_window` verbs' AppKit
-/// half; the PNG encode + write run on the encode worker).
+/// return its `(tightly-packed premultiplied RGBA8 bytes, width, height)`.
+/// Runs on the MAIN thread (called from the `capture_window`/`capture_aux_window`
+/// verbs' AppKit half); unassociating the alpha, the stitch, the PNG encode and
+/// the write run on the encode worker ([`WindowStitch::finish`]).
 ///
 /// Robust-format strategy (per the implementation note): rather than read the
 /// source `CGImage`'s native, possibly-padded pixel layout, we draw it into a
 /// freshly-created RGBA8 `CGBitmapContext` we own, then read THAT context's
 /// tightly-packed buffer (`width * 4` stride, premultiplied-alpha-last). So the
-/// bytes are always plain RGBA8 no matter what the window server hands us.
+/// bytes are always premultiplied RGBA8 no matter what the window server hands
+/// us.
 ///
 /// Returns `Err` (never panics / leaks) when CoreGraphics cannot capture. That is NOT
 /// a permission failure: this is aterm's own window, which CoreGraphics photographs
@@ -8455,13 +8822,7 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         .ok_or_else(|| "window capture failed (image too large)".to_string())?;
     // SAFETY: `data_ptr` is the context's backing buffer of exactly `total` bytes
     // (width*4 stride, no extra padding — CG honours the stride we requested).
-    let mut rgba = unsafe { std::slice::from_raw_parts(data_ptr, total) }.to_vec();
-    // CoreGraphics bitmap contexts expose premultiplied RGBA, while PNG and
-    // every renderer-owned capture buffer in aterm use straight alpha. Convert
-    // exactly once at the platform boundary so later stitching never mixes two
-    // alpha encodings (which darkens translucent titlebar/rounded-edge pixels).
-    unpremultiply_rgba8(&mut rgba);
-
+    let rgba = unsafe { std::slice::from_raw_parts(data_ptr, total) }.to_vec();
     Ok((rgba, width as u32, height as u32))
 }
 
@@ -8516,6 +8877,363 @@ struct RgbaOverlay {
     rgba: Vec<u8>,
 }
 
+/// One platform photograph of a window ([`App::photograph`]) as the platform
+/// made it, before the encode worker stitches the presented client into it
+/// ([`WindowStitch::finish`]).
+#[cfg(any(target_os = "macos", windows))]
+struct PlatformShot {
+    /// Four bytes a pixel, tightly packed, in `encoding`.
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    encoding: ShotEncoding,
+    /// Platform chrome drawn over the client rect, composited back over the
+    /// stitched client: the macOS titlebar subtree.
+    #[cfg(target_os = "macos")]
+    chrome: Option<ChromeLayer>,
+}
+
+/// How a platform photograph's four bytes a pixel hold it.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShotEncoding {
+    /// Premultiplied RGBA, as a CoreGraphics bitmap context draws it.
+    #[cfg(target_os = "macos")]
+    PremultipliedRgba,
+    /// BGR and a fourth byte GDI leaves undefined (`GetDIBits`): opaque.
+    #[cfg(windows)]
+    Bgrx,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl ShotEncoding {
+    /// The encoding this platform's photograph comes in ([`App::photograph`]).
+    #[cfg(target_os = "macos")]
+    const NATIVE: Self = Self::PremultipliedRgba;
+    #[cfg(windows)]
+    const NATIVE: Self = Self::Bgrx;
+
+    /// Turn a photograph in this encoding into straight RGBA8, in place: a
+    /// stitch never mixes two alpha encodings (which darkens translucent
+    /// titlebar and rounded-edge pixels).
+    fn to_straight_rgba8(self, pixels: &mut [u8]) {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::PremultipliedRgba => unpremultiply_rgba8(pixels),
+            #[cfg(windows)]
+            Self::Bgrx => bgrx_to_opaque_rgba8(pixels),
+        }
+    }
+
+    /// Whether the photograph's alpha draws the compositor's outer shape
+    /// (macOS rounded corners: [`multiply_platform_outer_shape_alpha`]).
+    fn carries_outer_shape(self) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::PremultipliedRgba => true,
+            #[cfg(windows)]
+            Self::Bgrx => false,
+        }
+    }
+}
+
+/// A `window` capture as its main-thread turn left it: the platform
+/// photograph, the presented client destination, and where that client sits
+/// in the photograph, checked in that turn ([`App::window_stitch`]). The
+/// encode worker composes them ([`Self::finish`]).
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) struct WindowStitch {
+    shot: PlatformShot,
+    client: CapturePixels,
+    rect: WindowClientRect,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl WindowStitch {
+    /// The full-window capture, on the encode worker: the photograph in
+    /// straight RGBA, the presented client replacing its client rows, the
+    /// platform chrome back over them, and the photograph's outer shape alpha
+    /// multiplied back last ([`multiply_platform_outer_shape_alpha`]).
+    fn finish(self) -> Result<CapturePixels, String> {
+        note_pixel_work();
+        let Self { shot, client, rect } = self;
+        let (width, height, encoding) = (shot.width, shot.height, shot.encoding);
+        let mut pixels = shot.pixels;
+        // Unassociating leaves alpha as it was, so the mask is the photograph's.
+        let outer_alpha: Option<Vec<u8>> = encoding.carries_outer_shape().then(|| {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[3])
+                .collect()
+        });
+        encoding.to_straight_rgba8(&mut pixels);
+        stitch_presented_client_into_window_rgba(&mut pixels, width, height, rect, &client)?;
+        drop(client);
+        #[cfg(target_os = "macos")]
+        if let Some(chrome) = shot.chrome {
+            composite_straight_rgba_overlay(&mut pixels, width, height, &chrome.overlay()?, rect)?;
+        }
+        if let Some(outer_alpha) = &outer_alpha {
+            multiply_platform_outer_shape_alpha(&mut pixels, width, height, outer_alpha)?;
+        }
+        CapturePixels::rgba8(width, height, pixels)
+    }
+
+    /// What this capture holds at most on the encode worker, for
+    /// [`CapturePermit::recharge`] ([`StitchCharge::peak_bytes`]).
+    fn peak_bytes(&self) -> usize {
+        #[cfg(target_os = "macos")]
+        let chrome = self.shot.chrome.as_ref().map_or(0, ChromeLayer::peak_bytes);
+        #[cfg(not(target_os = "macos"))]
+        let chrome = 0;
+        StitchCharge {
+            width: self.shot.width as usize,
+            height: self.shot.height as usize,
+            photograph: self.shot.pixels.capacity(),
+            client: self.client.allocation(),
+            client_width: self.client.dims().0,
+            chrome,
+            outer_shape: self.shot.encoding.carries_outer_shape(),
+        }
+        .peak_bytes()
+    }
+}
+
+/// The sizes a `window` capture's charge is made of: those of a
+/// [`WindowStitch`], or the estimate of one before the photograph is taken
+/// ([`App::window_capture_estimate`]).
+#[cfg(any(target_os = "macos", windows))]
+struct StitchCharge {
+    /// The photograph's size in pixels.
+    width: usize,
+    height: usize,
+    /// The photograph's bytes, which become the encoded pixels.
+    photograph: usize,
+    /// The presented client's allocation ([`CapturePixels::allocation`]).
+    client: usize,
+    /// The client's width in pixels: one stitched row.
+    client_width: usize,
+    /// The chrome as handed over and as straight RGBA ([`chrome_peak_bytes`]).
+    chrome: usize,
+    /// The photograph carries an outer shape mask
+    /// ([`ShotEncoding::carries_outer_shape`]).
+    outer_shape: bool,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl StitchCharge {
+    /// The photograph, and the larger of what the stitch holds beside it (the
+    /// client, the chrome, one stitched row, and for an outer shape its mask,
+    /// its mirrored copy and the flood's visited flags, a byte a pixel each;
+    /// the flood's queue is not counted) and what the encode does
+    /// ([`capture_encode_overhead`]).
+    fn peak_bytes(&self) -> usize {
+        let shape = if self.outer_shape {
+            self.width.saturating_mul(self.height).saturating_mul(3)
+        } else {
+            0
+        };
+        let stitch = self
+            .client
+            .saturating_add(self.chrome)
+            .saturating_add(shape)
+            .saturating_add(self.client_width.saturating_mul(4));
+        self.photograph
+            .saturating_add(stitch.max(capture_encode_overhead(self.width, self.height)))
+    }
+}
+
+/// The macOS titlebar subtree's snapshot, placed in full-window pixels, in the
+/// form AppKit handed it over ([`ChromePixels`]).
+#[cfg(target_os = "macos")]
+struct ChromeLayer {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    pixels: ChromePixels,
+}
+
+/// The chrome snapshot's pixels: its sRGB bitmap's own bytes when their
+/// layout is one [`normalize_bitmap`] reads, else AppKit's PNG of it.
+#[cfg(target_os = "macos")]
+enum ChromePixels {
+    Bitmap { bytes: Vec<u8>, desc: BitmapDesc },
+    Png(Vec<u8>),
+}
+
+#[cfg(target_os = "macos")]
+impl ChromeLayer {
+    /// The snapshot as a straight RGBA8 overlay, on the encode worker.
+    fn overlay(self) -> Result<RgbaOverlay, String> {
+        note_pixel_work();
+        let rgba = match self.pixels {
+            ChromePixels::Bitmap { bytes, desc } => normalize_bitmap(&bytes, desc)
+                .map_err(|error| format!("window capture AppKit chrome: {error}"))?,
+            ChromePixels::Png(png) => {
+                let (rgba, width, height) = decode_native_chrome_png(&png)?;
+                if (width, height) != (self.width, self.height) {
+                    return Err(format!(
+                        "window capture AppKit chrome PNG {width}x{height}px disagrees with its \
+                         bitmap {}x{}px",
+                        self.width, self.height
+                    ));
+                }
+                rgba
+            }
+        };
+        Ok(RgbaOverlay {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            rgba,
+        })
+    }
+
+    /// The bytes it holds ([`chrome_peak_bytes`]).
+    fn peak_bytes(&self) -> usize {
+        let handed = match &self.pixels {
+            ChromePixels::Bitmap { bytes, .. } | ChromePixels::Png(bytes) => bytes.capacity(),
+        };
+        chrome_peak_bytes(self.width as usize, self.height as usize, handed)
+    }
+}
+
+/// What a `width`×`height` chrome snapshot holds: the `handed` bytes AppKit
+/// gave over, and the straight RGBA8 overlay made from them.
+#[cfg(target_os = "macos")]
+fn chrome_peak_bytes(width: usize, height: usize, handed: usize) -> usize {
+    handed.saturating_add(width.saturating_mul(height).saturating_mul(4))
+}
+
+/// A CoreGraphics bitmap's layout, as the `CGImageGet*` accessors report it.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BitmapDesc {
+    width: usize,
+    height: usize,
+    bytes_per_row: usize,
+    bits_per_component: usize,
+    bits_per_pixel: usize,
+    /// `CGBitmapInfo`: the alpha info, float and byte-order bits.
+    bitmap_info: u32,
+    /// The colour space's model is RGB.
+    rgb: bool,
+}
+
+/// Where an 8-bit pixel's channels sit in its four bytes, and whether its
+/// colour is premultiplied by its alpha.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectLayout {
+    /// The byte offsets of R, G, B and A within a pixel.
+    offsets: [usize; 4],
+    premultiplied: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl BitmapDesc {
+    /// The layout its bytes are read in directly: 8-bit RGB components with
+    /// alpha, first or last, premultiplied or straight, in 32-bit pixels of
+    /// either byte order, packed, rows at least `4 · width` bytes. `Err` for any
+    /// other bitmap, which is not guessed at (`CGImage.h` defines the bits).
+    fn direct_layout(&self) -> Result<DirectLayout, String> {
+        const ALPHA_INFO: u32 = 0x1F;
+        const PREMULTIPLIED_LAST: u32 = 1;
+        const PREMULTIPLIED_FIRST: u32 = 2;
+        const LAST: u32 = 3;
+        const FIRST: u32 = 4;
+        const FLOAT: u32 = 0xF00;
+        const BYTE_ORDER: u32 = 0x7000;
+        const ORDER_DEFAULT: u32 = 0;
+        const ORDER_32_LITTLE: u32 = 2 << 12;
+        const ORDER_32_BIG: u32 = 4 << 12;
+        const PIXEL_FORMAT: u32 = 0xF_0000;
+        let refuse = || format!("AppKit chrome bitmap layout is not read directly: {self:?}");
+        if !self.rgb
+            || self.bits_per_component != 8
+            || self.bits_per_pixel != 32
+            || self.bitmap_info & (FLOAT | PIXEL_FORMAT) != 0
+            || self
+                .width
+                .checked_mul(4)
+                .is_none_or(|row| row > self.bytes_per_row)
+        {
+            return Err(refuse());
+        }
+        let (alpha_first, premultiplied) = match self.bitmap_info & ALPHA_INFO {
+            PREMULTIPLIED_LAST => (false, true),
+            PREMULTIPLIED_FIRST => (true, true),
+            LAST => (false, false),
+            FIRST => (true, false),
+            _ => return Err(refuse()),
+        };
+        // Memory order is the component order for big-endian (and default)
+        // 32-bit pixels, and its reverse for little-endian ones.
+        let big_endian = match self.bitmap_info & BYTE_ORDER {
+            ORDER_DEFAULT | ORDER_32_BIG => true,
+            ORDER_32_LITTLE => false,
+            _ => return Err(refuse()),
+        };
+        let offsets = match (alpha_first, big_endian) {
+            (false, true) => [0, 1, 2, 3],  // R G B A
+            (true, true) => [1, 2, 3, 0],   // A R G B
+            (false, false) => [3, 2, 1, 0], // A B G R
+            (true, false) => [2, 1, 0, 3],  // B G R A
+        };
+        Ok(DirectLayout {
+            offsets,
+            premultiplied,
+        })
+    }
+}
+
+/// A bitmap in a direct layout ([`BitmapDesc::direct_layout`]) as tightly
+/// packed straight RGBA8, premultiplied colour unassociated as
+/// [`unpremultiply_rgba8`] does. `Err` for any other layout, or bytes short of
+/// the last row.
+#[cfg(any(target_os = "macos", test))]
+fn normalize_bitmap(bytes: &[u8], desc: BitmapDesc) -> Result<Vec<u8>, String> {
+    let layout = desc.direct_layout()?;
+    let required = match desc.height {
+        0 => 0,
+        height => (height - 1)
+            .checked_mul(desc.bytes_per_row)
+            .and_then(|rows| rows.checked_add(desc.width * 4))
+            .ok_or_else(|| "AppKit chrome bitmap size overflows".to_string())?,
+    };
+    if bytes.len() < required {
+        return Err(format!(
+            "AppKit chrome bitmap has {} bytes, expected at least {required}",
+            bytes.len()
+        ));
+    }
+    let mut rgba = Vec::with_capacity(desc.width * desc.height * 4);
+    for y in 0..desc.height {
+        let row = &bytes[y * desc.bytes_per_row..][..desc.width * 4];
+        for pixel in row.as_chunks::<4>().0 {
+            rgba.extend(layout.offsets.map(|offset| pixel[offset]));
+        }
+    }
+    if layout.premultiplied {
+        unpremultiply_rgba8(&mut rgba);
+    }
+    Ok(rgba)
+}
+
+/// A GDI photograph's BGR, and the fourth byte `GetDIBits` leaves undefined,
+/// as opaque RGBA8, in place.
+#[cfg(any(windows, test))]
+fn bgrx_to_opaque_rgba8(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+        pixel[3] = u8::MAX;
+    }
+}
+
 /// Splice the exact successful-present destination into the platform frame.
 ///
 /// Unlike the retired logical-frame stitch, this performs no centering,
@@ -8534,7 +9252,7 @@ fn stitch_presented_client_into_window_rgba(
     window_width: u32,
     window_height: u32,
     rect: WindowClientRect,
-    client: &crate::PresentedClientFrame,
+    client: &CapturePixels,
 ) -> Result<(), String> {
     let width = usize::try_from(window_width)
         .map_err(|_| "window capture width does not fit memory".to_string())?;
@@ -8550,24 +9268,12 @@ fn stitch_presented_client_into_window_rgba(
             window_rgba.len()
         ));
     }
-    if (client.width, client.height) != (rect.width, rect.height) {
+    let (client_width, client_height) = client.dims();
+    if (client_width, client_height) != (rect.width as usize, rect.height as usize) {
         return Err(format!(
-            "presented client {}x{}px does not match platform client {}x{}px",
-            client.width, client.height, rect.width, rect.height
-        ));
-    }
-    let client_width = usize::try_from(client.width)
-        .map_err(|_| "presented client width does not fit memory".to_string())?;
-    let client_height = usize::try_from(client.height)
-        .map_err(|_| "presented client height does not fit memory".to_string())?;
-    let client_expected = client_width
-        .checked_mul(client_height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "presented client dimensions overflow".to_string())?;
-    if client.rgba.len() != client_expected {
-        return Err(format!(
-            "presented client has {} bytes, expected {client_expected}",
-            client.rgba.len()
+            "presented client {client_width}x{client_height}px does not match platform client \
+             {}x{}px",
+            rect.width, rect.height
         ));
     }
     let x =
@@ -8584,11 +9290,15 @@ fn stitch_presented_client_into_window_rgba(
             rect.x, rect.y, rect.width, rect.height, window_width, window_height
         ));
     }
+    let mut row = Vec::with_capacity(client_width * 4);
     for source_y in 0..client_height {
-        let source = source_y * client_width * 4;
+        row.clear();
+        client.rgba_row(source_y, &mut row);
+        if row.len() != client_width * 4 {
+            return Err(format!("presented client row {source_y} is short"));
+        }
         let destination = ((y + source_y) * width + x) * 4;
-        window_rgba[destination..destination + client_width * 4]
-            .copy_from_slice(&client.rgba[source..source + client_width * 4]);
+        window_rgba[destination..destination + client_width * 4].copy_from_slice(&row);
     }
     Ok(())
 }
@@ -8613,7 +9323,7 @@ fn stitch_presented_client_into_window_rgba(
 /// a column is read as not photographed: its shape is its mirror column's
 /// (the window's rounded outline is symmetric), or opaque when that one was not
 /// photographed either ([`photographed_shape_alpha`]).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn multiply_platform_outer_shape_alpha(
     current_rgba: &mut [u8],
     width: u32,
@@ -8702,7 +9412,7 @@ fn multiply_platform_outer_shape_alpha(
 /// across the window's centre, or opaque where that is unphotographed too
 /// ([`multiply_platform_outer_shape_alpha`], day five, D27). Borrowed as-is when
 /// every column and row has ink — the common case costs one scan.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 fn photographed_shape_alpha(
     alpha: &[u8],
     width: usize,
@@ -8871,26 +9581,11 @@ fn composite_straight_rgba_overlay(
     Ok(())
 }
 
-/// Encode a tightly-packed RGBA8 buffer (`width * height * 4` bytes, no row
-/// padding) to PNG bytes, reusing the same `png` crate the `image` verb's
-/// framebuffer path uses. Platform-neutral because both `window` capture and
-/// Linux/macOS/Windows video export consume it; only the OS pixel acquisition is
-/// platform-gated.
+/// Encode a tightly-packed straight RGBA8 buffer (`width * height * 4` bytes,
+/// no row padding) as the capture encoder does ([`CapturePng::encode`]): a
+/// borrowed buffer, for the video export's frames and the tests' fixtures.
 pub(crate) fn encode_rgba8_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    {
-        let mut encoder = aterm_png::Encoder::new(&mut out, width, height);
-        encoder.set_color(aterm_png::ColorType::Rgba);
-        encoder.set_depth(aterm_png::BitDepth::Eight);
-        // Both CoreGraphics normalization and AppKit's transparent chrome PNG
-        // arrive in sRGB. Declare that transfer function explicitly so viewers
-        // never reinterpret the stitched bytes as untagged device RGB.
-        encoder.set_source_srgb(aterm_png::SrgbRenderingIntent::Perceptual);
-        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        writer.write_image_data(rgba).map_err(|e| e.to_string())?;
-        writer.finish().map_err(|e| e.to_string())?;
-    }
-    Ok(out)
+    encode_srgb_rgba8(width, height, |writer| writer.write_image_data(rgba))
 }
 
 /// One session's window membership as the main thread sees it: the row the
@@ -9037,32 +9732,9 @@ mod session_window_rows_tests {
 mod dims_snapshot_tests {
     use std::time::Instant;
 
-    use super::{App, dims_axis, dims_axis_y};
+    use super::App;
     use crate::WindowId;
     use aterm_window::dpi::PhysicalSize;
-
-    #[test]
-    fn dims_axis_exposes_odd_trailing_bands_and_centered_crop() {
-        assert_eq!(
-            dims_axis(111, 100),
-            (5, 5, 6, 0, 0),
-            "odd spare pixel stays in the trailing band"
-        );
-        assert_eq!(
-            dims_axis(100, 111),
-            (-6, 0, 0, 6, 5),
-            "the same centered rule exposes transient crop on both sides"
-        );
-        // The vertical axis follows the platform placement: top-pinned on Linux
-        // (all slack/crop trailing), the centred rule elsewhere.
-        if cfg!(target_os = "linux") {
-            assert_eq!(dims_axis_y(111, 100), (0, 0, 11, 0, 0));
-            assert_eq!(dims_axis_y(100, 111), (0, 0, 0, 0, 11));
-        } else {
-            assert_eq!(dims_axis_y(111, 100), dims_axis(111, 100));
-            assert_eq!(dims_axis_y(100, 111), dims_axis(100, 111));
-        }
-    }
 
     #[test]
     fn coherent_dims_snapshot_is_nonblocking_when_the_grid_is_busy() {
@@ -9595,11 +10267,14 @@ mod split_capture_tests {
 
 #[cfg(test)]
 mod chrome_output_tests {
+    #[cfg(target_os = "macos")]
+    use super::decode_native_chrome_png;
     use super::{
-        RgbaOverlay, WindowClientRect, composite_straight_rgba_overlay,
-        multiply_platform_outer_shape_alpha, snapshot_frame_from_presented_client,
+        BitmapDesc, CapturePixels, CapturePng, RgbaOverlay, WindowClientRect, bgrx_to_opaque_rgba8,
+        composite_straight_rgba_overlay, multiply_platform_outer_shape_alpha, normalize_bitmap,
         stitch_presented_client_into_window_rgba, unpremultiply_rgba8,
     };
+    use aterm_render::Frame;
 
     /// The `strip-caption` line names the window's own frame (LW.5) and the
     /// buttons the strip laid out for it, at the columns `pointer move -1 <col>`
@@ -9848,11 +10523,7 @@ mod chrome_output_tests {
         for i in 0..(width * height) {
             fresh.extend_from_slice(&[(100 + i) as u8, 70, 40, 200]);
         }
-        let client = crate::PresentedClientFrame {
-            width,
-            height,
-            rgba: fresh.clone(),
-        };
+        let client = CapturePixels::rgba8(width, height, fresh.clone()).expect("a 5x5 client");
         stitch_presented_client_into_window_rgba(
             &mut window,
             width,
@@ -9927,29 +10598,275 @@ mod chrome_output_tests {
         assert_eq!((alpha(0, 0), alpha(1, 0), alpha(2, 1)), (0, 100, 200));
     }
 
+    /// THE WINDOWED SNAPSHOT ENCODES THE EXACT DESTINATION AS MAPPED. A GPU
+    /// tap's padded `Bgra8Unorm` rows travel as they were mapped and the
+    /// snapshot PNG decodes to their straight RGBA byte for byte, the
+    /// remainder band and the alpha-192 present pass included. NEGATIVE
+    /// CONTROL: a mapped buffer one byte short of its last row is refused when
+    /// the tap builds it, so a destination that is not what it claims never
+    /// reaches the encoder.
     #[test]
     fn sigusr_windowed_snapshot_roundtrips_exact_non_cell_destination_and_present_passes() {
         // 3×2 deliberately cannot be expressed as this fixture's hypothetical
         // 2×2 cell grid. The last column is a destination remainder band; the
         // other sentinels stand for already-applied SDR crown / HDR glow output.
-        let client = crate::PresentedClientFrame {
-            width: 3,
-            height: 2,
-            rgba: vec![
-                11, 12, 13, 255, // semantic base
-                90, 80, 70, 255, // present-only crown transformed pixel
-                3, 4, 5, 255, // right remainder band
-                21, 31, 41, 255, // semantic base
-                210, 160, 120, 192, // present-only glow + alpha
-                6, 7, 8, 255, // right remainder band
-            ],
-        };
-        let frame = snapshot_frame_from_presented_client(&client).unwrap();
-        assert_eq!((frame.width, frame.height), (3, 2));
+        let expected = vec![
+            11, 12, 13, 255, // semantic base
+            90, 80, 70, 255, // present-only crown transformed pixel
+            3, 4, 5, 255, // right remainder band
+            21, 31, 41, 255, // semantic base
+            210, 160, 120, 192, // present-only glow + alpha
+            6, 7, 8, 255, // right remainder band
+        ];
+        // As a swapchain tap maps it: BGRA, rows padded to 256 bytes.
+        let stride = 256;
+        let mut mapped = vec![0xA5_u8; stride * 2];
+        for (index, &[r, g, b, a]) in expected.as_chunks::<4>().0.iter().enumerate() {
+            let at = (index / 3) * stride + (index % 3) * 4;
+            mapped[at..at + 4].copy_from_slice(&[b, g, r, a]);
+        }
+        let raw =
+            aterm_gpu::video_tap::RawCapture::bgra8_srgb_for_test(mapped.clone(), 3, 2, stride)
+                .expect("a whole destination");
+        let pixels = CapturePixels::raw(raw);
+        assert_eq!(pixels.dims(), (3, 2));
+
+        let encoded = CapturePng::encode(&pixels).expect("encodes");
+        assert_eq!((encoded.width, encoded.height), (3, 2));
+        let (decoded, w, h) = aterm_render::decode_png_rgba8(&encoded.png).expect("decodes");
+        assert_eq!((w, h), (3, 2));
         assert_eq!(
-            frame.rgba_bytes(),
-            client.rgba,
-            "snapshot container conversion cannot rerender, crop, or recolor the exact destination"
+            decoded, expected,
+            "the snapshot cannot rerender, crop, or recolor the exact destination"
+        );
+
+        let short = mapped[..stride + 3 * 4 - 1].to_vec();
+        assert!(
+            aterm_gpu::video_tap::RawCapture::bgra8_srgb_for_test(short, 3, 2, stride).is_err()
+        );
+    }
+
+    /// A CPU present's capture is its softbuffer, opaque: each pixel's RGB as
+    /// the surface holds it, alpha 255 whatever the renderer's transmittance
+    /// byte says. NEGATIVE CONTROL: a softbuffer that is not its size is
+    /// refused.
+    #[test]
+    fn cpu_softbuffer_capture_is_its_rgb_and_opaque() {
+        let pixels = CapturePixels::softbuffer(vec![0x7f11_2233, 0xff44_5566], 2, 1)
+            .expect("a well-shaped softbuffer");
+        let mut row = Vec::new();
+        pixels.rgba_row(0, &mut row);
+        assert_eq!(
+            row,
+            [0x11, 0x22, 0x33, 255, 0x44, 0x55, 0x66, 255],
+            "softbuffer ignores renderer transmittance and presents opaque RGB"
+        );
+        assert!(CapturePixels::softbuffer(vec![0], 2, 1).is_err());
+        assert!(CapturePixels::softbuffer(vec![0; 3], 2, 1).is_err());
+    }
+
+    /// Pixels a frame rendered with transmittance, alpha and every channel
+    /// distinct, at a width that is not a multiple of anything the encoder or
+    /// the fingerprint's blocks use.
+    fn packed_fixture(width: usize, height: usize) -> Frame {
+        Frame {
+            width,
+            height,
+            pixels: (0..width * height)
+                .map(|i| {
+                    let i = i as u32;
+                    (((i * 37) % 256) << 24)
+                        | (((i * 11) % 256) << 16)
+                        | (((i * 5 + 3) % 256) << 8)
+                        | ((i * 3 + 1) % 256)
+                })
+                .collect(),
+        }
+    }
+
+    /// The same pixels in every form a capture travels in: straight RGBA, the
+    /// packed frame, a padded `Bgra8Unorm` mapping, and (for an opaque frame)
+    /// a softbuffer.
+    fn every_form(frame: &Frame) -> Vec<(&'static str, CapturePixels)> {
+        let (width, height) = (frame.width, frame.height);
+        let rgba = frame.rgba_bytes();
+        let stride = (width * 4).div_ceil(256) * 256;
+        let mut mapped = vec![0x5A_u8; stride * height];
+        for (index, &[r, g, b, a]) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            let at = (index / width) * stride + (index % width) * 4;
+            mapped[at..at + 4].copy_from_slice(&[b, g, r, a]);
+        }
+        let raw = aterm_gpu::video_tap::RawCapture::bgra8_srgb_for_test(
+            mapped,
+            width as u32,
+            height as u32,
+            stride,
+        )
+        .expect("a whole mapping");
+        let mut forms = vec![
+            (
+                "rgba8",
+                CapturePixels::rgba8(width as u32, height as u32, rgba).expect("straight"),
+            ),
+            (
+                "packed",
+                CapturePixels::packed(frame.clone()).expect("packed"),
+            ),
+            ("raw", CapturePixels::raw(raw)),
+        ];
+        if frame.pixels.iter().all(|pixel| pixel >> 24 == 0) {
+            forms.push((
+                "softbuffer",
+                CapturePixels::softbuffer(frame.pixels.clone(), width, height).expect("softbuffer"),
+            ));
+        }
+        forms
+    }
+
+    /// ONE ENCODER FOR EVERY FORM. A rerender's packed frame, its straight
+    /// RGBA bytes and its mapped destination encode to the same PNG, byte for
+    /// byte, and the PNG decodes to those bytes (alpha `255 - transmittance`).
+    /// Straight RGBA and a packed frame one pixel longer or shorter than their
+    /// size are refused when built. NEGATIVE CONTROL: a frame one channel
+    /// different encodes differently, so the comparison sees the pixels.
+    #[test]
+    fn packed_frame_encodes_like_its_rgba_bytes() {
+        for (width, height) in [(1usize, 1usize), (3, 2), (37, 29)] {
+            let frame = packed_fixture(width, height);
+            let rgba = frame.rgba_bytes();
+            let forms = every_form(&frame);
+            let packed = CapturePng::encode(&forms[1].1).expect("packed encodes");
+            for (form, pixels) in &forms {
+                let png = CapturePng::encode(pixels).expect("encodes");
+                assert_eq!(png.png, packed.png, "{width}x{height} {form}");
+            }
+            for pixels in [width * height + 1, width * height - 1] {
+                let mut wrong = frame.clone();
+                wrong.pixels.resize(pixels, 0);
+                let mut bytes = rgba.clone();
+                bytes.resize(pixels * 4, 0);
+                assert!(
+                    CapturePixels::packed(wrong).is_err()
+                        && CapturePixels::rgba8(width as u32, height as u32, bytes).is_err(),
+                    "{width}x{height}: {pixels} pixels are refused in both forms"
+                );
+            }
+            let (decoded, w, h) = aterm_render::decode_png_rgba8(&packed.png).expect("decodes");
+            assert_eq!((w, h, decoded), (width, height, rgba), "{width}x{height}");
+
+            let mut nudged = frame;
+            nudged.pixels[width * height / 2] ^= 1;
+            let other = CapturePixels::packed(nudged)
+                .and_then(|pixels| CapturePng::encode(&pixels))
+                .expect("encodes");
+            assert_ne!(
+                other.png, packed.png,
+                "{width}x{height}: one channel differs"
+            );
+        }
+    }
+
+    /// ONE `pixel-fingerprint` FOR EVERY FORM. Straight RGBA, a mapped
+    /// destination and a softbuffer fold into the same hash as the packed frame
+    /// they show, at sizes below, at and past the fingerprint's 1024-pixel
+    /// blocks, and that hash is [`App::image_pixel_fingerprint`] of the frame.
+    /// NEGATIVE CONTROL: one alpha step (one transmittance step) changes it.
+    #[test]
+    fn rgba8_and_packed_pixels_share_one_fingerprint() {
+        for (width, height) in [(1usize, 1usize), (32, 32), (37, 29), (1031, 3)] {
+            for opaque in [false, true] {
+                let mut frame = packed_fixture(width, height);
+                if opaque {
+                    frame
+                        .pixels
+                        .iter_mut()
+                        .for_each(|pixel| *pixel &= 0x00FF_FFFF);
+                }
+                let expected = crate::App::image_pixel_fingerprint(width, height, &frame.pixels);
+                for (form, pixels) in every_form(&frame) {
+                    assert_eq!(
+                        pixels.pixel_fingerprint(),
+                        expected,
+                        "{width}x{height} {form}"
+                    );
+                }
+                let mut rgba = frame.rgba_bytes();
+                rgba[3] ^= 1;
+                let nudged = CapturePixels::rgba8(width as u32, height as u32, rgba)
+                    .expect("straight")
+                    .pixel_fingerprint();
+                assert_ne!(nudged, expected, "{width}x{height}: one alpha step");
+            }
+        }
+    }
+
+    /// A CAPTURE CUT TO A RECT IS THAT RECT. In every form, the encode and the
+    /// fingerprint of pixels cut to a sub-rect are those of the sub-rect's
+    /// pixels on their own, and a second cut is relative to the first.
+    /// NEGATIVE CONTROLS: a rect reaching past the pixels is refused, and the
+    /// rect one pixel further right is different pixels.
+    #[test]
+    fn a_cut_capture_is_its_rect() {
+        let frame = packed_fixture(9, 7);
+        let rgba = frame.rgba_bytes();
+        let rect = aterm_render::PixelRect {
+            x: 2,
+            y: 1,
+            width: 5,
+            height: 4,
+        };
+        let own = |rect: aterm_render::PixelRect| {
+            let bytes: Vec<u8> = (rect.y..rect.y + rect.height)
+                .flat_map(|y| {
+                    let start = (y * 9 + rect.x) * 4;
+                    rgba[start..start + rect.width * 4].to_vec()
+                })
+                .collect();
+            CapturePixels::rgba8(rect.width as u32, rect.height as u32, bytes).expect("own")
+        };
+        let expected = own(rect);
+        let expected_png = CapturePng::encode(&expected).expect("encodes").png;
+        for (form, pixels) in every_form(&frame) {
+            let cut = pixels
+                .cut_to(aterm_render::PixelRect {
+                    x: 1,
+                    y: 0,
+                    width: 7,
+                    height: 6,
+                })
+                .and_then(|pixels| {
+                    pixels.cut_to(aterm_render::PixelRect {
+                        x: 1,
+                        y: 1,
+                        width: 5,
+                        height: 4,
+                    })
+                })
+                .expect("inside");
+            assert_eq!(cut.dims(), (5, 4), "{form}");
+            assert_eq!(
+                CapturePng::encode(&cut).expect("encodes").png,
+                expected_png,
+                "{form}"
+            );
+            assert_eq!(
+                cut.pixel_fingerprint(),
+                expected.pixel_fingerprint(),
+                "{form}"
+            );
+            let past = cut.cut_to(aterm_render::PixelRect {
+                x: 1,
+                y: 0,
+                width: 5,
+                height: 4,
+            });
+            assert!(past.is_err(), "{form}: a rect past the pixels");
+        }
+        let shifted = own(aterm_render::PixelRect { x: 3, ..rect });
+        assert_ne!(
+            shifted.pixel_fingerprint(),
+            expected.pixel_fingerprint(),
+            "one pixel right is other pixels"
         );
     }
 
@@ -9959,11 +10876,8 @@ mod chrome_output_tests {
         // already contain arbitrary live remainder/crop output; the stitch
         // neither recenters nor synthesizes any band.
         let mut window = vec![9_u8; 5 * 4 * 4];
-        let client = crate::PresentedClientFrame {
-            width: 2,
-            height: 2,
-            rgba: (0_u8..16).collect(),
-        };
+        let rgba: Vec<u8> = (0_u8..16).collect();
+        let client = CapturePixels::rgba8(2, 2, rgba.clone()).expect("a 2x2 client");
         stitch_presented_client_into_window_rgba(
             &mut window,
             5,
@@ -9980,19 +10894,15 @@ mod chrome_output_tests {
         // Byte offset of the (row, col) pixel in the 5-wide RGBA window, so the
         // client's two rows stay legible as rows rather than as byte counts.
         let at = |row: usize, col: usize| (row * 5 + col) * 4;
-        assert_eq!(&window[at(1, 2)..at(1, 4)], &client.rgba[..8]);
-        assert_eq!(&window[at(2, 2)..at(2, 4)], &client.rgba[8..]);
+        assert_eq!(&window[at(1, 2)..at(1, 4)], &rgba[..8]);
+        assert_eq!(&window[at(2, 2)..at(2, 4)], &rgba[8..]);
         assert!(window[..at(1, 2)].iter().all(|&byte| byte == 9));
         assert!(window[at(3, 0)..].iter().all(|&byte| byte == 9));
     }
 
     #[test]
     fn window_stitch_and_unpremultiply_fail_closed_and_cover_alpha_endpoints() {
-        let honest = crate::PresentedClientFrame {
-            width: 2,
-            height: 1,
-            rgba: vec![0; 8],
-        };
+        let honest = CapturePixels::rgba8(2, 1, vec![0; 8]).expect("a 2x1 client");
         let rect = WindowClientRect {
             x: 0,
             y: 0,
@@ -10002,11 +10912,7 @@ mod chrome_output_tests {
         assert!(
             stitch_presented_client_into_window_rgba(&mut [0; 7], 2, 1, rect, &honest).is_err()
         );
-        let wrong_shape = crate::PresentedClientFrame {
-            width: 1,
-            height: 1,
-            rgba: vec![0; 4],
-        };
+        let wrong_shape = CapturePixels::rgba8(1, 1, vec![0; 4]).expect("a 1x1 client");
         assert!(
             stitch_presented_client_into_window_rgba(&mut [0; 8], 2, 1, rect, &wrong_shape)
                 .is_err()
@@ -10117,7 +11023,470 @@ mod chrome_output_tests {
             composite_straight_rgba_overlay(&mut destination, 3, 2, &inside, invalid_clip).is_err()
         );
     }
+
+    /// The bitmap a [`BitmapDesc`] names in each of its direct layouts: two
+    /// rows of three pixels, padded, `pixels` placed by `offsets` (R, G, B, A).
+    fn bitmap_of(pixels: &[[u8; 4]; 6], offsets: [usize; 4], bytes_per_row: usize) -> Vec<u8> {
+        let mut bytes = vec![0xC3_u8; bytes_per_row * 2];
+        for (index, pixel) in pixels.iter().enumerate() {
+            let at = (index / 3) * bytes_per_row + (index % 3) * 4;
+            for (channel, offset) in offsets.iter().enumerate() {
+                bytes[at + offset] = pixel[channel];
+            }
+        }
+        bytes
+    }
+
+    /// EVERY CHROME BITMAP LAYOUT READ DIRECTLY IS NORMALIZED TO STRAIGHT
+    /// RGBA8. Alpha first or last, premultiplied or straight, in 32-bit pixels
+    /// of default, big- or little-endian byte order, with padded rows: each
+    /// gives the hand-computed straight pixels (premultiplied colour
+    /// unassociated with round-half, transparent colour zeroed). NEGATIVE
+    /// CONTROLS: a 16-bit, float, alpha-less or non-RGB bitmap, or one short
+    /// of its last row, is refused, which sends the capture to AppKit's PNG.
+    #[test]
+    fn normalize_bitmap_covers_every_supported_layout() {
+        // Premultiplied R, G, B, A.
+        let premultiplied = [
+            [0x40, 0x20, 0x10, 0x80],
+            [1, 2, 3, 255],
+            [9, 8, 7, 0],
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [0x10, 0x08, 0x04, 0x20],
+        ];
+        let unassociated = [
+            128, 64, 32, 128, 1, 2, 3, 255, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 128, 64,
+            32, 32,
+        ];
+        let straight: Vec<u8> = premultiplied.iter().flatten().copied().collect();
+        // (alpha info, byte order, R/G/B/A offsets)
+        let layouts = [
+            (1, 0, [0, 1, 2, 3]),       // premultiplied last: R G B A
+            (1, 4 << 12, [0, 1, 2, 3]), // the same, 32-bit big-endian
+            (1, 2 << 12, [3, 2, 1, 0]), // little-endian: A B G R
+            (2, 0, [1, 2, 3, 0]),       // premultiplied first: A R G B
+            (2, 2 << 12, [2, 1, 0, 3]), // little-endian: B G R A
+            (3, 0, [0, 1, 2, 3]),       // straight last
+            (3, 2 << 12, [3, 2, 1, 0]),
+            (4, 0, [1, 2, 3, 0]), // straight first
+            (4, 2 << 12, [2, 1, 0, 3]),
+        ];
+        let desc = |bitmap_info: u32| BitmapDesc {
+            width: 3,
+            height: 2,
+            bytes_per_row: 16,
+            bits_per_component: 8,
+            bits_per_pixel: 32,
+            bitmap_info,
+            rgb: true,
+        };
+        for (alpha, order, offsets) in layouts {
+            let bytes = bitmap_of(&premultiplied, offsets, 16);
+            let expected = if alpha <= 2 {
+                unassociated.to_vec()
+            } else {
+                straight.clone()
+            };
+            assert_eq!(
+                normalize_bitmap(&bytes, desc(alpha | order)),
+                Ok(expected),
+                "alpha info {alpha}, byte order {order:#x}"
+            );
+        }
+
+        let bytes = bitmap_of(&premultiplied, [0, 1, 2, 3], 16);
+        let sixteen = BitmapDesc {
+            bits_per_component: 16,
+            bits_per_pixel: 64,
+            bytes_per_row: 32,
+            ..desc(1)
+        };
+        for (label, refused) in [
+            ("16-bit", sixteen),
+            ("float", desc(1 | 1 << 8)),
+            ("no alpha", desc(5)),
+            ("16-bit byte order", desc(1 | 1 << 12)),
+            (
+                "not RGB",
+                BitmapDesc {
+                    rgb: false,
+                    ..desc(1)
+                },
+            ),
+            (
+                "row narrower than its pixels",
+                BitmapDesc {
+                    bytes_per_row: 8,
+                    ..desc(1)
+                },
+            ),
+        ] {
+            assert!(refused.direct_layout().is_err(), "{label}");
+            assert!(normalize_bitmap(&bytes, refused).is_err(), "{label}");
+        }
+        assert!(
+            normalize_bitmap(&bytes[..16 + 11], desc(1)).is_err(),
+            "short of its last row"
+        );
+    }
+
+    /// A real `width`×`height` `NSBitmapImageRep` of `bits`-bit RGBA samples
+    /// (`straight` alpha or premultiplied), built off WindowServer as the
+    /// wallpaper decoder's tests build theirs, its one plane written by
+    /// `fill(bytes, bytes_per_row)`, then converted to sRGB as the titlebar
+    /// snapshot is (`native_chrome_overlay_pooled`). A device RGB rep is
+    /// really converted; `tagged_srgb` tags it sRGB first, so the conversion
+    /// keeps its samples. Returns the rep (+1) and the converted one (+0, in
+    /// the caller's autorelease pool).
+    #[cfg(target_os = "macos")]
+    fn srgb_chrome_rep(
+        (width, height): (isize, isize),
+        bits: isize,
+        straight: bool,
+        tagged_srgb: bool,
+        fill: impl FnOnce(&mut [u8], usize),
+    ) -> (aterm_objc::Obj, aterm_objc::Id) {
+        use aterm_objc::{Bool, Id, Obj, Sel, class, sel};
+
+        use crate::appkit;
+        use crate::appkit::consts::NS_COLOR_RENDERING_INTENT_PERCEPTUAL;
+
+        /// `NSBitmapFormatAlphaNonpremultiplied` (`NSBitmapImageRep.h`).
+        const ALPHA_NONPREMULTIPLIED: usize = 1 << 1;
+        type Init = unsafe extern "C-unwind" fn(
+            Id,
+            Sel,
+            *mut *mut u8,
+            isize,
+            isize,
+            isize,
+            isize,
+            Bool,
+            Bool,
+            Id,
+            usize,
+            isize,
+            isize,
+        ) -> Id;
+        let space = appkit::nsstring("NSDeviceRGBColorSpace").expect("a colour space name");
+        // SAFETY: `+alloc`, then the designated initializer with its own
+        // prototype (`NSInteger` sizes and sample counts, `BOOL` flags, the
+        // `NSString *` colour space name, an `NSBitmapFormat` (`NSUInteger`),
+        // `NSInteger` row and pixel sizes, 0 for "computed"); NULL planes make
+        // the rep allocate its own meshed buffer. +1.
+        let rep = unsafe {
+            let init: Init = aterm_objc::checked_msg();
+            let alloc = appkit::send_id(class(c"NSBitmapImageRep").as_id(), sel!(alloc));
+            Obj::from_owned(init(
+                alloc,
+                sel!(initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bitmapFormat:bytesPerRow:bitsPerPixel:),
+                std::ptr::null_mut(),
+                width,
+                height,
+                bits,
+                4,
+                Bool::YES,
+                Bool::NO,
+                space.id(),
+                if straight { ALPHA_NONPREMULTIPLIED } else { 0 },
+                0,
+                0,
+            ))
+        }
+        .expect("an NSBitmapImageRep");
+        // SAFETY: `-bytesPerRow` (`NSInteger`) and `-bitmapData`
+        // (`unsigned char *`) of the live meshed rep, whose one plane is
+        // `bytesPerRow · height` bytes it owns while `rep` lives.
+        let (plane, row) = unsafe {
+            let data: unsafe extern "C-unwind" fn(Id, Sel) -> *mut u8 = aterm_objc::checked_msg();
+            let row = usize::try_from(appkit::send_isize(rep.id(), sel!(bytesPerRow)))
+                .expect("a row length");
+            let rows = usize::try_from(height).expect("a height");
+            (
+                std::slice::from_raw_parts_mut(data(rep.id(), sel!(bitmapData)), row * rows),
+                row,
+            )
+        };
+        fill(plane, row);
+        // SAFETY: `+sRGBColorSpace` (+0, immortal); the retag and the
+        // conversion are `-(NSBitmapImageRep *)` sends on the live rep, +0.
+        let converted = unsafe {
+            let srgb = appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace));
+            let source = if tagged_srgb {
+                appkit::send_id_id(
+                    rep.id(),
+                    sel!(bitmapImageRepByRetaggingWithColorSpace:),
+                    srgb,
+                )
+            } else {
+                rep.id()
+            };
+            appkit::send_id_id_isize(
+                source,
+                sel!(bitmapImageRepByConvertingToColorSpace:renderingIntent:),
+                srgb,
+                NS_COLOR_RENDERING_INTENT_PERCEPTUAL,
+            )
+        };
+        assert!(!converted.is_null(), "AppKit converts the rep to sRGB");
+        (rep, converted)
+    }
+
+    /// AN 8-BIT APPKIT CHROME BITMAP IS COPIED AS IT IS, AND READS AS THE PNG
+    /// IT REPLACED. A real premultiplied 8-bit rep holding every colour value
+    /// under every alpha, converted from device RGB to sRGB as the titlebar
+    /// snapshot is, takes `chrome_pixels_of`'s direct copy, and its straight
+    /// overlay is byte for byte the decode of AppKit's own PNG of the same rep
+    /// (the main-thread round trip the copy replaced): translucent edges
+    /// included, AppKit unassociates as `unpremultiply_rgba8` does. NEGATIVE
+    /// CONTROL: the same bytes read as straight alpha are not that PNG.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_appkit_chrome_bitmap_is_copied_as_its_png_would_read() {
+        use super::{ChromeLayer, ChromePixels, chrome_pixels_of, chrome_png_of};
+
+        aterm_objc::autoreleasepool(|_| {
+            let (_rep, converted) = srgb_chrome_rep((256, 256), 8, false, false, |plane, row| {
+                for alpha in 0..256 {
+                    for x in 0..256 {
+                        let colour = x * alpha / 255;
+                        let pixel = &mut plane[alpha * row + x * 4..][..4];
+                        // `as u8`: every value is at most `alpha`, below 256.
+                        pixel.copy_from_slice(&[
+                            colour as u8,
+                            (colour * 3 % (alpha + 1)) as u8,
+                            (alpha - colour) as u8,
+                            alpha as u8,
+                        ]);
+                    }
+                }
+            });
+            let (pixels, width, height) = chrome_pixels_of(converted).expect("the chrome bytes");
+            assert_eq!((width, height), (256, 256));
+            let ChromePixels::Bitmap { bytes, desc } = pixels else {
+                panic!("an 8-bit sRGB rep is copied directly, not re-encoded");
+            };
+            let png = chrome_png_of(converted).expect("AppKit's PNG of the rep");
+            let (expected, png_width, png_height) =
+                decode_native_chrome_png(&png).expect("the PNG decodes");
+            assert_eq!((png_width, png_height), (width, height));
+            assert!(
+                expected
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| (1..255).contains(&pixel[3])),
+                "the rep has translucent pixels"
+            );
+            let as_straight = BitmapDesc {
+                // Alpha info 3: straight, last.
+                bitmap_info: (desc.bitmap_info & !0x1F) | 3,
+                ..desc
+            };
+            assert_ne!(
+                normalize_bitmap(&bytes, as_straight).expect("a straight reading"),
+                expected,
+                "negative control: the copy's premultiplication matters"
+            );
+            let overlay = ChromeLayer {
+                x: 0,
+                y: 0,
+                width,
+                height,
+                pixels: ChromePixels::Bitmap { bytes, desc },
+            }
+            .overlay()
+            .expect("the overlay");
+            assert_eq!(overlay.rgba.len(), expected.len());
+            let first_difference = overlay
+                .rgba
+                .iter()
+                .zip(&expected)
+                .position(|(copied, png)| copied != png);
+            assert_eq!(
+                first_difference, None,
+                "the direct copy reads as AppKit's PNG of the rep"
+            );
+        });
+    }
+
+    /// A 16-BIT APPKIT CHROME BITMAP KEEPS APPKIT'S PNG. The sRGB conversion
+    /// keeps a device RGB 16-bit rep at 16 bits a sample, and
+    /// `chrome_pixels_of` does not read it directly; a straight 16-bit sRGB
+    /// rep (whose conversion keeps its samples) is handed over as AppKit's
+    /// PNG, whose overlay is each sample's high byte. NEGATIVE CONTROL: bytes
+    /// that are not a PNG are refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sixteen_bit_appkit_chrome_bitmap_goes_through_its_png() {
+        use super::{ChromeLayer, ChromePixels, chrome_pixels_of};
+
+        let samples: Vec<u16> = (0..3 * 2 * 4).map(|i| 0x1234 + i * 0x0A0B).collect();
+        aterm_objc::autoreleasepool(|_| {
+            let (_rep, converted) = srgb_chrome_rep((3, 2), 16, false, false, |_, _| {});
+            let (pixels, ..) = chrome_pixels_of(converted).expect("the chrome bytes");
+            assert!(
+                matches!(pixels, ChromePixels::Png(_)),
+                "a converted 16-bit rep stays 16-bit and is not read directly"
+            );
+            let (_rep, converted) = srgb_chrome_rep((3, 2), 16, true, true, |plane, row| {
+                for (pixel, rgba) in samples.chunks(4).enumerate() {
+                    let at = pixel / 3 * row + pixel % 3 * 8;
+                    for (channel, sample) in rgba.iter().enumerate() {
+                        plane[at + channel * 2..][..2].copy_from_slice(&sample.to_ne_bytes());
+                    }
+                }
+            });
+            let (pixels, width, height) = chrome_pixels_of(converted).expect("the chrome bytes");
+            assert_eq!((width, height), (3, 2));
+            assert!(
+                matches!(pixels, ChromePixels::Png(_)),
+                "a 16-bit rep is not read directly"
+            );
+            let overlay = ChromeLayer {
+                x: 0,
+                y: 0,
+                width,
+                height,
+                pixels,
+            }
+            .overlay()
+            .expect("the PNG decodes");
+            let high: Vec<u8> = samples
+                .iter()
+                .map(|sample| sample.to_be_bytes()[0])
+                .collect();
+            assert_eq!(overlay.rgba, high);
+        });
+        assert!(decode_native_chrome_png(&[0; 16]).is_err());
+    }
+
+    /// A GDI photograph's BGR becomes opaque RGB, whatever GDI left in its
+    /// fourth byte.
+    #[test]
+    fn bgrx_photograph_becomes_opaque_rgba() {
+        let mut pixels = vec![1, 2, 3, 99, 4, 5, 6, 0];
+        bgrx_to_opaque_rgba8(&mut pixels);
+        assert_eq!(pixels, [3, 2, 1, 255, 6, 5, 4, 255]);
+    }
+
+    /// `window` IS STITCHED ON THE ENCODE WORKER. The photograph as
+    /// CoreGraphics drew it (premultiplied, transparent corners), the
+    /// presented client and the AppKit chrome in its own bitmap layout
+    /// (premultiplied BGRA) travel to the encode worker, which writes the
+    /// composition: the client over every client row, the opaque chrome pixel
+    /// as it is and the translucent one blended over the client, and the
+    /// photograph's corners transparent again. The submitting thread ran none
+    /// of it. Negative control: the same stitch finished on this thread is
+    /// recorded here, and it is the PNG the worker wrote.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_is_stitched_on_the_encode_worker() {
+        use super::{
+            ChromeLayer, ChromePixels, EncodeJob, PlatformShot, ShotEncoding, WindowStitch,
+        };
+
+        let (width, height) = (4_u32, 3_u32);
+        let stitch = || {
+            let mut photograph = Vec::new();
+            for index in 0..width * height {
+                let corner = [0, 3, 8, 11].contains(&index);
+                photograph.extend(if corner { [0; 4] } else { [9, 9, 9, 255] });
+            }
+            let client: Vec<u32> = (0..width * height).map(|i| 0x0010_2030 + i).collect();
+            // Premultiplied BGRA, rows padded to 12 bytes: half-alpha magenta, then
+            // opaque (1, 2, 3).
+            let mut chrome = vec![0x80, 0, 0x80, 0x80, 3, 2, 1, 255];
+            chrome.extend([0xEE; 4]);
+            WindowStitch {
+                shot: PlatformShot {
+                    pixels: photograph,
+                    width,
+                    height,
+                    encoding: ShotEncoding::PremultipliedRgba,
+                    chrome: Some(ChromeLayer {
+                        x: 1,
+                        y: 0,
+                        width: 2,
+                        height: 1,
+                        pixels: ChromePixels::Bitmap {
+                            bytes: chrome,
+                            desc: BitmapDesc {
+                                width: 2,
+                                height: 1,
+                                bytes_per_row: 12,
+                                bits_per_component: 8,
+                                bits_per_pixel: 32,
+                                bitmap_info: 2 | 2 << 12,
+                                rgb: true,
+                            },
+                        },
+                    }),
+                },
+                client: CapturePixels::softbuffer(client, 4, 3).expect("a 4x3 client"),
+                rect: WindowClientRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+            }
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-window-stitch-worker-{}-{}",
+            std::process::id(),
+            aterm_time::since_epoch().expect("clock").as_nanos()
+        ));
+        crate::control_auth::ensure_private_dir(&dir).expect("capture dir");
+        let mut app = crate::App::headless_for_test();
+        let (reply, rx) = std::sync::mpsc::channel();
+        app.submit_encode_job(EncodeJob::Window {
+            stitch: stitch(),
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+            target: crate::control_auth::ConfinedImage::for_test(&dir, "window.png"),
+            cancel: crate::control::CaptureCancellation::new(),
+            reply,
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the window job answers")
+            .expect("the window job succeeds");
+        assert_eq!(answer.value, (width, height));
+        let png = std::fs::read(dir.join("window.png")).expect("the written PNG");
+        drop(answer);
+        let here = std::thread::current().id();
+        assert!(!super::ran_pixel_work(here), "the stitch ran on the worker");
+
+        let (rgba, w, h) = aterm_render::decode_png_rgba8(&png).expect("a PNG");
+        assert_eq!((w, h), (4, 3));
+        let at = |x: usize, y: usize| &rgba[(y * 4 + x) * 4..][..4];
+        assert_eq!(
+            at(0, 0)[3],
+            0,
+            "the photograph's corner is transparent again"
+        );
+        assert_eq!(at(1, 1), [0x10, 0x20, 0x35, 255], "a client pixel");
+        assert_eq!(at(2, 0), [1, 2, 3, 255], "the opaque chrome pixel");
+        assert_eq!(
+            at(1, 0)[3],
+            255,
+            "the translucent chrome is over an opaque client"
+        );
+        assert_ne!(at(1, 0), [0x10, 0x20, 0x31, 255], "and blended into it");
+
+        // Negative control: on this thread, the same composition.
+        let here_pixels = stitch().finish().expect("finishes");
+        assert!(super::ran_pixel_work(here));
+        let here_png = CapturePng::encode(&here_pixels).expect("encodes");
+        assert_eq!(here_png.png, png);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+#[cfg(test)]
+#[path = "capture_barrier_tests.rs"]
+mod capture_barrier_tests;
 
 #[cfg(test)]
 mod terminal_split_capture_tests {
@@ -10138,84 +11507,6 @@ mod terminal_split_capture_tests {
 
     fn confined(dir: &std::path::Path, name: &str) -> control_auth::ConfinedImage {
         control_auth::ConfinedImage::for_test(dir, name)
-    }
-
-    #[test]
-    fn presented_terminal_authority_rejects_unpresented_staging_and_binds_geometry() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let terminal = app.front_terminal(wid).unwrap().term.clone();
-        term_lock(&terminal).process(b"A");
-        app.prepare_terminal_capture_grid(wid)
-            .expect("initial terminal model");
-        {
-            let window = app.windows.get_mut(&wid).unwrap();
-            window.capture_leaf_snapshot_seqs = vec![window.input_scratch.snapshot_seq];
-            window.capture_leaf_content_seqs = vec![0];
-        }
-
-        assert!(
-            app.presented_terminal_capture_after(wid, 0, None).is_none(),
-            "pre-first-present staged pixels have no capture authority"
-        );
-
-        let overlay = crate::app_render::OverlayGlow {
-            accent: 0x0012_3456,
-            wash_a: 17,
-            border_a: 203,
-            border_scale_q4: 0,
-        };
-        {
-            let window = app.windows.get_mut(&wid).unwrap();
-            window.capture_present_serial = 1;
-            window.capture_present_invert = true;
-            window.capture_present_overlay = Some(overlay);
-            window.input_scratch.cursor_row = 3;
-            window.input_scratch.cursor_col = 7;
-        }
-        let frame_a = app
-            .presented_terminal_capture_after(wid, 0, None)
-            .expect("successful A is authorized");
-        assert_eq!(frame_a.serial, 1);
-        assert!(frame_a.invert);
-        assert_eq!(frame_a.overlay, Some(overlay));
-        assert_eq!((frame_a.input.cursor_row, frame_a.input.cursor_col), (3, 7));
-
-        // Stage a materially different B (cursor + content + font/DPI metric),
-        // but model a dropped surface transaction by NOT advancing the serial.
-        // Neither the old A capture nor a new capture-after-A may observe B.
-        let old_cell_size = frame_a.cell_size;
-        {
-            let window = app.windows.get_mut(&wid).unwrap();
-            window.input_scratch.cursor_row = 9;
-            window.input_scratch.cursor_col = 11;
-            window.input_scratch.cells[0][0].ch = 'B';
-            window.metrics = crate::MetricsView::applied(27.0, 9, 4, 3);
-        }
-        assert!(
-            app.presented_terminal_capture_after(wid, 1, None).is_none(),
-            "a dropped B cannot authorize mutable staged buffers"
-        );
-        assert_eq!(frame_a.input.cells[0][0].ch, 'A');
-        assert_eq!(
-            (frame_a.input.cursor_row, frame_a.input.cursor_col),
-            (3, 7),
-            "the owned A snapshot cannot tear with staged B"
-        );
-
-        // Once B succeeds, all of its generation moves together: pixels,
-        // cursor and DPI-derived cell geometry are sampled in the same
-        // main-thread success turn.
-        app.windows.get_mut(&wid).unwrap().capture_present_serial = 2;
-        let frame_b = app
-            .presented_terminal_capture_after(wid, 1, None)
-            .expect("successful B is authorized");
-        assert_eq!(frame_b.input.cells[0][0].ch, 'B');
-        assert_eq!(
-            (frame_b.input.cursor_row, frame_b.input.cursor_col),
-            (9, 11)
-        );
-        assert_ne!(frame_b.cell_size, old_cell_size);
     }
 
     #[test]
@@ -10396,14 +11687,14 @@ mod terminal_split_capture_tests {
         let retained = app
             .recording_presented_frame_capture(wid, true, false)
             .expect("resident successful frame survives scratch interleave");
-        assert_eq!(retained.frame.input.cursor_trail.len(), 1);
-        assert_eq!(retained.frame.input.cursor_trail_color, trail_color);
-        assert_eq!(retained.frame.input.cursor_glow_add.len(), 1);
+        assert_eq!(retained.input.cursor_trail.len(), 1);
+        assert_eq!(retained.input.cursor_trail_color, trail_color);
+        assert_eq!(retained.input.cursor_glow_add.len(), 1);
         assert_eq!(
-            retained.frame.input.cursor_glow_add[0].y, 1,
+            retained.input.cursor_glow_add[0].y, 1,
             "resident semantic capture undoes the nonzero pad transport shift"
         );
-        assert_eq!(retained.frame.input.free_sprites.len(), 1);
+        assert_eq!(retained.input.free_sprites.len(), 1);
         drop(retained);
 
         app.windows.get_mut(&wid).unwrap().blink_phase = false;
@@ -10457,6 +11748,114 @@ mod terminal_split_capture_tests {
         let staged = &app.windows[&wid].input_scratch;
         assert!(staged.cursor_trail.is_empty());
         assert!(staged.cursor_glow_add.is_empty());
+
+        // `image plain` of the recording rerenders the resident model under
+        // the visuals retained beside the recorded present (none here), from
+        // an owned copy stripped of its bling layers. A newer scratch and a
+        // live glow were never presented, so neither reaches the still.
+        let scratch_bg = 0x0013_57A9;
+        app.windows.get_mut(&wid).unwrap().input_scratch.default_bg = scratch_bg;
+        let plain_still = |app: &mut App, name: &str| {
+            let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
+            let (reply, rx) = std::sync::mpsc::channel();
+            app.render_image(crate::control::ImageReq {
+                handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+                target: confined(&root, name),
+                clean: true,
+                session: None,
+                want_bytes: true,
+                want_metadata: true,
+                frame_metadata: std::sync::Arc::clone(&metadata),
+                cancel: crate::control::CaptureCancellation::new(),
+                reply,
+            });
+            let (_, _, png) = rx
+                .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
+                .expect("plain still reply")
+                .expect("the plain recording still succeeds")
+                .value;
+            let (rgba, width, height) =
+                aterm_render::decode_png_rgba8(&png.expect("the plain still is encoded"))
+                    .expect("encoded RGBA8");
+            let pixels: Vec<u32> = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2]))
+                .collect();
+            let serial = metadata.get().expect("plain still metadata").capture_serial;
+            (width, height, pixels, serial)
+        };
+        let (width, height, absent, serial) = plain_still(&mut app, "plain.png");
+        assert_eq!(
+            serial, successful_serial,
+            "the plain still is bound to the recorded present"
+        );
+        assert!(
+            !absent.contains(&trail_color),
+            "the plain still strips the rainbow-trail sentinel"
+        );
+        assert!(
+            !absent.contains(&scratch_bg),
+            "the plain still rasterizes the resident model, not the newer scratch"
+        );
+        assert_eq!(
+            app.recording_presented_frame_capture(wid, true, false)
+                .expect("resident frame after the plain still")
+                .input
+                .cursor_trail
+                .len(),
+            1,
+            "the strip took an owned copy; the resident model keeps its trail"
+        );
+
+        app.level_up = Some(crate::level_up::LevelUp::charging_continued(
+            9,
+            Instant::now(),
+            0.0,
+        ));
+        let overlay = app
+            .host_visual_state(wid, Instant::now())
+            .overlay
+            .expect("a live glow");
+        let (_, _, glowing, serial) = plain_still(&mut app, "plain-glow.png");
+        assert_eq!(serial, successful_serial);
+        // The outer corner lies outside glyphs and cards; the rim covers it.
+        assert_eq!(
+            glowing[0], absent[0],
+            "a retained None overlay is authoritative: the live glow is not resampled"
+        );
+        app.level_up = None;
+
+        // Negative controls: the live glow, resampled, would show at the
+        // corner, and a rerender of the scratch shows its background.
+        let mut resampled = absent.clone();
+        crate::app_render::apply_overlay_at(
+            &mut resampled,
+            width,
+            height,
+            0,
+            0,
+            width,
+            height,
+            overlay,
+        );
+        assert_ne!(resampled[0], absent[0]);
+        let mut scratch = app.take_rerender_input(wid);
+        scratch.clear_overlays();
+        let scratch_frame = app
+            .rerender_capture(
+                wid,
+                &mut scratch,
+                crate::app_render::HostVisualState::default(),
+            )
+            .expect("a rerender of the scratch");
+        assert!(
+            scratch_frame
+                .pixels
+                .iter()
+                .any(|&pixel| pixel & 0x00FF_FFFF == scratch_bg)
+        );
 
         if let Some(crate::PresentTarget::Virtual { window_gpu }) =
             app.windows.get_mut(&wid).unwrap().present.as_mut()
@@ -11177,6 +12576,7 @@ mod capture_overlay_reset_tests {
 #[cfg(test)]
 mod encode_worker_tests {
     use super::*;
+    use crate::app_render::apply_overlay_at;
     use crate::control_auth::ensure_private_dir;
     use std::time::Duration;
 
@@ -11195,7 +12595,7 @@ mod encode_worker_tests {
         ensure_private_dir(dir.path()).expect("a private dir");
         let (tx, rx) = std::sync::mpsc::channel();
         app.render_image(crate::control::ImageReq {
-            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
             target: control_auth::ConfinedImage::for_test(dir.path(), "frame.png"),
             clean: false,
             session: None,
@@ -11221,7 +12621,7 @@ mod encode_worker_tests {
             "`image` asked the OS for no photograph"
         );
         assert!(
-            app.window_rgba_of(Some(WindowId(0))).is_err(),
+            app.window_rgba_of(WindowId(0)).is_err(),
             "a headless window has nothing on screen to photograph"
         );
         assert_eq!(
@@ -11242,38 +12642,83 @@ mod encode_worker_tests {
         control_auth::ConfinedImage::for_test(dir, name)
     }
 
-    /// Capture the front window through the production clean `image` path
-    /// (or the retained native path when `presented` is given) as bytes.
-    fn visual_capture_pixels(app: &mut App, presented: Option<PresentedFrameCapture>) -> Frame {
+    /// A capture of the front window bound to a retained present of `input`
+    /// under `visuals`, in the shape the resolver binds a headless recording's
+    /// still (`recorded_capture_source`), without the GPU recording. The
+    /// resolver arm itself is exercised through `render_image` by
+    /// `recording_image_keeps_the_exact_successful_present_cursor_layers`.
+    fn retained_capture(
+        app: &App,
+        input: aterm_render::RenderInput,
+        visuals: crate::app_render::HostVisualState,
+    ) -> ResolvedCapture {
+        let (plan, route) = app
+            .active_visible_frame_layout(crate::WindowId(0))
+            .expect("a visible layout");
+        ResolvedCapture {
+            source: CaptureSource::Rerender {
+                serial: Some(1),
+                visuals,
+            },
+            model: Some(input),
+            context: CaptureContext {
+                plan,
+                route,
+                terminal_grid: None,
+                recorded: None,
+            },
+        }
+    }
+
+    /// The pixels of an `image plain` of the front window: a fresh capture, or
+    /// one bound to a retained present of `input` under its visuals.
+    fn visual_capture_pixels(
+        app: &mut App,
+        presented: Option<(
+            aterm_render::RenderInput,
+            crate::app_render::HostVisualState,
+        )>,
+    ) -> Frame {
         let (reply, rx) = std::sync::mpsc::channel();
-        let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
-        if let Some(presented) = presented {
-            app.render_native_image(NativeImageRequest {
-                front: crate::WindowId(0),
-                clean: true,
-                presented: Some(presented),
-                request_layout: None,
-                presented_metadata: None,
-                exact_frame: None,
-                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
-                target: control_auth::ConfinedImage::in_memory(),
-                want_bytes: true,
-                want_metadata: false,
-                cancel: crate::control::CaptureCancellation::new(),
-                frame_metadata: &frame_metadata,
-                reply,
-            });
+        let req = image_req_for_test(
+            control_auth::ConfinedImage::in_memory(),
+            true,
+            true,
+            None,
+            reply,
+        );
+        if let Some((input, visuals)) = presented {
+            let capture = retained_capture(app, input, visuals);
+            app.image_tail(crate::WindowId(0), capture, req);
         } else {
-            let target = control_auth::ConfinedImage::in_memory();
-            app.render_image(image_req_for_test(target, true, true, None, reply));
+            app.render_image(req);
         }
         let (_, _, png) = rx
             .recv_timeout(WORKER_PATIENCE)
             .expect("visual capture worker reply")
             .expect("visual capture succeeds")
             .value;
-        let (rgba, width, height) =
-            aterm_render::decode_png_rgba8(&png.expect("capture PNG bytes")).unwrap();
+        rgb_frame_of_png(&png.expect("capture PNG bytes"))
+    }
+
+    /// The pixels of a SIGUSR1 snapshot of the front window, once published.
+    fn snapshot_capture_pixels(app: &mut App, dir: &std::path::Path, name: &str) -> Frame {
+        let path = dir.join(name);
+        let done = snapshot_sidecar_path(&path, ".done");
+        app.snapshot_at_path(path.display().to_string());
+        let deadline = std::time::Instant::now() + WORKER_PATIENCE;
+        while !done.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the snapshot was published"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        rgb_frame_of_png(&std::fs::read(&path).expect("snapshot PNG"))
+    }
+
+    fn rgb_frame_of_png(png: &[u8]) -> Frame {
+        let (rgba, width, height) = aterm_render::decode_png_rgba8(png).unwrap();
         let (pixels, remainder) = rgba.as_chunks::<4>();
         assert!(remainder.is_empty());
         Frame {
@@ -11286,15 +12731,31 @@ mod encode_worker_tests {
         }
     }
 
+    /// Both captures that rasterize their own frame, `image` and the SIGUSR1
+    /// snapshot, paint the host visual policy and no policy of their own.
     #[test]
     fn capture_visual_policy_terminal_fallback_keeps_charging_over_a_palette() {
+        type Capture = fn(&mut App, &std::path::Path, &str) -> Frame;
+        let image: Capture = |app, _, _| visual_capture_pixels(app, None);
+        let snapshot: Capture = snapshot_capture_pixels;
+        for (verb, capture) in [("image", image), ("snapshot", snapshot)] {
+            charging_stays_over_a_palette(verb, capture);
+        }
+    }
+
+    fn charging_stays_over_a_palette(
+        verb: &str,
+        capture: fn(&mut App, &std::path::Path, &str) -> Frame,
+    ) {
+        let dir = unique_dir("capture-visual-charging");
+        ensure_private_dir(&dir).unwrap();
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
         app.palette_enter();
         assert!(app.windows[&wid].overlay_open());
         assert!(app.windows[&wid].os_window.is_none());
         assert_eq!(app.windows[&wid].capture_present_serial, 0);
-        let baseline = visual_capture_pixels(&mut app, None);
+        let baseline = capture(&mut app, &dir, "baseline.png");
 
         let now = Instant::now();
         app.level_up = Some(crate::level_up::LevelUp::charging_continued(7, now, 0.0));
@@ -11304,10 +12765,11 @@ mod encode_worker_tests {
         let visuals = app.host_visual_state(wid, now);
         assert!(!visuals.invert, "a modal still suppresses the bell");
         let overlay = visuals.overlay.expect("charging remains admitted");
-        let charged = visual_capture_pixels(&mut app, None);
+        let charged = capture(&mut app, &dir, "charging.png");
         assert_eq!(
             (charged.width, charged.height),
-            (baseline.width, baseline.height)
+            (baseline.width, baseline.height),
+            "{verb}"
         );
         let mut expected = baseline.clone();
         apply_overlay_at(
@@ -11323,16 +12785,19 @@ mod encode_worker_tests {
         // The outer corner is outside terminal glyphs and cards, so cursor
         // timing cannot satisfy this comparison. The old blanket suppression
         // returned the baseline pixel here and fails the positive control.
-        assert_ne!(expected.pixels[0], baseline.pixels[0]);
-        assert_eq!(charged.pixels[0], expected.pixels[0]);
+        assert_ne!(expected.pixels[0], baseline.pixels[0], "{verb}");
+        assert_eq!(
+            charged.pixels[0], expected.pixels[0],
+            "{verb}: the charging rim, over the palette, with no bell"
+        );
 
         // The rim ended (Commit): the drag still yields to the modal.
         app.level_up = None;
         assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
-        let committed = visual_capture_pixels(&mut app, None);
+        let committed = capture(&mut app, &dir, "committed.png");
         assert_eq!(
             committed.pixels[0], baseline.pixels[0],
-            "the drag yields to the modal"
+            "{verb}: the drag yields to the modal"
         );
     }
 
@@ -11342,13 +12807,9 @@ mod encode_worker_tests {
         let wid = crate::WindowId(0);
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         assert!(app.prepare_native_input_scratch(wid));
-        let retained = PresentedFrameCapture {
-            input: app.windows[&wid].input_scratch.clone(),
-            invert: false,
-            overlay: None,
-            serial: 1,
-        };
-        let baseline = visual_capture_pixels(&mut app, Some(retained.clone()));
+        let retained = app.windows[&wid].input_scratch.clone();
+        let absent = crate::app_render::HostVisualState::default();
+        let baseline = visual_capture_pixels(&mut app, Some((retained.clone(), absent)));
         app.level_up = Some(crate::level_up::LevelUp::charging_continued(
             8,
             Instant::now(),
@@ -11358,7 +12819,7 @@ mod encode_worker_tests {
             .host_visual_state(wid, Instant::now())
             .overlay
             .expect("live glow");
-        let captured = visual_capture_pixels(&mut app, Some(retained.clone()));
+        let captured = visual_capture_pixels(&mut app, Some((retained.clone(), absent)));
         assert_eq!(
             captured.pixels, baseline.pixels,
             "retained None is authoritative, not a request to resample"
@@ -11366,10 +12827,13 @@ mod encode_worker_tests {
 
         let painted = visual_capture_pixels(
             &mut app,
-            Some(PresentedFrameCapture {
-                overlay: Some(overlay),
-                ..retained
-            }),
+            Some((
+                retained,
+                crate::app_render::HostVisualState {
+                    overlay: Some(overlay),
+                    ..absent
+                },
+            )),
         );
         assert_ne!(
             painted.pixels[0], baseline.pixels[0],
@@ -11397,12 +12861,14 @@ mod encode_worker_tests {
                 .expect("confine automatic image target");
             paths.push(target.display_path());
             app.submit_encode_job(EncodeJob::Image {
-                frame: Frame {
+                pixels: CapturePixels::packed(Frame {
                     width: side,
                     height: side,
                     pixels: vec![0u32; side * side],
-                },
-                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                })
+                .expect("a whole frame"),
+                metadata: None,
+                handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
                 target,
                 want_bytes: false,
                 cancel: crate::control::CaptureCancellation::new(),
@@ -11499,67 +12965,227 @@ mod encode_worker_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The capture kinds, each entered through its public entry.
+    #[derive(Clone, Copy, Debug)]
+    enum CaptureKind {
+        Image,
+        Snapshot,
+        #[cfg(any(target_os = "macos", windows))]
+        Window,
+    }
+
+    impl CaptureKind {
+        const ALL: &[CaptureKind] = &[
+            CaptureKind::Image,
+            CaptureKind::Snapshot,
+            #[cfg(any(target_os = "macos", windows))]
+            CaptureKind::Window,
+        ];
+
+        /// Enter the capture and return its reply. A snapshot has no caller to
+        /// reply to, so its answer is read off the disk instead: published once
+        /// its worker finishes when `admitted`, untouched otherwise.
+        fn enter(
+            self,
+            app: &mut App,
+            dir: &std::path::Path,
+            name: &str,
+            admitted: bool,
+        ) -> Option<Result<(), String>> {
+            match self {
+                CaptureKind::Image => {
+                    let (reply, rx) = std::sync::mpsc::channel();
+                    app.render_image(crate::control::ImageReq {
+                        handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+                        target: confined(dir, name),
+                        clean: true,
+                        session: None,
+                        want_bytes: false,
+                        want_metadata: false,
+                        frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
+                        cancel: crate::control::CaptureCancellation::new(),
+                        reply,
+                    });
+                    Some(
+                        rx.recv_timeout(WORKER_PATIENCE)
+                            .expect("the image answers")
+                            .map(drop),
+                    )
+                }
+                CaptureKind::Snapshot => {
+                    let path = dir.join(name);
+                    let done = snapshot_sidecar_path(&path, ".done");
+                    app.snapshot_at_path(path.display().to_string());
+                    if admitted {
+                        let deadline = std::time::Instant::now() + WORKER_PATIENCE;
+                        while !done.exists() {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the admitted snapshot was published"
+                            );
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    } else {
+                        assert!(!done.exists() && !path.exists(), "nothing was written");
+                    }
+                    None
+                }
+                #[cfg(any(target_os = "macos", windows))]
+                CaptureKind::Window => {
+                    let (reply, rx) = std::sync::mpsc::channel();
+                    app.capture_window(
+                        crate::control::ReplyRetentionPermit::from_own_budget(),
+                        confined(dir, name),
+                        crate::control::CaptureCancellation::new(),
+                        reply,
+                    );
+                    Some(
+                        rx.recv_timeout(WORKER_PATIENCE)
+                            .expect("the window capture answers")
+                            .map(drop),
+                    )
+                }
+            }
+        }
+    }
+
+    /// ONE DOOR ADMITS EVERY CAPTURE KIND, ONCE. `image`, the SIGUSR1 snapshot
+    /// and `window` all enter through `App::run_capture`: while the encoder
+    /// holds its whole byte budget each is answered busy and no body runs; with
+    /// room each runs exactly one body. The second half is the negative
+    /// control: a door that refused every kind, or admitted one twice, fails it.
+    #[test]
+    fn run_capture_admits_every_kind_once() {
+        let dir = unique_dir("capture-door");
+        ensure_private_dir(&dir).unwrap();
+        let mut app = App::headless_for_test();
+        let held = CapturePermit::try_reserve(&app.capture_bytes, CAPTURE_BYTE_BUDGET)
+            .expect("the budget is empty");
+        for &kind in CaptureKind::ALL {
+            let bodies = capture_bodies();
+            if let Some(reply) = kind.enter(&mut app, &dir, &format!("busy-{kind:?}.png"), false) {
+                let error = reply.expect_err("a saturated encoder refuses the capture");
+                assert!(error.contains(ENCODE_QUEUE_FULL), "{kind:?}: {error}");
+            }
+            assert_eq!(capture_bodies(), bodies, "{kind:?}: no body ran");
+        }
+        drop(held);
+        for &kind in CaptureKind::ALL {
+            let bodies = capture_bodies();
+            let reply = kind.enter(&mut app, &dir, &format!("{kind:?}.png"), true);
+            assert_eq!(
+                capture_bodies(),
+                bodies + 1,
+                "{kind:?}: admitted once ({reply:?})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Twenty captures asked of an encoder that drains nothing (a queue deep
+    /// enough that its record count never binds): each admitted by `admit`
+    /// is then taken, `job(i)`, and submitted. Returns the captures admitted,
+    /// the bytes in flight after each, and the queued work.
+    fn feed_a_blocked_encoder(
+        app: &mut App,
+        mut admit: impl FnMut(&mut App) -> bool,
+        mut job: impl FnMut(u32) -> EncodeJob,
+    ) -> (Vec<u32>, Vec<usize>, std::sync::mpsc::Receiver<EncodeWork>) {
+        let (tx, blocked) = std::sync::mpsc::sync_channel::<EncodeWork>(64);
+        app.encode_tx = Some(tx);
+        let mut admitted = Vec::new();
+        let mut in_flight = Vec::new();
+        for i in 0..20_u32 {
+            if !admit(app) {
+                continue;
+            }
+            // The capture: its pixels exist only for an admitted request.
+            app.submit_encode_job(job(i));
+            app.capture_permit = None;
+            admitted.push(i);
+            in_flight.push(app.capture_bytes.load(std::sync::atomic::Ordering::Acquire));
+        }
+        (admitted, in_flight, blocked)
+    }
+
+    /// An `image` job of `pixels`, whose reply nobody reads.
+    fn image_job(
+        pixels: CapturePixels,
+        reply: &std::sync::mpsc::Sender<crate::control::ImageReply>,
+    ) -> EncodeJob {
+        EncodeJob::Image {
+            pixels,
+            metadata: None,
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+            target: control_auth::ConfinedImage::for_test(&std::env::temp_dir(), "unused"),
+            want_bytes: true,
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: reply.clone(),
+        }
+    }
+
+    /// The captures `feed_a_blocked_encoder` admitted, each charged `peak`:
+    /// every admitted job holds exactly that, the bytes in flight never pass
+    /// the budget (a lone capture may), and as many are admitted as the
+    /// budget holds.
+    fn assert_each_holds_its_peak(label: &str, in_flight: &[usize], peak: usize) {
+        for (n, &bytes) in in_flight.iter().enumerate() {
+            assert_eq!(bytes, (n + 1) * peak, "{label}: capture {n} holds its peak");
+            assert!(
+                bytes <= CAPTURE_BYTE_BUDGET.max(peak),
+                "{label}: {bytes} bytes in flight past the budget"
+            );
+        }
+        assert_eq!(
+            in_flight.len(),
+            (CAPTURE_BYTE_BUDGET / peak).max(1),
+            "{label}: exactly as many as the budget holds"
+        );
+    }
+
     /// A BLOCKED ENCODER HOLDS AT MOST ITS BYTE BUDGET. Twenty maximum-size
-    /// (5K Retina) captures are asked of an encoder that drains nothing (a
-    /// queue deep enough that its record count never binds): each is admitted
-    /// only while the bytes in flight fit the budget, a refused one allocates
-    /// no framebuffer at all, and the in-flight bytes plateau instead of
-    /// growing with every request. The admitted jobs reach the encoder in
-    /// FIFO order, and draining it returns every byte.
+    /// (5K Retina) captures are asked of an encoder that drains nothing: each
+    /// is admitted only while the bytes in flight fit the budget, a refused
+    /// one allocates no framebuffer at all, and the in-flight bytes plateau
+    /// instead of growing with every request. Each holds its pixels and its
+    /// encode's working set ([`CapturePixels::peak_bytes`]), as estimated at
+    /// admission. The admitted jobs reach the encoder in FIFO order, and
+    /// draining it returns every byte.
     #[test]
     fn a_blocked_encoder_holds_at_most_its_byte_budget() {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
         let (width, height) = (5120_usize, 2880_usize);
-        let frame_bytes = width * height * 4;
+        let peak_bytes = width * height * 4 + capture_encode_overhead(width, height);
         app.windows.get_mut(&wid).unwrap().win_px = Some(aterm_window::dpi::PhysicalSize::new(
             u32::try_from(width).unwrap(),
             u32::try_from(height).unwrap(),
         ));
-        let (tx, blocked) = std::sync::mpsc::sync_channel::<EncodeWork>(64);
-        app.encode_tx = Some(tx);
+        let charge = CaptureCharge::Frame(DestinationDemand::Preferred);
+        assert_eq!(app.capture_bytes_estimate(wid, charge), peak_bytes);
         let (reply, _replies) = std::sync::mpsc::channel();
-        let mut admitted = Vec::new();
-        let mut refused = 0_usize;
-        let ceiling = CAPTURE_BYTE_BUDGET.max(frame_bytes);
-        for i in 0..20_u32 {
-            if !app.admit_capture(Some(wid)) {
-                refused += 1;
-                continue;
-            }
-            // The capture: a framebuffer exists only for an admitted request.
-            app.submit_encode_job(EncodeJob::Image {
-                frame: Frame {
+        let (admitted, in_flight, blocked) = feed_a_blocked_encoder(
+            &mut app,
+            |app| app.admit_capture(Some(wid), charge),
+            |i| {
+                let frame = Frame {
                     width,
                     height,
                     pixels: vec![i; width * height],
-                },
-                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
-                target: control_auth::ConfinedImage::for_test(&std::env::temp_dir(), "unused"),
-                want_bytes: true,
-                cancel: crate::control::CaptureCancellation::new(),
-                reply: reply.clone(),
-            });
-            app.capture_permit = None;
-            admitted.push(i);
-            let in_flight = app.capture_bytes.load(std::sync::atomic::Ordering::Acquire);
-            assert!(
-                in_flight <= ceiling,
-                "capture {i}: {in_flight} bytes in flight past the plateau {ceiling}"
-            );
-        }
-        assert!(refused > 0, "the budget refused once full");
-        assert_eq!(admitted.len() + refused, 20);
-        assert_eq!(
-            admitted.len(),
-            (CAPTURE_BYTE_BUDGET / frame_bytes).max(1),
-            "exactly as many as the budget holds"
+                };
+                image_job(CapturePixels::packed(frame).expect("a whole frame"), &reply)
+            },
         );
+        assert!(admitted.len() < 20, "the budget refused once full");
+        assert_each_holds_its_peak("5K", &in_flight, peak_bytes);
         for expect in &admitted {
             let work = blocked.try_recv().expect("an admitted capture was queued");
             match &work.job {
-                EncodeJob::Image { frame, .. } => {
-                    assert_eq!(frame.pixels.first(), Some(expect), "FIFO order");
+                EncodeJob::Image { pixels, .. } => {
+                    let mut row = Vec::new();
+                    pixels.rgba_row(0, &mut row);
+                    let blue = u8::try_from(*expect).expect("a small index");
+                    assert_eq!(row[..4], [0, 0, blue, 255], "FIFO order");
                 }
                 _ => panic!("an image job"),
             }
@@ -11573,24 +13199,233 @@ mod encode_worker_tests {
         );
     }
 
+    /// AN ADMITTED CAPTURE IS CHARGED WHAT ITS ADMISSION RESERVED, WHATEVER IT
+    /// CARRIES. A tapped f16 destination (eight bytes a pixel), a padded 8-bit
+    /// destination cut to its frame (it travels whole) and a `window` stitch
+    /// (photograph, client, chrome and shape mask) are each recharged, when
+    /// submitted, exactly the bytes admission estimated for them
+    /// ([`frame_capture_peak`] over the destination's mapped size, which
+    /// `GpuSurface::snapshot_bytes` reports; [`App::capture_bytes_estimate`]
+    /// for the window), so a blocked encoder fed any of them holds a whole
+    /// number of them and never more than its budget. NEGATIVE CONTROL:
+    /// admitted at the frame-only estimate (four bytes a pixel, what admission
+    /// reserved before it knew the payload), 1440x900 f16 destinations push
+    /// the bytes in flight past the budget.
+    #[test]
+    fn an_admitted_capture_is_charged_what_admission_reserved() {
+        use aterm_gpu::video_tap::RawCapture;
+
+        let (reply, _replies) = std::sync::mpsc::channel();
+        // A destination as mapped: `bpp`-byte texels, rows padded to 256 bytes.
+        let mapped = |width: usize, height: usize, bpp: usize| {
+            let row = (width * bpp).div_ceil(256) * 256;
+            (vec![0_u8; row * height], row)
+        };
+
+        let (width, height) = (1440_usize, 900_usize);
+        let f16 = || {
+            let (bytes, row) = mapped(width, height, 8);
+            CapturePixels::raw(
+                RawCapture::scrgb_f16_for_test(bytes, width as u32, height as u32, row)
+                    .expect("an f16 destination"),
+            )
+        };
+        let f16_peak = f16().peak_bytes();
+        let f16_estimate = frame_capture_peak(width, height, Some(f16().allocation()));
+        assert_eq!(f16_estimate, f16_peak, "the f16 estimate is its charge");
+        let mut app = App::headless_for_test();
+        let (_, in_flight, _queued) = feed_a_blocked_encoder(
+            &mut app,
+            |app| app.admit_capture_bytes(f16_estimate),
+            |_| image_job(f16(), &reply),
+        );
+        assert_each_holds_its_peak("f16", &in_flight, f16_peak);
+
+        let frame_only = frame_capture_peak(width, height, None);
+        assert!(frame_only < f16_peak);
+        let mut app = App::headless_for_test();
+        let (_, in_flight, _queued) = feed_a_blocked_encoder(
+            &mut app,
+            |app| app.admit_capture_bytes(frame_only),
+            |_| image_job(f16(), &reply),
+        );
+        assert!(
+            in_flight.iter().any(|&bytes| bytes > CAPTURE_BYTE_BUDGET),
+            "negative control: the frame-only estimate overruns the budget"
+        );
+
+        // A surface one pixel wider and taller than the frame cut from it.
+        let cut = || {
+            let (bytes, row) = mapped(width + 1, height + 1, 4);
+            let raw =
+                RawCapture::bgra8_srgb_for_test(bytes, width as u32 + 1, height as u32 + 1, row)
+                    .expect("an 8-bit destination");
+            CapturePixels::raw(raw)
+                .cut_to(aterm_render::PixelRect {
+                    x: 1,
+                    y: 0,
+                    width,
+                    height,
+                })
+                .expect("the frame is inside its surface")
+        };
+        let cut_peak = cut().peak_bytes();
+        assert_eq!(
+            frame_capture_peak(width, height, Some(cut().allocation())),
+            cut_peak,
+            "the cut destination's estimate is its charge"
+        );
+        assert!(cut_peak > frame_capture_peak(width, height, None));
+        let mut app = App::headless_for_test();
+        let (_, in_flight, _queued) = feed_a_blocked_encoder(
+            &mut app,
+            |app| app.admit_capture_bytes(cut_peak),
+            |_| image_job(cut(), &reply),
+        );
+        assert_each_holds_its_peak("cut", &in_flight, cut_peak);
+
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.win_px = Some(aterm_window::dpi::PhysicalSize::new(
+                width as u32,
+                height as u32,
+            ));
+            #[cfg(target_os = "macos")]
+            let chrome_height = 56;
+            #[cfg(target_os = "macos")]
+            {
+                ws.metrics.head = chrome_height;
+            }
+            let (window_reply, _window_replies) = std::sync::mpsc::channel();
+            let stitch = || WindowStitch {
+                shot: PlatformShot {
+                    pixels: vec![0; width * height * 4],
+                    width: width as u32,
+                    height: height as u32,
+                    encoding: ShotEncoding::NATIVE,
+                    #[cfg(target_os = "macos")]
+                    chrome: Some(ChromeLayer {
+                        x: 0,
+                        y: 0,
+                        width: width as u32,
+                        height: chrome_height as u32,
+                        pixels: ChromePixels::Bitmap {
+                            bytes: vec![0; width * chrome_height * 4],
+                            desc: BitmapDesc {
+                                width,
+                                height: chrome_height,
+                                bytes_per_row: width * 4,
+                                bits_per_component: 8,
+                                bits_per_pixel: 32,
+                                bitmap_info: 1,
+                                rgb: true,
+                            },
+                        },
+                    }),
+                },
+                client: CapturePixels::softbuffer(vec![0; width * height], width, height)
+                    .expect("a whole client"),
+                rect: WindowClientRect {
+                    x: 0,
+                    y: 0,
+                    width: width as u32,
+                    height: height as u32,
+                },
+            };
+            let window_peak = stitch().peak_bytes();
+            assert_eq!(
+                app.capture_bytes_estimate(wid, CaptureCharge::Window),
+                window_peak,
+                "the window estimate is its stitch's charge"
+            );
+            assert!(window_peak > frame_capture_peak(width, height, None));
+            let (_, in_flight, _queued) = feed_a_blocked_encoder(
+                &mut app,
+                |app| app.admit_capture(Some(wid), CaptureCharge::Window),
+                |_| EncodeJob::Window {
+                    stitch: stitch(),
+                    handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+                    target: control_auth::ConfinedImage::for_test(&std::env::temp_dir(), "unused"),
+                    cancel: crate::control::CaptureCancellation::new(),
+                    reply: window_reply.clone(),
+                },
+            );
+            assert_each_holds_its_peak("window", &in_flight, window_peak);
+        }
+    }
+
+    /// Metadata of no frame: every identity zero, no leaf.
+    fn blank_metadata() -> crate::control::ImageFrameMetadata {
+        crate::control::ImageFrameMetadata {
+            frame_kind: "terminal",
+            phase: "staged",
+            window: 0,
+            view: None,
+            generation: None,
+            config_revision: None,
+            update_revision: None,
+            document_seq: None,
+            presentation_revision: None,
+            paint_revision: None,
+            capture_serial: 0,
+            width: 0,
+            height: 0,
+            pixel_fingerprint: 0,
+            compiled_fingerprint: None,
+            raster_fingerprint: 0,
+            raster_model_fingerprint: 0,
+            raster_geometry: 0,
+            overlay_fingerprint: 0,
+            theme_fingerprint: 0,
+            leaves: Vec::new(),
+        }
+    }
+
     /// A CAPTURE'S BYTES ARE FREE BEFORE ITS ANSWER (2026-09-26 review). The
-    /// worker releases the capture permit with the raw framebuffer, before
-    /// the reply, so a client that sends its next `image` the moment it reads
-    /// the answer finds the budget free — on a 5K window one frame
-    /// (5120x2880x4 bytes) nearly fills it, and nothing retries `encode queue
-    /// full`. Both reply paths of a byte capture: the PNG, and a cancelled
-    /// request's error. RED before: the worker dropped the permit after
-    /// `run_encode_job` returned, after the reply, so the reader could still
-    /// see the frame's bytes held (reproduced by delaying that drop).
+    /// worker releases the capture permit with the raw pixels, before the
+    /// reply, so a client that sends its next `image` the moment it reads the
+    /// answer finds the budget free — on a 5K window one capture's peak
+    /// ([`CapturePixels::peak_bytes`]) is past the whole budget, and nothing
+    /// retries `encode queue full`. Every reply path of a byte capture: the
+    /// PNG, a cancelled request's error, an encoder's error (pixels wider than
+    /// a PNG can describe), which is an answer, never a worker panic, and a
+    /// request whose metadata was already published.
+    /// RED before: the worker dropped the permit after `run_encode_job`
+    /// returned, after the reply, so the reader could still see the frame's
+    /// bytes held (reproduced by delaying that drop).
     #[test]
     fn a_captures_bytes_are_free_before_its_answer() {
         let held = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for cancelled in [false, true] {
-            let (width, height) = (64_usize, 64_usize);
-            let permit =
-                CapturePermit::try_reserve(&held, width * height * 4).expect("the budget is empty");
+        for case in ["encoded", "cancelled", "unencodable", "republished"] {
+            let (width, height) = if case == "unencodable" {
+                // No pixels, and a width no PNG header can hold.
+                (usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit"), 0)
+            } else {
+                (64_usize, 64_usize)
+            };
+            let pixels = CapturePixels::packed(Frame {
+                width,
+                height,
+                pixels: vec![0u32; width * height],
+            })
+            .expect("a whole frame");
+            let metadata = (case == "republished").then(|| {
+                let cell = std::sync::Arc::new(std::sync::OnceLock::new());
+                let published = blank_metadata();
+                cell.set(published.clone()).expect("first");
+                PendingMetadata {
+                    metadata: published,
+                    raster_is_pixels: false,
+                    cell,
+                }
+            });
+            let permit = CapturePermit::try_reserve(&held, pixels.peak_bytes())
+                .expect("the budget is empty");
             let cancel = crate::control::CaptureCancellation::new();
-            if cancelled {
+            if case == "cancelled" {
                 assert!(cancel.cancel());
             }
             let (reply, rx) = std::sync::mpsc::channel::<Result<_, String>>();
@@ -11598,18 +13433,15 @@ mod encode_worker_tests {
             let reader = std::thread::spawn(move || {
                 let answer = rx.recv().expect("an answer");
                 (
-                    answer.is_ok(),
+                    answer.map(drop),
                     observed.load(std::sync::atomic::Ordering::Acquire),
                 )
             });
             run_encode_job(
                 EncodeJob::Image {
-                    frame: Frame {
-                        width,
-                        height,
-                        pixels: vec![0u32; width * height],
-                    },
-                    handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                    pixels,
+                    metadata,
+                    handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
                     target: control_auth::ConfinedImage::for_test(&std::env::temp_dir(), "unused"),
                     want_bytes: true,
                     cancel,
@@ -11617,11 +13449,22 @@ mod encode_worker_tests {
                 },
                 Some(permit),
             );
-            let (ok, at_answer) = reader.join().expect("reader");
-            assert_eq!(ok, !cancelled, "cancelled={cancelled}");
+            let (answer, at_answer) = reader.join().expect("reader");
+            match case {
+                "encoded" => assert!(answer.is_ok(), "{case}: {answer:?}"),
+                "cancelled" => assert!(answer.is_err_and(|e| e.contains("cancelled")), "{case}"),
+                "unencodable" => assert!(
+                    answer.is_err_and(|e| e.contains("image PNG encode failed")),
+                    "{case}"
+                ),
+                _ => assert!(
+                    answer.is_err_and(|e| e.contains("already initialized")),
+                    "{case}"
+                ),
+            }
             assert_eq!(
                 at_answer, 0,
-                "cancelled={cancelled}: the frame's bytes were free when the answer arrived"
+                "{case}: the capture's bytes were free when the answer arrived"
             );
         }
     }
@@ -11634,6 +13477,18 @@ mod encode_worker_tests {
         let here = std::thread::current().id();
         let frame = visual_capture_pixels(&mut app, None);
         assert!(frame.width > 0);
+        let held = CapturePermit::try_reserve(&app.capture_bytes, CAPTURE_BYTE_BUDGET * 2)
+            .or_else(|| CapturePermit::try_reserve(&app.capture_bytes, CAPTURE_BYTE_BUDGET));
+        let (reply, rx) = std::sync::mpsc::channel();
+        app.render_image(image_req_for_test(
+            control_auth::ConfinedImage::in_memory(),
+            true,
+            true,
+            None,
+            reply,
+        ));
+        let _ = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        drop(held);
         let encoders = ENCODE_THREADS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11658,12 +13513,14 @@ mod encode_worker_tests {
         let (reply, rx) = std::sync::mpsc::channel();
         reject_encode_job(
             EncodeJob::Image {
-                frame: Frame {
+                pixels: CapturePixels::packed(Frame {
                     width: 2,
                     height: 2,
                     pixels: vec![0; 4],
-                },
-                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                })
+                .expect("a whole frame"),
+                metadata: None,
+                handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
                 target,
                 want_bytes: false,
                 cancel: crate::control::CaptureCancellation::new(),
@@ -11685,11 +13542,12 @@ mod encode_worker_tests {
         assert!(!done.exists(), "begin removes the stale marker");
         reject_encode_job(
             EncodeJob::Snapshot {
-                frame: Frame {
+                pixels: CapturePixels::packed(Frame {
                     width: 1,
                     height: 1,
                     pixels: vec![0],
-                },
+                })
+                .expect("a whole frame"),
                 text: "unpublished".to_string(),
                 transaction,
             },
@@ -11719,7 +13577,7 @@ mod encode_worker_tests {
         std::fs::create_dir(&text_path).unwrap();
         let transaction = begin_snapshot_generation(&path).unwrap();
         let error =
-            write_snapshot_artifacts(&SnapshotPng::encode(&frame), "visible text", &transaction)
+            write_snapshot_artifacts(&encode_frame_png(&frame), "visible text", &transaction)
                 .expect_err("a failed payload write must abort the snapshot");
         assert!(
             error.contains("text write failed"),
@@ -11736,7 +13594,7 @@ mod encode_worker_tests {
 
         std::fs::remove_dir(&text_path).unwrap();
         let transaction = begin_snapshot_generation(&path).unwrap();
-        write_snapshot_artifacts(&SnapshotPng::encode(&frame), "visible text", &transaction)
+        write_snapshot_artifacts(&encode_frame_png(&frame), "visible text", &transaction)
             .expect("a complete snapshot commits");
         assert!(path.is_file() && text_path.is_file() && done_path.is_file());
         assert_eq!(std::fs::read_to_string(&text_path).unwrap(), "visible text");
@@ -11807,7 +13665,7 @@ mod encode_worker_tests {
                 target,
                 file,
                 lease: None,
-                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                permit: crate::control::ReplyRetentionPermit::from_own_budget(),
             },
             &reply,
             (1_u32, 1_u32, None::<Vec<u8>>),
@@ -11850,7 +13708,7 @@ mod encode_worker_tests {
                 target,
                 file,
                 lease: Some(lease),
-                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                permit: crate::control::ReplyRetentionPermit::from_own_budget(),
             },
             &reply_tx,
             (1_u32, 1_u32, None::<Vec<u8>>),
@@ -11906,7 +13764,7 @@ mod encode_worker_tests {
                 target: first_target,
                 file: first_file,
                 lease: Some(first_lease),
-                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                permit: crate::control::ReplyRetentionPermit::from_own_budget(),
             },
             &first_tx,
             (),
@@ -11956,7 +13814,7 @@ mod encode_worker_tests {
                 target: second_target,
                 file: second_file,
                 lease: Some(second_lease),
-                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                permit: crate::control::ReplyRetentionPermit::from_own_budget(),
             },
             &second_tx,
             (),
@@ -12090,7 +13948,7 @@ mod encode_worker_tests {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         send_video_reply_with_retention(
             publication,
-            crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            crate::control::ReplyRetentionPermit::from_own_budget(),
             &reply_tx,
             "OK video\n".to_string(),
         );
@@ -12219,7 +14077,7 @@ mod encode_worker_tests {
         let moved_for_hook = moved.clone();
 
         let error = write_snapshot_artifacts_with_hook(
-            &SnapshotPng::encode(&frame),
+            &encode_frame_png(&frame),
             "private text",
             &transaction,
             move || {
@@ -12272,14 +14130,14 @@ mod encode_worker_tests {
             !done_path.exists(),
             "B begin invalidates every prior marker"
         );
-        let stale = write_snapshot_artifacts(&SnapshotPng::encode(&frame), "A", &transaction_a)
+        let stale = write_snapshot_artifacts(&encode_frame_png(&frame), "A", &transaction_a)
             .expect_err("A cannot commit after B begins");
         assert!(stale.contains("superseded"));
         assert!(
             !done_path.exists(),
             "once B begin returns, A can never republish the fixed marker"
         );
-        write_snapshot_artifacts(&SnapshotPng::encode(&frame), "B", &transaction_b)
+        write_snapshot_artifacts(&encode_frame_png(&frame), "B", &transaction_b)
             .expect("the current generation commits");
         assert!(done_path.is_file());
 
@@ -12322,14 +14180,14 @@ mod encode_worker_tests {
         let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         write_snapshot_artifacts_with_hook(
-            &SnapshotPng::encode(&frame_b),
+            &encode_frame_png(&frame_b),
             "B payload",
             &transaction_b,
             move || {
                 std::thread::spawn(move || {
                     attempted_tx.send(()).unwrap();
                     let result = write_snapshot_artifacts(
-                        &SnapshotPng::encode(&frame_a),
+                        &encode_frame_png(&frame_a),
                         "A payload",
                         &transaction_a,
                     );
@@ -12427,7 +14285,7 @@ mod encode_worker_tests {
         run_encode_job(
             EncodeJob::VideoDump {
                 take,
-                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
                 mode: crate::VideoMode::SwapchainTap,
                 keys_enabled: false,
                 inputs: Vec::new(),
@@ -12562,7 +14420,10 @@ mod encode_worker_tests {
             .get()
             .expect("terminal frame metadata is bound");
         assert_eq!(metadata.frame_kind, "terminal");
-        assert_eq!(metadata.phase, "rendered");
+        assert_eq!(
+            metadata.phase, "staged",
+            "a headless frame is staged in its turn"
+        );
         assert_eq!(metadata.view, Some(view.get()));
         assert_eq!((metadata.width, metadata.height), (width, height));
         assert_eq!(metadata.compiled_fingerprint, None);
@@ -12611,6 +14472,116 @@ mod encode_worker_tests {
         assert!(wire.contains(&format!("seq{}", retained.snapshot_seq)));
     }
 
+    /// The `--meta` of one `image --bytes` of the front window.
+    fn image_metadata_now(
+        app: &mut App,
+        dir: &std::path::Path,
+    ) -> crate::control::ImageFrameMetadata {
+        let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+            target: confined(dir, "meta.png"),
+            clean: false,
+            session: None,
+            want_bytes: true,
+            want_metadata: true,
+            frame_metadata: std::sync::Arc::clone(&metadata),
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: tx,
+        });
+        rx.recv_timeout(WORKER_PATIENCE)
+            .expect("image reply")
+            .expect("image succeeds");
+        metadata.get().cloned().expect("frame metadata is bound")
+    }
+
+    /// A NATIVE FRAME'S RASTERS ARE HASHED ONCE PER RASTER PASS. Two `image
+    /// --meta` captures of an unchanged Settings tab publish the same leaf and
+    /// card `raster-fingerprint`s, and both are the hashes the first capture
+    /// stored on the leaf raster and the card. A regional raster pass patches
+    /// the leaf's pixels in place and takes its stored hash, so the next
+    /// capture hashes the patched pixels. NEGATIVE CONTROL: the stored hash is
+    /// gone after the pass; one left in place would answer for pixels that are
+    /// no longer the raster's.
+    #[test]
+    fn native_raster_fingerprints_are_hashed_once_per_raster_pass() {
+        let dir = unique_dir("native-raster-fingerprint-once");
+        ensure_private_dir(&dir).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, view) = app.active_native_view(wid).expect("Settings view");
+
+        let first = image_metadata_now(&mut app, &dir);
+        let leaf_fingerprint = first.leaves[0].raster_fingerprint.expect("native leaf");
+        let window = &app.windows[&wid];
+        let raster = window.leaf_render_cache[&view].native.as_ref().unwrap();
+        assert_eq!(
+            raster.raster_fingerprint_once.get(),
+            Some(&leaf_fingerprint),
+            "the leaf raster keeps its hash"
+        );
+        assert_eq!(
+            leaf_fingerprint,
+            hash_raster(raster.width, raster.height, &raster.rgba)
+        );
+        let card = window
+            .route_card
+            .as_ref()
+            .or(window.settings_card.as_ref())
+            .expect("the native card");
+        assert_eq!(
+            card.raster_fingerprint_once.get(),
+            Some(&first.raster_fingerprint),
+            "the card keeps its hash"
+        );
+        assert_eq!(
+            first.raster_fingerprint,
+            hash_raster(card.pw, card.ph, &card.rgba)
+        );
+
+        let second = image_metadata_now(&mut app, &dir);
+        assert_eq!(second.leaves[0].raster_fingerprint, Some(leaf_fingerprint));
+        assert_eq!(second.raster_fingerprint, first.raster_fingerprint);
+
+        app.invalidate_native_view_cache(
+            wid,
+            view,
+            crate::native_app::DamageRegion::Rect {
+                x: 7,
+                y: 11,
+                width: 19,
+                height: 23,
+            },
+        );
+        assert!(app.prepare_native_input_scratch(wid));
+        let raster = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(raster.last_work, crate::NativeRasterWork::Region { .. }),
+            "the damage took a regional pass"
+        );
+        assert_eq!(
+            raster.raster_fingerprint_once.get(),
+            None,
+            "the pass took the stored hash"
+        );
+        let third = image_metadata_now(&mut app, &dir);
+        let raster = app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            third.leaves[0].raster_fingerprint,
+            Some(hash_raster(raster.width, raster.height, &raster.rgba)),
+            "the next capture hashes the patched pixels"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn native_image_metadata_binds_dimensions_to_the_same_audit_frame() {
         let mut app = App::headless_for_test();
@@ -12620,19 +14591,15 @@ mod encode_worker_tests {
         let (_, view) = app.active_native_view(wid).expect("Settings view");
         let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
         let (tx, rx) = std::sync::mpsc::channel();
-        app.render_native_image(NativeImageRequest {
-            front: wid,
-            clean: false,
-            presented: None,
-            request_layout: None,
-            presented_metadata: None,
-            exact_frame: None,
-            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+        app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
             target: control_auth::ConfinedImage::in_memory(),
+            clean: false,
+            session: None,
             want_bytes: true,
             want_metadata: true,
+            frame_metadata: std::sync::Arc::clone(&metadata),
             cancel: crate::control::CaptureCancellation::new(),
-            frame_metadata: &metadata,
             reply: tx,
         });
         let (width, height, png) = rx
@@ -12785,7 +14752,7 @@ mod encode_worker_tests {
         let terminal_text = terminal_app.snapshot_visible_text(
             wid,
             terminal_route,
-            None,
+            &terminal_app.active_visible_leaf_plan(wid).unwrap(),
             &terminal_input,
             0,
             usize::from(terminal_app.windows[&wid].cols),
@@ -12810,7 +14777,7 @@ mod encode_worker_tests {
         let native_text = native_app.snapshot_visible_text(
             wid,
             native_route,
-            None,
+            &native_app.active_visible_leaf_plan(wid).unwrap(),
             &native_input,
             usize::from(native_app.tab_strip_rows),
             usize::from(native_app.windows[&wid].cols),
@@ -12835,7 +14802,7 @@ mod encode_worker_tests {
         let mixed_text = native_app.snapshot_visible_text(
             wid,
             mixed_route,
-            None,
+            &native_app.active_visible_leaf_plan(wid).unwrap(),
             &mixed_input,
             usize::from(native_app.tab_strip_rows),
             usize::from(native_app.windows[&wid].cols),
@@ -12879,7 +14846,7 @@ mod encode_worker_tests {
         let palette_text = native_app.snapshot_visible_text(
             wid,
             palette_route,
-            None,
+            &native_app.active_visible_leaf_plan(wid).unwrap(),
             &palette_input,
             usize::from(native_app.tab_strip_rows),
             usize::from(native_app.windows[&wid].cols),
@@ -13181,30 +15148,26 @@ mod encode_worker_tests {
             input.cursor_trail_color = 0x00FF_FFFF;
             input.word_decorations = vec![decoration];
         }
-        let presented = PresentedFrameCapture {
-            input: app.windows[&wid].input_scratch.clone(),
-            invert: false,
-            overlay: None,
-            serial: 1,
-        };
-        let capture = |app: &mut App, clean: bool, frame: PresentedFrameCapture| {
+        let presented = app.windows[&wid].input_scratch.clone();
+        let capture = |app: &mut App, clean: bool, input: aterm_render::RenderInput| {
             let (tx, rx) = std::sync::mpsc::channel();
-            let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
-            app.render_native_image(NativeImageRequest {
-                front: wid,
-                clean,
-                presented: Some(frame),
-                request_layout: None,
-                presented_metadata: None,
-                exact_frame: None,
-                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
-                target: control_auth::ConfinedImage::in_memory(),
-                want_bytes: true,
-                want_metadata: false,
-                cancel: crate::control::CaptureCancellation::new(),
-                frame_metadata: &metadata,
-                reply: tx,
-            });
+            let capture =
+                retained_capture(app, input, crate::app_render::HostVisualState::default());
+            app.image_tail(
+                wid,
+                capture,
+                crate::control::ImageReq {
+                    handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+                    target: control_auth::ConfinedImage::in_memory(),
+                    clean,
+                    session: None,
+                    want_bytes: true,
+                    want_metadata: false,
+                    frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    cancel: crate::control::CaptureCancellation::new(),
+                    reply: tx,
+                },
+            );
             rx.recv_timeout(WORKER_PATIENCE)
                 .expect("mixed plain reply")
                 .expect("mixed plain capture")
@@ -13244,21 +15207,41 @@ mod encode_worker_tests {
     /// (the one shape invariant clients rely on). `dropped=` is the TOTAL loss
     /// (ring skips + evictions), `head_truncated=` iff any frame was evicted,
     /// and index.json carries the honest split + the requested/covered window.
+    /// Each frames[] row carries its frame's content hash and changed tiles.
     #[test]
     fn video_dump_reply_keeps_path_last_and_reports_honest_coverage() {
         let root = unique_dir("video-dump");
         ensure_private_dir(&root).unwrap();
         let dir = crate::control_auth::confine_video_dir(&root).expect("server-minted video dir");
         let dir_path = dir.path().to_path_buf();
-        let frame = |seq: u64, t_us: u64| aterm_gpu::video_tap::CapturedFrame {
+        let frame = |seq: u64, t_us: u64, rgba: Vec<u8>| aterm_gpu::video_tap::CapturedFrame {
             seq,
             t_us,
             w: 2,
             h: 2,
-            rgba: vec![0u8; 16],
+            rgba,
         };
+        // The second frame differs in one green byte, which the strided byte
+        // sum `fp` used to be never sampled.
+        let mut lit = vec![0u8; 16];
+        lit[5] = 1;
+        let frames = [frame(4, 1_000, vec![0u8; 16]), frame(5, 2_000, lit)];
+        let fps = frames
+            .each_ref()
+            .map(crate::video_key_analysis::frame_fingerprint);
+        assert_ne!(fps[0], fps[1]);
+        let rows = [
+            format!(
+                "{{\"n\":1,\"seq\":4,\"t_us\":1000,\"fp\":{},\"delta\":0,",
+                fps[0]
+            ),
+            format!(
+                "{{\"n\":2,\"seq\":5,\"t_us\":2000,\"fp\":{},\"delta\":1,",
+                fps[1]
+            ),
+        ];
         let take = aterm_gpu::video_tap::VideoTake {
-            frames: [frame(4, 1_000), frame(5, 2_000)].into(),
+            frames: frames.into(),
             dropped: 1,   // ring skips (mid-stream)
             evicted: 3,   // budget evictions (head truncation)
             decimated: 2, // fps= gate (deliberate, not a loss)
@@ -13305,6 +15288,12 @@ mod encode_worker_tests {
             "\"mode\": \"swapchain-tap\"",
         ] {
             assert!(index.contains(key), "index.json missing {key}:\n{index}");
+        }
+        for row in &rows {
+            assert!(
+                index.contains(row.as_str()),
+                "index.json missing {row}:\n{index}"
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -13844,12 +15833,14 @@ mod encode_worker_tests {
         let (dead_tx, dead_rx) = std::sync::mpsc::channel();
         drop(dead_rx);
         app.submit_encode_job(EncodeJob::Image {
-            frame: Frame {
+            pixels: CapturePixels::packed(Frame {
                 width: 1,
                 height: 1,
                 pixels: vec![0u32; 1],
-            },
-            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            })
+            .expect("a whole frame"),
+            metadata: None,
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
             target: confined(&dir, "dead.png"),
             want_bytes: false,
             cancel: crate::control::CaptureCancellation::new(),
@@ -13857,12 +15848,14 @@ mod encode_worker_tests {
         });
         let (tx, rx) = std::sync::mpsc::channel();
         app.submit_encode_job(EncodeJob::Image {
-            frame: Frame {
+            pixels: CapturePixels::packed(Frame {
                 width: 2,
                 height: 2,
                 pixels: vec![0u32; 4],
-            },
-            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            })
+            .expect("a whole frame"),
+            metadata: None,
+            handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
             target: confined(&dir, "live.png"),
             want_bytes: false,
             cancel: crate::control::CaptureCancellation::new(),
@@ -13895,12 +15888,14 @@ mod encode_worker_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         run_encode_job(
             EncodeJob::Image {
-                frame: Frame {
+                pixels: CapturePixels::packed(Frame {
                     width: 2,
                     height: 2,
                     pixels: vec![0u32; 4],
-                },
-                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                })
+                .expect("a whole frame"),
+                metadata: None,
+                handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
                 target: confined(&dir, "unused.png"),
                 want_bytes: true,
                 cancel: crate::control::CaptureCancellation::new(),
@@ -13948,7 +15943,7 @@ mod encode_worker_tests {
             ws.presence.rim = rim;
             ws.presence.seed += 1;
         };
-        let mut shots: Vec<(&str, Frame, OverlayGlow)> = Vec::new();
+        let mut shots: Vec<(&str, Frame, crate::app_render::OverlayGlow)> = Vec::new();
         for (name, rim) in [
             ("stuck", Rim::Stuck),
             ("decide", Rim::Decide),
@@ -14925,6 +16920,23 @@ mod headless_cursor_fx_tests {
             ws.input_scratch.cursor_glow_add.is_empty(),
             "31 s idle: the fire must decay to exactly zero quads in the capture"
         );
+        // v0.31 ("the cursor color starts green" → warm it): the fire block
+        // cursor rests as a WARM EMBER on the black-body ramp (solved to read
+        // on its page), never the theme's accent, so the forge fill settles to
+        // a constant ember (Some) — NOT None — at idle. The
+        // idle-zero law it must still honour is the ANIMATED fire (the quads
+        // above) decaying to nothing; the rest ember is a static, u8-quantized
+        // override that rides `cursor_fill_override` WITHOUT churning the fp
+        // (the fold is temp-gated), so the present still dedups at rest.
+        let ember = ws
+            .input_scratch
+            .cursor_fill_override
+            .expect("31 s idle: the fire cursor rests as a warm ember, not the theme fill");
+        let (r, b) = ((ember >> 16) & 0xFF, ember & 0xFF);
+        assert!(
+            r > b,
+            "the rest cursor is warm metal (r > b), got {ember:#08x}"
+        );
     }
 
     /// **A ROW THE CAPTURE SKIPPED IS NO ROW, NOT A BLANK ONE** (2026-09-26,
@@ -14989,7 +17001,7 @@ mod headless_cursor_fx_tests {
 #[cfg(test)]
 mod deferred_gpu_capture_tests {
     use super::{
-        App, DEFERRED_GPU_CAPTURE_LIMIT, DeferredGpuCapture, DeferredGpuCaptureRequest,
+        App, CaptureRequest, DEFERRED_GPU_CAPTURE_LIMIT, DeferredGpuCapture,
         deferred_capture_identity_matches, enqueue_deferred_gpu_capture,
     };
     use crate::control::{CaptureCancellation, ImageReq, ReplyRetentionPermit};
@@ -15012,7 +17024,7 @@ mod deferred_gpu_capture_tests {
                 surface,
                 exact_tap: false,
                 budget: super::CapturePresentBudget::default(),
-                request: DeferredGpuCaptureRequest::Image(ImageReq {
+                request: CaptureRequest::Image(ImageReq {
                     target: control_auth::ConfinedImage::in_memory(),
                     clean: false,
                     session: None,
@@ -15021,7 +17033,7 @@ mod deferred_gpu_capture_tests {
                     frame_metadata: Arc::new(OnceLock::new()),
                     cancel: cancel.clone(),
                     reply,
-                    handoff: ReplyRetentionPermit::unmetered_for_test(),
+                    handoff: ReplyRetentionPermit::from_own_budget(),
                 }),
             },
             receiver,
@@ -15301,7 +17313,10 @@ mod deferred_gpu_capture_tests {
         ));
         assert!(cancellation.cancel());
         assert!(
-            app.deferred_gpu_captures[0].request.cancelled(),
+            app.deferred_gpu_captures[0]
+                .request
+                .cancellation()
+                .is_some(),
             "the original caller cancellation remains attached"
         );
         app.prune_deferred_gpu_captures();

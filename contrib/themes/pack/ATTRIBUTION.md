@@ -34,7 +34,7 @@ Each palette belongs to its author:
   https://github.com/jolaleye/horizon-theme-vscode
 - kepano/flexoki by Steph Ango (MIT; LICENSES/MIT-flexoki.txt): Flexoki Light
   https://github.com/kepano/flexoki
-- primer/github-vscode-theme by Primer (MIT; LICENSES/MIT-github-vscode-theme.txt): GitHub Dark Default, GitHub Dark Dimmed, GitHub Dark High Contrast, GitHub Light Default, GitHub Light High Contrast
+- primer/github-vscode-theme by Primer (MIT; LICENSES/MIT-github-vscode-theme.txt): GitHub Dark Default, GitHub Dark Dimmed, GitHub Dark High Contrast, GitHub Light High Contrast
   https://github.com/primer/github-vscode-theme
 - rebelot/kanagawa.nvim by Tommaso Laurenzi (MIT; LICENSES/MIT-kanagawa.nvim.txt): Kanagawa Dragon, Kanagawa Lotus, Kanagawa Wave
   https://github.com/rebelot/kanagawa.nvim

@@ -44,7 +44,7 @@
 //! `+[UNUserNotificationCenter currentNotificationCenter]` raises an
 //! `NSInternalInconsistencyException` in a process with no bundle proxy (a
 //! bare `target/debug` binary), so the center is touched only once aterm's own
-//! reading of the bundle id (`control_privacy::running_bundle_id`, which
+//! reading of the bundle id (`signing_identity::running_bundle_id`, which
 //! refuses an `Info.plist` under a protected root) and Foundation's
 //! (`-[NSBundle bundleIdentifier]`) both have one, and then under containment.
 //! The framework is opened at run time, never linked, so a headless instance
@@ -145,7 +145,7 @@ pub(crate) struct Notice<'a> {
 }
 
 /// THE CENTER'S ARMS, injected at `App` construction like the consent probes
-/// (`control_privacy::ConsentProbes`): the live ones in a windowed macOS
+/// (`consent_state::ConsentProbes`): the live ones in a windowed macOS
 /// instance ([`Self::for_instance`]), the inert ones in a headless instance
 /// and in every unit test ([`Self::inert`]). `Copy`, so the delivery thread
 /// and the update-health banner's thread each carry their own. Off macOS it
@@ -462,7 +462,7 @@ mod live {
     }
 
     /// The center, opening it on first use: not on the event loop, since
-    /// [`crate::control_privacy::running_bundle_id`] may read the signing
+    /// [`crate::signing_identity::running_bundle_id`] may read the signing
     /// identity there.
     fn center() -> Option<Id> {
         (*CENTER.get_or_init(open_center)).map(at)
@@ -474,7 +474,7 @@ mod live {
     /// bundle checks rule out; a raise is contained all the same.
     fn open_center() -> Option<usize> {
         if crate::menu::process_is_headless()
-            || crate::control_privacy::running_bundle_id().is_none()
+            || crate::signing_identity::running_bundle_id().is_none()
         {
             return None;
         }

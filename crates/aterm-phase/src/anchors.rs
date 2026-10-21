@@ -26,8 +26,8 @@
 //! Each missing vendor is COULD NOT RUN, including Gemini's npm bundle; the
 //! ordinary unit suite keeps deterministic resolver and table fixtures only.
 //!
-//! A row is owed only by the builds that draw it ([`Anchor::drawn_by`]), from
-//! `since` through `last` where present. Build versions come from atpkg records
+//! A row is owed only by the builds that draw it ([`Anchor::drawn_by`]): those
+//! from its `since` on. Build versions come from atpkg records
 //! or Gemini's package.json; no vendor executable is started. The bench accepts
 //! `$ATERM_CLAUDE_BIN`, `$ATERM_CODEX_BIN`, `$ATERM_AGY_BIN`, `$ATERM_MUSE_BIN`
 //! and `$ATERM_GEMINI_BIN`; otherwise it resolves managed builds through
@@ -60,37 +60,15 @@ pub struct Anchor {
     pub kind: AnchorKind,
     /// The vendor release it was read on (a capture or the binary).
     pub since: &'static str,
-    /// The LAST release that draws it, where a later one no longer does
-    /// ([`Anchor::through`]): the row stays for the readers of the builds
-    /// that draw it, and the drift canaries owe it only from `since`
-    /// through this one. `None`: the newest build still draws it.
-    pub last: Option<&'static str>,
 }
 
 impl Anchor {
-    /// This anchor as drawn by the builds from its `since` through `last`
-    /// alone: a later build no longer has it, and its readers read that
-    /// build's own words beside it.
-    #[must_use]
-    pub const fn through(self, last: &'static str) -> Anchor {
-        Anchor {
-            last: Some(last),
-            ..self
-        }
-    }
-
     /// Whether a build of `version` draws this anchor: it is not older than
-    /// `since` nor newer than `last`. A version that could not be read
-    /// (`None`) draws every anchor still drawn and none retired: a canary
-    /// that cannot tell the build owes it what the newest draws.
+    /// `since`. A version that could not be read (`None`) owes every anchor:
+    /// a canary that cannot tell the build judges it by the newest's rows.
     #[must_use]
     pub fn drawn_by(&self, version: Option<&str>) -> bool {
-        match version {
-            Some(v) => {
-                !newer_than(self.since, v) && self.last.is_none_or(|last| !newer_than(v, last))
-            }
-            None => self.last.is_none(),
-        }
+        version.is_none_or(|v| !newer_than(self.since, v))
     }
 }
 
@@ -100,7 +78,6 @@ const fn lit(id: &'static str, text: &'static str, since: &'static str) -> Ancho
         text,
         kind: AnchorKind::Literal,
         since,
-        last: None,
     }
 }
 
@@ -110,7 +87,6 @@ const fn composed(id: &'static str, text: &'static str, since: &'static str) -> 
         text,
         kind: AnchorKind::Composed,
         since,
-        last: None,
     }
 }
 
@@ -120,7 +96,6 @@ const fn hint(id: &'static str, text: &'static str, since: &'static str) -> Anch
         text,
         kind: AnchorKind::KeyHint,
         since,
-        last: None,
     }
 }
 
@@ -530,8 +505,8 @@ pub const ANCHORS: &[Anchor] = &[
     // The autocompact offer (the 2.1.302 binary's `dbe`, title `G8e`, footer
     // `Q8e`): Claude Code's own dialog offering to autocompact earlier than
     // its default. Its question, its accept row's words (the size between
-    // `‹ ` and ` ›` is the stepper's), its outcome line once saved, and its
-    // footer — drawn from `↑`/`\xB7` escapes, so composed for the canary.
+    // `‹ ` and ` ›` is the stepper's), and its footer — drawn from
+    // `↑`/`\xB7` escapes, so composed for the canary.
     lit(
         "autocompact.title",
         "We recommend compacting earlier",
@@ -539,7 +514,6 @@ pub const ANCHORS: &[Anchor] = &[
     ),
     lit("autocompact.question", "Want to autocompact at", "2.1.302"),
     lit("autocompact.accept", "Autocompact at", "2.1.302"),
-    lit("autocompact.saved", "Autocompact set to ", "2.1.302"),
     composed(
         "autocompact.footer",
         "↑/↓ choose · ←/→ change size · enter confirm · esc not now",
@@ -734,32 +708,47 @@ pub const ANCHORS: &[Anchor] = &[
     lit("usage.dismissed", "Settings dialog dismissed", "2.1.287"),
     // The limit reset (`crate::reset`,
     // `docs/SPEC-claude-accounts-resets-2026-10-02.md`). EVERY ROW IS READ
-    // in a bundle and NONE WAS SEEN on a screen or in a transcript: the
-    // offer's texts are one table there (2.1.287's `lg`, 2.1.304's `Ug`),
-    // the pending lines and the answers their own literals, and the server's
-    // flag payload may replace any text of the table. The rows are the words
-    // the readers match by, never a whole template: the grant row's head and
-    // the words between its count and its day (`Use your reset now ({left}
-    // left, until {date})`); the weekly session reset's row, which the
-    // vendor draws in the grant row's slot; the confirmation's title, the
-    // head of its body, the two joins of body and detail (`Refills your
-    // {limits} now · your weekly reset day stays {week}`, `{resets} left ·
-    // use by {deadline}`), its yes and its no, and the tail both early lines
-    // share (`… — use your reset anyway?`); the two pending lines, each
-    // `…`-ended on the screen (an escape in the bundle, so the rows carry the
-    // words without it); and of the answers the four a reader tells apart —
-    // the spent line's head, the two lifted lines, the kept line's head, the
+    // in the 2.1.304 bundle (the rows `since` 2.1.287 hold the words that
+    // build kept) and NONE WAS SEEN on a screen or in a transcript: the
+    // offer's texts are one table there (`Ug`), the kinds' words its
+    // functions (`X()`, `ce()`, `Mt()`), the pending lines and the answers
+    // their own literals, and the server's flag payload may replace any text
+    // of the table. The rows are the words the readers match by, never a
+    // whole template — a template's placeholders are no text a screen shows
+    // — so a `{kind}` is one of the four kind rows, and a text that holds
+    // one is its fixed parts either side: the grant row's head and the words
+    // between its count and its day (`Use a {kind} ({left} left, until
+    // {date})`), which the confirmation's title shares (`Use a {kind}?`);
+    // the kinds, as `{kind}` draws them and as `{kindResets}` counts the
+    // five-hour one (`2 five-hour resets`); the weekly session reset's row,
+    // which the vendor draws only where no grant row is; the head of the
+    // confirmation's body and its two joins (`Refills your {limits} now ·
+    // your weekly reset day stays {week}`, `{kindResets} left · use by
+    // {deadline}`), its yes's head (`Yes, use my {kind}`) and its no, and the
+    // words either side of the kind in the early lines' tail (`… — use your
+    // {kind} anyway?`); the two pending lines, each `…`-ended on the screen
+    // (an escape in the bundle, so the rows carry the words without it); and
+    // of the answers the ones a reader tells apart — each kind's head of the
+    // spent line (`{done}`), the still-walled line's words after its kind,
+    // the two lifted lines, the word after the kind in the kept line, the
     // login line's — with the ending the vendor adds where it queued no
     // continuation of its own. The other answers are no rows on purpose: a
-    // line no row names is a failure.
-    lit("reset.row", "Use your reset now", "2.1.287").through("2.1.303"),
+    // line no row names is a failure. The 2.1.287 wording (`Use your reset
+    // now (…)`, `Use your reset?`, `Yes, use my reset`, `Reset kept`) has no
+    // rows: the readers refuse it (approval.rs's `spends` still reads its
+    // words as a spend).
+    lit("reset.row", "Use a", "2.1.304"),
     lit("reset.row.until", "left, until", "2.1.287"),
+    lit("reset.kind.session", "5-hour reset", "2.1.304"),
+    lit("reset.kind.weekly", "weekly reset", "2.1.304"),
+    lit("reset.kind.fable", "Fable reset", "2.1.304"),
+    lit("reset.kind.full", "full reset", "2.1.304"),
+    lit("reset.kind.session_count", "five-hour reset", "2.1.304"),
     lit(
         "reset.weekly_row",
         "Reset your session limit now",
         "2.1.287",
     ),
-    lit("reset.confirm.title", "Use your reset?", "2.1.287").through("2.1.303"),
     lit("reset.confirm.refills", "Refills your", "2.1.287"),
     lit(
         "reset.confirm.stays",
@@ -767,49 +756,12 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.287",
     ),
     lit("reset.confirm.use_by", "left · use by", "2.1.287"),
-    lit("reset.yes", "Yes, use my reset", "2.1.287").through("2.1.303"),
+    lit("reset.yes", "Yes, use my", "2.1.304"),
     lit("reset.no", "No, keep it", "2.1.287"),
-    lit("reset.early", "use your reset anyway?", "2.1.287").through("2.1.303"),
+    lit("reset.early", "use your", "2.1.304"),
+    lit("reset.early.anyway", "anyway?", "2.1.304"),
     lit("reset.checking", "Checking for a reset", "2.1.287"),
     lit("reset.resetting", "Resetting your limits", "2.1.287"),
-    lit("reset.done", "Limits reset", "2.1.287"),
-    lit(
-        "reset.lifted",
-        "Your limit had already reset on its own · nothing was used",
-        "2.1.287",
-    ),
-    lit("reset.clear", "Your limits are clear", "2.1.287"),
-    lit("reset.kept", "Reset kept", "2.1.287").through("2.1.303"),
-    lit(
-        "reset.login",
-        "Couldn't reset your limits with this login",
-        "2.1.287",
-    ),
-    lit("reset.continue", "send a message to continue", "2.1.287"),
-    // 2.1.304 offers SEVERAL KINDS of reset, one row each, and names the
-    // kind where 2.1.287-2.1.303 said `your reset` (READ in the 2.1.304
-    // bundle: the table `Ug`, the kind names `X()`, the counted names `ce()`,
-    // the spent lines' heads `Mt()`): the row `Use a {kind} ({left} left,
-    // until {date})`, the confirmation's title `Use a {kind}?` and yes `Yes,
-    // use my {kind}`, its detail `{kindResets} left · use by {deadline}`, the
-    // early lines' tail `… — use your {kind} anyway?`, the spent line
-    // `{done} · your weekly reset day stays {week} · {kindResets} left` and
-    // the kept line `{Kind} kept · …` — `{Kind}` the kind with its first
-    // letter capitalised. The rows: the words before and after the kind, each
-    // kind's name as drawn and as counted (the 5-hour kind counts as
-    // `five-hour reset`), each kind's spent head, the kept line's word, and
-    // the line a declined chooser (`Which reset do you want to use?`, reached
-    // by a typed `/limit-reset` alone) answers with.
-    lit("reset.kind.row", "Use a", "2.1.304"),
-    lit("reset.kind.yes", "Yes, use my", "2.1.304"),
-    lit("reset.kind.early", "use your", "2.1.304"),
-    lit("reset.kind.anyway", "anyway?", "2.1.304"),
-    lit("reset.kind.kept", "kept", "2.1.304"),
-    lit("reset.kind.session", "5-hour reset", "2.1.304"),
-    lit("reset.kind.session.counted", "five-hour reset", "2.1.304"),
-    lit("reset.kind.weekly", "weekly reset", "2.1.304"),
-    lit("reset.kind.full", "full reset", "2.1.304"),
-    lit("reset.kind.fable", "Fable reset", "2.1.304"),
     lit("reset.done.session", "Session limit reset", "2.1.304"),
     lit("reset.done.weekly", "Weekly limits reset", "2.1.304"),
     lit(
@@ -817,7 +769,21 @@ pub const ANCHORS: &[Anchor] = &[
         "Fable reset used · what Fable used is back in your weekly limit",
         "2.1.304",
     ),
-    lit("reset.kept.choice", "Resets kept", "2.1.304"),
+    lit("reset.done.full", "Limits reset", "2.1.287"),
+    lit("reset.walled", "used · you're still at your", "2.1.304"),
+    lit(
+        "reset.lifted",
+        "Your limit had already reset on its own · nothing was used",
+        "2.1.287",
+    ),
+    lit("reset.clear", "Your limits are clear", "2.1.287"),
+    lit("reset.kept", "kept", "2.1.304"),
+    lit(
+        "reset.login",
+        "Couldn't reset your limits with this login",
+        "2.1.287",
+    ),
+    lit("reset.continue", "send a message to continue", "2.1.287"),
     // The walls (see `wall::PHRASES` for the whole classification table).
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
@@ -2240,88 +2206,42 @@ mod tests {
         assert!(committed_rollouts("9.9.999").is_empty());
     }
 
-    /// WHICH BUILDS OWE A ROW: an anchor from its `since` through its
-    /// `last`, and a build whose version could not be read every anchor the
-    /// newest draws; the reset's templates by the same rule. The reset's
-    /// 2.1.287 words are 2.1.287-2.1.303's, and 2.1.304's words are no older
-    /// build's. NEGATIVE CONTROLS: a retired row is owed by no build after
-    /// its last, nor by an unread one; a row is owed by no build before its
-    /// first; a planted template of one build is missing from bytes that
-    /// spell the other build's.
+    /// THE RESET'S TEMPLATES ARE ITS ANCHORS' WORDS, WHOLE: each is built
+    /// from the rows the readers match by, none is empty or another's, and
+    /// a text that spells them all holds every one. NEGATIVE CONTROL: that
+    /// text with the confirmation's yes reworded misses that template, and a
+    /// planted template of a kind no build names is missing from it.
     #[test]
-    fn a_row_is_owed_only_by_the_builds_that_draw_it() {
-        let row = ANCHORS
-            .iter()
-            .find(|a| a.id == "reset.row")
-            .expect("the old row");
-        let kinds = ANCHORS
-            .iter()
-            .find(|a| a.id == "reset.kind.row")
-            .expect("2.1.304's row");
-        let until = ANCHORS
-            .iter()
-            .find(|a| a.id == "reset.row.until")
-            .expect("both builds' join");
-        for (version, old, new) in [
-            (Some("2.1.286"), false, false),
-            (Some("2.1.287"), true, false),
-            (Some("2.1.303"), true, false),
-            (Some("2.1.304"), false, true),
-            (Some("2.1.310"), false, true),
-            (Some("2.1.303.1"), false, false),
-            (None, false, true),
-        ] {
-            assert_eq!(row.drawn_by(version), old, "{version:?}");
-            assert_eq!(kinds.drawn_by(version), new, "{version:?}");
-            assert_eq!(
-                until.drawn_by(version),
-                version != Some("2.1.286"),
-                "{version:?}"
-            );
-        }
-        // No row is retired before it was first drawn: each is owed by the
-        // build that first drew it and the build that last did.
-        for a in ANCHORS.iter().filter(|a| a.last.is_some()) {
-            assert!(a.drawn_by(Some(a.since)), "{}", a.id);
-            assert!(a.drawn_by(a.last), "{}", a.id);
-        }
-        // The templates: a 2.1.303 build spells only the old ones, a 2.1.304
-        // build only the new ones, both spell the lifted and login lines.
-        let ids = |version: &str| {
-            reset_templates()
-                .into_iter()
-                .filter(|t| t.spelled_by(Some(version)))
-                .map(|t| (t.id, t.text))
-                .collect::<Vec<_>>()
-        };
-        let (old, new) = (ids("2.1.303"), ids("2.1.304"));
-        assert!(
-            old.iter()
-                .any(|(_, t)| t == "Use your reset now ({left} left, until {date})")
-        );
-        assert!(
-            new.iter()
-                .any(|(_, t)| t == "Use a {kind} ({left} left, until {date})")
-        );
-        for both in ["reset.lifted", "reset.login"] {
-            assert!(old.iter().any(|(id, _)| *id == both), "{both}");
-            assert!(new.iter().any(|(id, _)| *id == both), "{both}");
-        }
-        // NEGATIVE CONTROL: the bytes of one build's spelling miss the
-        // other's templates, and nothing of their own.
-        let spell = |templates: &[(&str, String)]| {
+    fn the_reset_templates_are_built_from_the_readers_rows() {
+        let templates = reset_templates();
+        let mut names: Vec<&str> = templates.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), templates.len(), "a name is two templates'");
+        assert!(templates.iter().all(|(_, text)| !text.is_empty()));
+        let spelled = |templates: &[(&'static str, String)]| {
             templates
                 .iter()
-                .map(|(_, t)| t.as_str())
+                .map(|(_, text)| text.as_str())
                 .collect::<Vec<_>>()
                 .join("|")
                 .into_bytes()
         };
-        let (old_bytes, new_bytes) = (spell(&old), spell(&new));
-        assert!(missing_templates(&old_bytes, Some("2.1.303")).is_empty());
-        assert!(missing_templates(&new_bytes, Some("2.1.304")).is_empty());
-        assert!(missing_templates(&old_bytes, Some("2.1.304")).contains(&"reset.kind.row"));
-        assert!(missing_templates(&new_bytes, Some("2.1.303")).contains(&"reset.row.until"));
+        let bytes = spelled(&templates);
+        assert!(missing_templates(&bytes, &templates).is_empty());
+        let reworded: Vec<(&'static str, String)> = templates
+            .iter()
+            .map(|(name, text)| (*name, text.replace(anchor("reset.yes"), "Yes, spend my")))
+            .collect();
+        assert_eq!(
+            missing_templates(&spelled(&reworded), &templates),
+            ["confirmation yes"]
+        );
+        let planted = [(
+            "planted",
+            format!("{} planted-by-no-build reset?", anchor("reset.row")),
+        )];
+        assert_eq!(missing_templates(&bytes, &planted), ["planted"]);
     }
 
     /// The bundle finder on a stand-in package: the version its

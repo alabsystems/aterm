@@ -7,14 +7,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm's CoreGraphics display declarations (active displays, bounds, modes) for the windowing backend, held to the SDK headers."
+description = "aterm's CoreGraphics declarations (active displays, bounds, modes; CGImage layout reads) for the windowing backend and the GUI's window capture, held to the SDK headers."
 
 # ZERO third-party dependencies, like aterm-objc, which it builds on. Its own
 # crate rather than a feature of aterm-objc: CoreGraphics is a GUI framework
 # whose link is not dead-stripped, so only the binaries that link the windowing
-# backend (crates/aterm-window, the one dependent) may load it. A feature was
-# unified into every binary of a build that also compiled winit, and forked
-# aterm-objc between `-p` and `--workspace` selections.
+# backend (crates/aterm-window) or the GUI (crates/aterm-gui, whose AppKit links
+# CoreGraphics already) may load it. A feature was unified into every binary of
+# a build that also compiled winit, and forked aterm-objc between `-p` and
+# `--workspace` selections.
 autotests = false
 
 [lints]

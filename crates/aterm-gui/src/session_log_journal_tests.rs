@@ -72,7 +72,7 @@ impl Targets for Sessions {
 
 impl Sessions {
     fn add(&self, sid: &str) -> Timeline {
-        let tl: Timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        let tl: Timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
         let sid = ShortId::new(sid).expect("a sid");
         with_log(&tl, |log| {
             log.open_session(
@@ -247,24 +247,35 @@ fn host(r: &aterm_slog::Rec) -> aterm_slog::Rec {
 
 // ---- the gate and the default ------------------------------------------
 
+/// D3 ON (Phase 6 step 6B-1, ruling U21): with no `[session_log]` table the
+/// journal is asked for, and the gate opens on a window's desk and the lab's
+/// seam, on macOS and Linux. It stays shut for an explicit `journal =
+/// false`, a plain headless instance, `restore_session = false` and a
+/// platform with no writer.
+///
+/// NEGATIVE CONTROLS: the old default (`unwrap_or(false)`) fails the
+/// default's arms; a gate without its restore leg fails the
+/// `restore_session = false` arm.
 #[test]
-fn the_gate_is_off_by_default_and_follows_the_desk() {
+fn the_gate_is_on_by_default_and_follows_the_desk() {
     use crate::app_config::{Config, SessionLogConfig};
     use crate::desk::Desk;
-    let off = Config::default();
-    let on = Config {
+    let default = Config::default();
+    let off = Config {
         session_log: Some(SessionLogConfig {
-            journal: Some(true),
+            journal: Some(false),
             clause: None,
         }),
         ..Config::default()
     };
     let no_restore = Config {
         restore_session: Some(false),
-        ..on.clone()
+        ..Config::default()
     };
+    assert!(default.session_log_journal(), "asked for by default");
+    assert!(!off.session_log_journal(), "`journal = false` opts out");
     for desk in [Desk::Window, Desk::LabHeadless, Desk::Headless] {
-        assert!(!gate(&off, desk), "off by default ({desk:?})");
+        assert!(!gate(&off, desk), "`journal = false` ({desk:?})");
         assert!(
             !gate(&no_restore, desk),
             "follows restore_session ({desk:?})"
@@ -280,22 +291,39 @@ fn the_gate_is_off_by_default_and_follows_the_desk() {
     ] {
         assert_eq!(eligibility(requested, restore, desk, supported), expected);
     }
-    assert_eq!(gate(&on, Desk::Window), cfg!(unix));
-    assert_eq!(gate(&on, Desk::LabHeadless), cfg!(unix), "the lab's seam");
-    assert!(!gate(&on, Desk::Headless), "headless keeps no desk");
+    assert_eq!(gate(&default, Desk::Window), cfg!(unix), "on by default");
+    assert_eq!(
+        gate(&default, Desk::LabHeadless),
+        cfg!(unix),
+        "the lab's seam"
+    );
+    assert!(!gate(&default, Desk::Headless), "headless keeps no desk");
 }
 
-/// RULING R10: with the default the lane is inert on every path: no thread,
-/// no wake in any log, no read, no file; and the reader's open creates
-/// nothing. NEGATIVE CONTROL: the writer's open makes the directory, 0700.
+/// RULING R10: with `journal = false` (the opt-out since D3 is on) the lane
+/// is inert on every path: no thread, no wake in any log, no read, no file;
+/// and the reader's open creates nothing. NEGATIVE CONTROL: the writer's
+/// open makes the directory, 0700.
 #[cfg(unix)]
 #[test]
-fn the_default_creates_nothing() {
+fn journal_false_creates_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
-    let scratch = tempdir("default-off");
+    let scratch_guard = tempdir("journal-false");
+    let scratch = scratch_guard.path();
     let logs = scratch.join("logs");
     std::fs::create_dir_all(&logs).expect("logs");
-    let mut lane = Lane::new(None, false);
+    let off = crate::app_config::Config {
+        session_log: Some(crate::app_config::SessionLogConfig {
+            journal: Some(false),
+            clause: None,
+        }),
+        ..crate::app_config::Config::default()
+    };
+    // The launch's own expression (`lib.rs`): the gate decides the folder.
+    let mut lane = Lane::new(
+        gate(&off, crate::desk::Desk::Window).then(|| logs.clone()),
+        false,
+    );
     lane.start(crate::session_store::new_store());
     lane.finish_at_quit(QUIT_BUDGET);
     assert!(lane.attention().is_none());
@@ -376,20 +404,14 @@ fn the_default_creates_nothing() {
         .expect("made");
     let md = std::fs::metadata(logs.join("session-log")).expect("made");
     assert_eq!(md.permissions().mode() & 0o777, 0o700);
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
-pub(crate) fn tempdir(stem: &str) -> std::path::PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn tempdir(stem: &str) -> aterm_tempfile::TempDir {
     let base = std::fs::canonicalize(std::env::temp_dir()).expect("tmp");
-    let dir = base.join(format!(
-        "aterm-slogj-{stem}-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    dir
+    aterm_tempfile::Builder::new()
+        .prefix(&format!("aterm-slogj-{stem}-"))
+        .tempdir_in(base)
+        .expect("exclusive scratch")
 }
 
 // ---- the writer -------------------------------------------------------
@@ -1017,7 +1039,7 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
         rig.fs.fault(None);
         drop(a);
         // The successor: the carried log, its journal from the fence.
-        let b_tl: Timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        let b_tl: Timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
         {
             let mut g = b_tl.lock().expect("b");
             let ids = crate::session_log::LogCarry {
@@ -1080,6 +1102,188 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
         .filter_map(|l| decode_line(l).ok())
         .any(|f| matches!(f, Frame::End { .. }));
     assert!(!newest, "the newest segment holds no trailer");
+}
+
+/// D3 ON ACROSS AN UPDATE (Phase 6 step 6B-1, ruling U21): a predecessor
+/// that kept no journal (`journal = false`, or an older build that shipped it
+/// off) carries no `journal v=1` host line, so a successor on the default
+/// config, whose gate is open, journals each carried log itself from its
+/// first record, and only once its Commit lands: its armed lane (an update
+/// candidate's, `lib.rs`) creates nothing before. The read shows every
+/// carried seq once, from the first, losing none, and the run the
+/// predecessor opened.
+///
+/// NEGATIVE CONTROLS: the predecessor's `journal = false` shuts the gate the
+/// default opens (the old default fails the second assertion); a carry that
+/// claims the journal (`journal v=1`) would start the successor's journal
+/// after the head and lose the first records (the `journal_start` arm); a
+/// lane that ignores `armed` starts its writer before the Commit (the
+/// `Phase::Armed` assertion, read only once the lane's first pass decided).
+#[cfg(unix)]
+#[test]
+fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
+    use crate::app_config::{Config, SessionLogConfig};
+    use crate::desk::Desk;
+    let off = Config {
+        session_log: Some(SessionLogConfig {
+            journal: Some(false),
+            clause: None,
+        }),
+        ..Config::default()
+    };
+    assert!(
+        !gate(&off, Desk::Window),
+        "the predecessor keeps no journal"
+    );
+    assert!(
+        gate(&Config::default(), Desk::Window),
+        "the successor's default keeps one"
+    );
+    // The predecessor: no lane, a command and four marks, then its take.
+    let a: Timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
+    with_log(&a, |log| {
+        log.open_session(
+            Kind::Spawn,
+            Src::Aterm,
+            Conf::Exact,
+            Actor::Nobody,
+            Fields::new(),
+            at(0),
+        )
+        .expect("opens");
+    });
+    let carried_run = cmd(&a, 1);
+    for i in 0..4 {
+        mark(&a, 2 + i);
+    }
+    let (lines, head, ids) = {
+        let mut g = a.lock().expect("a");
+        let out = g
+            .slog_mut()
+            .carry_source()
+            .encode(aterm_slog::CarryBudget::SESSION)
+            .expect("carried");
+        let log = g.slog().log();
+        (out.lines, log.last_seq(), log.id_counters())
+    };
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l == crate::session_log::JOURNAL_HOST_LINE),
+        "a lane-less predecessor claims no journal: {lines:?}"
+    );
+    // The successor: a session of the real store adopts the carry.
+    let handle = crate::session_store::test_handle(7);
+    let sid = handle.sid.as_str().to_string();
+    {
+        let mut g = handle.ctx.timeline.lock().expect("b");
+        g.slog_mut()
+            .adopt_carried(
+                &lines,
+                crate::session_log::LogCarry { ep: 1, ids },
+                head + 65536,
+                at(100),
+            )
+            .expect("adopts");
+        assert_eq!(g.slog().journal_start(), None, "from the first record");
+    }
+    let store = crate::session_store::new_store();
+    store
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .register(handle);
+    let scratch_guard = tempdir("off-to-on");
+    let scratch = scratch_guard.path();
+    let logs = scratch.join("logs");
+    std::fs::create_dir_all(&logs).expect("logs");
+    let shared = Shared::new();
+    // Join this lane before its scratch guard drops, including assertion
+    // unwind. The finish request also wakes an armed or parked lane.
+    struct Worker {
+        shared: Arc<Shared>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                self.shared.request(REQ_FINISH);
+                let _ = thread.join();
+            }
+        }
+    }
+    let mut thread = Worker {
+        shared: Arc::clone(&shared),
+        thread: Some({
+            let (shared, logs, store) = (Arc::clone(&shared), logs.clone(), Arc::clone(&store));
+            std::thread::spawn(move || run(&shared, &logs, store, inst("p2-b2"), true))
+        }),
+    };
+    // A hang detector: the lane's first pass decides, either to wait for
+    // the Commit (the armed lane's park) or to start a writer.
+    let decided = aterm_spec::wait::within(HANG, Duration::from_millis(5), || {
+        (shared.armed_waits.load(Ordering::Acquire) > 0 || shared.phase() != Phase::Armed)
+            .then_some(())
+    });
+    assert!(decided.is_some(), "the lane never ran");
+    assert_eq!(
+        shared.phase(),
+        Phase::Armed,
+        "an armed successor starts no writer before its Commit"
+    );
+    assert_eq!(
+        std::fs::read_dir(&logs).expect("logs").count(),
+        0,
+        "an armed successor writes nothing before its Commit"
+    );
+    // The Commit lands (`commit_landed`): the writer starts.
+    shared.request(REQ_COMMIT);
+    // A hang detector: the pass the Commit asks for must come.
+    let view = aterm_spec::wait::within(HANG, Duration::from_millis(20), || {
+        let fs = super::fs::PinnedJournalFs::open(&logs, false).ok()??;
+        match view_with(
+            &fs,
+            &Mutex::new(Index::default()),
+            &ShortId::new(&sid).expect("a sid"),
+            Budgets::READER,
+        ) {
+            JournalRead::View(v) if v.log.last_seq() >= head => Some(*v),
+            _ => None,
+        }
+    })
+    .expect("the successor journals the carried log after its Commit");
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    *shared.ack.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    shared.request(REQ_FINISH);
+    rx.recv_timeout(HANG)
+        .expect("the writer answers its finish");
+    thread
+        .thread
+        .take()
+        .expect("the lane is owned")
+        .join()
+        .expect("the writer thread ends");
+    let read = view.log.read(Cursor::new(view.log.ep(), 0), usize::MAX);
+    // The epoch the adoption took is said as a handoff, and nothing is lost.
+    assert!(
+        read.gap.is_none_or(|g| g.lost == 0),
+        "nothing lost: {:?}",
+        read.gap
+    );
+    let seqs: Vec<u64> = read.recs.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs.first(), Some(&1), "from the first record: {seqs:?}");
+    let mut once = seqs.clone();
+    once.dedup();
+    assert_eq!(once, seqs, "each seq once");
+    assert!(
+        (1..=head).all(|n| seqs.contains(&n)),
+        "every carried record: {seqs:?} through {head}"
+    );
+    assert!(
+        read.recs
+            .iter()
+            .any(|r| r.node == carried_run && r.op == aterm_slog::Op::Open),
+        "the predecessor's run, from the carry"
+    );
 }
 
 /// RULING R14: a clean quit writes each open session's closes and `#fin`; the
@@ -1267,7 +1471,8 @@ fn the_reader_is_bounded_and_skips_what_is_not_a_line() {
 #[test]
 fn the_real_directory_keeps_its_rules() {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
-    let scratch = tempdir("real");
+    let scratch_guard = tempdir("real");
+    let scratch = scratch_guard.path();
     let logs = scratch.join("logs");
     std::fs::create_dir_all(&logs).expect("logs");
     let dir = super::fs::PinnedJournalFs::open(&logs, true)
@@ -1328,7 +1533,6 @@ fn the_real_directory_keeps_its_rules() {
     assert!(super::fs::PinnedJournalFs::open(&other, true).is_err());
     assert!(super::fs::PinnedJournalFs::open(&other, false).is_err());
     assert_eq!(std::fs::read_dir(&target).expect("target").count(), 0);
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// THE HOSTILE DIRECTORY (ruling R9): retention, with a 1 KiB budget, removes
@@ -1341,7 +1545,8 @@ fn the_real_directory_keeps_its_rules() {
 #[test]
 fn retention_in_a_hostile_directory_removes_only_what_it_may() {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
-    let scratch = tempdir("hostile");
+    let scratch_guard = tempdir("hostile");
+    let scratch = scratch_guard.path();
     let logs = scratch.join("logs");
     std::fs::create_dir_all(&logs).expect("logs");
     let dir = super::fs::PinnedJournalFs::open(&logs, true)
@@ -1445,7 +1650,6 @@ fn retention_in_a_hostile_directory_removes_only_what_it_may() {
     assert!(!exists("p6-dd.1.slog") && exists("p6-dd.2.slog"));
     assert!(exists("p8-bb.1.slog"), "still live");
     drop(live);
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// VERSION SKEW: a config with a key this build does not know under
@@ -1473,7 +1677,7 @@ fn version_skew_both_ways() {
         .prepare()
         .encode(aterm_slog::CarryBudget::SESSION, &[])
         .expect("carried");
-    let mut tl = SessionTimeline::default();
+    let mut tl = SessionTimeline::for_test();
     let ids = crate::session_log::LogCarry {
         ep: 1,
         ids: aterm_slog::IdCounters::default(),
@@ -1487,10 +1691,11 @@ fn version_skew_both_ways() {
         "no host line: from the first record"
     );
     // An older build's config reads a table it does not know the same way:
-    // skipped, not refused.
+    // skipped, not refused; a config without `[session_log]` asks for the
+    // journal (D3 on, ruling U21).
     let older: crate::app_config::Config =
         aterm_toml::from_str("[a_future_table]\nanything = true\n").expect("skipped");
-    assert!(!older.session_log_journal());
+    assert!(older.session_log_journal());
 }
 
 /// A writer that runs long stays within the budget: it removes its own
@@ -2594,7 +2799,8 @@ fn queuing_a_retirement_wakes_even_when_its_close_is_already_recorded() {
 #[test]
 fn the_real_journals_flushes_are_only_ordered() {
     use aterm_durable::{Flush, seam::Recording};
-    let scratch = tempdir("flush-tiers");
+    let scratch_guard = tempdir("flush-tiers");
+    let scratch = scratch_guard.path();
     let logs = scratch.join("logs");
     std::fs::create_dir_all(&logs).expect("logs");
     let dir = super::fs::PinnedJournalFs::open(&logs, true)
@@ -2618,5 +2824,4 @@ fn the_real_journals_flushes_are_only_ordered() {
         "the directory's entries"
     );
     drop(held);
-    let _ = std::fs::remove_dir_all(&scratch);
 }

@@ -7,8 +7,8 @@
 
 use crate::vocab::{
     ACT_WORDS, BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, DUR_WORDS, END_WORDS, MAIL_KIND_WORDS,
-    NEED_WORDS, OUT_WORDS, PHASE_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS, WHY_WORDS,
-    WORD_WORDS, lookup,
+    NEED_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, STATE_WORDS, ShortId, VERB_WORDS, WALL_WORDS,
+    WHY_WORDS, WORD_WORDS, lookup,
 };
 
 /// Where a value may be stored (§3.6). Ordered: a reply, journal or body at
@@ -220,6 +220,19 @@ keys! {
     // a person chose (a map's member).
     PrevEnd "prev_end" Wire Cap::Word(END_WORDS),
     CfgKey "key" Wire Cap::Id,
+    // Phase 6 (6C-2, ruling U6), appended: a turn's close restates who opened
+    // it (`op_by=<actor word>`), so a reader holding the close alone, its open
+    // evicted, still names the turn's author. The log writes it, never a
+    // caller ([`crate::log_owned`]). HOST only: an edge's actor is a raw sid,
+    // and the bus aliases only a record's own `by=`, so `op_by=` never
+    // crosses the fabric. Printed as text by the local `brief`, never parsed
+    // back into an actor, and the fold never reads it.
+    OpBy "op_by" Host Cap::Id,
+    // Phase 6 (6C-6, ruling U18), appended: whose count a `dropped=` is when
+    // it is not its mark's author's own (`pool=shared`: the shared pool the
+    // mark limiter's owed-only table spilled into, `crate::limit`). A closed
+    // word; HOST only, as the input marks that carry it are.
+    Pool "pool" Host Cap::Word(POOL_WORDS),
 }
 
 impl Key {

@@ -1799,9 +1799,6 @@ mod tests {
         assert_eq!(node(&projection, "status").live(), Some(Live::Polite));
     }
 
-    /// A list box and its options lower to the platform's own roles: the
-    /// box scrolls, each option is pressed and focused, and the highlighted
-    /// one is selected.
     /// A row its list holds off screen lowers as off screen (in the tree,
     /// not showing) and takes a reader's "scroll into view", which routes to
     /// its key. Negative control: a row on screen is neither.
@@ -1858,6 +1855,9 @@ mod tests {
         );
     }
 
+    /// A list box and its options lower to the platform's own roles: the
+    /// box scrolls, each option is pressed and focused, and the highlighted
+    /// one is selected.
     #[test]
     fn list_box_and_its_options_lower_to_their_roles() {
         let option = |key: &str, selected: bool| {

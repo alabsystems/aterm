@@ -360,7 +360,7 @@ fn only_a_proven_claims_holder_records_an_act() {
         let rows: Vec<String> = timeline
             .since(None)
             .filter(|e| e.kind == crate::session_timeline::HARNESS_ACT)
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect();
         (rows, timeline.last_act().map(str::to_owned))
     };
@@ -734,13 +734,13 @@ impl LaneService for MetaService {
 
     fn serve_line(
         &self,
-        line: String,
+        request: super::Request,
         scope: Scope,
         _stream: &CtlStream,
         _reader: &mut LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut super::control_lanes::Outbox,
     ) -> Option<ServeDisposition> {
-        let rest = line.strip_prefix("meta ").unwrap_or("");
+        let rest = request.line().strip_prefix("meta ").unwrap_or("");
         let master = self.master;
         let alab_image = self.alab_image;
         let prove = |holder: &str| super::prove_self_claim_by(holder, master, &alab_image);
@@ -760,11 +760,11 @@ impl LaneService for MetaService {
         None
     }
 
-    fn is_wait(&self, _line: &str, _scope: Scope) -> bool {
+    fn is_wait(&self, _request: &super::Request, _scope: Scope) -> bool {
         false
     }
 
-    fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
+    fn subscribe(&self, _request: super::Request, _scope: Scope, _stream: CtlStream) {}
 
     fn has_live_claim(&self, id: u64) -> bool {
         self.ctx
@@ -991,8 +991,9 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
             wait: 0,
             inline: 0,
             open: 4,
+            subscriptions: 0,
         });
-        assert_eq!(lanes.start(), 1, "the request lane starts");
+        assert_eq!(lanes.start().rpc, 1, "the request lane starts");
         lanes.publish(service.clone());
         let (stream, _) = aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -1070,17 +1071,15 @@ fn a_startup_binary_header_is_counted_from_the_current_direct_peer() {
     let active: super::ActiveHandle = Arc::new(Mutex::new(None));
     let (_client, server) = CtlStream::pair().expect("socket pair");
     let serving = ServingFd::enter(&server);
+    let selector = aterm_types::control_request::Selector::parse("907");
     let header = |out: &mut Vec<u8>| {
         super::feed_bin_header(
-            "@907 feed-bin 1",
-            "feed-bin",
+            Some(&selector),
             super::FeedBinRoute {
                 active: &active,
                 store: &store,
                 scope: Scope::Owner,
-                subscribers: None,
             },
-            &mut |_| "OK\n".to_owned(),
             out,
         )
     };
@@ -1127,14 +1126,12 @@ fn a_startup_subscription_resolution_uses_its_scoped_peer() {
     witness.shell.set((leader, None)).expect("unobserved shell");
     store.write().unwrap().register(handle);
     let active: super::ActiveHandle = Arc::new(Mutex::new(None));
-    let subscribers = crate::subscribe::new_registry();
     let subscribe = || {
         let mut out = Vec::new();
         super::run_subscribe_with_peer_probe(
-            "subscribe @908 screen",
+            aterm_types::control_request::head("subscribe @908 screen"),
             &active,
             &store,
-            &subscribers,
             Scope::Owner,
             &mut out,
             || true,

@@ -793,6 +793,12 @@ pub struct ViewRules {
     /// A later snap of the session voids its `#handed` (an update that stood
     /// down; off: a `#handed` voided only by a record or a gap frame).
     pub snap_voids_handed: bool,
+    /// Two chains that no `#handed` links and that hold different records
+    /// at one `(base, seq)` are two seq spaces, ordered by when each chain
+    /// began (session log phase 6, 6A-2; off: the reader before it, which
+    /// keyed a space by its base alone and let a relaunch's records hide
+    /// behind a dead process's at the same seqs).
+    pub split_unlinked: bool,
 }
 
 impl ViewRules {
@@ -803,6 +809,7 @@ impl ViewRules {
         say_losses: true,
         restated_heads: true,
         snap_voids_handed: true,
+        split_unlinked: true,
     };
 }
 
@@ -876,6 +883,140 @@ fn uncovered(lo: u64, hi: u64, covered: &[Run]) -> Vec<Run> {
     out
 }
 
+/// What one chain wrote of session `sid` in one base: each seq's first
+/// admitted record (an ordinary one ahead of a restatement), and whether its
+/// last word on the session was
+/// `#handed` (as [`view_of`] reads it: a later record, gap or snap voids
+/// it).
+#[derive(Default)]
+struct ChainSpace<'a> {
+    recs: BTreeMap<u64, (&'a Rec, bool)>,
+    handed: bool,
+}
+
+/// THE SEQ SPACES THE CHAINS WROTE (session log phase 6, 6A-2, ruling U1):
+/// for each `(chain, base)`, the number of its space among that base's,
+/// counted in the order the chains began (`start_t`, then instance). A
+/// chain continues the base's newest space when the newest chain of it
+/// handed the session on (`#handed`: a seamless update's successor), or
+/// when every seq both hold is the same record (an overlap journaled
+/// twice, a carry's restatement); otherwise it holds another process's
+/// records at the same seqs (a relaunch under the same sid by a producer
+/// that reused the epoch) and starts a space of its own, newer, so its
+/// records are never hidden behind the dead one's. Every chain is space 0
+/// with the rule off.
+fn space_numbers(
+    sid: &ShortId,
+    chains: &[ChainRead],
+    rules: ViewRules,
+) -> BTreeMap<(usize, u32), u32> {
+    let mut wrote: BTreeMap<(usize, u32), ChainSpace<'_>> = BTreeMap::new();
+    for (ci, chain) in chains.iter().enumerate() {
+        let mut segs: Vec<&SegmentRead> = chain.segments.iter().collect();
+        segs.sort_by_key(|s| s.n);
+        for seg in segs {
+            let mut space: Option<u32> = None;
+            let mut snap_open = false;
+            let mut snap_head = 0;
+            for f in &seg.frames {
+                match f {
+                    Frame::Seg { v, .. } if *v != FORMAT => break,
+                    Frame::Snap {
+                        sid: s, base, head, ..
+                    } if s == sid => {
+                        space = Some(*base);
+                        snap_open = true;
+                        snap_head = *head;
+                        let cs = wrote.entry((ci, *base)).or_default();
+                        if rules.snap_voids_handed {
+                            cs.handed = false;
+                        }
+                    }
+                    Frame::Rec {
+                        sid: s,
+                        rec,
+                        restated,
+                    } if s == sid => {
+                        if let Some(b) = space {
+                            // Only a row the view admits may distinguish spaces.
+                            // An ignored restatement is no conflicting evidence.
+                            if *restated
+                                && (!snap_open || (rules.restated_heads && rec.seq > snap_head))
+                            {
+                                continue;
+                            }
+                            if !*restated {
+                                snap_open = false;
+                            }
+                            let cs = wrote.entry((ci, b)).or_default();
+                            match cs.recs.get(&rec.seq) {
+                                Some((_, true)) if !*restated => {
+                                    cs.recs.insert(rec.seq, (rec, false));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    cs.recs.insert(rec.seq, (rec, *restated));
+                                }
+                            }
+                            if !*restated {
+                                cs.handed = false;
+                            }
+                        }
+                    }
+                    Frame::Gap { sid: s, .. } if s == sid => {
+                        snap_open = false;
+                        if let Some(b) = space {
+                            wrote.entry((ci, b)).or_default().handed = false;
+                        }
+                    }
+                    Frame::Hole { sid: s, .. } if s == sid => snap_open = false,
+                    Frame::Handed { sid: s, .. } if s == sid => {
+                        snap_open = false;
+                        if let Some(b) = space {
+                            wrote.entry((ci, b)).or_default().handed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut bases: BTreeMap<u32, Vec<(u64, &Inst, usize)>> = BTreeMap::new();
+    for &(ci, base) in wrote.keys() {
+        let chain = &chains[ci];
+        bases
+            .entry(base)
+            .or_default()
+            .push((chain.start_t, &chain.inst, ci));
+    }
+    let mut out = BTreeMap::new();
+    for (base, mut order) in bases {
+        order.sort();
+        // The newest space's records so far, and whether its newest chain
+        // handed the session on.
+        let mut held: BTreeMap<u64, &Rec> = BTreeMap::new();
+        let mut handed = false;
+        let mut n = 0u32;
+        for (i, &(.., ci)) in order.iter().enumerate() {
+            let cs = &wrote[&(ci, base)];
+            let conflict = cs
+                .recs
+                .iter()
+                .any(|(seq, (r, _))| held.get(seq).is_some_and(|h| h != r));
+            if i > 0 && rules.split_unlinked && !handed && conflict {
+                n = n.saturating_add(1);
+                held.clear();
+            }
+            for (seq, (r, _)) in &cs.recs {
+                held.entry(*seq).or_insert(r);
+            }
+            handed = cs.handed;
+            out.insert((ci, base), n);
+        }
+    }
+    out
+}
+
 /// The view of session `sid` over the chains a read gathered (module
 /// docs); `unread`: the read stopped at its budget, so a range nobody
 /// accounts for may still be on disk. `None` when no chain holds a line of
@@ -887,14 +1028,17 @@ pub fn view_of(
     unread: bool,
     rules: ViewRules,
 ) -> Option<View> {
-    let mut spaces: BTreeMap<u32, Space> = BTreeMap::new();
+    let numbers = space_numbers(sid, chains, rules);
+    let number = |ci: usize, base: u32| numbers.get(&(ci, base)).copied().unwrap_or(0);
+    // Keyed by base, then by its space's number among that base's.
+    let mut spaces: BTreeMap<(u32, u32), Space> = BTreeMap::new();
     // Per chain: whether the session's last line in it is `#handed`.
     let mut handed: BTreeMap<usize, bool> = BTreeMap::new();
     for (ci, chain) in chains.iter().enumerate() {
         let mut segs: Vec<&SegmentRead> = chain.segments.iter().collect();
         segs.sort_by_key(|s| s.n);
         for seg in segs {
-            let mut space: Option<u32> = None;
+            let mut space: Option<(u32, u32)> = None;
             let mut snap_open = false;
             // The head of the snap whose restatement is being read.
             let mut snap_head = 0u64;
@@ -910,7 +1054,8 @@ pub fn view_of(
                         open,
                         t,
                     } if s == sid => {
-                        let sp = spaces.entry(*base).or_default();
+                        let key = (*base, number(ci, *base));
+                        let sp = spaces.entry(key).or_default();
                         sp.ep = sp.ep.max(*ep);
                         sp.first = sp.first.max(*first);
                         sp.last_t = sp.last_t.max(*t);
@@ -921,7 +1066,7 @@ pub fn view_of(
                             want: *open,
                             open: BTreeSet::new(),
                         });
-                        space = Some(*base);
+                        space = Some(key);
                         snap_open = true;
                         snap_head = *head;
                         if rules.snap_voids_handed {
@@ -1009,7 +1154,7 @@ pub fn view_of(
             }
         }
     }
-    let (base, sp) = spaces.into_iter().next_back()?;
+    let ((base, _), sp) = spaces.into_iter().next_back()?;
     build(base, sp, chains, &handed, unread, rules)
 }
 

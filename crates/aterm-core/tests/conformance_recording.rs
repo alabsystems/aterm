@@ -7,8 +7,13 @@
 //! [`Terminal::from_checkpoint`]-hydrated terminal reproduces the live terminal's
 //! checkpoint at `t1` exactly. Negative control: dropping one delta chunk makes them
 //! diverge.
+//!
+//! The hydrated terminal is a restore that output reached before any host adopted it,
+//! so its checkpoint also carries that lineage's seed uncertainty
+//! (`HolderRepr::seed_untrusted`), which no live terminal has; [`lineage_taken`]
+//! asserts it and takes it out, and every other field is compared.
 
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 /// Prefix script driven to `t0`, the keyframe point: scrollback, SGR, scroll
 /// region, alt-screen round-trip, cursor moves, charset, kitty keyboard, cwd.
@@ -36,6 +41,15 @@ const DELTA: &[&[u8]] = &[
     b"\x1b[1;1Htop-left edit",
     b"\x1b[?7l", // toggle autowrap off (a captured mode bit)
 ];
+
+/// A hydrated terminal's checkpoint with its restore lineage asserted and taken out.
+fn lineage_taken(c: TerminalCheckpoint) -> TerminalCheckpoint {
+    assert!(
+        c.holder.seed_untrusted,
+        "a restore output reached before adoption carries its lineage"
+    );
+    c.without_seed_lineage()
+}
 
 /// Drive `t` through a slice of byte chunks.
 fn run(t: &mut Terminal, chunks: &[&[u8]]) {
@@ -67,7 +81,7 @@ fn replay_from_checkpoint_matches_live_engine() {
     // The checkpoint+replay reproduces live at t1 over the full projection.
     assert_eq!(
         live.checkpoint(),
-        replay.checkpoint(),
+        lineage_taken(replay.checkpoint()),
         "checkpoint+replay must reproduce the live projection (B.8.4 faithfulness)"
     );
     // Human-readable cross-check on the rendered content.
@@ -99,7 +113,7 @@ fn replay_negative_control_dropped_delta_diverges() {
 
     assert_ne!(
         live.checkpoint(),
-        replay.checkpoint(),
+        lineage_taken(replay.checkpoint()),
         "dropping a recorded delta event MUST diverge (negative control); if this \
          passes, the faithfulness assertion is vacuous"
     );

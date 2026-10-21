@@ -12,9 +12,13 @@ use crate::harness::disk::tests::Tmp;
 #[test]
 fn the_reserve_is_written_once_and_released_by_one_unlink() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let tmp = Tmp::new("reserve");
+    let tmp = aterm_tempfile::TempDir::new().expect("owned scratch directory");
     let path = path_for(tmp.path());
     assert_eq!(state(&path), Ok(State::Absent));
+    let folder = path.parent().expect("reserve folder");
+    std::fs::create_dir_all(folder).expect("reserve folder");
+    let preexisting = folder.join(format!(".{FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&preexisting, b"keep this preexisting file").expect("preexisting stage name");
     let recording = aterm_durable::seam::Recording::start();
     assert_eq!(ensure(&path, 3 * 1024 * 1024 + 5), Ok(true));
     assert_eq!(
@@ -33,6 +37,10 @@ fn the_reserve_is_written_once_and_released_by_one_unlink() {
     assert_eq!(release(&path), Ok(Some(3 * 1024 * 1024 + 5)));
     assert!(!path.exists());
     assert_eq!(release(&path), Ok(None));
+    assert_eq!(
+        std::fs::read(&preexisting).expect("preexisting stage survives"),
+        b"keep this preexisting file"
+    );
 }
 
 /// NEGATIVE CONTROLS: a link in the reserve's place (to a victim file) and a

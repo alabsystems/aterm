@@ -21,6 +21,8 @@ aterm-grapheme = { workspace = true }
 aterm-cap = { workspace = true }
 # The key vocabulary (`Key`, `Modifiers`) the input reducer reads.
 aterm-types = { workspace = true }
+# FNV-1a/64, the stable hash behind the edit script's `line:h6` anchors.
+aterm-hash = { workspace = true }
 
 [dev-dependencies]
 # The engine's tests mint a root authority for the store's write cap; only a

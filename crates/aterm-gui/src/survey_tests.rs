@@ -58,7 +58,7 @@ fn turn(id: u64, text: &str, by: crate::turn_ledger::TurnBy) -> crate::turn_ledg
         dur_ms: 1,
         submitted: true,
         status: "settled",
-        text: text.to_owned(),
+        text: text.into(),
         screen_hash: 0,
         seq: 0,
         arch: Default::default(),

@@ -18,6 +18,7 @@ pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
     let hardware = crate::hardware::describe(&facts)
         .map(|d| d.parts().to_vec())
         .unwrap_or_default();
+    let vitals = crate::facts::gather_vitals(sys, &facts);
     let floors = state::floors_or_refuse(sys, layout).unwrap_or_default();
     Hello {
         schema: crate::SCHEMA,
@@ -48,6 +49,7 @@ pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
         } else {
             Vec::new()
         },
+        vitals,
     }
 }
 

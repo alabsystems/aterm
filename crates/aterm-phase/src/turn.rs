@@ -64,6 +64,23 @@ pub struct LaunchCard {
     pub effort: Option<String>,
 }
 
+/// A launch card's reading with the rows it was read from: the card's
+/// banner row (`banner`), and the program's live status row under its
+/// composer where that named the model (`status`: agy's and Muse Code's
+/// footers, `agy::launch_card_read`, `muse::launch_card_read`). A caller
+/// that keeps the reading for the program in front holds both rows to the
+/// ones that program drew (the harness card's fence, aterm-gui's
+/// `claude_card`); a reading with neither row is never made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchCardRead {
+    /// What the card (and the status row) say.
+    pub card: LaunchCard,
+    /// The card's banner row, its top: `None` where no card was read.
+    pub banner: Option<usize>,
+    /// The status row the model was read from: `None` where the card named it.
+    pub status: Option<usize>,
+}
+
 /// The launch card above the composer, read ONLY when it is the newest card
 /// on the screen and nothing a person said sits between it and the
 /// composer's frame: no user message (`❯`) — a system notice (`⏺ agents-md:
@@ -77,6 +94,14 @@ pub struct LaunchCard {
 /// to check.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
+    launch_card_read(rows).map(|read| read.card)
+}
+
+/// [`launch_card`] with its banner row ([`LaunchCardRead::banner`]: the row
+/// the card was read at, which the harness card's gate holds to the card it
+/// admits). Never panics, on any rows.
+#[must_use]
+pub fn launch_card_read(rows: &[String]) -> Option<LaunchCardRead> {
     let frame = composer_frame(rows)?;
     let banner = const { crate::anchors::anchor_text("launch.banner") };
     let card = rows.iter().rposition(|r| r.contains(banner))?;
@@ -104,10 +129,14 @@ pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
         _ => (model, None),
     };
     let model = crate::text::trim(model);
-    (!model.is_empty()).then(|| LaunchCard {
-        version,
-        model: model.to_owned(),
-        effort,
+    (!model.is_empty()).then(|| LaunchCardRead {
+        card: LaunchCard {
+            version,
+            model: model.to_owned(),
+            effort,
+        },
+        banner: Some(card),
+        status: None,
     })
 }
 
@@ -189,6 +218,30 @@ pub struct CardPlace {
     /// to `ends[k]` when the cell at `ends[k] - 1` holds a wide glyph.
     pub ends: [usize; 3],
 }
+
+/// What a reader's banner says about the build that drew it, declared beside
+/// each card reader ([`LAUNCH_CARD_BUILD`], `agy::LAUNCH_CARD_BUILD`,
+/// `muse::LAUNCH_CARD_BUILD`): the harness card's gate holds a placed card's
+/// banner to the running image's build only where the banner is known to
+/// print that build (`docs/DESIGN-card-engine-2026-10-19.md` §3.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerBuild {
+    /// The banner names the running build exactly: a card is held to the
+    /// image's build. Claude Code's, pinned by its corpus
+    /// (`the_placed_cards_version_is_its_banners`).
+    Exact,
+    /// The banner's version is not known to be the running build's (agy's
+    /// fixtures all read 1.4.0 while the store held 1.4.1 and 1.4.2): only
+    /// the card's provenance, the rows the image itself drew, decides.
+    ProvenanceOnly,
+}
+
+/// Claude Code's banner prints its running build ([`BannerBuild::Exact`]).
+pub const LAUNCH_CARD_BUILD: BannerBuild = BannerBuild::Exact;
+
+/// The rows [`launch_card_scan`] reads of a card from its banner down: the
+/// banner, the model and the working directory.
+pub const LAUNCH_CARD_ROWS: usize = CARD_ROWS;
 
 /// Where the NEWEST launch card on the screen sits ([`CardPlace`]), read by
 /// its geometry: the banner row STARTS with the mascot's ` ▐` and the banner
@@ -676,6 +729,89 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     said_message(rows).map(|(_, said)| said)
 }
 
+/// WHETHER THE MESSAGE [`said_tail`] READS IS WHOLE ON `rows`: its `⏺`
+/// head is one of them. `false` for a message taller than the rows, its head
+/// above them (its tail is then the visible rows from the top, and what
+/// stood above them — a need, an open item — is not in it), and where there
+/// are no last words.
+#[must_use]
+pub fn said_whole(rows: &[String]) -> bool {
+    said_message(rows).is_some_and(|(head, _)| rows[head].starts_with(['⏺', '●']))
+}
+
+/// THE WORKER'S OTHER WORDS IN THE TURN ITS LAST WORDS END ([`said_tail`]):
+/// every `⏺` message of the same turn above its last — the words it said
+/// before a tool call, say — oldest first, each as [`said_tail`] reads one
+/// (its marker and indentation stripped, its `⎿` blocks left out), joined
+/// by a blank line. Walking up from the last message's head, a tool's call
+/// (`⏺ Bash(…)`, [`is_tool_call`]), its rows and blank rows are passed over;
+/// the first other row in column 0 — the `❯` row that opened the turn, a
+/// done row, the launch card — ends the walk, as the rows' top does. `None`
+/// where the turn holds no other message on `rows`, or there are no last
+/// words.
+#[must_use]
+pub fn turn_said_before(rows: &[String]) -> Option<String> {
+    let (_, said) = turn_before(rows)?;
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+/// WHETHER THE TURN [`said_tail`]'s MESSAGE ENDS IS WHOLE ON `rows`: the
+/// message is ([`said_whole`]), and so is the row that opened the turn — the
+/// first other row in column 0 the walk of [`turn_said_before`] meets (the
+/// `❯` row, a done row, the launch card). `false` where that walk reaches
+/// the rows' top: an earlier message of the turn, and a need said in it,
+/// may stand above them. `false` too where there are no last words.
+#[must_use]
+pub fn turn_whole(rows: &[String]) -> bool {
+    turn_before(rows).is_some_and(|(opened, _)| opened)
+}
+
+/// A row a read of the history above the screen stops at, for a turn
+/// [`turn_whole`] finds cut: one that opens in column 0 with words and is no
+/// `⏺` message or call of the turn — the row that opened it, as the walk of
+/// [`turn_said_before`] reads one.
+#[must_use]
+pub fn turn_history_stop(row: &str) -> bool {
+    !row.is_empty() && !row.starts_with(char::is_whitespace) && !row.starts_with(['⏺', '●'])
+}
+
+/// The turn [`turn_said_before`] walks: whether the walk met the row that
+/// opened it ([`turn_whole`]), and the words of its other messages, oldest
+/// first. `None` where the last message's head is not on `rows`, or there
+/// are no last words.
+fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
+    let (head, _) = said_message(rows)?;
+    if !rows[head].starts_with(['⏺', '●']) {
+        return None;
+    }
+    let mut said: Vec<String> = Vec::new();
+    let mut opened = false;
+    // The row under the message walked up to last: its last row is above it.
+    let mut below = head;
+    for i in (0..head).rev() {
+        let r = &rows[i];
+        if crate::text::trim(r).is_empty() || leading_spaces(r) > 0 {
+            continue;
+        }
+        if !r.starts_with(['⏺', '●']) {
+            opened = true;
+            break;
+        }
+        if !is_tool_call(r) {
+            let last = (i..below)
+                .rev()
+                .find(|&k| !crate::text::trim(&rows[k]).is_empty())
+                .unwrap_or(i);
+            if let Some((_, words)) = message_at(rows, last).filter(|(h, _)| *h == i) {
+                said.push(words);
+            }
+        }
+        below = i;
+    }
+    said.reverse();
+    Some((opened, said))
+}
+
 /// The message [`said_tail`] reads: its head's index ([`message_at`]) and
 /// its words. `None` where it is CLAUDE CODE'S OWN LABEL OVER A HOOK'S
 /// VERDICT ON A PROMPT ([`is_hook_verdict`]): the words behind it are the
@@ -1022,6 +1158,133 @@ mod tests {
             "  ? for shortcuts",
         );
         assert_eq!(said_tail(&tool), None);
+    }
+
+    /// WHETHER THE LAST MESSAGE IS WHOLE ON THE ROWS ([`said_whole`]): its
+    /// `⏺` head among them. A message whose head scrolled off reads only its
+    /// visible rows, and a NEEDS YOU line above them is unread: not whole.
+    /// NEGATIVE CONTROLS: a message whose head is on the rows is whole, and
+    /// rows with no last words are not.
+    #[test]
+    fn a_message_is_whole_only_where_its_head_is_on_the_rows() {
+        let whole = framed(
+            &[
+                "⏺ Merged it.",
+                "",
+                "  Nothing left: all of it is on main.",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert!(said_whole(&whole));
+        let cut = framed(
+            &[
+                "  - finding 29: details",
+                "",
+                "  Nothing left: all of it is on main.",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert!(said_tail(&cut).is_some(), "the visible rows are read");
+        assert!(!said_whole(&cut));
+        let user = framed(&["❯ carry on", ""], "  ? for shortcuts");
+        assert!(!said_whole(&user));
+    }
+
+    /// THE TURN'S OTHER WORDS ([`turn_said_before`]): the `⏺` messages above
+    /// the last one in its turn — across a tool call and its output — oldest
+    /// first, joined by a blank line; the `❯` row that opened the turn ends
+    /// the walk. NEGATIVE CONTROLS: a message above the turn's `❯` row is
+    /// another turn's, a turn with only its last message has none, and a
+    /// last message whose head scrolled off reads none.
+    #[test]
+    fn the_turns_other_words_are_its_messages_above_the_last() {
+        let turn = framed(
+            &[
+                "⏺ An older turn's words.",
+                "",
+                "❯ land the parser",
+                "",
+                "⏺ Merged the lexer.",
+                "  NEEDS YOU: the signing credential",
+                "",
+                "⏺ Bash(git push)",
+                "  ⎿  Everything up-to-date",
+                "",
+                "⏺ Pushed the docs too.",
+                "",
+                "⏺ Nothing left: all of it is on main.",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert_eq!(
+            said_tail(&turn).as_deref(),
+            Some("Nothing left: all of it is on main.")
+        );
+        assert_eq!(
+            turn_said_before(&turn).as_deref(),
+            Some("Merged the lexer.\nNEEDS YOU: the signing credential\n\nPushed the docs too.")
+        );
+        // NEGATIVE CONTROLS.
+        let alone = framed(
+            &[
+                "⏺ An older turn's words.",
+                "",
+                "❯ land the parser",
+                "",
+                "⏺ Nothing left: all of it is on main.",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert_eq!(turn_said_before(&alone), None);
+        let cut = framed(
+            &["  - finding 29: details", "  Nothing left: on main.", ""],
+            "  ? for shortcuts",
+        );
+        assert_eq!(turn_said_before(&cut), None);
+    }
+
+    /// A TURN WHOSE START IS ABOVE THE ROWS IS NO WHOLE TURN ([`turn_whole`]):
+    /// its last message whole on them, the walk up from it reaches their top
+    /// with no row that opened the turn — an earlier message, and a need
+    /// said in it, may stand above. The read of the history above stops at
+    /// that row, past the turn's `⏺` messages and calls
+    /// ([`turn_history_stop`]). NEGATIVE CONTROLS: the `❯` row on the rows
+    /// (or a done row) makes the turn whole; a cut message is no whole turn.
+    #[test]
+    fn a_turn_whose_start_is_above_the_rows_is_no_whole_turn() {
+        let body = [
+            "⏺ Bash(git push)",
+            "  ⎿  Everything up-to-date",
+            "",
+            "⏺ Nothing left: all of it is on main.",
+            "",
+        ];
+        let cut = framed(&body, "  ? for shortcuts");
+        assert!(said_whole(&cut) && !turn_whole(&cut));
+        for opener in ["❯ land the parser", "✻ Worked for 3m 2s"] {
+            let mut rows = vec![opener, ""];
+            rows.extend(body);
+            let whole = framed(&rows, "  ? for shortcuts");
+            assert!(turn_whole(&whole), "{opener}");
+        }
+        let tall = framed(
+            &["  - finding 29: details", "  Nothing left: on main.", ""],
+            "  ? for shortcuts",
+        );
+        assert!(!turn_whole(&tall));
+        assert!(turn_history_stop("❯ land the parser") && turn_history_stop("✻ Worked for 3m"));
+        for row in [
+            "⏺ Merged the lexer.",
+            "● Bash(ls)",
+            "  NEEDS YOU: the key",
+            "",
+        ] {
+            assert!(!turn_history_stop(row), "{row}");
+        }
     }
 
     /// A message taller than the screen: its `⏺` row scrolled off, every

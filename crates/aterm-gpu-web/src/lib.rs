@@ -1501,7 +1501,7 @@ pub fn encode_key_with_mode(
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
 
-/// A detected link under a cell: its text/URL, the half-open display-column span
+/// A detected link under a cell: its text/URL, the half-open grid-column span
 /// it covers, and a `kind` discriminant (0=osc8, 1=url, 2=file_path, 3=other).
 /// Same shape as aterm-wasm's `LinkHit`.
 #[cfg_attr(target_arch = "wasm32", export)]
@@ -1520,13 +1520,16 @@ impl LinkHit {
         self.url.clone()
     }
 
-    /// Inclusive start display column of the link span.
+    /// Inclusive start column of the link span: a grid column in logical order,
+    /// the painted cell on a single-width left-to-right row (a DEC double-width
+    /// line paints grid column `c` at cells `2c` and `2c + 1`; a BiDi row is
+    /// painted in visual order).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn start_col(&self) -> u16 {
         self.start_col
     }
 
-    /// Exclusive end display column of the link span.
+    /// Exclusive end column of the link span, a grid column as `start_col` is.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn end_col(&self) -> u16 {
         self.end_col

@@ -729,6 +729,54 @@ fn the_app_is_told_when_the_last_read_stops_counting() {
     assert!(!slot.reading, "the lapse is no read");
 }
 
+/// A LAPSE THAT PASSES WHILE THE READ'S END IS TOLD IS TOLD TOO: the next
+/// lapse is reckoned from the instant the App was told, not from a later
+/// look at the clock, so one that passes in between (the reader descheduled
+/// after its post, a Mac asleep) is still news. Here the clock passes the
+/// read's freshness inside the very post that tells the read's end, the
+/// latest the race can put it, and the tick is an hour, so only the lapse
+/// can wake the reader. The waits are hang detectors. NEGATIVE CONTROL: the
+/// read was fresh when its end was told, and the lapse is no second read.
+#[test]
+fn a_lapse_that_passes_while_the_read_is_told_is_told() {
+    use std::sync::atomic::AtomicU64;
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let start = 1_000_000;
+    let lapsed = start + millis(COUNT_FRESH) + 1_000;
+    let clock = Arc::new(AtomicU64::new(start));
+    let (posts_tx, posts) = std::sync::mpsc::channel();
+    let (now, moved) = (Arc::clone(&clock), Arc::clone(&clock));
+    let told = AtomicUsize::new(0);
+    let glance = spawn(
+        Box::new(Empty),
+        ReaderSeams {
+            tick: Duration::from_secs(3600),
+            now_ms: Box::new(move || now.load(Ordering::SeqCst)),
+            // The first look, the read's start, then its end: the clock
+            // passes the read's freshness as its end is told.
+            post: Box::new(move || {
+                if told.fetch_add(1, Ordering::SeqCst) == 2 {
+                    moved.store(lapsed, Ordering::SeqCst);
+                }
+                posts_tx.send(()).is_ok()
+            }),
+            ..seams(false, std::sync::mpsc::channel().0)
+        },
+    )
+    .expect("the thread starts");
+    posts.recv_timeout(hang).expect("the first look is told");
+    glance.kick(Kick::Now);
+    posts.recv_timeout(hang).expect("began");
+    posts.recv_timeout(hang).expect("ended");
+    let read = glance.copy().snapshot.expect("read");
+    assert!(read.fresh(start), "CONTROL: fresh when its end was told");
+    posts.recv_timeout(hang).expect("the lapse is told");
+    let slot = glance.copy();
+    assert!(!slot.snapshot.expect("kept").fresh(lapsed));
+    assert_eq!(slot.generation, 1, "CONTROL: the lapse is no read");
+    assert!(!slot.reading);
+}
+
 /// A CHILD THAT NEVER ANSWERS IS KILLED AT THE CAP and the read fails: the
 /// slot keeps no snapshot, says why, and the App is told. The cap ends the
 /// wait; the minute is a hang detector. NEGATIVE CONTROL: a child that

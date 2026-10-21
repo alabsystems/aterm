@@ -239,6 +239,7 @@ fn the_real_dial_wait_refines_the_model() {
                 &DialerCode::this_process(),
                 far(),
                 &cancel_rx,
+                &Default::default(),
             )
         });
         assert!(
@@ -359,6 +360,7 @@ fn the_real_dial_wait_refines_the_model() {
             &DialerCode::this_process(),
             far(),
             &cancel_rx,
+            &Default::default(),
         );
         // Reaped before the wait first saw it: no birth stamp was read.
         let death = PreDialDeath::NamedProcessGone {
@@ -419,6 +421,7 @@ fn the_real_dial_wait_refines_the_model() {
                 &DialerCode::this_process(),
                 far(),
                 &cancel_rx,
+                &Default::default(),
             );
             (accepted, dialer.join().expect("the dialer thread"))
         });
@@ -484,6 +487,7 @@ fn the_real_dial_wait_refines_the_model() {
             &DialerCode::this_process(),
             Instant::now() + Duration::from_millis(200),
             &cancel_rx,
+            &Default::default(),
         );
         assert_eq!(
             ended.err(),
@@ -515,7 +519,8 @@ fn the_real_dial_wait_refines_the_model() {
                 &in_flight,
                 &DialerCode::this_process(),
                 far(),
-                &cancel_rx
+                &cancel_rx,
+                &Default::default(),
             )
             .err(),
             Some(LaunchedDialEnd::Cancelled)

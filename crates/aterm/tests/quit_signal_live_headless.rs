@@ -87,14 +87,17 @@ fn spawn_worker(inst: &Instance, manager: &str) -> PathBuf {
     cmd.env("ATERM_PARENT_SESSION_ID", manager)
         .current_dir(inst.tmp.join("work"))
         .stdin(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn aterm ctl");
-    child
-        .stdin
-        .take()
-        .expect("its stdin")
-        .write_all(b"say hello")
-        .expect("write the task");
-    let out = child_output::wait_and_read(child, Instant::now() + HANG).expect("aterm ctl exits");
+    // Asked again while the instance has not yet accepted it, or answers it busy: nothing was sent.
+    let out = headless_boot::until_served(|| {
+        let mut child = cmd.spawn().expect("spawn aterm ctl");
+        child
+            .stdin
+            .take()
+            .expect("its stdin")
+            .write_all(b"say hello")
+            .expect("write the task");
+        child_output::wait_and_read(child, Instant::now() + HANG).expect("aterm ctl exits")
+    });
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "spawn: {stdout} {:?}", out.stderr);
     let worker = stdout
@@ -172,9 +175,7 @@ fn sigterm_quits_a_headless_instance_as_the_quit_verb_does() {
     assert!(!markers(&inst).is_empty(), "the crash marker is armed");
     // A watcher as the run's: the client's own `subscribe`, its pushes on
     // stdout, attached before the signal.
-    let watcher = client_command(&inst, &["subscribe", "@*", "events,sessions"])
-        .spawn()
-        .expect("spawn the watcher");
+    let watcher = headless_boot::subscribed(&inst, &["@*", "events,sessions"]);
     until_watched(&inst, &manager, 1);
 
     let status = signal_and_reap(&mut inst, libc::SIGTERM);

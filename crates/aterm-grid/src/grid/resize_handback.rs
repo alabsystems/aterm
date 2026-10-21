@@ -54,7 +54,12 @@
 //! aterm before the hand-back did. A grow reveals history wherever the grid
 //! keeps it, the lazy buffer's and the tiered store's once the ring's run out
 //! (`Grid::pull_history_into_ring`), so a grid whose history went to its store
-//! (a rewrap, a restore) hands back what one whose did not would.
+//! (a rewrap, a restore) hands back what one whose did not would. It cannot
+//! reveal what history no longer keeps: a shrink that demotes more rows than
+//! a history cap holds pushes the oldest of them out of it, and a grow back
+//! comes back short of them, every row higher (grid SPECS
+//! `rows-only-resize-transcript`: the identity holds while retention holds
+//! its rows).
 //!
 //! The bottom-push corner: a shrink past the blank tail with the cursor too
 //! near the top to demote rotates the bottom rows into history as its newest
@@ -816,6 +821,19 @@ impl Grid {
         }
     }
 
+    /// Whether nothing a later resize reads from the hand-back stands: no rows
+    /// owed, and no split pass's offer, lift, plan, fill or skew
+    /// ([`Grid::replay_fork`] copies none of them).
+    pub(super) fn handback_idle(&self) -> bool {
+        let hb = self.storage.handback;
+        self.handback_owed(true) == Edge::None
+            && HandBack {
+                edge: hb.edge,
+                at: hb.at,
+                ..HandBack::default()
+            } == hb
+    }
+
     /// Record `edge` owed as of now, after the rows-only resize that moved the
     /// counter for its own trims and appends.
     pub(super) fn set_handback(&mut self, edge: Edge) {
@@ -1274,6 +1292,16 @@ impl Grid {
                 extras.push((row_u16(j), bx));
             }
         }
+        // The dense rings hold exactly the screen's rows, indexed modulo
+        // their count: the rows this grows the screen by have none, and a
+        // shift past the last would wrap onto the first, so the top row's
+        // ring-held base or true colour would read another row's (`U+FFFD`).
+        // Harvest them into the map, read at the live rows, and drop them.
+        let offset = std::mem::take(&mut self.storage.display_offset);
+        self.migrate_complex_ring_to_extras();
+        self.migrate_rgb_ring_to_extras();
+        self.storage.display_offset = offset;
+        self.storage.extras.invalidate_rings();
         let bottom = self.storage.visible_rows + shift - 1;
         self.storage.extras.shift_region_down_by(0, bottom, shift);
         self.storage.visible_rows += shift;
@@ -1821,6 +1849,68 @@ mod tests {
         flapped.resize(8, 10);
         assert_eq!(flapped.take_last_resize_shape().revealed, 1);
         assert_eq!(picture(&flapped), picture(&never));
+        flapped.assert_invariants();
+    }
+
+    /// A grow part of the way back after trims and output that scrolled shows
+    /// what a screen that stayed at that height shows. A shell: a prompt and
+    /// six lines at the top of 50 rows (no history, or after a clear with
+    /// history above), shrunk to 10, twenty lines of output, then grown to 12,
+    /// 30, 40 or 50. And a grow that found no history to reveal, a shrink past
+    /// the start, one line of output, then a grow short of the first height.
+    #[test]
+    fn a_partial_grow_after_scrolled_output_shows_the_screen_that_stayed() {
+        for prior in [0u16, 60] {
+            for target in [12u16, 30, 40, 50] {
+                let feed = |grid: &mut Grid, part: u8| {
+                    if part == 0 {
+                        for i in 0..prior {
+                            write_line(grid, &format!("old{i}"));
+                        }
+                        if prior > 0 {
+                            grid.erase_screen();
+                            grid.set_cursor(0, 0);
+                        }
+                        for i in 0..6 {
+                            write_line(grid, &format!("p{i}"));
+                        }
+                    } else {
+                        for i in 0..20 {
+                            write_line(grid, &format!("o{i}"));
+                        }
+                    }
+                };
+                let mut flapped = Grid::with_scrollback(50, 10, 1000);
+                feed(&mut flapped, 0);
+                flapped.resize(10, 10);
+                feed(&mut flapped, 1);
+                flapped.resize(target, 10);
+                let mut stayed = Grid::with_scrollback(target, 10, 1000);
+                feed(&mut stayed, 0);
+                feed(&mut stayed, 1);
+                let at = format!("{prior} lines before, 50 -> 10, 20 lines, -> {target}");
+                assert_eq!(screen(&flapped), screen(&stayed), "{at}");
+                assert_eq!(flapped.cursor_row(), stayed.cursor_row(), "{at}");
+                flapped.assert_invariants();
+            }
+        }
+
+        let drawn = || {
+            let mut grid = Grid::with_scrollback(8, 10, 100);
+            for i in 0..4 {
+                write_line(&mut grid, &format!("L{i}"));
+            }
+            grid
+        };
+        let mut never = drawn();
+        let mut flapped = drawn();
+        flapped.resize(9, 10);
+        flapped.resize(5, 10);
+        for grid in [&mut never, &mut flapped] {
+            write_line(grid, "X0");
+        }
+        flapped.resize(8, 10);
+        assert_eq!(picture(&flapped), picture(&never), "8 -> 9 -> 5, X0, -> 8");
         flapped.assert_invariants();
     }
 

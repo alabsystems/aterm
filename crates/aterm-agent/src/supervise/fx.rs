@@ -14,9 +14,27 @@
 //! `limit::unix_now`, `journal::unix_ms`, `thread::sleep`), each one a hole a
 //! recorder would miss and a replay would answer from the real clock. Now the
 //! loop holds one [`Fx`] (`Session::fx`, cloned into the sink that stamps the
-//! journal) and reads every clock through it; the `supervise-fx` source guard
-//! (`aterm-census`) keeps a direct read out of the supervisor's shipped code,
-//! so a new one is a finding, not a silent hole.
+//! journal), and every clock read and sleep written in the supervisor's own
+//! source goes through it: the `supervise-fx` source guard (`aterm-census`)
+//! names a direct one in the supervisor's shipped files — by its path, or
+//! bound by an import to a bare name, a rename or a glob — so a new one is a
+//! finding, not a silent hole.
+//!
+//! **Where that claim ends.** The guard is lexical and reads the supervisor's
+//! files alone. A helper ELSEWHERE in the crate that the loop calls, and that
+//! reads a clock for itself, is out of its sight, so the claim is not "every
+//! clock the loop thread ever reads": such a helper is put behind a door when
+//! one is found. The retired Codex lane's process-age reader
+//! (`upgrade_drive::started_ms`, a wall read that picked the Codex rollout)
+//! was one; T5 made it part of a derived door's live body
+//! (`Fx::codex_records`), below that door, before the lane was retired. The
+//! harness helpers the loop calls
+//! today were read for this (2026-10-20): the upgrade drive's
+//! (`lefts_of`, `earlier_ledgers_in`, `note_earlier_tab_under`, `host_turn`,
+//! the hand requests) read no clock, `repo_work::probe`'s deadline runs
+//! inside the host's door (`IdleHost::repo_work`), and the disk poke a failed
+//! journal write sends stamps its own record, which the loop never reads
+//! back.
 //!
 //! **The other doors.** Beside the clocks the door carries every other kind
 //! of value the loop observes, each by the method a recorder needs it by
@@ -125,7 +143,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::policy::box_facts::BoxFacts;
 use super::policy::probe::{LiveProbe, PolicyProbe, ReplayProbe, TapedProbe};
-use super::policy::sleeps::SleepStamp;
+use super::policy::sleeps::{Boot, SleepStamp};
 use super::run::IdleHost;
 use super::screen::Screen;
 use super::tape::codec::{CodecError, End, Stamp};
@@ -392,12 +410,39 @@ impl Fx {
 
     /// THE MACHINE'S COUNT OF ITS SLEEP NOW ([`SleepStamp`]: how long it
     /// slept since boot, `aterm_uds::process::asleep_since_boot`, and the
-    /// boot's name, `boot_session`), `None` where it keeps none — and from
-    /// the system's clocks in a test build, whose loops read a sleep only
-    /// where a test's clock counts one ([`ScriptedClock::count_sleeps`]). On a
-    /// tape, the derived door [`doors::PROBE_ASLEEP`].
+    /// boot's id, `astream_sys::boot_session`), `None` where it keeps none —
+    /// and from the system's clocks in a test build, whose loops read a sleep
+    /// only where a test's clock counts one ([`ScriptedClock::count_sleeps`]).
+    /// On a tape, the derived door [`doors::PROBE_ASLEEP`].
     pub(crate) fn asleep(&self) -> Option<SleepStamp> {
         self.exchange(doors::PROBE_ASLEEP, Vec::new, || self.clock.asleep())
+    }
+
+    /// The same count for an act's row, retaining a replay's exact validated
+    /// boot text. `Boot` keeps the kernel's upper/lower form intrinsically;
+    /// broader admitted tape forms need their original bytes at this output.
+    /// Live and recorded counts still use `Boot::kernel`'s host spelling.
+    pub(crate) fn asleep_for_ledger(&self) -> (Option<SleepStamp>, Option<String>) {
+        self.exchange_as(
+            doors::PROBE_ASLEEP,
+            Vec::new,
+            || (self.clock.asleep(), None),
+            |(count, _), _| count.to_tape(),
+            |bytes, _| {
+                let count = Option::<SleepStamp>::from_tape(bytes)?;
+                let spelling = std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|text| text.split_once(' ').map(|(_, boot)| boot))
+                    .filter(|text| {
+                        count
+                            .as_ref()
+                            .and_then(|c| c.boot)
+                            .is_some_and(|boot| Boot::of(text) == Some(boot))
+                    })
+                    .map(str::to_owned);
+                Ok((count, spelling))
+            },
+        )
     }
 
     /// THE MACHINE'S LAST SLEEP, as its kernel recorded it: when it slept and
@@ -690,6 +735,55 @@ impl Fx {
         }
     }
 
+    /// Whether a decision here keeps its RULE TRACE: only in a replay asked
+    /// for one at a point (`tape::replay::Options::trace_at`, what `aterm
+    /// drive replay --why` replays a turn end with). The shipped loop and a
+    /// recording one never trace (`policy::trace`).
+    pub(crate) fn tracing(&self) -> bool {
+        match &self.mode {
+            Mode::Live | Mode::Record(_) => false,
+            Mode::Replay(core) => core.tracing(),
+        }
+    }
+
+    /// The trace of the decision about to be marked, for the replay that
+    /// asked for one ([`Self::tracing`]); nothing anywhere else. Handed over
+    /// right before the decision's mark ([`Self::decide`]), never while the
+    /// decision is being made: one cut short by a lost read leaves no steps
+    /// for the next mark to carry.
+    pub(crate) fn traced(&self, steps: Vec<super::policy::trace::TraceStep>) {
+        if let Mode::Replay(core) = &self.mode {
+            core.traced(steps);
+        }
+    }
+
+    /// The CANDIDATE policy a shadow replay decides each turn end again
+    /// under (`tape::shadow`, `aterm drive replay --shadow`); `None` in the
+    /// shipped loop, a recording one and any other replay.
+    pub(crate) fn shadow_policy(&self) -> Option<super::SupervisorConfig> {
+        match &self.mode {
+            Mode::Live | Mode::Record(_) => None,
+            Mode::Replay(core) => core.shadow_policy(),
+        }
+    }
+
+    /// The candidate's decision on the turn end about to be marked, for the
+    /// shadow replay that asked for one ([`Self::shadow_policy`]): its rule,
+    /// and its outcome rendered by `outcome` with every `Instant` as an offset
+    /// from the replay's origin, as the mark writes the recorded one. Handed
+    /// over right before the mark, as [`Self::traced`] is; nothing anywhere
+    /// else.
+    pub(crate) fn shadowed(
+        &self,
+        rule: Option<&str>,
+        outcome: impl FnOnce(&dyn Fn(Instant) -> String) -> String,
+    ) {
+        if let Mode::Replay(core) = &self.mode {
+            let text = outcome(&|at| core.offset_text(at));
+            core.shadowed(rule, text);
+        }
+    }
+
     /// The run's end, said on its tape ([`End`]), which then makes the tape
     /// durable. Nothing is taped after it.
     pub(crate) fn finish(&self, end: End) {
@@ -783,7 +877,7 @@ impl ClockSource {
         match self {
             Self::Os => std::thread::sleep(d),
             #[cfg(test)]
-            Self::Scripted(_) => std::thread::sleep(d),
+            Self::Scripted(c) => c.sleep(d),
             #[cfg(test)]
             Self::Virtual(v) => v.advance(d),
         }
@@ -812,12 +906,16 @@ impl ClockSource {
     }
 }
 
-/// The machine's count of its sleep, read off the kernel.
+/// The machine's count of its sleep, read off the kernel, on the boot
+/// astream names (`astream_sys::boot_session`: the reading aterm-link's
+/// broker opens its log in, the all-zero id a damaged answer reads as
+/// refused, so the supervisor and the bus name a boot one way), spelled as
+/// this host's kernel spells it ([`Boot::kernel`]).
 #[cfg(not(test))]
 fn os_asleep() -> Option<SleepStamp> {
     aterm_uds::process::asleep_since_boot().map(|asleep| SleepStamp {
         asleep,
-        boot: aterm_uds::process::boot_session(),
+        boot: astream_sys::boot_session().map(Boot::kernel),
     })
 }
 
@@ -839,6 +937,28 @@ fn os_last_sleep() -> Option<(i64, i64)> {
 #[cfg(test)]
 fn os_last_sleep() -> Option<(i64, i64)> {
     None
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's PLANTED VARIANT of the loop: a build that reads the clock
+    /// once more before each screen it reads ([`planted_clock_read`]).
+    static PLANTED_CLOCK_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Plant (or pull) the extra clock read in the loops this thread runs: what
+/// a counterfactual's test replays a recorded run with, as "a build that
+/// reads the clock more often" (`tape::acts`: it still replays in acts mode;
+/// a strict replay drifts at it).
+#[cfg(test)]
+pub(crate) fn plant_clock_read(on: bool) {
+    PLANTED_CLOCK_READ.with(|p| p.set(on));
+}
+
+/// Whether this thread's loops read the clock once more before each screen.
+#[cfg(test)]
+pub(crate) fn planted_clock_read() -> bool {
+    PLANTED_CLOCK_READ.with(std::cell::Cell::get)
 }
 
 /// THE TESTS' FIXED WALL CLOCK, over the real monotonic clock (and the time a
@@ -869,6 +989,9 @@ struct Script {
     /// Where the monotonic clock STANDS ([`ScriptedClock::stand_mono`]);
     /// `None`: the system's.
     mono_stands: Option<Instant>,
+    /// A sleep through the door SKIPS its length instead of sleeping it
+    /// ([`ScriptedClock::run_virtual`]).
+    sleeps_skip: bool,
     /// The time SKIPPED ([`ScriptedClock::skip`]), which the monotonic clock
     /// stands ahead of the system's (or of where it stands) by.
     skipped: Duration,
@@ -887,16 +1010,27 @@ struct Script {
     staged_ms: i64,
     /// The boot the count is on ([`ScriptedClock::set_boot`]); `None`:
     /// [`TEST_BOOT`].
-    boot: Option<String>,
+    boot: Option<[u8; 16]>,
     /// The machine's record of its last sleep (unix ms, asleep and woke):
     /// the last one a counting test staged, or what it set
     /// ([`ScriptedClock::set_last_sleep`]).
     last_sleep: Option<(i64, i64)>,
 }
 
-/// The boot a counting test clock counts on unless the test names another.
+/// The boot a counting test clock counts on unless the test names another:
+/// a boot id, 16 bytes, as `astream_sys::boot_session` reads one
+/// (`7E57B007-…`, "test boot").
 #[cfg(test)]
-pub(crate) const TEST_BOOT: &str = "test-boot";
+pub(crate) const TEST_BOOT: [u8; 16] = [
+    0x7E, 0x57, 0xB0, 0x07, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+];
+
+/// The boot a test names when the machine restarted between two loops: not
+/// [`TEST_BOOT`].
+#[cfg(test)]
+pub(crate) const OTHER_TEST_BOOT: [u8; 16] = [
+    0x7E, 0x57, 0xB0, 0x07, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+];
 
 #[cfg(test)]
 impl Script {
@@ -993,8 +1127,8 @@ impl ScriptedClock {
 
     /// The boot the count is on ([`TEST_BOOT`] unless set): another boot's
     /// count compares with none of this one's.
-    pub(crate) fn set_boot(&self, boot: &str) {
-        self.script().boot = Some(boot.to_string());
+    pub(crate) fn set_boot(&self, boot: [u8; 16]) {
+        self.script().boot = Some(boot);
     }
 
     /// The machine's record of its last sleep (unix ms, asleep and woke), or
@@ -1011,7 +1145,7 @@ impl ScriptedClock {
         let ms = s.counted_ms?;
         Some(SleepStamp {
             asleep: Duration::from_millis(u64::try_from(ms).unwrap_or(0)),
-            boot: Some(s.boot.clone().unwrap_or_else(|| TEST_BOOT.to_string())),
+            boot: Some(Boot::kernel(s.boot.unwrap_or(TEST_BOOT))),
         })
     }
 
@@ -1042,6 +1176,30 @@ impl ScriptedClock {
     /// time between two steps, however long a loaded machine takes over them.
     pub(crate) fn stand_mono(&self) {
         self.script().mono_stands = Some(Instant::now());
+    }
+
+    /// THE CLOCKS RUN ON THE RUN'S STEPS ALONE from now: the monotonic
+    /// clock stands ([`Self::stand_mono`]) and moves only by what the run
+    /// skips — a scripted worker's wait on a sitting screen ([`Self::skip`])
+    /// and every sleep the loop takes through its door, which skips its
+    /// length instead of sleeping it — and a running fixed clock
+    /// ([`Self::set_running`]) with it. A hosted run waits out a reset, a
+    /// back-off or a window in no real time, at the same step every time,
+    /// however loaded the machine.
+    pub(crate) fn run_virtual(&self) {
+        let mut s = self.script();
+        s.mono_stands = Some(s.mono_stands.unwrap_or_else(Instant::now));
+        s.sleeps_skip = true;
+    }
+
+    /// Sleep `d`: skipped on a clock that runs on the run's steps
+    /// ([`Self::run_virtual`]), else slept.
+    fn sleep(&self, d: Duration) {
+        if self.script().sleeps_skip {
+            self.skip(d);
+        } else {
+            std::thread::sleep(d);
+        }
     }
 
     /// The fixed clock's milliseconds now, the staged jump's swap made (or
@@ -1164,7 +1322,7 @@ impl VirtualClock {
         let s = self.sleeps_mut();
         s.counts.then(|| SleepStamp {
             asleep: s.slept,
-            boot: Some(TEST_BOOT.to_string()),
+            boot: Some(Boot::kernel(TEST_BOOT)),
         })
     }
 

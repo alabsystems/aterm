@@ -65,22 +65,56 @@ impl CursorGlow {
         self.disp_t.clamp(0.0, 1.0)
     }
 
-    /// The forge cursor fill for the fire style, always warm metal: a dull
-    /// ember at rest, climbing the black-body ramp (cherry → orange → hot
-    /// yellow) with sustained momentum. The renderer's fill-override contrast
-    /// floor keeps the glyph beneath readable. Quantized to u8 channels, so
-    /// frames with an imperceptible temperature change fingerprint identically
-    /// and early-out: a cool cursor is a static ember (the heating arc keeps
-    /// the timer armed via `is_active`'s `cursor_temp` term).
+    /// The forge cursor fill for the fire style, always warm metal on the
+    /// black-body ramp: a glowing ember at rest, climbing toward the hot end
+    /// with sustained momentum, inside the page's [`ForgeBand`]. Never the
+    /// theme's cursor colour (the style is its colour; OSC 12 does not reach
+    /// it, by design) and never `None`, so the caret is warm the instant the
+    /// style is active.
+    ///
+    /// The glyph under a block caret is drawn in the page colour, so the
+    /// fill's contrast against the page is that glyph's contrast; the band
+    /// holds every fill at [`ForgeBand::PAGE_CONTRAST`] against the page the
+    /// last tick saw (the reference dark ground before the first tick). The
+    /// host's caret floor (`cursor_fx::floor_block_fill`) still runs over this
+    /// fill and asks for the same 4.5:1, so on its own page it leaves the
+    /// band's colour alone.
+    /// Quantized to u8 channels, so frames with an imperceptible temperature
+    /// change fingerprint identically and early-out: a cool cursor is a static
+    /// ember (the heating arc keeps the timer armed via `is_active`'s
+    /// `cursor_temp` term).
     pub fn forge_fill(&self) -> Option<u32> {
+        let band = self
+            .forge_band
+            .unwrap_or_else(|| ForgeBand::solve(Self::STREAK_REF_GROUND, true));
         let t = ((self.cursor_temp - Self::FORGE_MIN_TEMP) / (1.0 - Self::FORGE_MIN_TEMP))
             .clamp(0.0, 1.0);
         // A slow molten shimmer rides the field phase (deterministic; quantized to u8 by the
         // ramp, so idle settles).
         let breathe = 0.045 * t * (self.flame_phase * 1.7).sin();
-        // Ramp floor 0.10 = a dull ember even stone-cold; never returns None,
-        // so the fire cursor is warm the instant the style is active.
-        Some(fire_ramp((0.10 + 0.64 * t + breathe).clamp(0.0, 0.86)))
+        Some(fire_ramp(band.at(t, breathe)))
+    }
+
+    /// Re-solve the [`ForgeBand`] when the page under the caret changed (a
+    /// theme switch, DECSCNM): one bisection per new ground, nothing per frame.
+    pub(super) fn refresh_forge_band(&mut self, cfg: &GlowConfig) {
+        let ground = if cfg.theme_bg & 0xFF00_0000 != 0 {
+            // No resolved page (`COLOR_UNSET`): the reference ground of the
+            // ground's side.
+            if cfg.dark_theme {
+                Self::STREAK_REF_GROUND
+            } else {
+                0x00FF_FFFF
+            }
+        } else {
+            cfg.theme_bg
+        };
+        if self
+            .forge_band
+            .is_none_or(|b| b.ground != ground || b.dark != cfg.dark_theme)
+        {
+            self.forge_band = Some(ForgeBand::solve(ground, cfg.dark_theme));
+        }
     }
 
     /// Zero the thermal integrators (heat / flare / coal / quench, the eased display
@@ -121,6 +155,7 @@ impl CursorGlow {
             typing,
             fire,
             forward,
+            echo_run,
             deletion,
             navigation,
             ..
@@ -133,7 +168,10 @@ impl CursorGlow {
                 .map(|t| now.saturating_duration_since(t).as_secs_f32())
                 .unwrap_or(f32::MAX);
             // Forward-only momentum heats fire; the other styles keep direction-blind heat.
-            if (forward || !fire) && !deletion && !navigation {
+            // A typed echo run (a wide glyph's two cells, or keys the echo batched into one
+            // hop) is a forward advance too, earning one key's credit: CJK typed into fire
+            // heats it as Latin text does.
+            if (forward || echo_run || !fire) && !deletion && !navigation {
                 let cadence = Self::heat_cadence(gap);
                 let gain = Self::heat_gain(fire);
                 self.heat = (self.heat + cadence * gain).min(1.0);
@@ -195,12 +233,15 @@ impl CursorGlow {
             }
             self.last_type = Some(now);
             // Quench steam: a deletion echo flashes vapor off the doused cell,
-            // scaling with the quench meter, plus a couple of hiss specks.
+            // scaling with the quench meter, plus a hiss speck. A held
+            // backspace keeps the cloud fed key after key, so a key adds at
+            // most `STEAM_ECHO_PUFFS_MAX` puffs (the cloud's light is budgeted
+            // as a whole in `emit_vapor`).
             if deletion && fire {
                 let cell = geom.ch as f32;
                 let ox = geom.origin_x as f32 + (pc as f32 + 0.5) * geom.cw as f32;
                 let oy = geom.origin_y as f32 + (pr as f32 + 0.2) * cell;
-                let puffs = (2 + (self.quench * 4.0) as usize).min(6);
+                let puffs = (2 + (self.quench * 1.5) as usize).min(Self::STEAM_ECHO_PUFFS_MAX);
                 self.spawn_quench_steam(puffs, |_| ox, oy, cell, geom.cw as f32, now);
             }
             gap
@@ -208,4 +249,131 @@ impl CursorGlow {
             f32::MAX
         }
     }
+}
+
+/// The forge caret's span of the black-body ramp ([`fire_ramp`]), solved for
+/// one page: the resting ember sits at `lo`, full heat at `hi`, and every
+/// point between reads against the page at [`Self::PAGE_CONTRAST`] or better.
+///
+/// On a dark page the ramp's dark end is lost in the ground, so the band is
+/// on the ramp's bright side: `lo` is the lowest point that reaches the
+/// contrast (an orange-red ember on the default dark theme) and the metal
+/// heats from there toward gold. On a light page the ramp's hot end is lost
+/// instead, so the band is on the deep side: the ember keeps its deep rest
+/// point and `hi` is the hottest point that still reads, so the metal heats
+/// from maroon to a deep orange, never to a yellow the page swallows. A page
+/// takes the side its theme names when that side reads, else the other one;
+/// where neither reaches the contrast (a mid-grey page) the band collapses
+/// onto the ramp end that comes closest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ForgeBand {
+    /// The page this band was solved against.
+    pub(super) ground: u32,
+    /// The theme's side (`GlowConfig::dark_theme`) the solve was asked for.
+    pub(super) dark: bool,
+    /// Whether the band lies on the ramp's bright side (the ember lighter than
+    /// the page), where the breath may ride above `hi`.
+    pub(super) bright: bool,
+    /// The resting ember's ramp position.
+    pub(super) lo: f32,
+    /// The ramp position at full heat.
+    pub(super) hi: f32,
+}
+
+impl ForgeBand {
+    /// The least contrast every forge fill keeps against its page: the
+    /// host's caret floor ([`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`],
+    /// WCAG's text minimum, since a block caret draws the glyph beneath it in
+    /// the page colour), so the floor finds the band's ember already clear.
+    pub(super) const PAGE_CONTRAST: f32 = crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
+    /// The deep rest point a cold forge took before its page was solved, kept
+    /// wherever it already reads (a light page).
+    pub(super) const COLD: f32 = 0.10;
+    /// The shipped full-heat point: orange-gold, short of cream.
+    pub(super) const HOT: f32 = 0.74;
+    /// The ramp ceiling the fill never passes, breathing included.
+    pub(super) const TOP: f32 = 0.86;
+    /// The least heating arc a dark page keeps between rest and full heat, so
+    /// a page that pushes the ember up still shows the metal heating.
+    pub(super) const MIN_ARC: f32 = 0.22;
+
+    /// Solve the band for `ground`, preferring the side `dark` names.
+    pub(super) fn solve(ground: u32, dark: bool) -> Self {
+        // The crate's WCAG luminance (`color_math`), the one any page floor
+        // on the caret measures with, so such a floor leaves these fills be.
+        let lum_of = crate::color_math::relative_luminance;
+        let lum = lum_of(ground);
+        let ratio = |p: f32| {
+            let l = lum_of(fire_ramp(p));
+            (l.max(lum) + 0.05) / (l.min(lum) + 0.05)
+        };
+        let reads = |p: f32| ratio(p) >= Self::PAGE_CONTRAST;
+        // Bright side: lighter than the page and reading, false below and
+        // true above, so the band starts at the first point that reads.
+        let lit = |p: f32| lum_of(fire_ramp(p)) > lum && reads(p);
+        let bright = lit(Self::TOP).then(|| {
+            let lo = if lit(Self::COLD) {
+                Self::COLD
+            } else {
+                bisect_edge(Self::COLD, Self::TOP, |p| !lit(p)).1
+            };
+            (lo, (lo + Self::MIN_ARC).clamp(Self::HOT, Self::TOP))
+        });
+        // Deep side: darker than the page and reading, true below and false
+        // above, so the band ends at the last point that reads.
+        let deep_ok = |p: f32| lum_of(fire_ramp(p)) < lum && reads(p);
+        let deep = deep_ok(0.0).then(|| {
+            let hi = if deep_ok(Self::HOT) {
+                Self::HOT
+            } else {
+                bisect_edge(0.0, Self::HOT, deep_ok).0
+            };
+            (Self::COLD.min(hi), hi)
+        });
+        let pick = if dark {
+            bright.map(|b| (true, b)).or(deep.map(|d| (false, d)))
+        } else {
+            deep.map(|d| (false, d)).or(bright.map(|b| (true, b)))
+        };
+        let (bright, (lo, hi)) = pick.unwrap_or_else(|| {
+            // Neither side reads: the ramp end that comes closest.
+            if ratio(Self::TOP) >= ratio(0.0) {
+                (true, (Self::TOP, Self::TOP))
+            } else {
+                (false, (0.0, 0.0))
+            }
+        });
+        Self {
+            ground,
+            dark,
+            bright,
+            lo,
+            hi,
+        }
+    }
+
+    /// The ramp position at heat `t` (`0..=1`) with the metal's `breathe`:
+    /// rest at `lo`, full heat at `hi`, never below the rest point and never
+    /// past what the page allows (on the bright side the breath may ride up
+    /// to [`Self::TOP`]).
+    pub(super) fn at(self, t: f32, breathe: f32) -> f32 {
+        let ceiling = if self.bright { Self::TOP } else { self.hi };
+        (self.lo + (self.hi - self.lo) * t + breathe).clamp(self.lo, ceiling.max(self.lo))
+    }
+}
+
+/// The edge of a predicate that holds on `[lo, edge]` and fails past it, to
+/// well under one ramp step; the caller has checked it holds at `lo` and
+/// fails at `hi`. Returns the last point known to hold and the first known to
+/// fail.
+fn bisect_edge(mut lo: f32, mut hi: f32, holds: impl Fn(f32) -> bool) -> (f32, f32) {
+    for _ in 0..16 {
+        let mid = 0.5 * (lo + hi);
+        if holds(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo, hi)
 }

@@ -236,7 +236,7 @@ pub(crate) fn surface_event(opcode: u32, args: &[EventArg<'_>]) -> Option<Surfac
 
 /// The native-endian `u32`s of a `wl_array`.
 pub(crate) fn words(bytes: &[u8]) -> Vec<u32> {
-    bytes.chunks_exact(4).map(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]])).collect()
+    bytes.as_chunks::<4>().0.iter().map(|w| u32::from_ne_bytes(*w)).collect()
 }
 
 /// A protocol string, as text.

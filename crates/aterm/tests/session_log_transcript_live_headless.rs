@@ -7,13 +7,14 @@
 //!
 //! * A CLAUDE-SHAPED STAND-IN: a POSIX `sh` script run as `claude` via
 //!   `exec -a`, with `CLAUDE_CONFIG_DIR` in its own environment (the lifted
-//!   Claude home, addendum A25). On macOS the interpreter is a copy of
-//!   `/bin/bash` signed ad hoc: the kernel hides a platform binary's
-//!   environment from another process, so `/bin/sh` itself would hide the
-//!   home the footer reads. It writes its registry row under that home and
-//!   draws Claude Code's idle screen, or its busy one (ticking) while the
-//!   test's `busy` file exists. The test writes the transcript itself:
-//!   synthetic rows in Claude Code's shape, every value made up.
+//!   Claude home, addendum A25). On macOS the interpreter is the kept
+//!   stand-in of `/bin/bash`, signed ad hoc and run in place: the kernel
+//!   hides a platform binary's environment from another process, so
+//!   `/bin/sh` itself would hide the home the footer reads. It writes its
+//!   registry row under that home and draws Claude Code's idle screen, or
+//!   its busy one (ticking) while the test's `busy` file exists. The test
+//!   writes the transcript itself: synthetic rows in Claude Code's shape,
+//!   every value made up.
 //! * HISTORY IS NEVER REPLAYED (S1): the transcript holds 20 turns before the
 //!   stand-in starts; the log says so once (`source field=transcript …
 //!   skipped=<its length>`) and holds no turn of them.
@@ -21,10 +22,11 @@
 //!   names it (`amend … vref=`, exactly one turn per vref, S30), its Bash
 //!   step opens and closes (`await log kind=tool` returns), and the idle
 //!   screen's settle closes the turn (`await log close=turn` returns).
-//! * THE CLAUSE (plan §5, rulings S11; `[session_log] clause = true` and the
-//!   in-grid strip, whose menu `open tab-menu` reads headless): the tab's
-//!   menu says `now: running shell` while the step is open, and a `ctl`
-//!   client's label shows in `log`, never in the menu.
+//! * THE CLAUSE (plan §5, rulings S11; on by default since D6, so the config
+//!   names no `[session_log]`; the in-grid strip, whose menu `open tab-menu`
+//!   reads headless): the tab's menu says `now: running shell` while the
+//!   step is open, and a `ctl` client's label shows in `log`, never in the
+//!   menu.
 //! * NO TRANSCRIPT TEXT (S6, D5 decision B): no prompt, reply, tool input or
 //!   result word reaches `log` at either tier, `brief`, the menu, or any file
 //!   under the instance's scratch world outside the Claude home.
@@ -115,17 +117,15 @@ fn busy() -> Vec<String> {
     r
 }
 
-/// The stand-in's interpreter under `root`: on macOS a copy of `/bin/bash`
-/// signed ad hoc (module doc, `aterm_uds::deadline::ad_hoc_copy`), elsewhere
-/// `/bin/sh`.
-fn interpreter(root: &Path) -> PathBuf {
+/// The stand-in's interpreter: on macOS the kept stand-in of `/bin/bash`,
+/// signed ad hoc and run in place (module doc, `aterm_uds::deadline::stand_in`:
+/// nothing removes it, so no instance's teardown can unlink it while macOS
+/// still assesses its first exec), elsewhere `/bin/sh`.
+fn interpreter() -> PathBuf {
     if !cfg!(target_os = "macos") {
         return PathBuf::from("/bin/sh");
     }
-    let copy = root.join("bin").join("claude-sh");
-    std::fs::create_dir_all(copy.parent().expect("a parent")).expect("bin dir");
-    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &copy);
-    copy
+    aterm_uds::deadline::stand_in(Path::new("/bin/bash"))
 }
 
 /// The tab menu's rows as `controls tab-menu` reads them after `open
@@ -276,14 +276,12 @@ fn session_log_transcript_live_headless() {
         "atslt",
         |root, cmd| {
             // The in-grid strip (its menu is what `open tab-menu` reads
-            // headless) and the clause, at the config's top and its end.
+            // headless), at the config's top; the clause is the default's.
             let path = root.join("cfg/aterm/aterm.toml");
             let base = std::fs::read_to_string(&path).expect("the scratch config");
-            std::fs::write(
-                &path,
-                format!("tab_strip_rows = 1\n{base}[session_log]\nclause = true\n"),
-            )
-            .expect("write the scratch config");
+            assert!(!base.contains("[session_log]"), "the clause's default");
+            std::fs::write(&path, format!("tab_strip_rows = 1\n{base}"))
+                .expect("write the scratch config");
             cmd.args(["--lines", "40", "--columns", "120"]);
         },
         |_| true,
@@ -299,7 +297,7 @@ fn session_log_transcript_live_headless() {
     std::fs::write(dir.join("busy.scr"), render(&busy())).expect("busy.scr");
     let script = inst.tmp.join("claude.sh");
     std::fs::write(&script, STANDIN).expect("the stand-in");
-    let sh = interpreter(&inst.tmp);
+    let sh = interpreter();
     let projects = claude
         .join("projects")
         .join(aterm_agent::harness::footer::project_slug(&work));

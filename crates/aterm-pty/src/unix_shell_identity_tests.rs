@@ -502,9 +502,11 @@ fn a_quit_after_wait_for_reaps_leaves_no_hup_ignoring_shell() {
 /// controlling terminal's foreground group). A plain foreground job in its own
 /// group, as a job-control shell runs one, dies of that; one that ignores
 /// SIGHUP (`nohup`, `trap '' HUP`) has opted out and outlives the close, as it
-/// does in kitty and WezTerm (run 2026-10-19, macOS 27.0.1, zsh 5.9) and in
-/// Terminal.app and iTerm2 (their close replayed): the same five survivors
-/// and two deaths in each. The plain
+/// does in kitty and WezTerm (run 2026-10-19, macOS 27.0.1, zsh 5.9: seven
+/// jobs, five survivors and two deaths) and in Terminal.app and iTerm2 3.6.11
+/// (each closed and quit, run 2026-10-19 and 2026-10-20: eight jobs, a
+/// background `nohup` one added, six survivors and the same two deaths, the
+/// plain foreground and background jobs). The plain
 /// job is the negative control: it shows the close reaches the job's group, so
 /// the survivor is the job's own choice. RED with a teardown that also kills
 /// the terminal's foreground group (the alternative the rule rejects, which

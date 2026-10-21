@@ -1210,39 +1210,59 @@ pub fn harness_upgrade_work_end_model() -> Model {
 /// the owner told there), and this tab waits on it, typing nothing; the login comes back there
 /// (`OtherBack`: `elsewhere` 2), and this tab's turn is delivered again (`Continue` at its wall:
 /// the model's answer is its lift), or that tab closes with its sign-in unfinished
-/// (`OtherGone`), and this tab's `/login` is the login's. More ghosts: `stranded` (a session
-/// left on a dead login, continued or
-/// signed in, while a renewed one stood ready), `checked` (a check run under an idle login,
-/// which spends its single-use refresh token: the login dies), `silent` (the supervisor rested
+/// (`OtherGone`), and this tab's `/login` is the login's. The login may come back in another
+/// tab while this tab's own `/login` carries its sign-in, too (`BackElsewhere`: the owner signed
+/// in there, this tab's dialog standing or left; the review of the login carry, 2026-10-20, whose
+/// carrier never read it back): its turn is delivered again all the same — or, a renewal
+/// standing, it moves onto the renewed login (`Relaunch`) — and nobody is told to sign in a login
+/// that is back: while aterm's dialog still stands, the owner is told to close it (`TellClose`;
+/// it takes no keys of the loop's, and its picker is answered by nobody), and the turn goes once
+/// it is left (`Dismiss`). A renewal made while aterm's `/login` was up is followed once that
+/// `/login` is left (`Relaunch` at `Login interrupted`), never told as a sign-in to make again:
+/// while its dialog stands the owner is told to close it (`TellClose`) and its picker is answered
+/// by nobody (the review of the login carry, acct3-3: the dialog asked for a browser sign-in that
+/// would bring back the replaced login). More ghosts: `stranded` (a session left on a dead login, continued or signed in,
+/// while a renewed one stood ready), `checked` (a check run under an idle login, which spends its
+/// single-use refresh token: the login dies), `silent` (the supervisor rested
 /// at a lost login with nothing typed and nobody told), `relooped` (`/login` typed again into a
 /// loss its `/login` already met), `guessed` (a method picked that nothing said the session
 /// uses), `overrode` (`/login` typed into a loss a person's own `/login` left), `overpicked` (a
 /// person's own picker answered), `doubled` (`/login` typed while another tab carries the
-/// login's sign-in, or after it came back there).
+/// login's sign-in, or after it came back there, or once a renewal replaced it), `misled` (the
+/// owner told now to sign in a login that came back in another tab), `reasked` (the owner told now
+/// to sign in at aterm's dialog over a renewal).
 ///
 /// Properties: `NoNoticeAtTheWall`, `NoGiveUpUnread`, `NoFutileContinue`, `TheOwnerIsToldFirst`,
 /// `NoSessionLeftOnADeadLogin`, `NoCheckUnderAnIdleLogin`, `NoLostLoginLeftSilent`,
 /// `LoginTypedOncePerLoss`, `NoMethodGuessed`, `NoLoginOverAPersonsCancel`,
-/// `NoPersonsPickerAnswered`, `OneSignInPerLogin`. One knob per defect, each caught alone: `NoGate`
-/// (the upgrade's gate misses the wall), `NoRefund` (a notice the wall answered is counted and
-/// given up on), `ClockAtWall` (the window runs at the wall and the lift does not restart it),
-/// `NoSee` (the supervisor's reader misses the wall), `NoHold` (a lost login is continued once
-/// its row leaves the screen), `WaitOnRoster` (v0.106.0: a rostered login is waited at, nothing
-/// typed and nobody told), `NoFollow` (a renewed login is not followed: the session continues or
-/// signs in the dead one), `CheckIdle` (the renewal checks the idle login it replaces),
-/// `NoDoneWall` (v0.106.0: a wall over a finished task is no point, nothing typed and nobody
-/// told), `GraceHolds` (the prompt's own key holds `/login` as a person's), `Relogin` (`/login`
-/// typed again after `Login interrupted`), `GuessMethod` (the picker answered with no method
-/// known), `ReloginOverLeft` (`/login` typed after a person's own was left), `PickAnyPicker`
+/// `NoPersonsPickerAnswered`, `OneSignInPerLogin`, `NoSignInAskedOfALoginBack`,
+/// `NoSignInAskedOverARenewal`. One knob per defect, each caught alone: `SignInOverBack` (the
+/// review of the login carry, 2026-10-20: the sign-in notice of aterm's dialog stands over a login
+/// back in another tab), `SignInOverRenewed` (acct3-3: it stands over a renewal made while it was
+/// up), `PickAfterBack` (aterm's picker answered after the login came back elsewhere or was
+/// renewed: a browser sign-in nobody needs), `NoFollowAfterLogin` (a renewal made while aterm's `/login` was up is not followed
+/// once it is left: the owner is told to sign the replaced login in again), `NoGate` (the upgrade's gate misses the wall), `NoRefund` (a notice
+/// the wall answered is counted and given up on), `ClockAtWall` (the window runs at the wall and
+/// the lift does not restart it), `NoSee` (the supervisor's reader misses the wall), `NoHold` (a
+/// lost login is continued once its row leaves the screen), `WaitOnRoster` (v0.106.0: a rostered
+/// login is waited at, nothing typed and nobody told), `NoFollow` (a renewed login is not followed:
+/// the session continues or signs in the dead one), `CheckIdle` (the renewal checks the idle login
+/// it replaces), `NoDoneWall` (v0.106.0: a wall over a finished task is no point, nothing typed and
+/// nobody told), `GraceHolds` (the prompt's own key holds `/login` as a person's), `Relogin`
+/// (`/login` typed again after `Login interrupted`), `GuessMethod` (the picker answered with no
+/// method known), `ReloginOverLeft` (`/login` typed after a person's own was left), `PickAnyPicker`
 /// (any `/login`'s picker answered, a person's own included), `NoLatch` (each tab types its own
-/// `/login`). The dials, each a family whose space stays inside the interpreter's budget (ten
-/// defects at once, or four, outran it): `Buggy = 1` the upgrade's three (`NoGate`, `NoRefund`,
-/// `ClockAtWall`), `2` the supervisor's reader (`NoSee`, `NoHold`), `3` v0.106.0's walls and the
-/// renewal (`WaitOnRoster`, `NoFollow`, `CheckIdle`, `NoDoneWall`, `GraceHolds`), `4` `/login`
-/// typed again (`Relogin`, `ReloginOverLeft`), `5` a picker answered (`GuessMethod`,
-/// `PickAnyPicker`), `6` a second sign-in (`NoLatch`). Tier-1:
-/// aterm-agent's `conformance_login_wall`, over the real readers, reducer, turn-end decider,
-/// exception, picker gate and policy and renewal on every reachable state.
+/// `/login`), `NoCarrierBack` (a tab whose loss had a `/login` never reads the login back from
+/// another tab: its turn stays stopped under the notice of a sign-in). The dials, each a family
+/// whose space stays inside the interpreter's budget (ten defects at once, or four, outran it):
+/// `Buggy = 1` the upgrade's three (`NoGate`, `NoRefund`, `ClockAtWall`), `2` the supervisor's
+/// reader (`NoSee`, `NoHold`), `3` v0.106.0's walls and the renewal (`WaitOnRoster`, `NoFollow`,
+/// `CheckIdle`, `NoDoneWall`, `GraceHolds`), `4` `/login` typed again (`Relogin`,
+/// `ReloginOverLeft`), `5` a picker answered (`GuessMethod`, `PickAnyPicker`), `6` one sign-in per
+/// login (`NoLatch`, `NoCarrierBack`), `7` a sign-in asked over a renewal (`SignInOverRenewed`).
+/// Tier-1: aterm-agent's `conformance_login_wall`, over the
+/// real readers, reducer, turn-end decider, exception, picker gate and policy and renewal on every
+/// reachable state.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_login_wall_model() -> Model {
@@ -1264,6 +1284,11 @@ pub fn harness_login_wall_model() -> Model {
             const ReloginOverLeft = 0;
             const PickAnyPicker = 0;
             const NoLatch = 0;
+            const NoCarrierBack = 0;
+            const SignInOverBack = 0;
+            const PickAfterBack = 0;
+            const NoFollowAfterLogin = 0;
+            const SignInOverRenewed = 0;
             const MaxAsks = 2;
             var login = 1;
             var wall = 0;
@@ -1299,6 +1324,8 @@ pub fn harness_login_wall_model() -> Model {
             var overpicked = 0;
             var elsewhere = 0;
             var doubled = 0;
+            var misled = 0;
+            var reasked = 0;
 
             // The account and the session, as they please: the login goes; a turn someone else
             // began (a background completion, a /loop wakeup) is answered by the wall, or the
@@ -1338,7 +1365,7 @@ pub fn harness_login_wall_model() -> Model {
                 };
                 dark = if ((Buggy == 0 || Buggy > 1) && ClockAtWall == 0) { 0 } else { dark };
             }
-            action Dismiss when (track == 1 && wall == 1 && login == 0) {
+            action Dismiss when (track == 1 && wall == 1 && (login == 0 || elsewhere == 2)) {
                 wall = 0;
                 picker = 0;
             }
@@ -1374,6 +1401,14 @@ pub fn harness_login_wall_model() -> Model {
             action OtherGone when (elsewhere == 1) {
                 elsewhere = 0;
                 told = if (track == 0) { 0 } else { told };
+            }
+            // …or the owner signs the login in in another tab while this tab's
+            // own `/login` carries its sign-in (its dialog standing, or left).
+            action BackElsewhere when (
+                track == 1 && login == 0 && elsewhere == 0 && back == 0 && renewed == 0
+            ) {
+                login = 1;
+                elsewhere = 2;
             }
             // A state an older build left: it gave up on every notice, each answered by the wall.
             action Inherit when (phase == 0 && asks == 0 && inherited == 0 && stood == 1) {
@@ -1431,12 +1466,40 @@ pub fn harness_login_wall_model() -> Model {
             }
             // The owner told now (the exception the host asks on the glass, not escalated)
             // wherever the rest of the loss is theirs: a `/login` left (aterm's, or a person's
-            // own with no renewed login to move onto) until the login is back. The sign-in
-            // `/login` opened in the browser is told with it (`TypeLogin` sets `told`); a
-            // `/login` about to be typed, a move and its wait tell nothing: aterm is still at
-            // it.
+            // own with no renewed login to move onto) until the login is back, here or in
+            // another tab (`NoCarrierBack`: the notice of a sign-in stands over a login back
+            // there). The sign-in `/login` opened in the browser is told with it (`TypeLogin`
+            // sets `told`); a `/login` about to be typed, a move and its wait tell nothing:
+            // aterm is still at it.
+            //
+            // Not at aterm's `/login` left once a renewal stood ready: the tab moves onto the
+            // renewed login (`Relaunch`; `NoFollowAfterLogin`: the owner is told to sign the
+            // login it replaced in again, a second sign-in for one loss). Nor while that
+            // `/login`'s dialog stands over a renewal: nothing is left to sign in there
+            // (`TellClose`; `SignInOverRenewed`: the dialog's sign-in notice stands, a browser
+            // sign-in that would bring back the login the renewal replaced).
             action TellNow when (
-                back == 0 && (track == 1 || (left == 1 && renewed == 0))
+                back == 0 && (track == 1 || (left == 1 && renewed == 0)) &&
+                (elsewhere <= 1 || Buggy == 6 || NoCarrierBack == 1 ||
+                    (wall == 1 && track == 1 && SignInOverBack == 1)) &&
+                (track == 0 || renewed == 0 ||
+                    (wall == 1 && (SignInOverRenewed == 1 || Buggy == 7)) ||
+                    (wall == 0 && NoFollowAfterLogin == 1))
+            ) {
+                misled = if (elsewhere == 2) { 1 } else { misled };
+                reasked = if (track == 1 && wall == 1 && renewed == 1) { 1 } else { reasked };
+                stranded = if (track == 1 && wall == 0 && renewed == 1) { 1 } else { stranded };
+                told = 1;
+            }
+            // The login back in another tab, or a renewal made, while aterm's own `/login`
+            // dialog still stands here: nothing is left to sign in, and the owner is told to
+            // close the dialog (it takes no keys of the loop's), never to finish a sign-in
+            // (`SignInOverBack`, `SignInOverRenewed`: the dialog's sign-in notice stands over
+            // the login back, or over the renewal).
+            action TellClose when (
+                back == 0 && track == 1 && wall == 1 &&
+                ((elsewhere == 2 && SignInOverBack == 0) ||
+                    (renewed == 1 && SignInOverRenewed == 0))
             ) {
                 told = 1;
             }
@@ -1450,21 +1513,33 @@ pub fn harness_login_wall_model() -> Model {
             }
             // The picker answered with the method the session's login already is; with none
             // known, it is left to the owner (`GuessMethod`: a method is picked anyway).
+            // Not once the login came back in another tab, nor once a renewal replaced it:
+            // nothing is left to sign in, and a method picked opens a browser sign-in nobody
+            // needs (`PickAfterBack`).
             action PickMethod when (
-                (picker == 1 && (known == 1 || Buggy == 5 || GuessMethod == 1)) ||
+                (picker == 1 && ((elsewhere <= 1 && renewed == 0) || PickAfterBack == 1) &&
+                    (known == 1 || Buggy == 5 || GuessMethod == 1)) ||
                 (picker == 2 && (Buggy == 5 || PickAnyPicker == 1))
             ) {
+                doubled = if (picker == 1 && (elsewhere == 2 || renewed == 1)) {
+                    1
+                } else {
+                    doubled
+                };
                 guessed = if (picker == 1 && known == 0) { 1 } else { guessed };
                 overpicked = if (picker == 2) { 1 } else { overpicked };
                 picker = 0;
             }
             // Renewed: a session at its wall is relaunched under the renewed login (its
-            // continuation follows) — not through a `/login` already typed there, whose
-            // sign-in is the owner's to finish; the old login back in another tab meanwhile
-            // holds none of it — …
+            // continuation follows) — not through a `/login` dialog of aterm's still standing
+            // there, whose sign-in is the owner's to finish or leave (it takes no keys of the
+            // loop's); once that `/login` is left, its sign-in is over and the tab moves
+            // (`NoFollowAfterLogin`: not then, short of the login back in another tab, which
+            // leaves it nothing to sign in); the old login back there meanwhile holds none of
+            // it (the relaunch ends this tab's loss, its track included) — …
             action Relaunch when (
                 renewed == 1 && (wall == 1 || stood == 1) && (login == 0 || elsewhere == 2) &&
-                track == 0 &&
+                (track == 0 || (wall == 0 && (elsewhere == 2 || NoFollowAfterLogin == 0))) &&
                 (Buggy <= 2 || Buggy > 3) && NoFollow == 0
             ) {
                 login = 1;
@@ -1476,6 +1551,7 @@ pub fn harness_login_wall_model() -> Model {
                 picker = 0;
                 left = 0;
                 elsewhere = 0;
+                track = 0;
                 window = if (phase == 1 && ClockAtWall == 0) { 0 } else { window };
                 dark = if (ClockAtWall == 0) { 0 } else { dark };
             }
@@ -1489,12 +1565,16 @@ pub fn harness_login_wall_model() -> Model {
             }
             // At a point it reads no wall at, a continuation, never while a lost login's track
             // stands and the screen does not say it is back (`NoHold`: it does), nor while a
-            // renewed login stands ready (`NoFollow`: it continues on the dead one). Answered by
-            // the model, the login is back, the track ends and the notices are read; answered by
-            // the wall, its row and the transcript's word.
+            // renewed login stands ready (`NoFollow`: it continues on the dead one). The login
+            // back in another tab is this tab's lift whoever's `/login` this loss had — its own
+            // or a person's, left or standing (`NoCarrierBack`: only a tab that typed none is
+            // delivered). Answered by the model, the login is back, the track ends and the
+            // notices are read; answered by the wall, its row and the transcript's word.
             action Continue when (
-                (wall == 0 || elsewhere == 2 || Buggy == 2 || NoSee == 1) &&
-                ((track == 0 && left == 0) || back == 1 || Buggy == 2 || NoHold == 1) &&
+                (wall == 0 || (elsewhere == 2 && track == 0) || Buggy == 2 || NoSee == 1) &&
+                ((track == 0 && left == 0) || back == 1 ||
+                    (elsewhere == 2 && (Buggy <= 5 || Buggy > 6) && NoCarrierBack == 0) ||
+                    Buggy == 2 || NoHold == 1) &&
                 (renewed == 0 || Buggy == 3 || NoFollow == 1)
             ) {
                 futile = if (login == 0 && stood == 1) { 1 } else { futile };
@@ -1608,6 +1688,8 @@ pub fn harness_login_wall_model() -> Model {
             invariant NoLoginOverAPersonsCancel: overrode == 0;
             invariant NoPersonsPickerAnswered: overpicked == 0;
             invariant OneSignInPerLogin: doubled == 0;
+            invariant NoSignInAskedOfALoginBack: misled == 0;
+            invariant NoSignInAskedOverARenewal: reasked == 0;
         }
     }
 }

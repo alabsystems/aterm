@@ -51,9 +51,11 @@ macro_rules! bind {
                 self.effects.is_active()
             }
 
-            /// Milliseconds until the next rain engine tick, or `undefined` when
-            /// active frame-rate motion needs rAF (and when every effect is idle).
-            pub fn effects_next_deadline_ms(&self) -> Option<f64> {
+            /// Milliseconds until the next engine wake (a rain tick, a settling
+            /// cursor's next step), or `undefined` when active frame-rate motion needs
+            /// rAF (and when every effect is idle). `&mut`: a settling rainbow caret's
+            /// step is a memoised dry run of its tick.
+            pub fn effects_next_deadline_ms(&mut self) -> Option<f64> {
                 self.effects.next_deadline_ms()
             }
 
@@ -109,11 +111,17 @@ macro_rules! bind {
                 true
             }
 
-            /// Configure the cursor aurora with the native knobs and clamps: `style` ∈
-            /// `lumen|phaser|rainbow kitty|sparkle|fire|laser|beam|water|comet` (unknown →
-            /// lumen); `color`/`accent` omitted derive from the theme cursor (accent = color
-            /// brightened 1.5×); `duration_ms` 30..=2000, `length` (cells) 1..=512,
-            /// `intensity` 0..=1 (0 = off), `radius` (cells) 0..=2, `ring` = landing-ring ping.
+            /// Configure the cursor aurora with the native knobs and clamps: `style` is any
+            /// native `cursor_trail_style` spelling, read through the native table
+            /// (`aterm_effects::cursor_glow::spellings`), aliases included (`rainbow kitty`,
+            /// `nyan`, `lightning`, …); `off` draws nothing and an unknown spelling draws
+            /// lumen. `color` omitted follows the native colour law
+            /// (`aterm_effects::cursor_fx::automatic_glow_color`): laser, beam, comet and
+            /// sparkle keep their own hues (beam, comet and sparkle wear a live OSC 12), every
+            /// other style the live cursor colour; `accent` omitted = color brightened 1.5×;
+            /// `duration_ms` 30..=2000, `length` (cells) 1..=512, `intensity` 0..=1 (0 = off;
+            /// dims the aurora and every caret body), `radius` (cells) 0..=2, `ring` =
+            /// landing-ring ping.
             #[allow(clippy::too_many_arguments)]
             pub fn set_cursor_glow(
                 &mut self,
@@ -143,8 +151,9 @@ macro_rules! bind {
             }
 
             /// Configure the opaque comet trail (native `cursor_trail_style = "comet"`).
-            /// `color` omitted = the theme cursor; `duration_ms` 30..=2000, `length` 1..=512.
-            /// The native app runs one of trail or glow per style; here the embedder chooses.
+            /// `color` omitted follows the live cursor (OSC 12, else the theme cursor);
+            /// `duration_ms` 30..=2000, `length` 1..=512. The native app runs one of trail or
+            /// glow per style; here the embedder chooses.
             pub fn set_cursor_trail(
                 &mut self,
                 enabled: bool,

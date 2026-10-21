@@ -52,13 +52,42 @@
 > `src/tests.rs` and the IOKit declaration probe in `tests/iokit_sdk.rs`. Their specs are not recovered
 > here yet; the tables below still state the 15 specs over the 14 tests that predate them (the volume
 > tests, which joined on 2026-10-17 with `volumes`, are not recovered either).
+>
+> Later on 2026-10-19 the job probe joined (`jobs`: `JobsReader`, the macOS arm through libproc and
+> `sysctl(KERN_PROC_PID)`, the Linux arm under a root; the pure `jobs::darwin` layout decoders, the
+> `jobs::linux` parsers, `tail_allowed`, `tail_has_lf`), and the sweep gained group, uid, state and the
+> session and terminal flags, a zombie's row coming from `kinfo_proc`. Its 16 tests are in
+> `src/jobs/tests.rs` (13 run on every host or every Unix; 3 need macOS and read the live host: this
+> process's own reading, both lanes' self-checks, a stopped and a zombie child) and the layout probe in
+> `tests/proc_info_sdk.rs` (a green run and its negative control). Their specs are not recovered here
+> yet either.
+>
+> On 2026-10-20 the Stats Deck v2 readers joined: `net_links` (the macOS arm decoding
+> `NET_RT_IFLIST2` through the pure `iflist::{links_of, dl_name, kind_of_functional, link_kind,
+> read_growing}`, the Linux arm `linux::links_under` over the pure `linux::{net_dev, hex_flags,
+> link_up, speed_bps, sys_kind}`), the pure `counts_toward_machine` and `machine::kind_by_name`, `process_limits` (with the pure
+> `machine::{smaller, rlimit_ceiling}`) and `load_average`; the sweep gained each process's disk bytes
+> and `gpu` the driver's allocation and recovery count. Their tests are 6 in `src/iflist.rs` (every
+> host) and 9 in `src/tests.rs` (6 on every host, 3 that read the live host), and the layout probe in
+> `tests/iflist_sdk.rs` (a green run and its negative control). Their specs are not recovered here yet
+> either.
+>
+> On 2026-10-20 `stdin_sharers` (the members of a group that read its leader's own input device: a
+> program an agent handed its terminal to, which a bare Ctrl-R/Ctrl-S then reaches) and its Linux
+> parser `linux::children` joined, with a spec and a test each: the tables below state 17 specs over
+> 16 tests.
 
-Source: `crates/aterm-sysprobe`. Every `#[test]` is in `crates/aterm-sysprobe/src/tests.rs` (14 tests: 8 run
-on every host, 1 needs `unix`, 1 needs `macos` or `linux`, 4 need `macos`). Each was read together with the
+Source: `crates/aterm-sysprobe`. Every `#[test]` is in `crates/aterm-sysprobe/src/tests.rs` (16 tests: 9 run
+on every host, 1 needs `unix`, 1 needs `macos` or `linux`, 5 need `macos`). Each was read together with the
 code it reaches in `src/lib.rs`, `src/linux.rs` and `src/macos.rs`. Nothing was compiled or run for this
 file. The claims come from reading the code.
 
-Result: **15 specs**, covering **14 tests**. Every test is a spec sample (§4).
+Result: **17 specs**, covering **16 tests**. Every test is a spec sample (§4).
+
+> 2026-10-20: `procargs-parse` (the workspace's one `KERN_PROCARGS2` reader and parser,
+> `procargs`, which `kproc`, atpkg, aterm-gui and aterm-uds' `process` read through; aterm-uds
+> re-exports it) moved here from aterm-uds with its tests (`src/procargs_tests.rs`). The counts
+> below were taken before.
 
 ## 0. Notation used in the statements
 
@@ -96,47 +125,50 @@ pressure-level-table	table-property	pressure_of	∀ level: i64: pressure_of(leve
 used-mib-of	contract	used_mib_of	∀ internal, purgeable, wired, compressor, page: used_mib_of(...) = None if page = 0. Otherwise, with pages = (internal sat- purgeable) + wired + compressor, it is u32::try_from((pages sat* page) >> 20).ok(). requires (no panic): the two plain additions do not overflow u64 (§5). The result is not capped at physical memory.	T::memory_in_use_is_counted_from_the_vm_pages	u64 scalar arithmetic, saturating ops, unchecked add, u32::try_from; seal 150efe4a: E6 refuses (Option<u32> return, saturating calls, Assert)	0,1,3
 available-mib-of	contract	available_mib_of	∀ free, inactive, purgeable, page, physical: available_mib_of(...) = None if page = 0. Otherwise it is Some(min(((free sat+ inactive sat+ purgeable) sat* page) >> 20, physical)), where the min applies only when physical is Some. Corollary: the result never exceeds physical when physical is known.	T::memory_available_is_free_inactive_and_purgeable_pages	u64 scalar arithmetic, Option<u64> map_or with a closure	0,1,3,13
 swap-meter-rate	refinement	SwapMeter::new, SwapMeter::observe	State (base: Option<(Instant,u64)>, rate: Option<u32>), with new() = (None, None). observe(at, kib): kib = None resets to (None, None) and returns None. With no base, it sets base = (at, kib) and returns None. Otherwise let span = at sat- base_at. If span > SWAP_SPAN_MAX, the state becomes (Some((at,kib)), None) and observe returns None. If span < SWAP_SPAN_MIN, the state is unchanged and observe returns rate. Otherwise r = min(u32::MAX, ((kib sat- base_kib) sat* 1000) div max(1, span_ms)), the state becomes (Some((at,kib)), Some(r)), and observe returns Some(r). Corollaries: a counter that went backwards gives rate 0; a second reader within SWAP_SPAN_MIN repeats the last rate; a rate is never taken over a span longer than SWAP_SPAN_MAX.	T::the_swap_meter_reads_a_rate_over_a_span_of_its_readings	&mut self two-state, Option<(Instant,u64)>, Duration comparison/as_millis (u128), try_from	0,1,2,3
-process-cwd-path-own	other	process_cwd, process_path, macos::process_cwd, macos::process_path	Effects(proc_pidinfo/proc_pidpath, or /proc/<pid>/{cwd,exe}). ∀ pid: process_cwd(pid) = Some(p) ⇒ p is absolute and equals the OS's current-directory path for pid. process_path(pid) = Some(p) ⇒ p is absolute and equals the OS's executable path for pid (truncated to PATH_CAP bytes on macOS). process_cwd(0) = process_path(0) = None, and both are None for pid > i32::MAX (on macOS pid is filtered to 0 < pid ≤ i32::MAX). Every platform but macOS and Linux answers None.	T::a_processs_working_directory_and_executable_are_its_own	FFI, unsafe zeroed structs, OsStr from bytes, PathBuf, fs::read_link	0,1,8
+process-cwd-path-own	other	process_cwd, process_path, macos::process_cwd, macos::process_path	Effects(proc_pidinfo/proc_pidpath, or /proc/<pid>/{cwd,exe}). ∀ pid: process_cwd(pid) = Some(p) ⇒ p is absolute and equals the OS's current-directory path for pid. process_path(pid) = Some(p) ⇒ p is absolute and equals the OS's executable path for pid (truncated to PATH_CAP bytes on macOS). process_cwd(0) = process_path(0) = None, and both are None for pid > i32::MAX (on macOS pid is filtered to 0 < pid ≤ i32::MAX). On Windows process_cwd reads the process environment block's CurrentDirectory (peb::cwd: Effects(OpenProcess, NtQueryInformationProcess, ReadProcessMemory)), spelled as the process's own GetCurrentDirectoryW answers it (no trailing separator but at a root), None for a process that refuses PROCESS_VM_READ or has exited (peb::tests::a_processs_working_directory_is_read_from_its_environment_block); process_path answers None there. Every other platform answers None.	T::a_processs_working_directory_and_executable_are_its_own	FFI, unsafe zeroed structs, OsStr from bytes, PathBuf, fs::read_link	0,1,8
 group-memory-members	other	group_memory, macos::group_memory, macos::footprint_kib	Effects(libproc). ∀ pid: group_memory(pid) = None if pid = 0, if pid > i32::MAX, if the short info is unreadable, if pgid = 0, or if no member was measured. Otherwise it is Some{pgid = pbsi_pgid(pid), measured = the number of the first min(n, MAX_GROUP_PIDS) listed group members > 0 whose footprint_kib is Some, footprint_mib = (sat-sum of those footprint_kib)/1024}, where footprint_kib(m) = proc_pid_rusage(m, RUSAGE_INFO_V4).ri_phys_footprint / 1024 when the call succeeds. So a child that took its own process group is never counted in its parent's group. On every platform but macOS it is always None.	T::a_groups_memory_is_its_own_members_footprint	FFI proc_listpids into a fixed array, unsafe, loop with a saturating sum	0,7,8
 machine-memory-within-physical	other	physical_memory_mib, machine_memory, memory_pressure, macos::machine_memory, macos::physical_memory_mib, macos::memory_pressure	Effects(sysctl and HOST_VM_INFO64, or /proc/meminfo). machine_memory() = Some(m) ∧ physical_memory_mib() = Some(p) ⇒ m.available_mib ≤ p, and on Linux also m.used_mib ≤ p. On macOS used_mib ≤ p holds only empirically, because used_mib_of is not capped (§5). Pure cores: macOS uses available_mib_of(free, inactive, purgeable, page, physical) and used_mib_of(internal, purgeable, wire, compressor, page); Linux uses available = min(avail/1024, total/1024) and used = (total sat- avail)/1024 over meminfo-facts' (total, avail). physical_memory_mib is (hw.memsize >> 20).filter(> 0) on macOS and (total_kib ≥ 1024).then(total_kib/1024) on Linux. memory_pressure is kern.memorystatus_vm_pressure_level through pressure_of on macOS and None elsewhere.	T::the_machines_memory_and_pressure_are_read_on_this_host	FFI, OnceLock, composition of pure callees	0,4,8
 swapped-kib-counter	other	swapped_kib, macos::swapped_kib	Effects(HOST_VM_INFO64 and vm.pagesize, or /proc/vmstat and /proc/self/auxv). On macOS swapped_kib() = (swapins sat+ swapouts) sat* page_kib with page_kib = vm.pagesize div 1024, and None when that is 0 or unread or the kernel refuses the statistics. On Linux it is swap_pages(read_bounded(/proc/vmstat)) sat* page_kib, with page_kib = auxv_value(read_bounded_bytes(/proc/self/auxv), 6 = AT_PAGESZ) div 1024 when that is > 0, else 4, read once per process. Every other platform answers None. The kernel's counters only grow, so two reads k1 then k2 on one host satisfy k1 ≤ k2.	T::the_swap_counter_reads_on_this_host_and_never_runs_backwards	FFI, OnceLock, composition with swap-pages-sum and auxv-lookup	0,4,8
 stat-pgrp	contract	linux::stat_pgrp	∀ stat: stat_pgrp(stat) = the third whitespace token after the LAST ')' of stat, parsed as u32 (the pgrp field after state and ppid), or None when stat has no ')', fewer than three tokens follow it, or that token does not parse. So a command name holding spaces or ')' cannot move the field.	T::a_stat_line_gives_its_group_past_any_command_name	&str rsplit_once, iterator nth, u32 parse	0,1,3,5,7,13
 lone-group-leader	other	lone_group_leader, macos::lone_group_leader, macos::complete_lone_group, macos::short_info	Effects(libproc). macOS returns a nonempty kernel name only for a readable positive leader whose aligned, nonempty, nonfull listing contains exactly that one positive pid (zero padding permitted). Failed, empty, misaligned, full, overlong, absent-leader or extra-member listings return None. The pure complete_lone_group predicate enforces the listing rule and its test reads captured arrays only. Every non-macOS platform returns None: Linux direct children are not a complete group census. All observations are snapshots, without a process-lifetime guarantee.	T::only_a_complete_group_census_admits_its_leader	FFI proc_pidinfo and proc_listpids into fixed arrays; pure byte-count and membership adapter	0,7,8
+children-pids	contract	linux::children	∀ text: children(text) = the words w of text.split_inclusive(' ') that end in ' ' and whose w minus that space parses as u32, parsed, in order. So a pid cut at the 4 KiB cap (no closing space) is never read as a shorter pid, and a word that is not a pid is skipped.	T::a_children_text_names_only_the_pids_its_spaces_close	&str split_inclusive, strip_suffix, u32 parse, filter_map	0,1,3,5,7,13
+stdin-sharers	other	stdin_sharers, macos::stdin_sharers, macos::stdin_device, macos::short_info, linux_stdin_sharers	Effects(libproc, or /proc). macOS: stdin_sharers(l) = None if l = 0, l > i32::MAX, the short info is unreadable or names a group other than l, l's descriptor 0 is not a character device (proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO) answers other than the whole struct, or vst_mode is not S_IFCHR), or the group listing writes no bytes. Otherwise it is Some(the positive members ≠ l among the first min(n, MAX_GROUP_PIDS) listed whose descriptor 0 is a character device with l's (vst_dev, vst_ino)). Linux: the same over l's children read from /proc/l/task/*/children (children-pids) whose stat_pgrp is l and whose /proc/<pid>/fd/0 has l's (dev, ino), None when no children file was read. Every other platform answers None. A snapshot, without a process-lifetime guarantee.	T::a_leaders_input_is_shared_only_by_members_on_that_very_device	FFI proc_pidinfo, proc_listpids and proc_pidfdinfo into fixed arrays; the jobs::darwin::vnode decoder	0,7,8
+procargs-parse	contract	procargs::{parse,ProcArgs2::whole,ProcArgs2::env}	∀ buf: parse(buf) = None iff |buf| < 4, argc = i32 ne(buf[..4]) < 0, or no NUL ends the exec path after it; else exec_path = the bytes up to that NUL, and after skipping every NUL that follows it (an empty argv[0] reads as padding, as ps reads it) argv = the first min(argc, k) NUL-terminated words, k the number the buffer holds. whole ⇔ |argv| = argc. env = the NUL-terminated strings after the words up to the first empty one, and none when not whole. Nothing is reserved past 1024 words for any argc. read(pid) answers the kernel's whole record from one read into a kern.argmax + 4 buffer (a buffer sized by a size query races an exec, measured 2026-10-20), and None for an answer that fills it: a record past kern.argmax is handed over as its tail, never its start.	src/procargs_tests.rs::a_whole_answer_gives_the_path_the_words_and_the_environment, src/procargs_tests.rs::the_padding_is_skipped_whatever_its_length, src/procargs_tests.rs::an_argc_of_zero_reads_no_words_and_the_environment, src/procargs_tests.rs::a_cut_buffer_answers_the_words_it_holds_and_no_environment, src/procargs_tests.rs::a_buffer_without_its_header_is_no_answer, src/procargs_tests.rs::this_process_reads_back_as_it_was_exec_d, src/procargs_tests.rs::a_record_past_what_the_kernel_hands_over_reads_as_nothing	&[u8] slicing with get, position scans, i32 from_ne_bytes, a bounded Vec, an iterator closure over a cursor. read is the sysctl FFI.	0,1,3,5,7
 ```
 
 ### Kinds
 
 | kind | count | ids |
 |---|---|---|
-| contract | 7 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, used-mib-of, available-mib-of, stat-pgrp |
+| contract | 8 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, used-mib-of, available-mib-of, stat-pgrp, children-pids |
 | table-property | 1 | pressure-level-table |
 | invariant | 1 | whole-lines-torn-tail-ignored |
 | refinement | 1 | swap-meter-rate |
-| other (effectful host facts) | 5 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader |
+| other (effectful host facts) | 6 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers |
 
-Total: 7 + 1 + 1 + 1 + 5 = 15.
+Total: 8 + 1 + 1 + 1 + 6 = 17.
 
-### Gap histogram (number of the 15 specs each gap blocks)
+### Gap histogram (number of the 17 specs each gap blocks)
 
 | gap | specs blocked |
 |---|---|
-| 0 | 15 |
-| 1 | 10 |
+| 0 | 17 |
+| 1 | 12 |
 | 2 | 2 |
-| 3 | 9 |
+| 3 | 10 |
 | 4 | 3 |
-| 5 | 5 |
-| 7 | 8 |
-| 8 | 6 |
+| 5 | 6 |
+| 7 | 10 |
+| 8 | 7 |
 | 11 | 1 |
-| 13 | 6 |
+| 13 | 7 |
 
 Gaps 6, 9, 10, 12, 14, 15, 16 and 17 are not listed per spec. Gap 6 (plain-Rust clause publication) and
 gap 14 (Clean elaborator coverage) apply to every spec, depending on which lane discharges it, and gap 16
 (soundness) applies to every proof. No spec here cites another crate's types any more, so gap 12 blocks
 none.
 
-## 2. Test → spec map (TSV; all 14)
+## 2. Test → spec map (TSV; all 16)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
@@ -156,22 +188,26 @@ src/tests.rs	the_swap_counter_reads_on_this_host_and_never_runs_backwards	swappe
 src/tests.rs	the_swap_meter_reads_a_rate_over_a_span_of_its_readings	swap-meter-rate	
 src/tests.rs	a_stat_line_gives_its_group_past_any_command_name	stat-pgrp	
 src/tests.rs	only_a_complete_group_census_admits_its_leader	lone-group-leader	
+src/tests.rs	a_children_text_names_only_the_pids_its_spaces_close	children-pids	
+src/tests.rs	a_leaders_input_is_shared_only_by_members_on_that_very_device	stdin-sharers	
 ```
 
 ## 3. Coverage
 
-- 14 tests read. All 14 map to one of the 15 specs.
+- 16 tests read. All 16 map to one of the 17 specs.
 - One spec has no primary test of its own (`whole-lines-torn-tail-ignored`). It is sampled as a secondary
   part of `every_proc_read_is_bounded_to_4_kib`, whose primary spec is `read-bounded-cap`. That test is
   deleted only when both of its specs are proved.
 - Every spec has at most one primary test. The value of this crate's migration is the generalisation:
   each test samples one or two inputs of a total function over all inputs.
-- Four tests (3 `macos` ones and the `macos`/`linux` one) read the live host, and
-  `every_proc_read_is_bounded_to_4_kib` reads `/dev/zero` and files of its own. Their specs are the five
+- Five tests (4 `macos` ones and the `macos`/`linux` one) read the live host, and
+  `every_proc_read_is_bounded_to_4_kib` reads `/dev/zero` and files of its own. Their specs are the six
   `Effects(...)` rows. They retire only with a platform model (gap 8). Until then, the pure-core halves
   can be proved and the host test can be cut down to the effectful part. The new lone-group test exercises
   its production pure census adapter, not libproc. The unsafe child-process fixture was removed because
-  its cleanup did not run on assertion failure and could signal a recycled group id. The `unix` test builds its
+  its cleanup did not run on assertion failure and could signal a recycled group id. The stdin-sharers test
+  starts its `sleep`s through `spawnfd::command` and holds each in a guard that kills and reaps it by its
+  own unreaped pid, on a panic too, so it never signals a group. The `unix` test builds its
   auxiliary vector from fixed pairs and reads nothing of the host.
 
 ## 4. Tests that are not spec samples

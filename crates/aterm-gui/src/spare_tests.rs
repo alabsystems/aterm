@@ -287,6 +287,55 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     assert!(try_with(&mut app, &SpawnAsk::new(Some("/usr"), None), grid).is_ok());
 }
 
+/// A spare whose startup files have run and whose escape scan waits out its
+/// window (Verifying) is taken as a warming one is, through the warm tiers'
+/// gates; one still spawning is not. Its verdict, coming after, acts on no
+/// other spare. NEGATIVE CONTROL: with Verifying refused as `booked` again
+/// (before, a tab asked for in the grace after the mark went cold), the
+/// adoption fails.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_spare_verifying_its_run_is_taken_as_a_warming_one_is() {
+    let wid = WindowId(0);
+    let mut app = app_in("/tmp");
+    app.session_factory.shell_override = Some("/bin/zsh".to_owned());
+    let grid = app.spawn_grid(wid);
+    let plain = SpawnAsk::new(None, None);
+    let id = app.next_session_id;
+    app.next_session_id += 2;
+    app.spares.shared.generation.store(7, Ordering::Release);
+    app.spares.shared.eligible.store(true, Ordering::Release);
+    app.spares.slot = Some(parked_slot(&app, id, Some("/tmp")));
+    app.spares.slot.as_mut().unwrap().state = SlotState::Spawned;
+    let try_with = |app: &mut App| {
+        app.try_adopt_spare(wid, Some(wid), grid, &plain)
+            .map(|_| ())
+    };
+    assert_eq!(try_with(&mut app), Err("booked"), "still spawning");
+    app.spares.slot.as_mut().unwrap().state = SlotState::Verifying;
+    app.spares.shared.eligible.store(false, Ordering::Release);
+    assert_eq!(try_with(&mut app), Err("gate"), "a warm tier's gate");
+    app.spares.shared.eligible.store(true, Ordering::Release);
+    app.spares.shared.generation.store(8, Ordering::Release);
+    assert_eq!(try_with(&mut app), Err("stale"), "a warm tier's generation");
+    app.spares.shared.generation.store(7, Ordering::Release);
+    let (slot, session) = app
+        .try_adopt_spare(wid, Some(wid), grid, &plain)
+        .expect("adopted while it verifies");
+    assert_eq!(
+        (slot.id, session.id, slot.state),
+        (id, id, SlotState::Verifying)
+    );
+    // The next spare verifies in its turn; the adopted one's verdict leaves it.
+    app.spares.slot = Some(parked_slot(&app, id + 1, Some("/tmp")));
+    app.spares.slot.as_mut().unwrap().state = SlotState::Verifying;
+    app.on_spare_note(id, SpareNote::Verified(Verdict::Backoff("escaped")));
+    assert_eq!(
+        app.spares.slot.as_ref().map(|s| (s.id, s.state)),
+        Some((id + 1, SlotState::Verifying))
+    );
+}
+
 /// U3: a booking waits for a person, the boot grace, the settle after input,
 /// the replacement spacing, the hourly budget and a pressure episode; a
 /// session not at its prompt waits for its output (a held pane books in its
@@ -1115,15 +1164,11 @@ fn the_backstop_swallows_only_a_spares_own_wakes() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
-    // The copied fixture binaries are signed, which waits on trustd.
-    aterm_uds::deadline::require_trust_service();
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let shell = dir.path().join("sh");
-    let sleep = dir.path().join("sleep");
-    for (from, to) in [("/bin/sh", &shell), ("/bin/sleep", &sleep)] {
-        std::fs::copy(from, to).expect("copy the owned stand-in");
-        aterm_uds::deadline::sign_ad_hoc(to);
-    }
+    // Stand-ins of our own, whose environment the scan can read, run in
+    // place: never copies in `dir`, which goes when the test ends, while
+    // macOS may still assess a first exec (`aterm_uds::deadline::stand_in`).
+    let (shell, sleep) = (fixture_shell(), fixture_sleep());
     let mark = dir.path().join("daemon-pid");
     let release = dir.path().join("release-parent");
     let child = aterm_uds::spawnfd::command(&shell)
@@ -1141,7 +1186,7 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
         .env_clear()
         .env("HOME", dir.path())
         .env("PATH", "/usr/bin:/bin")
-        .env("ATERM_PARENT_SESSION_ID", "s-0123456789abcdef0123")
+        .env(aterm_types::domain::ENV_PARENT_SESSION_ID, FIXTURE_SID)
         .current_dir(dir.path())
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
@@ -1470,12 +1515,13 @@ fn a_pid_reaped_mid_scan_is_settled_by_a_later_listing() {
 /// daemon's read and its own) is not left to the kernel's timing: the scan's
 /// first read of the daemon is the daemon's real record from before its
 /// launcher was killed. NEGATIVE CONTROL: without the second read both scans
-/// are `Clean`; a stale daemon that cannot be read again leaves the scan
-/// `Unknown`, never `Clean`; the same tree read live is `Escaped`.
+/// are `Clean`; a stale daemon that cannot be read again, yet is still listed
+/// (a later listing says so), leaves the scan `Unknown`, never `Clean`; the
+/// same tree read live is `Escaped`.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_daemon_read_before_its_launcher_exited_is_read_again() {
-    let sid = "s-0123456789abcdef0123";
+    let sid = FIXTURE_SID;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let null = aterm_uds::spawnfd::Stdio::null;
     // The shell stand-in is born first: an adopted daemon is younger than it.
@@ -1493,20 +1539,13 @@ fn a_daemon_read_before_its_launcher_exited_is_read_again() {
         daemon: None,
     };
     let mark = dir.path().join("daemon-pid");
-    let launcher = aterm_uds::spawnfd::command("/bin/sh")
+    let launcher = fixture_command(&fixture_shell())
         .arg("-c")
         .arg(r#""$1" 600 & printf '%s\n' "$!" > "$2"; exec "$1" 600"#)
         .arg("launcher")
-        .arg("/bin/sleep")
+        .arg(fixture_sleep())
         .arg(&mark)
-        .env_clear()
-        .env("HOME", dir.path())
-        .env("PATH", "/usr/bin:/bin")
-        .env("ATERM_PARENT_SESSION_ID", sid)
         .current_dir(dir.path())
-        .stdin(null())
-        .stdout(null())
-        .stderr(null())
         .process_group(0)
         .spawn()
         .expect("spawn the launcher");
@@ -1621,10 +1660,49 @@ fn a_daemon_read_before_its_launcher_exited_is_read_again() {
     );
     assert_eq!(
         zombie_not_again,
-        (Scan::Unknown, 1),
-        "a stale record that cannot be read again"
+        (Scan::Unknown, 2),
+        "a stale record that cannot be read again, its pid still listed"
     );
     assert_eq!(read_live, Scan::Escaped, "the same tree read live");
+}
+
+/// The session every escape fixture's processes name in their environment
+/// (`ATERM_PARENT_SESSION_ID`), and the one the scans here judge.
+#[cfg(target_os = "macos")]
+const FIXTURE_SID: &str = "s-0123456789abcdef0123";
+
+/// The escape fixtures' shell and `sleep`: ad hoc signed stand-ins of
+/// `/bin/bash` and `/bin/sleep` ([`aterm_uds::deadline::stand_in`]), run in
+/// place, whose environment another process can read. Darwin 27 withholds a
+/// platform binary's, and a scan counts an orphan whose environment it cannot
+/// read, so a fixture of plain `/bin/sh` and `/bin/sleep` left orphans that
+/// any other run's scan on the host counted as that run's escape: the live
+/// spare suite (`spare_live_headless`) beside two loops of `spare::` read
+/// COULD NOT RUN in 14 of 160 module runs (load 131-220), each on such a
+/// `sleep` (9) or the `bash` forked for one (5). Each process a fixture makes
+/// names [`FIXTURE_SID`] instead, which these scans count and no other run's
+/// does: 0 of 160 beside 865 runs of `spare::` (load 112-243).
+#[cfg(target_os = "macos")]
+fn fixture_shell() -> PathBuf {
+    aterm_uds::deadline::stand_in(std::path::Path::new("/bin/bash"))
+}
+
+/// See [`fixture_shell`].
+#[cfg(target_os = "macos")]
+fn fixture_sleep() -> PathBuf {
+    aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sleep"))
+}
+
+/// A fixture's process: `program` naming [`FIXTURE_SID`], its stdio null.
+#[cfg(target_os = "macos")]
+fn fixture_command(program: &std::path::Path) -> aterm_uds::spawnfd::Command {
+    let mut command = aterm_uds::spawnfd::command(program);
+    command
+        .env(aterm_types::domain::ENV_PARENT_SESSION_ID, FIXTURE_SID)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    command
 }
 
 /// Hang-detector waits shared by the escape fixtures below.
@@ -1659,9 +1737,19 @@ impl FixtureWaits {
         }
     }
 
-    /// Until `pid` is neither readable as `birth` nor a zombie: reaped.
+    /// Until `pid` is neither readable as `birth`, nor a zombie, nor named by
+    /// a whole listing of our uid: reaped. A process still exiting reads as
+    /// nothing and is no zombie yet, but every listing names it until its exit
+    /// is done (a scan then reads it unsettled, `Unknown`: measured 10 of 667
+    /// runs of `spare::` beside the live spare suite; none of 1449 once this
+    /// waits, which outwaited such an exit 46 times).
     fn gone(&self, pid: i32, birth: u64) {
-        while bsdinfo_uniq(pid).is_some_and(|i| i.p_uniqueid == birth) || exited(pid) {
+        // SAFETY: `getuid` is a side-effect-free getter.
+        let uid = unsafe { libc::getuid() };
+        while bsdinfo_uniq(pid).is_some_and(|i| i.p_uniqueid == birth)
+            || exited(pid)
+            || !uid_pids(uid).is_some_and(|pids| !pids.contains(&pid))
+        {
             assert!(Instant::now() < self.give_up, "{pid} was never reaped");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1694,15 +1782,12 @@ fn session_shell(
     waits: &FixtureWaits,
 ) -> (OwnedEscapeFixture, i32, i32, BsdInfoWithUniqId) {
     let mark = dir.join("child-pid");
-    let shell = aterm_uds::spawnfd::command("/bin/sh")
+    let shell = fixture_command(&fixture_shell())
         .arg("-c")
         .arg(r#""$1" 600 & printf '%s\n' "$!" > "$2"; wait; exec "$1" 600"#)
         .arg("shell")
-        .arg("/bin/sleep")
+        .arg(fixture_sleep())
         .arg(&mark)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
         .setsid(true)
         .spawn()
         .expect("spawn the shell stand-in");
@@ -1730,15 +1815,12 @@ fn adopted_orphan(
     waits: &FixtureWaits,
 ) -> (OwnedEscapeFixture, i32, BsdInfoWithUniqId) {
     let mark = dir.join("orphan-pid");
-    let launcher = aterm_uds::spawnfd::command("/bin/sh")
+    let launcher = fixture_command(&fixture_shell())
         .arg("-c")
         .arg(r#""$1" 600 & printf '%s\n' "$!" > "$2"; exec "$1" 600"#)
         .arg("launcher")
-        .arg("/bin/sleep")
+        .arg(fixture_sleep())
         .arg(&mark)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
         .setsid(true)
         .spawn()
         .expect("spawn the launcher");
@@ -1883,14 +1965,9 @@ fn scan_reads(
         },
         |pid, sid| match owner {
             Some(owner) => owner(pid),
-            None => u32::try_from(pid)
-                .ok()
-                .and_then(atpkg::caller_shell::process_args)
-                .map(|args| {
-                    args.env.is_empty()
-                        || args.env_var(aterm_types::domain::ENV_PARENT_SESSION_ID) == Some(sid)
-                }),
+            None => environment_names(pid, sid),
         },
+        stdio_dead,
     )
 }
 
@@ -2055,6 +2132,66 @@ fn a_daemon_read_under_a_parent_gone_since_its_read_is_read_again() {
         stranger,
         Scan::Clean,
         "a live child in a session older than the shell"
+    );
+}
+
+/// A record naming a parent gone since the listing that is gone itself when
+/// read again (a parent and its last child exiting together, a busy host's
+/// churn) orphaned nothing when nothing recorded below it lives: the scan is
+/// whole. Measured: 240 runs of the live spare module beside three more loops
+/// of it (load 130-246) failed 15 of 3600 tests on an `Inconclusive` visible
+/// run (the gate left learning) or a verification's `scan-unknown`, and each
+/// of their scans read `Unknown` on such stale records alone; with this rule,
+/// 720 more runs failed none that way. One with a live process recorded
+/// below it still leaves the scan `Unknown`. The parent and the child
+/// are real pids of ours, reaped; the live process below is a real orphan.
+/// NEGATIVE CONTROL: on the code before, the lone child's scan read `Unknown`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_child_gone_with_its_gone_parent_is_no_stale_record() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let waits = FixtureWaits::new();
+    let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
+    let (mut owned, daemon_pid, adopted) = adopted_orphan(dir.path(), &waits);
+    let parent_pid = reaped_pid();
+    let child_pid = reaped_pid();
+    let child = record_as(&adopted, child_pid, parent_pid, adopted.p_uniqueid - 1);
+    let alone = scan_reads(
+        shell_pid,
+        &adopted,
+        &[shell_pid, parent_pid, child_pid],
+        &[shell_pid],
+        &[(parent_pid, None), (child_pid, Some(child))],
+        None,
+    );
+    let below = scan_reads(
+        shell_pid,
+        &adopted,
+        &[shell_pid, parent_pid, child_pid, daemon_pid],
+        &[shell_pid, daemon_pid],
+        &[
+            (parent_pid, None),
+            (child_pid, Some(child)),
+            (
+                daemon_pid,
+                Some(record_as(
+                    &adopted,
+                    daemon_pid,
+                    child_pid,
+                    adopted.p_uniqueid,
+                )),
+            ),
+        ],
+        None,
+    );
+    owned
+        .retire_owned_escape_fixture()
+        .expect("retire the daemon");
+    assert_eq!(alone, Scan::Clean, "a child gone with its gone parent");
+    assert_eq!(
+        below,
+        Scan::Unknown,
+        "the same child with a live process recorded below it"
     );
 }
 
@@ -2237,28 +2374,90 @@ fn a_daemon_below_another_users_process_is_still_the_shells() {
 }
 
 /// A scan lists only once the window it judges has ended (the mark plus the
-/// grace), as a sample is due, so a verification at its hold waits; and it runs
-/// at most once per [`SCAN_EVERY`]. NEGATIVE CONTROL: without the wait (before,
-/// a verification listed as soon as the rate limit let it), the first scan
-/// lists at the mark, before a daemon the startup files fork in the grace.
+/// grace), as a sample is due, so a verification at its hold waits; and a
+/// sample's runs at most once per [`SCAN_EVERY`]. NEGATIVE CONTROL: without the
+/// wait (before, a verification listed as soon as the rate limit let it), the
+/// first scan lists at the mark, before a daemon the startup files fork in the
+/// grace.
 #[test]
 fn a_scan_lists_after_its_window() {
     let mark = Instant::now();
     let mut last = None;
     let mut listed = None;
-    let first = rate_limited(mark, &mut last, || {
+    let first = rate_limited(mark, &mut last, true, || {
         listed = Some(Instant::now());
         Scan::Unknown
     });
     let listed = listed.expect("the first scan runs");
     let mut again = false;
-    let second = rate_limited(mark, &mut last, || {
+    let second = rate_limited(mark, &mut last, true, || {
         again = true;
         Scan::Unknown
     });
     assert_eq!(first, Scan::Unknown);
     assert!(listed >= mark + SCAN_GRACE, "listed inside the window");
     assert_eq!((second, again), (Scan::RateLimited, false), "rate-limited");
+}
+
+/// A verification's scan is not spaced from the scan before it (a sample's,
+/// or the last spare's): its spare, and the thread that forks the next one,
+/// wait on it. Its job reaches the scan (the
+/// generation it was booked for, a clean posture), the last scan a moment ago
+/// (a stamp ahead of now is inside any spacing); pid 42 is a boot-time
+/// process, none of ours on a host whose tests run as a person, but whatever
+/// the scan reads of it, the verdict is the scan's. NEGATIVE CONTROLS: with the verification waiting
+/// out the spacing again, its verdict never comes (the hang detector); with its
+/// scan spaced, it is rate-limited and the earlier scan stays the last.
+#[test]
+fn a_verification_is_not_spaced_from_the_scan_before_it() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let inputs = GenInputs {
+        shell: aterm_core::shell_integration::ShellType::Zsh,
+        shell_path: dir.path().join("shell"),
+        home: dir.path().into(),
+        launch_zdotdir: dir.path().into(),
+        fingerprint: 1,
+        containment: 1,
+    };
+    let generation = rc_generation(&inputs, &Reported::default());
+    let witness = Arc::new(Witness::default());
+    witness
+        .shell
+        .set((42, Some(PathBuf::from("/owned/shell"))))
+        .unwrap();
+    let mut seen = a_start_seen(StartKind::Spare);
+    seen.fg_pgrp = 42;
+    seen.image = Some(PathBuf::from("/owned/shell"));
+    witness.start_seen.set(seen).unwrap();
+    let job = VerifyJob {
+        id: 94,
+        witness,
+        sid: "s-0123456789abcdef0123".into(),
+        inputs,
+        generation,
+        run_at: Instant::now(),
+        reply: Arc::new(|_| true),
+    };
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut last = Some(Instant::now() + Duration::from_secs(3600));
+        let verdict = verify(&job, &mut last, &Shared::default());
+        let _ = tx.send((verdict, last));
+    });
+    let (verdict, last) = rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the verification waited out the last scan's spacing");
+    assert!(
+        matches!(
+            verdict,
+            Verdict::Ok | Verdict::Backoff("escaped" | "scan-unknown")
+        ),
+        "it reached the scan: {verdict:?}"
+    );
+    assert!(
+        last.is_some_and(|at| at <= Instant::now()),
+        "its scan is the last one now"
+    );
 }
 
 /// A process launchd itself started in the run's window (a Spotlight worker
@@ -2374,7 +2573,7 @@ impl ForeignSession {
     fn new(dir: &std::path::Path, name: &str) -> Self {
         let go = dir.join(format!("{name}-go"));
         let mark = dir.join(format!("{name}-orphan-pid"));
-        let leader = aterm_uds::spawnfd::command("/bin/sh")
+        let leader = fixture_command(&fixture_shell())
             .arg("-c")
             .arg(
                 r#"while [ ! -e "$3" ]; do "$1" 0.01; done
@@ -2382,12 +2581,9 @@ impl ForeignSession {
                 exec "$1" 600"#,
             )
             .arg(name)
-            .arg("/bin/sleep")
+            .arg(fixture_sleep())
             .arg(&mark)
             .arg(&go)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
             .setsid(true)
             .spawn()
             .expect("spawn the session leader");
@@ -2562,6 +2758,387 @@ fn an_orphan_of_a_session_older_than_the_shell_is_no_escape() {
     );
 }
 
+/// `<sys/proc_info.h>`: `pbi_flags` says the process has exec'd (`P_EXEC`).
+#[cfg(target_os = "macos")]
+const PROC_FLAG_EXEC: u32 = 0x4000;
+
+/// When a [`TerminalSession`]'s orphan execs its `sleep`.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrphanExec {
+    /// At once, while the terminal still has its leader: it keeps
+    /// `P_CONTROLT`.
+    WhileLed,
+    /// Only once [`TerminalSession::exec_now`] says so, after
+    /// [`TerminalSession::end_leader`]: as the `$(...)` child of a tab's zsh
+    /// whose tab closed before its exec. It loses `P_CONTROLT`.
+    AfterLeader,
+}
+
+/// Another terminal's session, owned: its leader leads a fresh PTY, as a
+/// tab's shell does, and leaves one background process to launchd at once (a
+/// double fork), which ignores the hangup and so lives on through its leader's
+/// exit. The leader is this process's child, killed and reaped by
+/// [`Self::end_leader`] or at drop; the orphan is retired by its birth. Its
+/// programs are the fixtures' stand-ins, naming [`FIXTURE_SID`].
+#[cfg(target_os = "macos")]
+struct TerminalSession {
+    leader: Option<i32>,
+    master: i32,
+    orphan: OwnedEscapeFixture,
+    /// The FIFO an [`OrphanExec::AfterLeader`] orphan reads its go from.
+    go: std::path::PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl TerminalSession {
+    /// The session, and its orphan's pid and record once launchd adopted it
+    /// (and, [`OrphanExec::WhileLed`], once it exec'd).
+    fn new(
+        dir: &std::path::Path,
+        waits: &FixtureWaits,
+        exec: OrphanExec,
+    ) -> (Self, i32, BsdInfoWithUniqId) {
+        let mark = dir.join("terminal-orphan-pid");
+        let go = dir.join("terminal-orphan-go");
+        let script = match exec {
+            OrphanExec::WhileLed => {
+                r#"trap '' HUP; ( "$1" 600 & printf '%s\n' "$!" > "$2" ); exec "$1" 600"#
+            }
+            OrphanExec::AfterLeader => {
+                r#"trap '' HUP; ( ( read -r _ < "$3"; exec "$1" 600 ) & printf '%s\n' "$!" > "$2" ); exec "$1" 600"#
+            }
+        };
+        if exec == OrphanExec::AfterLeader {
+            let c = std::ffi::CString::new(go.as_os_str().as_encoded_bytes()).expect("a path");
+            // SAFETY: `c` is a NUL-terminated path that lives across the call.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "the go FIFO");
+        }
+        let argv: Vec<std::ffi::OsString> = vec![
+            fixture_shell().into_os_string(),
+            "-c".into(),
+            script.into(),
+            "leader".into(),
+            fixture_sleep().into_os_string(),
+            mark.clone().into_os_string(),
+            go.clone().into_os_string(),
+        ];
+        // SAFETY: a test process; the trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let spawned = aterm_pty::spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[(
+                aterm_types::domain::ENV_PARENT_SESSION_ID.to_owned(),
+                FIXTURE_SID.to_owned(),
+            )],
+            None,
+            None,
+            None,
+            Some(&argv),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+            None,
+        )
+        .expect("spawn the terminal's leader");
+        let mut session = Self {
+            leader: Some(spawned.pid),
+            master: spawned.master,
+            orphan: OwnedEscapeFixture {
+                child: None,
+                daemon: None,
+            },
+            go,
+        };
+        let pid = waits.pid_in(&mark);
+        let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
+        session.orphan.daemon = Some((pid, birth));
+        // Adopted, and (`WhileLed`) its `sleep` exec'd while the terminal
+        // still has its leader: an exec after the leader's exit drops
+        // `P_CONTROLT` (measured on Darwin 27: 0 of 30 such orphans kept it,
+        // 30 of 30 that exec'd before), and the forked shell can be adopted
+        // before it execs.
+        let adopted = session.orphan_once(waits, |info| {
+            info.pbsd.pbi_ppid == 1
+                && (exec == OrphanExec::AfterLeader || info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0)
+        });
+        (session, pid, adopted)
+    }
+
+    /// The orphan's record once `holds` of it, under the hang detector.
+    fn orphan_once(
+        &self,
+        waits: &FixtureWaits,
+        holds: impl Fn(&BsdInfoWithUniqId) -> bool,
+    ) -> BsdInfoWithUniqId {
+        let (pid, birth) = self.orphan.daemon.expect("the orphan's birth");
+        loop {
+            if let Some(info) = bsdinfo_uniq(pid)
+                && info.p_uniqueid == birth
+                && holds(&info)
+            {
+                return info;
+            }
+            assert!(
+                Instant::now() < waits.give_up,
+                "the terminal's orphan never reached the state waited for"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// An [`OrphanExec::AfterLeader`] orphan's go: it execs its `sleep` now.
+    /// Its record once it has.
+    fn exec_now(&self, waits: &FixtureWaits) -> BsdInfoWithUniqId {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // The orphan waits in its open of the read end from its birth, and a
+        // reader waiting there counts: a non-blocking open for writing then
+        // succeeds, where it fails `ENXIO` with no reader. A blocking open
+        // would wait for ever on an orphan that died; this is a hang detector.
+        let mut go = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.go)
+            {
+                Ok(go) => break go,
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {}
+                Err(e) => panic!("open the orphan's go: {e}"),
+            }
+            assert!(
+                Instant::now() < waits.give_up,
+                "the terminal's orphan never opened its go"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        go.write_all(b"go\n").expect("tell the orphan to exec");
+        drop(go);
+        self.orphan_once(waits, |info| info.pbsd.pbi_flags & PROC_FLAG_EXEC != 0)
+    }
+
+    /// Kill and reap the leader: its session outlives it in its orphan.
+    fn end_leader(&mut self) {
+        if let Some(leader) = self.leader.take() {
+            // SAFETY: this process's own unreaped child, so the pid is still it.
+            unsafe { libc::kill(leader, libc::SIGKILL) };
+            let mut status = 0;
+            // SAFETY: reaps exactly that child.
+            let reaped = unsafe { libc::waitpid(leader, &mut status, 0) };
+            assert_eq!(reaped, leader, "reap the terminal's leader");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.end_leader();
+        aterm_pty::close_fd(self.master);
+    }
+}
+
+/// An orphan born on another terminal, outside the shell's session, whose
+/// leader is not shown to be the run's, is none of the run's: as the child an
+/// interactive zsh forks for a startup file's `$(...)` (`/etc/zshrc`'s
+/// `locale LC_CTYPE`) is when that zsh's tab closes mid-startup and launchd
+/// holds the child for its last moment. Measured: the live gate tests read a
+/// visible run `Unclean` under load with no unclean-run line; with the escape
+/// named in the log, 240 runs of the live spare module beside three more
+/// loops of it (load 60-150) read one, in L3: a `zsh` with the terminal flag
+/// (`0x1400090`), adopted in the session of a leader gone and unlisted. The
+/// run's own processes leave its session only by `setsid`, which drops the
+/// terminal for good. The processes are real; the orphan ignores the hangup,
+/// so it holds still in the state the scan read that `zsh` in, and the
+/// environment's answer is Darwin 27's for a platform binary (withheld, so
+/// counted against the run).
+/// NEGATIVE CONTROL: the same orphan read without its terminal flag and with
+/// its stdio live (the run's `setsid` daemon whose launcher exited, on the
+/// shell's terminal) is `Escaped`, and so is the orphan
+/// while its live leader is read as under the shell (a terminal the run
+/// opened). On the code before, the gone leader's orphan read `Escaped`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_orphan_born_on_another_terminal_is_no_escape() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let waits = FixtureWaits::new();
+    let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
+    let version = bsdinfo_uniq(shell_pid)
+        .expect("the shell stand-in")
+        .p_idversion;
+    let (mut terminal, orphan, adopted) =
+        TerminalSession::new(dir.path(), &waits, OrphanExec::WhileLed);
+    let leader = terminal.leader.expect("the leader lives");
+    let scan_with = |listed: &[i32],
+                     read: &dyn Fn(i32) -> Option<BsdInfoWithUniqId>,
+                     stdio: &dyn Fn(i32) -> Option<bool>| {
+        escape_scan_with_owner(
+            shell_pid,
+            Some(version),
+            FIXTURE_SID,
+            born_at(&adopted),
+            born_at(&adopted),
+            |_| Some(listed.to_vec()),
+            read,
+            |_, _| Some(true),
+            stdio,
+        )
+    };
+    let scan = |listed: &[i32], read: &dyn Fn(i32) -> Option<BsdInfoWithUniqId>| {
+        scan_with(listed, read, &stdio_dead)
+    };
+    let leader_under_the_shell = scan(&[shell_pid, orphan, leader], &|p| {
+        bsdinfo_uniq(p).map(|mut i| {
+            if p == leader {
+                i.pbsd.pbi_ppid = shell_pid as u32;
+            }
+            i
+        })
+    });
+    terminal.end_leader();
+    // SAFETY: `getsid` reads the process table.
+    let sessions = unsafe { (libc::getsid(orphan), libc::getsid(leader)) };
+    let leader_gone = scan(&[shell_pid, orphan], &bsdinfo_uniq);
+    // The run's `setsid` daemon holds the shell's terminal, live while the
+    // shell lives.
+    let born_on_none = scan_with(
+        &[shell_pid, orphan],
+        &|p| {
+            bsdinfo_uniq(p).map(|mut i| {
+                if p == orphan {
+                    i.pbsd.pbi_flags &= !PROC_FLAG_CONTROLT;
+                }
+                i
+            })
+        },
+        &|_| Some(false),
+    );
+    let still = bsdinfo_uniq(orphan);
+    terminal
+        .orphan
+        .retire_owned_escape_fixture()
+        .expect("retire the orphan");
+    assert!(
+        adopted.pbsd.pbi_flags & PROC_FLAG_CONTROLT != 0,
+        "born on the terminal: {:#x}",
+        adopted.pbsd.pbi_flags
+    );
+    assert_eq!(
+        sessions,
+        (leader, -1),
+        "the orphan stays in the session its gone leader led"
+    );
+    assert!(
+        still.is_some_and(|i| i.pbsd.pbi_ppid == 1 && i.pbsd.pbi_flags & PROC_FLAG_CONTROLT != 0),
+        "adopted, its terminal flag kept through its leader's exit"
+    );
+    assert_eq!(
+        leader_under_the_shell,
+        Scan::Escaped,
+        "an orphan of a terminal the run opened, its leader under the shell"
+    );
+    assert_eq!(
+        leader_gone,
+        Scan::Clean,
+        "an orphan born on another terminal, its leader gone"
+    );
+    assert_eq!(
+        born_on_none,
+        Scan::Escaped,
+        "the same orphan born on no terminal (the run's `setsid` daemon)"
+    );
+}
+
+/// An orphan born on another terminal that exec'd only after that terminal's
+/// leader left has lost `P_CONTROLT`, yet still holds its standard
+/// descriptors on the terminal its leader's exit revoked: none of the run's.
+/// As the `locale` a tab's zsh forks for `/etc/zshrc`'s `$(locale LC_CTYPE)`
+/// and execs once its tab has closed: the live spare suite read one as L3's
+/// escape in 960 module runs (`flags=0x21404010`, its session's leader gone
+/// and unlisted), and this orphan reads those flags and `ENOENT` for each of
+/// its descriptors 0, 1 and 2. The processes are real: the orphan waits on a
+/// FIFO for its go, given after the leader is killed and reaped.
+/// NEGATIVE CONTROL: the same orphan with its descriptors read as live (the
+/// run's `setsid` daemon on the shell's terminal) or unreadable is `Escaped`;
+/// on the scan before the descriptors were read, this orphan read `Escaped`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_orphan_that_execd_after_its_terminals_leader_left_is_no_escape() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let waits = FixtureWaits::new();
+    let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
+    let version = bsdinfo_uniq(shell_pid)
+        .expect("the shell stand-in")
+        .p_idversion;
+    let (mut terminal, orphan, adopted) =
+        TerminalSession::new(dir.path(), &waits, OrphanExec::AfterLeader);
+    let leader = terminal.leader.expect("the leader lives");
+    terminal.end_leader();
+    let execd = terminal.exec_now(&waits);
+    let scan = |stdio: &dyn Fn(i32) -> Option<bool>| {
+        escape_scan_with_owner(
+            shell_pid,
+            Some(version),
+            FIXTURE_SID,
+            born_at(&execd),
+            born_at(&execd),
+            |_| Some(vec![shell_pid, orphan]),
+            bsdinfo_uniq,
+            |_, _| Some(true),
+            stdio,
+        )
+    };
+    let revoked = scan(&stdio_dead);
+    let live = scan(&|_| Some(false));
+    let unread = scan(&|_| None);
+    let read = stdio_dead(orphan);
+    let shell_read = stdio_dead(shell_pid);
+    // SAFETY: `getsid` reads the process table.
+    let session = unsafe { libc::getsid(orphan) };
+    terminal
+        .orphan
+        .retire_owned_escape_fixture()
+        .expect("retire the orphan");
+    assert!(
+        adopted.pbsd.pbi_flags & PROC_FLAG_CONTROLT != 0,
+        "born on the terminal: {:#x}",
+        adopted.pbsd.pbi_flags
+    );
+    assert_eq!(
+        (
+            execd.pbsd.pbi_ppid,
+            execd.pbsd.pbi_flags & (PROC_FLAG_CONTROLT | PROC_FLAG_EXEC),
+            session,
+        ),
+        (1, PROC_FLAG_EXEC, leader),
+        "adopted, exec'd after its leader left, its terminal flag gone ({:#x}), \
+         in the session its leader led",
+        execd.pbsd.pbi_flags
+    );
+    assert_eq!(read, Some(true), "its stdio on the revoked terminal");
+    assert_eq!(
+        shell_read,
+        Some(false),
+        "the shell's stdio, `/dev/null`, is live"
+    );
+    assert_eq!(
+        revoked,
+        Scan::Clean,
+        "an orphan on another terminal, exec'd after its leader left"
+    );
+    assert_eq!(
+        live,
+        Scan::Escaped,
+        "the same orphan with its stdio live (the run's `setsid` daemon)"
+    );
+    assert_eq!(unread, Scan::Escaped, "the same orphan, its stdio unread");
+}
+
 /// A late missing identity is not proof that a listed process disappeared.
 /// The BSD records and ownership answers are modeled observations; only the
 /// candidate pid is this test's own process, so the scan's session/table reads
@@ -2619,6 +3196,7 @@ fn a_late_unreadable_escape_identity_keeps_the_scan_unknown() {
                 }
             },
             |_, _| owner,
+            stdio_dead,
         )
     };
     // Ordinary ownership, foreign environment, known replacement and a

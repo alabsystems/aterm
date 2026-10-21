@@ -103,9 +103,9 @@ fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Outp
 /// Run one `aterm <args…>` client call against the instance, hermetically, asserting success
 /// and returning stdout. The first call is the anchor that needs the event loop running, which
 /// under load can start taking connections later than the client's 10 s accept deadline
-/// ([`headless_boot::until_accepted`]); any other failure ends the test.
+/// ([`headless_boot::until_served`]); any other failure ends the test.
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
-    let out = headless_boot::until_accepted(|| {
+    let out = headless_boot::until_served(|| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
         cmd.args(args)
             .stdin(Stdio::null())

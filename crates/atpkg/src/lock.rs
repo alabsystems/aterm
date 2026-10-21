@@ -410,7 +410,47 @@ pub fn lock_store_waiting(
     on_first_contention: impl FnOnce(&Path),
     still_wanted: impl Fn() -> bool,
 ) -> Result<StoreLock, StoreLockError> {
-    let started = Instant::now();
+    lock_store_waiting_on(
+        &MonotonicClock,
+        layout,
+        timeout,
+        on_first_contention,
+        still_wanted,
+    )
+}
+
+/// The clock a waiting acquisition reads and sleeps on ([`lock_store_waiting_on`]).
+pub(crate) trait WaitClock {
+    /// Now, on the clock the wait's grace and bound are measured on.
+    fn now(&self) -> Instant;
+    /// Wait `pause` on it.
+    fn sleep(&self, pause: Duration);
+}
+
+/// The monotonic clock and a real sleep: every caller's wait ([`lock_store_waiting`]).
+struct MonotonicClock;
+
+impl WaitClock for MonotonicClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// [`lock_store_waiting`] on `clock`: the grace, the bound and every poll's pause are
+/// read and waited on it — a test drives one whose sleep moves its time, so a wait
+/// of seconds runs its every poll with none of them spent.
+pub(crate) fn lock_store_waiting_on(
+    clock: &impl WaitClock,
+    layout: &Layout,
+    timeout: Duration,
+    on_first_contention: impl FnOnce(&Path),
+    still_wanted: impl Fn() -> bool,
+) -> Result<StoreLock, StoreLockError> {
+    let started = clock.now();
     let deadline = started + timeout.min(WAIT_MAX);
     let mut announce = Some(on_first_contention);
     // The first attempt creates and vets the prefix; the polls only re-open the
@@ -426,7 +466,7 @@ pub fn lock_store_waiting(
                 if !still_wanted() {
                     return Err(StoreLockError::Contended(path));
                 }
-                let now = Instant::now();
+                let now = clock.now();
                 if now.duration_since(started) >= WAIT_ANNOUNCE_GRACE
                     && let Some(announce) = announce.take()
                 {
@@ -435,7 +475,7 @@ pub fn lock_store_waiting(
                 if now >= deadline {
                     return Err(StoreLockError::Contended(path));
                 }
-                std::thread::sleep(WAIT_POLL.min(deadline.saturating_duration_since(now)));
+                clock.sleep(WAIT_POLL.min(deadline.saturating_duration_since(now)));
                 attempt = repoll_store_lock(layout, &path);
             }
             Err(io) => return Err(io),
@@ -456,8 +496,15 @@ fn repoll_store_lock(layout: &Layout, path: &Path) -> Result<StoreLock, StoreLoc
     if !prefix_is_a_real_dir(&layout.prefix) {
         return try_lock_store(layout);
     }
+    #[cfg(test)]
+    tests::between_vet_and_open();
     match open_store_lock(path) {
-        Err(StoreLockError::Io(_, e)) if e.kind() == std::io::ErrorKind::NotFound => {
+        // Gone, or no longer a real directory: a link swapped in after the vet above
+        // fails the open ([`open_lock_file`]) and meets the F16 refusal here.
+        Err(StoreLockError::Io(_, e))
+            if e.kind() == std::io::ErrorKind::NotFound
+                || !prefix_is_a_real_dir(&layout.prefix) =>
+        {
             try_lock_store(layout)
         }
         polled => polled,
@@ -530,15 +577,7 @@ pub fn store_writer_released(layout: &Layout) -> bool {
 /// the `NotFound` the open reports, which the waiter answers with the full
 /// acquisition; a bare caller sees it as the same `Io` refusal as any other.
 fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
-    let mut opts = std::fs::OpenOptions::new();
-    // Never truncate: a lock file is a rendezvous, not data (the FileLock discipline).
-    opts.create(true).read(true).write(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let file = match opts.open(path) {
+    let file = match open_lock_file(path) {
         Ok(f) => f,
         Err(e) => return Err(StoreLockError::Io(path.to_path_buf(), e)),
     };
@@ -561,14 +600,128 @@ fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
     }
 }
 
+/// The lock file at `path`, created `0600` if it is missing and never truncated (a lock
+/// file is a rendezvous, not data: the FileLock discipline), opened IN the directory
+/// that is at `path`'s parent now: that directory is opened without following a link,
+/// then the file by name inside it (`openat`). Every caller vets the prefix first
+/// (`ensure_dir`, a poll's [`prefix_is_a_real_dir`]), a read before this open, and an
+/// open by path followed a symlink swapped in between the two: the lock was taken on a
+/// file the real store never sees (F16), which the swap test caught under load
+/// (2026-10-20). Here that swap fails the open (`ELOOP`).
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no file in a directory", path.display()),
+        ));
+    };
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        })?;
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    // SAFETY: `dir` is open for the call and `name` is NUL-terminated; the mode is the
+    // variadic argument `O_CREAT` reads.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+            libc::c_uint::from(0o600_u16),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` just returned `fd`, which nothing else owns.
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// The lock file at `path`, created if it is missing and never truncated.
+#[cfg(not(unix))]
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    thread_local! {
+        /// What runs in this thread's next waiting poll, after its vet of the prefix
+        /// and before its open ([`between_vet_and_open`]).
+        static BETWEEN_VET_AND_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// [`repoll_store_lock`]'s seam: run the act this thread armed, once.
+    pub(super) fn between_vet_and_open() {
+        if let Some(act) = BETWEEN_VET_AND_OPEN.with(|slot| slot.borrow_mut().take()) {
+            act();
+        }
+    }
+
     fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
         crate::testdir::absent_layout(&format!("atpkg-lock-{label}-"))
+    }
+
+    /// A waiter's clock whose sleep moves its time and returns at once
+    /// ([`lock_store_waiting_on`]): a wait of seconds runs its every poll with none of them
+    /// spent. `at_sleep` runs on the waiter's thread INSIDE sleep `n` (from 1), before the
+    /// time moves — where a holder lets go, or the prefix moves, "during the wait".
+    struct ManualClock<'a> {
+        origin: Instant,
+        elapsed: std::cell::Cell<Duration>,
+        sleeps: std::cell::Cell<u32>,
+        at_sleep: std::cell::RefCell<Box<dyn FnMut(u32) + 'a>>,
+    }
+
+    impl<'a> ManualClock<'a> {
+        fn new() -> Self {
+            Self::at_sleep(|_| {})
+        }
+
+        fn at_sleep(at_sleep: impl FnMut(u32) + 'a) -> Self {
+            Self {
+                origin: Instant::now(),
+                elapsed: std::cell::Cell::new(Duration::ZERO),
+                sleeps: std::cell::Cell::new(0),
+                at_sleep: std::cell::RefCell::new(Box::new(at_sleep)),
+            }
+        }
+
+        /// The time the wait has spent on this clock.
+        fn elapsed(&self) -> Duration {
+            self.elapsed.get()
+        }
+    }
+
+    impl WaitClock for ManualClock<'_> {
+        fn now(&self) -> Instant {
+            self.origin + self.elapsed.get()
+        }
+
+        fn sleep(&self, pause: Duration) {
+            let n = self.sleeps.get() + 1;
+            self.sleeps.set(n);
+            (self.at_sleep.borrow_mut())(n);
+            self.elapsed.set(self.elapsed.get() + pause);
+        }
     }
 
     /// The contention wake's poll never writes or claims the writer lock. A
@@ -965,7 +1118,8 @@ mod tests {
         ));
         let polls = std::cell::Cell::new(0u32);
         let announced = std::cell::Cell::new(0u32);
-        let got = lock_store_waiting(
+        let got = lock_store_waiting_on(
+            &ManualClock::new(),
             &b,
             Duration::from_secs(120),
             |_| announced.set(announced.get() + 1),
@@ -989,9 +1143,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
-    /// Past the grace the wait is ANNOUNCED — exactly once, naming the lock path —
-    /// and the waiter still proceeds when the holder finally lets go (here, as it
-    /// is told the wait was announced).
+    /// Past the grace the wait is ANNOUNCED — exactly once, naming the lock path, at the
+    /// first poll the grace has passed by — and the waiter still proceeds when the holder
+    /// finally lets go (here, as it is told the wait was announced). On the waiter's own
+    /// clock ([`ManualClock`]), so the grace is a value read off it, not seconds spent.
     #[test]
     fn lock_store_waiting_announces_once_after_the_grace_then_acquires() {
         let a = temp_layout("wait-announce");
@@ -999,12 +1154,16 @@ mod tests {
             prefix: a.prefix.clone(),
         };
         let guard = try_lock_store(&a).expect("first acquisition succeeds");
-        let announced = std::cell::RefCell::new(Vec::<PathBuf>::new());
-        let got = lock_store_waiting(
+        let clock = ManualClock::new();
+        let announced = std::cell::RefCell::new(Vec::<(PathBuf, Duration)>::new());
+        let got = lock_store_waiting_on(
+            &clock,
             &b,
             Duration::from_secs(120),
             |p| {
-                announced.borrow_mut().push(p.to_path_buf());
+                announced
+                    .borrow_mut()
+                    .push((p.to_path_buf(), clock.elapsed()));
                 drop(guard);
             },
             || true,
@@ -1012,8 +1171,8 @@ mod tests {
         assert!(got.is_ok(), "acquired after the holder dropped");
         assert_eq!(
             announced.borrow().as_slice(),
-            &[a.store_lock()],
-            "announced once, with the lock path"
+            &[(a.store_lock(), WAIT_ANNOUNCE_GRACE)],
+            "announced once, with the lock path, at the poll the grace ran out on"
         );
         drop(got);
         let _ = std::fs::remove_dir_all(&a.prefix);
@@ -1030,7 +1189,9 @@ mod tests {
         let _guard = try_lock_store(&a).expect("first acquisition succeeds");
         let timeout = WAIT_ANNOUNCE_GRACE + Duration::from_secs(1);
         let announced = std::cell::Cell::new(0u32);
-        let err = match lock_store_waiting(
+        let clock = ManualClock::new();
+        let err = match lock_store_waiting_on(
+            &clock,
             &b,
             timeout,
             |_| announced.set(announced.get() + 1),
@@ -1044,6 +1205,11 @@ mod tests {
             "the timeout is a contention refusal naming the path: {err:?}"
         );
         assert_eq!(announced.get(), 1, "announced exactly once per wait");
+        assert_eq!(
+            clock.elapsed(),
+            timeout,
+            "it waited out its bound, and no more"
+        );
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
@@ -1056,7 +1222,9 @@ mod tests {
     /// `remove_dir_all` in place unlinked `store.lock` before the directory, and a
     /// poll landing between the two re-created the lock file in it, so the removal
     /// failed "directory not empty" (2 runs in 20 of four concurrent suites, found in
-    /// review 2026-09-23).
+    /// review 2026-09-23). It goes at the wait's first poll, so the wait has met the
+    /// held lock first, however loaded the machine (a remover thread 300 ms on could
+    /// land before the first attempt, which then waited on nothing).
     ///
     /// Unix only: the remover moves a directory whose `store.lock` the holder
     /// keeps open and flock'd, which Unix allows; on Windows the open
@@ -1069,15 +1237,15 @@ mod tests {
             prefix: a.prefix.clone(),
         };
         let guard = try_lock_store(&a).expect("first acquisition succeeds");
-        let prefix = a.prefix.clone();
         let aside = PathBuf::from(format!("{}-gone", a.prefix.display()));
         let _ = std::fs::remove_dir_all(&aside);
-        let gone = aside.clone();
-        let remover = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            std::fs::rename(&prefix, &gone).expect("the prefix is movable under a holder");
+        // Inside the waiter's first poll sleep, on its own thread: the prefix goes.
+        let clock = ManualClock::at_sleep(|n| {
+            if n == 1 {
+                std::fs::rename(&a.prefix, &aside).expect("the prefix is movable under a holder");
+            }
         });
-        let got = lock_store_waiting(&b, aterm_spec::wait::MUST_HAPPEN, |_| {}, || true);
+        let got = lock_store_waiting_on(&clock, &b, aterm_spec::wait::MUST_HAPPEN, |_| {}, || true);
         assert!(
             got.is_ok(),
             "the re-created prefix's lock is free: {:?}",
@@ -1089,7 +1257,7 @@ mod tests {
         );
         let dir_mode = std::fs::metadata(&b.prefix).unwrap().permissions().mode();
         assert_eq!(dir_mode & 0o777, 0o700, "the re-created prefix is hardened");
-        remover.join().unwrap();
+        drop(clock);
         drop(guard);
         drop(got);
         let _ = std::fs::remove_dir_all(&a.prefix);
@@ -1106,7 +1274,15 @@ mod tests {
     /// acquisition, which refuses the link with the F16 error at that poll rather
     /// than at the bound.
     ///
-    /// RED before the fix: `Ok` — the lock taken on `<elsewhere>/store.lock`.
+    /// The swap lands at a place the wait names, never at a clock's guess: between
+    /// two polls (the next poll's lstat sees the link), and inside a poll, after its
+    /// lstat said "a real directory" and before its open ([`between_vet_and_open`]).
+    /// RED before 2026-10-20 at that second place: `Ok`, the lock taken through the
+    /// link, because the open went by path ([`open_lock_file`]). A swapper thread 300
+    /// ms on reached it by chance under load ("the waiter locked THROUGH the link",
+    /// once in a whole-library run at load 90).
+    ///
+    /// RED before the lstat: `Ok` — the lock taken on `<elsewhere>/store.lock`.
     /// macOS and Linux: the swap is one atomic exchange of the real prefix (its held
     /// lock file goes with it) and a link — never a moment with nothing at the path.
     /// It was a rename then a `symlink`, and a poll landing between the two re-created
@@ -1141,61 +1317,90 @@ mod tests {
                 Err(io::Error::last_os_error())
             }
         }
-        let a = temp_layout("wait-symlink");
-        let b = Layout {
-            prefix: a.prefix.clone(),
-        };
-        let guard = try_lock_store(&a).expect("first acquisition succeeds");
-        let elsewhere = temp_layout("wait-symlink-target");
-        std::fs::create_dir_all(&elsewhere.prefix).unwrap();
-        let prefix = a.prefix.clone();
-        let moved = PathBuf::from(format!("{}-moved", a.prefix.display()));
-        let _ = std::fs::remove_dir_all(&moved);
-        std::os::unix::fs::symlink(&elsewhere.prefix, &moved).expect("the link, beside the prefix");
-        let aside = moved.clone();
-        let swapper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            // Inside the waiter's first poll sleep: the link takes the prefix's name
-            // and the real prefix takes the link's, in one step.
-            exchange(&aside, &prefix).expect("the prefix and the link exchange names");
-        });
-        let err = match lock_store_waiting(&b, Duration::from_secs(120), |_| {}, || true) {
-            Ok(_) => panic!("the waiter locked THROUGH the link"),
-            Err(e) => e,
-        };
-        swapper.join().unwrap();
-        assert!(
-            matches!(
-                err,
-                StoreLockError::Io(_, ref e)
-                    if e.kind() == io::ErrorKind::PermissionDenied
-                        && e.to_string().contains("is a symlink; refusing")
-            ),
-            "the F16 refusal at the poll that saw the link, never the bound's \
-             contention: {err:?}"
-        );
-        assert!(
-            !elsewhere.store_lock().exists(),
-            "nothing was opened through the link"
-        );
-        drop(guard);
-        let _ = std::fs::remove_file(&a.prefix);
-        let _ = std::fs::remove_dir_all(&moved);
-        let _ = std::fs::remove_dir_all(&elsewhere.prefix);
+        for inside_a_poll in [false, true] {
+            let a = temp_layout("wait-symlink");
+            let b = Layout {
+                prefix: a.prefix.clone(),
+            };
+            let guard = try_lock_store(&a).expect("first acquisition succeeds");
+            let elsewhere = temp_layout("wait-symlink-target");
+            std::fs::create_dir_all(&elsewhere.prefix).unwrap();
+            let moved = PathBuf::from(format!("{}-moved", a.prefix.display()));
+            let _ = std::fs::remove_dir_all(&moved);
+            std::os::unix::fs::symlink(&elsewhere.prefix, &moved)
+                .expect("the link, beside the prefix");
+            // The link takes the prefix's name and the real prefix takes the link's,
+            // in one step.
+            let swap = {
+                let (moved, prefix) = (moved.clone(), a.prefix.clone());
+                move || exchange(&moved, &prefix).expect("the prefix and the link exchange names")
+            };
+            let polls = std::cell::Cell::new(0u32);
+            let swap = std::cell::Cell::new(Some(swap));
+            let still_wanted = || {
+                if polls.replace(polls.get() + 1) == 0 {
+                    let swap = swap.take().expect("one swap");
+                    if inside_a_poll {
+                        BETWEEN_VET_AND_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
+                    } else {
+                        swap();
+                    }
+                }
+                true
+            };
+            let err = match lock_store_waiting_on(
+                &ManualClock::new(),
+                &b,
+                Duration::from_secs(120),
+                |_| {},
+                still_wanted,
+            ) {
+                Ok(_) => {
+                    panic!("inside a poll {inside_a_poll}: the waiter locked THROUGH the link")
+                }
+                Err(e) => e,
+            };
+            let unrun = BETWEEN_VET_AND_OPEN.with(|slot| slot.borrow_mut().take().is_some());
+            assert!(!unrun, "the poll after the first ran the swap");
+            assert_eq!(
+                polls.get(),
+                1,
+                "inside a poll {inside_a_poll}: refused at that poll"
+            );
+            assert!(
+                matches!(
+                    err,
+                    StoreLockError::Io(_, ref e)
+                        if e.kind() == io::ErrorKind::PermissionDenied
+                            && e.to_string().contains("is a symlink; refusing")
+                ),
+                "inside a poll {inside_a_poll}: the F16 refusal at the poll that saw the link, \
+                 never the bound's contention: {err:?}"
+            );
+            assert!(
+                !elsewhere.store_lock().exists(),
+                "inside a poll {inside_a_poll}: nothing was opened through the link"
+            );
+            drop(guard);
+            let _ = std::fs::remove_file(&a.prefix);
+            let _ = std::fs::remove_dir_all(&moved);
+            let _ = std::fs::remove_dir_all(&elsewhere.prefix);
+        }
     }
 
     /// An unusable prefix is not something to wait on: the `Io` refusal comes back
     /// at once, with no announcement. "At once" is read off the wait's own polls —
-    /// every poll asks `still_wanted` first, and none was asked — not off a clock,
-    /// with a minute's hang detector against a bound of two.
+    /// every poll asks `still_wanted` first, and none was asked — and off the
+    /// waiter's own clock ([`ManualClock`]), on which not one pause was spent.
     #[test]
     fn lock_store_waiting_never_waits_on_io() {
         let l = temp_layout("wait-badprefix");
         std::fs::write(&l.prefix, b"not a directory").unwrap();
-        let started = Instant::now();
+        let clock = ManualClock::new();
         let announced = std::cell::Cell::new(0u32);
         let polls = std::cell::Cell::new(0u32);
-        let err = match lock_store_waiting(
+        let err = match lock_store_waiting_on(
+            &clock,
             &l,
             Duration::from_secs(120),
             |_| announced.set(announced.get() + 1),
@@ -1209,11 +1414,7 @@ mod tests {
         };
         assert!(matches!(err, StoreLockError::Io(..)), "{err:?}");
         assert_eq!(polls.get(), 0, "no wait on Io: the first attempt's refusal");
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "no wait on Io: {:?}",
-            started.elapsed()
-        );
+        assert_eq!(clock.elapsed(), Duration::ZERO, "no wait on Io: no pause");
         assert_eq!(announced.get(), 0);
         let _ = std::fs::remove_file(&l.prefix);
     }
@@ -1221,8 +1422,8 @@ mod tests {
     /// A waiter whose caller has gone (`still_wanted` says no — the window that
     /// spawned it quit) stands down with `Contended` instead of polling out its
     /// whole bound and then racing a successor's waiter for the freed lock: at
-    /// the very poll that found it gone (read off the polls, not a clock), and
-    /// inside a minute's hang detector against a bound of two.
+    /// the very poll that found it gone, one poll into a bound of two minutes, with
+    /// nothing announced inside the grace.
     #[test]
     fn lock_store_waiting_stands_down_when_no_longer_wanted() {
         let a = temp_layout("wait-orphan");
@@ -1231,19 +1432,13 @@ mod tests {
         };
         let _guard = try_lock_store(&a).expect("first acquisition succeeds");
         let polls = std::cell::Cell::new(0u32);
-        let started = Instant::now();
-        let err = match lock_store_waiting(
+        let announced = std::cell::Cell::new(0u32);
+        let clock = ManualClock::new();
+        let err = match lock_store_waiting_on(
+            &clock,
             &b,
             Duration::from_secs(120),
-            // Nothing is announced inside the grace. A first poll a loaded
-            // machine delays past the grace may announce — the caller is still
-            // there then — but never one inside it.
-            |_| {
-                assert!(
-                    started.elapsed() >= WAIT_ANNOUNCE_GRACE,
-                    "stood down inside the grace: nothing to announce"
-                );
-            },
+            |_| announced.set(announced.get() + 1),
             || {
                 polls.set(polls.get() + 1);
                 polls.get() < 2
@@ -1254,10 +1449,11 @@ mod tests {
         };
         assert!(matches!(err, StoreLockError::Contended(..)), "{err:?}");
         assert_eq!(polls.get(), 2, "stood down at the poll that found it gone");
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "stood down long before the bound: {:?}",
-            started.elapsed()
+        assert_eq!(clock.elapsed(), WAIT_POLL, "one poll in, not at the bound");
+        assert_eq!(
+            announced.get(),
+            0,
+            "stood down inside the grace: nothing to announce"
         );
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
@@ -1274,18 +1470,18 @@ mod tests {
             prefix: a.prefix.clone(),
         };
         let _guard = try_lock_store(&a).expect("first acquisition succeeds");
-        let started = Instant::now();
-        // Wanted for slightly LESS than the grace, so the caller is gone by the
-        // first poll at which the grace has elapsed — the ordering under test.
-        let wanted_for = WAIT_ANNOUNCE_GRACE - Duration::from_millis(100);
+        let clock = ManualClock::new();
+        // Wanted until the grace has elapsed, so the caller is gone at exactly the first
+        // poll whose grace is up — the poll that would announce: the ordering under test.
         let wanted = std::cell::Cell::new(0u32);
         let announced = std::cell::Cell::new(0u32);
-        let err = match lock_store_waiting(
+        let err = match lock_store_waiting_on(
+            &clock,
             &b,
             Duration::from_secs(30),
             |_| announced.set(announced.get() + 1),
             || {
-                let still = started.elapsed() < wanted_for;
+                let still = clock.elapsed() < WAIT_ANNOUNCE_GRACE;
                 wanted.set(wanted.get() + u32::from(still));
                 still
             },
@@ -1295,6 +1491,11 @@ mod tests {
         };
         assert!(matches!(err, StoreLockError::Contended(..)), "{err:?}");
         assert!(wanted.get() > 0, "it waited while it was wanted");
+        assert_eq!(
+            clock.elapsed(),
+            WAIT_ANNOUNCE_GRACE,
+            "it stood down at the poll the grace ran out on"
+        );
         assert_eq!(
             announced.get(),
             0,

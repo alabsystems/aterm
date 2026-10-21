@@ -9,12 +9,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
+name = "astream-wire"
+version = "0.2.0"
+
+[[package]]
 name = "aterm-codec"
-version = "0.105.0"
+version = "0.107.0"
+dependencies = [
+ "astream-wire",
+]
 
 [[package]]
 name = "aterm-dbus"
-version = "0.105.0"
+version = "0.107.0"
 dependencies = [
  "aterm-codec",
  "aterm-uds",
@@ -31,7 +38,10 @@ dependencies = [
 
 [[package]]
 name = "aterm-uds"
-version = "0.105.0"
+version = "0.107.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "cc"

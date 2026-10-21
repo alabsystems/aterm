@@ -381,7 +381,6 @@ enum Whole {
     Real,
     /// NEGATIVE CONTROL: its contents deleted first, the real primitive (and
     /// its locks) after.
-    #[cfg(unix)]
     DeletesBeforeLocking,
 }
 
@@ -408,6 +407,7 @@ fn run_with(rep: &Report, script: &[u64], whole: Whole) -> (Option<Applied>, Vec
         now,
         threshold_days: 1,
         device: None,
+        volume: None,
     };
     let done = disk::apply_auto(
         rep,
@@ -647,8 +647,6 @@ fn a_planner_that_takes_recent_caches_for_a_demand_is_rejected() {
 /// `Remove` with no `LockHeld` before it. And the same report through the
 /// real primitive alone conforms, every whole unit's `LockHeld` read from its
 /// own `Stage::Locked`.
-// The real primitive locks and removes through Unix fds; elsewhere it refuses.
-#[cfg(unix)]
 #[test]
 fn a_whole_removal_that_deletes_before_it_locks_is_rejected() {
     let m = disk_reclaim_pass_model();

@@ -50,6 +50,25 @@
 //! identity). Model: `SessionIdClaim` (`PredecessorExits` /
 //! `SuccessorPublishes`; `Unmarked = 1` is the exit that duplicates).
 //!
+//! ## The epoch record
+//!
+//! A relaunch under an adopted id starts a new session log for it, whose
+//! first epoch must be above every epoch a predecessor's log of the id held
+//! (`session_log::Epochs`, ruling U1), or a reader's cursor of the dead
+//! process reads on into the live one with no gap. The wall seconds give that
+//! only when the relaunch comes a second or more after the predecessor's
+//! log started and the clock has not stepped back, and a restore leaf's
+//! `log_ep` only when a layout was restored. So every process that gives an
+//! adopted id's log an epoch records it beside the claim, in
+//! `claims/<sid>.ep` ([`record_epoch`]): the process that adopted the
+//! environment's premint, and each process the id is then handed to (a
+//! seamless update's successor, a crash recovery) while that record exists.
+//! The record only grows, is written tmp-then-rename, and is read by the
+//! next adoption once its claim is held ([`recorded_epoch_in`]), before its
+//! log starts. Like the claim file it is never unlinked. A build older than
+//! the record neither writes nor reads it: a relaunch by one, or after one,
+//! within the predecessor's wall second can still repeat its epoch.
+//!
 //! ## The update candidate
 //!
 //! A successor on a per-process socket (`aterm-<pid>.sock`) binds before the
@@ -200,9 +219,136 @@ fn successor_marker_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.successor", sid.as_str())))
 }
 
+/// The epoch record beside a claim file: `claims/<sid>.ep` (module doc, "The
+/// epoch record").
+fn epoch_record_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
+    claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.ep", sid.as_str())))
+}
+
+/// A small claim-side record, read without following or waiting on a final
+/// link or FIFO. Unix also proves the held regular file is ours and has one
+/// name; Windows refuses a reparse handle, under the claims directory's
+/// existing owner/DACL admission. Old ordinary record files need no mode change.
+#[cfg(any(unix, windows))]
+fn read_claim_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT: inspect the entry, not its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > 16 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != crate::control_auth::our_uid() || metadata.nlink() != 1 {
+            return None;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // FILE_ATTRIBUTE_REPARSE_POINT: a link is never record authority.
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return None;
+        }
+    }
+    let mut text = String::new();
+    file.take(17).read_to_string(&mut text).ok()?;
+    (text.len() <= 16).then_some(text)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_claim_record(_: &Path) -> Option<String> {
+    None
+}
+
+/// Publish through an exclusive directory of this write's own. No existing
+/// staging entry is opened or removed. The directory guard owns cleanup on
+/// every error and stays alive through the rename; the final entry is replaced,
+/// never written through. Keep the claim records' existing best-effort policy.
+fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a record without a parent",
+        )
+    })?;
+    let temporary = aterm_tempfile::TempDir::new_in(parent)?;
+    let staged = temporary.path().join("record");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&staged)?;
+    file.write_all(text.as_bytes())?;
+    drop(file);
+    std::fs::rename(&staged, path)
+}
+
+/// The largest epoch a holder of `sid` recorded for its log under control
+/// directory `dir`, or `None`: no record, one that does not read as a decimal
+/// epoch, or one no producer writes (`session_log::told_epoch`: 0, or above
+/// the ceiling a corrupt value would saturate the allocator at). A record
+/// must fit 16 bytes; one extra byte detects a truncated prefix.
+pub(crate) fn recorded_epoch_in(dir: &Path, sid: &SessionId) -> Option<u32> {
+    let text = read_claim_record(&epoch_record_path(dir, sid)?)?;
+    text.trim()
+        .parse()
+        .ok()
+        .and_then(crate::session_log::told_epoch)
+}
+
+/// Record that this process gave `sid`'s log the epoch `ep`, under control
+/// directory `dir`: `create` for the process that adopted the id from the
+/// environment (it starts the record), otherwise only where a record exists
+/// (a handoff successor of an id that was so adopted; a minted id is never
+/// re-adopted, so it gets none). Never lowers a record. Written
+/// tmp-then-rename, so a reader sees the old record or the new, never a torn
+/// one; failures are silent (the wall seconds still stand). This is
+/// synchronous local filesystem work, not a hard bound on a spawn's wait.
+pub(crate) fn record_epoch_in(dir: &Path, sid: &SessionId, ep: u32, create: bool) {
+    let Some(path) = epoch_record_path(dir, sid) else {
+        return;
+    };
+    if recorded_epoch_in(dir, sid).is_some_and(|had| had >= ep) || (!create && !path.exists()) {
+        return;
+    }
+    if crate::control_auth::ensure_private_dir(&dir.join(CLAIMS_DIR)).is_err() {
+        return;
+    }
+    let _ = write_claim_record(&path, &format!("{ep}\n"));
+}
+
+/// [`record_epoch_in`] on the rendezvous directory.
+pub(crate) fn record_epoch(sid: &SessionId, ep: u32, create: bool) {
+    if let Some(dir) = rendezvous_dir() {
+        record_epoch_in(&dir, sid, ep, create);
+    }
+}
+
 /// The pid a successor marker names for `sid`, whatever its liveness.
 fn marked_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
-    let text = std::fs::read_to_string(successor_marker_path(dir, sid)?).ok()?;
+    let text = read_claim_record(&successor_marker_path(dir, sid)?)?;
     text.strip_prefix("pid ")?.trim().parse().ok()
 }
 
@@ -218,8 +364,8 @@ pub(crate) fn live_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
 /// Predecessor, at Commit, before `_exit`: name `successor` as the process about
 /// to answer to each of `sids`, so a launch between this exit and the
 /// successor's publish is refused. Written tmp-then-rename; failures are silent
-/// (the other two gates still stand, and the Commit must not wait on a
-/// filesystem).
+/// (the other two gates still stand). The local filesystem work remains
+/// synchronous; a slow filesystem can delay Commit.
 #[cfg(unix)]
 pub(crate) fn mark_successor_in(dir: &Path, sids: &[SessionId], successor: u32) {
     if crate::control_auth::ensure_private_dir(&dir.join(CLAIMS_DIR)).is_err() {
@@ -229,16 +375,7 @@ pub(crate) fn mark_successor_in(dir: &Path, sids: &[SessionId], successor: u32) 
         let Some(marker) = successor_marker_path(dir, sid) else {
             continue;
         };
-        let tmp = marker.with_file_name(format!(
-            ".{}.successor.{}.tmp",
-            sid.as_str(),
-            std::process::id()
-        ));
-        if std::fs::write(&tmp, format!("pid {successor}\n")).is_ok()
-            && std::fs::rename(&tmp, &marker).is_err()
-        {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        let _ = write_claim_record(&marker, &format!("pid {successor}\n"));
     }
 }
 

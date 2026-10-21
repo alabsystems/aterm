@@ -1425,23 +1425,88 @@ mod tests {
         }
     }
 
+    /// Set in the child [`in_private_font_home`] starts: run the body here.
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
+    const PRIVATE_FONT_HOME: &str = "ATERM_RENDER_TEST_PRIVATE_FONT_HOME";
+
+    /// `true` in a child of this test binary whose per-user font roots are
+    /// empty: `HOME` is a fresh empty directory and `XDG_DATA_HOME` and
+    /// `XDG_DATA_DIRS` are unset, so [`crate::font_search_dirs`] holds that
+    /// empty home's roots and the system roots alone. A copy the person
+    /// installed for themselves (`~/.local/share/fonts`) is then not in the
+    /// search, and cannot win a name the test asks for. In the parent, run
+    /// `test` (of this module) in such a child and answer as it did (its
+    /// COULD NOT RUN is this test's), then `false`: the parent's part is done.
+    /// The process is the child's own, so no sibling test sees its
+    /// environment.
+    #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
+    fn in_private_font_home(test: &str) -> bool {
+        if std::env::var_os(PRIVATE_FONT_HOME).is_some() {
+            return true;
+        }
+        // libtest names the test from the module below the crate.
+        let module = module_path!();
+        let path = module
+            .split_once("::")
+            .map_or_else(|| test.to_owned(), |(_, inner)| format!("{inner}::{test}"));
+        let home = std::env::temp_dir().join(format!(
+            "aterm-render-font-home-{}-{test}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&home).expect("a fresh empty HOME for the child");
+        let out = aterm_uds::spawnfd::command(
+            std::env::current_exe().expect("the test binary's own path"),
+        )
+        .args(["--exact", "--nocapture", "--test-threads=1", &path])
+        .env(PRIVATE_FONT_HOME, "1")
+        .env("HOME", &home)
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_DATA_DIRS")
+        .output()
+        .expect("re-running this test binary on one test");
+        let _ = std::fs::remove_dir_all(&home);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() {
+            assert!(
+                stdout.contains("1 passed"),
+                "the child ran no test named {path}\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            return false;
+        }
+        let why = stderr.lines().chain(stdout.lines()).find_map(|line| {
+            let (_, rest) = line.split_once(aterm_spec::host::COULD_NOT_RUN)?;
+            Some(rest.trim_start_matches(|c: char| c == '—' || c.is_whitespace()))
+        });
+        if let Some(why) = why {
+            aterm_spec::host::could_not_run(format!("{why} ({path}, with an empty HOME)"));
+        }
+        panic!("{path} failed with an empty HOME\nstdout: {stdout}\nstderr: {stderr}");
+    }
+
     /// A bundled family resolves by NAME through every resolver (startup,
     /// config admission, the catalogue worker) to its compiled-in faces, and
     /// measures its own `cell` at the 16 px probe.
     ///
     /// The NAME yields to an installed copy (see `resolve_family_or_bundled`,
-    /// and the catalogue's fixture test for that half), so on a host that has
-    /// one the bundle cannot be asked by name: COULD NOT RUN.
+    /// and the catalogue's fixture test for that half), so the body runs in
+    /// [`in_private_font_home`], where no per-user copy is searched. A copy in
+    /// the system roots still wins the name there: COULD NOT RUN.
     #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn bundled_family_resolves_by_name(
+        test: &str,
         family: &str,
         id: &str,
         bold_id: &str,
         cell: (usize, usize),
     ) {
+        if !in_private_font_home(test) {
+            return;
+        }
         if crate::resolve_font_family(family, crate::FaceTarget::REGULAR).is_some() {
             aterm_spec::host::could_not_run(format!(
-                "{family} is installed on this host, and an installed copy wins the name"
+                "{family} is installed in this host's system font roots, and an installed \
+                 copy wins the name"
             ));
         }
         for spelling in [family, id] {
@@ -1479,6 +1544,7 @@ mod tests {
     #[cfg(all(feature = "embedded-font", not(target_os = "macos")))]
     fn jetbrains_mono_resolves_by_name() {
         bundled_family_resolves_by_name(
+            "jetbrains_mono_resolves_by_name",
             JETBRAINS_FAMILY,
             JETBRAINS_ID,
             JETBRAINS_BOLD_ID,
@@ -1494,7 +1560,13 @@ mod tests {
     #[test]
     #[cfg(all(feature = "embedded-font", windows))]
     fn cascadia_mono_pl_resolves_by_name() {
-        bundled_family_resolves_by_name(CASCADIA_FAMILY, CASCADIA_ID, CASCADIA_BOLD_ID, (9, 21));
+        bundled_family_resolves_by_name(
+            "cascadia_mono_pl_resolves_by_name",
+            CASCADIA_FAMILY,
+            CASCADIA_ID,
+            CASCADIA_BOLD_ID,
+            (9, 21),
+        );
     }
 
     /// Iosevka Term Semibold by name, on Windows, where it is compiled in (the
@@ -1505,6 +1577,7 @@ mod tests {
     #[cfg(all(feature = "embedded-font", windows))]
     fn iosevka_term_semibold_resolves_by_name() {
         bundled_family_resolves_by_name(
+            "iosevka_term_semibold_resolves_by_name",
             IOSEVKA_SEMIBOLD_FAMILY,
             IOSEVKA_SEMIBOLD_ID,
             IOSEVKA_SEMIBOLD_BOLD_ID,

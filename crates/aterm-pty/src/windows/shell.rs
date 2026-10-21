@@ -567,14 +567,14 @@ mod tests {
     fn resolve_program_finds_cmd_and_bat_shims_via_pathext() {
         // Hermetic (no PATH/PATHEXT mutation — multi-threaded harness): probe a
         // stock System32 `.cmd`, a dir SearchPathW always searches. winrm.cmd
-        // ships on every Windows; skip gracefully if a trimmed SKU lacks it.
+        // ships on every Windows; a trimmed SKU that lacks it ends COULD NOT RUN.
         let sysroot = match std::env::var_os("SystemRoot") {
             Some(r) => r,
-            None => return,
+            None => aterm_spec::host::could_not_run("no %SystemRoot% here"),
         };
         let shim = Path::new(&sysroot).join("System32").join("winrm.cmd");
         if !shim.is_file() {
-            return;
+            aterm_spec::host::could_not_run("this Windows SKU ships no System32\\winrm.cmd");
         }
         let hit = resolve_program_windows("winrm");
         assert!(

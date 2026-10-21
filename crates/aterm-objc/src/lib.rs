@@ -27,7 +27,7 @@
 //!    its sends: run-loop sources and observers, retain/release. Each
 //!    declaration is held to the SDK headers by clang (`tests/cf_sdk.rs`).
 //!    CoreGraphics (display IDs, bounds and modes) is its own crate,
-//!    `aterm-cg`, so only the windowing backend's binaries load it.
+//!    `aterm-cg`, so only the windowing backend's and the GUI's binaries load it.
 //! 9. **[A window's content view](view)** — [`HasNsView`], the `NSView` the
 //!    windowing crate hands the Metal presenter and the GUI's chrome.
 //!

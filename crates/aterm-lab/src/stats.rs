@@ -136,9 +136,11 @@
 //!   failed`, twice each), and the dialog it opened offered no reset row:
 //!   `Stop and wait …`, `Wait here, …`, `Add funds …`, `Upgrade your plan`
 //!   (`limit-dialog-no-reset-rows`). NOTHING was pressed on it (the harness
-//!   off, `limit_reset = false`). `Use your reset now ({left} left, until
-//!   {date})` and `available again {date}` stay READ-FROM-CODE, their
-//!   fixtures composed (aterm-phase's `reset::fixtures`).
+//!   off, `limit_reset = false`). The grant rows (`Use your reset now
+//!   ({left} left, until {date})` then; 2.1.304's `Use a {kind} ({left}
+//!   left, until {date})`) and `available again {date}` stay
+//!   READ-FROM-CODE, their fixtures composed (aterm-phase's
+//!   `reset::fixtures`).
 //! * (5) THE STATUS LINE'S STDIN (`statusline TAG on`, then `show`): after
 //!   one turn, `cost.total_cost_usd` 0.045628 (`model.id`
 //!   `claude-sonnet-5-5`, PLAIN: 22.8k input, 12 output) and 0.092048

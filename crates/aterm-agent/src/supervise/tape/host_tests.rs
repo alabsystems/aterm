@@ -94,8 +94,26 @@ fn every_host_answer_reads_back_as_written() {
         untracked: 1,
         stashes: 1,
         unpushed: 3,
+        unlanded: 4,
+        main_ref: "origin/main".to_string(),
         paths: vec!["src/a.rs".to_string(), "notes/".to_string()],
+        state: Some(u64::MAX),
     }));
+    // A tape recorded before the probe read the remote's default branch:
+    // no default branch known (and before it read the work's state: none).
+    let old =
+        br#"{"repo":"/r","changed":1,"untracked":0,"stashes":0,"unpushed":2,"paths":["a.rs"]}"#;
+    assert_eq!(
+        <Option<crate::harness::repo_work::RepoWork> as TapeValue>::from_tape(old)
+            .expect("an older tape's finding"),
+        Some(crate::harness::repo_work::RepoWork {
+            repo: "/r".to_string(),
+            changed: 1,
+            unpushed: 2,
+            paths: vec!["a.rs".to_string()],
+            ..Default::default()
+        })
+    );
     same(None::<StandingLimit>);
     same(Some(StandingLimit {
         text: "You've hit your weekly limit · resets 6pm".to_string(),
@@ -124,6 +142,19 @@ fn every_host_answer_reads_back_as_written() {
             largest_other_mib: Some(1024),
         }));
     }
+    same(BackgroundEvidence::Unknown);
+    for (task, wait) in [(None, None), (Some("bplle5dxj"), Some("mutex"))] {
+        same(BackgroundEvidence::NoProgress {
+            worst: BackgroundCall {
+                pid: 27098,
+                pgid: u32::MAX,
+                exe: "aterm_gui-e0964a".to_string(),
+                task: task.map(str::to_string),
+                quiet_ms: u64::MAX,
+                wait: wait.map(str::to_string),
+            },
+        });
+    }
     same(Ok::<(), ProbeNo>(()));
     for no in ProbeNo::ALL {
         same(Err::<(), ProbeNo>(no));
@@ -132,27 +163,33 @@ fn every_host_answer_reads_back_as_written() {
     for no in ResetNo::ALL {
         same(ResetWord::No(no));
     }
-    for kind in std::iter::once(None).chain(aterm_phase::ResetKind::ALL.map(Some)) {
+    for kind in aterm_phase::ResetKind::ALL {
         same(ResetWord::Take(ResetGo {
             until: 1_789_840_800,
             long: true,
             limits: vec!["weekly".to_string(), "Opus".to_string()],
+            kind,
             left: 2,
             day: "Oct 5".to_string(),
-            kind,
         }));
     }
     for outcome in [
         ResetOutcome::Pending,
         ResetOutcome::Spent {
+            kind: aterm_phase::ResetKind::Weekly,
             asks: true,
             left: Some(1),
             cleared_at: 1_789_660_500,
         },
         ResetOutcome::Spent {
+            kind: aterm_phase::ResetKind::Full,
             asks: false,
             left: None,
             cleared_at: 0,
+        },
+        ResetOutcome::Walled {
+            kind: aterm_phase::ResetKind::Fable,
+            left: 0,
         },
         ResetOutcome::Lifted {
             asks: true,
@@ -180,6 +217,118 @@ fn every_host_answer_reads_back_as_written() {
         })),
     }));
     same(None::<Instant>);
+    let next = |label: &str, renew| {
+        Some(crate::supervise::policy::turn_end::SignInNext {
+            label: label.to_string(),
+            renew,
+        })
+    };
+    for word in [
+        None,
+        Some(RosterWord::Unlisted),
+        Some(RosterWord::Unread),
+        Some(RosterWord::Row {
+            next: None,
+            ready: None,
+            held: None,
+        }),
+        Some(RosterWord::Row {
+            next: next("work-2", true),
+            ready: None,
+            held: None,
+        }),
+        Some(RosterWord::Row {
+            next: next("work-2", true),
+            ready: None,
+            held: Some(HeldBy::Earlier),
+        }),
+        Some(RosterWord::Row {
+            next: None,
+            ready: ready("pool-a"),
+            held: Some(HeldBy::Earlier),
+        }),
+        Some(RosterWord::Row {
+            next: next("work-2", false),
+            ready: ready("pool-a"),
+            held: Some(HeldBy::Pin),
+        }),
+        Some(RosterWord::Row {
+            next: None,
+            ready: ready("pool-a"),
+            held: Some(HeldBy::Reset),
+        }),
+        Some(RosterWord::Row {
+            next: None,
+            ready: ready("pool-a"),
+            held: None,
+        }),
+    ] {
+        same(word);
+    }
+}
+
+/// A row ready to run now.
+fn ready(label: &str) -> Option<Ready> {
+    Some(Ready {
+        label: label.to_string(),
+    })
+}
+
+/// THE ROSTER'S WORD ON A TAPE AN EARLIER BUILD WROTE, from before it named
+/// a row ready to run now (acct3-5), reads back with none ready and nothing
+/// holding the tab; one from before it said what holds the tab off that row
+/// (ox4-5), with nothing holding it — which the notice's `{why}` beside a
+/// ready row tells as the limit from before this Claude Code, as that build
+/// did — and one from before a hold was kept with no row ready (r4h-4), as
+/// the hold it names. NEGATIVE CONTROLS: the word with a row ready and its
+/// hold reads back with both; a hold this build does not know is refused,
+/// not read as another.
+#[test]
+fn a_rosters_word_an_earlier_build_taped_reads_back_with_none_ready() {
+    let origin = Instant::now();
+    let take = |bytes: &[u8]| <Option<RosterWord> as HostReply>::take(bytes, origin).ok();
+    let work_2 = Some(crate::supervise::policy::turn_end::SignInNext {
+        label: "work-2".to_string(),
+        renew: true,
+    });
+    assert_eq!(
+        take(b"{\"row\":[\"work-2\",true]}"),
+        Some(Some(RosterWord::Row {
+            next: work_2.clone(),
+            ready: None,
+            held: None,
+        }))
+    );
+    assert_eq!(
+        take(b"{\"ready\":{\"next\":null,\"ready\":\"pool-a\"}}"),
+        Some(Some(RosterWord::Row {
+            next: None,
+            ready: ready("pool-a"),
+            held: None,
+        }))
+    );
+    assert_eq!(
+        take(b"{\"ready\":{\"next\":null,\"ready\":\"pool-a\",\"held\":\"pin\"}}"),
+        Some(Some(RosterWord::Row {
+            next: None,
+            ready: ready("pool-a"),
+            held: Some(HeldBy::Pin),
+        }))
+    );
+    assert_eq!(
+        take(b"{\"held\":{\"next\":[\"work-2\",true],\"held\":\"earlier\"}}"),
+        Some(Some(RosterWord::Row {
+            next: work_2,
+            ready: None,
+            held: Some(HeldBy::Earlier),
+        }))
+    );
+    for unknown in [
+        &b"{\"ready\":{\"next\":null,\"ready\":\"pool-a\",\"held\":\"later\"}}"[..],
+        &b"{\"held\":{\"next\":null,\"held\":\"later\"}}"[..],
+    ] {
+        assert_eq!(take(unknown), None);
+    }
 }
 
 /// AN ANSWER THAT HOLDS AN INSTANT is written from the recording's origin and
@@ -248,11 +397,36 @@ fn an_answer_this_build_did_not_write_is_refused() {
     assert!(refused::<Result<(), ProbeNo>>(b"\"not-a-word\""));
     assert!(refused::<ResetWord>(b"{\"no\":\"never\"}"));
     assert!(refused::<ResetWord>(b"\"maybe\""));
+    // A go for a kind of reset this build does not know, and one written
+    // before a go carried its row's kind: refused, never a reset guessed (a
+    // reset step taped before the 2.1.304 port does not replay: host.rs's
+    // `ResetWordWire`). CONTROL: the same go with a kind it knows is read.
+    let take = |kind: &str| {
+        format!(
+            "{{\"take\":{{\"until\":1,\"long\":true,\"limits\":[\"weekly\"],{kind}\"left\":2,\
+             \"day\":\"Oct 5\"}}}}"
+        )
+    };
     assert!(refused::<ResetWord>(
-        b"{\"take\":{\"until\":1,\"long\":true,\"limits\":[],\"left\":2,\"day\":\"Oct 5\",\
-          \"kind\":\"monthly\"}}"
+        take("\"kind\":\"hourly\",").as_bytes()
+    ));
+    assert!(refused::<ResetWord>(take("").as_bytes()));
+    assert!(!refused::<ResetWord>(
+        take("\"kind\":\"weekly\",").as_bytes()
     ));
     assert!(refused::<ResetOutcome>(b"\"spent\""));
+    // A spend with a kind this build does not know, and one written before
+    // a spend carried its kind: refused, as the go is. CONTROL: with one.
+    let spent =
+        |kind: &str| format!("{{\"spent\":{{{kind}\"asks\":true,\"left\":1,\"cleared_at\":5}}}}");
+    assert!(refused::<ResetOutcome>(
+        spent("\"kind\":\"hourly\",").as_bytes()
+    ));
+    assert!(refused::<ResetOutcome>(spent("").as_bytes()));
+    assert!(!refused::<ResetOutcome>(
+        spent("\"kind\":\"full\",").as_bytes()
+    ));
+    assert!(refused::<ResetOutcome>(b"{\"walled\":{\"left\":0}}"));
     assert!(refused::<Reach>(b"\"sideways\""));
     assert!(refused::<Option<HostStep>>(
         b"{\"line\":\"x\",\"moved\":true,\"typed\":\"song\",\"repeat\":false}"
@@ -267,6 +441,10 @@ fn an_answer_this_build_did_not_write_is_refused() {
     assert!(refused::<Option<(String, HostTurn)>>(b"{\"line\":\"x\"}"));
     assert!(refused::<Option<String>>(b"not json"));
     assert!(refused::<Option<AccountAdvice>>(b"{\"wait\":{}}"));
+    assert!(refused::<BackgroundEvidence>(b"\"all-stuck\""));
+    assert!(refused::<BackgroundEvidence>(
+        b"{\"no-progress\":{\"pid\":1,\"exe\":\"x\",\"task\":null,\"quiet_ms\":1,\"wait\":null}}"
+    ));
 }
 
 /// A LINE TYPED AT A BREAK ON A TAPE AN EARLIER BUILD WROTE, from before
@@ -283,29 +461,6 @@ fn a_break_line_an_earlier_build_taped_reads_back_as_the_notice() {
     assert_eq!(
         <Option<(String, HostTurn)> as HostReply>::take(b"null", origin).ok(),
         Some(None)
-    );
-}
-
-/// A RESET'S GO ON A TAPE AN EARLIER BUILD WROTE, from before Claude Code
-/// 2.1.304's rows named a kind of reset, reads back as a go for a row that
-/// named none. NEGATIVE CONTROL: the same go with a kind reads back with it.
-#[test]
-fn a_resets_go_an_earlier_build_taped_reads_back_with_no_kind() {
-    let origin = Instant::now();
-    let take = |bytes: &[u8]| match <ResetWord as HostReply>::take(bytes, origin) {
-        Ok(ResetWord::Take(go)) => go.kind,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(
-        take(b"{\"take\":{\"until\":1,\"long\":true,\"limits\":[],\"left\":2,\"day\":\"Oct 5\"}}"),
-        None
-    );
-    assert_eq!(
-        take(
-            b"{\"take\":{\"until\":1,\"long\":true,\"limits\":[],\"left\":2,\"day\":\"Oct 5\",\
-              \"kind\":\"full\"}}"
-        ),
-        Some(aterm_phase::ResetKind::Full)
     );
 }
 

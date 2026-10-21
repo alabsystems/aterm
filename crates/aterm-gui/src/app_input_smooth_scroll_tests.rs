@@ -922,6 +922,7 @@ fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
     // (`control::control_input::parse_mouse`): N notches, each worth the
     // platform's lines-per-detent as a hand's notch is.
     let notch = i64::from(crate::input::wheel_platform_lines(
+        crate::input::WheelPlatform::Host,
         1,
         app.windows[&wid].rows,
         true,

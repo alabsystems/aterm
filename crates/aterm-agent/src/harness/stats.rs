@@ -40,6 +40,7 @@
 //! | journal | `cleared` of a badge (`box`, `turn-end`, `goal`, `memory`, `stale`, `hidden`, a limit's `attention=`; a leading `seq=-` passed over) | the wait closes — [`HarnessStats::human_wait_ms`] — only on `attention=OK` or the explicit `attention=none`; refused or unknown results leave it open |
 //! | journal | `FROZEN` (kind `other`, [`FROZEN`]): a stall's hold, which takes the loop's point badge down with no `CLEARED` line | the wait closes only on `attention=OK` or `attention=none`; kept, skipped, refused and unknown results leave it open |
 //! | journal | `exit`, `timeout`: a loop's end | the session's open wait ends, counting nothing |
+//! | journal | `needs` whose entry went up (`attention=OK`): the worker's NEEDS YOU on the person's screen | [`HarnessStats::needs_told`] (no escalation, no wait; its `CLEARED … needs` closes none) |
 //! | journal | every other kind | nothing but [`HarnessStats::rows`] (its `approved`, `declined`, `typed`, `continued` and `unproven` lines repeat the ledger's rows) |
 //! | upgrade | `relaunched` on the build it ran | [`HarnessStats::relaunched`] (a crash relaunched, a restart in place) |
 //! | upgrade | `relaunched` onto another build | [`HarnessStats::upgraded`] |
@@ -208,6 +209,10 @@ pub struct HarnessStats {
     pub resumed: u64,
     /// Points handed to a person (a box, a question, a limit, a turn end).
     pub escalated: u64,
+    /// The worker's NEEDS YOU sets put on the person's screen (the journal's
+    /// `NEEDS` lines whose entry went up, `attention=OK`): told, never an
+    /// escalation — the worker carried on — and no person's wait.
+    pub needs_told: u64,
     /// How long escalations waited on a person, inside the window: while a
     /// badge of the loop's stood, from the `ESCALATED` (or `ADOPTED`) that
     /// raised it to the `CLEARED` that took it down (module docs, THE WAITS).
@@ -268,6 +273,8 @@ pub struct Tally {
     pub resumed: u64,
     /// [`HarnessStats::escalated`]'s share.
     pub escalated: u64,
+    /// [`HarnessStats::needs_told`]' share.
+    pub needs_told: u64,
     /// [`HarnessStats::human_wait_ms`]' share.
     pub human_wait_ms: u64,
     /// [`HarnessStats::limit_wait_ms`]' share.
@@ -293,6 +300,8 @@ enum Count {
     Unproven,
     /// A point handed to a person.
     Escalated,
+    /// A NEEDS YOU set put on the person's screen.
+    NeedsTold,
     /// An agent started again on the build it ran.
     Relaunched,
     /// An agent relaunched onto another build.
@@ -329,6 +338,7 @@ impl Counts for HarnessStats {
             },
             Count::Unproven => &mut self.unproven,
             Count::Escalated => &mut self.escalated,
+            Count::NeedsTold => &mut self.needs_told,
             Count::Relaunched => &mut self.relaunched,
             Count::Upgraded => &mut self.upgraded,
         }
@@ -355,6 +365,7 @@ impl Counts for Tally {
             },
             Count::Unproven => &mut self.unproven,
             Count::Escalated => &mut self.escalated,
+            Count::NeedsTold => &mut self.needs_told,
             Count::Relaunched => &mut self.relaunched,
             Count::Upgraded => &mut self.upgraded,
         }
@@ -582,7 +593,7 @@ pub struct Decision {
     pub said: bool,
     /// [`DecisionKind::Chose`]: the options chosen, `; ` between them;
     /// [`DecisionKind::Answered`]: the answer's words (`the land answer:
-    /// finish cleanly soonest, start nothing new`);
+    /// land all of the work on the remote main soonest, start nothing new`);
     /// [`DecisionKind::Unproven`]: the option full power chose where its
     /// ledger names one (`No, keep default`, `Stop and wait for limit to
     /// reset`; [`SUBJECT_OPTION`]), empty for a one-shot allow's or a trust
@@ -1179,7 +1190,9 @@ fn box_option<'a>(rule: &str, command: &'a str) -> (&'a str, Option<&'a str>) {
 /// typed (`command`), cut inside its quotes so they close.
 fn prose_answer_words(rule: &str, command: &str) -> Box<str> {
     match rule {
-        RULE_LAND_ANSWER => Box::from("the land answer: finish cleanly soonest, start nothing new"),
+        RULE_LAND_ANSWER => Box::from(
+            "the land answer: land all of the work on the remote main soonest, start nothing new",
+        ),
         RULE_PROSE_LONG_TERM => {
             Box::from("the long-term answer: decide for long-term correctness and total value")
         }
@@ -1488,6 +1501,16 @@ fn takes_badge_down(summary: &str) -> bool {
     cleared_reply(reply)
 }
 
+/// Whether a `NEEDS` line's tail (`count=<k> attention=<reply> <need>`,
+/// [`crate::supervise::journal::NEEDS`]) says its entry went up: the reply
+/// is `OK`.
+fn needs_went_up(summary: &str) -> bool {
+    summary
+        .split(' ')
+        .find_map(|w| w.strip_prefix("attention="))
+        .is_some_and(|reply| reply.strip_suffix(':').unwrap_or(reply) == "OK")
+}
+
 /// The writer's successful unset reply, or its explicit report that it
 /// holds no entry. Never infer a change from a refusal or an unknown word.
 fn cleared_reply(reply: &str) -> bool {
@@ -1544,6 +1567,7 @@ pub fn fold_journal(acc: &mut HarnessStats, recs: &[JournalRecord]) {
                 }
             },
             "cleared" if takes_badge_down(&r.summary) => acc.badge_down(sid, r.t),
+            "needs" if inside && needs_went_up(&r.summary) => acc.count(sid, Count::NeedsTold),
             // The loop's end: what its badges did after it is in no journal
             // of its own — the next loop ADOPTS a badge it was handed, and
             // opens the wait anew there.

@@ -99,8 +99,14 @@ pub const PATH_MARK: char = '\u{2302}'; // ⌂
 pub const BRANCH_MARK: char = '\u{2387}'; // ⎇
 /// The mark before the account the process runs on.
 pub const ACCOUNT_MARK: char = '\u{2386}'; // ⎆
+/// The mark before the selected account's subscription plan.
+pub const PLAN_MARK: char = '\u{25c7}'; // ◇
+/// The mark before the selected account's weekly quota.
+pub const WEEKLY_MARK: char = '\u{25f7}'; // ◷
 /// The mark before a limit wall the session hit.
 pub const WALL_MARK: char = '\u{29D7}'; // ⧗
+/// The mark before the session's context window indicator.
+pub const CONTEXT_MARK: char = '\u{25D0}'; // ◐
 /// The mark before the session's usage.
 pub const USAGE_MARK: char = '\u{03A3}'; // Σ
 /// The mark inside a limit wall that stands for "resets" (`⧗ 5h ♻ 3pm`). Not
@@ -220,6 +226,11 @@ pub struct FooterFacts {
     /// resolver fills it, from the process's own exec environment. Shown
     /// after the model, whole or not at all ([`facts_ladder`]).
     pub account: Option<String>,
+    /// Volatile email, subscription and weekly quota from the selected process's own
+    /// profile. Replaced on every read, including account changes and missing data.
+    pub subscription: Option<super::profile::SubscriptionDisplay>,
+    /// Standardized context budget indicator (`ctx 84% left` or `ctx auto`).
+    pub context: Option<String>,
 }
 
 /// One wording of an [`UpgradeNote`]: whole, and short for a narrow rule.
@@ -2546,6 +2557,8 @@ fn facts_for_entry_from(
         }),
         upgrade: None,
         account: None,
+        subscription: None,
+        context: None,
     }
 }
 
@@ -2555,28 +2568,41 @@ fn facts_for_entry_from(
 /// is not plainly a name.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<aterm_phase::LaunchCard> {
-    if let Some(card) = live_repl_row(rows).and_then(|_| aterm_phase::launch_card(rows)) {
-        return Some(aterm_phase::LaunchCard {
-            model: footer_model_name(&card.model)?,
-            effort: card
-                .effort
-                .as_deref()
-                .and_then(effort_level)
-                .map(str::to_owned),
-            version: card.version,
-        });
+    launch_card_read(rows).map(|(_, read)| read.card)
+}
+
+/// [`launch_card`] with the reader that read it (Claude Code's, agy's or
+/// Muse Code's) and the rows it was read from
+/// ([`aterm_phase::LaunchCardRead`]): what the host holds to the rows the
+/// program in front drew before it keeps the card for its facts (the
+/// harness card's gate, card engine §3.8).
+#[must_use]
+pub fn launch_card_read(
+    rows: &[String],
+) -> Option<(aterm_phase::Program, aterm_phase::LaunchCardRead)> {
+    let named = |read: aterm_phase::LaunchCardRead| {
+        let card = read.card;
+        Some(aterm_phase::LaunchCardRead {
+            card: aterm_phase::LaunchCard {
+                model: footer_model_name(&card.model)?,
+                effort: card
+                    .effort
+                    .as_deref()
+                    .and_then(effort_level)
+                    .map(str::to_owned),
+                version: card.version,
+            },
+            ..read
+        })
+    };
+    if let Some(read) = live_repl_row(rows).and_then(|_| aterm_phase::launch_card_read(rows)) {
+        return Some((aterm_phase::Program::Claude, named(read)?));
     }
-    let card =
-        aterm_phase::agy::launch_card(rows).or_else(|| aterm_phase::muse::launch_card(rows))?;
-    Some(aterm_phase::LaunchCard {
-        model: footer_model_name(&card.model)?,
-        effort: card
-            .effort
-            .as_deref()
-            .and_then(effort_level)
-            .map(str::to_owned),
-        version: card.version,
-    })
+    if let Some(read) = aterm_phase::agy::launch_card_read(rows) {
+        return Some((aterm_phase::Program::Agy, named(read)?));
+    }
+    let read = aterm_phase::muse::launch_card_read(rows)?;
+    Some((aterm_phase::Program::Muse, named(read)?))
 }
 
 impl FooterFacts {
@@ -2947,10 +2973,37 @@ fn fact_segments(facts: &FooterFacts) -> Vec<Segment> {
                 .and_then(|u| u.wall.as_ref())
                 .map(super::session_usage::wall_text),
         ),
+        (
+            ACCOUNT_MARK,
+            facts.subscription.as_ref().map(|s| {
+                s.email
+                    .clone()
+                    .unwrap_or_else(|| "account unavailable".into())
+            }),
+        ),
+        (
+            PLAN_MARK,
+            facts.subscription.as_ref().and_then(|s| s.plan.clone()),
+        ),
+        (
+            WEEKLY_MARK,
+            facts.subscription.as_ref().map(|s| {
+                s.weekly
+                    .clone()
+                    .unwrap_or_else(|| "weekly unavailable".into())
+            }),
+        ),
         (MODEL_MARK, model_effort),
-        (ACCOUNT_MARK, facts.account.clone()),
+        (
+            ACCOUNT_MARK,
+            facts
+                .account
+                .clone()
+                .filter(|_| facts.subscription.is_none()),
+        ),
         (PATH_MARK, facts.path.clone()),
         (BRANCH_MARK, facts.branch.clone()),
+        (CONTEXT_MARK, facts.context.clone()),
         (
             USAGE_MARK,
             usage.and_then(|u| {
@@ -2976,10 +3029,7 @@ fn model_alone(facts: &FooterFacts) -> Option<Segment> {
 /// or a control none (the painter leaves those out).
 #[must_use]
 pub fn text_width(text: &str) -> usize {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .map(aterm_grapheme::char_width)
-        .sum()
+    aterm_grapheme::str_grid_columns(text)
 }
 
 /// The cells `segments` take on the glass, set ([`set_facts`]).
@@ -3013,6 +3063,10 @@ pub struct SetFacts {
     pub cells: usize,
     /// Every glyph, in reading order, each in a cell of its own.
     pub glyphs: Vec<SetGlyph>,
+    /// Native emoji clusters at their set lead cell.
+    pub clusters: Vec<(usize, Box<str>)>,
+    /// Native combining marks at their set base cell.
+    pub combining: Vec<(usize, Box<[char]>)>,
 }
 
 /// Set the facts as a line of type: each fact a mark, a space and its value,
@@ -3035,36 +3089,91 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
     // Each glyph's place on the line, in pitches from its start.
     let mut glyphs: Vec<SetGlyph> = Vec::new();
     let mut place: Vec<f32> = Vec::new();
+    let mut clusters = Vec::new();
+    let mut combining: Vec<(usize, Vec<char>)> = Vec::new();
+    let mut native_pitch = false;
     let mut line = 0.0f32;
     for (i, segment) in segments.iter().enumerate() {
         if i > 0 {
             line += GAP;
         }
-        let chars = std::iter::once((segment.mark, true))
-            .chain(std::iter::once((' ', false)))
-            .chain(segment.text.chars().map(|ch| (ch, false)));
-        for (ch, mark) in chars {
-            let cols = if ch.is_control() {
-                0
-            } else {
-                aterm_grapheme::char_width(ch)
-            };
-            if cols == 0 {
-                continue;
+        let mut mark_buf = [0; 4];
+        let mark_text = segment.mark.encode_utf8(&mut mark_buf);
+        for (text, mark) in [
+            (mark_text as &str, true),
+            (" ", false),
+            (&segment.text, false),
+        ] {
+            let mut grid = aterm_grapheme::GridColumns::new();
+            let mut base = None;
+            for cluster in aterm_grapheme::split_graphemes(text) {
+                if cluster.is_emoji || cluster.text.contains('\u{20e3}') {
+                    // Color glyphs keep native size and ignore Sub nudges. A
+                    // mixed run must keep native pitch too, so adjacent text
+                    // (such as an email's @) cannot slide under the emoji.
+                    native_pitch |= cluster.width == 2
+                        && (cluster.codepoint_count > 1
+                            || cluster
+                                .text
+                                .chars()
+                                .next()
+                                .is_some_and(aterm_grapheme::is_emoji_presentation));
+                    grid.advance_str(cluster.text);
+                    let index = glyphs.len();
+                    place.push(line);
+                    glyphs.push(SetGlyph {
+                        ch: cluster.text.chars().next().unwrap_or(' '),
+                        cell: 0,
+                        cols: cluster.width,
+                        nudge: 0,
+                        mark,
+                    });
+                    if cluster.codepoint_count > 1 {
+                        clusters.push((index, Box::<str>::from(cluster.text)));
+                    }
+                    line += cluster.width as f32;
+                    base = Some(index);
+                    continue;
+                }
+                // Match the native grid: a non-emoji cluster may open several
+                // cells, while its marks attach to the preceding spacing base.
+                for ch in cluster.text.chars().filter(|ch| !ch.is_control()) {
+                    match grid.step(ch) {
+                        aterm_grapheme::GridStep::Opens { width, .. } => {
+                            if ch.is_whitespace() {
+                                line += width as f32;
+                                base = None;
+                                continue;
+                            }
+                            base = Some(glyphs.len());
+                            place.push(line);
+                            glyphs.push(SetGlyph {
+                                ch,
+                                cell: 0,
+                                cols: width,
+                                nudge: 0,
+                                mark,
+                            });
+                            line += width as f32;
+                        }
+                        step => {
+                            if let Some(index) = base {
+                                if step == (aterm_grapheme::GridStep::Joins { widened: true }) {
+                                    line += (2 - glyphs[index].cols) as f32;
+                                    glyphs[index].cols = 2;
+                                }
+                                if let Some((_, marks)) =
+                                    combining.last_mut().filter(|(at, _)| *at == index)
+                                {
+                                    marks.push(ch);
+                                } else {
+                                    combining.push((index, vec![ch]));
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            if ch.is_whitespace() {
-                line += cols as f32;
-                continue;
-            }
-            place.push(line);
-            glyphs.push(SetGlyph {
-                ch,
-                cell: 0,
-                cols,
-                nudge: 0,
-                mark,
-            });
-            line += cols as f32;
         }
     }
     let ink: usize = glyphs.iter().map(|g| g.cols).sum();
@@ -3074,7 +3183,8 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
     let reach = f32::from(i8::MAX) / f32::from(NUDGES_PER_CELL);
     // A line of at most a few hundred pitches; the hair under `ceil` keeps a
     // whole product (`25 * 0.8`) from rounding up a cell.
-    let mut cells = ((line * FACT_PITCH - 1e-3).ceil() as usize).max(ink);
+    let pitch = if native_pitch { 1.0 } else { FACT_PITCH };
+    let mut cells = ((line * pitch - 1e-3).ceil() as usize).max(ink);
     loop {
         let pitch = cells as f32 / line;
         // The cells before each glyph's, and the cell it would lead from if
@@ -3122,7 +3232,18 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
             g.nudge = (moved * f32::from(NUDGES_PER_CELL)).round() as i8;
         }
         if fits {
-            return SetFacts { cells, glyphs: set };
+            return SetFacts {
+                cells,
+                clusters: clusters
+                    .into_iter()
+                    .map(|(index, text)| (set[index].cell, text))
+                    .collect(),
+                combining: combining
+                    .into_iter()
+                    .map(|(index, marks)| (set[index].cell, marks.into_boxed_slice()))
+                    .collect(),
+                glyphs: set,
+            };
         }
         cells += 1;
     }
@@ -3290,15 +3411,22 @@ fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
-/// The model-and-effort segment and a limit wall of `rung`: what a reason —
-/// a light's, or the upgrade's note — never takes the room of ([`fit_rule`]).
+/// What a reason never takes the room of ([`fit_rule`]): a standing limit
+/// and subscription identity/quota, or model and effort without a subscription.
 fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
-    rung.iter()
-        .filter(|s| s.mark == MODEL_MARK || s.mark == WALL_MARK)
+    let subscription = rung.iter().any(|s| s.mark == WEEKLY_MARK);
+    rung.iter().filter(move |s| {
+        s.mark == WALL_MARK
+            || (!subscription && s.mark == MODEL_MARK)
+            || (subscription && (s.mark == ACCOUNT_MARK || s.mark == WEEKLY_MARK))
+    })
 }
 
 /// [`facts_ladder`] of the facts alone, with no upgrade note.
 fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
+    if facts.subscription.is_some() {
+        return subscription_ladder(facts);
+    }
     let whole = fact_segments(facts);
     let mark = |mark: char| whole.iter().find(|s| s.mark == mark).cloned();
     let (wall, model_effort, account, path, branch) = (
@@ -3401,6 +3529,82 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
+/// The explicit subscription display keeps identity and weekly quota after secondary
+/// workspace and usage details have given way. The native footer without this display
+/// keeps its established ladder above.
+fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
+    let mut rung = fact_segments(facts);
+    let mut out = vec![rung.clone()];
+    for mark in [
+        CONTEXT_MARK,
+        USAGE_MARK,
+        BRANCH_MARK,
+        PATH_MARK,
+        MODEL_MARK,
+        PLAN_MARK,
+    ] {
+        rung.retain(|segment| segment.mark != mark);
+        if out.last() != Some(&rung) {
+            out.push(rung.clone());
+        }
+    }
+    // Keep both essentials on small panes, shortening the email before the quota.
+    for limit in [24, 18, 12, 8] {
+        let mut short = rung.clone();
+        if shorten_subscription_account(&mut short, limit) && out.last() != Some(&short) {
+            out.push(short);
+        }
+    }
+    // A standing limit is actionable. Keep it beside the controls even when
+    // identity and weekly quota no longer fit; only an overlong wall yields.
+    if let Some(wall) = rung.iter().find(|s| s.mark == WALL_MARK).cloned() {
+        out.push(vec![wall]);
+        let mut without_wall = facts.clone();
+        if let Some(usage) = &mut without_wall.usage {
+            usage.wall = None;
+        }
+        out.extend(subscription_ladder(&without_wall));
+    }
+    out
+}
+
+/// Shorten by display columns, so an international account does not reserve
+/// twice the intended room when the control block is built.
+fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool {
+    let Some(account) = segments.iter_mut().find(|s| s.mark == ACCOUNT_MARK) else {
+        return false;
+    };
+    if text_width(&account.text) <= limit {
+        return false;
+    }
+    account.text = aterm_grapheme::grid_graphemes(&account.text)
+        .take_while(|cluster| cluster.end_col <= limit.saturating_sub(1))
+        .map(|cluster| cluster.text)
+        .chain(std::iter::once("…"))
+        .collect();
+    true
+}
+
+/// The account/quota pair that controls must leave room for. A limit wall
+/// retains priority when a pane cannot hold it and the pair together.
+fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
+    let segments = fact_segments(facts);
+    let wall = segments.iter().find(|s| s.mark == WALL_MARK).cloned();
+    let mut essentials: Vec<_> = segments
+        .into_iter()
+        .filter(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK))
+        .collect();
+    shorten_subscription_account(&mut essentials, 8);
+    let with_wall: Vec<_> = wall.iter().cloned().chain(essentials.clone()).collect();
+    [with_wall.as_slice(), wall.as_slice(), essentials.as_slice()]
+        .into_iter()
+        .filter(|segments| !segments.is_empty())
+        .map(|segments| rule_width(segments, TitleFit::None, false, None))
+        // Leave at least one control glyph with its two surrounding blanks.
+        .find(|width| width + RULE_SEP + 3 <= room)
+        .unwrap_or(0)
+}
+
 /// What of the facts and lights fits `room` cells of the rule ([`rule_room`]).
 /// Order of giving way:
 ///
@@ -3419,12 +3623,16 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 ///   refusal) goes whole, then, short, takes the tokens', account's, branch's
 ///   and path's room (never the effort's, the model's or a limit wall's); a
 ///   reason too long even beside the model and effort goes, and the facts come
-///   back;
+///   back. With an explicit subscription display, identity and weekly quota
+///   replace model and effort in that protected set, so a reason can take the
+///   model's room while the account, weekly quota and limit wall stay visible;
 /// * a live upgrade's note ([`FooterFacts::upgrade`]) gives way the same way
 ///   ([`facts_ladder`]), and yields to a light's reason where the two do not
 ///   fit together;
 /// * then the facts give way ([`facts_ladder`]), then the chips, and the model
-///   goes last.
+///   goes last without a subscription display. A subscription reserves identity
+///   and weekly quota ahead of the model; controls and a standing limit remain
+///   available when a pane cannot hold all three.
 ///
 /// Chips stand at the left end after [`RULE_LEAD`], the title right of them,
 /// facts right-aligned, so chips never move. Tries are measured in place and
@@ -3471,10 +3679,16 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         .map(|rung| (rung.as_slice(), TitleFit::None, chips));
     // Then the model without the chips, and chips narrower than the model
     // still drawn where the model cannot be.
-    let last = [(model.as_slice(), false), (&[][..], true)]
-        .into_iter()
-        .filter(|_| chips)
-        .map(|(segments, chips)| (segments, TitleFit::None, chips));
+    let last = if facts.subscription.is_some() {
+        // The chip budget reserved the subscription essentials where possible.
+        // If the pane is narrower still, keep its active controls before a model.
+        [(&[][..], true), (model.as_slice(), false)]
+    } else {
+        [(model.as_slice(), false), (&[][..], true)]
+    }
+    .into_iter()
+    .filter(|_| chips)
+    .map(|(segments, chips)| (segments, TitleFit::None, chips));
     let (segments, title, chips) = titled
         .chain(reasons)
         .chain(bare)
@@ -3489,13 +3703,18 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
 }
 
 /// The most cells the chips may take in a rule of `room` cells: what remains
-/// beside the model alone, when it fits. The lights' block is built to it and
-/// the keyboard selects only chips that fit.
+/// beside subscription identity and weekly quota, or the model alone without
+/// a subscription display. A standing limit retains priority. The lights' block
+/// is built to it and the keyboard selects only chips that fit.
 #[must_use]
 pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
-    let model_w = rule_width(model_alone(facts).as_slice(), TitleFit::None, false, None);
-    let beside = if model_w > 0 && model_w <= room {
-        model_w + RULE_SEP
+    let reserved = if facts.subscription.is_some() {
+        subscription_reservation(facts, room)
+    } else {
+        rule_width(model_alone(facts).as_slice(), TitleFit::None, false, None)
+    };
+    let beside = if reserved > 0 && reserved <= room {
+        reserved + RULE_SEP
     } else {
         0
     };

@@ -24,6 +24,13 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     let wid = WindowId(0);
     let terminal = app.windows[&wid].tab_set.active().unwrap().focus;
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    // A record stamped now: the page says `just now`, so its clock is owed
+    // the minute.
+    app.post_message(aterm_messages::Message::new(
+        aterm_messages::tags::CONFIG,
+        aterm_messages::Severity::Warn,
+        "a record the page dates",
+    ));
     assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
     let (instance, first) = app.active_native_view(wid).unwrap();
     let sibling = app.view_store.insert_native(instance).unwrap();
@@ -756,10 +763,15 @@ fn a_durable_write_awaiting_reconciliation_answers_with_what_it_wrote() {
 
 #[test]
 fn legacy_control_field_is_materialized_at_the_versioned_lane_head() {
+    // copy_on_select's default is this platform's (on, but off on Linux,
+    // where a selection already owns PRIMARY): the file names the other value
+    // and the control writes the default back.
+    let default = crate::app_config::Config::default().copy_on_select_or_default();
     let mut app = App::headless_for_test();
-    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
-        "copy_on_select = false\nfont_px = 14.0\n".to_string(),
-    )
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(format!(
+        "copy_on_select = {}\nfont_px = 14.0\n",
+        !default
+    ))
     .unwrap();
 
     // Advance the service before reducing the absolute control intent: the
@@ -786,11 +798,11 @@ fn legacy_control_field_is_materialized_at_the_versioned_lane_head() {
     let reduced = app
         .reduce_native_config_work(NativeConfigWork::ControlField {
             key: crate::prefs::EDIT_COPY_ON_SELECT.to_string(),
-            value: Some("true".to_string()),
+            value: Some(default.to_string()),
         })
         .unwrap();
     assert!(matches!(reduced, ConfigPatchResult::Applied { .. }));
-    // `true` is copy_on_select's default, so the write removes the key.
+    // The value written is copy_on_select's default, so the write removes the key.
     assert_eq!(
         app.native_config_service
             .value(crate::prefs::EDIT_COPY_ON_SELECT)
@@ -919,7 +931,8 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
             NativeConfigOrigin::View { .. }
             | NativeConfigOrigin::Control { .. }
             | NativeConfigOrigin::Presence { .. }
-            | NativeConfigOrigin::ThemeChoice { .. } => {
+            | NativeConfigOrigin::ThemeChoice { .. }
+            | NativeConfigOrigin::StatsBars { .. } => {
                 panic!("unexpected non-Serious-Mode request")
             }
         };
@@ -988,7 +1001,8 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
                 NativeConfigOrigin::View { .. }
                 | NativeConfigOrigin::Control { .. }
                 | NativeConfigOrigin::Presence { .. }
-                | NativeConfigOrigin::ThemeChoice { .. } => {
+                | NativeConfigOrigin::ThemeChoice { .. }
+                | NativeConfigOrigin::StatsBars { .. } => {
                     panic!("unexpected non-Serious-Mode request")
                 }
             })
@@ -3471,6 +3485,58 @@ fn a_parked_control_apply_rides_the_next_newer_facts_instead_of_going_stale() {
     );
 }
 
+/// A SEAMLESS SUCCESSOR'S OWN UPDATE FACTS OUTLIVE ITS COMMIT WAIT (round eight of
+/// the update audit, U14). The successor asks the facts worker for its Startup
+/// read as it boots; the answer usually lands inside the overlap, before the
+/// Commit, and nothing asks again after it. Swallowed there, a restored Settings ▸
+/// Software Update page kept the pristine reducer's "You're up to date." while the
+/// ledger said updates had been failing for half an hour. Now the answer waits for
+/// the Commit wake, which reduces it once this process is no candidate.
+///
+/// RED before the change: the wake was dropped, nothing was held, and the headline
+/// stayed "You're up to date." with no republish. NEGATIVE CONTROL: before its
+/// Commit the candidate reduces nothing.
+#[cfg(unix)]
+#[test]
+fn a_successors_startup_update_facts_survive_the_commit_wait() {
+    let mut app = App::headless_for_test();
+    app.incoming_handoff_pending = true;
+    let mut failing = status(None, 9);
+    failing.failing_persistent = true;
+    failing.failing_kind = "manifest".to_string();
+    let wake = crate::Wake::NativeUpdateReconcileFinished {
+        purpose: NativeUpdateReconcilePurpose::Startup,
+        facts: reconcile_facts(1, 1, Some(failing)),
+    };
+    assert!(
+        app.admit_wake_before_commit(wake).is_none(),
+        "a candidate does not act on it before its Commit"
+    );
+    assert_ne!(
+        app.update_snapshot(false).projection().headline,
+        "Updates are failing on this machine.",
+        "NEGATIVE: nothing is reduced before the Commit"
+    );
+    // The Commit wake: the handoff is no longer pending, and what was held runs
+    // through `user_event`, whose arm for this wake is this call.
+    app.incoming_handoff_pending = false;
+    let published = FULL_UPDATE_PUBLISHES.with(std::cell::Cell::get);
+    for held in std::mem::take(&mut app.handoff_committed_wakes) {
+        let crate::Wake::NativeUpdateReconcileFinished { purpose, facts } = held else {
+            panic!("only the update facts were held");
+        };
+        app.finish_native_update_reconcile(purpose, facts);
+    }
+    assert_eq!(
+        app.update_snapshot(false).projection().headline,
+        "Updates are failing on this machine."
+    );
+    assert!(
+        FULL_UPDATE_PUBLISHES.with(std::cell::Cell::get) > published,
+        "the restored page is republished"
+    );
+}
+
 fn start(service: &mut NativeUpdaterService) -> UpdaterWorkTicket {
     match service.request_check() {
         CheckStart::Start(ticket) => ticket,
@@ -3481,7 +3547,7 @@ fn start(service: &mut NativeUpdaterService) -> UpdaterWorkTicket {
 /// `arm_native_auto_apply` applies each `arm` decision to the retained
 /// intent (the decisions themselves are `native_update_auto_intent`'s): the
 /// same exact target keeps its backoff and attempt count; a newer build
-/// replaces it, fresh, one quiet epoch out; a manual-only latch on exactly
+/// replaces it, fresh, due at once; a manual-only latch on exactly
 /// these bytes survives duplicate wakes while new bytes re-arm and release
 /// it; and `[update] auto_apply = false` clears the retained intent.
 #[test]
@@ -3510,8 +3576,10 @@ fn arm_applies_each_decision_to_the_retained_intent() {
         (intent.build, intent.dmg_sha256, intent.attempts),
         (current + 2, [0xcd; 32], 0)
     );
-    assert!(intent.retry_at >= before + crate::AUTOMATIC_UPDATE_QUIET_EPOCH);
-    assert!(intent.retry_at <= after + crate::AUTOMATIC_UPDATE_QUIET_EPOCH);
+    assert!(
+        intent.retry_at >= before && intent.retry_at <= after,
+        "due at once"
+    );
 
     let latch = crate::AutoApplyManualOnly {
         build: current + 2,
@@ -5230,7 +5298,7 @@ fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended(
         .held_person_apply_deadline(now)
         .expect("the loop looks again");
     assert!(
-        next <= now + std::time::Duration::from_millis(100),
+        next <= now + super::PREVERIFY_READ_POLL,
         "within the poll: the read raises only a flag"
     );
     let records = app.messages.log().records().count();
@@ -6003,6 +6071,68 @@ fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
     assert_eq!(app.auto_apply_roster_wait, None, "the hold ends");
+    assert_eq!(
+        app.auto_apply_intent.map(|intent| intent.attempts),
+        Some(1),
+        "the attempt reached the apply preflight"
+    );
+}
+
+/// AN ARMED LANE LOOKS AT ONCE AND STARTS AS ITS CANDIDATE'S PRE-PARK READ ENDS. The arm makes the
+/// intent due at once (the quiet gate reads the epoch behind it, so a first look one epoch out only
+/// waited); while the arm-time read of exactly these bytes runs, a look holds the attempt (intent
+/// kept, nothing spent, looked at again [`super::PREVERIFY_READ_POLL`] later) instead of letting
+/// its worker verify the same bytes beside it; the first look after the read ends makes the
+/// attempt (stopped here at the preflight by a Settings draft, which counts it). Negative controls,
+/// run when this was written: the arm one quiet epoch out fails "due at once", and without the
+/// hold the look during the read makes the attempt.
+#[cfg(unix)]
+#[test]
+fn an_armed_lane_looks_at_once_and_starts_as_its_pre_park_read_ends() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let current = app.native_updater_service.snapshot().current_build;
+    let build = current + 5_034;
+    let before = std::time::Instant::now();
+    stage_one_build_for_test(&mut app, build);
+    let armed = app.auto_apply_intent.expect("the stage arms the lane");
+    assert!(
+        armed.retry_at >= before && armed.retry_at <= std::time::Instant::now(),
+        "due at once"
+    );
+    // The arm-time read of these bytes is still running, and no verdict stands yet.
+    *app.handoff_preverified
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let done = preverify_read_running(&mut app, build);
+    let _ = park_a_settings_draft_in_a_background_tab(&mut app);
+    force_auto_apply_attempt_now(&mut app);
+    let looked = std::time::Instant::now();
+    app.try_pending_native_auto_apply(false);
+    let held = app.auto_apply_intent.expect("the intent is kept");
+    assert_eq!(held.attempts, 0, "no attempt while the read runs");
+    assert!(
+        held.retry_at >= looked + super::PREVERIFY_READ_POLL
+            && held.retry_at <= std::time::Instant::now() + super::PREVERIFY_READ_POLL,
+        "looked at again one read poll later"
+    );
+
+    // The read ends with its verdict: the next look makes the attempt.
+    *app.handoff_preverified
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::HandoffPreverification {
+        build,
+        commit: PREFLIGHT_TEST_COMMIT.to_string(),
+        artifact: "ab".repeat(32),
+        at: std::time::Instant::now(),
+        passed: true,
+        reason: None,
+        policy: None,
+        grant_chunks: false,
+    });
+    done.store(true, std::sync::atomic::Ordering::Release);
+    force_auto_apply_attempt_now(&mut app);
+    app.try_pending_native_auto_apply(false);
     assert_eq!(
         app.auto_apply_intent.map(|intent| intent.attempts),
         Some(1),
@@ -7496,8 +7626,8 @@ fn tab_walks_the_whole_settings_list() {
     }
     assert_eq!(focus(&app).as_ref(), Some(&search));
     app.move_native_focus(wid, false).unwrap();
-    let first =
-        crate::native_ui::UiKey::new(format!("settings/control/{}", crate::prefs::EDIT_THEME));
+    // The theme card leads with its Follow system switch.
+    let first = crate::native_ui::UiKey::new("settings/theme-mode");
     assert_eq!(
         focus(&app).as_ref(),
         Some(&first),
@@ -8928,19 +9058,24 @@ fn theme_choice_app(toml: &str, os: aterm_types::Appearance) -> App {
 fn palette_choice_keeps_a_follow_system_pair() {
     use aterm_types::Appearance::{Dark, Light};
     let pair = "theme = \"dark:Aterm Night,light:Aterm Day\"\n";
-    for (os, written) in [
-        (Dark, "dark:Nord,light:Aterm Day"),
-        (Light, "dark:Aterm Night,light:Nord"),
+    // A theme made for the side on screen takes that side; one made for the
+    // other appearance is kept for both (Follow system off), so what is on
+    // screen stays and no slot holds a theme of the wrong appearance.
+    for (os, chosen, written) in [
+        (Dark, "Nord", "dark:Nord,light:Aterm Day"),
+        (Light, "GitHub Light", "dark:Aterm Night,light:GitHub Light"),
+        (Light, "Nord", "Nord"),
+        (Dark, "Linen", "Linen"),
     ] {
         let mut app = theme_choice_app(pair, os);
-        app.enqueue_theme_choice("Nord");
+        app.enqueue_theme_choice(chosen);
         let snapshot = complete_theme_choice(&mut app);
         assert!(
             snapshot.text.contains(&format!("theme = \"{written}\"")),
-            "{os:?}: {}",
+            "{os:?} {chosen}: {}",
             snapshot.text
         );
-        assert_eq!(app.installed_colors.id, "Nord", "{os:?}");
+        assert_eq!(app.installed_colors.id, chosen, "{os:?}");
     }
 
     let mut app = theme_choice_app(pair, Dark);
@@ -8981,6 +9116,42 @@ fn palette_choice_from_an_unset_theme_is_its_plain_name() {
         );
         assert_eq!(app.installed_colors.id, chosen, "{os:?}");
     }
+}
+
+/// A theme file whose `name =` is not its id reads the same in the palette's
+/// Theme section as in Settings: its name, the one fact separator, its id.
+/// Negative control: a file named as its id is its id alone.
+#[test]
+fn a_theme_file_reads_in_the_palette_as_it_does_in_settings() {
+    let mut app = App::headless_for_test();
+    app.reload_theme_catalog(crate::app_config::ThemeCatalog::from_schemes([
+        (
+            "studio".to_string(),
+            aterm_types::ColorScheme {
+                name: "Studio Night".to_string(),
+                ..aterm_types::ColorScheme::default()
+            },
+        ),
+        (
+            "paper".to_string(),
+            aterm_types::ColorScheme {
+                name: "paper".to_string(),
+                ..aterm_types::ColorScheme::default()
+            },
+        ),
+    ]));
+    let label = |id: &str| {
+        app.palette_themes()
+            .into_iter()
+            .find(|theme| theme.id == id)
+            .unwrap_or_else(|| panic!("{id} is listed"))
+            .label
+    };
+    assert_eq!(
+        label("studio"),
+        format!("Studio Night{}studio", crate::native_ui::FACT_SEPARATOR)
+    );
+    assert_eq!(label("paper"), "paper");
 }
 
 /// A refused theme choice reverts its preview to the configured theme and
@@ -9274,4 +9445,246 @@ fn a_segmented_control_is_one_tab_stop_and_one_arrow_model() {
         (Some(warn.clone()), true),
         "Space chooses Problems"
     );
+}
+
+/// An Editor on `text` in a fresh file under `dir`, in window 0, laid out
+/// large enough for the M-x rows: `(app, view, document, path)`.
+fn editor_app(
+    dir: &std::path::Path,
+    name: &str,
+    text: &str,
+) -> (
+    App,
+    crate::tab_model::ViewId,
+    crate::document_store::DocumentId,
+    std::path::PathBuf,
+) {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    if let Some(window) = app.windows.get_mut(&wid) {
+        window.cols = 92;
+        window.rows = 34;
+    }
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+    app.open_document_tab(crate::native_app::AppKind::Editor, &uri)
+        .unwrap();
+    let (instance, view) = app.active_native_view(wid).unwrap();
+    let document = app.native_runtime.document_id(instance).unwrap();
+    (app, view, document, path)
+}
+
+fn editor_status(app: &App, view: crate::tab_model::ViewId) -> Option<String> {
+    match app.native_runtime.view_state(view) {
+        Some(crate::native_app::AppViewState::Editor(state)) => state.status.clone(),
+        _ => panic!("an Editor view"),
+    }
+}
+
+fn editor_key(
+    key: aterm_types::keyboard::Key,
+    mods: aterm_types::keyboard::Modifiers,
+) -> crate::input::InputEvent {
+    crate::input::InputEvent::Key {
+        key,
+        mods,
+        base_layout: None,
+        layout_text: None,
+        event_type: aterm_types::keyboard::KeyEventType::Press,
+    }
+}
+
+/// `act` is a control client's gesture, so an editor command it names runs
+/// only within a control client's grant (`command_registry::editor_grant`:
+/// Read, Edit, Save). `kill-ring-save` copies text to the system
+/// clipboard, so `act` on its M-x row is refused: nothing is copied, and the
+/// reason is the caller's answer and the status line. The person's own press
+/// of the same row copies, to the kill ring and the clipboard; a control
+/// client's M-w key meets the same check in the reducer, and `act` still
+/// saves.
+#[test]
+fn act_dispatch_consults_authority() {
+    use crate::native_editor::{EditorCommand, EditorCompletionAction};
+    use aterm_types::keyboard::{Key, Modifiers};
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-editor-act-authority-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut app, view, document, path) = editor_app(&dir, "notes.txt", "alpha beta\n");
+    let wid = WindowId(0);
+    let refusal = "kill-ring-save needs clipboard authority, which this input does not carry";
+    app.dispatch_native_event(wid, AppEvent::EditorSetSelection { anchor: 0, head: 5 })
+        .unwrap();
+    app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::ExecuteCommand))
+        .unwrap();
+    app.dispatch_native_event(wid, AppEvent::InsertText("kill-ring-save".to_string()))
+        .unwrap();
+    assert_eq!(
+        crate::native_editor::command_completions("kill-ring-save").first(),
+        Some(&EditorCommand::KillRingSave)
+    );
+    let act = |app: &mut App, key: &str, action: &str| {
+        app.act_app(crate::app_control::ActRequest {
+            view,
+            ui_key: key.to_string(),
+            action: action.to_string(),
+            value: None,
+        })
+    };
+    assert_eq!(
+        act(&mut app, "editor/completion/0", "editor/completion/0"),
+        Err(refusal.to_string())
+    );
+    let board = || crate::control::PBPASTE_STUB.with(|board| board.borrow().clone());
+    assert!(app.editor_workspace.kill_ring.is_empty());
+    assert_eq!(board(), None);
+    assert_eq!(editor_status(&app, view).as_deref(), Some(refusal));
+    assert!(!app.person_gesture_refused(), "the mark ends with the act");
+
+    // The person's press of the same row copies the region.
+    app.dispatch_native_event(
+        wid,
+        AppEvent::EditorCompletion(EditorCompletionAction::Choose(0)),
+    )
+    .unwrap();
+    assert_eq!(
+        app.editor_workspace.kill_ring.front().map(String::as_str),
+        Some("alpha")
+    );
+    assert_eq!(board().as_deref(), Some("alpha"));
+
+    // A control client's M-w key reaches the reducer's own check.
+    app.dispatch_native_event(
+        wid,
+        AppEvent::EditorSetSelection {
+            anchor: 6,
+            head: 10,
+        },
+    )
+    .unwrap();
+    assert!(app.with_gesture_source(true, |app| {
+        app.native_input_event(wid, &editor_key(Key::Character('w'), Modifiers::ALT))
+    }));
+    assert_eq!(app.editor_workspace.kill_ring.len(), 1);
+    assert_eq!(editor_status(&app, view).as_deref(), Some(refusal));
+
+    // Save is in the grant.
+    app.dispatch_native_event(wid, AppEvent::InsertText("!".to_string()))
+        .unwrap();
+    act(&mut app, "editor/save-button", "editor/save").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha !\n");
+    assert_eq!(
+        app.document_store.snapshot(document).unwrap().text.as_ref(),
+        "alpha !\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A person's kill reaches the system clipboard, the kill ring's bridge
+/// (design §2.1); a control client's stays in the ring, because its input
+/// carries no Clipboard authority (`command_registry::editor_grant`), even
+/// when it joins the person's kill.
+#[test]
+fn a_persons_kill_reaches_the_clipboard_and_a_controllers_does_not() {
+    use aterm_types::keyboard::{Key, Modifiers};
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-editor-kill-clipboard-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut app, _, _, _) = editor_app(&dir, "kills.txt", "one\ntwo\n");
+    let wid = WindowId(0);
+    let board = || crate::control::PBPASTE_STUB.with(|board| board.borrow().clone());
+    let kill_line = editor_key(Key::Character('k'), Modifiers::CTRL);
+    assert_eq!(board(), None);
+    assert!(app.native_input_event(wid, &kill_line));
+    assert_eq!(board().as_deref(), Some("one"));
+    assert!(app.with_gesture_source(true, |app| app.native_input_event(wid, &kill_line)));
+    assert_eq!(
+        app.editor_workspace.kill_ring.front().map(String::as_str),
+        Some("one\n")
+    );
+    assert_eq!(board().as_deref(), Some("one"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The closing keys close the Editor view the way ⌘W does: `C-x k` with
+/// another buffer's file URI closes that buffer's tab and leaves the person
+/// where they were, and `C-x C-c` closes this one. `C-c C-c` with no client
+/// waiting on the file closes nothing and says so.
+#[test]
+fn closing_keys_close_the_editor_view() {
+    use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-editor-close-keys-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut app, first_view, first_document, _) = editor_app(&dir, "first.txt", "one\n");
+    let wid = WindowId(0);
+    let second = dir.join("second.txt");
+    std::fs::write(&second, "two\n").unwrap();
+    let second_uri = crate::native_document_host::path_to_file_uri(&second).unwrap();
+    app.open_document_tab(crate::native_app::AppKind::Editor, &second_uri)
+        .unwrap();
+    let (_, second_view) = app.active_native_view(wid).unwrap();
+    assert_ne!(second_view, first_view);
+    let tabs = |app: &App| app.windows.get(&wid).unwrap().tab_set.len();
+    // The window's own first tab, and the two Editors.
+    let opened = tabs(&app);
+    let first_uri = app
+        .document_store
+        .canonical_uri(first_document)
+        .unwrap()
+        .to_string();
+    let press = |app: &mut App, keys: &[crate::input::InputEvent]| {
+        for key in keys {
+            assert!(app.native_input_event(wid, key));
+        }
+    };
+    let ctrl = |c| editor_key(Key::Character(c), Modifiers::CTRL);
+
+    press(&mut app, &[ctrl('c'), ctrl('c')]);
+    assert_eq!(
+        editor_status(&app, second_view).as_deref(),
+        Some("nothing is waiting on this file; C-x C-s saves")
+    );
+    assert_eq!(tabs(&app), opened);
+
+    press(
+        &mut app,
+        &[
+            ctrl('x'),
+            editor_key(Key::Character('k'), Modifiers::empty()),
+        ],
+    );
+    app.dispatch_native_event(wid, AppEvent::InsertText(first_uri))
+        .unwrap();
+    press(
+        &mut app,
+        &[editor_key(Key::Named(NamedKey::Enter), Modifiers::empty())],
+    );
+    assert_eq!(tabs(&app), opened - 1);
+    assert_eq!(
+        app.active_native_view(wid).map(|(_, view)| view),
+        Some(second_view)
+    );
+    assert!(app.view_store.get(first_view).is_none());
+    assert_eq!(
+        editor_status(&app, second_view).as_deref(),
+        Some("Killed buffer first.txt")
+    );
+
+    press(&mut app, &[ctrl('x'), ctrl('c')]);
+    assert_eq!(tabs(&app), opened - 2);
+    assert!(app.view_store.get(second_view).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }

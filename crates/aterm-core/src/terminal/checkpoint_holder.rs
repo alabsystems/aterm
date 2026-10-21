@@ -9,7 +9,9 @@
 //!
 //! These ride the keyframes the crash journal and the seamless rungs restore
 //! from; no tail record carries them (an older reader stops at an unknown
-//! kind). A replayed terminal never cuts, so its fence is empty.
+//! kind). A replay does not observe holder cuts; output before host adoption
+//! taints its carried current mark and disables the old command-start seed,
+//! including across an intermediate checkpoint.
 //!
 //! A restore installs the fence only whole: a repr whose spans do not name
 //! the anchors it carries, or that breaks a bound, installs as no fence at
@@ -84,7 +86,8 @@ pub struct HolderMarkRepr {
 }
 
 /// The holder fence and the main grid's anchors. `Default` (no mark, no
-/// anchor) is a session in which no drawer ran; the wire omits it.
+/// anchor and no seed uncertainty) is a session in which no drawer ran; the
+/// wire omits it. An otherwise empty uncertain carry keeps its one bit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HolderRepr {
@@ -109,10 +112,18 @@ pub struct HolderRepr {
     /// The anchor set's seal epoch.
     #[cfg_attr(feature = "serde", serde(default))]
     pub seal_epoch: u64,
+    /// Output arrived while a restored fence awaited host adoption. The
+    /// carried command's C cannot seed a range in this restored lineage.
+    /// Older checkpoints omit it; older readers ignore this new qualification.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "core::ops::Not::not")
+    )]
+    pub seed_untrusted: bool,
 }
 
 impl HolderRepr {
-    /// Whether no drawer ran (the wire omits it).
+    /// Whether no mark, anchor or seed uncertainty needs carrying.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
@@ -122,7 +133,9 @@ impl HolderRepr {
     /// the checkpoint carries) clamped to it, as the restored grid will hold
     /// it.
     fn capture(fence: &HolderFence, anchors: &AnchorSet, floor: u64) -> Self {
-        if fence.is_empty() && anchors.slots().is_empty() {
+        // No mark, anchor or seed uncertainty: nothing a restore needs (the
+        // clock orders only marks, the seal epoch only seals).
+        if fence.is_empty() && anchors.is_empty() && !fence.seed_untrusted {
             return Self::default();
         }
         let slot = |id: AnchorId| id.index();
@@ -163,6 +176,7 @@ impl HolderRepr {
                 .collect(),
             anchors_lost: anchors.lost(),
             seal_epoch: anchors.seal_epoch(),
+            seed_untrusted: fence.seed_untrusted,
         }
     }
 
@@ -248,6 +262,7 @@ impl HolderRepr {
                 current: self.current,
                 marks,
                 clock: self.clock,
+                seed_untrusted: self.seed_untrusted,
             },
             anchors,
         ))
@@ -261,21 +276,50 @@ impl Terminal {
     /// The fence and the main grid's anchors, an anchor below `floor` (the
     /// oldest primary row the checkpoint carries) clamped to it.
     pub(super) fn capture_holder_repr(&self, floor: u64) -> HolderRepr {
-        HolderRepr::capture(&self.holder_fence, self.main_grid().anchors(), floor)
+        let mut repr = HolderRepr::capture(&self.holder_fence, self.main_grid().anchors(), floor);
+        if self
+            .holder_carried_at
+            .is_some_and(|at| at != self.transient.screen_mutations)
+        {
+            // A recovery reader may checkpoint its replay before the actual
+            // host adopts it. Do not re-arm that stale current mark as an
+            // untouched carry at the next restore. Suspended marks stay put.
+            repr.seed_untrusted = true;
+            if let Some(mark) = repr
+                .current
+                .and_then(|i| repr.marks.get_mut(usize::from(i)))
+            {
+                mark.tainted = true;
+            }
+        }
+        repr
     }
 
     /// Install a carried fence after the grids were restored: its anchors go
     /// to the main grid, keyed under `counter` (the carried main grid's
     /// absolute row counter; a grid numbered otherwise marks them lost). One
-    /// that does not install whole leaves no fence and no anchor.
+    /// that does not install whole leaves no fence and no anchor. The output
+    /// count at the install is kept: a carried current mark continues at
+    /// the adoption only if no byte came between
+    /// ([`Terminal::adopt_holder_after_restore`]).
     pub(super) fn install_holder_repr(&mut self, repr: &HolderRepr, counter: u64) {
-        let (fence, anchors) = repr.install().unwrap_or_default();
-        self.holder_fence = fence;
-        let main = if self.modes.alternate_screen {
-            self.alt_grid.as_mut().unwrap_or(&mut self.grid)
-        } else {
-            &mut self.grid
+        let (mut fence, anchors) = match repr.install() {
+            Some(pair) => pair,
+            None => {
+                // A structurally invalid fence is not seed authority either.
+                let fence = HolderFence {
+                    seed_untrusted: true,
+                    ..HolderFence::default()
+                };
+                (fence, AnchorSet::default())
+            }
         };
+        fence.seed_untrusted |= repr.seed_untrusted;
+        // Track a restore even when a predecessor carried no mark: its old
+        // signed C must not become a seed after an unobserved replay tail.
+        self.holder_carried_at = Some(self.transient.screen_mutations);
+        let (slot, main) = self.fence_and_main_grid();
+        *slot = fence;
         main.install_anchors(anchors, counter);
     }
 }

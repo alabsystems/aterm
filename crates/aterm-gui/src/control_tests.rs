@@ -18,18 +18,65 @@ fn live_foreign_entry() -> String {
     format!("sock /nonexistent/aterm.sock\nnonce ab\npid {LIVE_FOREIGN_PID}\n")
 }
 
-/// The ambiguity refusal belongs to the resolver, so seams that skip `handle`
-/// cannot skip it: `post` with a binary body, `feed-bin`/`paste-bin` at the header
-/// fence and the effect boundary, and `subscribe`'s target list all resolve without
-/// `handle`, and they write input and stream output. The gate lives in
-/// [`resolve_explicit`], whose `Result` no caller can ignore, with the bare lookup
-/// nested inside it.
+/// [`proxy_forward_plan`] for a request line, read as a lane reads it.
+fn plan_for(line: &str, scope: Scope, store: &Store, dir: &std::path::Path) -> Option<String> {
+    proxy_forward_plan(&Request::parse(line.to_string()), scope, store, dir)
+}
+
+/// [`is_wait_request`] for a request line, read as a lane reads it.
+fn request_waits(line: &str, scope: Scope, store: &Store) -> bool {
+    is_wait_request(&Request::parse(line.to_string()), scope, store)
+}
+
+/// [`run_feed_bin_routed`] for a counted frame's header line, read as a lane
+/// reads it.
+#[cfg(unix)]
+fn feed_bin_routed<W: Write, F>(
+    line: &str,
+    reader: &mut impl BufRead,
+    route: FeedBinRoute<'_>,
+    dispatch_front_input: &mut F,
+    writer: &mut W,
+) -> bool
+where
+    F: FnMut(InputEvent, Option<u64>) -> Result<InputOutcome, String>,
+{
+    let request = Request::parse(line.to_string());
+    let frame = request.frame().expect("a counted frame's header");
+    run_feed_bin_routed(&request, frame, reader, route, dispatch_front_input, writer)
+}
+
+/// [`deliver`] by the background route, as a `verb`'s arm calls it for a session
+/// not on screen: the seam is never asked.
+#[cfg_attr(not(unix), allow(dead_code))] // its tests are unix-only
+fn background(
+    verb: &str,
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    ev: InputEvent,
+) -> Result<InputOutcome, String> {
+    deliver(
+        InputRoute::Background,
+        input_of(verb),
+        |_, _, _| panic!("the background route never takes the seam"),
+        term,
+        ctx,
+        ev,
+        None,
+    )
+}
+
+/// The ambiguity refusal belongs to the resolver, so seams that skip
+/// `dispatch_request` cannot skip it: `post` with a binary body, `feed-bin`/
+/// `paste-bin` at the header fence and the effect boundary, and `subscribe`'s
+/// target list all resolve without it, and they write input and stream output. The gate lives in
+/// [`resolve`], whose [`Resolution`] hands no seam a hosted target past it.
 ///
 /// This pins the resolver's three answers; the type checker ensures every seam
 /// is bound by them.
 #[test]
 fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
-    use super::{Selector, resolve_explicit};
+    use super::{Resolution, Selector, resolve};
     use aterm_session::{LaunchNonce, SessionId};
 
     let _guard = crate::identity_claim::rendezvous_test_guard();
@@ -47,7 +94,7 @@ fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
         .unwrap_or_else(|p| p.into_inner())
         .register(handle);
     crate::identity_claim::note_adopted(&sid);
-    let sel = Selector::Sid(sid.clone());
+    let sel = Selector::parse(sid.as_str());
 
     // Our own entry, nobody else's: the ordinary cross-session address.
     crate::proxy::write_graph_entry(
@@ -57,9 +104,7 @@ fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
         &LaunchNonce::generate(),
     );
     assert!(
-        resolve_explicit(&store, &sel)
-            .expect("an id only this instance serves resolves")
-            .is_some(),
+        matches!(resolve(&store, &sel), Resolution::Hosted(_)),
         "the gate must not refuse the ids this instance published"
     );
 
@@ -70,7 +115,7 @@ fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
         live_foreign_entry(),
     )
     .expect("plant a foreign entry");
-    let Err(refusal) = resolve_explicit(&store, &sel) else {
+    let Resolution::Ambiguous(refusal) = resolve(&store, &sel) else {
         panic!("an id two live instances serve names two places, and is refused");
     };
     assert!(
@@ -90,9 +135,11 @@ fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
     )
     .expect("plant a foreign entry");
     assert!(
-        resolve_explicit(&store, &Selector::Sid(stranger))
-            .expect("an id we do not host is a miss, not an ambiguity")
-            .is_none(),
+        matches!(
+            resolve(&store, &Selector::parse(stranger.as_str())),
+            Resolution::Missing
+        ),
+        "an id we do not host is a miss, not an ambiguity"
     );
 }
 
@@ -112,7 +159,7 @@ fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
 #[cfg(unix)]
 #[test]
 fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() {
-    use super::{Selector, ambiguous_sid_refusal, resolve_explicit};
+    use super::{Resolution, Selector, ambiguous_sid_refusal, resolve};
     use crate::identity_claim::project_handoff_address_owner as project;
     use aterm_session::SessionId;
 
@@ -132,7 +179,7 @@ fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() 
         .unwrap_or_else(|p| p.into_inner())
         .register(handle);
     crate::identity_claim::note_adopted(&sid);
-    let sel = Selector::Sid(sid.clone());
+    let sel = Selector::parse(sid.as_str());
 
     // The candidate: a live process that is not us.
     let mut candidate = aterm_uds::spawnfd::command("/bin/sleep")
@@ -154,10 +201,10 @@ fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() 
         let mut st = project(dir.path(), &sid, cand);
         assert!(m.fire("Request", &mut st), "{why}: Request at {st:?}");
         let refusal = ambiguous_sid_refusal(&sel);
-        let resolved = resolve_explicit(&store, &sel);
+        let resolved = resolve(&store, &sel);
         assert_eq!(
             refusal.is_some(),
-            resolved.is_err(),
+            matches!(resolved, Resolution::Ambiguous(_)),
             "{why}: the resolver and the dispatch seam agree"
         );
         assert_eq!(
@@ -192,9 +239,8 @@ fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() 
     let reg = crate::identity_claim::register_handoff_candidate(cand);
     assert!(conforms(&model, "registered").is_none());
     assert!(
-        resolve_explicit(&store, &sel)
-            .expect("served here until the Commit")
-            .is_some()
+        matches!(resolve(&store, &sel), Resolution::Hosted(_)),
+        "served here until the Commit"
     );
 
     // Negative control: a stranger publishing the same id mid-update.
@@ -217,7 +263,7 @@ fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() 
         format!("sock /nonexistent/aterm.sock\nnonce ab\npid {cand}\n"),
     )
     .expect("plant the entry");
-    assert!(ambiguous_sid_refusal(&Selector::Sid(minted)).is_none());
+    assert!(ambiguous_sid_refusal(&Selector::parse(minted.as_str())).is_none());
 
     // The candidate dead (a rejected attempt's reap): its entry holds nothing.
     let _ = candidate.kill();
@@ -233,7 +279,7 @@ fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() 
 /// `video ... keys` ledger).
 #[test]
 fn an_explicit_selector_for_the_front_tab_is_routed_through_the_input_seam() {
-    use super::{TurnInputRoute, front_routed, license_clear_reply, turn_input_route};
+    use super::{InputRoute, front_routed};
     // Named the tab on screen -> the seam, whoever asks.
     for owner_class in [true, false] {
         assert!(front_routed(true, owner_class, Some(7), 7));
@@ -255,28 +301,39 @@ fn an_explicit_selector_for_the_front_tab_is_routed_through_the_input_seam() {
     assert!(front_routed(false, false, Some(7), 7));
     assert!(front_routed(false, false, Some(9), 7));
 
-    // `turn` is composite paste + Return, but both phases must make the
-    // identical routing decision. In particular, explicit `@self` (which
-    // arrives as a cross selector naming the visible sid) is FRONT, as is a
-    // scoped caller's flagless turn, while a genuinely hidden target remains
-    // on the background sink and only the Owner's flagless turn follows the
-    // front.
-    assert_eq!(turn_input_route(true, true), TurnInputRoute::Front);
-    assert_eq!(turn_input_route(true, false), TurnInputRoute::Background);
-    assert_eq!(turn_input_route(false, false), TurnInputRoute::Local);
-    assert_eq!(turn_input_route(false, true), TurnInputRoute::Front);
-
-    // The reply tells transport failure from a harmless race: a `false` main-thread
-    // result means the tab switched before the fence, so the target is now
-    // background and its valid signal must not be dropped.
-    assert_eq!(license_clear_reply(Ok(true)), "OK\n");
-    assert_eq!(license_clear_reply(Ok(false)), "OK\n");
-    assert!(
-        license_clear_reply(Err(super::control_media::MainHopError::Reason(
-            "event loop gone"
-        )))
-        .starts_with("ERR ")
-    );
+    // One route per request, which every event of a composite `turn` takes, so
+    // paste and Return cannot part. Explicit `@self` (which arrives as a cross
+    // selector naming the visible sid) is the pinned seam, as is a scoped caller's
+    // flagless request, while a genuinely hidden target stays on the background
+    // sink. The Owner's flagless request takes the seam: a gesture follows the front
+    // (an overlay in front may take it), the program's own bytes stay pinned to the
+    // session (`Input::PINNED`: `send`, `feed`, the frames). Negative control: the
+    // same flagless Owner request of a gesture and of a pinned verb route apart.
+    let pinned = InputRoute::Seam { pin: Some(7) };
+    let follows = InputRoute::Seam { pin: None };
+    for verb in [
+        "key", "ctrl", "paste", "mouse", "focus", "resize", "scroll", "turn",
+    ] {
+        let class = input_of(verb);
+        assert_eq!(InputRoute::of(class, true, true, 7), pinned, "{verb}");
+        assert_eq!(
+            InputRoute::of(class, true, false, 7),
+            InputRoute::Background,
+            "{verb}"
+        );
+        assert_eq!(InputRoute::of(class, false, true, 7), pinned, "{verb}");
+        assert_eq!(InputRoute::of(class, false, false, 7), follows, "{verb}");
+    }
+    for verb in ["send", "feed", "feed-bin", "paste-bin"] {
+        let class = input_of(verb);
+        assert_eq!(InputRoute::of(class, true, true, 7), pinned, "{verb}");
+        assert_eq!(
+            InputRoute::of(class, true, false, 7),
+            InputRoute::Background,
+            "{verb}"
+        );
+        assert_eq!(InputRoute::of(class, false, false, 7), pinned, "{verb}");
+    }
 
     // A scoped caller's front-surface hop: a stalled main thread's refusal reaches
     // the wire as the retryable stall line, like every main-thread verb, never as a
@@ -331,14 +388,42 @@ impl Drop for WireProbe {
     }
 }
 
+/// A verb's answer queued as a connection queues it
+/// ([`control_lanes::Outbox::attach`]).
+fn outbox_of(reply: ControlReply) -> control_lanes::Outbox {
+    let mut outbox = control_lanes::Outbox::default();
+    outbox.attach(reply);
+    outbox
+}
+
+/// Deliver `outbox` into `writer` waiting, as a lane with no parker and the
+/// bridge deliver to their socket, a write timeout being nothing to arm.
+fn deliver_waiting(
+    outbox: &mut control_lanes::Outbox,
+    writer: &mut impl Write,
+) -> std::io::Result<bool> {
+    outbox.deliver_to(writer, false, |_| Ok(()))
+}
+
+/// The acknowledgement a delivered guarded answer awaits, read waiting from
+/// `server` and judged, as a lane with no parker and the bridge read it.
+fn await_ack(outbox: &mut control_lanes::Outbox, server: &CtlStream) -> ArtifactAckOutcome {
+    let mut reader = BufReader::new(server);
+    outbox
+        .finish_waiting(server, &mut reader)
+        .expect("the answer is already out")
+        .expect("an acknowledgement is owed")
+}
+
 #[test]
 fn artifact_handoff_permits_bound_and_release_capacity() {
     const CHARGE: usize = 2;
     const DESCRIPTOR_LIMIT: usize = 6;
-    static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
-        live: 0,
-        descriptor_units: 0,
-    });
+    let pool = Arc::new(UnitBudget::new(
+        ARTIFACT_HANDOFF_LIMIT,
+        DESCRIPTOR_LIMIT,
+        observe_artifact_handoff,
+    ));
     let model = aterm_models_misc::artifact_handoff_capacity_model();
     type CapacityState = (usize, usize, [usize; 3], usize);
     let project = |state: CapacityState| {
@@ -356,17 +441,15 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
     };
     // Each call follows the shipping operation it names, so the after state's
     // `(live, descriptor_units)` is read off the real pool: the model judges what
-    // `try_acquire_from`, a reconcile or a drop left. The charge buckets and
+    // `try_take`, a reconcile or a drop left. The charge buckets and
     // `selected` stay drive coordinates (the pool has no per-permit view).
     let validate = |action: &str, before: CapacityState, after: CapacityState| {
-        {
-            let usage = USAGE.lock().unwrap();
-            assert_eq!(
-                (usage.live, usage.descriptor_units),
-                (after.0, after.1),
-                "{action}: the pool the shipping operation left"
-            );
-        }
+        let usage = pool.usage();
+        assert_eq!(
+            (usage.live, usage.units),
+            (after.0, after.1),
+            "{action}: the pool the shipping operation left"
+        );
         let (conforms, evidence) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
@@ -395,15 +478,7 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
     let mut permits = Vec::new();
     let descriptor_slots = DESCRIPTOR_LIMIT / CHARGE;
     for before in 0..descriptor_slots {
-        permits.push(
-            ArtifactHandoffPermit::try_acquire_from(
-                &USAGE,
-                ARTIFACT_HANDOFF_LIMIT,
-                DESCRIPTOR_LIMIT,
-                CHARGE,
-            )
-            .unwrap(),
-        );
+        permits.push(pool.try_take(CHARGE).unwrap());
         validate(
             "Acquire",
             (before, before * CHARGE, [0, before, 0], CHARGE),
@@ -416,21 +491,13 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
         );
     }
     assert_eq!(
-        *USAGE.lock().unwrap(),
-        ArtifactHandoffUsage {
+        pool.usage(),
+        UnitUsage {
             live: descriptor_slots,
-            descriptor_units: DESCRIPTOR_LIMIT,
+            units: DESCRIPTOR_LIMIT
         }
     );
-    assert!(
-        ArtifactHandoffPermit::try_acquire_from(
-            &USAGE,
-            ARTIFACT_HANDOFF_LIMIT,
-            DESCRIPTOR_LIMIT,
-            CHARGE,
-        )
-        .is_none()
-    );
+    assert!(pool.try_take(CHARGE).is_none());
     validate(
         "RefuseAtCap",
         (
@@ -485,8 +552,8 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
 
     while let Some(permit) = permits.pop() {
         let before = {
-            let usage = USAGE.lock().unwrap();
-            (usage.live, usage.descriptor_units)
+            let usage = pool.usage();
+            (usage.live, usage.units)
         };
         drop(permit);
         validate(
@@ -500,21 +567,15 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
             ),
         );
     }
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(pool.usage(), UnitUsage::default());
 
-    let mut reconciled = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("provisional charge fits");
+    let mut reconciled = pool.try_take(CHARGE).expect("provisional charge fits");
     validate(
         "Acquire",
         (0, 0, [0, 0, 0], CHARGE),
         (1, CHARGE, [0, 1, 0], CHARGE),
     );
-    assert!(reconciled.try_reconcile_descriptor_units(CHARGE + 1));
+    assert!(reconciled.reconcile(CHARGE + 1));
     validate(
         "ReconcileGrow",
         (1, CHARGE, [0, 1, 0], CHARGE),
@@ -526,7 +587,7 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
         (1, CHARGE + 1, [0, 0, 1], CHARGE + 1),
         (0, 0, [0, 0, 0], CHARGE + 1),
     );
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(pool.usage(), UnitUsage::default());
     // The same drop returning the provisional charge — a reconcile that
     // never recorded the grown charge on the permit — strands one unit.
     rejects(
@@ -536,14 +597,10 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
         "artifact handoff provisional-release negative control",
     );
 
-    let mut reconciled = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("second provisional charge fits");
-    assert!(reconciled.try_reconcile_descriptor_units(CHARGE - 1));
+    let mut reconciled = pool
+        .try_take(CHARGE)
+        .expect("second provisional charge fits");
+    assert!(reconciled.reconcile(CHARGE - 1));
     validate(
         "ReconcileShrink",
         (1, CHARGE, [0, 1, 0], CHARGE),
@@ -555,115 +612,82 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
         (1, CHARGE - 1, [1, 0, 0], CHARGE - 1),
         (0, 0, [0, 0, 0], CHARGE - 1),
     );
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(pool.usage(), UnitUsage::default());
 
-    let in_memory = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("byte reply provisional charge fits");
+    let in_memory = pool
+        .try_take(CHARGE)
+        .expect("byte reply provisional charge fits");
     struct AccountedCapabilityProbe {
-        usage: &'static Mutex<ArtifactHandoffUsage>,
+        pool: Arc<UnitBudget>,
         expected_units: usize,
     }
 
     impl Drop for AccountedCapabilityProbe {
         fn drop(&mut self) {
             assert_eq!(
-                self.usage.lock().unwrap().descriptor_units,
+                self.pool.usage().units,
                 self.expected_units,
-                "the accounted capability must close before its charge shrinks"
+                "the accounted capability must close before its charge is given back"
             );
         }
     }
 
-    let retention = ReplyRetentionPermit(in_memory).release_path_and_retain_in_memory(
-        AccountedCapabilityProbe {
-            usage: &USAGE,
-            expected_units: CHARGE,
-        },
-    );
+    let in_flight = Arc::new(Slots::new(1));
+    let retention = ReplyRetentionPermit {
+        in_flight: in_flight.try_take().expect("a place in flight"),
+        descriptors: Some(in_memory),
+    }
+    .release_path_and_retain_in_memory(AccountedCapabilityProbe {
+        pool: Arc::clone(&pool),
+        expected_units: CHARGE,
+    });
     assert_eq!(
-        *USAGE.lock().unwrap(),
-        ArtifactHandoffUsage {
-            live: 1,
-            descriptor_units: 1,
-        },
-        "dropping the path capability releases its descriptor charge"
+        pool.usage(),
+        UnitUsage::default(),
+        "dropping the path capability gives back its whole descriptor chain"
     );
     validate(
-        "ReconcileShrink",
+        "Release",
         (1, CHARGE, [0, 1, 0], CHARGE),
-        (1, 1, [1, 0, 0], 1),
+        (0, 0, [0, 0, 0], CHARGE),
     );
+    assert_eq!(in_flight.used(), 1, "the body keeps its place in flight");
     drop(retention);
-    validate("Release", (1, 1, [1, 0, 0], 1), (0, 0, [0, 0, 0], 1));
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(in_flight.used(), 0, "and gives it back once flushed");
 
-    let mut grown = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("mixed-charge first permit fits");
-    assert!(grown.try_reconcile_descriptor_units(CHARGE + 1));
-    let ordinary = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("mixed-charge second permit fits");
+    let mut grown = pool
+        .try_take(CHARGE)
+        .expect("mixed-charge first permit fits");
+    assert!(grown.reconcile(CHARGE + 1));
+    let ordinary = pool
+        .try_take(CHARGE)
+        .expect("mixed-charge second permit fits");
     validate("Acquire", (1, 3, [0, 0, 1], 3), (2, 5, [0, 1, 1], 2));
     drop(ordinary);
     validate("Release", (2, 5, [0, 1, 1], 2), (1, 3, [0, 0, 1], 2));
     validate("SelectThree", (1, 3, [0, 0, 1], 2), (1, 3, [0, 0, 1], 3));
     drop(grown);
     validate("Release", (1, 3, [0, 0, 1], 3), (0, 0, [0, 0, 0], 3));
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(pool.usage(), UnitUsage::default());
 
-    let mut small = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("far-refusal selected permit fits");
-    assert!(small.try_reconcile_descriptor_units(1));
-    let ordinary_a = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("far-refusal first competing permit fits");
-    let ordinary_b = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        CHARGE,
-    )
-    .expect("far-refusal second competing permit fits");
-    assert_eq!(
-        *USAGE.lock().unwrap(),
-        ArtifactHandoffUsage {
-            live: 3,
-            descriptor_units: 5,
-        }
-    );
+    let mut small = pool
+        .try_take(CHARGE)
+        .expect("far-refusal selected permit fits");
+    assert!(small.reconcile(1));
+    let ordinary_a = pool
+        .try_take(CHARGE)
+        .expect("far-refusal first competing permit fits");
+    let ordinary_b = pool
+        .try_take(CHARGE)
+        .expect("far-refusal second competing permit fits");
+    assert_eq!(pool.usage(), UnitUsage { live: 3, units: 5 });
     assert!(
-        !small.try_reconcile_descriptor_units(3),
+        !small.reconcile(3),
         "a direct one-to-three jump cannot consume two units of one-unit headroom"
     );
     assert_eq!(
-        *USAGE.lock().unwrap(),
-        ArtifactHandoffUsage {
-            live: 3,
-            descriptor_units: 5,
-        },
+        pool.usage(),
+        UnitUsage { live: 3, units: 5 },
         "failed far reconciliation leaves the original charge intact"
     );
     validate(
@@ -678,88 +702,77 @@ fn artifact_handoff_permits_bound_and_release_capacity() {
     validate("Release", (2, 4, [0, 2, 0], 2), (1, 2, [0, 1, 0], 2));
     drop(ordinary_b);
     validate("Release", (1, 2, [0, 1, 0], 2), (0, 0, [0, 0, 0], 2));
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(pool.usage(), UnitUsage::default());
 
+    let count_pool = Arc::new(UnitBudget::new(
+        ARTIFACT_HANDOFF_LIMIT,
+        usize::MAX,
+        observe_artifact_handoff,
+    ));
     let mut count_permits = Vec::new();
     for _ in 0..ARTIFACT_HANDOFF_LIMIT {
         count_permits.push(
-            ArtifactHandoffPermit::try_acquire_from(&USAGE, ARTIFACT_HANDOFF_LIMIT, usize::MAX, 1)
+            count_pool
+                .try_take(1)
                 .expect("count slot remains available"),
         );
     }
     assert!(
-        ArtifactHandoffPermit::try_acquire_from(&USAGE, ARTIFACT_HANDOFF_LIMIT, usize::MAX, 1,)
-            .is_none(),
+        count_pool.try_take(1).is_none(),
         "object count refuses work independently of descriptor capacity"
     );
     drop(count_permits);
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(count_pool.usage(), UnitUsage::default());
 
     // Partial headroom: a charge past what is left of the descriptor budget is
     // refused before the object-count cap, and a single charge past the whole
     // budget is refused outright (the headroom subtraction cannot underflow).
-    let deep = ArtifactHandoffPermit::try_acquire_from(
-        &USAGE,
-        ARTIFACT_HANDOFF_LIMIT,
-        DESCRIPTOR_LIMIT,
-        DESCRIPTOR_LIMIT - 2,
-    )
-    .expect("one deep request fits the descriptor budget");
+    let deep = pool
+        .try_take(DESCRIPTOR_LIMIT - 2)
+        .expect("one deep request fits the descriptor budget");
     assert!(
-        ArtifactHandoffPermit::try_acquire_from(
-            &USAGE,
-            ARTIFACT_HANDOFF_LIMIT,
-            DESCRIPTOR_LIMIT,
-            3,
-        )
-        .is_none(),
+        pool.try_take(3).is_none(),
         "descriptor saturation refuses work before the object-count cap"
     );
     drop(deep);
     assert!(
-        ArtifactHandoffPermit::try_acquire_from(
-            &USAGE,
-            ARTIFACT_HANDOFF_LIMIT,
-            DESCRIPTOR_LIMIT,
-            DESCRIPTOR_LIMIT + 1,
-        )
-        .is_none(),
+        pool.try_take(DESCRIPTOR_LIMIT + 1).is_none(),
         "a single over-budget descriptor charge must be refused"
     );
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(pool.usage(), UnitUsage::default());
 }
 
+/// Video retention is a reservation of its own: path artifacts at their cap
+/// leave every armed video's sweep its capacity, and videos at theirs leave
+/// path artifacts theirs. Each budget refuses at its own cap (the control).
 #[test]
-fn video_retention_capacity_is_reserved_and_returned_exactly() {
-    static USAGE: Mutex<VideoRetentionUsage> = Mutex::new(VideoRetentionUsage {
-        live: 0,
-        descriptor_units: 0,
-    });
-
-    let first = ReplyRetention::try_reserve_video_retention_from(&USAGE, 1, 8, 4)
-        .expect("first distinct video reserves its future retention sweep");
+fn video_retention_is_reserved_apart_from_path_artifacts() {
+    let budgets = ArtifactBudgets::shipping();
+    let path = std::path::Path::new("/captures/shot.png");
+    let paths: Vec<_> = std::iter::from_fn(|| budgets.try_reserve_for_path(path)).collect();
     assert_eq!(
-        *USAGE.lock().unwrap(),
-        VideoRetentionUsage {
-            live: 1,
-            descriptor_units: 4,
-        }
+        paths.len(),
+        ARTIFACT_HANDOFF_LIMIT,
+        "path artifacts fill their cap"
     );
+    let videos: Vec<_> =
+        std::iter::from_fn(|| budgets.try_reserve_video_retention_for_path(path)).collect();
+    assert_eq!(
+        videos.len(),
+        ARTIFACT_HANDOFF_LIMIT,
+        "path artifacts at their cap leave every video its slot"
+    );
+    drop(paths);
     assert!(
-        ReplyRetention::try_reserve_video_retention_from(&USAGE, 1, 8, 1).is_none(),
-        "the distinct-video count bound is independent of GC queue pressure"
+        budgets.try_reserve_for_path(path).is_some(),
+        "videos at their cap leave path artifacts theirs"
     );
-    assert!(
-        ReplyRetention::try_reserve_video_retention_from(&USAGE, 2, 8, 5).is_none(),
-        "the descriptor bound is enforced independently of count"
+    drop(videos);
+    assert_eq!(
+        budgets.video.usage(),
+        UnitUsage::default(),
+        "each video gives back its slot and its units"
     );
-
-    drop(first);
-    assert_eq!(*USAGE.lock().unwrap(), VideoRetentionUsage::default());
-    let reopened = ReplyRetention::try_reserve_video_retention_from(&USAGE, 1, 8, 8)
-        .expect("dropping the sweep returns both accounting dimensions");
-    drop(reopened);
-    assert_eq!(*USAGE.lock().unwrap(), VideoRetentionUsage::default());
 }
 
 /// How long a test waits for the quarantine reaper to drop a guard whose
@@ -782,11 +795,24 @@ const REAPER_PATIENCE: std::time::Duration = EVENTUALLY;
 /// passed without looking at the quarantine at all.
 const HELD_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// The ticket of the guard this thread put in quarantine last.
+/// The ticket of the guard this thread put in quarantine last, its grace now
+/// held for [`HELD_QUARANTINE`] (the shipping 30 s, re-dated before the test
+/// looks): [`end_quarantine`] ends it.
 fn last_quarantine_ticket() -> u64 {
-    super::LAST_QUARANTINE_TICKET
+    let ticket = super::LAST_QUARANTINE_TICKET
         .with(std::cell::Cell::take)
-        .expect("this thread quarantined a guard")
+        .expect("this thread quarantined a guard");
+    let quarantine = artifact_reply_quarantine();
+    let mut entries = quarantine
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries
+        .iter_mut()
+        .find(|entry| entry.ticket == ticket)
+        .expect("the quarantine is still held")
+        .until = std::time::Instant::now() + HELD_QUARANTINE;
+    ticket
 }
 
 /// End quarantine `ticket`'s grace now and ring the reaper: the guard goes at
@@ -807,9 +833,10 @@ fn end_quarantine(ticket: u64) {
     quarantine.changed.notify_one();
 }
 
-/// Drive the shipping reservation through a real failed ACK. The permit
-/// must remain charged while its guard is in the process-global quarantine,
-/// and return only when the quarantine's expiry sweep drops that guard.
+/// Drive a path artifact's reservation through a real failed ACK. Its
+/// descriptor chain must remain charged while its guard is in the
+/// process-global quarantine, and return only when the quarantine's expiry
+/// sweep drops that guard; its place in flight returns at the failed ACK.
 ///
 /// The sweep runs on THIS thread, at an instant past the quarantine, so the
 /// test waits on no clock and no scheduler: this isolated child initialises
@@ -823,56 +850,51 @@ fn quarantined_reply_holds_production_handoff_capacity() {
         return;
     }
     let quarantine = *ARTIFACT_REPLY_QUARANTINE.get_or_init(ArtifactReplyQuarantine::leak);
-    // Long enough that no run of this test outlives it: expiry is the
-    // sweep's instant below, never elapsed time.
-    let quarantine_for = std::time::Duration::from_secs(3600);
-    let probe = || WireProbe {
-        alive: Arc::new(AtomicBool::new(true)),
-        prepared: Arc::new(AtomicBool::new(false)),
-        fail_prepare: false,
+    let budgets = ArtifactBudgets::shipping();
+    let path = std::path::Path::new("/captures/shot.png");
+    let retain = |alive: &Arc<AtomicBool>| {
+        budgets.try_reserve_for_path(path).map(|permit| {
+            permit.retain(WireProbe {
+                alive: Arc::clone(alive),
+                prepared: Arc::new(AtomicBool::new(false)),
+                fail_prepare: false,
+            })
+        })
     };
+    let probe = || Arc::new(AtomicBool::new(true));
 
-    let alive = Arc::new(AtomicBool::new(true));
-    let retention = ReplyRetention::try_new(WireProbe {
-        alive: Arc::clone(&alive),
-        prepared: Arc::new(AtomicBool::new(false)),
-        fail_prepare: false,
-    })
-    .unwrap_or_else(|_| panic!("first production permit is available"));
-    let reply = ControlReply::guarded("OK guarded\n".to_string(), Some(retention));
-    let mut wire = Vec::new();
-    let pending = write_control_reply(&mut wire, reply)
-        .expect("wire write")
-        .expect("guarded reply");
+    let alive = probe();
+    let retention = retain(&alive).expect("first production permit is available");
+    let mut outbox = outbox_of(ControlReply::guarded(
+        "OK guarded\n".to_string(),
+        Some(retention),
+    ));
+    assert!(deliver_waiting(&mut outbox, &mut Vec::new()).expect("wire write"));
     let (mut client, server) = CtlStream::pair().unwrap();
     client.write_all(b"ACK wrong\n").unwrap();
     client.flush().unwrap();
-    let mut reader = BufReader::new(&server);
     assert_eq!(
-        await_guarded_reply_close_with_quarantine(&server, &mut reader, pending, quarantine_for,),
+        await_ack(&mut outbox, &server),
         ArtifactAckOutcome::AcknowledgementQuarantined
     );
+    // Held for a day: expiry is the sweep's instant below, never elapsed time.
+    last_quarantine_ticket();
     assert!(alive.load(Ordering::Acquire));
+    assert_eq!(
+        budgets.in_flight.used(),
+        0,
+        "the failed ACK gives back the capture's place in flight"
+    );
 
     let mut admitted = Vec::new();
     for _ in 1..ARTIFACT_HANDOFF_LIMIT {
-        admitted.push(
-            ReplyRetention::try_new(probe())
-                .unwrap_or_else(|_| panic!("capacity below the quarantined reply remains usable")),
-        );
+        admitted
+            .push(retain(&probe()).expect("capacity below the quarantined reply remains usable"));
     }
-    let refused_alive = Arc::new(AtomicBool::new(true));
-    let refused = ReplyRetention::try_new(WireProbe {
-        alive: Arc::clone(&refused_alive),
-        prepared: Arc::new(AtomicBool::new(false)),
-        fail_prepare: false,
-    });
     assert!(
-        refused.is_err(),
+        retain(&probe()).is_none(),
         "quarantine must consume its production permit"
     );
-    drop(refused);
-    assert!(!refused_alive.load(Ordering::Acquire));
 
     let sweep = |at: std::time::Instant| {
         let mut entries = quarantine
@@ -886,40 +908,87 @@ fn quarantined_reply_holds_production_handoff_capacity() {
         "a sweep inside the quarantine releases nothing"
     );
     assert!(alive.load(Ordering::Acquire), "the guard is still held");
-    assert!(
-        ReplyRetention::try_new(probe()).is_err(),
-        "and so is its permit"
-    );
+    assert!(retain(&probe()).is_none(), "and so is its permit");
     drop(admitted);
 
-    let expired = sweep(std::time::Instant::now() + quarantine_for);
+    let expired = sweep(std::time::Instant::now() + HELD_QUARANTINE);
     assert_eq!(expired.len(), 1, "the expired reply leaves the quarantine");
     drop(expired);
     assert!(!alive.load(Ordering::Acquire), "its guard is released");
     let reopened: Vec<_> = (0..ARTIFACT_HANDOFF_LIMIT)
-        .map(|_| {
-            ReplyRetention::try_new(probe())
-                .unwrap_or_else(|_| panic!("expired quarantine returns every permit"))
-        })
+        .map(|_| retain(&probe()).expect("expired quarantine returns every permit"))
         .collect();
     drop(reopened);
 }
 
-struct FailAfterFirstWrite {
+/// Path captures whose acknowledgements failed sit in quarantine with their
+/// descriptor chains, but none keeps a place in flight, so an in-memory
+/// `--bytes` capture is admitted while they wait. Negative control: at that
+/// same moment the budget the quarantine holds refuses a path capture; and
+/// while the captures were still in flight, `--bytes` was refused too, which
+/// is what keeps captures off every request lane.
+#[test]
+fn a_quarantined_path_capture_does_not_block_bytes() {
+    let budgets = ArtifactBudgets::shipping();
+    let path = std::path::Path::new("/captures/shot.png");
+    let in_flight: Vec<_> = (0..ARTIFACT_HANDOFF_LIMIT)
+        .map(|_| budgets.try_reserve_for_path(path).expect("below the caps"))
+        .collect();
+    assert!(
+        budgets.try_reserve_in_memory().is_none(),
+        "captures in flight fill every place, the in-memory kind included"
+    );
+
+    let mut tickets = Vec::new();
+    for permit in in_flight {
+        let mut outbox = outbox_of(guarded_probe_reply(permit.retain(WireProbe {
+            alive: Arc::new(AtomicBool::new(true)),
+            prepared: Arc::new(AtomicBool::new(false)),
+            fail_prepare: false,
+        })));
+        assert!(deliver_waiting(&mut outbox, &mut Vec::new()).expect("wire write"));
+        let (mut client, server) = CtlStream::pair().unwrap();
+        client.write_all(b"ACK wrong\n").unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            await_ack(&mut outbox, &server),
+            ArtifactAckOutcome::AcknowledgementQuarantined
+        );
+        tickets.push(last_quarantine_ticket());
+    }
+
+    assert!(
+        budgets.try_reserve_for_path(path).is_none(),
+        "the quarantined chains keep refusing path captures (fail-closed)"
+    );
+    assert!(
+        budgets.try_reserve_in_memory().is_some(),
+        "a quarantined capture holds no place in flight: --bytes is admitted"
+    );
+    for ticket in tickets {
+        end_quarantine(ticket);
+    }
+}
+
+/// A peer that takes `limit` bytes and then breaks: every write past them
+/// fails, as a socket whose peer went away does.
+struct FailPast {
+    limit: usize,
     bytes: Vec<u8>,
 }
 
-impl Write for FailAfterFirstWrite {
+impl Write for FailPast {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.bytes.is_empty() {
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        } else {
-            Err(std::io::Error::new(
+        let room = self.limit - self.bytes.len();
+        if room == 0 {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "injected challenge write failure",
-            ))
+                "injected write failure",
+            ));
         }
+        let taken = room.min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..taken]);
+        Ok(taken)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -929,12 +998,13 @@ impl Write for FailAfterFirstWrite {
 
 #[test]
 fn in_memory_handoff_releases_after_flush_without_ack_or_quarantine() {
-    static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
-        live: 0,
-        descriptor_units: 0,
-    });
+    let budgets = ArtifactBudgets {
+        in_flight: Arc::new(Slots::new(1)),
+        ..ArtifactBudgets::shipping()
+    };
 
     struct UsageCheckingWriter {
+        in_flight: Arc<Slots>,
         bytes: usize,
         fail_flush: bool,
     }
@@ -942,11 +1012,8 @@ fn in_memory_handoff_releases_after_flush_without_ack_or_quarantine() {
     impl Write for UsageCheckingWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             assert_eq!(
-                *USAGE.lock().unwrap(),
-                ArtifactHandoffUsage {
-                    live: 1,
-                    descriptor_units: 1,
-                },
+                self.in_flight.used(),
+                1,
                 "the in-memory permit spans every body write"
             );
             assert!(
@@ -961,11 +1028,8 @@ fn in_memory_handoff_releases_after_flush_without_ack_or_quarantine() {
 
         fn flush(&mut self) -> std::io::Result<()> {
             assert_eq!(
-                *USAGE.lock().unwrap(),
-                ArtifactHandoffUsage {
-                    live: 1,
-                    descriptor_units: 1,
-                },
+                self.in_flight.used(),
+                1,
                 "the in-memory permit spans the socket flush"
             );
             if self.fail_flush {
@@ -980,9 +1044,10 @@ fn in_memory_handoff_releases_after_flush_without_ack_or_quarantine() {
     }
 
     let make_reply = || {
-        let permit = ArtifactHandoffPermit::try_acquire_from(&USAGE, 1, 1, 1)
+        let permit = budgets
+            .try_reserve_in_memory()
             .expect("write-only handoff capacity");
-        let retention = ReplyRetentionPermit(permit).release_path_and_retain_in_memory(());
+        let retention = permit.release_path_and_retain_in_memory(());
         ControlReply::with_handoff(
             "x".repeat(1024 * 1024),
             Some(ReplyHandoff::WriteOnly(retention)),
@@ -990,30 +1055,32 @@ fn in_memory_handoff_releases_after_flush_without_ack_or_quarantine() {
     };
 
     let mut writer = UsageCheckingWriter {
+        in_flight: Arc::clone(&budgets.in_flight),
         bytes: 0,
         fail_flush: false,
     };
+    let mut outbox = outbox_of(make_reply());
+    assert!(deliver_waiting(&mut outbox, &mut writer).expect("write-only reply"));
     assert!(
-        write_control_reply(&mut writer, make_reply())
-            .expect("write-only reply")
-            .is_none(),
+        !outbox.holds_handoff_for_test(),
         "an in-memory reply has no pending ACK"
     );
     assert_eq!(writer.bytes, 1024 * 1024);
-    assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    assert_eq!(budgets.in_flight.used(), 0);
 
     let mut failing = UsageCheckingWriter {
+        in_flight: Arc::clone(&budgets.in_flight),
         bytes: 0,
         fail_flush: true,
     };
-    let error = match write_control_reply(&mut failing, make_reply()) {
+    let error = match deliver_waiting(&mut outbox_of(make_reply()), &mut failing) {
         Err(error) => error,
         Ok(_) => panic!("flush failure must propagate without quarantine"),
     };
     assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     assert_eq!(
-        *USAGE.lock().unwrap(),
-        ArtifactHandoffUsage::default(),
+        budgets.in_flight.used(),
+        0,
         "a failed in-memory write releases immediately instead of quarantining"
     );
 }
@@ -1048,8 +1115,7 @@ fn in_memory_handoff_restores_timeout_before_next_persistent_reply() {
     }
 
     let timeout = Arc::new(Mutex::new(None));
-    let retention =
-        ReplyRetentionPermit::unmetered_for_test().release_path_and_retain_in_memory(());
+    let retention = ReplyRetentionPermit::from_own_budget().release_path_and_retain_in_memory(());
     let inline = ControlReply::with_handoff(
         "OK inline\n".to_string(),
         Some(ReplyHandoff::WriteOnly(retention)),
@@ -1060,19 +1126,16 @@ fn in_memory_handoff_restores_timeout_before_next_persistent_reply() {
         bytes: Vec::new(),
     };
     let setter_timeout = Arc::clone(&timeout);
+    let mut outbox = outbox_of(inline);
     assert!(
-        write_control_reply_with_timeout_arm(
-            &mut inline_wire,
-            inline,
-            std::time::Duration::from_secs(1),
-            |value| {
+        outbox
+            .deliver_to(&mut inline_wire, false, |value| {
                 *setter_timeout.lock().unwrap() = value;
                 Ok(())
-            },
-        )
-        .unwrap()
-        .is_none()
+            })
+            .unwrap()
     );
+    assert!(!outbox.holds_handoff_for_test());
     assert_eq!(inline_wire.bytes, b"OK inline\n");
     assert_eq!(
         *timeout.lock().unwrap(),
@@ -1088,17 +1151,12 @@ fn in_memory_handoff_restores_timeout_before_next_persistent_reply() {
     };
     let setter_timeout = Arc::clone(&timeout);
     assert!(
-        write_control_reply_with_timeout_arm(
-            &mut ordinary_wire,
-            ordinary,
-            std::time::Duration::from_secs(1),
-            |value| {
+        outbox_of(ordinary)
+            .deliver_to(&mut ordinary_wire, false, |value| {
                 *setter_timeout.lock().unwrap() = value;
                 Ok(())
-            },
-        )
-        .unwrap()
-        .is_none()
+            })
+            .unwrap()
     );
     assert_eq!(ordinary_wire.bytes, b"OK next\n");
 }
@@ -1106,7 +1164,7 @@ fn in_memory_handoff_restores_timeout_before_next_persistent_reply() {
 /// A reply carrying a [`ReplyWritten`] releases its [`ReplyWire`] once its bytes are
 /// written and flushed (not before, and not only at a guarded reply's ACK), and on
 /// a failed write too; a seamless update's Commit waits on this for a `video` reply.
-/// A reply dropped unwritten releases it as well.
+/// A reply dropped unwritten releases it as well, queued or not.
 #[test]
 fn a_reply_wire_releases_when_its_reply_is_written() {
     struct WireCheckingWriter {
@@ -1136,21 +1194,23 @@ fn a_reply_wire_releases_when_its_reply_is_written() {
         bytes: Vec::new(),
         flushed: false,
     };
+    let mut outbox = outbox_of(reply);
     assert!(!wire.is_released(), "owed until written");
-    assert!(write_control_reply(&mut writer, reply).unwrap().is_none());
+    assert!(deliver_waiting(&mut outbox, &mut writer).unwrap());
     assert!(writer.flushed && wire.is_released(), "written, so released");
     assert!(wire.wait_released(std::time::Instant::now()));
 
     // A failed write releases it too: nothing more is coming.
     let (wire, written) = ReplyWire::new();
     let reply = ControlReply::from("OK a\n").releasing_on_write(written);
-    let mut failing = FailAfterFirstWrite {
-        bytes: b"x".to_vec(),
+    let mut failing = FailPast {
+        limit: 0,
+        bytes: Vec::new(),
     };
-    assert!(write_control_reply(&mut failing, reply).is_err());
+    assert!(deliver_waiting(&mut outbox_of(reply), &mut failing).is_err());
     assert!(wire.is_released());
 
-    // Through `handle`'s tail, as the `video` arm hands it on.
+    // Through `serve_session_verb`'s tail, as the `image` arm hands it on.
     let (wire, written) = ReplyWire::new();
     let mut tail = ReplyTail::default();
     let body = ControlReply::from("OK b\n")
@@ -1159,9 +1219,11 @@ fn a_reply_wire_releases_when_its_reply_is_written() {
     assert!(!wire.is_released(), "the tail keeps it owed");
     let mut bytes = Vec::new();
     assert!(
-        write_control_reply(&mut bytes, ControlReply::with_tail(body, tail))
-            .unwrap()
-            .is_none()
+        deliver_waiting(
+            &mut outbox_of(ControlReply::with_tail(body, tail)),
+            &mut bytes
+        )
+        .unwrap()
     );
     assert_eq!(bytes, b"OK b\n");
     assert!(wire.is_released());
@@ -1169,6 +1231,12 @@ fn a_reply_wire_releases_when_its_reply_is_written() {
     // Dropped unwritten: released, and a waiter is not left hanging.
     let (wire, written) = ReplyWire::new();
     drop(ControlReply::from("OK c\n").releasing_on_write(written));
+    assert!(wire.wait_released(std::time::Instant::now()));
+    // Queued, and its connection ended before a byte went out: the same.
+    let (wire, written) = ReplyWire::new();
+    drop(outbox_of(
+        ControlReply::from("OK d\n").releasing_on_write(written),
+    ));
     assert!(wire.wait_released(std::time::Instant::now()));
     // CONTROL: an unreleased wire's wait ends at its deadline.
     let (wire, _written) = ReplyWire::new();
@@ -1356,9 +1424,11 @@ fn capture_reply_ack_path_conforms_to_artifact_reply_publication() {
     );
 
     let (_, handoff) = retained.into_parts();
+    let mut outbox = outbox_of(ControlReply::with_handoff(body.clone(), handoff));
     let mut wire = Vec::new();
-    let pending = write_control_reply(&mut wire, ControlReply::with_handoff(body.clone(), handoff))
-        .expect("the complete frame is written")
+    assert!(deliver_waiting(&mut outbox, &mut wire).expect("the complete frame is written"));
+    let nonce = outbox
+        .nonce_for_test()
         .expect("a guarded reply awaits its ACK");
     let prepared = reply_successor(&model, "PrepareWire", &swept);
     let written = observe(&wire, 5);
@@ -1399,19 +1469,12 @@ fn capture_reply_ack_path_conforms_to_artifact_reply_publication() {
     let ack = format!(
         "{}{nonce}\n",
         aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX,
-        nonce = pending.nonce.as_str()
     );
     let (mut client, server) = CtlStream::pair().unwrap();
     client.write_all(ack.as_bytes()).unwrap();
     client.flush().unwrap();
-    let mut reader = BufReader::new(&server);
     assert_eq!(
-        await_guarded_reply_close_with_quarantine(
-            &server,
-            &mut reader,
-            pending,
-            std::time::Duration::from_millis(20),
-        ),
+        await_ack(&mut outbox, &server),
         ArtifactAckOutcome::PeerAcknowledged
     );
     let acknowledged = reply_successor(&model, "AcknowledgePeer", &written);
@@ -1463,7 +1526,7 @@ fn capture_reply_quarantines_conform_to_artifact_reply_publication() {
         crate::app_introspect::queue_capture_reply_for_test(target, file, Some(lease))
             .unwrap()
             .into_parts();
-    let queued = observe_capture_reply(
+    let queued_state = observe_capture_reply(
         &model,
         &path,
         &path,
@@ -1471,11 +1534,11 @@ fn capture_reply_quarantines_conform_to_artifact_reply_publication() {
         &body,
         capture_reply_observation(3),
     );
+    let mut outbox = outbox_of(ControlReply::with_handoff(body.clone(), handoff));
     let mut wire = Vec::new();
-    let pending = write_control_reply(&mut wire, ControlReply::with_handoff(body.clone(), handoff))
-        .unwrap()
-        .expect("guarded reply");
-    let prepared = reply_successor(&model, "PrepareWire", &queued);
+    assert!(deliver_waiting(&mut outbox, &mut wire).unwrap());
+    assert!(outbox.nonce_for_test().is_some(), "guarded reply");
+    let prepared = reply_successor(&model, "PrepareWire", &queued_state);
     let written = observe_capture_reply(
         &model,
         &path,
@@ -1494,9 +1557,8 @@ fn capture_reply_quarantines_conform_to_artifact_reply_publication() {
     let (mut client, server) = CtlStream::pair().unwrap();
     client.write_all(b"ACK wrong\n").unwrap();
     client.flush().unwrap();
-    let mut reader = BufReader::new(&server);
     assert_eq!(
-        await_guarded_reply_close_with_quarantine(&server, &mut reader, pending, HELD_QUARANTINE),
+        await_ack(&mut outbox, &server),
         ArtifactAckOutcome::AcknowledgementQuarantined
     );
     let ticket = last_quarantine_ticket();
@@ -1571,7 +1633,7 @@ fn capture_reply_quarantines_conform_to_artifact_reply_publication() {
         crate::app_introspect::queue_capture_reply_for_test(target, file, Some(lease))
             .unwrap()
             .into_parts();
-    let queued = observe_capture_reply(
+    let queued_state = observe_capture_reply(
         &model,
         &path,
         &path,
@@ -1579,16 +1641,20 @@ fn capture_reply_quarantines_conform_to_artifact_reply_publication() {
         &body,
         capture_reply_observation(3),
     );
-    let mut writer = FailAfterFirstWrite { bytes: Vec::new() };
-    let error = match write_control_reply(
+    // The peer takes the body and breaks before the challenge.
+    let mut writer = FailPast {
+        limit: body.len(),
+        bytes: Vec::new(),
+    };
+    let error = match deliver_waiting(
+        &mut outbox_of(ControlReply::with_handoff(body.clone(), handoff)),
         &mut writer,
-        ControlReply::with_handoff(body.clone(), handoff),
     ) {
         Err(error) => error,
         Ok(_) => panic!("the trailer write fails after the complete body"),
     };
     assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-    let prepared = reply_successor(&model, "PrepareWire", &queued);
+    let prepared = reply_successor(&model, "PrepareWire", &queued_state);
     let write_failed = observe_capture_reply(
         &model,
         &path,
@@ -1767,23 +1833,20 @@ fn capture_reply_identity_failures_conform_to_artifact_reply_publication() {
                 crate::app_introspect::queue_capture_reply_for_test(target, file, Some(lease))
                     .expect("the identity still validates when queued")
                     .into_parts();
-            let queued =
+            let queued_state =
                 observe_capture_reply(&model, &path, &path, b"", "", capture_reply_observation(3));
             swap();
+            let mut outbox = outbox_of(ControlReply::with_handoff(body.to_string(), handoff));
             assert!(
-                write_control_reply(
-                    &mut wire,
-                    ControlReply::with_handoff(body.to_string(), handoff),
-                )
-                .expect("the failure reply is written")
-                .is_none(),
+                !outbox.holds_handoff_for_test(),
                 "a failed preparation leaves nothing to acknowledge"
             );
+            assert!(deliver_waiting(&mut outbox, &mut wire).expect("the failure reply is written"));
             assert!(
                 String::from_utf8_lossy(&wire).starts_with("ERR artifact reply validation failed"),
                 "no OK byte certifies the swapped identity"
             );
-            (queued, "PrepareFailed")
+            (queued_state, "PrepareFailed")
         } else {
             swap();
             let refused =
@@ -1873,14 +1936,10 @@ fn nonreading_peer_cannot_hold_a_guarded_write_past_its_deadline() {
         })),
     );
     let (_nonreading_client, server) = CtlStream::pair().unwrap();
-    let mut writer = &server;
+    let mut outbox = control_lanes::Outbox::default();
+    outbox.attach_within(reply, std::time::Duration::from_millis(100));
     let started = std::time::Instant::now();
-    let error = match write_control_reply_with_timeout_arm(
-        &mut writer,
-        reply,
-        std::time::Duration::from_millis(100),
-        |timeout| server.set_write_timeout(timeout),
-    ) {
+    let error = match outbox.deliver(&server, false) {
         Err(error) => error,
         Ok(_) => panic!("a non-reading peer must exhaust the whole-write deadline"),
     };
@@ -1910,19 +1969,13 @@ fn dribbling_ack_cannot_refresh_the_handoff_deadline() {
             fail_prepare: false,
         })),
     );
-    let mut wire = Vec::new();
-    let pending = write_control_reply_with_timeout_arm(
-        &mut wire,
-        reply,
-        std::time::Duration::from_millis(250),
-        |_| Ok(()),
-    )
-    .unwrap()
-    .expect("guarded response");
+    let mut outbox = control_lanes::Outbox::default();
+    outbox.attach_within(reply, std::time::Duration::from_millis(250));
+    assert!(deliver_waiting(&mut outbox, &mut Vec::new()).unwrap());
     let ack = format!(
         "{}{nonce}\n",
         aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX,
-        nonce = pending.nonce.as_str()
+        nonce = outbox.nonce_for_test().expect("guarded response")
     );
     let (mut client, server) = CtlStream::pair().unwrap();
     // One byte per `DRIBBLE_GAP`, inside the 250 ms handoff budget, so a budget
@@ -1947,14 +2000,8 @@ fn dribbling_ack_cannot_refresh_the_handoff_deadline() {
             std::thread::sleep(DRIBBLE_GAP);
         }
     });
-    let mut reader = BufReader::new(&server);
     assert_eq!(
-        await_guarded_reply_close_with_quarantine(
-            &server,
-            &mut reader,
-            pending,
-            std::time::Duration::from_millis(20),
-        ),
+        await_ack(&mut outbox, &server),
         ArtifactAckOutcome::AcknowledgementQuarantined
     );
     // The outcome is the proof: the dribbled ack is the CORRECT one, so a budget
@@ -1984,7 +2031,7 @@ fn dribbling_ack_cannot_refresh_the_handoff_deadline() {
 fn acknowledge_then_exit(
     client: CtlStream,
     server: &CtlStream,
-    pending: PendingArtifactAck,
+    outbox: &mut control_lanes::Outbox,
 ) -> ArtifactAckOutcome {
     {
         let mut writing = &client;
@@ -2013,13 +2060,7 @@ fn acknowledge_then_exit(
     // server's receive queue and unread.
     drop(client);
     assert_peer_detached(server);
-    let mut server_reader = BufReader::new(server);
-    await_guarded_reply_close_with_quarantine(
-        server,
-        &mut server_reader,
-        pending,
-        std::time::Duration::from_millis(40),
-    )
+    await_ack(outbox, server)
 }
 
 /// THE DETACHED-PEER HAZARD, SET UP — asserted, never assumed. `drop`
@@ -2098,37 +2139,34 @@ fn sequential_acknowledged_replies_never_exhaust_the_handoff_pool() {
     // live cap, the way a real capture path's pinned chain does.
     const CHARGE: usize = ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT / ARTIFACT_HANDOFF_LIMIT;
     const CAPTURES: usize = 120;
-    static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
-        live: 0,
-        descriptor_units: 0,
-    });
+    let budgets = ArtifactBudgets::shipping();
 
     for capture in 0..CAPTURES {
-        let permit = ArtifactHandoffPermit::try_acquire_from(
-            &USAGE,
-            ARTIFACT_HANDOFF_LIMIT,
-            ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT,
-            CHARGE,
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "capture {capture} was refused admission: a released reply \
-                 is still holding its handoff permit"
-            )
-        });
+        let permit = budgets
+            .in_flight
+            .try_take()
+            .zip(budgets.descriptors.try_take(CHARGE))
+            .map(|(in_flight, chain)| ReplyRetentionPermit {
+                in_flight,
+                descriptors: Some(chain),
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "capture {capture} was refused admission: a released reply \
+                     is still holding its handoff permit"
+                )
+            });
         let alive = Arc::new(AtomicBool::new(true));
         let (client, server) = CtlStream::pair().unwrap();
-        let reply = guarded_probe_reply(ReplyRetentionPermit(permit).retain(WireProbe {
+        let reply = guarded_probe_reply(permit.retain(WireProbe {
             alive: Arc::clone(&alive),
             prepared: Arc::new(AtomicBool::new(false)),
             fail_prepare: false,
         }));
-        let mut writer = &server;
-        let pending = write_control_reply(&mut writer, reply)
-            .unwrap()
-            .expect("guarded response");
+        let mut outbox = outbox_of(reply);
+        assert!(outbox.deliver(&server, false).unwrap(), "guarded response");
         assert_eq!(
-            acknowledge_then_exit(client, &server, pending),
+            acknowledge_then_exit(client, &server, &mut outbox),
             ArtifactAckOutcome::PeerAcknowledged,
             "capture {capture} lost its acknowledgement"
         );
@@ -2139,13 +2177,8 @@ fn sequential_acknowledged_replies_never_exhaust_the_handoff_pool() {
     }
 
     assert_eq!(
-        *USAGE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ArtifactHandoffUsage {
-            live: 0,
-            descriptor_units: 0,
-        },
+        (budgets.descriptors.usage(), budgets.in_flight.used()),
+        (UnitUsage::default(), 0),
         "every one of {CAPTURES} sequential captures gave its permit back"
     );
 }
@@ -2175,10 +2208,8 @@ fn detached_peer_without_a_valid_ack_is_still_quarantined() {
             prepared: Arc::new(AtomicBool::new(false)),
             fail_prepare: false,
         }));
-        let mut writer = &server;
-        let pending = write_control_reply(&mut writer, reply)
-            .unwrap()
-            .expect("guarded response");
+        let mut outbox = outbox_of(reply);
+        assert!(outbox.deliver(&server, false).unwrap(), "guarded response");
         if let Some(farewell) = farewell {
             let mut writing = &client;
             writing.write_all(farewell.as_bytes()).unwrap();
@@ -2186,23 +2217,16 @@ fn detached_peer_without_a_valid_ack_is_still_quarantined() {
         }
         drop(client);
         assert_peer_detached(&server);
-        let mut server_reader = BufReader::new(&server);
         assert_eq!(
-            await_guarded_reply_close_with_quarantine(
-                &server,
-                &mut server_reader,
-                pending,
-                // A hang detector's length, so the reaper cannot beat the
-                // assertion below to the guard however long this thread
-                // stalls between the two: this test is about the verdict,
-                // not about how quickly the grace expires. (2 s raced a
-                // stall of 2 s.) The process is this test's alone, and
-                // ends before the grace does.
-                aterm_spec::wait::MUST_HAPPEN,
-            ),
+            await_ack(&mut outbox, &server),
             ArtifactAckOutcome::AcknowledgementQuarantined,
             "{label} must not read as a consume acknowledgement"
         );
+        // Held for a day, so the reaper cannot beat the assertion below to the
+        // guard however long this thread stalls between the two: this test is
+        // about the verdict, not about how quickly the grace expires. The
+        // process is this test's alone, and ends before the grace does.
+        last_quarantine_ticket();
         assert!(
             alive.load(Ordering::Acquire),
             "{label} keeps the guard until its quarantine grace elapses"
@@ -2233,17 +2257,11 @@ fn a_pre_challenge_guess_or_a_half_close_is_quarantined_not_acknowledged() {
                 prepared: Arc::new(AtomicBool::new(false)),
                 fail_prepare: false,
             }));
-            let mut writer = &server;
-            let pending = write_control_reply(&mut writer, reply)
+            let mut reader = BufReader::new(&server);
+            let outcome = outbox_of(reply)
+                .finish_waiting(&server, &mut reader)
                 .unwrap()
                 .expect("guarded response");
-            let mut reader = BufReader::new(&server);
-            let outcome = await_guarded_reply_close_with_quarantine(
-                &server,
-                &mut reader,
-                pending,
-                HELD_QUARANTINE,
-            );
             (outcome, last_quarantine_ticket())
         });
         let mut reader = BufReader::new(&client);
@@ -2471,23 +2489,26 @@ use super::control_media::{
     MAX_IMAGE_PAYLOAD_BYTES, cmd_image_read, image_payload, image_read_line,
 };
 use super::control_query::{
-    AbsRow, abs_row_text, cmd_cell, cmd_colors, cmd_cursor_json, cmd_cwd, cmd_line, cmd_mainscreen,
-    cmd_modes, cmd_screen_styled_json, cmd_search, cmd_text, cmd_text_json, serialize_dims,
+    TextArgs, cmd_cell, cmd_colors, cmd_cursor_json, cmd_cwd, cmd_line, cmd_mainscreen, cmd_modes,
+    cmd_screen_styled_json, cmd_search, cmd_text, cmd_text_json_opt, serialize_dims,
     serialize_dims_json, styled_image_json,
 };
 use super::control_selection::{cmd_blocks, cmd_blocks_json, cmd_wait};
 use super::control_session::{
     TurnIo, cmd_await, cmd_cast, cmd_connect_in, cmd_disconnect_in, cmd_edges, cmd_edges_json,
-    cmd_family, cmd_flows, cmd_grant, cmd_lease, cmd_meta, cmd_ready, cmd_revoke, cmd_sessions,
-    cmd_timeline, cmd_turn, cmd_who, cmd_whoami, raise_target,
+    cmd_family, cmd_flows, cmd_grant, cmd_lease, cmd_meta, cmd_ready, cmd_revoke,
+    cmd_sessions_store, cmd_timeline, cmd_turn, cmd_who, cmd_whoami, raise_target,
 };
 use super::*;
 use crate::TabAction;
+use crate::budget::UnitUsage;
 use crate::input::InputEvent;
 use crate::session_waits::RewrapGauge;
 use aterm_control::wire::pct_decode;
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_session::sink::SinkWriter;
+use aterm_types::control_verbs::input_of;
+use std::io::BufReader;
 // The pipe-backed byte-drain assertions are Unix-only (the tests that read
 // do so through fn-local imports).
 #[cfg(unix)]
@@ -2511,26 +2532,26 @@ fn owner_only_verbs_refuse_an_edge_and_a_named_session() {
     );
 }
 
-/// `task mark` is Owner-only at the dispatch gate (`escalated_op`): an edge
+/// `task mark` is Owner-only at the dispatch gate ([`need_of`]): an edge
 /// granted ANY op on the session is refused it — a manager acts on the record,
 /// so no edge may forge one — while a read edge reads `task` and parks `await
 /// task`, and an ungranted edge does neither.
 #[test]
 fn task_mark_is_owner_only_and_task_is_a_read() {
     let ctx = test_ctx();
-    assert!(dispatch_authorized(Scope::Owner, "task", "mark done", &ctx));
+    assert!(line_authorized(Scope::Owner, "task", "mark done", &ctx));
     for op in [Op::ReadScreen, Op::WriteInput, Op::Signal, Op::ConfigWrite] {
         let granted = edge_granted(op, &ctx);
         assert!(
-            !dispatch_authorized(granted, "task", "mark done why=marker", &ctx),
+            !line_authorized(granted, "task", "mark done why=marker", &ctx),
             "{op:?}"
         );
     }
     let read = edge_granted(Op::ReadScreen, &ctx);
-    assert!(dispatch_authorized(read, "task", "", &ctx));
-    assert!(dispatch_authorized(read, "await", "task since=1", &ctx));
-    assert!(!dispatch_authorized(edge(), "task", "", &ctx));
-    assert!(!dispatch_authorized(edge(), "await", "task", &ctx));
+    assert!(line_authorized(read, "task", "", &ctx));
+    assert!(line_authorized(read, "await", "task since=1", &ctx));
+    assert!(!line_authorized(edge(), "task", "", &ctx));
+    assert!(!line_authorized(edge(), "await", "task", &ctx));
 }
 
 /// The list form of `await task` is the dispatcher's (no session of the
@@ -2560,16 +2581,15 @@ fn the_await_task_list_form_is_told_from_every_other_await() {
 fn dispatch_await_task_resolves_its_list_and_refuses_what_it_cannot() {
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
     let store = session_store::new_store();
-    let subscribers = crate::subscribe::new_registry();
     let active: ActiveHandle = Arc::default();
     let a = registered_session(1, -1, b"");
     let b = registered_session(2, -1, b"");
     store.write().unwrap().register(a.clone());
     store.write().unwrap().register(b.clone());
-    mark_session_task(&a.ctx, 1, &TaskMark::new(TaskState::Done), &subscribers).expect("unfenced");
+    mark_session_task(&a.ctx, 1, &TaskMark::new(TaskState::Done)).expect("unfenced");
     let list = format!("@{},@2 since=0 timeout=60000", a.sid.as_str());
     let words: Vec<&str> = list.split_whitespace().collect();
-    let reply = dispatch_await_task(&words, &active, &store, &subscribers, Scope::Owner);
+    let reply = dispatch_await_task(&words, &active, &store, Scope::Owner);
     assert!(reply.starts_with("OK 2\n"), "{reply}");
     assert!(
         reply.contains(&format!("@{} rev=1 state=done ", a.sid.as_str()))
@@ -2580,7 +2600,7 @@ fn dispatch_await_task_resolves_its_list_and_refuses_what_it_cannot() {
     // so a client reads row `i` as target `i`'s.
     let twice = format!("@1,@{} since=0 timeout=60000", a.sid.as_str());
     let words: Vec<&str> = twice.split_whitespace().collect();
-    let reply = dispatch_await_task(&words, &active, &store, &subscribers, Scope::Owner);
+    let reply = dispatch_await_task(&words, &active, &store, Scope::Owner);
     let rows: Vec<&str> = reply.lines().collect();
     assert_eq!(rows.len(), 3, "{reply}");
     assert_eq!(rows[0], "OK 2", "{reply}");
@@ -2593,20 +2613,19 @@ fn dispatch_await_task_resolves_its_list_and_refuses_what_it_cannot() {
         &["@2,@s-0000000000000000dead"],
         &active,
         &store,
-        &subscribers,
         Scope::Owner,
     );
     assert_eq!(missing, "ERR no such session @s-0000000000000000dead\n");
     assert_eq!(
-        dispatch_await_task(&["@."], &active, &store, &subscribers, Scope::Owner),
+        dispatch_await_task(&["@."], &active, &store, Scope::Owner),
         NO_ACTIVE_TERMINAL
     );
     assert_eq!(
-        dispatch_await_task(&["@2"], &active, &store, &subscribers, edge()),
+        dispatch_await_task(&["@2"], &active, &store, edge()),
         "ERR denied\n"
     );
     assert_eq!(
-        dispatch_await_task(&["@2", "@1"], &active, &store, &subscribers, Scope::Owner),
+        dispatch_await_task(&["@2", "@1"], &active, &store, Scope::Owner),
         crate::task_record::AWAIT_TASK_USAGE
     );
 }
@@ -2615,7 +2634,9 @@ fn dispatch_await_task_resolves_its_list_and_refuses_what_it_cannot() {
 /// event or hand the connection to a relay. Every read, keystroke and `subscribe`
 /// that flips to push here is request-lane work; a `subscribe` to one session
 /// another instance hosts is relayed for the whole subscription, a wait, in every
-/// spelling the relay follows. Only an Owner-class connection is relayed.
+/// spacing the request grammar reads. A spelling that is no session id (`@S-…`,
+/// upper-case hex, a path) is answered here and relayed nowhere. Only an
+/// Owner-class connection is relayed.
 #[test]
 fn wait_requests_are_the_ones_that_park_or_relay() {
     let store = session_store::new_store();
@@ -2633,15 +2654,18 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         "turn hello",
         "post to=@s-x kind=ask hi",
         "inbox get @42",
-        "@s-not-hosted-here text",
+        &format!("@{remote_sid} text"),
+        &format!("@{remote_sid}\ttext"),
+        &format!("  @{remote_sid}  text"),
+        "@s-0a1b2c3d4e5f60718293 text",
+        // An owner verb that acts on a session is relayed like any other.
+        &format!("@{remote_sid} topic triage"),
         // The selector-second grammar: relayed to the instance that hosts it,
-        // under any spelling `graph/<sid>` resolves (a path; another case on a
-        // case-insensitive volume) — classed a wait wherever it is relayed.
+        // classed a wait wherever it is relayed.
         &format!("subscribe @{remote_sid} events"),
         &format!("subscribe  @{remote_sid} events"),
-        &format!("subscribe @./{remote_sid} events"),
-        &format!("subscribe @S-{} events", &remote_sid[2..]),
-        // Settles 60 ms and folds the whole recording (`cast drift`).
+        &format!("subscribe\t@{remote_sid}\tevents"),
+        // Waits for the recording, then folds it whole (`cast drift`).
         "cast drift",
         &format!("@{local_sid} cast drift max_runs=4"),
         // Waits, bounded, for the console host's forwarded leave.
@@ -2656,30 +2680,55 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         &format!("@{local_sid} paste-bin 5"),
         "paste-bin 5",
         "@. paste-bin 5",
+        // A recording runs for its seconds (up to 60) and an update check waits
+        // on the network for tens of seconds.
+        "video 3",
+        "video 3 full",
+        "update check",
+        // Parks for the owner to answer the sudo password sheet.
+        "askpass",
+        // Lays out a new Editor view on the main thread, then parks until that
+        // view closes.
+        &format!("@{local_sid} edit file:///tmp/x.txt"),
+        "await edit ticket=1",
     ] {
         assert!(
-            is_wait_request(line, Scope::Owner, &store),
+            request_waits(line, Scope::Owner, &store),
             "{line:?} parks or relays"
         );
     }
     // An Edge is never relayed, so a line naming another instance's session is
     // refused at once on a request lane; what parks still parks.
     for line in [
-        "@s-not-hosted-here text",
+        &format!("@{remote_sid} text"),
         &format!("subscribe @{remote_sid} events"),
     ] {
         assert!(
-            !is_wait_request(line, edge, &store),
+            !request_waits(line, edge, &store),
             "{line:?} from an Edge is refused, never relayed"
         );
     }
-    assert!(is_wait_request("await seq 5 timeout 20000", edge, &store));
-    assert!(is_wait_request(
-        "@s-not-hosted-here await seq 5",
+    assert!(request_waits("await seq 5 timeout 20000", edge, &store));
+    assert!(request_waits(
+        &format!("@{remote_sid} await seq 5"),
         edge,
         &store
     ));
     for line in [
+        // An instance verb is answered here whatever it names, as the instance
+        // hosting it would answer.
+        &format!("@{remote_sid} who"),
+        &format!("@{remote_sid} hold on"),
+        // No session id, so no relay: answered here at once.
+        "@s-not-hosted-here text",
+        &format!("@S-{} text", &remote_sid[2..]),
+        &format!("@./{remote_sid} text"),
+        &format!("subscribe @./{remote_sid} events"),
+        &format!("subscribe @S-{} events", &remote_sid[2..]),
+        // Upper-case hex is no minted id: the lower-case spelling of this one
+        // is relayed (above).
+        "@s-0A1B2C3D4E5F60718293 text",
+        "subscribe @s-0A1B2C3D4E5F60718293 events",
         "version",
         "text --json tail=40",
         "status",
@@ -2710,12 +2759,54 @@ fn wait_requests_are_the_ones_that_park_or_relay() {
         &format!("@{local_sid} text"),
         "cast",
         "cast frames count=4",
+        // A recording's status, its stop and its frame listing answer at once,
+        // as do the updater's status forms.
+        "video status",
+        "video stop",
+        "video frames count=4",
+        "update",
+        "update status",
     ] {
         assert!(
-            !is_wait_request(line, Scope::Owner, &store),
+            !request_waits(line, Scope::Owner, &store),
             "{line:?} is request-lane work"
         );
     }
+}
+
+/// The subscription cap is a sixteenth of the soft descriptor limit, within
+/// `[CONTROL_SUBSCRIPTIONS_MIN, CONTROL_SUBSCRIPTIONS_MAX]`, beside the
+/// connections' quarter: at launchd's 256, both together leave more than
+/// two-thirds of the descriptors to the rest of the window.
+#[test]
+fn the_subscription_cap_is_a_share_of_the_descriptor_limit() {
+    assert_eq!(subscriptions_cap_for(Some(256)), 16, "launchd's default");
+    assert!(connections_cap_for(Some(256)) + subscriptions_cap_for(Some(256)) < 256 / 3);
+    assert_eq!(subscriptions_cap_for(Some(2_048)), 128);
+    assert_eq!(
+        subscriptions_cap_for(Some(10_240)),
+        CONTROL_SUBSCRIPTIONS_MAX
+    );
+    assert_eq!(
+        subscriptions_cap_for(Some(u64::MAX)),
+        CONTROL_SUBSCRIPTIONS_MAX,
+        "RLIM_INFINITY"
+    );
+    assert_eq!(
+        subscriptions_cap_for(Some(20)),
+        CONTROL_SUBSCRIPTIONS_MIN,
+        "never below the fixed pool it replaced"
+    );
+    assert_eq!(
+        subscriptions_cap_for(None),
+        CONTROL_SUBSCRIPTIONS_MIN,
+        "unreadable"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        control_subscriptions_cap(),
+        subscriptions_cap_for(soft_descriptor_limit())
+    );
 }
 
 /// The pre-auth read deadline relies on a timed-out read surfacing as an error:
@@ -2759,7 +2850,8 @@ fn authenticated_readiness_preserves_slow_cadence() {
         std::thread::sleep(std::time::Duration::from_millis(150));
         client.write_all(b"version\n").expect("late request");
     });
-    let mut reader = control_lanes::lane_reader(&server, Vec::new());
+    let mut unread = control_lanes::Unread::default();
+    let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
     assert_eq!(
         read_authenticated_request_line(&mut reader, &mut std::io::sink()).as_deref(),
         Some("version"),
@@ -2798,7 +2890,8 @@ fn authenticated_readiness_preserves_partial_line() {
         );
         client.write_all(b"sion\n").expect("final line chunk");
     });
-    let mut reader = control_lanes::lane_reader(&server, Vec::new());
+    let mut unread = control_lanes::Unread::default();
+    let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
     assert_eq!(
         read_authenticated_request_line(&mut reader, &mut std::io::sink()).as_deref(),
         Some("version")
@@ -2822,7 +2915,8 @@ fn authenticated_readiness_drains_prefetched_lines_without_waiting() {
         .expect("coalesced request lines");
     let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
-        let mut reader = control_lanes::lane_reader(&server, Vec::new());
+        let mut unread = control_lanes::Unread::default();
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
         let first = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let prefetched = !reader.buffer().is_empty();
         let second = read_authenticated_request_line(&mut reader, &mut std::io::sink());
@@ -2841,7 +2935,7 @@ fn authenticated_readiness_drains_prefetched_lines_without_waiting() {
 }
 
 /// A wait moved to a wait lane carries the requests pipelined behind it
-/// (`control_lanes::lane_reader`). They were read from the socket already,
+/// (`control_lanes::Unread`). They were read from the socket already,
 /// so a readiness wait on it would park until the still-open peer sent
 /// more: the carried lines must be read first, without waiting, and the
 /// socket after them.
@@ -2855,7 +2949,8 @@ fn authenticated_readiness_reads_carried_lines_without_waiting() {
         .expect("arm authenticated recv backstop");
     let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
-        let mut reader = control_lanes::lane_reader(&server, b"version\nstatus\n".to_vec());
+        let mut unread = control_lanes::Unread::holding(b"version\nstatus\n".to_vec());
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
         let first = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let second = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let _ = tx.send((first, second));
@@ -2889,7 +2984,8 @@ fn authenticated_readiness_drains_tail_then_observes_peer_eof() {
         .expect("arm authenticated recv backstop");
     let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
-        let mut reader = control_lanes::lane_reader(&server, Vec::new());
+        let mut unread = control_lanes::Unread::default();
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
         let tail = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let eof = read_authenticated_request_line(&mut reader, &mut std::io::sink());
         let _ = tx.send((tail, eof));
@@ -2908,8 +3004,36 @@ fn authenticated_readiness_drains_tail_then_observes_peer_eof() {
     assert_eq!(eof, None);
 }
 
+/// A relay forwards what the lane reader already holds past its request line
+/// before its own reads (`LaneReader::take_buffered`): exactly those bytes,
+/// once, and never a read of the socket for more. A one-line forward's client
+/// sends nothing until it is answered, so such a read would wait forever before
+/// the relay starts (the `drain_buffered` `fill_buf` hang). The bytes the client
+/// has sent before the first take are the witness: still in the socket, they
+/// are not the reader's to hand over.
 #[test]
-#[cfg(target_os = "macos")]
+fn a_lane_reader_hands_over_what_it_holds_without_reading_for_more() {
+    use std::io::{BufRead, Write};
+
+    let (mut client, server) = CtlStream::pair().expect("real control socket pair");
+    client
+        .write_all(b"verb line\nLEFTOVER")
+        .expect("a request line and what was pipelined behind it");
+    let mut unread = control_lanes::Unread::default();
+    let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
+    assert!(
+        reader.take_buffered().is_empty(),
+        "nothing held: what is still in the socket is not read for it"
+    );
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("the request line");
+    assert_eq!(line, "verb line\n");
+    assert_eq!(reader.take_buffered(), b"LEFTOVER");
+    assert!(reader.take_buffered().is_empty(), "handed over once");
+}
+
+#[test]
+#[cfg(unix)]
 fn authenticated_poll_event_drains_hangup_and_rejects_invalid_fd() {
     assert!(authenticated_poll_event(libc::POLLIN).is_ok());
     assert!(authenticated_poll_event(libc::POLLHUP).is_ok());
@@ -3016,86 +3140,6 @@ fn unread_bytes(socket: std::os::fd::BorrowedFd<'_>) -> usize {
     let rc = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut queued) };
     assert_eq!(rc, 0, "FIONREAD on a live socket");
     usize::try_from(queued).expect("a byte count")
-}
-
-/// Push capacity is isolated and lane-exact AT ITS CEILING: a dispatch that
-/// may hold four lanes and grows none, four long-lived subscribers own them,
-/// the FIFTH gets a prompt explicit error rather than waiting behind them
-/// without an ACK, and completion restores one admission.
-#[test]
-fn fifth_subscription_is_promptly_rejected_and_capacity_recovers() {
-    use std::io::BufRead;
-
-    let subscriptions = SubscriptionDispatch::new(CONTROL_SUBSCRIPTION_WORKERS);
-    subscriptions
-        .jobs
-        .set_capacity(CONTROL_SUBSCRIPTION_WORKERS);
-    let mut clients = Vec::new();
-    for index in 0..CONTROL_SUBSCRIPTION_WORKERS {
-        let (client, server) = CtlStream::pair().expect("subscription socket pair");
-        clients.push(client);
-        assert!(
-            subscriptions
-                .try_submit(
-                    format!("subscribe @. screen since={index}"),
-                    Scope::Owner,
-                    server
-                )
-                .is_ok(),
-            "subscriber {index} owns one reserved push lane"
-        );
-    }
-    let (overflow_client, overflow_server) = CtlStream::pair().expect("fifth subscription pair");
-    // The refusal MUST come: a hang detector, not a latency budget.
-    overflow_client
-        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-        .expect("bound rejection read");
-    handoff_subscription(
-        &subscriptions,
-        "subscribe @. screen".to_string(),
-        Scope::Owner,
-        overflow_server,
-    );
-    let mut rejection = String::new();
-    BufReader::new(overflow_client)
-        .read_line(&mut rejection)
-        .expect("fifth subscriber gets a prompt response");
-    assert_eq!(rejection, "ERR subscription capacity busy; retry\n");
-
-    // Independent ordinary admission remains live while push is saturated.
-    let ordinary: BoundedDispatch<CtlStream> = BoundedDispatch::new(1);
-    ordinary.set_capacity(1);
-    let (_ordinary_client, ordinary_server) = CtlStream::pair().expect("ordinary control pair");
-    assert!(ordinary.try_submit(ordinary_server).is_ok());
-
-    // Popping starts long-lived work; it must NOT release capacity early.
-    drop(subscriptions.jobs.pop());
-    let (_recovery_client, recovery_server) =
-        CtlStream::pair().expect("recovery subscription pair");
-    assert!(
-        subscriptions
-            .try_submit(
-                "subscribe @. screen".to_string(),
-                Scope::Owner,
-                recovery_server,
-            )
-            .is_err(),
-        "starting a long-lived subscription does not create a phantom slot"
-    );
-    subscriptions.jobs.complete();
-    let (_restored_client, restored_server) =
-        CtlStream::pair().expect("restored subscription pair");
-    assert!(
-        subscriptions
-            .try_submit(
-                "subscribe @. screen".to_string(),
-                Scope::Owner,
-                restored_server,
-            )
-            .is_ok(),
-        "one completed subscriber restores exactly one push lane"
-    );
-    drop(clients);
 }
 
 /// The `key` / `ctrl` grammar, one labelled row per input line.
@@ -3374,7 +3418,7 @@ fn screen_styled_frame_is_lossless() {
 fn screen_verb_framing_is_single_line_json() {
     use aterm_core::terminal::Terminal;
     let term = Arc::new(Mutex::new(Terminal::new(2, 4)));
-    let out = cmd_screen_styled_json(&term, "");
+    let out = cmd_screen_styled_json(&term, &crate::frame_memo::FrameSlot::default(), "");
     assert!(out.starts_with("OK 1\n"), "{out}");
     let body = out
         .strip_prefix("OK 1\n")
@@ -3402,7 +3446,7 @@ fn screen_never_sends_a_line_past_the_reply_cap() {
     let fits = |out: &str| out.lines().all(|line| line.len() <= cap);
     // A grid whose cells alone pass the cap.
     let term = Arc::new(Mutex::new(Terminal::new(120, 300)));
-    let out = cmd_screen_styled_json(&term, "");
+    let out = cmd_screen_styled_json(&term, &crate::frame_memo::FrameSlot::default(), "");
     assert!(
         fits(&out) && out.starts_with("ERR screen:"),
         "{}",
@@ -3418,7 +3462,7 @@ fn screen_never_sends_a_line_past_the_reply_cap() {
             format!("\x1b[{row};1H\x1b]1337;File=inline=1;width=10;height=4:{b64}\x07").as_bytes(),
         );
     }
-    let out = cmd_screen_styled_json(&term, "");
+    let out = cmd_screen_styled_json(&term, &crate::frame_memo::FrameSlot::default(), "");
     assert!(
         out.starts_with("OK 1\n") && fits(&out),
         "{}",
@@ -3432,13 +3476,83 @@ fn screen_never_sends_a_line_past_the_reply_cap() {
     assert!(out.contains(&format!("\"nbytes\":{}", 3 << 20)));
 }
 
+/// AN OVER-CAP `screen` GATHERS AGAIN ONLY TO LEAVE OUT A PUBLISHED FRAME'S
+/// PICTURES. A grid past the reply-line cap with no image is answered the `ERR`
+/// line from the one gather the read made, or from none when a `cells` watch
+/// published the frame; a frame the read gathered with pictures is rebuilt from
+/// its own snapshot without them.
+///
+/// Negative control: a published frame that carries pictures is gathered afresh,
+/// so the counter reads a second gather when one is made, and the published
+/// frame keeps its payloads for its watchers.
+#[test]
+fn an_over_cap_screen_gathers_again_only_for_a_published_frames_pictures() {
+    use crate::frame_memo::{FrameSlot, Styled};
+    use crate::work_counts::take_styled_frames_gathered as gathered;
+    use aterm_core::terminal::Terminal;
+    let too_big = "ERR screen: frame too large";
+    let truncated = |out: &str| {
+        out.starts_with("OK 1\n") && out.matches("\"format\":\"truncated\"").count() == 2
+    };
+
+    let term = Arc::new(Mutex::new(Terminal::new(120, 300)));
+    let slot = Arc::new(FrameSlot::default());
+    gathered();
+    assert!(cmd_screen_styled_json(&term, &slot, "").starts_with(too_big));
+    assert_eq!(gathered(), 1, "one gather for the ERR line");
+    let hold = FrameSlot::hold_cells(&slot);
+    assert!(cmd_screen_styled_json(&term, &slot, "").starts_with(too_big));
+    assert_eq!(gathered(), 1, "the read that published gathered once");
+    assert!(cmd_screen_styled_json(&term, &slot, "").starts_with(too_big));
+    assert_eq!(
+        gathered(),
+        0,
+        "a published frame with no picture is not gathered"
+    );
+    drop(hold);
+
+    // Two ~3 MiB pictures on an ordinary screen.
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    for (row, fill) in [(1, 1u8), (12, 2)] {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(3 << 20, fill);
+        let b64 = aterm_codec::base64::encode(&png).expect("encodes");
+        term.lock().unwrap().process(
+            format!("\x1b[{row};1H\x1b]1337;File=inline=1;width=10;height=4:{b64}\x07").as_bytes(),
+        );
+    }
+    let slot = Arc::new(FrameSlot::default());
+    gathered();
+    assert!(truncated(&cmd_screen_styled_json(&term, &slot, "")));
+    assert_eq!(gathered(), 1, "its own snapshot, rebuilt without them");
+    let _hold = FrameSlot::hold_cells(&slot);
+    assert!(truncated(&cmd_screen_styled_json(&term, &slot, "")));
+    assert_eq!(gathered(), 1, "the read that published gathered once");
+    assert!(truncated(&cmd_screen_styled_json(&term, &slot, "")));
+    assert_eq!(
+        gathered(),
+        1,
+        "the negative control: a published frame's pictures are left out of a fresh gather"
+    );
+    let look = slot.look_frame();
+    let t = term.lock().unwrap();
+    let key = crate::frame_key::FrameKey::read(&t);
+    match look.styled(&t, &key) {
+        Styled::Hit(frame) => assert!(
+            frame.carries_image_payloads(),
+            "the published frame keeps its payloads"
+        ),
+        Styled::Miss(_) => panic!("the frame stays published"),
+    }
+}
+
 /// A small inline image encodes normally; an oversized one (user-supplied OSC 1337)
 /// is `truncated` with an empty payload but its real `nbytes`, so consumers learn
 /// it exists without a multi-MB payload on every `image read` / styled frame.
 #[test]
 fn oversized_image_payload_is_truncated_not_encoded() {
     use aterm_core::grid::extra::{ImageData, ImageFormat, ImageScaling};
-    let small = ImageData {
+    let small = Arc::new(ImageData {
         bytes: vec![1, 2, 3, 4],
         format: ImageFormat::Png,
         cols: 1,
@@ -3448,12 +3562,15 @@ fn oversized_image_payload_is_truncated_not_encoded() {
         cell_offset_px: (0, 0),
         scaling: ImageScaling::Fit,
         source_rect: None,
-    };
-    let (fmt, b64) = image_payload(&small);
-    assert_eq!(fmt, "png");
-    assert!(!b64.is_empty(), "small image must carry its payload");
+    });
+    let payload = image_payload(&small);
+    assert_eq!(payload.format(), "png");
+    assert!(
+        !payload.b64().is_empty(),
+        "small image must carry its payload"
+    );
 
-    let big = ImageData {
+    let big = Arc::new(ImageData {
         bytes: vec![0u8; MAX_IMAGE_PAYLOAD_BYTES + 1],
         format: ImageFormat::Png,
         cols: 80,
@@ -3463,18 +3580,27 @@ fn oversized_image_payload_is_truncated_not_encoded() {
         cell_offset_px: (0, 0),
         scaling: ImageScaling::Fit,
         source_rect: None,
-    };
-    let (fmt, b64) = image_payload(&big);
-    assert_eq!(fmt, "truncated", "oversized image must be marked truncated");
-    assert!(b64.is_empty(), "oversized image must NOT be base64-encoded");
+    });
+    let payload = image_payload(&big);
+    assert_eq!(
+        payload.format(),
+        "truncated",
+        "oversized image must be marked truncated"
+    );
+    assert!(
+        payload.b64().is_empty(),
+        "oversized image must NOT be base64-encoded"
+    );
     // The line form still reports the real size (so the consumer can decide).
-    let line = image_read_line(0, 0, 0, 0, &big);
+    let mut line = String::new();
+    image_read_line(&mut line, 0, 0, 0, 0, &big, &payload);
     assert!(
         line.contains(&format!("truncated {}", MAX_IMAGE_PAYLOAD_BYTES + 1)),
         "{line}"
     );
     // And the JSON form is well-formed with an empty payload + real nbytes.
-    let js = styled_image_json(0, 0, &big);
+    let mut js = String::new();
+    styled_image_json(&mut js, 0, 0, &big, &payload);
     assert!(
         js.contains("\"format\":\"truncated\"") && js.contains("\"b64\":\"\""),
         "{js}"
@@ -3566,99 +3692,357 @@ fn image_read_of_a_stacked_cell_reports_the_top_image() {
     );
 }
 
-/// The cross-process forward decision: Owner-only, presents the per-op edge token,
-/// rewrites the child selector to `@.`, and fails closed on an Edge scope, an
-/// unknown child, or a relaunched (nonce-mismatched) child.
+/// A NESTED CHILD IS REACHED WITH ITS OWN TOKEN. A session an inner aterm hosts
+/// (one this process provisioned, holding the edges it minted for it in the
+/// child's `ATERM_EDGE_TOKENS` file) is forwarded like any other instance's: to
+/// the socket its graph entry names, confined to the runtime dir, presenting the
+/// token beside that socket and the caller's line as it came, selector kept (a
+/// `subscribe`'s streams and flags too). The edges minted for it are never
+/// presented, so a relaunch under a fresh nonce is reached the same way.
+/// Fail-closed: an Edge, a list of targets, an id with no entry and an entry
+/// redirected out of the runtime dir plan nothing.
 #[test]
-fn proxy_forward_plan_owner_only_op_scoped_and_nonce_guarded() {
-    use aterm_session::{EdgeToken, LaunchNonce, SessionId};
-    let dir = std::env::temp_dir().join(format!("aterm-fwd-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+fn a_nested_child_is_forwarded_with_its_own_token() {
+    let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+    let dir = dir.path();
     let store = crate::session_store::new_store();
-    let child = SessionId::generate();
-    let nonce = LaunchNonce::generate();
-    let entry = crate::proxy::ProxyEntry {
-        nonce,
-        read: EdgeToken::generate(),
-        write: EdgeToken::generate(),
-        signal: EdgeToken::generate(),
+    // The child as this process provisions it: its identity and its edges.
+    let (env, _provisioned) = crate::spawn::provision_child_proxy(Some(dir));
+    let get = |key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("the child's {key}"))
     };
-    let read_hex = entry.read.to_hex();
-    let write_hex = entry.write.to_hex();
-    crate::proxy::register_child(child.clone(), entry);
-    // The published socket must live directly in `dir` (the runtime sock dir);
-    // `confine_proxy_sock` rejects anything else, and the forward dials the
-    // confined path.
-    let child_sock = dir.join("aterm-child.sock");
-    let child_sock_str = child_sock.to_string_lossy().into_owned();
-    let confined = std::fs::canonicalize(&dir)
+    let child = SessionId::new(get(aterm_types::domain::ENV_SESSION_ID));
+    let (read, write, signal) =
+        crate::proxy::read_edge_tokens(&get(aterm_types::domain::ENV_EDGE_TOKENS))
+            .expect("the child's edges");
+    let edges = [read, write, signal];
+    let nonce = LaunchNonce::generate();
+    let sock = hosting_instance(dir, 77030, &child, "c0ffee01");
+    // The forward dials the confined path: the canonical runtime dir.
+    let confined = std::fs::canonicalize(dir)
         .unwrap()
-        .join("aterm-child.sock");
-    let confined_str = confined.to_string_lossy().into_owned();
-    crate::proxy::write_graph_entry(&dir, &child, &child_sock_str, &nonce);
+        .join("aterm-77030.sock")
+        .to_string_lossy()
+        .into_owned();
 
     let line = format!("@{} screen", child.as_str());
-    // Owner forwards: read verb → READ token, selector rewritten to @.
-    let plan = proxy_forward_plan(&line, Scope::Owner, &store, &dir).expect("owner forwards");
-    assert_eq!(plan.0, confined_str);
-    assert_eq!(presented(&plan), format!("TOKEN {read_hex} @. screen\n"));
-    // A write verb selects the WRITE token (op→token mapping).
-    let kline = format!("@{} key up", child.as_str());
-    let kplan = proxy_forward_plan(&kline, Scope::Owner, &store, &dir).expect("write forwards");
-    assert_eq!(presented(&kplan), format!("TOKEN {write_hex} @. key up\n"));
+    for relayed in [
+        line.clone(),
+        format!("@{} key up", child.as_str()),
+        format!("subscribe @{} cells,bytes every-frame", child.as_str()),
+        format!("subscribe  @{} cells", child.as_str()),
+    ] {
+        let plan = plan_for(&relayed, Scope::Owner, &store, dir)
+            .unwrap_or_else(|| panic!("{relayed:?}: the Owner reaches the child"));
+        assert_eq!(plan, confined);
+        let first = presented(&plan, &relayed);
+        assert_eq!(first, format!("TOKEN c0ffee01 {relayed}\n"));
+        assert!(
+            edges.iter().all(|edge| !first.contains(edge.as_str())),
+            "{relayed:?}: an edge minted for the child was presented"
+        );
+    }
 
-    // The selector-second `subscribe` grammar is forwarded too, presenting the read
-    // token, rewriting the child selector to `@.`, keeping streams and flags.
-    let sline = format!("subscribe @{} cells,bytes every-frame", child.as_str());
-    let splan = proxy_forward_plan(&sline, Scope::Owner, &store, &dir).expect("subscribe forwards");
-    assert_eq!(splan.0, confined_str);
-    assert_eq!(
-        presented(&splan),
-        format!("TOKEN {read_hex} subscribe @. cells,bytes every-frame\n")
-    );
-    // The rewrite replaces the selector, wherever it starts: the streams that
-    // follow it reach the child whole.
-    let spaced = format!("subscribe  @{} cells", child.as_str());
-    let spaced_plan = proxy_forward_plan(&spaced, Scope::Owner, &store, &dir).expect("forwards");
-    assert_eq!(
-        presented(&spaced_plan),
-        format!("TOKEN {read_hex} subscribe @. cells\n")
-    );
-    // A subscribe with a comma-list of targets stays local (not a single child).
+    // A subscribe with a comma-list of targets stays local (not one session).
     let mixed = format!("subscribe @.,@{} cells", child.as_str());
-    assert!(proxy_forward_plan(&mixed, Scope::Owner, &store, &dir).is_none());
-    // An unregistered child id → no plan.
+    assert!(plan_for(&mixed, Scope::Owner, &store, dir).is_none());
+    // An id no instance published → no plan.
     let other = format!("@{} screen", SessionId::generate().as_str());
-    assert!(proxy_forward_plan(&other, Scope::Owner, &store, &dir).is_none());
+    assert!(plan_for(&other, Scope::Owner, &store, dir).is_none());
 
-    // A relaunch (graph entry under a NEW nonce) fails closed.
-    crate::proxy::write_graph_entry(&dir, &child, &child_sock_str, &LaunchNonce::generate());
-    assert!(
-        proxy_forward_plan(&line, Scope::Owner, &store, &dir).is_none(),
-        "nonce mismatch must fail closed",
+    // A relaunch (graph entry under a NEW nonce) is the same host to reach.
+    crate::proxy::write_graph_entry(
+        dir,
+        &child,
+        &sock.to_string_lossy(),
+        &LaunchNonce::generate(),
+    );
+    assert_eq!(
+        plan_for(&line, Scope::Owner, &store, dir).as_deref(),
+        Some(confined.as_str()),
+        "a relaunched child is reached with its own token"
     );
 
-    // A graph entry redirected outside our runtime dir (a same-uid overwrite that
-    // copies the readable nonce) fails closed: the parent neither dials it nor
-    // presents the token. The correct nonce is restored so only the path trips.
-    crate::proxy::write_graph_entry(&dir, &child, "/tmp/evil-attacker.sock", &nonce);
+    // A graph entry redirected outside our runtime dir (a same-uid overwrite)
+    // fails closed: nothing dials it, so no token is presented there.
+    crate::proxy::write_graph_entry(dir, &child, "/tmp/evil-attacker.sock", &nonce);
     assert!(
-        proxy_forward_plan(&line, Scope::Owner, &store, &dir).is_none(),
+        plan_for(&line, Scope::Owner, &store, dir).is_none(),
         "out-of-dir socket path must fail closed (token must not leak)",
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Sibling hop: an `@<sid>` neither hosted locally nor a spawned child but published
-/// in the graph by another live same-uid instance forwards to that instance's
-/// socket, presenting the sibling's own per-launch token and keeping the selector
-/// so the sibling resolves it among its tabs. Fail-closed guards: Edge scope,
-/// locally hosted sid, out-of-dir socket, dead listener, unreadable token, non-op
-/// verbs. (The self-dial guard: `sibling_forward_plan_conforms_to_proxy_forward_one_hop`.)
+/// OWNER VERBS REACH A NESTED CHILD. The child hop presented the edge for a
+/// verb's base op, so `topic` and `rekey` (owner verbs on a session) never
+/// forwarded, and `settings`, `copy`, `meta set`, `inbox seen`, `spawn` and
+/// `window` reached the child under an edge its own gates refuse. A child is
+/// reached with its own token now: each line is planned to the child's socket
+/// verbatim, and what the child's connect-time auth (`first_line_scope`) makes
+/// of the presented line is an Owner connection, which those gates admit.
+/// Negative control: an Edge plans none of them.
+#[test]
+fn owner_topic_and_settings_reach_a_nested_child() {
+    let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+    let dir = dir.path();
+    let store = crate::session_store::new_store();
+    let child = SessionId::generate();
+    let child_token = "0f".repeat(32);
+    hosting_instance(dir, 77031, &child, &child_token);
+    let edge = Scope::Edge(aterm_session::EdgeToken::generate());
+    for verb in [
+        "topic triage",
+        "rekey",
+        "story",
+        "settings get font.size",
+        "copy",
+        "meta set title x",
+        "inbox seen 3 handled",
+        "spawn",
+        "window",
+    ] {
+        let line = format!("@{} {verb}", child.as_str());
+        let sock = plan_for(&line, Scope::Owner, &store, dir)
+            .unwrap_or_else(|| panic!("{line:?}: the Owner reaches the child"));
+        let first = presented(&sock, &line);
+        let (scope, _, inline) =
+            first_line_scope(first.trim_end_matches('\n'), &child_token, || None).unwrap_or_else(
+                |why| panic!("{first:?} does not authenticate at the child: {why}"),
+            );
+        assert_eq!(
+            scope,
+            Scope::Owner,
+            "{line:?}: the child serves it as its Owner"
+        );
+        assert_eq!(inline.as_deref(), Some(line.as_str()));
+        assert!(
+            plan_for(&line, edge, &store, dir).is_none(),
+            "{line:?}: an Edge never forwards"
+        );
+    }
+}
+
+/// A socket bound at `path` and closed without ever listening: a connect to it
+/// answers `ECONNREFUSED`, like a crashed instance's leftover socket file. A
+/// listening descriptor in a shared test process could be inherited by another
+/// test's child between listen and close, and the kernel would keep accepting
+/// through that duplicate until its execve; one that never listened cannot.
+#[cfg(unix)]
+fn never_listening_socket(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    // SAFETY: three straight-line libc calls; the path is checked to fit
+    // sun_path, and every return is checked.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0, "socket(AF_UNIX)");
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert!(bytes.len() < addr.sun_path.len(), "sun_path fits");
+        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        let bound = libc::bind(
+            fd,
+            std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        );
+        assert_eq!(bound, 0, "bind never-listening dead socket");
+        assert_eq!(libc::close(fd), 0, "close bound socket");
+    }
+    // PRECONDITION, stated rather than assumed: the kernel must answer this
+    // dial with ECONNREFUSED. Any other connect error (EMFILE under a
+    // saturated test process, EINTR, EAGAIN) is the environment's, not the
+    // code's: wait out that transient.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "PRECONDITION: the dead socket answers ECONNREFUSED (transient connect errors \
+         persisting are the environment, not the proxy)",
+        || match CtlStream::connect(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Some(()),
+            Err(_) => None,
+            Ok(_) => panic!("nobody should be listening on the dead socket"),
+        },
+    );
+}
+
+/// A STALE ENTRY IS NO HOP, AND THE FORWARD'S CONNECT IS ITS ONLY LOOK. An entry
+/// whose socket nothing listens at (a crashed instance's leftover, or no socket
+/// file at all) or that has no token beside its socket is not forwarded:
+/// `try_proxy_forward` returns `false` with the connection untouched — its read
+/// timeout as the lane set it, the request the client pipelined behind still in
+/// the reader, nothing written — so the local dispatch answers `ERR no such
+/// session` and then serves the next line. FAILS WITH THE CONNECT MADE AFTER the
+/// timeout is cleared and the reader drained: the pipelined request is lost.
+/// Negative control: the same request to a live host is forwarded, on its one
+/// connection and with no silent one before it (the liveness probe this
+/// replaces connected and hung up first, which the host counts).
+#[test]
+#[cfg(unix)]
+fn a_stale_graph_entry_answers_no_such_session_without_a_probe() {
+    use std::io::{BufRead, BufReader, Write};
+    /// The read timeout a lane serves a connection under.
+    const LANE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch control dir");
+    let dir = scratch.path();
+    let store = crate::session_store::new_store();
+    let nonce = LaunchNonce::generate();
+    // Nothing listening: a socket bound and closed without listening.
+    let dead = SessionId::generate();
+    let dead_sock = dir.join("aterm-77040.sock");
+    never_listening_socket(&dead_sock);
+    std::fs::write(dir.join("aterm-77040.token"), "beef\n").expect("token");
+    crate::proxy::write_graph_entry(dir, &dead, &dead_sock.to_string_lossy(), &nonce);
+    // A live listener with no token beside it.
+    let tokenless = SessionId::generate();
+    let tokenless_sock = dir.join("aterm-77041.sock");
+    let _tokenless = aterm_uds::CtlListener::bind(&tokenless_sock).expect("bind");
+    crate::proxy::write_graph_entry(dir, &tokenless, &tokenless_sock.to_string_lossy(), &nonce);
+    // No socket file at all.
+    let unbound = SessionId::generate();
+    let unbound_sock = dir.join("aterm-77042.sock");
+    std::fs::write(dir.join("aterm-77042.token"), "beef\n").expect("token");
+    crate::proxy::write_graph_entry(dir, &unbound, &unbound_sock.to_string_lossy(), &nonce);
+
+    for (what, sid) in [
+        ("nothing listening", &dead),
+        ("no token", &tokenless),
+        ("no socket", &unbound),
+    ] {
+        let line = format!("@{} text", sid.as_str());
+        let (client, server) = CtlStream::pair().expect("pair");
+        server
+            .set_read_timeout(Some(LANE_POLL))
+            .expect("the lane's poll");
+        (&client)
+            .write_all(format!("{line}\nversion\n").as_bytes())
+            .expect("the request, and the next one behind it");
+        let mut unread = control_lanes::Unread::default();
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
+        let mut got = String::new();
+        reader.read_line(&mut got).expect("the request line");
+        assert_eq!(
+            reader.buffer(),
+            b"version\n",
+            "PRECONDITION: the reader holds the pipelined request"
+        );
+        let request = Request::parse(got.trim_end_matches('\n').to_string());
+        assert!(
+            proxy_forward_plan(&request, Scope::Owner, &store, dir).is_some(),
+            "{what}: the plan names the entry's socket (the connect decides)"
+        );
+        let forwarded =
+            try_proxy_forward(&request, Scope::Owner, &store, dir, &server, &mut reader);
+        assert!(!forwarded, "{what}: a stale entry is answered here");
+        assert_eq!(
+            reader.buffer(),
+            b"version\n",
+            "{what}: the pipelined request is still the lane's"
+        );
+        assert_eq!(
+            server.read_timeout().expect("read timeout"),
+            Some(LANE_POLL),
+            "{what}: the read timeout is as the lane set it"
+        );
+        client.set_nonblocking(true).expect("non-blocking");
+        assert_eq!(
+            (&client).read(&mut [0u8; 64]).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "{what}: nothing was written to the client"
+        );
+    }
+
+    // Negative control: a live host is forwarded to, on one connection.
+    let live = SessionId::generate();
+    let live_sock = hosting_instance(dir, 77043, &live, "cafe0123");
+    let listener = aterm_uds::CtlListener::bind(&live_sock).expect("bind the host");
+    let line = format!("@{} text", live.as_str());
+    let host = std::thread::spawn(move || {
+        // Every connection until `stop`: the verbs forwarded to it, those that
+        // said nothing, and those that asked `version` alone (the relay's look
+        // at a host that ended the exchange first).
+        let (mut verbs, mut silent, mut looks) = (Vec::new(), 0, 0);
+        loop {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(&conn);
+            let mut first = String::new();
+            if reader.read_line(&mut first).unwrap_or(0) == 0 {
+                silent += 1;
+                continue;
+            }
+            if first == "stop\n" {
+                return (verbs, silent, looks);
+            }
+            let _ = (&conn).write_all(b"OK version=host\n");
+            let mut verb = String::new();
+            if reader.read_line(&mut verb).unwrap_or(0) == 0 {
+                looks += 1;
+                continue;
+            }
+            let _ = (&conn).write_all(b"OK served\n");
+            verbs.push(verb);
+        }
+    });
+    let (client, server) = CtlStream::pair().expect("pair");
+    client
+        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+        .expect("a hang detector on the reply");
+    (&client)
+        .write_all(format!("{line}\n").as_bytes())
+        .expect("the request");
+    let server_dir = dir.to_path_buf();
+    let server_store = store.clone();
+    let forward = std::thread::spawn(move || {
+        let mut unread = control_lanes::Unread::default();
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
+        let mut got = String::new();
+        reader.read_line(&mut got).expect("the request line");
+        let request = Request::parse(got.trim_end_matches('\n').to_string());
+        try_proxy_forward(
+            &request,
+            Scope::Owner,
+            &server_store,
+            &server_dir,
+            &server,
+            &mut reader,
+        )
+    });
+    let mut reply = String::new();
+    let _ = BufReader::new(&client).read_line(&mut reply);
+    assert_eq!(
+        reply, "OK served\n",
+        "the live host answered through the relay"
+    );
+    hang_up(client);
+    assert!(
+        join_after_hang_up(forward, "the forward to end on its client's hang-up"),
+        "the forward owned the line"
+    );
+    (&CtlStream::connect(&live_sock).expect("connect to stop"))
+        .write_all(b"stop\n")
+        .expect("stop");
+    let (verbs, silent, _looks) = host.join().expect("the stand-in host");
+    assert_eq!(
+        verbs,
+        [format!("{line}\n")],
+        "one forward, the line as it came"
+    );
+    assert_eq!(silent, 0, "a connection said nothing: a liveness probe");
+}
+
+/// Sibling hop: an `@<sid>` not hosted locally but published in the graph by
+/// another live same-uid instance forwards to that instance's socket, presenting
+/// the sibling's own per-launch token and keeping the selector so the sibling
+/// resolves it among its tabs. Fail-closed guards: Edge scope, locally hosted
+/// sid, an out-of-dir socket, instance (`Target::Meta`) verbs. Whether anything
+/// listens there and has a token is the forward's connect's to find
+/// (`a_stale_graph_entry_answers_no_such_session_without_a_probe`). (The
+/// self-dial guard: `sibling_forward_plan_conforms_to_proxy_forward_one_hop`.)
 #[test]
 #[cfg(unix)]
 fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
-    use aterm_session::{LaunchNonce, SessionId};
     // Serialize with every other test touching the process-global self sock.
     let _guard = crate::proxy::self_sock_test_guard();
     let dir = std::env::temp_dir().join(format!("aterm-sib-{}", std::process::id()));
@@ -3683,34 +4067,44 @@ fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
 
     // Owner + live sibling + op verb → forward, selector KEPT, sibling token.
     let line = format!("@{} text", sid.as_str());
-    let plan = proxy_forward_plan(&line, Scope::Owner, &store, &dir).expect("sibling forwards");
-    assert_eq!(plan.0, confined);
+    let plan = plan_for(&line, Scope::Owner, &store, &dir).expect("sibling forwards");
+    assert_eq!(plan, confined);
     assert_eq!(
-        presented(&plan),
+        presented(&plan, &line),
         format!("TOKEN cafe0123 @{} text\n", sid.as_str())
     );
 
     // Selector-SECOND subscribe grammar: forwarded verbatim (selector kept).
     let sline = format!("subscribe @{} cells,bytes", sid.as_str());
-    let splan = proxy_forward_plan(&sline, Scope::Owner, &store, &dir).expect("subscribe forwards");
-    assert_eq!(splan.0, confined);
+    let splan = plan_for(&sline, Scope::Owner, &store, &dir).expect("subscribe forwards");
+    assert_eq!(splan, confined);
     assert_eq!(
-        presented(&splan),
+        presented(&splan, &sline),
         format!("TOKEN cafe0123 subscribe @{} cells,bytes\n", sid.as_str())
     );
-    // `graph/<sid>` is joined verbatim, so a path spelling reaches the same
-    // entry and is relayed too.
-    let pline = format!("subscribe @./{} cells", sid.as_str());
-    assert!(
-        proxy_forward_plan(&pline, Scope::Owner, &store, &dir).is_some(),
-        "a path spelling of the sid reaches its entry"
-    );
+    // A path spelling is no session id, though `graph/./<sid>` names the same
+    // entry: answered here (no such session), relayed nowhere.
+    for pline in [
+        format!("subscribe @./{} cells", sid.as_str()),
+        format!("@./{} text", sid.as_str()),
+    ] {
+        assert!(
+            plan_for(&pline, Scope::Owner, &store, &dir).is_none(),
+            "{pline:?}: only a session id is joined into a graph path"
+        );
+        assert!(!request_waits(&pline, Scope::Owner, &store));
+    }
     // `@*` is this instance's live target set (the bridge's and fleet's
-    // subscription), never one session: an entry named `*` relays it nowhere.
-    crate::proxy::write_graph_entry(&dir, &SessionId::new("*"), &sib_sock_str, &nonce);
+    // subscription), never one session: an entry named `*` (planted by hand,
+    // since no id that is not a session id is ever written) relays it nowhere.
+    std::fs::write(
+        dir.join("graph").join("*"),
+        format!("sock {sib_sock_str}\nnonce {}\n", nonce.to_hex()),
+    )
+    .expect("plant `graph/*`");
     let all = "subscribe @* events,sessions";
     assert!(
-        proxy_forward_plan(all, Scope::Owner, &store, &dir).is_none(),
+        plan_for(all, Scope::Owner, &store, &dir).is_none(),
         "`subscribe @*` stays local"
     );
 
@@ -3718,14 +4112,18 @@ fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
     let edge = Scope::Edge(aterm_session::EdgeToken::generate());
     for relayed in [&line, &sline] {
         assert!(
-            proxy_forward_plan(relayed, edge, &store, &dir).is_none(),
+            plan_for(relayed, edge, &store, &dir).is_none(),
             "edge scope must not forward to a sibling",
         );
     }
 
-    // A non-op verb (identity/privilege) never crosses processes.
-    let gline = format!("@{} whoami", sid.as_str());
-    assert!(proxy_forward_plan(&gline, Scope::Owner, &store, &dir).is_none());
+    // An instance verb never crosses processes: it is answered here, as the
+    // sibling would answer it (`whoami` an owner verb, `who` a read).
+    for meta in ["whoami", "who"] {
+        let gline = format!("@{} {meta}", sid.as_str());
+        assert!(plan_for(&gline, Scope::Owner, &store, &dir).is_none());
+        assert!(!request_waits(&gline, Scope::Owner, &store), "{gline:?}");
+    }
 
     // A locally hosted sid is not a hop (in-process resolution owns it).
     let local = registered_session(91, -1, b"");
@@ -3733,120 +4131,236 @@ fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
     crate::proxy::write_graph_entry(&dir, &local.sid, &sib_sock_str, &local.nonce);
     store.write().unwrap().register(local.clone());
     assert!(
-        proxy_forward_plan(&local_line, Scope::Owner, &store, &dir).is_none(),
+        plan_for(&local_line, Scope::Owner, &store, &dir).is_none(),
         "locally-hosted sid must resolve in-process, never hop",
     );
 
-    // CONFINEMENT on the SIBLING hop: an entry redirected OUTSIDE our runtime
-    // dir must never be dialed (same posture as the child hop).
+    // CONFINEMENT: an entry redirected OUTSIDE our runtime dir must never be
+    // dialed.
     let outside = SessionId::generate();
     crate::proxy::write_graph_entry(&dir, &outside, "/tmp/evil-sibling.sock", &nonce);
     let out_line = format!("@{} text", outside.as_str());
     assert!(
-        proxy_forward_plan(&out_line, Scope::Owner, &store, &dir).is_none(),
+        plan_for(&out_line, Scope::Owner, &store, &dir).is_none(),
         "an out-of-dir sibling socket must fail closed",
     );
-
-    // DEAD listener: entry present, socket file present, nobody listening.
-    let dead = SessionId::generate();
-    let dead_sock = dir.join("aterm-77002.sock");
-    let _ = std::fs::remove_file(&dead_sock);
-    // Bound but never listening: a listening descriptor in a shared test process
-    // can be inherited by another test's child between listen and close, and the
-    // kernel keeps accepting through that duplicate until its execve. Raw
-    // socket+bind+close never listens and answers ECONNREFUSED, like a crashed
-    // sibling's leftover socket file.
-    // SAFETY: three straight-line libc calls on a path the std bind here already
-    // proved fits sun_path; every return is checked.
-    unsafe {
-        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-        assert!(fd >= 0, "socket(AF_UNIX)");
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let bytes = dead_sock.as_os_str().as_encoded_bytes();
-        assert!(bytes.len() < addr.sun_path.len(), "sun_path fits");
-        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
-            *slot = *byte as libc::c_char;
-        }
-        let bound = libc::bind(
-            fd,
-            std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        );
-        assert_eq!(bound, 0, "bind never-listening dead socket");
-        assert_eq!(libc::close(fd), 0, "close bound socket");
-    }
-    std::fs::write(dir.join("aterm-77002.token"), "beef\n").expect("token");
-    crate::proxy::write_graph_entry(&dir, &dead, &dead_sock.to_string_lossy(), &nonce);
-    let dead_line = format!("@{} text", dead.as_str());
-    // PRECONDITION, stated rather than assumed: the kernel must answer this
-    // dial with ECONNREFUSED. `socket_is_live` deliberately treats ANY OTHER
-    // connect error (EMFILE under a saturated test process, EINTR, EAGAIN) as
-    // "maybe live — never hijack", so under load the plan below can legitimately
-    // return `Some` for reasons that are the environment's, not the code's.
-    // Wait out that transient instead of reporting it as a proxy defect.
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "PRECONDITION: the dead sibling socket answers ECONNREFUSED (transient connect \
-         errors persisting are the environment, not the proxy)",
-        || match aterm_uds::CtlStream::connect(&dead_sock) {
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Some(()),
-            Err(_) => None,
-            Ok(_) => panic!("nobody should be listening on the dead sibling socket"),
-        },
-    );
-    assert!(
-        proxy_forward_plan(&dead_line, Scope::Owner, &store, &dir).is_none(),
-        "a dead sibling must fail closed, not hang a dial",
-    );
-
-    // UNREADABLE token: live listener but no token file → no forward (the
-    // relay must never dial unauthenticated).
-    let toothless = SessionId::generate();
-    let tl_sock = dir.join("aterm-77003.sock");
-    let _tl = std::os::unix::net::UnixListener::bind(&tl_sock).expect("bind");
-    crate::proxy::write_graph_entry(&dir, &toothless, &tl_sock.to_string_lossy(), &nonce);
-    let tl_line = format!("@{} text", toothless.as_str());
-    assert!(
-        proxy_forward_plan(&tl_line, Scope::Owner, &store, &dir).is_none(),
-        "a sibling with no readable token must fail closed",
-    );
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A selector body that is no session id is never joined into a graph path: the
+/// entry `graph/../x` would name is planted, live and token-bearing, and `@../x`
+/// still resolves to no session, plans no forward and is no wait. So is an id
+/// spelled in upper-case hex, whose `graph/` entry a case-insensitive volume
+/// folds onto the planted lower-case one. Negative control: the same entries
+/// under a session id's name are forwarded.
+#[test]
+#[cfg(unix)]
+fn an_invalid_sid_is_never_joined_into_a_path() {
+    use aterm_session::{LaunchNonce, SessionId};
+    let _guard = crate::proxy::self_sock_test_guard();
+    let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+    let dir = dir.path();
+    let store = crate::session_store::new_store();
+    let nonce = LaunchNonce::generate();
+    let sock = dir.join("aterm-77010.sock");
+    let sock_str = sock.to_string_lossy().into_owned();
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the planted host");
+    std::fs::write(dir.join("aterm-77010.token"), "cafe0123\n").expect("token");
+    // `graph/../x` is `<dir>/x` once `graph/` exists: plant a live entry there,
+    // by hand, since no id that is not a session id is ever written.
+    crate::proxy::write_graph_entry(dir, &SessionId::generate(), &sock_str, &nonce);
+    std::fs::write(
+        dir.join("graph").join("../x"),
+        format!("sock {sock_str}\nnonce {}\n", nonce.to_hex()),
+    )
+    .expect("plant `graph/../x`");
+    assert!(
+        dir.join("x").is_file(),
+        "the planted entry sits outside graph/"
+    );
+    // Letters in it, so its upper-case spelling differs from it.
+    let folded = SessionId::new("s-0a1b2c3d4e5f60718293");
+    crate::proxy::write_graph_entry(dir, &folded, &sock_str, &nonce);
+
+    for line in [
+        "@../x text",
+        "subscribe @../x screen",
+        "@./../x text",
+        "@s-0A1B2C3D4E5F60718293 text",
+        "subscribe @s-0A1B2C3D4E5F60718293 screen",
+    ] {
+        assert!(
+            plan_for(line, Scope::Owner, &store, dir).is_none(),
+            "{line:?} must not reach the planted entry"
+        );
+        assert!(!request_waits(line, Scope::Owner, &store), "{line:?}");
+    }
+    let selector = control_request::head("@../x text")
+        .selector
+        .expect("a selector");
+    assert_eq!(selector, Selector::Invalid("../x"));
+    assert!(matches!(resolve(&store, &selector), Resolution::Missing));
+
+    // Negative control: the same entry under a session id's name forwards.
+    let sid = SessionId::generate();
+    crate::proxy::write_graph_entry(dir, &sid, &sock_str, &nonce);
+    for line in [
+        format!("@{} text", sid.as_str()),
+        format!("@{} text", folded.as_str()),
+    ] {
+        assert!(
+            plan_for(&line, Scope::Owner, &store, dir).is_some(),
+            "{line:?}: the planted host is reachable by a session id"
+        );
+    }
+}
+
+/// One request line is tokenized once, and every stage reads that one parse: the
+/// head, the body a frame announces, the session a relay would carry it to and
+/// the lane it takes agree on lines with leading separators, tabs and runs of
+/// spaces, and a payload keeps its spacing. Negative control: the dispatcher's
+/// old head (split at single spaces) and the old frame detector (any whitespace)
+/// disagree on the first two lines, so a corpus like this one tells two
+/// tokenizers apart.
+#[test]
+fn head_tokenizes_once_for_every_stage() {
+    /// The dispatcher's request head before the one grammar (frozen copy).
+    fn legacy_head_verb(line: &str) -> &str {
+        let tail = match line.split_once(' ') {
+            Some((first, tail)) if first.starts_with('@') => tail,
+            _ => line,
+        };
+        tail.split_once(' ').map_or(tail, |(verb, _)| verb)
+    }
+    /// The frame detector's verb before the one grammar (frozen copy).
+    fn legacy_frame_verb(line: &str) -> Option<&str> {
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some(first) if first.starts_with('@') => words.next(),
+            other => other,
+        }
+    }
+
+    let store = session_store::new_store();
+    let remote = SessionId::generate();
+    let remote = remote.as_str();
+    struct Case<'a> {
+        line: String,
+        selector: Option<Selector<'a>>,
+        verb: &'a str,
+        rest: &'a str,
+        body: usize,
+        relay: Option<&'a str>,
+        wait: bool,
+    }
+    let remote_sel = Selector::parse(remote);
+    let subscribed = format!("@{remote} screen");
+    let cases = [
+        Case {
+            line: format!("@{remote}\tfeed-bin 5"),
+            selector: Some(remote_sel),
+            verb: "feed-bin",
+            rest: "5",
+            body: 5,
+            relay: Some(remote),
+            wait: true,
+        },
+        Case {
+            line: "  feed-bin 5".to_string(),
+            selector: None,
+            verb: "feed-bin",
+            rest: "5",
+            body: 5,
+            relay: None,
+            wait: false,
+        },
+        Case {
+            line: "send  hello".to_string(),
+            selector: None,
+            verb: "send",
+            rest: " hello",
+            body: 0,
+            relay: None,
+            wait: false,
+        },
+        Case {
+            line: format!("subscribe\t@{remote} screen"),
+            selector: None,
+            verb: "subscribe",
+            rest: &subscribed,
+            body: 0,
+            relay: Some(remote),
+            wait: true,
+        },
+    ];
+    for case in &cases {
+        let request = Request::parse(case.line.clone());
+        let head = request.head();
+        assert_eq!(head, control_request::head(&case.line), "{:?}", case.line);
+        assert_eq!(
+            (head.selector, head.verb, head.rest),
+            (case.selector, case.verb, case.rest),
+            "{:?}",
+            case.line
+        );
+        assert_eq!(request.body_len(), case.body, "{:?}: body", case.line);
+        assert_eq!(
+            announced_body_of(&case.line),
+            case.body,
+            "{:?}: lane",
+            case.line
+        );
+        assert_eq!(
+            relay_candidate(&request, Scope::Owner).map(|sid| sid.as_str()),
+            case.relay,
+            "{:?}: relay",
+            case.line
+        );
+        assert_eq!(
+            is_wait_request(&request, Scope::Owner, &store),
+            case.wait,
+            "{:?}: lane",
+            case.line
+        );
+    }
+    for case in &cases[..2] {
+        assert_ne!(
+            Some(legacy_head_verb(&case.line)),
+            legacy_frame_verb(&case.line),
+            "{:?}: the old stages read two verbs",
+            case.line
+        );
+    }
+}
+
 /// Tier-1 conformance of the router to `dispatch_complete_model`'s
-/// `ForwardableRemoteAlwaysForwarded`: for an Owner reaching a registered remote
-/// child, `proxy_forward_plan` forwards a verb iff it is forwardable (the op-bearing
-/// verbs: `required_op` ⇒ read/write/signal). Drives the real decision over every
-/// verb class; letting a forwardable verb fall to the local path fails it. (The
-/// selector-second `subscribe` forward:
-/// `proxy_forward_plan_owner_only_op_scoped_and_nonce_guarded`.)
+/// `ForwardableRemoteAlwaysForwarded`: for an Owner reaching a session another
+/// instance hosts, `proxy_forward_plan` forwards a verb iff it is forwardable,
+/// which is its row's target: a verb that acts on a session or an instance
+/// (`Target::Session`, `Target::App`) is forwarded whatever its op class, the
+/// owner verbs `topic` and `rekey` and the fine ops of `settings` and `copy`
+/// included; an instance verb (`Target::Meta`) or an unknown one is answered
+/// here, as the far instance would answer it. Drives the real decision over
+/// every class; letting a forwardable verb fall to the local path fails it.
+/// (The selector-second `subscribe` forward:
+/// `a_nested_child_is_forwarded_with_its_own_token`.)
+///
+/// Negative control: the op-class rule this replaced (`required_op(verb)`
+/// names an op) parts from the router on exactly `topic`, `rekey` (never
+/// forwarded) and `who`, `hold`, `deliver` (forwarded to be refused there).
 #[test]
 fn proxy_forward_plan_conforms_to_dispatch_model() {
-    use aterm_session::{EdgeToken, LaunchNonce, SessionId};
-    let dir = std::env::temp_dir().join(format!("aterm-conform-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    use aterm_types::control_verbs::Target;
+    let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+    let dir = dir.path();
     let store = crate::session_store::new_store();
-    let child = SessionId::generate();
-    let nonce = LaunchNonce::generate();
-    crate::proxy::register_child(
-        child.clone(),
-        crate::proxy::ProxyEntry {
-            nonce,
-            read: EdgeToken::generate(),
-            write: EdgeToken::generate(),
-            signal: EdgeToken::generate(),
-        },
-    );
-    // The published socket must live directly in `dir` — `confine_proxy_sock`
-    // (the proxy forward's anti-token-capture guard) rejects any out-of-dir path.
-    let child_sock = dir.join("aterm-child.sock").to_string_lossy().into_owned();
-    crate::proxy::write_graph_entry(&dir, &child, &child_sock, &nonce);
-    let sid = child.as_str();
+    let remote = SessionId::generate();
+    hosting_instance(dir, 77050, &remote, "cafe0123");
+    let sid = remote.as_str();
 
-    // Representative verb lines across EVERY class: forwardable read-side,
-    // forwardable write-side, signal, and NON-forwardable (owner-only / global).
+    // Representative verb lines across EVERY class: read, write, signal and
+    // fine-op verbs on a session or an instance, owner verbs on a session, and
+    // instance verbs.
     let cases: &[&str] = &[
         "screen",
         "text",
@@ -3854,6 +4368,7 @@ fn proxy_forward_plan_conforms_to_dispatch_model() {
         "search x",
         "modes",
         "image read",
+        "image shot.png",
         "cast",
         "temporal",
         "scroll up",
@@ -3865,115 +4380,131 @@ fn proxy_forward_plan_conforms_to_dispatch_model() {
         "resize 10 20",
         "focus in",
         "send hi",
-        "signal int", // forwardable (read/write/signal)
+        "signal int",
+        "copy",
+        "story",
+        "meta set title x",
+        "topic triage",
+        "rekey",
+        "settings get font.size",
+        "window",
+        "spawn",
         "grant x",
         "revoke x",
         "whoami",
         "sessions",
         "version",
-        "bogus", // NOT forwardable
+        "who",
+        "hold on",
+        "deliver x",
+        "bogus",
     ];
+    let mut parted = Vec::new();
     for verb_line in cases {
-        let verb = verb_line.split_whitespace().next().unwrap();
         let line = format!("@{sid} {verb_line}");
-        let forwarded = proxy_forward_plan(&line, Scope::Owner, &store, &dir).is_some();
-        let forwardable = required_op(verb).is_some();
+        let head = control_request::head(&line);
+        let forwarded = plan_for(&line, Scope::Owner, &store, dir).is_some();
+        let forwardable = matches!(
+            aterm_types::control_verbs::spec_for(head.verb, head.rest).map(|form| form.row.target),
+            Some(Target::Session | Target::App)
+        );
         assert_eq!(
             forwarded, forwardable,
-            "router ≠ model for `{verb}`: forwarded={forwarded} forwardable={forwardable}"
+            "router ≠ model for `{verb_line}`: forwarded={forwarded} forwardable={forwardable}"
         );
+        if required_op(head.verb).is_some() != forwarded {
+            parted.push(head.verb.to_string());
+        }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        parted,
+        ["topic", "rekey", "who", "hold", "deliver"],
+        "the op-class rule must part from the router where the target decides"
+    );
 }
 
-/// The line a planned forward presents, `TOKEN <token> <verb>`, with the token the
-/// forward takes once connected ([`crate::proxy::ForwardLine::token_at`]): a child's
-/// edge token as planned, or a sibling's read beside its socket.
-fn presented((sock, line): &(String, crate::proxy::ForwardLine)) -> String {
-    let token = line
-        .token_at(sock)
-        .unwrap_or_else(|e| panic!("{sock}: no token to present: {e}"));
-    crate::proxy::forward_first_line(&token, &line.verb)
+/// The line a planned forward to `sock` presents for `line`, `TOKEN <token>
+/// <line>`, with the token beside `sock` read as the forward reads it once
+/// connected ([`crate::proxy::connect_hop`]).
+fn presented(sock: &str, line: &str) -> String {
+    let token = crate::proxy::read_sibling_token(sock)
+        .unwrap_or_else(|| panic!("{sock}: no token to present"));
+    crate::proxy::forward_first_line(&token, line)
 }
 
-/// A spawned child this process can forward to: registered in the proxy table with
-/// fresh per-op edge tokens and published by a graph entry naming
-/// `<dir>/aterm-child.sock` (directly in `dir`, as `confine_proxy_sock` requires).
-/// Returns the child's id and the capability held over it.
-fn forwardable_child(
+/// An instance hosting the session `sid`, as this process finds it: the graph
+/// entry it published, naming `<dir>/aterm-<pid>.sock` (directly in `dir`, as
+/// `confine_proxy_sock` requires), and `token` beside that socket. Nothing
+/// listens there unless the test binds it, since a plan never connects.
+/// Returns the socket's path.
+fn hosting_instance(
     dir: &std::path::Path,
-) -> (aterm_session::SessionId, crate::proxy::ProxyEntry) {
-    use aterm_session::{LaunchNonce, SessionId};
-    let child = SessionId::generate();
-    let entry = forwardable_child_as(dir, &child, LaunchNonce::generate());
-    (child, entry)
-}
-
-/// [`forwardable_child`] for a child whose identity is given — the
-/// `(sid, nonce)` of a session a test also stands up as the child.
-fn forwardable_child_as(
-    dir: &std::path::Path,
-    child: &aterm_session::SessionId,
-    nonce: aterm_session::LaunchNonce,
-) -> crate::proxy::ProxyEntry {
-    use aterm_session::EdgeToken;
+    pid: u32,
+    sid: &SessionId,
+    token: &str,
+) -> std::path::PathBuf {
     let _ = std::fs::create_dir_all(dir);
-    let entry = crate::proxy::ProxyEntry {
-        nonce,
-        read: EdgeToken::generate(),
-        write: EdgeToken::generate(),
-        signal: EdgeToken::generate(),
-    };
-    crate::proxy::register_child(child.clone(), entry.clone());
-    let sock = dir.join("aterm-child.sock").to_string_lossy().into_owned();
-    crate::proxy::write_graph_entry(dir, child, &sock, &entry.nonce);
-    entry
+    let sock = dir.join(format!("aterm-{pid}.sock"));
+    std::fs::write(dir.join(format!("aterm-{pid}.token")), format!("{token}\n"))
+        .expect("the host's token");
+    crate::proxy::write_graph_entry(dir, sid, &sock.to_string_lossy(), &LaunchNonce::generate());
+    sock
 }
 
 /// Tier-1 conformance of the forward decision to
 /// `aterm_models_session::no_transitive_authority_model` (`NoTransitiveAuthority`): a
 /// forward is permitted only for an Owner-class connection, so a connection that
-/// arrived over a forward can never start another hop.
+/// holds only an edge can never start a hop, and authority does not compose
+/// across instances.
 ///
-/// For read, write, signal and subscribe lines aimed at a forwardable child,
-/// `proxy_forward_plan` is driven for three connections: the instance token (Owner),
-/// the inherited bridge fd, and one that arrived over the forward, whose scope is
-/// what the child's real connect-time auth (`first_line_scope`) makes of the
-/// Owner plan's first line, against a child table holding the parent edges
+/// For read, write, signal, owner and subscribe lines aimed at a session another
+/// instance hosts, `proxy_forward_plan` is driven for three connections: the
+/// instance token (Owner), the inherited bridge fd, and one that arrived with an
+/// edge, whose scope is what the real connect-time auth (`first_line_scope`)
+/// makes of `TOKEN <edge> <line>` at a child holding the parent edges
 /// `spawn::install_parent_edges` put there. The model's `owner` guard comes from
 /// what each scope is, never from `is_owner_class` (the code under test);
 /// `forwarded` is the real plan. Every `Arrive`/`Forward` step must be admitted.
 ///
 /// Negative control: `Buggy = 1` (owner guard waived) must reject the steps, since
-/// the real router denies forwards the mutant permits. Removing the
-/// `!scope.is_owner_class()` early return from `proxy_forward_plan` fails this.
+/// the real router denies forwards the mutant permits. Removing the owner-class
+/// test from `relay_candidate` fails this.
 #[test]
 fn proxy_forward_plan_conforms_to_no_transitive_authority() {
+    use aterm_session::EdgeToken;
     use aterm_spec::verify::validate_transition_tiered;
     use std::collections::BTreeMap;
-    let dir = std::env::temp_dir().join(format!("aterm-nta-{}", std::process::id()));
+    let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+    let dir = dir.path();
     let store = crate::session_store::new_store();
-    // The child, as a session of its own: its identity is the one the
-    // parent registered, and its table holds the edges the parent granted.
+    // A child, as a session of its own holding the edges its parent minted.
     let at_child = registered_session(94, -1, b"");
-    let entry = forwardable_child_as(&dir, &at_child.sid, at_child.nonce);
+    let (read, write, signal) = (
+        EdgeToken::generate(),
+        EdgeToken::generate(),
+        EdgeToken::generate(),
+    );
     let installed = crate::spawn::install_parent_edges(
         &mut at_child.ctx.edges.lock().unwrap(),
         &at_child.sid,
         &at_child.nonce,
-        Some(aterm_session::SessionId::generate().as_str()),
-        Some(&entry.read.to_hex()),
-        Some(&entry.write.to_hex()),
-        Some(&entry.signal.to_hex()),
+        Some(SessionId::generate().as_str()),
+        Some(&read.to_hex()),
+        Some(&write.to_hex()),
+        Some(&signal.to_hex()),
     );
     assert_eq!(installed, 3, "the child holds all three parent edges");
     let child_instance_token = "0f".repeat(32);
-    let sid = at_child.sid.as_str();
+    // What each line is aimed at: a session another instance hosts.
+    let remote = SessionId::generate();
+    hosting_instance(dir, 77060, &remote, "cafe0123");
+    let sid = remote.as_str();
     let lines = [
-        format!("@{sid} screen"),
-        format!("@{sid} key up"),
-        format!("@{sid} signal int"),
-        format!("subscribe @{sid} cells,bytes"),
+        (format!("@{sid} screen"), read),
+        (format!("@{sid} key up"), write),
+        (format!("@{sid} signal int"), signal),
+        (format!("@{sid} topic triage"), write),
+        (format!("subscribe @{sid} cells,bytes"), read),
     ];
     // What each scope IS (see the doc): stated here, not read from the router.
     let owner_authority = |scope: Scope| match scope {
@@ -3984,20 +4515,17 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let init = model.init_state();
     let mut buggy_rejections = 0;
-    for line in &lines {
-        let first_line = presented(
-            &proxy_forward_plan(line, Scope::Owner, &store, &dir)
-                .unwrap_or_else(|| panic!("`{line}`: the Owner must reach a registered child")),
-        );
+    for (line, edge) in &lines {
+        let edge_line = crate::proxy::forward_first_line(&edge.to_hex(), line);
         let (arrived_scope, _, _) = first_line_scope(
-            first_line.trim_end_matches('\n'),
+            edge_line.trim_end_matches('\n'),
             &child_instance_token,
             || Some(at_child.ctx.clone()),
         )
-        .unwrap_or_else(|why| panic!("`{first_line}` does not authenticate at the child: {why}"));
+        .unwrap_or_else(|why| panic!("`{edge_line}` does not authenticate at the child: {why}"));
         assert!(
             matches!(arrived_scope, Scope::Edge(_)),
-            "`{first_line}`: a forwarded connection must arrive with an edge scope"
+            "`{edge_line}`: an edge-authenticated connection must arrive with an edge scope"
         );
         for (who, scope) in [
             ("owner", Scope::Owner),
@@ -4013,7 +4541,7 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
             ),
         ] {
             let owner = owner_authority(scope);
-            let forwarded = proxy_forward_plan(line, scope, &store, &dir).is_some();
+            let forwarded = plan_for(line, scope, &store, dir).is_some();
             let arrived = BTreeMap::from([("owner", i64::from(owner)), ("forwarded", 0)]);
             let decided = BTreeMap::from([
                 ("owner", i64::from(owner)),
@@ -4033,7 +4561,7 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
             assert!(model.check_invariant("ForwardImpliesOwner", &decided));
             assert_eq!(
                 forwarded, owner,
-                "{who} `{line}`: an Owner-class connection must reach a registered child"
+                "{who} `{line}`: an Owner-class connection must reach the hosting instance"
             );
             let (admitted, _) = validate_transition_tiered(
                 &buggy,
@@ -4052,108 +4580,25 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
         "the owner-waiving mutant must part from the real router on exactly the \
          non-owner connections' lines: the arrived edge's and the fleet peer's"
     );
-    crate::proxy::deregister_child(&at_child.sid);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Tier-1 conformance of the child hop to `aterm_models_gui::proxy_forward_model`
-/// (`ProxyForward`): a chain is at most one cross-process hop, because the parent
-/// rewrites the child's selector to `@.` so the child runs the verb itself. (The
-/// sibling hop keeps its selector and ends differently:
-/// `sibling_forward_plan_conforms_to_proxy_forward_one_hop`.)
+/// Tier-1 conformance of the forward to `aterm_models_gui::proxy_forward_model`
+/// (`ProxyForward`). A forward keeps the `@<sid>` selector, so what ends the chain
+/// is the host: the entry it followed was published by the instance at that
+/// socket, so there the sid is hosted locally, or (a stale entry) names the
+/// host's own socket, which `resolve_sibling`'s self-dial guard refuses. A nested
+/// child is such a host too: it is reached with its own token.
 ///
-/// For each forwardable line shape, the verb the child runs is the planned first
-/// line past its `TOKEN <edge-hex>` handshake. Whether the chain stays `active` is
-/// asked of the real router in the worst context (this process, where the child's
-/// sid is forwardable) with Owner scope, so only the rewrite can end the chain. The
-/// hop is validated as `Forward` and must leave `OneHopNoCycle` unthreatened.
-///
-/// Negative control: `Buggy = 1` (original selector relayed) must reject every real
-/// hop; relaying the original line instead of `@.` makes the re-plan forward again.
-#[test]
-fn proxy_forward_plan_conforms_to_proxy_forward_one_hop() {
-    use aterm_spec::verify::validate_transition_tiered;
-    use std::collections::BTreeMap;
-    let dir = std::env::temp_dir().join(format!("aterm-pfw-{}", std::process::id()));
-    let store = crate::session_store::new_store();
-    let (child, _) = forwardable_child(&dir);
-    let sid = child.as_str();
-    let model = aterm_models_gui::proxy_forward_model();
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let before = model.init_state();
-    assert_eq!(before, BTreeMap::from([("depth", 0), ("active", 1)]));
-    for line in [
-        format!("@{sid} screen"),
-        format!("@{sid} key up"),
-        format!("@{sid} signal int"),
-        format!("subscribe @{sid} cells,bytes every-frame"),
-    ] {
-        let first_line = presented(
-            &proxy_forward_plan(&line, Scope::Owner, &store, &dir)
-                .unwrap_or_else(|| panic!("`{line}`: a registered child must be forwarded to")),
-        );
-        let at_child = first_line
-            .trim_end_matches('\n')
-            .splitn(3, ' ')
-            .nth(2)
-            .unwrap_or_else(|| panic!("`{first_line}` is not `TOKEN <hex> <verb>`"));
-        let onward = proxy_forward_plan(at_child, Scope::Owner, &store, &dir).is_some();
-        let after = BTreeMap::from([("depth", 1), ("active", i64::from(onward))]);
-        let (ok, why) = validate_transition_tiered(
-            &model,
-            &[],
-            &before,
-            &after,
-            Some("Forward"),
-            "ProxyForward(proxy_forward_plan)",
-        );
-        assert!(
-            ok,
-            "`{line}` reaches the child as `{at_child}`, which would forward on \
-             (onward={onward}); the model admits no such hop — {why}"
-        );
-        assert!(
-            !model.action_enabled("Forward", &after),
-            "`{line}`: a second hop is possible after `{at_child}`"
-        );
-        assert!(model.check_invariant("OneHopNoCycle", &after));
-        let (admitted, _) = validate_transition_tiered(
-            &buggy,
-            &[],
-            &before,
-            &after,
-            Some("Forward"),
-            "ProxyForward(Buggy=1)",
-        );
-        assert!(
-            !admitted,
-            "`{line}`: the re-forwarding mutant admitted the real hop, so this \
-             conformance cannot tell the two apart"
-        );
-    }
-    crate::proxy::deregister_child(&child);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Tier-1 conformance of the sibling hop to `aterm_models_gui::proxy_forward_model`
-/// (`ProxyForward`). This hop keeps the `@<sid>` selector, so what ends the chain is
-/// the sibling: the entry it followed was published by the instance at that socket,
-/// so there the sid is hosted locally, or (a stale entry) names the sibling's own
-/// socket, which `resolve_sibling`'s self-dial guard refuses.
-///
-/// The onward question is therefore asked in the sibling's context: the relayed line
-/// past its `TOKEN <sibling-token>` handshake (the token read beside the socket once
-/// connected, `ForwardLine::token_at`, so Owner there), planned against the
-/// sibling's store (hosting the sid, and not) with the recorded self socket set to
-/// the sibling's. Each hop is validated as `Forward` with `active` = whether the
-/// sibling would forward on.
+/// The onward question is therefore asked in the host's context: the relayed line
+/// past its `TOKEN <host-token>` handshake (the token read beside the socket once
+/// connected, so Owner there), planned against the host's store (hosting the sid,
+/// and not) with the recorded self socket set to the host's. Each hop is validated
+/// as `Forward` with `active` = whether the host would forward on.
 ///
 /// Negative control: `Buggy = 1` (chain continues) must reject every real hop;
 /// deleting the self-dial guard makes the stale-entry case forward back to itself.
 #[test]
-#[cfg(unix)]
 fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
-    use aterm_session::{LaunchNonce, SessionId};
     use aterm_spec::verify::validate_transition_tiered;
     use std::collections::BTreeMap;
     // Serialize with every other test touching the process-global self sock.
@@ -4162,16 +4607,14 @@ fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
     let dir = std::env::temp_dir().join(format!("aterm-sib1-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
-    // The sibling: a live listener, its 0600 token, and its entries (one for a
-    // session it hosts, one left for a session it no longer hosts).
-    let sib_sock = dir.join("aterm-77011.sock");
-    let sib_sock_str = sib_sock.to_string_lossy().into_owned();
-    let _listener = std::os::unix::net::UnixListener::bind(&sib_sock).expect("bind sibling");
-    std::fs::write(dir.join("aterm-77011.token"), "cafe0123\n").expect("token");
+    // The host: a live listener, its token, and its entries (one for a session
+    // it hosts, one left for a session it no longer hosts).
     let hosted = registered_session(93, -1, b"");
-    crate::proxy::write_graph_entry(&dir, &hosted.sid, &sib_sock_str, &hosted.nonce);
+    let host_sock = hosting_instance(&dir, 77011, &hosted.sid, "cafe0123");
+    let host_sock_str = host_sock.to_string_lossy().into_owned();
+    let _listener = aterm_uds::CtlListener::bind(&host_sock).expect("bind the host");
     let stale = SessionId::generate();
-    crate::proxy::write_graph_entry(&dir, &stale, &sib_sock_str, &LaunchNonce::generate());
+    crate::proxy::write_graph_entry(&dir, &stale, &host_sock_str, &LaunchNonce::generate());
     let here = crate::session_store::new_store();
     let hosting = crate::session_store::new_store();
     hosting.write().unwrap().register(hosted.clone());
@@ -4180,7 +4623,8 @@ fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
     let model = aterm_models_gui::proxy_forward_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let before = model.init_state();
-    for (what, sid, sibling_store) in [
+    assert_eq!(before, BTreeMap::from([("depth", 0), ("active", 1)]));
+    for (what, sid, host_store) in [
         ("hosted there", hosted.sid.clone(), &hosting),
         ("a stale entry", stale, &emptied),
     ] {
@@ -4188,20 +4632,19 @@ fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
         for line in [
             format!("@{sid} screen"),
             format!("@{sid} key up"),
+            format!("@{sid} topic triage"),
             format!("subscribe @{sid} cells,bytes"),
         ] {
-            let first_line = presented(
-                &proxy_forward_plan(&line, Scope::Owner, &here, &dir).unwrap_or_else(|| {
-                    panic!("{what} `{line}`: a live sibling must be forwarded to")
-                }),
-            );
-            let at_sibling = first_line
+            let plan = plan_for(&line, Scope::Owner, &here, &dir)
+                .unwrap_or_else(|| panic!("{what} `{line}`: a live host must be forwarded to"));
+            let first_line = presented(&plan, &line);
+            let at_host = first_line
                 .trim_end_matches('\n')
                 .strip_prefix("TOKEN cafe0123 ")
-                .unwrap_or_else(|| panic!("`{first_line}` does not present the sibling's token"));
-            // Become the sibling for the onward question.
-            crate::proxy::set_self_sock(&dir, &sib_sock_str);
-            let onward = proxy_forward_plan(at_sibling, Scope::Owner, sibling_store, &dir);
+                .unwrap_or_else(|| panic!("`{first_line}` does not present the host's token"));
+            // Become the host for the onward question.
+            crate::proxy::set_self_sock(&dir, &host_sock_str);
+            let onward = plan_for(at_host, Scope::Owner, host_store, &dir);
             crate::proxy::clear_self_sock();
             let after = BTreeMap::from([("depth", 1), ("active", i64::from(onward.is_some()))]);
             let (ok, why) = validate_transition_tiered(
@@ -4210,12 +4653,16 @@ fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
                 &before,
                 &after,
                 Some("Forward"),
-                "ProxyForward(proxy_forward_plan sibling hop)",
+                "ProxyForward(proxy_forward_plan)",
             );
             assert!(
                 ok,
-                "{what} `{line}` reaches the sibling as `{at_sibling}`, which it would \
+                "{what} `{line}` reaches the host as `{at_host}`, which it would \
                  forward on to {onward:?}; the model admits no such hop — {why}"
+            );
+            assert!(
+                !model.action_enabled("Forward", &after),
+                "{what} `{line}`: a second hop is possible after `{at_host}`"
             );
             assert!(model.check_invariant("OneHopNoCycle", &after));
             let (admitted, _) = validate_transition_tiered(
@@ -4235,30 +4682,25 @@ fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A forward planned against a sibling's listener and token, where an update's
-/// successor takes the socket first (token file rewritten, then the same path
-/// bound), must present the token beside the socket once connected, the
-/// successor's; the plan-time token is refused `ERR auth` there, and the caller is
-/// answered `ERR forward`.
+/// A forward planned to a host that an update's successor replaces before the
+/// forward connects (token file rewritten, then the same path bound) presents
+/// the token beside the socket once connected, the successor's: a token taken
+/// earlier is refused `ERR auth` there, and the caller is answered `ERR
+/// forward`.
 #[test]
 #[cfg(unix)]
 fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
-    use aterm_session::{LaunchNonce, SessionId};
     use std::io::{BufRead, BufReader, Write};
     let dir = std::env::temp_dir().join(format!("aterm-sibrep-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let store = crate::session_store::new_store();
     let sid = SessionId::generate();
-    let sock = dir.join("aterm-77021.sock");
+    let sock = hosting_instance(&dir, 77021, &sid, "deadbeef");
     let token_file = dir.join("aterm-77021.token");
-    std::fs::write(&token_file, "deadbeef\n").expect("the sibling's token");
     let predecessor = aterm_uds::CtlListener::bind(&sock).expect("bind the sibling");
-    let sock_text = sock.to_string_lossy().into_owned();
-    crate::proxy::write_graph_entry(&dir, &sid, &sock_text, &LaunchNonce::generate());
     let line = format!("@{} text", sid.as_str());
-    let plan = proxy_forward_plan(&line, Scope::Owner, &store, &dir)
-        .expect("a live sibling is forwarded to");
+    let plan = plan_for(&line, Scope::Owner, &store, &dir).expect("a live sibling is forwarded to");
 
     std::fs::remove_file(&token_file).expect("unlink the old token");
     std::fs::write(&token_file, "cafef00d\n").expect("the successor's token");
@@ -4285,7 +4727,8 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
     });
     let (client_app, client_relay) = CtlStream::pair().expect("pair");
     let forward = std::thread::spawn(move || {
-        crate::proxy::connect_and_relay(&plan.0, &plan.1, &client_relay, &[])
+        let hop = crate::proxy::connect_hop(&plan).map_err(|e| format!("no hop: {e:?}"))?;
+        crate::proxy::relay_hop(hop, &line, &client_relay, &[]).map_err(|e| e.to_string())
     });
     // The reply ends either way (the relayed answer, or EOF once a failed
     // forward drops its end), and the forward with it once the client
@@ -4308,26 +4751,26 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
     let probe = join_after_hang_up(served, "the successor to finish serving");
     assert_eq!(
         probe, "TOKEN cafef00d version\n",
-        "the successor was sent the token beside its socket at plan time"
+        "the successor was sent a token read before the connect"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Tier-1 conformance of the forward path to
 /// `aterm_models_session::forward_handshake_model` (`ForwardHandshake`), its liveness
-/// twin: the server holds a request the child must receive while the client waits
+/// twin: the server holds a request the host must receive while the client waits
 /// for the reply, so relaying must not wait on a fresh client read (e.g.
 /// `fill_buf()` on the common empty buffer would wedge every forward).
 ///
-/// End to end: a client sends one `@<child> screen` line and waits; the server reads
-/// it as the serve loop does and calls `try_proxy_forward`; a stand-in child reports
+/// End to end: a client sends one `@<sid> screen` line and waits; the server reads
+/// it as the serve loop does and calls `try_proxy_forward`; a stand-in host reports
 /// the handshake it receives (`Relay`: buffered -> relayed) and answers; the client
 /// reading it is `ClientRecv`. Each step is validated against the model, which must
 /// end in `Done`.
 ///
 /// Negative control: `Buggy = 1` (a fresh read before the first relay) disables
-/// `Relay`; with `fill_buf()` in `drain_buffered` the child never gets the request
-/// and the test reports the parked state.
+/// `Relay`; with `fill_buf()` in `LaneReader::take_buffered` the host never gets
+/// the request and the test reports the parked state.
 #[test]
 #[cfg(unix)]
 fn try_proxy_forward_conforms_to_forward_handshake() {
@@ -4335,11 +4778,11 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
     use std::io::{BufRead, BufReader, Write};
     let dir = std::env::temp_dir().join(format!("aterm-fhs-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (child, entry) = forwardable_child(&dir);
-    let listener =
-        aterm_uds::CtlListener::bind(dir.join("aterm-child.sock")).expect("bind the child");
+    let sid = SessionId::generate();
+    let sock = hosting_instance(&dir, 77070, &sid, "c0ffee02");
+    let listener = aterm_uds::CtlListener::bind(&sock).expect("bind the host");
     let (handshake_tx, handshake_rx) = std::sync::mpsc::channel::<String>();
-    let child_side = std::thread::spawn(move || {
+    let host_side = std::thread::spawn(move || {
         let (conn, _) = listener.accept().expect("accept the forward");
         let mut reader = BufReader::new(conn.try_clone().expect("clone"));
         // The forward's connect probe comes first and is answered; the
@@ -4347,7 +4790,7 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
         let mut probe = String::new();
         reader.read_line(&mut probe).expect("read the handshake");
         (&conn)
-            .write_all(b"OK version=child\n")
+            .write_all(b"OK version=host\n")
             .expect("answer the probe");
         let mut verb = String::new();
         reader.read_line(&mut verb).expect("read the verb");
@@ -4362,17 +4805,18 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
         .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
         .expect("client deadline");
     (&client)
-        .write_all(format!("@{} screen\n", child.as_str()).as_bytes())
+        .write_all(format!("@{} screen\n", sid.as_str()).as_bytes())
         .expect("send the request");
     let store = crate::session_store::new_store();
     let server_dir = dir.clone();
     let server = std::thread::spawn(move || {
-        let mut reader = BufReader::new(&server_end);
+        let mut unread = control_lanes::Unread::default();
+        let mut reader = control_lanes::LaneReader::new(&server_end, &mut unread);
         let mut line = String::new();
         reader.read_line(&mut line).expect("read the request");
         let line = line.trim_end_matches('\n');
         try_proxy_forward(
-            line,
+            &Request::parse(line.to_string()),
             Scope::Owner,
             &store,
             &server_dir,
@@ -4422,9 +4866,9 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
     );
     assert_eq!(
         handshake,
-        format!("TOKEN {} version\n@. screen\n", entry.read.to_hex()),
-        "the child receives the edge handshake (with the connect probe) and \
-         the rewritten verb"
+        format!("TOKEN c0ffee02 version\n@{} screen\n", sid.as_str()),
+        "the host receives its own token's handshake (with the connect probe) and \
+         the line as it came"
     );
     let relayed = step(&parked, "Relay", &[("buffered", 0), ("relayed", 1)]);
 
@@ -4442,15 +4886,14 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
     // Hang up (for the whole socket, [`hang_up`]: a `drop` leaves the
     // socket open while a sibling's fork holds a copy of the client end, and
     // the both-ways `shutdown` Darwin refuses once the relay half-closed
-    // toward the client shut nothing), so the relay's client-to-child pump
+    // toward the client shut nothing), so the relay's client-to-host pump
     // hits EOF and the forward returns.
     hang_up(client);
     assert!(
         join_after_hang_up(server, "the forward to end on its client's hang-up"),
         "the forward owned the line"
     );
-    join_after_hang_up(child_side, "the stand-in child to finish serving");
-    crate::proxy::deregister_child(&child);
+    join_after_hang_up(host_side, "the stand-in host to finish serving");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4764,65 +5207,91 @@ fn the_window_form_of_resize_survives_a_native_front_and_the_cell_form_does_not_
     }
 }
 
-/// An aimed `spawn`/`tab` (`@<sid> spawn …`, `@<sid> tab …`) keeps the App verdict
+/// [`app_route`]: an Edge is denied every App-target verb BEFORE its selector is
+/// looked up, so it learns nothing about which sessions exist, and an aimed
+/// `spawn`/`tab` (`@<sid> spawn …`, `@<sid> tab close <N>`) keeps the App verdict
 /// every App-target selector gets; otherwise an edge with write-input on one
-/// session could mint a tab in, or `tab close <N>` any tab of, the window hosting
-/// it. The main-thread hop needs an event loop, so the lane verdict is tested:
-/// `ResolveSession` is the `return None` that carries the Owner's selector into
-/// `dispatch_request` -> `handle` (`cmd_spawn(.., is_cross.then_some(session))`,
-/// `"tab" if is_cross => cmd_tab_aimed(..)`).
+/// session could mint a tab in, or close any tab of, the window hosting it. An
+/// Owner's selector is looked up once and becomes the aim (`@<sid> panes`
+/// describes the window showing that session); flagless and `@.` forms aim at the
+/// front window with no lookup. Negative control: the same dead selector from an
+/// Owner is looked up and answers `ERR no such session`.
 #[test]
-fn an_aimed_spawn_or_tab_is_owner_only_and_the_owner_keeps_the_selector() {
-    use super::{AimedAppLane, aimed_app_lane, request_head};
-    // Every aimed spelling, both selector forms (local id, stable sid), with
-    // a well-formed and a malformed tail: the verdict precedes the parse.
+fn app_route_denies_an_edge_before_it_looks() {
+    let looked = std::cell::Cell::new(0);
+    let dead = |_: &Selector<'_>| {
+        looked.set(looked.get() + 1);
+        Resolution::Missing
+    };
+    let edge = NativeControlPrincipal::Edge;
+    let owner = NativeControlPrincipal::Owner;
+    // Every aimed spelling, both selector forms (local id, stable sid), with a
+    // well-formed and a malformed tail, and the unaimed forms: the verdict
+    // precedes the lookup and the parse.
     for line in [
         "@0 spawn",
         "@0 spawn raise=maybe",
         "@s-abc spawn cwd=/w split=v",
-        "@0 tab next",
-        "@0 tab prev",
-        "@0 tab 1",
-        "@0 tab new",
         "@0 tab close 0",
         "@s-abc tab move 0 1",
+        "@0 panes",
+        "@0 hover on",
+        "spawn",
+        "@. tab close",
     ] {
-        let (selector, verb, _) = request_head(line);
+        let Head { selector, .. } = control_request::head(line);
         assert_eq!(
-            aimed_app_lane(verb, selector.as_ref(), NativeControlPrincipal::Edge),
-            Some(AimedAppLane::Denied),
-            "an Edge is refused {line:?} before the sid is looked up",
-        );
-        assert_eq!(
-            aimed_app_lane(verb, selector.as_ref(), NativeControlPrincipal::Owner),
-            Some(AimedAppLane::ResolveSession),
-            "an Owner's selector survives to the resolver for {line:?}",
+            app_route(edge, selector.as_ref(), dead).err().as_deref(),
+            Some("ERR denied\n"),
+            "an Edge is refused {line:?}",
         );
     }
-    // The flagless and `@.` forms keep the ordinary App path (Owner:
-    // `WithoutSession` -> the front-window verb; Edge: `ERR denied`).
+    assert_eq!(looked.get(), 0, "an Edge is refused before any lookup");
+
+    let Head { selector, .. } = control_request::head("@0 spawn");
+    assert_eq!(
+        app_route(owner, selector.as_ref(), dead).err().as_deref(),
+        Some("ERR no such session\n"),
+    );
+    assert_eq!(looked.get(), 1, "the Owner's selector is looked up, once");
+
     for line in [
         "spawn",
         "spawn window=1 raise=false",
         "@. spawn",
         "tab next",
-        "@. tab close",
+        "panes",
     ] {
-        let (selector, verb, _) = request_head(line);
-        for principal in [NativeControlPrincipal::Owner, NativeControlPrincipal::Edge] {
-            assert_eq!(
-                aimed_app_lane(verb, selector.as_ref(), principal),
-                None,
-                "{line:?} is not aimed ({principal:?})",
-            );
-        }
+        let Head { selector, .. } = control_request::head(line);
+        assert!(
+            matches!(app_route(owner, selector.as_ref(), dead), Ok(AppAim::Front)),
+            "{line:?} aims at the front window",
+        );
     }
-    // Nor is any OTHER selector-bearing App verb: `@0 hover on` keeps the
-    // lane it always had (this lane is exactly spawn/tab).
-    let (selector, verb, _) = request_head("@0 hover on");
+    assert_eq!(looked.get(), 1, "an unaimed form looks nothing up");
+
+    // A hosted session is the aim, the session `cmd_spawn`, `cmd_tab_aimed` and
+    // `cmd_panes` are handed; an id two instances answer to is refused by name.
+    let handle = crate::session_store::test_handle(7);
+    let hosted: Target = (
+        handle.term.clone(),
+        handle.master,
+        handle.local_id,
+        handle.ctx.clone(),
+    );
+    let Head { selector, .. } = control_request::head("@7 panes");
+    let aim = app_route(owner, selector.as_ref(), |_| {
+        Resolution::Hosted(hosted.clone())
+    });
+    assert_eq!(aim.ok().and_then(|aim| aim.session()), Some(7));
+    assert_eq!(AppAim::Front.session(), None);
     assert_eq!(
-        aimed_app_lane(verb, selector.as_ref(), NativeControlPrincipal::Edge),
-        None
+        app_route(owner, selector.as_ref(), |_| {
+            Resolution::Ambiguous("ERR ambiguous\n".to_string())
+        })
+        .err()
+        .as_deref(),
+        Some("ERR ambiguous\n"),
     );
 }
 
@@ -5048,10 +5517,23 @@ fn the_fleet_gate_admits_only_fleet_verbs_with_no_selector_or_frame() {
             drive: false,
         };
         for served in VERBS.iter().filter(|spec| spec.fleet) {
-            assert_eq!(fleet_refusal(served.name, fleet), None, "{}", served.name);
+            assert_eq!(
+                fleet_refusal(&Request::parse(served.name.to_string()), fleet),
+                None,
+                "{}",
+                served.name
+            );
         }
-        // A stray tail is the verb's own usage error, not the gate's.
-        assert_eq!(fleet_refusal("version --json", fleet), None);
+        // A stray tail is the verb's own usage error, not the gate's, and the
+        // one request grammar reads the verb past leading separators and up to
+        // an HT as every other stage does.
+        for line in ["version --json", " version", "version\tx"] {
+            assert_eq!(
+                fleet_refusal(&Request::parse(line.to_string()), fleet),
+                None,
+                "{line:?}"
+            );
+        }
         for line in [
             "@1 version",
             "@s-0123456789abcdef version",
@@ -5074,11 +5556,10 @@ fn the_fleet_gate_admits_only_fleet_verbs_with_no_selector_or_frame() {
             "whoami",
             "task mark done",
             "",
-            " version",
             "VERSION",
-            "version\tx",
         ] {
-            let refusal = fleet_refusal(line, fleet).unwrap_or_else(|| panic!("{line:?} passed"));
+            let refusal = fleet_refusal(&Request::parse(line.to_string()), fleet)
+                .unwrap_or_else(|| panic!("{line:?} passed"));
             assert!(
                 refusal.starts_with("ERR denied: the fleet serves ") && refusal.ends_with('\n'),
                 "{line:?}: {refusal:?}"
@@ -5100,7 +5581,11 @@ fn the_fleet_gate_admits_only_fleet_verbs_with_no_selector_or_frame() {
         Scope::Edge(aterm_session::EdgeToken::generate()),
     ] {
         for line in ["@1 text", "spawn", "feed-bin 5", "subscribe @* events"] {
-            assert_eq!(fleet_refusal(line, scope), None, "{scope:?} {line:?}");
+            assert_eq!(
+                fleet_refusal(&Request::parse(line.to_string()), scope),
+                None,
+                "{scope:?} {line:?}"
+            );
         }
     }
 }
@@ -5127,7 +5612,7 @@ fn the_empty_selector_gate_refuses_an_at_that_names_nothing() {
         " @ status",
     ] {
         assert_eq!(
-            empty_selector_refusal(line).as_deref(),
+            empty_selector_refusal(&Request::parse(line.to_string())).as_deref(),
             Some(refusal.as_str()),
             "{line:?}"
         );
@@ -5143,13 +5628,21 @@ fn the_empty_selector_gate_refuses_an_at_that_names_nothing() {
         "await task @s-a,@.",
         "",
     ] {
-        assert_eq!(empty_selector_refusal(line), None, "{line:?}");
+        assert_eq!(
+            empty_selector_refusal(&Request::parse(line.to_string())),
+            None,
+            "{line:?}"
+        );
     }
     // Past the gate: no selector, and the `@` is the verb no handler answers.
-    let (selector, verb, rest) = request_head("@ task");
+    let Head {
+        selector,
+        verb,
+        rest,
+    } = control_request::head("@ task");
     assert!(selector.is_none());
     assert_eq!((verb, rest), ("@", "task"));
-    let (selector, verb, _) = request_head("@. task");
+    let Head { selector, verb, .. } = control_request::head("@. task");
     assert!(matches!(selector, Some(Selector::SelfTok)));
     assert_eq!(verb, "task");
 }
@@ -5183,7 +5676,11 @@ fn a_fleet_peer_reads_the_survey_at_its_level() {
             drive: false,
         };
         let line = format!("survey {rest}");
-        assert_eq!(fleet_refusal(line.trim(), fleet), None, "{line:?}");
+        assert_eq!(
+            fleet_refusal(&Request::parse(line.trim().to_string()), fleet),
+            None,
+            "{line:?}"
+        );
         let reply = fleet_survey("survey", rest, fleet, &store).expect("a fleet survey");
         assert_eq!(
             level(&reply).as_deref(),
@@ -5215,7 +5712,6 @@ fn a_fleet_peer_reads_the_survey_at_its_level() {
 #[cfg(unix)]
 fn a_turn_with_no_text_is_usage_unless_it_submits_nothing() {
     let store = crate::session_store::new_store();
-    let subscribers = subscribe::new_registry();
     let (target, _rx) = pipe_session(74);
     store.write().unwrap().register(target.clone());
     let paste = |_: &str| panic!("an empty turn pastes nothing");
@@ -5237,7 +5733,6 @@ fn a_turn_with_no_text_is_usage_unless_it_submits_nothing() {
             &store,
             target.local_id,
             rest,
-            &subscribers,
             &target.ctx,
             &io,
         );
@@ -5248,7 +5743,6 @@ fn a_turn_with_no_text_is_usage_unless_it_submits_nothing() {
         &store,
         target.local_id,
         "idle=1 timeout=500 submit=none",
-        &subscribers,
         &target.ctx,
         &io,
     );
@@ -5267,7 +5761,6 @@ fn a_turn_with_no_text_is_usage_unless_it_submits_nothing() {
 fn history_prints_the_turn_start_arch_mark_before_text() {
     const ORIGIN: u64 = 0xBEEF;
     let store = crate::session_store::new_store();
-    let subscribers = subscribe::new_registry();
     let (target, _rx) = pipe_session(73);
     store.write().unwrap().register(target.clone());
     {
@@ -5299,7 +5792,6 @@ fn history_prints_the_turn_start_arch_mark_before_text() {
         &store,
         target.local_id,
         "idle=1 timeout=2000 submit=none -- look here",
-        &subscribers,
         &target.ctx,
         &control_session::TurnIo {
             paste: &paste,
@@ -5338,7 +5830,11 @@ fn history_prints_the_turn_start_arch_mark_before_text() {
 
     // The mark is the token `offscreen since=` takes: it reads exactly the rows
     // that scrolled off during the turn.
-    let off = control_query::cmd_offscreen(&target.term, &format!("since={ORIGIN}:4"));
+    let off = control_query::cmd_offscreen(
+        &target.term,
+        &target.ctx.frame,
+        &format!("since={ORIGIN}:4"),
+    );
     let rows: Vec<&str> = off.lines().skip(1).collect();
     assert_eq!(
         rows,
@@ -5367,14 +5863,22 @@ fn cross_session_input_reaches_target_sink_not_self() {
     store.write().unwrap().register(h_self.clone());
     store.write().unwrap().register(h_target.clone());
 
-    // Resolve `@2` (the target's local id) EXACTLY as `handle()` does.
-    let (term, _, _, ctx) = resolve_explicit(&store, &Selector::parse("2").expect("a selector"))
-        .expect("@2 is not ambiguous")
-        .expect("@2 resolves");
+    // Resolve `@2` (the target's local id) EXACTLY as the dispatch does.
+    let Resolution::Hosted((term, _, _, ctx)) = resolve(&store, &Selector::parse("2")) else {
+        panic!("@2 resolves");
+    };
     let ctx: &SessionCtx = &ctx;
 
     // `key enter` cross-session: CR reaches the TARGET sink, nothing to self.
-    assert_eq!(cross_input(&term, ctx, parse_key("enter"), "ERR\n"), "OK\n");
+    assert_eq!(
+        control_input::input_reply_to_str(background(
+            "key",
+            &term,
+            ctx,
+            parse_key("enter").unwrap()
+        )),
+        "OK\n"
+    );
     assert_eq!(
         drain_pipe(&target_rx),
         b"\r",
@@ -5400,20 +5904,16 @@ fn cross_session_input_reaches_target_sink_not_self() {
         "cross input must stamp only its resolved session"
     );
 
-    // A malformed name cross-session is the same usage line the flagless
-    // arm answers, and nothing reaches either pty.
-    assert_eq!(
-        cross_input(&term, ctx, parse_key("notakey"), control_input::KEY_USAGE),
-        control_input::KEY_USAGE
-    );
-    assert!(drain_pipe(&target_rx).is_empty());
-    assert!(drain_pipe(&self_rx).is_empty());
-
     // Raw feed/send retain their direct background route but now publish an
     // accepted-input receipt on that same resolved SessionCtx.
     let unlogged_before_feed = crate::unseamed_control_inputs();
     assert_eq!(
-        cross_raw_input(&term, ctx, feed_bytes("03").unwrap()),
+        background(
+            "feed",
+            &term,
+            ctx,
+            InputEvent::KeySequence(feed_bytes("03").unwrap())
+        ),
         Ok(InputOutcome::Ok)
     );
     assert_eq!(
@@ -5431,7 +5931,12 @@ fn cross_session_input_reaches_target_sink_not_self() {
     // `send` is RAW (no implicit CR unless a literal trailing `\n` is given).
     let unlogged_before_send = crate::unseamed_control_inputs();
     assert_eq!(
-        cross_raw_input(&term, ctx, send_bytes("ls")),
+        background(
+            "send",
+            &term,
+            ctx,
+            InputEvent::KeySequence(send_bytes("ls"))
+        ),
         Ok(InputOutcome::Ok)
     );
     assert_eq!(
@@ -5690,7 +6195,7 @@ fn test_ctx() -> Arc<crate::SessionCtx> {
     registered_session(0, -1, b"").ctx
 }
 
-/// The decision the op-scope gate at the top of `handle()` makes, kept in lockstep
+/// The decision the op-scope gate at the top of `serve_session_verb` makes, kept in lockstep
 /// with its inline `match (scope, required_op(verb))` so it is testable without an
 /// `EventLoopProxy`: the deny path returns before any proxy use.
 fn gate_allows(scope: Scope, verb: &str, active: &SessionCtx) -> bool {
@@ -5724,6 +6229,133 @@ fn edge_granted(op: Op, ctx: &SessionCtx) -> Scope {
     Scope::Edge(tok)
 }
 
+/// [`route`]: every row of the table, a listed sub-form row as its verb, goes to
+/// the class handler its `(access, target)` names, and a verb the table does not
+/// list is refused before any handler (a retired verb by its tombstone, any other
+/// by `ERR unknown verb`), so no arm can serve a verb outside the table.
+#[test]
+fn the_router_routes_every_row_by_its_class_and_refuses_the_rest() {
+    use aterm_types::control_verbs::{VERBS, spec_for};
+    let route_of = |verb: &str, rest: &str| route(verb, spec_for(verb, rest));
+    for row in VERBS {
+        let (verb, sub) = row.name.split_once(' ').unwrap_or((row.name, ""));
+        let (routed, form) = route_of(verb, sub)
+            .unwrap_or_else(|refusal| panic!("{}: refused {refusal:?}", row.name));
+        assert_eq!(form.row.name, row.name, "{} keeps its own form", row.name);
+        assert_eq!(
+            Ok(routed),
+            route_of(verb, "").map(|(base, _)| base),
+            "{} routes as its verb",
+            row.name
+        );
+    }
+    for (line, want) in [
+        ("version", Route::Meta),
+        ("privacy --json", Route::Meta),
+        ("deliver s-a off=1", Route::Bridge),
+        ("outbox sent s-a 1 off=9", Route::Bridge),
+        ("hold s-a on", Route::Owner),
+        ("appnotice update hi", Route::Owner),
+        ("story approved", Route::Owner),
+        ("flows", Route::Owner),
+        ("window", Route::App),
+        ("hwkey a", Route::App),
+        ("theme set Nord", Route::App),
+        ("panes", Route::App),
+        ("text", Route::Session),
+        ("inbox seen 3", Route::Session),
+        ("subscribe screen", Route::Session),
+    ] {
+        let (verb, rest) = line.split_once(' ').unwrap_or((line, ""));
+        assert_eq!(route_of(verb, rest).map(|(r, _)| r), Ok(want), "{line:?}");
+    }
+    for verb in ["bogus", "Text", "theme-set", ""] {
+        assert_eq!(
+            route_of(verb, "").err().as_deref(),
+            Some("ERR unknown verb (try: help)\n"),
+            "{verb:?}"
+        );
+    }
+    assert_eq!(
+        route_of("dial", "").err().as_deref(),
+        retired_verb_error("dial").as_deref(),
+        "a retired verb answers its tombstone"
+    );
+}
+
+/// [`owner_aim`] over every owner-only row: only the session-authority verbs
+/// (`grant`, `revoke`, `whoami`) and a bare `topic` or `story` ask for the
+/// connection's own session, so every other owner verb, a new row included,
+/// answers with no terminal or a native tab in front. A selector naming another
+/// session is the verb's own aim; `@.` is the connection's.
+#[test]
+fn owner_verbs_need_no_terminal_except_the_session_authority_ones() {
+    use aterm_types::control_verbs::{Access, VERBS};
+    let own_session = ["grant", "revoke", "whoami", "topic", "story"];
+    for row in VERBS
+        .iter()
+        .filter(|row| matches!(row.access, Access::OwnerOnly))
+    {
+        let verb = row.name.split_once(' ').map_or(row.name, |(verb, _)| verb);
+        let want = if own_session.contains(&verb) {
+            OwnerAim::OwnSession
+        } else {
+            OwnerAim::Instance
+        };
+        assert_eq!(owner_aim(verb, None), want, "{}", row.name);
+    }
+    for (verb, selector, want) in [
+        ("topic", "s-a1", OwnerAim::Instance),
+        ("topic", "s-x", OwnerAim::Instance),
+        ("story", "0", OwnerAim::Instance),
+        ("story", ".", OwnerAim::OwnSession),
+        ("topic", ".", OwnerAim::OwnSession),
+        ("flows", ".", OwnerAim::Instance),
+    ] {
+        assert_eq!(
+            owner_aim(verb, Some(&Selector::parse(selector))),
+            want,
+            "@{selector} {verb}"
+        );
+    }
+}
+
+/// [`dispatch_authorized`] for `verb rest` over its table form, as the router
+/// hands it to the gate.
+fn line_authorized(scope: Scope, verb: &str, rest: &str, ctx: &SessionCtx) -> bool {
+    let form = aterm_types::control_verbs::spec_for(verb, rest).expect("a table verb");
+    dispatch_authorized(scope, &form, verb, rest, ctx)
+}
+
+/// What `verb rest` needs at the dispatch gate: [`need_of`] over its table form.
+fn request_need(verb: &str, rest: &str) -> Option<Need> {
+    aterm_types::control_verbs::spec_for(verb, rest).and_then(|form| need_of(&form, verb, rest))
+}
+
+/// What `verb rest` needs at the dispatch gate BEYOND its verb's base op
+/// ([`required_op`]): [`request_need`] when the two differ, `None` when the base op
+/// is the whole requirement.
+fn escalation(verb: &str, rest: &str) -> Option<Need> {
+    let need = request_need(verb, rest);
+    need.filter(|_| need != required_op(verb).map(Need::Op))
+}
+
+/// The relay's and the cross-session gate's verb-only projection
+/// ([`required_op`]) agrees with the dispatch gate ([`need_of`]) on every bare
+/// row of the table.
+#[test]
+fn the_verb_only_projection_agrees_with_the_dispatch_gate() {
+    use aterm_types::control_verbs::VERBS;
+    for row in VERBS {
+        assert_eq!(
+            request_need(row.name, ""),
+            required_op(row.name).map(Need::Op),
+            "{}",
+            row.name
+        );
+    }
+}
+
 /// `invoke <clipboard/config action>` and `open prefs|settings` escalate their op on
 /// the argument, so a plain WriteInput edge cannot reach the fenced fine ops
 /// through them: WriteInput is denied, Owner and a granted
@@ -5732,33 +6364,41 @@ fn edge_granted(op: Op, ctx: &SessionCtx) -> Scope {
 /// like `invoke ApplyUpdate`/`open update`, so a ReadScreen edge cannot re-exec.
 #[test]
 fn update_check_and_apply_are_owner_only_subcommands() {
-    assert!(update_is_owner_only_subcmd("check"));
-    assert!(update_is_owner_only_subcmd("apply"));
-    assert!(update_is_owner_only_subcmd("  apply  "));
+    // What `cmd_update` asks: the table's `update` form for the request.
+    let owner_only = |rest: &str| {
+        aterm_types::control_verbs::spec_for("update", rest).is_some_and(|form| form.owner_only)
+    };
+    assert!(owner_only("check"));
+    assert!(owner_only("apply"));
+    assert!(owner_only("  apply  "));
+    // The sub-command word decides, whatever follows it: a malformed `check` is
+    // refused to an edge before it can read as a usage error.
+    assert!(owner_only("check extra"));
     // Reads stay any-scope so an in-session observer can SEE update state.
-    assert!(!update_is_owner_only_subcmd(""));
-    assert!(!update_is_owner_only_subcmd("status"));
-    assert!(!update_is_owner_only_subcmd("bogus"));
+    assert!(!owner_only(""));
+    assert!(!owner_only("status"));
+    assert!(!owner_only("bogus"));
 }
 
-/// `escalated_op`, the argument-dependent fences. `invoke`/`open`/`act` escalate to
-/// the fine op their target needs; owner-only surfaces (the palette gateway, update
-/// re-exec, standing connection authority, `family <sid>`, `pointer click`,
-/// `brief all`) to `OwnerOnly`. `find` escalates for nothing: escalation replaces the base op, and
-/// every `find` form answers with a match position, so it would give a
+/// The argument-dependent fences ([`escalation`]: what [`need_of`] asks beyond
+/// the verb's base op). `invoke`/`open`/`act` escalate to the fine op their
+/// target needs; owner-only surfaces (the palette gateway, update re-exec,
+/// standing connection authority, `family <sid>`, `pointer click`, `brief all`)
+/// to `OwnerOnly`. `find` escalates for nothing: escalation replaces the base op,
+/// and every `find` form answers with a match position, so it would give a
 /// keystroke-only edge a screen read (the dispatch requires write on top instead).
 /// The spawn fence tokenizes as `parse_spawn_args` does, so quoting or position
 /// cannot walk a `connected=`/`identity=` past it.
 #[test]
 fn escalated_op_fences_argument_dependent_seams() {
-    use Escalation::{Op as EOp, OwnerOnly};
+    use Need::{Op as EOp, OwnerOnly};
     const SETTINGS_ACT: &str =
         "app/v1 view 42 settings/control/allow_osc52_query settings/set/allow_osc52_query true";
     let clipboard = Some(EOp(Op::ClipboardWrite));
     let config = Some(EOp(Op::ConfigWrite));
     let write = Some(EOp(Op::WriteInput));
     let owner = Some(OwnerOnly);
-    let rows: &[(&str, &str, Option<Escalation>)] = &[
+    let rows: &[(&str, &str, Option<Need>)] = &[
         ("invoke", "Copy", clipboard),
         ("invoke", "Paste", clipboard),
         ("invoke", "SelectAll", clipboard),
@@ -5884,6 +6524,8 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("pointer", "status", None),
         ("pointer", "leave", None),
         ("pointer", "move 1 2", None),
+        // A wheel scrolls (or, under DEC mouse tracking, reports) as `move` does.
+        ("pointer", "wheel dy=3 key=settings/search", None),
         ("pointer", "click", owner),
         ("pointer", "  click  ", owner),
         // `pointer mods` arms the click (and the person's next keys): Owner-only too.
@@ -5906,7 +6548,7 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("find", "cancel", None),
     ];
     for &(verb, rest, want) in rows {
-        assert_eq!(escalated_op(verb, rest), want, "{verb} {rest:?}");
+        assert_eq!(escalation(verb, rest), want, "{verb} {rest:?}");
     }
     // Before any hop, `invoke` answers a retired name `ERR retired` and the
     // person's own acts `ERR denied`, to the Owner token too. CONTROL: an
@@ -5924,10 +6566,20 @@ fn escalated_op_fences_argument_dependent_seams() {
             "{retired}"
         );
     }
-    for name in ["TakeOver", "HandBack", "HoldSession", "LiftHold"] {
+    for name in [
+        "TakeOver",
+        "HandBack",
+        "HoldSession",
+        "LiftHold",
+        "ToggleStatsLens",
+    ] {
         let refusal = super::control_media::invoke_refusal(name).expect("refused");
         assert!(refusal.starts_with("ERR denied"), "{name}: {refusal}");
     }
+    // The stats lens is the person's close-up (design §12.2): its refusal
+    // names where the person opens it.
+    let lens = super::control_media::invoke_refusal("ToggleStatsLens").expect("refused");
+    assert!(lens.contains("\u{2318}I"), "{lens}");
     assert_eq!(super::control_media::invoke_refusal("OpenPalette"), None);
     assert_eq!(
         super::control_media::invoke_refusal("TotallyBogusAction"),
@@ -5940,7 +6592,7 @@ fn escalated_op_fences_argument_dependent_seams() {
 /// sub-form word. Negative control: the read forms add nothing.
 #[test]
 fn control_theme_sub_forms_escalate_to_the_class_they_need() {
-    use Escalation::Op as EOp;
+    use Need::Op as EOp;
     for rest in [
         "",
         "status",
@@ -5950,7 +6602,7 @@ fn control_theme_sub_forms_escalate_to_the_class_they_need() {
         "session",
         "session status",
     ] {
-        assert_eq!(escalated_op("theme", rest), None, "{rest:?} is a read");
+        assert_eq!(escalation("theme", rest), None, "{rest:?} is a read");
     }
     // A session's own theme is runtime state of that session (spec
     // `session-theme-install`): the preview lane's class, never a config write.
@@ -5964,14 +6616,14 @@ fn control_theme_sub_forms_escalate_to_the_class_they_need() {
         "session bogus",
     ] {
         assert_eq!(
-            escalated_op("theme", rest),
+            escalation("theme", rest),
             Some(EOp(Op::WriteInput)),
             "{rest:?}"
         );
     }
     for rest in ["set Nord", "commit", "bogus", "SET Nord"] {
         assert_eq!(
-            escalated_op("theme", rest),
+            escalation("theme", rest),
             Some(EOp(Op::ConfigWrite)),
             "{rest:?} fails closed to the write class"
         );
@@ -6000,6 +6652,7 @@ fn dispatch_authorization_applies_the_escalated_op() {
         ("write", write, "open", "about", true),
         ("write", write, "spawn", "cwd=/tmp", true),
         ("write", write, "pointer", "move 1 2", true),
+        ("write", write, "pointer", "wheel dy=3", true),
         ("read", read, "controls", "front", true),
         ("write", write, "invoke", "Copy", false),
         ("write", write, "act", SETTINGS_ACT, false),
@@ -6023,7 +6676,7 @@ fn dispatch_authorization_applies_the_escalated_op() {
     ];
     for &(who, scope, verb, rest, allowed) in rows {
         assert_eq!(
-            dispatch_authorized(scope, verb, rest, &ctx),
+            line_authorized(scope, verb, rest, &ctx),
             allowed,
             "{who} edge: {verb} {rest:?}"
         );
@@ -6052,8 +6705,8 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
             "key", "ctrl", "mouse", "paste", "focus", "send", "feed", "turn",
         ] {
             assert_eq!(
-                front_drive_escalation(scoped, verb, FrontControlSurface::Overlay(kind)),
-                Some(Escalation::OwnerOnly),
+                front_drive_escalation(scoped, input_of(verb), FrontControlSurface::Overlay(kind)),
+                Some(Need::OwnerOnly),
                 "{verb} must be owner-only under {kind:?}"
             );
         }
@@ -6062,7 +6715,7 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
     // OWNER is ALWAYS exempt — the owner's established control path is untouched.
     for kind in [OverlayKind::Palette, OverlayKind::Overview] {
         assert_eq!(
-            front_drive_escalation(owner, "key", FrontControlSurface::Overlay(kind)),
+            front_drive_escalation(owner, input_of("key"), FrontControlSurface::Overlay(kind)),
             None,
             "Owner may drive its own {kind:?} overlay"
         );
@@ -6070,18 +6723,19 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
 
     // Native Settings is not an Overlay at all, but it still consumes the
     // same key/mouse vocabulary and can emit ConfigPatch effects.
-    let escalation = front_drive_escalation(scoped, "key", FrontControlSurface::NativeSettings);
-    assert_eq!(escalation, Some(Escalation::Op(Op::ConfigWrite)));
+    let escalation =
+        front_drive_escalation(scoped, input_of("key"), FrontControlSurface::NativeSettings);
+    assert_eq!(escalation, Some(Need::Op(Op::ConfigWrite)));
     let ctx = test_ctx();
     assert!(
-        !scope_holds_escalation(
+        !scope_holds_need(
             edge_granted(Op::WriteInput, &ctx),
             escalation.unwrap(),
             &ctx
         ),
         "a WriteInput edge cannot drive native Settings"
     );
-    assert!(scope_holds_escalation(
+    assert!(scope_holds_need(
         edge_granted(Op::ConfigWrite, &ctx),
         escalation.unwrap(),
         &ctx,
@@ -6089,16 +6743,20 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
 
     // No privileged front consumer => preserve the verb's ordinary authority.
     assert_eq!(
-        front_drive_escalation(scoped, "key", FrontControlSurface::None),
+        front_drive_escalation(scoped, input_of("key"), FrontControlSurface::None),
         None
     );
     assert_eq!(
-        front_drive_escalation(scoped, "key", FrontControlSurface::OtherNative),
+        front_drive_escalation(scoped, input_of("key"), FrontControlSurface::OtherNative),
         None
     );
     // A NON-input verb is never dynamically escalated.
     assert_eq!(
-        front_drive_escalation(scoped, "text", FrontControlSurface::NativeSettings),
+        front_drive_escalation(
+            scoped,
+            input_of("text"),
+            FrontControlSurface::NativeSettings
+        ),
         None,
         "reads are not front-driving input"
     );
@@ -6119,9 +6777,10 @@ fn real_native_settings_front_is_explicitly_fenced_while_owner_open_still_works(
     );
     let ctx = test_ctx();
     let write_edge = edge_granted(Op::WriteInput, &ctx);
-    let escalation = front_drive_escalation(write_edge, "key", app.front_control_surface())
-        .expect("native Settings replaces the base input authority");
-    assert!(!scope_holds_escalation(write_edge, escalation, &ctx));
+    let escalation =
+        front_drive_escalation(write_edge, input_of("key"), app.front_control_surface())
+            .expect("native Settings replaces the base input authority");
+    assert!(!scope_holds_need(write_edge, escalation, &ctx));
 }
 
 /// SETTINGS ▸ HARNESS'S SESSION PRESSES ARE OWNER-ONLY, like `meta set autopilot`:
@@ -6130,9 +6789,9 @@ fn real_native_settings_front_is_explicitly_fenced_while_owner_open_still_works(
 /// reach.
 ///
 /// END TO END NO EDGE REACHES THE PAGE TODAY, whatever it holds: `act` (like
-/// `settings`) is an App-target verb, which `dispatch_before_session` answers `ERR
-/// denied` for every Edge (`native_control_decision`'s App arm) before `escalated_op`
-/// is asked; and an Edge's flagless `key`/`mouse`/`paste` are pinned to the session
+/// `settings`) is an App-target verb, which `dispatch_app` answers `ERR denied`
+/// for every Edge (`app_route`, by `native_control_decision`'s App arm) before
+/// `need_of` is asked; and an Edge's flagless `key`/`mouse`/`paste` are pinned to the session
 /// its token was checked against (`front_routed`), which `input_to_session` hands to
 /// that session and never to `native_input_event`. That gate is asserted first. The
 /// two fences below are DEFENCE IN DEPTH, read at their own predicates (the main-
@@ -6169,7 +6828,7 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
             NativeControlTarget::App
         ),
         NativeControlDecision::Denied,
-        "an Edge's `act` is ERR denied before escalated_op"
+        "an Edge's `act` is ERR denied before need_of"
     );
     assert_eq!(
         native_control_decision(
@@ -6219,17 +6878,13 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
     .chain(every.iter().map(String::as_str))
     {
         let press = format!("app/v1 view 42 {action} {action}");
-        assert_eq!(
-            escalated_op("act", &press),
-            Some(Escalation::OwnerOnly),
-            "{action}"
-        );
+        assert_eq!(escalation("act", &press), Some(Need::OwnerOnly), "{action}");
         assert!(
-            !dispatch_authorized(config_edge, "act", &press, &ctx),
+            !line_authorized(config_edge, "act", &press, &ctx),
             "a ConfigWrite edge is DENIED a session's {action}"
         );
         assert!(
-            dispatch_authorized(owner, "act", &press, &ctx),
+            line_authorized(owner, "act", &press, &ctx),
             "Owner presses {action}"
         );
     }
@@ -6241,14 +6896,11 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
         "app/v1 view 42 harness/all/autopilot/land harness/all/autopilot/land",
     ] {
         assert_eq!(
-            escalated_op("act", rest),
-            Some(Escalation::Op(Op::ConfigWrite)),
+            escalation("act", rest),
+            Some(Need::Op(Op::ConfigWrite)),
             "{rest}"
         );
-        assert!(
-            dispatch_authorized(config_edge, "act", rest, &ctx),
-            "{rest}"
-        );
+        assert!(line_authorized(config_edge, "act", rest, &ctx), "{rest}");
     }
 
     // The front path: keys and clicks at the Settings tab while it shows the page.
@@ -6259,16 +6911,16 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
         FrontControlSurface::HarnessSettings
     );
     for verb in ["key", "mouse", "paste"] {
-        let need = front_drive_escalation(config_edge, verb, app.front_control_surface())
+        let need = front_drive_escalation(config_edge, input_of(verb), app.front_control_surface())
             .expect("the page replaces the base input authority");
-        assert_eq!(need, Escalation::OwnerOnly, "{verb}");
+        assert_eq!(need, Need::OwnerOnly, "{verb}");
         assert!(
-            !scope_holds_escalation(config_edge, need, &ctx),
+            !scope_holds_need(config_edge, need, &ctx),
             "a ConfigWrite edge is DENIED {verb} on the Harness page"
         );
-        assert!(scope_holds_escalation(owner, need, &ctx));
+        assert!(scope_holds_need(owner, need, &ctx));
         assert_eq!(
-            front_drive_escalation(owner, verb, app.front_control_surface()),
+            front_drive_escalation(owner, input_of(verb), app.front_control_surface()),
             None,
             "Owner drives the page"
         );
@@ -6283,9 +6935,9 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
         app.front_control_surface(),
         FrontControlSurface::NativeSettings
     );
-    let need = front_drive_escalation(config_edge, "key", app.front_control_surface())
+    let need = front_drive_escalation(config_edge, input_of("key"), app.front_control_surface())
         .expect("native Settings");
-    assert!(scope_holds_escalation(config_edge, need, &ctx));
+    assert!(scope_holds_need(config_edge, need, &ctx));
 }
 
 /// Copy-on-select exfil fence (the decision): a scoped-edge `mouse` gesture has its
@@ -6636,7 +7288,7 @@ fn resize_cell_and_px_forms_parse() {
 fn cast_verb_frames_asciicast_body() {
     let ctx = test_ctx();
     // Empty recording: header-only body, framed with its true byte length.
-    let reply = cmd_cast(&ctx);
+    let reply = cmd_cast(&ctx.cast);
     let (hdr_line, body) = reply.split_once('\n').expect("OK <n>\\n<body>");
     let n: usize = hdr_line
         .strip_prefix("OK ")
@@ -6656,7 +7308,7 @@ fn cast_verb_frames_asciicast_body() {
         let t = rec.now();
         rec.record_output(t, b"hi there\r\n");
     }
-    let reply2 = cmd_cast(&ctx);
+    let reply2 = cmd_cast(&ctx.cast);
     let (hdr2, body2) = reply2.split_once('\n').unwrap();
     let n2: usize = hdr2.strip_prefix("OK ").unwrap().parse().unwrap();
     assert_eq!(n2, body2.len());
@@ -6677,7 +7329,7 @@ fn cast_verb_frames_asciicast_body() {
 #[test]
 fn mainscreen_verb_forces_the_primary_screen_and_says_whether_it_did() {
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-    let reg = subscribe::new_registry();
+    let reg = Arc::<crate::session_watch::Watchers>::default();
     let host = GuiHost::new(0, &term, None, &reg);
     assert_eq!(cmd_mainscreen(&host, 0), "OK left=0\n");
     // A pager enters the alt screen and dies there: its rows are on the alt
@@ -6706,7 +7358,7 @@ fn mainscreen_verb_forces_the_primary_screen_and_says_whether_it_did() {
 #[test]
 fn blocks_verb_surfaces_command_blocks() {
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-    let reg = subscribe::new_registry();
+    let reg = Arc::<crate::session_watch::Watchers>::default();
     let host = GuiHost::new(0, &term, None, &reg);
     // No shell integration yet -> no blocks.
     assert_eq!(cmd_blocks(&host, 0, ""), "OK 0\n");
@@ -6741,7 +7393,7 @@ fn blocks_verb_surfaces_command_blocks() {
 #[test]
 fn wait_verb_returns_a_prerace_completion_immediately() {
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-    let reg = subscribe::new_registry();
+    let reg = Arc::<crate::session_watch::Watchers>::default();
     let host = GuiHost::new(0, &term, None, &reg);
     // The command completed (exit 1) and the shell is at a fresh idle prompt,
     // including the prompt-end 133;B a real shell emits before typing, which parks
@@ -6904,13 +7556,16 @@ fn read_paths_preserve_combining_and_zwj_clusters() {
     let hit = s.lines().nth(1).expect("a match row");
     let mut parts = hit.split(' ');
     let abs_row: u64 = parts.next().unwrap().parse().expect("abs row");
-    // The absolute row resolves (via abs_row_text, the `line`/`text` space)
-    // to a row whose text contains the faithful cluster.
-    let row_text = match abs_row_text(&term_lock(&term), abs_row) {
-        AbsRow::Text(t) => t,
-        AbsRow::Evicted => panic!("search row {abs_row} unexpectedly evicted"),
-        AbsRow::OutOfRange => panic!("search row {abs_row} out of range"),
-        AbsRow::Unreadable => panic!("search row {abs_row} unreadable"),
+    // The absolute row resolves (via abs_row_text_within, the `line`/`text`
+    // space) to a row whose text contains the faithful cluster.
+    let row = term_lock(&term).abs_row_text_within(abs_row, usize::MAX);
+    let row_text = match row {
+        aterm_core::terminal::AbsRowText::Text(t) => t,
+        aterm_core::terminal::AbsRowText::Evicted => {
+            panic!("search row {abs_row} unexpectedly evicted")
+        }
+        aterm_core::terminal::AbsRowText::OutOfRange => panic!("search row {abs_row} out of range"),
+        aterm_core::terminal::AbsRowText::Unreadable => panic!("search row {abs_row} unreadable"),
     };
     assert!(
         row_text.contains(&family_sel),
@@ -6924,9 +7579,6 @@ fn read_paths_preserve_combining_and_zwj_clusters() {
 /// match is case-insensitive unless `case`.
 #[test]
 fn search_reaches_scrollback_and_parses_its_flags_off_the_tail() {
-    // A match scrolled deep into history assumes the default (large) cap:
-    // serialize against the cap-mutation test that lowers the process-global cap.
-    let _serial = super::search_cap_test_guard();
     let term = Arc::new(Mutex::new(Terminal::new(4, 40)));
     term.lock()
         .unwrap()
@@ -6984,6 +7636,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
     if !seed.is_empty() {
         term.lock().unwrap().process(seed);
     }
+    let observed = crate::session_watch::Observed::default();
     let ctx = Arc::new(crate::SessionCtx {
         sink: Arc::new(SinkWriter::new(master)),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
@@ -7000,22 +7653,21 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
             crate::temporal::TemporalRecorder::new(),
         )),
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
-        turns: Arc::new(std::sync::Mutex::new(
-            crate::turn_ledger::TurnLedger::default(),
-        )),
+        turns: observed.turns,
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-        timeline: Arc::new(std::sync::Mutex::new(
-            crate::session_timeline::SessionTimeline::default(),
-        )),
+        timeline: observed.timeline,
         fabric: std::sync::Arc::default(),
         idem: Default::default(),
         rewrap_gauge: std::sync::Arc::default(),
         human_input: Default::default(),
+        licence: Default::default(),
         launch: Default::default(),
         reset_lane: Default::default(),
         crash_journal: Default::default(),
         typed: Default::default(),
         update_parked: Default::default(),
+        watchers: observed.watchers,
+        frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
     });
@@ -7033,6 +7685,91 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
     }
 }
 
+/// (a) `@.` names the connection's own session: the resolver answers `SelfTok`
+/// without a lookup, even with nothing registered, so the dispatch serves it from
+/// the very tuple a flagless line gets. A bare `@` (an empty body, what `@$W` is
+/// when `$W` is empty) or a blank one names nothing, so it is never self.
+#[test]
+fn at_dot_selector_resolves_self_verbatim() {
+    let empty = session_store::new_store();
+    let sel = Selector::parse(".");
+    assert!(sel.is_self(), "@. names self");
+    assert!(
+        matches!(resolve(&empty, &sel), Resolution::SelfTok),
+        "@. is self whatever the registry holds"
+    );
+    for nothing in ["", " ", "\t"] {
+        assert!(
+            !Selector::parse(nothing).is_self(),
+            "@{nothing:?} names nothing"
+        );
+    }
+    // Negative control: a number, even the self session's own, is a lookup.
+    assert!(matches!(
+        resolve(&empty, &Selector::parse("0")),
+        Resolution::Missing
+    ));
+}
+
+/// (b) A SECOND registered session is readable via `@<local>` and `@<sid>` by an
+/// Owner connection, and returns ITS state (its text), not self's.
+#[test]
+fn owner_reads_a_sibling_via_local_and_sid_selectors() {
+    let store = session_store::new_store();
+    let self_h = registered_session(0, -1, b"I-am-self\r\n");
+    let peer_h = registered_session(7, -1, b"I-am-peer\r\n");
+    store.write().unwrap().register(self_h.clone());
+    store.write().unwrap().register(peer_h.clone());
+    let hosted = |sel: &Selector<'_>| match resolve(&store, sel) {
+        Resolution::Hosted(target) => Some(target),
+        Resolution::SelfTok | Resolution::Missing | Resolution::Ambiguous(_) => None,
+    };
+
+    let self_text = cmd_text(&self_h.term);
+    let peer_text = cmd_text(&peer_h.term);
+    assert_ne!(self_text, peer_text, "the two sessions read distinctly");
+
+    // By process-local id.
+    let by_local = hosted(&Selector::parse("7")).expect("by local");
+    assert!(
+        Arc::ptr_eq(&by_local.0, &peer_h.term),
+        "resolved the peer term"
+    );
+    assert_eq!(
+        cmd_text(&by_local.0),
+        peer_text,
+        "@7 returns the PEER's state"
+    );
+    assert_ne!(cmd_text(&by_local.0), self_text, "@7 is NOT self's state");
+
+    // By stable SessionId.
+    let by_sid = hosted(&Selector::parse(peer_h.sid.as_str())).expect("by sid");
+    assert!(
+        Arc::ptr_eq(&by_sid.0, &peer_h.term),
+        "@s-... resolved the peer term"
+    );
+    assert_eq!(
+        cmd_text(&by_sid.0),
+        peer_text,
+        "@s-... returns the PEER's state"
+    );
+
+    // Owner is authorized to read the sibling (same trust domain).
+    assert!(
+        cross_session_authorized(Scope::Owner, "text", &peer_h.ctx),
+        "Owner may read a sibling",
+    );
+
+    // An unknown selector fails closed (no such session), and so does a
+    // spelling that is no session id.
+    for body in ["999", "s-0ff", "s-nope", "S-7"] {
+        assert!(
+            matches!(resolve(&store, &Selector::parse(body)), Resolution::Missing),
+            "@{body}"
+        );
+    }
+}
+
 /// `who` is the presence readout: no driver or watcher reads
 /// `driving=- watchers=0`; a held turn lease reads `driving=<id>`, and a live
 /// subscriber bumps `watchers`.
@@ -7041,10 +7778,9 @@ fn who_verb_reports_driver_and_watchers() {
     let store = session_store::new_store();
     let root = registered_session(0, -1, b"");
     store.write().unwrap().register(root.clone());
-    let subs = subscribe::new_registry();
 
     // Idle: no driver, no watcher.
-    let out = cmd_who(&store, &subs);
+    let out = cmd_who(&store);
     let line = out.lines().nth(1).expect("one session line");
     assert!(
         line.starts_with("0 ") && line.contains("driving=- watchers=0 turns=0"),
@@ -7065,8 +7801,8 @@ fn who_verb_reports_driver_and_watchers() {
         driver: None,
         typing: true,
     });
-    let _watch = subscribe::SubscriberSet::register(&subs, &[0]);
-    let out = cmd_who(&store, &subs);
+    let _watch = crate::session_watch::Subscription::single(&root.ctx.watchers);
+    let out = cmd_who(&store);
     let line = out.lines().nth(1).expect("one session line");
     assert!(
         line.contains("driving=9 watchers=1"),
@@ -7083,7 +7819,7 @@ fn who_verb_reports_driver_and_watchers() {
         here: false,
         holder_pid: None,
     });
-    let line = cmd_who(&store, &subs)
+    let line = cmd_who(&store)
         .lines()
         .nth(1)
         .expect("one session line")
@@ -7105,7 +7841,7 @@ fn sessions_verb_lists_the_registry() {
     // Registered child first: the listing sorts by local id, not arrival.
     store.write().unwrap().register(child.clone());
     store.write().unwrap().register(root.clone());
-    let two = cmd_sessions(&root.ctx, &store, None);
+    let two = cmd_sessions_store(&store, None);
     let rows: Vec<&str> = two.lines().collect();
     assert_eq!(rows[0], "OK 2", "{two}");
     assert!(
@@ -7214,7 +7950,7 @@ fn meta_questions_is_a_closed_set_stored_case_folded() {
     }
     assert_eq!(h.ctx.meta.lock().unwrap().questions, None);
     assert!(
-        cmd_sessions(&h.ctx, &store, None)
+        cmd_sessions_store(&store, None)
             .lines()
             .nth(1)
             .unwrap()
@@ -7228,7 +7964,7 @@ fn meta_questions_is_a_closed_set_stored_case_folded() {
     let (read1, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
     assert!(read1.contains(" questions=recommended "), "{read1}");
     assert!(
-        cmd_sessions(&h.ctx, &store, None)
+        cmd_sessions_store(&store, None)
             .lines()
             .nth(1)
             .unwrap()
@@ -7255,7 +7991,7 @@ fn meta_questions_is_a_closed_set_stored_case_folded() {
     let (read3, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
     assert!(read3.contains(" questions=- "), "{read3}");
     assert!(
-        cmd_sessions(&h.ctx, &store, None)
+        cmd_sessions_store(&store, None)
             .lines()
             .nth(1)
             .unwrap()
@@ -7317,8 +8053,8 @@ fn meta_autopilot_is_a_closed_set_stored_as_the_modes_word_and_read_last() {
     store.write().unwrap().register(h.clone());
     let (read0, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
     assert!(
-        read0.ends_with(" autopilot=- land_at=-\n"),
-        "always named: {read0}"
+        read0.ends_with(" autopilot=- land_at=- autopilot_by=- autopilot_since=-\n"),
+        "always named, and no setter for a word never set: {read0}"
     );
     for bad in [
         "set autopilot",
@@ -7349,14 +8085,16 @@ fn meta_autopilot_is_a_closed_set_stored_as_the_modes_word_and_read_last() {
         assert_eq!(r, "OK\n", "{typed}");
         let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
         assert!(
-            read.ends_with(&format!(" autopilot={stored} land_at=-\n")),
+            read.contains(&format!(
+                " autopilot={stored} land_at=- autopilot_by=ctl autopilot_since="
+            )),
             "{read}"
         );
     }
     let (_, again) = cmd_meta(&h.term, &store, 0, &h.ctx, "set autopilot wrap");
     assert!(!again, "the owner's word for land is the same value");
     assert!(
-        cmd_sessions(&h.ctx, &store, None)
+        cmd_sessions_store(&store, None)
             .lines()
             .nth(1)
             .unwrap()
@@ -7367,14 +8105,18 @@ fn meta_autopilot_is_a_closed_set_stored_as_the_modes_word_and_read_last() {
     assert_eq!(r, "OK\n");
     assert!(c);
     let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
-    assert!(read.ends_with(" autopilot=- land_at=-\n"), "{read}");
+    // Who handed it back to the default stays beside the unset word.
+    assert!(
+        read.contains(" autopilot=- land_at=- autopilot_by=ctl autopilot_since="),
+        "{read}"
+    );
     // `land_at=` follows it (the Autopilot design, §9.3.5): a timed Cruise's
     // instant as stored, in unix seconds — printed only, no field of its own.
     h.ctx.meta.lock().unwrap().autopilot = Some("cruise".into());
     h.ctx.meta.lock().unwrap().land_at = Some(1_792_249_200_000);
     let (read, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
     assert!(
-        read.ends_with(" autopilot=cruise land_at=1792249200\n"),
+        read.contains(" autopilot=cruise land_at=1792249200 "),
         "{read}"
     );
     let (r, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "set land_at 18:00");
@@ -7564,6 +8306,19 @@ fn timeline_records_lifecycle_in_order() {
 
 // ── P1.3 subscribe wiring ────────────────────────────────────────────────
 
+/// How many of `store`'s sessions a subscription is registered on, the
+/// instance list counting as one more: what a refused subscribe, or a push
+/// loop that returned, must leave at zero.
+fn watched_sessions(store: &Store) -> usize {
+    let g = store.read().unwrap();
+    let sessions = g
+        .snapshot()
+        .iter()
+        .filter(|h| h.ctx.watchers.count() > 0)
+        .count();
+    sessions + usize::from(g.instance_watchers().count() > 0)
+}
+
 /// Build an [`ActiveHandle`] over a registered session's tuple, so `@.` self
 /// subscribe follows the active tab the same way a self read does.
 fn active_for(h: &SessionHandle) -> ActiveHandle {
@@ -7591,7 +8346,8 @@ fn a_refused_handshake_is_recorded_by_kind_through_the_denials_it_is_given() {
     let dial = |first: &str, active: &ActiveHandle| {
         let (mut client, server) = CtlStream::pair().unwrap();
         client.write_all(format!("{first}\n").as_bytes()).unwrap();
-        let mut reader = control_lanes::lane_reader(&server, Vec::new());
+        let mut unread = control_lanes::Unread::default();
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let got = authenticate_connection(&server, &mut reader, TOKEN, active, &denials, deadline);
         if got.is_none() {
@@ -7674,7 +8430,6 @@ fn a_half_closed_subscriber_reads_eof_when_its_stream_ends_though_a_copy_survive
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
     let active = active_for(&h);
-    let registry = subscribe::new_registry();
     let (client, server) = CtlStream::pair().unwrap();
     // Every read below is bounded by a hang detector, not a poll: the
     // end-of-file the test reads last is owed by then (the push loop has
@@ -7687,14 +8442,13 @@ fn a_half_closed_subscriber_reads_eof_when_its_stream_ends_though_a_copy_survive
     let forked_copy = server
         .try_clone()
         .expect("a surviving copy of the server end");
-    let (store_t, active_t, reg_t) = (store.clone(), active.clone(), registry.clone());
+    let (store_t, active_t) = (store.clone(), active.clone());
     let join = std::thread::spawn(move || {
         let mut w = server;
         run_subscribe_socket(
-            "subscribe @. screen",
+            control_request::head("subscribe @. screen"),
             &active_t,
             &store_t,
-            &reg_t,
             Scope::Owner,
             &mut w,
         );
@@ -7726,7 +8480,6 @@ fn a_half_closed_subscriber_reads_eof_when_its_stream_ends_though_a_copy_survive
 #[test]
 fn topic_is_owner_class_and_names_its_session() {
     let store = session_store::new_store();
-    let subscribers = crate::subscribe::new_registry();
     let h = registered_session(0, -1, b"");
     let sid = h.sid.clone();
     let h_ctx = h.ctx.clone();
@@ -7737,10 +8490,9 @@ fn topic_is_owner_class_and_names_its_session() {
     assert_eq!(
         dispatch_topic_verb(
             "ls",
-            Some(&Selector::Sid(sid.clone())),
+            Some(&Selector::parse(sid.as_str())),
             edge,
             &store,
-            &subscribers,
             None
         ),
         "ERR denied\n"
@@ -7750,10 +8502,9 @@ fn topic_is_owner_class_and_names_its_session() {
     let owner_ls = |rest: &str| {
         dispatch_topic_verb(
             rest,
-            Some(&Selector::Sid(sid.clone())),
+            Some(&Selector::parse(sid.as_str())),
             Scope::Owner,
             &store,
-            &subscribers,
             None,
         )
     };
@@ -7792,7 +8543,7 @@ fn topic_is_owner_class_and_names_its_session() {
         .unwrap()
         .since(None)
         .filter(|e| e.kind == "topic")
-        .map(|e| e.payload.clone())
+        .map(|e| e.payload.to_string())
         .collect();
     assert_eq!(
         pushed,
@@ -7823,18 +8574,20 @@ fn topic_is_owner_class_and_names_its_session() {
             owner_ls(bad)
         );
     }
-    // A session nobody hosts.
-    assert_eq!(
-        dispatch_topic_verb(
-            "ls",
-            Some(&Selector::Sid(aterm_session::SessionId::new("s-nobody"))),
-            Scope::Owner,
-            &store,
-            &subscribers,
-            None,
-        ),
-        "ERR no such session\n"
-    );
+    // A session nobody hosts, and a spelling that is no session id.
+    for nobody in [aterm_session::SessionId::generate().as_str(), "s-nobody"] {
+        assert_eq!(
+            dispatch_topic_verb(
+                "ls",
+                Some(&Selector::parse(nobody)),
+                Scope::Owner,
+                &store,
+                None,
+            ),
+            "ERR no such session\n",
+            "{nobody}"
+        );
+    }
 }
 
 /// ONE SESSION OPTS INTO AT MOST `MAX_TOPICS` TOPICS (round eight of the
@@ -7851,7 +8604,6 @@ fn topic_is_owner_class_and_names_its_session() {
 fn a_session_opts_into_at_most_the_topic_bound() {
     use crate::fabric::MAX_TOPICS;
     let store = session_store::new_store();
-    let subscribers = crate::subscribe::new_registry();
     let h = registered_session(0, -1, b"");
     let sid = h.sid.clone();
     let h_ctx = h.ctx.clone();
@@ -7859,10 +8611,9 @@ fn a_session_opts_into_at_most_the_topic_bound() {
     let owner = |rest: &str| {
         dispatch_topic_verb(
             rest,
-            Some(&Selector::Sid(sid.clone())),
+            Some(&Selector::parse(sid.as_str())),
             Scope::Owner,
             &store,
-            &subscribers,
             None,
         )
     };
@@ -7926,15 +8677,20 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
             let h = registered_session(0, -1, b"");
             store.write().unwrap().register(h.clone());
             let active = active_for(&h);
-            let registry = subscribe::new_registry();
             let sid = h.sid.as_str().to_string();
 
             let (client, server) = CtlStream::pair().unwrap();
-            let (store_t, active_t, reg_t) = (store.clone(), active.clone(), registry.clone());
+            let (store_t, active_t) = (store.clone(), active.clone());
             let line = format!("subscribe @. {streams}");
             let join = std::thread::spawn(move || {
                 let mut w = server;
-                run_subscribe_socket(&line, &active_t, &store_t, &reg_t, Scope::Owner, &mut w);
+                run_subscribe_socket(
+                    control_request::head(&line),
+                    &active_t,
+                    &store_t,
+                    Scope::Owner,
+                    &mut w,
+                );
             });
             let acc = read_until(&client, String::new(), |s| s.contains("OK subscribe 1\n"));
             assert!(acc.contains("OK subscribe 1\n"), "ack: {acc:?}");
@@ -7947,7 +8703,7 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
             // loop seeded anything, and this waited for the registration
             // instead.) The registration is a fact by now, not a wait.
             assert_eq!(
-                registry.lock().unwrap().watched_sessions(),
+                watched_sessions(&store),
                 1,
                 "the ack follows the watch's registration"
             );
@@ -7969,9 +8725,7 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
                 );
                 assert!(reply.starts_with("OK"), "deliver: {reply}");
             }
-            // The mail stream rides the loop's liveness tick; a notify only
-            // makes it prompt.
-            registry.lock().unwrap().notify(0);
+            // Each delivery's `inbox` record woke the watch: no tick is waited for.
             // Wait for what this subscription will send, not one line per delivery: a
             // filtered watch drops rows on purpose.
             let acc = read_until(&client, acc, |s| s.matches("MAIL 0 ").count() >= want);
@@ -8037,29 +8791,28 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
 
 /// A push-only client can disappear while every watched terminal is quiet. The
 /// server must discover that from the socket's read side, not from a future
-/// write, or each crash permanently occupies one of the four reserved workers.
-/// Run more sequential crash cycles than the pool size, each client crashing
-/// with every frame read and nothing left to write; every loop must return
-/// and deregister on its own. The request is selectorless (`subscribe screen`),
-/// which names the connection's own session like every selectorless verb.
+/// write, or each crash holds its subscription lane for good and the cap
+/// (`control_subscriptions_cap`) runs out. Run sequential crash cycles, each
+/// client crashing with every frame read and nothing left to write; every
+/// loop must return and deregister on its own. The request is selectorless
+/// (`subscribe screen`), which names the connection's own session like every
+/// selectorless verb.
 #[test]
-fn quiet_subscription_crashes_reap_past_the_worker_pool_size() {
+fn quiet_subscription_crashes_are_each_reaped() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
     let active = active_for(&h);
-    let registry = subscribe::new_registry();
 
-    for cycle in 0..(CONTROL_SUBSCRIPTION_WORKERS + 2) {
+    for cycle in 0..6 {
         let (client, server) = CtlStream::pair().expect("subscription socket pair");
-        let (store_t, active_t, registry_t) = (store.clone(), active.clone(), registry.clone());
+        let (store_t, active_t) = (store.clone(), active.clone());
         let join = std::thread::spawn(move || {
             let mut server = server;
             run_subscribe_socket(
-                "subscribe screen",
+                control_request::head("subscribe screen"),
                 &active_t,
                 &store_t,
-                &registry_t,
                 Scope::Owner,
                 &mut server,
             );
@@ -8094,7 +8847,7 @@ fn quiet_subscription_crashes_reap_past_the_worker_pool_size() {
         // nothing: a loop that ended at its first probe still passed it.)
         let marker = format!("live-{cycle}");
         crate::term_lock(&h.term).process(marker.as_bytes());
-        registry.lock().unwrap().notify(0);
+        h.ctx.watchers.ring_watchers();
         let delta = read_until(&client, String::new(), |text| {
             text.contains(&marker) && screen_frame_read_whole(text)
         });
@@ -8103,130 +8856,138 @@ fn quiet_subscription_crashes_reap_past_the_worker_pool_size() {
             "cycle {cycle} keeps a fully-open quiet peer subscribed: {delta:?}"
         );
 
-        // No output or registry notify follows. Socket EOF is the only fact
-        // capable of releasing this worker.
+        // No output or wake follows. Socket EOF is the only fact capable of
+        // releasing this worker.
         hang_up(client);
         join_after_hang_up(join, &format!("quiet dead subscriber {cycle} to be reaped"));
         assert_eq!(
-            registry.lock().unwrap().watched_sessions(),
+            watched_sessions(&store),
             0,
-            "cycle {cycle} released its registry entry"
+            "cycle {cycle} left its session's watchers"
         );
     }
 }
 
-/// A PUSHED FRAME WAITS ON NO PROBE READ. The push loop asks its peer probe
-/// before every pass, the real wakes included, so a probe read the kernel may
-/// park is a wait in front of every frame: the 1 ms receive-timeout `read` the
-/// probe used to be held every `DELTA` and `EVENT` to every quiet (that is,
-/// live) subscriber about 1.1 ms, the fabric bridge's `EVENT post` on the post
-/// → visible path among them. Counted, never timed: over `FRAMES` pushed
-/// DELTAs the push thread's [`push_probe_tally`] must show a probe read for
-/// every pass (one per pushed frame, plus the one that sees the hang-up —
-/// liveness is still asked every pass) and NONE that could park.
-///
-/// It judges the read the tally is attached to, by that read's own flags; a
-/// wait put BESIDE the read is the kernel's to count, and
-/// [`the_push_probe_enters_the_kernel_once`] counts it.
-///
-/// NEGATIVE CONTROL, run here: the same frames through the probe this
-/// replaced — a clone under a 1 ms receive timeout, then `read` — tally a
-/// parking read for every pass, at least one per pushed frame.
-#[cfg(unix)]
+/// AN EVENTS-ONLY SUBSCRIPTION PARKS WITH NO TIMER, AND ITS CLIENT'S HANG-UP
+/// STILL ENDS IT, end to end through the production socket path. With no
+/// content stream and the peer watch running (unix), a wait the loop entered
+/// before the hang-up has no bound, so only the peer watch's ring wakes it;
+/// a hang-up that lands before the loop's next wait is read off the verdict,
+/// which bounds that wait. The quiet open peer is kept first, at a fact: an
+/// event its session records is pushed to it. Where no peer watch runs, the
+/// loop's timed probe ends it the same way. Which of the two ends it here is
+/// a race, so each link is pinned on its own: the ring by
+/// `peer_watch::tests`, the unbounded wait by
+/// `an_evented_subscription_parks_without_a_timeout`, the
+/// loop's parking on its peer's list by
+/// `an_events_only_loop_parked_without_a_bound_wakes_on_its_peers_ring`, and
+/// the list a watched stream names by
+/// `a_watched_peer_names_its_list_only_while_its_stream_is_watched`.
 #[test]
-fn a_pushed_frame_waits_on_no_probe_read() {
-    use std::os::fd::AsRawFd as _;
-
-    use super::push_probe_tally::{self, Tally};
-
-    const FRAMES: u64 = 6;
+fn an_events_only_subscription_ends_on_its_clients_hang_up() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
     let active = active_for(&h);
-    let registry = subscribe::new_registry();
-
-    // One subscription over a real socket pair, FRAMES DELTAs pushed through
-    // it one at a time (each read whole before the next change), then a
-    // hang-up: the push thread's tally.
-    let push = |replaced_probe: bool| -> Tally {
-        let (client, server) = CtlStream::pair().expect("subscription socket pair");
-        let (store_t, active_t, reg_t) = (store.clone(), active.clone(), registry.clone());
-        let join = std::thread::spawn(move || {
-            let mut server = server;
-            let line = "subscribe @. screen";
-            if replaced_probe {
-                let probe = server.try_clone().expect("probe clone");
-                probe
-                    .set_read_timeout(Some(std::time::Duration::from_millis(1)))
-                    .expect("the replaced probe's 1 ms bound");
-                run_subscribe_with_peer_probe(
-                    line,
-                    &active_t,
-                    &store_t,
-                    &reg_t,
-                    Scope::Owner,
-                    &mut server,
-                    move || {
-                        push_probe_tally::record(probe.as_raw_fd(), 0);
-                        let mut byte = [0_u8; 1];
-                        !matches!(
-                            (&probe).read(&mut byte),
-                            Err(error) if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::WouldBlock
-                                    | std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::Interrupted
-                            )
-                        )
-                    },
-                );
-                aterm_uds::hangup::hang_up(&server);
-            } else {
-                run_subscribe_socket(line, &active_t, &store_t, &reg_t, Scope::Owner, &mut server);
-            }
-            push_probe_tally::take()
-        });
-        let ack = read_until(&client, String::new(), |text| {
-            text.contains("OK subscribe 1\n")
-        });
-        let caught_up = read_until(&client, ack, screen_frame_read_whole);
-        assert!(
-            screen_frame_read_whole(&caught_up),
-            "entered push mode and read the catch-up: {caught_up:?}"
+    let (client, server) = CtlStream::pair().expect("subscription socket pair");
+    let (store_t, active_t) = (store.clone(), active.clone());
+    let join = std::thread::spawn(move || {
+        let mut server = server;
+        run_subscribe_socket(
+            control_request::head("subscribe @. events"),
+            &active_t,
+            &store_t,
+            Scope::Owner,
+            &mut server,
         );
-        for frame in 0..FRAMES {
-            let marker = format!("pf{frame}x");
-            crate::term_lock(&h.term).process(marker.as_bytes());
-            registry.lock().unwrap().notify(0);
-            let delta = read_until(&client, String::new(), |text| {
-                text.contains(&marker) && screen_frame_read_whole(text)
-            });
-            assert!(
-                delta.contains(&marker) && screen_frame_read_whole(&delta),
-                "frame {frame} pushed: {delta:?}"
-            );
-        }
-        hang_up(client);
-        join_after_hang_up(join, "the push loop to end on its subscriber's hang-up")
+    });
+    let ack = read_until(&client, String::new(), |text| {
+        text.contains("OK subscribe 1\n")
+    });
+    assert!(
+        ack.contains("OK subscribe 1\n"),
+        "entered push mode: {ack:?}"
+    );
+
+    crate::term_lock(&h.term).process(b"\x1b]2;kept\x07");
+    h.ctx.watchers.ring_watchers();
+    let title = format!("EVENT {} title kept\n", h.local_id);
+    let pushed = read_until(&client, ack, |text| text.contains(&title));
+    assert!(
+        pushed.contains(&title),
+        "a quiet open peer stays subscribed: {pushed:?}"
+    );
+
+    hang_up(client);
+    join_after_hang_up(
+        join,
+        "the parked events loop to end on its client's hang-up",
+    );
+    assert_eq!(watched_sessions(&store), 0, "deregistered on return");
+}
+
+/// A WATCHED PEER NAMES ITS LIST ONLY WHILE THE WATCH HOLDS ITS STREAM.
+/// While the client is `Watching`, `rings()` is the guard's list, so the push
+/// loop parks on it with no timer; once the verdict settles it is `None`, and
+/// the loop's wait is bounded again. `gone()` is the verdict once the hang-up
+/// rang, and once a stopped watch handed the stream back (`Unwatched`) it is
+/// the stream's own read-side probe: a quiet open client is kept, and its
+/// hang-up, which no watch polls any more, is read off the stream.
+#[cfg(unix)]
+#[test]
+fn a_watched_peer_names_its_list_only_while_its_stream_is_watched() {
+    use crate::peer_watch::{Peer, PeerWatch};
+    use crate::session_watch::Subscription;
+    use crate::subscribe::PeerLiveness as _;
+
+    let watch = PeerWatch::start().expect("the peer watch thread starts");
+    let (left_server, left_client) = CtlStream::pair().expect("pair");
+    let (kept_server, kept_client) = CtlStream::pair().expect("pair");
+    let mut left = WatchedPeer {
+        guard: watch.watch(&left_server).expect("watched"),
+        stream: &left_server,
     };
-
-    let tally = push(false);
+    let mut kept = WatchedPeer {
+        guard: watch.watch(&kept_server).expect("watched"),
+        stream: &kept_server,
+    };
+    let names_its_list = |peer: &WatchedPeer<'_>| {
+        peer.rings()
+            .is_some_and(|wakes| Arc::ptr_eq(wakes, peer.guard.wakes()))
+    };
     assert!(
-        tally.reads > FRAMES,
-        "the peer is still asked before every pass: {tally:?} over {FRAMES} frames"
-    );
-    assert_eq!(
-        tally.parking, 0,
-        "no probe read in front of a pushed frame may park: {tally:?} over {FRAMES} frames"
+        names_its_list(&left) && !left.gone(),
+        "watching: the guard's list, and there"
     );
 
-    let replaced = push(true);
+    let left_rang = Subscription::single(left.guard.wakes());
+    hang_up(left_client);
     assert!(
-        replaced.parking > FRAMES && replaced.parking == replaced.reads,
-        "negative control: the 1 ms receive-timeout probe parks before every pass: \
-         {replaced:?} over {FRAMES} frames"
+        left_rang.wait(aterm_spec::wait::MUST_HAPPEN),
+        "the hang-up rang"
     );
+    assert_eq!(left.guard.peer(), Peer::Gone);
+    assert!(left.rings().is_none(), "gone: no list");
+    assert!(left.gone(), "gone: the verdict");
+
+    assert!(names_its_list(&kept), "the quiet client is still watched");
+    let kept_rang = Subscription::single(kept.guard.wakes());
+    watch.fail_for_test();
+    assert!(
+        kept_rang.wait(aterm_spec::wait::MUST_HAPPEN),
+        "the stop rang"
+    );
+    assert_eq!(kept.guard.peer(), Peer::Unwatched);
+    assert!(
+        kept.rings().is_none(),
+        "unwatched: no list, so the loop keeps a timer"
+    );
+    assert!(
+        !kept.gone(),
+        "a quiet open client, asked of its stream, is kept"
+    );
+    hang_up(kept_client);
+    assert!(kept.gone(), "and its hang-up is read off the stream");
 }
 
 /// A live subscriber keeps its write half open, so the server can tell a quiet
@@ -8238,8 +8999,7 @@ fn a_pushed_frame_waits_on_no_probe_read() {
 /// thread under a hang detector, which names that instead of wedging the
 /// suite. NEGATIVE CONTROL (run by restoring the blocking `read`): the
 /// detector fires. The probe this replaced bounded the same park with a 1 ms
-/// timeout, and paid it before every frame pushed
-/// ([`a_pushed_frame_waits_on_no_probe_read`] counts that).
+/// timeout.
 #[test]
 fn subscription_probe_keeps_quiet_peer_and_rejects_write_half_close() {
     let (client, server) = CtlStream::pair().expect("probe socket pair");
@@ -8271,28 +9031,30 @@ fn subscription_probe_keeps_quiet_peer_and_rejects_write_half_close() {
 
 /// THE PUSH PROBE ENTERS THE KERNEL ONCE: its `recv`, and nothing else.
 ///
-/// [`a_pushed_frame_waits_on_no_probe_read`] judges the probe's one `recv` by
-/// the flags that `recv` was given, so a wait added BESIDE it — a bounded
-/// `poll(fd, POLLIN, 1)` before the peek, a 1 ms receive timeout and a `read`
-/// next to it — passes that tally, and passes the quiet-peer hang detector
-/// above too, because the wait is bounded. Every way a thread waits is a
-/// kernel entry (a `poll`, a timed `read`, `nanosleep`, a contended lock's
-/// `ulock`/`psynch` wait, a Mach semaphore), so this counts the probe's: the
-/// kernel's own per-task count of BSD syscalls plus Mach traps
-/// (`proc_pidinfo(PROC_PIDTASKINFO)`) must grow by exactly one per probe of a
-/// quiet open peer. With the quiet-peer test above — that one `recv` answers
-/// on a socket with nothing to bound a park — no part of the probe can wait
-/// (short of a spin on the clock, which no kernel entry reveals).
+/// A wait added BESIDE the probe's one `recv` — a bounded `poll(fd, POLLIN,
+/// 1)` before the peek, a 1 ms receive timeout and a `read` next to it —
+/// passes the quiet-peer hang detector above, because the wait is bounded.
+/// Every way a thread waits is a kernel entry (a `poll`, a timed `read`,
+/// `nanosleep`, a contended lock's `ulock`/`psynch` wait, a Mach semaphore), so
+/// this counts the probe's: the kernel's own per-task count of BSD syscalls
+/// plus Mach traps (`proc_pidinfo(PROC_PIDTASKINFO)`) must grow by one per
+/// probe of a quiet open peer. With the quiet-peer test above — that one
+/// `recv` answers on a socket with nothing to bound a park — no part of the
+/// probe can wait (short of a spin on the clock, which no kernel entry
+/// reveals).
 ///
 /// The count is per TASK, so the test runs alone in its own process
 /// ([`crate::test_alone`]), where the only other thread is libtest's, parked
-/// on its result channel for the whole count. It counts, never times: a
-/// scheduler under load preempts the loop but adds no syscall to it, and the
-/// count's own reads are measured and taken off, not assumed.
+/// on its result channel. It counts once and never times: a scheduler under
+/// load preempts the loop but adds no syscall to it. What else lands in the
+/// count — the count's own reads, an entry of that other thread — is a few
+/// entries that do not grow with `PROBES`, while a wait in the probe adds one
+/// per probe, so the count is held under `PROBES + PROBES / 2`: one entry per
+/// probe passes, two cannot.
 ///
 /// NEGATIVE CONTROL, run here: the same count over the probe with a 1 ms
-/// readiness `poll` in front of it grows by two per probe — the wait the
-/// tally cannot see.
+/// readiness `poll` in front of it reaches two per probe — the wait the hang
+/// detector cannot see.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_push_probe_enters_the_kernel_once() {
@@ -8344,16 +9106,11 @@ fn the_push_probe_enters_the_kernel_once() {
         let count = |n: i32| u64::try_from(n).expect("a count is never negative");
         count(info.syscalls_unix) + count(info.syscalls_mach)
     };
-    // What two reads back to back cost: the second's own entry.
-    let reads = {
-        let before = entries();
-        entries() - before
-    };
 
     let (_client, server) = CtlStream::pair().expect("probe socket pair");
-    // The kernel entries `PROBES` probes made, the count's own reads taken off.
+    // The kernel entries over `PROBES` probes, the count's own read included.
     let over_probes = |probe: &dyn Fn() -> bool| -> u64 {
-        // The first probe pays its first touches (its thread-local tally) once.
+        // The first probe pays its first touches once.
         assert!(!probe(), "a fully-open quiet peer is there");
         let before = entries();
         let mut gone = 0_u64;
@@ -8365,13 +9122,14 @@ fn the_push_probe_enters_the_kernel_once() {
             gone, 0,
             "a fully-open quiet peer stays there for every probe"
         );
-        after - before - reads
+        after - before
     };
 
-    assert_eq!(
-        over_probes(&|| subscription_peer_gone(&server)),
-        PROBES,
-        "the push probe enters the kernel once, for its recv, over {PROBES} probes"
+    let probed = over_probes(&|| subscription_peer_gone(&server));
+    assert!(
+        (PROBES..PROBES + PROBES / 2).contains(&probed),
+        "the push probe enters the kernel once, for its recv: {probed} entries over {PROBES} \
+         probes"
     );
 
     let polled = over_probes(&|| {
@@ -8385,118 +9143,10 @@ fn the_push_probe_enters_the_kernel_once() {
         let _ = unsafe { libc::poll(&raw mut ready, 1, 1) };
         subscription_peer_gone(&server)
     });
-    assert_eq!(
-        polled,
-        2 * PROBES,
+    assert!(
+        polled >= 2 * PROBES,
         "negative control: a readiness wait in front of the recv is a second kernel entry \
-         per probe, over {PROBES} probes"
-    );
-}
-
-/// A FLOOD OF WAKES IS PACED; A WAKE WITH ROOM IS NOT. The push probe's 1 ms
-/// sleep was also the loop's only coalescing window, and without it a session
-/// printing flat out woke one pass — a terminal lock, a rendered screen, a
-/// frame — per output burst, thousands a second ([`crate::subscribe`]'s
-/// `Pacer` has the measurements). The pass budget puts the window back for a
-/// flood only: [`crate::subscribe::PASS_BURST`] woken passes go at once, and
-/// past them a pass waits for its [`crate::subscribe::PASS_INTERVAL`].
-///
-/// Counted, never timed: the pacer's clock is frozen on the push thread, so
-/// how fast this machine runs decides nothing. Frozen, `FRAMES` DELTAs pushed
-/// back to back (each read whole before the next change) spend the burst and
-/// then pause before every further pass; with the clock stepped one interval
-/// per wake, the same frames never pause — a keystroke's echo or a lone
-/// `EVENT` is not held for a flood that is not happening. Before the budget,
-/// the frozen run paused before none.
-#[cfg(unix)]
-#[test]
-fn a_flood_of_wakes_is_paced_and_a_wake_with_room_is_not() {
-    use crate::subscribe::pace_clock::tally::{self, Tally};
-    use crate::subscribe::{PASS_BURST, PASS_INTERVAL};
-
-    const FRAMES: u64 = 14;
-    let burst = u64::from(PASS_BURST);
-    assert!(
-        FRAMES > burst + 2,
-        "the run spends the burst and paces past it"
-    );
-    let store = session_store::new_store();
-    let h = registered_session(0, -1, b"");
-    store.write().unwrap().register(h.clone());
-    let active = active_for(&h);
-    let registry = subscribe::new_registry();
-
-    // One subscription over a real socket pair with the push thread's pacer
-    // clock frozen and moved on by `step` at every wake (the probe is the hook
-    // the loop calls on its thread after a wake, before its pass), FRAMES
-    // DELTAs pushed one at a time, then a hang-up: the push thread's tally.
-    let push = |step: std::time::Duration| -> Tally {
-        let (client, server) = CtlStream::pair().expect("subscription socket pair");
-        let (store_t, active_t, reg_t) = (store.clone(), active.clone(), registry.clone());
-        let join = std::thread::spawn(move || {
-            tally::freeze();
-            let mut server = server;
-            let probe = server.try_clone().expect("probe clone");
-            run_subscribe_with_peer_probe(
-                "subscribe @. screen",
-                &active_t,
-                &store_t,
-                &reg_t,
-                Scope::Owner,
-                &mut server,
-                move || {
-                    tally::step(step);
-                    subscription_peer_gone(&probe)
-                },
-            );
-            aterm_uds::hangup::hang_up(&server);
-            tally::take()
-        });
-        let ack = read_until(&client, String::new(), |text| {
-            text.contains("OK subscribe 1\n")
-        });
-        let caught_up = read_until(&client, ack, screen_frame_read_whole);
-        assert!(
-            screen_frame_read_whole(&caught_up),
-            "entered push mode and read the catch-up: {caught_up:?}"
-        );
-        for frame in 0..FRAMES {
-            // A line each, so no marker wraps across two rows.
-            let marker = format!("pace{frame}x");
-            crate::term_lock(&h.term).process(format!("{marker}\r\n").as_bytes());
-            registry.lock().unwrap().notify(0);
-            let delta = read_until(&client, String::new(), |text| {
-                text.contains(&marker) && screen_frame_read_whole(text)
-            });
-            assert!(
-                delta.contains(&marker) && screen_frame_read_whole(&delta),
-                "frame {frame} pushed: {delta:?}"
-            );
-        }
-        hang_up(client);
-        join_after_hang_up(join, "the push loop to end on its subscriber's hang-up")
-    };
-
-    let flood = push(std::time::Duration::ZERO);
-    assert!(
-        flood.admitted >= FRAMES,
-        "every pushed frame was a woken pass: {flood:?} over {FRAMES} frames"
-    );
-    assert_eq!(
-        flood.paused,
-        flood.admitted - burst,
-        "past the burst of {burst}, every woken pass of a flood waits for its interval: \
-         {flood:?} over {FRAMES} frames"
-    );
-
-    let room = push(PASS_INTERVAL);
-    assert!(
-        room.admitted >= FRAMES,
-        "every pushed frame was a woken pass: {room:?} over {FRAMES} frames"
-    );
-    assert_eq!(
-        room.paused, 0,
-        "a wake an interval after the last pass is pushed at once: {room:?} over {FRAMES} frames"
+         per probe: {polled} entries over {PROBES} probes"
     );
 }
 
@@ -8559,14 +9209,13 @@ fn subscribe_refusals_register_nothing() {
             store.write().unwrap().register(h.clone());
         }
         let active = active_for(&handles[0]);
-        let registry = subscribe::new_registry();
         let scope = if owner {
             Scope::Owner
         } else {
             Scope::Edge(EdgeToken::generate())
         };
         let mut out: Vec<u8> = Vec::new();
-        run_subscribe(line, &active, &store, &registry, scope, &mut out);
+        run_subscribe(line, &active, &store, scope, &mut out);
         let s = String::from_utf8(out).unwrap();
         match want {
             Want::Exact(reply) => assert_eq!(s, reply, "{label}"),
@@ -8576,13 +9225,29 @@ fn subscribe_refusals_register_nothing() {
             ),
         }
         assert_eq!(
-            registry.lock().unwrap().watched_sessions(),
+            watched_sessions(&store),
             0,
             "{label}: a refused subscribe registers nothing"
         );
     }
     // The comma form of the space-separated request IS the grammar — it parses.
     assert!(subscribe::Requested::parse("screen,cursor").is_some());
+}
+
+/// `@<sid> subscribe …` is answered through dispatch on a connection that stays
+/// open, so its usage is one `ERR` line: a second line would be read as the next
+/// request's reply. The serve loop's refusal, which closes the connection, adds
+/// the streams after that same line.
+#[test]
+fn the_dispatched_subscribe_usage_is_one_line() {
+    assert!(SUBSCRIBE_USAGE.starts_with("ERR usage: subscribe "));
+    assert_eq!(SUBSCRIBE_USAGE.matches('\n').count(), 1);
+    assert!(SUBSCRIBE_USAGE.ends_with('\n'));
+    let closing = String::from_utf8(subscribe_usage_bytes()).expect("utf-8");
+    let rest = closing
+        .strip_prefix(SUBSCRIBE_USAGE)
+        .expect("the closing refusal starts with the one-line usage");
+    assert!(rest.starts_with("  <streams>: "), "{rest:?}");
 }
 
 /// The `sessions` stream is instance-wide (it diffs the whole live roster), so a
@@ -8595,7 +9260,6 @@ fn sessions_stream_is_denied_to_a_scoped_edge_that_may_read_its_target() {
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
     let active = active_for(&h);
-    let registry = subscribe::new_registry();
 
     // A ReadScreen edge granted ON this very session: the per-target gate passes.
     let tok = {
@@ -8613,7 +9277,6 @@ fn sessions_stream_is_denied_to_a_scoped_edge_that_may_read_its_target() {
         "subscribe @. screen,sessions",
         &active,
         &store,
-        &registry,
         scope,
         &mut out,
     );
@@ -8622,11 +9285,7 @@ fn sessions_stream_is_denied_to_a_scoped_edge_that_may_read_its_target() {
         "ERR denied\n",
         "the instance-wide sessions stream needs Owner, not a per-target grant",
     );
-    assert_eq!(
-        registry.lock().unwrap().watched_sessions(),
-        0,
-        "no registration on denial"
-    );
+    assert_eq!(watched_sessions(&store), 0, "no registration on denial");
 }
 
 /// A self (`@.`) subscribe re-verifies the edge against the session active now: the
@@ -8640,7 +9299,6 @@ fn subscribe_self_edge_denied_after_active_session_swings() {
     let b = registered_session(2, -1, b""); // a DIFFERENT session, where the edge was granted
     store.write().unwrap().register(a.clone());
     let active = active_for(&a);
-    let registry = subscribe::new_registry();
 
     // A ReadScreen edge GRANTED on B's table (op matches subscribe) — but no grant
     // against the now-active A.
@@ -8657,24 +9315,13 @@ fn subscribe_self_edge_denied_after_active_session_swings() {
 
     // A SELF subscribe while A is frontmost is DENIED — no partial push, no entry.
     let mut out: Vec<u8> = Vec::new();
-    run_subscribe(
-        "subscribe @. screen",
-        &active,
-        &store,
-        &registry,
-        scope,
-        &mut out,
-    );
+    run_subscribe("subscribe @. screen", &active, &store, scope, &mut out);
     assert_eq!(
         String::from_utf8_lossy(&out),
         "ERR denied\n",
         "B's edge must NOT subscribe to the swung-to active session A",
     );
-    assert_eq!(
-        registry.lock().unwrap().watched_sessions(),
-        0,
-        "no registration on denial"
-    );
+    assert_eq!(watched_sessions(&store), 0, "no registration on denial");
 }
 
 /// MULTIPLEX through per-target edges: one scoped `Edge` holding a `ReadScreen`
@@ -8689,7 +9336,6 @@ fn subscribe_multiplex_two_sids_tags_each() {
     store.write().unwrap().register(a.clone());
     store.write().unwrap().register(b.clone());
     let active = active_for(&a);
-    let registry = subscribe::new_registry();
     let token = EdgeToken::generate();
     for h in [&a, &b] {
         assert!(h.ctx.edges.lock().unwrap().insert(
@@ -8702,15 +9348,14 @@ fn subscribe_multiplex_two_sids_tags_each() {
     }
 
     let (client, server) = CtlStream::pair().unwrap();
-    let (store_t, active_t, reg_t) = (store.clone(), active.clone(), registry.clone());
+    let (store_t, active_t) = (store.clone(), active.clone());
     let join = std::thread::spawn(move || {
         let mut w = server;
         // `@0` is self (active), `@2` a sibling; the edge is granted on both.
         run_subscribe_socket(
-            "subscribe @0,@2 screen",
+            control_request::head("subscribe @0,@2 screen"),
             &active_t,
             &store_t,
-            &reg_t,
             Scope::Edge(token),
             &mut w,
         );
@@ -8737,8 +9382,8 @@ fn subscribe_multiplex_two_sids_tags_each() {
 
     crate::term_lock(&a.term).process(b"AAA");
     crate::term_lock(&b.term).process(b"BBB");
-    registry.lock().unwrap().notify(0);
-    registry.lock().unwrap().notify(2);
+    a.ctx.watchers.ring_watchers();
+    b.ctx.watchers.ring_watchers();
     // Accumulate until BOTH sids' deltas (with their text) have shown up.
     let seen = read_until(&client, ack, |s| s.contains("AAA") && s.contains("BBB"));
     assert!(
@@ -8757,6 +9402,49 @@ fn subscribe_multiplex_two_sids_tags_each() {
     );
 }
 
+/// The subscribe handler serves the line its lane, relay and push flip read:
+/// every spelling the request grammar classes a `subscribe` (a leading
+/// separator, a tab or a run of separators between its words) is acked, never
+/// flipped to push and then answered with usage. Served as production serves
+/// it, from the head of the request its lane parsed.
+///
+/// NEGATIVE CONTROL: the handler that split the line at its first space itself
+/// (`split_once(' ')` had to give `("subscribe", …)`) answered usage to the
+/// first two spellings, which the push flip had already taken.
+#[test]
+fn subscribe_reads_its_line_by_the_request_grammar() {
+    for line in [
+        "subscribe\t@. screen",
+        "  subscribe @. screen",
+        "subscribe  @.\t screen",
+    ] {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let active = active_for(&h);
+        let request = Request::parse(line.to_string());
+        let head = request.head();
+        assert!(
+            head.verb == "subscribe" && head.selector.is_none(),
+            "{line:?}: the push flip takes it"
+        );
+        let (client, server) = CtlStream::pair().unwrap();
+        let (store_t, active_t) = (store.clone(), active.clone());
+        let join = std::thread::spawn(move || {
+            let mut w = server;
+            run_subscribe_socket(request.head(), &active_t, &store_t, Scope::Owner, &mut w);
+        });
+        let want = format!("OK subscribe 1\nsub 0 {}\n", h.sid.as_str());
+        let ack = read_until(&client, String::new(), |s| s.contains(&want));
+        assert!(
+            ack.starts_with(&want),
+            "{line:?} subscribes its own session: {ack:?}"
+        );
+        hang_up(client);
+        join_after_hang_up(join, "the push loop to end on its client's hang-up");
+    }
+}
+
 // ── wf3: --json read mode + edges/family/feed-bin/ready verbs ─────────────
 
 /// A `--json` body is one well-formed JSON value, as the workspace's JSON
@@ -8767,31 +9455,39 @@ fn assert_well_formed_json(s: &str) {
     }
 }
 
-/// `--json` handling, one labelled row per verb / tail.
+/// The `--json` gate ([`json_ask`]), read off the table's `json` column.
 ///
-/// * The `--json`/`json` flag is parsed off `rest` and stripped, so the verb's own
-///   positional parse runs unchanged (e.g. `blocks 1 --json`), even mid-tail.
-/// * An explicit `--json`/`json` on a verb with no structured form (`offscreen`,
-///   `modes`, …) is an ERR, never the text reply with the flag dropped; a
-///   payload-bearing verb, for which `json` is data, falls through untouched.
+/// * On a JSON-emitting row the `--json`/`json` flag is taken off `rest`, so the
+///   emitter's own positional parse runs unchanged (`blocks 1 --json`), even
+///   mid-tail.
+/// * An explicit flag on a row with no JSON form (`offscreen`, `modes`, …) is an
+///   ERR, never the text reply with the flag dropped.
+/// * A payload verb's `json` is data: the gate never looks at it, so it reaches
+///   the handler verbatim. Negative control: the same token on a JSON-emitting
+///   verb is the flag.
 #[test]
-fn json_flag_is_stripped_and_unsupported_verbs_refuse_it() {
-    for (rest, want) in [
-        ("", (false, "")),
-        ("1", (false, "1")),
-        ("--json", (true, "")),
-        ("1 --json", (true, "1")),
-        ("json 1", (true, "1")),
-        // The dispatch sees the flag on an offscreen tail.
-        ("since=4 --json screen=1", (true, "since=4 screen=1")),
+fn json_gate_strips_the_flag_refuses_it_and_never_scans_a_payload_verb() {
+    // The router hands each class handler the request's form: unknown verbs are
+    // refused before any handler asks.
+    let json_ask = |verb: &str, rest: &str| {
+        let form = aterm_types::control_verbs::spec_for(verb, rest).expect("a table verb");
+        json_ask(&form, verb, rest)
+    };
+    for (verb, rest, body) in [
+        ("blocks", "1 --json", "1"),
+        ("blocks", "json 1", "1"),
+        ("text", "--json", ""),
+        ("log", "since=4 --json tier=content", "since=4 tier=content"),
+        ("metrics", "percentiles json", "percentiles"),
+        ("privacy", "--json", ""),
     ] {
         assert_eq!(
-            take_json_flag(rest),
-            (want.0, want.1.to_string()),
-            "take_json_flag({rest:?})"
+            json_ask(verb, rest),
+            JsonAsk::Emit(body.to_string()),
+            "{verb} {rest:?}"
         );
     }
-    for v in [
+    for verb in [
         "offscreen",
         "modes",
         "selection",
@@ -8802,19 +9498,31 @@ fn json_flag_is_stripped_and_unsupported_verbs_refuse_it() {
         "wait",
     ] {
         assert!(
-            json_unsupported(v).is_some(),
-            "{v} must refuse an explicit json request"
+            matches!(
+                json_ask(verb, "since=4 --json"),
+                JsonAsk::Refuse(refusal) if refusal.starts_with("ERR ")
+            ),
+            "{verb} refuses an explicit json request"
         );
+        assert_eq!(json_ask(verb, "since=4"), JsonAsk::No, "{verb} bare");
     }
-    // Payload-bearing verbs keep the token as data (`send --json` writes it to the
-    // PTY; `search json` searches for it). JSON-capable verbs answer before the
-    // fallback, so the allowlist must not shadow them.
-    for v in [
-        "send", "paste", "feed", "turn", "search", "await", "text", "screen", "cursor", "dims",
-        "metrics", "blocks", "edges", "grants",
+    for (verb, rest) in [
+        ("search", "json"),
+        ("meta", "set title json"),
+        ("send", "--json"),
+        ("paste", "json"),
+        ("feed", "--json"),
+        ("turn", "echo json"),
+        ("await", "match json"),
+        ("inbox", "get json"),
     ] {
-        assert_eq!(json_unsupported(v), None, "{v} must fall through");
+        assert_eq!(json_ask(verb, rest), JsonAsk::No, "{verb} {rest:?}");
     }
+    assert_eq!(
+        json_ask("text", "json"),
+        JsonAsk::Emit(String::new()),
+        "the token the payload verbs keep is the flag on a JSON-emitting verb"
+    );
 }
 
 /// `cursor --json` / `dims --json` / `blocks --json` round-trip the same data as
@@ -8822,7 +9530,7 @@ fn json_flag_is_stripped_and_unsupported_verbs_refuse_it() {
 #[test]
 fn cursor_dims_blocks_json_schemas() {
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
-    let reg = subscribe::new_registry();
+    let reg = Arc::<crate::session_watch::Watchers>::default();
     let host = GuiHost::new(0, &term, None, &reg);
     // cursor: row/col/visible/style.
     let cj = cmd_cursor_json(&term);
@@ -8832,7 +9540,7 @@ fn cursor_dims_blocks_json_schemas() {
         cbody.contains("\"row\":0") && cbody.contains("\"style\":\"blinking_block\""),
         "{cbody}"
     );
-    let tj = cmd_text_json(&term);
+    let tj = cmd_text_json_opt(&term, TextArgs::default());
     assert!(tj.contains("\"cursor\":{\"row\":0,\"col\":0,"), "{tj}");
 
     // dims: the compatible leading grid facts plus the live
@@ -9386,78 +10094,77 @@ fn raise_target_resolves_registered_sids() {
     }
 }
 
-/// `feed-bin` framing: the request-line parse extracts the optional selector and
-/// declared length, rejects malformed or oversize lines, and recognizes the verb with
-/// or without an `@<sel>` prefix.
+/// `feed-bin` framing: the request line's parse yields the optional selector, and
+/// its row's counted body the declared length; malformed or oversize lines are
+/// told apart, and the verb is recognized with or without an `@<sel>` prefix.
 #[test]
 fn feed_bin_framing_parse() {
+    let read = |line: &str| {
+        let request = Request::parse(line.to_string());
+        let selector = request.head().selector.map(|s| format!("{s:?}"));
+        let frame = request.frame().map(|frame| format!("{frame:?}"));
+        (selector, frame, request.body_len())
+    };
+    let ok = |n: usize| Some(format!("{:?}", FeedBinFrame::Ok(n, None)));
+    let malformed = Some(format!("{:?}", FeedBinFrame::Malformed));
     // Bare form.
-    assert!(matches!(
-        parse_feed_bin("feed-bin 4", "feed-bin"),
-        FeedBinFrame::Ok(None, 4, None)
-    ));
-    assert!(binary_frame_verb("feed-bin 4").is_some());
+    assert_eq!(read("feed-bin 4"), (None, ok(4), 4));
     // Cross-session form.
-    assert!(matches!(
-        parse_feed_bin("@7 feed-bin 10", "feed-bin"),
-        FeedBinFrame::Ok(Some(Selector::Local(7)), 10, None)
-    ));
-    assert!(binary_frame_verb("@7 feed-bin 10").is_some());
-    // Not feed-bin.
-    assert!(binary_frame_verb("feed 0a").is_none());
-    assert!(binary_frame_verb("@7 feed 0a").is_none());
+    assert_eq!(
+        read("@7 feed-bin 10"),
+        (Some(format!("{:?}", Selector::Local(7))), ok(10), 10)
+    );
+    // Not a counted frame: no header, no body.
+    assert_eq!(read("feed 0a").1, None);
+    assert_eq!(read("@7 feed 0a").1, None);
     // Malformed (missing / non-numeric length) -> Malformed: no payload was
     // announced, so the caller keeps the connection.
-    assert!(matches!(
-        parse_feed_bin("feed-bin", "feed-bin"),
-        FeedBinFrame::Malformed
-    ));
-    assert!(matches!(
-        parse_feed_bin("feed-bin xx", "feed-bin"),
-        FeedBinFrame::Malformed
-    ));
+    assert_eq!(read("feed-bin"), (None, malformed.clone(), 0));
+    assert_eq!(read("feed-bin xx"), (None, malformed.clone(), 0));
     // A valid but oversize length is TooLarge, not Malformed: the client pipelined
     // N bytes we refuse to read, so the caller must close rather than desync.
-    assert!(matches!(
-        parse_feed_bin(&format!("feed-bin {}", MAX_FEED_BIN + 1), "feed-bin"),
-        FeedBinFrame::TooLarge
-    ));
+    assert_eq!(
+        read(&format!("feed-bin {}", MAX_FEED_BIN + 1)).1,
+        Some(format!("{:?}", FeedBinFrame::TooLarge))
+    );
     // Exactly the cap is allowed.
-    assert!(
-        matches!(parse_feed_bin(&format!("feed-bin {MAX_FEED_BIN}"), "feed-bin"), FeedBinFrame::Ok(None, n, None) if n == MAX_FEED_BIN)
+    assert_eq!(
+        read(&format!("feed-bin {MAX_FEED_BIN}")).1,
+        ok(MAX_FEED_BIN)
     );
     // Trailing tokens after the length are Malformed: a canonical frame is exactly
-    // `[@sel] feed-bin <n>`, and reading `feed-bin 1 junk` as a 1-byte frame would
-    // consume a byte of the next pipelined line. Trailing whitespace is fine.
-    assert!(matches!(
-        parse_feed_bin("feed-bin 1 junk", "feed-bin"),
-        FeedBinFrame::Malformed
-    ));
-    assert!(matches!(
-        parse_feed_bin("@7 feed-bin 10 extra", "feed-bin"),
-        FeedBinFrame::Malformed
-    ));
-    assert!(matches!(
-        parse_feed_bin("feed-bin 4   ", "feed-bin"),
-        FeedBinFrame::Ok(None, 4, None)
-    ));
+    // `[@sel] feed-bin <n> [id=<key>]`, and reading `feed-bin 1 junk` as a 1-byte
+    // frame would consume a byte of the next pipelined line. Trailing whitespace is
+    // fine; only `feed-bin` takes the key.
+    assert_eq!(read("feed-bin 1 junk").1, malformed);
+    assert_eq!(read("@7 feed-bin 10 extra").1, malformed);
+    assert_eq!(read("feed-bin 4   ").1, ok(4));
+    assert_eq!(
+        read("feed-bin 4 id=e:p:1").1,
+        Some(format!("{:?}", FeedBinFrame::Ok(4, Some("e:p:1"))))
+    );
+    assert_eq!(read("paste-bin 4 id=e:p:1").1, malformed);
 }
 
-/// A bounded binary header is the authoritative input boundary: the licence fence
-/// completes before the server can block on a slow payload, and rejected or
-/// unauthorized headers never mutate cursor state.
+/// A bounded binary header is the authoritative input boundary: the target's
+/// licence fence is recorded before the server can block on a slow payload, and
+/// rejected or unauthorized headers never record one.
 #[test]
 #[cfg(unix)]
 fn binary_input_header_fences_before_payload_and_only_after_authorization() {
+    use crate::licence_fence::LicenceFence;
+
     struct FenceCheckedReader {
         inner: std::io::Cursor<Vec<u8>>,
-        fenced: std::rc::Rc<std::cell::Cell<bool>>,
+        licence: Arc<LicenceFence>,
+        before: crate::licence_fence::LicenceEpoch,
     }
 
     impl std::io::Read for FenceCheckedReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            assert!(
-                self.fenced.get(),
+            assert_ne!(
+                self.licence.read(),
+                self.before,
                 "payload read began before the authorized target fence"
             );
             self.inner.read(buf)
@@ -9478,64 +10185,46 @@ fn binary_input_header_fences_before_payload_and_only_after_authorization() {
     let (front, front_rx) = pipe_session(1);
     store.write().unwrap().register(front.clone());
     let active = active_for_handle(&front);
-    let fenced = std::rc::Rc::new(std::cell::Cell::new(false));
+    let licence = front.ctx.licence.clone();
     let mut reader = FenceCheckedReader {
         inner: std::io::Cursor::new(b"ABCafter\n".to_vec()),
-        fenced: fenced.clone(),
+        licence: licence.clone(),
+        before: licence.read(),
     };
     let mut dispatch = |_event, _session| Ok(InputOutcome::Ok);
-    let mut cancel = {
-        let fenced = fenced.clone();
-        move |session| {
-            assert_eq!(session, 1);
-            fenced.set(true);
-            "OK\n".to_string()
-        }
-    };
     let mut out = Vec::new();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         "@1 feed-bin 3",
-        "feed-bin",
         &mut reader,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: Scope::Owner,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut out,
     ));
-    assert!(fenced.get());
     assert_eq!(String::from_utf8_lossy(&out), "OK 3 bytes\n");
     assert_eq!(read_request_line(&mut reader).as_deref(), Some("after"));
     assert!(drain_pipe(&front_rx).is_empty());
 
     // A rejected frame still consumes its bounded payload, but an unauthorized
     // header cannot use the licence fence as a UI side channel.
-    let cancel_count = std::cell::Cell::new(0usize);
-    let mut cancel = |_session| {
-        cancel_count.set(cancel_count.get() + 1);
-        "OK\n".to_string()
-    };
+    let before = licence.read();
     let mut reader = std::io::Cursor::new(b"XYZafter\n".to_vec());
     let mut denied = Vec::new();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         "@1 feed-bin 3",
-        "feed-bin",
         &mut reader,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: Scope::Edge(EdgeToken::generate()),
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut denied,
     ));
-    assert_eq!(cancel_count.get(), 0, "denied header must not touch UI");
+    assert_eq!(licence.read(), before, "denied header must not touch UI");
     assert_eq!(String::from_utf8_lossy(&denied), "ERR denied\n");
     assert_eq!(read_request_line(&mut reader).as_deref(), Some("after"));
 
@@ -9544,55 +10233,48 @@ fn binary_input_header_fences_before_payload_and_only_after_authorization() {
     // unknown target stays side-effect free.
     let mut empty = std::io::Cursor::new(Vec::<u8>::new());
     let mut malformed = Vec::new();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         "@1 feed-bin nope",
-        "feed-bin",
         &mut empty,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: Scope::Owner,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut malformed,
     ));
-    assert_eq!(cancel_count.get(), 1);
+    let after_malformed = licence.read();
+    assert_ne!(after_malformed, before);
     let mut oversize = Vec::new();
-    assert!(!run_feed_bin_routed(
+    assert!(!feed_bin_routed(
         &format!("@1 feed-bin {}", MAX_FEED_BIN + 1),
-        "feed-bin",
         &mut empty,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: Scope::Owner,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut oversize,
     ));
-    assert_eq!(cancel_count.get(), 2);
+    let after_oversize = licence.read();
+    assert_ne!(after_oversize, after_malformed);
     let mut missing = Vec::new();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         "@999999 feed-bin nope",
-        "feed-bin",
         &mut empty,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: Scope::Owner,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut missing,
     ));
     assert_eq!(
-        cancel_count.get(),
-        2,
+        licence.read(),
+        after_oversize,
         "unknown target cannot fence a window"
     );
 }
@@ -9633,19 +10315,18 @@ fn a_typing_verb_credits_its_caller_only_when_it_wrote() {
                 }
                 Ok(crate::app_input::receipt_outcome(receipt))
             };
-        let mut cancel = |_session| "OK\n".to_string();
+        let request = Request::parse(format!("@1 feed-bin {}", payload.len()));
+        let frame = request.frame().expect("a counted frame's header");
         assert!(run_feed_bin_routed_observed(
-            &format!("@1 feed-bin {}", payload.len()),
-            "feed-bin",
+            &request,
+            frame,
             &mut std::io::Cursor::new(payload.to_vec()),
             FeedBinRoute {
                 active: &active,
                 store: &store,
                 scope,
-                subscribers: None,
             },
             &mut dispatch,
-            &mut cancel,
             &mut out,
         ));
         String::from_utf8_lossy(&out).into_owned()
@@ -9754,13 +10435,102 @@ fn a_typing_verb_credits_its_caller_only_when_it_wrote() {
     );
 }
 
+/// THE EDIT HOLD REACHES THE WIRE (amacs design §6.7): a binary frame
+/// (`feed-bin`, `paste-bin`) meets the hold at the input admission (`admit`),
+/// as a text verb does. While an edit ticket holds the target, both frames answer
+/// `ERR busy editing ticket=<t> view=<v>`, nothing reaches the input
+/// dispatch or the PTY and nobody is credited, and the payload is consumed
+/// so the stream stays framed. NEGATIVE CONTROL: the same frame types once
+/// the ticket's hold clears.
+#[test]
+#[cfg(unix)]
+fn a_binary_frame_into_a_session_an_edit_holds_is_refused_busy_editing() {
+    use amacs::protocol::edit::Ticket;
+
+    use crate::control_edit::hold;
+
+    // A session no other test mints: the hold map is process-wide.
+    const SID: u64 = 1 << 47;
+    let store = session_store::new_store();
+    let (front, front_rx) = crate::control_input_ack::testing::owned_handle(SID);
+    store.write().unwrap().register(front.clone());
+    let active = active_for_handle(&front);
+    let dispatched = std::cell::Cell::new(0);
+    let frame = |verb: &str| {
+        let mut out = Vec::new();
+        let mut dispatch =
+            |event,
+             _target: Option<u64>,
+             _completion: Option<crate::control_input_ack::InputCompletion>| {
+                dispatched.set(dispatched.get() + 1);
+                let receipt = crate::app_input::tracked_egress(
+                    &front.term,
+                    &front.ctx.modes,
+                    &front.ctx.sink,
+                    &front.ctx.output_echo,
+                    &event,
+                    crate::input::EgressMode::Backpressured,
+                );
+                Ok(crate::app_input::receipt_outcome(receipt))
+            };
+        let request = Request::parse(format!("@{SID} {verb} 1"));
+        let header = request.frame().expect("a counted frame's header");
+        let mut payload = std::io::Cursor::new(b"X".to_vec());
+        assert!(run_feed_bin_routed_observed(
+            &request,
+            header,
+            &mut payload,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut out,
+        ));
+        assert_eq!(payload.position(), 1, "{verb}: the payload is consumed");
+        String::from_utf8_lossy(&out).into_owned()
+    };
+
+    hold::set(
+        SID,
+        hold::Hold {
+            ticket: Ticket(91),
+            view: 4,
+        },
+    );
+    for verb in ["feed-bin", "paste-bin"] {
+        assert_eq!(frame(verb), "ERR busy editing ticket=91 view=4\n", "{verb}");
+    }
+    assert_eq!(dispatched.get(), 0, "nothing reached the input dispatch");
+    assert!(drain_pipe(&front_rx).is_empty(), "nothing reached the PTY");
+    assert!(front.ctx.typed.last().is_none(), "nobody is credited");
+
+    hold::clear(SID, Ticket(91));
+    assert_eq!(
+        frame("feed-bin"),
+        "OK 1 bytes\n",
+        "typed once the hold clears"
+    );
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(drain_pipe(&front_rx), b"X");
+}
+
 /// The header fence is an early liveness boundary, not an authority cache: target
 /// and capability scope are sampled again after the payload, so a stalled `@.`
-/// frame follows the new active session and a revoked edge can no longer write. A
-/// failed early fence closes before touching payload bytes.
+/// frame follows the new active session and a revoked edge can no longer write.
+/// Each session's licence counts the fences it took.
 #[test]
 #[cfg(unix)]
 fn binary_input_revalidates_target_and_authority_after_payload() {
+    // A licence that took `n` fences, none keeping the hand: what a frame's
+    // fences leave on a session that took no other.
+    fn fenced(n: usize) -> crate::licence_fence::LicenceEpoch {
+        let licence = crate::licence_fence::LicenceFence::default();
+        (0..n).for_each(|_| licence.fence(false));
+        licence.read()
+    }
+
     struct OnFirstRead<F> {
         inner: std::io::Cursor<Vec<u8>>,
         action: Option<F>,
@@ -9805,32 +10575,27 @@ fn binary_input_revalidates_target_and_authority_after_payload() {
             });
         }),
     };
-    let canceled = std::cell::RefCell::new(Vec::new());
-    let mut cancel = |session| {
-        canceled.borrow_mut().push(session);
-        "OK\n".to_string()
-    };
     let routed = std::cell::RefCell::new(None);
     let mut dispatch = |event, session| {
         *routed.borrow_mut() = Some((event, session));
         Ok(InputOutcome::Ok)
     };
     let mut out = Vec::new();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         "@. feed-bin 1",
-        "feed-bin",
         &mut reader,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: Scope::Owner,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut out,
     ));
-    assert_eq!(&*canceled.borrow(), &[1, 2]);
+    // The header fenced the session active then, the effect boundary the one
+    // active now.
+    assert_eq!(first.ctx.licence.read(), fenced(1));
+    assert_eq!(second.ctx.licence.read(), fenced(1));
     assert!(matches!(
         &*routed.borrow(),
         Some((InputEvent::KeySequence(bytes), Some(2))) if bytes == b"X"
@@ -9859,31 +10624,24 @@ fn binary_input_revalidates_target_and_authority_after_payload() {
             );
         }),
     };
-    let mut cancel_count = 0usize;
-    let mut cancel = |_session| {
-        cancel_count += 1;
-        "OK\n".to_string()
-    };
     let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
         panic!("revoked payload reached the App input seam")
     };
     let mut denied = Vec::new();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         "@3 feed-bin 1",
-        "feed-bin",
         &mut reader,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut denied,
     ));
     assert_eq!(
-        cancel_count, 1,
+        guarded.ctx.licence.read(),
+        fenced(1),
         "only the header fence ran before revocation"
     );
     assert_eq!(String::from_utf8_lossy(&denied), "ERR denied\n");
@@ -9917,58 +10675,174 @@ fn binary_input_revalidates_target_and_authority_after_payload() {
             );
         }),
     };
-    let canceled_late = std::cell::RefCell::new(Vec::new());
-    let mut cancel = |session| {
-        canceled_late.borrow_mut().push(session);
-        "OK\n".to_string()
-    };
     let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
         panic!("background explicit feed unexpectedly entered App input")
     };
     let mut accepted = Vec::new();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         "@4 feed-bin 1",
-        "feed-bin",
         &mut reader,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: late_scope,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut cancel,
         &mut accepted,
     ));
-    assert_eq!(&*canceled_late.borrow(), &[4]);
+    assert_eq!(granted_late.ctx.licence.read(), fenced(1));
     assert_eq!(String::from_utf8_lossy(&accepted), "OK 1 bytes\n");
     assert_eq!(drain_pipe(&granted_late_rx), b"W");
+}
 
-    let mut reader = OnFirstRead {
-        inner: std::io::Cursor::new(b"Z".to_vec()),
-        action: Some(|| panic!("payload read despite a failed header fence")),
+/// A refused frame still consumes its body, whichever admission gate refuses it:
+/// a held session's frame answers the halt although its lease would refuse it
+/// too, the lease once the hold lifts, and the frame writes once neither stands.
+/// Each time the next line is read as a request, never as payload, and a refused
+/// body reaches no PTY. (The lease before the unread-input gate is
+/// `feed_bin_gets_the_s4_ctrl_c_exemption`'s.)
+#[test]
+#[cfg(unix)]
+fn a_refused_frame_still_consumes_its_body() {
+    let store = session_store::new_store();
+    let (front, front_rx) = pipe_session(1);
+    let (target, target_rx) = pipe_session(2);
+    store.write().unwrap().register(front.clone());
+    store.write().unwrap().register(target.clone());
+    let active = active_for_handle(&front);
+    let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
+        panic!("a frame into a background session never takes the seam")
     };
-    let mut cancel = |_session| "ERR licence fence unavailable\n".to_string();
-    let mut dispatch = |_event, _session| Ok(InputOutcome::Ok);
-    let mut failed = Vec::new();
-    assert!(!run_feed_bin_routed(
-        "@2 feed-bin 1",
-        "feed-bin",
-        &mut reader,
-        FeedBinRoute {
-            active: &active,
-            store: &store,
-            scope: Scope::Owner,
-            subscribers: None,
-        },
-        &mut dispatch,
-        &mut cancel,
-        &mut failed,
+    let mut frame = |want: &str| {
+        let mut reader = std::io::Cursor::new(b"ABCafter\n".to_vec());
+        let mut out = Vec::new();
+        assert!(feed_bin_routed(
+            "@2 feed-bin 3",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut out,
+        ));
+        assert_eq!(String::from_utf8_lossy(&out), want);
+        assert_eq!(read_request_line(&mut reader).as_deref(), Some("after"));
+    };
+    assert!(crate::fabric::apply_hold_for_test(
+        &target.ctx,
+        Some(crate::fabric::Hold {
+            reason: "demo".to_string(),
+            origin: "local".to_string(),
+        })
     ));
-    assert_eq!(
-        String::from_utf8_lossy(&failed),
-        "ERR licence fence unavailable\n"
+    *target.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+        id: 7,
+        driver: None,
+        typing: false,
+    });
+    frame("ERR halted reason=demo origin=local\n");
+    assert!(crate::fabric::apply_hold_for_test(&target.ctx, None));
+    frame("ERR busy turn=7\n");
+    assert!(
+        drain_pipe(&target_rx).is_empty(),
+        "no refused body was written"
     );
+    *target.ctx.turn_lease.lock().unwrap() = None;
+    frame("OK 3 bytes\n");
+    assert_eq!(drain_pipe(&target_rx), b"ABC");
+    assert!(drain_pipe(&front_rx).is_empty());
+}
+
+/// `feed-bin` meets the unread-input gate with its own body, so it gets the S4
+/// exemption `feed 03` has: a lone `^C` frame into a cbreak program (ISIG on) whose
+/// stall is published is a signal, not input behind the unread `q`, and is written
+/// (the line discipline flushes the `q`). Before, the frame asked the gate with no
+/// body and was refused. Negative control: a frame of one byte that is not `^C` is
+/// refused `ERR busy input-unread`, its body consumed and nothing written behind the
+/// `q`.
+///
+/// A frame meets the admission in the text verbs' order: with a turn's lease on
+/// the same stalled session, the `x` frame answers the lease (`ERR busy turn=`),
+/// which comes before the unread-input gate. The frame path's own order (halt,
+/// gate, lease, floor) answered `ERR busy input-unread` here.
+#[test]
+#[cfg(target_os = "macos")]
+fn feed_bin_gets_the_s4_ctrl_c_exemption() {
+    use crate::input_stall::tests::{publish_stall, raw_pty_pair, slave_read_all};
+    let (master, slave) = raw_pty_pair();
+    // SAFETY: all-zeros is a valid termios, overwritten by `tcgetattr`.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `slave` is this test's live pty slave; `t` is an out-param.
+    assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0);
+    t.c_lflag |= libc::ISIG;
+    // SAFETY: `slave` is live; `t` is derived from its own termios.
+    assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) }, 0);
+    let target = registered_session(9, master, b"");
+    target.ctx.sink.note_master_nonblocking(true);
+    target
+        .ctx
+        .sink
+        .write_frame_nonparking(b"q")
+        .expect("the person's key");
+    publish_stall(&target.ctx);
+    let store = session_store::new_store();
+    let (front, _front_rx) = pipe_session(1);
+    store.write().unwrap().register(front.clone());
+    store.write().unwrap().register(target.clone());
+    let active = active_for_handle(&front);
+    let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
+        panic!("a frame into a background session never takes the seam")
+    };
+    let mut frame = |body: &[u8]| {
+        let mut input = body.to_vec();
+        input.extend_from_slice(b"after\n");
+        let mut reader = std::io::Cursor::new(input);
+        let mut out = Vec::new();
+        assert!(feed_bin_routed(
+            "@9 feed-bin 1",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut out,
+        ));
+        assert_eq!(read_request_line(&mut reader).as_deref(), Some("after"));
+        String::from_utf8_lossy(&out).into_owned()
+    };
+
+    let refused = frame(b"x");
+    assert!(refused.starts_with("ERR busy input-unread"), "{refused}");
+    *target.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+        id: 7,
+        driver: None,
+        typing: false,
+    });
+    assert_eq!(
+        frame(b"x"),
+        "ERR busy turn=7\n",
+        "the lease before the gate"
+    );
+    *target.ctx.turn_lease.lock().unwrap() = None;
+    assert_eq!(slave_read_all(slave), b"q", "nothing queued behind the `q`");
+    target
+        .ctx
+        .sink
+        .write_frame_nonparking(b"q")
+        .expect("the person's key again");
+    publish_stall(&target.ctx);
+    assert_eq!(frame(b"\x03"), "OK 1 bytes\n");
+    assert_eq!(
+        target.ctx.sink.input_backlog().map(|b| b.queued),
+        Some(0),
+        "the ^C was a signal and flushed the `q`: nothing was read behind it"
+    );
+    aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
 }
 
 /// `feed-bin <n>\n<bytes>` / `paste-bin <n>\n<bytes>` end to end, one row per
@@ -9991,7 +10865,6 @@ fn binary_frames_land_exact_bytes_and_keep_the_stream_framed() {
     struct Row {
         label: &'static str,
         input: Vec<u8>,
-        verb: &'static str,
         line: Option<&'static str>,
         frame: Frame,
         keep: bool,
@@ -10008,7 +10881,6 @@ fn binary_frames_land_exact_bytes_and_keep_the_stream_framed() {
         Row {
             label: "feed-bin is raw and framed",
             input: b"feed-bin 3\n\x00\x01\x02next-line\n".to_vec(),
-            verb: "feed-bin",
             line: Some("feed-bin 3"),
             frame: Frame::Any,
             keep: true,
@@ -10021,7 +10893,6 @@ fn binary_frames_land_exact_bytes_and_keep_the_stream_framed() {
         Row {
             label: "paste-bin maps LF to CR",
             input: b"paste-bin 5\nab\ncdafter\n".to_vec(),
-            verb: "paste-bin",
             line: Some("paste-bin 5"),
             frame: Frame::Is("paste-bin"),
             keep: true,
@@ -10035,7 +10906,6 @@ fn binary_frames_land_exact_bytes_and_keep_the_stream_framed() {
         Row {
             label: "an over-cap length closes the connection",
             input: format!("feed-bin {}\nsubscribe all\n", MAX_FEED_BIN + 1).into_bytes(),
-            verb: "feed-bin",
             line: None,
             frame: Frame::Any,
             keep: false,
@@ -10048,12 +10918,24 @@ fn binary_frames_land_exact_bytes_and_keep_the_stream_framed() {
         Row {
             label: "a bad length consumes no payload",
             input: b"feed-bin notanumber\nfollowing\n".to_vec(),
-            verb: "feed-bin",
             line: None,
             frame: Frame::Unchecked,
             keep: true,
             reply: Reply::Prefix("ERR usage"),
             pty: None,
+            next: Some("following"),
+        },
+        // A frame's header takes a length and, on `feed-bin`, a key; `unread=ok` is
+        // the text verbs' leading option, so here it is a malformed header and no
+        // payload is read.
+        Row {
+            label: "a frame takes no unread=ok",
+            input: b"feed-bin 3 unread=ok\nfollowing\n".to_vec(),
+            line: None,
+            frame: Frame::Unchecked,
+            keep: true,
+            reply: Reply::Prefix("ERR usage"),
+            pty: Some(b""),
             next: Some("following"),
         },
     ];
@@ -10068,22 +10950,16 @@ fn binary_frames_land_exact_bytes_and_keep_the_stream_framed() {
         if let Some(want) = row.line {
             assert_eq!(line, want, "{}", row.label);
         }
+        let request = Request::parse(line.clone());
         match row.frame {
-            Frame::Any => assert!(binary_frame_verb(&line).is_some(), "{}", row.label),
+            Frame::Any => assert!(request.frame().is_some(), "{}", row.label),
             Frame::Is(verb) => {
-                assert_eq!(binary_frame_verb(&line), Some(verb), "{}", row.label)
+                assert!(request.frame().is_some(), "{}", row.label);
+                assert_eq!(request.head().verb, verb, "{}", row.label);
             }
             Frame::Unchecked => {}
         }
-        let keep = run_feed_bin(
-            &line,
-            row.verb,
-            &mut reader,
-            &active,
-            &store,
-            Scope::Owner,
-            &mut out,
-        );
+        let keep = run_feed_bin(&line, &mut reader, &active, &store, Scope::Owner, &mut out);
         assert_eq!(keep, row.keep, "{}: connection kept?", row.label);
         let reply = String::from_utf8_lossy(&out);
         match row.reply {
@@ -10116,19 +10992,15 @@ fn explicit_front_paste_bin_routes_to_the_targeted_app_input_seam() {
         routed = Some((event, session));
         Ok(InputOutcome::Ok)
     };
-    let mut clear_license = |_session| "OK\n".to_string();
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         &line,
-        "paste-bin",
         &mut reader,
         FeedBinRoute {
             active: &active,
             store: &store,
             scope: Scope::Owner,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut clear_license,
         &mut reply,
     ));
     assert_eq!(String::from_utf8_lossy(&reply), "OK 7 bytes\n");
@@ -10158,18 +11030,15 @@ fn explicit_front_paste_bin_routes_to_the_targeted_app_input_seam() {
         routed = Some(event);
         Ok(InputOutcome::Ok)
     };
-    assert!(run_feed_bin_routed(
+    assert!(feed_bin_routed(
         &line,
-        "paste-bin",
         &mut reader,
         FeedBinRoute {
             active: &no_terminal,
             store: &session_store::new_store(),
             scope: Scope::Owner,
-            subscribers: None,
         },
         &mut dispatch,
-        &mut clear_license,
         &mut reply,
     ));
     assert_eq!(String::from_utf8_lossy(&reply), "OK 6 bytes\n");
@@ -10211,19 +11080,15 @@ fn background_binary_frame_reports_a_dead_peer_as_write_failed() {
         let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
             panic!("background {verb} unexpectedly entered App input")
         };
-        let mut clear_license = |_session| "OK\n".to_string();
-        assert!(run_feed_bin_routed(
+        assert!(feed_bin_routed(
             &line,
-            verb,
             &mut reader,
             FeedBinRoute {
                 active: &active,
                 store: &store,
                 scope: Scope::Owner,
-                subscribers: None,
             },
             &mut dispatch,
-            &mut clear_license,
             &mut reply,
         ));
         assert_eq!(
@@ -10256,24 +11121,19 @@ fn cross_session_input_reports_a_dead_peer_as_write_failed() {
     drop(rx);
     kill_peer_in_kernel(h.master, "a cross-session send into a dead peer");
     assert_eq!(
-        cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
+        background(
+            "send",
+            &h.term,
+            &h.ctx,
+            InputEvent::KeySequence(send_bytes("ls"))
+        ),
         Ok(InputOutcome::WriteFailed),
         "raw send into a dead peer is a failed write"
     );
     assert_eq!(
-        cross_input(&h.term, &h.ctx, parse_key("enter"), "ERR\n"),
-        "ERR write failed\n",
+        background("key", &h.term, &h.ctx, parse_key("enter").unwrap()),
+        Ok(InputOutcome::WriteFailed),
         "a key into a dead peer is a failed write, not OK"
-    );
-    // A malformed line is still the usage error, decided before any write.
-    assert_eq!(
-        cross_input(
-            &h.term,
-            &h.ctx,
-            parse_key("notakey"),
-            control_input::KEY_USAGE
-        ),
-        control_input::KEY_USAGE
     );
 }
 
@@ -10293,13 +11153,18 @@ fn queued_background_input_into_a_dead_peer_is_a_failed_write() {
     let _wait = super::queued_input_waits_for_test(aterm_spec::wait::MUST_HAPPEN);
     let (live, live_rx) = pipe_session(75);
     assert_eq!(
-        cross_raw_input(&live.term, &live.ctx, send_bytes("ls")),
+        background(
+            "send",
+            &live.term,
+            &live.ctx,
+            InputEvent::KeySequence(send_bytes("ls"))
+        ),
         Ok(InputOutcome::Ok),
         "CONTROL: a send into a live reader"
     );
     assert_eq!(
-        cross_input(&live.term, &live.ctx, parse_key("enter"), "ERR\n"),
-        "OK\n"
+        background("key", &live.term, &live.ctx, parse_key("enter").unwrap()),
+        Ok(InputOutcome::Ok)
     );
     assert_eq!(
         background_input(
@@ -10327,13 +11192,18 @@ fn queued_background_input_into_a_dead_peer_is_a_failed_write() {
     drop(dead_rx);
     kill_peer_in_kernel(dead.master, "a queued background write into a dead peer");
     assert_eq!(
-        cross_raw_input(&dead.term, &dead.ctx, send_bytes("ls")),
+        background(
+            "send",
+            &dead.term,
+            &dead.ctx,
+            InputEvent::KeySequence(send_bytes("ls"))
+        ),
         Ok(InputOutcome::WriteFailed),
         "a queued send into a dead peer"
     );
     assert_eq!(
-        cross_input(&dead.term, &dead.ctx, parse_key("enter"), "ERR\n"),
-        "ERR write failed\n",
+        background("key", &dead.term, &dead.ctx, parse_key("enter").unwrap()),
+        Ok(InputOutcome::WriteFailed),
         "a queued key into a dead peer"
     );
     assert_eq!(
@@ -10416,12 +11286,12 @@ fn paste_while_the_peer_closes_mid_write() -> MidWriteClose {
         );
         drop(reader);
     });
-    let reply = cross_input(
+    let reply = control_input::input_reply_to_str(background(
+        "paste",
         &handle.term,
         &handle.ctx,
-        Some(InputEvent::Paste("newer".into(), PasteFraming::AtDrain)),
-        "ERR malformed\n",
-    );
+        InputEvent::Paste("newer".into(), PasteFraming::AtDrain),
+    ));
     closer.join().expect("peer closer");
     // SAFETY: a one-byte write from a static buffer to this test's own live
     // (non-blocking) write end.
@@ -10438,7 +11308,7 @@ fn paste_while_the_peer_closes_mid_write() -> MidWriteClose {
 
 /// A cross-session paste reply is a kernel-delivery receipt, not just acceptance
 /// into the process-local spill: closing the peer while the paste waits behind an
-/// older spilled frame, `cross_input` keeps the sink's sticky failure and returns
+/// older spilled frame, the background route keeps the sink's sticky failure and returns
 /// an error once the queued bytes are discarded.
 ///
 /// Asserted only over runs whose peer the probe saw dead; a run a stranger voided
@@ -10522,7 +11392,9 @@ fn background_input_into_a_program_that_reads_nothing_never_parks_the_lane() {
     let ctx = Arc::clone(&handle.ctx);
 
     let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
-    let sent = answered_without_parking("send", move || cross_raw_input(&t, &c, send_bytes("ls")));
+    let sent = answered_without_parking("send", move || {
+        background("send", &t, &c, InputEvent::KeySequence(send_bytes("ls")))
+    });
     assert_eq!(sent, Ok(InputOutcome::Ok), "accepted for delivery");
     assert!(
         ctx.sink.spilled_bytes() >= 2,
@@ -10530,7 +11402,7 @@ fn background_input_into_a_program_that_reads_nothing_never_parks_the_lane() {
     );
     let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
     let key = answered_without_parking("key", move || {
-        cross_input(&t, &c, parse_key("enter"), "ERR\n")
+        control_input::input_reply_to_str(background("key", &t, &c, parse_key("enter").unwrap()))
     });
     assert_eq!(key, "OK\n");
 
@@ -10575,7 +11447,7 @@ fn background_input_into_a_program_that_reads_nothing_never_parks_the_lane() {
     let spilled = ctx.sink.spilled_bytes();
     let (t, c) = (Arc::clone(&term), Arc::clone(&ctx));
     let refused = answered_without_parking("key at the cap", move || {
-        cross_input(&t, &c, parse_key("enter"), "ERR\n")
+        control_input::input_reply_to_str(background("key", &t, &c, parse_key("enter").unwrap()))
     });
     assert_eq!(refused, INPUT_QUEUE_FULL);
     assert!(
@@ -10689,7 +11561,7 @@ fn a_wheel_cut_short_at_the_input_cap_is_not_answered_nothing_written() {
 /// was `ERR write failed` in front (in doubt, so a driver could not retry) and
 /// busy behind (retryable as is). Driven through the real App input seam
 /// ([`crate::App::input`]) on the headless App's session 0, and the background
-/// lane ([`cross_input`]) on the same session.
+/// route ([`InputRoute::Background`]) on the same session.
 #[test]
 #[cfg(unix)]
 fn a_full_input_queue_answers_busy_in_the_front_tab_as_in_a_background_one() {
@@ -10732,7 +11604,7 @@ fn a_full_input_queue_answers_busy_in_the_front_tab_as_in_a_background_one() {
         INPUT_QUEUE_FULL
     );
     assert_eq!(
-        cross_input(&term, &ctx, parse_key("enter"), "ERR\n"),
+        control_input::input_reply_to_str(background("key", &term, &ctx, key())),
         INPUT_QUEUE_FULL,
         "the background lane's answer for the same refusal"
     );
@@ -10754,21 +11626,21 @@ fn stamp_input_seq_appends_baseline_to_ok_input_replies() {
     let seq = crate::term_lock(&term).content_seq();
     // `send`/`feed` OK replies gain ` seq=<n>` before the newline.
     assert_eq!(
-        stamp_input_seq("send", "OK\n".to_string(), &term),
+        stamp_input_seq(input_of("send"), "OK\n".to_string(), &term),
         format!("OK seq={seq}\n")
     );
     assert_eq!(
-        stamp_input_seq("feed", "OK 3 bytes\n".to_string(), &term),
+        stamp_input_seq(input_of("feed"), "OK 3 bytes\n".to_string(), &term),
         format!("OK 3 bytes seq={seq}\n")
     );
     // A non-input verb is NOT stamped.
     assert_eq!(
-        stamp_input_seq("text", "OK\n".to_string(), &term),
+        stamp_input_seq(input_of("text"), "OK\n".to_string(), &term),
         "OK\n".to_string()
     );
     // An ERR reply is NOT stamped (no baseline to correlate).
     assert_eq!(
-        stamp_input_seq("send", "ERR no window\n".to_string(), &term),
+        stamp_input_seq(input_of("send"), "ERR no window\n".to_string(), &term),
         "ERR no window\n".to_string()
     );
 }
@@ -10801,15 +11673,7 @@ fn feed_bin_self_edge_denied_after_active_session_swings() {
     let mut reader = BufReader::new(std::io::Cursor::new(input));
     let mut out: Vec<u8> = Vec::new();
     let line = read_request_line(&mut reader).unwrap();
-    let keep = run_feed_bin(
-        &line,
-        "feed-bin",
-        &mut reader,
-        &active,
-        &store,
-        edge_b,
-        &mut out,
-    );
+    let keep = run_feed_bin(&line, &mut reader, &active, &store, edge_b, &mut out);
 
     assert!(keep, "denied frame keeps the connection");
     assert_eq!(
@@ -10883,6 +11747,40 @@ fn guarded_line_deadline_rearms_once_per_buffer_refill() {
     );
 }
 
+/// AN EXIT ALONE ENDS A PARKED `await`: the shell's `set_state(Exited)` records
+/// the transition, the record rings the session's watchers, and the await
+/// reads `Exited` and answers. The exit path sends no wake of its own, so this
+/// is the only road. The wait is a hang detector: the await asks ten minutes.
+#[test]
+fn exit_wakes_a_parked_await() {
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let waiter = {
+        let (store, h) = (store.clone(), h.clone());
+        std::thread::spawn(move || {
+            cmd_await(
+                &h.term,
+                &store,
+                0,
+                &h.ctx,
+                "match never-on-this-screen-xyzzy timeout=600000",
+            )
+        })
+    };
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the await parks", || {
+        (h.ctx.watchers.count() == 1).then_some(())
+    });
+    store
+        .write()
+        .unwrap()
+        .set_state(0, session_store::SessionState::Exited);
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the await answers", || {
+        waiter.is_finished().then_some(())
+    });
+    assert_eq!(waiter.join().unwrap(), "ERR exited\n");
+}
+
 /// `ready` reports the target's readiness: a fresh OSC-133 prompt is `prompt`,
 /// an in-flight command times out (not ready), a completed command is `prompt`
 /// again, and a session marked `Exited` in the registry fails closed.
@@ -10896,7 +11794,7 @@ fn ready_verb_reports_prompt_executing_and_exit() {
     // A fresh prompt (OSC 133 A) -> PromptOnly -> ready immediately.
     term.lock().unwrap().process(b"\x1b]133;A\x07$ ");
     assert_eq!(
-        cmd_ready(term, &store, 0, &h.ctx, "2000", &subscribe::new_registry()),
+        cmd_ready(term, &store, 0, &h.ctx, "2000"),
         "OK ready prompt\n",
         "fresh prompt is ready"
     );
@@ -10906,7 +11804,7 @@ fn ready_verb_reports_prompt_executing_and_exit() {
         .unwrap()
         .process(b"\x1b]133;B\x07sleep\n\x1b]133;C\x07");
     assert_eq!(
-        cmd_ready(term, &store, 0, &h.ctx, "0", &subscribe::new_registry()),
+        cmd_ready(term, &store, 0, &h.ctx, "0"),
         "OK timeout\n",
         "executing is not ready"
     );
@@ -10914,7 +11812,7 @@ fn ready_verb_reports_prompt_executing_and_exit() {
     // The command completes -> Complete -> ready again (prompt-end).
     term.lock().unwrap().process(b"\x1b]133;D;0\x07");
     assert_eq!(
-        cmd_ready(term, &store, 0, &h.ctx, "2000", &subscribe::new_registry()),
+        cmd_ready(term, &store, 0, &h.ctx, "2000"),
         "OK ready prompt\n",
         "completed is ready"
     );
@@ -10925,7 +11823,7 @@ fn ready_verb_reports_prompt_executing_and_exit() {
         .unwrap()
         .set_state(0, session_store::SessionState::Exited);
     assert_eq!(
-        cmd_ready(term, &store, 0, &h.ctx, "2000", &subscribe::new_registry()),
+        cmd_ready(term, &store, 0, &h.ctx, "2000"),
         "ERR exited\n",
         "exited fails closed"
     );
@@ -10945,13 +11843,12 @@ fn the_wait_family_refuses_an_ms_that_is_not_one() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let registry = subscribe::new_registry();
     // A fresh prompt: `ready` and `await gone` both answer at once when asked well.
     crate::term_lock(&h.term).process(b"\x1b]133;A\x07$ ");
-    let ready = |tail: &str| cmd_ready(&h.term, &store, 0, &h.ctx, tail, &registry);
-    let await_ = |tail: &str| cmd_await(&h.term, &store, 0, &h.ctx, tail, &registry);
+    let ready = |tail: &str| cmd_ready(&h.term, &store, 0, &h.ctx, tail);
+    let await_ = |tail: &str| cmd_await(&h.term, &store, 0, &h.ctx, tail);
     let dark = || Ok((0.0, Instant::now()));
-    let momentum = |tail: &str| cmd_await_momentum(&h.term, &store, 0, tail, &registry, &dark);
+    let momentum = |tail: &str| cmd_await_momentum(&h.term, &store, 0, &h.ctx, tail, &dark);
 
     for tail in ["2s", "timeout=2s", "1.5", "-1", "5 6", "timeout="] {
         assert!(
@@ -11000,14 +11897,7 @@ fn ready_verb_settles_on_idle_without_shell_integration() {
     store.write().unwrap().register(h.clone());
     // No OSC-133 at all: the settle heuristic fires (content_seq holds steady).
     assert_eq!(
-        cmd_ready(
-            &h.term,
-            &store,
-            0,
-            &h.ctx,
-            "2000",
-            &subscribe::new_registry()
-        ),
+        cmd_ready(&h.term, &store, 0, &h.ctx, "2000",),
         "OK ready idle\n",
         "idle plain shell"
     );
@@ -11045,7 +11935,6 @@ fn turn_types_submits_verified_and_returns_settled_screen() {
         &store,
         0,
         "idle=50 timeout=60000 x=1 hello peer",
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -11114,7 +12003,6 @@ fn turn_if_rows_lets_the_rows_outside_move_and_refuses_a_change_inside() {
         press: &press,
         ..TurnIo::paste_only()
     };
-    let registry = subscribe::new_registry();
     // Row 0 a spinner, rows 1-3 an input box, the cursor in it.
     term.lock()
         .unwrap()
@@ -11148,7 +12036,6 @@ fn turn_if_rows_lets_the_rows_outside_move_and_refuses_a_change_inside() {
         &store,
         0,
         &format!("if-gen={judged} idle=50 timeout=5000 hello peer"),
-        &registry,
         &h.ctx,
         &io,
     );
@@ -11160,7 +12047,6 @@ fn turn_if_rows_lets_the_rows_outside_move_and_refuses_a_change_inside() {
         &store,
         0,
         &format!("if-rows={fence} idle=50 timeout=60000 hello peer"),
-        &registry,
         &h.ctx,
         &io,
     );
@@ -11184,7 +12070,6 @@ fn turn_if_rows_lets_the_rows_outside_move_and_refuses_a_change_inside() {
         &store,
         0,
         &format!("if-rows={now} idle=50 timeout=5000 hello again"),
-        &registry,
         &h.ctx,
         &io,
     );
@@ -11203,7 +12088,6 @@ fn turn_if_rows_lets_the_rows_outside_move_and_refuses_a_change_inside() {
         &store,
         0,
         &format!("if-rows=900-901:{:016x} idle=50 hello", now.hash),
-        &registry,
         &h.ctx,
         &io,
     );
@@ -11215,7 +12099,6 @@ fn turn_if_rows_lets_the_rows_outside_move_and_refuses_a_change_inside() {
             &store,
             0,
             &format!("{bad} idle=50 hello"),
-            &registry,
             &h.ctx,
             &io,
         );
@@ -11319,7 +12202,6 @@ fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
             &store,
             0,
             line,
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -11398,7 +12280,6 @@ fn the_typed_turn_s_only_signature_is_its_even_cadence() {
         &store,
         0,
         &format!("typed=1 cadence={cadence_ms} submit=none idle=20 timeout=60000 Hi, a-1!\\n"),
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -11500,7 +12381,6 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
             &store,
             0,
             &format!("typed=1 cadence=1 submit=none idle=20 timeout=60000 {args} {text}"),
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -11605,7 +12485,6 @@ fn typed_turn_with(
         &store,
         0,
         &format!("{fence}typed=1 idle=20 {opts} hello world"),
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -11900,7 +12779,6 @@ fn composer_turn_on(
             &store,
             0,
             &format!("if-rows={fence} typed=1 cadence=1 idle=20 {opts} {text}"),
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -12367,8 +13245,8 @@ fn await_momentum_returns_when_the_ribbon_exhales_and_never_polls() {
         &h.term,
         &store,
         0,
+        &h.ctx,
         "momentum 0.30 timeout 60000",
-        &subscribe::new_registry(),
         &read,
     );
     let waited = t0.elapsed();
@@ -12398,8 +13276,8 @@ fn await_momentum_returns_when_the_ribbon_exhales_and_never_polls() {
         &h.term,
         &store,
         0,
+        &h.ctx,
         "momentum 0.30 timeout=60000",
-        &subscribe::new_registry(),
         &read,
     );
     let waited = t0.elapsed();
@@ -12418,8 +13296,8 @@ fn await_momentum_returns_when_the_ribbon_exhales_and_never_polls() {
         &h.term,
         &store,
         0,
+        &h.ctx,
         "momentum 0.30 timeout 120",
-        &subscribe::new_registry(),
         &read,
     );
     assert_eq!(out, "OK timeout\n");
@@ -12455,7 +13333,6 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
         &store,
         0,
         "yield=0.30 submit=none idle=20 timeout=60000 after you",
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -12485,7 +13362,6 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
         &store,
         0,
         "yield=0.30 submit=none timeout=100 after you",
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &untyped,
@@ -12511,17 +13387,9 @@ fn await_gone_verb_latches_at_arm_when_clear_and_when_the_row_leaves() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"Done.\r\n\xe2\x9d\xaf ");
     store.write().unwrap().register(h.clone());
-    let registry = subscribe::new_registry();
 
     // Already clear => latched at arm, answered as `gone` with the latch seq.
-    let out = cmd_await(
-        &h.term,
-        &store,
-        0,
-        &h.ctx,
-        "gone interrupt timeout=2000",
-        &registry,
-    );
+    let out = cmd_await(&h.term, &store, 0, &h.ctx, "gone interrupt timeout=2000");
     assert!(
         out.starts_with("OK gone "),
         "an already-clear surface latches at arm: {out:?}"
@@ -12533,23 +13401,16 @@ fn await_gone_verb_latches_at_arm_when_clear_and_when_the_row_leaves() {
 
     // The footer goes up: the same wait holds to its deadline.
     crate::term_lock(&h.term).process(b"\r\nthinking (esc to interrupt)\r\n");
-    let out = cmd_await(
-        &h.term,
-        &store,
-        0,
-        &h.ctx,
-        "gone interrupt timeout=150",
-        &registry,
-    );
+    let out = cmd_await(&h.term, &store, 0, &h.ctx, "gone interrupt timeout=150");
     assert_eq!(
         out, "OK timeout\n",
         "a visible match holds `gone` pending to the deadline"
     );
 
-    // It latches on the clearing frame, woken by the notify the GUI's Wake::Output
-    // hook fires. A lost notify would park to the two-minute timeout, where the
+    // It latches on the clearing frame, woken by the ring the PTY reader makes
+    // after a burst. A lost wake would park to the two-minute timeout, where the
     // re-poll still latches, so the bound sits a minute clear of both.
-    let (term_t, reg_t) = (h.term.clone(), registry.clone());
+    let (term_t, watchers) = (h.term.clone(), h.ctx.watchers.clone());
     let painter = std::thread::spawn(move || {
         // Painted once the await is PARKED — its subscriber registered — a
         // fact, where 120 ms let a slow await arm on the cleared frame and
@@ -12557,20 +13418,13 @@ fn await_gone_verb_latches_at_arm_when_clear_and_when_the_row_leaves() {
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the `gone` await parks on the session",
-            || (reg_t.lock().unwrap().watchers(0) == 1).then_some(()),
+            || (watchers.count() == 1).then_some(()),
         );
         crate::term_lock(&term_t).process(b"\x1b[H\x1b[2Jresponse-line\r\n\xe2\x9d\xaf ");
-        reg_t.lock().unwrap().notify(0);
+        watchers.ring_watchers();
     });
     let t0 = std::time::Instant::now();
-    let out = cmd_await(
-        &h.term,
-        &store,
-        0,
-        &h.ctx,
-        "gone interrupt timeout=120000",
-        &registry,
-    );
+    let out = cmd_await(&h.term, &store, 0, &h.ctx, "gone interrupt timeout=120000");
     painter.join().unwrap();
     assert!(
         out.starts_with("OK gone "),
@@ -12591,16 +13445,8 @@ fn await_gone_refuses_a_bad_regex_and_a_row_span_off_the_grid() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"esc to interrupt\r\n");
     store.write().unwrap().register(h.clone());
-    let registry = subscribe::new_registry();
     assert_eq!(
-        cmd_await(
-            &h.term,
-            &store,
-            0,
-            &h.ctx,
-            "gone (unclosed timeout=100",
-            &registry
-        ),
+        cmd_await(&h.term, &store, 0, &h.ctx, "gone (unclosed timeout=100",),
         "ERR badregex\n"
     );
     // A 24-row grid: rows 40..=50 meet nothing, rows 5..=2 is inverted.
@@ -12609,14 +13455,7 @@ fn await_gone_refuses_a_bad_regex_and_a_row_span_off_the_grid() {
         "gone interrupt rows 5 2",
         "match interrupt rows 40 50",
     ] {
-        let out = cmd_await(
-            &h.term,
-            &store,
-            0,
-            &h.ctx,
-            &format!("{args} timeout=100"),
-            &registry,
-        );
+        let out = cmd_await(&h.term, &store, 0, &h.ctx, &format!("{args} timeout=100"));
         assert!(
             out.starts_with("ERR bad rows"),
             "{args} meets no visible row: {out:?}"
@@ -12630,7 +13469,6 @@ fn await_gone_refuses_a_bad_regex_and_a_row_span_off_the_grid() {
         0,
         &h.ctx,
         "gone interrupt rows 23 99 timeout=100",
-        &registry,
     );
     assert!(
         out.starts_with("OK gone "),
@@ -12682,7 +13520,6 @@ fn turn_settle_gone_rows() {
         let store = session_store::new_store();
         let h = registered_session(0, -1, b"");
         store.write().unwrap().register(h.clone());
-        let registry = subscribe::new_registry();
         let term = &h.term;
         let painter: Cell<Option<std::thread::JoinHandle<()>>> = Cell::new(None);
         let paste = |text: &str| {
@@ -12691,12 +13528,12 @@ fn turn_settle_gone_rows() {
         };
         let press = |_: &str| {
             term.lock().unwrap().process(row.press_paint);
-            let (term_t, reg_t, script) = (term.clone(), registry.clone(), row.script);
+            let (term_t, watchers, script) = (term.clone(), h.ctx.watchers.clone(), row.script);
             painter.set(Some(std::thread::spawn(move || {
                 for &(ms, bytes) in script {
                     std::thread::sleep(std::time::Duration::from_millis(ms));
                     crate::term_lock(&term_t).process(bytes);
-                    reg_t.lock().unwrap().notify(0);
+                    watchers.ring_watchers();
                 }
             })));
             true
@@ -12706,7 +13543,6 @@ fn turn_settle_gone_rows() {
             &store,
             0,
             row.options,
-            &registry,
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -12759,12 +13595,10 @@ fn turn_settle_submitted_answers_at_the_verified_submit_on_a_screen_that_never_r
         let store = session_store::new_store();
         let h = registered_session(0, -1, b"");
         store.write().unwrap().register(h.clone());
-        let registry = subscribe::new_registry();
         crate::task_record::mark_session_task(
             &h.ctx,
             0,
             &crate::task_record::TaskMark::new(crate::task_record::TaskState::Done),
-            &registry,
         )
         .expect("unfenced");
         let term = &h.term;
@@ -12779,7 +13613,8 @@ fn turn_settle_submitted_answers_at_the_verified_submit_on_a_screen_that_never_r
                 return true;
             }
             term.lock().unwrap().process(b"\r\nworking\r\n");
-            let (term_t, reg_t, stop_t) = (term.clone(), registry.clone(), Arc::clone(&stop));
+            let (term_t, watchers_t, stop_t) =
+                (term.clone(), h.ctx.watchers.clone(), Arc::clone(&stop));
             painter.set(Some(std::thread::spawn(move || {
                 let mut red = false;
                 while !stop_t.load(Ordering::SeqCst) {
@@ -12790,7 +13625,7 @@ fn turn_settle_submitted_answers_at_the_verified_submit_on_a_screen_that_never_r
                         b"\x1b7\x1b[1;1H\x1b[32m*\x1b[0m\x1b8"
                     };
                     crate::term_lock(&term_t).process(frame);
-                    reg_t.lock().unwrap().notify(0);
+                    watchers_t.ring_watchers();
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             })));
@@ -12801,7 +13636,6 @@ fn turn_settle_submitted_answers_at_the_verified_submit_on_a_screen_that_never_r
             &store,
             0,
             options,
-            &registry,
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -12908,7 +13742,6 @@ fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
                 },
             );
         }
-        let registry = subscribe::new_registry();
         let term = &h.term;
         let stop = Arc::new(AtomicBool::new(false));
         let painter: Cell<Option<std::thread::JoinHandle<()>>> = Cell::new(None);
@@ -12938,7 +13771,8 @@ fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
                 ),
             }
             if presses.get() == 1 {
-                let (term_t, reg_t, stop_t) = (term.clone(), registry.clone(), Arc::clone(&stop));
+                let (term_t, watchers_t, stop_t) =
+                    (term.clone(), h.ctx.watchers.clone(), Arc::clone(&stop));
                 painter.set(Some(std::thread::spawn(move || {
                     let mut red = false;
                     while !stop_t.load(Ordering::SeqCst) {
@@ -12949,7 +13783,7 @@ fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
                             b"\x1b7\x1b[1;1H\x1b[32m*\x1b[0m\x1b8"
                         };
                         crate::term_lock(&term_t).process(frame);
-                        reg_t.lock().unwrap().notify(0);
+                        watchers_t.ring_watchers();
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                 })));
@@ -12961,7 +13795,6 @@ fn turn_into_claude_code_verifies_its_submit_by_the_composer_not_a_repaint() {
             &store,
             0,
             options,
-            &registry,
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -13039,7 +13872,6 @@ fn a_turn_into_a_worker_names_the_task_rev_its_enter_found() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let registry = subscribe::new_registry();
     let term = &h.term;
     let paste = |text: &str| {
         term.lock().unwrap().process(text.as_bytes());
@@ -13055,7 +13887,6 @@ fn a_turn_into_a_worker_names_the_task_rev_its_enter_found() {
             &store,
             0,
             "settle=submitted timeout=60000 also the README",
-            &registry,
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -13072,7 +13903,7 @@ fn a_turn_into_a_worker_names_the_task_rev_its_enter_found() {
         why: Some("marker"),
         ..TaskMark::new(TaskState::Done)
     };
-    let (found, _) = mark_session_task(&h.ctx, 0, &done, &registry).expect("unfenced");
+    let (found, _) = mark_session_task(&h.ctx, 0, &done).expect("unfenced");
     let verdict = turn();
     let named: u64 = verdict
         .split_whitespace()
@@ -13086,12 +13917,12 @@ fn a_turn_into_a_worker_names_the_task_rev_its_enter_found() {
             ctx: &h.ctx,
             since: Some(named),
         }];
-        super::control_session::await_task(&store, &target, Combine::Any, timeout_ms, &registry)
+        super::control_session::await_task(&store, &target, Combine::Any, timeout_ms)
     };
     // The reopened `working` is no news past the found rev.
     assert!(wait(0).starts_with("OK 1 status=timeout\n"), "{}", wait(0));
     // The follow-up's own done, marked before the wait is armed, answers it.
-    mark_session_task(&h.ctx, 0, &done, &registry).expect("unfenced");
+    mark_session_task(&h.ctx, 0, &done).expect("unfenced");
     let rows = wait(60_000);
     assert!(rows.starts_with("OK 1\n"), "{rows}");
     assert!(rows.contains("state=done"), "{rows}");
@@ -13110,7 +13941,6 @@ fn a_turn_into_an_agent_names_the_verdict_rev_its_enter_found() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let registry = subscribe::new_registry();
     let term = &h.term;
     let paste = |text: &str| {
         term.lock().unwrap().process(text.as_bytes());
@@ -13126,7 +13956,6 @@ fn a_turn_into_an_agent_names_the_verdict_rev_its_enter_found() {
             &store,
             0,
             "settle=submitted submit_verify=seq timeout=60000 carry on",
-            &registry,
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -13159,7 +13988,7 @@ fn a_turn_into_an_agent_names_the_verdict_rev_its_enter_found() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no agent_rev=: {verdict}"));
     assert_eq!(found, h.ctx.timeline.lock().unwrap().agent().rev);
-    let wait = |tail: &str| cmd_await(term, &store, 0, &h.ctx, tail, &registry);
+    let wait = |tail: &str| cmd_await(term, &store, 0, &h.ctx, tail);
     let past = format!("agent idle,prompt,question,wall since={found}");
     // NEGATIVE CONTROL: latched, the idle from before the submit answers.
     assert_eq!(
@@ -13193,7 +14022,6 @@ fn turn_settle_submitted_parses_and_needs_a_submit() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let registry = subscribe::new_registry();
     let term = &h.term;
     let pasted = Cell::new(0u32);
     let paste = |text: &str| {
@@ -13211,7 +14039,6 @@ fn turn_settle_submitted_parses_and_needs_a_submit() {
             &store,
             0,
             options,
-            &registry,
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -13251,43 +14078,115 @@ fn turn_settle_submitted_parses_and_needs_a_submit() {
 /// swallowed press). A press paints synchronously, so a row whose first press
 /// does not land waits a short `submit_window`, not the 2 s default, before it
 /// presses again.
+///
+/// The rows about the started-command counter carry a NEGATIVE CONTROL read
+/// before and after the first press's paint, shown to give the wrong answer on
+/// that row's fixture: the count of blocks that reached C (Executing or
+/// Complete), the signal `turn` once verified by, or `content_seq`, whose
+/// advance is all that wakes the block check inside the window. Each such row
+/// exercises a defect the counter, read at every wake and once more as the
+/// window closes, does not have.
 #[test]
 fn turn_submit_verification_rows() {
+    use aterm_core::terminal::{BlockState, Terminal};
     use std::cell::Cell;
+    #[derive(Clone, Copy)]
+    struct Probe {
+        started_blocks: usize,
+        content_seq: u64,
+    }
+    /// The probe before and after the first press, and why the signal it
+    /// reads misjudges the press.
+    type Control = (fn(Probe, Probe) -> bool, &'static str);
     struct Row {
         label: &'static str,
-        seed: &'static [u8],
+        seed: Vec<u8>,
         paints: &'static [&'static [u8]],
         options: &'static str,
         verdict: &'static str,
         presses: u32,
         why: &'static str,
+        control: Option<Control>,
     }
     const PROMPT: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07";
+    const COMMAND: &[u8] =
+        b"\x1b]133;A\x07$ \x1b]133;B\x07echo\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07";
+    let probe = |t: &Terminal| Probe {
+        started_blocks: t
+            .all_blocks()
+            .filter(|b| matches!(b.state, BlockState::Executing | BlockState::Complete))
+            .count(),
+        content_seq: t.content_seq(),
+    };
     let rows = [
         // Verified-submit retry: an Enter swallowed mid-paste-ingestion does not
         // advance `content_seq`, so the verb re-presses and the second lands. The
         // press count shows verification, not a timer, drove the retry.
         Row {
             label: "swallowed first Enter",
-            seed: b"",
+            seed: Vec::new(),
             paints: &[b"", b"\r\nlanded\r\n"],
             options: "idle=50 timeout=60000 submit_window=150 msg",
             verdict: "submitted=1 status=settled",
             presses: 2,
             why: "exactly one re-press after the swallow",
+            control: None,
         },
         // At a shell prompt (133;A opens the block, 133;B marks input-ready) `turn`
         // auto-verifies against the OSC-133 command start with no `submit_verify=`,
         // and the command start (133;C -> Executing) attributes the press at once.
         Row {
             label: "auto block-verifies at a shell prompt",
-            seed: PROMPT,
+            seed: PROMPT.to_vec(),
             paints: &[b"echo\x1b]133;C\x07\r\nrunning"],
             options: "idle=50 timeout=60000 build",
             verdict: "submitted=1",
             presses: 1,
             why: "one press started the command — no re-press",
+            control: None,
+        },
+        // A C that moves no grid content — its command prints nothing in the
+        // window (`sleep 3`, `ssh host`) — wakes no content latch: the
+        // window's close reads the counter, so no Enter goes into the command.
+        Row {
+            label: "a C that moves no content verifies at the window's close",
+            seed: PROMPT.to_vec(),
+            paints: &[b"\x1b]133;C\x07"],
+            options: "idle=50 timeout=60000 submit_window=120 presses=2 sleep",
+            verdict: "submitted=1",
+            presses: 1,
+            why: "the started command verified the first press",
+            control: Some((
+                |before, after| after.content_seq == before.content_seq,
+                "the C moved no content: a check run only on a latch never reads it",
+            )),
+        },
+        // A full block ring (1000 archived): the press's command starts, ends and
+        // the next prompt archives it in one paint, evicting the oldest block.
+        Row {
+            label: "a command archived out of a full ring still verifies",
+            seed: [COMMAND.repeat(1001).as_slice(), PROMPT].concat(),
+            paints: &[b"\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07"],
+            options: "idle=50 timeout=60000 run",
+            verdict: "submitted=1",
+            presses: 1,
+            why: "the started command verified the first press",
+            control: Some((
+                |before, after| after.started_blocks == before.started_blocks,
+                "one block archived, one evicted: the count stays flat",
+            )),
+        },
+        // `clear`: its command starts, then its ED 3 drops every finished block
+        // (the engine keeps the running one, so its exit status lands).
+        Row {
+            label: "a command that clears the scrollback still verifies",
+            seed: [COMMAND, PROMPT].concat(),
+            paints: &[b"\x1b]133;C\x07\x1b[H\x1b[2J\x1b[3Jafter-clear\r\n"],
+            options: "idle=50 timeout=60000 clear",
+            verdict: "submitted=1",
+            presses: 1,
+            why: "no extra Enter after a `clear` that ran",
+            control: None,
         },
         // Auto degrade: the target looks like a shell prompt but the 133 stream is
         // desynced, so no press ever produces a command start (e.g. vte.sh
@@ -13297,37 +14196,56 @@ fn turn_submit_verification_rows() {
         // verdict. The small submit_window makes the degrade arrive fast.
         Row {
             label: "auto degrades when the prompt block is stale",
-            seed: PROMPT,
+            seed: PROMPT.to_vec(),
             paints: &[b"\r\nran-anyway\r\n$ "],
             options: "idle=50 timeout=60000 submit_window=120 run",
             verdict: "submitted=1 status=settled",
             presses: 1,
             why: "a press whose echo moved the screen was consumed — re-pressing would double-type",
+            control: None,
         },
         // The degrade must not fire on a proven-healthy stream: once this session
-        // started a command block (133;C seen), no block plus ambient movement looks
+        // started a command (133;C seen), no command plus ambient movement looks
         // like a swallowed Enter beside background output. The strict lane
         // re-presses and reports `submitted=0` when nothing starts.
         Row {
             label: "auto stays strict once the stream has started blocks",
-            seed: b"\x1b]133;A\x07$ \x1b]133;B\x07echo\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+            seed: [COMMAND, PROMPT].concat(),
             paints: &[b"\r\n[bg] tick"],
             options: "idle=50 timeout=60000 submit_window=120 presses=2 run",
             verdict: "submitted=0",
             presses: 2,
             why: "strictness holds — the press budget retries instead of overclaiming",
+            control: None,
+        },
+        // A healthy stream whose blocks a reset took (RIS; a clear keeps a
+        // finished block) is still a healthy stream: the C it accepted before
+        // the reset keeps AUTO strict.
+        Row {
+            label: "auto stays strict after a reset took the started blocks",
+            seed: [COMMAND, b"\x1bc", PROMPT].concat(),
+            paints: &[b"\r\n[bg] tick"],
+            options: "idle=50 timeout=60000 submit_window=120 presses=2 run",
+            verdict: "submitted=0",
+            presses: 2,
+            why: "strictness holds — the reset stream is not a desynced one",
+            control: Some((
+                |before, _| before.started_blocks == 0,
+                "no started block left at the press: AUTO would degrade to submitted=1",
+            )),
         },
         // `submit_verify=block` verifies against the OSC-133 command start, not a
         // bare `content_seq` advance, so an ambient repaint (a spinner frame) cannot
         // false-verify; `seq` mode would on the first press.
         Row {
             label: "submit_verify=block ignores an ambient repaint",
-            seed: PROMPT,
+            seed: PROMPT.to_vec(),
             paints: &[b"\x1b[2K spinner-tick ", b"echo\x1b]133;C\x07\r\ndone"],
             options: "idle=50 timeout=60000 submit_window=150 submit_verify=block run",
             verdict: "submitted=1",
             presses: 2,
             why: "the ambient repaint did NOT verify; a second press started the block",
+            control: None,
         },
     ];
     for row in rows {
@@ -13336,9 +14254,10 @@ fn turn_submit_verification_rows() {
         store.write().unwrap().register(h.clone());
         let term = &h.term;
         if !row.seed.is_empty() {
-            term.lock().unwrap().process(row.seed);
+            term.lock().unwrap().process(&row.seed);
         }
         let presses = Cell::new(0u32);
+        let first_press = Cell::new(None);
         let paste = |text: &str| {
             term.lock().unwrap().process(text.as_bytes());
             true
@@ -13347,8 +14266,13 @@ fn turn_submit_verification_rows() {
             presses.set(presses.get() + 1);
             let at = (presses.get() as usize - 1).min(row.paints.len() - 1);
             let paint = row.paints[at];
+            let mut t = term.lock().unwrap();
+            let before = probe(&t);
             if !paint.is_empty() {
-                term.lock().unwrap().process(paint);
+                t.process(paint);
+            }
+            if presses.get() == 1 {
+                first_press.set(Some((before, probe(&t))));
             }
             true
         };
@@ -13357,7 +14281,6 @@ fn turn_submit_verification_rows() {
             &store,
             0,
             row.options,
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -13372,6 +14295,18 @@ fn turn_submit_verification_rows() {
             out.lines().next().unwrap_or("")
         );
         assert_eq!(presses.get(), row.presses, "{}: {}", row.label, row.why);
+        if let Some((misjudges, what)) = row.control {
+            let (before, after) = first_press.get().expect("the turn pressed");
+            assert!(
+                misjudges(before, after),
+                "{}: control: {what} (started blocks {} -> {}, content_seq {} -> {})",
+                row.label,
+                before.started_blocks,
+                after.started_blocks,
+                before.content_seq,
+                after.content_seq
+            );
+        }
     }
 }
 
@@ -13397,7 +14332,6 @@ fn turn_lease_refuses_concurrent_writers() {
         &store,
         0,
         "timeout=2000 hi",
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -13478,7 +14412,6 @@ fn cooperative_lease_blocks_turn_but_not_raw_writes() {
         &store,
         0,
         "timeout=2000 hi",
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -13545,17 +14478,7 @@ fn a_hard_lease_holds_every_other_connection_and_its_own_types_through() {
         press: &press,
         ..TurnIo::paste_only()
     };
-    let turn = || {
-        cmd_turn(
-            term,
-            &store,
-            0,
-            "timeout=300 idle=1 hi",
-            &subscribe::new_registry(),
-            &h.ctx,
-            &io,
-        )
-    };
+    let turn = || cmd_turn(term, &store, 0, "timeout=300 idle=1 hi", &h.ctx, &io);
     on(8);
     assert_eq!(turn(), "ERR busy lease=aterm-harness@1\n", "another's turn");
     on(7);
@@ -13705,7 +14628,6 @@ fn a_lease_taken_here_ends_with_its_connection() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
     let marked = || CONNECTION_CLAIMED.with(|c| c.replace(false));
     let acquire = |rest: &str| {
@@ -13720,15 +14642,15 @@ fn a_lease_taken_here_ends_with_its_connection() {
     marked();
     acquire("hard here");
     assert!(marked(), "its connection's end sweeps it");
-    release_connection_claims(&store, &subs, None, 8);
+    release_connection_claims(&store, None, 8);
     assert!(held(), "another connection's end frees nothing");
-    release_connection_claims(&store, &subs, None, 7);
+    release_connection_claims(&store, None, 7);
     assert_eq!(cmd_lease(&h.ctx, "status"), "OK lease none\n", "freed");
 
     // NEGATIVE CONTROLS.
     acquire("hard");
     assert!(!marked(), "nothing to sweep");
-    release_connection_claims(&store, &subs, None, 7);
+    release_connection_claims(&store, None, 7);
     assert!(held(), "a plain hand outlives its connection");
     assert_eq!(
         cmd_lease(&h.ctx, "release holder=aterm-harness@1"),
@@ -13737,8 +14659,8 @@ fn a_lease_taken_here_ends_with_its_connection() {
     acquire("hard here");
     on(8);
     acquire("hard");
-    release_connection_claims(&store, &subs, None, 7);
-    release_connection_claims(&store, &subs, None, 8);
+    release_connection_claims(&store, None, 7);
+    release_connection_claims(&store, None, 8);
     assert!(held(), "moved by a plain renewal, unbound");
     SERVING_CONNECTION.with(|s| s.set(None));
     CONNECTION_CLAIMED.with(|c| c.set(false));
@@ -13756,7 +14678,6 @@ fn a_connection_end_drops_the_hands_unsubmitted_text_and_wakes_presence() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
     let take = || {
         let request = hand_take_here_request();
@@ -13764,16 +14685,7 @@ fn a_connection_end_drops_the_hands_unsubmitted_text_and_wakes_presence() {
         assert!(reply.starts_with("OK lease acquired"), "{reply}");
     };
     let input = |verb: &str, rest: &str| {
-        control_session::ledger_typed_input(
-            &h.term,
-            &h.ctx,
-            Scope::Owner,
-            verb,
-            rest,
-            "OK\n",
-            &subs,
-            0,
-        );
+        control_session::ledger_typed_input(&h.term, &h.ctx, Scope::Owner, verb, rest, "OK\n");
     };
     let turns = || control_session::cmd_history(&h.ctx, "").lines().count() - 1;
     on(7);
@@ -13785,12 +14697,12 @@ fn a_connection_end_drops_the_hands_unsubmitted_text_and_wakes_presence() {
 
     input("send", "keep going");
     let _ = crate::presence::take_lease_wakes();
-    release_connection_claims(&store, &subs, None, 8);
+    release_connection_claims(&store, None, 8);
     assert!(
         crate::presence::take_lease_wakes().is_empty(),
         "another connection's end moved nothing"
     );
-    release_connection_claims(&store, &subs, None, 7);
+    release_connection_claims(&store, None, 7);
     assert_eq!(cmd_lease(&h.ctx, "status"), "OK lease none\n", "freed");
     assert_eq!(
         crate::presence::take_lease_wakes(),
@@ -13836,7 +14748,6 @@ fn history_names_who_typed_each_turn_and_the_harness_hand_reads_harness() {
             &store,
             0,
             &format!("timeout=300 idle=1 {text}"),
-            &subscribe::new_registry(),
             &h.ctx,
             &io,
         );
@@ -13908,14 +14819,13 @@ fn the_harness_send_and_its_enter_are_its_turn_and_nobody_elses_are() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let on = |conn: u64| SERVING_CONNECTION.with(|s| s.set(Some(conn)));
     let lease = |request: &str| {
         let reply = cmd_lease(&h.ctx, request.strip_prefix("lease ").unwrap_or(request));
         assert!(reply.starts_with("OK"), "{request}: {reply}");
     };
     let input = |scope: Scope, verb: &str, rest: &str, reply: &str| {
-        control_session::ledger_typed_input(&h.term, &h.ctx, scope, verb, rest, reply, &subs, 0);
+        control_session::ledger_typed_input(&h.term, &h.ctx, scope, verb, rest, reply);
     };
     let typed = |scope: Scope, enter_on: u64, between: &[(&str, &str, &str)], reply: &str| {
         input(scope, "send", "keep going", "OK\n");
@@ -13994,15 +14904,7 @@ fn the_harness_send_and_its_enter_are_its_turn_and_nobody_elses_are() {
         by: control_session::turn_by(Scope::Owner, driver.as_ref()),
         ..TurnIo::paste_only()
     };
-    let reply = cmd_turn(
-        &h.term,
-        &store,
-        0,
-        "timeout=300 idle=1 next",
-        &subs,
-        &h.ctx,
-        &io,
-    );
+    let reply = cmd_turn(&h.term, &store, 0, "timeout=300 idle=1 next", &h.ctx, &io);
     assert!(reply.starts_with("OK "), "{reply}");
     let last = rows().pop().expect("the manager's row");
     assert!(last.split_whitespace().any(|w| w == "by=ctl"), "{last}");
@@ -14023,7 +14925,6 @@ fn a_turn_into_a_done_worker_opens_its_task_unless_the_harness_typed_it() {
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subscribers = subscribe::new_registry();
     let term = &h.term;
     let paste = |text: &str| {
         term.lock().unwrap().process(text.as_bytes());
@@ -14048,7 +14949,6 @@ fn a_turn_into_a_done_worker_opens_its_task_unless_the_harness_typed_it() {
             &store,
             0,
             &format!("idle=1 timeout=300 submit_window=50 {text}"),
-            &subscribers,
             &h.ctx,
             &io,
         )
@@ -14058,7 +14958,7 @@ fn a_turn_into_a_done_worker_opens_its_task_unless_the_harness_typed_it() {
             why: Some("marker"),
             ..TaskMark::new(TaskState::Done)
         };
-        mark_session_task(&h.ctx, 0, &mark, &subscribers).expect("unfenced");
+        mark_session_task(&h.ctx, 0, &mark).expect("unfenced");
     };
     let state = || {
         h.ctx
@@ -14157,7 +15057,6 @@ fn turn_fails_closed_on_exit_and_bad_submit_key() {
         &store,
         0,
         "submit=bogus-key timeout=3000 hi",
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -14180,7 +15079,6 @@ fn turn_fails_closed_on_exit_and_bad_submit_key() {
         &store,
         0,
         "timeout=3000 hi",
-        &subscribe::new_registry(),
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -14221,8 +15119,8 @@ fn the_accept_loop_backs_off_on_descriptor_exhaustion_only() {
 }
 
 /// `fabric status` / `fabric attach` arm the supervisor of a running instance
-/// without a relaunch. Drives the same decision function both dispatch entries
-/// call, against the real launcher with an argv that exits at once (`true`), enough
+/// without a relaunch. Drives the decision function [`dispatch_owner`] calls,
+/// against the real launcher with an argv that exits at once (`true`), enough
 /// to show the supervisor thread started and the endpoint latch flipped. `post`'s
 /// refusal is the observable (`no-bridge=1` before, `queued=1` after), since that
 /// token is what an agent acts on.
@@ -14250,7 +15148,11 @@ fn fabric_attach_body() {
     store.write().unwrap().register(handle);
     let edge = Scope::Edge(EdgeToken::generate());
     let run = |scope: Scope, line: &str| {
-        let (selector, verb, rest) = request_head(line);
+        let Head {
+            selector,
+            verb,
+            rest,
+        } = control_request::head(line);
         assert_eq!(verb, "fabric");
         dispatch_fabric_verb(rest, selector.as_ref(), scope, &store)
     };
@@ -14428,15 +15330,12 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
     store.write().unwrap().register(handle);
     let edge = Scope::Edge(EdgeToken::generate());
     let run = |scope: Scope, line: &str| {
-        let (selector, verb, rest) = request_head(line);
-        dispatch_bridge_verb(
+        let Head {
+            selector,
             verb,
             rest,
-            selector.as_ref(),
-            scope,
-            &store,
-            &subscribe::new_registry(),
-        )
+        } = control_request::head(line);
+        dispatch_bridge_verb(verb, rest, selector.as_ref(), scope, &store)
     };
 
     for (scope, name) in [(Scope::Owner, "owner"), (edge, "edge")] {
@@ -14444,52 +15343,47 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
             run(
                 scope,
                 &format!("deliver {sid} off=1 from=h-a kind=task text=x")
-            )
-            .as_deref(),
-            Some("ERR denied\n"),
+            ),
+            "ERR denied\n",
             "deliver from {name} scope"
-        );
-        // `hold` is not on this plane any more: from EVERY scope it falls
-        // through to the owner-only dispatch, which is where its gate lives.
-        assert!(
-            run(scope, &format!("hold {sid} on reason=x")).is_none(),
-            "hold from {name} scope is not a bridge-plane verb"
         );
         // The outbound plane is the same authority: an Owner reading `outbox` would
         // read every session's outbound traffic, and forging `outbox sent` would
         // release a `post --wait` for a message that never left.
         assert_eq!(
-            run(scope, "outbox").as_deref(),
-            Some("ERR denied\n"),
+            run(scope, "outbox"),
+            "ERR denied\n",
             "outbox from {name} scope"
         );
         assert_eq!(
-            run(scope, &format!("outbox sent {sid} 1 off=9")).as_deref(),
-            Some("ERR denied\n"),
+            run(scope, &format!("outbox sent {sid} 1 off=9")),
+            "ERR denied\n",
             "outbox sent from {name} scope"
         );
     }
+    // `hold` is not on this plane any more: from EVERY scope, the bridge's
+    // included, the router hands it to the owner-only dispatch, which is where its
+    // gate lives.
+    assert_eq!(
+        route("hold", aterm_types::control_verbs::spec_for("hold", "")).map(|(r, _)| r),
+        Ok(Route::Owner),
+    );
     // From the inherited bridge connection, both land.
     assert_eq!(
         run(
             Scope::Bridge,
             &format!("deliver {sid} off=1 from=h-a kind=task trust=human text=x")
-        )
-        .as_deref(),
-        Some("OK 1\n")
-    );
-    assert!(
-        run(Scope::Bridge, &format!("hold {sid} on reason=x")).is_none(),
-        "hold is owner-class now, from the bridge too"
+        ),
+        "OK 1\n"
     );
     assert_eq!(
-        run(Scope::Bridge, "outbox").as_deref(),
-        Some("OK 0\n"),
+        run(Scope::Bridge, "outbox"),
+        "OK 0\n",
         "an empty outbox is a zero-length frame, not a refusal"
     );
     assert_eq!(
-        run(Scope::Bridge, &format!("outbox sent {sid} 1 off=9")).as_deref(),
-        Some("ERR no such post\n"),
+        run(Scope::Bridge, &format!("outbox sent {sid} 1 off=9")),
+        "ERR no such post\n",
         "reached the handler, which is the point"
     );
     // A SELECTOR is refused even from the bridge: `@<other> deliver <sid> …`
@@ -14498,9 +15392,8 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
         run(
             Scope::Bridge,
             &format!("@1 deliver {sid} off=2 from=h-a kind=task text=x")
-        )
-        .as_deref(),
-        Some("ERR denied\n")
+        ),
+        "ERR denied\n"
     );
     // Every BridgeOnly row of the table reaches a handler (bare, so each answers
     // its usage or an empty read, never the `no_handler` refusal).
@@ -14508,15 +15401,12 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
         if spec.access == aterm_types::control_verbs::Access::BridgeOnly {
             assert_ne!(
                 run(Scope::Bridge, spec.name),
-                Some(no_handler(spec.name)),
+                no_handler(spec.name),
                 "bridge-only {:?} has no dispatch arm",
                 spec.name
             );
         }
     }
-    // Everything else falls through untouched.
-    assert!(run(Scope::Bridge, "text").is_none());
-    assert!(run(Scope::Owner, "inbox").is_none());
 }
 
 /// THE BRIDGE NAMES ITS LANE AND BUILD, AND THE INSTANCE REPORTS BOTH. A
@@ -14538,16 +15428,12 @@ fn a_bridges_hello_and_its_unparsed_lines_body() {
     let sid = handle.sid.as_str().to_string();
     store.write().unwrap().register(handle);
     let run = |line: &str| {
-        let (selector, verb, rest) = request_head(line);
-        dispatch_bridge_verb(
+        let Head {
+            selector,
             verb,
             rest,
-            selector.as_ref(),
-            Scope::Bridge,
-            &store,
-            &subscribe::new_registry(),
-        )
-        .expect("a bridge-plane verb")
+        } = control_request::head(line);
+        dispatch_bridge_verb(verb, rest, selector.as_ref(), Scope::Bridge, &store)
     };
     let own = aterm_types::version::build_id();
     let lane = aterm_types::control_verbs::BRIDGE_LANE;
@@ -14646,15 +15532,7 @@ fn the_mirror_off_answers_with_the_mirrors_lock_held_body() {
             "hello",
             Box::new(move |store| {
                 crate::fabric::set_lane_generation(generation);
-                dispatch_bridge_verb(
-                    "hello",
-                    "lane=2 build=x",
-                    None,
-                    Scope::Bridge,
-                    store,
-                    &subscribe::new_registry(),
-                )
-                .unwrap_or_default()
+                dispatch_bridge_verb("hello", "lane=2 build=x", None, Scope::Bridge, store)
             }),
         ),
         (
@@ -14748,7 +15626,7 @@ fn the_mirror_off_answers_with_the_mirrors_lock_held_body() {
 /// `origin=fleet` hold is refused, so an injected agent holding Owner cannot lift
 /// the halt meant to stop it; an Owner `on` beside it sets the owner's own slot
 /// and leaves the fleet's standing. The bridge sets fleet holds by default and its
-/// `off` lifts only a fleet one. Drives the decision function both entries call.
+/// `off` lifts only a fleet one. Drives the decision function [`dispatch_owner`] calls.
 #[test]
 fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_inbox_hold() {
     // A bridge-issued `hold` records the session as bridge-governed in the
@@ -14766,15 +15644,13 @@ fn the_local_owner_may_hold_its_session_and_never_a_fleet_hold_body() {
     store.write().unwrap().register(handle);
     let edge = Scope::Edge(EdgeToken::generate());
     let run = |scope: Scope, line: &str| {
-        let (selector, verb, rest) = request_head(line);
-        assert_eq!(verb, "hold");
-        dispatch_hold_verb(
+        let Head {
+            selector,
+            verb,
             rest,
-            selector.as_ref(),
-            scope,
-            &store,
-            &subscribe::new_registry(),
-        )
+        } = control_request::head(line);
+        assert_eq!(verb, "hold");
+        dispatch_hold_verb(rest, selector.as_ref(), scope, &store)
     };
 
     // OWNER: on, halted, status/inbox say so, off, lifted.
@@ -14905,6 +15781,364 @@ fn post_refuses_an_edge_token_connection_inbox_hold() {
     assert!(post_scope_denied(Scope::Edge(EdgeToken::generate())));
 }
 
+/// THE INPUT ADMISSION'S ORDER (`admit`), on a real pty. Every gate armed at once —
+/// a hold, a self-feed floor the write overdraws, a turn's lease, an edit ticket's
+/// hold, a malformed leading option and a published stall behind the person's
+/// unread `q` — and the halt answers; lifting each in turn hands the answer to the
+/// next: halt, floor, lease, edit hold, usage, the request's own words, unread-input
+/// gate, then the write is admitted. The edit hold answers before the usage step and
+/// before the words, which it never asks. The class decides which gates ask:
+/// `signal` meets none of the floor, the lease or the stall.
+///
+/// Negative control: each gate armed alone refuses with its own line, so the
+/// answer at each step is the order and not a gate that never fires.
+#[test]
+#[cfg(target_os = "macos")]
+fn admit_orders_its_gates() {
+    use amacs::protocol::edit::Ticket;
+
+    use crate::control_edit::hold;
+    use crate::input_stall::tests::{publish_stall, raw_pty_pair};
+    let (master, slave) = raw_pty_pair();
+    let h = registered_session(9, master, b"");
+    h.ctx.sink.note_master_nonblocking(true);
+    h.ctx
+        .sink
+        .write_frame_nonparking(b"q")
+        .expect("the person's key");
+    publish_stall(&h.ctx);
+    // The floor's own bucket, which no other test spends.
+    let floor_key = 0xC6_0000_0001;
+    let overdraw = vec![b'x'; 256 * 1024 + 1];
+    let hold = |on: bool| {
+        assert!(crate::fabric::apply_hold_for_test(
+            &h.ctx,
+            on.then(|| crate::fabric::Hold {
+                reason: "demo".to_string(),
+                origin: "local".to_string(),
+            })
+        ));
+    };
+    let lease = |on: bool| {
+        *h.ctx.turn_lease.lock().unwrap() = on.then_some(crate::Lease::Turn {
+            id: 7,
+            driver: None,
+            typing: false,
+        });
+    };
+    // The edit hold is keyed by the request's session: the floor's key, which no
+    // other test holds either.
+    let editing = |on: bool| {
+        if on {
+            hold::set(
+                floor_key,
+                hold::Hold {
+                    ticket: Ticket(61),
+                    view: 6,
+                },
+            );
+        } else {
+            hold::clear(floor_key, Ticket(61));
+        }
+    };
+    let usage = "ERR usage: id= given twice\n";
+    let admit_key = |args: &[u8], usage: Option<&str>, unread_ok: bool| {
+        admit(InputAdmission {
+            class: input_of("key"),
+            verb: "key",
+            ctx: &h.ctx,
+            session: floor_key,
+            is_cross: false,
+            args,
+            unread_ok,
+            usage: usage.map(str::to_string),
+        })
+    };
+    // A request whose own words refuse, counting each time they are asked.
+    let words_refusal = "ERR cause: 999999 names no record of this session\n";
+    let asked = std::cell::Cell::new(0u32);
+    let admit_words = || {
+        admit_with(
+            InputAdmission {
+                class: input_of("key"),
+                verb: "key",
+                ctx: &h.ctx,
+                session: floor_key,
+                is_cross: false,
+                args: b"down",
+                unread_ok: false,
+                usage: None,
+            },
+            || {
+                asked.set(asked.get() + 1);
+                Err::<(), _>(words_refusal.to_string())
+            },
+        )
+        .map(|((), warning)| warning)
+    };
+    let halted = Err("ERR halted reason=demo origin=local\n".to_string());
+    let rate = Err(RATE_REFUSAL.to_string());
+    let leased = Err("ERR busy turn=7\n".to_string());
+    let held = Err("ERR busy editing ticket=61 view=6\n".to_string());
+
+    hold(true);
+    lease(true);
+    editing(true);
+    assert_eq!(admit_key(&overdraw, Some(usage), false), halted);
+    hold(false);
+    assert_eq!(admit_key(&overdraw, Some(usage), false), rate);
+    assert_eq!(admit_key(b"down", Some(usage), false), leased);
+    lease(false);
+    assert_eq!(
+        admit_key(b"down", Some(usage), false),
+        held,
+        "the edit hold answers before the usage step"
+    );
+    assert_eq!(admit_words(), held, "and before the request's words");
+    assert_eq!(asked.get(), 0, "which it never asks");
+    editing(false);
+    assert_eq!(
+        admit_key(b"down", Some(usage), false),
+        Err(usage.to_string())
+    );
+    assert_eq!(admit_words(), Err(words_refusal.to_string()));
+    assert_eq!(asked.get(), 1);
+    let stalled = admit_key(b"down", None, false).expect_err("the stall refuses");
+    assert!(stalled.starts_with("ERR busy input-unread"), "{stalled}");
+    assert_eq!(admit_key(b"down", None, true), Ok(None), "admitted");
+
+    // Each gate alone.
+    hold(true);
+    assert_eq!(admit_key(b"down", None, true), halted);
+    hold(false);
+    assert_eq!(admit_key(&overdraw, None, true), rate);
+    lease(true);
+    assert_eq!(admit_key(b"down", None, true), leased);
+    lease(false);
+    editing(true);
+    assert_eq!(admit_key(b"down", None, true), held);
+    editing(false);
+    assert_eq!(
+        admit_key(b"down", Some(usage), true),
+        Err(usage.to_string())
+    );
+
+    // The class decides: everything but the halt armed, a `signal` is admitted.
+    lease(true);
+    let signal = admit(InputAdmission {
+        class: input_of("signal"),
+        verb: "signal",
+        ctx: &h.ctx,
+        session: floor_key,
+        is_cross: false,
+        args: &overdraw,
+        unread_ok: false,
+        usage: None,
+    });
+    assert_eq!(
+        signal,
+        Ok(None),
+        "the remedy meets no floor, lease or stall"
+    );
+    lease(false);
+    crate::inject_floor::forget(floor_key);
+    aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
+}
+
+/// A REQUEST'S OWN WORDS ARE TOLD BEFORE THE UNREAD-INPUT GATE (`admit_with`
+/// asking `input_words`, as `serve_session_verb` does). Into a program published
+/// as not reading, a `send` whose `cause=` names nothing this session holds is
+/// answered with the cause's refusal, an edge without read with `ERR denied`, and
+/// a `turn` with a bad option, or a `cause=` among its options that names
+/// nothing, with that refusal: never `ERR busy input-unread`. A held session
+/// still says `ERR halted` first, and its words are never asked.
+///
+/// Negative control: the same requests with well-formed words are refused by the
+/// stall, so each answer above is the order and not a gate that never fires.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_requests_own_words_are_told_before_the_unread_input_gate() {
+    use crate::input_stall::tests::{publish_stall, raw_pty_pair};
+    use crate::session_log::CauseRef;
+    let (master, slave) = raw_pty_pair();
+    let h = registered_session(9, master, b"");
+    let store = session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    // Mail this session holds, the cause a well-formed request names.
+    assert!(
+        crate::fabric::cmd_deliver(
+            &store,
+            &format!(
+                "{} off=100 from=h-a kind=task trust=agent text=x",
+                h.sid.as_str()
+            )
+        )
+        .starts_with("OK")
+    );
+    h.ctx.sink.note_master_nonblocking(true);
+    h.ctx
+        .sink
+        .write_frame_nonparking(b"q")
+        .expect("the person's key");
+    publish_stall(&h.ctx);
+    let asked = std::cell::Cell::new(0u32);
+    let admit_words = |scope: Scope, verb: &str, rest: &str, cause: Option<CauseRef>| {
+        admit_with(
+            InputAdmission {
+                class: input_of(verb),
+                verb,
+                ctx: &h.ctx,
+                session: 9,
+                is_cross: true,
+                args: rest.as_bytes(),
+                unread_ok: false,
+                usage: None,
+            },
+            || {
+                asked.set(asked.get() + 1);
+                input_words(scope, verb, rest, cause, &h.ctx)
+            },
+        )
+        .map(|(words, _)| words.cause.map(|c| c.to_string()))
+    };
+    let unread = |answer: Result<Option<String>, String>| {
+        answer.is_err_and(|refusal| refusal.starts_with("ERR busy input-unread"))
+    };
+    let no_record = Err("ERR cause: 999999 names no record of this session\n".to_string());
+
+    assert_eq!(
+        admit_words(Scope::Owner, "send", "hi", Some(CauseRef::Rec(999_999))),
+        no_record
+    );
+    assert_eq!(
+        admit_words(edge(), "send", "hi", Some(CauseRef::Mail(100))),
+        Err("ERR denied\n".to_string()),
+        "an edge without read learns nothing of the stall"
+    );
+    assert_eq!(
+        admit_words(Scope::Owner, "turn", "idle=abc hi", None),
+        Err(control_session::TURN_USAGE.to_string())
+    );
+    assert_eq!(
+        admit_words(Scope::Owner, "turn", "idle=5 cause=999999 hi", None),
+        no_record
+    );
+    assert_eq!(
+        admit_words(
+            Scope::Owner,
+            "turn",
+            "idle=5 cause=@100 hi",
+            Some(CauseRef::Mail(100))
+        ),
+        Err(crate::session_log::CAUSE_USAGE.to_string()),
+        "one leading and one among the options"
+    );
+
+    // Negative control: well-formed words meet the stall.
+    assert!(unread(admit_words(
+        Scope::Owner,
+        "send",
+        "hi",
+        Some(CauseRef::Mail(100))
+    )));
+    assert!(unread(admit_words(Scope::Owner, "send", "hi", None)));
+    assert!(unread(admit_words(Scope::Owner, "turn", "idle=5 hi", None)));
+    assert!(unread(admit_words(
+        Scope::Owner,
+        "turn",
+        "idle=5 cause=@100 hi",
+        None
+    )));
+
+    // The halt is asked before the words.
+    assert!(crate::fabric::apply_hold_for_test(
+        &h.ctx,
+        Some(crate::fabric::Hold {
+            reason: "demo".to_string(),
+            origin: "local".to_string(),
+        })
+    ));
+    asked.set(0);
+    assert_eq!(
+        admit_words(Scope::Owner, "send", "hi", Some(CauseRef::Rec(999_999))),
+        Err("ERR halted reason=demo origin=local\n".to_string())
+    );
+    assert_eq!(asked.get(), 0, "a halted request's words are never asked");
+    assert!(crate::fabric::apply_hold_for_test(&h.ctx, None));
+    aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
+}
+
+/// The admission binds drivers, never the person at the glass: on a session that
+/// is held AND has a published stall behind unread input, the person's `↓`
+/// through the real App input seam (`Source::Human`) reaches the PTY, behind the
+/// unread `q`. Negative control: a driver's `key` on that same session is refused
+/// by the halt, and with the hold lifted by the stall.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_person_types_into_a_held_and_stalled_session() {
+    use crate::input::Source;
+    use crate::input_stall::tests::{publish_stall, raw_pty_pair, slave_read_all};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    let (master, slave) = raw_pty_pair();
+    let sink = Arc::new(SinkWriter::new(master));
+    sink.note_master_nonblocking(true);
+    let mut app = crate::App::headless_for_test_with_sink(sink);
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    ctx.sink
+        .write_frame_nonparking(b"q")
+        .expect("the person's earlier key");
+    publish_stall(&ctx);
+    assert!(crate::fabric::apply_hold_for_test(
+        &ctx,
+        Some(crate::fabric::Hold {
+            reason: "demo".to_string(),
+            origin: "fleet".to_string(),
+        })
+    ));
+    let driver = |ctx: &SessionCtx| {
+        admit(InputAdmission {
+            class: input_of("key"),
+            verb: "key",
+            ctx,
+            session: 0,
+            is_cross: true,
+            args: b"down",
+            unread_ok: false,
+            usage: None,
+        })
+    };
+    assert_eq!(
+        driver(&ctx),
+        Err("ERR halted reason=demo origin=fleet\n".to_string())
+    );
+
+    let down = InputEvent::Key {
+        key: Key::Named(NamedKey::ArrowDown),
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let _ = app.input(crate::WindowId(0), down, Source::Human);
+    assert_eq!(
+        slave_read_all(slave),
+        b"q\x1b[B",
+        "the person's arrow reached the PTY behind the unread key"
+    );
+
+    assert!(crate::fabric::apply_hold_for_test(&ctx, None));
+    ctx.sink
+        .write_frame_nonparking(b"q")
+        .expect("unread input again");
+    publish_stall(&ctx);
+    let stalled = driver(&ctx).expect_err("the stall refuses the driver");
+    assert!(stalled.starts_with("ERR busy input-unread"), "{stalled}");
+    aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
+}
+
 /// The dispatch's gates on a real pty: a raw program that stopped reading holds the
 /// human's Enter; once the watch publishes it as stalled, a driver's `key down` is
 /// refused `ERR busy input-unread` (before publication it is written with a warning;
@@ -14936,25 +16170,20 @@ fn the_unread_input_gate_refuses_after_the_halt_and_gives_the_id_back() {
         None
     );
 
-    // A local hold: the halt, asked first, is the answer.
-    assert!(crate::fabric::apply_hold_for_test(
-        &h.ctx,
-        Some(crate::fabric::Hold {
-            reason: "demo".to_string(),
-            origin: "local".to_string(),
-        })
-    ));
-    assert_eq!(
-        crate::fabric::halt_refusal(&h.ctx, "key").as_deref(),
-        Some("ERR halted reason=demo origin=local\n"),
-    );
-    assert!(crate::fabric::apply_hold_for_test(&h.ctx, None));
-
-    // The refused attempt never reached the claim, so its key is unspent.
+    // The dispatch's admission, then its claim around the write.
     let key = format!("{}:4:1", h.ctx.nonce.to_hex());
-    let attempt = || match crate::input_stall::refusal(&h.ctx, "key", "down", false) {
-        Some(refusal) => refusal,
-        None => {
+    let attempt = || match admit(InputAdmission {
+        class: input_of("key"),
+        verb: "key",
+        ctx: &h.ctx,
+        session: 9,
+        is_cross: true,
+        args: b"down",
+        unread_ok: false,
+        usage: None,
+    }) {
+        Err(refusal) => refusal,
+        Ok(_) => {
             crate::pty_idem::guarded(&h.ctx, Scope::Owner, "key", Some(key.as_str()), || match h
                 .ctx
                 .sink
@@ -14965,6 +16194,18 @@ fn the_unread_input_gate_refuses_after_the_halt_and_gives_the_id_back() {
             })
         }
     };
+    // A local hold: the halt, asked first, is the answer.
+    assert!(crate::fabric::apply_hold_for_test(
+        &h.ctx,
+        Some(crate::fabric::Hold {
+            reason: "demo".to_string(),
+            origin: "local".to_string(),
+        })
+    ));
+    assert_eq!(attempt(), "ERR halted reason=demo origin=local\n");
+    assert!(crate::fabric::apply_hold_for_test(&h.ctx, None));
+
+    // The refused attempt never reached the claim, so its key is unspent.
     assert!(attempt().starts_with("ERR busy input-unread"));
     // Nothing was written behind the Enter: the program reads it alone.
     assert_eq!(slave_read_all(slave), b"\r");
@@ -14998,7 +16239,6 @@ fn the_unread_input_gate_lets_a_turn_press_enter_once_into_a_program_that_is_not
     use crate::input_stall::tests::{raw_pty_pair, slave_read_all};
     let turn = |h: &SessionHandle| -> (String, u32) {
         let store = session_store::new_store();
-        let subscribers = crate::subscribe::new_registry();
         store.write().unwrap().register(h.clone());
         let presses = std::cell::Cell::new(0u32);
         let paste = |text: &str| h.ctx.sink.write_frame_nonparking(text.as_bytes()).is_ok();
@@ -15012,7 +16252,6 @@ fn the_unread_input_gate_lets_a_turn_press_enter_once_into_a_program_that_is_not
             &store,
             h.local_id,
             "idle=1 timeout=600000 submit_window=150 presses=3 -- hi",
-            &subscribers,
             &h.ctx,
             &control_session::TurnIo {
                 paste: &paste,
@@ -15051,12 +16290,12 @@ fn the_unread_input_gate_lets_a_turn_press_enter_once_into_a_program_that_is_not
 
 /// An aimed App verb is gated on what it drives, not on the sid it names.
 ///
-/// `@<sid> tab …` passes the App-lane halt gate via `aimed_app_lane` so the selector
-/// reaches the resolver, then drives `hosting_window(sid)`, so `tab close N`
-/// retires whatever session tab N hosts. Gated only on the aimed session's hold, a
-/// partial halt (`bridge_lost` halts only `LINK.touched` sids) would let
-/// `@<unheld> tab close N` retire a held sibling that `@<held> close` and bare
-/// `tab close` refuse.
+/// `@<sid> tab …` drives `hosting_window(sid)`, so `tab close N` retires whatever
+/// session tab N hosts. Gated only on the aimed session's hold, a partial halt
+/// (`bridge_lost` halts only `LINK.touched` sids) would let `@<unheld> tab close N`
+/// retire a held sibling that `@<held> close` and bare `tab close` refuse. So
+/// [`app_verb_halt`] asks the aimed session first, which a held aim answers with
+/// its own `reason=`, and then the App lane, which every App verb passes.
 #[test]
 fn an_aimed_app_verb_asks_the_app_lane_halt_question_inbox_hold() {
     crate::fabric::with_link_reset(an_aimed_app_verb_asks_the_app_lane_halt_question_body);
@@ -15064,61 +16303,80 @@ fn an_aimed_app_verb_asks_the_app_lane_halt_question_inbox_hold() {
 
 fn an_aimed_app_verb_asks_the_app_lane_halt_question_body() {
     let store = session_store::new_store();
-    let held = crate::session_store::test_handle(1);
-    let unheld = crate::session_store::test_handle(2);
-    let held_sid = held.sid.as_str().to_string();
-    let unheld_ctx = unheld.ctx.clone();
-    store.write().unwrap().register(held);
-    store.write().unwrap().register(unheld);
-    assert_eq!(
-        dispatch_hold_verb(
-            &format!("{held_sid} on reason=fabric-lost origin=fleet"),
-            None,
-            Scope::Bridge,
-            &store,
-            &subscribe::new_registry(),
-        ),
-        "OK hold=1\n",
-    );
+    let handles = [1, 2, 3].map(crate::session_store::test_handle);
+    let aims = handles
+        .each_ref()
+        .map(|h| (h.term.clone(), h.master, h.local_id, h.ctx.clone()));
+    for handle in handles {
+        store.write().unwrap().register(handle);
+    }
+    let sid = |n: usize| aims[n].3.self_id.as_str().to_string();
+    for (n, reason) in [(0, "first"), (1, "second")] {
+        assert_eq!(
+            dispatch_hold_verb(
+                &format!("{} on reason={reason} origin=fleet", sid(n)),
+                None,
+                Scope::Bridge,
+                &store,
+            ),
+            "OK hold=1\n",
+        );
+    }
+    let unheld = AppAim::Aimed(aims[2].clone());
 
     // The session gate alone says the request may proceed, because the sid it
     // names is not the sid it would retire.
     assert!(
-        crate::fabric::halt_refusal(&unheld_ctx, "tab").is_none(),
+        crate::fabric::halt_refusal(&aims[2].3, "tab").is_none(),
         "the unheld window-mate is not itself held: this is precisely why the \
          session gate is the wrong question for a verb that drives a window",
     );
-    // The APP-lane gate — which the aimed forms now also ask — refuses it.
+    // The APP-lane gate refuses it, aimed or not.
+    let lane = crate::fabric::app_halt_refusal(&store, "tab").expect("a session is held");
     assert_eq!(
-        crate::fabric::app_halt_refusal(&store, "tab").as_deref(),
-        Some("ERR halted reason=fabric-lost origin=fleet\n"),
+        app_verb_halt(&unheld, &store, input_of("tab"), "tab", ""),
+        Some(lane.clone())
     );
-    // `spawn` rides the same lane and is a named residual of the halt set (it mints
-    // a session rather than reaching one; see `is_pty_reaching`), so widening the
-    // gate must not sweep it in.
-    assert!(is_aimed_app_verb("spawn"));
-    assert!(
-        crate::fabric::app_halt_refusal(&store, "spawn").is_none(),
-        "the gate asks `is_pty_reaching`, not `is this an aimed App verb`",
+    assert_eq!(
+        app_verb_halt(&AppAim::Front, &store, input_of("tab"), "tab", ""),
+        Some(lane.clone())
     );
-
-    // ONE LITERAL, NOT TWO: every verb the lane routes to the resolver is a
-    // verb this gate asks about, over the whole shipped table.
-    for spec in aterm_types::control_verbs::VERBS {
-        let routed = aimed_app_lane(
-            spec.name,
-            Some(&Selector::Local(1)),
-            NativeControlPrincipal::Owner,
-        )
-        .is_some();
+    // A held aim answers with its OWN hold, though the App lane would have named
+    // whichever held session it found first (the negative control: one of the two
+    // differs from the lane's line).
+    let mut own_differs = false;
+    for aim in &aims[..2] {
+        let own = crate::fabric::halt_refusal(&aim.3, "tab").expect("held");
+        own_differs |= own != lane;
         assert_eq!(
-            routed,
-            is_aimed_app_verb(spec.name),
-            "{}: the aimed lane and the gate that follows it must name the \
-             same verbs",
-            spec.name,
+            app_verb_halt(
+                &AppAim::Aimed(aim.clone()),
+                &store,
+                input_of("tab"),
+                "tab",
+                ""
+            ),
+            Some(own)
         );
     }
+    assert!(
+        own_differs,
+        "two holds, two reasons: the lane names only one"
+    );
+    // `spawn` rides the same lane and is a named residual of the halt set (it mints
+    // a session rather than reaching one; its row argues it), so neither gate
+    // sweeps it in.
+    assert!(crate::fabric::app_halt_refusal(&store, "spawn").is_none());
+    assert!(
+        app_verb_halt(
+            &AppAim::Aimed(aims[0].clone()),
+            &store,
+            input_of("spawn"),
+            "spawn",
+            ""
+        )
+        .is_none()
+    );
 }
 
 /// The `fabric:` lease namespace belongs to the bridge connection.
@@ -15189,10 +16447,8 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
             None,
             Scope::Bridge,
             &store,
-            &subscribe::new_registry(),
-        )
-        .as_deref(),
-        Some("OK 1\n")
+        ),
+        "OK 1\n"
     );
     assert!(crate::fabric::halt_refusal(&ctx, "turn").is_none());
     // The default: the governed session keeps running, with its advisory.
@@ -15200,7 +16456,6 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
     crate::fabric::bridge_attached(generation);
     drop(BridgeLostGuard {
         store: store.clone(),
-        subscribers: subscribe::new_registry(),
         generation,
     });
     assert!(
@@ -15215,7 +16470,6 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
     crate::fabric::set_hold_on_bridge_lost(true);
     drop(BridgeLostGuard {
         store: store.clone(),
-        subscribers: subscribe::new_registry(),
         generation: crate::fabric::next_bridge_generation(),
     });
     assert_eq!(
@@ -15227,24 +16481,25 @@ fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
 
 /// The length-prefixed `post` frame is detected with the handler's own option
 /// vocabulary, so a `len=` inside a message body is not a frame (a separate parser
-/// would desync the stream).
+/// would desync the stream). Only a row whose body is [`Body::PostLen`] is read for
+/// one, and the lanes wait for exactly the body it announces.
 #[test]
 fn the_post_frame_detector_agrees_with_the_body_rule_inbox_hold() {
-    assert_eq!(post_frame_len("post to=h-a kind=note len=12"), Some(Ok(12)));
+    let frame = |line: &str| Request::parse(line.to_string()).post_frame();
+    assert_eq!(frame("post to=h-a kind=note len=12"), Some(Ok(12)));
+    assert_eq!(frame("@s-a post to=h-a kind=ask --wait len=3"), Some(Ok(3)));
     assert_eq!(
-        post_frame_len("@s-a post to=h-a kind=ask --wait len=3"),
-        Some(Ok(3))
-    );
-    assert_eq!(
-        post_frame_len("post to=h-a kind=note hello len=12"),
+        frame("post to=h-a kind=note hello len=12"),
         None,
         "a `len=` inside the BODY is not a frame"
     );
-    assert_eq!(post_frame_len("post to=h-a kind=note hi"), None);
+    assert_eq!(frame("post to=h-a kind=note hi"), None);
     // After `--` everything is body: a `len=` there announces no frame.
-    assert_eq!(post_frame_len("post to=h-a kind=note -- len=12"), None);
-    assert_eq!(post_frame_len("send len=4"), None);
-    let refused = |line: &str| match post_frame_len(line) {
+    assert_eq!(frame("post to=h-a kind=note -- len=12"), None);
+    // Negative control: the same options on a row with no post body.
+    assert_eq!(frame("send len=4"), None);
+    assert_eq!(frame("feed-bin len=4"), None);
+    let refused = |line: &str| match frame(line) {
         Some(Err(refusal)) => refusal,
         other => panic!("{line}: {other:?}"),
     };
@@ -15253,6 +16508,17 @@ fn the_post_frame_detector_agrees_with_the_body_rule_inbox_hold() {
         refused("post to=h-a kind=note len=abc").starts_with("ERR usage"),
         "a typo is not a size problem"
     );
+    // The lanes' wholeness test reads the same rule off the raw line: a refused
+    // length announces no body (the request is answered and the connection closed).
+    for (line, body) in [
+        ("post to=h-a kind=note len=12", 12),
+        ("post to=h-a kind=note hello len=12", 0),
+        ("post to=h-a kind=note len=abc", 0),
+        ("send len=4", 0),
+    ] {
+        assert_eq!(announced_body_of(line), body, "{line}");
+        assert_eq!(Request::parse(line.to_string()).body_len(), body, "{line}");
+    }
 }
 
 /// A WORKER's `spawn … len=<n>` frame is detected with the handler's own
@@ -15263,38 +16529,54 @@ fn the_post_frame_detector_agrees_with_the_body_rule_inbox_hold() {
 /// exactly that many body bytes (`announced_body`).
 #[test]
 fn the_worker_spawn_frame_detector_agrees_with_the_spawn_tokenizer() {
-    assert_eq!(spawn_frame_len("spawn agent=claude len=12"), Some(Ok(12)));
     assert_eq!(
-        spawn_frame_len("@s-ab spawn cwd=/w agent=claude model=opus len=0"),
+        spawn_frame_len(&control_request::head("spawn agent=claude len=12")),
+        Some(Ok(12))
+    );
+    assert_eq!(
+        spawn_frame_len(&control_request::head(
+            "@s-ab spawn cwd=/w agent=claude model=opus len=0"
+        )),
         Some(Ok(0))
     );
     assert_eq!(
-        spawn_frame_len("spawn cwd=\"/a len=9\" agent=claude"),
+        spawn_frame_len(&control_request::head(
+            "spawn cwd=\"/a len=9\" agent=claude"
+        )),
         None,
         "a `len=` inside a quoted value is no frame"
     );
-    assert_eq!(spawn_frame_len("spawn \"len=7\" agent=claude"), Some(Ok(7)));
     assert_eq!(
-        spawn_frame_len("spawn cwd=\"/a agent=claude len=3"),
+        spawn_frame_len(&control_request::head("spawn \"len=7\" agent=claude")),
+        Some(Ok(7))
+    );
+    assert_eq!(
+        spawn_frame_len(&control_request::head("spawn cwd=\"/a agent=claude len=3")),
         Some(Ok(3)),
         "an unterminated quote still frames its len="
     );
-    assert_eq!(spawn_frame_len("spawn cwd=/w"), None);
-    assert_eq!(spawn_frame_len("post to=h-a kind=note len=3"), None);
-    assert_eq!(spawn_frame_len("send len=4"), None);
     assert_eq!(
-        spawn_frame_len("spawn agent=claude len=65537"),
+        spawn_frame_len(&control_request::head("spawn cwd=/w")),
+        None
+    );
+    assert_eq!(
+        spawn_frame_len(&control_request::head("post to=h-a kind=note len=3")),
+        None
+    );
+    assert_eq!(spawn_frame_len(&control_request::head("send len=4")), None);
+    assert_eq!(
+        spawn_frame_len(&control_request::head("spawn agent=claude len=65537")),
         Some(Err(
             "ERR spawn agent=claude: the task is 65537 bytes (max 65536)\n".to_string()
         ))
     );
     assert!(
-        spawn_frame_len("spawn agent=claude len=abc")
+        spawn_frame_len(&control_request::head("spawn agent=claude len=abc"))
             .is_some_and(|len| len.is_err_and(|e| e.starts_with("ERR usage: spawn")))
     );
-    assert_eq!(announced_body("spawn agent=claude len=65536"), 65536);
-    assert_eq!(announced_body("spawn agent=claude len=65537"), 0);
-    assert_eq!(announced_body("spawn cwd=/w"), 0);
+    assert_eq!(announced_body_of("spawn agent=claude len=65536"), 65536);
+    assert_eq!(announced_body_of("spawn agent=claude len=65537"), 0);
+    assert_eq!(announced_body_of("spawn cwd=/w"), 0);
 }
 
 /// A worker's task is read only behind a `GO <n>` the client waits for: a
@@ -15318,7 +16600,8 @@ fn a_workers_task_is_read_behind_its_go() {
             go
         })
     };
-    let mut reader = control_lanes::lane_reader(&server, Vec::new());
+    let mut unread = control_lanes::Unread::default();
+    let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
     assert_eq!(
         read_worker_task(&server, &mut reader, task.len()).expect("read"),
         task
@@ -15332,7 +16615,8 @@ fn a_workers_task_is_read_behind_its_go() {
     let mut here = task.clone();
     here.extend_from_slice(b"next\n");
     {
-        let mut reader = control_lanes::lane_reader(&server, here);
+        let mut unread = control_lanes::Unread::holding(here);
+        let mut reader = control_lanes::LaneReader::new(&server, &mut unread);
         assert_eq!(
             read_worker_task(&server, &mut reader, task.len()).expect("read"),
             task
@@ -15362,20 +16646,22 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
     let local = registered_session(0, -1, b"");
     let local_sid = local.ctx.self_id.as_str().to_string();
     store.write().unwrap().register(local);
-    let refused = worker_frame_refusal("@s-not-hosted-here spawn agent=claude len=4", &store);
+    let refused = worker_frame_refusal(
+        &control_request::head("@s-0ffcafe spawn agent=claude len=4"),
+        &store,
+    );
     assert!(
-        refused.as_deref().is_some_and(|r| r.starts_with(
-            "ERR spawn agent=claude: @s-not-hosted-here is not a session of this instance"
-        )),
+        refused.as_deref().is_some_and(|r| r
+            .starts_with("ERR spawn agent=claude: @s-0ffcafe is not a session of this instance")),
         "{refused:?}"
     );
-    assert!(!is_wait_request(
-        "@s-not-hosted-here spawn agent=claude len=4",
+    assert!(!request_waits(
+        "@s-0ffcafe spawn agent=claude len=4",
         Scope::Owner,
         &store
     ));
     assert!(
-        is_wait_request("@s-not-hosted-here spawn cwd=/w", Scope::Owner, &store),
+        request_waits("@s-0ffcafe spawn cwd=/w", Scope::Owner, &store),
         "a plain spawn is relayed as before"
     );
     for here in [
@@ -15383,10 +16669,14 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
         "@. spawn agent=claude len=4".to_string(),
         "@0 spawn agent=claude len=4".to_string(),
         format!("@{local_sid} spawn agent=claude len=4"),
-        "@s-not-hosted-here spawn cwd=/w".to_string(),
-        "@s-not-hosted-here text".to_string(),
+        "@s-0ffcafe spawn cwd=/w".to_string(),
+        "@s-0ffcafe text".to_string(),
     ] {
-        assert_eq!(worker_frame_refusal(&here, &store), None, "{here}");
+        assert_eq!(
+            worker_frame_refusal(&control_request::head(&here), &store),
+            None,
+            "{here}"
+        );
     }
 }
 
@@ -15412,21 +16702,17 @@ fn feed_bin_once(
         }
         Ok(InputOutcome::Ok)
     };
-    let mut clear_license = |_session| "OK\n".to_string();
     let mut out = Vec::new();
     assert!(
-        run_feed_bin_routed(
+        feed_bin_routed(
             line,
-            "feed-bin",
             &mut reader,
             FeedBinRoute {
                 active,
                 store,
                 scope: Scope::Owner,
-                subscribers: None,
             },
             &mut dispatch,
-            &mut clear_license,
             &mut out,
         ),
         "the frame must keep the connection: {line}"
@@ -15698,7 +16984,6 @@ fn feed_idempotent_turn_submits_once() {
                 &store,
                 0,
                 "idle=50 timeout=60000 hello peer",
-                &subscribe::new_registry(),
                 &h.ctx,
                 &TurnIo {
                     paste: &paste,
@@ -15772,7 +17057,7 @@ fn feed_idempotent_an_unknown_outcome_is_reported_and_never_replayed() {
         .filter(|e| e.kind == "in-doubt")
         .collect();
     assert_eq!(doubt.len(), 1, "exactly one in-doubt row");
-    assert_eq!(doubt[0].payload, "producer=4 seq=1 reply=ERR-write");
+    assert_eq!(&*doubt[0].payload, "producer=4 seq=1 reply=ERR-write");
     drop(timeline);
 
     // The carve-outs: a lease or authority refusal is decided before any byte,
@@ -15848,10 +17133,13 @@ fn unkeyed_verbs_deliver_a_leading_id_as_content() {
     let key = format!("{}:7:1", h.ctx.nonce.to_hex());
     // The literal trailing `\n` is the paste verb's line break, sent as CR.
     let line = format!("id={key} hi\\n");
-    assert!(!crate::pty_idem::is_keyed_verb("paste"));
+    assert!(
+        !aterm_types::control_verbs::input_of("paste")
+            .contains(aterm_types::control_verbs::Input::KEYED)
+    );
 
     // The dispatch's scan takes nothing: the tail is the whole line.
-    let (leading, rest) = control_input::take_leading_options("paste", &line);
+    let (leading, rest) = control_input::take_leading_options(input_of("paste"), &line);
     assert_eq!(leading.idem, None);
     assert!(leading.refusal.is_none());
     assert_eq!(rest, line);
@@ -15859,13 +17147,13 @@ fn unkeyed_verbs_deliver_a_leading_id_as_content() {
     // The `paste` arm's event, delivered through the real sink: the key
     // lands on the PTY as text, byte for byte, and the `\n` as CR.
     assert_eq!(
-        cross_input(
+        background(
+            "paste",
             &h.term,
             &h.ctx,
-            Some(InputEvent::Paste(paste_text(&rest), PasteFraming::AtDrain)),
-            "ERR\n",
+            InputEvent::Paste(paste_text(rest), PasteFraming::AtDrain),
         ),
-        "OK\n"
+        Ok(InputOutcome::Ok)
     );
     assert_eq!(
         drain_pipe(&rx),
@@ -15939,11 +17227,11 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     // driver's next `await seq` is anchored whichever way the guard went.
     let seq = crate::term_lock(&h.term).content_seq();
     assert_eq!(
-        stamp_input_seq("key", "OK skipped\n".to_string(), &h.term),
+        stamp_input_seq(input_of("key"), "OK skipped\n".to_string(), &h.term),
         format!("OK skipped seq={seq}\n")
     );
     assert_eq!(
-        stamp_input_seq("key", "OK\n".to_string(), &h.term),
+        stamp_input_seq(input_of("key"), "OK\n".to_string(), &h.term),
         format!("OK seq={seq}\n")
     );
 
@@ -16025,14 +17313,10 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     assert!(drain_pipe(&rx).is_empty());
 
     let observed = observe();
-    h.ctx
-        .update_parked
-        .store(true, std::sync::atomic::Ordering::Release);
+    h.ctx.update_parked.park_for_test();
     assert!(launch(observed).is_err());
     assert!(drain_pipe(&rx).is_empty());
-    h.ctx
-        .update_parked
-        .store(false, std::sync::atomic::Ordering::Release);
+    h.ctx.update_parked.resume_for_test();
 
     assert!(
         crate::task_launch::type_launch_line(
@@ -16179,12 +17463,14 @@ fn a_guarded_key_composes_with_the_idempotency_key_and_a_skip_gives_the_sequence
     let key = format!("{}:9:1", h.ctx.nonce.to_hex());
 
     // Either order is one request.
-    let (a, rest_a) =
-        control_input::take_leading_options("key", &format!("id={key} if=Do.you.want 1"));
-    let (b, rest_b) =
-        control_input::take_leading_options("key", &format!("if=Do.you.want id={key} 1"));
+    let (key_first, guard_first) = (
+        format!("id={key} if=Do.you.want 1"),
+        format!("if=Do.you.want id={key} 1"),
+    );
+    let (a, rest_a) = control_input::take_leading_options(input_of("key"), &key_first);
+    let (b, rest_b) = control_input::take_leading_options(input_of("key"), &guard_first);
     assert_eq!(a, b);
-    assert_eq!((rest_a.as_str(), rest_b.as_str()), ("1", "1"));
+    assert_eq!((rest_a, rest_b), ("1", "1"));
     assert_eq!(a.idem.as_deref(), Some(key.as_str()));
     assert_eq!(a.guard.as_deref(), Some("Do.you.want"));
     assert!(a.refusal.is_none());
@@ -16581,7 +17867,6 @@ fn a_guarded_turn_submit_never_presses_enter_into_a_screen_its_guard_left() {
             &store,
             0,
             line,
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste,
@@ -16656,7 +17941,6 @@ fn a_guarded_submit_is_bound_to_the_cursor_row_not_a_transcript_caret() {
             &store,
             0,
             "idle=20 timeout=3000 submit_window=100 presses=1 submit=guarded:^\u{276f} hello",
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste,
@@ -16975,10 +18259,9 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
     }
 
     // Another connection ending releases nothing; its own does.
-    let subscribers = subscribe::new_registry();
-    release_connection_claims(&store, &subscribers, None, 40);
+    release_connection_claims(&store, None, 40);
     assert!(row().ends_with(" supervisor=sup-a"));
-    release_connection_claims(&store, &subscribers, None, 41);
+    release_connection_claims(&store, None, 41);
     assert!(row().ends_with(" supervisor=-"), "{}", row());
 
     // A `ttl=` claim is not bound to the connection that set it.
@@ -16986,7 +18269,7 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
         sup(Scope::Owner, Some(43), "set supervisor sup-b ttl=60000"),
         Some(("OK\n".to_string(), true))
     );
-    release_connection_claims(&store, &subscribers, None, 43);
+    release_connection_claims(&store, None, 43);
     assert!(row().ends_with(" supervisor=sup-b"), "{}", row());
     // `holder=` gives back only the named holder's claim: another's
     // stays (a stopped supervisor never clears its successor's)…
@@ -17081,7 +18364,7 @@ fn local_of(app: &crate::App, ctx: &crate::SessionCtx) -> u64 {
 fn log_and_brief_answer_a_closed_session_for_the_owner() {
     use super::{Scope, Selector, closed_session_reply};
     let (mut app, ctx, _) = closed_session_fixture(&[]);
-    let sid = Selector::Sid(ctx.self_id.clone());
+    let sid = Selector::parse(ctx.self_id.as_str());
     let local = local_of(&app, &ctx);
     assert_eq!(
         closed_session_reply(Some(&sid), "log", "", &app.store, Scope::Owner),
@@ -17091,7 +18374,10 @@ fn log_and_brief_answer_a_closed_session_for_the_owner() {
     app.retire_session_registration(local);
     let at_close = super::control_session::cmd_log(&ctx, "");
     assert!(at_close.contains(" close - "), "{at_close}");
-    for sel in [Selector::Sid(ctx.self_id.clone()), Selector::Local(local)] {
+    for sel in [
+        Selector::parse(ctx.self_id.as_str()),
+        Selector::Local(local),
+    ] {
         assert_eq!(
             closed_session_reply(Some(&sel), "log", "", &app.store, Scope::Owner),
             at_close
@@ -17121,13 +18407,73 @@ fn log_and_brief_answer_a_closed_session_for_the_owner() {
     );
     assert_eq!(
         closed_session_reply(
-            Some(&Selector::Sid(aterm_session::SessionId::generate())),
+            Some(&Selector::parse(
+                aterm_session::SessionId::generate().as_str()
+            )),
             "log",
             "",
             &app.store,
             Scope::Owner
         ),
         "ERR no such session\n"
+    );
+}
+
+/// A CLOSE WAKES ITS WATCHERS ONLY ONCE ITS LOG IS KEPT. A watcher on the
+/// session's list and the instance's holds the session's edge table, which the
+/// shipping retire takes between its deregister and the closed-session entry's
+/// link: once the store no longer lists the session, neither list has rung (a
+/// ring there wakes a reader into `ERR no such session`). Released, the close
+/// rings, and the reader it wakes is answered from the closed index.
+#[test]
+fn a_close_wakes_its_watchers_only_once_its_log_is_kept() {
+    use std::sync::atomic::Ordering;
+
+    use super::{Scope, Selector, closed_session_reply};
+    let (mut app, ctx, _) = closed_session_fixture(&[]);
+    let local = local_of(&app, &ctx);
+    let store = app.store.clone();
+    let lists = [
+        std::sync::Arc::clone(&ctx.watchers),
+        store.read().unwrap().instance_watchers(),
+    ];
+    let (edges, sid) = (std::sync::Arc::clone(&ctx.edges), ctx.self_id.clone());
+    let (armed, ready) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        let mut sub = crate::session_watch::Subscription::new();
+        let flags: Vec<_> = lists.iter().map(|list| sub.watch(list)).collect();
+        for flag in &flags {
+            flag.store(false, Ordering::Release);
+        }
+        let between = edges.lock().unwrap();
+        armed.send(()).expect("the test waits for the watcher");
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the close to deregister the session",
+            || store.read().unwrap().by_sid(&sid).is_none().then_some(()),
+        );
+        let rang: Vec<bool> = flags.iter().map(|f| f.load(Ordering::Acquire)).collect();
+        drop(between);
+        assert!(
+            sub.wait(aterm_spec::wait::MUST_HAPPEN),
+            "the close rings its lists"
+        );
+        let sel = Selector::parse(sid.as_str());
+        let log = closed_session_reply(Some(&sel), "log", "", &store, Scope::Owner);
+        (rang, log)
+    });
+    ready.recv().expect("the watcher is armed");
+    app.retire_session_registration(local);
+    let (rang, log) =
+        crate::test_socket::join_after_hang_up(watcher, "the woken watcher to read the log");
+    assert_eq!(
+        rang,
+        [false, false],
+        "no list rang between the deregister and the link"
+    );
+    assert!(
+        log.contains(" close - "),
+        "the woken reader reads the kept log: {log}"
     );
 }
 
@@ -17138,7 +18484,7 @@ fn log_and_brief_answer_a_closed_session_for_the_owner() {
 /// escalation, and `brief` is unchanged.
 #[test]
 fn log_n_is_the_owners_and_names_no_session() {
-    use super::{Scope, Selector, escalated_op, node_log_reply};
+    use super::{Scope, Selector, node_log_reply};
     let ctx = test_ctx();
     let read_edge = edge_granted(Op::ReadScreen, &ctx);
     let owner = node_log_reply("n", None, Scope::Owner);
@@ -17162,15 +18508,12 @@ fn log_n_is_the_owners_and_names_no_session() {
         "ERR denied: log n takes no @<sid>\n"
     );
     assert_eq!(
-        escalated_op("log", ""),
+        escalation("log", ""),
         None,
         "NEGATIVE CONTROL: a session's log"
     );
-    assert_eq!(escalated_op("brief", ""), None, "brief is unchanged");
-    assert_eq!(
-        escalated_op("brief", "all"),
-        Some(super::Escalation::OwnerOnly)
-    );
+    assert_eq!(escalation("brief", ""), None, "brief is unchanged");
+    assert_eq!(escalation("brief", "all"), Some(Need::OwnerOnly));
 }
 
 /// AN EDGE LEARNS NOTHING OF A CLOSED SESSION IT COULD NOT READ: one granted
@@ -17196,7 +18539,7 @@ fn an_edge_learns_nothing_of_a_closed_session() {
     );
     let local = local_of(&app, &ctx);
     app.retire_session_registration(local);
-    let sid = Selector::Sid(ctx.self_id.clone());
+    let sid = Selector::parse(ctx.self_id.as_str());
     let owner = closed_session_reply(Some(&sid), "log", "", &app.store, Scope::Owner);
     assert!(owner.starts_with("OK "), "{owner}");
     assert_eq!(
@@ -17246,7 +18589,7 @@ fn a_closing_sessions_own_read_grant_dies_with_its_source() {
 
     let local = local_of(&app, &ctx);
     app.retire_session_registration(local);
-    let sid = Selector::Sid(ctx.self_id.clone());
+    let sid = Selector::parse(ctx.self_id.as_str());
     let owner = closed_session_reply(Some(&sid), "log", "", &app.store, Scope::Owner);
     assert!(owner.starts_with("OK "), "the closed log remains: {owner}");
     assert_eq!(
@@ -17281,7 +18624,7 @@ fn a_closed_sessions_read_grants_stay_revocable_and_never_answer_twice() {
     let source = owner_ctx.self_id.clone();
     let local = local_of(&app, &ctx);
     app.retire_session_registration(local);
-    let sid = Selector::Sid(ctx.self_id.clone());
+    let sid = Selector::parse(ctx.self_id.as_str());
     let reads = |scope: Scope| {
         closed_session_reply(Some(&sid), "log", "", &app.store, scope).starts_with("OK ")
     };
@@ -17382,7 +18725,7 @@ fn a_resolved_disconnect_revokes_the_same_read_grant_across_retirement() {
         if !close_first {
             app.retire_session_registration(local);
         }
-        let selector = Selector::Sid(dst.clone());
+        let selector = Selector::parse(dst.as_str());
         let can_read = |token| {
             closed_session_reply(Some(&selector), "log", "", &app.store, Scope::Edge(token))
                 .starts_with("OK ")
@@ -17467,7 +18810,7 @@ fn a_late_owner_grant_on_an_initially_empty_closed_table_remains_revocable() {
         let token =
             aterm_session::EdgeToken::from_hex(reply.strip_prefix("OK ").unwrap().trim_end())
                 .unwrap();
-        let selector = Selector::Sid(ctx.self_id.clone());
+        let selector = Selector::parse(ctx.self_id.as_str());
         let reads = |app: &crate::App| {
             closed_session_reply(Some(&selector), "log", "", &app.store, Scope::Edge(token))
                 .starts_with("OK ")
@@ -17501,7 +18844,7 @@ fn an_ambiguous_closed_sid_is_refused() {
     let local = local_of(&app, &ctx);
     app.retire_session_registration(local);
     crate::identity_claim::note_adopted(&ctx.self_id);
-    let sid = Selector::Sid(ctx.self_id.clone());
+    let sid = Selector::parse(ctx.self_id.as_str());
     assert!(
         closed_session_reply(Some(&sid), "log", "", &app.store, Scope::Owner).starts_with("OK "),
         "CONTROL: nobody else serves it"
@@ -17598,7 +18941,7 @@ fn a_session_from_an_earlier_process_answers_from_the_journal_for_the_owner_only
     let logs = journal_with_a_dead_chain(&scratch, &sid);
     let reader = crate::session_log_journal::read::Reader::at(logs);
     let store = crate::session_store::new_store();
-    let sel = Selector::Sid(sid.clone());
+    let sel = Selector::parse(sid.as_str());
     let owner =
         journal_session_reply_with(Some(&reader), Some(&sel), "log", "", &store, Scope::Owner)
             .expect("the owner reads the journal");
@@ -17636,7 +18979,8 @@ fn a_session_from_an_earlier_process_answers_from_the_journal_for_the_owner_only
         None,
         "the journal off reads nothing"
     );
-    let unknown = Selector::Sid(aterm_session::SessionId::generate());
+    let unknown_sid = aterm_session::SessionId::generate();
+    let unknown = Selector::parse(unknown_sid.as_str());
     assert_eq!(
         journal_session_reply_with(
             Some(&reader),
@@ -17762,7 +19106,7 @@ fn a_revoked_edge_cannot_read_a_closed_session_through_the_journal() {
     let scratch = base.join(format!("aterm-ctl-journal-revoked-{}", std::process::id()));
     let logs = journal_with_a_dead_chain(&scratch, &ctx.self_id);
     let reader = crate::session_log_journal::read::Reader::at(logs);
-    let sel = Selector::Sid(ctx.self_id.clone());
+    let sel = Selector::parse(ctx.self_id.as_str());
     let edge = Scope::Edge(tokens[0]);
     let read = |verb: &str, scope: Scope| {
         closed_session_reply_with(Some(&reader), Some(&sel), verb, "", &app.store, scope)
@@ -17861,18 +19205,16 @@ fn a_wrong_token_is_still_err_auth() {
 #[test]
 fn cause_is_taken_among_the_leading_options_once() {
     use crate::session_log::CauseRef;
-    let (o, tail) = control_input::take_leading_options("send", "cause=@5 id=a:b:c hi");
+    let (o, tail) = control_input::take_leading_options(input_of("send"), "cause=@5 id=a:b:c hi");
     assert_eq!(
-        (o.cause, o.idem.as_deref(), tail.as_str()),
+        (o.cause, o.idem.as_deref(), tail),
         (Some(CauseRef::Mail(5)), Some("a:b:c"), "hi")
     );
-    let (o, tail) = control_input::take_leading_options("send", "id=a:b:c cause=12 if=x hi");
-    assert_eq!((o.cause, tail.as_str()), (Some(CauseRef::Rec(12)), "hi"));
-    let (o, tail) = control_input::take_leading_options("turn", "cause=7 idle=5 hi");
-    assert_eq!(
-        (o.cause, tail.as_str()),
-        (Some(CauseRef::Rec(7)), "idle=5 hi")
-    );
+    let (o, tail) =
+        control_input::take_leading_options(input_of("send"), "id=a:b:c cause=12 if=x hi");
+    assert_eq!((o.cause, tail), (Some(CauseRef::Rec(12)), "hi"));
+    let (o, tail) = control_input::take_leading_options(input_of("turn"), "cause=7 idle=5 hi");
+    assert_eq!((o.cause, tail), (Some(CauseRef::Rec(7)), "idle=5 hi"));
     for bad in [
         "cause=@",
         "cause=0",
@@ -17881,19 +19223,15 @@ fn cause_is_taken_among_the_leading_options_once() {
         "cause=@5 cause=6",
         "cause=@1x",
     ] {
-        let (o, _) = control_input::take_leading_options("send", &format!("{bad} hi"));
+        let (o, _) = control_input::take_leading_options(input_of("send"), &format!("{bad} hi"));
         assert_eq!(
             o.refusal.as_deref(),
             Some(crate::session_log::CAUSE_USAGE),
             "{bad}"
         );
     }
-    let (o, tail) = control_input::take_leading_options("key", "cause=7 enter");
-    assert_eq!(
-        (o.cause, tail.as_str()),
-        (None, "cause=7 enter"),
-        "key takes none"
-    );
+    let (o, tail) = control_input::take_leading_options(input_of("key"), "cause=7 enter");
+    assert_eq!((o.cause, tail), (None, "cause=7 enter"), "key takes none");
 }
 
 /// `act=` (phase 5, ruling T1): taken among `key`'s and `send`'s leading
@@ -17903,18 +19241,19 @@ fn cause_is_taken_among_the_leading_options_once() {
 #[test]
 fn act_is_taken_among_key_and_send_leading_options_once() {
     use aterm_slog::ActWord;
-    let (o, tail) = control_input::take_leading_options("key", "act=approve 1");
+    let (o, tail) = control_input::take_leading_options(input_of("key"), "act=approve 1");
     assert_eq!(
-        (o.act, o.refusal.as_deref(), tail.as_str()),
+        (o.act, o.refusal.as_deref(), tail),
         (Some(ActWord::Approve), None, "1")
     );
-    let (o, tail) = control_input::take_leading_options("send", "id=a:b:c act=answer cause=@5 hi");
+    let (o, tail) =
+        control_input::take_leading_options(input_of("send"), "id=a:b:c act=answer cause=@5 hi");
     assert_eq!(
-        (o.act, o.idem.as_deref(), tail.as_str()),
+        (o.act, o.idem.as_deref(), tail),
         (Some(ActWord::Answer), Some("a:b:c"), "hi")
     );
-    let (o, tail) = control_input::take_leading_options("key", "if-gen=1.2 act=deny 2");
-    assert_eq!((o.act, tail.as_str()), (Some(ActWord::Deny), "2"));
+    let (o, tail) = control_input::take_leading_options(input_of("key"), "if-gen=1.2 act=deny 2");
+    assert_eq!((o.act, tail), (Some(ActWord::Deny), "2"));
     for bad in [
         "act=",
         "act=yes",
@@ -17924,7 +19263,7 @@ fn act_is_taken_among_key_and_send_leading_options_once() {
         "act=approve act=deny",
     ] {
         for verb in ["key", "send"] {
-            let (o, _) = control_input::take_leading_options(verb, &format!("{bad} 1"));
+            let (o, _) = control_input::take_leading_options(input_of(verb), &format!("{bad} 1"));
             assert_eq!(
                 o.refusal.as_deref(),
                 Some(control_input::ACT_USAGE),
@@ -17933,8 +19272,8 @@ fn act_is_taken_among_key_and_send_leading_options_once() {
         }
     }
     for verb in ["paste", "turn"] {
-        let (o, tail) = control_input::take_leading_options(verb, "act=approve hi");
-        assert_eq!((o.act, tail.as_str()), (None, "act=approve hi"), "{verb}");
+        let (o, tail) = control_input::take_leading_options(input_of(verb), "act=approve hi");
+        assert_eq!((o.act, tail), (None, "act=approve hi"), "{verb}");
     }
 }
 
@@ -18033,7 +19372,6 @@ fn a_turn_takes_cause_among_its_options_and_types_only_the_text() {
             &store,
             0,
             line,
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -18097,7 +19435,6 @@ fn a_refused_turn_option_leaves_its_id_for_the_retry() {
             &store,
             0,
             line,
-            &subscribe::new_registry(),
             &h.ctx,
             &TurnIo {
                 paste: &paste,
@@ -18170,7 +19507,6 @@ fn feed_bin_and_paste_bin_note_their_input() {
         let mut out = Vec::new();
         assert!(run_feed_bin(
             &line,
-            verb,
             &mut reader,
             &active,
             &store,
@@ -18211,12 +19547,10 @@ fn a_turn_wakes_the_logs_watchers() {
     let store = session_store::new_store();
     let (h, _reader) = crate::control_input_ack::testing::owned_handle(0);
     store.write().unwrap().register(h.clone());
-    let subscribers = subscribe::new_registry();
     let _ = h.ctx.timeline.lock().unwrap().slog_take_wake();
-    let sub = crate::subscribe::SubscriberSet::register(&subscribers, &[0]);
+    let sub = crate::session_watch::Subscription::single(&h.ctx.watchers);
     let mark = crate::control_input_ack::InputMark::at_epoch(
         &h.ctx,
-        Some(&subscribers),
         0,
         aterm_slog::Actor::Harness,
         crate::session_log::InputVerb::Turn,
@@ -18230,7 +19564,6 @@ fn a_turn_wakes_the_logs_watchers() {
         &store,
         0,
         "submit=none idle=5 timeout=60000 hi",
-        &subscribers,
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -18315,7 +19648,6 @@ fn a_mark_act_on_an_open_approval_writes_no_byte() {
     let store = session_store::new_store();
     let (h, rx) = pipe_session(1);
     store.write().unwrap().register(h.clone());
-    let subscribers = subscribe::new_registry();
     let step = with_open_approval(&h);
     let (edge, src) = edge_to(&h, aterm_session::Op::WriteInput);
     let act = format!("{step} act word=approve rule=r1 re=1");
@@ -18324,7 +19656,7 @@ fn a_mark_act_on_an_open_approval_writes_no_byte() {
         (Scope::Owner, true, "harness".to_string()),
     ] {
         let _principal = harness.then(|| ServingPrincipal::enter(Principal::Harness));
-        let reply = dispatch_mark(&h.ctx, scope, 1, &act, &subscribers);
+        let reply = dispatch_mark(&h.ctx, scope, &act);
         assert!(
             reply.starts_with("OK seq=") && reply.ends_with(&format!(" node={step} by={by}\n")),
             "{reply}"
@@ -18332,18 +19664,18 @@ fn a_mark_act_on_an_open_approval_writes_no_byte() {
     }
     // The edge, which may not read the session, marks the deepest open node
     // (the approval's step) and is told nothing of it.
-    let reply = dispatch_mark(&h.ctx, edge, 1, "- act word=approve rule=r1", &subscribers);
+    let reply = dispatch_mark(&h.ctx, edge, "- act word=approve rule=r1");
     assert_eq!(reply, format!("OK by={}\n", src.as_str()));
     // The positive control, through the write a `send` makes to a background
     // session.
-    assert!(
-        cross_input(
+    assert_eq!(
+        background(
+            "send",
             &h.term,
             &h.ctx,
-            Some(InputEvent::KeySequence(b"Z".to_vec())),
-            "ERR\n"
-        )
-        .starts_with("OK"),
+            InputEvent::KeySequence(b"Z".to_vec())
+        ),
+        Ok(InputOutcome::Ok),
         "the sentinel was written"
     );
     let (tx, got) = std::sync::mpsc::channel();
@@ -18391,14 +19723,7 @@ fn a_marks_author_is_the_connection_and_never_a_chosen_word() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subscribers = subscribe::new_registry();
-    let reply = dispatch_mark(
-        &h.ctx,
-        Scope::Owner,
-        1,
-        "- verdict word=done as=reviewer",
-        &subscribers,
-    );
+    let reply = dispatch_mark(&h.ctx, Scope::Owner, "- verdict word=done as=reviewer");
     assert!(reply.ends_with(" node=- by=ctl\n"), "{reply}");
     let forged = h.ctx.edges.lock().unwrap().grant(
         SessionId::new("harness"),
@@ -18411,18 +19736,14 @@ fn a_marks_author_is_the_connection_and_never_a_chosen_word() {
         dispatch_mark(
             &h.ctx,
             Scope::Edge(forged),
-            1,
             "- label text=trust%20me as=harness",
-            &subscribers,
         ),
         "ERR mark: as=harness is a session log actor\n"
     );
     let reply = dispatch_mark(
         &h.ctx,
         Scope::Edge(forged),
-        1,
         "- label text=trust%20me as=bot",
-        &subscribers,
     );
     assert!(reply.ends_with(" by=-\n"), "{reply}");
     let g = h.ctx.timeline.lock().unwrap();
@@ -18479,7 +19800,6 @@ fn a_mark_tells_a_writer_that_may_not_read_nothing() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let step = with_open_approval(&h);
     let source = SessionId::generate();
     let writer = h.ctx.edges.lock().unwrap().grant(
@@ -18496,26 +19816,20 @@ fn a_mark_tells_a_writer_that_may_not_read_nothing() {
         "- note text=x re=@5".to_string(),
     ] {
         assert_eq!(
-            dispatch_mark(&h.ctx, Scope::Edge(writer), 1, &probe, &subs),
+            dispatch_mark(&h.ctx, Scope::Edge(writer), &probe),
             "ERR denied\n",
             "{probe}"
         );
     }
-    let reply = dispatch_mark(&h.ctx, Scope::Edge(writer), 1, "- note text=x", &subs);
+    let reply = dispatch_mark(&h.ctx, Scope::Edge(writer), "- note text=x");
     assert_eq!(reply, format!("OK by={}\n", source.as_str()));
     // NEGATIVE CONTROL: the owner may read, and is told.
-    let reply = dispatch_mark(
-        &h.ctx,
-        Scope::Owner,
-        1,
-        &format!("{step} note text=y re=1"),
-        &subs,
-    );
+    let reply = dispatch_mark(&h.ctx, Scope::Owner, &format!("{step} note text=y re=1"));
     assert!(
         reply.starts_with("OK seq=") && reply.contains(&format!(" node={step} by=ctl")),
         "{reply}"
     );
-    let reply = dispatch_mark(&h.ctx, Scope::Owner, 1, "r999 note text=z", &subs);
+    let reply = dispatch_mark(&h.ctx, Scope::Owner, "r999 note text=z");
     assert_eq!(reply, "ERR mark: no node r999\n");
 }
 
@@ -18603,9 +19917,8 @@ fn mark_grammar_refuses_what_a_claim_may_not_say() {
 #[test]
 fn a_mark_lands_only_on_an_open_node() {
     let h = registered_session(1, -1, b"");
-    let subscribers = subscribe::new_registry();
     let step = with_open_approval(&h);
-    let reply = dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=x", &subscribers);
+    let reply = dispatch_mark(&h.ctx, Scope::Owner, "- note text=x");
     assert!(
         reply.ends_with(&format!(" node={step} by=ctl\n")),
         "{reply}"
@@ -18620,17 +19933,11 @@ fn a_mark_lands_only_on_an_open_node() {
         g.publish_agent("busy", None, None, claude, stamp);
     }
     assert_eq!(
-        dispatch_mark(
-            &h.ctx,
-            Scope::Owner,
-            1,
-            &format!("{step} act word=approve"),
-            &subscribers
-        ),
+        dispatch_mark(&h.ctx, Scope::Owner, &format!("{step} act word=approve"),),
         format!("ERR mark: {step} is not open\n")
     );
     assert_eq!(
-        dispatch_mark(&h.ctx, Scope::Owner, 1, "p999 note text=x", &subscribers),
+        dispatch_mark(&h.ctx, Scope::Owner, "p999 note text=x"),
         "ERR mark: no node p999\n"
     );
 }
@@ -18641,7 +19948,6 @@ fn a_mark_lands_only_on_an_open_node() {
 #[test]
 fn the_twenty_first_mark_is_busy() {
     let h = registered_session(1, -1, b"");
-    let subscribers = subscribe::new_registry();
     let ms = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
     let read = Arc::clone(&ms);
     h.ctx
@@ -18654,33 +19960,21 @@ fn the_twenty_first_mark_is_busy() {
             aterm_slog::Stamp::new(1_760_000_000_000 + t, t)
         }));
     for i in 0..20 {
-        let reply = dispatch_mark(
-            &h.ctx,
-            Scope::Owner,
-            1,
-            &format!("- note text=n{i}"),
-            &subscribers,
-        );
+        let reply = dispatch_mark(&h.ctx, Scope::Owner, &format!("- note text=n{i}"));
         assert!(reply.starts_with("OK "), "{i}: {reply}");
     }
-    let busy = dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=more", &subscribers);
+    let busy = dispatch_mark(&h.ctx, Scope::Owner, "- note text=more");
     assert!(busy.starts_with("ERR busy retry_ms="), "{busy}");
     {
         let _principal = ServingPrincipal::enter(Principal::Harness);
-        let reply = dispatch_mark(
-            &h.ctx,
-            Scope::Owner,
-            1,
-            "- verdict word=on-track",
-            &subscribers,
-        );
+        let reply = dispatch_mark(&h.ctx, Scope::Owner, "- verdict word=on-track");
         assert!(
             reply.ends_with(" by=harness\n"),
             "the harness's own bucket: {reply}"
         );
     }
     ms.fetch_add(1_000, std::sync::atomic::Ordering::SeqCst);
-    let again = dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=later", &subscribers);
+    let again = dispatch_mark(&h.ctx, Scope::Owner, "- note text=later");
     assert!(again.starts_with("OK "), "{again}");
 }
 
@@ -18690,7 +19984,6 @@ fn the_twenty_first_mark_is_busy() {
 #[test]
 fn a_marks_need_ranks_last_and_its_clear_lifts_only_claims() {
     let h = registered_session(1, -1, b"");
-    let subscribers = subscribe::new_registry();
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
@@ -18716,9 +20009,7 @@ fn a_marks_need_ranks_last_and_its_clear_lifts_only_claims() {
         )
         .expect("fail");
     }
-    assert!(
-        dispatch_mark(&h.ctx, Scope::Owner, 1, "- need word=help", &subscribers).starts_with("OK ")
-    );
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- need word=help").starts_with("OK "));
     let needs = |h: &SessionHandle| -> Vec<&'static str> {
         h.ctx
             .timeline
@@ -18734,7 +20025,7 @@ fn a_marks_need_ranks_last_and_its_clear_lifts_only_claims() {
             .collect()
     };
     assert_eq!(needs(&h), vec!["failure", "help"], "the claim ranks last");
-    assert!(dispatch_mark(&h.ctx, Scope::Owner, 1, "- clear", &subscribers).starts_with("OK "));
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- clear").starts_with("OK "));
     assert_eq!(
         needs(&h),
         vec!["failure"],
@@ -18762,10 +20053,7 @@ fn mark_is_not_halted_or_leased() {
         "mark is not"
     );
     assert!(!crate::fabric::is_pty_reaching("mark"));
-    let subscribers = subscribe::new_registry();
-    assert!(
-        dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=held", &subscribers).starts_with("OK ")
-    );
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- note text=held").starts_with("OK "));
 }
 
 /// VERSION SKEW (phase 3A): `mark`'s reply is one `OK`/`ERR` status line, the
@@ -18782,15 +20070,8 @@ fn mark_is_status_framed() {
 
 /// `await log <args>` on `h`, in process (no hangup slicing: a missing wake
 /// parks it to its deadline).
-fn await_log(h: &SessionHandle, store: &Store, subs: &Subscribers, args: &str) -> String {
-    control_session::cmd_await(
-        &h.term,
-        store,
-        h.local_id,
-        &h.ctx,
-        &format!("log {args}"),
-        subs,
-    )
+fn await_log(h: &SessionHandle, store: &Store, args: &str) -> String {
+    control_session::cmd_await(&h.term, store, h.local_id, &h.ctx, &format!("log {args}"))
 }
 
 /// A session continued from its own log's carry, as a seamless update's
@@ -18822,14 +20103,13 @@ fn a_latched_need_across_a_handoff_answers_without_looping() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let step = with_open_approval(&h);
     carried_across_an_update(&h);
     for call in 0..2 {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+        let (h2, store2) = (h.clone(), store.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(await_log(&h2, &store2, &subs2, "need timeout=600000"));
+            let _ = tx.send(await_log(&h2, &store2, "need timeout=600000"));
         });
         let reply = rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
@@ -18842,11 +20122,8 @@ fn a_latched_need_across_a_handoff_answers_without_looping() {
     // A claim's need alone does not latch: the wait is for what comes next.
     let h3 = registered_session(2, -1, b"");
     store.write().unwrap().register(h3.clone());
-    assert!(dispatch_mark(&h3.ctx, Scope::Owner, 2, "- need word=help", &subs).starts_with("OK "));
-    assert_eq!(
-        await_log(&h3, &store, &subs, "need timeout=0"),
-        "OK timeout\n"
-    );
+    assert!(dispatch_mark(&h3.ctx, Scope::Owner, "- need word=help").starts_with("OK "));
+    assert_eq!(await_log(&h3, &store, "need timeout=0"), "OK timeout\n");
 }
 
 /// R2: a wait that crosses a loss with no match answers the gap, its
@@ -18857,7 +20134,6 @@ fn a_rearm_at_resync_to_never_returns_the_same_gap() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let (ep, last) = {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
@@ -18878,12 +20154,7 @@ fn a_rearm_at_resync_to_never_returns_the_same_gap() {
         assert!(log.lost() > 0, "PRECONDITION: the ring evicted");
         (log.ep(), log.last_seq())
     };
-    let reply = await_log(
-        &h,
-        &store,
-        &subs,
-        &format!("kind=note since=1 ep={ep} timeout=0"),
-    );
+    let reply = await_log(&h, &store, &format!("kind=note since=1 ep={ep} timeout=0"));
     let resync = reply
         .strip_prefix("OK gap why=evicted ")
         .and_then(|r| {
@@ -18897,20 +20168,14 @@ fn a_rearm_at_resync_to_never_returns_the_same_gap() {
         await_log(
             &h,
             &store,
-            &subs,
             &format!("kind=note since={resync} ep={ep} timeout=0")
         ),
         "OK timeout\n",
         "re-armed at resync_to: no gap again"
     );
     // A match past the loss carries the gap before it.
-    assert!(dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=here", &subs).starts_with("OK "));
-    let reply = await_log(
-        &h,
-        &store,
-        &subs,
-        &format!("kind=note since=1 ep={ep} timeout=0"),
-    );
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- note text=here").starts_with("OK "));
+    let reply = await_log(&h, &store, &format!("kind=note since=1 ep={ep} timeout=0"));
     assert!(
         reply.starts_with("OK seq=")
             && reply.contains(" gap=evicted:")
@@ -18928,15 +20193,12 @@ fn await_log_predicates_match_exactly_their_records() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let head = |h: &SessionHandle| {
         let g = h.ctx.timeline.lock().unwrap();
         (g.slog().log().ep(), g.slog().log().last_seq())
     };
     let (ep, s0) = head(&h);
-    assert!(
-        dispatch_mark(&h.ctx, Scope::Owner, 1, "- verdict word=blocked", &subs).starts_with("OK ")
-    );
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- verdict word=blocked").starts_with("OK "));
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
@@ -18957,34 +20219,19 @@ fn await_log_predicates_match_exactly_their_records() {
         .expect("status");
     }
     assert_eq!(
-        await_log(
-            &h,
-            &store,
-            &subs,
-            &format!("need since={s0} ep={ep} timeout=0")
-        ),
+        await_log(&h, &store, &format!("need since={s0} ep={ep} timeout=0")),
         "OK timeout\n",
         "a verdict claim and a status mark raise no need"
     );
     let step = with_open_approval(&h);
-    let reply = await_log(
-        &h,
-        &store,
-        &subs,
-        &format!("need since={s0} ep={ep} timeout=0"),
-    );
+    let reply = await_log(&h, &store, &format!("need since={s0} ep={ep} timeout=0"));
     assert!(
         reply.contains(&format!(" open {step} approval ")),
         "{reply}"
     );
     let (_, s1) = head(&h);
-    assert!(dispatch_mark(&h.ctx, Scope::Owner, 1, "- need word=help", &subs).starts_with("OK "));
-    let reply = await_log(
-        &h,
-        &store,
-        &subs,
-        &format!("need since={s1} ep={ep} timeout=0"),
-    );
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- need word=help").starts_with("OK "));
+    let reply = await_log(&h, &store, &format!("need since={s1} ep={ep} timeout=0"));
     assert!(
         reply.contains(" need word=help by=ctl src=mark conf=claim "),
         "{reply}"
@@ -18992,7 +20239,6 @@ fn await_log_predicates_match_exactly_their_records() {
     let reply = await_log(
         &h,
         &store,
-        &subs,
         &format!("open=step since={s0} ep={ep} timeout=0"),
     );
     assert!(reply.contains(&format!(" open {step} ")), "{reply}");
@@ -19000,7 +20246,6 @@ fn await_log_predicates_match_exactly_their_records() {
     let reply = await_log(
         &h,
         &store,
-        &subs,
         &format!("kind=verdict since=0 ep={ep} timeout=0"),
     );
     assert!(
@@ -19017,7 +20262,6 @@ fn await_log_refuses_its_usage_at_once_and_says_a_reset() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     for bad in [
         "since=3 timeout=0 need",
         "open=page",
@@ -19030,17 +20274,14 @@ fn await_log_refuses_its_usage_at_once_and_says_a_reset() {
         "need since=4",
     ] {
         assert_eq!(
-            await_log(&h, &store, &subs, bad),
+            await_log(&h, &store, bad),
             crate::session_log::AWAIT_LOG_USAGE,
             "{bad:?}"
         );
     }
-    let reply = await_log(&h, &store, &subs, "close=run since=1 ep=999 timeout=0");
+    let reply = await_log(&h, &store, "close=run since=1 ep=999 timeout=0");
     assert!(reply.starts_with("OK gap why=reset "), "{reply}");
-    assert_eq!(
-        await_log(&h, &store, &subs, "close=run timeout=0"),
-        "OK timeout\n"
-    );
+    assert_eq!(await_log(&h, &store, "close=run timeout=0"), "OK timeout\n");
 }
 
 /// 5F-1: A PREDICATE LIST IS ONE WAITER. `await log kind=bell,kind=note`
@@ -19055,37 +20296,36 @@ fn an_await_log_list_parks_one_waiter_and_answers_on_either_member() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let (ep, head) = {
         let g = h.ctx.timeline.lock().unwrap();
         (g.slog().log().ep(), g.slog().log().last_seq())
     };
     let args = format!("kind=bell,kind=note since={head} ep={ep} timeout=600000");
     let (tx, rx) = std::sync::mpsc::channel();
-    let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+    let (h2, store2) = (h.clone(), store.clone());
     std::thread::spawn(move || {
-        let _ = tx.send(await_log(&h2, &store2, &subs2, &args));
+        let _ = tx.send(await_log(&h2, &store2, &args));
     });
     until_within(MUST_HAPPEN, "the list's waiter registers", || {
-        (subs.lock().unwrap().watchers(1) > 0).then_some(())
+        (h.ctx.watchers.count() > 0).then_some(())
     });
-    assert_eq!(subs.lock().unwrap().watchers(1), 1, "one waiter for two");
-    assert!(dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=second", &subs).starts_with("OK "));
+    assert_eq!(h.ctx.watchers.count(), 1, "one waiter for two");
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- note text=second").starts_with("OK "));
     let reply = rx
         .recv_timeout(MUST_HAPPEN)
         .expect("woken by the second member's record");
     assert!(reply.contains(" mark - note text=second "), "{reply}");
     until_within(MUST_HAPPEN, "the answered waiter leaves", || {
-        (subs.lock().unwrap().watchers(1) == 0).then_some(())
+        (h.ctx.watchers.count() == 0).then_some(())
     });
 
     let step = with_open_approval(&h);
     for list in ["close=turn,need", "need,kind=bell"] {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+        let (h2, store2) = (h.clone(), store.clone());
         let args = format!("{list} timeout=600000");
         std::thread::spawn(move || {
-            let _ = tx.send(await_log(&h2, &store2, &subs2, &args));
+            let _ = tx.send(await_log(&h2, &store2, &args));
         });
         let reply = rx.recv_timeout(MUST_HAPPEN).expect("a latched need");
         assert!(
@@ -19108,7 +20348,6 @@ fn a_parked_await_log_wakes_on_the_record() {
     let store = session_store::new_store();
     let (h, _reader) = crate::control_input_ack::testing::owned_handle(1);
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     let park = |what: &str| {
         let (ep, head) = {
             let g = h.ctx.timeline.lock().unwrap();
@@ -19116,15 +20355,15 @@ fn a_parked_await_log_wakes_on_the_record() {
         };
         let args = format!("{what} since={head} ep={ep} timeout=600000");
         let (tx, rx) = std::sync::mpsc::channel();
-        let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+        let (h2, store2) = (h.clone(), store.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(await_log(&h2, &store2, &subs2, &args));
+            let _ = tx.send(await_log(&h2, &store2, &args));
         });
         rx
     };
     // A mark.
     let rx = park("kind=note");
-    assert!(dispatch_mark(&h.ctx, Scope::Owner, 1, "- note text=wake", &subs).starts_with("OK "));
+    assert!(dispatch_mark(&h.ctx, Scope::Owner, "- note text=wake").starts_with("OK "));
     let reply = rx
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("woken by the mark");
@@ -19133,7 +20372,6 @@ fn a_parked_await_log_wakes_on_the_record() {
     let rx = park("kind=input");
     let mark = crate::control_input_ack::InputMark::at_epoch(
         &h.ctx,
-        Some(&subs),
         1,
         aterm_slog::Actor::Bridge,
         crate::session_log::InputVerb::Turn,
@@ -19147,7 +20385,6 @@ fn a_parked_await_log_wakes_on_the_record() {
         &store,
         1,
         "submit=none idle=5 timeout=60000 hi",
-        &subs,
         &h.ctx,
         &TurnIo {
             paste: &paste,
@@ -19171,7 +20408,7 @@ fn a_parked_await_log_wakes_on_the_record() {
         crate::session_store::ExitReason::CtlClose,
         crate::session_store::ExitActor::Ctl,
     );
-    subs.lock().unwrap().notify(1);
+    h.ctx.watchers.ring_watchers();
     let reply = rx
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("woken by the close");
@@ -19196,12 +20433,11 @@ fn await_log_waits_for_the_close_of_a_shell_that_exited() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     h.ctx.timeline.lock().unwrap().slog_mut().note_close_due();
     store.write().unwrap().set_state(1, SessionState::Exited);
     for what in ["close=session", "need", "close=run", "kind=verdict"] {
         assert_eq!(
-            await_log(&h, &store, &subs, &format!("{what} timeout=0")),
+            await_log(&h, &store, &format!("{what} timeout=0")),
             "OK timeout\n",
             "{what}: the close is still to come"
         );
@@ -19213,16 +20449,16 @@ fn await_log_waits_for_the_close_of_a_shell_that_exited() {
     let (tx, rx) = std::sync::mpsc::channel();
     for what in ["close=session", "need"] {
         let args = format!("{what} since={head} ep={ep} timeout=600000");
-        let (h2, store2, subs2, tx) = (h.clone(), store.clone(), subs.clone(), tx.clone());
+        let (h2, store2, tx) = (h.clone(), store.clone(), tx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(await_log(&h2, &store2, &subs2, &args));
+            let _ = tx.send(await_log(&h2, &store2, &args));
         });
     }
     store
         .write()
         .unwrap()
         .deregister_local_as(1, ExitReason::ShellExit, ExitActor::Unknown);
-    subs.lock().unwrap().notify(1);
+    h.ctx.watchers.ring_watchers();
     for _ in 0..2 {
         let reply = rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
@@ -19239,7 +20475,7 @@ fn await_log_waits_for_the_close_of_a_shell_that_exited() {
     store.write().unwrap().set_state(2, SessionState::Exited);
     for what in ["close=session", "need", "close=run", "kind=verdict"] {
         assert_eq!(
-            await_log(&held, &store, &subs, &format!("{what} timeout=0")),
+            await_log(&held, &store, &format!("{what} timeout=0")),
             "ERR exited\n",
             "{what}: no close is coming"
         );
@@ -19263,14 +20499,13 @@ fn await_log_waits_for_the_close_of_a_shell_that_exited() {
         &kept.ctx,
         crate::session_log::LogAwait::parse(&["close=session"]).expect("parses"),
         u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis()).unwrap_or(u64::MAX),
-        &subs,
         || {
             looks += 1;
             if looks == 1 {
                 let mut tl = kept.ctx.timeline.lock().unwrap();
                 assert!(tl.slog_mut().take_close_due(), "the close was due");
                 drop(tl);
-                subs.lock().unwrap().notify(3);
+                kept.ctx.watchers.ring_watchers();
             }
         },
     );
@@ -19295,7 +20530,6 @@ fn await_log_answers_a_close_written_right_after_its_look() {
     let store = session_store::new_store();
     let h = registered_session(1, -1, b"");
     store.write().unwrap().register(h.clone());
-    let subs = subscribe::new_registry();
     h.ctx.timeline.lock().unwrap().slog_mut().note_close_due();
     store.write().unwrap().set_state(1, SessionState::Exited);
     let mut retired = 0;
@@ -19305,7 +20539,6 @@ fn await_log_answers_a_close_written_right_after_its_look() {
         &h.ctx,
         crate::session_log::LogAwait::parse(&["close=session"]).expect("parses"),
         u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis()).unwrap_or(u64::MAX),
-        &subs,
         || {
             retired += 1;
             if retired == 1 {
@@ -19314,7 +20547,7 @@ fn await_log_answers_a_close_written_right_after_its_look() {
                     ExitReason::ShellExit,
                     ExitActor::Unknown,
                 );
-                subs.lock().unwrap().notify(1);
+                h.ctx.watchers.ring_watchers();
             }
         },
     );
@@ -19334,7 +20567,6 @@ fn since_log_needs_log_ep_and_a_single_target() {
     store.write().unwrap().register(a.clone());
     store.write().unwrap().register(b.clone());
     let active = active_for(&a);
-    let registry = subscribe::new_registry();
     for (line, want) in [
         (
             "subscribe @. log since-log=4",
@@ -19359,9 +20591,9 @@ fn since_log_needs_log_ep_and_a_single_target() {
         ),
     ] {
         let mut out: Vec<u8> = Vec::new();
-        run_subscribe(line, &active, &store, &registry, Scope::Owner, &mut out);
+        run_subscribe(line, &active, &store, Scope::Owner, &mut out);
         assert_eq!(String::from_utf8_lossy(&out), want, "{line}");
-        assert_eq!(registry.lock().unwrap().watched_sessions(), 0, "{line}");
+        assert_eq!(watched_sessions(&store), 0, "{line}");
     }
     let tok = a.ctx.edges.lock().unwrap().grant(
         SessionId::generate(),
@@ -19374,7 +20606,6 @@ fn since_log_needs_log_ep_and_a_single_target() {
         "subscribe @. log",
         &active,
         &store,
-        &registry,
         Scope::Edge(tok),
         &mut out,
     );
@@ -19434,112 +20665,6 @@ fn the_autopilot_words_meta_lines_wait_on_the_journal() {
         "ERR denied\n",
         "a refusal is answered as it is"
     );
-}
-
-/// A FULL POOL GROWS (AD-2 of the codex-alab end-to-end run, 2026-10-16:
-/// the fifth codex-alab of an instance was refused its `subscribe @self`
-/// for good, and with it its claim): past the four started lanes, each
-/// further long-lived subscriber starts one more lane and is admitted, until
-/// the ceiling, where the next is refused at once as before. Negative
-/// control: a grower whose thread does not start admits nothing past the
-/// started lanes and publishes no lane.
-#[test]
-fn a_full_push_pool_grows_a_lane_per_subscriber_up_to_its_ceiling() {
-    use std::io::BufRead;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let ceiling = CONTROL_SUBSCRIPTION_WORKERS + 2;
-    let subscriptions = SubscriptionDispatch::new(ceiling);
-    subscriptions
-        .jobs
-        .set_capacity(CONTROL_SUBSCRIPTION_WORKERS);
-    let grown = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&grown);
-    assert!(
-        subscriptions
-            .grow
-            .set(Box::new(move || {
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            }))
-            .is_ok()
-    );
-    let mut clients = Vec::new();
-    for index in 0..ceiling {
-        let (client, server) = CtlStream::pair().expect("subscription socket pair");
-        clients.push(client);
-        assert!(
-            subscriptions
-                .try_submit(format!("subscribe @{index} screen"), Scope::Owner, server)
-                .is_ok(),
-            "subscriber {index} of {ceiling} is admitted"
-        );
-    }
-    assert_eq!(
-        grown.load(Ordering::SeqCst),
-        2,
-        "one lane per subscriber past four"
-    );
-    assert_eq!(subscriptions.jobs.capacity(), ceiling);
-    let (overflow, overflow_server) = CtlStream::pair().expect("overflow pair");
-    overflow
-        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-        .expect("bound rejection read");
-    handoff_subscription(
-        &subscriptions,
-        "subscribe @. screen".to_string(),
-        Scope::Owner,
-        overflow_server,
-    );
-    let mut rejection = String::new();
-    BufReader::new(overflow)
-        .read_line(&mut rejection)
-        .expect("the subscriber past the ceiling gets a prompt response");
-    assert_eq!(rejection, "ERR subscription capacity busy; retry\n");
-    assert_eq!(
-        grown.load(Ordering::SeqCst),
-        2,
-        "nothing grows past the ceiling"
-    );
-
-    // The negative control: no lane starts, nothing is admitted past four.
-    let stuck = SubscriptionDispatch::new(ceiling);
-    stuck.jobs.set_capacity(CONTROL_SUBSCRIPTION_WORKERS);
-    assert!(stuck.grow.set(Box::new(|| false)).is_ok());
-    let mut kept = Vec::new();
-    for index in 0..CONTROL_SUBSCRIPTION_WORKERS {
-        let (client, server) = CtlStream::pair().expect("pair");
-        kept.push(client);
-        assert!(
-            stuck
-                .try_submit(format!("subscribe @{index} screen"), Scope::Owner, server)
-                .is_ok()
-        );
-    }
-    let (_client, server) = CtlStream::pair().expect("pair");
-    assert!(
-        stuck
-            .try_submit("subscribe @. screen".to_string(), Scope::Owner, server)
-            .is_err(),
-        "CONTROL: a lane that did not start admits nobody"
-    );
-    assert_eq!(stuck.jobs.capacity(), CONTROL_SUBSCRIPTION_WORKERS);
-}
-
-/// The push ceiling answers to the descriptor limit: an eighth of it, never
-/// fewer than the started lanes nor more than the hard ceiling.
-#[test]
-fn the_push_ceiling_is_an_eighth_of_the_descriptor_limit_within_its_bounds() {
-    assert_eq!(subscriptions_cap_for(Some(256)), 32, "launchd's soft limit");
-    assert_eq!(
-        subscriptions_cap_for(Some(16)),
-        CONTROL_SUBSCRIPTION_WORKERS
-    );
-    assert_eq!(
-        subscriptions_cap_for(Some(1 << 20)),
-        CONTROL_SUBSCRIPTION_MAX
-    );
-    assert_eq!(subscriptions_cap_for(None), CONTROL_SUBSCRIPTION_WORKERS);
 }
 
 /// THE DRIVE GATE (the step-in, design §5.1) admits its allowlist and
@@ -19711,24 +20836,30 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
         host: "mac-03".to_owned(),
     };
     // No node on the thread: the line passes untouched, to the fleet gate.
-    let (passed, scope, _) = drive_admission(line.clone(), drive, &store).unwrap();
-    assert_eq!((passed.as_str(), scope), (line.as_str(), drive));
+    let (passed, scope, _) = drive_admission(Request::parse(line.clone()), drive, &store).unwrap();
+    assert_eq!((passed.line(), scope), (line.as_str(), drive));
     assert!(
         fleet_refusal(&passed, scope).is_some(),
         "the fleet gate refuses it"
     );
     {
         let _driving = crate::fabric::DrivingAs::enter(driver.clone());
-        let (_, scope, _) = drive_admission(line.clone(), reader, &store).unwrap();
+        let (_, scope, _) = drive_admission(Request::parse(line.clone()), reader, &store).unwrap();
         assert_eq!(scope, reader, "a reader's connection is never driven");
-        let (_, scope, write) = drive_admission(line.clone(), drive, &store).unwrap();
+        let (_, scope, write) =
+            drive_admission(Request::parse(line.clone()), drive, &store).unwrap();
         assert_eq!((scope, write), (Scope::Owner, None), "an admitted read");
-        let (_, scope, _) = drive_admission("survey".to_owned(), drive, &store).unwrap();
+        let (_, scope, _) =
+            drive_admission(Request::parse("survey".to_owned()), drive, &store).unwrap();
         assert_eq!(scope, drive, "a fleet verb keeps the fleet scope");
-        let refused = drive_admission("settings set columns 80".to_owned(), drive, &store);
+        let refused = drive_admission(
+            Request::parse("settings set columns 80".to_owned()),
+            drive,
+            &store,
+        );
         assert!(refused.is_err_and(|why| why.starts_with("ERR denied: ")));
         let typing = format!("@{} send hi", sid.as_str());
-        let (_, scope, write) = drive_admission(typing, drive, &store).unwrap();
+        let (_, scope, write) = drive_admission(Request::parse(typing), drive, &store).unwrap();
         assert_eq!(scope, Scope::Owner);
         assert_eq!(write.map(|act| act.verb), Some("send"));
     }

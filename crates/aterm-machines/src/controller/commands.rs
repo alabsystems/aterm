@@ -670,25 +670,261 @@ fn parse_device_info_txt(text: &str) -> (Option<String>, Option<u32>) {
 
 /// Resolve a `.local` hostname to its IPv4 address and read its port-22 SSH version banner.
 fn resolve_ipv4_and_ssh_banner(hostname: &str, port: u16) -> (Option<String>, Option<String>) {
+    let (ipv4, banner, _) = resolve_ipv4_banner_and_rtt(hostname, port);
+    (ipv4, banner)
+}
+
+/// Resolve a `.local` hostname to its IPv4 address, read its port-22 SSH version banner,
+/// and measure the TCP connect round-trip time in microseconds.
+fn resolve_ipv4_banner_and_rtt(
+    hostname: &str,
+    port: u16,
+) -> (Option<String>, Option<String>, Option<u64>) {
     use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     let ipv4 = (hostname, port).to_socket_addrs().ok().and_then(|addrs| {
-        addrs.into_iter().find_map(|a| match a {
-            SocketAddr::V4(v4) => Some(v4.ip().to_string()),
-            SocketAddr::V6(_) => None,
-        })
+        let v4s: Vec<std::net::Ipv4Addr> = addrs
+            .filter_map(|a| match a {
+                SocketAddr::V4(v4) => Some(*v4.ip()),
+                SocketAddr::V6(_) => None,
+            })
+            .collect();
+        v4s.iter()
+            .copied()
+            .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .or_else(|| v4s.first().copied())
+            .map(|ip| ip.to_string())
     });
     let target_ip = ipv4
         .as_deref()
         .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok());
+    let mut rtt_us = None;
     let banner = target_ip.and_then(|ip| {
         let addr = SocketAddr::from((ip, port));
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(60)).ok()?;
+        let t0 = std::time::Instant::now();
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(120)).ok()?;
+        rtt_us = u64::try_from(t0.elapsed().as_micros().max(1)).ok();
         read_ssh_banner(
             &stream,
-            std::time::Instant::now() + Duration::from_millis(80),
+            std::time::Instant::now() + Duration::from_millis(120),
         )
     });
-    (ipv4, banner)
+    (ipv4, banner, rtt_us)
+}
+
+/// Pure parser for the batched SSH vitals probe output (supports both Linux `/proc` + `nvidia-smi`
+/// and macOS `sysctl` + `vm_stat`).
+#[must_use]
+pub fn parse_ssh_vitals_output(
+    out: &str,
+    rtt_us: Option<u64>,
+) -> Option<crate::protocol::HostVitals> {
+    if !out.contains("__OS__") {
+        return None;
+    }
+    let mut cpu_cores = 0u32;
+    let mut load_avg_100 = None;
+    let mut uptime_secs = None;
+    let mut disk_total_bytes = 0u64;
+    let mut disk_used_bytes = 0u64;
+    let mut disk_avail_bytes = 0u64;
+    let mut mem_total_kb = 0u64;
+    let mut mem_avail_kb = 0u64;
+    let mut swap_total_kb = 0u64;
+    let mut swap_free_kb = 0u64;
+    let mut hw_mem_bytes = 0u64;
+    let mut gpu_name = None;
+    let mut gpu_busy_pct = None;
+    let mut gpu_temp_c = None;
+    let mut gpu_power_deciwatts = None;
+
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("__CORES__") {
+            cpu_cores = rest.trim().parse::<u32>().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("__LOAD__") {
+            load_avg_100 = crate::facts::parse_loadavg(rest);
+        } else if let Some(rest) = line.strip_prefix("__UPTIME__") {
+            let trimmed = rest.trim();
+            if trimmed.contains("sec =") {
+                if let Some(boot) = crate::facts::parse_boottime(trimmed) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if now > boot {
+                        uptime_secs = Some(now - boot);
+                    }
+                }
+            } else if let Some(val) = trimmed
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok())
+                && val > 0.0
+            {
+                uptime_secs = Some(val.round() as u64);
+            }
+        } else if let Some(rest) = line.strip_prefix("__DF__") {
+            if let Some((tot, used, avail)) = crate::facts::parse_df_k(&format!("Header\n{rest}")) {
+                disk_total_bytes = tot;
+                disk_used_bytes = used;
+                disk_avail_bytes = avail;
+            }
+        } else if let Some(rest) = line.strip_prefix("MemTotal:") {
+            mem_total_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            mem_avail_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
+            swap_total_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+            swap_free_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("__HW_MEM__") {
+            hw_mem_bytes = rest.trim().parse::<u64>().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("__NVGPU__") {
+            let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+            if let Some(&name) = parts.first().filter(|n| !n.is_empty()) {
+                gpu_name = Some(name.to_owned());
+            }
+            if let Some(pct) = parts.get(1).and_then(|s| s.parse::<u8>().ok()) {
+                gpu_busy_pct = Some(pct.min(100));
+            }
+            if let Some(temp) = parts.get(2).and_then(|s| s.parse::<u16>().ok()) {
+                gpu_temp_c = Some(temp);
+            }
+            if let Some(watts) = parts.get(3).and_then(|s| s.parse::<f64>().ok())
+                && watts >= 0.0
+            {
+                gpu_power_deciwatts = Some((watts * 10.0).round() as u32);
+            }
+        }
+    }
+
+    let (mem_total_bytes, mem_used_bytes, mem_wired_bytes, mem_compressed_bytes) =
+        if mem_total_kb > 0 {
+            let tot = mem_total_kb.saturating_mul(1024);
+            let avail = mem_avail_kb.saturating_mul(1024).min(tot);
+            (tot, tot.saturating_sub(avail), None, None)
+        } else if let Some((used, wired, comp)) = crate::facts::parse_vm_stat(out) {
+            (
+                hw_mem_bytes.max(used),
+                used.min(hw_mem_bytes.max(used)),
+                Some(wired),
+                Some(comp),
+            )
+        } else {
+            (hw_mem_bytes, 0, None, None)
+        };
+    let swap_used_bytes =
+        (swap_total_kb > swap_free_kb).then(|| (swap_total_kb - swap_free_kb).saturating_mul(1024));
+    let cpu_busy_pct = load_avg_100.and_then(|[l1, _, _]| {
+        (cpu_cores > 0).then(|| (l1.saturating_mul(100) / (cpu_cores * 100)).min(100) as u8)
+    });
+
+    Some(crate::protocol::HostVitals {
+        cpu_cores,
+        cpu_busy_pct,
+        load_avg_100,
+        gpu_name,
+        gpu_busy_pct,
+        gpu_temp_c,
+        gpu_power_deciwatts,
+        mem_total_bytes,
+        mem_used_bytes,
+        mem_wired_bytes,
+        mem_compressed_bytes,
+        swap_used_bytes,
+        mem_pressure: Some("normal".to_owned()),
+        disk_total_bytes,
+        disk_used_bytes,
+        disk_avail_bytes,
+        uptime_secs,
+        rtt_us,
+    })
+}
+
+/// Try to open the native Fleet System Monitor tab (`/monitor`) in a running local `aterm`
+/// instance via its control socket. Returns the socket path on success.
+fn open_native_monitor_tab_in_aterm() -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let mut candidates = Vec::new();
+        if let Some(sock) = std::env::var_os("ATERM_SOCKET") {
+            candidates.push(PathBuf::from(sock));
+        }
+        if let Some(dir) = aterm_uds::control_socket_dir()
+            && let Ok(entries) = std::fs::read_dir(&dir)
+        {
+            let mut socks: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("aterm-") && n.ends_with(".sock"))
+                })
+                .collect();
+            socks.sort();
+            socks.reverse();
+            for s in socks {
+                if !candidates.contains(&s) {
+                    candidates.push(s);
+                }
+            }
+        }
+        for sock_path in candidates {
+            let stem = sock_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".sock"));
+            let Some(stem) = stem else { continue };
+            let token_path = sock_path.with_file_name(format!("{stem}.token"));
+            let Ok(token) = std::fs::read_to_string(&token_path) else {
+                continue;
+            };
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Ok(mut stream) = UnixStream::connect(&sock_path) else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+            if writeln!(stream, "AUTH {token}").is_err() {
+                continue;
+            }
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || !line.starts_with("OK") {
+                continue;
+            }
+            if writeln!(reader.get_mut(), "open app settings /monitor").is_err() {
+                continue;
+            }
+            line.clear();
+            if reader.read_line(&mut line).is_ok() && line.starts_with("OK") {
+                return Some(sock_path.display().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// One complete SSH identification, bounded by bytes and a single deadline.
@@ -764,8 +1000,8 @@ fn working_ai_sessions(sessions: &[crate::protocol::HostedSession]) -> usize {
         .count()
 }
 
-/// Print one host's row in `aterm machines tabs`, followed by indented `aterm` session lines
-/// and indented tab lines underneath each `aterm` session.
+/// Print one host's row in `aterm machines tabs` / `monitor`, followed by its live system
+/// vitals line, indented `aterm` session lines, and indented tab lines underneath each session.
 #[allow(clippy::too_many_arguments)]
 fn print_host_tabs_rows(
     host_name: &str,
@@ -775,6 +1011,7 @@ fn print_host_tabs_rows(
     os_display: &str,
     services_display: &str,
     why_not: Option<&str>,
+    vitals: Option<&crate::protocol::HostVitals>,
     sessions: Option<&[crate::protocol::HostedSession]>,
 ) {
     let observed = sessions.is_some();
@@ -818,6 +1055,17 @@ fn print_host_tabs_rows(
         shown(services_display),
         summary
     );
+    if let Some(v) = vitals {
+        let vitals_branch = if by_instance.is_empty() {
+            "\u{2514}\u{2500}"
+        } else {
+            "\u{251c}\u{2500}"
+        };
+        outln!(
+            "  {vitals_branch} vitals: {}",
+            shown(&v.format_summary_line())
+        );
+    }
     for (pid, tabs) in by_instance {
         let win = tabs
             .first()
@@ -899,6 +1147,52 @@ fn print_host_tabs_rows(
     }
 }
 
+/// `aterm machines monitor [<host>…] [--open | --once | --watch] [--interval <s>] [--json]`:
+/// live continuous system monitoring across the fleet (`docs/DESIGN-fleet-monitor-2026-10-20.md`).
+#[must_use]
+pub fn monitor(
+    env: &Env<'_>,
+    names: &[String],
+    all: bool,
+    open: bool,
+    once: bool,
+    watch: bool,
+    interval_secs: u64,
+) -> ExitCode {
+    let is_live = env.sys.own_uuid().is_some() && crate::sessions::is_live_account();
+    if (open || (!once && !watch && !env.json)) && is_live {
+        if let Some(sock) = open_native_monitor_tab_in_aterm() {
+            outln!(
+                "opened Live Fleet System Monitor tab (/monitor) in aterm ({})",
+                shown(&sock)
+            );
+            if open {
+                return ExitCode::SUCCESS;
+            }
+        } else if open {
+            errln!(
+                "aterm machines monitor: no running local aterm window answered; printing fleet telemetry snapshot"
+            );
+        }
+    }
+    if watch && !once && !env.json && is_live {
+        loop {
+            if env.tty {
+                outln!("\x1b[2J\x1b[H");
+            }
+            let now_secs = env.sys.now();
+            outln!(
+                "=== ATERM FLEET LIVE SYSTEM MONITOR (every {}s \u{b7} unix {}s \u{b7} Ctrl-C to stop) ===",
+                interval_secs,
+                now_secs
+            );
+            let _ = tabs(env, names, all);
+            std::thread::sleep(Duration::from_secs(interval_secs.max(1)));
+        }
+    }
+    tabs(env, names, all)
+}
+
 /// `aterm machines tabs [<host>…] [--json]`: live spreadsheet of accessible Macs, `aterm`
 /// instances, tabs, stats and AI CLI status.
 #[must_use]
@@ -956,6 +1250,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
         && crate::sessions::is_live_account();
     if live_all && !self_in_hosts {
         let local_sessions = crate::sessions::scan_local_aterm_sessions();
+        let local_vitals = crate::facts::gather_vitals(env.sys, &own_facts);
         let raw_self = if !own_facts.local_host_name.is_empty() {
             own_facts.local_host_name.clone()
         } else if !own_facts.computer_name.is_empty() {
@@ -1003,6 +1298,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                     "os_build": own_facts.os_build,
                     "os_ssh": os_display,
                     "services": local_services,
+                    "vitals": local_vitals,
                     "sessions": local_sessions,
                 }))
                 .unwrap_or_default()
@@ -1020,6 +1316,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                     "unobserved"
                 },
                 None,
+                local_vitals.as_ref(),
                 Some(&local_sessions),
             );
         }
@@ -1042,6 +1339,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
             .as_ref()
             .map(|h| h.sessions.as_slice())
             .unwrap_or(&[]);
+        let vitals = hello_opt.as_ref().and_then(|h| h.vitals.as_ref());
         let host_name = inventory::canonical_host_name(&r.host.name, &inv.names);
         let hw_display = hello_opt
             .as_ref()
@@ -1066,6 +1364,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                     "hardware": hw_display,
                     "os_version": hello_opt.as_ref().map(|h| h.os_version.as_str()).unwrap_or(""),
                     "os_build": hello_opt.as_ref().map(|h| h.os_build.as_str()).unwrap_or(""),
+                    "vitals": vitals,
                     "sessions": sessions,
                 }))
                 .unwrap_or_default()
@@ -1079,6 +1378,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                 &os_display,
                 "ssh",
                 why_not.as_deref(),
+                vitals,
                 Some(sessions),
             );
         }
@@ -1153,7 +1453,11 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                 .run(&txt_cmd)
                 .map(|ran| parse_device_info_txt(&ran.out()))
                 .unwrap_or((None, None));
-            let (ipv4, ssh_banner) = resolve_ipv4_and_ssh_banner(&dot_local, port);
+            let (ipv4, ssh_banner, rtt_us) = resolve_ipv4_banner_and_rtt(&dot_local, port);
+            let vitals = ssh_banner.is_some().then(|| crate::protocol::HostVitals {
+                rtt_us,
+                ..crate::protocol::HostVitals::default()
+            });
             let has_sftp = sftp_instances.iter().any(|s| s.name == inst.name);
             let has_rfb = rfb_instances.iter().any(|s| s.name == inst.name);
             let mut svc_list = vec!["ssh"];
@@ -1187,6 +1491,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                 svc_list,
                 status_word,
                 reachable,
+                vitals,
             ))
         });
 
@@ -1202,6 +1507,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
             svc_list,
             status_word,
             reachable,
+            vitals,
         ) in enriched.into_iter().flatten()
         {
             if env.json {
@@ -1219,6 +1525,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                         "hardware": hw_display,
                         "os_ssh": os_display,
                         "services": svc_list,
+                        "vitals": vitals,
                         "sessions": Option::<&[crate::protocol::HostedSession]>::None,
                     }))
                     .unwrap_or_default()
@@ -1232,6 +1539,7 @@ pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
                     &os_display,
                     &svc_list.join(", "),
                     None,
+                    vitals.as_ref(),
                     None,
                 );
             }
@@ -2170,6 +2478,11 @@ fn pending_upgrade_row(hello: &Hello, own: &OwnAgent) -> ItemReport {
         revert: None,
         effect: Effect::Now,
         detail: None,
+        layer: None,
+        class: None,
+        explain: None,
+        stood_aside: None,
+        essential: false,
     }
 }
 
@@ -2372,7 +2685,7 @@ fn read_stream(out: &str, now: u64) -> (Option<HostReport>, Option<String>) {
     for line in out.lines().filter(|l| !l.trim().is_empty()) {
         match aterm_json::from_str::<Line>(line) {
             Ok(Line::Report(report)) => return (Some(*report), started),
-            Ok(Line::Item(row)) => items.push(row),
+            Ok(Line::Item(row)) => items.push(*row),
             Ok(Line::Refused { why }) => {
                 let report = HostReport {
                     schema: crate::SCHEMA,
@@ -3897,8 +4210,33 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
             return ExitCode::FAILURE;
         }
     };
+    let mut journal = match crate::engine::account_journal() {
+        Ok(journal) => journal,
+        Err(why) => {
+            errln!("aterm machines here: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let remedy = aterm_converge::Remedy::Command(format!(
+        "sudo aterm machines here apply {}",
+        baseline_path.display()
+    ));
     let started = sys.now();
-    let rows = crate::engine::run(&items, mode, sys, &ctx, &mut crate::engine::NoJournal);
+    let rows = match crate::engine::run_with(
+        &items,
+        mode,
+        sys,
+        &ctx,
+        &remedy,
+        &mut journal,
+        &mut |_| {},
+    ) {
+        Ok(rows) => rows,
+        Err(refused) => {
+            errln!("aterm machines here: {refused}");
+            return ExitCode::FAILURE;
+        }
+    };
     let report = HostReport {
         schema: crate::SCHEMA,
         mode,
@@ -4141,6 +4479,11 @@ mod tests {
             revert: None,
             effect: Effect::Now,
             detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside: None,
+            essential: false,
         }
     }
 
@@ -6359,5 +6702,113 @@ mod tests {
         assert_eq!(banner(b"SSH-2.0-partial", false), None);
         assert_eq!(banner(b"SSH-2.0-\xff\r\n", false), None);
         assert_eq!(banner(b"SSH-2.0-observed_peer\r\n", true), None);
+
+        let dgx_out = "__OS__ Linux\n\
+__CORES__ 20\n\
+__LOAD__ 1.10 1.59 1.22 2/1383 3612429\n\
+__UPTIME__ 3108837.87\n\
+__DF__ /dev/nvme0n1p2 3937374564 2929223648 808111020 79% /\n\
+MemTotal:       127600528 kB\n\
+MemAvailable:   114306188 kB\n\
+SwapTotal:      16777212 kB\n\
+SwapFree:       16448040 kB\n\
+__NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
+        let vitals = parse_ssh_vitals_output(dgx_out, Some(2_100)).unwrap();
+        assert_eq!(vitals.cpu_cores, 20);
+        assert_eq!(vitals.load_avg_100, Some([110, 159, 122]));
+        assert_eq!(vitals.gpu_name.as_deref(), Some("NVIDIA GB10"));
+        assert_eq!(vitals.gpu_busy_pct, Some(12));
+        assert_eq!(vitals.gpu_temp_c, Some(45));
+        assert_eq!(vitals.gpu_power_deciwatts, Some(34));
+        assert_eq!(vitals.uptime_secs, Some(3_108_838));
+        assert_eq!(vitals.rtt_us, Some(2_100));
+        let summary = vitals.format_summary_line();
+        assert!(summary.contains("NVIDIA GB10"), "{summary}");
+        assert!(summary.contains("45°C"), "{summary}");
+        assert!(summary.contains("RTT 2.1 ms"), "{summary}");
+
+        assert_eq!(
+            monitor(&e, &[], false, false, true, false, 2),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn here_journals_each_change_under_the_accounts_state_and_nothing_when_all_is_right() {
+        // A test binary's private state root is the account's state here
+        // (`engine::account_journal`); no other test of this binary journals into it. The
+        // lines already there (a development build's own `ATERM_STATE_HOME`) are kept.
+        let state = aterm_types::dirs::state_dir().expect("a test binary's state root");
+        let journal = aterm_converge::FileJournal::under(&state);
+        let journaled = || -> Vec<aterm_json::Value> {
+            std::fs::read_to_string(journal.path())
+                .unwrap_or_default()
+                .lines()
+                .map(|l| aterm_json::from_str(l).unwrap())
+                .collect()
+        };
+        let before = journaled().len();
+        let baseline = "/b/baseline.toml";
+        let text: &[u8] = b"schema = 1\n[names]\nhost_name = \"lab-07.lab.example\"\n";
+        // A Mac at the login window (root owns the console), so the run has no users.
+        let mac = || {
+            let sys = Fake::root();
+            sys.file(baseline, text).stat_of(
+                "/dev/console",
+                crate::port::Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys
+        };
+        // The negative control first: the name is already as wanted, so nothing is written.
+        let sys = mac();
+        sys.on(
+            "/usr/sbin/scutil --get HostName",
+            Ran::ok("lab-07.lab.example\n"),
+        );
+        assert_eq!(
+            here(&sys, Mode::Apply, Path::new(baseline), true),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            journaled().len(),
+            before,
+            "{}: a line for a run that changed nothing",
+            journal.path().display()
+        );
+        // A change: its line, then scutil's set and the read-back.
+        let sys = mac();
+        sys.on(
+            "/usr/sbin/scutil --get HostName",
+            Ran::exit(1, "HostName: not set"),
+        )
+        .on(
+            "/usr/sbin/scutil --get HostName",
+            Ran::ok("lab-07.lab.example\n"),
+        )
+        .on(
+            "/usr/sbin/scutil --set HostName lab-07.lab.example",
+            Ran::ok(""),
+        );
+        assert_eq!(
+            here(&sys, Mode::Apply, Path::new(baseline), true),
+            ExitCode::SUCCESS
+        );
+        let lines = journaled();
+        assert_eq!(lines.len(), before + 1, "{lines:?}");
+        let line = &lines[before];
+        assert_eq!(line["id"].as_str(), Some("names.host-name"));
+        assert_eq!(line["from"].as_str(), Some("not set"));
+        assert_eq!(line["to"].as_str(), Some("\"lab-07.lab.example\""));
+        assert_eq!(
+            line["revert"].as_str(),
+            Some("/usr/sbin/scutil --set HostName ''")
+        );
     }
 }

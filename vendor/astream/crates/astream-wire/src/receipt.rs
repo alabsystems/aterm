@@ -1,25 +1,46 @@
-//! Canonical fabric receipt and deadline grammar (`REQUIREMENTS` R8, §4.2 `ack`,
-//! §6.4 `dl=` / `expired`).
-//!
-//! Two explicitly formatted receipt bodies travel on `/f/<F>/in/...` subjects so
-//! independent bridges (`aterm-link`, `asb`, `aspump`) never disagree on receipt or
-//! deadline-expiry wire representations:
+//! A header-first receipt and deadline grammar (`REQUIREMENTS` R8,
+//! `DESIGN-aterm-fabric` §4.2 `ack`, §6.4 `dl=` / `expired`), and the Clean-origin
+//! kernels it is built on:
 //!
 //! ```text
 //! ack re=<off> verdict=handled|refused|deferred bt=<ms>
 //! expired re=<off> dl=<ms> bt=<ms>
 //! ```
 //!
-//! - `ack`: emitted by the recipient's bridge when a message at log offset `<off>`
-//!   is acted upon (`handled`, `refused`, or `deferred`) at broker timestamp `bt=<ms>`.
-//! - `expired`: emitted by the ASKER's own bridge when its deadline `dl=<ms>` passes
-//!   at `bt=<ms>` (`bt >= dl`) with no `answer`, `report`, or `ack` referencing
-//!   `re=<off>`. The broker holds no timers; both records are ordinary durable log
-//!   entries.
+//! - `ack`: a message at log offset `<off>` was acted upon (`handled`, `refused`, or
+//!   `deferred`) at broker timestamp `bt=<ms>`.
+//! - `expired`: the asker's deadline `dl=<ms>` passed at `bt=<ms>` (`bt >= dl`) with no
+//!   `answer`, `report`, or `ack` referencing `re=<off>`. The broker holds no timers; both
+//!   would be ordinary durable log entries.
 //!
-//! For backwards compatibility with existing CLI scripts, [`FabricReceipt::decode`]
-//! also accepts the legacy `asb ack` spelling (`v=1 t=<ms> re=<off> state=<verdict>`),
-//! while [`FabricReceipt::encode`] always emits the canonical R8 grammar.
+//! NOTHING WRITES THIS GRAMMAR. The receipts on a real fabric are §4.1 bodies — one
+//! `v=1 key=value` line, the kind in the subject's last segment, never a header word.
+//! aterm's bridge renders every body with its own codec (`aterm-link`'s `Body::encode`),
+//! which always ends in a pct-encoded `text=`, and reads them back with the same total
+//! decoder. Its receipt on `inbox seen` (`from=` the session that answered) and its
+//! `expired` verdict (`dl=` relative, as the ask carried it) are:
+//!
+//! ```text
+//! v=1 t=<ms> from=<sid> re=<off> verdict=<word> text=marked%20<word>%20by%20the%20recipient
+//! v=1 t=<ms> re=<off> dl=<ms> text=no%20reply%20within%20<span>
+//! ```
+//!
+//! `asb ack` writes the bare `v=1 t=<ms> re=<off> verdict=<word>`. [`FabricReceipt::decode`]
+//! refuses all three: its `v=1` arm reads only `t=`, `re=` and `state=` (the spelling
+//! `asb ack` has retired), so `verdict=`, `dl=`, `from=` and `text=` are each an unknown
+//! field, and a decoder taught `verdict=` would take `asb ack`'s body and still refuse both
+//! of aterm's. That arm also maps `t=` to [`FabricReceipt::bt_ms`], which contradicts R3:
+//! `t=` is the SENDER's clock, and no broker stamps a `bt=` yet (R3 is partly built). The
+//! test `what_aterm_and_asb_write_is_not_this_grammar` decodes those exact bytes and pins
+//! each fact. Owning the real §4.1 codec — the kind from the subject, `dl=` relative, no
+//! `bt=` until R3 — is deferred; until then this module is not the bus's receipt format,
+//! and no writer should be pointed at it as if it were.
+//!
+//! It stays because its kernels are proved and exercised: [`deadline_elapsed`] and
+//! [`monotone_clock_tick`] are Clean-origin, and `verify.clean-origin-tla-protocols`
+//! exercises them beside [`FabricReceipt::new_expired`], [`FabricReceipt::tick_clock`]
+//! and an encoded [`FabricReceipt::Ack`]. [`FabricReceipt::encode`] emits the
+//! header-first grammar only.
 //!
 //! ## Formal Verification (Embedded Clean Island + TLA+ Specification)
 //!
@@ -622,7 +643,8 @@ mod tests {
             })
         );
 
-        // Legacy `asb ack` format also decodes into `FabricReceipt::Ack`.
+        // The retired `asb ack` spelling (`state=`) decodes into `FabricReceipt::Ack`,
+        // its sender's `t=` read as `bt_ms` (the module doc says why that is wrong).
         let legacy = "v=1 t=1700000000999 re=7 state=handled";
         assert_eq!(
             FabricReceipt::decode(legacy).unwrap(),
@@ -684,6 +706,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// WHAT THE MODULE DOC SAYS OF THE BUS, PINNED ON THE WRITERS' OWN BYTES. aterm's
+    /// bridge renders a receipt and an `expired` verdict through `aterm-link`'s
+    /// `Body::encode` — `from=` on a receipt, and a pct-encoded `text=` on both, always —
+    /// and `asb ack` (asb.rs `cmd_ack`) writes the bare `v=1 t= re= verdict=` line. All
+    /// three are refused. The receipt's `verdict=` is not the only reason: spelled with
+    /// the retired `state=` it is still refused, on `from=` alone and on `text=` alone,
+    /// while the same line without those two decodes (the negative control). So a
+    /// decoder taught `verdict=` decodes `asb ack`'s line and still refuses aterm's, and
+    /// this test says which. The control also shows the retired spelling reading the
+    /// SENDER's `t=` as `bt_ms`, the R3 contradiction the module doc names. Any change
+    /// that makes one of these lines decode owes the module doc, `REQUIREMENTS` R8 and
+    /// the `wire.cut.consistent-lattice` claim a rewrite naming that line, and only the
+    /// two aterm lines here can show that aterm's receipts decode.
+    #[test]
+    fn what_aterm_and_asb_write_is_not_this_grammar() {
+        const ASB_ACK: &str = "v=1 t=1700000000999 re=7 verdict=handled";
+        const ATERM_RECEIPT: &str = "v=1 t=1700000000999 from=s-host re=41 verdict=handled \
+                                     text=marked%20handled%20by%20the%20recipient";
+        const ATERM_EXPIRED: &str =
+            "v=1 t=1700000000999 re=7 dl=240000 text=no%20reply%20within%20240%20s";
+        for wire in [ASB_ACK, ATERM_RECEIPT, ATERM_EXPIRED] {
+            assert_eq!(
+                FabricReceipt::decode(wire),
+                Err(ReceiptError::UnknownField),
+                "{wire:?}"
+            );
+        }
+        // aterm's receipt with its word in the retired spelling: refused on its own
+        // `from=` and `text=`, each alone.
+        const FROM: &str = "from=s-host ";
+        const TEXT: &str = " text=marked%20handled%20by%20the%20recipient";
+        let retired_word = ATERM_RECEIPT.replace("verdict=", "state=");
+        let without_from = retired_word.replace(FROM, "");
+        let without_text = retired_word.replace(TEXT, "");
+        let bare = without_from.replace(TEXT, "");
+        for wire in [&retired_word, &without_from, &without_text] {
+            assert_eq!(
+                FabricReceipt::decode(wire),
+                Err(ReceiptError::UnknownField),
+                "{wire:?}"
+            );
+        }
+        // Control: with neither, the retired spelling decodes, its sender clock taken
+        // for `bt=`.
+        assert_eq!(bare, "v=1 t=1700000000999 re=41 state=handled");
+        let retired = FabricReceipt::decode(&bare).expect("the retired `state=` spelling decodes");
+        assert_eq!(retired.re(), Offset(41));
+        assert_eq!(retired.bt_ms(), 1_700_000_000_999);
     }
 
     #[test]

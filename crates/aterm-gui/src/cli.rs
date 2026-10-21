@@ -494,8 +494,8 @@ const STARTER_CONFIG: &str = concat!(
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop decorative effects under sustained render overload (smooth scrolling is never shed); false = never shed (motion=\"full\" also forces effects on)
-# cursor_trail_style = \"rainbow kitty pet\"  # the cursor motion trail + light crown; off draws none. rainbow kitty pet (DEFAULT, except on Windows where off is: uncomment this line for the whole show; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw, in shifting colors, or in ONE hue with cursor_trail_color set; \"classic mono\" names the one hue in the cursor colour) | off
-# cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
+# cursor_trail_style = \"rainbow kitty pet\"  # the cursor motion trail + light crown; off draws none. rainbow kitty pet (DEFAULT, except on Windows where off is: uncomment this line for the whole show; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\"/\"rainbow kitty tall\" name the same resident) | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow dog pet | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | phaser | fire | water | laser (Lightning: lightning on jumps and a bolt caret; also \"lightning\") | comet | sparkle | lumen | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw, in shifting colors, or in ONE hue with cursor_trail_color set; cursor_trail_color = \"cursor\", which the old \"classic mono\" says, is the one hue in the cursor colour) | off
+# cursor_trail_color = \"#50FA7B\"      # base colour (default: laser/beam/comet/sparkle their own hue — beam/comet/sparkle wear a configured cursor_color or a program's OSC 12 — every other style the cursor colour; \"cursor\" chooses the live cursor colour for every style)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
@@ -560,11 +560,12 @@ const STARTER_CONFIG: &str = concat!(
                                    # update-health cause only you can end) also as system notifications (macOS,
                                    # run from the app: aterm's own once macOS allows it, which Notify Me asks when
                                    # turned on and the first notice asks while on, none until then or once it says
-                                   # no, and none from one in your Desktop, Documents or Downloads folder until it
-                                   # moves to Applications; not run from the app, terminal-notifier, found on PATH
-                                   # or in Homebrew, else osascript, whose banner is \"Script Editor\"'s). Needs
-                                   # only. DEFAULT off: they stay in the band, the menu bar and messages.log; the
-                                   # menu bar's Notify Me When I'm Needed turns them on. Programs' OSC 9/99/777 notifications are allow_notifications' below
+                                   # no, none from one in your Desktop, Documents or Downloads folder until it moves
+                                   # to Applications, and none from one started through a link to it, such as
+                                   # ~/.local/bin/aterm, until aterm.app itself is opened; not run from the app,
+                                   # terminal-notifier, found on PATH or in Homebrew, else osascript, whose banner is
+                                   # \"Script Editor\"'s). Needs only. DEFAULT off: they stay in the band, the menu
+                                   # bar and messages.log; the menu bar's Notify Me When I'm Needed turns them on. Programs' OSC 9/99/777 notifications are allow_notifications' below
 
 # --- program permissions (default OFF unless noted) --------------------------
 # allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
@@ -573,10 +574,10 @@ const STARTER_CONFIG: &str = concat!(
 # allow_notifications = false      # OSC 9/99/777 desktop notifications; macOS, run from the app, delivers as aterm
 #                                  # itself once macOS allows it (see desktop_alerts; while that is off they ask
 #                                  # nothing), none until then or once it says no, and none from one in your
-#                                  # Desktop, Documents or Downloads folder; not run from the app, through
-#                                  # terminal-notifier if installed, else osascript — a subprocess under aterm's
-#                                  # identity; Windows shows a notification-area balloon/toast from aterm itself
-#                                  # (Shell_NotifyIcon, no subprocess); Linux has no delivery yet — the request is dropped
+#                                  # Desktop, Documents or Downloads folder or one started through a link to it;
+#                                  # not run from the app, through terminal-notifier if installed, else osascript —
+#                                  # a subprocess under aterm's identity; Windows shows a notification-area
+#                                  # balloon/toast from aterm itself (Shell_NotifyIcon, no subprocess); Linux has no delivery yet — the request is dropped
 # allow_palette_reconfigure = true   # programs may set the 256 indexed colours (OSC 4/21: base16-shell, pywal,
 #                                  # theme.sh) for the session; false refuses
 # allow_kitty_file_transfer = false # let Kitty file/temp-file/shm media read host files; applies to new sessions
@@ -700,10 +701,11 @@ const STARTER_CONFIG: &str = concat!(
 # [machine]
 # universal_control = \"off\"        # \"off\" (default: disable it for this host) | \"leave\"
 
-# --- system awareness: the stats bars under the titlebar (Global, aterm, Tab):
-# every core as a tile, the GPU, memory and swap, the disk the tab is in. Read live.
+# --- system awareness: the stats bars (Global, aterm, Tab): every core as a
+# tile, the GPU, memory and swap, the disk the tab is in. Read live; ⌘I opens
+# the close-up.
 # [sys]
-# stats_bars = \"deck\"              # \"deck\" (default: the three bars) | \"off\"
+# stats_bars = \"deck\"              # \"deck\" (default: under the titlebar) | \"sill\" (bottom padding, no row) | \"off\"
 
 # --- input policy: map a chord to RAW BYTES sent to the program, overriding the
 # default key encoding + non-menu hardcoded chords (NOT macOS menu keys like Cmd-C,

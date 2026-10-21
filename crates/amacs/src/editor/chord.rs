@@ -80,7 +80,9 @@ impl KeyChord {
         !self.control && !self.meta && !self.shift && self.key == "escape"
     }
 
-    pub(super) fn display(&self) -> String {
+    /// The chord as a keymap spells it (`C-x`, `M-S-,`), and
+    /// [`Self::parse`] reads back.
+    pub fn display(&self) -> String {
         let mut out = String::new();
         if self.control {
             out.push_str("C-");

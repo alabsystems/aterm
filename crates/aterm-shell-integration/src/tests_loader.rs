@@ -221,6 +221,63 @@ fn a_real_zsh_sources_the_body_alone_cleanly() {
     }
 }
 
+/// Sourcing the live body (in zsh and bash, as `__aterm_body_check` does on an
+/// adopted shell's next prompt) exports `AGY_CLI_FAST_PROMPT_EDITOR=true` to
+/// child processes when unset, while preserving an explicit user override.
+#[cfg(unix)]
+#[test]
+fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    ensure_scripts(dir.path()).unwrap();
+    for (ext, shell, flag) in [("zsh", need_zsh(), "-f"), ("bash", bash_shell(), "--norc")] {
+        let body = dir.path().join(format!("{BODY_FILE_STEM}.{ext}"));
+        let default_out = shell_command(shell)
+            .args([
+                flag,
+                "-c",
+                ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+                ext,
+            ])
+            .arg(&body)
+            .env("HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            default_out.status.success(),
+            "{ext} default failed: {}",
+            String::from_utf8_lossy(&default_out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&default_out.stdout).trim(),
+            "true",
+            "{ext} body must export AGY_CLI_FAST_PROMPT_EDITOR=true when unset"
+        );
+
+        let override_out = shell_command(shell)
+            .args([
+                flag,
+                "-c",
+                ". \"$1\" && /usr/bin/printenv AGY_CLI_FAST_PROMPT_EDITOR",
+                ext,
+            ])
+            .arg(&body)
+            .env("HOME", dir.path())
+            .env("AGY_CLI_FAST_PROMPT_EDITOR", "false")
+            .output()
+            .unwrap();
+        assert!(
+            override_out.status.success(),
+            "{ext} override failed: {}",
+            String::from_utf8_lossy(&override_out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&override_out.stdout).trim(),
+            "false",
+            "{ext} body must preserve explicit AGY_CLI_FAST_PROMPT_EDITOR=false"
+        );
+    }
+}
+
 /// The body of this build under a cache root, plus a NEWER build's folder whose
 /// body is this build's with one probe function spliced in: what a running
 /// shell finds under its root after an update.
@@ -312,8 +369,7 @@ fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) ->
         .env("HOME", &fx.home)
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
-        .env("ATERM_CHILD", "1")
-        .env_remove("BASH_ENV");
+        .env("ATERM_CHILD", "1");
     for (key, value) in env_add {
         cmd.env(key, value);
     }
@@ -696,19 +752,44 @@ fn preloader_folder(fx: &LiveFixture) -> PathBuf {
     old
 }
 
+/// The start the body's AN OLDER SCRIPT'S `~/.aterm/bin` block takes a shell's
+/// against: 2026-10-16 00:00 UTC, before which every script prepended. The
+/// shells below start ten seconds either side of it, so a cut moved further
+/// either way fails a case.
+#[cfg(unix)]
+const CUT: u64 = 1_792_108_800;
+
+/// The clock the stand-ins below read: 2026-10-20 00:00 UTC, four days after
+/// [`CUT`].
+#[cfg(unix)]
+const STAND_IN_NOW: u64 = CUT + 4 * 86_400;
+
+/// A shell's age as the stand-in `ps -o etime=` reports it: four days less ten
+/// seconds, so started ten seconds after [`CUT`] ...
+#[cfg(unix)]
+const STARTED_SINCE: &str = "3-23:59:50";
+
+/// ... or four days and ten seconds, so started ten seconds before it.
+#[cfg(unix)]
+const STARTED_BEFORE: &str = "4-00:00:10";
+
 /// Lay the fixture's bin before the shell starts. The actual loader's external
-/// readers receive captured timestamps: clock 1000, process age 10, birth and
-/// modification 900. No filesystem creation-time convention or aging wait is used.
+/// readers receive captured timestamps: the clock [`STAND_IN_NOW`], a shell
+/// started since the cut ([`STARTED_SINCE`]), the folder born and changed 100 s
+/// before [`CUT`], so before every shell here. No filesystem creation-time
+/// convention or aging wait is used.
 #[cfg(unix)]
 fn lay_aterm_bin(fx: &LiveFixture) -> String {
-    lay_aterm_bin_with_dates(fx, 900, 900)
+    lay_aterm_bin_with_dates(fx, CUT - 100, CUT - 100, STARTED_SINCE)
 }
 
-/// Owned stand-ins for the timestamp readings the real cleanup `sh -c` asks.
-/// Other invocations still use the system tools. The old loader puts this bin
-/// first, so the same actual PATH cleanup consumes these captured readings.
+/// Owned stand-ins for the timestamp readings the real cleanup `sh -c` asks:
+/// the folder's `birth` and `modified` (`stat`), the clock (`date`,
+/// [`STAND_IN_NOW`]) and the shell's `age` (`ps -o etime=`). Other invocations
+/// still use the system tools. The old loader puts this bin first, so the same
+/// actual PATH cleanup consumes these captured readings.
 #[cfg(unix)]
-fn lay_aterm_bin_with_dates(fx: &LiveFixture, birth: u64, modified: u64) -> String {
+fn lay_aterm_bin_with_dates(fx: &LiveFixture, birth: u64, modified: u64, age: &str) -> String {
     let bin = fx.home.join(".aterm").join("bin");
     std::fs::create_dir_all(&bin).expect("mk ~/.aterm/bin");
     write_executable(
@@ -721,11 +802,15 @@ fn lay_aterm_bin_with_dates(fx: &LiveFixture, birth: u64, modified: u64) -> Stri
     );
     write_executable(
         &bin.join("date"),
-        "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = +%s ]; then printf '%s\\n' 1000; else exec /bin/date \"$@\"; fi\n",
+        &format!(
+            "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = +%s ]; then printf '%s\\n' {STAND_IN_NOW}; else exec /bin/date \"$@\"; fi\n"
+        ),
     );
     write_executable(
         &bin.join("ps"),
-        "#!/bin/sh\nif [ \"$#\" -eq 4 ] && [ \"$1:$2:$3\" = '-o:etime=:-p' ]; then printf '%s\\n' 00:10; else exec /bin/ps \"$@\"; fi\n",
+        &format!(
+            "#!/bin/sh\nif [ \"$#\" -eq 4 ] && [ \"$1:$2:$3\" = '-o:etime=:-p' ]; then printf '%s\\n' {age}; else exec /bin/ps \"$@\"; fi\n"
+        ),
     );
     bin.to_str().expect("UTF-8 home").to_owned()
 }
@@ -813,15 +898,10 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     let at = sh.wait_for_after("RAN201", at);
     if !trace.is_empty() {
         // The trace's own last line, `set +x`, ends it on stderr.
-        let started = std::time::Instant::now();
-        while !sh.stderr_text().contains("set +x") {
-            assert!(
-                started.elapsed() < LiveShell::TIMEOUT,
-                "{label}: no trace\n{}",
-                sh.stderr_text()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
+        let pipe = std::sync::Arc::clone(&sh.stderr);
+        sh.wait_on(&pipe, "the trace's `set +x`", |err| {
+            find_bytes(err, b"set +x").map(|_| ())
+        });
         // bash writes its prompt, and the signed 133;B in it, on stderr too.
         assert!(
             !cut_osc(&sh.stderr_text()).contains(REKEY_NEW),
@@ -1082,8 +1162,7 @@ fn a_nested_bash_is_not_integrated_by_the_typed_line() {
         .env("TERM", "dumb")
         .env("ATERM_CHILD", "1")
         .env("ATERM_REROUTE_DIR", &bf.fx.reroute)
-        .env("ATERM_SHELL_INTEGRATION_INSTALLED", "1")
-        .env_remove("BASH_ENV");
+        .env("ATERM_SHELL_INTEGRATION_INSTALLED", "1");
     let mut sh = LiveShell::spawn("bash", &mut cmd);
     nested_shell_is_left_alone("bash", ShellType::Bash, &mut sh, &bf);
     sh.finish();
@@ -1111,8 +1190,15 @@ fn a_nested_bash_is_not_integrated_by_the_typed_line() {
 ///   the file sourced again keeps it.
 /// - A NESTED pwsh — the guard and PATH inherited, no variable of an older
 ///   script's — keeps PATH as it found it.
+///
+/// The five processes share nothing (each its own home), so they start side by
+/// side and are read in this order: one after another they were five pwsh
+/// startups end to end, the longest wait in the crate's binary.
 #[cfg(any(unix, windows))]
-fn pwsh_takes_an_older_scripts_aterm_bin_off(label: &str, run: impl Fn(&str, bool) -> String) {
+fn pwsh_takes_an_older_scripts_aterm_bin_off(
+    label: &str,
+    run: impl Fn(&str, bool) -> String + Sync,
+) {
     let sep = if cfg!(windows) { ";" } else { ":" };
     // Captured metadata in the existing owned child, not filesystem birthtime
     // setters: the actual loader still reads its normal Get-Item boundary.
@@ -1122,8 +1208,7 @@ fn pwsh_takes_an_older_scripts_aterm_bin_off(label: &str, run: impl Fn(&str, boo
                  [PSCustomObject]@{ CreationTimeUtc = $__t_born; LastWriteTimeUtc = $__t_mtime } \
                  } else { Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath -Force:$Force -ErrorAction $ErrorAction } }; ";
     // The `B=` and `P<n>=` lines a run printed, in order.
-    let lines = |snippet: &str, nested: bool| -> (String, Vec<String>) {
-        let stdout = run(&format!("{dates}{snippet}"), nested);
+    let lines = |stdout: &str| -> (String, Vec<String>) {
         let mut bin = String::new();
         let mut paths = Vec::new();
         for line in stdout.lines() {
@@ -1151,13 +1236,54 @@ fn pwsh_takes_an_older_scripts_aterm_bin_off(label: &str, run: impl Fn(&str, boo
     let user_last = "$env:PATH = $env:PATH + [IO.Path]::PathSeparator + $__t_bin; ";
     let copies = |path: &str, bin: &str| path.split(sep).filter(|entry| *entry == bin).count();
 
-    let (bin, p) = lines(
-        &format!(
+    let fallbacks = ["", "$__t_born = [DateTime]::MinValue; "];
+    let mut runs = vec![(
+        format!(
             "{older}. $env:ATERM_TEST_NEW; 'P0=' + $env:PATH; {user_first}'P1=' + $env:PATH; \
              . $env:ATERM_TEST_NEW; 'P2=' + $env:PATH"
         ),
         false,
-    );
+    )];
+    runs.extend(fallbacks.map(|fallback| {
+        (
+            format!(
+                "{older}{fallback}. $env:ATERM_TEST_OLD; {user_last}'P0=' + $env:PATH; \
+                 . $env:ATERM_TEST_NEW; 'P1=' + $env:PATH; . $env:ATERM_TEST_NEW; 'P2=' + $env:PATH"
+            ),
+            false,
+        )
+    }));
+    runs.push((
+        format!(
+            ". $env:ATERM_TEST_OLD; {now}{user_last}'P0=' + $env:PATH; \
+             . $env:ATERM_TEST_NEW; 'P1=' + $env:PATH"
+        ),
+        false,
+    ));
+    runs.push((
+        "'P0=' + $env:PATH; . $env:ATERM_TEST_NEW; 'P1=' + $env:PATH".to_owned(),
+        true,
+    ));
+    let run = &run;
+    let mut outs = std::thread::scope(|scope| {
+        let started: Vec<_> = runs
+            .iter()
+            .map(|(snippet, nested)| {
+                scope.spawn(move || run(&format!("{dates}{snippet}"), *nested))
+            })
+            .collect();
+        started
+            .into_iter()
+            .map(|one| {
+                one.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    });
+    let mut next = || lines(&outs.next().expect("one output per run"));
+
+    let (bin, p) = next();
     assert_eq!(p.len(), 3, "{label}: {p:?}");
     assert_eq!(
         copies(&p[0], &bin),
@@ -1167,14 +1293,8 @@ fn pwsh_takes_an_older_scripts_aterm_bin_off(label: &str, run: impl Fn(&str, boo
     assert_eq!(p[1], format!("{bin}{sep}{}", p[0]), "{label}");
     assert_eq!(p[2], p[1], "{label}: the user's own ~/.aterm/bin stays");
 
-    for fallback in ["", "$__t_born = [DateTime]::MinValue; "] {
-        let (bin, p) = lines(
-            &format!(
-                "{older}{fallback}. $env:ATERM_TEST_OLD; {user_last}'P0=' + $env:PATH; \
-                 . $env:ATERM_TEST_NEW; 'P1=' + $env:PATH; . $env:ATERM_TEST_NEW; 'P2=' + $env:PATH"
-            ),
-            false,
-        );
+    for _fallback in fallbacks {
+        let (bin, p) = next();
         assert_eq!(p.len(), 3, "{label}: {p:?}");
         assert!(
             p[0].starts_with(&format!("{bin}{sep}")) && copies(&p[0], &bin) == 2,
@@ -1188,13 +1308,7 @@ fn pwsh_takes_an_older_scripts_aterm_bin_off(label: &str, run: impl Fn(&str, boo
         assert_eq!(p[2], p[1], "{label}: once");
     }
 
-    let (bin, p) = lines(
-        &format!(
-            ". $env:ATERM_TEST_OLD; {now}{user_last}'P0=' + $env:PATH; \
-             . $env:ATERM_TEST_NEW; 'P1=' + $env:PATH"
-        ),
-        false,
-    );
+    let (bin, p) = next();
     assert_eq!(p.len(), 2, "{label}: {p:?}");
     assert_eq!(
         copies(&p[0], &bin),
@@ -1206,10 +1320,7 @@ fn pwsh_takes_an_older_scripts_aterm_bin_off(label: &str, run: impl Fn(&str, boo
         "{label}: a folder made after the process started was never the old script's"
     );
 
-    let (_, p) = lines(
-        "'P0=' + $env:PATH; . $env:ATERM_TEST_NEW; 'P1=' + $env:PATH",
-        true,
-    );
+    let (_, p) = next();
     assert_eq!(p.len(), 2, "{label}: {p:?}");
     assert!(p[0].contains(".aterm"), "{label}: inherited: {p:?}");
     assert_eq!(
@@ -1347,30 +1458,49 @@ fn line_then_body(
 /// this build reaches a running loader shell, from the real loaders that put
 /// it there (57daa3707e) and from the same minus that block (613305828c, the
 /// first build that put none there and set no mark, as every build since up
-/// to this one). `spawn(bf, folder)` starts the shell on `folder`'s scripts
-/// with the session's body pointer. Four shells:
+/// to this one). `spawn(bf, folder, spawned_by)` starts the shell on
+/// `folder`'s scripts with the session's body pointer and `spawned_by` in its
+/// environment. The shells, each in its own fixture, side by side, each started
+/// since the cut the scripts take a shell's start against unless it says
+/// otherwise:
 ///
 /// 1. The prepending loader, the folder there before the shell started: it put
 ///    the folder first, and the user adds a copy at the end. This build's
 ///    body, taken at a prompt, takes exactly the first off, and a newer body
 ///    after it nothing more.
 /// 2. The same loader with no folder at its load (it put nothing there), the
-///    folder made after the shell started and the user's copy at the end: the
-///    body keeps it.
-/// 3. 613305828c's loader, the folder there before: a copy the user puts
-///    first stays through the body (the review's v0.106.0 shell).
+///    folder made after the shell started and the user's copy first: the body
+///    keeps it — in a shell started before the cut too, whose start proves
+///    the loader prepended but not that the folder was there.
+/// 3. 613305828c's loader, the folder there before, the shell spawned by a
+///    terminal naming itself aterm 0.105.0 (a dev build of the hour after
+///    613305828c): a copy the user puts first stays through the body, since
+///    the loader is there and answers (the review's v0.106.0 shell).
 /// 4. The prepending loader, then this build's LOADER sourced over it in place
 ///    (a re-source; the typed upgrade's way): it notes the older loader before
 ///    it writes over `__aterm_si_dir`, and its body takes exactly the first
 ///    off.
+/// 5. The prepending loader whose folder is then collected, and 6. the
+///    prepending loader with 613305828c's sourced over it in place: neither
+///    shell names a loader that holds the prepend any more
+///    ([`UNNAMED_LOADER_CASES`]). Started before the cut, the start alone
+///    proves an older script loaded it; started since, the version aterm
+///    named to the shell does when it is v0.105.0 or older. Then the body
+///    takes exactly the first off; otherwise it keeps the entry (the limit
+///    `aterm help update` states).
 #[cfg(unix)]
-fn live_older_loaders_aterm_bin(label: &str, spawn: impl Fn(&BodyFixture, &Path) -> LiveShell) {
+fn live_older_loaders_aterm_bin(
+    label: &str,
+    spawn: impl Fn(&BodyFixture, &Path, &[(&str, &str)]) -> LiveShell + Sync,
+) {
     let ours_rev = |bf: &BodyFixture| bf.ours_rev();
+    let spawn = &spawn;
+    let source = if label == "fish" { "source" } else { "." };
 
-    for birth in [900, 0] {
+    let born = |birth: u64| {
         let bf = BodyFixture::new();
-        let bin = lay_aterm_bin_with_dates(&bf.fx, birth, 900);
-        let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, true));
+        let bin = lay_aterm_bin_with_dates(&bf.fx, birth, CUT - 100, STARTED_SINCE);
+        let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, true), &[]);
         let (at, rev, before) = probe_rev_path(label, &mut sh, 1, 0);
         assert_eq!(rev, PREPENDING_REV, "{label}: the older loader runs");
         assert!(
@@ -1388,109 +1518,260 @@ fn live_older_loaders_aterm_bin(label: &str, spawn: impl Fn(&BodyFixture, &Path)
         let (_, again) = line_then_body(label, &mut sh, &bf, ("true", NEWER_REV, 3), at);
         assert_eq!(again, path, "{label}: once per shell");
         sh.finish();
+    };
+
+    let made_after = |age: &str| {
+        let bf = BodyFixture::new();
+        let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, true), &[]);
+        let (at, _, before) = probe_rev_path(label, &mut sh, 1, 0);
+        assert!(
+            !before.contains(".aterm/bin"),
+            "{label}: no folder, no entry: {before:?}"
+        );
+        // The directory is created after the old loader ran. Its positive birth
+        // is newer than the shell, although its preserved mtime is much older.
+        let bin = lay_aterm_bin_with_dates(&bf.fx, STAND_IN_NOW - 5, CUT - 100, age);
+        let user = users_aterm_bin(label, true);
+        let (_, path) = line_then_body(label, &mut sh, &bf, (user, &ours_rev(&bf), 2), at);
+        assert_eq!(
+            path,
+            format!("{bin}:{before}"),
+            "{label} ({age}): the user's own ~/.aterm/bin stays where the older loader found no folder"
+        );
+        sh.finish();
+    };
+
+    let unprepending = || {
+        let bf = BodyFixture::new();
+        let bin = lay_aterm_bin(&bf.fx);
+        // Spawned by a dev build of the hour after 613305828c that still read
+        // 0.105.0: its loader is there, and it answers.
+        let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, false), SPAWNED_BY_0_105);
+        let (at, rev, before) = probe_rev_path(label, &mut sh, 1, 0);
+        assert_eq!(rev, UNPREPENDING_REV, "{label}: 613305828c's loader runs");
+        assert!(
+            !before.contains(".aterm/bin"),
+            "{label}: it puts none there: {before:?}"
+        );
+        let user = users_aterm_bin(label, true);
+        let (_, path) = line_then_body(label, &mut sh, &bf, (user, &ours_rev(&bf), 2), at);
+        assert_eq!(
+            path,
+            format!("{bin}:{before}"),
+            "{label}: the user's own ~/.aterm/bin stays in a shell no older script prepended, \
+             its loader there to say so whatever version spawned it"
+        );
+        sh.finish();
+    };
+
+    let in_place = || {
+        let bf = BodyFixture::new();
+        let bin = lay_aterm_bin(&bf.fx);
+        let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, true), &[]);
+        let (at, _, before) = probe_rev_path(label, &mut sh, 1, 0);
+        assert!(
+            before.starts_with(&format!("{bin}:")),
+            "{label}: {before:?}"
+        );
+        let with_users = format!("{before}:{bin}");
+        let loader = bf.ours.join(format!("aterm_shell_integration.{label}"));
+        sh.send(&format!(
+            "{}; {source} '{}'; {}",
+            users_aterm_bin(label, false),
+            loader.display(),
+            ran(label, 202)
+        ));
+        let at = sh.wait_for_after("RAN202", at);
+        let (_, rev, path) = probe_rev_path(label, &mut sh, 2, at);
+        assert_eq!(
+            rev,
+            ours_rev(&bf),
+            "{label}: this build's loader came in place"
+        );
+        assert_eq!(
+            path,
+            without_first(&with_users, &bin),
+            "{label}: in place: the older loader's ~/.aterm/bin off, the user's copy kept"
+        );
+        sh.finish();
+    };
+
+    let unnamed = |(age, spawned_by, collected, off): (&str, SpawnedBy, bool, bool)| {
+        let bf = BodyFixture::new();
+        let bin = lay_aterm_bin_with_dates(
+            &bf.fx,
+            STAND_IN_NOW - 6 * 86_400,
+            STAND_IN_NOW - 6 * 86_400,
+            age,
+        );
+        let older = older_loader_folder(&bf.fx, true);
+        let mut sh = spawn(&bf, &older, spawned_by);
+        let (at, _, before) = probe_rev_path(label, &mut sh, 1, 0);
+        assert!(
+            before.starts_with(&format!("{bin}:")),
+            "{label}: the older loader put ~/.aterm/bin first: {before:?}"
+        );
+        let with_users = format!("{before}:{bin}");
+        let user = users_aterm_bin(label, false);
+        let line = if collected {
+            std::fs::remove_dir_all(&older).expect("collect the older loader's folder");
+            user.to_owned()
+        } else {
+            let between =
+                older_loader_folder(&bf.fx, false).join(format!("aterm_shell_integration.{label}"));
+            format!("{user}; {source} '{}'", between.display())
+        };
+        let (_, path) = line_then_body(label, &mut sh, &bf, (&line, &ours_rev(&bf), 2), at);
+        let how = format!(
+            "{}, started {}, spawned by {spawned_by:?}",
+            if collected {
+                "its loader's folder collected"
+            } else {
+                "613305828c's loader sourced in place"
+            },
+            if age == STARTED_BEFORE {
+                "before the cut"
+            } else {
+                "since"
+            },
+        );
+        if off {
+            assert_eq!(
+                path,
+                without_first(&with_users, &bin),
+                "{label} ({how}): the older loader's ~/.aterm/bin off, the user's copy and \
+                 the rest where they were"
+            );
+        } else {
+            assert_eq!(
+                path, with_users,
+                "{label} ({how}): nothing proves whose the entry is, so it stays"
+            );
+        }
+        sh.finish();
+    };
+
+    let mut cases: Vec<(String, Box<dyn FnOnce() + Send + '_>)> = vec![
+        (format!("{label}-born-before"), Box::new(|| born(CUT - 100))),
+        (format!("{label}-no-birth"), Box::new(|| born(0))),
+        (
+            format!("{label}-made-after-since"),
+            Box::new(|| made_after(STARTED_SINCE)),
+        ),
+        (
+            format!("{label}-made-after-before"),
+            Box::new(|| made_after(STARTED_BEFORE)),
+        ),
+        (format!("{label}-unprepending"), Box::new(unprepending)),
+        (format!("{label}-in-place"), Box::new(in_place)),
+    ];
+    let unnamed = &unnamed;
+    for (n, case) in UNNAMED_LOADER_CASES.into_iter().enumerate() {
+        cases.push((
+            format!("{label}-unnamed-{n}"),
+            Box::new(move || unnamed(case)),
+        ));
     }
-
-    let bf = BodyFixture::new();
-    let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, true));
-    let (at, _, before) = probe_rev_path(label, &mut sh, 1, 0);
-    assert!(
-        !before.contains(".aterm/bin"),
-        "{label}: no folder, no entry: {before:?}"
-    );
-    // The directory is created after the old loader ran. Its positive birth
-    // is newer than the shell, although its preserved mtime is much older.
-    let bin = lay_aterm_bin_with_dates(&bf.fx, 995, 900);
-    let user = users_aterm_bin(label, true);
-    let (_, path) = line_then_body(label, &mut sh, &bf, (user, &ours_rev(&bf), 2), at);
-    assert_eq!(
-        path,
-        format!("{bin}:{before}"),
-        "{label}: the user's own ~/.aterm/bin stays where the older loader found no folder"
-    );
-    sh.finish();
-
-    let bf = BodyFixture::new();
-    let bin = lay_aterm_bin(&bf.fx);
-    let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, false));
-    let (at, rev, before) = probe_rev_path(label, &mut sh, 1, 0);
-    assert_eq!(rev, UNPREPENDING_REV, "{label}: 613305828c's loader runs");
-    assert!(
-        !before.contains(".aterm/bin"),
-        "{label}: it puts none there: {before:?}"
-    );
-    let user = users_aterm_bin(label, true);
-    let (_, path) = line_then_body(label, &mut sh, &bf, (user, &ours_rev(&bf), 2), at);
-    assert_eq!(
-        path,
-        format!("{bin}:{before}"),
-        "{label}: the user's own ~/.aterm/bin stays in a shell no older script prepended"
-    );
-    sh.finish();
-
-    let bf = BodyFixture::new();
-    let bin = lay_aterm_bin(&bf.fx);
-    let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, true));
-    let (at, _, before) = probe_rev_path(label, &mut sh, 1, 0);
-    assert!(
-        before.starts_with(&format!("{bin}:")),
-        "{label}: {before:?}"
-    );
-    let with_users = format!("{before}:{bin}");
-    let loader = bf.ours.join(format!("aterm_shell_integration.{label}"));
-    let source = if label == "fish" { "source" } else { "." };
-    sh.send(&format!(
-        "{}; {source} '{}'; {}",
-        users_aterm_bin(label, false),
-        loader.display(),
-        ran(label, 202)
-    ));
-    let at = sh.wait_for_after("RAN202", at);
-    let (_, rev, path) = probe_rev_path(label, &mut sh, 2, at);
-    assert_eq!(
-        rev,
-        ours_rev(&bf),
-        "{label}: this build's loader came in place"
-    );
-    assert_eq!(
-        path,
-        without_first(&with_users, &bin),
-        "{label}: in place: the older loader's ~/.aterm/bin off, the user's copy kept"
-    );
-    sh.finish();
+    side_by_side(cases);
 }
+
+/// Run `cases`, each on a thread named for it, and wait for every one: shells
+/// that share nothing start side by side instead of end to end. The first
+/// case to panic (each prints its own message as it fails, under its thread's
+/// name) is raised again here once all have ended.
+#[cfg(unix)]
+fn side_by_side<'a>(cases: Vec<(String, Box<dyn FnOnce() + Send + 'a>)>) {
+    std::thread::scope(|scope| {
+        let running: Vec<_> = cases
+            .into_iter()
+            .map(|(name, case)| {
+                std::thread::Builder::new()
+                    .name(name)
+                    .spawn_scoped(scope, case)
+                    .expect("start a case's thread")
+            })
+            .collect();
+        let mut first = None;
+        for case in running {
+            if let Err(panic) = case.join() {
+                first.get_or_insert(panic);
+            }
+        }
+        if let Some(panic) = first {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}
+
+/// The environment a terminal names itself in to the shells it spawns.
+#[cfg(unix)]
+type SpawnedBy = &'static [(&'static str, &'static str)];
+
+/// Spawned by aterm v0.105.0, the last release whose every script prepended
+/// ...
+#[cfg(unix)]
+const SPAWNED_BY_0_105: SpawnedBy = &[
+    ("TERM_PROGRAM", "aterm"),
+    ("TERM_PROGRAM_VERSION", "0.105.0"),
+];
+
+/// ... v0.106.0, the first whose script did not ...
+#[cfg(unix)]
+const SPAWNED_BY_0_106: SpawnedBy = &[
+    ("TERM_PROGRAM", "aterm"),
+    ("TERM_PROGRAM_VERSION", "0.106.0"),
+];
+
+/// ... another terminal at a version that would count were it aterm's ...
+#[cfg(unix)]
+const SPAWNED_BY_ANOTHER: SpawnedBy = &[
+    ("TERM_PROGRAM", "vscode"),
+    ("TERM_PROGRAM_VERSION", "0.105.0"),
+];
+
+/// The shells whose loader is gone or unnamed ([`live_older_loaders_aterm_bin`]
+/// 5 and 6): `(age, what spawned it, collected, the entry goes)`. Before the
+/// cut the start proves the prepend whatever named it; since, only aterm at
+/// v0.105.0 or older does.
+#[cfg(unix)]
+const UNNAMED_LOADER_CASES: [(&str, SpawnedBy, bool, bool); 8] = [
+    (STARTED_BEFORE, &[], true, true),
+    (STARTED_BEFORE, &[], false, true),
+    (STARTED_SINCE, &[], true, false),
+    (STARTED_SINCE, &[], false, false),
+    (STARTED_SINCE, SPAWNED_BY_0_105, true, true),
+    (STARTED_SINCE, SPAWNED_BY_0_105, false, true),
+    (STARTED_SINCE, SPAWNED_BY_0_106, true, false),
+    (STARTED_SINCE, SPAWNED_BY_ANOTHER, false, false),
+];
 
 #[cfg(target_os = "macos")]
 #[test]
 fn a_live_zsh_takes_an_older_loaders_aterm_bin_off_and_only_that() {
     let zsh = zsh_shell().expect("macOS ships /bin/zsh");
-    live_older_loaders_aterm_bin("zsh", |bf, dir| {
+    live_older_loaders_aterm_bin("zsh", |bf, dir, spawned_by| {
         let pointer = bf.pointer.to_str().unwrap().to_string();
-        spawn_live_zsh_from(
-            zsh,
-            &bf.fx,
-            dir,
-            &[
-                ("ATERM_SHELL_NONCE", REKEY_OLD),
-                ("ATERM_CHILD", "1"),
-                (BODY_POINTER_VAR, pointer.as_str()),
-            ],
-        )
+        let mut env = vec![
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            ("ATERM_CHILD", "1"),
+            (BODY_POINTER_VAR, pointer.as_str()),
+        ];
+        env.extend_from_slice(spawned_by);
+        spawn_live_zsh_from(zsh, &bf.fx, dir, &env)
     });
 }
 
 #[cfg(unix)]
 #[test]
 fn a_live_bash_takes_an_older_loaders_aterm_bin_off_and_only_that() {
-    live_older_loaders_aterm_bin("bash", |bf, dir| {
+    live_older_loaders_aterm_bin("bash", |bf, dir, spawned_by| {
         let pointer = bf.pointer.to_str().unwrap().to_string();
-        spawn_live_bash_from(
-            &bf.fx,
-            dir,
-            &[
-                ("ATERM_SHELL_NONCE", REKEY_OLD),
-                (BODY_POINTER_VAR, pointer.as_str()),
-            ],
-        )
+        let mut env = vec![
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            (BODY_POINTER_VAR, pointer.as_str()),
+        ];
+        env.extend_from_slice(spawned_by);
+        spawn_live_bash_from(&bf.fx, dir, &env)
     });
 }
 
@@ -1534,7 +1815,7 @@ fn spawn_live_fish_from(
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("ATERM_CHILD", "1");
-    let data = hermetic.home().join("data");
+    let data = hermetic_data(hermetic.home());
     match dir {
         Some(dir) => {
             let InjectionEnv { env_add, .. } = injection_for(ShellType::Fish, dir).expect("fish");
@@ -1627,17 +1908,14 @@ fn a_nested_fish_is_not_integrated_by_the_typed_line() {
 #[test]
 fn a_live_fish_takes_an_older_loaders_aterm_bin_off_and_only_that() {
     let fish = live_fish();
-    live_older_loaders_aterm_bin("fish", |bf, dir| {
+    live_older_loaders_aterm_bin("fish", |bf, dir, spawned_by| {
         let pointer = bf.pointer.to_str().unwrap().to_string();
-        spawn_live_fish_from(
-            fish,
-            &bf.fx,
-            Some(dir),
-            &[
-                ("ATERM_SHELL_NONCE", REKEY_OLD),
-                (BODY_POINTER_VAR, pointer.as_str()),
-            ],
-        )
+        let mut env = vec![
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            (BODY_POINTER_VAR, pointer.as_str()),
+        ];
+        env.extend_from_slice(spawned_by);
+        spawn_live_fish_from(fish, &bf.fx, Some(dir), &env)
     });
 }
 

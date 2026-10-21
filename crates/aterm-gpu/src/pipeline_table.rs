@@ -370,8 +370,8 @@ pub(crate) struct VertexAttr {
     pub(crate) offset: u64,
 }
 
-/// A vertex attribute's element type. Exactly the five `renderer.rs` uses; the
-/// Metal twin is `crate::metal::ffi::VertexFormat`.
+/// A vertex attribute's element type. Exactly the seven `renderer.rs` uses;
+/// the Metal twin is `crate::metal::ffi::VertexFormat`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttrFormat {
     /// `wgpu::VertexFormat::Uint16x4` / `MTLVertexFormatUShort4` — pixel rects,
@@ -388,8 +388,14 @@ pub(crate) enum AttrFormat {
     /// and UV.
     Float32x4,
     /// `wgpu::VertexFormat::Uint32` / `MTLVertexFormatUInt` — the fire churn
-    /// phase.
+    /// phase, and the fx palette base and flags.
     Uint32,
+    /// `wgpu::VertexFormat::Sint16x2` / `MTLVertexFormatShort2` — the fx
+    /// item origin (`FxInstance::origin`, stored mod 2¹⁶).
+    Sint16x2,
+    /// `wgpu::VertexFormat::Uint16x2` / `MTLVertexFormatUShort2` — the fx
+    /// sprite's destination size.
+    Uint16x2,
 }
 
 impl AttrFormat {
@@ -402,6 +408,8 @@ impl AttrFormat {
             Self::Uint8x4 => wgpu::VertexFormat::Uint8x4,
             Self::Float32x4 => wgpu::VertexFormat::Float32x4,
             Self::Uint32 => wgpu::VertexFormat::Uint32,
+            Self::Sint16x2 => wgpu::VertexFormat::Sint16x2,
+            Self::Uint16x2 => wgpu::VertexFormat::Uint16x2,
         }
     }
 }
@@ -435,6 +443,8 @@ pub(crate) enum VertexLayout {
     RainGlow,
     /// `renderer.rs::FireInstance` — 24 bytes.
     Fire,
+    /// `fx_gpu::FxInstance` — 32 bytes: one band slice of one fx item.
+    Fx,
 }
 
 /// `BgInstance`: `[u16;4]` rect + `[u8;4]` colour.
@@ -556,6 +566,46 @@ pub(crate) const FIRE_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     ],
 };
 
+/// `FxInstance`: the slice rect, the item origin (mod 2¹⁶), the sprite's
+/// destination size, the atlas region, the absolute palette base and the
+/// flags (kind, flip, texel kind, Index8 reach). Every field is an integer the
+/// fragment reads flat: pixel law F has no interpolant.
+pub(crate) const FX_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
+    stride: 32,
+    attrs: &[
+        VertexAttr {
+            location: 0,
+            format: AttrFormat::Uint16x4,
+            offset: 0,
+        },
+        VertexAttr {
+            location: 1,
+            format: AttrFormat::Sint16x2,
+            offset: 8,
+        },
+        VertexAttr {
+            location: 2,
+            format: AttrFormat::Uint16x2,
+            offset: 12,
+        },
+        VertexAttr {
+            location: 3,
+            format: AttrFormat::Uint16x4,
+            offset: 16,
+        },
+        VertexAttr {
+            location: 4,
+            format: AttrFormat::Uint32,
+            offset: 24,
+        },
+        VertexAttr {
+            location: 5,
+            format: AttrFormat::Uint32,
+            offset: 28,
+        },
+    ],
+};
+
 impl VertexLayout {
     /// The layout's stride + attributes, or `None` for a vertex-id-only pass.
     #[cfg(any(target_os = "macos", gl_arm))]
@@ -567,6 +617,7 @@ impl VertexLayout {
             Self::Glyph => Some(GLYPH_LAYOUT),
             Self::RainGlow => Some(RAIN_GLOW_LAYOUT),
             Self::Fire => Some(FIRE_LAYOUT),
+            Self::Fx => Some(FX_LAYOUT),
         }
     }
 }
@@ -616,6 +667,17 @@ static FIRE_ATTRS: [wgpu::VertexAttribute; 4] = [
     wgpu_attr(FIRE_LAYOUT.attrs[3]),
 ];
 
+/// The `wgpu` attribute array for [`FX_LAYOUT`].
+#[cfg(wgpu_arm)]
+static FX_ATTRS: [wgpu::VertexAttribute; 6] = [
+    wgpu_attr(FX_LAYOUT.attrs[0]),
+    wgpu_attr(FX_LAYOUT.attrs[1]),
+    wgpu_attr(FX_LAYOUT.attrs[2]),
+    wgpu_attr(FX_LAYOUT.attrs[3]),
+    wgpu_attr(FX_LAYOUT.attrs[4]),
+    wgpu_attr(FX_LAYOUT.attrs[5]),
+];
+
 /// The `wgpu` per-instance buffer layout for [`VertexLayout::Bg`].
 #[cfg(wgpu_arm)]
 static BG_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
@@ -652,6 +714,14 @@ static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBuffe
     attributes: &FIRE_ATTRS,
 }];
 
+/// The `wgpu` per-instance buffer layout for [`VertexLayout::Fx`].
+#[cfg(wgpu_arm)]
+static FX_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
+    array_stride: FX_LAYOUT.stride,
+    step_mode: wgpu::VertexStepMode::Instance,
+    attributes: &FX_ATTRS,
+}];
+
 /// Where one row's resources bind on the explicit-slot backends (Metal today;
 /// D3D11's per-stage registers take the same numbers, and GL's units and block
 /// bindings the buffer and texture ones). `metal/blit.rs` and the encoder call
@@ -683,6 +753,11 @@ pub(crate) struct BindSpec {
     /// vertex stage's `Uniforms` (argument tables are per stage); post passes
     /// read their uniform at 2.
     pub(crate) fragment_buffers: &'static [u32],
+    /// The fx frame palette's slot, or `None`: Metal binds the per-frame
+    /// palette stream as fragment `[[buffer(n)]]` (`device const uint*`); GL,
+    /// whose GLSL ES 3.00 has no storage buffer, binds the frame slot's
+    /// palette texture as sampler `aterm_t<n>` on texture unit `n`.
+    pub(crate) fragment_palette: Option<u32>,
 }
 
 #[cfg(any(target_os = "macos", gl_arm))]
@@ -694,6 +769,7 @@ impl BindSpec {
         fragment_textures: &[],
         fragment_samplers: &[],
         fragment_buffers: &[],
+        fragment_palette: None,
     };
     /// The atlas-sampling cell rows (colour glyph, deco pair, sprites):
     /// [`Self::CELL_FLAT`] plus the atlas at fragment texture/sampler 0.
@@ -702,6 +778,7 @@ impl BindSpec {
         fragment_textures: &[0],
         fragment_samplers: &[0],
         fragment_buffers: &[],
+        fragment_palette: None,
     };
     /// `fs_glyph`: [`Self::CELL_ATLAS`] plus `Uniforms` re-bound at fragment
     /// `[[buffer(0)]]` (it reads `text_blend`).
@@ -710,6 +787,7 @@ impl BindSpec {
         fragment_textures: &[0],
         fragment_samplers: &[0],
         fragment_buffers: &[0],
+        fragment_palette: None,
     };
     /// The `[[vertex_id]]` post passes (bloom, shimmer, blit): no vertex
     /// uniform; the frame at fragment texture/sampler 0 and the pass uniform at
@@ -719,6 +797,7 @@ impl BindSpec {
         fragment_textures: &[0],
         fragment_samplers: &[0],
         fragment_buffers: &[2],
+        fragment_palette: None,
     };
     /// The crown pair: `HdrU` at vertex `[[buffer(0)]]` and fragment
     /// `[[buffer(0)]]`; no texture (the crown is procedural light).
@@ -727,6 +806,20 @@ impl BindSpec {
         fragment_textures: &[],
         fragment_samplers: &[],
         fragment_buffers: &[0],
+        fragment_palette: None,
+    };
+    /// The fx rows: `Uniforms` at vertex `[[buffer(0)]]`; the R8 (Index8) and
+    /// RGBA8 atlases at fragment textures 0 and 1, read by integer texel
+    /// address (`read`, `texelFetch`, `textureLoad`), so no sampler; and the
+    /// frame palette at slot 2 ([`Self::fragment_palette`]). GL pairs each
+    /// texture unit with the nearest sampler object regardless, so a texture
+    /// is complete without mipmaps.
+    const FX: Self = Self {
+        vertex_uniform: Some(0),
+        fragment_textures: &[0, 1],
+        fragment_samplers: &[],
+        fragment_buffers: &[],
+        fragment_palette: Some(2),
     };
     /// The tray: placement uniform at vertex `[[buffer(2)]]`, card texture and
     /// linear sampler at fragment 0.
@@ -735,6 +828,7 @@ impl BindSpec {
         fragment_textures: &[0],
         fragment_samplers: &[0],
         fragment_buffers: &[],
+        fragment_palette: None,
     };
 }
 
@@ -797,6 +891,7 @@ impl PipelineSpec {
             VertexLayout::Glyph => &GLYPH_BUFFERS,
             VertexLayout::RainGlow => &RAIN_GLOW_BUFFERS,
             VertexLayout::Fire => &FIRE_BUFFERS,
+            VertexLayout::Fx => &FX_BUFFERS,
         }
     }
 
@@ -1137,11 +1232,49 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::TRAY,
     },
+    // --- the fx engine's two rows (design §4.5-§4.6) -----------------------
+    PipelineSpec {
+        label: "aterm-gpu fx pipeline",
+        library: ShaderLibrary::Cell,
+        // Pixel law F over flat integer varyings: the fragment addresses its
+        // texel and its ramp column from the absolute pixel and the item's
+        // unclamped origin, never a sampler or a float UV.
+        vs: "vs_fx",
+        fs: "fs_fx",
+        // `fs_glow`'s state: `(c, a) / 255` raw into `src + dst·(1 − a)` on
+        // the Unorm view rounds once on store, byte-exact with the CPU
+        // `over_premul` (`add_sat` at `a = 0`).
+        target: TargetRole::OffscreenUnorm,
+        blend: Some(Blend::GLOW_OVER),
+        write_mask: WriteMask::Color,
+        vertex: VertexLayout::Fx,
+        #[cfg(any(wgpu_arm, gl_arm, test))]
+        topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", gl_arm))]
+        binds: BindSpec::FX,
+    },
+    PipelineSpec {
+        label: "aterm-gpu fx linear pipeline",
+        library: ShaderLibrary::Cell,
+        vs: "vs_fx",
+        // A Linear layer's straight texels under their tint, decoded and
+        // blended in linear light: the scene-over row's target and blend
+        // (FreeSprite's law and tolerance).
+        fs: "fs_fx_linear",
+        target: TargetRole::OffscreenSrgb,
+        blend: Some(Blend::ALPHA_BLENDING),
+        write_mask: WriteMask::All,
+        vertex: VertexLayout::Fx,
+        #[cfg(any(wgpu_arm, gl_arm, test))]
+        topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", gl_arm))]
+        binds: BindSpec::FX,
+    },
 ];
 
 /// How many rows [`PIPELINES`] has. A `const` so the array length is visible at
 /// its definition, exactly like `EFFECT_PIPELINE_COUNT`.
-pub(crate) const PIPELINE_COUNT: usize = 18;
+pub(crate) const PIPELINE_COUNT: usize = 20;
 
 /// A row of [`PIPELINES`], by name. The discriminants are the indices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1187,6 +1320,10 @@ pub(crate) enum Pipeline {
     Blit = 16,
     /// The tray/overlay card blit.
     Tray = 17,
+    /// The fx engine's Exact layers (pixel law F on the Unorm view).
+    Fx = 18,
+    /// The fx engine's Linear layers (straight texels, linear-light blend).
+    FxLinear = 19,
 }
 
 /// Every [`Pipeline`], in row order — the single enumeration a sweep walks.
@@ -1210,6 +1347,8 @@ pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::SdrGlow,
     Pipeline::Blit,
     Pipeline::Tray,
+    Pipeline::Fx,
+    Pipeline::FxLinear,
 ];
 
 impl Pipeline {
@@ -1242,6 +1381,8 @@ impl Pipeline {
             Self::SdrGlow => "sdr_glow",
             Self::Blit => "blit",
             Self::Tray => "tray",
+            Self::Fx => "fx",
+            Self::FxLinear => "fx_linear",
         }
     }
 }

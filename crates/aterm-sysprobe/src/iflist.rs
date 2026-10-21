@@ -1,0 +1,768 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The routing socket's interface list (`sysctl {CTL_NET, PF_ROUTE, 0, 0,
+//! NET_RT_IFLIST2, 0}`), decoded from bytes: Darwin's 64-bit interface
+//! counters, which [`crate::net_links`] reads on macOS.
+//!
+//! The answer is a run of routing messages, each led by its length,
+//! version and type. An `RTM_IFINFO2` message is a `struct if_msghdr2`
+//! (`net/if.h`) whose `ifm_data` is a `struct if_data64` (`net/if_var.h`,
+//! under `#pragma pack(4)`), followed, when `ifm_addrs` has `RTA_IFP`, by
+//! the interface's link-level address: a `struct sockaddr_dl`
+//! (`net/if_dl.h`) that holds its name. The address messages after each
+//! interface are skipped. The first-party `libc` declares none of these, so
+//! they are declared here; every size, offset and constant is a row of
+//! [`SDK_ROWS`], which `tests/iflist_sdk.rs` compiles as `_Static_assert`s
+//! against the SDK for `arm64` and `x86_64` (with a negative control). The
+//! decoder is pure and tested on every host from bytes the tests write.
+//!
+//! Not `getifaddrs`: its `AF_LINK` entries carry the 32-bit `struct
+//! if_data`, whose byte counters wrap every 4 GiB (every 34 s at 1 Gb/s).
+//! Not `if_indextoname` for the names: libc answers it by listing every
+//! interface, about 20 µs a name on the owner's M5 Max (512 µs for 24
+//! interfaces, against 33 µs for the whole list), while the message already
+//! carries the name.
+
+use crate::machine::{
+    LinkCounters, LinkKind, LinkReading, MAX_LINKS, kind_by_name, never_the_machines,
+};
+
+/// `CTL_NET` (`sys/sysctl.h`).
+pub const CTL_NET: i32 = 4;
+/// `PF_ROUTE` (`sys/socket.h`).
+pub const PF_ROUTE: i32 = 17;
+/// `NET_RT_IFLIST2` (`sys/socket.h`): the interface list with 64-bit
+/// counters.
+pub const NET_RT_IFLIST2: i32 = 6;
+/// `RTM_VERSION` (`net/route.h`): the message format decoded here; a
+/// message of another version is skipped.
+pub const RTM_VERSION: u8 = 5;
+/// `RTM_IFINFO2` (`net/route.h`): an interface's `if_msghdr2`.
+pub const RTM_IFINFO2: u8 = 0x12;
+/// `RTA_IFP` (`net/route.h`): the message carries the interface's
+/// link-level address.
+pub const RTA_IFP: i32 = 0x10;
+/// `AF_LINK` (`sys/socket.h`).
+pub const AF_LINK: u8 = 18;
+/// `IFF_UP` (`net/if.h`).
+pub const IFF_UP: i32 = 0x1;
+/// `IFF_LOOPBACK` (`net/if.h`).
+pub const IFF_LOOPBACK: i32 = 0x8;
+/// `IFF_RUNNING` (`net/if.h`).
+pub const IFF_RUNNING: i32 = 0x40;
+/// `SIOCGIFFUNCTIONALTYPE` (`sys/sockio.h`, `_IOWR('i', 173, struct
+/// ifreq)`): an interface's functional type, asked on any socket.
+pub const SIOCGIFFUNCTIONALTYPE: u64 = 0xC020_69AD;
+/// `IFRTYPE_FUNCTIONAL_WIRED` (`net/if.h`).
+pub const IFRTYPE_FUNCTIONAL_WIRED: u32 = 2;
+/// `IFRTYPE_FUNCTIONAL_WIFI_INFRA` (`net/if.h`).
+pub const IFRTYPE_FUNCTIONAL_WIFI_INFRA: u32 = 3;
+/// `IFRTYPE_FUNCTIONAL_CELLULAR` (`net/if.h`).
+pub const IFRTYPE_FUNCTIONAL_CELLULAR: u32 = 5;
+
+/// `struct if_data64`: 128 bytes at 4-byte alignment (`#pragma pack(4)`).
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+pub(crate) struct IfData64 {
+    ifi_type: u8,
+    ifi_typelen: u8,
+    ifi_physical: u8,
+    ifi_addrlen: u8,
+    ifi_hdrlen: u8,
+    ifi_recvquota: u8,
+    ifi_xmitquota: u8,
+    ifi_unused1: u8,
+    ifi_mtu: u32,
+    ifi_metric: u32,
+    pub(crate) ifi_baudrate: u64,
+    pub(crate) ifi_ipackets: u64,
+    pub(crate) ifi_ierrors: u64,
+    pub(crate) ifi_opackets: u64,
+    pub(crate) ifi_oerrors: u64,
+    ifi_collisions: u64,
+    pub(crate) ifi_ibytes: u64,
+    pub(crate) ifi_obytes: u64,
+    ifi_imcasts: u64,
+    ifi_omcasts: u64,
+    pub(crate) ifi_iqdrops: u64,
+    ifi_noproto: u64,
+    ifi_recvtiming: u32,
+    ifi_xmittiming: u32,
+    /// `struct timeval32`: two `int32_t`.
+    ifi_lastchange: [i32; 2],
+}
+
+/// `struct if_msghdr2`: 160 bytes at 4-byte alignment.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct IfMsghdr2 {
+    pub(crate) ifm_msglen: u16,
+    pub(crate) ifm_version: u8,
+    pub(crate) ifm_type: u8,
+    pub(crate) ifm_addrs: i32,
+    pub(crate) ifm_flags: i32,
+    pub(crate) ifm_index: u16,
+    /// The two bytes C pads `ifm_index` with, named so the struct has no
+    /// padding.
+    ifm_pad: u16,
+    ifm_snd_len: i32,
+    ifm_snd_maxlen: i32,
+    pub(crate) ifm_snd_drops: i32,
+    ifm_timer: i32,
+    pub(crate) ifm_data: IfData64,
+}
+
+/// `sizeof(struct if_msghdr2)`.
+pub const MSGHDR2_SIZE: usize = 160;
+const _: () = assert!(std::mem::size_of::<IfMsghdr2>() == MSGHDR2_SIZE);
+const _: () = assert!(std::mem::size_of::<IfData64>() == 128);
+const _: () = assert!(std::mem::offset_of!(IfMsghdr2, ifm_data) == 32);
+const _: () = assert!(std::mem::offset_of!(IfData64, ifi_baudrate) == 16);
+const _: () = assert!(std::mem::offset_of!(IfData64, ifi_ibytes) == 64);
+
+/// `struct ifreq` as `SIOCGIFFUNCTIONALTYPE` reads it: the name, then the
+/// union's `ifru_functional_type`; 32 bytes, as the ioctl's size says.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct IfReqFunctional {
+    pub(crate) ifr_name: [u8; 16],
+    pub(crate) ifru_functional_type: u32,
+    ifru_rest: [u8; 12],
+}
+
+const _: () = assert!(std::mem::size_of::<IfReqFunctional>() == 32);
+
+/// `offsetof(struct sockaddr_dl, sdl_family)`.
+pub const DL_FAMILY_AT: usize = 1;
+/// `offsetof(struct sockaddr_dl, sdl_nlen)`: the name's length.
+pub const DL_NLEN_AT: usize = 5;
+/// `offsetof(struct sockaddr_dl, sdl_data)`: the name, then the address.
+pub const DL_DATA_AT: usize = 8;
+
+/// Every layout row and constant above, as the C expression the SDK must
+/// agree with: `tests/iflist_sdk.rs` asserts each on `arm64` and `x86_64`.
+/// The sizes and offsets are the Rust declarations' own (`size_of`,
+/// `offset_of!`), so a field declared in the wrong place fails there.
+#[cfg(target_os = "macos")]
+pub const SDK_ROWS: &[(&str, i64)] = &[
+    ("CTL_NET", CTL_NET as i64),
+    ("PF_ROUTE", PF_ROUTE as i64),
+    ("NET_RT_IFLIST2", NET_RT_IFLIST2 as i64),
+    ("RTM_VERSION", RTM_VERSION as i64),
+    ("RTM_IFINFO2", RTM_IFINFO2 as i64),
+    ("RTA_IFP", RTA_IFP as i64),
+    ("AF_LINK", AF_LINK as i64),
+    ("IFF_UP", IFF_UP as i64),
+    ("IFF_LOOPBACK", IFF_LOOPBACK as i64),
+    ("IFF_RUNNING", IFF_RUNNING as i64),
+    ("SIOCGIFFUNCTIONALTYPE", SIOCGIFFUNCTIONALTYPE as i64),
+    ("IFRTYPE_FUNCTIONAL_WIRED", IFRTYPE_FUNCTIONAL_WIRED as i64),
+    (
+        "IFRTYPE_FUNCTIONAL_WIFI_INFRA",
+        IFRTYPE_FUNCTIONAL_WIFI_INFRA as i64,
+    ),
+    (
+        "IFRTYPE_FUNCTIONAL_CELLULAR",
+        IFRTYPE_FUNCTIONAL_CELLULAR as i64,
+    ),
+    ("sizeof(struct if_msghdr2)", size_of::<IfMsghdr2>() as i64),
+    (
+        "offsetof(struct if_msghdr2, ifm_msglen)",
+        std::mem::offset_of!(IfMsghdr2, ifm_msglen) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_version)",
+        std::mem::offset_of!(IfMsghdr2, ifm_version) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_type)",
+        std::mem::offset_of!(IfMsghdr2, ifm_type) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_addrs)",
+        std::mem::offset_of!(IfMsghdr2, ifm_addrs) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_flags)",
+        std::mem::offset_of!(IfMsghdr2, ifm_flags) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_index)",
+        std::mem::offset_of!(IfMsghdr2, ifm_index) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_snd_len)",
+        std::mem::offset_of!(IfMsghdr2, ifm_snd_len) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_snd_drops)",
+        std::mem::offset_of!(IfMsghdr2, ifm_snd_drops) as i64,
+    ),
+    ("offsetof(struct if_msghdr2, ifm_data)", DATA as i64),
+    ("sizeof(struct if_data64)", size_of::<IfData64>() as i64),
+    ("_Alignof(struct if_data64)", align_of::<IfData64>() as i64),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_baudrate)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_baudrate)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_ipackets)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_ipackets)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_ierrors)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_ierrors)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_opackets)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_opackets)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_oerrors)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_oerrors)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_ibytes)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_ibytes)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_obytes)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_obytes)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_iqdrops)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_iqdrops)) as i64,
+    ),
+    (
+        "offsetof(struct if_msghdr2, ifm_data.ifi_lastchange)",
+        (DATA + std::mem::offset_of!(IfData64, ifi_lastchange)) as i64,
+    ),
+    ("sizeof(struct ifreq)", size_of::<IfReqFunctional>() as i64),
+    (
+        "offsetof(struct ifreq, ifr_ifru.ifru_functional_type)",
+        std::mem::offset_of!(IfReqFunctional, ifru_functional_type) as i64,
+    ),
+    (
+        "offsetof(struct sockaddr_dl, sdl_family)",
+        DL_FAMILY_AT as i64,
+    ),
+    ("offsetof(struct sockaddr_dl, sdl_nlen)", DL_NLEN_AT as i64),
+    ("offsetof(struct sockaddr_dl, sdl_data)", DL_DATA_AT as i64),
+];
+
+/// `offsetof(struct if_msghdr2, ifm_data)`, where the counters start.
+#[cfg(target_os = "macos")]
+const DATA: usize = std::mem::offset_of!(IfMsghdr2, ifm_data);
+
+/// The interface name a `struct sockaddr_dl` holds: `sdl_data`'s first
+/// `sdl_nlen` bytes, held within `sdl_len` and `bytes`; `None` for another
+/// family, an empty name, or one that does not fit. PURE.
+#[must_use]
+pub fn dl_name(bytes: &[u8]) -> Option<String> {
+    let len = usize::from(*bytes.first()?).min(bytes.len());
+    if bytes.get(DL_FAMILY_AT) != Some(&AF_LINK) {
+        return None;
+    }
+    let nlen = usize::from(*bytes.get(DL_NLEN_AT)?);
+    let name = bytes[..len].get(DL_DATA_AT..DL_DATA_AT + nlen)?;
+    (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned())
+}
+
+/// A functional type (`SIOCGIFFUNCTIONALTYPE`) as a [`LinkKind`]: wired,
+/// Wi-Fi infrastructure and cellular name theirs; `IFRTYPE_FUNCTIONAL_UNKNOWN`
+/// (0) is `unknown`'s; every other type (loopback, AWDL, intcoproc,
+/// companion link, management) is other. The type is the driver's own
+/// claim, which a tunnel or bridge can make too: [`link_kind`] decides
+/// which links it is asked of. PURE.
+#[must_use]
+pub fn kind_of_functional(functional: u32, unknown: LinkKind) -> LinkKind {
+    match functional {
+        0 => unknown,
+        IFRTYPE_FUNCTIONAL_WIRED => LinkKind::Wired,
+        IFRTYPE_FUNCTIONAL_WIFI_INFRA => LinkKind::Wifi,
+        IFRTYPE_FUNCTIONAL_CELLULAR => LinkKind::Cellular,
+        _ => LinkKind::Other,
+    }
+}
+
+/// The kind of the macOS link `name`: [`LinkKind::Other`], without asking,
+/// for a name [`crate::counts_toward_machine`] refuses by prefix (a
+/// loopback, tunnel, bridge, peer-to-peer or companion radio, coprocessor
+/// or guest link), since macOS reports `utun`, `bridge` and `anpi` links as
+/// wired and `llw` and `ap` links as Wi-Fi; else the functional type
+/// `functional` asks for ([`kind_of_functional`]), and the name's
+/// ([`kind_by_name`]) where it answers none or unknown. PURE but for
+/// `functional`, called at most once.
+#[must_use]
+pub fn link_kind(name: &str, functional: impl FnOnce() -> Option<u32>) -> LinkKind {
+    if never_the_machines(name) {
+        return LinkKind::Other;
+    }
+    let by_name = kind_by_name(name);
+    functional().map_or(by_name, |t| kind_of_functional(t, by_name))
+}
+
+/// What one ask of the kernel answered ([`read_growing`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Asked {
+    /// It fit: this many bytes written, or, asked with no buffer, needed.
+    Bytes(usize),
+    /// The buffer was too small (`ENOMEM`).
+    TooSmall,
+    /// Any other failure.
+    Failed,
+}
+
+/// A kernel answer of unknown size read by `ask`: `ask(Some(buf))` fills
+/// `buf`, `ask(None)` names the size the answer needs now. First into
+/// `first` bytes; where that is too small, into what the kernel then asks
+/// for and a quarter more (the answer can grow between the two asks), at
+/// least twice the last size, three tries at most and never past `cap`.
+/// `None` on any other failure. The buffer is made per call (see
+/// [`crate::net_links`]). PURE but for `ask`.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn read_growing(
+    first: usize,
+    cap: usize,
+    mut ask: impl FnMut(Option<&mut [u8]>) -> Asked,
+) -> Option<Vec<u8>> {
+    if first > cap {
+        return None;
+    }
+    let mut size = first;
+    for _ in 0..3 {
+        let mut buf = vec![0u8; size];
+        match ask(Some(&mut buf)) {
+            Asked::Bytes(n) => {
+                buf.truncate(n);
+                return Some(buf);
+            }
+            Asked::TooSmall => {}
+            Asked::Failed => return None,
+        }
+        let Asked::Bytes(need) = ask(None) else {
+            return None;
+        };
+        size = need.saturating_add(need / 4).max(size.saturating_mul(2));
+        if size > cap {
+            return None;
+        }
+    }
+    None
+}
+
+/// One interface's reading from its message header and name: up and
+/// running from `IFF_UP | IFF_RUNNING`, loopback from `IFF_LOOPBACK`, the
+/// rate where it is not zero, the send-queue drop count (a signed 32-bit
+/// `int` in the kernel, the one 32-bit counter) read unsigned, so it wraps
+/// at 2³² rather than reading zero past 2³¹; the kind is the name's
+/// ([`kind_by_name`]) and `physical` is unknown. PURE.
+fn link_of(h: &IfMsghdr2, name: String) -> LinkReading {
+    let d = h.ifm_data;
+    let up = IFF_UP | IFF_RUNNING;
+    LinkReading {
+        kind: kind_by_name(&name),
+        name,
+        index: u32::from(h.ifm_index),
+        up: h.ifm_flags & up == up,
+        loopback: h.ifm_flags & IFF_LOOPBACK != 0,
+        physical: None,
+        rate_bps: Some(d.ifi_baudrate).filter(|b| *b > 0),
+        rx: LinkCounters {
+            bytes: d.ifi_ibytes,
+            packets: d.ifi_ipackets,
+            errors: d.ifi_ierrors,
+            drops: d.ifi_iqdrops,
+        },
+        tx: LinkCounters {
+            bytes: d.ifi_obytes,
+            packets: d.ifi_opackets,
+            errors: d.ifi_oerrors,
+            drops: u64::from(h.ifm_snd_drops.cast_unsigned()),
+        },
+    }
+}
+
+/// Every interface in a `NET_RT_IFLIST2` answer, in the kernel's order, at
+/// most [`MAX_LINKS`]. A message shorter than its own 4-byte lead, or one
+/// that runs past `buf`, ends the walk; a message of another version or
+/// type, or an `RTM_IFINFO2` shorter than [`MSGHDR2_SIZE`], is skipped. An
+/// interface whose message carries no name reads `""` (the macOS arm then
+/// asks `if_indextoname`). The kind is the name's and `physical` is `None`
+/// ([`link_of`]). PURE.
+#[must_use]
+pub fn links_of(buf: &[u8]) -> Vec<LinkReading> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while out.len() < MAX_LINKS {
+        let Some(lead) = buf.get(at..at + 4) else {
+            break;
+        };
+        let len = usize::from(u16::from_ne_bytes([lead[0], lead[1]]));
+        let Some(msg) = buf.get(at..at + len).filter(|_| len >= 4) else {
+            break;
+        };
+        at += len;
+        if msg[2] != RTM_VERSION || msg[3] != RTM_IFINFO2 || len < MSGHDR2_SIZE {
+            continue;
+        }
+        // SAFETY: `msg` holds at least `MSGHDR2_SIZE` bytes, the size of
+        // `IfMsghdr2`, which is integers only (no padding, every bit
+        // pattern a value); the read is unaligned.
+        let h: IfMsghdr2 = unsafe { std::ptr::read_unaligned(msg.as_ptr().cast()) };
+        let name = if h.ifm_addrs & RTA_IFP != 0 {
+            dl_name(&msg[MSGHDR2_SIZE..])
+        } else {
+            None
+        };
+        out.push(link_of(&h, name.unwrap_or_default()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::offset_of;
+
+    use super::*;
+
+    /// The byte offset of an `if_data64` field inside the header.
+    fn data_at(field: usize) -> usize {
+        offset_of!(IfMsghdr2, ifm_data) + field
+    }
+
+    fn put(buf: &mut [u8], at: usize, bytes: &[u8]) {
+        buf[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// An `RTM_IFINFO2` message as the kernel writes one: the header, then
+    /// (when `name` is given) a `sockaddr_dl` holding it, padded to 4 bytes.
+    fn ifinfo2(index: u16, flags: i32, name: Option<&str>, rx: u64, tx: u64, baud: u64) -> Vec<u8> {
+        let mut dl = Vec::new();
+        if let Some(name) = name {
+            let mut sdl = vec![0u8; (DL_DATA_AT + name.len()).max(20)];
+            sdl[0] = sdl.len() as u8;
+            sdl[DL_FAMILY_AT] = AF_LINK;
+            sdl[DL_NLEN_AT] = name.len() as u8;
+            put(&mut sdl, DL_DATA_AT, name.as_bytes());
+            dl = sdl;
+        }
+        let len = (MSGHDR2_SIZE + dl.len()).next_multiple_of(4);
+        let mut m = vec![0u8; len];
+        put(&mut m, 0, &(len as u16).to_ne_bytes());
+        m[2] = RTM_VERSION;
+        m[3] = RTM_IFINFO2;
+        let addrs = if name.is_some() { RTA_IFP } else { 0 };
+        put(
+            &mut m,
+            offset_of!(IfMsghdr2, ifm_addrs),
+            &addrs.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            offset_of!(IfMsghdr2, ifm_flags),
+            &flags.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            offset_of!(IfMsghdr2, ifm_index),
+            &index.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            offset_of!(IfMsghdr2, ifm_snd_drops),
+            &(-1i32).to_ne_bytes(),
+        );
+        let d = |f| data_at(f);
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_baudrate)),
+            &baud.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_ipackets)),
+            &11u64.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_ierrors)),
+            &2u64.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_opackets)),
+            &13u64.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_oerrors)),
+            &3u64.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_ibytes)),
+            &rx.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_obytes)),
+            &tx.to_ne_bytes(),
+        );
+        put(
+            &mut m,
+            d(offset_of!(IfData64, ifi_iqdrops)),
+            &5u64.to_ne_bytes(),
+        );
+        put(&mut m, MSGHDR2_SIZE, &dl);
+        m
+    }
+
+    /// Another message (an `RTM_NEWADDR`, 0xc) of `len` bytes.
+    fn other(len: u16) -> Vec<u8> {
+        let mut m = vec![0u8; usize::from(len)];
+        put(&mut m, 0, &len.to_ne_bytes());
+        m[2] = RTM_VERSION;
+        m[3] = 0xc;
+        m
+    }
+
+    #[test]
+    fn the_interface_list_reads_each_interfaces_counters_and_name() {
+        let up = IFF_UP | IFF_RUNNING;
+        let mut buf = ifinfo2(1, up | IFF_LOOPBACK, Some("lo0"), 7, 7, 0);
+        buf.extend(other(36));
+        buf.extend(ifinfo2(
+            16,
+            up,
+            Some("en0"),
+            663_548_928_000,
+            90_182_656,
+            183_200_000,
+        ));
+        buf.extend(ifinfo2(17, IFF_UP, None, 1, 2, 0));
+        let links = links_of(&buf);
+        assert_eq!(links.len(), 3, "{links:?}");
+
+        let lo = &links[0];
+        assert_eq!((lo.name.as_str(), lo.index), ("lo0", 1));
+        assert!(lo.up && lo.loopback && lo.rate_bps.is_none(), "{lo:?}");
+
+        let en = &links[1];
+        assert_eq!(
+            (en.name.as_str(), en.index, en.kind),
+            ("en0", 16, LinkKind::Wired)
+        );
+        assert!(en.up && !en.loopback && en.physical.is_none(), "{en:?}");
+        assert_eq!(en.rate_bps, Some(183_200_000));
+        assert_eq!(
+            en.rx,
+            LinkCounters {
+                bytes: 663_548_928_000,
+                packets: 11,
+                errors: 2,
+                drops: 5
+            }
+        );
+        assert_eq!(
+            en.tx,
+            LinkCounters {
+                bytes: 90_182_656,
+                packets: 13,
+                errors: 3,
+                drops: u64::from(u32::MAX)
+            },
+            "the send queue's drop count is a 32-bit counter read unsigned: \
+             -1 is 2³² − 1, not a reset to zero"
+        );
+
+        let nameless = &links[2];
+        assert_eq!((nameless.name.as_str(), nameless.index), ("", 17));
+        assert!(!nameless.up, "IFF_UP without IFF_RUNNING is not up");
+    }
+
+    /// NEGATIVE CONTROLS: a message of another version is skipped; a
+    /// message that runs past the buffer, or one whose length is under its
+    /// own lead, ends the walk with what came before it.
+    #[test]
+    fn the_interface_list_skips_other_versions_and_stops_at_a_torn_message() {
+        let up = IFF_UP | IFF_RUNNING;
+        let mut old = ifinfo2(2, up, Some("en1"), 1, 1, 0);
+        old[2] = RTM_VERSION - 1;
+        let mut buf = old;
+        buf.extend(ifinfo2(3, up, Some("en2"), 1, 1, 0));
+        let mut torn = ifinfo2(4, up, Some("en3"), 1, 1, 0);
+        torn.truncate(MSGHDR2_SIZE - 1);
+        buf.extend(torn);
+        let names: Vec<String> = links_of(&buf).into_iter().map(|l| l.name).collect();
+        assert_eq!(names, ["en2"]);
+
+        let mut zero = ifinfo2(5, up, Some("en4"), 1, 1, 0);
+        zero.extend([0, 0, RTM_VERSION, 0xc]);
+        zero.extend(ifinfo2(6, up, Some("en5"), 1, 1, 0));
+        let names: Vec<String> = links_of(&zero).into_iter().map(|l| l.name).collect();
+        assert_eq!(names, ["en4"]);
+        assert!(links_of(&[]).is_empty());
+        assert!(links_of(&[1, 2]).is_empty());
+    }
+
+    #[test]
+    fn a_link_level_address_gives_its_name_within_its_length() {
+        let mut sdl = vec![0u8; 20];
+        sdl[0] = 20;
+        sdl[DL_FAMILY_AT] = AF_LINK;
+        sdl[DL_NLEN_AT] = 6;
+        put(&mut sdl, DL_DATA_AT, b"bridge");
+        assert_eq!(dl_name(&sdl).as_deref(), Some("bridge"));
+        // Another family, an empty name, a name past `sdl_len`.
+        let mut inet = sdl.clone();
+        inet[DL_FAMILY_AT] = 2;
+        assert_eq!(dl_name(&inet), None);
+        let mut empty = sdl.clone();
+        empty[DL_NLEN_AT] = 0;
+        assert_eq!(dl_name(&empty), None);
+        let mut short = sdl.clone();
+        short[0] = 10;
+        assert_eq!(dl_name(&short), None);
+        assert_eq!(dl_name(&sdl[..12]), None);
+        assert_eq!(dl_name(&[]), None);
+    }
+
+    #[test]
+    fn a_functional_type_names_wired_wifi_and_cellular() {
+        let by_name = LinkKind::Wired;
+        assert_eq!(kind_of_functional(0, by_name), LinkKind::Wired);
+        assert_eq!(kind_of_functional(1, by_name), LinkKind::Other);
+        assert_eq!(kind_of_functional(2, by_name), LinkKind::Wired);
+        assert_eq!(kind_of_functional(3, by_name), LinkKind::Wifi);
+        assert_eq!(kind_of_functional(4, by_name), LinkKind::Other);
+        assert_eq!(kind_of_functional(5, by_name), LinkKind::Cellular);
+        assert_eq!(kind_of_functional(8, by_name), LinkKind::Other);
+    }
+
+    /// The kind rule: a link the machine filter refuses by name is other,
+    /// and its functional type is never asked, whatever the OS would claim
+    /// (the live M5 Max read wired for `utun4`, `bridge0` and `anpi0`–`2`,
+    /// Wi-Fi for `llw0` and `ap1`); every other link takes its functional
+    /// type, and its name's kind where the ask answers none or unknown.
+    /// NEGATIVE CONTROL: an excluded name whose type would be asked panics.
+    #[test]
+    fn a_refused_links_kind_is_other_and_the_rest_take_their_functional_type() {
+        let never = || -> Option<u32> { panic!("an excluded link's type is never asked") };
+        for name in [
+            "utun4", "bridge0", "anpi0", "anpi2", "llw0", "ap1", "awdl0", "lo0", "ipsec0", "ppp0",
+            "gif0", "stf0", "nan0", "vmenet0",
+        ] {
+            assert_eq!(link_kind(name, never), LinkKind::Other, "{name}");
+        }
+        let wired = || Some(IFRTYPE_FUNCTIONAL_WIRED);
+        let wifi = || Some(IFRTYPE_FUNCTIONAL_WIFI_INFRA);
+        assert_eq!(link_kind("en0", wifi), LinkKind::Wifi);
+        assert_eq!(link_kind("en7", wired), LinkKind::Wired);
+        assert_eq!(
+            link_kind("pdp_ip0", || Some(IFRTYPE_FUNCTIONAL_CELLULAR)),
+            LinkKind::Cellular
+        );
+        assert_eq!(link_kind("en0", || None), LinkKind::Wired, "no answer");
+        assert_eq!(link_kind("en0", || Some(0)), LinkKind::Wired, "unknown");
+        assert_eq!(link_kind("en3", || Some(4)), LinkKind::Other, "AWDL");
+        assert_eq!(
+            link_kind("XHC20", wired),
+            LinkKind::Wired,
+            "a name no prefix refuses takes the OS's type"
+        );
+    }
+
+    /// A kernel whose answer is `answer` and grows by `grows` bytes each
+    /// time it is asked its size (the list changing between two asks),
+    /// logging each ask's buffer length (`None`: the size ask).
+    struct Kernel {
+        answer: Vec<u8>,
+        grows: usize,
+        asks: Vec<Option<usize>>,
+    }
+
+    impl Kernel {
+        fn new(len: usize, grows: usize) -> Self {
+            Self {
+                answer: (0..len).map(|i| i as u8).collect(),
+                grows,
+                asks: Vec::new(),
+            }
+        }
+
+        fn ask(&mut self, buf: Option<&mut [u8]>) -> Asked {
+            self.asks.push(buf.as_ref().map(|b| b.len()));
+            let len = self.answer.len();
+            match buf {
+                None => {
+                    self.answer.resize(len + self.grows, 0xab);
+                    Asked::Bytes(len)
+                }
+                Some(b) if b.len() >= len => {
+                    b[..len].copy_from_slice(&self.answer);
+                    Asked::Bytes(len)
+                }
+                Some(_) => Asked::TooSmall,
+            }
+        }
+    }
+
+    /// The interface list's buffer: the first size where it fits; where it
+    /// is too small, what the kernel then asks for and a quarter more, at
+    /// least twice the last size, three tries; the answer cut to what the
+    /// kernel wrote. NEGATIVE CONTROLS: a size past the cap, a list that
+    /// outgrows every try, and a failed ask of either kind are `None`.
+    #[test]
+    fn the_interface_lists_buffer_grows_to_what_the_kernel_asks_for() {
+        assert_eq!(
+            read_growing(65, 64, |_| panic!(
+                "an oversized first buffer is never asked"
+            )),
+            None,
+            "the initial buffer obeys the cap too"
+        );
+        let read = |k: &mut Kernel, cap| read_growing(64, cap, |b| k.ask(b));
+
+        let mut fits = Kernel::new(40, 0);
+        assert_eq!(read(&mut fits, 1024).as_deref(), Some(&fits.answer[..]));
+        assert_eq!(fits.asks, [Some(64)]);
+
+        let mut once = Kernel::new(200, 0);
+        assert_eq!(read(&mut once, 1024).as_deref(), Some(&once.answer[..]));
+        assert_eq!(once.asks, [Some(64), None, Some(250)], "200 and a quarter");
+
+        let mut small = Kernel::new(100, 0);
+        assert_eq!(read(&mut small, 1024).map(|b| b.len()), Some(100));
+        assert_eq!(small.asks, [Some(64), None, Some(128)], "at least twice");
+
+        let mut grew = Kernel::new(200, 40);
+        let got = read(&mut grew, 1024).expect("a quarter more covers it");
+        assert_eq!((got.len(), grew.asks.len()), (240, 3));
+
+        let mut twice = Kernel::new(200, 100);
+        assert_eq!(read(&mut twice, 1024).map(|b| b.len()), Some(400));
+        assert_eq!(
+            twice.asks,
+            [Some(64), None, Some(250), None, Some(500)],
+            "the third and last try"
+        );
+
+        let mut runaway = Kernel::new(200, 1000);
+        assert_eq!(read(&mut runaway, 1 << 20), None, "three tries at most");
+        assert_eq!(runaway.asks.len(), 6);
+
+        let mut huge = Kernel::new(5000, 0);
+        assert_eq!(read(&mut huge, 1024), None, "past the cap");
+        assert_eq!(huge.asks, [Some(64), None], "nothing past the cap is made");
+
+        assert_eq!(read_growing(64, 1024, |_| Asked::Failed), None);
+        let size_fails = read_growing(64, 1024, |b| match b {
+            Some(_) => Asked::TooSmall,
+            None => Asked::Failed,
+        });
+        assert_eq!(size_fails, None);
+    }
+}

@@ -241,16 +241,16 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
         };
 
         // DROPPED AND ADDED AGAIN, through the verb.
-        assert!(cmd_topic(&ctx, "add news").0.contains("added=1"));
+        assert!(cmd_topic(&ctx, "add news").contains("added=1"));
         assert_eq!(broadcast(&store, &sid, 10, "news", "b"), "OK 1\n");
-        assert!(cmd_topic(&ctx, "drop news").0.contains("dropped=1"));
-        assert!(cmd_topic(&ctx, "add news").0.contains("added=1"));
+        assert!(cmd_topic(&ctx, "drop news").contains("dropped=1"));
+        assert!(cmd_topic(&ctx, "add news").contains("added=1"));
         assert_eq!(broadcast(&store, &sid, 11, "news", "b"), "OK 2\n");
         assert_eq!(carried(&ctx), (2, 1), "only the row taken since the add");
 
         // A PERSON'S BROADCAST, then agents' from distinct peers (one
         // quota each): the ring evicts the agents' first.
-        assert!(cmd_topic(&pctx, "add news").0.contains("added=1"));
+        assert!(cmd_topic(&pctx, "add news").contains("added=1"));
         let shout = |off: u64, from: &str| {
             cmd_deliver(
                 &store,
@@ -567,7 +567,7 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
         );
         assert!(halt_refusal(&new_ctx, "send").is_some(), "send is refused");
         assert_eq!(
-            cmd_topic(&new_ctx, "ls").0,
+            cmd_topic(&new_ctx, "ls"),
             "OK 1 seen=0\ntopic builds since=@5\n",
             "the opt-in is listed, so the bridge keeps its cursor"
         );
@@ -576,7 +576,7 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
             .lock()
             .unwrap()
             .since(None)
-            .map(|e| (e.kind.to_string(), e.payload.clone()))
+            .map(|e| (e.kind.to_string(), e.payload.to_string()))
             .collect();
         for id in [2, 3] {
             assert!(
@@ -975,7 +975,7 @@ fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
             .lock()
             .unwrap()
             .since(None)
-            .map(|e| e.payload.clone())
+            .map(|e| e.payload.to_string())
             .collect();
         assert_eq!(
             rows,

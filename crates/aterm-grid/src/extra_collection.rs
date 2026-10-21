@@ -918,18 +918,31 @@ impl CellExtras {
             .and_then(|e| e.complex_char())
     }
 
-    /// Look up a complex char as a full `String` (ring or map), for text
-    /// extraction; it allocates, unlike `complex_codepoint_for`.
-    pub fn complex_char_str_for(&self, row: u16, col: u16) -> Option<String> {
+    /// Append a complex char's full text to `out`: the ring's codepoint, else
+    /// the HashMap's string (a multi-scalar cluster). Returns whether either
+    /// held one; `false` appends nothing.
+    ///
+    /// Used by text extraction (row_text, content export, the styled frame),
+    /// which needs the complete string. It borrows the stored text, so a
+    /// complex cell costs no allocation of its own.
+    pub fn push_complex_char(&self, row: u16, col: u16, out: &mut String) -> bool {
         if let Some(ring) = &self.complex_ring
             && let Some(c) = ring.get(row, col)
         {
-            return Some(c.to_string());
+            out.push(c);
+            return true;
         }
-        self.data
+        match self
+            .data
             .get(&self.internal_coord(CellCoord::new(row, col)))
             .and_then(|e| e.complex_char())
-            .map(|s| s.to_string())
+        {
+            Some(s) => {
+                out.push_str(s);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Store RGB fg/bg in the dense ring buffer for a column range, allocating

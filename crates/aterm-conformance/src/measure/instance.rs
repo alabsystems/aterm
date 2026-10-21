@@ -181,7 +181,11 @@ pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
 impl World {
     /// Lay out `root`: `home/` with a two-column `/bin/sh` prompt (so a typed
     /// burst never wraps on a long host name), `cfg/aterm/aterm.toml` holding
-    /// `config_head` then [`CONFIG_OFF`], and `run/`.
+    /// the audible bell off, `config_head` then [`CONFIG_OFF`], and `run/`.
+    /// The bell line leads because `config_head` may open a table; it is off
+    /// because the binary under measurement (`--app`) may be a build from
+    /// before a headless aterm stopped beeping, and its BEL would play the
+    /// owner's alert sound with nothing on screen.
     ///
     /// # Errors
     /// A file or directory could not be written.
@@ -198,7 +202,7 @@ impl World {
         std::fs::write(home.join(".shrc"), "PS1='$ '\n")?;
         std::fs::write(
             root.join("cfg/aterm/aterm.toml"),
-            format!("{config_head}\n{CONFIG_OFF}"),
+            format!("bell_sound = false\n{config_head}\n{CONFIG_OFF}"),
         )?;
         Ok(Self {
             root: root.to_path_buf(),
@@ -474,6 +478,31 @@ mod tests {
             (asked == 3).then_some(asked)
         });
         assert_eq!(got, Ok(3));
+    }
+
+    /// The measure world's `aterm.toml` sets the audible bell off once, ahead
+    /// of every table, even when the head it is given opens one (the cold
+    /// streamer's `[sparkle_words]`): a `bell_sound` line after a table header
+    /// would be that table's key, not the root one aterm reads.
+    #[test]
+    fn a_measure_world_starts_with_the_audible_bell_off() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let head = "cursor_trail_style = \"off\"\n[sparkle_words]\nenabled = false";
+        let world = World::prepare(dir.path(), head).expect("world");
+        let text =
+            std::fs::read_to_string(world.root.join("cfg/aterm/aterm.toml")).expect("written");
+        let keys = |key: &str| {
+            text.lines()
+                .filter(|l| l.split('=').next().map(str::trim) == Some(key))
+                .count()
+        };
+        assert_eq!(text.lines().next(), Some("bell_sound = false"), "{text}");
+        assert_eq!(keys("bell_sound"), 1, "one bell key: {text}");
+        assert!(text.contains(head), "the head follows: {text}");
+        assert!(
+            text.ends_with(CONFIG_OFF),
+            "the lanes-off tables close it: {text}"
+        );
     }
 
     #[test]

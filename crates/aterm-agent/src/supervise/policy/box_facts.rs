@@ -16,7 +16,7 @@
 //! decides through. A diagnostic reader can rebuild the context without
 //! running the loop, then decide from the facts its mark carries
 //! ([`BoxFacts::to_json`]), the header's policy and process inputs, and a
-//! probe answering from the tape. These APIs have no current CLI reader.
+//! probe answering from the tape (`aterm drive replay --why`, `tape::explain`).
 //!
 //! **On a tape** the facts are a JSON object in the decision's mark
 //! (`decide.approval`, `decide.question`), written by the recorder only:
@@ -82,6 +82,13 @@ pub struct BoxFacts {
     /// The `/login` picker is behind the loop's own `/login`
     /// ([`ApprovalCtx::login_carry`]).
     pub login_carry: bool,
+    /// The `/login` picker is behind the loop's own `/login`, and the login
+    /// came back in another tab since ([`ApprovalCtx::login_back`]).
+    pub login_back: bool,
+    /// The `/login` picker is behind the loop's own `/login`, and a renewal
+    /// the tab follows replaced the login it signs in
+    /// ([`ApprovalCtx::login_renewed`]).
+    pub login_renewed: bool,
     /// The method the session's login already is, as its host read it
     /// ([`ApprovalCtx::login_method`]), for the picker of the loop's own
     /// `/login` only; `None`: not read, or nothing says.
@@ -120,6 +127,8 @@ pub const FIELDS: &[&str] = &[
     "question",
     "box_call",
     "login_carry",
+    "login_back",
+    "login_renewed",
     "login_method",
 ];
 
@@ -170,6 +179,7 @@ impl ApprovalCtx {
         // The grant row's rule, under `[harness] limit_reset` — and never
         // again at a dialog mount the reset was passed over for.
         ctx.limit_reset = config.limit_reset && !facts.limit_reset_passed;
+        ctx.reset_kinds.clone_from(&config.limit_reset_kinds);
         // A credits consent, under `[harness] usage_credits` alone: policy,
         // no fact of the box.
         ctx.usage_credits = config.usage_credits;
@@ -196,6 +206,8 @@ impl ApprovalCtx {
         }
         ctx.box_call = facts.box_call.clone();
         ctx.login_carry = facts.login_carry;
+        ctx.login_back = facts.login_back;
+        ctx.login_renewed = facts.login_renewed;
         ctx.login_method = facts.login_method;
         ctx
     }
@@ -221,6 +233,8 @@ struct Wire {
     question: Option<QuestionWire>,
     box_call: Option<String>,
     login_carry: bool,
+    login_back: bool,
+    login_renewed: bool,
     login_method: Option<String>,
 }
 
@@ -280,6 +294,8 @@ impl BoxFacts {
             }),
             box_call: self.box_call.clone(),
             login_carry: self.login_carry,
+            login_back: self.login_back,
+            login_renewed: self.login_renewed,
             login_method: self.login_method.map(|m| m.word().to_string()),
         };
         // The wire holds strings, numbers, booleans and lists of them, which
@@ -368,6 +384,8 @@ impl BoxFacts {
                 .transpose()?,
             box_call: wire.box_call,
             login_carry: wire.login_carry,
+            login_back: wire.login_back,
+            login_renewed: wire.login_renewed,
             login_method: wire
                 .login_method
                 .as_deref()

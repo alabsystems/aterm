@@ -36,8 +36,6 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_core::terminal::Terminal;
-
 #[path = "session_program.rs"]
 pub(crate) mod program;
 
@@ -47,24 +45,18 @@ pub(crate) mod program;
 /// are not postponed by a same-zone redraw.
 pub(crate) const AGENT_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The whole-screen fingerprint and only the final `tail_rows` rows, read in
-/// one pass under the status sweep's terminal `try_lock`. Hash every visible
-/// row plus its newline, exactly as [`crate::control::screen_text`] does, but
-/// retain no full-screen String and no rows outside the live zone. A parity
-/// test spans Unicode, resize and alternate-screen transitions.
-pub(crate) fn screen_agent_frame(t: &Terminal, tail_rows: usize) -> (u64, Vec<String>) {
-    let first = (t.rows() as usize).saturating_sub(tail_rows);
-    let mut rows = Vec::with_capacity((t.rows() as usize).min(tail_rows));
-    let mut hash = aterm_hash::Fnv1a64::new();
-    for r in 0..t.rows() as usize {
-        let row = crate::control::visible_row(t, r);
-        hash.write(row.as_bytes());
-        hash.write(b"\n");
-        if r >= first {
-            rows.push(row);
-        }
-    }
-    (hash.finish(), rows)
+/// The whole-screen fingerprint and only the final `tail_rows` rows of a
+/// screen's published text ([`crate::frame_memo::ScreenText`]): the fingerprint
+/// is the text's `hash=`, exactly the `status hash=` of the same screen, and the
+/// rows are copied out of the text with no lock held. A parity test spans
+/// Unicode, resize and alternate-screen transitions.
+pub(crate) fn screen_agent_frame(
+    text: &crate::frame_memo::ScreenText,
+    tail_rows: usize,
+) -> (u64, Vec<String>) {
+    let first = text.row_count().saturating_sub(tail_rows);
+    let rows = text.rows().skip(first).map(str::to_string).collect();
+    (text.fnv(), rows)
 }
 
 /// How often a foreground group whose screen keeps moving is re-named. A
@@ -944,7 +936,8 @@ impl CompletedBlock {
 /// `started_held`) says whether a command went with them. `running_detail`
 /// is the executing block's [`executing_detail`], read by the caller from the
 /// same guard; a finished block's is read here once, as the log takes each
-/// block once. Field reads
+/// block once, and reduced by the same [`command_detail`]: a fact names its
+/// program, never its line. Field reads
 /// (and a finished block's command row) under the guard the sweep already
 /// holds, and only of the blocks from `from` on: the walk goes newest first
 /// and stops at the cursor, so the guard pays for what is new, never for the
@@ -1028,9 +1021,13 @@ pub(crate) fn block_read(
         let Some(end) = end else {
             continue;
         };
+        // Its program, never its line: a block the sweep first sees already
+        // finished (the usual case for `echo`, `export KEY=…`) is reduced by
+        // the same [`command_detail`] the running one's caller applied, so no
+        // later word of a command reaches the log, its journal or the bus.
         let detail = match end {
             BlockEnd::Running => running_detail.clone(),
-            _ => block_detail(term, block),
+            _ => block_command_line(term, block).and_then(|line| command_detail(&line)),
         };
         read.facts.push(BlockFact {
             id: block.id,
@@ -1066,12 +1063,14 @@ pub(crate) fn executing_command_line(term: &aterm_core::terminal::Terminal) -> O
     if block.state != aterm_types::BlockState::Executing {
         return None;
     }
-    block_detail(term, block)
+    block_command_line(term, block)
 }
 
-/// `block`'s command reduced by [`command_detail`]: the shell's own OSC 633;E
-/// line, else its command row scraped from the screen past the prompt.
-fn block_detail(
+/// `block`'s WHOLE command line, arguments and all: the shell's own OSC
+/// 633;E line, else its command row scraped from the screen past the prompt.
+/// Never stored as it is: the session log reduces it by [`command_detail`]
+/// ([`block_read`]), and the survey redacts and caps it.
+fn block_command_line(
     term: &aterm_core::terminal::Terminal,
     block: &aterm_types::OutputBlock,
 ) -> Option<String> {
@@ -2107,6 +2106,10 @@ struct FooterAsk {
     at: Instant,
     pgid: i32,
     stopped: bool,
+    /// The Claude Code drawer image the ask was made under
+    /// (`SessionTimeline::claude_drawer_token`), where one was known: a new
+    /// one at an exec edge is asked for at once.
+    image: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -2230,7 +2233,18 @@ impl StatusObserver {
 
     /// Ask for `session`'s footer facts when Claude Code is the program in
     /// front and the last ask is at least [`crate::claude_footer::RECHECK`]
-    /// old. The answer arrives on the resolver thread; a change wakes the loop.
+    /// old — or, on an `edged` visit, when the group's published image is a
+    /// store or Native Claude Code drawer the last ask was not made under
+    /// (card engine §3.10): the `exec` into it keeps the group and the
+    /// program's name, so nothing else would ask before `RECHECK`, and an
+    /// ask made before it may have fallen in atpkg's `/bin/sh` shim, whose
+    /// environment macOS hides, so it could not find the Claude dir whose
+    /// registry the resolver watches. The answer arrives on the resolver
+    /// thread; a change wakes the loop.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the sweep's one call site hands over what it already sampled"
+    )]
     pub(crate) fn request_footer_if_due(
         &mut self,
         session: u64,
@@ -2239,6 +2253,7 @@ impl StatusObserver {
         pgid: i32,
         now: Instant,
         wake: &crate::claude_footer::LogWake,
+        edged: bool,
     ) {
         if !crate::claude_footer::drawn_for(program) || pgid <= 0 {
             // A held pane can outlive Claude with no valid foreground group;
@@ -2275,16 +2290,28 @@ impl StatusObserver {
                         at: now,
                         pgid: old,
                         stopped: true,
+                        image: None,
                     },
                 );
                 crate::claude_footer::stop(session, old);
             }
             return;
         }
-        let due = self.footer_asked.get(&session).is_none_or(|ask| {
+        // Only an edge can publish a new image, so only an edged visit looks.
+        let image = if edged {
+            timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .claude_drawer_token(pgid)
+        } else {
+            None
+        };
+        let prior = self.footer_asked.get(&session).copied();
+        let due = prior.is_none_or(|ask| {
             ask.stopped
                 || ask.pgid != pgid
                 || now.saturating_duration_since(ask.at) >= crate::claude_footer::RECHECK
+                || image.is_some_and(|token| ask.image != Some(token))
         });
         if due {
             // The sampled program can become stale while this sweep runs. A
@@ -2297,12 +2324,20 @@ impl StatusObserver {
             {
                 return;
             }
+            // An ask off an edge keeps the image the last ask of this group
+            // was made under, so the next edge of that image asks nothing.
+            let image = image.or_else(|| {
+                prior
+                    .filter(|ask| ask.pgid == pgid && !ask.stopped)
+                    .and_then(|ask| ask.image)
+            });
             self.footer_asked.insert(
                 session,
                 FooterAsk {
                     at: now,
                     pgid,
                     stopped: false,
+                    image,
                 },
             );
             crate::claude_footer::request_footer(session, timeline, pgid, wake);
@@ -3218,6 +3253,10 @@ impl crate::App {
     /// `tcgetpgrp`, and no map lookup for it.
     pub(crate) fn observe_session_statuses(&mut self, now: std::time::Instant) -> Vec<u64> {
         if !self.config.tab_status_or_default() {
+            // The edged inbox's pushes do not stop with the sweep (the PTY
+            // readers know no config): emptied here, so a session's id is
+            // never kept past the wake it rode.
+            drop(self.session_factory.edge_inbox.take());
             return Vec::new();
         }
         // THE O(1) DEADLINE GATE (MPT-4). "Which sessions are past their
@@ -3251,11 +3290,16 @@ impl crate::App {
         // visited ahead of everything else, each whether or not it is due, so
         // a drawer's program is named on the wake after its edge rather than
         // at its next observation. A visit the PTY reader's hold refuses goes
-        // back in the inbox for the next wake, with no interval charged.
+        // back in the inbox for the next wake and charges nothing itself: the
+        // pool walk reaches the session again, and charges a due one's
+        // refusal as it charges any, so its owed instant never stays past.
         let edged = self.session_factory.edge_inbox.take();
         if retry_only && !self.session_status.has_unclassified() && edged.is_empty() {
             return Vec::new();
         }
+        // A sweep that visits sessions, timed for `metrics`' `status_sweeps`
+        // (card engine §8): the gate's O(1) answer above is none.
+        let _timed = crate::metrics::SweepTimer::start();
         let retry = if retry_only {
             self.session_status.take_unclassified()
         } else {
@@ -3277,8 +3321,8 @@ impl crate::App {
                     .map(|session| (session, false)),
             );
         let mut changed = Vec::new();
-        // The proven claims this sweep cleared: their chrome and subscribers
-        // are told once the pool is no longer borrowed (below).
+        // The proven claims this sweep cleared: their chrome is told once the
+        // pool is no longer borrowed (below).
         let mut claims_cleared = Vec::new();
         // The sessions whose citation hovers a new naming of the front owes a
         // re-ask (`App::reask_renamed_hovers`), after the loop.
@@ -3288,6 +3332,11 @@ impl crate::App {
         // 7501): an `fx celebrate on=done` arm bound to one fires after the
         // loop (`App::note_program_done`).
         let mut program_done = Vec::new();
+        // The sessions whose agent word or program report moved: a proven
+        // self-claim's landing reopens at a turn anyone begins after it
+        // (`App::reopen_self_claim_landing`, FOREVER LAND §10.4), after the
+        // loop.
+        let mut turns_moved = Vec::new();
         // What a footer read the sweep starts wakes when it moves a session's
         // log (session log Phase 3B, `claude_footer::LogWake`).
         let footer_wake = self.footer_log_wake();
@@ -3299,8 +3348,13 @@ impl crate::App {
             #[cfg(test)]
             crate::work_counts::status_probe();
             let id = session.id;
-            // An edged session is visited once, first, due or not.
-            if !edged_visit && (edged.contains(&id) || !self.session_status.due(id, now)) {
+            // An edged session is visited first, due or not, and the pool
+            // walk takes it as it takes any other: a visit observed it, which
+            // leaves it not due, and a refused one leaves a due session due,
+            // to be tried and charged there (`note_skipped`). Skipped here,
+            // a due slot refused on its edged visit kept its past `next_due`,
+            // re-arming the loop every turn the reader's hold won.
+            if !edged_visit && !self.session_status.due(id, now) {
                 continue;
             }
             let (master, pid) = (session.master, session.pid);
@@ -3322,6 +3376,10 @@ impl crate::App {
             // (`note_skipped`): without it `next_due` never advances on this
             // path, and `next_wake`'s structural clamp — which floors every
             // armed instant at `next_due` — has nothing to floor against.
+            //
+            // An edged visit refused is owed on the next wake (the inbox) and
+            // charges nothing: the pool walk below decides that, as for any
+            // session.
             let Ok(guard) = session.term.try_lock() else {
                 if edged_visit {
                     self.session_factory.edge_inbox.push(id);
@@ -3356,10 +3414,16 @@ impl crate::App {
             // The cwd report the engine holds, witnessed below under the group
             // this sweep finds in front (`SessionTimeline::witness_cwd_report`),
             // with the group in front read under this SAME hold: one `tcgetpgrp`
-            // ioctl, the reader's wait no longer than it. A front that moved
-            // between this read and the sweep's own one below names no group.
+            // ioctl, the reader's wait no longer than it.
+            //
+            // ONE READ PER LOOK: the job evidence and the program identity
+            // below take this same answer. On macOS the ioctl on a PTY master
+            // costs ~51k instructions (2.5 us), and a look asked it three
+            // times: at 40 idle tabs, every sweep a new tab's wakes and owed
+            // looks run observed all of them, and those reads were 86% of the
+            // main thread's sweep and most of its per-tab cost of a spawn.
             let cwd_report = guard.reported_cwd_seq();
-            let cwd_group = if master >= 0 {
+            let pgid = if master >= 0 {
                 (self.session_factory.fg_probe)(master)
             } else {
                 -1
@@ -3413,21 +3477,26 @@ impl crate::App {
             // is the grid's, the rows' own (`visible_row` reads the live rows
             // whatever the scroll position).
             let cursor = crate::presence::Cursor::At(Some(usize::from(guard.cursor().row)));
+            // The text is built under the guard and published to the session's
+            // slot once the guard is gone, so the `status`, `text` and `turn`
+            // reads of this screen that follow are served it. No look first: a
+            // contended session costs one `try_lock` and nothing else.
             let read = self
                 .session_status
                 .agent_zone_wanted(id, generation, cursor, &program, now)
-                .then(|| {
+                .then(|| std::sync::Arc::new(crate::frame_memo::ScreenText::of(&guard)));
+            drop(guard);
+            let (zone, stamp) = match read {
+                Some(text) => {
                     // The whole screen: the verdict reads its live zone (the
                     // last CLASSIFY_ROWS of the content, `presence::live_zone`),
                     // and the whole for a box the zone cuts
                     // (`presence::agent_verdict`).
-                    let (fp, zone) = screen_agent_frame(&guard, usize::MAX);
+                    let (fp, zone) = screen_agent_frame(&text, usize::MAX);
+                    session.ctx.frame.publish_text(text);
                     let stamp = crate::session_timeline::AgentStamp { generation, fp };
-                    (zone, stamp)
-                });
-            drop(guard);
-            let (zone, stamp) = match read {
-                Some((zone, stamp)) => (Some(zone), Some(stamp)),
+                    (Some(zone), Some(stamp))
+                }
                 None => (None, None),
             };
             let last_output = match latest_output_ns {
@@ -3451,22 +3520,23 @@ impl crate::App {
             // all), so the classifier is deliberately built to need only this.
             //
             // Routed through `App::job_probe` rather than calling
-            // `foreground_is_job` directly. On unix that is the same cheap
-            // per-fd `tcgetpgrp` this always was. On WINDOWS there is no
-            // `tcgetpgrp`, so the answer comes from a system-wide process-table
-            // walk (~3 ms measured) — and calling it here, once per due session
-            // per sweep, is what made an idle EIGHT-tab window cost ~4x an idle
-            // one-tab window at the same two frames a second: eight walks every
-            // 250 ms, ~100 ms of CPU per idle second, none of it visible to the
-            // scheduler's deadline counters because it rides the per-turn sweep
-            // rather than any armed wake. `JobProbe` keeps the verdict and its
-            // freshness rule and removes only the duplication: one capture per
-            // sweep for every due session, and one per
-            // `quit_safety::JOB_PROBE_MAX_AGE` while no session's evidence moves.
+            // `foreground_is_job` directly. On unix that is the group read
+            // under the hold above, the per-fd `tcgetpgrp` this always was.
+            // On WINDOWS there is no `tcgetpgrp`, so the answer comes from a
+            // system-wide process-table walk (~3 ms measured) — and calling it
+            // here, once per due session per sweep, is what made an idle
+            // EIGHT-tab window cost ~4x an idle one-tab window at the same two
+            // frames a second: eight walks every 250 ms, ~100 ms of CPU per
+            // idle second, none of it visible to the scheduler's deadline
+            // counters because it rides the per-turn sweep rather than any
+            // armed wake. `JobProbe` keeps the verdict and its freshness rule
+            // and removes only the duplication: one capture per sweep for every
+            // due session, and one per `quit_safety::JOB_PROBE_MAX_AGE` while
+            // no session's evidence moves.
             let foreground_job = (master >= 0 && pid > 0).then(|| {
                 self.job_probe.is_job(
                     id,
-                    master,
+                    pgid,
                     pid,
                     crate::quit_safety::JobEvidenceKey {
                         content_seq,
@@ -3523,20 +3593,15 @@ impl crate::App {
                 let at = timeline.slog().now();
                 timeline.slog_mut().observe_status(*facts, at);
             }
-            // PROGRAM IDENTITY + AGENT VERDICT. The foreground group is one
-            // `tcgetpgrp` (the job probe above asked the same question); only
-            // a CHANGED group costs a resolution, and that runs off this
-            // thread. The verdict is published on the session's timeline —
-            // the store `status`, `sessions`, `await agent` and the events
-            // digest all read — and a move wakes this session's subscribers
-            // now rather than on their next 250 ms tick. Read through the
+            // PROGRAM IDENTITY + AGENT VERDICT. The foreground group is the
+            // one read under the hold above (the job probe took the same
+            // answer); only a CHANGED group costs a resolution, and that runs
+            // off this thread. The verdict is published on the session's
+            // timeline — the store `status`, `sessions`, `await agent` and the
+            // events digest all read — and a move records `agent-change`,
+            // which wakes this session's watchers at once. Read through the
             // factory's injected probe (`tcgetpgrp` in shipping), so a test
             // puts a group in front with no process.
-            let pgid = if master >= 0 {
-                (self.session_factory.fg_probe)(master)
-            } else {
-                -1
-            };
             // THE SESSION LOG's shell blocks, then a failure the person saw
             // (`seen` above), then the foreground move, in that order
             // (`SessionTimeline::sweep_slog`): a command the shell reported
@@ -3552,7 +3617,7 @@ impl crate::App {
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                timeline.witness_cwd_report(cwd_report, pgid, cwd_group);
+                timeline.witness_cwd_report(cwd_report, pgid);
                 let previous = timeline.sweep_slog(&blocks, seen, pid, pgid);
                 // The engine's marks (phase 3B), on what is open once the
                 // blocks and the foreground move were written.
@@ -3592,6 +3657,7 @@ impl crate::App {
             // The disk tick's roster reads it on the host's thread: a vendor
             // `codex` under `node` is named by its report alone.
             if program_state_moved {
+                turns_moved.push(id);
                 let shown = self
                     .session_status
                     .program_state(id)
@@ -3677,6 +3743,7 @@ impl crate::App {
                 pgid,
                 now,
                 &footer_wake,
+                edged_visit,
             );
             // THE LOST INTEGRATION (`integration_notice`): while the posture
             // is degraded, what gives it back — the tab's re-key channel, the
@@ -3765,6 +3832,7 @@ impl crate::App {
                 let arm = self.harness_ab_arm(id);
                 let glass = self.harness_ab_glass(id);
                 self.harness_screen.note_phase(id, &session.ctx, arm, glass);
+                turns_moved.push(id);
             }
             // THE RESIZE LEDGER, evaluated on this sweep so a `render` verdict
             // transition lands on the timeline (and wakes the digest) without
@@ -3775,16 +3843,17 @@ impl crate::App {
             // `site=-`.
             let now_ms = crate::turn_ledger::now_ms();
             // The session log's owed wake is taken here too, after every
-            // append this pass made (its blocks, a failure seen, the verdict),
-            // and woken below with the rest (phase 3A, `take_log_wake`).
-            let (render_moved, behind, log_moved) = {
+            // append this pass made (its blocks, a failure seen, the verdict):
+            // an owed one rings the session's watchers (phase 3A,
+            // `SessionTimeline::slog_take_wake`).
+            let (behind, log_moved) = {
                 let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
+                let _ = timeline.evaluate_resizes(resize_probe, now_ms);
                 (
-                    timeline.evaluate_resizes(resize_probe, now_ms),
                     timeline.resizes().behind(&resize_probe),
                     timeline.slog_take_wake(),
                 )
@@ -3800,30 +3869,19 @@ impl crate::App {
             };
             // A render mark the backfill writes comes after the wake was
             // taken above: it takes its own (addendum A22).
-            let (backfilled, backfill_logged) = journal.map_or((false, false), |copy| {
+            let backfill_logged = journal.is_some_and(|copy| {
                 let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                (
-                    timeline.ingest_resizes(&copy, None, now_ms),
-                    timeline.slog_take_wake(),
-                )
+                let _ = timeline.ingest_resizes(&copy, None, now_ms);
+                timeline.slog_take_wake()
             });
-            let log_moved = log_moved || backfill_logged;
             // The sweep's moves reach the tab's clause (phase 3B; addendum
             // A12 item 4), refreshed below once the pool is let go.
-            if log_moved && self.clause_moved(id) {
+            if (log_moved || backfill_logged) && self.clause_moved(id) {
                 clauses_moved.push(id);
-            }
-            if (moved || render_moved || backfilled || status_event.is_some() || log_moved)
-                && self.subscribers.any()
-            {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(id);
             }
             if status_changed
                 || detail_changed
@@ -3869,16 +3927,22 @@ impl crate::App {
         for id in program_done {
             self.note_program_done(id, now);
         }
+        for id in turns_moved {
+            self.reopen_self_claim_landing(id);
+        }
+        // THE CARD'S ARTS, AHEAD (card engine §4.3): a session whose PTY
+        // reader published a card drawer's image is a card about to be
+        // drawn; each window showing it has the card's arts for its cell
+        // height queued for residency now. The first admitted ask may still
+        // build during drawing; this queue does not promise a prior upload.
+        for &id in &edged {
+            self.prefetch_card_arts_for(id);
+        }
         // A cleared proven claim moves what a released one moves (the
-        // `Wake::MetaChanged` arm) and is pushed as `EVENT meta`.
+        // `Wake::MetaChanged` arm); its `meta-change` row rang the session's
+        // watchers, so it is pushed as `EVENT meta`.
         for id in claims_cleared {
             self.on_meta_changed(id);
-            if self.subscribers.any() {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(id);
-            }
         }
         // Said here, before either exit: a newcomer retry records a moved
         // reading in the loop too, and returning early without saying it
@@ -4018,34 +4082,23 @@ impl crate::App {
             .flatten()
             .filter(|_| carried.is_none());
         if let Some((payload, facts)) = event {
-            {
-                let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
-                timeline.record(STATUS_CHANGE, payload);
-                // THE SESSION LOG's typed `status` mark, in the same hold;
-                // the notify below wakes its watchers too.
-                let at = timeline.slog().now();
-                timeline.slog_mut().observe_status(facts, at);
-                let _ = timeline.slog_take_wake();
-            }
-            if self.subscribers.any() {
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notify(session);
-            }
+            let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.record(STATUS_CHANGE, payload);
+            // THE SESSION LOG's typed `status` mark, in the same hold, and
+            // its owed wake taken there (`slog_take_wake` rings the watchers).
+            let at = timeline.slog().now();
+            timeline.slog_mut().observe_status(facts, at);
+            let _ = timeline.slog_take_wake();
         }
         let quieted =
             carried.is_some_and(|carried| carried.seen) && self.session_status.note_seen(session);
         if quieted {
             // THE SESSION LOG: the failure the carry says was seen is seen here,
-            // and its readers woken once the lock is released (ruling R9).
-            let owed = {
-                let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
-                let at = timeline.slog().now();
-                timeline.slog_mut().failure_seen(at);
-                timeline.slog_take_wake()
-            };
-            self.wake_log_watchers(session, owed);
+            // and its readers woken in the same hold (ruling R9).
+            let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let at = timeline.slog().now();
+            timeline.slog_mut().failure_seen(at);
+            let _ = timeline.slog_take_wake();
         }
         if moved || quieted {
             self.refresh_session_status_chrome(session);
@@ -4066,14 +4119,14 @@ impl crate::App {
             .is_some_and(crate::os_window_focused)
             && self.focused_session_id(wid) == Some(session);
         if looking && self.session_status.note_seen(session) {
-            // THE SESSION LOG: `mark - seen` lifts the failure's need.
-            let owed = self.pool.get(session).is_some_and(|s| {
+            // THE SESSION LOG: `mark - seen` lifts the failure's need; its
+            // owed wake rings the session's watchers in the same hold.
+            if let Some(s) = self.pool.get(session) {
                 let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                 let at = timeline.slog().now();
                 timeline.slog_mut().failure_seen(at);
-                timeline.slog_take_wake()
-            });
-            self.wake_log_watchers(session, owed);
+                let _ = timeline.slog_take_wake();
+            }
             self.refresh_session_status_chrome(session);
         }
     }
@@ -4359,6 +4412,11 @@ impl crate::App {
             .fabric
             .hold_advisory()
             .map_or_else(|| "-".to_string(), |h| h.reason);
+        // `editing=<n>` (amacs §6.7), just before the `gen=`/`seq=`/`hash=` stamp:
+        // how many open `edit` tickets hold this session, whose typing verbs then
+        // answer `ERR busy editing` ([`crate::control_edit::hold`]). Its leaf lock
+        // is taken here, before any other this record takes.
+        let editing = crate::control_edit::hold::count(session);
         let fabric = crate::fabric::fabric_state();
         let fabric_tail = crate::fabric::fabric_status_tail();
         // `fleet=` (2026-10-15), after the fabric's tail: the INSTANCE's fleet
@@ -4389,6 +4447,10 @@ impl crate::App {
         // question-lean re-port). `agent_gen=` is the sweep's stamp, taken
         // before this record: it pairs with no count of this record's.
         let human_seq = pooled.ctx.human_input.seq();
+        // The session's published text, looked at BEFORE the terminal guard (the
+        // two never nest): `hash=` below is served from it when it is this
+        // screen's, and built under the guard when it is not.
+        let mut look = pooled.ctx.frame.look_frame();
         let term = match pooled.term.try_lock() {
             Ok(t) => Some(t),
             Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
@@ -4450,7 +4512,9 @@ impl crate::App {
         // ledger rather than believed (a manager's fold of a report). A session
         // whose terminal could not be locked answers `-`/`-`: the poll never
         // waits on the guard for a field it can say it does not have.
-        let stamp = term.as_deref().map(crate::control::screen_stamp);
+        let stamp = term
+            .as_deref()
+            .map(|t| (t.content_seq(), look.text(t).fnv()));
         // THE RESIZE LEDGER's probe (`render=`), from the same guard: four
         // integer loads. `None` when the lock was contended, and `render=-`.
         let resize_probe = term
@@ -4524,19 +4588,21 @@ impl crate::App {
         // `supervisor_proven=<0|1>` beside it (2026-10-16): whether that claim
         // is a PROVEN self-claim ([`crate::self_claim`]): the kernel proved the
         // claim is the foreground agent's own, never the holder's spelling.
-        let (supervisor, word, land_at, claimed_here) = {
+        let (supervisor, word, land_at, claimed_here, proven) = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let now = crate::metrics::now_us();
             let live = meta.live_supervisor(now);
+            let proven = meta.supervisor_proven(now);
             (
                 format!(
                     "{} supervisor_proven={}",
                     live.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode),
-                    u8::from(meta.supervisor_proven(now)),
+                    u8::from(proven),
                 ),
                 meta.autopilot_word(),
                 meta.land_at,
                 live == Some(crate::autopilot::own_holder()),
+                proven,
             )
         };
         // `input= input_bytes= input_wait_ms= fg_rss_mb=` (2026-09-24), after
@@ -4624,16 +4690,17 @@ impl crate::App {
         // reports about itself (OSC 7501, [`crate::program_state`]), for
         // display. Never `agent=`, never an `await`'s, never a decision's.
         let program_state = crate::program_state::wire(self.session_status.program_state(session));
-        // `land_at=<unix s|-> task=<open|landed|done|spent|theirs|->`
+        // `land_at=<unix s|-> task=<open|landed|theirs|->`
         // (2026-10-16, `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.5,
         // §9.4.1), from the same two reads and printed just before the
         // `gen=`/`seq=`/`hash=` stamp, which stays last: for an agent session,
-        // the instant its timed Cruise lands and its task's face under Land as
-        // its loop last told this window's host — `task=` only while that host
-        // holds the live claim — and `-` otherwise.
+        // the instant its timed Cruise lands and its task's face as its loop
+        // last told this window's host — `task=` only while that host holds
+        // the live claim, or beside a proven self-claim whose own acts tell
+        // the face (FOREVER LAND §10.4) — and `-` otherwise.
         let land_at =
             crate::autopilot::land_at_field(land_at.filter(|_| supervised_agent.is_some()));
-        let task = crate::autopilot::task_field(face, claimed_here, supervised_agent);
+        let task = crate::autopilot::task_field(face, claimed_here || proven, supervised_agent);
         // `pause=<unix s|->` (2026-10-17, design §10.5.1), right after
         // `task=` and under its rule: the unix second the loop's pause after
         // short turns ends, as it last told this window's host.
@@ -4727,7 +4794,9 @@ impl crate::App {
         // told when it does; `aterm keeper status journals=` counts what one holds),
         // with a `journal_off=` reason when it does not, and while it does, its tail and
         // history ring's lag, whether memory pressure shed its ring
-        // (`journal_ring=<live|shed>`) and the RAM its region costs (`journal_bytes=`);
+        // (`journal_ring=<live|shedding|shed>`), the RAM its region costs (`journal_bytes=`)
+        // and the turn records its control slot does not hold (`journal_ledger_lag=`: not
+        // carried yet, or shed to fit);
         // then, on a session the keeper recovered, `restore=<exact|screen|meta>` and what
         // the restore could not reproduce (`crash_restore::RestoreReport::status_words`).
         // Counts only: no verb reads a region.
@@ -4763,7 +4832,7 @@ impl crate::App {
                  {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
                  human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-                 land_at={land_at} task={task} pause={pause} {task_record} {slog} gen={generation} seq={seq} hash={hash}",
+                 land_at={land_at} task={task} pause={pause} {task_record} {slog} editing={editing} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -4802,7 +4871,7 @@ impl crate::App {
              {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
              human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
-             land_at={land_at} task={task} pause={pause} {task_record} {slog} gen={generation} seq={seq} hash={hash}",
+             land_at={land_at} task={task} pause={pause} {task_record} {slog} editing={editing} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),

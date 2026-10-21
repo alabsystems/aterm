@@ -460,6 +460,50 @@ fn a_link_is_a_hyperlink_and_a_slider_a_value() {
     );
 }
 
+/// A load bar reads as a level bar holding its value, and a heatmap of
+/// cores as a table: the stats bars' meters (`Role::Meter`) and core grid
+/// (`Role::Grid`). Negative control: the slider beside them is still a
+/// slider.
+#[test]
+fn a_meter_is_a_level_bar_and_a_grid_a_table() {
+    const METER: LocalId = LocalId(30);
+    const GRID: LocalId = LocalId(31);
+    let mut update = fixture("hi\n");
+    let mut meter = Node::new(Role::Meter);
+    meter.set_label("CPU");
+    meter.set_description("42 %, rising");
+    meter.set_numeric_value(42.0);
+    meter.set_min_numeric_value(0.0);
+    meter.set_max_numeric_value(100.0);
+    let mut grid = Node::new(Role::Grid);
+    grid.set_label("Cores");
+    let window = &mut update.nodes[0].1;
+    window.set_children(vec![TERMINAL, BUTTON, LINK, SLIDER, METER, GRID]);
+    update.nodes.push((METER, meter));
+    update.nodes.push((GRID, grid));
+    let s = Served::over(update);
+    let meter = s.path(METER);
+    assert_eq!(
+        s.ok(&meter, ACCESSIBLE, "GetRole", vec![]),
+        vec![Value::U32(103)]
+    );
+    assert_eq!(
+        s.get(&meter, ACCESSIBLE, "Description"),
+        Value::from("42 %, rising")
+    );
+    let value = "org.a11y.atspi.Value";
+    assert_eq!(s.get(&meter, value, "CurrentValue"), Value::F64(42.0));
+    assert_eq!(s.get(&meter, value, "MaximumValue"), Value::F64(100.0));
+    assert_eq!(
+        s.ok(&s.path(GRID), ACCESSIBLE, "GetRole", vec![]),
+        vec![Value::U32(55)]
+    );
+    assert_eq!(
+        s.ok(&s.path(SLIDER), ACCESSIBLE, "GetRole", vec![]),
+        vec![Value::U32(51)]
+    );
+}
+
 /// A window holding a button and, after it, a list box of two options: ON
 /// selected, OFF not, over the button where the list would scroll it to,
 /// marked off screen when `offscreen`.
@@ -1050,6 +1094,27 @@ struct TestBuses {
     session: Option<CtlStream>,
     accessibility: VecDeque<CtlStream>,
     opened: Sender<String>,
+    /// How many `open`s fail, as a bus that is not there yet fails, before
+    /// the queue's buses are handed out.
+    refuse: usize,
+    /// [`Buses::write_timeout`]'s answer.
+    write_timeout: Option<Duration>,
+}
+
+impl TestBuses {
+    fn new(
+        session: CtlStream,
+        accessibility: impl IntoIterator<Item = CtlStream>,
+        opened: Sender<String>,
+    ) -> TestBuses {
+        TestBuses {
+            session: Some(session),
+            accessibility: accessibility.into_iter().collect(),
+            opened,
+            refuse: 0,
+            write_timeout: Some(super::WRITE),
+        }
+    }
 }
 
 impl Buses for TestBuses {
@@ -1058,8 +1123,16 @@ impl Buses for TestBuses {
         Connection::handshake(stream, 1000, None)
     }
 
+    fn write_timeout(&self) -> Option<Duration> {
+        self.write_timeout
+    }
+
     fn open(&mut self, address: &str) -> aterm_dbus::Result<Connection> {
         let _ = self.opened.send(address.to_owned());
+        if self.refuse > 0 {
+            self.refuse -= 1;
+            return Err(aterm_dbus::Error::Io(std::io::ErrorKind::NotFound.into()));
+        }
         let stream = self
             .accessibility
             .pop_front()
@@ -1204,11 +1277,7 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     let second_peer = Peer::accept(second_bus, ":1.21");
     let (opened_tx, opened) = mpsc::channel();
     let publisher = Publisher::start(
-        TestBuses {
-            session: Some(session_client),
-            accessibility: VecDeque::from([first_client, second_client]),
-            opened: opened_tx,
-        },
+        TestBuses::new(session_client, [first_client, second_client], opened_tx),
         Some("aterm-test".into()),
     );
     let (tx, window_heard) = mpsc::channel();
@@ -1314,6 +1383,84 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     drop(publisher);
 }
 
+/// The events that show an AT a window and where its focus is.
+const ANNOUNCING: [&str; 4] = [
+    "ChildrenChanged",
+    "Activate",
+    "StateChanged",
+    "ActiveDescendantChanged",
+];
+
+/// What an AT on the bus hears of a window's first tree and its focus, up to
+/// the focus itself, when the window had the keyboard focus before its tree
+/// (`focus_first`) or after it: each event's member and kind.
+fn first_announcement(focus_first: bool) -> Vec<(String, String)> {
+    let _log = captured();
+    let (session_client, session_bus) = CtlStream::pair().unwrap();
+    let (bus_client, bus_end) = CtlStream::pair().unwrap();
+    let session_peer = Peer::accept(session_bus, ":1.10");
+    let bus_peer = Peer::accept(bus_end, ":1.20");
+    let (opened_tx, _opened) = mpsc::channel();
+    let publisher = Publisher::start(
+        TestBuses::new(session_client, [bus_client], opened_tx),
+        Some("aterm-test".into()),
+    );
+    let (tx, window_heard) = mpsc::channel();
+    let mut adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
+    let mut session = session_peer.join().unwrap();
+    open_session(&mut session, true);
+    let mut bus = bus_peer.join().unwrap();
+    embedded(&mut bus, ":1.20");
+    assert_eq!(heard(&window_heard), Heard::Activated);
+    if focus_first {
+        adapter.update_window_focus_state(true);
+        adapter.update_if_active(|| fixture("hi\n"));
+    } else {
+        adapter.update_if_active(|| fixture("hi\n"));
+        adapter.update_window_focus_state(true);
+    }
+    let mut heard_events = Vec::new();
+    loop {
+        let msg = bus.next();
+        let member = msg.member.clone().unwrap_or_default();
+        if msg.kind != Kind::Signal || !ANNOUNCING.contains(&member.as_str()) {
+            continue;
+        }
+        let kind = msg
+            .body
+            .first()
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let focused = member == "StateChanged" && kind == "focused";
+        heard_events.push((member, kind));
+        if focused {
+            break;
+        }
+    }
+    drop(adapter);
+    drop(publisher);
+    heard_events
+}
+
+/// A window focused before its first tree reached the bus is announced as one
+/// focused after it: activated, then its focus. Orca names a window only
+/// when it hears it activated (the Linux lane's Orca row, x86_64, 2026-10-19,
+/// heard the terminal's text and no frame).
+#[test]
+fn a_window_focused_before_its_tree_is_announced_activated() {
+    let event = |member: &str, kind: &str| (member.to_owned(), kind.to_owned());
+    let announced = vec![
+        event("ChildrenChanged", "add"),
+        event("Activate", ""),
+        event("StateChanged", "active"),
+        event("ActiveDescendantChanged", ""),
+        event("StateChanged", "focused"),
+    ];
+    assert_eq!(first_announcement(false), announced, "focus after the tree");
+    assert_eq!(first_announcement(true), announced, "focus before the tree");
+}
+
 // --- a tree on its way when the bus dies ------------------------------------
 
 /// What the window had sent the publisher thread, still unread, when the
@@ -1365,11 +1512,7 @@ fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
     let second_peer = Peer::accept(second_bus, ":1.21");
     let (opened_tx, _opened) = mpsc::channel();
     let publisher = Publisher::start(
-        TestBuses {
-            session: Some(session_client),
-            accessibility: VecDeque::from([first_client, second_client]),
-            opened: opened_tx,
-        },
+        TestBuses::new(session_client, [first_client, second_client], opened_tx),
         Some("aterm-test".into()),
     );
     let (tx, window_heard) = mpsc::channel();
@@ -1509,4 +1652,294 @@ fn a_node_queued_when_the_bus_dies_is_served_live_on_the_next() {
     the_terminal_reads(&r);
     assert_eq!(r.extra.kind, Kind::MethodReturn, "{:?}", r.extra);
     only_the_live_tree_arrived(&r);
+}
+
+// --- a bus that stops reading -------------------------------------------------
+
+/// How long a write may wait here for a bus that stopped reading. The bus
+/// reads nothing at all, so the bound under test is the publisher's, never
+/// the machine's speed.
+const STALL: Duration = Duration::from_millis(100);
+
+/// Updates the window's text one line at a time until `until` says the
+/// window heard what it waits for, or `count` updates are sent when it
+/// waits for nothing (`until` is `None`).
+fn keep_changing(
+    adapter: &mut super::Adapter,
+    window_heard: &Receiver<Heard>,
+    until: Option<Heard>,
+    count: usize,
+) {
+    let started = std::time::Instant::now();
+    for i in 0.. {
+        adapter.update_if_active(|| fixture(&format!("line {i}\n")));
+        match &until {
+            None if i + 1 >= count => return,
+            None => {}
+            Some(wanted) => {
+                if let Ok(got) = window_heard.recv_timeout(Duration::from_millis(1))
+                    && &got == wanted
+                {
+                    return;
+                }
+                assert!(
+                    started.elapsed() < HANG,
+                    "the window never heard {wanted:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A session over accessibility buses whose writes wait `write_timeout`;
+/// the first bus is joined, and the window's tree published there. With a
+/// deadline there is a second bus to rejoin (`second`); without one the
+/// publisher never leaves the first, and no second bus waits on a join that
+/// never comes.
+struct Stalling {
+    publisher: Publisher,
+    adapter: super::Adapter,
+    window_heard: Receiver<Heard>,
+    session: Peer,
+    first: Peer,
+    second: Option<std::thread::JoinHandle<Peer>>,
+}
+
+fn stalling(write_timeout: Option<Duration>) -> Stalling {
+    let _log = captured();
+    let (session_client, session_bus) = CtlStream::pair().unwrap();
+    let (first_client, first_bus) = CtlStream::pair().unwrap();
+    let session_peer = Peer::accept(session_bus, ":1.10");
+    let first_peer = Peer::accept(first_bus, ":1.20");
+    let mut buses = vec![first_client];
+    let second = write_timeout.map(|_| {
+        let (second_client, second_bus) = CtlStream::pair().unwrap();
+        buses.push(second_client);
+        Peer::accept(second_bus, ":1.21")
+    });
+    let (opened_tx, _opened) = mpsc::channel();
+    let publisher = Publisher::start(
+        TestBuses {
+            write_timeout,
+            ..TestBuses::new(session_client, buses, opened_tx)
+        },
+        Some("aterm-test".into()),
+    );
+    let (tx, window_heard) = mpsc::channel();
+    let mut adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
+    let mut session = session_peer.join().unwrap();
+    open_session(&mut session, true);
+    let mut first = first_peer.join().unwrap();
+    embedded(&mut first, ":1.20");
+    assert_eq!(heard(&window_heard), Heard::Activated);
+    adapter.update_window_focus_state(true);
+    adapter.update_if_active(|| fixture("hi\n"));
+    first.expect_signal("ChildrenChanged");
+    Stalling {
+        publisher,
+        adapter,
+        window_heard,
+        session,
+        first,
+        second,
+    }
+}
+
+#[test]
+fn a_bus_that_stops_reading_is_left_and_the_next_one_joined() {
+    let log = captured();
+    let mut s = stalling(Some(STALL));
+    // The first bus reads nothing more while the text keeps changing: its
+    // socket fills, a write waits out its bound, and the window is told.
+    keep_changing(&mut s.adapter, &s.window_heard, Some(Heard::Deactivated), 0);
+    assert!(
+        log.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("the AT-SPI bus stopped reading")),
+        "the stall is logged"
+    );
+    // The publisher asks at-spi2-core again and joins the bus it names.
+    answer_status(&mut s.session, true);
+    let mut bus = s.second.take().expect("a second bus").join().unwrap();
+    embedded(&mut bus, ":1.21");
+    assert_eq!(heard(&s.window_heard), Heard::Activated);
+    s.adapter.update_if_active(|| fixture("after\n"));
+    bus.expect_signal("ChildrenChanged");
+    let children = bus.ask(":1.21", ROOT_PATH, ACCESSIBLE, "GetChildren", vec![]);
+    let window = child_path(&children);
+    let first = bus.ask(
+        ":1.21",
+        &window,
+        ACCESSIBLE,
+        "GetChildAtIndex",
+        vec![0.into()],
+    );
+    let Value::Struct(fields) = &first.body[0] else {
+        panic!("{first:?}")
+    };
+    let text = bus.ask(
+        ":1.21",
+        fields[1].as_str().unwrap(),
+        "org.a11y.atspi.Text",
+        "GetText",
+        vec![0.into(), (-1).into()],
+    );
+    assert_eq!(text.body, vec![Value::from("lane$ echo hi\nafter\n")]);
+    drop(s.first);
+    drop(s.adapter);
+    drop(s.publisher);
+}
+
+#[test]
+fn without_a_write_deadline_a_bus_that_stops_reading_holds_the_publisher() {
+    // The negative control: the same bus, with writes that wait for as long
+    // as the bus does. Ten times the bound above passes and the window is
+    // still not told; once the bus reads again, every change it held
+    // arrives, and the window was never let go.
+    const CHANGES: usize = 2000;
+    let mut s = stalling(None);
+    keep_changing(&mut s.adapter, &s.window_heard, None, CHANGES);
+    let early = s.window_heard.recv_timeout(STALL * 10);
+    assert!(
+        early.is_err(),
+        "the window heard {early:?} with the bus stalled"
+    );
+    let answer = s
+        .first
+        .ask(":1.20", ROOT_PATH, ACCESSIBLE, "GetChildren", vec![]);
+    assert_eq!(answer.kind, Kind::MethodReturn, "{answer:?}");
+    let changed = s
+        .first
+        .held
+        .iter()
+        .filter(|m| m.member.as_deref() == Some("TextChanged"))
+        .count();
+    assert!(
+        changed >= CHANGES,
+        "{changed} text changes arrived of the {CHANGES} sent"
+    );
+    assert!(s.window_heard.try_recv().is_err());
+    drop(s.adapter);
+    drop(s.publisher);
+}
+
+#[test]
+fn a_join_that_fails_is_tried_again() {
+    let log = captured();
+    let (session_client, session_bus) = CtlStream::pair().unwrap();
+    let (bus_client, bus_end) = CtlStream::pair().unwrap();
+    let session_peer = Peer::accept(session_bus, ":1.10");
+    let bus_peer = Peer::accept(bus_end, ":1.30");
+    let (opened_tx, opened) = mpsc::channel();
+    let publisher = Publisher::start(
+        TestBuses {
+            refuse: 1,
+            ..TestBuses::new(session_client, [bus_client], opened_tx)
+        },
+        Some("aterm-test".into()),
+    );
+    let (tx, window_heard) = mpsc::channel();
+    let adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
+    let mut session = session_peer.join().unwrap();
+    // The first join fails, and nothing on the session bus changes after it.
+    open_session(&mut session, true);
+    opened.recv_timeout(HANG).unwrap();
+    // A second later the publisher asks again, unprompted, and joins.
+    answer_status(&mut session, true);
+    opened.recv_timeout(HANG).unwrap();
+    let mut bus = bus_peer.join().unwrap();
+    embedded(&mut bus, ":1.30");
+    assert_eq!(heard(&window_heard), Heard::Activated);
+    assert!(
+        log.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("cannot join the AT-SPI bus") && l.contains("in 1 s")),
+        "the failure and the next attempt are logged"
+    );
+    drop(adapter);
+    drop(publisher);
+}
+
+/// A status read that fails while the publisher waits to rejoin (at-spi2-core
+/// busy, or answering an error) keeps the wait going, longer, instead of
+/// ending the attempts until the next status signal.
+#[test]
+fn a_status_unanswered_during_the_backoff_keeps_it() {
+    let (session_client, session_bus) = CtlStream::pair().unwrap();
+    let (bus_client, bus_end) = CtlStream::pair().unwrap();
+    let session_peer = Peer::accept(session_bus, ":1.10");
+    let bus_peer = Peer::accept(bus_end, ":1.30");
+    let (opened_tx, opened) = mpsc::channel();
+    let publisher = Publisher::start(
+        TestBuses {
+            refuse: 1,
+            ..TestBuses::new(session_client, [bus_client], opened_tx)
+        },
+        Some("aterm-test".into()),
+    );
+    let (tx, window_heard) = mpsc::channel();
+    let adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
+    let mut session = session_peer.join().unwrap();
+    // The first join fails; a second later the status read that would retry
+    // it is answered with an error.
+    open_session(&mut session, true);
+    opened.recv_timeout(HANG).unwrap();
+    let get = session.expect_call("Get");
+    let mut failed = Message::error(
+        &get,
+        "org.freedesktop.DBus.Error.NoReply",
+        "at-spi-bus-launcher did not answer",
+    )
+    .unwrap();
+    failed.sender = Some("org.freedesktop.DBus".into());
+    session.write(failed);
+    // Two seconds after that, unprompted, the publisher asks again and joins.
+    answer_status(&mut session, true);
+    opened.recv_timeout(HANG).unwrap();
+    let mut bus = bus_peer.join().unwrap();
+    embedded(&mut bus, ":1.30");
+    assert_eq!(heard(&window_heard), Heard::Activated);
+    drop(adapter);
+    drop(publisher);
+}
+
+/// The desktop's join of the accessibility bus gives up on a daemon that
+/// never answers its handshake (a frozen one's listener still takes the
+/// connection into its backlog) within [`super::WRITE`], not aterm-dbus's
+/// 25 s handshake default.
+#[test]
+fn the_desktop_s_join_gives_up_on_a_silent_bus_within_the_write_deadline() {
+    let path = std::env::temp_dir().join(format!("aterm-a11y-frozen-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _frozen = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let asked = std::time::Instant::now();
+    let joined = super::SessionBuses.open(&format!("unix:path={}", path.display()));
+    let waited = asked.elapsed();
+    assert!(
+        matches!(joined, Err(aterm_dbus::Error::Timeout)),
+        "{:?}",
+        joined.err()
+    );
+    // The two bounds compared, not the machine's speed.
+    assert!(
+        waited < aterm_dbus::conn::HANDSHAKE_TIMEOUT,
+        "the join gave up after {waited:?}, the handshake default's, not WRITE's"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_failed_join_waits_twice_as_long_each_time_up_to_a_minute() {
+    let now = std::time::Instant::now();
+    let mut waits = Vec::new();
+    let mut last = None;
+    for _ in 0..9 {
+        last = super::publisher::Rejoin::next(last, now);
+        waits.push(last.unwrap().after.as_secs());
+    }
+    assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
 }

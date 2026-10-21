@@ -248,3 +248,64 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         "nobody owns an unfocused caret: {line}"
     );
 }
+
+/// The native host floors the caret against the cell it sits on, read from
+/// the frame the window renders (`input_scratch`), as the web page does:
+/// Fire's ember on a reverse-video cell (SGR 7, its ground the default ink)
+/// keeps the effect's 4.5:1 against that cell, the background the renderer
+/// cuts the block's glyph out in. Negative control: the same caret over a
+/// plain cell is floored against the page alone and sits under that floor
+/// on the reverse cell's colour.
+#[test]
+fn the_caret_floor_reads_the_cell_under_the_caret_from_the_rendered_frame() {
+    let fill_on = |reverse: bool| {
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("fire".into());
+        app.config.trail_sounds = Some(false);
+        app.config.cursor_trail_color = None;
+        let wid = WindowId(0);
+        let mut term = Terminal::new(24, 80);
+        term.process(if reverse {
+            b"\x1b[7mx\x1b[27m\x1b[H"
+        } else {
+            b"x\x1b[H"
+        });
+        let ws = app.windows.get_mut(&wid).expect("fixture window");
+        ws.focused = true;
+        ws.input_scratch = term.cell_frame(24, 80);
+        let cell = aterm_render::rgb_to_u32(ws.input_scratch.cells[0][0].bg);
+        let fill = app
+            .cursor_frame(
+                wid,
+                CursorFxInputs {
+                    default_bg: aterm_render::rgb_to_u32(terminal_blank_cell(&term).bg),
+                    default_fg: aterm_render::rgb_to_u32(terminal_blank_cell(&term).fg),
+                    ..CursorFxInputs::sample_for_test(Instant::now())
+                },
+            )
+            .expect("fixture window")
+            .block_fill
+            .filter(|owned| owned.owner == crate::cursor_glow::BlockFillOwner::Forge)
+            .expect("the fire style owns the caret")
+            .fill;
+        (fill, cell)
+    };
+    let (fill, cell) = fill_on(true);
+    let (plain, page_cell) = fill_on(false);
+    assert_ne!(
+        cell, page_cell,
+        "SGR 7 gives the caret's cell its own ground"
+    );
+    let floor = aterm_effects::cursor_fx::CARET_PAGE_MIN_CONTRAST;
+    let ratio = aterm_effects::color_math::contrast_ratio(fill, cell);
+    assert!(
+        ratio >= floor,
+        "the ember {fill:06x} on the reverse cell {cell:06x} reads {ratio:.2}:1"
+    );
+    assert!(
+        aterm_effects::color_math::contrast_ratio(plain, cell) < floor,
+        "control: the page-floored ember {plain:06x} is under the floor on {cell:06x}"
+    );
+}

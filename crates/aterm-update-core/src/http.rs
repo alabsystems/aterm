@@ -304,6 +304,34 @@ pub fn note_link_down() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
 }
 
+/// The pause before attempt `attempt` of a request: curl's own `--retry` backoff, kept
+/// by every lane that retries in-process — nothing before the first attempt, 1 s before
+/// the second, 2 s before the third.
+///
+/// A development build under the fast-timers seam
+/// ([`aterm_types::domain::ENV_DEV_FAST_TIMERS`], `dev_seam!`) waits a thousandth of it,
+/// so a test that counts a request's attempts — a child it starts with the seam set —
+/// does not sit out the seconds between them. A shipped build never reads the seam.
+fn backoff_before(attempt: u32) -> std::time::Duration {
+    let production = match attempt {
+        0 | 1 => return std::time::Duration::ZERO,
+        n => std::time::Duration::from_secs(1 << (n - 2)),
+    };
+    if aterm_types::dev_seam!(aterm_types::domain::ENV_DEV_FAST_TIMERS).is_some() {
+        production / 1000
+    } else {
+        production
+    }
+}
+
+/// Sleep out [`backoff_before`] `attempt`.
+fn back_off_before(attempt: u32) {
+    let pause = backoff_before(attempt);
+    if !pause.is_zero() {
+        std::thread::sleep(pause);
+    }
+}
+
 /// Whether an HTTP status is worth another in-process attempt: the transient
 /// server-side set curl itself calls retryable (`man curl`, `--retry`).
 ///
@@ -454,9 +482,7 @@ fn head_attempts(
 ) -> Result<HeadAnswer, HttpError> {
     let mut attempt = from;
     loop {
-        if attempt > 1 {
-            std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
-        }
+        back_off_before(attempt);
         match head_attempt(url, args, attempt, attempts) {
             FirstHead::Settled(answer) => return answer,
             FirstHead::Again { .. } => attempt += 1,
@@ -608,10 +634,7 @@ pub fn download_bytes(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, Str
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        if attempt > 1 {
-            // curl's own inter-retry backoff, preserved: 1 s, then 2 s.
-            std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
-        }
+        back_off_before(attempt);
         let out = curl_fetch(&download_bytes_args(&cap), asset_url)?;
         // Its stdout is the body: no trailer says how far a failed connection got.
         let again = attempt_again(
@@ -1373,8 +1396,9 @@ fn download_to_resumable_with(
                         // already known down.
                         if attempt_again(out.status.code(), Handshake::Unknown, idle, CURL_ATTEMPTS)
                         {
-                            // curl's own `--retry` backoff, preserved: 1 s, then 2 s.
-                            std::thread::sleep(std::time::Duration::from_secs(1 << (idle - 1)));
+                            // `idle` attempts in a row moved nothing: the next is attempt
+                            // `idle + 1` of the run, after its backoff.
+                            back_off_before(idle + 1);
                             continue;
                         }
                     }
@@ -1815,13 +1839,6 @@ fn vendor_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String
         .map_err(|e| format!("spawn curl: {e}"))
 }
 
-/// Pause before attempt `attempt` (2 → 1 s, 3 → 2 s); nothing before the first.
-fn vendor_backoff(attempt: u32) {
-    if attempt > 1 {
-        std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
-    }
-}
-
 /// A fresh private directory for one vendor request's body and header dump, removed on
 /// drop. `create_dir` on a new name (never an existing path) at mode `0700` on unix, so no
 /// other user can pre-plant or read what curl writes there.
@@ -1960,7 +1977,7 @@ fn vendor_get_within(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        vendor_backoff(attempt);
+        back_off_before(attempt);
         // A previous attempt's body or headers must never be read as this one's.
         let _ = std::fs::remove_file(&body);
         let _ = std::fs::remove_file(&headers);
@@ -2008,7 +2025,7 @@ pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        vendor_backoff(attempt);
+        back_off_before(attempt);
         let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
         let (stdout, stderr) = (
             String::from_utf8_lossy(&out.stdout),
@@ -3367,6 +3384,8 @@ mod tests {
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     struct Transfer {
         lane: &'static str,
+        /// The payload's size, which is also the probe's cap.
+        size: usize,
         child: Option<aterm_uds::spawnfd::Child>,
         ranges: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         _server: TransferServer,
@@ -3412,6 +3431,14 @@ mod tests {
         }
     }
 
+    /// What a fresh attempt's quick stall bound (`--speed-time`) is cut to behind
+    /// [`start_transfer`]'s curl. curl's speed is a moving average over its last five seconds,
+    /// so an attempt notices a silence about `--speed-time` after its average falls under the
+    /// floor; two seconds leaves a fresh attempt's first byte a hundred times the loopback
+    /// round trip, on a loaded machine too.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    const FRESH_STALL_SECS: u32 = 2;
+
     /// Start a [`Transfer`] of a `size`-byte payload on `lane`, with `stale` already standing
     /// at the destination when given.
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
@@ -3432,6 +3459,9 @@ mod tests {
         let current = std::sync::Arc::new(std::sync::Mutex::new(None));
         let stopping = std::sync::Arc::clone(&stop);
         let serving = std::sync::Arc::clone(&current);
+        // Every request is answered from this one payload: built per request, a 20 MiB body
+        // cut twenty times cost seconds of unoptimized generation before curl saw a byte.
+        let body = payload(size);
         let thread = std::thread::spawn(move || {
             let mut n = 0;
             while !stopping.load(std::sync::atomic::Ordering::Acquire) {
@@ -3454,6 +3484,7 @@ mod tests {
                     }
                 }
                 let seen = std::sync::Arc::clone(&seen);
+                let body = &body;
                 (move || {
                     let mut head = Vec::new();
                     let mut buf = [0u8; 4096];
@@ -3476,7 +3507,6 @@ mod tests {
                         );
                         return;
                     };
-                    let body = payload(size);
                     let from = range
                         .strip_prefix("bytes=")
                         .and_then(|r| r.trim_end_matches('-').parse::<usize>().ok())
@@ -3514,14 +3544,21 @@ mod tests {
             std::fs::write(dir.path().join("a-1.bin"), stale).unwrap();
         }
         let wrapper = dir.path().join("curl");
-        // The real curl, every option as the lane wrote it, the URL swapped for the server's.
+        // The real curl, every option as the lane wrote it, the URL swapped for the server's
+        // — but for a fresh attempt's quick stall bound, cut to `FRESH_STALL_SECS`, so a
+        // silent hold is noticed in seconds. Only the quick bound of an attempt from byte 0:
+        // an attempt that continues a file, and a patient bound, run as the lane wrote them.
+        let quick = StallBound::Quick.secs();
         std::fs::write(
             &wrapper,
             format!(
                 "#!/bin/sh\nunset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY\n\
-                 n=$#; i=0\nfor a do\n  i=$((i+1))\n  [ $i -eq 1 ] && set --\n  \
+                 fresh=1\nfor a do [ \"$a\" = --continue-at ] && fresh=0; done\n\
+                 n=$#; i=0; prev=\nfor a do\n  i=$((i+1))\n  [ $i -eq 1 ] && set --\n  \
                  if [ $i -eq $n ]; then set -- \"$@\" http://127.0.0.1:{port}/a-1.bin; \
-                 else set -- \"$@\" \"$a\"; fi\ndone\nexec /usr/bin/curl \"$@\"\n"
+                 elif [ $fresh = 1 ] && [ \"$prev\" = --speed-time ] && [ \"$a\" = {quick} ]; \
+                 then set -- \"$@\" {FRESH_STALL_SECS}; \
+                 else set -- \"$@\" \"$a\"; fi\n  prev=$a\ndone\nexec /usr/bin/curl \"$@\"\n"
             ),
         )
         .unwrap();
@@ -3533,6 +3570,9 @@ mod tests {
             .env(RESUME_PROBE_LANE, lane)
             .env(RESUME_PROBE_SIZE, size.to_string())
             .env(super::CURL_SEAM, &wrapper)
+            // A retry's backoff at a thousandth (`backoff_before`): what these transfers
+            // pin is which requests are made, never the seconds between them.
+            .env(aterm_types::domain::ENV_DEV_FAST_TIMERS, "1")
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::null())
             .stderr(aterm_uds::spawnfd::Stdio::null())
@@ -3540,6 +3580,7 @@ mod tests {
             .unwrap();
         Transfer {
             lane,
+            size,
             child: Some(child),
             ranges,
             _server: server,
@@ -3547,22 +3588,62 @@ mod tests {
         }
     }
 
-    /// Wait for `run`'s probe to finish — a one-minute hang detector, never a latency budget
-    /// — and return what its download said: `ok`, or `err` and the error.
+    /// Wait for `run`'s probe to finish and return what its download said: `ok`, or `err`
+    /// and the error.
+    ///
+    /// The wait is a one-minute hang detector, never a latency budget, and it times a STEP,
+    /// not the whole transfer: it fires only after a minute in which the transfer moved not
+    /// at all — no new request reached the server and no byte reached its file. A transfer
+    /// of twenty attempts, each a fresh curl, went past one minute in all under a loaded
+    /// workspace run while every attempt moved (and passed alone), so a bound on the whole
+    /// call read a slow machine as a hang.
+    ///
+    /// Progress alone could feed that detector forever, so it also fails the call the moment
+    /// the server has been asked more often than the lane's loop may ask it: every resume
+    /// `resume_allowed` grants, the first attempt and the one fresh retry after a refused
+    /// range, each after at most `CURL_ATTEMPTS - 1` retries in a row (the TERMINATION note in
+    /// `download_to_resumable_with`). A lane that asks in a loop fails here at once, not never.
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     fn finished(run: &mut Transfer) -> String {
         const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
-        let deadline = std::time::Instant::now() + HANG_DETECTOR;
+        let resumes = u64::from(super::SHORT_RESUMES_PER_CALL)
+            + u64::try_from(run.size).unwrap() / super::RESUME_EARNED_AT;
+        let ceiling = usize::try_from((resumes + 2) * u64::from(super::CURL_ATTEMPTS)).unwrap();
+        let dir = run.dir.path().to_path_buf();
+        let moved = |run: &Transfer| {
+            let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |m| m.len());
+            (
+                run.ranges.lock().unwrap().len(),
+                size("a-1.bin.part"),
+                size("a-1.bin"),
+            )
+        };
+        let mut last = moved(run);
+        let mut deadline = std::time::Instant::now() + HANG_DETECTOR;
         let said = loop {
-            match std::fs::read_to_string(run.dir.path().join("said")) {
+            match std::fs::read_to_string(dir.join("said")) {
                 Ok(said) => break said,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => panic!("{}: reading the probe's completion: {error}", run.lane),
             }
-            if std::time::Instant::now() > deadline {
+            let now = moved(run);
+            if now.0 > ceiling {
                 panic!(
-                    "{}: the transfer never finished; requests: {:?}",
+                    "{}: the server was asked {} times, past the {ceiling} the lane's loop \
+                     allows one call; requests: {:?}",
                     run.lane,
+                    now.0,
+                    run.ranges.lock().unwrap()
+                );
+            }
+            if now != last {
+                last = now;
+                deadline = std::time::Instant::now() + HANG_DETECTOR;
+            } else if std::time::Instant::now() > deadline {
+                panic!(
+                    "{}: the transfer moved nothing for {}s and never finished; requests: {:?}",
+                    run.lane,
+                    HANG_DETECTOR.as_secs(),
                     run.ranges.lock().unwrap()
                 );
             }
@@ -3581,17 +3662,19 @@ mod tests {
 
     /// A SILENT DROP, OVER REAL CURL, on both file lanes at once: the resumable `.part` lane
     /// (`atpkg`'s archives) and the app container's (`download_to`). The server's first
-    /// connection moves 1 MiB of 4 and then goes silent — open, no byte, no FIN, no reset: a
-    /// Wi-Fi switch, a NAT timeout, a sleeping peer. Each lane must notice within its quick
-    /// stall bound and continue its file in the same call, so its server sees exactly two
-    /// requests, the second for `bytes=1048576-`, and the file is whole. On the lanes before
-    /// this, curl waited 120 s for the stall and then retried from byte 0: the hang detector
-    /// fires, and a second request carries no range.
+    /// connection moves the first 2000 bytes of 4 MiB and then goes silent — open, no byte, no
+    /// FIN, no reset: a Wi-Fi switch, a NAT timeout, a sleeping peer. Each lane must notice
+    /// within its quick stall bound (cut to [`FRESH_STALL_SECS`] by the server's curl) and
+    /// continue its file in the same call, so its server sees exactly two requests, the second
+    /// for `bytes=2000-`, and the file is whole. The bytes before the silence are under curl's
+    /// 4 KiB/s floor, so its five-second average has no burst to drain before the bound
+    /// counts. On the lanes before this, curl waited 120 s for the stall and then retried from
+    /// byte 0: the hang detector fires, and a second request carries no range.
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     #[test]
     fn a_silently_held_transfer_continues_within_the_call() {
         const SIZE: usize = 4 << 20;
-        const HELD_AT: usize = 1 << 20;
+        const HELD_AT: usize = 2000;
         let script = |n| Answer::Body {
             send: if n == 0 { HELD_AT } else { usize::MAX },
             hold: n == 0,

@@ -1714,13 +1714,20 @@ fn erased_before_it_stood_twin_min(id: &str, paced_until: u64) -> bool {
 /// A streamed quote, then Ctrl-U, at every pause and pacing: the composer quoted
 /// one or two rows up, Ctrl-U 20–900 ms later, at the flat train and both GUI
 /// pacings. Limit: one row up (`gap1`) with the quote erased before it stood
-/// `TWIN_MIN` ([`erased_before_it_stood_twin_min`], paced until 60 ms).
+/// `TWIN_MIN` ([`erased_before_it_stood_twin_min`], paced until 60 ms). Under
+/// `pet` too until 60 ms: the cat owes no frame once the quote lands (its
+/// station keeps the lead it took, `PetBrain::lead`, so no home eases back
+/// after the keys), and the pane frames as `paced` does.
 #[test]
 fn a_streamed_quote_then_ctrl_u_at_every_pause_and_pacing() {
     holds_but(
         all_cases(),
         |id| id.starts_with("a3.p1."),
-        |id| id.contains("/gap1/") && erased_before_it_stood_twin_min(id, 60),
+        |id| {
+            id.contains("/gap1/")
+                && (erased_before_it_stood_twin_min(id, 60)
+                    || (id.ends_with("/pet") && pause_of(id) <= 60))
+        },
     );
 }
 

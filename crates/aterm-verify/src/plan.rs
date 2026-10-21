@@ -7,8 +7,14 @@
 
 use std::path::PathBuf;
 
+use aterm_toolchain::build_cache::noindex;
+
 use crate::Ctx;
 use crate::scope::Scope;
+
+/// The libc oracle's lane under `<root>/libc-oracle` ([`Lane::LibcOracleTarget`]),
+/// which `aterm-libc-oracle` defaults to as well.
+pub const LIBC_ORACLE_TARGET: &str = "target.noindex";
 
 /// A contended resource. Two stages in one lane run in declared order; lanes
 /// overlap freely. A lane is a cargo target directory, which two cargo
@@ -27,24 +33,24 @@ pub enum Lane {
     /// compiles nothing more. Beside it, not after it: a whole `verify --all`
     /// measured shorter that way (the commit that set it carries the figures).
     AfterCompile,
-    /// `<target>/verify/tippy`: the lint. Its check-mode units share no
+    /// `<target>/verify/tippy.noindex`: the lint. Its check-mode units share no
     /// artifact with the test build, so a dir of its own lets the two compile
     /// at once instead of queueing on cargo's lock.
     TippyTarget,
-    /// `<target>/verify/checkers`: the workspace's tests under
+    /// `<target>/verify/checkers.noindex`: the workspace's tests under
     /// `--features aterm-spec/checkers`, a feature build the main cache never holds.
     CheckersTarget,
-    /// `<target>/verify/gpu-oracle`: aterm-gpu's tests under `--features
+    /// `<target>/verify/gpu-oracle.noindex`: aterm-gpu's tests under `--features
     /// wgpu-oracle`, a feature build the main cache never holds.
     GpuOracleTarget,
-    /// `<target>/verify/trust`: the release tools (aterm-release) that
+    /// `<target>/verify/trust.noindex`: the release tools (aterm-release) that
     /// `ship check --export` runs.
     TrustTarget,
-    /// `<target>/verify/cells`: the `cells` check, one directory per cell,
+    /// `<target>/verify/cells.noindex`: the `cells` check, one directory per cell,
     /// and the `wasm-smoke`, `wasm-glue` and `browser` modules, each built by
     /// a rustup toolchain no other lane uses.
     CellsTarget,
-    /// `<root>/libc-oracle/target`: the libc oracle's own workspace and its
+    /// `<root>/libc-oracle/target.noindex`: the libc oracle's own workspace and its
     /// gate. One per checkout, never under a shared target dir: the oracle's
     /// shim build is keyed by paths relative to its workspace, so a dir shared
     /// across checkouts can serve another checkout's conformance build.
@@ -170,10 +176,13 @@ pub struct StageSpec {
 }
 
 /// The target directory a lane's cargo children use; `None` for [`Lane::Pure`].
-/// The side lanes live under the run's target dir, never beside it.
+/// The side lanes live under the run's target dir, never beside it, each in a
+/// folder named `*.noindex`, which Spotlight skips with all it holds
+/// (`aterm_toolchain::build_cache::NOINDEX`): a side lane's builds are
+/// intermediates nobody opens.
 #[must_use]
 pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
-    let side = |name: &str| Some(ctx.target_dir.join("verify").join(name));
+    let side = |name: &str| Some(ctx.state_dir().join(noindex(name)));
     match lane {
         Lane::Pure => None,
         Lane::MainTarget | Lane::AfterCompile => Some(ctx.target_dir.clone()),
@@ -181,9 +190,16 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::CheckersTarget => side("checkers"),
         Lane::GpuOracleTarget => side("gpu-oracle"),
         Lane::TrustTarget => side("trust"),
-        Lane::CellsTarget => side("cells"),
-        Lane::LibcOracleTarget => Some(ctx.root.join("libc-oracle/target")),
+        Lane::CellsTarget => Some(cells_dir(ctx)),
+        Lane::LibcOracleTarget => Some(ctx.root.join("libc-oracle").join(LIBC_ORACLE_TARGET)),
     }
+}
+
+/// The cells lane's directory ([`Lane::CellsTarget`]): every cell's target dir,
+/// the wasm modules' builds and the browser sessions' frames live under it.
+#[must_use]
+pub fn cells_dir(ctx: &Ctx) -> PathBuf {
+    ctx.state_dir().join(noindex("cells"))
 }
 
 /// The run's stages: every declared stage the selected checks need
@@ -393,6 +409,47 @@ mod tests {
 
     fn every_check() -> Vec<Check> {
         CHECKS.iter().map(|s| s.check).collect()
+    }
+
+    /// EVERY SIDE LANE IS A `*.noindex` FOLDER Spotlight skips: under the run's
+    /// `<target>/verify` (the caller's `CARGO_TARGET_DIR` moves it), the libc
+    /// oracle's under the checkout whatever the target is; the main lanes share
+    /// the target dir itself.
+    #[test]
+    fn every_side_lane_is_a_folder_spotlight_skips() {
+        for (env, target) in [
+            (EnvSnapshot::default(), PathBuf::from("/repo/target")),
+            (
+                EnvSnapshot {
+                    cargo_target_dir: Some(PathBuf::from("/fast/t")),
+                    ..EnvSnapshot::default()
+                },
+                PathBuf::from("/fast/t"),
+            ),
+        ] {
+            let c = Ctx::new(
+                PathBuf::from("/repo"),
+                Scope::workspace(),
+                env,
+                PathBuf::from("/tmp"),
+            );
+            let lane = |l| lane_dir(&c, l).expect("a directory");
+            for (l, name) in [
+                (Lane::TippyTarget, "tippy.noindex"),
+                (Lane::CheckersTarget, "checkers.noindex"),
+                (Lane::GpuOracleTarget, "gpu-oracle.noindex"),
+                (Lane::TrustTarget, "trust.noindex"),
+                (Lane::CellsTarget, "cells.noindex"),
+            ] {
+                assert_eq!(lane(l), target.join("verify").join(name), "{l:?}");
+            }
+            assert_eq!(
+                lane(Lane::LibcOracleTarget),
+                PathBuf::from("/repo/libc-oracle/target.noindex")
+            );
+            assert_eq!(lane(Lane::MainTarget), target);
+            assert_eq!(lane_dir(&c, Lane::Pure), None);
+        }
     }
 
     /// Each check plans its own stages, nothing else; every combination the

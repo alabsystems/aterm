@@ -197,7 +197,7 @@ impl Lane {
                 "harness card, cursor glow and inline-scroll frames: emission, CPU raster, GPU \
                  encode and GPU time, and the pass-economy ablation"
             }
-            Lane::Wasm => "the shipped wasm modules under node, plus the module-size ceiling",
+            Lane::Wasm => "the shipped wasm modules under node, plus their module-size ceilings",
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
             Lane::Cat => "cat 150 MB ascii + unicode, aterm vs the pinned ghostty tip",
@@ -513,10 +513,23 @@ const OPTIONS: &[OptSpec] = &[
     },
     OptSpec {
         flag: "--durability",
-        value: Some("TIER"),
+        value: Some("TIER,..."),
         lanes: &[Lane::Fabric],
-        help: "the bench broker's tier: strict (default, as aterm opens it) or relaxed (no \
-               fsync: the ceiling arm)",
+        help: "the arms, one run and one ledger entry each, opened with aterm's options: \
+               strict (default), ordered (once per --horizon-ms) and relaxed (no flush: the \
+               ceiling arm)",
+    },
+    OptSpec {
+        flag: "--horizon-ms",
+        value: Some("N,N,..."),
+        lanes: &[Lane::Fabric],
+        help: "the ordered arm's horizons, one run each (default aterm's 100)",
+    },
+    OptSpec {
+        flag: "--passes",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "run the arm list N times, forward then backward: A B B A (default 1)",
     },
     OptSpec {
         flag: "--profile",
@@ -1027,8 +1040,12 @@ mod tests {
         assert_eq!(fabric_args.pingpong, Some(30));
         assert_eq!(fabric_args.json_out, Some(PathBuf::from("/tmp/f.json")));
         assert_eq!(
-            fabric_args.durability.map(|tier| tier.word()),
-            Some("relaxed")
+            fabric_args
+                .arms
+                .iter()
+                .map(|arm| arm.tier.word())
+                .collect::<Vec<_>>(),
+            ["relaxed"]
         );
         // A flag the table gives only to the fabric lane never reaches the
         // arena parser, which has no arm for it.

@@ -133,11 +133,23 @@ impl GlyphStyleMap {
     /// map.
     ///
     /// Roughly based on <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.c#L126>
+    ///
+    /// A face whose `GSUB` walk runs past its budget gets the styles it
+    /// would without the table: none of what the walk reached before the
+    /// cut.
     pub fn new(glyph_count: u32, shaper: &Shaper) -> Self {
         let lookup_count = shaper.lookup_count() as usize;
         // One bit per lookup: the lookups already visited.
         let mut bytes = vec![0u8; lookup_count.div_ceil(8)];
-        Self::new_inner(glyph_count, shaper, VisitedLookupSet::new(&mut bytes))
+        let map = Self::new_inner(glyph_count, shaper, VisitedLookupSet::new(&mut bytes));
+        if !shaper.refused() {
+            return map;
+        }
+        Self::new_inner(
+            glyph_count,
+            &shaper.without_gsub(),
+            VisitedLookupSet::new(&mut []),
+        )
     }
 
     fn new_inner(glyph_count: u32, shaper: &Shaper, mut visited_set: VisitedLookupSet) -> Self {

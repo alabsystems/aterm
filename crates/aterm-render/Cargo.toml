@@ -123,6 +123,9 @@ aterm-font = { workspace = true, features = ["hint"] }
 [dev-dependencies]
 # Base64 encoder for the inline-image (OSC 1337) integration tests.
 aterm-codec = { workspace = true }
+# The child a by-name bundled-font test runs in, with an empty HOME
+# (`bundled::tests::in_private_font_home`); already in the graph under aterm-spec.
+aterm-uds = { workspace = true }
 # The rain_render test drives the shared aterm-effects engines. The dev-dep cycle (effects depends on
 # this crate) is fine — cargo permits dev-dependency cycles. Dev-only: the
 # shipped renderer lib gains no effects dep.
@@ -199,4 +202,11 @@ harness = false
 [[bench]]
 name = "first_frame_per_script"
 path = "benches/first_frame_per_script.rs"
+harness = false
+
+# A measurement, not a gate: how many pages of each mapped Windows font file the
+# font stack's admission, coverage, parse and draw touch. Windows only.
+[[bench]]
+name = "font_residency"
+path = "benches/font_residency.rs"
 harness = false

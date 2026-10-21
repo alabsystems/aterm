@@ -531,10 +531,11 @@ fn cross_row_licences(h: &Host) -> Vec<String> {
 
 /// The shipping single-pane contract: the torn present's hidden write
 /// cursor is not judged as the caret, no licence leaves the composer row,
-/// and the line stays one band. Negative control: with the hidden caret
-/// always handed over (the pre-fix contract), the write cursor is judged as
-/// the caret, the keys in flight license the cross-row moves and the boundary
-/// cells go dark; if that stops reproducing, the fixed take proves nothing.
+/// no foreign-row park is held on it, and the line stays one band. Negative
+/// control: with the hidden caret always handed over (the pre-fix contract),
+/// the write cursor is judged as the caret, the keys in flight license the
+/// cross-row moves and the boundary cells go dark; if that stops reproducing,
+/// the fixed take proves nothing.
 #[test]
 fn a_torn_full_screen_repaint_keeps_the_boundary_space_lit() {
     let pre_fix = take(Contract::HandedOver, 280);
@@ -557,6 +558,11 @@ fn a_torn_full_screen_repaint_keeps_the_boundary_space_lit() {
     assert!(
         off_row.is_empty(),
         "licensed off the composer row: {off_row:?}{rep}"
+    );
+    assert_eq!(
+        h.glow.in_flight_tally().park_returns,
+        0,
+        "the shipping contract never shows the glow the write cursor{rep}"
     );
 }
 

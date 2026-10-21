@@ -29,8 +29,13 @@ aterm-types = { workspace = true }
 # — this binary stays free of third-party dependencies.
 aterm-uds = { workspace = true }
 # The control wire's percent escape (`sessions` titles, `conn`), the one copy
-# the server's `aterm_control::wire::pct_*` re-export. Workspace crate, std-only.
+# the server's `aterm_control::wire::pct_*` re-export. Workspace crate: std plus
+# astream-wire (dependency-free, vendor/astream), so still no third-party crate.
 aterm-codec = { workspace = true }
+# The `edit` request, its ticket replies and `await edit` (`amacs::protocol`),
+# for the `amacs` client's exchanges (`edit`): one grammar with the server.
+# First-party; it brings only first-party crates.
+amacs = { workspace = true }
 
 [dev-dependencies]
 # Scratch directories removed on drop (the tests' sockets live in them).

@@ -12,22 +12,30 @@
 //! answers a connection's writes in the order it read them — and those share
 //! one group-commit flush.
 //!
-//! The price is a rule the client states and cannot enforce: every other
-//! request reads ITS reply as the next frame (`Fetch`, `Last`, `Commit`,
-//! `Will`, `Budget`, `Keepalive`, a blocking `Publish`), so it may be sent only
-//! once every pipelined ack ahead of it has been read. A request sent with an
-//! ack unread would take that ack for its own reply — a `Fetch` that answers
-//! "no rows", a commit that answers some publish's offset.
+//! The price is a rule: every other request reads ITS reply as the next frame
+//! (`Fetch`, `Last`, `Commit`, `Will`, `Budget`, `Keepalive`, a blocking
+//! `Publish`), so it may be sent only once every pipelined ack ahead of it has
+//! been read. A request sent with an ack unread would take that ack for its own
+//! reply — a commit that answers some publish's offset, a `Fetch` that fails on
+//! a reply of the wrong kind and leaves the connection out of step.
 //!
-//! [`Link`] is that rule as a type. It owns the client and the queue of unread
-//! acks, each carrying what its sender wants done with the answer (`T`), and
-//! it hands the client out for a request that reads its own reply only while
-//! the queue is empty ([`Link::ready`]). There is no other way to reach the
-//! client mutably, so a request cannot be sent past an unread ack by a path
-//! that forgot to read it: it finds no connection and fails as an unreachable
-//! broker does. And the queue lives and dies with the connection — a dropped
-//! connection drops the acks owed on it, so they can never be read off the
-//! NEXT connection, which owes them nothing.
+//! Two guards keep it. The FIRST is astream's client: it counts the acks it
+//! owes itself (`Client::owed_acks`) and refuses such a request, sending
+//! nothing, with its typed `AcksOwed` (`astream_broker::client::acks_owed`
+//! reads it back) — a refusal that leaves the connection in step, except for a
+//! subscribe, which consumes its client and so closes the connection.
+//!
+//! The SECOND is [`Link`], the rule as a type, which carries what the client's
+//! bare count cannot. It owns the client and the queue of unread acks, each
+//! carrying what its sender wants done with the answer (`T`, and the riders
+//! hung on it after it was sent), and it hands the client out for a request
+//! that reads its own reply only while the queue is empty ([`Link::ready`]).
+//! There is no other way to reach the client mutably, so a request cannot be
+//! sent past an unread ack by a path that forgot to read it: it finds no
+//! connection and fails as an unreachable broker does, before the client's own
+//! refusal is ever reached. And the queue lives and dies with the connection —
+//! a dropped connection drops the acks owed on it, so they can never be read
+//! off the NEXT connection, which owes them nothing.
 //!
 //! WHAT IT DOES NOT PROMISE is that a refusal is sticky. The broker answers a
 //! connection's writes in order, but a write it refuses for a reason not known
@@ -112,11 +120,17 @@ impl<T> Link<T> {
     /// error: nothing is owed for it. A write that failed part-way latched the
     /// client out of step (astream's `Client::send`), so every later request on
     /// it fails too; one refused before a byte was written (a frame over the
-    /// cap) leaves it in step.
+    /// cap) leaves it in step. `now` is when it was written, on the caller's
+    /// clock (the bridge's door, [`crate::fx::Fx::now`]): the ack's round trip
+    /// is measured from it.
     ///
     /// # Errors
     ///
     /// The send's, with the tag.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one publish's fields, its tag and the instant its caller read off its own clock"
+    )]
     pub fn send(
         &mut self,
         producer_id: u64,
@@ -125,13 +139,14 @@ impl<T> Link<T> {
         subject: &str,
         body: &[u8],
         tag: T,
+        now: Instant,
     ) -> Result<(), (io::Error, T)> {
         match self.client.send_publish(producer_id, seq, subject, body) {
             Ok(()) => {
                 self.unacked.push_back(Unacked {
                     seq,
                     first,
-                    sent: Instant::now(),
+                    sent: now,
                     tag,
                     rider: None,
                 });
@@ -270,7 +285,7 @@ mod tests {
             } else {
                 format!("/f/f/x/{i}")
             };
-            link.send(7, u64::from(i) + 1, true, &subject, b"b", i)
+            link.send(7, u64::from(i) + 1, true, &subject, b"b", i, Instant::now())
                 .map_err(|(e, _)| e)
                 .expect("written");
         }
@@ -333,9 +348,17 @@ mod tests {
     fn a_rider_comes_back_with_the_ack_it_was_hung_on() {
         let (_dir, _server, mut link, _reader) = served();
         let send = |link: &mut Link<u32>, tag: u32| {
-            link.send(7, u64::from(tag), true, &format!("/f/f/r/{tag}"), b"b", tag)
-                .map_err(|(e, _)| e)
-                .expect("written");
+            link.send(
+                7,
+                u64::from(tag),
+                true,
+                &format!("/f/f/r/{tag}"),
+                b"b",
+                tag,
+                Instant::now(),
+            )
+            .map_err(|(e, _)| e)
+            .expect("written");
         };
         assert!(!link.ride(1, |_| true), "nothing owed: nothing to wait on");
         // Even tags are the ones the rider waits on.
@@ -405,12 +428,12 @@ mod tests {
             truncate: false,
         });
         let held = broker.pause_next_acks();
-        link.send(7, 1, true, a, b"a", 'a')
+        link.send(7, 1, true, a, b"a", 'a', Instant::now())
             .map_err(|(e, _)| e)
             .expect("A written");
         assert!(held.wait(), "A's batch was tried and is held unanswered");
         broker.inject_faults(astream_broker::InjectedFaults::default());
-        link.send(7, 2, true, b, b"b", 'b')
+        link.send(7, 2, true, b, b"b", 'b', Instant::now())
             .map_err(|(e, _)| e)
             .expect("B written while A's answer is held");
         held.resume();

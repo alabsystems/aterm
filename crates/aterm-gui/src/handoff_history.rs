@@ -127,9 +127,9 @@
 //! The sidecar is in NEITHER adoption-proof digest and no schema moved: an
 //! older successor skips the record keys and adopts exactly as before (the
 //! outgoing process retires the unread sidecar), and an older outgoing
-//! process names none. A successor OLDER than the running build (a rollback)
-//! is handed no sidecar at all ([`exports_for_target`]): it could not import
-//! one, and would say nothing about the lines it did not get.
+//! process names none. A rollback to a build with no importer is handed no
+//! sidecar at all ([`exports_for_target`]): it could not import one, and
+//! would say nothing about the lines it did not get.
 //!
 //! # Privacy
 //!
@@ -181,10 +181,27 @@ pub(crate) const MAX_AGGREGATE_BYTES: u64 = 1024 * 1024 * 1024;
 /// counted). The launched lane is macOS's.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const EXPORT_PATIENCE: Duration = Duration::from_secs(5);
-/// How long the park waits for an export it stops: the chunk it is reading,
-/// then its last look (at most [`LAST_LOOK_CHUNKS`] per session) — a
-/// millisecond or two on a desk that is not flooding.
+/// How long the park gives an export it stops or pauses: the chunk it is
+/// reading, then its last look (at most [`LAST_LOOK_CHUNKS`] per session) — a
+/// millisecond or two on a desk that is not flooding. A stop waits for it; the
+/// launched lane's pause does not hold the event loop for it, but re-runs the
+/// park until it is answered or this long has passed
+/// ([`HistoryExporter::ask_pause`]).
 pub(crate) const HALT_WAIT: Duration = Duration::from_millis(100);
+
+/// [`HALT_WAIT`] as a park waits it out — the pause before the freeze, the
+/// halt that collects what the export finished: the product constant, which a
+/// loaded debug build misses, so under `cfg(test)` the one-minute hang
+/// detector the park's freeze deadline is stamped from unless the test holds
+/// the real budget (`app_update_handoff::park_budget_for_test`), as the
+/// freeze budget is.
+pub(crate) fn park_halt_wait() -> Duration {
+    #[cfg(all(test, unix))]
+    let wait = crate::app_update_handoff::park_budget_for_test::deadline_budget(HALT_WAIT);
+    #[cfg(not(all(test, unix)))]
+    let wait = HALT_WAIT;
+    wait
+}
 /// How often a FOLLOWING export (the launched lane's) takes the history that
 /// landed since its last look. Between the export's first pass and the park
 /// the successor boots and the gate waits for a quiet moment — seconds, up to
@@ -198,8 +215,8 @@ pub(crate) const FOLLOW_EVERY: Duration = Duration::from_millis(25);
 /// it is caught up over the next ticks, or outruns the join and is counted.
 const FOLLOW_CHUNKS: usize = 8;
 /// Chunks one session's history is followed by in the export's LAST look, as
-/// the park stops it — bounded, because the park waits for it on the main
-/// thread ([`HALT_WAIT`]).
+/// the park stops it — bounded, because the park goes ahead without it after
+/// [`HALT_WAIT`].
 const LAST_LOOK_CHUNKS: usize = 2;
 /// How long the fork lane's worker gives its export, which it runs itself
 /// once the capture is done: every reader is parked by then, so nothing
@@ -523,7 +540,7 @@ enum ExportEvent {
     /// came first).
     Passed,
     /// The worker took its last look for the pause request of this
-    /// generation ([`HistoryExporter::pause`]) and waits, taking no terminal
+    /// generation ([`HistoryExporter::ask_pause`]) and waits, taking no terminal
     /// lock, to be resumed or stopped.
     Paused(u64),
     Done,
@@ -546,18 +563,36 @@ pub(crate) struct ExportResults {
     pub(crate) withheld: bool,
 }
 
+/// Where a pause the park asked stands ([`HistoryExporter::ask_pause`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PauseAnswer {
+    /// The worker paused (or had stopped): it takes no terminal lock until
+    /// the export is resumed or stopped.
+    Paused,
+    /// Asked and not answered yet: the worker is in its last look.
+    Asked,
+    /// Asked the wait or longer ago and still not answered: the park goes
+    /// ahead, and the worker hands over what it finished.
+    Unanswered,
+}
+
 /// The outgoing process's export worker — see the module doc. Dropping it
 /// stops the worker, and every sidecar it wrote that nobody took is removed.
 pub(crate) struct HistoryExporter {
     events: std::sync::mpsc::Receiver<ExportEvent>,
     cancel: Arc<AtomicBool>,
     /// The generation of the pause in force, `0` for none
-    /// ([`Self::pause`], [`Self::resume`]): only the launched lane, macOS's,
+    /// ([`Self::ask_pause`], [`Self::resume`]): only the launched lane, macOS's,
     /// pauses an export.
     #[cfg(any(target_os = "macos", test))]
     pause: Arc<AtomicU64>,
     /// The last pause generation handed out.
     pause_generation: u64,
+    /// When the pause in force was asked ([`Self::ask_pause`]), until the
+    /// export is resumed.
+    #[cfg(any(target_os = "macos", test))]
+    pause_asked_at: Option<std::time::Instant>,
     /// The last pause generation the worker answered.
     paused: u64,
     /// The worker, to wake from its follow tick when it is stopped.
@@ -668,13 +703,13 @@ impl From<Vec<ExportSession>> for ExportSessions {
 /// How one attempt's history is exported — decided per LANE, because the two
 /// lanes park at different moments.
 pub(crate) enum HistoryPlan {
-    /// Nothing is exported: a successor older than this build (it has no
-    /// importer), or no private control dir. Every session keeps the screen
+    /// Nothing is exported: a successor with no importer
+    /// ([`exports_for_target`]), or no private control dir. Every session keeps the screen
     /// carry's bounded history, and the join counts what that leaves behind.
     Unexported,
     /// The launched lane's export, run with every reader live while the
     /// successor booted and FOLLOWING the history until the park paused it
-    /// ([`HistoryExporter::pause`]) before freezing anything. macOS's lane.
+    /// ([`HistoryExporter::ask_pause`]) before freezing anything. macOS's lane.
     #[cfg(any(target_os = "macos", test))]
     Exported(HistoryExporter),
     /// The fork lane's sessions, exported by the worker once the capture is
@@ -782,14 +817,35 @@ impl HistoryPlan {
     }
 }
 
-/// Whether an attempt handing to `target_build` exports history at all: only
-/// to a successor at least as new as this build. An OLDER one (a rollback)
-/// has no importer, would retire the sidecar unread, and could not say what
-/// it did not get.
+/// Whether an attempt handing to `target_build` exports its handed sessions'
+/// history: to a successor at least as new as this build, or to an older one
+/// from [`IMPORTS_HISTORY_FROM_BUILD`] on, which imports this sidecar (round
+/// eight's lead U24: such a rollback lost every tab's scrollback above the
+/// screen carry). A build before it has no importer, would retire the sidecar
+/// unread, and could not say what it did not get.
 #[must_use]
 pub(crate) fn exports_for_target(running_build: u64, target_build: u64) -> bool {
-    target_build >= running_build
+    target_build >= running_build || target_build >= IMPORTS_HISTORY_FROM_BUILD
 }
+
+/// [`exports_for_target`] for a held pane's history, which a successor
+/// imports from [`IMPORTS_HELD_HISTORY_FROM_BUILD`] on.
+#[must_use]
+pub(crate) fn exports_held_for_target(running_build: u64, target_build: u64) -> bool {
+    target_build >= running_build || target_build >= IMPORTS_HELD_HISTORY_FROM_BUILD
+}
+
+/// The first build whose successor imports a handed session's sidecar
+/// (`incoming`): v0.94.0's claim in `RELEASES.ledger`. Every sidecar this
+/// build writes is one it reads: the same magic, header, frames and stamp,
+/// and no record over the frame decode's caps ([`strip_over_cap_links`]),
+/// which v0.94.0 through v0.97.0 refused whole. Its import fails soft: a
+/// sidecar it cannot take costs its lines, counted, never the adoption.
+const IMPORTS_HISTORY_FROM_BUILD: u64 = 1_790_526_323;
+
+/// The first build whose successor imports a held pane's sidecar
+/// (`incoming_held`): v0.101.0's claim in `RELEASES.ledger`.
+const IMPORTS_HELD_HISTORY_FROM_BUILD: u64 = 1_791_501_389;
 
 impl HistoryExporter {
     /// Start exporting `sessions` into `dir`, on a worker of its own. With
@@ -866,6 +922,8 @@ impl HistoryExporter {
             #[cfg(any(target_os = "macos", test))]
             pause,
             pause_generation: 0,
+            #[cfg(any(target_os = "macos", test))]
+            pause_asked_at: None,
             paused: 0,
             worker,
             #[cfg(test)]
@@ -980,36 +1038,71 @@ impl HistoryExporter {
         self.done
     }
 
-    /// PAUSE the worker and wait up to `wait` for it to say it has — what
-    /// the launched lane's park runs before it freezes anything. Like
-    /// [`Self::halt`] the worker finishes (or drops, to redo) the chunk it is
-    /// reading, takes one bounded last look, and then takes no terminal lock;
-    /// unlike it, the export is not over. A park that lands hands it over as
-    /// it stands ([`Self::finish`] stops it then, taking no further look). A
-    /// park that misses — or returns before the capture for any reason —
-    /// RESUMES it ([`Self::resume`]) with the readers, so the re-park joins
-    /// an export that followed the history through the retry delay instead of
-    /// one stopped where the first attempt stopped it (round six of the update
+    /// PAUSE the worker, WITHOUT WAITING for it — what the launched lane's
+    /// park asks before it freezes anything, and asks again on each of its
+    /// runs until the worker answers ([`PauseAnswer`]). Like [`Self::halt`]
+    /// the worker finishes (or drops, to redo) the chunk it is reading, takes
+    /// one bounded last look, and then takes no terminal lock; unlike it, the
+    /// export is not over. A park that lands hands it over as it stands
+    /// ([`Self::finish`] stops it then, taking no further look). A park that
+    /// misses — or returns before the capture for any reason — RESUMES it
+    /// ([`Self::resume`]) with the readers, so the re-park joins an export
+    /// that followed the history through the retry delay instead of one
+    /// stopped where the first attempt stopped it (round six of the update
     /// audit, finding 14: a tab printing more than the screen carry's lines
-    /// in that delay lost its whole exported history to `Outrun`). `true`
-    /// when the worker answered (or had already stopped).
+    /// in that delay lost its whole exported history to `Outrun`).
+    ///
+    /// THE LAST LOOK IS THE WORKER'S TIME, NOT THE EVENT LOOP'S (round eight
+    /// of the update audit, U20). The park used to wait here for the answer,
+    /// up to [`HALT_WAIT`], at every park and so at every one of the free
+    /// mid-sequence re-parks of a flood: on a desk of 32 flooding tabs each
+    /// wait was 10–20 ms of an event loop that drew nothing. Asked again
+    /// before it is answered, the pause is the same pause: the worker's one
+    /// last look answers it. `wait` is how long after the ask the park stops
+    /// asking and goes ahead ([`PauseAnswer::Unanswered`]).
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn pause(&mut self, wait: Duration) -> bool {
-        self.pause_generation = self.pause_generation.wrapping_add(1).max(1);
-        let generation = self.pause_generation;
-        self.pause.store(generation, Ordering::Release);
-        self.worker.unpark();
-        self.drain_while(std::time::Instant::now() + wait, |export| {
-            export.paused != generation
-        });
-        self.done || self.paused == generation
+    pub(crate) fn ask_pause(&mut self, wait: Duration) -> PauseAnswer {
+        let asked_at = if let Some(asked_at) = self.pause_asked_at {
+            asked_at
+        } else {
+            self.pause_generation = self.pause_generation.wrapping_add(1).max(1);
+            self.pause.store(self.pause_generation, Ordering::Release);
+            self.worker.unpark();
+            *self.pause_asked_at.insert(std::time::Instant::now())
+        };
+        self.poll();
+        if self.done || self.paused == self.pause_generation {
+            PauseAnswer::Paused
+        } else if asked_at.elapsed() >= wait {
+            PauseAnswer::Unanswered
+        } else {
+            PauseAnswer::Asked
+        }
     }
 
-    /// Undo [`Self::pause`]: the worker goes on following each history (and
+    /// Whether a pause is asked and the export not resumed since: the park
+    /// that asked it passed its gate, and re-runs past it until the answer.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn pause_asked(&self) -> bool {
+        self.pause_asked_at.is_some()
+    }
+
+    /// [`Self::ask_pause`], then wait up to `wait` for the answer. `true`
+    /// when the worker answered (or had already stopped).
+    #[cfg(test)]
+    pub(crate) fn pause(&mut self, wait: Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        self.ask_pause(wait);
+        self.drain_while(deadline, |export| export.paused != export.pause_generation);
+        self.done || self.paused == self.pause_generation
+    }
+
+    /// Undo [`Self::ask_pause`]: the worker goes on following each history (and
     /// finishes a first pass the pause interrupted). Nothing when no pause is
     /// in force; a worker that never answered the pause simply never waits.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn resume(&mut self) {
+        self.pause_asked_at = None;
         if self.pause.swap(0, Ordering::AcqRel) != 0 {
             self.worker.unpark();
         }
@@ -1040,7 +1133,7 @@ impl HistoryExporter {
     fn finish_by(mut self, deadline: std::time::Instant) -> ExportResults {
         self.drain_until(deadline);
         if !self.done {
-            self.halt(HALT_WAIT);
+            self.halt(park_halt_wait());
         }
         // Without following, each handed session's export was handed over as
         // its pass finished, every one of them by `CaughtUp`.
@@ -1069,17 +1162,16 @@ pub(crate) fn park_wait(exporting: bool, held_for: Duration) -> Option<&'static 
 }
 
 /// A terminal's lock, taken on the export and import workers. A poisoned
-/// lock's data is still the data.
+/// lock's data is still the data. It is a [`crate::TermGuard`] hold, so an
+/// import's attach, which moves the screen generation, rings the session's
+/// screen readers as the hold ends.
 fn locked<T>(term: &Mutex<Terminal>, read: impl FnOnce(&mut Terminal) -> T) -> T {
-    let mut guard = term
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read(&mut guard)
+    read(&mut crate::term_lock(term))
 }
 
 /// What the export worker is asked to stop for: `cancel` ends it, a non-zero
 /// `pause` generation parks it after one last look until it is resumed
-/// ([`HistoryExporter::pause`]).
+/// ([`HistoryExporter::ask_pause`]).
 #[derive(Clone, Copy)]
 struct Stop<'a> {
     cancel: &'a AtomicBool,
@@ -1316,8 +1408,8 @@ impl Worker<'_> {
                 due = std::time::Instant::now() + FOLLOW_EVERY;
             }
             // The last look, as the park stops or pauses it: what landed since
-            // the last tick, bounded (the park waits for it on the main
-            // thread). A held pass still running is not taken further.
+            // the last tick, bounded (the park goes ahead without it after
+            // `HALT_WAIT`). A held pass still running is not taken further.
             self.follow_tick(LAST_LOOK_CHUNKS, false)?;
             if self.stop.cancelled() {
                 break;
@@ -2114,7 +2206,7 @@ impl ExportResults {
     /// records — never sees them; and why a held pane with none has none
     /// ([`HeldExports::unexported`]): the policy's withholding, as the handed
     /// records say it; else `older_successor` when the attempt hands to a
-    /// build older than this one ([`exports_for_target`] false); else a
+    /// build with no held importer ([`exports_held_for_target`] false); else a
     /// failure.
     pub(crate) fn take_held(&mut self, held: &[u64], older_successor: bool) -> HeldExports {
         let (exports, kept) = std::mem::take(&mut self.exports)
@@ -2154,8 +2246,8 @@ impl ExportResults {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldLoss {
     /// BY DESIGN: the hop carries a held pane's screen alone — a successor
-    /// older than this build has no held importer ([`exports_for_target`]),
-    /// so nothing was exported for it. Said as a held pane's
+    /// older than this build may have no held importer
+    /// ([`exports_held_for_target`]), so nothing was exported for it. Said as a held pane's
     /// ([`AdoptedHistory::held`]).
     ScreenOnly,
     /// BY REQUEST: the successor's signed handoff policy carries no
@@ -2227,7 +2319,7 @@ pub(crate) struct HeldHistory {
 /// its held capture took, exactly as [`join`] joins a session's — the screen
 /// carrying no line of it — and linked to `named`, its attempt-bound name
 /// `<dir>/seamless-<pid>-<nonce>.h<id>.hist` (the `h` keeps it apart from a
-/// session's `.s<id>.hist`). No export (a successor older than this build,
+/// session's `.s<id>.hist`). No export (a successor with no held importer,
 /// a policy that carries no scrollback, an export that had not reached it), a
 /// fence that moved (a resize rewrapped it) or a link that cannot be made
 /// leaves the lines behind, counted, with WHY ([`HeldLoss`]): with no export,

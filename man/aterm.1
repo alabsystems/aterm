@@ -381,15 +381,16 @@ connections
 and discovery
 .RB ( ls ", " instances ", " windows ", " mux ).
 .PP
-With
-.B "[session_log] clause = true"
-(off by default), a terminal tab's tooltip and context menu add one
+A terminal tab's tooltip and context menu add one
 .B now:
 line saying what its session log says the session is doing
-.RB ( "now: running shell" ", " "now: approval \(pc bash" ,
-or a label the harness or you set; never a label another program set with
-.BR mark ).
-Off, they are as before.
+.RB ( "now: running shell" ", " "now: approval \(pc bash" ", " "now: limit \(pc resets 14:05" );
+while the tab needs you, that comes first, and a label another program set with
+.B mark
+never shows there.
+The tab's name is unchanged.
+.B "[session_log] clause = false"
+turns the line off, and the tooltip and menu are then as before.
 .PP
 .B aterm ctl
 exits 0 on
@@ -456,18 +457,22 @@ is
 (Windows).
 .TP
 .I <logs>/session\-log/
-The session journal, only with
-.B "[session_log] journal = true"
-(off by default; macOS and Linux): each session's log as
+The session journal (on by default on macOS and Linux, while
+.B restore_session
+is on; a headless instance keeps none;
+.B "[session_log] journal = false"
+turns it off): each session's log as
 .IB <instance> . <n> .slog
-segments, 0600 in a 0700 folder, at most 64 MiB and 2048 files, the oldest
-deleted first, so
+segments, 0600 in a 0700 folder, the oldest deleted first to keep it near
+64 MiB and 2048 files (files a running instance is still writing can hold it
+above that), so
 .B aterm ctl log @<sid>
 answers for a session from an earlier run. It keeps each command's first word
 as typed (so a secret typed at a prompt and run is kept too), the session's
 folder, its meta values (an attention text only as a fingerprint) and mail's
 senders and recipients; never a command's arguments, an OSC title, a mail's
-body or an agent's transcript text. Off, nothing is created there.
+body or an agent's transcript text. Off, nothing is created there, and
+nothing already there is deleted.
 .SH EXAMPLES
 .nf
 aterm                                  # an interactive shell

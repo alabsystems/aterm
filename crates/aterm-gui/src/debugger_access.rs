@@ -2161,7 +2161,8 @@ enum OnDisk {
 /// This Mac in the asked record, as the launch ask reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostAsked {
-    /// The host key is not read yet: it is read once, off the event loop.
+    /// The host key is not read yet, or the record not read for it: each is
+    /// read once, off the event loop.
     Cold,
     /// The kernel names no host, so no record could be keyed to this Mac.
     Unnamed,
@@ -2629,7 +2630,7 @@ impl DebuggerChangeLane {
 /// The App's launch ask: queued on a windowed macOS instance until it asks,
 /// settles or drops, with the park's next look. It holds the host-key reader
 /// (injected; the live one, `host_uuid_if_warm`, never makes a syscall) and the
-/// record's answer for this Mac, read once.
+/// record's answer for this Mac, read once, off the event loop.
 #[derive(Debug)]
 pub(crate) struct LaunchAskQueue {
     queued: bool,
@@ -2639,8 +2640,12 @@ pub(crate) struct LaunchAskQueue {
     /// The host key's read off the event loop: `None` until it is started, then
     /// whether it has ended.
     host_read: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// The record's answer, as read for a host.
-    asked: Option<(&'static str, bool)>,
+    /// The record's read for a host: `None` until it is started, then its
+    /// answer once it has ended.
+    asked: Option<(&'static str, Arc<std::sync::OnceLock<bool>>)>,
+    /// Where the record is read: on a thread of its own (a launch's), or on
+    /// the asking thread (a test's stand-in, beside its stand-in host key).
+    record_read: RecordRead,
     /// What the last look waited on.
     waiting: Option<AskWait>,
     /// When the first offer this process was refused before anything was
@@ -2656,6 +2661,21 @@ pub(crate) struct LaunchAskQueue {
 /// warm-up, which waits while the ask is queued, for longer.
 pub(crate) const REFUSED_FOR: Duration = Duration::from_secs(5 * 60);
 
+/// Where [`LaunchAskQueue`] reads the record ([`LaunchAskQueue::start_record_read`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordRead {
+    /// On a thread of its own, which wakes the window when it has the answer:
+    /// the record lives beside `aterm.toml`, in the home folder, and a home on
+    /// a network volume that stopped answering held the window on this read —
+    /// every key, frame and control verb — until the server came back
+    /// (measured in a macOS 27 guest, 2026-10-20: a `call_main` verb waited
+    /// out its 30 s twice).
+    Thread,
+    /// On the asking thread: a test's stand-in, as its host key is.
+    #[cfg(test)]
+    Inline,
+}
+
 impl LaunchAskQueue {
     /// Queued when `queued` (a windowed macOS instance), with the live host key.
     pub(crate) fn new(queued: bool) -> Self {
@@ -2665,23 +2685,26 @@ impl LaunchAskQueue {
             host: aterm_containment::consent::host_uuid_if_warm,
             host_read: None,
             asked: None,
+            record_read: RecordRead::Thread,
             waiting: None,
             refused_since: None,
         }
     }
 
-    /// A queued ask with a stand-in host key whose read has ended.
+    /// A queued ask with a stand-in host key whose read has ended, its record
+    /// read on the asking thread.
     #[cfg(test)]
     pub(crate) fn queued_for_test(host: fn() -> Option<&'static str>) -> Self {
         Self {
             host,
             host_read: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            record_read: RecordRead::Inline,
             ..Self::new(true)
         }
     }
 
     /// A queued ask with a stand-in host key whose read is out, ended once
-    /// `done` is set.
+    /// `done` is set, its record read on the asking thread.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn reading_host_for_test(
         host: fn() -> Option<&'static str>,
@@ -2690,7 +2713,19 @@ impl LaunchAskQueue {
         Self {
             host,
             host_read: Some(done),
+            record_read: RecordRead::Inline,
             ..Self::new(true)
+        }
+    }
+
+    /// A queued ask with a stand-in host key whose read has ended, its record
+    /// read off the asking thread as a launch's is. Only macOS's access-refresh
+    /// tests ask for one.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn reading_record_for_test(host: fn() -> Option<&'static str>) -> Self {
+        Self {
+            record_read: RecordRead::Thread,
+            ..Self::queued_for_test(host)
         }
     }
 
@@ -2761,16 +2796,32 @@ impl LaunchAskQueue {
             .is_some_and(|done| done.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// Whether the record names `host` ([`read_asked`]), read once per process.
-    pub(crate) fn asked(&mut self, config_path: &Path, host: &'static str) -> bool {
-        match self.asked {
-            Some((read_for, asked)) if read_for == host => asked,
-            _ => {
-                let asked = read_asked(config_path, host);
-                self.asked = Some((host, asked));
-                asked
-            }
+    /// Whether the record names `host` ([`read_asked`]): `None` until its
+    /// read, once per process ([`Self::start_record_read`]), has ended.
+    pub(crate) fn asked(&self, host: &'static str) -> Option<bool> {
+        self.asked
+            .as_ref()
+            .filter(|(read_for, _)| *read_for == host)
+            .and_then(|(_, answer)| answer.get().copied())
+    }
+
+    /// The record's read for `host`, the first time it is asked for that host:
+    /// `Some((slot, where))` — the caller reads [`read_asked`] into `slot`,
+    /// where `where` says — and `None` once it is out or done.
+    pub(crate) fn start_record_read(
+        &mut self,
+        host: &'static str,
+    ) -> Option<(Arc<std::sync::OnceLock<bool>>, RecordRead)> {
+        if self
+            .asked
+            .as_ref()
+            .is_some_and(|(read_for, _)| *read_for == host)
+        {
+            return None;
         }
+        let slot = Arc::new(std::sync::OnceLock::new());
+        self.asked = Some((host, Arc::clone(&slot)));
+        Some((slot, self.record_read))
     }
 
     /// The ask is over for this process.
@@ -5068,10 +5119,28 @@ mod tests {
         assert!(queue.wait(AskWait::BehindPage, now + RESULT_RECHECK));
         let dir = scratch("queue");
         let config = dir.join("aterm.toml");
-        assert!(!queue.asked(&config, "MAC-A"));
+        assert_eq!(queue.asked("MAC-A"), None, "not read yet");
+        let (slot, read) = queue.start_record_read("MAC-A").expect("the first time");
+        assert_eq!(read, RecordRead::Inline, "a stand-in reads where it asks");
+        assert!(queue.start_record_read("MAC-A").is_none(), "out already");
+        assert_eq!(queue.asked("MAC-A"), None, "out, not ended");
+        let _ = slot.set(read_asked(&config, "MAC-A"));
+        assert_eq!(queue.asked("MAC-A"), Some(false));
         note_asked(&config, "MAC-A", 1).unwrap();
-        assert!(!queue.asked(&config, "MAC-A"), "read once per process");
-        assert!(queue.asked(&config, "MAC-B") == read_asked(&config, "MAC-B"));
+        assert_eq!(queue.asked("MAC-A"), Some(false), "read once per process");
+        assert_eq!(
+            queue.asked("MAC-B"),
+            None,
+            "another host's line is its own read"
+        );
+        assert!(queue.start_record_read("MAC-B").is_some());
+        assert_eq!(
+            LaunchAskQueue::new(true)
+                .start_record_read("MAC-A")
+                .map(|(_, read)| read),
+            Some(RecordRead::Thread),
+            "a launch reads it off the event loop"
+        );
         queue.end();
         assert!(!queue.queued() && !queue.due(now + RESULT_RECHECK));
         assert_eq!(queue.next_deadline(), None);

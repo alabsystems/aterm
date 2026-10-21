@@ -578,9 +578,6 @@ fn a_band_painted_over_a_bidi_row_drops_its_map() {
 /// row below the top-anchored band.
 #[test]
 fn highlight_all_maps_scrollback_current_below_top_bar() {
-    // Pushes matches into scrollback: serialize against the test that lowers the
-    // process-global search cap.
-    let _serial = crate::control::search_cap_test_guard();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let rows = app.windows.get(&wid).unwrap().rows as usize;
@@ -1338,8 +1335,6 @@ fn find_bar_default_top_sits_below_tab_strip() {
 /// selected (ready for ⌘C), and remembers the query for empty-query recall.
 #[test]
 fn accept_keeps_viewport_and_remembers_query() {
-    // Pushes matches into scrollback — serialize against the search-cap mutation test.
-    let _serial = crate::control::search_cap_test_guard();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let rows = app.windows.get(&wid).unwrap().rows as usize;
@@ -1523,7 +1518,6 @@ fn accepted_anchor_keeps_the_revision_its_match_was_computed_in() {
 
 #[test]
 fn active_search_defers_then_recomputes_after_codex_footer_row_splice() {
-    let _serial = crate::control::search_cap_test_guard();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let rows = app.windows[&wid].rows;
@@ -1585,7 +1579,6 @@ fn active_search_defers_then_recomputes_after_codex_footer_row_splice() {
 /// does not remember the cancelled query.
 #[test]
 fn cancel_restores_origin_viewport() {
-    let _serial = crate::control::search_cap_test_guard();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let rows = app.windows.get(&wid).unwrap().rows as usize;
@@ -2489,7 +2482,10 @@ fn the_windows_bar_lays_its_fluent_face_over_the_band() {
             rows.clone().all(|row| !laid(input, row)),
             "CONTROL: no face off Windows"
         );
-        return;
+        if !crate::find_bar::FIND_TOOLBAR {
+            return;
+        }
+        aterm_spec::host::could_not_run("no system UI face here for the strip band");
     }
     for row in rows.clone() {
         let images = &input.images[row];
@@ -2554,8 +2550,11 @@ fn a_press_in_the_fluent_box_lands_on_the_character_under_the_pointer() {
     let wid = WindowId(0);
     let query = "needle in the hay";
     let mut app = painted_with_faces(true, b"a needle in the haystack\r\n", query);
-    if !crate::find_bar::FIND_TOOLBAR || !crate::tray_raster::strip_band_ui_ready() {
+    if !crate::find_bar::FIND_TOOLBAR {
         return;
+    }
+    if !crate::tray_raster::strip_band_ui_ready() {
+        aterm_spec::host::could_not_run("no system UI face here for the strip band");
     }
     let hit = app.windows[&wid].find_bar_hit.clone().expect("geometry");
     let (cell_w, cell_h) = app.win_cell_size(wid);

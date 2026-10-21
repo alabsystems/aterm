@@ -22,13 +22,14 @@ use std::time::{Duration, Instant};
 use aterm_phase::wall::WallKind;
 use aterm_phase::{LoginScreen, Program};
 
+use super::super::background::BackgroundCall;
 use super::super::config::SupervisorConfig;
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    Composer, ContextFill, RULE_LOGIN, RenewStep, TurnEndAction, TurnEndReading, TurnEndState,
-    bucket_model, decide_turn_end, login_wall_moves, login_wall_waits, renew_step, sign_in_how,
-    waited_login,
+    AccountAdvice, Composer, ContextFill, RULE_LOGIN, RenewStep, RosterWord, TurnEndAction,
+    TurnEndReading, TurnEndState, bucket_model, decide_turn_end, login_wall_moves,
+    login_wall_waits, renew_step, sign_in_how, waited_login,
 };
 
 /// Whether the person is needed now or only when they next look.
@@ -90,7 +91,21 @@ impl Exception {
         why: Option<&str>,
         clears: &'static str,
     ) -> Self {
-        let filled = text.fill(label, why);
+        Self::of_notice_reset(text, label, why, None, clears)
+    }
+
+    /// [`Self::of_notice`] for a usage limit whose reset is known and past
+    /// which aterm continues the tab: `reset` (`on Oct 23 at 9am`) fills
+    /// the expectation that names it ([`NoticeText::fill_reset`]).
+    #[must_use]
+    pub fn of_notice_reset(
+        text: &NoticeText,
+        label: Option<&str>,
+        why: Option<&str>,
+        reset: Option<&str>,
+        clears: &'static str,
+    ) -> Self {
+        let filled = text.fill_reset(label, why, reset);
         Self {
             kind: ExceptionKind::Login,
             when: Urgency::Now,
@@ -102,8 +117,12 @@ impl Exception {
                 id: text.id,
                 code: text.code,
                 title: text.title,
+                short_title: text.short_title,
                 did: filled.did,
                 expect: filled.expect,
+                command: filled.command,
+                short: filled.short,
+                undo: filled.undo,
             }),
         }
     }
@@ -124,6 +143,32 @@ impl Exception {
             why: "the screen reads busy, Claude's title says idle, and nothing here explains it"
                 .to_string(),
             action: "Open the tab and type keep going".to_string(),
+            clears: "the screen moving on, or the agent working",
+            escalated: false,
+            notice: None,
+        }
+    }
+
+    /// THE BACKGROUND CALL THAT MAKES NO PROGRESS (the canary's third rung
+    /// where the host's jobs reading explains the screen,
+    /// `wall_memory::Session::stuck_busy_note`; the hung-call design's R1):
+    /// the agent waits on a call of its own that has made no progress since
+    /// the canary's `STALLED`, one unit ago. The fact is the why
+    /// ([`BackgroundCall::why`], template words only, the digest's 90
+    /// characters), never "nothing here explains it". The one thing to do is
+    /// to tell the agent, which started the call and alone knows whether to
+    /// end it (the hung-call design §4: aterm ends nothing on a timer). Not
+    /// raised by [`exception_for`]; `Later`, as [`Self::stalled`].
+    #[must_use]
+    pub fn no_progress(call: &BackgroundCall) -> Self {
+        Self {
+            kind: ExceptionKind::Stalled,
+            when: Urgency::Later,
+            why: call.why(),
+            action: format!(
+                "Tell the agent in the tab that pid {} makes no progress",
+                call.pid
+            ),
             clears: "the screen moving on, or the agent working",
             escalated: false,
             notice: None,
@@ -507,6 +552,269 @@ fn login_text(program: Program, message: &str) -> (&'static str, String, &'stati
 /// What ends a lost login's notice: the login back, or the agent working.
 const LOGIN_CLEARS: &str = "`Login successful` on the screen, or the agent working";
 
+/// How far off a weekly usage limit's reset must be before a tab with no
+/// account rotation available raises [`notice::LIMIT_SIGN_IN`] (above a 5-hour
+/// session window).
+const WEEKLY_LIMIT_NOTICE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// CLAUDE CODE'S USAGE LIMIT WITH NO ACCOUNT ROTATION AVAILABLE, OR A
+/// PERSON'S `/login` AT A USAGE LIMIT: when Claude Code hits a multi-day
+/// weekly usage limit (`reset_at` > 6 hours away) and the account roster has
+/// no move, wait, or resume to offer (`reading.advised().is_none()`), the
+/// owner is told so the tab does not sit silent for days — what to do
+/// chosen by WHOSE THE LOGIN IS ([`TurnEndReading::roster`], the review's
+/// acct-1 and acct-7):
+///
+/// * no roster row's ([`RosterWord::Unlisted`], or no word): `/login` in the
+///   tab with another account ([`notice::LIMIT_SIGN_IN`]);
+/// * a roster row's: NEVER `/login` in the tab — it would sign another
+///   account into that row's own login, and every session on it would
+///   follow — but the owner's `accounts use` of another row ready to run now
+///   that the roster does not move the tab onto by itself
+///   ([`notice::LIMIT_USE`]; nothing where it does, [`limit_roster_step`]);
+///   else the sign-in by name of the first other row
+///   not signed in ([`notice::LIMIT_RENEW`], [`notice::LIMIT_LOGIN`]), after
+///   which the tab moves by itself — or, where the roster holds the tab at
+///   this limit, aterm names the next step ([`limit_roster_step`]); with no
+///   such row, the roster report ([`notice::LIMIT_ROSTER`]). Each of the
+///   first three promises a switch, so each is told only where one can
+///   follow ([`limit_switch`]): where the owner's aterm.toml keeps aterm from
+///   switching the tab, the lines that let it ([`notice::LIMIT_STAY`]);
+///   where nothing here relaunches the tab at all, the roster report;
+/// * not known, the roster refused or the state unread
+///   ([`RosterWord::Unread`]): the roster report ([`notice::LIMIT_UNREAD`]).
+///
+/// The roster's reports say the session continues by itself only where
+/// aterm continues it past the reset (`resume_limits`; else
+/// [`notice::LIMIT_ROSTER_KEPT`], [`notice::LIMIT_UNREAD_KEPT`]).
+///
+/// A MULTI-DAY WAIT THE ROSTER ADVISES (an [`AccountAdvice::Wait`] past the
+/// same 6 hours) on a roster row with another row to sign in is told the
+/// same sign-in by name (the review's acct-4: a synced row never signed in
+/// left the tab waiting silently for days). While the owner is in `/login`
+/// at a usage limit, its failure is surfaced just like a lost login's, and
+/// its cancellation as the limit's own notice — the roster's step on a
+/// roster row, else the sign-in to another account ([`notice::LIMIT_SIGN_IN`];
+/// the review of the login carry, r5h-4: told a lost login's "sign in again",
+/// the owner signed the same account in, whose limit still stood).
+fn claude_limit_login(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+) -> Option<Option<Exception>> {
+    let far = now + WEEKLY_LIMIT_NOTICE_AFTER;
+    let roster_step = limit_roster_step(
+        reading.roster.as_ref(),
+        limit_switch(reading, cfg),
+        cfg.resume_limits,
+        state.account_refused(),
+    );
+    let waits_on_sign_in =
+        matches!(
+            reading.advised(),
+            Some(AccountAdvice::Wait { until }) if *until > far
+        ) && matches!(reading.roster, Some(RosterWord::Row { next: Some(_), .. }));
+    if !super::login::carried(reading.program)
+        || state.wall_attempts(WallKind::UsageWeekly).is_none()
+        || (reading.advised().is_some() && !waits_on_sign_in)
+        || reading.taskless
+        || state.task_done()
+    {
+        return None;
+    }
+    // WHEN IT ENDS BY ITSELF: under `resume_limits` aterm continues the tab
+    // past the limit's reset whatever the owner does, so a limit's notice
+    // names the reset where its notice says one (the review of the band,
+    // 2026-10-20: the notices never said when, or that the tab goes on).
+    let reset = reading
+        .reset_clock
+        .filter(|_| {
+            cfg.resume_limits
+                && reading.wall == Some(WallKind::UsageWeekly)
+                && reading.reset_at.is_some_and(|at| at > now)
+        })
+        .map(|clock| clock.words());
+    let told = |step: Option<LimitStep<'_>>| {
+        Some(step.map(|(text, label, why)| {
+            Exception::of_notice_reset(text, label, why, reset.as_deref(), LOGIN_CLEARS)
+        }))
+    };
+    match &reading.login_screen {
+        // The person's own `/login`, theirs as they go through it — Console's
+        // menu included, which they chose and nothing stopped (as at a lost
+        // login, [`claude_login`]).
+        Some(
+            LoginScreen::Success { .. }
+            | LoginScreen::Picker(_)
+            | LoginScreen::ConsoleMenu
+            | LoginScreen::Browser,
+        ) => {
+            return Some(None);
+        }
+        Some(LoginScreen::Failed) => {
+            return told(Some((&notice::LOGIN_STOPPED, None, None)));
+        }
+        None => {}
+    }
+    // No row is the login's: a sign-in in the tab — to ANOTHER account,
+    // whatever `/login` left before it (r5h-4: the same account signed in
+    // again meets the same limit).
+    let sign_in = || Some((&notice::LIMIT_SIGN_IN, None, None));
+    if reading.login_interrupted || state.login_cancelled_on_limit() {
+        return told(roster_step.unwrap_or_else(sign_in));
+    }
+    if cfg.resume_limits
+        && reading.wall == Some(WallKind::UsageWeekly)
+        && reading.reset_at.is_some_and(|at| at > far)
+    {
+        return told(roster_step.unwrap_or_else(sign_in));
+    }
+    None
+}
+
+/// WHETHER ANOTHER ACCOUNT CAN TAKE THIS TAB OVER AT ITS USAGE LIMIT, as
+/// [`limit_roster_step`] needs it (the review of the login carry, r3h-2):
+/// `Ok` where a switch can follow the owner's step — the rotation on, and a
+/// relaunch that reaches the tab (`relaunch` and `resume_limits` on, Claude
+/// Code, a host that relaunches it or an upgrade holding the point for now:
+/// what `super::turn_end::account_rotates` asks of a move, a draft and a
+/// refused relaunch aside, which pass); `Err(Some(lines))` where the owner's
+/// aterm.toml keeps aterm from switching it, with EVERY line of its
+/// `[harness]` table that does ([`notice::stay_why`]: `accounts` off,
+/// `relaunch` off, `resume_limits` off, named together — the review of the
+/// login carry, r4h-2: named one at a time, the line the notice named was
+/// set and the next notice named another); `Err(None)` where nothing here
+/// relaunches the tab whatever aterm.toml says. The owner's `relaunch` is
+/// the host's where it reads the key live (`super::turn_end::relaunch_on`,
+/// r4h-1: the loop's config always said `true`). PURE.
+fn limit_switch(
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+) -> Result<(), Option<&'static str>> {
+    if !super::turn_end::relaunch_lane(reading) {
+        return Err(None);
+    }
+    match notice::stay_why(
+        cfg.accounts == crate::harness::accounts::Mode::Off,
+        !super::turn_end::relaunch_on(reading, cfg),
+        !cfg.resume_limits,
+    ) {
+        Some(lines) => Err(Some(lines)),
+        None => Ok(()),
+    }
+}
+
+/// A notice a usage limit's tab is told ([`limit_roster_step`]): the text,
+/// the label it names and its `{why}`.
+type LimitStep<'a> = (&'static NoticeText, Option<&'a str>, Option<&'static str>);
+
+/// The notice a usage limit's tab is told where its login is a roster row's,
+/// or whose it is is not known ([`claude_limit_login`]), with the label it
+/// names and its `{why}`; `None` where no row is the login's and a sign-in in
+/// the tab is the owner's way on ([`RosterWord::Unlisted`], or no word).
+/// Another row ready to run now comes first ([`notice::LIMIT_USE`], its
+/// `{why}` what holds the tab where it is: `super::turn_end::HeldBy`): the tab
+/// is told to go there, never that no listed account can take over
+/// (acct3-5). A step whose expectation is a switch — that, or another row's
+/// sign-in by name — is told only where one can follow (`switch`,
+/// [`limit_switch`]; r3h-2: under `accounts = "off"` the owner ran `accounts
+/// use`, which pinned the account, the tab never moved and the notice asked
+/// again): where aterm.toml keeps the tab where it is, the lines that let it
+/// switch ([`notice::LIMIT_STAY`], naming the row it could switch to); where
+/// nothing here relaunches the tab, the roster report.
+///
+/// A SWITCH BY ITSELF IS PROMISED ONLY WHERE THE ROSTER MAKES ONE (the
+/// review of the login carry, r4h-4): where its own advice holds the tab at
+/// this limit even once another row is ready (the row's `held`: a limit from
+/// before this Claude Code started, the owner's pin, a limit reset kept), a
+/// sign-in by name, and the lines of aterm.toml, are told with an
+/// expectation that names the next step instead ([`notice::LIMIT_RENEW_HELD`],
+/// [`notice::LIMIT_LOGIN_HELD`], [`notice::LIMIT_STAY_HELD`]) — the sign-in
+/// leads to [`notice::LIMIT_USE`]. So are the lines of aterm.toml where no
+/// row is ready yet (r5h-2): with them set, the next step is that row's
+/// sign-in, not a switch. And where aterm continues nothing past the
+/// limit's reset (`resumes` false: `resume_limits` off, at a person's
+/// `/login` left at the limit), the roster's two reports say so
+/// ([`notice::LIMIT_ROSTER_KEPT`], [`notice::LIMIT_UNREAD_KEPT`]; r4h-3:
+/// they said the session continues by itself once an account is ready).
+///
+/// A READY ROW NOTHING HOLDS THE TAB OFF IS THE ROSTER'S OWN MOVE (`held`
+/// `None`; r5h-3): advised, it is that move and no notice stands; where the
+/// point was not asked about — a person's draft, an upgrade holding it, or
+/// read in the moment before the advice — the move follows once it is, and
+/// nothing is told (`Some(None)`): never the limit from before this Claude
+/// Code, which this process may well have hit itself, nor a pin of every
+/// session that the roster's own move makes needless. A relaunch onto it the
+/// host refused (`refused`, [`TurnEndState::account_refused`]) is the
+/// rotation FAILED, and told as the ready row's `accounts use` naming that
+/// cause ([`notice::WHY_USE_UNMADE`]): the step is the accounts' news that
+/// ends the refusal, and the move is asked again. PURE.
+fn limit_roster_step<'a>(
+    word: Option<&'a RosterWord>,
+    switch: Result<(), Option<&'static str>>,
+    resumes: bool,
+    refused: bool,
+) -> Option<Option<LimitStep<'a>>> {
+    let (next, ready, held) = match word? {
+        RosterWord::Unlisted => return None,
+        RosterWord::Unread => {
+            let text = if resumes {
+                &notice::LIMIT_UNREAD
+            } else {
+                &notice::LIMIT_UNREAD_KEPT
+            };
+            return Some(Some((text, None, None)));
+        }
+        RosterWord::Row { next, ready, held } => (next.as_ref(), ready.as_ref(), *held),
+    };
+    Some(match (switch, ready, next) {
+        (_, None, None) | (Err(None), ..) => Some((
+            if resumes {
+                &notice::LIMIT_ROSTER
+            } else {
+                &notice::LIMIT_ROSTER_KEPT
+            },
+            None,
+            None,
+        )),
+        (Err(Some(lines)), ..) => Some((
+            if held.is_none() && ready.is_some() {
+                &notice::LIMIT_STAY
+            } else {
+                &notice::LIMIT_STAY_HELD
+            },
+            ready
+                .map(|ready| ready.label.as_str())
+                .or_else(|| next.map(|next| next.label.as_str())),
+            Some(lines),
+        )),
+        (Ok(()), Some(ready), _) => match (held, refused) {
+            (Some(held), _) => Some((
+                &notice::LIMIT_USE,
+                Some(ready.label.as_str()),
+                Some(held.why()),
+            )),
+            (None, true) => Some((
+                &notice::LIMIT_USE,
+                Some(ready.label.as_str()),
+                Some(notice::WHY_USE_UNMADE),
+            )),
+            (None, false) => None,
+        },
+        (Ok(()), None, Some(next)) => Some((
+            match (next.renew, held.is_none()) {
+                (true, true) => &notice::LIMIT_RENEW,
+                (false, true) => &notice::LIMIT_LOGIN,
+                (true, false) => &notice::LIMIT_RENEW_HELD,
+                (false, false) => &notice::LIMIT_LOGIN_HELD,
+            },
+            Some(next.label.as_str()),
+            None,
+        )),
+    })
+}
+
 /// CLAUDE CODE'S LOST LOGIN, CARRIED BY THE HARNESS UP TO THE SIGN-IN
 /// ([`super::login`], the owner's ruling of 2026-10-19): `Some` at a point of
 /// such an episode — the wall's row, `/login`'s dialog over the lost login
@@ -529,12 +837,21 @@ const LOGIN_CLEARS: &str = "`Login successful` on the screen, or the agent worki
 /// | point | notice |
 /// | --- | --- |
 /// | the browser hand-off of aterm's `/login` | [`notice::LOGIN_SIGN_IN`], or [`notice::LOGIN_SIGN_IN_AS`] naming the roster row the session's login is |
-/// | the method picker of aterm's `/login`, which it does not answer ([`super::login::picks`]) | [`notice::LOGIN_CHOOSE`] |
-/// | Console's menu, an error, an account on hold, anyone's `/login` | [`notice::LOGIN_STOPPED`] |
+/// | any dialog of aterm's `/login` still standing once the login came back in another tab | [`notice::LOGIN_BACK_DIALOG`] |
+/// | any dialog of aterm's `/login` still standing once a renewal the tab follows replaced the login | [`notice::LOGIN_RENEWED_DIALOG`] |
+/// | the method picker of aterm's `/login`, which it does not answer ([`super::login::picks`]), or Console's menu behind it | [`notice::LOGIN_CHOOSE`] |
+/// | an error, an account on hold, anyone's `/login` | [`notice::LOGIN_STOPPED`] |
 /// | aterm's `/login` left (`Login interrupted`, or its dialog gone with no login back) | [`notice::LOGIN_CANCELLED`] |
+/// | the login back in another tab, this tab's turn delivered again | none |
+/// | aterm's `/login` left once a renewal stood ready, the tab moved onto the renewed login | none |
 /// | a person's own `/login` left | [`notice::LOGIN_LEFT`] |
-/// | `/login` not typed and not about to be | [`notice::LOGIN_NOT_RUN`], with why ([`notice::WHYS`]) |
+/// | `/login` not typed and not about to be | [`notice::LOGIN_NOT_RUN`], with why ([`notice::WHYS`]); [`notice::LOGIN_NOT_RUN_DRAFT`] where a draft holds it |
 /// | a renewed login the tab cannot move onto by itself | [`notice::RENEWED_DRAFT`], [`notice::RENEWED_BY_HAND`] |
+///
+/// On a roster row's login, a notice whose step has the owner type `/login`
+/// themselves names the row whose own account to sign in with
+/// ([`NoticeText::todo_as`]): nothing at the hand-off of their own `/login`
+/// says it.
 fn claude_login(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -557,6 +874,16 @@ fn claude_login(
     // aterm's own `/login` into this loss, not left: the dialog's steps are
     // aterm's to carry, and what the owner is told says aterm ran it.
     let own = state.login_typed_at().is_some();
+    // The roster row the session's login is (the renewable login it runs
+    // on, or the account a move put it on): a sign-in in the tab must be
+    // that row's own account, which the browser hand-off of aterm's
+    // `/login` says, and every step that has the owner type `/login`
+    // themselves says in its place ([`NoticeText::todo_as`]: nothing at the
+    // hand-off of their own `/login` does).
+    let roster = reading
+        .login_label
+        .as_deref()
+        .or_else(|| state.account_move().map(|m| m.to.as_str()));
     let told = |text: &NoticeText, label: Option<&str>, why: Option<&str>| {
         Some(Some(Exception::of_notice(text, label, why, LOGIN_CLEARS)))
     };
@@ -564,8 +891,41 @@ fn claude_login(
         // The login is back; its one Enter is aterm's, and a success that
         // stayed up after it is a login back all the same.
         Some(LoginScreen::Success { .. }) => return Some(None),
-        // A person's own `/login`: theirs, as they go through it.
-        Some(LoginScreen::Picker(_) | LoginScreen::Browser) if !own => return Some(None),
+        // A person's own `/login`: theirs, as they go through it, Console's
+        // menu included (they chose Console there).
+        Some(LoginScreen::Picker(_) | LoginScreen::ConsoleMenu | LoginScreen::Browser) if !own => {
+            return Some(None);
+        }
+        // THE LOGIN CAME BACK IN ANOTHER TAB while this dialog stands
+        // ([`super::turn_end::login_back_elsewhere`]): nothing is left to
+        // sign in, and nobody is told to (the model's
+        // `NoSignInAskedOfALoginBack`); the dialog takes no keys of the
+        // loop's, so the owner closes it, and the turn is delivered again
+        // once it is left.
+        Some(_) if super::turn_end::login_back_elsewhere(state, reading) => {
+            return told(&notice::LOGIN_BACK_DIALOG, None, None);
+        }
+        // A RENEWAL MADE WHILE aterm'S OWN `/login` STANDS, one the tab
+        // follows by itself ([`super::login::renewal_followed`]): nothing is
+        // left to sign in (a browser sign-in would bring back the login the
+        // renewal replaced), and nobody is told to (the model's
+        // `NoSignInAskedOverARenewal`); the dialog takes no keys of the
+        // loop's, so the owner closes it, and the tab moves onto the renewed
+        // login once it is left (acct3-3).
+        Some(_)
+            if own
+                && super::login::renewal_followed(
+                    reading.login_superseded,
+                    cfg,
+                    reading.restartable || reading.upgrading,
+                ) =>
+        {
+            return told(
+                &notice::LOGIN_RENEWED_DIALOG,
+                reading.login_label.as_deref(),
+                None,
+            );
+        }
         // aterm answers its own picker with the method the session already
         // uses where it can say which; any other is the owner's.
         Some(LoginScreen::Picker(picker)) => {
@@ -577,19 +937,24 @@ fn claude_login(
         // The browser sign-in is open: the one step only the owner can
         // take, as the roster row's own account where the login is one.
         Some(LoginScreen::Browser) => {
-            let label = reading
-                .login_label
-                .as_deref()
-                .or_else(|| state.account_move().map(|m| m.to.as_str()));
-            return match label {
+            return match roster {
                 Some(label) => told(&notice::LOGIN_SIGN_IN_AS, Some(label), None),
                 None => told(&notice::LOGIN_SIGN_IN, None, None),
             };
         }
-        Some(LoginScreen::ConsoleMenu | LoginScreen::Failed) => {
-            return told(&notice::LOGIN_STOPPED, None, None);
-        }
+        // Console's own menu behind aterm's `/login` (a person moved the
+        // picker onto Console): how to sign in is still the owner's choice,
+        // and nothing has stopped (one of its options mints an API key, which
+        // aterm never presses).
+        Some(LoginScreen::ConsoleMenu) => return told(&notice::LOGIN_CHOOSE, None, None),
+        Some(LoginScreen::Failed) => return told(&notice::LOGIN_STOPPED, None, None),
         None => {}
+    }
+    // The login back in another tab, this tab's turn about to be delivered
+    // again ([`super::turn_end::login_back_elsewhere`]): nothing has failed,
+    // the carrier's own `/login` left included.
+    if super::turn_end::login_back_elsewhere(state, reading) {
+        return Some(None);
     }
     // A lost login read before any turn was asked under the login the
     // session's own move AT A WALL chose is the old process's notice, no
@@ -608,9 +973,9 @@ fn claude_login(
     }
     if state.login_cancelled() || (track.is_some() && reading.login_interrupted) {
         return if typed {
-            told(&notice::LOGIN_CANCELLED, None, None)
+            told(&notice::LOGIN_CANCELLED, roster, None)
         } else {
-            told(&notice::LOGIN_LEFT, None, None)
+            told(&notice::LOGIN_LEFT, roster, None)
         };
     }
     if typed {
@@ -622,7 +987,7 @@ fn claude_login(
         return if state.login_opening(now).is_some() {
             Some(None)
         } else {
-            told(&notice::LOGIN_CANCELLED, None, None)
+            told(&notice::LOGIN_CANCELLED, roster, None)
         };
     }
     if !walled {
@@ -661,26 +1026,36 @@ fn claude_login(
         TurnEndAction::Escalate { .. } if reading.composer == Composer::Absent => {
             told(&notice::LOGIN_STOPPED, None, None)
         }
-        // `/login` held back: the owner is told why, and types it.
+        // `/login` held back: the owner is told why, and types it — the
+        // draft cleared first where one holds it (typed onto the draft,
+        // `/login` is no command).
+        TurnEndAction::Escalate { .. } if reading.composer.drafted() => {
+            told(&notice::LOGIN_NOT_RUN_DRAFT, roster, None)
+        }
         TurnEndAction::Escalate { .. } => {
-            // The three that hold it ([`decide_turn_end`]'s draft gate, the
-            // wall's own rule under `retry_api_errors = false`, the hour's
-            // typing budget); the budget is the last left.
-            let why = if reading.composer.drafted() {
-                notice::WHY_DRAFT
-            } else if !cfg.retry_api_errors {
-                notice::WHY_RETRY_OFF
-            } else {
+            // The other two that hold it (the wall's own rule under
+            // `retry_api_errors = false`, the hour's typing budget); the
+            // budget is the last left.
+            let why = if cfg.retry_api_errors {
                 notice::WHY_BUDGET
+            } else {
+                notice::WHY_RETRY_OFF
             };
-            told(&notice::LOGIN_NOT_RUN, None, Some(why))
+            told(&notice::LOGIN_NOT_RUN, roster, Some(why))
         }
-        // Nothing typed into a tab with no task, or one whose task is done.
+        // Nothing typed into a tab with no task, a landed one, or a
+        // person's own exchange left to them (the task's two ends under
+        // FOREVER CRUISE / FOREVER LAND).
         TurnEndAction::Nothing if reading.taskless => {
-            told(&notice::LOGIN_NOT_RUN, None, Some(notice::WHY_NO_TASK))
+            told(&notice::LOGIN_NOT_RUN, roster, Some(notice::WHY_NO_TASK))
         }
+        TurnEndAction::Nothing if state.landed() => told(
+            &notice::LOGIN_NOT_RUN,
+            roster,
+            Some(notice::WHY_TASK_LANDED),
+        ),
         TurnEndAction::Nothing if state.task_done() => {
-            told(&notice::LOGIN_NOT_RUN, None, Some(notice::WHY_TASK_DONE))
+            told(&notice::LOGIN_NOT_RUN, roster, Some(notice::WHY_TURN_YOURS))
         }
         // A point not decided yet (an act still to be taken, a read that is
         // no point), or one no act of the wall's answers: nothing has failed.
@@ -709,6 +1084,9 @@ pub fn exception_for(
         None => reading,
     };
     if let Some(told) = claude_login(state, reading, cfg, now) {
+        return told;
+    }
+    if let Some(told) = claude_limit_login(state, reading, cfg, now) {
         return told;
     }
     let kind = reading.wall?;

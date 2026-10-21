@@ -9,6 +9,14 @@
 //! accessibility node ids, cache file names, pet-atlas host ids). It is never
 //! a security primitive.
 //!
+//! The byte loop and the offset basis are astream-wire's
+//! (`astream_wire::hash::{fnv1a_64_update, FNV1A_64_INIT}`), the function
+//! astream's `assign_partition` hashes a partition key with: one FNV across
+//! aterm and the bus it builds on. Both compute the published algorithm, so
+//! every value aterm has persisted is the same value it was. What stays here
+//! is what astream exports no counterpart for: the prime (for the word fold
+//! below), the 128-bit member, and the fixed-width little-endian feeds.
+//!
 //! - [`fnv1a_64`] hashes one byte slice, and [`fnv1a_64_extend`] continues a
 //!   running hash, so extending by `a` and then `b` is the hash of `a ++ b`.
 //! - [`Fnv1a64`] is that running hash as a value, for a stream of writes.
@@ -17,10 +25,16 @@
 //!   step of the hash; over wider words it is a different function, the one
 //!   the scalar fingerprints fold.
 
-/// The FNV-1a/64 offset basis: the hash of no bytes.
-pub const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// The FNV-1a/64 offset basis: the hash of no bytes (astream-wire's
+/// `FNV1A_64_INIT`, under the name aterm's callers already spell).
+pub const FNV64_OFFSET: u64 = astream_wire::hash::FNV1A_64_INIT;
 
-/// The FNV-64 prime, 2^40 + 0x1b3.
+/// The FNV-64 prime, 2^40 + 0x1b3. astream-wire keeps its prime private to its
+/// byte loop, so the word fold ([`fnv_mix_u64`]) names it here. Two tests hold
+/// it: `matches_the_published_vectors` takes the word fold over bytes to the
+/// published vectors, and `the_word_fold_agrees_with_astreams_byte_loop` holds
+/// that fold and astream's loop to one function. The vectors through
+/// [`fnv1a_64`] alone never reach this constant.
 pub const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// FNV-1a/64 of `bytes`.
@@ -30,17 +44,11 @@ pub const fn fnv1a_64(bytes: &[u8]) -> u64 {
     fnv1a_64_extend(FNV64_OFFSET, bytes)
 }
 
-/// The FNV-1a/64 state `hash` continued over `bytes`.
+/// The FNV-1a/64 state `hash` continued over `bytes`: astream-wire's byte loop.
 #[inline]
 #[must_use]
 pub const fn fnv1a_64_extend(hash: u64, bytes: &[u8]) -> u64 {
-    let mut h = hash;
-    let mut i = 0;
-    while i < bytes.len() {
-        h = fnv_mix_u64(h, bytes[i] as u64);
-        i += 1;
-    }
-    h
+    astream_wire::hash::fnv1a_64_update(hash, bytes)
 }
 
 /// One fold step: `(hash ^ word) * FNV64_PRIME`, wrapping.
@@ -258,17 +266,72 @@ mod tests {
     use super::*;
 
     /// FNV's published vectors; a wrong prime can agree in the low 40 bits only.
+    /// These are the conformance check on astream-wire's byte loop: every
+    /// value aterm persisted (`hash=`, node ids, cache names) was one of these
+    /// functions' outputs before the loop moved, so they must not change.
+    /// Each 64-bit vector is also taken through this file's word fold
+    /// ([`fnv_mix_u64`] over the bytes widened), the only path here that
+    /// multiplies by [`FNV64_PRIME`]: `fnv1a_64` multiplies by astream's own
+    /// private prime, so without those rows a wrong `FNV64_PRIME` passed this
+    /// test (it did, with bit 41 flipped, before they were added).
     #[test]
     fn matches_the_published_vectors() {
-        assert_eq!(fnv1a_64(b""), FNV64_OFFSET);
-        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+        let word_fold = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold(FNV64_OFFSET, |h, &b| fnv_mix_u64(h, u64::from(b)))
+        };
+        assert_eq!(FNV64_OFFSET, 0xcbf2_9ce4_8422_2325);
+        for (bytes, hash) in [
+            (&b""[..], FNV64_OFFSET),
+            (b"a", 0xaf63_dc4c_8601_ec8c),
+            (b"foobar", 0x8594_4171_f739_67e8),
+        ] {
+            assert_eq!(fnv1a_64(bytes), hash, "{bytes:02x?}");
+            assert_eq!(word_fold(bytes), hash, "the word fold, {bytes:02x?}");
+        }
         assert_eq!(fnv1a_128(b""), FNV128_OFFSET);
         assert_eq!(fnv1a_128(b"a"), 0xd228_cb69_6f1a_8caf_7891_2b70_4e4a_8964);
         assert_eq!(
             fnv1a_128_extend(fnv1a_128(b"foo"), b"bar"),
             fnv1a_128(b"foobar")
         );
+    }
+
+    /// The byte loop is astream-wire's and the word fold is this file's; over
+    /// bytes widened to `u64` they must stay one function, which is what lets
+    /// [`FNV64_PRIME`] live here while the loop lives there. Negative control: a
+    /// fold under a prime one bit away (above the low 40, where the published
+    /// vectors are weakest) parts from the loop, so the agreement above is a
+    /// check, not a tautology.
+    #[test]
+    fn the_word_fold_agrees_with_astreams_byte_loop() {
+        let fold = |prime: u64, bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold(FNV64_OFFSET, |h, &b| (h ^ u64::from(b)).wrapping_mul(prime))
+        };
+        let inputs: [&[u8]; 5] = [
+            b"",
+            b"a",
+            b"foobar",
+            &[0x00, 0x80, 0xff, 0x7f, 0x01],
+            &[0xa5; 64],
+        ];
+        for bytes in inputs {
+            assert_eq!(fnv1a_64(bytes), astream_wire::fnv1a_64(bytes));
+            assert_eq!(
+                fnv1a_64(bytes),
+                bytes
+                    .iter()
+                    .fold(FNV64_OFFSET, |h, &b| fnv_mix_u64(h, u64::from(b))),
+                "{bytes:02x?}"
+            );
+            assert_eq!(fnv1a_64(bytes), fold(FNV64_PRIME, bytes));
+        }
+        let off_by_one_bit = FNV64_PRIME ^ (1 << 41);
+        assert_ne!(fold(off_by_one_bit, b"foobar"), fnv1a_64(b"foobar"));
+        assert_ne!(fold(off_by_one_bit, b"a"), fnv1a_64(b"a"));
     }
 
     #[test]

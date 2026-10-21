@@ -1430,7 +1430,9 @@ mod tests {
         for locked in [staging.failed(), staging.quarantine()] {
             mode(&locked, 0o000).unwrap();
             if std::fs::File::open(&locked).is_ok() {
-                return; // root reads through any mode: nothing to stand in with
+                aterm_uds::host::could_not_run(
+                    "a mode-0 file opened anyway: root, or a file system that ignores modes",
+                );
             }
             FailedMark::record_stage_moment(&staging.failed(), 8, &y, 1_000);
             FailedMark::record_stage_failure(&staging.failed(), 8, &y, 2_000);
@@ -2181,7 +2183,9 @@ changelog = '''
             |bits| std::fs::set_permissions(staging.floor(), std::fs::Permissions::from_mode(bits));
         mode(0o000).unwrap();
         if std::fs::File::open(staging.floor()).is_ok() {
-            return; // root reads through any mode: nothing to stand in with
+            aterm_uds::host::could_not_run(
+                "a mode-0 file opened anyway: root, or a file system that ignores modes",
+            );
         }
         let read = Ready::read_publishable(&staging);
         mode(0o600).unwrap();

@@ -37,25 +37,25 @@
 //! stretches) and publishes a stall only on that evidence. So a slow read is
 //! a warning the driver can act on, and a refusal waits for the watch.
 //!
-//! WHERE IT IS ASKED: on the SOCKET seams only — the verb dispatch
-//! (`control::handle`), the `feed-bin`/`paste-bin` frame and the App lane —
-//! each after authorization and after the halt, so an unauthorized caller
-//! learns nothing and a halted session says `ERR halted` first. NEVER on the
-//! input seam the window keyboard travels (`input.rs`, `app_input.rs`,
-//! `control_input.rs`'s write path, the sink): a
-//! person typing into a frozen program is refused nothing, exactly as the
-//! fleet halt refuses them nothing.
+//! WHERE IT IS ASKED: on the SOCKET seams only — last of the input admission
+//! (`control::admit`) every text verb and `feed-bin`/`paste-bin` frame passes,
+//! and in the App lane (`control::dispatch_app`) — each after authorization and
+//! after the halt, so an unauthorized caller learns nothing and a halted session
+//! says `ERR halted` first. NEVER on the input seam the window keyboard travels
+//! (`input.rs`, `app_input.rs`, the sink): a person typing into a frozen program
+//! is refused nothing, exactly as the fleet halt refuses them nothing
+//! (`control.rs`'s `a_person_types_into_a_held_and_stalled_session`).
 //!
 //! WHAT STAYS OPEN: `resize`, `signal`, `close`, `pane` and `tab` write no input
 //! bytes and are the remedies — `signal int` interrupts, `signal term`
 //! restarts a frozen program, `signal cont` resumes a stopped one. So does a
-//! lone SIGNAL CHARACTER (`key ctrl+c`, `ctrl c`, `feed 03`) while the tty has
-//! `ISIG` on: the line discipline turns it into a signal as it is written, so
-//! it is never read behind anything (S4 review, 2026-09-24). A driver that
-//! means to queue anyway leads `send`/`key` with `unread=ok`. The refusal
-//! starts `ERR busy`, so every driver's existing back-off
-//! (`CtlReply::is_err("busy")`) retries it rather than treating it as a hard
-//! failure.
+//! lone SIGNAL CHARACTER (`key ctrl+c`, `ctrl c`, `feed 03`, a one-byte
+//! `feed-bin` frame) while the tty has `ISIG` on: the line discipline turns it
+//! into a signal as it is written, so it is never read behind anything (S4
+//! review, 2026-09-24). A driver that means to queue anyway leads `send`/`key`
+//! with `unread=ok`. The refusal starts `ERR busy`, so every driver's existing
+//! back-off (`CtlReply::is_err("busy")`) retries it rather than treating it as
+//! a hard failure.
 
 use aterm_agent::harness::resume::{AfterRestart, RELAUNCH_WORDS};
 use aterm_session::input_backlog::{self, Contention, Gate, InputBacklog, InputWord, Liveness};
@@ -63,32 +63,31 @@ use aterm_session::sink::SinkWriter;
 use aterm_types::keyboard::KeyboardMode;
 use std::time::{Duration, Instant};
 
+use aterm_types::control_verbs::{Input, input_of};
+
 use crate::SessionCtx;
 use crate::input::InputEvent;
 use crate::menu::MenuAction;
 
-/// Whether `verb` (with its argument tail `rest`) writes INPUT BYTES to a
-/// session's PTY — the verbs the gate asks about.
-///
-/// A SUBSET of `fabric::is_pty_reaching`, the halt's set, minus the verbs that
-/// reach a PTY without writing input to it: `resize` (a winsize), `signal` (a
-/// signal), `close` (a hangup), `pane` and `tab` (which session the keyboard
-/// drives, or retiring one) and `confirm` (the answer to a parked close, whose
-/// `yes` is a hangup too). Those are exactly the remedies for a program that
-/// is not reading, so they must stay answerable while this gate refuses.
-/// `invoke` writes input only for an action whose
-/// [`MenuAction::writes_pty_input`] says so (today, `Paste`).
+/// [`writes_input`] of `verb`'s class, as a test asks it by name.
+#[cfg(test)]
 pub(crate) fn is_input_writing(verb: &str, rest: &str) -> bool {
-    match verb {
-        "send" | "key" | "ctrl" | "feed" | "feed-bin" | "paste" | "paste-bin" | "mouse"
-        | "focus" | "turn" | "hwkey" | "pointer" => true,
-        "invoke" => rest
-            .split_whitespace()
-            .next()
-            .and_then(MenuAction::from_invoke_name)
-            .is_some_and(MenuAction::writes_pty_input),
-        _ => false,
-    }
+    writes_input(input_of(verb), verb, rest.as_bytes())
+}
+
+/// Whether a request of a `class` verb writes INPUT BYTES to a session's PTY — the
+/// requests the gate asks about: the class's [`Input::WRITES`] flag, a subset of
+/// the halt's set (checked where the table compiles), plus `invoke` of an action
+/// whose [`MenuAction::writes_pty_input`] says so (today, `Paste`), which only its
+/// argument can tell. `args` are a text verb's tail or a frame's body.
+pub(crate) fn writes_input(class: Input, verb: &str, args: &[u8]) -> bool {
+    class.contains(Input::WRITES)
+        || (verb == "invoke"
+            && std::str::from_utf8(args)
+                .ok()
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(MenuAction::from_invoke_name)
+                .is_some_and(MenuAction::writes_pty_input))
 }
 
 /// What the unread-input gate does with one input-writing verb
@@ -144,7 +143,20 @@ impl Admission {
 /// lookup. A warning or a refusal also wakes the session's input watch, in
 /// case nothing else has.
 pub(crate) fn admission(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: bool) -> Admission {
-    if unread_ok || !is_input_writing(verb, rest) {
+    gate(ctx, input_of(verb), verb, rest.as_bytes(), unread_ok)
+}
+
+/// [`admission`] for a request whose verb's class is known: `args` are what it
+/// writes, a text verb's tail or a frame's body (`feed-bin`'s bytes are its own,
+/// so a lone `^C` frame into a cbreak program is a signal too).
+pub(crate) fn gate(
+    ctx: &SessionCtx,
+    class: Input,
+    verb: &str,
+    args: &[u8],
+    unread_ok: bool,
+) -> Admission {
+    if unread_ok || !writes_input(class, verb, args) {
         return Admission::Open;
     }
     let Some(backlog) = ctx.sink.input_backlog() else {
@@ -153,7 +165,7 @@ pub(crate) fn admission(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: boo
     // A `^C` into a cbreak program is SIGINT, not a byte behind the unread
     // ones (S4 review, 2026-09-24: the gate refused the remedy).
     let signals = || {
-        written_bytes(verb, rest, ctx.modes.keyboard_mode())
+        written_bytes(verb, args, ctx.modes.keyboard_mode())
             .is_some_and(|bytes| backlog.signals_on_write(&bytes))
     };
     // Copied out, so the leader lookup runs with the timeline released.
@@ -206,7 +218,7 @@ pub(crate) fn admission(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: boo
     // interrupts instead (S4 review, 2026-09-24) — the legacy encoding, so a
     // kitty-mode `ctrl+c` counts too.
     let interrupt =
-        written_bytes(verb, rest, KeyboardMode::default()).as_deref() == Some(b"\x03".as_slice());
+        written_bytes(verb, args, KeyboardMode::default()).as_deref() == Some(b"\x03".as_slice());
     let liveness = if published.is_some() {
         Liveness::Published
     } else {
@@ -275,13 +287,18 @@ pub(crate) fn with_warning(resp: String, warning: Option<&str>) -> String {
     out
 }
 
-/// The exact bytes `verb` writes for `rest`, for the verbs whose bytes follow
+/// The exact bytes `verb` writes for `args`, for the verbs whose bytes follow
 /// from their arguments and the keyboard mode alone: `key` and `ctrl` through
 /// the encoder their seams run (so a program that asked for the kitty
 /// protocol gets `ctrl+c` as the CSI sequence it will receive, not `^C`),
-/// `feed` decoded from hex and `send` raw. `None` for every other verb and for
-/// a tail that does not parse, which its own arm refuses later.
-fn written_bytes(verb: &str, rest: &str, mode: KeyboardMode) -> Option<Vec<u8>> {
+/// `feed` decoded from hex, `send` raw and a `feed-bin` frame's body as it
+/// is. `None` for every other verb and for a tail that does not parse, which
+/// its own arm refuses later.
+fn written_bytes(verb: &str, args: &[u8], mode: KeyboardMode) -> Option<Vec<u8>> {
+    if verb == "feed-bin" {
+        return Some(args.to_vec());
+    }
+    let rest = std::str::from_utf8(args).ok()?;
     let event = match verb {
         "key" => crate::control::parse_key(rest)?,
         "ctrl" => crate::control::parse_ctrl(rest)?,
@@ -1044,6 +1061,14 @@ pub(crate) struct InputStallFact {
     /// When the oldest unread byte was accepted by the kernel (a lower bound
     /// on its age: `now - wait` at the reading).
     pub(crate) since: Instant,
+    /// The wall-clock second `since` fell at, in Unix seconds: STAMPED ONCE
+    /// for the episode as it is first published ([`since_unix_of`], by
+    /// `App::publish_input_stall`) and carried with it from then on, the
+    /// watch's copy too ([`InputWatches::settle_publication`]), so every
+    /// reading of one stall — the attention entry, the menu row, a
+    /// republication — names one clock time ([`since_hhmm`]). `None` before
+    /// the publication stamps it, and where no wall clock could be read.
+    pub(crate) since_unix: Option<i64>,
     /// Every unread input byte at entry: the kernel's queue plus the spill.
     pub(crate) bytes: usize,
     /// The foreground job is stopped (`word == Stopped`): the remedy is
@@ -1060,7 +1085,7 @@ pub(crate) struct InputStallFact {
     /// published or moves, and again at each of the watch's probes of a
     /// standing one (every [`RECHECK`]), republished when it moved. The
     /// watch's copy carries it as the timeline's does
-    /// ([`InputWatches::set_act`]): the attention entry, the menu row and
+    /// ([`InputWatches::settle_publication`]): the attention entry, the menu row and
     /// the band ([`crate::presence::Native`], off the watch's copy with no
     /// lock) name one remedy.
     pub(crate) act: Option<StallAct>,
@@ -1266,6 +1291,9 @@ impl InputWatches {
                 let fact = InputStallFact {
                     word,
                     since,
+                    // The publication's to stamp ([`since_unix_of`]): this
+                    // step reads no clock.
+                    since_unix: None,
                     bytes: backlog.map_or(0, InputBacklog::unread),
                     stopped: word == InputWord::Stopped,
                     rss_mb: rss(),
@@ -1339,14 +1367,22 @@ impl InputWatches {
         );
     }
 
-    /// Give session `id`'s published stall the explicit restart its
-    /// publication names ([`InputStallFact::act`]): the band reads it off
-    /// this copy with no lock, and a later [`Self::step`]'s update carries it
-    /// over until the publication asks again. Nothing where nothing is
-    /// published.
-    pub(crate) fn set_act(&mut self, id: u64, act: Option<StallAct>) {
+    /// Give session `id`'s published stall what its publication settled: the
+    /// explicit restart its words name ([`InputStallFact::act`]), which the
+    /// band reads off this copy with no lock, and the clock time it was
+    /// stamped with ([`InputStallFact::since_unix`]). A later
+    /// [`Self::step`]'s update carries both over: the act until the
+    /// publication asks again, the stamp for the episode's life. Nothing where
+    /// nothing is published.
+    pub(crate) fn settle_publication(
+        &mut self,
+        id: u64,
+        act: Option<StallAct>,
+        since_unix: Option<i64>,
+    ) {
         if let Some(fact) = self.watches.get_mut(&id).and_then(|w| w.published.as_mut()) {
             fact.act = act;
+            fact.since_unix = since_unix;
         }
     }
 
@@ -1546,20 +1582,25 @@ pub(crate) fn status_input(
     status_fields(backlog.as_ref(), word, rss)
 }
 
-/// The local wall-clock `HH:MM` at which `since` fell, given the same moment
-/// as an `Instant` (`now`) and as Unix seconds (`now_unix`) and the zone's
-/// offset from UTC. `None` without an offset — then the caller says `for
-/// <dur>` instead of inventing a clock.
-pub(crate) fn since_hhmm(
-    since: Instant,
-    now: Instant,
-    now_unix: i64,
-    offset_s: Option<i64>,
-) -> Option<String> {
-    let offset = offset_s?;
-    let ago = i64::try_from(now.saturating_duration_since(since).as_secs()).ok()?;
-    let local = (now_unix - ago + offset).rem_euclid(86_400);
+/// The local wall-clock `HH:MM` of the Unix second `since_unix`, under the
+/// zone's offset from UTC. `None` without an offset — then the caller says
+/// `for <dur>` instead of inventing a clock.
+pub(crate) fn since_hhmm(since_unix: i64, offset_s: Option<i64>) -> Option<String> {
+    let local = since_unix.saturating_add(offset_s?).rem_euclid(86_400);
     Some(format!("{:02}:{:02}", local / 3600, (local % 3600) / 60))
+}
+
+/// The Unix second at which `since` fell: the monotonic clock's distance back
+/// to it, taken off the wall clock read beside it, to the nanosecond, then
+/// floored once. Read once per episode, as it is published
+/// ([`InputStallFact::since_unix`]): placed again at every reading, from the
+/// reader's own instant and each clock cut to its second apart, a stall whose
+/// oldest byte came in a minute's last second named one minute here and the
+/// next there. `None` without a wall clock.
+pub(crate) fn since_unix_of(since: Instant) -> Option<i64> {
+    let ago = Instant::now().saturating_duration_since(since);
+    let wall = aterm_time::since_epoch()?;
+    i64::try_from(wall.checked_sub(ago)?.as_secs()).ok()
 }
 
 /// The server's attention line for a stall, at most
@@ -1774,9 +1815,12 @@ pub(crate) fn host_hand_refusal(ctx: &crate::SessionCtx, now_us: u64) -> Option<
     }
 }
 
-/// [`attention_text`] at `now`, with the wall clock and the zone read here:
-/// the ONE composition the server's attention entry and the menu-bar row
-/// share, so the row a human clicks says what `meta attention=` says.
+/// [`attention_text`] at `now`, with the zone read here: the ONE composition
+/// the server's attention entry and the menu-bar row share, so the row a
+/// human clicks says what `meta attention=` says. The clock time is the one
+/// the episode was stamped with ([`InputStallFact::since_unix`]), whenever it
+/// is read and whatever `now` the reader holds; `now` measures only the `for
+/// <dur>` said where no clock time can be.
 pub(crate) fn attention_now(
     fact: &InputStallFact,
     program: Option<&str>,
@@ -1784,8 +1828,9 @@ pub(crate) fn attention_now(
     sid: &str,
     now: Instant,
 ) -> String {
-    let now_unix = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
-    let clock = since_hhmm(fact.since, now, now_unix, crate::presence::local_offset_s());
+    let clock = fact
+        .since_unix
+        .and_then(|since_unix| since_hhmm(since_unix, crate::presence::local_offset_s()));
     attention_text(
         fact,
         program,
@@ -1960,15 +2005,17 @@ impl crate::App {
 
     /// Publish (`Some`) or clear (`None`) session `id`'s stall, in lockstep:
     /// the timeline's effective agent word, the server's attention entry, and
-    /// the presence, chrome and menu refreshes that carry them — plus a
-    /// subscriber notify when either moved, so `EVENT <local> agent …` and
-    /// `EVENT <local> meta …` push now.
+    /// the presence, chrome and menu refreshes that carry them. A move of
+    /// either is recorded, and the record wakes the session's watchers, so
+    /// `EVENT <local> agent …` and `EVENT <local> meta …` push now.
     ///
     /// The publication carries its explicit restart ([`InputStallFact::act`]),
     /// asked here of the one predicate ([`act_of`]) before the timeline's
-    /// leaf lock, and given to the watch's copy too
-    /// ([`InputWatches::set_act`]): what the attention entry, the menu row
-    /// and the band then name alike.
+    /// leaf lock, and the episode's clock time, stamped here as it is first
+    /// published ([`InputStallFact::since_unix`]) and kept by every
+    /// republication; both are given to the watch's copy too
+    /// ([`InputWatches::settle_publication`]): what the attention entry, the
+    /// menu row and the band then name alike.
     fn publish_input_stall(
         &mut self,
         id: u64,
@@ -1978,10 +2025,13 @@ impl crate::App {
     ) {
         let fact = fact.map(|fact| InputStallFact {
             act: act_of(ctx, &fact),
+            since_unix: fact.since_unix.or_else(|| since_unix_of(fact.since)),
             ..fact
         });
         if let Some(fact) = &fact {
-            self.session_status.inputs.set_act(id, fact.act.clone());
+            self.session_status
+                .inputs
+                .settle_publication(id, fact.act.clone(), fact.since_unix);
         }
         let (agent_moved, text, wake) = {
             let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -2004,14 +2054,10 @@ impl crate::App {
             // The A/B book (Settings ▸ Harness): a stall moves the word too.
             self.note_harness_phase(id);
         }
+        // A move of either records on the timeline, which wakes the session's
+        // watchers.
         let attention_moved =
             crate::session_timeline::write_server_attention(ctx, SERVER_ATTENTION_OWNER, text);
-        if (agent_moved || attention_moved) && self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(id);
-        }
         if attention_moved {
             // What `Wake::MetaChanged` refreshes for a driver's `meta set
             // attention`: the tab labels and the menu-bar item.
@@ -2051,11 +2097,13 @@ pub(crate) mod tests {
     }
 
     /// A stall published at `since`: one byte unread, no leader read, nothing
-    /// held.
+    /// held. As the watch enters it: its clock time is the publication's to
+    /// stamp ([`InputStallFact::since_unix`]).
     fn stalled(since: Instant) -> InputStallFact {
         InputStallFact {
             word: InputWord::Stalled,
             since,
+            since_unix: None,
             bytes: 1,
             stopped: false,
             rss_mb: None,
@@ -2166,6 +2214,31 @@ pub(crate) mod tests {
         buf[..usize::try_from(n).unwrap_or(0)].to_vec()
     }
 
+    /// `invoke` writes input only for an action that writes input, which its
+    /// argument names; the table's column decides every other verb (negative
+    /// control: `status` writes none).
+    #[test]
+    fn invoke_writes_input_only_for_an_action_that_writes_input() {
+        assert!(is_input_writing("invoke", "Paste"));
+        assert!(is_input_writing("invoke", "Paste extra"));
+        for name in [
+            "SelectAll",
+            "Copy",
+            "NewTab",
+            "OpenPalette",
+            "NoSuchAction",
+            "",
+        ] {
+            assert!(!is_input_writing("invoke", name), "invoke {name}");
+        }
+        assert!(is_input_writing("send", ""));
+        assert!(!is_input_writing("status", ""));
+        assert!(
+            !is_input_writing("signal", "term"),
+            "a remedy writes no input"
+        );
+    }
+
     /// The refusal is ONE `ERR busy input-unread` line (a driver's
     /// `is_err("busy")` back-off retries it) whose `k=v` facts count the
     /// spill toward `bytes=`, ending in the one remedy: `signal cont` for a
@@ -2231,6 +2304,13 @@ pub(crate) mod tests {
             false
         };
         assert!(until(false), "a running child is not stopped");
+        // Stopped from here at once, and safely: Darwin mishandles a SIGSTOP
+        // that lands while the child is exec'ing (7d71bf733f), but `/bin/sleep`
+        // is no shim and execs nothing, and its one exec is done inside the
+        // `posix_spawn` that `spawn` returned from. Measured on Darwin 27.0.0,
+        // 24-wide beside 16 spinners: 0 of 24,000 runs failed; with the child
+        // `/bin/sh -c 'exec /bin/sleep 30'` (two execs after `spawn` returns)
+        // 17 of 24,000 waited out "SIGSTOP reads as stopped".
         // SAFETY: `pid` is this test's own live child.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
         assert!(until(true), "SIGSTOP reads as stopped");
@@ -2322,19 +2402,52 @@ pub(crate) mod tests {
         aterm_pty::close_fd(slave);
     }
 
-    /// The bytes the gate judges are the bytes the seam writes, under the
-    /// session's keyboard mode: under the kitty protocol `ctrl+c` is a CSI
-    /// sequence, not `^C`, so it is input like any other key and never the
-    /// signal-character exemption.
+    /// The bytes the gate judges are the bytes the seam writes: `key` and
+    /// `ctrl` through the encoder under the session's keyboard mode, `feed`
+    /// decoded, `send` raw, a `feed-bin` body as it is. Under the kitty protocol
+    /// `ctrl+c` is a CSI sequence, not `^C`, so it is input like any other key.
     #[test]
-    fn written_bytes_follow_the_sessions_keyboard_mode() {
-        assert_eq!(
-            written_bytes("key", "ctrl+c", KeyboardMode::empty()).as_deref(),
-            Some(&b"\x03"[..])
-        );
+    fn written_bytes_are_the_bytes_the_seam_writes() {
+        let legacy = KeyboardMode::empty();
+        for (verb, rest, want) in [
+            ("key", "ctrl+c", &b"\x03"[..]),
+            ("key", "c mods=ctrl", b"\x03"),
+            ("key", "ctrl+\\", b"\x1c"),
+            ("key", "ctrl+z", b"\x1a"),
+            ("ctrl", "c", b"\x03"),
+            ("ctrl", "C", b"\x03"),
+            ("ctrl", "z", b"\x1a"),
+            ("feed", "03", b"\x03"),
+            ("send", "\x03", b"\x03"),
+            ("key", "down", b"\x1b[B"),
+            ("key", "enter", b"\r"),
+            ("feed-bin", "\x03", b"\x03"),
+            ("feed-bin", "03", b"03"),
+        ] {
+            assert_eq!(
+                written_bytes(verb, rest.as_bytes(), legacy).as_deref(),
+                Some(want),
+                "{verb} {rest:?}"
+            );
+        }
         let kitty =
-            written_bytes("key", "ctrl+c", KeyboardMode::DISAMBIGUATE_ESC_CODES).expect("encodes");
+            written_bytes("key", b"ctrl+c", KeyboardMode::DISAMBIGUATE_ESC_CODES).expect("encodes");
         assert_ne!(kitty, b"\x03", "the kitty protocol reports ctrl+c as a key");
+        for (verb, rest) in [
+            ("key", "no-such-key"),
+            ("ctrl", "cc"),
+            ("feed", "zz"),
+            ("paste", "x"),
+            ("mouse", "click 1 1"),
+            ("turn", "x"),
+            ("paste-bin", "\x03"),
+        ] {
+            assert_eq!(
+                written_bytes(verb, rest.as_bytes(), legacy),
+                None,
+                "{verb} {rest}"
+            );
+        }
     }
 
     /// THE REMEDY IS NOT REFUSED (S4 review, 2026-09-24). A cbreak program —
@@ -2450,7 +2563,6 @@ pub(crate) mod tests {
                 &store,
                 h.local_id,
                 request,
-                &crate::subscribe::new_registry(),
                 &h.ctx,
                 &crate::control::TurnIo {
                     paste: &paste,
@@ -3294,22 +3406,77 @@ pub(crate) mod tests {
     /// no offset, no clock.
     #[test]
     fn since_hhmm_is_the_local_clock_at_the_stall() {
+        // 1_700_000_000 is 22:13:20 UTC; a minute before it, 22:12:20.
+        let since = 1_700_000_000 - 60;
+        assert_eq!(since_hhmm(since, Some(0)).as_deref(), Some("22:12"));
+        assert_eq!(since_hhmm(since, Some(-7 * 3600)).as_deref(), Some("15:12"));
+        assert_eq!(since_hhmm(since, Some(2 * 3600)).as_deref(), Some("00:12"));
+        assert_eq!(since_hhmm(since, None), None);
+        // The stamp is the second the stall fell in, read off the wall clock:
+        // between the wall clock's seconds on either side of the reading, 90
+        // seconds back, however long the reading took.
+        let wall = || aterm_time::unix_secs().and_then(|s| i64::try_from(s).ok());
+        let before = wall();
         let now = Instant::now();
-        let since = now - Duration::from_secs(60);
-        // 1_700_000_000 is 22:13:20 UTC.
-        assert_eq!(
-            since_hhmm(since, now, 1_700_000_000, Some(0)).as_deref(),
-            Some("22:12")
+        let stamped = since_unix_of(now.checked_sub(Duration::from_secs(90)).unwrap_or(now));
+        let after = wall();
+        let (Some(before), Some(stamped), Some(after)) = (before, stamped, after) else {
+            panic!("this machine has a wall clock");
+        };
+        assert!(
+            (before - 90..=after - 90).contains(&stamped),
+            "{stamped} in {before}..={after}, 90 s back"
         );
-        assert_eq!(
-            since_hhmm(since, now, 1_700_000_000, Some(-7 * 3600)).as_deref(),
-            Some("15:12")
-        );
-        assert_eq!(
-            since_hhmm(since, now, 1_700_000_000, Some(2 * 3600)).as_deref(),
-            Some("00:12")
-        );
-        assert_eq!(since_hhmm(since, now, 1_700_000_000, None), None);
+    }
+
+    /// ONE EPISODE, ONE CLOCK TIME: a published stall names the clock time
+    /// its first publication stamped at every reading — a republication off
+    /// the watch's copy, the menu row off the timeline's — whatever instant
+    /// the reader holds. Before, each reading placed `since` again from the
+    /// wall clock and the reader's instant, each cut to its second, so the
+    /// clock time moved with the reader: a stall whose oldest byte came in a
+    /// minute's last second named one minute in the attention entry and the
+    /// next in the menu row (`since 10:26` beside `since 10:25`, a run of
+    /// `the_publication_names_one_remedy_wherever_it_is_read` on a busy
+    /// machine), and a republication a minute on named a minute earlier.
+    #[test]
+    fn every_reading_of_a_stall_names_the_clock_time_it_was_published_with() {
+        let mut app = crate::App::headless_for_test();
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        let now = Instant::now();
+        let fact = stalled(now.checked_sub(Duration::from_secs(30)).unwrap_or(now));
+        let attention = |ctx: &SessionCtx| {
+            ctx.meta
+                .lock()
+                .unwrap()
+                .attention
+                .clone()
+                .expect("attention")
+        };
+        app.session_status
+            .inputs
+            .publish_for_test(0, fact.clone(), now);
+        app.publish_input_stall(0, &ctx, Some(fact), now);
+        let first = attention(&ctx);
+        assert!(first.contains(" since "), "a clock time: {first}");
+        // A minute and more on: the probe's republication of the standing
+        // stall, off the watch's copy, and the row a reader composes then.
+        let later = now + Duration::from_secs(61);
+        let standing = app.session_status.inputs.published(0).cloned();
+        app.publish_input_stall(0, &ctx, standing, later);
+        assert_eq!(attention(&ctx), first, "the republication");
+        let row = {
+            let tl = ctx.timeline.lock().unwrap();
+            let fact = tl.agent().input.clone().expect("the timeline's stall");
+            menu_row(
+                &fact,
+                tl.agent().program.as_deref(),
+                &after_restart(&tl, fact.act.as_ref()),
+                ctx.self_id.as_str(),
+                later,
+            )
+        };
+        assert_eq!(row.text, first, "the menu row");
     }
 
     /// This tab's own resume line (`FooterFacts::resume`, read from Claude

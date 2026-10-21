@@ -11,7 +11,9 @@
 //!   (`recovery_census::record`'s thread) amends it with how the run before
 //!   this launch ended once it has read the ledger ([`NodeLogHost::note_prev_end`]:
 //!   `amend n start prev_end=<word>`, a caught signal's number in `code=`). A
-//!   launch that never reads the ledger (headless, dev) keeps `-`.
+//!   launch that never reads the ledger (plain headless, dev) keeps `-`; a lab
+//!   desk reads its private root's own (Phase 6 step 6C-4,
+//!   `recovery_census::cold_census`).
 //! - **`link state=`.** Every stored transition of the fabric link, through
 //!   `aterm_gui_fabric::on_link_moved` (that crate has no aterm-slog
 //!   dependency), installed by [`install`] before any bridge can attach.

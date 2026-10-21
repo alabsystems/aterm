@@ -198,6 +198,14 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // Show Needs in Windows writes `[presence] rim` — durable config, the
         // Serious Mode class; the id keeps the rim's.
         M::ToggleNeedsInWindows => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
+        // The Stats Bars radio writes `[sys] stats_bars`: durable config, the
+        // Show Needs in Windows class.
+        M::StatsBarsDeck => spec("sys.stats_bars.deck", S::Process, A::ConfigMutate, C::Any),
+        M::StatsBarsSill => spec("sys.stats_bars.sill", S::Process, A::ConfigMutate, C::Any),
+        M::StatsBarsOff => spec("sys.stats_bars.off", S::Process, A::ConfigMutate, C::Any),
+        // The lens: a summoned overlay on the front window, runtime view
+        // state only (the font zoom's class).
+        M::ToggleStatsLens => spec("sys.stats_lens.toggle", S::Window, A::LocalUi, C::Any),
         // The manual reset of the focused view's terminal to its host defaults: runtime engine
         // state only (`LocalUi`, the class of the font zoom), and it needs a terminal leaf.
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
@@ -293,45 +301,59 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
     Some(result)
 }
 
-pub(crate) fn editor_command(command: &crate::native_editor::EditorCommand) -> CommandSpec {
-    use crate::native_editor::EditorCommand as E;
-    use ActionAuthority as A;
-    use CommandScope as S;
-    use ContentRequirement as C;
+/// The registry's row for an editor command, derived from the engine's own
+/// closed table: its exact name is its id ([`EditorCommand::name`]) and its
+/// authority is [`EditorCommand::authority`]'s, so a command a later slice
+/// adds to the engine is registered here with no edit to this file.
+///
+/// [`EditorCommand::name`]: crate::native_editor::EditorCommand::name
+/// [`EditorCommand::authority`]: crate::native_editor::EditorCommand::authority
+pub(crate) fn editor_command(command: crate::native_editor::EditorCommand) -> CommandSpec {
+    spec(
+        command.name(),
+        CommandScope::Document,
+        editor_action_authority(command.authority()),
+        ContentRequirement::Native,
+    )
+}
 
-    let authority = match command {
-        E::Save | E::RevertBuffer => A::DocumentWrite,
-        E::DeleteBackward
-        | E::DeleteForward
-        | E::IndentForTab
-        | E::KillRegion
-        | E::KillLine
-        | E::Yank
-        | E::YankPop
-        | E::Undo
-        | E::Redo
-        | E::StartMacro
-        | E::EndMacro
-        | E::PlayMacro => A::DocumentWrite,
-        E::MoveBackward
-        | E::MoveForward
-        | E::MoveLineUp
-        | E::MoveLineDown
-        | E::ScrollPageDown
-        | E::ScrollPageUp
-        | E::MoveLineStart
-        | E::MoveLineEnd
-        | E::MoveWordBackward
-        | E::MoveWordForward
-        | E::SetMark
-        | E::Abort
-        | E::UniversalArgument
-        | E::ExecuteCommand
-        | E::IncrementalSearch
-        | E::GotoLine
-        | E::SwitchBuffer => A::LocalUi,
-    };
-    spec(command.name(), S::Document, authority, C::Native)
+/// The host ceiling an editor authority class asks for: moving and reading
+/// is local UI, editing and saving write the document, copying out is the
+/// clipboard, and naming other files or running a program is the owner's.
+pub(crate) const fn editor_action_authority(
+    authority: crate::native_editor::CommandAuthority,
+) -> ActionAuthority {
+    use crate::native_editor::CommandAuthority as E;
+    match authority {
+        E::Read => ActionAuthority::LocalUi,
+        E::Edit | E::Save => ActionAuthority::DocumentWrite,
+        E::Clipboard => ActionAuthority::Clipboard,
+        E::Files | E::Spawn => ActionAuthority::Owner,
+    }
+}
+
+/// Whether a control client's gesture reaches `authority`: it may look at,
+/// move through, edit and save the document it was pointed at, and nothing
+/// that reaches past it (the clipboard, other files, a program).
+const fn controller_reaches(authority: ActionAuthority) -> bool {
+    matches!(
+        authority,
+        ActionAuthority::Observe
+            | ActionAuthority::LocalUi
+            | ActionAuthority::DocumentRead
+            | ActionAuthority::DocumentWrite
+    )
+}
+
+/// The editor authority classes a gesture carries, read off the host
+/// ceiling each class asks for. A person at the window holds every class; a
+/// control client's gesture (`act`, `pointer`, `key` and `text` into an
+/// Editor) holds Read, Edit and Save.
+pub(crate) fn editor_grant(controller: bool) -> Vec<crate::native_editor::CommandAuthority> {
+    crate::native_editor::CommandAuthority::ALL
+        .into_iter()
+        .filter(|class| !controller || controller_reaches(editor_action_authority(*class)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -409,12 +431,109 @@ mod tests {
     #[test]
     fn editor_mutations_and_navigation_have_distinct_authority() {
         assert_eq!(
-            editor_command(&crate::native_editor::EditorCommand::GotoLine).authority,
+            editor_command(crate::native_editor::EditorCommand::GotoLine).authority,
             ActionAuthority::LocalUi
         );
         assert_eq!(
-            editor_command(&crate::native_editor::EditorCommand::RevertBuffer).authority,
+            editor_command(crate::native_editor::EditorCommand::RevertBuffer).authority,
             ActionAuthority::DocumentWrite
         );
+    }
+
+    /// Every editor command has a row, named exactly as M-x names it and
+    /// carrying the host ceiling of the engine's authority class; a control
+    /// client's grant holds Read, Edit and Save and nothing past them.
+    #[test]
+    fn editor_rows_carry_their_authority() {
+        use crate::native_editor::{CommandAuthority as E, EditorCommand};
+        let mut ids = std::collections::BTreeSet::new();
+        for command in EditorCommand::ALL {
+            let row = editor_command(command);
+            assert_eq!(row.id.as_str(), command.name());
+            assert!(ids.insert(row.id), "{command:?} shares an id");
+            assert_eq!(row.scope, CommandScope::Document);
+            assert_eq!(row.content, ContentRequirement::Native);
+            assert_eq!(
+                row.authority,
+                editor_action_authority(command.authority()),
+                "{command:?}"
+            );
+        }
+        let ceilings = E::ALL.map(editor_action_authority);
+        assert_eq!(
+            ceilings,
+            [
+                ActionAuthority::LocalUi,
+                ActionAuthority::DocumentWrite,
+                ActionAuthority::DocumentWrite,
+                ActionAuthority::Owner,
+                ActionAuthority::Clipboard,
+                ActionAuthority::Owner,
+            ]
+        );
+        assert_eq!(editor_grant(false), E::ALL);
+        assert_eq!(editor_grant(true), [E::Read, E::Edit, E::Save]);
+        assert!(!controller_reaches(ActionAuthority::Clipboard));
+        assert!(!controller_reaches(ActionAuthority::Owner));
+        let kill_ring_save = editor_command(EditorCommand::KillRingSave);
+        assert_eq!(kill_ring_save.id.as_str(), "kill-ring-save");
+        assert_eq!(kill_ring_save.authority, ActionAuthority::Clipboard);
+        assert!(!editor_grant(true).contains(&EditorCommand::KillRingSave.authority()));
+    }
+
+    /// The host's keybinding table reads every key before the Editor does,
+    /// so a chord it binds never reaches the editor's keymap. This lists
+    /// every editor binding the host table shadows on this platform. Off
+    /// macOS that is M-left and M-right, the pane-focus seeds, which pass
+    /// through to the editor in a one-pane tab
+    /// (`keybinding::pane_focus_passes_through`); macOS seeds none.
+    #[test]
+    fn host_keybindings_shadow_only_the_listed_editor_chords() {
+        use crate::native_editor::{KeyChord, Keymap, Platform, Profile};
+        use aterm_window::keyboard::{Key as WinitKey, ModifiersState, NamedKey, SmolStr};
+        let host = crate::keybinding::Keybindings::platform_defaults();
+        let winit = |chord: &KeyChord| {
+            let key = match chord.key.as_str() {
+                "space" => WinitKey::Named(NamedKey::Space),
+                "backspace" => WinitKey::Named(NamedKey::Backspace),
+                "delete" => WinitKey::Named(NamedKey::Delete),
+                "enter" => WinitKey::Named(NamedKey::Enter),
+                "escape" => WinitKey::Named(NamedKey::Escape),
+                "tab" => WinitKey::Named(NamedKey::Tab),
+                "left" => WinitKey::Named(NamedKey::ArrowLeft),
+                "right" => WinitKey::Named(NamedKey::ArrowRight),
+                key => {
+                    assert_eq!(key.chars().count(), 1, "unmapped editor key {key}");
+                    WinitKey::Character(SmolStr::new(key))
+                }
+            };
+            let mut mods = ModifiersState::empty();
+            mods.set(ModifiersState::CONTROL, chord.control);
+            mods.set(ModifiersState::ALT, chord.meta);
+            mods.set(ModifiersState::SHIFT, chord.shift);
+            (key, mods)
+        };
+        let mut shadowed = Vec::new();
+        for (keys, command) in Keymap::emacs(Profile::Gui(Platform::HOST)).bindings() {
+            for chord in &keys {
+                let (key, mods) = winit(chord);
+                if let Some(action) = host.lookup(&key, mods) {
+                    shadowed.push(format!(
+                        "{} {} ({action:?})",
+                        chord.display(),
+                        command.name()
+                    ));
+                }
+            }
+        }
+        let expected: &[&str] = if cfg!(target_os = "macos") {
+            &[]
+        } else {
+            &[
+                "M-left backward-word (FocusPaneLeft)",
+                "M-right forward-word (FocusPaneRight)",
+            ]
+        };
+        assert_eq!(shadowed, expected);
     }
 }

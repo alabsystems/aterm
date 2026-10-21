@@ -42,6 +42,24 @@ pub(crate) fn default_cursor_trail_style() -> &'static str {
     }
 }
 
+/// The cursor style an aterm.toml draws from its `cursor_trail_style`
+/// (`style`) and the retired `cursor_trail` master (`master`), trimmed: the
+/// one fold [`Config::cursor_trail_style_raw`] and the writer
+/// (`prefs::apply_prefs_edits`, which keeps the style Off replaced) both
+/// read. `master = false` is Off whatever the style says, and `master =
+/// true` with no style names the default style; unset, the platform's
+/// default ([`default_cursor_trail_style`]).
+pub(crate) fn drawn_cursor_trail_style(master: Option<bool>, style: Option<&str>) -> &str {
+    if master == Some(false) {
+        return "off";
+    }
+    match style {
+        Some(style) => style.trim(),
+        None if master == Some(true) => crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+        None => default_cursor_trail_style(),
+    }
+}
+
 /// Platform default for `line_height`, the cell-box multiplier: `1.1` on
 /// Windows, `1.0` everywhere else.
 ///
@@ -143,18 +161,22 @@ pub(crate) struct Config {
     /// included; its default follows [`DEFAULT_DECORATIVE_EFFECTS`] (owner,
     /// 2026-09-08).
     pub(crate) cursor_momentum_glow: Option<bool>,
-    /// Trail style: `rainbow kitty pet` (default: rainbow ribbon plus the
-    /// full-body cat; every kitty-named spelling, bare `kitty` included, selects
-    /// it), `rainbow kitty flying` (the ribbon under the flying kitty head; also
-    /// `flying kitty`, `kitty flying`, `nyan rainbow`, `nyan`, `rainbow`),
-    /// `rainbow kitty underline`, `rainbow kitty tall` (the default full-height
-    /// geometry), `phaser`, `comet`, `lumen`, `sparkle`, `fire`, `laser`,
-    /// `water`, `beam`, or `off`.
+    /// Trail style: one of the Cursor Styles rows — `off`, `rainbow kitty pet`
+    /// (default: rainbow ribbon plus the full-body cat; `rainbow kitty`, bare
+    /// `kitty` and the `… tall` spellings are aliases of it), `rainbow kitty
+    /// underline`, `rainbow dog pet`, `rainbow kitty flying` (the ribbon under
+    /// the flying kitty head; also `flying kitty`, `kitty flying`, `nyan
+    /// rainbow`, `nyan`, `rainbow`), `rainbow kitty flat`, `phaser`, `fire`,
+    /// `water`, `laser` (listed as Lightning; also `lightning`), `comet`,
+    /// `sparkle`, `lumen`, `beam`, `classic` (the old `classic mono` spellings
+    /// are aliases of it that keep its one-colour face). The vocabulary is
+    /// `aterm_effects::cursor_glow::spellings`.
     ///
-    /// Rainbow kitty styles draw the engine in `docs/design/RAINBOW-KITTY-V2.md`;
-    /// `… v2` spellings mean the same as the bare ones. Unknown spellings
-    /// (including `… v1`) fall back to the default, and the fallback is reported
-    /// (`--validate-config`, the load-time warning, `trail status`'s `resolved=`).
+    /// Rainbow kitty styles draw the engine in `docs/design/RAINBOW-KITTY-V2.md`.
+    /// Unknown spellings (the retired `… v2`, `… v1` and `pack:` ones
+    /// included) fall back to the default, and the fallback is reported
+    /// (`--validate-config`, the load-time warning, `trail status`'s
+    /// `resolved=`).
     pub(crate) cursor_trail_style: Option<String>,
     /// Music effects (Settings ▸ Sound): the master switch for every synth
     /// voice (`sound_policy::voice_gain`). Default on. Each style's typing
@@ -194,13 +216,23 @@ pub(crate) struct Config {
     /// Audible terminal bell (default on). BEL rings the system alert sound
     /// (`NSBeep` on macOS, `MessageBeep` on Windows), outside the trail synth's
     /// volume controls. `false` suppresses the beep only; the visual bell and the
-    /// attention request stay. Inert off macOS/Windows.
+    /// attention request stay. Inert off macOS/Windows, and in a `--headless`
+    /// instance, which never beeps (`App::on_bell`).
     pub(crate) bell_sound: Option<bool>,
-    /// Trail colour, `#RRGGBB`. Defaults to the (themed) cursor colour, so the
-    /// trail matches the cursor unless overridden here.
+    /// Trail colour, `#RRGGBB`. Unset, the style's automatic colour
+    /// (`aterm_effects::cursor_fx::automatic_glow_color`): laser, beam, comet
+    /// and sparkle their own hue (beam, comet and sparkle wear a configured
+    /// `cursor_color` or a program's OSC 12), every other style the live cursor
+    /// colour. Where it lands is `GlowStyle::reads_knob`: Classic draws its
+    /// one-colour face in it; Fire, Water, Phaser and the rainbow styles wear
+    /// it only on a bar cursor's light rod.
     pub(crate) cursor_trail_color: Option<String>,
-    /// Secondary/accent colour, `#RRGGBB` (comet tail + landing ring of the LUMEN
-    /// styles). Defaults to a brightened cursor colour.
+    /// Secondary/accent colour, `#RRGGBB`. Where it lands is
+    /// `GlowStyle::reads_knob`: Lumen and Comet shade their wake with it on a
+    /// dark ground, and their landing ring; Classic its one-colour face and
+    /// its ring; Phaser and Sparkle only the landing ring; the other looks
+    /// never read it. Defaults to the style's automatic colour (or a trail
+    /// colour the style draws) brightened 1.5×.
     pub(crate) cursor_trail_accent: Option<String>,
     /// Path to a PNG sprite for the flying cat on the `rainbow kitty flying`
     /// style (RGBA or RGB, ideally small right-facing pixel art), nearest-scaled
@@ -276,6 +308,16 @@ pub(crate) struct Config {
     /// briefly show unechoed input behind a remote raw-mode link until it is
     /// reconciled or expires; `adaptive` requires current-line echo proof.
     pub(crate) predictive_echo: Option<String>,
+    /// Predictive editing (default on): with `predictive_echo` on, a bare `←` or
+    /// `→` (the main block's or the keypad's) and a Backspace at the end of the
+    /// line are predicted as edits of the line. In `adaptive` a Backspace shows
+    /// at once on a line that has proven it echoes, and an arrow only once the
+    /// shell has also echoed an arrow of that line exactly (an echoed Backspace
+    /// proves no arrow; a cooked `cat` echoes `^[[D` and never shows one);
+    /// `always` shows both at once, unproven, as it shows typing. Off, those keys
+    /// are predicted as they were before (an arrow ends the proof, a Backspace
+    /// cancels only a guess of its own). The kill switch.
+    pub(crate) predictive_echo_editing: Option<bool>,
     /// Focus-linked shell priority (Windows): while a window is focused, its
     /// visible tab's shell processes and ConPTY hosts run above normal priority
     /// with EcoQoS off so keystroke echo is not starved; on blur they return to
@@ -402,7 +444,10 @@ pub(crate) struct Config {
     /// values fall back to `srgb`. Hot-reloadable; inert off macOS and on the CPU
     /// present path.
     pub(crate) window_colorspace: Option<String>,
-    /// `true` (default) makes Alt/Option send ESC-prefixed (Meta) sequences;
+    /// `true` (default) makes Alt/Option send ESC-prefixed (Meta) sequences,
+    /// except that on macOS an Option chord typing a printable ASCII character
+    /// no key on the layout types bare or with Shift (German Option+L → `@`,
+    /// French Option+( → `{`) types that character, as AltGr does on Linux;
     /// `false` forwards the OS-composed text (Option+A → `å` on macOS) while
     /// non-text Alt chords still use the encoder. See
     /// [`Config::option_as_meta_or_default`].
@@ -540,10 +585,13 @@ pub(crate) struct Config {
     /// `messages.log`. Program notifications (OSC 9/99/777) are governed by
     /// `allow_notifications`. Applied live (`notify::spawn_delivery`).
     pub(crate) desktop_alerts: Option<bool>,
-    /// Whether each fresh session spawn also installs or updates the coding-agent
-    /// primer and bundled skills for every detected agent (the `aterm agents
-    /// install` upsert, on a detached thread, at most once a minute). Default on.
-    /// `false` stops it entirely, which is what makes `aterm agents remove` stick.
+    /// Whether the window's launch and each fresh session spawn also install or
+    /// update the coding-agent primer and bundled skills for every detected agent
+    /// (the `aterm agents install` upsert, on a detached thread, at most once a
+    /// minute; the launch's pass, once its first frame is on glass, covers the
+    /// tabs an update hands over). Default
+    /// on. `false` stops it entirely, which is what makes `aterm agents remove`
+    /// stick.
     pub(crate) agents_auto_prime: Option<bool>,
     /// BiDi handling: `"implicit"` (default, per-line UAX#9 reordering),
     /// `"disabled"` (logical order), or `"explicit"` (app-controlled). Maps to the
@@ -818,8 +866,9 @@ pub(crate) struct Config {
     /// up its shells and the next launch reattaches them. Absent means off. Read
     /// at launch. See [`KeeperConfig`].
     pub(crate) keeper: Option<KeeperConfig>,
-    /// The session log's disk journal (`[session_log]`,
-    /// `docs/DESIGN-session-log-2026-10-15.md` §5.3): absent means off. Read
+    /// The session log's disk journal and tab clause (`[session_log]`,
+    /// `docs/DESIGN-session-log-2026-10-15.md` §5.3, §7.3): absent means the
+    /// journal follows the desk and `restore_session` (D3, ruled on). Read
     /// at launch. See [`SessionLogConfig`].
     pub(crate) session_log: Option<SessionLogConfig>,
     /// The `[harness]` policy ([`HarnessPolicy`]), read from the file's whole
@@ -1299,6 +1348,22 @@ fn admit_theme_file(
 ) -> aterm_types::scheme::ThemePackage {
     let measured = measured_appearance(parsed.scheme.background);
     aterm_types::scheme::ThemePackage::admit(parsed, id, measured)
+}
+
+/// A loaded theme file's label wherever it is listed (the command palette's
+/// Theme section, Settings' theme pickers): its own `name =` verbatim, and the
+/// id config writes after [`crate::native_ui::FACT_SEPARATOR`] where they
+/// differ, so two files that share a name stay apart.
+pub(crate) fn theme_file_label(id: &str, meta: &aterm_types::scheme::ThemeMeta) -> String {
+    if meta.display_name == id {
+        id.to_string()
+    } else {
+        format!(
+            "{}{}{id}",
+            meta.display_name,
+            crate::native_ui::FACT_SEPARATOR
+        )
+    }
 }
 
 /// The partial-apply reason for a loaded theme from a newer schema: which
@@ -2919,7 +2984,8 @@ impl PrivacyWarmup {
 pub(crate) struct PrivacyConfig {
     /// Master for the consent lane. Absent means on. Off, every consent field
     /// reads `unknown` (aterm stopped looking, not "denied"), no probe, notice
-    /// or launch hand-over runs, and the warm-up is neither offered nor walked.
+    /// or launch hand-over runs, the warm-up is neither offered nor walked, and
+    /// the `tccd` observer is off in every mode, Full included.
     pub(crate) enabled: Option<bool>,
     /// Silent macOS access probes. Absent means on. The Full Disk Access probe
     /// opens the user's TCC.db read-only, unread (the system one where macOS
@@ -3017,14 +3083,17 @@ impl Config {
     }
 }
 
-/// The `[session_log]` table: `journal` (default off: D3, decided 2026-10-19, opt-in)
-/// keeps a disk journal of what each session did, so `log @<sid>` and `brief
-/// @<sid>` answer for a session from an earlier run or a crash
-/// (`crate::session_log_journal`). Off, aterm creates no file or directory
-/// for it, starts no thread and deletes nothing. `clause` (default off;
-/// session log phase 3B) adds the log's clause to a tab's tooltip and context
-/// menu (`now: running shell`), never to its label (D6); off, both are
-/// today's, byte for byte.
+/// The `[session_log]` table: `journal` (default on: D3, ruled 2026-10-19;
+/// it follows `restore_session` and the desk, so a headless instance and
+/// Windows keep none) keeps a disk journal of what each session did, so `log
+/// @<sid>` and `brief @<sid>` answer for a session from an earlier run or a
+/// crash (`crate::session_log_journal`). `journal = false` is the opt-out:
+/// aterm then creates no file or directory for it, starts no thread and
+/// deletes nothing. `clause` (default on: D6, ruled 2026-10-19; session log
+/// phase 3B) adds the log's clause to a tab's tooltip and context menu (`now:
+/// running shell`, a shown label with its author), never to its label;
+/// `clause = false` is the opt-out, and then both are as they were before
+/// the clause, byte for byte.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
 #[serde(default)]
@@ -3035,24 +3104,25 @@ pub(crate) struct SessionLogConfig {
 
 impl Config {
     /// Whether the session journal is asked for (`[session_log] journal`,
-    /// default `false`). It also follows `restore_session` and the desk
+    /// default `true`: D3, ruled 2026-10-19; `journal = false` opts out). It
+    /// also follows `restore_session` and the desk
     /// (`session_log_journal::gate`).
     pub(crate) fn session_log_journal(&self) -> bool {
         self.session_log
             .as_ref()
             .and_then(|s| s.journal)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Whether a tab's tooltip and menu show its session log clause
-    /// (`[session_log] clause`, default `false`). Read live at each
-    /// compose: the chrome cache keys on the clause, so a reload is shown at
-    /// the next refresh.
+    /// (`[session_log] clause`, default `true`: D6, ruled 2026-10-19;
+    /// `clause = false` opts out). Read live at each compose: the chrome
+    /// cache keys on the clause, so a reload is shown at the next refresh.
     pub(crate) fn session_log_clause(&self) -> bool {
         self.session_log
             .as_ref()
             .and_then(|s| s.clause)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 }
 
@@ -3073,14 +3143,15 @@ pub(crate) struct MachineConfig {
 ///
 /// ```toml
 /// [sys]
-/// stats_bars = "deck"   # the default; "off" hides the bars
+/// stats_bars = "deck"   # the default; "sill" for the compact form; "off" hides the bars
 /// ```
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
 #[serde(default)]
 pub(crate) struct SysConfig {
     /// The stats bars, Global, aterm and Tab: `"deck"` (default, three full
-    /// bars under the titlebar) or `"off"`. Unknown values show the Deck.
+    /// bars under the titlebar), `"sill"` (three light lanes in the bottom
+    /// pad, no terminal row) or `"off"`. Unknown values show the Deck.
     pub(crate) stats_bars: Option<String>,
 }
 
@@ -3825,6 +3896,13 @@ impl Config {
             .unwrap_or("adaptive")
     }
 
+    /// Predictive editing (`aterm_predict::Predictor::set_editing`). Default on: it
+    /// shows only what the shell's own echoes have proven, and with
+    /// `predictive_echo = "off"` nothing is predicted at all.
+    pub(crate) fn predictive_echo_editing_or_default(&self) -> bool {
+        self.predictive_echo_editing.unwrap_or(true)
+    }
+
     /// Focus-linked shell priority boost. Default on: a few syscalls per focus or
     /// tab change and none while typing; touches only the shell root and its
     /// console host.
@@ -3844,12 +3922,42 @@ impl Config {
     }
 
     /// The explicit trail-colour override as packed `0x00RRGGBB`, if `cursor_trail_color`
-    /// is set and valid. `None` → the caller falls back to the themed cursor colour.
+    /// is a colour. `None` → the caller falls back to the themed cursor colour
+    /// (and `cursor`, [`Self::trail_color`], is that colour chosen).
     pub(crate) fn cursor_trail_color_u32(&self) -> Option<u32> {
-        self.cursor_trail_color
-            .as_deref()
-            .and_then(aterm_types::scheme::parse_hex)
-            .map(rgb_u32)
+        match self.trail_color() {
+            aterm_effects::cursor_fx::TrailColor::Pinned(color) => Some(color),
+            _ => None,
+        }
+    }
+
+    /// What `cursor_trail_color` says ([`crate::prefs::trail_color_setting`]):
+    /// each style's automatic colour, the cursor's colour chosen, or a colour.
+    pub(crate) fn trail_color(&self) -> aterm_effects::cursor_fx::TrailColor {
+        crate::prefs::trail_color_setting(self.cursor_trail_color.as_deref())
+    }
+
+    /// The cursor family's knobs as this config sets them, for a trail that
+    /// may draw (`enabled`: Serious Mode folded in by the host) against
+    /// `theme_cursor` in `presentation` (its brightness default is the
+    /// style's, [`Self::cursor_trail_intensity_for`]): the one reading
+    /// [`resolve_cursor_glow`] takes from a window's config.
+    pub(crate) fn cursor_glow_inputs(
+        &self,
+        enabled: bool,
+        theme_cursor: u32,
+        presentation: ResolvedTrailPresentation,
+    ) -> CursorGlowInputs {
+        CursorGlowInputs {
+            enabled,
+            color: self.trail_color().knob(theme_cursor),
+            accent: self.cursor_trail_accent_u32(),
+            duration_ms: self.cursor_trail_ms_or_default(),
+            length: self.cursor_trail_length_or_default(),
+            intensity: self.cursor_trail_intensity_for(presentation),
+            radius: self.cursor_trail_radius_or_default(),
+            ring: self.cursor_trail_ring_or_default(),
+        }
     }
 
     /// The primary-font request: `font_family`, the person's own font. A
@@ -3896,21 +4004,23 @@ impl Config {
     /// still reads: `cursor_trail = false` is Off whatever the style says, and
     /// `cursor_trail = true` with no style names the default style.
     pub(crate) fn cursor_trail_style_raw(&self) -> &str {
-        if self.cursor_trail == Some(false) {
-            return "off";
-        }
-        match self.cursor_trail_style.as_deref() {
-            Some(style) => style.trim(),
-            None if self.cursor_trail == Some(true) => crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-            None => default_cursor_trail_style(),
-        }
+        drawn_cursor_trail_style(self.cursor_trail, self.cursor_trail_style.as_deref())
     }
 
-    /// Trail brightness, default 1.0, clamped 0.0..=1.0. Non-finite values
-    /// (`nan` is valid TOML) read as `0.0`, since NaN would slip past every
-    /// downstream `intensity <= 0.0` check.
-    pub(crate) fn cursor_trail_intensity_or_default(&self) -> f32 {
-        let v = self.cursor_trail_intensity.unwrap_or(1.0);
+    /// Trail brightness for the resolved style, clamped 0.0..=1.0. Unset, the
+    /// style's own default (`aterm_effects::cursor_fx::default_trail_intensity`:
+    /// 1.0, and Classic's spectrum face the v0.28 release's 0.7; a trail
+    /// colour, the cursor's chosen included, draws its one-colour face).
+    /// Non-finite values (`nan` is valid TOML) read as `0.0`, since NaN would
+    /// slip past every downstream `intensity <= 0.0` check.
+    pub(crate) fn cursor_trail_intensity_for(
+        &self,
+        presentation: ResolvedTrailPresentation,
+    ) -> f32 {
+        let mono = presentation.classic_mono || self.trail_color().chosen();
+        let v = self.cursor_trail_intensity.unwrap_or(
+            aterm_effects::cursor_fx::default_trail_intensity(presentation.style.style, mono),
+        );
         if v.is_finite() {
             v.clamp(0.0, 1.0)
         } else {
@@ -4847,8 +4957,9 @@ impl Config {
     /// Config only — `crate::consent_observer` takes this resolved value as an
     /// argument and reads no environment knob of its own, so a program inside
     /// a session has nothing to flip. Whether a sentinel actually STARTS is
-    /// the host's call (`App::effective_observer_mode`): it needs the card's
-    /// own switches on, since it exists only to feed the card.
+    /// the host's call (`App::effective_observer_mode`): every mode needs the
+    /// master switch on, and the sentinel needs the card's own switches too,
+    /// since it exists only to feed the card.
     pub(crate) fn privacy_observer_mode(&self) -> crate::consent_observer::ObserverMode {
         use crate::consent_observer::ObserverMode;
         match self.privacy.as_ref().and_then(|p| p.observer) {
@@ -5500,21 +5611,23 @@ impl Config {
              nyan rainbow/nyan/rainbow/tall rainbow/ember/ocean)",
             default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
             options = crate::prefs::CURSOR_TRAIL_STYLES.join("|"),
-            // A listed style first; else an alias, which loads as the
-            // style it names.
+            // The near miss is drawn from every accepted spelling and named by
+            // the canonical it resolves to, so an alias (`rainbow kity` →
+            // `rainbow kitty`) still finds its look under the name Settings
+            // writes.
             suggestion = crate::native_config_language::nearest_enum_value(
                 raw,
-                crate::prefs::CURSOR_TRAIL_STYLES
+                &crate::prefs::CURSOR_TRAIL_STYLES
+                    .iter()
+                    .copied()
+                    .chain(
+                        crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
+                            .iter()
+                            .map(|&(alias, _)| alias),
+                    )
+                    .collect::<Vec<_>>(),
             )
-            .or_else(|| {
-                crate::native_config_language::nearest_enum_value(
-                    raw,
-                    &crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
-                        .iter()
-                        .map(|(alias, _)| *alias)
-                        .collect::<Vec<_>>(),
-                )
-            })
+            .and_then(crate::prefs::cursor_trail_style_canonical)
             .map_or_else(String::new, |near| format!(" — did you mean {near:?}?")),
         ))
     }
@@ -7889,8 +8002,10 @@ pub(crate) fn resolve_trail_presentation_from_style(
 /// The spelling the raw-token predicates must read: what the trail draws, not
 /// what was authored. The companion, species, comet and ribbon forks are string
 /// predicates, so a typo must be replaced by the spelling
-/// [`resolve_trail_style`] settled on. Aliases collapse onto their canonical
-/// (pinned by `prefs`' `cursor_trail_style_aliases_agree_with_engine_parse`).
+/// [`resolve_trail_style`] settled on. Aliases collapse onto their canonical in
+/// one step (`aterm_effects::cursor_glow::spellings`; `prefs`'
+/// `no_spelling_that_loaded_before_changes_what_it_draws` pins that the
+/// collapse changes no look).
 #[cfg(test)]
 pub(crate) fn effective_trail_style_token(raw: &str) -> &str {
     let raw = raw.trim();
@@ -7901,7 +8016,9 @@ pub(crate) fn effective_trail_style_token(raw: &str) -> &str {
 /// Cold-path construction of the engine's `GlowConfig` through
 /// [`aterm_effects::cursor_fx::resolve_glow_config`] (shared with the web
 /// pipeline). The live terminal and Settings preview differ only in injected
-/// geometry/theme facts (`dark_theme`, `head_dx`).
+/// geometry/theme facts (`dark_theme`, `head_dx`) and in a pinned cursor
+/// colour, which the live frame folds through
+/// `aterm_effects::cursor_fx::automatic_glow_color`.
 pub(crate) fn resolve_cursor_glow(
     inputs: CursorGlowInputs,
     presentation: ResolvedTrailPresentation,
@@ -8565,7 +8682,8 @@ impl App {
             let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
             let cell_h = self.win_cell_size(wid).1;
             let strip = self.synthetic_strip_head_px(scale, cell_h);
-            // The stats Deck sits under the strip band (`crate::stats_deck`).
+            // The stats Deck takes the head's top, the strip band under it
+            // (`App::deck_rows_px`).
             let head = strip + crate::stats_deck::deck_px(self.stats_bars_form(), scale);
             if let Some(ws) = self
                 .windows
@@ -8933,7 +9051,7 @@ impl App {
         // compositor backdrop the raw recording lacks) can present.
         let _ = self.video_abort_translucent_swapchain(
             self.render_knobs.background_opacity,
-            cfg!(target_os = "macos"),
+            crate::HOST_CAPTURE.compositor_blends_client,
         );
         self.backend
             .set_background_opacity(self.render_knobs.background_opacity);
@@ -9135,7 +9253,10 @@ impl App {
             KnobChange::BackgroundOpacity(v) => {
                 // The recording was admitted opaque; abort it before a translucent
                 // raw layer can be appended.
-                let _ = self.video_abort_translucent_swapchain(v, cfg!(target_os = "macos"));
+                let _ = self.video_abort_translucent_swapchain(
+                    v,
+                    crate::HOST_CAPTURE.compositor_blends_client,
+                );
                 self.backend.set_background_opacity(v);
                 // On the GPU backend, re-apply the window/layer opacity flip and
                 // backdrop. The CPU surface is opaque, so it stays solid and warns
@@ -9993,12 +10114,6 @@ impl App {
         // (`typing_sound_to_audition_on_swap`; an in-app pick already auditioned
         // and latched it, so its reload is silent). Decided before the swap.
         let audition_voice = self.typing_sound_to_audition_on_swap(&config);
-        // A changed privacy probe gate is applied before the swap.
-        if self.config.privacy_probe_gate() != config.privacy_probe_gate() {
-            // Retire an in-flight answer even if an off/on pair of reloads
-            // arrives before any card/status read sees the intermediate state.
-            self.consent.invalidate();
-        }
         // The Claude footer's `[claude_footer]` switches change what every
         // window's Claude Code panes show — an idle background window too,
         // which no other branch below repaints.
@@ -10007,6 +10122,8 @@ impl App {
         // (or no longer), after the swap so the look reads the new table.
         let ai_changed = self.config.ai != config.ai;
         self.config = config.clone();
+        self.reconcile_consent_config();
+        let _ = self.reconcile_consent_observer();
         // The fleet listener follows `[fleet]` live: a changed table rebinds it.
         crate::fleet_listen::configure_fleet_listener(self.config.fleet.as_ref());
         // The fleet glance follows `[fleet] watch`.
@@ -10518,9 +10635,22 @@ impl App {
             config.window_padding_or_default(),
             config.window_padding_top_or_default(),
         );
-        // The Deck (`[sys] stats_bars`) is part of the head, so turning it on or
-        // off re-grids the same way.
-        let stats_bars_changed = old_stats_bars != config.stats_bars_or_default();
+        // The Deck (`[sys] stats_bars`) is part of the head, so a change into or
+        // out of it re-grids the same way. The sill and off take no row, so a
+        // change between them re-grids nothing (only repaints, below).
+        let new_stats_bars = config.stats_bars_or_default();
+        let stats_bars_changed = old_stats_bars.takes_room() != new_stats_bars.takes_room();
+        // View ▸ Stats Bars' radio reads the applied form (`validateMenuItem:`
+        // cannot reach the App), so every apply republishes it.
+        crate::menu::set_stats_bars_form(new_stats_bars);
+        if old_stats_bars != new_stats_bars {
+            for ws in self.windows.values_mut() {
+                ws.stats_lens = crate::stats_lens::LensSlot::default();
+                if let Some(w) = ws.os_window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+        }
         if !backend_rebuild_needed && (old_padding != new_padding || stats_bars_changed) {
             let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
                 .windows
@@ -13441,8 +13571,9 @@ mod tab_band_height_tests {
     fn three_lines_restore_the_cascadia_9x21_cell() {
         let family = aterm_render::bundled::CASCADIA_FAMILY;
         if aterm_render::resolve_font_family(family, aterm_render::FaceTarget::REGULAR).is_some() {
-            crate::logging::stderr_line!("SKIP: {family} is installed on this host");
-            return;
+            aterm_spec::host::could_not_run(format!(
+                "{family} is installed on this host, and an installed face wins the name"
+            ));
         }
         let old = cfg("font_family = \"Cascadia Mono PL\"\nfont_px = 16\nline_height = 1.0\n");
         assert_eq!(
@@ -13521,8 +13652,7 @@ mod tab_band_height_tests {
         let Some(renderer) =
             aterm_render::Renderer::from_system(crate::FONT_PX, aterm_render::Theme::default())
         else {
-            crate::logging::stderr_line!("SKIP: no system monospace font");
-            return;
+            aterm_spec::host::could_not_run("no system monospace font here");
         };
         let target = TabBandHeight::Standard.target_logical_px();
         let pad_logical = Config::default().window_padding_top_or_default();
@@ -15010,6 +15140,79 @@ mod trail_style_resolution_tests {
             ..Config::default()
         }
         .cursor_trail_style_warning()
+    }
+
+    /// CLASSIC RECEIVES THE SHIPPED KNOBS: a window whose user named Classic
+    /// and set no knob hands the engine 260 ms, 24 cells, the v0.28 release's
+    /// 0.7 brightness, a 0.6-cell crown and the ring, the knobs aterm-effects'
+    /// `the_host_resolved_dark_wake_is_byte_identical_to_its_base` pins the
+    /// dark wake on, through the window's own resolution (`App::glow_config`).
+    /// Negative controls: a set length and a set brightness reach the engine
+    /// as set, and the one-colour face's and another style's unset brightness
+    /// are full.
+    #[test]
+    fn classic_receives_the_shipped_knobs() {
+        let mut app = crate::App::headless_for_test();
+        app.config.cursor_trail_style = Some("classic".to_string());
+        let cfg = app.glow_config();
+        assert_eq!(
+            (
+                cfg.style,
+                cfg.enabled,
+                cfg.duration,
+                cfg.length,
+                cfg.intensity,
+                cfg.radius,
+                cfg.ring,
+                cfg.beam,
+                cfg.classic_mono,
+                cfg.head_dx,
+            ),
+            (
+                GlowStyle::Classic,
+                true,
+                std::time::Duration::from_millis(260),
+                24,
+                aterm_effects::cursor_fx::CLASSIC_DEFAULT_INTENSITY,
+                0.6,
+                true,
+                true,
+                false,
+                0.5,
+            ),
+            "the window hands Classic other knobs than the dark wake is pinned on"
+        );
+        assert_eq!(
+            aterm_effects::cursor_fx::CLASSIC_DEFAULT_INTENSITY,
+            0.7,
+            "Classic's unset brightness is the v0.28 release's"
+        );
+        app.config.cursor_trail_length = Some(18);
+        assert_eq!(
+            app.glow_config().length,
+            18,
+            "control: a set length is read"
+        );
+        app.config.cursor_trail_intensity = Some(1.0);
+        assert_eq!(
+            app.glow_config().intensity,
+            1.0,
+            "control: a set brightness is read"
+        );
+        app.config.cursor_trail_intensity = None;
+        app.config.cursor_trail_color = Some("#d03a8c".to_string());
+        assert_eq!(
+            app.glow_config().intensity,
+            1.0,
+            "control: Classic's one-colour face (a trail colour) draws at full brightness"
+        );
+        app.config.cursor_trail_color = None;
+        app.config.cursor_trail_style = Some("lumen".to_string());
+        assert_eq!(
+            app.glow_config().intensity,
+            1.0,
+            "control: another style's unset brightness is full"
+        );
     }
 
     #[test]

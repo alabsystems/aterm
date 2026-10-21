@@ -1004,23 +1004,21 @@ impl App {
                 } else {
                     None
                 };
-                let (sid, lineage) = self
+                let (sid, lineage, log_ep) = self
                     .pool
                     .get(terminal.session)
                     .map(|s| {
-                        let lineage = s
-                            .ctx
-                            .timeline
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .slog()
-                            .lineage();
+                        let (lineage, log_ep) = {
+                            let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                            (tl.slog().lineage(), tl.slog().log().ep())
+                        };
                         let sid = s.ctx.self_id.as_str();
                         (
                             Some(sid.to_string()).filter(|sid| restore::carried_sid(sid)),
                             lineage
                                 .map(|l| l.as_str().to_string())
                                 .filter(|l| l != sid && restore::carried_sid(l)),
+                            Some(log_ep),
                         )
                     })
                     .unwrap_or_default();
@@ -1040,6 +1038,8 @@ impl App {
                         // Its timer, beside the word it goes with (`sanitized`
                         // keeps it under `cruise` only).
                         land_at: user_meta.land_at,
+                        // Who set the word, beside it (§11.7.3, item 5).
+                        autopilot_by: user_meta.autopilot_set_by.map(|set_by| set_by.carried()),
                         // The spawn-time identity, so the respawn is under it.
                         identity: self
                             .pool
@@ -1077,10 +1077,12 @@ impl App {
                         // may start or end in between.
                         held: !carry_drafts && self.restore_session_held(terminal.session),
                         // THE SESSION IT WAS AND ITS LINEAGE (session log
-                        // phase 2A), constant for a session, so the Commit's
+                        // phase 2A), and the epoch its log is at (phase 6,
+                        // 6A-2), constant for a session, so the Commit's
                         // comparison is unmoved by them.
                         sid,
                         lineage,
+                        log_ep,
                         // The tab's holds ride the layouts an end nobody
                         // chose leaves, with its agent
                         // ([`Self::fill_desk_agents`]); a handoff's session
@@ -1627,6 +1629,9 @@ impl App {
         }
         if !self.config.restore_session_or_default() {
             self.crash_journal.withdraw();
+            // …and the layout this launch took goes too: nothing is restored after a
+            // crash now (`restore::settle_take`).
+            crate::restore::settle_take();
             return;
         }
         // The verbs waiting on a word's image are answered by this lane
@@ -4226,6 +4231,13 @@ impl App {
         let _ = meta.set("attention", leaf.attention.clone());
         let _ = meta.set("questions", leaf.questions.clone());
         let _ = meta.set_autopilot(leaf.autopilot.clone(), leaf.carried_land_at());
+        // Who set it, beside it (§11.7.3, item 5): none where the word was
+        // not stored (one this build cannot read), and no revision steps,
+        // since the write it names was made in another process.
+        meta.autopilot_set_by = leaf.carried_set_by().filter(|_| meta.autopilot.is_some());
+        drop(meta);
+        // A worker an older build started, its identity naming no word.
+        crate::session_timeline::keep_worker_autopilot(&session.ctx);
     }
 
     /// Put `leaf`'s USER identity (its six `meta set` fields) on the shell
@@ -4407,7 +4419,7 @@ impl App {
                         && !live.ctx.fabric.holds().has("local")
                     {
                         for hold in owners.standing() {
-                            let wake = || self.wake_log_watchers(*session, true);
+                            let wake = || live.ctx.watchers.ring_watchers();
                             if !crate::fabric::carry_hold_waking(&live.ctx, hold, &wake) {
                                 aterm_log::warn!(
                                     "session restore: the owner's hold on a reopened tab was not \
@@ -4541,11 +4553,9 @@ impl App {
                 .slog_mut()
                 .seed_lineage(leaf.lineage.as_deref());
         } else if shell.handoff_local_id.is_none() {
-            let owed = note_restored(shell, leaf.sid.as_deref(), leaf.lineage.as_deref());
-            // A bootstrap already served under its sid may have readers.
-            if let FillingShell::Registered(id) = filling {
-                self.wake_log_watchers(id, owed);
-            }
+            // A bootstrap already served under its sid may have readers: an owed
+            // log wake rang its watchers under the timeline lock.
+            let _ = note_restored(shell, leaf.sid.as_deref(), leaf.lineage.as_deref());
         } else if let Some(other) = leaf
             .local_id
             .and_then(|l| self.adopted_session(l))
@@ -4604,16 +4614,13 @@ impl App {
         };
         let ctx = live.ctx.clone();
         let lands = self.harness_ab_reading(session).1;
-        let moved = crate::session_timeline::restore_carried_meta(&ctx, &leaf.carried_user_meta());
+        let mut moved =
+            crate::session_timeline::restore_carried_meta(&ctx, &leaf.carried_user_meta());
+        // A worker an older build started, its identity naming no word.
+        moved |= crate::session_timeline::keep_worker_autopilot(&ctx);
         // A carried word is no move into Land: the landing began before this
         // process (the A/B book's time from Land to landed, §11.6.4).
         self.harness_mode_carried(session, lands);
-        if moved && self.subscribers.any() {
-            self.subscribers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .notify(session);
-        }
         // Its timer, from the pair now stored (design §9.3.6, item 2): the
         // carried one, or a driver's written here first.
         self.index_autopilot_timer(session, Some(crate::autopilot_timers::ClosedOver::Aterm));
@@ -4625,6 +4632,9 @@ impl App {
         wid: WindowId,
         descriptor: &restore::NativeLeafRestore,
     ) -> Result<BuiltRestoreLeaf, String> {
+        // Settings ▸ Harness brought back reads the ledgers and the other
+        // processes' A/B books once, as its arrival does.
+        let mut reads_harness = false;
         match descriptor.restore_tag.as_str() {
             "settings" => {
                 // Every route is a page, Manual included: going to one opens
@@ -4635,6 +4645,9 @@ impl App {
                     .and_then(crate::native_settings::SettingsRoute::from_path)
                     .ok_or_else(|| "Settings route is unavailable".to_string())?;
                 self.stage_settings_restore_view(wid, route)?;
+                // Tab Control needs none: its fleet sweep reads at the first
+                // wake that sees it shown (`App::service_vitals`).
+                reads_harness = route == crate::native_settings::SettingsRoute::Harness;
             }
             "markdown" | "editor" => {
                 let uri = descriptor
@@ -4666,6 +4679,21 @@ impl App {
             if let Some(live) = self.live_view_presentation(view) {
                 presentation = live;
             }
+        }
+        if reads_harness && !self.incoming_handoff_pending {
+            // THE RESTORED PAGE READS AS AN OPENED ONE (the post-landing
+            // check's behaviour-2): staging only navigates the view, which
+            // asks the host for nothing, so without this the page drew this
+            // process's live book alone — `Ends: none yet` over a book on
+            // disk that holds the done — until a Refresh. One off-loop
+            // reading, the Refresh arm's (`execute_native_harness`); a
+            // second restored page joins the one running. Not in an update's
+            // successor before its Commit, which drops the reading's wake
+            // (`drops_wake_before_commit`) and would leave it running for
+            // good, so that no later reading begins: its Commit reads
+            // instead (`App::read_harness_pages_at_commit`).
+            self.start_harness_stats_refresh();
+            self.publish_native_harness_state();
         }
         Ok((view, presentation, Some(staging_tab)))
     }
@@ -5439,8 +5467,8 @@ impl App {
 /// registration opens it, else an `amend - restore` on the open session
 /// (`SessionLog::note_restored`).
 ///
-/// Returns whether the log's readers are owed a wake (phase 3A): the caller
-/// wakes a registered session's subscribers once the lock is released.
+/// Returns whether the log's readers were owed a wake (phase 3A), which rang
+/// the session's watchers under the timeline lock (`slog_take_wake`).
 fn note_restored(session: &crate::Session, prev: Option<&str>, lineage: Option<&str>) -> bool {
     let mut tl = session
         .ctx

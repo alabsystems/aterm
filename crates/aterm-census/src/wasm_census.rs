@@ -191,7 +191,7 @@ fn spawn_sites(root: &Path, scan_dirs: &[String]) -> Vec<SpawnSite> {
     files.retain(|p| !is_test_file(p));
     files.sort();
     for file in files {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = crate::tree::read_to_string(&file) else {
             continue;
         };
         let rel = file
@@ -336,7 +336,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
     for rc in WASM_ROOT_CRATES {
         pub_count.insert(rc, 0);
         for file in crate_source_files(root, rc) {
-            let Ok(text) = std::fs::read_to_string(&file) else {
+            let Ok(text) = crate::tree::read_to_string(&file) else {
                 continue;
             };
             let rel = file
@@ -713,7 +713,6 @@ mod tests {
         files.extend(synth_fixed_roots());
         let root = synth_tree("aterm-wasm-census", "green", &files);
         let out = run_wasm_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "expected GREEN, got:\n{}", out.log);
         assert!(
             out.log.contains("VACUOUS") && out.log.contains("wasm32-unknown-unknown"),
@@ -736,7 +735,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-wasm-census", "red-reintroduced", &files);
         let out = run_wasm_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(
             out.log.contains("[OB-10]") && out.log.contains("crates/aterm-wasm/src/lib.rs:1"),
@@ -764,7 +762,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-wasm-census", "red-ob10", &files);
         let out = run_wasm_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(out.log.contains("[OB-10]"), "log:\n{}", out.log);
         assert!(
@@ -791,7 +788,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-wasm-census", "red-direct", &files);
         let out = run_wasm_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(
             out.log.contains("[OB-10]") && out.log.contains("DIRECT call"),
@@ -811,7 +807,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-wasm-census", "red-ob12", &files);
         let out = run_wasm_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(
             out.log.contains("[OB-12]") && out.log.contains("crates/aterm-grid/src/worker.rs"),
@@ -829,7 +824,6 @@ mod tests {
         ));
         let root = synth_tree("aterm-wasm-census", "green-gated-spawn", &files);
         let out = run_wasm_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             out.ok,
             "a cfg(not(wasm32))-gated spawn must not trip OB-12; log:\n{}",
@@ -846,7 +840,6 @@ mod tests {
             .collect();
         let root = synth_tree("aterm-wasm-census", "red-ob8", &files);
         let out = run_wasm_census(&root);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(!out.ok, "expected RED, got:\n{}", out.log);
         assert!(
             out.log.contains("[OB-8] SCAN-SET DERIVATION FAILED"),

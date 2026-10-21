@@ -1355,8 +1355,10 @@ impl MessageCenter {
         if let Some(title) = r.title {
             let title = clip(&title, TITLE_CAP);
             if title != row.msg.title {
-                // Declared finished words finished the old title.
+                // Declared finished words finished the old title, and its
+                // short form shortened it.
                 row.msg.finished = None;
+                row.msg.short_title = None;
             }
             row.msg.title = title;
         }
@@ -2732,13 +2734,16 @@ impl MessageCenter {
     /// this process), the echoes, the estimator, the load and the motion epoch.
     #[must_use]
     pub fn carried(&self) -> Carry {
-        let mut live: Vec<CarriedMessage> =
-            self.on_glass().map(|l| carried_message(l, true)).collect();
+        let posted = |l: &Live| self.log.get(l.id).map(|rec| rec.posted_severity);
+        let mut live: Vec<CarriedMessage> = self
+            .on_glass()
+            .map(|l| carried_message(l, true, posted(l)))
+            .collect();
         live.extend(
             self.live
                 .iter()
                 .filter(|l| l.revealed && !self.glass.contains(&l.id))
-                .map(|l| carried_message(l, false)),
+                .map(|l| carried_message(l, false, posted(l))),
         );
         Carry {
             next_id: self.log.next_id().raw(),
@@ -2817,6 +2822,7 @@ impl MessageCenter {
                 severity,
                 glyph: Glyph::or_fallback(c.glyph),
                 title: c.title.clone(),
+                short_title: c.short_title.clone(),
                 detail: c.detail.clone(),
                 actions: c.actions.iter().filter_map(|a| Intent::decode(a)).collect(),
                 hold,
@@ -2856,8 +2862,13 @@ impl MessageCenter {
             entry.fold_at = None;
             entry.stale_at = Some(at(now, STALE_HANDOFF));
             entry.carried_pending = true;
-            self.log
-                .adopt_carried(LogRecord::from_posted(id, stamp, &entry.msg));
+            let mut record = LogRecord::from_posted(id, stamp, &entry.msg);
+            record.posted_severity = c
+                .posted_severity
+                .as_deref()
+                .and_then(Severity::parse)
+                .unwrap_or(severity);
+            self.log.adopt_carried(record);
             // The record may be the file's own Posted line, under the mark it
             // was posted with: that is what the Retired line is weighed
             // against, and the ring reads the mark the row shows.
@@ -3802,13 +3813,30 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
     }
     let stats = msg.meter.as_ref().map_or("", |m| m.stats.as_str());
     let moving_fill = ind.moving && ind.fill.is_some();
+    // The excerpt is the ask's one step where the row leads with it (a
+    // notice's ask writes its step first; one led by `lead_with` says its
+    // reason first, and that excerpt is an extra as any other).
+    let step = matches!(
+        msg.need(),
+        crate::need::Need::Now(ask)
+            if msg.excerpt && msg.detail.first().map(String::as_str) == Some(ask.then().words())
+    );
+    // ...and its short form, which stands in its place where the step is not
+    // whole beside the title (a command is never cut).
+    let step_short = match msg.need() {
+        crate::need::Need::Now(ask) if step => ask.then().short(),
+        _ => None,
+    };
     let spec = RowSpec {
         kind,
         severity: msg.severity,
         live: matches!(msg.hold, Hold::Live { .. } | Hold::Standing(_)),
         glyph: msg.glyph.ch(),
         title: &msg.title,
+        title_short: msg.short_title.as_deref(),
         detail0: detail0.as_deref(),
+        step,
+        step_short,
         meter: msg.meter.as_ref().map(|_| (ind.fill, stats)),
         busy: ind.busy && ind.fill.is_none(),
         animated: moving_fill,
@@ -4038,14 +4066,18 @@ fn quit_reading(row: &Live) -> Option<String> {
     Some(format!("{}% when aterm quit", fill.min(1000) / 10))
 }
 
-fn carried_message(l: &Live, on_glass: bool) -> CarriedMessage {
+fn carried_message(l: &Live, on_glass: bool, posted_severity: Option<Severity>) -> CarriedMessage {
     CarriedMessage {
         id: l.id.raw(),
         unix_ms: l.stamp.unix_ms,
         tag: l.msg.tag.as_str().to_string(),
         severity: l.msg.severity.as_str().to_string(),
+        posted_severity: posted_severity
+            .filter(|severity| *severity != l.msg.severity)
+            .map(|severity| severity.as_str().to_string()),
         glyph: l.msg.glyph.ch(),
         title: l.msg.title.clone(),
+        short_title: l.msg.short_title.clone(),
         detail: l.msg.detail.clone(),
         actions: l.msg.actions.iter().map(Intent::encode).collect(),
         hold: l.msg.hold.encode(),

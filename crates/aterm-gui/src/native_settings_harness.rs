@@ -54,8 +54,8 @@
 //!    time, a plain note. Then how long boxes and questions stood (medians,
 //!    Cruise beside Off, with how many each is of), the time held as a share
 //!    of working time where the lead does not say it, the time at the prompt
-//!    with Cruise's finished and pausing shares, Land on its own row, the
-//!    ends (landings, quiet ends, the time from Land to landed; `none yet`),
+//!    with Cruise's pausing share, Land on its own row with its landed share,
+//!    the ends (landings and the time from Land to landed; `none yet`),
 //!    unsupervised time (`none`), and how long it has measured, to when
 //!    (`harness_ab::ab_rows`). Its rows stand where nothing is counted yet,
 //!    so a background landing changes words above SUPERVISION's switches,
@@ -217,7 +217,7 @@ pub(super) const HARNESS_AI_CLIS: &str = "harness/ai-clis";
 pub(super) const HARNESS_TAB_CONTROL: &str = "harness/tab-control";
 
 /// The page's heading (its rail label is the route's, "Harness").
-const HARNESS_PAGE_TITLE: &str = "Coding agent harness";
+pub(super) const HARNESS_PAGE_TITLE: &str = "Coding agent harness";
 
 /// The SUPERVISION card's registry rows: every row of the Harness section, in
 /// the registry's order, so an agent's switch added to the registry is on
@@ -266,10 +266,16 @@ fn harness_page_title(width: f32) -> &'static str {
 }
 
 /// A card's heading at `width`: its full words, else its short ones; a
-/// continued card's says so after them where that fits too.
+/// continued card's says so after them where that fits too. Where not even
+/// the short words are one line, the full words, which the card wraps to its
+/// column ([`caption_node`]) — a caption is never cut ("SUPERVISI…" at 2×
+/// text on a phone-width card).
 pub(super) fn card_heading(full: &str, short: &str, continued: bool, width: f32) -> String {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
-    let fits = |text: &str| crate::tray_raster::ui_text_width_for(face, text, px) <= width;
+    let fits = |text: &str| {
+        crate::tray_raster::ui_text_width_for(face, text, px)
+            <= width + crate::native_ui::TEXT_FIT_SLACK
+    };
     let mut candidates = Vec::new();
     if continued {
         candidates.push(format!("{full} \u{b7} CONTINUED"));
@@ -277,20 +283,17 @@ pub(super) fn card_heading(full: &str, short: &str, continued: bool, width: f32)
     }
     candidates.push(full.to_string());
     candidates.push(short.to_string());
-    if let Some(text) = candidates.iter().find(|text| fits(text)) {
-        return text.clone();
-    }
-    // Not even the short words: they are elided (the card's group keeps its
-    // whole name for a screen reader).
-    let mut chars: Vec<char> = short.chars().collect();
-    while !chars.is_empty() {
-        chars.pop();
-        let text = format!("{}\u{2026}", chars.iter().collect::<String>());
-        if fits(&text) {
-            return text;
-        }
-    }
-    String::new()
+    candidates
+        .iter()
+        .find(|text| fits(text))
+        .cloned()
+        .unwrap_or_else(|| {
+            if continued {
+                format!("{full} \u{b7} CONTINUED")
+            } else {
+                full.to_string()
+            }
+        })
 }
 
 /// The page's palette commands while it is the route.
@@ -394,12 +397,33 @@ impl SettingsApp {
             view.harness_timer_open = (view.harness_timer_open != Some(session)).then_some(session);
             if view.harness_timer_open.is_some() {
                 view.harness_every_timer_open = false;
+                // THE TIMER OPENS IN VIEW: its row's controls, the choices
+                // it opened among them, whole in the list's room — as a
+                // press on a control an edge cuts brings it whole
+                // ([`SettingsViewState::reveal_pressed`]; the final check of
+                // 2026-10-20, F1: opened at the room's edge, its last line
+                // was drawn nowhere). The stop that holds those choices
+                // ([`timer_opening_reveal`]): where the row is listed a part
+                // at a time, not the Timer button's part.
+                view.reveal_pressed(timer_opening_reveal(Some(session)));
+            } else {
+                // THE TIMER CLOSED GIVES BACK THE PLACE ITS OPENING SCROLLED:
+                // the list seats on its stops again, and the press's reveal
+                // keeps the Timer whole under the pointer — the closed row is
+                // drawn whole where it was, never left under the caption
+                // above it (the second review of 2026-10-20, R2).
+                view.drop_list_nudge();
             }
             view.invalidate_result_page_limit();
         } else if action == every_timer_toggle() {
             view.harness_every_timer_open = !view.harness_every_timer_open;
             if view.harness_every_timer_open {
                 view.harness_timer_open = None;
+                // In view, as a row's Timer opens (above).
+                view.reveal_pressed(timer_opening_reveal(None));
+            } else {
+                // Its place given back, as a row's Timer closing (above).
+                view.drop_list_nudge();
             }
             view.invalidate_result_page_limit();
         } else if let Some(press) = parse_every_action(action) {
@@ -473,6 +497,7 @@ pub(super) fn harness_page(
     let maximum = PageLayout::Form.maximum(width);
     let page_width = settings_page_content_width(viewport.width, width, maximum);
     let (heading, heading_height) = pinned_heading(
+        state,
         width,
         viewport,
         gap,
@@ -518,6 +543,7 @@ fn harness_choice_page(
     let gap = settings_page_gap(state, width, cx.viewport);
     let maximum = PageLayout::Form.maximum(width);
     let (mut out, _) = pinned_heading(
+        state,
         width,
         cx.viewport,
         gap,
@@ -542,11 +568,16 @@ fn harness_cards(
     card_width: f32,
     (room, gap): (f32, f32),
 ) -> Vec<(UiNode, f32)> {
-    let inner = (card_width - 2.0 * CARD_PAD).max(0.0);
-    let label_width = about_metadata_label_width();
-    let value_width = (inner - label_width - ABOUT_METADATA_ROW_GAP).max(0.0);
+    let inner = card_text_width(card_width);
     let facts = |key: &str, heading: (&str, &str), rows: &[(String, String)]| {
-        metadata_cards(key, heading, rows, inner, (value_width, label_width))
+        // Each fact card its own label column ([`fact_label_width`]).
+        metadata_cards(
+            key,
+            heading,
+            rows,
+            card_width,
+            fact_label_width(rows, inner),
+        )
     };
     // The page's own width class: a compact row keeps its label beside its
     // control wherever the label gets its room, else above it.
@@ -637,16 +668,15 @@ fn harness_cards(
         .map(|(key, _)| metadata_value_text_width(key, px, false))
         .fold(0.0_f32, f32::max)
         + ABOUT_METADATA_TEXT_SAFETY;
-    let config_label_width = key_width.min(inner * 0.4).max(label_width.min(inner * 0.4));
+    let config_label_width = key_width
+        .min(inner * 0.4)
+        .max(about_metadata_label_width().min(inner * 0.4));
     cards.extend(metadata_cards(
         "harness/config",
         ("SETTINGS IN ATERM.TOML", "ATERM.TOML"),
         &config,
-        inner,
-        (
-            (inner - config_label_width - ABOUT_METADATA_ROW_GAP).max(0.0),
-            config_label_width,
-        ),
+        card_width,
+        config_label_width,
     ));
     if harness.config_rows.len() > harness.config_own.len() {
         cards.push(config_disclosure(
@@ -656,23 +686,6 @@ fn harness_cards(
         ));
     }
     cards
-}
-
-/// `text` whole where `fits` says so, else cut back at its last ` · ` joint
-/// that leaves it fitting (§10.3.1: a narrow page cuts a day's words at a
-/// joint, never inside one); where not even its first part fits, that part
-/// elided by `elide`.
-fn cut_at_joint(text: &str, fits: impl Fn(&str) -> bool, elide: impl Fn(&str) -> String) -> String {
-    use crate::harness_screen::JOINT;
-    if fits(text) {
-        return text.to_string();
-    }
-    let parts: Vec<&str> = text.split(JOINT).collect();
-    (1..parts.len())
-        .rev()
-        .map(|n| parts[..n].join(JOINT))
-        .find(|cut| fits(cut))
-        .unwrap_or_else(|| elide(parts[0]))
 }
 
 /// Whether `text` is whole at `width` in the type `role` and `style` paint.
@@ -687,13 +700,13 @@ fn fits_in(text: &str, width: f32, role: SemanticRole, style: StyleRef) -> bool 
 /// page heading's) where it counts and is whole at the card's `inner`
 /// width, else in the page's plain type — a note (`nothing yet today`,
 /// `reading…`, [`crate::harness_screen::today_counts`]) always plain; the
-/// second, where there is one, plain. A plain line that does not fit is cut
-/// at a ` · ` joint ([`cut_at_joint`]).
+/// second, where there is one, plain. A plain line wraps to `inner`, whole
+/// (it was cut at a ` · ` joint, and a note with none inside a word).
 ///
 /// A NOTE KEEPS THE COUNTS' ROOM: where Hero type would hold it, a note is
 /// drawn plain in the Hero line's slot, so the counts that replace it (the
 /// first reading, the day's first act) move nothing under STATUS — not
-/// SESSIONS, not a row `⚙` has just landed on.
+/// SESSIONS, not a row `Harness settings…` has just landed on.
 ///
 /// THE BUDGET is what the page's first screen has left once SESSIONS' top
 /// is on it (§4 item 2: SESSIONS shares the first screen with the status).
@@ -709,35 +722,40 @@ pub(super) fn today_block(
     let scale = settings_text_scale();
     let plain_height = 28.0_f32.max(18.0 * scale);
     let hero_height = page_heading_height();
-    let line = |suffix: &str, text: &str, hero: bool, height: f32| {
-        let (role, style) = if hero {
-            (SemanticRole::Heading, StyleRef::Hero)
-        } else {
-            (SemanticRole::Text, StyleRef::Primary)
-        };
-        let shown = if hero {
-            text.to_string()
-        } else {
-            cut_at_joint(
-                text,
-                |t| fits_in(t, inner, role, style),
-                |t| crate::native_ui::fit_native_text_label(t, inner),
+    // A line in Hero type (whole: it is drawn so only where it fits), or in
+    // plain type on as many lines as `inner` needs, never cut — "nothing
+    // yet today" was cut to "nothing y…" at 2× on a 24-column page, which
+    // has no joint to cut at. Returns the node, the height its slot takes
+    // (at least `slot`) and how tall its plain lines are.
+    let line = |suffix: &str, text: &str, hero: bool, slot: f32| -> (UiNode, f32) {
+        let key = format!("harness/status/today/{suffix}");
+        let (mut node, height) = if hero {
+            (
+                UiNode::new(
+                    key,
+                    UiContent::Text(TextSpec {
+                        text: text.to_string(),
+                        role: SemanticRole::Heading,
+                        style: StyleRef::Hero,
+                    }),
+                ),
+                slot,
             )
+        } else {
+            let (node, height) = wrapped_words_node(
+                &key,
+                text,
+                (SemanticRole::Text, StyleRef::Primary),
+                inner,
+                plain_height,
+            );
+            (node, height.max(slot))
         };
-        UiNode::new(
-            format!("harness/status/today/{suffix}"),
-            UiContent::Text(TextSpec {
-                text: shown,
-                role,
-                style,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        )
-        .paint_only()
+        node.layout = node
+            .layout
+            .width(Length::Fill)
+            .height(Length::Fixed(height));
+        (node.paint_only(), height)
     };
     // The Hero line's slot where Hero type holds the first line whole; its
     // type Hero only where the line counts — a note is plain in it.
@@ -746,22 +764,25 @@ pub(super) fn today_block(
     let more = !second.is_empty();
     // Each shape, fullest first: (the Hero line's slot, the second drawn).
     let shapes = [(tall, more), (false, more), (false, false)];
-    let (tall, more) = shapes.into_iter().find(|&(tall, more)| {
-        let height = if tall { hero_height } else { plain_height }
-            + if more { 4.0 + plain_height } else { 0.0 };
-        height <= budget
-    })?;
-    let first_height = if tall { hero_height } else { plain_height };
-    let mut children = vec![line("hero", first, tall && counts, first_height)];
-    let mut height = first_height;
-    if more {
-        children.push(line("more", second, false, plain_height));
-        height += 4.0 + plain_height;
-    }
+    let build = |(tall, more): (bool, bool)| {
+        let slot = if tall { hero_height } else { plain_height };
+        let (head, mut height) = line("hero", first, tall && counts, slot);
+        let mut children = vec![head];
+        if more {
+            let (next, next_height) = line("more", second, false, plain_height);
+            children.push(next);
+            height += 4.0 + next_height;
+        }
+        (children, height)
+    };
+    let (children, height) = shapes
+        .into_iter()
+        .map(build)
+        .find(|(_, height)| *height <= budget)?;
     let label = if second.is_empty() {
         first.clone()
     } else {
-        format!("{first}{}{second}", crate::harness_screen::JOINT)
+        format!("{first}{}{second}", crate::native_ui::FACT_SEPARATOR)
     };
     Some((
         UiNode::new(
@@ -927,7 +948,7 @@ pub(super) fn ab_lead_block(lead: &AbLead, inner: f32) -> (UiNode, f32) {
         return lines(&[
             ("", caption),
             (" ", cruise.words()),
-            (crate::harness_screen::JOINT, off.words()),
+            (crate::native_ui::FACT_SEPARATOR, off.words()),
         ]);
     }
     let row = sides
@@ -1014,18 +1035,26 @@ fn config_facts(harness: &HarnessProjection, open: bool) -> Vec<(String, String)
 /// shows).
 fn config_disclosure(open: bool, keys: usize, card_width: f32) -> (UiNode, f32) {
     let height = scaled_control_height();
-    let (label, visual) = if open {
+    let (label, forms) = if open {
         (
             "Show only yours: the settings you changed".to_string(),
-            "Show only yours".to_string(),
+            ["Show only yours".to_string(), "Only yours".to_string()],
         )
     } else {
         (
             format!("Show all {keys} settings"),
-            format!("Show all {keys}"),
+            [format!("Show all {keys}"), "Show all".to_string()],
         )
     };
-    let width = (crate::native_ui::native_button_label_width(&visual) + 56.0).min(card_width);
+    // Its words whole beside its chevron: the count, or the verb alone, given
+    // up before a word is cut ("Show a…" on a phone-width card at 2× text).
+    let need = |words: &str| crate::native_ui::native_button_label_width(words) + 56.0;
+    let visual = forms
+        .iter()
+        .find(|words| need(words) <= card_width + crate::native_ui::TEXT_FIT_SLACK)
+        .unwrap_or(&forms[1])
+        .clone();
+    let width = need(&visual).min(card_width);
     (
         UiNode::new(
             HARNESS_CONFIG_TOGGLE,
@@ -1053,36 +1082,36 @@ fn config_disclosure(open: bool, keys: usize, card_width: f32) -> (UiNode, f32) 
     )
 }
 
-/// A fact card ([`metadata_card_at`]) keyed `key`, its heading fitted to the
-/// card's `inner` width ([`card_heading`], `heading` its full and short
-/// words). The page's list scrolls a card taller than the screen by its
-/// rows. `columns` is the value column's width and the label column's.
+/// A fact card ([`metadata_card`]) `card_width` wide keyed `key`, its
+/// caption fitted to the card's text column ([`card_heading`], `heading` its
+/// full and short words), its facts set by the one measured rule
+/// ([`FactColumns`]) with a name column `label_width` wide where they sit
+/// beside each other. The page's list scrolls a card taller than the screen
+/// by its rows.
 pub(super) fn metadata_cards(
     key: &str,
     heading: (&str, &str),
     rows: &[(String, String)],
-    inner: f32,
-    columns: (f32, f32),
+    card_width: f32,
+    label_width: f32,
 ) -> Vec<(UiNode, f32)> {
-    let (value_width, label_width) = columns;
-    let scale = settings_text_scale();
-    let heading_height = 22.0_f32.max(16.0 * scale);
-    let line_height = 28.0_f32.max(18.0 * scale) + 4.0;
-    let heading = card_heading(heading.0, heading.1, false, inner);
-    let height = 2.0 * ABOUT_METADATA_CARD_PADDING
-        + heading_height
-        + metadata_line_count(rows, value_width) as f32 * line_height;
-    vec![(
-        metadata_card_at(key, &heading, rows, height, value_width, label_width),
-        height,
-    )]
+    let caption = card_heading(heading.0, heading.1, false, card_text_width(card_width));
+    vec![metadata_card(key, &caption, rows, card_width, label_width)]
 }
 
 /// A card of control rows, split into continued cards no taller than `room`
 /// ([`chunk_rows`]): a Secondary group, its heading, then its rows. `names`
 /// is its semantic label and its heading's full and short words. Its padding
-/// is the page's, or a tight one where the room holds its tallest row only
-/// that way (a short host at large type).
+/// is the page's, or, over and under its rows, a tight one where the room
+/// holds its tallest row only that way (a short host at large type).
+///
+/// ITS ROWS ARE MEASURED IN THE BOX THEY ARE DRAWN IN: every caller lays its
+/// rows out in the card's text column ([`card_text_width`]), so the card
+/// keeps its side padding ([`card_side_padding`]) beside them whatever the
+/// room. The tight padding used to be taken on all four sides, which handed
+/// rows wrapped for a column 20pt narrower than the one they were drawn in
+/// — a name broken onto a second line beside room for its last word on the
+/// first.
 pub(super) fn row_cards(
     key: &str,
     names: (&str, (&str, &str)),
@@ -1095,16 +1124,15 @@ pub(super) fn row_cards(
 
 /// How far a SESSIONS row's words stand inside the block its landing draws
 /// the accent card on (§10.3.1): the outline clear of every glyph and button.
-const ROW_INSET: f32 = 8.0;
+pub(super) const ROW_INSET: f32 = 8.0;
 
 /// [`row_cards`], where `blocks`, of rows a landing can draw selected
 /// (SESSIONS, [`session_timer`]'s block): each row's block keeps
-/// [`ROW_INSET`] (half the card's padding, where that is tight) beside its
-/// words and half the gap between rows over and under them, taken from the
-/// card's padding and that gap — so every word stands where it would stand
-/// without it, the heading's too (inset as the rows are, in a frame the list
-/// still reads as the card's head), and nothing moves when a row lands. The
-/// card's height is the same.
+/// [`ROW_INSET`] beside its words and half the gap between rows over and
+/// under them, taken from the card's padding and that gap — so every word
+/// stands where it would stand without it, the heading's too (inset as the
+/// rows are, in a frame the list still reads as the card's head), and
+/// nothing moves when a row lands. The card's height is the same.
 fn row_cards_inset(
     key: &str,
     names: (&str, (&str, &str)),
@@ -1113,20 +1141,55 @@ fn row_cards_inset(
     blocks: bool,
 ) -> Vec<(UiNode, f32)> {
     let (label, heading) = names;
-    let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
-    let tallest = rows
-        .iter()
-        .map(|(_, height)| *height)
-        .fold(0.0_f32, f32::max);
+    let side = card_side_padding(card_width);
+    let inner = card_text_width(card_width);
+    // The caption a card wears, its continuations' too, wrapped to the
+    // card's text column ([`caption_node`]); the taller of the two sets the
+    // room each card's rows get, so every continued card fits as the first.
+    let caption = |key: &str, continued: bool| {
+        caption_node(
+            &format!("{key}/heading"),
+            &card_heading(heading.0, heading.1, continued, inner),
+            inner,
+        )
+    };
+    let heading_height = caption(key, false).1.max(caption(key, true).1);
+    // The tallest ROW, a row listed a part at a time ([`split_tall_block`])
+    // counted whole: the padding is the list's, decided by its rows, so a
+    // row above that comes to be listed in parts (or whole again) as a
+    // republish changes its height moves no card's padding under a row
+    // the page has landed on.
+    let mut tallest = 0.0_f32;
+    let mut block: Option<(&str, f32)> = None;
+    for (node, height) in &rows {
+        let key = node.key.as_str();
+        match block.as_mut() {
+            Some((head, total))
+                if key
+                    .strip_prefix(*head)
+                    .is_some_and(|rest| rest.starts_with("/part-")) =>
+            {
+                *total += CARD_GAP + height;
+            }
+            _ => {
+                if let Some((_, total)) = block {
+                    tallest = tallest.max(total);
+                }
+                block = Some((key, *height));
+            }
+        }
+    }
+    if let Some((_, total)) = block {
+        tallest = tallest.max(total);
+    }
     let pad = if 2.0 * CARD_PAD + heading_height + tallest + CARD_GAP <= room {
         CARD_PAD
     } else {
         TIGHT_CARD_PAD
     };
     let fixed = 2.0 * pad + heading_height;
-    let inner = (card_width - 2.0 * pad).max(0.0);
     let (inset_x, inset_y) = if blocks {
-        (ROW_INSET.min(pad / 2.0), CARD_GAP / 2.0)
+        (ROW_INSET, CARD_GAP / 2.0)
     } else {
         (0.0, 0.0)
     };
@@ -1142,21 +1205,13 @@ fn row_cards_inset(
                     format!("{label}, continued"),
                 )
             };
-            let heading = card_heading(heading.0, heading.1, index > 0, inner);
-            let height = fixed
+            let (mut heading, heading_height) = caption(&key, index > 0);
+            let height = 2.0 * pad
+                + heading_height
                 + rows
                     .iter()
                     .map(|(_, height)| height + CARD_GAP)
                     .sum::<f32>();
-            let mut heading = UiNode::new(
-                format!("{key}/heading"),
-                UiContent::Text(TextSpec {
-                    text: heading,
-                    role: SemanticRole::Heading,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(heading_height)));
             if blocks {
                 heading = UiNode::new(
                     format!("{key}/heading-frame"),
@@ -1195,9 +1250,9 @@ fn row_cards_inset(
                     .height(Length::Fixed(height))
                     .padding(Insets {
                         top: pad,
-                        right: pad - inset_x,
+                        right: side - inset_x,
                         bottom: pad - inset_y,
-                        left: pad - inset_x,
+                        left: side - inset_x,
                     })
                     .gap(CARD_GAP - 2.0 * inset_y)
                     .clipped(),
@@ -1244,12 +1299,13 @@ fn harness_actions(harness: &HarnessProjection, card_width: f32) -> (UiNode, f32
         <= card_width;
     let subpages_side_by_side =
         !row && need("AI CLIs") + need("Tab Control") + CARD_GAP <= card_width;
-    let button = |key: &str, label: &str, busy: bool, style: StyleRef, width: Length| {
-        let max_w = match width {
-            Length::Fixed(w) => (w - 40.0).max(0.0),
-            _ => (card_width - 40.0).max(0.0),
-        };
-        let visual = crate::native_ui::fit_native_button_label(label, max_w);
+    // Each button `width` wide, its words fitted to that box by the one
+    // rule every page button keeps ([`button_words`]): whole, on as many
+    // lines as the box needs, never cut. A label was fitted 20pt short of the
+    // room the button paints it in, which cut "Tab Control" to "Tab Co…" in
+    // a box that held it.
+    let button = |key: &str, label: &str, busy: bool, style: StyleRef, width: f32| {
+        let (visual, lines) = button_words(label, &[], width);
         let action = if key == HARNESS_AI_CLIS {
             route_action(SettingsRoute::Ai)
         } else if key == HARNESS_TAB_CONTROL {
@@ -1257,111 +1313,114 @@ fn harness_actions(harness: &HarnessProjection, card_width: f32) -> (UiNode, f32
         } else {
             ActionId::new(key)
         };
-        UiNode::new(
-            key,
-            UiContent::Button(
-                Control::new(ButtonSpec::new(label).visual_label(visual), action)
-                    .state(ControlState {
-                        busy,
-                        ..ControlState::default()
-                    })
-                    .style(style),
-            ),
-        )
-        .layout(
-            Layout::default()
-                .width(width)
-                .height(Length::Fixed(control_height)),
-        )
-    };
-    let w = |label: &str| {
-        if row {
-            Length::Fixed(need(label))
-        } else {
-            Length::Fill
-        }
-    };
-    let buttons = if subpages_side_by_side {
-        vec![
-            button(
-                HARNESS_REFRESH,
-                "Refresh",
-                harness.collecting,
-                StyleRef::Primary,
-                Length::Fill,
-            ),
-            button(
-                HARNESS_OPEN_CONFIG,
-                "Open aterm.toml",
-                false,
-                StyleRef::Secondary,
-                Length::Fill,
-            ),
+        let height = crate::native_ui::native_button_height_for_lines(lines, control_height);
+        (
             UiNode::new(
-                "harness/actions/subpages",
-                UiContent::Group(GroupSpec::new("Harness sub-pages")),
+                key,
+                UiContent::Button(
+                    Control::new(ButtonSpec::new(label).visual_label(visual), action)
+                        .state(ControlState {
+                            busy,
+                            ..ControlState::default()
+                        })
+                        .style(style),
+                ),
             )
             .layout(
-                Layout::row()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(control_height))
-                    .gap(CARD_GAP),
-            )
-            .children(vec![
-                button(
-                    HARNESS_AI_CLIS,
-                    "AI CLIs",
-                    false,
-                    StyleRef::Secondary,
-                    Length::Fixed(need("AI CLIs")),
-                ),
-                button(
-                    HARNESS_TAB_CONTROL,
-                    "Tab Control",
-                    false,
-                    StyleRef::Secondary,
-                    Length::Fill,
-                ),
-            ]),
-        ]
+                Layout::default()
+                    .width(if row {
+                        Length::Fixed(width)
+                    } else {
+                        Length::Fill
+                    })
+                    .height(Length::Fixed(height)),
+            ),
+            height,
+        )
+    };
+    let w = |label: &str| if row { need(label) } else { card_width };
+    let (buttons, height) = if subpages_side_by_side {
+        let (refresh, refresh_height) = button(
+            HARNESS_REFRESH,
+            "Refresh",
+            harness.collecting,
+            StyleRef::Primary,
+            card_width,
+        );
+        let (open, open_height) = button(
+            HARNESS_OPEN_CONFIG,
+            "Open aterm.toml",
+            false,
+            StyleRef::Secondary,
+            card_width,
+        );
+        let (mut ai, _) = button(
+            HARNESS_AI_CLIS,
+            "AI CLIs",
+            false,
+            StyleRef::Secondary,
+            need("AI CLIs"),
+        );
+        ai.layout.width = Length::Fixed(need("AI CLIs"));
+        ai.layout.height = Length::Fixed(control_height);
+        let (mut tabs, _) = button(
+            HARNESS_TAB_CONTROL,
+            "Tab Control",
+            false,
+            StyleRef::Secondary,
+            card_width - need("AI CLIs") - CARD_GAP,
+        );
+        tabs.layout.height = Length::Fixed(control_height);
+        (
+            vec![
+                refresh,
+                open,
+                UiNode::new(
+                    "harness/actions/subpages",
+                    UiContent::Group(GroupSpec::new("Harness sub-pages")),
+                )
+                .layout(
+                    Layout::row()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(control_height))
+                        .gap(CARD_GAP),
+                )
+                .children(vec![ai, tabs]),
+            ],
+            refresh_height + open_height + control_height + 2.0 * CARD_GAP,
+        )
     } else {
-        vec![
-            button(
+        let buttons = [
+            (
                 HARNESS_REFRESH,
                 "Refresh",
                 harness.collecting,
                 StyleRef::Primary,
-                w("Refresh"),
             ),
-            button(
+            (
                 HARNESS_OPEN_CONFIG,
                 "Open aterm.toml",
                 false,
                 StyleRef::Secondary,
-                w("Open aterm.toml"),
             ),
-            button(
-                HARNESS_AI_CLIS,
-                "AI CLIs",
-                false,
-                StyleRef::Secondary,
-                w("AI CLIs"),
-            ),
-            button(
+            (HARNESS_AI_CLIS, "AI CLIs", false, StyleRef::Secondary),
+            (
                 HARNESS_TAB_CONTROL,
                 "Tab Control",
                 false,
                 StyleRef::Secondary,
-                w("Tab Control"),
             ),
         ]
-    };
-    let height = if row {
-        control_height
-    } else if subpages_side_by_side {
-        3.0 * control_height + 2.0 * CARD_GAP
-    } else {
-        4.0 * control_height + 3.0 * CARD_GAP
+        .map(|(key, label, busy, style)| button(key, label, busy, style, w(label)));
+        let height = if row {
+            buttons
+                .iter()
+                .map(|(_, height)| *height)
+                .fold(control_height, f32::max)
+        } else {
+            buttons.iter().map(|(_, height)| height).sum::<f32>() + 3.0 * CARD_GAP
+        };
+        (buttons.into_iter().map(|(node, _)| node).collect(), height)
     };
     let layout = if row { Layout::row() } else { Layout::column() };
     (
@@ -1435,40 +1494,42 @@ fn session_rows(
         } else {
             "Reading the sessions\u{2026}".to_string()
         };
-        let height = 22.0_f32.max(18.0 * settings_text_scale());
-        return vec![(
-            UiNode::new(
-                "harness/sessions/empty",
-                UiContent::Text(TextSpec {
-                    text: crate::native_ui::fit_native_text_label(&text, inner),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(height))),
-            height,
+        // Wrapped to the card's column, never cut: a narrow page used to
+        // paint "No Claude Code, Codex, Antigrav…", and say only that.
+        return vec![wrapped_words_node(
+            "harness/sessions/empty",
+            &text,
+            (SemanticRole::Text, StyleRef::Quiet),
+            inner,
+            22.0_f32.max(18.0 * settings_text_scale()),
         )];
     }
     let offer = harness.land_at_offer;
-    // What one row of a continued card may take, as `switch_rows` reads it.
+    // What one row of a continued card may take, as `switch_rows` reads it:
+    // a row taller is listed a part at a time — but a row with its Timer
+    // open only where it is taller than the list itself, since one no
+    // taller is drawn whole where it is landed on, its card's caption let
+    // go (the post-landing check's behaviour-1).
     let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
     let row_room = (room - 2.0 * TIGHT_CARD_PAD - heading_height - CARD_GAP).max(0.0);
-    let measure = RowMeasure::of(&harness.sessions, width, (inner, row_room));
+    let room_for = |open: bool| if open { room.max(0.0) } else { row_room };
+    let measure = RowMeasure::of(&harness.sessions, width, inner);
     let mut rows: Vec<(UiNode, f32)> = harness
         .sessions
         .iter()
-        .map(|row| {
+        .flat_map(|row| {
             let open = timer_open == Some(row.local_id);
             let landed = selected == Some(row.local_id);
             let (node, height) = session_row(row, open, landed, measure, inner);
-            session_timer(
+            let block = session_timer(
                 row,
                 (node, height),
                 row.default.is_some(),
                 offer,
                 (open, landed),
                 inner,
-            )
+            );
+            split_tall_block(block, room_for(open))
         })
         .collect();
     // AFTER every per-session row (design §11.5.1): a session opening or
@@ -1476,15 +1537,138 @@ fn session_rows(
     // it moves none of them under the pointer, and SESSIONS' top is where it
     // was.
     if let Some(every) = &harness.every {
-        rows.push(every_row(
-            every,
-            measure,
-            offer,
-            every_open,
-            (inner, row_room),
+        rows.extend(split_tall_block(
+            every_row(every, measure, offer, every_open, inner),
+            room_for(every_open),
         ));
     }
     rows
+}
+
+/// A SESSIONS ROW TALLER THAN ONE CARD'S ROOM, LISTED A PART AT A TIME: its
+/// block's lines — its words, its lines of buttons, its state, day and timer
+/// lines — gathered into parts no taller than `room` (a part a line alone
+/// where one is), each a row of the card and so a stop of the page's list,
+/// every part of a landed row on the accent card the row wears. The first
+/// part keeps the block's key and the row's group (its name and its words,
+/// whole); the rest are keyed `<block>/part-<n>`. A row the room holds is
+/// one block, as before. A short window at large text used to cram the row's
+/// buttons onto fewer lines to fit, cutting their faces to "Cru…" and "…".
+pub(super) fn split_tall_block((block, height): (UiNode, f32), room: f32) -> Vec<(UiNode, f32)> {
+    if height <= room + 0.01 {
+        return vec![(block, height)];
+    }
+    let gap = block.layout.gap;
+    let style = match &block.content {
+        UiContent::Group(group) => group.style,
+        _ => StyleRef::Plain,
+    };
+    let block_key = block.key.as_str().to_string();
+    let mut lines: Vec<UiNode> = Vec::new();
+    // The row's own group (its first child, a column of its words and
+    // buttons) is opened up, its lines listed one by one; the first part
+    // keeps the group, so its name is said once.
+    let mut row_group: Option<UiNode> = None;
+    for (index, child) in block.children.into_iter().enumerate() {
+        if index == 0 && !child.children.is_empty() && matches!(child.content, UiContent::Group(_))
+        {
+            let mut group = child;
+            lines.extend(std::mem::take(&mut group.children));
+            row_group = Some(group);
+        } else {
+            lines.push(child);
+        }
+    }
+    let mut parts: Vec<Vec<UiNode>> = vec![Vec::new()];
+    let mut used = 0.0_f32;
+    for line in lines {
+        let line_height = fixed_height(&line);
+        let part = parts.last_mut().expect("one part");
+        let cost = if part.is_empty() {
+            line_height
+        } else {
+            gap + line_height
+        };
+        if !part.is_empty() && used + cost > room + 0.01 {
+            parts.push(vec![line]);
+            used = line_height;
+        } else {
+            part.push(line);
+            used += cost;
+        }
+    }
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, lines)| {
+            let height = lines.iter().map(fixed_height).sum::<f32>()
+                + gap * lines.len().saturating_sub(1) as f32;
+            let children = match (index, row_group.as_mut()) {
+                (0, Some(group)) => {
+                    let mut group = std::mem::replace(
+                        group,
+                        UiNode::new(
+                            "-",
+                            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                        ),
+                    );
+                    group.layout = group.layout.height(Length::Fixed(height));
+                    group.children = lines;
+                    vec![group]
+                }
+                _ => lines,
+            };
+            let key = if index == 0 {
+                block_key.clone()
+            } else {
+                format!("{block_key}/part-{index}")
+            };
+            (
+                UiNode::new(
+                    key,
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group).style(style)),
+                )
+                .layout(Layout::column().height(Length::Fixed(height)).gap(gap))
+                .children(children),
+                height,
+            )
+        })
+        .collect()
+}
+
+/// AN OPEN TIMER'S CHOICES, ONE PIECE OF ITS ROW: its lines of choices
+/// (`<row>/timer-row/<n>`) in one column, `<row>/timer-choices`, so a row
+/// listed a part at a time — by the page ([`split_tall_block`]) or by the
+/// list ([`scroll::row_parts`]) — keeps every choice the Timer opened in one
+/// part where they fit one, never `1 hour` on one screen and `at 18:00` on
+/// the next (the open `Every session` row at 2× text on a short page). Its
+/// group is unlabeled: each line keeps its own name.
+fn timer_choices(key: &str, rows: Vec<(UiNode, f32)>) -> (UiNode, f32) {
+    let height = rows.iter().map(|(_, height)| height).sum::<f32>()
+        + 4.0 * rows.len().saturating_sub(1) as f32;
+    (
+        UiNode::new(
+            format!("{key}/timer-choices"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
+        .children(rows.into_iter().map(|(row, _)| row).collect()),
+        height,
+    )
+}
+
+/// WHAT A TIMER'S OPENING REVEALS: its first choice, whose stop holds every
+/// choice it opened ([`split_tall_block`] keeps them one part) — the block
+/// itself where the room holds it whole, the part listing the choices where
+/// the block is listed a part at a time (the open `Every session` row at 2×
+/// text on a short page: its Timer button's part was revealed, and `at 18:00`
+/// was on no screen).
+fn timer_opening_reveal(session: Option<u64>) -> UiKey {
+    let first = TimerChoice::In(crate::autopilot_menu::LAND_IN_MINUTES[0]);
+    UiKey::new(match session {
+        Some(local_id) => timer_action(local_id, first),
+        None => crate::harness_screen::every_action(EveryPress::Timer(first)),
+    })
 }
 
 /// The `Every session` row's faces, in its order: Cruise, Land, its Timer
@@ -1512,7 +1696,7 @@ fn every_row(
     measure: RowMeasure,
     offer: Option<crate::claude_lights::LandAtGlass>,
     open: bool,
-    (inner, row_room): (f32, f32),
+    inner: f32,
 ) -> (UiNode, f32) {
     use crate::harness_screen::sessions_words;
     let enabled = every.steered > 0;
@@ -1539,22 +1723,15 @@ fn every_row(
     // let the row fit one card of the page.
     const FLOWS: [&[u8]; 3] = [&[4], &[2, 2], &[1, 1, 1, 1]];
     let lines: &'static [u8] = if stacked {
-        let want = FLOWS
+        // Faces whole, always; a row taller than the room is listed a part at
+        // a time ([`split_tall_block`]).
+        FLOWS
             .iter()
             .position(|flow| {
                 flow.iter()
                     .all(|&count| line_button(inner, count) - 20.0 >= widest)
             })
-            .unwrap_or(FLOWS.len() - 1);
-        FLOWS[..=want]
-            .iter()
-            .rev()
-            .find(|flow| {
-                stacked_row_height(f32::from(u8::try_from(flow.len()).unwrap_or(u8::MAX)))
-                    <= row_room
-            })
-            .copied()
-            .unwrap_or(FLOWS[0])
+            .map_or(FLOWS[FLOWS.len() - 1], |want| FLOWS[want])
     } else {
         FLOWS[0]
     };
@@ -1615,8 +1792,8 @@ fn every_row(
                     Some(open),
                 ),
             };
-            let mut spec = ButtonSpec::new(label)
-                .visual_label(crate::native_ui::fit_native_button_label(face, room));
+            let mut spec =
+                ButtonSpec::new(label).visual_label(button_words(face, &[], room + 20.0).0);
             spec.description = Some(description);
             // One press writes every session: it goes only where the pointer
             // looked, never where a session opening or closing above, or the
@@ -1655,36 +1832,30 @@ fn every_row(
     } else {
         (inner - 5.0 * (measure.button_width + MODE_GAP)).max(0.0)
     };
-    let text = |suffix: &str, text: String, role: SemanticRole, style: StyleRef, height: f32| {
-        UiNode::new(
-            format!("{key}/{suffix}"),
-            UiContent::Text(TextSpec { text, role, style }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        )
-        .paint_only()
-    };
     let line = every.line();
-    let title = text(
-        "title",
-        crate::native_ui::fit_native_text_label("Every session", text_width),
-        SemanticRole::Text,
-        StyleRef::Primary,
-        title_height,
-    );
-    let detail = text(
-        "detail",
-        crate::native_ui::fit_native_status_label(&line, text_width),
-        SemanticRole::Status,
-        StyleRef::Quiet,
-        detail_height,
-    );
     let label = format!("Every session, {line}");
     let (row, height) = if stacked {
-        let mut children = vec![title, detail];
+        // Stacked, its words have the row's width, whole on as many lines as
+        // they need.
+        let wrapped = |suffix: &str, text: &str, kind: (SemanticRole, StyleRef), height: f32| {
+            wrapped_words_node(&format!("{key}/{suffix}"), text, kind, inner, height)
+                .0
+                .paint_only()
+        };
+        let mut children = vec![
+            wrapped(
+                "title",
+                "Every session",
+                (SemanticRole::Text, StyleRef::Primary),
+                title_height,
+            ),
+            wrapped(
+                "detail",
+                &line,
+                (SemanticRole::Status, StyleRef::Quiet),
+                detail_height,
+            ),
+        ];
         let mut rest = buttons.into_iter();
         let mut start = 0;
         for (n, &count) in lines.iter().enumerate() {
@@ -1699,6 +1870,19 @@ fn every_row(
                 let faces = EVERY_FACES.get(start..start + count).unwrap_or_default();
                 (format!("line/{n}"), faces.join(", "))
             };
+            let line_height = on_line
+                .iter()
+                .filter_map(|button| match &button.content {
+                    UiContent::Button(control) => control.spec.visual_label.as_deref(),
+                    _ => None,
+                })
+                .map(|words| {
+                    crate::native_ui::native_button_height_for_lines(
+                        words.lines().count().max(1),
+                        control_height,
+                    )
+                })
+                .fold(control_height, f32::max);
             children.push(
                 UiNode::new(
                     format!("{key}/{suffix}"),
@@ -1706,14 +1890,15 @@ fn every_row(
                 )
                 .layout(
                     Layout::row()
-                        .height(Length::Fixed(control_height))
+                        .height(Length::Fixed(line_height))
                         .gap(MODE_GAP),
                 )
                 .children(on_line),
             );
             start += count;
         }
-        let height = stacked_row_height(f32::from(u8::try_from(lines.len()).unwrap_or(u8::MAX)));
+        let height = children.iter().map(fixed_height).sum::<f32>()
+            + 4.0 * children.len().saturating_sub(1) as f32;
         (
             UiNode::new(key.clone(), UiContent::Group(GroupSpec::new(label)))
                 .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
@@ -1721,15 +1906,34 @@ fn every_row(
             height,
         )
     } else {
-        let height = control_height.max(title_height + detail_height);
+        // Beside the buttons its words wrap to their column, whole, as a
+        // session row's do ([`session_row`]), its buttons a control tall.
+        let (title, title_lines) = wrapped_words_node(
+            &format!("{key}/title"),
+            "Every session",
+            (SemanticRole::Text, StyleRef::Primary),
+            text_width,
+            title_height,
+        );
+        let (detail, detail_lines) = wrapped_words_node(
+            &format!("{key}/detail"),
+            &line,
+            (SemanticRole::Status, StyleRef::Quiet),
+            text_width,
+            detail_height,
+        );
+        let height = control_height.max(title_lines + detail_lines);
         let words = UiNode::new(
             format!("{key}/words"),
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
         .layout(Layout::column().width(Length::Fill).height(Length::Fill))
-        .children(vec![title, detail]);
+        .children(vec![title.paint_only(), detail.paint_only()]);
         let mut children = vec![words];
-        children.extend(buttons);
+        children.extend(buttons.into_iter().map(|mut button| {
+            button.layout.height = Length::Fixed(control_height);
+            button
+        }));
         (
             UiNode::new(key.clone(), UiContent::Group(GroupSpec::new(label)))
                 .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
@@ -1738,7 +1942,8 @@ fn every_row(
         )
     };
     // The Timer, open: `1 hour`, `2 hours`, `4 hours`, `at 18:00`, each as wide as its
-    // words, in as many lines as the column needs.
+    // words on one line, else on the row's slots or each as wide as the
+    // widest, in as many lines as the column needs.
     let mut children = vec![row];
     let mut total = height;
     if open {
@@ -1782,10 +1987,42 @@ fn every_row(
             let room = (3.0 * measure.button_width + 2.0 * MODE_GAP).min(inner);
             (inner - room, room)
         };
+        // ONE GRID WHERE THEY WRAP: on one line each is as wide as its
+        // words; where they take more lines than one, beside the words each
+        // takes one of the row's slots, as many to a line as leave the lines
+        // even (two and two), so the columns stand under the Timer and
+        // Follow the default (the post-landing check's owner-eye-3, and its
+        // review) — where every face is whole in a slot (`at Sat 18:00` may
+        // not be); else, and stacked, each is as wide as the widest, so the
+        // lines' columns still stand under one another — never `at 18:00` a
+        // few points right of `2 hours`.
+        let own = |face: &str| (face_width(face) + 40.0).min(room);
+        let shared = wrapped_width(
+            &choices
+                .iter()
+                .map(|(_, _, face)| own(face))
+                .collect::<Vec<_>>(),
+            room,
+        );
+        let one_line = shared.is_none();
+        let slot = measure.button_width;
+        let on_slots = !one_line
+            && !stacked
+            && choices
+                .iter()
+                .all(|(_, _, face)| face_width(face) + 24.0 <= slot);
+        let per_line = on_slots.then(|| {
+            let fit = (((room + MODE_GAP) / (slot + MODE_GAP)).floor() as usize).max(1);
+            choices.len().div_ceil(choices.len().div_ceil(fit))
+        });
         let mut lines: Vec<Vec<UiNode>> = Vec::new();
         let mut used = 0.0_f32;
         for (press, label, face) in choices {
-            let width = (face_width(&face) + 40.0).min(room);
+            let width = match shared {
+                None => own(&face),
+                Some(_) if on_slots => slot,
+                Some(widest) => widest,
+            };
             let action = every_action(press);
             let mut spec = ButtonSpec::new(label).visual_label(
                 crate::native_ui::fit_native_button_label(&face, (width - 24.0).max(0.0)),
@@ -1809,7 +2046,10 @@ fn every_row(
                     .height(Length::Fill),
             );
             match lines.last_mut() {
-                Some(line) if used + MODE_GAP + width <= room => {
+                Some(line)
+                    if used + MODE_GAP + width <= room
+                        && per_line.is_none_or(|per_line| line.len() < per_line) =>
+                {
                     used += MODE_GAP + width;
                     line.push(node);
                 }
@@ -1819,25 +2059,32 @@ fn every_row(
                 }
             }
         }
-        for (i, line) in lines.into_iter().enumerate() {
-            children.push(
-                UiNode::new(
-                    format!("{key}/timer-row/{i}"),
-                    UiContent::Group(GroupSpec::new("Timer for every session")),
+        let rows = lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                (
+                    UiNode::new(
+                        format!("{key}/timer-row/{i}"),
+                        UiContent::Group(GroupSpec::new("Timer for every session")),
+                    )
+                    .layout(
+                        Layout::row()
+                            .height(Length::Fixed(control_height))
+                            .gap(MODE_GAP)
+                            .padding(Insets {
+                                left: indent,
+                                ..Insets::default()
+                            }),
+                    )
+                    .children(line),
+                    control_height,
                 )
-                .layout(
-                    Layout::row()
-                        .height(Length::Fixed(control_height))
-                        .gap(MODE_GAP)
-                        .padding(Insets {
-                            left: indent,
-                            ..Insets::default()
-                        }),
-                )
-                .children(line),
-            );
-            total += control_height + 4.0;
-        }
+            })
+            .collect();
+        let (choices, height) = timer_choices(&key, rows);
+        children.push(choices);
+        total += height + 4.0;
     }
     (
         UiNode::new(
@@ -1850,14 +2097,27 @@ fn every_row(
     )
 }
 
+/// THE TIMER'S CHOICES WHERE THEY WRAP (owner-eye-3, the Every row's in
+/// §11.13 and a session row's in the final check of 2026-10-20, F2): the one
+/// width each choice takes where `own` — each its own words' width — do not
+/// all stand on one line in `room` (between them, [`MODE_GAP`]): the
+/// widest, so each line's choices start where the line above's do — never
+/// `at 18:00` a few points right of `1 hour`, nor `Cancel` of `2 hours`.
+/// `None` on one line, where each keeps its own.
+fn wrapped_width(own: &[f32], room: f32) -> Option<f32> {
+    let line = own.iter().sum::<f32>() + own.len().saturating_sub(1) as f32 * MODE_GAP;
+    (line > room).then(|| own.iter().copied().fold(0.0_f32, f32::max))
+}
+
 /// A SESSIONS row under its STATE LINE and its open TIMER (§9.3.4): the
-/// `row` node as built (its `Timer` disclosure beside the mode buttons,
-/// [`session_row`]), then — where its glass says something — the state line
+/// `row` node as built (its `Timer` disclosure beside the mode buttons, and
+/// its setting line, [`session_row`]), then — where its glass says
+/// something — the state line
 /// (`lands at 18:00`, `landed 17:42`, `last: ✓ approved 14:05`: clock times
 /// only), then, the disclosure open, `1 hour`, `2 hours`, `4 hours`, `at 18:00` (with
 /// `[harness] land_at` set, `offer`) and `Cancel` (while a timer is armed),
 /// in as many lines as the column needs. Closed and with nothing to say, the
-/// row is as tall as v1's. The timer's buttons act only where the modes do
+/// row is v1's and its setting line. The timer's buttons act only where the modes do
 /// (`enabled`). One column: the row's BLOCK (`harness/session/<id>/block`),
 /// which the page's landing (`landed`, §10.3.1) draws whole on the accent
 /// card the page's selected things wear — the row, its state, its day and
@@ -1877,31 +2137,28 @@ fn session_timer(
     let key = format!("harness/session/{}", row.local_id);
     let mut children = vec![node];
     let mut total = height;
+    // Its state, and its day (§10.3.1): `today: needed you once, 1m at 18:29
+    // · 31 approved` — each on as many lines as the column needs, never cut
+    // (a narrow column cut the day at a joint and the state anywhere); the
+    // day's label whole.
     if let Some(line) = row.state_line() {
-        children.push(
-            UiNode::new(
-                format!("{key}/state"),
-                UiContent::Text(TextSpec {
-                    text: crate::native_ui::fit_native_status_label(&line, inner),
-                    role: SemanticRole::Status,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(line_height)),
-            ),
+        let (state, height) = wrapped_words_node(
+            &format!("{key}/state"),
+            &line,
+            (SemanticRole::Status, StyleRef::Quiet),
+            inner,
+            line_height,
         );
-        total += line_height + 4.0;
+        children.push(state);
+        total += height + 4.0;
     }
-    // Its day (§10.3.1): `today: needed you once, 1m at 18:29 · 31 approved`,
-    // cut at a joint where the column is narrow; its label whole.
     if let Some(day) = &row.day_line {
-        let shown = cut_at_joint(
+        let (shown, height) = wrapped_words_node(
+            &format!("{key}/today/text"),
             day,
-            |t| fits_in(t, inner, SemanticRole::Status, StyleRef::Quiet),
-            |t| crate::native_ui::fit_native_status_label(t, inner),
+            (SemanticRole::Status, StyleRef::Quiet),
+            inner,
+            line_height,
         );
         children.push(
             UiNode::new(
@@ -1911,44 +2168,50 @@ fn session_timer(
             .layout(
                 Layout::default()
                     .width(Length::Fill)
-                    .height(Length::Fixed(line_height)),
+                    .height(Length::Fixed(height)),
             )
-            .children(vec![
-                UiNode::new(
-                    format!("{key}/today/text"),
-                    UiContent::Text(TextSpec {
-                        text: shown,
-                        role: SemanticRole::Status,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .layout(
-                    Layout::default()
-                        .width(Length::Fill)
-                        .height(Length::Fixed(line_height)),
-                )
-                .paint_only(),
-            ]),
+            .children(vec![shown.paint_only()]),
         );
-        total += line_height + 4.0;
+        total += height + 4.0;
     }
-    // Each button as wide as its words, and the buttons laid in as many rows
-    // as the column needs: a phone page holds two or three a row.
+    // Each button as wide as its words on one line; where they take more
+    // lines than one, each as wide as the widest ([`wrapped_width`]), laid
+    // in as many rows as the column needs: a phone page holds two or three a
+    // row, and the rows' columns stand under one another.
+    let own =
+        |visual: &str| (crate::native_ui::native_button_label_width(visual) + 40.0).min(inner);
+    let mut faces: Vec<String> = Vec::new();
+    if open {
+        for minutes in crate::autopilot_menu::LAND_IN_MINUTES {
+            let hours = minutes / 60;
+            faces.push(if hours == 1 {
+                "1 hour".to_string()
+            } else {
+                format!("{hours} hours")
+            });
+        }
+        if let Some(at) = offer {
+            faces.push(format!("at {}", crate::autopilot_menu::when(at)));
+        }
+        if row.armed_at_ms.is_some() {
+            faces.push("Cancel".to_string());
+        }
+    }
+    let shared = wrapped_width(
+        &faces.iter().map(|face| own(face)).collect::<Vec<_>>(),
+        inner,
+    );
     let button =
         |action: String, label: String, visual: &str, enabled: bool, expanded: Option<bool>| {
-            let width = (crate::native_ui::native_button_label_width(visual) + 40.0).min(inner);
+            let width = shared.unwrap_or_else(|| own(visual));
             let node = UiNode::new(
                 action.clone(),
                 UiContent::Button(
                     Control::new(
-                        ButtonSpec::new(label).visual_label(
-                            crate::native_ui::fit_native_button_label(
-                                visual,
-                                (width - 24.0).max(0.0),
-                            ),
-                        ),
+                        ButtonSpec::new(label).visual_label(button_words(visual, &[], width).0),
                         ActionId::new(action),
                     )
+                    .look_first()
                     .state(ControlState {
                         enabled,
                         expanded,
@@ -2025,20 +2288,36 @@ fn session_timer(
             }
         }
     }
+    let mut rows = Vec::new();
     for (i, line) in lines.into_iter().enumerate() {
-        children.push(
+        // As tall as its tallest choice's words need.
+        let height = line
+            .iter()
+            .filter_map(|button| match &button.content {
+                UiContent::Button(control) => control.spec.visual_label.as_deref(),
+                _ => None,
+            })
+            .map(|words| {
+                crate::native_ui::native_button_height_for_lines(
+                    words.lines().count().max(1),
+                    control_height,
+                )
+            })
+            .fold(control_height, f32::max);
+        rows.push((
             UiNode::new(
                 format!("{key}/timer-row/{i}"),
                 UiContent::Group(GroupSpec::new("Timer")),
             )
-            .layout(
-                Layout::row()
-                    .height(Length::Fixed(control_height))
-                    .gap(MODE_GAP),
-            )
+            .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
             .children(line),
-        );
-        total += control_height + 4.0;
+            height,
+        ));
+    }
+    if !rows.is_empty() {
+        let (choices, height) = timer_choices(&key, rows);
+        children.push(choices);
+        total += height + 4.0;
     }
     // The landed row is drawn on the accent-tinted card the page's selected
     // things wear, until the next press or scroll.
@@ -2330,8 +2609,8 @@ const fn mode_label(mode: Autopilot) -> &'static str {
 /// What a mode does, for its button's description.
 const fn mode_description(mode: Autopilot) -> &'static str {
     match mode {
-        Autopilot::Cruise => "keep the work moving until the agent's clear final statement",
-        Autopilot::Land => "wrap the work up cleanly, then stop",
+        Autopilot::Cruise => "keep the work going: nothing the agent says ends it",
+        Autopilot::Land => "land all of the work on the remote main branch, then stop",
         Autopilot::Off => "the harness keeps its hands off this session",
     }
 }
@@ -2347,9 +2626,9 @@ const ROW_FACES: [&str; 5] = ["Cruise", "Land", "Off", "Timer", "Show"];
 /// tab apart, [`HarnessSessionRow::place`]); else they go over the buttons,
 /// which share the row's width, as many to a line as hold their faces whole
 /// — all five; else the three modes, then `Timer` and `Show`; else two to a
-/// line; else one — but never more lines than let the row, with its state
-/// and day lines, fit one card of the page (`row_room`): there the faces are
-/// cut, their labels whole. A fixed button is as wide as its widest face.
+/// line; else one. A row taller than one card of the page is listed a part
+/// at a time ([`split_tall_block`]); its faces are never cut. A fixed button
+/// is as wide as its widest face.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RowMeasure {
     /// A fixed button's width, beside the words.
@@ -2361,7 +2640,7 @@ struct RowMeasure {
 }
 
 impl RowMeasure {
-    fn of(rows: &[HarnessSessionRow], width: SettingsWidth, (inner, row_room): (f32, f32)) -> Self {
+    fn of(rows: &[HarnessSessionRow], width: SettingsWidth, inner: f32) -> Self {
         let scale = settings_text_scale();
         let face = ROW_FACES
             .iter()
@@ -2383,33 +2662,16 @@ impl RowMeasure {
             flow.iter()
                 .all(|&count| line_button(inner, count) - 20.0 >= face)
         };
-        // The tallest row a flow makes: its words, its lines of buttons, and
-        // the state and day lines under it ([`session_timer`]).
-        let line_height = 18.0_f32.max(16.0 * scale);
-        let under = rows
-            .iter()
-            .map(|row| {
-                let lines = [row.state_line().is_some(), row.day_line.is_some()];
-                lines.iter().filter(|line| **line).count()
-            })
-            .max()
-            .unwrap_or(0);
-        let under = f32::from(u8::try_from(under).unwrap_or(u8::MAX)) * (line_height + 4.0);
-        let fits = |flow: &[u8]| {
-            let lines = f32::from(u8::try_from(flow.len()).unwrap_or(u8::MAX));
-            stacked_row_height(lines) + under <= row_room
-        };
+        // FACES WHOLE, ALWAYS: the fewest lines whose buttons hold every face
+        // whole. A row taller than one screen of the card is listed a part at
+        // a time ([`split_tall_block`]), never crammed: the flow used to fall
+        // back to more buttons a line where its lines would not fit the room,
+        // painting "Cru…" and a lone "…" on a short window at large text.
         let lines: &'static [u8] = if stacked {
-            let want = FLOWS
+            FLOWS
                 .iter()
                 .position(|&flow| holds(flow))
-                .unwrap_or(FLOWS.len() - 1);
-            FLOWS[..=want]
-                .iter()
-                .rev()
-                .find(|&&flow| fits(flow))
-                .copied()
-                .unwrap_or(FLOWS[0])
+                .map_or(FLOWS[FLOWS.len() - 1], |want| FLOWS[want])
         } else {
             FLOWS[0]
         };
@@ -2436,13 +2698,36 @@ impl RowMeasure {
     }
 }
 
-/// A stacked row's height with `lines` lines of buttons: its title and
-/// detail over them ([`session_row`]).
-fn stacked_row_height(lines: f32) -> f32 {
-    let scale = settings_text_scale();
-    let title_height = 22.0_f32.max(18.0 * scale);
-    let detail_height = 18.0_f32.max(16.0 * scale);
-    title_height + detail_height + lines * scaled_control_height() + (1.0 + lines) * 4.0
+/// The height of a SESSIONS row's setting line ([`setting_line`]).
+fn setting_line_height() -> f32 {
+    18.0_f32.max(16.0 * settings_text_scale())
+}
+
+/// A SESSIONS ROW'S SETTING LINE (design §11.7.1, §11.7.7;
+/// [`HarnessSessionRow::setting`]), keyed `harness/session/<id>/setting`:
+/// `its own setting, set 14:05 over aterm ctl` or `follows the default`,
+/// its label the words whole and its text the words whole too, on as many
+/// lines of the column `inner` as they need ([`wrapped_words_node`]) — once
+/// cut after a comma where the column was narrow. Returns it and its height.
+fn setting_line(row: &HarnessSessionRow, inner: f32) -> (UiNode, f32) {
+    let key = format!("harness/session/{}/setting", row.local_id);
+    let (text, height) = wrapped_words_node(
+        &format!("{key}/text"),
+        &row.setting,
+        (SemanticRole::Status, StyleRef::Quiet),
+        inner,
+        setting_line_height(),
+    );
+    (
+        UiNode::new(key, UiContent::Group(GroupSpec::new(row.setting.clone())))
+            .layout(
+                Layout::default()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height)),
+            )
+            .children(vec![text.paint_only()]),
+        height,
+    )
 }
 
 /// The width each of `count` buttons sharing a line of `inner` has.
@@ -2460,8 +2745,15 @@ fn line_button(inner: f32, count: u8) -> f32 {
 /// (its own posture's default, [`HarnessSessionRow::default`]), whose
 /// button's description says it follows the default where a press of it
 /// hands back ([`hands_back`]: a default that carries). On a line where
-/// `measure` allows; else stacked, the buttons on one line or two
-/// ([`RowMeasure`]).
+/// `measure` allows, its setting line ([`setting_line`]) right under it
+/// (the pair keyed `harness/session/<id>/head`); else stacked, the setting
+/// line under its detail and the buttons on one line or more
+/// ([`RowMeasure`]). Every row has the setting line, so no press moves a
+/// row (§11.7.7). Every button of the row, and of its open Timer
+/// ([`session_timer`]), waits for a look before a pointer press
+/// (`Control::look_first`, §11.5.7): a state line coming or going in a row
+/// above it (a background done, a timer's fire) moves it under a still
+/// pointer, and that press then only lights it.
 fn session_row(
     row: &HarnessSessionRow,
     timer_open: bool,
@@ -2482,9 +2774,11 @@ fn session_row(
     } else {
         (inner - 5.0 * (button_width + MODE_GAP)).max(0.0)
     };
-    // Each face is fitted to its own button: stacked, a line's buttons share
-    // its width ([`RowMeasure::button`]).
-    let face_room = |index: usize| (measure.button(inner, index) - 20.0).max(0.0);
+    // Each face whole in its own button ([`button_words`]): stacked, a line's
+    // buttons share its width ([`RowMeasure::button`]), the flow chosen so
+    // each holds its face on one line.
+    let face_words =
+        |word: &str, index: usize| button_words(word, &[], measure.button(inner, index)).0;
     let key = format!("harness/session/{}", row.local_id);
     let mut buttons: Vec<UiNode> = Autopilot::ALL
         .iter()
@@ -2493,10 +2787,7 @@ fn session_row(
             let action = autopilot_action(row.local_id, *mode);
             let word = mode_label(*mode);
             let mut spec = ButtonSpec::new(format!("Autopilot {} for {}", mode.word(), row.name))
-                .visual_label(crate::native_ui::fit_native_button_label(
-                    word,
-                    face_room(index),
-                ));
+                .visual_label(face_words(word, index));
             spec.description = Some(if default.is_some_and(|d| hands_back(*mode, d)) {
                 format!(
                     "{}; the default, so this follows [harness] autopilot",
@@ -2509,6 +2800,7 @@ fn session_row(
                 action.clone(),
                 UiContent::Button(
                     Control::new(spec, ActionId::new(action))
+                        .look_first()
                         .state(ControlState {
                             enabled,
                             selected: enabled && row.mode == Some(*mode),
@@ -2534,11 +2826,11 @@ fn session_row(
             toggle.clone(),
             UiContent::Button(
                 Control::new(
-                    ButtonSpec::new(format!("Timer for {}", row.name)).visual_label(
-                        crate::native_ui::fit_native_button_label("Timer", face_room(3)),
-                    ),
+                    ButtonSpec::new(format!("Timer for {}", row.name))
+                        .visual_label(face_words("Timer", 3)),
                     ActionId::new(toggle),
                 )
+                .look_first()
                 .state(ControlState {
                     enabled,
                     expanded: Some(timer_open),
@@ -2560,15 +2852,15 @@ fn session_row(
     // SHOW raises the session's tab and pane (§10.3.1); drawn selected while
     // the page is landed on this row.
     let show = show_action(row.local_id);
-    let mut show_spec = ButtonSpec::new(format!("Show {}", row.name)).visual_label(
-        crate::native_ui::fit_native_button_label("Show", face_room(4)),
-    );
+    let mut show_spec =
+        ButtonSpec::new(format!("Show {}", row.name)).visual_label(face_words("Show", 4));
     show_spec.description = Some("raise its tab and pane".to_string());
     buttons.push(
         UiNode::new(
             show.clone(),
             UiContent::Button(
                 Control::new(show_spec, ActionId::new(show))
+                    .look_first()
                     .state(ControlState {
                         selected: landed,
                         ..ControlState::default()
@@ -2586,47 +2878,52 @@ fn session_row(
                 .height(Length::Fill),
         ),
     );
-    let text = |suffix: &str, text: String, role: SemanticRole, style: StyleRef, height: f32| {
-        UiNode::new(
-            format!("{key}/{suffix}"),
-            UiContent::Text(TextSpec { text, role, style }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        )
-        .paint_only()
-    };
-    let title = text(
-        "title",
-        crate::native_ui::fit_native_text_label(&row.title, text_width),
-        SemanticRole::Text,
-        StyleRef::Primary,
-        title_height,
-    );
-    let detail = text(
-        "detail",
-        crate::native_ui::fit_native_status_label(&row.detail, text_width),
-        SemanticRole::Status,
-        StyleRef::Quiet,
-        detail_height,
-    );
     let label = format!("{}: {}", row.title, row.detail);
     if compact {
+        // A line of buttons as tall as its tallest face needs.
         let line = |suffix: &str, name: &str, buttons: Vec<UiNode>| {
+            let height = buttons
+                .iter()
+                .filter_map(|button| match &button.content {
+                    UiContent::Button(control) => control.spec.visual_label.as_deref(),
+                    _ => None,
+                })
+                .map(|words| {
+                    crate::native_ui::native_button_height_for_lines(
+                        words.lines().count().max(1),
+                        control_height,
+                    )
+                })
+                .fold(control_height, f32::max);
             UiNode::new(
                 format!("{key}/{suffix}"),
                 UiContent::Group(GroupSpec::new(name)),
             )
-            .layout(
-                Layout::row()
-                    .height(Length::Fixed(control_height))
-                    .gap(MODE_GAP),
-            )
+            .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
             .children(buttons)
         };
-        let mut children = vec![title, detail];
+        // Stacked, the words have the row's width: its title, its detail and
+        // its setting line each on as many lines as it needs, never cut.
+        let wrapped = |suffix: &str, text: &str, kind: (SemanticRole, StyleRef), height: f32| {
+            wrapped_words_node(&format!("{key}/{suffix}"), text, kind, inner, height)
+                .0
+                .paint_only()
+        };
+        let title = wrapped(
+            "title",
+            &row.title,
+            (SemanticRole::Text, StyleRef::Primary),
+            title_height,
+        );
+        let detail = wrapped(
+            "detail",
+            &row.detail,
+            (SemanticRole::Status, StyleRef::Quiet),
+            detail_height,
+        );
+        let (setting, _) = setting_line(row, inner);
+        // Its setting line under its detail, over the buttons.
+        let mut children = vec![title, detail, setting];
         // The first line keeps v1's key and name (`…/modes`, Autopilot); the
         // next are `…/line/<n>`, named by their faces (`Timer, Show`).
         let mut rest = buttons.into_iter();
@@ -2642,9 +2939,8 @@ fn session_row(
             });
             start += count;
         }
-        let height = stacked_row_height(f32::from(
-            u8::try_from(measure.lines.len()).unwrap_or(u8::MAX),
-        ));
+        let height = children.iter().map(fixed_height).sum::<f32>()
+            + 4.0 * children.len().saturating_sub(1) as f32;
         return (
             UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
                 .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
@@ -2652,19 +2948,51 @@ fn session_row(
             height,
         );
     }
-    let height = control_height.max(title_height + detail_height);
+    // Beside the buttons, its title and detail wrap to the words' column,
+    // whole, the row as tall as they are and its buttons a control tall at
+    // its top: a wide page at 1.5× text cut the detail at a joint ("Tab 2 ·
+    // Claude Code ·…") where a line more holds it.
+    let (title, words_title) = wrapped_words_node(
+        &format!("{key}/title"),
+        &row.title,
+        (SemanticRole::Text, StyleRef::Primary),
+        text_width,
+        title_height,
+    );
+    let (detail, words_detail) = wrapped_words_node(
+        &format!("{key}/detail"),
+        &row.detail,
+        (SemanticRole::Status, StyleRef::Quiet),
+        text_width,
+        detail_height,
+    );
+    let height = control_height.max(words_title + words_detail);
     let words = UiNode::new(
         format!("{key}/words"),
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
     )
     .layout(Layout::column().width(Length::Fill).height(Length::Fill))
-    .children(vec![title, detail]);
+    .children(vec![title.paint_only(), detail.paint_only()]);
     let mut children = vec![words];
-    children.extend(buttons);
+    children.extend(buttons.into_iter().map(|mut button| {
+        button.layout.height = Length::Fixed(control_height);
+        button
+    }));
+    let line = UiNode::new(key.clone(), UiContent::Group(GroupSpec::new(label)))
+        .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
+        .children(children);
+    // Its setting line right under it, at the column's width: the row's
+    // words read on into it (title, detail, setting), clear of the next
+    // row's title by the gap between rows.
+    let (setting, setting_height) = setting_line(row, inner);
+    let total = height + setting_height;
     (
-        UiNode::new(key, UiContent::Group(GroupSpec::new(label)))
-            .layout(Layout::row().height(Length::Fixed(height)).gap(MODE_GAP))
-            .children(children),
-        height,
+        UiNode::new(
+            format!("{key}/head"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::column().height(Length::Fixed(total)))
+        .children(vec![line, setting]),
+        total,
     )
 }

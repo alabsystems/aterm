@@ -427,7 +427,7 @@ impl Dir {
     /// The bytes of `<log>.id`, or `None` when there is none.
     pub(crate) fn read_id(&self) -> io::Result<Option<Vec<u8>>> {
         match self {
-            Dir::Os(p) => match std::fs::read(crate::logid::sidecar_path(p)) {
+            Dir::Os(p) => match std::fs::read(crate::logid::identity_path(p)) {
                 Ok(b) => Ok(Some(b)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
@@ -442,7 +442,7 @@ impl Dir {
     pub(crate) fn replace_id(&self, bytes: &[u8]) -> io::Result<()> {
         match self {
             Dir::Os(p) => {
-                let path = crate::logid::sidecar_path(p);
+                let path = crate::logid::identity_path(p);
                 let mut tmp = path.clone();
                 tmp.as_mut_os_string().push(".tmp");
                 {

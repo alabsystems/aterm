@@ -151,6 +151,9 @@ struct Setup {
     id_mask: u32,
     /// The first screen's root window.
     root: u32,
+    /// The keycodes the server sends, lowest and highest.
+    min_keycode: u8,
+    max_keycode: u8,
 }
 
 /// Read a whole setup reply (its 8-byte head, then the head's length in
@@ -186,10 +189,14 @@ fn parse_setup(reply: &[u8]) -> Result<Setup, String> {
     if id_mask == 0 {
         return Err("the X server gave no resource ids".into());
     }
+    let min_keycode = *reply.get(34).ok_or_else(short)?;
+    let max_keycode = *reply.get(35).ok_or_else(short)?;
     Ok(Setup {
         id_base,
         id_mask,
         root,
+        min_keycode,
+        max_keycode,
     })
 }
 
@@ -379,6 +386,8 @@ impl X {
                 id_base: 0,
                 id_mask: 0,
                 root: 0,
+                min_keycode: 0,
+                max_keycode: 0,
             },
             next_id: 0,
             queued: VecDeque::new(),
@@ -442,7 +451,9 @@ impl X {
         Ok(p)
     }
 
-    fn send(&mut self, req: &[u8]) -> Result<u16, Error> {
+    /// Send a request without awaiting anything: one with no reply, whose
+    /// error the next [`X::call`] reads.
+    pub(crate) fn send(&mut self, req: &[u8]) -> Result<u16, Error> {
         self.sock.write_all(req).map_err(|e| fault(e.to_string()))?;
         self.seq = self.seq.wrapping_add(1);
         Ok(self.seq)
@@ -466,6 +477,16 @@ impl X {
                 _ => self.queued.push_back(head),
             }
         }
+    }
+
+    /// The first screen's root window.
+    pub(crate) fn root(&self) -> u32 {
+        self.setup.root
+    }
+
+    /// The keycodes the server sends, lowest and highest (its setup's).
+    pub(crate) fn keycodes(&self) -> (u8, u8) {
+        (self.setup.min_keycode, self.setup.max_keycode)
     }
 
     /// The next event, the ones queued first.
@@ -828,9 +849,9 @@ mod tests {
         let mut r = vec![1, 0, 11, 0, 0, 0, 0, 0];
         r.extend_from_slice(&words(&[0, 0x0020_0000, 0x001f_ffff, 0]));
         r.extend_from_slice(&5u16.to_le_bytes()); // vendor length
-        // maximum-request-length, one screen, two formats, six bytes of image
-        // facts, four unused.
-        r.extend_from_slice(&[0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // maximum-request-length, one screen, two formats, four bytes of
+        // image facts, keycodes 8 to 255, four unused.
+        r.extend_from_slice(&[0, 0, 1, 2, 0, 0, 0, 0, 8, 255, 0, 0, 0, 0]);
         r.extend_from_slice(b"Xorg\0\0\0\0"); // vendor, padded to 8
         r.extend_from_slice(&[0; 16]); // two formats
         r.extend_from_slice(&0x0000_0505u32.to_le_bytes());
@@ -839,7 +860,9 @@ mod tests {
             Ok(Setup {
                 id_base: 0x0020_0000,
                 id_mask: 0x001f_ffff,
-                root: 0x0505
+                root: 0x0505,
+                min_keycode: 8,
+                max_keycode: 255,
             })
         );
         let mut refused = vec![0, 6, 11, 0, 0, 0, 2, 0];

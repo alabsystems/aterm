@@ -334,6 +334,16 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
 /// holding only that guess hands over ([`crate::predict::Predictor::take_link_estimate`]):
 /// a link nothing has measured, owing that one keystroke's echo.
 fn arm_prediction(app: &mut crate::App, ch: char) -> crate::predict::LinkEstimate {
+    arm_prediction_with(app, ch, None)
+}
+
+/// [`arm_prediction`] with `rule_off` switched off in both predictors it arms,
+/// through the predictor's debug-only negative-control seam.
+fn arm_prediction_with(
+    app: &mut crate::App,
+    ch: char,
+    rule_off: Option<crate::predict::Rule>,
+) -> crate::predict::LinkEstimate {
     let wid = WindowId(0);
     let term = app
         .front_terminal(wid)
@@ -352,12 +362,22 @@ fn arm_prediction(app: &mut crate::App, ch: char) -> crate::predict::LinkEstimat
     let born = std::time::Instant::now();
     let predictor = &mut app.windows.get_mut(&wid).unwrap().predictor;
     predictor.set_mode(crate::predict::PredictMode::Always);
-    assert!(predictor.predict_char_in_grid(ch, cursor, coords, grid, born));
     let mut unmeasured = crate::predict::Predictor::new(crate::predict::PredictMode::Always);
+    if let Some(rule) = rule_off {
+        predictor.disable_rule_for_test(rule);
+        unmeasured.disable_rule_for_test(rule);
+    }
+    assert!(predictor.predict_char_in_grid(ch, cursor, coords, grid, born));
     assert!(unmeasured.predict_char_in_grid(ch, cursor, coords, grid, born));
     unmeasured.take_link_estimate()
 }
 
+/// The frame's observe reads a row the engine reorders (right-to-left text) at
+/// LOGICAL columns, so a guess's echo there is found where its key typed it, and
+/// confirms. The predictor declines a right-to-left glyph outright
+/// (`Rule::RightToLeftRows`: UAX #9 decides where its echo is drawn, and moves
+/// its neighbours), so the host's half is driven with that rule switched off;
+/// with it in force the glyph is declined, owed, and nothing is armed.
 #[test]
 fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
     let wid = WindowId(0);
@@ -366,7 +386,13 @@ fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
     app.predict_mode_cache = None;
     feed(&app, "אב".as_bytes());
     app.redraw_window(wid);
-    arm_prediction(&mut app, 'ג');
+    let mut declining = crate::predict::Predictor::new(crate::predict::PredictMode::Always);
+    assert!(
+        !declining.predict_char_in_grid('ג', (0, 2), 0, (80, 24), std::time::Instant::now()),
+        "a right-to-left glyph is declined"
+    );
+    assert!(declining.idle());
+    arm_prediction_with(&mut app, 'ג', Some(crate::predict::Rule::RightToLeftRows));
     feed(&app, "ג".as_bytes());
     app.redraw_window(wid);
     let ws = app.windows.get_mut(&wid).unwrap();
@@ -409,5 +435,144 @@ fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
     assert_eq!(
         estimate, unmeasured,
         "nothing past the pending guess's own echo debt"
+    );
+}
+
+/// The single-pane path paints a state chain as the composed path does
+/// (`render-paint-prediction-chain`): every cell of its displayed state or
+/// none, with the chain's OWN cursor, which a pure motion moves with no cell
+/// painted and an erase leaves on the cell it vacated. Driven through the
+/// press path (`App::input`) and `redraw_window` on a one-pane window, in
+/// `always` (the class ladder is Adaptive's; this is the painter's half). The
+/// glyph lane's cursor, one past the newest painted cell, would put a pure
+/// motion's cursor nowhere (it paints no cell) and an erase's a cell right of
+/// its vacated cell.
+#[test]
+fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
+    use crate::input::{InputEvent, Source};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    let press = |key| InputEvent::Key {
+        key,
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let wid = WindowId(0);
+    // (the edit key, the cell `$ ab`'s (0, 3) shows on glass)
+    for (key, on_glass) in [(NamedKey::ArrowLeft, 'b'), (NamedKey::Backspace, ' ')] {
+        let mut app = scripted_app();
+        app.config.predictive_echo = Some("always".into());
+        app.predict_mode_cache = None;
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        feed(&app, b"$ ");
+        app.redraw_window(wid);
+        for c in ['a', 'b'] {
+            let _ = app.input(wid, press(Key::Character(c)), Source::Human);
+            feed(&app, c.to_string().as_bytes());
+            app.redraw_window(wid);
+        }
+        assert!(
+            app.windows[&wid].predictor.idle(),
+            "fixture: `ab` echoed and retired, the known line"
+        );
+        let _ = app.input(wid, press(Key::Named(key)), Source::Human);
+        assert!(
+            !app.windows[&wid].predictor.idle(),
+            "{key:?}: armed as an edit op"
+        );
+        app.redraw_window(wid);
+        let ws = &app.windows[&wid];
+        assert!(ws.pred_shown, "{key:?}: the chain is on glass");
+        assert_eq!(
+            (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
+            (0, 3),
+            "{key:?}: the chain's cursor, on `b`'s cell"
+        );
+        assert_eq!(
+            ws.input_scratch.cells[0][3].ch, on_glass,
+            "{key:?}: what the state shows on `b`'s cell"
+        );
+    }
+}
+
+/// The scroll's own frame reads the content witness's rows in the frame's one hold, after
+/// the translation (`CursorEffectScrollChange::translated_only`): a box redrawn in place
+/// under a scroll, as Claude Code's composer is when a tool result lands under a full
+/// transcript, keeps its band on the frame it is drawn, never on the row the scroll
+/// carried it to, still in one terminal hold.
+#[test]
+fn a_box_redrawn_in_place_under_a_scroll_keeps_its_band_in_the_scroll_s_one_hold() {
+    let wid = WindowId(0);
+    let mut app = lit_app();
+    app.config.motion = Some("full".into());
+    app.windows.get_mut(&wid).expect("scripted window").focused = true;
+    let term = app
+        .front_terminal(wid)
+        .expect("front terminal")
+        .term
+        .clone();
+    let rows = term_lock(&term).grid().rows();
+    // The line on the fourth row from the bottom, 1-based `line`.
+    let line = rows - 3;
+    let row = line - 1;
+    feed(&app, format!("\x1b[{line};1H").as_bytes());
+    app.redraw_window(wid);
+    let ribbon_cols = |app: &crate::App, row: u16| -> Vec<u16> {
+        let mut cols: Vec<u16> = app.windows[&wid]
+            .fx
+            .cursor()
+            .glow
+            .v2_ribbon()
+            .map(|r| {
+                r.cells()
+                    .iter()
+                    .filter(|c| c.row == row && !c.leaving())
+                    .map(|c| c.col)
+                    .collect()
+            })
+            .unwrap_or_default();
+        cols.sort_unstable();
+        cols
+    };
+    for ch in "hello world".bytes() {
+        app.windows
+            .get_mut(&wid)
+            .expect("scripted window")
+            .fx
+            .cursor_mut()
+            .glow
+            .note_typed_cells(std::time::Instant::now(), 1);
+        feed(&app, &[ch]);
+        app.redraw_window(wid);
+    }
+    app.redraw_window(wid);
+    let lit: Vec<u16> = (0..11).collect();
+    assert_eq!(ribbon_cols(&app, row), lit, "fixture: the typed band");
+    feed(
+        &app,
+        format!(
+            "\x1b[?2026h\x1b[{rows};1H\r\n\r\n\r\n\x1b[{};1H\x1b[2Kother text\
+             \x1b[{line};1H\x1b[2Khello world\x1b[?2026l",
+            line - 3
+        )
+        .as_bytes(),
+    );
+    let before = term_lock_acquisitions_on_this_thread();
+    app.redraw_window(wid);
+    let taken = term_lock_acquisitions_on_this_thread() - before;
+    assert_eq!(
+        ribbon_cols(&app, row),
+        lit,
+        "on the scroll's own frame the band stands under its text"
+    );
+    assert!(
+        ribbon_cols(&app, row - 3).is_empty(),
+        "nothing on the row the scroll carried it to: {:?}",
+        ribbon_cols(&app, row - 3)
+    );
+    assert_eq!(
+        taken, 1,
+        "the scroll's frame takes ONE terminal hold (took {taken})"
     );
 }

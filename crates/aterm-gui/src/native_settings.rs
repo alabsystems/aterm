@@ -67,14 +67,14 @@ pub(crate) enum SettingsRoute {
     Modified,
     Manual,
     Appearance,
-    /// SETTINGS ▸ THEMES, the Theme Showcase: every theme as a live sample,
-    /// a trial of one on the whole app (Keep or Revert), the colour and type
-    /// settings a theme is tuned with, and Save as theme… A SPECIAL page
-    /// (`showcase_page`). It is Appearance's sub-page: while it shows, the
-    /// rail lists an indented Themes row under Appearance, and that row is
-    /// the selected one (the rail scrolls where its rows outgrow the window);
-    /// the compact category sheet, the palette and `aterm ctl open app
-    /// settings /themes` reach it by name.
+    /// SETTINGS ▸ THEMES, the Theme Showcase: a chooser of every theme beside
+    /// one live demo, a trial of one on the whole app (Keep or Revert), the
+    /// color and type settings a theme is tuned with, and Save as theme… A
+    /// SPECIAL page (`showcase_page`). It is Appearance's sub-page: while it
+    /// shows, the rail lists an indented Themes row under Appearance, and
+    /// that row is the selected one (the rail scrolls where its rows outgrow
+    /// the window); the compact category sheet, the palette and `aterm ctl
+    /// open app settings /themes` reach it by name.
     Themes,
     TextFonts,
     CursorMotion,
@@ -98,8 +98,8 @@ pub(crate) enum SettingsRoute {
     /// SETTINGS ▸ HARNESS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §4):
     /// the coding-agent harness's own page — its switches, the default
     /// Autopilot, each session's Autopilot, what the harness did and the
-    /// effective `[harness]` table. Reached from the footer's `⚙` chip,
-    /// View ▸ Coding Agent Harness… (`MenuAction::HarnessSettings`), the
+    /// effective `[harness]` table. Reached from the Autopilot menu's
+    /// `Harness settings…`, View ▸ Coding Agent Harness… (`MenuAction::HarnessSettings`), the
     /// palette and `aterm ctl open app settings /harness`. A SPECIAL page
     /// (`harness_page`) over the host's [`HarnessState`]; it places
     /// [`Section::Harness`]'s registry rows itself, which stay owned by that
@@ -219,7 +219,15 @@ impl SettingsRoute {
         if path == "/agents" {
             return Some(Self::Harness);
         }
-        if matches!(path, "/tab-control" | "/control-panel" | "/fleet") {
+        if matches!(
+            path,
+            "/tab-control"
+                | "/control-panel"
+                | "/fleet"
+                | "/monitor"
+                | "/fleet-monitor"
+                | "/system-monitor"
+        ) {
             return Some(Self::Tabs);
         }
         Self::ALL.into_iter().find(|route| route.path() == path)
@@ -372,11 +380,43 @@ const THEMES_BROWSE_KEY: &str = "settings/themes/browse";
 const THEMES_BROWSE_ROW_KEY: &str = "settings/themes/browse-row";
 /// The theme card's Follow system switch (its node key and its action).
 const THEME_MODE_ACTION: &str = "settings/theme-mode";
+/// The Follow system switch's row key (`settings/row/<this>`).
+const THEME_MODE_KEY: &str = "theme-mode";
 /// The theme card's preview side switch, shown while the theme follows the
 /// system.
 const THEME_PREVIEW_SIDE_ACTION: &str = "settings/theme-preview-side";
 /// A Follow-system slot button: `settings/theme-slot/dark` or `…/light`.
 const THEME_SLOT_ACTION_PREFIX: &str = "settings/theme-slot/";
+
+/// The config key the compiled Settings control `key` edits, one binding the
+/// Settings builder owns: a row's `settings/control/<key>`, and the theme
+/// card's Follow-system slots and Follow system switch, which edit `theme`.
+/// `None` for anything else: a Reset, the preview side switch (view state),
+/// navigation, a showcase control.
+pub(crate) fn edited_setting_key(key: &UiKey) -> Option<&str> {
+    let key = key.as_str();
+    if let Some(setting) = key.strip_prefix("settings/control/") {
+        return Some(setting);
+    }
+    let slot = key
+        .strip_prefix(THEME_SLOT_ACTION_PREFIX)
+        .and_then(parse_appearance_word)
+        .is_some();
+    (slot || key == THEME_MODE_ACTION).then_some(prefs::EDIT_THEME)
+}
+
+/// What a setting is, in the words its controls together say, where its
+/// control is not one `settings/control/<key>` row: the theme card's slots
+/// and switch say the pair ("Nord / Solarized Light · follows system"), the
+/// one wording the status, Undo and the Color theme control use.
+pub(crate) fn setting_effective_words(state: &SettingsViewState, key: &str) -> Option<String> {
+    (key == prefs::EDIT_THEME).then(|| {
+        theme_value_words(
+            &state.assets.themes,
+            state.raw_value(prefs::EDIT_THEME).as_deref(),
+        )
+    })
+}
 
 /// A Follow-system slot button's node key and action.
 fn theme_slot_action(side: aterm_types::Appearance) -> String {
@@ -402,14 +442,38 @@ fn parse_appearance_word(word: &str) -> Option<aterm_types::Appearance> {
     }
 }
 
-/// The side of a Follow-system pair the theme preview draws: the one the
-/// person switched to, else the one the OS appearance picks.
+/// The side of a Follow-system pair the theme preview draws: the side the
+/// person chose ([`chosen_theme_side`]), else, on Settings ▸ Themes, the
+/// side the theme the chooser's highlight is on is made for
+/// ([`SettingsViewState::showcase_highlight_side`]), else the one the OS
+/// appearance picks.
 fn theme_visible_side(state: &SettingsViewState, system_dark: bool) -> aterm_types::Appearance {
-    state.theme_preview_side.unwrap_or(if system_dark {
+    chosen_theme_side(state)
+        .or_else(|| state.showcase_highlight_side())
+        .unwrap_or_else(|| os_theme_side(system_dark))
+}
+
+/// The side of a Follow-system pair the person chose: an open slot picker's
+/// own side while it is open (read from the picker, so every way it closes
+/// without a pick — Cancel, Escape, a second press, leaving the page, a
+/// search — puts the preview back by construction), else the side the person
+/// switched to on the surface that draws the switch (Appearance's Preview
+/// side, Themes' Dark | Light segment). `None` where they chose none.
+fn chosen_theme_side(state: &SettingsViewState) -> Option<aterm_types::Appearance> {
+    state
+        .choice_picker
+        .as_ref()
+        .and_then(|picker| picker.slot)
+        .or(state.theme_preview_side)
+}
+
+/// The side the OS appearance picks.
+const fn os_theme_side(system_dark: bool) -> aterm_types::Appearance {
+    if system_dark {
         aterm_types::Appearance::Dark
     } else {
         aterm_types::Appearance::Light
-    })
+    }
 }
 
 /// The theme picker for one Follow-system side, opened on what that slot
@@ -423,7 +487,7 @@ fn theme_slot_picker(state: &SettingsViewState, side: aterm_types::Appearance) -
     };
     let mut picker = ChoicePicker::for_themes_in(
         &state.assets.themes,
-        theme_slot_picker_rows(&state.assets.themes),
+        theme_slot_picker_rows(&state.assets.themes, side),
         &current,
         false,
         true,
@@ -433,19 +497,42 @@ fn theme_slot_picker(state: &SettingsViewState, side: aterm_types::Appearance) -
 }
 
 /// A slot picker's rows: the theme picker's, with its Default row naming
-/// Default instead of being the reset. A slot names one side of the pair; the
-/// reset would unset both sides (and stop following the system).
-fn theme_slot_picker_rows(themes: &crate::app_config::ThemeCatalog) -> Vec<ChoiceOption> {
+/// Default instead of being the reset (a slot names one side of the pair; the
+/// reset would unset both sides and stop following the system), and the
+/// slot's own side first: its built-in section leads, aterm's own theme for
+/// that side first in it (as Default leads the dark section), then the other
+/// side's, then the person's own files and those that did not load, each
+/// section in the whole-theme picker's order. Home and Page Up on the Light
+/// slot land on light themes.
+fn theme_slot_picker_rows(
+    themes: &crate::app_config::ThemeCatalog,
+    side: aterm_types::Appearance,
+) -> Vec<ChoiceOption> {
     let mut rows = theme_picker_rows(themes);
     for row in &mut rows {
         if row.value.is_none() && row.disabled_reason().is_none() {
             row.value = row.theme.as_ref().map(|theme| theme.id.clone());
         }
     }
+    let own = match side {
+        aterm_types::Appearance::Dark => ThemeSection::Dark,
+        aterm_types::Appearance::Light => ThemeSection::Light,
+    };
+    let own_default = crate::app_config::default_pair_side(side);
+    // A stable sort: the order inside each section stays the catalog's.
+    rows.sort_by_key(|row| match row.theme.as_ref() {
+        Some(theme) if theme.section == own && theme.id.eq_ignore_ascii_case(own_default) => 0,
+        Some(theme) if theme.section == own => 1,
+        Some(theme) if matches!(theme.section, ThemeSection::Dark | ThemeSection::Light) => 2,
+        Some(theme) if theme.section == ThemeSection::Yours => 3,
+        _ => 4,
+    });
     rows
 }
 
-/// The theme picker's sections, in the order its rows are listed.
+/// The theme picker's sections, in the order the whole-theme picker lists
+/// its rows (a Follow-system slot's picker lists its own side first,
+/// [`theme_slot_picker_rows`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThemeSection {
     /// The configured value when no row names it (a `dark:…,light:…` split,
@@ -462,6 +549,14 @@ enum ThemeSection {
 }
 
 impl ThemeSection {
+    /// A section that only ever holds one row, which names itself (the
+    /// configured value no row names, "Current · …"): in a headed picker it
+    /// is a full-width row of its own with no caption over it, and the
+    /// column count is measured without it.
+    fn spans_row(self) -> bool {
+        matches!(self, Self::Current)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Current => "Current",
@@ -531,7 +626,9 @@ enum PickerRow {
 
 /// A picker's rows: `count` cells in rows of `columns`. With `headed`, each
 /// run of cells `section` puts in one section (`None`: no section) starts a
-/// row of its own under its heading; without, the cells fill every row.
+/// row of its own under its heading (a section of one self-naming row,
+/// [`ThemeSection::spans_row`], takes no heading); without, the cells fill
+/// every row.
 fn picker_rows(
     count: usize,
     columns: usize,
@@ -547,7 +644,10 @@ fn picker_rows(
         while end < count && (!headed || section(end) == heading) {
             end += 1;
         }
-        if headed && let Some(heading) = heading {
+        if headed
+            && let Some(heading) = heading
+            && section_captioned(heading)
+        {
             rows.push(PickerRow::Heading(heading));
         }
         let mut first = start;
@@ -559,6 +659,12 @@ fn picker_rows(
         start = end;
     }
     rows
+}
+
+/// Whether a picker section named `heading` draws its caption: every one but
+/// a section of one self-naming row ([`ThemeSection::spans_row`]).
+fn section_captioned(heading: &str) -> bool {
+    heading != ThemeSection::Current.label()
 }
 
 /// A picker heading row's height: a caption, as a settings group's.
@@ -606,20 +712,28 @@ struct ChoicePicker {
     /// `offset` and holds as many rows as `room` (the list's height) takes,
     /// `gap` between each two. Layout sizes it to the room under the preview;
     /// when every row fits it is all of them, and when not, the list scrolls
-    /// a row at a time. `headed` draws a theme picker's section headings
-    /// (where the room holds them). Interior mutability keeps render,
-    /// reducer, focus, and hit testing on the same window.
+    /// a row at a time. A theme picker always heads its sections
+    /// ([`Self::headed`]): the room is never less than a heading over a row.
+    /// Interior mutability keeps render, reducer, focus, and hit testing on
+    /// the same window.
     offset: Cell<usize>,
     room: Cell<PickerMeasure>,
     gap: Cell<PickerMeasure>,
-    headed: Cell<bool>,
     columns: Cell<usize>,
+    /// The cell the window last followed ([`Self::configure_window`]): a
+    /// layout brings the highlight on glass only when it moved, or the list
+    /// was laid out anew, so the wheel can scroll the list away from it.
+    followed: Cell<Option<usize>>,
     /// An option [`Self::reveal`] asked to bring on glass, for the next
     /// layout to put in the window it sizes.
     reveal_pending: Cell<Option<usize>>,
     /// The option indices the filter admits, in list order (every option
     /// when there is no filter).
     shown: Vec<usize>,
+    /// The theme rows a Settings search's query named when it seeded the
+    /// filter ([`Self::seed_filter`]): where the keyboard starts, among what
+    /// the field's text lists. Typing in the field lets them go.
+    seed_named: Vec<usize>,
     /// A font picker takes typing: `filter` narrows [`Self::shown`] to the
     /// options whose name holds it.
     fonts: bool,
@@ -655,6 +769,10 @@ impl ChoicePicker {
         } else {
             current.strip_suffix(" (default)").unwrap_or(current).trim()
         };
+        // A trail style saved in an alias (`nyan rainbow`) stands on the row
+        // it resolves to, so the picker selects that row instead of adding a
+        // `(current)` copy of it; a spelling nothing knows keeps its own row.
+        let current = trail_style_row_value(key, current);
         // The rows read as the closed control does.
         let option_label = |value: &str| setting_choice_label(key, value);
         let options = options.into_iter().collect::<Vec<_>>();
@@ -728,10 +846,11 @@ impl ChoicePicker {
             // Until the first layout sizes the window, show everything.
             room: Cell::new(PickerMeasure::new(f32::INFINITY)),
             gap: Cell::new(PickerMeasure::new(6.0)),
-            headed: Cell::new(false),
             columns: Cell::new(1),
+            followed: Cell::new(None),
             reveal_pending: Cell::new(None),
             shown,
+            seed_named: Vec::new(),
             fonts: false,
             filter: String::new(),
             themes,
@@ -904,28 +1023,50 @@ impl ChoicePicker {
         }
     }
 
+    /// Whether the list heads its sections: a theme picker always does, at
+    /// every size (a structure, never a presentation threshold); the card
+    /// gives its list the room of a heading over one row at least.
+    fn headed(&self) -> bool {
+        self.themes.is_some()
+    }
+
+    /// Whether the cell at `position` is a row of its own, full width
+    /// ([`ThemeSection::spans_row`]).
+    fn spans_row(&self, position: usize) -> bool {
+        self.headed()
+            && self
+                .shown
+                .get(position)
+                .and_then(|index| self.options[*index].theme.as_ref())
+                .is_some_and(|theme| theme.section.spans_row())
+    }
+
     /// The list's rows over the shown options and the trailing cells.
     fn rows(&self) -> Vec<PickerRow> {
         picker_rows(
             self.slots(),
             self.columns.get(),
-            self.headed.get(),
+            self.headed(),
             |position| self.cell_section(position),
         )
     }
 
-    /// The rows every option and the trailing cells take at `columns`, with
-    /// or without headings: what the card is sized by, so typing a filter
-    /// never moves its edges.
-    fn unfiltered_rows(&self, columns: usize, headed: bool) -> Vec<PickerRow> {
+    /// The rows every option and the trailing cells take at `columns`: what
+    /// the card is sized by, so typing a filter never moves its edges.
+    fn unfiltered_rows(&self, columns: usize) -> Vec<PickerRow> {
         let options = self.options.len();
-        picker_rows(options + self.trailing.get(), columns, headed, |position| {
-            if position < options {
-                self.option_section(position)
-            } else {
-                Some(THEME_FILES_HEADING)
-            }
-        })
+        picker_rows(
+            options + self.trailing.get(),
+            columns,
+            self.headed(),
+            |position| {
+                if position < options {
+                    self.option_section(position)
+                } else {
+                    Some(THEME_FILES_HEADING)
+                }
+            },
+        )
     }
 
     /// The heading a window that starts at row `first` carries over its first
@@ -933,11 +1074,13 @@ impl ChoicePicker {
     /// section's own heading (scrolled into the section), that section's
     /// name, so every screen that shows a section's choices names it.
     fn carried_heading(&self, rows: &[PickerRow], first: usize) -> Option<&'static str> {
-        if !self.headed.get() {
+        if !self.headed() {
             return None;
         }
         match rows.get(first)? {
-            PickerRow::Cells(cells) => self.cell_section(cells.start),
+            PickerRow::Cells(cells) => self
+                .cell_section(cells.start)
+                .filter(|heading| section_captioned(heading)),
             PickerRow::Heading(_) => None,
         }
     }
@@ -969,7 +1112,16 @@ impl ChoicePicker {
         {
             count -= 1;
         }
-        count.max(usize::from(first < rows.len()))
+        // A window that starts on a heading holds its first row too (the
+        // card's least room is a heading over a row), so no screen is a
+        // caption alone.
+        let least =
+            if matches!(rows.get(first), Some(PickerRow::Heading(_))) && first + 1 < rows.len() {
+                2
+            } else {
+                usize::from(first < rows.len())
+            };
+        count.max(least)
     }
 
     /// The rows on glass, as a range of [`Self::rows`].
@@ -1007,6 +1159,7 @@ impl ChoicePicker {
     }
 
     /// Whether option `index` is in the window.
+    #[cfg(test)]
     fn is_visible(&self, index: usize) -> bool {
         self.visible_indices().contains(&index)
     }
@@ -1082,16 +1235,13 @@ impl ChoicePicker {
     }
 
     /// Size the window to `room` points of rows of `columns`, `gap` apart,
-    /// with or without section headings, keeping cell `anchor` (the
-    /// highlighted one) on glass.
-    fn configure_window(
-        &self,
-        columns: usize,
-        room: f32,
-        gap: f32,
-        headed: bool,
-        anchor: Option<usize>,
-    ) {
+    /// keeping cell `anchor` (the highlighted one) on glass where it moved
+    /// since the last layout or the list is laid out anew; otherwise the
+    /// window stays where the wheel, or the last layout, put it.
+    fn configure_window(&self, columns: usize, room: f32, gap: f32, anchor: Option<usize>) {
+        let reflowed = self.columns.get() != columns.max(1)
+            || self.room.get() != PickerMeasure::new(room.max(0.0))
+            || self.gap.get() != PickerMeasure::new(gap);
         // The cell that led the old window leads the new one, so a reflow
         // keeps the reader's place.
         let old = self.rows();
@@ -1104,19 +1254,43 @@ impl ChoicePicker {
         self.columns.set(columns.max(1));
         self.room.set(PickerMeasure::new(room.max(0.0)));
         self.gap.set(PickerMeasure::new(gap));
-        self.headed.set(headed);
         let rows = self.rows();
         self.offset.set(
             leading
                 .and_then(|leading| Self::row_of(&rows, leading))
                 .map_or(0, |row| Self::with_heading(&rows, row)),
         );
+        let moved = self.followed.replace(anchor) != anchor;
         let anchor = self
             .reveal_pending
             .take()
             .and_then(|index| self.position_of(index))
-            .or(anchor);
+            .or(anchor.filter(|_| reflowed || moved));
         self.scroll_to(anchor);
+    }
+
+    /// Scroll the list `rows` rows of choices (the wheel, a screen reader's
+    /// scroll), leaving the highlight, and so the preview, where it is: the
+    /// window starts that many rows of cells on (a section's first row with
+    /// its heading), clamped to the list's ends. Whether the window moved
+    /// (`false` at the end it is turned toward).
+    fn scroll_by(&self, rows: isize) -> bool {
+        let all = self.rows();
+        let cells: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, PickerRow::Cells(_)))
+            .map(|(index, _)| index)
+            .collect();
+        let Some(last) = cells.len().checked_sub(1) else {
+            return false;
+        };
+        let offset = self.offset.get();
+        let at = cells.iter().position(|row| *row >= offset).unwrap_or(last);
+        let target = (at as isize).saturating_add(rows).clamp(0, last as isize) as usize;
+        self.offset.set(Self::with_heading(&all, cells[target]));
+        self.scroll_to(None);
+        self.offset.get() != offset
     }
 
     /// The row of `rows` that holds cell `position`.
@@ -1170,7 +1344,7 @@ impl ChoicePicker {
             .max(1)
     }
 
-    /// The cell `rows` rows (Up/Down, the wheel) or `steps` places
+    /// The cell `rows` rows (Up/Down, Page Up/Down) or `steps` places
     /// (Left/Right) from cell `from`, among the shown options and the
     /// trailing cells. Up and Down keep the column (a shorter row lands on
     /// its end) and skip headings; one row up from the top row, or down from
@@ -1219,48 +1393,124 @@ impl ChoicePicker {
             .map_or("", |extras| extras.filter.value())
     }
 
-    /// Fill the theme filter with `query` when it names a theme (a Settings
-    /// search for "nord"); otherwise leave the picker unfiltered, on the
-    /// saved choice. Whether it filtered.
+    /// Fill the theme filter when `query` names a theme (a Settings search
+    /// for "nord", [`Self::named_by`]); otherwise leave the picker
+    /// unfiltered, on the saved choice. Whether it filtered.
+    ///
+    /// THE FIELD SHOWS THE FILTER IN FORCE: it holds the text
+    /// [`Self::seed_text`] picks, and the list is exactly what that text
+    /// lists when typed ([`Self::refilter`]), so the next keystroke filters
+    /// on from what the field shows. (Showing the whole query over the rows
+    /// its name words picked left "gruvbox theme" in the field over both
+    /// Gruvbox rows, which that text, typed, does not list: the next key
+    /// emptied the list.)
     fn seed_filter(&mut self, query: &str) -> bool {
-        if !self.names_theme(query) {
+        let named = self.named_by(query);
+        if named.is_empty() || self.themes.is_none() {
             return false;
         }
-        let Some(extras) = self.themes.as_mut() else {
+        let Some(text) = self.seed_text(query, &named) else {
             return false;
         };
-        extras.filter = crate::native_text_input::TextInputState::new(query.to_string());
-        self.refilter();
-        if self.shown.is_empty() {
-            if let Some(extras) = self.themes.as_mut() {
-                extras.filter = crate::native_text_input::TextInputState::new(String::new());
-            }
-            self.refilter();
-            return false;
+        if let Some(extras) = self.themes.as_mut() {
+            extras.filter = crate::native_text_input::TextInputState::new(text);
         }
+        self.refilter();
+        self.seed_named = named;
         true
     }
 
-    /// Whether `query` names one of the picker's themes: answers an option's
-    /// label or catalog id, never only its description or appearance, so a
-    /// search such as "light theme" that finds the theme row does not narrow
-    /// the picker to the themes whose descriptions happen to say it.
-    fn names_theme(&self, query: &str) -> bool {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() || self.themes.is_none() {
-            return false;
-        }
-        let matches = |candidate: &str| {
-            crate::native_config_language::candidate_match_score(&candidate.to_lowercase(), &query)
-                .is_some()
+    /// The text a seeded filter shows for `query`, whose name words named
+    /// the theme rows `named`: the query as typed, else without its generic
+    /// nouns ("gruvbox theme" is "gruvbox"), else its name words alone
+    /// ("catppuccin light" is "catppuccin": the filter matches a phrase, and
+    /// no name holds that one) — the first that, typed, lists every row the
+    /// query named. `None` where none does.
+    fn seed_text(&self, query: &str, named: &[usize]) -> Option<String> {
+        let core = |word: &str| {
+            word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                .to_lowercase()
         };
-        self.options.iter().any(|option| {
-            matches(&option.label)
-                || option
-                    .theme
-                    .as_ref()
-                    .is_some_and(|theme| matches(&theme.id))
-        })
+        let typed: Vec<&str> = query.split_whitespace().collect();
+        let specific: Vec<&str> = typed
+            .iter()
+            .copied()
+            .filter(|word| !THEME_GENERIC_NOUNS.contains(&core(word).as_str()))
+            .collect();
+        let names = ThemeNaming::of(query).map_or_else(Vec::new, |naming| naming.names);
+        [typed.join(" "), specific.join(" "), names.join(" ")]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .find(|text| {
+                let typed = text.to_lowercase();
+                named
+                    .iter()
+                    .all(|index| theme_choice_matches(&self.options[*index], &typed))
+            })
+    }
+
+    /// The theme rows `query` names ([`ThemeNaming`]), in list order. A
+    /// query of appearance words and generic nouns names nothing, so "light"
+    /// or "dark mode" never narrows the picker to a side. Only a theme can be
+    /// named: never the configured value's Current row, nor a file that did
+    /// not load.
+    fn named_by(&self, query: &str) -> Vec<usize> {
+        if self.themes.is_none() {
+            return Vec::new();
+        }
+        let Some(naming) = ThemeNaming::of(query) else {
+            return Vec::new();
+        };
+        (0..self.options.len())
+            .filter(|index| {
+                let option = &self.options[*index];
+                let Some(theme) = option.theme.as_ref() else {
+                    return false;
+                };
+                if !matches!(
+                    theme.section,
+                    ThemeSection::Dark | ThemeSection::Light | ThemeSection::Yours
+                ) || theme.reason.is_some()
+                {
+                    return false;
+                }
+                naming.names(&option.label, &theme.id, theme.appearance)
+            })
+            .collect()
+    }
+
+    /// Where the keyboard starts when the picker opens: the saved choice
+    /// where the list shows it, so opening never moves the preview; else,
+    /// among the rows a seeding query named where the list shows any
+    /// ([`Self::seed_named`]), else among all it shows: in a Follow-system
+    /// slot's picker the first theme made for the slot's side, else the
+    /// first row.
+    fn seed_focus(&self) -> usize {
+        if self.shown.contains(&self.selected) {
+            return self.selected;
+        }
+        let named: Vec<usize> = self
+            .shown
+            .iter()
+            .copied()
+            .filter(|index| self.seed_named.contains(index))
+            .collect();
+        let rows = if named.is_empty() {
+            &self.shown
+        } else {
+            &named
+        };
+        self.slot
+            .and_then(|side| {
+                rows.iter().copied().find(|index| {
+                    self.options[*index]
+                        .theme
+                        .as_ref()
+                        .is_some_and(|theme| theme.appearance == Some(side))
+                })
+            })
+            .or_else(|| rows.first().copied())
+            .unwrap_or(self.selected)
     }
 
     /// Re-run the theme filter after its text changed: the shown rows are the
@@ -1271,7 +1521,73 @@ impl ChoicePicker {
         self.shown = (0..self.options.len())
             .filter(|index| theme_choice_matches(&self.options[*index], &query))
             .collect();
+        self.seed_named.clear();
         self.offset.set(0);
+    }
+}
+
+/// The nouns a Settings search for a theme carries that name no theme
+/// ("gruvbox theme", "nord color"): a theme's naming reads past them
+/// ([`ThemeNaming`], [`ChoicePicker::seed_text`]).
+const THEME_GENERIC_NOUNS: [&str; 5] = ["theme", "themes", "mode", "color", "colour"];
+
+/// WHAT A QUERY NAMES A THEME BY — the one rule Settings search finds the
+/// theme rows by ([`field_match_score_in`]) and the theme picker that search
+/// opens seeds its filter by ([`ChoicePicker::named_by`]), so a search that
+/// lists the theme rows for a theme's name opens their picker on it, and one
+/// that names none lists nothing for it. Every word of the query that is not
+/// an appearance word or a generic noun ("dark", "light", "theme", "mode",
+/// "colour") starts a word of the theme's name or catalog id that is not
+/// itself an appearance word (Settings search's word-start rungs, never an
+/// acronym), in any order; an appearance word the query carries agrees with
+/// the side the theme is made for ("gruvbox light" names Gruvbox Light
+/// alone). (Search matched a theme's name as one phrase, so "nord theme",
+/// "gruvbox theme" and "night tokyo" found nothing, while the picker read
+/// them as names.)
+struct ThemeNaming {
+    /// The query's name words, lowercase.
+    names: Vec<String>,
+    /// The side an appearance word of the query asks for.
+    side: Option<aterm_types::Appearance>,
+}
+
+impl ThemeNaming {
+    /// The naming `query` makes; `None` for a query of appearance words and
+    /// generic nouns alone ("light", "dark mode"), which names no theme.
+    fn of(query: &str) -> Option<Self> {
+        let mut side = None;
+        let mut names = Vec::new();
+        for word in query
+            .trim()
+            .to_lowercase()
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+        {
+            if let Some(appearance) = parse_appearance_word(word) {
+                side = Some(appearance);
+            } else if !THEME_GENERIC_NOUNS.contains(&word) {
+                names.push(word.to_string());
+            }
+        }
+        (!names.is_empty()).then_some(Self { names, side })
+    }
+
+    /// Whether this names the theme called `label` (catalog id `id`), made
+    /// for `appearance`.
+    fn names(&self, label: &str, id: &str, appearance: Option<aterm_types::Appearance>) -> bool {
+        if self.side.is_some_and(|side| appearance != Some(side)) {
+            return false;
+        }
+        let label = label.to_lowercase();
+        let id = id.to_lowercase();
+        let words: Vec<&str> = [label.as_str(), id.as_str()]
+            .into_iter()
+            .flat_map(|text| text.split(|ch: char| !ch.is_alphanumeric()))
+            .filter(|word| !word.is_empty() && parse_appearance_word(word).is_none())
+            .collect();
+        self.names
+            .iter()
+            .all(|name| words.iter().any(|word| word.starts_with(name.as_str())))
     }
 }
 
@@ -1454,7 +1770,7 @@ pub(crate) struct SettingsViewState {
     /// today (its `Show all N` disclosure open) or the newest three.
     pub(crate) harness_decided_open: bool,
     /// Where Settings ▸ Harness was opened landed (§10.3.3, item 8): a
-    /// session's row (`⚙`, the Autopilot menu's `Harness settings…`), drawn
+    /// session's row (the Autopilot menu's `Harness settings…`), drawn
     /// selected, or SUPERVISION (an `⊘ off` chip) — until the next press or
     /// scroll; `Top` otherwise. The landing itself is the list's own reveal
     /// (`page_reveal`, a landing's), which lands it before and after a render
@@ -1507,6 +1823,11 @@ pub(crate) struct SettingsViewState {
     /// their save feedback agree on it — unobserved until a read has said.
     presented_update_installable: Cell<UpdateInstallability>,
     pub(crate) search_input: crate::native_text_input::TextInputState,
+    /// The compact toolbar's search is open: where the bar is too narrow for a
+    /// field that says "Search" beside its back button, Search is a button
+    /// ([`compact_search_is_a_button`]) that opens the field across the bar,
+    /// with Cancel after it, until Cancel, Escape or another page closes it.
+    search_open: bool,
     /// Why the last value typed into a row was not saved, by key: said under
     /// the row while its text waits there to be corrected.
     field_errors: BTreeMap<String, String>,
@@ -1524,9 +1845,19 @@ pub(crate) struct SettingsViewState {
     /// colour set any other way is read from its hex.
     color_kept: Vec<KeptColor>,
     /// The side the theme preview shows while the theme follows the system,
-    /// when the person switched it; `None` shows the side the OS appearance
-    /// picks. View-local, never config.
+    /// when the person switched it (the Preview side switch, the Themes
+    /// segment, a slot they picked in); `None` shows the side the OS
+    /// appearance picks. View-local, never config, and the state of the
+    /// surface that draws the switch: a page change or a new search query
+    /// lets it go ([`SettingsViewState::page_replaced`]), so no surface without
+    /// the switch ever draws, marks or keeps a side nobody can see.
     theme_preview_side: Option<aterm_types::Appearance>,
+    /// What turning Follow system off replaced, so turning it back on while
+    /// the theme is still the name Off wrote gives the person's pair back
+    /// ([`prefs::theme_follow_system_value`]). View-local, never config: the
+    /// mode is the value. It outlives a page change, so Off on Appearance and
+    /// On on Top Settings or Themes share it.
+    theme_follow_kept: Option<prefs::ThemeFollowKept>,
     /// Reset All is intentionally a two-step destructive action. The first
     /// invocation only discloses its complete aterm.toml scope; the explicit
     /// confirmation action is the sole path that emits a clearing patch.
@@ -1534,6 +1865,22 @@ pub(crate) struct SettingsViewState {
     /// Discarding retained text drafts is independently destructive and must
     /// never inherit Reset All's confirmation edge.
     draft_discard_confirmation: bool,
+    /// The viewer paused the looping cursor previews (each is its own
+    /// Pause/Play control). View state, never config: a fresh Settings view
+    /// plays again.
+    pub(crate) preview_paused: bool,
+    /// The setting the Advanced preview last demonstrated for a focused row,
+    /// and the path of the preview that showed it ([`renderer_preview_path`]),
+    /// so activating that preview itself (which takes focus) keeps showing the
+    /// same subject instead of the page's default one. A subject recorded by
+    /// another page's (or a search's) preview is not this one's.
+    preview_subject: Cell<Option<(&'static str, &'static str)>>,
+    /// The cursor style the Cursor Styles preview was last trying (the row
+    /// under the pointer or the keyboard), so focusing the preview itself
+    /// keeps it ([`cursor_style_candidate`]).
+    preview_candidate: std::cell::RefCell<Option<String>>,
+    /// Where each looping cursor preview's cycle began ([`PreviewClock`]).
+    preview_clock: PreviewClock,
     /// The exact immutable non-text assets admitted with this config revision.
     /// Holding the outer Arc keeps trail-style, kitty sprite, and parsed-theme
     /// identity atomic:
@@ -1642,16 +1989,33 @@ pub(crate) struct SettingsViewState {
     /// the filter and the open entry it just set ([`messages_plan`], rulings
     /// 263 and 264).
     messages_page_geometry: Cell<Option<(SettingsWidth, LogicalRect)>>,
+    /// Whether the last Messages render drew its Tag pop-up open, and the stops
+    /// its list counted before the first entry then
+    /// ([`MessagesPlan::lead_stops`]): `page_scroll` is counted for that list
+    /// until something re-counts it. The pop-up's chips can take a wider page's
+    /// header into the list or out of it, so a pop-up opened or closed since
+    /// that render by a path that did not re-count the stop (focusing Search
+    /// closes it, r4g-7) is re-counted before the next input, or by the render
+    /// ([`messages_seated_top`]) if it comes first; the reducers refresh it
+    /// ([`SettingsApp::restop_messages`]).
+    messages_drawn_menu: Cell<Option<(bool, usize)>>,
     /// A deep link arrived before any render measured the page (a Settings
     /// view opened for it): the next render lands the selected entry itself,
     /// and the reducer adopts the stop it drew ([`Self::messages_drawn`])
     /// before it moves the list again.
     messages_reveal: bool,
+    /// The stop the last Messages render re-seated its list at where the
+    /// window's size took the header into the list or out of it under
+    /// `page_scroll` ([`messages_seated_top`]): the next event adopts it
+    /// before anything moves the list ([`Self::settle_messages_reseat`]),
+    /// and a render before that event moves on from it.
+    messages_reseat: Cell<Option<usize>>,
     /// The entry the last Messages render drew at the top of its list while
-    /// the list was scrolled into the log (ruling 441 (r)): a record posted
-    /// at the head moves every entry one stop down, and the next projection
-    /// keeps the reader's view on this entry
-    /// ([`SettingsApp::keep_messages_anchor`]).
+    /// the list was scrolled into the log, and the ones it drew under it
+    /// (ruling 441 (r)): a record posted at the head moves every entry one
+    /// stop down, and the next projection keeps the reader's view on this
+    /// entry, or on the first one under it still listed where it left the
+    /// list ([`SettingsApp::keep_messages_anchor`]).
     messages_anchor: RefCell<Option<MessagesAnchor>>,
     /// How many list stops the last render showed at once — the page Page Up
     /// and Page Down move by (design ruling 267). `None` where the render
@@ -1672,10 +2036,27 @@ pub(crate) struct SettingsViewState {
     /// the list ([`scroll::ScrollRecord`]); the reducer bounds the scroll,
     /// moves the keyboard and adopts the render's clamp through it.
     scroll_record: RefCell<Option<scroll::ScrollRecord>>,
+    /// The page chrome the render seats the page under ([`PageChrome`]):
+    /// what of its subtitle and vertical insets a short window gave its
+    /// list, measured each render by [`page`] before the page is seated.
+    page_chrome: Cell<PageChrome>,
+    /// The window and the text size the chrome was chosen at: a page whose
+    /// list is scrolled past its first screen keeps the chrome it has while
+    /// both stay ([`page`]).
+    page_chrome_at: Cell<Option<(LogicalRect, f32)>>,
+    /// Whether the render is measuring the page as it seats with no status
+    /// bar up ([`page`]): the bars read as taking nothing while it does, so
+    /// the chrome a page keeps is the same with a bar and without.
+    measuring_calm: Cell<bool>,
     /// A control every render keeps in view until the list is scrolled: the
     /// one the keyboard just reached, or the row a change was just made on
     /// (a status bar the change brings up must not scroll it away).
     page_reveal: Option<UiKey>,
+    /// The control the LIST'S OWN KEYS last put the keyboard on (Up and Down,
+    /// Page Up and Page Down, Home and End: [`Self::land_list_focus`]).
+    /// While the keyboard is still there and the person has not worked it,
+    /// those keys go on acting on the list ([`Self::list_keys_carried`]).
+    list_carried: Option<UiKey>,
     /// What `page_reveal` is ([`scroll::Reveal`]): a control the keyboard
     /// reached, one a person pressed or changed ([`Self::reveal_pressed`]),
     /// or where a page lands ([`Self::reset_page_scroll`],
@@ -1861,6 +2242,7 @@ impl SettingsViewState {
             presented_package_admission: Cell::new(PackageAdmission::Unobserved),
             presented_update_installable: Cell::new(UpdateInstallability::Unobserved),
             search_input: crate::native_text_input::TextInputState::new(String::new()),
+            search_open: false,
             field_errors: BTreeMap::new(),
             editing_field: None,
             field_inputs: BTreeMap::new(),
@@ -1868,8 +2250,13 @@ impl SettingsViewState {
             color_picker: None,
             color_kept: Vec::new(),
             theme_preview_side: None,
+            theme_follow_kept: None,
             reset_all_confirmation: false,
             draft_discard_confirmation: false,
+            preview_paused: false,
+            preview_subject: Cell::new(None),
+            preview_candidate: std::cell::RefCell::new(None),
+            preview_clock: PreviewClock::default(),
             sparkle_spec_consumers: assets.sparkle_spec_consumers.as_deref().copied(),
             assets,
             environment_overrides,
@@ -1895,14 +2282,20 @@ impl SettingsViewState {
             messages_tag_menu: false,
             messages_drawn: Cell::new(None),
             messages_page_geometry: Cell::new(None),
+            messages_drawn_menu: Cell::new(None),
             messages_reveal: false,
+            messages_reseat: Cell::new(None),
             messages_anchor: RefCell::new(None),
             page_window: Cell::new(None),
             navigation_scroll: Cell::new(0.0),
             navigation_scroll_limit: Cell::new(0.0),
             navigation_revealed: RefCell::new(None),
             scroll_record: RefCell::new(None),
+            page_chrome: Cell::new(PageChrome::FULL),
+            page_chrome_at: Cell::new(None),
+            measuring_calm: Cell::new(false),
             page_reveal: None,
+            list_carried: None,
             reveal_as: scroll::Reveal::Keep,
             style_trial_undo: None,
             chosen_style_row: None,
@@ -1984,6 +2377,7 @@ impl SettingsViewState {
         let config = Arc::clone(&snapshot.config);
         let fields = self.theme_seeded_fields(&config, &snapshot.assets.themes);
         let raw_values = snapshot.values()?;
+        let highlighted = self.showcase_highlight_before_change();
         let active_edit = self.editing_field.clone();
         let mut retained_inputs = BTreeMap::new();
         let mut draft_conflicts = Vec::new();
@@ -2054,6 +2448,7 @@ impl SettingsViewState {
         self.config_reconciliation_required = false;
         self.unverified_patch = None;
         self.invalidate_result_page_limit();
+        self.follow_showcase_change(highlighted);
         // Messages' scroll counts the LOG's stops, bounded by the plan its
         // render records (ruling 264), never by the settings' field count:
         // an aterm.toml change clamped a scroll deeper than that count back
@@ -2095,6 +2490,13 @@ impl SettingsViewState {
     }
 
     fn reduce_page_scroll(&mut self, limit: usize, command: SettingsPageScrollCommand) {
+        // A scroll by lines — the wheel, the keys, a reader's — is the
+        // person's: the list seats on its stops again. An absolute one that
+        // names the stop it is on (a re-clamp after aterm.toml changed)
+        // scrolls nothing.
+        if matches!(command, SettingsPageScrollCommand::Lines(_)) {
+            self.drop_list_nudge();
+        }
         self.page_scroll = settings_page_scroll_transition(self.page_scroll, limit, command);
     }
 
@@ -2167,6 +2569,16 @@ impl SettingsViewState {
         if let Some(top) = self.messages_drawn.get() {
             self.page_scroll = top;
             self.messages_reveal = false;
+        }
+    }
+
+    /// Adopt, once, the stop the last Messages render re-seated its list at
+    /// across a resize ([`Self::messages_reseat`]), so whatever the next
+    /// event does moves on from the place the reader saw, counted as the
+    /// page is now laid out.
+    fn settle_messages_reseat(&mut self) {
+        if let Some(top) = self.messages_reseat.take() {
+            self.page_scroll = top;
         }
     }
 
@@ -3012,6 +3424,11 @@ impl SettingsViewState {
     fn clear_search(&mut self) -> bool {
         let changed = !self.search.is_empty() || !self.search_input.value().is_empty();
         if changed {
+            // The page comes back in Search Results' place: what that surface
+            // chose (its preview side) goes with it.
+            if !self.search.trim().is_empty() {
+                self.page_replaced();
+            }
             self.search_input = crate::native_text_input::TextInputState::new(String::new());
             self.search.clear();
             self.invalidate_result_page_limit();
@@ -3044,10 +3461,12 @@ impl SettingsViewState {
         {
             access.reset = None;
         }
-        if self.route == SettingsRoute::Themes && route != SettingsRoute::Themes {
-            self.leave_showcase();
+        if self.route != route {
+            self.page_replaced();
         }
         self.route = route;
+        // Another page closes a narrow toolbar's open, empty search.
+        self.search_open = false;
         self.cursor_style_note.replace(None);
         self.invalidate_result_page_limit();
         self.compact_navigation = false;
@@ -3091,8 +3510,26 @@ impl SettingsViewState {
         self.reset_page_scroll();
     }
 
+    /// Another surface replaces the page on glass (another route, Search
+    /// Results for a new query, the compact category list): the page's
+    /// transient state goes with it, as leaving it does. Settings ▸ Themes'
+    /// trial ends (the host reverts it) and its slot editor, Save as row and
+    /// pending select go ([`Self::leave_showcase`]); the theme preview side a
+    /// switch on the page chose goes too, so the surface that replaces it
+    /// draws the side the OS picks until its own switch says otherwise.
+    fn page_replaced(&mut self) {
+        self.messages_tag_menu = false;
+        self.theme_preview_side = None;
+        if self.route == SettingsRoute::Themes {
+            self.leave_showcase();
+        }
+    }
+
     pub(crate) fn set_search(&mut self, query: String) {
         self.begin_search_interaction();
+        if query.trim() != self.search.trim() {
+            self.page_replaced();
+        }
         self.search = query;
         self.manual_search_expanded = false;
         self.invalidate_result_page_limit();
@@ -3317,6 +3754,18 @@ impl SettingsViewState {
             .strip_prefix("settings/control/")
     }
 
+    /// THE LIST'S KEYS STAY THE LIST'S: whether the keyboard is on the
+    /// control the list's own keys carried it to ([`Self::list_carried`])
+    /// and the person has not worked that control since — no press, no
+    /// typing, no arrow across it. A slider takes Page Up/Down and Home/End,
+    /// and a colour wheel Up and Down, for itself only once the person works
+    /// it: a Page Up that took the keyboard to Text & Fonts' Weight slider
+    /// made every Page Up after it a step down the font's weight, written to
+    /// aterm.toml.
+    fn list_keys_carried(&self) -> bool {
+        self.list_carried.is_some() && self.list_carried == self.common.last_focus
+    }
+
     /// The keyboard is on a slider: a registry row's, or a colour picker's
     /// Brightness.
     fn focused_slider(&self) -> bool {
@@ -3445,6 +3894,10 @@ impl SettingsViewState {
         };
         let key = match target {
             Some(target) => {
+                // The key's move is where the window goes: it supersedes a
+                // reveal the opening asked for that no layout has placed yet
+                // (the next layout follows the highlight, which moved).
+                picker.reveal_pending.set(None);
                 picker.scroll_to(Some(target));
                 picker.position_key(target)
             }
@@ -3501,18 +3954,21 @@ impl SettingsViewState {
                         prefs::EDIT_THEME | prefs::EDIT_WINDOW_THEME => Some(picker.key.as_str()),
                         _ => None,
                     });
+            // Keyed on the preview nodes the last screen DREW (its peeks
+            // included), never on a control row: a cursor preview on glass
+            // moves though its link row is cut off below it.
             let shown_stops = self.scroll_shown();
-            let shown = |key: &str| {
+            let drawn = |key: &str| {
                 shown_stops.as_ref().is_some_and(|(plan, view)| {
-                    plan.stop_of(&UiKey::new(format!("settings/control/{key}")))
-                        .is_some_and(|stop| view.contains(&stop))
+                    plan.stop_of_preview(&UiKey::new(key))
+                        .is_some_and(|stop| scroll::drawn_stops(plan, view).contains(&stop))
                 })
             };
             let visible = focused.or_else(|| match shown_stops {
-                Some(_) if shown(prefs::EDIT_CURSOR_TRAIL_STYLE) => {
+                Some(_) if drawn("settings/top/cursor-trail/preview") => {
                     Some(prefs::EDIT_CURSOR_TRAIL_STYLE)
                 }
-                Some(_) => shown(prefs::EDIT_THEME).then_some(prefs::EDIT_THEME),
+                Some(_) => drawn("settings/top/theme/preview").then_some(prefs::EDIT_THEME),
                 None if width != SettingsWidth::Compact
                     && settings_text_scale() <= 1.25
                     && viewport.width >= 900.0 * settings_text_scale().min(1.25) =>
@@ -3663,8 +4119,11 @@ impl SettingsViewState {
         if self.search_has_focus()
             || !self.search_input.value().is_empty()
             || !self.search.is_empty()
+            || self.search_open
         {
             self.clear_search();
+            // A narrow toolbar's open search closes with it.
+            self.search_open = false;
             self.common.last_focus = self.presented_route_focus(self.route);
             self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
         }
@@ -4191,6 +4650,34 @@ impl SettingsApp {
             view.clear_field_edit();
             return EventResult::Handled;
         }
+        // A narrow toolbar's Search button opens the field across the bar with
+        // the keyboard in it; its Cancel empties and closes it, the keyboard
+        // back on the button ([`compact_search_is_a_button`]).
+        if action == SEARCH_OPEN {
+            view.begin_search_interaction();
+            view.search_open = true;
+            view.common.last_focus = Some(UiKey::new("settings/search"));
+            view.common.focus_visible = true;
+            view.common.presentation_revision = view.common.presentation_revision.saturating_add(1);
+            cx.repaint(crate::native_app::DamageRegion::All);
+            return EventResult::Handled;
+        }
+        if action == SEARCH_CANCEL {
+            view.begin_search_interaction();
+            let _ = view.clear_search();
+            view.search_open = false;
+            view.common.last_focus = Some(UiKey::new(SEARCH_OPEN));
+            view.common.presentation_revision = view.common.presentation_revision.saturating_add(1);
+            cx.repaint(crate::native_app::DamageRegion::All);
+            return EventResult::Handled;
+        }
+        if action == crate::settings_preview::PREVIEW_PAUSE_ACTION {
+            // Pause/Play for the looping cursor demonstrations (WCAG 2.2.2).
+            // Pure view state: no config write, no transaction.
+            view.preview_paused = !view.preview_paused;
+            cx.repaint(crate::native_app::DamageRegion::All);
+            return EventResult::Handled;
+        }
         if action == "settings/search-clear" {
             view.begin_search_interaction();
             let _ = view.clear_search();
@@ -4206,8 +4693,10 @@ impl SettingsApp {
             view.clear_field_edit();
             let _ = view.clear_search();
             // The category list replaces the page: an open Tag pop-up would
-            // take the Escape that closes the list (ruling 441 (p)).
-            view.messages_tag_menu = false;
+            // take the Escape that closes the list (ruling 441 (p)), and a
+            // theme being tried on Themes would go on drawing with no Keep
+            // or Revert.
+            view.page_replaced();
             view.compact_navigation = true;
             view.reset_page_scroll();
             // The keyboard starts on the page it came from, where the grid's
@@ -4426,7 +4915,9 @@ impl SettingsApp {
                 view.search_input = crate::native_text_input::TextInputState::new(query.clone());
                 view.set_search(query);
             } else {
+                // ⌘F opens a narrow toolbar's search too.
                 view.begin_search_interaction();
+                view.search_open = true;
                 view.common.last_focus = Some(UiKey::new("settings/search"));
                 view.common.focus_visible = true;
             }
@@ -4438,6 +4929,7 @@ impl SettingsApp {
             view.settle_messages_scroll();
             view.page_reveal = None;
             if let Some(SemanticInput::Number(offset)) = invocation.value {
+                view.drop_list_nudge();
                 let limit = self.page_scroll_limit(view);
                 view.reduce_page_scroll(
                     limit,
@@ -4488,11 +4980,14 @@ impl SettingsApp {
             return EventResult::Handled;
         }
         if action == THEME_MODE_ACTION {
-            // Follow system on writes the configured theme (Default when
-            // none is set) on its own side and its pair on the other, or
-            // aterm's own theme for that side when it has none; off writes
-            // the side on screen as one name. Either way the mode is the
-            // value: nothing else records it.
+            // Follow system on writes the pair Off replaced while the theme
+            // is still the name Off wrote, else the configured theme
+            // (Default when none is set) on its own side and its pair on the
+            // other, or aterm's own theme for that side when it has none;
+            // off writes the side on screen as one name, and remembers the
+            // pair it replaced. Either way the mode is the value: the memory
+            // is the view's, and only a name still equal to what Off wrote
+            // reads it.
             if Self::reject_pending_key(view, prefs::EDIT_THEME, cx) {
                 return EventResult::Handled;
             }
@@ -4512,11 +5007,23 @@ impl SettingsApp {
                     view.choice_picker = None;
                 }
                 let value = Some(if wanted {
-                    prefs::theme_follow_system_value(current.as_deref(), &view.assets.themes)
+                    let value = prefs::theme_follow_system_value(
+                        current.as_deref(),
+                        view.theme_follow_kept.as_ref(),
+                        &view.assets.themes,
+                    );
+                    view.theme_follow_kept = None;
+                    value
                 } else {
                     let visible = theme_visible_side(view, view.presented_motion.get().system_dark);
                     view.theme_preview_side = None;
-                    prefs::theme_always_value(current.as_deref(), visible, &view.assets.themes)
+                    let value =
+                        prefs::theme_always_value(current.as_deref(), visible, &view.assets.themes);
+                    view.theme_follow_kept = current.clone().map(|pair| prefs::ThemeFollowKept {
+                        always: value.clone(),
+                        pair,
+                    });
+                    value
                 });
                 if value != current {
                     self.commit_theme_value(view, value, cx);
@@ -4539,19 +5046,17 @@ impl SettingsApp {
                 view.choice_picker = None;
                 view.common.last_focus = Some(UiKey::new(theme_slot_action(side)));
             } else {
+                // The preview draws the picker's side while it is open
+                // ([`theme_visible_side`]); only a pick keeps that side.
                 view.clear_field_edit();
-                view.theme_preview_side = Some(side);
                 let mut picker = theme_slot_picker(view, side);
                 // A Settings search that names a theme ("nord") opens the
                 // side's picker already filtered to it, as the Color theme
                 // control does.
-                let seeded =
-                    !view.search.trim().is_empty() && picker.seed_filter(view.search.trim());
-                let first = if seeded && !picker.shown.contains(&picker.selected) {
-                    picker.shown[0]
-                } else {
-                    picker.selected
-                };
+                if !view.search.trim().is_empty() {
+                    picker.seed_filter(view.search.trim());
+                }
+                let first = picker.seed_focus();
                 picker.reveal(first);
                 view.choice_picker = Some(picker);
                 view.common.last_focus = Some(UiKey::new(format!(
@@ -4717,9 +5222,11 @@ impl SettingsApp {
                 };
                 let picker = view.choice_picker.take();
                 view.common.last_focus = picker.as_ref().map(ChoicePicker::opener_focus);
+                // The preview stays on the side just chosen in: the page that
+                // opened the picker draws the Preview side switch saying so.
+                view.theme_preview_side = Some(side);
                 let current = view.raw_value(prefs::EDIT_THEME);
-                // A slot picker names its side: only that side changes, even
-                // over a pair that draws one theme on both.
+                // A slot picker names its side: only that side changes.
                 let value = Some(prefs::theme_with_side(
                     current.as_deref(),
                     side,
@@ -4773,17 +5280,24 @@ impl SettingsApp {
                 return EventResult::Handled;
             }
             let mut value = option.map(|option| option.value);
-            // A theme name goes through the one choice rule every theme
-            // picker shares: the name itself over one theme or none, only
-            // the side on screen over a pair that follows the system.
+            // A theme name goes through the rule for a choice that names no
+            // side (this picker is the whole theme's, not a slot's): the name
+            // itself over one theme or none; over a pair that follows the
+            // system, the side on screen for a theme made for it, else the
+            // name for both appearances.
             if key == prefs::EDIT_THEME
                 && let Some(Some(name)) = value.as_ref()
             {
                 let side = theme_visible_side(view, view.presented_motion.get().system_dark);
                 let current = view.raw_value(key);
                 value = Some(Some(
-                    prefs::theme_choice_value(current.as_deref(), side, name, &view.assets.themes)
-                        .0,
+                    prefs::theme_sideless_choice_value(
+                        current.as_deref(),
+                        side,
+                        name,
+                        &view.assets.themes,
+                    )
+                    .0,
                 ));
             }
             if let Some(value) = value {
@@ -5170,17 +5684,14 @@ impl SettingsApp {
                     };
                     // A Settings search that names a theme ("nord") opens the
                     // picker already filtered to it, its first match previewed.
-                    let seeded = picker.themes.is_some()
-                        && !view.search.trim().is_empty()
-                        && picker.seed_filter(view.search.trim());
-                    // Begin on the saved choice, so opening the picker does
-                    // not move the preview; moving the highlight previews
-                    // candidates without a write until one is activated.
-                    let first = if seeded && !picker.shown.contains(&picker.selected) {
-                        picker.shown[0]
-                    } else {
-                        picker.selected
-                    };
+                    if picker.themes.is_some() && !view.search.trim().is_empty() {
+                        picker.seed_filter(view.search.trim());
+                    }
+                    // Begin on the saved choice where the list shows it, so
+                    // opening the picker does not move the preview; moving
+                    // the highlight previews candidates without a write until
+                    // one is activated.
+                    let first = picker.seed_focus();
                     picker.reveal(first);
                     view.choice_picker = Some(picker);
                     view.common.last_focus =
@@ -6519,7 +7030,18 @@ impl SettingsApp {
                 view.page_scroll = 0;
             }
             "tag-menu" => {
+                // The pop-up's chips grow the filters card, which can take a
+                // wider page's header into the list or out of it
+                // (`MessagesPlan::scrolls`): the list keeps its place, and a
+                // pop-up just opened is drawn, its card seated where the
+                // header scrolls — never opened out of view with the
+                // keyboard on a button the page does not show.
+                let before = self.messages_lead_stops(view);
                 view.messages_tag_menu = !view.messages_tag_menu;
+                self.restop_messages(view, before);
+                if view.messages_tag_menu {
+                    self.seat_messages_header_key(view, MESSAGES_TAG_MENU);
+                }
             }
             "select" => {
                 let Some(SemanticInput::Text(id)) = value else {
@@ -6628,9 +7150,10 @@ impl SettingsApp {
         EventResult::Handled
     }
 
-    /// THE PAGE'S CONFIRMATION IS SAID WHERE IT IS SEEN (s-13). On a compact page
-    /// the count line that carries the transient line (ruling 270) is a header
-    /// item that scrolls away with the list, so once the reader had scrolled
+    /// THE PAGE'S CONFIRMATION IS SAID WHERE IT IS SEEN (s-13). Where the header
+    /// scrolls (a compact page; a wider one under a tall open entry) the count
+    /// line that carries the transient line (ruling 270) is a header item that
+    /// scrolls away with the list, so once the reader had scrolled
     /// past it an entry's Copy, its buttons and the palette's Copy All and Open
     /// Log Folder said nothing anywhere, painted or spoken. The line stays on the
     /// count line where that is on screen, and in the footer of the entry whose
@@ -6644,9 +7167,6 @@ impl SettingsApp {
         let Some((width, viewport)) = view.messages_page_geometry.get() else {
             return;
         };
-        if width != SettingsWidth::Compact {
-            return;
-        }
         let visible = messages_visible(&self.messages, &view.messages_filter);
         let plan = messages_plan(view, &self.messages, &visible, width, viewport);
         let Some(card) = plan.filters_stop() else {
@@ -6679,19 +7199,29 @@ impl SettingsApp {
     ) -> bool {
         match verb {
             "title" => {
+                let geometry = view.messages_page_geometry.get();
+                let visible = messages_visible(&self.messages, &view.messages_filter);
+                let lead = |view: &SettingsViewState| {
+                    geometry.map(|(width, viewport)| {
+                        messages_plan(view, &self.messages, &visible, width, viewport)
+                    })
+                };
+                let before = lead(view).map(|plan| plan.lead_stops());
                 view.messages_selected = if view.messages_selected == Some(id) {
                     None
                 } else {
                     Some(id)
                 };
-                // An entry opened low in the view is read whole: the list
-                // takes the least scroll that shows it (ruling 264).
-                if view.messages_selected == Some(id)
-                    && let Some((width, viewport)) = view.messages_page_geometry.get()
-                {
-                    let visible = messages_visible(&self.messages, &view.messages_filter);
-                    if let Some(index) = visible.iter().position(|e| e.id == id) {
-                        let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+                if let (Some(before), Some(plan)) = (before, lead(view)) {
+                    // An entry opened or closed can take the header into the
+                    // list or out of it (`MessagesPlan::scrolls`): the list
+                    // keeps its place.
+                    view.page_scroll = messages_restop(view.page_scroll, before, plan.lead_stops());
+                    // An entry opened low in the view is read whole: the list
+                    // takes the least scroll that shows it (ruling 264).
+                    if view.messages_selected == Some(id)
+                        && let Some(index) = visible.iter().position(|e| e.id == id)
+                    {
                         view.page_scroll = plan.reveal(index, view.page_scroll);
                     }
                 }
@@ -6827,9 +7357,13 @@ impl SettingsApp {
     /// its top and dropped its bottom one, and an entry just opened low in
     /// the view (read whole, ruling 264) with it. A new projection keeps the
     /// entry the last render drew at the top of a list scrolled into the log
-    /// where it was (and any scroll made since, on top of it). A list at its
-    /// newest entry takes the new record at its top, as before; so does one
-    /// whose filter changed, or that scrolled back above that entry since.
+    /// where it was (and any scroll made since, on top of it). An entry that
+    /// left the list since — told on while the owner was not reading it
+    /// ([`Self::follow_told_on`]), or dropped — hands the top to the first
+    /// entry that render drew under it that is still listed, so the rows
+    /// being read stay where they were. A list at its newest entry takes the
+    /// new record at its top, as before; so does one whose filter changed,
+    /// or that scrolled back above that entry since.
     fn keep_messages_anchor(&self, view: &mut SettingsViewState) {
         if view.route != SettingsRoute::Messages
             || view.compact_navigation
@@ -6848,15 +7382,91 @@ impl SettingsApp {
             return;
         };
         let visible = messages_visible(&self.messages, &view.messages_filter);
-        let Some(index) = visible.iter().position(|entry| entry.id == anchor.id) else {
+        let mut drawn = std::iter::once(anchor.id).chain(anchor.below.iter().copied());
+        let Some((id, index)) = drawn.by_ref().find_map(|id| {
+            visible
+                .iter()
+                .position(|entry| entry.id == id)
+                .map(|index| (id, index))
+        }) else {
             return;
         };
+        let below = drawn.collect();
         let plan = messages_plan(view, &self.messages, &visible, width, viewport);
-        let stop = plan.lead_stops() + index;
+        let stop = plan.entry_stop(index);
         let moved = view.page_scroll - anchor.stop;
         view.page_scroll = (stop + moved).min(plan.limit());
-        view.messages_anchor
-            .replace(Some(MessagesAnchor { stop, ..anchor }));
+        view.messages_anchor.replace(Some(MessagesAnchor {
+            stop,
+            id,
+            below,
+            filter: anchor.filter,
+        }));
+    }
+
+    /// AN ENTRY THAT MOVED ON STAYS OPEN AS THE ROW THAT TELLS IT NOW. A
+    /// later row can tell an entry's story on (a lost login's sign-in
+    /// cancelled, a keyed row in new words), and the page then lists the
+    /// story once, as that row ([`MessagesState::told_on`]): the entry the
+    /// owner had open, the one the keyboard was on and the one whose button
+    /// set the status line left the list with their id. A publication
+    /// re-points each to the entry standing for it, before the list keeps
+    /// its place ([`Self::keep_messages_anchor`], which measures the open
+    /// entry): the open entry is still open, read in its latest words
+    /// (ruling 264), and a focused control goes to the same control of that
+    /// entry (its Copy, else its title), whose row this returns for
+    /// [`Self::seat_followed_focus`]. The list's anchor (the entry the last
+    /// render drew at its top) follows only the open entry, and the list
+    /// holds that row where the entry was. An anchor told on that was not
+    /// open stays put: its story moves to the head, and the list keeps the
+    /// rows drawn under it where they were (ruling 441 (r)). A record the
+    /// ring dropped re-points nothing.
+    fn follow_told_on(&self, view: &mut SettingsViewState) -> Option<u64> {
+        let standing = |id: u64| self.messages.standing_for(id);
+        let open = view.messages_selected;
+        if let Some(id) = open.and_then(standing) {
+            view.messages_selected = Some(id);
+        }
+        if let Some(id) = view.messages_note_entry.and_then(standing) {
+            view.messages_note_entry = Some(id);
+        }
+        let anchor = view.messages_anchor.borrow().clone();
+        if let Some(anchor) = anchor
+            && open == Some(anchor.id)
+            && let Some(id) = standing(anchor.id)
+        {
+            view.messages_anchor
+                .replace(Some(MessagesAnchor { id, ..anchor }));
+        }
+        let focus = view.common.last_focus.clone()?;
+        let id = messages_row_of(focus.as_str()).and_then(standing)?;
+        let control = if focus.as_str().ends_with("/copy") {
+            "copy"
+        } else {
+            "title"
+        };
+        view.common.last_focus = Some(UiKey::new(format!("settings/messages/row/{id}/{control}")));
+        Some(id)
+    }
+
+    /// A focused control [`Self::follow_told_on`] moved to entry `id` is
+    /// seated: the list takes the least scroll that shows the entry (ruling
+    /// 267), wherever the row standing for the story is listed.
+    fn seat_followed_focus(&self, view: &mut SettingsViewState, id: u64) {
+        if view.route != SettingsRoute::Messages
+            || view.compact_navigation
+            || !view.search.trim().is_empty()
+        {
+            return;
+        }
+        let Some((width, viewport)) = view.messages_page_geometry.get() else {
+            return;
+        };
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        if let Some(index) = visible.iter().position(|entry| entry.id == id) {
+            let plan = messages_plan(view, &self.messages, &visible, width, viewport);
+            view.page_scroll = plan.reveal(index, view.page_scroll);
+        }
     }
 
     /// FOCUS NEVER SCROLLS AWAY (ruling 267). A compact Messages page scrolls
@@ -6895,21 +7505,29 @@ impl SettingsApp {
         let plan = messages_plan(view, &self.messages, &visible, width, viewport);
         let shown = plan.view(view.page_scroll.min(plan.limit()));
         if let Some(id) = messages_row_of(focus.as_str()) {
+            // Seated with its entry — and on a tall entry's part, drawn in it.
+            let drawn = |k: usize| match (shown.part, plan.tall.as_ref()) {
+                (Some(part), Some(tall)) if tall.entry == k => {
+                    tall.keys[part].contains(focus.as_str())
+                }
+                _ => true,
+            };
             if visible
                 .iter()
                 .position(|entry| entry.id == id)
-                .is_some_and(|k| shown.rows.contains(&k))
+                .is_some_and(|k| shown.rows.contains(&k) && drawn(k))
             {
                 return;
             }
         } else {
             // Whether the header holds `key`, and then whether the page seats
-            // it: the wider pages' header stays, only the compact one scrolls.
+            // it: a header that stays seats every item, one that scrolls
+            // those the list has not scrolled past.
             let seated = |key: &str| {
                 plan.header
                     .iter()
                     .position(|(node, _)| ui_node_holds(node, key))
-                    .map(|item| !plan.compact || shown.header.contains(&item))
+                    .map(|item| !plan.scrolls || shown.header.contains(&item))
             };
             match seated(focus.as_str()) {
                 Some(true) => return,
@@ -6934,17 +7552,34 @@ impl SettingsApp {
                 }
             }
         }
-        let seated_header = if plan.compact {
+        let seated_header = if plan.scrolls {
             shown.header.clone()
         } else {
             0..plan.header.len()
         };
-        view.common.last_focus = shown
-            .rows
-            .clone()
-            .next()
-            .and_then(|k| visible.get(k))
-            .map(|entry| UiKey::new(format!("settings/messages/row/{}/title", entry.id)))
+        // The first control the view draws: the first entry's title, or on a
+        // tall entry's later part its first key that takes the keyboard.
+        let in_part = shown
+            .part
+            .filter(|&part| part > 0)
+            .and_then(|part| plan.tall.as_ref().map(|tall| &tall.keys[part]))
+            .and_then(|keys| {
+                keys.iter()
+                    .find(|key| key.contains("/action/") || key.ends_with("/copy"))
+                    .map(|key| UiKey::new(key.clone()))
+            });
+        view.common.last_focus = in_part
+            .or_else(|| {
+                shown
+                    .rows
+                    .clone()
+                    .find(|&k| {
+                        shown.part.is_none_or(|part| part == 0)
+                            || plan.tall.as_ref().is_none_or(|tall| tall.entry != k)
+                    })
+                    .and_then(|k| visible.get(k))
+                    .map(|entry| UiKey::new(format!("settings/messages/row/{}/title", entry.id)))
+            })
             .or_else(|| {
                 seated_header
                     .filter_map(|k| plan.header.get(k))
@@ -6959,6 +7594,28 @@ impl SettingsApp {
         let (width, viewport) = view.messages_page_geometry.get()?;
         let visible = messages_visible(&self.messages, &view.messages_filter);
         Some(messages_plan(view, &self.messages, &visible, width, viewport).header)
+    }
+
+    /// The stops the Messages list counts before its first entry
+    /// ([`MessagesPlan::lead_stops`]), laid out in the geometry its last
+    /// render had; `None` before any Messages render.
+    fn messages_lead_stops(&self, view: &SettingsViewState) -> Option<usize> {
+        let (width, viewport) = view.messages_page_geometry.get()?;
+        let visible = messages_visible(&self.messages, &view.messages_filter);
+        Some(messages_plan(view, &self.messages, &visible, width, viewport).lead_stops())
+    }
+
+    /// Keep the Messages list's place across a change of the view that took
+    /// its header into the list or out of it: `before`, the stops it counted
+    /// before the change ([`Self::messages_lead_stops`]), `page_scroll`
+    /// re-counted for the list now ([`messages_restop`]).
+    fn restop_messages(&self, view: &mut SettingsViewState, before: Option<usize>) {
+        if let (Some(before), Some(after)) = (before, self.messages_lead_stops(view)) {
+            view.page_scroll = messages_restop(view.page_scroll, before, after);
+            // Counted for the pop-up as it is now: the render has nothing left to re-count.
+            view.messages_drawn_menu
+                .set(Some((view.messages_tag_menu, after)));
+        }
     }
 
     /// Whether Settings ▸ Messages DRAWS its Tag pop-up open, so that Escape
@@ -7015,35 +7672,44 @@ impl SettingsApp {
         }
     }
 
-    /// Scroll a compact Messages page back to the header control the keyboard
-    /// was just put on, when its header item is scrolled away: that item goes
-    /// to the top of the list. Escape closing the Tag pop-up puts the keyboard
-    /// on the pop-up's button (ruling 441 (p)), and the pop-up's chips may have
-    /// scrolled it away — a focus the page did not show, with no ring, and a
-    /// Return that fell through to the page's default action. Nothing on the
-    /// wider pages, whose header stays, nor for a control already seated.
+    /// Scroll a Messages page whose header scrolls (a compact one's; a wider
+    /// one's under a tall open entry, [`MessagesPlan::scrolls`]) back to the
+    /// header control the keyboard was just put on, when its header item is
+    /// scrolled away: that item goes to the top of the list. Escape closing
+    /// the Tag pop-up puts the keyboard on the pop-up's button (ruling 441
+    /// (p)), and the pop-up's chips may have scrolled it away — a focus the
+    /// page did not show, with no ring, and a Return that fell through to the
+    /// page's default action. Nothing where the header stays, nor for a
+    /// control already seated.
     fn seat_message_header_focus(&self, view: &mut SettingsViewState) {
+        let Some(focus) = view.common.last_focus.clone() else {
+            return;
+        };
+        self.seat_messages_header_key(view, focus.as_str());
+    }
+
+    /// [`Self::seat_message_header_focus`] for the header control `key`:
+    /// where the header scrolls and the item holding `key` is scrolled
+    /// away, that item goes to the top of the list.
+    fn seat_messages_header_key(&self, view: &mut SettingsViewState, key: &str) {
         if view.route != SettingsRoute::Messages
             || view.compact_navigation
             || !view.search.trim().is_empty()
         {
             return;
         }
-        let Some(focus) = view.common.last_focus.clone() else {
-            return;
-        };
         let Some((width, viewport)) = view.messages_page_geometry.get() else {
             return;
         };
         let visible = messages_visible(&self.messages, &view.messages_filter);
         let plan = messages_plan(view, &self.messages, &visible, width, viewport);
-        if !plan.compact {
+        if !plan.scrolls {
             return;
         }
         let Some(item) = plan
             .header
             .iter()
-            .position(|(node, _)| ui_node_holds(node, focus.as_str()))
+            .position(|(node, _)| ui_node_holds(node, key))
         else {
             return;
         };
@@ -7061,10 +7727,18 @@ impl SettingsApp {
     /// list stays; else the entry at the top of the list, as far as the list
     /// scrolls — measured for the filter and the open entry the link leaves
     /// (ruling 263). Before any render has measured the page the render lands
-    /// it ([`SettingsViewState::messages_reveal`]). An id the ring no longer
-    /// holds is selected all the same: the list shows what it has, from the
-    /// top.
+    /// it ([`SettingsViewState::messages_reveal`]). A record a later row
+    /// tells on opens that row, which stands for it on the page
+    /// ([`MessagesState::standing_for`]). An id the ring no longer holds is
+    /// selected all the same: the list shows what it has, from the top.
     fn reveal_message(&self, view: &mut SettingsViewState, id: u64) {
+        let id = self.messages.standing_for(id).unwrap_or(id);
+        // The stops the list's header took before the link: an entry it
+        // opens can take the header into the list (`MessagesPlan::scrolls`).
+        let before = view.messages_page_geometry.get().map(|(width, viewport)| {
+            let visible = messages_visible(&self.messages, &view.messages_filter);
+            messages_plan(view, &self.messages, &visible, width, viewport).lead_stops()
+        });
         view.messages_selected = Some(id);
         view.messages_reveal = false;
         let Some(entry) = self.messages.entry(id) else {
@@ -7083,7 +7757,12 @@ impl SettingsApp {
         match view.messages_page_geometry.get() {
             Some((width, viewport)) => {
                 let plan = messages_plan(view, &self.messages, &visible, width, viewport);
-                view.page_scroll = plan.land(index, view.page_scroll);
+                let top = messages_restop(
+                    view.page_scroll,
+                    before.unwrap_or_default(),
+                    plan.lead_stops(),
+                );
+                view.page_scroll = plan.land(index, top);
             }
             None => view.messages_reveal = true,
         }
@@ -7259,6 +7938,9 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
                             COMPATIBILITY_ONLY_PREVIEW.to_string()
                         } else if schema.is_none() {
                             unknown_key_preview(key)
+                        } else if key == prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF {
+                            // A style by the name its row goes by.
+                            cursor_style_name(raw)
                         } else {
                             manual_override_preview(raw, schema)
                         }
@@ -7732,7 +8414,7 @@ fn palette_colours_source_words(
         .themes
         .meta(&id)
         .map_or(id, |meta| meta.display_name);
-    format!("Palette colours now come from {theme}")
+    format!("Palette colors now come from {theme}")
 }
 
 /// A row's name, as its page shows it; a key with none goes by the key.
@@ -7741,7 +8423,7 @@ fn row_name(view: &SettingsViewState, key: &str) -> String {
         return slot;
     }
     if key == prefs::EDIT_PALETTE_OVERRIDES {
-        return "Palette colours".to_string();
+        return "Palette colors".to_string();
     }
     view.field_by_key(key)
         .map(|field| field.label.to_string())
@@ -7786,8 +8468,7 @@ fn theme_pair_words(dark: &str, light: &str) -> String {
 /// A row's value in the words its control shows, from the raw values `raw`
 /// reads; an absent key reads as its default.
 fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<String>) -> String {
-    let default =
-        || default_value_label(key).map_or_else(|| "its default".to_string(), str::to_string);
+    let default = || modified_default_words(view, key).unwrap_or_else(|| "its default".to_string());
     if key == prefs::EDIT_PALETTE_OVERRIDES {
         // The whole slot map: the theme's own colours, or how many are tuned.
         return raw(key).map_or_else(
@@ -7807,6 +8488,13 @@ fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<S
         let style =
             raw(key).unwrap_or_else(|| crate::app_config::default_cursor_trail_style().to_string());
         return setting_choice_label(key, &style);
+    }
+    if key == prefs::EDIT_CURSOR_TRAIL_COLOR
+        && prefs::trail_color_setting(raw(key).as_deref())
+            == aterm_effects::cursor_fx::TrailColor::Cursor
+    {
+        // The cursor's colour by its word reads as the picker names it.
+        return prefs::TRAIL_COLOR_CURSOR_LABEL.to_string();
     }
     if key == prefs::EDIT_DISPLAY_FONT {
         let ids = display_font_ids(raw(key).as_deref());
@@ -8339,6 +9027,15 @@ fn row_available_here(key: &str, availability: SettingsAvailability) -> bool {
     }
 }
 
+/// Whether this platform runs one of aterm's native updaters (macOS's, or
+/// Linux's `linux_updater`): the update rows' platform half of admission
+/// ([`row_available_here`]), which Software Update reads too, so the page
+/// never says "no updater here" or greys its switches where the rows read
+/// both keys.
+fn native_updater_here(availability: SettingsAvailability) -> bool {
+    row_available_here(prefs::EDIT_UPDATE_ENABLED, availability)
+}
+
 /// Audited shipping consumer for an ordinary Advanced control. This is more
 /// specific than a visibility allowlist: every retained row must name the
 /// subsystem that consumes it. The enum identifies ownership, while
@@ -8529,6 +9226,7 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         prefs::EDIT_COPY_ON_SELECT
         | prefs::EDIT_OPTION_AS_META
         | prefs::EDIT_PREDICTIVE_ECHO
+        | prefs::EDIT_PREDICTIVE_ECHO_EDITING
         | prefs::EDIT_CONFIRM_MULTILINE_PASTE => Some(Effect::InputRuntime),
         prefs::EDIT_MATRIX_RAIN_ENABLED
         // Sound VOLUME and PALETTE (2026-07-24 UX audit): both shipped and
@@ -8671,6 +9369,18 @@ impl NativeAppModel for SettingsApp {
     ) -> EventResult {
         let view_id = cx.view_id();
         view.settle_page_scroll();
+        view.settle_messages_reseat();
+        // Search can close the pop-up between renders. Re-count its stop before
+        // another input applies the closed page's limits or reveals an entry.
+        if view.route == SettingsRoute::Messages
+            && !view.compact_navigation
+            && view.search.trim().is_empty()
+            && let Some((open, lead)) = view.messages_drawn_menu.get()
+            && open != view.messages_tag_menu
+        {
+            view.settle_messages_scroll();
+            self.restop_messages(view, Some(lead));
+        }
         view.settle_status_set_aside();
         // A chosen Cursor Styles row stays chosen while the keyboard rests on
         // it; once it moved on, coming back tries the row again.
@@ -8717,6 +9427,24 @@ impl NativeAppModel for SettingsApp {
             )
         {
             view.showcase.note_input();
+        }
+        // The person works the control the list's keys carried the keyboard
+        // to — a press, typing, an arrow across it — or puts the keyboard on
+        // a control themselves (Tab, a click: the host's focus change, even
+        // back onto that same control), and it takes its own keys from then
+        // on ([`SettingsViewState::list_keys_carried`]).
+        if matches!(
+            event,
+            AppEvent::Action(_)
+                | AppEvent::FocusChanged(_)
+                | AppEvent::InsertText(_)
+                | AppEvent::TextInput(
+                    TextInputEvent::Left { .. }
+                        | TextInputEvent::Right { .. }
+                        | TextInputEvent::Submit
+                )
+        ) {
+            view.list_carried = None;
         }
         let focus_before = view.common.last_focus.clone();
         let keyboard_move = matches!(
@@ -8849,7 +9577,26 @@ impl NativeAppModel for SettingsApp {
                 view.move_choice_highlight(0, step)
             }
             AppEvent::ScrollLines(lines) if view.choice_picker.is_some() => {
-                view.move_choice_highlight(lines as isize, 0)
+                // The wheel (and a screen reader's scroll) scrolls the list
+                // and nothing else: the highlight, the keyboard's ring and
+                // the preview stay, and a field keeps the keyboard. A tile
+                // the pointer hovered is no longer under it once the list
+                // moved; at the end the wheel turns toward, nothing moved
+                // and the tile stays hovered.
+                let moved = view
+                    .choice_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.scroll_by(lines as isize));
+                if moved
+                    && view
+                        .common
+                        .hovered
+                        .as_ref()
+                        .is_some_and(|key| key.as_str().starts_with("settings/choice/"))
+                {
+                    view.common.hovered = None;
+                }
+                true
             }
             AppEvent::ScrollPage(direction) if view.choice_picker.is_some() => {
                 let rows = view
@@ -8874,7 +9621,9 @@ impl NativeAppModel for SettingsApp {
                 }
                 true
             }
-            AppEvent::StepFocus(lines) if view.focused_color_wheel().is_some() => {
+            AppEvent::StepFocus(lines)
+                if view.focused_color_wheel().is_some() && !view.list_keys_carried() =>
+            {
                 if let Some(key) = view.focused_color_wheel() {
                     self.step_color_wheel(view, key, 0.0, -(lines.signum() as f32), cx);
                 }
@@ -8905,10 +9654,15 @@ impl NativeAppModel for SettingsApp {
             // A FOCUSED SLIDER TAKES HOME AND END to its domain's ends, and
             // Page Up and Page Down as ten steps, as platform sliders do; the
             // keyboard stays on it. (The list's own Home/End and page keys
-            // act from every other control.)
+            // act from every other control, and from a slider those keys
+            // carried the keyboard to until the person works it:
+            // [`SettingsViewState::list_keys_carried`].)
             AppEvent::TextInput(
                 edge @ (TextInputEvent::Home { .. } | TextInputEvent::End { .. }),
-            ) if view.focused_slider() && view.choice_picker.is_none() => {
+            ) if view.focused_slider()
+                && view.choice_picker.is_none()
+                && !view.list_keys_carried() =>
+            {
                 self.reduce_slider_move(
                     view,
                     SliderMove::Edge {
@@ -8919,7 +9673,9 @@ impl NativeAppModel for SettingsApp {
                 true
             }
             AppEvent::ScrollPage(direction)
-                if view.focused_slider() && view.choice_picker.is_none() =>
+                if view.focused_slider()
+                    && view.choice_picker.is_none()
+                    && !view.list_keys_carried() =>
             {
                 self.reduce_slider_move(
                     view,
@@ -8940,10 +9696,18 @@ impl NativeAppModel for SettingsApp {
                     view.messages_tag_menu = false;
                 }
                 let tag_menu_open = view.messages_tag_menu;
+                let lead = if tag_menu_open {
+                    self.messages_lead_stops(view)
+                } else {
+                    None
+                };
                 view.cancel_transient();
                 // The Tag pop-up closed with the keyboard back on its button:
-                // the page shows that button (ruling 441 (p)).
+                // the list keeps its place where the smaller card pins the
+                // header again, and the page shows that button (ruling 441
+                // (p)).
                 if tag_menu_open && !view.messages_tag_menu {
+                    self.restop_messages(view, lead);
                     self.seat_message_header_focus(view);
                 }
                 true
@@ -9082,11 +9846,21 @@ impl NativeAppModel for SettingsApp {
                 }
                 true
             }
-            // Page Up and Page Down move the Themes highlight by the rows a
-            // screen of the chooser holds.
-            AppEvent::ScrollPage(direction) if view.showcase_steps_highlight() => {
-                let rows = view.showcase_page_rows() as isize;
-                view.step_highlight(direction.signum() as isize * rows)
+            // Page Up and Page Down turn the Themes highlight by the screen
+            // the chooser draws ([`SettingsViewState::showcase_page_step`]);
+            // from the keyboard in the list with no row that way (on its
+            // last row, the closed Community disclosure) they turn the
+            // list's page as every list's do, onto what it holds past its
+            // rows (the disclosure and the footer, the demo and the strip
+            // where they are its first stops). The filter keeps the keyboard.
+            AppEvent::ScrollPage(direction)
+                if view.showcase_steps_highlight()
+                    && (view.showcase_text_focus()
+                        == Some(showcase_page::ShowcaseText::Filter)
+                        || view.showcase_page_step(direction as isize) != 0) =>
+            {
+                let step = view.showcase_page_step(direction as isize);
+                view.step_highlight(step)
             }
             AppEvent::ScrollPage(direction) => {
                 // PAGE UP / PAGE DOWN MOVE BY THE PAGE SHOWN (ruling 267):
@@ -9101,20 +9875,19 @@ impl NativeAppModel for SettingsApp {
                 view.settle_messages_scroll();
                 let from_sidebar = view.navigation_has_focus();
                 let direction = direction.signum();
-                // A list turns back to the screen that ends where this one
-                // began, as it turns forward to the stop after this screen.
-                let page = match view.scroll_shown() {
-                    Some((plan, shown)) if direction < 0 => {
-                        shown.start - plan.page_before(shown.start)
-                    }
-                    _ => self.shown_page(view),
-                };
-                let lines = direction.saturating_mul(i32::try_from(page).unwrap_or(i32::MAX));
-                if !self.step_message_focus(view, lines) {
+                // A page's list turns over exactly what its screen showed
+                // whole: forward to the stop after it, back to the screen
+                // that ends on the stop before it ([`ScrollPlan::page_up`]).
+                let turned = view.turn_list_page(direction > 0);
+                let lines = direction
+                    .saturating_mul(i32::try_from(self.shown_page(view)).unwrap_or(i32::MAX));
+                if turned || !self.step_message_focus(view, lines) {
                     view.page_reveal = None;
-                    let limit = self.page_scroll_limit(view);
-                    view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
-                    self.keep_message_focus_seated(view);
+                    if !turned {
+                        let limit = self.page_scroll_limit(view);
+                        view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
+                        self.keep_message_focus_seated(view);
+                    }
                     if from_sidebar {
                         view.focus_list_screen(true);
                     } else {
@@ -9267,7 +10040,13 @@ impl NativeAppModel for SettingsApp {
                     }
                     _ => {}
                 }
+                // An entry a later row told on stays open, and in its place,
+                // as that row.
+                let followed = self.follow_told_on(view);
                 self.keep_messages_anchor(view);
+                if let Some(id) = followed {
+                    self.seat_followed_focus(view, id);
+                }
                 // A list at its newest entry takes the record at its top and
                 // pushes an entry opened low in it out whole; the ring can
                 // evict the focused entry. Either took its focused control
@@ -9604,6 +10383,7 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "restore_session" => config.restore_session,
         "show_build_badge" => config.show_build_badge,
         "confirm_multiline_paste" => config.confirm_multiline_paste,
+        "predictive_echo_editing" => config.predictive_echo_editing,
         "option_as_meta" => config.option_as_meta,
         "focus_boost" => config.focus_boost,
         "desktop_alerts" => config.desktop_alerts,
@@ -9639,8 +10419,9 @@ fn semantic_value_for_field(
                 .unwrap_or(false);
             Some((!current).to_string())
         }
+        // ←/→ steps from the row an alias stands on, not from the first.
         None if let EditKind::Enum { options } = field.kind => cycle_choice(
-            SettingsState::display_value(field),
+            trail_style_row_value(field.key, SettingsState::display_value(field)),
             options,
             field.seed.is_some(),
         ),
@@ -9751,6 +10532,20 @@ fn apply_text_input_event(
             input.redo();
         }
         TextInputEvent::Submit | TextInputEvent::Cancel => input.cancel_preedit(),
+    }
+}
+
+/// The row a choice value stands on: a `cursor_trail_style` spelling (an alias
+/// such as `nyan rainbow`, on either trail-style key) is its canonical row;
+/// every other value, and a spelling nothing knows, is itself.
+fn trail_style_row_value<'a>(key: &str, value: &'a str) -> &'a str {
+    if matches!(
+        key,
+        prefs::EDIT_CURSOR_TRAIL_STYLE | prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF
+    ) {
+        prefs::cursor_trail_style_canonical(value).unwrap_or(value)
+    } else {
+        value
     }
 }
 
@@ -9944,140 +10739,31 @@ impl CursorStyleGroup {
     }
 }
 
-/// One built-in style the Cursor Styles page knows: the `cursor_trail_style`
-/// value it saves, its name, and what it draws.
-struct CursorStyleEntry {
-    value: &'static str,
-    name: &'static str,
-    description: &'static str,
-    group: CursorStyleGroup,
+/// Where a spelling-table row sits on the Cursor Styles page: `off` alone,
+/// the rainbow companions, then the trails.
+fn cursor_style_group(
+    row: &aterm_effects::cursor_glow::spellings::TrailStyleRow,
+) -> CursorStyleGroup {
+    match row.style {
+        None => CursorStyleGroup::Off,
+        Some(aterm_effects::cursor_glow::GlowStyle::RainbowKitty) => CursorStyleGroup::Companions,
+        Some(_) => CursorStyleGroup::Trails,
+    }
 }
-
-/// Every built-in cursor style, in list order: one entry per look the
-/// preview tells apart from every other in a dark and a light theme alike
-/// (`every_listed_cursor_style_is_a_look_of_its_own_at_every_card_size`),
-/// each described by what it draws there. Spellings that draw the same
-/// thing are aliases (`prefs::CURSOR_TRAIL_STYLE_ALIASES`), not entries.
-const CURSOR_STYLE_ENTRIES: &[CursorStyleEntry] = &[
-    // Off leads the list, so the way to no trail is never screens away.
-    CursorStyleEntry {
-        value: "off",
-        name: "Off",
-        description: OFF_PLAIN_DESCRIPTION,
-        group: CursorStyleGroup::Off,
-    },
-    CursorStyleEntry {
-        value: prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-        name: "Rainbow kitty",
-        description: "A rainbow ribbon with a cat that walks beside your cursor",
-        group: CursorStyleGroup::Companions,
-    },
-    CursorStyleEntry {
-        value: "rainbow dog pet",
-        name: "Rainbow dog",
-        description: "The rainbow ribbon with a dog that walks beside your cursor",
-        group: CursorStyleGroup::Companions,
-    },
-    CursorStyleEntry {
-        value: "rainbow kitty flying",
-        name: "Flying kitty",
-        description: "The rainbow ribbon; a kitty flies in after a few seconds of steady typing",
-        group: CursorStyleGroup::Companions,
-    },
-    CursorStyleEntry {
-        value: "rainbow kitty underline",
-        name: "Rainbow underline",
-        description: "A rainbow line under what you type, with the walking cat",
-        group: CursorStyleGroup::Companions,
-    },
-    // The flat body is the owner's A/B control against the default's. The
-    // default's comet body thins toward its tail and dips deeper under the
-    // cursor on every ground (`Ribbon::body_profile`), and adds the bright
-    // strip under the ribbon on a dark one; Flat rainbow keeps one height.
-    CursorStyleEntry {
-        value: "rainbow kitty flat",
-        name: "Flat rainbow",
-        description: "The rainbow kitty with an even ribbon, the same height end to end",
-        group: CursorStyleGroup::Companions,
-    },
-    CursorStyleEntry {
-        value: "phaser",
-        name: "Phaser",
-        description: "A beam that sweeps through the colors as you type",
-        group: CursorStyleGroup::Trails,
-    },
-    CursorStyleEntry {
-        value: "comet",
-        name: "Comet",
-        description: "A comet tail in your cursor's color, widest at the cursor",
-        group: CursorStyleGroup::Trails,
-    },
-    CursorStyleEntry {
-        value: "lumen",
-        name: "Lumen",
-        description: "A soft glow around your cursor, in its color",
-        group: CursorStyleGroup::Trails,
-    },
-    CursorStyleEntry {
-        value: "sparkle",
-        name: "Sparkle",
-        description: "Rainbow sparkles scatter behind your cursor",
-        group: CursorStyleGroup::Trails,
-    },
-    CursorStyleEntry {
-        value: "fire",
-        name: "Fire",
-        description: "A red-hot cursor that blazes into flames as you keep typing",
-        group: CursorStyleGroup::Trails,
-    },
-    CursorStyleEntry {
-        value: "laser",
-        name: "Laser",
-        description: "A lightning-bolt cursor and a laser line that crackles with sparks",
-        group: CursorStyleGroup::Trails,
-    },
-    CursorStyleEntry {
-        value: "water",
-        name: "Water",
-        description: "A water-drop cursor with a blue wake behind it",
-        group: CursorStyleGroup::Trails,
-    },
-    CursorStyleEntry {
-        value: "beam",
-        name: "Beam",
-        description: "An even tube in your cursor's color that follows it",
-        group: CursorStyleGroup::Trails,
-    },
-    // One colour is Classic's Trail color, not a style of its own (the old
-    // `classic mono` spellings are aliases of it).
-    CursorStyleEntry {
-        value: "classic",
-        name: "Classic",
-        description: "The original cursor glow, in shifting colors or your trail color",
-        group: CursorStyleGroup::Trails,
-    },
-];
 
 /// The values the Cursor Styles page lists, Off first.
 #[cfg(test)]
 pub(crate) fn listed_cursor_style_values() -> impl Iterator<Item = &'static str> {
-    CURSOR_STYLE_ENTRIES.iter().map(|entry| entry.value)
+    prefs::CURSOR_TRAIL_STYLES.iter().copied()
 }
 
-/// The name a `cursor_trail_style` value goes by: its list entry's name,
-/// through any alias.
+/// The name a `cursor_trail_style` value goes by: its row's name in the
+/// engine's spelling table, through any alias; else the value in sentence
+/// case.
 fn cursor_style_name(value: &str) -> String {
     let value = value.trim();
-    prefs::cursor_trail_style_canonical(value)
-        .and_then(|canonical| {
-            CURSOR_STYLE_ENTRIES
-                .iter()
-                .find(|entry| entry.value == canonical)
-        })
-        .map_or_else(
-            || sentence_case_token(value),
-            |entry| entry.name.to_string(),
-        )
+    aterm_effects::cursor_glow::spellings::label(value)
+        .map_or_else(|| sentence_case_token(value), str::to_string)
 }
 
 /// One row of the Cursor Styles list.
@@ -10107,11 +10793,15 @@ impl ListedCursorStyle {
 const OFF_PLAIN_DESCRIPTION: &str = "No trail; the cursor stays plain";
 /// What Off draws while Typing momentum glow (Cursor & Motion) is on: the glow
 /// works on every style, Off included, round any cursor shape — light on a
-/// dark theme, warm ink on a light one.
+/// dark theme, ink beneath the letters in the caret's own hue on a light one.
 const OFF_GLOW_DESCRIPTION: &str = "No trail; typing still makes the cursor glow";
 
-/// The styles the Cursor Styles page lists: Off first, then every built-in
-/// entry.
+/// The styles the Cursor Styles page lists: every row of the engine's
+/// spelling table (`aterm_effects::cursor_glow::spellings::TRAIL_STYLES`), in
+/// its order — Off first, then the companions, then the trails — each named
+/// and described by its row, so the page cannot drift from the vocabulary.
+/// Nothing is hidden; spellings that draw the same look are aliases, not
+/// rows.
 fn listed_cursor_styles(state: &SettingsViewState) -> Vec<ListedCursorStyle> {
     // Choosing Off leaves Typing momentum glow as it is, which still lights
     // the cursor as you type — unless Serious Mode is on, which choosing Off
@@ -10127,19 +10817,42 @@ fn listed_cursor_styles(state: &SettingsViewState) -> Vec<ListedCursorStyle> {
         OFF_PLAIN_DESCRIPTION
     };
     let default_style = crate::app_config::default_cursor_trail_style();
-    let builtin = |entry: &CursorStyleEntry| ListedCursorStyle {
-        default: entry.value.eq_ignore_ascii_case(default_style),
-        value: entry.value.to_string(),
-        name: entry.name.to_string(),
-        description: if entry.group == CursorStyleGroup::Off {
-            off_description
-        } else {
-            entry.description
+    // The style Off replaced says so first, so a person finds it again.
+    let before_off = cursor_style_before_off(state);
+    let builtin = |row: &aterm_effects::cursor_glow::spellings::TrailStyleRow| {
+        let group = cursor_style_group(row);
+        ListedCursorStyle {
+            default: row.name.eq_ignore_ascii_case(default_style),
+            value: row.name.to_string(),
+            name: row.label.to_string(),
+            description: {
+                let description = if group == CursorStyleGroup::Off {
+                    off_description
+                } else {
+                    row.blurb
+                };
+                match before_off.as_deref() {
+                    Some(style) if row.name.eq_ignore_ascii_case(style) => {
+                        format!("{BEFORE_OFF_MARK} \u{b7} {description}")
+                    }
+                    // The saved Off, where the list lands, names the style it
+                    // replaced first (an elided line keeps it), so a person
+                    // who left Serious Mode by another effect sees where their
+                    // style went without looking for it.
+                    Some(style) if group == CursorStyleGroup::Off => format!(
+                        "{BEFORE_OFF_MARK}: {} \u{b7} {description}",
+                        cursor_style_name(style)
+                    ),
+                    _ => description.to_string(),
+                }
+            },
+            group,
         }
-        .to_string(),
-        group: entry.group,
     };
-    CURSOR_STYLE_ENTRIES.iter().map(builtin).collect()
+    aterm_effects::cursor_glow::spellings::TRAIL_STYLES
+        .iter()
+        .map(builtin)
+        .collect()
 }
 
 /// A style row's key and action, from the style's key fragment.
@@ -10174,14 +10887,27 @@ fn cursor_style_candidate(state: &SettingsViewState) -> Option<String> {
         return None;
     }
     let writing = state.config_key_pending(prefs::EDIT_CURSOR_TRAIL_STYLE);
-    [
+    let found = [
         state.common.hovered.as_ref(),
         state.common.last_focus.as_ref(),
     ]
     .into_iter()
     .flatten()
     .filter(|key| writing || state.chosen_style_row.as_ref() != Some(*key))
-    .find_map(|key| cursor_style_for_row(state, key.as_str()))
+    .find_map(|key| cursor_style_for_row(state, key.as_str()));
+    // Focusing the preview itself (its Pause/Play control) keeps the style it
+    // was trying, rather than dropping back to the saved one. What it keeps
+    // passed the chosen-row rule above, so a chosen row is never brought back.
+    let on_preview = state
+        .common
+        .last_focus
+        .as_ref()
+        .is_some_and(|focus| focus.as_str().starts_with("settings/preview"));
+    if found.is_none() && on_preview {
+        return state.preview_candidate.borrow().clone();
+    }
+    state.preview_candidate.replace(found.clone());
+    found
 }
 
 /// The style being TRIED: a [`cursor_style_candidate`] that is not the saved
@@ -10206,6 +10932,42 @@ fn saved_cursor_style(state: &SettingsViewState) -> String {
     }
 }
 
+/// THE STYLE THE CURSOR HAD BEFORE OFF, as the list names it, where aterm.toml
+/// keeps one and its style is Off: the style the writer kept beside an Off
+/// ([`prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF`] — the person's own Off, or
+/// Serious Mode's exit holding the cursor Off while another effect turned on),
+/// or, in an older file, the style a retired `cursor_trail = false` holds
+/// off. `None` while the style draws, or for a style aterm cannot draw.
+fn cursor_style_before_off(state: &SettingsViewState) -> Option<String> {
+    if crate::app_config::resolve_trail_style(&top_authored_trail_value(state))
+        .style
+        .is_some()
+    {
+        return None;
+    }
+    let kept = state
+        .raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF)
+        .or_else(|| {
+            (state
+                .raw_value(prefs::RETIRED_CURSOR_TRAIL)
+                .is_some_and(|master| master.trim() == "false"))
+            .then(|| {
+                state
+                    .raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE)
+                    .unwrap_or_else(|| prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string())
+            })
+        })?;
+    let resolved = crate::app_config::resolve_trail_style(&kept);
+    if resolved.unknown || resolved.style.is_none() {
+        return None;
+    }
+    resolved.canonical.map(str::to_string)
+}
+
+/// The words a Cursor Styles row says before its description when it is the
+/// style the cursor had before Off ([`cursor_style_before_off`]).
+const BEFORE_OFF_MARK: &str = "Your style before Off";
+
 /// Whether choosing `style` would change nothing: the terminal draws it and
 /// aterm.toml names it. An Off that Serious Mode or the effects switch forces
 /// over another saved style, or a spelling aterm does not know, is worth
@@ -10217,8 +10979,10 @@ fn cursor_style_is_saved(state: &SettingsViewState, style: &str) -> bool {
         .raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE)
         .unwrap_or_else(|| crate::app_config::default_cursor_trail_style().to_string());
     let raw = raw.trim();
-    // The old `classic mono` spelling draws Classic in the cursor's colour,
-    // not the Classic row's shifting colours: choosing the row writes it.
+    // The old `classic mono` spelling says Classic and the cursor's colour
+    // in one word: choosing the row writes the style by its name in the list,
+    // and the writer moves the colour onto Trail color (`cursor`), where its
+    // Reset gives the Classic row's shifting colours.
     let authored = if aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono(raw) {
         raw
     } else {
@@ -10281,9 +11045,21 @@ fn trail_knob_idle_reason(
         ));
     }
     if reads(KnobContext { dark: true, ..ctx }) {
+        // What the light ground does not draw, by the knob's own part.
+        let semantic = match knob {
+            aterm_effects::cursor_glow::TrailKnob::Radius => {
+                "On a light background this style draws no glow at the cursor for it to size; the value applies on dark themes"
+            }
+            aterm_effects::cursor_glow::TrailKnob::Accent => {
+                "On a light background this style draws no wake for it to shade; the value applies on dark themes"
+            }
+            _ => {
+                "On a light background this style draws no tail for it to shape; the value applies on dark themes"
+            }
+        };
         return Some(EffectDisclosure::new(
             EffectNoteKind::Inactive,
-            "On a light background this style draws no tail for it to shape; the value applies on dark themes",
+            semantic,
             "Inactive: dark themes only",
             "Currently inactive: it shows only on dark themes",
         ));
@@ -10613,13 +11389,7 @@ fn theme_picker_rows(themes: &crate::app_config::ThemeCatalog) -> Vec<ChoiceOpti
         let Ok(package) = themes.resolve_package(id) else {
             continue;
         };
-        // The file's own name, as written; the id (what config stores) joins
-        // it when they differ, so two files that share a `name =` stay apart.
-        let label = if meta.display_name == id {
-            id.to_string()
-        } else {
-            format!("{}{FACT_SEPARATOR}{id}", meta.display_name)
-        };
+        let label = crate::app_config::theme_file_label(id, meta);
         // The description, then the type settings the theme names and, for a
         // file from a newer theme schema, the settings this aterm skipped.
         let notes: Vec<String> = meta
@@ -10803,18 +11573,21 @@ fn picker_choice<'a>(state: &'a SettingsViewState, key: &str) -> Option<&'a Choi
         let prefix = format!("settings/choice/{key}/");
         focus.as_str().strip_prefix(&prefix)?.parse::<usize>().ok()
     };
+    // The highlight previews while the list shows it (a filter can hide
+    // it), on screen or scrolled away by the wheel: scrolling alone never
+    // changes the preview.
     let hovered = state
         .common
         .hovered
         .as_ref()
         .and_then(choice_index)
-        .filter(|index| picker.is_visible(*index));
+        .filter(|index| picker.position_of(*index).is_some());
     let focused = state
         .common
         .last_focus
         .as_ref()
         .and_then(choice_index)
-        .filter(|index| picker.is_visible(*index));
+        .filter(|index| picker.position_of(*index).is_some());
     let candidate = hovered.or(focused);
     let index = candidate.unwrap_or(picker.selected);
     picker.options.get(index)
@@ -11237,6 +12010,16 @@ fn split_font_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The route part of the Advanced preview's semantic key
+/// (`settings/preview{path}`): the page, or `/search` while a query runs.
+fn renderer_preview_path(state: &SettingsViewState) -> &'static str {
+    if state.search.trim().is_empty() {
+        state.route.path()
+    } else {
+        "/search"
+    }
+}
+
 fn focused_preview_key(state: &SettingsViewState) -> Option<String> {
     let query = state.search.trim().to_ascii_lowercase();
     // While searching, a focused control previews only if it is one of the
@@ -11250,22 +12033,45 @@ fn focused_preview_key(state: &SettingsViewState) -> Option<String> {
                     })))
     };
     let focused = state.common.last_focus.as_ref().map(UiKey::as_str);
-    if let Some(key) = focused.and_then(|focus| focus.strip_prefix("settings/control/"))
-        && previewable(key)
+    let preview_path = renderer_preview_path(state);
+    // Remember which subject this page's preview shows, so focusing the
+    // preview itself (its Pause/Play control) keeps demonstrating it.
+    let subject = |key: &str| {
+        let key = prefs::VISUAL_PREVIEW_KEYS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == key && previewable(candidate))?;
+        state.preview_subject.set(Some((key, preview_path)));
+        Some(key.to_string())
+    };
+    if let Some(key) = focused
+        .and_then(|focus| focus.strip_prefix("settings/control/"))
+        .and_then(subject)
     {
-        return Some(key.to_string());
+        return Some(key);
     }
-    if let Some(choice) = focused.and_then(|focus| {
-        focus
-            .strip_prefix("settings/choice/")
-            .or_else(|| focus.strip_prefix("settings/segment/"))
-    }) && let Some((key, _)) = choice.rsplit_once('/')
-        && previewable(key)
+    if let Some(key) = focused
+        .and_then(|focus| {
+            focus
+                .strip_prefix("settings/choice/")
+                .or_else(|| focus.strip_prefix("settings/segment/"))
+        })
+        .and_then(|choice| choice.rsplit_once('/'))
+        .and_then(|(key, _)| subject(key))
     {
-        return Some(key.to_string());
+        return Some(key);
     }
-    if let Some(key) = state.editing_field.as_deref()
-        && previewable(key)
+    if let Some(key) = state.editing_field.as_deref().and_then(subject) {
+        return Some(key);
+    }
+    // A looping preview is its own Pause/Play control, so activating it moves
+    // focus onto it: keep demonstrating what THAT preview was showing. A
+    // subject another page's preview showed would swap this page's card for
+    // a different scene (one that may not even loop) the moment it is
+    // focused, so it is not consulted.
+    if focused.and_then(|focus| focus.strip_prefix("settings/preview")) == Some(preview_path)
+        && let Some((key, shown_in)) = state.preview_subject.get()
+        && shown_in == preview_path
     {
         return Some(key.to_string());
     }
@@ -11292,21 +12098,9 @@ fn focused_preview_key(state: &SettingsViewState) -> Option<String> {
             })
             .map(|(_, field)| field.key.to_string());
     }
-    // A Top Settings list showing the trail card selects the trail's preview;
-    // the wide grid's always-visible runway is scheduled explicitly by
-    // `preview_animation`.
-    let trail = UiKey::new(format!(
-        "settings/control/{}",
-        prefs::EDIT_CURSOR_TRAIL_STYLE
-    ));
-    if state.route == SettingsRoute::Home
-        && state.scroll_shown().is_some_and(|(plan, shown)| {
-            plan.stop_of(&trail)
-                .is_some_and(|stop| shown.start > 0 && shown.contains(&stop))
-        })
-    {
-        return Some(prefs::EDIT_CURSOR_TRAIL_STYLE.to_string());
-    }
+    // (Top Settings names its previews' keys itself, and its font candidate
+    // and cadence do not ask this: `preview_font_candidate`,
+    // `preview_animation`.)
     state.route.section().and_then(|section| {
         prefs::VISUAL_PREVIEW_KEYS
             .iter()
@@ -11483,6 +12277,16 @@ fn preview_resolved_colors_with(
     system_dark: bool,
     candidate: Option<&str>,
 ) -> crate::resolved_colors::ResolvedColors {
+    preview_resolved_colors_on(state, theme_visible_side(state, system_dark), candidate)
+}
+
+/// [`preview_resolved_colors_with`] on the `appearance` side, whichever side
+/// the page shows: what the person's colors draw on the other side's theme.
+fn preview_resolved_colors_on(
+    state: &SettingsViewState,
+    appearance: aterm_types::Appearance,
+    candidate: Option<&str>,
+) -> crate::resolved_colors::ResolvedColors {
     // A pinned environment value outranks the file; otherwise a key counts
     // when `aterm.toml` sets it or the user is drafting it.
     let authored = |key: &str| {
@@ -11515,7 +12319,6 @@ fn preview_resolved_colors_with(
     });
     // The sparse slots as written, with the Themes page's open slot draft.
     config.palette_overrides = state.showcase_palette_overrides();
-    let appearance = theme_visible_side(state, system_dark);
     config.resolved_colors_previewing(appearance, &state.assets.themes, candidate)
 }
 
@@ -11572,11 +12375,7 @@ fn renderer_preview(
         terminal_scale,
         prepared_font,
     )?;
-    let preview_path = if state.search.trim().is_empty() {
-        state.route.path()
-    } else {
-        "/search"
-    };
+    let preview_path = renderer_preview_path(state);
     // A large size shows fewer whole rows; the card never grows past twice
     // its usual height, so the rows under it keep the page.
     let height = if spec.scene == PreviewScene::Typography {
@@ -11584,12 +12383,21 @@ fn renderer_preview(
             .min(2.0 * renderer_preview_height(width))
             .min(maximum_height.max(96.0))
     } else {
-        // A large size still keeps its one whole row.
-        renderer_preview_height(width).max(spec.minimum_height(48.0))
+        // At most `maximum_height` (a host sizing the preview to its room),
+        // and a large size still keeps its one whole row.
+        renderer_preview_height(width)
+            .min(maximum_height)
+            .max(spec.minimum_height(48.0))
     };
+    let key = format!("settings/preview{preview_path}");
+    let focused = state
+        .common
+        .last_focus
+        .as_ref()
+        .is_some_and(|focus| focus.as_str() == key);
     Some(crate::settings_preview::preview_node(
-        format!("settings/preview{preview_path}"),
-        spec,
+        key,
+        spec.with_focus_ring(focused),
         height,
     ))
 }
@@ -11732,27 +12540,20 @@ fn renderer_preview_spec_for_key_with_font(
     } else {
         PreviewPause::Unspecified
     };
-    let motion_reason = if previews_serious_mode_exit {
+    // Why motion runs, for the paint audit. Why it is reduced is `pause`'s
+    // one answer ([`PreviewPause::audit`], read by
+    // `SettingsPreviewSpec::motion_reason`), so the badge, the spoken summary
+    // and the audit name one cause in one order.
+    let motion_reason = if reduced_motion {
+        pause.audit()
+    } else if previews_serious_mode_exit {
         "the highlighted trail previews its post-commit state; other playful effects stay off"
-    } else if motion.serious {
-        "serious mode suppresses decorative motion and post-processing"
-    } else if focus_load_probe && load_shed {
-        "the bounded adaptive-motion demo is applying a representative load signal"
     } else if focus_load_probe {
         "the bounded adaptive-motion demo is bypassing its representative load signal"
-    } else if load_shed {
-        "adaptive performance load-shed is active"
-    } else if !motion.focused {
-        "the aterm window is unfocused"
+    } else if motion_mode == crate::motion::MotionMode::Full {
+        "motion=full explicitly enables motion"
     } else {
-        match motion_mode {
-            crate::motion::MotionMode::Full => "motion=full explicitly enables motion",
-            crate::motion::MotionMode::Reduced => "motion=reduced explicitly disables motion",
-            crate::motion::MotionMode::Auto if motion.system_reduced => {
-                "motion=auto follows system Reduce Motion"
-            }
-            crate::motion::MotionMode::Auto => "motion=auto follows the active system policy",
-        }
+        "motion=auto follows the active system policy"
     };
 
     let committed_kitty_sprite = state
@@ -11834,17 +12635,30 @@ fn renderer_preview_spec_for_key_with_font(
         )
     });
     let resolved_trail = crate::app_config::resolve_trail_style(&trail_style_value);
+    let trail_color =
+        prefs::trail_color_setting(Some(&field_text(state, prefs::EDIT_CURSOR_TRAIL_COLOR, "")));
+    // Unset, the style's own brightness, as the terminal resolves it
+    // (`Config::cursor_trail_intensity_for`): a trail colour (the cursor's,
+    // chosen, among them) or the `classic mono` spelling draws Classic's
+    // one-colour face.
+    let default_intensity = aterm_effects::cursor_fx::default_trail_intensity(
+        resolved_trail.style,
+        trail_color.chosen()
+            || aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono(
+                trail_style_value.trim(),
+            ),
+    );
     let mut cursor = CursorPreviewSpec {
         style: cursor_style,
         blink: field_bool(state, prefs::EDIT_CURSOR_BLINK, true),
         trail_enabled: !serious_preview_suppression,
         trail_style: PreviewTrailStyle::from_resolution(resolved_trail),
         trail_style_raw: Arc::from(trail_style_value),
-        color: field_color(state, prefs::EDIT_CURSOR_TRAIL_COLOR),
+        color: trail_color,
         accent: field_color(state, prefs::EDIT_CURSOR_TRAIL_ACCENT),
         duration_ms: field_number(state, prefs::EDIT_CURSOR_TRAIL_MS, 260_u64),
         length: field_number(state, prefs::EDIT_CURSOR_TRAIL_LENGTH, 24_usize),
-        intensity: field_number(state, prefs::EDIT_CURSOR_TRAIL_INTENSITY, 1.0_f32),
+        intensity: field_number(state, prefs::EDIT_CURSOR_TRAIL_INTENSITY, default_intensity),
         radius: field_number(state, prefs::EDIT_CURSOR_TRAIL_RADIUS, 0.6_f32),
         ring: field_bool(state, prefs::EDIT_CURSOR_TRAIL_RING, true),
         momentum_glow: field_bool(
@@ -11852,8 +12666,10 @@ fn renderer_preview_spec_for_key_with_font(
             prefs::EDIT_CURSOR_MOMENTUM_GLOW,
             crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
         ),
-        cursor_color_pinned: state.is_explicit(prefs::EDIT_CURSOR_COLOR)
-            || state.field_has_unsaved_draft(prefs::EDIT_CURSOR_COLOR),
+        // A configured (or drafted) cursor colour pins the caret's base, as
+        // `cursor_color.is_some()` does for the terminal's `CursorFxInput`; a
+        // draft that clears it unpins.
+        cursor_color_pinned: field_color(state, prefs::EDIT_CURSOR_COLOR).is_some(),
     };
     if !serious_preview_suppression && focused_key == prefs::EDIT_CURSOR_FIRE_SHIMMER {
         // This control is dormant for every non-Fire trail. Give it a bounded
@@ -11926,10 +12742,15 @@ fn renderer_preview_spec_for_key_with_font(
             // A Follow system pair is named by the side the preview draws,
             // never as its raw `dark:…,light:…` text.
             resolved.id.clone()
+        } else if focused_key == prefs::EDIT_CURSOR_TRAIL_COLOR
+            && value.trim().eq_ignore_ascii_case(prefs::TRAIL_COLOR_CURSOR)
+        {
+            // The cursor's colour by its word, named as the row names it.
+            prefs::TRAIL_COLOR_CURSOR_LABEL.to_string()
         } else if state
             .field_by_key(focused_key)
             .is_some_and(|field| field.kind == EditKind::Color)
-            && aterm_types::scheme::parse_hex(&value).is_none()
+            && !prefs::color_value_is_valid(focused_key, &value)
         {
             // A draft that is no color names nothing the preview draws: the
             // header names the color it does draw.
@@ -11975,7 +12796,6 @@ fn renderer_preview_spec_for_key_with_font(
             .with_font_candidate(font_candidate)
             .with_prepared_font(prepared_font)
             .with_appearance(appearance)
-            .with_system_dark(motion.system_dark)
             .with_typography_candidate(typography)
             .with_post_fx(post_fx)
             .with_focus(focused_key, focused_value)
@@ -11990,10 +12810,78 @@ fn renderer_preview_spec_for_key_with_font(
                     .field_by_key(focused_key)
                     .map_or("", |field| field.label),
             )
-            .with_phase(phase_ms)
             .with_reduced_motion(reduced_motion)
-            .with_pause(pause),
+            .with_pause(pause)
+            .with_paused(state.preview_paused)
+            .map_phase(|spec| {
+                state
+                    .preview_clock
+                    .phase(focused_key, spec.loop_identity(), phase_ms)
+            }),
     )
+}
+
+/// Where each looping cursor preview's cycle began, per previewed setting, so
+/// a newly demonstrated choice starts its own loop at the beginning.
+///
+/// A preview's frame is a pure function of its spec, phase included, and the
+/// scene player behind it continues frame to frame
+/// (`settings_preview::CursorScene`); but on the host's free-running clock a
+/// newly highlighted picker choice would first be asked for wherever that
+/// clock's cycle stood, so its first paint replays the warm cycles AND the
+/// cycle so far, and the demo opens mid-command. Started at its own
+/// beginning, the first paint replays the warm cycles alone and shows the
+/// line from its first key. The phase stays an input of the spec, so paint
+/// stays deterministic; only which phase the host hands over changes.
+///
+/// The rule, per setting key: the first demonstration the view shows keeps
+/// the clock's own phase, and the one shown last keeps its cycle's origin
+/// however far the clock moves; a demonstration whose loop identity
+/// ([`crate::settings_preview::SettingsPreviewSpec::loop_identity`]) is new
+/// starts its cycle at the phase it is first asked for; an earlier one shown
+/// again keeps its origin if it was on screen in the last
+/// [`PreviewClock::RESUME_MS`] (two previews of one setting painted in the
+/// same frames never restart each other) and starts over otherwise.
+#[derive(Debug, Default)]
+struct PreviewClock {
+    /// `(setting key, loop identity, origin phase, last phase it was asked for)`,
+    /// most recent first, at most [`PreviewClock::ENTRIES`].
+    entries: std::cell::RefCell<Vec<(String, u64, u64, u64)>>,
+}
+
+impl PreviewClock {
+    const ENTRIES: usize = 8;
+    /// How long a demonstration may go unpainted and still resume its cycle.
+    const RESUME_MS: u64 = 250;
+
+    /// The phase to hand a preview of `key` whose loop identity is `identity`
+    /// (`None` for one that does not loop, which takes the clock's phase).
+    fn phase(&self, key: &str, identity: Option<u64>, phase_ms: u64) -> u64 {
+        let Some(identity) = identity else {
+            return phase_ms;
+        };
+        let mut entries = self.entries.borrow_mut();
+        let known = entries
+            .iter()
+            .position(|(k, id, _, _)| k == key && *id == identity);
+        let latest = entries.iter().position(|(k, ..)| k == key);
+        let origin = match known {
+            Some(at) => {
+                let (_, _, origin, seen) = entries[at];
+                let resumed =
+                    latest == Some(at) || (phase_ms >= seen && phase_ms - seen <= Self::RESUME_MS);
+                entries.remove(at);
+                if resumed { origin } else { phase_ms }
+            }
+            // The view's first demonstration of this setting plays on the
+            // clock's own phase; any later one starts its own cycle.
+            None if entries.iter().all(|(k, ..)| k != key) => 0,
+            None => phase_ms,
+        };
+        entries.insert(0, (key.to_string(), identity, origin, phase_ms));
+        entries.truncate(Self::ENTRIES);
+        phase_ms.saturating_sub(origin)
+    }
 }
 
 /// The focused row's own verdict when it changes nothing now, in the words
@@ -12151,7 +13039,7 @@ fn settings_text_scale() -> f32 {
     crate::native_appearance::text_scale().clamp(0.85, 2.0)
 }
 
-fn scaled_control_height() -> f32 {
+pub(crate) fn scaled_control_height() -> f32 {
     scaled_control_height_at_scale(settings_text_scale())
 }
 
@@ -12417,6 +13305,123 @@ fn settings_search(state: &SettingsViewState, placeholder: &str) -> UiNode {
     )
 }
 
+/// The search field's placeholder in a field `field_width` wide: "Search…"
+/// where it is whole, else "Search", else none (a bar that narrow draws
+/// Search as a button, [`compact_search_is_a_button`]).
+fn search_placeholder(field_width: f32) -> String {
+    let fitted =
+        |words: &str| crate::native_ui::fit_native_field_placeholder(words, field_width, false);
+    if fitted("Search…") == "Search…" {
+        "Search…".to_string()
+    } else {
+        fitted("Search")
+    }
+}
+
+/// Whether the compact toolbar draws Search as a button: where a field
+/// `field_width` wide beside the back button cannot say "Search" whole.
+fn compact_search_is_a_button(field_width: f32) -> bool {
+    crate::native_ui::fit_native_field_placeholder("Search", field_width, false) != "Search"
+}
+
+/// Whether the narrow toolbar's search is open across the bar: opened by its
+/// button ([`SettingsViewState::search_open`]), or holding words or the
+/// keyboard.
+fn compact_search_shows_its_field(state: &SettingsViewState) -> bool {
+    state.search_open
+        || !state.search_input.value().is_empty()
+        || !state.search.is_empty()
+        || state.search_has_focus()
+}
+
+/// The narrow toolbar's Search button: a magnifying glass, named Search
+/// Settings, a touch target wide.
+fn compact_search_open_button() -> UiNode {
+    UiNode::new(
+        SEARCH_OPEN,
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new("Search Settings")
+                    .visual_icon(ButtonIcon::Search)
+                    .description("Opens the search field"),
+                ActionId::new(SEARCH_OPEN),
+            )
+            .style(StyleRef::Navigation),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(56.0 * settings_text_scale().min(1.4)))
+            .height(Length::Fill),
+    )
+}
+
+/// THE NARROW TOOLBAR'S OPEN SEARCH: the field across the whole bar
+/// (`width` wide, `height` tall), its Cancel a cross over the field's end
+/// that empties the field and closes it, the back button coming back — so
+/// the field keeps the bar's whole width to say "Search" and hold a query.
+fn compact_open_search(state: &SettingsViewState, width: f32, height: f32) -> UiNode {
+    let end = crate::native_ui::TEXT_FIELD_END_BUTTON;
+    let placeholder = search_placeholder(width - end - crate::native_ui::TEXT_FIELD_END_BUTTON_GAP);
+    let mut field = settings_search(state, &placeholder)
+        .layout(Layout::default().width(Length::Fill).height(Length::Fill));
+    if let UiContent::TextField(spec) = &mut field.content {
+        spec.spec.end_button = true;
+    }
+    let pad = ((height - end) / 2.0).max(0.0);
+    let cancel = UiNode::new(
+        SEARCH_CANCEL,
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new("Cancel search")
+                    .visual_label("")
+                    .visual_icon(ButtonIcon::Clear),
+                ActionId::new(SEARCH_CANCEL),
+            )
+            .style(StyleRef::Quiet),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(end))
+            .height(Length::Fill),
+    );
+    let end_row = UiNode::new(
+        "settings/search-bar/end",
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::row()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Insets {
+                top: pad,
+                right: pad,
+                bottom: pad,
+                left: 0.0,
+            }),
+    )
+    .children(vec![
+        UiNode::new(
+            "settings/search-bar/lead",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+        cancel,
+    ]);
+    UiNode::new(
+        "settings/search-bar",
+        UiContent::Group(GroupSpec::new("Settings search")),
+    )
+    .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+    .children(vec![field, end_row])
+}
+
+/// The narrow toolbar's Search button's action ([`compact_search_open_button`]).
+const SEARCH_OPEN: &str = "settings/search-open";
+/// The open narrow search's Cancel ([`compact_open_search`]).
+const SEARCH_CANCEL: &str = "settings/search-cancel";
+
 fn settings_search_bar(state: &SettingsViewState, placeholder: &str, height: Length) -> UiNode {
     let mut children = vec![
         settings_search(state, placeholder)
@@ -12461,12 +13466,106 @@ fn settings_search_bar(state: &SettingsViewState, placeholder: &str, height: Len
 /// title, on every page.
 const ALL_SETTINGS: &str = "All Settings";
 
+/// The compact toolbar's title: the page's name in the Heading role at the
+/// Body step in bold — a toolbar's title, as a navigation bar's inline title
+/// is — measured in the face it paints in.
+fn compact_title_width(title: &str) -> f32 {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Plain);
+    crate::tray_raster::ui_text_width_for(face, title, px).ceil()
+}
+
+/// What Search keeps beside a toolbar title: a field to type into, at the
+/// live text size.
+fn compact_search_least() -> f32 {
+    160.0 * settings_text_scale()
+}
+
+/// The widest title any compact page puts in the toolbar: every route's
+/// name, the category sheet's and Search's. The toolbar names the page by
+/// this measure on every page, so ONE rule — decided by the window, never by
+/// the route — says whether a page draws its heading row
+/// ([`compact_toolbar_titles`]), and moving between pages never moves where
+/// their content starts.
+fn compact_title_widest() -> f32 {
+    SettingsRoute::ALL
+        .iter()
+        .map(|route| route.label())
+        .chain([ALL_SETTINGS, "Search Results"])
+        .map(compact_title_width)
+        .fold(0.0, f32::max)
+}
+
+/// The leading button beside a toolbar title, and its width: the back arrow
+/// with its name where the toolbar holds that, the title and what Search
+/// keeps ([`compact_search_least`]); else the arrow alone, its name kept for
+/// assistive technology (a navigation bar's back button gives way to the
+/// title first). `None` where the toolbar cannot hold the title beside even
+/// the narrowest leading button — the arrow, or the category sheet's Done —
+/// and Search: the page draws its heading row instead.
+fn compact_titled_leading(viewport: LogicalRect) -> Option<(ButtonSpec, f32)> {
+    let scale = settings_text_scale();
+    let room = viewport.width - 20.0 - 16.0 - compact_title_widest() - compact_search_least();
+    // The wider of the two leading buttons a titled toolbar draws: the arrow
+    // (56pt) and the category sheet's Done (94pt).
+    let least = 94.0 * scale.min(1.4);
+    if least > room {
+        return None;
+    }
+    let label = crate::native_ui::native_button_label_width(ALL_SETTINGS);
+    let with_arrow = (40.0 + label + 12.0).ceil().max(96.0);
+    let spec = ButtonSpec::new(ALL_SETTINGS).visual_icon(ButtonIcon::Back);
+    Some(if with_arrow <= room {
+        (spec.visual_label(ALL_SETTINGS), with_arrow)
+    } else {
+        (spec, 56.0 * scale.min(1.4))
+    })
+}
+
+/// THE COMPACT TOOLBAR NAMES THE PAGE wherever it holds the title beside its
+/// leading button and Search ([`compact_titled_leading`]), as a navigation
+/// bar's inline title does: the page then draws no heading row
+/// ([`page_chrome`], [`pinned_heading`]) and its body keeps that height for
+/// its own content. A phone at large text, where the title would squeeze
+/// Search below a field to type into, keeps the heading row. Decided by the
+/// window alone — not the route, not a status the toolbar docks (it takes the
+/// title's place as it takes Search's), so a status that comes never moves
+/// the page under the pointer.
+fn compact_toolbar_titles(width: SettingsWidth, viewport: LogicalRect) -> bool {
+    width == SettingsWidth::Compact && compact_titled_leading(viewport).is_some()
+}
+
+/// Whether the page is named on screen: by its heading row, or by the
+/// compact toolbar's title. Only a window too short for the heading row whose
+/// toolbar cannot hold the title leaves a card to name the page itself.
+fn page_named(width: SettingsWidth, viewport: LogicalRect) -> bool {
+    compact_toolbar_titles(width, viewport) || window_page_chrome(width, viewport).0
+}
+
+/// The title the shown page carries — in its heading row, or the compact
+/// toolbar ([`compact_toolbar_titles`]): Search Results while Search holds
+/// words, All Settings on the category sheet, else the route's name; the
+/// harness page's whole title where the toolbar's slot holds it, as its
+/// heading row's is where the page holds it.
+fn compact_page_title(state: &SettingsViewState, slot: f32) -> &'static str {
+    if !state.search.trim().is_empty() {
+        "Search Results"
+    } else if state.compact_navigation {
+        ALL_SETTINGS
+    } else if state.route == SettingsRoute::Harness
+        && compact_title_width(harness_page::HARNESS_PAGE_TITLE) <= slot
+    {
+        harness_page::HARNESS_PAGE_TITLE
+    } else {
+        state.route.label()
+    }
+}
+
 /// How the compact toolbar's leading button is drawn. On every page it is
 /// the same back button to the All Settings sheet — the parent of every
 /// page, Top Settings included — painted with its name beside the back
 /// arrow wherever the toolbar holds both and Search, else its name alone;
 /// beside a docked status it is the arrow alone, and the sheet's own button
-/// is Done.
+/// is Done. Beside the toolbar's title it is [`compact_titled_leading`]'s.
 fn compact_toolbar_leading(
     state: &SettingsViewState,
     viewport: LogicalRect,
@@ -12486,6 +13585,9 @@ fn compact_toolbar_leading(
         // recovery/confirmation action pair at 2x Dynamic Type while its
         // name remains "All Settings".
         return (spec.visual_icon(ButtonIcon::Back), 56.0);
+    }
+    if let Some(titled) = compact_titled_leading(viewport) {
+        return titled;
     }
     // The button's room: the toolbar less its padding and gap, less what
     // Search keeps to say what it is (its placeholder whole, with the
@@ -12540,27 +13642,73 @@ fn compact_toolbar(
             .width(Length::Fixed(leading_width))
             .height(leading_height),
     );
-    let trailing = if status_docked {
-        compact_status_dock(state, viewport)
-            .expect("a docked compact status always has a watcher or feedback")
-    } else {
-        // The field takes the toolbar beside its leading button (its 10pt
-        // insets and 8pt gap): its placeholder fitted to that, so a narrow
-        // window reads "Search" or "Sea…", never "Searc".
-        let field_width = viewport.width - 2.0 * 10.0 - 8.0 - leading_width;
-        let placeholder = crate::native_ui::fit_native_field_placeholder(
-            if crate::native_ui::fit_native_field_placeholder("Search…", field_width, false)
-                == "Search…"
-            {
-                "Search…"
-            } else {
-                "Search"
-            },
-            field_width,
-            false,
+    let mut children = vec![leading];
+    if status_docked {
+        // A docked status takes the title's place as it takes Search's; the
+        // page's group keeps the route's name.
+        children.push(
+            compact_status_dock(state, viewport)
+                .expect("a docked compact status always has a watcher or feedback"),
         );
-        settings_search_bar(state, &placeholder, Length::Fill)
-    };
+    } else {
+        // The title, where the toolbar carries it ([`compact_toolbar_titles`]),
+        // sits between the leading button and Search.
+        let mut title_width = 0.0;
+        if compact_toolbar_titles(SettingsWidth::Compact, viewport) {
+            // The page's heading, in the toolbar: the Heading role and the
+            // page's whole name, at its measured width; Search fills the rest.
+            let slot = viewport.width - 20.0 - leading_width - 16.0 - compact_search_least();
+            let title = compact_page_title(state, slot);
+            title_width = compact_title_width(title);
+            children.push(
+                UiNode::new(
+                    format!("settings/page-heading/{}", key_fragment(title)),
+                    UiContent::Text(TextSpec {
+                        text: title.to_string(),
+                        role: SemanticRole::Heading,
+                        style: StyleRef::Plain,
+                    }),
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fixed(title_width))
+                        .height(Length::Fill),
+                ),
+            );
+        }
+        // The field takes the toolbar beside its leading button and the title
+        // (its 10pt insets and 8pt gaps): its placeholder fitted to that —
+        // "Search…", else "Search". WHERE IT CANNOT SAY "Search" WHOLE
+        // ([`compact_search_is_a_button`]: a phone-width window at large
+        // text, which painted "Se…"), Search is a button, a magnifying glass
+        // named Search Settings, that opens the field across the whole bar
+        // with Cancel after it; the field stays open while it holds words or
+        // the keyboard.
+        let field_width = viewport.width
+            - 2.0 * 10.0
+            - 8.0
+            - leading_width
+            - if title_width > 0.0 {
+                title_width + 8.0
+            } else {
+                0.0
+            };
+        if !compact_search_is_a_button(field_width) {
+            children.push(settings_search_bar(
+                state,
+                &search_placeholder(field_width),
+                Length::Fill,
+            ));
+        } else if !compact_search_shows_its_field(state) {
+            children.push(compact_search_open_button());
+        } else {
+            children = vec![compact_open_search(
+                state,
+                viewport.width - 2.0 * 10.0,
+                compact_header_height(state, viewport) - 2.0 * 8.0,
+            )];
+        }
+    }
     UiNode::new(
         "settings/compact-toolbar",
         UiContent::Group(GroupSpec::new("Settings toolbar").style(StyleRef::Secondary)),
@@ -12571,7 +13719,7 @@ fn compact_toolbar(
             .padding(Insets::symmetric(10.0, 8.0))
             .gap(8.0),
     )
-    .children(vec![leading, trailing])
+    .children(children)
 }
 
 /// The lines the Reset All question paints across a bar `room` wide: how
@@ -12772,7 +13920,7 @@ fn feedback_bar(
         );
     }
     let undo_width = if state.undo_offer().is_some() {
-        68.0 + 8.0
+        bar_undo_width() + 8.0
     } else {
         0.0
     };
@@ -12822,7 +13970,7 @@ fn feedback_bar(
             )
             .layout(
                 Layout::default()
-                    .width(Length::Fixed(68.0))
+                    .width(Length::Fixed(bar_undo_width()))
                     .height(Length::Fill),
             ),
         );
@@ -13334,6 +14482,9 @@ fn settings_status_bars_height(
     width: SettingsWidth,
     viewport_width: f32,
 ) -> f32 {
+    if state.measuring_calm.get() {
+        return 0.0;
+    }
     feedback_bar_height(state, width, viewport_width) + config_watch_status_bar_height(state)
 }
 
@@ -13739,6 +14890,30 @@ fn compact_feedback_parts(
         actions: undo,
         group_label: "Settings status",
     })
+}
+
+/// How wide the status bar's Undo (or Redo) is: 68pt, or, where that cuts the
+/// wider of its two words, as wide as that word needs to paint whole in the
+/// room a text button keeps for its label
+/// ([`crate::native_ui::text_button_label_room`]), so the button is one
+/// width whichever it offers and never says "Un…" in a wider UI face or at a
+/// larger text size.
+fn bar_undo_width() -> f32 {
+    const WIDTH: f32 = 68.0;
+    let edges = WIDTH - crate::native_ui::text_button_label_room(&ButtonSpec::new("Undo"), WIDTH);
+    let words = ["Undo", "Redo"]
+        .into_iter()
+        .map(crate::native_ui::native_button_label_width)
+        .fold(0.0_f32, f32::max);
+    let need = words + edges;
+    if need <= WIDTH {
+        WIDTH
+    } else {
+        // A point past the exact measure: the painter takes its edges off the
+        // button's placed origin, so a width of exactly the word's lands a
+        // hair under it (`top_regular_choice_control_width` says the same).
+        need.ceil() + 1.0
+    }
 }
 
 /// The status bar's offer button: Undo, or Redo once an Undo has taken the
@@ -14331,9 +15506,133 @@ fn page(
     cx: &ViewCx<'_>,
     width: SettingsWidth,
 ) -> UiNode {
+    // SHORT WINDOWS SHED CHROME BEFORE CONTENT ([`PageChrome`]): the page is
+    // seated under its full chrome, and where its list's first screen does
+    // not hold the page's lead, seated again under less, a step at a time,
+    // each time from the list's place as the last render left it.
+    let record = state.scroll_record.borrow().clone();
+    // MEASURED AS THE PAGE SEATS WITH NO BAR UP, so a status bar that comes
+    // never changes the chrome and moves the page under the pointer. A bar
+    // no taller than the strip the page keeps for it leaves the list's room
+    // as it was; a taller one (a reload warning, draft recovery, the Reset
+    // All question) takes room from the list and the pinned preview, which
+    // re-seats what the list holds (a preview sized to the room, a card
+    // split into stops by it): its measure is the page's with no bar, and
+    // the page is then seated under that chrome with its bars.
+    let bars = settings_status_bars_height(state, width, cx.viewport.width) > 0.0;
+    let seat = |chrome: PageChrome, calm: bool| {
+        state.scroll_record.replace(record.clone());
+        state.page_chrome.set(chrome);
+        state.measuring_calm.set(calm);
+        let built = page_children(state, update, packages, messages, harness, cx, width);
+        let holds = if state.route == SettingsRoute::Messages
+            && state.search.trim().is_empty()
+            && !state.compact_navigation
+        {
+            // Messages measures its own list: its first screen holds the
+            // newest entry the filters admit — every entry closed, so opening
+            // one (a tall one makes the header scroll away with the list)
+            // never changes the chrome under the pointer.
+            let visible = messages_visible(messages, &state.messages_filter);
+            visible.is_empty()
+                || !messages_plan_opening(
+                    state,
+                    messages,
+                    &visible,
+                    width,
+                    cx.viewport,
+                    None,
+                    state.messages_tag_menu,
+                )
+                .view(0)
+                .rows
+                .is_empty()
+        } else {
+            state
+                .scroll_plan()
+                .is_none_or(|plan| plan.first_screen_need() <= plan.room() + 0.01)
+        };
+        state.measuring_calm.set(false);
+        (built, holds)
+    };
+    // Only a step that lets the first screen hold the lead is taken: where
+    // even the leanest chrome cannot, the lead leaves the first screen
+    // whatever the chrome, and the page keeps its own. WHAT THE FIRST SCREEN
+    // NEEDS IS ASKED WHERE IT IS DRAWN: a list scrolled past its first screen
+    // keeps the chrome it was seated under while its window and its text
+    // size stay, so a republish that changes a row's height (another
+    // session's word on Settings ▸ Harness) never moves the screen the
+    // person is reading — and a text size changed under it chooses again, as
+    // the page at that size chooses (a 1× chrome was kept for a 2× page).
+    let seated_at = (cx.viewport, settings_text_scale());
+    let kept = record
+        .as_ref()
+        .filter(|record| record.top() > 0 && record.same_context(state))
+        .and_then(|_| state.page_chrome_at.get())
+        .filter(|at| *at == seated_at)
+        .map(|_| state.page_chrome.get());
+    let chosen = match kept {
+        Some(chrome) => {
+            let (built, _) = seat(chrome, bars);
+            Some((chrome, built))
+        }
+        None => PageChrome::ladder(width, cx.viewport)
+            .into_iter()
+            .find_map(|chrome| {
+                let (built, holds) = seat(chrome, bars);
+                holds.then_some((chrome, built))
+            }),
+    };
+    let (mut children, layout) = match chosen {
+        // Measured with no bar up: seated again under that chrome with its
+        // bars.
+        Some((chrome, _)) if bars => seat(chrome, false).0,
+        Some((_, built)) => built,
+        None => seat(PageChrome::FULL, false).0,
+    };
+    // The window and the text size the page is seated at: what a later
+    // render scrolled past its first screen keeps the chrome under.
+    state.page_chrome_at.set(Some(seated_at));
+    let global_search = !state.search.trim().is_empty();
+    let insets = page_frame_insets(state, cx.viewport, width, layout.maximum(width));
+    // The page's own list scrolls with its thumb in the right gutter.
+    scroll::seat_page_scroller(&mut children, insets.right);
+    let (page_key, page_label) = if global_search {
+        ("settings/page/search-results".to_string(), "Search Results")
+    } else if width == SettingsWidth::Compact && state.compact_navigation {
+        ("settings/categories/page".to_string(), "All Settings")
+    } else {
+        (
+            format!("settings/page{}", state.route.path()),
+            state.route.label(),
+        )
+    };
+    UiNode::new(page_key, UiContent::Group(GroupSpec::new(page_label)))
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(insets)
+                .gap(settings_page_gap(state, width, cx.viewport))
+                .clipped(),
+        )
+        .children(children)
+}
+
+/// The page's own children and the layout it drew them in, under the chrome
+/// [`page`] chose ([`PageChrome`]).
+fn page_children(
+    state: &SettingsViewState,
+    update: &UpdateProjection,
+    packages: &PackagesProjection,
+    messages: &MessagesState,
+    harness: &HarnessProjection,
+    cx: &ViewCx<'_>,
+    width: SettingsWidth,
+) -> (Vec<UiNode>, PageLayout) {
     let global_search = !state.search.trim().is_empty();
     let shown = PageLayout::shown(state);
-    let (mut children, layout) = if global_search {
+    if global_search {
         (
             settings_fields_page(state, false, cx, width, packages),
             shown,
@@ -14380,35 +15679,7 @@ fn page(
                 shown,
             ),
         }
-    };
-    let insets = responsive_page_insets(
-        cx.viewport.width,
-        cx.viewport.height,
-        width,
-        layout.maximum(width),
-    );
-    // The page's own list scrolls with its thumb in the right gutter.
-    scroll::seat_page_scroller(&mut children, insets.right);
-    let (page_key, page_label) = if global_search {
-        ("settings/page/search-results".to_string(), "Search Results")
-    } else if width == SettingsWidth::Compact && state.compact_navigation {
-        ("settings/categories/page".to_string(), "All Settings")
-    } else {
-        (
-            format!("settings/page{}", state.route.path()),
-            state.route.label(),
-        )
-    };
-    UiNode::new(page_key, UiContent::Group(GroupSpec::new(page_label)))
-        .layout(
-            Layout::column()
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(insets)
-                .gap(settings_page_gap(state, width, cx.viewport))
-                .clipped(),
-        )
-        .children(children)
+    }
 }
 
 /// THE CATEGORY SHEET: every route as one scrolling list under its heading,
@@ -14426,6 +15697,7 @@ fn compact_navigation_page(
     let page_gap = settings_page_gap(state, SettingsWidth::Compact, cx.viewport);
     let body = settings_page_body_height(state, SettingsWidth::Compact, cx.viewport);
     let (mut out, used) = pinned_heading(
+        state,
         SettingsWidth::Compact,
         cx.viewport,
         page_gap,
@@ -14473,7 +15745,7 @@ fn compact_navigation_page(
         );
     }
     plan.set_room((body - used).max(row_height));
-    let view = state.seat_scroll(&plan);
+    let view = state.seat_scroll(&mut plan);
     let button = |route: SettingsRoute| {
         UiNode::new(
             format!("settings/categories{}", route.path()),
@@ -14736,48 +16008,170 @@ fn compact_page_budget(state: &SettingsViewState, viewport: LogicalRect) -> Comp
     }
 }
 
-/// Whether a page draws its heading and its one-line subtitle: ONE rule for
-/// every route, decided by the window and never by the scroll. The heading
-/// names the page at every size but a truly tiny one; a compact page gives
-/// the subtitle's line to its rows.
-fn page_chrome(width: SettingsWidth, viewport: LogicalRect) -> (bool, bool) {
-    let heading = !compact_page_omits_heading(viewport.height);
+/// Whether a page draws its heading row and its one-line subtitle: ONE rule
+/// for every route, decided by the window and never by the scroll. The
+/// heading row names the page at every size but a truly tiny one, and but
+/// where the compact toolbar names it ([`compact_toolbar_titles`]); a compact
+/// page gives the subtitle's line to its rows.
+fn window_page_chrome(width: SettingsWidth, viewport: LogicalRect) -> (bool, bool) {
+    let heading =
+        !compact_page_omits_heading(viewport.height) && !compact_toolbar_titles(width, viewport);
     let subtitle = heading && width != SettingsWidth::Compact;
     (heading, subtitle)
+}
+
+/// [`window_page_chrome`] under the chrome this render's page keeps
+/// ([`PageChrome`]): a short window's page may have given its subtitle's line
+/// to its list.
+fn page_chrome(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> (bool, bool) {
+    let (heading, subtitle) = window_page_chrome(width, viewport);
+    (heading, subtitle && !state.page_chrome.get().no_subtitle)
+}
+
+/// SHORT WINDOWS SHED CHROME BEFORE CONTENT: what of a page's own chrome —
+/// the subtitle under its heading, the vertical insets over and under it —
+/// the page draws this render. One measured rule for every page ([`page`]):
+/// the page is seated under its full chrome, and where its list's first
+/// screen then cannot hold the page's lead
+/// ([`scroll::ScrollPlan::first_screen_need`]: its first stop, and the first
+/// row of controls the list holds after it), it sheds its chrome a step at a
+/// time — the subtitle's line, then the insets to 12pt, then to 4pt — the
+/// least that lets the first screen hold it. Where even the leanest cannot,
+/// the lead leaves the first screen whatever the chrome, and the page keeps
+/// all of its own. The heading, which names the page, stays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageChrome {
+    /// The page gave its subtitle's line to its list.
+    no_subtitle: bool,
+    /// The vertical inset the page keeps over and under itself where it gave
+    /// some of the window's own ([`responsive_page_insets`]) to its list.
+    inset: Option<f32>,
+}
+
+impl PageChrome {
+    /// The page's whole chrome.
+    const FULL: Self = Self {
+        no_subtitle: false,
+        inset: None,
+    };
+
+    /// The chrome a page on `viewport` may keep, fullest first, each step
+    /// shedding more: the subtitle where the window shows one, then the
+    /// vertical insets to 12pt and to 4pt where the window's own are more.
+    fn ladder(width: SettingsWidth, viewport: LogicalRect) -> Vec<Self> {
+        let natural = responsive_page_insets(viewport.width, viewport.height, width, FORM_MEASURE);
+        let mut ladder = vec![Self::FULL];
+        if window_page_chrome(width, viewport).1 {
+            ladder.push(Self {
+                no_subtitle: true,
+                inset: None,
+            });
+        }
+        for inset in [12.0, 4.0] {
+            if natural.top.max(natural.bottom) > inset + 0.01 {
+                ladder.push(Self {
+                    no_subtitle: true,
+                    inset: Some(inset),
+                });
+            }
+        }
+        ladder
+    }
+}
+
+/// The insets a page is seated in this render: the window's
+/// ([`responsive_page_insets`]), the vertical ones no more than the page's
+/// chrome keeps ([`PageChrome`]).
+fn page_frame_insets(
+    state: &SettingsViewState,
+    viewport: LogicalRect,
+    width: SettingsWidth,
+    maximum: f32,
+) -> Insets {
+    let mut insets = responsive_page_insets(viewport.width, viewport.height, width, maximum);
+    if let Some(inset) = state.page_chrome.get().inset {
+        insets.top = insets.top.min(inset);
+        insets.bottom = insets.bottom.min(inset);
+    }
+    insets
 }
 
 /// A page's pinned heading under [`page_chrome`], and the height it takes
 /// with the page gap after each line.
 fn pinned_heading(
+    state: &SettingsViewState,
     width: SettingsWidth,
     viewport: LogicalRect,
     gap: f32,
     title: &str,
     subtitle: &str,
 ) -> (Vec<UiNode>, f32) {
-    let (heading, show_subtitle) = page_chrome(width, viewport);
+    let (heading, show_subtitle) = page_chrome(state, width, viewport);
     if !heading {
         return (Vec::new(), 0.0);
     }
     let subtitle = if show_subtitle { subtitle } else { "" };
     let mut nodes = page_heading(title, subtitle);
-    if width == SettingsWidth::Compact
-        && settings_text_scale() > 1.25
-        && let Some(heading) = nodes.first_mut()
+    // THE PAGE'S NAME IS WHOLE IN ITS COLUMN, measured: in the page's title
+    // type (on a compact page at large text, Body-bold, as before); else in
+    // Body-bold where that is one line; else Body-bold on as many lines as
+    // the column needs ([`wrapped_words_node`]). A 22-column page painted
+    // "Keyboard…" and "Software U…" at 1× text.
+    let column = settings_page_content_width(viewport.width, width, FORM_MEASURE);
+    let one_line = |style: StyleRef| {
+        let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, style);
+        crate::tray_raster::ui_text_width_for(face, title, px)
+            <= column + crate::native_ui::TEXT_FIT_SLACK
+    };
+    let large = width == SettingsWidth::Compact && settings_text_scale() > 1.25;
+    let mut heading_height = page_heading_height();
+    if let Some(heading) = nodes.first_mut()
         && let UiContent::Text(spec) = &mut heading.content
+        && (large || !one_line(spec.style))
     {
-        // The full route name stays the semantic Heading; at maximum text
-        // size Body-bold keeps every route name whole on a compact page.
+        // The full route name stays the semantic Heading.
         spec.style = StyleRef::Plain;
+        if !one_line(StyleRef::Plain) {
+            let (wrapped, height) = wrapped_words_node(
+                heading.key.as_str(),
+                title,
+                (SemanticRole::Heading, StyleRef::Plain),
+                column,
+                page_heading_height() / 1.5,
+            );
+            heading_height = height.max(page_heading_height());
+            *heading = wrapped;
+            heading.layout.height = Length::Fixed(heading_height);
+        }
     }
-    let height = page_heading_height()
-        + gap
-        + if subtitle.is_empty() {
-            0.0
-        } else {
-            page_subtitle_height() + gap
-        };
-    (nodes, height)
+    // ITS SUBTITLE WRAPS TO THE SAME COLUMN, never cut: one line where it
+    // fits, else as many as it needs. A wide Harness page at 2× painted
+    // "…what it did, and its settin…", 4pt short of its words.
+    let mut subtitle_height = 0.0;
+    if !subtitle.is_empty()
+        && let Some(line) = nodes.get_mut(1)
+    {
+        let (wrapped, height) = wrapped_words_node(
+            line.key.as_str(),
+            subtitle,
+            (SemanticRole::Text, StyleRef::Quiet),
+            column,
+            page_subtitle_height(),
+        );
+        *line = wrapped;
+        // On lines, the box they were measured for (a page that reads wider
+        // than a form, Themes or Top Settings, keeps its words at the form's
+        // measure).
+        if !matches!(line.content, UiContent::Text(_)) {
+            line.layout.width = Length::Fixed(column);
+        }
+        subtitle_height = height + gap;
+    }
+    (nodes, heading_height + gap + subtitle_height)
 }
 
 /// The height a scrolling page's pinned header and list share: the page's
@@ -14810,7 +16204,7 @@ fn settings_status_bar_cost(
     viewport: LogicalRect,
 ) -> f32 {
     let bar = scaled_control_height();
-    let watcher = state.config_watch_status.is_some();
+    let watcher = state.config_watch_status.is_some() && !state.measuring_calm.get();
     let docks = width == SettingsWidth::Compact
         && compact_status_dock_required_at(state, viewport, bar, &DockActions::Undo, watcher, true);
     if !docks {
@@ -14928,7 +16322,12 @@ fn noncompact_page_content_height(
     maximum: f32,
 ) -> f32 {
     debug_assert_ne!(width, SettingsWidth::Compact);
-    let insets = page_insets(viewport_width, width, maximum);
+    let insets = page_frame_insets(
+        state,
+        LogicalRect::new(0.0, 0.0, viewport_width, viewport_height),
+        width,
+        maximum,
+    );
     (viewport_height
         - settings_status_bars_height(state, width, viewport_width)
         - insets.top
@@ -14988,7 +16387,7 @@ fn settings_page_body_height(
     // Only the vertical insets are read here, and they do not depend on the
     // measure — which a page with columns decides only after it knows this
     // height.
-    let insets = responsive_page_insets(viewport.width, viewport.height, width, FORM_MEASURE);
+    let insets = page_frame_insets(state, viewport, width, FORM_MEASURE);
     let chrome = if width == SettingsWidth::Compact {
         compact_header_height(state, viewport)
             + if compact_status_dock_required(state, viewport) {
@@ -15199,6 +16598,43 @@ struct ChoicePickerFit {
     compact: bool,
 }
 
+/// The least list a picker keeps in its compact form: a theme picker's
+/// section heading over two rows of choices, two rows in any other. The one
+/// measure the stacked card's compact decision ([`ChoicePickerFit::stacked`])
+/// and the room a host leaves under its preview ([`choice_picker_floor`])
+/// both read.
+fn picker_list_least(themed: bool) -> f32 {
+    let gap = 6.0;
+    (if themed {
+        picker_heading_height() + gap
+    } else {
+        0.0
+    }) + 2.0 * scaled_control_height()
+        + gap
+}
+
+/// The least card an open picker takes on a `width` page: its compact form's
+/// padding and header over [`picker_list_least`]. A host stacking a preview
+/// over the picker leaves it this much.
+fn choice_picker_floor(themed: bool, width: SettingsWidth) -> f32 {
+    let padding = if width == SettingsWidth::Compact {
+        22.0
+    } else {
+        24.0
+    };
+    padding + scaled_control_height() + 6.0 + picker_list_least(themed)
+}
+
+/// THE PREVIEW OVER AN OPEN PICKER, one rule for every host (Top Settings,
+/// a registry page, Search): as tall as the room the picker's least form
+/// leaves under it (`room`), never under the least the specimen demonstrates
+/// at (`least`) nor over its usual height (`natural`). So the picker keeps a
+/// section heading over two rows of choices wherever the window holds them
+/// beside the least preview, on every width.
+fn picker_host_preview_height(least: f32, natural: f32, room: f32) -> f32 {
+    room.min(natural).max(least)
+}
+
 impl ChoicePickerFit {
     /// The stacked card under the page's heading and preview: the page's
     /// content column, and the height left under what is already above it.
@@ -15232,12 +16668,12 @@ impl ChoicePickerFit {
         // footer. A host too short to keep a section heading over two rows
         // of choices under them (a wide but short window) takes the compact
         // form instead, as the compact width does: the filter in the header
-        // and the folder actions as cells, so its list shows sections.
+        // and the folder actions as cells, which buys the list those rows
+        // (its sections are headed in either form).
         let row = scaled_control_height();
         let full_room =
             height - padding.top - padding.bottom - row - tile_gap - 2.0 * (row + tile_gap);
-        let compact = width == SettingsWidth::Compact
-            || full_room + 0.5 < picker_heading_height() + 2.0 * row + 2.0 * tile_gap;
+        let compact = width == SettingsWidth::Compact || full_room + 0.5 < picker_list_least(true);
         Self {
             width: settings_page_content_width(
                 viewport.width,
@@ -15255,9 +16691,10 @@ impl ChoicePickerFit {
 /// The picker card: a header (the title and Cancel), then the options in as
 /// many columns as keep their labels whole, sized to the room it is given.
 /// Every option is on glass when they fit; when they do not, the list scrolls
-/// a row at a time (the wheel and the arrow keys move the highlight, and the
-/// window follows it) and a thumb down its edge says so. The card is as tall
-/// as the rows it shows, so nothing under it is blank.
+/// a row at a time (the arrow keys move the highlight and the window follows
+/// it; the wheel scrolls the window and leaves the highlight) and a thumb
+/// down its edge says so. The card is as tall as the rows it shows, and its
+/// list's room is full on every screen, the last one too.
 fn choice_picker_card(
     state: &SettingsViewState,
     picker: &ChoicePicker,
@@ -15291,10 +16728,20 @@ fn choice_picker_card(
 
     // Columns: as many as keep the widest label whole beside the check (at
     // least a 140pt tile, and room for the scroll gutter), up to four; prefer
-    // two, and spend more only to fit the whole list.
+    // two, and spend more only to fit the whole list. Measured over the
+    // labels that become grid tiles: a row of its own (the configured value
+    // no row names, [`ThemeSection::spans_row`]) is full width and never
+    // shares a row, so its label never narrows the grid.
     let widest = picker
         .options
         .iter()
+        .filter(|option| {
+            !(picker.headed()
+                && option
+                    .theme
+                    .as_ref()
+                    .is_some_and(|theme| theme.section.spans_row()))
+        })
         .map(|option| crate::native_ui::native_button_label_width(&option.label))
         .fold(0.0_f32, f32::max);
     let tile_minimum = (widest + 58.0)
@@ -15303,35 +16750,30 @@ fn choice_picker_card(
     let max_columns =
         (((inner_width - 10.0 + gap) / (tile_minimum + gap)).floor() as usize).clamp(1, 4);
     // The list's room: what the card has under its header, filter, footer
-    // and any "no match" line, at least one row of choices.
+    // and any "no match" line. A host leaves a theme picker a heading over
+    // two rows where the window holds them ([`choice_picker_floor`]); one
+    // that cannot still gets the list's heading and first row, cut by the
+    // list's edge and live where they show ([`UiNode::room`]), never a card
+    // taller than its host.
     let room = (fit.height
         - padding.top
         - padding.bottom
         - row_height
         - gap
         - (theme_rows + usize::from(no_match)) as f32 * (row_height + gap))
-        .max(row_height);
-    // A theme picker heads each section where the room holds a heading over
-    // two rows of choices (the shipped window's compact picker among them),
-    // so a screen that shows a heading still shows two rows; a shorter one
-    // keeps every row for choices, and its spoken label still names the
-    // sections it shows.
-    let headed = picker.themes.is_some()
-        && room + 0.5 >= picker_heading_height() + 2.0 * row_height + 2.0 * gap;
+        .max(0.0);
     // Laid out by every option, not by what a filter leaves: typing never
     // moves the card's edges.
     let columns = (max_columns.min(2)..=max_columns)
-        .find(|columns| {
-            picker_rows_height(&picker.unfiltered_rows(*columns, headed), gap) <= room + 0.5
-        })
+        .find(|columns| picker_rows_height(&picker.unfiltered_rows(*columns), gap) <= room + 0.5)
         .unwrap_or(max_columns);
-    let rows_height = picker_rows_height(&picker.unfiltered_rows(columns, headed), gap).min(room);
+    let rows_height = picker_rows_height(&picker.unfiltered_rows(columns), gap).min(room);
     let anchor = state
         .common
         .last_focus
         .as_ref()
         .and_then(|focus| picker.focus_position(focus));
-    picker.configure_window(columns, rows_height, gap, headed, anchor);
+    picker.configure_window(columns, rows_height, gap, anchor);
     // The list scrolls when what the filter leaves takes more than the room
     // (never because of the options it hides).
     let rows = picker.rows();
@@ -15344,16 +16786,19 @@ fn choice_picker_card(
     let row_node = |row: usize, cells: &PickerRow| match cells {
         PickerRow::Heading(heading) => picker_heading_node(picker, heading),
         PickerRow::Cells(cells) => {
+            // A row of its own spans the list.
+            let spans = cells.len() == 1 && picker.spans_row(cells.start);
+            let width = if spans { rows_width } else { tile_width };
             let mut tiles = cells
                 .clone()
                 .map(|position| match picker.shown.get(position) {
                     Some(index) => PickerCell::Option(*index),
                     None => PickerCell::Action(position - picker.shown.len()),
                 })
-                .map(|cell| picker_cell_node(state, picker, cell, tile_width))
+                .map(|cell| picker_cell_node(state, picker, cell, width))
                 .collect::<Vec<_>>();
             // A short row keeps its tiles at column width.
-            for spacer in cells.len()..columns {
+            for spacer in cells.len()..if spans { 1 } else { columns } {
                 tiles.push(
                     UiNode::new(
                         format!("settings/choice-spacer/{}/{row}/{spacer}", picker.key),
@@ -15370,41 +16815,82 @@ fn choice_picker_card(
             .children(tiles)
         }
     };
-    // A window scrolled into a section carries its heading over its first
-    // row, so the section's choices are never on screen without its name.
+    // THE LIST'S EDGE RULE, as every Settings list's ([`UiNode::room`]):
+    // what of a row shows in the list's room is live, cut by an edge or
+    // whole. A window scrolled into a section carries its heading over its
+    // first row, so the section's choices are never on screen without its
+    // name. Where the window's rows leave the room, the rows after them
+    // peek in under it, so the list never ends in blank space while it goes
+    // on; on the LAST screen, where nothing comes after, the rows before the
+    // window peek in over the top instead, the section's caption pinned over
+    // them, and the last row ends on the list's bottom edge.
     let carried = picker.carried_heading(&rows, window.start);
-    let mut option_rows = carried
-        .map(|heading| picker_heading_node(picker, heading))
-        .into_iter()
-        .chain(
+    let window_used = picker_rows_height(&rows[window.clone()], gap)
+        + carried.map_or(0.0, |_| picker_heading_height() + gap);
+    let last_screen =
+        window.start > 0 && window.end == rows.len() && window_used + 0.5 < rows_height;
+    let mut pinned = None;
+    let mut scrolled = 0.0;
+    let mut option_rows = Vec::new();
+    let peeks = if last_screen {
+        // From the window back, the fewest rows that fill the room under
+        // the caption of the section the topmost of them is in.
+        let caption_of = |first: usize| {
+            let cells = (first..rows.len())
+                .find(|row| matches!(rows[*row], PickerRow::Cells(_)))
+                .unwrap_or(first);
+            picker.carried_heading(&rows, cells)
+        };
+        let drawn_from = |first: usize| match rows[first] {
+            // A heading at the top is the pinned caption itself.
+            PickerRow::Heading(_) if caption_of(first).is_some() => first + 1,
+            _ => first,
+        };
+        let inner_of = |first: usize| {
+            rows_height - caption_of(first).map_or(0.0, |_| picker_heading_height() + gap)
+        };
+        let mut first = window.start;
+        while first > 0
+            && picker_rows_height(&rows[drawn_from(first)..], gap) + 0.5 < inner_of(first)
+        {
+            first -= 1;
+        }
+        pinned = caption_of(first);
+        let from = drawn_from(first);
+        scrolled = (picker_rows_height(&rows[from..], gap) - inner_of(first)).max(0.0);
+        option_rows.extend(
+            rows.iter()
+                .enumerate()
+                .skip(from)
+                .map(|(row, cells)| row_node(row - from, cells)),
+        );
+        true
+    } else {
+        option_rows.extend(carried.map(|heading| picker_heading_node(picker, heading)));
+        option_rows.extend(
             rows[window.clone()]
                 .iter()
                 .enumerate()
                 .map(|(row, cells)| row_node(row, cells)),
-        )
-        .collect::<Vec<_>>();
-    // Where the window's rows leave the list room, the rows after them peek
-    // in under it, cut at its edge and live where they show, as every list's
-    // are ([`UiNode::room`]), so the list never ends in blank space while it
-    // goes on.
-    let mut used = picker_rows_height(&rows[window.clone()], gap)
-        + carried.map_or(0.0, |_| picker_heading_height() + gap);
-    for (row, cells) in rows.iter().enumerate().skip(window.end) {
-        if used + gap >= rows_height - 4.0 {
-            break;
+        );
+        let mut used = window_used;
+        for (row, cells) in rows.iter().enumerate().skip(window.end) {
+            if used + gap >= rows_height - 4.0 {
+                break;
+            }
+            // A heading never ends what the list shows (as `rows_fitting`
+            // never ends a window on one): it peeks only over some of its
+            // section's first row of cells, never as a caption alone.
+            if matches!(cells, PickerRow::Heading(_))
+                && used + gap + picker_heading_height() + gap >= rows_height - 4.0
+            {
+                break;
+            }
+            option_rows.push(row_node(row - window.start, cells));
+            used += gap + picker_row_height(cells);
         }
-        // A heading never ends what the list shows (as `rows_fitting` never
-        // ends a window on one): it peeks only over some of its section's
-        // first row of cells, never as a caption alone.
-        if matches!(cells, PickerRow::Heading(_))
-            && used + gap + picker_heading_height() + gap >= rows_height - 4.0
-        {
-            break;
-        }
-        option_rows.push(row_node(row - window.start, cells).paint_only().peek());
-        used += gap + picker_row_height(cells);
-    }
-    let peeks = used > rows_height + 0.5;
+        used > rows_height + 0.5
+    };
     if no_match {
         option_rows.insert(0, theme_no_match_node(picker));
     }
@@ -15428,9 +16914,37 @@ fn choice_picker_card(
             .width(Length::Fixed(rows_width))
             .height(Length::Fixed(rows_height))
             .gap(gap);
-        if peeks { layout.clipped() } else { layout }
+        match pinned {
+            Some(_) => layout.clipped(),
+            None if peeks => layout.scrolled(scrolled).clipped(),
+            None => layout,
+        }
     })
-    .children(option_rows);
+    .room(rows_height, false)
+    .children(match pinned {
+        // The pinned caption over the rows scrolled under it.
+        Some(caption) => {
+            let inner = (rows_height - picker_heading_height() - gap).max(0.0);
+            vec![
+                picker_heading_node(picker, caption),
+                UiNode::new(
+                    format!("settings/choice-list/{}/scrolled", picker.key),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(
+                    Layout::column()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(inner))
+                        .gap(gap)
+                        .scrolled(scrolled)
+                        .clipped(),
+                )
+                .room(inner, false)
+                .children(option_rows),
+            ]
+        }
+        None => option_rows,
+    });
     let list = if scrolls {
         let thumb = UiNode::new(
             format!("settings/choice-scroll/{}/thumb", picker.key),
@@ -15786,17 +17300,6 @@ fn choice_option_node(
         text_width
     };
     let mut spec = choice_option_button(option, button_text_width, picker.fonts);
-    // Under its section's heading a row need not repeat it: the current
-    // value paints its name.
-    if picker.headed.get()
-        && let Some(theme) = option.theme.as_ref()
-        && theme.section == ThemeSection::Current
-    {
-        spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-            &theme.id,
-            button_text_width.max(0.0),
-        ));
-    }
     // The saved option wears the accent wash and a check, the highlighted
     // one the focus ring.
     if selected {
@@ -16722,11 +18225,6 @@ fn top_setting_row(
     };
     let parts = setting_row_parts_in(state, index, &projected, form, width);
     let mut row = parts.row;
-    // The Top theme card is a fixed-height quick picker beside its own
-    // preview; its "Browse themes…" lives on the Appearance page's row.
-    if direct {
-        strip_theme_browse_button(&mut row);
-    }
     // Top's large-text compact card paints a short name; the row, its label
     // and its control still say the whole one.
     let name = if direct && width == SettingsWidth::Compact && settings_text_scale() > 1.25 {
@@ -16813,11 +18311,13 @@ enum ThemeRowsHost {
 }
 
 /// THE THEME CARD'S ROWS, one builder for Top Settings and every list that
-/// shows the theme. Always mode (one theme, or none, which is Default): the
-/// Color theme control (`single`, the host's own form of that row), then the
-/// Follow system switch. Follow system (a `dark:…,light:…` pair): a Dark
-/// theme and a Light theme slot, each editing only its own side, the preview
-/// side switch, then the Follow system switch.
+/// shows the theme. The Follow system switch leads; the rows it governs
+/// follow it. Always mode (one theme, or none, which is Default): the Color
+/// theme control (`single`, the host's own form of that row). Follow system
+/// (a `dark:…,light:…` pair): a Dark theme and a Light theme slot, each
+/// editing only its own side, then the preview side switch. A list (not
+/// Modified) ends the card with its way to Settings ▸ Themes
+/// ([`theme_showcase_row`]).
 /// The mode is read off the configured value, so a pair always opens here and
 /// never behind a single-name control. `text_width` is the card's text
 /// measure.
@@ -16825,12 +18325,18 @@ fn theme_card_rows(
     state: &SettingsViewState,
     host: ThemeRowsHost,
     width: SettingsWidth,
-    viewport: LogicalRect,
     text_width: f32,
     single: impl FnOnce() -> Option<(UiNode, f32)>,
 ) -> Vec<(UiNode, f32)> {
     let raw = state.raw_value(prefs::EDIT_THEME);
     let following = prefs::theme_mode(raw.as_deref()) == prefs::ThemeMode::FollowSystem;
+    // THE SWITCH LEADS: the rows it governs come after it, so turning it on
+    // or off changes only rows below the switch, which stays under the
+    // pointer (above it, the list could only hold its place by scrolling the
+    // rows it just brought off the top).
+    let mode = theme_mode_row(state, host, following, width, text_width);
+    let mode_height = fixed_height(&mode);
+    let mut sized = vec![(mode, mode_height)];
     let mut rows: Vec<UiNode> = Vec::new();
     if following {
         let (dark, light) = prefs::theme_slots(raw.as_deref(), &state.assets.themes);
@@ -16840,7 +18346,6 @@ fn theme_card_rows(
             aterm_types::Appearance::Dark,
             &dark,
             width,
-            viewport,
             text_width,
         ));
         rows.push(theme_slot_row(
@@ -16849,26 +18354,35 @@ fn theme_card_rows(
             aterm_types::Appearance::Light,
             &light,
             width,
-            viewport,
             text_width,
         ));
         if !matches!(host, ThemeRowsHost::List { preview: false, .. }) {
             rows.push(theme_preview_side_row(state, host, width, text_width));
         }
     }
-    let mut sized = rows
-        .into_iter()
-        .map(|row| {
-            let height = fixed_height(&row);
-            (row, height)
-        })
-        .collect::<Vec<_>>();
+    sized.extend(rows.into_iter().map(|row| {
+        let height = fixed_height(&row);
+        (row, height)
+    }));
     if !following {
         sized.extend(single());
     }
-    let mode = theme_mode_row(state, host, following, width, text_width);
-    let height = fixed_height(&mode);
-    sized.push((mode, height));
+    // A list's way to Settings ▸ Themes is the card's own last row, in
+    // either mode: a link to a gallery page, as Cursor & Motion's to Cursor
+    // Styles is, never a second control in one picker's line (it pushed that
+    // picker off the column every other row shares). Top and Modified carry
+    // none.
+    if matches!(
+        host,
+        ThemeRowsHost::List {
+            modified_only: false,
+            ..
+        }
+    ) {
+        let row = theme_showcase_row(host, width, text_width);
+        let height = fixed_height(&row);
+        sized.push((row, height));
+    }
     if host == ThemeRowsHost::Top {
         // As Top's other rows, at every size: the row and its control
         // already say the whole name, so the label paints without a second
@@ -16878,6 +18392,51 @@ fn theme_card_rows(
         }
     }
     sized
+}
+
+/// How much taller the theme card's rows are in their taller mode than now:
+/// the Dark and Light slots and the preview side (with the card's `gap`
+/// after each) against the one Color theme row (`single`) while one theme is
+/// set, nothing while the theme follows the system. A host that decides
+/// what sits above the Follow system switch by whether the card fits adds
+/// it ([`constrain_top_split_card`]), so the decision is the same in either
+/// mode and turning the switch moves nothing above it.
+fn theme_rows_reserve(
+    state: &SettingsViewState,
+    host: ThemeRowsHost,
+    width: SettingsWidth,
+    text_width: f32,
+    single: Option<f32>,
+    gap: f32,
+) -> f32 {
+    let raw = state.raw_value(prefs::EDIT_THEME);
+    if prefs::theme_mode(raw.as_deref()) == prefs::ThemeMode::FollowSystem {
+        return 0.0;
+    }
+    let (dark, light) = prefs::theme_slots(raw.as_deref(), &state.assets.themes);
+    let mut follow = vec![
+        theme_slot_row(
+            state,
+            host,
+            aterm_types::Appearance::Dark,
+            &dark,
+            width,
+            text_width,
+        ),
+        theme_slot_row(
+            state,
+            host,
+            aterm_types::Appearance::Light,
+            &light,
+            width,
+            text_width,
+        ),
+    ];
+    if !matches!(host, ThemeRowsHost::List { preview: false, .. }) {
+        follow.push(theme_preview_side_row(state, host, width, text_width));
+    }
+    let follow: f32 = follow.iter().map(|row| fixed_height(row) + gap).sum();
+    (follow - single.map_or(0.0, |height| height + gap)).max(0.0)
 }
 
 /// A TOP ROW'S LABEL IS PAINT, at every text size and width: Top's rows are
@@ -16899,6 +18458,17 @@ fn top_row_label_paints_only(row: &mut UiNode) {
 /// or the place it keeps). An `inline` row keeps its label beside its
 /// fixed-width controls on a compact host too, one control tall, so the
 /// card's switches do not cost the preview its room.
+///
+/// THE ROW RULE EVERY SETTING ROW KEEPS: a one-line row leaves its name its
+/// floor beside everything on its line ([`one_line_name_floor`]), and stacks
+/// the controls under the name where it cannot; a stacked row seats Reset
+/// (or its place) as every stacked row does ([`seat_stacked_reset`]: after a
+/// switch where that line holds both, else ending the name's line, else on
+/// a line of its own where a word of the name cannot sit beside it); no
+/// control is wider than its line, and a button's words are fitted to the
+/// button they are drawn in. (The Follow system row kept its name beside the
+/// switch and Reset's place whatever the column, so at 22 columns its name
+/// got 40pt, 8pt at 2× text, broken inside its words.)
 #[allow(clippy::too_many_arguments)]
 fn theme_card_row(
     key: &str,
@@ -16912,31 +18482,23 @@ fn theme_card_row(
     inline: bool,
 ) -> UiNode {
     let label = with_tags(name, tags.iter());
-    let stacked = width == SettingsWidth::Compact && !inline;
+    let fixed = |node: &UiNode| match node.layout.width {
+        Length::Fixed(width) => Some(width),
+        _ => None,
+    };
     let trailing_width = trailing
         .as_ref()
-        .map_or(0.0, |node| match node.layout.width {
-            Length::Fixed(width) => width + 12.0,
-            _ => 0.0,
+        .and_then(fixed)
+        .map_or(0.0, |width| width + 12.0);
+    // A small margin, then each fixed control and its gap.
+    let one_line_room = controls
+        .iter()
+        .filter_map(fixed)
+        .fold(text_width - 8.0 - trailing_width, |left, control| {
+            left - control - 12.0
         });
-    let label_width = if stacked {
-        // The label line holds the trailing node beside the label.
-        text_width
-            - if trailing.is_some() {
-                trailing_width - 6.0
-            } else {
-                0.0
-            }
-    } else {
-        // A small margin, then each fixed control and its gap.
-        controls.iter().fold(
-            text_width - 8.0 - trailing_width,
-            |left, control| match control.layout.width {
-                Length::Fixed(control) => left - control - 12.0,
-                _ => left,
-            },
-        )
-    };
+    let stacked = (width == SettingsWidth::Compact && !inline)
+        || one_line_room + 0.01 < one_line_name_floor(visual_name);
     let label_height = 22.0_f32.max(20.0 * settings_text_scale());
     let label_node = UiNode::new(
         format!("settings/label/{key}"),
@@ -16956,9 +18518,31 @@ fn theme_card_row(
         vec![visual_name.to_string()],
     )]);
     let (layout, children) = if stacked {
-        // A stacked row's trailing node ends its label line, so the control
-        // under it keeps the whole width (as a list's stacked rows do).
+        // A switch row's Reset follows the switch on the control line, the
+        // switch at the line's end, as every stacked switch row's
+        // ([`seat_stacked_switch_reset`] moves it where that line cannot hold
+        // both); any other row's Reset ends the label line, so its control
+        // keeps the whole width. Fixed-width controls end the line, as they
+        // end a one-line row.
+        let switch = controls
+            .iter()
+            .any(|control| matches!(control.content, UiContent::Switch(_)));
+        let mut line = Vec::with_capacity(controls.len() + 2);
+        if controls.iter().all(|control| fixed(control).is_some()) {
+            line.push(
+                UiNode::new(
+                    format!("settings/control-spacer/{key}"),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            );
+        }
+        line.extend(controls);
         let label_line = match trailing {
+            Some(trailing) if switch => {
+                line.push(trailing);
+                label_node
+            }
             Some(trailing) => UiNode::new(
                 format!("settings/label-line/{key}"),
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -16980,12 +18564,12 @@ fn theme_card_row(
             Layout::row()
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .gap(6.0),
+                .gap(STACKED_CONTROL_GAP),
         )
-        .children(controls);
+        .children(line);
         (
             Layout::column()
-                .height(Length::Fixed(width.row_height()))
+                .height(Length::Fixed(SettingsWidth::Compact.row_height()))
                 .gap(4.0),
             vec![label_line, controls],
         )
@@ -17010,6 +18594,14 @@ fn theme_card_row(
     )
     .layout(layout)
     .children(children);
+    let label_width = if stacked {
+        seat_stacked_reset(&mut row, visual_name, text_width);
+        fit_stacked_controls(&mut row, text_width);
+        row_label_room(&row, true, text_width)
+    } else {
+        one_line_room
+    };
+    fit_theme_row_buttons(&mut row, text_width);
     // The name wraps, never cut, its tags where they fit beside it and else
     // on its second line, as every setting row's ([`place_row_tags`]).
     let placement = lay_out_row_label(
@@ -17025,14 +18617,113 @@ fn theme_card_row(
     with_row_detail(row, key, &detail, stacked)
 }
 
+/// NO CONTROL IS WIDER THAN ITS LINE: on a stacked row's control line each
+/// fixed-width control keeps its natural width where the line holds it, else
+/// takes what the line leaves it beside the others and their gaps (a switch,
+/// 145.6pt at 2× text, in a 122pt phone-width column).
+fn fit_stacked_controls(row: &mut UiNode, text_width: f32) {
+    let Some(line) = row
+        .children
+        .iter_mut()
+        .find(|child| child.key.as_str().starts_with("settings/controls/"))
+    else {
+        return;
+    };
+    let gaps = line.layout.gap * line.children.len().saturating_sub(1) as f32;
+    let widths: Vec<f32> = line
+        .children
+        .iter()
+        .map(|child| match child.layout.width {
+            Length::Fixed(width) => width,
+            _ => 0.0,
+        })
+        .collect();
+    let total: f32 = widths.iter().sum();
+    for (control, own) in line.children.iter_mut().zip(widths) {
+        if let Length::Fixed(width) = control.layout.width {
+            let room = (text_width - gaps - (total - own)).max(0.0);
+            control.layout.width = Length::Fixed(width.min(room));
+        }
+    }
+}
+
+/// A theme row's buttons say their words in the width they are drawn at
+/// (the slot pickers, Preview side, Browse themes…): fitted to that button's
+/// own label room ([`crate::native_ui::text_button_label_room`]: its lead,
+/// chevron and colour strip), never to an estimate of the column, so the
+/// painter never has less room than the words were fitted to. The words
+/// fitted are the button's whole visual label; its semantic label stays
+/// complete.
+fn fit_theme_row_buttons(row: &mut UiNode, text_width: f32) {
+    fn fit_line(line: &mut UiNode, text_width: f32) {
+        let gaps = line.layout.gap * line.children.len().saturating_sub(1) as f32;
+        let fixed: f32 = line
+            .children
+            .iter()
+            .filter(|child| !child.key.as_str().starts_with("settings/label"))
+            .map(|child| match child.layout.width {
+                Length::Fixed(width) => width,
+                _ => 0.0,
+            })
+            .sum();
+        let fills = line
+            .children
+            .iter()
+            .filter(|child| {
+                matches!(child.content, UiContent::Button(_))
+                    && !matches!(child.layout.width, Length::Fixed(_))
+            })
+            .count()
+            .max(1) as f32;
+        let fill = ((text_width - fixed - gaps) / fills).max(0.0);
+        for child in &mut line.children {
+            let width = match child.layout.width {
+                Length::Fixed(width) => width,
+                _ => fill,
+            };
+            if let UiContent::Button(button) = &mut child.content
+                && let Some(words) = button
+                    .spec
+                    .visual_label
+                    .clone()
+                    .filter(|words| !words.is_empty())
+            {
+                button.spec.visual_label = Some(crate::native_ui::fit_native_button_label(
+                    &words,
+                    crate::native_ui::text_button_label_room(&button.spec, width),
+                ));
+            }
+        }
+    }
+    let one_line = !row
+        .children
+        .iter()
+        .any(|child| child.key.as_str().starts_with("settings/controls/"));
+    if one_line {
+        // The label fills what the controls leave: it is no button.
+        fit_line(row, text_width);
+        return;
+    }
+    for child in &mut row.children {
+        if child.key.as_str().starts_with("settings/controls/")
+            || child.key.as_str().starts_with("settings/label-line/")
+            || child.key.as_str().starts_with("settings/reset-line/")
+        {
+            fit_line(child, text_width);
+        }
+    }
+}
+
 /// The Reset action of a Follow-system slot on a list:
 /// `settings/theme-slot-reset/dark` or `…/light`.
 const THEME_SLOT_RESET_PREFIX: &str = "settings/theme-slot-reset/";
 
 /// A list theme row's trailing node: `reset` (a Reset button) where the row
 /// has one, else the place it keeps, so its controls line up with the rows
-/// around it. Top rows have neither, and a compact list's one-line switch
-/// rows keep no place (nothing there lines up beside them).
+/// around it. Top rows have neither, and a compact list's one-line Preview
+/// side and Browse rows keep no place: they end where the card's stacked
+/// pickers do. (The Follow system switch keeps Reset's place as every switch
+/// row does, [`theme_mode_row`].)
 fn theme_row_trailing(
     host: ThemeRowsHost,
     key: &str,
@@ -17057,7 +18748,6 @@ fn theme_slot_row(
     side: aterm_types::Appearance,
     name: &str,
     width: SettingsWidth,
-    viewport: LogicalRect,
     text_width: f32,
 ) -> UiNode {
     let title = match side {
@@ -17100,20 +18790,15 @@ fn theme_slot_row(
                 ),
         )
     };
-    let button_text_width = match control_width {
-        Length::Fixed(width) => (width - 48.0).max(0.0),
-        _ => top_compact_choice_text_width(viewport),
-    };
     let control = UiNode::new(
         action.clone(),
         UiContent::Button(
             Control::new(
                 ButtonSpec {
                     label: format!("{title}: {shown}"),
-                    visual_label: Some(crate::native_ui::fit_native_button_label(
-                        &shown,
-                        button_text_width,
-                    )),
+                    // Fitted to the width the row draws it at
+                    // ([`fit_theme_row_buttons`]).
+                    visual_label: Some(shown.clone()),
                     visual_icon: None,
                     trailing_icon: Some(ButtonIcon::ChevronDown),
                     description: Some(format!(
@@ -17184,26 +18869,12 @@ fn theme_slot_row(
             pending,
         )
     });
-    let mut controls = vec![control];
-    // A list's way to the Theme Showcase (Settings ▸ Themes) sits on the
-    // card's first row, as it does beside one theme's Color theme control.
-    if side == aterm_types::Appearance::Dark
-        && matches!(
-            host,
-            ThemeRowsHost::List {
-                modified_only: false,
-                ..
-            }
-        )
-    {
-        controls.push(theme_browse_button(width));
-    }
     theme_card_row(
         &key,
         title,
         title,
         (tags, worst),
-        controls,
+        vec![control],
         theme_row_trailing(host, &key, reset, width),
         width,
         text_width,
@@ -17232,10 +18903,9 @@ fn theme_preview_side_row(
             Control::new(
                 ButtonSpec {
                     label: format!("Preview: {shown}"),
-                    visual_label: Some(crate::native_ui::fit_native_button_label(
-                        shown,
-                        (button_width - 48.0).max(0.0),
-                    )),
+                    // Fitted to the width the row draws it at
+                    // ([`fit_theme_row_buttons`]).
+                    visual_label: Some(shown.to_string()),
                     visual_icon: None,
                     trailing_icon: None,
                     description: Some(
@@ -17327,6 +18997,21 @@ fn theme_mode_row(
         }
         worst.state.push(CHANGED_WORD.to_string());
     }
+    // A LIST LAYS THE SWITCH ROW OUT AS EVERY SWITCH ROW ON THE PAGE
+    // ([`switch_tail`]): on one line wherever the column leaves its name room
+    // beside the switch and the place Reset keeps, the switch ending before
+    // that place, so the Reset turning it on can bring (a written pair of
+    // aterm's own) takes the place and never moves the switch out from under
+    // the pointer; a column too narrow for that (large text) stacks the name
+    // over the switch, which is pushed to the control line's end, Reset or
+    // its place seated by the rule every stacked switch row keeps
+    // ([`theme_card_row`]). Top keeps no Reset, and stacks only where its
+    // name cannot keep its floor beside the switch.
+    let list = matches!(host, ThemeRowsHost::List { .. });
+    let inline = !list
+        || width != SettingsWidth::Compact
+        || compact_row_inline(&EditKind::Bool, text_width, true);
+    let trailing = list.then(|| reset.unwrap_or_else(|| reset_slot(THEME_MODE_KEY)));
     let controls = vec![
         UiNode::new(
             THEME_MODE_ACTION,
@@ -17362,15 +19047,15 @@ fn theme_mode_row(
         ),
     ];
     theme_card_row(
-        "theme-mode",
+        THEME_MODE_KEY,
         name,
         "Follow system",
         (tags, worst),
         controls,
-        theme_row_trailing(host, "theme-mode", reset, width),
+        trailing,
         width,
         text_width,
-        true,
+        inline,
     )
 }
 
@@ -17390,9 +19075,14 @@ fn top_preview(
         cx.terminal_scale,
         cx.semantic_font.as_ref(),
     )?;
+    let focused = state
+        .common
+        .last_focus
+        .as_ref()
+        .is_some_and(|focus| focus.as_str() == semantic_key);
     Some(crate::settings_preview::preview_node(
         semantic_key,
-        spec,
+        spec.with_focus_ring(focused),
         height,
     ))
 }
@@ -17454,9 +19144,11 @@ struct TopPreviews {
     trail: f32,
 }
 
-/// A Top Settings specimen at `height`, so a short page keeps the specimen
-/// beside its control — never under the least it demonstrates at (one whole
-/// row at the authored size), which a large font size raises. Returns the
+/// A Top Settings specimen at most `height`, so a short page keeps the
+/// specimen beside its control — never under the least it demonstrates at
+/// (one whole row at the authored size), which a large font size raises —
+/// and ending on a whole row, so no part-row of empty terminal shows under
+/// its last ([`SettingsPreviewSpec::whole_rows_at_most`]). Returns the
 /// height it takes.
 fn top_preview_at(
     state: &SettingsViewState,
@@ -17467,7 +19159,7 @@ fn top_preview_at(
 ) -> Option<(UiNode, f32)> {
     top_preview(state, key, semantic_key, height, cx).map(|mut node| {
         let height = match &node.content {
-            UiContent::SettingsPreview(spec) => spec.minimum_height(height),
+            UiContent::SettingsPreview(spec) => spec.whole_rows_at_most(height),
             _ => height,
         };
         node.layout.height = Length::Fixed(height);
@@ -17505,19 +19197,12 @@ fn top_cards(
     };
     let compact = width == SettingsWidth::Compact;
 
-    let mut color_rows: Vec<(UiNode, f32)> = Vec::new();
-    color_rows.extend(preview(
-        prefs::EDIT_THEME,
-        "settings/top/theme/preview",
-        previews.theme,
-    ));
-    color_rows.extend(theme_card_rows(
-        state,
-        ThemeRowsHost::Top,
-        width,
-        cx.viewport,
-        text_width,
-        || {
+    // The Follow system switch leads the card, over the colour sample and
+    // the rows it governs: turning it changes the rows under it, and the
+    // sample's height with them where the card balances a column, never
+    // anything above the switch, which stays under the pointer.
+    let mut color_rows: Vec<(UiNode, f32)> =
+        theme_card_rows(state, ThemeRowsHost::Top, width, text_width, || {
             top_card_row(
                 state,
                 prefs::EDIT_THEME,
@@ -17527,8 +19212,15 @@ fn top_cards(
                 text_width,
                 true,
             )
-        },
-    ));
+        });
+    let sample_at = usize::from(!color_rows.is_empty());
+    if let Some(sample) = preview(
+        prefs::EDIT_THEME,
+        "settings/top/theme/preview",
+        previews.theme,
+    ) {
+        color_rows.insert(sample_at, sample);
+    }
     color_rows.extend(row(prefs::EDIT_WINDOW_THEME, None));
     let colors = top_split_card(
         "theme",
@@ -17634,38 +19326,29 @@ fn top_cards(
     [colors, text, trail, playful]
 }
 
-/// Remove the Theme row's "Browse themes…" ([`theme_browse_button`]) from
-/// `row`, wherever its layout seated it.
-fn strip_theme_browse_button(row: &mut UiNode) {
-    row.children
-        .retain(|child| child.key.as_str() != THEMES_BROWSE_ROW_KEY);
-    for child in &mut row.children {
-        child
-            .children
-            .retain(|node| node.key.as_str() != THEMES_BROWSE_ROW_KEY);
-    }
-}
-
-/// The compact Theme row's Browse arrow: a whole hit target at every size.
+/// The compact Theme Showcase row's Browse arrow: a whole hit target at
+/// every size, where the labelled button would leave the row no name.
 fn theme_browse_arrow_width() -> f32 {
     44.0 * settings_text_scale().min(1.5)
 }
 
-/// "Browse themes…": Settings ▸ Themes, the Theme Showcase, from the Theme
-/// row (its node key is [`THEMES_BROWSE_ROW_KEY`], its action the route's).
-/// A stacked row seats it beside the control as an arrow, leaving the
-/// theme's name the rest of the line.
-fn theme_browse_button(width: SettingsWidth) -> UiNode {
+/// "Browse themes…": Settings ▸ Themes, the Theme Showcase (its node key is
+/// [`THEMES_BROWSE_ROW_KEY`], its action the route's), labelled wherever its
+/// row holds the label beside the row's name, else an arrow.
+fn theme_browse_button(text_width: f32) -> UiNode {
     let spec = ButtonSpec::new("Browse themes")
         .description("Browse and customize themes in Settings, Themes");
-    let (spec, button_width) = if width == SettingsWidth::Compact {
+    let visual = "Browse themes\u{2026}";
+    let labelled = native_button_width_for(visual);
+    // The row's name keeps at least its own words beside the button.
+    let name_room = crate::native_ui::native_button_label_width(THEME_SHOWCASE_ROW_LABEL);
+    let (spec, button_width) = if labelled + 12.0 + name_room + 8.0 <= text_width {
+        (spec.visual_label(visual), labelled)
+    } else {
         (
             spec.visual_icon(ButtonIcon::Forward),
             theme_browse_arrow_width(),
         )
-    } else {
-        let visual = "Browse themes\u{2026}";
-        (spec.visual_label(visual), native_button_width_for(visual))
     };
     UiNode::new(
         THEMES_BROWSE_ROW_KEY,
@@ -17680,8 +19363,38 @@ fn theme_browse_button(width: SettingsWidth) -> UiNode {
     )
 }
 
+/// The Theme Showcase row's name.
+const THEME_SHOWCASE_ROW_LABEL: &str = "More themes";
+
+/// The theme card's way to Settings ▸ Themes on a list: a row of its own,
+/// one control tall at every width, its button ending where every other
+/// row's control ends (the trailing place keeps it clear of the Reset
+/// column), so no picker shares its line.
+fn theme_showcase_row(host: ThemeRowsHost, width: SettingsWidth, text_width: f32) -> UiNode {
+    theme_card_row(
+        "theme-browse",
+        THEME_SHOWCASE_ROW_LABEL,
+        THEME_SHOWCASE_ROW_LABEL,
+        (RowTags::default(), RowTags::default()),
+        vec![theme_browse_button(text_width)],
+        theme_row_trailing(host, "theme-browse", None, width),
+        width,
+        text_width,
+        true,
+    )
+}
+
 /// One Top Settings control row, laid out on one line on a compact card
 /// wherever its label has room.
+///
+/// THE ROW RULE EVERY SETTING ROW KEEPS ([`finished_setting_row`]): a
+/// one-line row leaves its name its floor ([`one_line_name_floor`]) beside
+/// everything on its line — in the ordinary form (the Sound page's) that
+/// includes the place Reset keeps whether or not aterm.toml sets the key
+/// ([`RowForm::List`]) — its control giving up width first, down to its
+/// least; where the name still cannot keep its floor, the row stacks its
+/// control under it. (Music effects at 1.25× on a phone-width Sound page was
+/// measured without Reset's place, and its name got 80 of its 96pt.)
 fn top_card_row(
     state: &SettingsViewState,
     key: &str,
@@ -17691,61 +19404,81 @@ fn top_card_row(
     text_width: f32,
     direct: bool,
 ) -> Option<(UiNode, f32)> {
-    let with_reset = !direct && state.is_explicit(key);
+    let with_reset = !direct;
     let kind = state.field_by_key(key).map(|field| field.kind);
     let inline = width == SettingsWidth::Compact
         && kind.is_some_and(|kind| compact_row_inline(&kind, text_width, with_reset));
-    let row_width = if inline { SettingsWidth::Medium } else { width };
-    top_setting_row(state, key, projected, row_width, viewport, direct).map(|top| {
-        let TopRow {
-            mut row,
-            name,
-            tags,
-            worst,
-            timing,
-        } = top;
-        if inline {
-            row.layout.height = Length::Fixed(compact_inline_row_height());
-        }
-        // The name, wrapped to the room its control (and in the ordinary
-        // form, Reset's place) leaves, never cut; the ordinary form's tags
-        // after it where they fit, else on its second line.
-        let stacked = row_width == SettingsWidth::Compact;
-        if stacked {
-            seat_stacked_reset(&mut row, &name, text_width);
-        } else if let Some(kind) = kind {
-            // A column too narrow for the name beside the control (the Text
-            // band's half column): the control gives up width first, down to
-            // its least, so the name keeps its floor on one line.
-            let short = one_line_name_floor(&name) - row_label_room(&row, false, text_width);
-            let least = match kind {
-                EditKind::Bool => f32::INFINITY,
-                EditKind::Enum { .. } | EditKind::Theme => COMPACT_INLINE_CHOICE_MIN,
-                _ => 200.0,
-            };
-            if short > 0.01
-                && let Some(control) = row
-                    .children
-                    .get_mut(1)
-                    .filter(|control| control.key.as_str().starts_with("settings/control/"))
-                && let Length::Fixed(current) = control.layout.width
+    let mut row_width = if inline { SettingsWidth::Medium } else { width };
+    let mut top = top_setting_row(state, key, projected.clone(), row_width, viewport, direct)?;
+    if row_width != SettingsWidth::Compact
+        && let Some(kind) = kind
+    {
+        // A column too narrow for the name beside the control (the Text
+        // band's half column): the control gives up width first, down to
+        // its least, so the name keeps its floor on one line.
+        let short = one_line_name_floor(&top.name) - row_label_room(&top.row, false, text_width);
+        let least = match kind {
+            EditKind::Bool => f32::INFINITY,
+            EditKind::Enum { .. } | EditKind::Theme => COMPACT_INLINE_CHOICE_MIN,
+            _ => 200.0,
+        };
+        if short > 0.01 {
+            match top
+                .row
+                .children
+                .get_mut(1)
+                .filter(|control| control.key.as_str().starts_with("settings/control/"))
+                .map(|control| (control.layout.width, control))
             {
-                control.layout.width = Length::Fixed((current - short).max(least.min(current)));
+                Some((Length::Fixed(current), control)) if current - short + 0.01 >= least => {
+                    control.layout.width = Length::Fixed(current - short);
+                }
+                _ => {
+                    row_width = SettingsWidth::Compact;
+                    top = top_setting_row(state, key, projected, row_width, viewport, direct)?;
+                }
             }
         }
-        let room = row_label_room(&row, stacked, text_width);
-        let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, false);
-        if direct {
-            top_row_label_paints_only(&mut row);
+    }
+    let stacked = row_width == SettingsWidth::Compact;
+    let TopRow {
+        mut row,
+        name,
+        tags,
+        worst,
+        timing,
+    } = top;
+    if !stacked && width == SettingsWidth::Compact {
+        row.layout.height = Length::Fixed(compact_inline_row_height());
+    }
+    // The name, wrapped to the room its control (and in the ordinary form,
+    // Reset's place) leaves, never cut; the ordinary form's tags after it
+    // where they fit, else on its second line.
+    if stacked {
+        // A card's column too narrow for a short choice's segments side by
+        // side (Window appearance at the largest text on a phone-width card,
+        // in a UI face wider than the one it was drawn in) sets them on as
+        // few lines as their labels allow, as a page's stacked row does
+        // ([`wrap_segments`]), rather than cut a label to "Li…".
+        if let Some(field) = state.field_by_key(key)
+            && !segments_hold_their_labels(field, text_width)
+        {
+            wrap_segments(&mut row, key, text_width);
         }
-        // The ordinary form (the Sound page's) paints the row's note, as
-        // every page's row does; the direct form leaves it to its control.
-        let note = (!direct).then(|| prefs::footnote_of(key)).flatten();
-        let detail = row_second_line(&placement, timing, note, text_width);
-        let row = with_row_detail(row, key, &detail, stacked);
-        let height = top_row_height(&row, row_width);
-        (row, height)
-    })
+        seat_stacked_reset(&mut row, &name, text_width);
+    }
+    let room = row_label_room(&row, stacked, text_width);
+    let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, false);
+    if direct {
+        top_row_label_paints_only(&mut row);
+    }
+    // The ordinary form (the Sound page's) paints the row's note, as every
+    // page's row does; the direct form leaves it to its control.
+    let note = (!direct).then(|| prefs::footnote_of(key)).flatten();
+    let detail = row_second_line(&placement, timing, note, text_width);
+    let row = with_row_detail(row, key, &detail, stacked);
+    let height = top_row_height(&row, row_width);
+    Some((row, height))
 }
 
 /// THE MUSIC EFFECTS SWITCH, with its status where it is silent or partly
@@ -17787,13 +19520,25 @@ fn music_effects_rows(
 
 /// Fit a listed Top card to `limit`: its description moves up beside its
 /// title where that one line holds both, else yields; then specimen height
-/// yields toward the least it still demonstrates at. Its title stays: a card
+/// yields toward the least it still demonstrates at, a whole row at a time,
+/// only as far as a control row needs. Its title stays: a card
 /// that still does not fit is split by the list, its title over each part,
 /// so no card shows without one. A compact page keeps the Playful effects
 /// note this way, the one place on screen that says what Sparkle words and
 /// Keyword kitties do.
-fn constrain_top_split_card(mut card: SplitCard, limit: f32, text_width: f32) -> SplitCard {
-    if card.height() > limit
+fn constrain_top_split_card(
+    mut card: SplitCard,
+    limit: f32,
+    reserve: f32,
+    text_width: f32,
+) -> SplitCard {
+    // The description moves up beside the title where one line holds both,
+    // else yields, where the card in its tallest form (`reserve` taller: the
+    // colours card with the rows Follow system brings,
+    // [`theme_rows_reserve`]) does not fit the screen whole. Decided on that
+    // form in either mode, so turning the switch never moves what is above
+    // it.
+    if card.height() + reserve > limit
         && let Some(index) = card
             .rows
             .iter()
@@ -17804,20 +19549,61 @@ fn constrain_top_split_card(mut card: SplitCard, limit: f32, text_width: f32) ->
             card.head = vec![head];
         }
     }
-    let excess = card.height() - limit;
-    if excess > 0.0
-        && let Some((node, height)) = card
-            .rows
-            .iter_mut()
-            .find(|(node, _)| matches!(node.content, UiContent::SettingsPreview(_)))
-    {
-        let floor = match &node.content {
-            UiContent::SettingsPreview(spec) => spec.minimum_height(48.0),
-            _ => 48.0,
-        };
-        let reduced = (*height - excess).max(floor.min(*height));
-        *height = reduced;
-        node.layout.height = Length::Fixed(reduced);
+    if card.height() <= limit {
+        return card;
+    }
+    let preview_at = card
+        .rows
+        .iter()
+        .position(|(node, _)| matches!(node.content, UiContent::SettingsPreview(_)));
+    let spec = preview_at.and_then(|index| match &card.rows[index].0.content {
+        UiContent::SettingsPreview(spec) => Some((**spec).clone()),
+        _ => None,
+    });
+    let set_preview = |card: &mut SplitCard, height: f32| {
+        if let Some(index) = preview_at {
+            card.rows[index].1 = height;
+            card.rows[index].0.layout.height = Length::Fixed(height);
+        }
+    };
+    let natural = preview_at.map_or(0.0, |index| card.rows[index].1);
+    let floor = spec
+        .as_ref()
+        .map_or(natural, |spec| spec.minimum_height(48.0).min(natural));
+    // What a first screen of the card holds with the specimen at its floor:
+    // the most it can, so what the specimen may take is what does not cost
+    // one of those controls.
+    let mut at_floor = card.clone();
+    set_preview(&mut at_floor, floor);
+    if let (Some(spec), Some(_)) = (spec.as_ref(), preview_at) {
+        // THE SPECIMEN YIELDS ONLY UNTIL THE LIST GAINS A CONTROL ROW: the
+        // tallest whole-row height, natural down to its floor a row at a
+        // time, at which the card still fits whole where it fits whole at
+        // the floor, else the first screen still shows every control it
+        // shows with the specimen at its floor. Cut in whole rows, so no
+        // part-row of empty terminal shows under the last one.
+        let whole_at_floor = at_floor.height() <= limit + 0.01;
+        let wanted = at_floor.first_screen_controls(limit);
+        let mut height = spec.whole_rows_at_most(natural);
+        loop {
+            let mut trial = card.clone();
+            set_preview(&mut trial, height);
+            let keeps = if whole_at_floor {
+                trial.height() <= limit + 0.01
+            } else {
+                trial.first_screen_controls(limit) >= wanted
+            };
+            if keeps || height <= floor + 0.01 {
+                break;
+            }
+            let next = spec.whole_rows_at_most(height - 1.0).max(floor);
+            if next >= height - 0.01 {
+                height = floor;
+                break;
+            }
+            height = next;
+        }
+        set_preview(&mut card, height.max(floor));
     }
     // The specimen at its floor is still one stop under the card's head
     // ([`SplitCard::stops`]), and a stop taller than the list's room
@@ -18190,6 +19976,7 @@ fn cursor_styles_page(
         kept: settings_status_bar_cost(state, width, cx.viewport),
     };
     let (mut out, mut used) = pinned_heading(
+        state,
         width,
         cx.viewport,
         gap,
@@ -18222,19 +20009,29 @@ fn cursor_styles_page(
         }
         None => state.cursor_style_note.borrow().clone(),
     };
-    let status = if let Some((status, _)) = live {
-        Some(note(&status))
+    // The note's rungs, longest first: its sentence, then the short one a
+    // narrower room pins where the sentence would not ([`cursor_style_note_rungs`]).
+    let status: Vec<(UiNode, f32)> = if let Some((status, _)) = live {
+        cursor_style_note_rungs(&status)
+            .into_iter()
+            .map(|text| note(&text))
+            .collect()
     } else if let Some((was, now)) = retired {
         // A choice retired the note: the page says what changed in its
-        // place, as tall as the note was, so the rows under it keep their
-        // place under the pointer.
-        let (_, was_height) = note(&was);
-        let (mut node, height) = note(now);
-        let height = height.max(was_height);
-        node.layout.height = Length::Fixed(height);
-        Some((node, height))
+        // place, as tall as the note was (each rung as tall as that rung
+        // of it), so the rows under it keep their place under the pointer.
+        cursor_style_note_rungs(&was)
+            .into_iter()
+            .map(|was| {
+                let (_, was_height) = note(&was);
+                let (mut node, height) = note(now);
+                let height = height.max(was_height);
+                node.layout.height = Length::Fixed(height);
+                (node, height)
+            })
+            .collect()
     } else {
-        None
+        Vec::new()
     };
     let saved = saved_cursor_style(state);
     let pending = state.config_key_pending(prefs::EDIT_CURSOR_TRAIL_STYLE);
@@ -18339,22 +20136,29 @@ fn cursor_styles_page(
         scroll::tallest_span(items, gap, room).max(card)
     };
     let mut stops_before_styles = 0;
-    let status = match status {
-        Some((node, height))
-            if pin_room - (height + gap) - preview.as_ref().map_or(0.0, |_| floor + gap)
-                >= tallest_in(&items, pin_room) =>
-        {
+    // The first rung that pins: the sentence where it does, else its short
+    // one, so a UI face that wraps the sentence onto another line (Noto Sans
+    // at the 80x24 window) still keeps the note in view.
+    let pins = |height: f32| {
+        pin_room - (height + gap) - preview.as_ref().map_or(0.0, |_| floor + gap)
+            >= tallest_in(&items, pin_room)
+    };
+    let pinned = status.iter().position(|(_, height)| pins(*height));
+    let mut rungs = status.into_iter();
+    let status = match pinned {
+        Some(rung) => rungs.nth(rung).map(|(node, height)| {
             room -= height + gap;
             steady_room -= height + gap;
-            Some((node, height))
-        }
-        Some((node, height)) => {
-            // The stop above the first style row, which a landing shows.
-            items.insert(0, ListItem::Card(Box::new(node), height));
-            stops_before_styles = 1;
+            (node, height)
+        }),
+        None => {
+            if let Some((node, height)) = rungs.next() {
+                // The stop above the first style row, which a landing shows.
+                items.insert(0, ListItem::Card(Box::new(node), height));
+                stops_before_styles = 1;
+            }
             None
         }
-        None => None,
     };
     if let Some(mut preview) = preview {
         let tallest = tallest_in(&items, steady_room);
@@ -18406,6 +20210,24 @@ fn cursor_styles_page(
     out
 }
 
+/// The Cursor Styles note's Serious Mode sentence ([`cursor_style_status`]).
+const SERIOUS_STYLE_NOTE: &str = "Serious Mode is on, so your cursor has no trail. Choosing a style turns Serious Mode off; other effects stay off.";
+
+/// [`SERIOUS_STYLE_NOTE`] in fewer words, for a room that pins the note only
+/// where it takes one line fewer: what the sentence says, nothing dropped.
+const SERIOUS_STYLE_NOTE_SHORT: &str =
+    "Serious Mode is on, so no trail. Choosing a style turns it off; other effects stay off.";
+
+/// The words the Cursor Styles page may paint for `note`, longest first: the
+/// note, then its short sentence where it has one.
+fn cursor_style_note_rungs(note: &str) -> Vec<String> {
+    let mut rungs = vec![note.to_string()];
+    if note == SERIOUS_STYLE_NOTE {
+        rungs.push(SERIOUS_STYLE_NOTE_SHORT.to_string());
+    }
+    rungs
+}
+
 /// Why the saved style is not what the list would suggest: Serious Mode, the
 /// effects switch, or a style aterm cannot draw. With it, what the page says
 /// in its place once that reason is gone (a choice turned Serious Mode off,
@@ -18417,8 +20239,7 @@ fn cursor_style_status(
 ) -> Option<(String, Option<&'static str>)> {
     if serious_mode_active(state, None, motion) {
         return Some((
-            "Serious Mode is on, so your cursor has no trail. Choosing a style turns Serious Mode off; other effects stay off."
-                .to_string(),
+            SERIOUS_STYLE_NOTE.to_string(),
             Some("Serious Mode is off now."),
         ));
     }
@@ -18588,6 +20409,10 @@ fn cursor_style_tuning_bound(
         .filter_map(|key| {
             let index = state.field_index_of(key)?;
             let field = &state.legacy.fields[index];
+            // Without its note: a row and its note that outgrow the room
+            // list the note as blocks of their own after it (the card's
+            // `finished_row_stops`), so the stop it must show whole is the
+            // row.
             let finished = finished_setting_row(
                 state, index, field, false, width, text_width, None, None, None,
             );
@@ -18649,13 +20474,20 @@ fn cursor_style_tuning_card(
         empty.height() + empty.gap
     };
     let room = (room - chrome).max(0.0);
-    let keys: Vec<(&str, Option<prefs::RowNote<'_>>)> = prefs::CURSOR_STYLE_TUNING_KEYS
+    let shown = prefs::CURSOR_STYLE_TUNING_KEYS
         .iter()
+        .copied()
         .filter(|key| {
             tuning_row_shown(state, key)
                 && trail_style_uses(&resolved, key, !configured_cursor_is_block(state))
         })
-        .map(|key| (*key, None))
+        .collect::<Vec<_>>();
+    // Each row's note as every page draws them ([`prefs::row_notes`]): a
+    // row's own inside it, one several share once after the last of them.
+    let keys: Vec<(&str, Option<prefs::RowNote<'_>>)> = shown
+        .iter()
+        .copied()
+        .zip(prefs::row_notes(&shown))
         .collect();
     // The box places its rows' facts alike ([`place_box_facts`]); a colour
     // row's open picker goes under it, one stop with it.
@@ -18664,7 +20496,9 @@ fn cursor_style_tuning_card(
     let rows = finished
         .iter()
         .flat_map(|finished| {
-            let mut stops = finished_row_stops(finished, None);
+            // A row and its note that outgrow the room list the note as
+            // blocks of their own after it, so its control is reached whole.
+            let mut stops = finished_row_stops(finished, Some(room));
             if let Some((row, height)) = stops.first_mut() {
                 let picked = with_open_color_picker(
                     state,
@@ -18741,9 +20575,14 @@ fn cursor_style_link_row(state: &SettingsViewState, text_width: f32) -> (UiNode,
                         )),
                         visual_icon: None,
                         trailing_icon: Some(ButtonIcon::Forward),
+                        // What the saved style draws leads, then where the
+                        // button goes.
                         description: Some(
-                            "Opens Cursor Styles, where every style previews as you point at it"
-                                .to_string(),
+                            listed_cursor_styles(state)
+                                .into_iter()
+                                .find(|style| style.value.eq_ignore_ascii_case(&saved))
+                                .map_or_else(String::new, |style| format!("{}. ", style.description))
+                                + "Opens Cursor Styles, where every style previews as you point at it",
                         ),
                         badge: false,
                         swatches: Vec::new(),
@@ -18848,7 +20687,10 @@ fn top_split_card(
 /// A page control on a row of its own, laid out the way [`page_setting_row`]
 /// lays a registry row out at this width: its label leading, the control
 /// after it, or the control under the label on a compact page too narrow for
-/// both on one line.
+/// both on one line — and at any width where the label's whole words and
+/// [`PAGE_CONTROL_FLOOR`] of control do not fit `text_width` side by side.
+/// Beside its label the control is its natural width or what the label
+/// leaves it, never more than the row holds.
 fn page_control_row(
     key: &str,
     label: &str,
@@ -18856,9 +20698,20 @@ fn page_control_row(
     width: SettingsWidth,
     text_width: f32,
 ) -> (UiNode, f32) {
-    let inline =
-        width == SettingsWidth::Compact && compact_row_inline(&EditKind::Float, text_width, false);
-    let compact = width == SettingsWidth::Compact && !inline;
+    let natural = 300.0 * settings_text_scale().min(1.25);
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let beside =
+        (text_width - crate::tray_raster::ui_text_width_for(face, label, px) - 12.0).min(natural);
+    let fits_beside = beside >= PAGE_CONTROL_FLOOR * settings_text_scale().min(1.25);
+    let inline = width == SettingsWidth::Compact
+        && fits_beside
+        && compact_row_inline(&EditKind::Float, text_width, false);
+    let compact = (width == SettingsWidth::Compact && !inline) || !fits_beside;
+    let width = if compact {
+        SettingsWidth::Compact
+    } else {
+        width
+    };
     let label_node = UiNode::new(
         format!("{key}/label"),
         UiContent::Text(TextSpec {
@@ -18876,7 +20729,7 @@ fn page_control_row(
     control.layout.width = if compact {
         Length::Fill
     } else {
-        Length::Fixed(300.0 * settings_text_scale().min(1.25))
+        Length::Fixed(beside)
     };
     control.layout.height = Length::Fill;
     let height = if inline {
@@ -18899,6 +20752,11 @@ fn page_control_row(
         height,
     )
 }
+
+/// The least a [`page_control_row`]'s control keeps beside its label at 1×
+/// (a slider's track with its readout); with less, the control goes under
+/// the label.
+const PAGE_CONTROL_FLOOR: f32 = 140.0;
 
 /// A group card's padding (the registry pages' and [`page_group_card`]'s):
 /// cards stacked on a page share these side insets, so their words and
@@ -19114,6 +20972,7 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
     let text_width = settings_group_text_width(viewport, width);
     let gap = settings_page_gap(state, width, viewport);
     let (mut out, used) = pinned_heading(
+        state,
         width,
         viewport,
         gap,
@@ -19318,18 +21177,35 @@ fn top_settings_page(
             .map(|choice| choice.key.as_str())
             .filter(|key| top_picker_previews(key))
         {
-            let preview_height = if cx.viewport.height < 620.0 {
-                64.0
-            } else {
-                renderer_preview_height(width).min(112.0)
-            };
-            if let Some(preview) = top_preview(
-                state,
-                key,
-                "settings/top/choice-preview",
-                preview_height,
-                cx,
-            ) {
+            // The one rule every picker host shares
+            // ([`picker_host_preview_height`]): the room the picker's least
+            // form leaves, between the specimen's least and its usual height.
+            let gap = settings_page_gap(state, width, cx.viewport);
+            let used: f32 = out
+                .iter()
+                .map(|node| match node.layout.height {
+                    Length::Fixed(height) => height + gap,
+                    _ => gap,
+                })
+                .sum();
+            let themed = state
+                .choice_picker
+                .as_ref()
+                .is_some_and(|picker| picker.themes.is_some());
+            let room = settings_list_body_height(state, width, cx.viewport)
+                - used
+                - gap
+                - choice_picker_floor(themed, width);
+            let natural = renderer_preview_height(width).min(132.0);
+            if let Some(mut preview) =
+                top_preview(state, key, "settings/top/choice-preview", natural, cx)
+            {
+                let least = match &preview.content {
+                    UiContent::SettingsPreview(spec) => spec.minimum_height(48.0),
+                    _ => 48.0,
+                };
+                preview.layout.height =
+                    Length::Fixed(picker_host_preview_height(least, natural, room));
                 out.push(preview);
             }
         }
@@ -19344,6 +21220,7 @@ fn top_settings_page(
     let gap = settings_page_gap(state, width, cx.viewport);
     let body = settings_list_body_height(state, width, cx.viewport);
     let (mut out, mut used) = pinned_heading(
+        state,
         width,
         cx.viewport,
         gap,
@@ -19405,13 +21282,37 @@ fn top_settings_page(
             trail: preview,
         },
     );
+    let reserve = theme_rows_reserve(
+        state,
+        ThemeRowsHost::Top,
+        width,
+        text_width,
+        top_card_row(
+            state,
+            prefs::EDIT_THEME,
+            None,
+            width,
+            cx.viewport,
+            text_width,
+            true,
+        )
+        .map(|(_, height)| height),
+        6.0,
+    );
     out.push(scroll::list_page_peeking(
         state,
         "settings/top/list",
         "Top settings",
         cards
             .into_iter()
-            .map(|card| ListItem::Split(constrain_top_split_card(card, room, text_width)))
+            .map(|card| {
+                let reserve = if card.key == "settings/top/theme" {
+                    reserve
+                } else {
+                    0.0
+                };
+                ListItem::Split(constrain_top_split_card(card, room, reserve, text_width))
+            })
             .collect(),
         room,
         gap,
@@ -19455,17 +21356,43 @@ fn top_settings_grid(
         let right = trail.1 + STACK_GAP + playful.1;
         ([colors, trail, playful], left, right)
     };
+    // Each specimen ends on a whole row ([`top_preview_at`]): sizes are
+    // reckoned from the whole-row heights the cards really take, so a cut
+    // asked for is the cut made, and what a column's slack leaves past a
+    // specimen's last row is its card's foot, never part of a row of empty
+    // terminal.
+    let spec_of = |key: &str, semantic: &str| {
+        top_preview(state, key, semantic, natural, cx).and_then(|node| match node.content {
+            UiContent::SettingsPreview(spec) => Some(*spec),
+            _ => None,
+        })
+    };
+    let theme_spec = spec_of(prefs::EDIT_THEME, "settings/top/theme/preview");
+    let trail_spec = spec_of(
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        "settings/top/cursor-trail/preview",
+    );
+    let whole = |spec: &Option<SettingsPreviewSpec>, height: f32| {
+        spec.as_ref()
+            .map_or(height, |spec| spec.whole_rows_at_most(height))
+    };
     let mut previews = TopPreviews {
-        theme: natural,
+        theme: whole(&theme_spec, natural),
         text: natural,
-        trail: natural,
+        trail: whole(&trail_spec, natural),
     };
     let (_, left, right) = measure(previews);
     if left > room {
-        previews.theme = (natural - (left - room)).max(PREVIEW_FLOOR);
+        previews.theme = whole(
+            &theme_spec,
+            (previews.theme - (left - room)).max(PREVIEW_FLOOR),
+        );
     }
     if right > room {
-        previews.trail = (natural - (right - room)).max(PREVIEW_FLOOR);
+        previews.trail = whole(
+            &trail_spec,
+            (previews.trail - (right - room)).max(PREVIEW_FLOOR),
+        );
     }
     // Measured again: a specimen never goes under its own least height,
     // which a large font size raises past the floor asked for.
@@ -19476,21 +21403,16 @@ fn top_settings_grid(
     if right > left {
         // The color sample grows to show every row it has, never into an
         // empty terminal under them.
-        let whole = top_preview(
-            state,
-            prefs::EDIT_THEME,
-            "settings/top/theme/preview",
-            previews.theme,
-            cx,
-        )
-        .and_then(|node| match &node.content {
-            UiContent::SettingsPreview(spec) => spec.whole_color_sample_height(),
-            _ => None,
-        })
-        .unwrap_or(previews.theme);
-        previews.theme += (right - left).min((whole - previews.theme).max(0.0));
+        let most = theme_spec
+            .as_ref()
+            .and_then(SettingsPreviewSpec::whole_color_sample_height)
+            .unwrap_or(previews.theme);
+        previews.theme = whole(
+            &theme_spec,
+            previews.theme + (right - left).min((most - previews.theme).max(0.0)),
+        );
     } else if left > right {
-        previews.trail += (left - right).min(96.0);
+        previews.trail = whole(&trail_spec, previews.trail + (left - right).min(96.0));
     }
     let ([mut colors, trail, mut playful], left, right) = measure(previews);
     let columns_height = left.max(right);
@@ -19715,7 +21637,7 @@ fn file_viewer_name() -> &'static str {
 fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth) -> Vec<UiNode> {
     const WHAT_MANUAL_IS: &str = "Edit aterm.toml directly, with completion and error checking.";
     let gap = settings_page_gap(state, width, cx.viewport);
-    let (mut out, used) = pinned_heading(width, cx.viewport, gap, "Manual", WHAT_MANUAL_IS);
+    let (mut out, used) = pinned_heading(state, width, cx.viewport, gap, "Manual", WHAT_MANUAL_IS);
     let room =
         (settings_list_body_height(state, width, cx.viewport) - used).max(scaled_control_height());
     let text_width =
@@ -19799,13 +21721,47 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
             has_path,
         ),
     ];
-    // Three buttons to a row where each keeps its label whole; else each a
-    // row of its own, so a short screen scrolls to every one.
-    let stacked = text_width < 3.0 * 150.0 * settings_text_scale().min(1.5) + 16.0;
+    // THREE BUTTONS TO A ROW WHERE EACH KEEPS ITS WORDS IN ITS THIRD, measured
+    // in the room each label has (its lead, its arrow); else each a row of
+    // its own the card's width, so a short screen scrolls to every one, its
+    // words on as many lines as that needs ([`button_words_in`]). A guess
+    // from the text size (capped at 1.5×) set three in a row on a 150 × 48
+    // window at 2× text, and painted "Open aterm.t…".
+    let third = ((text_width - 16.0) / 3.0).max(0.0);
+    let words_fit = |node: &UiNode, width: f32| match &node.content {
+        UiContent::Button(button) => {
+            let label = button
+                .spec
+                .visual_label
+                .as_deref()
+                .unwrap_or(&button.spec.label);
+            crate::native_ui::native_button_label_width(label)
+                <= crate::native_ui::text_button_label_room(&button.spec, width)
+                    + crate::native_ui::TEXT_FIT_SLACK
+        }
+        _ => true,
+    };
+    let stacked = !actions.iter().all(|node| words_fit(node, third));
+    let mut stacked_height = 0.0;
+    let actions = actions.map(|mut node| {
+        if stacked && let UiContent::Button(button) = &mut node.content {
+            let label = button
+                .spec
+                .visual_label
+                .clone()
+                .unwrap_or_else(|| button.spec.label.clone());
+            let (words, lines) = button_words_in(&button.spec, &label, &[], text_width);
+            button.spec.visual_label = Some(words);
+            let height = crate::native_ui::native_button_height_for_lines(lines, control);
+            node.layout.height = Length::Fixed(height);
+            stacked_height += height + 10.0;
+        }
+        node
+    });
     // Where the page shows no subtitle, the card says what Manual is.
     let mut rows = Vec::new();
     let mut explanation_height = 0.0;
-    if !page_chrome(width, cx.viewport).1 {
+    if !page_chrome(state, width, cx.viewport).1 {
         let (node, height) = wrapped_copy_node(
             "settings/manual/explanation",
             WHAT_MANUAL_IS,
@@ -19831,8 +21787,12 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
             .children(actions.into_iter().collect()),
         );
     }
-    let buttons = if stacked { 3.0 } else { 1.0 };
-    let height = 28.0 + explanation_height + path_height + buttons * (control + 10.0);
+    let buttons_height = if stacked {
+        stacked_height
+    } else {
+        control + 10.0
+    };
+    let height = 28.0 + explanation_height + path_height + buttons_height;
     let card = UiNode::new(
         "settings/manual/card",
         UiContent::Group(GroupSpec::new("aterm.toml").style(StyleRef::Secondary)),
@@ -19909,17 +21869,17 @@ fn manual_search_result_node(keys: &[String], expanded: bool, text_width: f32) -
     } else {
         MANUAL_SEARCH_KEYS_SHOWN
     };
-    let heading = UiNode::new(
+    // Its caption wraps to the card, never cut ("ONLY IN ATE…" at large
+    // text on a phone-width page).
+    let (mut heading, heading_height) = caption_node(
         "settings/search/manual-result/detail",
-        UiContent::Text(TextSpec {
-            text: MANUAL_ONLY_GROUP.to_ascii_uppercase(),
-            role: SemanticRole::Heading,
-            style: StyleRef::Quiet,
-        }),
-    )
-    .layout(Layout::default().height(Length::Fixed(group_heading_label_height())));
+        &MANUAL_ONLY_GROUP.to_ascii_uppercase(),
+        text_width,
+    );
+    let heading_height = heading_height.max(group_heading_label_height());
+    heading.layout.height = Length::Fixed(heading_height);
     let mut rows = vec![heading];
-    let mut height = 28.0 + group_heading_label_height();
+    let mut height = 28.0 + heading_height;
     // The label's room in a row: past the icon slot (40) and the chevron's
     // (34) and the painter's 12pt end.
     let label_room = (text_width - 86.0).max(48.0);
@@ -19934,26 +21894,37 @@ fn manual_search_result_node(keys: &[String], expanded: bool, text_width: f32) -
         let joined = name.map(|name| format!("{name} ({key})"));
         // Its name says what it shows: the name and the key.
         let spoken = joined.clone().unwrap_or_else(|| (*key).to_string());
-        let (visual, name_under) = match (joined, name) {
-            (Some(joined), _)
-                if crate::native_ui::native_button_label_width(&joined) <= label_room =>
-            {
-                (joined, None)
-            }
-            (_, name) => (
-                crate::native_ui::fit_native_button_label(key, label_room),
-                name,
-            ),
+        let fits_icon_row = |words: &str| {
+            crate::native_ui::native_button_label_width(words)
+                <= label_room + crate::native_ui::TEXT_FIT_SLACK
         };
+        // The key whole: on the icon row where it is one line there; else
+        // without the icon, its lines centred beside the arrow (the row less
+        // twice the arrow's 38pt), broken after a `.` or a `_` and never with
+        // a hyphen a key could hold ("cur…" at 22 columns).
+        let (visual, name_under, icon, key_lines) = match (joined, name) {
+            (Some(joined), _) if fits_icon_row(&joined) => (joined, None, true, 1),
+            (_, name) if fits_icon_row(key) => ((*key).to_string(), name, true, 1),
+            (_, name) => {
+                let lines = key_lines(key, (text_width - 76.0).max(0.0));
+                let count = lines.len();
+                (lines.join("\n"), name, false, count)
+            }
+        };
+        let mut spec = ButtonSpec::new(spoken)
+            .description(format!("Opens aterm.toml at {key}"))
+            .trailing_icon(ButtonIcon::Forward);
+        if icon {
+            spec = spec.visual_icon(ButtonIcon::Document);
+        }
+        // After the icon, which clears a visual label it finds.
+        let spec = spec.visual_label(visual);
+        let key_height = crate::native_ui::native_button_height_for_lines(key_lines, row_height);
         let button = UiNode::new(
             format!("settings/search/manual-result/key/{ordinal}"),
             UiContent::Button(
                 Control::new(
-                    ButtonSpec::new(spoken)
-                        .description(format!("Opens aterm.toml at {key}"))
-                        .visual_icon(ButtonIcon::Document)
-                        .visual_label(visual)
-                        .trailing_icon(ButtonIcon::Forward),
+                    spec,
                     ActionId::new(format!("settings/manual/open-match/{ordinal}")),
                 )
                 .style(StyleRef::Navigation),
@@ -19962,29 +21933,34 @@ fn manual_search_result_node(keys: &[String], expanded: bool, text_width: f32) -
         .layout(
             Layout::default()
                 .width(Length::Fill)
-                .height(Length::Fixed(row_height)),
+                .height(Length::Fixed(key_height)),
         );
         let Some(name) = name_under else {
             rows.push(button);
-            height += 6.0 + row_height;
+            height += 6.0 + key_height;
             continue;
         };
         // The name under its key, from the label's start, so the pair reads
-        // as one entry; one stop of the card with its button.
-        let (mut name, name_height) = wrapped_copy_node(
+        // as one entry; one stop of the card with its button. Under a key
+        // without its icon, the card's whole column.
+        let (lead, name_room) = if icon {
+            (40.0, label_room)
+        } else {
+            (0.0, text_width)
+        };
+        let (mut name, name_height) = wrapped_words_node(
             &format!("settings/search/manual-result/name/{ordinal}"),
             name,
-            SemanticRole::Text,
-            StyleRef::Quiet,
-            label_room,
+            (SemanticRole::Text, StyleRef::Quiet),
+            name_room,
             18.0_f32.max(16.0 * settings_text_scale()),
-            None,
         );
+        name.layout.height = Length::Fixed(name_height);
         name.layout.padding = Insets {
-            left: 40.0,
+            left: lead,
             ..Insets::all(0.0)
         };
-        let entry_height = row_height + name_height;
+        let entry_height = key_height + name_height;
         rows.push(
             UiNode::new(
                 format!("settings/search/manual-result/entry/{ordinal}"),
@@ -20034,6 +22010,46 @@ fn manual_search_result_node(keys: &[String], expanded: bool, text_width: f32) -
     .children(rows)
 }
 
+/// An aterm.toml key's lines in a box `width` wide: broken after a `.` or a
+/// `_` where the key is wider than the box, as full as each line holds, and
+/// inside a part only where the part alone is wider, with no mark (a hyphen
+/// would read as one of the key's characters; [`wrap_to_box_marked`]).
+fn key_lines(key: &str, width: f32) -> Vec<String> {
+    let measure = |line: &str| crate::native_ui::native_button_label_width(line);
+    let fits = |line: &str| measure(line) <= width + crate::native_ui::TEXT_FIT_SLACK;
+    let mut parts = Vec::new();
+    let mut from = 0;
+    for (at, c) in key.char_indices() {
+        if matches!(c, '.' | '_') && at + 1 < key.len() {
+            parts.push(&key[from..=at]);
+            from = at + 1;
+        }
+    }
+    parts.push(&key[from..]);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for part in parts {
+        if fits(&format!("{line}{part}")) {
+            line.push_str(part);
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if fits(part) {
+            line = part.to_string();
+        } else {
+            let mut broken = wrap_to_box_marked(part, width, &measure, "");
+            line = broken.pop().unwrap_or_default();
+            lines.extend(broken);
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 /// A search result that opens a page: the page by its own name and words, or
 /// a setting whose control that page draws itself rather than as a row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20044,6 +22060,80 @@ struct PageHit {
     setting: Option<&'static str>,
     /// The control the page opens on.
     focus: Option<String>,
+}
+
+/// `fixed` and then each roster name's lowercase spelling, once: a page's
+/// words over a roster that is read, never copied, so the page is found by a
+/// name the roster gains with no list to edit. Search compares lowercase.
+fn roster_words(
+    fixed: &[&'static str],
+    names: impl Iterator<Item = &'static str>,
+) -> Vec<&'static str> {
+    let mut words = fixed.to_vec();
+    for name in names {
+        let lower = name.to_ascii_lowercase();
+        if !words.iter().any(|word| *word == lower) {
+            let lower: &'static str = if lower == name {
+                name
+            } else {
+                Box::leak(lower.into_boxed_str())
+            };
+            words.push(lower);
+        }
+    }
+    words
+}
+
+/// The Harness page's words: what a person comes to do there, then the word
+/// and the product name of every agent it has a switch for
+/// ([`aterm_phase::Program::harness_table`]: `agy`, `Antigravity CLI`,
+/// `Gemini CLI` …), from the roster the switches are drawn from.
+fn harness_route_keywords() -> &'static [&'static str] {
+    static WORDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| {
+        roster_words(
+            &[
+                "agent",
+                "agents",
+                "coding agents",
+                "harness",
+                "supervise",
+                "supervisor",
+                "autopilot",
+                "approve",
+                "approvals",
+                "questions",
+            ],
+            aterm_phase::Program::ALL
+                .into_iter()
+                .filter(|agent| agent.harness_table())
+                .flat_map(|agent| [agent.name(), agent.product()]),
+        )
+    })
+}
+
+/// The AI CLIs page's words: what a person comes to do there (sign one in,
+/// choose the preferred one, see reviews), then the id and the product name
+/// of every CLI it lists ([`aterm_agent::ai::connector::ROWS`]).
+fn ai_route_keywords() -> &'static [&'static str] {
+    static WORDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| {
+        roster_words(
+            &[
+                "ai",
+                "ai cli",
+                "review",
+                "reviews",
+                "login",
+                "sign in",
+                "preferred",
+                "fleet",
+            ],
+            aterm_agent::ai::connector::ROWS
+                .iter()
+                .flat_map(|cli| [cli.id, cli.product]),
+        )
+    })
 }
 
 /// What a page is called besides its name: the words the page itself shows,
@@ -20163,37 +22253,8 @@ fn route_keywords(route: SettingsRoute) -> &'static [&'static str] {
         SettingsRoute::Packages => &["toolchain", "tools", "alab", "atpkg", "cargo", "rustc"],
         SettingsRoute::Messages => &["notices", "log", "history", "alerts"],
         SettingsRoute::About => &["version", "build", "license", "credits"],
-        SettingsRoute::Harness => &[
-            "agent",
-            "agents",
-            "coding agents",
-            "harness",
-            "claude",
-            "claude code",
-            "codex",
-            "supervise",
-            "supervisor",
-            "autopilot",
-            "approve",
-            "approvals",
-            "questions",
-        ],
-        // The AI CLIs answer to their own words and to what a person comes
-        // to do there: sign one in, choose the preferred one, see reviews.
-        SettingsRoute::Ai => &[
-            "ai",
-            "ai cli",
-            "codex",
-            "agy",
-            "antigravity",
-            "muse",
-            "review",
-            "reviews",
-            "login",
-            "sign in",
-            "preferred",
-            "fleet",
-        ],
+        SettingsRoute::Harness => harness_route_keywords(),
+        SettingsRoute::Ai => ai_route_keywords(),
         SettingsRoute::Tabs => &[
             "tab control",
             "control panel",
@@ -20291,39 +22352,39 @@ fn search_page_hits(state: &SettingsViewState, query: &str) -> Vec<PageHit> {
     // saved spelling, from the table the page draws, so the two cannot drift;
     // the result opens the page on that style's row. Off is left out: "off"
     // is about switches everywhere else.
-    for entry in CURSOR_STYLE_ENTRIES
+    for row in aterm_effects::cursor_glow::spellings::TRAIL_STYLES
         .iter()
-        .filter(|entry| entry.group != CursorStyleGroup::Off)
+        .filter(|row| row.style.is_some())
     {
         scratch.clear();
-        scratch.extend(entry.name.chars().map(|c| c.to_ascii_lowercase()));
+        scratch.extend(row.label.chars().map(|c| c.to_ascii_lowercase()));
         // Its name, its saved spelling and every alias of it ("classic
         // mono" finds Classic, "flat rainbow" Flat rainbow).
         let aliases = prefs::CURSOR_TRAIL_STYLE_ALIASES
             .iter()
-            .filter(|(_, canonical)| *canonical == entry.value)
+            .filter(|(_, canonical)| *canonical == row.name)
             .map(|(alias, _)| *alias);
-        let words = [scratch.as_str(), entry.value].into_iter().chain(aliases);
+        let words = [scratch.as_str(), row.name].into_iter().chain(aliases);
         let Some(score) =
             crate::native_config_language::query_match_score(words, query).map(SearchRank::own)
         else {
             continue;
         };
-        let focus = Some(cursor_style_row_key(entry.value));
+        let focus = Some(cursor_style_row_key(row.name));
         match hits
             .iter_mut()
             .find(|hit| hit.route == SettingsRoute::CursorStyles)
         {
             Some(hit) if score < hit.score || (score == hit.score && hit.focus.is_none()) => {
                 hit.score = score;
-                hit.setting = Some(entry.name);
+                hit.setting = Some(row.label);
                 hit.focus = focus;
             }
             Some(_) => {}
             None => hits.push(PageHit {
                 route: SettingsRoute::CursorStyles,
                 score,
-                setting: Some(entry.name),
+                setting: Some(row.label),
                 focus,
             }),
         }
@@ -20339,8 +22400,9 @@ fn search_page_hits(state: &SettingsViewState, query: &str) -> Vec<PageHit> {
     hits
 }
 
-/// Search's page results, first in the list: each opens its page.
-fn search_pages_node(hits: &[PageHit]) -> UiNode {
+/// Search's page results, first in the list: each opens its page, its
+/// words whole in the card's column `text_width` ([`search_page_button`]).
+fn search_pages_node(hits: &[PageHit], text_width: f32) -> UiNode {
     let row_height = scaled_control_height();
     let heading = UiNode::new(
         "settings/search/pages/heading",
@@ -20352,6 +22414,7 @@ fn search_pages_node(hits: &[PageHit]) -> UiNode {
     )
     .layout(Layout::default().height(Length::Fixed(group_heading_label_height())));
     let mut rows = vec![heading];
+    let mut height = 28.0 + group_heading_label_height();
     for hit in hits {
         let route = hit.route;
         let (label, visual) = match hit.setting {
@@ -20361,15 +22424,15 @@ fn search_pages_node(hits: &[PageHit]) -> UiNode {
             ),
             None => (format!("Open {}", route.label()), route.label().to_string()),
         };
+        let (spec, lines) = search_page_button(route, label, &visual, text_width);
+        let button_height = crate::native_ui::native_button_height_for_lines(lines, row_height);
+        height += 4.0 + button_height;
         rows.push(
             UiNode::new(
                 format!("settings/search/page{}", route.path()),
                 UiContent::Button(
                     Control::new(
-                        ButtonSpec::new(label)
-                            .visual_icon(route_icon(route))
-                            .visual_label(visual)
-                            .trailing_icon(ButtonIcon::Forward),
+                        spec,
                         ActionId::new(format!("settings/search/page{}", route.path())),
                     )
                     .style(StyleRef::Navigation),
@@ -20378,11 +22441,10 @@ fn search_pages_node(hits: &[PageHit]) -> UiNode {
             .layout(
                 Layout::default()
                     .width(Length::Fill)
-                    .height(Length::Fixed(row_height)),
+                    .height(Length::Fixed(button_height)),
             ),
         );
     }
-    let height = 28.0 + group_heading_label_height() + hits.len() as f32 * (4.0 + row_height);
     UiNode::new(
         "settings/search/pages",
         UiContent::Group(GroupSpec::new("Pages").style(StyleRef::Secondary)),
@@ -20394,6 +22456,50 @@ fn search_pages_node(hits: &[PageHit]) -> UiNode {
             .gap(4.0),
     )
     .children(rows)
+}
+
+/// A PAGE RESULT'S BUTTON `width` wide, its words never cut: the page's
+/// icon, its words and its arrow on one line where the row holds them (an
+/// icon row's label starts [`crate::native_ui::NAVIGATION_LABEL_LEAD`] in
+/// and stops the arrow's 34pt and [`crate::native_ui::NAVIGATION_LABEL_END`]
+/// short of its end, and paints one line); else without the icon, a text
+/// row whose words go on lines beside the arrow ([`whole_button_words_in`]);
+/// else without the arrow too ([`button_words_in`]). Its name keeps the page
+/// and the setting whole. Returns the spec and its label's line count. A
+/// 24-column window at 2× text painted "✦ C… →" for Cursor Motion.
+fn search_page_button(
+    route: SettingsRoute,
+    label: String,
+    visual: &str,
+    width: f32,
+) -> (ButtonSpec, usize) {
+    let icon_room = width
+        - crate::native_ui::NAVIGATION_LABEL_LEAD
+        - crate::native_ui::NAVIGATION_LABEL_END
+        - 34.0;
+    if width >= 96.0
+        && crate::native_ui::native_button_label_width(visual)
+            <= icon_room + crate::native_ui::TEXT_FIT_SLACK
+    {
+        let spec = ButtonSpec::new(label)
+            .visual_icon(route_icon(route))
+            .visual_label(visual)
+            .trailing_icon(ButtonIcon::Forward);
+        return (spec, 1);
+    }
+    // Without its icon a navigation row centres its words on the whole row,
+    // so beside the arrow's 38pt a line holds the row less twice that: the
+    // room a left-set text button 28pt narrower has ([`button_words_in`]
+    // measures for one).
+    let arrowed = ButtonSpec::new(label.clone()).trailing_icon(ButtonIcon::Forward);
+    if let Some((words, lines)) =
+        whole_button_words_in(&arrowed, visual, &[], (width - 28.0).max(0.0))
+    {
+        return (arrowed.visual_label(words), lines);
+    }
+    let bare = ButtonSpec::new(label);
+    let (words, lines) = button_words_in(&bare, visual, &[], width);
+    (bare.visual_label(words), lines)
 }
 
 /// What else is true of a key only aterm.toml holds: when a save applies, an
@@ -20694,9 +22800,15 @@ fn settings_fields_page(
         (width == SettingsWidth::Compact).then(|| compact_page_budget(state, cx.viewport));
     let landscape = compact_budget.is_some_and(|budget| budget.side_by_side_pager);
     let show_renderer_preview_now = show_renderer_preview;
-    // Short or large-type compact hosts take the leading cards' compact forms.
-    let compact_cards = width == SettingsWidth::Compact
-        && (cx.viewport.height <= 420.0 || settings_text_scale() > 1.25);
+    // How much of the MACOS ACCESS block's verdict leads its actions row:
+    // measured against the first screen ([`macos_access_lead`]), never a
+    // window-height cutoff.
+    let access_lead = state
+        .macos_access
+        .as_ref()
+        .map_or(AccessLead::Whole, |access| {
+            macos_access_lead(state, width, cx.viewport, access)
+        });
     // THE MACOS ACCESS BLOCK (design §3.4/§3.7) leads the Security list, and
     // the "This Mac" status rides under the Universal Control row, only once
     // the host has published a posture, so a unit test and every non-macOS
@@ -20722,8 +22834,7 @@ fn settings_fields_page(
         .map(|access| {
             devtools_card(
                 access,
-                compact_cards,
-                DevToolsCardFit::stacked(state, width, cx.viewport, access, compact_cards),
+                DevToolsCardFit::stacked(state, width, cx.viewport, access, access_lead),
             )
         });
     // The Display faces card owns `display_font` on Text & Fonts at every
@@ -20845,7 +22956,7 @@ fn settings_fields_page(
 
     let gap = settings_page_gap(state, width, cx.viewport);
     let body = settings_list_body_height(state, width, cx.viewport);
-    let (mut out, mut used) = pinned_heading(width, cx.viewport, gap, title, subtitle);
+    let (mut out, mut used) = pinned_heading(state, width, cx.viewport, gap, title, subtitle);
     let preview_for = |maximum: f32| {
         show_renderer_preview_now
             .then(|| {
@@ -20877,18 +22988,25 @@ fn settings_fields_page(
             });
             used = 0.0;
         }
-        // The picker keeps at least its header and two rows of choices.
-        let picker_floor = 3.0 * scaled_control_height() + 36.0;
-        let mut preview = preview_for((body - used - gap - picker_floor).max(48.0));
-        if width == SettingsWidth::Compact
-            && cx.viewport.height < 620.0
-            && let Some(preview) = preview.as_mut()
-        {
-            let floor = match &preview.content {
-                UiContent::SettingsPreview(spec) => spec.minimum_height(96.0),
-                _ => 96.0,
+        // The picker keeps at least its least form (a section heading over
+        // two rows of choices), the preview the rest, by the one rule every
+        // picker host shares ([`picker_host_preview_height`]).
+        let themed = state
+            .choice_picker
+            .as_ref()
+            .is_some_and(|picker| picker.themes.is_some());
+        let room = body - used - gap - choice_picker_floor(themed, width);
+        let mut preview = preview_for(renderer_preview_height(width));
+        if let Some(preview) = preview.as_mut() {
+            let least = match &preview.content {
+                UiContent::SettingsPreview(spec) => spec.minimum_height(48.0),
+                _ => 48.0,
             };
-            preview.layout.height = Length::Fixed(floor);
+            preview.layout.height = Length::Fixed(picker_host_preview_height(
+                least,
+                fixed_height(preview),
+                room,
+            ));
         }
         out.extend(preview);
         out.extend(choice_picker_node(state, width, cx.viewport, &out));
@@ -20907,75 +23025,100 @@ fn settings_fields_page(
     } else {
         None
     };
-    let summary = summary_text.map(|text| {
-        let count = UiNode::new(
+    // The count, on as many lines as the page's column needs, never cut ("2
+    // pages · 19 s…" at 2× on a phone-width page); Modified's beside its
+    // Reset All where both fit on a line, else over it.
+    let column = settings_page_content_width(cx.viewport.width, width, FORM_MEASURE);
+    let count_node = |text: &str, room: f32| {
+        wrapped_words_node(
             "settings/results-range",
-            UiContent::Text(TextSpec {
-                text,
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
+            text,
+            (SemanticRole::Status, StyleRef::Quiet),
+            room,
+            22.0_f32.max(18.0 * settings_text_scale()),
         )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(summary_height)),
-        );
+    };
+    let summary = summary_text.map(|text| {
         if !modified_only {
+            let (count, height) = count_node(&text, column);
+            summary_height = height;
             return count;
         }
         // Modified's count carries Reset All, which asks before it clears.
-        summary_height = scaled_control_height();
-        let mut count = count;
-        count.layout.height = Length::Fill;
+        let control_height = scaled_control_height();
+        let (visual, lines) = button_words("Reset All\u{2026}", &[], column);
+        let button_width = if lines > 1 {
+            column
+        } else {
+            (crate::native_ui::native_button_label_width(&visual) + 28.0).min(column)
+        };
+        let button_height = crate::native_ui::native_button_height_for_lines(lines, control_height);
         let resettable = reset_all_count(state);
+        let reset_all = UiNode::new(
+            "settings/modified/reset-all",
+            UiContent::Button(
+                Control::new(
+                    ButtonSpec::new(if resettable == 0 && !manual_overrides.is_empty() {
+                        "Reset All: keys only in aterm.toml stay; use Reset on each row".to_string()
+                    } else if resettable == 0 {
+                        "Reset All: nothing to reset".to_string()
+                    } else {
+                        format!(
+                            "Reset All {}\u{2026}",
+                            counted_value_label("setting", "settings", resettable)
+                        )
+                    })
+                    .visual_label(visual),
+                    ActionId::new("settings/reset-all"),
+                )
+                .state(ControlState {
+                    enabled: resettable > 0
+                        && !state.config_patch_pending()
+                        && !state.reset_all_confirmation,
+                    ..ControlState::default()
+                })
+                .style(StyleRef::Quiet),
+            ),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fixed(button_width))
+                .height(Length::Fixed(button_height)),
+        );
+        let beside = column - button_width - 8.0;
+        let (count, _) = count_node(&text, beside.max(0.0));
+        if lines == 1 && beside > 0.0 && matches!(count.content, UiContent::Text(_)) {
+            summary_height = control_height;
+            let mut count = count;
+            count.layout.width = Length::Fill;
+            count.layout.height = Length::Fill;
+            let mut reset_all = reset_all;
+            reset_all.layout.height = Length::Fill;
+            return UiNode::new(
+                "settings/modified/summary",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::row()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(summary_height))
+                    .gap(8.0),
+            )
+            .children(vec![count, reset_all]);
+        }
+        let (count, count_height) = count_node(&text, column);
+        summary_height = count_height + 6.0 + button_height;
         UiNode::new(
             "settings/modified/summary",
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
         .layout(
-            Layout::row()
+            Layout::column()
                 .width(Length::Fill)
                 .height(Length::Fixed(summary_height))
-                .gap(8.0),
+                .gap(6.0),
         )
-        .children(vec![
-            count,
-            UiNode::new(
-                "settings/modified/reset-all",
-                UiContent::Button(
-                    Control::new(
-                        ButtonSpec::new(if resettable == 0 && !manual_overrides.is_empty() {
-                            "Reset All: keys only in aterm.toml stay; use Reset on each row"
-                                .to_string()
-                        } else if resettable == 0 {
-                            "Reset All: nothing to reset".to_string()
-                        } else {
-                            format!(
-                                "Reset All {}…",
-                                counted_value_label("setting", "settings", resettable)
-                            )
-                        })
-                        .visual_label("Reset All…"),
-                        ActionId::new("settings/reset-all"),
-                    )
-                    .state(ControlState {
-                        enabled: resettable > 0
-                            && !state.config_patch_pending()
-                            && !state.reset_all_confirmation,
-                        ..ControlState::default()
-                    })
-                    .style(StyleRef::Quiet),
-                ),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(
-                        crate::native_ui::native_button_label_width("Reset All…") + 28.0,
-                    ))
-                    .height(Length::Fixed(summary_height)),
-            ),
-        ])
+        .children(vec![count, reset_all])
     });
     // The summary is pinned only where the body still holds it, as the
     // preview is: where a tall question over a short window leaves the page
@@ -21017,12 +23160,12 @@ fn settings_fields_page(
             &mut plan,
             macos_access_card(
                 access,
-                compact_cards,
+                access_lead,
                 settings_card_text_width(cx.viewport, width),
             ),
             macos_access_height(
                 access,
-                compact_cards,
+                access_lead,
                 settings_card_text_width(cx.viewport, width),
             ),
         );
@@ -21034,7 +23177,7 @@ fn settings_fields_page(
     }
     // A search lists the pages it found first.
     if !page_hits.is_empty() {
-        let node = search_pages_node(&page_hits);
+        let node = search_pages_node(&page_hits, settings_group_text_width(cx.viewport, width));
         let height = fixed_height(&node);
         card(&mut plan, node, height);
     }
@@ -21042,7 +23185,11 @@ fn settings_fields_page(
         && manual_keys.is_empty()
         && manual_overrides.is_empty()
         && page_hits.is_empty()
-        && let Some(node) = settings_empty_node(global_search, modified_only)
+        && let Some(node) = settings_empty_node(
+            global_search,
+            modified_only,
+            settings_page_content_width(cx.viewport.width, width, FORM_MEASURE),
+        )
     {
         let height = fixed_height(&node);
         card(&mut plan, node, height);
@@ -21107,6 +23254,17 @@ fn settings_fields_page(
         // The card's 14pt padding below its rows, less the 4pt gap over the
         // first row.
         let id = plan.group(head, head - 10.0);
+        // Its rows are 4pt apart in the card, each stop 4pt taller for it.
+        plan.set_row_gap(id, 4.0);
+        // A hard edge lands on its caption's top, never through its words:
+        // the caption and the reason under it, inside the card's padding.
+        if shows_caption || reason.is_some() {
+            plan.set_caption(
+                id,
+                SETTINGS_GROUP_CARD_INSET,
+                head - SETTINGS_GROUP_CARD_INSET,
+            );
+        }
         debug_assert_eq!(id, groups.len());
         groups.push(FieldGroup::Settings {
             caption,
@@ -21180,11 +23338,20 @@ fn settings_fields_page(
                     let height = fixed_height(&row);
                     Some((row, height))
                 };
-                let rows =
-                    theme_card_rows(state, host, width, cx.viewport, group_text_width, single);
+                let rows = theme_card_rows(state, host, width, group_text_width, single);
+                // The card's first value row: the one after the Follow system
+                // switch, which leads it.
+                let value_row = rows
+                    .iter()
+                    .position(|(node, _)| {
+                        node.key.as_str() != format!("settings/row/{THEME_MODE_KEY}")
+                    })
+                    .unwrap_or(0);
                 for (ordinal, (node, _)) in rows.into_iter().enumerate() {
+                    // A refused value says why under the card's value row (one
+                    // theme's own row already says it: `single`).
                     let node = match state.field_errors.get(field.key) {
-                        Some(message) if ordinal == 0 && !theme_single => {
+                        Some(message) if ordinal == value_row && !theme_single => {
                             with_row_error(node, field.key, message, group_text_width)
                         }
                         _ => node,
@@ -21243,13 +23410,50 @@ fn settings_fields_page(
                 keys.push(UiKey::new(format!("settings/reset/{}", field.key)));
             }
             keys.extend(color_picker::open_color_picker_keys(state, field.key));
-            plan.row(id, row_height + 4.0, keys);
-            plan.measure(&row, row_height);
-            plan.add_segments(&row);
-            stops.push(FieldStop::Row {
-                position,
-                node: Box::new(row),
-            });
+            // A ROW STILL TALLER THAN A SCREEN SHOWS UNDER ITS GROUP'S HEAD
+            // (its name on six lines over its switch at 2× text in a
+            // 22-column window) is listed a part at a time, as a card's row
+            // is ([`scroll::row_parts`]): its first part the row's stop, the
+            // rest the stops right after it, each control with the part that
+            // draws it. Its switch was on no screen. A row with an open
+            // picker the room holds stays one with it.
+            let limit = footnote_room - head - 4.0;
+            let parts = if row_height > limit + 0.01
+                && !(scroll::holds_open_disclosure(&row) && row_height <= footnote_room + 0.01)
+            {
+                scroll::row_parts((row, row_height), limit.max(1.0))
+            } else {
+                vec![(row, row_height)]
+            };
+            // Each key with the part that draws it; one no part draws, with
+            // the first.
+            let drawn = parts
+                .iter()
+                .map(|(node, _)| scroll::focus_keys(node))
+                .collect::<Vec<_>>();
+            for (part, (node, height)) in parts.into_iter().enumerate() {
+                let part_keys = keys
+                    .iter()
+                    .filter(
+                        |key| match drawn.iter().position(|keys| keys.contains(key)) {
+                            Some(at) => at == part,
+                            None => part == 0,
+                        },
+                    )
+                    .cloned()
+                    .collect::<Vec<_>>();
+                plan.row(id, height + 4.0, part_keys);
+                plan.measure(&node, height);
+                plan.add_segments(&node);
+                stops.push(if part == 0 {
+                    FieldStop::Row {
+                        position,
+                        node: Box::new(node),
+                    }
+                } else {
+                    FieldStop::Under(Box::new(node))
+                });
+            }
             for (node, height) in split_note {
                 plan.row(id, height + 4.0, Vec::new());
                 plan.measure(&node, height);
@@ -21263,16 +23467,28 @@ fn settings_fields_page(
             }
             // The This Mac status is the stop after its row, Apply Now in it.
             if show_machine_status && field.key == prefs::EDIT_MACHINE_UNIVERSAL_CONTROL {
-                let (node, height) = machine_status_node(
-                    packages,
-                    group_text_width,
-                    compact_cards,
-                    debugger_row_drawn,
-                );
-                plan.row(id, height + 4.0, scroll::focus_keys(&node));
-                plan.measure(&node, height);
-                plan.add_segments(&node);
-                stops.push(FieldStop::Under(Box::new(node)));
+                // The whole status where a screen holds it (its stop, under the
+                // group's head); a screen too short for that drops what this
+                // launch changed, never Apply Now.
+                let whole =
+                    machine_status_node(packages, group_text_width, false, debugger_row_drawn);
+                let (node, height) = if head + whole.1 + 4.0 <= footnote_room + 0.01 {
+                    whole
+                } else {
+                    machine_status_node(packages, group_text_width, true, debugger_row_drawn)
+                };
+                // Still taller than a screen under the group's head (its
+                // sentence on nine lines at 2× text in a 22-column window), a
+                // part at a time, each a stop ([`scroll::row_parts`]): its end
+                // was on no screen.
+                for (node, height) in
+                    scroll::row_parts((node, height), (footnote_room - head - 4.0).max(1.0))
+                {
+                    plan.row(id, height + 4.0, scroll::focus_keys(&node));
+                    plan.measure(&node, height);
+                    plan.add_segments(&node);
+                    stops.push(FieldStop::Under(Box::new(node)));
+                }
             }
         }
         // The Display faces card lists like a box of settings, a stop per
@@ -21306,6 +23522,12 @@ fn settings_fields_page(
     // apart by their place.
     if !manual_overrides.is_empty() {
         let id = plan.group(group_heading_height(), group_heading_height() - 10.0);
+        plan.set_row_gap(id, 4.0);
+        plan.set_caption(
+            id,
+            SETTINGS_GROUP_CARD_INSET,
+            group_heading_height() - SETTINGS_GROUP_CARD_INSET,
+        );
         debug_assert_eq!(id, groups.len());
         groups.push(FieldGroup::Settings {
             caption: MANUAL_ONLY_GROUP.to_string(),
@@ -21343,11 +23565,14 @@ fn settings_fields_page(
     // THE LIVE PREVIEW IS PINNED, never a page of its own, and keeps one
     // height on every screen: it yields height toward its floor before any
     // screen of the list would lose its second stop (so every screen holds
-    // two stops wherever two adjacent ones can share one), and yields
-    // altogether where even at its floor (one whole row of its specimen at
-    // the authored size) a screen could not hold the list's tallest stop
-    // whole: a short host shows no preview, never a header over a sliver of
-    // cut glyphs.
+    // two stops wherever two adjacent ones can share one). Where even at its
+    // floor (one whole row of its specimen at the authored size) a screen
+    // could not hold the list's tallest stop whole under it, it is the
+    // list's FIRST STOP instead, as Top Settings' colour sample is a row of
+    // its card: it scrolls with the list and is always reachable, never
+    // removed (it is the one place the effect of a change shows while the
+    // terminal is behind Settings), and the Preview side switch still
+    // steers a preview the page draws.
     let tallest = (0..plan.len())
         .map(|stop| plan.span(stop..stop + 1))
         .fold(0.0, f32::max);
@@ -21370,6 +23595,16 @@ fn settings_fields_page(
             preview.layout.height = Length::Fixed(height);
             out.push(preview);
             used += height + gap;
+        } else {
+            // The list's first stop: as tall as leaves the stop after it a
+            // place on the same screen, between its floor and its natural
+            // height (and never past the list's room).
+            let list_room = (body - used).max(0.0);
+            let next = plan.span(0..1.min(plan.len()));
+            let height = (list_room - gap - next).clamp(floor, natural.min(list_room).max(floor));
+            preview.layout.height = Length::Fixed(height);
+            plan.insert_card(0, height, Vec::new());
+            stops.insert(0, FieldStop::Card(preview));
         }
     }
     out.extend(summary);
@@ -21379,7 +23614,7 @@ fn settings_fields_page(
         settings_list_overhang(state, width, cx.viewport),
     );
 
-    let view = state.seat_scroll(&plan);
+    let view = state.seat_scroll(&mut plan);
     // The stops after the screen peek in under it (on the last screen, the
     // stops before it over it).
     let drawn = scroll::drawn_stops(&plan, &view);
@@ -21516,7 +23751,7 @@ fn settings_fields_page(
 
 /// What an empty search or Modified says. An ordinary page with no rows of
 /// its own says nothing: it has no list to be empty.
-fn settings_empty_node(searching: bool, modified_only: bool) -> Option<UiNode> {
+fn settings_empty_node(searching: bool, modified_only: bool, width: f32) -> Option<UiNode> {
     let text = if searching {
         "No settings or aterm.toml keys match this search."
     } else if modified_only {
@@ -21524,10 +23759,18 @@ fn settings_empty_node(searching: bool, modified_only: bool) -> Option<UiNode> {
     } else {
         return None;
     };
-    Some(
-        UiNode::new("settings/empty", UiContent::Text(TextSpec::text(text)))
-            .layout(Layout::default().height(Length::Fixed(48.0))),
-    )
+    // On as many lines as the page's column needs, never cut ("Settings you
+    // c…" at 1.5× on a phone-width page).
+    let style = TextSpec::text(text);
+    let (mut node, height) = wrapped_words_node(
+        "settings/empty",
+        text,
+        (style.role, style.style),
+        width,
+        22.0_f32.max(18.0 * settings_text_scale()),
+    );
+    node.layout.height = Length::Fixed(height.max(48.0));
+    Some(node)
 }
 
 /// How many pages and settings a search lists. Keys only aterm.toml holds
@@ -21560,8 +23803,18 @@ fn push_field_card(
 ) {
     match ListItem::of(node, height) {
         ListItem::Split(split) if !split.rows.is_empty() => {
+            // Its rows fitted to the screen as every list's are.
+            let split = if split.outgrows(room) {
+                split.fitted(room)
+            } else {
+                split
+            };
             let head = split.height_of_head();
             let id = plan.group(head, split.height_of_lead());
+            plan.set_row_gap(id, split.gap);
+            if let Some((top, bottom)) = split.caption() {
+                plan.set_caption(id, top, bottom);
+            }
             debug_assert_eq!(id, groups.len());
             for rows in split.stops(room) {
                 plan.row(
@@ -21577,6 +23830,8 @@ fn push_field_card(
                 );
                 plan.set_control_rows(split.control_rows(rows.clone()));
                 plan.set_ink(split.ink(rows.clone()));
+                plan.set_ink_top(split.ink_top(rows.clone()));
+                plan.set_first_controls(split.first_controls(rows.clone()));
                 for (row, _) in &split.rows[rows.clone()] {
                     plan.add_segments(row);
                 }
@@ -21919,6 +24174,23 @@ fn candidate_trail_resolution(
         crate::app_config::default_cursor_trail_style(),
     );
     crate::app_config::resolve_trail_style(&raw)
+}
+
+/// The candidate `cursor_trail_intensity`, resolved as the runtime does
+/// (`Config::cursor_trail_intensity_for`) for the question it answers (is the
+/// trail dimmed to nothing): unset is lit (1; Classic's own default, 0.7, is
+/// lit too), a non-finite value is 0, and the rest clamps to `0..=1`.
+fn candidate_trail_intensity(state: &SettingsViewState, patch: Option<&ConfigPatch>) -> f32 {
+    let intensity = candidate_setting_text(state, patch, prefs::EDIT_CURSOR_TRAIL_INTENSITY, "1")
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    if intensity.is_finite() {
+        intensity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn candidate_profanity_style(
@@ -22300,7 +24572,7 @@ fn registered_value_unavailability(
         EditKind::Enum { options } => {
             !crate::native_config_language::registered_enum_value_is_valid(key, &raw, options)
         }
-        EditKind::Color => aterm_types::scheme::parse_hex(&raw).is_none(),
+        EditKind::Color => !prefs::color_value_is_valid(key, &raw),
         EditKind::Bool | EditKind::Integer | EditKind::Float | EditKind::Text => {
             return None;
         }
@@ -23163,6 +25435,19 @@ fn parent_or_motion_inactivity(
                     motion,
                 );
             }
+            // Intensity 0 is the person's explicit off for the aurora, and it
+            // closes the trail's key seam (`sound_policy::user_lit`, binding
+            // decision C), so the voices carried only on the trail's cues are
+            // silent too. Not the Typing sound row: it also voices the bonk.
+            if matches!(key, prefs::EDIT_TONE_MELODY | prefs::EDIT_TRAIL_SOUND_BED)
+                && candidate_trail_intensity(state, patch) <= 0.0
+            {
+                return Some(inactive(
+                    "This sound setting is saved but inactive while Trail intensity is 0, which silences the trail's typing sounds",
+                    "Inactive: Trail intensity 0",
+                    "Currently inactive: Trail intensity is 0",
+                ));
+            }
             if key == prefs::EDIT_CURSOR_FIRE_SHIMMER && trail_resolution.canonical != Some("fire")
             {
                 return Some(inactive(
@@ -23681,6 +25966,23 @@ fn cross_field_constraints(
         ));
     }
 
+    // HDR GLOW IN THE PREVIEW: on a screen that shows EDR, HDR glow lifts the
+    // trail past standard range, and the preview, an 8-bit picture, caps it.
+    // The row says so while it applies, by the cause and in the words the
+    // preview's own line uses ([`crate::settings_preview::hdr_glow_capped`]).
+    if key == prefs::EDIT_HDR_GLOW
+        && crate::settings_preview::hdr_glow_capped(
+            candidate_setting_bool(state, patch, prefs::EDIT_HDR_GLOW, true),
+            state.presented_motion.get().display_edr,
+        )
+    {
+        constraints.push(constraint(
+            crate::settings_preview::HDR_PREVIEW_CAVEAT.to_string(),
+            crate::settings_preview::HDR_PREVIEW_CAVEAT_TAG.to_string(),
+            crate::settings_preview::HDR_PREVIEW_CAVEAT_SPOKEN.to_string(),
+        ));
+    }
+
     // The numbers are Top edge's, so only its row states them. A change to
     // either edge reports them after it saves, so lowering All edges still
     // says what it did to the top.
@@ -23851,7 +26153,7 @@ fn session_runtime_disclosure(
     let mut parts = Vec::new();
     match key {
         prefs::EDIT_SESSION_LOG_JOURNAL => {
-            let requested = candidate_setting_bool(state, patch, key, false);
+            let requested = candidate_setting_bool(state, patch, key, true);
             if requested
                 && let Some(reason) = crate::session_log_journal::eligibility(
                     true,
@@ -24100,7 +26402,7 @@ pub(crate) struct MacosAccess {
     pub(crate) sessions_total: usize,
     pub(crate) sessions_adopted: usize,
     /// The per-service coverage buckets, from the ONE split the verb uses
-    /// (`control_privacy::covers_split`), so the panel and the verb cannot
+    /// (`privacy_report::covers_split`), so the panel and the verb cannot
     /// disagree about a service.
     pub(crate) covers: Vec<&'static str>,
     pub(crate) uncovered: Vec<&'static str>,
@@ -25209,26 +27511,25 @@ const fn debugger_mode_words(mode: aterm_containment::consent::DebuggerMode) -> 
     }
 }
 
-/// THE O8 SENTENCE (owner, 2026-09-29): an aterm that is not hardened offers
-/// the change too, and says what it exposes — beside the button on the row,
-/// and in the alert. `None` for a hardened aterm. `where_` finishes the
-/// sentence: the row says "aterm's alert", the alert says "this alert".
+/// THE ROW'S O8 SENTENCE (owner, 2026-09-29): an aterm that is not hardened
+/// offers the change too, and says beside the button what it exposes. `None`
+/// for a hardened aterm. The alert says it in its own bullet
+/// ([`debugger_alert_not_hardened_bullet`]).
 fn debugger_not_hardened_sentence(
     hardening: aterm_containment::consent::SelfHardening,
-    where_: &str,
-) -> Option<String> {
+) -> Option<&'static str> {
     use aterm_containment::consent::SelfHardening;
     match hardening {
         SelfHardening::Hardened => None,
-        SelfHardening::NotHardened => Some(format!(
+        SelfHardening::NotHardened => Some(
             "This aterm is not hardened (a development build), so after this any program you \
-             run could take control of this aterm and drive it past {where_}."
-        )),
-        SelfHardening::Unknown => Some(format!(
+             run could take control of this aterm and drive it past aterm's alert.",
+        ),
+        SelfHardening::Unknown => Some(
             "aterm could not read whether this aterm is hardened. If it is not (a development \
              build), after this any program you run could take control of this aterm and drive \
-             it past {where_}."
-        )),
+             it past aterm's alert.",
+        ),
     }
 }
 
@@ -25272,8 +27573,8 @@ pub(crate) fn debugger_row_copy(access: &MacosAccess) -> DebuggerRowCopy {
                 That list governs running software that fails the security policy, and does not \
                 help with this dialog."
         .to_string();
-    let not_hardened = debugger_not_hardened_sentence(facts.self_hardened, "aterm's alert");
-    let with_not_hardened = |text: &str| match not_hardened.as_deref() {
+    let not_hardened = debugger_not_hardened_sentence(facts.self_hardened);
+    let with_not_hardened = |text: &str| match not_hardened {
         Some(extra) => format!("{text} {extra}"),
         None => text.to_string(),
     };
@@ -25738,108 +28039,131 @@ fn debugger_press_refusal(
 
 /// Who raises [`debugger_access_alert`]: the owner's press on the Security
 /// page, or the App's once-per-Mac launch ask (owner ruling O29), whose alert
-/// says first that aterm asks this once and where the answer can be changed.
+/// says first that aterm asks this once per Mac and sends the undo to the
+/// Security page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DebuggerAlertFrom {
     Press,
     Launch,
 }
 
+/// THE ALERT'S O8 BULLET: what an aterm that is not hardened, or that cannot
+/// tell, exposes once the rule is loosened, as one bullet line of
+/// [`debugger_access_alert`]. `None` for a hardened aterm. The Security row
+/// says it in its own sentence ([`debugger_not_hardened_sentence`]).
+fn debugger_alert_not_hardened_bullet(
+    hardening: aterm_containment::consent::SelfHardening,
+) -> Option<&'static str> {
+    use aterm_containment::consent::SelfHardening;
+    match hardening {
+        SelfHardening::Hardened => None,
+        SelfHardening::NotHardened => Some(
+            "\u{2022} Not protected: this aterm (a development build). Any program you run could \
+             take control of it and get past this alert.",
+        ),
+        SelfHardening::Unknown => Some(
+            "\u{2022} Maybe not protected: this aterm, if it is a development build. Any program \
+             you run could then take control of it and get past this alert.",
+        ),
+    }
+}
+
 /// aterm's own alert before a debugger-access change (debugger design §3.4
 /// step 1; owner rulings O7, O8 and O29). A pure function of the facts, so
 /// what it must say is tested without an alert (no test reaches
-/// `menu::confirm_owner`): the not-hardened sentence exactly when aterm is not
-/// hardened, a measured or hedged administrator-password sentence by the
-/// evidence, the revert line in every On body, and no path to the tool but
-/// the `-disable` one. Returns `(title, body, proceed)`. The launch ask's
-/// alert (`from` [`DebuggerAlertFrom::Launch`], only ever for turning it on)
-/// opens with why it is up unasked and sends the undo to the Security page;
-/// every other word is the press's.
+/// `menu::confirm_owner`): the not-hardened bullet exactly when aterm is not
+/// hardened, a measured or hedged administrator-password line by the
+/// evidence (the owner's own only on an admin account), the revert line in
+/// every On body, and no path to the tool but
+/// the `-disable` one. Returns `(title, body, proceed)`.
+///
+/// Short paragraphs and `•` bullet lines (owner, 2026-10-20: "more concise and
+/// organized"), which NSAlert's informative text shows as written. The launch
+/// ask's alert (`from` [`DebuggerAlertFrom::Launch`], only ever for turning it
+/// on) opens with why it is up unasked and sends the undo to the Security page;
+/// every other line is the press's.
 pub(crate) fn debugger_access_alert(
     change: aterm_containment::consent::DebuggerChange,
     facts: &crate::debugger_access::DebuggerFacts,
     evidence: SpikeEvidence,
     from: DebuggerAlertFrom,
 ) -> (String, String, &'static str) {
-    use aterm_containment::consent::{DEBUGGER_ACCESS_REVERT, DebuggerChange, SelfHardening};
+    use aterm_containment::consent::{
+        DEBUGGER_ACCESS_REVERT, DebuggerChange, DebuggerMember, SelfHardening,
+    };
     // GATED ON D2 and D4 (`devtools_enable_measured`, measured): Apple's tool
     // puts up one administrator dialog for either change, so the alert says
-    // macOS asks; under `UNMEASURED` it says macOS SHOULD ask.
-    let measured = evidence.devtools_enable_measured;
-    let launch = from == DebuggerAlertFrom::Launch;
+    // macOS asks; under `UNMEASURED` it says macOS SHOULD ask. The dialog's
+    // name was measured on 26.6.2 and 27.0 (design §7 D2): SecurityAgent names
+    // Apple's tool, "SamplingTools", never aterm, so the owner is told what to
+    // expect before an unfamiliar name asks for their password. The password
+    // is "yours" only on an admin account: the tool's write is authorized
+    // against `config.modify.` (`[is-root, authenticate-admin]`, design §1.3),
+    // so a `_developer` member, or an account outside both groups turning it
+    // off, types an administrator's.
+    let password_of = if facts.probe.member == DebuggerMember::Admin {
+        "your admin password"
+    } else {
+        "an admin's password"
+    };
+    let dialog = match (change, evidence.devtools_enable_measured) {
+        (DebuggerChange::On, true) => {
+            format!("asks for {password_of} in a dialog named \"SamplingTools\", Apple's tool")
+        }
+        (DebuggerChange::On, false) => format!(
+            "should ask for {password_of} in its own dialog, named \"SamplingTools\", Apple's tool"
+        ),
+        (DebuggerChange::Off, true) => {
+            format!("asks for {password_of} in a dialog named \"SamplingTools\"")
+        }
+        (DebuggerChange::Off, false) => format!("should ask for {password_of} in its own dialog"),
+    };
+    let password = format!("Next, macOS {dialog}. aterm never sees it.");
     match change {
         DebuggerChange::On => {
-            let hardened = facts.self_hardened == SelfHardening::Hardened;
-            let mut body = String::new();
-            if launch {
-                body.push_str(
-                    "aterm asks this once on each Mac; you can change your answer at any time in \
-                     aterm's Settings \u{25b8} Security. ",
-                );
-            }
-            body.push_str(
-                "This loosens a macOS security rule for the whole Mac: every app, and every \
-                 administrator or developer account on it, not only aterm. Afterwards any program \
-                 running as one of those users can use Apple's debugger on that user's other \
-                 programs without a password, and read or change their memory. That includes \
-                 Homebrew tools, interpreters such as node, agents that hold decrypted keys such \
-                 as gpg-agent, anything built with cargo, and development builds of aterm. ",
-            );
-            body.push_str(if hardened {
-                "Hardened apps, this aterm among them, and macOS itself stay protected. "
-            } else {
-                "Hardened apps and macOS itself stay protected. "
-            });
-            if let Some(extra) = debugger_not_hardened_sentence(facts.self_hardened, "this alert") {
-                body.push_str(&extra);
-                body.push(' ');
-            }
-            body.push_str(
-                "Apple's own tool makes this change, although Apple's note on the rule advises \
-                 administrators not to modify it. ",
-            );
-            // The dialog's name was measured on 26.6.2 and 27.0 (design §7 D2):
-            // SecurityAgent names Apple's tool, "SamplingTools", never aterm,
-            // so the owner is told what to expect before an unfamiliar name asks
-            // for their password.
-            body.push_str(if measured {
-                "macOS asks for an administrator password next, in a dialog that names \
-                 SamplingTools, Apple's tool; aterm never sees it. "
-            } else {
-                "macOS should ask for an administrator password next, in its own dialog, which \
-                 names SamplingTools, Apple's tool; aterm never sees it. "
-            });
-            body.push_str(&format!(
-                "To undo it, press Turn Off Debugger Access\u{2026} {}, or run \
-                 {DEBUGGER_ACCESS_REVERT}.",
-                if launch {
-                    "in aterm's Settings \u{25b8} Security"
+            let mut bullets = vec![
+                "\u{2022} Whole Mac: every admin and developer account, not just aterm",
+                "\u{2022} Exposed: Homebrew tools, node, gpg-agent, cargo builds",
+                if facts.self_hardened == SelfHardening::Hardened {
+                    "\u{2022} Still protected: hardened apps (this aterm too) and macOS"
                 } else {
-                    "here"
+                    "\u{2022} Still protected: hardened apps and macOS"
+                },
+            ];
+            bullets.extend(debugger_alert_not_hardened_bullet(facts.self_hardened));
+            bullets.push("\u{2022} Apple advises administrators not to change this rule");
+            let undo = match from {
+                DebuggerAlertFrom::Press => "press Turn Off Debugger Access\u{2026} here",
+                DebuggerAlertFrom::Launch => {
+                    "aterm's Settings \u{25b8} Security \u{25b8} Turn Off Debugger Access\u{2026}"
                 }
-            ));
+            };
+            let mut paragraphs = Vec::new();
+            if from == DebuggerAlertFrom::Launch {
+                paragraphs.push("aterm asks this once per Mac.".to_owned());
+            }
+            paragraphs.extend([
+                "Afterwards, programs you run can debug your other programs without a password, \
+                 and read or change their memory."
+                    .to_owned(),
+                bullets.join("\n"),
+                password,
+                format!("To undo: {undo}, or run {DEBUGGER_ACCESS_REVERT}."),
+            ]);
             (
-                "Allow debugger access on this Mac?".to_string(),
-                body,
+                "Allow debugger access on this Mac?".to_owned(),
+                paragraphs.join("\n\n"),
                 "Allow\u{2026}",
             )
         }
         DebuggerChange::Off => (
-            "Turn off debugger access on this Mac?".to_string(),
+            "Turn off debugger access on this Mac?".to_owned(),
             // D4, measured: `-disable` leaves Apple's rule unshared, so
             // every new debugger asks, not once per 10 hours.
-            if measured {
-                "macOS will ask for a password again each time a new debugger attaches (turning \
-                 it off does not bring back the 10 hours of quiet after an answer that Apple's \
-                 original rule gives), and asks for an administrator password now, in a dialog \
-                 that names SamplingTools; aterm never sees it."
-            } else {
-                "macOS will ask for a password again each time a new debugger attaches (turning \
-                 it off does not bring back the 10 hours of quiet after an answer that Apple's \
-                 original rule gives), and should ask for an administrator password now, in its \
-                 own dialog; aterm never sees it."
-            }
-            .to_string(),
+            format!(
+                "Debuggers will need a password again each time one attaches. Apple's original \
+                 10 hours without asking, after an answer, does not come back.\n\n{password}"
+            ),
             "Turn Off\u{2026}",
         ),
     }
@@ -26374,15 +28698,15 @@ fn prefers_macos_access(state: &SettingsViewState) -> bool {
 /// Exact authored height, so the page budget sees the same card the renderer
 /// draws. Grows with the rows and repair lines it actually has, and with the
 /// rows its buttons take in `text_width`, the card's measure.
-fn macos_access_height(access: &MacosAccess, compact: bool, text_width: f32) -> f32 {
+fn macos_access_height(access: &MacosAccess, lead: AccessLead, text_width: f32) -> f32 {
     let scale = settings_text_scale();
     let line_height = 24.0_f32.max(20.0 * scale);
     let heading_height = 28.0_f32.max(22.0 * scale);
     let copy = macos_access_copy(access);
-    let (above, below) = macos_access_rows(&copy, access, compact);
+    let (above, below) = macos_access_rows(&copy, access, lead);
     let lines = macos_access_visual_lines(&above, text_width)
         + macos_access_visual_lines(&below, text_width)
-        + macos_access_visual_lines(&debugger_row_lines(&copy.debugger, compact), text_width);
+        + macos_access_visual_lines(&debugger_row_lines(&copy.debugger), text_width);
     let debugger_actions = if copy.debugger.button.is_some() {
         scaled_control_height()
     } else {
@@ -26390,7 +28714,7 @@ fn macos_access_height(access: &MacosAccess, compact: bool, text_width: f32) -> 
     };
     heading_height
         + lines as f32 * line_height
-        + macos_access_actions_height(access, compact, text_width)
+        + macos_access_actions_height(access, text_width)
         + debugger_actions
         + 12.0
         + 24.0
@@ -26399,23 +28723,47 @@ fn macos_access_height(access: &MacosAccess, compact: bool, text_width: f32) -> 
 /// One text line of the MACOS ACCESS block: `(key, text, role, style)`.
 type MacosAccessLine = (String, String, SemanticRole, StyleRef);
 
+/// How much of the MACOS ACCESS block's verdict sits above its actions row,
+/// MEASURED for the window ([`macos_access_lead`]); what is not above is the
+/// first lines under the row, so the block says the same at every size and
+/// only their order moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessLead {
+    /// The state, a broken anchor, the coverage claim and the trade the owner
+    /// makes by granting.
+    Whole,
+    /// The trade is the first line under the row.
+    NoTrade,
+    /// The state and a broken anchor (it overrides a "granted" headline) alone:
+    /// the coverage claim and the trade follow the row.
+    State,
+}
+
+impl AccessLead {
+    /// Every lead, the most above the row first.
+    const ALL: [Self; 3] = [Self::Whole, Self::NoTrade, Self::State];
+}
+
 /// THE BLOCK'S TEXT LINES, ABOVE AND BELOW ITS ACTIONS ROW (s-22) — the one source
 /// the card, its height and the first screen's budget read, so they cannot
 /// disagree. Above the row: the verdict a press acts on — the state, a broken
-/// anchor (it overrides a "granted" headline), the coverage claim and (but in
-/// the compact block, where it is the first line under the row) the trade the
-/// owner makes by granting — so *Open Privacy & Security…*, the one press that
-/// fixes a Full Disk Access denial, sits a few lines under the heading at every
-/// size instead of after two dozen detail lines. Right under it, at every size,
-/// the lines about its buttons: the rebuild line that says why Ask Again is
-/// missing, and the Trash's status. Then, in the tall card only: what a grant covers and how long it lasts, the probe, the prompt, the
-/// observation, the route, the identity, who is responsible, aterm's checks by
-/// service, the folders, the repair lines, other copies and what the Trash
-/// took. `access` styles two lines; the counts never read it.
+/// anchor (it overrides a "granted" headline), and as `lead` holds them the
+/// coverage claim and the trade the owner makes by granting — so *Open Privacy
+/// & Security…*, the one press that fixes a Full Disk Access denial, sits a few
+/// lines under the heading at every size instead of after two dozen detail
+/// lines. Right under it: the verdict lines `lead` leaves there (still read
+/// before the owner grants anything, which happens in System Settings after
+/// the press), the rebuild line that says why Ask Again is missing, and the
+/// Trash's status. Then, at every size — nothing the block says vanishes on a
+/// short window or at large text — what a grant covers and how long it lasts,
+/// the probe, the prompt, the observation, the route, the identity, who is
+/// responsible, aterm's checks by service, the folders, the repair lines, other
+/// copies and what the Trash took. `access` styles two lines; the counts never
+/// read it.
 fn macos_access_rows(
     copy: &MacosAccessCopy,
     access: &MacosAccess,
-    compact: bool,
+    lead: AccessLead,
 ) -> (Vec<MacosAccessLine>, Vec<MacosAccessLine>) {
     let line = |key: &str, text: &str, role: SemanticRole, style: StyleRef| {
         (
@@ -26445,23 +28793,21 @@ fn macos_access_rows(
             StyleRef::Danger,
         ));
     }
-    above.push(line(
+    let coverage = line(
         "coverage",
         &copy.coverage,
         SemanticRole::Status,
         StyleRef::Primary,
-    ));
+    );
     let trade = line("trade", &copy.trade, SemanticRole::Text, StyleRef::Primary);
     let mut below = Vec::new();
-    // The compact block (a 348pt short landscape list, maximum Dynamic Type)
-    // holds the card's one row and the block through its actions on the first
-    // screen only with the trade — two lines once it wraps — as the first line
-    // under the buttons; it is still read before the owner grants anything,
-    // which happens in System Settings after the press.
-    if compact {
-        below.push(trade);
-    } else {
-        above.push(trade);
+    match lead {
+        AccessLead::Whole => above.extend([coverage, trade]),
+        AccessLead::NoTrade => {
+            above.push(coverage);
+            below.push(trade);
+        }
+        AccessLead::State => below.extend([coverage, trade]),
     }
     if let Some(rebuild) = &copy.rebuild {
         below.push(line(
@@ -26478,9 +28824,6 @@ fn macos_access_rows(
             SemanticRole::Status,
             StyleRef::Primary,
         ));
-    }
-    if compact {
-        return (above, below);
     }
     below.extend([
         line("grants", &copy.grants, SemanticRole::Text, StyleRef::Quiet),
@@ -26570,21 +28913,35 @@ fn macos_access_rows(
 
 /// What of the block the DEVELOPER TOOLS card above it leaves on the first
 /// screen ([`DevToolsCardFit::stacked`]): down to the end of its actions row —
-/// *Open Privacy & Security…* and the buttons beside it — at every size. The
-/// row sits under the block's verdict lines ([`macos_access_rows`]), four at
-/// most, so holding it costs the card a few lines; when it sat after every
+/// *Open Privacy & Security…* and the buttons beside it — with `lead` over it.
+/// The row sits under the block's verdict lines ([`macos_access_rows`]), four
+/// at most, so holding it costs the card a few lines; when it sat after every
 /// detail line (two dozen once aterm's checks list their services) holding it
 /// left the card one row and the row still below the glass (measured live,
 /// 2026-10-16, on a 774x782 window), and the first screen kept only the block's
 /// heading (s-22).
-fn macos_access_kept_in_view(access: &MacosAccess, compact: bool, text_width: f32) -> f32 {
+fn macos_access_kept_in_view(access: &MacosAccess, lead: AccessLead, text_width: f32) -> f32 {
+    macos_access_reach(access, lead, text_width, None)
+}
+
+/// How far under the block's top its actions end with `lead` above them in
+/// `text_width`: through every row of buttons, or through the first `rows`.
+fn macos_access_reach(
+    access: &MacosAccess,
+    lead: AccessLead,
+    text_width: f32,
+    rows: Option<usize>,
+) -> f32 {
     let scale = settings_text_scale();
     let line_height = 24.0_f32.max(20.0 * scale);
     let heading_height = 28.0_f32.max(22.0 * scale);
-    let (above, _) = macos_access_rows(&macos_access_copy(access), access, compact);
+    let (above, _) = macos_access_rows(&macos_access_copy(access), access, lead);
+    let all = macos_access_action_rows(access, text_width).len().max(1);
+    let rows = rows.map_or(all, |rows| rows.clamp(1, all));
     12.0 + heading_height
         + macos_access_visual_lines(&above, text_width) as f32 * line_height
-        + macos_access_actions_height(access, compact, text_width)
+        + rows as f32 * scaled_control_height()
+        + (rows - 1) as f32 * 8.0
 }
 
 /// How many visual lines `line` takes in the block's `text_width`: a fact
@@ -26623,7 +28980,7 @@ fn macos_access_line_node(line: MacosAccessLine, text_width: f32, line_height: f
 /// The block's buttons, in order: *Open Privacy & Security…* first, then the
 /// folder warm-up, Files & Folders and Ask Again where they apply, the Trash
 /// where other copies are listed, and the `sudo` prompts switch.
-fn macos_access_buttons(access: &MacosAccess, compact: bool) -> Vec<UiNode> {
+fn macos_access_buttons(access: &MacosAccess) -> Vec<UiNode> {
     let mut buttons = vec![macos_access_button(
         MACOS_ACCESS_OPEN_FDA,
         "Open Privacy & Security\u{2026}",
@@ -26657,7 +29014,7 @@ fn macos_access_buttons(access: &MacosAccess, compact: bool) -> Vec<UiNode> {
             ));
         }
     }
-    if !compact && !access.retire_plan().is_empty() {
+    if !access.retire_plan().is_empty() {
         buttons.push(macos_access_button(
             MACOS_ACCESS_TRASH,
             "Move Other Copies to the Trash",
@@ -26667,14 +29024,12 @@ fn macos_access_buttons(access: &MacosAccess, compact: bool) -> Vec<UiNode> {
     }
     // The `sudo` askpass relay off switch (design §3.1): one button carrying
     // its direction. macOS only, so always relevant on this card.
-    if !compact {
-        let (action, label) = if access.askpass_relay_off {
-            (MACOS_ACCESS_ASKPASS_ON, "Allow sudo Password Prompts")
-        } else {
-            (MACOS_ACCESS_ASKPASS_OFF, "Turn Off sudo Password Prompts")
-        };
-        buttons.push(macos_access_button(action, label, true, false));
-    }
+    let (action, label) = if access.askpass_relay_off {
+        (MACOS_ACCESS_ASKPASS_ON, "Allow sudo Password Prompts")
+    } else {
+        (MACOS_ACCESS_ASKPASS_OFF, "Turn Off sudo Password Prompts")
+    };
+    buttons.push(macos_access_button(action, label, true, false));
     buttons
 }
 
@@ -26684,14 +29039,10 @@ fn macos_access_buttons(access: &MacosAccess, compact: bool) -> Vec<UiNode> {
 /// "Open Privacy &…", "Ask for Folder Ac…" on a 1074pt window, seen once a
 /// headless instance could carry a posture, s-24). A label wider than the
 /// whole measure takes a row of its own at that measure.
-fn macos_access_action_rows(
-    access: &MacosAccess,
-    compact: bool,
-    text_width: f32,
-) -> Vec<Vec<UiNode>> {
+fn macos_access_action_rows(access: &MacosAccess, text_width: f32) -> Vec<Vec<UiNode>> {
     let mut rows: Vec<Vec<UiNode>> = Vec::new();
     let mut used = 0.0_f32;
-    for mut button in macos_access_buttons(access, compact) {
+    for mut button in macos_access_buttons(access) {
         let label = match &button.content {
             UiContent::Button(control) => control
                 .spec
@@ -26718,36 +29069,29 @@ fn macos_access_action_rows(
 
 /// The height the block's button rows take in `text_width`
 /// ([`macos_access_action_rows`]).
-fn macos_access_actions_height(access: &MacosAccess, compact: bool, text_width: f32) -> f32 {
-    let rows = macos_access_action_rows(access, compact, text_width)
-        .len()
-        .max(1);
+fn macos_access_actions_height(access: &MacosAccess, text_width: f32) -> f32 {
+    let rows = macos_access_action_rows(access, text_width).len().max(1);
     rows as f32 * scaled_control_height() + (rows - 1) as f32 * 8.0
 }
 
-/// The debugger row's text lines in render order: `(key, text, role, style)`.
-/// Compact keeps its state line, its status and the line that says whether
-/// it is allowed; the tall card adds what it is not, the four facts, the trade
-/// and the cross-link to THIS MAC. The height and the card both read this, so
-/// they cannot disagree.
-fn debugger_row_lines(
-    copy: &DebuggerRowCopy,
-    compact: bool,
-) -> Vec<(String, String, SemanticRole, StyleRef)> {
+/// The debugger row's text lines in render order: `(key, text, role, style)`:
+/// its state line, what it is not, the line that says whether it is allowed,
+/// its status, the four facts, the trade and the cross-link to THIS MAC — at
+/// every size, under the block's actions. The height and the card both read
+/// this, so they cannot disagree.
+fn debugger_row_lines(copy: &DebuggerRowCopy) -> Vec<(String, String, SemanticRole, StyleRef)> {
     let mut lines = vec![(
         "settings/macos-access/debugger/state".to_string(),
         copy.headline.clone(),
         SemanticRole::Status,
         StyleRef::Primary,
     )];
-    if !compact {
-        lines.push((
-            "settings/macos-access/debugger/kind".to_string(),
-            copy.kind.clone(),
-            SemanticRole::Text,
-            StyleRef::Quiet,
-        ));
-    }
+    lines.push((
+        "settings/macos-access/debugger/kind".to_string(),
+        copy.kind.clone(),
+        SemanticRole::Text,
+        StyleRef::Quiet,
+    ));
     lines.push((
         "settings/macos-access/debugger/observed".to_string(),
         copy.state.clone(),
@@ -26762,22 +29106,20 @@ fn debugger_row_lines(
             StyleRef::Primary,
         ));
     }
-    if !compact {
-        for (key, text) in [
-            ("stops", &copy.stops),
-            ("grants", &copy.grants),
-            ("lasts", &copy.lasts),
-            ("undo", &copy.undo),
-            ("trade", &copy.trade),
-            ("machine", &copy.cross_link),
-        ] {
-            lines.push((
-                format!("settings/macos-access/debugger/{key}"),
-                text.clone(),
-                SemanticRole::Text,
-                StyleRef::Quiet,
-            ));
-        }
+    for (key, text) in [
+        ("stops", &copy.stops),
+        ("grants", &copy.grants),
+        ("lasts", &copy.lasts),
+        ("undo", &copy.undo),
+        ("trade", &copy.trade),
+        ("machine", &copy.cross_link),
+    ] {
+        lines.push((
+            format!("settings/macos-access/debugger/{key}"),
+            text.clone(),
+            SemanticRole::Text,
+            StyleRef::Quiet,
+        ));
     }
     lines
 }
@@ -26822,12 +29164,12 @@ fn lone_button_width(buttons: &mut [UiNode]) {
 }
 
 /// The block itself.
-fn macos_access_card(access: &MacosAccess, compact: bool, text_width: f32) -> UiNode {
+fn macos_access_card(access: &MacosAccess, lead: AccessLead, text_width: f32) -> UiNode {
     let line_height = 24.0_f32.max(20.0 * settings_text_scale());
     let heading_height = 28.0_f32.max(22.0 * settings_text_scale());
     let copy = macos_access_copy(access);
     let line = |line: MacosAccessLine| macos_access_line_node(line, text_width, line_height);
-    let (above, below) = macos_access_rows(&copy, access, compact);
+    let (above, below) = macos_access_rows(&copy, access, lead);
     let mut children = vec![
         UiNode::new(
             "settings/macos-access/heading",
@@ -26840,8 +29182,8 @@ fn macos_access_card(access: &MacosAccess, compact: bool, text_width: f32) -> Ui
         .layout(Layout::default().height(Length::Fixed(heading_height))),
     ];
     children.extend(above.into_iter().map(line));
-    let rows = macos_access_action_rows(access, compact, text_width);
-    let actions_height = macos_access_actions_height(access, compact, text_width);
+    let rows = macos_access_action_rows(access, text_width);
+    let actions_height = macos_access_actions_height(access, text_width);
     children.push(
         UiNode::new(
             "settings/macos-access/actions",
@@ -26872,14 +29214,10 @@ fn macos_access_card(access: &MacosAccess, compact: bool, text_width: f32) -> Ui
                 .collect(),
         ),
     );
-    // The tall card's detail lines, under the row they explain.
+    // What the verdict leaves under the row, and the detail lines it explains.
     children.extend(below.into_iter().map(line));
     // THE DEBUGGER ROW, the Full Disk Access row's peer (debugger design §3.3).
-    children.extend(
-        debugger_row_lines(&copy.debugger, compact)
-            .into_iter()
-            .map(line),
-    );
+    children.extend(debugger_row_lines(&copy.debugger).into_iter().map(line));
     if let Some(button) = copy.debugger.button {
         children.push(
             UiNode::new(
@@ -26912,9 +29250,7 @@ fn macos_access_card(access: &MacosAccess, compact: bool, text_width: f32) -> Ui
     )
     .layout(
         Layout::column()
-            .height(Length::Fixed(macos_access_height(
-                access, compact, text_width,
-            )))
+            .height(Length::Fixed(macos_access_height(access, lead, text_width)))
             .padding(Insets::all(12.0))
             .gap(0.0)
             .clipped(),
@@ -26945,8 +29281,9 @@ const MACHINE_TOOL_MISSING: &str =
 
 /// The "This Mac" status, drawn in the Universal Control row's own group under
 /// the row: what the Mac has, what Apply Now would do with the button beside
-/// it (only while there is something to apply), what is in the way, and on a
-/// roomy page what this launch changed. Every word comes from the packages
+/// it (only while there is something to apply), what is in the way, and — but
+/// `compact`, which the page draws only where a screen cannot hold the whole
+/// status — what this launch changed. Every word comes from the packages
 /// projection, so pixels, accessibility and introspection agree.
 fn machine_status_node(
     packages: &PackagesProjection,
@@ -27205,10 +29542,59 @@ fn segmented_natural_width(segments: &[SegmentOption]) -> f32 {
     widest * segments.len() as f32 + 2.0 * segments.len().saturating_sub(1) as f32
 }
 
+/// Whether `field`'s segments, sharing a `text_width` column equally as a
+/// stacked control band lays them ([`segmented_choice_node`]: Fill widths 2pt
+/// apart), each paint their label whole: a segment centres its label in the
+/// room a text button keeps clear of its edges
+/// ([`crate::native_ui::text_button_label_room`]), and elides what that room
+/// cannot hold. `true` where `field` is not drawn as segments.
+fn segments_hold_their_labels(field: &EditField, text_width: f32) -> bool {
+    let Some((segments, _)) = segmented_choices(field, SettingsState::display_value(field)) else {
+        return true;
+    };
+    let count = segments.len() as f32;
+    let share = (text_width - 2.0 * (count - 1.0)) / count;
+    segments.iter().all(|segment| {
+        let spec = ButtonSpec::new(segment.label.as_str());
+        crate::native_ui::native_button_label_width(&segment.label)
+            <= crate::native_ui::text_button_label_room(&spec, share)
+    })
+}
+
 /// The width `field`'s segments need, where it is drawn as segments.
 fn segmented_width_need(field: &EditField) -> Option<f32> {
     segmented_choices(field, SettingsState::display_value(field))
         .map(|(segments, _)| segmented_natural_width(&segments))
+}
+
+/// The room `key`'s segments have on their line of a stacked `row` whose
+/// column is `text_width`: the column less what shares their line (the
+/// Reset a stacked row keeps after them) — the box they are drawn in, so a
+/// label wrapped to fit it fits it ("Recommen-" / "ded" was measured for the
+/// whole column and painted 18pt short of its room), and segments wider than
+/// it are wrapped although the column alone would hold them (three
+/// segments at 2× ran a 108pt Reset 52pt past a wide Harness page's row).
+fn segments_line_room(row: &UiNode, key: &str, text_width: f32) -> f32 {
+    let segments_key = format!("settings/segments/{key}");
+    row.children
+        .iter()
+        .find(|line| {
+            line.children
+                .iter()
+                .any(|child| child.key.as_str() == segments_key)
+        })
+        .map_or(text_width, |line| {
+            let others = line
+                .children
+                .iter()
+                .filter(|child| child.key.as_str() != segments_key)
+                .map(|child| match child.layout.width {
+                    Length::Fixed(width) => width + line.layout.gap,
+                    _ => 0.0,
+                })
+                .sum::<f32>();
+            (text_width - others).max(0.0)
+        })
 }
 
 /// SEGMENTS ON AS FEW LINES AS THEIR LABELS ALLOW where the column cannot
@@ -27228,6 +29614,7 @@ fn wrap_segments(row: &mut UiNode, key: &str, text_width: f32) {
     }
     let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
     let segment_height = 44.0_f32.max((px * 1.25 + 12.0).ceil());
+    let text_width = segments_line_room(row, key, text_width);
     let Some(group) = find(row, &segments_key) else {
         return;
     };
@@ -27246,15 +29633,19 @@ fn wrap_segments(row: &mut UiNode, key: &str, text_width: f32) {
         .fold(0.0_f32, f32::max);
     let per_line = (((text_width + 2.0) / (widest + 2.0)).floor() as usize).clamp(1, count);
     // Never wider than the column: where even one segment's label is wider
-    // than the column (the largest text in the narrowest window), it is
-    // fitted to the column as a picker's label is, never cut by the edge.
+    // than the column (the largest text in the narrowest window), it keeps
+    // its words on as many lines as the column needs ([`button_words`]), its
+    // line as tall as they are — never cut ("Long-t…", "Leave a…" at 2× text
+    // on a phone-width page).
     let width = ((text_width - 2.0 * (per_line - 1) as f32) / per_line as f32)
         .max(widest)
         .min(text_width);
     let segments = std::mem::take(&mut group.children);
     let mut lines = Vec::new();
+    let mut column = 0.0;
     let mut segments = segments.into_iter().peekable();
     while segments.peek().is_some() {
+        let mut line_height = segment_height;
         let line: Vec<UiNode> = segments
             .by_ref()
             .take(per_line)
@@ -27265,13 +29656,16 @@ fn wrap_segments(row: &mut UiNode, key: &str, text_width: f32) {
                     && let UiContent::Button(button) = &mut segment.content
                     && let Some(label) = button.spec.visual_label.clone()
                 {
-                    let room = crate::native_ui::text_button_label_room(&button.spec, width);
-                    button.spec.visual_label =
-                        Some(crate::native_ui::fit_native_button_label(&label, room));
+                    let (words, count) = button_words_in(&button.spec, &label, &[], width);
+                    button.spec.visual_label = Some(words);
+                    line_height = line_height.max(
+                        crate::native_ui::native_button_height_for_lines(count, segment_height),
+                    );
                 }
                 segment
             })
             .collect();
+        column += line_height + if lines.is_empty() { 0.0 } else { 2.0 };
         lines.push(
             UiNode::new(
                 format!("{segments_key}/line-{}", lines.len()),
@@ -27280,13 +29674,12 @@ fn wrap_segments(row: &mut UiNode, key: &str, text_width: f32) {
             .layout(
                 Layout::row()
                     .width(Length::Fill)
-                    .height(Length::Fixed(segment_height))
+                    .height(Length::Fixed(line_height))
                     .gap(2.0),
             )
             .children(line),
         );
     }
-    let column = lines.len() as f32 * segment_height + 2.0 * lines.len().saturating_sub(1) as f32;
     group.layout = Layout::column()
         .width(Length::Fill)
         .height(Length::Fill)
@@ -27380,6 +29773,40 @@ fn segmented_choice_node(
     // One control to the keyboard: one Tab stop, Left/Right between its
     // segments, Return or Space to choose ([`UiNode::segmented`]).
     .segmented()
+}
+
+/// What Reset returns `key` to in `state`, in the words its control shows:
+/// [`default_value_label`], except for the knobs whose default is the cursor
+/// style's — the style aterm.toml names, as the row's own placeholder reads
+/// it — not an empty aterm.toml's: the trail colours
+/// ([`prefs::trail_color_default_words`]: Classic's shifting colours, Laser's
+/// violet, the accent a brighter trail colour where one is chosen) and the
+/// bloom size (the rainbow kitty's own).
+fn modified_default_words(state: &SettingsViewState, key: &str) -> Option<String> {
+    let style = || crate::app_config::resolve_trail_style(&top_authored_trail_value(state));
+    match key {
+        prefs::EDIT_CURSOR_TRAIL_COLOR | prefs::EDIT_CURSOR_TRAIL_ACCENT => {
+            // As aterm.toml spells it: an old `classic mono` says a colour.
+            let spelled = state
+                .raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE)
+                .unwrap_or_else(|| top_authored_trail_value(state));
+            Some(prefs::trail_color_default_words(
+                key,
+                &spelled,
+                prefs::trail_color_setting(
+                    state.raw_value(prefs::EDIT_CURSOR_TRAIL_COLOR).as_deref(),
+                ),
+                // The colour law's pin, as the row's placeholder reads it.
+                state.is_explicit(prefs::EDIT_CURSOR_COLOR),
+            ))
+        }
+        prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS => {
+            let value = crate::app_config::Config::bloom_radius_style_default(style());
+            let shown = value.to_string();
+            Some(prefs::numeric_reading(key, f64::from(value), &shown).unwrap_or(shown))
+        }
+        _ => default_value_label(key).map(str::to_string),
+    }
 }
 
 /// What Reset returns `key` to, in the words its control shows: the value an
@@ -27514,10 +29941,12 @@ fn finished_setting_row(
     let display_face = modified_only && field.key == prefs::EDIT_DISPLAY_FONT;
     let segment_need = segmented_width_need(field);
     // The row laid out one line (`inline_control`: its control's width
-    // there) or by `width`'s own rule; the parts' row is the finished row.
-    let build = |inline_control: Option<f32>| -> (SettingRowParts, bool) {
+    // there), stacked (`stack`: its control under its name, as a compact row
+    // lays it out) or by `width`'s own rule; the parts' row is the finished
+    // row.
+    let build = |inline_control: Option<f32>, stack: bool| -> (SettingRowParts, bool) {
         let inline = inline_control.is_some();
-        let row_width = if display_face {
+        let row_width = if display_face || stack {
             SettingsWidth::Compact
         } else if inline {
             SettingsWidth::Medium
@@ -27546,7 +29975,10 @@ fn finished_setting_row(
                 Length::Fixed(current.min(narrow).max(segment_need.unwrap_or_default()));
         }
         // A column narrower than the segments sets them on as few lines as fit.
-        if stacked && segment_need.is_some_and(|need| need > text_width + 0.01) {
+        if stacked
+            && segment_need
+                .is_some_and(|need| need > segments_line_room(&row, field.key, text_width) + 0.01)
+        {
             wrap_segments(&mut row, field.key, text_width);
         }
         // Modified's Display face row is the setting's own control, the face
@@ -27587,7 +30019,8 @@ fn finished_setting_row(
     let mut inline_control = (width == SettingsWidth::Compact && !display_face)
         .then(|| compact_inline_choice_width(field, segment_need, text_width))
         .flatten();
-    let (mut parts, mut stacked) = build(inline_control);
+    let (mut parts, mut stacked) = build(inline_control, false);
+    let floor = |parts: &SettingRowParts| one_line_name_floor(&parts.name);
     // ONE MEASURE FOR THE WHOLE LINE: a one-line row leaves its label its
     // floor ([`one_line_name_floor`]) beside EVERYTHING the line holds, so
     // what the row seats beside its control (the Theme row's Browse themes…,
@@ -27595,18 +30028,46 @@ fn finished_setting_row(
     // needs it, and the row stacks where the control would fall below its
     // least, never cutting the name to a word or two.
     if inline_control.is_some() {
-        let floor = |parts: &SettingRowParts| one_line_name_floor(&parts.name);
         if one_line_row_extras(&parts.row) > 0.0
             && one_line_label_room(&parts.row, text_width) + 0.01 < floor(&parts)
         {
             let beside = one_line_row_extras(&parts.row);
             inline_control = compact_inline_choice_width(field, segment_need, text_width - beside);
-            (parts, stacked) = build(inline_control);
+            (parts, stacked) = build(inline_control, false);
         }
         if inline_control.is_some()
             && one_line_label_room(&parts.row, text_width) + 0.01 < floor(&parts)
         {
-            (parts, stacked) = build(None);
+            (parts, stacked) = build(None, false);
+        }
+    } else if !stacked {
+        // A PAGE'S ONE-LINE ROW KEEPS THE SAME MEASURE: wider than Compact a
+        // row lays its control out at its regular width, and where that
+        // leaves the name less than its floor beside everything on the line
+        // (Harness' Question priority, whose three segments left "Question"
+        // 44pt, broken inside the word; a text field and Reset in the
+        // narrowest wide column), the control gives up width first, down to
+        // its least, then the row stacks the control under the name.
+        let short = floor(&parts) - one_line_label_room(&parts.row, text_width);
+        if short > 0.01 {
+            let least = match field.kind {
+                EditKind::Bool => f32::INFINITY,
+                EditKind::Enum { .. } | EditKind::Theme => {
+                    COMPACT_INLINE_CHOICE_MIN.max(segment_need.unwrap_or_default())
+                }
+                _ => 200.0,
+            };
+            match parts
+                .row
+                .children
+                .get_mut(1)
+                .map(|control| (control.layout.width, control))
+            {
+                Some((Length::Fixed(current), control)) if current - short + 0.01 >= least => {
+                    control.layout.width = Length::Fixed(current - short);
+                }
+                _ => (parts, stacked) = build(None, true),
+            }
         }
     }
     let SettingRowParts {
@@ -27658,9 +30119,29 @@ fn switch_tail(width: SettingsWidth, text_width: f32) -> Option<f32> {
         return Some(12.0);
     }
     // The stacked control band: its spacer, the switch and Reset's place.
-    let switch = 104.0 * settings_text_scale().min(1.4);
-    (switch + reset_slot_width() + 2.0 * STACKED_CONTROL_GAP <= text_width + 0.01)
-        .then_some(STACKED_CONTROL_GAP)
+    stacked_switch_line_holds(
+        switch_control_width(text_width),
+        reset_slot_width(),
+        text_width,
+    )
+    .then_some(STACKED_CONTROL_GAP)
+}
+
+/// A SWITCH IS NEVER WIDER THAN ITS LINE: its natural width — 104pt at 1×,
+/// growing with the text to 1.4× — or the whole line `text_width` where that
+/// is less (a phone-width column at large text), where its track and its
+/// On/Off word still sit whole. A stacked switch row's fixed 145.6pt switch
+/// used to run out of its card in a 116pt column at 2× text, cutting its
+/// own word and the card's edge.
+fn switch_control_width(text_width: f32) -> f32 {
+    (104.0 * settings_text_scale().min(1.4)).min(text_width.max(0.0))
+}
+
+/// Whether a stacked switch row's control line — its spacer, the switch and
+/// a Reset (or its place) `reset_width` wide, [`STACKED_CONTROL_GAP`] apart —
+/// holds both in `text_width`; where it does not, Reset ends the label line.
+fn stacked_switch_line_holds(switch_width: f32, reset_width: f32, text_width: f32) -> bool {
+    switch_width + reset_width + 2.0 * STACKED_CONTROL_GAP <= text_width + 0.01
 }
 
 /// The gap between the controls on a stacked row's control line.
@@ -27683,14 +30164,8 @@ fn seat_stacked_reset(row: &mut UiNode, name: &str, text_width: f32) {
         return;
     };
     let room = one_line_label_room(line, text_width);
-    // The pieces [`row_name_lines`] breaks between: words, and after a
-    // hyphen inside one.
-    let widest = name
-        .split_whitespace()
-        .flat_map(|word| word.split_inclusive('-'))
-        .map(row_label_width)
-        .fold(0.0_f32, f32::max);
-    if widest <= room + 0.01 {
+    // The pieces [`row_name_lines`] breaks between ([`line_pieces`]).
+    if pieces_fit(name, room, &row_label_width) {
         return;
     }
     let mut line = row.children.remove(0);
@@ -27706,8 +30181,20 @@ fn seat_stacked_reset(row: &mut UiNode, name: &str, text_width: f32) {
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
     )
     .layout(Layout::default().width(Length::Fill).height(Length::Fill));
+    // Reset after a spacer, on its own line — and where Reset's place is the
+    // line's whole width (a phone-width column at 2× text), Reset alone and
+    // never wider than the line, so no gap pushes it past the edge.
     let mut trailing = vec![spacer];
-    trailing.extend(line.children);
+    trailing.extend(line.children.into_iter().map(|mut reset| {
+        if let Length::Fixed(width) = reset.layout.width {
+            reset.layout.width = Length::Fixed(width.min(text_width));
+        }
+        reset
+    }));
+    let resets: f32 = trailing.iter().skip(1).map(fixed_width).sum();
+    if resets + STACKED_CONTROL_GAP * (trailing.len() - 1) as f32 > text_width + 0.01 {
+        trailing.remove(0);
+    }
     row.children.insert(0, label);
     row.children.push(
         UiNode::new(
@@ -27733,30 +30220,56 @@ fn seat_stacked_switch_reset(row: &mut UiNode, text_width: f32) {
     let Some(controls) = row
         .children
         .get_mut(1)
-        .filter(|controls| controls.key.as_str().starts_with("settings/controls/"))
+        .filter(|controls| controls.key.as_str().contains("/controls/"))
     else {
         return;
     };
-    let fixed: f32 = controls
+    let line_width = |controls: &UiNode| -> f32 {
+        let fixed: f32 = controls
+            .children
+            .iter()
+            .map(|child| match child.layout.width {
+                Length::Fixed(width) => width,
+                _ => 0.0,
+            })
+            .sum();
+        fixed + controls.layout.gap * controls.children.len().saturating_sub(1) as f32
+    };
+    let reset_at = controls
         .children
         .iter()
-        .map(|child| match child.layout.width {
-            Length::Fixed(width) => width,
-            _ => 0.0,
-        })
-        .sum();
-    let gaps = controls.layout.gap * controls.children.len().saturating_sub(1) as f32;
-    if fixed + gaps <= text_width + 0.01 {
-        return;
+        .position(|child| is_reset_place(child.key.as_str()));
+    let moved = match reset_at {
+        Some(at) if line_width(controls) > text_width + 0.01 => Some(controls.children.remove(at)),
+        _ => None,
+    };
+    // The switch takes what the line leaves it, never more than its natural
+    // width ([`switch_control_width`]): the gaps and anything else on it come
+    // first.
+    let others = line_width(controls)
+        - controls
+            .children
+            .iter()
+            .filter(|child| matches!(child.content, UiContent::Switch(_)))
+            .map(|child| match child.layout.width {
+                Length::Fixed(width) => width,
+                _ => 0.0,
+            })
+            .sum::<f32>();
+    for control in &mut controls.children {
+        if let (UiContent::Switch(_), Length::Fixed(width)) =
+            (&control.content, control.layout.width)
+        {
+            control.layout.width = Length::Fixed(
+                width
+                    .min(switch_control_width(text_width - others))
+                    .max(0.0),
+            );
+        }
     }
-    let Some(at) = controls
-        .children
-        .iter()
-        .position(|child| is_reset_place(child.key.as_str()))
-    else {
+    let Some(reset) = moved else {
         return;
     };
-    let reset = controls.children.remove(at);
     let label = row.children.remove(0);
     let height = fixed_height(&label);
     let key = label
@@ -28204,47 +30717,9 @@ struct RowTagFit {
 /// narrow window or large text would cut off. The row's semantic label still
 /// says it whole.
 fn row_name_lines(name: &str, label_width: f32) -> Vec<String> {
-    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-    // A line breaks between words, and after a hyphen inside one
-    // ("Ambiguous-" / "character width"); only a piece wider than the whole
-    // column breaks inside itself.
-    let mut pieces: Vec<(&str, &str)> = Vec::new();
-    for word in name.split_whitespace() {
-        let mut rest = word;
-        while let Some(at) = rest.find('-').filter(|at| at + 1 < rest.len()) {
-            pieces.push((&rest[..=at], ""));
-            rest = &rest[at + 1..];
-        }
-        pieces.push((rest, " "));
-    }
-    let mut lines: Vec<String> = Vec::new();
-    let mut line = String::new();
-    let mut joiner = "";
-    for (piece, after) in pieces {
-        let candidate = format!("{line}{joiner}{piece}");
-        if line.is_empty() || row_label_fits(&candidate, label_width) {
-            line = candidate;
-        } else {
-            lines.push(std::mem::take(&mut line));
-            line = piece.to_string();
-        }
-        if !row_label_fits(&line, label_width) {
-            // Broken at the label's own width (no floor), so no piece paints
-            // past its box.
-            let mut broken: Vec<String> =
-                crate::tray_raster::ui_text_wrap_ranges(&line, px, label_width.max(1.0))
-                    .into_iter()
-                    .map(|range| line[range].trim_end().to_string())
-                    .collect();
-            line = broken.pop().unwrap_or_default();
-            lines.extend(broken);
-        }
-        joiner = after;
-    }
-    if !line.is_empty() || lines.is_empty() {
-        lines.push(line);
-    }
-    lines
+    // The one measured rule every line of a setting's or a fact's words
+    // keeps: whole pieces, as many to a line as its box holds.
+    wrap_to_box(name, label_width, &row_label_width)
 }
 
 /// `base` and each of `tags` after it, joined by [`FACT_SEPARATOR`].
@@ -28260,7 +30735,11 @@ fn with_tags<'a>(base: &str, tags: impl IntoIterator<Item = &'a String>) -> Stri
 /// Whether `text` fits a row's label line `label_width` wide: the label's
 /// own box, no wider, so a line never paints past it.
 fn row_label_fits(text: &str, label_width: f32) -> bool {
-    row_label_width(text) <= label_width + 0.01
+    // As the painter elides (`elide_text_label`: whole where its width is at
+    // most the box's), with no slack of its own: a line a hair over its box
+    // painted "Mark t…" where this said it fit (108.004pt of Noto Sans in
+    // 108).
+    row_label_width(text) <= label_width
 }
 
 /// How wide `text` paints on a row's label line.
@@ -28772,26 +31251,24 @@ struct DevToolsCardFit {
 
 impl DevToolsCardFit {
     /// The stacked page: the card's column, and what is left of the page's
-    /// list under the page's heading and subtitle (the most the shed ladder
-    /// keeps; the room kept under the list for a status bar holds no row), a
-    /// gap after each leading child, and what the MACOS ACCESS card keeps in
-    /// view ([`macos_access_kept_in_view`]).
+    /// list's room ([`fields_page_list_room`]: under the heading the page
+    /// really pins, and the room kept under the list for a status bar holds no
+    /// row) after the gap after the card and what the MACOS ACCESS card keeps
+    /// in view ([`macos_access_kept_in_view`]).
     fn stacked(
         state: &SettingsViewState,
         width: SettingsWidth,
         viewport: LogicalRect,
         access: &MacosAccess,
-        compact: bool,
+        lead: AccessLead,
     ) -> Self {
         let gap = settings_page_gap(state, width, viewport);
         let text_width = settings_card_text_width(viewport, width);
         Self::within(
             text_width,
-            settings_list_body_height(state, width, viewport)
-                - page_heading_height()
-                - page_subtitle_height()
-                - 3.0 * gap
-                - macos_access_kept_in_view(access, compact, text_width),
+            fields_page_list_room(state, width, viewport)
+                - gap
+                - macos_access_kept_in_view(access, lead, text_width),
         )
     }
 
@@ -28804,6 +31281,55 @@ impl DevToolsCardFit {
             line_budget: (spare / devtools_card_line_height()).floor().max(0.0) as usize,
         }
     }
+}
+
+/// The room the list of a page of settings rows has on its screen: the list's
+/// body ([`settings_list_body_height`]) under the heading the page pins
+/// ([`pinned_heading`]: its row, or none where the compact toolbar names the
+/// page). The page itself seats its list in exactly this
+/// ([`settings_fields_page`], with no preview or count over it).
+fn fields_page_list_room(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    let gap = settings_page_gap(state, width, viewport);
+    let (_, pinned) = pinned_heading(
+        state,
+        width,
+        viewport,
+        gap,
+        state.route.label(),
+        settings_fields_subtitle(state.route, false, false),
+    );
+    (settings_list_body_height(state, width, viewport) - pinned).max(0.0)
+}
+
+/// THE MACOS ACCESS BLOCK'S VERDICT IS MEASURED AGAINST THE FIRST SCREEN (no
+/// window-height cutoff, s-22): the most of it ([`AccessLead`]) that leaves the
+/// Security list's first screen holding the DEVELOPER TOOLS card at its least
+/// (one row: its state beside its button) and the block down to the end of its
+/// actions; where not even the state alone does, the state alone, so *Open
+/// Privacy & Security…*, in the first row of buttons, is on that screen
+/// wherever the room holds the card's row, the block's heading, its state and
+/// one row of buttons ([`macos_access_reach`]).
+fn macos_access_lead(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+    access: &MacosAccess,
+) -> AccessLead {
+    let gap = settings_page_gap(state, width, viewport);
+    let text_width = settings_card_text_width(viewport, width);
+    let room = fields_page_list_room(state, width, viewport);
+    let devtools_least = scaled_control_height() + 2.0 * 12.0;
+    AccessLead::ALL
+        .into_iter()
+        .find(|lead| {
+            devtools_least + gap + macos_access_kept_in_view(access, *lead, text_width)
+                <= room + 0.01
+        })
+        .unwrap_or(AccessLead::State)
 }
 
 /// Which of the card's lines a short page keeps first, after the state line
@@ -28831,14 +31357,14 @@ fn devtools_card_priority(key: &str) -> u8 {
     }
 }
 
-/// The card's text in render order: `(key, text, role, style)`. Compact keeps
-/// the state line; a granted verdict keeps it and the trade (what the owner
-/// gave, and that it can be taken back); otherwise the whole explanation, the
-/// route before the trade whose "there" it is. The card and its height both
-/// read this, so they cannot disagree.
+/// The card's text in render order: `(key, text, role, style)`. A granted
+/// verdict keeps the state line and the trade (what the owner gave, and that
+/// it can be taken back); otherwise the whole explanation, the route before
+/// the trade whose "there" it is. What of it a short page keeps is the
+/// budget's to say ([`DevToolsCardFit`], [`devtools_card_priority`]). The card
+/// and its height both read this, so they cannot disagree.
 fn devtools_card_lines(
     copy: &DevToolsCardCopy,
-    compact: bool,
 ) -> Vec<(&'static str, String, SemanticRole, StyleRef)> {
     let mut lines = vec![(
         "state",
@@ -28846,9 +31372,6 @@ fn devtools_card_lines(
         SemanticRole::Status,
         copy.state_style,
     )];
-    if compact {
-        return lines;
-    }
     if copy.granted {
         lines.push((
             "trade",
@@ -28993,7 +31516,7 @@ fn devtools_state_short_node(
 /// and its exact height come back together, so the page charges the card it
 /// paints. Every key under it but its own sits under
 /// [`MACOS_ACCESS_GESTURE_PREFIX`], so `act` refuses its button.
-fn devtools_card(access: &MacosAccess, compact: bool, fit: DevToolsCardFit) -> (UiNode, f32) {
+fn devtools_card(access: &MacosAccess, fit: DevToolsCardFit) -> (UiNode, f32) {
     let line_height = devtools_card_line_height();
     let heading_height = devtools_card_heading_height();
     let copy = devtools_card_copy(access);
@@ -29079,7 +31602,7 @@ fn devtools_card(access: &MacosAccess, compact: bool, fit: DevToolsCardFit) -> (
     // earlier one that did not fit. The state line is always kept, and never
     // cut short: whole when the budget seats it, else in the floor's words on
     // one line (`devtools_state_short_node`).
-    let mut wrapped = devtools_card_lines(&copy, compact)
+    let mut wrapped = devtools_card_lines(&copy)
         .into_iter()
         .map(|(key, text, role, style)| {
             let (node, lines_height) = wrapped_copy_node(
@@ -29516,11 +32039,12 @@ fn setting_row_parts_in(
         .as_ref()
         .is_some_and(|key| key.as_str() == format!("settings/control/{}", field.key));
     let pending = state.config_key_pending(field.key);
-    // A color draft that is not a hex color is marked where it is typed.
+    // A color draft that is not a hex color (nor, for the trail color, the
+    // cursor's color by its word) is marked where it is typed.
     let invalid = field.kind == EditKind::Color
         && retained_input.is_some_and(|input| {
             let draft = input.value().trim();
-            !draft.is_empty() && aterm_types::scheme::parse_hex(draft).is_none()
+            !draft.is_empty() && !prefs::color_value_is_valid(field.key, draft)
         });
     let control_state = ControlState {
         enabled: !pending,
@@ -29763,7 +32287,7 @@ fn setting_row_parts_in(
     }
     // Modified says what Reset returns each row to. Last, so a label too long
     // for its row loses the default before it loses why the row is idle.
-    if modified_only && let Some(default) = default_value_label(field.key) {
+    if modified_only && let Some(default) = modified_default_words(state, field.key) {
         // The theme's says "Default theme", as a Follow system slot's does:
         // aterm's own theme is named Default, and "Default: Default" reads
         // as if nothing had changed.
@@ -29830,12 +32354,6 @@ fn setting_row_parts_in(
     };
     control_node.layout.height = Length::Fill;
     let mut control_children = vec![control_node];
-    // The Theme row's permanent way to Settings ▸ Themes, at every width:
-    // the chooser to try themes in is one press from the setting, whether
-    // or not its picker is open.
-    if field.key == prefs::EDIT_THEME && !modified_only {
-        control_children.push(theme_browse_button(width));
-    }
     let reset = if offers_reset {
         // Modified discards an unsaved draft where the row has one.
         Some(if modified_only && has_draft {
@@ -29969,13 +32487,47 @@ fn fit_row_choice_label(row: &mut UiNode, max_width: f32) {
     let complete = button
         .spec
         .visual_label
-        .as_deref()
-        .unwrap_or(&button.spec.label);
-    // The room the painter elides to: the button's lead, its trailing
-    // chevron and whatever its end wears (a colour chip, a badge). The
-    // semantic label/value remain complete.
+        .clone()
+        .unwrap_or_else(|| button.spec.label.clone());
+    // THE CHOICE KEEPS ITS WORDS (one measured ladder, the room the painter
+    // fits to: the button's lead, its trailing arrow and whatever its end
+    // wears — a colour chip, a badge): the whole choice; else the choice
+    // without its "(default)", which the row's absent Reset says; else, the
+    // arrow given up (the button still opens what it opens), each of those
+    // again; else, where the button wears the colour it names, that colour
+    // alone, its chip; only then the choice cut to the room. A stacked colour
+    // row at 22 columns painted "Automatic (default)" as "Auto…" beside room
+    // for "Automatic"; AI CLIs' "Claude (default)" read "Claude (…" at 2×.
+    // The semantic label and value remain complete.
+    let fits = |spec: &ButtonSpec, words: &str| {
+        crate::native_ui::native_button_label_width(words)
+            <= crate::native_ui::text_button_label_room(spec, max_width)
+                + crate::native_ui::TEXT_FIT_SLACK
+    };
+    let bare = complete
+        .strip_suffix(" (default)")
+        .filter(|bare| !bare.is_empty())
+        .map(str::to_string);
+    let forms: Vec<String> = std::iter::once(complete.clone()).chain(bare).collect();
+    if let Some(words) = forms.iter().find(|words| fits(&button.spec, words)) {
+        button.spec.visual_label = Some(words.clone());
+        return;
+    }
+    if button.spec.trailing_icon.is_some() {
+        let mut bare_spec = button.spec.clone();
+        bare_spec.trailing_icon = None;
+        if let Some(words) = forms.iter().find(|words| fits(&bare_spec, words)) {
+            button.spec.trailing_icon = None;
+            button.spec.visual_label = Some(words.clone());
+            return;
+        }
+    }
+    if button.spec.chip.is_some() {
+        button.spec.visual_label = Some(String::new());
+        return;
+    }
     button.spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-        complete,
+        forms.last().unwrap_or(&complete),
         crate::native_ui::text_button_label_room(&button.spec, max_width),
     ));
 }
@@ -30328,12 +32880,17 @@ fn color_submission_error(field: &EditField, raw: Option<&str>) -> Option<String
     let raw = raw?.trim();
     (field.kind == EditKind::Color
         && !raw.is_empty()
-        && aterm_types::scheme::parse_hex(raw).is_none())
+        && !prefs::color_value_is_valid(field.key, raw))
     .then(|| {
-        format!(
-            "{} needs a hex color like #D0D0D0; {raw:?} was not saved",
-            field.label
-        )
+        let takes = if field.key == prefs::EDIT_CURSOR_TRAIL_COLOR {
+            format!(
+                "a hex color like #D0D0D0, or {} for the cursor's color",
+                prefs::TRAIL_COLOR_CURSOR
+            )
+        } else {
+            "a hex color like #D0D0D0".to_string()
+        };
+        format!("{} needs {takes}; {raw:?} was not saved", field.label)
     })
 }
 
@@ -30416,13 +32973,11 @@ fn about_page(
     let text_scale = settings_text_scale();
     let viewport = LogicalRect::new(0.0, 0.0, viewport_width, viewport_height);
     let gap = settings_page_gap(state, width, viewport);
-    let (heading, heading_height) = pinned_heading(width, viewport, gap, "About", "");
+    let (heading, heading_height) = pinned_heading(state, width, viewport, gap, "About", "");
     // The room the page's list has under its heading: every section is
     // authored to fit it whole.
     let room = (settings_list_body_height(state, width, viewport) - heading_height)
         .max(scaled_control_height());
-    let compact_section_height = room;
-    let short_compact = width == SettingsWidth::Compact && compact_section_height < 270.0;
     let value = |wanted: &str, fallback: &str| {
         about
             .semantic_rows()
@@ -30440,39 +32995,48 @@ fn about_page(
     let content =
         settings_page_content_width(viewport_width, width, PageLayout::Form.maximum(width));
     let hero_inner = (content - 48.0).max(0.0);
-    let short_wordmark_width = 88.0 * text_scale.min(1.4);
-    let text_column = if short_compact {
-        (content - 24.0 - short_wordmark_width - 8.0).max(0.0)
-    } else {
-        hero_inner
+    // The short hero's wordmark at its own measure, in the face it paints in.
+    let short_wordmark_width = {
+        let (px, face) = crate::native_ui::wordmark_typography("aterm", f32::INFINITY);
+        (crate::tray_raster::ui_text_width_for(face, "aterm", px.get()) + 8.0).ceil()
     };
     // The two buttons at their own widths, side by side where the hero holds
     // both, else one under the other; never a full-width bar. Each paints its
-    // whole label where it fits the hero's column, else its short form, which
-    // its accessible name contains (label in name): "Copy Build" is in "Copy
-    // Build Information"; "Open Site" is not in "Open Project Site", so a short
-    // site button is named by its painted words.
-    let fits_button = |label: &str| {
-        crate::native_ui::native_button_label_width(label) + 28.0 <= hero_inner + 0.01
-    };
-    let copy_label = if fits_button("Copy Build Information") {
-        "Copy Build Information"
-    } else {
-        "Copy Build"
-    };
-    let site_label = if fits_button("Open Project Site") {
-        "Open Project Site"
-    } else {
+    // words by the one rule every page button keeps ([`button_words`]): its
+    // whole label where it is one line of the hero's column, else its short
+    // form, else its words on as many lines as the column needs — never cut
+    // ("Cop…" and "Ope…" at 2× text on a phone-width page). A short form's
+    // words are in the button's name (label in name): "Copy Build" is in "Copy
+    // Build Information"; "Open Site" is not in "Open Project Site", so a
+    // short site button is named by its painted words.
+    let (copy_visual, copy_lines) =
+        button_words("Copy Build Information", &["Copy Build"], hero_inner);
+    let (site_visual, site_lines) = button_words("Open Project Site", &["Open Site"], hero_inner);
+    let site_label = if painted_words(&site_visual) == "Open Site" {
         "Open Site"
+    } else {
+        "Open Project Site"
     };
-    let copy_width = page_button_width(copy_label, hero_inner);
-    let site_width = page_button_width(site_label, hero_inner);
-    let actions_in_row = copy_width + 8.0 + site_width <= hero_inner;
+    let button_width = |visual: &str, lines: usize| {
+        if lines > 1 {
+            hero_inner
+        } else {
+            page_button_width(visual, hero_inner)
+        }
+    };
+    let copy_width = button_width(&copy_visual, copy_lines);
+    let site_width = button_width(&site_visual, site_lines);
+    let actions_in_row =
+        copy_lines == 1 && site_lines == 1 && copy_width + 8.0 + site_width <= hero_inner;
     let row_actions_height = 40.0_f32.max(32.0 * text_scale);
+    let copy_height =
+        crate::native_ui::native_button_height_for_lines(copy_lines, scaled_control_height());
+    let site_height =
+        crate::native_ui::native_button_height_for_lines(site_lines, scaled_control_height());
     let compact_actions_height = if actions_in_row {
         row_actions_height
     } else {
-        scaled_control_height() * 2.0 + 8.0
+        copy_height + site_height + 8.0
     };
     let hero_actions = UiNode::new(
         "about/actions",
@@ -30492,7 +33056,7 @@ fn about_page(
             "about/copy-build-info",
             UiContent::Button(
                 Control::new(
-                    ButtonSpec::new("Copy Build Information").visual_label(copy_label),
+                    ButtonSpec::new("Copy Build Information").visual_label(copy_visual),
                     ActionId::new("about/copy-build-info"),
                 )
                 .style(StyleRef::Primary),
@@ -30502,14 +33066,14 @@ fn about_page(
             if actions_in_row {
                 Length::Fill
             } else {
-                Length::Fixed(scaled_control_height())
+                Length::Fixed(copy_height)
             },
         )),
         UiNode::new(
             "about/open-site",
             UiContent::Button(
                 Control::new(
-                    ButtonSpec::new(site_label).visual_label(site_label),
+                    ButtonSpec::new(site_label).visual_label(site_visual),
                     ActionId::new("about/open-site"),
                 )
                 .state(ControlState {
@@ -30523,19 +33087,35 @@ fn about_page(
             if actions_in_row {
                 Length::Fill
             } else {
-                Length::Fixed(scaled_control_height())
+                Length::Fixed(site_height)
             },
         )),
     ]);
-    let wordmark_height = 38.0_f32.max(30.0 * text_scale);
+    // THE WORDMARK IS WHOLE AT EVERY SIZE: in the hero's type, made smaller
+    // where the hero's column cannot hold it ([`native_ui::wordmark_typography`]),
+    // its line as much shorter.
+    let wordmark_base_height = 38.0_f32.max(30.0 * text_scale);
+    let wordmark_fit = {
+        let natural = crate::native_ui::wordmark_typography("aterm", f32::INFINITY).0;
+        crate::native_ui::wordmark_typography("aterm", hero_inner)
+            .0
+            .get()
+            / natural.get()
+    };
+    let wordmark_height = (wordmark_base_height * wordmark_fit).ceil();
     let status_height = 20.0_f32.max(18.0 * text_scale);
     let capability_height = 22.0_f32.max(18.0 * text_scale);
     let wordmark = UiNode::new(
         "about/wordmark",
-        UiContent::Text(TextSpec {
-            text: "aterm".to_string(),
+        UiContent::Custom(AuditedCustomNode {
+            audit_id: crate::native_ui::WORDMARK_AUDIT,
             role: SemanticRole::Heading,
-            style: StyleRef::Hero,
+            label: "aterm".to_string(),
+            value: None,
+            action: None,
+            focusable: false,
+            focused: false,
+            focus_visible: false,
         }),
     )
     .layout(Layout::default().height(Length::Fixed(wordmark_height)));
@@ -30545,35 +33125,35 @@ fn about_page(
     // words (where the wrapper would break inside the word) paints none, and
     // the Build Information card then lists it.
     let tagline_text = value("tagline", crate::build_info::TAGLINE);
-    let tagline = {
+    let tagline_in = |column: f32| {
         let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Plain);
         tagline_text
             .split_whitespace()
-            .all(|word| crate::tray_raster::ui_text_width(word, px) <= text_column)
+            .all(|word| crate::tray_raster::ui_text_width(word, px) <= column)
             .then(|| {
                 wrapped_copy_node(
                     "about/tagline",
                     &tagline_text,
                     SemanticRole::Text,
                     StyleRef::Plain,
-                    text_column,
+                    column,
                     26.0_f32.max(20.0 * text_scale),
                     None,
                 )
             })
     };
-    let tagline_height = tagline.as_ref().map_or(0.0, |(_, height)| *height);
-    let tagline = tagline.map(|(node, _)| node);
-    let version_summary = UiNode::new(
-        "about/version-summary",
-        UiContent::Text(TextSpec {
-            // The version alone: the build number is a build-information row.
-            text: format!("Version {}", value("version", "development")),
-            role: SemanticRole::Status,
-            style: StyleRef::Quiet,
-        }),
-    )
-    .layout(Layout::default().height(Length::Fixed(status_height)));
+    // The version alone (the build number is a build-information row),
+    // wrapped to its column where one line cannot hold it, never cut.
+    let version_text = format!("Version {}", value("version", "development"));
+    let version_in = |column: f32| {
+        wrapped_words_node(
+            "about/version-summary",
+            &version_text,
+            (SemanticRole::Status, StyleRef::Quiet),
+            column,
+            status_height,
+        )
+    };
     // The byline says WHO and WHERE FROM: author · company · site
     // (`alab.systems`, the `site` row — owner, 2026-09-14) wherever that whole
     // line fits, then author · company, then the author, then the author's short
@@ -30596,9 +33176,9 @@ fn about_page(
     // none, and none loses a fact: whatever the painted line does not name
     // (`author`, `company`, `site`) is a row of the Build Information card.
     let site = value("site", "");
-    let byline = {
+    let byline_in = |column: f32| {
         let px = 13.0 * text_scale;
-        let fits = |line: &str| crate::tray_raster::ui_text_width(line, px) <= text_column;
+        let fits = |line: &str| crate::tray_raster::ui_text_width(line, px) <= column;
         let author_company = crate::build_info::AUTHOR_COMPANY_BYLINE;
         // A build with no `site` row authors no full rung, rather than a line
         // ending in a dangling separator.
@@ -30614,6 +33194,54 @@ fn about_page(
             .position(|form| !form.is_empty() && fits(form))
             .map(|rung| (rung, ladder[rung].to_string()))
     };
+    let hero_vertical_padding = if width == SettingsWidth::Compact {
+        12.0
+    } else {
+        20.0
+    };
+    // THE SHORT HERO IS MEASURED, not taken below a fixed height: the full hero
+    // — the wordmark over the purpose, the version and the byline, its buttons
+    // inside it — wherever it fits the list's room whole; else, on a compact
+    // page, the short hero, one row (the wordmark beside the rest), which saves
+    // the height of the lines it sets beside the wordmark — wherever the column
+    // beside the wordmark holds the version whole. A phone at the largest text
+    // has no such column, and keeps the full hero, its buttons the stop after
+    // it.
+    let full_hero_height = {
+        let tagline = tagline_in(hero_inner).map_or(0.0, |(_, height)| height);
+        let byline = byline_in(hero_inner).map_or(0.0, |_| capability_height);
+        let children = 2 + usize::from(tagline > 0.0) + usize::from(byline > 0.0);
+        wordmark_height
+            + tagline
+            + version_in(hero_inner).1
+            + byline
+            + hero_vertical_padding * 2.0
+            + (children - 1) as f32 * 6.0
+            + 6.0
+            + compact_actions_height
+    };
+    let short_column = (content - 24.0 - short_wordmark_width - 8.0).max(0.0);
+    let version_fits_short = {
+        let (px, face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+        crate::tray_raster::ui_text_width_for(
+            face,
+            &format!("Version {}", value("version", "development")),
+            px,
+        ) <= short_column
+    };
+    let short_compact =
+        width == SettingsWidth::Compact && full_hero_height > room + 0.01 && version_fits_short;
+    let text_column = if short_compact {
+        short_column
+    } else {
+        hero_inner
+    };
+    let (version_summary, status_height) = version_in(text_column);
+    let tagline = tagline_in(text_column);
+    let tagline_height = tagline.as_ref().map_or(0.0, |(_, height)| *height);
+    let tagline = tagline.map(|(node, _)| node);
+    let byline = byline_in(text_column);
     // The provenance facts the painted byline names, which the card then does
     // not repeat: rung 0 names the author, the company and the site, rung 1 the
     // author and the company, rungs 2 and 3 the author.
@@ -30645,8 +33273,11 @@ fn about_page(
     // exact version and the byline — the attribution is painted wherever a rung
     // of it fits the column beside the wordmark, as in the full hero.
     let (mut hero_children, identity_height) = if short_compact {
+        // Beside the words, at its own measure: whole at the hero's size.
+        let wordmark_height = wordmark_base_height;
         let mut wordmark = wordmark;
         wordmark.layout.width = Length::Fixed(short_wordmark_width);
+        wordmark.layout.height = Length::Fixed(wordmark_height);
         let lines = usize::from(tagline.is_some()) + 1 + usize::from(capabilities.is_some());
         let detail_height = tagline_height
             + status_height
@@ -30691,11 +33322,6 @@ fn about_page(
             wordmark_height + tagline_height + status_height + capability_height,
         )
     };
-    let hero_vertical_padding = if width == SettingsWidth::Compact {
-        12.0
-    } else {
-        20.0
-    };
     // The hero is exactly its content: no floor that pads it with empty card.
     let identity_block = identity_height
         + hero_vertical_padding * 2.0
@@ -30735,35 +33361,17 @@ fn about_page(
         .filter(|(key, _)| !((*key == "tagline" && tagline_painted) || byline_names.contains(key)))
         .map(|(key, value)| ((*key).to_string(), about_fact_value(key, value, messages)))
         .collect::<Vec<_>>();
-    let metadata_heading_height = 22.0_f32.max(16.0 * text_scale);
-    let metadata_row_height = 28.0_f32.max(18.0 * text_scale);
-    // The card's heading is its whole name wherever that fits the card's text
-    // column, measured; its short form where it does not.
-    let build_heading = {
-        let (px, face) =
-            crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
-        if crate::tray_raster::ui_text_width_for(face, "BUILD INFORMATION", px)
-            <= content - 2.0 * ABOUT_METADATA_CARD_PADDING
-        {
-            "BUILD INFORMATION"
-        } else {
-            "BUILD INFO"
-        }
-    };
     // One card, the page's width: painted LINES, not facts — a long non-code
-    // value (the compiler line) wraps at its " · " separators, and the card
-    // must buy that height. The hero names the site and links it, so no
-    // second card repeats it.
-    let value_width = about_metadata_value_width(viewport_width, width);
-    let card_height = ABOUT_METADATA_CARD_PADDING * 2.0
-        + metadata_heading_height
-        + metadata_line_count(&build_rows, value_width) as f32 * (metadata_row_height + 4.0);
-    let build = metadata_card(
+    // value (the compiler line) wraps, and the card buys that height; its
+    // caption is its whole name where that is one line of the card's text
+    // column, else its short one, else the whole name on two. The hero names
+    // the site and links it, so no second card repeats it.
+    let (build, card_height) = metadata_card(
         "about/provenance",
-        build_heading,
+        caption_words("BUILD INFORMATION", "BUILD INFO", card_text_width(content)),
         &build_rows,
-        card_height,
-        value_width,
+        content,
+        about_metadata_label_width(),
     );
     let mut sections = vec![ListItem::of(hero, hero_height)];
     if split_compact_actions {
@@ -30778,19 +33386,14 @@ fn about_page(
         .iter()
         .map(|face| (face.label.to_string(), face.face.to_string()))
         .collect::<Vec<_>>();
-    let credits_height = ABOUT_METADATA_CARD_PADDING * 2.0
-        + metadata_heading_height
-        + metadata_line_count(&credit_rows, value_width) as f32 * (metadata_row_height + 4.0);
-    sections.push(ListItem::of(
-        metadata_card(
-            "about/font-credits",
-            "FONT CREDITS",
-            &credit_rows,
-            credits_height,
-            value_width,
-        ),
-        credits_height,
-    ));
+    let (credits, credits_height) = metadata_card(
+        "about/font-credits",
+        "FONT CREDITS",
+        &credit_rows,
+        content,
+        about_metadata_label_width(),
+    );
+    sections.push(ListItem::of(credits, credits_height));
     let mut out = heading;
     out.push(scroll::list_page_peeking(
         state,
@@ -30805,6 +33408,34 @@ fn about_page(
 }
 
 const ABOUT_METADATA_CARD_PADDING: f32 = 18.0;
+
+/// THE SIDE PADDING OF A CARD OF FACTS OR ROWS (About's, Harness's, AI CLIs'
+/// and Tab Control's cards): [`ABOUT_METADATA_CARD_PADDING`], or 12pt where
+/// the card is narrow for its words — where that padding would leave its text
+/// column under 16 ems of body text at the live text size (a phone-width
+/// window at large text: 110pt for 26px words at 22 columns, 122pt at 12pt,
+/// which still keeps a landed row's block [`harness_page::ROW_INSET`] round its words).
+/// The words get the room the padding would have taken; over and under them
+/// the card keeps its padding. One measure for the card and the rows laid
+/// out in it ([`card_text_width`]).
+fn card_side_padding(card_width: f32) -> f32 {
+    let em = 13.0 * settings_text_scale();
+    if card_width - 2.0 * ABOUT_METADATA_CARD_PADDING >= 16.0 * em {
+        ABOUT_METADATA_CARD_PADDING
+    } else {
+        NARROW_CARD_PADDING
+    }
+}
+
+/// A narrow card's side padding ([`card_side_padding`]).
+const NARROW_CARD_PADDING: f32 = 12.0;
+
+/// The text column of a card `card_width` wide: the card less its side
+/// padding each side ([`card_side_padding`]).
+fn card_text_width(card_width: f32) -> f32 {
+    (card_width - 2.0 * card_side_padding(card_width)).max(0.0)
+}
+
 const ABOUT_METADATA_LABEL_WIDTH: f32 = 104.0;
 const ABOUT_METADATA_ROW_GAP: f32 = 10.0;
 const ABOUT_METADATA_TEXT_SAFETY: f32 = 4.0;
@@ -30813,17 +33444,59 @@ fn about_metadata_label_width() -> f32 {
     ABOUT_METADATA_LABEL_WIDTH * settings_text_scale().min(1.2)
 }
 
-/// The value column of About's build information card, a card of the page's
-/// whole width.
-fn about_metadata_value_width(viewport_width: f32, width: SettingsWidth) -> f32 {
-    // About is one column of fact cards: the form measure ([`PageLayout`]).
-    let card_width =
-        settings_page_content_width(viewport_width, width, PageLayout::Form.maximum(width));
-    (card_width
-        - ABOUT_METADATA_CARD_PADDING * 2.0
-        - about_metadata_label_width()
-        - ABOUT_METADATA_ROW_GAP)
-        .max(0.0)
+/// A FACT CARD'S LABEL COLUMN (Settings ▸ Harness's STATUS, EFFECT OF EACH
+/// AUTOPILOT and WHAT THE HARNESS DID, Tab Control's summary, AI's WHO
+/// REVIEWS and WHAT IS HELD): as wide as the widest of ITS OWN `rows`'
+/// labels in the type the card paints them at the text scale now, never
+/// narrower than About's column — so at 2× text `Supervision`, `Waited at
+/// limits` and `System Vitals` are whole — as far as it leaves the value
+/// column its widest word ([`metadata_value_lines`] wraps a value between
+/// its words, so a word is what the column must hold whole). At 1× every
+/// label fits About's column, which it keeps. Each card its own column: one
+/// shared with another card's longer labels would take a value's room for
+/// a label it does not draw. About's own cards keep About's column
+/// ([`about_metadata_label_width`]).
+fn fact_label_width(rows: &[(String, String)], inner: f32) -> f32 {
+    let px = 13.0 * crate::native_appearance::text_scale();
+    let label = rows
+        .iter()
+        .map(|(label, _)| metadata_value_text_width(about_fact_label(label), px, false))
+        .fold(0.0_f32, f32::max)
+        + ABOUT_METADATA_TEXT_SAFETY;
+    let word = rows
+        .iter()
+        .filter(|(label, _)| !metadata_value_is_code(label))
+        .flat_map(|(_, value)| value_words(value))
+        .map(|word| metadata_value_text_width(word, px, false))
+        .fold(0.0_f32, f32::max)
+        + ABOUT_METADATA_TEXT_SAFETY;
+    about_metadata_label_width().max(label.min(inner - ABOUT_METADATA_ROW_GAP - word))
+}
+
+/// The least parts [`metadata_value_lines`] can break `value` into: its
+/// words, and a path's pieces after each `/`.
+fn value_words(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(FACT_SEPARATOR)
+        .flat_map(|segment| segment.split(' '))
+        .flat_map(|word| word.split_inclusive('/'))
+}
+
+/// A card caption's words for a text column `width` wide: the whole caption
+/// where it is one line there, else its short form where that is, else the
+/// whole caption, which then wraps to the column ([`caption_node`]) — never
+/// cut.
+fn caption_words<'a>(full: &'a str, short: &'a str, width: f32) -> &'a str {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
+    let one_line = |text: &str| {
+        crate::tray_raster::ui_text_width_for(face, text, px)
+            <= width + crate::native_ui::TEXT_FIT_SLACK
+    };
+    if one_line(full) || !one_line(short) {
+        full
+    } else {
+        short
+    }
 }
 
 /// A build fact's name as the page shows it; the row's key, and the copied
@@ -30883,219 +33556,474 @@ fn metadata_value_text_width(text: &str, px: f32, code: bool) -> f32 {
     }
 }
 
-/// Grapheme-safe ellipsis using the exact face and logical size that the native
-/// tree compiler paints for metadata values. Human-readable values retain the
-/// leading phrase; code/build identifiers retain both identifying ends.
-fn elide_metadata_value(text: &str, max_width: f32, code: bool) -> String {
-    let px = 13.0 * crate::native_appearance::text_scale();
-    if !max_width.is_finite() || max_width <= 0.0 || !px.is_finite() || px <= 0.0 {
-        return String::new();
-    }
-    let measure = |candidate: &str| metadata_value_text_width(candidate, px, code);
-    if measure(text) <= max_width {
-        return text.to_string();
-    }
-    if !code {
-        // The longest leading run of whole graphemes that fits with its `…`,
-        // found in one pass of the measuring pen.
-        let cuts = text
-            .grapheme_indices()
-            .map(|(at, _)| at)
-            .collect::<Vec<_>>();
-        return crate::tray_raster::ui_text_widths_at(
-            crate::widget::TextFace::Ui,
-            text,
-            &cuts,
-            "…",
-            px,
-        )
-        .iter()
-        .rposition(|width| *width <= max_width)
-        .map_or_else(String::new, |fit| format!("{}…", &text[..cuts[fit]]));
-    }
-    // A code identifier keeps both ends: each shorter candidate measured.
-    let graphemes = text.graphemes().collect::<Vec<_>>();
-    for retained in (0..graphemes.len()).rev() {
-        let prefix = retained.div_ceil(2);
-        let suffix = retained - prefix;
-        let candidate = format!(
-            "{}…{}",
-            graphemes[..prefix].concat(),
-            graphemes[graphemes.len() - suffix..].concat()
-        );
-        if measure(&candidate) <= max_width {
-            return candidate;
+/// The most painted lines one fact's value takes: a pathological value cannot
+/// stretch its card without limit (its last kept line then ends in an
+/// ellipsis that fits, saying it ran out of room). Every value aterm states is
+/// whole inside it at the narrowest column a 2× page gives — the running path
+/// of a development build in its build cache included, which took more than
+/// the 16 lines this was and lost its end ("96b519…") at 22 columns. A fact
+/// taller than a screen is listed a part at a time by the page's list.
+const MAX_METADATA_VALUE_LINES: usize = 64;
+
+/// THE PIECES A LINE OF WORDS BREAKS BETWEEN, `(joiner, piece)` each: its
+/// words (joined by a space), and inside a word after a `/` (a path wraps at
+/// its folders instead of losing its end) or a `-` (`aarch64-` /
+/// `apple-darwin`), as a setting's name breaks ([`row_name_lines`]). A fact
+/// separator (` · `) stays with the word before it, so no line starts with
+/// one.
+fn line_pieces(text: &str) -> Vec<(&str, &str)> {
+    // Each word's byte range, in order.
+    let mut words: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = None;
+    for (at, c) in text.char_indices() {
+        match (c.is_whitespace(), start) {
+            (true, Some(from)) => {
+                words.push(from..at);
+                start = None;
+            }
+            (false, None) => start = Some(at),
+            _ => {}
         }
     }
-    String::new()
+    if let Some(from) = start {
+        words.push(from..text.len());
+    }
+    let separator = FACT_SEPARATOR.trim();
+    let mut pieces: Vec<(&str, &str)> = Vec::new();
+    // The byte range the last piece covers, so a separator can join it.
+    let mut last: Option<std::ops::Range<usize>> = None;
+    for word in words {
+        if &text[word.clone()] == separator
+            && let (Some(range), Some(piece)) = (last.as_mut(), pieces.last_mut())
+        {
+            range.end = word.end;
+            piece.1 = &text[range.clone()];
+            continue;
+        }
+        let mut joiner = if pieces.is_empty() { "" } else { " " };
+        let mut from = word.start;
+        // After a `/` or a `-` that another character follows, but not
+        // inside a run of them (`https://`, `--columns`).
+        let chars = text[word.clone()].char_indices().collect::<Vec<_>>();
+        let breaks = chars
+            .windows(2)
+            .filter(|pair| {
+                let ((_, mark), (_, next)) = (pair[0], pair[1]);
+                matches!(mark, '/' | '-') && mark != next && !matches!(next, '/' | '-')
+            })
+            .map(|pair| word.start + pair[1].0)
+            .collect::<Vec<_>>();
+        for to in breaks.into_iter().chain([word.end]) {
+            pieces.push((joiner, &text[from..to]));
+            last = Some(from..to);
+            from = to;
+            joiner = "";
+        }
+    }
+    pieces
 }
 
-/// How many painted lines one metadata fact needs at `value_width`, and the
-/// lines themselves. A non-code value that cannot fit its column wraps at its
-/// own " · " separators instead of ellipsizing mid-token (2026-08 settings
-/// audit: the About compiler row painted "release · tr…", chopping
-/// `trust_verify` in half). Code identifiers keep the two-ended elision — a
-/// hash's identifying ends beat any wrap — and a single unbreakable segment
-/// still elides as a last resort. Bounded so a pathological value cannot
-/// stretch its card without limit.
-const MAX_METADATA_VALUE_LINES: usize = 3;
+/// `text`'s lines in a box `width` wide, each as full as the box holds,
+/// measured by `measure` (the face and size the lines paint in): broken
+/// between its pieces ([`line_pieces`]), and inside a piece only where the
+/// piece alone is wider than the box — at the box's own width, so no line
+/// paints past it, each line a piece breaks ending in a hyphen that says the
+/// word goes on ("Architec-" / "ture"). Nothing is cut and nothing is
+/// dropped.
+fn wrap_to_box(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
+    wrap_to_box_marked(text, width, measure, "-")
+}
 
-fn metadata_value_lines(label: &str, value: &str, value_width: f32) -> Vec<String> {
-    let budget = (value_width - ABOUT_METADATA_TEXT_SAFETY).max(0.0);
-    let code = metadata_value_is_code(label);
-    let px = 13.0 * crate::native_appearance::text_scale();
-    if code || metadata_value_text_width(value, px, code) <= budget {
-        return vec![elide_metadata_value(value, budget, code)];
+/// [`wrap_to_box`] whose lines inside a piece end in `mark` — none for a
+/// code identifier, where a hyphen would read as one of its characters.
+fn wrap_to_box_marked(
+    text: &str,
+    width: f32,
+    measure: &dyn Fn(&str) -> f32,
+    mark: &str,
+) -> Vec<String> {
+    let fits = |line: &str| measure(line) <= width + crate::native_ui::TEXT_FIT_SLACK;
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for (joiner, piece) in line_pieces(text) {
+        let candidate = if line.is_empty() {
+            piece.to_string()
+        } else {
+            format!("{line}{joiner}{piece}")
+        };
+        if fits(&candidate) {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if fits(piece) {
+            line = piece.to_string();
+            continue;
+        }
+        // A piece wider than the whole box breaks inside itself, grapheme
+        // by grapheme, at the box's width, its mark included — and leaves
+        // its last line three graphemes where the line before can spare
+        // them, never a lone letter ("hardene-" / "d,").
+        let graphemes = piece.graphemes().collect::<Vec<_>>();
+        let mut chunks: Vec<Vec<&str>> = vec![Vec::new()];
+        for (index, grapheme) in graphemes.iter().enumerate() {
+            let last = index + 1 == graphemes.len();
+            let chunk = chunks.last_mut().expect("one chunk");
+            let candidate = format!(
+                "{}{grapheme}{}",
+                chunk.concat(),
+                if last { "" } else { mark }
+            );
+            if chunk.is_empty() || fits(&candidate) {
+                chunk.push(grapheme);
+            } else {
+                chunks.push(vec![grapheme]);
+            }
+        }
+        if let [.., before, tail] = chunks.as_mut_slice() {
+            while tail.len() < 3 && before.len() > 3 {
+                let moved = before.pop().expect("more than three");
+                tail.insert(0, moved);
+                if !fits(&tail.concat()) {
+                    before.push(tail.remove(0));
+                    break;
+                }
+            }
+        }
+        let tail = chunks.pop().expect("one chunk").concat();
+        lines.extend(
+            chunks
+                .into_iter()
+                .map(|chunk| format!("{}{mark}", chunk.concat())),
+        );
+        line = tail;
     }
-    // Break at " · " separators, and inside a path too long for one line,
-    // after a `/`, so a long path wraps instead of losing its end.
-    let mut tokens: Vec<(&str, &str)> = Vec::new();
-    for (index, segment) in value.split(FACT_SEPARATOR).enumerate() {
-        let joiner = if index == 0 { "" } else { FACT_SEPARATOR };
-        if segment.contains('/') && metadata_value_text_width(segment, px, false) > budget {
-            for (piece_index, piece) in segment.split_inclusive('/').enumerate() {
-                tokens.push((if piece_index == 0 { joiner } else { "" }, piece));
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Whether every piece of `text` ([`line_pieces`]) is whole in a box `width`
+/// wide, so its wrap there never breaks inside one.
+fn pieces_fit(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> bool {
+    line_pieces(text)
+        .iter()
+        .all(|(_, piece)| measure(piece) <= width + crate::native_ui::TEXT_FIT_SLACK)
+}
+
+/// How wide a fact's name paints: quiet Body copy in the UI face.
+fn fact_name_width(text: &str) -> f32 {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+    crate::tray_raster::ui_text_width_for(face, text, px)
+}
+
+/// HOW A CARD OF FACTS SETS THEM — one measured rule, the setting rows'
+/// (a name wraps to the box it is drawn in; a control goes under its label
+/// where the row cannot hold both): each fact's name in a column beside its
+/// value wherever every fact's words sit in those columns whole — each piece
+/// of a name in the name column, each piece of a value in the value column,
+/// a code value whole in it — so no line there breaks inside a word; else
+/// every name over its value, each the card's whole text width. Decided for
+/// the card, so its facts line up.
+///
+/// The name column used to be a fixed 104pt (×1.2 at most) whatever its
+/// words, and the names were elided into it ("Architec…", "Supervi…" at 2×
+/// text; at a phone width it was wider than the card itself); the value
+/// column was what that left, a 35pt column at 2× that painted every value
+/// as "…".
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FactColumns {
+    /// The name column, or the whole text width where names stand over values.
+    label: f32,
+    /// The value column, or the whole text width.
+    value: f32,
+    stacked: bool,
+}
+
+impl FactColumns {
+    /// The columns `rows` take in a card `inner` wide whose name column is
+    /// `label_width` where its facts sit beside each other — or as wide as
+    /// the widest piece of a name, where that is wider, up to two fifths of
+    /// the card (a wide card at 2× text holds "Unsupervised" beside its
+    /// value, as a phone-width one cannot).
+    fn measure(rows: &[(String, String)], inner: f32, label_width: f32) -> Self {
+        let inner = inner.max(0.0);
+        let widest = rows
+            .iter()
+            .flat_map(|(name, _)| line_pieces(about_fact_label(name)))
+            .map(|(_, piece)| fact_name_width(piece))
+            .fold(0.0_f32, f32::max);
+        let label = label_width.max(widest.min(inner * 0.4)).min(inner);
+        let value = (inner - label - ABOUT_METADATA_ROW_GAP).max(0.0);
+        let px = 13.0 * crate::native_appearance::text_scale();
+        let beside = rows.iter().all(|(name, text)| {
+            let code = metadata_value_is_code(name);
+            pieces_fit(about_fact_label(name), label, &fact_name_width)
+                && if code {
+                    metadata_value_text_width(text, px, true)
+                        <= value + crate::native_ui::TEXT_FIT_SLACK
+                } else {
+                    pieces_fit(text, value, &|piece| {
+                        metadata_value_text_width(piece, px, false)
+                    })
+                }
+        });
+        if beside {
+            Self {
+                label,
+                value,
+                stacked: false,
             }
         } else {
-            tokens.push((joiner, segment));
+            Self {
+                label: inner,
+                value: inner,
+                stacked: true,
+            }
         }
     }
+}
+
+/// One fact's value as the lines it paints in its column `value_width`
+/// wide, never cut: whole where it fits; a non-code value wrapped at its own
+/// " · " separators where each part it joins is whole on a line, else at its
+/// pieces ([`wrap_to_box`]) — the About compiler row once painted "release ·
+/// tr…", chopping `trust_verify` in half (2026-08 settings audit); a code
+/// identifier (a commit, a build) on as many lines as its characters take,
+/// with no hyphen to read as one of them. A code value used to keep its two
+/// ends and lose its middle, and a phone-width column at 2× text painted
+/// the build number "179…328" and the commit "6e8…73a".
+fn metadata_value_lines(label: &str, value: &str, value_width: f32) -> Vec<String> {
+    let budget = value_width.max(0.0);
+    let code = metadata_value_is_code(label);
+    let px = 13.0 * crate::native_appearance::text_scale();
+    let measure = |line: &str| metadata_value_text_width(line, px, code);
+    let fits = |line: &str| measure(line) <= budget + crate::native_ui::TEXT_FIT_SLACK;
+    if fits(value) {
+        return vec![value.to_string()];
+    }
+    if code {
+        return wrap_to_box_marked(value, budget, &measure, "");
+    }
+    // Whole parts, as many to a line as it holds, a line break standing for
+    // the separator it falls on; a part too wide for a line takes lines of
+    // its own, wrapped between its pieces ([`wrap_to_box`]: its words, a
+    // path after its `/`s), and the part after it begins the next — so a
+    // fact the value lists is never broken after another's end or before
+    // another's start (`held 0%` / `at its prompt 98%, finished` / `83%`).
     let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for (joiner, token) in tokens {
-        let candidate = if current.is_empty() {
-            token.to_string()
-        } else {
-            format!("{current}{joiner}{token}")
-        };
-        if current.is_empty() || metadata_value_text_width(&candidate, px, false) <= budget {
-            current = candidate;
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current = token.to_string();
+    let mut after_wrap = false;
+    for part in value.split(FACT_SEPARATOR) {
+        if !fits(part) {
+            lines.extend(wrap_to_box(part, budget, &measure));
+            after_wrap = true;
+            continue;
         }
-    }
-    if !current.is_empty() {
-        lines.push(current);
+        match lines.last_mut() {
+            Some(line) if !after_wrap && fits(&format!("{line}{FACT_SEPARATOR}{part}")) => {
+                line.push_str(FACT_SEPARATOR);
+                line.push_str(part);
+            }
+            _ => lines.push(part.to_string()),
+        }
+        after_wrap = false;
     }
     if lines.len() > MAX_METADATA_VALUE_LINES {
         lines.truncate(MAX_METADATA_VALUE_LINES);
-        if let Some(last) = lines.last_mut() {
-            *last = format!("{last} \u{2026}");
+        if let Some(last) = lines.pop() {
+            lines.push(elide_wrapped_copy_tail(
+                &last,
+                px,
+                crate::widget::TextFace::Ui,
+                budget,
+            ));
         }
     }
     lines
-        .into_iter()
-        .map(|line| elide_metadata_value(&line, budget, false))
-        .collect()
 }
 
-/// Total painted rows a fact list occupies at `value_width` — the measure the
-/// card-height and compact-chunking arithmetic must share with the painter.
-fn metadata_line_count(rows: &[(String, String)], value_width: f32) -> usize {
-    rows.iter()
-        .map(|(label, value)| metadata_value_lines(label, value, value_width).len())
-        .sum()
-}
-
-fn metadata_card(
-    key: &str,
-    heading: &str,
-    rows: &[(String, String)],
-    height: f32,
-    value_width: f32,
-) -> UiNode {
-    metadata_card_at(
-        key,
-        heading,
-        rows,
-        height,
-        value_width,
-        about_metadata_label_width(),
+/// One fact's painted lines in `columns`: its name's, then its value's
+/// ([`metadata_value_lines`]).
+fn fact_card_lines(label: &str, value: &str, columns: FactColumns) -> (Vec<String>, Vec<String>) {
+    (
+        wrap_to_box(about_fact_label(label), columns.label, &fact_name_width),
+        metadata_value_lines(label, value, columns.value),
     )
 }
 
-/// [`metadata_card`] with a label column `label_width` wide: a card whose
-/// labels are longer than About's words (Settings ▸ Harness's `[harness]`
-/// keys) measures its own column and hands the value column the rest.
-fn metadata_card_at(
+/// One line of a fact card's caption: a card's caption in small capitals,
+/// the Heading role's Quiet step.
+fn caption_line_height() -> f32 {
+    22.0_f32.max(16.0 * settings_text_scale())
+}
+
+/// A CARD'S CAPTION WRAPS TO ITS CARD, never cut: `text` on as many lines as
+/// the card's text column `width` needs, each as tall as one caption line
+/// ([`wrapped_words_node`]). Returns the node, keyed `key`, and its height.
+fn caption_node(key: &str, text: &str, width: f32) -> (UiNode, f32) {
+    wrapped_words_node(
+        key,
+        text,
+        (SemanticRole::Heading, StyleRef::Quiet),
+        width,
+        caption_line_height(),
+    )
+}
+
+/// WORDS THAT WRAP TO THEIR BOX: `text` in `(role, style)` type on as many
+/// lines of a box `width` wide as it needs ([`wrap_to_box`], measured in the
+/// face and size it paints in), each `line_height` tall. One line is a plain
+/// text node keyed `key`; more are a group of that key, in that role, that
+/// says the whole text, its lines paint-only under it. Returns the node and
+/// its height.
+fn wrapped_words_node(
     key: &str,
-    heading: &str,
-    rows: &[(String, String)],
-    height: f32,
-    value_width: f32,
-    label_width: f32,
-) -> UiNode {
-    let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
-    let row_height = 28.0_f32.max(18.0 * settings_text_scale());
-    let mut children = vec![
+    text: &str,
+    (role, style): (SemanticRole, StyleRef),
+    width: f32,
+    line_height: f32,
+) -> (UiNode, f32) {
+    let (px, face) = crate::native_ui::text_paint_metrics(role, style);
+    let lines = wrap_to_box(text, width, &|line| {
+        if face == crate::widget::TextFace::Mono {
+            crate::tray_raster::measure_text(line, px, crate::widget::TextWeight::Regular)
+        } else {
+            crate::tray_raster::ui_text_width_for(face, line, px)
+        }
+    });
+    let height = lines.len().max(1) as f32 * line_height;
+    let line_node = |key: String, text: String| {
+        UiNode::new(key, UiContent::Text(TextSpec { text, role, style }))
+            .layout(Layout::default().height(Length::Fixed(line_height)))
+    };
+    if lines.len() <= 1 {
+        return (line_node(key.to_string(), text.to_string()), height);
+    }
+    (
         UiNode::new(
-            format!("{key}/heading"),
-            UiContent::Text(TextSpec {
-                text: heading.to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
+            key,
+            UiContent::Group(GroupSpec {
+                label: Some(text.to_string()),
+                role,
+                style,
             }),
         )
-        .layout(Layout::default().height(Length::Fixed(heading_height))),
-    ];
-    children.extend(rows.iter().flat_map(|(label, value)| {
+        .layout(Layout::column().height(Length::Fixed(height)))
+        .children(
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, line)| line_node(format!("{key}/line-{index}"), line).paint_only())
+                .collect(),
+        ),
+        height,
+    )
+}
+
+/// A CARD OF FACTS, `(name, value)` each, under its caption, `card_width`
+/// wide: its text column the card less its side padding
+/// ([`card_text_width`]), its name column `label_width` wide where the facts
+/// sit beside each other ([`FactColumns`]). Each fact is ONE block of the
+/// card, its lines inside it: the block owns the fact's whole accessible
+/// text, and a list that lays the card out a fact at a time never parts a
+/// fact from its own continuation. Returns the card and its height.
+fn metadata_card(
+    key: &str,
+    caption: &str,
+    rows: &[(String, String)],
+    card_width: f32,
+    label_width: f32,
+) -> (UiNode, f32) {
+    let inner = card_text_width(card_width);
+    let side = card_side_padding(card_width);
+    let columns = FactColumns::measure(rows, inner, label_width);
+    let row_height = 28.0_f32.max(18.0 * settings_text_scale());
+    let (heading, heading_height) = caption_node(&format!("{key}/heading"), caption, inner);
+    let mut children = vec![heading];
+    let mut height = 2.0 * ABOUT_METADATA_CARD_PADDING + heading_height;
+    children.extend(rows.iter().map(|(label, value)| {
         let fragment = key_fragment(label);
         let code = metadata_value_is_code(label);
         let shown_label = about_fact_label(label);
-        let visual_label = elide_metadata_value(
-            shown_label,
-            (label_width - ABOUT_METADATA_TEXT_SAFETY).max(0.0),
-            false,
-        );
         let value_style = if code {
             StyleRef::Code
         } else {
             StyleRef::Primary
         };
-        let value_cell = |key: String, line: String| {
-            UiNode::new(
-                key,
-                UiContent::Text(TextSpec {
-                    text: line,
-                    role: SemanticRole::Text,
-                    style: value_style,
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .paint_only()
-        };
-        let label_cell = |key: String, text: String| {
+        let cell = |key: String, text: String, style: StyleRef, width: Length| {
             UiNode::new(
                 key,
                 UiContent::Text(TextSpec {
                     text,
                     role: SemanticRole::Text,
-                    style: StyleRef::Quiet,
+                    style,
                 }),
             )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(label_width))
-                    .height(Length::Fill),
-            )
+            .layout(Layout::default().width(width).height(Length::Fill))
             .paint_only()
         };
-        let lines = metadata_value_lines(label, value, value_width);
-        // ONE block per fact, its wrapped lines inside it: the block owns the
-        // fact's complete accessibility contract, and a list that lays the card
-        // out a fact at a time never parts a fact from its own continuation.
+        let suffix = |index: usize| {
+            if index == 0 {
+                String::new()
+            } else {
+                format!("/line-{index}")
+            }
+        };
+        let label_cell = |index: usize, text: String, width: Length| {
+            cell(
+                format!("{key}/label/{fragment}{}", suffix(index)),
+                text,
+                StyleRef::Quiet,
+                width,
+            )
+        };
+        let value_cell = |index: usize, text: String| {
+            cell(
+                format!("{key}/value/{fragment}{}", suffix(index)),
+                text,
+                value_style,
+                Length::Fill,
+            )
+        };
+        let (names, values) = fact_card_lines(label, value, columns);
+        // Each painted line of the block: beside each other, a line of the
+        // name's column and of the value's; stacked, the name's lines, then
+        // the value's.
+        let lines: Vec<Vec<UiNode>> = if columns.stacked {
+            let name_lines = names
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| vec![label_cell(index, text, Length::Fill)]);
+            let value_lines = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| vec![value_cell(index, text)]);
+            name_lines.chain(value_lines).collect()
+        } else {
+            let count = names.len().max(values.len());
+            (0..count)
+                .map(|index| {
+                    vec![
+                        label_cell(
+                            index,
+                            names.get(index).cloned().unwrap_or_default(),
+                            Length::Fixed(columns.label),
+                        ),
+                        value_cell(index, values.get(index).cloned().unwrap_or_default()),
+                    ]
+                })
+                .collect()
+        };
         let count = lines.len();
         let block_height = count as f32 * row_height + count.saturating_sub(1) as f32 * 4.0;
+        height += block_height + 4.0;
         let line_rows = lines
             .into_iter()
             .enumerate()
-            .map(|(index, line)| {
-                let suffix = if index == 0 {
-                    String::new()
-                } else {
-                    format!("/line-{index}")
-                };
+            .map(|(index, cells)| {
                 UiNode::new(
                     format!("{key}/row/{fragment}/line-{index}"),
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -31105,46 +34033,37 @@ fn metadata_card_at(
                         .height(Length::Fixed(row_height))
                         .gap(ABOUT_METADATA_ROW_GAP),
                 )
-                .children(vec![
-                    label_cell(
-                        format!("{key}/label/{fragment}{suffix}"),
-                        if index == 0 {
-                            visual_label.clone()
-                        } else {
-                            String::new()
-                        },
-                    ),
-                    value_cell(format!("{key}/value/{fragment}{suffix}"), line),
-                ])
+                .children(cells)
                 .paint_only()
             })
             .collect::<Vec<_>>();
-        std::iter::once(
-            UiNode::new(
-                format!("{key}/row/{fragment}"),
-                UiContent::Group(GroupSpec::new(format!("{shown_label}: {value}"))),
-            )
-            .layout(
-                Layout::column()
-                    .height(Length::Fixed(block_height))
-                    .gap(4.0),
-            )
-            .children(line_rows),
+        UiNode::new(
+            format!("{key}/row/{fragment}"),
+            UiContent::Group(GroupSpec::new(format!("{shown_label}: {value}"))),
         )
+        .layout(
+            Layout::column()
+                .height(Length::Fixed(block_height))
+                .gap(4.0),
+        )
+        .children(line_rows)
     }));
-    UiNode::new(
-        key,
-        UiContent::Group(GroupSpec::new(heading).style(StyleRef::Secondary)),
+    (
+        UiNode::new(
+            key,
+            UiContent::Group(GroupSpec::new(caption).style(StyleRef::Secondary)),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(height))
+                .padding(Insets::symmetric(side, ABOUT_METADATA_CARD_PADDING))
+                .gap(4.0)
+                .clipped(),
+        )
+        .children(children),
+        height,
     )
-    .layout(
-        Layout::column()
-            .width(Length::Fill)
-            .height(Length::Fixed(height))
-            .padding(Insets::all(ABOUT_METADATA_CARD_PADDING))
-            .gap(4.0)
-            .clipped(),
-    )
-    .children(children)
 }
 
 fn update_release_notes_padding() -> f32 {
@@ -31196,7 +34115,10 @@ fn wrap_release_note_lines(lines: &[String], max_width: f32) -> Vec<String> {
 /// exactly the words it paints.
 fn update_release_notes_card(update: &UpdateProjection, room: f32, text_width: f32) -> UiNode {
     let line_height = update_release_notes_line_height();
-    let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
+    // Its caption wraps to the card's column, never cut ("RELEASE…" at 2×
+    // on a phone-width page).
+    let (heading, heading_height) =
+        caption_node("updates/release-notes-heading", "RELEASE NOTES", text_width);
     let padding = update_release_notes_padding();
     let gap = 8.0;
     let capacity =
@@ -31240,17 +34162,7 @@ fn update_release_notes_card(update: &UpdateProjection, room: f32, text_width: f
     }
     let height =
         padding * 2.0 + heading_height + rows.iter().map(|(_, height)| height + gap).sum::<f32>();
-    let mut children = vec![
-        UiNode::new(
-            "updates/release-notes-heading",
-            UiContent::Text(TextSpec {
-                text: "RELEASE NOTES".to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(heading_height))),
-    ];
+    let mut children = vec![heading];
     children.extend(rows.into_iter().map(|(node, _)| node));
     UiNode::new(
         "updates/release-notes-card",
@@ -31524,7 +34436,6 @@ fn compact_update_summary(
     let headline_height = 42.0_f32.max(30.0 * scale);
     let current_height = 22.0_f32.max(18.0 * scale);
     let detail_height = 24.0_f32.max(20.0 * scale);
-    let large_type = scale > 1.25;
     // This summary is a short landscape list's whole-width stop. Derive the
     // exact two text-column widths from that row instead of relying on the
     // compiler's emergency ellipsis. The owning Status below retains every
@@ -31532,40 +34443,60 @@ fn compact_update_summary(
     let inner_width = (available_width - 8.0 * 2.0 - 8.0).max(0.0);
     let identity_width = inner_width * 0.42;
     let detail_width = (inner_width - identity_width).max(0.0);
-    // Named only where the page heading is left out, as the full card is.
+    // EVERY WORDING IN THE SUMMARY IS MEASURED in the column it is painted in,
+    // never chosen by the text size: the whole form where it fits, else its
+    // shorter honest one.
+    // Named only where nothing else names the page, as the full card is.
+    let caption_px = 11.0 * crate::native_appearance::text_scale();
+    let caption_fits = |text: &str| {
+        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, text, caption_px)
+            <= identity_width + 0.5
+    };
     let title = titled.then(|| {
         fit_native_bold_label(
-            if large_type {
-                "UPDATE"
-            } else {
+            if caption_fits("SOFTWARE UPDATE") {
                 "SOFTWARE UPDATE"
+            } else {
+                "UPDATE"
             },
             identity_width,
-            11.0 * crate::native_appearance::text_scale(),
+            caption_px,
         )
     });
     // A STAGE THE ENGINE HAS ALREADY FAILED TO APPLY IS NOT A CELEBRATION. The
     // accent is the same argument the wording makes: `failing_persistent` is the
     // ESCALATION verdict and stays quiet through the first two attempts, so "Not
     // applying" rendered in the identical Hero accent as "You're up to date."
-    let headline_style =
-        if update.failing_persistent || update.linux_attention || not_applying(update) {
-            StyleRef::Danger
-        } else if large_type {
-            StyleRef::Plain
-        } else {
-            StyleRef::Hero
-        };
-    let headline_px = if large_type { 13.0 } else { 24.0 } * crate::native_appearance::text_scale();
+    // The verdict at its own step where it fits the column, else at the Body
+    // step in bold, a warning in the warning's colour still, as the full
+    // card's headline steps down ([`update_headline_fit`]).
     let headline_words = compact_update_headline(update);
-    let headline = fit_native_bold_label(&headline_words, identity_width, headline_px);
-    // The version a person knows; the build number is About's.
-    let current_semantic = format!("aterm {}", update.current_version);
-    let current_preferred = if large_type {
-        format!("v{}", update.current_version)
+    let headline_px =
+        |style: StyleRef| crate::native_ui::text_paint_metrics(SemanticRole::Heading, style).0;
+    let preferred_style = update_headline_style(update);
+    let headline_style = if crate::tray_raster::ui_text_width_for(
+        crate::widget::TextFace::UiBold,
+        &headline_words,
+        headline_px(preferred_style),
+    ) <= identity_width + 0.5
+    {
+        preferred_style
     } else {
-        current_semantic.clone()
+        compact_heading_style(preferred_style)
     };
+    let headline =
+        fit_native_bold_label(&headline_words, identity_width, headline_px(headline_style));
+    // The version a person knows; the build number is About's: "aterm 0.1.0"
+    // where it fits the column, else "v0.1.0".
+    let current_semantic = format!("aterm {}", update.current_version);
+    let current_preferred =
+        if crate::native_ui::fit_native_status_label(&current_semantic, detail_width)
+            == current_semantic
+        {
+            current_semantic.clone()
+        } else {
+            format!("v{}", update.current_version)
+        };
     let current = crate::native_ui::fit_native_status_label(&current_preferred, detail_width);
     let detail = crate::native_ui::fit_native_text_label(
         compact_update_summary_detail(update),
@@ -31743,6 +34674,7 @@ fn compact_update_full_items(
             Length::Fixed(width) => width,
             _ => notes_width,
         };
+        let row_height = fixed_height(&action).max(action_height);
         let mut row = vec![action];
         // The link rides beside the split-out action wherever the row
         // holds both, as it does inside the card.
@@ -31758,7 +34690,7 @@ fn compact_update_full_items(
                 "updates/actions",
                 UiContent::Group(GroupSpec::new("Update actions")),
             )
-            .layout(Layout::row().height(Length::Fixed(action_height)).gap(8.0))
+            .layout(Layout::row().height(Length::Fixed(row_height)).gap(8.0))
             .children(row),
         );
     }
@@ -31770,7 +34702,11 @@ fn compact_update_full_items(
     {
         sections.insert(
             1 + usize::from(split),
-            messages_link_button("updates/messages", messages_link_width(), action_height),
+            messages_link_button(
+                "updates/messages",
+                messages_link_width().min(notes_width),
+                action_height,
+            ),
         );
     }
     sections.extend(notes);
@@ -31811,8 +34747,12 @@ fn compact_update_summary_items(
     if !whole {
         return None;
     }
-    action.layout.height = Length::Fixed(action_height);
-    let link = messages_link_button("updates/messages", messages_link_width(), action_height);
+    action.layout.height = Length::Fixed(fixed_height(&action).max(action_height));
+    let link = messages_link_button(
+        "updates/messages",
+        messages_link_width().min(notes_width),
+        action_height,
+    );
     let action_width = match action.layout.width {
         Length::Fixed(width) => width,
         _ => notes_width,
@@ -31847,7 +34787,8 @@ fn compact_update_summary_items(
             detail,
             None,
         ));
-        items.push((action, action_height));
+        let height = fixed_height(&action);
+        items.push((action, height));
         items.push((link, action_height));
     }
     items.extend(automatic);
@@ -32004,12 +34945,29 @@ fn compact_update_outcome(update: &UpdateProjection, card_width: f32) -> Option<
 /// Install When Safe — which asked the user to know which stage the updater was
 /// in and to pick a policy for it. They only ever wanted the newest build, so
 /// this is that: check when nothing is staged, install when something is.
-fn update_action_label(compact_large_type: bool) -> &'static str {
-    if compact_large_type {
-        "Update"
+/// Its whole label wherever the button with it fits `room`, measured; else
+/// "Update", which its accessible name contains.
+fn update_action_label(room: f32) -> &'static str {
+    const WHOLE: &str = "Update to Latest Now";
+    if crate::native_ui::native_button_label_width(WHOLE) + 28.0 <= room + 0.01 {
+        WHOLE
     } else {
-        "Update to Latest Now"
+        "Update"
     }
+}
+
+/// The update action's painted words in a column `room` wide, by the one rule
+/// page buttons keep ([`whole_button_words`]): one line, "Update to Latest
+/// Now" where it fits, else "Update" — or `None` where not even that is whole
+/// there, and the action is a stop of its own under the card, the list's
+/// width (a 22-column page at 2× text painted "Upd…" inside the card).
+fn update_action_words(update: &UpdateProjection, room: f32) -> Option<String> {
+    let (full, short): (&str, &[&str]) = if update.linux_host {
+        ("Install in a terminal", &[])
+    } else {
+        (update_action_label(room), &["Update"])
+    };
+    whole_button_words(full, short, room).map(|(words, _)| words)
 }
 
 /// Why the update action is unavailable on a copy that cannot replace itself:
@@ -32021,13 +34979,7 @@ const UPDATE_CANT_INSTALL: &str = "This copy of aterm can\u{2019}t install updat
 const UPDATE_UNOBSERVED_FEEDBACK: &str =
     "Still checking whether this copy of aterm can update itself.";
 
-fn update_action_node(
-    update: &UpdateProjection,
-    width: SettingsWidth,
-    height: f32,
-    room: f32,
-) -> UiNode {
-    let compact_large_type = width == SettingsWidth::Compact && settings_text_scale() > 1.25;
+fn update_action_node(update: &UpdateProjection, height: f32, room: f32) -> UiNode {
     // A copy that can't replace itself never starts a check: the button is
     // greyed and says why, never a live primary that does nothing. One nothing
     // has read yet waits, greyed, for the read.
@@ -32037,11 +34989,12 @@ fn update_action_node(
     } else {
         "Update to Latest Now"
     };
-    let visual_label = if update.linux_host {
-        "Install in a terminal"
+    let (visual_label, lines) = if update.linux_host {
+        button_words("Install in a terminal", &[], room)
     } else {
-        update_action_label(compact_large_type)
+        button_words(update_action_label(room), &["Update"], room)
     };
+    let visual_label = visual_label.as_str();
     let unobserved = update.installable == UpdateInstallability::Unobserved && !update.linux_host;
     let mut spec = ButtonSpec::new(semantic_label).visual_label(visual_label);
     if unobserved {
@@ -32070,9 +35023,81 @@ fn update_action_node(
     )
     .layout(
         Layout::default()
-            .width(Length::Fixed(page_button_width(visual_label, room)))
-            .height(Length::Fixed(height)),
+            .width(Length::Fixed(if lines > 1 {
+                room
+            } else {
+                page_button_width(visual_label, room)
+            }))
+            .height(Length::Fixed(
+                crate::native_ui::native_button_height_for_lines(lines, height),
+            )),
     )
+}
+
+/// A BUTTON'S WORDS FOR ITS BOX — one rule for the system pages' buttons:
+/// its whole label `full` on one line where a text button `width` wide holds
+/// it, else the first of its `short` forms that is one line there, else its
+/// whole label on two lines or more at its words, else a short form so
+/// ([`native_ui::native_button_label_lines`]) — never cut, its painted words
+/// one phrase of its name. Only where not even the shortest form's longest
+/// word fits the box is that word broken, with a hyphen.
+/// Returns the painted label (`\n` between its lines) and its line count, the
+/// height a button takes for them being
+/// [`native_ui::native_button_height_for_lines`]'s.
+fn button_words(full: &str, short: &[&str], width: f32) -> (String, usize) {
+    button_words_in(&ButtonSpec::new(full), full, short, width)
+}
+
+/// The words a button's painted label says, its lines joined again: a line a
+/// word broke at ends in the hyphen the break added, which joins it.
+fn painted_words(visual: &str) -> String {
+    visual
+        .replace("-\n", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`button_words`] for a button that wears what `spec` does beside its
+/// words (a trailing arrow, a chip, a badge), whose room it takes.
+fn button_words_in(spec: &ButtonSpec, full: &str, short: &[&str], width: f32) -> (String, usize) {
+    whole_button_words_in(spec, full, short, width).unwrap_or_else(|| {
+        // A word of every form wider than the button: the shortest form with
+        // that word broken by a hyphen ([`wrap_to_box`]), never cut.
+        let shortest = short.last().copied().unwrap_or(full);
+        let room = crate::native_ui::text_button_label_room(spec, width);
+        let lines = wrap_to_box(shortest, room, &crate::native_ui::native_button_label_width);
+        (lines.join("\n"), lines.len())
+    })
+}
+
+/// [`button_words`], or `None` where no form of the label is whole in a
+/// button `width` wide on any number of lines (a word of each wider than the
+/// button): a caller with somewhere wider to put the button puts it there.
+fn whole_button_words(full: &str, short: &[&str], width: f32) -> Option<(String, usize)> {
+    whole_button_words_in(&ButtonSpec::new(full), full, short, width)
+}
+
+/// [`whole_button_words`] for a button that wears what `spec` does.
+fn whole_button_words_in(
+    spec: &ButtonSpec,
+    full: &str,
+    short: &[&str],
+    width: f32,
+) -> Option<(String, usize)> {
+    let room = crate::native_ui::text_button_label_room(spec, width);
+    let one_line = |label: &str| {
+        crate::native_ui::native_button_label_width(label)
+            <= room + crate::native_ui::TEXT_FIT_SLACK
+    };
+    let forms = std::iter::once(full).chain(short.iter().copied());
+    if let Some(form) = forms.clone().find(|form| one_line(form)) {
+        return Some((form.to_string(), 1));
+    }
+    forms
+        .clone()
+        .find_map(|form| crate::native_ui::native_button_label_lines(form, room))
+        .map(|lines| (lines.join("\n"), lines.len()))
 }
 
 /// A page action button's width: its label and the painter's padding, at
@@ -32168,11 +35193,151 @@ impl StatusLineBudget {
 /// How the status card fits its window.
 #[derive(Clone, Copy, Debug)]
 struct StatusCardShape {
-    /// A narrow column at large text: the compact headline and detail rungs.
-    large_type_narrow: bool,
-    /// The page heading is left out (a window too short for it), so the card
-    /// names the page itself.
+    /// Nothing else names the page ([`page_named`]: no heading row, no
+    /// toolbar title), so the card names it itself.
     titled: bool,
+}
+
+/// The status card's headline style: a persistent failure is a warning, not a
+/// hero — the same treatment the configuration-reload warning gets, so it cannot
+/// be mistaken for the accent "You're up to date" line it replaces. A stage that
+/// has already failed to apply gets it too, from the FIRST failure — the headline
+/// says "Update didn't install" and it must not be painted in the colour of good
+/// news.
+fn update_headline_style(update: &UpdateProjection) -> StyleRef {
+    if update.failing_persistent || update.linux_attention || not_applying(update) {
+        StyleRef::Danger
+    } else {
+        StyleRef::Hero
+    }
+}
+
+/// THE STATUS CARD'S HEADLINE IS MEASURED in the card's text column
+/// (`text_width`), never guessed from the window's width class: the whole
+/// sentence where it fits its line in its style ([`update_headline_style`]);
+/// else the compact verdict there ([`compact_update_headline`]: "Can't
+/// update"), the same state in fewer words; else that verdict at the Body
+/// step in bold, as a compact page's heading takes at large text (a phone
+/// column at the platform maximum Dynamic Type) — A WARNING STAYS A WARNING
+/// AS IT GIVES UP ITS SIZE ([`compact_heading_style`]: colour isn't size);
+/// and where not even that is one line, that verdict on as many lines as the
+/// column needs, never cut. The complete sentence stays the card's semantic
+/// label.
+fn update_headline_fit(update: &UpdateProjection, text_width: f32) -> (String, StyleRef) {
+    let style = update_headline_style(update);
+    let width = |text: &str, style: StyleRef| {
+        let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, style);
+        crate::tray_raster::ui_text_width_for(face, text, px)
+    };
+    let compact = compact_update_headline(update);
+    if width(&update.headline, style) <= text_width + 0.01 {
+        (update.headline.clone(), style)
+    } else if width(&compact, style) <= text_width + 0.01 {
+        (compact, style)
+    } else {
+        (compact, compact_heading_style(style))
+    }
+}
+
+/// A heading's style at the compact heading step, the Body step in bold: a
+/// warning's ([`StyleRef::DangerCompact`]) keeps the warning's colour; any
+/// other is [`StyleRef::Plain`]'s. The fallback used to be Plain for a
+/// warning too, so where Software Update's verdict had to step down it lost
+/// its red and read as a routine headline.
+fn compact_heading_style(style: StyleRef) -> StyleRef {
+    if matches!(style, StyleRef::Danger | StyleRef::DangerCompact) {
+        StyleRef::DangerCompact
+    } else {
+        StyleRef::Plain
+    }
+}
+
+/// A CARD'S HEADLINE WHOLE IN ITS COLUMN, measured: `text` in its heading
+/// `style` on one line `height` tall where the column `width` holds it; else
+/// at the compact heading step ([`compact_heading_style`]) on one line; else
+/// at that step on as many lines as the column needs, never cut. Returns the
+/// node, keyed `key`, and its height.
+fn fitted_headline_node(
+    key: &str,
+    text: &str,
+    style: StyleRef,
+    width: f32,
+    height: f32,
+) -> (UiNode, f32) {
+    let one_line = |style: StyleRef| {
+        let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, style);
+        crate::tray_raster::ui_text_width_for(face, text, px)
+            <= width + crate::native_ui::TEXT_FIT_SLACK
+    };
+    let style = if one_line(style) {
+        style
+    } else {
+        compact_heading_style(style)
+    };
+    let (mut node, lines_height) = wrapped_words_node(
+        key,
+        text,
+        (SemanticRole::Heading, style),
+        width,
+        26.0_f32.max(22.0 * settings_text_scale()),
+    );
+    let height = if matches!(node.content, UiContent::Text(_)) {
+        height
+    } else {
+        lines_height
+    };
+    node.layout.height = Length::Fixed(height);
+    (node, height)
+}
+
+/// THE STATUS CARD'S DETAIL IS MEASURED too: the whole sentence (`full`) where
+/// it wraps within the card's line budget (`max_lines`) in its text column;
+/// else the compact sentence ([`compact_update_detail`]), then the tersest
+/// truthful one ([`compact_update_detail_minimum`]), each only where it is
+/// whole there; and where none is, the whole sentence, its last line cut with
+/// an ellipsis by the card's bound. The complete sentence stays the detail's
+/// semantic value whatever paints.
+fn update_detail_fit(
+    update: &UpdateProjection,
+    full: &str,
+    text_width: f32,
+    max_lines: usize,
+) -> String {
+    let px = 13.0 * crate::native_appearance::text_scale();
+    // Whole: every word on a line of its own measure (the wrapper breaks a
+    // word wider than the column inside it), in no more lines than the budget.
+    let whole = |text: &str| {
+        !text.trim().is_empty()
+            && text
+                .split_whitespace()
+                .all(|word| crate::tray_raster::ui_text_width(word, px) <= text_width + 0.01)
+            && wrap_to_box(text, text_width, &|line| {
+                crate::tray_raster::ui_text_width(line, px)
+            })
+            .len()
+                <= max_lines.max(1)
+    };
+    let forms = [
+        full.to_string(),
+        compact_update_detail(update),
+        compact_update_detail_minimum(update),
+    ];
+    // Where no form is whole word by word (a word wider than a phone-width
+    // column at 2× text), the first that fits the budget with that word
+    // broken by a hyphen ([`wrap_to_box`]) — rather than the whole sentence
+    // cut by the budget ("… this / copy…").
+    let measure = |line: &str| crate::tray_raster::ui_text_width(line, px);
+    forms
+        .iter()
+        .find(|text| whole(text))
+        .or_else(|| {
+            forms.iter().find(|text| {
+                !text.trim().is_empty()
+                    && wrap_to_box(text, text_width, &measure).len() <= max_lines.max(1)
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| full.to_string())
 }
 
 /// Status: what is running, what is available, and the single action. Also the
@@ -32190,35 +35355,14 @@ fn update_status_card(
     action_height: f32,
     lines: StatusLineBudget,
 ) -> (UiNode, f32) {
-    let StatusCardShape {
-        large_type_narrow,
-        titled,
-    } = shape;
+    let StatusCardShape { titled } = shape;
     let text_scale = settings_text_scale();
-    let title_height = 20.0_f32.max(16.0 * text_scale);
     let headline_height = 42.0_f32.max(30.0 * text_scale);
     let current_height = 22.0_f32.max(18.0 * text_scale);
     let detail_height = 24.0_f32.max(20.0 * text_scale);
     let full_detail = update_status_detail(update, width);
-    let visual_headline = if large_type_narrow {
-        compact_update_headline(update)
-    } else {
-        update.headline.clone()
-    };
-    let visual_detail = if large_type_narrow {
-        // Author the richest single-line rung that FITS the card's wrap
-        // measure — the compact sentence itself overruns a phone column at
-        // 2× native text, and the painter's ellipsis is not a layout.
-        let preferred = compact_update_detail(update);
-        let px = 13.0 * crate::native_appearance::text_scale();
-        if crate::tray_raster::ui_text_width(&preferred, px) <= text_width {
-            preferred
-        } else {
-            compact_update_detail_minimum(update)
-        }
-    } else {
-        full_detail.clone()
-    };
+    let (visual_headline, headline_style) = update_headline_fit(update, text_width);
+    let visual_detail = update_detail_fit(update, &full_detail, text_width, lines.detail);
     // THE DETAIL IS AUTHORED PROSE NOW TOO, and it grew: "Version 0.5.15 · build
     // 830 · every attempt to start it has failed; see aterm.log" was ~80 characters
     // and the apply-trouble sentence is half as long again. It was painted as ONE
@@ -32227,11 +35371,10 @@ fn update_status_card(
     // treatment as the `updates/outcome` node below, which has wrapped and bounded
     // for exactly this reason since it was authored.
     let detail_lines = {
-        let mut wrapped = wrap_native_lines(
-            std::slice::from_ref(&visual_detail),
-            text_width,
-            13.0 * crate::native_appearance::text_scale(),
-        );
+        let px = 13.0 * crate::native_appearance::text_scale();
+        let mut wrapped = wrap_to_box(&visual_detail, text_width, &|line| {
+            crate::tray_raster::ui_text_width(line, px)
+        });
         bound_update_lines(&mut wrapped, text_width, lines.detail.max(1));
         // A measure too small to fit anything still owes the card one row; an empty
         // vector would collapse the node and silently drop the line.
@@ -32261,63 +35404,53 @@ fn update_status_card(
             wrapped
         })
         .unwrap_or_default();
-    // The card names itself only where the page heading is left out (a window
-    // too short for it, `compact_page_omits_heading`): under the heading that
-    // was "Software Update" twice, eight points apart. In caption case, as
-    // every card caption is.
+    // The card names itself only where nothing else names the page
+    // ([`page_named`]): under the heading that was "Software Update" twice,
+    // eight points apart. In caption case, as every card caption is.
     let mut children = Vec::new();
+    // The caption, the headline and the version each wrap to the card's
+    // column where one line cannot hold them, never cut ("SOFTWARE UPD…",
+    // "aterm 0.…" at 2× on a phone-width page): a one-line headline keeps its
+    // headline band, a wrapped one takes its lines.
+    let (title_node, title_height) = caption_node(
+        "updates/title",
+        caption_words("SOFTWARE UPDATE", "UPDATE", text_width),
+        text_width,
+    );
+    let title_height = if titled { title_height } else { 0.0 };
     if titled {
-        children.push(
-            UiNode::new(
-                "updates/title",
-                UiContent::Text(TextSpec {
-                    text: "SOFTWARE UPDATE".to_string(),
-                    role: SemanticRole::Heading,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(title_height))),
-        );
+        children.push(title_node);
     }
+    let (mut headline, wrapped_headline_height) = wrapped_words_node(
+        "updates/headline",
+        &visual_headline,
+        (SemanticRole::Heading, headline_style),
+        text_width,
+        26.0_f32.max(22.0 * text_scale),
+    );
+    let headline_height = if matches!(headline.content, UiContent::Text(_)) {
+        headline_height
+    } else {
+        wrapped_headline_height
+    };
+    headline.layout.height = Length::Fixed(headline_height);
+    let (current, current_height) = wrapped_words_node(
+        "updates/current",
+        // The version a person knows; the build number is About's.
+        &format!("aterm {}", update.current_version),
+        (SemanticRole::Status, StyleRef::Quiet),
+        text_width,
+        current_height,
+    );
     children.extend([
-        UiNode::new(
-            "updates/headline",
-            UiContent::Text(TextSpec {
-                text: visual_headline,
-                role: SemanticRole::Heading,
-                // A persistent failure is a warning, not a hero: the same treatment
-                // the configuration-reload warning gets, so it cannot be mistaken
-                // for the accent "You're up to date" line it replaces. A stage that
-                // has already failed to apply gets it too, from the FIRST failure —
-                // the headline says "Update didn't install" and it
-                // must not be painted in the colour of good news.
-                style: if update.failing_persistent
-                    || update.linux_attention
-                    || not_applying(update)
-                {
-                    StyleRef::Danger
-                } else {
-                    StyleRef::Hero
-                },
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(headline_height))),
-        UiNode::new(
-            "updates/current",
-            UiContent::Text(TextSpec {
-                // The version a person knows; the build number is About's.
-                text: format!("aterm {}", update.current_version),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(current_height))),
+        headline,
+        current,
         UiNode::new(
             "updates/detail",
             UiContent::Group(GroupSpec {
                 // The COMPLETE sentence stays the semantic value — assistive tech and
                 // `controls update` read it whole however narrow the card paints.
-                label: Some(visual_detail.clone()),
+                label: Some(full_detail.clone()),
                 role: SemanticRole::Text,
                 style: StyleRef::Quiet,
             }),
@@ -32525,7 +35658,8 @@ const PLATFORM_UPDATE_LANE: &str = "Pull, rebuild and reinstall from your aterm 
 
 /// What the automatic-updates card explains, beyond the switches' own labels, for the
 /// updater this host has. `macos_updater` is [`SettingsAvailability::macos`];
-/// `linux_updater` is [`UpdateProjection::linux_host`]. Both native updaters read
+/// `linux_updater` is [`UpdateProjection::linux_host`], or Linux's updater running
+/// here off macOS ([`native_updater_here`]). Both native updaters read
 /// `[update] enabled` once per process (`aterm_update::automatic`, through
 /// `aterm_update_core::settings`) to decide whether the BACKGROUND checker starts —
 /// a person's check never consults it (Check for Updates on macOS, `aterm update check`
@@ -32708,7 +35842,7 @@ fn update_automatic_cards(
         // L4). The row's semantic label already carries the registry's "Native updater
         // unavailable on this platform; saved for portability" disclosure, so assistive
         // tech hears the same truth the caption paints.
-        if !availability.macos && !linux_updater {
+        if !native_updater_here(availability) && !linux_updater {
             // Desktop rows hold the switch directly at children[1]; compact rows
             // wrap it in a controls group (spacer first, switch LAST). Rather than
             // mirror that layout knowledge here, find the row's one Switch.
@@ -32755,14 +35889,20 @@ fn update_automatic_cards(
     // card therefore tries its own sentence, then the compact one, within the budget.
     let room =
         height_budget.map(|budget| (budget - (40.0 + title_block + rows_height + 8.0)).max(0.0));
-    // Nothing has read whether this copy can replace itself: the caption would
-    // say either what the switches do or that they do nothing, so it waits.
-    let unread =
-        availability.macos && availability.update_installable == UpdateInstallability::Unobserved;
+    // The updater the caption speaks for is the platform's: macOS's, or Linux's
+    // wherever Linux's updater runs (`native_updater_here` off macOS) as well as
+    // where a status names Linux's lane (`linux_updater`). Never macOS's sentence
+    // off macOS, and never "do nothing" where an updater reads both switches.
+    let linux_caption = linux_updater || (!availability.macos && native_updater_here(availability));
+    // Nothing has read this copy yet (no installability, and no Linux status,
+    // which is a read too): the caption would claim what the switches do here
+    // before anything knows, so it waits.
+    let unread = (availability.macos || (native_updater_here(availability) && !linux_updater))
+        && availability.update_installable == UpdateInstallability::Unobserved;
     let mut rungs = vec![update_automatic_caption(
         width,
         availability.macos,
-        linux_updater,
+        linux_caption,
         availability.update_installable,
     )];
     if unread {
@@ -32771,7 +35911,7 @@ fn update_automatic_cards(
         rungs.push(update_automatic_caption(
             SettingsWidth::Compact,
             availability.macos,
-            linux_updater,
+            linux_caption,
             availability.update_installable,
         ));
     }
@@ -32891,7 +36031,7 @@ fn update_page(
     // per-copy status even when unenrolled; macOS keeps its existing projection.
     // Enabled projection fixtures retain their staged/checking layout shapes.
     let honest;
-    let update = if availability.macos || update.enabled || update.linux_host {
+    let update = if native_updater_here(availability) || update.enabled || update.linux_host {
         update
     } else {
         honest = UpdateProjection {
@@ -32911,20 +36051,19 @@ fn update_page(
     };
     let text_scale = settings_text_scale();
     let compact = width == SettingsWidth::Compact;
-    let compact_large_type = compact && text_scale > 1.25;
-    let large_type_narrow = compact_large_type && viewport_width < 220.0 * text_scale;
     let viewport = LogicalRect::new(0.0, 0.0, viewport_width, viewport_height);
     let gap = settings_page_gap(state, width, viewport);
     let subtitle = if update.linux_host {
         "Updating keeps open terminals running."
     } else {
-        update_page_subtitle(availability.macos)
+        update_page_subtitle(native_updater_here(availability))
     };
     let (heading, heading_height) =
-        pinned_heading(width, viewport, gap, "Software Update", subtitle);
-    // The status card names the page only where the page heading is left out
-    // (a window too short for it): under the heading it would say it twice.
-    let card_titled = heading.is_empty();
+        pinned_heading(state, width, viewport, gap, "Software Update", subtitle);
+    // The status card names the page only where nothing else does (a window
+    // too short for the heading row whose toolbar cannot hold the title):
+    // under the heading, or the toolbar's title, it would say it twice.
+    let card_titled = !page_named(width, viewport);
     // The room the page's list has under its heading: every section is
     // authored to fit it whole.
     let room = (settings_list_body_height(state, width, viewport) - heading_height)
@@ -32938,18 +36077,19 @@ fn update_page(
     // the form's measure, as on every other single-column page.
     let columns_width =
         settings_page_content_width(viewport_width, width, PageLayout::Columns.maximum(width));
-    // Prose inside the two cards wraps to the measure each card really gets:
-    // full width when the page stacks, and the workbench fractions when the
-    // desktop layout sets them side by side. WRAP_SLACK keeps the greedy
-    // wrapper a hair inside the painter's own measure — without it a line can
-    // come back a fraction of a point over and trip the overflow audit. The
-    // fractions share the row less its gap: measured against the whole row, the
-    // gap's share ate the slack and a caption line painted 0.1pt over (2026-09-23).
-    const WRAP_SLACK: f32 = 6.0;
+    // Prose inside the two cards wraps to the measure each card really gets —
+    // the BOX ITS WORDS ARE DRAWN IN, no narrower and no wider: full width when
+    // the page stacks, and the workbench fractions when the desktop layout sets
+    // them side by side. The fractions share the row less its gap: measured
+    // against the whole row, the gap's share painted a caption line 0.1pt over
+    // (2026-09-23). A 6pt "wrap slack" under every measure used to absorb that
+    // error, and with it wrapped every switch name and sentence on the page 6pt
+    // short of its box; the painter's own fit slack ([`native_ui::TEXT_FIT_SLACK`])
+    // is what f32 rounding costs. No floor either: a 48pt floor claimed a column
+    // a phone-width card at large text does not have.
     const WORKBENCH_GAP: f32 = 16.0;
     let shared = columns_width - WORKBENCH_GAP;
-    let side_text_width =
-        |status_share: f32| (shared * (1.0 - status_share) - 40.0 - WRAP_SLACK).max(48.0);
+    let side_text_width = |status_share: f32| (shared * (1.0 - status_share) - 40.0).max(0.0);
     // The two cards sit side by side only where the switches' card holds each
     // switch on one line in its worst case (written: Changed and Reset beside
     // it) and the status card still holds its one-line headline whole — at the
@@ -32964,7 +36104,7 @@ fn update_page(
         .then(|| {
             [0.62_f32, 0.5].into_iter().find(|share| {
                 update_switches_fit_inline(state, side_text_width(*share))
-                    && headline_width <= shared * share - 44.0 - WRAP_SLACK
+                    && headline_width <= shared * share - 44.0
             })
         })
         .flatten();
@@ -32976,27 +36116,24 @@ fn update_page(
     let notes_width = settings_page_content_width(viewport_width, width, layout.maximum(width));
     let notes_text_width = (notes_width - update_release_notes_padding() * 2.0).max(48.0);
     let (status_text_width, automatic_text_width) = match status_share {
-        Some(share) => (
-            (shared * share - 44.0 - WRAP_SLACK).max(48.0),
-            side_text_width(share),
-        ),
-        None => (
-            (notes_width - 44.0 - WRAP_SLACK).max(48.0),
-            (notes_width - 40.0 - WRAP_SLACK).max(48.0),
-        ),
+        Some(share) => ((shared * share - 44.0).max(0.0), side_text_width(share)),
+        None => ((notes_width - 44.0).max(0.0), (notes_width - 40.0).max(0.0)),
     };
-    let action = update_action_node(update, width, action_height, status_text_width);
+    let action = update_action_node(update, action_height, status_text_width);
     // The action rides inside the status card, the Messages link beside it where
     // the card's measure holds both, wherever the card with them fits the list's
-    // room — measured, not a fixed height — and is a stop of its own after the
-    // card on a compact page where it does not (or at large type).
+    // room and its words are one line of the card's column — measured, not a
+    // fixed height nor the text size — and is a stop of its own after the card,
+    // the list's width, on a compact page where it does not.
+    let action_in_card =
+        update_action_words(update, status_text_width).is_some_and(|words| !words.contains('\n'));
+    let list_action = update_action_node(update, action_height, notes_width);
     let split_action = compact
-        && (text_scale > 1.25 || {
+        && (!action_in_card || {
             let (_, with_action) = update_status_card(
                 update,
                 width,
                 StatusCardShape {
-                    large_type_narrow,
                     titled: card_titled,
                 },
                 status_text_width,
@@ -33025,7 +36162,6 @@ fn update_page(
             update,
             width,
             StatusCardShape {
-                large_type_narrow,
                 titled: card_titled,
             },
             status_text_width,
@@ -33087,7 +36223,7 @@ fn update_page(
         };
         let full = compact_update_full_items(
             status,
-            split_action.then(|| action.clone()),
+            split_action.then(|| list_action.clone()),
             automatic.clone(),
             notes_cards(compact_section_height),
             notes_width,
@@ -33095,7 +36231,11 @@ fn update_page(
         );
         let summary = compact_update_summary_items(
             update,
-            action.clone(),
+            if action_in_card {
+                action.clone()
+            } else {
+                list_action.clone()
+            },
             automatic.clone(),
             notes_cards(compact_section_height),
             SummaryPlace {
@@ -33575,16 +36715,19 @@ fn first_focusable_key(node: &UiNode) -> Option<UiKey> {
 /// the update chip down ([`MESSAGES_SHOW_UPDATE`], the chip a press on it would set) —
 /// every update's download, install and landing, and why one did not install.
 fn messages_link_button(key: &str, width: f32, height: f32) -> UiNode {
+    // In a button narrower than its word and its arrow (a phone-width page at
+    // large text) the word keeps the room and the arrow goes: "Messa…" read as
+    // a cut word, where the button still goes to the same page without it.
+    let mut spec = messages_link_spec();
+    if crate::native_ui::native_button_label_width("Messages")
+        > crate::native_ui::text_button_label_room(&spec, width) + crate::native_ui::TEXT_FIT_SLACK
+    {
+        spec.trailing_icon = None;
+    }
     UiNode::new(
         key,
         UiContent::Button(
-            Control::new(
-                ButtonSpec::new("Open Settings \u{25b8} Messages")
-                    .visual_label("Messages")
-                    .trailing_icon(ButtonIcon::Forward),
-                ActionId::new(MESSAGES_SHOW_UPDATE),
-            )
-            .style(StyleRef::Secondary),
+            Control::new(spec, ActionId::new(MESSAGES_SHOW_UPDATE)).style(StyleRef::Secondary),
         ),
     )
     .layout(
@@ -33594,10 +36737,24 @@ fn messages_link_button(key: &str, width: f32, height: f32) -> UiNode {
     )
 }
 
-/// The width of [`messages_link_button`]: its label and arrow at every text scale
-/// (the width "View Log" had — "Messages" is the same eight characters).
+fn messages_link_spec() -> ButtonSpec {
+    ButtonSpec::new("Open Settings \u{25b8} Messages")
+        .visual_label("Messages")
+        .trailing_icon(ButtonIcon::Forward)
+}
+
+/// The width of [`messages_link_button`]: its label MEASURED at the live text
+/// size, with the lead and the arrow's slot the painter keeps around it
+/// ([`crate::native_ui::text_button_label_room`]), at least a touch target
+/// wide — never a fixed width that is too wide at 1× and capped at 1.5×.
 fn messages_link_width() -> f32 {
-    124.0 * settings_text_scale().min(1.5)
+    let spec = messages_link_spec();
+    // What the painter keeps beside the label in a button of any width.
+    let probe = 1_000.0;
+    let reserve = probe - crate::native_ui::text_button_label_room(&spec, probe);
+    (crate::native_ui::native_button_label_width("Messages") + reserve)
+        .ceil()
+        .max(72.0)
 }
 
 // The filter (`MessagesFilter`), the chip identity (`messages_same_chip`), the
@@ -33673,11 +36830,11 @@ fn messages_visible<'a>(
         .collect()
 }
 
-/// The page's subtitle, the engine's (`aterm_messages::page::SUBTITLE`, ruling
-/// 395): what the log is (design §10.11). One line at every width (it fits the
-/// 286.5 pt phone page).
-fn messages_page_subtitle() -> &'static str {
-    aterm_messages::page::SUBTITLE
+/// The page's subtitle, the engine's (`MessagesState::subtitle`, ruling 395):
+/// what the log is (design §10.11), and that the open items lead it while one
+/// does. One line at every width (it fits the 286.5 pt phone page).
+fn messages_page_subtitle(messages: &MessagesState) -> &'static str {
+    messages.subtitle()
 }
 
 /// A status-sized line whose WHOLE text is the semantic node's label and
@@ -33707,6 +36864,76 @@ fn messages_fitted_status(key: &str, words: String, width: Length, fit_width: f3
         .layout(Layout::default().width(Length::Fill).height(Length::Fill))
         .paint_only(),
     ])
+}
+
+/// THE COUNT LINE'S WORDS (`words`: the count, and the page's note after
+/// it), its lines in a column `fit_width` wide: the count on as many lines as
+/// it needs, whole ("40 messa…" at 2× on a phone-width page); the note on
+/// the count's last line, fitted to what that line leaves — where the count
+/// decides the line's place (round 17 review, V4), a five-second note never
+/// moves the buttons under it by a line of its own. The group's name says
+/// both whole. Returns the node and its line count.
+fn messages_count_status(
+    words: String,
+    count: Option<&str>,
+    note: Option<&str>,
+    fit_width: f32,
+) -> (UiNode, usize) {
+    let key = "settings/messages/status";
+    let room = (fit_width - 4.0).max(24.0);
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let mut lines = count.map_or_else(Vec::new, |count| {
+        wrap_to_box(count, room, &|line| {
+            crate::tray_raster::ui_text_width_for(face, line, px)
+        })
+    });
+    if let Some(note) = note {
+        let last = lines.pop().map_or_else(
+            || note.to_string(),
+            |last| format!("{last} \u{00b7} {note}"),
+        );
+        lines.push(crate::native_ui::fit_native_status_label(&last, room));
+    }
+    let count = lines.len().max(1);
+    let line = |key: String, text: String, height: Length| {
+        UiNode::new(
+            key,
+            UiContent::Text(TextSpec {
+                text,
+                role: SemanticRole::Status,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(Layout::default().width(Length::Fill).height(height))
+        .paint_only()
+    };
+    let children = if count == 1 {
+        vec![line(
+            format!("{key}/visual"),
+            lines.pop().unwrap_or_default(),
+            Length::Fill,
+        )]
+    } else {
+        let height = Length::Fixed(messages_line_height());
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| line(format!("{key}/visual/line-{index}"), text, height))
+            .collect()
+    };
+    (
+        UiNode::new(
+            key,
+            UiContent::Group(GroupSpec {
+                label: Some(words),
+                role: SemanticRole::Status,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(Layout::column().width(Length::Fill).height(Length::Fill))
+        .children(children),
+        count,
+    )
 }
 
 /// A small secondary button: `label` painted, `semantic` its name, measured
@@ -33755,6 +36982,7 @@ fn messages_count_line(
         crate::tray_raster::ui_text_width_for(sface, w, spx) + 8.0
     });
     // The page's own confirmation rides the count (ruling 270).
+    let count = words.clone();
     let words = match (words, note) {
         (Some(words), Some(note)) => Some(format!("{words} \u{00b7} {note}")),
         (None, Some(note)) => Some(note.to_string()),
@@ -33773,6 +37001,24 @@ fn messages_count_line(
         true,
     );
     let button_h = messages_small_button_height();
+    // A button wider than the whole column (a phone-width page at 2× text)
+    // keeps its words on as many lines as the column needs ([`button_words`]),
+    // never past the page's edge ("Open Log Folder" ran 87pt off it).
+    let fit = |(mut node, width): (UiNode, f32), label: &str| -> (UiNode, f32, f32) {
+        if width <= content_width + crate::native_ui::TEXT_FIT_SLACK {
+            return (node, width, button_h);
+        }
+        let (words, lines) = button_words(label, &[], content_width);
+        if let UiContent::Button(button) = &mut node.content {
+            button.spec.visual_label = Some(words);
+        }
+        let height = crate::native_ui::native_button_height_for_lines(lines, button_h);
+        node.layout.width = Length::Fixed(content_width);
+        node.layout.height = Length::Fixed(height);
+        (node, content_width, height)
+    };
+    let (copy, copy_w, copy_h) = fit((copy, copy_w), aterm_messages::page::COPY_ALL);
+    let (folder, folder_w, folder_h) = fit((folder, folder_w), "Open Log Folder");
     // The buttons beside the count where both fit; else under it, right-aligned.
     let beside = words_w + copy_w + folder_w + 16.0 <= content_width;
     let status_w = if beside {
@@ -33780,17 +37026,18 @@ fn messages_count_line(
     } else {
         content_width
     };
-    let status = match words {
-        Some(words) => {
-            messages_fitted_status("settings/messages/status", words, Length::Fill, status_w)
-        }
-        None => UiNode::new(
-            "settings/messages/status-spacer",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+    let (status, status_lines) = match words {
+        Some(words) => messages_count_status(words, count.as_deref(), note, status_w),
+        None => (
+            UiNode::new(
+                "settings/messages/status-spacer",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            1,
+        ),
     };
-    let row = |key: &str, children: Vec<UiNode>| {
+    let row = |key: &str, children: Vec<UiNode>, height: f32| {
         UiNode::new(
             key.to_string(),
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -33798,14 +37045,18 @@ fn messages_count_line(
         .layout(
             Layout::row()
                 .width(Length::Fill)
-                .height(Length::Fixed(button_h))
+                .height(Length::Fixed(height))
                 .gap(8.0),
         )
         .children(children)
     };
     if beside {
         return (
-            row("settings/messages/header", vec![status, copy, folder]),
+            row(
+                "settings/messages/header",
+                vec![status, copy, folder],
+                button_h,
+            ),
             button_h,
         );
     }
@@ -33821,23 +37072,30 @@ fn messages_count_line(
         vec![row(
             "settings/messages/report",
             vec![spacer("settings/messages/report/spacer"), copy, folder],
+            copy_h.max(folder_h),
         )]
     } else {
         vec![
             row(
                 "settings/messages/report",
                 vec![spacer("settings/messages/report/spacer"), copy],
+                copy_h,
             ),
             row(
                 "settings/messages/report/folder",
                 vec![spacer("settings/messages/report/folder-spacer"), folder],
+                folder_h,
             ),
         ]
     };
     let line_h = messages_line_height();
     let mut status = status;
-    status.layout.height = Length::Fixed(line_h);
-    let height = line_h + button_rows.len() as f32 * (6.0 + button_h);
+    status.layout.height = Length::Fixed(status_lines as f32 * line_h);
+    let height = status_lines as f32 * line_h
+        + button_rows
+            .iter()
+            .map(|row| 6.0 + fixed_height(row))
+            .sum::<f32>();
     let mut children = vec![status];
     children.extend(button_rows);
     (
@@ -33891,13 +37149,17 @@ fn messages_severity_segments(
     // chips stand on the filters' card as the tag chips do, spaced, not in a
     // track of their own: a card in a card.
     let stacked = total > content_width;
+    let mut stacked_h = 2.0 + 6.0;
     let children = segments
         .into_iter()
         .zip(widths)
         .map(|((key, label, selected), width)| {
-            let mut chip = messages_filter_chip(key, &label, selected, width.min(content_width));
+            let width = width.min(content_width);
+            let mut chip = messages_filter_chip(key, &label, selected, width);
             if stacked {
-                chip.layout.height = Length::Fixed(height - 6.0);
+                let chip_h = messages_chip_height(&label, width, height - 6.0);
+                chip.layout.height = Length::Fixed(chip_h);
+                stacked_h += chip_h;
             }
             chip
         })
@@ -33908,7 +37170,7 @@ fn messages_severity_segments(
                 .width(Length::Fill)
                 .gap(2.0)
                 .padding(Insets::symmetric(0.0, 3.0)),
-            2.0 * (height - 6.0) + 2.0 + 6.0,
+            stacked_h,
         )
     } else {
         (
@@ -33944,11 +37206,12 @@ fn messages_severity_segments(
 /// accent wash within 1.06:1 of a resting one (selection carried by hue alone,
 /// reading as disabled in greyscale) and a resting one's 1.4:1 hairline rim.
 fn messages_filter_chip(key: &str, label: &str, selected: bool, width: f32) -> UiNode {
+    let (words, _) = messages_chip_words(label, width);
     UiNode::new(
         key.to_string(),
         UiContent::Button(
             Control::new(
-                ButtonSpec::new(label).visual_label(label),
+                ButtonSpec::new(label).visual_label(words),
                 ActionId::new(key.to_string()),
             )
             .state(ControlState {
@@ -33963,6 +37226,27 @@ fn messages_filter_chip(key: &str, label: &str, selected: bool, width: f32) -> U
             .width(Length::Fixed(width))
             .height(Length::Fill),
     )
+}
+
+/// A filter chip's painted words in a chip `width` wide, and their line
+/// count: the label on one line where it fits the room a centred chip keeps
+/// clear of its edges, else on as many lines as it needs (never "Proble…"),
+/// measured in the wider of the faces a resting and a selected chip paint.
+fn messages_chip_words(label: &str, width: f32) -> (String, usize) {
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    let measure = |line: &str| {
+        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, line, px).max(
+            crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, line, px),
+        )
+    };
+    let lines = wrap_to_box(label, (width - 20.0).max(0.0), &measure);
+    let count = lines.len();
+    (lines.join("\n"), count)
+}
+
+/// A filter chip's height in a chip `width` wide whose one line is `single`.
+fn messages_chip_height(label: &str, width: f32, single: f32) -> f32 {
+    crate::native_ui::native_button_height_for_lines(messages_chip_words(label, width).1, single)
 }
 
 /// The TAG chips (ruling 262): `All tags`, then one chip per chip-name present
@@ -34019,18 +37303,27 @@ fn messages_tag_chip_rows(
         .map(|(_, label, _)| measure(label).min(room))
         .collect();
     let mut chips = chips.into_iter().zip(widths.iter().copied());
+    let lead_h = first
+        .as_ref()
+        .map_or(chip_h, |(node, _)| fixed_height(node).max(chip_h));
     let mut lead = first.map(|(node, _)| node);
     messages_chip_row_lengths(&widths, 6.0, room)
         .into_iter()
         .enumerate()
         .map(|(index, len)| {
             let mut children: Vec<UiNode> = lead.take().into_iter().collect();
+            // As tall as its tallest chip's words (one wider than the row
+            // keeps them on lines).
+            let mut row_h = if index == 0 { lead_h } else { chip_h };
             children.extend(
                 chips
                     .by_ref()
                     .take(len)
                     .map(|((key, label, selected), width)| {
-                        messages_filter_chip(&key, &label, selected, width)
+                        row_h = row_h.max(messages_chip_height(&label, width, chip_h));
+                        let mut chip = messages_filter_chip(&key, &label, selected, width);
+                        chip.layout.height = Length::Fill;
+                        chip
                     }),
             );
             UiNode::new(
@@ -34040,7 +37333,7 @@ fn messages_tag_chip_rows(
             .layout(
                 Layout::row()
                     .width(Length::Fill)
-                    .height(Length::Fixed(chip_h + 6.0))
+                    .height(Length::Fixed(row_h + 6.0))
                     .padding(Insets {
                         top: 3.0,
                         right: 0.0,
@@ -34097,20 +37390,22 @@ fn messages_chip_row_lengths(widths: &[f32], gap: f32, room: f32) -> Vec<usize> 
 /// are the engine's (ruling 395).
 fn messages_tag_popup(filter: &MessagesFilter, open: bool, width: f32, height: f32) -> UiNode {
     let tag = filter.tag.as_deref();
+    // Its words whole beside its chevron, on lines where the pop-up is
+    // narrower than them ("Tag:…" at 2× on a phone-width page).
+    let spec = ButtonSpec::new(aterm_messages::page::tag_menu_name(tag))
+        .trailing_icon(ButtonIcon::ChevronDown);
+    let label = aterm_messages::page::tag_menu_label(tag);
+    let (words, lines) = button_words_in(&spec, &label, &[], width);
+    let height = crate::native_ui::native_button_height_for_lines(lines, height);
     UiNode::new(
         MESSAGES_TAG_MENU,
         UiContent::Button(
-            Control::new(
-                ButtonSpec::new(aterm_messages::page::tag_menu_name(tag))
-                    .visual_label(aterm_messages::page::tag_menu_label(tag))
-                    .trailing_icon(ButtonIcon::ChevronDown),
-                ActionId::new(MESSAGES_TAG_MENU),
-            )
-            .state(ControlState {
-                expanded: Some(open),
-                ..ControlState::default()
-            })
-            .style(StyleRef::Secondary),
+            Control::new(spec.visual_label(words), ActionId::new(MESSAGES_TAG_MENU))
+                .state(ControlState {
+                    expanded: Some(open),
+                    ..ControlState::default()
+                })
+                .style(StyleRef::Secondary),
         ),
     )
     .layout(
@@ -34169,6 +37464,22 @@ struct MessagesLead {
     when: f32,
     tag: f32,
     gap: f32,
+    /// The head stacks: its mark and `when` on its first line, its title on
+    /// a line of its own under them across the row ([`messages_head_height`])
+    /// — where even the narrowed lead leaves the title less than two fifths
+    /// of the row (a phone-width window, where the title had 24pt: "C…").
+    stacked: bool,
+    /// On a stacked head, the lines `when` takes under the mark where the
+    /// log's widest own `when` is wider than the room beside it (0: beside
+    /// it). The most any of the log's words take, so every head of the page
+    /// is as tall (the list is virtual, ruling 264: its rows' heights are
+    /// known without measuring every entry).
+    when_lines: usize,
+    /// On a stacked head, the lines its title takes across the row: as many
+    /// as the log's longest title needs there ([`messages_plan`] holds the
+    /// head inside the list), one height for every head. On one line,
+    /// ruling 262's one line.
+    title_lines: usize,
 }
 
 impl MessagesLead {
@@ -34211,12 +37522,49 @@ impl MessagesLead {
             when,
             tag,
             gap: 8.0,
+            stacked: false,
+            when_lines: 0,
+            title_lines: 1,
         };
-        // A title keeps at least two fifths of the row: where the column would
-        // take more, the tag column goes first (the row's name says it), then
-        // the time column narrows to its own words.
-        if lead.title_x() > content_width * 0.6 {
+        // A title keeps at least two fifths of the row, the chevron's end not
+        // counted as its (at 30 columns it had a quarter, "Claud…"): where
+        // the column would take more, the tag column goes first (the row's
+        // name says it), then
+        // the time column narrows to its own words (the log's own, not the
+        // longest it may say later); and where not even that leaves the title
+        // its two fifths, the head stacks.
+        if lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6 {
             lead.tag = 0.0;
+        }
+        if lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6 {
+            let own = whens.iter().map(|when| width(when)).fold(0.0_f32, f32::max) + 4.0;
+            lead.when = lead.when.min(own);
+        }
+        lead.stacked = lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6;
+        if lead.stacked {
+            let beside = content_width - lead.mark - lead.gap - MESSAGES_CHEVRON_END;
+            let under = content_width - lead.gap - MESSAGES_CHEVRON_END;
+            if whens.iter().any(|when| width(when) > beside + 0.01) {
+                lead.when_lines = whens
+                    .iter()
+                    .map(|when| wrap_to_box(when, under, &width).len())
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+            }
+            // The title across the row, whole: its lines the most any of the
+            // log's titles takes there, each distinct title measured once.
+            let (ppx, pface) =
+                crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+            let primary = |line: &str| crate::tray_raster::ui_text_width_for(pface, line, ppx);
+            let titles: std::collections::BTreeSet<&str> =
+                visible.iter().map(|entry| entry.title.as_str()).collect();
+            lead.title_lines = titles
+                .into_iter()
+                .map(|title| wrap_to_box(title, under, &primary).len())
+                .max()
+                .unwrap_or(1)
+                .max(1);
         }
         lead
     }
@@ -34237,10 +37585,58 @@ thread_local! {
     static MESSAGES_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// One entry's ONE LINE (ruling 262): a flush DISCLOSURE control the whole
-/// row wide — its name the title, its description the plain words, expanded
-/// or collapsed — under the painted lead column and title. Hover, press and
-/// open paint a quiet wash; the chevron says which way it opens.
+/// The room a head keeps clear at its end for the disclosure's chevron.
+const MESSAGES_CHEVRON_END: f32 = 36.0;
+
+/// AN ENTRY'S TITLE AS ITS HEAD PAINTS IT, and whether that cut it: on one
+/// line, fitted to the title's column (ruling 262); stacked, on the head's
+/// title lines across the row, the last cut only where the title needs more
+/// than the list lets a head have. The open entry's body says a title its
+/// head cut whole ([`MessagesBody::name`]).
+fn messages_head_title(
+    entry: &MessageView,
+    lead: MessagesLead,
+    content_width: f32,
+) -> (Vec<String>, bool) {
+    if !lead.stacked {
+        let title_w = (content_width - lead.title_x() - MESSAGES_CHEVRON_END).max(24.0);
+        let shown = crate::native_ui::fit_native_text_label(&entry.title, title_w);
+        let cut = shown != entry.title;
+        return (vec![shown], cut);
+    }
+    let under = (content_width - lead.gap - MESSAGES_CHEVRON_END).max(24.0);
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    let mut lines = wrap_to_box(&entry.title, under, &|line| {
+        crate::tray_raster::ui_text_width_for(face, line, px)
+    });
+    if lines.len() <= lead.title_lines {
+        return (lines, false);
+    }
+    let rest = lines.split_off(lead.title_lines - 1).join(" ");
+    lines.push(crate::native_ui::fit_native_text_label(&rest, under));
+    (lines, true)
+}
+
+/// A HEAD'S HEIGHT ([`messages_head_node`]): a row on one line (ruling 262);
+/// stacked ([`MessagesLead::stacked`]), the mark's row, the lines `when`
+/// takes under it where it does not fit beside it, and the title's line. One
+/// height for every entry of the page, so the virtual list (ruling 264)
+/// knows every row's without measuring a word.
+fn messages_head_height(lead: MessagesLead) -> f32 {
+    let row_h = messages_row_height();
+    if !lead.stacked {
+        return row_h;
+    }
+    let line_h = messages_line_height();
+    row_h + (lead.when_lines + lead.title_lines) as f32 * line_h + (row_h - line_h) / 2.0
+}
+
+/// One entry's head (ruling 262): a flush DISCLOSURE control the whole row
+/// wide — its name the title, its description the plain words, expanded or
+/// collapsed — under the painted lead column and title, every word whole
+/// on one line or stacked ([`messages_head_height`]). Hover, press and open
+/// paint a quiet wash; the
+/// chevron says which way it opens.
 fn messages_head_node(
     entry: &MessageView,
     expanded: bool,
@@ -34272,7 +37668,7 @@ fn messages_head_node(
         ),
     )
     .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-    let text = |key: String, text: String, style: StyleRef, width: Length| {
+    let text = |key: String, text: String, style: StyleRef, width: Length, height: f32| {
         UiNode::new(
             key,
             UiContent::Text(TextSpec {
@@ -34281,7 +37677,7 @@ fn messages_head_node(
                 style,
             }),
         )
-        .layout(Layout::default().width(width).height(Length::Fill))
+        .layout(Layout::default().width(width).height(Length::Fixed(height)))
         .paint_only()
     };
     let (quiet_px, quiet_face) =
@@ -34294,7 +37690,6 @@ fn messages_head_node(
             crate::native_ui::fit_native_text_label(&s, (w - 2.0).max(8.0))
         }
     };
-    let title_w = (content_width - lead.title_x() - 36.0).max(24.0);
     let mark = UiNode::new(
         format!("{key}/severity"),
         UiContent::Custom(crate::native_ui::AuditedCustomNode {
@@ -34313,28 +37708,144 @@ fn messages_head_node(
     .layout(
         Layout::default()
             .width(Length::Fixed(lead.mark))
-            .height(Length::Fill),
+            .height(Length::Fixed(row_h)),
     )
     .paint_only();
-    let visual = UiNode::new(
-        format!("{key}/lead"),
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-    )
-    .layout(
-        Layout::row()
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .gap(lead.gap),
-    )
-    .paint_only()
-    .children({
+    let when = clock.when(entry.at_unix_ms);
+    let visual = if lead.stacked {
+        // The mark and `when` over the title, which has the row less the
+        // chevron's end: `when` beside the mark where the log's words fit
+        // there, else on its own lines under it, whole.
+        let line_h = messages_line_height();
+        let under = (content_width - lead.gap - MESSAGES_CHEVRON_END).max(24.0);
+        let pad = Insets {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: lead.gap,
+        };
+        let mut first = vec![mark];
+        let mut children = Vec::new();
+        if lead.when_lines == 0 {
+            first.push(text(
+                format!("{key}/when"),
+                when.clone(),
+                StyleRef::Quiet,
+                Length::Fill,
+                row_h,
+            ));
+        }
+        children.push(
+            UiNode::new(
+                format!("{key}/lead/first"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::row()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(row_h))
+                    .gap(lead.gap),
+            )
+            .paint_only()
+            .children(first),
+        );
+        if lead.when_lines > 0 {
+            let (px, face) =
+                crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+            let lines = wrap_to_box(&when, under, &|line| {
+                crate::tray_raster::ui_text_width_for(face, line, px)
+            });
+            children.push(
+                UiNode::new(
+                    format!("{key}/when"),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(
+                    // The box its lines were measured for: clear of the
+                    // chevron, centred on the head's lines beside them.
+                    Layout::column()
+                        .width(Length::Fixed(under + lead.gap))
+                        .height(Length::Fixed(lead.when_lines as f32 * line_h))
+                        .padding(pad),
+                )
+                .paint_only()
+                .children(
+                    lines
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, line)| {
+                            text(
+                                format!("{key}/when/line-{index}"),
+                                line,
+                                StyleRef::Quiet,
+                                Length::Fill,
+                                line_h,
+                            )
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        // The title across the row, on its lines: whole where the head's
+        // lines hold it (they hold the log's longest wherever the list has
+        // the room), else its last line cut.
+        let (lines, _) = messages_head_title(entry, lead, content_width);
+        let title = if let [line] = lines.as_slice() {
+            let mut title = text(
+                format!("{key}/label"),
+                line.clone(),
+                StyleRef::Primary,
+                Length::Fixed(under + lead.gap),
+                line_h,
+            );
+            title.layout.padding = pad;
+            title
+        } else {
+            UiNode::new(
+                format!("{key}/label"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::column()
+                    .width(Length::Fixed(under + lead.gap))
+                    .height(Length::Fixed(lead.title_lines as f32 * line_h))
+                    .padding(pad),
+            )
+            .paint_only()
+            .children(
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        text(
+                            format!("{key}/label/line-{index}"),
+                            line,
+                            StyleRef::Primary,
+                            Length::Fill,
+                            line_h,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        children.push(title);
+        UiNode::new(
+            format!("{key}/lead"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(Layout::column().width(Length::Fill).height(Length::Fill))
+        .paint_only()
+        .children(children)
+    } else {
+        let title_w = (content_width - lead.title_x() - MESSAGES_CHEVRON_END).max(24.0);
         let mut children = vec![
             mark,
             text(
                 format!("{key}/when"),
-                clock.when(entry.at_unix_ms),
+                when,
                 StyleRef::Quiet,
                 Length::Fixed(lead.when),
+                row_h,
             ),
         ];
         if lead.tag > 0.0 {
@@ -34343,16 +37854,30 @@ fn messages_head_node(
                 fit(&crate::messages_host::tag_words(&entry.tag), lead.tag),
                 StyleRef::Quiet,
                 Length::Fixed(lead.tag),
+                row_h,
             ));
         }
+        let (title, _) = messages_head_title(entry, lead, content_width);
         children.push(text(
             format!("{key}/label"),
-            crate::native_ui::fit_native_text_label(&entry.title, title_w),
+            title.concat(),
             StyleRef::Primary,
             Length::Fixed(title_w),
+            row_h,
         ));
-        children
-    });
+        UiNode::new(
+            format!("{key}/lead"),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::row()
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .gap(lead.gap),
+        )
+        .paint_only()
+        .children(children)
+    };
     UiNode::new(
         format!("{key}/head"),
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -34360,7 +37885,7 @@ fn messages_head_node(
     .layout(
         Layout::default()
             .width(Length::Fill)
-            .height(Length::Fixed(row_h)),
+            .height(Length::Fixed(messages_head_height(lead))),
     )
     .children(vec![button, visual])
 }
@@ -34371,6 +37896,9 @@ fn messages_head_node(
 /// technical details in small monospace last.
 #[derive(Clone, Debug, PartialEq)]
 struct MessagesBody {
+    /// The entry's title whole, on the body's lines, where its head cut it
+    /// ([`messages_head_title`]): opened, an entry says all of its name.
+    name: Vec<String>,
     meta: Vec<String>,
     sentence: Vec<String>,
     technical: Vec<String>,
@@ -34383,9 +37911,27 @@ struct MessagesBody {
 struct MessagesButton {
     key: String,
     label: String,
+    /// The words it paints: its label, on lines where the body is narrower
+    /// than it ([`button_words`]; "Ope…" at 1.5× on a phone-width page).
+    visual: String,
+    lines: usize,
     primary: bool,
     enabled: bool,
     width: f32,
+}
+
+impl MessagesButton {
+    /// Its height: a small button's, as tall as its lines need.
+    fn height(&self) -> f32 {
+        crate::native_ui::native_button_height_for_lines(self.lines, messages_small_button_height())
+    }
+}
+
+/// A footer row's height: its tallest button's.
+fn messages_footer_row_height(row: &[MessagesButton]) -> f32 {
+    row.iter()
+        .map(MessagesButton::height)
+        .fold(messages_small_button_height(), f32::max)
 }
 
 impl MessagesBody {
@@ -34406,23 +37952,11 @@ impl MessagesBody {
         // lines.
         let (sentence, technical) = entry.sentence_and_technical();
         let diagram = entry.is_diagram();
+        // Every line of it, whole: an entry taller than the room is read a
+        // part at a time ([`MessagesTall`]); it was cut to three lines.
         let sentence = sentence
             .into_iter()
-            .flat_map(|first| {
-                let mut wrapped = wrapped_copy_lines(first, ppx, text_width);
-                if wrapped.len() > 3 {
-                    wrapped.truncate(3);
-                    if let Some(last) = wrapped.pop() {
-                        wrapped.push(elide_wrapped_copy_tail(
-                            &last,
-                            ppx,
-                            crate::widget::TextFace::Ui,
-                            text_width,
-                        ));
-                    }
-                }
-                wrapped
-            })
+            .flat_map(|first| wrapped_copy_lines(first, ppx, text_width))
             .collect();
         // A diagram's rows are CUT (a column stays a column); a prose line in
         // the monospace face wraps at its spaces.
@@ -34443,6 +37977,19 @@ impl MessagesBody {
         let measure = |label: &str| {
             crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px) + 24.0
         };
+        // A footer row is a spacer and its buttons, 8pt apart: the buttons
+        // have the body less the gap after the spacer.
+        let room = (text_width - 8.0).max(48.0);
+        // Its words and its width: one line where the row holds it, else the
+        // row's width and the words on its lines.
+        let words = |label: &str| {
+            if measure(label) <= room + crate::native_ui::TEXT_FIT_SLACK {
+                (label.to_string(), 1, measure(label))
+            } else {
+                let (words, lines) = button_words(label, &[], room);
+                (words, lines, room)
+            }
+        };
         // The Primary is the engine's (ruling 407; the lines carry it as
         // `primary=`): the FIRST button offered while a press can still
         // perform it (ruling 265); past a dead one — which stays, plain and
@@ -34457,26 +38004,32 @@ impl MessagesBody {
             .enumerate()
             .map(|(k, action)| {
                 let label = aterm_messages::page::button_label(action.label);
+                let (visual, lines, width) = words(&label);
                 MessagesButton {
                     key: format!("{key}/action/{}", action.index),
-                    width: measure(&label).min(text_width),
+                    width,
                     label,
+                    visual,
+                    lines,
                     primary: Some(k) == lead,
                     enabled: action.still_actionable,
                 }
             })
             .collect();
+        let (visual, lines, width) = words(aterm_messages::page::COPY);
         buttons.push(MessagesButton {
             key: format!("{key}/copy"),
             label: aterm_messages::page::COPY.to_string(),
+            visual,
+            lines,
             primary: false,
             enabled: true,
-            width: measure(aterm_messages::page::COPY).min(text_width),
+            width,
         });
         let mut footer: Vec<Vec<MessagesButton>> = vec![Vec::new()];
         let mut used = 0.0_f32;
         for button in buttons {
-            if used + 8.0 + button.width > text_width && !footer.last().is_some_and(Vec::is_empty) {
+            if used + 8.0 + button.width > room && !footer.last().is_some_and(Vec::is_empty) {
                 footer.push(Vec::new());
                 used = 0.0;
             }
@@ -34484,6 +38037,7 @@ impl MessagesBody {
             footer.last_mut().expect("a row").push(button);
         }
         Self {
+            name: Vec::new(),
             meta: wrapped_copy_lines(&meta, qpx, text_width),
             sentence,
             technical,
@@ -34516,17 +38070,26 @@ impl MessagesBody {
             8.0 + line + self.technical.len() as f32 * messages_code_line_height()
         };
         let rows = self.footer.len().max(1) as f32;
-        (self.meta.len() + self.sentence.len()) as f32 * line
+        let footer = if self.footer.is_empty() {
+            messages_small_button_height()
+        } else {
+            self.footer
+                .iter()
+                .map(|row| messages_footer_row_height(row))
+                .sum()
+        };
+        (self.name.len() + self.meta.len() + self.sentence.len()) as f32 * line
             + MESSAGES_FOOTER_GAP
-            + rows * messages_small_button_height()
+            + footer
             + (rows - 1.0) * 6.0
             + tech
             + 10.0
     }
 
-    /// Fit the body into `avail` points, giving up what matters least first:
-    /// technical lines (to one, then the block — Copy keeps every line), then
-    /// sentence lines to one, then meta lines to one. The footer stays.
+    /// Fit the body into `avail` points by its technical lines alone (to
+    /// one, then the block — Copy keeps every line); the meta line, the
+    /// sentence and the footer stay whole, and what is still taller than the
+    /// room is read a part at a time ([`MessagesTall`]).
     fn fit(&mut self, avail: f32) {
         let code_h = messages_code_line_height();
         if self.height() > avail && !self.technical.is_empty() {
@@ -34540,12 +38103,10 @@ impl MessagesBody {
                 self.technical.clear();
             }
         }
-        while self.height() > avail && self.sentence.len() > 1 {
-            self.sentence.pop();
-        }
-        while self.height() > avail && self.meta.len() > 1 {
-            self.meta.pop();
-        }
+        // The meta line and the sentence stay whole: an entry taller than
+        // the room is read a part at a time ([`MessagesTall`]). They were
+        // dropped a line at a time here, the cause and its next step the
+        // first to go.
     }
 }
 
@@ -34629,6 +38190,15 @@ fn messages_body_node(
         )
     };
     let mut children: Vec<UiNode> = Vec::new();
+    for (index, words) in body.name.iter().enumerate() {
+        children.push(line(
+            format!("{key}/name/{index}"),
+            words.clone(),
+            SemanticRole::Text,
+            StyleRef::Primary,
+            line_h,
+        ));
+    }
     for (index, words) in body.meta.iter().enumerate() {
         children.push(line(
             format!("{key}/meta/{index}"),
@@ -34652,7 +38222,6 @@ fn messages_body_node(
         MESSAGES_FOOTER_GAP,
     ));
     // The footer: the buttons right-aligned, never full-width.
-    let button_h = messages_small_button_height();
     let rows = body.footer.len().max(1);
     let footer_rows: Vec<UiNode> = body
         .footer
@@ -34679,13 +38248,14 @@ fn messages_body_node(
                 .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
             };
             let mut buttons: Vec<UiNode> = vec![lead];
+            let row_h = messages_footer_row_height(row);
             for b in row {
                 buttons.push(
                     UiNode::new(
                         b.key.clone(),
                         UiContent::Button(
                             Control::new(
-                                ButtonSpec::new(b.label.clone()),
+                                ButtonSpec::new(b.label.clone()).visual_label(b.visual.clone()),
                                 ActionId::new(b.key.clone()),
                             )
                             .state(ControlState {
@@ -34702,7 +38272,7 @@ fn messages_body_node(
                     .layout(
                         Layout::default()
                             .width(Length::Fixed(b.width))
-                            .height(Length::Fixed(button_h)),
+                            .height(Length::Fixed(b.height())),
                     ),
                 );
             }
@@ -34713,12 +38283,17 @@ fn messages_body_node(
             .layout(
                 Layout::row()
                     .width(Length::Fill)
-                    .height(Length::Fixed(button_h))
+                    .height(Length::Fixed(row_h))
                     .gap(8.0),
             )
             .children(buttons)
         })
         .collect();
+    let footer_h = footer_rows
+        .iter()
+        .map(fixed_height)
+        .sum::<f32>()
+        .max(messages_small_button_height());
     children.push(
         UiNode::new(
             format!("{key}/actions"),
@@ -34727,9 +38302,7 @@ fn messages_body_node(
         .layout(
             Layout::column()
                 .width(Length::Fill)
-                .height(Length::Fixed(
-                    rows as f32 * button_h + (rows - 1) as f32 * 6.0,
-                ))
+                .height(Length::Fixed(footer_h + (rows - 1) as f32 * 6.0))
                 .gap(6.0),
         )
         .children(footer_rows),
@@ -34837,12 +38410,11 @@ fn messages_day_node(day: i64, plan: &MessagesPlan) -> UiNode {
 /// ([`SemanticRole::List`]).
 fn messages_list_node(
     rows: &[&MessageView],
-    first: usize,
+    (first, part): (usize, Option<usize>),
     plan: &MessagesPlan,
     selected: Option<u64>,
     note: Option<(u64, &str)>,
 ) -> (UiNode, f32) {
-    let row_h = messages_row_height();
     let indent = plan.indent();
     let mut children: Vec<UiNode> = vec![messages_spacer(
         "settings/messages/list/top",
@@ -34863,6 +38435,7 @@ fn messages_list_node(
         }
         let expanded = selected == Some(entry.id);
         let head = messages_head_node(entry, expanded, plan.lead, plan.content_width, plan.clock);
+        let row_h = fixed_height(&head);
         let key = format!("settings/messages/row/{}", entry.id);
         match plan
             .body
@@ -34870,7 +38443,54 @@ fn messages_list_node(
             .filter(|(id, _)| expanded && *id == entry.id)
         {
             Some((_, b)) => {
-                let h = row_h + b.height();
+                let mut body = messages_body_node(
+                    entry,
+                    b,
+                    indent,
+                    (plan.content_width - indent - 16.0).max(48.0),
+                    note.filter(|(id, _)| *id == entry.id).map(|(_, text)| text),
+                );
+                // A tall entry's part: its blocks alone, the body's
+                // padding with them ([`MessagesTall`]).
+                let shown = part
+                    .filter(|_| k == 0)
+                    .zip(plan.tall.as_ref().filter(|tall| tall.entry == first));
+                let (key, row, h) = match shown {
+                    Some((part, tall)) => {
+                        let blocks = tall.parts[part].clone();
+                        let last = body.children.len();
+                        let body_blocks = blocks.start.max(1) - 1..blocks.end - 1;
+                        body.layout.padding.bottom = if blocks.end - 1 == last {
+                            body.layout.padding.bottom
+                        } else {
+                            0.0
+                        };
+                        let kept: Vec<UiNode> = std::mem::take(&mut body.children)
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(index, _)| body_blocks.contains(index))
+                            .map(|(_, child)| child)
+                            .collect();
+                        let body_h =
+                            kept.iter().map(fixed_height).sum::<f32>() + body.layout.padding.bottom;
+                        body.layout.height = Length::Fixed(body_h);
+                        body.children = kept;
+                        let mut row = Vec::new();
+                        if blocks.start == 0 {
+                            row.push(head);
+                        }
+                        if !body.children.is_empty() {
+                            row.push(body);
+                        }
+                        let key = if part == 0 {
+                            key
+                        } else {
+                            format!("{key}/part-{part}")
+                        };
+                        (key, row, tall.heights[part])
+                    }
+                    None => (key, vec![head, body], row_h + b.height()),
+                };
                 children.push(
                     UiNode::new(key, UiContent::Group(GroupSpec::new(entry.title.clone())))
                         .layout(
@@ -34879,16 +38499,7 @@ fn messages_list_node(
                                 .height(Length::Fixed(h))
                                 .clipped(),
                         )
-                        .children(vec![
-                            head,
-                            messages_body_node(
-                                entry,
-                                b,
-                                indent,
-                                (plan.content_width - indent - 16.0).max(48.0),
-                                note.filter(|(id, _)| *id == entry.id).map(|(_, text)| text),
-                            ),
-                        ]),
+                        .children(row),
                 );
                 height += h;
             }
@@ -34978,7 +38589,8 @@ fn messages_filter_items(
     messages: &MessagesState,
     visible: usize,
     page_width: f32,
-    compact: bool,
+    (compact, room): (bool, Option<f32>),
+    tag_menu: bool,
 ) -> Vec<(UiNode, f32)> {
     // THE FILTERS AND THE COUNT SIT ON ONE CARD (system-15): they were the only
     // Settings controls with no card under them, so the chips, the count and
@@ -35032,7 +38644,7 @@ fn messages_filter_items(
                 px,
             ) + 56.0)
                 .min(content_width);
-            let popup = messages_tag_popup(filter, state.messages_tag_menu, popup_w, chip_h);
+            let popup = messages_tag_popup(filter, tag_menu, popup_w, chip_h);
             let segments_w = match segments.layout.width {
                 Length::Fixed(width) => width,
                 _ => content_width,
@@ -35073,10 +38685,11 @@ fn messages_filter_items(
                     chip_h + 6.0,
                 ));
             } else {
+                let popup_h = fixed_height(&popup);
                 items.push((segments, segments_h));
-                items.push((popup, chip_h));
+                items.push((popup, popup_h));
             }
-            if state.messages_tag_menu {
+            if tag_menu {
                 messages_tag_chip_rows(messages, filter, content_width, chip_h, None)
             } else {
                 Vec::new()
@@ -35098,7 +38711,10 @@ fn messages_filter_items(
             items.push((segments, segments_h));
             messages_tag_chip_rows(messages, filter, content_width, chip_h, None)
         };
-        items.extend(tag_rows.into_iter().map(|row| (row, chip_h + 6.0)));
+        items.extend(tag_rows.into_iter().map(|row| {
+            let height = fixed_height(&row);
+            (row, height)
+        }));
     }
     let words = (total > 0).then(|| messages_status_words(total, visible, filter.is_all()));
     let note = state
@@ -35114,27 +38730,58 @@ fn messages_filter_items(
         items.push(messages_no_match_node(content_width));
     }
     let gap = 8.0;
-    let height = items.iter().map(|(_, h)| *h).sum::<f32>()
-        + items.len().saturating_sub(1) as f32 * gap
-        + 2.0 * MESSAGES_FILTERS_PAD_Y;
-    vec![(
-        UiNode::new(
-            "settings/messages/filters",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group).style(StyleRef::Secondary)),
-        )
-        .layout(
-            Layout::column()
-                .width(Length::Fill)
-                .height(Length::Fixed(height))
-                .padding(Insets::symmetric(
-                    MESSAGES_FILTERS_PAD_X,
-                    MESSAGES_FILTERS_PAD_Y,
-                ))
-                .gap(gap),
-        )
-        .children(items.into_iter().map(|(node, _)| node).collect()),
-        height,
-    )]
+    let card_height = |items: &[(UiNode, f32)]| {
+        items.iter().map(|(_, h)| *h).sum::<f32>()
+            + items.len().saturating_sub(1) as f32 * gap
+            + 2.0 * MESSAGES_FILTERS_PAD_Y
+    };
+    // A CARD NO TALLER THAN THE LIST (a compact page's, which scrolls it as
+    // stops): where the card is taller than the room, it is listed a part at
+    // a time, each a card of the same face no taller than the room (a part
+    // an item alone where one is), so every control is whole on some screen.
+    // At 2× on a 22 × 24 window the one card was 405pt in a 268pt list,
+    // Copy All half under its edge and Open Log Folder on no screen at all.
+    let mut parts: Vec<Vec<(UiNode, f32)>> = vec![Vec::new()];
+    for item in items {
+        let part = parts.last_mut().expect("one part");
+        part.push(item);
+        if part.len() > 1 && room.is_some_and(|room| card_height(part) > room + 0.01) {
+            let item = part.pop().expect("the item just pushed");
+            parts.push(vec![item]);
+        }
+    }
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, items)| {
+            let height = card_height(&items);
+            let key = if index == 0 {
+                "settings/messages/filters".to_string()
+            } else {
+                format!("settings/messages/filters/part-{index}")
+            };
+            (
+                UiNode::new(
+                    key,
+                    UiContent::Group(
+                        GroupSpec::unlabeled(SemanticRole::Group).style(StyleRef::Secondary),
+                    ),
+                )
+                .layout(
+                    Layout::column()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(height))
+                        .padding(Insets::symmetric(
+                            MESSAGES_FILTERS_PAD_X,
+                            MESSAGES_FILTERS_PAD_Y,
+                        ))
+                        .gap(gap),
+                )
+                .children(items.into_iter().map(|(node, _)| node).collect()),
+                height,
+            )
+        })
+        .collect()
 }
 
 /// The filters card's own padding ([`messages_filter_items`]): the one place
@@ -35204,7 +38851,12 @@ fn messages_no_match_node(text_width: f32) -> (UiNode, f32) {
 /// list scrolls by STOP — one per entry, and on a compact page one per header
 /// item before them, because there the filters scroll away with the log —
 /// and `page_scroll` is the stop at the top of the view. On the wider pages
-/// the heading and the header stay; the card under them scrolls. What a
+/// the heading and the header stay; the card under them scrolls — unless the
+/// open entry's body does not fit whole under them, when the header scrolls
+/// away with the list as on a compact page, so the entry is read through its
+/// last line (the review of the owner's notices, 2026-10-20: a lost login's
+/// `what to expect` line was dropped under the pinned filters at 864×462,
+/// which no scroll could bring back). What a
 /// Messages render seats before it builds a node: the header items, the room
 /// the list has, the lead column, and every admitted entry's height in the
 /// card, the open one with its body fitted to the room. One
@@ -35213,14 +38865,19 @@ fn messages_no_match_node(text_width: f32) -> (UiNode, f32) {
 /// (ruling 263).
 struct MessagesPlan {
     compact: bool,
+    /// The header scrolls away with the list, one stop an item: a compact
+    /// page's always; a wider page's while the open entry's body does not
+    /// fit whole under the pinned header.
+    scrolls: bool,
     content_width: f32,
     /// The header items, top to bottom, with their heights.
     header: Vec<(UiNode, f32)>,
     item_gap: f32,
     /// The gap between the header and the log's card.
     gap: f32,
-    /// The height the scrolling region has: the whole section on a compact
-    /// page, the room under the pinned heading and header on the wider ones.
+    /// The height the scrolling region has: the whole section where the
+    /// header scrolls, the room under the pinned heading and header on the
+    /// wider pages else.
     room: f32,
     lead: MessagesLead,
     /// Each admitted entry's height in the card, newest first.
@@ -35234,55 +38891,154 @@ struct MessagesPlan {
     sections: Option<Vec<i64>>,
     /// A day header's height.
     day_h: f32,
+    /// The open entry where it is taller than the list's room, listed a
+    /// part at a time ([`MessagesTall`]).
+    tall: Option<MessagesTall>,
+}
+
+/// AN OPEN ENTRY TALLER THAN THE LIST, READ A PART AT A TIME: its head and
+/// its body's lines, footer and details gathered into parts no taller than
+/// the room (a part a block alone where one is), each a stop of the list
+/// whose screen shows that part whole — never a line cut by the room's edge.
+/// Seated whole or not at all, an entry taller than the room was seated at
+/// the top and cut by the edge, or had its sentence dropped a line at a time
+/// to fit; at 2× text on a 24-row window its buttons were on no screen.
+#[derive(Clone, Debug, PartialEq)]
+struct MessagesTall {
+    entry: usize,
+    /// Each part's blocks: block 0 the head, block `i` the body's child
+    /// `i - 1` ([`messages_body_node`]).
+    parts: Vec<std::ops::Range<usize>>,
+    /// Each part's height, its share of the body's padding with it.
+    heights: Vec<f32>,
+    /// The keys each part draws: the head's title, the body's lines and
+    /// buttons — what the keyboard can be on while that part is the view.
+    keys: Vec<std::collections::BTreeSet<String>>,
+}
+
+/// Every key under `node`, its own included.
+fn ui_node_keys(node: &UiNode, into: &mut std::collections::BTreeSet<String>) {
+    into.insert(node.key.as_str().to_string());
+    for child in &node.children {
+        ui_node_keys(child, into);
+    }
+}
+
+/// The blocks of an open entry — its head (`head`) and its body's children
+/// — packed into parts no taller than `room`, and each part's height: a
+/// part's body blocks carry the body's bottom padding where they end it.
+fn messages_tall_parts(
+    head: f32,
+    body: &UiNode,
+    room: f32,
+) -> (Vec<std::ops::Range<usize>>, Vec<f32>) {
+    let pad = body.layout.padding.bottom;
+    let blocks: Vec<f32> = std::iter::once(head)
+        .chain(body.children.iter().map(fixed_height))
+        .collect();
+    let last = blocks.len() - 1;
+    let mut parts: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut heights: Vec<f32> = Vec::new();
+    let mut start = 0;
+    let mut used = 0.0_f32;
+    for (index, height) in blocks.iter().copied().enumerate() {
+        let end_pad = if index == last { pad } else { 0.0 };
+        if index > start && used + height + end_pad > room + 0.01 {
+            parts.push(start..index);
+            heights.push(used);
+            start = index;
+            used = 0.0;
+        }
+        used += height + end_pad;
+    }
+    parts.push(start..blocks.len());
+    heights.push(used);
+    (parts, heights)
 }
 
 /// What the list shows with one stop at its top: the header items it seats
-/// (a compact page's; the wider pages' header is always there) and the
-/// entries, by index among those the filters admit.
+/// (a compact page's; the wider pages' header is always there), the
+/// entries, by index among those the filters admit, and — where the first
+/// is a tall open entry ([`MessagesTall`]) — which of its parts it shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MessagesView {
     header: std::ops::Range<usize>,
     rows: std::ops::Range<usize>,
+    part: Option<usize>,
 }
 
 /// Where a scrolled Messages list stood when it was last drawn: the stop at
-/// its top, the entry there, and the filter it was drawn under
-/// ([`SettingsViewState::messages_anchor`]).
+/// its top, the entry there, the entries drawn under it in order, and the
+/// filter it was drawn under ([`SettingsViewState::messages_anchor`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MessagesAnchor {
     stop: usize,
     id: u64,
+    below: Vec<u64>,
     filter: MessagesFilter,
 }
 
 impl MessagesPlan {
-    /// The stops before the entries: the compact page's header items, which
-    /// scroll with the list.
+    /// The stops before the entries: the header items, where they scroll
+    /// with the list ([`Self::scrolls`]).
     fn lead_stops(&self) -> usize {
-        if self.compact { self.header.len() } else { 0 }
+        if self.scrolls { self.header.len() } else { 0 }
     }
 
-    /// Every stop the list has.
+    /// Every stop the list has: a tall open entry's every part one.
     fn stops(&self) -> usize {
-        self.lead_stops() + self.heights.len()
+        self.lead_stops() + self.heights.len() + self.extra()
     }
 
-    /// The compact page's stop holding the filters card, whose count line
-    /// carries the page's transient line (`None` on the wider pages, whose
-    /// header always stays).
+    /// The stops a tall open entry adds after its first.
+    fn extra(&self) -> usize {
+        self.tall.as_ref().map_or(0, |tall| tall.parts.len() - 1)
+    }
+
+    /// The stop entry `index` stands at the top of.
+    fn entry_stop(&self, index: usize) -> usize {
+        self.lead_stops()
+            + index
+            + if self.tall.as_ref().is_some_and(|tall| index > tall.entry) {
+                self.extra()
+            } else {
+                0
+            }
+    }
+
+    /// The entry at the top of entry stop `j` (a stop less the header's),
+    /// and which of a tall entry's parts it shows there.
+    fn stop_entry(&self, j: usize) -> (usize, Option<usize>) {
+        let extra = self.extra();
+        match &self.tall {
+            Some(tall) if j >= tall.entry && j <= tall.entry + extra => {
+                (tall.entry, Some(j - tall.entry))
+            }
+            Some(tall) if j > tall.entry + extra => (j - extra, None),
+            _ => (j, None),
+        }
+    }
+
+    /// The stop holding the filters card's count line, which carries the
+    /// page's transient line, where the header scrolls (`None` where it
+    /// stays): the card, or the part of it that holds the line where a short
+    /// list lists the card a part at a time.
     fn filters_stop(&self) -> Option<usize> {
-        self.compact
+        self.scrolls
             .then(|| {
                 self.header
                     .iter()
-                    .position(|(node, _)| node.key.as_str() == "settings/messages/filters")
+                    .position(|(node, _)| ui_node_holds(node, "settings/messages/header"))
             })
             .flatten()
     }
 
     /// Where every row's body text begins, from the card's left edge.
     fn indent(&self) -> f32 {
-        if self.compact {
+        if self.lead.stacked {
+            // Under a stacked head the body has the row, as its title does.
+            self.lead.gap
+        } else if self.compact {
             self.lead.mark + self.lead.gap
         } else {
             self.lead.title_x()
@@ -35325,7 +39081,7 @@ impl MessagesPlan {
         let lead = self.lead_stops();
         let n = self.heights.len();
         let top = top.min(self.stops().saturating_sub(1));
-        let (header, first, room) = if top < lead {
+        let (header, first, part, room) = if top < lead {
             let (mut end, mut used) = (top, 0.0_f32);
             for k in top..lead {
                 let h = self.header[k].1 + if k > top { self.item_gap } else { 0.0 };
@@ -35340,12 +39096,38 @@ impl MessagesPlan {
             } else {
                 f32::NEG_INFINITY
             };
-            (top..end, 0, room)
+            (top..end, 0, None, room)
         } else {
-            (0..0, top - lead, self.room)
+            let (first, part) = self.stop_entry(top - lead);
+            (0..0, first, part, self.room)
         };
+        // A view that starts on a tall entry's part shows that part, and
+        // after its last part the entries that fit under it.
+        if let (Some(part), Some(tall)) = (part, self.tall.as_ref()) {
+            let mut end = first + 1;
+            if part + 1 == tall.parts.len() {
+                let mut used = self.part_card_height(first, part);
+                while end < n {
+                    let more = 1.0 + self.heights[end];
+                    if used + more > room + 0.01 {
+                        break;
+                    }
+                    used += more;
+                    end += 1;
+                }
+            }
+            return MessagesView {
+                header,
+                rows: first..end,
+                part: Some(part),
+            };
+        }
         let mut end = first;
         while end < n {
+            // A tall entry is seated only from its first part's own stop.
+            if self.tall.as_ref().is_some_and(|tall| tall.entry == end) {
+                break;
+            }
             let fits = self.card_height(first..end + 1) <= room + 0.01;
             // The list's top entry is shown whatever its height.
             let heads = end == first && header.is_empty();
@@ -35357,16 +39139,40 @@ impl MessagesPlan {
         MessagesView {
             header,
             rows: first..end,
+            part: None,
         }
     }
 
-    /// Whether the view from `top` reaches the list's end.
+    /// The card's height showing part `part` of the tall entry `entry`
+    /// alone: its padding, the entry's day header where it carries one, and
+    /// the part.
+    fn part_card_height(&self, entry: usize, part: usize) -> f32 {
+        let day = if self.sections.is_some() {
+            self.day_h
+        } else {
+            0.0
+        };
+        let height = self
+            .tall
+            .as_ref()
+            .and_then(|tall| (tall.entry == entry).then(|| tall.heights[part]))
+            .unwrap_or_default();
+        2.0 * MESSAGES_LIST_PAD + day + height
+    }
+
+    /// Whether the view from `top` reaches the list's end: its last entry,
+    /// a tall one's last part.
     fn reaches_end(&self, top: usize) -> bool {
         let view = self.view(top);
         if self.heights.is_empty() {
             view.header.end == self.lead_stops()
         } else {
             view.rows.end == self.heights.len()
+                && view.part.is_none_or(|part| {
+                    self.tall
+                        .as_ref()
+                        .is_none_or(|tall| part + 1 == tall.parts.len())
+                })
         }
     }
 
@@ -35390,7 +39196,7 @@ impl MessagesPlan {
         if view.rows.contains(&index) {
             return top;
         }
-        let stop = self.lead_stops() + index;
+        let stop = self.entry_stop(index);
         if index < view.rows.start {
             return stop.min(limit);
         }
@@ -35410,7 +39216,7 @@ impl MessagesPlan {
         if self.view(top).rows.contains(&index) {
             top
         } else {
-            (self.lead_stops() + index).min(limit)
+            self.entry_stop(index).min(limit)
         }
     }
 }
@@ -35424,11 +39230,36 @@ fn messages_plan(
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> MessagesPlan {
+    messages_plan_opening(
+        state,
+        messages,
+        visible,
+        width,
+        viewport,
+        state.messages_selected,
+        state.messages_tag_menu,
+    )
+}
+
+/// [`messages_plan`] with entry `open` open (`None`: every entry closed),
+/// and the Tag pop-up in `tag_menu`'s state, including the last render's
+/// state when a resize reconstructs the list that `page_scroll` counted.
+fn messages_plan_opening(
+    state: &SettingsViewState,
+    messages: &MessagesState,
+    visible: &[&MessageView],
+    width: SettingsWidth,
+    viewport: LogicalRect,
+    open: Option<u64>,
+    tag_menu: bool,
+) -> MessagesPlan {
     let compact = width == SettingsWidth::Compact;
     let maximum = PageLayout::Form.maximum(width);
     let content_width = settings_page_content_width(viewport.width, width, maximum);
     let total = messages.entries.len();
-    let text_width = (content_width - 24.0).max(48.0);
+    // The not-saved note and the empty log's words are the controls column's
+    // own children, the page's whole content width, so they wrap to it.
+    let text_width = content_width;
     let item_gap = 8.0;
     // The header items: the not-saved note, the filters with the count line
     // and the report buttons, then the no-match line or the invitation of an
@@ -35445,12 +39276,26 @@ fn messages_plan(
             None,
         ));
     }
+    // A compact page's list room, which its header items scroll in: under
+    // the page's pinned heading, which every route keeps.
+    let compact_room = compact.then(|| {
+        let (_, heading) = pinned_heading(
+            state,
+            width,
+            viewport,
+            settings_page_gap(state, width, viewport),
+            aterm_messages::page::HEADING,
+            "",
+        );
+        compact_page_budget(state, viewport).content_height - heading
+    });
     header.extend(messages_filter_items(
         state,
         messages,
         visible.len(),
         content_width,
-        compact,
+        (compact, compact_room),
+        tag_menu,
     ));
     if total == 0 {
         header.push(wrapped_copy_node(
@@ -35465,32 +39310,28 @@ fn messages_plan(
     }
     // The room the list has: a compact page's whole section (its items
     // `MESSAGES_ROW_GAP` apart); on the wider pages the page's column under
-    // the heading and the header, each its own gap apart.
-    let (room, gap) = if compact {
-        // Under the page's pinned heading, which every route keeps.
-        let (_, heading) = pinned_heading(
-            width,
-            viewport,
-            settings_page_gap(state, width, viewport),
-            aterm_messages::page::HEADING,
-            "",
-        );
-        (
-            compact_page_budget(state, viewport).content_height - heading,
-            MESSAGES_ROW_GAP,
-        )
+    // the heading and the header, each its own gap apart — or, where the
+    // header scrolls, the whole column under the heading (`whole`).
+    let mut whole = 0.0_f32;
+    let (mut room, gap) = if let Some(room) = compact_room {
+        (room, MESSAGES_ROW_GAP)
     } else {
         let gap = responsive_page_gap(width, viewport.height);
         let header_h: f32 = header.iter().map(|(_, h)| *h).sum::<f32>()
             + header.len().saturating_sub(1) as f32 * item_gap;
-        let heading_h = page_heading_height() + page_subtitle_height() + 2.0 * gap;
-        (
-            noncompact_page_content_height(state, width, viewport.width, viewport.height, maximum)
-                - heading_h
-                - header_h
-                - gap,
+        // Its heading and subtitle under the page's chrome ([`PageChrome`]).
+        let (_, heading_h) = pinned_heading(
+            state,
+            width,
+            viewport,
             gap,
-        )
+            aterm_messages::page::HEADING,
+            messages_page_subtitle(messages),
+        );
+        whole =
+            noncompact_page_content_height(state, width, viewport.width, viewport.height, maximum)
+                - heading_h;
+        (whole - header_h - gap, gap)
     };
     let clock = MessagesClock::of(visible, messages.now_unix_ms, messages.utc_offset_s);
     // The lead column is the LOG's, whatever the filter admits (D13): the
@@ -35498,10 +39339,25 @@ fn messages_plan(
     // list can say (a list is headed only when the log is).
     let all: Vec<&MessageView> = messages.entries.iter().collect();
     let log_clock = MessagesClock::of(&all, messages.now_unix_ms, messages.utc_offset_s);
-    let lead = MessagesLead::measure(&all, log_clock, compact, content_width);
-    let row_h = messages_row_height();
+    let mut lead = MessagesLead::measure(&all, log_clock, compact, content_width);
+    // A stacked head stays inside the list: its title gives up lines (its
+    // last cut) only where the log's longest would make it taller than the
+    // room under its day header.
+    if lead.stacked {
+        let day = if clock.sections(visible).is_some() {
+            messages_day_height()
+        } else {
+            0.0
+        };
+        while lead.title_lines > 1
+            && messages_head_height(lead) > room - 2.0 * MESSAGES_LIST_PAD - day + 0.01
+        {
+            lead.title_lines -= 1;
+        }
+    }
     let mut plan = MessagesPlan {
         compact,
+        scrolls: compact,
         content_width,
         header,
         item_gap,
@@ -35513,13 +39369,21 @@ fn messages_plan(
         clock,
         sections: clock.sections(visible),
         day_h: messages_day_height(),
+        tall: None,
     };
     // The open entry's body at the card's measure, bounded to what the card
     // has with the entry alone in it: it is read whole wherever the list
-    // shows it.
+    // shows it. A body taller than the room under a wider page's pinned
+    // header takes the header's room too: the header scrolls away with the
+    // list, as on a compact page, before a line of the body is dropped.
     let body_width = (content_width - plan.indent() - 16.0).max(48.0);
-    plan.body = state
-        .messages_selected
+    // An entry at the list's top carries its day's header too.
+    let day_h = if plan.sections.is_some() {
+        plan.day_h
+    } else {
+        0.0
+    };
+    plan.body = open
         .and_then(|id| visible.iter().find(|entry| entry.id == id))
         .map(|entry| {
             let mut body = MessagesBody::of(
@@ -35528,22 +39392,80 @@ fn messages_plan(
                 messages.utc_offset_s,
                 messages.now_unix_ms,
             );
-            // An entry at the list's top carries its day's header too.
-            let day_h = if plan.sections.is_some() {
-                plan.day_h
-            } else {
-                0.0
-            };
-            body.fit(room - row_h - day_h - 2.0 * MESSAGES_LIST_PAD);
+            if messages_head_title(entry, plan.lead, content_width).1 {
+                let (px, face) =
+                    crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+                body.name = wrap_to_box(&entry.title, body_width, &|line| {
+                    crate::tray_raster::ui_text_width_for(face, line, px)
+                });
+            }
+            let card = messages_head_height(plan.lead) + day_h + 2.0 * MESSAGES_LIST_PAD;
+            if !compact && body.height() > room - card {
+                plan.scrolls = true;
+                room = whole;
+                plan.room = room;
+            }
+            body.fit(room - card);
             (entry.id, body)
         });
+    let head = messages_head_height(plan.lead);
     plan.heights = visible
         .iter()
         .map(|entry| match &plan.body {
-            Some((id, body)) if *id == entry.id => row_h + body.height(),
-            _ => row_h,
+            Some((id, body)) if *id == entry.id => head + body.height(),
+            _ => head,
         })
         .collect();
+    // The open entry, where even fitted it is taller than the room, is read
+    // a part at a time ([`MessagesTall`]), each part whole on its screen.
+    plan.tall = plan
+        .body
+        .as_ref()
+        .and_then(|(id, body)| {
+            let index = visible.iter().position(|entry| entry.id == *id)?;
+            Some((index, body))
+        })
+        .and_then(|(entry, body)| {
+            let room = plan.room
+                - 2.0 * MESSAGES_LIST_PAD
+                - if plan.sections.is_some() {
+                    plan.day_h
+                } else {
+                    0.0
+                };
+            (plan.card_height(entry..entry + 1) > plan.room + 0.01).then(|| {
+                let node = messages_body_node(
+                    visible[entry],
+                    body,
+                    plan.indent(),
+                    (plan.content_width - plan.indent() - 16.0).max(48.0),
+                    None,
+                );
+                let (parts, heights) = messages_tall_parts(head, &node, room);
+                let title = format!("settings/messages/row/{}/title", visible[entry].id);
+                let keys = parts
+                    .iter()
+                    .map(|blocks| {
+                        let mut keys = std::collections::BTreeSet::new();
+                        for block in blocks.clone() {
+                            match block.checked_sub(1) {
+                                None => {
+                                    keys.insert(title.clone());
+                                }
+                                Some(child) => ui_node_keys(&node.children[child], &mut keys),
+                            }
+                        }
+                        keys
+                    })
+                    .collect();
+                MessagesTall {
+                    entry,
+                    parts,
+                    heights,
+                    keys,
+                }
+            })
+        });
     plan
 }
 
@@ -35552,9 +39474,11 @@ fn messages_plan(
 /// list, newest first, in one card of one-line entries with hairlines between
 /// them; the filters narrow it and there is no pager. On the wider pages the
 /// heading and the header stay and the card scrolls under them; on a compact
-/// page the header scrolls away with the list. An open entry grows its card
-/// in place. What the render measured is recorded for the reducer: the limit
-/// the list scrolls to, the stop it drew, and the geometry it laid out in.
+/// page, and under an open entry too tall for the room the pinned header
+/// leaves, the header scrolls away with the list. An open entry grows its
+/// card in place. What the render measured is recorded for the reducer: the limit
+/// the list scrolls to, the stop it drew (re-seated across a resize,
+/// [`messages_seated_top`]), and the geometry it laid out in.
 fn messages_page(
     state: &SettingsViewState,
     messages: &MessagesState,
@@ -35565,26 +39489,46 @@ fn messages_page(
     let plan = messages_plan(state, messages, &visible, width, viewport);
     let limit = plan.limit();
     state.record_result_page_limit(limit);
-    state.messages_page_geometry.set(Some((width, viewport)));
+    let last = state
+        .messages_page_geometry
+        .replace(Some((width, viewport)));
     let selected = state
         .messages_selected
         .filter(|id| visible.iter().any(|entry| entry.id == *id));
+    let open = selected.and_then(|id| visible.iter().position(|entry| entry.id == id));
     // A deep link that came before any render lands here, once.
-    let top = match selected.and_then(|id| visible.iter().position(|entry| entry.id == id)) {
-        Some(index) if state.messages_reveal => plan.land(index, state.page_scroll),
-        _ => state.page_scroll.min(limit),
+    let top = match open {
+        Some(index) if state.messages_reveal => {
+            state.messages_reseat.set(None);
+            plan.land(index, state.page_scroll)
+        }
+        _ => messages_seated_top(
+            state,
+            messages,
+            &visible,
+            &plan,
+            last.filter(|&geometry| geometry != (width, viewport)),
+            open,
+        ),
     };
     state.messages_drawn.set(Some(top));
+    state
+        .messages_drawn_menu
+        .set(Some((state.messages_tag_menu, plan.lead_stops())));
     let view = plan.view(top);
     state
         .messages_anchor
-        .replace(
-            (view.rows.start > 0 && !view.rows.is_empty()).then(|| MessagesAnchor {
+        .replace((view.rows.start > 0 && !view.rows.is_empty()).then(|| {
+            MessagesAnchor {
                 stop: top,
                 id: visible[view.rows.start].id,
+                below: visible[view.rows.start + 1..view.rows.end]
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect(),
                 filter: state.messages_filter.clone(),
-            }),
-        );
+            }
+        }));
     let shown: Vec<&MessageView> = visible[view.rows.clone()].to_vec();
     // Where the page's transient line is said (s-13): on the count line where
     // that is on screen; else in the footer of the open entry whose button set
@@ -35598,24 +39542,30 @@ fn messages_page(
         .filter(|id| selected == Some(*id))
         .zip(state.feedback.as_deref());
     let list = (!shown.is_empty()).then(|| {
-        let (card, height) =
-            messages_list_node(&shown, view.rows.start, &plan, selected, entry_note);
+        let (card, height) = messages_list_node(
+            &shown,
+            (view.rows.start, view.part),
+            &plan,
+            selected,
+            entry_note,
+        );
         messages_scroll_node(card, height, view.rows.clone(), visible.len())
     });
     let MessagesPlan {
         compact,
+        scrolls,
         header,
         item_gap,
         gap,
         room,
         ..
     } = plan;
-    // The header items this view seats: every one on the wider pages, whose
-    // header stays; on a compact page the ones the list has not scrolled past.
+    // The header items this view seats: every one where the header stays;
+    // where it scrolls, the ones the list has not scrolled past.
     let header: Vec<(UiNode, f32)> = header
         .into_iter()
         .enumerate()
-        .filter(|(k, _)| !compact || view.header.contains(k))
+        .filter(|(k, _)| !scrolls || view.header.contains(k))
         .map(|(_, item)| item)
         .collect();
     let controls = (!header.is_empty()).then(|| {
@@ -35633,15 +39583,24 @@ fn messages_page(
         )
         .children(header.into_iter().map(|(node, _)| node).collect())
     });
-    if compact {
+    if scrolls {
+        // The header and the list in one clipped section under the heading:
+        // a compact page's pinned one, a wider page's with its subtitle.
         let mut children: Vec<UiNode> = controls.into_iter().collect();
         children.extend(list);
+        // A compact page's pinned heading; a wider page's with its subtitle,
+        // both under the page's chrome ([`PageChrome`]).
         let (mut out, _) = pinned_heading(
+            state,
             width,
             viewport,
             settings_page_gap(state, width, viewport),
             aterm_messages::page::HEADING,
-            "",
+            if compact {
+                ""
+            } else {
+                messages_page_subtitle(messages)
+            },
         );
         out.push(
             UiNode::new(
@@ -35659,29 +39618,113 @@ fn messages_page(
         );
         return out;
     }
-    let mut out = page_heading(aterm_messages::page::HEADING, messages_page_subtitle());
+    let (mut out, _) = pinned_heading(
+        state,
+        width,
+        viewport,
+        responsive_page_gap(width, viewport.height),
+        aterm_messages::page::HEADING,
+        messages_page_subtitle(messages),
+    );
     out.extend(controls);
     out.extend(list);
     out
+}
+
+/// Stop `top` of a list whose header took `from` stops, as a stop of the
+/// same list whose header takes `to` ([`MessagesPlan::lead_stops`]): an
+/// entry's stop is that entry's; the list's top is its top (the header
+/// whole above the first entry, in either form); a header item's, where the
+/// header no longer scrolls, the top.
+fn messages_restop(top: usize, from: usize, to: usize) -> usize {
+    if top == 0 {
+        0
+    } else if top >= from {
+        top - from + to
+    } else {
+        top.min(to)
+    }
+}
+
+/// THE LIST KEEPS ITS PLACE ACROSS A RESIZE. The stop a Messages render draws
+/// at the top of its list: `page_scroll`, or the stop the last render
+/// re-seated it at that no event has adopted yet
+/// ([`SettingsViewState::messages_reseat`]) — counted for the page as it was
+/// laid out at `resized_from`, the last render's geometry where this one's
+/// differs. A window resized across the switch, or across the compact
+/// breakpoint, takes the header into the list or out of it
+/// ([`MessagesPlan::scrolls`]), and the same stop then names another entry:
+/// grown at 864×462 from a landing on a tall usage-limit entry, the open
+/// entry went above the view. Where the header's stops changed, the list is
+/// drawn from the same place ([`messages_restop`]) and an open entry (`open`,
+/// its index) the reader had in view is kept in view
+/// ([`MessagesPlan::reveal`]), and the next event adopts the stop drawn.
+///
+/// THE LIST KEEPS ITS PLACE ACROSS THE TAG POP-UP, however it closed (r4g-7).
+/// Its chips grow the filters card, which can take a wider page's header into
+/// the list; a pop-up opened or closed since the last render by a path that
+/// did not re-count the stop (focusing Search closes it, by a click, a
+/// reader's focus or the Search action) is re-counted here from the stops
+/// that render counted ([`SettingsViewState::messages_drawn_menu`]).
+fn messages_seated_top(
+    state: &SettingsViewState,
+    messages: &MessagesState,
+    visible: &[&MessageView],
+    plan: &MessagesPlan,
+    resized_from: Option<(SettingsWidth, LogicalRect)>,
+    open: Option<usize>,
+) -> usize {
+    let pending = state.messages_reseat.get();
+    let from = pending.unwrap_or(state.page_scroll);
+    // Reconstruct the geometry with the menu that counted the stop. Search
+    // can close it without re-counting the stop, then a resize can arrive
+    // before the next render; the current menu would measure the wrong old list.
+    let drawn_menu = state
+        .messages_drawn_menu
+        .get()
+        .map_or(state.messages_tag_menu, |(open, _)| open);
+    let before = resized_from
+        .map(|(width, viewport)| {
+            messages_plan_opening(
+                state,
+                messages,
+                visible,
+                width,
+                viewport,
+                state.messages_selected,
+                drawn_menu,
+            )
+        })
+        .filter(|before| before.lead_stops() != plan.lead_stops());
+    let menu_lead = state
+        .messages_drawn_menu
+        .get()
+        .filter(|&(open, lead)| {
+            resized_from.is_none() && open != state.messages_tag_menu && lead != plan.lead_stops()
+        })
+        .map(|(_, lead)| lead);
+    let top = match (&before, menu_lead) {
+        (Some(before), _) => {
+            let was = from.min(before.limit());
+            let top = messages_restop(was, before.lead_stops(), plan.lead_stops());
+            match open {
+                Some(index) if before.view(was).rows.contains(&index) => plan.reveal(index, top),
+                _ => top.min(plan.limit()),
+            }
+        }
+        (None, Some(lead)) => messages_restop(from, lead, plan.lead_stops()).min(plan.limit()),
+        (None, None) => from.min(plan.limit()),
+    };
+    state
+        .messages_reseat
+        .set((pending.is_some() || before.is_some() || menu_lead.is_some()).then_some(top));
+    top
 }
 
 /// One wrapped line of the Packages page's own sentences — a program row's height, at the
 /// Caption step the reason wrap's budgets are measured for.
 fn packages_wrapped_line_height() -> f32 {
     24.0_f32.max(20.0 * settings_text_scale())
-}
-
-/// The retired key's note's measure: the card's full width at each layout's NARROWEST
-/// viewport, by the same audit — 402pt at 474, 476pt at 760, 704pt at 1040 — at most 7pt a
-/// unit, each a little under. Not [`packages_reason_wrap_chars`]: its medium and wide
-/// budgets were taken at those layouts' WIDEST pages (720pt, 944pt), and the note's first
-/// line met the ellipsis at the 760pt page on them; the remedy the note ends with may not.
-fn packages_note_wrap_chars(width: SettingsWidth) -> usize {
-    match width {
-        SettingsWidth::Compact => 56,
-        SettingsWidth::Medium => 64,
-        SettingsWidth::Wide => 96,
-    }
 }
 
 /// THE BACKGROUND SERVICE LINE: its label, then what the loop runs, as plain text like
@@ -35696,81 +39739,85 @@ fn packages_note_wrap_chars(width: SettingsWidth) -> usize {
 fn packages_service_status_row(packages: &PackagesProjection, text_width: f32) -> (UiNode, f32) {
     let key = "packages/loop-status";
     let label = "Background service";
-    const GAP: f32 = 12.0;
-    let (label_px, label_face) =
-        crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
-    let label_width =
-        (crate::tray_raster::ui_text_width_for(label_face, label, label_px) + 4.0).ceil();
-    let (value_px, _) =
-        crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Primary);
-    let value_width = (text_width - label_width - GAP).max(48.0);
-    let mut lines = wrapped_copy_lines(&packages.loop_status, value_px, value_width);
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    let count = lines.len();
+    // ONE RULE FOR A FACT ([`FactColumns`]): the label beside its value where
+    // both are whole there — the label's column its own width — else the label
+    // over the value, each the card's width. The value's column was what a
+    // fixed-width label left, floored at 48pt: at 2× text a phone-width card
+    // painted the label past the card and the value's lines into 2pt.
+    let rows = [(label.to_string(), packages.loop_status.clone())];
+    let columns = FactColumns::measure(&rows, text_width, fact_name_width(label).ceil());
+    let (_, values) = fact_card_lines(label, &packages.loop_status, columns);
     let line_height = packages_wrapped_line_height();
-    let height = scaled_control_height().max(count as f32 * line_height + 8.0);
-    // The label sits beside the FIRST line: a line's box when the sentence wraps, the whole
-    // row when it does not (the one-line row's own alignment).
-    let label_height = if count > 1 {
-        Length::Fixed((height - 8.0) / count as f32)
+    let (label_node, label_height) = wrapped_words_node(
+        &format!("{key}/label"),
+        label,
+        (SemanticRole::Text, StyleRef::Quiet),
+        columns.label,
+        line_height,
+    );
+    let count = values.len().max(1);
+    let value_height = count as f32 * line_height;
+    let value = UiNode::new(
+        format!("{key}/value"),
+        UiContent::Group(GroupSpec {
+            label: Some(packages.loop_status.clone()),
+            role: SemanticRole::Status,
+            style: StyleRef::Plain,
+        }),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(value_height)),
+    )
+    .children(
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                UiNode::new(
+                    format!("{key}/value/line/{}", index + 1),
+                    UiContent::Text(TextSpec {
+                        text,
+                        role: SemanticRole::Status,
+                        style: StyleRef::Primary,
+                    }),
+                )
+                .layout(Layout::default().height(Length::Fixed(line_height)))
+                .paint_only()
+            })
+            .collect(),
+    );
+    let (layout, content, gap) = if columns.stacked {
+        (Layout::column(), label_height + 4.0 + value_height, 4.0)
     } else {
-        Length::Fill
+        // The gap the columns were measured with ([`FactColumns::measure`]):
+        // 12pt here left the value 2pt short of the column its words were
+        // wrapped for ("Unavailabl…" at 36 columns).
+        (
+            Layout::row(),
+            label_height.max(value_height),
+            ABOUT_METADATA_ROW_GAP,
+        )
     };
+    let mut label_node = label_node;
+    if !columns.stacked {
+        label_node.layout.width = Length::Fixed(columns.label);
+    }
+    // A sentence that fits paints on one line, at the control's height.
+    let height = scaled_control_height().max(content + 8.0);
     (
         UiNode::new(
             key,
             UiContent::Group(GroupSpec::new(label).style(StyleRef::Plain)),
         )
         .layout(
-            Layout::row()
+            layout
                 .height(Length::Fixed(height))
                 .padding(Insets::symmetric(0.0, 4.0))
-                .gap(GAP),
+                .gap(gap),
         )
-        .children(vec![
-            UiNode::new(
-                format!("{key}/label"),
-                UiContent::Text(TextSpec {
-                    text: label.to_string(),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(label_width))
-                    .height(label_height),
-            ),
-            UiNode::new(
-                format!("{key}/value"),
-                UiContent::Group(GroupSpec {
-                    label: Some(packages.loop_status.clone()),
-                    role: SemanticRole::Status,
-                    style: StyleRef::Plain,
-                }),
-            )
-            .layout(Layout::column().width(Length::Fill).height(Length::Fill))
-            .children(
-                lines
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, text)| {
-                        UiNode::new(
-                            format!("{key}/value/line/{}", index + 1),
-                            UiContent::Text(TextSpec {
-                                text,
-                                role: SemanticRole::Status,
-                                style: StyleRef::Primary,
-                            }),
-                        )
-                        .layout(Layout::default().height(Length::Fill))
-                        .paint_only()
-                    })
-                    .collect(),
-            ),
-        ]),
+        .children(vec![label_node, value]),
         height,
     )
 }
@@ -35781,13 +39828,20 @@ fn packages_service_status_row(packages: &PackagesProjection, text_width: f32) -
 /// WRAPPED to the card's measure under the switch it explains, every line kept. It rode
 /// the hero's one-line detail until the review of the Phase 4 merge (2026-09-23), where its
 /// remedy — the words it ends with — was the part the ellipsis took at every width. One
-/// semantic node with the whole sentence; the lines are paint-only.
+/// semantic node with the whole sentence; the lines are paint-only. ITS LINES ARE THE
+/// CARD'S MEASURED COLUMN's, `text_width`, in the quiet type they paint in
+/// ([`wrap_to_box`]): they were budgeted in characters per width class (56 on a compact
+/// page whatever the text size), which a phone-width card at 2× text cut a line of to an
+/// ellipsis, losing the remedy again.
 fn packages_retired_switch_note(
     packages: &PackagesProjection,
-    width: SettingsWidth,
+    text_width: f32,
 ) -> Option<(UiNode, f32)> {
     let note = packages.retired_switch_note.as_deref()?;
-    let lines = crate::packages_screen::note_lines(note, packages_note_wrap_chars(width));
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let lines = wrap_to_box(note, text_width, &|line| {
+        crate::tray_raster::ui_text_width_for(face, line, px)
+    });
     let line_height = packages_wrapped_line_height();
     let height = lines.len() as f32 * line_height;
     Some((
@@ -35918,13 +39972,11 @@ fn registry_switch_row(
         .find(|note| !(page_says_why && note.kind == EffectNoteKind::Unavailable))
         .map(|note| note.visual.clone());
     let stacked = width == SettingsWidth::Compact;
-    // Measured beside the switch AND Reset's place: every inline row keeps
-    // that place (`reset_slot`) whether or not Reset is drawn, so an unwritten
-    // row's label gets no more room than a Changed one's.
-    let label_width = if stacked {
-        text_width
+    // Reset, or the place it keeps, so the switch never moves when it comes.
+    let reset = if changed {
+        setting_reset_button(field, pending)
     } else {
-        inline_row_label_width(&EditKind::Bool, text_width, true)
+        reset_slot(key)
     };
     // The name wraps, never cut; Changed and the note after it where they
     // fit in the row's fullest state, else on its second line, whole
@@ -35937,7 +39989,6 @@ fn registry_switch_row(
     worst.state.push(CHANGED_WORD.to_string());
     tags.facts.extend(note.clone());
     worst.facts.extend(note);
-    let placement = place_row_tags(field.label, &tags, &worst, label_width, false);
     let label_key = format!("settings/label/{key}");
     let label = UiNode::new(
         label_key.clone(),
@@ -35956,7 +40007,6 @@ fn registry_switch_row(
         &label_key,
         vec![field.label.to_string()],
     )]);
-    let second_line = row_second_line(&placement, timing, None, text_width);
     let control = UiNode::new(
         format!("settings/control/{key}"),
         UiContent::Switch(
@@ -35979,76 +40029,82 @@ fn registry_switch_row(
     )
     .layout(
         Layout::default()
-            .width(Length::Fixed(104.0 * settings_text_scale().min(1.4)))
+            .width(Length::Fixed(switch_control_width(text_width)))
             .height(Length::Fill),
     );
-    // Reset, or the place it keeps, so the switch never moves when it comes.
-    let reset = Some(if changed {
-        setting_reset_button(field, pending)
-    } else {
-        reset_slot(key)
-    });
     // The tags that did not fit, under the name, at the card's measure.
-    let detail = (!second_line.is_empty()).then(|| {
-        let line_height = row_detail_line_height();
-        let height = second_line.len() as f32 * line_height;
-        (
-            UiNode::new(
-                format!("{prefix}/detail/{key}"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    let detail = |placement: &RowTagPlacement| {
+        let second_line = row_second_line(placement, timing, None, text_width);
+        (!second_line.is_empty()).then(|| {
+            let line_height = row_detail_line_height();
+            let height = second_line.len() as f32 * line_height;
+            (
+                UiNode::new(
+                    format!("{prefix}/detail/{key}"),
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(
+                    Layout::column()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(height)),
+                )
+                .children(
+                    second_line
+                        .into_iter()
+                        .enumerate()
+                        .map(|(line, text)| {
+                            reserved_or_detail_line(
+                                format!("{prefix}/detail/{key}/line-{line}"),
+                                text,
+                                line_height,
+                            )
+                        })
+                        .collect(),
+                ),
+                height,
             )
-            .layout(
-                Layout::column()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(height)),
-            )
-            .children(
-                second_line
-                    .into_iter()
-                    .enumerate()
-                    .map(|(line, text)| {
-                        reserved_or_detail_line(
-                            format!("{prefix}/detail/{key}/line-{line}"),
-                            text,
-                            line_height,
-                        )
-                    })
-                    .collect(),
-            ),
-            height,
-        )
-    });
+        })
+    };
     if stacked {
+        // Under the name, over the switch, as every stacked switch row: its
+        // Reset after the switch where their line holds both, else at the
+        // end of the label line, else on a line of its own under the switch
+        // ([`seat_stacked_reset`]); the name has what that leaves.
         let controls = UiNode::new(
             format!("{prefix}/controls/{key}"),
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
-        .layout(Layout::row().height(Length::Fill).gap(6.0))
-        .children(
-            [
-                UiNode::new(
-                    format!("{prefix}/control-spacer/{key}"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-                control,
-            ]
-            .into_iter()
-            .chain(reset)
-            .collect(),
-        );
-        // Under the name, over the switch.
-        let height = row_height + detail.as_ref().map_or(0.0, |(_, height)| height + 4.0);
+        .layout(Layout::row().height(Length::Fill).gap(STACKED_CONTROL_GAP))
+        .children(vec![
+            UiNode::new(
+                format!("{prefix}/control-spacer/{key}"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+            control,
+            reset,
+        ]);
         let mut row = UiNode::new(row_key, UiContent::Group(GroupSpec::new(field.label)))
-            .layout(Layout::column().height(Length::Fixed(height)).gap(4.0))
+            .layout(Layout::column().height(Length::Fixed(row_height)).gap(4.0))
             .children(vec![label, controls]);
+        seat_stacked_reset(&mut row, field.label, text_width);
+        let label_width = row_label_room(&row, true, text_width);
+        let placement = place_row_tags(field.label, &tags, &worst, label_width, false);
+        let detail = detail(&placement);
         set_row_label_lines(&mut row, placement.lines, true);
-        if let Some((detail, _)) = detail {
+        if let Some((detail, detail_height)) = detail {
             row.children.insert(1, detail);
+            row.layout.height = Length::Fixed(fixed_height(&row) + detail_height + 4.0);
         }
         let height = fixed_height(&row);
         return Some((row, height));
     }
+    // Measured beside the switch AND Reset's place: every inline row keeps
+    // that place (`reset_slot`) whether or not Reset is drawn, so an unwritten
+    // row's label gets no more room than a Changed one's.
+    let label_width = inline_row_label_width(&EditKind::Bool, text_width, true);
+    let placement = place_row_tags(field.label, &tags, &worst, label_width, false);
+    let detail = detail(&placement);
     let row = UiNode::new(
         row_key.clone(),
         UiContent::Group(GroupSpec::new(field.label)),
@@ -36059,7 +40115,7 @@ fn registry_switch_row(
             .padding(Insets::symmetric(0.0, 4.0))
             .gap(12.0),
     )
-    .children([label, control].into_iter().chain(reset).collect());
+    .children(vec![label, control, reset]);
     let mut row = row;
     set_row_label_lines(&mut row, placement.lines, false);
     let row_height = fixed_height(&row);
@@ -36100,14 +40156,50 @@ const PACKAGES_PAGE_SWITCHES: [&str; 3] = [
 
 /// The Activity card's heading row: the heading and the "Open Log" button, which opens
 /// `packages.log` through the host (NSWorkspace — no shell, no Terminal).
-fn packages_activity_heading(packages: &PackagesProjection, height: f32) -> UiNode {
-    UiNode::new(
-        "packages/activity/header",
-        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+fn packages_activity_heading(
+    packages: &PackagesProjection,
+    height: f32,
+    width: f32,
+) -> (UiNode, f32) {
+    // The caption and Open Log side by side where the card's column holds the
+    // caption whole beside the button's words; else the caption over the
+    // button, each the column's ("ACTI…" beside a button run past the card
+    // at 2× text on a phone-width page).
+    let (caption_px, caption_face) =
+        crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
+    let caption_width = crate::tray_raster::ui_text_width_for(caption_face, "ACTIVITY", caption_px);
+    let button_width =
+        (112.0 * settings_text_scale().min(1.5)).max(page_button_width("Open Log", f32::INFINITY));
+    let beside = caption_width + 8.0 + button_width <= width + crate::native_ui::TEXT_FIT_SLACK;
+    let (visual, lines) = button_words("Open Log", &[], button_width.min(width));
+    let button_height = crate::native_ui::native_button_height_for_lines(lines, height);
+    let button = UiNode::new(
+        "packages/activity/open-log",
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new("Open Log")
+                    .visual_label(visual)
+                    .description("Opens the package log"),
+                ActionId::new("packages/activity/open-log"),
+            )
+            .state(ControlState {
+                enabled: packages.log_path.is_some() && !packages.activity.is_empty(),
+                ..ControlState::default()
+            })
+            .style(StyleRef::Secondary),
+        ),
     )
-    .layout(Layout::row().height(Length::Fixed(height)).gap(8.0))
-    .children(vec![
-        UiNode::new(
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(button_width.min(width)))
+            .height(if beside {
+                Length::Fill
+            } else {
+                Length::Fixed(button_height)
+            }),
+    );
+    if beside {
+        let caption = UiNode::new(
             "packages/activity/heading",
             UiContent::Text(TextSpec {
                 text: "ACTIVITY".to_string(),
@@ -36115,29 +40207,28 @@ fn packages_activity_heading(packages: &PackagesProjection, height: f32) -> UiNo
                 style: StyleRef::Quiet,
             }),
         )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+        .layout(Layout::default().width(Length::Fill).height(Length::Fill));
+        return (
+            UiNode::new(
+                "packages/activity/header",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::row().height(Length::Fixed(height)).gap(8.0))
+            .children(vec![caption, button]),
+            height,
+        );
+    }
+    let (caption, caption_height) = caption_node("packages/activity/heading", "ACTIVITY", width);
+    let total = caption_height + 8.0 + button_height;
+    (
         UiNode::new(
-            "packages/activity/open-log",
-            UiContent::Button(
-                Control::new(
-                    ButtonSpec::new("Open Log")
-                        .visual_label("Open Log")
-                        .description("Opens the package log"),
-                    ActionId::new("packages/activity/open-log"),
-                )
-                .state(ControlState {
-                    enabled: packages.log_path.is_some() && !packages.activity.is_empty(),
-                    ..ControlState::default()
-                })
-                .style(StyleRef::Secondary),
-            ),
+            "packages/activity/header",
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
-        .layout(
-            Layout::default()
-                .width(Length::Fixed(112.0 * settings_text_scale().min(1.5)))
-                .height(Length::Fill),
-        ),
-    ])
+        .layout(Layout::column().height(Length::Fixed(total)).gap(8.0))
+        .children(vec![caption, button]),
+        total,
+    )
 }
 
 /// One painted line of the Activity card: an event's first line (`packages/activity/<n>`),
@@ -36153,7 +40244,7 @@ struct ActivityRow {
 }
 
 /// The Activity lines: every event the log's tail holds (at most
-/// [`atpkg::packages_log::ACTIVITY_EVENTS`]) as `when  ·  what`, wrapped to `width`'s
+/// [`atpkg::packages_log::ACTIVITY_EVENTS`]) as `when · what`, wrapped to `width`'s
 /// measure ([`packages_reason_wrap_chars`], the program rows' own), and where the tail is
 /// full, one quiet line that says Open Log has the rest; or the one line that says
 /// nothing is recorded yet. Each line is a stop of the page's one scrolling list (s-25):
@@ -36215,20 +40306,61 @@ fn packages_activity_rows(packages: &PackagesProjection, width: SettingsWidth) -
 /// One Activity line's node: body text, a failure or a refusal in the danger colour (a
 /// `Status` role would paint any style but Primary as a quiet caption — the opposite of
 /// what a person scanning for trouble needs).
-fn packages_activity_row_node(key: String, text: String, trouble: bool, height: f32) -> UiNode {
-    UiNode::new(
-        key,
-        UiContent::Text(TextSpec {
-            text,
-            role: SemanticRole::Text,
-            style: if trouble {
+fn packages_activity_row(
+    key: String,
+    text: &str,
+    trouble: bool,
+    height: f32,
+    width: f32,
+) -> (UiNode, f32) {
+    // Its lines were budgeted in average glyphs per width class
+    // ([`packages_reason_wrap_chars`]); each is wrapped again to the card's
+    // MEASURED column, so a narrow card at large text breaks a line it cannot
+    // hold instead of the painter cutting it ("No package act…").
+    wrapped_words_node(
+        &key,
+        text,
+        (
+            SemanticRole::Text,
+            if trouble {
                 StyleRef::Danger
             } else {
                 StyleRef::Primary
             },
-        }),
+        ),
+        width,
+        height,
     )
-    .layout(Layout::default().height(Length::Fixed(height)))
+}
+
+/// One program line as the Programs card's row: the line's node where it is
+/// one line of the card's MEASURED column `width`, else its words over as
+/// many lines as that needs ([`wrapped_words_node`]), its accessible text —
+/// and a state line's canonical state — whole on the row. The lines are
+/// budgeted in average glyphs per width class first
+/// ([`packages_reason_wrap_chars`]); this is what keeps the painter from
+/// cutting one a narrow card at large text cannot hold ("Readin…").
+fn packages_program_line_row(line: &ProgramLine, row_height: f32, width: f32) -> (UiNode, f32) {
+    let style = if line.quiet {
+        StyleRef::Quiet
+    } else {
+        StyleRef::Primary
+    };
+    let (wrapped, height) = wrapped_words_node(
+        &line.key,
+        &line.text,
+        (SemanticRole::Status, style),
+        width,
+        row_height,
+    );
+    if matches!(wrapped.content, UiContent::Text(_)) {
+        return (packages_program_line_node(line, row_height), row_height);
+    }
+    let mut wrapped = wrapped;
+    if let (Some(state), UiContent::Group(group)) = (line.state.as_deref(), &mut wrapped.content) {
+        group.label = Some(format!("{}\n{state}", line.text));
+    }
+    (wrapped, height)
 }
 
 /// A Packages verb button's width in a row, the gap between two, and the
@@ -36279,7 +40411,13 @@ fn packages_page(
         "Install ALab Tools Now",
         "Remove ALab Tools",
     ];
-    let even_actions = hero_inner >= 3.0 * PACKAGES_ACTION_WIDTH + 2.0 * PACKAGES_ACTION_GAP;
+    // Even only where each label is whole in the even width, measured: at 2×
+    // text a wide hero held three 196pt buttons and cut every label in them
+    // ("Check & Up…").
+    let even_actions = hero_inner >= 3.0 * PACKAGES_ACTION_WIDTH + 2.0 * PACKAGES_ACTION_GAP
+        && action_labels
+            .iter()
+            .all(|label| page_button_width(label, f32::INFINITY) <= PACKAGES_ACTION_WIDTH);
     let natural_actions = action_labels
         .iter()
         .map(|label| page_button_width(label, hero_inner))
@@ -36293,31 +40431,56 @@ fn packages_page(
     // cannot act; the busy one paints as busy while its worker runs. A copy
     // whose manager can never act paints no primary at all.
     let can_act = !packages.tool_observed || (packages.available && packages.manager_enabled);
+    // Each verb's words by the one rule page buttons keep ([`button_words`]):
+    // its whole label, else its short form ("Check & Update", "Install ALab
+    // Tools"), else on as many lines as the stacked button needs, never cut
+    // ("Check & Up…" at 22 columns).
+    let words = |label: &str| {
+        let short: &[&str] = match label {
+            "Check & Update Now" => &["Check & Update"],
+            "Install ALab Tools Now" => &["Install ALab Tools"],
+            _ => &[],
+        };
+        button_words(label, short, hero_inner)
+    };
     let action_button = |key: &str, label: &str, busy: PackagesBusy, primary: bool| {
+        let (visual, lines) = words(label);
         UiNode::new(
             key,
             UiContent::Button(
-                Control::new(ButtonSpec::new(label), ActionId::new(key))
-                    .state(ControlState {
-                        enabled: packages.actions_enabled,
-                        busy: packages.busy == Some(busy),
-                        ..ControlState::default()
-                    })
-                    .style(if primary && can_act {
-                        StyleRef::Primary
-                    } else {
-                        StyleRef::Secondary
-                    }),
+                Control::new(
+                    ButtonSpec::new(label).visual_label(&visual),
+                    ActionId::new(key),
+                )
+                .state(ControlState {
+                    enabled: packages.actions_enabled,
+                    busy: packages.busy == Some(busy),
+                    ..ControlState::default()
+                })
+                .style(if primary && can_act {
+                    StyleRef::Primary
+                } else {
+                    StyleRef::Secondary
+                }),
             ),
         )
         .layout(
             Layout::default()
                 .width(Length::Fixed(if even_actions {
                     PACKAGES_ACTION_WIDTH
+                } else if lines > 1 {
+                    hero_inner
                 } else {
-                    page_button_width(label, hero_inner)
+                    page_button_width(&visual, hero_inner)
                 }))
-                .height(Length::Fill),
+                .height(if stack_actions {
+                    Length::Fixed(crate::native_ui::native_button_height_for_lines(
+                        lines,
+                        action_control_height,
+                    ))
+                } else {
+                    Length::Fill
+                }),
         )
     };
     let [check_label, install_label, remove_label] = action_labels;
@@ -36345,7 +40508,7 @@ fn packages_page(
     // with the status they act on wherever the card fits a screen, and never
     // leaves a button alone on a screen of its own.
     let action_rows: Vec<(UiNode, f32)> = if stack_actions {
-        let height = 3.0 * action_control_height + 2.0 * PACKAGES_ACTION_GAP;
+        let height = actions.iter().map(fixed_height).sum::<f32>() + 2.0 * PACKAGES_ACTION_GAP;
         vec![(
             UiNode::new(
                 "packages/actions",
@@ -36356,15 +40519,7 @@ fn packages_page(
                     .height(Length::Fixed(height))
                     .gap(PACKAGES_ACTION_GAP),
             )
-            .children(
-                actions
-                    .into_iter()
-                    .map(|mut action| {
-                        action.layout.height = Length::Fixed(action_control_height);
-                        action
-                    })
-                    .collect(),
-            ),
+            .children(actions),
             height,
         )]
     } else {
@@ -36399,14 +40554,22 @@ fn packages_page(
     };
     // The detail wraps to the hero's measure: a remedy cut by an ellipsis
     // loses exactly the part that says what to do.
-    let (detail, detail_height) = wrapped_copy_node(
+    // The whole sentence, at the hero's own measure: the hero is listed row
+    // by row, so a long remedy takes lines, never an ellipsis ("package
+    // tool.…" at three lines).
+    let (detail, detail_height) = wrapped_words_node(
         "packages/detail",
         packages.detail.as_deref().unwrap_or_default(),
-        SemanticRole::Text,
-        StyleRef::Quiet,
-        (hero_inner - 4.0).max(48.0),
+        (SemanticRole::Text, StyleRef::Quiet),
+        hero_inner,
         detail_height,
-        Some(3),
+    );
+    let (headline, headline_height) = fitted_headline_node(
+        "packages/headline",
+        &packages.headline,
+        StyleRef::Hero,
+        hero_inner,
+        headline_height,
     );
     let mut status_lines = vec![
         UiNode::new(
@@ -36420,15 +40583,7 @@ fn packages_page(
             }),
         )
         .layout(Layout::default().height(Length::Fixed(title_height))),
-        UiNode::new(
-            "packages/headline",
-            UiContent::Text(TextSpec {
-                text: packages.headline.clone(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Hero,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(headline_height))),
+        headline,
         detail,
     ];
     if !service_line.is_empty() {
@@ -36489,7 +40644,6 @@ fn packages_page(
     } else {
         width.row_height()
     };
-    let consent_heading_height = 22.0_f32.max(16.0 * text_scale);
     let consent_line_height = 21.0_f32.max(18.0 * text_scale);
     // TELL THE TRUTH ABOUT THE DEFAULT. aterm installs and maintains the ALab
     // toolset by default — that is what the app is for — so copy implying the
@@ -36517,16 +40671,21 @@ fn packages_page(
         } else {
             (PACKAGE_CONSENT_NOTE_INERT, &PACKAGE_CONSENT_LINES_INERT)
         };
-    let consent_note_height = consent_lines.len() as f32 * consent_line_height;
-    let consent_heading = UiNode::new(
+    // Each sentence WRAPS to the card's text column, at whole words, as the
+    // layout measures it: authored as one line apiece, a narrow card (a 339pt
+    // window's 267pt column) cut "Saved for a copy of aterm that has its
+    // package tool." to "…its packa…".
+    let (note_px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+    let consent_painted = consent_lines
+        .iter()
+        .flat_map(|text| wrapped_copy_lines(text, note_px, consent_text_width))
+        .collect::<Vec<_>>();
+    let consent_note_height = consent_painted.len() as f32 * consent_line_height;
+    let (consent_heading, consent_heading_height) = caption_node(
         "packages/consent-heading",
-        UiContent::Text(TextSpec {
-            text: "AUTOMATIC MAINTENANCE".to_string(),
-            role: SemanticRole::Heading,
-            style: StyleRef::Quiet,
-        }),
-    )
-    .layout(Layout::default().height(Length::Fixed(consent_heading_height)));
+        "AUTOMATIC MAINTENANCE",
+        consent_text_width,
+    );
     let mut consent_rows = vec![packages_service_status_row(packages, consent_text_width)];
     for key in PACKAGES_PAGE_SWITCHES {
         if let Some(row) =
@@ -36535,7 +40694,7 @@ fn packages_page(
             consent_rows.push(row);
             // The retired key's note sits under the switch whose Off it explains.
             if key == prefs::EDIT_PACKAGES_ENABLED
-                && let Some(note) = packages_retired_switch_note(packages, width)
+                && let Some(note) = packages_retired_switch_note(packages, consent_text_width)
             {
                 consent_rows.push(note);
             }
@@ -36550,25 +40709,23 @@ fn packages_page(
                 style: StyleRef::Quiet,
             }),
         )
-        .layout(
-            Layout::column()
-                .height(Length::Fixed(consent_note_height))
-                .gap(2.0),
-        )
+        .layout(Layout::column().height(Length::Fixed(consent_note_height)))
         .children(
-            consent_lines
-                .iter()
+            consent_painted
+                .into_iter()
                 .enumerate()
                 .map(|(index, text)| {
                     UiNode::new(
                         format!("packages/consent-note/line/{}", index + 1),
                         UiContent::Text(TextSpec {
-                            text: text.to_string(),
+                            text,
                             role: SemanticRole::Text,
                             style: StyleRef::Quiet,
                         }),
                     )
-                    .layout(Layout::default().height(Length::Fill))
+                    // Its own line's height, so a screen too short for the
+                    // note lists it a part at a time.
+                    .layout(Layout::default().height(Length::Fixed(consent_line_height)))
                     .paint_only()
                 })
                 .collect(),
@@ -36588,27 +40745,19 @@ fn packages_page(
     // its vendor, license and size). Bounded rows keep the card height deterministic;
     // the overflow line says exactly how much is elided.
     let row_height = 24.0_f32.max(20.0 * text_scale);
-    let programs_heading_height = 22.0_f32.max(16.0 * text_scale);
     let programs = SplitCard {
         key: "packages/programs".to_string(),
         spec: GroupSpec::new("Programs").style(StyleRef::Secondary),
         padding: Insets::all(20.0),
         gap: 8.0,
-        head: vec![(
-            UiNode::new(
-                "packages/programs-heading",
-                UiContent::Text(TextSpec {
-                    text: "PROGRAMS".to_string(),
-                    role: SemanticRole::Heading,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(Layout::default().height(Length::Fixed(programs_heading_height))),
-            programs_heading_height,
+        head: vec![caption_node(
+            "packages/programs-heading",
+            "PROGRAMS",
+            consent_text_width,
         )],
         rows: packages_program_lines(packages, width)
             .iter()
-            .map(|line| (packages_program_line_node(line, row_height), row_height))
+            .map(|line| packages_program_line_row(line, row_height, consent_text_width))
             .collect(),
     };
 
@@ -36622,9 +40771,12 @@ fn packages_page(
     let activity_rows: Vec<(UiNode, f32)> = packages_activity_rows(packages, width)
         .into_iter()
         .map(|row| {
-            (
-                packages_activity_row_node(row.key, row.text, row.trouble, row_height),
+            packages_activity_row(
+                row.key,
+                &row.text,
+                row.trouble,
                 row_height,
+                consent_text_width,
             )
         })
         .collect();
@@ -36633,17 +40785,24 @@ fn packages_page(
         spec: GroupSpec::new("Package activity").style(StyleRef::Secondary),
         padding: Insets::all(20.0),
         gap: 8.0,
-        head: vec![(
-            packages_activity_heading(packages, activity_heading_height),
+        head: vec![packages_activity_heading(
+            packages,
             activity_heading_height,
+            consent_text_width,
         )],
         rows: activity_rows,
     };
 
     let viewport = LogicalRect::new(0.0, 0.0, viewport_width, viewport_height);
     let gap = settings_page_gap(state, width, viewport);
-    let (mut out, heading_height) =
-        pinned_heading(width, viewport, gap, "Packages", packages_page_subtitle());
+    let (mut out, heading_height) = pinned_heading(
+        state,
+        width,
+        viewport,
+        gap,
+        "Packages",
+        packages_page_subtitle(),
+    );
     let room = (settings_list_body_height(state, width, viewport) - heading_height)
         .max(scaled_control_height());
     out.push(scroll::list_page_peeking(
@@ -36661,6 +40820,14 @@ fn packages_page(
         settings_list_overhang(state, width, viewport),
     ));
     out
+}
+
+/// A node's fixed width (`0` for any other length).
+fn fixed_width(node: &UiNode) -> f32 {
+    match node.layout.width {
+        Length::Fixed(width) => width,
+        _ => 0.0,
+    }
 }
 
 /// A node's fixed height (`0` for any other length).
@@ -36720,7 +40887,31 @@ fn field_match_score_in(
         .filter(|score| *score < crate::native_config_language::ACRONYM_RUNG)
         .min()
         .map(|score| SearchRank::synonym(score.saturating_add(1)));
-    own.into_iter().chain(by_name).min()
+    // A query that names a theme by the rule its picker seeds by ("nord
+    // theme", "light gruvbox", "night tokyo": [`ThemeNaming`]) finds the row
+    // too, on the word-start rung a name reaches.
+    let named = ThemeNaming::of(query)
+        .filter(|naming| {
+            theme_search_entries(themes)
+                .any(|(label, id, appearance)| naming.names(label, id, Some(appearance)))
+        })
+        .map(|_| SearchRank::synonym(2));
+    own.into_iter().chain(by_name).chain(named).min()
+}
+
+/// Every theme a search can name ([`ThemeNaming`]): the built-ins, and each
+/// loaded theme file, with its name, catalog id and the side it is made for.
+fn theme_search_entries(
+    themes: &crate::app_config::ThemeCatalog,
+) -> impl Iterator<Item = (&str, &str, aterm_types::Appearance)> {
+    aterm_types::scheme::builtin_theme_list()
+        .into_iter()
+        .map(|builtin| (builtin.name, builtin.name, builtin.appearance))
+        .chain(
+            themes
+                .ready_themes()
+                .map(|(id, meta)| (meta.display_name.as_str(), id, meta.appearance)),
+        )
 }
 
 /// Every name a theme can be searched by: the built-ins, and each loaded
@@ -36767,8 +40958,8 @@ fn field_own_match_score(
 /// for every copy: what the page is about, never a promise this copy may not
 /// keep (the status card says what it can do). Linux uses a separate subtitle
 /// naming its native disk transaction, not the macOS session handoff.
-fn update_page_subtitle(macos_updater: bool) -> &'static str {
-    if !macos_updater {
+fn update_page_subtitle(native_updater: bool) -> &'static str {
+    if !native_updater {
         // The headline ("No in-app updater here.") and the detail line name the rest.
         "Updates arrive by reinstalling."
     } else {

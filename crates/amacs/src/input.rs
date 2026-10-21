@@ -6,8 +6,9 @@
 //! One key-to-command semantics for both faces: aterm's native Editor view
 //! maps each winit event to an [`EditorInput`], the terminal face maps each
 //! decoded terminal event, and [`EditorWorkspace::handle_input`] decides what
-//! it means. Chords and prefixes (`C-x`, `M-g`, ESC as Meta), the `C-u`
-//! argument, self-insertion, the minibuffer's own keys and a paste are all
+//! it means. Chords and prefixes (`C-x`, `M-g`, and in the terminal face ESC
+//! as Meta), the `C-u` argument, self-insertion, the minibuffer's own keys
+//! and a paste are all
 //! decided here, so the two faces cannot fork. The keymap's [`Profile`]
 //! carries what differs by face: the GUI's platform spellings and its Super
 //! (⌘) shortcuts.
@@ -206,12 +207,12 @@ impl EditorWorkspace {
             Some(twin) => (twin, text),
             None => (key, text),
         };
-        // ESC is Meta for the next key the keymap can spell. A key it has no
-        // name for (Up, Home, a function key) and a ⌘ key (a chord has no
-        // Super) end the ESC instead, and do what they do without it: so
-        // Escape, then Down, moves down, and Escape, then ⌘Z, undoes. The
-        // ESC's HUD goes either way, so the face repaints even for a key
-        // that then does nothing.
+        // In the terminal face ESC is Meta for the next key the keymap can
+        // spell. A key it has no name for (Up, Home, a function key) and a
+        // Super key (a chord has none) end the ESC instead, and do what they
+        // do without it: so Escape, then Down, moves down. The ESC's HUD goes
+        // either way, so the face repaints even for a key that then does
+        // nothing. (A GUI's Escape never leaves an ESC pending.)
         let spelled = !mods.intersects(Modifiers::SUPER | Modifiers::HYPER)
             && KeyChord::from_key(&key, mods).is_some();
         if !spelled && view.end_escape_prefix() {
@@ -347,26 +348,24 @@ impl EditorWorkspace {
                 if view.minibuffer_active() {
                     self.submit_minibuffer(store, view)?
                 } else {
-                    self.insert_text(store, view, "\n")?
+                    self.execute(store, view, EditorCommand::Newline)?
                 }
             }
-            // Escape closes an open minibuffer at once; otherwise it is the
-            // ESC prefix, Meta for the next key (`handle_chord`), and in a
-            // GUI it quits first, as a GUI's Escape always has
-            // (`Profile::escape_quits`).
-            Key::Named(NamedKey::Escape) if view.minibuffer_active() => {
+            // Escape closes an open minibuffer at once. Otherwise a GUI's
+            // Escape quits, as it always has, and the terminal face's is the
+            // ESC prefix, Meta for the next key (`handle_chord`,
+            // `Profile::escape_is_meta`). A GUI's Escape after a pending
+            // prefix (`C-x`) is that sequence's next key, which nothing binds.
+            Key::Named(NamedKey::Escape)
+                if view.minibuffer_active()
+                    || !(self.keymap.profile().escape_is_meta() || view.chord_pending()) =>
+            {
                 self.execute(store, view, EditorCommand::Abort)?
             }
             Key::Named(NamedKey::Escape) => {
-                let mut effects = if self.keymap.profile().escape_quits() {
-                    self.execute(store, view, EditorCommand::Abort)?
-                } else {
-                    Vec::new()
-                };
                 let escape =
                     KeyChord::from_key(&key, Modifiers::empty()).expect("Escape has a chord name");
-                effects.extend(self.handle_chord(store, view, escape)?);
-                effects
+                self.handle_chord(store, view, escape)?
             }
             // Page Up and Page Down page the caret with the view, Emacs'
             // scroll-down/up-command (`C-v` and `M-v` off the Windows GUI).
@@ -451,7 +450,7 @@ mod tests {
     }
 
     /// The profiles differ only where a face's platform has a reflex of its
-    /// own, and ESC is Meta in every one of them.
+    /// own.
     #[test]
     fn profile_tables() {
         let command = KeyResolution::Command;
@@ -505,43 +504,20 @@ mod tests {
                 "Tab indents on {profile:?}"
             );
         }
-        // ESC x is M-x in every profile, and ESC ESC quits.
+    }
+
+    /// ESC is Meta in the terminal face alone (`Profile::escape_is_meta`):
+    /// there `ESC x` is `M-x`, ESC keeps a region and a C-u argument while it
+    /// waits, and ESC ESC quits. A GUI's Escape is what it always was: it
+    /// quits at once (the region and a C-u argument go, the status says
+    /// Quit), and the key after it is typed as itself.
+    #[test]
+    fn escape_is_meta_only_in_the_terminal_face() {
+        let escape = || key(Key::Named(NamedKey::Escape), Modifiers::empty());
         for profile in PROFILES {
-            let (mut store, mut workspace, mut view, _) = editor(profile, "abc");
-            press(
-                &mut store,
-                &mut workspace,
-                &mut view,
-                key(Key::Named(NamedKey::Escape), Modifiers::empty()),
-            );
-            assert!(view.chord_pending(), "ESC waits for its key on {profile:?}");
-            press(
-                &mut store,
-                &mut workspace,
-                &mut view,
-                key(Key::Character('x'), Modifiers::empty()),
-            );
-            assert!(
-                matches!(view.minibuffer, Minibuffer::Command { .. }),
-                "ESC x opens M-x on {profile:?}"
-            );
-            assert!(!view.chord_pending());
-
-            let (mut store, mut workspace, mut view, _) = editor(profile, "abc");
-            for _ in 0..2 {
-                press(
-                    &mut store,
-                    &mut workspace,
-                    &mut view,
-                    key(Key::Named(NamedKey::Escape), Modifiers::empty()),
-                );
-            }
-            assert!(!view.chord_pending(), "ESC ESC quits on {profile:?}");
-            assert_eq!(view.prefix_hud, None);
-
-            // A GUI's Escape quits before it arms ESC: the region and a C-u
-            // argument go. The terminal face's ESC only arms.
-            let (mut store, mut workspace, mut view, _) = editor(profile, "abc");
+            let meta = profile == Profile::Terminal;
+            assert_eq!(profile.escape_is_meta(), meta, "{profile:?}");
+            let (mut store, mut workspace, mut view, document) = editor(profile, "abc");
             workspace
                 .execute(&mut store, &mut view, EditorCommand::SetMark)
                 .unwrap();
@@ -551,42 +527,84 @@ mod tests {
                 &mut view,
                 key(Key::Character('u'), Modifiers::CTRL),
             );
-            let reduction = press(
-                &mut store,
-                &mut workspace,
-                &mut view,
-                key(Key::Named(NamedKey::Escape), Modifiers::empty()),
-            );
-            assert!(view.escape_pending(), "{profile:?}");
-            let quits = profile != Profile::Terminal;
-            assert_eq!(profile.escape_quits(), quits);
-            assert_eq!(view.mark_active, !quits, "{profile:?}");
+            let reduction = press(&mut store, &mut workspace, &mut view, escape());
+            assert_eq!(view.escape_pending(), meta, "{profile:?}");
+            assert_eq!(view.mark_active, meta, "{profile:?}");
             assert_eq!(
-                view.prefix_hud.as_deref().unwrap().starts_with("C-u 4 ESC"),
-                !quits,
+                view.prefix_hud
+                    .as_deref()
+                    .is_some_and(|hud| hud.starts_with("C-u 4 ESC")),
+                meta,
                 "{profile:?}"
             );
             assert_eq!(
                 reduction.effects,
-                if quits {
-                    vec![EditorEffect::Status("Quit".to_string())]
-                } else {
+                if meta {
                     Vec::new()
+                } else {
+                    vec![EditorEffect::Status("Quit".to_string())]
                 },
                 "{profile:?}"
             );
+            press(
+                &mut store,
+                &mut workspace,
+                &mut view,
+                key(Key::Character('x'), Modifiers::empty()),
+            );
+            assert!(!view.chord_pending(), "{profile:?}");
+            if meta {
+                assert!(
+                    matches!(view.minibuffer, Minibuffer::Command { .. }),
+                    "ESC x opens M-x on {profile:?}"
+                );
+                assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "abc");
+            } else {
+                assert!(!view.minibuffer_active(), "{profile:?}");
+                assert_eq!(
+                    store.snapshot(document).unwrap().text.as_ref(),
+                    "xabc",
+                    "Escape, then x, types x on {profile:?}"
+                );
+            }
+
+            // ESC ESC quits in the terminal face; two Escapes quit twice in a GUI.
+            let (mut store, mut workspace, mut view, _) = editor(profile, "abc");
+            for _ in 0..2 {
+                press(&mut store, &mut workspace, &mut view, escape());
+            }
+            assert!(!view.chord_pending(), "{profile:?}");
+            assert_eq!(view.prefix_hud, None, "{profile:?}");
+
+            // After a prefix, Escape is the sequence's next key in every
+            // face, and nothing binds it.
+            press(
+                &mut store,
+                &mut workspace,
+                &mut view,
+                key(Key::Character('x'), Modifiers::CTRL),
+            );
+            assert_eq!(
+                press(&mut store, &mut workspace, &mut view, escape()).effects,
+                [EditorEffect::Status("C-x escape is not bound".to_string())],
+                "{profile:?}"
+            );
+            assert!(!view.chord_pending(), "{profile:?}");
         }
     }
 
-    /// ESC is Meta only for a key the keymap can spell. A key it cannot
-    /// (Down, a function key) or a ⌘ key ends the ESC and does what it does
-    /// without it, and so do committed text and a paste; a pending C-u
-    /// survives the ESC it outlived. Any other pending sequence waits on.
+    /// In the terminal face ESC is Meta only for a key the keymap can
+    /// spell. A key it cannot (Down, a function key) or a Super key ends the
+    /// ESC and does what it does without it, and so do committed text and a
+    /// paste; a pending C-u survives the ESC it outlived. Any other pending
+    /// sequence waits on. In a GUI, Escape leaves nothing pending, so every
+    /// one of these keys does what it does after a plain Escape.
     #[test]
     fn escape_ends_for_a_key_it_cannot_spell() {
         let text = "alpha beta\ngamma delta\nthird\nfourth\nfifth\nsixth\n";
         let escape = || key(Key::Named(NamedKey::Escape), Modifiers::empty());
         for profile in PROFILES {
+            let meta = profile.escape_is_meta();
             let (mut store, mut workspace, mut view, document) = editor(profile, text);
             press(&mut store, &mut workspace, &mut view, escape());
             let reduction = press(
@@ -615,7 +633,8 @@ mod tests {
                 "{profile:?}"
             );
 
-            // A key nothing reads still ends the ESC, and the face repaints.
+            // A key nothing reads still ends a pending ESC, and the face
+            // repaints; with no ESC pending (a GUI) the key is ignored.
             press(&mut store, &mut workspace, &mut view, escape());
             let reduction = press(
                 &mut store,
@@ -623,7 +642,15 @@ mod tests {
                 &mut view,
                 key(Key::Named(NamedKey::F5), Modifiers::empty()),
             );
-            assert_eq!(reduction, Reduction::reveal(Vec::new()), "{profile:?}");
+            assert_eq!(
+                reduction,
+                if meta {
+                    Reduction::reveal(Vec::new())
+                } else {
+                    Reduction::ignored()
+                },
+                "{profile:?}"
+            );
             assert!(!view.chord_pending(), "{profile:?}");
 
             // Committed text and a paste insert, and end the ESC.
@@ -715,7 +742,13 @@ mod tests {
         let escape = key(Key::Named(NamedKey::Escape), Modifiers::empty());
         let c_x = key(Key::Character('x'), Modifiers::CTRL);
         for profile in PROFILES {
-            for before in [&escape, &c_x] {
+            // Only the terminal face's ESC waits for a key.
+            let befores = if profile.escape_is_meta() {
+                vec![&escape, &c_x]
+            } else {
+                vec![&c_x]
+            };
+            for before in befores {
                 let (mut store, mut workspace, mut view, _) = editor(profile, "abc abc");
                 press(&mut store, &mut workspace, &mut view, before.clone());
                 assert!(view.chord_pending());

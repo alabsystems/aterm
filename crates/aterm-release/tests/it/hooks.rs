@@ -19,7 +19,9 @@ use crate::transforms::{Inputs, run};
 const ACCOUNT: &str = concat!("aya", "tes");
 const PRIVATE_ORG: &str = concat!("andrew", "yatesai");
 
-/// git, isolated from this machine's configuration (local submodules allowed).
+/// git, isolated from this machine's configuration (local submodules allowed), found on a
+/// `PATH` with git's exec-path first: the fixture's and the hooks' own git (which take this
+/// env) skip macOS's xcrun trampoline.
 #[derive(Clone)]
 struct Git {
     env: Vec<(String, String)>,
@@ -29,11 +31,12 @@ impl Git {
     fn new(home: &Path) -> Self {
         Self {
             env: vec![
+                ("PATH".into(), crate::git_first_path().into()),
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
                 ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-                ("GIT_CONFIG_COUNT".into(), "3".into()),
+                ("GIT_CONFIG_COUNT".into(), "4".into()),
                 ("GIT_CONFIG_KEY_0".into(), "protocol.file.allow".into()),
                 ("GIT_CONFIG_VALUE_0".into(), "always".into()),
                 ("GIT_CONFIG_KEY_1".into(), "user.name".into()),
@@ -43,6 +46,10 @@ impl Git {
                     "GIT_CONFIG_VALUE_2".into(),
                     "fixture@example.invalid".into(),
                 ),
+                // No `git maintenance run --auto` after each commit, fetch or push: it does
+                // nothing in a fixture this small.
+                ("GIT_CONFIG_KEY_3".into(), "maintenance.auto".into()),
+                ("GIT_CONFIG_VALUE_3".into(), "false".into()),
             ],
         }
     }
@@ -132,15 +139,15 @@ fn pre_promote_asks_the_commits_own_tree_and_leaves_no_worktree() {
     let (_dir, root, git) = scratch();
     let (repo, first) = repo_with_history(&root, &git);
     for (target, want_target, verdict) in [
-        (None, repo.join("target/pre-promote"), 1),
+        (None, repo.join("target/pre-promote.noindex"), 1),
         (
             Some(PathBuf::from("build/shared")),
-            repo.join("build/shared/pre-promote"),
+            repo.join("build/shared/pre-promote.noindex"),
             0,
         ),
         (
             Some(root.join("elsewhere")),
-            root.join("elsewhere/pre-promote"),
+            root.join("elsewhere/pre-promote.noindex"),
             1,
         ),
     ] {
@@ -984,7 +991,7 @@ fn dispatch(facts: &Transforms) -> (i32, Ran, String) {
 /// when its whole source tree is the captured commit's; an edited or untracked
 /// file, an edited lockfile, or a captured
 /// commit older than the checkout hands the export to that commit's own cutter, built
-/// in a throwaway worktree of exactly it, into the target dir's `pre-promote` — never
+/// in a throwaway worktree of exactly it, into the target dir's `pre-promote.noindex` — never
 /// this working tree's code.
 #[test]
 fn the_transforms_run_as_the_captured_commits_own_code() {
@@ -1005,7 +1012,7 @@ fn the_transforms_run_as_the_captured_commits_own_code() {
     let there = |rules: &str, full: &str| Ran::There {
         rules: rules.into(),
         full: full.into(),
-        target: repo.join("build/shared/pre-promote"),
+        target: repo.join("build/shared/pre-promote.noindex"),
     };
 
     // the checkout IS the captured commit: here, with the full sha for HEAD
@@ -1096,10 +1103,11 @@ fn the_transforms_refuse_rather_than_run_other_rules() {
 }
 
 /// The cutter's path dependencies and Cargo inputs are executable rules too.
-/// Exercise the real source judge and dispatcher over a committed checkout;
-/// each local difference must select the captured worktree, and restoring it
-/// must select the identical checkout again. Ignored includes/config files
-/// matter just as untracked files do.
+/// Exercise the real source judge over a committed checkout: each local
+/// difference is a source other than the captured commit's, and restoring it
+/// makes it that commit's again. Ignored includes/config files matter just as
+/// untracked files do. The dispatcher runs end to end on one tracked input and
+/// one ignored one: the captured worktree, then the identical checkout again.
 #[test]
 fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
     let (_dir, root, git) = scratch();
@@ -1136,43 +1144,63 @@ fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
         git_env: git.env.clone(),
     };
     assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
-    let expected = Ran::There {
-        rules: "// TWO\n".to_owned(),
-        full: captured.clone(),
-        target: root.join("shared-target/pre-promote"),
-    };
+    // Each local difference is a source that is not the captured commit's (the selection
+    // `transforms` delegates on), and the restored tree is that commit's again.
+    let differs = || source_differs(&facts.source, &git.env, &captured);
     let mut wrong = Vec::new();
     for path in tracked {
         let file = repo.join(path);
         std::fs::write(&file, "# local code or build setting\n").unwrap();
-        let (code, ran, said) = dispatch(&facts);
-        if code != 0 || ran != expected {
-            wrong.push(format!("tracked {path}: {code}, {ran:?}, {said}"));
+        if differs().is_none() {
+            wrong.push(format!("tracked {path}"));
         }
         std::fs::write(file, "# captured input\n").unwrap();
-        assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
+        assert_eq!(differs(), None, "restored {path}");
     }
-    for path in [
+    let extras = [
         "crates/aterm-json/src/new.rs",
         "crates/aterm-toml/src/local.rs",
         ".cargo/local.toml",
         "target/ignored-build-artifact",
-    ] {
+    ];
+    for path in extras {
         let file = repo.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "local input\n").unwrap();
-        let (code, ran, said) = dispatch(&facts);
-        if code != 0 || ran != expected {
-            wrong.push(format!("extra {path}: {code}, {ran:?}, {said}"));
+        if differs().is_none() {
+            wrong.push(format!("extra {path}"));
         }
         std::fs::remove_file(file).unwrap();
-        assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
+        assert_eq!(differs(), None, "removed {path}");
     }
-    assert_eq!(worktrees(&git, &repo), 1, "delegated trees were removed");
     assert!(
         wrong.is_empty(),
-        "local inputs ran as attested code: {wrong:#?}"
+        "local inputs read as the captured source: {wrong:#?}"
     );
+    // End to end, a tracked input outside the cutter's crate and an ignored extra: each
+    // runs the captured commit's own cutter in a worktree that is gone afterwards, and the
+    // restored tree runs here.
+    let expected = Ran::There {
+        rules: "// TWO\n".to_owned(),
+        full: captured.clone(),
+        target: root.join("shared-target/pre-promote.noindex"),
+    };
+    for (path, captured_body) in [
+        ("crates/aterm-json/src/lib.rs", Some("# captured input\n")),
+        ("target/ignored-build-artifact", None),
+    ] {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "# local code or build setting\n").unwrap();
+        let (code, ran, said) = dispatch(&facts);
+        assert_eq!((code, &ran), (0, &expected), "{path}: {said}");
+        match captured_body {
+            Some(body) => std::fs::write(file, body).unwrap(),
+            None => std::fs::remove_file(file).unwrap(),
+        }
+        assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()), "{path}");
+    }
+    assert_eq!(worktrees(&git, &repo), 1, "delegated trees were removed");
 }
 
 /// A path dependency behind a gitlink is part of the cutter's source too:

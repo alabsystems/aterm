@@ -22,8 +22,9 @@
 >   (SHAPE gate; FACET gate as well with the `as` cast), gap 3. A struct return has no kernel
 >   denotation (`result.<field>`: `admission_minted=false`), gap 1.
 
-Source: `crates/aterm-dirfd` (read only). The crate is one file, `src/lib.rs`, gated
-`#![cfg(unix)]`, and is a thin shell over libc's `*at` calls. I read every `#[test]` in
+Source: `crates/aterm-dirfd` (read only). The crate was then one file, `src/lib.rs`, gated
+`#![cfg(unix)]`, and is a thin shell over libc's `*at` calls (since 2026-10-19 that unix half
+is `src/unix.rs`, beside a Windows half these specs do not cover). I read every `#[test]` in
 `tests/dirfd.rs` (15; `src/` has none) and the code each one reaches. Nothing was compiled
 or run. The claims below come from reading the code.
 
@@ -182,7 +183,7 @@ tests/dirfd.rs	names_across_the_stack_buffer_boundary_agree	arg-cstr-faithful	sy
    occupied destination. No step has both conditions at once, so this is untested rather than
    wrong. The test is not gated to Linux/Apple either, but on any other unix `renameat_with`
    returns `ENOSYS` by design, so the test would fail there.
-6. **`Errno::last` can report errno 0.** `crates/aterm-dirfd/src/lib.rs` `Errno::last` uses
+6. **`Errno::last` can report errno 0.** `crates/aterm-dirfd/src/unix.rs` `Errno::last` uses
    `unwrap_or(0)`, so a failure with no OS error code would surface as `Err(Errno(0))`. No test
    samples it. `syscall-passthrough` must either rule it out (as a `Sys` axiom that libc sets
    errno whenever it returns -1) or state it.

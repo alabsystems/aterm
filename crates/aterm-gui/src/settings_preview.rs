@@ -39,6 +39,13 @@ const MAX_LENGTH: usize = 512;
 const PHASE_CYCLE_MS: u64 = 2_400;
 const MOTION_STEP_MS: u64 = 52;
 const CURSOR_BLINK_HALF_MS: u64 = 530;
+/// The Pause/Play glyph's slot at the right of a looping preview's header,
+/// logical points.
+const PAUSE_GLYPH_W: f32 = 14.0;
+/// The one action a looping preview's Pause/Play activation invokes. The view
+/// owns the paused bit; the spec only carries it, so paint, cadence and
+/// accessibility read one value.
+pub(crate) const PREVIEW_PAUSE_ACTION: &str = "settings/preview-pause";
 
 /// The narrowest host cadence that can change a preview's pixels.
 ///
@@ -112,6 +119,9 @@ pub(crate) enum PreviewPause {
     SystemReduceMotion,
     /// The demo played three times over with nothing touched on its page.
     Resting,
+    /// The viewer paused the looping preview with its Pause/Play control
+    /// (`SettingsPreviewSpec::paused`); not a reduced-motion cause.
+    Viewer,
 }
 
 impl PreviewPause {
@@ -128,13 +138,30 @@ impl PreviewPause {
             ),
             Self::SystemReduceMotion => "the system asks for reduced motion".to_string(),
             Self::Resting => "nothing on the page has changed for a while".to_string(),
+            Self::Viewer => "you paused it".to_string(),
+        }
+    }
+
+    /// The cause in the paint audit's words ("raw/effective motion … because
+    /// …"): the same cause the badge and the spoken summary name, so the
+    /// three can never disagree. Exhaustive: a new cause must say its own.
+    pub(crate) const fn audit(self) -> &'static str {
+        match self {
+            Self::Unspecified => "motion is reduced",
+            Self::SeriousMode => "serious mode suppresses decorative motion and post-processing",
+            Self::Load => "adaptive performance load-shed is active",
+            Self::Unfocused => "the aterm window is unfocused",
+            Self::MotionSetting => "motion=reduced explicitly disables motion",
+            Self::SystemReduceMotion => "motion=auto follows system Reduce Motion",
+            Self::Resting => "the demo rests after three loops with nothing touched on its page",
+            Self::Viewer => "the viewer paused the looping preview with its Pause/Play control",
         }
     }
 
     fn badge(self) -> String {
         match self {
             Self::SeriousMode => "Serious Mode".to_string(),
-            Self::Unfocused | Self::Load | Self::Resting => "Paused".to_string(),
+            Self::Unfocused | Self::Load | Self::Resting | Self::Viewer => "Paused".to_string(),
             Self::MotionSetting => crate::native_settings::reduce_motion_words(),
             Self::SystemReduceMotion => "System Reduce Motion".to_string(),
             Self::Unspecified => "Reduced motion".to_string(),
@@ -242,8 +269,9 @@ pub(crate) struct CursorPreviewSpec {
     /// geometry and companion identity intentionally live in its spelling.
     /// `trail_style` is only the shared engine's broad dispatch class.
     pub(crate) trail_style_raw: Arc<str>,
-    /// Optional packed `0x00RRGGBB`; `None` follows the live theme/style rule.
-    pub(crate) color: Option<u32>,
+    /// The trail colour setting: each style's automatic colour, the cursor's
+    /// colour chosen, or a packed `0x00RRGGBB`.
+    pub(crate) color: aterm_effects::cursor_fx::TrailColor,
     /// Optional packed `0x00RRGGBB`; `None` brightens the resolved base colour.
     pub(crate) accent: Option<u32>,
     pub(crate) duration_ms: u64,
@@ -267,7 +295,7 @@ impl Default for CursorPreviewSpec {
             trail_enabled: true,
             trail_style: PreviewTrailStyle::RainbowKitty,
             trail_style_raw: Arc::from(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE),
-            color: None,
+            color: aterm_effects::cursor_fx::TrailColor::Automatic,
             accent: None,
             duration_ms: 260,
             length: 24,
@@ -294,7 +322,7 @@ impl CursorPreviewSpec {
             trail_enabled: self.trail_enabled,
             trail_style: self.trail_style,
             trail_style_raw,
-            color: self.color.map(|color| color & 0x00ff_ffff),
+            color: self.color.masked(),
             accent: self.accent.map(|color| color & 0x00ff_ffff),
             duration_ms: self.duration_ms.clamp(MIN_DURATION_MS, MAX_DURATION_MS),
             length: self.length.clamp(1, MAX_LENGTH),
@@ -379,7 +407,7 @@ impl CursorPreviewSpec {
         crate::app_config::resolve_cursor_glow(
             crate::app_config::CursorGlowInputs {
                 enabled: self.trail_enabled,
-                color: self.color,
+                color: self.color.knob(theme.cursor),
                 accent: self.accent,
                 duration_ms: self.duration_ms,
                 length: self.length,
@@ -641,6 +669,51 @@ pub(crate) struct CursorPostFxSpec {
     pub(crate) companion_look: aterm_effects::kitty_registry::KittyLook,
 }
 
+/// Whether the preview shows HDR glow dimmer than the terminal: HDR glow on,
+/// on a screen that shows EDR. The preview is standard range (the tray is
+/// 8-bit), so it caps that glow ([`SettingsPreviewSpec::post_process`]) while
+/// the terminal draws it brighter. The one cause behind every place that says
+/// so — the HDR glow row's note and the preview's spoken line — each in the
+/// words below.
+pub(crate) const fn hdr_glow_capped(hdr_glow: bool, display_edr: bool) -> bool {
+    hdr_glow && display_edr
+}
+
+/// What the preview cannot show while [`hdr_glow_capped`]: the row's note and
+/// the preview's spoken line.
+pub(crate) const HDR_PREVIEW_CAVEAT: &str = "The preview can\u{2019}t show HDR brightness; the terminal draws this glow brighter on this display";
+/// [`HDR_PREVIEW_CAVEAT`] as the row's tag.
+pub(crate) const HDR_PREVIEW_CAVEAT_TAG: &str = "Preview can\u{2019}t show HDR";
+/// [`HDR_PREVIEW_CAVEAT`] as the row speaks it.
+pub(crate) const HDR_PREVIEW_CAVEAT_SPOKEN: &str = "The preview can\u{2019}t show HDR brightness";
+
+impl CursorPostFxSpec {
+    /// Whether the preview draws HDR glow capped ([`hdr_glow_capped`]).
+    pub(crate) const fn hdr_glow_capped(&self) -> bool {
+        hdr_glow_capped(self.hdr_glow, self.display_edr)
+    }
+
+    /// The one crown that lifts the trail's glow here, in the paint audit's
+    /// words: HDR glow capped at standard range on a screen that shows EDR,
+    /// else the SDR crown at SDR glow boost.
+    fn glow_lift_words(&self) -> String {
+        if self.hdr_glow_capped() {
+            "HDR glow on an HDR display, shown capped at standard range".to_string()
+        } else {
+            format!(
+                "HDR glow {}{}; SDR crown at SDR glow boost {}",
+                if self.hdr_glow { "on" } else { "off" },
+                if self.display_edr {
+                    ""
+                } else {
+                    " (no HDR display)"
+                },
+                trim_float(self.sdr_boost)
+            )
+        }
+    }
+}
+
 impl Default for CursorPostFxSpec {
     fn default() -> Self {
         Self {
@@ -843,15 +916,6 @@ pub(crate) struct SettingsPreviewSpec {
     /// primitive carries this identity through delayed rasterization.
     pub(crate) font_candidate: SemanticFontCandidate,
     pub(crate) appearance: AppearancePreviewSpec,
-    /// Live OS appearance used only when `appearance.window_theme` is `auto`.
-    /// It is deliberately independent of the terminal candidate palette.
-    pub(crate) system_dark: bool,
-    /// The window sample takes the CANDIDATE THEME's side under `auto`
-    /// instead of the platform's: set by the Themes stage, whose sample
-    /// shows one theme, so a light theme is never framed by a dark
-    /// titlebar because the OS happens to be dark. A forced Light/Dark
-    /// `window_theme` still wins.
-    pub(crate) window_follows_theme: bool,
     pub(crate) typography: TypographyPreviewSpec,
     pub(crate) post_fx: CursorPostFxSpec,
     /// Exact visual field currently authoring the demo and its normalized
@@ -889,6 +953,15 @@ pub(crate) struct SettingsPreviewSpec {
     /// motion and freezes a visible cursor instead of retaining a misleading
     /// in-flight trail.
     pub(crate) reduced_motion: bool,
+    /// The viewer paused this looping demonstration (the card is its own
+    /// Pause/Play control; WCAG 2.2.2). View state, never config: the view
+    /// owns the bit and the spec carries it, so paint, cadence and
+    /// accessibility read one value. A paused cursor scene holds one frame
+    /// with its trail lit ([`CURSOR_SCENE_PAUSE_MS`]) and arms no cadence.
+    pub(crate) paused: bool,
+    /// Keyboard focus is on this preview (a Pause/Play control while it
+    /// loops): paint draws the focus ring the standard controls draw.
+    pub(crate) focused: bool,
     /// Why `reduced_motion` holds, for the badge and the spoken summary.
     pub(crate) pause: PreviewPause,
     /// The Themes demo's playback; read only by [`PreviewScene::ThemeDemo`].
@@ -912,8 +985,6 @@ impl Default for SettingsPreviewSpec {
             synthetic_styles: true,
             font_candidate: SemanticFontCandidate::default(),
             appearance: AppearancePreviewSpec::default(),
-            system_dark: false,
-            window_follows_theme: false,
             typography: TypographyPreviewSpec::default(),
             post_fx: CursorPostFxSpec::default(),
             focused_key: "cursor_trail_style".to_string(),
@@ -932,6 +1003,8 @@ impl Default for SettingsPreviewSpec {
             cursor: CursorPreviewSpec::default(),
             phase_ms: 720,
             reduced_motion: false,
+            paused: false,
+            focused: false,
             pause: PreviewPause::Unspecified,
             demo: ThemeDemoSpec::default(),
             wallpaper: None,
@@ -972,7 +1045,6 @@ impl SettingsPreviewSpec {
         Self {
             scene: PreviewScene::ThemeDemo,
             font_px,
-            window_follows_theme: true,
             cursor: CursorPreviewSpec {
                 trail_enabled: false,
                 blink: false,
@@ -1022,9 +1094,38 @@ impl SettingsPreviewSpec {
         self
     }
 
+    /// [`Self::with_phase`] with a phase the host derives from the rest of
+    /// the spec (its loop identity, [`Self::loop_identity`]).
+    pub(crate) fn map_phase(self, phase: impl FnOnce(&Self) -> u64) -> Self {
+        let phase_ms = phase(&self);
+        self.with_phase(phase_ms)
+    }
+
     pub(crate) fn with_reduced_motion(mut self, reduced_motion: bool) -> Self {
         self.reduced_motion = reduced_motion;
         self
+    }
+
+    pub(crate) fn with_paused(mut self, paused: bool) -> Self {
+        self.paused = paused;
+        self
+    }
+
+    pub(crate) fn with_focus_ring(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    /// Why the preview moves or holds still, in the paint audit's words:
+    /// while motion is reduced, the cause the badge and spoken summary name
+    /// ([`PreviewPause::audit`]), never a second opinion; otherwise why it
+    /// moves (`post_fx.motion_reason`).
+    pub(crate) fn motion_reason(&self) -> &str {
+        if self.reduced_motion {
+            self.pause.audit()
+        } else {
+            &self.post_fx.motion_reason
+        }
     }
 
     pub(crate) fn with_pause(mut self, pause: PreviewPause) -> Self {
@@ -1112,17 +1213,6 @@ impl SettingsPreviewSpec {
         self
     }
 
-    pub(crate) fn with_system_dark(mut self, system_dark: bool) -> Self {
-        self.system_dark = system_dark;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_window_following_theme(mut self, follows: bool) -> Self {
-        self.window_follows_theme = follows;
-        self
-    }
-
     pub(crate) fn with_typography_candidate(mut self, typography: TypographyPreviewSpec) -> Self {
         self.typography = typography;
         self
@@ -1163,8 +1253,6 @@ impl SettingsPreviewSpec {
                 bold_is_bright: self.appearance.bold_is_bright,
                 faint_opacity: finite_or(self.appearance.faint_opacity, 0.5).clamp(0.0, 1.0),
             },
-            system_dark: self.system_dark,
-            window_follows_theme: self.window_follows_theme,
             typography: TypographyPreviewSpec {
                 cursor_break_ligatures: self.typography.cursor_break_ligatures,
                 underline_position: self.typography.underline_position.clamp(-32, 32),
@@ -1206,6 +1294,8 @@ impl SettingsPreviewSpec {
             cursor: self.cursor.normalized(),
             phase_ms: self.phase_ms % self.phase_cycle_ms(),
             reduced_motion: self.reduced_motion,
+            paused: self.paused,
+            focused: self.focused,
             pause: self.pause,
             demo: ThemeDemoSpec {
                 phase_ms: self.demo.phase_ms % crate::settings_theme_demo::DEMO_LOOP_MS,
@@ -1239,10 +1329,64 @@ impl SettingsPreviewSpec {
     /// (no motion) here exactly as it does in paint;
     /// `millis_until_next_blink_edge` re-applies the scene's cycle itself.
     pub(crate) fn animation(&self) -> PreviewAnimation {
-        if self.reduced_motion {
+        if self.reduced_motion || self.holds_pause() {
             return PreviewAnimation::None;
         }
         self.animation_without_reduction()
+    }
+
+    /// The identity of a looping demonstration, everything that decides its
+    /// replay but the phase (the cursor scene's script key without the theme,
+    /// which the spec's candidate palette already carries); `None` for a
+    /// preview that does not loop. A host that sees this change starts the
+    /// new demonstration at its own cycle's beginning (`PreviewClock` in
+    /// `native_settings`), so the first paint of a newly highlighted choice
+    /// replays the warm cycles alone, not the cycle so far too.
+    pub(crate) fn loop_identity(&self) -> Option<u64> {
+        if self.animation() != PreviewAnimation::Continuous {
+            return None;
+        }
+        // Focusing the card (to pause it) is the same demonstration.
+        let mut probe = self.clone().with_phase(0);
+        probe.focused = false;
+        Some(probe.paint_fingerprint())
+    }
+
+    /// Whether this preview offers its Pause/Play control: the cursor scene
+    /// loops (or would loop, once played again) and Reduce Motion has not
+    /// already stilled it. A blink-only or static preview, and the Themes
+    /// demo (which rests on its own, [`PreviewPause::Resting`]), have nothing
+    /// to pause.
+    pub(crate) fn pause_control(&self) -> bool {
+        self.scene == PreviewScene::CursorMotion
+            && !self.reduced_motion
+            && self.animation_without_reduction() == PreviewAnimation::Continuous
+    }
+
+    /// The activation a looping preview offers: Pause/Play. `None` for every
+    /// preview with nothing to pause, which stays a plain demonstration group.
+    pub(crate) fn pause_action(&self) -> Option<crate::native_ui::ActionId> {
+        self.pause_control()
+            .then(|| crate::native_ui::ActionId::new(PREVIEW_PAUSE_ACTION))
+    }
+
+    /// What activating the preview does, for the accessibility description.
+    pub(crate) fn semantic_description(&self) -> Option<String> {
+        self.pause_control().then(|| {
+            if self.holds_pause() {
+                "Activate to play the looping trail demonstration again.".to_string()
+            } else {
+                "Activate to pause the looping trail demonstration on one still frame.".to_string()
+            }
+        })
+    }
+
+    /// The paused bit as it reaches pixels: a pause on a preview with nothing
+    /// to pause (the view kept the bit while the user moved to a blink-only
+    /// candidate, which shows no Play control) is no state at all, so that
+    /// preview still blinks.
+    fn holds_pause(&self) -> bool {
+        self.paused && self.pause_control()
     }
 
     fn animation_without_reduction(&self) -> PreviewAnimation {
@@ -1257,12 +1401,13 @@ impl SettingsPreviewSpec {
             return PreviewAnimation::None;
         }
         // The scripted typing plays wherever typing would light something in
-        // a window: a trail, or the momentum glow, which obeys only the
-        // effects switch and its own (Off keeps it, at any intensity).
+        // a window: a trail, or the momentum glow, which obeys its own switch
+        // (Off keeps it). Both are lit at the folded trail intensity, as in a
+        // terminal (`CursorFx` drives every body at `GlowConfig::intensity`),
+        // so at 0 there is nothing to type for.
         if self.cursor.trail_enabled
-            && (self.cursor.momentum_glow
-                || (self.cursor.has_resolved_trail()
-                    && finite_or(self.cursor.intensity, 0.0) > 0.0))
+            && finite_or(self.cursor.intensity, 0.0) > 0.0
+            && (self.cursor.momentum_glow || self.cursor.has_resolved_trail())
         {
             return PreviewAnimation::Continuous;
         }
@@ -1280,6 +1425,7 @@ impl SettingsPreviewSpec {
 
     fn cursor_visible(&self) -> bool {
         self.reduced_motion
+            || self.holds_pause()
             || !self.cursor.blink
             || (self.phase_ms / CURSOR_BLINK_HALF_MS).is_multiple_of(2)
     }
@@ -1408,44 +1554,39 @@ impl SettingsPreviewSpec {
                     || "the current terminal colors".to_string(),
                     |theme| spoken_palette(theme, identity.as_ref()),
                 );
+                // Auto announces the side the painter resolves through
+                // `window_sample_light` (the terminal theme's), never a
+                // second opinion of our own; on macOS it also says that the
+                // menus and sheets follow macOS, as the dropdown's "Match
+                // macOS" does. With no candidate palette the painter falls
+                // back to the HOST terminal theme, a colour the semantic
+                // projection is compiled before any theme is bound to, so it
+                // names the RULE and no side. (Every shipping spec carries a
+                // candidate: `renderer_preview_spec_for_key_with_font`
+                // derives one from the host theme even when nothing is
+                // edited.)
+                let auto_side = spec.terminal_theme.map(|candidate| {
+                    if window_sample_light(&spec, candidate.into_theme()) {
+                        "Light"
+                    } else {
+                        "Dark"
+                    }
+                });
                 let window = match spec.appearance.window_theme.as_str() {
-                    "light" => "Light window appearance",
-                    "dark" => "Dark window appearance",
-                    // Linux and Windows Auto follow the TERMINAL THEME, not a
-                    // live OS appearance feed ([`AUTO_WINDOW_FOLLOWS_TERMINAL`]);
-                    // announce the side the painter resolves through
-                    // `window_sample_light`, never a second opinion of our own.
-                    //
-                    // With no candidate palette the painter falls back to the
-                    // HOST terminal theme — a colour the semantic projection is
-                    // compiled long before any theme is bound to, so it names
-                    // the RULE and no side, rather than substituting the
-                    // `system_dark` OS feed this platform's Auto explicitly does
-                    // not consult. (Every shipping spec carries a candidate:
-                    // `renderer_preview_spec_for_key_with_font` derives one from
-                    // the host theme even when nothing is edited.)
-                    _ if spec.window_follows_theme || AUTO_WINDOW_FOLLOWS_TERMINAL => {
-                        match spec.terminal_theme {
-                            Some(candidate) => {
-                                if window_sample_light(&spec, candidate.into_theme()) {
-                                    "window appearance that matches the terminal theme, currently Light"
-                                } else {
-                                    "window appearance that matches the terminal theme, currently Dark"
-                                }
-                            }
-                            None => "window appearance that matches the terminal theme",
-                        }
-                    }
-                    _ if spec.system_dark && cfg!(target_os = "macos") => {
-                        "window appearance that follows macOS, currently Dark"
-                    }
-                    _ if cfg!(target_os = "macos") => {
-                        "window appearance that follows macOS, currently Light"
-                    }
-                    _ if spec.system_dark => {
-                        "window appearance that follows the system, currently Dark"
-                    }
-                    _ => "window appearance that follows the system, currently Light",
+                    "light" => "Light window appearance".to_string(),
+                    "dark" => "Dark window appearance".to_string(),
+                    _ if cfg!(target_os = "macos") => match auto_side {
+                        Some(side) => format!(
+                            "window appearance that follows macOS, its title bar in the terminal theme's colors, currently {side}"
+                        ),
+                        None => "window appearance that follows macOS, its title bar in the terminal theme's colors".to_string(),
+                    },
+                    _ => match auto_side {
+                        Some(side) => format!(
+                            "window appearance that matches the terminal theme, currently {side}"
+                        ),
+                        None => "window appearance that matches the terminal theme".to_string(),
+                    },
                 };
                 // "Sample" only when the demo draws a tried row, never for the
                 // theme the configuration applies.
@@ -1545,6 +1686,8 @@ impl SettingsPreviewSpec {
                 };
                 let state = if spec.reduction_suppresses_motion() {
                     format!(", paused because {}", spec.pause.because())
+                } else if spec.holds_pause() {
+                    format!(", paused because {}", PreviewPause::Viewer.because())
                 } else {
                     match spec.animation() {
                         PreviewAnimation::Continuous => ", shown while typing".to_string(),
@@ -1570,8 +1713,20 @@ impl SettingsPreviewSpec {
                     .map_or_else(String::new, |effect| {
                         format!(" {} · {effect}.", spec.focused_label)
                     });
+                // On an HDR display the preview, standard range, cannot show
+                // HDR glow at the terminal's brightness: said where one of
+                // the brightness rows has the keyboard.
+                let range = if spec.post_fx.hdr_glow_capped()
+                    && matches!(
+                        spec.focused_key.as_str(),
+                        crate::prefs::EDIT_HDR_GLOW | crate::prefs::EDIT_CURSOR_GLOW_SDR_BOOST
+                    ) {
+                    format!(" {HDR_PREVIEW_CAVEAT}.")
+                } else {
+                    String::new()
+                };
                 format!(
-                    "{lead}: {} cursor, {trail}{state}.{idle}",
+                    "{lead}: {} cursor, {trail}{state}.{idle}{range}",
                     spec.cursor.style.label()
                 )
             }
@@ -1656,6 +1811,7 @@ impl SettingsPreviewSpec {
             PreviewAnimation::None if spec.reduction_suppresses_motion() => {
                 "reduced motion; static"
             }
+            PreviewAnimation::None if spec.holds_pause() => "paused by the viewer; one frame",
             PreviewAnimation::None => "static",
             PreviewAnimation::BlinkEdge { .. } => "live cursor blink",
             PreviewAnimation::Continuous => "live motion",
@@ -1691,7 +1847,7 @@ impl SettingsPreviewSpec {
             |color| format!("#{color:06X}"),
         );
         let post_fx = format!(
-            "live bloom kernel on the CPU: bloom {} strength {} radius {}; fire shimmer {}; HDR candidate {} drawn as its SDR crown (no panel-headroom claim); SDR boost {}",
+            "live bloom kernel on the CPU: bloom {} strength {} radius {}; fire shimmer {} (the GPU's present-time refraction pass, not drawn here); {}",
             if spec.post_fx.bloom { "on" } else { "off" },
             trim_float(spec.post_fx.bloom_strength),
             trim_float(spec.post_fx.bloom_radius),
@@ -1700,8 +1856,7 @@ impl SettingsPreviewSpec {
             } else {
                 "off"
             },
-            if spec.post_fx.hdr_glow { "on" } else { "off" },
-            trim_float(spec.post_fx.sdr_boost),
+            spec.post_fx.glow_lift_words(),
         );
         let kitty_asset = match &spec.post_fx.kitty_asset {
             crate::app_config::KittySpriteAsset::BuiltIn => {
@@ -1777,7 +1932,7 @@ impl SettingsPreviewSpec {
             spec.cursor.effective_trail_style_raw(),
             spec.post_fx.motion_raw,
             spec.post_fx.motion_effective,
-            spec.post_fx.motion_reason,
+            spec.motion_reason(),
             if spec.post_fx.adaptive_motion {
                 "on"
             } else {
@@ -1876,18 +2031,9 @@ impl SettingsPreviewSpec {
             .clamp(0.0, 1.0)
             .to_bits()
             .hash(&mut hash);
-        // Compare the NORMALIZED theme word: an authored " Auto " must still
-        // fold `system_dark` in, or an OS light/dark flip would not invalidate
-        // the raster.
-        if self
-            .appearance
-            .window_theme
-            .trim()
-            .eq_ignore_ascii_case("auto")
-        {
-            self.system_dark.hash(&mut hash);
-            self.window_follows_theme.hash(&mut hash);
-        }
+        // Auto's window sample takes the candidate theme's side, which the
+        // terminal theme folded above already carries: no host appearance
+        // reaches the raster.
         self.typography.cursor_break_ligatures.hash(&mut hash);
         self.typography
             .underline_position
@@ -1947,10 +2093,7 @@ impl SettingsPreviewSpec {
             .effective_trail_style_raw()
             .trim()
             .hash(&mut hash);
-        self.cursor
-            .color
-            .map(|color| color & 0x00ff_ffff)
-            .hash(&mut hash);
+        self.cursor.color.masked().hash(&mut hash);
         self.cursor
             .accent
             .map(|color| color & 0x00ff_ffff)
@@ -1973,6 +2116,10 @@ impl SettingsPreviewSpec {
         self.cursor.cursor_color_pinned.hash(&mut hash);
         self.reduced_motion.hash(&mut hash);
         self.pause.hash(&mut hash);
+        // The held frame and its glyph, and the focus ring a looping card
+        // draws, are pixels.
+        self.holds_pause().hash(&mut hash);
+        (self.focused && self.pause_control()).hash(&mut hash);
         self.wallpaper
             .as_ref()
             .map(|wallpaper| {
@@ -2019,28 +2166,35 @@ impl SettingsPreviewSpec {
         hash.finish() | 1
     }
 
-    /// Typography keeps the candidate's exact size. Buy the five specimen rows
-    /// and a separate font-status band instead of painting a badge over glyphs.
+    /// Typography keeps the candidate's exact size. Buy the five core
+    /// specimen rows and a separate font-status band instead of painting a
+    /// badge over glyphs; a card taller than that fills with the specimen's
+    /// further rows ([`TYPOGRAPHY_SPECIMEN_ROWS`]).
     pub(crate) fn preferred_height(&self, minimum: f32) -> f32 {
         if self.scene != PreviewScene::Typography {
             return minimum;
         }
-        minimum.max(self.typography_height(TYPOGRAPHY_SPECIMEN_ROWS))
+        minimum.max(self.typography_height(TYPOGRAPHY_KEPT_ROWS))
     }
 
     /// The least height this preview still demonstrates at. Every scene paints
     /// whole rows at the authored size, never a shrunken one: a typography
     /// specimen keeps one row and its status band; a cursor specimen keeps one
-    /// row for the prompt its cursor types on; a color specimen keeps one row
-    /// above its palette swatches. A host that cannot give this height shows
-    /// no preview rather than a sliver ([`Self::paint`] draws only the header
-    /// below it).
+    /// row for the prompt its cursor types on, and never less than a control's
+    /// height at the text scale, since where it loops it is its own Pause/Play
+    /// control ([`Self::pause_control`]; the same floor while motion is reduced,
+    /// so the page does not re-flow as the loop stops); a color specimen keeps
+    /// one row above its palette swatches. A host never gives it less: a field
+    /// page that cannot pin it at this height lists it as the first stop of its
+    /// scrolling list instead, never dropping it, and [`Self::paint`] draws
+    /// only the header below it.
     pub(crate) fn minimum_height(&self, floor: f32) -> f32 {
         let spec = self.normalized();
         floor.max(match self.scene {
             PreviewScene::Typography => self.typography_height(1),
             PreviewScene::CursorMotion => {
-                preview_header_height(&spec) + 15.0 + spec.typography_row_height()
+                (preview_header_height(&spec) + 15.0 + spec.typography_row_height())
+                    .max(crate::native_settings::scaled_control_height())
             }
             PreviewScene::Appearance => {
                 preview_header_height(&spec)
@@ -2099,15 +2253,55 @@ impl SettingsPreviewSpec {
     /// with more room would only add empty terminal under the last one.
     /// `None` for the other scenes.
     pub(crate) fn whole_color_sample_height(&self) -> Option<f32> {
+        self.color_sample_height_at_most(f32::INFINITY)
+    }
+
+    /// The tallest color sample no taller than `height` whose rows end on a
+    /// row boundary: the card holds whole rows and no part-row of empty
+    /// terminal (one row at least, even past `height`). `None` for the other
+    /// scenes. [`Self::whole_color_sample_height`] and the least height
+    /// read the same formula.
+    pub(crate) fn color_sample_height_at_most(&self, height: f32) -> Option<f32> {
         (self.scene == PreviewScene::Appearance).then(|| {
             let spec = self.normalized();
-            (preview_header_height(&spec)
-                + 15.0
-                + appearance_terminal_floor(
-                    APPEARANCE_SPECIMEN_ROWS as f32 * spec.typography_row_height(),
-                ))
-            .ceil()
+            let row = spec.typography_row_height();
+            let at = |rows: usize| {
+                (preview_header_height(&spec) + 15.0 + appearance_terminal_floor(rows as f32 * row))
+                    .ceil()
+            };
+            (1..=APPEARANCE_SPECIMEN_ROWS)
+                .rev()
+                .map(at)
+                .find(|&tall| tall <= height + 0.01)
+                .unwrap_or_else(|| at(1))
         })
+    }
+
+    /// The tallest preview no taller than `height` whose specimen ends on a
+    /// whole row, never under its least ([`Self::minimum_height`]): a host
+    /// cutting the preview to fit cuts whole rows, so no part-row of empty
+    /// terminal shows under the last one.
+    pub(crate) fn whole_rows_at_most(&self, height: f32) -> f32 {
+        let least = self.minimum_height(48.0);
+        let spec = self.normalized();
+        let row = spec.typography_row_height().max(1.0);
+        let fitted = match self.scene {
+            PreviewScene::Appearance => self.color_sample_height_at_most(height).unwrap_or(height),
+            PreviewScene::CursorMotion => {
+                let fixed = preview_header_height(&spec) + 15.0;
+                let rows = ((height - fixed) / row).floor().max(1.0);
+                (fixed + rows * row).ceil()
+            }
+            PreviewScene::Typography => {
+                let fixed = self.typography_height(0);
+                let rows = ((height - fixed) / row).floor().max(1.0);
+                fixed + rows * row
+            }
+            // The demo's window and the picture under the Wallpaper session
+            // fill whatever height they are given: no row is left part-empty.
+            PreviewScene::ThemeDemo | PreviewScene::Wallpaper => height,
+        };
+        fitted.min(height.max(least)).max(least)
     }
 
     /// A typography preview's height with `rows` whole specimen rows.
@@ -2133,13 +2327,25 @@ impl SettingsPreviewSpec {
     }
 
     fn row_height_at(&self, font_px: f32) -> f32 {
-        // Native layout is in logical points. One point of rounding headroom
-        // per row covers the renderer's device-pixel rounding at scales >=1;
-        // the size itself is never rounded here.
-        self.prepared_font
-            .specimen_cell_height(font_px, self.line_height, &self.variation_requests())
-            .map_or(font_px * self.line_height * 1.5, |height| height as f32)
-            + 1.0
+        // Native layout is in logical points; the specimen paints at the
+        // window's scale (`terminal_scale`), where the renderer rounds its
+        // cell to whole device pixels. The row pitch is that device cell back
+        // in points, and never under the 1x cell, so rows stay whole at both
+        // and a card counts every row it holds (a flat point of headroom per
+        // row lost a whole row on every card). The size itself is never
+        // rounded here.
+        let scale = finite_or(self.terminal_scale, 1.0).max(1.0);
+        let variations = self.variation_requests();
+        let at = |scale: f32| {
+            self.prepared_font
+                .specimen_cell_height(font_px * scale, self.line_height, &variations)
+                .map(|height| height as f32 / scale)
+        };
+        match (at(1.0), at(scale)) {
+            (Some(one), Some(device)) => one.max(device),
+            (Some(one), None) => one,
+            _ => font_px * self.line_height * 1.5,
+        }
     }
 
     /// Where the color specimen paints in `terminal`: its type size and
@@ -2375,23 +2581,81 @@ impl SettingsPreviewSpec {
         })
     }
 
+    /// The terminal body of a preview drawn in `rect`: under its header,
+    /// inside its inset ([`Self::paint`] draws the specimen there).
+    pub(crate) fn terminal_rect(&self, rect: LogicalRect) -> LogicalRect {
+        let header_h = preview_header_height(&self.normalized());
+        LogicalRect::new(
+            rect.x + PREVIEW_INSET,
+            rect.y + header_h + 5.0,
+            (rect.width - PREVIEW_INSET * 2.0).max(1.0),
+            (rect.height - header_h - PREVIEW_INSET - 5.0).max(1.0),
+        )
+    }
+
     /// What one tick of this preview's motion can repaint, of a node drawn
     /// in `rect`: a Themes demo's tick changes only its terminal grid (the
-    /// window, its strip and its shadow stay); every other scene, `rect`.
+    /// window, its strip and its shadow stay); a cursor scene only the
+    /// columns of its terminal body its specimen's frame spans (the cursor,
+    /// its trail and companion are drawn into that frame); every other scene
+    /// its terminal body. The header, its badge and the card stay: a change
+    /// to them is a change of spec, which the compiled tree's own diff
+    /// damages.
     pub(crate) fn tick_rect(&self, rect: LogicalRect) -> LogicalRect {
-        if self.scene != PreviewScene::ThemeDemo || rect.width <= 2.0 || rect.height <= 2.0 {
+        if rect.width <= 2.0 || rect.height <= 2.0 {
             return rect;
         }
-        Self::demo_grid_rect(rect).unwrap_or(rect)
+        match self.scene {
+            PreviewScene::ThemeDemo => Self::demo_grid_rect(rect).unwrap_or(rect),
+            PreviewScene::CursorMotion => {
+                let terminal = self.terminal_rect(rect);
+                let spec = self.normalized();
+                let scale = finite_or(spec.terminal_scale, 1.0).max(f32::EPSILON);
+                let frame = spec
+                    .prepared_font
+                    .specimen_cell_size(
+                        spec.font_px * scale,
+                        spec.line_height,
+                        &spec.variation_requests(),
+                    )
+                    .map(|(cell_w, _)| (CURSOR_SCENE_COLS * cell_w) as f32 / scale);
+                match frame {
+                    Some(width) => LogicalRect::new(
+                        terminal.x,
+                        terminal.y,
+                        (width + 1.0).min(terminal.width),
+                        terminal.height,
+                    ),
+                    None => terminal,
+                }
+            }
+            _ => self.terminal_rect(rect),
+        }
     }
 
     /// What changing this spec to `next` repaints of a node drawn in `rect`:
-    /// between two Themes demo specs that differ only in where the tape is,
-    /// whether it rests, or the face its grid is set in, the grid
-    /// ([`Self::tick_rect`]); any other change, `rect`.
+    /// nothing (an empty rect) between two that paint the same pixels; between
+    /// two Themes demo specs that differ only in where the tape is, whether it
+    /// rests, or the face its grid is set in, the grid ([`Self::tick_rect`]),
+    /// and between two other specs that differ only in their clock, what a
+    /// tick repaints; any other change, `rect`.
     pub(crate) fn repaint_rect(&self, next: &Self, rect: LogicalRect) -> LogicalRect {
+        // Two specs that paint the same pixels repaint nothing: a still
+        // preview whose phase moved on (every spec carries the page's clock)
+        // is not re-rastered on another preview's tick.
+        if self.paint_fingerprint() == next.paint_fingerprint() {
+            return LogicalRect::new(rect.x, rect.y, 0.0, 0.0);
+        }
         if self.scene != PreviewScene::ThemeDemo || next.scene != PreviewScene::ThemeDemo {
-            return rect;
+            // A moving specimen whose only change is where its clock is
+            // repaints what a tick does.
+            let mut moved = self.clone();
+            moved.phase_ms = next.phase_ms;
+            return if moved == *next {
+                self.tick_rect(rect)
+            } else {
+                rect
+            };
         }
         let mut moved = self.clone();
         moved.demo.phase_ms = next.demo.phase_ms;
@@ -2494,7 +2758,7 @@ impl SettingsPreviewSpec {
             color: rgba(roles.separator, 190),
         });
 
-        let inset = 10.0;
+        let inset = PREVIEW_INSET;
         let header_h = preview_header_height(&spec);
         let caption_size = TypeStep::Caption
             .px(13.75)
@@ -2507,7 +2771,35 @@ impl SettingsPreviewSpec {
             scene_badge,
             caption_size.get(),
         );
-        let available = (rect.width - inset * 2.0).max(0.0);
+        // A looping preview is its own Pause/Play control: its glyph sits at
+        // the header's right edge and the state badge yields that slot.
+        let control_reserve = if spec.pause_control() {
+            PAUSE_GLYPH_W + 6.0
+        } else {
+            0.0
+        };
+        if spec.pause_control() {
+            paint_pause_glyph(
+                prims,
+                rect.right() - inset - PAUSE_GLYPH_W,
+                rect.y + 4.0,
+                header_h,
+                spec.holds_pause(),
+                roles.text_secondary,
+            );
+            if spec.focused {
+                prims.push(DrawPrim::Stroke {
+                    x: rect.x + 1.0,
+                    y: rect.y + 1.0,
+                    w: (rect.width - 2.0).max(0.0),
+                    h: (rect.height - 2.0).max(0.0),
+                    radius: 10.0,
+                    width: 2.0,
+                    color: rgba(roles.accent, 255),
+                });
+            }
+        }
+        let available = (rect.width - inset * 2.0 - control_reserve).max(0.0);
         let measure = |s: &str| {
             crate::tray_raster::ui_text_width_for(TextFace::UiBold, s, caption_size.get())
         };
@@ -2581,7 +2873,7 @@ impl SettingsPreviewSpec {
             ));
         }
         prims.push(text_prim(
-            (rect.right() - inset - state_width).max(rect.x + inset),
+            header_state_x(rect, inset, control_reserve, state_width),
             caption_y,
             state,
             caption_size,
@@ -2597,12 +2889,7 @@ impl SettingsPreviewSpec {
             ),
         ));
 
-        let terminal = LogicalRect::new(
-            rect.x + inset,
-            rect.y + header_h + 5.0,
-            (rect.width - inset * 2.0).max(1.0),
-            (rect.height - header_h - inset - 5.0).max(1.0),
-        );
+        let terminal = spec.terminal_rect(rect);
         let terminal_theme = spec
             .terminal_theme
             .map_or(theme, PreviewTerminalTheme::into_theme);
@@ -2748,6 +3035,8 @@ impl SettingsPreviewSpec {
     fn state_badge(&self) -> String {
         if self.reduction_suppresses_motion() {
             self.pause.badge()
+        } else if self.holds_pause() {
+            PreviewPause::Viewer.badge()
         } else {
             match self.animation() {
                 PreviewAnimation::None => match self.scene {
@@ -2942,6 +3231,8 @@ impl SettingsPreviewSpec {
     fn compact_state_badge(&self) -> String {
         if self.reduction_suppresses_motion() {
             self.pause.badge()
+        } else if self.holds_pause() {
+            PreviewPause::Viewer.badge()
         } else if let Some(effect) = self.focused_idle() {
             effect
         } else {
@@ -2959,7 +3250,20 @@ impl SettingsPreviewSpec {
     }
 }
 
-const TYPOGRAPHY_SPECIMEN_ROWS: usize = 5;
+/// The text specimen's rows a card buys ([`SettingsPreviewSpec::preferred_height`]):
+/// its five core rows (ANSI and weights, ligatures and the cursor, underline,
+/// wide and symbol glyphs, emoji). A large size grows the card to keep them.
+const TYPOGRAPHY_KEPT_ROWS: usize = 5;
+
+/// The rows the text specimen holds: the five it keeps, then font proof
+/// (confusables, more ligatures, box and block glyphs that show line-height
+/// seams, accents, digits and symbols), so a pinned card the width class
+/// sizes is filled with whole rows instead of empty terminal under row five.
+const TYPOGRAPHY_SPECIMEN_ROWS: usize = 10;
+
+/// The inset a preview's terminal body keeps from the card's sides and
+/// bottom ([`SettingsPreviewSpec::terminal_rect`]).
+const PREVIEW_INSET: f32 = 10.0;
 
 fn preview_header_height(spec: &SettingsPreviewSpec) -> f32 {
     if spec.scene == PreviewScene::Typography {
@@ -3092,7 +3396,7 @@ fn paint_platform_window_controls(
             h: 7.0,
             radius: 1.0,
             width: 1.0,
-            color: rgba(ink, 210),
+            color: rgba(ink, 255),
         });
         22.0
     }
@@ -3130,22 +3434,24 @@ struct WindowSampleTone {
 }
 
 /// The contrast with the specimen's background under which the window
-/// sample's bar draws a rim: Default Light's band is 1.2:1 off its page and
-/// the stock light fill 1.04:1, where Default's band is 1.43:1 off its page
-/// and reads without one.
+/// sample's bar draws a rim: Default Light's band is 1.2:1 off its page, the
+/// stock light fill 1.12:1 off white and the stock dark fill 1.03:1 off One
+/// Dark, where Default's band is 1.43:1 off its page and reads without one.
 const WINDOW_SAMPLE_RIM_BELOW: f64 = 1.3;
 
 /// The window sample's tones. Under Auto on Windows
 /// ([`WINDOW_SAMPLE_WEARS_THE_BAND`]) the fill is the candidate's tab-band tone
 /// (`tab_bar::strip_sample`, from its palette's hues and the chrome it
 /// authors), the colour the real caption wears, and its rim is the band's
-/// seam, the hairline the window draws where its band meets the grid. A
-/// forced Light or Dark on Windows is the stock caption, its rim the seam
-/// rule over the stock fill (Windows 11's 1-px window border). Either draws
-/// its rim only where the fill sits within [`WINDOW_SAMPLE_RIM_BELOW`] of the
-/// specimen's background: without it Default Light's sample showed only its
-/// glyphs. Elsewhere the stock fill alone. The ink is
-/// [`window_chrome_text_color`], floored to 4.5:1 on the fill.
+/// seam, the hairline the window draws where its band meets the grid.
+/// Elsewhere the stock fill, its rim the seam rule over it (Windows 11's
+/// 1-px window border). Either draws its rim only where the fill sits within
+/// [`WINDOW_SAMPLE_RIM_BELOW`] of the specimen's background, at 3:1 or more
+/// against it: without it Default Light's sample showed only its glyphs, and
+/// the stock light bar on a white terminal only its dots. The ink is
+/// [`window_chrome_text_color`], floored to 4.5:1 on the fill, and painted
+/// opaque: the compositors blend in linear light, which lifts a translucent
+/// ink toward the light end (alpha 210 read 2.93:1 on the light bar).
 fn window_sample_tone(
     spec: &SettingsPreviewSpec,
     candidate: &PreviewTerminalTheme,
@@ -3156,20 +3462,23 @@ fn window_sample_tone(
     let auto = !matches!(spec.appearance.window_theme.as_str(), "light" | "dark");
     let page = crate::settings::u32_rgb(candidate.bg);
     let ink_on = |fill: [u8; 3]| ensure_contrast(window_chrome_text_color(light), fill, 4.5);
-    let rim = |fill: [u8; 3], seam: [u8; 3]| {
-        (WINDOW_SAMPLE_WEARS_THE_BAND && contrast(fill, page) < WINDOW_SAMPLE_RIM_BELOW)
-            .then_some(seam)
-    };
+    // A bar that hardly stands off the specimen (a light bar on a white
+    // terminal, a dark one on One Dark) draws a 1px rim where it meets it,
+    // conditioned to 3:1 against the specimen, on every platform: without it
+    // the sample stops reading as a window exactly when the window's side
+    // matches the theme, the common case.
+    let indistinct = |fill: [u8; 3]| contrast(fill, page) < WINDOW_SAMPLE_RIM_BELOW;
     if WINDOW_SAMPLE_WEARS_THE_BAND && auto {
         let strip = crate::tab_bar::strip_sample(crate::chrome_band::ChromePalette {
             theme: candidate.into_theme(),
             ansi: Some(demo_ansi_hues(candidate)),
             authored: spec.demo.chrome,
         });
+        // The real window's own hairline, as it draws it.
         return WindowSampleTone {
             fill: strip.band,
             ink: ink_on(strip.band),
-            edge: rim(strip.band, strip.seam),
+            edge: indistinct(strip.band).then_some(strip.seam),
         };
     }
     let fill = if light {
@@ -3186,7 +3495,7 @@ fn window_sample_tone(
     WindowSampleTone {
         fill,
         ink,
-        edge: rim(fill, seam),
+        edge: indistinct(fill).then(|| ensure_contrast(seam, page, 3.0)),
     }
 }
 
@@ -3199,29 +3508,21 @@ fn theme_bg_is_dark(bg: u32) -> bool {
     aterm_render::theme_is_dark(bg)
 }
 
-/// Whether this platform's Auto window appearance follows the TERMINAL THEME
-/// rather than the OS. Linux does (`chrome_theme_for_apprt`/`chrome_palette_theme`;
-/// no live OS-appearance feed exists under winit's Wayland backend), and so does
-/// Windows, whose caption resolves Auto from the terminal background
-/// (`platform_win::resolve_chrome_theme`, the dropdown's "Match terminal
-/// (default)"). macOS follows the system.
-const AUTO_WINDOW_FOLLOWS_TERMINAL: bool = cfg!(any(target_os = "linux", windows));
-
 /// The light/dark side the WINDOW SAMPLE paints for the spec's `window_theme`.
-/// Explicit Light/Dark is itself. Auto is the PLATFORM truth: macOS follows the
-/// live system appearance (`system_dark`), while Linux and Windows follow the
-/// candidate TERMINAL THEME's darkness ([`AUTO_WINDOW_FOLLOWS_TERMINAL`]) — the
-/// resolution the shipping chrome actually uses there. The Themes stage
-/// ([`SettingsPreviewSpec::window_follows_theme`]) takes the candidate's side on
-/// every platform: its sample is the theme, not the OS.
+/// Explicit Light/Dark is itself. Auto is the side the real title bar takes,
+/// the candidate TERMINAL THEME's, on every platform: macOS draws its
+/// transparent title bar over the renderer on a window whose background is
+/// the theme's (`window_set_background_color`, the strip's `set_strip_dark`
+/// from [`aterm_render::theme_is_dark`]; only menus, sheets and alerts follow
+/// the OS), Windows resolves its caption from the terminal background
+/// (`platform_win::resolve_chrome_theme`), and Linux from the terminal theme
+/// (`chrome_theme_for_apprt`). One rule, so the Appearance and Top previews
+/// and the Themes demo draw the same bar for the same theme.
 fn window_sample_light(spec: &SettingsPreviewSpec, terminal_theme: Theme) -> bool {
     match spec.appearance.window_theme.as_str() {
         "light" => true,
         "dark" => false,
-        _ if spec.window_follows_theme || AUTO_WINDOW_FOLLOWS_TERMINAL => {
-            !theme_bg_is_dark(terminal_theme.bg)
-        }
-        _ => !spec.system_dark,
+        _ => !theme_bg_is_dark(terminal_theme.bg),
     }
 }
 
@@ -3374,13 +3675,17 @@ fn paint_window_theme_sample(
             APPEARANCE_WINDOW_SAMPLE_HEIGHT,
             tone.ink,
         );
+        // Opaque (see [`window_sample_tone`]), and centred on a whole point
+        // so the 2pt line covers whole pixel rows instead of three half-lit
+        // ones.
+        let line_y = terminal.y + (APPEARANCE_WINDOW_SAMPLE_HEIGHT / 2.0).round();
         prims.push(DrawPrim::Line {
             x1: x + title_inset,
-            y1: terminal.y + APPEARANCE_WINDOW_SAMPLE_HEIGHT / 2.0,
+            y1: line_y,
             x2: terminal.right() - 8.0,
-            y2: terminal.y + APPEARANCE_WINDOW_SAMPLE_HEIGHT / 2.0,
+            y2: line_y,
             width: 2.0,
-            color: rgba(tone.ink, 210),
+            color: rgba(tone.ink, 255),
         });
     }
 
@@ -3495,12 +3800,21 @@ fn build_terminal_specimen_input_grid(
     use aterm_core::selection::{SelectionSide, SelectionType};
     use aterm_core::terminal::{CursorStyle, Terminal};
 
+    // The five core rows first (a short card keeps them), then font proof
+    // for a card with room: confusables, more ligatures, box and block
+    // glyphs (they show line-height seams), accents and digits. Every row
+    // fits SPECIMEN_COLS.
     const FULL_SOURCE: &str = concat!(
         "\u{1b}[34mANSI 4 \u{1b}[1mBOLD\u{1b}[0m \u{1b}[2mFAINT\u{1b}[0m\r\n",
         "!= => -> \u{1b}[3mITAL\u{1b}[0m \u{1b}[1;3mB+I\u{1b}[0m cursor\r\n",
         "\u{1b}[4mgypq_j underline\u{1b}[0m\r\n",
         "CJK 你好  symbols ∑✓♥\r\n",
-        "emoji 😀 🚀 👩‍💻"
+        "emoji 😀 🚀 👩‍💻\r\n",
+        "0O 1lI| {}[]() ;:,.\r\n",
+        "<= >= === !== |> :: ->>\r\n",
+        "┌─┬─┐ ▁▂▃▅▇█ ░▒▓\r\n",
+        "Ünïcödé àéîõ ß ﬁ\r\n",
+        "0123456789 $%&@#~^"
     );
     let cursor_scene = spec.scene == PreviewScene::CursorMotion;
     let (rows, source) = match spec.scene {
@@ -3842,6 +4156,12 @@ const CURSOR_SCENE_HOLD_MS: u64 = 15 * MOTION_STEP_MS;
 const CURSOR_SCENE_CYCLE_MS: u64 = CURSOR_SCENE_KEYS * KEY_MS + CURSOR_SCENE_HOLD_MS;
 const _: () = assert!(CURSOR_SCENE_CYCLE_MS.is_multiple_of(MOTION_STEP_MS));
 
+/// The step a viewer-paused cursor scene holds: the second key after the Tab
+/// lands, so the typed trail and the Tab's jump light are both warm on the one
+/// still frame (`a_paused_preview_holds_the_trail_mid_line`).
+const CURSOR_SCENE_PAUSE_MS: u64 = (CURSOR_SCENE_TAB.0 as u64 + 3) * KEY_MS;
+const _: () = assert!(CURSOR_SCENE_PAUSE_MS < CURSOR_SCENE_KEYS * KEY_MS);
+
 /// Cycles the scene's engines play before the one shown, so the shown one
 /// opens as warm as a terminal that has been typing this way: Fire's coal
 /// bed and forge metal, the typing glow and the cadence chain carry the
@@ -3956,6 +4276,9 @@ pub(crate) struct CursorScene {
     phase_ms: u64,
     /// The scripted typing plays; otherwise the line stands finished and still.
     typing: bool,
+    /// The viewer paused the loop: the script plays to one fixed step
+    /// ([`CURSOR_SCENE_PAUSE_MS`]) and holds there, trail lit.
+    held: bool,
     /// The blink phase (and the cursor style) show the caret.
     caret_shown: bool,
     companion: SceneCompanion,
@@ -4037,6 +4360,7 @@ impl CursorScene {
         use std::hash::{Hash, Hasher};
 
         let sprite_diagnostic = spec.focused_key == crate::prefs::EDIT_CURSOR_NYAN_SPRITE;
+        let held = spec.holds_pause();
         let companion = if !spec.cursor.trail_enabled {
             SceneCompanion::None
         } else if sprite_diagnostic {
@@ -4083,8 +4407,13 @@ impl CursorScene {
             cursor: spec.cursor.clone(),
             post_fx: spec.post_fx.clone(),
             theme,
-            phase_ms: spec.phase_ms % CURSOR_SCENE_CYCLE_MS,
-            typing: spec.animation() == PreviewAnimation::Continuous,
+            phase_ms: if held {
+                CURSOR_SCENE_PAUSE_MS
+            } else {
+                spec.phase_ms % CURSOR_SCENE_CYCLE_MS
+            },
+            typing: held || spec.animation() == PreviewAnimation::Continuous,
+            held,
             caret_shown: spec.cursor_visible(),
             companion,
             flying_earned: companion == SceneCompanion::FlyingKitty && !sprite_diagnostic,
@@ -4094,9 +4423,10 @@ impl CursorScene {
         }
     }
 
-    /// The scripted typing plays, so every frame differs.
+    /// The scripted typing plays, so every frame differs (a held pause plays
+    /// it to one frame and stays there).
     pub(crate) fn is_moving(&self) -> bool {
-        self.typing
+        self.typing && !self.held
     }
 
     /// The cycles played before the shown one ([`CURSOR_SCENE_WARM_CYCLES`]).
@@ -4181,7 +4511,6 @@ impl CursorScene {
                 cursor_style: input.cursor_style,
             };
             cat = self.play(&mut input, &stage, cell);
-            self.post_glow(&mut input, geom, caret);
         }
         let settled_ms = if self.typing {
             offset - scene_last_key_ms(offset)
@@ -4366,6 +4695,7 @@ impl CursorScene {
             color: self
                 .cursor
                 .color
+                .knob(self.theme.cursor)
                 .unwrap_or(crate::cursor_glow::COMET_DEFAULT_COLOR),
             // Ignited per frame from the typing cadence, as in a window.
             intensity: 0.0,
@@ -4378,7 +4708,8 @@ impl CursorScene {
             &mut glow,
             &mut comet,
             self.theme.cursor,
-            self.cursor.color.is_some(),
+            self.cursor.cursor_color_pinned,
+            self.cursor.color,
             self.cursor.accent.is_some(),
         );
         let frame = fx.tick(
@@ -4391,13 +4722,17 @@ impl CursorScene {
                 live_cursor: self.theme.cursor,
                 cursor_color_pinned: self.cursor.cursor_color_pinned,
                 default_bg: self.theme.bg,
+                // The scene's caret sits on the page.
+                cursor_cell_bg: None,
                 geom: stage.geom,
                 focused: true,
-                amplitude: 1.0,
                 shed_envelope: 1.0,
+                // The Trail intensity dial dims the comet's bed as the
+                // terminal's does.
+                trail_brightness: glow.intensity,
                 body_allowed: true,
                 momentum_glow: self.cursor.trail_enabled && self.cursor.momentum_glow,
-                user_tinted: self.cursor.color.is_some(),
+                user_tinted: self.cursor.color.chosen(),
             },
             &glow,
             comet,
@@ -4463,36 +4798,6 @@ impl CursorScene {
             aterm_render::hdr::sdr_glow_budget(luma, self.post_fx.sdr_boost)
         };
         aterm_render::bloom::sdr_crown(frame, &input.cursor_glow_add, input.rows, budget)
-    }
-
-    /// The portable stand-in for the GPU-only fire shimmer: additive light,
-    /// so like the real thing it only shows on a dark ground. The bloom is
-    /// the live kernel, run over the rendered frame
-    /// ([`aterm_render::bloom`], `tray_raster::render_specimen_frame`).
-    fn post_glow(&self, input: &mut RenderInput, geom: Geom, caret: (u16, u16)) {
-        if !input.cursor_visible {
-            return;
-        }
-        let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        let cx = f32::from(caret.1) * cw + cw * 0.5;
-        if self.post_fx.fire_shimmer && self.cursor.trail_style == PreviewTrailStyle::Fire {
-            let wobble =
-                (((self.phase_ms / MOTION_STEP_MS) % 5) as f32 - 2.0) * (cw / 8.0).max(1.0);
-            let (row, y) = if caret.0 > 0 {
-                (caret.0 - 1, (f32::from(caret.0) * ch - 3.0).max(0.0))
-            } else {
-                (0, 1.0)
-            };
-            input.cursor_glow_add.push(GlowQuad::flat(
-                row,
-                (cx - cw * 0.8 + wobble).max(0.0) as u16,
-                y as u16,
-                (cw * 1.6).max(1.0) as u16,
-                2,
-                aterm_render::premul_rgb(0x00FF_8A24, 80),
-                0,
-            ));
-        }
     }
 
     /// Draw the companion beside the caret on its row: the pet stands at its
@@ -4703,6 +5008,9 @@ impl CursorScene {
                             motes: [None; PET_MOTES_MAX],
                             departures: [None; PET_DEPARTURES_MAX],
                         },
+                        // The preview's pet throws no motes, so no ink of
+                        // the paper law's is ever chosen here.
+                        page: None,
                     },
                     sprites,
                 );
@@ -4731,6 +5039,7 @@ impl CursorScene {
                         look,
                         colors,
                         bob,
+                        lift: 0.0,
                         alpha,
                         pose: aterm_effects::kitty_cursor::CatPose {
                             scale_x: pose.scale_x * fit,
@@ -4765,8 +5074,67 @@ fn hash_trimmed_lowercase<H: std::hash::Hasher>(value: &str, hash: &mut H) {
     H::write_u8(hash, 0xff);
 }
 
+/// Where a preview header's state label starts: flush with the right inset,
+/// left of the Pause/Play control's slot when the preview carries one
+/// (`control_reserve`, the glyph and its gap; `0` without a control), and
+/// never left of the left inset. The label's width was already fitted to the
+/// room left of that slot, so the two never overlap
+/// (`the_header_state_never_runs_under_the_pause_control`).
+fn header_state_x(rect: LogicalRect, inset: f32, control_reserve: f32, state_width: f32) -> f32 {
+    (rect.right() - inset - control_reserve - state_width).max(rect.x + inset)
+}
+
+/// The Pause (two bars) or Play (an outline triangle) glyph the header shows
+/// for a looping preview: what activating the card will do.
+fn paint_pause_glyph(
+    prims: &mut Vec<DrawPrim>,
+    x: f32,
+    y: f32,
+    header_h: f32,
+    paused: bool,
+    color: [u8; 3],
+) {
+    let cy = y + header_h * 0.5 - 2.0;
+    if paused {
+        let (left, right) = (x + 3.0, x + PAUSE_GLYPH_W - 2.0);
+        for (x1, y1, x2, y2) in [
+            (left, cy - 5.0, left, cy + 5.0),
+            (left, cy - 5.0, right, cy),
+            (left, cy + 5.0, right, cy),
+        ] {
+            prims.push(DrawPrim::Line {
+                x1,
+                y1,
+                x2,
+                y2,
+                width: 1.75,
+                color: rgba(color, 235),
+            });
+        }
+    } else {
+        // Two bars, drawn as strokes so the card keeps its two panels (the
+        // card and the terminal canvas).
+        for bar_x in [x + 4.5, x + PAUSE_GLYPH_W - 4.5] {
+            prims.push(DrawPrim::Line {
+                x1: bar_x,
+                y1: cy - 5.0,
+                x2: bar_x,
+                y2: cy + 5.0,
+                width: 3.0,
+                color: rgba(color, 220),
+            });
+        }
+    }
+}
+
+/// The least height a preview card is drawn at ([`preview_node`]).
+const PREVIEW_NODE_LEAST: f32 = 96.0;
+
 /// Canonical construction helper for Settings workbenches. The returned node is
 /// a single semantic object with stable bounds regardless of visual settings.
+/// A looping cursor preview is also its own Pause/Play control
+/// ([`SettingsPreviewSpec::pause_action`]): activating the card (pointer,
+/// Space/Return, or the accessibility Click) invokes [`PREVIEW_PAUSE_ACTION`].
 pub(crate) fn preview_node(
     key: impl Into<std::sync::Arc<str>>,
     spec: SettingsPreviewSpec,
@@ -4775,7 +5143,7 @@ pub(crate) fn preview_node(
     UiNode::new(key, UiContent::SettingsPreview(Box::new(spec))).layout(
         Layout::default()
             .width(Length::Fill)
-            .height(Length::Fixed(height.max(96.0)))
+            .height(Length::Fixed(height.max(PREVIEW_NODE_LEAST)))
             .padding(Insets::default())
             .clipped(),
     )
@@ -5491,8 +5859,32 @@ mod tests {
         raster_of(&prims)
     }
 
+    /// The bytes at which `left` and `right` differ, over their common length.
     fn differences(left: &[u8], right: &[u8]) -> usize {
-        left.iter().zip(right).filter(|(a, b)| a != b).count()
+        differences_up_to(left, right, usize::MAX)
+    }
+
+    /// [`differences`], counted no further than `cap`: `cap` once there are
+    /// that many. Blocks that match are passed by one slice compare and only
+    /// a block that differs is counted byte by byte (test-run speed: the
+    /// byte-by-byte count over whole 360x160 frames at opt-level 0 was two
+    /// thirds of `every_listed_cursor_style_is_a_look_of_its_own_at_every_card_size`).
+    fn differences_up_to(left: &[u8], right: &[u8], cap: usize) -> usize {
+        const BLOCK: usize = 256;
+        let common = left.len().min(right.len());
+        let mut counted = 0usize;
+        for (a, b) in left[..common]
+            .chunks(BLOCK)
+            .zip(right[..common].chunks(BLOCK))
+        {
+            if a != b {
+                counted += a.iter().zip(b).filter(|(x, y)| x != y).count();
+                if counted >= cap {
+                    return cap;
+                }
+            }
+        }
+        counted
     }
 
     fn panel_fill(prims: &[DrawPrim], wanted_radius: f32) -> [u8; 4] {
@@ -5576,6 +5968,95 @@ mod tests {
                 "preview state stays inside its right inset"
             );
         }
+    }
+
+    /// THE HEADER'S STATE NEVER RUNS UNDER THE PAUSE CONTROL: on every looping
+    /// cursor preview (playing, held, and a style being tried, as the Cursor
+    /// Styles page shows it), at 1x and 2x text and from a phone-width card
+    /// to a wide one, the state label ends left of the Pause/Play glyph with a
+    /// gap. Negative control: the same label placed with no room kept for the
+    /// control runs under the glyph.
+    #[test]
+    fn the_header_state_never_runs_under_the_pause_control() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        let roles = Roles::from_theme(Theme::default());
+        let specs = [
+            SettingsPreviewSpec::default().with_phase(300),
+            SettingsPreviewSpec::default()
+                .with_phase(300)
+                .with_paused(true),
+            SettingsPreviewSpec::default()
+                .with_phase(900)
+                .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "sparkle")
+                .with_style_trial(true),
+        ];
+        let mut checked = 0;
+        for scale in [1.0_f32, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for width in [254.5_f32, 420.0, 720.0] {
+                let rect = LogicalRect::new(16.0, 40.0, width, 220.0);
+                for spec in &specs {
+                    assert!(spec.pause_control(), "fixture: a looping preview");
+                    let header_bottom = spec.terminal_rect(rect).y;
+                    let mut prims = Vec::new();
+                    spec.paint(&mut prims, rect, Theme::default(), roles);
+                    let slot = rect.right() - PREVIEW_INSET - PAUSE_GLYPH_W;
+                    let glyph_left = prims
+                        .iter()
+                        .filter_map(|prim| match prim {
+                            DrawPrim::Line {
+                                x1,
+                                x2,
+                                y1,
+                                y2,
+                                width,
+                                ..
+                            } if y1.max(*y2) <= header_bottom && x1.min(*x2) >= slot - 0.01 => {
+                                Some(x1.min(*x2) - width * 0.5)
+                            }
+                            _ => None,
+                        })
+                        .fold(f32::MAX, f32::min);
+                    assert!(glyph_left < f32::MAX, "the preview draws its control");
+                    let (x, state, px) = prims
+                        .iter()
+                        .filter_map(|prim| match prim {
+                            DrawPrim::Text {
+                                x,
+                                baseline,
+                                s,
+                                px,
+                                face,
+                                ..
+                            } if *face == TextFace::UiBold && *baseline <= header_bottom => {
+                                Some((*x, s.clone(), *px))
+                            }
+                            _ => None,
+                        })
+                        .next_back()
+                        .expect("the header says its state");
+                    let state_width =
+                        crate::tray_raster::ui_text_width_for(TextFace::UiBold, &state, px);
+                    assert!(
+                        x + state_width + 2.0 <= glyph_left,
+                        "{scale}x, {width}pt: {state:?} ends at {:.1}, the control starts at \
+                         {glyph_left:.1}",
+                        x + state_width
+                    );
+                    let unreserved = header_state_x(rect, PREVIEW_INSET, 0.0, state_width);
+                    assert!(
+                        unreserved + state_width > glyph_left,
+                        "control: {state:?} with no room kept for the control must run under it"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+        assert_eq!(checked, 18);
     }
 
     #[test]
@@ -5903,8 +6384,11 @@ mod tests {
                     .collect();
                 for (i, a) in styles.iter().enumerate() {
                     for (j, b) in styles.iter().enumerate().skip(i + 1) {
+                        // Counted as far as the rule reads: 41 pixels' bytes
+                        // are more than 40 pixels, and a count under them
+                        // is whole.
                         let apart = (0..PHASES.len())
-                            .map(|p| differences(&frames[i][p], &frames[j][p]) / 4)
+                            .map(|p| differences_up_to(&frames[i][p], &frames[j][p], 4 * 41) / 4)
                             .max()
                             .unwrap_or(0);
                         assert!(
@@ -6251,63 +6735,16 @@ mod tests {
         );
     }
 
+    /// The window sample follows the TERMINAL THEME under Auto on every
+    /// platform, the side the real title bar takes (macOS draws a transparent
+    /// title bar over the renderer on a theme-coloured window; Windows and
+    /// Linux resolve their chrome from the terminal): a dark palette draws a
+    /// dark sample and a light one a light sample, the spoken words name that
+    /// side, and nothing about the host's appearance reaches the spec. The
+    /// Appearance preview and the Themes demo draw the same bar for the same
+    /// theme. An explicit appearance is independent of the palette.
     #[test]
-    #[cfg(not(any(target_os = "linux", windows)))]
-    fn automatic_window_samples_follow_the_os_not_the_terminal_palette() {
-        // Deliberately pair a dark terminal palette with OS Light, then flip
-        // only the host appearance. Auto must repaint both preview scenes.
-        let appearance_light = SettingsPreviewSpec::appearance(14.0)
-            .with_terminal_theme(NORD)
-            .with_system_dark(false);
-        let appearance_dark = appearance_light.clone().with_system_dark(true);
-        assert!(
-            differences(
-                &pixels(appearance_light.clone()),
-                &pixels(appearance_dark.clone())
-            ) > 40
-        );
-        assert_ne!(
-            appearance_light.paint_fingerprint(),
-            appearance_dark.paint_fingerprint()
-        );
-
-        // An explicit appearance is independent of the OS side of Auto.
-        let explicit = appearance_light.with_appearance(AppearancePreviewSpec {
-            window_theme: "dark".to_string(),
-            ..AppearancePreviewSpec::default()
-        });
-        let explicit_flip = explicit.clone().with_system_dark(true);
-        // The flipped paint recomputes: the two specs resolve to one theme, so
-        // a plain second paint would be served the first one's specimen frame
-        // (and its engine snapshot) and prove nothing about whether the OS side
-        // of Auto reached the specimen at all.
-        assert_eq!(
-            differences(
-                &pixels(explicit.clone()),
-                &pixels_recomputed(explicit_flip.clone())
-            ),
-            0
-        );
-        assert_eq!(
-            explicit.paint_fingerprint(),
-            explicit_flip.paint_fingerprint()
-        );
-    }
-
-    /// The Linux and Windows window sample follows the terminal theme: winit's
-    /// Wayland backend never delivers `ThemeChanged`, so the shipping chrome
-    /// resolves Auto from the TERMINAL THEME's darkness (`chrome_theme_for_apprt`
-    /// / `chrome_palette_theme`), and Windows' caption resolves Auto from the
-    /// terminal background (`platform_win::resolve_chrome_theme`, the dropdown's
-    /// "Match terminal (default)") — and the window sample must tell that truth:
-    /// an OS appearance flip moves nothing, a terminal palette flip moves the
-    /// sample titlebar, and the spoken description names the terminal. Windows
-    /// used to draw its sample from the OS (a dark title bar over Default
-    /// Light on a dark desktop, the 2026-10-18 judges).
-    #[test]
-    #[cfg(any(target_os = "linux", windows))]
-    fn automatic_window_samples_follow_the_terminal_palette_on_linux_and_windows() {
-        // A light candidate palette, luminance-opposite to NORD.
+    fn automatic_window_samples_follow_the_terminal_palette() {
         let paper = PreviewTerminalTheme {
             fg: 0x33_3333,
             bg: 0xFA_FAFA,
@@ -6315,52 +6752,156 @@ mod tests {
             selection: 0xD0_D7DE,
             ..NORD
         };
-        let dark_palette = SettingsPreviewSpec::appearance(14.0)
-            .with_terminal_theme(NORD)
-            .with_system_dark(false);
-        // Flip ONLY the host OS appearance: Auto ignores it here — the pixels
-        // must not move (recomputed, so the check cannot be served the first
-        // paint's cached specimen and prove nothing).
-        let os_flip = dark_palette.clone().with_system_dark(true);
-        assert_eq!(
-            differences(&pixels(dark_palette.clone()), &pixels_recomputed(os_flip)),
-            0
-        );
-        // Flip the TERMINAL palette: Auto follows it.
-        let light_palette = dark_palette.clone().with_terminal_theme(paper);
-        // The sides, against the OS: a dark palette on a light desktop draws a
-        // dark sample, a light palette on a dark desktop a light one, and the
-        // description says so in the dropdown's words.
         let host = Theme::default();
+        let dark_palette = SettingsPreviewSpec::appearance(14.0).with_terminal_theme(NORD);
+        let light_palette = dark_palette.clone().with_terminal_theme(paper);
         assert!(!dark_palette.window_sample_is_light(host));
-        let light_on_dark_os = light_palette.clone().with_system_dark(true);
-        assert!(light_on_dark_os.window_sample_is_light(host));
+        assert!(light_palette.window_sample_is_light(host));
+        let side_words = if cfg!(target_os = "macos") {
+            "its title bar in the terminal theme's colors, currently Light"
+        } else {
+            "matches the terminal theme, currently Light"
+        };
         assert!(
-            light_on_dark_os
-                .semantic_value()
-                .contains("matches the terminal theme, currently Light"),
+            light_palette.semantic_value().contains(side_words),
             "{}",
-            light_on_dark_os.semantic_value()
+            light_palette.semantic_value()
         );
-        assert!(differences(&pixels(dark_palette.clone()), &pixels(light_palette)) > 40);
-
-        // An explicit appearance remains independent of both feeds.
-        let explicit = dark_palette.with_appearance(AppearancePreviewSpec {
-            window_theme: "dark".to_string(),
-            ..AppearancePreviewSpec::default()
-        });
-        let explicit_flip = explicit.clone().with_system_dark(true);
-        assert_eq!(
+        assert!(
             differences(
-                &pixels(explicit.clone()),
-                &pixels_recomputed(explicit_flip.clone())
-            ),
-            0
+                &pixels(dark_palette.clone()),
+                &pixels(light_palette.clone())
+            ) > 40
         );
+        // The Themes demo's sample takes the same side for the same theme.
+        let demo = SettingsPreviewSpec {
+            terminal_theme: Some(paper),
+            ..SettingsPreviewSpec::theme_demo(14.0, 0)
+        };
         assert_eq!(
-            explicit.paint_fingerprint(),
-            explicit_flip.paint_fingerprint()
+            demo.window_sample_is_light(host),
+            light_palette.window_sample_is_light(host)
         );
+        // An explicit appearance is independent of the palette: forced Dark
+        // over the light palette draws dark, and differs from Auto.
+        let explicit = light_palette
+            .clone()
+            .with_appearance(AppearancePreviewSpec {
+                window_theme: "dark".to_string(),
+                ..AppearancePreviewSpec::default()
+            });
+        assert!(!explicit.window_sample_is_light(host));
+        assert!(differences(&pixels(explicit), &pixels(light_palette)) > 40);
+    }
+
+    /// The window sample's title line and rim hold their contrast on both
+    /// sides, measured on the tray raster (which composites in linear light,
+    /// the trap that took the old alpha-210 line on the light bar to 2.93:1):
+    /// the title line 4.5:1 against the bar, and where the bar hardly stands
+    /// off the terminal (light on white, dark on One Dark) a rim 3:1 against
+    /// the terminal. Negative control: the old translucent line reads under
+    /// 3:1 by the same measure.
+    #[test]
+    fn window_sample_title_and_edge_hold_contrast_on_both_sides() {
+        let white = PreviewTerminalTheme {
+            fg: 0x24_292F,
+            bg: 0xFF_FFFF,
+            ..NORD
+        };
+        let one_dark = PreviewTerminalTheme {
+            fg: 0xAB_B2BF,
+            bg: 0x21_252B,
+            ..NORD
+        };
+        for (window_theme, theme, rimmed) in [
+            ("light", white, true),
+            ("dark", one_dark, true),
+            ("light", NORD, false),
+            ("dark", white, false),
+        ] {
+            let context = format!("{window_theme} over #{:06X}", theme.bg);
+            let spec = SettingsPreviewSpec::appearance(14.0)
+                .with_terminal_theme(theme)
+                .with_appearance(AppearancePreviewSpec {
+                    window_theme: window_theme.to_string(),
+                    ..AppearancePreviewSpec::default()
+                });
+            let prims = compiled(spec).tray(Theme::default(), 13.0).prims;
+            let (bar, fill) = prims
+                .iter()
+                .find_map(|prim| match prim {
+                    DrawPrim::Panel {
+                        x,
+                        y,
+                        w,
+                        h,
+                        radius,
+                        fill,
+                    } if *radius == 0.0 && (*h - APPEARANCE_WINDOW_SAMPLE_HEIGHT).abs() < 0.01 => {
+                        Some((
+                            LogicalRect::new(*x, *y, *w, *h),
+                            [fill[0], fill[1], fill[2]],
+                        ))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{context}: the window sample's bar"));
+            let raster = raster_of(&prims);
+            let rgb_at = |x: usize, y: usize| {
+                let at = (y * VIEWPORT.width as usize + x) * 4;
+                [raster[at], raster[at + 1], raster[at + 2]]
+            };
+            let page = crate::settings::u32_rgb(theme.bg);
+            // The title line: the most ink on the bar's middle rows.
+            let line = (bar.y as usize + 8..bar.y as usize + 12)
+                .flat_map(|y| (bar.x as usize + 50..bar.right() as usize - 12).map(move |x| (x, y)))
+                .map(|(x, y)| rgb_at(x, y))
+                .max_by(|a, b| {
+                    test_contrast_ratio(*a, fill).total_cmp(&test_contrast_ratio(*b, fill))
+                })
+                .expect("the title line");
+            assert!(
+                test_contrast_ratio(line, fill) >= 4.5,
+                "{context}: title line {line:?} on {fill:?} is {:.2}:1",
+                test_contrast_ratio(line, fill)
+            );
+            let rim = rgb_at(bar.x as usize, bar.y as usize + 9);
+            if rimmed {
+                assert!(
+                    test_contrast_ratio(rim, page) >= 3.0,
+                    "{context}: rim {rim:?} on {page:?} is {:.2}:1",
+                    test_contrast_ratio(rim, page)
+                );
+            }
+        }
+        // Negative control: the old line, alpha 210 over the light bar.
+        let old = vec![
+            DrawPrim::Panel {
+                x: 0.0,
+                y: 0.0,
+                w: 40.0,
+                h: 19.0,
+                radius: 0.0,
+                fill: rgba([0xF1, 0xF2, 0xF5], 255),
+            },
+            DrawPrim::Line {
+                x1: 0.0,
+                y1: 10.0,
+                x2: 40.0,
+                y2: 10.0,
+                width: 2.0,
+                color: rgba(window_chrome_text_color(true), 210),
+            },
+        ];
+        let raster = raster_of(&old);
+        let worst = (0..40)
+            .map(|x| {
+                let at = (10 * VIEWPORT.width as usize + x) * 4;
+                [raster[at], raster[at + 1], raster[at + 2]]
+            })
+            .map(|ink| test_contrast_ratio(ink, [0xF1, 0xF2, 0xF5]))
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 3.0, "the old line read {worst:.2}:1");
     }
 
     /// The window sample's fill, rim and title line, as one Appearance paint
@@ -6463,9 +7004,11 @@ mod tests {
     /// rim 1.5:1 or more off band and page, where the old stock `#F1F2F5` was
     /// 1.04:1 and only its glyphs showed (the 2026-10-18 judges); Default's
     /// band stands off its page alone. A forced Light or Dark keeps the stock
-    /// caption, rimmed the same way. Elsewhere the stock fill and no rim. The
-    /// title line clears 4.5:1 on every fill. Negative control: the stock
-    /// light fill on Default Light's page.
+    /// caption, rimmed the same way. Elsewhere the stock fill, rimmed at 3:1
+    /// against the page wherever it sits within 1.3:1 of it (the light bar on
+    /// a white terminal read 1.12:1 with no edge). The title line clears 4.5:1
+    /// on every fill. Negative control: the stock light fill on Default
+    /// Light's page.
     #[test]
     fn the_window_sample_wears_the_caption_tone_with_a_rim_on_windows() {
         let theme = |name: &str| {
@@ -6498,8 +7041,15 @@ mod tests {
                 assert_eq!(rim, rimmed.then_some(strip.seam));
                 assert!(contrast(fill, page(candidate)) > 1.1, "{fill:?}");
             } else {
-                assert_eq!(rim, None);
                 assert_ne!(fill, strip.band);
+                assert_eq!(
+                    rim.is_some(),
+                    contrast(fill, page(candidate)) < 1.3,
+                    "{fill:?}"
+                );
+                if let Some(rim) = rim {
+                    assert!(contrast(rim, page(candidate)) >= 3.0, "{rim:?}");
+                }
             }
             if let Some(rim) = rim {
                 assert!(contrast(rim, fill) >= 1.5, "{rim:?} on {fill:?}");
@@ -6535,7 +7085,11 @@ mod tests {
             let (fill, rim, line) = window_sample_tones(spec);
             assert_eq!(fill, stock);
             assert!(contrast(line, fill) >= 4.5);
-            assert_eq!(rim.is_some(), cfg!(windows), "{forced}");
+            assert_eq!(
+                rim.is_some(),
+                contrast(fill, page(candidate)) < 1.3,
+                "{forced}"
+            );
             if let Some(rim) = rim {
                 assert!(contrast(rim, fill) >= 1.5, "{rim:?} on {fill:?}");
             }
@@ -6592,6 +7146,293 @@ mod tests {
             assert!(*x >= rect.x && *x + *width <= rect.right() + 0.01);
             assert!(*y >= rect.y && *y + 6.0 <= rect.bottom() + 0.01);
         }
+    }
+
+    #[test]
+    fn a_region_under_an_opaque_specimen_rasters_the_same_bytes_drawing_less() {
+        // A preview tick rasters its specimen's region; the layers under an
+        // opaque frame (the backdrop, the card, the terminal panel) are not
+        // drawn there, and the bytes equal the full raster's, at 1x and 2x,
+        // for a moving cursor specimen and a still colour sample, over the
+        // frame exactly and over a region its edge crosses.
+        let _ = compiled(SettingsPreviewSpec::appearance(14.0));
+        let prepared = crate::tray_raster::prepare_semantic_font(
+            &crate::widget::SemanticFontCandidate::default(),
+        );
+        assert!(prepared.is_ready());
+        let roles = Roles::from_theme(Theme::default());
+        for scene in ["cursor", "appearance"] {
+            for scale in [1.0_f32, 2.0] {
+                let context = format!("{scene} at {scale}x");
+                let spec = match scene {
+                    "cursor" => {
+                        SettingsPreviewSpec::cursor(CursorPreviewSpec::default()).with_phase(780)
+                    }
+                    _ => SettingsPreviewSpec::appearance(14.0),
+                }
+                .with_prepared_font(prepared.clone());
+                let mut prims = vec![
+                    DrawPrim::Panel {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 480.0,
+                        h: 220.0,
+                        radius: 0.0,
+                        fill: rgba([0x22, 0x26, 0x30], 255),
+                    },
+                    DrawPrim::Panel {
+                        x: 12.0,
+                        y: 16.0,
+                        w: 456.0,
+                        h: 196.0,
+                        radius: 12.0,
+                        fill: rgba([0x40, 0x46, 0x52], 200),
+                    },
+                ];
+                let rect = LogicalRect::new(20.0, 30.0, 420.0, 156.0);
+                spec.paint(&mut prims, rect, Theme::default(), roles);
+                let (full, pw, _) =
+                    crate::tray_raster::rasterize_tray(&prims, 480, 220, scale, [0, 0, 0, 0]);
+                let crop = |region: crate::tray_raster::RasterRect| {
+                    let mut out = Vec::new();
+                    for row in region.y..region.y + region.height {
+                        let start = ((row * pw + region.x) * 4) as usize;
+                        out.extend_from_slice(&full[start..start + region.width as usize * 4]);
+                    }
+                    out
+                };
+                let tick = spec.tick_rect(rect);
+                let crossing = crate::tray_raster::RasterRect {
+                    x: (tick.x * scale).floor() as u32,
+                    y: (tick.y * scale).floor() as u32,
+                    width: ((tick.right() * scale).ceil() - (tick.x * scale).floor()) as u32,
+                    height: ((tick.bottom() * scale).ceil() - (tick.y * scale).floor()) as u32,
+                };
+                let covered = crate::tray_raster::occluded_rect_for_test(&prims, scale, crossing)
+                    .unwrap_or_else(|| panic!("{context}: the specimen covers its tick region"));
+                let exact = crate::tray_raster::RasterRect {
+                    x: covered.0 as u32,
+                    y: covered.1 as u32,
+                    width: (covered.2 - covered.0) as u32,
+                    height: (covered.3 - covered.1) as u32,
+                };
+                for (name, region) in [("exact", exact), ("crossing", crossing)] {
+                    crate::tray_raster::DRAWN_PRIMS.with(|drawn| drawn.set(0));
+                    let bytes = crate::tray_raster::rasterize_tray_region(
+                        &prims,
+                        scale,
+                        [0, 0, 0, 0],
+                        region,
+                    );
+                    assert!(
+                        bytes == crop(region),
+                        "{context} {name}: the culled bytes differ"
+                    );
+                    if name == "exact" {
+                        let drawn = crate::tray_raster::DRAWN_PRIMS.with(std::cell::Cell::get);
+                        let drawable = prims
+                            .iter()
+                            .filter(|prim| {
+                                !matches!(
+                                    prim,
+                                    DrawPrim::ClipPush { .. }
+                                        | DrawPrim::ClipPop
+                                        | DrawPrim::FadePush { .. }
+                                        | DrawPrim::FadePop
+                                )
+                            })
+                            .count() as u64;
+                        assert!(
+                            drawn < drawable,
+                            "{context}: {drawn} of {drawable} prims drawn under the frame"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Fractional clips use the exact device-space arithmetic of the
+        // canvas, including its rounding. At 1.25x this logical right edge
+        // rounds to 14 if added before scaling, but the canvas clips at 13.
+        // The background at column 13 must survive the specimen's culling.
+        let spec = SettingsPreviewSpec::appearance(14.0).with_prepared_font(prepared.clone());
+        let mut sample = Vec::new();
+        spec.paint(
+            &mut sample,
+            LogicalRect::new(0.0, 0.0, 420.0, 156.0),
+            Theme::default(),
+            roles,
+        );
+        let specimen = sample
+            .into_iter()
+            .find_map(|prim| match prim {
+                DrawPrim::TerminalSpecimen { spec, .. } => Some(DrawPrim::TerminalSpecimen {
+                    x: 0.0,
+                    y: 0.0,
+                    spec,
+                }),
+                _ => None,
+            })
+            .expect("the prepared specimen");
+        let backdrop = [0x22, 0x26, 0x30, 255];
+        let prims = vec![
+            DrawPrim::Panel {
+                x: 0.0,
+                y: 0.0,
+                w: 32.0,
+                h: 16.0,
+                radius: 0.0,
+                fill: backdrop,
+            },
+            DrawPrim::ClipPush {
+                x: 0.1,
+                y: 0.0,
+                w: 10.3,
+                h: 8.0,
+            },
+            specimen,
+            DrawPrim::ClipPop,
+        ];
+        let scale = 1.25;
+        let (full, stride, _) =
+            crate::tray_raster::rasterize_tray(&prims, 32, 16, scale, [0, 0, 0, 0]);
+        let region = crate::tray_raster::RasterRect {
+            x: 0,
+            y: 0,
+            width: 14,
+            height: 10,
+        };
+        assert!(
+            crate::tray_raster::occluded_rect_for_test(&prims, scale, region).is_some(),
+            "the fractional region selects the culling path"
+        );
+        let patch = crate::tray_raster::rasterize_tray_region(&prims, scale, [0, 0, 0, 0], region);
+        for row in 0..region.height as usize {
+            let from = row * stride as usize * 4;
+            let at = row * region.width as usize * 4;
+            assert_eq!(
+                &patch[at..at + region.width as usize * 4],
+                &full[from..from + region.width as usize * 4],
+                "fractional clip row {row} agrees with the full raster"
+            );
+            assert_eq!(
+                &patch[at + 13 * 4..at + 14 * 4],
+                &backdrop,
+                "the backdrop outside the specimen's actual clip survives"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_specimens_fill_their_card_with_whole_rows() {
+        // A pinned card keeps one height per width class; what it holds fills
+        // it with whole rows: the empty terminal under the last row is less
+        // than a row, unless the specimen has no row left to show.
+        let _ = compiled(SettingsPreviewSpec::appearance(14.0));
+        let prepared = crate::tray_raster::prepare_semantic_font(
+            &crate::widget::SemanticFontCandidate::default(),
+        );
+        assert!(prepared.is_ready());
+        let mut checked = 0;
+        for (scene, most) in [
+            ("typography", TYPOGRAPHY_SPECIMEN_ROWS),
+            ("cursor", CURSOR_SPECIMEN_ROWS),
+            ("appearance", APPEARANCE_SPECIMEN_ROWS),
+        ] {
+            for height in [108.0, 132.0, 156.0] {
+                for font_px in [10.0, 12.0, 14.0] {
+                    for line_height in [1.0, 1.2] {
+                        for dpi in [1.0, 2.0] {
+                            let mut spec = match scene {
+                                "typography" => SettingsPreviewSpec::typography(font_px)
+                                    .with_focus(crate::prefs::EDIT_FONT_FAMILY, "default"),
+                                "cursor" => SettingsPreviewSpec {
+                                    font_px,
+                                    ..SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
+                                },
+                                _ => SettingsPreviewSpec::appearance(font_px),
+                            }
+                            .with_prepared_font(prepared.clone());
+                            spec.line_height = line_height;
+                            spec.terminal_scale = dpi;
+                            spec.font_status = "committed renderer font cascade ready".to_string();
+                            let context =
+                                format!("{scene} {height}pt {font_px}px lh {line_height} {dpi}x");
+                            let mut prims = Vec::new();
+                            spec.paint(
+                                &mut prims,
+                                LogicalRect::new(0.0, 0.0, 720.0, height),
+                                Theme::default(),
+                                Roles::from_theme(Theme::default()),
+                            );
+                            let Some(terminal) = prims.iter().find_map(|prim| match prim {
+                                DrawPrim::Panel {
+                                    x, y, w, h, radius, ..
+                                } if *radius == 8.0 => Some(LogicalRect::new(*x, *y, *w, *h)),
+                                _ => None,
+                            }) else {
+                                continue;
+                            };
+                            let Some((y, specimen)) = prims.iter().find_map(|prim| match prim {
+                                DrawPrim::TerminalSpecimen { y, spec, .. } => Some((*y, spec)),
+                                _ => None,
+                            }) else {
+                                continue;
+                            };
+                            let normalized = spec.normalized();
+                            let pitch = normalized.row_height_at(specimen.font_px);
+                            let rows = specimen.input.rows.min(most);
+                            let shown = if scene == "cursor" {
+                                // The cursor grid keeps a blank row under its
+                                // prompt: count what the card's body holds.
+                                ((terminal.height / pitch).floor() as usize).min(most)
+                            } else {
+                                rows
+                            };
+                            let bottom = match scene {
+                                "typography" => terminal.bottom() - 4.0,
+                                "appearance" => appearance_specimen_clip(terminal).bottom(),
+                                _ => terminal.bottom(),
+                            };
+                            let band = bottom - (y + shown as f32 * pitch);
+                            assert!(band >= -0.01, "{context}: rows past the body by {band}");
+                            if shown < most {
+                                assert!(
+                                    band < pitch,
+                                    "{context}: {band}pt of empty terminal under {shown} rows (pitch {pitch})"
+                                );
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 50, "{checked}");
+        // Pinned: the row pitch is the renderer's cell, with no point of
+        // headroom that cost every card a row; and the 156pt text card holds
+        // the rows its height has (it stopped at five, three rows of empty
+        // terminal under them).
+        let text = SettingsPreviewSpec::typography(12.0)
+            .with_focus(crate::prefs::EDIT_FONT_FAMILY, "default")
+            .with_prepared_font(prepared.clone());
+        let cell = prepared.specimen_cell_height(12.0, 1.0, &[]).unwrap() as f32;
+        assert_eq!(text.normalized().row_height_at(12.0), cell);
+        let mut prims = Vec::new();
+        text.paint(
+            &mut prims,
+            LogicalRect::new(0.0, 0.0, 720.0, 156.0),
+            Theme::default(),
+            Roles::from_theme(Theme::default()),
+        );
+        let rows = prims
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::TerminalSpecimen { spec, .. } => Some(spec.input.rows),
+                _ => None,
+            })
+            .expect("the text specimen");
+        assert!(rows >= 7, "a 156pt text card shows {rows} rows");
     }
 
     #[test]
@@ -6783,8 +7624,7 @@ mod tests {
                         for line_height in [0.8_f32, 1.0, 1.4, 2.0] {
                             let font_px = base * size_scale;
                             let mut spec = SettingsPreviewSpec::appearance(font_px)
-                                .with_prepared_font(prepared.clone())
-                                .with_window_following_theme(true);
+                                .with_prepared_font(prepared.clone());
                             spec.line_height = line_height;
                             // The size the terminal itself draws at (it
                             // holds every size to its 6px floor).
@@ -6947,8 +7787,11 @@ mod tests {
                 crate::native_ui::SemanticValue::Text(_)
             ));
             assert!(
-                compiled.hits.is_empty(),
-                "a demonstration is not a fake control"
+                compiled
+                    .hits
+                    .iter()
+                    .all(|hit| hit.action.as_str() == PREVIEW_PAUSE_ACTION),
+                "a demonstration is not a fake control: its only activation is the real Pause/Play"
             );
             node.rect
         };
@@ -7598,8 +8441,12 @@ mod tests {
                 "{raw}, control: the light reaches the typed line's end before the Return"
             );
             if raw == "comet" {
+                // The comet's tail is its Length of cells back along the
+                // leap, so on the scene's thirty-cell Return it starts a few
+                // cells in from the line's end; no grain gathers on the cell
+                // the caret left after the last letter.
                 assert!(
-                    reach(&after, row - 1) >= line_end,
+                    reach(&after, row - 1) >= line_end - 4 * cw,
                     "comet: the Return's streak leaves the line's end, one row up: {} px",
                     reach(&after, row - 1)
                 );
@@ -8055,13 +8902,14 @@ mod tests {
             ("committed renderer font cascade ready", false),
             ("candidate loading", true),
         ] {
-            for width in [254.0, 592.0, 900.0] {
+            for (width, dpi) in [(254.0, 1.0), (592.0, 1.25), (592.0, 2.0), (900.0, 3.0)] {
                 for font_px in [12.0, 24.0, 36.0, 72.0] {
                     for line_height in [0.8, 1.0, 2.0] {
                         let mut spec = SettingsPreviewSpec::typography(font_px)
                             .with_focus(crate::prefs::EDIT_FONT_FAMILY, "default")
                             .with_prepared_font(prepared.clone());
                         spec.line_height = line_height;
+                        spec.terminal_scale = dpi;
                         spec.font_status = status.to_string();
                         let full_height = spec.preferred_height(108.0);
                         for height in [108.0, full_height] {
@@ -8095,15 +8943,17 @@ mod tests {
                             };
                             assert!(has_pill, "a ready font paints no status pill");
                             if height == full_height {
-                                assert_eq!(
-                                    specimen.as_ref().unwrap().1.input.rows,
-                                    TYPOGRAPHY_SPECIMEN_ROWS,
+                                assert!(
+                                    specimen.as_ref().unwrap().1.input.rows >= TYPOGRAPHY_KEPT_ROWS,
                                     "all five intended rows fit {width}px / {font_px}px / {line_height}"
                                 );
                             }
                             if let Some((y, specimen)) = specimen {
+                                // The authored size, as the window's scale
+                                // admits it (its device-px bound).
                                 assert_eq!(
-                                    specimen.font_px, font_px,
+                                    specimen.font_px,
+                                    spec.normalized().font_px,
                                     "never shrink the authored type"
                                 );
                                 assert_eq!(specimen.line_height, line_height);
@@ -8114,17 +8964,17 @@ mod tests {
                                     first.starts_with("ANSI 4"),
                                     "a short specimen keeps the first rows, not parser-scroll tail: {first}"
                                 );
-                                for dpi in [1.0, 1.25, 2.0, 3.0] {
-                                    let row_h = prepared
-                                        .specimen_cell_height(font_px * dpi, line_height, &[])
-                                        .unwrap()
-                                        as f32
-                                        / dpi;
-                                    assert!(
-                                        y + specimen.input.rows as f32 * row_h <= pill_y - 4.0,
-                                        "{width}px/{height}px: {font_px}px at {dpi}dpi overlaps the badge"
-                                    );
-                                }
+                                // At the scale the specimen paints at (the
+                                // window's), its rows end above the badge.
+                                let dpi = spec.terminal_scale.max(1.0);
+                                let row_h = prepared
+                                    .specimen_cell_height(specimen.font_px * dpi, line_height, &[])
+                                    .unwrap() as f32
+                                    / dpi;
+                                assert!(
+                                    y + specimen.input.rows as f32 * row_h <= pill_y - 4.0,
+                                    "{width}px/{height}px: {font_px}px at {dpi}dpi overlaps the badge"
+                                );
                             }
                         }
                     }
@@ -8302,21 +9152,26 @@ mod tests {
     }
 
     /// The preview feeds the effect engine the colours a window does
-    /// (`cursor_fx::follow_live_cursor`): with no trail colour set, Comet,
-    /// Beam and Sparkle draw in the theme's cursor colour, not a built-in
-    /// hue; Laser keeps its violet; a set colour wins.
+    /// (`cursor_fx::follow_live_cursor`, the one colour law): with no trail
+    /// colour set, Comet, Beam and Sparkle keep their own hues while the
+    /// cursor colour is the theme's, and wear it once a cursor colour is
+    /// pinned; Laser keeps its violet either way; a set colour wins, and the
+    /// cursor's colour chosen (`cursor`) draws every style in it, Laser and
+    /// an unpinned Comet included.
     #[test]
     fn preview_trail_colours_follow_the_cursor_like_a_window() {
         let theme = PreviewTerminalTheme {
             cursor: 0x50_FA7B,
             ..NORD
         };
-        let drawn = |style: &'static str, color: Option<u32>| {
+        use aterm_effects::cursor_fx::TrailColor;
+        let drawn = |style: &'static str, color: TrailColor, pinned: bool| {
             let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
                 blink: false,
                 trail_style: PreviewTrailStyle::parse(style),
                 trail_style_raw: Arc::from(style),
                 color,
+                cursor_color_pinned: pinned,
                 ..CursorPreviewSpec::default()
             })
             .with_terminal_theme(theme)
@@ -8331,23 +9186,39 @@ mod tests {
             colors
         };
         let channels = |rgb: u32| ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+        let green = |rgb: u32| {
+            let (r, g, b) = channels(rgb);
+            g > b && g > r
+        };
         for style in ["comet", "beam", "sparkle"] {
-            for rgb in drawn(style, None) {
-                let (r, g, b) = channels(rgb);
+            for rgb in drawn(style, TrailColor::Automatic, false) {
+                assert!(!green(rgb), "{style} keeps its own hue: {rgb:06x}");
+            }
+            for rgb in drawn(style, TrailColor::Automatic, true) {
                 assert!(
-                    g > b && g > r,
-                    "{style} draws the green cursor colour: {rgb:06x}"
+                    green(rgb),
+                    "{style} wears the pinned cursor colour: {rgb:06x}"
                 );
             }
             // A set colour wins.
-            for rgb in drawn(style, Some(0x00E0_218A)) {
+            for rgb in drawn(style, TrailColor::Pinned(0x00E0_218A), false) {
                 let (r, g, b) = channels(rgb);
                 assert!(r > g && r > b, "{style} draws its set colour: {rgb:06x}");
             }
         }
-        for rgb in drawn("laser", None) {
-            let (r, g, b) = channels(rgb);
-            assert!(b > g && r > g, "Laser keeps its violet: {rgb:06x}");
+        for pinned in [false, true] {
+            for rgb in drawn("laser", TrailColor::Automatic, pinned) {
+                let (r, g, b) = channels(rgb);
+                assert!(b > g && r > g, "Laser keeps its violet: {rgb:06x}");
+            }
+        }
+        for style in ["laser", "comet"] {
+            for rgb in drawn(style, TrailColor::Cursor, false) {
+                assert!(
+                    green(rgb),
+                    "{style} in the cursor's colour, chosen: {rgb:06x}"
+                );
+            }
         }
     }
 
@@ -8554,5 +9425,304 @@ mod tests {
             crate::app_config::DEFAULT_INDEXED_MINIMUM_CONTRAST,
             "a sample's floor is the tab's default"
         );
+    }
+
+    /// A cursor preview of `raw`, steady, with the typing glow off so the
+    /// frame's light is the style's own.
+    fn style_scene(style: PreviewTrailStyle, raw: &'static str) -> CursorPreviewSpec {
+        CursorPreviewSpec {
+            blink: false,
+            trail_style: style,
+            trail_style_raw: Arc::from(raw),
+            momentum_glow: false,
+            ..CursorPreviewSpec::default()
+        }
+    }
+
+    /// WCAG 2.2.2: a looping preview carries a real Pause/Play control;
+    /// paused, it arms no cadence, holds one frame at every phase, and says
+    /// so. The card itself is the control: one full-size, keyboard-reachable
+    /// target carrying the action, its motion state in the value, and the
+    /// gesture in the description.
+    #[test]
+    fn pause_control_stills_the_looping_preview() {
+        let live = SettingsPreviewSpec::default().with_phase(300);
+        assert!(live.pause_control());
+        assert_eq!(live.animation(), PreviewAnimation::Continuous);
+        let paused = |phase_ms| {
+            SettingsPreviewSpec::default()
+                .with_phase(phase_ms)
+                .with_paused(true)
+        };
+        assert_eq!(paused(300).animation(), PreviewAnimation::None);
+        assert_eq!(
+            paused(300).paint_fingerprint(),
+            paused(1_900).paint_fingerprint()
+        );
+        assert_eq!(pixels(paused(300)), pixels_recomputed(paused(1_900)));
+        assert_ne!(
+            paused(300).state_badge(),
+            live.state_badge(),
+            "the header says the loop is held"
+        );
+        assert_ne!(
+            paused(300).semantic_value(),
+            live.semantic_value(),
+            "the accessible value says the loop is held"
+        );
+        assert!(
+            differences(
+                &pixels(live),
+                &pixels(SettingsPreviewSpec::default().with_phase(1_900))
+            ) > 80,
+            "negative control: playing, the phase moves pixels"
+        );
+
+        let held = compiled(paused(300));
+        let key = crate::native_ui::UiKey::new("preview");
+        let node = held.semantic(&key).expect("preview semantics");
+        assert_eq!(
+            node.action.as_ref().map(crate::native_ui::ActionId::as_str),
+            Some(PREVIEW_PAUSE_ACTION)
+        );
+        assert!(held.focus_order.contains(&key), "keyboard reachable");
+        let held_gesture = node
+            .description
+            .clone()
+            .expect("a control describes what activating it does");
+        let hit = held
+            .hits
+            .iter()
+            .find(|hit| hit.key == key)
+            .expect("a hit target");
+        assert!(
+            hit.rect.width >= 96.0 && hit.rect.height >= 96.0,
+            "{:?}",
+            hit.rect
+        );
+        let playing = compiled(SettingsPreviewSpec::default().with_phase(300));
+        let playing_gesture = playing
+            .semantic(&key)
+            .and_then(|node| node.description.clone())
+            .expect("a control describes what activating it does");
+        assert_ne!(
+            held_gesture, playing_gesture,
+            "the gesture flips with the state: play when held, pause when playing"
+        );
+
+        // A pause on a preview with nothing to pause is no state: the
+        // blink-only candidate keeps blinking and offers no control.
+        let blink_only = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            trail_enabled: false,
+            trail_style: PreviewTrailStyle::Off,
+            ..CursorPreviewSpec::default()
+        })
+        .with_phase(100)
+        .with_paused(true);
+        assert!(!blink_only.pause_control());
+        assert!(matches!(
+            blink_only.animation(),
+            PreviewAnimation::BlinkEdge { .. }
+        ));
+        // Reduce Motion already stills it: no control either.
+        assert!(
+            !SettingsPreviewSpec::default()
+                .with_reduced_motion(true)
+                .pause_control()
+        );
+    }
+
+    /// A PAUSED PREVIEW HOLDS THE TRAIL MID-LINE: the scene plays to the step
+    /// the second key after the Tab lands ([`CURSOR_SCENE_PAUSE_MS`]) and
+    /// stays there, whatever phase the host's clock hands it, with the typed
+    /// command part-way and the style's light on it. NEGATIVE CONTROL: the
+    /// still line a reduced-motion preview shows (the finished command, no
+    /// light) is what a pause would hold without the held step.
+    #[test]
+    fn a_paused_preview_holds_the_trail_mid_line() {
+        let spec = |phase| {
+            SettingsPreviewSpec::cursor(style_scene(PreviewTrailStyle::Comet, "comet"))
+                .with_phase(phase)
+                .with_paused(true)
+        };
+        let held = played(&spec(300), Theme::default());
+        assert_eq!(
+            scene_streams(&held),
+            scene_streams(&played(&spec(3_900), Theme::default())),
+            "one frame at every phase"
+        );
+        assert!(has_effect_light(&held), "the held frame shows the trail");
+        let (base, _) = build_terminal_specimen_input(&spec(300).normalized(), Theme::default());
+        let line = TypedLine::of(&base.cells[prompt_row(&base)]);
+        assert!(
+            held.cursor_col > line.start && held.cursor_col < line.end,
+            "the command is part-typed at the hold: caret {} in {}..{}",
+            held.cursor_col,
+            line.start,
+            line.end
+        );
+        let still = played(
+            &SettingsPreviewSpec::cursor(style_scene(PreviewTrailStyle::Comet, "comet"))
+                .with_phase(300)
+                .with_reduced_motion(true),
+            Theme::default(),
+        );
+        assert!(
+            !has_effect_light(&still),
+            "control: the still line carries no light"
+        );
+    }
+
+    /// The laser previews the caret the terminal draws: the bolt shape.
+    #[test]
+    fn laser_preview_caret_is_the_bolt() {
+        let at = |style, raw| {
+            played(
+                &SettingsPreviewSpec::cursor(style_scene(style, raw)).with_phase(900),
+                Theme::default(),
+            )
+        };
+        let laser = at(PreviewTrailStyle::Laser, "laser");
+        assert_eq!(
+            laser.cursor_effect_style_override,
+            Some(aterm_core::terminal::CursorStyle::Bolt)
+        );
+        assert!(laser.cursor_visible);
+        assert_ne!(
+            at(PreviewTrailStyle::Lumen, "lumen").cursor_effect_style_override,
+            Some(aterm_core::terminal::CursorStyle::Bolt),
+            "negative control: only the laser owns the bolt"
+        );
+    }
+
+    /// Fire previews the ember forge caret, through the fill-precedence law
+    /// the terminal runs: the caret's fill is the forge's, never the theme
+    /// cursor's.
+    #[test]
+    fn fire_preview_caret_is_the_forge_fill() {
+        let fire = played(
+            &SettingsPreviewSpec::cursor(style_scene(PreviewTrailStyle::Fire, "fire"))
+                .with_phase(1_200),
+            Theme::default(),
+        );
+        let fill = fire.cursor_fill_override.expect("fire owns the caret body");
+        assert_ne!(fill, Theme::default().cursor & 0x00FF_FFFF);
+        let (r, b) = ((fill >> 16) & 0xFF, fill & 0xFF);
+        assert!(r > b, "the forge caret is warm metal: {fill:#08x}");
+        assert_eq!(
+            played(
+                &SettingsPreviewSpec::cursor(style_scene(PreviewTrailStyle::Classic, "classic"))
+                    .with_phase(1_200),
+                Theme::default(),
+            )
+            .cursor_fill_override,
+            None,
+            "negative control: a style with no caret body leaves the caret alone"
+        );
+    }
+
+    /// GitHub Light: the light-theme rainbow is source-over ink, so the
+    /// preview of the DEFAULT trail must show it, not a white canvas under a
+    /// "Live trail" badge, which additive lowering produced. NEGATIVE
+    /// CONTROL: Off, with the typing glow off, lays nothing.
+    #[test]
+    fn light_theme_rainbow_pet_preview_shows_its_ribbon() {
+        let github_light = PreviewTerminalTheme::from_scheme(
+            &aterm_types::scheme::builtin("GitHub Light").expect("built-in GitHub Light"),
+        );
+        let at = |cursor| {
+            let spec = SettingsPreviewSpec::cursor(cursor)
+                .with_phase(1_100)
+                .with_terminal_theme(github_light);
+            played(&spec, github_light.into_theme())
+        };
+        let ink = |input: &RenderInput| {
+            input
+                .glow_under
+                .iter()
+                .chain(&input.cursor_glow_add)
+                .filter(|quad| quad.alpha > 0)
+                .count()
+        };
+        let rainbow = at(CursorPreviewSpec {
+            momentum_glow: false,
+            ..rainbow_cursor("rainbow kitty pet")
+        });
+        assert!(ink(&rainbow) > 0, "the light ribbon is ink on the page");
+        let off = at(style_scene(PreviewTrailStyle::Off, "off"));
+        assert!(!has_effect_light(&off), "control: Off lays no light");
+    }
+
+    /// THE TRAY BLIT IS THE SHIPPING RENDERER'S DEVICE FRAME: at fractional
+    /// display scales the cursor scene plays on the renderer's own integer
+    /// cell grid, so abutting light can never be double-counted at a rescaled
+    /// edge. The tray renders a moving specimen on a WARM configured fork (it
+    /// has drawn the previous frame); that fork's frame must still be a fresh
+    /// fork's, byte for byte. NEGATIVE CONTROL: the frame with the scene
+    /// taken off differs, so the equality is about the composited motion.
+    #[test]
+    fn preview_light_is_the_renderer_frame_at_fractional_scales() {
+        let specimen_at = |phase_ms| {
+            compiled(
+                SettingsPreviewSpec::cursor(rainbow_cursor("rainbow kitty pet"))
+                    .with_phase(phase_ms),
+            )
+            .tray(Theme::default(), 13.0)
+            .prims
+            .iter()
+            .find_map(|primitive| match primitive {
+                DrawPrim::TerminalSpecimen { spec, .. } => Some(spec.as_ref().clone()),
+                _ => None,
+            })
+            .expect("cursor specimen")
+        };
+        let earlier = specimen_at(312);
+        let specimen = specimen_at(1_196);
+        for scale in [1.25_f32, 1.5] {
+            let frame = crate::tray_raster::render_specimen_frame_for_test(&specimen, scale)
+                .expect("the specimen renders");
+            let logical_w = (frame.width as f32 / scale).ceil() as u32 + 1;
+            let logical_h = (frame.height as f32 / scale).ceil() as u32 + 1;
+            let blit = |specimen: &crate::widget::TerminalSpecimenSpec| {
+                crate::tray_raster::rasterize_tray(
+                    &[DrawPrim::TerminalSpecimen {
+                        x: 0.0,
+                        y: 0.0,
+                        spec: Box::new(specimen.clone()),
+                    }],
+                    logical_w,
+                    logical_h,
+                    scale,
+                    [0, 0, 0, 0],
+                )
+            };
+            // An earlier frame of the same configuration first: the frame
+            // below is then drawn by the fork that already drew this one.
+            let _ = blit(&earlier);
+            let (raster, raster_w, _) = blit(&specimen);
+            let still = crate::tray_raster::render_specimen_frame_for_test(
+                &crate::widget::TerminalSpecimenSpec {
+                    motion: None,
+                    ..specimen.clone()
+                },
+                scale,
+            )
+            .expect("the still specimen renders");
+            assert_ne!(
+                still.pixels, frame.pixels,
+                "{scale}x: the scene reaches the renderer's frame"
+            );
+            for (row, pixels) in frame.pixels.chunks(frame.width).enumerate() {
+                for (col, pixel) in pixels.iter().enumerate() {
+                    let i = (row * raster_w as usize + col) * 4;
+                    let rgb = [
+                        ((pixel >> 16) & 0xff) as u8,
+                        ((pixel >> 8) & 0xff) as u8,
+                        (pixel & 0xff) as u8,
+                    ];
+                    assert_eq!(raster[i..i + 3], rgb, "{scale}x pixel ({col},{row})");
+                }
+            }
+        }
     }
 }

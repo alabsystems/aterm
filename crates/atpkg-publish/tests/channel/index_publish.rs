@@ -9,11 +9,11 @@
 //! lapsed is refused.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use atpkg_publish::api::{Baseline, Delta, IndexRequest};
-use atpkg_publish::channel::Log;
 use atpkg_publish::channel::index::{Outcome, parse_delta, publish_with};
+use atpkg_publish::channel::{Log, SERVE_PROBES};
 use atpkg_publish::error::{Error, Result};
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
@@ -31,8 +31,20 @@ struct Faulty {
     inner: Arc<FakeHost>,
     /// `release(tag)` answers this instead (a racing read, an unreadable state).
     release_answer: Option<(String, HostError)>,
-    /// The download host never serves this tag.
-    unserved: Option<String>,
+    /// The download host lags: it answers 404 for this tag's first `n` probes once the
+    /// fake serves it (`usize::MAX`: never serves it).
+    unserved: Option<(String, Mutex<usize>)>,
+}
+
+impl Faulty {
+    /// The fake, its download host `probes` probes behind on `tag`.
+    fn unserved(inner: Arc<FakeHost>, tag: String, probes: usize) -> Self {
+        Self {
+            inner,
+            release_answer: None,
+            unserved: Some((tag, Mutex::new(probes))),
+        }
+    }
 }
 
 impl ReleaseHost for Faulty {
@@ -79,10 +91,18 @@ impl ReleaseHost for Faulty {
         self.inner.publish_draft(slug, tag)
     }
     fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
-        if self.unserved.as_deref() == Some(tag) {
-            return Probe::Absent;
+        let answer = self.inner.probe_public(slug, tag, asset);
+        if let Some((t, left)) = &self.unserved
+            && t == tag
+            && answer == Probe::Present
+        {
+            let mut left = left.lock().expect("the lag count");
+            if *left > 0 {
+                *left -= 1;
+                return Probe::Absent;
+            }
         }
-        self.inner.probe_public(slug, tag, asset)
+        answer
     }
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
         self.inner.fetch_public(slug, tag, asset, dest, cap)
@@ -304,13 +324,25 @@ fn packs_that_are_not_public_publish_no_index() {
 fn an_index_the_download_host_does_not_serve_after_its_create_fails_the_run() {
     let mut rig = live("idx-unserved");
     let host = rig.host.clone();
-    rig.route(Arc::new(Faulty {
-        inner: host,
-        release_answer: None,
-        unserved: Some(index_tag(22)),
-    }));
+    rig.route(Arc::new(Faulty::unserved(host, index_tag(22), usize::MAX)));
     let (e, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
     assert!(e.to_string().contains("is the repo public?"), "{e}");
+}
+
+/// The download host serves a fresh release only after a while (`atpkg-index-76` still
+/// answered 404 eight seconds after it was published): the publish waits for it.
+#[test]
+fn an_index_the_download_host_serves_late_is_published() {
+    let mut rig = live("idx-served-late");
+    let host = rig.host.clone();
+    rig.route(Arc::new(Faulty::unserved(
+        host,
+        index_tag(22),
+        SERVE_PROBES - 1,
+    )));
+    let (r, log) = publish(&rig, &request(&rig, "out", true, Delta::default()));
+    r.unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
+    assert!(log.contains("published atpkg-index-22"), "{}", log.text());
 }
 
 /// Publish once (the fixture's own bytes), then lay `atpkg-index-22` as `shape` makes it.

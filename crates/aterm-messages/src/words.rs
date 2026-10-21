@@ -102,6 +102,63 @@ pub fn spoken_relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
     }
 }
 
+/// The first instant after `now_unix_ms` at which a time word said of a
+/// record stamped `at_unix_ms`, on a clock `offset_s` seconds from UTC, reads
+/// otherwise: its [`relative_words`] and [`spoken_relative_words`] (`3 min
+/// ago` becomes `4 min ago`, `23 h ago` becomes `yesterday`, `36 hours ago`
+/// becomes `37 hours ago`), and the words read off the reader's day —
+/// [`local_words`], [`day_heading`], and whether the record is under a day
+/// older than today — which turn at a local midnight: `Today` to `Yesterday`
+/// to the weekday, the weekday to the date a week on, and the date gains its
+/// year when the year turns. Pure.
+#[must_use]
+pub fn words_change_after(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> u64 {
+    let ago = now_unix_ms.saturating_sub(at_unix_ms);
+    // The next whole `unit` of age past `ago`, as an instant.
+    let next =
+        |unit: u64| at_unix_ms.saturating_add((ago / unit).saturating_add(1).saturating_mul(unit));
+    let age_words = if ago < MS_PER_HOUR {
+        // `just now` until a minute (a stamp ahead of the clock too), then
+        // each minute.
+        next(MS_PER_MIN)
+    } else if ago < 2 * MS_PER_DAY {
+        // Each hour: `N h ago`, `yesterday` from 24 h, the date from 48 h,
+        // and the spoken `N hours ago` throughout.
+        next(MS_PER_HOUR)
+    } else {
+        // The written date stands; the spoken `N days ago` moves daily.
+        next(MS_PER_DAY)
+    };
+    let (day, today) = (
+        local_day(at_unix_ms, offset_s),
+        local_day(now_unix_ms, offset_s),
+    );
+    // The local day whose midnight turns the day words ([`day_heading`]'s
+    // rungs); `None` once nothing of the day can move.
+    let turn = match today.saturating_sub(day) {
+        // `Today` (a day ahead of the clock reads `Today` too) until the day
+        // after its own, then `Yesterday`, then its weekday.
+        i64::MIN..=0 => Some(today.max(day).saturating_add(1)),
+        1 => Some(today.saturating_add(1)),
+        // The weekday stands until a week has passed: then the date.
+        2..=6 => Some(day.saturating_add(7)),
+        // The date says its year only once that is not this year's.
+        _ => {
+            let civil = |d: i64| civil_from_days(u64::try_from(d).unwrap_or(0));
+            let ((at_year, _, _), (this_year, _, _)) = (civil(day), civil(today));
+            (at_year == this_year).then(|| {
+                i64::try_from(days_from_civil(this_year.saturating_add(1), 1, 1))
+                    .unwrap_or(i64::MAX)
+            })
+        }
+    };
+    let midnight = turn.map_or(u64::MAX, |turn| {
+        let secs = turn.saturating_mul(86_400).saturating_sub(offset_s);
+        u64::try_from(secs).unwrap_or(0).saturating_mul(1000)
+    });
+    age_words.min(midnight)
+}
+
 /// `secs` seconds into a day on a twelve-hour clock: `9:02 AM`, or with
 /// `seconds` `9:02:11 AM`.
 fn twelve_hour(secs: u64, seconds: bool) -> String {
@@ -229,6 +286,23 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + u64::from(m <= 2);
     (y, m, d)
+}
+
+/// Proleptic-Gregorian `(year, month, day)` → days since 1970-01-01, the
+/// inverse of [`civil_from_days`] (Howard Hinnant's `days_from_civil`), on
+/// the non-negative half only.
+fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
+    let y = if month <= 2 {
+        year.saturating_sub(1)
+    } else {
+        year
+    };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe).saturating_sub(719_468)
 }
 
 /// `v` in decimal, zero-padded to at least `width` digits.
@@ -403,6 +477,72 @@ mod tests {
     use super::*;
     use crate::log::{LogRecord, LogState};
     use crate::model::{Glyph, MessageId, Origin, Severity, WallStamp, tags};
+
+    /// WHEN A PAGE'S TIME WORDS NEXT MOVE: every word said of a record (its
+    /// written and spoken age, its local day and clock, its day header, and
+    /// whether it is under one) reads the same up to the instant
+    /// [`words_change_after`] names and otherwise at it — not one republish
+    /// early, none late — at every age band, in zones either side of UTC and
+    /// off the hour, and for a stamp ahead of the clock. Every word is a step
+    /// that only moves forward, so equal at both ends is equal throughout.
+    #[test]
+    fn the_time_words_change_exactly_when_words_change_after_says() {
+        let said = |now: u64, at: u64, offset: i64| {
+            let (day, today) = (local_day(at, offset), local_day(now, offset));
+            (
+                relative_words(now, at),
+                spoken_relative_words(now, at),
+                local_words(now, at, offset),
+                day_heading(today, day, false),
+                day_heading(today, day, true),
+                day < today,
+            )
+        };
+        let ages = [
+            0,
+            30_000,
+            MS_PER_MIN - 1,
+            MS_PER_MIN,
+            5 * MS_PER_MIN + 3_000,
+            MS_PER_HOUR - 1,
+            MS_PER_HOUR,
+            3 * MS_PER_HOUR + 7 * MS_PER_MIN,
+            MS_PER_DAY - 1,
+            MS_PER_DAY,
+            30 * MS_PER_HOUR,
+            2 * MS_PER_DAY - 1,
+            2 * MS_PER_DAY,
+            3 * MS_PER_DAY + 5 * MS_PER_HOUR,
+            6 * MS_PER_DAY + 11 * MS_PER_HOUR,
+            10 * MS_PER_DAY,
+            30 * MS_PER_DAY,
+            100 * MS_PER_DAY,
+            400 * MS_PER_DAY,
+        ];
+        // 2025-09-21 15:53:20.250 and 2025-12-28 20:10:00.125 UTC: off every
+        // boundary, and the second's week and month run into the new year.
+        for at in [1_758_470_000_250, 1_766_952_600_125] {
+            for offset in [0, -7 * 3600, 9 * 3600, 5 * 3600 + 1800] {
+                let mut nows: Vec<u64> = ages.iter().map(|age| at + age).collect();
+                // A writer's clock ahead of the reader's.
+                nows.push(at - 10_000);
+                for now in nows {
+                    let change = words_change_after(now, at, offset);
+                    assert!(change > now, "{now} at {offset}");
+                    assert_eq!(
+                        said(change - 1, at, offset),
+                        said(now, at, offset),
+                        "moved before {change} (at {at}, now {now}, offset {offset})"
+                    );
+                    assert_ne!(
+                        said(change, at, offset),
+                        said(now, at, offset),
+                        "nothing moved at {change} (at {at}, now {now}, offset {offset})"
+                    );
+                }
+            }
+        }
+    }
 
     /// Today, yesterday, else the local date, on a twelve-hour clock; the
     /// offset moves the day as well as the hour.
@@ -603,6 +743,7 @@ mod tests {
             },
             tag: tags::CRASH,
             severity: Severity::Error,
+            posted_severity: Severity::Error,
             glyph: Glyph::FALLBACK,
             title: "aterm closed unexpectedly last time".into(),
             detail: vec!["crash log at /x".into(), "signal 11".into()],

@@ -6,16 +6,18 @@
 
 use super::command::{EditorCommand, PrefixArgument};
 use super::view::EditorBufferView;
-use super::workspace::{EditorEffect, EditorError, EditorWorkspace};
+use super::workspace::{EditorEffect, EditorError, EditorWorkspace, Recorded};
 use crate::store::DocumentStore;
 
 /// One recorded step of a keyboard macro. A command carries the `C-u`
 /// argument it took, so neither `C-u` nor the digits after it are steps of
 /// their own: an argument nothing took (one pending at `C-x )`) records
-/// nothing, and a replay hands each command exactly the argument it had.
+/// nothing, and a replay hands each command exactly the argument it had. It
+/// carries the answers its minibuffer took too (`kill-buffer`'s buffer,
+/// `goto-line`'s line), so a replay runs it with them instead of asking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MacroStep {
-    Command(EditorCommand, Option<PrefixArgument>),
+    Command(EditorCommand, Option<PrefixArgument>, Vec<String>),
     Text(String),
 }
 
@@ -34,34 +36,38 @@ impl EditorWorkspace {
         vec![EditorEffect::Status("Keyboard macro defined".into())]
     }
 
+    /// `call-last-kbd-macro` (C-x e): replay the last macro's steps, and
+    /// return what they asked of the host (a save, a buffer to kill, their
+    /// statuses) in order, for the host to carry out once the macro is done.
     pub(super) fn play_macro(
         &mut self,
         store: &mut DocumentStore,
         view: &mut EditorBufferView,
-    ) -> Result<(), EditorError> {
+    ) -> Result<Vec<EditorEffect>, EditorError> {
         if self.playing_macro {
             return Err(EditorError::MacroRecursion);
         }
         self.playing_macro = true;
         let steps = self.last_macro.clone();
         let result = (|| {
+            let mut effects = Vec::new();
             for step in steps {
                 match step {
-                    MacroStep::Command(command, argument) => {
+                    MacroStep::Command(command, argument, args) => {
                         // The step hands its command the argument it took when
                         // recorded, and the argument never outlives the step,
                         // even when the command refuses to run.
                         view.prefix_argument = argument;
-                        let result = self.execute(store, view, command);
+                        let result = self.execute_with(store, view, command, args, Recorded::No);
                         view.take_prefix_argument();
-                        result?;
+                        effects.extend(result?);
                     }
                     MacroStep::Text(text) => {
-                        self.insert_text(store, view, &text)?;
+                        effects.extend(self.insert_text(store, view, &text)?);
                     }
                 }
             }
-            Ok(())
+            Ok(effects)
         })();
         self.playing_macro = false;
         result
@@ -72,7 +78,7 @@ impl EditorWorkspace {
 mod tests {
     use super::*;
     use crate::editor::projection::byte_of_line;
-    use crate::editor::{EditorWorkspace, KeyChord, editor};
+    use crate::editor::{EditorWorkspace, Invocation, KeyChord, Selection, editor};
     use crate::store::DocumentStore;
 
     /// A keyboard macro records the argument with the command that took it.
@@ -129,5 +135,91 @@ mod tests {
         assert_eq!(view.prefix_hud, None);
         press(&mut store, &mut workspace, &mut view, "C-f");
         assert_eq!(view.primary_selection().head, 3);
+    }
+
+    /// A macro keeps what each command's minibuffer was answered with
+    /// (goto-line's line, switch-to-buffer's and kill-buffer's buffer), so
+    /// its replay runs the command with that answer instead of asking again,
+    /// and hands the host what the commands asked of it. M-x is no step of
+    /// its own: the command it ran is. A machine's [`Invocation`] records its
+    /// answers as it passes them.
+    #[test]
+    fn a_macro_replays_its_prompts_answers() {
+        fn press(
+            store: &mut DocumentStore,
+            workspace: &mut EditorWorkspace,
+            view: &mut EditorBufferView,
+            keys: &str,
+        ) {
+            for key in keys.split_whitespace() {
+                workspace
+                    .handle_chord(store, view, KeyChord::parse(key).unwrap())
+                    .unwrap();
+            }
+        }
+        let text = (0..10)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let (mut store, mut workspace, mut view, _) = editor(&text);
+        let answer = |store: &mut DocumentStore,
+                      workspace: &mut EditorWorkspace,
+                      view: &mut EditorBufferView,
+                      keys: &str,
+                      answer: &str| {
+            press(store, workspace, view, keys);
+            workspace.insert_text(store, view, answer).unwrap();
+            workspace.submit_minibuffer(store, view).unwrap()
+        };
+        press(&mut store, &mut workspace, &mut view, "C-x (");
+        answer(&mut store, &mut workspace, &mut view, "M-g g", "3");
+        answer(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            "C-x b",
+            "mem://notes",
+        );
+        answer(&mut store, &mut workspace, &mut view, "C-x k", "mem://old");
+        answer(&mut store, &mut workspace, &mut view, "M-x", "forward-char");
+        press(&mut store, &mut workspace, &mut view, "C-x )");
+        assert_eq!(view.primary_selection().head, byte_of_line(&text, 2) + 1);
+
+        view.selections = vec![Selection::caret(0)];
+        press(&mut store, &mut workspace, &mut view, "C-x");
+        let effects = workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("e").unwrap())
+            .unwrap();
+        assert!(!view.minibuffer_active(), "{:?}", view.minibuffer);
+        assert_eq!(view.primary_selection().head, byte_of_line(&text, 2) + 1);
+        assert_eq!(
+            effects,
+            [
+                EditorEffect::Status("Line 3".to_string()),
+                EditorEffect::SwitchBuffer {
+                    query: "mem://notes".to_string()
+                },
+                EditorEffect::KillBuffer {
+                    query: "mem://old".to_string()
+                },
+            ]
+        );
+
+        let (mut store, mut workspace, mut view, _) = editor(&text);
+        press(&mut store, &mut workspace, &mut view, "C-x (");
+        workspace
+            .invoke(
+                &mut store,
+                &mut view,
+                Invocation {
+                    command: EditorCommand::GotoLine,
+                    count: None,
+                    args: vec!["5".to_string()],
+                },
+            )
+            .unwrap();
+        press(&mut store, &mut workspace, &mut view, "C-x )");
+        view.selections = vec![Selection::caret(0)];
+        press(&mut store, &mut workspace, &mut view, "C-x e");
+        assert_eq!(view.primary_selection().head, byte_of_line(&text, 4));
     }
 }

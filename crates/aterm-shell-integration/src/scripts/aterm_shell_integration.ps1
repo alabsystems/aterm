@@ -90,6 +90,9 @@ if (($env:ATERM_CHILD -or $env:ATERM_SESSION_ID) -and
 # manages that folder, and an entry there ahead of everything would let whatever
 # lands in it shadow every command in every session. atpkg's managed bin/ is
 # APPENDED, by its own hook.
+if (-not (Test-Path Env:AGY_CLI_FAST_PROMPT_EDITOR)) {
+    $env:AGY_CLI_FAST_PROMPT_EDITOR = 'true'
+}
 if ($HOME) {
     $__aterm_hooks = Join-Path $HOME '.aterm/shell.d'
     if (Test-Path -LiteralPath $__aterm_hooks) {

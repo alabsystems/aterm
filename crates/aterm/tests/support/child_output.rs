@@ -52,6 +52,123 @@ pub fn wait_and_read(mut child: Child, deadline: Instant) -> Option<Output> {
     }
 }
 
+/// The maximum raw bytes retained from either stream before an acknowledgement.
+pub const ACK_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// Wait until `child`'s piped stderr carries a whole line `wanted` accepts —
+/// a client's acknowledgement, written before what it goes on to do — reading
+/// one byte at a time, so nothing past that line is taken from the pipe, which
+/// is handed back to `child` (non-blocking) for whoever reads it next.
+///
+/// [`NoLine::Exited`] when the child exits first; [`NoLine::Hung`] when
+/// `deadline` passes first, the child then killed and reaped. Diagnostics from
+/// either stream stop at [`ACK_OUTPUT_LIMIT`]; excess output is a named failure,
+/// with the still-running owned child killed and reaped.
+#[allow(dead_code)]
+pub fn await_stderr_line(
+    child: &mut Child,
+    wanted: impl Fn(&str) -> bool,
+    deadline: Instant,
+) -> Result<(), NoLine> {
+    let mut stderr = child.stderr.take().map(|p| nonblocking(OwnedFd::from(p)));
+    let mut said = Vec::new();
+    let mut line_from = 0;
+    loop {
+        // Exit first, then the read, as in [`wait_and_read`].
+        let status = child.try_wait().expect("poll the child");
+        let mut byte = [0u8; 1];
+        while let Some(file) = stderr.as_mut() {
+            if Instant::now() >= deadline {
+                if status.is_none() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(NoLine::Hung(String::from_utf8_lossy(&said).into_owned()));
+            }
+            if said.len() == ACK_OUTPUT_LIMIT {
+                if status.is_none() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(NoLine::OutputLimit {
+                    stream: "stderr",
+                    captured: String::from_utf8_lossy(&said).into_owned(),
+                });
+            }
+            match file.read(&mut byte) {
+                Ok(0) => stderr = None,
+                Ok(_) => {
+                    said.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        let line = String::from_utf8_lossy(&said[line_from..said.len() - 1]);
+                        line_from = said.len();
+                        if wanted(line.trim_end_matches('\r')) {
+                            child.stderr = stderr.map(|f| OwnedFd::from(f).into());
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => panic!("read the child's stderr: {e}"),
+            }
+        }
+        if let Some(status) = status {
+            let mut stdout = child.stdout.take().map(|p| nonblocking(OwnedFd::from(p)));
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 8192];
+            while let Some(file) = stdout.as_mut() {
+                if Instant::now() >= deadline {
+                    return Err(NoLine::Hung(String::from_utf8_lossy(&said).into_owned()));
+                }
+                if out.len() == ACK_OUTPUT_LIMIT {
+                    return Err(NoLine::OutputLimit {
+                        stream: "stdout",
+                        captured: String::from_utf8_lossy(&out).into_owned(),
+                    });
+                }
+                let room = (ACK_OUTPUT_LIMIT - out.len()).min(chunk.len());
+                match file.read(&mut chunk[..room]) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => panic!("read the child's stdout: {e}"),
+                }
+            }
+            // The stderr loop already drained through EOF or WouldBlock;
+            // another drain could follow a sibling writer indefinitely.
+            return Err(NoLine::Exited(Output {
+                status,
+                stdout: out,
+                stderr: said,
+            }));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(NoLine::Hung(String::from_utf8_lossy(&said).into_owned()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Why [`await_stderr_line`] saw no line it wanted.
+#[allow(dead_code)]
+pub enum NoLine {
+    /// The child exited first: reaped, with bounded output available now.
+    Exited(Output),
+    /// The deadline passed first: the child was killed and reaped, having
+    /// written this much to stderr.
+    Hung(String),
+    /// The child's pre-acknowledgement output reached [`ACK_OUTPUT_LIMIT`].
+    /// A still-running owned child was killed and reaped.
+    OutputLimit {
+        stream: &'static str,
+        captured: String,
+    },
+}
+
 fn nonblocking(fd: OwnedFd) -> File {
     let raw = fd.as_raw_fd();
     // SAFETY: `raw` is the open descriptor `fd` owns for this whole call.

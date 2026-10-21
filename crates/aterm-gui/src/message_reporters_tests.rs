@@ -108,7 +108,7 @@ fn a_label_cannot_fault_the_signed_out_entry() {
 #[test]
 fn an_autopilot_set_from_the_window_is_a_keyed_record() {
     use crate::autopilot::AutopilotView;
-    let msg = super::autopilot_set("s-a1", "in tab 2", AutopilotView::Land, true, None);
+    let msg = super::autopilot_set("s-a1", "in tab 2", AutopilotView::Land, true, None, None);
     assert_eq!(msg.title, "Autopilot set to land");
     assert_eq!(attention(&msg), Ok(Attention::Record));
     assert_eq!(msg.tag, tags::HARNESS);
@@ -120,7 +120,14 @@ fn an_autopilot_set_from_the_window_is_a_keyed_record() {
             "this session's own setting"
         ]
     );
-    let back = super::autopilot_set("s-a1", "in its tab", AutopilotView::Cruise, false, None);
+    let back = super::autopilot_set(
+        "s-a1",
+        "in its tab",
+        AutopilotView::Cruise,
+        false,
+        None,
+        None,
+    );
     assert_eq!(back.title, "Autopilot set to cruise");
     assert_eq!(
         back.detail,
@@ -137,9 +144,10 @@ fn an_autopilot_set_from_the_window_is_a_keyed_record() {
 /// for every view, a timer today and on another day, each closed-over case
 /// and each thing the fire can find — passes the glass title rule; a hand
 /// change over an armed timer says it is cancelled, and one over none does
-/// not; the fire says the work is wrapped up only over work the harness
-/// carries, and over a done or landed task, an off harness, an agent's own
-/// switch off, no host or a tab with no agent, that there is nothing to land.
+/// not; the fire says the harness lands the work only over work the harness
+/// carries (Cruise never ends, so every hosted agent's work is that), and
+/// over an off harness, an agent's own switch off, no host or a tab with no
+/// agent, that nothing is landed.
 /// NEGATIVE CONTROL: main's two titles break the rule.
 #[test]
 fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
@@ -147,9 +155,7 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     use crate::autopilot::AutopilotView;
     use crate::autopilot_timers::ClosedOver;
     use crate::claude_lights::{Clock, LandAtGlass, Weekday};
-    use crate::harness_glass::Stamp;
     use aterm_messages::text::glass_title_fault;
-    const TODAY: i64 = 20_007;
     let six = LandAtGlass {
         clock: Clock::of_minute(18 * 60),
         other_day: None,
@@ -158,17 +164,11 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
         clock: Clock::of_minute(16 * 60),
         other_day: Some(Weekday::Sat),
     };
-    let at_1742 = |day| {
-        Some(Stamp {
-            clock: Clock::of_minute(17 * 60 + 42),
-            day,
-        })
-    };
     let mut titles = Vec::new();
     for view in AutopilotView::ALL {
         for cancelled in [None, Some(six), Some(sat)] {
             for own in [true, false] {
-                let msg = super::autopilot_set("s-1", "in tab 3", view, own, cancelled);
+                let msg = super::autopilot_set("s-1", "in tab 3", view, own, cancelled, None);
                 let cancel = msg
                     .detail
                     .iter()
@@ -191,43 +191,24 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
             }
         }
     }
-    let set = super::autopilot_timer_set("s-1", "in tab 3", six);
+    let set = super::autopilot_timer_set("s-1", "in tab 3", six, None);
     assert_eq!(set.title, "Autopilot cruises until 18:00");
     assert_eq!(
         set.detail,
         ["Tab 3: the harness keeps the work moving, then wraps it up at that time"]
     );
-    let saturday = super::autopilot_timer_set("s-1", "in tab 3", sat);
+    let saturday = super::autopilot_timer_set("s-1", "in tab 3", sat, None);
     assert_eq!(saturday.title, "Autopilot cruises until Sat 16:00");
     titles.push(set.title);
     titles.push(saturday.title);
     let ended = |clock, passed, over| {
-        super::autopilot_timer_ended("s-1", "in tab 3", clock, passed, over, TODAY)
+        super::autopilot_timer_ended("s-1", "in tab 3", clock, passed, over, None)
     };
     let turned = "Tab 3: at 18:00 Autopilot switched to land; ";
     for (over, then) in [
         (
             FireOver::Work,
-            "the harness wraps the work up at its next point, then stops".to_string(),
-        ),
-        (
-            FireOver::Done(at_1742(TODAY)),
-            "nothing to land, the task was done at 17:42".to_string(),
-        ),
-        (
-            FireOver::Done(at_1742(TODAY - 1)),
-            format!(
-                "nothing to land, the task was done at {} 17:42",
-                Weekday::of_days(TODAY - 1).short()
-            ),
-        ),
-        (
-            FireOver::Done(None),
-            "nothing to land, the task was done".to_string(),
-        ),
-        (
-            FireOver::Landed(at_1742(TODAY)),
-            "nothing to land, the task landed at 17:42".to_string(),
+            "the harness lands all of the work on the remote main branch, then stops".to_string(),
         ),
         (
             FireOver::MasterOff,
@@ -261,9 +242,9 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
             "{over:?}: {msg:?}"
         );
         assert_eq!(
-            then.contains("wraps the work up"),
+            then.contains("remote main branch"),
             over == FireOver::Work,
-            "{over:?}: only work the harness carries is wrapped up"
+            "{over:?}: only work the harness carries is landed"
         );
         assert_eq!(attention(&msg), Ok(Attention::Record), "{over:?}");
         assert_eq!(msg.key.as_deref(), Some("harness.autopilot.s-1"));
@@ -279,7 +260,7 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
             "Tab 3: the 18:00 landing time passed while the tab was closed; land is on",
         ),
     ] {
-        let msg = ended(Some("18:00"), Some(passed), FireOver::Done(at_1742(TODAY)));
+        let msg = ended(Some("18:00"), Some(passed), FireOver::Work);
         assert_eq!(
             msg.detail,
             [line],
@@ -291,8 +272,8 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     assert_eq!(
         unzoned.detail,
         [
-            "Tab 3: Autopilot switched to land; the harness wraps the work up at its next point, \
-             then stops"
+            "Tab 3: Autopilot switched to land; the harness lands all of the work on the remote \
+             main branch, then stops"
         ]
     );
     titles.push(unzoned.title);
@@ -302,6 +283,91 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     // NEGATIVE CONTROL: main's titles of the timer's two records.
     assert!(glass_title_fault("Autopilot set to cruise until 18:00, then land").is_some());
     assert!(glass_title_fault("autopilot: cruise until 18:00 ended; land").is_some());
+}
+
+/// WHO SET IT IS A LINE, NEVER THE TITLE (design §11.7.1, §11.7.5, "The
+/// titles"): with every setter's words — each window surface, the wire's
+/// writers, an edge writer's tab, a session gone, a word from before a
+/// restart, the timer's own clock — each Autopilot builder keeps the title it
+/// mints without one, still under the glass title rule, and ends its lines
+/// with the setter's, as given. NEGATIVE CONTROL: a builder that puts the
+/// setter in its title breaks the rule for every setter (checked below).
+#[test]
+fn who_set_it_is_the_records_last_line_never_its_title() {
+    use super::FireOver;
+    use crate::autopilot::{AutopilotView, Surface};
+    use crate::claude_lights::{Clock, LandAtGlass};
+    use aterm_messages::text::glass_title_fault;
+    let six = LandAtGlass {
+        clock: Clock::of_minute(18 * 60),
+        other_day: None,
+    };
+    let mut setters: Vec<String> = Surface::ALL
+        .into_iter()
+        .map(|surface| format!("set {}", surface.phrase()))
+        .collect();
+    setters.extend(
+        [
+            "set over aterm ctl",
+            "set by aterm's harness",
+            "set over the fabric",
+            "set from tab 2 (\u{2733} Claude Code)",
+            "set from session s-1a2b",
+            "set over aterm ctl (writer unknown)",
+            "set before aterm restarted",
+            "set at the 18:00 timer",
+        ]
+        .map(str::to_string),
+    );
+    for set_by in &setters {
+        let mut built = Vec::new();
+        for view in AutopilotView::ALL {
+            for (own, cancelled) in [(true, None), (false, Some(six))] {
+                built.push((
+                    super::autopilot_set("s-1", "in tab 3", view, own, cancelled, None),
+                    super::autopilot_set("s-1", "in tab 3", view, own, cancelled, Some(set_by)),
+                ));
+            }
+        }
+        built.push((
+            super::autopilot_timer_set("s-1", "in tab 3", six, None),
+            super::autopilot_timer_set("s-1", "in tab 3", six, Some(set_by)),
+        ));
+        for over in [
+            FireOver::Work,
+            FireOver::MasterOff,
+            FireOver::NoAgent { split: false },
+        ] {
+            built.push((
+                super::autopilot_timer_ended("s-1", "in tab 3", Some("18:00"), None, over, None),
+                super::autopilot_timer_ended(
+                    "s-1",
+                    "in tab 3",
+                    Some("18:00"),
+                    None,
+                    over,
+                    Some(set_by),
+                ),
+            ));
+        }
+        for (bare, with) in built {
+            assert_eq!(with.title, bare.title, "{set_by}: the title is unchanged");
+            assert_eq!(glass_title_fault(&with.title), None, "{}", with.title);
+            assert_eq!(with.detail.len(), bare.detail.len() + 1, "{set_by}");
+            assert_eq!(
+                with.detail[..bare.detail.len()],
+                bare.detail[..],
+                "{set_by}"
+            );
+            assert_eq!(with.detail.last(), Some(set_by), "{set_by}: the last line");
+            assert_eq!(with.key, bare.key);
+            // NEGATIVE CONTROL: the setter in the title breaks the rule.
+            assert!(
+                glass_title_fault(&format!("{} {set_by}", bare.title)).is_some(),
+                "{set_by}"
+            );
+        }
+    }
 }
 
 /// ONLY AN INTERRUPT STANDS ON THE BAND (the owner, 2026-09-28: "there needs
@@ -952,7 +1018,7 @@ fn every_reporter_message() -> Vec<Message> {
                 &Exception::of_notice(
                     text,
                     Some(&"a".repeat(aterm_agent::harness::accounts::LABEL_MAX)),
-                    Some("its typing budget for the hour is spent"),
+                    text.whys.iter().copied().max_by_key(|w| w.chars().count()),
                     "the agent working",
                 ),
             ));
@@ -983,8 +1049,8 @@ fn every_reporter_message() -> Vec<Message> {
         true,
     ));
     for view in crate::autopilot::AutopilotView::ALL {
-        all.push(autopilot_set("s-1", "in tab 2", view, true, None));
-        all.push(autopilot_set("s-1", "in its tab", view, false, None));
+        all.push(autopilot_set("s-1", "in tab 2", view, true, None, None));
+        all.push(autopilot_set("s-1", "in its tab", view, false, None, None));
     }
     all.push(hold_refused(true, "no session"));
     all.push(hold_refused(false, "no session"));
@@ -3050,34 +3116,59 @@ fn the_login_lifecycle_entries_are_showable() {
 /// read on 2026-10-19), the engine keeps each notice's key as written (its
 /// cap cut `harness.resume-ask.<tab>.login-…` once, and every notice's
 /// key was one), the keys differ, and each row is the owner's four parts,
-/// the reason and the step leading, all four the expanded row's sentence.
-/// NEGATIVE CONTROL: an exception with no notice keeps the tab's own key.
+/// THE STEP LEADING — the band's excerpt, under a title that already says
+/// what happened (the review of the login carry, 2026-10-20: led by the
+/// happening, the band said it twice and never the step) — all four the
+/// expanded row's sentence, with how the step's pin ends after them where it
+/// sets one (r3h-3), and the row offers its tab where it was found.
+/// NEGATIVE CONTROLS: an exception with no notice keeps the tab's own key; a
+/// tab not found offers nothing.
 #[test]
 fn every_notices_ask_is_its_own_row_keyed_whole() {
     let sid = "s-5f7f1e417ee76c7b52ae";
+    let show = Intent::ShowTab { tab: 1, window: 1 };
     let spot = UpgradeSpot {
         place: "in tab 1".to_string(),
+        nav: Some(show.clone()),
+    };
+    let lost = UpgradeSpot {
         nav: None,
+        ..spot.clone()
     };
     let mut keys = std::collections::BTreeSet::new();
     for text in aterm_agent::supervise::policy::notice::ALL {
-        let e = Exception::of_notice(text, Some("main"), Some("a draft is in the composer"), "x");
+        let e = Exception::of_notice(text, Some("main"), text.whys.first().copied(), "x");
         let n = e.notice.clone().expect("a notice");
         let msg = resume_ask(sid, &spot, &e);
         let key = notice_ask_key(sid, Some(text.code));
         assert_eq!(msg.key.as_deref(), Some(key.as_str()), "{}", text.id);
         assert!(keys.insert(key), "{}: a key twice", text.id);
+        // …and after them, where the step outlasts the notice, how it ends
+        // (r3h-3): the pin `accounts use` sets, and nothing else.
+        let undo = n.undo.clone();
+        assert_eq!(undo.is_some(), text.undo.is_some(), "{}", text.id);
+        let mut said = vec![e.action.clone(), e.why.clone(), n.did, n.expect];
+        said.extend(undo);
+        assert_eq!(msg.detail, said, "{}", text.id);
+        let aterm_messages::need::Need::Now(ask) = msg.need() else {
+            panic!("{}: not a standing ask", text.id);
+        };
+        assert_eq!(ask.then().words(), e.action, "{}", text.id);
         assert_eq!(
-            msg.detail,
-            [e.why.clone(), e.action.clone(), n.did, n.expect],
-            "{}",
+            msg.actions,
+            std::slice::from_ref(&show),
+            "{}: its tab",
             text.id
         );
-        assert!(matches!(msg.need(), aterm_messages::need::Need::Now(_)));
+        assert!(
+            resume_ask(sid, &lost, &e).actions.is_empty(),
+            "{}: no tab found, nothing offered",
+            text.id
+        );
         assert_eq!(
             sentence_lines(msg.key.as_deref(), &msg.detail),
-            4,
-            "{}: all four a person's words",
+            msg.detail.len(),
+            "{}: every line a person's words",
             text.id
         );
     }
@@ -3093,5 +3184,540 @@ fn every_notices_ask_is_its_own_row_keyed_whole() {
     assert_eq!(
         resume_ask(sid, &spot, &plain).key,
         Some(resume_ask_key(sid))
+    );
+}
+
+/// What a reader faults in the disk-full alert `msg` built for `cause`, whose
+/// bytes left read `left`: an ask that cannot stand, a band that does not
+/// open on the step, Details that do not show the cause next, the bytes left
+/// said on more lines than one, the claim that aterm took all it may said
+/// twice or where aterm was kept from trying, a settings key, a clipped line.
+fn disk_full_faults(msg: &Message, cause: DiskFullCause, left: &str) -> Vec<String> {
+    let aterm_messages::need::Need::Now(ask) = msg.need() else {
+        return vec!["not a standing ask".to_owned()];
+    };
+    let mut out: Vec<String> = ask.fault().map(str::to_owned).into_iter().collect();
+    let (why, then) = (ask.why().words(), ask.then().words().to_owned());
+    if msg.detail.first() != Some(&then) {
+        out.push("the band does not open on the step".to_owned());
+    }
+    if msg.detail.get(1) != Some(&why) {
+        out.push("Details do not show the cause".to_owned());
+    }
+    let said = msg.detail.iter().filter(|l| l.contains(left)).count();
+    if said > 1 {
+        out.push(format!("the bytes left said on {said} lines"));
+    }
+    let claims = msg
+        .detail
+        .iter()
+        .filter(|l| {
+            l.contains("every unused build cache")
+                || l.contains("every build cache it may")
+                || l.contains("nothing more")
+        })
+        .count();
+    if claims > 1 || (claims == 1 && cause != DiskFullCause::Spent) {
+        out.push(format!("says aterm took all it may on {claims} lines"));
+    }
+    for key in [
+        "auto_free_gib",
+        "dead_build_dirs",
+        "[disk]",
+        "ATERM_STATE_HOME",
+    ] {
+        if msg.detail.iter().any(|l| l.contains(key)) {
+            out.push(format!("names the key {key}"));
+        }
+    }
+    out.extend(
+        msg.detail
+            .iter()
+            .filter(|l| l.ends_with('\u{2026}'))
+            .map(|l| format!("clipped: {l}")),
+    );
+    out
+}
+
+/// The disk watch's lines on a volume it has not measured: the emergency's
+/// own floor, 4 GiB and 50,000 files.
+fn disk_lines() -> aterm_agent::harness::disk::Thresholds {
+    aterm_agent::harness::disk::Config::default().thresholds(None)
+}
+
+/// THE DISK-FULL ALERT SAYS WHAT ENDS IT AND WHAT FOLLOWS (the review of the
+/// band, 2026-10-20: an owner who freed 2 GiB still saw `Disk full`, with no
+/// target and no word that the stopped tabs go on): under its step and its
+/// cause, one line names the free space the watch ends the alert at — in
+/// bytes, or for a volume out of inodes in files — and it is part of the
+/// owner's sentence in Details, the largest folders technical lines under
+/// it. NEGATIVE CONTROL: other lines name other figures.
+#[test]
+fn the_disk_full_alert_says_what_ends_it() {
+    use super::DiskFullCause as C;
+    let human = aterm_agent::harness::disk::human_bytes;
+    let lines = disk_lines();
+    let other = aterm_agent::harness::disk::Thresholds {
+        emergency: 9 << 30,
+        files_emergency: 70_000,
+        ..lines
+    };
+    assert_eq!(
+        (human(lines.emergency).as_str(), lines.files_emergency),
+        ("4.0 GiB", 50_000)
+    );
+    let hogs = vec!["~/src/w/target 9.0 GiB".to_string()];
+    for cause in [
+        C::Spent,
+        C::Unrecorded,
+        C::Unsupervised { whole: true },
+        C::CleanupOff { fault: false },
+        C::Inodes,
+        C::Private(crate::harness_host::DiskPrivate::StateRoot),
+    ] {
+        let said = |t: &aterm_agent::harness::disk::Thresholds| {
+            super::disk_full(Some(1 << 20), 31 << 30, &hogs, cause, t)
+        };
+        let msg = said(&lines);
+        let expect = &msg.detail[2];
+        let (figure, theirs) = if cause == C::Inodes {
+            ("50,000".to_string(), "70,000".to_string())
+        } else {
+            (human(lines.emergency), human(other.emergency))
+        };
+        assert!(expect.contains(&figure), "{cause:?}: {expect}");
+        assert_eq!(
+            super::sentence_lines(msg.key.as_deref(), &msg.detail),
+            3,
+            "{cause:?}: the step, the cause and what to expect"
+        );
+        assert!(msg.detail[3].starts_with("Largest: "), "{cause:?}");
+        // NEGATIVE CONTROL: the line follows the watch's own figure.
+        let moved = said(&other);
+        assert!(
+            moved.detail[2].contains(&theirs),
+            "{cause:?}: {}",
+            moved.detail[2]
+        );
+        assert!(!moved.detail[2].contains(&figure), "{cause:?}");
+    }
+}
+
+/// THE DISK-FULL ALERT SHOWS ITS STEP AND STATES ITS CAUSE ONCE (review
+/// ox-17; the review of the owner's notices, 2026-10-20: the band showed the
+/// cause and never the step): the band's excerpt is the step, and Details
+/// open on it and then the cause; the bytes left lead the cause and are on
+/// no other line; only a pass that took every build cache aterm may remove
+/// says so, and once; no line names a settings key; every cause reads apart
+/// from the others; and the largest folders follow the cause, the step
+/// pointing at them. Every figure is tried at its widest, so no line is
+/// clipped. NEGATIVE CONTROLS: the alert's old shape (its own lines, then
+/// the ask) is faulted for leading with no step, for saying aterm took all
+/// it may twice and, with cleanup off, for claiming it at all and for naming
+/// the key.
+#[test]
+fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
+    use super::DiskFullCause as C;
+    let human = aterm_agent::harness::disk::human_bytes;
+    let causes = [
+        C::Spent,
+        C::Unrecorded,
+        C::Unsupervised { whole: true },
+        C::Unsupervised { whole: false },
+        C::CleanupOff { fault: false },
+        C::CleanupOff { fault: true },
+        C::Inodes,
+        C::Private(crate::harness_host::DiskPrivate::StateRoot),
+        C::Private(crate::harness_host::DiskPrivate::DeviceUnnamed),
+        C::Private(crate::harness_host::DiskPrivate::NoAccountHome),
+    ];
+    // 1023.9 MiB and 1023.9 GiB: the widest figures `human_bytes` writes
+    // below a TiB.
+    let widest_free = (1u64 << 30) - (1u64 << 20) / 10;
+    let widest_freed = (1u64 << 40) - (1u64 << 30) / 10;
+    assert_eq!(human(widest_free), "1023.9 MiB");
+    assert_eq!(human(widest_freed), "1023.9 GiB");
+    let hog = |i: usize| format!("~/src/w{i}/target 9{i}.0 GiB (cargo build; targo clean)");
+    let mut reasons = std::collections::BTreeSet::new();
+    for cause in causes {
+        for free in [1u64 << 20, widest_free] {
+            for freed in [0, 31u64 << 30, widest_freed] {
+                for n in [0, 1, 4] {
+                    let hogs: Vec<String> = (0..n).map(hog).collect();
+                    let msg = super::disk_full(Some(free), freed, &hogs, cause, &disk_lines());
+                    let left = human(free);
+                    let at = format!("{cause:?} free={left} freed={} hogs={n}", human(freed));
+                    assert_eq!(
+                        disk_full_faults(&msg, cause, &left),
+                        Vec::<String>::new(),
+                        "{at}: {:?}",
+                        msg.detail
+                    );
+                    assert_eq!(attention(&msg), Ok(Attention::Failure), "{at}");
+                    assert_eq!(msg.key.as_deref(), Some(super::DISK_FULL_KEY), "{at}");
+                    let largest: Vec<String> = hogs
+                        .iter()
+                        .take(3)
+                        .map(|h| format!("Largest: {h}"))
+                        .collect();
+                    assert_eq!(msg.detail[3..], largest[..], "{at}");
+                    let step = &msg.detail[0];
+                    if cause == C::Inodes {
+                        assert!(step.contains("small files"), "{at}: {step}");
+                    } else if n > 0 {
+                        assert!(step.contains("largest folder in Details"), "{at}: {step}");
+                    } else {
+                        assert!(step.contains("aterm harness disk"), "{at}: {step}");
+                    }
+                    if cause != C::Inodes {
+                        assert!(msg.detail[1].starts_with(&left), "{at}: {}", msg.detail[1]);
+                    }
+                    if free == 1 << 20 && freed == 31 << 30 && n == 0 {
+                        reasons.insert(msg.detail[1].clone());
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        reasons.len(),
+        causes.len(),
+        "one reason per cause: {reasons:?}"
+    );
+    // A PASS KEPT FROM REMOVING (its write-ahead record refused on the full
+    // volume) never says it found nothing to remove, nor that it took all it
+    // may; NEGATIVE CONTROL: a clean pass keeps the Spent words.
+    let kept = |freed| {
+        super::disk_full(Some(1 << 20), freed, &[], C::Unrecorded, &disk_lines()).detail[1].clone()
+    };
+    let spent = |freed| {
+        super::disk_full(Some(1 << 20), freed, &[], C::Spent, &disk_lines()).detail[1].clone()
+    };
+    for freed in [0, 31u64 << 30] {
+        let (kept, spent) = (kept(freed), spent(freed));
+        assert!(
+            kept.contains("could not log a removal")
+                && !kept.contains("found no unused build cache")
+                && !kept.contains("every unused build cache"),
+            "{kept}"
+        );
+        assert!(
+            spent.contains("found no unused build cache")
+                || spent.contains("every unused build cache"),
+            "{spent}"
+        );
+    }
+
+    // NEGATIVE CONTROLS: the old shape, its lines written before its ask.
+    let old = |why: &str| {
+        Message::new(tags::SYSTEM, Severity::Error, "Disk full")
+            .line("1.0 MiB left on /Users//x; aterm freed 0 B and can free nothing more safely")
+            .line(why)
+            .now(Ask::standing(
+                StandingWhy::Spent {
+                    tried: Reason::new("freed 0 B of rebuildable caches"),
+                    reason: Reason::new("nothing more on the volume is safe for aterm to remove"),
+                },
+                Then::step("Free up space on the home volume"),
+            ))
+            .key(super::DISK_FULL_KEY)
+    };
+    let spent = disk_full_faults(
+        &old("aterm reclaimed every build cache it may and nothing more is safe to remove"),
+        C::Spent,
+        "1.0 MiB",
+    );
+    assert!(
+        spent.contains(&"the band does not open on the step".to_owned())
+            && spent.contains(&"says aterm took all it may on 2 lines".to_owned()),
+        "{spent:?}"
+    );
+    let off = disk_full_faults(
+        &old(
+            "the automatic removal is off ([disk] auto_free_gib is 0, or a [disk] value aterm \
+             cannot read)",
+        ),
+        C::CleanupOff { fault: false },
+        "1.0 MiB",
+    );
+    assert!(
+        off.contains(&"says aterm took all it may on 1 lines".to_owned())
+            && off.contains(&"names the key auto_free_gib".to_owned()),
+        "{off:?}"
+    );
+}
+
+/// `msg` alone on the band of a window `cols` cells wide, once its reveal's
+/// grace is over, measured as the window measures it.
+fn band_row(msg: Message, cols: usize) -> aterm_messages::RowLayout {
+    let now = aterm_messages::Instant::now();
+    let mut c = aterm_messages::MessageCenter::new(aterm_messages::MessageLog::empty(), now);
+    c.post(msg, aterm_messages::WallStamp { unix_ms: 1 }, now);
+    let later = now + aterm_messages::PROGRESS_GRACE + aterm_messages::Duration::from_millis(1);
+    let _ = c.settle(later, true);
+    c.commit_rows(later, 3);
+    let mut p = c.presentation(
+        cols,
+        &crate::message_band::cell_width,
+        None,
+        aterm_messages::Links::Painted,
+    );
+    assert_eq!(p.rows.len(), 1, "one row on the band");
+    p.rows.remove(0)
+}
+
+/// The columns of the windows the review imaged the band at: 864 px and
+/// 514 px of the default font (`targo --unverified lab instance --columns`).
+const BAND_WIDE: usize = 120;
+const BAND_NARROW: usize = 70;
+
+/// The window's own width when nothing sizes it (`app_config`'s
+/// `resolve_initial_columns`): the band most owners read.
+const BAND_DEFAULT: usize = 80;
+
+/// The cells the band keeps clear before a row's first capsule
+/// (`aterm_messages`' `BEFORE_CAPSULES`).
+const BAND_CLEARANCE: usize = 2;
+
+/// The band's implicit link to Details, and the cells it takes beside the
+/// capsule before it (its words, its two pads, the gap).
+const DETAILS_LINK: &str = "Details \u{203a}";
+const DETAILS_CELLS: usize = 12;
+
+/// Whether a band row's `shown` title reads as its whole `title`, its
+/// `short` form whole, or its short form cut with an ellipsis: never as a
+/// cut of the whole title (the review of the band, 2026-10-20: `Claude's
+/// lo…` at the default window).
+fn title_reads(shown: &str, title: &str, short: &str) -> bool {
+    let said = shown.trim_end_matches('\u{2026}');
+    shown == title
+        || shown == short
+        || (shown.ends_with('\u{2026}') && !said.is_empty() && short.starts_with(said))
+}
+
+/// EVERY NOTICE'S STEP STANDS ON THE BAND, AND SAYS WHICH ACCOUNT THERE (the
+/// review of the owner's notices, 2026-10-20: at 864 px the step was cut
+/// mid-sentence, at 514 px it was gone, and the disk-full band showed no
+/// step at all; the review of the band, 2026-10-20: at 514 px, and at the
+/// default 80 columns, the cut took the account each step names, and a
+/// renewal's command lost its label). At the wide window the title and the
+/// step stand whole, for the roster's first label (`main`, which the first
+/// `accounts add` lists) and each clause a notice is raised with. At the
+/// narrow and the default ones, for that label and for one as long as the
+/// sentences name whole ([`notice::LABEL_ROOM`]): the step stands from its
+/// first word, the title giving way first; a step that names the account
+/// names it whole, and its lead clause (`Sign in to …:`) stands whole; and a
+/// step that runs a command is the whole command or its short form
+/// ([`notice::COMMAND_UNDER_DETAILS`]), never a cut of it — at every width.
+/// A sentence step not shown whole ends in `…`, its lead clause alone too
+/// (the review of the band, ox4-8: `Sign in to client-acme-research-024`
+/// read as the whole step); and where the short form stands in a command's
+/// place, a title cut beside it leaves no blank cells (ox4-3: 25 blank cells
+/// beside `Claude usag…`), and the short title whole leaves none `Details ›`
+/// would fit in. The title reads whole, as its short form whole or as its
+/// short form cut — never a stub of the whole title (`Claude's lo…` at the
+/// default window). The disk-full alert alike, at each step it says.
+/// NEGATIVE CONTROLS: a notice with no short title is a stub at the
+/// default band; a step
+/// longer than the wide band's room is cut there; a step that names its
+/// label last (the wording the review imaged) loses it at the narrow band; a
+/// lead clause too long for the narrow band is cut there; and a command with
+/// no short form is cut — so each check can fail.
+#[test]
+fn every_tab_notices_step_stands_on_the_band() {
+    use aterm_agent::supervise::policy::notice;
+    let spot = UpgradeSpot {
+        place: "in tab 1".to_string(),
+        nav: Some(Intent::ShowTab { tab: 1, window: 1 }),
+    };
+    let bare = |s: &str| s.trim_end_matches('\u{2026}').to_string();
+    let excerpt = |msg: Message, cols: usize| {
+        band_row(msg, cols)
+            .detail
+            .map(|(_, d)| bare(&d))
+            .unwrap_or_default()
+    };
+    let narrow = |msg: Message| excerpt(msg, BAND_NARROW);
+    let stands = |msg: Message, step: &str, at: &str| {
+        let title = msg.title.clone();
+        let wide = band_row(msg.clone(), BAND_WIDE);
+        assert_eq!(
+            wide.detail.as_ref().map(|(_, d)| d.as_str()),
+            Some(step),
+            "{at}: {wide:?}"
+        );
+        assert_eq!(wide.title.1, title, "{at}: {wide:?}");
+    };
+    const COMMAND: &str = "aterm harness";
+    // The width law of one notice's step at `cols`.
+    let holds = |e: &Exception, label: Option<&str>, cols: usize, at: &str| {
+        let msg = resume_ask("s-1", &spot, e);
+        let title = msg.title.clone();
+        let row = band_row(msg, cols);
+        let short = e.notice.as_ref().expect("a notice").short_title;
+        assert!(
+            title_reads(&row.title.1, &title, short),
+            "{at} at {cols}: a stub of the title: {:?}",
+            row.title.1
+        );
+        let raw = row
+            .detail
+            .as_ref()
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        let shown = bare(&raw);
+        let step = e.action.as_str();
+        assert!(!shown.is_empty(), "{at} at {cols}: no step");
+        if step.contains(COMMAND) {
+            assert!(
+                shown == step || shown == notice::COMMAND_UNDER_DETAILS,
+                "{at} at {cols}: a command cut: {shown:?}"
+            );
+            // The short form gives back what the whole command would have
+            // taken (ox4-3): a title cut beside it leaves no blank cells
+            // before the capsules' clearance, and the short title whole
+            // leaves fewer than `Details ›` takes where that link is gone
+            // (the short form sends the reader to it).
+            if shown == notice::COMMAND_UNDER_DETAILS && row.title.1 != title {
+                let (col, words) = row.detail.as_ref().expect("the short form");
+                let end = col + crate::message_band::cell_width(words);
+                let first = row.capsules.first().expect("Show tab 1").col;
+                let blank = first.saturating_sub(end + BAND_CLEARANCE);
+                let details = row.capsules.iter().any(|c| c.text == DETAILS_LINK);
+                let spare = if row.title.1.ends_with('\u{2026}') {
+                    0
+                } else if details {
+                    usize::MAX
+                } else {
+                    DETAILS_CELLS - 1
+                };
+                assert!(
+                    blank <= spare,
+                    "{at} at {cols}: {:?} beside {blank} blank cells",
+                    row.title.1,
+                );
+            }
+            return;
+        }
+        assert!(step.starts_with(&shown), "{at} at {cols}: {shown:?}");
+        // A step cut short says so (ox4-8): never its lead clause bare.
+        assert!(
+            raw == step || raw.ends_with('\u{2026}'),
+            "{at} at {cols}: a cut step with no mark: {raw:?}"
+        );
+        if let Some(label) = label.filter(|l| step.contains(l)) {
+            assert!(shown.contains(label), "{at} at {cols}: {shown:?}");
+        }
+        if let Some((lead, _)) = step.split_once(": ") {
+            assert!(shown.starts_with(lead), "{at} at {cols}: {shown:?}");
+        }
+    };
+    let room = "r".repeat(notice::LABEL_ROOM);
+    for text in notice::ALL {
+        let whys: Vec<Option<&str>> = if text.whys.is_empty() {
+            vec![None]
+        } else {
+            text.whys.iter().copied().map(Some).collect()
+        };
+        for why in whys {
+            let label = text.takes_label().then_some("main");
+            let e = Exception::of_notice(text, label, why, "x");
+            stands(resume_ask("s-1", &spot, &e), &e.action, text.id);
+            for name in [label, label.map(|_| room.as_str())] {
+                let e = Exception::of_notice(text, name, why, "x");
+                for cols in [BAND_NARROW, BAND_DEFAULT, BAND_WIDE] {
+                    holds(&e, name, cols, text.id);
+                }
+                // A command is never cut, at any width.
+                for cols in 30..=160 {
+                    let shown = excerpt(resume_ask("s-1", &spot, &e), cols);
+                    assert!(
+                        !shown.contains(COMMAND) || shown == e.action,
+                        "{} at {cols}: {shown:?}",
+                        text.id
+                    );
+                }
+            }
+        }
+    }
+    use super::DiskFullCause as C;
+    for (cause, hogs) in [
+        (C::Spent, vec![]),
+        (C::Spent, vec!["~/src/w/target 9.0 GiB".to_string()]),
+        (C::Inodes, vec![]),
+    ] {
+        let msg = super::disk_full(Some(1 << 20), 31 << 30, &hogs, cause, &disk_lines());
+        let step = msg.detail[0].clone();
+        stands(msg.clone(), &step, &format!("disk {cause:?}"));
+        let shown = narrow(msg);
+        assert!(
+            !shown.is_empty() && step.starts_with(&shown),
+            "disk {cause:?}: {shown:?}"
+        );
+    }
+    // NEGATIVE CONTROL: a notice with no short title reads as a stub of its
+    // whole title at the default band.
+    let e = Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x");
+    let unshort = Exception {
+        notice: e.notice.clone().map(|n| notice::Notice {
+            short_title: "",
+            ..n
+        }),
+        ..e
+    };
+    let msg = resume_ask("s-1", &spot, &unshort);
+    let title = msg.title.clone();
+    let row = band_row(msg, BAND_DEFAULT);
+    assert!(
+        !title_reads(&row.title.1, &title, notice::LIMIT_RENEW.short_title),
+        "the control: {row:?}"
+    );
+    // NEGATIVE CONTROL: a step past the wide band's room.
+    let long = Exception {
+        action: format!(
+            "{} {}",
+            "Type /login in the tab and sign in again",
+            "x".repeat(70)
+        ),
+        ..Exception::of_notice(&notice::LOGIN_CANCELLED, None, None, "x")
+    };
+    let row = band_row(resume_ask("s-1", &spot, &long), BAND_WIDE);
+    assert!(
+        row.detail.as_ref().map(|(_, d)| d.as_str()) != Some(long.action.as_str())
+            || row.title.1 != row.full_title,
+        "the control: {row:?}"
+    );
+    // NEGATIVE CONTROL: the step the review imaged, its label last.
+    let last = Exception {
+        action: "Type /login and sign in to the account labelled main.".to_string(),
+        ..Exception::of_notice(&notice::LOGIN_CANCELLED, Some("main"), None, "x")
+    };
+    assert!(
+        !narrow(resume_ask("s-1", &spot, &last)).contains("main"),
+        "the control: {:?}",
+        narrow(resume_ask("s-1", &spot, &last))
+    );
+    // NEGATIVE CONTROL: a lead clause past the narrow band's room is cut.
+    let lead = Exception {
+        action: format!("Sign in to {}: type /login in the tab.", "q".repeat(48)),
+        ..Exception::of_notice(&notice::LOGIN_CANCELLED, Some("main"), None, "x")
+    };
+    let shown = narrow(resume_ask("s-1", &spot, &lead));
+    assert!(
+        !shown.starts_with(lead.action.split_once(": ").expect("a lead").0),
+        "the control: {shown:?}"
+    );
+    // NEGATIVE CONTROL: a command with no short form is cut on the narrow
+    // band (an exception built by hand carries none).
+    let bare_command = Exception {
+        notice: Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x")
+            .notice
+            .map(|n| aterm_agent::supervise::policy::notice::Notice { short: None, ..n }),
+        ..Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x")
+    };
+    let shown = narrow(resume_ask("s-1", &spot, &bare_command));
+    assert!(
+        shown.contains(COMMAND) && shown != bare_command.action,
+        "the control: {shown:?}"
     );
 }

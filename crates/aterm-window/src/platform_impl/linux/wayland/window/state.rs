@@ -1001,6 +1001,12 @@ impl WindowState {
         self.reload_transparency_hint();
     }
 
+    /// The text inputs observed on the window (`retire_tests`).
+    #[cfg(test)]
+    pub(crate) fn text_inputs(&self) -> &[Weak<TextInput>] {
+        &self.text_inputs
+    }
+
     /// Register text input on the top-level.
     #[inline]
     pub fn text_input_entered(&mut self, text_input: &Arc<TextInput>) {

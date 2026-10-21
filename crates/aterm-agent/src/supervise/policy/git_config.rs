@@ -415,14 +415,20 @@ impl WorkerEnv {
     }
 
     /// The worker's Claude Code directory, for a worker standing in `cwd`, as
-    /// Claude Code resolves it ([`claude_dir_at`], with this account's home
-    /// from the passwd database): where its user settings, session files,
+    /// Claude Code resolves it ([`claude_dir_at`] over its `CLAUDE_CONFIG_DIR`
+    /// and the variable its `os.homedir()` reads,
+    /// [`crate::harness::accounts::HOMEDIR_ENV`]: `HOME`, on Windows
+    /// `USERPROFILE` — a scratch one included, whatever `HOME` says; with
+    /// that unset or empty, the account's home,
+    /// [`atpkg::platform::account_home`]: the passwd database's, on Windows
+    /// the token's profile): where its user settings, session files,
     /// transcripts and shell snapshots are. `Err` says why it cannot be
     /// named.
     pub fn claude_dir(&self, cwd: &Path) -> Result<PathBuf, String> {
+        use crate::harness::accounts::{HOME_ENV, HOMEDIR_ENV};
         claude_dir_at(
-            self.var("CLAUDE_CONFIG_DIR"),
-            self.var("HOME"),
+            self.var(HOME_ENV),
+            self.var(HOMEDIR_ENV),
             cwd,
             atpkg::platform::account_home,
         )
@@ -604,11 +610,12 @@ fn git_failed(what: &str, at: &Path, status: std::process::ExitStatus, command: 
 }
 
 /// The Claude Code directory of a process whose `CLAUDE_CONFIG_DIR` is
-/// `config_dir` and whose `HOME` is `home`, standing in `cwd`, as Claude Code
-/// resolves it: `path.resolve(CLAUDE_CONFIG_DIR ?? join(os.homedir(),
-/// ".claude"))`. A `CLAUDE_CONFIG_DIR` that is set at all counts, even an
-/// empty one (`??`); otherwise `os.homedir()` is the non-empty `HOME`, else
-/// the account's home from the passwd database (the worker's account is this
+/// `config_dir` and whose `HOME` (`USERPROFILE` on Windows,
+/// [`crate::harness::accounts::HOMEDIR_ENV`]) is `home`, standing in `cwd`,
+/// as Claude Code resolves it: `path.resolve(CLAUDE_CONFIG_DIR ??
+/// join(os.homedir(), ".claude"))`. A `CLAUDE_CONFIG_DIR` that is set at all
+/// counts, even an empty one (`??`); otherwise `os.homedir()` is the
+/// non-empty `home`, else the account's home (the worker's account is this
 /// process's: [`atpkg::caller_shell::process_args`] reads only this uid's
 /// processes). A relative result is taken against `cwd`, lexically. `Err`
 /// says what is missing where the account names no home either.
@@ -678,7 +685,11 @@ impl Probe<'_> {
             .ancestors()
             .find(|a| a.is_dir())
             .unwrap_or_else(|| Path::new("/"));
-        let run = |args: &[&str]| self.git(dir).args(args).output();
+        let run = |args: &[&str]| {
+            let mut cmd = self.git(dir);
+            cmd.args(args);
+            aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(10))
+        };
         let listed = run(&["config", "--list", "-z", "--show-scope"])
             .map_err(|e| format!("cannot read the git config in {}: {e}", dir.display()))?;
         if !listed.status.success() {
@@ -752,10 +763,9 @@ impl Probe<'_> {
     /// The paths of the submodules (gitlinks, mode 160000) in the index of
     /// the worktree at `top`.
     fn gitlinks(&self, top: &Path) -> Result<Vec<String>, String> {
-        let out = self
-            .git(top)
-            .args(["ls-files", "-z", "--stage"])
-            .output()
+        let mut cmd = self.git(top);
+        cmd.args(["ls-files", "-z", "--stage"]);
+        let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(10))
             .map_err(|e| format!("cannot list the index in {}: {e}", top.display()))?;
         if !out.status.success() {
             return Err(git_failed(
@@ -778,13 +788,13 @@ impl Probe<'_> {
     /// worktree at `top` (`git ls-files -z | git check-attr --stdin -z
     /// filter`); `None` when they could not be read.
     fn filters_selected(&self, top: &Path) -> Option<Vec<String>> {
-        let paths = self
-            .git(top)
-            .args(["ls-files", "-z"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())?
-            .stdout;
+        let mut cmd = self.git(top);
+        cmd.args(["ls-files", "-z"]);
+        let paths =
+            aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(10))
+                .ok()
+                .filter(|o| o.status.success())?
+                .stdout;
         let mut child = self
             .git(top)
             .args(["check-attr", "--stdin", "-z", "filter"])

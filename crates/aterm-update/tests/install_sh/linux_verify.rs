@@ -40,6 +40,8 @@ const OTHER: &str = "other";
 /// `os.getxattr` answers each attribute from the JSON table (`null`, it
 /// exists; an errno; `ENODATA` for one the table leaves out), and any other
 /// target is a verifier function that answers the JSON whatever it is asked.
+/// `STUB_SIGNATURES=once`: the verifier's own `verify_ed25519` runs once per
+/// distinct key, bytes and signature in the batch, its answer reused.
 const HARNESS: &str = r#"import contextlib, errno, io, json, os, sys, types
 source = sys.stdin.read()
 marker = "\nMASTER_PUBKEYS = "
@@ -59,6 +61,15 @@ if mode == "pins":
     print("\n".join(verifier["MASTER_PUBKEYS"]))
     sys.exit(0)
 refusals = (ValueError, OSError, verifier["subprocess"].SubprocessError)
+if os.environ.get("STUB_SIGNATURES") == "once":
+    # The verifier's own check, asked once per key, bytes and signature: its answer is
+    # OpenSSL's on exactly those, so a batch that repeats a proof spawns no second one.
+    checked, check = {}, verifier["verify_ed25519"]
+    def verify_once(key, data, signature):
+        if (key, data, signature) not in checked:
+            checked[key, data, signature] = check(key, data, signature)
+        return checked[key, data, signature]
+    verifier["verify_ed25519"] = verify_once
 def stand_in(spec):
     target, _, value = spec.partition("=")
     value = json.loads(value)
@@ -103,22 +114,50 @@ struct Tools {
     openssl: PathBuf,
 }
 
-fn tools() -> Option<Tools> {
-    let homebrew = ["/opt/homebrew/bin", "/usr/local/bin"];
-    let python = [
-        "python3.14",
-        "python3.13",
-        "python3.12",
-        "python3.11",
-        "python3",
-    ]
-    .iter()
-    .flat_map(|name| {
-        let mut found: Vec<PathBuf> = homebrew.iter().map(|d| Path::new(d).join(name)).collect();
-        found.extend(crate::support::which(name));
-        found
-    })
-    .find(|python| {
+/// Where the verifier's tools are looked for: each list in order, the first candidate
+/// that meets the floor taken. Injected, so a test can stand up a host with neither.
+#[derive(Default)]
+struct Search {
+    python: Vec<PathBuf>,
+    openssl: Vec<PathBuf>,
+}
+
+impl Search {
+    /// This host's, from the `python3` and `openssl3` rows of `TOOLS`.
+    fn host() -> Self {
+        Self {
+            python: candidates(
+                "python3",
+                &[
+                    "python3.14",
+                    "python3.13",
+                    "python3.12",
+                    "python3.11",
+                    "python3",
+                ],
+            ),
+            openssl: candidates("openssl3", &["openssl"]),
+        }
+    }
+}
+
+/// `row`'s candidates: `$ATERM_TEST_<ROW>` alone when it is set (an operator's choice is
+/// never passed over for another), else the row's usual paths, then each of `names` on
+/// `$PATH`.
+fn candidates(row: &str, names: &[&str]) -> Vec<PathBuf> {
+    let row = aterm_uds::host::tool(row);
+    if let Some(named) = std::env::var_os(row.var()) {
+        return vec![PathBuf::from(named)];
+    }
+    let mut found: Vec<PathBuf> = row.at.iter().map(PathBuf::from).collect();
+    found.extend(names.iter().filter_map(|name| crate::support::which(name)));
+    found
+}
+
+/// The first of `search`'s candidates that meets the floor, or the `TOOLS` rows of the
+/// ones no candidate meets.
+fn tools_in(search: &Search) -> Result<Tools, Vec<&'static str>> {
+    let python = search.python.iter().find(|python| {
         python.is_file()
             && run(aterm_uds::spawnfd::command(python).args([
                 "-I",
@@ -127,16 +166,8 @@ fn tools() -> Option<Tools> {
             ]))
             .status
                 == Some(0)
-    })?;
-    let mut openssl: Vec<PathBuf> = [
-        "/opt/homebrew/opt/openssl@3/bin/openssl",
-        "/usr/local/opt/openssl@3/bin/openssl",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect();
-    openssl.extend(crate::support::which("openssl"));
-    let openssl = openssl.into_iter().find(|exe| {
+    });
+    let openssl = search.openssl.iter().find(|exe| {
         exe.is_file() && {
             let out = run(aterm_uds::spawnfd::command(exe).arg("version")).stdout;
             out.strip_prefix("OpenSSL ")
@@ -144,8 +175,18 @@ fn tools() -> Option<Tools> {
                 .and_then(|major| major.parse::<u32>().ok())
                 .is_some_and(|major| major >= 3)
         }
-    })?;
-    Some(Tools { python, openssl })
+    });
+    match (python, openssl) {
+        (Some(python), Some(openssl)) => Ok(Tools {
+            python: python.clone(),
+            openssl: openssl.clone(),
+        }),
+        (python, openssl) => Err([("python3", python), ("openssl3", openssl)]
+            .into_iter()
+            .filter(|(_, found)| found.is_none())
+            .map(|(row, _)| row)
+            .collect()),
+    }
 }
 
 /// The installer's verifier, reachable from a batch: `python3` is the harness
@@ -156,14 +197,18 @@ struct Verifier {
 }
 
 impl Verifier {
-    /// The verifier under `scratch`. Its tools are a machine prerequisite: a
-    /// machine without them fails here, naming the remedy, never passes.
+    /// The verifier under `scratch`, over this host's tools.
     fn new(scratch: &Scratch) -> Self {
-        let tools = tools().unwrap_or_else(|| {
-            panic!(
-                "the installer's Linux verifier needs Python 3.11+ and OpenSSL 3 \
-                 (brew install python@3.13 openssl@3)"
-            )
+        Self::with(scratch, &Search::host())
+    }
+
+    /// The verifier under `scratch`, over the tools `search` finds. A host without them
+    /// ends the test COULD NOT RUN saying what is missing (their `TOOLS` rows' refusals):
+    /// never a pass, and never a FAIL, which would charge the installer with the host's gap.
+    fn with(scratch: &Scratch, search: &Search) -> Self {
+        let tools = tools_in(search).unwrap_or_else(|absent| {
+            aterm_uds::host::could_not_run_without(&absent);
+            unreachable!("an absent tool ends COULD NOT RUN")
         });
         let bin = scratch.mkdir("verifier-bin");
         scratch.stand_in(
@@ -654,6 +699,17 @@ fn ask_verifier(
     script: &Path,
     calls: &[String],
 ) -> Vec<String> {
+    ask_verifier_with(scratch, verifier, script, calls, &[])
+}
+
+/// [`ask_verifier`] with `env` set in each batch's environment.
+fn ask_verifier_with(
+    scratch: &Scratch,
+    verifier: &Verifier,
+    script: &Path,
+    calls: &[String],
+    env: &[(&str, &str)],
+) -> Vec<String> {
     let code = "linux_release_verify";
     let chunks: Vec<&[String]> = calls.chunks(32).collect();
     let answers = std::sync::Mutex::new(vec![Vec::new(); chunks.len()]);
@@ -667,6 +723,9 @@ fn ask_verifier(
                 );
                 let mut lib = verifier.lib(script);
                 lib.env("STUB_MODE", "calls").env("STUB_CALLS", s(&file));
+                for (key, value) in env {
+                    lib.env(key, value);
+                }
                 let call = lib.call(code, &[]);
                 let recs = lib.run(scratch);
                 let rec = &recs[call];
@@ -1273,7 +1332,11 @@ fn differential(scratch: &Scratch, verifier: &Verifier, script: &Path) -> Tally 
         calls.push(main_call(case, &laid));
         expected.push(updater_verdict(case, &laid.proofs));
     }
-    let answers = ask_verifier(scratch, verifier, script, &calls);
+    // Most cases carry the base case's roster or appcast: the verifier's signature check
+    // is asked once per batch for each distinct proof ([`HARNESS`]), every case still
+    // decided by `main` over its own files.
+    let once = [("STUB_SIGNATURES", "once")];
+    let answers = ask_verifier_with(scratch, verifier, script, &calls, &once);
     let mut tally = Tally {
         accepted: 0,
         refused: 0,
@@ -1301,6 +1364,56 @@ fn differential(scratch: &Scratch, verifier: &Verifier, script: &Path) -> Tally 
         }
     }
     tally
+}
+
+/// §10 S2: with its tools looked up nowhere, the verifier ends COULD NOT RUN saying what
+/// is missing and that nothing provides it before S11, never a FAIL: a host without
+/// Python 3.11+ and OpenSSL 3 did not run these tests, which is no verdict on the
+/// installer. A Python and an OpenSSL below the floor are no copy either (stock macOS
+/// has both: 3.9.6 and LibreSSL).
+///
+/// The words are read from the pure halves ([`tools_in`] and the rows' refusals), never
+/// from a caught COULD NOT RUN, whose sentinel in this test's output would record a
+/// regression here as the machine's refusal. The one caught panic comes last and is
+/// asserted only to carry the sentinel.
+#[test]
+fn a_host_without_the_verifiers_tools_ends_could_not_run() {
+    let scratch = Scratch::new();
+    assert_eq!(
+        tools_in(&Search::default()).err(),
+        Some(vec!["python3", "openssl3"])
+    );
+    let old = Search {
+        python: vec![scratch.stand_in("old/python3", "#!/bin/sh\nexit 1\n")],
+        openssl: vec![scratch.stand_in("old/openssl", "#!/bin/sh\necho 'LibreSSL 3.3.6'\n")],
+    };
+    assert_eq!(
+        tools_in(&old).err(),
+        Some(vec!["python3", "openssl3"]),
+        "a copy below the floor is none"
+    );
+    let words = aterm_uds::host::refusals_for(&["python3", "openssl3"]).expect("two absent");
+    assert!(
+        words.contains("no Python 3.11+ here: aterm provides none: S11's Rust bootstrap verifier")
+            && words.contains("no OpenSSL 3 here: aterm provides none")
+            && words.contains("ATERM_TEST_PYTHON3=<path>")
+            && !words.contains("verify linux")
+            && !words.contains("brew"),
+        "{words}"
+    );
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Verifier::with(&scratch, &Search::default())
+    }));
+    let carried = refused.as_ref().err().and_then(|payload| {
+        payload
+            .downcast_ref::<String>()
+            .map(|words| words.contains(aterm_uds::host::COULD_NOT_RUN))
+    });
+    assert_eq!(
+        carried,
+        Some(true),
+        "the verifier ends a host without them COULD NOT RUN"
+    );
 }
 
 /// The installer accepts exactly what the updater would install, naming the

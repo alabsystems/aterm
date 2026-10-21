@@ -29,8 +29,9 @@ use crate::native_document_host::{replace_file, sync_directory};
 use crate::native_document_io::{
     ContentFingerprint, DraftJournalReducer, DurableCheckpoint, DurableSource, JOURNAL_SECRET_LEN,
     JournalAppendPlan, JournalAppendProof, JournalAppendResult, JournalDocumentKey, JournalEdit,
-    JournalError, JournalRecord, JournalReduction, JournalSecret, JournalStage, MAX_INSERT_BYTES,
-    MAX_JOURNAL_BYTES, StoredJournalRecovery, compact_journal, encode_journal, recover_journal_for,
+    JournalError, JournalImageGeneration, JournalOwnerId, JournalRecord, JournalReduction,
+    JournalSecret, JournalStage, LegacyJournal, MAX_INSERT_BYTES, MAX_JOURNAL_BYTES,
+    StoredJournalRecovery, compact_journal, encode_journal, recover_journal_for,
 };
 
 #[cfg(any(unix, windows))]
@@ -45,10 +46,7 @@ mod owner {
     use std::fs::File;
     use std::path::{Path, PathBuf};
 
-    use super::{ContentFingerprint, JournalDocumentKey, JournalImageGeneration};
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub(crate) enum JournalOwnerId {}
+    use super::{ContentFingerprint, JournalDocumentKey, JournalImageGeneration, JournalOwnerId};
 
     #[derive(Debug)]
     pub(crate) enum JournalOwner {}
@@ -93,8 +91,6 @@ mod owner {
     }
 }
 
-pub(crate) use owner::JournalOwnerId;
-
 const COMPACT_RECORDS: usize = 128;
 const COMPACT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -134,84 +130,6 @@ pub(crate) struct JournalOpenDecision {
     expected_clean: bool,
     /// The legacy journal this open read in place of the keyed one.
     legacy: Option<LegacyJournal>,
-}
-
-/// A journal an aterm from before 2026-10-10 wrote under the unkeyed name
-/// (`JournalDocumentKey::legacy_unkeyed`), found by an open of a URI with that
-/// name and migrated into the keyed journal: the open replays it, `initialize`
-/// publishes the keyed image, and the legacy file is RETIRED — unlinked, under
-/// its own lock, and only while it is still the image the open read. One whose
-/// draft was not carried over (a disk conflict, or an image that does not
-/// decode) is set aside first, as any image an open replaces is.
-///
-/// MIGRATION RULINGS (hashclock-2, 2026-10-10):
-/// - FOUND ON OPEN, NEVER SWEPT. A legacy name says nothing of its URI, so a
-///   legacy journal is found only by an open of a URI that names it.
-/// - A LEGACY IMAGE THAT CARRIES NOTHING NEVER DECIDES (amended at review,
-///   2026-10-10). One that holds no draft (an older aterm's open or save,
-///   never edited), or whose draft was made against other contents and is the
-///   file now, is retired at the open, and the keyed journal decides what the
-///   open shows. An older aterm that runs after this one (a concurrent
-///   instance of another build, a downgrade, a rollback release) cannot see a
-///   keyed journal, so its clean image of the file says nothing about the
-///   keyed draft and never hides it.
-/// - A LEGACY DRAFT WINS while it exists. Only an older aterm writes one, and
-///   this module retires it before the keyed journal's first write after the
-///   migration ([`retire_legacy_journal`], bound into every write plan). So a
-///   keyed journal beside a legacy draft is that draft's migration, or older
-///   than it, unless aterms of two builds edit the document at once, when
-///   neither can tell which is newer. Either way nothing is lost: a keyed image
-///   that holds a draft the legacy one does not (or does not decode) is set
-///   aside, never replaced, and NEVER BY A SILENT OPEN. The legacy draft's own
-///   notice (`Recovered`, `DiskConflict`) says what is shown. A legacy draft
-///   that is the file itself (typed, then undone) has none, so the set-aside
-///   says `DiskConflict` (`Corrupt` for an undecodable image).
-/// - A CARRIED DRAFT'S LEGACY FILE STAYS UNTIL THAT FIRST WRITE. An update
-///   from an older aterm hands its unsaved drafts over by journal, and the
-///   outgoing process's Commit check reads ITS (legacy) file back: retiring it
-///   at the successor's open would refuse every such update while a draft is
-///   open. A clean image, a conflict and a corrupt one carry nothing to check,
-///   so they are retired at the open.
-/// - RESIDUAL COLLISION RISK, BOUNDED: the legacy lookup is still by the
-///   unkeyed name, so a URI that collides with one owning a legacy journal can
-///   read it — exactly the defect, confined to journals an older aterm wrote.
-///   No legacy journal is ever written by this version. Each one is retired by
-///   the first open that reads it, or, when that open carries its draft (an
-///   unedited document re-carries it at every open), by the document's first
-///   write. One an older aterm rewrote after the read is never retired (the
-///   write that would retire it refuses instead). So that set only shrinks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LegacyJournal {
-    path: PathBuf,
-    /// The image the open read: the only one retirement removes.
-    image: JournalImageGeneration,
-    /// Its draft was carried into the keyed journal: it stays until that
-    /// journal's first write.
-    carried: bool,
-    /// Set aside before it goes: its draft was not carried over.
-    keep_aside: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct JournalImageGeneration {
-    exists: bool,
-    fingerprint: ContentFingerprint,
-}
-
-impl JournalImageGeneration {
-    fn missing() -> Self {
-        Self {
-            exists: false,
-            fingerprint: ContentFingerprint::of(&[]),
-        }
-    }
-
-    fn of(bytes: &[u8]) -> Self {
-        Self {
-            exists: true,
-            fingerprint: ContentFingerprint::of(bytes),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

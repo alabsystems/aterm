@@ -458,11 +458,19 @@ fn a_config_family_whose_words_changed_is_not_logged_fixed() {
         matches!(rec.retired(), Some(Retired::Superseded { .. })),
         "the problem became another, it was not fixed: {rec:?}"
     );
-    assert_eq!(rec.severity, Severity::Warn, "still in Problems: {rec:?}");
+    assert_eq!(rec.severity, Severity::Warn, "its ⚠, never a fix: {rec:?}");
     assert_eq!(
         app.messages.wanted_rows(),
         1,
         "one row, in the old one's place"
+    );
+    // Settings ▸ Messages lists it as part of the new row, which keeps the
+    // problem in Problems.
+    let page = app.messages_state();
+    assert_eq!(page.standing_for(two.raw()), Some(one.raw()));
+    assert!(
+        page.entry(one.raw()).is_some_and(|entry| entry.alarm()),
+        "the problem stays in Problems, as the new row"
     );
 
     // The last chord fixed: the family is gone, and now it IS fixed.
@@ -601,7 +609,15 @@ fn the_final_snapshot_leaves_a_held_row_alone() {
 fn show_tab_goes_to_the_named_window_not_the_pressing_one() {
     let mut app = App::headless_for_test();
     let a = WindowId(0);
-    app.push_stub_tab(a, crate::stub_session(app.next_session_id));
+    let target = app.next_session_id;
+    app.push_stub_tab(a, crate::stub_session(target));
+    let sid = {
+        let mut store = app.store.write().unwrap();
+        if store.by_local(target).is_none() {
+            store.register(crate::session_store::test_handle(target));
+        }
+        store.by_local(target).unwrap().sid.as_str().to_string()
+    };
     app.switch_tab_in(a, 0);
     let b = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
     app.push_stub_tab(b, crate::stub_session(app.next_session_id));
@@ -609,24 +625,61 @@ fn show_tab_goes_to_the_named_window_not_the_pressing_one() {
     let active = |app: &App, w: WindowId| app.windows[&w].tab_set.active_index();
     assert_eq!((active(&app, a), active(&app, b)), (Some(0), Some(0)));
     let id = app.post_message(warn("Typing slowed by 'yes' (tab 2)"));
-    let show = Intent::ShowTab {
+    let show = Intent::ShowSession {
         tab: 2,
         window: a.0,
+        session: sid.clone(),
     };
-    assert!(app.perform_intent(b, id, show));
+    assert!(app.perform_intent(b, id, show.clone()));
     assert_eq!(active(&app, a), Some(1), "the named window shows tab 2");
     assert_eq!(active(&app, b), Some(0), "the pressing window is untouched");
+    // The row is not restated: its snapshot ordinal now names another tab.
+    app.move_tab(a, 1, 0);
+    app.switch_tab_in(a, 1);
+    assert!(app.perform_intent(b, id, show.clone()));
+    assert_eq!(
+        active(&app, a),
+        Some(0),
+        "the target moved, its identity did not"
+    );
+    assert_eq!(app.focused_session_id(a), Some(target));
+    // Removing a preceding tab also changes the ordinal without changing the target.
+    app.move_tab(a, 0, 1);
+    app.close_tab_at(a, 0);
+    assert_eq!(app.windows[&a].tab_set.len(), 1);
+    assert!(app.perform_intent(b, id, show.clone()));
+    assert_eq!(active(&app, a), Some(0));
+    // The target ends, while a different tab occupies its former position.
+    app.push_stub_tab(a, crate::stub_session(app.next_session_id));
+    app.close_tab_at(a, 0);
+    let before = active(&app, a);
+    assert!(!app.perform_intent(b, id, show));
+    assert_eq!(active(&app, a), before, "never select a replacement");
+    assert!(!app.perform_intent(
+        b,
+        id,
+        Intent::ShowSession {
+            tab: 1,
+            window: a.0,
+            session: "missing".into()
+        }
+    ));
+    // The original gone-ordinal/window controls remain refusals too.
     let gone = app.post_message(warn("gone"));
     assert!(!app.perform_intent(
         b,
         gone,
         Intent::ShowTab {
             tab: 3,
-            window: a.0,
+            window: a.0
         }
     ));
     let gone = app.post_message(warn("gone window"));
     assert!(!app.perform_intent(a, gone, Intent::ShowTab { tab: 1, window: 99 }));
+    // Old carries are decoded but never restamped from their ordinal.
+    let legacy = Intent::decode("show-tab:1:0").expect("readable legacy intent");
+    assert!(!app.perform_intent(b, id, legacy));
+    assert_eq!(active(&app, a), before);
 }
 
 /// THE DETAILS PRESS (design §3.6): the row is seen — a held row folds,
@@ -806,7 +859,8 @@ fn the_pages_press_acts_through_the_engine_and_words_the_outcome() {
 /// timed by the projections, and on a quiet page those came once a
 /// minute — so it stood one to two minutes, never about five seconds. The
 /// host now arms the publish that starts its clock and, five seconds on,
-/// the one that clears it; then only the minute tick again.
+/// the one that clears it; then only the minute tick again (the page dates
+/// a record stamped now, `just now` until the minute).
 #[test]
 fn a_transient_status_line_is_cleared_about_five_seconds_on() {
     use crate::app_native::{
@@ -816,6 +870,7 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.post_message(warn("a record the page dates"));
     assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
     let opened = app
         .messages_last_publish
@@ -1041,6 +1096,174 @@ fn the_minute_tick_arms_a_wake_while_a_view_is_on_the_route() {
     assert_eq!(app.messages_deadline(), None, "a hidden page is no wake");
     app.windows.get_mut(&wid).unwrap().occluded = false;
     assert_eq!(app.messages_deadline(), Some(published + TICK));
+}
+
+/// A MESSAGES PAGE'S CLOCK IS OWED A PUBLISH ONLY WHEN ITS TIME WORDS MOVE (r8
+/// D2). The minute tick armed for every shown page on the route, and since a
+/// headless window's active tab counts as shown (xa-13) a headless instance
+/// resting on Messages woke every minute even with nothing on the page that
+/// could move. Now, on a headless instance (no glass, nothing forced on
+/// screen): an empty page says no time and arms nothing; a record three hours
+/// old arms the publish at its next hour, not a wake a minute; a record
+/// stamped now arms the minute that turns it `1 min ago`; and the page off the
+/// route, or Settings in a background tab, arms nothing. NEGATIVE CONTROL: the
+/// minute tick armed at the empty page and at the three-hour-old record.
+#[test]
+fn a_headless_messages_page_is_republished_only_when_its_time_words_move() {
+    use crate::app_native::{MESSAGES_PUBLISH_MIN_GAP as GAP, MESSAGES_PUBLISH_TICK as TICK};
+    const MIN: u64 = 60_000;
+    let mut app = App::headless_for_test();
+    assert!(app.headless, "the headless lane");
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
+    assert!(
+        app.messages_state().entries.is_empty(),
+        "a fresh instance's log"
+    );
+    let opened = app
+        .messages_last_publish
+        .expect("opening Settings publishes");
+    assert_eq!(
+        app.messages_publish_due_at(),
+        None,
+        "an empty page says no time: no tick"
+    );
+    assert_eq!(app.messages_deadline(), None);
+
+    // A record from three hours and ten minutes ago: `3 h ago` until four.
+    let now = wall_stamp_now().unix_ms;
+    // Records, never rows: the band arms no wake of its own.
+    app.post_message_at(
+        warn("an old record").hold(Hold::LogOnly),
+        aterm_messages::WallStamp {
+            unix_ms: now - 190 * MIN,
+        },
+    );
+    app.publish_native_messages_state_if_due(opened + GAP);
+    let published = app.messages_last_publish.unwrap();
+    assert_ne!(published, opened);
+    let until = app
+        .messages_words_change_in
+        .expect("a record's age is said");
+    assert!(
+        until > TICK && until <= std::time::Duration::from_millis(50 * MIN),
+        "its next hour, not the minute: {until:?}"
+    );
+    assert_eq!(app.messages_publish_due_at(), Some(published + until));
+
+    // A record stamped now: `just now` turns `1 min ago` within the minute,
+    // which is as soon as the page is republished for its clock.
+    app.post_message(warn("a new record").hold(Hold::LogOnly));
+    app.publish_native_messages_state_if_due(published + GAP);
+    let fresh = app.messages_last_publish.unwrap();
+    assert!(
+        app.messages_words_change_in
+            .is_some_and(|until| until <= TICK)
+    );
+    assert_eq!(app.messages_publish_due_at(), Some(fresh + TICK));
+
+    // Off the route, nothing; back on it, the clock again.
+    fn view_mut(app: &mut App, wid: WindowId) -> &mut crate::native_settings::SettingsViewState {
+        let (_, view) = app.active_native_view(wid).expect("Settings fronts it");
+        match app.native_runtime.view_state_mut(view) {
+            Some(crate::native_app::AppViewState::Settings(state)) => state,
+            _ => unreachable!(),
+        }
+    }
+    view_mut(&mut app, wid).navigate(SettingsRoute::About);
+    assert_eq!(app.messages_publish_due_at(), None, "About says no time");
+    view_mut(&mut app, wid).navigate(SettingsRoute::Messages);
+    assert_eq!(app.messages_publish_due_at(), Some(fresh + TICK));
+
+    // Settings behind the terminal tab is not what the instance shows.
+    let settings_tab = app.windows[&wid].tab_set.active().unwrap().id;
+    assert!(
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .tab_set
+            .switch_to_index(0)
+    );
+    assert_ne!(
+        app.windows[&wid].tab_set.active().unwrap().id,
+        settings_tab,
+        "the terminal fronts it"
+    );
+    assert_eq!(app.messages_publish_due_at(), None, "a background tab");
+    assert_eq!(app.messages_deadline(), None);
+}
+
+/// THE PAGE'S CLOCK COUNTS THE NIGHT THE MAC SLEPT, AND THE ZONE IT IS IN.
+/// A page is republished when its time words move, a span after the publish
+/// on the monotonic clock, which stops while a Mac sleeps: a page that said
+/// `3 h ago` and slept the night would say it for most of an awake hour more,
+/// and `Today` past a midnight it slept through. The first turn after the
+/// sleep takes the time slept off the span, so the page is owed its publish
+/// (never sooner than a minute after the last); a wall clock stepped back
+/// moves nothing. A zone that reads another offset than the words were read
+/// on owes the publish too, and the publish reads the zone again. NEGATIVE
+/// CONTROL: uncounted, the slept page waits out the rest of its hour.
+#[test]
+fn a_messages_page_that_slept_through_its_words_is_owed_its_publish_on_waking() {
+    use crate::app_native::MESSAGES_PUBLISH_TICK as TICK;
+    const MIN: u64 = 60_000;
+    const NIGHT: std::time::Duration = std::time::Duration::from_secs(8 * 3600);
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let now = wall_stamp_now().unix_ms;
+    app.post_message_at(
+        warn("an old record").hold(Hold::LogOnly),
+        aterm_messages::WallStamp {
+            unix_ms: now - 190 * MIN,
+        },
+    );
+    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
+    let published = app
+        .messages_last_publish
+        .expect("opening Settings publishes");
+    let until = app
+        .messages_words_change_in
+        .expect("a record's age is said");
+    assert!(until > TICK, "`3 h ago` moves at its next hour: {until:?}");
+    assert_eq!(app.messages_publish_due_at(), Some(published + until));
+
+    let (instant, wall) = (std::time::Instant::now(), std::time::SystemTime::now());
+    app.count_sleep_since_last_turn(instant, wall);
+    app.count_sleep_since_last_turn(instant, wall - NIGHT);
+    assert_eq!(
+        app.messages_publish_due_at(),
+        Some(published + until),
+        "CONTROL: a wall clock stepped back moves nothing"
+    );
+    // The lid closes for the night: the wall clock runs, the monotonic one
+    // does not.
+    app.count_sleep_since_last_turn(instant, wall + NIGHT);
+    assert_eq!(
+        app.messages_publish_due_at(),
+        Some(published + TICK),
+        "owed at once, a minute after the last publish at the soonest"
+    );
+    app.publish_native_messages_state_if_due(published + TICK);
+    let republished = app.messages_last_publish.unwrap();
+    assert_ne!(republished, published, "the slept page is republished");
+    let until = app.messages_words_change_in.unwrap();
+    assert!(until > TICK, "and owes its next hour again: {until:?}");
+
+    // A zone that moved since the words were read: owed at once.
+    let read_on = app.messages_words_offset_s;
+    app.messages_words_offset_s = read_on + 3600;
+    assert_eq!(app.messages_publish_due_at(), Some(republished + TICK));
+    app.publish_native_messages_state_if_due(republished + TICK);
+    assert_eq!(
+        app.messages_words_offset_s, read_on,
+        "the publish reads the zone"
+    );
+    let last = app.messages_last_publish.unwrap();
+    assert_eq!(
+        app.messages_publish_due_at(),
+        app.messages_words_change_in
+            .map(|until| last + until.max(TICK))
+    );
 }
 
 /// THE DEVELOPER TOOLS LINE'S TWO CAPSULES, pressed on the page (owner ask
@@ -5018,6 +5241,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         log: Default::default(),
         journal_key: None,
         task: None,
+        autopilot_end: None,
     }];
     assert!(
         app.post_managed_current(

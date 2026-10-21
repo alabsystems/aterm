@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Settings ▸ Themes' rows: one per theme the catalog can draw or the
-//! community pack offers, each with a 44×20 slab painted in that theme's own
-//! colours.
+//! community pack offers, each with a 56×20 slab (40×20 on a narrow
+//! chooser) painted in that theme's own colours.
 //!
 //! The row list is built once per catalog generation ([`showcase_cards`])
 //! from the schemes the config worker already parsed and the embedded pack,
@@ -12,9 +12,9 @@
 //! `aterm.toml` colour overrides would make every slab the same, so they
 //! appear only in the demo and in the live trial.
 //!
-//! The slab itself ([`paint_row_slab`]) is three panels, two words and four
-//! dots: the theme's background, "Aa" in its foreground, and its red, green,
-//! blue and magenta. It never builds a terminal or forks a font, so a page
+//! The slab itself ([`paint_row_slab`]) is the theme's background, "Aa" in
+//! its foreground, and dots of its red, green, blue and magenta — as many as
+//! fit, two on the narrow slab. It never builds a terminal or forks a font, so a page
 //! of rows costs what a page of buttons costs. The faithful view is the
 //! demo.
 
@@ -31,7 +31,9 @@ pub(crate) enum Section {
     /// Theme files that did not load: listed first, never tried.
     Attention,
     /// aterm's own signature themes (Aterm Night, Aterm Day, Hearth, Linen),
-    /// in the registry's order. They lead the list with no caption.
+    /// in the registry's order. They lead the list with no caption — save
+    /// under NEEDS ATTENTION, where they take one of their own
+    /// ([`Section::caption_after_rows`]).
     Signature,
     /// Every other built-in, Default included, in the registry's order.
     Builtin,
@@ -54,6 +56,20 @@ impl Section {
         }
     }
 
+    /// The section's caption where other rows precede it (`after_rows`):
+    /// [`Self::caption`], and for the signature themes ATERM — leading the
+    /// list they need none, but under NEEDS ATTENTION (a theme file that did
+    /// not load) uncaptioned rows read as that section's, its caption
+    /// repeated over whichever of them starts a screen (the review of the
+    /// themes page, ox4-1: Linen, and Aterm Day in use, listed as needing
+    /// attention).
+    pub(crate) const fn caption_after_rows(self, after_rows: bool) -> Option<&'static str> {
+        match self {
+            Self::Signature if after_rows => Some("ATERM"),
+            _ => self.caption(),
+        }
+    }
+
     /// The section's key word (`settings/showcase/section/<word>`).
     pub(crate) const fn word(self) -> &'static str {
         match self {
@@ -66,13 +82,105 @@ impl Section {
     }
 }
 
+/// The format the parser names another terminal's theme by (`label`,
+/// [`ForeignFormat::label`]), in the one word a chooser row has room for:
+/// `JSON` for `JSON (Windows Terminal)`. A label this does not know keeps
+/// its first word.
+fn format_word(label: &str) -> &str {
+    use aterm_types::scheme::ForeignFormat;
+    for format in [
+        ForeignFormat::Kitty,
+        ForeignFormat::Ghostty,
+        ForeignFormat::Plist,
+        ForeignFormat::Toml,
+        ForeignFormat::Json,
+    ] {
+        if format.label() == label {
+            return match format {
+                ForeignFormat::Kitty => "kitty",
+                ForeignFormat::Ghostty => "Ghostty",
+                ForeignFormat::Plist => "plist",
+                ForeignFormat::Toml => "TOML",
+                ForeignFormat::Json => "JSON",
+            };
+        }
+    }
+    label.split_whitespace().next().unwrap_or(label)
+}
+
 /// A theme file that did not load: its id, a key-safe slug unique among the
-/// rows, and why.
+/// rows, and why — whole, and in the few words its row has room for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttentionRow {
     pub(crate) id: String,
     pub(crate) slug: String,
     pub(crate) reason: String,
+    /// [`reason_summary`] of `reason`.
+    pub(crate) summary: String,
+}
+
+/// A theme file's load failure (`reason`, as the catalog words it) in the
+/// few words a chooser row has room for: where in the file, then what is
+/// wrong there, the key first (`Line 2: background isn't a color`), so the
+/// words a row's edge keeps are the ones that say where to look. Another
+/// terminal's theme says what to do first, its format in a word after
+/// (`Import… converts it (JSON)`): the whole of it fits a row at every
+/// chooser width. A reason this does not know reads as written, its parser
+/// preamble gone.
+pub(crate) fn reason_summary(reason: &str) -> String {
+    let reason = reason.trim();
+    let capitalized = |text: &str| {
+        let mut chars = text.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+            .unwrap_or_default()
+    };
+    // Another terminal's theme: the whole file is, wherever the parser
+    // stopped.
+    if let Some((_, format)) = reason.split_once(" (this looks like a ") {
+        let format = format.split_once(" theme").map_or(format, |(name, _)| name);
+        return format!("Import\u{2026} converts it ({})", format_word(format));
+    }
+    // `theme parse error on line N: <what>`, line 0 for the whole file.
+    let (line, what) = reason
+        .strip_prefix("theme parse error on line ")
+        .and_then(|rest| rest.split_once(": "))
+        .and_then(|(line, what)| line.parse::<usize>().ok().map(|line| (line, what)))
+        .unwrap_or((0, reason));
+    let unquote = |text: &str| text.trim().trim_matches(['"', '\'']).to_string();
+    let before = |text: &str, end: &str| {
+        text.split_once(end)
+            .map_or(text, |(head, _)| head)
+            .to_string()
+    };
+    let what = if let Some(rest) = what.strip_prefix("invalid #RRGGBB or #RGB colour for ") {
+        format!("{} isn\u{2019}t a color", unquote(&before(rest, ": ")))
+    } else if let Some(key) = what.strip_prefix("unknown key ") {
+        format!("{} is no theme key", unquote(key))
+    } else if let Some(key) = what.strip_prefix("empty value for key ") {
+        format!("{} has no value", unquote(key))
+    } else if what.starts_with("missing '=' in ") {
+        "no = on the line".to_string()
+    } else if let Some(rest) = what.strip_prefix("duplicate key ") {
+        format!("{} is set twice", unquote(&before(rest, " (")))
+    } else if let Some(rest) = what.strip_prefix("duplicate colour index ") {
+        format!("color {} is set twice", before(rest, " (").trim())
+    } else if let Some(key) = what.strip_prefix("missing required key ") {
+        format!("no {}", unquote(key))
+    } else if let Some(rest) = what.strip_prefix("invalid value for ") {
+        format!(
+            "{} has a value aterm can\u{2019}t read",
+            unquote(&before(rest, ": "))
+        )
+    } else {
+        what.to_string()
+    };
+    if line > 0 {
+        format!("Line {line}: {what}")
+    } else {
+        capitalized(&what)
+    }
 }
 
 /// The theme files in the folder that did not load, by name, each with a
@@ -89,6 +197,7 @@ pub(crate) fn attention_rows(
             status.reason().map(|reason| AttentionRow {
                 id: id.to_string(),
                 slug: String::new(),
+                summary: reason_summary(&reason),
                 reason,
             })
         })
@@ -544,6 +653,75 @@ pub(crate) fn paint_row_slab(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NEEDS ATTENTION ROW SAYS WHERE, THEN WHAT, IN A ROW'S FEW WORDS: each
+    /// way the parser refuses a theme file reads as its line, its key and the
+    /// trouble, never the parser's preamble; another terminal's theme says
+    /// Import converts it, then its format. The reasons come from the parser
+    /// itself, so a change to its words shows here. Negative control: a
+    /// reason the summary has no words for keeps its own, after its line.
+    #[test]
+    fn a_load_failure_reads_as_its_line_and_key() {
+        let dir = aterm_tempfile::tempdir().expect("a themes folder");
+        let base = "foreground = #dddddd\nbackground = #101010\n";
+        let files = [
+            (
+                "a",
+                format!("{base}cursor = #zzz\n"),
+                "Line 3: cursor isn\u{2019}t a color",
+            ),
+            (
+                "b",
+                format!("{base}wibble = #123456\n"),
+                "Line 3: wibble is no theme key",
+            ),
+            (
+                "c",
+                format!("{base}cursor =\n"),
+                "Line 3: cursor has no value",
+            ),
+            ("d", format!("{base}cursor\n"), "Line 3: no = on the line"),
+            (
+                "e",
+                format!("{base}background = #000000\n"),
+                "Line 3: background is set twice",
+            ),
+            (
+                "f",
+                format!("{base}color1 = #ff0000\ncolor1 = #00ff00\n"),
+                "Line 4: color 1 is set twice",
+            ),
+            ("g", "background = #101010\n".to_string(), "No foreground"),
+            (
+                "h",
+                "{\"background\": \"#101010\"}\n".to_string(),
+                "Import\u{2026} converts it (JSON)",
+            ),
+            (
+                "i",
+                format!("{base}appearance = sideways\n"),
+                "Line 3: appearance must be dark|light, got \"sideways\"",
+            ),
+        ];
+        for (name, text, _) in &files {
+            std::fs::write(dir.path().join(format!("{name}.conf")), text).unwrap();
+        }
+        let rows = attention_rows(
+            &crate::app_config::ThemeCatalog::discover_in(dir.path()),
+            &[],
+        );
+        for (name, _, summary) in files {
+            let row = rows
+                .iter()
+                .find(|row| row.id == name)
+                .unwrap_or_else(|| panic!("{name} needs attention"));
+            assert_eq!(row.summary, summary, "{name}: {}", row.reason);
+            assert!(
+                row.reason.starts_with("theme parse error on line "),
+                "{name}"
+            );
+        }
+    }
 
     /// Signature themes lead, then every other built-in (Default among
     /// them), then the person's themes by name, then the community pack's;

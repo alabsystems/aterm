@@ -11,12 +11,14 @@
 //! The menu is never set on the item: a click reaches the target ([`super::app`]), which
 //! shows it with `-popUpMenuPositioningItem:atLocation:inView:`, and the image and tooltip
 //! are sent only when they change (aterm-gui's status item, 2026-09-28: a whole-app stall
-//! inside the status item's scene setup, under a `-setMenu:` on every change).
+//! inside the status item's scene setup, under a `-setMenu:` on every change). So that
+//! accessibility can open it too (an item with no menu offers no `AXShowMenu`), the button
+//! carries a custom action, [`SHOW_MENU`], which sends the target its own selector.
 
 use aterm_objc::send::{
-    alloc, send_bool, send_id, send_id_cptr_usize, send_id_f64, send_id_id, send_id_id_sel_id,
-    send_id_size, send_isize_usize, send_rect, send_v, send_v_bool, send_v_id, send_v_isize,
-    send_v_sel, send_v_size, send_v_usize,
+    alloc, send_bool, send_id, send_id_cptr_usize, send_id_f64, send_id_id, send_id_id_id_sel,
+    send_id_id_sel_id, send_id_size, send_isize_usize, send_rect, send_v, send_v_bool, send_v_id,
+    send_v_isize, send_v_sel, send_v_size, send_v_usize,
 };
 use aterm_objc::{Bool, CGPoint, CGRect, CGSize, Id, Obj, Sel, autoreleasepool, class, sel};
 
@@ -42,6 +44,9 @@ const POINTS: u32 = 18;
 const SCALES: [u32; 2] = [1, 2];
 /// How far below the button the menu's top edge sits, in points.
 const POPUP_GAP: f64 = 3.0;
+/// The button's custom accessibility action, which opens the menu: VoiceOver lists it
+/// among the item's actions (VO-Command-Space).
+pub(super) const SHOW_MENU: &str = "Show Menu";
 
 /// `-[NSMenu popUpMenuPositioningItem:atLocation:inView:]`, `B48@0:8@16{CGPoint=dd}24@40`:
 /// no helper has this shape.
@@ -74,10 +79,17 @@ pub(super) struct Popup {
 }
 
 /// Put the mug in the menu bar: a variable-length item whose button sends `click` to
-/// `target` on a left or right release, and the menu of `rows` whose items send `choose`
-/// to `target` with their action's tag. `None` when AppKit refuses any of it (nothing is
+/// `target` on a left or right release and `show` (`- (BOOL)x:(id)action`) for its
+/// [`SHOW_MENU`] accessibility action, and the menu of `rows` whose items send `choose` to
+/// `target` with their action's tag. `None` when AppKit refuses any of it (nothing is
 /// left on the bar then). Main thread only.
-pub(super) fn install(target: Id, click: Sel, choose: Sel, rows: Vec<Row>) -> Option<StatusUi> {
+pub(super) fn install(
+    target: Id,
+    click: Sel,
+    show: Sel,
+    choose: Sel,
+    rows: Vec<Row>,
+) -> Option<StatusUi> {
     autoreleasepool(|_| {
         let images = [template_image(false)?, template_image(true)?];
         let menu = new_menu()?;
@@ -107,6 +119,7 @@ pub(super) fn install(target: Id, click: Sel, choose: Sel, rows: Vec<Row>) -> Op
             if let Some(label) = aterm_objc::ns_string("Caffeine") {
                 send_v_id(button.id(), sel!(setAccessibilityLabel:), label.id());
             }
+            set_show_menu_action(button.id(), target, show);
             Some(StatusUi {
                 item,
                 button,
@@ -316,6 +329,37 @@ fn bitmap(png: &[u8]) -> Option<Obj> {
             ))
         }
     })
+}
+
+/// Give `button` the one custom accessibility action [`SHOW_MENU`], which sends `target`
+/// `show`. A refusal leaves the button without it (the clicks still work).
+fn set_show_menu_action(button: Id, target: Id, show: Sel) {
+    let Some(name) = aterm_objc::ns_string(SHOW_MENU) else {
+        return;
+    };
+    // SAFETY: main-thread AppKit sends on live receivers.
+    // `-initWithName:target:selector:` is `@40@0:8@16@24:32` and consumes the +alloc (the
+    // target held weakly: the caller keeps it alive); `+arrayWithObject:` is `@24@0:8@16`
+    // and answers +0; `-setAccessibilityCustomActions:` is `v24@0:8@16` and copies the array.
+    unsafe {
+        let Some(action) = Obj::from_owned(send_id_id_id_sel(
+            alloc(class(c"NSAccessibilityCustomAction")),
+            sel!(initWithName:target:selector:),
+            name.id(),
+            target,
+            show,
+        )) else {
+            return;
+        };
+        let actions = send_id_id(
+            class(c"NSArray").as_id(),
+            sel!(arrayWithObject:),
+            action.id(),
+        );
+        if !actions.is_null() {
+            send_v_id(button, sel!(setAccessibilityCustomActions:), actions);
+        }
+    }
 }
 
 /// A fresh `NSMenu` (+1) whose items' enabled flags are the ones set here.
@@ -601,6 +645,19 @@ mod tests {
                 false,
                 types(v, &[id]),
             ),
+            (
+                c"NSStatusBarButton",
+                sel!(setAccessibilityCustomActions:),
+                false,
+                types(v, &[id]),
+            ),
+            (
+                c"NSAccessibilityCustomAction",
+                sel!(initWithName:target:selector:),
+                false,
+                types(id, &[id, id, sel_]),
+            ),
+            (c"NSArray", sel!(arrayWithObject:), true, types(id, &[id])),
             (
                 c"NSStatusBarButton",
                 sel!(setImage:),

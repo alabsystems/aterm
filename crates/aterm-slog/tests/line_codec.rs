@@ -7,7 +7,8 @@
 
 use aterm_slog::vocab::{
     ACT_WORDS, BOX_WORDS, CAUSE_WORDS, CLS_WORDS, DIR_WORDS, END_WORDS, MAIL_KIND_WORDS,
-    NEED_WORDS, OUT_WORDS, PHASE_WORDS, STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS,
+    NEED_WORDS, OUT_WORDS, PHASE_WORDS, POOL_WORDS, STATE_WORDS, VERB_WORDS, WALL_WORDS, WHY_WORDS,
+    WORD_WORDS,
 };
 use aterm_slog::{
     Actor, Cap, Conf, DecodeError, EncodeError, FIELDS, Fields, Key, Kind, Lvl, MAX_RECORD_BYTES,
@@ -108,6 +109,7 @@ fn every_vocabulary_word_is_one_wire_token_named_once() {
         CAUSE_WORDS,
         ACT_WORDS,
         END_WORDS,
+        POOL_WORDS,
     ] {
         for (i, w) in list.iter().enumerate() {
             assert!(
@@ -563,7 +565,11 @@ fn phase_5_node_log_keys_are_appended_wire_words() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     assert_eq!(at(Key::PrevEnd), at(Key::Reached).map(|i| i + 1));
     assert_eq!(at(Key::CfgKey), at(Key::PrevEnd).map(|i| i + 1));
-    assert_eq!(FIELDS.len(), at(Key::CfgKey).map_or(0, |i| i + 1));
+    assert_eq!(
+        at(Key::OpBy),
+        at(Key::CfgKey).map(|i| i + 1),
+        "6C-2's op_by= comes after them"
+    );
     assert_eq!(
         (Key::PrevEnd.tier(), Key::PrevEnd.cap()),
         (Tier::Wire, Cap::Word(END_WORDS))
@@ -606,4 +612,117 @@ fn phase_5_node_log_keys_are_appended_wire_words() {
         "1 open n start prev_end=- by=aterm src=aterm conf=exact t=9"
     );
     assert_eq!(decode(&line), Ok(r));
+}
+
+/// PHASE 6 (6C-2, ruling U6): `op_by=` is appended after 5J's `key=`, a
+/// HOST id: a turn close's restated opener round-trips at the host tier
+/// and is in no wire or bus body (an edge's raw sid must not cross). AN
+/// OLDER READER SKIPS IT (the R13 rule): to a build without the key the
+/// token is an unknown one, and the close reads as the close without it.
+#[test]
+fn phase_6_op_by_is_appended_host_only_and_an_older_reader_skips_it() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(at(Key::OpBy), at(Key::CfgKey).map(|i| i + 1));
+    assert_eq!(
+        at(Key::Pool),
+        at(Key::OpBy).map(|i| i + 1),
+        "6C-6's pool= comes after it"
+    );
+    assert_eq!((Key::OpBy.tier(), Key::OpBy.cap()), (Tier::Host, Cap::Id));
+    assert_eq!(Key::OpBy.word(), "op_by");
+    let sid = ShortId::new("s-edge42").expect("a sid");
+    let r = Rec {
+        seq: 30,
+        t: 9,
+        op: Op::Close,
+        node: Node::new(Lvl::Turn, 3),
+        par: None,
+        k: Kind::Turn,
+        f: Fields::new()
+            .word(Key::Out, "done")
+            .and_then(|f| f.u(Key::DurMs, 40))
+            .and_then(|f| f.u(Key::Ledger, 7))
+            .and_then(|f| f.with(Key::OpBy, Val::Id(sid)))
+            .expect("a close's fields"),
+        src: Src::Screen,
+        conf: Conf::Strong,
+        by: Actor::Ctl,
+    };
+    let line = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        line,
+        "30 close t3 turn out=done dur_ms=40 ledger=7 op_by=s-edge42 by=ctl src=screen conf=strong t=9"
+    );
+    assert_eq!(decode(&line), Ok(r.clone()));
+    for tier in [Tier::Wire, Tier::WireMeta] {
+        let wire = encode(&r, tier).expect("fits");
+        assert!(
+            !wire.contains("op_by=") && !wire.contains("s-edge42"),
+            "{wire}"
+        );
+        let bus = encode_bus(&r, tier, 1, Some(4)).expect("fits");
+        assert!(
+            !bus.contains("op_by=") && !bus.contains("s-edge42"),
+            "{bus}"
+        );
+    }
+    // An older reader: `op_by=` is a key it does not know.
+    let older = line.replace(" op_by=", " zz_opener=");
+    let mut without = r.clone();
+    without.f.remove(Key::OpBy);
+    assert_eq!(decode(&older), Ok(without), "{older}");
+}
+
+/// PHASE 6 (6C-6, ruling U18): `pool=` is appended after 6C-2's `op_by=`,
+/// the last key, a HOST closed word whose one word is `shared`: an input
+/// mark that says the mark limiter's shared pool's count says so
+/// (`dropped=<n> pool=shared`), round-trips at the host tier and leaves no
+/// trace on the wire. An unknown pool word is refused by the writer, and a
+/// reader puts `unknown` in its place, never `shared`.
+#[test]
+fn phase_6_pool_is_appended_host_only_and_closed() {
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(at(Key::Pool), at(Key::OpBy).map(|i| i + 1));
+    assert_eq!(FIELDS.len(), at(Key::Pool).map_or(0, |i| i + 1), "the last");
+    assert_eq!(
+        (Key::Pool.tier(), Key::Pool.cap()),
+        (Tier::Host, Cap::Word(POOL_WORDS))
+    );
+    assert_eq!(Key::Pool.word(), "pool");
+    assert_eq!(POOL_WORDS, ["shared"]);
+    assert!(Fields::new().word(Key::Pool, "shared").is_ok());
+    for stranger in ["own", "maybe", "Shared", "shared ", ""] {
+        assert!(
+            Fields::new().word(Key::Pool, stranger).is_err(),
+            "{stranger:?} is no pool word"
+        );
+    }
+    let r = Rec {
+        seq: 31,
+        t: 9,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Input,
+        f: Fields::new()
+            .word(Key::Verb, "key")
+            .and_then(|f| f.word(Key::Act, "deny"))
+            .and_then(|f| f.u(Key::Dropped, 7))
+            .and_then(|f| f.word(Key::Pool, "shared"))
+            .expect("an input mark's fields"),
+        src: Src::Ctl,
+        conf: Conf::Strong,
+        by: Actor::Sid(ShortId::new("s-edge42").expect("a sid")),
+    };
+    let line = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        line,
+        "31 mark - input verb=key act=deny dropped=7 pool=shared by=s-edge42 src=ctl conf=strong t=9"
+    );
+    assert_eq!(decode(&line), Ok(r.clone()));
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(!wire.contains("pool="), "{wire}");
+    let stranger = line.replace(" pool=shared ", " pool=maybe ");
+    let read = decode(&stranger).expect("an unknown word reads");
+    assert_eq!(read.f.get_word(Key::Pool), Some("unknown"), "{stranger}");
 }

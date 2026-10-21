@@ -22,7 +22,7 @@ use crate::Ctx;
 use crate::exec::{self, Cmd};
 use crate::ladder::Report;
 use crate::perf::Status;
-use crate::plan::{Lane, lane_dir};
+use crate::plan::Lane;
 use crate::stages::lane_jobs;
 
 const LABEL: &str = "wasm-smoke (both web modules' host boundary and the CPU replay, under node)";
@@ -35,9 +35,7 @@ fn smoke_script() -> std::path::PathBuf {
 /// The cells lane's `wasm-smoke` directory: the dev build's target dir
 /// ([`build_dev`]) and the bound modules.
 pub(crate) fn build_dir(ctx: &Ctx) -> PathBuf {
-    lane_dir(ctx, Lane::CellsTarget)
-        .unwrap_or_else(|| ctx.state_dir().join("cells"))
-        .join("wasm-smoke")
+    crate::plan::cells_dir(ctx).join("wasm-smoke")
 }
 
 /// Both web modules built in the DEV profile for wasm32 on rustup's stable

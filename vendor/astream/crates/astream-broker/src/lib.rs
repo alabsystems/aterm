@@ -65,6 +65,15 @@
 //!   [`Lineage`] — where generations still agree, so a reader resumes at
 //!   [`LogIdentity::continues`] instead of forgetting — and the tier the broker serves
 //!   ([`Client::log_lineage`], [`Client::served_durability`]).
+//! - **HEALTH, FROM THE BROKER ITSELF**: the answer to every `Hello` says whether the
+//!   log is POISONED (it refuses every write until it is reopened) and why, and what its
+//!   flushes did ([`HelloHealth`], [`Client::broker_health`]) — read by the broker without
+//!   the log's lock, as are [`Broker::poisoned`] and [`Broker::wait_poisoned`]. The rest
+//!   of the operator's snapshot ([`BrokerHealth`]: what the log holds, who is attached,
+//!   what is parked) is kept beside the log in `<log>.health`
+//!   ([`OpenOptions::health_every`], [`Broker::keep_health`]), which another process
+//!   reads with [`read_health`] and is told whether the broker that wrote it still serves
+//!   the log.
 //! - **FORK-DELIVERY and cognition routing** build on the same SUBSCRIBE primitive.
 //! - **The durability dial**: Strict (a full flush per batch), Ordered (an ordering
 //!   barrier per batch, `F_BARRIERFSYNC`: a power loss leaves a prefix of whole batches,
@@ -109,10 +118,19 @@ mod twins;
 pub mod brecord;
 pub mod broker;
 pub mod client;
+/// Crash-safe, streaming compaction (the `retention` feature's rewrite of the log).
+#[cfg(feature = "retention")]
+mod compact;
 #[cfg(test)]
 mod crash_sim;
 mod escalation;
+pub mod health;
+mod last_view;
+pub use last_view::{LastStep, LastView, LastViewError, LastViewGarbage};
 pub mod logid;
+/// The power-loss model of a compaction's files, for its crash tests.
+#[cfg(all(test, unix, feature = "retention"))]
+mod power_loss;
 pub mod proto;
 mod recover;
 /// cfg(unix): sharding binds one Unix-domain socket per shard, and std has no
@@ -122,18 +140,22 @@ pub mod sharded;
 mod storage;
 pub mod store;
 
+pub use astream_wire::{
+    CausalCut, CausalEdge, CutViolation, FabricReceipt, ReceiptError, ReceiptVerdict,
+};
 pub use brecord::{
-    brecord_clamp_body_len, brecord_version_current, BrokerRecord, BREC_VERSION, MAX_RECORD_PAYLOAD,
+    brecord_clamp_body_len, brecord_version_current, BrokerRecord, BREC_VERSION, COMMIT_TAG_RETIRE,
+    MAX_RECORD_PAYLOAD, RETIRE_PRODUCER_SEQ,
 };
 pub use broker::{
     broker_batch_clamp, broker_wake_attempts_within_cap, identity_principal, Broker, BrokerHandle,
     BrokerStats, IDLE_MARK, IDLE_MARK_DEADLINE, KEEPALIVE_DEADLINE, KEEPALIVE_INTERVAL,
 };
 pub use client::{
-    ack, broker_refusal, client_walk_page_advance, client_walk_within_limit, connect, drain,
-    protocol_mismatch, take, AnyClient, AnyStream, AnySubscription, BrokerRefusal, Client, Closer,
-    CreditWindow, Event, Page, ProtocolMismatch, Record, SubjectBudget, Subscription,
-    SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE, LAST_WALK_PAGES_MAX,
+    ack, acks_owed, broker_refusal, client_walk_page_advance, client_walk_within_limit, connect,
+    drain, protocol_mismatch, take, AcksOwed, AnyClient, AnyStream, AnySubscription, BrokerRefusal,
+    Client, Closer, CreditWindow, Event, Page, ProtocolMismatch, Record, SubjectBudget,
+    Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE, LAST_WALK_PAGES_MAX,
 };
 
 /// Capability minting and principal derivation (`cap` feature), re-exported so
@@ -148,8 +170,14 @@ pub use astream_cap::{mint, producer_id_of, Capability};
 #[cfg(feature = "identity")]
 pub use astream_aead::{IdentityKeypair, ID_PUB_LEN};
 pub use escalation::{Escalate, Escalation};
-pub use logid::{logid_generation_advance, logid_lineage_within_cap, Lineage, LogIdentity};
-pub use proto::{NonceExt, Request, Response, ServedInfo, ServedReason, Tier};
+pub use health::{health_path, read_health, BrokerHealth, HealthRead, HealthWriter, HEALTH_SUFFIX};
+pub use logid::{
+    identity_path, logid_generation_advance, logid_lineage_within_cap, Lineage, LogIdentity,
+};
+pub use proto::{
+    HelloHealth, NonceExt, Request, Response, ServedInfo, ServedReason, Tier, ERR_RETIRE_REFUSED,
+    HELLO_REASON_MAX, REQUEST_RETIRE,
+};
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 #[cfg(unix)]
 pub use sharded::{
@@ -158,8 +186,10 @@ pub use sharded::{
 };
 pub use storage::{storage_len_advance, storage_truncate_within_len};
 pub use store::{
-    store_ack_seq_in_reserved_half, store_head_advance, Boot, BrokerLog, Durability, FlushCounts,
-    InjectedFaults, LogStats, OpenOptions, Prepared, Volume, ORDERED_HORIZON, RETIRE_SUBJECT,
+    incarnation_base, incarnation_of, is_hidden_record, on_boot_volume,
+    store_ack_seq_in_reserved_half, store_head_advance, will_seq, Boot, BrokerLog, Durability,
+    FlushCounts, InjectedFaults, LogStats, OpenOptions, Prepared, Volume, INC_MAX, ORDERED_HORIZON,
+    RETIRE_SUBJECT, WILL_SEQ_LOW,
 };
 
 #[cfg(test)]

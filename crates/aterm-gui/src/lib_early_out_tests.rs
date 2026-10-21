@@ -109,6 +109,7 @@ pub(super) fn frame_key(
         level_up_fp: 0,
         band_fp: 0,
         presence_fp: 0,
+        question: (0, 0),
         system_dark: false,
         link_caption: None,
         claude_footer_fp: 0,
@@ -543,4 +544,99 @@ fn a_selection_change_still_repaints() {
         should_repaint(Some(base), sel),
         "a selection change must repaint"
     );
+}
+
+/// A QUESTION ALONE REACHES THE GLASS: the multi-line paste confirmation and
+/// the close/quit confirm paint whole rows over the grid and dirty no engine
+/// cell, so the repaint key carries each (`RepaintKey::question`). Posting,
+/// answering and replacing one with nothing else moving each present a
+/// frame; a repeat with nothing changed is still proved unchanged (the
+/// control that the gate is not simply open). Before the term, the frames
+/// after posting and answering were proved unchanged (commits stayed at 1).
+#[test]
+fn a_question_posted_or_answered_alone_reaches_the_glass() {
+    use super::scripted_redraw_fixture::{scripted_app, surface};
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    app.redraw_window(wid);
+    let presents = |app: &mut App, what: &str, expect: usize| {
+        let before = surface(app).commits();
+        app.redraw_window(wid);
+        assert_eq!(surface(app).commits(), before + expect, "{what}");
+    };
+    presents(&mut app, "CONTROL: nothing changed, nothing presents", 0);
+    let paste = |text: &str| {
+        crate::paste_banner::PendingPaste::new(
+            wid,
+            Some(0),
+            text.to_string(),
+            crate::input::Source::Human,
+            crate::input::PasteFraming::AtDrain,
+        )
+    };
+    app.paste_banner = Some(paste("one\ntwo\n"));
+    presents(&mut app, "the paste question appears", 1);
+    presents(&mut app, "and stands", 0);
+    app.paste_banner = Some(paste("three\nfour\n"));
+    presents(&mut app, "a new question replaces it", 1);
+    app.paste_banner = None;
+    presents(&mut app, "the answer takes it away", 1);
+    let prompt =
+        crate::quit_safety::confirm_prompt(false, true, true).expect("a busy close prompts");
+    app.close_banner = Some(crate::close_confirm::PendingClose::new(
+        wid,
+        prompt,
+        crate::close_confirm::CloseReplay::Window(wid),
+        crate::session_store::ExitActor::Human,
+    ));
+    presents(&mut app, "the close question appears", 1);
+    app.close_banner = None;
+    presents(&mut app, "and its answer takes it away", 1);
+}
+
+/// The split twin of [`a_question_posted_or_answered_alone_reaches_the_glass`]:
+/// a composed window keys its own repaint gate (`redraw_compose`), and the
+/// question term must be in that key too.
+///
+/// The negative control is a mutation (run by hand, recorded in the lane
+/// report): dropping `question` from the composed key proves the frames after
+/// posting and answering unchanged and fails this test.
+#[test]
+fn a_question_alone_reaches_a_split_windows_glass() {
+    use super::scripted_redraw_fixture::{scripted_app, surface};
+    let wid = WindowId(0);
+    let mut app = scripted_app();
+    app.split_active_stub_tab(wid);
+    assert!(app.windows[&wid].is_split(), "the window composes");
+    // A fresh split presents twice before its key settles.
+    app.redraw_window(wid);
+    app.redraw_window(wid);
+    let presents = |app: &mut App, what: &str, expect: usize| {
+        let before = surface(app).commits();
+        app.redraw_window(wid);
+        assert_eq!(surface(app).commits(), before + expect, "{what}");
+    };
+    presents(&mut app, "CONTROL: nothing changed, nothing presents", 0);
+    app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+        wid,
+        Some(0),
+        "one\ntwo\n".to_string(),
+        crate::input::Source::Human,
+        crate::input::PasteFraming::AtDrain,
+    ));
+    presents(&mut app, "the paste question appears", 1);
+    presents(&mut app, "and stands", 0);
+    app.paste_banner = None;
+    presents(&mut app, "the answer takes it away", 1);
+    let prompt =
+        crate::quit_safety::confirm_prompt(false, true, true).expect("a busy close prompts");
+    app.close_banner = Some(crate::close_confirm::PendingClose::new(
+        wid,
+        prompt,
+        crate::close_confirm::CloseReplay::Window(wid),
+        crate::session_store::ExitActor::Human,
+    ));
+    presents(&mut app, "the close question appears", 1);
+    app.close_banner = None;
+    presents(&mut app, "and its answer takes it away", 1);
 }

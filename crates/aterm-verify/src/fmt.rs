@@ -884,7 +884,7 @@ mod tests {
     /// a context line reading `error: …` is one drift and nothing unread, and
     /// so is a new source not yet staged; `--fix` rewrites both, and leaves an
     /// untracked scratch file cargo builds nothing from as it was; the next
-    /// check passes. Skips, saying so, on a machine with no trustfmt.
+    /// check passes. Ends COULD NOT RUN on a machine with no trustfmt.
     #[test]
     fn the_real_formatter_reds_on_drift_and_the_fix_greens_it() {
         use crate::ladder::{Outcome, Severity};
@@ -893,7 +893,7 @@ mod tests {
         // (`Ctx::new_with_tools`), and an explicit override borrows nothing
         // (`toolchain-borrowed-tools`): a run whose directory lacks a formatter it
         // borrowed from the managed build would hand this test a toolchain with none,
-        // and the test would skip on every run. It wants a real formatter, whichever
+        // and the test could not run on any run. It wants a real formatter, whichever
         // one this machine has, so it looks again without the inherited override.
         let env = crate::EnvSnapshot::capture();
         let mut tools = crate::run_toolchain(&env, &repo);
@@ -905,12 +905,10 @@ mod tests {
             tools = crate::run_toolchain(&discovered, &repo);
         }
         if tools.trustfmt.is_none() {
-            eprintln!(
-                "SKIP the_real_formatter_reds_on_drift_and_the_fix_greens_it: {}, so this \
-                 machine cannot show the check either way",
+            aterm_uds::host::could_not_run(format!(
+                "{}, so this machine cannot show the check either way",
                 tools.missing_trustfmt_label()
-            );
-            return;
+            ));
         }
         let t = tree(&[
             (

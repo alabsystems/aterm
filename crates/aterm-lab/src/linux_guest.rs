@@ -156,18 +156,27 @@ pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-driv
 /// The guest's own tools: the build, the display servers, the second X
 /// client of the clipboard round trip, the baseline's input and probe tools
 /// (xdotool's XTEST keys and pointer, xset and xrdb, xdpyinfo, wayland-info,
-/// wl-clipboard's second Wayland client, ibus as the XIM server), the session
-/// bus and the accessibility bus, the GPU probes, fonts (a stock Ubuntu
+/// wl-clipboard's second Wayland client, ibus as the XIM server, GNOME Shell,
+/// whose IBus bridge is the one input method that reaches Mutter's
+/// text-input-v3, and pipewire, without which Mutter has no screencast, the
+/// space RemoteDesktop places a finger in), the session
+/// bus and the accessibility bus, Orca with speech-dispatcher (whose dummy
+/// output module answers speech with no audio device) and xdg-desktop-portal
+/// with its GTK backend (the Settings portal aterm's motion read asks), the
+/// GPU probes, fonts (a stock Ubuntu
 /// desktop's: Noto CJK and Noto Color Emoji are the CJK and colour faces
 /// aterm-render's script and emoji tests need, and without them those answer
-/// COULD NOT RUN), the x86_64 cross toolchain with its libc, and zsh and fish,
+/// COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish,
 /// the shells aterm integrates beside bash, whose integration tests run each
-/// one and cannot run without it.
+/// one and cannot run without it (pwsh, the fourth, is [`PWSH`]), and unzip,
+/// which `verify fetch-browser` unpacks the browser lane's pinned browsers
+/// with.
 pub const TOOLS: &[&str] = &[
     "build-essential",
     "pkg-config",
     "ca-certificates",
     "curl",
+    "unzip",
     "rustup",
     "xvfb",
     "xauth",
@@ -182,10 +191,17 @@ pub const TOOLS: &[&str] = &[
     "ibus",
     "weston",
     "mutter",
+    "gnome-shell",
+    "pipewire",
+    "wireplumber",
     "dbus",
     "dbus-x11",
     "dbus-user-session",
     "at-spi2-core",
+    "orca",
+    "speech-dispatcher",
+    "xdg-desktop-portal",
+    "xdg-desktop-portal-gtk",
     "mesa-utils",
     "vulkan-tools",
     "fonts-dejavu-core",
@@ -202,11 +218,75 @@ pub const TOOLS: &[&str] = &[
 /// translated binaries start on, and the C++ runtime Mesa links.
 pub const AMD64_RUNTIME: &[&str] = &["libc6", "libgcc-s1", "libstdc++6"];
 
+/// The libraries the browser lane's x86_64 browser loads (`linux browser`):
+/// every `NEEDED` entry of Chrome for Testing's linux64 chrome-headless-shell
+/// and the libraries it ships (`readelf -d`, pin 155.0.8059.84) that the
+/// archive does not carry, as amd64 packages.
+pub const BROWSER_AMD64: &[&str] = &[
+    "libasound2t64",
+    "libatk-bridge2.0-0t64",
+    "libatk1.0-0t64",
+    "libatspi2.0-0t64",
+    "libdbus-1-3",
+    "libexpat1",
+    "libgbm1",
+    "libglib2.0-0t64",
+    "libnspr4",
+    "libnss3",
+    "libudev1",
+    "libx11-6",
+    "libxcb1",
+    "libxcomposite1",
+    "libxdamage1",
+    "libxext6",
+    "libxfixes3",
+    "libxkbcommon0",
+    "libxrandr2",
+];
+
+/// The libraries the browser lane's aarch64 browser loads: every `NEEDED`
+/// entry of Playwright's Firefox for Ubuntu 24.04 on arm64 (build 1543) that
+/// the archive does not carry, as the guest's own packages.
+pub const BROWSER_ARM64: &[&str] = &[
+    "libasound2t64",
+    "libatk1.0-0t64",
+    "libcairo-gobject2",
+    "libcairo2",
+    "libdbus-1-3",
+    "libfontconfig1",
+    "libfreetype6",
+    "libgdk-pixbuf-2.0-0",
+    "libglib2.0-0t64",
+    "libgtk-3-0t64",
+    "libpango-1.0-0",
+    "libpangocairo-1.0-0",
+    "libx11-6",
+    "libx11-xcb1",
+    "libxcb-shm0",
+    "libxcb1",
+    "libxcomposite1",
+    "libxcursor1",
+    "libxdamage1",
+    "libxext6",
+    "libxfixes3",
+    "libxi6",
+    "libxrandr2",
+    "libxrender1",
+];
+
 /// Every package the guest installs, `:amd64` names last.
 #[must_use]
 pub fn packages() -> Vec<String> {
-    let native = TOOLS.iter().chain(DEV_LIBRARIES).chain(MESA);
-    let foreign = DEV_LIBRARIES.iter().chain(MESA).chain(AMD64_RUNTIME);
+    let native = TOOLS
+        .iter()
+        .chain(DEV_LIBRARIES)
+        .chain(MESA)
+        .chain(BROWSER_ARM64);
+    let foreign = DEV_LIBRARIES
+        .iter()
+        .chain(MESA)
+        .chain(AMD64_RUNTIME)
+        .chain(BROWSER_AMD64);
     native
         .map(|p| (*p).to_string())
         .chain(foreign.map(|p| format!("{p}:amd64")))
@@ -215,6 +295,41 @@ pub fn packages() -> Vec<String> {
 
 /// Where the guest records the plan it was provisioned with.
 pub const STAMP: &str = "/var/lib/aterm-lane/provisioned";
+
+/// PowerShell 7, the fourth shell aterm integrates: aterm-shell-integration's
+/// pwsh tests answer COULD NOT RUN without one, and Ubuntu packages none for
+/// arm64 (Microsoft's apt repository carries amd64 alone), so the guest gets
+/// the release's own linux-arm64 archive, held to the digest GitHub publishes
+/// for it ([`PWSH_INSTALL`]). 7.6.6 (2026-09-08): the newest release older
+/// than two weeks when it was pinned (2026-10-20); the host's is 7.6.7.
+pub const PWSH: (&str, &str) = (
+    "7.6.6",
+    "924829e54c983648f6f1419a2dc7f9433c861b2fb5bd57736ff096c24f133729",
+);
+
+/// Install [`PWSH`] (`$1` its version, `$2` the archive's sha256) at
+/// `/opt/aterm-lane/pwsh-<version>` and link it as `/usr/local/bin/pwsh`,
+/// run as root. Unpacked beside the target (on its filesystem) and renamed
+/// into place, so a directory there is a whole install and a provisioning run
+/// again skips the download, and one without its `pwsh` is replaced; an
+/// archive whose digest differs installs nothing.
+pub const PWSH_INSTALL: &str = r#"set -eu
+dir=/opt/aterm-lane/pwsh-$1
+if [ ! -x "$dir/pwsh" ]; then
+  mkdir -p /opt/aterm-lane
+  tmp=$(mktemp -d /opt/aterm-lane/.pwsh.XXXXXX)
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL -o "$tmp/pwsh.tar.gz" \
+    "https://github.com/PowerShell/PowerShell/releases/download/v$1/powershell-$1-linux-arm64.tar.gz"
+  echo "$2  $tmp/pwsh.tar.gz" | sha256sum -c --quiet
+  mkdir "$tmp/pwsh"
+  tar -xzf "$tmp/pwsh.tar.gz" -C "$tmp/pwsh"
+  chmod 0755 "$tmp/pwsh/pwsh"
+  rm -rf "$dir"
+  mv "$tmp/pwsh" "$dir"
+fi
+ln -sfn "$dir/pwsh" /usr/local/bin/pwsh
+"#;
 
 /// Webster's Second International (`web2`), the public-domain word list
 /// aterm-lexicon's dictionary gates walk: their allowlists are curated against
@@ -305,6 +420,11 @@ pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
             ],
             None,
         ),
+        step(
+            "pwsh",
+            &["sudo", "sh", "-s", "--", PWSH.0, PWSH.1],
+            Some(PWSH_INSTALL),
+        ),
     ];
     if let Some(words) = web2 {
         steps.push(step(
@@ -340,7 +460,10 @@ pub fn fingerprint(steps: &[Step]) -> String {
 /// The environment `cargo` gets for `arch`: the pinned stock toolchain, no
 /// incremental cache, the guest-local target dir, and for x86_64 the cross
 /// linker, C compiler and pkg-config search path (`CARGO_BUILD_TARGET`
-/// names x86_64, a cross triple here, only when `default_target` asks).
+/// names x86_64, a cross triple here, only when `default_target` asks) and
+/// libtest's one-test-at-a-time (`RUST_TEST_THREADS=1`, which a CMD's own
+/// `--test-threads` overrides): the proof's rule for Rosetta
+/// ([`crate::linux_proof::ROSETTA_ONE_AT_A_TIME`]) for every x86_64 `exec`.
 #[must_use]
 pub fn cargo_env(arch: Arch, target_dir: &str, default_target: bool) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
@@ -359,6 +482,7 @@ pub fn cargo_env(arch: Arch, target_dir: &str, default_target: bool) -> Vec<(Str
             (format!("CC_{t}"), "x86_64-linux-gnu-gcc".into()),
             (format!("AR_{t}"), "x86_64-linux-gnu-ar".into()),
             ("PKG_CONFIG_ALLOW_CROSS".into(), "1".into()),
+            ("RUST_TEST_THREADS".into(), "1".into()),
             (
                 format!("PKG_CONFIG_LIBDIR_{t}"),
                 "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig".into(),
@@ -394,6 +518,24 @@ pub enum Display {
     Mutter,
     /// X11 on Wayland: a rootful Xwayland inside headless weston.
     Xwayland,
+    /// Wayland: weston's x11 backend, its output a window on the lane's Xvfb,
+    /// whose seat (a pointer and a keyboard) reads that window's input, so
+    /// XTEST on the Xvfb display drives it (`lane-bus xseat`). The baseline's
+    /// one weston with a seat; the proof's displays leave it out
+    /// ([`Display::PROOF`]), and a proof that runs weston replays its
+    /// recordings ([`Display::proof_display`]).
+    WestonX11,
+}
+
+/// How the baseline gives a Wayland screen's seat its keys and pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seat {
+    /// A RemoteDesktop session of Mutter's (`lane-bus seat`), whose virtual
+    /// devices live as long as the session.
+    RemoteDesktop,
+    /// XTEST on the X display weston's x11 backend reads its input from
+    /// (`lane-bus xseat`): weston's own keyboard and pointer.
+    Xtest,
 }
 
 /// A user unit the lane starts in the guest (`systemd-run --user`), and the
@@ -419,8 +561,23 @@ const XWAYLAND_DISPLAY: &str = ":92";
 const WIDTH: &str = "1280";
 const HEIGHT: &str = "800";
 
+/// Every baseline screen with a seat in its seat's pixels (Mutter's logical
+/// ones; the fractional Mutter's 1920x1200 at 1.5): [`WIDTH`] by [`HEIGHT`].
+pub const SCREEN: (i32, i32) = (1280, 800);
+
 impl Display {
-    pub const ALL: [Display; 4] = [
+    pub const ALL: [Display; 5] = [
+        Display::Xvfb,
+        Display::Weston,
+        Display::Mutter,
+        Display::Xwayland,
+        Display::WestonX11,
+    ];
+
+    /// The displays a proof or a CPU run takes when none is named: every one
+    /// but [`Display::WestonX11`], a second weston that only the baseline's
+    /// input items need.
+    pub const PROOF: [Display; 4] = [
         Display::Xvfb,
         Display::Weston,
         Display::Mutter,
@@ -434,6 +591,7 @@ impl Display {
             Display::Weston => "weston",
             Display::Mutter => "mutter",
             Display::Xwayland => "xwayland",
+            Display::WestonX11 => "weston-x11",
         }
     }
 
@@ -442,13 +600,48 @@ impl Display {
     pub const fn protocol(self) -> &'static str {
         match self {
             Display::Xvfb | Display::Xwayland => "X11",
-            Display::Weston | Display::Mutter => "Wayland",
+            Display::Weston | Display::Mutter | Display::WestonX11 => "Wayland",
         }
     }
 
     #[must_use]
     pub fn parse(word: &str) -> Option<Display> {
         Display::ALL.into_iter().find(|d| d.name() == word)
+    }
+
+    /// The proof display under which a proof replays this display's baseline
+    /// screens: weston for weston's x11 backend (the same weston, its seat
+    /// read from an Xvfb window), the display itself otherwise.
+    #[must_use]
+    pub const fn proof_display(self) -> Display {
+        match self {
+            Display::WestonX11 => Display::Weston,
+            d => d,
+        }
+    }
+
+    /// How the baseline drives its seat: `None` on X11 (XTEST reaches the
+    /// client's own window) and under headless weston, which advertises no
+    /// `wl_seat`.
+    #[must_use]
+    pub const fn seat(self) -> Option<Seat> {
+        match self {
+            Display::Mutter => Some(Seat::RemoteDesktop),
+            Display::WestonX11 => Some(Seat::Xtest),
+            Display::Xvfb | Display::Weston | Display::Xwayland => None,
+        }
+    }
+
+    /// The X display XTEST drives this display's input through: the client's
+    /// own on X11, the one weston's x11 backend is nested in, none under a
+    /// headless compositor.
+    #[must_use]
+    pub const fn input_x(self) -> Option<&'static str> {
+        match self {
+            Display::Xvfb | Display::WestonX11 => Some(XVFB_DISPLAY),
+            Display::Xwayland => Some(XWAYLAND_DISPLAY),
+            Display::Weston | Display::Mutter => None,
+        }
     }
 
     /// Whether a client with no input device can own the clipboard and read it
@@ -460,6 +653,15 @@ impl Display {
     #[must_use]
     pub const fn clipboard_scriptable(self) -> bool {
         matches!(self, Display::Xvfb | Display::Xwayland)
+    }
+
+    /// Whether its servers include a weston, which reads [`WESTON_INI`].
+    #[must_use]
+    pub const fn runs_weston(self) -> bool {
+        matches!(
+            self,
+            Display::Weston | Display::Xwayland | Display::WestonX11
+        )
     }
 
     /// The servers it needs, in start order. `runtime` is the guest user's
@@ -488,26 +690,54 @@ impl Display {
                 &format!("--width={WIDTH}"),
                 &format!("--height={HEIGHT}"),
                 "--idle-time=0",
+                &format!("--config={WESTON_INI}"),
             ]),
             socket: format!("{runtime}/{UNIT_PREFIX}weston"),
         };
+        let xvfb = || Unit {
+            name: format!("{UNIT_PREFIX}xvfb"),
+            env: Vec::new(),
+            argv: strings(&[
+                "Xvfb",
+                XVFB_DISPLAY,
+                "-screen",
+                "0",
+                &format!("{WIDTH}x{HEIGHT}x24"),
+                "-nolisten",
+                "tcp",
+                "-noreset",
+            ]),
+            socket: x_socket(XVFB_DISPLAY),
+        };
         match self {
-            Display::Xvfb => vec![Unit {
-                name: format!("{UNIT_PREFIX}xvfb"),
-                env: Vec::new(),
-                argv: strings(&[
-                    "Xvfb",
-                    XVFB_DISPLAY,
-                    "-screen",
-                    "0",
-                    &format!("{WIDTH}x{HEIGHT}x24"),
-                    "-nolisten",
-                    "tcp",
-                    "-noreset",
-                ]),
-                socket: x_socket(XVFB_DISPLAY),
-            }],
+            Display::Xvfb => vec![xvfb()],
             Display::Weston => vec![weston()],
+            // Xvfb, then weston's x11 backend in it: one output window the size
+            // of the X screen, at its origin (no window manager places it), so
+            // an X pixel is an output pixel. GL, as headless weston draws, and
+            // its debug protocols on (`--debug`), as the proof's CPU rows start
+            // headless weston: the baseline's CPU item reads the output's pixels
+            // (`weston-screenshooter`) and where the window is in the scene graph
+            // (`weston-debug scene-graph`).
+            Display::WestonX11 => vec![
+                xvfb(),
+                Unit {
+                    name: format!("{UNIT_PREFIX}weston-x11"),
+                    env: vec![("DISPLAY".into(), XVFB_DISPLAY.into())],
+                    argv: strings(&[
+                        "weston",
+                        "--backend=x11",
+                        "--renderer=gl",
+                        &format!("--socket={UNIT_PREFIX}weston-x11"),
+                        &format!("--width={WIDTH}"),
+                        &format!("--height={HEIGHT}"),
+                        "--idle-time=0",
+                        &format!("--config={WESTON_INI}"),
+                        "--debug",
+                    ]),
+                    socket: format!("{runtime}/{UNIT_PREFIX}weston-x11"),
+                },
+            ],
             Display::Mutter => vec![Unit {
                 name: format!("{UNIT_PREFIX}mutter"),
                 env: vec![("XDG_SESSION_TYPE".into(), "wayland".into())],
@@ -554,7 +784,7 @@ impl Display {
         match self {
             Display::Xvfb => ("DISPLAY".into(), XVFB_DISPLAY.into()),
             Display::Xwayland => ("DISPLAY".into(), XWAYLAND_DISPLAY.into()),
-            Display::Weston | Display::Mutter => (
+            Display::Weston | Display::Mutter | Display::WestonX11 => (
                 "WAYLAND_DISPLAY".into(),
                 format!("{runtime}/{UNIT_PREFIX}{}", self.name()),
             ),
@@ -584,6 +814,23 @@ pub enum Scale {
     OneAndHalf,
 }
 
+/// The `weston.ini` every lane weston reads (`--config`), written before it
+/// starts ([`Screen::files`]) in a directory of its own.
+pub const WESTON_INI: &str = "/tmp/aterm-lane-weston-config/weston.ini";
+
+/// [`WESTON_INI`]'s text: desktop-shell's startup fade off. By default the
+/// shell starts behind a black curtain that fades out over about a second
+/// once its panel is up. A CPU row that photographed the output inside that
+/// second read every pixel `round(p * 254 / 255)` of the frame aterm
+/// presented: the curtain's last step at alpha 1/255, over the panel and the
+/// background as over aterm's window (1075 of 556248 pixels on the aarch64
+/// `--cpu weston` row, in proof-20261020-152623 and -160553 and in 1 of 6
+/// lone runs; main's lab, 1 of 8). With the fade on, weston's output differed
+/// from its settled output until 960 ms after the socket appeared; with it
+/// off, from the first shot at 42 ms on (16 shots each, measured
+/// 2026-10-20).
+pub const WESTON_INI_TEXT: &str = "[shell]\nstartup-animation=none\n";
+
 /// The scratch `XDG_CONFIG_HOME` of the fractional Mutter.
 pub const MUTTER_CONFIG: &str = "/tmp/aterm-lane-mutter-config";
 
@@ -603,6 +850,33 @@ pub const IBUS_KEYFILE: &str = "[desktop/ibus/general]\nuse-system-keyboard-layo
 /// The GSettings keyfile that turns on Mutter's fractional scaling.
 pub const MUTTER_KEYFILE: &str =
     "[org/gnome/mutter]\nexperimental-features=['scale-monitor-framebuffer']\n";
+
+/// The scratch `XDG_CONFIG_HOME` of the baseline's Mutter at scale 1 (the
+/// fractional one's is [`MUTTER_CONFIG`]): its keyboard data
+/// ([`MUTTER_XKB_US`]) and GNOME Shell's settings ([`SHELL_KEYFILE`]).
+pub const MUTTER_PLAIN_CONFIG: &str = "/tmp/aterm-lane-mutter-plain-config";
+
+/// `xkb/symbols/us` under a baseline Mutter's `XDG_CONFIG_HOME`: the default
+/// layout, `us`, made `us(intl)`. Mutter reads `$XDG_CONFIG_HOME/xkb` ahead of
+/// the system's keyboard data (its xkb context's first include path), and a
+/// bare Mutter's keymap is `us`, which has no dead key: RemoteDesktop found no
+/// keycode for `dead_acute` ("No keycode found for keyval fe51", measured).
+/// With this file it finds one, as the X11 screens' `us intl` does
+/// ([`Screen::baseline_keymap`]). libxkbcommon looks a file's other
+/// sections up further along the path (`us(intl)` and the `us(basic)` it
+/// includes come from the system's `us`).
+pub const MUTTER_XKB_US: &str = "default partial alphanumeric_keys modifier_keys\n\
+xkb_symbols \"lane\" {\n    include \"us(intl)\"\n};\n";
+
+/// GNOME Shell's settings in the baseline (the input-method item runs it
+/// headless on its screen's `XDG_CONFIG_HOME`, through a GSettings keyfile):
+/// one input source, `us+intl`, which GNOME Shell sets as Mutter's keymap
+/// and serves through IBus's `xkb:us::eng` engine, ibus's simple engine,
+/// which composes dead keys; and no welcome dialog over the first window.
+pub const SHELL_KEYFILE: &str = "[org/gnome/desktop/input-sources]\n\
+sources=[('xkb', 'us+intl')]\n\
+[org/gnome/shell]\n\
+welcome-dialog-last-shown-version='999'\n";
 
 /// The `monitors.xml` that puts Mutter's one virtual monitor (connector
 /// `Meta-0`, as Mutter 46 names it) at 1920x1200, scale 1.5: a logical
@@ -644,7 +918,7 @@ pub struct Screen {
 
 impl Screen {
     /// Every screen the baseline records, in the order it takes them.
-    pub const BASELINE: [Screen; 7] = [
+    pub const BASELINE: [Screen; 8] = [
         Screen::plain(Display::Xvfb),
         Screen {
             display: Display::Xvfb,
@@ -661,6 +935,17 @@ impl Screen {
             scale: Scale::OneAndHalf,
         },
         Screen::plain(Display::Xwayland),
+        Screen::plain(Display::WestonX11),
+    ];
+
+    /// The screens the stats Deck's layout rows run under: one per display
+    /// family, at its server's own scale (`linux_baseline::deck_row`).
+    pub const DECK: [Screen; 5] = [
+        Screen::plain(Display::Xvfb),
+        Screen::plain(Display::Weston),
+        Screen::plain(Display::Mutter),
+        Screen::plain(Display::Xwayland),
+        Screen::plain(Display::WestonX11),
     ];
 
     /// `display` at its server's own scale.
@@ -718,7 +1003,7 @@ impl Screen {
     /// The files its servers read, written before they start: `(path, text)`.
     #[must_use]
     pub fn files(self) -> Vec<(String, String)> {
-        match self.scale {
+        let mut files = match self.scale {
             Scale::OneAndHalf => vec![
                 (
                     format!("{MUTTER_CONFIG}/glib-2.0/settings/keyfile"),
@@ -730,7 +1015,11 @@ impl Screen {
                 ),
             ],
             _ => Vec::new(),
+        };
+        if self.display.runs_weston() {
+            files.push((WESTON_INI.into(), WESTON_INI_TEXT.into()));
         }
+        files
     }
 
     /// What runs once its servers are up, before a client starts.
@@ -747,21 +1036,101 @@ impl Screen {
         }]
     }
 
-    /// The baseline's X keymap, `us intl`, set before its client starts (an
-    /// X11 screen's only; the proof's rows and `exec` keep the server's own
-    /// `us`, where an apostrophe typed through a real key stays one). It has
-    /// the dead keys the compose and XIM checks type: xdotool types a keysym
-    /// the keymap lacks by remapping a spare keycode for the one key, and a
-    /// client that reads the key before the MappingNotify loses it (measured
-    /// under plain `us`: `dead_acute e` sometimes typed a bare `e`, with and
-    /// without XIM, on both architectures).
+    /// The scratch `XDG_CONFIG_HOME` of the screen's Mutter in the baseline
+    /// (`None`: the screen runs no Mutter).
     #[must_use]
-    pub fn baseline_keymap(self) -> Option<Step> {
-        (self.display.protocol() == "X11").then(|| Step {
+    pub const fn baseline_config(self) -> Option<&'static str> {
+        match (self.display, self.scale) {
+            (Display::Mutter, Scale::OneAndHalf) => Some(MUTTER_CONFIG),
+            (Display::Mutter, _) => Some(MUTTER_PLAIN_CONFIG),
+            _ => None,
+        }
+    }
+
+    /// The servers the baseline starts: [`Screen::units`], a Mutter's on its
+    /// [`Screen::baseline_config`], whose keyboard data gives the keymap a
+    /// dead key ([`MUTTER_XKB_US`]). The proof's rows and `exec` keep the
+    /// server's own `us`, as on X11.
+    #[must_use]
+    pub fn baseline_units(self, runtime: &str) -> Vec<Unit> {
+        let mut units = self.units(runtime);
+        if let Some(config) = self.baseline_config() {
+            for u in &mut units {
+                u.env.retain(|(k, _)| k != "XDG_CONFIG_HOME");
+                u.env.push(("XDG_CONFIG_HOME".into(), config.into()));
+            }
+        }
+        units
+    }
+
+    /// The files the baseline's servers read, written before they start:
+    /// [`Screen::files`], and under a Mutter's [`Screen::baseline_config`]
+    /// its keyboard data and GNOME Shell's settings (one keyfile with the
+    /// fractional scale's).
+    #[must_use]
+    pub fn baseline_files(self) -> Vec<(String, String)> {
+        let Some(config) = self.baseline_config() else {
+            return self.files();
+        };
+        let keyfile = format!("{config}/glib-2.0/settings/keyfile");
+        let mut files: Vec<(String, String)> = self
+            .files()
+            .into_iter()
+            .filter(|(path, _)| path != &keyfile)
+            .collect();
+        let scaled = if self.scale == Scale::OneAndHalf {
+            MUTTER_KEYFILE
+        } else {
+            ""
+        };
+        files.push((keyfile, format!("{scaled}{SHELL_KEYFILE}")));
+        files.push((format!("{config}/xkb/symbols/us"), MUTTER_XKB_US.into()));
+        files
+    }
+
+    /// GNOME Shell, headless, on the screen's monitor and its Mutter's
+    /// [`Screen::baseline_config`] (GSettings from its keyfile), on a socket
+    /// of its own: the compositor of the baseline's input-method item. `None`
+    /// on a screen without a Mutter.
+    #[must_use]
+    pub fn gnome_shell(self, runtime: &str) -> Option<Unit> {
+        self.baseline_config()?;
+        let mut unit = self.baseline_units(runtime).into_iter().next()?;
+        let name = format!("{UNIT_PREFIX}gnome-shell");
+        unit.argv[0] = "gnome-shell".into();
+        for a in &mut unit.argv {
+            if a == &format!("{UNIT_PREFIX}mutter") {
+                a.clone_from(&name);
+            }
+        }
+        unit.env.retain(|(k, _)| k != "GSETTINGS_BACKEND");
+        unit.env
+            .push(("GSETTINGS_BACKEND".into(), "keyfile".into()));
+        unit.socket = format!("{runtime}/{name}");
+        unit.name = name;
+        Some(unit)
+    }
+
+    /// The baseline's X keymap, `us intl`, and the socket of the X server it
+    /// is set on: set once that server listens, before the servers after it
+    /// and the client start (an X display's only: an X11 screen's, and the
+    /// Xvfb weston's x11 backend is nested in, which builds its own keymap
+    /// from the X server's rule names once, as it starts; the proof's rows and
+    /// `exec` keep the server's own `us`, where an apostrophe typed through a
+    /// real key stays one). It has the dead keys the compose and XIM checks
+    /// type: xdotool types a keysym the keymap lacks by remapping a spare
+    /// keycode for the one key, and a client that reads the key before the
+    /// MappingNotify loses it (measured under plain `us`: `dead_acute e`
+    /// sometimes typed a bare `e`, with and without XIM, on both
+    /// architectures).
+    #[must_use]
+    pub fn baseline_keymap(self) -> Option<(String, Step)> {
+        let display = self.display.input_x()?;
+        let step = Step {
             label: "keymap us intl",
             argv: strings(&[
                 "env",
-                &format!("DISPLAY={}", self.display.client_env("").1),
+                &format!("DISPLAY={display}"),
                 "setxkbmap",
                 "-layout",
                 "us",
@@ -769,7 +1138,8 @@ impl Screen {
                 "intl",
             ]),
             stdin: None,
-        })
+        };
+        Some((x_socket(display), step))
     }
 }
 
@@ -824,6 +1194,45 @@ pub fn wait_file(path: &str, secs: u32) -> Vec<String> {
         "until [ -e \"$1\" ]; do sleep 0.1; done".into(),
         "wait-file".into(),
         path.into(),
+    ]
+}
+
+/// Wait, in the guest, until the file `path` holds at least `n` lines that
+/// contain `text`: a hang detector, as [`wait_socket`]. The loop is a fixed
+/// literal; the path, the text and the count are its arguments, never shell
+/// source.
+#[must_use]
+pub fn wait_lines(path: &str, text: &str, n: usize, secs: u32) -> Vec<String> {
+    vec![
+        "timeout".into(),
+        secs.to_string(),
+        "sh".into(),
+        "-c".into(),
+        "until [ \"$(grep -cF -- \"$2\" \"$1\" 2>/dev/null)\" -ge \"$3\" ] 2>/dev/null; \
+         do sleep 0.1; done"
+            .into(),
+        "wait-lines".into(),
+        path.into(),
+        text.into(),
+        n.to_string(),
+    ]
+}
+
+/// Wait, in the guest, until a process owns the bus name `name` on the
+/// session bus (an activatable name nobody runs does not count): a hang
+/// detector, as [`wait_socket`].
+#[must_use]
+pub fn wait_name(name: &str, secs: u32) -> Vec<String> {
+    vec![
+        "timeout".into(),
+        secs.to_string(),
+        "sh".into(),
+        "-c".into(),
+        "until busctl --user list --no-legend | awk -v n=\"$1\" '$1 == n && $2 ~ /^[0-9]+$/ { f = 1 } \
+         END { exit !f }'; do sleep 0.1; done"
+            .into(),
+        "wait-name".into(),
+        name.into(),
     ]
 }
 
@@ -1090,6 +1499,12 @@ mod tests {
                 "{tool} is the guest's own"
             );
         }
+        for lib in BROWSER_AMD64 {
+            assert!(all.contains(&format!("{lib}:amd64")), "{lib}:amd64");
+        }
+        for lib in BROWSER_ARM64 {
+            assert!(all.iter().any(|p| p == lib), "{lib}");
+        }
         let first_foreign = all.iter().position(|p| p.ends_with(":amd64"));
         assert!(
             all[first_foreign.expect("amd64 rows")..]
@@ -1149,6 +1564,10 @@ mod tests {
     fn the_x86_64_environment_is_a_cross_environment() {
         let native = cargo_env(Arch::Aarch64, "/t", true);
         assert!(native.iter().all(|(k, _)| k != "CARGO_BUILD_TARGET"));
+        assert!(
+            native.iter().all(|(k, _)| k != "RUST_TEST_THREADS"),
+            "aarch64 runs its tests in parallel"
+        );
         assert!(native.contains(&("RUSTUP_TOOLCHAIN".into(), RUST.into())));
         let cross = cargo_env(Arch::X86_64, "/t", true);
         assert!(cross.contains(&(
@@ -1159,6 +1578,10 @@ mod tests {
             "CARGO_BUILD_TARGET".into(),
             "x86_64-unknown-linux-gnu".into()
         )));
+        assert!(
+            cross.contains(&("RUST_TEST_THREADS".into(), "1".into())),
+            "Rosetta runs x86_64 tests one at a time"
+        );
         let pinned_by_args = cargo_env(Arch::X86_64, "/t", false);
         assert!(
             pinned_by_args
@@ -1196,12 +1619,90 @@ mod tests {
             "/run/user/501/aterm-lane-weston".into()
         )));
         assert_eq!(Display::Mutter.protocol(), "Wayland");
+        // weston's x11 backend: Xvfb, then weston as one of its X clients.
+        let wx = Display::WestonX11.units(rt);
+        assert_eq!(wx.len(), 2, "Xvfb first, then weston inside it");
+        assert_eq!(wx[0], x[0]);
+        assert!(wx[1].argv.contains(&"--backend=x11".to_string()));
+        assert!(wx[1].env.contains(&("DISPLAY".into(), ":91".into())));
+        assert_eq!(
+            Display::WestonX11.client_env(rt),
+            (
+                "WAYLAND_DISPLAY".into(),
+                "/run/user/501/aterm-lane-weston-x11".into()
+            )
+        );
+        assert_eq!(wx[1].socket, Display::WestonX11.client_env(rt).1);
+        assert_eq!(Display::WestonX11.seat(), Some(Seat::Xtest));
+        assert_eq!(Display::Mutter.seat(), Some(Seat::RemoteDesktop));
+        assert_eq!(Display::Weston.seat(), None);
+        assert!(!Display::PROOF.contains(&Display::WestonX11));
+        for d in Display::ALL {
+            assert!(Display::PROOF.contains(&d.proof_display()), "{d:?}");
+        }
+        assert_eq!(Display::WestonX11.proof_display(), Display::Weston);
         for d in Display::ALL {
             assert_eq!(Display::parse(d.name()), Some(d));
             for u in d.units(rt) {
                 assert!(u.name.starts_with(UNIT_PREFIX));
             }
         }
+    }
+
+    /// Every weston the lane starts reads a `weston.ini` its screen writes
+    /// first, in the proof and in the baseline, so none starts with its
+    /// shell's fade over the pixels a row holds; a screen with no weston
+    /// writes none.
+    #[test]
+    fn every_weston_reads_the_ini_its_screen_writes() {
+        let rt = "/run/user/501";
+        let config = format!("--config={WESTON_INI}");
+        let screens = Screen::BASELINE.into_iter().chain(Screen::DECK);
+        for screen in screens {
+            let westons = |units: Vec<Unit>| {
+                units
+                    .into_iter()
+                    .filter(|u| u.argv.first().is_some_and(|a| a == "weston"))
+                    .count()
+            };
+            let reads =
+                |units: Vec<Unit>| units.iter().filter(|u| u.argv.contains(&config)).count();
+            let ini = |files: Vec<(String, String)>| {
+                files
+                    .into_iter()
+                    .filter(|(path, _)| path == WESTON_INI)
+                    .map(|(_, text)| text)
+                    .collect::<Vec<_>>()
+            };
+            let n = westons(screen.units(rt));
+            assert_eq!(n, usize::from(screen.display.runs_weston()), "{screen:?}");
+            assert_eq!(reads(screen.units(rt)), n, "{screen:?}");
+            assert_eq!(reads(screen.baseline_units(rt)), n, "{screen:?}");
+            let written = vec![WESTON_INI_TEXT.to_string(); n];
+            assert_eq!(ini(screen.files()), written, "{screen:?}");
+            assert_eq!(ini(screen.baseline_files()), written, "{screen:?}");
+        }
+    }
+
+    /// The baseline's `us intl` goes on the X server it names as soon as that
+    /// server listens: under weston's x11 backend before weston, which reads
+    /// the keymap once as it starts.
+    #[test]
+    fn the_baseline_keymap_follows_the_x_server_it_sets() {
+        let rt = "/run/user/501";
+        for (screen, server) in [
+            (Screen::plain(Display::Xvfb), 0),
+            (Screen::plain(Display::Xwayland), 1),
+            (Screen::plain(Display::WestonX11), 0),
+        ] {
+            let (socket, step) = screen.baseline_keymap().expect("an X display");
+            let units = screen.baseline_units(rt);
+            let at = units.iter().position(|u| u.socket == socket);
+            assert_eq!(at, Some(server), "{}", screen.name());
+            assert!(step.argv.contains(&"intl".to_string()));
+        }
+        assert!(Screen::plain(Display::Mutter).baseline_keymap().is_none());
+        assert!(Screen::plain(Display::Weston).baseline_keymap().is_none());
     }
 
     #[test]
@@ -1229,6 +1730,16 @@ mod tests {
         );
         assert_eq!(wait_socket("/s", 60)[..2], ["timeout", "60"]);
         assert_eq!(wait_socket("/s", 60).last().map(String::as_str), Some("/s"));
+        let lines = wait_lines("/log", "it's \"joined\"", 2, 60);
+        assert_eq!(lines[..2], ["timeout", "60"]);
+        assert_eq!(lines[lines.len() - 3..], ["/log", "it's \"joined\"", "2"]);
+        assert!(!lines[4].contains("joined"), "the text is an argument");
+        let name = wait_name("org.freedesktop.portal.Desktop", 60);
+        assert_eq!(name[..2], ["timeout", "60"]);
+        assert_eq!(
+            name.last().map(String::as_str),
+            Some("org.freedesktop.portal.Desktop")
+        );
     }
 
     /// The clipboard's second client: its owner is a lane unit, so the

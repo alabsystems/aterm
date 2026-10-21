@@ -57,7 +57,9 @@
 //! fleet reads of the real issuer through the CLI take `--timeout 10`, the
 //! longest a read may name, since its per-peer deadline covers that
 //! instance's answer too; the reach it shows is checked first in process
-//! under the hang detector.
+//! under the hang detector. A port that never speaks spends a read's whole
+//! deadline, so it is read under a short one of its own (half a second, the
+//! window under test), never under the ten seconds a real instance gets.
 //!
 //! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs`
 //! (a product that cannot start fails; a scratch/spawn refusal is COULD NOT
@@ -120,6 +122,12 @@ fn fleet_table(port: u16, allow: &str) -> String {
     format!("[fleet]\nlisten = \"127.0.0.1:{port}\"\nallow = \"{allow}\"\n")
 }
 
+/// How often this instance's listener tries a held port or an unusable key
+/// again, and reads its served key again: the product's `RETRY` (2 s) through
+/// its development seam. The test's port and key changes are about what the
+/// listener does at its next try, and each waited out up to a whole 2 s of it.
+const RETRY_MS: &str = "100";
+
 /// A refused boot ends the test COULD NOT RUN, never a pass that checked
 /// nothing (`headless_boot::boot_with`).
 fn boot(port: u16) -> Instance {
@@ -133,6 +141,7 @@ fn boot(port: u16) -> Instance {
             std::fs::write(&config, format!("{text}{}", fleet_table(port, "facts")))
                 .expect("write the fleet table");
             cmd.env("ATERM_STATE_HOME", &state)
+                .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
                 .args(["--lines", "24", "--columns", "80"]);
         },
         |_| true,
@@ -455,28 +464,33 @@ fn ctl_in(root: &Path, args: &[&str]) -> Output {
     ctl_fed(root, args, None)
 }
 
-/// [`ctl_in`] with `stdin` its standard input (`None`: nothing).
+/// [`ctl_in`] with `stdin` its standard input (`None`: nothing). Asked again, a
+/// fresh client each time, while the instance has not yet accepted it or answers
+/// it busy ([`headless_boot::until_served`]): the client's own 10 s accept budget
+/// is a person's, and a loaded machine can miss it.
 fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
-    )]
-    let mut cmd = std::process::Command::new(aterm);
-    cmd.arg("ctl")
-        .args(args)
-        .stdin(stdin.map_or_else(Stdio::null, |_| Stdio::piped()))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    crate::launch_isolation::apply(&mut cmd, root);
-    cmd.env("ATERM_STATE_HOME", root.join("state"));
-    let mut child = cmd.spawn().expect("spawn aterm ctl");
-    if let Some(bytes) = stdin {
-        let mut pipe = child.stdin.take().expect("its stdin");
-        pipe.write_all(bytes).expect("write its stdin");
-    }
-    crate::child_output::wait_and_read(child, Instant::now() + HANG)
-        .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit"))
+    headless_boot::until_served(|| {
+        let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+        #[expect(
+            clippy::disallowed_types,
+            reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
+        )]
+        let mut cmd = std::process::Command::new(aterm);
+        cmd.arg("ctl")
+            .args(args)
+            .stdin(stdin.map_or_else(Stdio::null, |_| Stdio::piped()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::launch_isolation::apply(&mut cmd, root);
+        cmd.env("ATERM_STATE_HOME", root.join("state"));
+        let mut child = cmd.spawn().expect("spawn aterm ctl");
+        if let Some(bytes) = stdin {
+            let mut pipe = child.stdin.take().expect("its stdin");
+            pipe.write_all(bytes).expect("write its stdin");
+        }
+        crate::child_output::wait_and_read(child, Instant::now() + HANG)
+            .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit"))
+    })
 }
 
 /// [`fleet`] that must succeed: its stdout.
@@ -779,30 +793,30 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     );
 
     // THE FLEET READ through the CLI, which composes and keeps what that read
-    // found: a closed port and one that accepts and never speaks are named
-    // beside the issuer by hand. Its deadline is the CLI's own and the
-    // longest a read takes (`--timeout 10`): the issuer's real instance must
-    // answer inside it, so it is the most room a hang detector gets here; the
-    // silent port spends it, the closed one answers at once, and the reach
-    // above does not hang on it.
+    // found: a closed port is named beside the issuer by hand. Its deadline
+    // is the CLI's own and the longest a read takes (`--timeout 10`): the
+    // issuer's real instance must answer inside it, so it is the most room a
+    // hang detector gets here; every peer in it answers (the closed one at
+    // once), so the read ends when they have, and the reach above does not
+    // hang on it.
     let (closed, closed_port) = hold_a_port();
     drop(closed);
-    let (silent, silent_port) = hold_a_port();
-    for port in [closed_port, silent_port] {
+    let add = |port: u16| {
         fleet_ok(
             &member.0,
             &["peers", "add", &format!("127.0.0.1:{port}")],
             None,
         );
-    }
+    };
+    add(closed_port);
     let read = ctl_in(&member.0, &["survey", "--fleet", "--timeout", "10"]);
     let text = String::from_utf8_lossy(&read.stdout);
     assert!(read.status.success(), "{read:?}");
     let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("== ")).collect();
     assert_eq!(
         rows.len(),
-        5,
-        "this machine and four peers — the issuer, the member its book names, the two named \
+        4,
+        "this machine and three peers — the issuer, the member its book names, the one named \
          by hand — one row each:\n{text}"
     );
     assert!(
@@ -810,6 +824,16 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
             .any(|r| r.starts_with("== this machine did not answer: ")),
         "no aterm runs on the member:\n{text}"
     );
+    // A peer's unreached row in a read's `text`: its reason, whole before its
+    // label. The closed port's is this read's, refused at once.
+    let reason = |text: &str, port: u16| {
+        let head = format!("== 127.0.0.1:{port} did not answer: ");
+        text.lines()
+            .find_map(|r| r.strip_prefix(&head)?.strip_suffix(" trust=screen"))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("an unreached row for :{port}:\n{text}"))
+    };
+    let refused = reason(&text, closed_port);
     // Headed by the name dialled — the host the issuer's join code names
     // (here an address, so no ` at <address>` beside it), as its join answer
     // gave it — never by what the reply says of itself.
@@ -861,15 +885,17 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "{listed}"
     );
 
-    // The closed port and the silent one each have an unreached row, its
-    // reason whole before its label, and the two reasons differ.
-    let reason = |port: u16| {
-        let head = format!("== 127.0.0.1:{port} did not answer: ");
-        rows.iter()
-            .find_map(|r| r.strip_prefix(&head)?.strip_suffix(" trust=screen"))
-            .unwrap_or_else(|| panic!("an unreached row for :{port}:\n{text}"))
-    };
-    assert_ne!(reason(closed_port), reason(silent_port), "{text}");
+    // A PORT THAT ACCEPTS AND NEVER SPEAKS, named by hand too, spends the
+    // read's whole deadline: so it is read under a short one, the window
+    // under test, whose close is its answer (what the other peers answer
+    // inside it, and so the rows they get, is the read above's, and nothing
+    // here judges it). Its unreached row has a reason too, and it is not the
+    // closed port's.
+    let (silent, silent_port) = hold_a_port();
+    add(silent_port);
+    let read = ctl_in(&member.0, &["survey", "--fleet", "--timeout", "0.5"]);
+    let text = String::from_utf8_lossy(&read.stdout);
+    assert_ne!(refused, reason(&text, silent_port), "{text}");
 
     // `--host`: a word that names more than one peer is refused, naming them;
     // the issuer's own address and port is one, read in full.
@@ -1106,7 +1132,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "the member's own status: {read}"
     );
     ctl_ok(&member, &[&at, "task", "mark", "working"]);
-    ctl_ok(&member, &[&at, "task", "mark", "done", "why=marker"]);
+    ctl_ok(&member, &[&at, "task", "mark", "done", "why=landed"]);
 
     // A TURN over the fleet opens the done worker again, and its verdict
     // names the record's rev the Enter found.
@@ -1170,7 +1196,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
             "task",
             "mark",
             "done",
-            "why=marker",
+            "why=landed",
             "result_bytes=23",
             &format!("result_path={path}"),
         ],

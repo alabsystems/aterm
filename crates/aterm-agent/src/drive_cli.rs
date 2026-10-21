@@ -15,7 +15,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::supervise::limit::tz_offset_s;
-use crate::supervise::tape::{replay, show, store};
+use crate::supervise::tape::acts::Candidate;
+use crate::supervise::tape::{corpus, explain, replay, show, store};
 use crate::supervise::{
     self, ClockAnchor, LedgerFormat, LedgerHost, LedgerOpts, LedgerSource, Session,
     SupervisorConfig, classify_command_with, render_phase_and_survey,
@@ -532,53 +533,270 @@ fn tape_verb(args: &[String]) -> Reply {
 /// named. The report goes to stdout; the exit code is its verdict's (0
 /// reproduced or ended, 1 diverged, 4 the recorded panic reproduced), and a
 /// tape that cannot be replayed at all, or a usage error, exits 2.
+///
+/// `aterm drive replay FILE --why --at POINT [--format text|md|html]`: one
+/// decision on the tape EXPLAINED instead (`supervise::tape::explain`) — the
+/// screen it judged, the box this build reads on it, the facts it was
+/// decided on and the door each came from, the policy's rule trace, the act,
+/// its reply, the journal line and the ledger row. An approval or a question
+/// is decided again by this build's policy on its mark's facts (no loop run);
+/// a turn end is traced by a strict replay of the tape to its mark, on the
+/// build that recorded it only. Only the file is read, and the local zone's
+/// offset at the instants a point named by a local time is compared with.
+/// Exit 0, or 2 for a point with no decision, a tape that does not read, or
+/// a usage error.
+///
+/// `aterm drive replay FILE --set k=v…|--policy FILE`: a COUNTERFACTUAL — the
+/// recorded loop run again under a candidate policy in acts mode
+/// (`supervise::tape::acts`), up to the first act it takes otherwise: exit 0
+/// reproduced, 1 diverged (both acts said, or the act it went on without), 3
+/// stale (a read the tape never answered there). `aterm drive replay FILE…
+/// --shadow [--set…|--policy…]`: every decision on each tape decided again
+/// under the candidate (`supervise::tape::shadow`): exit 0 when every point
+/// is decided again and as recorded, 1 where one is decided otherwise, 3
+/// where none is but one was not decided again; over several tapes each is
+/// said under its own heading, one that does not shadow with why, and the
+/// exit is the worst of them (`worst_shadow_code`).
+///
+/// `aterm drive replay --check FILE|DIR… [--set k=v…|--policy FILE]`: a
+/// CORPUS CHECK (`supervise::tape::corpus`) — every tape named, and every
+/// tape under each directory named, replayed in acts mode under its own
+/// policy (or the candidate's), a line each: exit 0 when every tape's acts
+/// are taken as recorded, else the worst tape's (`corpus::worst`: 1 diverged,
+/// 2 not replayed, 3 stale, 4 its recorded panic).
+/// Options of the replay, never verbs of their own (`aterm drive` keeps
+/// classify, phase, answer, ledger, tape and replay); only the files are read.
 fn replay_verb(args: &[String]) -> Reply {
-    match replay_reply(args) {
-        Ok(report) => Reply {
-            text: report.render(),
-            code: report.code(),
-        },
-        Err(e) => {
-            eprintln!("aterm drive: replay: {e}");
-            Reply {
-                text: String::new(),
-                code: 2,
-            }
+    replay_reply(args).unwrap_or_else(|e| {
+        eprintln!("aterm drive: replay: {e}");
+        Reply {
+            text: String::new(),
+            code: 2,
         }
-    }
+    })
 }
 
-/// [`replay_verb`]'s report. The tape is read as the `tape` verbs read one
-/// ([`read_tape_bytes`]): a regular file only, opened without blocking (a
-/// FIFO cannot park the replay at its open), and no more than the reader's
-/// held-item bound of input (`recover::HELD_MAX`) — a bigger file, or an
-/// endless one, is refused, never read until memory runs out. A refusal
-/// quotes the tape (a header's section, a note's text): it is said as every
-/// tape field is printed ([`show::shown`]), so a crafted tape writes no
-/// control sequence to the reader's terminal.
-fn replay_reply(args: &[String]) -> Result<supervise::tape::report::Report, String> {
+/// [`replay_verb`]'s answer: a replay's report and its verdict's exit code,
+/// with `--why` one decision explained (exit 0), with `--shadow` each tape's
+/// shadow (a batch's every tape said, its refusals among them). The tape is
+/// read as the
+/// `tape` verbs read one ([`read_tape_bytes`]): a regular file only, opened
+/// without blocking (a FIFO cannot park the replay at its open), and no more
+/// than the reader's held-item bound of input (`recover::HELD_MAX`) — a
+/// bigger file, or an endless one, is refused, never read until memory runs
+/// out. A refusal quotes the tape (a header's section, a note's text): it is
+/// said as every tape field is printed ([`show::shown`]), so a crafted tape
+/// writes no control sequence to the reader's terminal.
+pub(crate) fn replay_reply(args: &[String]) -> Result<Reply, String> {
     replay_reply_with_limit(args, supervise::tape::recover::HELD_MAX as u64)
 }
 
 /// [`replay_reply`] with a raw read budget a test can make small.
-fn replay_reply_with_limit(
-    args: &[String],
-    read_limit: u64,
-) -> Result<supervise::tape::report::Report, String> {
-    let (file, options) = replay_args(args)?;
-    let bytes = read_tape_bytes(&file, read_limit)
-        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    replay::replay(&bytes, &options).map_err(|e| format!("{}: {}", file.display(), show::shown(&e)))
+fn replay_reply_with_limit(args: &[String], read_limit: u64) -> Result<Reply, String> {
+    let ReplayArgs {
+        file,
+        more,
+        options,
+        why,
+        shadow,
+        check,
+    } = replay_args(args)?;
+    let read = |file: &PathBuf| {
+        read_tape_bytes(file, read_limit)
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))
+    };
+    let refused = |file: &PathBuf, e: String| format!("{}: {}", file.display(), show::shown(&e));
+    if check {
+        // A CORPUS CHECK: every tape named or under a directory named, each
+        // replayed in acts mode, its line said whatever the others' are.
+        let named: Vec<PathBuf> = std::iter::once(file).chain(more).collect();
+        let tapes = corpus::tapes_in(&named)?;
+        if tapes.is_empty() {
+            return Err(format!(
+                "--check found no tape (*.atape, *{}) under {}",
+                corpus::TEXT_SUFFIX,
+                named
+                    .iter()
+                    .map(|p| show::shown(&p.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let candidate = options.candidate.unwrap_or_default();
+        let rows: Vec<corpus::Checked> = tapes
+            .into_iter()
+            .map(|path| {
+                let outcome = read(&path).and_then(|bytes| {
+                    corpus::check(&bytes, &candidate).map_err(|e| show::shown(&e))
+                });
+                corpus::Checked { path, outcome }
+            })
+            .collect();
+        let codes: Vec<u8> = rows.iter().map(corpus::Checked::code).collect();
+        return Ok(Reply {
+            text: corpus::render(&rows),
+            code: corpus::worst(&codes),
+        });
+    }
+    if shadow {
+        let candidate = options.candidate.unwrap_or_default();
+        let shadow_one = |file: &PathBuf| {
+            read(file).and_then(|bytes| {
+                supervise::tape::shadow::shadow(&bytes, &candidate).map_err(|e| refused(file, e))
+            })
+        };
+        // One tape: its shadow, or its refusal (exit 2), as a replay's.
+        if more.is_empty() {
+            let shadow = shadow_one(&file)?;
+            return Ok(Reply {
+                text: shadow.render(),
+                code: shadow.code(),
+            });
+        }
+        // A BATCH: each tape shadowed in turn under its own heading — one
+        // that does not shadow (no decision on it, a header this build cannot
+        // read) said there with why, never ending the batch — and the exit
+        // code the worst of them ([`worst_shadow_code`]).
+        let mut text = String::new();
+        let mut codes = Vec::new();
+        for file in std::iter::once(&file).chain(&more) {
+            text.push_str(&format!("{}\n", show::shown(&file.display().to_string())));
+            match shadow_one(file) {
+                Ok(shadow) => {
+                    text.push_str(&shadow.render());
+                    codes.push(shadow.code());
+                }
+                Err(e) => {
+                    text.push_str(&format!("  not shadowed: {e}\n"));
+                    codes.push(2);
+                }
+            }
+        }
+        return Ok(Reply {
+            text,
+            code: worst_shadow_code(&codes),
+        });
+    }
+    let bytes = read(&file)?;
+    match why {
+        None => replay::replay(&bytes, &options)
+            .map(|report| Reply {
+                text: report.render(),
+                code: report.code(),
+            })
+            .map_err(|e| refused(&file, e)),
+        Some((at, format)) => explain::why(&bytes, &at, &supervise::limit::local_offset_at)
+            .map(|why| Reply::text(explain::render(&why, format)))
+            .map_err(|e| refused(&file, e)),
+    }
 }
 
-/// `replay`'s FILE and options, as its arguments name them.
-fn replay_args(args: &[String]) -> Result<(PathBuf, replay::Options), String> {
-    const USAGE: &str = "replay FILE [--until door=N]";
-    let mut file = None;
+/// The exit code of a `--shadow` batch from each tape's: 1 when a point on
+/// any tape is decided otherwise (the answer a batch is asked for), else 2
+/// when a tape did not shadow, else 3 when a point was not decided again,
+/// else 0 — every point on every tape decided again, and as recorded.
+fn worst_shadow_code(codes: &[u8]) -> u8 {
+    [1, 2, 3]
+        .into_iter()
+        .find(|code| codes.contains(code))
+        .unwrap_or(0)
+}
+
+/// What `replay`'s arguments name: the tape (and, with `--shadow` or
+/// `--check`, more tapes — with `--check`, directories of them), how to
+/// replay it — strictly, or as a counterfactual under the candidate policy
+/// `--set`/`--policy` name — with `--why` the decision to explain and how to
+/// render it, with `--shadow` every decision decided again, and with
+/// `--check` every tape replayed as a corpus replays it.
+#[derive(Debug)]
+struct ReplayArgs {
+    file: PathBuf,
+    more: Vec<PathBuf>,
+    options: replay::Options,
+    why: Option<(explain::At, explain::Format)>,
+    shadow: bool,
+    check: bool,
+}
+
+// A policy is text, not a tape's potentially long run: admit at most 1 MiB.
+const POLICY_INPUT_MAX: u64 = 1024 * 1024;
+
+/// `--policy FILE`: a whole `[harness]` table read by the owner's own reader
+/// (`SupervisorConfig::from_aterm_toml`). A counterfactual says exactly what
+/// it runs, or nothing (`Candidate`): a file that cannot be read is refused,
+/// never read as the defaults, and so is one the reader did not take as
+/// written — a key or a value it refused (and kept the default for), a key
+/// misplaced, a file read line by line — each of its notes said.
+fn candidate_file(path: &str) -> Result<(String, supervise::SupervisorConfig), String> {
+    candidate_file_with_limit(path, POLICY_INPUT_MAX)
+}
+
+/// The same admission with a small byte budget for the existing reader controls.
+fn candidate_file_with_limit(
+    path: &str,
+    limit: u64,
+) -> Result<(String, supervise::SupervisorConfig), String> {
+    let named = show::shown(path);
+    let bytes = read_regular_bytes(std::path::Path::new(path), limit, "policy")
+        .map_err(|e| format!("--policy {named}: cannot be read: {e}"))?;
+    let text =
+        std::str::from_utf8(&bytes).map_err(|e| format!("--policy {named}: not UTF-8: {e}"))?;
+    let (policy, notes) = SupervisorConfig::from_aterm_toml(text);
+    if !notes.is_empty() {
+        return Err(format!(
+            "--policy {named}: the reader did not take it as written, so no counterfactual runs \
+             under it: {}",
+            show::shown(&notes.join("; "))
+        ));
+    }
+    Ok((path.to_string(), policy))
+}
+
+/// `replay`'s FILE and options, as its arguments name them. `--at` and
+/// `--format` belong to `--why`, which names its own point and so takes no
+/// `--until`. `--set k=v` (each key the `[harness]` table's, `harness.`
+/// before it or not) and `--policy FILE` name a CANDIDATE policy: alone, a
+/// counterfactual replay (acts mode); with `--shadow`, the policy every
+/// decision is decided again under. `--shadow` alone shadows under the
+/// recorded policy (this build's decisions), takes more than one FILE, and
+/// no `--until`; neither a candidate nor `--shadow` goes with `--why`.
+/// `--check` takes FILEs and DIRs, a candidate or none, and nothing else.
+fn replay_args(args: &[String]) -> Result<ReplayArgs, String> {
+    const USAGE: &str = "replay FILE [--until door=N] | replay FILE --set k=v… | --policy FILE \
+                         [--set k=v…] [--until door=N] | replay FILE… --shadow [--set k=v…] \
+                         [--policy FILE] | replay --check FILE|DIR… [--set k=v…] [--policy \
+                         FILE] | replay FILE --why --at \
+                         seq=N|door=N|[YYYY-MM-DDT]HH:MM[:SS]|\"<journal line>\" [--format \
+                         text|md|html]";
+    let mut files = Vec::new();
     let mut options = replay::Options::default();
+    let (mut why, mut at, mut format) = (false, None, None);
+    let (mut shadow, mut sets, mut policy) = (false, Vec::new(), None);
+    let mut check = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--set" => {
+                let kv = it
+                    .next()
+                    .ok_or_else(|| format!("--set needs k=v: {USAGE}"))?;
+                let (k, v) = kv
+                    .split_once('=')
+                    .filter(|(k, _)| !k.trim().is_empty())
+                    .ok_or_else(|| format!("--set takes k=v (a [harness] key), not {kv:?}"))?;
+                sets.push((k.trim().to_string(), v.to_string()));
+            }
+            "--policy" => {
+                let path = it
+                    .next()
+                    .ok_or_else(|| format!("--policy needs a FILE: {USAGE}"))?;
+                if policy.is_some() {
+                    return Err(format!("one --policy only: {USAGE}"));
+                }
+                policy = Some(candidate_file(path)?);
+            }
+            "--shadow" => shadow = true,
+            "--check" => check = true,
             "--until" => {
                 let at = it
                     .next()
@@ -591,13 +809,96 @@ fn replay_args(args: &[String]) -> Result<(PathBuf, replay::Options), String> {
                     })?;
                 options.until = Some(n);
             }
+            "--why" => why = true,
+            "--at" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| format!("--at needs a point: {USAGE}"))?;
+                at = Some(explain::At::parse(v)?);
+            }
+            "--format" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| format!("--format needs text, md or html: {USAGE}"))?;
+                format = Some(
+                    explain::Format::parse(v)
+                        .ok_or_else(|| format!("--format needs text, md or html, not {v:?}"))?,
+                );
+            }
             s if s.starts_with("--") => return Err(format!("unknown option '{s}': {USAGE}")),
-            s if file.is_none() => file = Some(PathBuf::from(s)),
-            s => return Err(format!("one FILE only, not also {s:?}")),
+            s => files.push(PathBuf::from(s)),
         }
     }
-    let file = file.ok_or_else(|| format!("needs the tape's FILE: {USAGE}"))?;
-    Ok((file, options))
+    let mut files = files.into_iter();
+    let file = files
+        .next()
+        .ok_or_else(|| format!("needs the tape's FILE: {USAGE}"))?;
+    let more: Vec<PathBuf> = files.collect();
+    if check {
+        // A corpus check replays every tape whole, in acts mode: it names no
+        // point, and decides nothing again.
+        if why || at.is_some() || format.is_some() || shadow || options.until.is_some() {
+            return Err(format!(
+                "--check replays every tape whole, as a corpus replays it: it takes FILEs, \
+                 DIRs and a candidate, nothing else: {USAGE}"
+            ));
+        }
+        if !sets.is_empty() || policy.is_some() {
+            options.candidate = Some(Candidate { file: policy, sets });
+        }
+        return Ok(ReplayArgs {
+            file,
+            more,
+            options,
+            why: None,
+            shadow: false,
+            check: true,
+        });
+    }
+    if let Some(also) = more.first().filter(|_| !shadow) {
+        return Err(format!(
+            "one FILE only, not also {:?} (--shadow and --check take more than one)",
+            also.display().to_string()
+        ));
+    }
+    let why = match (why, at) {
+        (false, None) if format.is_none() => None,
+        (false, _) => {
+            return Err(format!(
+                "--at and --format name the decision --why explains: {USAGE}"
+            ));
+        }
+        (true, None) => return Err(format!("--why needs --at: {USAGE}")),
+        (true, Some(_)) if options.until.is_some() => {
+            return Err(format!(
+                "--why replays to its own point, so it takes no --until: {USAGE}"
+            ));
+        }
+        (true, Some(at)) => Some((at, format.unwrap_or_default())),
+    };
+    let counterfactual = shadow || !sets.is_empty() || policy.is_some();
+    if why.is_some() && counterfactual {
+        return Err(format!(
+            "--why explains a decision under the recorded policy; --shadow decides every one \
+             again under a candidate: {USAGE}"
+        ));
+    }
+    if shadow && options.until.is_some() {
+        return Err(format!(
+            "--shadow decides every point on the tape, so it takes no --until: {USAGE}"
+        ));
+    }
+    if counterfactual {
+        options.candidate = Some(Candidate { file: policy, sets });
+    }
+    Ok(ReplayArgs {
+        file,
+        more,
+        options,
+        why,
+        shadow,
+        check: false,
+    })
 }
 
 /// [`tape_verb`]'s answer and its note on how the tape ended.
@@ -746,11 +1047,16 @@ fn store_forget(store: &std::path::Path, args: &[String]) -> Result<String, Stri
 /// the decoder's held-item budget: the CLI currently chooses the same 1 GiB
 /// value, and refuses overflow rather than handing the decoder a prefix.
 fn read_tape_bytes(path: &std::path::Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    read_regular_bytes(path, limit, "tape")
+}
+
+/// Both CLI inputs use the same opened-handle admission and overflow refusal.
+fn read_regular_bytes(path: &std::path::Path, limit: u64, kind: &str) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
     let file = crate::harness::footer::open_regular(path)
         .ok_or_else(|| std::io::Error::other("not a readable regular file"))?;
-    let overflow = || std::io::Error::other(format!("tape input exceeds {limit} bytes"));
+    let overflow = || std::io::Error::other(format!("{kind} input exceeds {limit} bytes"));
     if file.metadata()?.len() > limit {
         return Err(overflow());
     }
@@ -1315,23 +1621,333 @@ mod tests {
             ("door=#0", 0),
             ("door=12", 12),
         ] {
-            let (named, options) =
-                replay_args(&args(&["--until", until, file.as_str()])).expect("parses");
+            let ReplayArgs {
+                file: named,
+                options,
+                why,
+                ..
+            } = replay_args(&args(&["--until", until, file.as_str()])).expect("parses");
             assert_eq!(named, path, "{until}");
+            assert!(why.is_none(), "{until}");
             assert_eq!(options.until, Some(door), "{until}");
             assert_eq!(options.base, None, "{until}");
             let err = replay_reply(&args(&[file.as_str(), "--until", until]))
                 .expect_err("no loop to rebuild");
             assert!(err.contains("not a tape header"), "{until}: {err}");
         }
-        let (_, options) = replay_args(&args(&[file.as_str()])).expect("parses");
+        let ReplayArgs { options, why, .. } = replay_args(&args(&[file.as_str()])).expect("parses");
         assert_eq!(options.until, None, "no --until, no stop");
+        assert!(why.is_none(), "no --why, a replay");
         for bad in ["door=#", "door=-1", "door=#x", "#7", "door= 7"] {
             assert!(
                 replay_args(&args(&[file.as_str(), "--until", bad])).is_err(),
                 "{bad}"
             );
         }
+    }
+
+    /// `replay FILE --why --at POINT [--format …]` is the replay's option,
+    /// never a verb of its own (`aterm drive why` is refused as any unknown
+    /// command): `--why` needs `--at`, `--at` and `--format` need `--why`,
+    /// `--why` names its own point and so takes no `--until`, and a point or
+    /// a format that does not read is refused — each exit 2 with nothing
+    /// printed. A tape with no decision at the point is refused too.
+    #[test]
+    fn why_is_an_option_of_replay_and_refuses_with_two() {
+        use crate::supervise::tape::codec::{End, Item};
+        use crate::supervise::tape::frame::TapeWriter;
+        let dir = crate::supervise::ScratchDir::new("drive-replay", "why");
+        let path = dir.join("run.atape");
+        {
+            let file = store::create(&path).expect("made");
+            let mut w = TapeWriter::start(
+                Box::new(file),
+                "run.atape",
+                "not a header\n",
+                Box::new(std::io::sink()),
+            );
+            w.append(&Item::End(End::Returned {
+                how: "exit 0".to_string(),
+            }));
+        }
+        let file = path.to_string_lossy().into_owned();
+        for line in [
+            vec![file.as_str(), "--why"],
+            vec![file.as_str(), "--at", "seq=1"],
+            vec![file.as_str(), "--format", "md"],
+            vec![file.as_str(), "--why", "--at"],
+            vec![file.as_str(), "--why", "--at", "seq=x"],
+            vec![file.as_str(), "--why", "--at", "seq=1", "--format"],
+            vec![file.as_str(), "--why", "--at", "seq=1", "--format", "pdf"],
+            vec![file.as_str(), "--why", "--at", "seq=1", "--until", "door=3"],
+            vec!["--why", "--at", "seq=1"],
+            vec!["/nonexistent/run.atape", "--why", "--at", "seq=1"],
+            vec![file.as_str(), "--why", "--at", "seq=1"],
+        ] {
+            let reply = replay_verb(&args(&line));
+            assert_eq!(reply.code, 2, "{line:?}");
+            assert!(reply.text.is_empty(), "{line:?}");
+        }
+        let ReplayArgs { why, options, .. } = replay_args(&args(&[
+            "--why",
+            "--at",
+            "door=#17",
+            file.as_str(),
+            "--format",
+            "html",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            why,
+            Some((explain::At::Door(17), explain::Format::Html)),
+            "the point and the rendering"
+        );
+        assert_eq!(options.until, None);
+        let ReplayArgs { why, .. } =
+            replay_args(&args(&[file.as_str(), "--why", "--at", "seq=3"])).expect("parses");
+        assert_eq!(why, Some((explain::At::Seq(3), explain::Format::Text)));
+        let err = replay_reply(&args(&[file.as_str(), "--why", "--at", "door=3"]))
+            .expect_err("no decision");
+        assert!(err.contains("no decisions"), "{err}");
+        let err = run(&Opts {
+            socket: None,
+            cmd: args(&["why", file.as_str(), "--at", "seq=1"]),
+        })
+        .expect_err("no `why` verb");
+        assert!(err.contains("unknown command 'why'"), "{err}");
+    }
+
+    /// THE COUNTERFACTUALS ARE OPTIONS OF `replay`, never verbs of their own
+    /// (`aterm drive shadow` is refused as any unknown command): `--set k=v`
+    /// and `--policy FILE` name a candidate policy (a counterfactual in acts
+    /// mode), `--shadow` decides every point again under it (or under the
+    /// recorded policy) and alone takes more than one FILE. Each misuse is
+    /// refused, exit 2 with nothing printed: a `--set` that is no `k=v`, a
+    /// `--policy` that does not read (never read as the defaults), two FILEs
+    /// without `--shadow`, `--shadow` with `--until`, a candidate or
+    /// `--shadow` with `--why`; and a tape no replay can stand on is refused
+    /// by both modes.
+    #[test]
+    fn counterfactuals_are_options_of_replay_and_refuse_with_two() {
+        use crate::supervise::tape::codec::{End, Item};
+        use crate::supervise::tape::frame::TapeWriter;
+        let dir = crate::supervise::ScratchDir::new("drive-replay", "counterfactual");
+        let path = dir.join("run.atape");
+        {
+            let file = store::create(&path).expect("made");
+            let mut w = TapeWriter::start(
+                Box::new(file),
+                "run.atape",
+                "not a header\n",
+                Box::new(std::io::sink()),
+            );
+            w.append(&Item::End(End::Returned {
+                how: "exit 0".to_string(),
+            }));
+        }
+        let file = path.to_string_lossy().into_owned();
+        let policy = dir.join("aterm.toml");
+        std::fs::write(&policy, "[harness]\napprove = \"none\"\n").expect("written");
+        let policy = policy.to_string_lossy().into_owned();
+        // A value the reader refuses (a typo): no counterfactual, never one run
+        // under the default the reader keeps in its place.
+        let typo = dir.join("typo.toml");
+        std::fs::write(&typo, "[harness]\napprove = \"saf\"\n").expect("written");
+        let typo = typo.to_string_lossy().into_owned();
+        let absent = dir.join("absent.toml");
+        let absent = absent.to_string_lossy().into_owned();
+        let len =
+            u64::try_from(b"[harness]\napprove = \"none\"\n".len()).expect("small policy fixture");
+        let (_, exact) = candidate_file_with_limit(&policy, len).expect("exact policy limit");
+        assert_eq!(exact.approve, supervise::config::Approve::None);
+        let over = candidate_file_with_limit(&policy, len - 1).expect_err("one byte over");
+        assert!(over.contains("exceeds"), "{over}");
+        let directory = dir.to_string_lossy().into_owned();
+        let kind = candidate_file(&directory).expect_err("a directory is not policy input");
+        assert!(kind.contains("not a readable regular file"), "{kind}");
+        let non_utf8 = dir.join("non-utf8.toml");
+        std::fs::write(&non_utf8, b"[harness]\n# \xff\n").expect("owned non-UTF8 policy");
+        assert!(
+            candidate_file(&non_utf8.to_string_lossy())
+                .expect_err("the policy bytes must be UTF-8")
+                .contains("not UTF-8")
+        );
+        let controls = dir.join("controls.toml");
+        std::fs::write(
+            &controls,
+            "[harness]\n\"\\u001b]52;c;YQ==\\u0007\" = true\n",
+        )
+        .expect("owned policy with a control-bearing unknown key");
+        let refusal = candidate_file(&controls.to_string_lossy()).expect_err("unknown policy key");
+        assert!(!refusal.chars().any(char::is_control), "{refusal:?}");
+        for line in [
+            vec![file.as_str(), "--set"],
+            vec![file.as_str(), "--set", "approve"],
+            vec![file.as_str(), "--set", "=safe"],
+            vec![file.as_str(), "--policy"],
+            vec![file.as_str(), "--policy", absent.as_str()],
+            vec![
+                file.as_str(),
+                "--policy",
+                policy.as_str(),
+                "--policy",
+                policy.as_str(),
+            ],
+            vec![file.as_str(), file.as_str(), "--set", "approve=safe"],
+            vec![file.as_str(), "--shadow", "--until", "door=3"],
+            vec![
+                file.as_str(),
+                "--why",
+                "--at",
+                "seq=1",
+                "--set",
+                "approve=safe",
+            ],
+            vec![file.as_str(), "--why", "--at", "seq=1", "--shadow"],
+            vec![file.as_str(), "--set", "approve=safe"],
+            vec![file.as_str(), "--shadow"],
+        ] {
+            let reply = replay_verb(&args(&line));
+            assert_eq!(reply.code, 2, "{line:?}");
+            assert!(reply.text.is_empty(), "{line:?}");
+        }
+        // Several tapes are a batch: each one's refusal is said under its own
+        // heading, the batch exiting 2.
+        let reply = replay_verb(&args(&[file.as_str(), file.as_str(), "--shadow"]));
+        assert_eq!(reply.code, 2, "{}", reply.text);
+        assert_eq!(
+            reply.text.matches("not shadowed: ").count(),
+            2,
+            "{}",
+            reply.text
+        );
+        let ReplayArgs {
+            options, shadow, ..
+        } = replay_args(&args(&[
+            file.as_str(),
+            "--set",
+            "harness.approve=safe",
+            "--set",
+            "continue=false",
+            "--until",
+            "door=9",
+        ]))
+        .expect("parses");
+        assert!(!shadow);
+        assert_eq!(options.until, Some(9));
+        let candidate = options.candidate.expect("a counterfactual");
+        assert_eq!(
+            candidate.sets,
+            [
+                ("harness.approve".to_string(), "safe".to_string()),
+                ("continue".to_string(), "false".to_string())
+            ]
+        );
+        assert!(candidate.file.is_none());
+        let ReplayArgs {
+            more,
+            options,
+            shadow,
+            ..
+        } = replay_args(&args(&[
+            "--shadow",
+            file.as_str(),
+            file.as_str(),
+            "--policy",
+            policy.as_str(),
+        ]))
+        .expect("parses");
+        assert!(shadow);
+        assert_eq!(more.len(), 1, "two tapes shadowed");
+        let (named, read) = options
+            .candidate
+            .expect("a candidate")
+            .file
+            .expect("the policy file");
+        assert_eq!(named, policy);
+        assert_eq!(read.approve, supervise::config::Approve::None);
+        for line in [
+            vec![file.as_str(), "--policy", typo.as_str()],
+            vec![file.as_str(), "--shadow", "--policy", typo.as_str()],
+        ] {
+            let err = replay_args(&args(&line)).expect_err("a policy the reader refuses");
+            assert!(
+                err.contains("harness.approve") && err.contains("saf"),
+                "{err}"
+            );
+        }
+        let ReplayArgs { options, .. } = replay_args(&args(&[file.as_str()])).expect("parses");
+        assert!(options.candidate.is_none(), "no candidate, a strict replay");
+        let err = run(&Opts {
+            socket: None,
+            cmd: args(&["shadow", file.as_str()]),
+        })
+        .expect_err("no `shadow` verb");
+        assert!(err.contains("unknown command 'shadow'"), "{err}");
+    }
+
+    /// A CORPUS CHECK IS AN OPTION OF REPLAY: `--check` names FILEs and DIRs
+    /// (a candidate beside them or none) and nothing else — a point, a shadow
+    /// or an `--until` refused, as is a check that finds no tape, each exit
+    /// 2; a tape that does not replay is said on its own line and counted,
+    /// never ending the check; and `check` is no verb.
+    #[test]
+    fn a_corpus_check_is_an_option_of_replay() {
+        let dir = crate::supervise::ScratchDir::new("drive-replay", "check");
+        std::fs::create_dir_all(dir.join("empty")).expect("made");
+        std::fs::create_dir_all(dir.join("corpus").join("deep")).expect("made");
+        let bad = dir.join("corpus").join("deep").join("bad.atape.txt");
+        std::fs::write(&bad, "atape-text 1\nnot a record\n").expect("written");
+        let corpus = dir.join("corpus").to_string_lossy().into_owned();
+        let empty = dir.join("empty").to_string_lossy().into_owned();
+        for line in [
+            vec!["--check"],
+            vec!["--check", corpus.as_str(), "--shadow"],
+            vec!["--check", corpus.as_str(), "--until", "door=3"],
+            vec!["--check", corpus.as_str(), "--why", "--at", "seq=1"],
+            vec!["--check", empty.as_str()],
+            vec!["--check", "/nonexistent/corpus"],
+        ] {
+            let reply = replay_verb(&args(&line));
+            assert_eq!(reply.code, 2, "{line:?}");
+            assert!(reply.text.is_empty(), "{line:?}");
+        }
+        let reply = replay_verb(&args(&["--check", corpus.as_str()]));
+        assert_eq!(reply.code, 2, "{}", reply.text);
+        assert!(
+            reply.text.starts_with("NOT REPLAYED ") && reply.text.contains("bad.atape.txt"),
+            "{}",
+            reply.text
+        );
+        assert!(
+            reply.text.ends_with("1 tape(s): 1 NOT REPLAYED\n"),
+            "{}",
+            reply.text
+        );
+        let ReplayArgs {
+            file,
+            options,
+            check,
+            ..
+        } = replay_args(&args(&[
+            "--check",
+            corpus.as_str(),
+            "--set",
+            "approve=safe",
+        ]))
+        .expect("parses");
+        assert!(check);
+        assert_eq!(file, PathBuf::from(&corpus));
+        assert_eq!(
+            options.candidate.expect("a candidate").sets,
+            [("approve".to_string(), "safe".to_string())]
+        );
+        let err = run(&Opts {
+            socket: None,
+            cmd: args(&["check", corpus.as_str()]),
+        })
+        .expect_err("no `check` verb");
+        assert!(err.contains("unknown command 'check'"), "{err}");
     }
 
     /// A replay reads its tape as the `tape` verbs do: a regular file at
@@ -1377,12 +1993,14 @@ mod tests {
         let fifo = fifo.to_string_lossy().into_owned();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(replay_verb(&args(&[fifo.as_str()])).code);
+            let tape_code = replay_verb(&args(&[fifo.as_str()])).code;
+            let policy_refused = candidate_file(&fifo).is_err();
+            let _ = tx.send((tape_code, policy_refused));
         });
-        let code = rx
+        let refused = rx
             .recv_timeout(Duration::from_secs(60))
-            .expect("the replay of a FIFO did not come back: it blocked at the open");
-        assert_eq!(code, 2);
+            .expect("the tape/policy FIFO admission did not come back: it blocked at the open");
+        assert_eq!(refused, (2, true));
     }
 
     /// A refusal quotes the tape — a header's section — and is said as every

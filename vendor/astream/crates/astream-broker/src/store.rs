@@ -41,6 +41,7 @@
 //! code against a device that loses power after any operation.
 
 use crate::brecord::{BrokerRecord, GroupCommit, Mark};
+use crate::last_view::{LastStep, LastView, LastViewError, LastViewGarbage, RetireHistory};
 use crate::logid::{self, Prior};
 use crate::recover::{self, Classified};
 use crate::storage::{Backing, Dir};
@@ -97,6 +98,8 @@ pub const BIND_SUBJECT: &str = "/a/bind";
 /// `subjects_per_producer` both live and on rebuild across restarts and compaction.
 pub const RETIRE_SUBJECT: &str = "/a/retire";
 
+pub use crate::brecord::RETIRE_PRODUCER_SEQ;
+
 /// Every broker-INTERNAL subject, in one place: a record on one of these consumes an
 /// offset but is never delivered, never enters the dedup map, the per-producer
 /// high-water map or the last-value index, and is refused to a client publish by
@@ -108,6 +111,42 @@ pub fn is_hidden_subject(subject: &str) -> bool {
         subject,
         COMMIT_SUBJECT | WILL_SUBJECT | BIND_SUBJECT | RETIRE_SUBJECT
     )
+}
+
+/// The exact header emitted by the retirement writer before the explicit marker.
+/// This tuple stays reserved in live admission and recovery. It is not a claim
+/// that pre-reservation data with identical bytes can be distinguished from it.
+fn is_legacy_retire(rec: &BrokerRecord) -> bool {
+    rec.subject == RETIRE_SUBJECT && rec.producer_seq == 0 && rec.commit.is_none()
+}
+
+fn is_retire_record(rec: &BrokerRecord) -> bool {
+    rec.is_marked_retire() || is_legacy_retire(rec)
+}
+
+/// A retirement command's exact, non-internal target, shared by replay and live
+/// promotion. Malformed historical commands stay hidden and have no target.
+fn retire_target(rec: &BrokerRecord) -> Option<&str> {
+    if !is_retire_record(rec) {
+        return None;
+    }
+    let target = std::str::from_utf8(&rec.body).ok()?;
+    if target == "/a" || target.starts_with("/a/") || Subject::new(target).is_err() {
+        return None;
+    }
+    Some(target)
+}
+
+/// Whether a stored [`BrokerRecord`] is broker-internal. The explicit retirement
+/// marker and the previous writer's seq-zero, no-commit header are reserved;
+/// other unmarked `/a/retire` records remain ordinary visible legacy data.
+#[must_use]
+pub fn is_hidden_record(rec: &BrokerRecord) -> bool {
+    match rec.subject.as_str() {
+        COMMIT_SUBJECT | WILL_SUBJECT | BIND_SUBJECT => true,
+        RETIRE_SUBJECT => is_retire_record(rec),
+        _ => false,
+    }
 }
 
 /// The top half of the producer sequence space, RESERVED for acks.
@@ -132,6 +171,106 @@ pub fn is_hidden_subject(subject: &str) -> bool {
 /// a sequence in this half is REFUSED at registration (`stage_will_register`) rather
 /// than accepted and left permanently unfenceable.
 pub const ACK_SEQ_BASE: u64 = 1 << 63;
+
+/// The low word an incarnation reserves at the top of its sequence space for its will:
+/// [`will_seq`]`(inc)` is `(inc << 32) | WILL_SEQ_LOW`. See [`will_seq`] for the layout.
+pub const WILL_SEQ_LOW: u64 = 0xFFFF_FFFF;
+
+/// The highest incarnation the layout holds ([`will_seq`]): the last whose will,
+/// `(INC_MAX << 32) | WILL_SEQ_LOW`, lies below [`ACK_SEQ_BASE`], where a will is
+/// refused at registration. It is 2^31 − 1, and nothing above it has a sequence space:
+/// [`incarnation_base`] and [`will_seq`] answer `None` there.
+pub const INC_MAX: u64 = (ACK_SEQ_BASE >> 32) - 1;
+// INC_MAX's will is below the reserved half and the next incarnation's is not. `+` is
+// `|` here, because `inc << 32` has no low bits.
+const _: () = assert!((INC_MAX << 32) + WILL_SEQ_LOW < ACK_SEQ_BASE);
+const _: () = assert!(((INC_MAX + 1) << 32) + WILL_SEQ_LOW >= ACK_SEQ_BASE);
+
+/// The first sequence of incarnation `inc`'s space, `inc << 32` ([`will_seq`] has the
+/// layout): every sequence of `inc` is at or above it, and every sequence of every
+/// earlier incarnation, its will's included, is below it. An incarnation hands out its
+/// ordinary sequences strictly between this and [`will_seq`]`(inc)`.
+///
+/// `None` past [`INC_MAX`]: CHECKED, never wrapped. `inc << 32` drops the high bits, so
+/// an unchecked incarnation 2^32 would be incarnation 0's space again, and a producer
+/// that reached it would reuse every sequence it ever presented.
+#[must_use]
+pub const fn incarnation_base(inc: u64) -> Option<u64> {
+    if inc > INC_MAX {
+        None
+    } else {
+        Some(inc << 32)
+    }
+}
+
+/// THE WILL'S SEQUENCE for incarnation `inc`, `(inc << 32) | WILL_SEQ_LOW`: the reserved
+/// top of the incarnation's sequence space. `None` past [`INC_MAX`].
+///
+/// THE INCARNATION LAYOUT, and the obligation it exists to meet. The will fence
+/// ([`crate::proto::will_is_fenced`]) suppresses a pending will once a record with a
+/// HIGHER sequence from the same producer has landed. That makes a reconnect suppress a
+/// dead connection's goodbye only if the reconnected producer publishes ABOVE the
+/// goodbye — and the broker cannot check that: a will is a hidden record no read
+/// returns, and which incarnation a sequence belongs to is the producer's own
+/// bookkeeping. So the fence rests on a PRODUCER OBLIGATION, stated on
+/// [`Request::Will`](crate::Request::Will) and [`Client::will`](crate::Client::will). In
+/// the `TlaWillFencing` island (`proto_island.rs`) it is the hypothesis of
+/// `newer_incarnation_publish_fences_the_will` and
+/// `obliged_spec_fences_the_will_once_landed`, which prove that the newer incarnation's
+/// publish fences the will in every later state; `WillFencingInv`, that a fired will
+/// was not fenced, holds without it:
+///
+/// 1. a new incarnation's sequences sit ABOVE every sequence of any incarnation the
+///    producer ever presented to a broker — registered a will under, or published
+///    under;
+/// 2. the incarnation is FLUSHED — on the producer's stable storage — before its will
+///    is registered. After a power loss only the producer's own disk can say an
+///    incarnation was used: one whose will was registered and whose first publish never
+///    landed left nothing any read returns, and a remote broker keeps that will, on a
+///    connection that may still be half open when the producer is back.
+///
+/// A producer that breaks either one reuses an incarnation, and then the fence protects
+/// nothing. The incarnation's two wills share one key, so whichever connection ends
+/// first fires its will and the other dedups away; when the old, half-open connection
+/// ends first, its goodbye lands over the new incarnation's records while the producer
+/// is alive (`will::a_reused_incarnation_is_not_fenced`,
+/// `will::a_reused_incarnations_wills_share_one_key`).
+///
+/// The layout meets (1) by construction. Incarnation `inc` owns the sequences
+/// [`incarnation_base`]`(inc)` through `will_seq(inc)`: its ordinary publishes sit
+/// strictly between the two, so none collides with its will; its will sits at the top,
+/// so a goodbye published by hand under the will's own key makes the will a no-op; and
+/// every sequence of `inc + 1` is above the will. [`incarnation_of`] maps a sequence
+/// back. (2), and the counter that hands out incarnations, stay the producer's: astream
+/// exports the layout, not a lease — aterm's flushed `inc` lease (aterm-link
+/// `state.rs`, "The incarnation lease") is coupled to aterm's state dir.
+///
+/// The values are aterm's, and they are a PERSISTENCE CONTRACT, not a tuning knob: a
+/// producer keeps its last sequence and incarnation on its own disk in this layout, so
+/// a changed value would let an upgraded producer present a sequence its older build
+/// already presented.
+#[must_use]
+pub const fn will_seq(inc: u64) -> Option<u64> {
+    match incarnation_base(inc) {
+        Some(base) => Some(base | WILL_SEQ_LOW),
+        None => None,
+    }
+}
+
+/// The incarnation sequence `seq` belongs to under the layout ([`will_seq`]): `seq >> 32`,
+/// at most [`INC_MAX`]. `None` for a sequence in the reserved ack half
+/// ([`ACK_SEQ_BASE`]), which is derived from an offset and is no incarnation's. A
+/// producer that reads `None` for a sequence it stored as its own holds a corrupt
+/// record, never incarnation 0: treating it as 0 would hand out sequences it already
+/// presented.
+#[must_use]
+pub const fn incarnation_of(seq: u64) -> Option<u64> {
+    if seq >= ACK_SEQ_BASE {
+        None
+    } else {
+        Some(seq >> 32)
+    }
+}
 
 /// A connection's registered LAST WILL: the record the broker appends on that
 /// connection's behalf when it ends.
@@ -259,45 +398,80 @@ fn literal_prefix(filter: &Filter) -> &str {
     s
 }
 
-/// Apply a durable [`RETIRE_SUBJECT`] record's target (`target` is either an exact
-/// [`Subject`] or a wildcard [`Filter`] such as `"/f/local/pub/n-1/s1/>"`) to `last`,
-/// `carried_last`, and `subjects_per_producer`.
+/// Apply a durable [`RETIRE_SUBJECT`] record's exact target [`Subject`] to `last`,
+/// `carried_last`, `subject_charges`, and `subjects_per_producer`.
 fn apply_retire_target(
     last: &mut BTreeMap<String, Offset>,
     carried_last: &mut BTreeMap<String, Arc<BrokerRecord>>,
+    subject_charges: &mut HashMap<String, u64>,
     subjects_per_producer: &mut HashMap<u64, usize>,
     producer_id: u64,
     target: &str,
 ) {
-    let mut removed = 0usize;
-    if Subject::new(target).is_ok() {
-        carried_last.remove(target);
-        if last.remove(target).is_some() {
-            removed = 1;
-        }
-    } else if let Ok(filt) = Filter::new(target) {
-        let prefix = literal_prefix(&filt);
-        let mut matching = Vec::new();
-        for (subj, _) in last.range::<str, _>((Bound::Included(prefix), Bound::Unbounded)) {
-            if !subj.starts_with(prefix) {
-                break;
-            }
-            if filt.matches_str(subj) {
-                matching.push(subj.clone());
-            }
-        }
-        for subj in matching {
-            carried_last.remove(&subj);
-            if last.remove(&subj).is_some() {
-                removed = removed.saturating_add(1);
+    if Subject::new(target).is_err() {
+        return;
+    }
+    carried_last.remove(target);
+    if last.remove(target).is_some() {
+        let charged = subject_charges.remove(target).unwrap_or(producer_id);
+        if let Some(c) = subjects_per_producer.get_mut(&charged) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                subjects_per_producer.remove(&charged);
             }
         }
     }
-    if removed > 0 {
-        if let Some(c) = subjects_per_producer.get_mut(&producer_id) {
-            *c = c.saturating_sub(removed);
-            if *c == 0 {
-                subjects_per_producer.remove(&producer_id);
+}
+
+/// Durable latest `/a/will` entry per producer, tracking whether a visible record of
+/// that producer has landed ABOVE `offset` that fences or dedups `will`.
+#[derive(Clone, Debug)]
+struct DurableWillEntry {
+    offset: Offset,
+    will: WillRecord,
+    settled_above: bool,
+}
+
+fn update_durable_wills_on_record(
+    durable_latest_wills: &mut HashMap<u64, DurableWillEntry>,
+    durable_wills_by_subject: &mut HashMap<String, HashSet<u64>>,
+    rec: &BrokerRecord,
+) {
+    if rec.subject == WILL_SUBJECT {
+        if let Some(will) = WillRecord::from_record(rec) {
+            if let Some(old) = durable_latest_wills.remove(&rec.producer_id) {
+                if let Some(pids) = durable_wills_by_subject.get_mut(&old.will.subject) {
+                    pids.remove(&rec.producer_id);
+                    if pids.is_empty() {
+                        durable_wills_by_subject.remove(&old.will.subject);
+                    }
+                }
+            }
+            let hidden_target = is_hidden_subject(&will.subject);
+            if !hidden_target {
+                durable_wills_by_subject
+                    .entry(will.subject.clone())
+                    .or_default()
+                    .insert(rec.producer_id);
+            }
+            durable_latest_wills.insert(
+                rec.producer_id,
+                DurableWillEntry {
+                    offset: rec.seq,
+                    will,
+                    settled_above: hidden_target,
+                },
+            );
+        }
+    } else if !is_hidden_record(rec) {
+        if let Some(entry) = durable_latest_wills.get_mut(&rec.producer_id) {
+            if rec.seq.0 > entry.offset.0 {
+                let fences = rec.producer_seq < ACK_SEQ_BASE
+                    && crate::proto::will_is_fenced(rec.producer_seq, entry.will.producer_seq);
+                let dedups = rec.producer_seq == entry.will.producer_seq;
+                if fences || dedups {
+                    entry.settled_above = true;
+                }
             }
         }
     }
@@ -351,6 +525,11 @@ pub struct BrokerLog {
     /// Set by [`close_clean`](Self::close_clean): the sidecar says this log stopped
     /// cleanly at its head, so nothing more may be appended under that claim.
     closed: bool,
+    /// Set by [`unlock`](Self::unlock): this open let its file lock go before it was
+    /// dropped (a broker's stop), so a successor may already serve the file, and every
+    /// mutation is refused — clean close or not. See `unlock` for why the clean close's
+    /// own latch is not enough.
+    released: bool,
     /// Byte length of the DURABLE prefix on disk (recovered prefix + everything a
     /// successful batch write/fsync has committed). Staged bytes live in `staged_bytes`
     /// until `commit_batch` writes them; a failed write or fsync truncates the file back
@@ -378,9 +557,30 @@ pub struct BrokerLog {
     /// whole index. Hidden subjects are excluded, so a retained-state query can never
     /// surface one.
     last: BTreeMap<String, Offset>,
+    /// Which producer id is CHARGED for each subject currently in `last`: the producer
+    /// whose record first put the subject into `last` (or re-introduced it after a
+    /// retirement). Updating an already-indexed subject changes `last`'s offset without
+    /// changing who is charged for the slot, so `Retire` authorizes against and credits
+    /// the charged producer rather than the newest writer.
+    subject_charges: HashMap<String, u64>,
     /// How many distinct subjects each producer has created in `last` (the bound
     /// [`MAX_SUBJECTS_PER_PRODUCER`] is checked against this).
     subjects_per_producer: HashMap<u64, usize>,
+    /// Each producer's latest durable `/a/will` record and whether a visible record of
+    /// that producer has landed ABOVE it that fences or dedups it.
+    durable_latest_wills: HashMap<u64, DurableWillEntry>,
+    /// Reverse index from target subject to the set of producers whose latest durable
+    /// `/a/will` targets that subject, so `Retire` checks durable wills in `O(1)` without
+    /// walking the log.
+    durable_wills_by_subject: HashMap<String, HashSet<u64>>,
+    /// Live connections' registered wills in the writer (`conn_id -> WillRecord`),
+    /// promoted when `WillRegister` commits and removed when the writer processes that
+    /// connection's `WillFire` or `WillDrop`.
+    live_wills_by_conn: HashMap<u64, WillRecord>,
+    /// Reverse index from target subject to live connection ids (`conn_id`), so
+    /// `Retire` checks live connection wills even when a producer holds wills on two
+    /// connections at once.
+    live_wills_by_subject: HashMap<String, HashSet<u64>>,
     /// Subjects RESERVED by registered wills that have not landed yet, per producer:
     /// a will's TARGET subject, held from the moment its `/a/will` record commits
     /// until a record on that subject lands under the same producer. Counted against
@@ -422,6 +622,14 @@ pub struct BrokerLog {
     /// [`Self::retain_before_carrying_state`] compacted the log, carried in `<log>.state`
     /// so `Last` queries still answer them across compaction and reopen (`REQUIREMENTS` R4).
     carried_last: BTreeMap<String, Arc<BrokerRecord>>,
+    /// Per-subject charged producer IDs (`subject -> producer_id`) live at `base`, carried
+    /// in `<log>.state` across [`Self::retain_before_carrying_state`] so `Retire` and
+    /// `max_subjects_per_producer` accounting remain exact across compaction and reopen.
+    #[cfg_attr(not(feature = "retention"), allow(dead_code))]
+    carried_charges: BTreeMap<String, u64>,
+    /// True when the log was cut above 0 without a `<log>.state` carrying `carried_charges`
+    /// (e.g. plain `retain_before`), making `Retire` refuse with `RETIRE_CUT_PREFIX`.
+    uncarried_cut_tainted: bool,
     /// The path this log was opened from: the log's own name, the stem the replica
     /// marker beside it is derived from, and what the retention compaction rewrites
     /// (with its base sidecar).
@@ -475,6 +683,17 @@ pub struct BrokerLog {
     /// distinct-subject bound counts a batch's own new subjects too and one batch
     /// cannot overshoot it.
     staged_new_subjects: HashMap<u64, HashSet<String>>,
+    /// Subjects present in `last` at the start of the batch that a staged `Retire`
+    /// has removed and not re-introduced under the same charged producer, crediting
+    /// that producer's count within the same batch.
+    staged_retired_durable: HashMap<u64, HashSet<String>>,
+    /// Future-observable retirement evidence for owned views. The publication owner
+    /// releases the store's visible prefix; active views keep their own suffix.
+    retire_history: RetireHistory,
+    /// Live connection wills staged in the current batch (`(conn_id, WillRecord)`),
+    /// promoted into `live_wills_by_conn` / `live_wills_by_subject` at `commit_end`
+    /// and discarded on `abort_batch`.
+    staged_live_wills: Vec<(u64, WillRecord)>,
     /// Bindings the in-flight batch would add, so two `Attach`es inside one batch
     /// see each other's binding instead of both appending.
     staged_bind: HashMap<u64, (String, Offset)>,
@@ -512,22 +731,32 @@ pub struct BrokerLog {
     /// Original offsets of resent escalated ops the in-flight batch answered from
     /// dedup, whose originals no full flush covers yet ([`Committed::held`]).
     staged_held: Vec<u64>,
-    /// [`FlushCounts`].
-    counts: FlushCounts,
+    /// [`FlushCounts`] and the poison, shared with the broker serving this log so it
+    /// reads them without this log's lock ([`LogVitals`]).
+    vitals: Arc<LogVitals>,
     /// A test's stand-in for a device that refuses the barrier while serving (the latch).
     #[cfg(test)]
     pub(crate) refuse_barrier: bool,
-    /// `Some(reason)` once the file or its sidecars no longer provably match this
-    /// state: a failed batch could not be rolled back (the truncate itself failed), a
-    /// retention rewrite failed half-way, or the anti-rollback watermark could not be
-    /// advanced over promoted records. Every further mutation is refused until the log
-    /// is reopened (the recovery scan re-establishes the prefix). Without this, after
-    /// a failed rollback the next batch would append records with the SAME seqs after
-    /// the orphaned suffix, and recovery would resurrect the rolled-back records and
-    /// drop the acked ones.
-    poisoned: Option<String>,
+    // THE POISON lives in `vitals` ([`LogVitals`], set once, read without this log's
+    // lock): set once the file or its sidecars no longer provably match this state — a
+    // failed batch could not be rolled back (the truncate itself failed), a full flush
+    // failed with records no full flush covers, a retention rewrite failed half-way, or
+    // the anti-rollback watermark could not be advanced over promoted records. Every
+    // further mutation is refused until the log is reopened (the recovery scan
+    // re-establishes the prefix). Without it, after a failed rollback the next batch
+    // would append records with the SAME seqs after the orphaned suffix, and recovery
+    // would resurrect the rolled-back records and drop the acked ones. It is PUBLISHED
+    // LAST, through `publish_poison` alone, once the failure's own disk work is done.
+    /// The test seam that stands where a lock-free reader of the poison stands: the bytes
+    /// of `<log>.id` the moment the poison was published (`Some(None)`: there was none),
+    /// so a test sees what an embedder that woke at the poison would leave a reopen.
+    #[cfg(test)]
+    pub(crate) id_at_poison: Option<Option<Vec<u8>>>,
     /// The documented fault-injection seam ([`inject_faults`](Self::inject_faults)).
     faults: InjectedFaults,
+    /// The compaction's I/O seam (`compact.rs`): inert unless a unit test arms it.
+    #[cfg(feature = "retention")]
+    compact_seam: crate::compact::Seam,
     /// Encrypt-at-rest key. `Some` seals every record's payload on disk under
     /// XChaCha20-Poly1305 (bound to its log index as AAD); `None` writes plaintext
     /// frames. Set only by the `open_encrypted*` constructors. The key is never
@@ -586,7 +815,7 @@ const HW_AAD: &[u8] = b"astream-anti-rollback-v1";
 
 /// The sidecar path for a log at `path`.
 #[cfg(feature = "anti-rollback")]
-fn watermark_path(path: &Path) -> PathBuf {
+pub(crate) fn watermark_path(path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     p.as_mut_os_string().push(".hw");
     p
@@ -594,14 +823,14 @@ fn watermark_path(path: &Path) -> PathBuf {
 
 /// The retention base-offset sidecar path for a log at `path`.
 #[cfg(feature = "retention")]
-fn base_path(path: &Path) -> PathBuf {
+pub(crate) fn base_path(path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     p.as_mut_os_string().push(".base");
     p
 }
 
 /// The state-carrying compaction sidecar path (`<log>.state`) for a log at `path`.
-fn state_path(path: &Path) -> PathBuf {
+pub(crate) fn state_path(path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     p.as_mut_os_string().push(".state");
     p
@@ -614,6 +843,48 @@ const STATE_AAD: &[u8] = b"astream-compacted-state-v1";
 #[cfg(feature = "retention")]
 const STATE_MAGIC: &[u8; 5] = b"ASST\x01";
 
+/// A compaction begun by [`BrokerLog::compact_begin`] and not yet finished: its copy,
+/// which borrows nothing of the log, and what its finish checks the log against.
+#[cfg(feature = "retention")]
+pub(crate) struct Compaction {
+    /// The new base.
+    min: u64,
+    /// Whether it carries state (`retain_before_carrying_state`).
+    carry: bool,
+    /// The base it began at.
+    base: u64,
+    /// How many records it drops.
+    drop_count: u64,
+    /// The log's permissions at the begin: every file the compaction writes that holds
+    /// its records is created with them (`create_like`).
+    perms: std::fs::Permissions,
+    copy: crate::compact::KeptCopy,
+}
+
+#[cfg(feature = "retention")]
+impl Compaction {
+    /// THE UNLOCKED COPY (`compact.rs`): the log from the cut to the durable length the
+    /// compaction began at. The broker runs it with no lock held.
+    pub(crate) fn copy(&mut self) -> io::Result<()> {
+        self.copy.run()
+    }
+
+    /// Give it up without its log (the broker's copy failed): the copy is removed.
+    pub(crate) fn abandon(self) {
+        self.copy.abandon();
+    }
+}
+
+/// The pending wills a carrying compaction keeps, by producer: each one's offset and will.
+#[cfg(feature = "retention")]
+type CarriedWills = HashMap<u64, (Offset, WillRecord)>;
+
+/// The quiet subjects' latest records a carrying compaction keeps, by subject.
+#[cfg(feature = "retention")]
+type CarriedLast = BTreeMap<String, Arc<BrokerRecord>>;
+#[cfg(feature = "retention")]
+type CarriedCharges = BTreeMap<String, u64>;
+
 /// Durable control state carried across log compaction (`<log>.state`).
 #[derive(Default)]
 struct CompactedState {
@@ -622,6 +893,8 @@ struct CompactedState {
     high_water: HashMap<u64, u64>,
     group_commits: HashMap<String, u64>,
     carried_last: BTreeMap<String, Arc<BrokerRecord>>,
+    carried_charges: BTreeMap<String, u64>,
+    uncarried_cut_tainted: bool,
 }
 
 #[cfg(feature = "retention")]
@@ -777,11 +1050,25 @@ impl CompactedState {
             out.extend_from_slice(&encode_u32_le_bytes(rlen));
             out.extend_from_slice(&rbytes);
         }
+
+        out.push(u8::from(self.uncarried_cut_tainted));
+        let Ok(cc_len) = u32::try_from(self.carried_charges.len()) else {
+            return Err(FrameError::TooLarge);
+        };
+        out.extend_from_slice(&encode_u32_le_bytes(cc_len));
+        for (subj, &pid) in &self.carried_charges {
+            let Ok(slen) = u32::try_from(subj.len()) else {
+                return Err(FrameError::TooLarge);
+            };
+            out.extend_from_slice(&encode_u64_le_bytes(pid));
+            out.extend_from_slice(&encode_u32_le_bytes(slen));
+            out.extend_from_slice(subj.as_bytes());
+        }
         Ok(out)
     }
 
     fn decode(bytes: &[u8], expected_base: u64) -> Option<CompactedState> {
-        let (_state_base, _) = decode_state_header(bytes, expected_base)?;
+        let (state_base, _) = decode_state_header(bytes, expected_base)?;
         let mut pos = 13usize;
 
         let bind_count = state_read_u32(bytes, &mut pos)?;
@@ -850,6 +1137,29 @@ impl CompactedState {
             }
         }
 
+        let mut carried_charges = BTreeMap::new();
+        let uncarried_cut_tainted = if pos < bytes.len() {
+            let Some(&tainted_byte) = bytes.get(pos) else {
+                return None;
+            };
+            if tainted_byte > 1 {
+                return None;
+            }
+            pos = pos.checked_add(1)?;
+            let cc_count = state_read_u32(bytes, &mut pos)?;
+            for _ in 0..cc_count {
+                let pid = state_read_u64(bytes, &mut pos)?;
+                let subj = state_read_str(bytes, &mut pos)?;
+                if is_hidden_subject(&subj) {
+                    return None;
+                }
+                carried_charges.insert(subj, pid);
+            }
+            (tainted_byte != 0) || (state_base != expected_base)
+        } else {
+            expected_base > 0
+        };
+
         if pos != bytes.len() {
             return None;
         }
@@ -859,6 +1169,8 @@ impl CompactedState {
             high_water,
             group_commits,
             carried_last,
+            carried_charges,
+            uncarried_cut_tainted,
         })
     }
 }
@@ -894,12 +1206,32 @@ fn open_state_payload(_key: Option<&[u8; 32]>, payload: Vec<u8>) -> Option<Vec<u
 
 /// Remove a file at `path` (shared `&Path` boundary).
 pub(crate) fn remove_file_path(path: &Path) -> io::Result<()> {
-    std::fs::remove_file(path)
+    std::fs::remove_file(path)?;
+    #[cfg(all(test, unix, feature = "retention"))]
+    crate::power_loss::entry_changed(path);
+    Ok(())
 }
 
 /// Rename `from` to `to` (shared `&Path` boundary).
 pub(crate) fn rename_path(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::rename(from, to)
+    std::fs::rename(from, to)?;
+    #[cfg(all(test, unix, feature = "retention"))]
+    crate::power_loss::entry_changed(to);
+    Ok(())
+}
+
+/// Flush `f`, the file at `at`, in full: its data and its size (`sync_all`). Under
+/// `cfg(test)` the compaction's power-loss model learns that the file's content as it
+/// stands now survives a power loss. (The sidecars that use it are the `retention` and
+/// `anti-rollback` features'.)
+#[cfg(any(feature = "retention", feature = "anti-rollback"))]
+pub(crate) fn flush_file(f: &File, at: &Path) -> io::Result<()> {
+    f.sync_all()?;
+    #[cfg(all(test, unix, feature = "retention"))]
+    crate::power_loss::flushed(at);
+    #[cfg(not(all(test, unix, feature = "retention")))]
+    let _ = at;
+    Ok(())
 }
 
 /// Open `path` with `opts` (shared `&Path` boundary).
@@ -907,12 +1239,33 @@ pub(crate) fn open_with_options(opts: &FsOpenOptions, path: &Path) -> io::Result
     opts.open(path)
 }
 
-#[cfg(feature = "retention")]
+/// Durably write `state` (at `base`) to `<log>.state` directly (the tests' seed; a
+/// compaction stages it at `<log>.state.next` and renames it over).
+#[cfg(all(test, feature = "retention"))]
 fn write_state(
     path: &Path,
     key: Option<&[u8; 32]>,
     base: u64,
     state: &CompactedState,
+) -> io::Result<()> {
+    let perms = match std::fs::metadata(path) {
+        Ok(m) => Some(m.permissions()),
+        Err(_) => None,
+    };
+    write_state_at(&state_path(path), key, base, state, perms.as_ref())
+}
+
+/// Durably write `state` (at `base`) to `sp`: `<log>.state`, or the compaction's staged
+/// `<log>.state.next` (`compact.rs`), which the switch renames over it. It holds record
+/// bodies (a quiet subject's `Last`, a pending will), so it is created with `perms`, the
+/// log's own, when given ([`create_like`]).
+#[cfg(feature = "retention")]
+fn write_state_at(
+    sp: &Path,
+    key: Option<&[u8; 32]>,
+    base: u64,
+    state: &CompactedState,
+    perms: Option<&std::fs::Permissions>,
 ) -> io::Result<()> {
     let Ok(raw) = state.encode(base) else {
         return Err(io::Error::new(
@@ -927,16 +1280,18 @@ fn write_state(
             "retention: state too large",
         ));
     };
-    let sp = state_path(path);
-    let mut tmp = sp.clone();
+    let mut tmp = sp.to_path_buf();
     tmp.as_mut_os_string().push(".tmp");
     {
-        let mut f = create_fresh(&tmp, &mut FsOpenOptions::new())?;
+        let mut f = match perms {
+            Some(p) => create_like(&tmp, p)?,
+            None => create_fresh(&tmp, &mut FsOpenOptions::new())?,
+        };
         f.write_all(&framed)?;
-        f.sync_all()?;
+        flush_file(&f, &tmp)?;
     }
-    rename_path(&tmp, &sp)?;
-    sync_parent_dir(&sp)?;
+    rename_path(&tmp, sp)?;
+    sync_parent_dir(sp)?;
     Ok(())
 }
 
@@ -955,6 +1310,17 @@ fn open_state_file(path: &Path) -> io::Result<Option<File>> {
             "retention: state sidecar is not a bounded regular file",
         ));
     }
+    let cap =
+        (astream_wire::HEADER_SIZE as u64).saturating_add(astream_wire::MAX_PAYLOAD_LEN as u64);
+    open_regular_sidecar(path, cap).map(Some)
+}
+
+/// Open an already-looked-up sidecar without following its final entry, and validate
+/// the opened handle before any read. Nonblocking open also refuses a substituted
+/// FIFO without waiting for its peer. Initial absence belongs to the caller; an
+/// entry changed or removed since that lookup is an error, never absence.
+#[cfg(feature = "retention")]
+pub(crate) fn open_regular_sidecar(path: &Path, cap: u64) -> io::Result<File> {
     #[cfg(not(any(
         target_os = "macos",
         windows,
@@ -965,7 +1331,7 @@ fn open_state_file(path: &Path) -> io::Result<Option<File>> {
     )))]
     return Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "retention: safe state-file admission is unavailable on this platform",
+        "retention: safe sidecar admission is unavailable on this platform",
     ));
     #[cfg(any(
         target_os = "macos",
@@ -1000,15 +1366,13 @@ fn open_state_file(path: &Path) -> io::Result<Option<File>> {
         }
         let file = open_with_options(&opts, path)?;
         let meta = file.metadata()?;
-        let cap =
-            (astream_wire::HEADER_SIZE as u64).saturating_add(astream_wire::MAX_PAYLOAD_LEN as u64);
         if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "retention: state sidecar is not a bounded regular file",
+                "retention: sidecar is not a bounded regular file",
             ));
         }
-        Ok(Some(file))
+        Ok(file)
     }
 }
 
@@ -1022,7 +1386,10 @@ fn read_state(
         use std::io::Read;
         let sp = state_path(path);
         let Some(mut file) = open_state_file(&sp)? else {
-            return Ok(CompactedState::default());
+            return Ok(CompactedState {
+                uncarried_cut_tainted: expected_base > 0,
+                ..CompactedState::default()
+            });
         };
         // The shared frame reader checks the header before buffering at most its payload cap.
         // Exactly one extra byte checks EOF, even if this file grew after the metadata check.
@@ -1055,8 +1422,31 @@ fn read_state(
     }
     #[cfg(not(feature = "retention"))]
     {
-        let _ = (path, key, expected_base);
-        Ok(CompactedState::default())
+        let _ = (path, key);
+        Ok(CompactedState {
+            uncarried_cut_tainted: expected_base > 0,
+            ..CompactedState::default()
+        })
+    }
+}
+
+/// The base `<log>.state` was written at, authenticated, or `None` when there is none:
+/// what an open finishing an interrupted carrying compaction checks the state it finds
+/// against (`compact.rs`).
+#[cfg(feature = "retention")]
+pub(crate) fn read_state_base(path: &Path, key: Option<&[u8; 32]>) -> io::Result<Option<u64>> {
+    let Some(mut file) = open_state_file(&state_path(path))? else {
+        return Ok(None);
+    };
+    let Some(payload) = crate::proto::read_frame(&mut file)? else {
+        return Ok(None);
+    };
+    let Some(pt) = open_state_payload(key, payload) else {
+        return Ok(None);
+    };
+    match decode_state_header(&pt, u64::MAX) {
+        Some((base, _)) => Ok(Some(base)),
+        None => Ok(None),
     }
 }
 
@@ -1076,7 +1466,7 @@ const fn decode_base_bytes(b: &[u8]) -> Option<Offset> {
 /// Read the persisted retention base offset (`0` / `Offset::ZERO` if none). A base
 /// that does not match the recovered records is caught by scan's `seq == base + i`
 /// check (a mismatch is a Corrupt tail), so a tampered base cannot silently reindex.
-fn read_base(path: &Path) -> io::Result<Offset> {
+pub(crate) fn read_base(path: &Path) -> io::Result<Offset> {
     #[cfg(feature = "retention")]
     {
         match std::fs::read(base_path(path)) {
@@ -1108,19 +1498,43 @@ pub(crate) fn create_fresh(path: &Path, opts: &mut FsOpenOptions) -> io::Result<
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    open_with_options(opts.write(true).create_new(true), path)
+    let f = open_with_options(opts.write(true).create_new(true), path)?;
+    #[cfg(all(test, unix, feature = "retention"))]
+    crate::power_loss::created(path);
+    Ok(f)
+}
+
+/// [`create_fresh`] with `perms`, the log's own: created with them and then set exactly,
+/// past the umask, so a file that holds the log's records (a compaction's copy of them,
+/// its intent, its carried state) is never readable more widely than the log, even
+/// briefly. A file whose permissions cannot be set is removed.
+#[cfg(feature = "retention")]
+pub(crate) fn create_like(path: &Path, perms: &std::fs::Permissions) -> io::Result<File> {
+    let mut opts = FsOpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(perms.mode());
+    }
+    let f = create_fresh(path, &mut opts)?;
+    if let Err(e) = f.set_permissions(perms.clone()) {
+        drop(f);
+        let _ = remove_file_path(path);
+        return Err(e);
+    }
+    Ok(f)
 }
 
 /// Durably persist the retention base offset via tmp-file rename.
 #[cfg(feature = "retention")]
-fn write_base(path: &Path, base: u64) -> io::Result<()> {
+pub(crate) fn write_base(path: &Path, base: u64) -> io::Result<()> {
     let bp = base_path(path);
     let mut tmp = bp.clone();
     tmp.as_mut_os_string().push(".tmp");
     {
         let mut f = create_fresh(&tmp, &mut FsOpenOptions::new())?;
         f.write_all(&encode_u64_le_bytes(base))?;
-        f.sync_all()?;
+        flush_file(&f, &tmp)?;
     }
     rename_path(&tmp, &bp)?;
     sync_parent_dir(&bp)?;
@@ -1134,7 +1548,7 @@ fn write_base(path: &Path, base: u64) -> io::Result<()> {
 /// key-less attacker from splicing a DIFFERENT same-key log's watermark onto this one
 /// (a watermark from log B carries log B's identity). `[0; 16]` for an empty log.
 #[cfg_attr(not(feature = "anti-rollback"), allow(dead_code))]
-fn log_identity(durable_frames: &[u8]) -> [u8; 16] {
+pub(crate) fn log_identity(durable_frames: &[u8]) -> [u8; 16] {
     if let Ok(Some(d)) = Frame::decode(durable_frames) {
         if let Some((_, tail)) = d.frame.payload.split_last_chunk::<16>() {
             return *tail;
@@ -1188,7 +1602,10 @@ const fn decode_watermark_plaintext(pt: &[u8]) -> Option<([u8; 16], u64, u64)> {
 /// `Ok(None)` if the sidecar does not exist; `Err` if it exists but fails to
 /// authenticate (tampered or wrong key).
 #[cfg(feature = "anti-rollback")]
-fn read_watermark(path: &Path, key: &[u8; 32]) -> io::Result<Option<([u8; 16], u64, u64)>> {
+pub(crate) fn read_watermark(
+    path: &Path,
+    key: &[u8; 32],
+) -> io::Result<Option<([u8; 16], u64, u64)>> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let Ok(pt) = astream_aead::open(key, HW_AAD, &bytes) else {
@@ -1215,7 +1632,7 @@ fn read_watermark(path: &Path, key: &[u8; 32]) -> io::Result<Option<([u8; 16], u
 /// keeps the (unauthenticated) retention base sidecar from being tampered under an
 /// anti-rollback log. Monotone by construction (the caller only advances head).
 #[cfg(feature = "anti-rollback")]
-fn write_watermark(
+pub(crate) fn write_watermark(
     path: &Path,
     key: &[u8; 32],
     log_id: &[u8; 16],
@@ -1232,7 +1649,7 @@ fn write_watermark(
     {
         let mut f = create_fresh(&tmp, &mut FsOpenOptions::new())?;
         f.write_all(&sealed)?;
-        f.sync_all()?;
+        flush_file(&f, &tmp)?;
     }
     rename_path(&tmp, path)?;
     sync_parent_dir(path)?;
@@ -1467,6 +1884,231 @@ pub struct FlushCounts {
     pub failed: u64,
 }
 
+/// WHAT A LOG SAYS ABOUT ITSELF WITHOUT ITS LOCK: the poison, the latch to Strict and the
+/// flush counts. One value per open, shared (`Arc`) by the [`BrokerLog`] that writes it
+/// and the [`Broker`](crate::Broker) serving that log, so every reader of them —
+/// [`Broker::poisoned`](crate::Broker::poisoned),
+/// [`Broker::served_durability`](crate::Broker::served_durability),
+/// [`Broker::flush_counts`](crate::Broker::flush_counts), the answer to every `Hello`
+/// (its block's tags 0x01 and 0x04) and the health sidecar — reads them with no lock at
+/// all.
+///
+/// WHY NOT UNDER THE LOG'S LOCK, where they lived before. The writer runs a batch's
+/// write and full flush with that lock released, but it HOLDS it across a rollback's
+/// truncate and across the `<log>.id` write a failed flush records `Lossy` in — and a
+/// failing disk is exactly when those are slow, and exactly when an embedder asks
+/// whether the log is poisoned. A look that waited there delayed the one cure (the
+/// reopen) behind the very I/O that was failing, and a `Hello` that carried the poison
+/// would have waited on a writer's fsync before a connection's first reply.
+///
+/// THE POISON IS PUBLISHED LAST. The lock used to give one more thing for free: no
+/// reader saw the poison until the writer had finished the failure's disk work. A
+/// lock-free look takes that away, so the log keeps it by ORDER instead
+/// ([`BrokerLog::publish_poison`] is the one place a poison is set): a failure first
+/// rolls its batch back, records `Lossy` in `<log>.id` and latches to Strict, and only
+/// then publishes its poison. The documented use of the poison is an embedder that
+/// EXITS on it so a supervisor reopens the log ([`Broker::wait_poisoned`]); one that
+/// woke before the `Lossy` record was written would kill the writer short of it, and
+/// the reopen in the same boot would keep the generation — readers keeping offsets the
+/// failed flush may have taken.
+///
+/// [`Broker::wait_poisoned`]: crate::Broker::wait_poisoned
+///
+/// The poison is SET ONCE. The first reason stands: a later failure on a log that
+/// already refuses every write is a consequence of the first, and the first is what an
+/// embedder's exit line must name. Nothing clears it: the cure is a reopen, which is a
+/// new [`BrokerLog`] with vitals of its own.
+///
+/// THE LATCH beside it is the tier served falling to Strict while the log serves, which
+/// a reader adds to the tier the open decided ([`served`](Self::served)). A latch a
+/// failed flush sets RIDES ITS POISON (one publication: no reader sees the one without
+/// the other); a barrier the device refused latches with no poison, through
+/// [`latch`](Self::latch), which the log calls before any poison a later failure of the
+/// same batch publishes. So an answer that names the poison names the tier the log
+/// serves with it — never the poison beside the tier from before the latch.
+///
+/// The counts are written only by the log, under its lock (`&mut BrokerLog`), so each
+/// has one writer and is exact when read; four counts read one after another are not
+/// one instant, which no reader of them needs.
+///
+/// A waiter ([`wait`](Self::wait)) sleeps on the condition variable beside them, which
+/// the poison wakes, and which [`wake`](Self::wake) wakes for a condition of the
+/// waiter's own (the broker's stop).
+#[derive(Debug, Default)]
+pub(crate) struct LogVitals {
+    poison: std::sync::OnceLock<Poison>,
+    /// The [`ServedReason`](crate::ServedReason) code of a latch to Strict that came
+    /// WITHOUT a poison (a barrier refused while serving); 0 while there is none.
+    latched: std::sync::atomic::AtomicU8,
+    barrier: std::sync::atomic::AtomicU64,
+    full: std::sync::atomic::AtomicU64,
+    skipped: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+    /// Held only to wait and to notify: the poison is the `OnceLock`'s, never this.
+    wait_lock: std::sync::Mutex<()>,
+    changed: std::sync::Condvar,
+    /// The test seam that says a waiter is PARKED: how many waiters are asleep on
+    /// `changed` now, counted under `wait_lock` before each sleeps — so a test that reads
+    /// one knows a wake it causes after is one that waiter must be woken by.
+    #[cfg(test)]
+    pub(crate) parked: std::sync::atomic::AtomicUsize,
+}
+
+/// A published poison: why, and the latch to Strict the same failure set, if it set one.
+#[derive(Debug)]
+struct Poison {
+    reason: String,
+    latched: Option<crate::proto::ServedReason>,
+}
+
+impl LogVitals {
+    /// The reason the log is poisoned, or `None`: one atomic load.
+    pub(crate) fn poisoned(&self) -> Option<&str> {
+        match self.poison.get() {
+            Some(p) => Some(p.reason.as_str()),
+            None => None,
+        }
+    }
+
+    /// The tier served now: `told` (what the open decided, as the copy beside the log
+    /// holds it) with the latch to Strict published since, if any. Reads the poison
+    /// FIRST: a latch is published no later than the poison of the failure that set it
+    /// (it rides the poison, or [`latch`](Self::latch) stored it before), so a reader
+    /// that saw the poison before calling this is told the latched tier.
+    pub(crate) fn served(&self, told: crate::ServedInfo) -> crate::ServedInfo {
+        let with_poison = match self.poison.get() {
+            Some(p) => p.latched,
+            None => None,
+        };
+        let latched = match with_poison {
+            Some(r) => Some(r),
+            None => match self.latched.load(std::sync::atomic::Ordering::Acquire) {
+                0 => None,
+                code => Some(crate::proto::ServedReason::from_code(code)),
+            },
+        };
+        match latched {
+            Some(reason) => crate::ServedInfo {
+                served: crate::proto::Tier::Strict,
+                reason,
+                ..told
+            },
+            None => told,
+        }
+    }
+
+    /// Publish a latch to Strict that comes with no poison (the first stands). Called by
+    /// the log under its lock, before the poison of any failure that follows it.
+    fn latch(&self, reason: crate::proto::ServedReason) {
+        let _ = self.latched.compare_exchange(
+            0,
+            reason.code(),
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Publish the poison — `reason`, with the latch to Strict the same failure set —
+    /// unless the log already is poisoned (the first reason stands; a latch that came
+    /// after it is published on its own), and wake every waiter. Called only through
+    /// [`BrokerLog::publish_poison`], under the log's lock, once the failure's own disk
+    /// work is done.
+    fn poison(&self, reason: String, latched: Option<crate::proto::ServedReason>) {
+        match self.poison.set(Poison { reason, latched }) {
+            Ok(()) => {
+                // Taking the mutex orders this notify after any waiter's
+                // check-then-wait, which happens under it: no waiter misses the poison.
+                let _held = self
+                    .wait_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.changed.notify_all();
+            }
+            Err(refused) => {
+                if let Some(r) = refused.latched {
+                    self.latch(r);
+                }
+            }
+        }
+    }
+
+    /// The flush counts now ([`FlushCounts`]).
+    pub(crate) fn flush_counts(&self) -> FlushCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        FlushCounts {
+            barrier: self.barrier.load(Relaxed),
+            full: self.full.load(Relaxed),
+            skipped: self.skipped.load(Relaxed),
+            failed: self.failed.load(Relaxed),
+        }
+    }
+
+    /// Add `n` to one count. One writer per count (the log, under its lock), so the
+    /// load and the store cannot interleave with another add.
+    fn add(count: &std::sync::atomic::AtomicU64, n: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        count.store(count.load(Relaxed).saturating_add(n), Relaxed);
+    }
+
+    /// Sleep until `running` reads `false` (the broker's flag: it has stopped serving its
+    /// log), or — when `until_poisoned` — the log is poisoned, or `deadline` passes
+    /// (`None`: none), whichever is first. Whoever clears `running` calls
+    /// [`wake`](Self::wake) after it.
+    pub(crate) fn wait(
+        &self,
+        deadline: Option<std::time::Instant>,
+        running: &std::sync::atomic::AtomicBool,
+        until_poisoned: bool,
+    ) {
+        let mut held = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if !running.load(std::sync::atomic::Ordering::Acquire)
+                || (until_poisoned && self.poison.get().is_some())
+            {
+                return;
+            }
+            let timeout = match deadline {
+                Some(deadline) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return;
+                    }
+                    Some(deadline.duration_since(now))
+                }
+                None => None,
+            };
+            #[cfg(test)]
+            self.parked
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held = match timeout {
+                None => self
+                    .changed
+                    .wait(held)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                Some(t) => match self.changed.wait_timeout(held, t) {
+                    Ok((g, _)) => g,
+                    Err(e) => e.into_inner().0,
+                },
+            };
+            #[cfg(test)]
+            self.parked
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Wake every waiter to re-check the `running` flag it was given.
+    pub(crate) fn wake(&self) {
+        let _held = self
+            .wait_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.changed.notify_all();
+    }
+}
+
 /// The tier a log serves NOW, and why it differs from the one asked for: decided once by
 /// the open, and lowered to Strict (never raised) when a barrier or a full flush fails
 /// while it serves.
@@ -1559,7 +2201,16 @@ impl Volume {
     }
 }
 
-/// Whether the open log file shares a device with the boot volume.
+/// Whether an open file shares a device with the BOOT VOLUME: the device that loses
+/// power only together with the kernel, so a page cache that has run throughout this
+/// boot still holds every write made to it. [`Volume::Detect`] asks it of the log file.
+/// It is public so that an embedder which trusts its own unflushed writes within one
+/// boot draws that line where the log does: aterm's bridge trusts its incarnation lease
+/// only on the boot volume. A directory opened with [`File::open`] answers for the files
+/// written inside it, except links that point elsewhere. Off the boot volume (a
+/// removable or network disk, which can vanish while the kernel runs), and wherever
+/// `fstat` fails, the answer is `false`. That is the safe direction: a wrong `false`
+/// costs a flush, and a wrong `true` would trust a write the disk may have lost.
 ///
 /// THE FILE'S OWN DEVICE, never its directory's: the log is opened following symlinks,
 /// so `~/fabric/bus.log` can be a link into `/Volumes/USB` while `~/fabric` is on the
@@ -1570,7 +2221,8 @@ impl Volume {
 /// would reuse their offsets under an unchanged identity. `fstat` on the descriptor the
 /// log is written through cannot be pointed elsewhere.
 #[cfg(unix)]
-fn on_boot_volume(file: &File) -> bool {
+#[must_use]
+pub fn on_boot_volume(file: &File) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(here) = file.metadata() else {
         return false;
@@ -1594,8 +2246,10 @@ fn on_boot_volume(file: &File) -> bool {
     false
 }
 
+/// No device to compare: never the boot volume, the safe direction.
 #[cfg(not(unix))]
-fn on_boot_volume(_file: &File) -> bool {
+#[must_use]
+pub fn on_boot_volume(_file: &File) -> bool {
     false
 }
 
@@ -1634,6 +2288,13 @@ pub struct OpenOptions {
     /// refused). Ignored by [`BrokerLog::open_opts`].
     #[cfg(feature = "cap")]
     pub guard: Option<Vec<u8>>,
+    /// `Some(period)`: a broker opened with these options keeps its health sidecar,
+    /// `<log>.health`, from the open on — written at once, every `period` after, at the
+    /// poison, and a last time once the log has closed
+    /// ([`Broker::keep_health`](crate::Broker::keep_health),
+    /// [`read_health`](crate::read_health)). `None` (the default): no sidecar unless the
+    /// embedder writes one. Ignored by [`BrokerLog::open_opts`].
+    pub health_every: Option<std::time::Duration>,
     /// The crash simulation's recovery mutation (a negative control).
     #[cfg(test)]
     pub(crate) mutation: Mutation,
@@ -1668,7 +2329,8 @@ impl fmt::Debug for OpenOptions {
         d.field("durability", &self.durability)
             .field("escalation", &self.escalation)
             .field("boot", &self.boot)
-            .field("volume", &self.volume);
+            .field("volume", &self.volume)
+            .field("health_every", &self.health_every);
         // The capability secret is a key: never printed.
         #[cfg(feature = "cap")]
         {
@@ -1783,9 +2445,23 @@ pub(crate) enum StageErr {
     /// early refusal uses.
     ReservedReplica(String),
     /// The log is a REPLICA and the op would have appended a record of this broker's
-    /// OWN making (a will firing at open). Not a failure — the intended outcome of
-    /// the leader/replica split; the file is untouched.
+    /// OWN making (a will firing at open, or a subject retirement). Not a failure —
+    /// the intended outcome of the leader/replica split; the file is untouched.
     Replica(String),
+    /// A subject is not a valid `Subject` (`ERR_BAD_SUBJECT`).
+    BadSubject(String),
+    /// A subject retirement was offered on a log that prefix retention has cut
+    /// (`base > 0`, `ERR_RECORD_REFUSED` with `cut: ` prefix).
+    Cut(String),
+    /// A subject retirement named a subject charged to another producer
+    /// (`ERR_RETIRE_REFUSED` with `charged: ` prefix).
+    RetireCharged(String),
+    /// A subject retirement named a subject targeted by a will that can still append
+    /// (`ERR_RETIRE_REFUSED` with `will: ` prefix).
+    RetireWill(String),
+    /// A conditional subject retirement's log identity or offset did not match
+    /// (`ERR_RETIRE_REFUSED` with `log: ` prefix).
+    RetireLog(String),
     /// An I/O error while staging (the replica marker could not be written) — the
     /// batch is poisoned and must be aborted. Also raised for every mutation once the
     /// log is [poisoned](BrokerLog#poison).
@@ -1907,7 +2583,11 @@ pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     };
     match res {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(all(test, feature = "retention"))]
+            crate::power_loss::dir_synced(path);
+            Ok(())
+        }
         // The directory entry simply cannot be fsync'd here, through no fault of the
         // log: a filesystem that refuses to fsync a directory handle (Unsupported /
         // InvalidInput), or a directory this process may write but not OPEN — a
@@ -2141,8 +2821,10 @@ pub(crate) enum Begun {
 /// 0.004/0.024 and publish → recv from 7.796/11.229 to 3.566/5.194. `Hello`, which
 /// takes no log lock, is the control (0.012 against 0.010). aterm's fabric burst (300
 /// posts, 12 interleaved pairs, load 8-22) is neutral: 200.6 against 211.5 msg/s
-/// nearest-rank p50, paired median -3.9 msg/s, because its posts are still published
-/// one at a time, one fsync each, and no reader there waits behind a queued batch.
+/// nearest-rank p50, paired median -3.9 msg/s, because its posts went out one at a
+/// time, one fsync each, and no reader there waits behind a queued batch. (Since aterm
+/// `f443f00a66` a drain's fresh posts are pipelined, one in flight per sender, which
+/// this measurement predates.)
 ///
 /// WHAT IT DOES NOT MOVE. The staged records are promoted only by `commit_end`, after
 /// the flush returned, so nothing becomes visible or ack-able before it is durable (or
@@ -2582,7 +3264,7 @@ impl BrokerLog {
     /// appended a second time. A reopen re-establishes the watermark.
     fn cover_head(&mut self) -> io::Result<()> {
         if let Err(e) = self.advance_watermark() {
-            self.poisoned = Some(format!("anti-rollback watermark update failed: {e}"));
+            self.publish_poison(format!("anti-rollback watermark update failed: {e}"), None);
             return Err(e);
         }
         Ok(())
@@ -2691,11 +3373,25 @@ impl BrokerLog {
             if created {
                 let _ = remove_file_path(&marker);
                 let _ = remove_file_path(&state_path(&path));
+                #[cfg(feature = "retention")]
+                crate::compact::clear_created(&path);
             }
             marker.exists()
         };
         let mut existing = Vec::new();
         file.read_to_end(&mut existing)?;
+        // A compaction a crash interrupted is finished or discarded HERE, before the base
+        // and the carried state are read, from its intent and the log's first frame
+        // (`compact.rs`): it touches only the sidecars, never the log file.
+        #[cfg(feature = "retention")]
+        if dir.is_os() && !created {
+            crate::compact::recover(
+                &path,
+                &existing,
+                at_rest_key.as_ref(),
+                anti_rollback != AntiRollbackMode::Off,
+            )?;
+        }
         let (base, compacted) = if dir.is_os() {
             let base = read_base(&path)?;
             (base, read_state(&path, at_rest_key.as_ref(), base.0)?)
@@ -2827,10 +3523,15 @@ impl BrokerLog {
             records,
             dedup,
             last,
+            subject_charges,
             subjects_per_producer,
+            durable_latest_wills,
+            durable_wills_by_subject,
             high_water,
             carried_wills,
             carried_last,
+            carried_charges,
+            uncarried_cut_tainted,
             bind,
             group_commits,
         ) = Self::rebuild_open_indices(compacted, records);
@@ -2850,11 +3551,18 @@ impl BrokerLog {
             next,
             dedup,
             last,
+            subject_charges,
             subjects_per_producer,
+            durable_latest_wills,
+            durable_wills_by_subject,
+            live_wills_by_conn: HashMap::new(),
+            live_wills_by_subject: HashMap::new(),
             will_reserved: HashMap::new(),
             high_water,
             carried_wills,
             carried_last,
+            carried_charges,
+            uncarried_cut_tainted,
             bind,
             group_commits,
             staged: Vec::new(),
@@ -2864,6 +3572,9 @@ impl BrokerLog {
             unsealed_writer: false,
             staged_dedup: HashMap::new(),
             staged_new_subjects: HashMap::new(),
+            staged_retired_durable: HashMap::new(),
+            retire_history: RetireHistory::new(next.0),
+            staged_live_wills: Vec::new(),
             staged_bind: HashMap::new(),
             durability,
             served,
@@ -2874,12 +3585,16 @@ impl BrokerLog {
             held_commits: Vec::new(),
             staged_escalated: None,
             staged_held: Vec::new(),
-            counts: FlushCounts::default(),
+            vitals: Arc::new(LogVitals::default()),
             #[cfg(test)]
             refuse_barrier: false,
-            poisoned: None,
+            #[cfg(test)]
+            id_at_poison: None,
             closed: false,
+            released: false,
             faults: InjectedFaults::default(),
+            #[cfg(feature = "retention")]
+            compact_seam: crate::compact::Seam::default(),
             at_rest_key,
             head_watermark,
             replication_epoch: 0,
@@ -3064,28 +3779,63 @@ impl BrokerLog {
         Vec<Arc<BrokerRecord>>,
         HashMap<(u64, u64), Offset>,
         BTreeMap<String, Offset>,
+        HashMap<String, u64>,
         HashMap<u64, usize>,
+        HashMap<u64, DurableWillEntry>,
+        HashMap<String, HashSet<u64>>,
         HashMap<u64, u64>,
         HashMap<u64, (Offset, WillRecord)>,
         BTreeMap<String, Arc<BrokerRecord>>,
+        BTreeMap<String, u64>,
+        bool,
         HashMap<u64, (String, Offset)>,
         HashMap<String, u64>,
     ) {
         let mut dedup = HashMap::new();
         let mut group_commits: HashMap<String, u64> = compacted.group_commits;
         let mut last: BTreeMap<String, Offset> = BTreeMap::new();
+        let mut subject_charges: HashMap<String, u64> = HashMap::new();
         let mut subjects_per_producer: HashMap<u64, usize> = HashMap::new();
+        let mut durable_latest_wills: HashMap<u64, DurableWillEntry> = HashMap::new();
+        let mut durable_wills_by_subject: HashMap<String, HashSet<u64>> = HashMap::new();
         let mut bind: HashMap<u64, (String, Offset)> = compacted.bind;
         let mut high_water: HashMap<u64, u64> = compacted.high_water;
         let carried_wills: HashMap<u64, (Offset, WillRecord)> = compacted.carried_wills;
         let mut carried_last: BTreeMap<String, Arc<BrokerRecord>> = compacted.carried_last;
+        let carried_charges: BTreeMap<String, u64> = compacted.carried_charges;
+        let uncarried_cut_tainted: bool = compacted.uncarried_cut_tainted;
+        let mut pending_carried_charges: BTreeMap<String, u64> = carried_charges.clone();
+        for (&pid, (off, will)) in &carried_wills {
+            let hidden_target = is_hidden_subject(&will.subject);
+            if !hidden_target {
+                durable_wills_by_subject
+                    .entry(will.subject.clone())
+                    .or_default()
+                    .insert(pid);
+            }
+            durable_latest_wills.insert(
+                pid,
+                DurableWillEntry {
+                    offset: *off,
+                    will: will.clone(),
+                    settled_above: hidden_target,
+                },
+            );
+        }
         for (subj, rec) in &carried_last {
+            let owner = pending_carried_charges.remove(subj).unwrap_or(rec.producer_id);
             if last.insert(subj.clone(), rec.seq).is_none() {
-                let c = subjects_per_producer.entry(rec.producer_id).or_insert(0);
+                subject_charges.insert(subj.clone(), owner);
+                let c = subjects_per_producer.entry(owner).or_insert(0);
                 *c = c.saturating_add(1);
             }
         }
         for r in &records {
+            update_durable_wills_on_record(
+                &mut durable_latest_wills,
+                &mut durable_wills_by_subject,
+                r,
+            );
             if r.subject == BIND_SUBJECT {
                 if let Ok(principal) = std::str::from_utf8(&r.body) {
                     if !bind.contains_key(&r.producer_id) {
@@ -3093,26 +3843,29 @@ impl BrokerLog {
                     }
                 }
             }
-            if r.subject == RETIRE_SUBJECT {
-                if let Ok(target) = std::str::from_utf8(&r.body) {
-                    apply_retire_target(
-                        &mut last,
-                        &mut carried_last,
-                        &mut subjects_per_producer,
-                        r.producer_id,
-                        target,
-                    );
-                }
+            if let Some(target) = retire_target(r) {
+                pending_carried_charges.remove(target);
+                apply_retire_target(
+                    &mut last,
+                    &mut carried_last,
+                    &mut subject_charges,
+                    &mut subjects_per_producer,
+                    r.producer_id,
+                    target,
+                );
             }
             // The broker's own hidden records (commits, wills, producer bindings) are
             // not produces: they never enter the dedup map and never enter the
             // last-value index. Rebuilding both here is what makes exactly-once ingest
             // AND retained state survive a restart.
-            if !is_hidden_subject(&r.subject) {
+            if !is_hidden_record(r) {
                 dedup.insert((r.producer_id, r.producer_seq), r.seq);
+                let carried_owner = pending_carried_charges.remove(&r.subject);
                 carried_last.remove(&r.subject);
                 if last.insert(r.subject.clone(), r.seq).is_none() {
-                    let c = subjects_per_producer.entry(r.producer_id).or_insert(0);
+                    let owner = carried_owner.unwrap_or(r.producer_id);
+                    subject_charges.insert(r.subject.clone(), owner);
+                    let c = subjects_per_producer.entry(owner).or_insert(0);
                     *c = c.saturating_add(1);
                 }
                 // The reserved ack half never enters the fence's high water — the
@@ -3138,10 +3891,15 @@ impl BrokerLog {
             shared_records,
             dedup,
             last,
+            subject_charges,
             subjects_per_producer,
+            durable_latest_wills,
+            durable_wills_by_subject,
             high_water,
             carried_wills,
             carried_last,
+            carried_charges,
+            uncarried_cut_tainted,
             bind,
             group_commits,
         )
@@ -3209,12 +3967,18 @@ impl BrokerLog {
         Ok(())
     }
 
-    /// Re-establish the will-subject reservations after a recovery scan: every will the
-    /// log still holds ([`pending_wills`](Self::pending_wills) — at most one per
-    /// producer, the one a broker open would actually fire) holds its target subject
-    /// unless that subject is already an index entry.
+    /// Re-establish the will-subject reservations after a recovery scan: every latest
+    /// durable `/a/will` that can still append (neither fenced nor deduped by a visible
+    /// record above it, nor targeting a hidden subject) holds its target subject unless
+    /// that subject is already an index entry.
     fn reserve_pending_will_subjects(&mut self) {
-        for will in self.pending_wills() {
+        let mut to_reserve = Vec::new();
+        for entry in self.durable_latest_wills.values() {
+            if !entry.settled_above && !is_hidden_subject(&entry.will.subject) {
+                to_reserve.push(entry.will.clone());
+            }
+        }
+        for will in to_reserve {
             self.reserve_will_subject(&will);
         }
     }
@@ -3242,9 +4006,13 @@ impl BrokerLog {
     ///   the floor).
     ///
     /// The broker runs it when its last listener shuts down (after the writer has
-    /// joined) and when an unserved `Broker` drops; a direct `BrokerLog` user calls it
-    /// as the log's last act. Afterwards every mutation is refused until the log is
-    /// reopened: the sidecar now promises nothing was appended. A poisoned log, or one
+    /// joined) and when an unserved `Broker` drops — but not under the test seam
+    /// [`Broker::arm_unclean_stop`](crate::Broker::arm_unclean_stop), which leaves the
+    /// log as a killed process would (the broker's stop latches the log shut all the
+    /// same, when it lets the lock go: `unlock`); a direct `BrokerLog` user calls it as
+    /// the log's last act, and one that drops the log without it has stopped uncleanly.
+    /// Afterwards every mutation is refused until the log is reopened: the sidecar now
+    /// promises nothing was appended. A poisoned log, or one
     /// with a batch staged, is not closed (`Err`), and a flush or sidecar error leaves
     /// the record `Open` — so the next open in another boot moves the generation once,
     /// the safe direction.
@@ -3288,7 +4056,7 @@ impl BrokerLog {
     /// [`close_clean`](Self::close_clean) at shutdown: said on stderr when it fails,
     /// since nothing else is left to report to.
     pub(crate) fn close_clean_at_shutdown(&mut self) {
-        if self.poisoned.is_some() || self.closed {
+        if self.vitals.poisoned().is_some() || self.closed {
             return;
         }
         if let Err(e) = self.close_clean() {
@@ -3336,8 +4104,8 @@ impl BrokerLog {
     }
 
     /// How many flushes this log has issued since it opened ([`FlushCounts`]).
-    pub const fn flush_counts(&self) -> FlushCounts {
-        self.counts
+    pub fn flush_counts(&self) -> FlushCounts {
+        self.vitals.flush_counts()
     }
 
     /// The head readers may see: the log's head, or — while a full flush is still owed
@@ -3372,7 +4140,7 @@ impl BrokerLog {
         self.check_poisoned()?;
         let target = self.next.0;
         if self.durable_head >= target {
-            self.counts.skipped = self.counts.skipped.saturating_add(1);
+            LogVitals::add(&self.vitals.skipped, 1);
             return Ok(self.durable_head());
         }
         match self.flush_handle().full() {
@@ -3399,12 +4167,12 @@ impl BrokerLog {
     /// skipped) when one already covers it — and `false`, uncounted, on a poisoned log,
     /// where no flush can make anything durable for this open
     /// ([`full_flush_failed`](Self::full_flush_failed)).
-    pub(crate) const fn full_flush_owed(&mut self, target: u64) -> bool {
-        if self.poisoned.is_some() {
+    pub(crate) fn full_flush_owed(&mut self, target: u64) -> bool {
+        if self.vitals.poisoned().is_some() {
             return false;
         }
         if self.durable_head >= target {
-            self.counts.skipped = self.counts.skipped.saturating_add(1);
+            LogVitals::add(&self.vitals.skipped, 1);
             return false;
         }
         true
@@ -3417,10 +4185,10 @@ impl BrokerLog {
     /// after a failed full flush a later one that succeeds says nothing about what the
     /// failed one was to cover ([`full_flush_failed`](Self::full_flush_failed)).
     pub(crate) fn full_flush_done(&mut self, target: u64) {
-        if self.poisoned.is_some() {
+        if self.vitals.poisoned().is_some() {
             return;
         }
-        self.counts.full = self.counts.full.saturating_add(1);
+        LogVitals::add(&self.vitals.full, 1);
         self.durable_head = self.durable_head.max(target);
         if let Some(h) = self.held_from {
             if h < self.durable_head {
@@ -3434,8 +4202,8 @@ impl BrokerLog {
     /// un-acked, and the device may have lost what the flush was to cover:
     /// [`flush_failed_lossy`](Self::flush_failed_lossy).
     pub(crate) fn full_flush_failed(&mut self, e: &io::Error) {
-        self.counts.failed = self.counts.failed.saturating_add(1);
-        self.flush_failed_lossy(e);
+        LogVitals::add(&self.vitals.failed, 1);
+        self.flush_failed_lossy(e, None);
     }
 
     /// A flush failed while PROMOTED records exist that no full flush has covered — an
@@ -3450,6 +4218,13 @@ impl BrokerLog {
     /// 3. the log is POISONED: every write is refused until it is reopened, and the
     ///    durable head and the held head stay where they were — the records a held batch
     ///    kept back stay unseen, their ops answered "outcome unknown".
+    ///
+    /// In THAT order, the poison last ([`publish_poison`](Self::publish_poison)): a
+    /// reader of the poison takes no lock, and the one that exits on it must find the
+    /// `Lossy` record already written, and the tier it is told already Strict. `rolled`
+    /// is the reason a rollback the caller ran just before could not be made (its
+    /// truncate failed), which stands as the poison's reason — the log's on-disk suffix
+    /// is then unknown, which says more than the flush did.
     ///
     /// WHY POISON, and not a resend that dedups to its original and a later flush that
     /// covers it. A later flush that SUCCEEDS says nothing about the records the failed
@@ -3474,7 +4249,7 @@ impl BrokerLog {
     /// flush has nothing dirty to rewrite either; its floor then covers those bytes, and a
     /// later power loss that takes them is REFUSED at the open after it (damage below the
     /// floor) — a refusal and `asb repair`, never a silent loss.
-    fn flush_failed_lossy(&mut self, e: &io::Error) {
+    fn flush_failed_lossy(&mut self, e: &io::Error, rolled: Option<String>) {
         if self.identity.state != logid::State::Lossy {
             let lossy = self.identity.lossy();
             match logid::write(&self.dir, &lossy) {
@@ -3486,27 +4261,49 @@ impl BrokerLog {
                 ),
             }
         }
-        if self.served.tier != crate::proto::Tier::Strict {
+        // The latch rides the poison: published with it below, never before it.
+        let latched = if self.served.tier == crate::proto::Tier::Strict {
+            None
+        } else {
             self.served = Served {
                 tier: crate::proto::Tier::Strict,
                 reason: crate::proto::ServedReason::LatchedAfterFlushFailure,
             };
-        }
-        if self.poisoned.is_none() {
+            Some(crate::proto::ServedReason::LatchedAfterFlushFailure)
+        };
+        if self.vitals.poisoned().is_none() {
             eprintln!(
                 "astream-broker: {}: a flush failed ({e}) while records no full flush covers \
                  were acked or held; they may be lost, so the log refuses every write until it \
                  is reopened, and that open moves its generation",
                 self.path.display()
             );
-            self.poisoned = Some(format!(
+        }
+        let reason = match rolled {
+            Some(why) => why,
+            None => format!(
                 "a flush failed ({e}) with records no full flush covers: the device may have \
                  dropped them, and nothing appended after them could be promised"
-            ));
-        }
+            ),
+        };
+        self.publish_poison(reason, latched);
     }
 
-    /// Serve Strict from now on, saying why once.
+    /// PUBLISH THE POISON — the one place a poison is set — with the latch to Strict the
+    /// same failure set ([`LogVitals`]: the first reason stands). The caller has done
+    /// the failure's own disk work first: a reader of the poison takes no lock, so
+    /// whatever is written after this is written behind the back of an embedder that
+    /// may already be exiting on it.
+    fn publish_poison(&mut self, reason: String, latched: Option<crate::proto::ServedReason>) {
+        #[cfg(test)]
+        if self.vitals.poisoned().is_none() {
+            self.id_at_poison = Some(self.dir.read_id().unwrap_or(None));
+        }
+        self.vitals.poison(reason, latched);
+    }
+
+    /// Serve Strict from now on, saying why once. Published at once ([`LogVitals`]'s
+    /// latch), before any poison a later failure of the same batch publishes.
     fn latch_strict(&mut self, reason: crate::proto::ServedReason, why: &str) {
         if self.served.tier == crate::proto::Tier::Strict {
             return;
@@ -3520,6 +4317,7 @@ impl BrokerLog {
             tier: crate::proto::Tier::Strict,
             reason,
         };
+        self.vitals.latch(reason);
     }
 
     /// The flush a commit owes before its ack, by the tier served.
@@ -3569,9 +4367,9 @@ impl BrokerLog {
                 &format!("the device refused a barrier ({why})"),
             );
         }
-        self.counts.full = self.counts.full.saturating_add(u64::from(full));
-        self.counts.barrier = self.counts.barrier.saturating_add(u64::from(barrier));
-        self.counts.failed = self.counts.failed.saturating_add(u64::from(failed));
+        LogVitals::add(&self.vitals.full, u64::from(full));
+        LogVitals::add(&self.vitals.barrier, u64::from(barrier));
+        LogVitals::add(&self.vitals.failed, u64::from(failed));
     }
 
     /// The test seam standing in for a device that refuses the barrier while serving
@@ -3654,9 +4452,23 @@ impl BrokerLog {
 
     /// Release the exclusive file lock early (the broker calls this at shutdown, once
     /// its writer has exited, so a successor can open the log while connection threads
-    /// that still hold the old log's `Arc` are being reaped). Dropping the log also
-    /// releases it.
-    pub(crate) fn unlock(&self) {
+    /// that still hold the old log's `Arc` are being reaped), and LATCH THE LOG SHUT:
+    /// from here every mutation is refused (`check_poisoned`), whatever the stop did
+    /// before it. Dropping the log also releases the lock.
+    ///
+    /// WHY A LATCH OF ITS OWN. The lock is what makes this open the file's one writer;
+    /// once it is let go a successor may open the log, and anything this open still
+    /// wrote would land under it. The clean close's latch (`closed`) used to be all that
+    /// stood between a stopped broker and its file, and a stop can end without it: a
+    /// clean close that failed (a flush or sidecar error, said on stderr), and every
+    /// stop under the test seam [`Broker::arm_unclean_stop`](crate::Broker::arm_unclean_stop),
+    /// which skips the clean close to leave the log as a killed process leaves it. A
+    /// `Broker` value kept after such a stop could still compact: its `retain_before`
+    /// renamed the compacted copy over the path and re-locked the new file, while the
+    /// successor acked Strict records into the unlinked one — gone at the next open. A
+    /// killed process leaves no such writer behind, and a stopped broker must not either.
+    pub(crate) fn unlock(&mut self) {
+        self.released = true;
         self.file.unlock();
     }
 
@@ -3667,15 +4479,28 @@ impl BrokerLog {
     }
 
     /// `Some(reason)` once the log refuses every further mutation until it is reopened
-    /// (see the `poisoned` field): a failed batch whose rollback could not put the file
-    /// back, a full flush that failed with acked or held records no full flush covers
-    /// ([`InjectedFaults::sync`]), or an anti-rollback watermark that could not follow
-    /// promoted records. Reopen to recover. Every write the broker's writer refuses
-    /// meanwhile says why in a message that starts
+    /// (see the comment on the `vitals` field): a failed batch whose rollback could not
+    /// put the file back, a full flush that failed with acked or held records no full
+    /// flush covers ([`InjectedFaults::sync`]), a retention rewrite that failed half-way,
+    /// or an anti-rollback watermark that could not follow promoted records. Set once:
+    /// the first reason stands. Reopen to recover. Every write the broker's writer
+    /// refuses meanwhile says why in a message that starts
     /// [`LOG_POISONED_PREFIX`](crate::proto::LOG_POISONED_PREFIX)
     /// (`poisoned_refusal`).
     pub fn poisoned(&self) -> Option<&str> {
-        self.poisoned.as_deref()
+        self.vitals.poisoned()
+    }
+
+    /// The poison and the flush counts, shared: what the broker serving this log reads
+    /// them through without the log's lock ([`LogVitals`]).
+    pub(crate) fn vitals(&self) -> Arc<LogVitals> {
+        Arc::clone(&self.vitals)
+    }
+
+    /// The path this log was opened from: the stem the broker's health sidecar is named
+    /// from ([`health_path`](crate::health::health_path)).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Whether this log is a REPLICA — a replication TARGET whose contents are a
@@ -3954,6 +4779,9 @@ impl BrokerLog {
     pub fn stats(&self) -> LogStats {
         let mut pending_wills = 0usize;
         for (_, w) in self.latest_wills() {
+            if is_hidden_subject(&w.subject) {
+                continue;
+            }
             let fenced = match self.high_water.get(&w.producer_id) {
                 Some(&hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
                 None => false,
@@ -3973,7 +4801,7 @@ impl BrokerLog {
             group_commits: self.group_commits.len(),
             durability: self.durability,
             is_replica: self.replica,
-            poisoned: self.poisoned.is_some(),
+            poisoned: self.vitals.poisoned().is_some(),
         }
     }
 
@@ -4139,7 +4967,13 @@ impl BrokerLog {
                 "the log was closed cleanly (close_clean); reopen it to write",
             ));
         }
-        match &self.poisoned {
+        if self.released {
+            return Err(io::Error::other(
+                "the broker serving this log stopped and released its lock, so another \
+                 open may serve it now; reopen it to write",
+            ));
+        }
+        match self.vitals.poisoned() {
             Some(reason) => Err(io::Error::other(poisoned_refusal(reason))),
             None => Ok(()),
         }
@@ -4172,6 +5006,33 @@ impl BrokerLog {
         }
     }
 
+    /// The `(latest_offset, charged_producer_id)` of `subject` after folding the
+    /// durable index (`last` + `subject_charges`) and the in-flight batch (`staged`) in
+    /// commit order, or `None` if `subject` is currently absent (never published, or
+    /// retired and not re-introduced since).
+    fn batch_subject_state(&self, subject: &str) -> Option<(Offset, u64)> {
+        let mut state = match self.last.get(subject) {
+            Some(&off) => {
+                let charged = self.subject_charges.get(subject).copied().unwrap_or(0);
+                Some((off, charged))
+            }
+            None => None,
+        };
+        for rec in &self.staged {
+            if let Some(target) = retire_target(rec) {
+                if target == subject {
+                    state = None;
+                }
+            } else if !is_hidden_record(rec) && rec.subject == subject {
+                state = Some(match state {
+                    Some((_, charged)) => (rec.seq, charged),
+                    None => (rec.seq, rec.producer_id),
+                });
+            }
+        }
+        state
+    }
+
     /// Whether `rec` would create a NEW distinct subject for its producer beyond
     /// [`MAX_SUBJECTS_PER_PRODUCER`], counting the durable index, the subjects that
     /// producer's registered wills have RESERVED (`will_reserved`), and `pending` (the
@@ -4180,7 +5041,7 @@ impl BrokerLog {
     /// [`publish`](Self::publish) / [`process_and_produce`](Self::process_and_produce)
     /// cannot disagree about it.
     fn subject_bound_exceeded(&self, rec: &BrokerRecord, pending: usize) -> bool {
-        if is_hidden_subject(&rec.subject) || self.last.contains_key(&rec.subject) {
+        if is_hidden_record(rec) || self.batch_subject_state(&rec.subject).is_some() {
             return false;
         }
         // A record on a subject this producer has ALREADY reserved consumes that
@@ -4193,12 +5054,17 @@ impl BrokerLog {
                 .saturating_sub(usize::from(held_set.contains(&rec.subject))),
             None => 0,
         };
-        let already = pending.saturating_add(held).saturating_add(
-            self.subjects_per_producer
-                .get(&rec.producer_id)
-                .copied()
-                .unwrap_or(0),
-        );
+        let durable_count = self
+            .subjects_per_producer
+            .get(&rec.producer_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(
+                self.staged_retired_durable
+                    .get(&rec.producer_id)
+                    .map_or(0, HashSet::len),
+            );
+        let already = pending.saturating_add(held).saturating_add(durable_count);
         already >= MAX_SUBJECTS_PER_PRODUCER
     }
 
@@ -4305,6 +5171,14 @@ impl BrokerLog {
     /// that offset — never silently overwritten or skipped).
     pub(crate) fn stage_replica(&mut self, rec: BrokerRecord) -> Result<(Offset, bool), StageErr> {
         self.check_poisoned_stage()?;
+        // Both retirement encodings are commands, never newly admitted data. Refuse
+        // malformed targets before staging or declaring a replica, so an acknowledged
+        // record cannot acquire a different meaning at the next open.
+        if is_retire_record(&rec) && retire_target(&rec).is_none() {
+            return Err(StageErr::BadSubject(
+                "retirement record requires an exact non-internal UTF-8 target".into(),
+            ));
+        }
         // WHOSE LOG IS THIS — decided here, in the writer, in the same critical section
         // that appends the record, because that is the only place the answer cannot
         // change under the decision. The connection thread asks the same question
@@ -4327,7 +5201,7 @@ impl BrokerLog {
         // own `/a/commit` record, it carries no producer key and no body, and a client
         // that can reach this verb can advance a group cursor with `Commit` anyway.
         let declares = self.next.0 == 0 && self.staged.is_empty();
-        if is_hidden_subject(&rec.subject) && !is_pure_commit(&rec) && !(self.replica || declares) {
+        if is_hidden_record(&rec) && !is_pure_commit(&rec) && !(self.replica || declares) {
             return Err(StageErr::ReservedReplica(replicated_reserved_msg(
                 &rec.subject,
             )));
@@ -4437,7 +5311,16 @@ impl BrokerLog {
     /// budget (`will_reserved`, promoted when the batch commits and rebuilt on open),
     /// so the next registration sees it — the firings are exempt from the bound, and
     /// the reservation is what keeps them from overshooting it.
+    #[cfg(test)]
     pub(crate) fn stage_will_register(&mut self, will: &WillRecord) -> Result<Offset, StageErr> {
+        self.stage_will_register_for_conn(None, will)
+    }
+
+    pub(crate) fn stage_will_register_for_conn(
+        &mut self,
+        conn_id: Option<u64>,
+        will: &WillRecord,
+    ) -> Result<Offset, StageErr> {
         self.check_poisoned_stage()?;
         // THE FENCE IS WHAT MAKES A STALE GOODBYE HARMLESS, and it does not reach into
         // the reserved ack half ([`ACK_SEQ_BASE`]): a sequence there is derived from an
@@ -4489,13 +5372,36 @@ impl BrokerLog {
             Some(held_set) => held_set.contains(&will.subject),
             None => false,
         };
-        if !already_queued && !held && !self.last.contains_key(&will.subject) {
+        if !already_queued && !held && self.batch_subject_state(&will.subject).is_none() {
             self.staged_new_subjects
                 .entry(will.producer_id)
                 .or_default()
                 .insert(will.subject.clone());
         }
+        if let Some(cid) = conn_id {
+            self.staged_live_wills.push((cid, will.clone()));
+        }
         Ok(seq)
+    }
+
+    /// Remove a live connection's will slot when the connection closes or its will is
+    /// processed by the writer (`DESIGN-aterm-fabric` §5.2).
+    pub(crate) fn drop_live_will(&mut self, conn_id: u64) {
+        let mut kept = Vec::new();
+        for (cid, w) in std::mem::take(&mut self.staged_live_wills) {
+            if cid != conn_id {
+                kept.push((cid, w));
+            }
+        }
+        self.staged_live_wills = kept;
+        if let Some(old) = self.live_wills_by_conn.remove(&conn_id) {
+            if let Some(conns) = self.live_wills_by_subject.get_mut(&old.subject) {
+                conns.remove(&conn_id);
+                if conns.is_empty() {
+                    self.live_wills_by_subject.remove(&old.subject);
+                }
+            }
+        }
     }
 
     /// FIRE a will as an ordinary publish, FENCED: nothing is appended if a record
@@ -4515,7 +5421,19 @@ impl BrokerLog {
     /// every later open. The exemption costs no overshoot: registration RESERVED this
     /// subject against the producer's budget (`will_reserved`) and holds it until this
     /// record lands, so what the firing indexes was already paid for.
+    #[cfg(test)]
     pub(crate) fn stage_will_fire(&mut self, will: WillRecord) -> Result<(Offset, bool), StageErr> {
+        self.stage_will_fire_for_conn(None, will)
+    }
+
+    pub(crate) fn stage_will_fire_for_conn(
+        &mut self,
+        conn_id: Option<u64>,
+        will: WillRecord,
+    ) -> Result<(Offset, bool), StageErr> {
+        if let Some(cid) = conn_id {
+            self.drop_live_will(cid);
+        }
         self.check_poisoned_stage()?;
         // NEVER on a replica. The log is the leader's spine: the wills it holds are the
         // leader's, they fire THERE, and firing one here would append a record the
@@ -4556,9 +5474,7 @@ impl BrokerLog {
     pub fn producer_high_water(&self, producer_id: u64) -> Option<u64> {
         let mut best = self.high_water.get(&producer_id).copied();
         for r in &self.staged {
-            if r.producer_id == producer_id
-                && !is_hidden_subject(&r.subject)
-                && r.producer_seq < ACK_SEQ_BASE
+            if r.producer_id == producer_id && !is_hidden_record(r) && r.producer_seq < ACK_SEQ_BASE
             {
                 best = Some(match best {
                     Some(a) => crate::proto::high_water_monotone(a, r.producer_seq),
@@ -4623,6 +5539,9 @@ impl BrokerLog {
     fn pending_wills_below(&self, min: u64) -> Vec<(Offset, WillRecord)> {
         let mut out = Vec::new();
         for (off, w) in self.latest_wills() {
+            if is_hidden_subject(&w.subject) {
+                continue;
+            }
             if off.0 < min && !self.dedup.contains_key(&(w.producer_id, w.producer_seq)) {
                 let fenced = match self.high_water.get(&w.producer_id) {
                     Some(&hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
@@ -4823,8 +5742,8 @@ impl BrokerLog {
             Some(p) => (p.len(), p.contains(&rec.subject)),
             None => (0, false),
         };
-        let new_subject = !is_hidden_subject(&rec.subject)
-            && !self.last.contains_key(&rec.subject)
+        let new_subject = !is_hidden_record(&rec)
+            && self.batch_subject_state(&rec.subject).is_none()
             && !queued_has_subject;
         if new_subject && enforce_bound && self.subject_bound_exceeded(&rec, queued_len) {
             return Err(StageErr::SubjectBound(subject_bound_msg(rec.producer_id)));
@@ -4848,12 +5767,23 @@ impl BrokerLog {
         self.staged_last_at = self.staged_bytes.len();
         self.staged_bytes.extend_from_slice(&frame);
         if new_subject {
-            self.staged_new_subjects
-                .entry(rec.producer_id)
-                .or_default()
-                .insert(rec.subject.clone());
+            if let Some(retired) = self.staged_retired_durable.get_mut(&rec.producer_id) {
+                if !retired.remove(&rec.subject) {
+                    self.staged_new_subjects
+                        .entry(rec.producer_id)
+                        .or_default()
+                        .insert(rec.subject.clone());
+                } else if retired.is_empty() {
+                    self.staged_retired_durable.remove(&rec.producer_id);
+                }
+            } else {
+                self.staged_new_subjects
+                    .entry(rec.producer_id)
+                    .or_default()
+                    .insert(rec.subject.clone());
+            }
         }
-        if !is_hidden_subject(&rec.subject) {
+        if !is_hidden_record(&rec) {
             self.staged_dedup
                 .insert((rec.producer_id, rec.producer_seq), rec.seq);
         }
@@ -4865,7 +5795,7 @@ impl BrokerLog {
     /// count) as it becomes durable. Hidden subjects are excluded, so no query and no
     /// bound ever sees one.
     fn index_last(&mut self, rec: &BrokerRecord) {
-        if is_hidden_subject(&rec.subject) {
+        if is_hidden_record(rec) {
             return;
         }
         // The last-will FENCE asks "has this producer been heard from SINCE it
@@ -4888,6 +5818,8 @@ impl BrokerLog {
             Some(slot) => *slot = rec.seq,
             None => {
                 self.last.insert(rec.subject.clone(), rec.seq);
+                self.subject_charges
+                    .insert(rec.subject.clone(), rec.producer_id);
                 let count = self
                     .subjects_per_producer
                     .entry(rec.producer_id)
@@ -5071,17 +6003,22 @@ impl BrokerLog {
             // truncate fault armed in the window would otherwise fail this batch's
             // rollback and poison the log.
             let armed = std::mem::replace(&mut self.faults, faults);
-            self.abort_batch();
+            let rolled = self.discard_batch();
             self.faults = armed;
             // The batch is rolled back, as under Strict before the tiers. But a flush
             // that FAILS on a log whose earlier acks rode barriers or the page cache says
             // the device may have dropped THEM too, and the rollback cannot reach them:
             // that is a failed full flush's case ([`flush_failed_lossy`]). A failed WRITE
-            // flushed nothing, and says nothing about them.
+            // flushed nothing, and says nothing about them. A rollback that could not be
+            // made poisons the log either way — AFTER the `Lossy` record, when there is
+            // one ([`publish_poison`]).
             //
             // [`flush_failed_lossy`]: Self::flush_failed_lossy
+            // [`publish_poison`]: Self::publish_poison
             if flush_failed && self.durable_head < self.next.0 {
-                self.flush_failed_lossy(&e);
+                self.flush_failed_lossy(&e, rolled);
+            } else if let Some(why) = rolled {
+                self.publish_poison(why, None);
             }
             return Err(e);
         }
@@ -5095,7 +6032,24 @@ impl BrokerLog {
         self.staged_bytes = bytes;
         self.staged_dedup.clear();
         self.staged_new_subjects.clear();
+        self.staged_retired_durable.clear();
         self.staged_bind.clear();
+        for (cid, will) in std::mem::take(&mut self.staged_live_wills) {
+            if let Some(old) = self.live_wills_by_conn.insert(cid, will.clone()) {
+                if let Some(conns) = self.live_wills_by_subject.get_mut(&old.subject) {
+                    conns.remove(&cid);
+                    if conns.is_empty() {
+                        self.live_wills_by_subject.remove(&old.subject);
+                    }
+                }
+            }
+            if !is_hidden_subject(&will.subject) {
+                self.live_wills_by_subject
+                    .entry(will.subject)
+                    .or_default()
+                    .insert(cid);
+            }
+        }
         // Where the held head will stand: a group commit at or above it takes effect only
         // when a full flush releases it (`held_commits`).
         let hold_at = match (self.held_from, self.staged_escalated) {
@@ -5119,8 +6073,13 @@ impl BrokerLog {
                     }
                 }
             }
+            update_durable_wills_on_record(
+                &mut self.durable_latest_wills,
+                &mut self.durable_wills_by_subject,
+                &rec,
+            );
             self.apply_retire(&rec);
-            if !is_hidden_subject(&rec.subject) {
+            if !is_hidden_record(&rec) {
                 self.dedup
                     .insert((rec.producer_id, rec.producer_seq), rec.seq);
             }
@@ -5167,13 +6126,21 @@ impl BrokerLog {
     }
 
     fn apply_retire(&mut self, rec: &BrokerRecord) {
-        if rec.subject != RETIRE_SUBJECT {
-            return;
-        }
-        if let Ok(target) = std::str::from_utf8(&rec.body) {
+        if let Some(target) = retire_target(rec) {
+            let removed = self
+                .last
+                .get(target)
+                .and_then(|off| self.record_at(off.0))
+                .cloned()
+                .or_else(|| self.carried_last.get(target).cloned());
+            if let Some(removed) = removed {
+                self.retire_history
+                    .append(target.to_string(), removed, rec.seq.0);
+            }
             apply_retire_target(
                 &mut self.last,
                 &mut self.carried_last,
+                &mut self.subject_charges,
                 &mut self.subjects_per_producer,
                 rec.producer_id,
                 target,
@@ -5181,80 +6148,181 @@ impl BrokerLog {
         }
     }
 
-    /// Validate a retirement target (either an exact [`Subject`] or a wildcard [`Filter`])
-    /// and check whether any matching subject is currently present in `last` (and owned by
-    /// `producer_id`).
-    fn check_retire_target(&self, producer_id: u64, target: &str) -> Result<bool, StageErr> {
+    fn will_can_still_append(&self, w: &WillRecord) -> bool {
+        if is_hidden_subject(&w.subject) {
+            return false;
+        }
+        let fenced = match self.producer_high_water(w.producer_id) {
+            Some(hw) => crate::proto::will_is_fenced(hw, w.producer_seq),
+            None => false,
+        };
+        !fenced
+            && self
+                .staged_or_durable_dup((w.producer_id, w.producer_seq))
+                .is_none()
+    }
+
+    fn effective_durable_will(&self, pid: u64) -> Option<DurableWillEntry> {
+        let mut cur = self.durable_latest_wills.get(&pid).cloned();
+        for rec in &self.staged {
+            if rec.producer_id != pid {
+                continue;
+            }
+            if rec.subject == WILL_SUBJECT {
+                if let Some(will) = WillRecord::from_record(rec) {
+                    cur = Some(DurableWillEntry {
+                        offset: rec.seq,
+                        will,
+                        settled_above: false,
+                    });
+                }
+            } else if !is_hidden_record(rec) {
+                if let Some(entry) = cur.as_mut() {
+                    let deduped = rec.producer_seq == entry.will.producer_seq;
+                    let fenced = rec.producer_seq < ACK_SEQ_BASE
+                        && crate::proto::will_is_fenced(rec.producer_seq, entry.will.producer_seq);
+                    if deduped || fenced {
+                        entry.settled_above = true;
+                    }
+                }
+            }
+        }
+        cur
+    }
+
+    /// Whether any live connection's registered will or any producer's latest durable
+    /// `/a/will` record targets `target` and can still append (`DESIGN-aterm-fabric`
+    /// §5.2).
+    fn will_targets_subject(&self, target: &str) -> bool {
+        if is_hidden_subject(target) {
+            return false;
+        }
+        if let Some(conns) = self.live_wills_by_subject.get(target) {
+            for &cid in conns {
+                let mut latest_staged = None;
+                for (c, sw) in self.staged_live_wills.iter().rev() {
+                    if *c == cid {
+                        latest_staged = Some(sw);
+                        break;
+                    }
+                }
+                let w = match latest_staged {
+                    Some(w) if w.subject == target => Some(w),
+                    Some(_) => None,
+                    None => self.live_wills_by_conn.get(&cid),
+                };
+                if let Some(w) = w {
+                    if self.will_can_still_append(w) {
+                        return true;
+                    }
+                }
+            }
+        }
+        let mut seen_staged_conns = HashSet::new();
+        for (cid, w) in self.staged_live_wills.iter().rev() {
+            if seen_staged_conns.insert(*cid)
+                && w.subject == target
+                && self.will_can_still_append(w)
+            {
+                return true;
+            }
+        }
+        if let Some(pids) = self.durable_wills_by_subject.get(target) {
+            for &pid in pids {
+                if let Some(entry) = self.effective_durable_will(pid) {
+                    if entry.will.subject == target
+                        && !entry.settled_above
+                        && self.will_can_still_append(&entry.will)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if !self.staged.is_empty() {
+            let mut staged_pids = HashSet::new();
+            for rec in &self.staged {
+                if rec.subject == WILL_SUBJECT {
+                    staged_pids.insert(rec.producer_id);
+                }
+            }
+            for pid in staged_pids {
+                if let Some(entry) = self.effective_durable_will(pid) {
+                    if entry.will.subject == target
+                        && !entry.settled_above
+                        && self.will_can_still_append(&entry.will)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Validate an exact [`Subject`] retirement target under the narrowed rules of
+    /// `DESIGN-aterm-fabric` §5.2:
+    /// - refused on a replica (`StageErr::Replica`)
+    /// - refused on a retention-cut log (`base > 0`, `StageErr::Cut`)
+    /// - refused on a reserved `/a/...` subject (`StageErr::Reserved`)
+    /// - refused on a non-`Subject` (including wildcards `*` and `>`, `StageErr::BadSubject`)
+    /// - if `target` is absent from `Last`, returns `Ok(None)` (idempotent no-op)
+    /// - refused when `target` is charged to a producer other than `producer_id`
+    ///   (`StageErr::RetireCharged`)
+    /// - refused while a live or durable will that can still append targets `target`
+    ///   (`StageErr::RetireWill`)
+    fn check_retire_target(
+        &self,
+        producer_id: u64,
+        target: &str,
+    ) -> Result<Option<(Offset, u64)>, StageErr> {
+        if self.replica {
+            return Err(StageErr::Replica(format!(
+                "retire for subject {target:?} is refused here: this log is a replication target"
+            )));
+        }
+        if self.uncarried_cut_tainted {
+            return Err(StageErr::Cut(format!(
+                "{}retire for subject {target:?} is refused on a log retention has cut (base = {})",
+                crate::proto::RETIRE_CUT_PREFIX,
+                self.base.0
+            )));
+        }
         if is_hidden_subject(target) || target.starts_with("/a/") || target == "/a" {
             return Err(StageErr::Reserved(target.to_string()));
         }
-        let Ok(filter) = Filter::new(target) else {
-            return Err(StageErr::Collision(format!(
-                "bad subject or filter {target:?}"
-            )));
+        if Subject::new(target).is_err() {
+            return Err(StageErr::BadSubject(format!("bad subject {target:?}")));
+        }
+        let Some((off, charged_pid)) = self.batch_subject_state(target) else {
+            return Ok(None);
         };
-        let prefix = literal_prefix(&filter);
-        let mut owners: BTreeMap<&str, u64> = BTreeMap::new();
-        for (subject, &off) in self
-            .last
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-        {
-            if !subject.starts_with(prefix) {
-                break;
-            }
-            if filter.matches_str(subject) {
-                let owner_rec = match self.record_at(off.0) {
-                    Some(r) => Some(r),
-                    None => self.carried_last.get(subject),
-                };
-                let Some(owner) = owner_rec else {
-                    return Err(StageErr::Collision(format!(
-                        "subject {subject:?} has no owner record"
-                    )));
-                };
-                owners.insert(subject.as_str(), owner.producer_id);
-            }
+        if charged_pid != producer_id {
+            return Err(StageErr::RetireCharged(format!(
+                "{}subject {target:?} is charged to producer {charged_pid}, not {producer_id}",
+                crate::proto::RETIRE_CHARGED_PREFIX
+            )));
         }
-        // Replay just this target's Last view through the staged prefix, in commit order.
-        for record in &self.staged {
-            if record.subject == RETIRE_SUBJECT {
-                if let Ok(retired) = std::str::from_utf8(&record.body) {
-                    if let Ok(retired) = Filter::new(retired) {
-                        let mut drop_keys = Vec::new();
-                        for &subject in owners.keys() {
-                            if retired.matches_str(subject) {
-                                drop_keys.push(subject);
-                            }
-                        }
-                        for k in drop_keys {
-                            owners.remove(k);
-                        }
-                    }
-                }
-            } else if !is_hidden_subject(&record.subject) && filter.matches_str(&record.subject) {
-                owners.insert(record.subject.as_str(), record.producer_id);
-            }
+        if self.will_targets_subject(target) {
+            return Err(StageErr::RetireWill(format!(
+                "{}subject {target:?} is targeted by a will that can still append",
+                crate::proto::RETIRE_WILL_PREFIX
+            )));
         }
-        for (subject, &owner) in &owners {
-            if owner != producer_id {
-                return Err(StageErr::Collision(format!(
-                    "subject {subject:?} (matched by {target:?}) is owned by producer {owner}, not {producer_id}"
-                )));
-            }
-        }
-        Ok(!owners.is_empty())
+        Ok(Some((off, charged_pid)))
     }
 
-    /// Durably retire `subject_or_filter` (either an exact [`Subject`] or a wildcard
-    /// [`Filter`] such as `"/f/local/pub/n-1/s1/>"`) from the last-value index (`Last`)
-    /// and decrement `producer_id`'s distinct-subject count (`subjects_per_producer`),
-    /// appending a hidden [`RETIRE_SUBJECT`] record so the reclamation survives a broker
-    /// restart and log compaction (`aterm-link` `bridge.rs` §"A NODE'S DISTINCT-SUBJECT BUDGET").
+    /// Durably retire an exact [`Subject`] from the last-value index (`Last`) and
+    /// decrement its charged producer's distinct-subject count
+    /// (`subjects_per_producer`), appending a hidden [`RETIRE_SUBJECT`] record so the
+    /// reclamation survives a broker restart (`DESIGN-aterm-fabric` §5.2).
     ///
-    /// Returns `Ok(Some(offset))` when at least one matching subject was present in `last`
-    /// and retired; `Ok(None)` when no matching subject was present (idempotent no-op,
-    /// nothing appended). Refuses with `PermissionDenied` if any matching subject in `last`
-    /// is currently held by a different producer.
+    /// Returns `Ok(Some(offset))` when `subject` was present in `last` and retired;
+    /// `Ok(None)` when `subject` was absent (idempotent no-op, nothing appended).
+    /// Refuses when the log is a replica or retention-cut (`base > 0`), when `subject`
+    /// is not a valid exact [`Subject`] (including wildcards), when `subject` is charged
+    /// to a different producer (`PermissionDenied`), or while a will that can still
+    /// append targets `subject` (`PermissionDenied`).
     pub fn retire_subject(
         &mut self,
         producer_id: u64,
@@ -5266,55 +6334,162 @@ impl BrokerLog {
                 "retire_subject: a batch is staged; commit or abort it first",
             ));
         }
-        let present = match self.check_retire_target(producer_id, subject) {
-            Ok(p) => p,
+        let state = match self.check_retire_target(producer_id, subject) {
+            Ok(s) => s,
             Err(StageErr::Reserved(s)) => return Err(reserved_err(&s)),
-            Err(StageErr::Collision(msg)) => {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg))
+            Err(StageErr::BadSubject(msg) | StageErr::Cut(msg) | StageErr::Replica(msg)) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
             }
+            Err(
+                StageErr::RetireCharged(msg) | StageErr::RetireWill(msg) | StageErr::Collision(msg),
+            ) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg)),
             Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad retire")),
         };
-        if !present {
+        if state.is_none() {
             return Ok(None);
         }
         let seq = self.next;
-        self.append_record(BrokerRecord {
-            seq,
-            producer_id,
-            producer_seq: 0,
-            subject: RETIRE_SUBJECT.to_string(),
-            body: subject.as_bytes().to_vec(),
-            commit: None,
-        })?;
+        self.append_record(BrokerRecord::marked_retire(seq, producer_id, subject))?;
         Ok(Some(seq))
     }
 
-    /// Stage a durable subject or wildcard-filter retirement ([`RETIRE_SUBJECT`]) into the
-    /// current group-commit batch. Mirrors [`retire_subject`](Self::retire_subject): returns
-    /// `(offset, false)` when staged, `(head, true)` when no matching subject was present in
-    /// `last` (idempotent no-op), or `Err` if `subject` is reserved or owned by a different
-    /// producer.
+    /// Stage a durable exact-subject retirement ([`RETIRE_SUBJECT`]) into the current
+    /// group-commit batch. Mirrors [`retire_subject`](Self::retire_subject): returns
+    /// `(offset, false)` when staged, `(head, true)` when `subject` was absent from
+    /// `last` (idempotent no-op), or `Err` on refusal.
     pub(crate) fn stage_retire(
         &mut self,
         producer_id: u64,
         subject: String,
     ) -> Result<(Offset, bool), StageErr> {
         self.check_poisoned_stage()?;
-        let present = self.check_retire_target(producer_id, &subject)?;
-        if !present {
+        let Some((_off, charged_pid)) = self.check_retire_target(producer_id, &subject)? else {
             let cur = self.next_staged_seq().unwrap_or(self.next);
             return Ok((cur, true));
-        }
+        };
         let seq = self.next_staged_seq().ok_or(StageErr::TooLarge)?;
-        self.stage_record(BrokerRecord {
-            seq,
-            producer_id,
-            producer_seq: 0,
-            subject: RETIRE_SUBJECT.to_string(),
-            body: subject.into_bytes(),
-            commit: None,
-        })?;
+        self.stage_record(BrokerRecord::marked_retire(seq, producer_id, &subject))?;
+        self.credit_staged_retire(charged_pid, subject);
         Ok((seq, false))
+    }
+
+    fn credit_staged_retire(&mut self, charged_pid: u64, subject: String) {
+        let mut removed_staged = false;
+        if let Some(set) = self.staged_new_subjects.get_mut(&charged_pid) {
+            if set.remove(&subject) {
+                removed_staged = true;
+                if set.is_empty() {
+                    self.staged_new_subjects.remove(&charged_pid);
+                }
+            }
+        }
+        if !removed_staged && self.last.contains_key(&subject) {
+            self.staged_retired_durable
+                .entry(charged_pid)
+                .or_default()
+                .insert(subject);
+        }
+    }
+
+    /// Stage a conditional [`Request::Retire`](crate::Request::Retire) (`DESIGN-aterm-fabric`
+    /// §5.2): returns `(offset, deduped, ungated)`:
+    /// - `ungated == true` when `subject` is absent and no unconfirmed retire of `subject`
+    ///   is in flight (`offset == visible_head`, `deduped == true`).
+    /// - `ungated == false` when a new marked retire record was staged (`deduped == false`),
+    ///   when `subject` was superseded by a newer record at `cur_off` (`deduped == true`),
+    ///   or when `subject` was retired by an unconfirmed retire at `r_off >= visible_head`
+    ///   (`deduped == true`).
+    pub(crate) fn stage_retire_conditional(
+        &mut self,
+        producer_id: u64,
+        subject: String,
+        offset: u64,
+        log: crate::LogIdentity,
+        visible_head: u64,
+    ) -> Result<(Offset, bool, bool), StageErr> {
+        self.check_poisoned_stage()?;
+        if self.replica {
+            return Err(StageErr::Replica(format!(
+                "retire for subject {subject:?} is refused here: this log is a replication target"
+            )));
+        }
+        if self.uncarried_cut_tainted {
+            return Err(StageErr::Cut(format!(
+                "{}retire for subject {subject:?} is refused on a log retention has cut (base = {})",
+                crate::proto::RETIRE_CUT_PREFIX,
+                self.base.0
+            )));
+        }
+        if is_hidden_subject(&subject) || subject.starts_with("/a/") || subject == "/a" {
+            return Err(StageErr::Reserved(subject));
+        }
+        if Subject::new(&subject).is_err() {
+            return Err(StageErr::BadSubject(format!("bad subject {subject:?}")));
+        }
+        if log != self.identity() {
+            return Err(StageErr::RetireLog(format!(
+                "{}log identity mismatch: request names {log}, broker serves {}",
+                crate::proto::RETIRE_LOG_PREFIX,
+                self.identity()
+            )));
+        }
+        match self.batch_subject_state(&subject) {
+            Some((cur_off, charged_pid)) => {
+                if offset > cur_off.0 {
+                    return Err(StageErr::RetireLog(format!(
+                        "{}offset {offset} is ahead of subject {subject:?}'s current offset {}",
+                        crate::proto::RETIRE_LOG_PREFIX,
+                        cur_off.0
+                    )));
+                }
+                if cur_off.0 >= self.next.0 || offset < cur_off.0 {
+                    // Moot: superseded by a newer record at `cur_off` (either in `last`
+                    // or staged earlier in this batch).
+                    return Ok((cur_off, true, false));
+                }
+                // `offset == cur_off.0` and `cur_off.0 < self.next.0`: matches the
+                // subject's current committed record.
+                if charged_pid != producer_id {
+                    return Err(StageErr::RetireCharged(format!(
+                        "{}subject {subject:?} is charged to producer {charged_pid}, not {producer_id}",
+                        crate::proto::RETIRE_CHARGED_PREFIX
+                    )));
+                }
+                if self.will_targets_subject(&subject) {
+                    return Err(StageErr::RetireWill(format!(
+                        "{}subject {subject:?} is targeted by a will that can still append",
+                        crate::proto::RETIRE_WILL_PREFIX
+                    )));
+                }
+                let seq = self.next_staged_seq().ok_or(StageErr::TooLarge)?;
+                self.stage_record(BrokerRecord::marked_retire(seq, producer_id, &subject))?;
+                self.credit_staged_retire(charged_pid, subject);
+                Ok((seq, false, false))
+            }
+            None => {
+                if offset >= self.next.0 {
+                    return Err(StageErr::RetireLog(format!(
+                        "{}offset {offset} is at or above log head {}",
+                        crate::proto::RETIRE_LOG_PREFIX,
+                        self.next.0
+                    )));
+                }
+                // Subject is absent in `batch_subject_state` and `offset < self.next.0`.
+                // If an unconfirmed retire in `self.staged` or retirement history
+                // (`retire_offset >= visible_head`) retired `subject`, gate the moot
+                // reply on that retire's offset so the caller does not receive `Ack`
+                // while `Last` still shows `subject`.
+                for rec in self.staged.iter().rev() {
+                    if retire_target(rec) == Some(subject.as_str()) {
+                        return Ok((rec.seq, true, false));
+                    }
+                }
+                if let Some(offset) = self.retire_history.pending(&subject, visible_head) {
+                    return Ok((Offset(offset), true, false));
+                }
+                Ok((Offset(visible_head), true, true))
+            }
+        }
     }
 
     /// Discard the staged (unsynced) batch, truncating the file back to `durable_len`
@@ -5323,27 +6498,45 @@ impl BrokerLog {
     /// seek back to the end) fails, the on-disk suffix is unknown: the log is POISONED
     /// and refuses every further mutation until reopened.
     pub(crate) fn abort_batch(&mut self) {
-        self.rollback_to(self.durable_len);
+        if let Some(why) = self.discard_batch() {
+            self.publish_poison(why, None);
+        }
+    }
+
+    /// [`abort_batch`](Self::abort_batch) but for the poison: the reason the rollback
+    /// could not be made, for a caller with more disk work to do before it publishes
+    /// the poison ([`commit_end`](Self::commit_end)'s failed flush, which records
+    /// `Lossy` first).
+    #[must_use]
+    fn discard_batch(&mut self) -> Option<String> {
+        let rolled = self.rollback_to(self.durable_len);
         self.staged.clear();
         self.staged_bytes.clear();
         self.staged_dedup.clear();
         self.staged_new_subjects.clear();
+        self.staged_retired_durable.clear();
         self.staged_bind.clear();
+        self.staged_live_wills.clear();
         self.staged_escalated = None;
         self.staged_held.clear();
+        rolled
     }
 
-    /// Truncate the file back to `len` durable bytes and reposition at its end;
-    /// poison the log if that cannot be done.
-    fn rollback_to(&mut self, len: u64) {
+    /// Truncate the file back to `len` durable bytes and reposition at its end. `Some`
+    /// names why that could not be done: the log must then be POISONED, which the
+    /// caller does ([`publish_poison`](Self::publish_poison)) once the rest of its
+    /// failure's disk work is done.
+    #[must_use]
+    fn rollback_to(&mut self, len: u64) -> Option<String> {
         let res = match self.truncate_to(len) {
             Ok(()) => self.file.seek_end(),
             Err(e) => Err(e),
         };
-        if let Err(e) = res {
-            self.poisoned = Some(format!(
+        match res {
+            Ok(()) => None,
+            Err(e) => Some(format!(
                 "could not roll the staged suffix back to {len} bytes: {e}"
-            ));
+            )),
         }
     }
 
@@ -5385,6 +6578,11 @@ impl BrokerLog {
         // when it returns Ok under Strict, and for an escalated record on any tier.
         self.prebind_watermark(&frame)?;
         let durable = self.append_frame(&frame, escalated)?;
+        update_durable_wills_on_record(
+            &mut self.durable_latest_wills,
+            &mut self.durable_wills_by_subject,
+            &rec,
+        );
         self.apply_retire(&rec);
         self.index_last(&rec);
         if let Some(c) = &rec.commit {
@@ -5402,6 +6600,34 @@ impl BrokerLog {
             self.release_held_commits();
         }
         self.cover_head()
+    }
+
+    /// Capture an owned view at an already PUBLISHED head. An old raw number is
+    /// refused once the owner advances its published floor; a captured view keeps
+    /// its retirement evidence across that advance and later lock acquisitions.
+    pub fn last_view_at(&self, visible: u64) -> Result<LastView, LastViewError> {
+        self.retire_history.view(visible)
+    }
+
+    /// Report the actual subscriber-visible head and release the store's obsolete
+    /// retirement ownership. This is an owner publication, NOT part of a read request.
+    /// A direct library owner must report its own held/quorum head; the broker calls
+    /// this from its existing locked publication paths. Drop returned garbage after
+    /// releasing any external log mutex. No old view is revoked by this publication.
+    pub fn publish_last_visible(&mut self, visible: u64) -> Result<LastViewGarbage, LastViewError> {
+        let promoted = self.head().0;
+        if visible > promoted {
+            return Err(LastViewError::AbovePromoted {
+                requested: visible,
+                promoted,
+            });
+        }
+        self.retire_history.advance(visible)
+    }
+
+    // The private broker constructor owns the newly recovered log exclusively.
+    pub(crate) fn start_last_visible(&mut self, visible: u64) {
+        self.retire_history.start_published(visible);
     }
 
     /// LAST-VALUE query (retained state): the most recent record of every subject
@@ -5430,12 +6656,18 @@ impl BrokerLog {
     /// [`read_from`](Self::read_from), so the caller writes them to a socket with the
     /// log lock released.
     ///
-    /// `visible` is the SUBSCRIBER-VISIBLE head, which the caller must read under the
-    /// same lock as this call. In the Strict/Relaxed tiers it is the durable head; in
-    /// the Replicated tier it LAGS it, and a subject whose newest record is at or
+    /// The view owns the SUBSCRIBER-VISIBLE head captured under the log lock and
+    /// remains owned through every lock-release round. Capture it with
+    /// [`last_view_at`](Self::last_view_at); raw older numbers return a typed error
+    /// after owner publication advances the available floor. The broker uses its
+    /// actual held/quorum head. A subject whose newest record is at or
     /// above it is OMITTED from the page rather than answered with a record the tail
     /// path would refuse to deliver — the same fail-closed direction as `tail_loop`.
     ///
+    /// Retirement-event visits and subject-index visits share `scan_max`. A
+    /// [`LastStep::Pending`] needs another bounded call with the SAME view and query;
+    /// it is never a complete empty page. Live views and returned `Arc` handles can
+    /// retain payloads; an indefinitely held view has no fixed memory bound.
     /// Hidden subjects are not in the index at all, so no filter can reach one.
     pub fn last_matching(
         &self,
@@ -5443,14 +6675,22 @@ impl BrokerLog {
         after: &str,
         max: usize,
         scan_max: usize,
-        visible: u64,
-    ) -> (Vec<Arc<BrokerRecord>>, Option<String>) {
+        view: &mut LastView,
+    ) -> Result<LastStep, LastViewError> {
+        self.retire_history.check(view)?;
+        view.bind(filter, after)?;
+        let visible = view.visible();
         let mut out = Vec::new();
         if max == 0 {
             // The head query: nothing is scanned and nothing is delivered, and there is
             // no page to continue — the only answer is the caller's `Mark`.
-            return (out, None);
+            return Ok(LastStep::Page(out, None));
         }
+        let mut work = scan_max;
+        if !view.drain(filter, after, &mut work) || work == 0 {
+            return Ok(LastStep::Pending);
+        }
+        let scan_max = work;
         let prefix = literal_prefix(filter);
         // `>=`, not `>`: a WILDCARD-FREE filter's literal prefix IS the only subject it
         // can match, so a resume cursor equal to the prefix must EXCLUDE it (with `>`
@@ -5461,29 +6701,101 @@ impl BrokerLog {
         } else {
             Bound::Included(prefix)
         };
+        // The view has drained this round's retirement events within the same work
+        // budget. Its owned overlay survives future head publication and compaction.
+        let overlay = &view.overlay;
         let mut visited = 0usize;
-        for (subject, off) in self.last.range::<str, _>((lower, Bound::Unbounded)) {
+        if overlay.is_empty() {
+            for (subject, off) in self.last.range::<str, _>((lower, Bound::Unbounded)) {
+                if !subject.starts_with(prefix) {
+                    break; // past the filter's literal prefix: nothing later can match
+                }
+                visited = visited.saturating_add(1);
+                let matched = off.0 < visible && filter.matches_str(subject);
+                if matched {
+                    let rec = match self.record_at(off.0) {
+                        Some(r) => Some(r),
+                        None => self.carried_last.get(subject),
+                    };
+                    if let Some(rec) = rec {
+                        out.push(rec.clone());
+                    }
+                }
+                if out.len() >= max || visited >= scan_max {
+                    // The resume cursor is the last entry VISITED, matched or not.
+                    return Ok(LastStep::Page(out, Some(subject.clone())));
+                }
+            }
+            return Ok(LastStep::Page(out, None));
+        }
+        let mut last_it = self
+            .last
+            .range::<str, _>((lower, Bound::Unbounded))
+            .peekable();
+        let mut over_it = overlay
+            .range::<str, _>((lower, Bound::Unbounded))
+            .peekable();
+        loop {
+            let next_entry: (&str, Option<&Arc<BrokerRecord>>, Option<Offset>) =
+                match (last_it.peek(), over_it.peek()) {
+                    (None, None) => break,
+                    (Some((ls, lo)), None) => {
+                        let s = ls.as_str();
+                        let o = **lo;
+                        last_it.next();
+                        (s, None, Some(o))
+                    }
+                    (None, Some((os, orec))) => {
+                        let s = os.as_str();
+                        let r = *orec;
+                        over_it.next();
+                        (s, Some(r), None)
+                    }
+                    (Some((ls, lo)), Some((os, orec))) => {
+                        let ls_str = ls.as_str();
+                        let os_str = os.as_str();
+                        if ls_str < os_str {
+                            let o = **lo;
+                            last_it.next();
+                            (ls_str, None, Some(o))
+                        } else if os_str < ls_str {
+                            let r = *orec;
+                            over_it.next();
+                            (os_str, Some(r), None)
+                        } else {
+                            let r = *orec;
+                            last_it.next();
+                            over_it.next();
+                            (os_str, Some(r), None)
+                        }
+                    }
+                };
+            let (subject, over_rec, last_off) = next_entry;
             if !subject.starts_with(prefix) {
-                break; // past the filter's literal prefix: nothing later can match
+                break;
             }
             visited = visited.saturating_add(1);
-            let matched = off.0 < visible && filter.matches_str(subject);
-            if matched {
-                let rec = match self.record_at(off.0) {
-                    Some(r) => Some(r),
-                    None => self.carried_last.get(subject),
-                };
-                if let Some(rec) = rec {
+            if let Some(rec) = over_rec {
+                if filter.matches_str(subject) {
                     out.push(rec.clone());
+                }
+            } else if let Some(off) = last_off {
+                if off.0 < visible && filter.matches_str(subject) {
+                    let rec = match self.record_at(off.0) {
+                        Some(r) => Some(r),
+                        None => self.carried_last.get(subject),
+                    };
+                    if let Some(rec) = rec {
+                        out.push(rec.clone());
+                    }
                 }
             }
             if out.len() >= max || visited >= scan_max {
-                // The resume cursor is the last entry VISITED, matched or not.
-                return (out, Some(subject.clone()));
+                return Ok(LastStep::Page(out, Some(subject.to_string())));
             }
         }
         // The range ran out: the answer is complete, so there is nothing to resume.
-        (out, None)
+        Ok(LastStep::Page(out, None))
     }
 
     /// BOUNDED READ: at most `max` records matching `filter` with offset >= `from`,
@@ -5521,7 +6833,7 @@ impl BrokerLog {
         while off < limit {
             next = off.saturating_add(1);
             if let Some(rec) = self.record_at(off) {
-                if !is_hidden_subject(&rec.subject) && filter.matches_str(&rec.subject) {
+                if !is_hidden_record(rec) && filter.matches_str(&rec.subject) {
                     out.push(rec.clone());
                     if out.len() >= max {
                         break;
@@ -5578,14 +6890,17 @@ impl BrokerLog {
     /// the base (the earliest retained record), and may re-read records it had already
     /// committed.
     ///
-    /// Cold + explicit: no batch may be staged. The kept suffix is rewritten
-    /// atomically (tmp + rename); then the base floor (and, under anti-rollback, the
-    /// re-identified watermark) is advanced. An in-process failure after the rewrite
-    /// POISONS the log. A CRASH in the small window between the log rewrite and the
-    /// base/watermark update leaves them disagreeing, which the next open REFUSES
-    /// (fail-safe — no acked data is silently dropped); recover by restoring the log
-    /// file from a backup (NOT `open_repair`, which is keyless and would truncate an
-    /// encrypted log). Do retention on a broker you can restart, off the ack path.
+    /// No batch may be staged. CRASH-SAFE (`compact.rs`): the kept suffix is copied, in
+    /// bounded chunks, to `<log>.kept` with the log's permissions and flushed; an intent,
+    /// `<log>.compact`, is made durable; the copy is renamed over the log; then the base
+    /// (and, under anti-rollback, the re-identified watermark) is advanced and the intent
+    /// removed. An open after a crash anywhere in that finishes the compaction or
+    /// discards it, from the intent and the log's first frame, so no crash leaves a log
+    /// that refuses to open. A failure before the rename leaves the log untouched; an
+    /// in-process failure after it POISONS the log until it is reopened, and the reopen
+    /// finishes the compaction. Called here, on the log, the whole copy runs inside this
+    /// call; a broker runs the bulk of it off the ack path
+    /// ([`Broker::retain_before`](crate::Broker::retain_before)).
     #[cfg(feature = "retention")]
     pub fn retain_before(&mut self, min_offset: Offset) -> io::Result<u64> {
         self.compact_to(min_offset, false)
@@ -5599,14 +6914,38 @@ impl BrokerLog {
     ///
     /// Unlike [`Self::retain_before`], this never stops at an early `/a/bind` or
     /// pending `/a/will` record, and preserves `Last` of quiet subjects across
-    /// compaction and restart (`REQUIREMENTS` R4).
+    /// compaction and restart (`REQUIREMENTS` R4). Crash-safe as `retain_before` is: the
+    /// carried state is staged at `<log>.state.next` before the intent, and installed
+    /// over `<log>.state` after the rename.
     #[cfg(feature = "retention")]
     pub fn retain_before_carrying_state(&mut self, min_offset: Offset) -> io::Result<u64> {
         self.compact_to(min_offset, true)
     }
 
+    /// A whole compaction on this thread: begin, copy, finish.
     #[cfg(feature = "retention")]
     fn compact_to(&mut self, min_offset: Offset, carry_state: bool) -> io::Result<u64> {
+        let Some(mut c) = self.compact_begin(min_offset, carry_state)? else {
+            return Ok(0);
+        };
+        if let Err(e) = c.copy() {
+            self.compact_abandon(c);
+            return Err(e);
+        }
+        self.compact_finish(c)
+    }
+
+    /// BEGIN a compaction to `min_offset`: settle the floor, refuse what a plain
+    /// compaction may not drop, and open its copy (`compact.rs`). `None` when the floor
+    /// drops nothing. What it returns borrows nothing of the log, so the broker runs its
+    /// [`copy`](Compaction::copy) with no lock held, and then
+    /// [`compact_finish`](Self::compact_finish)es it under the locks.
+    #[cfg(feature = "retention")]
+    pub(crate) fn compact_begin(
+        &mut self,
+        min_offset: Offset,
+        carry_state: bool,
+    ) -> io::Result<Option<Compaction>> {
         self.check_poisoned()?;
         if !self.staged.is_empty() {
             return Err(io::Error::other(
@@ -5615,116 +6954,132 @@ impl BrokerLog {
         }
         let min = crate::proto::compact_floor_monotone(min_offset.0.min(self.next.0), self.base.0);
         if min <= self.base.0 {
-            return Ok(0);
+            return Ok(None);
         }
         if !carry_state {
-            if let Some((off, what)) = self.retention_blocker(min) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "retention: the record at offset {off}, below the floor {min}, holds \
-                         {what}, which only that record keeps across a restart; the highest \
-                         floor retention can take now is {off}"
-                    ),
-                ));
-            }
+            self.refuse_retention_blocker(min)?;
         }
         let drop_count = min.saturating_sub(self.base.0);
-        let mut durable = std::fs::read(&self.path)?;
-        durable.truncate(self.durable_len as usize);
-        // Byte offset of the first KEPT record in the durable log.
-        let mut cut = 0usize;
-        for _ in 0..drop_count {
-            let Some(tail) = durable.get(cut..) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "retention: could not locate the cut point in the durable log",
-                ));
-            };
-            match Frame::decode(tail) {
-                Ok(Some(d)) if d.consumed > 0 => cut = cut.saturating_add(d.consumed),
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "retention: could not locate the cut point in the durable log",
-                    ))
-                }
-            }
-        }
-        let kept: Vec<u8> = match durable.get(cut..) {
-            Some(slice) => slice.to_vec(),
-            None => Vec::new(),
-        };
-        drop(durable);
+        let perms = self.file.os()?.metadata()?.permissions();
+        let copy = crate::compact::KeptCopy::begin(
+            &self.path,
+            &perms,
+            drop_count,
+            self.durable_len,
+            self.compact_seam.clone(),
+        )?;
+        Ok(Some(Compaction {
+            min,
+            carry: carry_state,
+            base: self.base.0,
+            drop_count,
+            perms,
+            copy,
+        }))
+    }
 
-        // When carrying state across compaction, persist `<log>.state` BEFORE replacing
-        // the log file so an I/O error writing the sidecar leaves the log untouched.
-        let new_carried = if carry_state {
-            let mut carried: HashMap<u64, (Offset, WillRecord)> = HashMap::new();
-            for (off, w) in self.pending_wills_below(min) {
-                carried.insert(w.producer_id, (off, w));
-            }
-            let mut carried_last: BTreeMap<String, Arc<BrokerRecord>> = BTreeMap::new();
-            for (subj, &off) in &self.last {
-                if off.0 < min {
-                    let rec = match self.record_at(off.0) {
-                        Some(r) => Some(r),
-                        None => self.carried_last.get(subj),
-                    };
-                    if let Some(rec) = rec {
-                        carried_last.insert(subj.clone(), Arc::clone(rec));
-                    }
-                }
-            }
+    /// A plain compaction to `min` refused, naming the record it may not drop.
+    #[cfg(feature = "retention")]
+    fn refuse_retention_blocker(&self, min: u64) -> io::Result<()> {
+        if let Some((off, what)) = self.retention_blocker(min) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "retention: the record at offset {off}, below the floor {min}, holds \
+                     {what}, which only that record keeps across a restart; the highest \
+                     floor retention can take now is {off}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// FINISH a compaction whose copy has run, between batches (the broker holds its
+    /// batch lock and the log lock): copy what was appended since the begin, stage the
+    /// carried state, write the intent, switch the files, and only then move the state in
+    /// memory. Each durable step is a crash point of the seam; see `compact.rs` for the
+    /// order and for what an open does after a crash at each.
+    #[cfg(feature = "retention")]
+    pub(crate) fn compact_finish(&mut self, mut c: Compaction) -> io::Result<u64> {
+        use crate::compact::{staged_state_path, write_intent, Intent, Step};
+        if let Err(e) = self.compact_ready(&c) {
+            self.compact_abandon(c);
+            return Err(e);
+        }
+        // 1) The bytes the log took since the begin, and their flush: the unlocked copy
+        //    flushed the rest, so this flush covers only the delta.
+        if let Err(e) = c.copy.extend_to(self.durable_len) {
+            self.compact_abandon(c);
+            return Err(e);
+        }
+        if let Err(e) = c.copy.flush() {
+            self.compact_abandon(c);
+            return Err(e);
+        }
+        self.compact_crash(Step::Copy)?;
+        let (Some(old), Some(cut)) = (c.copy.old(), c.copy.cut()) else {
+            self.compact_abandon(c);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retention: could not locate the cut point in the durable log",
+            ));
+        };
+        // 2) The carried state, staged at the new base: written BEFORE the intent, so an
+        //    intent that carries state always has it beside it.
+        let carried = if c.carry {
+            let (wills, last, charges) = self.carried_below(c.min);
             let state = CompactedState {
                 bind: self.bind.clone(),
-                carried_wills: carried.clone(),
+                carried_wills: wills.clone(),
                 high_water: self.high_water.clone(),
                 group_commits: self.group_commits.clone(),
-                carried_last: carried_last.clone(),
+                carried_last: last.clone(),
+                carried_charges: charges.clone(),
+                uncarried_cut_tainted: self.uncarried_cut_tainted,
             };
-            write_state(&self.path, self.at_rest_key.as_ref(), min, &state)?;
-            Some((carried, carried_last))
+            let staged = staged_state_path(&self.path);
+            let key = self.at_rest_key.as_ref();
+            if let Err(e) = write_state_at(&staged, key, c.min, &state, Some(&c.perms)) {
+                self.compact_abandon(c);
+                return Err(e);
+            }
+            self.compact_crash(Step::State)?;
+            Some((wills, last, charges))
         } else {
             None
         };
-
-        // 1) Rewrite the log to the kept suffix, atomically (tmp + rename), then reopen
-        //    and re-lock the new file (the old inode is now unlinked).
-        let mut tmp = self.path.clone();
-        tmp.as_mut_os_string().push(".compact");
-        // The copy REPLACES the log, so it carries the log's permissions — and is
-        // created with them (then set exactly, past the umask), so the kept records
-        // are never readable more widely than the log they came from, even briefly.
-        let perms = self.file.os()?.metadata()?.permissions();
-        {
-            let mut opts = FsOpenOptions::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-                opts.mode(perms.mode());
-            }
-            let mut f = create_fresh(&tmp, &mut opts)?;
-            f.set_permissions(perms)?;
-            f.write_all(&kept)?;
-            f.sync_all()?;
-        }
-        rename_path(&tmp, &self.path)?;
-
-        // From here the on-disk log is ALREADY compacted, so any failure leaves the
-        // in-memory state and the base/watermark sidecars possibly disagreeing with it.
-        // Do the remaining durable I/O FIRST, and POISON on any failure — the log then
-        // refuses every further op until it is reopened (whereupon a base/log mismatch
-        // is a fail-safe REFUSE, never silent loss). `next`/head is unchanged (front prune).
-        if let Err(e) = self.finish_retention(min) {
-            self.poisoned = Some(format!("retention compaction failed after rewrite: {e}"));
+        // 3) The intent, durable before the rename.
+        let intent = Intent {
+            old_base: self.base.0,
+            new_base: c.min,
+            old,
+            new: c.copy.first(),
+            carries_state: c.carry,
+        };
+        if let Err(e) = write_intent(&self.path, self.at_rest_key.as_ref(), &intent, &c.perms) {
+            self.compact_abandon(c);
             return Err(e);
         }
-
-        // In-memory state (infallible): re-base + drop pruned records and their
-        // still-theirs dedup keys, then re-write the anti-rollback watermark to the NEW
-        // first-record identity (also fail-closed -> poison).
-        let drain_len = usize::try_from(drop_count)
+        self.compact_crash(Step::Intent)?;
+        // 4) The switch. A failed rename leaves the log as it was.
+        if let Err(e) = rename_path(c.copy.kept(), &self.path) {
+            self.compact_abandon(c);
+            return Err(e);
+        }
+        // From here the on-disk log is ALREADY compacted: the rest of the durable I/O
+        // runs FIRST, and any failure POISONS the log — it refuses every further op until
+        // it is reopened, and the reopen finishes the compaction from the intent.
+        // `next`/head is unchanged (a front prune).
+        if let Err(e) = self.compact_switch(&c, &intent) {
+            self.publish_poison(
+                format!("retention compaction failed after rewrite: {e}"),
+                None,
+            );
+            return Err(e);
+        }
+        // 5) In memory (infallible): re-base, drop the pruned records and their
+        //    still-theirs dedup keys, take the carried state and the new identity.
+        let drain_len = usize::try_from(c.drop_count)
             .unwrap_or(self.records.len())
             .min(self.records.len());
         let old_records = std::mem::take(&mut self.records);
@@ -5739,13 +7094,16 @@ impl BrokerLog {
                 self.records.push(rec);
             }
         }
-        if let Some((carried_wills, carried_last)) = new_carried {
+        if let Some((carried_wills, carried_last, carried_charges)) = carried {
             self.carried_wills = carried_wills;
             self.carried_last = carried_last;
+            self.carried_charges = carried_charges;
         } else {
+            self.uncarried_cut_tainted = true;
+            self.carried_charges.clear();
             let mut drop_carried = Vec::new();
             for (k, r) in &self.carried_last {
-                if r.seq.0 < min {
+                if r.seq.0 < c.min {
                     drop_carried.push(k.clone());
                 }
             }
@@ -5753,34 +7111,158 @@ impl BrokerLog {
                 self.carried_last.remove(&k);
             }
         }
-        self.durable_len = kept.len() as u64;
+        self.durable_len = self.durable_len.saturating_sub(cut);
         self.newest_at = match self.newest_at {
-            Some(at) => at.checked_sub(cut as u64),
+            Some(at) => at.checked_sub(cut),
             None => None,
         };
-        self.log_id = log_identity(&kept);
-        self.base = Offset(min);
-        if let Err(e) = self.advance_watermark() {
-            self.poisoned = Some(format!("retention: watermark update failed: {e}"));
-            return Err(e);
-        }
-        Ok(drop_count)
+        self.log_id = match intent.new {
+            Some(n) => n.tag,
+            None => [0u8; 16],
+        };
+        self.base = Offset(c.min);
+        Ok(c.drop_count)
     }
 
-    /// Reopen + re-lock the freshly-compacted log and durably record the new base
-    /// floor. Split out so a failure here is caught and poisons the log.
+    /// Whether the log is still the one `c` began on, between batches.
     #[cfg(feature = "retention")]
-    fn finish_retention(&mut self, min: u64) -> io::Result<()> {
-        // Make the rename durable, reopen + re-lock the new inode (the old is now
-        // unlinked), and record the new base — all inside the caller's poison guard, so
-        // an in-process failure at ANY step (including this directory fsync) poisons the
-        // log rather than leaving it serving on the dead inode.
+    fn compact_ready(&self, c: &Compaction) -> io::Result<()> {
+        self.check_poisoned()?;
+        if !self.staged.is_empty() {
+            return Err(io::Error::other(
+                "retention: a batch is staged; compact when idle",
+            ));
+        }
+        if self.base.0 != c.base {
+            return Err(io::Error::other(
+                "retention: the log was compacted while this compaction copied it",
+            ));
+        }
+        if !c.carry {
+            self.refuse_retention_blocker(c.min)?;
+        }
+        Ok(())
+    }
+
+    /// The pending wills, the quiet subjects' latest records, and the charged producer
+    /// per live subject below `min`: what a carrying compaction to `min` keeps in
+    /// `<log>.state`.
+    #[cfg(feature = "retention")]
+    fn carried_below(&self, min: u64) -> (CarriedWills, CarriedLast, CarriedCharges) {
+        let mut carried: CarriedWills = HashMap::new();
+        for (off, w) in self.pending_wills_below(min) {
+            carried.insert(w.producer_id, (off, w));
+        }
+        let mut carried_last: CarriedLast = BTreeMap::new();
+        for (subj, &off) in &self.last {
+            if off.0 < min {
+                let rec = match self.record_at(off.0) {
+                    Some(r) => Some(r),
+                    None => self.carried_last.get(subj),
+                };
+                if let Some(rec) = rec {
+                    carried_last.insert(subj.clone(), Arc::clone(rec));
+                }
+            }
+        }
+        let mut carried_charges: CarriedCharges = self.carried_charges.clone();
+        for rec in &self.records {
+            if rec.seq.0 >= min {
+                break;
+            }
+            if let Some(target) = retire_target(rec) {
+                carried_charges.remove(target);
+            } else if !is_hidden_record(rec) {
+                carried_charges
+                    .entry(rec.subject.clone())
+                    .or_insert(rec.producer_id);
+            }
+        }
+        (carried, carried_last, carried_charges)
+    }
+
+    /// Steps 4 (its directory flush) to 8 of the switch: the log is already the kept
+    /// suffix on disk. Reopen and re-lock the new inode (the old one is unlinked), install
+    /// the carried state, record the base, re-identify the watermark, remove the intent.
+    #[cfg(feature = "retention")]
+    fn compact_switch(
+        &mut self,
+        c: &Compaction,
+        intent: &crate::compact::Intent,
+    ) -> io::Result<()> {
+        use crate::compact::{remove_intent, staged_state_path, Step};
         sync_parent_dir(&self.path)?;
+        self.compact_crash(Step::Rename)?;
         let newf = open_with_options(FsOpenOptions::new().read(true).write(true), &self.path)?;
         lock_exclusive(&newf, &self.path)?;
         self.file = Backing::from_file(newf);
         self.file.seek_end()?;
-        write_base(&self.path, min)
+        if c.carry {
+            let state = state_path(&self.path);
+            rename_path(&staged_state_path(&self.path), &state)?;
+            sync_parent_dir(&state)?;
+            self.compact_crash(Step::StateInstalled)?;
+        }
+        write_base(&self.path, c.min)?;
+        self.compact_crash(Step::Base)?;
+        if self.compact_watermark(c.min, intent)? {
+            self.compact_crash(Step::Watermark)?;
+        }
+        remove_intent(&self.path)?;
+        self.compact_crash(Step::IntentRemoved)
+    }
+
+    /// Re-identify the anti-rollback watermark to the kept suffix's first frame at the
+    /// new base `min`; `false` when none was written. A verified log writes its own, at
+    /// its head. A keyed log that does not verify moves a watermark a verified open keeps
+    /// beside it all the same, its head kept (`compact::reidentify`), or the next
+    /// verified open would refuse a log this compaction left whole.
+    #[cfg(all(feature = "retention", feature = "anti-rollback"))]
+    fn compact_watermark(&self, min: u64, intent: &crate::compact::Intent) -> io::Result<bool> {
+        let Some(key) = self.at_rest_key.as_ref() else {
+            return Ok(false);
+        };
+        let Some(hw) = &self.head_watermark else {
+            return crate::compact::reidentify(&self.path, Some(key), intent, false);
+        };
+        let tag = match intent.new {
+            Some(n) => n.tag,
+            None => [0u8; 16],
+        };
+        write_watermark(hw, key, &tag, min, self.next.0)?;
+        Ok(true)
+    }
+
+    #[cfg(all(feature = "retention", not(feature = "anti-rollback")))]
+    fn compact_watermark(&self, _min: u64, _intent: &crate::compact::Intent) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    /// The seam's injected crash after `step`: the log is poisoned and nothing more is
+    /// done or undone, which is what a process that died there leaves.
+    #[cfg(feature = "retention")]
+    fn compact_crash(&mut self, step: crate::compact::Step) -> io::Result<()> {
+        if let Err(e) = self.compact_seam.crash(step) {
+            self.publish_poison(e.to_string(), None);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Give a compaction up before its switch: the intent, the staged state and the copy
+    /// are removed (best-effort: an open discards or clears any of them it finds), and the
+    /// log, its base, its state and its watermark were never touched.
+    #[cfg(feature = "retention")]
+    fn compact_abandon(&self, c: Compaction) {
+        let _ = crate::compact::remove_intent(&self.path);
+        let _ = remove_file_path(&crate::compact::staged_state_path(&self.path));
+        c.abandon();
+    }
+
+    /// Arm the compaction's seam (`compact.rs`).
+    #[cfg(all(test, feature = "retention"))]
+    pub(crate) fn arm_compact_seam(&mut self, seam: crate::compact::Seam) {
+        self.compact_seam = seam;
     }
 
     /// Hand out every committed record with `seq >= start` (from the earliest retained
@@ -5825,7 +7307,7 @@ impl BrokerLog {
             return false;
         };
         for r in recs {
-            if !is_hidden_subject(&r.subject) {
+            if !is_hidden_record(r) {
                 return true;
             }
         }
@@ -5925,15 +7407,21 @@ impl BrokerLog {
             self.flush_owed()
         };
         if let Err(e) = self.file.write_all(frame_bytes) {
-            self.rollback_to(committed);
+            if let Some(why) = self.rollback_to(committed) {
+                self.publish_poison(why, None);
+            }
             return Err(e);
         }
         let durable = match self.issue(flush) {
             Ok(durable) => durable,
             Err(e) => {
-                self.rollback_to(committed);
+                // The rollback, then the `Lossy` record, then the poison: as in
+                // `commit_end`.
+                let rolled = self.rollback_to(committed);
                 if self.durable_head < self.next.0 {
-                    self.flush_failed_lossy(&e);
+                    self.flush_failed_lossy(&e, rolled);
+                } else if let Some(why) = rolled {
+                    self.publish_poison(why, None);
                 }
                 return Err(e);
             }
@@ -6710,7 +8198,7 @@ mod tests {
         let err = BrokerLog::open(&path).err().expect("must refuse to open");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
         drop(first);
-        let again = BrokerLog::open(&path).unwrap();
+        let mut again = BrokerLog::open(&path).unwrap();
         // An explicit unlock (what the broker does at shutdown) releases it early too.
         again.unlock();
         let third = BrokerLog::open(&path).unwrap();
@@ -7582,7 +9070,15 @@ mod tests {
             assert_eq!(log.group_start("g1"), Offset(11));
             // `Last` of the quiet subject `/a/s/1` (written at offset 3 < base 4) still answers!
             let all = Filter::new("/a/s/*").unwrap();
-            let (page, _) = log.last_matching(&all, "", 10, 100, log.head().0);
+            let (page, _) = {
+                let last_head = log.head().0;
+                drop(log.publish_last_visible(last_head).unwrap());
+                let mut last_view = log.last_view_at(last_head).unwrap();
+                log.last_matching(&all, "", 10, 100, &mut last_view)
+                    .unwrap()
+                    .into_page()
+                    .expect("the fixed fixture fits one bounded step")
+            };
             let got: Vec<(&str, u64, &[u8])> = page
                 .iter()
                 .map(|r| (r.subject.as_str(), r.seq.0, &r.body[..]))
@@ -7603,7 +9099,15 @@ mod tests {
         assert_eq!(log.pending_wills(), vec![will.clone()]);
         assert_eq!(log.group_start("g1"), Offset(11));
         let all = Filter::new("/a/s/*").unwrap();
-        let (page, _) = log.last_matching(&all, "", 10, 100, log.head().0);
+        let (page, _) = {
+            let last_head = log.head().0;
+            drop(log.publish_last_visible(last_head).unwrap());
+            let mut last_view = log.last_view_at(last_head).unwrap();
+            log.last_matching(&all, "", 10, 100, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        };
         let got: Vec<(&str, u64, &[u8])> = page
             .iter()
             .map(|r| (r.subject.as_str(), r.seq.0, &r.body[..]))
@@ -7663,9 +9167,10 @@ mod tests {
             assert_eq!(off3, orig_off);
         }
     }
-    /// Retirement observes all preceding staged records, just as commit will apply them.
+    /// Retirement observes the subject charge after preceding staged records, and
+    /// invalid targets cannot mutate that state.
     #[test]
-    fn staged_retirement_uses_the_preceding_effective_last_owner() {
+    fn staged_retire_uses_the_preceding_subject_charge_and_refuses_invalid_targets() {
         let root = crate::test_scratch::Scratch::new("retire-order");
         let subject = "/t/session/presence";
         let mut ordinary =
@@ -7676,12 +9181,26 @@ mod tests {
         ordinary.stage_retire(1, subject.into()).unwrap();
         ordinary.commit_batch().unwrap();
         let filter = Filter::new("/t/session/>").unwrap();
-        assert!(ordinary
-            .last_matching(&filter, "", 8, 8, ordinary.head().0)
-            .0
-            .is_empty());
-        let mut observations = Vec::new();
-        for (n, target) in [subject, "/t/session/>"].into_iter().enumerate() {
+        let current_last = |log: &mut BrokerLog| {
+            let head = log.head().0;
+            drop(log.publish_last_visible(head).unwrap());
+            let mut view = log.last_view_at(head).unwrap();
+            log.last_matching(&filter, "", 8, 8, &mut view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+                .0
+        };
+        assert!(current_last(&mut ordinary).is_empty());
+        for (n, target) in [subject, "/t/session/>", "/a/session/presence"]
+            .into_iter()
+            .enumerate()
+        {
+            let invalid = |result: Result<(Offset, bool), StageErr>| match n {
+                1 => assert!(matches!(result, Err(StageErr::BadSubject(_)))),
+                2 => assert!(matches!(result, Err(StageErr::Reserved(_)))),
+                _ => unreachable!(),
+            };
             let mut fresh =
                 BrokerLog::open_with(root.path().join(format!("fresh-{n}")), Durability::Relaxed)
                     .unwrap();
@@ -7689,15 +9208,22 @@ mod tests {
                 .stage_publish(1, 1, subject.into(), b"new".to_vec())
                 .unwrap();
             let retired = fresh.stage_retire(1, target.into());
-            let accepted = retired.is_ok_and(|(_, absent)| !absent);
+            if n == 0 {
+                assert!(!retired.unwrap().1);
+            } else {
+                invalid(retired);
+            }
             fresh.commit_batch().unwrap();
-            observations.push(
-                accepted
-                    && fresh
-                        .last_matching(&filter, "", 8, 8, fresh.head().0)
-                        .0
-                        .is_empty(),
-            );
+            let page = current_last(&mut fresh);
+            if n == 0 {
+                assert!(page.is_empty());
+                assert_eq!(fresh.subjects_per_producer(1), 0);
+            } else {
+                assert_eq!(page.len(), 1);
+                assert_eq!(page[0].producer_id, 1);
+                assert_eq!(page[0].body, b"new");
+                assert_eq!(fresh.subjects_per_producer(1), 1);
+            }
 
             let mut changed = BrokerLog::open_with(
                 root.path().join(format!("changed-{n}")),
@@ -7710,18 +9236,25 @@ mod tests {
             changed
                 .stage_publish(2, 1, subject.into(), b"new owner".to_vec())
                 .unwrap();
-            let refused = matches!(
-                changed.stage_retire(1, target.into()),
-                Err(StageErr::Collision(_))
-            );
+            // An update changes the latest writer, not the producer charged for
+            // introducing the subject. That updater cannot retire the entry.
+            let retired = changed.stage_retire(2, target.into());
+            if n == 0 {
+                assert!(matches!(retired, Err(StageErr::RetireCharged(_))));
+            } else {
+                invalid(retired);
+            }
             changed.commit_batch().unwrap();
-            let page = changed.last_matching(&filter, "", 8, 8, changed.head().0).0;
-            observations.push(
-                refused
-                    && page.len() == 1
-                    && page[0].producer_id == 2
-                    && page[0].body == b"new owner",
-            );
+            let page = current_last(&mut changed);
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].producer_id, 2);
+            assert_eq!(page[0].body, b"new owner");
+            assert_eq!(changed.subjects_per_producer(1), 1);
+            assert_eq!(changed.subjects_per_producer(2), 0);
+            assert!(!changed.stage_retire(1, subject.into()).unwrap().1);
+            changed.commit_batch().unwrap();
+            assert!(current_last(&mut changed).is_empty());
+            assert_eq!(changed.subjects_per_producer(1), 0);
 
             let mut replaced = BrokerLog::open_with(
                 root.path().join(format!("replaced-{n}")),
@@ -7731,26 +9264,297 @@ mod tests {
             replaced
                 .publish(1, 1, subject.into(), b"old".to_vec())
                 .unwrap();
-            replaced.stage_retire(1, target.into()).unwrap();
+            if n != 0 {
+                invalid(replaced.stage_retire(1, target.into()));
+            }
+            assert!(!replaced.stage_retire(1, subject.into()).unwrap().1);
             replaced
                 .stage_publish(2, 1, subject.into(), b"after retire".to_vec())
                 .unwrap();
-            let refused = matches!(
-                replaced.stage_retire(1, target.into()),
-                Err(StageErr::Collision(_))
-            );
+            // A retire followed by a new introduction transfers the charge.
+            let retired = replaced.stage_retire(1, target.into());
+            if n == 0 {
+                assert!(matches!(retired, Err(StageErr::RetireCharged(_))));
+            } else {
+                invalid(retired);
+            }
             replaced.commit_batch().unwrap();
-            let page = replaced
-                .last_matching(&filter, "", 8, 8, replaced.head().0)
-                .0;
-            observations.push(
-                refused
-                    && page.len() == 1
-                    && page[0].producer_id == 2
-                    && page[0].body == b"after retire",
-            );
+            let page = current_last(&mut replaced);
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].producer_id, 2);
+            assert_eq!(page[0].body, b"after retire");
+            assert_eq!(replaced.subjects_per_producer(1), 0);
+            assert_eq!(replaced.subjects_per_producer(2), 1);
+            assert!(!replaced.stage_retire(2, subject.into()).unwrap().1);
+            replaced.commit_batch().unwrap();
+            assert!(current_last(&mut replaced).is_empty());
+            assert_eq!(replaced.subjects_per_producer(2), 0);
         }
-        assert_eq!(observations, vec![true; 6]);
+    }
+
+    #[test]
+    fn marked_vs_unmarked_retire_record_and_pending_retire_visible_head_gating() {
+        use crate::brecord::{COMMIT_TAG_RETIRE, RETIRE_PRODUCER_SEQ};
+
+        // 1. Marked retire wire encoding vs unmarked `/a/retire`:
+        let marked = BrokerRecord::marked_retire(Offset(7), 42, "/f/local/pub/n-1/s1/ev");
+        assert!(marked.is_marked_retire());
+        assert!(is_hidden_record(&marked));
+        assert_eq!(marked.producer_seq, RETIRE_PRODUCER_SEQ);
+        let payload = marked.encode_payload().unwrap();
+        assert_eq!(*payload.last().unwrap(), COMMIT_TAG_RETIRE);
+        let (decoded, _) = BrokerRecord::from_payload_marked(&payload).unwrap();
+        assert!(decoded.is_marked_retire());
+
+        // An unmarked payload (commit_tag = 0) with `producer_seq == RETIRE_PRODUCER_SEQ` is rejected:
+        let mut forged_unmarked = payload.clone();
+        *forged_unmarked.last_mut().unwrap() = 0;
+        assert!(BrokerRecord::from_payload_marked(&forged_unmarked).is_none());
+
+        // Unmarked `/a/retire` record (e.g. written before `/a/retire` was reserved):
+        let unmarked = BrokerRecord {
+            seq: Offset(1),
+            producer_id: 42,
+            producer_seq: 9,
+            subject: "/a/retire".into(),
+            body: b"/f/local/pub/n-1/s1/ev".to_vec(),
+            commit: None,
+        };
+        assert!(!unmarked.is_marked_retire());
+        assert!(!is_hidden_record(&unmarked));
+
+        // Write a raw log containing (0) a publish on `/f/local/pub/n-1/s1/ev` and
+        // (1) an UNMARKED `/a/retire` record whose body names `/f/local/pub/n-1/s1/ev`.
+        // Reopening the log must NOT retire `/f/local/pub/n-1/s1/ev`!
+        let root = crate::test_scratch::Scratch::new("retire-marked-gating");
+        let log_path = root.path().join("log");
+        {
+            let rec0 = BrokerRecord {
+                seq: Offset(0),
+                producer_id: 42,
+                producer_seq: 1,
+                subject: "/f/local/pub/n-1/s1/ev".into(),
+                body: b"still-live".to_vec(),
+                commit: None,
+            };
+            let mut raw = Vec::new();
+            raw.extend_from_slice(&rec0.encode().unwrap());
+            raw.extend_from_slice(&unmarked.encode().unwrap());
+            std::fs::write(&log_path, &raw).unwrap();
+        }
+        let mut reopened = BrokerLog::open_with(&log_path, Durability::Relaxed).unwrap();
+        let f_pub = Filter::new("/f/local/pub/>").unwrap();
+        let (rows, _) = {
+            let last_head = reopened.head().0;
+            drop(reopened.publish_last_visible(last_head).unwrap());
+            let mut last_view = reopened.last_view_at(last_head).unwrap();
+            reopened
+                .last_matching(&f_pub, "", 8, 8, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "unmarked /a/retire record must not retire target"
+        );
+        assert_eq!(rows[0].body, b"still-live");
+        let fetched = reopened.read_from(Offset(0));
+        assert_eq!(
+            fetched.len(),
+            2,
+            "unmarked /a/retire record remains visible in read_from"
+        );
+
+        // The immediately previous writer emitted this seq-zero/tag-zero header.
+        // It is reserved in both live admission and recovery, not inferred from body text.
+        let mut legacy = unmarked.clone();
+        legacy.producer_seq = 0;
+        assert!(!legacy.is_marked_retire());
+        assert!(is_hidden_record(&legacy));
+        assert_eq!(*legacy.encode_payload().unwrap().last().unwrap(), 0);
+        assert!(matches!(
+            reopened.stage_publish(42, 0, RETIRE_SUBJECT.into(), legacy.body.clone()),
+            Err(StageErr::Reserved(_))
+        ));
+        assert!(reopened
+            .publish(42, 0, RETIRE_SUBJECT.into(), legacy.body.clone())
+            .is_err());
+        let mut next_legacy = legacy.clone();
+        next_legacy.seq = reopened.head();
+        assert!(matches!(
+            reopened.stage_replica(next_legacy),
+            Err(StageErr::ReservedReplica(_))
+        ));
+        assert_eq!(
+            reopened.head().0,
+            2,
+            "no new data with the reserved header was acknowledged"
+        );
+
+        // A captured previous-writer log keeps its acknowledged retirement after open.
+        let old_path = root.path().join("old-retirement");
+        let mut old_bytes = fetched[0].encode().unwrap();
+        old_bytes.extend_from_slice(&legacy.encode().unwrap());
+        std::fs::write(&old_path, old_bytes).unwrap();
+        let mut old = BrokerLog::open_with(&old_path, Durability::Relaxed).unwrap();
+        assert!({
+            let last_head = old.head().0;
+            drop(old.publish_last_visible(last_head).unwrap());
+            let mut last_view = old.last_view_at(last_head).unwrap();
+            old.last_matching(&f_pub, "", 8, 8, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        }
+        .0
+        .is_empty());
+        assert_eq!(old.subjects_per_producer(42), 0);
+        // Raw history retains internal commands for replication. The bounded public
+        // fetch applies the subscriber filter while advancing past hidden offsets.
+        assert_eq!(old.read_from(Offset(0)).len(), 2);
+        let all = Filter::new("/>").unwrap();
+        let head = old.head().0;
+        let (delivered, next) = old.fetch(0, &all, 8, 8, head);
+        assert_eq!((delivered.len(), next, head), (1, 2, 2));
+        assert_eq!(delivered[0].seq, Offset(0));
+        assert_eq!(delivered[0].subject, "/f/local/pub/n-1/s1/ev");
+        assert_eq!(delivered[0].body, b"still-live");
+        drop(old);
+
+        // A declared replica applies the same legacy command immediately, not only on reopen.
+        let replica_path = root.path().join("legacy-replica");
+        std::fs::write(&replica_path, fetched[0].encode().unwrap()).unwrap();
+        let mut replica = BrokerLog::open_with(&replica_path, Durability::Relaxed).unwrap();
+        replica.declare_replica().unwrap();
+        for body in [vec![0xff], b"/t/>".to_vec(), b"/a/will".to_vec()] {
+            let mut invalid = legacy.clone();
+            invalid.body = body;
+            assert!(matches!(
+                replica.stage_replica(invalid),
+                Err(StageErr::BadSubject(_))
+            ));
+            assert_eq!(replica.head().0, 1);
+        }
+        assert_eq!(
+            replica.stage_replica(legacy.clone()).unwrap(),
+            (Offset(1), false)
+        );
+        replica.commit_batch().unwrap();
+        assert!({
+            let last_head = replica.head().0;
+            drop(replica.publish_last_visible(last_head).unwrap());
+            let mut last_view = replica.last_view_at(last_head).unwrap();
+            replica
+                .last_matching(&f_pub, "", 8, 8, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        }
+        .0
+        .is_empty());
+        assert_eq!(replica.subjects_per_producer(42), 0);
+        drop(replica);
+        let mut replica = BrokerLog::open_with(&replica_path, Durability::Relaxed).unwrap();
+        assert!({
+            let last_head = replica.head().0;
+            drop(replica.publish_last_visible(last_head).unwrap());
+            let mut last_view = replica.last_view_at(last_head).unwrap();
+            replica
+                .last_matching(&f_pub, "", 8, 8, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        }
+        .0
+        .is_empty());
+        assert_eq!(replica.subjects_per_producer(42), 0);
+        assert_eq!(replica.read_from(Offset(0)).len(), 2);
+        let head = replica.head().0;
+        let (delivered, next) = replica.fetch(0, &all, 8, 8, head);
+        assert_eq!((delivered.len(), next, head), (1, 2, 2));
+        assert_eq!(delivered[0].seq, Offset(0));
+        assert_eq!(delivered[0].subject, "/f/local/pub/n-1/s1/ev");
+        assert_eq!(delivered[0].body, b"still-live");
+
+        // 2. Capture the owned head BEFORE a future retirement can change the index.
+        // Publication is an owner operation, separate from this read capture.
+        drop(reopened.publish_last_visible(2).unwrap());
+        let mut held_view = reopened.last_view_at(2).unwrap();
+        let log_id = reopened.identity();
+        let (r_off, absent, gated) = reopened
+            .stage_retire_conditional(42, "/f/local/pub/n-1/s1/ev".into(), 0, log_id, 2)
+            .unwrap();
+        assert_eq!((r_off.0, absent, gated), (2, false, false));
+        reopened.commit_batch().unwrap();
+
+        // A retirement visit consumes the same step budget as an index visit: one
+        // unit cannot both build the overlay and report it as a completed page.
+        assert!(matches!(
+            reopened
+                .last_matching(&f_pub, "", 8, 1, &mut held_view)
+                .unwrap(),
+            LastStep::Pending
+        ));
+        // While visible_head == 2 (<= r_off == 2), `last_matching` still surfaces offset 0:
+        let (rows_held, _) = reopened
+            .last_matching(&f_pub, "", 8, 8, &mut held_view)
+            .unwrap()
+            .into_page()
+            .expect("the captured history fits this work step");
+        assert_eq!(
+            rows_held.len(),
+            1,
+            "retire at offset 2 must not take effect in Last while visible_head == 2"
+        );
+        assert_eq!(
+            (rows_held[0].seq.0, rows_held[0].body.as_slice()),
+            (0, b"still-live".as_slice())
+        );
+
+        // And a moot retry while visible_head == 2 reports `ungated == false` with `r_off`:
+        let (retry_off, retry_absent, retry_ungated) = reopened
+            .stage_retire_conditional(42, "/f/local/pub/n-1/s1/ev".into(), 0, log_id, 2)
+            .unwrap();
+        assert_eq!((retry_off.0, retry_absent, retry_ungated), (2, true, false));
+
+        drop(reopened.publish_last_visible(3).unwrap());
+        assert!(matches!(
+            reopened.last_view_at(2),
+            Err(LastViewError::TooOld { .. })
+        ));
+        // The already-owned head still works after the store relinquishes its old root.
+        let (still_held, _) = reopened
+            .last_matching(&f_pub, "", 8, 8, &mut held_view)
+            .unwrap()
+            .into_page()
+            .expect("the old view remains ready");
+        assert_eq!(
+            (still_held[0].seq.0, still_held[0].body.as_slice()),
+            (0, b"still-live".as_slice())
+        );
+
+        // Once visible_head advances to 3 (> r_off == 2), `last_matching` drops the retired subject
+        // and a moot retry returns `(visible_head, true, true)`:
+        let (rows_vis, _) = {
+            let last_head = 3;
+            drop(reopened.publish_last_visible(last_head).unwrap());
+            let mut last_view = reopened.last_view_at(last_head).unwrap();
+            reopened
+                .last_matching(&f_pub, "", 8, 8, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        };
+        assert!(rows_vis.is_empty());
+        let (retry_vis, retry_vis_absent, retry_vis_ungated) = reopened
+            .stage_retire_conditional(42, "/f/local/pub/n-1/s1/ev".into(), 0, log_id, 3)
+            .unwrap();
+        assert_eq!(
+            (retry_vis.0, retry_vis_absent, retry_vis_ungated),
+            (3, true, true)
+        );
     }
 
     /// Zero suffix bytes do not prove that a complete, corrupted record was never committed.
@@ -7869,7 +9673,7 @@ mod tests {
             }
             (log.bytes(), log.identity())
         };
-        let sidecar = std::fs::read(logid::sidecar_path(&path)).unwrap();
+        let sidecar = std::fs::read(logid::identity_path(&path)).unwrap();
         let next = rec(2, 1, 3).encode().unwrap();
         let header = torn_header();
         for (behind, moves) in [(&[][..], false), (&next[..], true)] {
@@ -7877,7 +9681,7 @@ mod tests {
             damaged.extend_from_slice(&header);
             damaged.extend_from_slice(behind);
             std::fs::write(&path, &damaged).unwrap();
-            std::fs::write(logid::sidecar_path(&path), &sidecar).unwrap();
+            std::fs::write(logid::identity_path(&path), &sidecar).unwrap();
             let log = BrokerLog::open_with(&path, Durability::Strict)
                 .expect("with the floor known, a torn batch opens");
             assert_eq!(log.head(), Offset(2));
@@ -7894,7 +9698,7 @@ mod tests {
             );
 
             std::fs::write(&path, &damaged).unwrap();
-            std::fs::remove_file(logid::sidecar_path(&path)).unwrap();
+            std::fs::remove_file(logid::identity_path(&path)).unwrap();
             let err = BrokerLog::open_with(&path, Durability::Strict)
                 .err()
                 .expect("an empty frame must be refused");
@@ -7916,7 +9720,7 @@ mod tests {
             );
             drop(log);
             assert_eq!(std::fs::read(&path).unwrap(), clean);
-            std::fs::remove_file(logid::sidecar_path(&path)).unwrap();
+            std::fs::remove_file(logid::identity_path(&path)).unwrap();
         }
     }
 
@@ -7974,13 +9778,13 @@ mod tests {
             // Keep two records; the third's frame is a real sealed record to plant.
             (bytes[..second].to_vec(), bytes[second..].to_vec())
         };
-        let sidecar = std::fs::read(logid::sidecar_path(&path)).unwrap();
+        let sidecar = std::fs::read(logid::identity_path(&path)).unwrap();
         // The floor known (the sidecar the writing open left), or not (none at all).
         let floor_known = |known: bool| {
             if known {
-                std::fs::write(logid::sidecar_path(&path), &sidecar).unwrap();
+                std::fs::write(logid::identity_path(&path), &sidecar).unwrap();
             } else {
-                let _ = std::fs::remove_file(logid::sidecar_path(&path));
+                let _ = std::fs::remove_file(logid::identity_path(&path));
             }
         };
         let mut partial = torn_header();
@@ -8610,14 +10414,27 @@ mod model_tests {
             .unwrap();
         assert_eq!(log.subjects_per_producer(pid), 2);
 
-        // Another producer cannot retire pid's subject.
+        // Another producer cannot retire pid's subject, even after updating it: the
+        // subject is charged to the producer that introduced its current `Last` entry.
+        log.publish(
+            99,
+            1,
+            "/f/local/pub/n-1/s1/presence".into(),
+            b"updated-by-99".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(log.subjects_per_producer(pid), 2);
+        assert_eq!(log.subjects_per_producer(99), 0);
         assert!(log
             .retire_subject(99, "/f/local/pub/n-1/s1/presence")
             .is_err());
         assert_eq!(log.subjects_per_producer(pid), 2);
 
-        // Retiring the exited session's two subjects removes them from `Last` and
-        // decrements `subjects_per_producer` back to 0.
+        // Wildcard filters are refused (exact `Subject` only).
+        assert!(log.retire_subject(pid, "/f/local/pub/n-1/s1/>").is_err());
+
+        // Retiring the exited session's two subjects as the charged producer removes
+        // them from `Last` and decrements `subjects_per_producer` back to 0.
         assert!(log
             .retire_subject(pid, "/f/local/pub/n-1/s1/presence")
             .unwrap()
@@ -8635,14 +10452,30 @@ mod model_tests {
         assert_eq!(log.subjects_per_producer(pid), 0);
 
         let filter = Filter::new("/f/local/pub/n-1/>").unwrap();
-        let (rows, _) = log.last_matching(&filter, "", 16, 16, log.head().0);
+        let (rows, _) = {
+            let last_head = log.head().0;
+            drop(log.publish_last_visible(last_head).unwrap());
+            let mut last_view = log.last_view_at(last_head).unwrap();
+            log.last_matching(&filter, "", 16, 16, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        };
         assert!(rows.is_empty(), "retired subjects are removed from Last");
         drop(log);
 
         // Reopen from disk: the `/a/retire` records replay and keep the budget at 0.
-        let log2 = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
+        let mut log2 = BrokerLog::open_with(&path, Durability::Relaxed).unwrap();
         assert_eq!(log2.subjects_per_producer(pid), 0);
-        let (rows2, _) = log2.last_matching(&filter, "", 16, 16, log2.head().0);
+        let (rows2, _) = {
+            let last_head = log2.head().0;
+            drop(log2.publish_last_visible(last_head).unwrap());
+            let mut last_view = log2.last_view_at(last_head).unwrap();
+            log2.last_matching(&filter, "", 16, 16, &mut last_view)
+                .unwrap()
+                .into_page()
+                .expect("the fixed fixture fits one bounded step")
+        };
         assert!(rows2.is_empty());
     }
 
@@ -8854,6 +10687,47 @@ mod unclean_tests {
             "Lossy moves it"
         );
         assert_eq!(moved.continues(id, log.lineage()), Some(2));
+    }
+
+    /// A log whose lock was RELEASED early ([`BrokerLog::unlock`], the last step of a
+    /// broker's stop) refuses every mutation, clean close or not: the file may already
+    /// be a successor's. The broker's stop under the unclean-stop seam skips the clean
+    /// close and its `closed` latch, and before this latch a broker kept after such a
+    /// stop could still compact the file under its successor, renaming its copy over a
+    /// log the successor was acking Strict records into. The successor's records are
+    /// read back to show the stopped log wrote nothing: its refused publish left the
+    /// file to the successor, and the reopen holds exactly the successor's head.
+    #[test]
+    fn a_log_whose_lock_was_released_refuses_every_write() {
+        let root = Scratch::new("released");
+        let path = root.path().join("log");
+        let mut stopped = open(&path, Durability::Strict, BOOT_A);
+        publish(&mut stopped, 2);
+        stopped.unlock();
+        let mut successor = open(&path, Durability::Strict, BOOT_A);
+        assert_eq!(
+            successor.head().0,
+            2,
+            "the lock was released to the successor"
+        );
+        publish(&mut successor, 3);
+
+        let refused = stopped
+            .publish(7, 99, "/a/x".into(), Vec::new())
+            .expect_err("a released log refuses a publish");
+        assert!(refused.to_string().contains("released"), "{refused}");
+        let refused = stopped
+            .commit("/g".into(), 1)
+            .expect_err("a released log refuses a commit");
+        assert!(refused.to_string().contains("released"), "{refused}");
+        assert!(
+            stopped.close_clean().is_err(),
+            "and refuses the clean close, which would record its own head as the floor"
+        );
+        drop(stopped);
+        drop(successor);
+        let log = open(&path, Durability::Strict, BOOT_A);
+        assert_eq!(log.head().0, 5, "every record the successor acked is there");
     }
 
     /// A replica that stopped uncleanly takes a fresh id at generation 0 — never its
@@ -9556,5 +11430,147 @@ mod ordered_tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("Group"), "{err}");
         assert!(!path.exists());
+    }
+
+    /// THE POISON IS PUBLISHED LAST, after the failure's own disk work. An Ordered log
+    /// whose first batch rode a barrier (the durable head below the head); then a batch
+    /// on a device that refuses the barrier (the latch), whose full flush fails (the
+    /// fault seam's sync) and whose rollback fails too (its truncate): a double fault on
+    /// a failing disk. On BOTH paths — the writer's batch (`commit_batch`) and the
+    /// un-batched append (`publish`) — the poison must not be visible until `<log>.id`
+    /// records `Lossy`: the seam `id_at_poison` stands where a lock-free reader of the
+    /// poison stands, and an embedder that exits there (`Broker::wait_poisoned`'s
+    /// documented use) leaves the reopen the sidecar as it read it. Before, the rollback
+    /// published the poison at once, and the seam read the identity the open recorded —
+    /// a same-boot reopen that kept its generation. The rollback's reason stands (the
+    /// on-disk suffix is unknown), and the tier the vitals tell beside the poison is the
+    /// latched Strict, never the Ordered before it.
+    #[test]
+    fn a_double_fault_publishes_its_poison_after_its_lossy_record_and_its_latch() {
+        let told = |log: &BrokerLog| crate::ServedInfo {
+            served: Tier::Ordered,
+            reason: ServedReason::None,
+            ..log.served()
+        };
+        let double_fault = |log: &mut BrokerLog| {
+            log.refuse_barrier = true;
+            log.inject_faults(InjectedFaults {
+                sync: true,
+                truncate: true,
+            });
+        };
+        for batched in [true, false] {
+            let sim = Sim::fresh();
+            let mut log = open_sim(&sim, ORDERED, BOOT_A);
+            assert_eq!(log.served().served, Tier::Ordered);
+            if batched {
+                stage(&mut log, 1, 1, "/o/a");
+                log.commit_batch().unwrap();
+            } else {
+                log.publish(1, 1, "/o/a".into(), vec![1]).unwrap();
+            }
+            assert_eq!(
+                log.durable_head(),
+                Offset(0),
+                "a barrier makes nothing durable"
+            );
+            let opened = sim.read_id();
+            double_fault(&mut log);
+            if batched {
+                stage(&mut log, 1, 2, "/o/b");
+                log.commit_batch().unwrap_err();
+            } else {
+                log.publish(1, 2, "/o/b".into(), vec![2]).unwrap_err();
+            }
+            let lossy = sim.read_id();
+            assert_ne!(
+                lossy, opened,
+                "batched={batched}: the run is recorded Lossy"
+            );
+            assert_eq!(
+                log.id_at_poison,
+                Some(lossy),
+                "batched={batched}: a reader that saw the poison found the Lossy record"
+            );
+            let why = log.poisoned().expect("the double fault poisoned the log");
+            assert!(
+                why.starts_with("could not roll the staged suffix back"),
+                "{why}"
+            );
+            let served = log.vitals.served(told(&log));
+            assert_eq!(
+                (served.served, served.reason),
+                (Tier::Strict, ServedReason::LatchedAfterBarrierError),
+                "batched={batched}: the poison is told beside the latched tier"
+            );
+        }
+    }
+
+    /// THE LATCH RIDES THE POISON, AND THE FIRST POISON STANDS ([`LogVitals`]). Until
+    /// either is published, a reader is told the tier the open decided. A latch a failed
+    /// flush sets is told only WITH its poison; a barrier's latch is told on its own,
+    /// and a poison after it leaves it standing. A second poison changes neither the
+    /// reason (the first is what an embedder's exit line must name) nor, once latched,
+    /// the tier — and a latch that arrives after the poison is still told. NEGATIVE
+    /// CONTROL: a vitals that took the last reason (a mutant that overwrites) fails the
+    /// first-reason check.
+    #[test]
+    fn the_latch_rides_its_poison_and_the_first_poison_stands() {
+        let told = crate::ServedInfo {
+            requested: Tier::Ordered,
+            served: Tier::Ordered,
+            reason: ServedReason::None,
+            horizon_ms: None,
+            rules: 0,
+        };
+        let tier = |v: &LogVitals| {
+            let s = v.served(told);
+            (s.served, s.reason)
+        };
+
+        let v = LogVitals::default();
+        assert_eq!(tier(&v), (Tier::Ordered, ServedReason::None));
+        v.poison(
+            "first".to_string(),
+            Some(ServedReason::LatchedAfterFlushFailure),
+        );
+        assert_eq!(v.poisoned(), Some("first"));
+        assert_eq!(
+            tier(&v),
+            (Tier::Strict, ServedReason::LatchedAfterFlushFailure)
+        );
+        v.poison("second".to_string(), None);
+        assert_eq!(v.poisoned(), Some("first"), "the first reason stands");
+        assert_eq!(
+            tier(&v),
+            (Tier::Strict, ServedReason::LatchedAfterFlushFailure)
+        );
+
+        let v = LogVitals::default();
+        v.latch(ServedReason::LatchedAfterBarrierError);
+        assert_eq!(v.poisoned(), None, "a barrier's latch poisons nothing");
+        assert_eq!(
+            tier(&v),
+            (Tier::Strict, ServedReason::LatchedAfterBarrierError)
+        );
+        v.poison("after the latch".to_string(), None);
+        assert_eq!(
+            tier(&v),
+            (Tier::Strict, ServedReason::LatchedAfterBarrierError)
+        );
+
+        let v = LogVitals::default();
+        v.poison("no latch".to_string(), None);
+        assert_eq!(tier(&v), (Tier::Ordered, ServedReason::None));
+        v.poison(
+            "a later failure".to_string(),
+            Some(ServedReason::LatchedAfterFlushFailure),
+        );
+        assert_eq!(v.poisoned(), Some("no latch"), "the first reason stands");
+        assert_eq!(
+            tier(&v),
+            (Tier::Strict, ServedReason::LatchedAfterFlushFailure),
+            "a latch after the poison is told on its own"
+        );
     }
 }

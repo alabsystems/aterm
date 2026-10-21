@@ -88,7 +88,7 @@ impl MemoryTape {
         let bytes = self.sink.bytes();
         let first = self.sink.taken().writes.first().copied().unwrap_or(0);
         let mut out = MAGIC.to_vec();
-        out.extend(frame_bytes(Kind::Header, header.as_bytes()));
+        out.extend(frame_bytes(Kind::Header, 0, header.as_bytes()));
         out.extend_from_slice(&bytes[first..]);
         out
     }
@@ -142,6 +142,39 @@ pub(crate) fn assert_replays(
         "the replay prints what the recorded run printed"
     );
     assert_eq!(replayed(), first, "a tape replays the same way twice");
+    // ACTS SELF-CONSISTENCY (the plan's T9): the same tape run as a
+    // counterfactual under its own policy takes every act it holds, asks
+    // what the recorded run asked, and follows the tape record for record —
+    // nothing dropped, served again, made up or left unmatched — so acts mode
+    // over an unchanged run is a strict replay.
+    let acts = replay(
+        &bytes,
+        &Options {
+            candidate: Some(super::acts::Candidate::default()),
+            ..Options::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("the recorded run's tape does not replay in acts mode: {e}"));
+    assert_eq!(
+        acts.verdict,
+        Verdict::Reproduced,
+        "the recorded run replays in acts mode under its own policy:\n{}",
+        acts.render()
+    );
+    assert_eq!(
+        acts.requests, first.requests,
+        "acts mode asks what strict asks"
+    );
+    assert_eq!(
+        acts.lines, first.lines,
+        "acts mode prints what strict prints"
+    );
+    let account = &acts.acts.as_ref().expect("an acts report").account;
+    assert!(
+        account.exact() && account.consumed == first.effects,
+        "acts mode over an unchanged run follows the tape exactly: {account:?} of {} effects",
+        first.effects
+    );
     first
 }
 

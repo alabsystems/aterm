@@ -20,36 +20,120 @@
 //! recoverable, never an unlink — and the folder is read again the same way.
 //! Keep on a Community row adds a community pack theme ([`add_pack_into`]) through
 //! `aterm_theme_pack::install`, the path `aterm theme install` takes.
+//!
+//! What the host reaches beyond the themes folder — the system Trash, the
+//! platform's open-in-workspace and its file picker — goes through
+//! [`ThemesHostArms`], whose arm for a headless instance reaches none of
+//! them.
 
 use crate::native_app::{ThemesOutcome, ThemesRequest};
 
-/// Perform `request` against the live themes folder. Main thread only: an
-/// import runs the modal file picker.
-pub(crate) fn perform(request: &ThemesRequest) -> ThemesOutcome {
+/// What the themes host reaches beyond the themes folder. A HEADLESS
+/// INSTANCE (a lab's, a harness's) reaches none of it: its themes folder is
+/// its scratch world's, and the account's Trash, Finder and desktop are not
+/// its to touch — the system trash tool files by the account's real home
+/// whatever `HOME` says, and a picker or Finder would open on the owner's
+/// desktop. Its Trash is the `.trash` folder beside its themes
+/// ([`move_to_trash_fallback`]), recoverable inside its world; opening a
+/// file or the folder, and importing through a picker, say they are not
+/// done here.
+#[derive(Clone, Copy)]
+pub(crate) struct ThemesHostArms {
+    /// Move a theme file to where it can be put back.
+    trash: fn(&std::path::Path) -> Result<(), String>,
+    /// Show a theme file or the folder in the platform's file manager.
+    open: fn(&std::path::Path) -> Result<(), String>,
+    /// Ask the person for a file to import: `Ok(None)` when they cancel.
+    choose: fn() -> Result<Option<std::path::PathBuf>, String>,
+}
+
+impl ThemesHostArms {
+    /// The isolated arms for a headless instance, the live ones otherwise.
+    pub(crate) fn for_instance(headless: bool) -> Self {
+        if headless {
+            Self::isolated()
+        } else {
+            Self::live()
+        }
+    }
+
+    fn live() -> Self {
+        Self {
+            trash: move_to_trash,
+            open: open_in_workspace,
+            choose: choose_import,
+        }
+    }
+
+    fn isolated() -> Self {
+        Self {
+            trash: move_to_local_trash,
+            open: refuse_open,
+            choose: refuse_choose,
+        }
+    }
+}
+
+fn open_in_workspace(target: &std::path::Path) -> Result<(), String> {
+    if crate::menu::open_file_in_workspace(target) {
+        Ok(())
+    } else {
+        Err(format!("could not open {}", target.display()))
+    }
+}
+
+fn choose_import() -> Result<Option<std::path::PathBuf>, String> {
+    Ok(crate::menu::choose_local_file("Import a theme", "Import"))
+}
+
+fn move_to_local_trash(file: &std::path::Path) -> Result<(), String> {
+    move_to_trash_fallback(file, |_| {})
+}
+
+fn refuse_open(_target: &std::path::Path) -> Result<(), String> {
+    Err("a headless instance opens nothing on the desktop".to_string())
+}
+
+fn refuse_choose() -> Result<Option<std::path::PathBuf>, String> {
+    Err("a headless instance shows no file picker".to_string())
+}
+
+/// Perform `request` against the live themes folder, reaching beyond it
+/// only through `arms`. Main thread only: an import runs the modal file
+/// picker.
+pub(crate) fn perform(request: &ThemesRequest, arms: ThemesHostArms) -> ThemesOutcome {
     let Some(dir) = aterm_types::scheme::user_theme_dir() else {
         return ThemesOutcome::Failed {
             message: "no themes folder: neither XDG_CONFIG_HOME, APPDATA nor HOME is set"
                 .to_string(),
         };
     };
+    perform_in(&dir, request, arms)
+}
+
+/// [`perform`] against the themes folder `dir`.
+fn perform_in(
+    dir: &std::path::Path,
+    request: &ThemesRequest,
+    arms: ThemesHostArms,
+) -> ThemesOutcome {
     match request {
-        ThemesRequest::OpenFolder => open(&dir, &dir, true),
+        ThemesRequest::OpenFolder => open(dir, dir, true, arms.open),
         ThemesRequest::OpenFile { id } => {
-            let file = theme_file(&dir, id);
+            let file = theme_file(dir, id);
             match file {
-                Some(file) => open(&file, &dir, false),
-                None => open(&dir, &dir, true),
+                Some(file) => open(&file, dir, false, arms.open),
+                None => open(dir, dir, true, arms.open),
             }
         }
-        ThemesRequest::Import => {
-            let Some(path) = crate::menu::choose_local_file("Import a theme", "Import") else {
-                return ThemesOutcome::Cancelled;
-            };
-            import_from(&path, &dir)
-        }
-        ThemesRequest::Save { id, text } => save_into(&dir, id, text),
-        ThemesRequest::Trash { id } => trash_from(&dir, id, move_to_trash),
-        ThemesRequest::AddPack { id } => add_pack_into(&dir, id),
+        ThemesRequest::Import => match (arms.choose)() {
+            Ok(Some(path)) => import_from(&path, dir),
+            Ok(None) => ThemesOutcome::Cancelled,
+            Err(message) => ThemesOutcome::Failed { message },
+        },
+        ThemesRequest::Save { id, text } => save_into(dir, id, text),
+        ThemesRequest::Trash { id } => trash_from(dir, id, arms.trash),
+        ThemesRequest::AddPack { id } => add_pack_into(dir, id),
     }
 }
 
@@ -230,18 +314,22 @@ pub(crate) fn import_from(path: &std::path::Path, dir: &std::path::Path) -> Them
     }
 }
 
-fn open(target: &std::path::Path, dir: &std::path::Path, create: bool) -> ThemesOutcome {
+fn open(
+    target: &std::path::Path,
+    dir: &std::path::Path,
+    create: bool,
+    opener: fn(&std::path::Path) -> Result<(), String>,
+) -> ThemesOutcome {
     if create && let Err(error) = std::fs::create_dir_all(dir) {
         return ThemesOutcome::Failed {
             message: format!("could not create the themes folder: {error}"),
         };
     }
-    if crate::menu::open_file_in_workspace(target) {
-        ThemesOutcome::Opened
-    } else {
-        aterm_log::warn!("could not open {}", target.display());
-        ThemesOutcome::Failed {
-            message: format!("could not open {}", target.display()),
+    match opener(target) {
+        Ok(()) => ThemesOutcome::Opened,
+        Err(message) => {
+            aterm_log::warn!("{message}");
+            ThemesOutcome::Failed { message }
         }
     }
 }
@@ -385,6 +473,95 @@ mod tests {
         let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
         assert!(!catalog.ready_names().any(|name| name == "mine"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A HEADLESS INSTANCE'S REACHES STOP AT ITS THEMES FOLDER: its Trash
+    /// moves the file into the `.trash` folder beside the themes (the
+    /// catalog no longer lists it, the bytes are still there), and Open and
+    /// Import say they are not done here, the folder untouched. Negative
+    /// control: a windowed instance gets the live arms — the system Trash,
+    /// the platform's open and its picker.
+    #[test]
+    fn a_headless_instance_trashes_into_its_own_folder_and_opens_nothing() {
+        fn same(a: ThemesHostArms, b: ThemesHostArms) -> bool {
+            std::ptr::fn_addr_eq(a.trash, b.trash)
+                && std::ptr::fn_addr_eq(a.open, b.open)
+                && std::ptr::fn_addr_eq(a.choose, b.choose)
+        }
+        assert!(same(
+            ThemesHostArms::for_instance(false),
+            ThemesHostArms::live()
+        ));
+        assert!(same(
+            ThemesHostArms::for_instance(true),
+            ThemesHostArms::isolated()
+        ));
+        let live = ThemesHostArms::live();
+        let isolated = ThemesHostArms::isolated();
+        assert!(!std::ptr::fn_addr_eq(live.trash, isolated.trash));
+        assert!(!std::ptr::fn_addr_eq(live.open, isolated.open));
+        assert!(!std::ptr::fn_addr_eq(live.choose, isolated.choose));
+
+        let dir = scratch("headless");
+        let text = "background = #000000\nforeground = #ffffff\n";
+        std::fs::write(dir.join("mine.conf"), text).unwrap();
+        let arms = ThemesHostArms::for_instance(true);
+        assert_eq!(
+            perform_in(
+                &dir,
+                &ThemesRequest::Trash {
+                    id: "mine".to_string()
+                },
+                arms
+            ),
+            ThemesOutcome::Trashed {
+                id: "mine".to_string()
+            }
+        );
+        assert!(!dir.join("mine.conf").exists());
+        let kept: Vec<String> = walk(&dir.join(".trash"))
+            .into_iter()
+            .filter_map(|file| std::fs::read_to_string(file).ok())
+            .collect();
+        assert_eq!(kept, vec![text.to_string()], "the bytes stay in the folder");
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+        assert!(!catalog.ready_names().any(|name| name == "mine"));
+        // Each refusal is the isolated arm's own.
+        let refused_open = (isolated.open)(&dir).expect_err("the isolated open refuses");
+        let refused_choose = (isolated.choose)().expect_err("the isolated picker refuses");
+        for (request, refusal) in [
+            (ThemesRequest::OpenFolder, &refused_open),
+            (
+                ThemesRequest::OpenFile {
+                    id: "mine".to_string(),
+                },
+                &refused_open,
+            ),
+            (ThemesRequest::Import, &refused_choose),
+        ] {
+            assert_eq!(
+                perform_in(&dir, &request, arms),
+                ThemesOutcome::Failed {
+                    message: refusal.clone()
+                },
+                "{request:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every regular file under `dir`, at any depth.
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walk(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
     }
 
     /// The window's import writes a new theme the catalog then lists, and

@@ -42,13 +42,15 @@ pub fn corpus_under(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Whether the corpus walk stays out of the directory `name` inside `parent`:
-/// `target`, `.git` and `node_modules` at any depth, and at the repository root
-/// every `target-*` sibling build dir (`target-trust`, older lanes' leftovers)
+/// `target`, `.git`, `node_modules` and every `*.noindex` build dir a tool chose
+/// (`libc-oracle/target.noindex`) at any depth, and at the repository root every
+/// `target-*` sibling build dir (`target-trust.noindex`, older lanes' leftovers)
 /// and a leftover `.aterm-verify` state dir, which the checked-in .gitignore names as
 /// `/target-*` and `/.aterm-verify/`.
 fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
     name == "target"
         || name == ".git"
+        || name.ends_with(".noindex")
         || name == "node_modules"
         || (parent == root && (name.starts_with("target-") || name == ".aterm-verify"))
         || is_handoff_fixture_dir(parent, name)

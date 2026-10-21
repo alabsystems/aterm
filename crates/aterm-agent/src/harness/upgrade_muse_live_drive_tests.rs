@@ -217,12 +217,9 @@ impl MuseKernel for Kernel2 {
         // The child a backgrounded shell leaves where its `sh` exec'd its
         // last command: a bare `sleep`, which a shell-name rule misses.
         let table = if self.knobs.child && pid == TUI && MuseKernel::alive(self, TUI) {
-            vec![
-                (TUI, SHELL, "muse".to_string()),
-                (CHILD, TUI, "sleep".to_string()),
-            ]
+            vec![(TUI, SHELL, "muse".into()), (CHILD, TUI, "sleep".into())]
         } else {
-            vec![(TUI, SHELL, "muse".to_string())]
+            vec![(TUI, SHELL, "muse".into())]
         };
         descendants_in(&table, pid)
     }
@@ -1389,12 +1386,9 @@ fn real_restarts(s: &State) -> bool {
             .is_some_and(|(_, lines)| lines.iter().all(|l| l.trim().is_empty()))
     };
     let table = if s["child"] == 1 {
-        vec![
-            (TUI, SHELL, "muse".to_string()),
-            (CHILD, TUI, "sleep".to_string()),
-        ]
+        vec![(TUI, SHELL, "muse".into()), (CHILD, TUI, "sleep".into())]
     } else {
-        vec![(TUI, SHELL, "muse".to_string())]
+        vec![(TUI, SHELL, "muse".into())]
     };
     // The look composed as the drive's own `look_at` composes it.
     let look: Look = live::look_of(
@@ -1563,10 +1557,10 @@ fn tier1_the_real_muse_quiet_upgrade_conforms_to_the_model() {
 #[test]
 fn the_process_rule_finds_every_descendant() {
     let table = vec![
-        (TUI, SHELL, "muse".to_string()),
-        (CHILD, TUI, "sh".to_string()),
-        (CHILD + 1, CHILD, "sleep".to_string()),
-        (OTHER, SHELL, "vim".to_string()),
+        (TUI, SHELL, "muse".into()),
+        (CHILD, TUI, "sh".into()),
+        (CHILD + 1, CHILD, "sleep".into()),
+        (OTHER, SHELL, "vim".into()),
     ];
     let found = descendants_in(&table, TUI).expect("read");
     assert_eq!(found.len(), 2, "{found:?}");

@@ -300,9 +300,12 @@ fn validated_copy(number: RawFd) -> io::Result<File> {
 /// nothing is closed then.
 pub fn close_inherited_copies(lifeline: &OwnedFd) -> io::Result<Vec<RawFd>> {
     use std::os::unix::fs::MetadataExt as _;
-    // Only a FIFO node, and never inode 0 (no node at all).
+    // Only a FIFO node, and never inode 0 (no node at all), read from the
+    // descriptor itself: a `/dev/fd` path lookup can answer `EBADF` for an open
+    // descriptor ([`crate::spawnfd::descriptor_metadata`]), and a copy it missed
+    // would stay open, a writer this instance waits on forever.
     let identity = |fd: RawFd| {
-        std::fs::metadata(format!("/dev/fd/{fd}"))
+        crate::spawnfd::descriptor_metadata(fd)
             .map(|m| (m.file_type().is_fifo() && m.ino() != 0).then(|| (m.dev(), m.ino())))
     };
     let own_fd = lifeline.as_raw_fd();
@@ -427,10 +430,11 @@ mod tests {
     ///
     /// In this multi-threaded test process a closed number may be reused at once
     /// by another test, so "closed" is asserted as "no longer names the
-    /// lifeline", never by the number alone.
+    /// lifeline", never by the number alone. Read from the descriptor, never its
+    /// `/dev/fd` path ([`crate::spawnfd::descriptor_metadata`]).
     fn node(fd: RawFd) -> Option<(u64, u64)> {
         use std::os::unix::fs::MetadataExt as _;
-        let meta = std::fs::metadata(format!("/dev/fd/{fd}")).ok()?;
+        let meta = crate::spawnfd::descriptor_metadata(fd).ok()?;
         Some((meta.dev(), meta.ino()))
     }
 
@@ -729,6 +733,78 @@ mod tests {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Selects the staged instance of the next test; its value is a scratch dir.
+    #[cfg(target_vendor = "apple")]
+    const CONTENDED_STAGE_ENV: &str = "ATERM_UDS_LIFELINE_CONTENDED_STAGE";
+
+    /// The sweep finds a copy of the lifeline while another thread looks its number up.
+    /// The sweep once read each number's node by `/dev/fd` path, which on Darwin answers
+    /// `EBADF` for an open descriptor when another lookup of the same number lands
+    /// mid-call (`spawnfd::descriptor_metadata`): the copy was passed over and stayed open,
+    /// a writer the instance would wait on forever. Each round puts a copy at one number
+    /// and sweeps while another thread looks that number up
+    /// (`spawnfd::test_support::racing_lookups`, whose path `stat`s failing are the
+    /// negative control); every sweep must close exactly that copy. On the path-reading
+    /// sweep, 20 of 20 runs here missed copies.
+    ///
+    /// Runs in a re-exec'd child, for the reason the tests above give.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_copy_is_swept_while_its_number_is_looked_up_elsewhere() {
+        /// The number each round's copy sits at: one no other test looks up.
+        const COPY: RawFd = 1600;
+        const F_DUPFD: i32 = 0;
+        if let Some(dir) = std::env::var_os(CONTENDED_STAGE_ENV) {
+            let (Lifeline { held }, far) =
+                Lifeline::open(std::path::Path::new(&dir)).expect("open a lifeline");
+            let adopted = adopt(std::os::fd::IntoRawFd::into_raw_fd(far)).expect("adopt");
+            // The launcher's end is a copy of the same node too: not this test's.
+            drop(held);
+            let mut missed = Vec::new();
+            let rounds = crate::spawnfd::test_support::racing_lookups(COPY, 20, |looker| {
+                // SAFETY: `F_DUPFD` returns a fresh descriptor or -1.
+                let copy = unsafe { fcntl(adopted.as_raw_fd(), F_DUPFD, COPY) };
+                assert_eq!(copy, COPY, "fd {COPY} is held elsewhere in this process");
+                looker.probe();
+                let closed = close_inherited_copies(&adopted).expect("sweep");
+                if closed != [COPY] {
+                    missed.push(closed);
+                    // SAFETY: the copy the sweep passed over, owned here alone.
+                    drop(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(COPY) });
+                }
+            });
+            assert!(
+                missed.is_empty(),
+                "{} of {rounds} sweeps missed the copy at {COPY}: {:?}",
+                missed.len(),
+                missed.first()
+            );
+            return;
+        }
+        let dir = scratch("contended");
+        let out = Command::new(std::env::current_exe().expect("the test binary"))
+            .arg("a_copy_is_swept_while_its_number_is_looked_up_elsewhere")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CONTENDED_STAGE_ENV, &dir)
+            .output()
+            .expect("re-exec this test binary as the instance");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if let Some(why) = stderr
+            .lines()
+            .find_map(|l| l.split_once(crate::host::COULD_NOT_RUN).map(|(_, why)| why))
+        {
+            crate::host::could_not_run(format!("the staged sweep{why}"));
+        }
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the staged instance: {:?}\nstdout: {stdout}\nstderr: {stderr}",
+            out.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `adopt` moves the lifeline to a close-on-exec copy at 3 or above and

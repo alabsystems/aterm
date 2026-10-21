@@ -13,13 +13,13 @@ state on
 bind 0
 see busy
 expect open t1 turn par=r1 src=screen conf=strong
-tx prompt v1 dated=0 off=45544 slice=2.1.303:51-60
+tx prompt v1 dated=0 off=35369 slice=2.1.303:51-60
 expect amend t1 turn vref=v1 by=vendor src=transcript conf=exact
-at 2033 tx tool c1 dated=2033 off=47153 slice=2.1.303:51-60
+at 2033 tx tool c1 dated=2033 off=36896 slice=2.1.303:51-60
 expect open p1 tool par=t1 cls=shell tool=Bash vref=c1 by=vendor src=transcript conf=exact
-at 8069 tx result c1 dated=8069 off=49032 slice=2.1.303:51-60
+at 8069 tx result c1 dated=8069 off=38666 slice=2.1.303:51-60
 expect close p1 tool out=ok by=vendor src=transcript conf=exact
-at 8092 tx end vdur=8100 in=45497 out=33 dated=8092 off=51030 slice=2.1.303:51-60
+at 8092 tx end vdur=8100 in=45497 out=33 dated=8092 off=40576 slice=2.1.303:51-60
 expect close t1 turn out=done steps=1 tools=shell:1 by=vendor src=transcript conf=exact
 expect amend t1 turn vdur_ms=8100 tok_in=45497 tok_out=33 by=vendor src=transcript conf=exact
 expect turn=none

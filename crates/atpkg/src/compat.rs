@@ -1608,9 +1608,7 @@ mod tests {
     /// was linked or unlinked.
     #[test]
     fn a_failed_lay_commits_nothing_and_the_shims_stay_plain() {
-        if crate::platform::our_uid() == 0 {
-            return; // root reads a 0000 directory; the failure cannot be staged
-        }
+        aterm_uds::host::could_not_run_as_root("a mode-0 directory");
         let fx = Fx::new("layfail");
         let build = fx.build(8595, Shape::Copy);
         let locked = build.join("lib").join("rustlib").join("locked");
@@ -2046,6 +2044,7 @@ mod tests {
                 None,
                 "doctor",
                 &crate::doctor::Probes::default(),
+                crate::doctor::Detail::Everything,
                 &mut out,
                 &mut err,
             );
@@ -2498,9 +2497,7 @@ mod tests {
     /// no temp; the pass's reconcile then reports the refusal.
     #[test]
     fn install_over_a_root_that_cannot_be_laid_lays_plain_shims() {
-        if crate::platform::our_uid() == 0 {
-            return; // root reads a 0000 directory; the failure cannot be staged
-        }
+        aterm_uds::host::could_not_run_as_root("a mode-0 directory");
         let fx = Fx::new("install-fail");
         let build = fx.build(8595, Shape::Copy);
         let locked = build.join("lib").join("rustlib").join("locked");
@@ -2535,9 +2532,7 @@ mod tests {
     /// shim, [`inspect`] answers `Err`, and the shim still routes. Readable again, nothing to do.
     #[test]
     fn a_build_that_cannot_be_read_keeps_its_root_and_its_routes() {
-        if crate::platform::our_uid() == 0 {
-            return; // root reads a 0000 file; the failure cannot be staged
-        }
+        aterm_uds::host::could_not_run_as_root("a mode-0 file");
         let fx = Fx::new("unread");
         let build = fx.build(8595, Shape::Copy);
         let none = crate::shim_env::ShimEnv::NONE;

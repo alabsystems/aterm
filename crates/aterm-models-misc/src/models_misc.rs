@@ -2649,6 +2649,12 @@ pub fn native_update_overlap_handoff_model() -> Model {
             // EOF for the whole grace and we kill it. Both reach `child_reaped`. Who gives its
             // counted trial launch back is the death evidence's to decide, not modelled here.
             var successor_exited = 0;
+            // The launched successor has dialled the rendezvous: the hold, the park and the
+            // grant all come after it. Before it the attempt can still end — the dial budget
+            // runs out under load, or the cancel comes — with the successor alive in its
+            // boot, and that end is a revocation like any other: its retire needs the reap
+            // too (round eight of the update audit, lead U41).
+            var dialled = 0;
 
             action SelectLegacyBridge when (
                 phase == 0 && protocol == 0 && launched_early == 0
@@ -2657,7 +2663,8 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 commit_channel = 0;
             }
             action ParkParentReaders when (
-                phase == 0 && parent_readers == 1 && failure == 0 && retired == 0
+                phase == 0 && parent_readers == 1 && failure == 0 && retired == 0 &&
+                (launched_early == 0 || dialled == 1)
             ) {
                 phase = 1;
                 parent_readers = 0;
@@ -2676,6 +2683,14 @@ pub fn native_update_overlap_handoff_model() -> Model {
             ) {
                 child_live = 1;
                 launched_early = 1;
+            }
+            // Its claim is accepted, with every reader live; a revocation before this is
+            // the dial wait's (`app_update_handoff::await_launched_dial`'s budget or cancel).
+            action SuccessorDials when (
+                phase == 0 && launched_early == 1 && child_live == 1 && dialled == 0 &&
+                failure == 0
+            ) {
+                dialled = 1;
             }
             action GrantDescriptorsToBootedSuccessor when (
                 phase == 1 && parent_parked == 1 && launched_early == 1 &&
@@ -3233,8 +3248,9 @@ pub fn native_update_overlap_handoff_model() -> Model {
                     parent_readers <= 1
                 };
             // An attempt retires only over a successor proven gone, so a retry never launches
-            // beside a candidate still running. The proof is the reap, licensed either by the
-            // successor's own exit on the closed rendezvous or by our kill.
+            // beside a candidate still running, dialled or not. The proof is the reap,
+            // licensed either by the successor's own exit on the closed rendezvous or by our
+            // kill.
             invariant UngrantedRetireRequiresReap:
                 if retired == 1 {
                     (child_killed == 1 || successor_exited == 1) &&
@@ -5058,15 +5074,16 @@ pub fn anchored_artifact_transaction_model() -> Model {
 /// pruning a leased artifact, releasing without a valid ACK, reading an ACK
 /// before the server's causal challenge exists, releasing quarantine before
 /// expiry, and four lines of the shipping writer or guard written wrong:
-/// * `BuggyChallengeBeforeBody` — `write_control_reply_with_timeout_arm` with
-///   its two `write_all_until` calls swapped, so an echo no longer proves the
-///   client read the complete frame (`ChallengeRequiresCompleteWire`);
-/// * `BuggyOkBeforeRevalidation` — the same function writing the OK body before
+/// * `BuggyChallengeBeforeBody` — `ControlReply::into_wire` queueing the
+///   challenge ahead of the body, so an echo no longer proves the client read
+///   the complete frame (`ChallengeRequiresCompleteWire`);
+/// * `BuggyOkBeforeRevalidation` — `Outbox::attach` queueing the OK body before
 ///   `retention.prepare_write()`: when revalidation then fails, the client has
 ///   read OK for a file the abort removes (`CommitRequiresWirePreparation`);
-/// * `BuggyTrailerErrorIgnored` — the trailer's `write_all_until` error dropped,
-///   so a frame whose challenge never went out awaits an ACK that cannot come,
-///   instead of entering quarantine (`CompleteReplyPrecedesAck`);
+/// * `BuggyTrailerErrorIgnored` — `Outbox::deliver_to` dropping the error of a
+///   write that left the challenge unsent, so the partial frame awaits an ACK
+///   that cannot come, instead of entering quarantine
+///   (`CompleteReplyPrecedesAck`);
 /// * `BuggyAbortRetainsArtifact` — `CaptureReplyRetention`'s drop without its
 ///   uncommitted `remove_exact` arm (`AbortReleaseRemovesUncommittedArtifact`).
 ///
@@ -5292,9 +5309,11 @@ pub fn artifact_reply_publication_model() -> Model {
     }
 }
 
-/// Aggregate admission bound for queued, in-flight, and quarantined artifact
-/// handoffs. A failed acknowledgement releases its worker immediately but not
-/// its filesystem guard, so worker count alone cannot bound retained resources.
+/// Aggregate admission bound for queued, in-flight, and quarantined path
+/// artifacts and their directory chains (aterm-gui's
+/// `ArtifactBudgets::descriptors`, a `UnitBudget`). A failed acknowledgement
+/// releases its worker immediately but not its filesystem guard, so worker
+/// count alone cannot bound retained resources.
 /// Admission stops at either the object cap or the aggregate descriptor-unit
 /// cap; any release returns both charges atomically. The three charge buckets
 /// are a bounded multiset of live permits (one, two, or three units). `Select*`
@@ -5304,17 +5323,17 @@ pub fn artifact_reply_publication_model() -> Model {
 /// cost, chosen so descriptor saturation occurs while the count still has room.
 ///
 /// `Buggy=1` enables four dead negative controls, each one line of
-/// `ArtifactHandoffPermit` written wrong:
+/// `UnitBudget` written wrong:
 /// * `BuggyOverbook` admits past either cap (`Bounded`);
 /// * `BuggyReconcileOverbook` grows a permit past the unit cap (`Bounded`);
-/// * `BuggyRefuseLeaksSlot` is `try_acquire_from` taking the count slot before
-///   the unit check and returning `None` without giving it back — each refusal
-///   at the unit cap leaks one slot until the pool answers busy forever
+/// * `BuggyRefuseLeaksSlot` is `try_take` taking the count slot before the unit
+///   check and returning `None` without giving it back — each refusal at the
+///   unit cap leaks one slot until the pool answers busy forever
 ///   (`CountMatchesCharges`);
-/// * `BuggyReleaseProvisionalCharge` is `try_reconcile_descriptor_units`
-///   updating the pool without `self.descriptor_units = descriptor_units`, so the
-///   grown permit's drop returns its provisional charge and strands the unit
-///   reconciliation added (`UnitsMatchCharges`).
+/// * `BuggyReleaseProvisionalCharge` is `UnitPermit::reconcile` updating the
+///   pool without recording the permit's new charge, so the grown permit's
+///   drop returns its provisional charge and strands the unit reconciliation
+///   added (`UnitsMatchCharges`).
 ///
 /// No separate "each live permit owns a unit" law: every bucket charges at
 /// least one unit, so that follows from the two conservation laws.

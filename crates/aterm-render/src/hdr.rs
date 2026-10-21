@@ -161,6 +161,41 @@ pub fn sdr_glow_budget(bg_luma: f32, strength: f32) -> f32 {
     clamp_add(SDR_GLOW_BUDGET_BASE * s * rolloff, SDR_GLOW_BUDGET_BASE)
 }
 
+/// WCAG 2 relative luminance where the one dark/light classifier
+/// ([`crate::theme_is_dark`], the inverse of `aterm_messages::ink::bg_is_light`)
+/// turns a page light: the pole where black and white ink tie,
+/// `√0.0525 − 0.05 ≈ 0.1791`.
+pub const LIGHT_PAGE_LUMINANCE: f64 = 0.179_128_784_747_792;
+
+/// The share of the cursor-trail bloom's configured strength a page `bg`
+/// (`0x00RRGGBB`) keeps (`0..=1`).
+///
+/// Exactly `1.0` on every page the classifier calls dark
+/// ([`crate::theme_is_dark`]), so every dark theme's bloom is the configured
+/// one, bit for bit, and the knee is the classifier itself, not a second
+/// threshold beside it. On the light side a `(1 − L)²` rolloff on the page's
+/// WCAG relative luminance `L`, rescaled to meet `1.0` at the pole
+/// ([`LIGHT_PAGE_LUMINANCE`]), takes it to `0` on white: the bloom composites
+/// additive light over the finished frame, caret included, and on a light
+/// page that only whitens the caret and the glyphs beside it into the ground
+/// ("additive light cannot brighten a white ground").
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a share in 0..=1 narrowed to the strength's f32"
+)]
+pub fn light_page_bloom_share(bg: u32) -> f32 {
+    if crate::theme_is_dark(bg) {
+        return 1.0;
+    }
+    let [_, r, g, b] = bg.to_be_bytes();
+    // `contrast(black, bg)` is `(L + 0.05) / 0.05`: the classifier's own
+    // luminance, in its own unfused arithmetic.
+    let l = aterm_messages::ink::contrast([0, 0, 0], [r, g, b]).mul_add(0.05, -0.05);
+    let k = ((1.0 - l) / (1.0 - LIGHT_PAGE_LUMINANCE)).clamp(0.0, 1.0);
+    (k * k) as f32
+}
+
 /// Relative luma (`0..=1`, Rec.601 on the raw sRGB bytes) of a packed
 /// `0x00RRGGBB` colour — the SDR glow budget's background-darkness input.
 #[must_use]
@@ -376,6 +411,41 @@ mod tests {
                 (0.0..=EDR_MAX_CAP - 1.0).contains(&h),
                 "{v:e} → headroom {h}"
             );
+        }
+    }
+
+    /// The bloom's page share: exactly 1 on every page the classifier calls
+    /// dark (the shipped bloom untouched), continuous at the pole, monotone
+    /// falling to 0 on white, and inside `0..=1` everywhere.
+    #[test]
+    fn the_bloom_keeps_dark_pages_and_fades_out_on_white() {
+        for bg in [0x0011_1318u32, 0x001A_1B26, 0x0028_2A36, 0x0000_2B36, 0] {
+            assert_eq!(
+                light_page_bloom_share(bg),
+                1.0,
+                "dark page {bg:06x} keeps the configured bloom exactly"
+            );
+        }
+        assert_eq!(light_page_bloom_share(0x00FF_FFFF), 0.0);
+        assert!(light_page_bloom_share(0x00FD_F6E3) < 0.05);
+        // The greys on either side of the pole: #757575 is dark and keeps the
+        // bloom whole, #767676 is light and has barely started to lose it.
+        assert_eq!(light_page_bloom_share(0x0075_7575), 1.0);
+        let first_light = light_page_bloom_share(0x0076_7676);
+        assert!((0.99..1.0).contains(&first_light), "{first_light}");
+        // Every grey the classifier calls dark keeps the bloom whole, and the
+        // light ones fall monotonically to nothing.
+        let mut last = 1.0f32;
+        for v in 0..=255u32 {
+            let grey = v * 0x0001_0101;
+            let s = light_page_bloom_share(grey);
+            assert!((0.0..=1.0).contains(&s), "{grey:06x}: {s}");
+            if crate::theme_is_dark(grey) {
+                assert_eq!(s, 1.0, "{grey:06x}");
+            } else {
+                assert!(s < 1.0 && s <= last, "{grey:06x}: {s} after {last}");
+            }
+            last = s;
         }
     }
 

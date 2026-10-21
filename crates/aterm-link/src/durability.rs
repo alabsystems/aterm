@@ -7,22 +7,95 @@
 //!
 //! ## The tiers
 //!
-//! * `strict`, the default — astream's [`astream_broker::Durability::Strict`]:
+//! A bare broker argv runs THE BUILD'S DEFAULT ([`default_for`]): ordered for
+//! a GUARDED broker (its argv names a mint secret, as the job `aterm fabric
+//! on` writes does), strict for a broker naming no mint secret. astream serves
+//! that ordered default strict where the device cannot promise the order —
+//! off Apple, a log off the boot volume, a descriptor that refuses the barrier
+//! — and says why in its `Hello`: astream decides where ordered is served,
+//! never this crate. A named tier, strict included, is written into the argv
+//! and kept.
+//!
+//! * `strict` — astream's [`astream_broker::Durability::Strict`]:
 //!   an ack follows the batch's full flush (`F_FULLFSYNC` on macOS, a flush of
 //!   the drive's own cache), so an acked record survives a power loss.
+//! * `ordered` — astream's [`astream_broker::Durability::Ordered`] at aterm's
+//!   100 ms horizon ([`ORDERED_HORIZON`]): an ack follows
+//!   an ORDERING barrier (`F_BARRIERFSYNC`: every write issued before it
+//!   reaches the media before any issued after it, without waiting for the
+//!   media to hold either). After a power loss the log is a prefix of whole
+//!   acked batches. It holds every batch a full flush covered: every record
+//!   [`escalation`] names, flushed in full BEFORE anyone can see it or be
+//!   acked for it; every batch older than the horizon plus one batch and one
+//!   full flush; and everything before a clean stop. It may lack the newest
+//!   machine records, and then the log's generation moves with lineage, so
+//!   readers resume where it continues (below). A process crash (`kill -9`)
+//!   costs nothing. astream serves it STRICT, and says so in its `Hello`,
+//!   where the device cannot promise the order: off Apple (Linux has no
+//!   ordering-only flush), a log off the boot volume, a descriptor that
+//!   refuses the barrier — never weaker than asked ([`describe_served`]).
 //! * `relaxed`, opt-in — [`astream_broker::Durability::Relaxed`]: an ack
 //!   follows the batch's write into the page cache. It survives a crash or a
 //!   restart of the broker (the kernel holds the bytes), NOT a power loss, a
-//!   kernel panic or a hard reset, any of which can take every record acked
-//!   since the broker last opened the log or stopped cleanly.
-//! * `ordered` — ACCEPTED, SERVED STRICT by this build. The word is the tier a
-//!   later build serves (astream's [`astream_broker::Durability::Ordered`]: an
-//!   ack after an ordering barrier, a full flush at most a horizon later). This
-//!   build takes it on the command line and in a job's argv, and opens the log
-//!   Strict, so a job a later build wrote with `--durability ordered` runs here
-//!   — never weaker than asked — instead of refusing to start after a revert.
-//!   Status and doctor say "ordered, served strict", read from the broker
-//!   itself ([`describe_served`]).
+//!   kernel panic or a hard reset, any of which can take every machine record
+//!   acked since the broker last opened the log or stopped cleanly. The
+//!   escalation table applies here too: a full flush of the log writes every
+//!   dirty page of it, so an escalated record and everything before it
+//!   survive.
+//!
+//! ## What escalates ([`escalation`]), and why the rest may ride the horizon
+//!
+//! The broker decides, at staging, from data aterm hands its open — so a halt
+//! an OLDER aterm person tool writes is escalated exactly like a new one's,
+//! with no request tag, no protocol version and no flag on the wire.
+//! Four rules, each a record a person would miss:
+//!
+//! | rule | records | why it must survive a panic |
+//! |---|---|---|
+//! | `Subject("/f/*/fleet/>")` | a person's halt (`state=on` and `off`), barrier, notice | the emergency brake: a lost acked halt resumes agents after the reboot while the person saw ON; a lost lift re-halts the fleet |
+//! | `Subject("/f/*/in/p/>")` | mail onto a person's (or a service's) lane: an agent's `post to=<person>`, the receipts of a person's posts, the bridges' `undeliverable`/`expired`/`refused` notices | the notifier pages them off the machine, and the person reads them in `inbox` |
+//! | `PrincipalPrefix("h-")` | every VISIBLE record a person's own bound producer stages: halts, asks, answers, tasks, notes — never a hidden one (their `/a/bind`, below) | the person's own words, confirmed to them `@off` |
+//! | `Group("/f/*/cur/p/>")` | a person's inbox commit (a hidden `/a/commit`, producer 0, so only a group rule sees it) | `inbox` prints "marked read through @upto" right after it; a lost one re-shows mail the person was told is read |
+//!
+//! Both subject and principal rules, because an unbound grant (the fleet
+//! root's god cap) has no principal: only a subject rule catches what it
+//! writes. On an UNGUARDED broker nothing is bound, so the principal rule sees
+//! nobody and a person's own posts ride the horizon with the machine records;
+//! that broker's promise says so ([`describe_served`]).
+//!
+//! The principal rule reads only a VISIBLE record: astream matches no hidden
+//! `/a/...` subject by subject or by principal. So a person's own bind — the
+//! hidden `/a/bind` their first attach stages, before their producer is bound
+//! — rides the horizon (astream's `broker.guarded-durability` asserts both
+//! for an `h-` producer). It may: every record a person's tools write after
+//! it is escalated, and the first one's full flush covers everything before
+//! it in the log; a bind a power loss took is staged again by their next
+//! attach. A person's tools (`aterm fabric halt|post|inbox`,
+//! [`crate::person`]) register no will and retire nothing: only a bridge does
+//! either, under its node's `n-` principal.
+//!
+//! Everything else — agent and session posts and their receipts, presence
+//! (`attention=` included), `ev` digests, and a bridge's halt acks, node inbox
+//! commits, retires (hidden `/a/retire` records) and presence will (its hidden
+//! registration, and its firing: a publish on the node's own presence face,
+//! which no rule names) — rides the horizon. It may, because:
+//!
+//! * ON THE BROKER'S DEVICE IT IS A CONSISTENT CUT. The barrier is device-wide
+//!   and a batch's ack is sent after it, so every effect of that ack recorded
+//!   on the same disk — the bridge's state files, the endpoint's ring, the
+//!   notifier's cursor, transcripts — is issued after the barrier and cannot
+//!   reach the media unless the batch did. After a power loss the disk holds a
+//!   consistent past; the generation's lineage tells every reader where the
+//!   log continues, and `halt-acked` is cleared so every bridge re-acks.
+//! * OFF THE DEVICE, ONLY THE NOTIFIER PUSHES, and on a broker that serves
+//!   ordered it pages a record only once a `Mark` says it is durable
+//!   ([`crate::notify`]): an `attention=` row waits at most the horizon plus
+//!   one batch and one full flush, and escalated records — durable before
+//!   they are visible — page at once.
+//! * NO PEER IS OFF THE MACHINE. The bus is this machine's Unix socket
+//!   ([`crate::transport`]): every bridge, notifier and person tool that
+//!   holds an offset into the log keeps it on the broker's own host, which the
+//!   lineage clamp covers.
 //!
 //! What the flush costs, MEASURED with astream's own
 //! `broker_durability_bench` (one producer, each publish acked before the
@@ -48,41 +121,46 @@
 //!   bridge as `inbox-owed`: copies, OUTSIDE the log, of a commit the node's
 //!   inbox group has not made yet;
 //! * the notifier's `cur/` and `journal` ([`crate::notify`]);
-//! * the aterm endpoint's inbox ring (`off=`), told which log by the bridge.
+//! * the aterm endpoint's inbox ring (`off=`, and its delivery dedup), its
+//!   owed receipts, queued replies and parked reads, told which log by the
+//!   bridge.
 //!
-//! A relaxed power loss cuts the log back to what reached the disk, and the
-//! next writes reuse the lost records' offsets. Kept under an unchanged
-//! identity, every one of those offsets would then name a record its holder
-//! never saw — the bridge's `seen/` would answer "nothing to refill" over new
-//! mail, `topics/` would skip broadcasts, `acked` would vouch for a record that
-//! is not this node's, a notifier's journal would swallow a new escalation —
-//! and once another writer regrew the log past the old head, nothing could
-//! tell. So the identity has to change, and it does:
+//! A power loss under a weak tier (ordered or relaxed) cuts the log back to
+//! what reached the disk, and the next writes reuse the lost records' offsets.
+//! Kept under an unchanged identity, every one of those offsets would then
+//! name a record its holder never saw — the bridge's `seen/` would answer
+//! "nothing to refill" over new mail, `topics/` would skip broadcasts, `acked`
+//! would vouch for a record that is not this node's, a notifier's journal
+//! would swallow a new escalation — and once another writer regrew the log
+//! past the old head, nothing could tell. So the identity has to change, and
+//! it does:
 //!
 //! ## What astream does: the generation moves, with LINEAGE
 //!
 //! astream's broker log records how each run stood with the log in its
 //! identity sidecar (`<log>.id`, FORMAT 2): the tier it served, the boot it
 //! served in, whether the log was on the boot volume, and whether it stopped
-//! cleanly. The first open after a run that served Relaxed and did NOT stop
-//! cleanly moves the log's GENERATION by one when that open is in ANOTHER
-//! boot — or when either boot cannot be named, or the run's log was off the
-//! boot volume — and records where the two generations still agree — `(new
-//! generation, common)`, `common` being the head the open recovered: every
-//! offset below it names the same record under both
+//! cleanly. The first open after a run that served a weak tier (Ordered or
+//! Relaxed) and did NOT stop cleanly moves the log's GENERATION by one when
+//! that open is in ANOTHER boot — or when either boot cannot be named, or the
+//! run's log was off the boot volume — and records where the two generations
+//! still agree — `(new generation, common)`, `common` being the head the open
+//! recovered: every offset below it names the same record under both
 //! ([`astream_broker::LogIdentity::continues`]). A process crash (`kill -9`)
 //! reopened in the same boot, on the boot volume, moves nothing: the kernel
 //! still held every acked byte, and the open's flush made them durable. Off
 //! the boot volume (a separate `/home` partition, an external disk) astream
 //! cannot lean on that — a disk's own cache can go with it, a forced eject
 //! included — so there every unclean relaxed stop moves the generation, a
-//! `kill -9` too.
+//! `kill -9` too (astream serves ordered strict off the boot volume, and a
+//! strict run moves nothing).
 //!
 //! Every reader CLAMPS instead of forgetting: the bridge resumes its cursors
 //! at the lower of where they were and `common`, and drops only what names a
 //! record at or above it ([`crate::state::LogWitness::continues`],
 //! [`crate::state::StateDir::forget_log_offsets`]); the notifier carries its
-//! cursors and journal over the same way (`Store::for_log`). So a broadcast or
+//! cursors and journal over the same way (`Store::for_log`), and the aterm
+//! endpoint its sessions' references (below). So a broadcast or
 //! an escalation posted after the restart, at an offset the lost records once
 //! had, is delivered and paged — nothing below the fork is re-read, nothing
 //! after it skipped. Only `halt-acked` is always cleared, clamped or not: it
@@ -95,15 +173,15 @@
 //!
 //! ## What the broker verb does
 //!
-//! A RELAXED BROKER STOPS CLEANLY. Stopped by SIGTERM, SIGINT or SIGHUP —
-//! launchd at logout or shutdown, `systemctl stop`, `aterm fabric off`, a
-//! terminal's ^C — or leaving for a replaced build, it drops its listeners:
-//! astream joins the writer, flushes the log in full and writes `Closed` into
-//! the sidecar before it lets go of the log's lock, so a reboot after it moves
-//! nothing. Only a stop that never got that far — a power loss, a kernel
-//! panic, a hard reset, a SIGKILL (a supervisor's stop timeout included) —
-//! leaves the run `Open`, and the next boot's open moves the generation (the
-//! next open at all, off the boot volume).
+//! A WEAK BROKER (ORDERED OR RELAXED) STOPS CLEANLY. Stopped by SIGTERM,
+//! SIGINT or SIGHUP — launchd at logout or shutdown, `systemctl stop`, `aterm
+//! fabric off`, a terminal's ^C — or leaving for a replaced build, it drops
+//! its listener: astream joins the writer, flushes the log in full and writes
+//! `Closed` into the sidecar before it lets go of the log's lock, so a reboot
+//! after it moves nothing. Only a stop that never got that far — a power
+//! loss, a kernel panic, a hard reset, a SIGKILL (a supervisor's stop timeout
+//! included) — leaves the run `Open`, and the next boot's open moves the
+//! generation (the next open at all, off the boot volume).
 //!
 //! THE LEGACY MARK. Builds before lineage marked a relaxed log with the boot
 //! that opened it (`<log>.aterm-relaxed`, [`MARK_SUFFIX`]) and renewed the
@@ -143,21 +221,38 @@
 //! generation after every unclean stop, a process crash included — the price
 //! of not knowing.
 //!
-//! WHAT A MOVE STILL COSTS A SESSION. The clamp is the bridge's and the
-//! notifier's; the aterm endpoint (each session's inbox, outbox and owed
-//! receipts) is told the new identity and forgets every bus offset it holds,
-//! as for any change of log. So a reply a session had queued while the broker
-//! was down, and a verdict (`inbox ack`) on a row it was shown before the move,
-//! are retired `log-replaced` — and the asker's bridge, which keeps its
-//! deadline below the fork, says `expired` for that ask (no reply reached it)
-//! where before lineage it said nothing. A reply posted after the move, or one
-//! the bridge already held in flight, is published and settles the ask.
+//! THE ENDPOINT CLAMPS TOO. The aterm endpoint (each session's inbox, outbox
+//! and owed receipts) is told the new identity together with the generation it
+//! continues and the fork (`link log <id> continues=<f> was=<id>`, bridge lane
+//! 3, `Bridge::tell_endpoint_log`), and a session on that generation forgets
+//! only what names an offset at or above the fork: a reply it had queued while
+//! the broker was down, a verdict (`inbox seen <id> handled`) on a row it was
+//! shown before the move, a parked `inbox get @<off>` and its delivery dedup
+//! survive below it, so the reply is published, the receipt settles the
+//! asker's deadline (which its bridge kept below the fork) and a refill does
+//! not deliver a row twice. What names an offset at or above the fork is
+//! retired `log-replaced`, as on any change of log. An endpoint of an older
+//! build (lane 2) is told the bare identity and forgets every offset: its
+//! queued reply and its verdict's receipt are retired, and the asker's bridge
+//! says `expired` for that ask (no reply reached it). So does a session
+//! carried on any other clock than the one the move continues. The endpoint
+//! applies each move it is told once, with no window of its own: the fork is
+//! already the lowest common between the two identities, so a chain of moves
+//! keeps exactly what is below every fork in it, however long. All of this is
+//! for an aterm that OUTLIVES the move — the reopen after a failed flush
+//! poisoned the log, a repair's cut, a `kill -9` where the generation moves
+//! for it (above). A power loss stops aterm too, and its sessions' queued
+//! replies and owed receipts go with it.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// The flag a broker argv carries for a named tier.
 pub const FLAG: &str = "--durability";
+
+/// The broker's volume seam, a development build's only: `other` opens the log
+/// as if it were off the boot volume ([`open_escalating`]).
+pub const VOLUME_SEAM: &str = "ATERM_LINK_BROKER_VOLUME";
 
 /// What a build before lineage marked a log with while a Relaxed run's acks
 /// might be only in the page cache: `<log>` + this. Read, never written.
@@ -166,17 +261,83 @@ pub const MARK_SUFFIX: &str = ".aterm-relaxed";
 /// The tier a broker acks at ([module docs](self)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
-    /// An ack is flushed in full: it survives a power loss. The default.
+    /// An ack is flushed in full: it survives a power loss. The fallback for
+    /// an argv this build cannot read ([`Durability::of_argv`]); a bare argv
+    /// runs [`default_for`].
     #[default]
     Strict,
-    /// An ack is ordered on the device, flushed in full at most a horizon
-    /// later — the tier a later build serves. THIS build accepts the word and
-    /// serves it strict ([`Durability::tier`]).
+    /// An ack is ordered on the device, and flushed in full by the full
+    /// flush the writer issues a horizon after the first ack no full flush
+    /// covers — at most the horizon plus one batch plus one full flush after
+    /// it ([`ORDERED_HORIZON`]); the records [`escalation`] names are flushed
+    /// in full before their ack. astream serves it strict where the device
+    /// cannot promise the order.
     Ordered,
     /// An ack is in the page cache: it survives a broker crash, not a power
     /// loss, and the log's generation moves (with lineage) after the machine
-    /// restarts without the broker's clean stop.
+    /// restarts without the broker's clean stop. The records [`escalation`]
+    /// names are flushed in full before their ack.
     Relaxed,
+}
+
+/// THE HORIZON aterm opens an ordered broker with: once this has passed since
+/// the first ack no full flush covers, the writer issues a full flush after
+/// the batch in hand ([`astream_broker::ServedInfo::horizon_ms`]) — so the
+/// oldest such ack is at most this plus one batch plus one full flush old, the
+/// "machine records" a panic or forced power-off can take. Not "at most
+/// 100 ms": the 2026-10-20 arms below measured an ack up to 145 ms from being
+/// on stable media (`2026-10-20-fabric-3`'s burst; 114-123 ms at most in the
+/// latency phases, from a p50 of 64-75 ms). 100 ms, not astream's one-second
+/// default ([`astream_broker::ORDERED_HORIZON`]).
+///
+/// MEASURED, by the rule the ordered plan set before any number existed: one
+/// second stays unless a 100 ms arm beats it by more than 20 % on the fabric
+/// bench's post -> durable p50, the one number a horizon bounds — and the
+/// 100 ms arm must pass the default's own gate ([`default_for`]). In the
+/// same-day set of 2026-10-20 (`docs/measured/fabric/2026-10-20-fabric` to
+/// `-11`, dev build, one machine at load 15-58) it beat one second in every
+/// pair: 75.75, 64.99 and 70.42 ms against 543.53, 222.05 and 227.08, and it
+/// passed every clause of that gate in every pair. What it costs is full
+/// flushes while traffic is continuous — about one a horizon, so up to ten a
+/// second against one: 3-4 over a 500-message burst against none, 0.02-0.035
+/// a message in the latency phase against 0-0.005, 0.035-0.06 a ping-pong
+/// round trip against 0.005 — each outside the log's lock, after the batch's
+/// acks. A sparse burst pays one full flush at either horizon (it runs from
+/// the first uncovered ack), and a strict broker pays one per batch. ON TOP of
+/// the horizon's, every batch that carries a record [`escalation`] names pays
+/// its own full flush before its ack, at either horizon: a person posting, a
+/// halt, mail to a person, an inbox read mark. The bench's messages are agent
+/// notes, so none of its numbers include one.
+pub const ORDERED_HORIZON: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// THE RECORDS A PERSON WOULD MISS, as the broker's escalation table
+/// ([`astream_broker::OpenOptions::escalation`]): flushed in full before they
+/// are visible or acked on a tier whose ordinary ack is not — ordered and
+/// relaxed. The [module docs](self) say record by record what each rule
+/// catches and why; the table test (`each_record_a_person_would_miss_is_escalated`)
+/// drives every kind through a real broker, built by aterm's own subject
+/// builders.
+///
+/// Data, not a closure: astream parses it at the open (a rule that does not
+/// parse refuses the open, naming it) and matches it as each record is
+/// staged.
+#[must_use]
+pub fn escalation() -> astream_broker::Escalation {
+    use astream_broker::Escalate::{Group, PrincipalPrefix, Subject};
+    astream_broker::Escalation::new([
+        // Halts on and off, barriers, notices: the fleet face only an `h-`
+        // grant writes — and the god cap, whose writes have no principal.
+        Subject("/f/*/fleet/>".into()),
+        // Anything addressed to a person's (or a service's) lane.
+        Subject("/f/*/in/p/>".into()),
+        // Every visible record a person's own bound producer stages: a
+        // human's principal is `h-<name>` ([`crate::person::is_person_id`]).
+        // Never a hidden one (their `/a/bind`). An `a-` service's writes are
+        // machine records, and ride the horizon.
+        PrincipalPrefix("h-".into()),
+        // A person's inbox commit: a hidden record only a group rule sees.
+        Group("/f/*/cur/p/>".into()),
+    ])
 }
 
 impl Durability {
@@ -207,41 +368,59 @@ impl Durability {
         }
     }
 
-    /// astream's tier, AS THIS BUILD OPENS IT: `ordered` is served strict
-    /// ([module docs](self)), never weaker than asked.
+    /// astream's tier: `ordered` at aterm's horizon ([`ORDERED_HORIZON`]).
+    /// astream itself serves it strict where the device cannot promise the
+    /// order, and says so in its `Hello` ([`describe_served`]).
     #[must_use]
     pub fn tier(self) -> astream_broker::Durability {
         match self {
-            Durability::Strict | Durability::Ordered => astream_broker::Durability::Strict,
+            Durability::Strict => astream_broker::Durability::Strict,
+            Durability::Ordered => astream_broker::Durability::Ordered {
+                horizon: Some(ORDERED_HORIZON),
+            },
             Durability::Relaxed => astream_broker::Durability::Relaxed,
         }
     }
 
-    /// Whether this build serves the tier as it is named: every tier but
-    /// `ordered`, which it serves strict.
+    /// HOW aterm OPENS a broker at this tier: [`Self::tier`], and on every
+    /// tier whose ordinary ack is not a full flush, aterm's [`escalation`]
+    /// table. Strict gets no table: every one of its batches is flushed in
+    /// full anyway, and a table there would only spend a match per staged
+    /// record (and report rules its `Hello` has no use for). The boot, the
+    /// volume and the guard are the caller's ([`open`] sets the boot and the
+    /// guard; the fabric suite and bench set the guard, and a horizon of
+    /// their own where they measure one).
     #[must_use]
-    pub fn served_as_named(self) -> bool {
-        self != Durability::Ordered
+    pub fn options(self) -> astream_broker::OpenOptions {
+        let mut opts = astream_broker::OpenOptions::new(self.tier());
+        if self != Durability::Strict {
+            opts.escalation = escalation();
+        }
+        opts
     }
 
-    /// What an ack promises, in words, for the tier AS SERVED — the broker's
-    /// readiness line, `aterm fabric`, doctor and `on`, through
-    /// [`describe_served`], which reads the tier served from the broker
-    /// itself. `ordered`'s words are the tier's own, without the numbers its
-    /// broker reports ([`describe_served`] says those); a broker of THIS build
-    /// serves `ordered` strict and says strict's words.
+    /// What an ack promises, in words, for a GUARDED broker of THIS build
+    /// SERVING this tier, with its own horizon and table — `on`'s note
+    /// ([`describe_own`]) and the fallback for a broker that does not report
+    /// what it serves. A weak tier's LOSS is worded by [`loss`] over this
+    /// build's horizon, the words a running broker's `Hello` gets
+    /// ([`describe_served`]) for the horizon it reports, so `on`'s note and
+    /// `aterm fabric`'s `acks` row cannot state two bounds for one broker —
+    /// astream's, the horizon plus a batch and a full flush. Only this, which
+    /// knows the table this build hands its broker ([`escalation`]), names
+    /// the records it spares ([`SPARED`]): a `Hello` reports a rule count,
+    /// which identifies no table ([`weak_promise`]).
     #[must_use]
-    pub fn promise(self) -> &'static str {
+    pub fn promise(self) -> String {
         match self {
-            Durability::Strict => "an ack is on the disk: a power loss loses nothing acked",
-            Durability::Ordered => {
-                "an ack is in order on the disk: a power loss keeps a prefix of whole acked \
-                 batches, every one a full flush covered, and can lose the newest ones, and \
-                 readers resume where the log continues"
-            }
-            Durability::Relaxed => {
-                "an ack is in memory: a power loss can lose any record acked since the broker \
-                 last started or stopped cleanly, and readers resume where the log continues"
+            Durability::Strict => STRICT_PROMISE.to_string(),
+            weak => {
+                // This build's own broker reports aterm's horizon on ordered,
+                // as astream rounds it, and none on relaxed.
+                let horizon_ms = (weak == Durability::Ordered)
+                    .then(|| astream_broker::ServedInfo::horizon_ms_of(ORDERED_HORIZON));
+                let (head, lost) = loss(weak, horizon_ms, "machine record");
+                format!("{head}: {lost} — {SPARED} — and readers resume where the log continues")
             }
         }
     }
@@ -287,12 +466,54 @@ impl Durability {
     }
 }
 
-/// The tier a broker runs whose argv names `named` (`None`: a bare argv,
-/// which runs THE BUILD'S DEFAULT — strict in this build). Every judgement of
-/// what a broker acks under goes through here, never through the argv's words.
+/// THE BUILD'S DEFAULT for a bare broker argv: ORDERED for a GUARDED broker
+/// (`guarded`: its argv names a mint secret, `--secret-file`, as the job
+/// `aterm fabric on` writes always does), STRICT for one naming none.
+///
+/// WHERE ORDERED IS SERVED IS ASTREAM'S TO DECIDE, never this function's: a
+/// log on a macOS boot volume is served ordered, and anywhere the device
+/// cannot promise the order — off Apple (no ordering-only flush), a log off
+/// the boot volume, a descriptor that refuses the barrier — astream serves it
+/// strict, never weaker than asked, and its `Hello` says why, which status
+/// and doctor print ([`describe_served`]). So this asks for ordered on every
+/// platform, and a platform astream learns to order on gets it with no change
+/// here.
+///
+/// Decided by the same-day ledger set of 2026-10-20
+/// (`docs/measured/fabric/2026-10-20-fabric` to `-11`: strict, ordered at 1 s
+/// and at 100 ms, and relaxed, interleaved on one machine), against the gate
+/// the ordered plan set before any number existed: ordered's post -> visible
+/// p50 at most 0.6 × strict's, its burst at least 0.95 × strict's messages/s,
+/// and its 8-session attach p50 no worse than strict's by more than that run's
+/// own p50–p95 spread. Every clause held for both horizons in every pair (the
+/// README and the CHANGELOG quote the numbers), and the horizon is aterm's
+/// 100 ms by the same plan's rule ([`ORDERED_HORIZON`]).
+///
+/// Strict stays the default for an argv naming no mint secret: nothing is
+/// bound there, so the `PrincipalPrefix("h-")` rule ([`escalation`]) sees
+/// nobody and a person's own posts would ride the horizon with the machine
+/// records. (A broker guarded only by the `mint.secret` beside its socket is
+/// judged by its argv as unguarded: strict, the safe side, and the same word
+/// every reader of the running argv — `aterm fabric`, doctor, `on` —
+/// derives.) The bus is this machine's Unix socket, so every reader that
+/// holds an offset into the log is on the broker's own device, which the
+/// barrier orders and the lineage clamp covers.
 #[must_use]
-pub fn resolve(named: Option<Durability>) -> Durability {
-    named.unwrap_or_default()
+pub fn default_for(guarded: bool) -> Durability {
+    if guarded {
+        Durability::Ordered
+    } else {
+        Durability::Strict
+    }
+}
+
+/// The tier a broker runs whose argv names `named` (`None`: a bare argv,
+/// which runs THE BUILD'S DEFAULT for a broker `guarded` or not,
+/// [`default_for`]). Every judgement of what a broker acks under goes through
+/// here, never through the argv's words.
+#[must_use]
+pub fn resolve(named: Option<Durability>, guarded: bool) -> Durability {
+    named.unwrap_or_else(|| default_for(guarded))
 }
 
 /// The words a broker argv carries for a tier: `--durability <tier>` for a
@@ -338,27 +559,34 @@ fn served_reason(reason: astream_broker::ServedReason) -> String {
 /// names (or, for a broker this host cannot read the argv of, the one its
 /// `Hello` says was requested), `served` what its `Hello` block's tag 0x01
 /// says it serves ([`astream_broker::Client::served_durability`]; `None` from
-/// a broker that predates the block). The words `aterm fabric`'s `acks` row,
-/// doctor and the broker's own readiness line print after the tier's name.
+/// a broker that predates the block), and `guarded` whether it checks
+/// capabilities (`None`: not known, read as guarded — `aterm fabric`'s
+/// `guard` row says it when it is not). The words `aterm fabric`'s `acks`
+/// row, doctor and the broker's own readiness line print after the tier's
+/// name.
 ///
 /// THE SERVED TIER IS READ FROM THE BROKER, NEVER INFERRED FROM THE ARGV, and
 /// its words are the served tier's whatever was asked: a broker of another
-/// build need not serve what this build would for the same argv. An `ordered`
-/// argv run by THIS build serves strict and says "served strict"; a LATER
-/// build's broker that serves ordered — named, or as its default for a bare
-/// argv this build reads as strict — says ordered's words with the horizon and
-/// the escalation rules it reports, never strict's "loses nothing acked"; and
-/// whenever the tier served is not the one asked, the line says so, and why.
-/// With no block the broker predates lineage (an aterm before this one): its
-/// argv is all there is to go by, and a relaxed one's power loss gives the log
-/// a NEW IDENTITY, which every reader forgets its place in — not a generation
-/// readers resume on.
+/// build need not serve what this build would for the same argv, and astream
+/// serves `ordered` strict where the device cannot promise the order. A broker
+/// that serves ordered says ordered's words with the horizon and the
+/// escalation rules it reports, never strict's "loses nothing acked"; a weak
+/// tier whose broker reports no rules (an older build's, or `asb serve`'s)
+/// spares nothing, and says so; and whenever the tier served is not the one
+/// asked, the line says so, and why. With no block the broker predates
+/// lineage (an aterm before it): its argv is all there is to go by, and a
+/// relaxed one's power loss gives the log a NEW IDENTITY, which every reader
+/// forgets its place in — not a generation readers resume on.
 #[must_use]
-pub fn describe_served(asked: Durability, served: Option<astream_broker::ServedInfo>) -> String {
+pub fn describe_served(
+    asked: Durability,
+    served: Option<astream_broker::ServedInfo>,
+    guarded: Option<bool>,
+) -> String {
     use astream_broker::{ServedReason, Tier};
     let Some(info) = served else {
         return match asked {
-            Durability::Strict => Durability::Strict.promise().to_string(),
+            Durability::Strict => Durability::Strict.promise(),
             Durability::Ordered => "a broker too old to report what it serves, and too old to \
                                     serve ordered"
                 .to_string(),
@@ -370,8 +598,8 @@ pub fn describe_served(asked: Durability, served: Option<astream_broker::ServedI
         };
     };
     let promise = match Durability::of_tier(info.served) {
-        Some(Durability::Ordered) => ordered_promise(&info),
-        Some(tier) => tier.promise().to_string(),
+        Some(Durability::Strict) => Durability::Strict.promise(),
+        Some(weak) => weak_promise(weak, &info, guarded),
         None => format!(
             "a tier this build cannot name ({:?}), whose promise it cannot say",
             info.served
@@ -383,61 +611,127 @@ pub fn describe_served(asked: Durability, served: Option<astream_broker::ServedI
     let why = if info.reason != ServedReason::None {
         // The broker lowered what it was asked for itself.
         served_reason(info.reason)
-    } else if asked == Durability::Ordered && info.served == Tier::Strict {
-        // A broker of THIS increment: it takes the word and opens the log strict.
+    } else if asked == Durability::Ordered
+        && info.served == Tier::Strict
+        && info.requested == Tier::Strict
+    {
+        // A broker of an older build: it took the word and opened the log
+        // strict, as the build before this one did.
         "its build serves ordered as strict".to_string()
     } else {
         // Asked one tier, opened at another, and not lowered: a broker of
-        // another build — a later one whose default a bare argv runs.
+        // another build — one whose default a bare argv runs.
         format!("its build opened it {}", tier_name(info.requested))
     };
     format!("served {} ({why}) — {promise}", tier_name(info.served))
 }
 
-/// What THIS build's broker serves for a tier `aterm fabric on` writes into
-/// its job — `on`'s own note, said before any broker of it runs: `ordered` is
-/// served strict, every other tier as named.
+/// What THIS build's broker promises for a tier `aterm fabric on` writes into
+/// its job — `on`'s own note, said before any broker of it runs, for the
+/// guarded broker `on` installs: the tier's promise as that broker reports it
+/// when it serves the tier ([`Durability::promise`]: the words `aterm fabric`
+/// then prints), and for ordered, that astream serves it strict where the
+/// device cannot keep the order. WHICH devices those are is astream's to
+/// decide and only the running broker can tell — today off Apple, a log off
+/// the boot volume, a descriptor that refuses the barrier — so the note does
+/// not guess: status reads what is served from the broker's `Hello`.
 #[must_use]
 pub fn describe_own(tier: Durability) -> String {
-    if tier.served_as_named() {
-        tier.promise().to_string()
-    } else {
-        format!(
-            "served strict (this build serves ordered as strict) — {}",
-            Durability::Strict.promise()
-        )
+    match tier {
+        Durability::Ordered => format!(
+            "{}; astream serves it strict where the device cannot keep the order, and `aterm \
+             fabric` says so and why",
+            tier.promise()
+        ),
+        _ => tier.promise(),
     }
 }
 
-/// ORDERED'S PROMISE WITH THE NUMBERS ITS BROKER REPORTS: the horizon a full
-/// flush follows an ack within (`None`: no horizon, so only an escalated
-/// record, a flush asked for or a clean stop flushes in full) and how many
-/// escalation rules flush their records in full before the ack. The bound is
-/// astream's ([`astream_broker::ServedInfo::horizon_ms`]): the oldest ack no
-/// full flush covers is at most the horizon plus one batch plus one full
-/// flush old.
-fn ordered_promise(info: &astream_broker::ServedInfo) -> String {
-    let lost = match info.horizon_ms {
-        Some(ms) if ms % 1000 == 0 && ms > 0 => format!(
-            "a power loss can lose the acks of the last {} s, plus a batch and a full flush",
-            ms / 1000
+/// What a strict ack promises: its batch's full flush came first.
+const STRICT_PROMISE: &str = "an ack is on the disk: a power loss loses nothing acked";
+
+/// The records aterm's [`escalation`] table keeps through a power loss, in
+/// the words this build's own promise uses ([`Durability::promise`]).
+const SPARED: &str =
+    "never a halt, a person's own words, mail to a person, or a person's read mark";
+
+/// WHAT A WEAK TIER CAN LOSE (`tier` is ordered or relaxed), as `(head,
+/// loss)`: for ordered, bounded by `horizon_ms` as a `Hello` reports it
+/// (`None`: no horizon, so only an escalated record, a flush asked for or a
+/// clean stop flushes in full) by the bound astream states
+/// ([`astream_broker::ServedInfo::horizon_ms`]: the oldest ack no full flush
+/// covers is at most the horizon plus one batch plus one full flush old); for
+/// relaxed, everything since the open. `what` names the records it can take.
+/// ONE WORDING for this build's own promise ([`Durability::promise`]) and a
+/// running broker's ([`weak_promise`]), so the two never state two bounds.
+fn loss(tier: Durability, horizon_ms: Option<u32>, what: &str) -> (&'static str, String) {
+    match tier {
+        Durability::Ordered => (
+            "an ack is in order on the disk",
+            match horizon_ms {
+                Some(0) => format!(
+                    "a panic or forced power-off can lose the newest batch and a full flush \
+                     of {what}s"
+                ),
+                Some(ms) if ms % 1000 == 0 => format!(
+                    "a panic or forced power-off can lose the last {} s of {what}s, plus a batch \
+                     and a full flush",
+                    ms / 1000
+                ),
+                Some(ms) => format!(
+                    "a panic or forced power-off can lose the last {ms} ms of {what}s, plus a \
+                     batch and a full flush"
+                ),
+                None => format!(
+                    "a panic or forced power-off can lose every {what} since the last full flush \
+                     (an escalated record's, a flush asked for, or a clean stop's)"
+                ),
+            },
         ),
-        Some(ms) => format!(
-            "a power loss can lose the acks of the last {ms} ms, plus a batch and a full flush"
+        _ => (
+            "an ack is in memory",
+            format!(
+                "a power loss can lose any {what} since the broker last started or stopped \
+                 cleanly"
+            ),
         ),
-        None => "a power loss can lose every ack since the last full flush (an escalated \
-                 record's, a flush asked for, or a clean stop's)"
+    }
+}
+
+/// A WEAK TIER'S PROMISE WITH THE NUMBERS ITS BROKER REPORTS (`tier` is
+/// ordered or relaxed): what a power loss can take — for ordered, bounded by
+/// the horizon it reports (`None`: no horizon, so only an escalated record, a
+/// flush asked for or a clean stop flushes in full), the bound astream states
+/// ([`astream_broker::ServedInfo::horizon_ms`]: the oldest ack no full flush
+/// covers is at most the horizon plus one batch plus one full flush old) —
+/// and what it never takes: the records its reported rules name, or nothing
+/// when it has none. A rule count identifies no table or protected record
+/// classes; only the known-local [`Durability::promise`] names those. On an
+/// unguarded broker principal-based rules match no producer.
+fn weak_promise(
+    tier: Durability,
+    info: &astream_broker::ServedInfo,
+    guarded: Option<bool>,
+) -> String {
+    // Hello reports a count, not the rules or a table identity: no record
+    // can be told apart as a "machine" one.
+    let (head, lost) = loss(tier, info.horizon_ms, "record");
+    let spared = match info.rules {
+        0 => " — no record is flushed in full before its ack —".to_string(),
+        1 => " — except the records its 1 escalation rule names, flushed in full before their \
+              ack —"
             .to_string(),
+        n => format!(
+            " — except the records its {n} escalation rules name, flushed in full before their \
+             ack —"
+        ),
     };
-    let escalated = match info.rules {
-        0 => "no record is flushed in full before its ack".to_string(),
-        1 => "the records 1 escalation rule names are flushed in full before their ack".to_string(),
-        n => format!("the records {n} escalation rules name are flushed in full before their ack"),
+    let unguarded = if guarded == Some(false) && info.rules > 0 {
+        "; on an unguarded broker no principal is bound, so principal-based rules do not match"
+    } else {
+        ""
     };
-    format!(
-        "an ack is in order on the disk: the log keeps a prefix of whole acked batches; {lost}; \
-         {escalated}; readers resume where the log continues"
-    )
+    format!("{head}: {lost}{spared} and readers resume where the log continues{unguarded}")
 }
 
 /// `<log>.aterm-relaxed`.
@@ -667,7 +961,8 @@ pub fn boot_text(boot: &[u8; 16]) -> String {
 
 /// What [`open`] opened, and what it did beside the open.
 pub struct Opened {
-    /// The broker, at the tier asked for (`ordered` served strict).
+    /// The broker, at the tier asked for, with aterm's table ([`Durability::options`]):
+    /// what it serves is its own word ([`astream_broker::Broker::served_durability`]).
     pub broker: astream_broker::Broker,
     /// Why a legacy mark made the open's verdict unclean, when it did: astream
     /// then moved the log's generation (with lineage, when it could bound the
@@ -697,12 +992,42 @@ pub fn open(
     durability: Durability,
     boot: Option<[u8; 16]>,
 ) -> io::Result<Opened> {
-    let mut opts = astream_broker::OpenOptions::new(durability.tier());
+    open_escalating(log, secret, durability, boot, Vec::new())
+}
+
+/// [`open`] with `extra` rules added to this build's escalation table — the
+/// broker fault seam's `escalate=` ([`crate::broker_health::Seam`]), a dev
+/// build's only, by which a test makes an ordinary post on a weak tier owe
+/// the broker a full flush. A release build passes none.
+///
+/// # Errors
+///
+/// As [`open`], and astream's refusal of a rule that does not parse.
+pub fn open_escalating(
+    log: &Path,
+    secret: Option<Vec<u8>>,
+    durability: Durability,
+    boot: Option<[u8; 16]>,
+    extra: Vec<astream_broker::Escalate>,
+) -> io::Result<Opened> {
+    let mut opts = durability.options();
     // The same 16 bytes the legacy mark is compared with (`renewal` below):
     // astream's verdict and the mark's judge one boot. An unknown boot makes
     // every unclean weak run move the generation, the safe direction.
     opts.boot = boot.map_or(astream_broker::Boot::Unknown, astream_broker::Boot::Known);
     opts.guard = secret;
+    // THE TEST SEAM FOR A LOG OFF THE BOOT VOLUME (a removable disk, a
+    // separate partition): astream then serves ordered strict, and moves the
+    // generation after every unclean relaxed stop. What the end-to-end test of
+    // the default off the boot volume stands in, since no test can unplug a
+    // disk; a released binary honours none (`aterm_types::dev_seam!`).
+    if aterm_types::dev_seam!(VOLUME_SEAM).is_some_and(|v| v == "other") {
+        opts.volume = astream_broker::Volume::Other;
+    }
+    if !extra.is_empty() {
+        let rules = opts.escalation.rules().to_vec();
+        opts.escalation = astream_broker::Escalation::new(rules.into_iter().chain(extra));
+    }
     // The mark is read INSIDE astream's open, under the log's own exclusive
     // lock and before astream reads `<log>.id`: a log another broker serves is
     // refused before anything here looks at it, and the verdict is the one
@@ -836,8 +1161,10 @@ mod tests {
                 "bus.log",
             ],
         ];
+        // Each names a mint secret and no tier: the guarded default, never the
+        // tier a value spells.
         let got: Vec<_> = cases.iter().map(|args| Durability::of_argv(args)).collect();
-        assert_eq!(got, vec![Durability::Strict; cases.len()]);
+        assert_eq!(got, vec![default_for(true); cases.len()]);
     }
 
     #[cfg(unix)]
@@ -860,7 +1187,11 @@ mod tests {
         opaque.push(OsString::from_vec(
             b"/r/name\xff --durability relaxed".to_vec(),
         ));
-        assert_eq!(Durability::try_of_argv(&opaque), Some(Durability::Strict));
+        assert_eq!(
+            Durability::try_of_argv(&opaque),
+            Some(default_for(true)),
+            "a secret file whose name spells a tier names none"
+        );
         let invalid = [
             vec!["aterm", "link", "broker", "sock", "--secret-file"],
             vec![
@@ -894,10 +1225,17 @@ mod tests {
     }
 
     /// THE WORD, THE ARGV AND THE DEFAULT. Every word round-trips, a bare
-    /// argv names nothing and runs the build's default (strict), and a NAMED
-    /// strict is written into the argv and read back as named — so a job that
-    /// chose strict keeps it under a later build whose default differs. A word
-    /// the broker would refuse reads as no recognised argv.
+    /// argv names nothing and runs the build's default ([`default_for`]):
+    /// ordered for a guarded broker on every platform (astream decides where
+    /// it is served, and serves it strict elsewhere), strict for an unguarded
+    /// one. A NAMED strict is written into the argv and read back as named —
+    /// so a job that chose strict keeps it under this build, whose default for
+    /// `on`'s guarded broker is ordered. A word the broker would refuse reads
+    /// as no recognised argv.
+    ///
+    /// COMPAT, BOTH WAYS. An older build reads the same bare argv as its own
+    /// default, strict, so a revert runs strict; and every build since the one
+    /// that first took the word parses a named `ordered`.
     #[test]
     fn the_word_the_argv_and_the_default() {
         for tier in [Durability::Strict, Durability::Ordered, Durability::Relaxed] {
@@ -917,8 +1255,33 @@ mod tests {
         assert!(argv_words(None).is_empty(), "a bare argv names nothing");
         let bare = ["aterm", "link", "broker", "/r/bus.sock", "/r/bus.log"];
         assert_eq!(Durability::named_of_argv(&bare), Some(None));
-        assert_eq!(Durability::of_argv(&bare), resolve(None));
-        assert_eq!(resolve(None), Durability::Strict, "this build's default");
+        assert_eq!(Durability::of_argv(&bare), resolve(None, false));
+        assert_eq!(
+            resolve(None, false),
+            Durability::Strict,
+            "unguarded: strict"
+        );
+        assert_eq!(
+            resolve(None, true),
+            Durability::Ordered,
+            "the guarded broker's default, on every platform: astream decides what is served"
+        );
+        let guarded = [
+            "aterm",
+            "link",
+            "broker",
+            "/r/bus.sock",
+            "/r/bus.log",
+            "--secret-file",
+            "/r/mint.secret",
+        ];
+        assert_eq!(Durability::named_of_argv(&guarded), Some(None));
+        assert_eq!(Durability::of_argv(&guarded), resolve(None, true));
+        for named in [Durability::Strict, Durability::Ordered, Durability::Relaxed] {
+            for guarded in [false, true] {
+                assert_eq!(resolve(Some(named), guarded), named, "{named:?} {guarded}");
+            }
+        }
         assert_eq!(
             Durability::of_argv(&["broker", "--durability", "bogus"]),
             Durability::Strict,
@@ -926,57 +1289,111 @@ mod tests {
         );
     }
 
-    /// `ORDERED IS ACCEPTED AND SERVED STRICT`. The word maps to astream's
-    /// Strict, a broker opened with it answers `Hello` with a Strict tier
-    /// served as asked (the request astream saw was strict), and every line
-    /// that describes it says "served strict" with this build's reason —
-    /// never the ordered promise, which this build does not keep. A broker
-    /// that was asked for ordered and lowered it itself names its own reason.
+    /// `ORDERED IS SERVED ORDERED, WITH ATERM'S TABLE`. The word maps to
+    /// astream's Ordered tier at aterm's 100 ms horizon, and every weak tier opens with the
+    /// four-rule table while strict opens with none (its every batch is a
+    /// full flush). A broker opened ordered answers `Hello` with what astream
+    /// serves: on macOS, for a log under `/tmp` (the boot volume), ordered at
+    /// a 100 ms horizon with 4 rules, said in ordered's words with the
+    /// records it spares; elsewhere strict, said "served strict" with
+    /// astream's reason. A broker of an OLDER build, which took the word and
+    /// opened the log strict, is told so; one that lowered ordered itself
+    /// names its own reason; a relaxed broker says relaxed's words, sparing
+    /// the same records.
+    ///
+    /// ONE BOUND FOR ONE BROKER: `on`'s note for the ordered job it writes
+    /// ([`describe_own`]) words what a panic can take exactly as `aterm
+    /// fabric` words it for that broker's reported horizon — astream's bound,
+    /// the horizon plus a batch and a full flush — never a shorter one of its
+    /// own; only the note, which knows the table it wrote, names the records
+    /// the table spares.
     #[test]
-    fn ordered_is_accepted_and_served_strict() {
+    fn ordered_is_served_ordered_with_aterms_table() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
         assert_eq!(
             Durability::Ordered.tier(),
-            astream_broker::Durability::Strict
+            astream_broker::Durability::Ordered {
+                horizon: Some(ORDERED_HORIZON)
+            }
         );
-        assert!(!Durability::Ordered.served_as_named());
-        assert!(Durability::Strict.served_as_named() && Durability::Relaxed.served_as_named());
+        assert_eq!(Durability::Ordered.options().escalation, escalation());
+        assert_eq!(Durability::Relaxed.options().escalation, escalation());
+        assert!(Durability::Strict.options().escalation.is_empty());
         let dir = scratch();
         let log = dir.path().join("bus.log");
         let opened = open(&log, None, Durability::Ordered, Some(test_boot(1))).unwrap();
         let served = opened.broker.served_durability();
-        assert_eq!(
-            (served.requested, served.served, served.reason),
-            (Tier::Strict, Tier::Strict, ServedReason::None)
+        let said = describe_served(Durability::Ordered, Some(served), Some(true));
+        assert_eq!(served.requested, Tier::Ordered);
+        assert_eq!(served.rules, 4, "aterm's four rules");
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(
+                (served.served, served.reason, served.horizon_ms),
+                (Tier::Ordered, ServedReason::None, Some(100))
+            );
+            assert!(said.starts_with("an ack is in order on the disk"), "{said}");
+            assert!(
+                said.contains("the last 100 ms of records, plus a batch and a full flush"),
+                "astream's bound, not a shorter one: {said}"
+            );
+            assert!(said.contains("its 4 escalation rules name"), "{said}");
+            assert!(
+                !said.contains(SPARED),
+                "a count identifies no table: {said}"
+            );
+            assert!(!said.contains("loses nothing"), "{said}");
+            // ONE BOUND FOR THIS BROKER: the promise `on` states for it words
+            // its loss exactly as its Hello's horizon does.
+            let (_, lost) = loss(Durability::Ordered, served.horizon_ms, "machine record");
+            let promise = Durability::Ordered.promise();
+            assert!(
+                promise.contains(&lost) && promise.contains(SPARED),
+                "{promise} / {lost}"
+            );
+        } else {
+            assert_eq!(
+                (served.served, served.reason),
+                (Tier::Strict, ServedReason::NotApple)
+            );
+            assert!(
+                said.starts_with("served strict (the ordering barrier exists only on Apple)"),
+                "{said}"
+            );
+            assert!(said.ends_with(STRICT_PROMISE), "{said}");
+        }
+        let own = describe_own(Durability::Ordered);
+        assert!(
+            own.starts_with(&Durability::Ordered.promise())
+                && own.contains("astream serves it strict where the device cannot keep the order"),
+            "`on`'s note: the served promise, and that astream decides where: {own}"
         );
-        let said = describe_served(Durability::Ordered, Some(served));
+        let older = ServedInfo {
+            requested: Tier::Strict,
+            served: Tier::Strict,
+            reason: ServedReason::None,
+            horizon_ms: None,
+            rules: 0,
+        };
+        let said = describe_served(Durability::Ordered, Some(older), Some(true));
         assert!(
             said.starts_with("served strict (its build serves ordered as strict)"),
             "{said}"
         );
-        assert!(said.ends_with(Durability::Strict.promise()), "{said}");
-        assert_eq!(
-            describe_own(Durability::Ordered),
-            format!(
-                "served strict (this build serves ordered as strict) — {}",
-                Durability::Strict.promise()
-            ),
-            "`on` says what this build will serve"
-        );
+        assert!(said.ends_with(STRICT_PROMISE), "{said}");
         let lowered = ServedInfo {
             requested: Tier::Ordered,
             served: Tier::Strict,
             reason: ServedReason::NotBootVolume,
             horizon_ms: Some(1000),
-            rules: 0,
+            rules: 4,
         };
-        let said = describe_served(Durability::Ordered, Some(lowered));
+        let said = describe_served(Durability::Ordered, Some(lowered), Some(true));
         assert!(said.contains("its log is not on the boot volume"), "{said}");
         // The words are the SERVED tier's, whatever was asked: a broker that reports
         // strict is described as strict even when this host asked relaxed of it.
-        let said = describe_served(Durability::Relaxed, Some(served));
+        let said = describe_served(Durability::Relaxed, Some(older), Some(true));
         assert!(said.starts_with("served strict ("), "{said}");
-        assert!(said.ends_with(Durability::Strict.promise()), "{said}");
+        assert!(said.ends_with(STRICT_PROMISE), "{said}");
         let relaxed = open(
             &dir.path().join("relaxed.log"),
             None,
@@ -984,30 +1401,37 @@ mod tests {
             Some(test_boot(1)),
         )
         .unwrap();
-        assert_eq!(
-            describe_served(
-                Durability::Relaxed,
-                Some(relaxed.broker.served_durability())
-            ),
-            Durability::Relaxed.promise(),
-            "a tier served as asked says its own promise"
+        assert_eq!(relaxed.broker.served_durability().rules, 4);
+        let said = describe_served(
+            Durability::Relaxed,
+            Some(relaxed.broker.served_durability()),
+            Some(true),
         );
+        assert!(said.contains("its 4 escalation rules name"), "{said}");
+        assert!(
+            !said.contains(SPARED),
+            "a count identifies no table: {said}"
+        );
+        for weak in [Durability::Ordered, Durability::Relaxed] {
+            assert!(weak.promise().contains(SPARED), "{weak:?}");
+        }
     }
 
-    /// A BROKER THAT SERVES ORDERED IS NEVER TOLD AS STRICT. A later build's
-    /// broker reports ordered in its `Hello`: asked ordered (a named job, or a
-    /// broker whose argv this host cannot read, whose requested tier is the
-    /// one asked), or asked
-    /// what this build reads a bare argv as (strict) while that build's own
-    /// default is ordered. Either way the line says ordered's words with the
-    /// broker's own horizon and escalation count — never strict's "loses nothing
-    /// acked", which a power loss there would make a lie — and in the second
-    /// case says the tier served differs from the one asked. A broker with no
-    /// block (older than lineage) running relaxed is told with the cost such a
-    /// broker has: a new identity readers forget, not a generation they resume
-    /// on.
+    /// A BROKER THAT SERVES A WEAK TIER IS TOLD BY WHAT IT REPORTS. Ordered
+    /// is never told as strict: asked ordered, or asked what this build reads
+    /// a bare argv as (strict) while the broker's build opened it ordered,
+    /// the line says ordered's words with the broker's own horizon — never
+    /// strict's "loses nothing acked", which a power loss there would make a
+    /// lie — and in the second case says the tier served differs from the one
+    /// asked. A rule COUNT identifies no table: four arbitrary rules do not
+    /// imply that a person's records survive. Every nonzero count names only
+    /// its rules; NONE (an older build's relaxed broker, or `asb serve`'s)
+    /// spares nothing and says so. An unguarded broker's words qualify only
+    /// the effect on principal-based rules. A broker with no block (older than
+    /// lineage) running relaxed is told with the cost such a broker has: a
+    /// new identity readers forget, not a generation they resume on.
     #[test]
-    fn a_broker_that_serves_ordered_is_never_told_as_strict() {
+    fn a_weak_tier_is_told_by_what_its_broker_reports() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
         let ordered = ServedInfo {
             requested: Tier::Ordered,
@@ -1016,36 +1440,78 @@ mod tests {
             horizon_ms: Some(1000),
             rules: 4,
         };
-        let strict = Durability::Strict.promise();
-        let said = describe_served(Durability::Ordered, Some(ordered));
+        let strict = STRICT_PROMISE;
+        let said = describe_served(Durability::Ordered, Some(ordered), Some(true));
         assert!(said.starts_with("an ack is in order on the disk"), "{said}");
         assert!(said.contains("the last 1 s"), "{said}");
-        assert!(said.contains("4 escalation rules"), "{said}");
+        assert!(said.contains("its 4 escalation rules name"), "{said}");
+        assert!(
+            !said.contains(SPARED),
+            "four rules identify no table: {said}"
+        );
+        assert!(
+            !said.contains("machine record"),
+            "unknown protected classes: {said}"
+        );
+        assert!(describe_own(Durability::Relaxed).contains(SPARED));
+        assert!(!said.contains("unguarded"), "{said}");
         assert!(
             !said.contains(strict) && !said.contains("loses nothing"),
             "{said}"
         );
-        let said = describe_served(Durability::Strict, Some(ordered));
+        let said = describe_served(Durability::Strict, Some(ordered), Some(true));
         assert!(
             said.starts_with("served ordered (its build opened it ordered) — an ack is in order"),
             "{said}"
         );
         assert!(!said.contains("loses nothing"), "{said}");
+        let said = describe_served(Durability::Ordered, Some(ordered), Some(false));
+        assert!(
+            said.ends_with("no principal is bound, so principal-based rules do not match"),
+            "{said}"
+        );
         let unbounded = ServedInfo {
             horizon_ms: None,
             rules: 1,
             ..ordered
         };
-        let said = describe_served(Durability::Ordered, Some(unbounded));
+        let said = describe_served(Durability::Ordered, Some(unbounded), None);
         assert!(
-            said.contains("every ack since the last full flush"),
+            said.contains("every record since the last full flush"),
             "{said}"
         );
-        assert!(said.contains("1 escalation rule names"), "{said}");
-        let said = describe_served(Durability::Relaxed, None);
+        assert!(said.contains("its 1 escalation rule names"), "{said}");
+        assert!(
+            !said.contains(SPARED),
+            "another table spares its own records"
+        );
+        let hundred = ServedInfo {
+            horizon_ms: Some(100),
+            ..ordered
+        };
+        let said = describe_served(Durability::Ordered, Some(hundred), None);
+        assert!(said.contains("the last 100 ms of records"), "{said}");
+        for tier in [Tier::Ordered, Tier::Relaxed] {
+            let bare = ServedInfo {
+                requested: tier,
+                served: tier,
+                horizon_ms: None,
+                rules: 0,
+                ..ordered
+            };
+            let asked = Durability::of_tier(tier).unwrap();
+            let said = describe_served(asked, Some(bare), Some(false));
+            assert!(said.contains("no record is flushed in full"), "{said}");
+            assert!(
+                !said.contains(SPARED) && !said.contains("machine record"),
+                "{said}"
+            );
+            assert!(!said.contains("unguarded"), "nothing to tell apart: {said}");
+        }
+        let said = describe_served(Durability::Relaxed, None, None);
         assert!(said.contains("a new identity"), "{said}");
         assert!(!said.contains("resume where the log continues"), "{said}");
-        assert_eq!(describe_served(Durability::Strict, None), strict);
+        assert_eq!(describe_served(Durability::Strict, None, None), strict);
         assert_eq!(
             Durability::of_tier(Tier::Ordered),
             Some(Durability::Ordered)
@@ -1617,6 +2083,218 @@ mod tests {
         );
         assert_eq!(std::fs::read(identity_sidecar(&log)).unwrap(), sidecar);
         drop(held);
+    }
+
+    /// One record kind the table test writes: who writes it, where, and
+    /// whether the table must escalate it.
+    enum Write {
+        /// A publish on `subject` under `who`'s caps.
+        Publish(Who, String),
+        /// A pure commit of `group` under `who`'s caps.
+        Commit(Who, String),
+    }
+
+    /// Whose caps a [`Write`] goes under.
+    #[derive(Clone, Copy, Debug)]
+    enum Who {
+        /// The person `h-x`, bound by their ring ([`crate::enable::person_grants`]).
+        Person,
+        /// The node's bridge, bound by its ring ([`crate::enable::node_grants`]).
+        Node,
+        /// The fleet root's god cap: unbound, so no principal rule sees it.
+        God,
+    }
+
+    const TABLE_FLEET: &str = "f";
+    const TABLE_NODE: &str = "n-00000000000000aa";
+    const TABLE_PERSON: &str = "h-x";
+
+    /// Every record kind of the table, as aterm's own builders spell it
+    /// ([`crate::subject`]), with whether it must be escalated.
+    fn table_writes() -> Vec<(&'static str, Write, bool)> {
+        use crate::subject;
+        let (f, node, p) = (TABLE_FLEET, TABLE_NODE, TABLE_PERSON);
+        vec![
+            (
+                "a person's halt",
+                Write::Publish(Who::Person, subject::person_halt(f, p)),
+                true,
+            ),
+            (
+                "a person's answer",
+                Write::Publish(Who::Person, subject::post_lane(f, node, "s-1", p, "answer")),
+                true,
+            ),
+            (
+                "mail onto a person's lane",
+                Write::Publish(
+                    Who::Node,
+                    format!("{}/ask", subject::person_lane(f, p, node)),
+                ),
+                true,
+            ),
+            (
+                "a person's inbox commit",
+                Write::Commit(Who::Person, subject::person_inbox_group(f, p)),
+                true,
+            ),
+            (
+                "the god cap's halt",
+                Write::Publish(Who::God, subject::person_halt(f, "h-y")),
+                true,
+            ),
+            (
+                "an agent's post",
+                Write::Publish(Who::Node, subject::post_lane(f, node, "s-2", node, "note")),
+                false,
+            ),
+            (
+                "a session's presence row",
+                Write::Publish(Who::Node, subject::session_face(f, node, "s-1", "presence")),
+                false,
+            ),
+            (
+                "the node's ev digest",
+                Write::Publish(Who::Node, subject::node_face(f, node, "ev")),
+                false,
+            ),
+            (
+                "a bridge's halt ack",
+                Write::Publish(Who::Node, subject::node_face(f, node, "ack")),
+                false,
+            ),
+            (
+                "the node's inbox commit",
+                Write::Commit(Who::Node, subject::inbox_group(f, node)),
+                false,
+            ),
+        ]
+    }
+
+    /// Write every [`table_writes`] record through a guarded broker opened
+    /// at `tier` with `table`, and answer, per kind, whether its record was
+    /// on stable media when its ack arrived — astream's own matcher, staged
+    /// as a real client's records are. `None` when astream serves `tier`
+    /// strict here (every record durable: the arm says nothing).
+    fn escalated_by(
+        tier: Durability,
+        table: astream_broker::Escalation,
+    ) -> Option<Vec<(&'static str, bool)>> {
+        let dir = scratch();
+        let log = dir.path().join("bus.log");
+        let sock = dir.path().join("bus.sock");
+        let secret = b"a-mint-secret-of-thirty-two-bytes".to_vec();
+        let mut opts = tier.options();
+        if tier == Durability::Ordered {
+            // NO HORIZON: the durable head then moves only for an escalated
+            // record, so what this answers depends on nothing but the code
+            // under test — never on how long the loop took between two acks.
+            opts.durability = astream_broker::Durability::Ordered { horizon: None };
+        }
+        opts.escalation = table;
+        opts.guard = Some(secret.clone());
+        opts.boot = astream_broker::Boot::Known(test_boot(1));
+        let broker =
+            astream_broker::Broker::open_opts(&log, opts, || Ok(astream_broker::Prepared::Nothing))
+                .expect("open");
+        if broker.served_durability().served == astream_broker::Tier::Strict {
+            return None;
+        }
+        let mut h = broker.serve(&sock).expect("serve");
+        let client = |grants: Vec<String>| {
+            let mut c = astream_broker::Client::connect(&sock).expect("connect");
+            for grant in grants {
+                let cap = astream_cap::mint(&secret, &grant).expect("mint");
+                c.attach(&cap.filter, &cap.tag).expect("attach");
+            }
+            c
+        };
+        let mut person = client(crate::enable::person_grants(TABLE_FLEET, TABLE_PERSON));
+        let mut node = client(crate::enable::node_grants(TABLE_FLEET, TABLE_NODE));
+        let mut god = client(vec![format!("/f/{TABLE_FLEET}/>")]);
+        let mut seq = 0;
+        let mut out = Vec::new();
+        for (what, write, _) in table_writes() {
+            seq += 1;
+            let off = match write {
+                Write::Publish(who, subject) => {
+                    let (c, producer) = match who {
+                        Who::Person => (&mut person, astream_cap::producer_id_of(TABLE_PERSON)),
+                        Who::Node => (&mut node, astream_cap::producer_id_of(TABLE_NODE)),
+                        Who::God => (&mut god, 9_100),
+                    };
+                    c.publish(producer, seq, &subject, b"v=1 t=1 state=on")
+                        .unwrap_or_else(|e| panic!("{what} on {subject}: {e}"))
+                        .0
+                }
+                Write::Commit(who, group) => {
+                    let c = match who {
+                        Who::Person => &mut person,
+                        Who::Node => &mut node,
+                        Who::God => &mut god,
+                    };
+                    c.commit(&group, 0)
+                        .unwrap_or_else(|e| panic!("{what} on {group}: {e}"))
+                }
+            };
+            // The ack is in hand: an escalated record's full flush came
+            // first, and nothing else moves the durable head (Relaxed keeps
+            // no horizon, and Ordered is opened with none).
+            out.push((what, broker.durable_head() > off));
+        }
+        h.shutdown();
+        Some(out)
+    }
+
+    /// EACH RECORD A PERSON WOULD MISS IS ESCALATED, AND NOTHING ELSE IS.
+    /// Every kind of the table, written by the principal that writes it in
+    /// the fabric (a person's ring, a node's ring, the god cap) on the
+    /// subjects aterm's own builders spell, through a real guarded broker:
+    /// the halt, the person's own post, mail onto their lane, their inbox
+    /// commit (a hidden record only the group rule sees) and an unbound halt
+    /// are on stable media at their ack; an agent's post, a presence row, an
+    /// `ev` digest, a bridge's halt ack and a node's inbox commit are not.
+    /// Relaxed runs it on every platform (its durable head moves only at a
+    /// full flush); Ordered too where astream serves it (macOS).
+    ///
+    /// NEGATIVE CONTROL: the table without the fleet subject rule. The
+    /// person's halt is still escalated (their principal rule sees it), but
+    /// the god cap's is NOT — no principal is bound to an unbound grant —
+    /// which is why the table keeps both kinds of rule.
+    #[test]
+    fn each_record_a_person_would_miss_is_escalated() {
+        let want: Vec<(&str, bool)> = table_writes()
+            .into_iter()
+            .map(|(what, _, escalated)| (what, escalated))
+            .collect();
+        let mut arms = 0;
+        for tier in [Durability::Relaxed, Durability::Ordered] {
+            match escalated_by(tier, escalation()) {
+                Some(got) => {
+                    assert_eq!(got, want, "{tier:?}");
+                    arms += 1;
+                }
+                None => eprintln!("{tier:?}: served strict here, so the arm proves nothing"),
+            }
+        }
+        assert!(arms >= 1, "the relaxed arm runs everywhere");
+
+        let without_fleet = astream_broker::Escalation::new(
+            escalation()
+                .rules()
+                .iter()
+                .filter(|r| **r != astream_broker::Escalate::Subject("/f/*/fleet/>".into()))
+                .cloned(),
+        );
+        assert_eq!(without_fleet.rules().len(), escalation().rules().len() - 1);
+        let got = escalated_by(Durability::Relaxed, without_fleet).expect("relaxed is served");
+        let of = |what: &str| got.iter().find(|(w, _)| *w == what).map(|(_, e)| *e);
+        assert_eq!(of("a person's halt"), Some(true), "their principal rule");
+        assert_eq!(
+            of("the god cap's halt"),
+            Some(false),
+            "an unbound halt escapes a table with no fleet subject rule"
+        );
     }
 
     /// The guarded broker takes the tier too (astream's `OpenOptions::guard`):

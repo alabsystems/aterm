@@ -8,9 +8,16 @@ use std::time::{Duration, Instant};
 type Tally = BTreeMap<&'static str, u64>;
 
 fn tally() -> Tally {
-    crate::metrics::frame_refill_full_causes()
+    crate::metrics::METRICS
+        .window
+        .redraw
+        .refill_cause
+        .sparse(
+            aterm_core::render::FullRefillCause::ALL
+                .iter()
+                .map(|cause| (cause.index(), cause.as_str())),
+        )
         .into_iter()
-        .map(|c| (c.cause, c.frames))
         .collect()
 }
 
@@ -71,8 +78,9 @@ impl std::fmt::Debug for Arms {
 fn steady_state(app: &mut App, wid: WindowId, into: u64, frames: usize) -> Arms {
     let term = app.pool.get(into).expect("pane session").term.clone();
     let mut now = Instant::now();
+    let redraw = &crate::metrics::METRICS.window.redraw;
     let before = tally();
-    let m0 = crate::metrics::snapshot();
+    let (scoped0, full0) = (redraw.refills_scoped.get(), redraw.refills_full.get());
     let mut painted = 0usize;
     for i in 0..frames {
         term_lock(&term).process(if i % 2 == 0 { b"\rx" } else { b"\ry" });
@@ -84,13 +92,10 @@ fn steady_state(app: &mut App, wid: WindowId, into: u64, frames: usize) -> Arms 
             painted += 1;
         }
     }
-    let m1 = crate::metrics::snapshot();
     Arms {
         // Saturating for the same reason `since` is.
-        scoped: m1
-            .frame_refills_scoped
-            .saturating_sub(m0.frame_refills_scoped),
-        full: m1.frame_refills_full.saturating_sub(m0.frame_refills_full),
+        scoped: redraw.refills_scoped.get().saturating_sub(scoped0),
+        full: redraw.refills_full.get().saturating_sub(full0),
         causes: since(&before),
         painted,
     }

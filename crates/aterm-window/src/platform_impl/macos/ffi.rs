@@ -103,6 +103,8 @@ pub type UniChar = std::os::raw::c_ushort;
 pub type OSStatus = i32;
 
 #[allow(non_upper_case_globals)]
+pub const kUCKeyActionDown: u16 = 0;
+#[allow(non_upper_case_globals)]
 pub const kUCKeyActionDisplay: u16 = 3;
 #[allow(non_upper_case_globals)]
 pub const kUCKeyTranslateNoDeadKeysMask: OptionBits = 1;

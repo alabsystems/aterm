@@ -17,7 +17,6 @@ use aterm_slog::Tier;
 use super::super::tests::{WALL0, hand_clock, lines, stamp, time_order_holds, with_claude};
 use super::*;
 use crate::claude_footer::{LogWake, rig};
-use crate::subscribe::SubscriberSet;
 
 /// The Claude Code process in front ([`with_claude`]'s group).
 const PID: i32 = 300;
@@ -481,12 +480,11 @@ fn each_chunk_hold_is_timed_and_booked_by_its_kind() {
     assert!(booked.is_empty(), "{booked:?}");
 }
 
-/// S12: the footer read wakes the session's watchers itself, once the
-/// timeline is released — a subscription registered for the session holds
-/// a notify the moment the read returns, and a parked in-process `await log
-/// kind=tool` returns (a one-minute hang detector). NEGATIVE CONTROL: the
-/// same read with a wake that holds no subscribers (a test App's) notifies
-/// nobody, and a read that moved nothing owes nothing.
+/// S12: the footer read rings the session's watchers itself, under the
+/// timeline lock that took the owed wake — a subscription registered on the
+/// session holds a ring the moment the read returns, and a parked in-process
+/// `await log kind=tool` returns (a one-minute hang detector). NEGATIVE
+/// CONTROL: a read that moved nothing owes nothing and rings nobody.
 #[test]
 fn the_footer_read_wakes_the_watchers_directly() {
     // A registered session, so an in-process `await log` finds it.
@@ -497,9 +495,8 @@ fn the_footer_read_wakes_the_watchers_directly() {
     store.write().unwrap().register(h.clone());
     let mut r = Rig::on("slog-tx-wake", tl, hand);
     r.touch();
-    let subs = crate::subscribe::new_registry();
-    let wake = LogWake::new(&subs, false);
-    let sub = SubscriberSet::register(&subs, &[7]);
+    let wake = LogWake::default();
+    let sub = crate::session_watch::Subscription::single(&h.ctx.watchers);
     let _ = r.read(&wake);
     assert!(sub.wait(Duration::ZERO), "the bind's source mark woke it");
     // NEGATIVE CONTROL: nothing moved, nothing owed.
@@ -511,16 +508,15 @@ fn the_footer_read_wakes_the_watchers_directly() {
         prompt("v1", 1_100, "go"),
         calls("m1", 1_200, &[("toolu_a", "Bash")]),
     ]);
-    // NEGATIVE CONTROL: no subscribers in the wake, no notify.
-    let quiet = r.read(&LogWake::default());
-    assert!(quiet.owed && !sub.wait(Duration::ZERO), "{quiet:?}");
+    let moved = r.read(&wake);
+    assert!(moved.owed && sub.wait(Duration::ZERO), "{moved:?}");
     // A parked `await log kind=tool` returns on the read.
     let (since, ep) = {
         let g = r.tl.lock().unwrap();
         (g.slog().log().last_seq(), g.slog().log().ep())
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let (h2, store2, subs2) = (h.clone(), store.clone(), subs.clone());
+    let (h2, store2) = (h.clone(), store.clone());
     std::thread::spawn(move || {
         let reply = crate::control::cmd_await(
             &h2.term,
@@ -528,7 +524,6 @@ fn the_footer_read_wakes_the_watchers_directly() {
             h2.local_id,
             &h2.ctx,
             &format!("log kind=tool since={since} ep={ep} timeout=600000"),
-            &subs2,
         );
         let _ = tx.send(reply);
     });

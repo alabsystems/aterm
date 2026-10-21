@@ -13,6 +13,9 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use aterm_uds::process::child_pids;
+
 /// The copy for a destructive close/quit confirmation dialog. Static strings, so the
 /// platform layer (`AppRt::confirm` → the native `NSAlert`) just hands them straight
 /// to the alert.
@@ -413,18 +416,21 @@ impl JobProbe {
     }
 
     /// The observer's entry point: is `shell_pid` running a foreground job?
+    /// `fg` is the session's foreground group as the sweep read it for this
+    /// look ([`foreground_pgrp`] through the factory's probe): the sweep asks
+    /// the PTY once per look and hands every reader of the group that answer.
     ///
     /// `now` must be the sweep's single clock reading — sharing it is what
     /// makes "one capture per sweep" exact.
     pub(crate) fn is_job(
         &mut self,
         session: u64,
-        master: i32,
+        fg: i32,
         shell_pid: i32,
         key: JobEvidenceKey,
         now: Instant,
     ) -> bool {
-        self.is_job_with(session, master, shell_pid, key, now, capture_child_links)
+        self.is_job_with(session, fg, shell_pid, key, now, capture_child_links)
     }
 
     /// [`Self::is_job`] with the system capture injected, so the batching and
@@ -432,15 +438,14 @@ impl JobProbe {
     pub(crate) fn is_job_with(
         &mut self,
         session: u64,
-        master: i32,
+        fg: i32,
         shell_pid: i32,
         key: JobEvidenceKey,
         now: Instant,
         capture: impl FnOnce() -> ChildLinks,
     ) -> bool {
-        // The unix answer is a cheap per-fd `tcgetpgrp`, never a process-table
-        // walk: take it verbatim and keep no state for it.
-        let fg = foreground_pgrp(master);
+        // The unix answer is the per-fd `tcgetpgrp` the sweep read, never a
+        // process-table walk: take it verbatim and keep no state for it.
         if fg > 0 {
             self.keys.remove(&session);
             return fg != shell_pid;
@@ -544,9 +549,10 @@ pub(crate) fn foreground_pgrp(master: i32) -> i32 {
     }
 }
 
-/// The most children [`session_root`] reports: one is enough to say a job is
+/// The most children [`session_root`] reports on Linux, as macOS's listing
+/// ([`aterm_uds::process::CHILD_PIDS_MAX`]): one is enough to say a job is
 /// there, and a handful lets a test clean up after itself.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const ROOT_CHILDREN_MAX: usize = 64;
 
 /// What the process table says about a session's root, the process the PTY was
@@ -586,19 +592,6 @@ pub(crate) fn session_root(pid: i32) -> Option<SessionRoot> {
         return None;
     }
     platform_session_root(pid)
-}
-
-// libproc's child listing (`<libproc.h>`: `int proc_listchildpids(pid_t
-// ppid, void *buffer, int buffersize)`, answering the number of pids written
-// or -1), in libSystem. Declared here because `crates/aterm-libc` is
-// generated and does not carry it.
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn proc_listchildpids(
-        ppid: libc::pid_t,
-        buffer: *mut libc::c_void,
-        buffersize: libc::c_int,
-    ) -> libc::c_int;
 }
 
 /// `pid`'s `proc_pidinfo(PROC_PIDTBSDINFO)` record: an exact-size read that names
@@ -646,19 +639,6 @@ pub(crate) fn process_name(pid: i32) -> Option<String> {
             .map(|c| char::from(c.to_ne_bytes()[0]))
             .collect(),
     )
-}
-
-/// `pid`'s live children, at most [`ROOT_CHILDREN_MAX`], from libproc, or
-/// `None` when the table cannot answer.
-#[cfg(target_os = "macos")]
-pub(crate) fn child_pids(pid: libc::pid_t) -> Option<Vec<libc::pid_t>> {
-    let mut pids = [0 as libc::pid_t; ROOT_CHILDREN_MAX];
-    let bytes = i32::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is `bytes` writable bytes of pid_t slots; libproc writes
-    // at most that many and answers how many pids it wrote, or -1.
-    let found = unsafe { proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
-    let found = usize::try_from(found).ok()?.min(ROOT_CHILDREN_MAX);
-    Some(pids[..found].iter().copied().filter(|p| *p > 0).collect())
 }
 
 /// Whether the shell `shell_pid` runs a program it started at or after
@@ -1649,20 +1629,26 @@ mod tests {
     }
 
     /// The unix arm is untouched: a live `tcgetpgrp` answer short-circuits
-    /// before any capture, and keeps no state.
+    /// before any capture, and keeps no state. The group is the one the sweep
+    /// read (windows' is always -1, which falls through to the walk).
     #[test]
     fn a_live_foreground_pgrp_never_buys_a_capture() {
         let mut probe = JobProbe::default();
         let now = Instant::now();
         let mut captures = 0usize;
-        // `is_job_with` reads `foreground_pgrp(master)`; on windows that is
-        // always -1, so drive the short-circuit through `child_verdict`'s
-        // caller only where it can be observed. The state-free property is
-        // what matters here and holds on both arms.
-        let busy = probe.is_job_with(1, -1, 0, key(0), now, || {
+        let mut capture = || {
             captures += 1;
             ChildLinks::default()
-        });
+        };
+        assert!(
+            probe.is_job_with(1, 4321, 1234, key(0), now, &mut capture),
+            "a group in front that is not the shell's is a job"
+        );
+        assert!(
+            !probe.is_job_with(1, 1234, 1234, key(0), now, &mut capture),
+            "the shell's own group in front is idle"
+        );
+        let busy = probe.is_job_with(1, -1, 0, key(0), now, &mut capture);
         assert!(!busy, "an unknown shell pid is idle, and buys nothing");
         assert_eq!(captures, 0);
         assert_eq!(probe.capture_count(), 0);
@@ -1674,6 +1660,11 @@ mod tests {
     /// the instant is not; and one the shell put in a group of its own (`set
     /// -m`, as zsh, bash and fish do) is the foreground word's, never the
     /// probe's.
+    ///
+    /// The job-control stand-in is bash, by name: `/bin/sh` is bash only on
+    /// macOS. Debian's and Ubuntu's is dash, which turns `set -m` off without
+    /// a terminal ("can't access tty; job control turned off") and keeps the
+    /// program in the shell's group, so it cannot stand in for one.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_probe_sees_a_program_the_shell_runs_in_its_own_group() {
@@ -1689,36 +1680,77 @@ mod tests {
         // Linux reads a start time to the clock tick: the instant is taken a
         // little early so a program started right after it is after it.
         let since = now_ms().saturating_sub(100);
-        let shell = |script: &str| {
-            aterm_uds::spawnfd::command("/bin/sh")
+        // Real shells, so hermetic ones (§8.6 of the init design): a scratch home, and no
+        // inherited `$BASH_ENV`, which a non-interactive bash would source.
+        let home = aterm_tempfile::tempdir().expect("scratch home");
+        let shell = |program: &std::path::Path, script: &str| {
+            aterm_spec::host::shell_command(program, home.path())
                 .args(["-c", script])
                 .stdin(aterm_uds::spawnfd::Stdio::null())
                 .stdout(aterm_uds::spawnfd::Stdio::null())
                 .stderr(aterm_uds::spawnfd::Stdio::null())
                 .spawn()
-                .expect("spawn sh")
         };
+        // Every way out of the test, a failing assertion's included, kills
+        // what it started: each shell's programs (read while the shell still
+        // holds them as its children), then the shell.
+        struct Started(Vec<aterm_uds::spawnfd::Child>);
+        impl Started {
+            fn hold(&mut self, child: aterm_uds::spawnfd::Child) -> i32 {
+                let pid = i32::try_from(child.id()).expect("pid fits");
+                self.0.push(child);
+                pid
+            }
+        }
+        impl Drop for Started {
+            fn drop(&mut self) {
+                for shell in &mut self.0 {
+                    let programs = i32::try_from(shell.id())
+                        .ok()
+                        .and_then(session_root)
+                        .map(|root| root.children)
+                        .unwrap_or_default();
+                    for program in programs {
+                        // SAFETY: SIGKILL to a `sleep` this test's shell forked.
+                        unsafe { libc::kill(program, libc::SIGKILL) };
+                    }
+                    let _ = shell.kill();
+                    let _ = shell.wait();
+                }
+            }
+        }
+        let mut started = Started(Vec::new());
+        // Only a bash the host lacks is the host's refusal: any spawn error of
+        // the one it has is a finding.
+        let bash = aterm_spec::host::test_shell("bash").unwrap_or_else(|| {
+            aterm_spec::host::could_not_run(aterm_spec::host::tool("bash").refusal())
+        });
+        let job_control = started.hold(
+            shell(&bash, "set -m; sleep 120 & wait")
+                .unwrap_or_else(|error| panic!("spawn {}: {error}", bash.display())),
+        );
+        let own_group =
+            started.hold(shell(std::path::Path::new("/bin/sh"), "sleep 120; :").expect("spawn sh"));
         // A hang detector: the shell forks its program.
-        let mut programs = Vec::new();
-        let mut with_child = |child: &aterm_uds::spawnfd::Child| {
-            let pid = i32::try_from(child.id()).expect("pid fits");
-            let forked = aterm_spec::wait::within(
+        let forks = |pid: i32| {
+            aterm_spec::wait::within(
                 aterm_spec::wait::MUST_HAPPEN,
                 std::time::Duration::from_millis(5),
-                || session_root(pid).filter(|root| !root.children.is_empty()),
-            );
-            programs.extend(forked.expect("sh forked its program").children);
-            pid
+                || {
+                    session_root(pid)
+                        .filter(|root| !root.children.is_empty())
+                        .map(drop)
+                },
+            )
+            .expect("the shell forked its program");
         };
-        let mut own_group = shell("sleep 120; :");
-        let pid = with_child(&own_group);
-        assert!(shell_runs_program_since(pid, since), "started since");
+        forks(own_group);
+        assert!(shell_runs_program_since(own_group, since), "started since");
         assert!(
-            !shell_runs_program_since(pid, now_ms() + 3_600_000),
+            !shell_runs_program_since(own_group, now_ms() + 3_600_000),
             "started before the instant"
         );
-        let mut job_control = shell("set -m; sleep 120 & wait");
-        let pid = with_child(&job_control);
+        forks(job_control);
         // A hang detector: the shell moves its program to a group of its own
         // just AFTER the fork (`setpgid`), and until then the program is in
         // the shell's group, where the probe rightly counts it.
@@ -1726,7 +1758,7 @@ mod tests {
             aterm_spec::wait::MUST_HAPPEN,
             std::time::Duration::from_millis(5),
             || {
-                session_root(pid)
+                session_root(job_control)
                     .filter(|root| {
                         !root.children.is_empty()
                             && root.children.iter().all(|&program| {
@@ -1738,19 +1770,11 @@ mod tests {
                     .map(drop)
             },
         )
-        .expect("sh moved its program to a group of its own");
+        .expect("bash moved its program to a group of its own");
         assert!(
-            !shell_runs_program_since(pid, since),
+            !shell_runs_program_since(job_control, since),
             "a program in a group of its own"
         );
         assert!(!shell_runs_program_since(-1, since), "no shell");
-        for program in programs {
-            // SAFETY: SIGKILL to a `sleep` this test's shell forked.
-            unsafe { libc::kill(program, libc::SIGKILL) };
-        }
-        for child in [&mut own_group, &mut job_control] {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }

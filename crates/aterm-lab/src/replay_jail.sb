@@ -1,0 +1,20 @@
+(version 1)
+;; THE REPLAY'S JAIL (`tape replay-jailed`): `aterm drive replay --check` run from a corpus tape alone. A replay answers
+;; every value its loop observes from the tape, so it needs nothing else; this profile makes anything else fail, and
+;; `replay-jailed` proves it does on the same binary, the same profile and a copy of the tape it does not name.
+(allow default)
+;; NO NETWORK: no socket is opened, no name resolved
+(deny network*)
+;; NO WRITE: no file is made, changed, moved or removed (the replay's report goes to the pipe it was handed)
+(deny file-write*)
+;; NO PROGRAM: nothing is run, nothing forked; only the binary itself is exec'd, by sandbox-exec, into the jail
+(deny process-fork)
+(deny process-exec)
+(allow process-exec (literal "@BIN@"))
+;; NO READ but the binary and the tape: a file's contents anywhere else are refused. The loader's own reads of every
+;; process stay open — the root directory it finds the shared cache from, the system's libraries and the shared cache
+;; itself — and no other: no home, no state, no ledger, no journal, no other tape. A file's metadata stays readable, so
+;; the replay can see that the directory its roots move under does not exist.
+(deny file-read-data)
+(allow file-read-data (literal "@BIN@") (literal "@TAPE@") (literal "/"))
+(allow file-read-data (subpath "/usr/lib") (subpath "/System") (subpath "/private/var/db/dyld"))

@@ -44,7 +44,8 @@ aterm-toml = { workspace = true }
 # `hash::sha256_file`: the CPU's SHA-256 instructions, as atpkg's bulk hash uses.
 ring = { workspace = true }
 # Decode the base64 master + machine Ed25519 public keys (32 raw bytes each).
-# Standard padded Base64 — first-party and zero-dependency. `decode_strict` is
+# Standard padded Base64 — first-party; its one dependency is astream-wire
+# (dependency-free, vendor/astream). `decode_strict` is
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
@@ -68,9 +69,6 @@ libc = { workspace = true }
 aterm-digest = { workspace = true }
 
 [dev-dependencies]
-# The counting seam (`aterm_durable::seam`) its tests reach, in an optimized test
-# build too.
-aterm-durable = { workspace = true, features = ["test-support"] }
 # Exclusive private directories for file-hash fixtures, removed on drop.
 aterm-tempfile = { workspace = true }
 # The Linux binary-identity round-trip test reads its JSON back through the

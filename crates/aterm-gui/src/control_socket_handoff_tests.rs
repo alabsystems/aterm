@@ -44,7 +44,7 @@ fn step(model: &Model, state: &mut BTreeMap<&'static str, i64>, action: &'static
 fn incoming_control_preparation_requires_both_real_service_lanes() {
     let model = aterm_models_update::native_update_control_preparation_model();
     for rpc in [0, 1, CONTROL_WORKERS] {
-        for subscriptions in [0, 1, CONTROL_SUBSCRIPTION_WORKERS] {
+        for subscriptions in [0, 1, 2] {
             let preparation = ControlPreparation::default();
             let mut state = model.init_state();
             assert_eq!(preparation.state(), ControlPreparationState::Pending);
@@ -87,8 +87,8 @@ fn incoming_control_preparation_requires_both_real_service_lanes() {
 
 /// The successor binds the fixed path only after the Commit, its predecessor's
 /// exit AND the close of the predecessor's listener — each judged at a FACT:
-/// the worker parked on the closed gate, then asking again about a parent it
-/// was told is alive, then probing again a listener it found live. A window
+/// the worker parked on the closed gate, then waiting on the exit of a parent
+/// that has not exited, then probing again a listener it found live. A window
 /// ("nothing done within 30 ms") passes vacuously whenever the worker is slow
 /// to get there, which a loaded machine makes the common case.
 ///
@@ -120,7 +120,7 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
         return;
     }
     let (_dir, plan) = fixture();
-    let (parent, parent_token) = bind_control_listener(&plan, None, || false, |_| false, None)
+    let (parent, parent_token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .unwrap()
         .into_parts();
     let token_before = std::fs::read(&plan.token_path).unwrap();
@@ -131,7 +131,8 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     )
     .unwrap();
     let gate = crate::spawn::DeferredReaderGate::closed();
-    let parent_live = Arc::new(AtomicBool::new(true));
+    // The predecessor's exit, as `AttestedParent::exited_by` reports it.
+    let (exit_tx, exit_rx) = mpsc::sync_channel::<()>(1);
     let parent_asked = Arc::new(AtomicUsize::new(0));
     // Dials that reached a listener; the third is held until `closed`, and
     // asked who owns it before the close and after.
@@ -143,16 +144,17 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     let child = {
         let plan = plan.clone();
         let gate = gate.clone();
-        let live = parent_live.clone();
         let asked = parent_asked.clone();
         let dialed = parent_dialed.clone();
         std::thread::spawn(move || {
             let result = bind_control_listener_within(
                 &plan,
                 Some(&gate),
-                || {
+                |deadline: std::time::Instant| {
                     asked.fetch_add(1, Ordering::AcqRel);
-                    live.load(Ordering::Acquire)
+                    exit_rx
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                        .is_ok()
                 },
                 |pid| pid == std::process::id(),
                 Some(&identity),
@@ -194,15 +196,15 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     assert!(model.successors("Bind", &state).is_empty());
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), token_before);
 
-    // Committed, its parent alive: asked twice is told twice, so it is
-    // holding at the parent witness rather than moving on.
+    // Committed, its parent alive: the worker waits on the parent's exit, and
+    // nothing it does after that wait (a probe of the listener, an end) has
+    // happened.
     gate.release();
     step(&model, &mut state, "Commit");
-    until_within(
-        MUST_HAPPEN,
-        "the worker asks again about a live parent",
-        || (asked() >= 2 || child.is_finished()).then_some(()),
-    );
+    until_within(MUST_HAPPEN, "the worker waits on its parent's exit", || {
+        (asked() > 0 || dialed() > 0 || child.is_finished()).then_some(())
+    });
+    assert_eq!(dialed(), 0, "the worker probed before its parent exited");
     assert!(!child.is_finished(), "the worker ended over a live parent");
     assert!(model.successors("Bind", &state).is_empty());
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), token_before);
@@ -211,7 +213,7 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
     // worker then probes the listener it attested, finds it live, and probes
     // again: its probes are accepted here, two of them, and its third dial
     // reaches the listener too, as the fact. That one is left in the queue.
-    parent_live.store(false, Ordering::Release);
+    exit_tx.send(()).unwrap();
     step(&model, &mut state, "Exit");
     parent.set_nonblocking(true).unwrap();
     let mut probes = Vec::new();
@@ -277,7 +279,7 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
 #[test]
 fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
     let (_dir, plan) = fixture();
-    let (parent, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+    let (parent, token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .unwrap()
         .into_parts();
     let identity =
@@ -286,21 +288,52 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
     let before = std::fs::read(&plan.token_path).unwrap();
     // Historical behavior: starting the successor before Commit loses its
     // control listener. Keep this negative control against the genuine binder.
-    assert!(bind_control_listener(&plan, None, || false, |_| false, None).is_none());
+    assert!(bind_control_listener(&plan, None, |_| true, |_| false, None).is_none());
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
 
-    // Even a released gate and an exited predecessor do not grant permission
-    // to displace a DIFFERENT listener on the fixed path.
+    // Committed, with the predecessor still running at the deadline (passed
+    // already): the successor stands down at the parent wait, before any
+    // probe. The probe loop would refuse this live listener too, so the fact
+    // judged is that nothing was dialed: the parent wait kept the socket.
     let gate = crate::spawn::DeferredReaderGate::closed();
     gate.release();
     let model = native_update_control_socket_handoff_model();
     let mut state = model.init_state();
     step(&model, &mut state, "Commit");
+    assert!(model.successors("Bind", &state).is_empty());
+    let (mut asked, mut dialed) = (0, 0);
+    assert!(
+        bind_control_listener_within(
+            &plan,
+            Some(&gate),
+            |_| {
+                asked += 1;
+                false
+            },
+            |pid| pid == std::process::id(),
+            Some(&identity),
+            Duration::ZERO,
+            |path: &str| {
+                dialed += 1;
+                control_auth::connect_socket_nonblocking(path)
+            },
+        )
+        .is_none(),
+        "the successor bound over a live predecessor"
+    );
+    assert_eq!(asked, 1, "the successor never waited on its predecessor");
+    assert_eq!(dialed, 0, "the successor probed over a live predecessor");
+    assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
+    let client = CtlStream::connect(&plan.sock_path).unwrap();
+    drop((client, parent.accept().unwrap()));
+
+    // Even a released gate and an exited predecessor do not grant permission
+    // to displace a DIFFERENT listener on the fixed path.
     step(&model, &mut state, "Exit");
     step(&model, &mut state, "ForeignBind");
     assert!(model.successors("Bind", &state).is_empty());
     assert!(
-        bind_control_listener(&plan, Some(&gate), || false, |_| false, Some(&identity)).is_none()
+        bind_control_listener(&plan, Some(&gate), |_| true, |_| false, Some(&identity)).is_none()
     );
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
     assert!(control_auth::socket_is_live(&plan.sock_path));
@@ -319,7 +352,7 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
 fn prefilled_foreign_backlog_cannot_replace_the_parents_endpoint() {
     use std::os::fd::AsRawFd;
     let (_dir, plan) = fixture();
-    let (parent, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+    let (parent, token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .unwrap()
         .into_parts();
     let identity =
@@ -327,7 +360,7 @@ fn prefilled_foreign_backlog_cannot_replace_the_parents_endpoint() {
             .unwrap();
     drop(parent);
     leave(&plan);
-    let (foreign, foreign_token) = bind_control_listener(&plan, None, || false, |_| false, None)
+    let (foreign, foreign_token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .unwrap()
         .into_parts();
     assert_eq!(unsafe { libc::listen(foreign.as_raw_fd(), 1) }, 0);
@@ -339,7 +372,7 @@ fn prefilled_foreign_backlog_cannot_replace_the_parents_endpoint() {
     gate.release();
     // Even an errno that looks stale grants nothing over a replaced inode/token.
     assert!(
-        bind_control_listener(&plan, Some(&gate), || false, |_| false, Some(&identity)).is_none()
+        bind_control_listener(&plan, Some(&gate), |_| true, |_| false, Some(&identity)).is_none()
     );
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
     assert_eq!(
@@ -360,7 +393,7 @@ fn prefilled_foreign_backlog_cannot_replace_the_parents_endpoint() {
 fn a_failed_handoff_bind_never_retries_over_a_foreign_full_backlog() {
     use std::os::fd::AsRawFd;
     let (_dir, plan) = fixture();
-    let (foreign, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+    let (foreign, token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .unwrap()
         .into_parts();
     let identity =
@@ -379,7 +412,12 @@ fn a_failed_handoff_bind_never_retries_over_a_foreign_full_backlog() {
         std::thread::spawn(move || {
             // The foreign bind raced after the caller's final ownership check
             // and initial unlink. Drive the real remaining bind/retry path.
-            let result = bind_prepared_control_listener(&plan, true);
+            let result = bind_with_retry(
+                &plan,
+                BindRetry::HANDOFF,
+                |path| CtlListener::bind(path),
+                std::thread::sleep,
+            );
             let _ = send.send(result);
         })
     };
@@ -421,8 +459,9 @@ fn a_transient_handoff_bind_failure_recovers_without_rewriting_credentials() {
     let before = std::fs::read(&plan.token_path).unwrap();
     let mut attempts = 0;
     let mut pauses = Vec::new();
-    let listener = bind_handoff_control_listener(
+    let listener = bind_with_retry(
         &plan,
+        BindRetry::HANDOFF,
         |path| {
             attempts += 1;
             if attempts == 1 {
@@ -464,24 +503,25 @@ fn handoff_bind_retry_exhausts_a_finite_budget_and_matches_the_model_guard() {
     let mut state = model.init_state();
     let mut attempts = 0;
     let mut pauses = Vec::new();
-    let result = bind_handoff_control_listener(
+    let result = bind_with_retry(
         &plan,
+        BindRetry::HANDOFF,
         |_| {
             attempts += 1;
             step(&model, &mut state, "Fail");
             assert_eq!(
-                handoff_bind_retry_allowed(attempts, true),
+                BindRetry::HANDOFF.retry_allowed(attempts, true),
                 !model.successors("Retry", &state).is_empty(),
                 "shipping retry guard disagrees at failure {attempts}"
             );
             let mut occupied = state.clone();
             step(&model, &mut occupied, "Occupy");
             assert_eq!(
-                handoff_bind_retry_allowed(attempts, false),
+                BindRetry::HANDOFF.retry_allowed(attempts, false),
                 !model.successors("Retry", &occupied).is_empty(),
                 "a foreign path must reject even while budget remains"
             );
-            if handoff_bind_retry_allowed(attempts, true) {
+            if BindRetry::HANDOFF.retry_allowed(attempts, true) {
                 step(&model, &mut state, "Retry");
             } else {
                 step(&model, &mut state, "Stop");
@@ -491,7 +531,7 @@ fn handoff_bind_retry_exhausts_a_finite_budget_and_matches_the_model_guard() {
         |duration| pauses.push(duration),
     );
     assert!(result.is_none());
-    assert_eq!(attempts, HANDOFF_BIND_ATTEMPTS);
+    assert_eq!(attempts, BindRetry::HANDOFF.attempts);
     assert_eq!(state["attempts"], i64::from(attempts));
     assert_eq!(state["stopped"], 1);
     assert_eq!(
@@ -509,8 +549,9 @@ fn an_endpoint_arriving_during_handoff_backoff_is_preserved() {
     let mut foreign = None;
     let mut connections = Vec::new();
     let mut identity = None;
-    let result = bind_handoff_control_listener(
+    let result = bind_with_retry(
         &plan,
+        BindRetry::HANDOFF,
         |path| {
             attempts += 1;
             if attempts == 1 {
@@ -524,7 +565,7 @@ fn an_endpoint_arriving_during_handoff_backoff_is_preserved() {
                 foreign.is_none(),
                 "an occupied path cannot schedule more backoff"
             );
-            let (listener, token) = bind_control_listener(&plan, None, || false, |_| false, None)
+            let (listener, token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
                 .unwrap()
                 .into_parts();
             identity = Some(
@@ -549,4 +590,92 @@ fn an_endpoint_arriving_during_handoff_backoff_is_preserved() {
     assert!(identity.unwrap().matches_current(&plan));
     drop((connections, foreign));
     leave(&plan);
+}
+
+/// Startup's policy under the same failure, a bind that fails once: with
+/// nothing at the shared explicit path after the pause it binds (the control);
+/// with a sibling's listener bound there during the pause it keeps that
+/// listener and stops. A per-instance path's leftover is removed without a
+/// probe, and out of attempts it stops at its last failure, unpaused.
+#[test]
+fn startup_bind_retry_unlinks_a_leftover_and_keeps_a_path_that_turned_live() {
+    let (_dir, plan) = fixture();
+    let fail_once = |attempts: &mut u32, path: &str| {
+        *attempts += 1;
+        if *attempts == 1 {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        } else {
+            CtlListener::bind(path)
+        }
+    };
+
+    let mut attempts = 0;
+    let mut pauses = Vec::new();
+    let listener = bind_with_retry(
+        &plan,
+        BindRetry::STARTUP,
+        |path| fail_once(&mut attempts, path),
+        |duration| pauses.push(duration),
+    )
+    .expect("a vacant shared path binds on the retry");
+    assert_eq!(attempts, 2);
+    assert_eq!(pauses, [Duration::from_millis(750)]);
+    drop(listener);
+    leave(&plan);
+
+    let mut attempts = 0;
+    let mut sibling = None;
+    let result = bind_with_retry(
+        &plan,
+        BindRetry::STARTUP,
+        |path| fail_once(&mut attempts, path),
+        |_| sibling = Some(CtlListener::bind(&plan.sock_path).unwrap()),
+    );
+    assert!(
+        result.is_none(),
+        "a shared path that turned live is not taken"
+    );
+    assert_eq!(attempts, 1);
+    let sibling = sibling.expect("the sibling bound during the pause");
+    let client = CtlStream::connect(&plan.sock_path).unwrap();
+    let (accepted, _) = sibling.accept().unwrap();
+    drop((client, accepted, sibling));
+    leave(&plan);
+
+    // A per-instance path is this instance's alone: a leftover file there
+    // fails the bind, and is removed after the pause without a probe.
+    let per_instance = control_auth::SocketPlan {
+        latest_link: Some(std::path::PathBuf::from(&plan.sock_path).with_file_name("latest")),
+        ..plan.clone()
+    };
+    std::fs::write(&per_instance.sock_path, b"left behind").unwrap();
+    let mut attempts = 0;
+    let listener = bind_with_retry(
+        &per_instance,
+        BindRetry::STARTUP,
+        |path| {
+            attempts += 1;
+            CtlListener::bind(path)
+        },
+        |_| {},
+    )
+    .expect("the leftover is removed and the path bound");
+    assert_eq!(attempts, 2, "the leftover failed the first bind");
+    drop(listener);
+    leave(&plan);
+
+    let mut attempts = 0;
+    let mut pauses = Vec::new();
+    let result = bind_with_retry(
+        &plan,
+        BindRetry::STARTUP,
+        |_| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        },
+        |duration| pauses.push(duration),
+    );
+    assert!(result.is_none());
+    assert_eq!(attempts, BindRetry::STARTUP.attempts);
+    assert_eq!(pauses, [Duration::from_millis(750); 2]);
 }

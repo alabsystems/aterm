@@ -66,10 +66,13 @@
 //! worker an earlier one started); any other name with
 //! `<modes-dir>/<name>.json` but `refresh` (the refresh's answer,
 //! [`not_custom`]) is a CUSTOM mode (`{"status", "headers", "json"|"body",
-//! "stream", "text", "delay_ms", "times", "auth"}`; `times`: the first N
-//! requests, then `ok`; `auth`: only a request that carried that lab
+//! "stream", "text", "delay_ms", "times", "auth", "replies"}`; `times`: the
+//! first N requests, then `ok`; `auth`: only a request that carried that lab
 //! credential gets it, the others are answered as `ok`; its `headers` go out
-//! on a streamed answer too).
+//! on a streamed answer too; `replies`: `[{"when", "last", "text"}, …]`, a
+//! turn's text picked by the words its conversation's user texts and its
+//! newest one hold, in every API, a side request answered as `ok`
+//! ([`scripted_reply`])).
 //!
 //! A Codex request (`/v1/responses`) is answered by the same modes: `ok`,
 //! `long`, `numbered` and `slow` as text; `overloaded` as a 503
@@ -124,7 +127,7 @@
 use std::io::{self, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -265,6 +268,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
+/// How many request dumps the stub keeps, the newest: a lab of a dozen
+/// agents' conversations (`lab forever`) and their side calls stays whole.
+const DUMPS_KEPT: u64 = 2000;
+
 /// The counters and the mode, as `/__status` shows them.
 #[derive(Debug, Default)]
 struct State {
@@ -296,6 +303,10 @@ pub struct Stub {
     /// The 200 answers to `/v1/messages` served so far that carried on200
     /// headers: the `k` of a `@SEQ@` header value.
     served_200: AtomicU32,
+    /// The request bodies dumped so far ([`Stub::dump`]): each dump takes
+    /// its index from here as it is written, so requests in flight together
+    /// (a reply's delay and pace hold `record` back) never share one.
+    dumped: AtomicU64,
 }
 
 /// The extra headers one `/v1/messages` request's answer carries (`--headers-file`).
@@ -499,6 +510,70 @@ pub fn text_of(content: Option<&J>) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// THE SCRIPTED REPLY OF A CUSTOM MODE (`"replies": [{"when", "last",
+/// "text"}, …]`, the per-turn script of `forever`): the `text` of the first
+/// rule whose `when` stands in one of the conversation's user texts `users`
+/// (in order, oldest first) and whose `last` stands in the newest of them,
+/// either left out or empty matching any. The stub keeps no state: a
+/// conversation's turn is told by what it holds (the scenario's word in its
+/// prompt, the harness's act it answers), so several tabs of one lab, each
+/// its own conversation, are scripted at once. `None` where the spec has no
+/// rules or none matches.
+#[must_use]
+pub fn scripted_reply(spec: &J, users: &[String]) -> Option<String> {
+    let rules = spec.get("replies").and_then(J::as_arr)?;
+    fn word<'a>(r: &'a J, k: &str) -> Option<&'a str> {
+        r.get(k).and_then(J::as_str).filter(|w| !w.is_empty())
+    }
+    let last = users.last().map_or("", String::as_str);
+    rules.iter().find_map(|r| {
+        let text = r.get("text").and_then(J::as_str)?;
+        let when = word(r, "when").is_none_or(|w| users.iter().any(|u| u.contains(w)));
+        let at_last = word(r, "last").is_none_or(|w| last.contains(w));
+        (when && at_last).then(|| text.to_string())
+    })
+}
+
+/// Whether a custom spec scripts its replies ([`scripted_reply`]): such a
+/// spec answers a conversation's turns alone, and a side request (Claude
+/// Code's title, a structured check) is answered as `ok`.
+#[must_use]
+pub fn is_scripted(spec: &J) -> bool {
+    spec.get("replies").is_some()
+}
+
+/// `spec` with its `text` the reply `users` pick ([`scripted_reply`]), else
+/// as it is.
+#[must_use]
+pub fn with_reply(spec: J, users: &[String]) -> J {
+    match scripted_reply(&spec, users) {
+        Some(text) => {
+            let mut spec = spec;
+            spec.set("text", J::s(text));
+            spec
+        }
+        None => spec,
+    }
+}
+
+/// The user texts of a Messages API request, oldest first: each user
+/// message's text blocks ([`text_of`]); one that holds none (a tool result's)
+/// is left out.
+#[must_use]
+pub fn message_users(body: &[u8]) -> Vec<String> {
+    let Ok(j) = J::parse_bytes(body) else {
+        return Vec::new();
+    };
+    j.get("messages")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m.get("role").and_then(J::as_str) == Some("user"))
+        .map(|m| text_of(m.get("content")))
+        .filter(|t| !t.trim().is_empty())
+        .collect()
 }
 
 /// The facts of one `/v1/messages` request every answer logs: its request
@@ -986,6 +1061,24 @@ pub fn analyse_responses(body: &[u8]) -> RInfo {
         info.schema = fmt.and_then(|f| f.get("schema")).cloned();
     }
     info
+}
+
+/// The user texts of a Responses API request (Codex's, Muse Code's), oldest
+/// first: each user item's text ([`item_text`]), the runtime's
+/// `<system-reminder …>` notes and empty items left out.
+#[must_use]
+pub fn responses_users(body: &[u8]) -> Vec<String> {
+    let Ok(j) = J::parse_bytes(body) else {
+        return Vec::new();
+    };
+    j.get("input")
+        .and_then(J::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter(|it| it.get("role").and_then(J::as_str) == Some("user"))
+        .map(item_text)
+        .filter(|t| !t.trim().is_empty() && !t.trim_start().starts_with("<system-reminder"))
+        .collect()
 }
 
 /// A wall's answer: its status, body and headers.
@@ -1541,6 +1634,7 @@ impl Stub {
             }),
             log_lock: Mutex::new(()),
             served_200: AtomicU32::new(0),
+            dumped: AtomicU64::new(0),
         })
     }
 
@@ -1706,17 +1800,22 @@ impl Stub {
         }
     }
 
+    /// The request `body` kept as `req-<index>.json` in the dump directory,
+    /// its index the next of [`Stub::dumped`]; only the newest
+    /// [`DUMPS_KEPT`] stay.
     fn dump(&self, body: &[u8]) {
         let Some(dir) = &self.args.dump_dir else {
             return;
         };
         let _ = std::fs::create_dir_all(dir);
-        let idx = self.st().n_requests + 1;
+        let idx = self.dumped.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = std::fs::write(
             dir.join(format!("req-{idx:05}.json")),
             &body[..body.len().min(4 << 20)],
         );
-        let _ = std::fs::remove_file(dir.join(format!("req-{:05}.json", idx - 200)));
+        if let Some(old) = idx.checked_sub(DUMPS_KEPT) {
+            let _ = std::fs::remove_file(dir.join(format!("req-{old:05}.json")));
+        }
     }
 
     /// Answer one request on `w`. `Err` only when the client went away.
@@ -1953,7 +2052,11 @@ impl Stub {
             }
         }
         let mut mode = mode;
-        if let Some(sp) = self.take_custom(&mode, None) {
+        if let Some(sp) = self
+            .take_custom(&mode, None)
+            .filter(|sp| kind == "main" || !is_scripted(sp))
+        {
+            let sp = with_reply(sp, &message_users(body));
             return self.custom(&base.in_mode(&mode), &sp, &summary, out);
         }
         if self.custom_spec(&mode).is_some() {
@@ -2138,7 +2241,11 @@ impl Stub {
                 Some(ToolTurn::Say(..)) | None => {}
             }
         }
-        if let Some(spec) = self.take_custom(&mode, Some(&label)) {
+        if let Some(spec) = self
+            .take_custom(&mode, Some(&label))
+            .filter(|sp| !matches!(kind, "codex-json" | "muse-json") || !is_scripted(sp))
+        {
+            let spec = with_reply(spec, &responses_users(body));
             if let Some(ms) = spec
                 .get("delay_ms")
                 .and_then(J::as_f64)

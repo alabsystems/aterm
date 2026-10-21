@@ -158,32 +158,92 @@ pub(crate) fn lay_with(layout: &Layout, embedder: &crate::stub::Embedder) -> std
     crate::lay::write_regenerable(&crate::lay::Executable::new(&path, body.as_bytes()))
 }
 
-/// The one doctor line for the brew stub: laid/off/foreign/missing,
-/// plus where real brew resolves. Doctor names; it never lays.
+/// The one doctor row for the brew stub: laid/off/foreign/missing,
+/// plus where real brew resolves, and the class of what fixes it:
+/// `relay` (`repair` lays the stub again), or `person` for a foreign
+/// file at its path, which nothing touches. Doctor names; it never lays.
 #[must_use]
-pub fn doctor_line(layout: &Layout) -> String {
+pub fn doctor_row(layout: &Layout) -> (crate::doctor::Row, aterm_converge::Class) {
     let prefix = Prefix::resolve();
     let real =
         resolve_real_brew(&prefix).map_or_else(|| "none".to_string(), |p| p.display().to_string());
+    doctor_row_with(
+        layout,
+        crate::config::load_abrew().enabled(),
+        prefix.is_disabled(),
+        &real,
+    )
+}
+
+/// [`doctor_row`] over what it reads from the config and the abrew prefix: whether abrew
+/// is `enabled`, whether `abrew off` `disabled` it, and where `real` brew resolves.
+fn doctor_row_with(
+    layout: &Layout,
+    enabled: bool,
+    disabled: bool,
+    real: &str,
+) -> (crate::doctor::Row, aterm_converge::Class) {
+    use crate::doctor::{Level, Row};
+    use aterm_converge::Class;
     let path = stub_path(layout);
-    if !crate::config::load_abrew().enabled() {
-        return format!("note — abrew off by [abrew] enabled=false; real brew: {real}");
+    let row = |level, text| (Row { level, text }, Class::Relay);
+    if !enabled {
+        return row(
+            Level::Note,
+            format!("abrew off by [abrew] enabled=false; real brew: {real}"),
+        );
     }
-    if prefix.is_disabled() {
-        return format!("note — abrew off (`abrew on` re-enables); real brew: {real}");
+    if disabled {
+        return row(
+            Level::Note,
+            format!("abrew off (`abrew on` re-enables); real brew: {real}"),
+        );
     }
     if is_abrew_stub(&path) {
-        format!("ok — reroute stub brew laid (abrew); real brew: {real}")
+        // A stub naming no live atpkg degrades silently to real brew
+        // on every invocation (found live: a dev binary with no
+        // co-located atpkg laid ATPKG=''). Name it, don't say ok.
+        let live = std::fs::read_to_string(&path).is_ok_and(|body| stub_names_live_atpkg(&body));
+        if live {
+            row(
+                Level::Ok,
+                format!("reroute stub brew laid (abrew); real brew: {real}"),
+            )
+        } else {
+            row(
+                Level::Warn,
+                format!(
+                    "reroute stub brew names no live atpkg, so brew runs real Homebrew; `aterm pkg repair` re-lays it; real brew: {real}"
+                ),
+            )
+        }
     } else if path.exists() {
-        format!(
-            "warn — {} is not ours (foreign file; never touched)",
-            path.display()
+        (
+            Row {
+                level: Level::Warn,
+                text: format!(
+                    "{} is not ours (foreign file; never touched)",
+                    path.display()
+                ),
+            },
+            Class::Person,
         )
     } else {
-        format!(
-            "warn — reroute stub brew missing; the next aterm session lays it — now: aterm pkg repair; real brew: {real}"
+        row(
+            Level::Warn,
+            format!(
+                "reroute stub brew missing; the next aterm session lays it — now: aterm pkg repair; real brew: {real}"
+            ),
         )
     }
+}
+
+/// Whether a stub body names an atpkg that is actually there and
+/// executable — the same `[ -x ]` the body itself asks before its
+/// hand-over, so doctor and the stub agree.
+#[must_use]
+pub fn stub_names_live_atpkg(body: &str) -> bool {
+    crate::stub::sh_named_atpkg(body, "ATPKG").is_some_and(|p| crate::stub::is_live_atpkg(&p))
 }
 
 /// Remove an ours stub (`abrew off`, uninstall).
@@ -254,6 +314,49 @@ pub fn engaged(value: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    /// Doctor's row for the stub's path, and the class of what fixes it: a missing stub is
+    /// `repair`'s to lay again (`relay`); a foreign file there is the person's, never
+    /// touched (`person`).
+    #[test]
+    fn a_foreign_file_at_the_stub_s_path_is_the_person_s() {
+        use crate::doctor::Level;
+        use aterm_converge::Class;
+        let l = crate::testdir::layout("atpkg-abrew-row-");
+        let (row, class) = doctor_row_with(&l, true, false, "none");
+        assert_eq!(
+            (row.level, class),
+            (Level::Warn, Class::Relay),
+            "{}",
+            row.text
+        );
+        assert!(row.text.contains("missing"), "{}", row.text);
+        std::fs::create_dir_all(stub_path(&l).parent().unwrap()).unwrap();
+        std::fs::write(
+            stub_path(&l),
+            "#!/bin/sh\nexec /opt/homebrew/bin/brew \"$@\"\n",
+        )
+        .unwrap();
+        let (row, class) = doctor_row_with(&l, true, false, "none");
+        assert_eq!(
+            (row.level, class),
+            (Level::Warn, Class::Person),
+            "{}",
+            row.text
+        );
+        assert!(
+            row.text.contains("foreign file; never touched"),
+            "{}",
+            row.text
+        );
+        let (row, class) = doctor_row_with(&l, false, false, "none");
+        assert_eq!(
+            (row.level, class),
+            (Level::Note, Class::Relay),
+            "{}",
+            row.text
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn stub_execs_abrew_and_real_escape() {
@@ -300,6 +403,29 @@ mod tests {
         std::fs::write(tmp.join("disabled"), "off\n").unwrap();
         assert_eq!(run(&["info", "wget"], false), "REAL info wget");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stub_names_live_atpkg_rejects_empty_and_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let owned = aterm_tempfile::TempDir::new().expect("private stub fixture");
+        let tmp = owned.path();
+        let fake = tmp.join("atpkg");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body =
+            |atpkg: &Path| stub_body(atpkg, &tmp.join("disabled"), &tmp.join("none/bin/brew"));
+        assert!(stub_names_live_atpkg(&body(&fake)));
+        // The ATPKG='' lay a dev binary without a co-located atpkg
+        // produces: doctor must warn, never say ok.
+        assert!(!stub_names_live_atpkg(&body(Path::new(""))));
+        assert!(!stub_names_live_atpkg(&body(&tmp.join("gone/atpkg"))));
+        // A non-executable file is not live either.
+        let dull = tmp.join("dull");
+        std::fs::write(&dull, "not a program\n").unwrap();
+        std::fs::set_permissions(&dull, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!stub_names_live_atpkg(&body(&dull)));
     }
 
     #[test]

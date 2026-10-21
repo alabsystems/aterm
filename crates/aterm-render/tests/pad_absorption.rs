@@ -19,7 +19,10 @@
 //! placement law of `place_frame_bands`.
 
 use aterm_models_render::pad_absorption_model;
-use aterm_render::{band_offset, band_offset_y, pad_split, place_frame_bands};
+use aterm_render::{
+    AxisPlacement, band_offset, band_offset_y, continue_chrome_edges, frame_placement, pad_split,
+    place_frame_bands,
+};
 
 /// Every pad and cell parity, with cells from degenerate through typical glyph
 /// boxes to large.
@@ -220,6 +223,86 @@ fn place_frame_bands_crops_centred_and_handles_one_axis() {
     }
 }
 
+/// The placement law ([`frame_placement`], which the CPU and GPU presents,
+/// `dims` and the crop of a presented destination all read): an odd spare
+/// pixel stays in the trailing band, and an overflow crops centred
+/// horizontally and per the platform policy vertically (top-pinned on Linux).
+/// Over every small surface and frame, each axis partitions the surface into
+/// `band_before + visible + band_after` and the frame into
+/// `crop_before + visible + crop_after`, its origin is the axis offset, and
+/// `source` maps exactly the surface pixels the frame covers back to it.
+#[test]
+fn frame_placement_partitions_surface_and_frame() {
+    let parts = |axis: AxisPlacement| {
+        (
+            axis.origin,
+            axis.band_before,
+            axis.visible,
+            axis.band_after,
+            axis.crop_before,
+            axis.crop_after,
+        )
+    };
+    let banded = frame_placement(111, 111, 100, 100);
+    assert_eq!(
+        parts(banded.x),
+        (5, 5, 100, 6, 0, 0),
+        "odd spare pixel trails"
+    );
+    let cropped = frame_placement(100, 100, 111, 111);
+    assert_eq!(parts(cropped.x), (-6, 0, 100, 0, 6, 5), "centred crop");
+    if cfg!(target_os = "linux") {
+        assert_eq!(parts(banded.y), (0, 0, 100, 11, 0, 0));
+        assert_eq!(parts(cropped.y), (0, 0, 100, 0, 0, 11));
+    } else {
+        assert_eq!(banded.y, banded.x);
+        assert_eq!(cropped.y, cropped.x);
+    }
+
+    for surface in 0..=24usize {
+        for frame in 0..=24usize {
+            let place = frame_placement(surface, surface, frame, frame);
+            for (axis, offset) in [
+                (place.x, band_offset(surface, frame)),
+                (place.y, band_offset_y(surface, frame)),
+            ] {
+                let at = (surface, frame);
+                assert_eq!(axis.origin, offset, "{at:?}");
+                assert_eq!(axis.band_before + axis.visible + axis.band_after, surface);
+                assert_eq!(axis.crop_before + axis.visible + axis.crop_after, frame);
+                for px in 0..surface {
+                    let shown = px as i64 - offset;
+                    let covered = (0..frame as i64).contains(&shown);
+                    assert_eq!(
+                        axis.source(px),
+                        covered.then_some(shown as usize),
+                        "{at:?} surface px {px}"
+                    );
+                }
+            }
+            // The visible rect is the surface pixels some frame pixel reaches.
+            let rect = place
+                .visible_rect(surface, surface)
+                .expect("a placement in its own surface");
+            let shown =
+                |axis: AxisPlacement| (0..surface).filter(move |&px| axis.source(px).is_some());
+            assert_eq!(
+                (rect.x..rect.x + rect.width).collect::<Vec<_>>(),
+                shown(place.x).collect::<Vec<_>>(),
+                "{surface} {frame}"
+            );
+            assert_eq!(
+                (rect.y..rect.y + rect.height).collect::<Vec<_>>(),
+                shown(place.y).collect::<Vec<_>>(),
+                "{surface} {frame}"
+            );
+            // Negative control: no rect for a surface the placement does not span.
+            assert_eq!(place.visible_rect(surface + 1, surface), None);
+            assert_eq!(place.visible_rect(surface, surface + 1), None);
+        }
+    }
+}
+
 /// Beside the source rows in `edge_rows` the remainder bands continue the row's
 /// own first and last pixel, so a chrome band (and a meter on it) reaches the
 /// true window edge. Every other band pixel stays the theme background,
@@ -275,6 +358,48 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
         assert_eq!(continued, edge_rows.len() * (dw - fw));
         assert_eq!(banded, dw * dh - fw * fh - continued);
     }
+    // Host chrome composited over the placed frame since (a tray card such as
+    // the stats Deck, whose bottom rule runs edge to edge) changes a chrome
+    // row's edge pixel: `continue_chrome_edges` re-continues it from the
+    // surface, and leaves every other pixel as it was.
+    let rule = 0x00AB_CDEF;
+    for (edge_rows, rule_row) in [(0..5, 3usize), (2..5, 4), (0..0, 3), (0..5, 7)] {
+        let mut dst = vec![0u32; dw * dh];
+        place_frame_bands(
+            &mut dst,
+            dw,
+            dh,
+            &src,
+            fw,
+            fh,
+            false,
+            BAND,
+            edge_rows.clone(),
+        );
+        let y = (rule_row as i64 + oy) as usize;
+        let frame = ox as usize..ox as usize + fw;
+        dst[y * dw..y * dw + dw][frame.clone()].fill(rule);
+        let before = dst.clone();
+        continue_chrome_edges(&mut dst, dw, dh, fw, fh, edge_rows.clone());
+        let chrome = edge_rows.contains(&rule_row);
+        for (i, (&d, &b)) in dst.iter().zip(&before).enumerate() {
+            let (x, py) = (i % dw, i / dw);
+            if py == y && !frame.contains(&x) && chrome {
+                assert_eq!(
+                    d, rule,
+                    "the chrome row's band continues the card ({x},{py})"
+                );
+            } else {
+                assert_eq!(d, b, "every other pixel is left as placed ({x},{py})");
+            }
+        }
+        // Non-vacuity: a chrome row's band moved, a terminal row's did not.
+        assert_eq!(dst != before, chrome, "{edge_rows:?}, rule on {rule_row}");
+    }
+    // An exact fit has no band to continue.
+    let mut exact = src.clone();
+    continue_chrome_edges(&mut exact, fw, fh, fw, fh, 0..fh);
+    assert_eq!(exact, src);
     // `edge_rows` past the frame is clamped by the frame itself.
     let mut all = vec![0u32; dw * dh];
     place_frame_bands(&mut all, dw, dh, &src, fw, fh, false, BAND, 0..usize::MAX);

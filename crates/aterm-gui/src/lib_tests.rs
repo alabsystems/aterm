@@ -855,6 +855,137 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
     );
 }
 
+/// The momentum glow's cool-down keeps the lane to its last frame: after a burst
+/// with a steady cursor (no blink clock to repaint the window), identical frames
+/// release the frame train while the halo is still on glass, but the lane must stay
+/// armed, advance on every plan, and park only after a frame that drew nothing: no
+/// halo, no tint, not hot. Drives the real planner as the event loop does; the
+/// engine's twin (`a_cooling_glow_keeps_the_lane_until_its_last_frame_clears_the_halo`)
+/// pins the schedule. Prints the wakes against the frame train; nothing pins them.
+#[test]
+fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
+    use aterm_effects::cursor_glow::Geom;
+    use aterm_effects::cursor_momentum::{
+        MOMENTUM_GLOW_RADIUS_CELLS, MOMENTUM_GLOW_TAU_S, MomentumGlowConfig, MomentumGlowFrame,
+    };
+
+    let geom = Geom {
+        cw: 8,
+        ch: 16,
+        rows: 24,
+        cols: 80,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 640,
+        win_h: 384,
+        head: 0,
+    };
+    let cfg = MomentumGlowConfig {
+        enabled: true,
+        intensity: 1.0,
+        tau_s: MOMENTUM_GLOW_TAU_S,
+        radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
+        base: 0x0050_FA7B,
+        dark_theme: true,
+        hue: 0x0050_FA7B,
+        theme_fg: 0x00C8_D3F5,
+        theme_bg: 0x001A_1B26,
+        block: true,
+        glyph_span: None,
+    };
+    let mut app = App::headless_for_test();
+    let t0 = Instant::now();
+    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    ws.focused = true;
+    // A 120 Hz panel: the shipped effect lane.
+    ws.frame_interval = Some(Duration::from_nanos(8_333_333));
+    let interval = ws.effect_present_interval();
+    let mut halo = Vec::new();
+    let tick = |ws: &mut super::WindowState,
+                at: Instant,
+                col: u16,
+                halo: &mut Vec<_>|
+     -> MomentumGlowFrame {
+        halo.clear();
+        ws.fx
+            .cursor_mut()
+            .momentum
+            .tick(Some((4, col)), at, geom, &cfg, halo, &mut Vec::new())
+    };
+
+    // 24 keys at 60 ms, each moving the caret, a frame after each; then rest
+    // on the frame train until the fingerprint law lets go.
+    let mut t = t0;
+    let mut col = 10u16;
+    for k in 0..24u16 {
+        t = t0 + Duration::from_millis(60 * u64::from(k));
+        col = 10 + k;
+        ws.fx.cursor_mut().momentum.on_key(t, MOMENTUM_GLOW_TAU_S);
+        tick(ws, t, col, &mut halo);
+    }
+    let last_key = t;
+    while !ws.fx.cursor().momentum.settling() {
+        t += interval;
+        tick(ws, t, col, &mut halo);
+        assert!(
+            t.saturating_duration_since(t0) < Duration::from_secs(10),
+            "fixture: the glow's frames never stopped moving"
+        );
+    }
+    assert!(!halo.is_empty(), "fixture: the halo is still on glass");
+    assert!(
+        !ws.cursor_dependents_need_frame_cadence(t, false),
+        "negative control: the frame-cadence set alone parks the lane here, mid-cool-down"
+    );
+    assert!(
+        ws.cursor_fx_active(t, false),
+        "…but the cool-down is live effect state"
+    );
+    let first = ws
+        .plan_terminal_effect_lane(t, false, true)
+        .expect("the settling glow owns a deadline");
+    assert!(first > t, "the deadline is in the future");
+
+    let horizon = t + Duration::from_secs(20);
+    let mut wakes = 0_usize;
+    let mut deadline = first;
+    let (released_at, last) = loop {
+        assert!(
+            deadline <= horizon,
+            "the lane never released: {wakes} wakes"
+        );
+        assert!(
+            ws.service_due_terminal_effect_tick(deadline),
+            "the armed clock is due at its deadline"
+        );
+        let frame = tick(ws, deadline, col, &mut halo);
+        wakes += 1;
+        match ws.plan_terminal_effect_lane(deadline, false, true) {
+            Some(next) => {
+                assert!(next > deadline, "a deadline must advance");
+                deadline = next;
+            }
+            None => break (deadline, frame),
+        }
+    };
+    assert!(
+        halo.is_empty() && last.fill.is_none() && !last.hot,
+        "the lane parks only on a frame that drew nothing ({} halo quads)",
+        halo.len()
+    );
+    assert!(
+        !ws.fx.cursor().momentum.is_active() && !ws.fx.cursor().momentum.settling(),
+        "the lane parks only once the glow itself is cold"
+    );
+    let window = released_at.saturating_duration_since(t);
+    let frame_train = (window.as_secs_f32() / interval.as_secs_f32()) as usize;
+    println!(
+        "settling momentum glow: {wakes} wakes over {window:?} after the frame train let go \
+         ({:?} after the last key; the frame train: {frame_train} at {interval:?})",
+        released_at.saturating_duration_since(last_key)
+    );
+}
+
 #[test]
 fn static_collection_hello_uses_cursor_effect_presentability() {
     let mut app = App::headless_for_test();
@@ -963,49 +1094,125 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
     assert_eq!(app.pool.rain_override(0), Some(true));
 }
 
+/// The bell tests' positive control: a windowed instance with every gate open
+/// (`bell_sound` ships on, serious mode off, a fresh lane) asks the fixture's
+/// counting `alert_sound` for exactly one sound per [`BELL_BEEP_INTERVAL`], and
+/// that bell burns the lane. So the zero counts the silenced-bell tests below
+/// assert are the gates at work, not a counter that never moves. The fixture's
+/// `alert_sound` only counts, so no test here plays a real alert sound.
+#[test]
+fn a_windowed_bell_plays_one_alert_sound_per_lane() {
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    let now = std::time::Instant::now();
+    let before = crate::alert_sounds_on_this_thread();
+
+    app.on_bell(WindowId(0), 0, now);
+    app.on_bell(WindowId(0), 0, now);
+
+    assert_eq!(
+        crate::alert_sounds_on_this_thread() - before,
+        1,
+        "two bells inside one lane interval play exactly one alert sound",
+    );
+    assert!(
+        !app.bell_beep.try_fire(now),
+        "the bell that sounded burned the lane's token",
+    );
+}
+
 #[test]
 fn serious_mode_bell_never_consumes_the_audible_rate_limit_lane() {
     let mut app = App::headless_for_test();
+    // As a windowed instance: headless alone silences every bell
+    // (`a_headless_bell_never_reaches_the_alert_sound`), which would leave
+    // serious mode's own gate untested here.
+    app.headless = false;
     assert!(app.set_serious_mode(true));
+    let now = std::time::Instant::now();
+    let before = crate::alert_sounds_on_this_thread();
 
     // The headless fixture has no active native view to flash.  What this
     // path must establish is that a suppressed BEL never reaches (or even
     // consumes) the audible limiter; visual-bell preservation is not
     // driven here.
-    app.on_bell(WindowId(0), 0);
+    app.on_bell(WindowId(0), 0, now);
 
+    assert_eq!(
+        crate::alert_sounds_on_this_thread(),
+        before,
+        "a serious-mode BEL plays no alert sound",
+    );
     assert!(!app.set_serious_mode(false));
+    // The same instant the bell arrived at: a consumed token would refuse it
+    // however long the test took between the two calls.
     assert!(
-        app.bell_beep.try_fire(std::time::Instant::now()),
+        app.bell_beep.try_fire(now),
         "a serious-mode BEL must not consume the audible rate-limit lane"
     );
 }
 
 /// `bell_sound = false` silences the audible BEL without consuming the
 /// [`BELL_BEEP_INTERVAL`] token (the `&&` order in `on_bell`), like the serious-mode
-/// twin. Non-vacuous: it first asserts the key ships on, a fresh lane is open, and one
-/// fire consumes it. The audible half is not driven (a headless beep would need
-/// AppKit).
+/// twin. Non-vacuous: it first asserts the key ships on, and the positive control
+/// (`a_windowed_bell_plays_one_alert_sound_per_lane`) shows an open gate both
+/// sounds and burns the lane.
 #[test]
 fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
     let mut app = App::headless_for_test();
+    // As a windowed instance, so `bell_sound` is what silences this bell.
+    app.headless = false;
     assert!(
         app.config.bell_sound_or_default(),
         "the audible bell ships ON; this switch is the opt-OUT",
     );
-
-    // The lane is consumable: exactly the property the assertion below
-    // depends on to mean anything.
     let now = std::time::Instant::now();
-    let mut lane = crate::BellRateLimiter::new(crate::BELL_BEEP_INTERVAL);
-    assert!(lane.try_fire(now), "a fresh lane is open");
-    assert!(!lane.try_fire(now), "one fire consumes the lane's token");
+    let before = crate::alert_sounds_on_this_thread();
 
     app.config.bell_sound = Some(false);
-    app.on_bell(WindowId(0), 0);
+    app.on_bell(WindowId(0), 0, now);
+    assert_eq!(
+        crate::alert_sounds_on_this_thread(),
+        before,
+        "a silenced BEL plays no alert sound",
+    );
     assert!(
-        app.bell_beep.try_fire(std::time::Instant::now()),
+        app.bell_beep.try_fire(now),
         "a silenced BEL must not consume the audible rate-limit lane",
+    );
+}
+
+/// A headless instance has no window, so its BEL never asks the OS for the
+/// alert sound: every other gate is open (the switch ships on, serious mode is
+/// off, the lane is fresh), yet no sound is requested and the lane's token is
+/// still there after the bell. Measured before this gate: headless lab
+/// instances, live tests and checks on the owner's Mac played the system alert
+/// sound for every BEL their scripted shells rang.
+#[test]
+fn a_headless_bell_never_reaches_the_alert_sound() {
+    let mut app = App::headless_for_test();
+    assert!(app.headless, "the fixture is a headless instance");
+    assert!(
+        app.config.bell_sound_or_default(),
+        "the audible bell ships ON, so the switch is not what silences it here",
+    );
+    assert!(
+        app.serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::TerminalSound),
+        "serious mode is off, so it is not what silences it here either",
+    );
+    let now = std::time::Instant::now();
+    let before = crate::alert_sounds_on_this_thread();
+
+    app.on_bell(WindowId(0), 0, now);
+    assert_eq!(
+        crate::alert_sounds_on_this_thread(),
+        before,
+        "a headless BEL must never reach the alert sound",
+    );
+    assert!(
+        app.bell_beep.try_fire(now),
+        "a headless BEL must never burn the alert sound's lane",
     );
 }
 
@@ -1275,16 +1482,14 @@ fn controls_prefs_projects_current_native_top_settings_tree() {
         )
     }));
 
-    let expected_field_keys = compiled
-        .semantics
-        .iter()
-        .filter_map(|node| {
-            node.key
-                .as_str()
-                .strip_prefix("settings/control/")
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
+    let mut expected_field_keys: Vec<String> = Vec::new();
+    for node in &compiled.semantics {
+        if let Some(key) = crate::native_settings::edited_setting_key(&node.key)
+            && !expected_field_keys.iter().any(|seen| seen == key)
+        {
+            expected_field_keys.push(key.to_string());
+        }
+    }
     let emitted_field_keys = open
         .iter()
         .filter_map(|line| {

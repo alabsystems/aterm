@@ -64,9 +64,16 @@ fn glow_halo_dirty_gate_marks_prev_and_cur_rows() {
     let prev = frame(&settled);
     let cur = frame(&settled);
     let mut dirty = Vec::new();
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(
@@ -78,9 +85,16 @@ fn glow_halo_dirty_gate_marks_prev_and_cur_rows() {
 
     // The halo steps row 1 → row 4: prev and cur rows repaint, nothing else.
     let cur = frame(&[halo(4, 0, 64, 8, 16, 0x0010_2010)]);
-    let DirtyDecision::Rows(d) =
-        compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
-    else {
+    let DirtyDecision::Rows(d) = compute_dirty_rows(
+        &prev,
+        &cur,
+        false,
+        None,
+        false,
+        None,
+        aterm_render::RowBands::new(0, 16),
+        &mut dirty,
+    ) else {
         panic!("identical-geometry frames must take the row-damage path");
     };
     assert!(

@@ -1,44 +1,266 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The engine: every item through probe, plan, apply, verify (design §5).
+//! The engine (design §5) is `aterm_converge`'s (docs/DESIGN-init-system-2026-10-20.md
+//! §3): this module binds machines items, which take their `System` and context per call,
+//! to it ([`Bound`]), so the sixteen families keep their code.
 
 use crate::items::{Ctx, Item};
-use crate::model::{ItemReport, Mode, Outcome, Probe};
+use crate::model::{ItemReport, Mode, Probe};
 use crate::port::System;
+use aterm_converge::{Class, Effect, Explain, FileJournal, Layer, Remedy, Requires, StoodAside};
 
-/// Where the engine records a value before it changes it.
-pub trait Journal {
-    /// Record that `id` held `from` and is about to become `to`.
-    ///
-    /// # Errors
-    /// One line; the engine then does not apply the change.
-    fn before_change(&mut self, id: &str, from: &str, to: &str) -> Result<(), String>;
+#[cfg(any(test, debug_assertions))]
+pub use aterm_converge::NoJournal;
+pub use aterm_converge::{Journal, Refusal};
+
+/// Where a machines item sits in the desired state. Its family does not say: the
+/// `keyboard` family is a workstation preference under `aterm init` and a fleet setting
+/// under `aterm machines`, so the surface that composes the run places it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    /// The layer.
+    pub layer: Layer,
+    /// What its apply does.
+    pub class: Class,
+    /// Where it may run.
+    pub requires: Requires,
+    /// The act that makes a change of this run's: the surface's own command.
+    pub remedy: Remedy,
 }
 
-/// A journal that keeps nothing (plan runs, tests).
-#[derive(Debug, Default)]
-pub struct NoJournal;
-
-impl Journal for NoJournal {
-    fn before_change(&mut self, _id: &str, _from: &str, _to: &str) -> Result<(), String> {
-        Ok(())
+impl Place {
+    /// A fleet item's place, by its family (the baseline table it came from), for
+    /// `aterm machines here` and the agent.
+    #[must_use]
+    pub fn fleet(family: &str, remedy: Remedy) -> Self {
+        let (layer, class) = match family {
+            // `base.clt` is this family's item (design §4.2), installed as root.
+            "developer" => (Layer::Base, Class::Elevate),
+            // The app and each user's toolset, from the network.
+            "aterm" => (Layer::Base, Class::Install),
+            "app" | "homebrew" | "github" => (Layer::Workstation, Class::Install),
+            "person" => (Layer::Workstation, Class::Person),
+            "keyboard" | "consumer" | "setup" | "defaults" => {
+                (Layer::Workstation, Class::Preference)
+            }
+            // names, sharing, firewall, time, power, updates: the Mac's own settings, as
+            // root.
+            _ => (Layer::Workstation, Class::Elevate),
+        };
+        Self {
+            layer,
+            class,
+            requires: Requires::Account,
+            remedy,
+        }
     }
 }
 
-/// Run `items` in order and report each.
+/// A machines [`Item`] with the `System` and context it runs against: an
+/// [`aterm_converge::Item`]. It forwards the item's id, family, title, probe, apply,
+/// refresh, detail, revert, effect and stood-aside line, and takes its layer, class and
+/// precondition from its [`Place`].
+pub struct Bound<'a> {
+    item: &'a dyn Item,
+    sys: &'a dyn System,
+    ctx: &'a Ctx,
+    place: Place,
+    after: Vec<String>,
+}
+
+impl<'a> Bound<'a> {
+    /// `item`, bound to `sys` and `ctx` at `place`, with its own `after` edges.
+    #[must_use]
+    pub fn new(item: &'a dyn Item, sys: &'a dyn System, ctx: &'a Ctx, place: Place) -> Self {
+        Self {
+            after: item.after(),
+            item,
+            sys,
+            ctx,
+            place,
+        }
+    }
+}
+
+/// Bind the items of one run. Each item's `after` is narrowed to the items the run holds:
+/// a family names prerequisites from other baseline tables (`homebrew.pkg` after
+/// `developer.command-line-tools`), and a baseline without that table, or an
+/// `--only <table>` run (`baseline::keep_only`), leaves them out, which the machines
+/// engine always read as no constraint. The converge engine refuses an edge that names no
+/// item, so an edge is kept only when it names one here, by the engine's own rule
+/// ([`aterm_converge::named_by`]).
+#[must_use]
+pub fn bind<'a>(
+    items: impl IntoIterator<Item = (&'a dyn Item, Place)>,
+    sys: &'a dyn System,
+    ctx: &'a Ctx,
+) -> Vec<Box<dyn aterm_converge::Item + 'a>> {
+    let mut bound: Vec<Bound<'a>> = items
+        .into_iter()
+        .map(|(item, place)| Bound::new(item, sys, ctx, place))
+        .collect();
+    let ids: Vec<String> = bound.iter().map(|b| b.item.id()).collect();
+    for (me, b) in bound.iter_mut().enumerate() {
+        b.after
+            .retain(|want| aterm_converge::named_by(want, me, &ids).next().is_some());
+    }
+    bound
+        .into_iter()
+        .map(|b| Box::new(b) as Box<dyn aterm_converge::Item + 'a>)
+        .collect()
+}
+
+impl aterm_converge::Item for Bound<'_> {
+    fn id(&self) -> String {
+        self.item.id()
+    }
+
+    fn family(&self) -> &'static str {
+        self.item.family()
+    }
+
+    fn layer(&self) -> Layer {
+        self.place.layer
+    }
+
+    fn class(&self) -> Class {
+        self.place.class
+    }
+
+    fn requires(&self) -> Requires {
+        self.place.requires
+    }
+
+    fn title(&self) -> String {
+        self.item.title()
+    }
+
+    fn probe(&self) -> Probe {
+        self.item.probe(self.sys, self.ctx)
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        self.item.apply(self.sys, self.ctx)
+    }
+
+    fn refresh(&self) -> Option<Result<(), String>> {
+        self.item.refresh(self.sys, self.ctx)
+    }
+
+    fn explain(&self, probe: &Probe) -> Explain {
+        let (why, remedy) = match probe {
+            Probe::Person { step, how } => (
+                how.clone(),
+                Remedy::Person {
+                    pane: step.clone(),
+                    how: how.clone(),
+                },
+            ),
+            Probe::Ok { now } => (now.clone(), Remedy::None),
+            // A missing precondition this item cannot lift; its line says which.
+            Probe::NotApplicable { why } | Probe::Blocked { why } => (why.clone(), Remedy::None),
+            Probe::Change { from, to } => {
+                (format!("{from}; wanted: {to}"), self.place.remedy.clone())
+            }
+            // The surface's next run: after the prerequisite, when the Mac is idle, when
+            // the read answers.
+            Probe::Waits { why, .. } | Probe::Deferred { why } | Probe::Unusable { why } => {
+                (why.clone(), self.place.remedy.clone())
+            }
+        };
+        Explain { why, remedy }
+    }
+
+    fn after(&self) -> Vec<String> {
+        self.after.clone()
+    }
+
+    fn detail(&self) -> Option<String> {
+        self.item.detail(self.sys, self.ctx)
+    }
+
+    fn revert(&self) -> Option<String> {
+        self.item.revert()
+    }
+
+    fn effect(&self) -> Effect {
+        self.item.effect()
+    }
+
+    fn stood_aside(&self) -> Option<StoodAside> {
+        self.item.stood_aside()
+    }
+}
+
+/// The converge journal of the account this process runs as,
+/// `<state_dir>/converge/journal.ndjson` (design §3.3), for `aterm init` and `aterm
+/// machines here`. The state root comes from the account record's home, never `$HOME`:
+/// `sudo aterm machines here apply` may keep the invoking person's HOME, and root must not
+/// write into their tree (a root-owned journal there would refuse every later `aterm init`
+/// change). A private state root (a test binary's, a development build's
+/// `ATERM_STATE_HOME`) is used as it is.
 ///
-/// In [`Mode::Apply`] a planned change is journaled, applied, and probed again. Only a
-/// read-back that probes `Ok` counts as [`Outcome::Changed`]. Anything else is
-/// [`Outcome::Failed`], with the read-back in `why`. A failure does not stop the run.
-/// An item whose [`Item::after`] names an earlier item that did not end `Ok` or `Changed`
-/// is not probed in an apply run: it is [`Outcome::Blocked`] on that item. In a plan
-/// run it is probed as usual, since its prerequisite may only be planned; when that
-/// probe [`Probe::Waits`] on an item this plan changes first (git's settings before the
-/// Command Line Tools exist), the row is [`Outcome::Planned`]: the apply judges it after
-/// that change. Any other block stays [`Outcome::Blocked`], and an unreadable probe stays
-/// [`Outcome::Unknown`], whatever is planned before it: a read that failed is a failure,
-/// never a plan.
+/// # Errors
+/// The account has no home to keep state under.
+pub fn account_journal() -> Result<FileJournal, String> {
+    let private =
+        aterm_types::dirs::runs_under_private_state_root().then(aterm_types::dirs::state_dir);
+    journal_root(private, aterm_uds::account::home())
+        .map(|root| FileJournal::under(&root))
+        .ok_or_else(|| "this account has no state directory to journal changes in".into())
+}
+
+/// The pure half of [`account_journal`]: the state root its journal lives under.
+/// `private` is `Some` when the process runs under a private state root, holding what
+/// that root resolves to, which is used as it is (and `None` inside it, a relative
+/// `ATERM_STATE_HOME`, resolves no journal rather than the account's). Otherwise the root
+/// is the state directory of `account_home`, the account record's home, never `$HOME`'s.
+fn journal_root(
+    private: Option<Option<std::path::PathBuf>>,
+    account_home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    match private {
+        Some(root) => root,
+        None => aterm_types::dirs::resolve_state_dir(
+            None,
+            aterm_types::dirs::StatePlatform {
+                home: account_home,
+                ..aterm_types::dirs::StatePlatform::default()
+            },
+        ),
+    }
+}
+
+/// Run a fleet baseline's `items` (`aterm machines here`, the agent's run job), each placed
+/// by its family with `remedy` as the surface's own command, handing each row to `on_row`
+/// as soon as its item finishes: the agent's run job streams them to `progress.ndjson`
+/// (design §4.4).
+///
+/// # Errors
+/// The items cannot be ordered ([`aterm_converge::order`]); nothing was probed.
+pub fn run_with(
+    items: &[Box<dyn Item>],
+    mode: Mode,
+    sys: &dyn System,
+    ctx: &Ctx,
+    remedy: &Remedy,
+    journal: &mut dyn Journal,
+    on_row: &mut dyn FnMut(&ItemReport),
+) -> Result<Vec<ItemReport>, Refusal> {
+    let bound = bind(
+        items
+            .iter()
+            .map(|item| (item.as_ref(), Place::fleet(item.family(), remedy.clone()))),
+        sys,
+        ctx,
+    );
+    aterm_converge::run_with(&bound, mode, journal, on_row)
+}
+
+/// [`run_with`] as the families' tests call it: placed as a fleet run, no stream, and a
+/// composition that cannot be ordered fails the test.
+#[cfg(test)]
 pub fn run(
     items: &[Box<dyn Item>],
     mode: Mode,
@@ -46,226 +268,17 @@ pub fn run(
     ctx: &Ctx,
     journal: &mut dyn Journal,
 ) -> Vec<ItemReport> {
-    run_with(items, mode, sys, ctx, journal, &mut |_| {})
-}
-
-/// [`run`], handing each row to `on_row` as soon as its item finishes: the agent's run job
-/// streams them to `progress.ndjson` (design §4.4).
-pub fn run_with(
-    items: &[Box<dyn Item>],
-    mode: Mode,
-    sys: &dyn System,
-    ctx: &Ctx,
-    journal: &mut dyn Journal,
-    on_row: &mut dyn FnMut(&ItemReport),
-) -> Vec<ItemReport> {
-    let mut rows: Vec<ItemReport> = Vec::with_capacity(items.len());
-    for item in items {
-        let blocker = (mode == Mode::Apply)
-            .then(|| unmet_prerequisite(item.as_ref(), &rows))
-            .flatten();
-        let row = match blocker {
-            Some(on) => ItemReport {
-                id: item.id(),
-                family: item.family().to_owned(),
-                title: item.title(),
-                outcome: Outcome::Blocked,
-                from: None,
-                to: None,
-                why: Some(format!("waits for {on}")),
-                revert: None,
-                effect: item.effect(),
-                detail: None,
-            },
-            None => run_one(item.as_ref(), mode, sys, ctx, journal, &rows),
-        };
-        on_row(&row);
-        rows.push(row);
-    }
-    rows
-}
-
-/// The first earlier row `item` must wait for that did not end `Ok` or `Changed`.
-fn unmet_prerequisite(item: &dyn Item, rows: &[ItemReport]) -> Option<String> {
-    for want in item.after() {
-        let matches = |id: &str| match want.strip_suffix('*') {
-            Some(prefix) => id.starts_with(prefix),
-            None => id == want,
-        };
-        for row in rows.iter().filter(|r| matches(&r.id)) {
-            if !matches!(row.outcome, Outcome::Ok | Outcome::Changed) {
-                return Some(row.id.clone());
-            }
-        }
-    }
-    None
-}
-
-/// One item through probe, plan, apply and read-back; `earlier` are the rows before it.
-fn run_one(
-    item: &dyn Item,
-    mode: Mode,
-    sys: &dyn System,
-    ctx: &Ctx,
-    journal: &mut dyn Journal,
-    earlier: &[ItemReport],
-) -> ItemReport {
-    let mut row = ItemReport {
-        id: item.id(),
-        family: item.family().to_owned(),
-        title: item.title(),
-        outcome: Outcome::Ok,
-        from: None,
-        to: None,
-        why: None,
-        revert: None,
-        effect: item.effect(),
-        detail: None,
-    };
-    match item.probe(sys, ctx) {
-        Probe::Ok { now } => {
-            row.to = Some(now);
-        }
-        Probe::Person { step, how } => {
-            row.outcome = Outcome::Person;
-            row.to = Some(step);
-            row.why = Some(how);
-        }
-        Probe::Blocked { why } => {
-            row.outcome = Outcome::Blocked;
-            row.why = Some(why);
-        }
-        Probe::Waits { on, why } => {
-            let planned = earlier
-                .iter()
-                .any(|r| r.id == on && r.outcome == Outcome::Planned);
-            if mode == Mode::Plan && planned {
-                row.outcome = Outcome::Planned;
-                row.why = Some(format!(
-                    "read after {on}, which this plan changes first ({why})"
-                ));
-            } else {
-                row.outcome = Outcome::Blocked;
-                row.why = Some(why);
-            }
-        }
-        Probe::NotApplicable { why } => {
-            row.outcome = Outcome::NotApplicable;
-            row.why = Some(why);
-        }
-        Probe::Deferred { why } => {
-            row.outcome = Outcome::Deferred;
-            row.why = Some(why);
-        }
-        Probe::Unusable { why } => {
-            row.outcome = Outcome::Unknown;
-            row.why = Some(why);
-        }
-        Probe::Change { from, to } => {
-            row.from = Some(from.clone());
-            row.to = Some(to.clone());
-            row.revert = item.revert();
-            if mode == Mode::Plan {
-                row.outcome = Outcome::Planned;
-            } else if let Err(why) = journal.before_change(&row.id, &from, &to) {
-                row.outcome = Outcome::Failed;
-                row.why = Some(format!(
-                    "not applied: the journal refused the record ({why})"
-                ));
-            } else {
-                match item.apply(sys, ctx) {
-                    Err(why) => {
-                        row.outcome = Outcome::Failed;
-                        row.why = Some(why);
-                    }
-                    Ok(()) if item.stood_aside().is_some() => {
-                        row.outcome = Outcome::Blocked;
-                        row.why = item.stood_aside();
-                    }
-                    Ok(()) => match item.probe(sys, ctx) {
-                        Probe::Ok { .. } => row.outcome = Outcome::Changed,
-                        Probe::Change { from: now, .. } => {
-                            row.outcome = Outcome::Failed;
-                            row.why = Some(format!("applied, but it still reads {now}"));
-                        }
-                        Probe::Unusable { why } => {
-                            row.outcome = Outcome::Failed;
-                            row.why =
-                                Some(format!("applied, but the read-back did not answer: {why}"));
-                        }
-                        Probe::Blocked { why }
-                        | Probe::Waits { why, .. }
-                        | Probe::NotApplicable { why }
-                        | Probe::Deferred { why }
-                        | Probe::Person { how: why, .. } => {
-                            row.outcome = Outcome::Failed;
-                            row.why = Some(format!("applied, but the read-back says: {why}"));
-                        }
-                    },
-                }
-            }
-        }
-    }
-    row.detail = item.detail(sys, ctx);
-    row
+    run_with(items, mode, sys, ctx, &Remedy::None, journal, &mut |_| {})
+        .unwrap_or_else(|refused| panic!("the test composed items no order runs: {refused}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Effect, HostFacts};
+    use crate::model::{HostFacts, Outcome};
     use crate::port::Fake;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// An item whose probes answer from a list, and which counts its applies.
-    struct Scripted {
-        probes: std::sync::Mutex<Vec<Probe>>,
-        applies: Arc<AtomicU32>,
-        apply_result: Result<(), String>,
-        family: &'static str,
-    }
-
-    impl Scripted {
-        fn new(probes: Vec<Probe>, apply_result: Result<(), String>) -> Self {
-            Self {
-                probes: std::sync::Mutex::new(probes),
-                applies: Arc::new(AtomicU32::new(0)),
-                apply_result,
-                family: "test",
-            }
-        }
-    }
-
-    impl Item for Scripted {
-        fn id(&self) -> String {
-            "test.scripted".into()
-        }
-        fn family(&self) -> &'static str {
-            self.family
-        }
-        fn title(&self) -> String {
-            "scripted".into()
-        }
-        fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
-            let mut p = self.probes.lock().unwrap();
-            if p.len() > 1 {
-                p.remove(0)
-            } else {
-                p[0].clone()
-            }
-        }
-        fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
-            self.applies.fetch_add(1, Ordering::SeqCst);
-            self.apply_result.clone()
-        }
-        fn revert(&self) -> Option<String> {
-            Some("undo".into())
-        }
-        fn effect(&self) -> Effect {
-            Effect::Login
-        }
-    }
+    use std::sync::{Arc, Mutex};
 
     fn ctx() -> Ctx {
         Ctx {
@@ -278,10 +291,71 @@ mod tests {
         }
     }
 
-    fn change() -> Probe {
-        Probe::Change {
-            from: "a".into(),
-            to: "b".into(),
+    /// A machines item that reads the `System` and context it is handed, so a test sees
+    /// that the binding passes them through.
+    struct Seen {
+        id: &'static str,
+        family: &'static str,
+        probes: Mutex<Vec<Probe>>,
+        after: Vec<String>,
+        refreshes: Arc<AtomicU32>,
+        refresh: Result<(), String>,
+        aside: Option<StoodAside>,
+        hosts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Seen {
+        fn new(id: &'static str, family: &'static str, probes: Vec<Probe>) -> Self {
+            Self {
+                id,
+                family,
+                probes: Mutex::new(probes),
+                after: Vec::new(),
+                refreshes: Arc::new(AtomicU32::new(0)),
+                refresh: Ok(()),
+                aside: None,
+                hosts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Item for Seen {
+        fn id(&self) -> String {
+            self.id.into()
+        }
+        fn family(&self) -> &'static str {
+            self.family
+        }
+        fn title(&self) -> String {
+            self.id.into()
+        }
+        fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
+            self.hosts
+                .lock()
+                .unwrap()
+                .push(format!("{}@{}", ctx.host_name, sys.euid()));
+            let mut p = self.probes.lock().unwrap();
+            if p.len() > 1 {
+                p.remove(0)
+            } else {
+                p[0].clone()
+            }
+        }
+        fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+            Ok(())
+        }
+        fn refresh(&self, _: &dyn System, _: &Ctx) -> Option<Result<(), String>> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Some(self.refresh.clone())
+        }
+        fn after(&self) -> Vec<String> {
+            self.after.clone()
+        }
+        fn detail(&self, _: &dyn System, ctx: &Ctx) -> Option<String> {
+            Some(format!("key for {}", ctx.host_name))
+        }
+        fn stood_aside(&self) -> Option<StoodAside> {
+            self.aside.clone()
         }
     }
 
@@ -289,288 +363,221 @@ mod tests {
         Probe::Ok { now: "b".into() }
     }
 
-    fn one(item: Scripted, mode: Mode) -> (ItemReport, u32) {
-        let applies = Arc::clone(&item.applies);
+    fn change() -> Probe {
+        Probe::Change {
+            from: "a".into(),
+            to: "b".into(),
+        }
+    }
+
+    #[test]
+    fn the_binding_forwards_family_refresh_detail_and_the_system_and_context() {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        let item = Seen::new("keyboard.caps-lock@alice", "keyboard", vec![ok()]);
+        let (refreshes, hosts) = (Arc::clone(&item.refreshes), Arc::clone(&item.hosts));
         let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
-        let rows = run(&items, mode, &Fake::root(), &ctx(), &mut NoJournal);
-        (
-            rows.into_iter().next().unwrap(),
-            applies.load(Ordering::SeqCst),
-        )
+        let rows = run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Ok);
+        // `--only <table>` merges a report by each row's family.
+        assert_eq!(rows[0].family, "keyboard");
+        assert_eq!(rows[0].detail.as_deref(), Some("key for h"));
+        assert_eq!(rows[0].layer, Some(Layer::Workstation));
+        assert_eq!(rows[0].class, Some(Class::Preference));
+        // One refresh in an apply, and its read-back: both probes saw this sys and ctx.
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(*hosts.lock().unwrap(), ["h@501", "h@501"]);
     }
 
     #[test]
-    fn a_plan_run_never_applies() {
-        let (row, applies) = one(Scripted::new(vec![change()], Ok(())), Mode::Plan);
-        assert_eq!(row.outcome, Outcome::Planned);
-        assert_eq!(applies, 0);
-        assert_eq!(row.revert.as_deref(), Some("undo"));
-        assert_eq!(row.effect, Effect::Login);
-    }
-
-    #[test]
-    fn only_a_matching_read_back_counts_as_changed() {
-        let (row, applies) = one(Scripted::new(vec![change(), ok()], Ok(())), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Changed);
-        assert_eq!(applies, 1);
-        let (row, _) = one(Scripted::new(vec![change(), change()], Ok(())), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Failed);
-        assert!(row.why.unwrap().contains("still reads a"));
-    }
-
-    #[test]
-    fn an_apply_error_is_a_failure_with_its_reason() {
-        let (row, _) = one(Scripted::new(vec![change()], Err("no".into())), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Failed);
-        assert_eq!(row.why.as_deref(), Some("no"));
-    }
-
-    #[test]
-    fn an_item_already_as_wanted_is_not_applied() {
-        let (row, applies) = one(Scripted::new(vec![ok()], Ok(())), Mode::Apply);
-        assert_eq!(row.outcome, Outcome::Ok);
-        assert_eq!(applies, 0);
-    }
-
-    #[test]
-    fn an_unmeasurable_item_is_unknown_never_ok() {
-        let (row, applies) = one(
-            Scripted::new(
-                vec![Probe::Unusable {
-                    why: "timeout".into(),
-                }],
-                Ok(()),
+    fn a_stood_aside_toolset_apply_carries_its_kind_into_the_row() {
+        let remedy = Remedy::Command("aterm machines apply h".into());
+        for (aside, status, wanted) in [
+            (
+                StoodAside::Lock("another atpkg run held the store".into()),
+                75,
+                remedy.clone(),
             ),
-            Mode::Apply,
-        );
-        assert_eq!(row.outcome, Outcome::Unknown);
-        assert_eq!(applies, 0);
-        assert!(row.outcome.is_failure());
+            (
+                StoodAside::Offline("the ALab index could not be reached".into()),
+                69,
+                Remedy::Network,
+            ),
+        ] {
+            let mut item = Seen::new("aterm.toolset@alice", "aterm", vec![change(), ok()]);
+            item.aside = Some(aside.clone());
+            let hosts = Arc::clone(&item.hosts);
+            let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
+            let rows = run_with(
+                &items,
+                Mode::Apply,
+                &Fake::root(),
+                &ctx(),
+                &remedy,
+                &mut NoJournal,
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(rows[0].outcome, Outcome::Blocked);
+            assert_eq!(rows[0].why.as_deref(), Some(aside.why()));
+            assert_eq!(
+                rows[0].stood_aside.as_ref().map(StoodAside::exit_status),
+                Some(status)
+            );
+            // Probed once: no `aterm pkg doctor` as the user after atpkg stood aside.
+            assert_eq!(hosts.lock().unwrap().len(), 1, "{aside:?} was read back");
+            // A lock is the surface's next run; offline is the network's.
+            assert_eq!(
+                rows[0].explain,
+                Some(Explain {
+                    why: aside.why().into(),
+                    remedy: wanted,
+                })
+            );
+        }
     }
 
     #[test]
-    fn a_reading_a_user_could_not_make_stays_unknown_with_its_own_reason() {
-        // `here plan` as a user: `socketfilterfw --get…` answers root or not (firewall.rs),
-        // so a garbled read is reported as it is, never as a missing privilege.
-        let mut user = Fake::root();
-        user.euid = 501;
-        let item = Scripted {
-            family: "firewall",
-            ..Scripted::new(
-                vec![Probe::Unusable {
-                    why: "socketfilterfw printed nothing".into(),
-                }],
-                Ok(()),
+    fn a_failed_refresh_is_explained_as_a_failure_the_next_run_retries() {
+        // init's trackpad: the saved preference reads as wanted and the native refresh
+        // refuses. The row fails, and `aterm init` again is what retries it; "nothing
+        // aterm can do" would be the Ok read's explanation.
+        let mut item = Seen::new(
+            "init.trackpad.scroll-direction@alice",
+            "trackpad",
+            vec![ok()],
+        );
+        item.refresh = Err("the native setter refused".into());
+        let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
+        let remedy = Remedy::Command("aterm init".into());
+        let rows = run_with(
+            &items,
+            Mode::Apply,
+            &Fake::root(),
+            &ctx(),
+            &remedy,
+            &mut NoJournal,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(rows[0].outcome, Outcome::Failed);
+        assert_eq!(
+            rows[0].explain,
+            Some(Explain {
+                why: "the native setter refused".into(),
+                remedy,
+            })
+        );
+    }
+
+    #[test]
+    fn the_journal_root_is_the_account_records_home_never_home_and_a_private_root_as_given() {
+        use std::path::PathBuf;
+        let state = |home: &str| {
+            aterm_types::dirs::resolve_state_dir(
+                None,
+                aterm_types::dirs::StatePlatform {
+                    home: Some(home.into()),
+                    ..aterm_types::dirs::StatePlatform::default()
+                },
             )
         };
-        let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
-        let rows = run(&items, Mode::Plan, &user, &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Unknown);
+        // `sudo aterm machines here apply` with the person's HOME kept: root's journal is
+        // under root's own home, never in the tree of the person who typed sudo.
+        let root = journal_root(None, Some("/var/root".into())).unwrap();
+        assert!(root.starts_with("/var/root"), "{}", root.display());
+        assert_eq!(Some(root.clone()), state("/var/root"));
+        // The negative control: the `$HOME` answer is another folder.
+        assert_ne!(Some(root), state("/Users//alice"));
+        // A private state root is used as it is, and one that resolves nothing (a
+        // relative override) journals nowhere rather than in the account's state.
+        let private = PathBuf::from("/scratch/state");
         assert_eq!(
-            rows[0].why.as_deref(),
-            Some("socketfilterfw printed nothing")
+            journal_root(Some(Some(private.clone())), Some("/var/root".into())),
+            Some(private)
         );
-    }
-
-    /// An item with a fixed id, outcome-by-probe, and prerequisites.
-    struct Named {
-        id: &'static str,
-        probe: Probe,
-        after: Vec<String>,
-    }
-
-    impl Item for Named {
-        fn id(&self) -> String {
-            self.id.into()
-        }
-        fn family(&self) -> &'static str {
-            "test"
-        }
-        fn title(&self) -> String {
-            self.id.into()
-        }
-        fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
-            self.probe.clone()
-        }
-        fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
-            Err("apply must not be reached".into())
-        }
-        fn after(&self) -> Vec<String> {
-            self.after.clone()
-        }
+        assert_eq!(journal_root(Some(None), Some("/var/root".into())), None);
+        assert_eq!(journal_root(None, None), None);
     }
 
     #[test]
-    fn an_item_waits_for_a_prerequisite_that_did_not_land() {
-        let items: Vec<Box<dyn Item>> = vec![
-            Box::new(Named {
-                id: "developer.clt",
-                probe: Probe::Unusable { why: "x".into() },
-                after: vec![],
-            }),
-            Box::new(Named {
-                id: "homebrew.pkg",
-                probe: ok(),
-                after: vec!["developer.*".into()],
-            }),
-            Box::new(Named {
-                id: "names.computer",
-                probe: ok(),
-                after: vec![],
-            }),
-        ];
+    fn an_edge_to_a_table_the_run_does_not_hold_is_no_constraint_and_one_it_holds_orders() {
+        // `apply --only homebrew`: no developer table, so no Command Line Tools item.
+        let mut brew = Seen::new("homebrew.pkg", "homebrew", vec![ok()]);
+        brew.after = vec!["developer.command-line-tools".into()];
+        let items: Vec<Box<dyn Item>> = vec![Box::new(brew)];
         let rows = run(&items, Mode::Apply, &Fake::root(), &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Unknown);
-        assert_eq!(rows[1].outcome, Outcome::Blocked);
-        assert_eq!(rows[1].why.as_deref(), Some("waits for developer.clt"));
-        assert_eq!(rows[2].outcome, Outcome::Ok);
-        // A plan run probes the dependent anyway.
-        let rows = run(&items, Mode::Plan, &Fake::root(), &ctx(), &mut NoJournal);
-        assert_eq!(rows[1].outcome, Outcome::Ok);
-    }
-
-    #[test]
-    fn a_plan_judges_an_item_waiting_on_a_planned_prerequisite_as_planned() {
-        let waits = |on: &str| Probe::Waits {
-            on: on.into(),
-            why: "no git".into(),
-        };
-        let items: Vec<Box<dyn Item>> = vec![
-            Box::new(Named {
-                id: "developer.clt",
-                probe: change(),
-                after: vec![],
-            }),
-            Box::new(Named {
-                id: "github.ssh-urls",
-                probe: waits("developer.clt"),
-                after: vec!["developer.clt".into()],
-            }),
-            // Waiting on a row the plan made planned the same way.
-            Box::new(Named {
-                id: "github.after-urls",
-                probe: waits("github.ssh-urls"),
-                after: vec!["github.ssh-urls".into()],
-            }),
-            // With no planned prerequisite, a wait is a block.
-            Box::new(Named {
-                id: "github.other",
-                probe: waits("github.absent"),
-                after: vec![],
-            }),
-        ];
-        let rows = run(&items, Mode::Plan, &Fake::root(), &ctx(), &mut NoJournal);
-        assert_eq!(rows[1].outcome, Outcome::Planned);
-        assert!(rows[1].why.as_deref().unwrap().contains("developer.clt"));
-        assert_eq!(rows[2].outcome, Outcome::Planned);
-        assert_eq!(rows[3].outcome, Outcome::Blocked);
-        assert_eq!(rows[3].why.as_deref(), Some("no git"));
-    }
-
-    #[test]
-    fn a_plan_keeps_a_block_its_prerequisite_does_not_lift() {
-        // Homebrew in a prefix another uid owns: installing the Command Line Tools first
-        // changes nothing about that, so the plan says blocked, as the apply will.
-        let items: Vec<Box<dyn Item>> = vec![
-            Box::new(Named {
-                id: "developer.command-line-tools",
-                probe: change(),
-                after: vec![],
-            }),
-            Box::new(Named {
-                id: "homebrew.pkg",
-                probe: Probe::Blocked {
-                    why: "/opt/homebrew belongs to uid 502".into(),
-                },
-                after: vec!["developer.command-line-tools".into()],
-            }),
-            Box::new(Named {
-                id: "homebrew.formula.jq",
-                probe: Probe::Waits {
-                    on: "homebrew.pkg".into(),
-                    why: "no brew".into(),
-                },
-                after: vec!["homebrew.pkg".into()],
-            }),
-        ];
-        let rows = run(&items, Mode::Plan, &Fake::root(), &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Planned);
+        assert_eq!(rows[0].outcome, Outcome::Ok);
+        // With the developer table, composed after it, the edge orders the run and blocks.
+        let mut brew = Seen::new("homebrew.pkg", "homebrew", vec![ok()]);
+        brew.after = vec!["developer.*".into()];
+        let clt = Seen::new(
+            "developer.command-line-tools",
+            "developer",
+            vec![Probe::Unusable { why: "x".into() }],
+        );
+        let items: Vec<Box<dyn Item>> = vec![Box::new(brew), Box::new(clt)];
+        let rows = run(&items, Mode::Apply, &Fake::root(), &ctx(), &mut NoJournal);
+        assert_eq!(rows[0].id, "developer.command-line-tools");
+        assert_eq!(rows[0].layer, Some(Layer::Base));
+        assert_eq!(rows[0].class, Some(Class::Elevate));
         assert_eq!(rows[1].outcome, Outcome::Blocked);
         assert_eq!(
             rows[1].why.as_deref(),
-            Some("/opt/homebrew belongs to uid 502")
+            Some("waits for developer.command-line-tools")
         );
-        assert_eq!(rows[2].outcome, Outcome::Blocked);
+        // Two items that wait on each other are still refused.
+        let mut a = Seen::new("names.a", "names", vec![ok()]);
+        a.after = vec!["names.b".into()];
+        let mut b = Seen::new("names.b", "names", vec![ok()]);
+        b.after = vec!["names.a".into()];
+        let items: Vec<Box<dyn Item>> = vec![Box::new(a), Box::new(b)];
+        let refused = run_with(
+            &items,
+            Mode::Plan,
+            &Fake::root(),
+            &ctx(),
+            &Remedy::None,
+            &mut NoJournal,
+            &mut |_| {},
+        );
+        assert!(matches!(refused, Err(Refusal::Cycle { .. })));
     }
 
     #[test]
-    fn a_plan_keeps_an_unreadable_item_unknown_behind_a_planned_prerequisite() {
+    fn a_change_and_a_person_step_are_explained_with_the_surfaces_remedy_and_the_pane() {
         let items: Vec<Box<dyn Item>> = vec![
-            Box::new(Named {
-                id: "developer.clt",
-                probe: change(),
-                after: vec![],
-            }),
-            // git's settings file is mode 000: no answer, whatever the CLT will be.
-            Box::new(Named {
-                id: "github.git",
-                probe: Probe::Unusable {
-                    why: "~/.gitconfig: Permission denied".into(),
-                },
-                after: vec!["developer.clt".into()],
-            }),
-            // Nor does it carry what waits for it into the plan.
-            Box::new(Named {
-                id: "github.ssh-urls",
-                probe: Probe::Waits {
-                    on: "github.git".into(),
-                    why: "no git".into(),
-                },
-                after: vec!["github.git".into()],
-            }),
+            Box::new(Seen::new("power.sleep", "power", vec![change()])),
+            Box::new(Seen::new(
+                "person.fda",
+                "person",
+                vec![Probe::Person {
+                    step: "fda".into(),
+                    how: "Privacy & Security ▸ Full Disk Access".into(),
+                }],
+            )),
         ];
-        let rows = run(&items, Mode::Plan, &Fake::root(), &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Planned);
-        assert_eq!(rows[1].outcome, Outcome::Unknown);
-        assert!(rows[1].outcome.is_failure());
-        assert_eq!(rows[2].outcome, Outcome::Blocked);
-    }
-
-    #[test]
-    fn not_applicable_and_deferred_are_their_own_outcomes() {
-        let items: Vec<Box<dyn Item>> = vec![
-            Box::new(Named {
-                id: "a",
-                probe: Probe::NotApplicable {
-                    why: "intel".into(),
-                },
-                after: vec![],
-            }),
-            Box::new(Named {
-                id: "b",
-                probe: Probe::Deferred {
-                    why: "in use".into(),
-                },
-                after: vec![],
-            }),
-        ];
-        let rows = run(&items, Mode::Apply, &Fake::root(), &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::NotApplicable);
-        assert_eq!(rows[1].outcome, Outcome::Deferred);
-    }
-
-    struct Refusing;
-    impl Journal for Refusing {
-        fn before_change(&mut self, _: &str, _: &str, _: &str) -> Result<(), String> {
-            Err("disk full".into())
-        }
-    }
-
-    #[test]
-    fn a_change_the_journal_cannot_record_is_not_applied() {
-        let items: Vec<Box<dyn Item>> = vec![Box::new(Scripted::new(vec![change()], Ok(())))];
-        let rows = run(&items, Mode::Apply, &Fake::root(), &ctx(), &mut Refusing);
-        assert_eq!(rows[0].outcome, Outcome::Failed);
-        assert!(rows[0].why.as_deref().unwrap().contains("disk full"));
+        let remedy = Remedy::Command("aterm machines apply h".into());
+        let rows = run_with(
+            &items,
+            Mode::Plan,
+            &Fake::root(),
+            &ctx(),
+            &remedy,
+            &mut NoJournal,
+            &mut |_| {},
+        )
+        .unwrap();
+        let explain = rows[0].explain.as_ref().unwrap();
+        assert_eq!(explain.remedy, remedy);
+        assert_eq!(explain.why, "a; wanted: b");
+        assert_eq!(rows[1].class, Some(Class::Person));
+        assert_eq!(
+            rows[1].explain.as_ref().unwrap().remedy,
+            Remedy::Person {
+                pane: "fda".into(),
+                how: "Privacy & Security ▸ Full Disk Access".into()
+            }
+        );
     }
 }

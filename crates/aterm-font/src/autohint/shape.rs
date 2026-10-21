@@ -12,7 +12,9 @@
 //! Shaping support for autohinting: the glyphs a style's reference
 //! characters map to (through a style's feature where it has one), and the
 //! glyphs `GSUB` reaches, which take the style of the script whose lookups
-//! reach them (FreeType afshaper.c).
+//! reach them (FreeType afshaper.c). Every walk of a shaper's `GSUB` spends
+//! one budget ([`LayoutWork`]), one unit per lookup, subtable and entry it
+//! visits; a walk that runs past it refuses the table.
 
 use super::GlyphId;
 use super::charmap::Charmap;
@@ -23,7 +25,16 @@ use crate::gsub::SubstitutionSubtable;
 use crate::opentype_layout::{
     ChainedContextLookup, ContextLookup, Coverage, Feature, LayoutTable, LookupList, ScriptList,
 };
+use crate::work::LayoutWork;
 use core::ops::Range;
+
+/// The traversals of `GSUB` a shaper's walks may spend ([`LayoutWork`]).
+/// The style walk visits each lookup once per style whose scripts reach it,
+/// so a face whose lookups serve several scripts may be walked several
+/// times over. The most on this Mac (2026-10-19, 523 faces with `GSUB`) is
+/// 0.26 traversals, by a Hiragino Sans W3 face, and a style's metrics walk
+/// spends at most 0.04 (Trattatello).
+const STYLE_WALK_TRAVERSALS: u64 = 8;
 
 // To prevent infinite recursion in contextual lookups. Matches HB
 // <https://github.com/harfbuzz/harfbuzz/blob/c7ef6a2ed58ae8ec108ee0962bef46f42c73a60c/src/hb-limits.hh#L53>
@@ -151,6 +162,14 @@ fn subtables<'a>(
     (0..subtables.len()).filter_map(move |i| subtables.get::<SubstitutionSubtable>(i))
 }
 
+/// `items`, one unit of `work` each, ending where the budget does.
+fn charged<'w, I: Iterator + 'w>(
+    work: &'w LayoutWork,
+    items: I,
+) -> impl Iterator<Item = I::Item> + 'w {
+    items.take_while(move |_| work.spend(1).is_some())
+}
+
 /// Every element of a lazy offset array that resolves.
 fn each<'a, T: crate::parser::FromSlice<'a>>(
     array: crate::parser::LazyOffsetArray16<'a, T>,
@@ -188,6 +207,8 @@ pub(crate) struct Shaper<'a, 'f> {
     font: &'f HintFont<'a>,
     charmap: Charmap<'a>,
     gsub: Option<LayoutTable<'a>>,
+    /// What this shaper's walks of `gsub` may still spend.
+    work: LayoutWork,
 }
 
 impl<'a, 'f> Shaper<'a, 'f> {
@@ -196,7 +217,24 @@ impl<'a, 'f> Shaper<'a, 'f> {
             font,
             charmap: *font.charmap(),
             gsub: font.gsub(),
+            work: LayoutWork::for_table(font.gsub_len(), STYLE_WALK_TRAVERSALS),
         }
+    }
+
+    /// The same face with its `GSUB` dropped, for a face whose walk ran
+    /// past its budget ([`Self::refused`]).
+    pub fn without_gsub(&self) -> Self {
+        Self {
+            font: self.font,
+            charmap: self.charmap,
+            gsub: None,
+            work: LayoutWork::for_table(0, 0),
+        }
+    }
+
+    /// Whether a walk of this shaper's `GSUB` ran past its budget.
+    pub fn refused(&self) -> bool {
+        self.work.refused()
     }
 
     pub fn font(&self) -> &'f HintFont<'a> {
@@ -297,6 +335,7 @@ impl<'a, 'f> Shaper<'a, 'f> {
             style,
             glyph_styles,
             visited_set,
+            &self.work,
         );
         let have = record_tags(&script_list);
         for script in script_tags.iter().filter_map(|tag| {
@@ -304,11 +343,11 @@ impl<'a, 'f> Shaper<'a, 'f> {
                 .and_then(|ix| script_list.get(ix))
         }) {
             // And all language systems for each script
-            for langsys in (0..script.languages.len())
+            let langsys = (0..script.languages.len())
                 .filter_map(|i| script.languages.get(i))
-                .chain(script.default_language)
-            {
-                for feature_ix in langsys.feature_indices {
+                .chain(script.default_language);
+            for langsys in charged(&self.work, langsys) {
+                for feature_ix in charged(&self.work, langsys.feature_indices.into_iter()) {
                     // If our style has a feature tag, we only look at that
                     // specific feature; otherwise, handle all of them
                     let Some(tag) = feature_list.tag(feature_ix) else {
@@ -322,8 +361,12 @@ impl<'a, 'f> Shaper<'a, 'f> {
                     };
                     // And now process associated lookups
                     for index in feature.lookup_indices {
-                        // We only care about errors here for testing
-                        let _ = gsub_handler.process_lookup(index);
+                        // We only care about errors here for testing, and
+                        // the budget's: past it the walk stops.
+                        if gsub_handler.process_lookup(index) == Err(ProcessLookupError::OverBudget)
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -363,7 +406,7 @@ impl ClusterShaper<'_, '_, '_> {
         }
         if let Some(feature) = self.feature {
             let mut did_subst = false;
-            for lookup_ix in feature.lookup_indices {
+            for lookup_ix in charged(&self.shaper.work, feature.lookup_indices.into_iter()) {
                 let mut glyph_ix = 0;
                 while glyph_ix < output.len() {
                     did_subst |= self.apply_lookup(lookup_ix, output, glyph_ix, 0);
@@ -374,7 +417,7 @@ impl ClusterShaper<'_, '_, '_> {
             // FreeType detects this by shaping twice and comparing gids
             // but we just track substitutions
             // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L528>
-            if !did_subst {
+            if !did_subst || self.shaper.refused() {
                 output.clear();
             }
         }
@@ -404,7 +447,7 @@ impl ClusterShaper<'_, '_, '_> {
         // currently only handling shaping for "feature" styles like
         // c2sc (caps to small caps) which are (almost?) always
         // single substs
-        for table in subtables(&lookup) {
+        for table in charged(&self.shaper.work, subtables(&lookup)) {
             if let SubstitutionSubtable::Single(table) = table {
                 match table {
                     crate::gsub::SingleSubstitution::Format1 { coverage, delta } => {
@@ -466,6 +509,7 @@ struct GsubHandler<'a, 'b> {
     max_gid: usize,
     lookup_depth: usize,
     visited_set: &'a mut VisitedLookupSet<'b>,
+    work: &'a LayoutWork,
 }
 
 impl<'a, 'b> GsubHandler<'a, 'b> {
@@ -475,6 +519,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
         style: &'a StyleClass,
         glyph_styles: &'a mut [GlyphStyle],
         visited_set: &'a mut VisitedLookupSet<'b>,
+        work: &'a LayoutWork,
     ) -> Self {
         let min_gid = glyph_styles.len();
         // If we have a feature, then we need to check the blue string to see
@@ -491,10 +536,13 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
             max_gid: 0,
             lookup_depth: 0,
             visited_set,
+            work,
         }
     }
 
     fn process_lookup(&mut self, lookup_index: u16) -> Result<(), ProcessLookupError> {
+        // Every reference spends, those to a lookup already visited too.
+        self.work.spend(1).ok_or(ProcessLookupError::OverBudget)?;
         // General protection against stack overflows
         if self.lookup_depth == MAX_NESTING_DEPTH {
             return Err(ProcessLookupError::ExceededMaxDepth);
@@ -516,11 +564,12 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
         let Some(lookup) = self.lookup_list.get(lookup_index) else {
             return Ok(());
         };
-        for table in subtables(&lookup) {
+        let work = self.work;
+        for table in charged(work, subtables(&lookup)) {
             match table {
                 SubstitutionSubtable::Single(table) => match table {
                     crate::gsub::SingleSubstitution::Format1 { coverage, delta } => {
-                        for gid in coverage_glyphs(coverage) {
+                        for gid in charged(work, coverage_glyphs(coverage)) {
                             self.capture_glyph(u32::from(
                                 (i32::from(gid) + i32::from(delta)) as u16,
                             ));
@@ -536,7 +585,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                         coverage,
                         substitutes,
                     } => {
-                        for gid in substitutes {
+                        for gid in charged(work, substitutes.into_iter()) {
                             self.capture_glyph(u32::from(gid.0));
                         }
                         // See above
@@ -546,8 +595,8 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                     }
                 },
                 SubstitutionSubtable::Multiple(table) => {
-                    for seq in each(table.sequences) {
-                        for gid in seq.substitutes {
+                    for seq in charged(work, each(table.sequences)) {
+                        for gid in charged(work, seq.substitutes.into_iter()) {
                             self.capture_glyph(u32::from(gid.0));
                         }
                     }
@@ -557,23 +606,23 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                     }
                 }
                 SubstitutionSubtable::Ligature(table) => {
-                    for set in each(table.ligature_sets) {
-                        for lig in each(set) {
+                    for set in charged(work, each(table.ligature_sets)) {
+                        for lig in charged(work, each(set)) {
                             self.capture_glyph(u32::from(lig.glyph.0));
                         }
                     }
                 }
                 SubstitutionSubtable::Alternate(table) => {
-                    for set in each(table.alternate_sets) {
-                        for gid in set.alternates {
+                    for set in charged(work, each(table.alternate_sets)) {
+                        for gid in charged(work, set.alternates.into_iter()) {
                             self.capture_glyph(u32::from(gid.0));
                         }
                     }
                 }
                 SubstitutionSubtable::Context(table) => match table {
                     ContextLookup::Format1 { sets, .. } | ContextLookup::Format2 { sets, .. } => {
-                        for set in each(sets) {
-                            for rule in each(set) {
+                        for set in charged(work, each(sets)) {
+                            for rule in charged(work, each(set)) {
                                 for rec in rule.lookups {
                                     self.process_lookup(rec.lookup_list_index)?;
                                 }
@@ -589,8 +638,8 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                 SubstitutionSubtable::ChainContext(table) => match table {
                     ChainedContextLookup::Format1 { sets, .. }
                     | ChainedContextLookup::Format2 { sets, .. } => {
-                        for set in each(sets) {
-                            for rule in each(set) {
+                        for set in charged(work, each(sets)) {
+                            for rule in charged(work, each(set)) {
                                 for rec in rule.lookups {
                                     self.process_lookup(rec.lookup_list_index)?;
                                 }
@@ -604,11 +653,14 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                     }
                 },
                 SubstitutionSubtable::ReverseChainSingle(table) => {
-                    for gid in table.substitutes {
+                    for gid in charged(work, table.substitutes.into_iter()) {
                         self.capture_glyph(u32::from(gid.0));
                     }
                 }
             }
+        }
+        if work.refused() {
+            return Err(ProcessLookupError::OverBudget);
         }
         Ok(())
     }
@@ -639,8 +691,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
     /// strings associated with our current style.
     fn check_blue_coverage(&mut self, coverage: &Coverage) {
         for (blue_str, _) in self.style.script.blues {
-            if blue_str
-                .chars()
+            if charged(self.work, blue_str.chars())
                 .filter_map(|ch| self.charmap.map(ch))
                 .filter_map(|gid| coverage_get(coverage, gid))
                 .next()
@@ -697,6 +748,8 @@ impl<'a> VisitedLookupSet<'a> {
 #[derive(PartialEq, Debug)]
 enum ProcessLookupError {
     ExceededMaxDepth,
+    /// The walk ran past the shaper's budget ([`LayoutWork`]).
+    OverBudget,
 }
 
 #[cfg(test)]

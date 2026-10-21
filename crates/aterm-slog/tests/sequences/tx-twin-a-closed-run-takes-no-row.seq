@@ -1,0 +1,16 @@
+seq v=1 rig=transcript program=claude build=2.1.0
+# Twin of a_closed_run_takes_no_transcript_row: the run closed, the join
+# writes nothing more, and the transcript step it had open closed with the
+# run's cascade, out=gone.
+bind 0
+see busy
+expect open t1 turn
+tx prompt v1
+tx tool c1
+expect open p1 tool par=t1 vref=c1
+close-run gone
+expect close p1 tool out=gone
+expect close t1 turn out=gone
+expect close r1 agent out=gone src=status conf=strong
+tx result c1
+tx prompt v2

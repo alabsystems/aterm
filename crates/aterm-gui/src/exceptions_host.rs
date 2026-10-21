@@ -348,7 +348,7 @@ impl App {
     /// FORGOTTEN: this is for a reporter that can no longer say its fact, or
     /// says it anew of another subject, which is not the cause ending
     /// ([`Self::except_clear`] is that).
-    fn except_end(&mut self, key: &str) -> bool {
+    pub(crate) fn except_end(&mut self, key: &str) -> bool {
         self.ripening.retain(|claim| claim.key != key);
         self.entries_refused.remove(key);
         let ended = self.messages.clear_digest(key, Instant::now());
@@ -600,13 +600,17 @@ impl App {
             }
             HostNote::DiskFull {
                 free,
-                volume,
                 freed,
                 hogs,
-                why,
+                cause,
+                thresholds,
             } => {
                 self.post_message(message_reporters::disk_full(
-                    free, &volume, freed, &hogs, &why,
+                    free,
+                    freed,
+                    &hogs,
+                    cause,
+                    &thresholds,
                 ));
             }
             HostNote::DiskFullOver => {
@@ -617,6 +621,9 @@ impl App {
                 );
                 aterm_log::info!("harness disk watch: the disk is out of its emergency");
             }
+            // A beat, not a fact: no record, no claim. With no window showing
+            // the stats bars, the jobs engine reads on it.
+            HostNote::DiskLooked => self.vitals_disk_looked(Instant::now()),
             HostNote::DiskSettingsRead => {
                 self.host_noted.remove(DISK_CLEANUP_OFF_NOTED);
                 self.except_clear(message_reporters::DISK_SETTINGS_KEY);
@@ -700,6 +707,23 @@ impl App {
                                     minutes,
                                 )
                             }
+                            // The jobs reading names the call the agent waits
+                            // on, which has made no progress: no fault of
+                            // aterm's reading.
+                            StallSeen::NoProgress { minutes, pid } => {
+                                aterm_log::warn!(
+                                    "harness @{sid}: a background call of {}'s (pid {pid}) has \
+                                     made no progress for {minutes} min",
+                                    agent.product()
+                                );
+                                message_reporters::stall_no_progress_record(
+                                    &sid,
+                                    &spot.place,
+                                    agent,
+                                    pid,
+                                    minutes,
+                                )
+                            }
                         };
                         self.record_message(record);
                     }
@@ -712,13 +736,22 @@ impl App {
             HostNote::Accounts(said) => {
                 // A roster that lists rows speaks for Claude's login: the AI
                 // CLIs' lines then say nothing of Claude (`ai_screen`).
-                self.note_ai_accounts_listed(matches!(said, AccountsSaid::Listed { .. }));
+                self.note_ai_accounts_listed(matches!(
+                    said,
+                    AccountsSaid::Listed { .. } | AccountsSaid::LoginsUnread
+                ));
                 // One fact at a time, the one whose action can be done: a
-                // refused roster names no account, so its line stands alone.
-                // Each end is said at every note, as every end here is.
+                // roster that cannot be read — refused, or this machine's
+                // logins unread (r3h-7) — names no account, so its line
+                // stands alone, each naming its own file. Each end is said
+                // at every note, as every end here is.
                 let refused = said == AccountsSaid::Refused;
+                let logins_unread = said == AccountsSaid::LoginsUnread;
+                let unread = refused || logins_unread;
                 let (labels, credits, full, due, none_soon, wrong) = match said {
-                    AccountsSaid::Nothing | AccountsSaid::Refused => Default::default(),
+                    AccountsSaid::Nothing | AccountsSaid::Refused | AccountsSaid::LoginsUnread => {
+                        Default::default()
+                    }
                     AccountsSaid::Listed {
                         signed_out,
                         credits,
@@ -761,7 +794,7 @@ impl App {
                 for (key, entry) in lines {
                     match entry {
                         Some(entry) => self.except(&entry),
-                        None if refused => {
+                        None if unread => {
                             self.except_end(key);
                         }
                         None => self.except_clear(key),
@@ -771,6 +804,11 @@ impl App {
                     self.except(&message_reporters::accounts_refused_entry());
                 } else {
                     self.except_clear(message_reporters::ACCOUNTS_REFUSED_KEY);
+                }
+                if logins_unread {
+                    self.except(&message_reporters::accounts_logins_unread_entry());
+                } else {
+                    self.except_clear(message_reporters::ACCOUNTS_LOGINS_UNREAD_KEY);
                 }
                 let key = message_reporters::ACCOUNTS_SIGNED_OUT_KEY;
                 match message_reporters::accounts_signed_out_entry(&labels) {
@@ -798,7 +836,7 @@ impl App {
                     // A roster that cannot be read says nothing of who is
                     // signed out: the line gives way, and what the owner
                     // filed of it holds.
-                    None if refused => {
+                    None if unread => {
                         self.except_end(key);
                     }
                     None => self.except_clear(key),
@@ -1122,6 +1160,20 @@ impl App {
             );
         } else if let Some(story) = self.resume_stories.get_mut(sid) {
             story.last = wall;
+        } else if head == Some(id) {
+            // A row an earlier process carried here, told again in its own
+            // words: the post is a duplicate of it, and the story this
+            // process holds none of is told in it, so the login back closes
+            // it fixed.
+            self.resume_stories.insert(
+                sid.to_string(),
+                NoticeStory {
+                    head: id,
+                    back,
+                    last: wall,
+                    read: std::collections::BTreeMap::new(),
+                },
+            );
         }
         self.withdraw_resume_asks(sid, Some(&key));
     }
@@ -1195,11 +1247,15 @@ impl App {
     /// ended): its row is withdrawn, claiming no outcome — the loop says the
     /// point moved on, not that the owner's step was taken. Its story stands
     /// ([`NOTICE_STORY_SPAN`] from this last word): the loss's next notice
-    /// tells it on, and the login back closes it fixed.
+    /// tells it on, and the login back closes it fixed. Only an ask that
+    /// stood is a word of the story: the tab's other tells routed here (a
+    /// stall, a spend, a goal cleared, a worker's end, each with no ask of
+    /// this process's standing) say nothing of the loss, so they never keep
+    /// a story that had no word open for the tab's next loss to swallow.
     fn end_resume_ask(&mut self, sid: &str) {
-        self.host_noted.remove(&resume_asked_key(sid));
+        let ended = self.host_noted.remove(&resume_asked_key(sid));
         self.withdraw_resume_asks(sid, None);
-        if let Some(story) = self.resume_stories.get_mut(sid) {
+        if ended && let Some(story) = self.resume_stories.get_mut(sid) {
             story.last = wall_stamp_now().unix_ms;
         }
     }
@@ -1288,6 +1344,35 @@ impl App {
         self.render_unrepaired.insert(session, (sid.clone(), epoch));
         self.except(&message_reporters::render_unrepaired_entry(
             &sid, &spot, why,
+        ));
+    }
+
+    /// A Claude Code whose registry row reports a build its Store or Native
+    /// drawer image does not name (card engine §3.10) is said as one entry
+    /// per image and reported build
+    /// ([`crate::session_timeline::SessionTimeline::take_registry_drift`]),
+    /// on the footer's own wake. It gates nothing: the card reads neither.
+    pub(crate) fn note_claude_build_drift(&mut self, session: u64) {
+        let drift = {
+            let Some(found) = self.pool.get(session) else {
+                return;
+            };
+            found
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take_registry_drift()
+        };
+        let Some(drift) = drift else {
+            return;
+        };
+        let Some(sid) = self.session_sid(session) else {
+            return;
+        };
+        let spot = self.upgrade_spot(&sid);
+        self.except(&message_reporters::claude_build_drift_entry(
+            &sid, &spot, &drift,
         ));
     }
 
@@ -2018,7 +2103,7 @@ mod tests {
         );
         assert_eq!(
             app.status_item_chrome_line(),
-            "statusitem title=\u{276f}\u{2022} needs=0 stuck=0 exceptions=1 fleet=off",
+            "statusitem title=\u{276f}\u{2022} needs=0 stuck=0 exceptions=1 done=0 fleet=off",
             "the menu-bar cue an agent can read"
         );
     }

@@ -5,7 +5,7 @@
 //! read: this program again, under the name a session's shell runs it by (a
 //! link in the simulation's `bin/`, `main` dispatching on argv[0]).
 //!
-//! * `claude <busy|question|prompt|idle> [<n>]` — a FIXTURE named `claude`,
+//! * `claude <busy|question|prompt|idle> [<n>] [--subscription-fixture]` — a FIXTURE named `claude`,
 //!   not Claude Code: it paints a Claude-Code-shaped screen (the launch card,
 //!   the prompt it was given, its last words, then a spinner over the
 //!   composer, a question dialog, a Bash approval box, or an idle composer),
@@ -22,6 +22,8 @@
 //!   a Claude Code session in that tab has ([`ENV_DIR`]). `<n>` picks its
 //!   words. `--version` answers at once (the first exec the system checks,
 //!   paid before anything is timed).
+//!   The explicit subscription flag creates a synthetic profile for footer captures,
+//!   only when no profile already exists in its scratch HOME.
 //! * `build-loop [<n>]` — a long command printing progress lines, the busy
 //!   shell a survey names by its program.
 //!
@@ -218,6 +220,11 @@ pub fn claude(args: &[String]) -> i32 {
     // (the survey then says it has no excerpts, which the simulation reports).
     let _ = write_session(&cwd, mode, &prompt, &said, tool);
     let _ = write_env();
+    if args.iter().any(|arg| arg == "--subscription-fixture")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        let _ = write_subscription(std::path::Path::new(&home), crate::util::now_secs());
+    }
     // Claude Code titles its terminal with its conversation's summary (`✳ …`),
     // which the survey's line shows: the head of the prompt stands for it.
     let summary: Vec<&str> = prompt.split_whitespace().take(6).collect();
@@ -226,6 +233,36 @@ pub fn claude(args: &[String]) -> i32 {
     let _ = out.flush();
     drop(out);
     paint_until_gone(|tick, cols, rows| screen(mode, tick, cols, rows, &cwd, &prompt, &said))
+}
+
+/// Seed only a fresh lab home. A pre-existing profile is never overwritten.
+fn write_subscription(home: &std::path::Path, now: i64) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".claude.json"))?;
+    let reset = crate::util::utc_stamp(now + 7 * 24 * 60 * 60);
+    let profile = aterm_json::json!({
+        "oauthAccount": {
+            "accountUuid": "aterm-subscription-fixture",
+            "emailAddress": "fixture@example.com",
+            "organizationType": "claude_max",
+            "userRateLimitTier": "default_claude_max_5x",
+            "planDisplayName": "Max 5x"
+        },
+        "cachedUsageUtilization": {
+            "fetchedAtMs": now * 1000,
+            "accountUuid": "aterm-subscription-fixture",
+            "utilization": {
+                "seven_day": { "utilization": 71, "resets_at": reset }
+            }
+        }
+    });
+    file.write_all(
+        aterm_json::to_string(&profile)
+            .map_err(std::io::Error::other)?
+            .as_bytes(),
+    )
 }
 
 /// `build-loop [<n>]`: progress lines until the terminal goes.
@@ -433,7 +470,9 @@ fn screen(
     }
     rows_out.extend(bottom);
     rows_out.truncate(rows);
-    rows_out
+    // Every entry owns one physical row. In particular, a mode pill on the last
+    // row must not wrap and scroll the grid before the cursor is parked by index.
+    rows_out.into_iter().map(|row| clip(&row, cols)).collect()
 }
 
 /// This process's environment, as a Claude Code session in this tab has it,
@@ -541,15 +580,26 @@ mod tests {
     #[test]
     fn every_frame_fills_its_screen_and_busy_says_esc_to_interrupt() {
         let cwd = std::path::Path::new("/tmp/af/m00/home");
-        for mode in [Mode::Busy, Mode::Question, Mode::Prompt, Mode::Idle] {
-            let rows = screen(mode, 7, 100, 30, cwd, "a prompt", HOSTILE_SAID);
-            assert_eq!(rows.len(), 30, "{mode:?}");
-            assert!(rows.iter().all(|r| r.chars().count() <= 100), "{mode:?}");
-            // No control byte reaches the painted screen.
-            assert!(
-                rows.iter().all(|r| !r.chars().any(char::is_control)),
-                "{mode:?}"
-            );
+        for cols in [20, 46, 60, 100] {
+            for mode in [Mode::Busy, Mode::Question, Mode::Prompt, Mode::Idle] {
+                let rows = screen(mode, 7, cols, 30, cwd, "a prompt", HOSTILE_SAID);
+                assert_eq!(rows.len(), 30, "{mode:?}: {cols}");
+                assert!(
+                    rows.iter().all(|r| r.chars().count() <= cols),
+                    "{mode:?}: {cols}"
+                );
+                // No row wraps/scrolls the terminal, so the compositor and the cursor
+                // parked by this index agree even when the native mode pill is long.
+                if matches!(mode, Mode::Busy | Mode::Idle) {
+                    assert_eq!(rows.iter().rposition(|row| row == "❯ "), Some(27));
+                    assert!(rows[28].chars().all(|ch| ch == '─'));
+                }
+                // No control byte reaches the painted screen.
+                assert!(
+                    rows.iter().all(|r| !r.chars().any(char::is_control)),
+                    "{mode:?}"
+                );
+            }
         }
         let busy = screen(Mode::Busy, 7, 100, 30, cwd, "p", "s");
         assert!(busy[29].contains("esc to interrupt"), "{busy:?}");

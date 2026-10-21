@@ -24,6 +24,7 @@
 //! (fall back to a normal fresh window), and the manifest is single-use (deleted on read)
 //! so a crash mid-restore can never loop.
 
+use crate::crash_journal::{Evidence, JournalId};
 use crate::durable::Flush;
 use aterm_agent::harness::relaunch::AgentRun;
 use serde::{Deserialize, Serialize};
@@ -194,6 +195,18 @@ pub(crate) struct TerminalLeafRestore {
     /// under any word but `cruise` (`sanitize_user_metadata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub land_at: Option<i64>,
+    /// WHO SET THE AUTOPILOT WORD, AND WHEN (2026-10-19; additive, absent
+    /// tolerated, not written when unset;
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.3, item 5): `<setter>
+    /// <unix ms>`, the setter as `meta`'s `autopilot_by=` words it
+    /// (`human:chip`, `ctl`, …; [`crate::session_timeline::AutopilotSetBy`]),
+    /// carried beside `autopilot` on the cold, reopen and graft paths, so a
+    /// restored row still says `set 14:05 over aterm ctl`. Sanitized with the
+    /// word and dropped where it is (`sanitize_user_metadata`); a value this
+    /// build cannot read is dropped too, and a word with no setter reads
+    /// `restored`. An older build skips the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autopilot_by: Option<String>,
     /// IDENTITY (session identities, 2026-09-17; additive, absent tolerated):
     /// the agent identity the session was spawned under, so a cold restore
     /// respawns the leaf's shell under it — `create = false`
@@ -321,6 +334,17 @@ pub(crate) struct TerminalLeafRestore {
     /// is. On a seamless update's layout it goes to the shell the leaf names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
+    /// THE EPOCH ITS SHELL'S LOG WAS AT (session log phase 6, 6A-2, ruling
+    /// U1; additive, absent tolerated, written by every capture): a later
+    /// process notes it before any session starts
+    /// (`session_log::Epochs::note_leaves`), so the epoch it gives a log of
+    /// the same sid (an adoption told nothing of its predecessor's, a crash
+    /// recovery, a relaunch) is above it, even for a chain whose handoffs ran
+    /// ahead of the wall clock. Constant for a session in one process (an
+    /// epoch moves only at its adoption, before it registers), so the
+    /// Commit's layout comparison is unmoved by it. An older build skips it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_ep: Option<u32>,
 }
 
 /// The word that a tab's agent cannot be brought back, as a seamless update's
@@ -1305,8 +1329,19 @@ impl TerminalLeafRestore {
             questions: self.questions.clone(),
             autopilot: self.autopilot.clone(),
             land_at: self.carried_land_at(),
+            autopilot_set_by: self.carried_set_by(),
             ..Default::default()
         }
+    }
+
+    /// The setter this leaf carries ([`Self::autopilot_by`]), kept only
+    /// beside a word (§11.7.3, item 5: sanitized with the word) and only
+    /// where it parses.
+    pub(crate) fn carried_set_by(&self) -> Option<crate::session_timeline::AutopilotSetBy> {
+        self.autopilot.as_ref()?;
+        self.autopilot_by
+            .as_deref()
+            .and_then(crate::session_timeline::AutopilotSetBy::parse_carried)
     }
 
     /// The timer this leaf carries: its `land_at`, kept only beside the word
@@ -1340,6 +1375,9 @@ impl TerminalLeafRestore {
             .filter(|profile| profile.len() <= MAX_SETTINGS_ROUTE_BYTES && !profile.contains('\0'));
         self.sid = self.sid.take().filter(|sid| carried_sid(sid));
         self.lineage = self.lineage.take().filter(|sid| carried_sid(sid));
+        // An epoch no producer writes (0, or above the ceiling a corrupt or
+        // foreign value would saturate the allocator at) is dropped.
+        self.log_ep = self.log_ep.and_then(crate::session_log::told_epoch);
         // A hold row is never dropped — dropping it lifts a halt — but read
         // fail-closed and written back in its bounded wire form.
         self.holds = crate::fabric::render_holds(&self.carried_holds());
@@ -1381,6 +1419,9 @@ impl TerminalLeafRestore {
         // The timer goes with the word: under any word but `cruise` it is
         // dropped, never stored.
         self.land_at = self.carried_land_at();
+        // So does its setter, under any word, and written back in its one
+        // form (§11.7.3, item 5).
+        self.autopilot_by = self.carried_set_by().map(|set_by| set_by.carried());
     }
 
     fn user_metadata_is_canonical(&self) -> bool {
@@ -1397,6 +1438,7 @@ impl TerminalLeafRestore {
             && canonical("questions", &self.questions)
             && canonical("autopilot", &self.autopilot)
             && self.land_at == self.carried_land_at()
+            && self.autopilot_by == self.carried_set_by().map(|set_by| set_by.carried())
     }
 }
 
@@ -2614,6 +2656,7 @@ impl RestoredTab {
                     RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                         sid: None,
                         lineage: None,
+                        log_ep: None,
                         cwd: cwd.clone(),
                         title: title.clone(),
                         profile: None,
@@ -2626,6 +2669,7 @@ impl RestoredTab {
                         questions: None,
                         autopilot: None,
                         land_at: None,
+                        autopilot_by: None,
                         identity: None,
                         theme: None,
                         agent: None,
@@ -3250,6 +3294,85 @@ impl RestoreManifest {
         self.windows.first()?.bootstrap_cwd()
     }
 
+    /// A layout of one window whose one terminal leaf records `log_ep`
+    /// ([`TerminalLeafRestore::log_ep`]), as a capture writes it.
+    #[cfg(test)]
+    pub(crate) fn one_terminal_for_test(log_ep: Option<u32>) -> RestoreManifest {
+        RestoreManifest::new(vec![WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            inner_px: None,
+            presence_row: false,
+            show: WindowShow::UNKNOWN,
+            tabs: vec![PaneLayout::Leaf {
+                cwd: None,
+                title: "zsh".into(),
+                focused: true,
+                local_id: Some(7),
+            }],
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: None,
+            restored_tabs: vec![RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                    sid: Some("s-0123abcd".into()),
+                    lineage: None,
+                    log_ep,
+                    cwd: None,
+                    title: "zsh".into(),
+                    profile: None,
+                    local_id: Some(7),
+                    user_title: None,
+                    description: None,
+                    icon: None,
+                    role: None,
+                    attention: None,
+                    identity: None,
+                    theme: None,
+                    questions: None,
+                    autopilot: None,
+                    land_at: None,
+                    autopilot_by: None,
+                    agent: None,
+                    supervised: None,
+                    lost: None,
+                    held: false,
+                    holds: Vec::new(),
+                })),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        }])
+    }
+
+    /// The largest epoch a terminal leaf of the canonical tabs recorded for
+    /// its shell's log ([`TerminalLeafRestore::log_ep`]), or `None`.
+    pub(crate) fn max_log_ep(&self) -> Option<u32> {
+        fn walk(node: &RestoredSplitTree, max: &mut Option<u32>) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(terminal),
+                } => *max = (*max).max(terminal.log_ep),
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    walk(first, max);
+                    walk(second, max);
+                }
+            }
+        }
+        let mut max = None;
+        for window in &self.windows {
+            for tab in &window.restored_tabs {
+                walk(&tab.root, &mut max);
+            }
+        }
+        max
+    }
+
     /// The agent identity of the pane the bootstrap session 0 becomes — the
     /// FIRST window's [`WindowLayout::bootstrap_identity`] — so its spawn can
     /// run under it (`main_entry`, beside [`Self::first_leaf_cwd`]).
@@ -3747,7 +3870,7 @@ pub(crate) fn write_wire_once_to(path: &Path, wire: &str) -> Result<(), String> 
     written
 }
 
-/// A quit's `session.toml` as a launch takes it ([`take_quit_from`]).
+/// A quit's `session.toml` as a launch takes it ([`take_for_launch`]).
 #[derive(Debug)]
 pub(crate) struct TakenQuit {
     pub(crate) manifest: RestoreManifest,
@@ -3783,7 +3906,9 @@ pub(crate) fn modified_unix_ms(meta: &fs::Metadata) -> Option<u64> {
 /// `None` means absent, consumed-but-invalid, or an I/O failure. Failures are
 /// logged because this compatibility API intentionally falls back to a fresh
 /// window rather than blocking launch. With the manifest come the run its
-/// quit names ([`quit_run_of`]) and when it was written ([`TakenQuit`]).
+/// quit names ([`quit_run_of`]) and when it was written ([`TakenQuit`]). A
+/// unix launch takes in two phases instead ([`take_for_launch`]).
+#[cfg(any(test, not(unix)))]
 pub(crate) fn take_quit_from(path: &Path) -> Option<TakenQuit> {
     match take_from_result(path, LockWait::Unbounded) {
         Ok(manifest) => manifest,
@@ -4092,6 +4217,17 @@ fn with_restore_lock_waiting<T, E: From<RestoreFault>>(
     wait: LockWait,
     operation: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
+    with_restore_lock_seeing(path, wait, |_| operation())
+}
+
+/// [`with_restore_lock_waiting`], handing `operation` the launch takes other runs
+/// left beside `path` (`take_name`), which the sweep of dead siblings reads on
+/// its way ([`sweep_dead_restore_siblings`]).
+fn with_restore_lock_seeing<T, E: From<RestoreFault>>(
+    path: &Path,
+    wait: LockWait,
+    operation: impl FnOnce(Vec<PathBuf>) -> Result<T, E>,
+) -> Result<T, E> {
     let lock_path = restore_lock_path(path).ok_or_else(|| {
         RestoreFault::settled(format!("restore manifest {} has no parent", path.display()))
     })?;
@@ -4149,8 +4285,8 @@ fn with_restore_lock_waiting<T, E: From<RestoreFault>>(
     };
     #[cfg(all(test, unix))]
     crate::parked_fork::fork_if_armed();
-    sweep_dead_restore_siblings(path);
-    operation()
+    let takes = sweep_dead_restore_siblings(path);
+    operation(takes)
 }
 
 /// Remove the write temporaries and claims ([`restore_sibling_path`]) that a
@@ -4158,13 +4294,15 @@ fn with_restore_lock_waiting<T, E: From<RestoreFault>>(
 /// claim, when its directory sync failed): each a whole layout that nothing
 /// reads again. Run under `path`'s restore lock, which every write and claim of
 /// it holds; a live pid's is left all the same, this process's included. Only
-/// regular files go, so a link is never followed.
-fn sweep_dead_restore_siblings(path: &Path) {
+/// regular files go, so a link is never followed. Answers the launch takes it
+/// passed (`take_name`), which only a launch's take judges.
+fn sweep_dead_restore_siblings(path: &Path) -> Vec<PathBuf> {
+    let mut takes = Vec::new();
     let Some(parent) = path.parent() else {
-        return;
+        return takes;
     };
     let Ok(entries) = fs::read_dir(parent) else {
-        return;
+        return takes;
     };
     let name = path
         .file_name()
@@ -4176,10 +4314,15 @@ fn sweep_dead_restore_siblings(path: &Path) {
         let Some(rest) = file_name
             .to_str()
             .and_then(|sibling| sibling.strip_prefix(&prefix))
-            .filter(|rest| rest.ends_with(".tmp"))
         else {
             continue;
         };
+        if !rest.ends_with(".tmp") {
+            if rest.starts_with("taken-") || rest.starts_with("retaken-") {
+                takes.push(entry.path());
+            }
+            continue;
+        }
         let pid = ["write-", "claimed-"]
             .iter()
             .find_map(|purpose| rest.strip_prefix(purpose))
@@ -4191,6 +4334,7 @@ fn sweep_dead_restore_siblings(path: &Path) {
             let _ = fs::remove_file(entry.path());
         }
     }
+    takes
 }
 
 fn create_unique_restore_sibling(
@@ -4386,10 +4530,416 @@ pub(crate) fn take_from(path: &Path) -> Option<RestoreManifest> {
     take_quit_from(path).map(|taken| taken.manifest)
 }
 
-/// Read + delete the standard [`manifest_path`] (launch hook), with the run
-/// its quit names ([`quit_run_of`]) and when it was written ([`TakenQuit`]).
-pub(crate) fn take() -> Option<TakenQuit> {
-    take_quit_from(&manifest_path()?)
+// ---------------------------------------------------------------------------
+// THE LAUNCH'S TAKE, IN TWO PHASES (r6 sweep #7, START-1).
+//
+// A macOS window takes `session.toml` before its `NSApplication` build (LAG-11:
+// session 0's shell starts first, ahead of 28.6-60.2 ms of build in the owner's
+// two logged launches), and a single-use take there lost the last quit's windows
+// to a crash or a hang inside that build — and to any end after it until this
+// run kept a record of its own desk. So the launch's take holds what it took.
+// Phase one renames `session.toml` to a name tagged with this run,
+// `.session.toml.aterm-taken-<run>` (`<run>` is the run's crash-journal stem,
+// `<pid>-<nanos>`, the start its crash marker is named for), and holds that
+// file's `flock` for the run's life. Phase two ([`settle_take`]) removes it once
+// the run keeps the desk itself: its crash journal's first image (written once
+// the deferred restore has rebuilt the layout), its quit's own layout, or
+// `restore_session` going off.
+//
+// Every launch's take judges the takes other runs left, under the restore lock:
+// one whose `flock` is held is a live run's and is left alone; a dead run's is
+// taken again — renamed `.session.toml.aterm-retaken-<run>-<n>` and held by this
+// run — only when that run left crash evidence (`crash_journal::classify_death`)
+// and nothing else holds its desk. Otherwise it goes: the run ended cleanly; its
+// own quit's layout or its crash journal holds the desk; or it was this process's
+// previous image, which an `exec` replaced (the cold update lane, whose layout
+// names it). THE BRAKE: a re-taken file is never taken a third time. A run that
+// re-took one and died again before it settled leaves it set aside, so a layout
+// that stops aterm comes back at most once more, as a reopened crash journal does.
+
+/// Which of a launch's takes a file is ([`take_name`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TakeKind {
+    /// Taken from `session.toml`.
+    Taken,
+    /// Taken again from a run that died before it settled: never taken a third
+    /// time (the brake).
+    Retaken,
+}
+
+/// Run `run`'s take of the layout `name`: `.<name>.aterm-taken-<run>`, or its
+/// `n`th re-take, `.<name>.aterm-retaken-<run>-<n>`. No `.tmp` suffix, so no
+/// sweep of dead siblings ([`sweep_dead_restore_siblings`]), this build's or an
+/// older one's, ever removes it.
+#[cfg(unix)]
+fn take_name(name: &OsStr, kind: TakeKind, run: JournalId, n: usize) -> String {
+    let name = name.to_string_lossy();
+    match kind {
+        TakeKind::Taken => format!(".{name}.aterm-taken-{}", run.stem()),
+        TakeKind::Retaken => format!(".{name}.aterm-retaken-{}-{n}", run.stem()),
+    }
+}
+
+/// Parse a [`take_name`] of `name`: the take's kind and the run that took it.
+#[cfg(unix)]
+fn parse_take_name(name: &OsStr, file: &str) -> Option<(TakeKind, JournalId)> {
+    let rest = file.strip_prefix(&format!(".{}.aterm-", name.to_string_lossy()))?;
+    if let Some(stem) = rest.strip_prefix("taken-") {
+        return Some((TakeKind::Taken, JournalId::parse_stem(stem)?));
+    }
+    let (stem, n) = rest.strip_prefix("retaken-")?.rsplit_once('-')?;
+    n.parse::<usize>().ok()?;
+    Some((TakeKind::Retaken, JournalId::parse_stem(stem)?))
+}
+
+/// What a launch's take holds until its run keeps the desk itself
+/// ([`settle_take`]): each file it took, under that file's `flock`. Dropped
+/// unsettled — the run's death, or a test playing one — the files stay with
+/// their locks free, for a later launch to judge.
+#[cfg(unix)]
+#[derive(Default)]
+pub(crate) struct HeldTake {
+    files: Vec<(PathBuf, crate::native_document_host::HeldAdvisoryLock)>,
+}
+
+#[cfg(unix)]
+impl HeldTake {
+    /// Phase two: remove each file, THEN let its lock go, so a later launch
+    /// never wins the lock of a take whose name still stands ([`hold_take`]).
+    /// No directory sync: a removal a power loss undoes leaves a dead run's
+    /// take, which the next launch judges as any other (its crash journal, if
+    /// that reached the disk, holds the desk).
+    pub(crate) fn settle(self) {
+        for (path, lock) in self.files {
+            if let Err(error) = fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logging::stderr_line!(
+                    "aterm-gui: taken restore layout {} not removed: {error}",
+                    path.display()
+                );
+            }
+            drop(lock);
+        }
+    }
+}
+
+/// This run's [`HeldTake`], from [`take_for_launch`] until [`settle_take`].
+#[cfg(unix)]
+static HELD_TAKE: std::sync::Mutex<Option<HeldTake>> = std::sync::Mutex::new(None);
+
+/// PHASE TWO of this run's take (`HeldTake::settle`): the run keeps its desk
+/// itself now — its crash journal's first image is on disk, its quit wrote its
+/// own layout, or `restore_session` went off. Every later call, and every call
+/// in a run that took nothing, is one uncontended lock.
+pub(crate) fn settle_take() {
+    #[cfg(unix)]
+    if let Some(held) = HELD_TAKE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        held.settle();
+    }
+}
+
+/// THE LAUNCH'S TAKE of the standard [`manifest_path`] (launch hook): the last
+/// quit's layout and every dead run's take that comes back
+/// (`take_holding_from`), held for this run, `run` (its crash-journal id),
+/// until [`settle_take`]. `evidence` is where a dead run's end is read. Off unix
+/// the take is single-use (`take_quit_from`): no lock and no crash marker
+/// there say whether a run lives or how it ended.
+pub(crate) fn take_for_launch(run: JournalId, evidence: &Evidence<'_>) -> Option<TakenQuit> {
+    let path = manifest_path()?;
+    #[cfg(unix)]
+    {
+        let (taken, held) = take_holding_from(&path, run, evidence);
+        *HELD_TAKE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(held);
+        taken
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (run, evidence);
+        take_quit_from(&path)
+    }
+}
+
+/// `take_quit_from` in two phases, for a launch (the note above): `path` is
+/// claimed onto run `run`'s take and held there, and each take another run left
+/// beside it is judged — a dead run's comes back when it left crash `evidence`
+/// and nothing else holds its desk, and goes otherwise; a live run's is left
+/// alone. The layout is the quit's windows, then each re-taken one's, within
+/// [`MAX_WINDOWS`]. It returns a layout only once every claim is durable, as
+/// `take_quit_from` does, so a restore that brings the machine down comes
+/// back no further than the brake lets it; when that sync fails it returns
+/// none and still holds what it took.
+#[cfg(unix)]
+pub(crate) fn take_holding_from(
+    path: &Path,
+    run: JournalId,
+    evidence: &Evidence<'_>,
+) -> (Option<TakenQuit>, HeldTake) {
+    match take_holding_result(path, run, evidence) {
+        Ok(taken) => taken,
+        Err(error) => {
+            crate::logging::stderr_line!("aterm-gui: restore manifest not consumed: {error}");
+            (None, HeldTake::default())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn take_holding_result(
+    path: &Path,
+    run: JournalId,
+    evidence: &Evidence<'_>,
+) -> Result<(Option<TakenQuit>, HeldTake), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!("restore manifest {} has no parent", path.display()));
+    };
+    if !parent.exists() {
+        return Ok((None, HeldTake::default()));
+    }
+    with_restore_lock_seeing(path, LockWait::Unbounded, |left| {
+        let name = path
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("session.toml"));
+        let mut held = HeldTake::default();
+        // Every layout taken, the quit's first: its text and when its quit wrote it.
+        let mut texts: Vec<(String, Option<u64>)> = Vec::new();
+        // The runs whose desks the quit's layout holds, and below every other layout
+        // that comes back: a take of theirs is that layout's.
+        let mut kept_by_quit: Vec<String> = Vec::new();
+        // A claim this run could not hold goes once read, as the single-use one does.
+        let mut unheld = None;
+        let mut claimed = false;
+        if path.exists() {
+            let taken = parent.join(take_name(name, TakeKind::Taken, run, 0));
+            claim_restore_file(path, &taken)
+                .map_err(|error| format!("claim {}: {error}", path.display()))?;
+            claimed = true;
+            let read = match hold_take(&taken) {
+                Some(lock) => {
+                    let read = read_take(lock.file(), &taken);
+                    held.files.push((taken, lock));
+                    read
+                }
+                None => {
+                    let read = match File::open(&taken) {
+                        Ok(file) => read_take(&file, &taken),
+                        Err(error) => {
+                            crate::logging::stderr_line!(
+                                "aterm-gui: claimed restore read {} failed: {error}",
+                                taken.display()
+                            );
+                            None
+                        }
+                    };
+                    unheld = Some(taken);
+                    read
+                }
+            };
+            if let Some((text, written)) = read {
+                kept_by_quit = quit_run_of(&text)
+                    .into_iter()
+                    .chain(quit_also_of(&text))
+                    .collect();
+                texts.push((text, written));
+            }
+        }
+        // Every take another run left whose lock this run wins — a dead run's — with
+        // its first verdict and its text: the last verdict waits for them all, since
+        // a layout one of them brings back can hold the desk of the run another was
+        // taken by.
+        let mut dead = Vec::new();
+        for from in left {
+            let Some((kind, left_by)) = from
+                .file_name()
+                .and_then(OsStr::to_str)
+                .and_then(|file| parse_take_name(name, file))
+            else {
+                continue;
+            };
+            // A live run's take, or one no lock can be tried on: left alone.
+            let Some(lock) = hold_take(&from) else {
+                continue;
+            };
+            let why = take_set_aside(kind, left_by, run, &kept_by_quit, parent, evidence);
+            let read = read_take(lock.file(), &from);
+            dead.push((from, left_by, lock, why, read));
+        }
+        // A run's quit layout holds what that run had taken (it restored it first),
+        // so a take of a run a layout coming back names — its quit's, or a desk it
+        // kept — is that layout's already: it goes, never the desk twice.
+        for (_, _, _, why, read) in &dead {
+            if why.is_none()
+                && let Some((text, _)) = read
+            {
+                kept_by_quit.extend(quit_run_of(text).into_iter().chain(quit_also_of(text)));
+            }
+        }
+        let mut retaken = 0;
+        for (from, left_by, lock, why, read) in dead {
+            if let Some(why) = why.or_else(|| {
+                kept_by_quit
+                    .contains(&left_by.stem())
+                    .then_some("a layout this launch takes holds its run's desk")
+            }) {
+                let _ = fs::remove_file(&from);
+                aterm_log::info!("restore: {} set aside: {why}", from.display());
+                continue;
+            }
+            let to = parent.join(take_name(name, TakeKind::Retaken, run, retaken));
+            if let Err(error) = fs::rename(&from, &to) {
+                crate::logging::stderr_line!(
+                    "aterm-gui: restore layout {} not taken again: {error}",
+                    from.display()
+                );
+                continue;
+            }
+            retaken += 1;
+            aterm_log::info!(
+                "restore: the layout run {} took comes back ({}): it ended uncleanly before it \
+                 kept its desk",
+                left_by.stem(),
+                to.display()
+            );
+            texts.extend(read);
+            held.files.push((to, lock));
+        }
+        // DURABLE, as the single-use claim is: the names are what stop a restore
+        // that brings the machine down (a kernel panic, a watchdog reset) from
+        // running again past the brake at the next launch. Once per launch, and
+        // nearly all of the take's cost (START-1, take8 n=12: the journal phase
+        // 5.4-7.2 ms median with a layout to take, 0.2 ms without). It stays on
+        // the critical path: session 0's shell starts in the layout's first folder
+        // right after, and a folder whose file system takes the machine down is
+        // the very restore this guards.
+        if (claimed || retaken > 0)
+            && let Err(error) = sync_restore_directory(parent, Flush::Durable)
+        {
+            // Nothing comes back, as from the single-use claim: a claim that may not
+            // outlive a crash must not bring back a layout that brings the machine
+            // down. What this run took stays HELD — never a live run's take with its
+            // lock let go for another launch to take — and goes when it settles.
+            if let Some(unheld) = unheld {
+                let _ = fs::remove_file(&unheld);
+            }
+            crate::logging::stderr_line!(
+                "aterm-gui: restore manifest not consumed: {} was claimed but single-use \
+                 durability is indeterminate: {error}",
+                path.display()
+            );
+            return Ok((None, held));
+        }
+        if let Some(unheld) = unheld
+            && fs::remove_file(&unheld).is_ok()
+        {
+            // Ordered, as the single-use cleanup: a leftover claim is never read.
+            let _ = sync_restore_directory(parent, Flush::Ordered);
+        }
+        Ok((taken_together(texts), held))
+    })
+}
+
+/// Open the take at `path` — no link followed, no FIFO waited on — and take its
+/// `flock` without waiting: the held lock, or `None` when another description
+/// holds it (a live run's), when it is no regular file or cannot be opened or
+/// locked, or when `path` no longer names it: a run settles by removing the
+/// name BEFORE its lock goes ([`HeldTake::settle`]), so a lock won on a file
+/// whose name is gone was a settled take's.
+#[cfg(unix)]
+fn hold_take(path: &Path) -> Option<crate::native_document_host::HeldAdvisoryLock> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let lock = crate::native_document_host::HeldAdvisoryLock::try_lock(file).ok()?;
+    let locked = lock.file().metadata().ok()?;
+    let named = fs::symlink_metadata(path).ok()?;
+    (locked.is_file() && locked.dev() == named.dev() && locked.ino() == named.ino()).then_some(lock)
+}
+
+/// The text of the take `file` (at `path`) and when its quit wrote it — a
+/// rename keeps the file's time; `None`, said, when it cannot be read.
+#[cfg(unix)]
+fn read_take(file: &File, path: &Path) -> Option<(String, Option<u64>)> {
+    let written_unix_ms = file.metadata().ok().as_ref().and_then(modified_unix_ms);
+    let mut text = String::new();
+    let mut reader = file;
+    match std::io::Read::read_to_string(&mut reader, &mut text) {
+        Ok(_) => Some((text, written_unix_ms)),
+        Err(error) => {
+            crate::logging::stderr_line!(
+                "aterm-gui: claimed restore read {} failed: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Why the take `kind` that the dead run `left_by` left does not come back to
+/// run `run`, or `None` when it does: that run left crash `evidence` and nothing
+/// else holds its desk (the note above). `kept_by_quit`: the runs whose desks
+/// the quit's layout this run took holds; `dir`: where their crash journals are.
+#[cfg(unix)]
+fn take_set_aside(
+    kind: TakeKind,
+    left_by: JournalId,
+    run: JournalId,
+    kept_by_quit: &[String],
+    dir: &Path,
+    evidence: &Evidence<'_>,
+) -> Option<&'static str> {
+    if left_by.pid == run.pid {
+        Some("this process's previous image left it, which an exec replaced")
+    } else if kept_by_quit.contains(&left_by.stem()) {
+        Some("its run's own quit layout holds the desk")
+    } else if dir.join(left_by.file_name()).exists() {
+        Some("its run's crash journal holds the desk")
+    } else if crate::crash_journal::classify_death(evidence, left_by, None).is_none() {
+        Some("its run ended cleanly")
+    } else if kind == TakeKind::Retaken {
+        Some(
+            "its run had taken it again after a crash and ended uncleanly too before it kept the \
+             desk: a layout that stops aterm comes back once",
+        )
+    } else {
+        None
+    }
+}
+
+/// One launch's [`TakenQuit`] of the layouts it took (`texts`, the quit's
+/// first): the first readable one, with each later one's windows behind it
+/// within [`MAX_WINDOWS`] and each later one's runs among `also`, so a crash
+/// journal of theirs is set aside as that quit's own
+/// (`crash_journal::QuitLayout::names`).
+#[cfg(unix)]
+fn taken_together(texts: Vec<(String, Option<u64>)>) -> Option<TakenQuit> {
+    let mut parsed = texts.into_iter().filter_map(|(text, written_unix_ms)| {
+        RestoreManifest::from_toml(&text).map(|manifest| TakenQuit {
+            manifest,
+            run: quit_run_of(&text),
+            also: quit_also_of(&text),
+            written_unix_ms,
+        })
+    });
+    let mut taken = parsed.next()?;
+    for later in parsed {
+        taken.also.extend(later.run.into_iter().chain(later.also));
+        let room = MAX_WINDOWS.saturating_sub(taken.manifest.windows.len());
+        taken
+            .manifest
+            .windows
+            .extend(later.manifest.windows.into_iter().take(room));
+    }
+    Some(taken)
 }
 
 // ---------------------------------------------------------------------------
@@ -4756,8 +5306,26 @@ mod tests {
             "the take-back's rewrite and its entry"
         );
         assert!(path.exists(), "the other instance's desk stays");
-        assert!(take_quit_from(&path).is_some(), "the launch takes it");
+        assert!(
+            take_quit_from(&path).is_some(),
+            "the single-use take takes it"
+        );
         assert_eq!(recording.take(), [D, O], "the claim and the cleanup");
+        write_quit_to(&path, &sample(), Some("1-1")).expect("the other quit");
+        let _ = recording.take();
+        let run = crate::crash_journal::JournalId::now(std::process::id());
+        let (taken, held) = take_holding_from(&path, run, &no_evidence());
+        assert!(taken.is_some(), "the launch takes it");
+        assert_eq!(
+            recording.take(),
+            [D],
+            "the claim alone: the take stays until settled"
+        );
+        held.settle();
+        assert!(
+            recording.take().is_empty(),
+            "the settle's removal syncs nothing"
+        );
         let sidecar = dir.path().join("seamless-1-2.layout.toml");
         write_wire_once_to(&sidecar, &sample().to_toml().expect("wire")).expect("sidecar");
         assert_eq!(
@@ -4768,6 +5336,267 @@ mod tests {
         let metrics = dir.path().join("cell-metrics.toml");
         store_cell_metrics_to(&metrics, "font", 2.0, 13.0, 8, 16).expect("metrics");
         assert_eq!(recording.take(), [O, O], "the cell-metrics cache");
+    }
+
+    /// No crash evidence anywhere: every dead run's end reads clean.
+    #[cfg(unix)]
+    fn no_evidence() -> Evidence<'static> {
+        Evidence {
+            log_dir: None,
+            swept: &[],
+        }
+    }
+
+    /// The crash evidence in the log dir `logs`.
+    #[cfg(unix)]
+    fn evidence_in(logs: &Path) -> Evidence<'_> {
+        Evidence {
+            log_dir: Some(logs),
+            swept: &[],
+        }
+    }
+
+    /// The launch takes of `session.toml` in `dir`, sorted.
+    #[cfg(unix)]
+    fn takes_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("the data dir")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| parse_take_name(OsStr::new("session.toml"), name).is_some())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Run `run`'s `kind` take of `session.toml` (its `n`th).
+    #[cfg(unix)]
+    fn take_of(kind: TakeKind, run: JournalId, n: usize) -> String {
+        take_name(OsStr::new("session.toml"), kind, run, n)
+    }
+
+    /// A run of a pid that is no process any more, started now.
+    #[cfg(unix)]
+    fn dead_run() -> JournalId {
+        JournalId::now(crate::crash_journal::tests::reaped_pid())
+    }
+
+    /// THE LAUNCH'S TAKE HOLDS WHAT IT TOOK (r6 sweep #7, START-1). The layout
+    /// leaves `session.toml` for a name tagged with the run, which stays, under
+    /// the run's lock, until the run keeps its desk itself; a launch beside it
+    /// never takes a live run's take, crash marker or not, and the settle leaves
+    /// nothing behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_take_is_held_until_its_run_settles_and_never_taken_while_it_lives() {
+        use crate::crash_journal::tests::{marker, scratch};
+        let (dir, logs) = (scratch("rt-dir"), scratch("rt-logs"));
+        let path = dir.path().join("session.toml");
+        write_quit_to(&path, &sample(), Some("1-2")).expect("the quit's layout");
+        let a = dead_run();
+        let (taken, held) = take_holding_from(&path, a, &evidence_in(logs.path()));
+        let taken = taken.expect("the quit's layout");
+        assert_eq!(taken.manifest, sample());
+        assert_eq!(taken.run.as_deref(), Some("1-2"));
+        assert!(!path.exists(), "no longer under its public name");
+        assert_eq!(takes_in(dir.path()), [take_of(TakeKind::Taken, a, 0)]);
+        // A's marker would read as a kill, but A's lock is held: A lives.
+        marker(logs.path(), a);
+        let (beside, beside_held) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert!(beside.is_none(), "a live run's take is never taken");
+        assert_eq!(takes_in(dir.path()), [take_of(TakeKind::Taken, a, 0)]);
+        drop(beside_held);
+        held.settle();
+        assert!(takes_in(dir.path()).is_empty(), "settled, nothing is left");
+        let (after, _) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert!(after.is_none());
+    }
+
+    /// A DEAD RUN'S TAKE COMES BACK, ONCE (r6 sweep #7, START-1). A run that died
+    /// before it settled and left crash evidence (here its empty marker: a kill, a
+    /// hang's force quit) leaves its take to the next launch, behind that launch's
+    /// own quit layout, whose `also` names the run the take's quit was. When that
+    /// launch dies too before it settles, the layout it took AGAIN is set aside —
+    /// the brake — while the quit layout it took first comes back once in turn.
+    ///
+    /// NEGATIVE CONTROL: the single-use take (the launch's before this change)
+    /// leaves nothing for the launch after a run that dies before it restores.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_runs_take_comes_back_once_when_its_run_ended_uncleanly() {
+        use crate::crash_journal::tests::{cwds, layout, marker, scratch};
+        let (dir, logs) = (scratch("rt-dir"), scratch("rt-logs"));
+        let path = dir.path().join("session.toml");
+        let lost = layout(&[("/work/lost", "zsh")]);
+        let quit = layout(&[("/work/quit", "zsh")]);
+
+        write_quit_to(&path, &lost, Some("1-2")).expect("the quit's layout");
+        assert!(take_quit_from(&path).is_some(), "a single-use take");
+        assert!(
+            take_holding_from(&path, dead_run(), &evidence_in(logs.path()))
+                .0
+                .is_none(),
+            "the single-use take left nothing behind"
+        );
+
+        write_quit_to(&path, &lost, Some("1-2")).expect("the quit's layout");
+        let a = dead_run();
+        let (_, held) = take_holding_from(&path, a, &evidence_in(logs.path()));
+        marker(logs.path(), a);
+        drop(held); // A dies before it settles: its lock goes with it.
+        write_quit_to(&path, &quit, Some("7-8")).expect("another run's quit");
+        let b = dead_run();
+        let (taken, held) = take_holding_from(&path, b, &evidence_in(logs.path()));
+        let taken = taken.expect("B takes both");
+        assert_eq!(cwds(&taken.manifest), ["/work/quit", "/work/lost"]);
+        assert_eq!(taken.run.as_deref(), Some("7-8"), "the quit's run leads");
+        assert_eq!(taken.also, ["1-2"], "the run A's layout was the quit of");
+        assert_eq!(
+            takes_in(dir.path()),
+            [
+                take_of(TakeKind::Retaken, b, 0),
+                take_of(TakeKind::Taken, b, 0)
+            ]
+        );
+
+        marker(logs.path(), b);
+        drop(held); // B dies before it settles too.
+        let (taken, held) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        let taken = taken.expect("the quit layout B took first comes back");
+        assert_eq!(
+            cwds(&taken.manifest),
+            ["/work/quit"],
+            "and the layout B took again does not"
+        );
+        assert_eq!(
+            takes_in(dir.path()).len(),
+            1,
+            "set aside: {:?}",
+            takes_in(dir.path())
+        );
+        held.settle();
+        assert!(takes_in(dir.path()).is_empty());
+    }
+
+    /// A DEAD RUN'S TAKE GOES WHEN NOTHING SAYS IT WAS LOST (r6 sweep #7,
+    /// START-1): its run ended cleanly (no crash evidence); its run's own quit
+    /// wrote the desk before it was cut short (that layout comes back alone,
+    /// never the desk twice); its run's crash journal holds the desk (the claim
+    /// reopens that); this process's previous image left it, which an exec
+    /// replaced; or another dead run's take that comes back holds its run's desk.
+    /// NEGATIVE CONTROL: the same take with a crash marker and none of those comes
+    /// back (the last case).
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_runs_take_goes_when_its_end_was_clean_or_its_desk_is_held_elsewhere() {
+        use crate::crash_journal::tests::{cwds, layout, marker, scratch};
+        let (dir, logs) = (scratch("rt-dir"), scratch("rt-logs"));
+        let path = dir.path().join("session.toml");
+        let lost = layout(&[("/work/lost", "zsh")]);
+        // Run `a` takes `lost` and dies before it settles, `marked` or not.
+        let died_holding = |a: JournalId, marked: bool| {
+            write_quit_to(&path, &lost, Some("1-2")).expect("the quit's layout");
+            drop(take_holding_from(&path, a, &no_evidence()).1);
+            if marked {
+                marker(logs.path(), a);
+            }
+        };
+
+        died_holding(dead_run(), false);
+        let (taken, _) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert!(taken.is_none(), "a clean end's take goes");
+        assert!(takes_in(dir.path()).is_empty());
+
+        let a = dead_run();
+        died_holding(a, true);
+        let own = layout(&[("/work/own", "zsh")]);
+        write_quit_to(&path, &own, Some(&a.stem())).expect("A's own quit, cut short");
+        let (taken, held) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert_eq!(cwds(&taken.expect("A's quit").manifest), ["/work/own"]);
+        held.settle();
+        assert!(takes_in(dir.path()).is_empty(), "A's take went");
+
+        let a = dead_run();
+        died_holding(a, true);
+        fs::write(dir.path().join(a.file_name()), b"").expect("A's crash journal");
+        let (taken, _) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert!(taken.is_none(), "A's journal holds the desk");
+        assert!(takes_in(dir.path()).is_empty());
+        fs::remove_file(dir.path().join(a.file_name())).expect("A's crash journal");
+
+        let a = dead_run();
+        died_holding(a, true);
+        let next_image = JournalId {
+            pid: a.pid,
+            nanos: a.nanos + 1,
+        };
+        let (taken, _) = take_holding_from(&path, next_image, &evidence_in(logs.path()));
+        assert!(taken.is_none(), "this process's previous image's take goes");
+        assert!(takes_in(dir.path()).is_empty());
+
+        // Y took `lost` and its quit wrote `own`, which names Y, before Y settled; A took
+        // that quit meanwhile (Y's take, still held, was left alone); then both were
+        // killed. A's take comes back, and Y's goes: Y's desk, which A's take holds,
+        // holds what Y had taken.
+        write_quit_to(&path, &lost, Some("1-2")).expect("the quit's layout");
+        let y = dead_run();
+        let (_, y_held) = take_holding_from(&path, y, &no_evidence());
+        write_quit_to(&path, &own, Some(&y.stem())).expect("Y's quit");
+        let a = dead_run();
+        let (_, a_held) = take_holding_from(&path, a, &no_evidence());
+        assert_eq!(takes_in(dir.path()).len(), 2, "both held");
+        for (run, held) in [(y, y_held), (a, a_held)] {
+            marker(logs.path(), run);
+            drop(held);
+        }
+        let (taken, held) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert_eq!(
+            cwds(&taken.expect("A's take").manifest),
+            ["/work/own"],
+            "Y's desk once, never what Y took beside it"
+        );
+        held.settle();
+        assert!(takes_in(dir.path()).is_empty(), "Y's take went");
+
+        died_holding(dead_run(), true);
+        let (taken, held) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert_eq!(cwds(&taken.expect("comes back").manifest), ["/work/lost"]);
+        held.settle();
+    }
+
+    /// A TAKE WHOSE CLAIM MAY NOT OUTLIVE A CRASH BRINGS NOTHING BACK AND STILL
+    /// HOLDS WHAT IT TOOK (r6 sweep #7, START-1): the data dir's durable sync
+    /// fails (here the directory cannot be opened for it, while its names can
+    /// still be renamed), so the launch restores nothing, as the single-use
+    /// claim did; and its take stays under its lock, so a launch beside this
+    /// live run never takes it, crash marker or not, until the run settles.
+    /// NEGATIVE CONTROL: a take that let its lock go on that failure is taken
+    /// by the launch beside it (the `beside` check).
+    #[cfg(unix)]
+    #[test]
+    fn a_take_whose_sync_fails_restores_nothing_and_holds_what_it_took() {
+        use crate::crash_journal::tests::{marker, scratch};
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, logs) = (scratch("rt-dir"), scratch("rt-logs"));
+        let path = dir.path().join("session.toml");
+        write_quit_to(&path, &sample(), Some("1-2")).expect("the quit's layout");
+        let a = dead_run();
+        // Search and write but no read: the renames land, the open for the sync fails.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).expect("chmod");
+        let (taken, held) = take_holding_from(&path, a, &evidence_in(logs.path()));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(
+            taken.is_none(),
+            "nothing comes back past an indeterminate claim"
+        );
+        assert_eq!(takes_in(dir.path()), [take_of(TakeKind::Taken, a, 0)]);
+        // A's marker would read as a kill, but A's lock is held: A lives.
+        marker(logs.path(), a);
+        let (beside, _) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
+        assert!(beside.is_none(), "a live run's take is never taken");
+        assert_eq!(takes_in(dir.path()), [take_of(TakeKind::Taken, a, 0)]);
+        held.settle();
+        assert!(takes_in(dir.path()).is_empty());
     }
 
     /// ROUND EIGHT, U48: A LAYOUT WRITE SAYS WHETHER ITS CAUSE PASSES. A full
@@ -4829,6 +5658,7 @@ mod tests {
         RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
             sid: None,
             lineage: None,
+            log_ep: None,
             cwd: Some("/tmp/work".to_string()),
             title: title.to_string(),
             profile: None,
@@ -4841,6 +5671,7 @@ mod tests {
             questions: None,
             autopilot: None,
             land_at: None,
+            autopilot_by: None,
             identity: None,
             theme: None,
             agent: None,
@@ -6272,6 +7103,46 @@ metadata = "opaque=copy-me"
         );
     }
 
+    /// A LEAF NAMES THE EPOCH ITS SHELL'S LOG WAS AT (session log phase 6,
+    /// 6A-2, ruling U1), AND THE LAYOUT SAYS THE LARGEST: `log_ep` round
+    /// trips through the capture's wire and the parse; a leaf without it is
+    /// written as an older writer wrote it (no key) and an older writer's
+    /// layout reads as none; `max_log_ep` is the largest over every
+    /// window's leaves, which a launch notes before any session starts
+    /// (`session_log::Epochs::note_leaves`). NEGATIVE CONTROL: a layout with
+    /// no epoch says none.
+    #[test]
+    fn a_leaf_names_its_logs_epoch_and_the_layout_says_the_largest() {
+        let named = RestoreManifest::one_terminal_for_test(Some(1_792_000_123));
+        let wire = named.to_toml().expect("serialize");
+        assert!(wire.contains("log_ep = 1792000123"), "{wire}");
+        let parsed = RestoreManifest::from_toml(&wire).expect("parse");
+        assert_eq!(parsed, named, "the round trip holds");
+        assert_eq!(parsed.max_log_ep(), Some(1_792_000_123));
+        let older = wire.replace("log_ep = 1792000123\n", "");
+        assert_ne!(older, wire, "PRECONDITION: the key is out");
+        assert_eq!(
+            RestoreManifest::from_toml(&older).map(|m| m.max_log_ep()),
+            Some(None),
+            "an older writer's leaf names none, and parses"
+        );
+        let plain = RestoreManifest::one_terminal_for_test(None)
+            .to_toml()
+            .expect("serialize");
+        assert!(!plain.contains("log_ep"), "{plain}");
+        let mut two = RestoreManifest::one_terminal_for_test(Some(7));
+        two.windows
+            .extend(RestoreManifest::one_terminal_for_test(Some(9)).windows);
+        two.windows
+            .extend(RestoreManifest::one_terminal_for_test(None).windows);
+        assert_eq!(two.max_log_ep(), Some(9), "the largest of every window's");
+        assert_eq!(
+            RestoreManifest::one_terminal_for_test(None).max_log_ep(),
+            None,
+            "NEGATIVE CONTROL: no epoch, none said"
+        );
+    }
+
     /// A LEAF NAMES ITS SESSION AND ITS LINEAGE, AND A PEER WITHOUT THEM READS
     /// PAST THEM: both round-trip through the capture and the parse; a leaf
     /// without them is written as an older writer wrote it (no key), and this
@@ -6304,6 +7175,7 @@ metadata = "opaque=copy-me"
                 root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                     sid,
                     lineage,
+                    log_ep: None,
                     cwd: None,
                     title: "zsh".into(),
                     profile: None,
@@ -6318,6 +7190,7 @@ metadata = "opaque=copy-me"
                     questions: None,
                     autopilot: None,
                     land_at: None,
+                    autopilot_by: None,
                     agent: None,
                     supervised: None,
                     lost: None,
@@ -6630,6 +7503,46 @@ metadata = "opaque=copy-me"
         assert!(results.into_iter().flatten().all(|value| value == manifest));
         assert!(!path.exists());
         assert!(take_from(&path).is_none());
+
+        // The launch's two-phase take keeps the law (r6 sweep #7): of two launches
+        // racing for the layout one takes and holds it, and the other finds that
+        // live run's take and leaves it.
+        #[cfg(unix)]
+        {
+            write_to(&path, &manifest).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let mut takers = Vec::new();
+            for _ in 0..2 {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                let run = dead_run();
+                takers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    take_holding_from(&path, run, &no_evidence())
+                }));
+            }
+            barrier.wait();
+            let results = takers
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                results.iter().filter(|(taken, _)| taken.is_some()).count(),
+                1
+            );
+            assert!(
+                results
+                    .iter()
+                    .filter_map(|(taken, _)| taken.as_ref())
+                    .all(|taken| taken.manifest == manifest)
+            );
+            assert!(!path.exists());
+            assert_eq!(takes_in(&dir).len(), 1, "the winner's take, held");
+            for (_, held) in results {
+                held.settle();
+            }
+            assert!(takes_in(&dir).is_empty());
+        }
 
         // Tier-1 projection of the one real winner and absent loser. Returning
         // before SyncClaim is the explicit negative control.

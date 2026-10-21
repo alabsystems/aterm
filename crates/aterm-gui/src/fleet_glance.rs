@@ -553,10 +553,13 @@ fn content_what(word: NeedWord, row: &aterm_json::Map) -> Option<String> {
 /// failed at once with no route. Entries that are not a fleet peer's (this
 /// machine's instances, its siblings) are dropped — the sibling scan reads
 /// those — and so is a peer that proved its `node=` is `own_node`, this
-/// machine answering through its own book (an unproven peer's `node=` is its
-/// claim: it is listed, [`FleetMac::unproven`]); a row whose `held_from=` is
-/// `own_node` is a hold this machine placed ([`FleetMac::held_here`]). `Err`
-/// for text that is no survey.
+/// machine answering through its own book. A proven answer's `node=` is the
+/// node its connection proved: the read refuses one whose header names
+/// another (`aterm_net::fleet_member::Unreached::Misnamed`), which comes
+/// here as a peer that did not answer, never as one dropped. An unproven
+/// peer's `node=` is its claim: it is listed ([`FleetMac::unproven`]). A row
+/// whose `held_from=` is `own_node` is a hold this machine placed
+/// ([`FleetMac::held_here`]). `Err` for text that is no survey.
 pub(crate) fn parse(
     json: &str,
     no_route: bool,
@@ -934,6 +937,10 @@ fn reader_loop(
     // The next instant the last read, or a Mac's rows in it, stops
     // counting: news for the App when it passes.
     let mut lapse_at: Option<u64> = None;
+    // The clock when the App was last told: the next lapse is the first
+    // after it, so one that passes before the reader looks again (it was
+    // descheduled after its post, or the Mac slept) is still news.
+    let mut told_ms: u64 = 0;
     loop {
         let book = (seams.book)();
         let now = (seams.now_ms)();
@@ -950,8 +957,14 @@ fn reader_loop(
             moved
         };
         let lapsed = lapse_at.is_some_and(|at| now >= at);
-        if (read || book_moved || lapsed || std::mem::take(&mut first)) && !(seams.post)() {
-            return;
+        // Taken whatever else is news: a first look that is also a moved book
+        // is told once, never again a tick after the next read.
+        let first_look = std::mem::take(&mut first);
+        if read || book_moved || lapsed || first_look {
+            if !(seams.post)() {
+                return;
+            }
+            told_ms = now;
         }
         if read {
             let answer = runner.run();
@@ -985,13 +998,16 @@ fn reader_loop(
             if !(seams.post)() {
                 return;
             }
+            told_ms = now;
         }
-        // Wake at the tick, or just past the next lapse, whichever is first.
+        // Wake at the tick, or just past the next lapse after the App was
+        // last told (at once when the clock is already past it), whichever
+        // is first.
         let now = (seams.now_ms)();
         lapse_at = lock()
             .snapshot
             .as_deref()
-            .and_then(|snapshot| snapshot.next_lapse(now));
+            .and_then(|snapshot| snapshot.next_lapse(told_ms));
         let wait = lapse_at.map_or(seams.tick, |at| {
             Duration::from_millis(at.saturating_sub(now)).min(seams.tick)
         });

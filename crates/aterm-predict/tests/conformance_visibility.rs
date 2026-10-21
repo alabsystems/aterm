@@ -8,7 +8,9 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_predict::{EditKey, EditOutcome, KeySample, PredictMode, Predictor, Rule, Seen};
+use aterm_predict::{
+    EditKey, EditOutcome, EditorContext, InputStart, KeySample, PredictMode, Predictor, Rule, Seen,
+};
 
 /// The content-coordinate generation of a screen whose rows never move.
 const G: u64 = 0;
@@ -236,7 +238,10 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
 /// Every epoch boundary the shipping predictor recognises is the model's `Submit`
 /// (`confirmed = 0`): the proof belongs to the epoch that ended, so the next `Key`
 /// is invisible on both sides. A boundary missed is a proven epoch carried into a
-/// line that never echoed — the password-prompt leak.
+/// line that never echoed — the password-prompt leak. The rows moving under the
+/// cursor is the model's `RowsMoved`, which ends the proof as `Submit` does and
+/// keeps THE FIRST KEY's gate (`a_scroll_keeps_the_first_key_s_gate` binds that
+/// half).
 #[test]
 fn every_epoch_boundary_is_the_models_submit() {
     // Each boundary returns the generation and the cursor column the next key
@@ -276,6 +281,7 @@ fn every_epoch_boundary_is_the_models_submit() {
                 coords: G,
                 grid: (80, 24),
                 row: Some(&row),
+                ..KeySample::default()
             };
             assert_eq!(
                 p.predict_edit(EditKey::Left, &sample, at),
@@ -293,7 +299,9 @@ fn every_epoch_boundary_is_the_models_submit() {
         at = echo_turn(&mut p, 'b', 1, at, slow);
         assert!(model.fire("ConfirmSlow", &mut st));
         let (coords, col) = boundary(&mut p, at);
-        assert!(model.fire("Submit", &mut st));
+        // The rows moving is the model's own boundary, which keeps the gate.
+        let action = if coords == G { "Submit" } else { "RowsMoved" };
+        assert!(model.fire(action, &mut st), "{label}");
         assert_eq!(st["confirmed"], 0);
         assert!(p.predict_char('s', (0, col), coords, 80, at), "{label}");
         assert!(model.fire("Key", &mut st));
@@ -511,106 +519,215 @@ fn row_of(text: &str) -> Vec<Seen> {
     row
 }
 
-/// The press of `←` with the cursor at `(0, cursor)` over row 0 showing `ab`.
-fn press_left(p: &mut Predictor, cursor: u16, at: Instant) -> EditOutcome {
-    let row = row_of("ab");
-    let sample = KeySample {
+/// The press's sample with the cursor at `(0, cursor)` over `row`.
+fn sample(row: &[Seen], cursor: u16) -> KeySample<'_> {
+    KeySample {
         cursor: (0, cursor),
         coords: G,
         grid: (80, 24),
-        row: Some(&row),
-    };
-    p.predict_edit(EditKey::Left, &sample, at)
+        row: Some(row),
+        ..KeySample::default()
+    }
 }
 
-/// The shipping predictor through the class ladder: a slow proven line `ab`
-/// typed with its rows and echoed through `reconcile_seen` (so the edit lane may
-/// place an arrow on it), `←` pressed, its echo, then a second `←`. Returns
-/// whether each `←` was painted (its cursor in the overlay), and the predictor
-/// with the instant. With `rule_off` the class proof is switched off.
-fn class_ladder_run(rule_off: bool) -> (bool, bool, Predictor, Instant) {
+/// The press of edit `key` with the cursor at `(0, cursor)` over row 0 showing
+/// `text`.
+fn press(p: &mut Predictor, key: EditKey, text: &str, cursor: u16, at: Instant) -> EditOutcome {
+    let row = row_of(text);
+    p.predict_edit(key, &sample(&row, cursor), at)
+}
+
+/// A reconcile over row 0 showing `text`, the real cursor at `(0, cursor)`.
+fn reconcile(p: &mut Predictor, text: &str, cursor: u16, at: Instant) {
+    p.reconcile_seen(Some((0, cursor)), G, false, at, |r, c| {
+        let ch = (r == 0).then(|| text.chars().nth(usize::from(c))).flatten();
+        ch.map_or(Seen::Blank, |ch| Seen::of_cell(ch, false))
+    });
+}
+
+/// The edit classes THE CLASS LADDER proves one at a time, each with the rule
+/// that keeps it: `←` (a motion), a glyph typed inside the text (an insert that
+/// shifts the text right of it), a Backspace inside the text (an erase that
+/// shifts it left). The model has one abstract edit class; the binding drives
+/// each in turn and projects only that class's ops, the others' (the motions
+/// that bring the cursor inside the text) being steps the model does not see.
+#[derive(Clone, Copy, Debug)]
+enum EditClass {
+    Motion,
+    InsertShift,
+    EraseShift,
+}
+
+impl EditClass {
+    /// The predictor rule that keeps this class's proof.
+    fn rule(self) -> Rule {
+        match self {
+            Self::Motion => Rule::MotionClassProof,
+            Self::InsertShift => Rule::InsertShiftProof,
+            Self::EraseShift => Rule::EraseShiftProof,
+        }
+    }
+}
+
+/// The shipping predictor through the class ladder for `class`: a slow proven
+/// line typed with its rows and echoed through `reconcile_seen` (so the edit
+/// lane may place an op on it), the cursor walked into the text where the class
+/// needs it (each `←` echoed), the class's first op pressed, its echo, then a
+/// second op of the class. Returns whether each was painted (the chain's cursor
+/// in the overlay), the predictor and the instant. With `rule_off` the class
+/// proof is switched off.
+///
+/// The text is `ab` for `←` and `abc` for a shift: a shift proves its class
+/// only where its echo differs from an edit in place, and `bc` moved one cell
+/// does where a lone `b` might not.
+fn class_ladder_run(class: EditClass, rule_off: bool) -> (bool, bool, Predictor, Instant) {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if rule_off {
-        p.disable_rule_for_test(Rule::MotionClassProof);
+        p.disable_rule_for_test(class.rule());
     }
     let slow = Duration::from_millis(60);
+    let text = match class {
+        EditClass::Motion => "ab",
+        EditClass::InsertShift | EditClass::EraseShift => "abc",
+    };
     let mut at = Instant::now();
-    for (col, ch) in [(0u16, 'a'), (1, 'b')] {
-        let before: String = "ab".chars().take(usize::from(col)).collect();
+    for (col, ch) in (0u16..).zip(text.chars()) {
+        let before: String = text.chars().take(usize::from(col)).collect();
         let row = row_of(&before);
-        let sample = KeySample {
-            cursor: (0, col),
-            coords: G,
-            grid: (80, 24),
-            row: Some(&row),
-        };
-        assert!(p.predict_glyph(ch, &sample, at));
+        assert!(p.predict_glyph(ch, &sample(&row, col), at));
         at += slow;
-        let after: String = "ab".chars().take(usize::from(col) + 1).collect();
-        p.reconcile_seen(Some((0, col + 1)), G, false, at, |r, c| {
-            let ch = (r == 0)
-                .then(|| after.chars().nth(usize::from(c)))
-                .flatten();
-            ch.map_or(Seen::Blank, |ch| Seen::of_cell(ch, false))
-        });
+        let after: String = text.chars().take(usize::from(col) + 1).collect();
+        reconcile(&mut p, &after, col + 1, at);
     }
     let shown = |p: &mut Predictor, at: Instant| {
         let _ = p.overlay(at);
         p.overlay_cursor().is_some()
     };
-    let seen_ab = |r: u16, c: u16| match (r, c) {
-        (0, 0) => Seen::Glyph('a'),
-        (0, 1) => Seen::Glyph('b'),
-        _ => Seen::Blank,
+    let (first, second) = match class {
+        EditClass::Motion => {
+            assert_eq!(
+                press(&mut p, EditKey::Left, "ab", 2, at),
+                EditOutcome::Armed
+            );
+            reconcile(&mut p, "ab", 2, at);
+            let first = shown(&mut p, at);
+            at += slow;
+            reconcile(&mut p, "ab", 1, at);
+            assert!(p.idle(), "the first ← echoed and retired");
+            assert_eq!(
+                press(&mut p, EditKey::Left, "ab", 1, at),
+                EditOutcome::Armed
+            );
+            reconcile(&mut p, "ab", 1, at);
+            (first, shown(&mut p, at))
+        }
+        EditClass::InsertShift => {
+            for cursor in [3, 2] {
+                assert_eq!(
+                    press(&mut p, EditKey::Left, "abc", cursor, at),
+                    EditOutcome::Armed
+                );
+                at += slow;
+                reconcile(&mut p, "abc", cursor - 1, at);
+                assert!(p.idle(), "`←` echoed: the cursor on `b`");
+            }
+            let row = row_of("abc");
+            assert!(p.predict_glyph('x', &sample(&row, 1), at));
+            reconcile(&mut p, "abc", 1, at);
+            let first = shown(&mut p, at);
+            at += slow;
+            reconcile(&mut p, "axbc", 2, at);
+            assert!(p.idle(), "the first insert echoed, `bc` moved");
+            let row = row_of("axbc");
+            assert!(p.predict_glyph('y', &sample(&row, 2), at));
+            reconcile(&mut p, "axbc", 2, at);
+            (first, shown(&mut p, at))
+        }
+        EditClass::EraseShift => {
+            assert_eq!(
+                press(&mut p, EditKey::Left, "abc", 3, at),
+                EditOutcome::Armed
+            );
+            at += slow;
+            reconcile(&mut p, "abc", 2, at);
+            assert!(p.idle(), "`←` echoed: the cursor on `c`");
+            assert_eq!(
+                press(&mut p, EditKey::Backspace, "abc", 2, at),
+                EditOutcome::Armed
+            );
+            reconcile(&mut p, "abc", 2, at);
+            let first = shown(&mut p, at);
+            at += slow;
+            reconcile(&mut p, "ac", 1, at);
+            assert!(p.idle(), "the first erase echoed, `c` moved");
+            assert_eq!(
+                press(&mut p, EditKey::Backspace, "ac", 1, at),
+                EditOutcome::Armed
+            );
+            reconcile(&mut p, "ac", 1, at);
+            (first, shown(&mut p, at))
+        }
     };
-    assert_eq!(press_left(&mut p, 2, at), EditOutcome::Armed);
-    p.reconcile_seen(Some((0, 2)), G, false, at, seen_ab);
-    let first = shown(&mut p, at);
-    at += slow;
-    p.reconcile_seen(Some((0, 1)), G, false, at, seen_ab);
-    assert!(p.idle(), "the first ← echoed and retired");
-    assert_eq!(press_left(&mut p, 1, at), EditOutcome::Armed);
-    p.reconcile_seen(Some((0, 1)), G, false, at, seen_ab);
-    let second = shown(&mut p, at);
     (first, second, p, at)
 }
 
-/// THE EDIT CLASS: a motion displays only once a motion of its epoch has
-/// echoed. The model's `KeyEdit` before any `ConfirmEdit` is invisible, and so
-/// is the shipping predictor's first `←`; its echo is `ConfirmEdit`; the second
-/// `←` is visible on both sides; `note_line_submit` ends both proofs, `Submit`.
-/// Tier-0 controls: the states a missing class proof and a class proof outliving
-/// the glyph proof produce are rejected. Negative control, from the code: the
-/// same drive with `Rule::MotionClassProof` off paints the first `←`, and that
-/// pixel, projected onto the model's state at that step, is what
-/// `EditVisibleNeedsClassProof` rejects; if the mutated code stopped painting it,
-/// the control would prove nothing and fails instead.
+/// THE EDIT CLASS, for each class the ladder proves: an op displays only once
+/// an op of its class has echoed in its epoch (a motion, an insert that shifts
+/// the text, an erase that shifts it). The model's `KeyEdit` before any
+/// `ConfirmEdit` is invisible, and so is the shipping predictor's first op of
+/// the class; its echo is `ConfirmEdit`; the second op is visible on both
+/// sides; `note_line_submit` ends both proofs, `Submit`. Tier-0 controls: the
+/// states a missing class proof and a class proof outliving the glyph proof
+/// produce are rejected. Negative control, from the code, per class: the same
+/// drive with the class's rule off (`MotionClassProof`, `InsertShiftProof`,
+/// `EraseShiftProof`) paints the first op, and that pixel, projected onto the
+/// model's state at that step, is what `EditVisibleNeedsClassProof` rejects; if
+/// the mutated code stopped painting it, the control would prove nothing and
+/// fails instead.
 #[test]
 fn an_edit_displays_only_after_its_class_is_proven() {
     let model = aterm_models_core::predictive_echo_visibility_model();
-    let mut st = model.init_state();
-    assert!(model.fire("ConfirmSlow", &mut st));
-    let (first, second, mut p, at) = class_ladder_run(false);
-    assert!(model.fire("KeyEdit", &mut st));
-    assert_eq!((st["visible"], st["class"]), (0, 1));
-    assert!(
-        !first,
-        "the first ← is dark: no motion of this epoch has echoed"
-    );
-    let unproven = st.clone();
-    assert!(model.fire("ConfirmEdit", &mut st));
-    assert_eq!(st["edit_proven"], 1);
-    assert!(model.fire("KeyEdit", &mut st));
-    assert_eq!(st["visible"], 1);
-    assert!(second, "the second ← shows");
-    p.note_line_submit(at);
-    assert!(model.fire("Submit", &mut st));
-    assert_eq!((st["edit_proven"], st["confirmed"]), (0, 0));
-    assert_eq!(
-        press_left(&mut p, 1, at),
-        EditOutcome::Declined,
-        "nothing is placed on the line the terminator ended"
-    );
+    for class in [
+        EditClass::Motion,
+        EditClass::InsertShift,
+        EditClass::EraseShift,
+    ] {
+        let mut st = model.init_state();
+        assert!(model.fire("ConfirmSlow", &mut st));
+        let (first, second, mut p, at) = class_ladder_run(class, false);
+        assert!(model.fire("KeyEdit", &mut st));
+        assert_eq!((st["visible"], st["class"]), (0, 1));
+        assert!(
+            !first,
+            "{class:?}: the first op is dark, no op of its class has echoed"
+        );
+        let unproven = st.clone();
+        assert!(model.fire("ConfirmEdit", &mut st));
+        assert_eq!(st["edit_proven"], 1);
+        assert!(model.fire("KeyEdit", &mut st));
+        assert_eq!(st["visible"], 1);
+        assert!(second, "{class:?}: the second op shows");
+        p.note_line_submit(at);
+        assert!(model.fire("Submit", &mut st));
+        assert_eq!((st["edit_proven"], st["confirmed"]), (0, 0));
+        assert_eq!(
+            press(&mut p, EditKey::Left, "abc", 1, at),
+            EditOutcome::Declined,
+            "{class:?}: nothing is placed on the line the terminator ended"
+        );
+
+        let (mutant_first, ..) = class_ladder_run(class, true);
+        assert!(
+            mutant_first,
+            "{class:?}: the mutated gate paints the first op"
+        );
+        let mut borrowed = unproven;
+        borrowed.insert("visible", i64::from(mutant_first));
+        assert!(
+            !model.check_invariant("EditVisibleNeedsClassProof", &borrowed),
+            "{class:?}: an op shown before its class is proven must be rejected"
+        );
+    }
 
     let mut leaked = model.init_state();
     for (var, value) in [
@@ -627,13 +744,329 @@ fn an_edit_displays_only_after_its_class_is_proven() {
     let mut orphan = model.init_state();
     orphan.insert("edit_proven", 1);
     assert!(!model.check_invariant("ClassProofRidesOnGlyphProof", &orphan));
+}
 
-    let (mutant_first, ..) = class_ladder_run(true);
-    assert!(mutant_first, "the mutated gate paints the first ←");
-    let mut borrowed = unproven;
-    borrowed.insert("visible", i64::from(mutant_first));
+/// The press's sample with the cursor at `(0, cursor)` over `row`, handing
+/// `start` as the shell's authenticated buffer start, in one editor context.
+fn signed(row: &[Seen], cursor: u16, start: Option<InputStart>) -> KeySample<'_> {
+    KeySample {
+        input_start: start,
+        context: EditorContext::new(1, Some(&[7; 32]), false, false),
+        ..sample(row, cursor)
+    }
+}
+
+/// The `B` of the line-edge runs' prompt, at `(0, 0)`.
+const B: InputStart = InputStart {
+    cell: (0, 0),
+    prompt: 1,
+};
+
+/// How a line-edge run starts its line: whether its presses hand the `B`,
+/// whether a line terminator pressed at the prompt before opened THE FIRST
+/// KEY's gate, and whether the rows moved under the screen after it (a shell
+/// on the bottom row, whose Enter's output scrolls the screen: the frame before
+/// the terminator read another content-coordinate generation).
+#[derive(Clone, Copy)]
+struct Start {
+    hands_b: bool,
+    first_key: bool,
+    scrolled: bool,
+}
+
+/// A line started by the prompt's first key at its `B`: witnessed.
+const WITNESSED: Start = Start {
+    hands_b: true,
+    first_key: true,
+    scrolled: false,
+};
+
+/// The line a line-edge run starts as `start` says (see [`line_edge_run`]):
+/// `ab` typed and echoed on a slow link, the cursor at its end. Returns when
+/// the last echo landed.
+fn typed_ab(p: &mut Predictor, start: Start) -> Instant {
+    let slow = Duration::from_millis(60);
+    let mut at = Instant::now();
+    if start.scrolled {
+        // The frame before the Enter's output, at another generation.
+        p.reconcile_seen(Some((0, 0)), G + 1, false, at, |_, _| Seen::Blank);
+    }
+    if start.first_key {
+        p.note_line_submit_at(Some(B.prompt - 1), at);
+        at += p.glitch_window_for_test() + Duration::from_millis(1);
+    }
+    if start.scrolled {
+        // The Enter's output scrolled the screen: the frame it drew, before
+        // the next prompt's first key, reads `G`.
+        reconcile(p, "", 0, at);
+    }
+    for (col, ch) in (0u16..).zip("ab".chars()) {
+        let before: String = "ab".chars().take(usize::from(col)).collect();
+        let row = row_of(&before);
+        let b = start.hands_b.then_some(B);
+        assert!(p.predict_glyph(ch, &signed(&row, col, b), at));
+        at += slow;
+        let after: String = "ab".chars().take(usize::from(col) + 1).collect();
+        reconcile(p, &after, col + 1, at);
+    }
+    at
+}
+
+/// The shipping predictor through THE LINE EDGE: `ab` typed on a slow link,
+/// after a line terminator at the prompt before when `start.first_key` (so `a`
+/// is THE FIRST KEY), the rows moving under the screen after it when
+/// `start.scrolled`, each press handing the shell's authenticated buffer start
+/// at `(0, 0)` when `start.hands_b`; then Home pressed three times from the end
+/// of the line, each echoed as beginning-of-line (the cursor on `a`), the cursor
+/// walked back to the end between them with `→` (steps the model does not
+/// see). Every Home press hands the start. Returns whether each Home was
+/// painted (the chain's cursor in the overlay), the predictor and the instant.
+/// With `off` that rule is switched off.
+fn line_edge_run(off: Option<Rule>, start: Start) -> ([bool; 3], Predictor, Instant) {
+    let mut p = Predictor::new(PredictMode::Adaptive);
+    if let Some(rule) = off {
+        p.disable_rule_for_test(rule);
+    }
+    let slow = Duration::from_millis(60);
+    let mut at = typed_ab(&mut p, start);
+    let row = row_of("ab");
+    let mut shown = [false; 3];
+    for (round, painted) in shown.iter_mut().enumerate() {
+        assert_eq!(
+            p.predict_edit(EditKey::Home, &signed(&row, 2, Some(B)), at),
+            EditOutcome::Armed,
+            "Home, round {round}"
+        );
+        reconcile(&mut p, "ab", 2, at);
+        let _ = p.overlay(at);
+        *painted = p.overlay_cursor().is_some();
+        at += slow;
+        reconcile(&mut p, "ab", 0, at);
+        assert!(p.idle(), "Home's echo retires it, round {round}");
+        if round < 2 {
+            for cursor in [0, 1] {
+                assert_eq!(
+                    press(&mut p, EditKey::Right, "ab", cursor, at),
+                    EditOutcome::Armed
+                );
+                at += slow;
+                reconcile(&mut p, "ab", cursor + 1, at);
+                assert!(p.idle(), "`→` echoed");
+            }
+        }
+    }
+    (shown, p, at)
+}
+
+/// THE LINE EDGE: Home is placed only on a WITNESSED line and shown only once
+/// its binding is LEARNED. The model's `SubmitAtPrompt` is the line terminator
+/// pressed at the prompt before (`note_line_submit_at`), its `Key` the
+/// prompt's first key (`a`), and `Witness` the line it started at the shell's
+/// authenticated buffer start; `KeyLineEdge` before any `ConfirmLineEdge` is
+/// invisible, and so are the shipping predictor's first two Homes (probes: the
+/// code learns from two echoes, which the model folds into one step, the first
+/// echo its `Echo`); the second echo is `ConfirmLineEdge`, and the third Home
+/// is visible on both sides; `note_line_submit` ends the witness, `Submit`, and
+/// Home is then not placed. Tier-0 controls: a line-edge key shown unlearned, a
+/// binding a fresh session kept, and a line witnessed by a key that was not
+/// its prompt's first, are rejected. Negative controls, from the code: with
+/// `Rule::LearnedBindings` off the first Home is painted, and that pixel,
+/// projected onto the model's state at that step, is what
+/// `LineEdgeNeedsWitnessAndBinding` rejects; with `Rule::WitnessFreshPrompt`
+/// off, Home learned and painted on a line the presses never witnessed, which
+/// the model's state with no `Witness` rejects; and with
+/// `Rule::WitnessFirstKey` off, Home learned and painted on a line started at
+/// the `B` by a key that was not the prompt's first, which
+/// `WitnessIsTheFirstKey` rejects. Each control fails, rather than passing
+/// vacuously, if the mutated code stops painting.
+#[test]
+fn a_line_edge_key_displays_only_when_learned_at_a_witnessed_prompt() {
+    let model = aterm_models_core::predictive_echo_visibility_model();
+    let mut st = model.init_state();
+    assert!(model.fire("SubmitAtPrompt", &mut st));
+    assert!(model.fire("OwedExpire", &mut st));
+    assert!(model.fire("Key", &mut st));
+    assert_eq!(st["first"], 1, "the prompt's first key");
+    assert!(model.fire("Echo", &mut st));
+    assert!(model.fire("ConfirmSlow", &mut st));
+    assert!(model.fire("Witness", &mut st));
+    let (shown, mut p, at) = line_edge_run(None, WITNESSED);
+    assert!(model.fire("KeyLineEdge", &mut st));
+    assert_eq!((st["visible"], st["class"], st["learned"]), (0, 2, 0));
+    assert!(!shown[0], "the first Home is a probe: dark");
+    let unlearned = st.clone();
+    assert!(model.fire("Echo", &mut st));
+    assert!(model.fire("KeyLineEdge", &mut st));
+    assert_eq!(st["visible"], 0);
+    assert!(!shown[1], "one echo is not two: still a probe");
+    assert!(model.fire("ConfirmLineEdge", &mut st));
+    assert_eq!(st["learned"], 1);
+    assert!(model.fire("KeyLineEdge", &mut st));
+    assert_eq!(st["visible"], 1);
+    assert!(shown[2], "learned: the third Home shows");
+    p.note_line_submit(at);
+    assert!(model.fire("Echo", &mut st));
+    assert!(model.fire("Submit", &mut st));
+    assert_eq!((st["witness"], st["confirmed"], st["gate"]), (0, 0, 0));
     assert!(
-        !model.check_invariant("EditVisibleNeedsClassProof", &borrowed),
-        "a motion shown before its class is proven must be rejected"
+        !model.fire("KeyLineEdge", &mut st.clone()),
+        "no line-edge key without a witness"
     );
+    let row = row_of("ab");
+    assert_eq!(
+        p.predict_edit(EditKey::Home, &signed(&row, 0, Some(B)), at),
+        EditOutcome::Declined,
+        "nothing is placed on the line the terminator ended"
+    );
+    // A run that is not the prompt's first key witnesses nothing, in the model
+    // (the gate shut: `Witness` cannot fire) as in the code (Home is then not
+    // placed: `line_edge_run`'s first Home would panic).
+    let mut later = model.init_state();
+    assert!(model.fire("Key", &mut later));
+    assert!(model.fire("Echo", &mut later));
+    assert!(model.fire("ConfirmSlow", &mut later));
+    assert!(!model.fire("Witness", &mut later.clone()), "no first key");
+
+    let (mutant, ..) = line_edge_run(Some(Rule::LearnedBindings), WITNESSED);
+    assert!(mutant[0], "the mutated gate paints the first Home");
+    let mut borrowed = unlearned;
+    borrowed.insert("visible", i64::from(mutant[0]));
+    assert!(
+        !model.check_invariant("LineEdgeNeedsWitnessAndBinding", &borrowed),
+        "a line-edge key shown before its binding is learned must be rejected"
+    );
+
+    let (mutant, ..) = line_edge_run(
+        Some(Rule::WitnessFreshPrompt),
+        Start {
+            hands_b: false,
+            ..WITNESSED
+        },
+    );
+    assert!(mutant[2], "the mutated witness paints a learned Home");
+    let mut unwitnessed = model.init_state();
+    assert!(model.fire("ConfirmSlow", &mut unwitnessed));
+    for (var, value) in [
+        ("learned", 1),
+        ("pending", 1),
+        ("class", 2),
+        ("visible", i64::from(mutant[2])),
+    ] {
+        unwitnessed.insert(var, value);
+    }
+    assert!(
+        !model.check_invariant("LineEdgeNeedsWitnessAndBinding", &unwitnessed),
+        "a line-edge key shown on a line no B witnessed must be rejected"
+    );
+
+    let (mutant, ..) = line_edge_run(
+        Some(Rule::WitnessFirstKey),
+        Start {
+            first_key: false,
+            ..WITNESSED
+        },
+    );
+    assert!(
+        mutant[2],
+        "the mutated first key paints a learned Home on a later key's line"
+    );
+    let mut not_first = later;
+    for (var, value) in [
+        ("witness", 1),
+        ("witness_first", 0),
+        ("learned", 1),
+        ("pending", 1),
+        ("class", 2),
+        ("visible", i64::from(mutant[2])),
+    ] {
+        not_first.insert(var, value);
+    }
+    assert!(
+        !model.check_invariant("WitnessIsTheFirstKey", &not_first),
+        "a line witnessed by a key that was not its prompt's first must be rejected"
+    );
+
+    let mut leaked = model.init_state();
+    for (var, value) in [
+        ("visible", 1),
+        ("class", 2),
+        ("confirmed", 1),
+        ("slow", 1),
+        ("pending", 1),
+        ("fresh", 0),
+        ("witness", 1),
+        ("witness_first", 1),
+    ] {
+        leaked.insert(var, value);
+    }
+    assert!(!model.check_invariant("LineEdgeNeedsWitnessAndBinding", &leaked));
+    let mut kept = model.init_state();
+    kept.insert("learned", 1);
+    assert!(!model.check_invariant("FreshContextHasNoBinding", &kept));
+}
+
+/// THE FIRST KEY across a scroll: the rows moving under the screen between a
+/// line terminator pressed at a prompt and the next prompt's first key (a
+/// shell on the bottom row, whose Enter's own output scrolls the screen) is the
+/// model's `RowsMoved`, which ends the proof and owes as `Submit` does but
+/// keeps the gate, since a scroll lets no key past the predictor. So the next
+/// key is still the first (`first = 1`), `Witness` fires, and the learned
+/// Home shows on the third press, in the model as in the code, whose frames
+/// after the terminator read another content-coordinate generation than the
+/// frame before it. `WitnessIsTheFirstKey` holds of that state. The boundary a
+/// host reset is (it may have let keys past) is `Submit`, which shuts the
+/// gate: `Witness` cannot fire after it. Negative control, from the code:
+/// with `Rule::ScrollKeepsFirstKey` off the move shuts the gate, and Home is
+/// not placed on the line the model witnesses, so the code no longer refines
+/// `RowsMoved`; the control fails, rather than passing vacuously, if the
+/// mutated code still places it.
+#[test]
+fn a_scroll_keeps_the_first_key_s_gate() {
+    let model = aterm_models_core::predictive_echo_visibility_model();
+    let mut st = model.init_state();
+    assert!(model.fire("SubmitAtPrompt", &mut st));
+    assert!(model.fire("RowsMoved", &mut st));
+    assert_eq!((st["gate"], st["confirmed"], st["owed"]), (1, 0, 1));
+    assert!(model.fire("OwedExpire", &mut st));
+    assert!(model.fire("Key", &mut st));
+    assert_eq!(st["first"], 1, "still the prompt's first key");
+    assert!(model.fire("Echo", &mut st));
+    assert!(model.fire("ConfirmSlow", &mut st));
+    assert!(model.fire("Witness", &mut st));
+    assert!(model.check_invariant("WitnessIsTheFirstKey", &st));
+    let scrolled = Start {
+        scrolled: true,
+        ..WITNESSED
+    };
+    let (shown, ..) = line_edge_run(None, scrolled);
+    assert!(model.fire("KeyLineEdge", &mut st));
+    assert!(model.fire("Echo", &mut st));
+    assert!(model.fire("KeyLineEdge", &mut st));
+    assert!(model.fire("ConfirmLineEdge", &mut st));
+    assert!(model.fire("KeyLineEdge", &mut st));
+    assert_eq!(st["visible"], 1);
+    assert_eq!(shown, [false, false, true], "the third, learned Home shows");
+
+    // A host reset at the same point is `Submit`: the gate shut, no witness.
+    let mut reset = model.init_state();
+    assert!(model.fire("SubmitAtPrompt", &mut reset));
+    assert!(model.fire("Submit", &mut reset));
+    assert!(model.fire("OwedExpire", &mut reset));
+    assert!(model.fire("Key", &mut reset));
+    assert!(model.fire("Echo", &mut reset));
+    assert!(model.fire("ConfirmSlow", &mut reset));
+    assert_eq!(reset["first"], 0);
+    assert!(!model.fire("Witness", &mut reset.clone()), "no first key");
+
+    // The mutant: the move shuts the gate in the code, which then places no
+    // Home on the line `RowsMoved` lets the model witness.
+    for (rule_on, want) in [(true, EditOutcome::Armed), (false, EditOutcome::Declined)] {
+        let mut p = Predictor::new(PredictMode::Adaptive);
+        if !rule_on {
+            p.disable_rule_for_test(Rule::ScrollKeepsFirstKey);
+        }
+        let at = typed_ab(&mut p, scrolled);
+        let outcome = p.predict_edit(EditKey::Home, &signed(&row_of("ab"), 2, Some(B)), at);
+        assert_eq!(outcome, want, "rule on {rule_on}");
+    }
 }

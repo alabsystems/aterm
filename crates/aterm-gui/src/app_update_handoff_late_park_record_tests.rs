@@ -439,7 +439,9 @@ fn a_park_half_failure_stands_the_held_successor_down_as_a_producer_failure() {
 #[test]
 fn the_post_park_proof_deadline_widens_on_retries_and_for_an_explicit_apply() {
     if std::env::var_os("ATERM_HANDOFF_PROOF_TIMEOUT_MS").is_some() {
-        return;
+        aterm_spec::host::could_not_run(
+            "ATERM_HANDOFF_PROOF_TIMEOUT_MS is set here, and it replaces the ladder",
+        );
     }
     let park_at = std::time::Instant::now();
     let budget = |mode, prior| {
@@ -780,7 +782,7 @@ fn a_topic_escalation_or_claim_moved_after_the_draw_stands_the_commit_down() {
     arm(&mut app);
     assert!(exact_activity(&mut app), "control: nothing moved");
     // Negative control: reads move nothing.
-    assert!(crate::fabric::cmd_topic(&ctx, "ls").0.starts_with("OK 0"));
+    assert!(crate::fabric::cmd_topic(&ctx, "ls").starts_with("OK 0"));
     let _ = ctx
         .meta
         .lock()
@@ -790,12 +792,12 @@ fn a_topic_escalation_or_claim_moved_after_the_draw_stands_the_commit_down() {
 
     // `topic add` answered after the draw: the Commit stands down, and the
     // next attempt, which draws it, commits.
-    let (reply, _) = crate::fabric::cmd_topic(&ctx, "add news");
+    let reply = crate::fabric::cmd_topic(&ctx, "add news");
     assert!(reply.starts_with("OK news since=head added=1"), "{reply}");
     assert!(!exact_activity(&mut app), "the opt-in is in no manifest");
     arm(&mut app);
     assert!(exact_activity(&mut app), "drawn again, it is carried");
-    let (reply, _) = crate::fabric::cmd_topic(&ctx, "drop news");
+    let reply = crate::fabric::cmd_topic(&ctx, "drop news");
     assert!(reply.starts_with("OK news dropped=1"), "{reply}");
     assert!(!exact_activity(&mut app), "nor is the drop");
     arm(&mut app);
@@ -867,7 +869,7 @@ fn a_topic_change_issued_during_the_commit_waits_for_the_attempt() {
     {
         let answered = std::sync::Arc::clone(&answered);
         std::thread::spawn(move || {
-            let reply = crate::fabric::cmd_topic(&waiting, "add news").0;
+            let reply = crate::fabric::cmd_topic(&waiting, "add news");
             answered.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tx.send(reply);
         });

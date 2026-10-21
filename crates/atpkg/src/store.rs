@@ -2753,11 +2753,13 @@ mod tests {
         // root-owned and not group/other-writable on this machine.
         let Ok(meta) = std::fs::symlink_metadata("/usr/lib") else {
             let _ = std::fs::remove_dir_all(&home);
-            return;
+            aterm_uds::host::could_not_run("no /usr/lib here to stand in as a system chain");
         };
         if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
             let _ = std::fs::remove_dir_all(&home);
-            return;
+            aterm_uds::host::could_not_run(
+                "/usr/lib here is not root-owned and closed to group and other writes",
+            );
         }
         // A non-existent leaf is the tail the installer creates (as root).
         let prefix = Path::new("/usr/lib/aterm-pkg-system-prefix-test");
@@ -2778,22 +2780,32 @@ mod tests {
     }
 
     /// The system shape is an AND over the whole chain: one world-writable ancestor
-    /// (`/private/tmp`, root-owned and `0777`) fails the prefix closed to the default even
+    /// (the system's temporary root, root-owned and `0777` or `1777`: macOS's
+    /// `/private/tmp`, elsewhere `/tmp`) fails the prefix closed to the default even
     /// though root would create the leaf.
     #[cfg(unix)]
     #[test]
     fn world_writable_system_ancestor_is_refused() {
         use std::os::unix::fs::MetadataExt as _;
         let home = temp_home("wwancestor");
-        let Ok(meta) = std::fs::symlink_metadata("/private/tmp") else {
+        // A real directory, not macOS's `/tmp` link to `/private/tmp`.
+        let Some((root, meta)) = ["/private/tmp", "/tmp"].into_iter().find_map(|root| {
+            std::fs::symlink_metadata(root)
+                .ok()
+                .filter(std::fs::Metadata::is_dir)
+                .map(|meta| (root, meta))
+        }) else {
             let _ = std::fs::remove_dir_all(&home);
-            return;
+            aterm_uds::host::could_not_run("no /private/tmp or /tmp directory here");
         };
-        if meta.mode() & 0o022 == 0 {
+        if meta.uid() != 0 || meta.mode() & 0o022 == 0 {
             let _ = std::fs::remove_dir_all(&home);
-            return; // not the world-writable fixture this test needs
+            aterm_uds::host::could_not_run(format!(
+                "{root} here is not the root-owned world-writable fixture this test needs"
+            ));
         }
-        let prefix = Path::new("/private/tmp/aterm-pkg-should-not-be-trusted");
+        let prefix = Path::new(root).join("aterm-pkg-should-not-be-trusted");
+        let prefix = prefix.as_path();
         assert_eq!(
             vet_prefix(Some(prefix), &home),
             default_prefix(&home),
@@ -2933,15 +2945,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn trusted_system_prefix_that_we_cannot_write_falls_back_to_default() {
-        if crate::platform::our_uid() == 0 {
-            return; // root can write anywhere; the case does not exist.
-        }
+        aterm_uds::host::could_not_run_as_root("a prefix this user cannot write");
         let home = temp_home("unwritable-system");
-        // `/usr` is outside $HOME, root-owned and not group/other-writable (trusted), and
-        // not writable by an ordinary user.
-        let prefix = PathBuf::from("/usr/local/aterm-nux-probe/pkg");
+        // `/usr/lib` is outside $HOME, root-owned and not group/other-writable (trusted),
+        // and not writable by an ordinary user (`/usr/local` is a Homebrew user's own on an
+        // Intel Mac).
+        let prefix = PathBuf::from("/usr/lib/aterm-nux-probe/pkg");
         if !system_chain_trusted(&prefix) {
-            return; // a machine with a non-standard /usr chain proves nothing here.
+            let _ = std::fs::remove_dir_all(&home);
+            aterm_uds::host::could_not_run(
+                "/usr/lib here is not a trusted system chain (root-owned, closed to writes)",
+            );
         }
         assert!(
             !caller_can_use_prefix(&prefix),
@@ -2962,9 +2976,7 @@ mod tests {
     #[test]
     fn an_unwritable_prefix_whose_shims_cannot_be_stat_ed_is_still_usable() {
         use std::os::unix::fs::PermissionsExt as _;
-        if crate::platform::our_uid() == 0 {
-            return; // root reads and writes through mode 0; the case does not exist.
-        }
+        aterm_uds::host::could_not_run_as_root("a mode-0 prefix");
         let prefix = crate::testdir::dir("atpkg-shared-");
         let holder = prefix.join("store/ay/17/bin");
         std::fs::create_dir_all(&holder).unwrap();

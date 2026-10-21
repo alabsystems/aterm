@@ -575,11 +575,14 @@ fn a_record_the_broker_refuses_for_good_is_retired_and_the_queue_behind_it_lands
 /// session's mail for as long as its own record was refused.
 ///
 /// The staged refusal (`fail-post-publish` naming A) is the broker's own
-/// `ERR_REFUSED`, in place of A's publishes only. B's ask, and B's receipt for
-/// A's earlier ask, land while A's note and A's receipt are refused; once the
-/// refusal lifts, A's queue moves, in order. Negative control: on the previous
-/// drain B's ask never leaves (it answers `ERR fabric stale`), and B's receipt
-/// is never published.
+/// `ERR_REFUSED`, in place of A's publishes only. B's ask, B's receipt for A's
+/// earlier ask, and a note B posts once A's receipt is refused land while A's
+/// note and A's receipt are refused; once the refusal lifts, A's queue moves,
+/// in order. Negative control: a drain that ends at A's refused receipt
+/// (`drain_outbox`'s `stalled.insert` -> `return`) never reaches B's note,
+/// since the receipts drain before every post. A drain that ends at A's
+/// refused NOTE is not seen here: the endpoint lists the least recently listed
+/// session first (`cmd_outbox`), so B leads the next drain and lands anyway.
 #[test]
 fn a_record_refused_for_now_holds_back_only_its_own_session() {
     let w = World::boot_with(
@@ -605,9 +608,8 @@ fn a_record_refused_for_now_holds_back_only_its_own_session() {
         .expect("post answers OK <id>")
         .to_string();
 
-    // B IS AFTER A IN DRAIN ORDER, and is not held behind it.
-    // Landed, however slowly: the regression this holds never landed it while A's note
-    // was refused, and fails here by the hang detector.
+    // B IS NOT HELD BEHIND A: its ask lands while A's note is refused (waited
+    // for by the hang detector, never a latency bound).
     let (_, ask_off) = w.post_landed(&b, &a, "ask", "", "not-held");
     let in_flight = w.verb(&format!("@{a} inbox --peek"));
     assert!(
@@ -620,7 +622,7 @@ fn a_record_refused_for_now_holds_back_only_its_own_session() {
     );
 
     // AND THE RECEIPTS: A decides B's ask (refused, so it stays owed) and B
-    // decides A's (which lands, behind A's in the drain's order).
+    // decides A's (which lands).
     let id = until("B's ask to reach A", || harness::id_at_off(&w, &a, ask_off));
     let seen = w.verb(&format!("@{a} inbox seen {id} handled"));
     assert!(seen.ok(), "A marks B's ask: {}", seen.header());
@@ -640,6 +642,9 @@ fn a_record_refused_for_now_holds_back_only_its_own_session() {
             .any(|e| e.starts_with(&format!("ack re={ask_off} "))),
         "A's receipt is refused while the marker names A"
     );
+    // AND B'S MAIL STILL MOVES BEHIND A's REFUSED RECEIPT: every drain now
+    // lists that receipt, before any post.
+    w.post_landed(&b, &a, "note", "", "behind-a-refused-receipt");
 
     // THE REFUSAL LIFTS, and A's queue moves: its receipt lands, and a waiting
     // post lands behind the note that was held.

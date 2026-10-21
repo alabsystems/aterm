@@ -2913,3 +2913,7 @@ fn a_head_in_flight_is_counted_on_the_receipt_of_completed_checks_only() {
     );
     let _ = std::fs::remove_dir_all(&staging.root);
 }
+
+/// The app-container lane end to end, over real curl (`github_e2e_tests.rs`).
+#[path = "github_e2e_tests.rs"]
+mod e2e;

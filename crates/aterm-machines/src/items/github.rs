@@ -62,6 +62,18 @@ pub const GITHUB_FINGERPRINTS: [&str; 3] = [
 /// and only once it exists.
 pub const CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
 
+/// For a test that runs the real [`CLT_GIT`], as the code it checks does: COULD NOT RUN
+/// on a host without it (a Mac before the Command Line Tools; any other unix, where
+/// this crate builds but `aterm` never links it), never a spawn error read as a defect.
+#[cfg(test)]
+pub(crate) fn need_clt_git() {
+    if !Path::new(CLT_GIT).is_file() {
+        aterm_uds::host::could_not_run(format!(
+            "no {CLT_GIT} here (the Command Line Tools' git, which this code runs)"
+        ));
+    }
+}
+
 /// The item git's settings wait for (design §5's `after` edge).
 pub const CLT_ITEM: &str = "developer.command-line-tools";
 

@@ -46,7 +46,10 @@ pub use frame::{
     MAX_PAYLOAD_LEN,
 };
 pub use hash::{
-    crc32_ieee, crc32_ieee_update, crc_table_index_clamp, crc_table_index_in_bounds, fnv1a_64,
+    crc32_ieee, crc32_ieee_update, crc32_is_ieee_poly, crc32_poly_select, crc_table_index_clamp,
+    crc_table_index_in_bounds, fnv1a_64, fnv1a_64_is_init, fnv1a_64_is_prime, fnv1a_64_mix_u64,
+    fnv1a_64_mul_prime, fnv1a_64_state_matches, fnv1a_64_update, CRC32_IEEE_POLY, FNV1A_64_INIT,
+    FNV1A_64_PRIME,
 };
 pub use offset::{offset_advance_monotone, offset_precedes_or_eq, Offset};
 pub use partition::{

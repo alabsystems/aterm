@@ -8,17 +8,15 @@ const DAY: i64 = 20_002;
 const HOUR: u64 = 3_600_000;
 
 /// A day whose Cruise arm was busy `busy_ms` and saw `boxes` boxes in
-/// bucket 3, and `boxes` landings, one quiet end and a done.
+/// bucket 3, and `boxes` landings.
 fn day_of(day: i64, first_unix_ms: i64, busy_ms: u64, boxes: u32) -> AbDay {
     let mut kept = AbDay::new(day, first_unix_ms);
     kept.arms[AbArm::Cruise.index()].busy_ms = busy_ms;
     kept.arms[AbArm::Off.index()].at_prompt_ms = busy_ms / 2;
-    kept.arms[AbArm::Land.index()].finished_ms = 7;
+    kept.arms[AbArm::Land.index()].landed_ms = 7;
     kept.holds[0][0][3] = boxes;
     kept.holds[2][1][19] = 1;
     kept.ends.landed = boxes;
-    kept.ends.quiet = 1;
-    kept.ends.done = 1;
     kept.ends.landing[10] = boxes;
     kept
 }
@@ -205,8 +203,11 @@ struct StrictBookFile {
 /// "Schema-1 additive fields"): a book written now round-trips its ends; a
 /// file written before them reads with none; a file written now parses in
 /// the older build's `DayFile`, which skips them, its other numbers whole;
-/// and a day with no end writes no `ends` at all. NEGATIVE CONTROL: the
-/// older struct with `deny_unknown_fields` refuses the newer file.
+/// and a day with no end writes no `ends` at all. An older build's `done`
+/// and `quiet` counts (Cruise's dones and Land's quiet ends, neither of
+/// which FOREVER CRUISE / FOREVER LAND has) are passed over, its landings
+/// read whole. NEGATIVE CONTROL: the older struct with `deny_unknown_fields`
+/// refuses the newer file.
 #[test]
 fn the_ends_read_across_builds() {
     let state = aterm_tempfile::tempdir().expect("scratch state");
@@ -252,4 +253,19 @@ fn the_ends_read_across_builds() {
     write_own(state.path(), "3-3.json", &ring_of(&[quiet]), DAY, 0).unwrap();
     let text = std::fs::read_to_string(dir_of(state.path()).join("3-3.json")).unwrap();
     assert!(!text.contains("\"ends\""), "{text}");
+    // An older build's done and quiet counts are passed over.
+    let older_ends = aterm_tempfile::tempdir().expect("scratch state");
+    let two = day_of(DAY, 100, HOUR, 2);
+    write_own(older_ends.path(), "4-4.json", &ring_of(&[two]), DAY, 0).unwrap();
+    let path = dir_of(older_ends.path()).join("4-4.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let with_old = text.replace(
+        "\"ends\":{\"landed\":2",
+        "\"ends\":{\"done\":3,\"quiet\":4,\"landed\":2",
+    );
+    assert_ne!(with_old, text, "the older counts are in: {text}");
+    std::fs::write(&path, &with_old).unwrap();
+    let read = read_others(older_ends.path(), "9-9.json", DAY);
+    assert_eq!(read, [two], "the landings stand, the rest passed over");
+    assert_eq!(read[0].ends.landed, 2);
 }

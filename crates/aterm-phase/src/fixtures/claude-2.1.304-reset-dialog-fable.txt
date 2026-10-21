@@ -1,0 +1,13 @@
+# claude-code 2.1.304 · COMPOSED 2026-10-19, never captured: the texts are the bundle's (byte offsets into the store's 2.1.304 binary, docs/SPEC-claude-accounts-resets-2026-10-02.md §0: the grant rows' label `Ug.label` @225876351 filled by `Kg` @225879482, the kinds' names `X()` @244629154; the dialog's rows `so()` @257500437: the stop row, one row per kind on offer @257504167 (the wall's own kind first, `Xe` @244629033), the wait row, the credits row; at a Fable limit the Fable kind first (`Kn` @244628895)), the frame is the wall dialog's hand-built one (claude-2.1.287-usage-limit-dialog-fullscreen-panel.txt; the same Dialog component in 2.1.304), the values are invented · OPEN: replace with a capture (SPEC §6) · the usage-limit dialog at a Fable limit: the Fable reset's row first, then the weekly reset's
+⏺ Suites are running; I'll report the number when it lands.
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Use a Fable reset (1 left, until Oct 5)
+     3. Use a weekly reset (1 left, until Oct 9)
+     4. Wait here, then continue automatically at Oct 9 at 5am
+     5. Switch to usage credits
+
+   Enter to confirm · Esc to cancel

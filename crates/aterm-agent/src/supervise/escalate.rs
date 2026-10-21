@@ -19,7 +19,8 @@
 //! loop watching behind another supervisor's claim writes none.
 
 use super::super::journal::{
-    AGAIN_ADOPTED, AGAIN_RETRY, ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, ESCALATED_BEHIND,
+    AGAIN_ADOPTED, AGAIN_RETRY, ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, CLEARED_NEEDS,
+    ESCALATED_BEHIND, NEEDS,
 };
 use super::*;
 
@@ -508,6 +509,152 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
+/// THE KEY [`Session::needs_told`] HOLDS FOR A NEEDS ENTRY A LOOP BEFORE THIS
+/// ONE LEFT (`lifecycle.rs`'s `reconcile`: a crash, a kill, an update's old
+/// loop that ended before its last act): no set of needs keys to `0`
+/// ([`super::policy::needs::needs_key`]), so the first set this loop puts up
+/// replaces that entry, and the first point with none standing takes it down
+/// ([`NEEDS_LEFT_DOWN`]), as an Off park and the loop's end take down one of
+/// this loop's own.
+pub(super) const NEEDS_LEFT: u64 = 0;
+
+/// Why the entry a loop before this one left ([`NEEDS_LEFT`]) is taken
+/// down at this loop's first point: `CLEARED seq=<n> needs attention=<reply>
+/// no need stands at the loop's start`.
+pub(super) const NEEDS_LEFT_DOWN: &str = "no need stands at the loop's start";
+
+/// Whether a `meta` reply's `attention_kinds=` (`<ask|wait|->:<owner>` per
+/// entry, comma-joined, oldest first; an owner may hold a `:`) names an
+/// entry of `owner`.
+pub(super) fn kinds_name_owner(kinds: &str, owner: &str) -> bool {
+    kinds
+        .split(',')
+        .any(|entry| entry.split_once(':').is_some_and(|(_, o)| o == owner))
+}
+
+/// THE NEEDS ENTRY'S TEXT ([`Session::sync_needs`]): `<program> needs you:
+/// <first need, cut at 64 cells>[ (+N more)] — carrying on`, on one line and
+/// within the server's keyed cap ([`ATTENTION_BYTES`]). aterm's own words
+/// around the worker's; the need itself is the worker's line, sanitized and
+/// cut by the policy (`policy::needs::needs_you`) and here by cells.
+pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
+    let first = needs.first().map_or("", String::as_str);
+    let more = match needs.len() {
+        0 | 1 => String::new(),
+        n => format!(" (+{} more)", n - 1),
+    };
+    fit_bytes(
+        &format!(
+            "{program} needs you: {}{more} — carrying on",
+            clip_to(first, SUBJECT_CELLS)
+        ),
+        ATTENTION_BYTES,
+    )
+}
+
+impl<C: Ctl> Session<'_, C> {
+    /// THE WORKER'S NEEDS YOU, ON THE PERSON'S SCREEN (FOREVER CRUISE /
+    /// FOREVER LAND: loud, never blocking): where the needs the policy holds
+    /// standing ([`TurnEndState::standing_needs`], its set's
+    /// [`TurnEndState::needs_key`]) differ from the set this loop last put
+    /// up ([`Session::needs_told`]), the `needs` owner's entry is set —
+    /// `meta set attention owner=needs kind=ask <text>`
+    /// ([`needs_attention_text`]), journaled `NEEDS seq=<n> count=<k>
+    /// attention=<reply> <first need>`, never `ESCALATED`: nothing is handed
+    /// over and the worker carries on — or, none standing, taken down
+    /// ([`Self::needs_down`]; an entry a loop before this one left,
+    /// [`NEEDS_LEFT`], with [`NEEDS_LEFT_DOWN`]). Called as each point is
+    /// folded in and again as it is carried out (`turn_end_loop.rs`'s
+    /// `task_edge_with`), so it
+    /// goes up at the point itself, whatever back-off or grace the point's
+    /// act waits on. Not under Autopilot Off (an Off park takes it down);
+    /// and never beside a proven self-claim or behind another supervisor's
+    /// claim ([`Session::needs_not_ours`]) — codex-alab raises its own, and
+    /// this loop neither writes nor unsets that owner's entry there. A
+    /// request the connection lost is asked again at the next point; any
+    /// other reply is the set told.
+    pub(super) fn sync_needs(
+        &mut self,
+        screen: &Screen,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        if self.needs_not_ours() {
+            return Ok(());
+        }
+        let seq = screen.seq;
+        let key = self.turn_end.needs_key();
+        if key == 0 {
+            let why = if self.needs_told == Some(NEEDS_LEFT) {
+                NEEDS_LEFT_DOWN
+            } else {
+                "none stands now"
+            };
+            return self.needs_down(seq, why, review);
+        }
+        if self.needs_told == Some(key) || self.autopilot(opts) == Autopilot::Off {
+            return Ok(());
+        }
+        let needs = self.turn_end.standing_needs().to_vec();
+        let program = self.reader(&screen.rows).program().name();
+        let mut text = needs_attention_text(program, &needs);
+        let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
+        let kind = format!("kind={}", aterm_types::needs::AttentionKind::Ask.word());
+        let mut r = self.call(&["meta", "set", "attention", &owner, &kind, &text])?;
+        if let Some(cap) = refused_cap(&r, &text) {
+            text = fit_bytes(&text, cap);
+            r = self.call(&["meta", "set", "attention", &owner, &kind, &text])?;
+        }
+        if r.lost() {
+            return Ok(());
+        }
+        self.needs_told = Some(key);
+        let first = needs.first().map_or("", String::as_str);
+        review.note(&format!(
+            "{NEEDS} seq={seq} count={} attention={} {}",
+            needs.len(),
+            reply_word(&r),
+            clip_to(first, SUBJECT_CELLS)
+        ));
+        Ok(())
+    }
+
+    /// THE NEEDS ENTRY TAKEN DOWN, `why`: none stands now, an Off park, the
+    /// loop's end — `meta unset attention owner=needs`, journaled `CLEARED
+    /// seq=<n> needs attention=<reply> <why>` ([`CLEARED_NEEDS`]), which no
+    /// reader takes for a badge of an escalation. Nothing this loop put up:
+    /// nothing is said. Beside a proven self-claim or behind another
+    /// supervisor's claim nothing is unset ([`Session::needs_not_ours`]:
+    /// that owner's entry may be the self-claim's own, an Off park's
+    /// given-back claim and the loop's end included): the loop only forgets
+    /// its set.
+    pub(super) fn needs_down(
+        &mut self,
+        seq: u64,
+        why: &str,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        if self.needs_told.is_none() {
+            return Ok(());
+        }
+        if self.needs_not_ours() {
+            self.needs_told = None;
+            return Ok(());
+        }
+        let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
+        let r = self.call(&["meta", "unset", "attention", &owner])?;
+        if r.lost() {
+            return Ok(());
+        }
+        self.needs_told = None;
+        review.note(&format!(
+            "CLEARED seq={seq} {CLEARED_NEEDS} attention={} {why}",
+            reply_word(&r)
+        ));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +887,23 @@ mod tests {
             &turn(Phase::Prompt, f::bash_one_row()),
         );
         assert_eq!(kind, "bash");
+    }
+
+    /// A `meta` reply's `attention_kinds=` names the `needs` owner's entry
+    /// by its owner alone, whatever its kind or place, an owner with a `:`
+    /// read whole. NEGATIVE CONTROLS: other owners, an owner that only begins
+    /// or ends with the word, and no entries at all name none.
+    #[test]
+    fn the_kinds_field_names_an_owner_by_its_whole_name() {
+        for yes in [
+            "ask:needs",
+            "-:supervisor,ask:needs",
+            "wait:-,-:needs,ask:x",
+        ] {
+            assert!(kinds_name_owner(yes, "needs"), "{yes}");
+        }
+        for no in ["ask:supervisor,-:-", "ask:needs-2", "ask:a:needs", "-", ""] {
+            assert!(!kinds_name_owner(no, "needs"), "{no}");
+        }
     }
 }

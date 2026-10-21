@@ -2179,7 +2179,11 @@ impl CursorGlow {
     /// at the flush as the keyless hop it was) or a fresh delivered insert (a
     /// dropped path takes Ink's park + rewrite route too). Any width: Ink parks
     /// by one and two cells before parking wide, and holding changes no
-    /// verdict, only defers the v2 `Move` by at most one stamp window.
+    /// verdict, only defers the v2 `Move` by at most one stamp window. A
+    /// cross-row park stands at most [`CROSS_ROW_PARK_ROWS_MAX`] rows from the
+    /// row it left, off a fold, with the source it left intact; past the
+    /// adjacent row only where the program's print ended
+    /// ([`Self::landing_ends_a_print`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "the observed move, its clock, style and pane geometry determine park eligibility"
@@ -2211,7 +2215,8 @@ impl CursorGlow {
             {
                 return false;
             }
-        } else if pr.abs_diff(cr) != 1
+        } else if pr.abs_diff(cr) > CROSS_ROW_PARK_ROWS_MAX
+            || (pr.abs_diff(cr) > 1 && !self.landing_ends_a_print(cr, cc))
             || self.fold_shape(pr, pc, cr, cc, geom).is_some()
             || self
                 .coalesced_fold_shape(pr, pc, cr, cc, now, geom)
@@ -2230,6 +2235,19 @@ impl CursorGlow {
         // it is refused like the keyless control) or a delivered insert
         // awaiting its echo.
         self.typed_credits_within(now) >= 1 || self.insert.fresh(now).is_some()
+    }
+
+    /// Whether the caret stands where the program's latest print run ended
+    /// ([`Self::observe_print_anchor`], one past its last glyph): the caret a
+    /// repaint left on the row it was writing. A footer or status repaint two
+    /// or three rows from the composer ends its run there; a motion key's
+    /// jump (vim's `}`, `2j`, `3k`, `L`) is a bare cursor move whose landing
+    /// no print ended at, so it is judged on its own frame instead of held
+    /// ([`Self::park_candidate`]). An unwired host reports no anchor and
+    /// holds only the adjacent row's park.
+    pub(super) fn landing_ends_a_print(&self, row: u16, col: u16) -> bool {
+        self.print_anchor
+            .is_some_and(|(r, c, _)| r == row && c == col)
     }
 
     /// A cross-row park needs content evidence: the exact source prefix sampled
@@ -2882,6 +2900,19 @@ impl CursorGlow {
         lane: SpawnLane,
         call: SpawnCall,
     ) -> bool {
+        // A line pasted with its line break ([`Self::line_insert_echo`]): its
+        // echo draws the line and the break's new line in one frame, the caret
+        // going down a row to the new line's start. The insert pays for its
+        // line, laid as its sweep on its own row; the rest of the move, from the
+        // line's end to the new line, is judged as any other (the line's band
+        // then leaves at its rest, as a typed line's does when the hand goes
+        // down a line), and its verdict is the move's.
+        if lane == SpawnLane::Visible
+            && let Some((ins, end)) = self.line_insert_echo((pr, pc), (cr, cc), now, cfg, geom)
+        {
+            self.lay_insert(pr, pc, pr, end, ins, now);
+            return self.spawn_judged(pr, end, cr, cc, now, cfg, geom, lane, call);
+        }
         // The delivered insert (Rainbow Kitty only; `move_licensed` stays the
         // classic trail's lockstep contract). A file drop, ⌘V, the `paste`
         // verb, a Tab completion or ⌃V is the user's gesture, but its echo is

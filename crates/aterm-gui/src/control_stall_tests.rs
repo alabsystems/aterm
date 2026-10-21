@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::CtlStream;
 
-use super::control_lanes::{Census, LaneLimits, LaneReader, LaneService, Lanes, lane_reader};
+use super::control_lanes::{Census, LaneLimits, LaneReader, LaneService, Lanes, Outbox, Unread};
 use super::{
-    AUTH_READ_TIMEOUT, ActiveHandle, MAX_REQUEST_LINE, Scope, ServeDisposition,
+    AUTH_READ_TIMEOUT, ActiveHandle, MAX_REQUEST_LINE, Request, Scope, ServeDisposition,
     authenticate_connection, control_denials, read_request_line,
 };
 
@@ -76,18 +76,20 @@ impl LaneService for Stub {
 
     fn serve_line(
         &self,
-        line: String,
+        request: Request,
         _scope: Scope,
         _stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut Outbox,
     ) -> Option<ServeDisposition> {
+        let line = request.line();
         if line == "quit" {
             return Some(ServeDisposition::Close);
         }
         if line == "big" {
-            out.resize(out.len() + BIG, b'x');
-            out.push(b'\n');
+            let mut big = vec![b'x'; BIG];
+            big.push(b'\n');
+            out.push_owned(big);
             return None;
         }
         if let Some(n) = line.strip_prefix("feed-bin ") {
@@ -105,7 +107,8 @@ impl LaneService for Stub {
         None
     }
 
-    fn frame_header(&self, line: &str, _scope: Scope, out: &mut Vec<u8>) -> bool {
+    fn frame_header(&self, request: &Request, _scope: Scope, out: &mut Outbox) -> bool {
+        let line = request.line();
         self.headers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -117,11 +120,11 @@ impl LaneService for Stub {
         true
     }
 
-    fn is_wait(&self, _line: &str, _scope: Scope) -> bool {
+    fn is_wait(&self, _request: &Request, _scope: Scope) -> bool {
         false
     }
 
-    fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
+    fn subscribe(&self, _request: Request, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
 
@@ -148,8 +151,9 @@ impl Rig {
             wait: 0,
             inline: 0,
             open,
+            subscriptions: 1,
         });
-        assert_eq!(lanes.start(), 1, "the request lane started");
+        assert_eq!(lanes.start().rpc, 1, "the request lane started");
         let stub = Arc::new(Stub::default());
         lanes.publish(Arc::clone(&stub) as Arc<dyn LaneService>);
         Self { lanes, stub }
@@ -417,7 +421,8 @@ fn an_over_long_line_is_answered_why_then_closed() {
         let handshake = scope.spawn(move || {
             let active: ActiveHandle = Arc::new(Mutex::new(None));
             let denials = control_denials::AuthDenials::new();
-            let mut reader = lane_reader(&server, Vec::new());
+            let mut unread = Unread::default();
+            let mut reader = LaneReader::new(&server, &mut unread);
             let deadline = Instant::now() + AUTH_READ_TIMEOUT;
             authenticate_connection(&server, &mut reader, TOKEN, &active, &denials, deadline)
                 .is_some()
@@ -442,25 +447,24 @@ impl LaneService for FramedWaits {
 
     fn serve_line(
         &self,
-        line: String,
+        request: Request,
         scope: Scope,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut Outbox,
     ) -> Option<ServeDisposition> {
-        match line.split_once(" paste-bin ") {
-            Some((_, n)) => {
-                Stub::default().serve_line(format!("feed-bin {n}"), scope, stream, reader, out)
-            }
-            None => Stub::default().serve_line(line, scope, stream, reader, out),
-        }
+        let request = match request.line().split_once(" paste-bin ") {
+            Some((_, n)) => Request::parse(format!("feed-bin {n}")),
+            None => request,
+        };
+        Stub::default().serve_line(request, scope, stream, reader, out)
     }
 
-    fn is_wait(&self, line: &str, _scope: Scope) -> bool {
-        line.contains(" paste-bin ")
+    fn is_wait(&self, request: &Request, _scope: Scope) -> bool {
+        request.line().contains(" paste-bin ")
     }
 
-    fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
+    fn subscribe(&self, _request: Request, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
 
@@ -482,8 +486,9 @@ fn a_framed_wait_refused_busy_closes_and_serves_none_of_its_body() {
             wait: 0,
             inline: 0,
             open,
+            subscriptions: 1,
         });
-        assert_eq!(lanes.start(), 1, "the request lane started");
+        assert_eq!(lanes.start().rpc, 1, "the request lane started");
         lanes.publish(Arc::new(FramedWaits) as Arc<dyn LaneService>);
         let (client, server) = CtlStream::pair().expect("socket pair");
         client
@@ -537,24 +542,24 @@ impl LaneService for Forwarder {
 
     fn serve_line(
         &self,
-        line: String,
+        request: Request,
         scope: Scope,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-        out: &mut Vec<u8>,
+        out: &mut Outbox,
     ) -> Option<ServeDisposition> {
-        if super::try_proxy_forward(&line, scope, &self.store, &self.dir, stream, reader) {
+        if super::try_proxy_forward(&request, scope, &self.store, &self.dir, stream, reader) {
             return Some(ServeDisposition::Close);
         }
-        out.extend_from_slice(format!("OK {line}\n").as_bytes());
+        out.extend_from_slice(format!("OK {}\n", request.line()).as_bytes());
         None
     }
 
-    fn is_wait(&self, line: &str, scope: Scope) -> bool {
-        super::is_wait_request(line, scope, &self.store)
+    fn is_wait(&self, request: &Request, scope: Scope) -> bool {
+        super::is_wait_request(request, scope, &self.store)
     }
 
-    fn subscribe(&self, _line: String, _scope: Scope, _stream: CtlStream) {}
+    fn subscribe(&self, _request: Request, _scope: Scope, _stream: CtlStream) {}
 
     fn release(&self, _id: u64) {}
 
@@ -563,36 +568,46 @@ impl LaneService for Forwarder {
     }
 }
 
-/// A stand-in sibling instance on `listener`: it answers a forward's connect
-/// probe (`TOKEN <token> version`) and the subscription the forward hands it,
-/// and holds that subscription until its peer hangs up. A connection that
-/// says nothing (the forward's liveness probe) is dropped. Returns the
-/// subscriptions it served.
-fn stand_in_sibling(listener: &std::os::unix::net::UnixListener) -> usize {
+/// A stand-in sibling instance on `listener`, hosting the sessions in
+/// `store`: it answers a forward's connect probe (`TOKEN <token> version`) and
+/// serves the line the forward sends next with the genuine subscribe handler
+/// ([`super::run_subscribe_socket`]), which holds the subscription until its
+/// peer hangs up. A connection that says nothing is dropped. Returns the
+/// requests it handed the handler.
+fn stand_in_sibling(listener: &std::os::unix::net::UnixListener, store: &super::Store) -> usize {
+    let active: ActiveHandle = Arc::new(Mutex::new(None));
     let mut served = 0;
     while served == 0 {
-        let Ok((conn, _)) = listener.accept() else {
+        let Ok((mut conn, _)) = listener.accept() else {
             return served;
         };
         let _ = conn.set_read_timeout(Some(HANG));
-        let mut reader = BufReader::new(&conn);
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
-            let answer = if line.starts_with("TOKEN ") && line.trim_end().ends_with(" version") {
-                "OK version\n"
-            } else if line.starts_with("subscribe ") {
-                served += 1;
-                "OK subscribe 1\n"
-            } else {
-                "ERR unexpected\n"
-            };
-            if (&conn).write_all(answer.as_bytes()).is_err() {
-                break;
-            }
-            line.clear();
-        }
+        let Some(line) = line_after_probe(&conn) else {
+            continue;
+        };
+        served += 1;
+        let head = aterm_types::control_request::head(&line);
+        super::run_subscribe_socket(head, &active, store, Scope::Owner, &mut conn);
     }
     served
+}
+
+/// The first line on `conn` past the forward's connect probe, which it answers,
+/// without its newline; `None` when the connection ends first.
+fn line_after_probe(conn: &CtlStream) -> Option<String> {
+    let mut reader = BufReader::new(conn);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if !reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+            return None;
+        }
+        let request = line.strip_suffix('\n').unwrap_or(&line);
+        if !(request.starts_with("TOKEN ") && request.ends_with(" version")) {
+            return Some(request.to_string());
+        }
+        (&*conn).write_all(b"OK version\n").ok()?;
+    }
 }
 
 /// A scratch directory, removed when the test ends, failed or not.
@@ -610,19 +625,21 @@ impl Drop for ScratchDir {
 /// watchers of another window's sessions held every request lane: every other
 /// client was answered `ERR control server busy; retry` while they watched.
 /// Here the genuine lanes, classifier, forward and relay carry one such
-/// subscription to a stand-in sibling, with ONE request lane: the relay runs on
-/// a wait lane, and a fresh client is answered while it lives. So does a path
-/// spelling of the sid, which reaches the same `graph/<sid>` entry.
+/// subscription to a stand-in sibling that serves it with the genuine
+/// subscribe handler, with ONE request lane: the relay runs on a wait lane,
+/// and a fresh client is answered while it lives. So does a line the request
+/// grammar reads the same with tabs for spaces, which a sibling hop forwards
+/// as written: the sibling's handler acks it too.
 #[test]
 fn a_relayed_subscription_keeps_no_request_lane() {
     relay_one_subscription(0, |sid| format!("subscribe @{sid} events"));
-    relay_one_subscription(1, |sid| format!("subscribe @./{sid} events"));
+    relay_one_subscription(1, |sid| format!("subscribe\t@{sid}\tevents"));
 }
 
 /// One run of [`a_relayed_subscription_keeps_no_request_lane`]: `spell` writes
 /// the subscription for the sibling's session id.
 fn relay_one_subscription(run: u32, spell: fn(&str) -> String) {
-    use aterm_session::{LaunchNonce, SessionId};
+    use aterm_session::LaunchNonce;
     // Short: the socket path, canonicalized under `/private`, must fit a
     // `sockaddr_un`.
     let dir = std::env::temp_dir().join(format!("aterm-rl{run}-{}", std::process::id()));
@@ -632,22 +649,29 @@ fn relay_one_subscription(run: u32, spell: fn(&str) -> String) {
     let sock = dir.join("aterm-77101.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the sibling");
     std::fs::write(dir.join("aterm-77101.token"), "cafe0123\n").expect("its token");
-    let sid = SessionId::generate();
+    let hosted = crate::session_store::test_handle(0);
+    let sid = hosted.sid.clone();
+    let sibling_store = crate::session_store::new_store();
+    sibling_store
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .register(hosted);
     crate::proxy::write_graph_entry(
         &dir,
         &sid,
         &sock.to_string_lossy(),
         &LaunchNonce::generate(),
     );
-    let sibling = std::thread::spawn(move || stand_in_sibling(&listener));
+    let sibling = std::thread::spawn(move || stand_in_sibling(&listener, &sibling_store));
 
     let lanes = Lanes::new(LaneLimits {
         rpc: 1,
         wait: 1,
         inline: 0,
         open: 16,
+        subscriptions: 1,
     });
-    assert_eq!(lanes.start(), 1, "the request lane started");
+    assert_eq!(lanes.start().rpc, 1, "the request lane started");
     lanes.publish(Arc::new(Forwarder {
         store: crate::session_store::new_store(),
         dir: dir.clone(),
@@ -813,7 +837,8 @@ fn a_dribbled_handshake_ends_at_its_deadline() {
     let handshake = std::thread::spawn(move || {
         let active: ActiveHandle = Arc::new(Mutex::new(None));
         let denials = control_denials::AuthDenials::new();
-        let mut reader = lane_reader(&server, Vec::new());
+        let mut unread = Unread::default();
+        let mut reader = LaneReader::new(&server, &mut unread);
         let deadline = Instant::now() + Duration::from_millis(200);
         let got = authenticate_connection(&server, &mut reader, TOKEN, &active, &denials, deadline);
         (got.is_some(), Instant::now() >= deadline)

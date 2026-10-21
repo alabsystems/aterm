@@ -47,6 +47,16 @@ pub use astream_broker::AnyStream as Stream;
 /// (`BrokenPipe`) and the caller reconnects. A subscription wants `None`, since
 /// parking in `recv` is its normal state, until the broker's first idle mark arms a
 /// liveness bound through this same closer (`Subscription::recv_live`).
+///
+/// A subscriber re-bounds with [`Closer::set_read_timeout`] directly, `?` and all,
+/// even on a connection the broker may ALREADY have hung up (it answered and
+/// closed, refused a subscription, or marked a tail and went away). macOS answers
+/// `EINVAL` for a socket option on a socket shut down both ways, and astream takes
+/// that as nothing to bound when a zero-wait poll of the socket sees both
+/// directions ended: the reads after it return what the broker sent, then end of
+/// stream. Any other refusal stays the caller's. The cause and its tests are
+/// astream's; `a_subscription_whose_broker_already_hung_up_reads_its_mail_then_the_close`
+/// holds the pinned astream to it for the re-bounds here.
 pub use astream_broker::Closer;
 
 /// One broker connection with its transport erased: one code path per verb, not one
@@ -151,7 +161,7 @@ pub const POST_PAGE: u32 = 256;
 /// std has no bounded Unix connect, and it fails at once when nothing listens.
 ///
 /// A SUBSCRIBER lifts only the READ deadline once its subscription is open
-/// ([`bound_reads`]`(&closer, None)`): parking in `recv` with nothing to deliver
+/// (`closer.set_read_timeout(None)`): parking in `recv` with nothing to deliver
 /// is its normal state, and a subscription writes nothing after its request.
 ///
 /// astream's [`astream_broker::connect`] does the work. It is the only connect
@@ -167,29 +177,6 @@ pub fn connect(endpoint: &str, deadline: Duration) -> io::Result<(Conn, Closer)>
     closer.set_read_timeout(Some(deadline))?;
     closer.set_write_timeout(Some(deadline))?;
     Ok((conn, closer))
-}
-
-/// Re-bound how long reads on `closer`'s connection may park — `SO_RCVTIMEO`, as
-/// [`Closer::set_read_timeout`]; `None` lifts the bound — on a connection the broker
-/// may ALREADY have hung up: it answered and closed, refused a subscription, or went
-/// away between two requests.
-///
-/// A Unix socket whose peer closed is shut down in both directions, and macOS takes
-/// no option on such a socket: `setsockopt` fails `EINVAL`. Nothing is left to bound
-/// there — its reads return what the broker sent, then end of stream, and never park
-/// — so that refusal is not an error: the reads after it say what the broker sent and
-/// that it closed, where a bare "os error 22" said neither. Were `EINVAL` ever answered
-/// for another reason, the reads keep the bound they had, so none parks unbounded.
-///
-/// # Errors
-///
-/// The `setsockopt`, but for that refusal; a zero duration is `InvalidInput` (std's
-/// own refusal, which carries no OS error).
-pub fn bound_reads(closer: &Closer, deadline: Option<Duration>) -> io::Result<()> {
-    match closer.set_read_timeout(deadline) {
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
-        set => set,
-    }
 }
 
 /// The reconnect back-off floor and ceiling. §7: a bridge reconnects with jittered
@@ -230,9 +217,16 @@ impl Default for Backoff {
 
 impl Backoff {
     /// A dial or attach failed: how long to wait before the next one, which waits
-    /// twice as long, up to the ceiling.
+    /// twice as long, up to the ceiling. The jitter is a fresh CSPRNG draw.
     pub(crate) fn failed(&mut self) -> Duration {
-        let wait = random_u64().map_or(self.next, |r| jittered(self.next, r));
+        self.failed_with(random_u64())
+    }
+
+    /// [`Backoff::failed`] with the jitter drawn by the caller: `r`, or none at
+    /// all (`None`, the whole wait). The bridge draws through its door
+    /// ([`crate::fx::Fx::jitter`]), so a simulated world's back-off is its seed's.
+    pub(crate) fn failed_with(&mut self, r: Option<u64>) -> Duration {
+        let wait = r.map_or(self.next, |r| jittered(self.next, r));
         self.next = (self.next * 2).min(RECONNECT_MAX);
         wait
     }
@@ -247,12 +241,17 @@ impl Backoff {
     /// else the wait a failed attach gets ([`Self::failed`]). `None` too when no link
     /// was up, so one loss is waited out once.
     pub(crate) fn lost(&mut self, now: Instant) -> Option<Duration> {
+        self.lost_with(now, random_u64())
+    }
+
+    /// [`Backoff::lost`] with the jitter drawn by the caller ([`Backoff::failed_with`]).
+    pub(crate) fn lost_with(&mut self, now: Instant, r: Option<u64>) -> Option<Duration> {
         let up = self.up_since.take()?;
         if now.saturating_duration_since(up) >= LINK_STABLE {
             self.next = RECONNECT_MIN;
             None
         } else {
-            Some(self.failed())
+            Some(self.failed_with(r))
         }
     }
 }
@@ -267,7 +266,7 @@ fn jittered(b: Duration, r: u64) -> Duration {
 
 /// A jitter draw from the OS CSPRNG; `None` when it cannot be read, and the
 /// caller then waits the whole `b` — never a shorter wait.
-fn random_u64() -> Option<u64> {
+pub(crate) fn random_u64() -> Option<u64> {
     let mut raw = [0u8; 8];
     aterm_uds::rand::fill(&mut raw).ok()?;
     Some(u64::from_le_bytes(raw))
@@ -394,7 +393,9 @@ mod tests {
     /// re-bounds its reads (macOS: `EINVAL`, the socket is shut down both ways) is no
     /// error: the bound is set or lifted, and the subscription still reads the mail,
     /// then the close. The broker side runs on this thread and is closed before the
-    /// re-bound, so the interleaving is the one a race only sometimes produced.
+    /// re-bound, so the interleaving is the one a race only sometimes produced. astream's
+    /// `Closer` takes that refusal as nothing to bound, so this holds the pinned astream
+    /// to it for every re-bound here (the inbox, `fabric tail`, the presence view).
     #[test]
     fn a_subscription_whose_broker_already_hung_up_reads_its_mail_then_the_close() {
         use astream_broker::proto::{
@@ -437,9 +438,10 @@ mod tests {
         };
         write_frame(&mut broker, &encode_response(&mail)).expect("the mail");
         drop(broker);
-        bound_reads(&closer, Some(astream_broker::IDLE_MARK_DEADLINE))
+        closer
+            .set_read_timeout(Some(astream_broker::IDLE_MARK_DEADLINE))
             .expect("a hung-up socket has no read to bound");
-        bound_reads(&closer, None).expect("nor one to lift");
+        closer.set_read_timeout(None).expect("nor one to lift");
         match sub.recv_event().expect("the mail the broker sent") {
             Some(astream_broker::Event::Delivery {
                 offset: 7, body, ..
@@ -453,7 +455,8 @@ mod tests {
             "the broker hung up"
         );
         assert_eq!(
-            bound_reads(&closer, Some(Duration::ZERO))
+            closer
+                .set_read_timeout(Some(Duration::ZERO))
                 .expect_err("a zero bound is still refused")
                 .kind(),
             io::ErrorKind::InvalidInput

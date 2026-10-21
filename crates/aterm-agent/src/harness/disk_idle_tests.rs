@@ -421,6 +421,7 @@ fn the_removal_empties_each_profile_under_its_locks_and_keeps_the_rest() {
         now,
         threshold_days: 1,
         device: None,
+        volume: None,
     };
     let seen = now;
     // A second taker of the other profile's lock once the first is released.
@@ -501,6 +502,7 @@ fn the_removal_reads_the_clock_and_the_mount_table_again_under_the_locks() {
         now,
         threshold_days: 1,
         device: None,
+        volume: None,
     };
     let refused = target::reclaim_profiles(
         &target,
@@ -635,6 +637,7 @@ fn the_removal_takes_only_cargos_outputs_and_keeps_the_rest_of_a_profile() {
         now,
         threshold_days: 1,
         device: None,
+        volume: None,
     };
     let done =
         target::reclaim_profiles(
@@ -728,6 +731,7 @@ fn the_process_check_runs_under_the_locks_before_the_first_delete() {
         now,
         threshold_days: 1,
         device: None,
+        volume: None,
     };
     let order = std::cell::RefCell::new(Vec::new());
     let refused = target::reclaim_profiles_with(
@@ -935,6 +939,34 @@ fn links_are_resolved_only_on_local_mounts() {
             && unresolved_remote.iter().all(|refused| *refused)
             && unresolved_enumeration.iter().all(|refused| *refused),
         "UNKNOWN_INBOUND_LINK_MUST_KEEP_CANDIDATES: missing={missing:?}, cycle={cycle:?}, remote={unresolved_remote:?}, directories={unresolved_enumeration:?}"
+    );
+}
+
+/// A walk ends only on a local folder ([`resolve_local`]): `/` where the
+/// table calls its mount remote holds no component for a step to place, and
+/// resolves to nothing — as a link onto a remote root does, which ends the
+/// walk there (the old walk answered the root it ended on). NEGATIVE
+/// CONTROL: a local root resolves to itself. From the table alone: nothing
+/// is opened.
+#[test]
+fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
+    let root = |local: bool| aterm_sysprobe::volumes::Table {
+        mounts: vec![aterm_sysprobe::volumes::Mount {
+            on: PathBuf::from("/"),
+            from: "nas:/".to_owned(),
+            fstype: if local { "ext4" } else { "nfs" }.to_owned(),
+            local,
+            automounted: false,
+            read_only: false,
+            container: None,
+        }],
+        complete: true,
+        firmlinks: Vec::new(),
+    };
+    assert_eq!(resolve_local(Path::new("/"), &root(false)), None);
+    assert_eq!(
+        resolve_local(Path::new("/"), &root(true)),
+        Some(PathBuf::from("/"))
     );
 }
 

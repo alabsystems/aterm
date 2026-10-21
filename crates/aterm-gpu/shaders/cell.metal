@@ -575,3 +575,132 @@ fragment float4 fs_sprite_over(GlyphVsOut in [[stage_in]],
     float a = round(c.a * in.color.a * 255.0) / 255.0;
     return float4(s2l(tinted), a);
 }
+
+// ---------------------------------------------------------------- FX LAYERS
+// FX_LAYOUT: 0 => Uint16x4 (the slice rect), 1 => Sint16x2 (the item origin
+// mod 2^16), 2 => Uint16x2 (a sprite's dw, dh), 3 => Uint16x4 (the atlas
+// region; [w, 0, 0, 0] for Rect and Ramps), 4 => Uint32 (the absolute
+// palette entry), 5 => Uint32 (flags: bits 0-1 kind 0 Rect / 1 Ramps / 2
+// Sprite, bit 2 flip_x, bits 3-4 texels 0 Index8 / 1 Rgba8Premul / 2
+// Rgba8Straight, bits 8-15 an Index8 sprite's reach).
+//
+// Pixel law F (design §4.2), the WGSL `fs_fx` twin op for op: every operand
+// reaches the fragment [[flat]], the fragment addresses from its own pixel
+// p = floor(pos.xy) and the item's UNCLAMPED origin, so a slice cut anywhere
+// draws the bytes the CPU stamps. Texels are read by integer address (no
+// sampler, no float UV) and their bytes recovered with rint (a stored byte k
+// reads k/255). The origin is stored mod 2^16 and every slice lies inside its
+// item's box, whose sides are below 2^16, so (p - O) mod 2^16 is the
+// item-local pixel. Every palette and texel address is in range by
+// construction (renderer fx_gpu.rs), including after a discard.
+struct FxVsIn {
+    ushort4 rect_u [[attribute(0)]];
+    short2  origin [[attribute(1)]];
+    ushort2 dst    [[attribute(2)]];
+    ushort4 src    [[attribute(3)]];
+    uint    pal    [[attribute(4)]];
+    uint    flags  [[attribute(5)]];
+};
+
+struct FxVsOut {
+    float4 pos [[position]];
+    int2  origin [[flat]];
+    uint2 dst    [[flat]];
+    uint4 src    [[flat]];
+    uint  pal    [[flat]];
+    uint  flags  [[flat]];
+};
+
+vertex FxVsOut vs_fx(uint vi [[vertex_id]],
+                     FxVsIn vin [[stage_in]],
+                     constant Uniforms& u [[buffer(0)]]) {
+    float4 rect = float4(vin.rect_u);
+    float2 k = corner(vi);
+    float2 px = rect.xy + k * rect.zw;
+    FxVsOut o;
+    o.pos = float4(to_ndc(px, u), 0.0, 1.0);
+    o.origin = int2(vin.origin);
+    o.dst = uint2(vin.dst);
+    o.src = uint4(vin.src);
+    o.pal = vin.pal;
+    o.flags = vin.flags;
+    return o;
+}
+
+// Palette entry j as bytes (r, g, b, a): each entry's RGBA bytes read
+// little-endian. The palette is the frame slot's own stream (never a shared
+// texture), bound at fragment [[buffer(2)]] (BindSpec::FX).
+static inline uint4 fx_ink(device const uint* pal, uint j) {
+    uint e = pal[j];
+    return uint4(e & 255u, (e >> 8u) & 255u, (e >> 16u) & 255u, e >> 24u);
+}
+
+// The stored byte of each Unorm8 channel.
+static inline uint4 fx_byte4(float4 v) {
+    return uint4(rint(v * 255.0));
+}
+
+// The item-local pixel l = (p - O) mod 2^16.
+static inline uint2 fx_local(float4 pos, int2 origin) {
+    int2 p = int2(floor(pos.xy));
+    return uint2(p - origin) & uint2(65535u);
+}
+
+// The sprite texel under l: t = (l.x*w / dw, l.y*h / dh), mirrored under
+// flip_x, offset to the art's atlas region.
+static inline uint2 fx_texel(uint2 l, uint2 dst, uint4 src, uint flags) {
+    uint2 t = uint2(l.x * src.z / dst.x, l.y * src.w / dst.y);
+    if ((flags & 4u) != 0u) {
+        t.x = src.z - 1u - t.x;
+    }
+    return src.xy + t;
+}
+
+// The Exact law: (c, a) / 255 raw into src + dst*(1 - a) on the Unorm view,
+// fs_glow's state: over_premul, add_sat at a = 0.
+fragment float4 fs_fx(FxVsOut in [[stage_in]],
+                      texture2d<float> fx_r8 [[texture(0)]],
+                      texture2d<float> fx_rgba [[texture(1)]],
+                      device const uint* pal [[buffer(2)]]) {
+    uint2 l = fx_local(in.pos, in.origin);
+    uint kind = in.flags & 3u;
+    uint4 c;
+    if (kind == 2u) {
+        uint2 t = fx_texel(l, in.dst, in.src, in.flags);
+        if (((in.flags >> 3u) & 3u) == 0u) {
+            // Index8: 0 writes nothing; k names entry ink + k - 1, and an
+            // index past the palette writes nothing.
+            uint k = fx_byte4(fx_r8.read(t)).x;
+            uint reach = (in.flags >> 8u) & 255u;
+            if (k == 0u || k > reach) {
+                discard_fragment();
+            }
+            c = fx_ink(pal, in.pal + clamp(k, 1u, reach) - 1u);
+        } else {
+            // Rgba8Premul: the texel is its own (c, a); a = 0 is light.
+            c = fx_byte4(fx_rgba.read(t));
+        }
+    } else {
+        // Rect (row 0) and Ramps (row l.y): the GlowQuad ramp over entries
+        // j, j + 1 at column l.x of the item's width.
+        uint j = in.pal + 2u * (kind == 1u ? l.y : 0u);
+        c = glow_lerp4(fx_ink(pal, j), fx_ink(pal, j + 1u), l.x, max(in.src.x, 1u));
+    }
+    return float4(c) / 255.0;
+}
+
+// The Linear law (FreeSprite's): a straight texel under the tint entry,
+// (mul8(rgb, tint.rgb), mul8(A, tint.a)) in exact integers, decoded and
+// blended in linear light on the sRGB view (ALPHA_BLENDING).
+fragment float4 fs_fx_linear(FxVsOut in [[stage_in]],
+                             texture2d<float> fx_rgba [[texture(1)]],
+                             device const uint* pal [[buffer(2)]]) {
+    uint2 l = fx_local(in.pos, in.origin);
+    uint4 v = fx_byte4(fx_rgba.read(fx_texel(l, in.dst, in.src, in.flags)));
+    uint4 tint = fx_ink(pal, in.pal);
+    uint4 p = (v * tint + uint4(127u)) / 255u;
+    if (p.w == 0u) {
+        discard_fragment();
+    }
+    return float4(s2l(float3(p.xyz) / 255.0), float(p.w) / 255.0);
+}

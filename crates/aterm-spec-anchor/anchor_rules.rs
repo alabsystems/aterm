@@ -11,9 +11,11 @@
 //! verified lanes, so there no proc macro sits under the anchors (Trust's PM-1 boundary
 //! refuses to verify a library whose graph holds one) and the attributes are the
 //! declarative ones, which need the `macro_attr` language feature in every crate that
-//! writes them. A stock compiler, and Trust's lint driver (whose cfg query has no
-//! `trust_verify`), resolve the proc-macro dependency and keep the proc macros, so the
-//! lint gate reads the expansion it always read. Every anchored crate's build script
+//! writes them. A stock compiler resolves the proc-macro dependency and keeps the proc
+//! macros. So does a lint driver whose cfg query has no `trust_verify`; under
+//! trust-41d79979's `targo-tippy` the query answers it (build scripts see
+//! `CARGO_CFG_TRUST_VERIFY`), so that lint lane gets the declarative attributes too
+//! (src/lib.rs says what that changes). Every anchored crate's build script
 //! mounts this file: one fact on both sides, so the crate that defines the attributes
 //! and the crates that write them cannot disagree.
 

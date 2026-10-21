@@ -48,6 +48,7 @@ fn realistic_layout() -> RestoreManifest {
                     TerminalLeafRestore {
                         sid: None,
                         lineage: None,
+                        log_ep: None,
                         cwd: Some("/Users//example/aterm".to_string()),
                         title: "zsh".to_string(),
                         profile: None,
@@ -60,6 +61,7 @@ fn realistic_layout() -> RestoreManifest {
                         questions: None,
                         autopilot: None,
                         land_at: None,
+                        autopilot_by: None,
                         identity: None,
                         theme: None,
                         agent: None,
@@ -73,6 +75,7 @@ fn realistic_layout() -> RestoreManifest {
                     TerminalLeafRestore {
                         sid: None,
                         lineage: None,
+                        log_ep: None,
                         cwd: Some("/Users//example".to_string()),
                         title: "claude".to_string(),
                         profile: None,
@@ -85,6 +88,7 @@ fn realistic_layout() -> RestoreManifest {
                         questions: None,
                         autopilot: None,
                         land_at: None,
+                        autopilot_by: None,
                         identity: None,
                         theme: None,
                         agent: None,

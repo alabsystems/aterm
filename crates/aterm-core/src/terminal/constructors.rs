@@ -76,6 +76,7 @@ impl Terminal {
             kitty_keyboard: KittyKeyboardState::new(),
             xterm_keyboard: XtermKeyboardState::new(),
             mode_mirror: std::sync::Arc::default(),
+            frame_watchers: None,
             sixel: SixelState::new(),
             window_callback: None,
             text_selection: crate::selection::TextSelection::new(),
@@ -99,12 +100,13 @@ impl Terminal {
             // Gen 1, not 0: a fresh RenderInput's `extract_gen` is 0, so the first
             // scoped extraction on any scratch takes the full-refill arm.
             extract_gen: 1,
-            search_index: None,
+            search_slot: None,
             search_index_rebuilds: 0,
             search_index_refreshes: 0,
             budgeted_search: None,
             absolute_row_revision: 0,
             holder_fence: super::HolderFence::default(),
+            holder_carried_at: None,
             repaint_blink_epoch: 0,
             evidence_asserted: 0,
             content_scroll_state: super::ContentScrollState::default(),
